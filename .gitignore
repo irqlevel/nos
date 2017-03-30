@@ -1,0 +1,7 @@
+*.o
+*.iso
+*.bin
+*.elf
+*.pyc
+*.patch
+tags
