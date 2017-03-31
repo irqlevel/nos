@@ -29,6 +29,7 @@ ulong get_fs_32(void);
 ulong get_gs_32(void);
 
 void get_idt_32(void *result);
+void put_idt_32(void *result);
 void get_gdt_32(void *result);
 
 ulong check_cpuid_support_32(void);
@@ -36,6 +37,13 @@ ulong check_long_mode_support_32(void);
 
 void spin_lock_lock_32(ulong *lock);
 void spin_lock_unlock_32(ulong *lock);
+
+void outb(u16, u8);
+u8 inb(u16);
+
+void enable(void);
+void disable(void);
+void hlt(void);
 
 #ifdef __cplusplus
 }

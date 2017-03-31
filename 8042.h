@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "idt_descriptor.h"
 
 namespace Kernel
 {
@@ -17,6 +18,11 @@ public:
         return instance;
     }
 
+    void Register(IdtDescriptor *_irq);
+    void Unregister();
+
+    u8 get();
+
 private:
     IO8042();
     virtual ~IO8042();
@@ -28,11 +34,12 @@ private:
 
     __attribute((interrupt)) static void Interrupt(void *frame);
 
-    const ulong Port = 0x80;
+    static const ulong Port = 0x60;
 
     const ulong BufSize = 16;
-    u8 *Buf;
-    u8 *BufPtr;
+    volatile u8 *Buf;
+    volatile u8 *BufPtr;
+    IdtDescriptor *irq;
 };
 
 }

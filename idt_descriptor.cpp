@@ -1,10 +1,17 @@
+#include "gdt_descriptor.h"
 #include "idt_descriptor.h"
+#include "helpers32.h"
 
 namespace Kernel
 {
 
 namespace Core
 {
+
+IdtDescriptor::IdtDescriptor()
+{
+    *this = &IdtDescriptor::DummyHandler;
+}
 
 IdtDescriptor::IdtDescriptor(u64 value)
     : Value(value)
@@ -15,70 +22,29 @@ IdtDescriptor::~IdtDescriptor()
 {
 }
 
-u32 IdtDescriptor::GetBase()
+u32 IdtDescriptor::GetOffset()
 {
-	u32 high, low;
-	u32 base;
-
-	high = U64_HIGH(Value);
-	low = U64_LOW(Value);
-	base = 0;
-	base |= (low & 0xFFFF0000) >> 16;
-	base |= (high & 0x000000FF) << 16;
-	base |= (high & 0xFF000000);
-
-	return base;
+        return ((Value >> 48) << 16) | (Value & 0xFFFF);
 }
 
-u32 IdtDescriptor::GetLimit()
+u16 IdtDescriptor::GetSelector()
 {
-	u32 high, low;
-	u32 limit;
-
-	high = U64_HIGH(Value);
-	low = U64_LOW(Value);
-	limit = 0;
-	limit |= (low & 0x0000FFFF);
-	limit |= (high & 0x000F0000) << 16;
-	return limit;
+        return (Value >> 16) & 0xFFFF;
 }
 
-u8 IdtDescriptor::GetFlag()
+u8 IdtDescriptor::GetType()
 {
-	u32 high;
-
-	high = U64_HIGH(Value);
-	return (high & 0x00F00000) >> 20;
+        return (Value >> 40) & 0xFF;
 }
 
-u8 IdtDescriptor::GetAccess()
-{
-	u32 high;
-
-	high = U64_HIGH(Value);
-	return (high & 0x0000FF00) >> 8;
-}
-
-u64 IdtDescriptor::GetValue()
-{
-    return Value;
-}
-
-IdtDescriptor IdtDescriptor::Encode(u32 base, u32 limit, u8 flag, u8 access)
+IdtDescriptor IdtDescriptor::Encode(u32 offset, u16 selector, u8 type)
 {
 	u64 value = 0;
 
-	/* set high 32 bits */
-	value |= (limit & 0x000F0000); /* limit bits 19:16 */
-	value |= (flag & 0x0F) & 0x00F00000;
-	value |= (access & 0xFF) & 0x000FF00;
-	value |= (base >> 16) & 0x000000FF; /* base bits 23:16 */
-	value |= base & 0xFF000000; /* base bits 32:24 */
-
-	/* set low 32 bits */
-	value <<= 32;
-	value |= base << 16; /* base bits 15:0 */
-	value |= limit & 0x0000FFFF; /* limit bits 15:0 */
+        value |= (offset & 0xFFFF);
+        value |= selector << 16;
+        value |= ((u64) type) << 40;
+        value |= ((u64) offset >> 16) << 48;
 
 	return IdtDescriptor(value);
 }
@@ -111,6 +77,21 @@ IdtDescriptor& IdtDescriptor::operator=(const IdtDescriptor& other)
         Value = other.Value;
     }
     return *this;
+}
+
+IdtDescriptor& IdtDescriptor::operator=(void (*fn)(void*))
+{
+    if (fn)
+        *this = Encode((u32) fn, GdtDescriptor::GdtCode, IdtDescriptor::FlagPresent | IdtDescriptor::FlagGateInterrupt80386_32);
+    else
+        Value = 0;
+
+    return *this;
+}
+
+void IdtDescriptor::DummyHandler(void* __attribute((unused)) frame)
+{
+    outb(0x20, 0x20);
 }
 
 }

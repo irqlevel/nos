@@ -1,5 +1,6 @@
 #include "vga.h"
 #include "memory.h"
+#include "helpers32.h"
 
 namespace Kernel
 {
@@ -16,6 +17,7 @@ VgaTerm::VgaTerm()
     , ColorCode(MakeColor(ColorWhite, ColorBlack))
 {
 	Cls();
+        Cursor();
 }
 
 VgaTerm::~VgaTerm()
@@ -59,15 +61,16 @@ void VgaTerm::Overflow()
 void VgaTerm::PutChar(char c)
 {
 	if (c == '\n') {
+                while (Column < Width)
+                        PutCharAt(' ', ColorCode, Column++, Row);
 		Column = 0;
 		Row++;
-		Overflow();
-		return;
-	}
-
-	PutCharAt(c, ColorCode, Column, Row);
-	Column++;
+	} else {
+	        PutCharAt(c, ColorCode, Column, Row);
+	        Column++;
+        }
 	Overflow();
+        Cursor();
 }
 
 void VgaTerm::Puts(const char *str)
@@ -102,6 +105,15 @@ void VgaTerm::Printf(const char *fmt, ...)
 	va_start(args, fmt);
 	Vprintf(fmt, args);
 	va_end(args);
+}
+
+void VgaTerm::Cursor()
+{
+        u16 offset = ((Row % Height) * Width + (Column % Width)) % (Width * Height);
+        outb(VgaBase, VgaIndex + 1);
+        outb(VgaBase + 1, offset & 0xFF);
+        outb(VgaBase, VgaIndex);
+        outb(VgaBase + 1, offset >> 8);
 }
 
 }

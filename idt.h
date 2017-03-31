@@ -15,6 +15,7 @@ public:
     Idt();
     ~Idt();
     void Load();
+    void Save(const IdtDescriptor* base, u16 length);
 
     IdtDescriptor LoadDescriptor(u16 selector);
 

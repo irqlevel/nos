@@ -18,11 +18,17 @@ global get_es_32
 global get_fs_32
 global get_gs_32
 global get_idt_32
+global put_idt_32
 global get_gdt_32
 global spin_lock_lock_32
 global spin_lock_unlock_32
 global check_cpuid_support_32
 global check_long_mode_support_32
+global outb
+global inb
+global enable
+global disable
+global hlt
 
 get_cr0_32:
 	mov eax, cr0
@@ -99,6 +105,15 @@ get_idt_32:
 	mov eax, [ebp+8]
 	sidt [eax]
 	mov esp, ebp
+	pop ebp
+	ret
+
+put_idt_32:
+	push ebp
+	mov ebp, esp
+	mov eax, [ebp+8]
+	lidt [eax]
+	mov esp ,ebp
 	pop ebp
 	ret
 
@@ -186,3 +201,37 @@ check_long_mode_support_32:
 no_long_mode_support:
 	xor eax, eax
 	ret
+
+outb:
+	push ebp
+	mov ebp, esp
+        push edx
+        mov edx, [ebp + 8]
+        mov eax, [ebp + 12]
+        out dx, al
+        mov esp, ebp
+        pop ebp
+        ret
+
+inb:
+        push ebp
+        mov ebp, esp
+        push edx
+        mov edx, [ebp + 8]
+        xor eax, eax
+        in al, dx
+        mov esp, ebp
+        pop ebp
+        ret
+
+enable:
+        sti
+        ret
+
+disable:
+        cli
+        ret
+
+hlt:
+        hlt
+        ret

@@ -211,6 +211,12 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 pos += rc;
                 break;
             }
+            case 'c': {
+                int val;
+                val = va_arg(arg, int);
+                s[pos++] = val & 0xFF;
+                break;
+            }
             case 'p': {
                 void *val;
                 ulong uval;
