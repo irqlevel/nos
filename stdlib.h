@@ -95,6 +95,24 @@ size_t SizeOfInBits()
     return 8 * sizeof(T);
 }
 
+template <typename T>
+int TestBit(const T& value, u8 bit)
+{
+    return (value & (static_cast<T>(1) << bit)) ? 1 : 0;
+}
+
+template <typename T>
+void SetBit(T& value, u8 bit)
+{
+    value |= (static_cast<T>(1) << bit);
+}
+
+template <typename T>
+void ClearBit(T& value, u8 bit)
+{
+    value &= ~(static_cast<T>(1) << bit);
+}
+
 void *MemAdd(void *ptr, unsigned long len);
 
 const void *MemAdd(const void *ptr, unsigned long len);
