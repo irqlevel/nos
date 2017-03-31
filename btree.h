@@ -1,9 +1,10 @@
 #pragma once
 
 #include "trace.h"
-#include "unique_ptr.h"
 #include "new.h"
 #include "lock.h"
+#include "shared_ptr.h"
+#include "panic.h"
 
 namespace Kernel
 {

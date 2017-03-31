@@ -1,5 +1,5 @@
 #include "vga.h"
-#include "memory.h"
+#include "stdlib.h"
 
 namespace Kernel
 {

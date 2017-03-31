@@ -1,6 +1,6 @@
 #include "gdt.h"
 #include "helpers32.h"
-#include "memory.h"
+#include "stdlib.h"
 
 namespace Kernel
 {

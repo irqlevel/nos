@@ -21,7 +21,9 @@ global _start
 _start:
 	mov esp, stack_top
 	extern kernel_main
+	push ebx
 	call kernel_main
+	pop ebx
 	sub esp, 4
 	mov [esp], dword 0x0
 	extern __cxa_finalize

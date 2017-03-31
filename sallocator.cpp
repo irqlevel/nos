@@ -1,5 +1,5 @@
 #include "sallocator.h"
-#include "memory.h"
+#include "stdlib.h"
 #include "panic.h"
 #include "const.h"
 #include "trace.h"

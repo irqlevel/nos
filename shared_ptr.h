@@ -2,6 +2,7 @@
 
 #include "trace.h"
 #include "atomic.h"
+#include "panic.h"
 
 namespace Kernel
 {

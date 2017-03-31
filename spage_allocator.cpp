@@ -10,14 +10,26 @@ namespace Kernel
 namespace Core
 {
 
-SPageAllocator::SPageAllocator()
+SPageAllocator* SPageAllocator::InstancePtr = nullptr;
+
+SPageAllocator::SPageAllocator(ulong pageStart, ulong pageEnd)
     : Usage(0)
+    , PageStart(pageStart)
+    , PageEnd(pageEnd)
 {
     PageList.Init();
 
-    for (size_t i = 0; i < MaxPages; i++)
+    if (PageStart == 0 || PageEnd <= PageStart ||
+        (PageStart & (PAGE_SIZE - 1)) ||
+        (PageEnd & (PAGE_SIZE - 1)))
     {
-        ListEntry* pageLink = reinterpret_cast<ListEntry*>(Shared::MemAdd(Page, i * PAGE_SIZE));
+        Panic("Invalid page start/end");
+        return;
+    }
+
+    for (ulong page = PageStart; page < PageEnd; page+= PAGE_SIZE)
+    {
+        ListEntry* pageLink = reinterpret_cast<ListEntry*>(page);
         PageList.InsertTail(pageLink);
     }
 }
@@ -53,13 +65,13 @@ void SPageAllocator::Free(void* page)
 		return;
 	}
 
-	if (pageAddr < reinterpret_cast<ulong>(Page)) {
-		Panic("pageAddr < Page");
+	if (pageAddr < PageStart) {
+		Panic("pageAddr < PageStart");
 		return;
 	}
 
-	if (pageAddr >= (reinterpret_cast<ulong>(Page) + sizeof(Page))) {
-		Panic("pageAddr >= Page");
+	if (pageAddr >= PageEnd) {
+		Panic("pageAddr >= PageEnd");
 		return;
 	}
 
