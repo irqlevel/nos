@@ -17,6 +17,7 @@ IO8042::IO8042()
 
 IO8042::~IO8042()
 {
+    delete[] Buf;
 }
 
 void IO8042::Register(IdtDescriptor *_irq)
