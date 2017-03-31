@@ -1,6 +1,6 @@
 #include "vga.h"
-#include "memory.h"
 #include "helpers32.h"
+#include "stdlib.h"
 
 namespace Kernel
 {

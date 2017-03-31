@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "helpers32.h"
-#include "memory.h"
+#include "stdlib.h"
+#include "memory_map.h"
 
 namespace Kernel
 {

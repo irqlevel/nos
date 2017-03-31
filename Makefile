@@ -9,8 +9,8 @@ ASM = nasm
 AR = ar
 
 CPP_SRC = icxxabi.cpp list_entry.cpp new.cpp sallocator.cpp spage_allocator.cpp spool.cpp vga.cpp kernel.cpp \
-	trace.cpp memory.cpp panic.cpp debug.cpp error.cpp atomic.cpp cpu_state.cpp \
-	gdt_descriptor.cpp gdt.cpp 8042.cpp idt_descriptor.cpp idt.cpp
+	trace.cpp stdlib.cpp panic.cpp debug.cpp error.cpp atomic.cpp cpu_state.cpp \
+	gdt_descriptor.cpp gdt.cpp 8042.cpp idt_descriptor.cpp idt.cpp memory_map.cpp test.cpp
 
 all: kernel.iso
 
@@ -26,7 +26,7 @@ kernel.iso: kernel.elf
 	grub2-mkrescue -o kernel.iso iso
 	rm -rf iso
 
-kernel.elf:	$(CPP_SRC)
+kernel.elf: $(CPP_SRC)
 		rm -rf *.o
 		$(ASM) -felf32 boot.asm
 		$(ASM) -felf32 helpers32.asm

@@ -1,5 +1,5 @@
 #include "8042.h"
-#include "memory.h"
+#include "memory_map.h"
 #include "trace.h"
 #include "helpers32.h"
 

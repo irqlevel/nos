@@ -1,6 +1,6 @@
 #include "spool.h"
 #include "lock.h"
-#include "memory.h"
+#include "stdlib.h"
 #include "const.h"
 #include "panic.h"
 
