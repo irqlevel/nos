@@ -1,3 +1,4 @@
+#include "8042.h"
 #include "vga.h"
 #include "trace.h"
 #include "new.h"
@@ -231,6 +232,9 @@ extern "C" void kernel_main(void)
     Trace(0, "Cpu ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
         (ulong)cpuState.GetSs(), (ulong)cpuState.GetCs(), (ulong)cpuState.GetDs(),
         (ulong)cpuState.GetGs(), (ulong)cpuState.GetFs(), (ulong)cpuState.GetEs());
+
+    auto& kbd = IO8042::GetInstance();
+    Trace(0, "KBD %p", &kbd);
 
     Trace(0, "Exit");
 }
