@@ -6,6 +6,29 @@ extern IO8042Interrupt
 extern DummyInterrupt
 extern SerialInterrupt
 
+extern ExcDivideByZero
+extern ExcDebugger
+extern ExcNMI
+extern ExcBreakpoint
+extern ExcOverflow
+extern ExcBounds
+extern ExcInvalidOpcode
+extern ExcCoprocessorNotAvailable
+extern ExcDoubleFault
+extern ExcCoprocessorSegmentOverrun
+extern ExcInvalidTaskStateSegment
+extern ExcSegmentNotPresent
+extern ExcStackFault
+extern ExcGeneralProtectionFault
+extern ExcPageFault
+extern ExcReserved
+extern ExcMathFault
+extern ExcAlignmentCheck
+extern ExcMachineCheck
+extern ExcSIMDFpException
+extern ExcVirtException
+extern ExcControlProtection
+
 global get_cr0_32
 global get_cr1_32
 global get_cr2_32
@@ -36,6 +59,29 @@ global hlt
 global IO8042InterruptStub
 global DummyInterruptStub
 global SerialInterruptStub
+
+global ExcDivideByZeroStub
+global ExcDebuggerStub
+global ExcNMIStub
+global ExcBreakpointStub
+global ExcOverflowStub
+global ExcBoundsStub
+global ExcInvalidOpcodeStub
+global ExcCoprocessorNotAvailableStub
+global ExcDoubleFaultStub
+global ExcCoprocessorSegmentOverrunStub
+global ExcInvalidTaskStateSegmentStub
+global ExcSegmentNotPresentStub
+global ExcStackFaultStub
+global ExcGeneralProtectionFaultStub
+global ExcPageFaultStub
+global ExcReservedStub
+global ExcMathFaultStub
+global ExcAlignmentCheckStub
+global ExcMachineCheckStub
+global ExcSIMDFpExceptionStub
+global ExcVirtExceptionStub
+global ExcControlProtectionStub
 
 get_cr0_32:
 	mov eax, cr0
@@ -261,5 +307,159 @@ SerialInterruptStub:
 	pushad
 	cld
 	call SerialInterrupt
+	popad
+	iret
+
+ExcDivideByZeroStub:
+	pushad
+	cld
+	call ExcDivideByZero
+	popad
+	iret
+
+ExcDebuggerStub:
+	pushad
+	cld
+	call ExcDebugger
+	popad
+	iret
+
+ExcNMIStub:
+	pushad
+	cld
+	call ExcNMI
+	popad
+	iret
+
+ExcBreakpointStub:
+	pushad
+	cld
+	call ExcBreakpoint
+	popad
+	iret
+
+ExcOverflowStub:
+	pushad
+	cld
+	call ExcOverflow
+	popad
+	iret
+
+ExcBoundsStub:
+	pushad
+	cld
+	call ExcBounds
+	popad
+	iret
+
+ExcInvalidOpcodeStub:
+	pushad
+	cld
+	call ExcInvalidOpcode
+	popad
+	iret
+
+ExcCoprocessorNotAvailableStub:
+	pushad
+	cld
+	call ExcCoprocessorNotAvailable
+	popad
+	iret
+
+ExcDoubleFaultStub:
+	pushad
+	cld
+	call ExcDoubleFault
+	popad
+	iret
+
+ExcCoprocessorSegmentOverrunStub:
+	pushad
+	cld
+	call ExcCoprocessorSegmentOverrun
+	popad
+	iret
+
+ExcInvalidTaskStateSegmentStub:
+	pushad
+	cld
+	call ExcInvalidTaskStateSegment
+	popad
+	iret
+
+ExcSegmentNotPresentStub:
+	pushad
+	cld
+	call ExcSegmentNotPresent
+	popad
+	iret
+
+ExcStackFaultStub:
+	pushad
+	cld
+	call ExcStackFault
+	popad
+	iret
+
+ExcGeneralProtectionFaultStub:
+	pushad
+	cld
+	call ExcGeneralProtectionFault
+	popad
+	iret
+
+ExcPageFaultStub:
+	pushad
+	cld
+	call ExcPageFault
+	popad
+	iret
+
+ExcReservedStub:
+	pushad
+	cld
+	call ExcReserved
+	popad
+	iret
+
+ExcMathFaultStub:
+	pushad
+	cld
+	call ExcMathFault
+	popad
+	iret
+
+ExcAlignmentCheckStub:
+	pushad
+	cld
+	call ExcAlignmentCheck
+	popad
+	iret
+
+ExcMachineCheckStub:
+	pushad
+	cld
+	call ExcMachineCheck
+	popad
+	iret
+
+ExcSIMDFpExceptionStub:
+	pushad
+	cld
+	call ExcSIMDFpException
+	popad
+	iret
+
+ExcVirtExceptionStub:
+	pushad
+	cld
+	call ExcVirtException
+	popad
+	iret
+
+ExcControlProtectionStub:
+	pushad
+	cld
+	call ExcControlProtection
 	popad
 	iret

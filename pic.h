@@ -20,6 +20,8 @@ public:
 
     void Remap(int offset1 = 0x20, int offset2 = 0x28);
 
+    static void EOI();
+
 private:
     Pic();
     ~Pic();

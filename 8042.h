@@ -1,7 +1,7 @@
 #pragma once
 
 #include "types.h"
-#include "idt_descriptor.h"
+#include "idt.h"
 
 namespace Kernel
 {
@@ -18,8 +18,8 @@ public:
         return instance;
     }
 
-    void Register(IdtDescriptor *irq);
-    void Unregister();
+    void RegisterInterrupt(int intNum);
+    void UnregisterInterrupt();
 
     u8 Get();
 
@@ -39,7 +39,7 @@ private:
     const ulong BufSize = 16;
     volatile u8 *Buf;
     volatile u8 *BufPtr;
-    IdtDescriptor *Irq;
+    int IntNum;
 };
 
 }

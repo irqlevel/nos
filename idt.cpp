@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "helpers32.h"
 #include "stdlib.h"
+#include "pic.h"
 
 namespace Kernel
 {
@@ -12,6 +13,12 @@ Idt::Idt()
     : Base(0)
     , Limit(0)
 {
+    for (size_t i = 0; i < Shared::ArraySize(Entry); i++)
+    {
+        Entry[i] = IdtDescriptor::Encode(DummyInterruptStub);
+    }
+
+    Save();
 }
 
 Idt::~Idt()
@@ -28,11 +35,11 @@ void Idt::Load()
     Limit = desc.Limit;
 }
 
-void Idt::Save(const IdtDescriptor* base, u16 length)
+void Idt::Save()
 {
     TableDesc desc = {
-        .Base = (u32) base,
-        .Limit = length,
+        .Base = (u32) &Entry[0],
+        .Limit = sizeof(Entry),
     };
 
     put_idt_32(&desc);
@@ -51,16 +58,33 @@ u16 Idt::GetLimit()
     return Limit;
 }
 
-IdtDescriptor Idt::LoadDescriptor(u16 irq)
+IdtDescriptor Idt::GetDescriptor(u16 index)
 {
-    u32 selector = irq << 3;
-    if (selector >= Limit)
-	return IdtDescriptor(0);
+    if (index > Shared::ArraySize(Entry))
+	    return IdtDescriptor(0);
 
-    u64* base = reinterpret_cast<u64*>(
-        Shared::MemAdd(reinterpret_cast<void*>(Base), selector));
+    return Entry[index];
+}
 
-    return IdtDescriptor(*base);
+void Idt::SetDescriptor(u16 index, const IdtDescriptor& desc)
+{
+    if (index > Shared::ArraySize(Entry))
+	    return;
+
+    Entry[index] = desc;
+}
+
+void Idt::DummyHandler()
+{
+    DummyHandlerCounter.Inc();
+    Pic::EOI();
+}
+
+extern "C" void DummyInterrupt()
+{
+    auto& idt = Idt::GetInstance();
+
+    idt.DummyHandler();
 }
 
 }

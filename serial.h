@@ -1,7 +1,6 @@
 #pragma once
 
 #include "types.h"
-#include "idt_descriptor.h"
 
 namespace Kernel
 {
@@ -27,8 +26,8 @@ public:
     void Vprintf(const char *fmt, va_list args);
     void Printf(const char *fmt, ...);
 
-    void Register(IdtDescriptor *irq);
-    void Unregister();
+    void RegisterInterrupt(int intNum);
+    void UnregisterInterrupt();
 
     static void Interrupt();
 
@@ -43,7 +42,7 @@ private:
 
     void OnInterrupt();
     bool IsTransmitEmpty();
-    IdtDescriptor *Irq;
+    int IntNum;
 
     static const int Port = 0x3F8;
 };

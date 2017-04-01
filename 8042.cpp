@@ -2,6 +2,7 @@
 #include "memory_map.h"
 #include "trace.h"
 #include "helpers32.h"
+#include "pic.h"
 
 namespace Kernel
 {
@@ -10,8 +11,9 @@ namespace Core
 {
 
 IO8042::IO8042()
-    : Buf(new u8[BufSize]),
-      BufPtr(Buf)
+    : Buf(new u8[BufSize])
+    , BufPtr(Buf)
+    , IntNum(-1)
 {
 }
 
@@ -20,16 +22,23 @@ IO8042::~IO8042()
     delete[] Buf;
 }
 
-void IO8042::Register(IdtDescriptor *irq)
+void IO8042::RegisterInterrupt(int intNum)
 {
-    Irq = irq;
-    *Irq = IO8042InterruptStub;
+    auto& idt = Idt::GetInstance();
+
+    idt.SetDescriptor(intNum, IdtDescriptor::Encode(IO8042InterruptStub));
+    IntNum = intNum;
 }
 
-void IO8042::Unregister()
+void IO8042::UnregisterInterrupt()
 {
-    *Irq = (void (*)())0;
-    Irq = nullptr;
+    if (IntNum >= 0)
+    {
+        auto& idt = Idt::GetInstance();
+
+        idt.SetDescriptor(IntNum, IdtDescriptor::Encode(nullptr));
+        IntNum = -1;
+    }
 }
 
 void IO8042::Interrupt()
@@ -37,7 +46,7 @@ void IO8042::Interrupt()
     auto& io8042 = IO8042::GetInstance();
 
     *io8042.BufPtr++ = inb(Port);
-    outb(0x20, 0x20);
+    Pic::EOI();
 }
 
 u8 IO8042::Get()

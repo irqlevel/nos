@@ -51,6 +51,29 @@ void DummyInterruptStub();
 
 void SerialInterruptStub();
 
+void ExcDivideByZeroStub();
+void ExcDebuggerStub();
+void ExcNMIStub();
+void ExcBreakpointStub();
+void ExcOverflowStub();
+void ExcBoundsStub();
+void ExcInvalidOpcodeStub();
+void ExcCoprocessorNotAvailableStub();
+void ExcDoubleFaultStub();
+void ExcCoprocessorSegmentOverrunStub();
+void ExcInvalidTaskStateSegmentStub();
+void ExcSegmentNotPresentStub();
+void ExcStackFaultStub();
+void ExcGeneralProtectionFaultStub();
+void ExcPageFaultStub();
+void ExcReservedStub();
+void ExcMathFaultStub();
+void ExcAlignmentCheckStub();
+void ExcMachineCheckStub();
+void ExcSIMDFpExceptionStub();
+void ExcVirtExceptionStub();
+void ExcControlProtectionStub();
+
 #ifdef __cplusplus
 }
 #endif

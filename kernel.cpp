@@ -22,6 +22,7 @@
 #include "memory_map.h"
 #include "serial.h"
 #include "pic.h"
+#include "exception.h"
 
 using namespace Kernel::Core;
 using namespace Shared;
@@ -48,16 +49,16 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
     auto err = Test();
     TraceError(err);
 
-    static IdtDescriptor idt[256];
-    Idt idtr;
-    idtr.Save(idt, sizeof(idt));
+    Idt::GetInstance();
 
+    auto& excTable = ExceptionTable::GetInstance();
     auto& kbd = IO8042::GetInstance();
     auto& serial = Serial::GetInstance();
 
     Pic::GetInstance().Remap();
-    kbd.Register(&idt[0x21]);
-    serial.Register(&idt[0x24]);
+    excTable.RegisterInterrupts();
+    kbd.RegisterInterrupt(0x21);
+    serial.RegisterInterrupt(0x24);
     enable();
 
     auto& term = VgaTerm::GetInstance();

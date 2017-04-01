@@ -11,8 +11,8 @@ namespace Core
 {
 
 IdtDescriptor::IdtDescriptor()
+    : Value(0)
 {
-    *this = DummyInterruptStub;
 }
 
 IdtDescriptor::IdtDescriptor(u64 value)
@@ -178,28 +178,20 @@ IdtDescriptor& IdtDescriptor::operator=(const IdtDescriptor& other)
     return *this;
 }
 
-IdtDescriptor& IdtDescriptor::operator=(void (*fn)())
+IdtDescriptor IdtDescriptor::Encode(void (*handlerFn)())
 {
-    if (fn)
+    if (handlerFn != nullptr)
     {
         CpuState cpu;
 
         cpu.Load();
-        *this = Encode((u32) fn, cpu.GetCs(), IdtDescriptor::FlagPresent | IdtDescriptor::FlagGateInterrupt80386_32);
-    } else
-        Value = 0;
-
-    return *this;
-}
-
-void IdtDescriptor::DummyHandler()
-{
-    outb(0x20, 0x20);
-}
-
-extern "C" void DummyInterrupt()
-{
-    IdtDescriptor::DummyHandler();
+        return Encode((u32)handlerFn, cpu.GetCs(),
+            IdtDescriptor::FlagPresent | IdtDescriptor::FlagGateInterrupt80386_32);
+    }
+    else
+    {
+        return IdtDescriptor(0);
+    }
 }
 
 }

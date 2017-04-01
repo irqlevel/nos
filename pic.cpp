@@ -52,6 +52,11 @@ void Pic::Remap(int offset1, int offset2)
 	outb(PIC2_DATA, a2);    
 }
 
+void Pic::EOI()
+{
+    outb(PIC1, PIC_EOI);
+}
+
 }
 
 }

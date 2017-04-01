@@ -1,6 +1,8 @@
 #include "serial.h"
 #include "helpers32.h"
 #include "stdlib.h"
+#include "idt.h"
+#include "pic.h"
 
 namespace Kernel
 {
@@ -9,6 +11,7 @@ namespace Core
 {
 
 Serial::Serial()
+    : IntNum(-1)
 {
     outb(Port + 1, 0x00);    // Disable all interrupts
     outb(Port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
@@ -75,16 +78,23 @@ void Serial::Printf(const char *fmt, ...)
 	va_end(args);
 }
 
-void Serial::Register(IdtDescriptor *irq)
+void Serial::RegisterInterrupt(int intNum)
 {
-    Irq = irq;
-    *Irq = SerialInterruptStub;
+    auto& idt = Idt::GetInstance();
+
+    idt.SetDescriptor(intNum, IdtDescriptor::Encode(IO8042InterruptStub));
+    IntNum = intNum;
 }
 
-void Serial::Unregister()
+void Serial::UnregisterInterrupt()
 {
-    *Irq = (void (*)())0;
-    Irq = nullptr;
+    if (IntNum >= 0)
+    {
+        auto& idt = Idt::GetInstance();
+
+        idt.SetDescriptor(IntNum, IdtDescriptor(0));
+        IntNum = -1;
+    }
 }
 
 void Serial::OnInterrupt()
@@ -96,7 +106,7 @@ void Serial::Interrupt()
     auto& serial = Serial::GetInstance();
 
     serial.OnInterrupt();
-    outb(0x20, 0x20);
+    Pic::EOI();
 }
 
 extern "C" void SerialInterrupt()
