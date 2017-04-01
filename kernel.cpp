@@ -66,25 +66,9 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
     pit.Setup();
     enable();
 
-    auto& term = VgaTerm::GetInstance();
-    u8 mod = 0;
-    while (1) {
-        static char map[0x80] = "__1234567890-=_" "\tqwertyuiop[]\n" "_asdfghjkl;'`" "_\\zxcvbnm,./_" "*_ _";
-        u8 code = kbd.Get();
-
-        Trace(0, "Kbd: code 0x%p", (ulong)code);
-
-        if (code == 0x2a || code == 0x36) mod = 0x20;
-        else if (code == 0xaa || code == 0xb6) mod = 0x00;
-        else if (code & 0x80) continue;
-        else
-        {
-            char c = map[(int)code] ^ mod;
-
-            Trace(0, "Kbd: char %c", c);
-
-            term.Printf("%c", c);
-        }
+    for (;;)
+    {
+        hlt();
     }
 
     Trace(0, "Exit");

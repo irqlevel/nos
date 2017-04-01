@@ -4,6 +4,7 @@
 #include "pit.h"
 #include "pic.h"
 #include "stdlib.h"
+#include "timer.h"
 
 namespace Kernel
 {
@@ -66,6 +67,8 @@ void Pit::Interrupt()
         TimeMsNs -= 1000000;
         TimeMs += 1;
     }
+
+    TimerTable::GetInstance().ProcessTimers();
 
     Pic::EOI();
 }

@@ -7,6 +7,40 @@ namespace Shared
 
 struct Time
 {
+    Time()
+        : Secs(0)
+        , NanoSecs(0)
+    {
+    }
+
+    void Add(const Time& other)
+    {
+        Secs += other.Secs;
+
+        u64 nanoSecs = NanoSecs + other.NanoSecs;
+        while (nanoSecs > 1000000000)
+        {
+            Secs+= 1;
+            nanoSecs -= 1000000000;
+        }
+        NanoSecs = nanoSecs;
+    }
+
+    int Compare(const Time& other)
+    {
+        if (Secs < other.Secs)
+            return -1;
+        if (Secs > other.Secs)
+            return 1;
+
+        if (NanoSecs < other.NanoSecs)
+            return -1;
+        if (NanoSecs > other.NanoSecs)
+            return 1;
+
+        return 0;
+    }
+
     u32 Secs;
     u32 NanoSecs;
 };
