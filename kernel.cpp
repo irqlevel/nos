@@ -1,3 +1,4 @@
+#include "8042.h"
 #include "vga.h"
 #include "trace.h"
 #include "new.h"
@@ -12,6 +13,8 @@
 #include "error.h"
 #include "vector.h"
 #include "gdt.h"
+#include "idt.h"
+#include "idt_descriptor.h"
 #include "cpu_state.h"
 #include "grub.h"
 #include "test.h"
@@ -41,6 +44,25 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
 
     auto err = Test();
     TraceError(err);
+
+    auto& kbd = IO8042::GetInstance();
+
+    // FIXME: reconfigure 8259 to remap IRQs
+    kbd.Register(&idt[9]);
+    outb(0x21,0xfd);
+    outb(0xa1,0xff);
+    enable();
+
+    auto& term = VgaTerm::GetInstance();
+    u8 mod = 0;
+    while(1) {
+        static char map[0x80] = "__1234567890-=_" "\tqwertyuiop[]\n" "_asdfghjkl;'`" "_\\zxcvbnm,./_" "*_ _";
+        u8 c = kbd.get();
+        if (c == 0x2a || c == 0x36) mod = 0x20;
+        else if (c == 0xaa || c == 0xb6) mod = 0x00;
+        else if (c & 0x80) continue;
+        else term.Printf("%c", map[(int) c] ^ mod);
+    }
 
     Trace(0, "Exit");
 }

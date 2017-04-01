@@ -16,10 +16,12 @@ public:
     ~Idt();
     void Load();
 
-    IdtDescriptor GetDescriptor(u16 selector);
-    void SetDescriptor(u16 selector, const IdtDescriptor& desc);
+    void Save(const IdtDescriptor* base, u16 length);
+
+    IdtDescriptor LoadDescriptor(u16 selector);
 
     u32 GetBase();
+
     u16 GetLimit();
 
 private:

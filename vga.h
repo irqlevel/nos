@@ -61,6 +61,7 @@ private:
     void Overflow();
 
     void PutChar(char c);
+    void Cursor();
 
     const ulong BufAddr = 0xB8000;
 
@@ -70,6 +71,9 @@ private:
     u8 Width;
     u8 Height;
     u8 ColorCode;
+
+    const u16 VgaBase = 0x3D4;
+    const u16 VgaIndex = 0x0E;
 };
 
 }
