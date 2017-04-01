@@ -20,6 +20,7 @@
 #include "test.h"
 #include "stdlib.h"
 #include "memory_map.h"
+#include "serial.h"
 
 using namespace Kernel::Core;
 using namespace Shared;
@@ -27,8 +28,9 @@ using namespace Shared;
 extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
 {
     Tracer::GetInstance().SetLevel(1);
-
     Trace(0, "Enter");
+
+    VgaTerm::GetInstance().Printf("Hello!\n");
 
     auto& mmap = MemoryMap::GetInstance(MbInfo);
 
@@ -68,4 +70,5 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
     }
 
     Trace(0, "Exit");
+    VgaTerm::GetInstance().Printf("Bye!\n");
 }

@@ -8,3 +8,4 @@ tags
 iso
 .*.sw[ponm]
 bin
+*.log

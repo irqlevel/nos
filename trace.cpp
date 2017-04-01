@@ -1,5 +1,5 @@
 #include "trace.h"
-#include "vga.h"
+#include "serial.h"
 
 namespace Kernel
 {
@@ -31,9 +31,8 @@ void Tracer::Output(const char *fmt, ...)
     va_list args;
     va_start(args, fmt);
 
-    auto& term = VgaTerm::GetInstance();
-    term.SetColor(VgaTerm::ColorWhite, VgaTerm::ColorBlack);
-    term.Vprintf(fmt, args);
+    auto& serial = Serial::GetInstance();
+    serial.Vprintf(fmt, args);
     va_end(args);
 }
 

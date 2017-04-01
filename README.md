@@ -7,5 +7,5 @@ $ make
 
 #### run:
 ```sh
-$ qemu-system-x86_64 -cdrom nos.iso
+$ qemu-system-x86_64 -cdrom nos.iso -serial file:nos.log
 ```
