@@ -23,6 +23,7 @@
 #include "serial.h"
 #include "pic.h"
 #include "exception.h"
+#include "pit.h"
 
 using namespace Kernel::Core;
 using namespace Shared;
@@ -52,11 +53,13 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
     Idt::GetInstance();
 
     auto& excTable = ExceptionTable::GetInstance();
+    auto& pit = Pit::GetInstance();
     auto& kbd = IO8042::GetInstance();
     auto& serial = Serial::GetInstance();
 
     Pic::GetInstance().Remap();
     excTable.RegisterInterrupts();
+    pit.RegisterInterrupt(0x20);
     kbd.RegisterInterrupt(0x21);
     serial.RegisterInterrupt(0x24);
     enable();

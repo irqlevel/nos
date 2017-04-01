@@ -2,9 +2,10 @@ BITS 32
 
 section .text
 
-extern IO8042Interrupt
 extern DummyInterrupt
+extern IO8042Interrupt
 extern SerialInterrupt
+extern PitInterrupt
 
 extern ExcDivideByZero
 extern ExcDebugger
@@ -56,9 +57,11 @@ global inb
 global enable
 global disable
 global hlt
-global IO8042InterruptStub
+
 global DummyInterruptStub
+global IO8042InterruptStub
 global SerialInterruptStub
+global PitInterruptStub
 
 global ExcDivideByZeroStub
 global ExcDebuggerStub
@@ -289,13 +292,6 @@ hlt:
         hlt
         ret
 
-IO8042InterruptStub:
-	pushad
-	cld
-	call IO8042Interrupt
-	popad
-	iret
-
 DummyInterruptStub:
 	pushad
 	cld
@@ -303,10 +299,24 @@ DummyInterruptStub:
 	popad
 	iret
 
+IO8042InterruptStub:
+	pushad
+	cld
+	call IO8042Interrupt
+	popad
+	iret
+
 SerialInterruptStub:
 	pushad
 	cld
 	call SerialInterrupt
+	popad
+	iret
+
+PitInterruptStub:
+	pushad
+	cld
+	call PitInterrupt
 	popad
 	iret
 

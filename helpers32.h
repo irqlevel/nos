@@ -46,10 +46,10 @@ void disable(void);
 void hlt(void);
 
 void IO8042InterruptStub();
+void SerialInterruptStub();
+void PitInterruptStub();
 
 void DummyInterruptStub();
-
-void SerialInterruptStub();
 
 void ExcDivideByZeroStub();
 void ExcDebuggerStub();
