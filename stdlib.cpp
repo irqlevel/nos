@@ -214,7 +214,8 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
             case 'c': {
                 int val;
                 val = va_arg(arg, int);
-                s[pos++] = val & 0xFF;
+                if (!PutChar(val & 0xFF, s, size, pos++))
+                    return -1;
                 break;
             }
             case 'p': {
