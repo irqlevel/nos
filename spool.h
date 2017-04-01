@@ -27,7 +27,7 @@ private:
 
     struct Page {
         ListEntry Link;
-        byte Data[1]; 
+        u8 Data[1]; 
     };
 
     ulong Usage;

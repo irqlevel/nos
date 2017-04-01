@@ -17,22 +17,10 @@ Idt::Idt()
     {
         Entry[i] = IdtDescriptor::Encode(DummyInterruptStub);
     }
-
-    Save();
 }
 
 Idt::~Idt()
 {
-}
-
-void Idt::Load()
-{
-    TableDesc desc;
-
-    get_idt_32(&desc);
-
-    Base = desc.Base;
-    Limit = desc.Limit;
 }
 
 void Idt::Save()

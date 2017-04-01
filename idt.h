@@ -20,8 +20,6 @@ public:
         return instance;
     }
 
-    void Load();
-
     void Save();
 
     IdtDescriptor GetDescriptor(u16 index);

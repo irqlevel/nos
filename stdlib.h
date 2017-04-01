@@ -5,6 +5,12 @@
 namespace Shared
 {
 
+struct Time
+{
+    u32 Secs;
+    u32 NanoSecs;
+};
+
 template< class T > struct RemoveReference      {typedef T type;};
 template< class T > struct RemoveReference<T&>  {typedef T type;};
 template< class T > struct RemoveReference<T&&> {typedef T type;};
@@ -111,6 +117,36 @@ template <typename T>
 void ClearBit(T& value, u8 bit)
 {
     value &= ~(static_cast<T>(1) << bit);
+}
+
+static inline u32 HighPart(u64 value)
+{
+    return ((u32)(((value) >> 32ULL) & 0x00000000FFFFFFFFULL));
+}
+
+static inline u32 LowPart(u64 value)
+{
+    return ((u32)((value) & 0x00000000FFFFFFFFULL));
+}
+
+static inline u16 HighPart(u32 value)
+{
+    return ((u16)(((value) >> 16) & 0x0000FFFF));
+}
+
+static inline u16 LowPart(u32 value)
+{
+    return ((u16)((value) & 0x0000FFFF));
+}
+
+static inline u8 HighPart(u16 value)
+{
+    return ((u8)(((value) >> 8) & 0x00FF));
+}
+
+static inline u8 LowPart(u16 value)
+{
+    return ((u8)((value) & 0x00FF));
 }
 
 void *MemAdd(void *ptr, unsigned long len);

@@ -53,8 +53,8 @@ IdtDescriptor IdtDescriptor::Encode(u32 offset, u16 selector, u8 type)
 
 void IdtDescriptor::SetOffset(u32 offset)
 {
-    Value |= static_cast<u64>(U32_HIGH(offset)) << 48;
-    Value |= U32_LOW(offset);
+    Value |= static_cast<u64>(Shared::HighPart(offset)) << 48;
+    Value |= Shared::LowPart(offset);
 }
 
 void IdtDescriptor::SetSelector(u16 selector)

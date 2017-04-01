@@ -50,7 +50,7 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
     auto err = Test();
     TraceError(err);
 
-    Idt::GetInstance();
+    auto& idt = Idt::GetInstance();
 
     auto& excTable = ExceptionTable::GetInstance();
     auto& pit = Pit::GetInstance();
@@ -62,6 +62,8 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
     pit.RegisterInterrupt(0x20);
     kbd.RegisterInterrupt(0x21);
     serial.RegisterInterrupt(0x24);
+    idt.Save();
+    pit.Setup();
     enable();
 
     auto& term = VgaTerm::GetInstance();

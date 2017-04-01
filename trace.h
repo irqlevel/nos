@@ -2,6 +2,7 @@
 
 #include "stdlib.h"
 #include "error.h"
+#include "pit.h"
 
 namespace Kernel
 {
@@ -45,8 +46,10 @@ do {                                                                \
     auto& tracer = Kernel::Core::Tracer::GetInstance();             \
     if (unlikely((level) <= tracer.GetLevel()))                     \
     {                                                               \
-       tracer.Output("%u:%s():%s,%u: " fmt "\n",                    \
-            (level), __func__, Shared::TruncateFileName(__FILE__),  \
+        auto time = Pit::GetInstance().GetTime();                   \
+       tracer.Output("%u:%u.%u:%s(),%s,%u: " fmt "\n",              \
+            (level), time.Secs, time.NanoSecs,                      \
+            __func__, Shared::TruncateFileName(__FILE__),           \
             __LINE__, ##__VA_ARGS__);                               \
     }                                                               \
 } while (false)
