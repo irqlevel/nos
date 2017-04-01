@@ -32,7 +32,7 @@ private:
     IO8042& operator=(const IO8042& other) = delete;
     IO8042& operator=(IO8042&& other) = delete;
 
-    __attribute((interrupt)) static void Interrupt(void *frame);
+    static void Interrupt(void *frame);
 
     static const ulong Port = 0x60;
 

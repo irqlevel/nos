@@ -45,6 +45,9 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
     auto err = Test();
     TraceError(err);
 
+    static IdtDescriptor idt[256];
+    Idt idtr;
+    idtr.Save(idt, sizeof(idt));
     auto& kbd = IO8042::GetInstance();
 
     // FIXME: reconfigure 8259 to remap IRQs

@@ -22,9 +22,6 @@ public:
     u64 GetValue();
 
     static IdtDescriptor Encode(u32 offset, u16 selector, u8 type);
- 
-    IdtDescriptor(u64 value);
-    ~IdtDescriptor();
 
     void SetOffset(u32 offset);
     void SetSelector(u16 selector);
@@ -65,7 +62,6 @@ private:
     static const u8 FlagGateInterrupt80386_32 = 0xE;
     static const u8 FlagGateTrap80386_32 = 0xF;
 
-    __attribute((interrupt))
     static void DummyHandler(void *);
 
 };
