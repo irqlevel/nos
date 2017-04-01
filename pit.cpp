@@ -59,8 +59,6 @@ void Pit::UnregisterInterrupt()
 
 void Pit::Interrupt()
 {
-    IntCounter.Inc();
-
     TimeMs += TickMs;
     TimeMsNs += TickMsNs;
     while (TimeMsNs >= 1000000)

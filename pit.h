@@ -40,8 +40,6 @@ private:
 
     int IntNum;
 
-    Atomic IntCounter;
-
     static const int Channel0Port = 0x40;
     static const int Channel1Port = 0x41;
     static const int Channel2Port = 0x42;
