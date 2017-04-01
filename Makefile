@@ -12,9 +12,9 @@ CPP_SRC = icxxabi.cpp list_entry.cpp new.cpp sallocator.cpp spage_allocator.cpp 
 	trace.cpp stdlib.cpp panic.cpp debug.cpp error.cpp atomic.cpp cpu_state.cpp \
 	gdt_descriptor.cpp gdt.cpp 8042.cpp idt_descriptor.cpp idt.cpp memory_map.cpp test.cpp
 
-all: kernel.iso
+all: nos.iso
 
-kernel.iso: kernel.elf
+nos.iso: kernel.elf
 	rm -rf iso
 	rm -rf bin
 	mkdir -p iso/boot/grub
@@ -23,7 +23,7 @@ kernel.iso: kernel.elf
 	cp kernel.elf bin/kernel.elf
 	rm -rf kernel.elf
 	cp grub.cfg iso/boot/grub/grub.cfg
-	grub2-mkrescue -o kernel.iso iso
+	grub2-mkrescue -o nos.iso iso
 	rm -rf iso
 
 kernel.elf: $(CPP_SRC)
