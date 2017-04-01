@@ -39,6 +39,12 @@ typedef u8 byte;
 #define U64_LOW(value)	\
 		((u32)((value) & 0x00000000FFFFFFFFULL))
 
+#define U32_HIGH(value)	\
+		((u16)(((value) >> 16) & 0x0000FFFF))
+
+#define U32_LOW(value)	\
+		((u16)((value) & 0x0000FFFF))
+
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
 

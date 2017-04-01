@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "gdt.h"
 
 namespace Kernel
 {
@@ -55,6 +56,7 @@ private:
 	u16 Gs;
 	bool LongMode;
 	bool Cpuid;
+
 };
 
 }

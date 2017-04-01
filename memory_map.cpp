@@ -66,15 +66,12 @@ bool MemoryMap::GetFreeRegion(ulong base, ulong& start, ulong& end)
         {
             start = regionBase;
             end = regionLength;
-            Trace(0, "Mmap: start %p end %p", start, end);
         }
 
 nextMap:
 		mmap = static_cast<Kernel::Grub::MemoryMap*>(
             Shared::MemAdd(mmap, mmap->Size + sizeof(mmap->Size)));
 	}
-
-    Trace(0, "Mmap");
 
     if (end > start && start != 0)
         return true;
