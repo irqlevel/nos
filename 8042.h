@@ -18,10 +18,12 @@ public:
         return instance;
     }
 
-    void Register(IdtDescriptor *_irq);
+    void Register(IdtDescriptor *irq);
     void Unregister();
 
-    u8 get();
+    u8 Get();
+
+    static void Interrupt();
 
 private:
     IO8042();
@@ -32,14 +34,12 @@ private:
     IO8042& operator=(const IO8042& other) = delete;
     IO8042& operator=(IO8042&& other) = delete;
 
-    static void Interrupt(void *frame);
-
     static const ulong Port = 0x60;
 
     const ulong BufSize = 16;
     volatile u8 *Buf;
     volatile u8 *BufPtr;
-    IdtDescriptor *irq;
+    IdtDescriptor *Irq;
 };
 
 }

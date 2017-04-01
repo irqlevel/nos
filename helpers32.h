@@ -45,6 +45,10 @@ void enable(void);
 void disable(void);
 void hlt(void);
 
+void IO8042InterruptStub();
+
+void DummyInterruptStub();
+
 #ifdef __cplusplus
 }
 #endif

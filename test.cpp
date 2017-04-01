@@ -11,11 +11,13 @@ namespace Kernel
 namespace Core
 {
 
+const int TestLL = 3;
+
 Shared::Error TestBtree()
 {
     Shared::Error err;
 
-    Trace(1, "TestBtree: started");
+    Trace(TestLL, "TestBtree: started");
 
     size_t keyCount = 913;
 
@@ -165,7 +167,7 @@ Shared::Error TestBtree()
         return MakeError(Shared::Error::Unsuccessful);
     }
 
-    Trace(1, "TestBtree: min depth %d max depth %d", tree.MinDepth(), tree.MaxDepth());
+    Trace(TestLL, "TestBtree: min depth %d max depth %d", tree.MinDepth(), tree.MaxDepth());
 
     tree.Clear();
     if (!tree.Check())
@@ -174,7 +176,7 @@ Shared::Error TestBtree()
         return MakeError(Shared::Error::Unsuccessful);
     }
 
-    Trace(1, "TestBtree: complete");
+    Trace(TestLL, "TestBtree: complete");
 
     return MakeError(Shared::Error::Success);
 }
@@ -185,7 +187,7 @@ Shared::Error TestGdt()
 
     gdt.Load();
 
-    Trace(0, "Gdt base 0x%p limit 0x%p", (ulong)gdt.GetBase(), (ulong)gdt.GetLimit());
+    Trace(TestLL, "Gdt base 0x%p limit 0x%p", (ulong)gdt.GetBase(), (ulong)gdt.GetLimit());
 
     for (u16 selector = 0; selector < gdt.GetLimit(); selector+= 8)
     {
@@ -193,7 +195,7 @@ Shared::Error TestGdt()
         if (desc.GetValue() == 0)
             continue;
 
-        Trace(0, "Gdt[0x%p] desc 0x%p limit 0x%p access 0x%p flag 0x%p",
+        Trace(TestLL, "Gdt[0x%p] desc 0x%p limit 0x%p access 0x%p flag 0x%p",
             (ulong)selector, (ulong)desc.GetBase(), (ulong)desc.GetLimit(),
             (ulong)desc.GetAccess(), (ulong)desc.GetFlag());
 
@@ -208,14 +210,14 @@ Shared::Error TestCpuState()
 
     cpu.Load();
 
-    Trace(0, "Cpu cr0 0x%p cr1 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
+    Trace(TestLL, "Cpu cr0 0x%p cr1 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
         cpu.GetCr0(), cpu.GetCr1(), cpu.GetCr2(), cpu.GetCr3(),
         cpu.GetCr4());
 
-    Trace(0, "Cpu eflags 0x%p sp 0x%p",
+    Trace(TestLL, "Cpu eflags 0x%p sp 0x%p",
         cpu.GetEflags(), cpu.GetEsp());
 
-    Trace(0, "Cpu ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
+    Trace(TestLL, "Cpu ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
         (ulong)cpu.GetSs(), (ulong)cpu.GetCs(), (ulong)cpu.GetDs(),
         (ulong)cpu.GetGs(), (ulong)cpu.GetFs(), (ulong)cpu.GetEs());
 

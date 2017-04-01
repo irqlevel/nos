@@ -8,17 +8,19 @@ namespace Kernel
 namespace Core
 {
 
+const int MmapLL = 3;
+
 MemoryMap::MemoryMap(Grub::MultiBootInfo *MbInfo)
     : MbInfoPtr(MbInfo)
 {
-    Trace(0, "Mmap: mbInfo %p flags %p bdev %p cmd %p",
+    Trace(MmapLL, "Mmap: mbInfo %p flags %p bdev %p cmd %p",
         MbInfoPtr, MbInfoPtr->Flags, MbInfoPtr->BootDevice, MbInfoPtr->CmdLine);
 
     Grub::MemoryMap* mmap = reinterpret_cast<Grub::MemoryMap*>(MbInfoPtr->MmapAddr);
 	while(reinterpret_cast<void*>(mmap) <
         Shared::MemAdd(reinterpret_cast<void*>(MbInfoPtr->MmapAddr), MbInfoPtr->MmapLength))
     {
-        Trace(0, "Mmap: map %p%p %p%p %p",
+        Trace(MmapLL, "Mmap: map %p%p %p%p %p",
             mmap->BaseAddrHigh, mmap->BaseAddrLow, mmap->LengthHigh, mmap->LengthLow, mmap->Type);
 
 		mmap = static_cast<Kernel::Grub::MemoryMap*>(
@@ -26,11 +28,11 @@ MemoryMap::MemoryMap(Grub::MultiBootInfo *MbInfo)
 	}
 
     Grub::Module* module = reinterpret_cast<Grub::Module*>(MbInfoPtr->ModsAddr);
-    Trace(0, "Mmap: modsCount %u", MbInfoPtr->ModsCount);
+    Trace(MmapLL, "Mmap: modsCount %u", MbInfoPtr->ModsCount);
 
     while (module < (module + MbInfoPtr->ModsCount))
     {
-        Trace(0, "Mmap: module %p %p %p", module->ModStart, module->ModEnd, module->String);
+        Trace(MmapLL, "Mmap: module %p %p %p", module->ModStart, module->ModEnd, module->String);
 
         module++;
     }

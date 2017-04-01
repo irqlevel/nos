@@ -20,30 +20,36 @@ IO8042::~IO8042()
     delete[] Buf;
 }
 
-void IO8042::Register(IdtDescriptor *_irq)
+void IO8042::Register(IdtDescriptor *irq)
 {
-    irq = _irq;
-    *irq = &IO8042::Interrupt;
+    Irq = irq;
+    *Irq = IO8042InterruptStub;
 }
 
 void IO8042::Unregister()
 {
-    *irq = (void (*)(void*)) 0;
-    irq = 0;
+    *Irq = (void (*)())0;
+    Irq = nullptr;
 }
 
-void IO8042::Interrupt(void __attribute((unused)) *frame)
+void IO8042::Interrupt()
 {
-	static IO8042& io8042 = IO8042::GetInstance();
-        *io8042.BufPtr++ = inb(IO8042::Port);
-        outb(0x20,0x20);
+    auto& io8042 = IO8042::GetInstance();
+
+    *io8042.BufPtr++ = inb(Port);
+    outb(0x20, 0x20);
 }
 
-u8 IO8042::get()
+u8 IO8042::Get()
 {
         while (BufPtr == Buf)
                 hlt();
         return *--BufPtr;
+}
+
+extern "C" void IO8042Interrupt()
+{
+    IO8042::Interrupt();
 }
 
 }

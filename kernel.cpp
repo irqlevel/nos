@@ -39,7 +39,7 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
         return;
     }
 
-    Trace(0, "Free memory region %p %p", freeMemStart, freeMemEnd);
+    Trace(0, "Memory region %p %p", freeMemStart, freeMemEnd);
     SPageAllocator::GetInstance(freeMemStart, freeMemEnd);
 
     auto err = Test();
@@ -48,8 +48,8 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
     static IdtDescriptor idt[256];
     Idt idtr;
     idtr.Save(idt, sizeof(idt));
-    auto& kbd = IO8042::GetInstance();
 
+    auto& kbd = IO8042::GetInstance();
     // FIXME: reconfigure 8259 to remap IRQs
     kbd.Register(&idt[9]);
     outb(0x21,0xfd);
@@ -58,9 +58,9 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfo *MbInfo)
 
     auto& term = VgaTerm::GetInstance();
     u8 mod = 0;
-    while(1) {
+    while (1) {
         static char map[0x80] = "__1234567890-=_" "\tqwertyuiop[]\n" "_asdfghjkl;'`" "_\\zxcvbnm,./_" "*_ _";
-        u8 c = kbd.get();
+        u8 c = kbd.Get();
         if (c == 0x2a || c == 0x36) mod = 0x20;
         else if (c == 0xaa || c == 0xb6) mod = 0x00;
         else if (c & 0x80) continue;

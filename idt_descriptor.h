@@ -46,7 +46,9 @@ public:
     IdtDescriptor& operator=(IdtDescriptor&& other);
     IdtDescriptor& operator=(const IdtDescriptor& other);
 
-    IdtDescriptor& operator=(void (*)(void*));
+    IdtDescriptor& operator=(void (*)());
+
+    static void DummyHandler();
 
 private:
     u64 Value;
@@ -61,8 +63,6 @@ private:
     static const u8 FlagGateTrap80286_16 = 0x7;
     static const u8 FlagGateInterrupt80386_32 = 0xE;
     static const u8 FlagGateTrap80386_32 = 0xF;
-
-    static void DummyHandler(void *);
 
 };
 

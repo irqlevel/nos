@@ -2,6 +2,7 @@
 #include "idt_descriptor.h"
 #include "helpers32.h"
 #include "stdlib.h"
+#include "cpu_state.h"
 
 namespace Kernel
 {
@@ -11,7 +12,7 @@ namespace Core
 
 IdtDescriptor::IdtDescriptor()
 {
-    *this = &IdtDescriptor::DummyHandler;
+    *this = DummyInterruptStub;
 }
 
 IdtDescriptor::IdtDescriptor(u64 value)
@@ -42,10 +43,10 @@ IdtDescriptor IdtDescriptor::Encode(u32 offset, u16 selector, u8 type)
 {
 	u64 value = 0;
 
-        value |= (offset & 0xFFFF);
-        value |= selector << 16;
-        value |= ((u64) type) << 40;
-        value |= ((u64) offset >> 16) << 48;
+    value |= (offset & 0xFFFF);
+    value |= selector << 16;
+    value |= ((u64) type) << 40;
+    value |= ((u64) offset >> 16) << 48;
 
 	return IdtDescriptor(value);
 }
@@ -177,19 +178,28 @@ IdtDescriptor& IdtDescriptor::operator=(const IdtDescriptor& other)
     return *this;
 }
 
-IdtDescriptor& IdtDescriptor::operator=(void (*fn)(void*))
+IdtDescriptor& IdtDescriptor::operator=(void (*fn)())
 {
     if (fn)
-        *this = Encode((u32) fn, GdtDescriptor::GdtCode, IdtDescriptor::FlagPresent | IdtDescriptor::FlagGateInterrupt80386_32);
-    else
+    {
+        CpuState cpu;
+
+        cpu.Load();
+        *this = Encode((u32) fn, cpu.GetCs(), IdtDescriptor::FlagPresent | IdtDescriptor::FlagGateInterrupt80386_32);
+    } else
         Value = 0;
 
     return *this;
 }
 
-void IdtDescriptor::DummyHandler(void* __attribute((unused)) frame)
+void IdtDescriptor::DummyHandler()
 {
     outb(0x20, 0x20);
+}
+
+extern "C" void DummyInterrupt()
+{
+    IdtDescriptor::DummyHandler();
 }
 
 }

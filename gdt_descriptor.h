@@ -30,9 +30,6 @@ public:
     GdtDescriptor& operator=(GdtDescriptor&& other);
     GdtDescriptor& operator=(const GdtDescriptor& other);
 
-    static const u16 GdtCode = 0x08;
-    static const u16 GdtData = 0x10;
-
 private:
     u64 Value;
 
