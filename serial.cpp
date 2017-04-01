@@ -35,12 +35,13 @@ void Serial::Wait()
 {
     while (!IsTransmitEmpty())
     {
-        pause_32();
+        hlt();
     }
 }
 
 Serial::~Serial()
 {
+    Wait();
 }
 
 void Serial::WriteString(const char *str)
@@ -72,6 +73,35 @@ void Serial::Printf(const char *fmt, ...)
 	va_start(args, fmt);
 	Vprintf(fmt, args);
 	va_end(args);
+}
+
+void Serial::Register(IdtDescriptor *irq)
+{
+    Irq = irq;
+    *Irq = SerialInterruptStub;
+}
+
+void Serial::Unregister()
+{
+    *Irq = (void (*)())0;
+    Irq = nullptr;
+}
+
+void Serial::OnInterrupt()
+{
+}
+
+void Serial::Interrupt()
+{
+    auto& serial = Serial::GetInstance();
+
+    serial.OnInterrupt();
+    outb(0x20, 0x20);
+}
+
+extern "C" void SerialInterrupt()
+{
+    Serial::Interrupt();
 }
 
 }

@@ -49,6 +49,8 @@ void IO8042InterruptStub();
 
 void DummyInterruptStub();
 
+void SerialInterruptStub();
+
 #ifdef __cplusplus
 }
 #endif

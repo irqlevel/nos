@@ -4,6 +4,7 @@ section .text
 
 extern IO8042Interrupt
 extern DummyInterrupt
+extern SerialInterrupt
 
 global get_cr0_32
 global get_cr1_32
@@ -34,6 +35,7 @@ global disable
 global hlt
 global IO8042InterruptStub
 global DummyInterruptStub
+global SerialInterruptStub
 
 get_cr0_32:
 	mov eax, cr0
@@ -252,5 +254,12 @@ DummyInterruptStub:
 	pushad
 	cld
 	call DummyInterrupt
+	popad
+	iret
+
+SerialInterruptStub:
+	pushad
+	cld
+	call SerialInterrupt
 	popad
 	iret

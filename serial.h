@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "idt_descriptor.h"
 
 namespace Kernel
 {
@@ -26,6 +27,11 @@ public:
     void Vprintf(const char *fmt, va_list args);
     void Printf(const char *fmt, ...);
 
+    void Register(IdtDescriptor *irq);
+    void Unregister();
+
+    static void Interrupt();
+
 private:
     Serial();
     ~Serial();
@@ -35,7 +41,9 @@ private:
     Serial& operator=(const Serial& other) = delete;
     Serial& operator=(Serial&& other) = delete;
 
+    void OnInterrupt();
     bool IsTransmitEmpty();
+    IdtDescriptor *Irq;
 
     static const int Port = 0x3F8;
 };
