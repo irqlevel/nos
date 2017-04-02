@@ -12,26 +12,35 @@ namespace Core
 class MemoryMap final
 {
 public:
-    static MemoryMap& GetInstance(Grub::MultiBootInfo *MbInfo)
+    static MemoryMap& GetInstance()
     {
-        static MemoryMap instance(MbInfo);
+        static MemoryMap instance;
 
         return instance;
     }
     ~MemoryMap();
 
-    bool GetFreeRegion(ulong base, ulong& start, ulong& end);
+    bool AddRegion(u64 addr, u64 len, u32 type);
+
+    bool FindRegion(ulong base, ulong& start, ulong& end);
 
 private:
-    MemoryMap(Grub::MultiBootInfo *MbInfo);
-
-    MemoryMap() = delete;
     MemoryMap(const MemoryMap& other) = delete;
     MemoryMap(MemoryMap&& other) = delete;
     MemoryMap& operator=(const MemoryMap& other) = delete;
     MemoryMap& operator=(MemoryMap&& other) = delete;
 
-    Grub::MultiBootInfo *MbInfoPtr;
+    MemoryMap();
+
+    struct MemoryRegion
+    {
+        u64 Addr;
+        u64 Len;
+        u32 Type;
+    };
+
+    MemoryRegion Region[16];
+    size_t Size;
 };
 
 }

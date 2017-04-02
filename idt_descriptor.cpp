@@ -1,8 +1,7 @@
 #include "gdt_descriptor.h"
 #include "idt_descriptor.h"
-#include "helpers32.h"
 #include "stdlib.h"
-#include "cpu_state.h"
+#include "asm.h"
 
 namespace Kernel
 {
@@ -12,11 +11,13 @@ namespace Core
 
 IdtDescriptor::IdtDescriptor()
     : Value(0)
+    , HighValue(0)
 {
 }
 
 IdtDescriptor::IdtDescriptor(u64 value)
     : Value(value)
+    , HighValue(0)
 {
 }
 
@@ -151,12 +152,15 @@ IdtDescriptor IdtDescriptor::Encode(bool present, bool ss, u8 dpl, u32 offset, u
 IdtDescriptor::IdtDescriptor(IdtDescriptor&& other)
 {
     Value = other.Value;
+    HighValue = other.HighValue;
     other.Value = 0;
+    other.HighValue = 0;
 }
 
 IdtDescriptor::IdtDescriptor(const IdtDescriptor& other)
 {
     Value = other.Value;
+    HighValue = other.HighValue;
 }
 
 IdtDescriptor& IdtDescriptor::operator=(IdtDescriptor&& other)
@@ -164,7 +168,9 @@ IdtDescriptor& IdtDescriptor::operator=(IdtDescriptor&& other)
     if (this != &other)
     {
         Value = other.Value;
+        HighValue = other.HighValue;
         other.Value = 0;
+        other.HighValue = 0;
     }
     return *this;
 }
@@ -174,6 +180,7 @@ IdtDescriptor& IdtDescriptor::operator=(const IdtDescriptor& other)
     if (this != &other)
     {
         Value = other.Value;
+        HighValue = other.HighValue;
     }
     return *this;
 }
@@ -182,10 +189,7 @@ IdtDescriptor IdtDescriptor::Encode(void (*handlerFn)())
 {
     if (handlerFn != nullptr)
     {
-        CpuState cpu;
-
-        cpu.Load();
-        return Encode((u32)handlerFn, cpu.GetCs(),
+        return Encode(reinterpret_cast<u64>(handlerFn), GetCs(),
             IdtDescriptor::FlagPresent | IdtDescriptor::FlagGateInterrupt80386_32);
     }
     else

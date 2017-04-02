@@ -1,4 +1,4 @@
-#include "helpers32.h"
+#include "asm.h"
 #include "stdlib.h"
 #include "idt.h"
 #include "pit.h"
@@ -34,9 +34,9 @@ void Pit::Setup()
     TimeMs = 0;
     TimeMsNs = 0;
 
-    outb(ModePort, 0b00110100); //channel 0, lobyte/hibyte, rate generator
-    outb(Channel0Port, Shared::LowPart(ReloadValue));
-    outb(Channel0Port, Shared::HighPart(ReloadValue));
+    Outb(ModePort, 0b00110100); //channel 0, lobyte/hibyte, rate generator
+    Outb(Channel0Port, Shared::LowPart(ReloadValue));
+    Outb(Channel0Port, Shared::HighPart(ReloadValue));
 }
 
 void Pit::RegisterInterrupt(int intNum)

@@ -1,5 +1,5 @@
 #include "serial.h"
-#include "helpers32.h"
+#include "asm.h"
 #include "stdlib.h"
 #include "idt.h"
 #include "pic.h"
@@ -13,32 +13,32 @@ namespace Core
 Serial::Serial()
     : IntNum(-1)
 {
-    outb(Port + 1, 0x00);    // Disable all interrupts
-    outb(Port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
-    outb(Port + 0, 0x03);    // Set divisor to 3 (lo byte) 38400 baud
-    outb(Port + 1, 0x00);    //                  (hi byte)
-    outb(Port + 3, 0x03);    // 8 bits, no parity, one stop bit
-    outb(Port + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
-    outb(Port + 4, 0x0B);    // IRQs enabled, RTS/DSR set
+    Outb(Port + 1, 0x00);    // Disable all interrupts
+    Outb(Port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
+    Outb(Port + 0, 0x03);    // Set divisor to 3 (lo byte) 38400 baud
+    Outb(Port + 1, 0x00);    //                  (hi byte)
+    Outb(Port + 3, 0x03);    // 8 bits, no parity, one stop bit
+    Outb(Port + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
+    Outb(Port + 4, 0x0B);    // IRQs enabled, RTS/DSR set
 }
 
 void Serial::WriteChar(char c)
 {
     Wait();
 
-    outb(Port, c);
+    Outb(Port, c);
 }
 
 bool Serial::IsTransmitEmpty()
 {
-    return (inb(Port + 5) & 0x20) ? true : false;
+    return (Inb(Port + 5) & 0x20) ? true : false;
 }
 
 void Serial::Wait()
 {
     while (!IsTransmitEmpty())
     {
-        hlt();
+        Hlt();
     }
 }
 

@@ -1,5 +1,5 @@
 #include "idt.h"
-#include "helpers32.h"
+#include "asm.h"
 #include "stdlib.h"
 #include "pic.h"
 
@@ -26,11 +26,11 @@ Idt::~Idt()
 void Idt::Save()
 {
     TableDesc desc = {
-        .Base = (u32) &Entry[0],
+        .Base = reinterpret_cast<u64>(&Entry[0]),
         .Limit = sizeof(Entry),
     };
 
-    put_idt_32(&desc);
+    PutIdt(&desc);
 
     Base = desc.Base;
     Limit = desc.Limit;

@@ -44,7 +44,7 @@ private:
 
     struct TableDesc {
 	    u16 Limit;
-	    u32 Base;
+	    u64 Base;
     } __attribute((packed));
 
     u32 Base;

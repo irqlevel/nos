@@ -1,7 +1,7 @@
 #include "8042.h"
 #include "memory_map.h"
 #include "trace.h"
-#include "helpers32.h"
+#include "asm.h"
 #include "pic.h"
 #include "vga.h"
 
@@ -54,7 +54,7 @@ void IO8042::Interrupt()
 {
     auto& io8042 = IO8042::GetInstance();
 
-    *io8042.BufPtr++ = inb(Port);
+    *io8042.BufPtr++ = Inb(Port);
     Pic::EOI();
 }
 

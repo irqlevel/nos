@@ -1,5 +1,5 @@
 #include "vga.h"
-#include "helpers32.h"
+#include "asm.h"
 #include "stdlib.h"
 
 namespace Kernel
@@ -110,10 +110,10 @@ void VgaTerm::Printf(const char *fmt, ...)
 void VgaTerm::Cursor()
 {
         u16 offset = ((Row % Height) * Width + (Column % Width)) % (Width * Height);
-        outb(VgaBase, VgaIndex + 1);
-        outb(VgaBase + 1, offset & 0xFF);
-        outb(VgaBase, VgaIndex);
-        outb(VgaBase + 1, offset >> 8);
+        Outb(VgaBase, VgaIndex + 1);
+        Outb(VgaBase + 1, offset & 0xFF);
+        Outb(VgaBase, VgaIndex);
+        Outb(VgaBase + 1, offset >> 8);
 }
 
 }

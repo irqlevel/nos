@@ -1,6 +1,6 @@
 #pragma once
 
-#include "helpers32.h"
+#include "asm.h"
 #include "lock.h"
 
 namespace Kernel
@@ -21,22 +21,22 @@ public:
 
 	virtual void Lock() override
 	{
-		spin_lock_lock_32(&RawLock);
+		SpinLockLock(&RawLock);
 	}
 
 	virtual void Unlock() override
 	{
-		spin_lock_unlock_32(&RawLock);
+		SpinLockUnlock(&RawLock);
 	}
 
 	virtual void SharedLock() override
 	{
-		spin_lock_lock_32(&RawLock);
+		SpinLockLock(&RawLock);
 	}
 
 	virtual void SharedUnlock() override
 	{
-		spin_lock_unlock_32(&RawLock);
+		SpinLockUnlock(&RawLock);
 	}
 
 	virtual ~SpinLock()

@@ -17,7 +17,7 @@ struct NewEntry {
 
 const ulong Magic = 0xCBEFCBEF;
 
-void* New(unsigned int size, Shared::Allocator* allocator) noexcept
+void* New(size_t size, Shared::Allocator* allocator) noexcept
 {
 	NewEntry* e;
 
@@ -58,22 +58,22 @@ void Delete(void* ptr) noexcept
 }
 }
 
-void* operator new(unsigned int size, Shared::Allocator& allocator) noexcept
+void* operator new(size_t size, Shared::Allocator& allocator) noexcept
 {
 	return Kernel::Core::New(size, &allocator);
 }
 
-void* operator new[](unsigned int size, Shared::Allocator& allocator) noexcept
+void* operator new[](size_t size, Shared::Allocator& allocator) noexcept
 {
 	return Kernel::Core::New(size, &allocator);
 }
 
-void* operator new(unsigned int size) noexcept
+void* operator new(size_t size) noexcept
 {
 	return Kernel::Core::New(size, nullptr);
 }
 
-void* operator new[](unsigned int size) noexcept
+void* operator new[](size_t size) noexcept
 {
 	return Kernel::Core::New(size, nullptr);
 }

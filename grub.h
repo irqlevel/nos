@@ -1,5 +1,7 @@
 #pragma once
 
+#include "types.h"
+
 namespace Kernel
 {
 
@@ -76,6 +78,71 @@ struct MemoryMap
     unsigned long LengthHigh;
     unsigned long Type;
 };
+
+
+struct MultiBootTag
+{
+    u32 Type;
+    u32 Size;
+};
+
+struct MultiBootInfoHeader
+{
+    u32 TotalSize;
+    u32 Reserved;
+};
+
+struct MultiBootTagString
+{
+    u32 Type;
+    u32 Size;
+    char String[0];
+};
+
+struct MultiBootTagModule
+{
+    u32 Type;
+    u32 Size;
+    u32 ModStart;
+    u32 ModEnd;
+    char CmdLine[0];
+};
+
+struct MultiBootTagBootDev
+{
+    u32 Type;
+    u32 Size;
+    u32 BiosDev;
+    u32 Slice;
+    u32 Part;
+};
+
+struct MultiBootMmapEntry
+{
+    u64 Addr;
+    u64 Len;
+    u32 Type;
+    u32 Zero;
+} __attribute__((packed));
+
+const u32 MultiBootMemoryAvailable = 1;
+const u32 MultiBootMemoryReserved = 2;
+const u32 MultiBootMemoryAcpiReclaimable = 3;
+const u32 MultiBootMemoryNvs = 4;
+
+struct MultiBootTagMmap
+{
+    u32 Type;
+    u32 Size;
+    u32 EntrySize;
+    u32 EntryVersion;
+    MultiBootMmapEntry Entry[0];  
+};
+
+const u32 MultiBootTagTypeEnd = 0;
+const u32 MultiBootTagTypeMmap = 6;
+const u32 MultiBootTagTypeBootDev = 5;
+const u32 MultiBootTagTypeCmdline = 1;
 
 }
 }

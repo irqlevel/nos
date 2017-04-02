@@ -8,72 +8,49 @@ namespace Kernel
 namespace Core
 {
 
-const int MmapLL = 3;
-
-MemoryMap::MemoryMap(Grub::MultiBootInfo *MbInfo)
-    : MbInfoPtr(MbInfo)
+MemoryMap::MemoryMap()
+    : Size(0)
 {
-    Trace(MmapLL, "Mmap: mbInfo %p flags %p bdev %p cmd %p",
-        MbInfoPtr, MbInfoPtr->Flags, MbInfoPtr->BootDevice, MbInfoPtr->CmdLine);
-
-    Grub::MemoryMap* mmap = reinterpret_cast<Grub::MemoryMap*>(MbInfoPtr->MmapAddr);
-	while(reinterpret_cast<void*>(mmap) <
-        Shared::MemAdd(reinterpret_cast<void*>(MbInfoPtr->MmapAddr), MbInfoPtr->MmapLength))
-    {
-        Trace(MmapLL, "Mmap: map %p%p %p%p %p",
-            mmap->BaseAddrHigh, mmap->BaseAddrLow, mmap->LengthHigh, mmap->LengthLow, mmap->Type);
-
-		mmap = static_cast<Kernel::Grub::MemoryMap*>(
-            Shared::MemAdd(mmap, mmap->Size + sizeof(mmap->Size)));
-	}
-
-    Grub::Module* module = reinterpret_cast<Grub::Module*>(MbInfoPtr->ModsAddr);
-    Trace(MmapLL, "Mmap: modsCount %u", MbInfoPtr->ModsCount);
-
-    while (module < (module + MbInfoPtr->ModsCount))
-    {
-        Trace(MmapLL, "Mmap: module %p %p %p", module->ModStart, module->ModEnd, module->String);
-
-        module++;
-    }
 }
 
-bool MemoryMap::GetFreeRegion(ulong base, ulong& start, ulong& end)
+bool MemoryMap::AddRegion(u64 addr, u64 len, u32 type)
 {
-    Grub::MemoryMap* mmap = reinterpret_cast<Grub::MemoryMap*>(MbInfoPtr->MmapAddr);
+    if (Size >= Shared::ArraySize(Region))
+        return false;
 
-    start = end = 0;
-	while(reinterpret_cast<void*>(mmap) <
-        Shared::MemAdd(reinterpret_cast<void*>(MbInfoPtr->MmapAddr), MbInfoPtr->MmapLength))
+    auto& region = Region[Size];
+    region.Addr = addr;
+    region.Len = len;
+    region.Type = type;
+
+    Size++;
+
+    return true;
+}
+
+bool MemoryMap::FindRegion(ulong base, ulong& start, ulong& end)
+{
+    start = 0;
+    end = 0;
+    for (size_t i = 0; i < Size; i++)
     {
-        ulong regionBase, regionLength;
+        auto& region = Region[i];
+        if (region.Type != 1)
+            continue;
 
-        if (mmap->Type != 1)
-            goto nextMap;
+        if (region.Addr + region.Len <= base)
+            continue;
 
-        if (mmap->BaseAddrHigh != 0 || mmap->LengthHigh != 0)
-            goto nextMap;
-
-        if ((mmap->BaseAddrLow + mmap->LengthLow) <= base)
-            goto nextMap;
-
-        if (mmap->BaseAddrLow == 0 || mmap->LengthLow == 0)
-            goto nextMap;
-
-        regionBase = (mmap->BaseAddrLow < base) ? base : mmap->BaseAddrLow;
-        regionLength = (mmap->BaseAddrLow < base) ?
-            (mmap->LengthLow - (base - mmap->BaseAddrLow)) : mmap->LengthLow;
+        ulong regionBase = (region.Addr < base) ? base : region.Addr;
+        ulong regionLength = (region.Addr < base) ?
+            (region.Len - (base - region.Addr)) : region.Len;
 
         if ((end - start) < regionLength)
         {
             start = regionBase;
             end = regionLength;
         }
-
-nextMap:
-		mmap = static_cast<Kernel::Grub::MemoryMap*>(
-            Shared::MemAdd(mmap, mmap->Size + sizeof(mmap->Size)));
-	}
+    }
 
     if (end > start && start != 0)
         return true;

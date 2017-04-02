@@ -50,6 +50,7 @@ public:
 
 private:
     u64 Value;
+    u64 HighValue;
 
     static const u8 FlagPresent = (1 << 7);
     static const u8 FlagDPL0 = 0;

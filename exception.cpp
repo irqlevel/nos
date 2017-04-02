@@ -1,7 +1,7 @@
 #include "exception.h"
 #include "idt.h"
 #include "stdlib.h"
-#include "helpers32.h"
+#include "asm.h"
 #include "panic.h"
 
 namespace Kernel

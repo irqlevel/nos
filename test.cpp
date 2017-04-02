@@ -2,8 +2,6 @@
 #include "btree.h"
 #include "trace.h"
 #include "vector.h"
-#include "gdt.h"
-#include "cpu_state.h"
 
 namespace Kernel
 {
@@ -19,7 +17,7 @@ Shared::Error TestBtree()
 
     Trace(TestLL, "TestBtree: started");
 
-    size_t keyCount = 913;
+    size_t keyCount = 411;
 
     Vector<size_t> pos;
     if (!pos.ReserveAndUse(keyCount))
@@ -181,63 +179,20 @@ Shared::Error TestBtree()
     return MakeError(Shared::Error::Success);
 }
 
-Shared::Error TestGdt()
-{
-    Gdt gdt;
-
-    gdt.Load();
-
-    Trace(TestLL, "Gdt base 0x%p limit 0x%p", (ulong)gdt.GetBase(), (ulong)gdt.GetLimit());
-
-    for (u16 selector = 0; selector < gdt.GetLimit(); selector+= 8)
-    {
-        GdtDescriptor desc = gdt.LoadDescriptor(selector);
-        if (desc.GetValue() == 0)
-            continue;
-
-        Trace(TestLL, "Gdt[0x%p] desc 0x%p limit 0x%p access 0x%p flag 0x%p",
-            (ulong)selector, (ulong)desc.GetBase(), (ulong)desc.GetLimit(),
-            (ulong)desc.GetAccess(), (ulong)desc.GetFlag());
-
-    }
-
-    return MakeError(Shared::Error::Success);
-}
-
-Shared::Error TestCpuState()
-{
-    CpuState cpu;
-
-    cpu.Load();
-
-    Trace(TestLL, "Cpu cr0 0x%p cr1 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
-        cpu.GetCr0(), cpu.GetCr1(), cpu.GetCr2(), cpu.GetCr3(),
-        cpu.GetCr4());
-
-    Trace(TestLL, "Cpu eflags 0x%p sp 0x%p",
-        cpu.GetEflags(), cpu.GetEsp());
-
-    Trace(TestLL, "Cpu ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
-        (ulong)cpu.GetSs(), (ulong)cpu.GetCs(), (ulong)cpu.GetDs(),
-        (ulong)cpu.GetGs(), (ulong)cpu.GetFs(), (ulong)cpu.GetEs());
-
-    return MakeError(Shared::Error::Success);
-}
-
 Shared::Error Test()
 {
+    Shared::Error err;
+
+    int *a = new int;
+    *a = 1;
+    Trace(0, "a = %p", a);
+    delete a;
+
+/*
     auto err = TestBtree();
     if (!err.Ok())
         return err;
-
-    err = TestGdt();
-    if (!err.Ok())
-        return err;
-
-    err = TestCpuState();
-    if (!err.Ok())
-        return err;
-
+*/
     return err;
 }
 

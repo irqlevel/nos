@@ -1,5 +1,5 @@
 #include "debug.h"
-#include "helpers32.h"
+#include "asm.h"
 
 namespace Kernel
 {
@@ -13,7 +13,7 @@ void DebugWait()
     DebugWaitActive = true;
     while (DebugWaitActive)
     {
-        pause_32();
+        Pause();
     }	
 }
 

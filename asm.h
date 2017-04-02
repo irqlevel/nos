@@ -1,5 +1,4 @@
-#ifndef __HELPERS_32_H__
-#define __HELPERS_32_H__
+#pragma once
 
 #include "types.h"
 
@@ -8,42 +7,40 @@ extern "C"
 {
 #endif
 
-ulong get_cr0_32(void);
-ulong get_cr1_32(void);
-ulong get_cr2_32(void);
-ulong get_cr3_32(void);
-ulong get_cr4_32(void);
+ulong GetCr0(void);
+ulong GetCr1(void);
+ulong GetCr2(void);
+ulong GetCr3(void);
+ulong GetCr4(void);
 
-ulong get_esp_32(void);
-ulong get_eip_32(void);
+ulong GetRsp(void);
+ulong GetRip(void);
 
-ulong get_eflags_32(void);
+ulong GetRflags(void);
 
-void pause_32(void);
+void Pause(void);
 
-ulong get_cs_32(void);
-ulong get_ds_32(void);
-ulong get_ss_32(void);
-ulong get_es_32(void);
-ulong get_fs_32(void);
-ulong get_gs_32(void);
+ulong GetCs(void);
+ulong GetDs(void);
+ulong GetSs(void);
+ulong GetEs(void);
+ulong GetFs(void);
+ulong GetGs(void);
 
-void get_idt_32(void *result);
-void put_idt_32(void *result);
-void get_gdt_32(void *result);
+void GetIdt(void *result);
+void PutIdt(void *result);
+void GetGdt(void *result);
 
-ulong check_cpuid_support_32(void);
-ulong check_long_mode_support_32(void);
 
-void spin_lock_lock_32(ulong *lock);
-void spin_lock_unlock_32(ulong *lock);
+void SpinLockLock(ulong *lock);
+void SpinLockUnlock(ulong *lock);
 
-void outb(u16, u8);
-u8 inb(u16);
+void Outb(u16 port, u8 data);
+u8 Inb(u16 port);
 
-void enable(void);
-void disable(void);
-void hlt(void);
+void Enable(void);
+void Disable(void);
+void Hlt(void);
 
 void IO8042InterruptStub();
 void SerialInterruptStub();
@@ -76,6 +73,4 @@ void ExcControlProtectionStub();
 
 #ifdef __cplusplus
 }
-#endif
-
 #endif
