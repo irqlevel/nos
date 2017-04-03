@@ -10,72 +10,29 @@ namespace Kernel
 namespace Core
 {
 
-struct NewEntry {
-	ulong Magic;
-	Shared::Allocator* Allocator;
-};
-
-const ulong Magic = 0xCBEFCBEF;
-
-void* New(size_t size, Shared::Allocator* allocator) noexcept
+void* New(size_t size) noexcept
 {
-	NewEntry* e;
 
-	if (allocator == nullptr)
-	{
-		e = static_cast<NewEntry*>
-				(SAllocator::GetInstance(SPageAllocator::GetInstance()).Alloc(size + sizeof(*e)));
-	}
-	else
-	{
-		e = static_cast<NewEntry*>(allocator->Alloc(size + sizeof(*e)));
-	}
-
-	if (e == nullptr)
-		return nullptr;
-
-	e->Allocator = allocator;
-	e->Magic = Magic;
-
-	return e + 1;
+	return SAllocator::GetInstance(SPageAllocator::GetInstance()).Alloc(size);
 }
 
 void Delete(void* ptr) noexcept
 {
-	auto e = static_cast<NewEntry*>(ptr) - 1;
 
-	if (e->Allocator == nullptr)
-	{
-		SAllocator::GetInstance(SPageAllocator::GetInstance()).Free(e);
-	}
-	else
-	{
-		BugOn(e->Magic != Magic);
-		e->Allocator->Free(e);
-	}
+	SAllocator::GetInstance(SPageAllocator::GetInstance()).Free(ptr);
 }
 
 }
-}
-
-void* operator new(size_t size, Shared::Allocator& allocator) noexcept
-{
-	return Kernel::Core::New(size, &allocator);
-}
-
-void* operator new[](size_t size, Shared::Allocator& allocator) noexcept
-{
-	return Kernel::Core::New(size, &allocator);
 }
 
 void* operator new(size_t size) noexcept
 {
-	return Kernel::Core::New(size, nullptr);
+	return Kernel::Core::New(size);
 }
 
 void* operator new[](size_t size) noexcept
 {
-	return Kernel::Core::New(size, nullptr);
+	return Kernel::Core::New(size);
 }
 
 void operator delete(void* ptr) noexcept

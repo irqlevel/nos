@@ -17,26 +17,27 @@ public:
 	SpinLock()
 		: RawLock(0)
 	{
+		(void)RawLock;
 	}
 
 	virtual void Lock() override
 	{
-		SpinLockLock(&RawLock);
+		//SpinLockLock(&RawLock);
 	}
 
 	virtual void Unlock() override
 	{
-		SpinLockUnlock(&RawLock);
+		//SpinLockUnlock(&RawLock);
 	}
 
 	virtual void SharedLock() override
 	{
-		SpinLockLock(&RawLock);
+		//SpinLockLock(&RawLock);
 	}
 
 	virtual void SharedUnlock() override
 	{
-		SpinLockUnlock(&RawLock);
+		//SpinLockUnlock(&RawLock);
 	}
 
 	virtual ~SpinLock()

@@ -16,7 +16,7 @@ public:
     SPool();
     virtual ~SPool();
 
-    void Reset(size_t size, PageAllocator* pageAllocator = nullptr);
+    void Setup(size_t size, PageAllocator* pageAllocator = nullptr);
     void* Alloc();
     void Free(void *ptr);
 

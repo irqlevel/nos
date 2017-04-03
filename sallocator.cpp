@@ -15,7 +15,7 @@ SAllocator::SAllocator(PageAllocator& pageAllocator)
 {
 	for (size_t i = 0; i < Shared::ArraySize(Pool); i++)
 	{
-		Pool[i].Reset(static_cast<size_t>(1) << (StartLog + i), &PageAllocer);
+		Pool[i].Setup(static_cast<size_t>(1) << (StartLog + i), &PageAllocer);
 	}
 }
 
@@ -25,63 +25,50 @@ SAllocator::~SAllocator()
 
 size_t SAllocator::Log2(size_t size)
 {
-	size_t log = 0;
+	size_t log;
 
-	while (size != 0)
+	if (size <= 16)
 	{
-		size >>= 1;
-		log++;
+		log = 4;
 	}
+	else
+	{
+		log = 0;
+		while (size != 0)
+		{
+			size >>= 1;
+			log++;
+		}
+	}
+
+	BugOn((static_cast<size_t>(1) << log) < size);
 
 	return log;
 }
 
-bool SAllocator::LogBySize(size_t size, size_t& log)
-{
-	Header *header;
-	size_t reqSize = size + sizeof(*header);
-	size_t candLog = Log2(reqSize);
-	if ((static_cast<size_t>(1) << candLog) < reqSize)
-	{
-		return false;
-	}
-
-	if (candLog > EndLog)
-	{
-		return false;
-	}
-
-	if (candLog < StartLog)
-		candLog = StartLog;
-
-	log = candLog;
-	return true;
-}
-
 void* SAllocator::Alloc(size_t size)
 {
-	if (size == 0 || size > PAGE_SIZE)
+	if (size == 0 || size > Shared::PageSize)
 	{
 		return nullptr;
 	}
 
-	if (size == PAGE_SIZE)
+	Header* header;
+	size_t reqSize = (size + sizeof(*header));
+	if (reqSize >= (Shared::PageSize / 2))
 	{
 		return PageAllocer.Alloc();
 	}
 
-	size_t log;
-	if (!LogBySize(size, log))
-	{
-		if (size < PAGE_SIZE)
-		{
-			return PageAllocer.Alloc();
-		}
+	size_t log = Log2(reqSize);
 
+	Trace(0, "0x%p size 0x%p log 0x%p", this, size, log);
+	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Shared::ArraySize(Pool)))
+	{
 		return nullptr;
 	}
 
-	Header* header = static_cast<Header*>(Pool[log].Alloc());
+	header = static_cast<Header*>(Pool[log - StartLog].Alloc());
 	if (header == nullptr)
 	{
 		return nullptr;
@@ -96,7 +83,7 @@ void SAllocator::Free(void* ptr)
 {
 	BugOn(ptr == nullptr);
 
-	if ((reinterpret_cast<ulong>(ptr) & (PAGE_SIZE - 1)) == 0)
+	if ((reinterpret_cast<ulong>(ptr) & (Shared::PageSize - 1)) == 0)
 	{
 		PageAllocer.Free(ptr);
 		return;
@@ -109,14 +96,13 @@ void SAllocator::Free(void* ptr)
 		return;
 	}
 
-	size_t log;
-	if (!LogBySize(header->Size, log))
+	size_t log = Log2(header->Size + sizeof(*header));
+	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Shared::ArraySize(Pool)))
 	{
-		Panic("Invalid header");
 		return;
 	}
 
-	Pool[log].Free(header);
+	Pool[log - StartLog].Free(header);
 }
 
 }

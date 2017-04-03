@@ -117,6 +117,7 @@ public:
     }
 
     Vector(Vector&& other)
+        : Vector()
     {
         Arr = other.Arr;
         Size = other.Size;
@@ -139,11 +140,12 @@ public:
     }
 
     Vector(const Vector& other, Shared::Error& err)
+        : Vector()
     {
         if (!err.Ok())
             return;
 
-        T* Arr = new T[other.Capacity];
+        Arr = new T[other.Capacity];
         if (!Arr)
         {
             err = MakeError(Shared::Error::NoMemory);

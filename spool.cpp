@@ -3,6 +3,7 @@
 #include "stdlib.h"
 #include "const.h"
 #include "panic.h"
+#include "trace.h"
 
 namespace Kernel
 {
@@ -12,6 +13,7 @@ namespace Core
 
 SPool::SPool()
     : Usage(0)
+    , Size(0)
 {
     BlockList.Init();
     PageList.Init();
@@ -20,11 +22,13 @@ SPool::SPool()
 SPool::~SPool()
 {
     BugOn(Usage != 0);
-    Reset(0);
+    Setup(0);
 }
 
-void SPool::Reset(size_t size, PageAllocator* pageAllocator)
+void SPool::Setup(size_t size, PageAllocator* pageAllocator)
 {
+    Trace(0, "0x%p setup size 0x%p", this, size);
+
     Shared::AutoLock lock(Lock);
 
     while (!BlockList.IsEmpty())
@@ -44,7 +48,7 @@ void SPool::Reset(size_t size, PageAllocator* pageAllocator)
 
 bool SPool::CheckSize(size_t size)
 {
-    if (size == 0 || size >= PAGE_SIZE)
+    if (size == 0 || size >= Shared::PageSize)
         return false;
 
     return true;
@@ -52,6 +56,8 @@ bool SPool::CheckSize(size_t size)
 
 void* SPool::Alloc()
 {
+    Trace(0, "0x%p alloc block size 0x%p", this, Size);
+
     Shared::AutoLock lock(Lock);
 
     if (!CheckSize(Size))
@@ -70,7 +76,7 @@ void* SPool::Alloc()
         PageList.InsertTail(&page->Link);
 
         ListEntry* block = reinterpret_cast<ListEntry*>(&page->Data[0]);
-        while (Shared::MemAdd(block, Size) <= Shared::MemAdd(page, PAGE_SIZE))
+        while (Shared::MemAdd(block, Size) <= Shared::MemAdd(page, Shared::PageSize))
         {
             BlockList.InsertTail(block);
             block = static_cast<ListEntry*>(Shared::MemAdd(block, Size));
@@ -78,12 +84,17 @@ void* SPool::Alloc()
     }
 
     Usage++;
-    return BlockList.RemoveHead();
+    void* block = BlockList.RemoveHead();
+    Trace(0, "0x%p alloc block %p", this, block);
+
+    return block;
 }
 
 void SPool::Free(void* ptr)
 {
     Shared::AutoLock lock(Lock);
+
+    Trace(0, "Free block %p", ptr);
 
     if (ptr == nullptr)
     {

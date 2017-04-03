@@ -10,7 +10,10 @@ CPP_SRC = icxxabi.cpp list_entry.cpp new.cpp sallocator.cpp spage_allocator.cpp 
 	trace.cpp stdlib.cpp panic.cpp debug.cpp error.cpp atomic.cpp 8042.cpp idt_descriptor.cpp idt.cpp \
 	memory_map.cpp test.cpp serial.cpp pic.cpp exception.cpp pit.cpp timer.cpp
 
-all: nos.iso
+all: check nos.iso
+
+check: $(CPP_SRC)
+	cppcheck --error-exitcode=22 -q . || exit 1
 
 nos.iso: kernel64.elf
 	rm -rf iso

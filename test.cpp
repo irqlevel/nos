@@ -2,6 +2,8 @@
 #include "btree.h"
 #include "trace.h"
 #include "vector.h"
+#include "debug.h"
+#include "const.h"
 
 namespace Kernel
 {
@@ -17,7 +19,7 @@ Shared::Error TestBtree()
 
     Trace(TestLL, "TestBtree: started");
 
-    size_t keyCount = 411;
+    size_t keyCount = 431;
 
     Vector<size_t> pos;
     if (!pos.ReserveAndUse(keyCount))
@@ -179,20 +181,39 @@ Shared::Error TestBtree()
     return MakeError(Shared::Error::Success);
 }
 
+Shared::Error TestAllocator()
+{
+    Shared::Error err;
+
+    for (size_t size = 1; size <= Shared::PageSize; size++)
+    {
+        u8 *block = new u8[size];
+        if (block == nullptr)
+        {
+            return Shared::Error::NoMemory;
+        }
+
+        block[0] = 1;
+        block[size / 2] = 1;
+        block[size - 1] = 1;
+        delete [] block;
+    }
+
+    return Shared::Error::Success;
+}
+
 Shared::Error Test()
 {
     Shared::Error err;
 
-    int *a = new int;
-    *a = 1;
-    Trace(0, "a = %p", a);
-    delete a;
-
-/*
-    auto err = TestBtree();
+    err = TestAllocator();
     if (!err.Ok())
         return err;
-*/
+
+    err = TestBtree();
+    if (!err.Ok())
+        return err;
+
     return err;
 }
 

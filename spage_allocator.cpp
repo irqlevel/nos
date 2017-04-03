@@ -20,14 +20,14 @@ SPageAllocator::SPageAllocator(ulong pageStart, ulong pageEnd)
     PageList.Init();
 
     if (PageStart == 0 || PageEnd <= PageStart ||
-        (PageStart & (PAGE_SIZE - 1)) ||
-        (PageEnd & (PAGE_SIZE - 1)))
+        (PageStart & (Shared::PageSize - 1)) ||
+        (PageEnd & (Shared::PageSize - 1)))
     {
         Panic("Invalid page start/end");
         return;
     }
 
-    for (ulong page = PageStart; page < PageEnd; page+= PAGE_SIZE)
+    for (ulong page = PageStart; page < PageEnd; page+= Shared::PageSize)
     {
         ListEntry* pageLink = reinterpret_cast<ListEntry*>(page);
         PageList.InsertTail(pageLink);
@@ -49,18 +49,22 @@ void* SPageAllocator::Alloc()
     }
 
     Usage++;
-    return PageList.RemoveHead();
+    void* page = PageList.RemoveHead();
+    Trace(0, "Alloc page %p", page);
+    return page;
 }
 
 void SPageAllocator::Free(void* page)
 {
     Shared::AutoLock lock(Lock);
 
+    Trace(0, "Free page %p", page);
+
     BugOn(page == nullptr);
 
 	ulong pageAddr = reinterpret_cast<ulong>(page);
 
-	if (pageAddr & (PAGE_SIZE - 1)) {
+	if (pageAddr & (Shared::PageSize - 1)) {
 		Panic("pageAddr unaligned");
 		return;
 	}

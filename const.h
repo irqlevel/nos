@@ -1,6 +1,7 @@
-#ifndef __CONST_H__
-#define __CONST_H__
+#pragma once
 
-#define PAGE_SIZE 4096
-
-#endif
+namespace Shared
+{
+    const size_t PageSize = 4096;
+    const size_t PageShift = 12;
+};

@@ -6,6 +6,7 @@
 
 #include "spin_lock.h"
 #include "spool.h"
+#include "const.h"
 
 namespace Kernel
 {
@@ -33,18 +34,18 @@ private:
 	SAllocator& operator=(const SAllocator& other) = delete;
 	SAllocator& operator=(SAllocator&& other) = delete;
 
-	static const int StartLog = 3;
-	static const int EndLog = 11;
-
-	static const ulong Magic = 0xCBDECBDE;
+	static const u32 Magic = 0xCBDECBDE;
 
 	size_t Log2(size_t size);
 	bool LogBySize(size_t size, size_t& log);
 
 	struct Header {
-		ulong Magic;
-		ulong Size;
+		u32 Magic;
+		u32 Size;
 	};
+
+	static const size_t StartLog = 3;
+	static const size_t EndLog = Shared::PageShift - 1;
 
 	SPool Pool[EndLog - StartLog + 1];
 	PageAllocator& PageAllocer;

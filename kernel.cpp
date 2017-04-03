@@ -86,7 +86,6 @@ void DumpCpuState()
     Trace(0, "Cpu rflags 0x%p rsp 0x%p rip 0x%p",
         GetRflags(), GetRsp(), GetRip());
 
-
     Trace(0, "Cpu ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
         (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
@@ -115,9 +114,12 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     Trace(0, "Memory region %p %p", memStart, memEnd);
     SPageAllocator::GetInstance(memStart, memEnd);
 
+    VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
+
     auto err = Test();
     TraceError(err);
 
+    VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
 
     auto& idt = Idt::GetInstance();
 
@@ -135,11 +137,14 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     pit.Setup();
     Enable();
 
+    VgaTerm::GetInstance().Printf("Idle looping...\n");
+
     for (;;)
     {
         Hlt();
     }
 
     Trace(0, "Exit");
+
     VgaTerm::GetInstance().Printf("Bye!\n");
 }
