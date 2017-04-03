@@ -1,6 +1,8 @@
 #pragma once
 
 #include "types.h"
+#include "ring_buffer.h"
+#include "spin_lock.h"
 
 namespace Kernel
 {
@@ -19,7 +21,6 @@ public:
     }
 
     void WriteChar(char c);
-    void Wait();
 
     void WriteString(const char *str);
 
@@ -35,6 +36,9 @@ private:
     Serial();
     ~Serial();
 
+    void Send();
+    void Wait(size_t pauseCount);
+
     Serial(const Serial& other) = delete;
     Serial(Serial&& other) = delete;
     Serial& operator=(const Serial& other) = delete;
@@ -43,6 +47,9 @@ private:
     void OnInterrupt();
     bool IsTransmitEmpty();
     int IntNum;
+
+    RingBuffer<char, Shared::PageSize> Buf;
+    SpinLock Lock;
 
     static const int Port = 0x3F8;
 };

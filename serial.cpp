@@ -15,18 +15,49 @@ Serial::Serial()
 {
     Outb(Port + 1, 0x00);    // Disable all interrupts
     Outb(Port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
-    Outb(Port + 0, 0x03);    // Set divisor to 3 (lo byte) 38400 baud
+    Outb(Port + 0, 0x01);    // Set divisor to 1 (lo byte) 115200 baud
     Outb(Port + 1, 0x00);    //                  (hi byte)
     Outb(Port + 3, 0x03);    // 8 bits, no parity, one stop bit
     Outb(Port + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
     Outb(Port + 4, 0x0B);    // IRQs enabled, RTS/DSR set
 }
 
+void Serial::Send()
+{
+    while (!Buf.IsEmpty() && IsTransmitEmpty())
+    {
+        Outb(Port, Buf.Get());
+    }
+}
+
+void Serial::Wait(size_t pauseCount)
+{
+    for (size_t i = 0; i < pauseCount; i++)
+    {
+        if (IsTransmitEmpty())
+            break;
+
+        Pause();
+    }
+}
+
 void Serial::WriteChar(char c)
 {
-    Wait();
+    Shared::AutoLock lock(Lock);
+    size_t pauseCount = 1;
 
-    Outb(Port, c);
+again:
+    if (Buf.IsFull())
+        Send();
+
+    if (!Buf.Put(c))
+    {
+        Wait(pauseCount);
+        pauseCount *= 2;
+        goto again;
+    }
+
+    Send();
 }
 
 bool Serial::IsTransmitEmpty()
@@ -34,17 +65,8 @@ bool Serial::IsTransmitEmpty()
     return (Inb(Port + 5) & 0x20) ? true : false;
 }
 
-void Serial::Wait()
-{
-    while (!IsTransmitEmpty())
-    {
-        Hlt();
-    }
-}
-
 Serial::~Serial()
 {
-    Wait();
 }
 
 void Serial::WriteString(const char *str)
@@ -99,6 +121,8 @@ void Serial::UnregisterInterrupt()
 
 void Serial::OnInterrupt()
 {
+    Shared::AutoLock lock(Lock);
+    Send();
 }
 
 void Serial::Interrupt()
