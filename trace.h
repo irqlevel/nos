@@ -17,6 +17,7 @@ const int SharedPtrLL = 5;
 const int BtreeLL = 6;
 const int KbdLL = 3;
 const int ExcLL = 0;
+const int AcpiLL = 0;
 
 class Tracer
 {
