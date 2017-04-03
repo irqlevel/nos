@@ -3,7 +3,8 @@
 #include "trace.h"
 #include "vector.h"
 #include "debug.h"
-#include "const.h"
+#include "stdlib.h"
+#include "ring_buffer.h"
 
 namespace Kernel
 {
@@ -199,7 +200,44 @@ Shared::Error TestAllocator()
         delete [] block;
     }
 
-    return Shared::Error::Success;
+    return MakeError(Shared::Error::Success);
+}
+
+Shared::Error TestRingBuffer()
+{
+    RingBuffer<u8, 3> rb;
+
+    if (!rb.Put(0x1))
+        return MakeError(Shared::Error::Unsuccessful);
+
+    if (!rb.Put(0x2))
+        return MakeError(Shared::Error::Unsuccessful);
+
+    if (!rb.Put(0x3))
+        return MakeError(Shared::Error::Unsuccessful);
+
+    if (rb.Put(0x4))
+        return MakeError(Shared::Error::Unsuccessful);
+
+    if (!rb.IsFull())
+        return MakeError(Shared::Error::Unsuccessful);
+
+    if (rb.IsEmpty())
+        return MakeError(Shared::Error::Unsuccessful);    
+
+    if (rb.Get() != 0x1)
+        return MakeError(Shared::Error::Unsuccessful);
+
+    if (rb.Get() != 0x2)
+        return MakeError(Shared::Error::Unsuccessful);
+
+    if (rb.Get() != 0x3)
+        return MakeError(Shared::Error::Unsuccessful);
+
+    if (!rb.IsEmpty())
+        return MakeError(Shared::Error::Unsuccessful);
+   
+    return MakeError(Shared::Error::Success);
 }
 
 Shared::Error Test()
@@ -211,6 +249,10 @@ Shared::Error Test()
         return err;
 
     err = TestBtree();
+    if (!err.Ok())
+        return err;
+
+    err = TestRingBuffer();
     if (!err.Ok())
         return err;
 

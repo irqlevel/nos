@@ -12,15 +12,12 @@ namespace Core
 {
 
 IO8042::IO8042()
-    : Buf(new u8[BufSize])
-    , BufPtr(Buf)
-    , IntNum(-1)
+    : IntNum(-1)
 {
 }
 
 IO8042::~IO8042()
 {
-    delete[] Buf;
 }
 
 void IO8042::RegisterInterrupt(int intNum)
@@ -54,18 +51,18 @@ void IO8042::Interrupt()
 {
     auto& io8042 = IO8042::GetInstance();
 
-    *io8042.BufPtr++ = Inb(Port);
+    io8042.Put(Inb(Port));
     Pic::EOI();
 }
 
-bool IO8042::IsEmpty()
+bool IO8042::Put(u8 code)
 {
-    return (BufPtr == Buf) ? true : false;
+    return Buf.Put(code);
 }
 
 u8 IO8042::Get()
 {
-    return *--BufPtr;
+    return Buf.Get();
 }
 
 void IO8042::OnTick(TimerCallback& callback)
@@ -74,10 +71,10 @@ void IO8042::OnTick(TimerCallback& callback)
 
     auto& term = VgaTerm::GetInstance();
     u8 mod = 0;
-    while (!IsEmpty())
+    while (!Buf.IsEmpty())
     {
         static char map[0x80] = "__1234567890-=_" "\tqwertyuiop[]\n" "_asdfghjkl;'`" "_\\zxcvbnm,./_" "*_ _";
-        u8 code = Get();
+        u8 code = Buf.Get();
 
         Trace(0, "Kbd: code 0x%p", (ulong)code);
 

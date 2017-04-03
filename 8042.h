@@ -3,6 +3,8 @@
 #include "types.h"
 #include "idt.h"
 #include "timer.h"
+#include "ring_buffer.h"
+#include "spin_lock.h"
 
 namespace Kernel
 {
@@ -22,7 +24,7 @@ public:
     void RegisterInterrupt(int intNum);
     void UnregisterInterrupt();
 
-    bool IsEmpty();
+    bool Put(u8 code);
     u8 Get();
 
     static void Interrupt();
@@ -40,9 +42,7 @@ private:
 
     static const ulong Port = 0x60;
 
-    const ulong BufSize = 16;
-    volatile u8 *Buf;
-    volatile u8 *BufPtr;
+    RingBuffer<u8, 16, SpinLock> Buf;
     int IntNum;
 };
 
