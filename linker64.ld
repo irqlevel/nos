@@ -2,7 +2,7 @@ ENTRY(_start)
 
 SECTIONS
 {
-	. = 0x1100000;
+	. = 0x1000000;
 
 	.multiboot : {
 		*(.multiboot)

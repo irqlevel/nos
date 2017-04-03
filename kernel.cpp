@@ -100,13 +100,21 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     auto& mmap = MemoryMap::GetInstance();
 
     ulong memStart, memEnd;
+
+    //Kernel is loaded at 0x1000000 (see linke64.ld), so
+    //assume 0x2000000 is high enough to use
     if (!mmap.FindRegion(0x2000000, memStart, memEnd))
     {
         Panic("Can't get available memory region");
         return;
     }
 
-    Trace(0, "Memory region %p %p", memStart, memEnd);
+    //boot64.asm only setup paging for first 0x40000000 bytes(1GB)
+    //so do not overflow it
+    if (memEnd > 0x40000000)
+        memEnd = 0x40000000;
+
+    Trace(0, "Memory region 0x%p 0x%p", memStart, memEnd);
     SPageAllocator::GetInstance(memStart, memEnd);
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
