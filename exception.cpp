@@ -3,6 +3,7 @@
 #include "stdlib.h"
 #include "asm.h"
 #include "panic.h"
+#include "trace.h"
 
 namespace Kernel
 {
@@ -114,111 +115,155 @@ void ExceptionTable::RegisterInterrupts()
 void ExceptionTable::ExcDivideByZero()
 {
     ExcDivideByZeroCounter.Inc();
+
+    Trace(0, "EXC: DivideByZero");
 }
 
 void ExceptionTable::ExcDebugger()
 {
     ExcDebuggerCounter.Inc();
+
+    Trace(0, "EXC: Debugger");
 }
 
 void ExceptionTable::ExcNMI()
 {
     ExcNMICounter.Inc();
+
+    Trace(0, "EXC: NMI");
 }
 
 void ExceptionTable::ExcBreakpoint()
 {
     ExcBreakpointCounter.Inc();
+
+    Trace(0, "EXC: Breakpoint");
 }
 
 void ExceptionTable::ExcOverflow()
 {
     ExcOverflowCounter.Inc();
+
+    Trace(0, "EXC: Overflow");
 }
 
 void ExceptionTable::ExcBounds()
 {
     ExcBoundsCounter.Inc();
+
+    Trace(0, "EXC: Bounds");
 }
 
 void ExceptionTable::ExcInvalidOpcode()
 {
     ExcInvalidOpcodeCounter.Inc();
+
+    Trace(0, "EXC: InvalidOpCode");
 }
 
 void ExceptionTable::ExcCoprocessorNotAvailable()
 {
     ExcCoprocessorNotAvailableCounter.Inc();
+
+    Trace(0, "EXC: CoprocessorNotAvailable");
 }
 
 void ExceptionTable::ExcDoubleFault()
 {
     ExcDoubleFaultCounter.Inc();
+
+    Trace(0, "EXC: DoubleFault");
 }
 
 void ExceptionTable::ExcCoprocessorSegmentOverrun()
 {
     ExcCoprocessorSegmentOverrunCounter.Inc();
+
+    Trace(0, "EXC: CoprocessorSegmentOverrun");
 }
 
 void ExceptionTable::ExcInvalidTaskStateSegment()
 {
     ExcInvalidTaskStateSegmentCounter.Inc();
+
+    Trace(0, "EXC: InvalidTaskStateSegment");
 }
 
 void ExceptionTable::ExcSegmentNotPresent()
 {
     ExcSegmentNotPresentCounter.Inc();
+
+    Trace(0, "EXC: SegmentNotPresent");
 }
 
 void ExceptionTable::ExcStackFault()
 {
     ExcStackFaultCounter.Inc();
+
+    Trace(0, "EXC: StackFault");
 }
 
 void ExceptionTable::ExcGeneralProtectionFault()
 {
     ExcGeneralProtectionFaultCounter.Inc();
+
+    Trace(0, "EXC: GeneralProtectionFault");
 }
 
 void ExceptionTable::ExcPageFault()
 {
     ExcPageFaultCounter.Inc();
+
+    Trace(0, "EXC: PageFault");
 }
 
 void ExceptionTable::ExcReserved()
 {
     ExcReservedCounter.Inc();
+
+    Trace(0, "EXC: Reserved");
 }
 
 void ExceptionTable::ExcMathFault()
 {
     ExcMathFaultCounter.Inc();
+
+    Trace(0, "EXC: MathFault");
 }
 
 void ExceptionTable::ExcAlignmentCheck()
 {
     ExcAlignmentCheckCounter.Inc();
+
+    Trace(0, "EXC: AlignmentCheck");
 }
 
 void ExceptionTable::ExcMachineCheck()
 {
     ExcMachineCheckCounter.Inc();
+
+    Trace(0, "EXC: MachineCheck");
 }
 
 void ExceptionTable::ExcSIMDFpException()
 {
     ExcSIMDFpExceptionCounter.Inc();
+
+    Trace(0, "EXC: SIMDFpException");
 }
 
 void ExceptionTable::ExcVirtException()
 {
     ExcVirtExceptionCounter.Inc();
+
+    Trace(0, "EXC: VirtException");
 }
 
 void ExceptionTable::ExcControlProtection()
 {
     ExcControlProtectionCounter.Inc();
+
+    Trace(0, "EXC: ControlProtection");
 }
 
 extern "C" void ExcDivideByZero()
