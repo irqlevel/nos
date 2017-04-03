@@ -4,16 +4,10 @@
 #include "new.h"
 #include "panic.h"
 #include "debug.h"
-#include "unique_ptr.h"
-#include "sallocator.h"
 #include "spage_allocator.h"
 #include "atomic.h"
-#include "shared_ptr.h"
-#include "btree.h"
 #include "error.h"
-#include "vector.h"
 #include "idt.h"
-#include "idt_descriptor.h"
 #include "grub.h"
 #include "test.h"
 #include "stdlib.h"
@@ -23,6 +17,7 @@
 #include "exception.h"
 #include "pit.h"
 #include "asm.h"
+#include "acpi.h"
 
 using namespace Kernel::Core;
 using namespace Shared;
@@ -115,6 +110,9 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     SPageAllocator::GetInstance(memStart, memEnd);
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
+
+    auto& acpi = Acpi::GetInstance();
+    Trace(0, "Acpi RSDP 0x%p", acpi.GetRSDP());
 
     auto err = Test();
     TraceError(err);
