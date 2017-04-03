@@ -48,7 +48,7 @@ Shared::Error TestBtree()
 
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 
@@ -56,13 +56,13 @@ Shared::Error TestBtree()
     {
         if (!tree.Insert(key[pos[i]], value[pos[i]]))
         {
-            Trace(0, "TestBtree: cant insert key %llu", key[pos[i]]);
+            Trace(TestLL, "TestBtree: cant insert key %llu", key[pos[i]]);
             return MakeError(Shared::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 
@@ -72,19 +72,19 @@ Shared::Error TestBtree()
         auto foundValue = tree.Lookup(key[pos[i]], exist);
         if (!exist)
         {
-            Trace(0, "TestBtree: cant find key");
+            Trace(TestLL, "TestBtree: cant find key");
             return MakeError(Shared::Error::Unsuccessful);
         }
 
         if (foundValue != value[pos[i]])
         {
-            Trace(0, "TestBtree: unexpected found value");
+            Trace(TestLL, "TestBtree: unexpected found value");
             return MakeError(Shared::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 
@@ -92,13 +92,13 @@ Shared::Error TestBtree()
     {
         if (!tree.Delete(key[pos[i]]))
         {
-            Trace(0, "TestBtree: cant delete key[%lu][%lu]=%llu", i, pos[i], key[pos[i]]);
+            Trace(TestLL, "TestBtree: cant delete key[%lu][%lu]=%llu", i, pos[i], key[pos[i]]);
             return MakeError(Shared::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 
@@ -108,19 +108,19 @@ Shared::Error TestBtree()
         auto foundValue = tree.Lookup(key[pos[i]], exist);
         if (!exist)
         {
-            Trace(0, "TestBtree: cant find key");
+            Trace(TestLL, "TestBtree: cant find key");
             return MakeError(Shared::Error::Unsuccessful);
         }
 
         if (foundValue != value[pos[i]])
         {
-            Trace(0, "TestBtree: unexpected found value");
+            Trace(TestLL, "TestBtree: unexpected found value");
             return MakeError(Shared::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 
@@ -128,13 +128,13 @@ Shared::Error TestBtree()
     {
         if (!tree.Delete(key[pos[i]]))
         {
-            Trace(0, "TestBtree: cant delete key");
+            Trace(TestLL, "TestBtree: cant delete key");
             return MakeError(Shared::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 
@@ -144,13 +144,13 @@ Shared::Error TestBtree()
         tree.Lookup(key[pos[i]], exist);
         if (exist)
         {
-            Trace(0, "TestBtree: key still exist");
+            Trace(TestLL, "TestBtree: key still exist");
             return MakeError(Shared::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 
@@ -158,13 +158,13 @@ Shared::Error TestBtree()
     {
         if (!tree.Insert(key[pos[i]], value[pos[i]]))
         {
-            Trace(0, "TestBtree: can't insert key'");
+            Trace(TestLL, "TestBtree: can't insert key'");
             return MakeError(Shared::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 
@@ -173,7 +173,7 @@ Shared::Error TestBtree()
     tree.Clear();
     if (!tree.Check())
     {
-        Trace(0, "TestBtree: check failed");
+        Trace(TestLL, "TestBtree: check failed");
         return MakeError(Shared::Error::Unsuccessful);
     }
 

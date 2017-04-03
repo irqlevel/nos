@@ -12,8 +12,6 @@ namespace Kernel
 namespace Core
 {
 
-const int BtreeLL = 254;
-
 template<typename K, typename V, size_t T, typename LockType = Shared::NopLock>
 class Btree
 {

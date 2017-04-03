@@ -27,7 +27,7 @@ SPool::~SPool()
 
 void SPool::Setup(size_t size, PageAllocator* pageAllocator)
 {
-    Trace(0, "0x%p setup size 0x%p", this, size);
+    Trace(SPoolLL, "0x%p setup size 0x%p", this, size);
 
     Shared::AutoLock lock(Lock);
 
@@ -56,7 +56,7 @@ bool SPool::CheckSize(size_t size)
 
 void* SPool::Alloc()
 {
-    Trace(0, "0x%p alloc block size 0x%p", this, Size);
+    Trace(SPoolLL, "0x%p alloc block size 0x%p", this, Size);
 
     Shared::AutoLock lock(Lock);
 
@@ -85,7 +85,7 @@ void* SPool::Alloc()
 
     Usage++;
     void* block = BlockList.RemoveHead();
-    Trace(0, "0x%p alloc block %p", this, block);
+    Trace(SPoolLL, "0x%p alloc block %p", this, block);
 
     return block;
 }
@@ -94,7 +94,7 @@ void SPool::Free(void* ptr)
 {
     Shared::AutoLock lock(Lock);
 
-    Trace(0, "Free block %p", ptr);
+    Trace(SPoolLL, "Free block %p", ptr);
 
     if (ptr == nullptr)
     {

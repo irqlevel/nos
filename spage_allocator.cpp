@@ -50,7 +50,7 @@ void* SPageAllocator::Alloc()
 
     Usage++;
     void* page = PageList.RemoveHead();
-    Trace(0, "Alloc page %p", page);
+    Trace(SPageAllocatorLL, "Alloc page %p", page);
     return page;
 }
 
@@ -58,7 +58,7 @@ void SPageAllocator::Free(void* page)
 {
     Shared::AutoLock lock(Lock);
 
-    Trace(0, "Free page %p", page);
+    Trace(SPageAllocatorLL, "Free page %p", page);
 
     BugOn(page == nullptr);
 

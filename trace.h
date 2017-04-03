@@ -10,6 +10,14 @@ namespace Kernel
 namespace Core
 {
 
+const int SPageAllocatorLL = 4;
+const int SAllocatorLL = 4;
+const int SPoolLL = 4;
+const int SharedPtrLL = 5;
+const int BtreeLL = 6;
+const int KbdLL = 3;
+const int ExcLL = 0;
+
 class Tracer
 {
 public:

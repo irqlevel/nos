@@ -62,7 +62,7 @@ void* SAllocator::Alloc(size_t size)
 
 	size_t log = Log2(reqSize);
 
-	Trace(0, "0x%p size 0x%p log 0x%p", this, size, log);
+	Trace(SAllocatorLL, "0x%p size 0x%p log 0x%p", this, size, log);
 	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Shared::ArraySize(Pool)))
 	{
 		return nullptr;

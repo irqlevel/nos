@@ -76,7 +76,7 @@ void IO8042::OnTick(TimerCallback& callback)
         static char map[0x80] = "__1234567890-=_" "\tqwertyuiop[]\n" "_asdfghjkl;'`" "_\\zxcvbnm,./_" "*_ _";
         u8 code = Buf.Get();
 
-        Trace(0, "Kbd: code 0x%p", (ulong)code);
+        Trace(KbdLL, "Kbd: code 0x%p", (ulong)code);
 
         if (code == 0x2a || code == 0x36) mod = 0x20;
         else if (code == 0xaa || code == 0xb6) mod = 0x00;
@@ -85,7 +85,7 @@ void IO8042::OnTick(TimerCallback& callback)
         {
             char c = map[(int)code] ^ mod;
 
-            Trace(0, "Kbd: char %c", c);
+            Trace(KbdLL, "Kbd: char %c", c);
 
             term.Printf("%c", c);
         }

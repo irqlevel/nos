@@ -10,8 +10,6 @@ namespace Kernel
 namespace Core
 {
 
-const int SharedPtrLL = 255;
-
 template<typename T>
 class ObjectReference final
 {
