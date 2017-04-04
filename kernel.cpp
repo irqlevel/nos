@@ -120,7 +120,10 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
 
     auto& acpi = Acpi::GetInstance();
-    Trace(0, "Acpi Rsdp 0x%p", acpi.GetRsdp());
+    if (!acpi.Parse())
+    {
+        Trace(0, "Can't parse ACPI");
+    }
 
     auto err = Test();
     TraceError(err);

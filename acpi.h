@@ -17,7 +17,7 @@ public:
         return instance;
     }
 
-    void* GetRsdp();
+    bool Parse();
 
 private:
     Acpi();
@@ -43,7 +43,28 @@ private:
         u8 Reserved[3];
     } __attribute__ ((packed));
 
-    bool ParseRsdp(RSDPDescriptor20 *rsdp);
+    struct ACPISDTHeader {
+        char Signature[4];
+        u32 Length;
+        u8 Revision;
+        u8 Checksum;
+        char OEMID[6];
+        char OEMTableID[8];
+        u32 OEMRevision;
+        u32 CreatorID;
+        u32 CreatorRevision;
+    } __attribute__ ((packed));
+
+    bool CheckSum(void* table, size_t len);
+
+    bool ParseRsdp(RSDPDescriptor20* rsdp);
+    RSDPDescriptor20* FindRsdp();
+    bool ParseRsdt(ACPISDTHeader* rsdt);
+
+    char OemId[7];
+
+    RSDPDescriptor20* Rsdp;
+    ACPISDTHeader* Rsdt;
 
     static const u64 RSDPSignature = 0x2052545020445352; //'RSD PTR '
 
