@@ -11,6 +11,7 @@ namespace Core
 Cmd::Cmd()
     : InputActive(false)
     , Exit(false)
+    , Active(false)
 {
     CmdLine[0] = '\0';
 }
@@ -21,9 +22,8 @@ Cmd::~Cmd()
 
 void Cmd::ProcessCmd(const char *cmd)
 {
-    Trace(CmdLL, "Process cmd %s", cmd);
-
     auto& vga = VgaTerm::GetInstance();
+
     if (Shared::StrCmp(cmd, "cls") == 0)
     {
         vga.Cls();
@@ -31,11 +31,19 @@ void Cmd::ProcessCmd(const char *cmd)
     else if (Shared::StrCmp(cmd, "exit") == 0)
     {
         Exit = true;
+        return;
+    }
+    else if (Shared::StrCmp(cmd, "help") == 0)
+    {
+        vga.Printf("exit - shutdown kernel\n");
+        vga.Printf("cls - clear screen\n");
+        vga.Printf("help - help\n");
     }
     else
     {
-        vga.Printf("Unknown command\n");
+        vga.Printf("command not found\n");
     }
+    vga.Printf("$");
 }
 
 bool Cmd::IsExit()
@@ -43,9 +51,21 @@ bool Cmd::IsExit()
     return Exit;
 }
 
+void Cmd::Start()
+{
+    Shared::AutoLock lock(Lock);
+
+    auto& vga = VgaTerm::GetInstance();
+
+    vga.Printf("\n$");
+    Active = true;
+}
+
 void Cmd::Run()
 {
     Shared::AutoLock lock(Lock);
+    if (!Active)
+        return;
 
     if (CmdLine[0] != '\0')
     {
@@ -57,16 +77,17 @@ void Cmd::Run()
 void Cmd::OnChar(char c)
 {
     Shared::AutoLock lock(Lock);
+    if (!Active)
+        return;
 
-    if (c == '.')
+    if (!InputActive)
     {
         InputActive = true;
-        return;
     }
 
     if (InputActive)
     {
-        if (c == 0xA) //CR
+        if (c == '\n')
         {
             if (CmdLine[0] == '\0')
             {

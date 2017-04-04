@@ -163,6 +163,7 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
 
     VgaTerm::GetInstance().Printf("Idle looping...\n");
 
+    cmd.Start();
     auto& cpu = CpuTable::GetInstance().GetCpu(0);
     for (;;)
     {

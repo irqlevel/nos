@@ -24,6 +24,8 @@ public:
 
     bool IsExit();
 
+    void Start();
+
 private:
     void ProcessCmd(const char *cmd);
 
@@ -41,6 +43,7 @@ private:
 
     bool InputActive;
     bool Exit;
+    bool Active;
 };
 
 }

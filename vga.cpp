@@ -68,15 +68,16 @@ void VgaTerm::PutChar(char c)
 	{
 		while (Column < Width)
 				PutCharAt(' ', ColorCode, Column++, Row);
+
 		Column = 0;
 		Row++;
+		Overflow();
 	}
 	else
 	{
-	    PutCharAt(c, ColorCode, Column, Row);
-	    Column++;
+	    PutCharAt(c, ColorCode, Column++, Row);
+		Overflow();
     }
-	Overflow();
 	Cursor();
 }
 
