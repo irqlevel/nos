@@ -205,7 +205,7 @@ Shared::Error TestAllocator()
 
 Shared::Error TestRingBuffer()
 {
-    RingBuffer<u8, 3> rb;
+    Shared::RingBuffer<u8, 3> rb;
 
     if (!rb.Put(0x1))
         return MakeError(Shared::Error::Unsuccessful);

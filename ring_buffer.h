@@ -5,16 +5,19 @@
 #include "error.h"
 #include "lock.h"
 
-namespace Kernel
-{
-
-namespace Core
+namespace Shared
 {
 
 template <typename T, size_t Capacity = Shared::PageSize, typename LockType = Shared::NopLock>
 class RingBuffer final
 {
 public:
+    class Dumper
+    {
+    public:
+        virtual void OnElement(const T& element) = 0;
+    };
+
     RingBuffer()
     {
         Shared::AutoLock lock(Lock);
@@ -40,6 +43,22 @@ public:
 
         size_t position = EndIndex;
         Buf[position] = value;
+        EndIndex = (EndIndex + 1) % Capacity;
+        Size++;
+        return true;
+    }
+
+    bool Put(T&& value)
+    {
+        Shared::AutoLock lock(Lock);
+
+        if (Size == Capacity)
+        {
+            return false;
+        }
+
+        size_t position = EndIndex;
+        Buf[position] = Shared::Move(value);
         EndIndex = (EndIndex + 1) % Capacity;
         Size++;
         return true;
@@ -88,6 +107,17 @@ public:
         return Buf[position];
     }
 
+    void PopHead()
+    {
+        Shared::AutoLock lock(Lock);
+
+        if (Size == 0)
+            return;
+
+        StartIndex = (StartIndex + 1) % Capacity;
+        Size--;
+    }
+
     void Clear()
     {
         Shared::AutoLock lock(Lock);
@@ -95,6 +125,21 @@ public:
         Size = 0;
         StartIndex = 0;
         EndIndex = 0;
+    }
+
+    void Dump(Dumper& dumper)
+    {
+        Shared::AutoLock lock(Lock);
+
+        if (Size == 0)
+            return;
+
+        size_t index = StartIndex;
+        for (size_t i = 0; i < Size; i++)
+        {
+            dumper.OnElement(Buf[index]);
+            index = (index + 1) % Capacity;
+        }
     }
 
 private:
@@ -111,5 +156,4 @@ private:
     LockType Lock;
 };
 
-}
 }

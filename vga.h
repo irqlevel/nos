@@ -59,6 +59,8 @@ private:
 
     void PutCharAt(char c, u8 color, u8 x, u8 y);
 
+    size_t GetIndex(u8 x, u8 y);
+
     void Overflow();
 
     void PutChar(char c);

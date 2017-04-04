@@ -43,11 +43,14 @@ void VgaTerm::SetColor(Color fg, Color bg)
     ColorCode = MakeColor(fg, bg);
 }
 
+size_t VgaTerm::GetIndex(u8 x, u8 y)
+{
+	return y * Width + x;
+}
+
 void VgaTerm::PutCharAt(char c, u8 color, u8 x, u8 y)
 {
-	const size_t index = y * Width + x;
-
-	Buf[index] = MakeEntry(c, color);
+	Buf[GetIndex(x, y)] = MakeEntry(c, color);
 }
 
 void VgaTerm::Overflow()
@@ -59,7 +62,20 @@ void VgaTerm::Overflow()
 	}
 
 	if (Row == Height)
-		Row = 0;
+	{
+		for (size_t row = 0; row < Height - 1; row++)
+		{
+			for (size_t column = 0; column < Width; column++)
+			{
+				Buf[GetIndex(column, row)] = Buf[GetIndex(column, row + 1)];
+			}
+		}
+
+		for (size_t column = 0; column < Width; column++)
+			PutCharAt('\0', MakeColor(ColorBlack, ColorBlack), column, Height - 1);
+
+		Row = Height - 1;
+	}
 }
 
 void VgaTerm::PutChar(char c)

@@ -165,6 +165,27 @@ public:
         Panic("Not implemented yet!");
     }
 
+    Vector(const T* arr, size_t size, Shared::Error& err)
+    {
+        if (!err.Ok())
+            return;
+
+        Arr = new T[size];
+        if (!Arr)
+        {
+            err = MakeError(Shared::Error::NoMemory);
+            return;
+        }
+
+        for (size_t i = 0; i < size; i++)
+        {
+            Arr[i] = arr[i];
+        }
+
+        Size = size;
+        Capacity = Size;
+    }
+
 private:
     Vector(const Vector& other) = delete;
     Vector& operator=(const Vector& other) = delete;

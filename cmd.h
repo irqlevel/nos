@@ -37,7 +37,7 @@ private:
     Cmd& operator=(Cmd&& other) = delete;
 
     static const size_t CmdSizeMax = 80;
-    RingBuffer<char, CmdSizeMax> Buf;
+    Shared::RingBuffer<char, CmdSizeMax> Buf;
     char CmdLine[CmdSizeMax + 1];
     SpinLock Lock;
 

@@ -20,3 +20,10 @@ typedef uint64_t u64;
 
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
+
+#define OFFSET_OF(type, field)  \
+            (unsigned long)&((type*)0)->field
+
+#define CONTAINING_RECORD(addr, type, field)    \
+            (type*)((unsigned long)(addr) - (unsigned long)&((type*)0)->field)
+

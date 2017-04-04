@@ -2,6 +2,7 @@
 #include "trace.h"
 #include "vga.h"
 #include "asm.h"
+#include "dmesg.h"
 
 namespace Kernel
 {
@@ -44,6 +45,21 @@ void Cmd::ProcessCmd(const char *cmd)
 
         vga.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p\n",
             GetCr0(), GetCr2(), GetCr3(), GetCr4());
+    }
+    else if (Shared::StrCmp(cmd, "dmesg\n") == 0)
+    {
+        class DmesgPrinter final : public Dmesg::Dumper
+        {
+        public:
+            DmesgPrinter(){}
+            ~DmesgPrinter(){}
+            virtual void OnMessage(const char *msg)
+            {
+                VgaTerm::GetInstance().Printf(msg);
+            }
+        };
+        DmesgPrinter printer;
+        Dmesg::GetInstance().Dump(printer);
     }
     else if (Shared::StrCmp(cmd, "help\n") == 0)
     {

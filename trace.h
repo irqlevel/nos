@@ -3,6 +3,7 @@
 #include "stdlib.h"
 #include "error.h"
 #include "pit.h"
+#include "ring_buffer.h"
 
 namespace Kernel
 {
@@ -57,7 +58,7 @@ do {                                                                \
     if (unlikely((level) <= tracer.GetLevel()))                     \
     {                                                               \
         auto time = Pit::GetInstance().GetTime();                   \
-       tracer.Output("%u:%u.%u:%s(),%s,%u: " fmt "\n",              \
+        tracer.Output("%u:%u.%u:%s(),%s,%u: " fmt "\n",             \
             (level), time.Secs, time.NanoSecs,                      \
             __func__, Shared::TruncateFileName(__FILE__),           \
             __LINE__, ##__VA_ARGS__);                               \

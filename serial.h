@@ -20,9 +20,7 @@ public:
         return instance;
     }
 
-    void WriteChar(char c);
-
-    void WriteString(const char *str);
+    void PrintString(const char *str);
 
     void Vprintf(const char *fmt, va_list args);
     void Printf(const char *fmt, ...);
@@ -36,6 +34,7 @@ private:
     Serial();
     ~Serial();
 
+    void WriteChar(char c);
     void Send();
     void Wait(size_t pauseCount);
 
@@ -48,7 +47,7 @@ private:
     bool IsTransmitEmpty();
     int IntNum;
 
-    RingBuffer<char, Shared::PageSize> Buf;
+    Shared::RingBuffer<char, Shared::PageSize> Buf;
     SpinLock Lock;
 
     static const int Port = 0x3F8;

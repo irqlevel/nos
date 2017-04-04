@@ -43,7 +43,6 @@ void Serial::Wait(size_t pauseCount)
 
 void Serial::WriteChar(char c)
 {
-    Shared::AutoLock lock(Lock);
     size_t pauseCount = 1;
 
 again:
@@ -69,8 +68,10 @@ Serial::~Serial()
 {
 }
 
-void Serial::WriteString(const char *str)
+void Serial::PrintString(const char *str)
 {
+    Shared::AutoLock lock(Lock);
+
     for (;;)
     {
         char c = *str++;
@@ -88,7 +89,7 @@ void Serial::Vprintf(const char *fmt, va_list args)
 	if (Shared::VsnPrintf(str, sizeof(str), fmt, args) < 0)
 		return;
 
-	WriteString(str);
+	PrintString(str);
 }
 
 void Serial::Printf(const char *fmt, ...)
