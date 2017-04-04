@@ -48,8 +48,9 @@ void Cmd::ProcessCmd(const char *cmd)
     }
     else if (Shared::StrCmp(cmd, "help\n") == 0)
     {
-        vga.Printf("exit - shutdown kernel\n");
         vga.Printf("cls - clear screen\n");
+        vga.Printf("cpu - dump cpu state\n");
+        vga.Printf("exit - shutdown kernel\n");
         vga.Printf("help - help\n");
     }
     else if (Shared::StrCmp(cmd, "\n") == 0)
