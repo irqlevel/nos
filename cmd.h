@@ -41,7 +41,6 @@ private:
     char CmdLine[CmdSizeMax + 1];
     SpinLock Lock;
 
-    bool InputActive;
     bool Exit;
     bool Active;
 };

@@ -10,8 +10,7 @@ namespace Core
 {
 
 Cmd::Cmd()
-    : InputActive(false)
-    , Exit(false)
+    : Exit(false)
     , Active(false)
 {
     CmdLine[0] = '\0';
@@ -97,42 +96,34 @@ void Cmd::OnChar(char c)
     if (!Active)
         return;
 
-    if (!InputActive)
+    if (!Buf.Put(c))
     {
-        InputActive = true;
+        Trace(0, "Can't save cmd char, drop command");
+        Buf.Clear();
+        goto output;
     }
 
-    if (InputActive)
+    if (c == '\n')
     {
-        if (!Buf.Put(c))
+        if (CmdLine[0] == '\0')
         {
-            Trace(0, "Can't save cmd char, drop command");
+            size_t i = 0;
+            while (!Buf.IsEmpty())
+            {
+                BugOn(i >= (Shared::ArraySize(CmdLine) - 1));
+                CmdLine[i] = Buf.Get();
+                i++;
+            }
+            CmdLine[i] = '\0';
+        }
+        else
+        {
+            Trace(0, "Can't save cmd, drop command");
             Buf.Clear();
-            InputActive = false;
-        }
-
-        if (c == '\n')
-        {
-            if (CmdLine[0] == '\0')
-            {
-                size_t i = 0;
-                while (!Buf.IsEmpty())
-                {
-                    BugOn(i >= (Shared::ArraySize(CmdLine) - 1));
-                    CmdLine[i] = Buf.Get();
-                    i++;
-                }
-                CmdLine[i] = '\0';
-            }
-            else
-            {
-                Trace(0, "Can't save cmd, drop command");
-                Buf.Clear();
-            }
-            InputActive = false;
         }
     }
 
+output:
     VgaTerm::GetInstance().Printf("%c", c);
 }
 
