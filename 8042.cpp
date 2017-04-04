@@ -102,8 +102,6 @@ void IO8042::OnTick(TimerCallback& callback)
 
     Shared::AutoLock lock(Lock);
 
-    auto& term = VgaTerm::GetInstance();
-
     while (!Buf.IsEmpty())
     {
         static char map[0x80] = "__1234567890-=_" "\tqwertyuiop[]\n" "_asdfghjkl;'`" "_\\zxcvbnm,./_" "*_ _";
@@ -125,8 +123,6 @@ void IO8042::OnTick(TimerCallback& callback)
                 if (Observer[i] != nullptr)
                     Observer[i]->OnChar(c);
             }
-
-            term.Printf("%c", c);
         }
     }
 }

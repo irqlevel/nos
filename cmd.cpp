@@ -118,6 +118,8 @@ void Cmd::OnChar(char c)
             InputActive = false;
         }
     }
+
+    VgaTerm::GetInstance().Printf("%c", c);
 }
 
 }
