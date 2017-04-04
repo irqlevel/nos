@@ -216,4 +216,6 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg);
 
 int SnPrintf(char* buf, size_t size, const char* fmt, ...);
 
+int StrCmp(const char *s1, const char *s2);
+
 }

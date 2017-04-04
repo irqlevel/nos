@@ -1,6 +1,6 @@
 BITS 32
 
-extern kernel_main
+extern Main
 extern __cxa_finalize
 
 section .multiboot
@@ -191,7 +191,7 @@ long_mode_start:
 	mov gs, ax
 start64:
 	mov rdi, [mbinfo]
-	call kernel_main
+	call Main
 	xor rdi, rdi
 	call __cxa_finalize
 	cli

@@ -18,6 +18,8 @@
 #include "pit.h"
 #include "asm.h"
 #include "acpi.h"
+#include "cpu.h"
+#include "cmd.h"
 
 using namespace Kernel::Core;
 using namespace Shared;
@@ -86,7 +88,7 @@ void DumpCpuState()
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
 }
 
-extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
+extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
 {
     Tracer::GetInstance().SetLevel(1);
     Trace(0, "Enter");
@@ -94,6 +96,12 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     VgaTerm::GetInstance().Printf("Hello!\n");
 
     DumpCpuState();
+
+    if (!CpuTable::GetInstance().RegisterCpu(0))
+    {
+        Panic("Can't register 0 cpu");
+        return;
+    }
 
     ParseGrubInfo(MbInfo);
 
@@ -136,6 +144,13 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     auto& pit = Pit::GetInstance();
     auto& kbd = IO8042::GetInstance();
     auto& serial = Serial::GetInstance();
+    auto& cmd = Cmd::GetInstance();
+
+    if (!kbd.RegisterObserver(cmd))
+    {
+        Panic("Can't register cmd in kbd");
+        return;
+    }
 
     Pic::GetInstance().Remap();
     excTable.RegisterInterrupts();
@@ -148,9 +163,16 @@ extern "C" void kernel_main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
 
     VgaTerm::GetInstance().Printf("Idle looping...\n");
 
+    auto& cpu = CpuTable::GetInstance().GetCpu(0);
     for (;;)
     {
-        Hlt();
+        cpu.Idle();
+        cmd.Run();
+        if (cmd.IsExit())
+        {
+            Trace(0, "Exit requested");
+            break;
+        }
     }
 
     Trace(0, "Exit");

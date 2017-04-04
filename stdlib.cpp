@@ -271,4 +271,25 @@ int SnPrintf(char* buf, size_t size, const char* fmt, ...)
     return len;
 }
 
+int StrCmp(const char *s1, const char *s2)
+{
+    for (;;)
+    {
+        const char c1 = *s1, c2 = *s2;
+
+        if (c1 < c2)
+            return -1;
+        if (c1 > c2)
+            return 1;
+        else
+            if (c1 == '\0')
+                break;
+
+        s1++;
+        s2++;
+    }
+
+    return 0;
+}
+
 }

@@ -15,6 +15,8 @@ IO8042::IO8042()
     : IntNum(-1)
     , Mod(0)
 {
+    for (size_t i = 0; i < Shared::ArraySize(Observer); i++)
+        Observer[i] = nullptr;
 }
 
 IO8042::~IO8042()
@@ -48,27 +50,57 @@ void IO8042::UnregisterInterrupt()
     }
 }
 
+void IO8042::OnInterrupt()
+{
+    Shared::AutoLock lock(Lock);
+
+    if (!Buf.Put(Inb(Port)))
+    {
+        Trace(0, "Kbd: can't put new code");
+    }
+}
+
 void IO8042::Interrupt()
 {
-    auto& io8042 = IO8042::GetInstance();
 
-    io8042.Put(Inb(Port));
+    IO8042::GetInstance().OnInterrupt();
     Pic::EOI();
 }
 
-bool IO8042::Put(u8 code)
+bool IO8042::RegisterObserver(IO8042Observer& observer)
 {
-    return Buf.Put(code);
+    Shared::AutoLock lock(Lock);
+
+    for (size_t i = 0; i < MaxObserver; i++)
+    {
+        if (Observer[i] == nullptr)
+        {
+            Observer[i] = &observer;
+            return true;
+        }
+    }
+
+    return false;
 }
 
-u8 IO8042::Get()
+void IO8042::UnregisterObserver(IO8042Observer& observer)
 {
-    return Buf.Get();
+    Shared::AutoLock lock(Lock);
+
+    for (size_t i = 0; i < MaxObserver; i++)
+    {
+        if (Observer[i] == &observer)
+        {
+            Observer[i] = nullptr;
+        }
+    }
 }
 
 void IO8042::OnTick(TimerCallback& callback)
 {
     (void)callback;
+
+    Shared::AutoLock lock(Lock);
 
     auto& term = VgaTerm::GetInstance();
 
@@ -87,6 +119,12 @@ void IO8042::OnTick(TimerCallback& callback)
             char c = map[(int)code] ^ Mod;
 
             Trace(KbdLL, "Kbd: char %c", c);
+
+            for (size_t i = 0; i < MaxObserver; i++)
+            {
+                if (Observer[i] != nullptr)
+                    Observer[i]->OnChar(c);
+            }
 
             term.Printf("%c", c);
         }

@@ -88,6 +88,15 @@ public:
         return Buf[position];
     }
 
+    void Clear()
+    {
+        Shared::AutoLock lock(Lock);
+
+        Size = 0;
+        StartIndex = 0;
+        EndIndex = 0;
+    }
+
 private:
     RingBuffer(const RingBuffer& other) = delete;
     RingBuffer(RingBuffer&& other) = delete;

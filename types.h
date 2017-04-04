@@ -1,5 +1,4 @@
-#ifndef __TYPES_H__
-#define __TYPES_H__
+#pragma once
 
 #include <stdint.h>
 #include <stdarg.h>
@@ -21,5 +20,3 @@ typedef uint64_t u64;
 
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
-
-#endif

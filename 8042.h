@@ -12,6 +12,12 @@ namespace Kernel
 namespace Core
 {
 
+class IO8042Observer
+{
+public:
+    virtual void OnChar(char c) = 0;
+};
+
 class IO8042 : public TimerCallback
 {
 public:
@@ -24,12 +30,16 @@ public:
     void RegisterInterrupt(int intNum);
     void UnregisterInterrupt();
 
-    bool Put(u8 code);
-    u8 Get();
+    void OnInterrupt();
 
     static void Interrupt();
 
     virtual void OnTick(TimerCallback& callback) override;
+
+    char GetCmd();
+
+    bool RegisterObserver(IO8042Observer& observer);
+    void UnregisterObserver(IO8042Observer& observer);
 
 private:
     IO8042();
@@ -42,9 +52,14 @@ private:
 
     static const ulong Port = 0x60;
 
-    RingBuffer<u8, 16, SpinLock> Buf;
+    SpinLock Lock;
+    RingBuffer<u8, Shared::PageSize> Buf;
+
     int IntNum;
     u8 Mod;
+
+    static const size_t MaxObserver = 16;
+    IO8042Observer* Observer[MaxObserver];
 };
 
 }

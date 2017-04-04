@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.h"
+#include "spin_lock.h"
 
 namespace Kernel
 {
@@ -63,6 +64,9 @@ private:
     void PutChar(char c);
     void Cursor();
 
+    void PutsLockHeld(const char *s);
+    void ClsLockHeld();
+
     const ulong BufAddr = 0xB8000;
 
     u16 *Buf;
@@ -74,6 +78,8 @@ private:
 
     const u16 VgaBase = 0x3D4;
     const u16 VgaIndex = 0x0E;
+
+    SpinLock Lock;
 };
 
 }
