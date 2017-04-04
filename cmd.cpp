@@ -24,20 +24,23 @@ void Cmd::ProcessCmd(const char *cmd)
 {
     auto& vga = VgaTerm::GetInstance();
 
-    if (Shared::StrCmp(cmd, "cls") == 0)
+    if (Shared::StrCmp(cmd, "cls\n") == 0)
     {
         vga.Cls();
     }
-    else if (Shared::StrCmp(cmd, "exit") == 0)
+    else if (Shared::StrCmp(cmd, "exit\n") == 0)
     {
         Exit = true;
         return;
     }
-    else if (Shared::StrCmp(cmd, "help") == 0)
+    else if (Shared::StrCmp(cmd, "help\n") == 0)
     {
         vga.Printf("exit - shutdown kernel\n");
         vga.Printf("cls - clear screen\n");
         vga.Printf("help - help\n");
+    }
+    else if (Shared::StrCmp(cmd, "\n") == 0)
+    {
     }
     else
     {
@@ -87,6 +90,13 @@ void Cmd::OnChar(char c)
 
     if (InputActive)
     {
+        if (!Buf.Put(c))
+        {
+            Trace(0, "Can't save cmd char, drop command");
+            Buf.Clear();
+            InputActive = false;
+        }
+
         if (c == '\n')
         {
             if (CmdLine[0] == '\0')
@@ -106,15 +116,6 @@ void Cmd::OnChar(char c)
                 Buf.Clear();
             }
             InputActive = false;
-        }
-        else
-        {
-            if (!Buf.Put(c))
-            {
-                Trace(0, "Can't save cmd char, drop command");
-                Buf.Clear();
-                InputActive = false;
-            }
         }
     }
 }
