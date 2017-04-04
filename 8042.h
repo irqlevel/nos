@@ -44,6 +44,7 @@ private:
 
     RingBuffer<u8, 16, SpinLock> Buf;
     int IntNum;
+    u8 Mod;
 };
 
 }

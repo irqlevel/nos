@@ -13,6 +13,7 @@ namespace Core
 
 IO8042::IO8042()
     : IntNum(-1)
+    , Mod(0)
 {
 }
 
@@ -70,7 +71,7 @@ void IO8042::OnTick(TimerCallback& callback)
     (void)callback;
 
     auto& term = VgaTerm::GetInstance();
-    u8 mod = 0;
+
     while (!Buf.IsEmpty())
     {
         static char map[0x80] = "__1234567890-=_" "\tqwertyuiop[]\n" "_asdfghjkl;'`" "_\\zxcvbnm,./_" "*_ _";
@@ -78,12 +79,12 @@ void IO8042::OnTick(TimerCallback& callback)
 
         Trace(KbdLL, "Kbd: code 0x%p", (ulong)code);
 
-        if (code == 0x2a || code == 0x36) mod = 0x20;
-        else if (code == 0xaa || code == 0xb6) mod = 0x00;
+        if (code == 0x2a || code == 0x36) Mod = 0x20;
+        else if (code == 0xaa || code == 0xb6) Mod = 0x00;
         else if (code & 0x80) continue;
         else
         {
-            char c = map[(int)code] ^ mod;
+            char c = map[(int)code] ^ Mod;
 
             Trace(KbdLL, "Kbd: char %c", c);
 
