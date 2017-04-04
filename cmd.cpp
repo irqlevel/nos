@@ -1,6 +1,7 @@
 #include "cmd.h"
 #include "trace.h"
 #include "vga.h"
+#include "asm.h"
 
 namespace Kernel
 {
@@ -32,6 +33,18 @@ void Cmd::ProcessCmd(const char *cmd)
     {
         Exit = true;
         return;
+    }
+    else if (Shared::StrCmp(cmd, "cpu\n") == 0)
+    {
+        vga.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p\n",
+            (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
+            (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
+
+        vga.Printf("rflags 0x%p rsp 0x%p rip 0x%p\n",
+            GetRflags(), GetRsp(), GetRip());
+
+        vga.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p\n",
+            GetCr0(), GetCr2(), GetCr3(), GetCr4());
     }
     else if (Shared::StrCmp(cmd, "help\n") == 0)
     {
