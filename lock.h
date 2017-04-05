@@ -1,20 +1,22 @@
 #pragma once
 
+#include "types.h"
+
 namespace Shared
 {
 
 class LockInterface
 {
 public:
-    virtual void Lock() = 0;
-    virtual void Unlock() = 0;
+    virtual void Lock(ulong& flags) = 0;
+    virtual void Unlock(ulong flags) = 0;
 };
 
 class SharedLockInterface
 {
 public:
-    virtual void SharedLock() = 0;
-    virtual void SharedUnlock() = 0;
+    virtual void SharedLock(ulong& flags) = 0;
+    virtual void SharedUnlock(ulong flags) = 0;
 };
 
 class AutoLock
@@ -22,13 +24,14 @@ class AutoLock
 public:
     AutoLock(LockInterface& lock)
         : Lock(lock)
+        , Flags(0)
     {
-        Lock.Lock();
+        Lock.Lock(Flags);
     }
 
     virtual ~AutoLock()
     {
-        Lock.Unlock();
+        Lock.Unlock(Flags);
     }
 private:
     AutoLock() = delete;
@@ -38,6 +41,7 @@ private:
     AutoLock& operator=(AutoLock&& other) = delete;
 
     LockInterface& Lock;
+    ulong Flags;
 };
 
 class SharedAutoLock
@@ -45,13 +49,14 @@ class SharedAutoLock
 public:
     SharedAutoLock(SharedLockInterface& lock)
         : Lock(lock)
+        , Flags(0)
     {
-        Lock.SharedLock();
+        Lock.SharedLock(Flags);
     }
 
     virtual ~SharedAutoLock()
     {
-        Lock.SharedUnlock();
+        Lock.SharedUnlock(Flags);
     }
 private:
     SharedAutoLock() = delete;
@@ -61,6 +66,7 @@ private:
     SharedAutoLock& operator=(SharedAutoLock&& other) = delete;
 
     SharedLockInterface& Lock;
+    ulong Flags;
 };
 
 class NopLock
@@ -72,20 +78,24 @@ public:
 	{
 	}
 
-	virtual void Lock() override
+	virtual void Lock(ulong& flags) override
 	{
+        flags = 0;
 	}
 
-	virtual void Unlock() override
+	virtual void Unlock(ulong flags) override
 	{
+        (void)flags;
 	}
 
-	virtual void SharedLock() override
+	virtual void SharedLock(ulong& flags) override
 	{
+        flags = 0;
 	}
 
-	virtual void SharedUnlock() override
+	virtual void SharedUnlock(ulong flags) override
 	{
+        (void)flags;
 	}
 
 	virtual ~NopLock()

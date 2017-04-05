@@ -159,7 +159,7 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     serial.RegisterInterrupt(0x24);
     idt.Save();
     pit.Setup();
-    Enable();
+    InterruptEnable();
 
     VgaTerm::GetInstance().Printf("Idle looping...\n");
 

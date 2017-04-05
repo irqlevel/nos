@@ -2,6 +2,7 @@
 
 #include "asm.h"
 #include "lock.h"
+#include "preempt.h"
 
 namespace Kernel
 {
@@ -17,27 +18,31 @@ public:
 	SpinLock()
 		: RawLock(0)
 	{
-		(void)RawLock;
 	}
 
-	virtual void Lock() override
+	virtual void Lock(ulong& flags) override
 	{
+		flags = GetRflags();
+		InterruptDisable();
+		PreemptDisable();
 		SpinLockLock(&RawLock);
 	}
 
-	virtual void Unlock() override
+	virtual void Unlock(ulong flags) override
 	{
 		SpinLockUnlock(&RawLock);
+		SetRflags(flags);
+		PreemptEnable();
 	}
 
-	virtual void SharedLock() override
+	virtual void SharedLock(ulong& flags) override
 	{
-		SpinLockLock(&RawLock);
+		Lock(flags);
 	}
 
-	virtual void SharedUnlock() override
+	virtual void SharedUnlock(ulong flags) override
 	{
-		SpinLockUnlock(&RawLock);
+		Unlock(flags);
 	}
 
 	virtual ~SpinLock()

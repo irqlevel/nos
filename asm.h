@@ -17,6 +17,7 @@ ulong GetRsp(void);
 ulong GetRip(void);
 
 ulong GetRflags(void);
+void SetRflags(ulong rflags);
 
 void Pause(void);
 
@@ -38,8 +39,8 @@ void SpinLockUnlock(ulong *lock);
 void Outb(u16 port, u8 data);
 u8 Inb(u16 port);
 
-void Enable(void);
-void Disable(void);
+void InterruptEnable(void);
+void InterruptDisable(void);
 void Hlt(void);
 
 void IO8042InterruptStub();
@@ -73,4 +74,5 @@ void ExcControlProtectionStub();
 
 #ifdef __cplusplus
 }
+
 #endif

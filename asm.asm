@@ -38,6 +38,7 @@ global GetCr4
 global GetRsp
 global GetRip
 global GetRflags
+global SetRflags
 global Pause
 global GetCs
 global GetDs
@@ -52,8 +53,8 @@ global SpinLockLock
 global SpinLockUnlock
 global Outb
 global Inb
-global Enable
-global Disable
+global InterruptEnable
+global InterruptDisable
 global Hlt
 
 global DummyInterruptStub
@@ -117,6 +118,11 @@ GetRipF:
 GetRflags:
 	pushfq
 	pop rax
+	ret
+
+SetRflags:
+	push rdi
+	popfq
 	ret
 
 Pause:
@@ -210,11 +216,11 @@ Inb:
 	pop rdx
         ret
 
-Enable:
+InterruptEnable:
         sti
         ret
 
-Disable:
+InterruptDisable:
         cli
         ret
 
