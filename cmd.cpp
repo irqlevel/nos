@@ -65,6 +65,7 @@ void Cmd::ProcessCmd(const char *cmd)
     {
         vga.Printf("cls - clear screen\n");
         vga.Printf("cpu - dump cpu state\n");
+        vga.Printf("dmesg - dump kernel log\n");
         vga.Printf("exit - shutdown kernel\n");
         vga.Printf("help - help\n");
     }
