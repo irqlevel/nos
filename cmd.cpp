@@ -29,7 +29,8 @@ void Cmd::ProcessCmd(const char *cmd)
     {
         vga.Cls();
     }
-    else if (Shared::StrCmp(cmd, "exit\n") == 0)
+    else if (Shared::StrCmp(cmd, "exit\n") == 0 ||
+             Shared::StrCmp(cmd, "quit\n") == 0)
     {
         Exit = true;
         return;
@@ -60,6 +61,11 @@ void Cmd::ProcessCmd(const char *cmd)
         };
         DmesgPrinter printer;
         Dmesg::GetInstance().Dump(printer);
+    }
+    else if (Shared::StrCmp(cmd, "uptime\n") == 0)
+    {
+        auto time = Pit::GetInstance().GetTime();
+        vga.Printf("%u.%u\n", time.Secs, time.NanoSecs);
     }
     else if (Shared::StrCmp(cmd, "help\n") == 0)
     {
