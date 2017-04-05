@@ -218,4 +218,6 @@ int SnPrintf(char* buf, size_t size, const char* fmt, ...);
 
 int StrCmp(const char *s1, const char *s2);
 
+int StrnCmp(const char *s1, const char *s2, size_t size);
+
 }

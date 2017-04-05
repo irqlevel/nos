@@ -292,4 +292,27 @@ int StrCmp(const char *s1, const char *s2)
     return 0;
 }
 
+int StrnCmp(const char *s1, const char *s2, size_t size)
+{
+    size_t i;
+
+    for (i = 0; i < size; i++)
+    {
+        const char c1 = *s1, c2 = *s2;
+
+        if (c1 < c2)
+            return -1;
+        if (c1 > c2)
+            return 1;
+        else
+            if (c1 == '\0')
+                break;
+
+        s1++;
+        s2++;
+    }
+
+    return 0;
+}
+
 }

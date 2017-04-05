@@ -71,6 +71,12 @@ Acpi::RSDPDescriptor20* Acpi::FindRsdp()
 
 bool Acpi::ParseRsdt(ACPISDTHeader* rsdt)
 {
+    if (Shared::StrnCmp(rsdt->Signature, "RSDT", sizeof(rsdt->Signature)) != 0)
+    {
+        Trace(AcpiLL, "Rsdt 0x%p invalid signature", rsdt);
+        return false;
+    }
+
     if (!CheckSum(rsdt, sizeof(rsdt->Length)))
     {
         Trace(AcpiLL, "Rsdt 0x%p checksum failed", rsdt);
