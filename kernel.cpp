@@ -128,13 +128,15 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
 
     auto& acpi = Acpi::GetInstance();
-    if (!acpi.Parse())
+    auto err = acpi.Parse();
+    if (!err.Ok())
     {
-        Trace(0, "Can't parse ACPI");
+        TraceError(err, "Can't parse ACPI");
     }
 
-    auto err = Test();
-    TraceError(err);
+    err = Test();
+    if (!err.Ok())
+        TraceError(err, "Test failed");
 
     VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
 

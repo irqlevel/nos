@@ -33,6 +33,8 @@ public:
 
     void Output(const char *fmt, ...);
 
+    void Output(Shared::Error& err, const char *fmt, ...);
+
     void SetLevel(int level);
 
     int GetLevel();
@@ -65,11 +67,16 @@ do {                                                                \
     }                                                               \
 } while (false)
 
-#define  TraceError(err)                                                     \
-do {                                                                        \
-    if (!err.Ok())                                                          \
-    {                                                                       \
-        Trace(0, "Error %u occured at %s():%s,%u",                          \
-            err.GetCode(), err.GetFunc(), err.GetFile(), err.GetLine());    \
-    }                                                                       \
+#define TraceError(err, fmt, ...)                                   \
+do {                                                                \
+    auto& tracer = Kernel::Core::Tracer::GetInstance();             \
+    if (unlikely(0 <= tracer.GetLevel()))                           \
+    {                                                               \
+        auto time = Pit::GetInstance().GetTime();                   \
+        tracer.Output("%u:%u.%u:%s(),%s,%u: Error %u at %s(),%s,%u: " fmt "\n",    \
+            0, time.Secs, time.NanoSecs,                            \
+            __func__, Shared::TruncateFileName(__FILE__),           \
+            __LINE__, err.GetCode(), err.GetFunc(), Shared::TruncateFileName(err.GetFile()),  \
+            err.GetLine(), ##__VA_ARGS__);                                  \
+    }                                                               \
 } while (false)

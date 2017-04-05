@@ -1,6 +1,7 @@
 #pragma once
 
 #include "stdlib.h"
+#include "error.h"
 
 namespace Kernel
 {
@@ -17,7 +18,7 @@ public:
         return instance;
     }
 
-    bool Parse();
+    Shared::Error Parse();
 
 private:
     Acpi();
@@ -33,7 +34,7 @@ private:
         char OEMID[6];
         u8 Revision;
         u32 RsdtAddress;
-    } __attribute__ ((packed));
+    } __attribute__((packed));
 
     struct RSDPDescriptor20 {
         RSDPDescriptor FirstPart;
@@ -41,7 +42,7 @@ private:
         u64 XsdtAddress;
         u8 ExtendedChecksum;
         u8 Reserved[3];
-    } __attribute__ ((packed));
+    } __attribute__((packed));
 
     struct ACPISDTHeader {
         char Signature[4];
@@ -53,19 +54,31 @@ private:
         u32 OEMRevision;
         u32 CreatorID;
         u32 CreatorRevision;
-    } __attribute__ ((packed));
+        u32 Entry[0];
+    } __attribute__((packed));
 
-    bool CheckSum(void* table, size_t len);
+    static_assert(sizeof(ACPISDTHeader) == 36, "Invalid size");
+
+    int ComputeSum(void* table, size_t len);
 
     bool ParseRsdp(RSDPDescriptor20* rsdp);
     RSDPDescriptor20* FindRsdp();
-    bool ParseRsdt(ACPISDTHeader* rsdt);
+    Shared::Error ParseRsdt(ACPISDTHeader* rsdt);
+
+    Shared::Error ParseTablePointers();
+    Shared::Error ParseMADT();
+
+    ACPISDTHeader* LookupTable(const char *name);
 
     char OemId[7];
 
     RSDPDescriptor20* Rsdp;
     ACPISDTHeader* Rsdt;
 
+    static const size_t MaxTables = 32;
+    ACPISDTHeader* Table[MaxTables];
+
+    static const bool checkRsdtChecksum = false;
     static const u64 RSDPSignature = 0x2052545020445352; //'RSD PTR '
 
 };
