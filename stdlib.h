@@ -42,8 +42,8 @@ struct Time
         return 0;
     }
 
-    u32 Secs;
-    u32 NanoSecs;
+    ulong Secs;
+    ulong NanoSecs;
 };
 
 template< class T > struct RemoveReference      {typedef T type;};

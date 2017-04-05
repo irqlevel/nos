@@ -28,7 +28,8 @@ private:
     Acpi& operator=(const Acpi& other) = delete;
     Acpi& operator=(Acpi&& other) = delete;
 
-    struct RSDPDescriptor {
+    struct RSDPDescriptor
+    {
         u64 Signature;
         u8 Checksum;
         char OEMID[6];
@@ -36,7 +37,8 @@ private:
         u32 RsdtAddress;
     } __attribute__((packed));
 
-    struct RSDPDescriptor20 {
+    struct RSDPDescriptor20
+    {
         RSDPDescriptor FirstPart;
         u32 Length;
         u64 XsdtAddress;
@@ -44,7 +46,8 @@ private:
         u8 Reserved[3];
     } __attribute__((packed));
 
-    struct ACPISDTHeader {
+    struct ACPISDTHeader
+    {
         char Signature[4];
         u32 Length;
         u8 Revision;
@@ -58,6 +61,46 @@ private:
     } __attribute__((packed));
 
     static_assert(sizeof(ACPISDTHeader) == 36, "Invalid size");
+
+    struct MadtEntry
+    {
+        u8 Type;
+        u8 Length;
+    } __attribute__((packed));
+
+    static const u8 MadtEntryTypeLapic = 0;
+    static const u8 MadtEntryTypeIoApic = 1;
+    static const u8 MadtEntryTypeIntSrcOverride = 2;
+
+    struct MadtHeader
+    {
+        u32 LocalIntCtrlAddress;
+        u32 Flags;
+        MadtEntry Entry[0];
+    } __attribute__((packed));
+
+    struct MadtLapicEntry
+    {
+        u8 AcpiProcessId;
+        u8 ApicId;
+        u32 Flags;
+    } __attribute__((packed));
+
+    struct MadtIoApicEntry
+    {
+        u8 IoApicId;
+        u8 Reserved;
+        u32 IoApicAddress;
+        u32 GlobalSystemInterruptBase;
+    } __attribute__((packed));
+
+    struct MadtIntSrcOverrideEntry
+    {
+        u8 BusSource;
+        u8 IrqSource;
+        u32 GlobalSystemInterrupt;
+        u16 Flags;
+    } __attribute__((packed));
 
     int ComputeSum(void* table, size_t len);
 

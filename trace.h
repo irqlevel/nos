@@ -63,7 +63,7 @@ do {                                                                \
         tracer.Output("%u:%u.%u:%s(),%s,%u: " fmt "\n",             \
             (level), time.Secs, time.NanoSecs,                      \
             __func__, Shared::TruncateFileName(__FILE__),           \
-            __LINE__, ##__VA_ARGS__);                               \
+            (ulong)__LINE__, ##__VA_ARGS__);                               \
     }                                                               \
 } while (false)
 
@@ -76,7 +76,7 @@ do {                                                                \
         tracer.Output("%u:%u.%u:%s(),%s,%u: Error %u at %s(),%s,%u: " fmt "\n",    \
             0, time.Secs, time.NanoSecs,                            \
             __func__, Shared::TruncateFileName(__FILE__),           \
-            __LINE__, err.GetCode(), err.GetFunc(), Shared::TruncateFileName(err.GetFile()),  \
-            err.GetLine(), ##__VA_ARGS__);                                  \
+            (ulong)__LINE__, (ulong)err.GetCode(), err.GetFunc(), Shared::TruncateFileName(err.GetFile()),  \
+            (ulong)err.GetLine(), ##__VA_ARGS__);                                  \
     }                                                               \
 } while (false)

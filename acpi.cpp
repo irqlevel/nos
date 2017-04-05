@@ -120,7 +120,7 @@ Shared::Error Acpi::ParseTablePointers()
         return MakeError(Shared::Error::NotFound);
 
     size_t tableCount = (Rsdt->Length - OFFSET_OF(ACPISDTHeader, Entry)) / sizeof(Rsdt->Entry[0]);
-    Trace(0, "Acpi: tableCount %u", tableCount);
+    Trace(AcpiLL, "Acpi: tableCount %u", tableCount);
 
     for (size_t i = 0; i < tableCount; i++)
     {
@@ -130,7 +130,7 @@ Shared::Error Acpi::ParseTablePointers()
         Shared::MemCpy(tableSignature, header->Signature, sizeof(header->Signature));
         tableSignature[4] = '\0';
 
-        Trace(0, "Acpi: table 0x%p %s", header, tableSignature);
+        Trace(AcpiLL, "Acpi: table 0x%p %s", header, tableSignature);
         if (i >= Shared::ArraySize(Table))
         {
             Trace(0, "Acpi: can't insert table %u", (ulong)i);
@@ -146,12 +146,66 @@ Shared::Error Acpi::ParseTablePointers()
 
 Shared::Error Acpi::ParseMADT()
 {
-    ACPISDTHeader* table = LookupTable("APIC");
-    if (table == nullptr)
+    ACPISDTHeader* sdtHeader = LookupTable("APIC");
+    if (sdtHeader == nullptr)
     {
         return MakeError(Shared::Error::NotFound);
     }
-    Trace(0, "Acpi: MADT 0x%p", table);
+
+    Trace(AcpiLL, "Acpi: MADT 0x%p", sdtHeader);
+
+    MadtHeader* header = reinterpret_cast<MadtHeader*>(sdtHeader + 1);
+    Trace(AcpiLL, "Acpi: MADT LIntCtrl 0x%p flags 0x%p",
+        (ulong)header->LocalIntCtrlAddress, (ulong)header->Flags);
+
+    MadtEntry* entry = &header->Entry[0];
+
+    while (Shared::MemAdd(entry, entry->Length) <= Shared::MemAdd(sdtHeader, sdtHeader->Length))
+    {
+        Trace(AcpiLL, "Acpi: MADT entry 0x%p type %u len %u",
+            entry, entry->Type, entry->Length);
+
+        switch (entry->Type)
+        {
+        case MadtEntryTypeLapic:
+        {
+            MadtLapicEntry* lapicEntry = reinterpret_cast<MadtLapicEntry*>(entry + 1);
+            if (entry->Length < sizeof(*lapicEntry) + sizeof(*entry))
+                return MakeError(Shared::Error::InvalidValue);
+
+            Trace(AcpiLL, "Acpi: MADT lapic procId %u apicId %u flags 0x%p",
+                (ulong)lapicEntry->AcpiProcessId, (ulong)lapicEntry->ApicId, (ulong)lapicEntry->Flags);
+            break;
+        }
+        case MadtEntryTypeIoApic:
+        {
+            MadtIoApicEntry* ioApicEntry = reinterpret_cast<MadtIoApicEntry*>(entry + 1);
+            if (entry->Length < sizeof(*ioApicEntry) + sizeof(*entry))
+                return MakeError(Shared::Error::InvalidValue);
+
+            Trace(AcpiLL, "Acpi: MADT ioApicId %u addr 0x%p gsi 0x%p",
+                (ulong)ioApicEntry->IoApicId, (ulong)ioApicEntry->IoApicAddress,
+                (ulong)ioApicEntry->GlobalSystemInterruptBase);
+            break;
+        }
+        case MadtEntryTypeIntSrcOverride:
+        {
+            MadtIntSrcOverrideEntry* isoEntry = reinterpret_cast<MadtIntSrcOverrideEntry*>(entry + 1);
+            if (entry->Length < sizeof(*isoEntry) + sizeof(*entry))
+                return MakeError(Shared::Error::InvalidValue);
+
+            Trace(AcpiLL, "Acpi: MADT bus 0x%p irq 0x%p gsi 0x%p flags 0x%p",
+                (ulong)isoEntry->BusSource, (ulong)isoEntry->IrqSource, (ulong)isoEntry->GlobalSystemInterrupt,
+                (ulong)isoEntry->Flags);
+            break;
+        }
+        default:
+            break;
+        }
+
+        entry = static_cast<MadtEntry*>(Shared::MemAdd(entry, entry->Length));
+    }
+
     return MakeError(Shared::Error::Success);
 }
 
