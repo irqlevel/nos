@@ -1,5 +1,5 @@
-CPPFLAGS = -std=c++11 -mcmodel=kernel -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=large -mno-red-zone
-LFLAGS = -ffreestanding -nostdlib -fno-builtin -mcmodel=large -mno-red-zone -z max-page-size=4096
+CPPFLAGS = -std=c++11 -mcmodel=kernel -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=large -mno-red-zone -mcmodel=large
+LFLAGS = -nostdlib -z max-page-size=4096
 TARGET64 = x86_64-none-elf
 CC = clang
 CPP = clang -x c++
@@ -29,11 +29,11 @@ nos.iso: kernel64.elf
 	rm -rf iso
 
 kernel64.elf: $(CPP_SRC)
-		rm -rf *.o
-		$(ASM) -felf64 boot64.asm	
-		$(ASM) -felf64 asm.asm
-		$(CPP) $(CPPFLAGS) --target=$(TARGET64) -c $(CPP_SRC)
-		$(CC) $(LFLAGS) --target=$(TARGET64) -T linker64.ld -o kernel64.elf *.o
+	rm -rf *.o
+	$(ASM) -felf64 boot64.asm
+	$(ASM) -felf64 asm.asm
+	$(CPP) $(CPPFLAGS) --target=$(TARGET64) -c $(CPP_SRC)
+	ld $(LFLAGS) -T linker64.ld -o kernel64.elf *.o
 
 clean:
 	rm -rf *.o *.elf *.bin *.iso iso
