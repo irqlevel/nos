@@ -20,6 +20,9 @@
 #include "acpi.h"
 #include "cpu.h"
 #include "cmd.h"
+#include "lapic.h"
+#include "ioapic.h"
+#include "interrupt.h"
 
 using namespace Kernel::Core;
 using namespace Shared;
@@ -132,11 +135,17 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     if (!err.Ok())
     {
         TraceError(err, "Can't parse ACPI");
+        Panic("Can't parse ACPI");
+        return;
     }
 
     err = Test();
     if (!err.Ok())
+    {
         TraceError(err, "Test failed");
+        Panic("Self test failed");
+        return;
+    }
 
     VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
 
@@ -147,6 +156,9 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     auto& kbd = IO8042::GetInstance();
     auto& serial = Serial::GetInstance();
     auto& cmd = Cmd::GetInstance();
+    auto& pic = Pic::GetInstance();
+    auto& lapic = Lapic::GetInstance();
+    auto& ioApic = IoApic::GetInstance();
 
     if (!kbd.RegisterObserver(cmd))
     {
@@ -154,11 +166,18 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
         return;
     }
 
-    Pic::GetInstance().Remap();
-    excTable.RegisterInterrupts();
-    pit.RegisterInterrupt(0x20);
-    kbd.RegisterInterrupt(0x21);
-    serial.RegisterInterrupt(0x24);
+    pic.Remap();
+    pic.Disable();
+
+    lapic.Enable();
+    ioApic.Enable();
+
+    excTable.RegisterExceptionHandlers();
+
+    Interrupt::Register(pit, 0x0, 0x20);
+    Interrupt::Register(kbd, 0x1, 0x21);
+    Interrupt::Register(serial, 0x4, 0x24);
+
     idt.Save();
     pit.Setup();
     InterruptEnable();

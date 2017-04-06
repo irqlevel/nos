@@ -3,6 +3,7 @@
 #include "types.h"
 #include "ring_buffer.h"
 #include "spin_lock.h"
+#include "interrupt.h"
 
 namespace Kernel
 {
@@ -10,7 +11,7 @@ namespace Kernel
 namespace Core
 {
 
-class Serial final
+class Serial final : public InterruptHandler
 {
 public:
     static Serial& GetInstance()
@@ -25,10 +26,10 @@ public:
     void Vprintf(const char *fmt, va_list args);
     void Printf(const char *fmt, ...);
 
-    void RegisterInterrupt(int intNum);
-    void UnregisterInterrupt();
+    virtual void OnInterruptRegister(u8 irq, u8 vector) override;
+    virtual InterruptHandlerFn GetHandlerFn() override;
 
-    static void Interrupt();
+    void Interrupt();
 
 private:
     Serial();
@@ -43,9 +44,8 @@ private:
     Serial& operator=(const Serial& other) = delete;
     Serial& operator=(Serial&& other) = delete;
 
-    void OnInterrupt();
     bool IsTransmitEmpty();
-    int IntNum;
+    int IntVector;
 
     Shared::RingBuffer<char, Shared::PageSize> Buf;
     SpinLock Lock;

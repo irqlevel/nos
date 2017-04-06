@@ -39,6 +39,9 @@ void SpinLockUnlock(ulong *lock);
 void Outb(u16 port, u8 data);
 u8 Inb(u16 port);
 
+u64 ReadMsr(u32 msr);
+void WriteMsr(u32 msr, u64 value);
+
 void InterruptEnable(void);
 void InterruptDisable(void);
 void Hlt(void);

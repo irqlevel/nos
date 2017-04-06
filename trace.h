@@ -20,6 +20,8 @@ const int SAllocatorLL = 4;
 const int SPoolLL = 4;
 const int SharedPtrLL = 5;
 const int BtreeLL = 6;
+const int LapicLL = 0;
+const int IoApicLL = 0;
 
 class Tracer
 {

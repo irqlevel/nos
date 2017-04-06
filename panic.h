@@ -38,13 +38,13 @@ do {                                                                \
     auto& panicker = Kernel::Core::Panicker::GetInstance();         \
     panicker.DoPanic("PANIC:%s():%s,%u: " fmt "\n",                 \
         __func__, Shared::TruncateFileName(__FILE__),               \
-        __LINE__, ##__VA_ARGS__);                                   \
+        (ulong)__LINE__, ##__VA_ARGS__);                            \
 } while (false)
 
 static inline bool DoBugOn(const char *func, const char *file, int line)
 {
     auto& panicker = Kernel::Core::Panicker::GetInstance();
-    panicker.DoPanic("PANIC:%s():%s,%u: BUG\n", func, file, line);
+    panicker.DoPanic("PANIC:%s():%s,%u: BUG\n", func, file, (ulong)line);
     return true;
 }
 

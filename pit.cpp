@@ -5,6 +5,7 @@
 #include "pic.h"
 #include "stdlib.h"
 #include "timer.h"
+#include "lapic.h"
 
 namespace Kernel
 {
@@ -13,7 +14,7 @@ namespace Core
 {
 
 Pit::Pit()
-    : IntNum(-1)
+    : IntVector(-1)
     , TimeMs(0)
     , TimeMsNs(0)
     , TickMs(0)
@@ -39,23 +40,15 @@ void Pit::Setup()
     Outb(Channel0Port, Shared::HighPart(ReloadValue));
 }
 
-void Pit::RegisterInterrupt(int intNum)
+void Pit::OnInterruptRegister(u8 irq, u8 vector)
 {
-    auto& idt = Idt::GetInstance();
-
-    idt.SetDescriptor(intNum, IdtDescriptor::Encode(PitInterruptStub));
-    IntNum = intNum;
+    (void)irq;
+    IntVector = vector;
 }
 
-void Pit::UnregisterInterrupt()
+InterruptHandlerFn Pit::GetHandlerFn()
 {
-    if (IntNum >= 0)
-    {
-        auto& idt = Idt::GetInstance();
-
-        idt.SetDescriptor(IntNum, IdtDescriptor(0));
-        IntNum = -1;
-    }
+    return PitInterruptStub;
 }
 
 void Pit::Interrupt()
@@ -70,7 +63,7 @@ void Pit::Interrupt()
 
     TimerTable::GetInstance().ProcessTimers();
 
-    Pic::EOI();
+    Lapic::GetInstance().EOI(IntVector);
 }
 
 Shared::Time Pit::GetTime()
@@ -85,8 +78,7 @@ Shared::Time Pit::GetTime()
 
 extern "C" void PitInterrupt()
 {
-    auto& pit = Pit::GetInstance();
-    pit.Interrupt();
+    Pit::GetInstance().Interrupt();
 }
 
 }

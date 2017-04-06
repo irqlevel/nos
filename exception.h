@@ -20,7 +20,7 @@ public:
         return instance;
     }
 
-    void RegisterInterrupts();
+    void RegisterExceptionHandlers();
 
     void ExcDivideByZero();
     void ExcDebugger();

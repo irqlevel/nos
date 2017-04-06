@@ -4,6 +4,7 @@
 #include "asm.h"
 #include "pic.h"
 #include "vga.h"
+#include "lapic.h"
 
 namespace Kernel
 {
@@ -12,7 +13,7 @@ namespace Core
 {
 
 IO8042::IO8042()
-    : IntNum(-1)
+    : IntVector(-1)
     , Mod(0)
 {
     for (size_t i = 0; i < Shared::ArraySize(Observer); i++)
@@ -23,12 +24,12 @@ IO8042::~IO8042()
 {
 }
 
-void IO8042::RegisterInterrupt(int intNum)
+void IO8042::OnInterruptRegister(u8 irq, u8 vector)
 {
-    auto& idt = Idt::GetInstance();
+    (void)irq;
 
-    idt.SetDescriptor(intNum, IdtDescriptor::Encode(IO8042InterruptStub));
-    IntNum = intNum;
+    IntVector = vector;
+
     Shared::Time period;
 
     period.Secs = 0;
@@ -37,20 +38,12 @@ void IO8042::RegisterInterrupt(int intNum)
     TimerTable::GetInstance().StartTimer(*this, period);
 }
 
-void IO8042::UnregisterInterrupt()
+InterruptHandlerFn IO8042::GetHandlerFn()
 {
-    if (IntNum >= 0)
-    {
-        TimerTable::GetInstance().StopTimer(*this);
-
-        auto& idt = Idt::GetInstance();
-
-        idt.SetDescriptor(IntNum, IdtDescriptor::Encode(nullptr));
-        IntNum = -1;
-    }
+    return IO8042InterruptStub;
 }
 
-void IO8042::OnInterrupt()
+void IO8042::Interrupt()
 {
     Shared::AutoLock lock(Lock);
 
@@ -58,14 +51,10 @@ void IO8042::OnInterrupt()
     {
         Trace(0, "Kbd: can't put new code");
     }
+
+    Lapic::GetInstance().EOI(IntVector);
 }
 
-void IO8042::Interrupt()
-{
-
-    IO8042::GetInstance().OnInterrupt();
-    Pic::EOI();
-}
 
 bool IO8042::RegisterObserver(IO8042Observer& observer)
 {
@@ -129,7 +118,7 @@ void IO8042::OnTick(TimerCallback& callback)
 
 extern "C" void IO8042Interrupt()
 {
-    IO8042::Interrupt();
+    IO8042::GetInstance().Interrupt();
 }
 
 }

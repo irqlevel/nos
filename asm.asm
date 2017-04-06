@@ -53,6 +53,8 @@ global SpinLockLock
 global SpinLockUnlock
 global Outb
 global Inb
+global ReadMsr
+global WriteMsr
 global InterruptEnable
 global InterruptDisable
 global Hlt
@@ -201,32 +203,50 @@ SpinLockUnlock:
 	ret
 
 Outb:
-        push rdx
-        mov rdx, rdi
-        mov rax, rsi
-        out dx, al
+	push rdx
+	mov rdx, rdi
+	mov rax, rsi
+	out dx, al
 	pop rdx
-        ret
+	ret
 
 Inb:
-        push rdx
-        mov rdx, rdi
-        xor rax, rax
-        in al, dx
+	push rdx
+	mov rdx, rdi
+	xor rax, rax
+	in al, dx
 	pop rdx
-        ret
+	ret
+
+ReadMsr: ;Read MSR specified by ECX into EDX:EAX.
+	mov ecx, edi
+	rdmsr
+	shl rdx, 32
+	mov edx, eax
+	mov rax, rdx
+	ret
+
+WriteMsr: ;Write the value in EDX:EAX to MSR specified by ECX.
+	mov ecx, edi
+	mov rdx, rsi
+	mov eax, edx
+	shr rdx, 32
+	wrmsr
+	ret
+
+
 
 InterruptEnable:
-        sti
-        ret
+	sti
+	ret
 
 InterruptDisable:
-        cli
-        ret
+	cli
+	ret
 
 Hlt:
-        hlt
-        ret
+	hlt
+	ret
 
 %macro PushAll 0
 	push rax

@@ -102,7 +102,7 @@ bool ExceptionTable::SetHandler(size_t index, ExcHandler handler)
     return true;
 }
 
-void ExceptionTable::RegisterInterrupts()
+void ExceptionTable::RegisterExceptionHandlers()
 {
     auto& idt = Idt::GetInstance();
 

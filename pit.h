@@ -3,6 +3,7 @@
 #include "types.h"
 #include "atomic.h"
 #include "stdlib.h"
+#include "interrupt.h"
 
 namespace Kernel
 {
@@ -10,7 +11,7 @@ namespace Kernel
 namespace Core
 {
 
-class Pit final
+class Pit final : public InterruptHandler
 {
 public:
     static Pit& GetInstance()
@@ -20,8 +21,8 @@ public:
         return instance;
     }
 
-    void RegisterInterrupt(int intNum);
-    void UnregisterInterrupt();
+    virtual void OnInterruptRegister(u8 irq, u8 vector) override;
+    virtual InterruptHandlerFn GetHandlerFn() override;
 
     void Interrupt();
 
@@ -38,7 +39,7 @@ private:
     Pit& operator=(const Pit& other) = delete;
     Pit& operator=(Pit&& other) = delete;
 
-    int IntNum;
+    int IntVector;
 
     static const int Channel0Port = 0x40;
     static const int Channel1Port = 0x41;

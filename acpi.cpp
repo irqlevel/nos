@@ -10,6 +10,8 @@ namespace Core
 Acpi::Acpi()
     : Rsdp(nullptr)
     , Rsdt(nullptr)
+    , LapicAddress(nullptr)
+    , IoApicAddress(nullptr)
 {
     OemId[0] = '\0';
     for (size_t i = 0; i < Shared::ArraySize(Table); i++)
@@ -158,12 +160,14 @@ Shared::Error Acpi::ParseMADT()
     Trace(AcpiLL, "Acpi: MADT LIntCtrl 0x%p flags 0x%p",
         (ulong)header->LocalIntCtrlAddress, (ulong)header->Flags);
 
+    LapicAddress = reinterpret_cast<void*>((ulong)header->LocalIntCtrlAddress);
+
     MadtEntry* entry = &header->Entry[0];
 
     while (Shared::MemAdd(entry, entry->Length) <= Shared::MemAdd(sdtHeader, sdtHeader->Length))
     {
         Trace(AcpiLL, "Acpi: MADT entry 0x%p type %u len %u",
-            entry, entry->Type, entry->Length);
+            entry, (ulong)entry->Type, (ulong)entry->Length);
 
         switch (entry->Type)
         {
@@ -182,6 +186,8 @@ Shared::Error Acpi::ParseMADT()
             MadtIoApicEntry* ioApicEntry = reinterpret_cast<MadtIoApicEntry*>(entry + 1);
             if (entry->Length < sizeof(*ioApicEntry) + sizeof(*entry))
                 return MakeError(Shared::Error::InvalidValue);
+
+            IoApicAddress = reinterpret_cast<void*>((ulong)ioApicEntry->IoApicAddress);
 
             Trace(AcpiLL, "Acpi: MADT ioApicId %u addr 0x%p gsi 0x%p",
                 (ulong)ioApicEntry->IoApicId, (ulong)ioApicEntry->IoApicAddress,
@@ -240,6 +246,17 @@ Shared::Error Acpi::Parse()
     }
 
     return MakeError(Shared::Error::Success);
+}
+
+
+void* Acpi::GetLapicAddress()
+{
+    return LapicAddress;
+}
+
+void* Acpi::GetIoApicAddress()
+{
+    return IoApicAddress;
 }
 
 }

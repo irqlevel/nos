@@ -25,7 +25,7 @@ p4_table:
 p3_table:
 	resb 4096
 p2_table:
-	resb 4096
+	resb 4 * 4096
 stack_bottom:
 	resb 32768
 stack_top:
@@ -119,10 +119,14 @@ setup_page_tables:
     or eax, 0b11 ; present + writable
     mov [p4_table], eax
 
+    mov edi, 0
+    mov esi, p2_table
+.map_p3_table:
     ; map first P3 entry to P2 table
-    mov eax, p2_table
+
+    mov eax, esi
     or eax, 0b11 ; present + writable
-    mov [p3_table], eax
+    mov [p3_table + edi * 8], eax
 
    ; map each P2 entry to a huge 2MiB page
     mov ecx, 0         ; counter variable
@@ -132,11 +136,15 @@ setup_page_tables:
     mov eax, 0x200000  ; 2MiB
     mul ecx            ; start address of ecx-th page
     or eax, 0b10000011 ; present + writable + huge
-    mov [p2_table + ecx * 8], eax ; map ecx-th entry
+    mov [esi + ecx * 8], eax ; map ecx-th entry
 
     inc ecx            ; increase counter
     cmp ecx, 512       ; if counter == 512, the whole P2 table is mapped
     jne .map_p2_table  ; else map the next entry
+    inc edi
+    add esi, 4096
+    cmp edi, 4
+    jne .map_p3_table
 
     ret
 

@@ -5,6 +5,7 @@
 #include "timer.h"
 #include "ring_buffer.h"
 #include "spin_lock.h"
+#include "interrupt.h"
 
 namespace Kernel
 {
@@ -18,7 +19,7 @@ public:
     virtual void OnChar(char c) = 0;
 };
 
-class IO8042 : public TimerCallback
+class IO8042 : public TimerCallback, public InterruptHandler
 {
 public:
     static IO8042& GetInstance()
@@ -27,12 +28,10 @@ public:
         return instance;
     }
 
-    void RegisterInterrupt(int intNum);
-    void UnregisterInterrupt();
+    virtual void OnInterruptRegister(u8 irq, u8 vector) override;
+    virtual InterruptHandlerFn GetHandlerFn() override;
 
-    void OnInterrupt();
-
-    static void Interrupt();
+    void Interrupt();
 
     virtual void OnTick(TimerCallback& callback) override;
 
@@ -55,7 +54,7 @@ private:
     SpinLock Lock;
     Shared::RingBuffer<u8, Shared::PageSize> Buf;
 
-    int IntNum;
+    int IntVector;
     u8 Mod;
 
     static const size_t MaxObserver = 16;

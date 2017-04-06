@@ -3,6 +3,7 @@
 #include "stdlib.h"
 #include "idt.h"
 #include "pic.h"
+#include "lapic.h"
 
 namespace Kernel
 {
@@ -11,7 +12,7 @@ namespace Core
 {
 
 Serial::Serial()
-    : IntNum(-1)
+    : IntVector(-1)
 {
     Outb(Port + 1, 0x00);    // Disable all interrupts
     Outb(Port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
@@ -101,42 +102,28 @@ void Serial::Printf(const char *fmt, ...)
 	va_end(args);
 }
 
-void Serial::RegisterInterrupt(int intNum)
+void Serial::OnInterruptRegister(u8 irq, u8 vector)
 {
-    auto& idt = Idt::GetInstance();
+    (void)irq;
 
-    idt.SetDescriptor(intNum, IdtDescriptor::Encode(IO8042InterruptStub));
-    IntNum = intNum;
+    IntVector = vector;
 }
 
-void Serial::UnregisterInterrupt()
+InterruptHandlerFn Serial::GetHandlerFn()
 {
-    if (IntNum >= 0)
-    {
-        auto& idt = Idt::GetInstance();
-
-        idt.SetDescriptor(IntNum, IdtDescriptor(0));
-        IntNum = -1;
-    }
-}
-
-void Serial::OnInterrupt()
-{
-    Shared::AutoLock lock(Lock);
-    Send();
+    return IO8042InterruptStub;
 }
 
 void Serial::Interrupt()
 {
-    auto& serial = Serial::GetInstance();
-
-    serial.OnInterrupt();
-    Pic::EOI();
+    Shared::AutoLock lock(Lock);
+    Send();
+    Lapic::GetInstance().EOI(IntVector);
 }
 
 extern "C" void SerialInterrupt()
 {
-    Serial::Interrupt();
+    Serial::GetInstance().Interrupt();
 }
 
 }

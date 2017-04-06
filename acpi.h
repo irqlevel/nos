@@ -20,6 +20,10 @@ public:
 
     Shared::Error Parse();
 
+    void* GetLapicAddress();
+
+    void* GetIoApicAddress();
+
 private:
     Acpi();
     ~Acpi();
@@ -124,6 +128,8 @@ private:
     static const bool checkRsdtChecksum = false;
     static const u64 RSDPSignature = 0x2052545020445352; //'RSD PTR '
 
+    void* LapicAddress;
+    void* IoApicAddress;
 };
 
 }

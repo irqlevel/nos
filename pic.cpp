@@ -57,6 +57,12 @@ void Pic::EOI()
     Outb(PIC1, PIC_EOI);
 }
 
+void Pic::Disable()
+{
+	Outb(PIC2_DATA, 0xFF);
+	Outb(PIC1_DATA, 0xFF);
+}
+
 }
 
 }
