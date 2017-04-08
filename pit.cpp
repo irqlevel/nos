@@ -6,6 +6,7 @@
 #include "stdlib.h"
 #include "timer.h"
 #include "lapic.h"
+#include "trace.h"
 
 namespace Kernel
 {

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "stdlib.h"
-
+#include "spin_lock.h"
 
 namespace Kernel
 {
@@ -32,7 +32,7 @@ private:
     IoApic& operator=(IoApic&& other) = delete;
 
     u32 ReadRegister(u8 reg);
-    void WriteRegister(u8 reg, u8 value);
+    void WriteRegister(u8 reg, u32 value);
 
     void SetEntry(u8 index, u64 data);
 
@@ -45,6 +45,7 @@ private:
     static const ulong RedTbl = 0x10;
 
     void *BaseAddress;
+    SpinLock OpLock;
 };
 
 }

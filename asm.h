@@ -78,4 +78,6 @@ void ExcControlProtectionStub();
 #ifdef __cplusplus
 }
 
+#define Barrier() __asm__ __volatile__("": : :"memory")
+
 #endif

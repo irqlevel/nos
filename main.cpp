@@ -174,7 +174,8 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
 
     excTable.RegisterExceptionHandlers();
 
-    Interrupt::Register(pit, 0x0, 0x20);
+    //TODO: irq -> gsi remap by ACPI MADT
+    Interrupt::Register(pit, 0x2, 0x20);
     Interrupt::Register(kbd, 0x1, 0x21);
     Interrupt::Register(serial, 0x4, 0x24);
 

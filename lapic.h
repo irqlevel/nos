@@ -1,11 +1,10 @@
 #pragma once
 
 #include "stdlib.h"
-
+#include "spin_lock.h"
 
 namespace Kernel
 {
-
 
 namespace Core
 {
@@ -35,18 +34,20 @@ private:
 
     u32 ReadReg(ulong index);
     void WriteReg(ulong index, u32 value);
-    volatile void* GetRegBase(ulong index);
+    void* GetRegBase(ulong index);
 
     bool CheckIsr(u8 vector);
 
-    void *BaseAddress;  
+    void *BaseAddress;
+
+    SpinLock OpLock;
  
     static const ulong ApicIdIndex = 2;
     static const ulong TprIndex = 0x8;
     static const ulong LdrIndex = 0xD;
     static const ulong DfrIndex = 0xE;
     static const ulong EoiIndex = 0xB;
-    static const ulong SpuriousInterruptVectorIndex = 0xF;
+    static const ulong SpIvIndex = 0xF;
     static const ulong IsrBaseIndex = 0x10;
 
     static const ulong BaseMsr = 0x1B;

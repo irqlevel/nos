@@ -116,16 +116,17 @@ check_long_mode:
 setup_page_tables:
     ; map first P4 entry to P3 table
     mov eax, p3_table
-    or eax, 0b11 ; present + writable
+    or eax, 0b11011 ; present + writable
     mov [p4_table], eax
 
+    mov ebx, 0
     mov edi, 0
     mov esi, p2_table
 .map_p3_table:
     ; map first P3 entry to P2 table
 
     mov eax, esi
-    or eax, 0b11 ; present + writable
+    or eax, 0b11011 ; cache disabled + write through + present + writable
     mov [p3_table + edi * 8], eax
 
    ; map each P2 entry to a huge 2MiB page
@@ -135,7 +136,10 @@ setup_page_tables:
     ; map ecx-th P2 entry to a huge page that starts at address 2MiB*ecx
     mov eax, 0x200000  ; 2MiB
     mul ecx            ; start address of ecx-th page
-    or eax, 0b10000011 ; present + writable + huge
+
+    add eax, ebx
+
+    or eax, 0b10011011 ; present + writable + huge
     mov [esi + ecx * 8], eax ; map ecx-th entry
 
     inc ecx            ; increase counter
@@ -143,6 +147,7 @@ setup_page_tables:
     jne .map_p2_table  ; else map the next entry
     inc edi
     add esi, 4096
+    add ebx, 0x40000000 ; 1GB
     cmp edi, 4
     jne .map_p3_table
 
