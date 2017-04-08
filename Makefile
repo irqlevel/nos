@@ -6,7 +6,7 @@ CPP = clang -x c++
 ASM = nasm
 AR = ar
 
-CPP_SRC = icxxabi.cpp list_entry.cpp new.cpp sallocator.cpp spage_allocator.cpp spool.cpp vga.cpp kernel.cpp \
+CPP_SRC = icxxabi.cpp list_entry.cpp new.cpp sallocator.cpp spage_allocator.cpp spool.cpp vga.cpp main.cpp \
 	trace.cpp stdlib.cpp panic.cpp debug.cpp error.cpp atomic.cpp 8042.cpp idt_descriptor.cpp idt.cpp \
 	memory_map.cpp test.cpp serial.cpp pic.cpp exception.cpp pit.cpp timer.cpp acpi.cpp cpu.cpp cmd.cpp \
 	dmesg.cpp lapic.cpp ioapic.cpp interrupt.cpp

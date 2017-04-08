@@ -2,6 +2,7 @@
 #include "asm.h"
 #include "stdlib.h"
 #include "pic.h"
+#include "trace.h"
 
 namespace Kernel
 {
@@ -62,17 +63,14 @@ void Idt::SetDescriptor(u16 index, const IdtDescriptor& desc)
     Entry[index] = desc;
 }
 
-void Idt::DummyHandler()
+void Idt::DummyInterrupt()
 {
     DummyHandlerCounter.Inc();
-    Pic::EOI();
 }
 
 extern "C" void DummyInterrupt()
 {
-    auto& idt = Idt::GetInstance();
-
-    idt.DummyHandler();
+    Idt::GetInstance().DummyInterrupt();
 }
 
 }

@@ -22,6 +22,7 @@ const int SharedPtrLL = 5;
 const int BtreeLL = 6;
 const int LapicLL = 0;
 const int IoApicLL = 0;
+const int MmIoLL = 4;
 
 class Tracer
 {

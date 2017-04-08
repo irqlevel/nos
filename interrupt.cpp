@@ -15,7 +15,9 @@ namespace Core
         auto& ioApic = IoApic::GetInstance();
         auto& lapic = Lapic::GetInstance();
 
-        Trace(0, "Register interrupt irq 0x%p vector 0x%p", (ulong)irq, (ulong)vector);
+        Trace(0, "Register interrupt irq 0x%p vector 0x%p fn 0x%p",
+            (ulong)irq, (ulong)vector, handler.GetHandlerFn());
+
         ioApic.SetIrq(irq, lapic.GetId(), vector);
         idt.SetDescriptor(vector, IdtDescriptor::Encode(handler.GetHandlerFn()));
 

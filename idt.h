@@ -30,7 +30,7 @@ public:
 
     u16 GetLimit();
 
-    void DummyHandler();
+    void DummyInterrupt();
 
 private:
     Idt();
