@@ -6,6 +6,7 @@ extern DummyInterrupt
 extern IO8042Interrupt
 extern SerialInterrupt
 extern PitInterrupt
+extern IPInterrupt
 
 extern ExcDivideByZero
 extern ExcDebugger
@@ -63,6 +64,7 @@ global DummyInterruptStub
 global IO8042InterruptStub
 global SerialInterruptStub
 global PitInterruptStub
+global IPInterruptStub
 
 global ExcDivideByZeroStub
 global ExcDebuggerStub
@@ -307,6 +309,8 @@ InterruptStub Dummy
 InterruptStub IO8042
 InterruptStub Serial
 InterruptStub Pit
+InterruptStub IP
+
 ExceptionStub ExcDivideByZero
 ExceptionStub ExcDebugger
 ExceptionStub ExcNMI

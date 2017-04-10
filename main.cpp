@@ -133,10 +133,10 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
         return;
     }
 
-    //boot64.asm only setup paging for first 0x40000000 bytes(1GB)
+    //boot64.asm only setup paging for first 4GB
     //so do not overflow it
-    if (memEnd > 0x40000000)
-        memEnd = 0x40000000;
+    if (memEnd > 0x100000000)
+        memEnd = 0x100000000;
 
     Trace(0, "Memory region 0x%p 0x%p", memStart, memEnd);
     SPageAllocator::GetInstance(memStart, memEnd);
@@ -200,14 +200,27 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     Interrupt::Register(kbd, 0x1, 0x21);
     Interrupt::Register(serial, 0x4, 0x24);
 
+    idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
+
     idt.Save();
     pit.Setup();
     InterruptEnable();
 
-    if (!CpuTable::GetInstance().StartAll())
+    if (!cpus.StartAll())
     {
         Panic("Can't start all cpus");
         return;
+    }
+
+    VgaTerm::GetInstance().Printf("IPI test...\n");
+
+    ulong cpuMask = cpus.GetRunningCpus();
+    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    {
+        if (cpuMask & ((ulong)1 << i))
+        {
+            cpus.SendIPI(i);
+        }
     }
 
     VgaTerm::GetInstance().Printf("Idle looping...\n");

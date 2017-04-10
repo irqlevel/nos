@@ -180,5 +180,46 @@ Cpu& CpuTable::GetCurrentCpu()
     return GetCpu(GetCurrentCpuId());
 }
 
+void Cpu::IPI()
+{
+    Trace(0, "IPI cpu %u", Index);
+    Lapic::EOI(CpuTable::IPIVector);
+}
+
+extern "C" void IPInterrupt()
+{
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    cpu.IPI();
+}
+
+void CpuTable::SendIPI(ulong index)
+{
+    Shared::AutoLock lock(Lock);
+
+    if (BugOn(index >= Shared::ArraySize(CpuArray)))
+        return;
+
+    auto& cpu = CpuArray[BspIndex];
+    if (BugOn(!(cpu.GetState() & Cpu::StateRunning)))
+        return;
+
+    Lapic::SendIPI(index, CpuTable::IPIVector);
+}
+
+ulong CpuTable::GetRunningCpus()
+{
+    Shared::AutoLock lock(Lock);
+
+    ulong result = 0;
+    for (ulong i = 0; i < Shared::ArraySize(CpuArray); i++)
+    {
+        auto& cpu = CpuArray[i];
+        if (cpu.GetState() & Cpu::StateRunning)
+            result |= (ulong)1 << i;
+    }
+
+    return result;
+}
+
 }
 }

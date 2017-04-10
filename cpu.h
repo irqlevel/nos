@@ -25,6 +25,8 @@ public:
 
     ulong GetState();
 
+    void IPI();
+
     static const ulong StateInited = 0x1;
     static const ulong StateRunning = 0x2;
 
@@ -60,6 +62,12 @@ public:
     ulong GetCurrentCpuId();
 
     Cpu& GetCurrentCpu();
+
+    static const u8 IPIVector = 0xFE;
+
+    void SendIPI(ulong index);
+
+    ulong GetRunningCpus();
 
 private:
     CpuTable();

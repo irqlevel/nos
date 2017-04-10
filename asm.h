@@ -49,6 +49,7 @@ void Hlt(void);
 void IO8042InterruptStub();
 void SerialInterruptStub();
 void PitInterruptStub();
+void IPInterruptStub();
 
 void DummyInterruptStub();
 

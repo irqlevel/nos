@@ -35,7 +35,7 @@ void Lapic::Enable()
     WriteReg(DfrIndex, 0xffffffff);// Flat mode
     WriteReg(LdrIndex, 0x01000000);// All cpus use logical id 1
     WriteReg(TprIndex, 0xFF);// Disable all interrupts
-    WriteReg(SpIvIndex, 0x1FE);
+    WriteReg(SpIvIndex, 0x1FF);
 
     Trace(LapicLL, "Lapic: tpr 0x%p dfr 0x%p ldr 0x%p spiv 0x%p",
         (ulong)ReadReg(TprIndex), (ulong)ReadReg(DfrIndex), (ulong)ReadReg(LdrIndex), (ulong)ReadReg(SpIvIndex));
@@ -81,6 +81,17 @@ void Lapic::SendStartup(u32 apicId, u32 vector)
 {
     WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
     WriteReg(IcrLowIndex, vector | IcrStartup | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
+
+    while (ReadReg(IcrLowIndex) & IcrSendPending)
+    {
+        Pause();
+    }
+}
+
+void Lapic::SendIPI(u32 apicId, u32 vector)
+{
+    WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
+    WriteReg(IcrLowIndex, vector | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
 
     while (ReadReg(IcrLowIndex) & IcrSendPending)
     {

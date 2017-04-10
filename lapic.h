@@ -23,6 +23,8 @@ public:
 
     static void SendStartup(u32 apicId, u32 vector);
 
+    static void SendIPI(u32 apicId, u32 vector);
+
 private:
     Lapic() = delete;
     ~Lapic() = delete;
