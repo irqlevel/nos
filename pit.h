@@ -4,6 +4,7 @@
 #include "atomic.h"
 #include "stdlib.h"
 #include "interrupt.h"
+#include "spin_lock.h"
 
 namespace Kernel
 {
@@ -30,6 +31,9 @@ public:
 
     Shared::Time GetTime();
 
+    void Wait(const Shared::Time& timeout);
+    void Wait(ulong nanoSecs);
+
 private:
     Pit();
     ~Pit();
@@ -52,6 +56,8 @@ private:
     u32 TickMs;
     u32 TickMsNs;
     u16 ReloadValue;
+
+    SpinLock Lock;
 };
 
 

@@ -30,6 +30,8 @@ Pit::~Pit()
 
 void Pit::Setup()
 {
+    Shared::AutoLock lock(Lock);
+
     ReloadValue = 11932; // 1193182 / 11932.0 = 99.99849145155883
     TickMs = 10; // 1000 / 99.99849145155883 = 10.00015085711987
     TickMsNs = 150857;
@@ -54,21 +56,26 @@ InterruptHandlerFn Pit::GetHandlerFn()
 
 void Pit::Interrupt()
 {
-    TimeMs += TickMs;
-    TimeMsNs += TickMsNs;
-    while (TimeMsNs >= 1000000)
     {
-        TimeMsNs -= 1000000;
-        TimeMs += 1;
+        Shared::AutoLock lock(Lock);
+
+        TimeMs += TickMs;
+        TimeMsNs += TickMsNs;
+        while (TimeMsNs >= 1000000)
+        {
+            TimeMsNs -= 1000000;
+            TimeMs += 1;
+        }
     }
 
     TimerTable::GetInstance().ProcessTimers();
 
-    Lapic::GetInstance().EOI(IntVector);
+    Lapic::EOI(IntVector);
 }
 
 Shared::Time Pit::GetTime()
 {
+    Shared::AutoLock lock(Lock);
     Shared::Time time;
 
     time.Secs = TimeMs / 1000;
@@ -80,6 +87,32 @@ Shared::Time Pit::GetTime()
 extern "C" void PitInterrupt()
 {
     Pit::GetInstance().Interrupt();
+}
+
+void Pit::Wait(const Shared::Time& timeout)
+{
+    Shared::Time expTime = GetTime();
+    expTime.Add(timeout);
+
+    for (;;)
+    {
+        Shared::Time currTime = GetTime();
+        if (expTime.Compare(currTime) < 0)
+        {
+            break;
+        }
+        Hlt();
+    }
+}
+
+void Pit::Wait(ulong nanoSecs)
+{
+    Shared::Time timeout;
+
+    timeout.Secs = 0;
+    timeout.NanoSecs = nanoSecs;
+
+    Wait(timeout);
 }
 
 }

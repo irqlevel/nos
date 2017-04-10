@@ -1,5 +1,6 @@
 #include "acpi.h"
 #include "trace.h"
+#include "cpu.h"
 
 namespace Kernel
 {
@@ -179,6 +180,12 @@ Shared::Error Acpi::ParseMADT()
 
             Trace(AcpiLL, "Acpi: MADT lapic procId %u apicId %u flags 0x%p",
                 (ulong)lapicEntry->AcpiProcessId, (ulong)lapicEntry->ApicId, (ulong)lapicEntry->Flags);
+
+            if (lapicEntry->Flags & 0x1)
+            {
+                if (!CpuTable::GetInstance().InsertCpu(lapicEntry->ApicId))
+                    return MakeError(Shared::Error::Unsuccessful);
+            }
             break;
         }
         case MadtEntryTypeIoApic:

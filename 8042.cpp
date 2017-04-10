@@ -52,7 +52,7 @@ void IO8042::Interrupt()
         Trace(0, "Kbd: can't put new code");
     }
 
-    Lapic::GetInstance().EOI(IntVector);
+    Lapic::EOI(IntVector);
 }
 
 

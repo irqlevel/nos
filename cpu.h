@@ -15,12 +15,18 @@ public:
     Cpu();
     ~Cpu();
 
+    void Init(ulong index);
+
+    void SetRunning();
+
     ulong GetIndex();
 
     void Idle();
 
-    bool Activate(ulong index);
-    bool IsActive();
+    ulong GetState();
+
+    static const ulong StateInited = 0x1;
+    static const ulong StateRunning = 0x2;
 
 private:
     Cpu(const Cpu& other) = delete;
@@ -29,7 +35,7 @@ private:
     Cpu& operator=(Cpu&& other) = delete;
 
     ulong Index;
-    bool Active;
+    ulong State;
     SpinLock Lock;
 };
 
@@ -42,9 +48,18 @@ public:
         return instance;
     }
 
-    bool RegisterCpu(ulong index);
+    bool InsertCpu(ulong index);
 
     Cpu& GetCpu(ulong index);
+
+    bool StartAll();
+
+    ulong GetBspIndex();
+    bool SetBspIndex(ulong index);
+
+    ulong GetCurrentCpuId();
+
+    Cpu& GetCurrentCpu();
 
 private:
     CpuTable();
@@ -54,9 +69,14 @@ private:
     CpuTable& operator=(const CpuTable& other) = delete;
     CpuTable& operator=(CpuTable&& other) = delete;
 
+    ulong GetBspIndexLockHeld();
+
     static const ulong MaxCpu = 16;
+
     SpinLock Lock;
     Cpu CpuArray[MaxCpu];
+
+    ulong BspIndex;
 };
 
 }

@@ -78,33 +78,46 @@ void ParseGrubInfo(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     }
 }
 
-void DumpCpuState()
+void TraceCpuState(ulong cpu)
 {
-    Trace(0, "Cpu cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
-        GetCr0(), GetCr2(), GetCr3(), GetCr4());
+    Trace(0, "Cpu %u cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
+        cpu, GetCr0(), GetCr2(), GetCr3(), GetCr4());
 
-    Trace(0, "Cpu rflags 0x%p rsp 0x%p rip 0x%p",
-        GetRflags(), GetRsp(), GetRip());
+    Trace(0, "Cpu %u rflags 0x%p rsp 0x%p rip 0x%p",
+        cpu, GetRflags(), GetRsp(), GetRip());
 
-    Trace(0, "Cpu ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
-        (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
+    Trace(0, "Cpu %u ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
+        cpu, (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
+}
+
+extern "C" void ApMain()
+{
+    Lapic::Enable();
+
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    cpu.SetRunning();
+
+    Trace(0, "Cpu %u started rflags 0x%p", cpu.GetIndex(), GetRflags());
+
+    TraceCpuState(cpu.GetIndex());
+
+    Idt::GetInstance().Save();
+
+    InterruptEnable();
+
+    for (;;)
+    {
+        cpu.Idle();
+    }
 }
 
 extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
 {
     Tracer::GetInstance().SetLevel(1);
-    Trace(0, "Enter");
+    Trace(0, "Enter rflags 0x%p", GetRflags());
 
     VgaTerm::GetInstance().Printf("Hello!\n");
-
-    DumpCpuState();
-
-    if (!CpuTable::GetInstance().RegisterCpu(0))
-    {
-        Panic("Can't register 0 cpu");
-        return;
-    }
 
     ParseGrubInfo(MbInfo);
 
@@ -150,16 +163,14 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
 
     auto& idt = Idt::GetInstance();
-
     auto& excTable = ExceptionTable::GetInstance();
     auto& pit = Pit::GetInstance();
     auto& kbd = IO8042::GetInstance();
     auto& serial = Serial::GetInstance();
     auto& cmd = Cmd::GetInstance();
     auto& pic = Pic::GetInstance();
-    auto& lapic = Lapic::GetInstance();
     auto& ioApic = IoApic::GetInstance();
-
+    auto& cpus = CpuTable::GetInstance();
     if (!kbd.RegisterObserver(cmd))
     {
         Panic("Can't register cmd in kbd");
@@ -169,7 +180,17 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     pic.Remap();
     pic.Disable();
 
-    lapic.Enable();
+    Lapic::Enable();
+
+    auto& cpu = cpus.GetCurrentCpu();
+    if (!cpus.SetBspIndex(cpu.GetIndex()))
+    {
+        Panic("Can't set boot processor index");
+        return;
+    }
+
+    TraceCpuState(cpu.GetIndex());
+
     ioApic.Enable();
 
     excTable.RegisterExceptionHandlers();
@@ -183,10 +204,15 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     pit.Setup();
     InterruptEnable();
 
+    if (!CpuTable::GetInstance().StartAll())
+    {
+        Panic("Can't start all cpus");
+        return;
+    }
+
     VgaTerm::GetInstance().Printf("Idle looping...\n");
 
     cmd.Start();
-    auto& cpu = CpuTable::GetInstance().GetCpu(0);
     for (;;)
     {
         cpu.Idle();

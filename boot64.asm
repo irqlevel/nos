@@ -1,8 +1,34 @@
-BITS 32
-
 extern Main
+extern ApMain
 extern __cxa_finalize
 
+%define MAX_CPUS 8
+%define CPU_STACK_SIZE 32768
+
+BITS 16
+section .trampolinedata
+gdt32:
+    dq 0x0000000000000000       ; Null Descriptor
+.code equ $ - gdt32                 ; Code segment
+    dq 0x00cf9a000000ffff
+.data equ $ - gdt32                 ; Data segment
+    dq 0x00cf92000000ffff
+.desc:
+    dw $ - gdt32 - 1            ; 16-bit Size (Limit)
+    dd gdt32                    ; 32-bit Base Address
+
+section .trampoline
+trampoline_start:
+    lgdt [gdt32.desc]
+    mov eax, cr0
+    or al, 0x01
+    mov cr0, eax
+    jmp gdt32.code:ap_start32_stub         ; Jump to 32-bit code
+ap_start32_stub:
+    BITS 32
+    jmp gdt32.code:ap_start32         ; Jump to 32-bit code
+
+BITS 32
 section .multiboot
 align 8
     dd 0xe85250d6                ; magic number (multiboot 2)
@@ -21,16 +47,20 @@ align 8
 section .bootstrap_stack, nobits
 align 4096
 p4_table:
-	resb 4096
+    resb 4096
 p3_table:
-	resb 4096
+    resb 4096
 p2_table:
-	resb 4 * 4096
+    resb 4 * 4096
 stack_bottom:
-	resb 32768
+    resb CPU_STACK_SIZE * MAX_CPUS
 stack_top:
 mbinfo:
-	resb 8
+    resb 8
+mbsig:
+    resb 8
+stack_counter:
+    resb 8
 
 section .rodata
 gdt64:
@@ -42,6 +72,29 @@ gdt64:
     dq gdt64
 
 section .text
+%macro InitStack 0
+    mov dword [stack_counter], 0
+%endmacro
+
+%macro AllocStack 0
+    xor eax, eax
+    inc eax
+    lock xadd dword [stack_counter], eax
+    cmp eax, MAX_CPUS
+    jge .nostack
+    mov ebx, CPU_STACK_SIZE
+    mul ebx
+    mov edx, stack_top
+    sub edx, eax
+    mov eax, edx
+    jmp .out
+.nostack:
+    xor eax, eax
+    mov al, "3"
+    jmp error
+.out:
+%endmacro
+
 ; Prints `ERR: ` and the given error code to screen and hangs.
 ; parameter: error code (in ascii) in al
 error:
@@ -49,6 +102,7 @@ error:
     mov dword [0xb8004], 0x4f3a4f52
     mov dword [0xb8008], 0x4f204f20
     mov byte  [0xb800a], al
+    cli
     hlt
 
 check_multiboot:
@@ -116,7 +170,7 @@ check_long_mode:
 setup_page_tables:
     ; map first P4 entry to P3 table
     mov eax, p3_table
-    or eax, 0b11011 ; present + writable
+    or eax, 0b10011 ; present + writable + cache disabled
     mov [p4_table], eax
 
     mov ebx, 0
@@ -126,7 +180,7 @@ setup_page_tables:
     ; map first P3 entry to P2 table
 
     mov eax, esi
-    or eax, 0b11011 ; cache disabled + write through + present + writable
+    or eax, 0b10011 ; present + writable + cache disabled
     mov [p3_table + edi * 8], eax
 
    ; map each P2 entry to a huge 2MiB page
@@ -139,7 +193,7 @@ setup_page_tables:
 
     add eax, ebx
 
-    or eax, 0b10011011 ; present + writable + huge
+    or eax, 0b10010011 ; present + writable + cache disabled + huge
     mov [esi + ecx * 8], eax ; map ecx-th entry
 
     inc ecx            ; increase counter
@@ -178,36 +232,67 @@ enable_paging:
 
 global _start
 _start:
-	mov esp, stack_top
-	mov [mbinfo], ebx
-	call check_multiboot
-	call check_cpuid
-	call check_long_mode
-	call setup_page_tables
-	call enable_paging
-	; load the 64-bit GDT
-	lgdt [gdt64.pointer]
-	jmp gdt64.code:long_mode_start
-	cli
-_start_hang:
-	hlt
-	jmp _start_hang
+    mov [mbsig], eax
+    mov [mbinfo], ebx
+    InitStack
+    AllocStack
+    mov esp, eax
+    mov eax, [mbsig]
+    call check_multiboot
+    call check_cpuid
+    call check_long_mode
+    call setup_page_tables
+    call enable_paging
+    ; load the 64-bit GDT
+    lgdt [gdt64.pointer]
+    jmp gdt64.code:long_mode_start
+    cli
+.hang:
+    hlt
+    jmp .hang
+
+ap_start32:
+    AllocStack
+    mov esp, eax
+    call enable_paging
+    ; load the 64-bit GDT
+    lgdt [gdt64.pointer]
+    jmp gdt64.code:long_mode_ap_start
+    cli
+.ap_start32_hang:
+    hlt
+    jmp .ap_start32_hang
 
 BITS 64
 long_mode_start:
-	; load 0 into all data segment registers
-	mov ax, 0
-	mov ss, ax
-	mov ds, ax
-	mov es, ax
-	mov fs, ax
-	mov gs, ax
+    ; load 0 into all data segment registers
+    mov ax, 0
+    mov ss, ax
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
 start64:
-	mov rdi, [mbinfo]
-	call Main
-	xor rdi, rdi
-	call __cxa_finalize
-	cli
+    mov rdi, [mbinfo]
+    call Main
+    xor rdi, rdi
+    call __cxa_finalize
+    cli
 start64_hang:
-	hlt
-	jmp start64_hang
+    hlt
+    jmp start64_hang
+
+long_mode_ap_start:
+    ; load 0 into all data segment registers
+    mov ax, 0
+    mov ss, ax
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+ap_start64:
+    call ApMain
+    cli
+ap_start64_hang:
+    hlt
+    jmp ap_start64_hang

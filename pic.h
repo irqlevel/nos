@@ -22,7 +22,7 @@ public:
 
     void Disable();
 
-    static void EOI();
+    void EOI();
 
 private:
     Pic();

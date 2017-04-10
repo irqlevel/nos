@@ -9,3 +9,4 @@ iso
 .*.sw[ponm]
 bin
 *.log
+*.out

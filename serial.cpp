@@ -118,7 +118,7 @@ void Serial::Interrupt()
 {
     Shared::AutoLock lock(Lock);
     Send();
-    Lapic::GetInstance().EOI(IntVector);
+    Lapic::EOI(IntVector);
 }
 
 extern "C" void SerialInterrupt()

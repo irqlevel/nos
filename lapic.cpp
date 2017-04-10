@@ -10,31 +10,20 @@ namespace Kernel
 namespace Core
 {
 
-Lapic::Lapic()
-    : BaseAddress(nullptr)
-{
-    BaseAddress = Acpi::GetInstance().GetLapicAddress();
-}
-
-Lapic::~Lapic()
-{
-}
-
 void* Lapic::GetRegBase(ulong index)
 {
-    return Shared::MemAdd(BaseAddress, index * 0x10);
+    return Shared::MemAdd(Acpi::GetInstance().GetLapicAddress(), index * 0x10);
 }
 
 u32 Lapic::ReadReg(ulong index)
 {
-    SpinLock lock(OpLock);
     return MmIo::Read32(GetRegBase(index));
 }
 
 void Lapic::WriteReg(ulong index, u32 value)
 {
-    SpinLock lock(OpLock);
     MmIo::Write32(GetRegBase(index), value);
+    Barrier();
 }
 
 void Lapic::Enable()
@@ -43,15 +32,19 @@ void Lapic::Enable()
 
     Trace(LapicLL, "Lapic: msr 0x%p", msr);
 
-    WriteReg(TprIndex, 0x0);// Clear task priority to enable all interrupts
     WriteReg(DfrIndex, 0xffffffff);// Flat mode
     WriteReg(LdrIndex, 0x01000000);// All cpus use logical id 1
-    WriteReg(SpIvIndex, 0x1FF);
+    WriteReg(TprIndex, 0xFF);// Disable all interrupts
+    WriteReg(SpIvIndex, 0x1FE);
 
     Trace(LapicLL, "Lapic: tpr 0x%p dfr 0x%p ldr 0x%p spiv 0x%p",
         (ulong)ReadReg(TprIndex), (ulong)ReadReg(DfrIndex), (ulong)ReadReg(LdrIndex), (ulong)ReadReg(SpIvIndex));
 
-    Trace(LapicLL, "Lapic: id 0x%p", (ulong)GetId());
+    Trace(LapicLL, "Lapic: apicId 0x%p", (ulong)GetApicId());
+
+    WriteReg(EoiIndex, 0x0); // Acknowledge any outstanding interrupts
+
+    WriteReg(TprIndex, 0x0);// Clear task priority to enable all interrupts
 }
 
 bool Lapic::CheckIsr(u8 vector)
@@ -65,14 +58,35 @@ bool Lapic::CheckIsr(u8 vector)
 void Lapic::EOI(u8 vector)
 {
     if (CheckIsr(vector))
-        WriteReg(EoiIndex, 0x1);
+        WriteReg(EoiIndex, 0x0);
 }
 
-u8 Lapic::GetId()
+u8 Lapic::GetApicId()
 {
     return ReadReg(ApicIdIndex) >> 24;
 }
 
+void Lapic::SendInit(u32 apicId)
+{
+    WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
+    WriteReg(IcrLowIndex, IcrInit | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
+
+    while (ReadReg(IcrLowIndex) & IcrSendPending)
+    {
+        Pause();
+    }
 }
 
+void Lapic::SendStartup(u32 apicId, u32 vector)
+{
+    WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
+    WriteReg(IcrLowIndex, vector | IcrStartup | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
+
+    while (ReadReg(IcrLowIndex) & IcrSendPending)
+    {
+        Pause();
+    }
+}
+
+}
 }
