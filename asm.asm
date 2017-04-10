@@ -236,8 +236,6 @@ WriteMsr: ;Write the value in EDX:EAX to MSR specified by ECX.
 	wrmsr
 	ret
 
-
-
 InterruptEnable:
 	sti
 	ret
@@ -251,11 +249,10 @@ Hlt:
 	ret
 
 %macro PushAll 0
+	pushfq
 	push rax
-	lea rax, [rsp + 8]
-	push rax
-	push rbp
 	push rbx
+	push rcx
 	push rdx
 	push rdi
 	push rsi
@@ -267,9 +264,13 @@ Hlt:
 	push r13
 	push r14
 	push r15
+	push rbp
+	push rsp
 %endmacro
 
 %macro PopAll 0
+	pop rsp
+	pop rbp
 	pop r15
 	pop r14
 	pop r13
@@ -281,15 +282,16 @@ Hlt:
 	pop rsi
 	pop rdi
 	pop rdx
+	pop rcx
 	pop rbx
-	pop rbp
-	pop rsp
-	mov rax, [rsp]
+	pop rax
+	popfq
 %endmacro
 
 %macro InterruptStub 1
 %1InterruptStub:
 	PushAll
+	mov rdi, rsp
 	cld
 	call %1Interrupt
 	PopAll
@@ -299,6 +301,7 @@ Hlt:
 %macro ExceptionStub 1
 %1Stub:
 	PushAll
+	mov rdi, rsp
 	cld
 	call %1
 	PopAll

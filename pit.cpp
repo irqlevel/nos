@@ -54,8 +54,10 @@ InterruptHandlerFn Pit::GetHandlerFn()
     return PitInterruptStub;
 }
 
-void Pit::Interrupt()
+void Pit::Interrupt(Context* ctx)
 {
+    (void)ctx;
+
     {
         Shared::AutoLock lock(Lock);
 
@@ -84,9 +86,9 @@ Shared::Time Pit::GetTime()
     return time;
 }
 
-extern "C" void PitInterrupt()
+extern "C" void PitInterrupt(Context* ctx)
 {
-    Pit::GetInstance().Interrupt();
+    Pit::GetInstance().Interrupt(ctx);
 }
 
 void Pit::Wait(const Shared::Time& timeout)

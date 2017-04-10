@@ -31,7 +31,7 @@ public:
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;
     virtual InterruptHandlerFn GetHandlerFn() override;
 
-    void Interrupt();
+    void Interrupt(Context* ctx);
 
     virtual void OnTick(TimerCallback& callback) override;
 

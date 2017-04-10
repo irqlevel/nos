@@ -25,7 +25,7 @@ public:
 
     ulong GetState();
 
-    void IPI();
+    void IPI(Context* ctx);
 
     static const ulong StateInited = 0x1;
     static const ulong StateRunning = 0x2;

@@ -180,16 +180,16 @@ Cpu& CpuTable::GetCurrentCpu()
     return GetCpu(GetCurrentCpuId());
 }
 
-void Cpu::IPI()
+void Cpu::IPI(Context* ctx)
 {
-    Trace(0, "IPI cpu %u", Index);
+    Trace(0, "IPI cpu %u rip 0x%p", Index, ctx->GetRetRip());
     Lapic::EOI(CpuTable::IPIVector);
 }
 
-extern "C" void IPInterrupt()
+extern "C" void IPInterrupt(Context* ctx)
 {
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
-    cpu.IPI();
+    cpu.IPI(ctx);
 }
 
 void CpuTable::SendIPI(ulong index)

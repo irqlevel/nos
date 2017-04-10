@@ -78,7 +78,44 @@ void ExcControlProtectionStub();
 
 #ifdef __cplusplus
 }
+#endif
 
 #define Barrier() __asm__ __volatile__("": : :"memory")
 
-#endif
+namespace Kernel
+{
+
+namespace Core
+{
+    struct Context
+    {
+        ulong Rsp;
+        ulong Rbp;
+        ulong R15;
+        ulong R14;
+        ulong R13;
+        ulong R12;
+        ulong R11;
+        ulong R10;
+        ulong R9;
+        ulong R8;
+        ulong Rsi;
+        ulong Rdi;
+        ulong Rdx;
+        ulong Rcx;
+        ulong Rbx;
+        ulong Rax;
+        ulong Rflags;
+
+        ulong GetOrigRsp()
+        {
+            return Rsp + 16 * sizeof(ulong);
+        }
+
+        ulong GetRetRip()
+        {
+            return *((ulong *)GetOrigRsp());
+        }
+    };
+}
+}

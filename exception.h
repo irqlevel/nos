@@ -22,28 +22,28 @@ public:
 
     void RegisterExceptionHandlers();
 
-    void ExcDivideByZero();
-    void ExcDebugger();
-    void ExcNMI();
-    void ExcBreakpoint();
-    void ExcOverflow();
-    void ExcBounds();
-    void ExcInvalidOpcode();
-    void ExcCoprocessorNotAvailable();
-    void ExcDoubleFault();
-    void ExcCoprocessorSegmentOverrun();
-    void ExcInvalidTaskStateSegment();
-    void ExcSegmentNotPresent();
-    void ExcStackFault();
-    void ExcGeneralProtectionFault();
-    void ExcPageFault();
-    void ExcReserved();
-    void ExcMathFault();
-    void ExcAlignmentCheck();
-    void ExcMachineCheck();
-    void ExcSIMDFpException();
-    void ExcVirtException();
-    void ExcControlProtection();
+    void ExcDivideByZero(Context* ctx);
+    void ExcDebugger(Context* ctx);
+    void ExcNMI(Context* ctx);
+    void ExcBreakpoint(Context* ctx);
+    void ExcOverflow(Context* ctx);
+    void ExcBounds(Context* ctx);
+    void ExcInvalidOpcode(Context* ctx);
+    void ExcCoprocessorNotAvailable(Context* ctx);
+    void ExcDoubleFault(Context* ctx);
+    void ExcCoprocessorSegmentOverrun(Context* ctx);
+    void ExcInvalidTaskStateSegment(Context* ctx);
+    void ExcSegmentNotPresent(Context* ctx);
+    void ExcStackFault(Context* ctx);
+    void ExcGeneralProtectionFault(Context* ctx);
+    void ExcPageFault(Context* ctx);
+    void ExcReserved(Context* ctx);
+    void ExcMathFault(Context* ctx);
+    void ExcAlignmentCheck(Context* ctx);
+    void ExcMachineCheck(Context* ctx);
+    void ExcSIMDFpException(Context* ctx);
+    void ExcVirtException(Context* ctx);
+    void ExcControlProtection(Context* ctx);
 
 private:
     ExceptionTable();

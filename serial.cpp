@@ -114,16 +114,18 @@ InterruptHandlerFn Serial::GetHandlerFn()
     return IO8042InterruptStub;
 }
 
-void Serial::Interrupt()
+void Serial::Interrupt(Context* ctx)
 {
+    (void)ctx;
+
     Shared::AutoLock lock(Lock);
     Send();
     Lapic::EOI(IntVector);
 }
 
-extern "C" void SerialInterrupt()
+extern "C" void SerialInterrupt(Context* ctx)
 {
-    Serial::GetInstance().Interrupt();
+    Serial::GetInstance().Interrupt(ctx);
 }
 
 }

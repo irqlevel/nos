@@ -43,8 +43,9 @@ InterruptHandlerFn IO8042::GetHandlerFn()
     return IO8042InterruptStub;
 }
 
-void IO8042::Interrupt()
+void IO8042::Interrupt(Context* ctx)
 {
+    (void)ctx;
     Shared::AutoLock lock(Lock);
 
     if (!Buf.Put(Inb(Port)))
@@ -116,9 +117,9 @@ void IO8042::OnTick(TimerCallback& callback)
     }
 }
 
-extern "C" void IO8042Interrupt()
+extern "C" void IO8042Interrupt(Context* ctx)
 {
-    IO8042::GetInstance().Interrupt();
+    IO8042::GetInstance().Interrupt(ctx);
 }
 
 }

@@ -112,312 +112,356 @@ void ExceptionTable::RegisterExceptionHandlers()
     }
 }
 
-void ExceptionTable::ExcDivideByZero()
+void ExceptionTable::ExcDivideByZero(Context* ctx)
 {
+    (void)ctx;
+
     ExcDivideByZeroCounter.Inc();
 
     Trace(ExcLL, "EXC: DivideByZero");
 }
 
-void ExceptionTable::ExcDebugger()
+void ExceptionTable::ExcDebugger(Context* ctx)
 {
+    (void)ctx;
+
     ExcDebuggerCounter.Inc();
 
     Trace(ExcLL, "EXC: Debugger");
 }
 
-void ExceptionTable::ExcNMI()
+void ExceptionTable::ExcNMI(Context* ctx)
 {
+    (void)ctx;
+
     ExcNMICounter.Inc();
 
     Trace(ExcLL, "EXC: NMI");
 }
 
-void ExceptionTable::ExcBreakpoint()
+void ExceptionTable::ExcBreakpoint(Context* ctx)
 {
+    (void)ctx;
+
     ExcBreakpointCounter.Inc();
 
     Trace(ExcLL, "EXC: Breakpoint");
 }
 
-void ExceptionTable::ExcOverflow()
+void ExceptionTable::ExcOverflow(Context* ctx)
 {
+    (void)ctx;
+
     ExcOverflowCounter.Inc();
 
     Trace(ExcLL, "EXC: Overflow");
 }
 
-void ExceptionTable::ExcBounds()
+void ExceptionTable::ExcBounds(Context* ctx)
 {
+    (void)ctx;
+
     ExcBoundsCounter.Inc();
 
     Trace(ExcLL, "EXC: Bounds");
 }
 
-void ExceptionTable::ExcInvalidOpcode()
+void ExceptionTable::ExcInvalidOpcode(Context* ctx)
 {
+    (void)ctx;
+
     ExcInvalidOpcodeCounter.Inc();
 
     Trace(ExcLL, "EXC: InvalidOpCode");
 }
 
-void ExceptionTable::ExcCoprocessorNotAvailable()
+void ExceptionTable::ExcCoprocessorNotAvailable(Context* ctx)
 {
+    (void)ctx;
+
     ExcCoprocessorNotAvailableCounter.Inc();
 
     Trace(ExcLL, "EXC: CoprocessorNotAvailable");
 }
 
-void ExceptionTable::ExcDoubleFault()
+void ExceptionTable::ExcDoubleFault(Context* ctx)
 {
+    (void)ctx;
+
     ExcDoubleFaultCounter.Inc();
 
     Trace(ExcLL, "EXC: DoubleFault");
 }
 
-void ExceptionTable::ExcCoprocessorSegmentOverrun()
+void ExceptionTable::ExcCoprocessorSegmentOverrun(Context* ctx)
 {
+    (void)ctx;
+
     ExcCoprocessorSegmentOverrunCounter.Inc();
 
     Trace(ExcLL, "EXC: CoprocessorSegmentOverrun");
 }
 
-void ExceptionTable::ExcInvalidTaskStateSegment()
+void ExceptionTable::ExcInvalidTaskStateSegment(Context* ctx)
 {
+    (void)ctx;
+
     ExcInvalidTaskStateSegmentCounter.Inc();
 
     Trace(ExcLL, "EXC: InvalidTaskStateSegment");
 }
 
-void ExceptionTable::ExcSegmentNotPresent()
+void ExceptionTable::ExcSegmentNotPresent(Context* ctx)
 {
+    (void)ctx;
+
     ExcSegmentNotPresentCounter.Inc();
 
     Trace(ExcLL, "EXC: SegmentNotPresent");
 }
 
-void ExceptionTable::ExcStackFault()
+void ExceptionTable::ExcStackFault(Context* ctx)
 {
+    (void)ctx;
+
     ExcStackFaultCounter.Inc();
 
     Trace(ExcLL, "EXC: StackFault");
 }
 
-void ExceptionTable::ExcGeneralProtectionFault()
+void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
 {
+    (void)ctx;
+
     ExcGeneralProtectionFaultCounter.Inc();
 
     Trace(ExcLL, "EXC: GeneralProtectionFault");
 }
 
-void ExceptionTable::ExcPageFault()
+void ExceptionTable::ExcPageFault(Context* ctx)
 {
+    (void)ctx;
+
     ExcPageFaultCounter.Inc();
 
     Trace(ExcLL, "EXC: PageFault");
 }
 
-void ExceptionTable::ExcReserved()
+void ExceptionTable::ExcReserved(Context* ctx)
 {
+    (void)ctx;
+
     ExcReservedCounter.Inc();
 
     Trace(ExcLL, "EXC: Reserved");
 }
 
-void ExceptionTable::ExcMathFault()
+void ExceptionTable::ExcMathFault(Context* ctx)
 {
+    (void)ctx;
+
     ExcMathFaultCounter.Inc();
 
     Trace(ExcLL, "EXC: MathFault");
 }
 
-void ExceptionTable::ExcAlignmentCheck()
+void ExceptionTable::ExcAlignmentCheck(Context* ctx)
 {
+    (void)ctx;
+
     ExcAlignmentCheckCounter.Inc();
 
     Trace(ExcLL, "EXC: AlignmentCheck");
 }
 
-void ExceptionTable::ExcMachineCheck()
+void ExceptionTable::ExcMachineCheck(Context* ctx)
 {
+    (void)ctx;
+
     ExcMachineCheckCounter.Inc();
 
     Trace(ExcLL, "EXC: MachineCheck");
 }
 
-void ExceptionTable::ExcSIMDFpException()
+void ExceptionTable::ExcSIMDFpException(Context* ctx)
 {
+    (void)ctx;
+
     ExcSIMDFpExceptionCounter.Inc();
 
     Trace(ExcLL, "EXC: SIMDFpException");
 }
 
-void ExceptionTable::ExcVirtException()
+void ExceptionTable::ExcVirtException(Context* ctx)
 {
+    (void)ctx;
+
     ExcVirtExceptionCounter.Inc();
 
     Trace(ExcLL, "EXC: VirtException");
 }
 
-void ExceptionTable::ExcControlProtection()
+void ExceptionTable::ExcControlProtection(Context* ctx)
 {
+    (void)ctx;
+
     ExcControlProtectionCounter.Inc();
 
     Trace(ExcLL, "EXC: ControlProtection");
 }
 
-extern "C" void ExcDivideByZero()
+extern "C" void ExcDivideByZero(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcDivideByZero();
+    excTable.ExcDivideByZero(ctx);
 }
 
-extern "C" void ExcDebugger()
+extern "C" void ExcDebugger(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcDebugger();
+    excTable.ExcDebugger(ctx);
 }
 
-extern "C" void ExcNMI()
+extern "C" void ExcNMI(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcNMI();
+    excTable.ExcNMI(ctx);
 }
 
-extern "C" void ExcBreakpoint()
+extern "C" void ExcBreakpoint(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcBreakpoint();
+    excTable.ExcBreakpoint(ctx);
 }
 
-extern "C" void ExcOverflow()
+extern "C" void ExcOverflow(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcOverflow();
+    excTable.ExcOverflow(ctx);
 }
 
-extern "C" void ExcBounds()
+extern "C" void ExcBounds(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcBounds();
+    excTable.ExcBounds(ctx);
 }
 
-extern "C" void ExcInvalidOpcode()
+extern "C" void ExcInvalidOpcode(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcInvalidOpcode();
+    excTable.ExcInvalidOpcode(ctx);
 }
 
-extern "C" void ExcCoprocessorNotAvailable()
+extern "C" void ExcCoprocessorNotAvailable(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcCoprocessorNotAvailable();
+    excTable.ExcCoprocessorNotAvailable(ctx);
 }
 
-extern "C" void ExcDoubleFault()
+extern "C" void ExcDoubleFault(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcDoubleFault();
+    excTable.ExcDoubleFault(ctx);
 }
 
-extern "C" void ExcCoprocessorSegmentOverrun()
+extern "C" void ExcCoprocessorSegmentOverrun(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcCoprocessorSegmentOverrun();
+    excTable.ExcCoprocessorSegmentOverrun(ctx);
 }
 
-extern "C" void ExcInvalidTaskStateSegment()
+extern "C" void ExcInvalidTaskStateSegment(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcInvalidTaskStateSegment();
+    excTable.ExcInvalidTaskStateSegment(ctx);
 }
 
-extern "C" void ExcSegmentNotPresent()
+extern "C" void ExcSegmentNotPresent(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcSegmentNotPresent();
+    excTable.ExcSegmentNotPresent(ctx);
 }
 
-extern "C" void ExcStackFault()
+extern "C" void ExcStackFault(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcStackFault();
+    excTable.ExcStackFault(ctx);
 }
 
-extern "C" void ExcGeneralProtectionFault()
+extern "C" void ExcGeneralProtectionFault(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcGeneralProtectionFault();
+    excTable.ExcGeneralProtectionFault(ctx);
 }
 
-extern "C" void ExcPageFault()
+extern "C" void ExcPageFault(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcPageFault();
+    excTable.ExcPageFault(ctx);
 }
 
-extern "C" void ExcReserved()
+extern "C" void ExcReserved(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcReserved();
+    excTable.ExcReserved(ctx);
 }
 
-extern "C" void ExcMathFault()
+extern "C" void ExcMathFault(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcMathFault();
+    excTable.ExcMathFault(ctx);
 }
 
-extern "C" void ExcAlignmentCheck()
+extern "C" void ExcAlignmentCheck(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcAlignmentCheck();
+    excTable.ExcAlignmentCheck(ctx);
 }
 
-extern "C" void ExcMachineCheck()
+extern "C" void ExcMachineCheck(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcMachineCheck();
+    excTable.ExcMachineCheck(ctx);
 }
 
-extern "C" void ExcSIMDFpException()
+extern "C" void ExcSIMDFpException(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcSIMDFpException();
+    excTable.ExcSIMDFpException(ctx);
 }
 
-extern "C" void ExcVirtException()
+extern "C" void ExcVirtException(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcVirtException();
+    excTable.ExcVirtException(ctx);
 }
 
-extern "C" void ExcControlProtection()
+extern "C" void ExcControlProtection(Context* ctx)
 {
     auto& excTable = ExceptionTable::GetInstance();
 
-    excTable.ExcControlProtection();
+    excTable.ExcControlProtection(ctx);
 }
 
 }
