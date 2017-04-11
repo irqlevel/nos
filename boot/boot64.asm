@@ -3,10 +3,47 @@ extern ApMain
 extern __cxa_finalize
 
 %define MAX_CPUS 8
-%define CPU_STACK_SIZE 32768
+%define CPU_STACK_SIZE 4096
 
-BITS 16
-section .trampolinedata
+section .trampolinedata nobits
+align 4096
+p4_table:
+    resb 4096
+align 4096
+p3_low_table:
+    resb 4096
+align 4096
+p2_low_table:
+    resb 4 * 4096
+align 4096
+p3_high_table:
+    resb 4096
+align 4096
+p2_high_table:
+    resb 4 * 4096
+align 4096
+stack_bottom:
+    resb CPU_STACK_SIZE * MAX_CPUS
+stack_top:
+align 8
+mbinfo:
+    resb 8
+align 8
+mbsig:
+    resb 8
+align 8
+stack_counter:
+    resb 8
+
+section .trampolinerodata
+gdt64:
+    dq 0 ; zero entry
+.code: equ $ - gdt64 ; new
+    dq (1<<43) | (1<<44) | (1<<47) | (1<<53) ; code segment
+.pointer:
+    dw $ - gdt64 - 1
+    dq gdt64
+
 gdt32:
     dq 0x0000000000000000       ; Null Descriptor
 .code equ $ - gdt32                 ; Code segment
@@ -17,6 +54,7 @@ gdt32:
     dw $ - gdt32 - 1            ; 16-bit Size (Limit)
     dd gdt32                    ; 32-bit Base Address
 
+BITS 16
 section .trampoline
 trampoline_start:
     lgdt [gdt32.desc]
@@ -44,34 +82,7 @@ align 8
     dw 0    ; flags
     dd 8    ; size
 
-section .bootstrap_stack, nobits
-align 4096
-p4_table:
-    resb 4096
-p3_table:
-    resb 4096
-p2_table:
-    resb 4 * 4096
-stack_bottom:
-    resb CPU_STACK_SIZE * MAX_CPUS
-stack_top:
-mbinfo:
-    resb 8
-mbsig:
-    resb 8
-stack_counter:
-    resb 8
-
-section .rodata
-gdt64:
-    dq 0 ; zero entry
-.code: equ $ - gdt64 ; new
-    dq (1<<43) | (1<<44) | (1<<47) | (1<<53) ; code segment
-.pointer:
-    dw $ - gdt64 - 1
-    dq gdt64
-
-section .text
+section .trampoline
 %macro InitStack 0
     mov dword [stack_counter], 0
 %endmacro
@@ -167,21 +178,61 @@ check_long_mode:
     mov al, "2"
     jmp error
 
-setup_page_tables:
+setup_low_page_tables:
     ; map first P4 entry to P3 table
-    mov eax, p3_table
+    mov eax, p3_low_table
     or eax, 0b10011 ; present + writable + cache disabled
     mov [p4_table], eax
 
     mov ebx, 0
     mov edi, 0
-    mov esi, p2_table
+    mov esi, p2_low_table
 .map_p3_table:
     ; map first P3 entry to P2 table
 
     mov eax, esi
     or eax, 0b10011 ; present + writable + cache disabled
-    mov [p3_table + edi * 8], eax
+    mov [p3_low_table + edi * 8], eax
+
+   ; map each P2 entry to a huge 2MiB page
+    mov ecx, 0         ; counter variable
+
+.map_p2_table:
+    ; map ecx-th P2 entry to a huge page that starts at address 2MiB*ecx
+    mov eax, 0x200000  ; 2MiB
+    mul ecx            ; start address of ecx-th page
+
+    add eax, ebx
+
+    or eax, 0b10010011 ; present + writable + cache disabled + huge
+    mov [esi + ecx * 8], eax ; map ecx-th entry
+
+    inc ecx            ; increase counter
+    cmp ecx, 512       ; if counter == 512, the whole P2 table is mapped
+    jne .map_p2_table  ; else map the next entry
+    inc edi
+    add esi, 4096
+    add ebx, 0x40000000 ; 1GB
+    cmp edi, 4
+    jne .map_p3_table
+
+    ret
+
+setup_high_page_tables:
+    ; map first P4 entry to P3 table
+    mov eax, p3_high_table
+    or eax, 0b10011 ; present + writable + cache disabled
+    mov [p4_table + 256 * 8], eax
+
+    mov ebx, 0
+    mov edi, 0
+    mov esi, p2_high_table
+.map_p3_table:
+    ; map first P3 entry to P2 table
+
+    mov eax, esi
+    or eax, 0b10011 ; present + writable + cache disabled
+    mov [p3_high_table + edi * 8], eax
 
    ; map each P2 entry to a huge 2MiB page
     mov ecx, 0         ; counter variable
@@ -241,7 +292,8 @@ _start:
     call check_multiboot
     call check_cpuid
     call check_long_mode
-    call setup_page_tables
+    call setup_low_page_tables
+    call setup_high_page_tables
     call enable_paging
     ; load the 64-bit GDT
     lgdt [gdt64.pointer]
@@ -274,9 +326,8 @@ long_mode_start:
     mov gs, ax
 start64:
     mov rdi, [mbinfo]
-    call Main
-    xor rdi, rdi
-    call __cxa_finalize
+    mov rax, Main
+    call rax
     cli
 start64_hang:
     hlt
@@ -291,7 +342,8 @@ long_mode_ap_start:
     mov fs, ax
     mov gs, ax
 ap_start64:
-    call ApMain
+    mov rax, ApMain
+    call rax
     cli
 ap_start64_hang:
     hlt

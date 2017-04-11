@@ -144,7 +144,7 @@ bool CpuTable::StartAll()
         {
             if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
             {
-                Lapic::SendStartup(index, 0x6); //0x6 page number = 0x6000 ap trampoline code, see boot64.asm
+                Lapic::SendStartup(index, 0x8); //0x8 page number = 0x8000 ap trampoline code, see boot64.asm
             }
         }
     }

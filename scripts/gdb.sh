@@ -1,2 +1,2 @@
 #!/bin/bash
-gdb -x gdb-debug
+gdb -x scripts/gdb-debug

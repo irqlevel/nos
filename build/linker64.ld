@@ -2,35 +2,38 @@ ENTRY(_start)
 
 SECTIONS
 {
-	.trampolinedata 0x5000 : {
-		*(.trampolinedata)
-	}
-
-	.trampoline 0x6000 : {
+	.trampoline 0x8000 : {
 		*(.trampoline)
 	}
 
-	. = 0x1000000;
+	.trampolinerodata 0x9000 : {
+		*(.trampolinerodata)
+	}
 
-	.multiboot : {
+	.trampolinedata 0xA000 : {
+		*(.trampolinedata)
+	}
+
+	. = 0xFFFF800001000000;
+
+	.multiboot : AT (ADDR (.multiboot) - 0xFFFF800000000000) {
 		*(.multiboot)
 	}
 
-	.text : {
+	.text ALIGN (4K) : AT (ADDR (.text) - 0xFFFF800000000000) {
 		*(.text)
 	}
 
-	.rodata ALIGN(4K) : {
+	.rodata ALIGN(4K) : AT (ADDR (.rodata) - 0xFFFF800000000000) {
 		*(.rodata)
 	}
 
-	.data ALIGN(4K) : {
+	.data ALIGN(4K) : AT (ADDR (.data) - 0xFFFF800000000000) {
 		*(.data)
 	}
 
-	.bss ALIGN(4K) : {
+	.bss ALIGN(4K) : AT (ADDR (.bss) - 0xFFFF800000000000) {
 		*(COMMON)
 		*(.bss)
-		*(.bootstrap_stack)
 	}
 }

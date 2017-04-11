@@ -9,6 +9,7 @@
 #include "cpu.h"
 #include "cmd.h"
 #include "interrupt.h"
+#include "icxxabi.h"
 
 #include <boot/grub.h>
 
@@ -239,4 +240,5 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     Trace(0, "Exit");
 
     VgaTerm::GetInstance().Printf("Bye!\n");
+    __cxa_finalize(0);
 }
