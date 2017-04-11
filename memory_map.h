@@ -22,7 +22,7 @@ public:
 
     bool AddRegion(u64 addr, u64 len, u32 type);
 
-    bool FindRegion(ulong base, ulong& start, ulong& end);
+    bool FindRegion(ulong base, ulong limit, ulong& start, ulong& end);
 
 private:
     MemoryMap(const MemoryMap& other) = delete;

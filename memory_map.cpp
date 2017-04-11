@@ -28,7 +28,7 @@ bool MemoryMap::AddRegion(u64 addr, u64 len, u32 type)
     return true;
 }
 
-bool MemoryMap::FindRegion(ulong base, ulong& start, ulong& end)
+bool MemoryMap::FindRegion(ulong base, ulong limit, ulong& start, ulong& end)
 {
     start = 0;
     end = 0;
@@ -38,6 +38,9 @@ bool MemoryMap::FindRegion(ulong base, ulong& start, ulong& end)
         if (region.Type != 1)
             continue;
 
+        if (region.Len == 0)
+            continue;
+
         if (region.Addr + region.Len <= base)
             continue;
 
@@ -45,10 +48,18 @@ bool MemoryMap::FindRegion(ulong base, ulong& start, ulong& end)
         ulong regionLength = (region.Addr < base) ?
             (region.Len - (base - region.Addr)) : region.Len;
 
+        if ((regionBase + regionLength) > limit)
+        {
+            if (regionBase >= limit)
+                continue;
+
+            regionLength = limit - regionBase;
+        }
+
         if ((end - start) < regionLength)
         {
             start = regionBase;
-            end = regionLength;
+            end = regionBase + regionLength;
         }
     }
 
