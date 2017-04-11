@@ -1,4 +1,4 @@
-CPPFLAGS = -std=c++11 -mcmodel=kernel -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=large -mno-red-zone -mcmodel=large
+CPPFLAGS = -I$(CURDIR) -std=c++11 -mcmodel=kernel -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=large -mno-red-zone -mcmodel=large
 LFLAGS = -nostdlib -z max-page-size=4096
 TARGET64 = x86_64-none-elf
 CC = clang
@@ -6,10 +6,39 @@ CPP = clang -x c++
 ASM = nasm
 AR = ar
 
-CPP_SRC = icxxabi.cpp list_entry.cpp new.cpp sallocator.cpp spage_allocator.cpp spool.cpp vga.cpp main.cpp \
-	trace.cpp stdlib.cpp panic.cpp debug.cpp error.cpp atomic.cpp 8042.cpp idt_descriptor.cpp idt.cpp \
-	memory_map.cpp test.cpp serial.cpp pic.cpp exception.cpp pit.cpp timer.cpp acpi.cpp cpu.cpp cmd.cpp \
-	dmesg.cpp lapic.cpp ioapic.cpp interrupt.cpp task.cpp
+CPP_SRC =   \
+    drivers/serial.cpp  \
+    drivers/pic.cpp \
+    drivers/pit.cpp \
+    drivers/8042.cpp    \
+    drivers/acpi.cpp    \
+    drivers/lapic.cpp   \
+    drivers/ioapic.cpp  \
+    drivers/vga.cpp \
+    kernel/icxxabi.cpp    \
+    kernel/interrupt.cpp   \
+    kernel/task.cpp \
+    kernel/test.cpp \
+    kernel/main.cpp \
+    kernel/trace.cpp \
+    kernel/timer.cpp    \
+    kernel/panic.cpp    \
+    kernel/debug.cpp    \
+    kernel/atomic.cpp   \
+    kernel/idt_descriptor.cpp   \
+    kernel/idt.cpp  \
+    kernel/cpu.cpp  \
+    kernel/cmd.cpp  \
+    kernel/exception.cpp    \
+    kernel/dmesg.cpp    \
+    lib/stdlib.cpp  \
+    lib/list_entry.cpp  \
+    lib/error.cpp   \
+    mm/memory_map.cpp   \
+    mm/new.cpp  \
+    mm/sallocator.cpp   \
+    mm/spage_allocator.cpp  \
+    mm/spool.cpp    \
 
 all: check nos.iso
 
@@ -30,10 +59,11 @@ nos.iso: kernel64.elf
 
 kernel64.elf: $(CPP_SRC)
 	rm -rf *.o
-	$(ASM) -felf64 boot64.asm
-	$(ASM) -felf64 asm.asm
+	$(ASM) -felf64 boot/boot64.asm -o boot64.o
+	$(ASM) -felf64 kernel/asm.asm -o asm.o
 	$(CPP) $(CPPFLAGS) --target=$(TARGET64) -c $(CPP_SRC)
 	ld $(LFLAGS) -T linker64.ld -o kernel64.elf *.o
+	rm -rf *.o
 
 clean:
 	rm -rf *.o *.elf *.bin *.iso iso
