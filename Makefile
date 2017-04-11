@@ -53,7 +53,7 @@ nos.iso: kernel64.elf
 	cp kernel64.elf iso/boot/kernel64.elf
 	cp kernel64.elf bin/kernel64.elf
 	rm -rf kernel64.elf
-	cp grub.cfg iso/boot/grub/grub.cfg
+	cp build/grub.cfg iso/boot/grub/grub.cfg
 	grub2-mkrescue -o nos.iso iso
 	rm -rf iso
 
@@ -62,7 +62,7 @@ kernel64.elf: $(CPP_SRC)
 	$(ASM) -felf64 boot/boot64.asm -o boot64.o
 	$(ASM) -felf64 kernel/asm.asm -o asm.o
 	$(CPP) $(CPPFLAGS) --target=$(TARGET64) -c $(CPP_SRC)
-	ld $(LFLAGS) -T linker64.ld -o kernel64.elf *.o
+	ld $(LFLAGS) -T build/linker64.ld -o kernel64.elf *.o
 	rm -rf *.o
 
 clean:
