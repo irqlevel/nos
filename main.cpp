@@ -121,14 +121,12 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
 
     ParseGrubInfo(MbInfo);
 
-    auto& mmap = MemoryMap::GetInstance();
-
-    ulong memStart, memEnd;
-
     //Kernel is loaded at 0x1000000 (see linke64.ld), so
     //assume 0x2000000 is high enough to use.
     //boot64.asm only setup paging for first 4GB
     //so do not overflow it.
+    ulong memStart, memEnd;
+    auto& mmap = MemoryMap::GetInstance();
     if (!mmap.FindRegion(0x2000000, 0x100000000, memStart, memEnd))
     {
         Panic("Can't get available memory region");
