@@ -104,7 +104,8 @@ void ApStartup(void *ctx)
 
     cpu.SetRunning();
 
-    Trace(0, "Cpu %u started rflags 0x%p", cpu.GetIndex(), GetRflags());
+    Trace(0, "Cpu %u running rflags 0x%p task 0x%p",
+        cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
 
     TraceCpuState(cpu.GetIndex());
 
@@ -159,6 +160,9 @@ void BpStartup(void* ctx)
     auto& ioApic = IoApic::GetInstance();
     auto& cpus = CpuTable::GetInstance();
     auto& cpu = cpus.GetCurrentCpu();
+
+    Trace(0, "Cpu %u running rflags 0x%p task 0x%p",
+        cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
 
     TraceCpuState(cpu.GetIndex());
 

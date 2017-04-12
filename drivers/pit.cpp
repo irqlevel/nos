@@ -6,6 +6,7 @@
 #include <kernel/idt.h>
 #include <kernel/timer.h>
 #include <kernel/trace.h>
+#include <kernel/cpu.h>
 
 #include <lib/stdlib.h>
 
@@ -72,6 +73,9 @@ void Pit::Interrupt(Context* ctx)
     }
 
     TimerTable::GetInstance().ProcessTimers();
+
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    cpu.OnTimeChange(GetTime());
 
     Lapic::EOI(IntVector);
 }

@@ -242,6 +242,12 @@ void Cpu::IPI(Context* ctx)
     TaskQueue.Schedule();
 }
 
+void Cpu::OnTimeChange(const Shared::Time& time)
+{
+    (void)time;
+    TaskQueue.Schedule();
+}
+
 extern "C" void IPInterrupt(Context* ctx)
 {
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();

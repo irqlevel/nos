@@ -16,6 +16,9 @@ public:
     TaskQueue();
     ~TaskQueue();
 
+    void AddTask(Task* task);
+    void RemoveTask(Task* task);
+
     void Schedule();
 
 private:
@@ -23,6 +26,8 @@ private:
     TaskQueue(TaskQueue&& other) = delete;
     TaskQueue& operator=(const TaskQueue& other) = delete;
     TaskQueue& operator=(TaskQueue&& other) = delete;
+
+    void Switch(Task* curr, Task* next);
 
     using ListEntry = Shared::ListEntry;
     ListEntry TaskList;

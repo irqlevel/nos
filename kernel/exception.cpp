@@ -175,6 +175,8 @@ void ExceptionTable::ExcInvalidOpcode(Context* ctx)
 
     Trace(ExcLL, "EXC: InvalidOpcode cpu %u rip 0x%p rsp 0x%p",
         CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
+
+    Panic("InvalidOpCode");
 }
 
 void ExceptionTable::ExcCoprocessorNotAvailable(Context* ctx)
@@ -194,6 +196,8 @@ void ExceptionTable::ExcDoubleFault(Context* ctx)
 
     Trace(ExcLL, "EXC: DoubleFault cpu %u rip 0x%p rsp 0x%p",
         CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
+
+    Panic("DoubleFault");
 }
 
 void ExceptionTable::ExcCoprocessorSegmentOverrun(Context* ctx)
@@ -240,6 +244,8 @@ void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
 
     Trace(ExcLL, "EXC: GeneralProtectionFault cpu %u rip 0x%p rsp 0x%p",
         CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
+
+    Panic("GP");
 }
 
 void ExceptionTable::ExcPageFault(Context* ctx)

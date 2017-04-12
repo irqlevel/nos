@@ -39,6 +39,8 @@ public:
 
     void SendIPISelf();
 
+    void OnTimeChange(const Shared::Time& time);
+
 private:
     Cpu(const Cpu& other) = delete;
     Cpu(Cpu&& other) = delete;
@@ -48,8 +50,8 @@ private:
     ulong Index;
     ulong State;
     SpinLock Lock;
-    Task Task;
     TaskQueue TaskQueue;
+    Task Task;
 };
 
 class CpuTable final
