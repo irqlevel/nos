@@ -1,6 +1,8 @@
 extern Main
 extern ApMain
-extern __cxa_finalize
+
+global Start32
+global ApStart16
 
 %define MAX_CPUS 8
 %define CPU_STACK_SIZE 4096
@@ -25,15 +27,6 @@ align 4096
 stack_bottom:
     resb CPU_STACK_SIZE * MAX_CPUS
 stack_top:
-align 8
-mbinfo:
-    resb 8
-align 8
-mbsig:
-    resb 8
-align 8
-stack_counter:
-    resb 8
 
 section .trampolinerodata
 gdt64:
@@ -56,7 +49,7 @@ gdt32:
 
 BITS 16
 section .trampoline
-trampoline_start:
+ApStart16:
     lgdt [gdt32.desc]
     mov eax, cr0
     or al, 0x01
@@ -83,9 +76,15 @@ align 8
     dd 8    ; size
 
 section .trampoline
-%macro InitStack 0
-    mov dword [stack_counter], 0
-%endmacro
+align 8
+stack_counter:
+    dq 0
+align 8
+mbinfo:
+    dq 0
+align 8
+mbsig:
+    dq 0
 
 %macro AllocStack 0
     xor eax, eax
@@ -281,11 +280,9 @@ enable_paging:
 
     ret
 
-global _start
-_start:
+Start32:
     mov [mbsig], eax
     mov [mbinfo], ebx
-    InitStack
     AllocStack
     mov esp, eax
     mov eax, [mbsig]

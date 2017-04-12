@@ -2,6 +2,8 @@
 #include "panic.h"
 #include "trace.h"
 
+#include <boot/boot64.h>
+
 #include <drivers/lapic.h>
 #include <drivers/pit.h>
 
@@ -123,7 +125,15 @@ bool CpuTable::SetBspIndex(ulong index)
 
 bool CpuTable::StartAll()
 {
-    Trace(0, "Starting cpus");
+    ulong startupCode = (ulong)ApStart16;
+
+    Trace(0, "Starting cpus, startupCode 0x%p", startupCode);
+
+    if (startupCode & (Shared::PageSize - 1))
+        return false;
+
+    if (startupCode >= 0x100000)
+        return false;
 
     {
         Shared::AutoLock lock(Lock);
@@ -144,7 +154,7 @@ bool CpuTable::StartAll()
         {
             if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
             {
-                Lapic::SendStartup(index, 0x8); //0x8 page number = 0x8000 ap trampoline code, see boot64.asm
+                Lapic::SendStartup(index, startupCode >> Shared::PageShift);
             }
         }
     }
