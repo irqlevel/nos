@@ -1,6 +1,6 @@
 TARGET64 = x86_64-none-elf
 CPPFLAGS = -I$(CURDIR)
-CXXFLAGS = --target=$(TARGET64) -std=c++11 -mcmodel=kernel -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=large -mno-red-zone -mcmodel=large
+CXXFLAGS = --target=$(TARGET64) -std=c++11 -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=kernel -mcmodel=large -mno-red-zone
 LDFLAGS = -nostdlib -z max-page-size=4096
 LD = ld
 CC = clang
