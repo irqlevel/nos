@@ -50,8 +50,8 @@ private:
     ulong Index;
     ulong State;
     SpinLock Lock;
-    TaskQueue TaskQueue;
     Task Task;
+    TaskQueue TaskQueue;
 };
 
 class CpuTable final

@@ -22,8 +22,8 @@ Task::Task()
 Task::~Task()
 {
     Put();
-    BugOn(Stack != nullptr);
     BugOn(TaskQueue != nullptr);
+    BugOn(Stack != nullptr);
 }
 
 void Task::Release()
