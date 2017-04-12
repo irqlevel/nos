@@ -2,6 +2,7 @@
 #include "trace.h"
 #include "asm.h"
 #include "sched.h"
+#include "cpu.h"
 
 namespace Kernel
 {
@@ -11,12 +12,14 @@ namespace Core
 
 Task::Task()
     : TaskQueue(nullptr)
+    , Rsp(0)
     , Stack(nullptr)
     , Function(nullptr)
     , Ctx(nullptr)
 {
     RefCounter.Set(1);
     ListEntry.Init();
+    PreemptCounter.Set(0);
 }
 
 Task::~Task()
@@ -33,7 +36,6 @@ void Task::Release()
     if (Stack != nullptr)
     {
         delete Stack;
-        Stack = nullptr;
     }
 }
 
@@ -52,7 +54,7 @@ void Task::Put()
     }
 }
 
-bool Task::Run(Func func, void* ctx)
+bool Task::Start(Func func, void* ctx)
 {
     Stack = new struct Stack(this);
     if (Stack == nullptr)
@@ -60,7 +62,27 @@ bool Task::Run(Func func, void* ctx)
         return false;
     }
 
-    SwitchRsp((ulong)&Stack->StackTop[0]);
+    Function = func;
+    Ctx = ctx;
+
+    //TODO: setup registers context and ret addr = func on stack
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    cpu.GetTaskQueue().AddTask(this);
+    return true;
+}
+
+bool Task::Run(Func func, void* ctx)
+{
+    BugOn(Stack != nullptr);
+    BugOn(Function != nullptr);
+
+    Stack = new struct Stack(this);
+    if (Stack == nullptr)
+    {
+        return false;
+    }
+
+    SetRsp((ulong)&Stack->StackTop[0]);
     Function = func;
     Ctx = ctx;
 

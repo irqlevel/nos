@@ -59,7 +59,14 @@ global WriteMsr
 global InterruptEnable
 global InterruptDisable
 global Hlt
-global SwitchRsp
+global SetRsp
+global SwitchContext
+
+global AtomicInc
+global AtomicDec
+global AtomicRead
+global AtomicWrite
+global AtomicReadAndDec
 
 global DummyInterruptStub
 global IO8042InterruptStub
@@ -249,12 +256,10 @@ Hlt:
 	hlt
 	ret
 
-SwitchRsp:
-	mov rsi, rsp
+SetRsp:
 	mov rax, [rsp] ; save return address
 	mov rsp, rdi
 	push rax
-	mov rax, rsi ; return orig rsp
 	ret
 
 %macro PushAll 0
@@ -296,6 +301,39 @@ SwitchRsp:
 	pop rax
 	popfq
 %endmacro
+
+SwitchContext:
+	;rdi = nextTask->Rsp
+	;rsi = &currTask->Rsp
+	PushAll
+	mov rax, rsp
+	mov rsp, rdi
+	mov [rsi], rax
+	PopAll
+	ret
+
+AtomicInc:
+	lock inc qword [rdi]
+	ret
+
+AtomicDec:
+	lock dec qword [rdi]
+	ret
+
+AtomicRead:
+	xor rax, rax
+	lock xadd qword [rdi], rax
+	ret
+
+AtomicWrite:
+	lock xchg qword [rdi], rsi
+	ret
+
+AtomicReadAndDec:
+	xor rax, rax
+	dec rax
+	lock xadd qword [rdi], rax
+	ret
 
 %macro InterruptStub 1
 %1InterruptStub:

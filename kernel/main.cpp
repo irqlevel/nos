@@ -10,6 +10,7 @@
 #include "cmd.h"
 #include "interrupt.h"
 #include "icxxabi.h"
+#include "preempt.h"
 
 #include <boot/grub.h>
 
@@ -186,6 +187,8 @@ void BpStartup(void* ctx)
         Panic("Can't start all cpus");
         return;
     }
+
+    PreemptActivate();
 
     VgaTerm::GetInstance().Printf("IPI test...\n");
 

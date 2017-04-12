@@ -1,6 +1,7 @@
 #include "sched.h"
 #include "panic.h"
 #include "trace.h"
+#include "preempt.h"
 
 namespace Kernel
 {
@@ -13,15 +14,22 @@ TaskQueue::TaskQueue()
     TaskList.Init();
 }
 
-void TaskQueue::Switch(Task* curr, Task* next)
+void TaskQueue::Switch(Task* next, Task* curr)
 {
     BugOn(curr == next);
 
     Trace(0, "Switch task 0x%p -> 0x%p", curr, next);
+
+    SwitchContext(next->Rsp, &curr->Rsp);
 }
 
 void TaskQueue::Schedule()
 {
+    if (!PreemptIsActive())
+    {
+        return;
+    }
+
     Shared::AutoLock lock(Lock);
     Task* curr = Task::GetCurrentTask();
     Shared::AutoLock lock2(curr->Lock);
@@ -43,7 +51,7 @@ void TaskQueue::Schedule()
     curr->ListEntry.Remove();
     TaskList.InsertTail(&curr->ListEntry);
     TaskList.InsertTail(&next->ListEntry);
-    Switch(curr, next);
+    Switch(next, curr);
 }
 
 void TaskQueue::AddTask(Task* task)

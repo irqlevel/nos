@@ -8,15 +8,13 @@ namespace Kernel
 namespace Core
 {
 
-static inline void PreemptDisable()
-{
-    //TODO
-}
+void PreemptActivate();
 
-static inline void PreemptEnable()
-{
-    //TODO
-}
+bool PreemptIsActive();
+
+void PreemptDisable();
+
+void PreemptEnable();
 
 }
 }

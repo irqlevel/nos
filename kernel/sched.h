@@ -1,3 +1,5 @@
+#pragma once
+
 #include "spin_lock.h"
 #include "task.h"
 

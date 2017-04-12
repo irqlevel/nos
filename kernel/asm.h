@@ -32,7 +32,6 @@ void GetIdt(void *result);
 void PutIdt(void *result);
 void GetGdt(void *result);
 
-
 void SpinLockLock(ulong *lock);
 void SpinLockUnlock(ulong *lock);
 
@@ -46,7 +45,15 @@ void InterruptEnable(void);
 void InterruptDisable(void);
 void Hlt(void);
 
-ulong SwitchRsp(ulong newValue);
+void SetRsp(ulong newValue);
+
+void SwitchContext(ulong nextRsp, ulong* currRsp);
+
+void AtomicInc(volatile long *pvalue);
+void AtomicDec(volatile long *pvalue);
+long AtomicRead(volatile long *pvalue);
+void AtomicWrite(volatile long *pvalue, long newValue);
+long AtomicReadAndDec(volatile long *pvalue);
 
 void IO8042InterruptStub();
 void SerialInterruptStub();

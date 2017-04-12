@@ -248,6 +248,11 @@ void Cpu::OnTimeChange(const Shared::Time& time)
     TaskQueue.Schedule();
 }
 
+TaskQueue& Cpu::GetTaskQueue()
+{
+    return TaskQueue;
+}
+
 extern "C" void IPInterrupt(Context* ctx)
 {
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();

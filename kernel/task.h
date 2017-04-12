@@ -51,10 +51,14 @@ public:
     void Get();
     void Put();
 
+    bool Start(Func func, void* ctx);
+
 public:
     Shared::ListEntry ListEntry;
     TaskQueue* TaskQueue;
     SpinLock Lock;
+    Atomic PreemptCounter;
+    ulong Rsp;
 
 private:
     Task(const Task& other) = delete;

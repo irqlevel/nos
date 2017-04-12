@@ -1,6 +1,5 @@
 #include "atomic.h"
-
-#include <lib/lock.h>
+#include "asm.h"
 
 namespace Kernel
 {
@@ -13,38 +12,35 @@ Atomic::Atomic()
     Set(0);
 }
 
-Atomic::Atomic(int value)
+Atomic::Atomic(long value)
 {
     Set(value);
 }
 
 void Atomic::Inc()
 {
-    Shared::AutoLock lock(Lock);
+    AtomicInc(&Value);
+}
 
-    Value++;
+void Atomic::Dec()
+{
+    AtomicDec(&Value);
 }
 
 bool Atomic::DecAndTest()
 {
-    Shared::AutoLock lock(Lock);
-
-    Value--;
-    return (Value == 0) ? true : false;
+    long oldValue = AtomicReadAndDec(&Value);
+    return (oldValue == 1) ? true : false;
 }
 
-void Atomic::Set(int value)
+void Atomic::Set(long value)
 {
-    Shared::AutoLock lock(Lock);
-
-    Value = value;
+    AtomicWrite(&Value, value);
 }
 
-int Atomic::Get()
+long Atomic::Get()
 {
-    Shared::AutoLock lock(Lock);
-
-    return Value;
+    return AtomicRead(&Value);
 }
 
 Atomic::~Atomic()

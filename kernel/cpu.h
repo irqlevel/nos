@@ -41,6 +41,8 @@ public:
 
     void OnTimeChange(const Shared::Time& time);
 
+    TaskQueue& GetTaskQueue();
+
 private:
     Cpu(const Cpu& other) = delete;
     Cpu(Cpu&& other) = delete;

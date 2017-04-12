@@ -1,7 +1,5 @@
 #pragma once
 
-#include "spin_lock.h"
-
 namespace Kernel
 {
 
@@ -12,11 +10,12 @@ class Atomic
 {
 public:
     Atomic();
-    Atomic(int value);
+    Atomic(long value);
     void Inc();
+    void Dec();
     bool DecAndTest();
-    int Get();
-    void Set(int value);
+    long Get();
+    void Set(long value);
     ~Atomic();
 
     Atomic& operator=(Atomic&& other);
@@ -26,8 +25,7 @@ private:
     Atomic(const Atomic& other) = delete;
     Atomic& operator=(const Atomic& other) = delete;
 
-    int Value;
-    SpinLock Lock;
+    volatile long Value;
 };
 
 }
