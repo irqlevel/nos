@@ -1,13 +1,15 @@
-CPPFLAGS ?= -I$(CURDIR) -std=c++11 -mcmodel=kernel -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=large -mno-red-zone -mcmodel=large
-LFLAGS ?= -nostdlib -z max-page-size=4096
 TARGET64 = x86_64-none-elf
-CC ?= clang
-CPP ?= clang -x c++
-ASM ?= nasm
-AR ?= ar
+CPPFLAGS = -I$(CURDIR)
+CXXFLAGS = --target=$(TARGET64) -std=c++11 -mcmodel=kernel -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=large -mno-red-zone -mcmodel=large
+LDFLAGS = -nostdlib -z max-page-size=4096
+LD = ld
+CC = clang
+CXX = clang -x c++
+ASM = nasm
+AR = ar
 MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 
-CPP_SRC =   \
+CXX_SRC =   \
     drivers/serial.cpp  \
     drivers/pic.cpp \
     drivers/pit.cpp \
@@ -45,11 +47,13 @@ ASM_SRC =    \
     boot/boot64.asm \
     kernel/asm.asm
 
-OBJS = $(CPP_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
+OBJS = $(CXX_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
+
+.PHONY: all check clean %.o
 
 all: check nos.iso
 
-check: $(CPP_SRC)
+check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 -q . || exit 1
 
 nos.iso: kernel64.elf
@@ -67,10 +71,9 @@ nos.iso: kernel64.elf
 %.o: %.asm
 	$(ASM) -felf64 $< -o $@
 %.o: %.cpp
-	$(CPP) $(CPPFLAGS) --target=$(TARGET64) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-kernel64.elf: $(OBJS)
-	ld $(LFLAGS) -T build/linker64.ld -o kernel64.elf $(OBJS)
-
+kernel64.elf: build/linker64.ld $(OBJS)
+	$(LD) $(LDFLAGS) -T $< -o kernel64.elf $(OBJS)
 clean:
 	rm -rf $(OBJS) *.elf *.bin *.iso iso
