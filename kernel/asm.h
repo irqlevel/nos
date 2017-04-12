@@ -46,6 +46,8 @@ void InterruptEnable(void);
 void InterruptDisable(void);
 void Hlt(void);
 
+ulong SwitchRsp(ulong newValue);
+
 void IO8042InterruptStub();
 void SerialInterruptStub();
 void PitInterruptStub();

@@ -1,5 +1,4 @@
 #include "panic.h"
-#include "debug.h"
 
 #include <drivers/vga.h>
 
@@ -27,7 +26,8 @@ void Panicker::DoPanic(const char *fmt, ...)
     term.Vprintf(fmt, args);
     va_end(args);
 
-    DebugWait();
+    InterruptDisable();
+    Hlt();
 }
 
 }

@@ -24,6 +24,10 @@ public:
 
     bool FindRegion(ulong base, ulong limit, ulong& start, ulong& end);
 
+    ulong GetKernelSpaceBase();
+
+    ulong GetKernelEnd();
+
 private:
     MemoryMap(const MemoryMap& other) = delete;
     MemoryMap(MemoryMap&& other) = delete;
@@ -31,6 +35,8 @@ private:
     MemoryMap& operator=(MemoryMap&& other) = delete;
 
     MemoryMap();
+
+    static const ulong KernelSpaceBase = 0xFFFF800000000000;
 
     struct MemoryRegion
     {

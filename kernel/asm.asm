@@ -59,6 +59,7 @@ global WriteMsr
 global InterruptEnable
 global InterruptDisable
 global Hlt
+global SwitchRsp
 
 global DummyInterruptStub
 global IO8042InterruptStub
@@ -246,6 +247,14 @@ InterruptDisable:
 
 Hlt:
 	hlt
+	ret
+
+SwitchRsp:
+	mov rsi, rsp
+	mov rax, [rsp] ; save return address
+	mov rsp, rdi
+	push rax
+	mov rax, rsi ; return orig rsp
 	ret
 
 %macro PushAll 0

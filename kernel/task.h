@@ -9,34 +9,35 @@ namespace Kernel
 namespace Core
 {
 
-const ulong TaskInfoSize = 4 * Shared::PageSize;
-
-class Task;
-
-struct TaskInfo
-{
-    TaskInfo(Task* task)
-        : TaskPtr(task)
-    {
-    }
-
-    Task* TaskPtr;
-    u8 StackBottom[TaskInfoSize - sizeof(ulong)];
-} __attribute__((packed));
-
-static_assert(sizeof(TaskInfo) == TaskInfoSize, "Invalid size");
-
-using TaskRountinePtr = void (*)(void *ctx);
-
 class Task final
 {
 public:
-    Task(TaskRountinePtr routine, void* ctx);
+
+    static const ulong StackSize = Shared::PageSize;
+
+    struct Stack
+    {
+        Stack(Task* task)
+            : Task(task)
+        {
+        }
+
+        Task* Task;
+        u8 StackBottom[StackSize - sizeof(ulong)];
+        u8 StackTop[0];
+    } __attribute__((packed));
+
+    static_assert(sizeof(Stack) == StackSize, "Invalid size");
+
+    using Func = void (*)(void *ctx);
+
+    Task();
     ~Task();
 
-    Shared::ListEntry List;
+    bool Run(Func func, void* ctx);
 
-    void Run();
+public:
+    Shared::ListEntry List;
 
 private:
     Task(const Task& other) = delete;
@@ -44,9 +45,9 @@ private:
     Task& operator=(const Task& other) = delete;
     Task& operator=(Task&& other) = delete;
 
-    TaskRountinePtr Routine;
+    Stack* Stack;
+    Func Function;
     void* Ctx;
-    TaskInfo* TaskInfoPtr;
 };
 
 }

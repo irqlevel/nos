@@ -34,6 +34,7 @@ CXX_SRC =   \
     kernel/cmd.cpp  \
     kernel/exception.cpp    \
     kernel/dmesg.cpp    \
+    kernel/sched.cpp    \
     lib/stdlib.cpp  \
     lib/list_entry.cpp  \
     lib/error.cpp   \
@@ -56,7 +57,7 @@ all: check nos.iso
 check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 -q . || exit 1
 
-nos.iso: kernel64.elf
+nos.iso: build/grub.cfg kernel64.elf
 	rm -rf iso
 	rm -rf bin
 	mkdir -p iso/boot/grub

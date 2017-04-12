@@ -184,6 +184,12 @@ static inline u8 LowPart(u16 value)
     return ((u8)((value) & 0x00FF));
 }
 
+static inline ulong RoundUp(ulong value, ulong align)
+{
+    ulong i = value / align;
+    return ((value % align) == 0) ? value : ((i + 1) * align);
+}
+
 void *MemAdd(void *ptr, unsigned long len);
 
 const void *MemAdd(const void *ptr, unsigned long len);

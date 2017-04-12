@@ -2,6 +2,8 @@
 #include <kernel/trace.h>
 #include <lib/stdlib.h>
 
+extern "C" char KernelEnd;
+
 namespace Kernel
 {
 
@@ -71,6 +73,17 @@ bool MemoryMap::FindRegion(ulong base, ulong limit, ulong& start, ulong& end)
 
 MemoryMap::~MemoryMap()
 {
+}
+
+
+ulong MemoryMap::GetKernelSpaceBase()
+{
+    return KernelSpaceBase;
+}
+
+ulong MemoryMap::GetKernelEnd()
+{
+    return Shared::RoundUp((ulong)&KernelEnd, Shared::PageSize);
 }
 
 }

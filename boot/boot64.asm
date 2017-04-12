@@ -295,10 +295,6 @@ Start32:
     ; load the 64-bit GDT
     lgdt [gdt64.pointer]
     jmp gdt64.code:long_mode_start
-    cli
-.hang:
-    hlt
-    jmp .hang
 
 ap_start32:
     AllocStack
@@ -307,10 +303,6 @@ ap_start32:
     ; load the 64-bit GDT
     lgdt [gdt64.pointer]
     jmp gdt64.code:long_mode_ap_start
-    cli
-.ap_start32_hang:
-    hlt
-    jmp .ap_start32_hang
 
 BITS 64
 long_mode_start:
@@ -325,10 +317,6 @@ start64:
     mov rdi, [mbinfo]
     mov rax, Main
     call rax
-    cli
-start64_hang:
-    hlt
-    jmp start64_hang
 
 long_mode_ap_start:
     ; load 0 into all data segment registers
@@ -341,7 +329,3 @@ long_mode_ap_start:
 ap_start64:
     mov rax, ApMain
     call rax
-    cli
-ap_start64_hang:
-    hlt
-    jmp ap_start64_hang

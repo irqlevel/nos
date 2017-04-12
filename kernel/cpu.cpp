@@ -50,6 +50,12 @@ void Cpu::SetRunning()
     State |= StateRunning;
 }
 
+void Cpu::SetExiting()
+{
+    Shared::AutoLock lock(Lock);
+    State |= StateExiting;
+}
+
 void Cpu::Init(ulong index)
 {
     Shared::AutoLock lock(Lock);
@@ -191,16 +197,65 @@ Cpu& CpuTable::GetCurrentCpu()
     return GetCpu(GetCurrentCpuId());
 }
 
+void CpuTable::ExitAllExceptSelf()
+{
+    auto& self = GetCurrentCpu();
+
+    ulong cpuMask = GetRunningCpus();
+    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    {
+        if ((cpuMask & ((ulong)1 << i)) && (i != self.GetIndex()))
+        {
+            auto& cpu = GetCpu(i);
+            cpu.SetExiting();
+
+            while (!(cpu.GetState() & Cpu::StateExited))
+            {
+                cpu.SendIPISelf();
+                Pause();
+            }
+        }
+    }
+}
+
 void Cpu::IPI(Context* ctx)
 {
-    Trace(0, "IPI cpu %u rip 0x%p", Index, ctx->GetRetRip());
+    Trace(0, "IPI cpu %u rip 0x%p rsp 0x%p", Index, ctx->GetRetRip(), ctx->GetOrigRsp());
     Lapic::EOI(CpuTable::IPIVector);
+
+    bool exit;
+    {
+        Shared::AutoLock lock(Lock);
+        exit = (State & StateExiting) ? true : false;
+        if (exit)
+            State |= StateExited;
+    }
+
+    if (exit)
+    {
+        Trace(0, "Cpu %u exited, state 0x%p", Index, State);
+        InterruptDisable();
+        Hlt();
+        return;
+    }
+
+    TaskQueue.Schedule();
 }
 
 extern "C" void IPInterrupt(Context* ctx)
 {
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
     cpu.IPI(ctx);
+}
+
+void Cpu::SendIPISelf()
+{
+    Shared::AutoLock lock(Lock);
+
+    if (BugOn(!(State & Cpu::StateRunning)))
+        return;
+
+    Lapic::SendIPI(Index, CpuTable::IPIVector);
 }
 
 void CpuTable::SendIPI(ulong index)
@@ -210,11 +265,8 @@ void CpuTable::SendIPI(ulong index)
     if (BugOn(index >= Shared::ArraySize(CpuArray)))
         return;
 
-    auto& cpu = CpuArray[BspIndex];
-    if (BugOn(!(cpu.GetState() & Cpu::StateRunning)))
-        return;
-
-    Lapic::SendIPI(index, CpuTable::IPIVector);
+    auto& cpu = CpuArray[index];
+    cpu.SendIPISelf();
 }
 
 ulong CpuTable::GetRunningCpus()
@@ -230,6 +282,11 @@ ulong CpuTable::GetRunningCpus()
     }
 
     return result;
+}
+
+bool Cpu::Run(Task::Func func, void *ctx)
+{
+    return Task.Run(func, ctx);
 }
 
 }

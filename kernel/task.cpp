@@ -1,5 +1,6 @@
 #include "task.h"
 #include "trace.h"
+#include "asm.h"
 
 namespace Kernel
 {
@@ -7,26 +8,35 @@ namespace Kernel
 namespace Core
 {
 
-Task::Task(TaskRountinePtr routine, void* ctx)
-    : Routine(routine)
-    , Ctx(ctx)
-    , TaskInfoPtr(nullptr)
+Task::Task()
+    : Stack(nullptr)
+    , Function(nullptr)
+    , Ctx(nullptr)
 {
-    TaskInfoPtr = new TaskInfo(this);
-}
-
-void Task::Run()
-{
-    Routine(Ctx);
 }
 
 Task::~Task()
 {
-    if (TaskInfoPtr != nullptr)
+    if (Stack != nullptr)
     {
-        delete TaskInfoPtr;
-        TaskInfoPtr = nullptr;
+        delete Stack;
     }
+}
+
+bool Task::Run(Func func, void* ctx)
+{
+    Stack = new struct Stack(this);
+    if (Stack == nullptr)
+    {
+        return false;
+    }
+
+    SwitchRsp((ulong)&Stack->StackTop[0]);
+    Function = func;
+    Ctx = ctx;
+
+    Function(Ctx);
+    return true;
 }
 
 }

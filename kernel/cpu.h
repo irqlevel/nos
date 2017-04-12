@@ -2,6 +2,8 @@
 
 #include "stdlib.h"
 #include "spin_lock.h"
+#include "task.h"
+#include "sched.h"
 
 namespace Kernel
 {
@@ -18,6 +20,7 @@ public:
     void Init(ulong index);
 
     void SetRunning();
+    void SetExiting();
 
     ulong GetIndex();
 
@@ -29,6 +32,12 @@ public:
 
     static const ulong StateInited = 0x1;
     static const ulong StateRunning = 0x2;
+    static const ulong StateExiting = 0x4;
+    static const ulong StateExited = 0x8;
+
+    bool Run(Task::Func func, void *ctx);
+
+    void SendIPISelf();
 
 private:
     Cpu(const Cpu& other) = delete;
@@ -39,6 +48,8 @@ private:
     ulong Index;
     ulong State;
     SpinLock Lock;
+    Task Task;
+    TaskQueue TaskQueue;
 };
 
 class CpuTable final
@@ -69,6 +80,8 @@ public:
 
     ulong GetRunningCpus();
 
+    void ExitAllExceptSelf();
+
 private:
     CpuTable();
     ~CpuTable();
@@ -79,7 +92,7 @@ private:
 
     ulong GetBspIndexLockHeld();
 
-    static const ulong MaxCpu = 16;
+    static const ulong MaxCpu = 8;
 
     SpinLock Lock;
     Cpu CpuArray[MaxCpu];

@@ -96,11 +96,12 @@ void TraceCpuState(ulong cpu)
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
 }
 
-extern "C" void ApMain()
+void ApStartup(void *ctx)
 {
-    Lapic::Enable();
+    (void)ctx;
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+
     cpu.SetRunning();
 
     Trace(0, "Cpu %u started rflags 0x%p", cpu.GetIndex(), GetRflags());
@@ -117,50 +118,37 @@ extern "C" void ApMain()
     }
 }
 
-extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
+extern "C" void ApMain()
 {
-    Tracer::GetInstance().SetLevel(1);
-    Trace(0, "Enter rflags 0x%p", GetRflags());
+    Lapic::Enable();
 
-    VgaTerm::GetInstance().Printf("Hello!\n");
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
 
-    ParseGrubInfo(MbInfo);
-
-    //Kernel is loaded at 0x1000000 (see linke64.ld), so
-    //assume 0x2000000 is high enough to use.
-    //boot64.asm only setup paging for first 4GB
-    //so do not overflow it.
-    ulong memStart, memEnd;
-    auto& mmap = MemoryMap::GetInstance();
-    if (!mmap.FindRegion(0x2000000, 0x100000000, memStart, memEnd))
+    if (!cpu.Run(ApStartup, nullptr))
     {
-        Panic("Can't get available memory region");
+        Trace(0, "Can't run cpu %u task", cpu.GetIndex());
         return;
     }
+}
 
-    Trace(0, "Memory region 0x%p 0x%p", memStart, memEnd);
-    SPageAllocator::GetInstance(memStart, memEnd);
+void Exit()
+{
+    VgaTerm::GetInstance().Printf("Going to exit!\n");
+    Trace(0, "Exit begin");
 
-    VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
+    CpuTable::GetInstance().ExitAllExceptSelf();
 
-    auto& acpi = Acpi::GetInstance();
-    auto err = acpi.Parse();
-    if (!err.Ok())
-    {
-        TraceError(err, "Can't parse ACPI");
-        Panic("Can't parse ACPI");
-        return;
-    }
+    VgaTerm::GetInstance().Printf("Bye!\n");
+    Trace(0, "Exit end");
 
-    err = Test();
-    if (!err.Ok())
-    {
-        TraceError(err, "Test failed");
-        Panic("Self test failed");
-        return;
-    }
+    __cxa_finalize(0);
+    InterruptDisable();
+    Hlt();
+}
 
-    VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
+void BpStartup(void* ctx)
+{
+    (void)ctx;
 
     auto& idt = Idt::GetInstance();
     auto& excTable = ExceptionTable::GetInstance();
@@ -168,26 +156,9 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     auto& kbd = IO8042::GetInstance();
     auto& serial = Serial::GetInstance();
     auto& cmd = Cmd::GetInstance();
-    auto& pic = Pic::GetInstance();
     auto& ioApic = IoApic::GetInstance();
     auto& cpus = CpuTable::GetInstance();
-    if (!kbd.RegisterObserver(cmd))
-    {
-        Panic("Can't register cmd in kbd");
-        return;
-    }
-
-    pic.Remap();
-    pic.Disable();
-
-    Lapic::Enable();
-
     auto& cpu = cpus.GetCurrentCpu();
-    if (!cpus.SetBspIndex(cpu.GetIndex()))
-    {
-        Panic("Can't set boot processor index");
-        return;
-    }
 
     TraceCpuState(cpu.GetIndex());
 
@@ -237,8 +208,95 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
         }
     }
 
-    Trace(0, "Exit");
+    Exit();
+}
 
-    VgaTerm::GetInstance().Printf("Bye!\n");
-    __cxa_finalize(0);
+extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
+{
+    do {
+
+    Tracer::GetInstance().SetLevel(1);
+
+    auto& mmap = MemoryMap::GetInstance();
+    Trace(0, "Enter rflags 0x%p KernelSpace 0x%p KernelEnd 0x%p",
+        GetRflags(), mmap.GetKernelSpaceBase(), mmap.GetKernelEnd());
+
+    VgaTerm::GetInstance().Printf("Hello!\n");
+
+    ParseGrubInfo(MbInfo);
+
+    ulong memStart, memEnd;
+    if (mmap.GetKernelEnd() <= (mmap.GetKernelSpaceBase() + MB))
+    {
+        Panic("Kernel end is lower than kernel space base");
+        break;
+    }
+
+    //boot64.asm only setup paging for first 4GB
+    if (!mmap.FindRegion(mmap.GetKernelEnd() - mmap.GetKernelSpaceBase(), 4 * GB, memStart, memEnd))
+    {
+        Panic("Can't get available memory region");
+        break;
+    }
+
+    Trace(0, "Memory region 0x%p 0x%p", memStart, memEnd);
+    SPageAllocator::GetInstance(mmap.GetKernelSpaceBase() + memStart, mmap.GetKernelSpaceBase() + memEnd);
+
+    VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
+
+    auto& acpi = Acpi::GetInstance();
+    auto err = acpi.Parse();
+    if (!err.Ok())
+    {
+        TraceError(err, "Can't parse ACPI");
+        Panic("Can't parse ACPI");
+        break;
+    }
+
+    Trace(0, "Before test");
+
+    err = Test();
+    if (!err.Ok())
+    {
+        TraceError(err, "Test failed");
+        Panic("Self test failed");
+        break;
+    }
+
+    Trace(0, "After test");
+    VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
+
+    auto& kbd = IO8042::GetInstance();
+    auto& cmd = Cmd::GetInstance();
+    auto& pic = Pic::GetInstance();
+    auto& cpus = CpuTable::GetInstance();
+    if (!kbd.RegisterObserver(cmd))
+    {
+        Panic("Can't register cmd in kbd");
+        break;
+    }
+
+    pic.Remap();
+    pic.Disable();
+
+    Lapic::Enable();
+
+    auto& cpu = cpus.GetCurrentCpu();
+    if (!cpus.SetBspIndex(cpu.GetIndex()))
+    {
+        Panic("Can't set boot processor index");
+        break;
+    }
+
+    Trace(0, "Before cpu run");
+
+    if (!cpu.Run(BpStartup, nullptr))
+    {
+        Panic("Can't run cpu %u task", cpu.GetIndex());
+        break;
+    }
+
+    } while (false);
+
+    Exit();
 }

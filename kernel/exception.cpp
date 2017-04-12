@@ -4,6 +4,7 @@
 #include "asm.h"
 #include "panic.h"
 #include "trace.h"
+#include "cpu.h"
 
 namespace Kernel
 {
@@ -172,7 +173,8 @@ void ExceptionTable::ExcInvalidOpcode(Context* ctx)
 
     ExcInvalidOpcodeCounter.Inc();
 
-    Trace(ExcLL, "EXC: InvalidOpCode");
+    Trace(ExcLL, "EXC: InvalidOpcode cpu %u rip 0x%p rsp 0x%p",
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
 }
 
 void ExceptionTable::ExcCoprocessorNotAvailable(Context* ctx)
@@ -190,7 +192,8 @@ void ExceptionTable::ExcDoubleFault(Context* ctx)
 
     ExcDoubleFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: DoubleFault");
+    Trace(ExcLL, "EXC: DoubleFault cpu %u rip 0x%p rsp 0x%p",
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
 }
 
 void ExceptionTable::ExcCoprocessorSegmentOverrun(Context* ctx)
@@ -235,7 +238,8 @@ void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
 
     ExcGeneralProtectionFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: GeneralProtectionFault");
+    Trace(ExcLL, "EXC: GeneralProtectionFault cpu %u rip 0x%p rsp 0x%p",
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
 }
 
 void ExceptionTable::ExcPageFault(Context* ctx)
@@ -244,7 +248,9 @@ void ExceptionTable::ExcPageFault(Context* ctx)
 
     ExcPageFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: PageFault");
+    Trace(ExcLL, "EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0xp cr3 0xp",
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp(),
+        GetCr2(), GetCr3());
 }
 
 void ExceptionTable::ExcReserved(Context* ctx)
