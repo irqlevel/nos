@@ -34,6 +34,9 @@ private:
     using ListEntry = Shared::ListEntry;
     ListEntry TaskList;
     SpinLock Lock;
+
+    Atomic ScheduleCounter;
+    Atomic SwitchContextCounter;
 };
 
 }

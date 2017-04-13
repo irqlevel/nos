@@ -39,7 +39,7 @@ public:
 
     void SendIPISelf();
 
-    void OnTimeChange(const Shared::Time& time);
+    void Schedule();
 
     TaskQueue& GetTaskQueue();
 
@@ -54,6 +54,7 @@ private:
     SpinLock Lock;
     Task Task;
     TaskQueue TaskQueue;
+    Atomic IPIConter;
 };
 
 class CpuTable final
@@ -85,6 +86,8 @@ public:
     ulong GetRunningCpus();
 
     void ExitAllExceptSelf();
+
+    void SendIPIAllExclude(ulong excludeIndex);
 
 private:
     CpuTable();

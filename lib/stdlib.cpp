@@ -315,4 +315,21 @@ int StrnCmp(const char *s1, const char *s2, size_t size)
     return 0;
 }
 
+// find n : 2^n >= size
+size_t Log2(size_t size)
+{
+    if (size < 2)
+        return 0;
+
+	size_t log = 0;
+    size_t restSize = size;
+    while (restSize != 0)
+    {
+        restSize >>= 1;
+        log++;
+    }
+
+    return (size & (size - 1)) ? log : (log - 1);
+}
+
 }

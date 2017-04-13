@@ -36,6 +36,7 @@ void Task::Release()
     if (Stack != nullptr)
     {
         delete Stack;
+        Stack = nullptr;
     }
 }
 

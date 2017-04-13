@@ -1,6 +1,6 @@
 #include "new.h"
-#include "spage_allocator.h"
-#include "sallocator.h"
+#include "page_allocator.h"
+#include "allocator.h"
 
 #include <include/const.h>
 #include <kernel/panic.h>
@@ -14,13 +14,12 @@ namespace Core
 void* New(size_t size) noexcept
 {
 
-	return SAllocator::GetInstance(SPageAllocator::GetInstance()).Alloc(size);
+	return AllocatorImpl::GetInstance(PageAllocatorImpl::GetInstance()).Alloc(size);
 }
 
 void Delete(void* ptr) noexcept
 {
-
-	SAllocator::GetInstance(SPageAllocator::GetInstance()).Free(ptr);
+	AllocatorImpl::GetInstance(PageAllocatorImpl::GetInstance()).Free(ptr);
 }
 
 }

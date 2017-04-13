@@ -41,9 +41,9 @@ CXX_SRC =   \
     lib/error.cpp   \
     mm/memory_map.cpp   \
     mm/new.cpp  \
-    mm/sallocator.cpp   \
-    mm/spage_allocator.cpp  \
-    mm/spool.cpp    \
+    mm/allocator.cpp   \
+    mm/page_allocator.cpp  \
+    mm/pool.cpp    \
 
 ASM_SRC =    \
     boot/boot64.asm \

@@ -17,7 +17,7 @@ class Task final
 {
 public:
 
-    static const ulong StackSize = Shared::PageSize;
+    static const ulong StackSize = 8 * Shared::PageSize;
     static const ulong StackMagic1 = 0xBCDEBCDE;
     static const ulong StackMagic2 = 0xCBDECBDE;
 

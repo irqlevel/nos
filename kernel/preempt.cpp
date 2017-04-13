@@ -1,5 +1,7 @@
 #include "preempt.h"
 #include "task.h"
+#include "panic.h"
+#include "asm.h"
 
 namespace Kernel
 {
@@ -9,12 +11,19 @@ namespace Core
 
 volatile bool PreemptActive = false;
 
-void PreemptActivate()
+void PreemptOn()
 {
     PreemptActive = true;
+    Barrier();
 }
 
-bool PreemptIsActive()
+void PreemptOff()
+{
+    PreemptActive = false;
+    Barrier();
+}
+
+bool PreemptIsOn()
 {
     return PreemptActive;
 }
@@ -23,7 +32,7 @@ void PreemptDisable()
 {
     if (likely(PreemptActive))
     {
-        Task *task = Task::GetCurrentTask();
+        auto task = Task::GetCurrentTask();
         task->PreemptCounter.Inc();
     }
 }
@@ -32,7 +41,8 @@ void PreemptEnable()
 {
     if (likely(PreemptActive))
     {
-        Task *task = Task::GetCurrentTask();
+        auto task = Task::GetCurrentTask();
+        BugOn(task->PreemptCounter.Get() == 0);
         task->PreemptCounter.Dec();
     }
 }

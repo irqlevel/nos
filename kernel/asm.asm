@@ -184,32 +184,20 @@ GetGdt:
 	ret
 
 SpinLockLock:
-	push rdx
-	push rax
-	push rcx
-	mov rdx, rdi
-SpinLockLockAgain:
+	xor rsi, rsi
+	inc rsi
+.again:
 	xor rax, rax
-	xor rcx, rcx
-	inc rcx
-	lock cmpxchg [rdx], rcx
-	je SpinLockLockComplete
+	lock cmpxchg qword [rdi], rsi
+	je .complete
 	pause
-	jmp SpinLockLockAgain
-SpinLockLockComplete:
-	pop rcx
-	pop rax
-	pop rdx
+	jmp .again
+.complete:
 	ret
 
 SpinLockUnlock:
-	push rdx
-	push rcx
-	mov rdx, rdi
-	xor rcx, rcx
-	lock and [rdx], rcx
-	pop rcx
-	pop rdx
+	xor rax, rax
+	lock and qword [rdi], rax
 	ret
 
 Outb:

@@ -1,4 +1,4 @@
-#include "sallocator.h"
+#include "allocator.h"
 
 #include <include/const.h>
 #include <kernel/panic.h>
@@ -11,20 +11,20 @@ namespace Kernel
 namespace Core
 {
 
-SAllocator::SAllocator(PageAllocator& pageAllocator)
-	: PageAllocer(pageAllocator)
+AllocatorImpl::AllocatorImpl(class PageAllocator& pageAllocator)
+	: PageAllocator(pageAllocator)
 {
 	for (size_t i = 0; i < Shared::ArraySize(Pool); i++)
 	{
-		Pool[i].Setup(static_cast<size_t>(1) << (StartLog + i), &PageAllocer);
+		Pool[i].Setup(static_cast<size_t>(1) << (StartLog + i), &PageAllocator);
 	}
 }
 
-SAllocator::~SAllocator()
+AllocatorImpl::~AllocatorImpl()
 {
 }
 
-size_t SAllocator::Log2(size_t size)
+size_t AllocatorImpl::Log2(size_t size)
 {
 	size_t log;
 
@@ -34,12 +34,7 @@ size_t SAllocator::Log2(size_t size)
 	}
 	else
 	{
-		log = 0;
-		while (size != 0)
-		{
-			size >>= 1;
-			log++;
-		}
+		log = Shared::Log2(size);
 	}
 
 	BugOn((static_cast<size_t>(1) << log) < size);
@@ -47,23 +42,20 @@ size_t SAllocator::Log2(size_t size)
 	return log;
 }
 
-void* SAllocator::Alloc(size_t size)
+void* AllocatorImpl::Alloc(size_t size)
 {
-	if (size == 0 || size > Shared::PageSize)
-	{
-		return nullptr;
-	}
+	BugOn(size == 0);
 
 	Header* header;
 	size_t reqSize = (size + sizeof(*header));
 	if (reqSize >= (Shared::PageSize / 2))
 	{
-		return PageAllocer.Alloc();
+		return PageAllocator.Alloc(Shared::SizeInPages(size));
 	}
 
 	size_t log = Log2(reqSize);
 
-	Trace(SAllocatorLL, "0x%p size 0x%p log 0x%p", this, size, log);
+	Trace(AllocatorLL, "0x%p size 0x%p log 0x%p", this, size, log);
 	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Shared::ArraySize(Pool)))
 	{
 		return nullptr;
@@ -80,13 +72,13 @@ void* SAllocator::Alloc(size_t size)
 	return header + 1;
 }
 
-void SAllocator::Free(void* ptr)
+void AllocatorImpl::Free(void* ptr)
 {
 	BugOn(ptr == nullptr);
 
 	if ((reinterpret_cast<ulong>(ptr) & (Shared::PageSize - 1)) == 0)
 	{
-		PageAllocer.Free(ptr);
+		PageAllocator.Free(ptr);
 		return;
 	}
 

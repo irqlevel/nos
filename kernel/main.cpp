@@ -18,7 +18,7 @@
 #include <lib/stdlib.h>
 
 #include <mm/new.h>
-#include <mm/spage_allocator.h>
+#include <mm/page_allocator.h>
 #include <mm/memory_map.h>
 
 #include <drivers/8042.h>
@@ -135,6 +135,8 @@ extern "C" void ApMain()
 
 void Exit()
 {
+    PreemptDisable();
+
     VgaTerm::GetInstance().Printf("Going to exit!\n");
     Trace(0, "Exit begin");
 
@@ -142,6 +144,8 @@ void Exit()
 
     VgaTerm::GetInstance().Printf("Bye!\n");
     Trace(0, "Exit end");
+
+    PreemptOff();
 
     __cxa_finalize(0);
     InterruptDisable();
@@ -188,7 +192,7 @@ void BpStartup(void* ctx)
         return;
     }
 
-    PreemptActivate();
+    PreemptOn();
 
     VgaTerm::GetInstance().Printf("IPI test...\n");
 
@@ -247,7 +251,12 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
     }
 
     Trace(0, "Memory region 0x%p 0x%p", memStart, memEnd);
-    SPageAllocator::GetInstance(mmap.GetKernelSpaceBase() + memStart, mmap.GetKernelSpaceBase() + memEnd);
+    if (!PageAllocatorImpl::GetInstance().Setup(mmap.GetKernelSpaceBase() + memStart,
+                                                mmap.GetKernelSpaceBase() + memEnd))
+    {
+        Panic("Can't setup page allocator");
+        break;
+    }
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
 

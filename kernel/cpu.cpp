@@ -218,10 +218,25 @@ void CpuTable::ExitAllExceptSelf()
     }
 }
 
+void CpuTable::SendIPIAllExclude(ulong excludeIndex)
+{
+    ulong cpuMask = GetRunningCpus();
+    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    {
+        if ((cpuMask & ((ulong)1 << i)) && (i != excludeIndex))
+        {
+            auto& cpu = GetCpu(i);
+
+            cpu.SendIPISelf();
+        }
+    }
+}
+
 void Cpu::IPI(Context* ctx)
 {
-    Trace(0, "IPI cpu %u rip 0x%p rsp 0x%p", Index, ctx->GetRetRip(), ctx->GetOrigRsp());
-    Lapic::EOI(CpuTable::IPIVector);
+    (void)ctx;
+
+    IPIConter.Inc();
 
     bool exit;
     {
@@ -233,18 +248,19 @@ void Cpu::IPI(Context* ctx)
 
     if (exit)
     {
-        Trace(0, "Cpu %u exited, state 0x%p", Index, State);
+        Trace(0, "Cpu %u exited, state 0x%p, IPI count %u",
+            Index, State, IPIConter.Get());
         InterruptDisable();
+        Lapic::EOI(CpuTable::IPIVector);
         Hlt();
         return;
     }
-
-    TaskQueue.Schedule();
+    Schedule();
+    Lapic::EOI(CpuTable::IPIVector);
 }
 
-void Cpu::OnTimeChange(const Shared::Time& time)
+void Cpu::Schedule()
 {
-    (void)time;
     TaskQueue.Schedule();
 }
 
@@ -264,6 +280,9 @@ void Cpu::SendIPISelf()
     Shared::AutoLock lock(Lock);
 
     if (BugOn(!(State & Cpu::StateRunning)))
+        return;
+
+    if (State & Cpu::StateExited)
         return;
 
     Lapic::SendIPI(Index, CpuTable::IPIVector);

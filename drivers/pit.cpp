@@ -74,8 +74,11 @@ void Pit::Interrupt(Context* ctx)
 
     TimerTable::GetInstance().ProcessTimers();
 
+    //task scheduling
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
-    cpu.OnTimeChange(GetTime());
+    cpu.Schedule();
+    //ask other cpu's to schedule tasks
+    CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
 
     Lapic::EOI(IntVector);
 }

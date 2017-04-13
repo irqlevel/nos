@@ -1,4 +1,4 @@
-#include "spool.h"
+#include "pool.h"
 
 #include <include/const.h>
 #include <kernel/panic.h>
@@ -13,7 +13,7 @@ namespace Kernel
 namespace Core
 {
 
-SPool::SPool()
+Pool::Pool()
     : Usage(0)
     , Size(0)
 {
@@ -21,15 +21,15 @@ SPool::SPool()
     PageList.Init();
 }
 
-SPool::~SPool()
+Pool::~Pool()
 {
     BugOn(Usage != 0);
     Setup(0);
 }
 
-void SPool::Setup(size_t size, PageAllocator* pageAllocator)
+void Pool::Setup(size_t size, class PageAllocator* pageAllocator)
 {
-    Trace(SPoolLL, "0x%p setup size 0x%p", this, size);
+    Trace(PoolLL, "0x%p setup size 0x%p", this, size);
 
     Shared::AutoLock lock(Lock);
 
@@ -40,15 +40,15 @@ void SPool::Setup(size_t size, PageAllocator* pageAllocator)
 
     while (!PageList.IsEmpty())
     {
-        PageAllocer->Free(PageList.RemoveHead());
+        PageAllocator->Free(PageList.RemoveHead());
     }
 
     Usage = 0;
     Size = size;
-    PageAllocer = pageAllocator;
+    PageAllocator = pageAllocator;
 }
 
-bool SPool::CheckSize(size_t size)
+bool Pool::CheckSize(size_t size)
 {
     if (size == 0 || size >= Shared::PageSize)
         return false;
@@ -56,9 +56,9 @@ bool SPool::CheckSize(size_t size)
     return true;
 }
 
-void* SPool::Alloc()
+void* Pool::Alloc()
 {
-    Trace(SPoolLL, "0x%p alloc block size 0x%p", this, Size);
+    Trace(PoolLL, "0x%p alloc block size 0x%p", this, Size);
 
     Shared::AutoLock lock(Lock);
 
@@ -69,7 +69,7 @@ void* SPool::Alloc()
 
     if (BlockList.IsEmpty())
     {
-        Page* page = static_cast<Page*>(PageAllocer->Alloc());
+        Page* page = static_cast<Page*>(PageAllocator->Alloc(1));
         if (page == nullptr)
         {
             return nullptr;
@@ -87,16 +87,16 @@ void* SPool::Alloc()
 
     Usage++;
     void* block = BlockList.RemoveHead();
-    Trace(SPoolLL, "0x%p alloc block %p", this, block);
+    Trace(PoolLL, "0x%p alloc block %p", this, block);
 
     return block;
 }
 
-void SPool::Free(void* ptr)
+void Pool::Free(void* ptr)
 {
     Shared::AutoLock lock(Lock);
 
-    Trace(SPoolLL, "Free block %p", ptr);
+    Trace(PoolLL, "Free block %p", ptr);
 
     if (ptr == nullptr)
     {

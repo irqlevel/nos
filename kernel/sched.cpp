@@ -11,11 +11,17 @@ namespace Core
 
 TaskQueue::TaskQueue()
 {
+    Shared::AutoLock lock(Lock);
     TaskList.Init();
+
+    SwitchContextCounter.Set(0);
+    ScheduleCounter.Set(0);
 }
 
 void TaskQueue::Switch(Task* next, Task* curr)
 {
+    SwitchContextCounter.Inc();
+
     BugOn(curr == next);
 
     Trace(0, "Switch task 0x%p -> 0x%p", curr, next);
@@ -25,10 +31,7 @@ void TaskQueue::Switch(Task* next, Task* curr)
 
 void TaskQueue::Schedule()
 {
-    if (!PreemptIsActive())
-    {
-        return;
-    }
+    ScheduleCounter.Inc();
 
     Shared::AutoLock lock(Lock);
     Task* curr = Task::GetCurrentTask();
@@ -52,6 +55,7 @@ void TaskQueue::Schedule()
     TaskList.InsertTail(&curr->ListEntry);
     TaskList.InsertTail(&next->ListEntry);
     Switch(next, curr);
+
 }
 
 void TaskQueue::AddTask(Task* task)
@@ -95,6 +99,10 @@ TaskQueue::~TaskQueue()
         task->TaskQueue = nullptr;
         task->Put();
     }
+
+    Trace(0, "TaskQueue 0x%p counters: sched %u switch context %u",
+        this, ScheduleCounter.Get(), SwitchContextCounter.Get());
+
 }
 
 }

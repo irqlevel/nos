@@ -12,11 +12,11 @@ namespace Kernel
 namespace Core
 {
 
-class SPool
+class Pool
 {
 public:
-    SPool();
-    virtual ~SPool();
+    Pool();
+    virtual ~Pool();
 
     void Setup(size_t size, PageAllocator* pageAllocator = nullptr);
     void* Alloc();
@@ -37,7 +37,7 @@ private:
     ListEntry PageList;
     ListEntry BlockList;
     SpinLock Lock;
-    PageAllocator* PageAllocer;
+    PageAllocator* PageAllocator;
 };
 
 }

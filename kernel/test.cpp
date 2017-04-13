@@ -187,7 +187,7 @@ Shared::Error TestAllocator()
 {
     Shared::Error err;
 
-    for (size_t size = 1; size <= Shared::PageSize; size++)
+    for (size_t size = 1; size <= 8 * Shared::PageSize; size++)
     {
         u8 *block = new u8[size];
         if (block == nullptr)

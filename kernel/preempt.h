@@ -8,9 +8,11 @@ namespace Kernel
 namespace Core
 {
 
-void PreemptActivate();
+void PreemptOn();
 
-bool PreemptIsActive();
+void PreemptOff();
+
+bool PreemptIsOn();
 
 void PreemptDisable();
 

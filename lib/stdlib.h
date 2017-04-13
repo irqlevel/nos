@@ -184,10 +184,15 @@ static inline u8 LowPart(u16 value)
     return ((u8)((value) & 0x00FF));
 }
 
-static inline ulong RoundUp(ulong value, ulong align)
+static inline size_t RoundUp(size_t value, size_t align)
 {
-    ulong i = value / align;
+    size_t i = value / align;
     return ((value % align) == 0) ? value : ((i + 1) * align);
+}
+
+static inline size_t SizeInPages(size_t size)
+{
+    return RoundUp(size, Shared::PageSize) / Shared::PageSize;
 }
 
 void *MemAdd(void *ptr, unsigned long len);
@@ -225,5 +230,7 @@ int SnPrintf(char* buf, size_t size, const char* fmt, ...);
 int StrCmp(const char *s1, const char *s2);
 
 int StrnCmp(const char *s1, const char *s2, size_t size);
+
+size_t Log2(size_t size);
 
 }
