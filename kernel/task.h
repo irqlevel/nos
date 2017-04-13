@@ -10,9 +10,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Task final
 {
 public:
@@ -74,5 +71,4 @@ private:
     Atomic RefCounter;
 };
 
-}
 }

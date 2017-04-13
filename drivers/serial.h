@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Serial final : public InterruptHandler
 {
 public:
@@ -51,9 +48,6 @@ private:
     SpinLock Lock;
 
     static const int Port = 0x3F8;
-};
-
-
 };
 
 }

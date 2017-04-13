@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Tracer::Tracer()
     : Level(0)
 {
@@ -44,5 +41,4 @@ void Tracer::Output(const char *fmt, ...)
     Dmesg::GetInstance().PrintString(msg);
 }
 
-}
 }

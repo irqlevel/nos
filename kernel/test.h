@@ -5,11 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Shared::Error Test();
-
-}
 
 }

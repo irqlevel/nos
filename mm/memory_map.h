@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class MemoryMap final
 {
 public:
@@ -48,7 +45,5 @@ private:
     MemoryRegion Region[16];
     size_t Size;
 };
-
-}
 
 }

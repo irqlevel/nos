@@ -7,9 +7,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class BlockAllocatorImpl
 {
 public:
@@ -76,7 +73,5 @@ private:
     BlockAllocatorImpl Balloc[PageLogLimit];
 
 };
-
-}
 
 }

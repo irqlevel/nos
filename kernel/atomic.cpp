@@ -4,9 +4,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Atomic::Atomic()
 {
     Set(0);
@@ -58,5 +55,4 @@ Atomic& Atomic::operator=(Atomic&& other)
     return *this;
 }
 
-}
 }

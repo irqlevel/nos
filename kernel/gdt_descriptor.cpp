@@ -4,9 +4,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 GdtDescriptor::GdtDescriptor(u64 value)
     : Value(value)
 {
@@ -114,5 +111,4 @@ GdtDescriptor& GdtDescriptor::operator=(const GdtDescriptor& other)
     return *this;
 }
 
-}
 }

@@ -10,9 +10,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 IO8042::IO8042()
     : IntVector(-1)
     , Mod(0)
@@ -123,5 +120,4 @@ extern "C" void IO8042Interrupt(Context* ctx)
     IO8042::GetInstance().Interrupt(ctx);
 }
 
-}
 }

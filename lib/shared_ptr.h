@@ -7,9 +7,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 template<typename T>
 class ObjectReference final
 {
@@ -253,5 +250,4 @@ SharedPtr<T> MakeShared(Args&&... args)
     return SharedPtr<T>(objRef);
 }
 
-}
 }

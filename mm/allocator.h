@@ -10,9 +10,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Allocator
 {
 public:
@@ -57,5 +54,4 @@ private:
 	PageAllocator& PageAllocator;
 };
 
-}
 }

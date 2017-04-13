@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 BlockAllocatorImpl::BlockAllocatorImpl()
     : Usage(0)
     , Total(0)
@@ -147,8 +144,6 @@ void PageAllocatorImpl::Free(void* pages)
     }
 
     Panic("Can't free pages 0x%p", pages);
-}
-
 }
 
 }

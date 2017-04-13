@@ -7,9 +7,6 @@ extern "C" char KernelEnd;
 namespace Kernel
 {
 
-namespace Core
-{
-
 MemoryMap::MemoryMap()
     : Size(0)
 {
@@ -84,8 +81,6 @@ ulong MemoryMap::GetKernelSpaceBase()
 ulong MemoryMap::GetKernelEnd()
 {
     return Shared::RoundUp((ulong)&KernelEnd, Shared::PageSize);
-}
-
 }
 
 }

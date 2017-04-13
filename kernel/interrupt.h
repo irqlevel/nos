@@ -5,9 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 using InterruptHandlerFn = void (*)();
 
 class InterruptHandler
@@ -30,5 +27,4 @@ private:
     Interrupt& operator=(Interrupt&& other) = delete;
 };
 
-}
 }

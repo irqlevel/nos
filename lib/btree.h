@@ -10,9 +10,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 template<typename K, typename V, size_t T, typename LockType = Shared::NopLock>
 class Btree
 {
@@ -1185,5 +1182,4 @@ private:
     V EmptyValue;
 };
 
-}
 }

@@ -5,9 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Pic::Pic()
 {
 }
@@ -62,8 +59,6 @@ void Pic::Disable()
 {
 	Outb(PIC2_DATA, 0xFF);
 	Outb(PIC1_DATA, 0xFF);
-}
-
 }
 
 }

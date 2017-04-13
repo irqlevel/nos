@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Cpu final
 {
 public:
@@ -106,7 +103,5 @@ private:
 
     ulong BspIndex;
 };
-
-}
 
 }

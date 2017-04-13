@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class TimerCallback
 {
 public:
@@ -50,7 +47,5 @@ private:
 
     Timer Timer[16];
 };
-
-}
 
 }

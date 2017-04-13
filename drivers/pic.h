@@ -5,10 +5,6 @@
 namespace Kernel
 {
 
-
-namespace Core
-{
-
 class Pic final
 {
 public:
@@ -56,5 +52,4 @@ private:
 
 };
 
-}
 }

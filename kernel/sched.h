@@ -9,9 +9,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class TaskQueue
 {
 public:
@@ -38,7 +35,5 @@ private:
     Atomic ScheduleCounter;
     Atomic SwitchContextCounter;
 };
-
-}
 
 }

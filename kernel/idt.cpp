@@ -7,9 +7,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Idt::Idt()
     : Base(0)
     , Limit(0)
@@ -73,5 +70,4 @@ extern "C" void DummyInterrupt()
     Idt::GetInstance().DummyInterrupt();
 }
 
-}
 }

@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 volatile bool PreemptActive = false;
 
 void PreemptOn()
@@ -47,5 +44,4 @@ void PreemptEnable()
     }
 }
 
-}
 }

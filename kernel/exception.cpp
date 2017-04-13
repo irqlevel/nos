@@ -9,9 +9,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 ExceptionTable::ExceptionTable()
 {
     for (size_t i = 0; i < Shared::ArraySize(Handler); i++)
@@ -476,5 +473,4 @@ extern "C" void ExcControlProtection(Context* ctx)
     excTable.ExcControlProtection(ctx);
 }
 
-}
 }

@@ -3,9 +3,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Atomic
 {
 public:
@@ -27,7 +24,5 @@ private:
 
     volatile long Value;
 };
-
-}
 
 }

@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class ExceptionTable final
 {
 
@@ -86,7 +83,5 @@ private:
     Atomic ExcVirtExceptionCounter;
     Atomic ExcControlProtectionCounter;
 };
-
-}
 
 }

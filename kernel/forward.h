@@ -4,10 +4,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class TaskQueue;
 
-}
 }

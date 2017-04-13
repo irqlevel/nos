@@ -30,7 +30,7 @@
 #include <drivers/lapic.h>
 #include <drivers/ioapic.h>
 
-using namespace Kernel::Core;
+using namespace Kernel;
 using namespace Shared;
 
 void ParseGrubInfo(Kernel::Grub::MultiBootInfoHeader *MbInfo)

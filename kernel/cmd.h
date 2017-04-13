@@ -7,9 +7,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Cmd final : public IO8042Observer
 {
 public:
@@ -46,5 +43,4 @@ private:
     bool Active;
 };
 
-}
 }

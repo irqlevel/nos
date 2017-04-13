@@ -3,9 +3,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Dmesg::Dmesg()
     : CurrentDumper(nullptr)
     , MsgBufDumper(*this)
@@ -55,8 +52,6 @@ void Dmesg::Dump(Dumper& dumper)
     CurrentDumper = &dumper;
     MsgBuf.Dump(MsgBufDumper);
     CurrentDumper = nullptr;
-}
-
 }
 
 }

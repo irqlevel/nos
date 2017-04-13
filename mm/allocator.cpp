@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 AllocatorImpl::AllocatorImpl(class PageAllocator& pageAllocator)
 	: PageAllocator(pageAllocator)
 {
@@ -98,5 +95,4 @@ void AllocatorImpl::Free(void* ptr)
 	Pool[log - StartLog].Free(header);
 }
 
-}
 }

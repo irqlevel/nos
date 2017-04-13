@@ -10,9 +10,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Pool::Pool()
     : Usage(0)
     , Size(0)
@@ -115,5 +112,4 @@ void Pool::Free(void* ptr)
     Usage--;
 }
 
-}
 }

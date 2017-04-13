@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Dmesg final
 {
 public:
@@ -83,5 +80,4 @@ private:
     MessageBufferDumper MsgBufDumper;
 };
 
-}
 }

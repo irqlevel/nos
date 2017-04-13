@@ -5,9 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 VgaTerm::VgaTerm()
     : Buf(reinterpret_cast<u16*>(BufAddr))
     , Row(0)
@@ -163,5 +160,4 @@ void VgaTerm::Cursor()
 	Outb(VgaBase + 1, offset >> 8);
 }
 
-}
 }

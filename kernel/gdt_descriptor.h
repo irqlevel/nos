@@ -5,10 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
-
 class GdtDescriptor final
 {
 public:
@@ -49,5 +45,4 @@ private:
 
 };
 
-}
 }

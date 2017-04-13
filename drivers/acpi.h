@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Acpi final
 {
 public:
@@ -131,7 +128,5 @@ private:
     void* LapicAddress;
     void* IoApicAddress;
 };
-
-}
 
 }

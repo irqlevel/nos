@@ -9,9 +9,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 const int ExcLL = 0;
 const int AcpiLL = 0;
 const int CmdLL = 0;
@@ -24,6 +21,7 @@ const int BtreeLL = 6;
 const int LapicLL = 0;
 const int IoApicLL = 0;
 const int MmIoLL = 4;
+const int TestLL = 3;
 
 class Tracer
 {
@@ -56,24 +54,22 @@ private:
 
 }
 
-}
-
 #define Trace(level, fmt, ...)                                      \
 do {                                                                \
-    auto& tracer = Kernel::Core::Tracer::GetInstance();             \
+    auto& tracer = Kernel::Tracer::GetInstance();                   \
     if (unlikely((level) <= tracer.GetLevel()))                     \
     {                                                               \
         auto time = Pit::GetInstance().GetTime();                   \
         tracer.Output("%u:%u.%u:%s(),%s,%u: " fmt "\n",             \
             (level), time.Secs, time.NanoSecs,                      \
             __func__, Shared::TruncateFileName(__FILE__),           \
-            (ulong)__LINE__, ##__VA_ARGS__);                               \
+            (ulong)__LINE__, ##__VA_ARGS__);                        \
     }                                                               \
 } while (false)
 
 #define TraceError(err, fmt, ...)                                   \
 do {                                                                \
-    auto& tracer = Kernel::Core::Tracer::GetInstance();             \
+    auto& tracer = Kernel::Tracer::GetInstance();                   \
     if (unlikely(0 <= tracer.GetLevel()))                           \
     {                                                               \
         auto time = Pit::GetInstance().GetTime();                   \

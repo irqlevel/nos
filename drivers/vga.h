@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class VgaTerm
 {
 public:
@@ -84,5 +81,4 @@ private:
     SpinLock Lock;
 };
 
-}
 }

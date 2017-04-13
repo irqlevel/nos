@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class SpinLock
 	: public Shared::LockInterface
 	, public Shared::SharedLockInterface
@@ -52,7 +49,5 @@ public:
 private:
 	ulong RawLock;
 };
-
-}
 
 }

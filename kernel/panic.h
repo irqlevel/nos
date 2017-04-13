@@ -5,9 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Panicker
 {
 public:
@@ -31,11 +28,10 @@ private:
 };
 
 }
-}
 
 #define Panic(fmt, ...)                                             \
 do {                                                                \
-    auto& panicker = Kernel::Core::Panicker::GetInstance();         \
+    auto& panicker = Kernel::Panicker::GetInstance();               \
     panicker.DoPanic("PANIC:%s():%s,%u: " fmt "\n",                 \
         __func__, Shared::TruncateFileName(__FILE__),               \
         (ulong)__LINE__, ##__VA_ARGS__);                            \
@@ -43,7 +39,7 @@ do {                                                                \
 
 static inline bool DoBugOn(const char *func, const char *file, int line)
 {
-    auto& panicker = Kernel::Core::Panicker::GetInstance();
+    auto& panicker = Kernel::Panicker::GetInstance();
     panicker.DoPanic("PANIC:%s():%s,%u: BUG\n", func, file, (ulong)line);
     return true;
 }

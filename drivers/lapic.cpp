@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 void* Lapic::GetRegBase(ulong index)
 {
     return Shared::MemAdd(Acpi::GetInstance().GetLapicAddress(), index * 0x10);
@@ -100,5 +97,4 @@ void Lapic::SendIPI(u32 apicId, u32 vector)
     }
 }
 
-}
 }

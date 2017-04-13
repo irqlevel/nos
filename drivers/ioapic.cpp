@@ -7,9 +7,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 IoApic::IoApic()
     : BaseAddress(nullptr)
 {
@@ -83,8 +80,6 @@ void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)
         (ulong)irq, (ulong)apicId, (ulong)vector, (ulong)data);
 
     SetEntry(irq, data);
-}
-
 }
 
 }

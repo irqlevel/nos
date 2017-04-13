@@ -7,9 +7,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 IdtDescriptor::IdtDescriptor()
     : Value(0)
     , HighValue(0)
@@ -199,5 +196,4 @@ IdtDescriptor IdtDescriptor::Encode(void (*handlerFn)())
     }
 }
 
-}
 }

@@ -9,9 +9,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Serial::Serial()
     : IntVector(-1)
 {
@@ -129,5 +126,4 @@ extern "C" void SerialInterrupt(Context* ctx)
     Serial::GetInstance().Interrupt(ctx);
 }
 
-}
 }

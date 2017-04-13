@@ -10,11 +10,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
-const int TestLL = 3;
-
 Shared::Error TestBtree()
 {
     Shared::Error err;
@@ -260,5 +255,4 @@ Shared::Error Test()
     return err;
 }
 
-}
 }

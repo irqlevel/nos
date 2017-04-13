@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 template<class T>
 class Vector
 {
@@ -207,5 +204,4 @@ private:
     size_t Capacity;
 };
 
-}
 }

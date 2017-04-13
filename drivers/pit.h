@@ -9,9 +9,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Pit final : public InterruptHandler
 {
 public:
@@ -58,9 +55,6 @@ private:
     u16 ReloadValue;
 
     SpinLock Lock;
-};
-
-
 };
 
 }

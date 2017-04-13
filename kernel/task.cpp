@@ -7,9 +7,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Task::Task()
     : TaskQueue(nullptr)
     , Rsp(0)
@@ -103,5 +100,4 @@ Task* Task::GetCurrentTask()
     return stack->Task;
 }
 
-}
 }

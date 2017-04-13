@@ -13,9 +13,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Pit::Pit()
     : IntVector(-1)
     , TimeMs(0)
@@ -125,5 +122,4 @@ void Pit::Wait(ulong nanoSecs)
     Wait(timeout);
 }
 
-}
 }

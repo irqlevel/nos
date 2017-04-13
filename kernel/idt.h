@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Idt final
 {
 public:
@@ -54,7 +51,5 @@ private:
     IdtDescriptor Entry[256];
     Atomic DummyHandlerCounter;
 };
-
-}
 
 }

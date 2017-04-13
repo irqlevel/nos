@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Panicker::Panicker()
 {
 }
@@ -33,5 +30,4 @@ void Panicker::DoPanic(const char *fmt, ...)
     Hlt();
 }
 
-}
 }

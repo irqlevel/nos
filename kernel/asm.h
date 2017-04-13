@@ -94,8 +94,6 @@ void ExcControlProtectionStub();
 namespace Kernel
 {
 
-namespace Core
-{
     struct Context
     {
         ulong Rsp;
@@ -126,5 +124,5 @@ namespace Core
             return *((ulong *)GetOrigRsp());
         }
     };
-}
+
 }

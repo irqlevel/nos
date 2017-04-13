@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class Lapic final
 {
 public:
@@ -73,5 +70,4 @@ private:
 
 };
 
-}
 }

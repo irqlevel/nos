@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Cmd::Cmd()
     : Exit(false)
     , Active(false)
@@ -151,5 +148,4 @@ output:
     VgaTerm::GetInstance().Printf("%c", c);
 }
 
-}
 }

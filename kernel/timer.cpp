@@ -5,9 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 TimerTable::Timer::Timer()
     : Callback(nullptr)
 {
@@ -70,5 +67,4 @@ void TimerTable::ProcessTimers()
     }
 }
 
-}
 }

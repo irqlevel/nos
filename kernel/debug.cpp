@@ -3,8 +3,6 @@
 
 namespace Kernel
 {
-namespace Core
-{
 
 volatile bool DebugWaitActive;
 
@@ -17,5 +15,4 @@ void DebugWait()
     }	
 }
 
-}
 }

@@ -10,9 +10,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class IO8042Observer
 {
 public:
@@ -61,5 +58,4 @@ private:
     IO8042Observer* Observer[MaxObserver];
 };
 
-}
 }

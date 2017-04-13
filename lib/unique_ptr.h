@@ -8,9 +8,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 template<typename T>
 class UniquePtr final
 {
@@ -107,6 +104,4 @@ UniquePtr<T> MakeUnique(Args&&... args)
     return UniquePtr<T>(new T(Shared::Forward<Args>(args)...));
 }
 
-
-}
 }

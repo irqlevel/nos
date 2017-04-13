@@ -10,9 +10,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Cpu::Cpu()
     : Index(0)
     , State(0)
@@ -320,5 +317,4 @@ bool Cpu::Run(Task::Func func, void *ctx)
     return Task.Run(func, ctx);
 }
 
-}
 }

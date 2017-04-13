@@ -5,9 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 void PreemptOn();
 
 void PreemptOff();
@@ -18,5 +15,4 @@ void PreemptDisable();
 
 void PreemptEnable();
 
-}
 }

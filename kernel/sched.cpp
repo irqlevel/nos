@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 TaskQueue::TaskQueue()
 {
     Shared::AutoLock lock(Lock);
@@ -105,5 +102,4 @@ TaskQueue::~TaskQueue()
 
 }
 
-}
 }

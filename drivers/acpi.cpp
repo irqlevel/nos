@@ -6,9 +6,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 Acpi::Acpi()
     : Rsdp(nullptr)
     , Rsdt(nullptr)
@@ -267,5 +264,4 @@ void* Acpi::GetIoApicAddress()
     return IoApicAddress;
 }
 
-}
 }

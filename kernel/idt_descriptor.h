@@ -5,9 +5,6 @@
 namespace Kernel
 {
 
-namespace Core
-{
-
 class IdtDescriptor final
 {
 public:
@@ -64,5 +61,4 @@ private:
     static const u8 FlagGateTrap80386_32 = 0xF;
 };
 
-}
 }

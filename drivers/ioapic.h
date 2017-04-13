@@ -6,10 +6,6 @@
 namespace Kernel
 {
 
-
-namespace Core
-{
-
 class IoApic final
 {
 public:
@@ -48,5 +44,4 @@ private:
     SpinLock OpLock;
 };
 
-}
 }
