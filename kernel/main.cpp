@@ -33,57 +33,6 @@
 using namespace Kernel;
 using namespace Shared;
 
-void ParseGrubInfo(Kernel::Grub::MultiBootInfoHeader *MbInfo)
-{
-    Trace(0, "MbInfo %p", MbInfo);
-
-    Kernel::Grub::MultiBootTag * tag;
-    for (tag = reinterpret_cast<Kernel::Grub::MultiBootTag*>(MbInfo + 1);
-        tag->Type != Kernel::Grub::MultiBootTagTypeEnd;
-        tag = reinterpret_cast<Kernel::Grub::MultiBootTag*>(MemAdd(tag, (tag->Size + 7) & ~7)))
-    {
-        Trace(0, "Tag %u Size %u", tag->Type, tag->Size);
-        switch (tag->Type)
-        {
-        case Kernel::Grub::MultiBootTagTypeBootDev:
-        {
-            Kernel::Grub::MultiBootTagBootDev* bdev = reinterpret_cast<Kernel::Grub::MultiBootTagBootDev*>(tag);
-            Trace(0, "Boot dev %u %u %u %u", (ulong)bdev->BiosDev, (ulong)bdev->Slice, (ulong)bdev->Part);
-            break;
-        }
-        case Kernel::Grub::MultiBootTagTypeMmap:
-        {
-            Kernel::Grub::MultiBootTagMmap* mmap = reinterpret_cast<Kernel::Grub::MultiBootTagMmap*>(tag);
-            Kernel::Grub::MultiBootMmapEntry* entry;
-
-            for (entry = &mmap->Entry[0];
-                 MemAdd(entry, mmap->EntrySize) <= MemAdd(mmap, mmap->Size);
-                 entry = reinterpret_cast<Kernel::Grub::MultiBootMmapEntry*>(MemAdd(entry, mmap->EntrySize)))
-            {
-                Trace(0, "Mmap addr %p len %p type %u",
-                    entry->Addr, entry->Len, (ulong)entry->Type);
-
-                if (!MemoryMap::GetInstance().AddRegion(entry->Addr, entry->Len, entry->Type))
-                    Panic("Can't add memory region");
-
-            }
-            break;
-        }
-        case Kernel::Grub::MultiBootTagTypeCmdline:
-        {
-            Kernel::Grub::MultiBootTagString* cmdLine = reinterpret_cast<Kernel::Grub::MultiBootTagString*>(tag);
-
-            Trace(0, "Cmdline %s", cmdLine->String);
-            break;
-        }
-        default:
-        {
-            break;
-        }
-        }
-    }
-}
-
 void TraceCpuState(ulong cpu)
 {
     Trace(0, "Cpu %u cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
@@ -222,7 +171,7 @@ void BpStartup(void* ctx)
     Exit();
 }
 
-extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
+extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 {
     do {
 
@@ -234,7 +183,7 @@ extern "C" void Main(Kernel::Grub::MultiBootInfoHeader *MbInfo)
 
     VgaTerm::GetInstance().Printf("Hello!\n");
 
-    ParseGrubInfo(MbInfo);
+    Grub::ParseMultiBootInfo(MbInfo);
 
     ulong memStart, memEnd;
     if (mmap.GetKernelEnd() <= (mmap.GetKernelSpaceBase() + MB))

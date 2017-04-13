@@ -1,0 +1,66 @@
+#include "grub.h"
+
+#include <kernel/trace.h>
+#include <mm/memory_map.h>
+#include <lib/stdlib.h>
+
+namespace Kernel
+{
+
+namespace Grub
+{
+
+void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
+{
+    Trace(0, "MbInfo %p", MbInfo);
+
+    MultiBootTag * tag;
+    for (tag = reinterpret_cast<MultiBootTag*>(MbInfo + 1);
+        tag->Type != MultiBootTagTypeEnd;
+        tag = reinterpret_cast<MultiBootTag*>(Shared::MemAdd(tag, (tag->Size + 7) & ~7)))
+    {
+        Trace(0, "Tag %u Size %u", tag->Type, tag->Size);
+        switch (tag->Type)
+        {
+        case MultiBootTagTypeBootDev:
+        {
+            MultiBootTagBootDev* bdev = reinterpret_cast<MultiBootTagBootDev*>(tag);
+            Trace(0, "Boot dev %u %u %u %u", (ulong)bdev->BiosDev, (ulong)bdev->Slice, (ulong)bdev->Part);
+            break;
+        }
+        case MultiBootTagTypeMmap:
+        {
+            MultiBootTagMmap* mmap = reinterpret_cast<MultiBootTagMmap*>(tag);
+            MultiBootMmapEntry* entry;
+
+            for (entry = &mmap->Entry[0];
+                 Shared::MemAdd(entry, mmap->EntrySize) <= Shared::MemAdd(mmap, mmap->Size);
+                 entry = reinterpret_cast<MultiBootMmapEntry*>(Shared::MemAdd(entry, mmap->EntrySize)))
+            {
+                Trace(0, "Mmap addr %p len %p type %u",
+                    entry->Addr, entry->Len, (ulong)entry->Type);
+
+                if (!Kernel::MemoryMap::GetInstance().AddRegion(entry->Addr, entry->Len, entry->Type))
+                    Panic("Can't add memory region");
+
+            }
+            break;
+        }
+        case MultiBootTagTypeCmdline:
+        {
+            MultiBootTagString* cmdLine = reinterpret_cast<MultiBootTagString*>(tag);
+
+            Trace(0, "Cmdline %s", cmdLine->String);
+            break;
+        }
+        default:
+        {
+            break;
+        }
+        }
+    }
+}
+
+}
+
+}

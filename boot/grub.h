@@ -144,5 +144,7 @@ const u32 MultiBootTagTypeMmap = 6;
 const u32 MultiBootTagTypeBootDev = 5;
 const u32 MultiBootTagTypeCmdline = 1;
 
+void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo);
+
 }
 }

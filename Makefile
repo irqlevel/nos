@@ -10,6 +10,7 @@ AR = ar
 MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 
 CXX_SRC =   \
+    boot/grub.cpp    \
     drivers/serial.cpp  \
     drivers/pic.cpp \
     drivers/pit.cpp \
