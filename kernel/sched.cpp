@@ -24,10 +24,10 @@ void TaskQueue::Switch(Task* next, Task* curr)
 
     curr->State &= ~Task::StateRunning;
     curr->State |= Task::StateWaiting;
+    curr->ContextSwitches.Inc();
 
     SwitchContext(next->Rsp, &curr->Rsp);
 
-    next->ContextSwitches.Inc();
     next->State &= ~Task::StateWaiting;
     next->State |= Task::StateRunning;
 }
