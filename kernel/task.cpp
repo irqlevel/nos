@@ -13,6 +13,7 @@ Task::Task()
     , Stack(nullptr)
     , Function(nullptr)
     , Ctx(nullptr)
+    , State(0)
 {
     RefCounter.Set(1);
     ListEntry.Init();
@@ -52,14 +53,35 @@ void Task::Put()
     }
 }
 
+void Task::Exit()
+{
+    class TaskQueue *tq = TaskQueue;
+
+    BugOn(tq == nullptr);
+
+    tq->RemoveTask(this);
+    State |= StateExited;
+    tq->Schedule();
+    Panic("Can't be here");
+}
+
 void Task::ExecCallback()
 {
     Function(Ctx);
+    Exit();
 }
 
 void Task::Exec(void *task)
 {
     static_cast<Task *>(task)->ExecCallback();
+}
+
+void Task::Wait()
+{
+    while (!(State & StateExited))
+    {
+        GetCpu().Sleep(1000000);
+    }
 }
 
 bool Task::Start(Func func, void* ctx)

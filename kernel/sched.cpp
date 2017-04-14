@@ -36,15 +36,13 @@ void TaskQueue::Schedule()
     if (curr->PreemptDisable.Get() != 0)
         return;
 
-    Task* next;
+    Task* next = nullptr;
     {
         Shared::AutoLock lock(Lock);
         Shared::AutoLock lock2(curr->Lock);
 
-        BugOn(curr->TaskQueue != this);
         BugOn(TaskList.IsEmpty());
 
-        next = nullptr;
         for (auto currEntry = TaskList.Flink;
             currEntry != &TaskList;
             currEntry = currEntry->Flink)
@@ -69,8 +67,12 @@ void TaskQueue::Schedule()
 
         Shared::AutoLock lock3(next->Lock);
         next->ListEntry.Remove();
-        curr->ListEntry.Remove();
-        TaskList.InsertTail(&curr->ListEntry);
+        if (curr->TaskQueue != nullptr)
+        {
+            BugOn(curr->TaskQueue != this);
+            curr->ListEntry.Remove();
+            TaskList.InsertTail(&curr->ListEntry);
+        }
         TaskList.InsertTail(&next->ListEntry);
     }
 
@@ -100,7 +102,7 @@ void TaskQueue::RemoveTask(Task* task)
         BugOn(task->TaskQueue != this);
         BugOn(task->ListEntry.IsEmpty());
         task->TaskQueue = nullptr;
-        task->ListEntry.Remove();
+        task->ListEntry.RemoveInit();
     }
 
     task->Put();

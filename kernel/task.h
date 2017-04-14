@@ -66,6 +66,8 @@ public:
 
     bool Start(Func func, void* ctx);
 
+    void Wait();
+
 public:
     Shared::ListEntry ListEntry;
     TaskQueue* TaskQueue;
@@ -81,10 +83,16 @@ private:
 
     void Release();
 
+    void Exit();
+
     Stack* Stack;
     Func Function;
     void* Ctx;
     Atomic RefCounter;
+
+    static const ulong StateExited = 0x1;
+
+    volatile ulong State;
 
     void ExecCallback();
 

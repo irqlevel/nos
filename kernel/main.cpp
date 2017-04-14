@@ -105,25 +105,58 @@ void TestTaskFunc(void *ctx)
 {
     (void)ctx;
 
-    while (1)
+    for (size_t i = 0; i < 3; i++)
     {
-        GetCpu().Sleep(3000000000);
         Trace(0, "Hello from task 0x%p", Task::GetCurrentTask());
+        GetCpu().Sleep(100000000);
     }
 }
 
-void TestTask()
+bool TestTask()
 {
-    for (size_t i = 0; i < 10; i++)
+    Task *task[3] = {0};
+    for (size_t i = 0; i < ArraySize(task); i++)
     {
-        Task *task = new Task();
-        if (!task->Start(TestTaskFunc, nullptr))
+        task[i] = new Task();
+        if (task[i] == nullptr)
         {
-            Panic("Can't start task");
-            return;
+            for (size_t j = 0; j < i; j++)
+            {
+                delete task[j];
+            }
+            return false;
         }
-        Trace(0, "New task 0x%p", task);
     }
+
+    bool result;
+
+    for (size_t i = 0; i < ArraySize(task); i++)
+    {
+        if (!task[i]->Start(TestTaskFunc, nullptr))
+        {
+            for (size_t j = 0; j < i; j++)
+            {
+                task[j]->Wait();
+            }
+            result = false;
+            goto delTasks;
+        }
+    }
+
+    for (size_t i = 0; i < ArraySize(task); i++)
+    {
+        task[i]->Wait();
+    }
+
+    result = true;
+
+delTasks:
+    for (size_t i = 0; i < ArraySize(task); i++)
+    {
+        delete task[i];
+    }
+
+    return result;
 }
 
 void BpStartup(void* ctx)
@@ -179,9 +212,15 @@ void BpStartup(void* ctx)
         }
     }
 
-    VgaTerm::GetInstance().Printf("Idle looping...\n");
+    VgaTerm::GetInstance().Printf("Task test...\n");
 
-    TestTask();
+    if (!TestTask())
+    {
+        Panic("Task test failed");
+        return;
+    }
+
+    VgaTerm::GetInstance().Printf("Idle looping...\n");
 
     cmd.Start();
     for (;;)

@@ -16,8 +16,6 @@ Panicker::~Panicker()
 
 void Panicker::DoPanic(const char *fmt, ...)
 {
-    PreemptDisable();
-
     va_list args;
     va_start(args, fmt);
 
