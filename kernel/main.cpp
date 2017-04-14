@@ -222,14 +222,19 @@ void BpStartup(void* ctx)
 
     VgaTerm::GetInstance().Printf("Idle looping...\n");
 
-    cmd.Start();
+    if (!cmd.Start())
+    {
+        Panic("Can't start cmd");
+        return;
+    }
+
     for (;;)
     {
         cpu.Idle();
-        cmd.Run();
         if (cmd.IsExit())
         {
             Trace(0, "Exit requested");
+            cmd.Stop();
             break;
         }
     }

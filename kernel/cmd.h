@@ -1,4 +1,5 @@
 #include "spin_lock.h"
+#include "task.h"
 
 #include <drivers/8042.h>
 #include <lib/stdlib.h>
@@ -16,13 +17,13 @@ public:
         return instance;
     }
 
-    void Run();
-
     virtual void OnChar(char c) override;
 
     bool IsExit();
 
-    void Start();
+    bool Start();
+
+    void Stop();
 
 private:
     void ProcessCmd(const char *cmd);
@@ -34,11 +35,14 @@ private:
     Cmd& operator=(const Cmd& other) = delete;
     Cmd& operator=(Cmd&& other) = delete;
 
+    void Run();
+    static void RunFunc(void *ctx);
+
     static const size_t CmdSizeMax = 80;
-    Shared::RingBuffer<char, CmdSizeMax> Buf;
+    Shared::RingBuffer<char, Shared::PageSize> Buf;
     char CmdLine[CmdSizeMax + 1];
     SpinLock Lock;
-
+    Task *Task;
     bool Exit;
     bool Active;
 };

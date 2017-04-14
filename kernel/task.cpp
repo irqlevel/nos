@@ -53,6 +53,16 @@ void Task::Put()
     }
 }
 
+void Task::SetStopping()
+{
+    State |= StateStopping;
+}
+
+bool Task::IsStopping()
+{
+    return (State & StateStopping) ? true : false;
+}
+
 void Task::Exit()
 {
     class TaskQueue *tq = TaskQueue;

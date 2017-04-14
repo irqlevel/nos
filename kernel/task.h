@@ -68,6 +68,10 @@ public:
 
     void Wait();
 
+    void SetStopping();
+
+    bool IsStopping();
+
 public:
     Shared::ListEntry ListEntry;
     TaskQueue* TaskQueue;
@@ -91,6 +95,7 @@ private:
     Atomic RefCounter;
 
     static const ulong StateExited = 0x1;
+    static const ulong StateStopping = 0x2;
 
     volatile ulong State;
 
