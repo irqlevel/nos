@@ -101,6 +101,31 @@ void Exit()
     Hlt();
 }
 
+void TestTaskFunc(void *ctx)
+{
+    (void)ctx;
+
+    while (1)
+    {
+        GetCpu().Sleep(3000000000);
+        Trace(0, "Hello from task 0x%p", Task::GetCurrentTask());
+    }
+}
+
+void TestTask()
+{
+    for (size_t i = 0; i < 10; i++)
+    {
+        Task *task = new Task();
+        if (!task->Start(TestTaskFunc, nullptr))
+        {
+            Panic("Can't start task");
+            return;
+        }
+        Trace(0, "New task 0x%p", task);
+    }
+}
+
 void BpStartup(void* ctx)
 {
     (void)ctx;
@@ -155,6 +180,8 @@ void BpStartup(void* ctx)
     }
 
     VgaTerm::GetInstance().Printf("Idle looping...\n");
+
+    TestTask();
 
     cmd.Start();
     for (;;)

@@ -20,8 +20,7 @@ void TaskQueue::Switch(Task* next, Task* curr)
     SwitchContextCounter.Inc();
 
     BugOn(curr == next);
-
-    Trace(0, "Switch task 0x%p -> 0x%p", curr, next);
+    BugOn(next->Rsp == 0);
 
     SwitchContext(next->Rsp, &curr->Rsp);
 }
@@ -30,29 +29,52 @@ void TaskQueue::Schedule()
 {
     ScheduleCounter.Inc();
 
-    Shared::AutoLock lock(Lock);
+    if (!PreemptIsOn())
+        return;
+
     Task* curr = Task::GetCurrentTask();
-    Shared::AutoLock lock2(curr->Lock);
-    if (curr->TaskQueue == nullptr)
+    if (curr->PreemptDisable.Get() != 0)
         return;
 
-    BugOn(curr->TaskQueue != this);
-    BugOn(TaskList.IsEmpty());
-
-    Task* next = CONTAINING_RECORD(TaskList.RemoveHead(), Task, ListEntry);
-    if (next == curr)
+    Task* next;
     {
+        Shared::AutoLock lock(Lock);
+        Shared::AutoLock lock2(curr->Lock);
+
+        BugOn(curr->TaskQueue != this);
+        BugOn(TaskList.IsEmpty());
+
+        next = nullptr;
+        for (auto currEntry = TaskList.Flink;
+            currEntry != &TaskList;
+            currEntry = currEntry->Flink)
+        {
+            Task* cand = CONTAINING_RECORD(currEntry, Task, ListEntry);
+            if (cand == curr)
+            {
+                cand->ListEntry.Remove();
+                TaskList.InsertTail(&cand->ListEntry);
+                return;
+            }
+
+            if (cand->PreemptDisable.Get() != 0)
+                continue;
+
+            next = cand;
+            break;
+        }
+
+        if (next == nullptr)
+            return;
+
+        Shared::AutoLock lock3(next->Lock);
+        next->ListEntry.Remove();
+        curr->ListEntry.Remove();
+        TaskList.InsertTail(&curr->ListEntry);
         TaskList.InsertTail(&next->ListEntry);
-        return;
     }
 
-    Shared::AutoLock lock3(next->Lock);
-
-    curr->ListEntry.Remove();
-    TaskList.InsertTail(&curr->ListEntry);
-    TaskList.InsertTail(&next->ListEntry);
     Switch(next, curr);
-
 }
 
 void TaskQueue::AddTask(Task* task)

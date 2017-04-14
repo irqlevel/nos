@@ -94,35 +94,35 @@ void ExcControlProtectionStub();
 namespace Kernel
 {
 
-    struct Context
+struct Context final
+{
+    ulong R15;
+    ulong R14;
+    ulong R13;
+    ulong R12;
+    ulong R11;
+    ulong R10;
+    ulong R9;
+    ulong R8;
+    ulong Rsi;
+    ulong Rdi;
+    ulong Rdx;
+    ulong Rcx;
+    ulong Rbx;
+    ulong Rax;
+    ulong Rbp;
+    ulong Rflags;
+    ulong Rsp;
+
+    ulong GetRetRip()
     {
-        ulong Rsp;
-        ulong Rbp;
-        ulong R15;
-        ulong R14;
-        ulong R13;
-        ulong R12;
-        ulong R11;
-        ulong R10;
-        ulong R9;
-        ulong R8;
-        ulong Rsi;
-        ulong Rdi;
-        ulong Rdx;
-        ulong Rcx;
-        ulong Rbx;
-        ulong Rax;
-        ulong Rflags;
-
-        ulong GetOrigRsp()
-        {
-            return Rsp + 16 * sizeof(ulong);
-        }
-
-        ulong GetRetRip()
-        {
-            return *((ulong *)GetOrigRsp());
-        }
-    };
+        return *((ulong *)Rsp);
+    }
+private:
+    Context(const Context& other) = delete;
+    Context(Context&& other) = delete;
+    Context& operator=(const Context& other) = delete;
+    Context& operator=(Context&& other) = delete;
+};
 
 }

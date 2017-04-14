@@ -14,6 +14,12 @@ struct Time
     {
     }
 
+    Time(ulong secs, ulong nanoSecs)
+        : Secs(secs)
+        , NanoSecs(nanoSecs)
+    {
+    }
+
     void Add(const Time& other)
     {
         Secs += other.Secs;

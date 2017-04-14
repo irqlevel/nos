@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stdarg.h>
 
+static_assert(sizeof(char) == 1, "Invalid size");
+
 typedef unsigned long size_t;
 typedef long ssize_t;
 
@@ -26,4 +28,5 @@ typedef uint64_t u64;
 
 #define CONTAINING_RECORD(addr, type, field)    \
             (type*)((unsigned long)(addr) - (unsigned long)&((type*)0)->field)
+
 

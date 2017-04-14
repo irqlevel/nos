@@ -40,6 +40,8 @@ public:
 
     TaskQueue& GetTaskQueue();
 
+    void Sleep(ulong nanoSecs);
+
 private:
     Cpu(const Cpu& other) = delete;
     Cpu(Cpu&& other) = delete;
@@ -103,5 +105,10 @@ private:
 
     ulong BspIndex;
 };
+
+static inline Cpu& GetCpu()
+{
+    return CpuTable::GetInstance().GetCurrentCpu();
+}
 
 }

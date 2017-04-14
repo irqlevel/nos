@@ -251,7 +251,9 @@ SetRsp:
 	ret
 
 %macro PushAll 0
+	push rsp
 	pushfq
+	push rbp
 	push rax
 	push rbx
 	push rcx
@@ -266,13 +268,9 @@ SetRsp:
 	push r13
 	push r14
 	push r15
-	push rbp
-	push rsp
 %endmacro
 
 %macro PopAll 0
-	pop rsp
-	pop rbp
 	pop r15
 	pop r14
 	pop r13
@@ -287,7 +285,9 @@ SetRsp:
 	pop rcx
 	pop rbx
 	pop rax
+	pop rbp
 	popfq
+	add rsp, 8; simulate pop rsp(see push rsp in PushAll)
 %endmacro
 
 SwitchContext:

@@ -252,8 +252,9 @@ void Cpu::IPI(Context* ctx)
         Hlt();
         return;
     }
-    Schedule();
     Lapic::EOI(CpuTable::IPIVector);
+
+    Schedule();
 }
 
 void Cpu::Schedule()
@@ -264,6 +265,18 @@ void Cpu::Schedule()
 TaskQueue& Cpu::GetTaskQueue()
 {
     return TaskQueue;
+}
+
+void Cpu::Sleep(ulong nanoSecs)
+{
+    auto& pit = Pit::GetInstance();
+    auto target = pit.GetTime();
+
+    target.Add(Shared::Time(0, nanoSecs));
+    while (pit.GetTime().Compare(target) < 0)
+    {
+        Schedule();
+    }
 }
 
 extern "C" void IPInterrupt(Context* ctx)

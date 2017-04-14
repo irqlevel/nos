@@ -16,7 +16,7 @@ Task::Task()
 {
     RefCounter.Set(1);
     ListEntry.Init();
-    PreemptCounter.Set(0);
+    PreemptDisable.Set(0);
 }
 
 Task::~Task()
@@ -32,8 +32,6 @@ void Task::Release()
 
     if (Stack != nullptr)
     {
-        Stack->Magic1 = 0;
-        Stack->Magic2 = 0;
         delete Stack;
         Stack = nullptr;
     }
@@ -54,6 +52,16 @@ void Task::Put()
     }
 }
 
+void Task::ExecCallback()
+{
+    Function(Ctx);
+}
+
+void Task::Exec(void *task)
+{
+    static_cast<Task *>(task)->ExecCallback();
+}
+
 bool Task::Start(Func func, void* ctx)
 {
     Stack = new struct Stack(this);
@@ -65,7 +73,14 @@ bool Task::Start(Func func, void* ctx)
     Function = func;
     Ctx = ctx;
 
-    //TODO: setup registers context and ret addr = func on stack
+    ulong* rsp = (ulong *)&Stack->StackTop[0];
+    *(--rsp) = (ulong)&Task::Exec;//setup return address
+    Context* regs = (Context*)((ulong)rsp - sizeof(*regs));
+    Shared::MemSet(regs, 0, sizeof(*regs));
+    regs->Rdi = (ulong)this; //setup 1arg for Task::Exec
+    regs->Rflags = (1 << 9); //setup IF
+    Rsp = (ulong)regs;
+
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
     cpu.GetTaskQueue().AddTask(this);
     return true;

@@ -171,7 +171,7 @@ void ExceptionTable::ExcInvalidOpcode(Context* ctx)
     ExcInvalidOpcodeCounter.Inc();
 
     Trace(ExcLL, "EXC: InvalidOpcode cpu %u rip 0x%p rsp 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp);
 
     Panic("InvalidOpCode");
 }
@@ -192,7 +192,7 @@ void ExceptionTable::ExcDoubleFault(Context* ctx)
     ExcDoubleFaultCounter.Inc();
 
     Trace(ExcLL, "EXC: DoubleFault cpu %u rip 0x%p rsp 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp);
 
     Panic("DoubleFault");
 }
@@ -240,7 +240,7 @@ void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
     ExcGeneralProtectionFaultCounter.Inc();
 
     Trace(ExcLL, "EXC: GeneralProtectionFault cpu %u rip 0x%p rsp 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp());
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp);
 
     Panic("GP");
 }
@@ -252,7 +252,7 @@ void ExceptionTable::ExcPageFault(Context* ctx)
     ExcPageFaultCounter.Inc();
 
     Trace(ExcLL, "EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0xp cr3 0xp",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->GetOrigRsp(),
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp,
         GetCr2(), GetCr3());
 }
 
