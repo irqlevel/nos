@@ -4,11 +4,13 @@
 #include <drivers/8042.h>
 #include <lib/stdlib.h>
 #include <lib/ring_buffer.h>
+#include <lib/printer.h>
 
 namespace Kernel
 {
 
-class Cmd final : public IO8042Observer
+class Cmd final
+    : public IO8042Observer
 {
 public:
     static Cmd& GetInstance()

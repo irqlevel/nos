@@ -4,11 +4,26 @@
 
 #include <lib/stdlib.h>
 #include <lib/ring_buffer.h>
+#include <lib/printer.h>
 
 namespace Kernel
 {
 
-class Dmesg final
+struct DmesgMsg final
+{
+    char Str[256];
+
+    DmesgMsg& operator=(const DmesgMsg& other)
+    {
+        if (this != &other)
+        {
+            Shared::MemCpy(Str, other.Str, sizeof(other.Str));
+        }
+        return *this;
+    }
+};
+
+class Dmesg final : public Shared::TypePrinter<DmesgMsg>
 {
 public:
 
@@ -18,66 +33,28 @@ public:
         return instance;
     }
 
-    class Dumper
-    {
-    public:
-        virtual void OnMessage(const char *msg) = 0;
-    };
-
-    void Vprintf(const char *fmt, va_list args);
+    void VPrintf(const char *fmt, va_list args);
     void Printf(const char *fmt, ...);
     void PrintString(const char *s);
 
-    void Dump(Dumper& dumper);
+    void Dump(Shared::Printer& printer);
+
+    void PrintElement(const DmesgMsg& element) override;
 
 private:
     Dmesg();
     ~Dmesg();
+
+    void AppendMsg(const DmesgMsg& msg);
 
     Dmesg(const Dmesg& other) = delete;
     Dmesg(Dmesg&& other) = delete;
     Dmesg& operator=(const Dmesg& other) = delete;
     Dmesg& operator=(Dmesg&& other) = delete;
 
-    struct Msg final
-    {
-        char Str[256];
-
-        Msg& operator=(const Msg& other)
-        {
-            if (this != &other)
-            {
-                Shared::MemCpy(Str, other.Str, sizeof(other.Str));
-            }
-            return *this;
-        }
-    };
-
-    using MessageBuffer = Shared::RingBuffer<Msg, 1000>;
-
-    MessageBuffer MsgBuf;
+    Shared::RingBuffer<DmesgMsg, 1000> MsgBuf;
     SpinLock Lock;
-
-    class MessageBufferDumper final : public MessageBuffer::Dumper
-    {
-    public:
-        MessageBufferDumper(Dmesg& dmesg)
-            : Parent(dmesg)
-        {
-        }
-
-        ~MessageBufferDumper() {}
-        virtual void OnElement(const Msg& msg) override
-        {
-            if (Parent.CurrentDumper != nullptr)
-                Parent.CurrentDumper->OnMessage(msg.Str);
-        }
-    private:
-        Dmesg& Parent;
-    };
-
-    Dumper* CurrentDumper;
-    MessageBufferDumper MsgBufDumper;
+    Shared::Printer* Printer;
 };
 
 }

@@ -56,6 +56,8 @@ OBJS = $(CXX_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
 
 all: clean check nos.iso
 
+nocheck: clean nos.iso
+
 check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 -q . || exit 1
 

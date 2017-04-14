@@ -4,9 +4,7 @@ namespace Kernel
 {
 
 Dmesg::Dmesg()
-    : CurrentDumper(nullptr)
-    , MsgBufDumper(*this)
-
+    : Printer(nullptr)
 {
 }
 
@@ -14,15 +12,8 @@ Dmesg::~Dmesg()
 {
 }
 
-void Dmesg::Vprintf(const char *fmt, va_list args)
+void Dmesg::AppendMsg(const DmesgMsg& msg)
 {
-    Shared::AutoLock lock(Lock);
-	Msg msg;
-
-	int size = Shared::VsnPrintf(msg.Str, sizeof(msg.Str), fmt, args);
-    if (size < 0)
-		return;
-
     if (MsgBuf.IsFull())
     {
         MsgBuf.PopHead();
@@ -32,26 +23,49 @@ void Dmesg::Vprintf(const char *fmt, va_list args)
         return;
 }
 
+void Dmesg::VPrintf(const char *fmt, va_list args)
+{
+    Shared::AutoLock lock(Lock);
+	DmesgMsg msg;
+
+	int size = Shared::VsnPrintf(msg.Str, sizeof(msg.Str), fmt, args);
+    if (size < 0)
+		return;
+
+    AppendMsg(msg);
+}
+
 void Dmesg::Printf(const char *fmt, ...)
 {
     va_list args;
 
     va_start(args, fmt);
-    Vprintf(fmt, args);
+    VPrintf(fmt, args);
     va_end(args);
 }
 
 void Dmesg::PrintString(const char *s)
 {
-    Printf("%s", s);
+    Shared::AutoLock lock(Lock);
+	DmesgMsg msg;
+
+    Shared::StrnCpy(msg.Str, s, Shared::ArraySize(msg.Str));
+    msg.Str[Shared::ArraySize(msg.Str) - 1] = '\0';
+
+    AppendMsg(msg);
 }
 
-void Dmesg::Dump(Dumper& dumper)
+void Dmesg::PrintElement(const DmesgMsg& msg)
+{
+    Printer->PrintString(msg.Str);
+}
+
+void Dmesg::Dump(Shared::Printer& printer)
 {
     Shared::AutoLock lock(Lock);
-    CurrentDumper = &dumper;
-    MsgBuf.Dump(MsgBufDumper);
-    CurrentDumper = nullptr;
+    Printer = &printer;
+    MsgBuf.Print(*this);
+    Printer = nullptr;
 }
 
 }

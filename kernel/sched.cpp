@@ -22,7 +22,14 @@ void TaskQueue::Switch(Task* next, Task* curr)
     BugOn(curr == next);
     BugOn(next->Rsp == 0);
 
+    curr->State &= ~Task::StateRunning;
+    curr->State |= Task::StateWaiting;
+
     SwitchContext(next->Rsp, &curr->Rsp);
+
+    next->ContextSwitches.Inc();
+    next->State &= ~Task::StateWaiting;
+    next->State |= Task::StateRunning;
 }
 
 void TaskQueue::Schedule()
@@ -79,7 +86,7 @@ void TaskQueue::Schedule()
     Switch(next, curr);
 }
 
-void TaskQueue::AddTask(Task* task)
+void TaskQueue::Insert(Task* task)
 {
     task->Get();
 
@@ -93,7 +100,7 @@ void TaskQueue::AddTask(Task* task)
     TaskList.InsertTail(&task->ListEntry);
 }
 
-void TaskQueue::RemoveTask(Task* task)
+void TaskQueue::Remove(Task* task)
 {
     {
         Shared::AutoLock lock(Lock);
@@ -110,11 +117,15 @@ void TaskQueue::RemoveTask(Task* task)
 
 TaskQueue::~TaskQueue()
 {
-    Shared::AutoLock lock(Lock);
-
-    while (!TaskList.IsEmpty())
+    Shared::ListEntry taskList;
     {
-        Task* task = CONTAINING_RECORD(TaskList.RemoveHead(), Task, ListEntry);
+        Shared::AutoLock lock(Lock);
+        taskList.MoveTailList(&TaskList);
+    }
+
+    while (!taskList.IsEmpty())
+    {
+        Task* task = CONTAINING_RECORD(taskList.RemoveHead(), Task, ListEntry);
         Shared::AutoLock lock2(task->Lock);
         BugOn(task->TaskQueue != this);
         task->TaskQueue = nullptr;

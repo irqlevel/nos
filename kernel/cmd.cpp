@@ -54,23 +54,16 @@ void Cmd::ProcessCmd(const char *cmd)
     }
     else if (Shared::StrCmp(cmd, "dmesg") == 0)
     {
-        class DmesgPrinter final : public Dmesg::Dumper
-        {
-        public:
-            DmesgPrinter(){}
-            ~DmesgPrinter(){}
-            virtual void OnMessage(const char *msg)
-            {
-                VgaTerm::GetInstance().Printf(msg);
-            }
-        };
-        DmesgPrinter printer;
-        Dmesg::GetInstance().Dump(printer);
+        Dmesg::GetInstance().Dump(vga);
     }
     else if (Shared::StrCmp(cmd, "uptime") == 0)
     {
         auto time = Pit::GetInstance().GetTime();
         vga.Printf("%u.%u\n", time.Secs, time.NanoSecs);
+    }
+    else if (Shared::StrCmp(cmd, "ps") == 0)
+    {
+        TaskTable::GetInstance().Ps(vga);
     }
     else if (Shared::StrCmp(cmd, "help") == 0)
     {
@@ -78,6 +71,7 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Printf("cpu - dump cpu state\n");
         vga.Printf("dmesg - dump kernel log\n");
         vga.Printf("exit - shutdown kernel\n");
+        vga.Printf("ps - show tasks\n");
         vga.Printf("help - help\n");
     }
     else
@@ -108,7 +102,7 @@ bool Cmd::Start()
     if (Task != nullptr)
         return false;
 
-    auto task = new class Task();
+    auto task = new class Task("cmd");
     if (task == nullptr)
         return false;
 

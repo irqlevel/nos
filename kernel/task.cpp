@@ -3,6 +3,7 @@
 #include "asm.h"
 #include "sched.h"
 #include "cpu.h"
+#include "sched.h"
 
 namespace Kernel
 {
@@ -10,14 +11,24 @@ namespace Kernel
 Task::Task()
     : TaskQueue(nullptr)
     , Rsp(0)
+    , State(0)
     , Stack(nullptr)
     , Function(nullptr)
     , Ctx(nullptr)
-    , State(0)
 {
     RefCounter.Set(1);
     ListEntry.Init();
     PreemptDisable.Set(0);
+    Name[0] = '\0';
+}
+
+Task::Task(const char* fmt, ...)
+    : Task()
+{
+    va_list args;
+    va_start(args, fmt);
+    Shared::VsnPrintf(Name, Shared::ArraySize(Name), fmt, args);
+    va_end(args);
 }
 
 Task::~Task()
@@ -69,8 +80,9 @@ void Task::Exit()
 
     BugOn(tq == nullptr);
 
-    tq->RemoveTask(this);
+    tq->Remove(this);
     State |= StateExited;
+    TaskTable::GetInstance().Remove(this);
     tq->Schedule();
     Panic("Can't be here");
 }
@@ -113,12 +125,13 @@ bool Task::Start(Func func, void* ctx)
     regs->Rflags = (1 << 9); //setup IF
     Rsp = (ulong)regs;
 
+    TaskTable::GetInstance().Insert(this);
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
-    cpu.GetTaskQueue().AddTask(this);
+    cpu.GetTaskQueue().Insert(this);
     return true;
 }
 
-bool Task::Run(Func func, void* ctx)
+bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
 {
     BugOn(Stack != nullptr);
     BugOn(Function != nullptr);
@@ -133,7 +146,12 @@ bool Task::Run(Func func, void* ctx)
     Function = func;
     Ctx = ctx;
 
+    TaskTable::GetInstance().Insert(this);
+    taskQueue.Insert(this);
     Function(Ctx);
+    taskQueue.Remove(this);
+    TaskTable::GetInstance().Remove(this);
+
     return true;
 }
 
@@ -147,6 +165,79 @@ Task* Task::GetCurrentTask()
         return nullptr;
 
     return stack->Task;
+}
+
+void Task::SetName(const char *fmt, ...)
+{
+    Name[0] = '\0';
+
+    va_list args;
+    va_start(args, fmt);
+    Shared::VsnPrintf(Name, Shared::ArraySize(Name), fmt, args);
+    va_end(args);
+}
+
+const char* Task::GetName()
+{
+    return Name;
+}
+
+TaskTable::TaskTable()
+{
+    TaskList.Init();
+}
+
+TaskTable::~TaskTable()
+{
+    Shared::ListEntry taskList;
+
+    {
+        Shared::AutoLock lock(Lock);
+        taskList.MoveTailList(&TaskList);
+    }
+
+    while (!taskList.IsEmpty())
+    {
+        Task* task = CONTAINING_RECORD(taskList.RemoveHead(), Task, TableListEntry);
+        task->TableListEntry.Init();
+        task->Put();
+    }
+}
+
+void TaskTable::Insert(Task *task)
+{
+    task->Get();
+
+    Shared::AutoLock lock(Lock);
+
+    BugOn(!task->TableListEntry.IsEmpty());
+    TaskList.InsertTail(&task->TableListEntry);
+}
+
+void TaskTable::Remove(Task *task)
+{
+    {
+        Shared::AutoLock lock(Lock);
+
+        BugOn(task->TableListEntry.IsEmpty());
+        task->TableListEntry.RemoveInit();
+    }
+
+    task->Put();
+}
+
+void TaskTable::Ps(Shared::Printer& printer)
+{
+    Shared::AutoLock lock(Lock);
+
+    for (auto currEntry = TaskList.Flink;
+        currEntry != &TaskList;
+        currEntry = currEntry->Flink)
+    {
+        Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
+        printer.Printf("0x%p 0x%p %u %s\n",
+            task, task->State, task->ContextSwitches.Get(), task->GetName());
+    }
 }
 
 }

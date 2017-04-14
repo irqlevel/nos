@@ -3,10 +3,12 @@
 namespace Shared
 {
 
-struct ListEntry
+struct ListEntry final
 {
     struct ListEntry *Flink;
     struct ListEntry *Blink;
+
+    ListEntry();
 
     void Init();
 
@@ -26,6 +28,13 @@ struct ListEntry
 
     void InsertHead(ListEntry* Entry);
 
+    void MoveTailList(ListEntry* list);
+
+private:
+    ListEntry(const ListEntry& other) = delete;
+    ListEntry(ListEntry&& other) = delete;
+    ListEntry& operator=(const ListEntry& other) = delete;
+    ListEntry& operator=(ListEntry&& other) = delete;
 };
 
 }

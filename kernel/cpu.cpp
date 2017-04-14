@@ -326,8 +326,8 @@ ulong CpuTable::GetRunningCpus()
 
 bool Cpu::Run(Task::Func func, void *ctx)
 {
-    TaskQueue.AddTask(&Task);
-    return Task.Run(func, ctx);
+    Task.SetName("cpu%u", Index);
+    return Task.Run(TaskQueue, func, ctx);
 }
 
 }

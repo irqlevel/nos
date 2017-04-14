@@ -130,7 +130,7 @@ void VgaTerm::Cls()
 	Cursor();
 }
 
-void VgaTerm::Vprintf(const char *fmt, va_list args)
+void VgaTerm::VPrintf(const char *fmt, va_list args)
 {
 	Shared::AutoLock lock(Lock);
 
@@ -147,8 +147,15 @@ void VgaTerm::Printf(const char *fmt, ...)
 	va_list args;
 
 	va_start(args, fmt);
-	Vprintf(fmt, args);
+	VPrintf(fmt, args);
 	va_end(args);
+}
+
+void VgaTerm::PrintString(const char *s)
+{
+	Shared::AutoLock lock(Lock);
+
+	PutsLockHeld(s);
 }
 
 void VgaTerm::Cursor()

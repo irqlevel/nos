@@ -2,6 +2,7 @@
 
 #include <lib/stdlib.h>
 #include <lib/list_entry.h>
+#include <lib/printer.h>
 
 #include "atomic.h"
 #include "forward.h"
@@ -55,9 +56,11 @@ public:
     using Func = void (*)(void *ctx);
 
     Task();
+    Task(const char* fmt, ...);
+
     ~Task();
 
-    bool Run(Func func, void* ctx);
+    bool Run(class TaskQueue& taskQueue, Func func, void* ctx);
 
     static Task* GetCurrentTask();
 
@@ -69,15 +72,26 @@ public:
     void Wait();
 
     void SetStopping();
-
     bool IsStopping();
+
+    void SetName(const char *fmt, ...);
+    const char* GetName();
+
+    static const ulong StateWaiting = 0x1;
+    static const ulong StateRunning = 0x2;
+    static const ulong StateExited = 0x4;
+    static const ulong StateStopping = 0x8;
 
 public:
     Shared::ListEntry ListEntry;
+    Shared::ListEntry TableListEntry;
+
     TaskQueue* TaskQueue;
     SpinLock Lock;
     Atomic PreemptDisable;
+    Atomic ContextSwitches;
     ulong Rsp;
+    volatile ulong State;
 
 private:
     Task(const Task& other) = delete;
@@ -86,22 +100,43 @@ private:
     Task& operator=(Task&& other) = delete;
 
     void Release();
-
     void Exit();
+    void ExecCallback();
+    static void Exec(void *task);
 
     Stack* Stack;
     Func Function;
     void* Ctx;
     Atomic RefCounter;
 
-    static const ulong StateExited = 0x1;
-    static const ulong StateStopping = 0x2;
+    char Name[32];
+};
 
-    volatile ulong State;
+class TaskTable final
+{
+public:
+    static TaskTable& GetInstance()
+    {
+        static TaskTable Instance;
+        return Instance;
+    }
 
-    void ExecCallback();
+    void Insert(Task *task);
+    void Remove(Task *task);
 
-    static void Exec(void *task);
+    void Ps(Shared::Printer& printer);
+
+private:
+    TaskTable(const TaskTable& other) = delete;
+    TaskTable(TaskTable&& other) = delete;
+    TaskTable& operator=(const TaskTable& other) = delete;
+    TaskTable& operator=(TaskTable&& other) = delete;
+
+    TaskTable();
+    ~TaskTable();
+
+    SpinLock Lock;
+    Shared::ListEntry TaskList;
 };
 
 }

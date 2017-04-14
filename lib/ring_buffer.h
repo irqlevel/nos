@@ -3,6 +3,7 @@
 #include "stdlib.h"
 #include "error.h"
 #include "lock.h"
+#include "printer.h"
 
 #include <kernel/panic.h>
 
@@ -128,7 +129,7 @@ public:
         EndIndex = 0;
     }
 
-    void Dump(Dumper& dumper)
+    void Print(TypePrinter<T>& printer)
     {
         Shared::AutoLock lock(Lock);
 
@@ -138,7 +139,7 @@ public:
         size_t index = StartIndex;
         for (size_t i = 0; i < Size; i++)
         {
-            dumper.OnElement(Buf[index]);
+            printer.PrintElement(Buf[index]);
             index = (index + 1) % Capacity;
         }
     }

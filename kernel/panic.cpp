@@ -19,9 +19,9 @@ void Panicker::DoPanic(const char *fmt, ...)
     va_list args;
     va_start(args, fmt);
 
-    auto& term = VgaTerm::GetInstance();
-    term.SetColor(VgaTerm::ColorRed, VgaTerm::ColorBlack);
-    term.Vprintf(fmt, args);
+    auto& vga = VgaTerm::GetInstance();
+    vga.SetColor(VgaTerm::ColorRed, VgaTerm::ColorBlack);
+    vga.VPrintf(fmt, args);
     va_end(args);
 
     InterruptDisable();

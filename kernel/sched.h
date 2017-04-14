@@ -15,8 +15,8 @@ public:
     TaskQueue();
     ~TaskQueue();
 
-    void AddTask(Task* task);
-    void RemoveTask(Task* task);
+    void Insert(Task* task);
+    void Remove(Task* task);
 
     void Schedule();
 

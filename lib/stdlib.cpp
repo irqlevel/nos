@@ -315,6 +315,17 @@ int StrnCmp(const char *s1, const char *s2, size_t size)
     return 0;
 }
 
+void StrnCpy(char *dst, const char *src, size_t size)
+{
+    for (size_t i = 0; i < size; i++)
+    {
+        const char c = src[i];
+        dst[i] = c;
+        if (c == '\0')
+            break;
+    }
+}
+
 // find n : 2^n >= size
 size_t Log2(size_t size)
 {

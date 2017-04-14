@@ -3,6 +3,11 @@
 namespace Shared
 {
 
+ListEntry::ListEntry()
+{
+    Init();
+}
+
 void ListEntry::Init()
 {
     Flink = Blink = this;
@@ -91,6 +96,16 @@ void ListEntry::InsertHead(ListEntry* entry)
     flink->Blink = entry;
     Flink = entry;
     return;
+}
+
+void ListEntry::MoveTailList(ListEntry *list)
+{
+    if (list->IsEmpty())
+        return;
+
+    ListEntry* entry = list->Flink;
+    list->RemoveInit();
+    AppendTail(entry);
 }
 
 }

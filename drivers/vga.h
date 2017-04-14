@@ -2,11 +2,12 @@
 
 #include <include/types.h>
 #include <kernel/spin_lock.h>
+#include <lib/printer.h>
 
 namespace Kernel
 {
 
-class VgaTerm
+class VgaTerm : public Shared::Printer
 {
 public:
     static VgaTerm& GetInstance()
@@ -17,8 +18,10 @@ public:
 
     void Puts(const char *s);
     void Cls();
-    void Vprintf(const char *fmt, va_list args);
-    void Printf(const char *fmt, ...);
+
+    virtual void VPrintf(const char *fmt, va_list args) override;
+    virtual void Printf(const char *fmt, ...) override;
+    virtual void PrintString(const char *s) override;
 
     /* VGA hardware text mode color constants. */
     enum Color {
