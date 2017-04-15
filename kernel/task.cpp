@@ -85,6 +85,7 @@ void Task::Exit()
 
     tq->Remove(this);
     State.Set(StateExited);
+    ExitTime = GetBootTime();
 
     TaskTable::GetInstance().Remove(this);
 
@@ -96,6 +97,7 @@ void Task::Exit()
 
 void Task::ExecCallback()
 {
+    StartTime = GetBootTime();
     Function(Ctx);
     Exit();
 }
@@ -161,7 +163,10 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
         State = StateRunning;
     }
 
+    StartTime = GetBootTime();
+    RunStartTime = GetBootTime();
     Function(Ctx);
+    ExitTime = GetBootTime();
 
     taskQueue.Remove(this);
     TaskTable::GetInstance().Remove(this);
@@ -244,15 +249,16 @@ void TaskTable::Ps(Shared::Printer& printer)
 {
     Shared::AutoLock lock(Lock);
 
-    printer.Printf("id state flags ctxswitches name\n");
+    printer.Printf("id state flags runtime ctxswitches name\n");
 
     for (auto currEntry = TaskList.Flink;
         currEntry != &TaskList;
         currEntry = currEntry->Flink)
     {
         Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
-        printer.Printf("0x%p %u 0x%p %u %s\n",
-            task, task->State.Get(), task->Flags.Get(), task->ContextSwitches.Get(), task->GetName());
+        printer.Printf("0x%p %u 0x%p %u.%u %u %s\n",
+            task, task->State.Get(), task->Flags.Get(), task->Runtime.GetSecs(),
+            task->Runtime.GetUsecs(), task->ContextSwitches.Get(), task->GetName());
     }
 }
 

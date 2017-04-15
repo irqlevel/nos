@@ -28,7 +28,7 @@ void IO8042::OnInterruptRegister(u8 irq, u8 vector)
 
     IntVector = vector;
 
-    Shared::Time period(10 * NanoSecsInMs); //10ms
+    Shared::Time period(10 * Shared::NanoSecsInMs); //10ms
 
     TimerTable::GetInstance().StartTimer(*this, period);
 }

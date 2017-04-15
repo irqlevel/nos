@@ -96,6 +96,11 @@ public:
     Atomic State;
     Atomic Flags;
 
+    Shared::Time RunStartTime;
+    Shared::Time Runtime;
+    Shared::Time StartTime;
+    Shared::Time ExitTime;
+
 private:
     Task(const Task& other) = delete;
     Task(Task&& other) = delete;

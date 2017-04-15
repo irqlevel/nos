@@ -1,6 +1,6 @@
 #pragma once
 
-#include <drivers/pit.h>
+#include <kernel/time.h>
 
 #include <lib/stdlib.h>
 #include <lib/error.h>
@@ -59,7 +59,7 @@ do {                                                                \
     auto& tracer = Kernel::Tracer::GetInstance();                   \
     if (unlikely((level) <= tracer.GetLevel()))                     \
     {                                                               \
-        auto time = Pit::GetInstance().GetTime();                   \
+        auto time = GetBootTime();                                  \
         tracer.Output("%u:%u.%u:%s(),%s,%u: " fmt "\n",             \
             (level), time.GetSecs(), time.GetUsecs(),               \
             __func__, Shared::TruncateFileName(__FILE__),           \
@@ -72,7 +72,7 @@ do {                                                                \
     auto& tracer = Kernel::Tracer::GetInstance();                   \
     if (unlikely(0 <= tracer.GetLevel()))                           \
     {                                                               \
-        auto time = Pit::GetInstance().GetTime();                   \
+        auto time = GetBootTime();                                  \
         tracer.Output("%u:%u.%u:%s(),%s,%u: Error %u at %s(),%s,%u: " fmt "\n",    \
             0, time.GetSecs(), time.GetUsecs(),                     \
             __func__, Shared::TruncateFileName(__FILE__),           \

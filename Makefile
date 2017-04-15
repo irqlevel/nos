@@ -37,6 +37,7 @@ CXX_SRC =   \
     kernel/dmesg.cpp    \
     kernel/sched.cpp    \
     kernel/preempt.cpp  \
+    kernel/time.cpp \
     lib/stdlib.cpp  \
     lib/list_entry.cpp  \
     lib/error.cpp   \

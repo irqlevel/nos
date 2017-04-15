@@ -3,6 +3,7 @@
 #include "asm.h"
 #include "dmesg.h"
 #include "cpu.h"
+#include "time.h"
 
 #include <drivers/vga.h>
 
@@ -58,7 +59,7 @@ void Cmd::ProcessCmd(const char *cmd)
     }
     else if (Shared::StrCmp(cmd, "uptime") == 0)
     {
-        auto time = Pit::GetInstance().GetTime();
+        auto time = GetBootTime();
         vga.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
     }
     else if (Shared::StrCmp(cmd, "ps") == 0)

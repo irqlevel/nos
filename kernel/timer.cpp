@@ -1,6 +1,5 @@
 #include "timer.h"
-
-#include <drivers/pit.h>
+#include "time.h"
 
 namespace Kernel
 {
@@ -26,7 +25,7 @@ bool TimerTable::StartTimer(TimerCallback& callback, Shared::Time period)
         if (timer.Callback == nullptr)
         {
             timer.Period = period;
-            timer.Expired = Pit::GetInstance().GetTime() + period;
+            timer.Expired = GetBootTime() + period;
             timer.Callback = &callback;
             return true;
         }
@@ -49,7 +48,7 @@ void TimerTable::StopTimer(TimerCallback& callback)
 
 void TimerTable::ProcessTimers()
 {
-    auto now = Pit::GetInstance().GetTime();
+    auto now = GetBootTime();
 
     for (size_t i = 0; i < Shared::ArraySize(Timer); i++)
     {
@@ -59,7 +58,7 @@ void TimerTable::ProcessTimers()
         {
             timer.Callback->OnTick(*timer.Callback);
 
-            timer.Expired = now + timer.Period;
+            timer.Expired += timer.Period;
         }
     }
 }

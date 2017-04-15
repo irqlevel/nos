@@ -65,7 +65,6 @@ struct Time
         return *this;
     }
 
-
     ulong GetValue()
     {
         return NanoSecs;

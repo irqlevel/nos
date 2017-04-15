@@ -269,10 +269,9 @@ TaskQueue& Cpu::GetTaskQueue()
 
 void Cpu::Sleep(ulong nanoSecs)
 {
-    auto& pit = Pit::GetInstance();
-    auto expired = pit.GetTime() + nanoSecs;
+    auto expired = GetBootTime() + nanoSecs;
 
-    while (pit.GetTime() < expired)
+    while (GetBootTime() < expired)
     {
         Schedule();
     }

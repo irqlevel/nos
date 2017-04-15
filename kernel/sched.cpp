@@ -2,6 +2,7 @@
 #include "panic.h"
 #include "trace.h"
 #include "preempt.h"
+#include "time.h"
 
 namespace Kernel
 {
@@ -25,10 +26,12 @@ void TaskQueue::Switch(Task* next, Task* curr)
     if (curr->State.Get() != Task::StateExited)
         curr->State.Set(Task::StateWaiting);
     curr->ContextSwitches.Inc();
+    auto now = GetBootTime();
+    curr->Runtime += (now - curr->RunStartTime);
 
     BugOn(next->State.Get() == Task::StateExited);
     next->State.Set(Task::StateRunning);
-
+    next->RunStartTime = now;
     SwitchContext(next->Rsp, &curr->Rsp);
 }
 

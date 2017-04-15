@@ -62,9 +62,9 @@ void Pit::Interrupt(Context* ctx)
 
         TimeMs += TickMs;
         TimeMsNs += TickMsNs;
-        while (TimeMsNs >= NanoSecsInMs)
+        while (TimeMsNs >= Shared::NanoSecsInMs)
         {
-            TimeMsNs -= NanoSecsInMs;
+            TimeMsNs -= Shared::NanoSecsInMs;
             TimeMs += 1;
         }
     }
@@ -84,7 +84,7 @@ Shared::Time Pit::GetTime()
 {
     Shared::AutoLock lock(Lock);
 
-    return TimeMs * NanoSecsInMs + TimeMsNs;
+    return TimeMs * Shared::NanoSecsInMs + TimeMsNs;
 }
 
 extern "C" void PitInterrupt(Context* ctx)
