@@ -30,7 +30,7 @@ void PreemptDisable()
     if (likely(PreemptActive))
     {
         auto task = Task::GetCurrentTask();
-        task->PreemptDisable.Inc();
+        task->PreemptDisableCounter.Inc();
     }
 }
 
@@ -39,8 +39,8 @@ void PreemptEnable()
     if (likely(PreemptActive))
     {
         auto task = Task::GetCurrentTask();
-        BugOn(task->PreemptDisable.Get() == 0);
-        task->PreemptDisable.Dec();
+        BugOn(task->PreemptDisableCounter.Get() == 0);
+        task->PreemptDisableCounter.Dec();
     }
 }
 

@@ -67,6 +67,8 @@ global AtomicDec
 global AtomicRead
 global AtomicWrite
 global AtomicReadAndDec
+global AtomicTestAndSetBit
+global AtomicTestBit
 
 global DummyInterruptStub
 global IO8042InterruptStub
@@ -321,6 +323,22 @@ AtomicReadAndDec:
 	xor rax, rax
 	dec rax
 	lock xadd qword [rdi], rax
+	ret
+
+AtomicTestAndSetBit:
+	xor rax, rax
+	lock bts qword [rdi], rsi
+	jnc .return
+	inc rax
+.return
+	ret
+
+AtomicTestBit:
+	xor rax, rax
+	lock bt qword [rdi], rsi
+	jnc .return
+	inc rax
+.return
 	ret
 
 %macro InterruptStub 1

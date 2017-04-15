@@ -55,6 +55,9 @@ long AtomicRead(volatile long *pvalue);
 void AtomicWrite(volatile long *pvalue, long newValue);
 long AtomicReadAndDec(volatile long *pvalue);
 
+long AtomicTestAndSetBit(volatile long *pvalue, ulong bit);
+long AtomicTestBit(volatile long *pvalue, ulong bit);
+
 void IO8042InterruptStub();
 void SerialInterruptStub();
 void PitInterruptStub();

@@ -77,10 +77,11 @@ public:
     void SetName(const char *fmt, ...);
     const char* GetName();
 
-    static const ulong StateWaiting = 0x1;
-    static const ulong StateRunning = 0x2;
-    static const ulong StateExited = 0x4;
-    static const ulong StateStopping = 0x8;
+    static const long StateWaiting = 0x1;
+    static const long StateRunning = 0x2;
+    static const long StateExited = 0x3;
+
+    static const long FlagStoppingBit = 1;
 
 public:
     Shared::ListEntry ListEntry;
@@ -88,10 +89,12 @@ public:
 
     TaskQueue* TaskQueue;
     SpinLock Lock;
-    Atomic PreemptDisable;
+    Atomic PreemptDisableCounter;
     Atomic ContextSwitches;
     ulong Rsp;
-    volatile ulong State;
+
+    Atomic State;
+    Atomic Flags;
 
 private:
     Task(const Task& other) = delete;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <lib/stdlib.h>
+
 namespace Kernel
 {
 
@@ -13,6 +15,9 @@ public:
     bool DecAndTest();
     long Get();
     void Set(long value);
+    void SetBit(ulong bit);
+    bool TestBit(ulong bit);
+
     ~Atomic();
 
     Atomic& operator=(Atomic&& other);

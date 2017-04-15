@@ -22,25 +22,25 @@ void TaskQueue::Switch(Task* next, Task* curr)
     BugOn(curr == next);
     BugOn(next->Rsp == 0);
 
-    curr->State &= ~Task::StateRunning;
-    curr->State |= Task::StateWaiting;
+    if (curr->State.Get() != Task::StateExited)
+        curr->State.Set(Task::StateWaiting);
     curr->ContextSwitches.Inc();
 
-    SwitchContext(next->Rsp, &curr->Rsp);
+    BugOn(next->State.Get() == Task::StateExited);
+    next->State.Set(Task::StateRunning);
 
-    next->State &= ~Task::StateWaiting;
-    next->State |= Task::StateRunning;
+    SwitchContext(next->Rsp, &curr->Rsp);
 }
 
 void TaskQueue::Schedule()
 {
     ScheduleCounter.Inc();
 
-    if (!PreemptIsOn())
+    if (unlikely(!PreemptIsOn()))
         return;
 
     Task* curr = Task::GetCurrentTask();
-    if (curr->PreemptDisable.Get() != 0)
+    if (curr->PreemptDisableCounter.Get() != 0)
         return;
 
     Task* next = nullptr;
@@ -62,7 +62,7 @@ void TaskQueue::Schedule()
                 return;
             }
 
-            if (cand->PreemptDisable.Get() != 0)
+            if (cand->PreemptDisableCounter.Get() != 0)
                 continue;
 
             next = cand;

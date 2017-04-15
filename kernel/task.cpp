@@ -12,13 +12,14 @@ Task::Task()
     : TaskQueue(nullptr)
     , Rsp(0)
     , State(0)
+    , Flags(0)
     , Stack(nullptr)
     , Function(nullptr)
     , Ctx(nullptr)
 {
     RefCounter.Set(1);
     ListEntry.Init();
-    PreemptDisable.Set(0);
+    PreemptDisableCounter.Set(0);
     Name[0] = '\0';
 }
 
@@ -66,23 +67,29 @@ void Task::Put()
 
 void Task::SetStopping()
 {
-    State |= StateStopping;
+    Flags.SetBit(FlagStoppingBit);
 }
 
 bool Task::IsStopping()
 {
-    return (State & StateStopping) ? true : false;
+    return Flags.TestBit(FlagStoppingBit);
 }
 
 void Task::Exit()
 {
+    PreemptDisable();
+
     class TaskQueue *tq = TaskQueue;
 
     BugOn(tq == nullptr);
 
     tq->Remove(this);
-    State |= StateExited;
+    State.Set(StateExited);
+
     TaskTable::GetInstance().Remove(this);
+
+    PreemptEnable();
+
     tq->Schedule();
     Panic("Can't be here");
 }
@@ -100,7 +107,7 @@ void Task::Exec(void *task)
 
 void Task::Wait()
 {
-    while (!(State & StateExited))
+    while (State.Get() != StateExited)
     {
         GetCpu().Sleep(1000000);
     }
@@ -148,7 +155,14 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
 
     TaskTable::GetInstance().Insert(this);
     taskQueue.Insert(this);
+
+    {
+        Shared::AutoLock lock(Lock);
+        State = StateRunning;
+    }
+
     Function(Ctx);
+
     taskQueue.Remove(this);
     TaskTable::GetInstance().Remove(this);
 
@@ -236,7 +250,7 @@ void TaskTable::Ps(Shared::Printer& printer)
     {
         Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
         printer.Printf("0x%p 0x%p %u %s\n",
-            task, task->State, task->ContextSwitches.Get(), task->GetName());
+            task, task->State.Get(), task->ContextSwitches.Get(), task->GetName());
     }
 }
 

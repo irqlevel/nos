@@ -105,7 +105,7 @@ void TestTaskFunc(void *ctx)
 {
     (void)ctx;
 
-    for (size_t i = 0; i < 3; i++)
+    for (size_t i = 0; i < 2; i++)
     {
         Trace(0, "Hello from task 0x%p", Task::GetCurrentTask());
         GetCpu().Sleep(100000000);
@@ -114,7 +114,7 @@ void TestTaskFunc(void *ctx)
 
 bool TestTask()
 {
-    Task *task[3] = {0};
+    Task *task[2] = {0};
     for (size_t i = 0; i < ArraySize(task); i++)
     {
         task[i] = new Task();

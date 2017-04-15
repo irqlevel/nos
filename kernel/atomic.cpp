@@ -1,6 +1,8 @@
 #include "atomic.h"
 #include "asm.h"
 
+#include <kernel/panic.h>
+
 namespace Kernel
 {
 
@@ -38,6 +40,20 @@ void Atomic::Set(long value)
 long Atomic::Get()
 {
     return AtomicRead(&Value);
+}
+
+void Atomic::SetBit(ulong bit)
+{
+    BugOn(bit >= Shared::SizeOfInBits<long>());
+
+    AtomicTestAndSetBit(&Value, bit);
+}
+
+bool Atomic::TestBit(ulong bit)
+{
+    BugOn(bit >= Shared::SizeOfInBits<long>());
+
+    return (AtomicTestBit(&Value, bit)) ? true : false;
 }
 
 Atomic::~Atomic()
