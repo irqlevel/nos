@@ -61,7 +61,7 @@ do {                                                                \
     {                                                               \
         auto time = Pit::GetInstance().GetTime();                   \
         tracer.Output("%u:%u.%u:%s(),%s,%u: " fmt "\n",             \
-            (level), time.Secs, time.NanoSecs,                      \
+            (level), time.GetSecs(), time.GetUsecs(),               \
             __func__, Shared::TruncateFileName(__FILE__),           \
             (ulong)__LINE__, ##__VA_ARGS__);                        \
     }                                                               \
@@ -74,7 +74,7 @@ do {                                                                \
     {                                                               \
         auto time = Pit::GetInstance().GetTime();                   \
         tracer.Output("%u:%u.%u:%s(),%s,%u: Error %u at %s(),%s,%u: " fmt "\n",    \
-            0, time.Secs, time.NanoSecs,                            \
+            0, time.GetSecs(), time.GetUsecs(),                     \
             __func__, Shared::TruncateFileName(__FILE__),           \
             (ulong)__LINE__, (ulong)err.GetCode(), err.GetFunc(), Shared::TruncateFileName(err.GetFile()),  \
             (ulong)err.GetLine(), ##__VA_ARGS__);                                  \

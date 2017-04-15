@@ -48,10 +48,10 @@ private:
     static const int ModePort = 0x43;
     static const u32 HighestFrequency = 1193182;
 
-    u32 TimeMs;
-    u32 TimeMsNs;
-    u32 TickMs;
-    u32 TickMsNs;
+    ulong TimeMs;
+    ulong TimeMsNs;
+    ulong TickMs;
+    ulong TickMsNs;
     u16 ReloadValue;
 
     SpinLock Lock;

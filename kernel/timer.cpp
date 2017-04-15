@@ -26,8 +26,7 @@ bool TimerTable::StartTimer(TimerCallback& callback, Shared::Time period)
         if (timer.Callback == nullptr)
         {
             timer.Period = period;
-            timer.Expired = Pit::GetInstance().GetTime();
-            timer.Expired.Add(period);
+            timer.Expired = Pit::GetInstance().GetTime() + period;
             timer.Callback = &callback;
             return true;
         }
@@ -56,13 +55,11 @@ void TimerTable::ProcessTimers()
     {
         auto& timer = Timer[i];
 
-        if (timer.Callback != nullptr && now.Compare(timer.Expired) > 0)
+        if (timer.Callback != nullptr && now >= timer.Expired)
         {
             timer.Callback->OnTick(*timer.Callback);
 
-            auto expired = now;
-            expired.Add(timer.Period);
-            timer.Expired = expired;
+            timer.Expired = now + timer.Period;
         }
     }
 }

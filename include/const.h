@@ -14,4 +14,7 @@ namespace Shared
     const size_t MB = 1024 * 1024;
     const size_t GB = 1024 * 1024 * 1024;
 
+    const ulong NanoSecsInSec = 1000000000;
+    const ulong NanoSecsInMs = 1000000;
+    const ulong NanoSecsInUsec = 1000;
 };

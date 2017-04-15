@@ -59,7 +59,7 @@ void Cmd::ProcessCmd(const char *cmd)
     else if (Shared::StrCmp(cmd, "uptime") == 0)
     {
         auto time = Pit::GetInstance().GetTime();
-        vga.Printf("%u.%u\n", time.Secs, time.NanoSecs);
+        vga.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
     }
     else if (Shared::StrCmp(cmd, "ps") == 0)
     {

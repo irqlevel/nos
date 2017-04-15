@@ -9,46 +9,93 @@ namespace Shared
 struct Time
 {
     Time()
-        : Secs(0)
-        , NanoSecs(0)
+        : NanoSecs(0)
     {
     }
 
-    Time(ulong secs, ulong nanoSecs)
-        : Secs(secs)
-        , NanoSecs(nanoSecs)
+    Time(ulong nanoSecs)
+        : NanoSecs(nanoSecs)
     {
     }
 
-    void Add(const Time& other)
+    Time(const Time& other)
     {
-        Secs += other.Secs;
+        NanoSecs = other.NanoSecs;
+    }
 
-        u64 nanoSecs = NanoSecs + other.NanoSecs;
-        while (nanoSecs > 1000000000)
+    Time& operator=(const Time& other)
+    {
+        if (this != &other)
         {
-            Secs+= 1;
-            nanoSecs -= 1000000000;
+            NanoSecs = other.NanoSecs;
         }
-        NanoSecs = nanoSecs;
+        return *this;
     }
 
-    int Compare(const Time& other)
+    void Reset()
     {
-        if (Secs < other.Secs)
-            return -1;
-        if (Secs > other.Secs)
-            return 1;
-
-        if (NanoSecs < other.NanoSecs)
-            return -1;
-        if (NanoSecs > other.NanoSecs)
-            return 1;
-
-        return 0;
+        NanoSecs = 0;
     }
 
-    ulong Secs;
+    Time operator+(const Time& other) const
+    {
+        return NanoSecs + other.NanoSecs;
+    }
+
+    Time operator-(const Time& other) const
+    {
+        if (NanoSecs <= other.NanoSecs)
+            return Time(0);
+        else
+            return NanoSecs - other.NanoSecs;
+    }
+
+    Time& operator+=(const Time& other)
+    {
+        NanoSecs += other.NanoSecs;;
+        return *this;
+    }
+
+    Time& operator-=(const Time& other)
+    {
+        if (NanoSecs <= other.NanoSecs)
+           NanoSecs = 0;
+        else
+            NanoSecs -= other.NanoSecs;
+        return *this;
+    }
+
+
+    ulong GetValue()
+    {
+        return NanoSecs;
+    }
+
+    bool operator==(const Time& other) const
+    {
+        return (NanoSecs == other.NanoSecs) ? true : false;
+    }
+
+    bool operator<(const Time& other) const
+    {
+        return (NanoSecs < other.NanoSecs) ? true : false;
+    }
+
+    bool operator>=(const Time& other) const
+    {
+        return (NanoSecs >= other.NanoSecs) ? true : false;
+    }
+
+    ulong GetSecs()
+    {
+        return NanoSecs / NanoSecsInSec;
+    }
+
+    ulong GetUsecs()
+    {
+        return (NanoSecs % NanoSecsInSec) / NanoSecsInUsec;
+    }
+
     ulong NanoSecs;
 };
 

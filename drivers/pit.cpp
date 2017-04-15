@@ -62,9 +62,9 @@ void Pit::Interrupt(Context* ctx)
 
         TimeMs += TickMs;
         TimeMsNs += TickMsNs;
-        while (TimeMsNs >= 1000000)
+        while (TimeMsNs >= NanoSecsInMs)
         {
-            TimeMsNs -= 1000000;
+            TimeMsNs -= NanoSecsInMs;
             TimeMs += 1;
         }
     }
@@ -83,12 +83,8 @@ void Pit::Interrupt(Context* ctx)
 Shared::Time Pit::GetTime()
 {
     Shared::AutoLock lock(Lock);
-    Shared::Time time;
 
-    time.Secs = TimeMs / 1000;
-    time.NanoSecs = 1000000 * (TimeMs % 1000) + TimeMsNs;
-
-    return time;
+    return TimeMs * NanoSecsInMs + TimeMsNs;
 }
 
 extern "C" void PitInterrupt(Context* ctx)
@@ -98,26 +94,17 @@ extern "C" void PitInterrupt(Context* ctx)
 
 void Pit::Wait(const Shared::Time& timeout)
 {
-    Shared::Time expTime = GetTime();
-    expTime.Add(timeout);
+    Shared::Time expired = GetTime() + timeout;
 
-    for (;;)
+    while (GetTime() < expired)
     {
-        Shared::Time currTime = GetTime();
-        if (expTime.Compare(currTime) < 0)
-        {
-            break;
-        }
         Hlt();
     }
 }
 
 void Pit::Wait(ulong nanoSecs)
 {
-    Shared::Time timeout;
-
-    timeout.Secs = 0;
-    timeout.NanoSecs = nanoSecs;
+    Shared::Time timeout(nanoSecs);
 
     Wait(timeout);
 }
