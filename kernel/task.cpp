@@ -244,13 +244,15 @@ void TaskTable::Ps(Shared::Printer& printer)
 {
     Shared::AutoLock lock(Lock);
 
+    printer.Printf("id state flags ctxswitches name\n");
+
     for (auto currEntry = TaskList.Flink;
         currEntry != &TaskList;
         currEntry = currEntry->Flink)
     {
         Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
-        printer.Printf("0x%p 0x%p %u %s\n",
-            task, task->State.Get(), task->ContextSwitches.Get(), task->GetName());
+        printer.Printf("0x%p %u 0x%p %u %s\n",
+            task, task->State.Get(), task->Flags.Get(), task->ContextSwitches.Get(), task->GetName());
     }
 }
 

@@ -77,9 +77,9 @@ public:
     void SetName(const char *fmt, ...);
     const char* GetName();
 
-    static const long StateWaiting = 0x1;
-    static const long StateRunning = 0x2;
-    static const long StateExited = 0x3;
+    static const long StateWaiting = 1;
+    static const long StateRunning = 2;
+    static const long StateExited = 3;
 
     static const long FlagStoppingBit = 1;
 
