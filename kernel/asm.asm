@@ -69,6 +69,7 @@ global AtomicWrite
 global AtomicReadAndDec
 global AtomicTestAndSetBit
 global AtomicTestBit
+global AtomicCmpxchg
 
 global DummyInterruptStub
 global IO8042InterruptStub
@@ -339,6 +340,14 @@ AtomicTestBit:
 	jnc .return
 	inc rax
 .return
+	ret
+
+AtomicCmpxchg:
+	mov rax, rdx
+	lock cmpxchg qword [rdi], rsi
+	jne .complete
+	mov rax, rsi
+.complete:
 	ret
 
 %macro InterruptStub 1

@@ -56,6 +56,11 @@ bool Atomic::TestBit(ulong bit)
     return (AtomicTestBit(&Value, bit)) ? true : false;
 }
 
+long Atomic::Cmpxchg(long exchange, long comparand)
+{
+    return AtomicCmpxchg(&Value, exchange, comparand);
+}
+
 Atomic::~Atomic()
 {
 }

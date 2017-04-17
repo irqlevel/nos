@@ -18,6 +18,8 @@ public:
     void SetBit(ulong bit);
     bool TestBit(ulong bit);
 
+    long Cmpxchg(long exchange, long comparand);
+
     ~Atomic();
 
     Atomic& operator=(Atomic&& other);
