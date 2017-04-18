@@ -7,4 +7,6 @@ namespace Kernel
 
 Shared::Error Test();
 
+bool TestMultiTasking();
+
 }

@@ -1,5 +1,8 @@
 #include "trace.h"
 #include "debug.h"
+#include "task.h"
+#include "sched.h"
+#include "cpu.h"
 
 #include <lib/btree.h>
 #include <lib/error.h>
@@ -253,6 +256,65 @@ Shared::Error Test()
         return err;
 
     return err;
+}
+
+void TestMultiTaskingTaskFunc(void *ctx)
+{
+    (void)ctx;
+
+    for (size_t i = 0; i < 2; i++)
+    {
+        auto& cpu = GetCpu();
+        Trace(0, "Hello from task 0x%p cpu %u", Task::GetCurrentTask(), cpu.GetIndex());
+        cpu.Sleep(100 * Shared::NanoSecsInMs);
+    }
+}
+
+bool TestMultiTasking()
+{
+    Task *task[2] = {0};
+    for (size_t i = 0; i < Shared::ArraySize(task); i++)
+    {
+        task[i] = new Task();
+        if (task[i] == nullptr)
+        {
+            for (size_t j = 0; j < i; j++)
+            {
+                delete task[j];
+            }
+            return false;
+        }
+    }
+
+    bool result;
+
+    for (size_t i = 0; i < Shared::ArraySize(task); i++)
+    {
+        if (!task[i]->Start(TestMultiTaskingTaskFunc, nullptr))
+        {
+            for (size_t j = 0; j < i; j++)
+            {
+                task[j]->Wait();
+            }
+            result = false;
+            goto delTasks;
+        }
+    }
+
+    for (size_t i = 0; i < Shared::ArraySize(task); i++)
+    {
+        task[i]->Wait();
+    }
+
+    result = true;
+
+delTasks:
+    for (size_t i = 0; i < Shared::ArraySize(task); i++)
+    {
+        delete task[i];
+    }
+
+    return result;
 }
 
 }

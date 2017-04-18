@@ -18,6 +18,16 @@ public:
 	{
 	}
 
+	void Lock()
+	{
+		SpinLockLock(&RawLock);
+	}
+
+	void Unlock()
+	{
+		SpinLockUnlock(&RawLock);
+	}
+
 	virtual void Lock(ulong& flags) override
 	{
 		flags = GetRflags();

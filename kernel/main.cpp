@@ -46,6 +46,8 @@ void TraceCpuState(ulong cpu)
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
 }
 
+volatile bool PreemptOnWaiting = true;
+
 void ApStartup(void *ctx)
 {
     (void)ctx;
@@ -62,6 +64,17 @@ void ApStartup(void *ctx)
     Idt::GetInstance().Save();
 
     InterruptEnable();
+
+    while (PreemptOnWaiting)
+    {
+        cpu.Idle();
+    }
+
+    if (!TestMultiTasking())
+    {
+        Panic("Mulitasking test failed");
+        return;
+    }
 
     for (;;)
     {
@@ -101,64 +114,6 @@ void Exit()
     Hlt();
 }
 
-void TestTaskFunc(void *ctx)
-{
-    (void)ctx;
-
-    for (size_t i = 0; i < 2; i++)
-    {
-        Trace(0, "Hello from task 0x%p", Task::GetCurrentTask());
-        GetCpu().Sleep(100000000);
-    }
-}
-
-bool TestTask()
-{
-    Task *task[2] = {0};
-    for (size_t i = 0; i < ArraySize(task); i++)
-    {
-        task[i] = new Task();
-        if (task[i] == nullptr)
-        {
-            for (size_t j = 0; j < i; j++)
-            {
-                delete task[j];
-            }
-            return false;
-        }
-    }
-
-    bool result;
-
-    for (size_t i = 0; i < ArraySize(task); i++)
-    {
-        if (!task[i]->Start(TestTaskFunc, nullptr))
-        {
-            for (size_t j = 0; j < i; j++)
-            {
-                task[j]->Wait();
-            }
-            result = false;
-            goto delTasks;
-        }
-    }
-
-    for (size_t i = 0; i < ArraySize(task); i++)
-    {
-        task[i]->Wait();
-    }
-
-    result = true;
-
-delTasks:
-    for (size_t i = 0; i < ArraySize(task); i++)
-    {
-        delete task[i];
-    }
-
-    return result;
-}
-
 void BpStartup(void* ctx)
 {
     (void)ctx;
@@ -191,6 +146,7 @@ void BpStartup(void* ctx)
 
     idt.Save();
     pit.Setup();
+
     InterruptEnable();
 
     if (!cpus.StartAll())
@@ -200,6 +156,7 @@ void BpStartup(void* ctx)
     }
 
     PreemptOn();
+    PreemptOnWaiting = false;
 
     VgaTerm::GetInstance().Printf("IPI test...\n");
 
@@ -214,9 +171,9 @@ void BpStartup(void* ctx)
 
     VgaTerm::GetInstance().Printf("Task test...\n");
 
-    if (!TestTask())
+    if (!TestMultiTasking())
     {
-        Panic("Task test failed");
+        Panic("Mulitasking test failed");
         return;
     }
 

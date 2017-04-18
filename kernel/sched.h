@@ -28,6 +28,10 @@ private:
 
     void Switch(Task* curr, Task* next);
 
+    void Unlock();
+
+    static void Unlock(void* ctx);
+
     using ListEntry = Shared::ListEntry;
     ListEntry TaskList;
     SpinLock Lock;

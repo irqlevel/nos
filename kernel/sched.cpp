@@ -16,6 +16,17 @@ TaskQueue::TaskQueue()
     ScheduleCounter.Set(0);
 }
 
+void TaskQueue::Unlock()
+{
+    Lock.Unlock();
+    InterruptEnable();
+}
+
+void TaskQueue::Unlock(void* ctx)
+{
+    static_cast<TaskQueue*>(ctx)->Unlock();
+}
+
 void TaskQueue::Switch(Task* next, Task* curr)
 {
     SwitchContextCounter.Inc();
@@ -32,23 +43,32 @@ void TaskQueue::Switch(Task* next, Task* curr)
     BugOn(next->State.Get() == Task::StateExited);
     next->State.Set(Task::StateRunning);
     next->RunStartTime = now;
-    SwitchContext(next->Rsp, &curr->Rsp);
+
+    SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::Unlock, this);
 }
 
 void TaskQueue::Schedule()
 {
+    BugOn(!IsInterruptEnabled());
+
     ScheduleCounter.Inc();
 
     if (unlikely(!PreemptIsOn()))
+    {
         return;
+    }
 
-    Task* curr = Task::GetCurrentTask();
+    Task *curr = Task::GetCurrentTask();
     if (curr->PreemptDisableCounter.Get() != 0)
+    {
         return;
+    }
+
+    InterruptDisable();
+    Lock.Lock();
 
     Task* next = nullptr;
-    {
-        Shared::AutoLock lock(Lock);
+    do {
         Shared::AutoLock lock2(curr->Lock);
 
         BugOn(TaskList.IsEmpty());
@@ -60,20 +80,24 @@ void TaskQueue::Schedule()
             Task* cand = CONTAINING_RECORD(currEntry, Task, ListEntry);
             if (cand == curr)
             {
+                BugOn(cand->State.Get() == Task::StateExited);
                 cand->ListEntry.Remove();
                 TaskList.InsertTail(&cand->ListEntry);
-                return;
+                break;
             }
 
             if (cand->PreemptDisableCounter.Get() != 0)
+            {
                 continue;
-
+            }
             next = cand;
             break;
         }
 
         if (next == nullptr)
-            return;
+        {
+            break;
+        }
 
         Shared::AutoLock lock3(next->Lock);
         next->ListEntry.Remove();
@@ -84,9 +108,16 @@ void TaskQueue::Schedule()
             TaskList.InsertTail(&curr->ListEntry);
         }
         TaskList.InsertTail(&next->ListEntry);
+
+    } while (false);
+
+    if (next != nullptr)
+    {
+        Switch(next, curr);
+        return;
     }
 
-    Switch(next, curr);
+    Unlock();
 }
 
 void TaskQueue::Insert(Task* task)

@@ -19,7 +19,6 @@ Task::Task()
 {
     RefCounter.Set(1);
     ListEntry.Init();
-    PreemptDisableCounter.Set(0);
     Name[0] = '\0';
 }
 
@@ -77,6 +76,8 @@ bool Task::IsStopping()
 
 void Task::Exit()
 {
+    BugOn(this != GetCurrentTask());
+
     PreemptDisable();
 
     class TaskQueue *tq = TaskQueue;
@@ -97,6 +98,7 @@ void Task::Exit()
 
 void Task::ExecCallback()
 {
+    BugOn(this != GetCurrentTask());
     StartTime = GetBootTime();
     Function(Ctx);
     Exit();

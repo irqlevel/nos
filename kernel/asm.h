@@ -47,7 +47,7 @@ void Hlt(void);
 
 void SetRsp(ulong newValue);
 
-void SwitchContext(ulong nextRsp, ulong* currRsp);
+void SwitchContext(ulong nextRsp, ulong* currRsp, void (*callback)(void* ctx), void* ctx);
 
 void AtomicInc(volatile long *pvalue);
 void AtomicDec(volatile long *pvalue);
@@ -128,5 +128,10 @@ private:
     Context& operator=(const Context& other) = delete;
     Context& operator=(Context&& other) = delete;
 };
+
+static inline bool IsInterruptEnabled()
+{
+    return (GetRflags() & 0x200) ? true : false;
+}
 
 }

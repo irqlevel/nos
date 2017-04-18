@@ -55,6 +55,8 @@ InterruptHandlerFn Pit::GetHandlerFn()
 
 void Pit::Interrupt(Context* ctx)
 {
+    InterruptEnable();
+
     (void)ctx;
 
     {

@@ -4,7 +4,7 @@
 namespace Kernel
 {
 
-volatile bool DebugWaitActive;
+volatile bool DebugWaitActive = false;
 
 void DebugWait()
 {

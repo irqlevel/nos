@@ -300,7 +300,10 @@ SwitchContext:
 	mov rax, rsp
 	mov rsp, rdi
 	mov [rsi], rax
+	mov rdi, rcx
+	call rdx ; call callback
 	PopAll
+	sti
 	ret
 
 AtomicInc:
@@ -336,7 +339,7 @@ AtomicTestAndSetBit:
 
 AtomicTestBit:
 	xor rax, rax
-	lock bt qword [rdi], rsi
+	bt qword [rdi], rsi
 	jnc .return
 	inc rax
 .return

@@ -13,7 +13,7 @@ namespace Kernel
 Cpu::Cpu()
     : Index(0)
     , State(0)
-{ 
+{
 }
 
 ulong Cpu::GetIndex()
@@ -26,7 +26,7 @@ void Cpu::Idle()
     if (BugOn(!(State & StateRunning)))
         return;
 
-    if (BugOn(!(GetRflags() & 0x200))) //check interrupt flag is on
+    if (BugOn(!IsInterruptEnabled()))
         return;
 
     Hlt();
@@ -61,6 +61,8 @@ void Cpu::Init(ulong index)
 
     Index = index;
     State |= StateInited;
+
+    Trace(0, "Cpu 0x%p %u inited", this, Index);
 }
 
 Cpu::~Cpu()
@@ -231,6 +233,9 @@ void CpuTable::SendIPIAllExclude(ulong excludeIndex)
 
 void Cpu::IPI(Context* ctx)
 {
+    InterruptEnable();
+    Lapic::EOI(CpuTable::IPIVector);
+
     (void)ctx;
 
     IPIConter.Inc();
@@ -247,12 +252,11 @@ void Cpu::IPI(Context* ctx)
     {
         Trace(0, "Cpu %u exited, state 0x%p, IPI count %u",
             Index, State, IPIConter.Get());
+
         InterruptDisable();
-        Lapic::EOI(CpuTable::IPIVector);
         Hlt();
         return;
     }
-    Lapic::EOI(CpuTable::IPIVector);
 
     Schedule();
 }
