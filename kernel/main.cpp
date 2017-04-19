@@ -20,6 +20,7 @@
 #include <mm/new.h>
 #include <mm/page_allocator.h>
 #include <mm/memory_map.h>
+#include <mm/allocator.h>
 
 #include <drivers/8042.h>
 #include <drivers/vga.h>
@@ -234,6 +235,8 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
         Panic("Can't setup page allocator");
         break;
     }
+
+    AllocatorImpl::GetInstance(PageAllocatorImpl::GetInstance());
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
 

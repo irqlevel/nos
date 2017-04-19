@@ -51,7 +51,7 @@ private:
     ulong Index;
     ulong State;
     SpinLock Lock;
-    Task Task;
+    Task* Task;
     TaskQueue TaskQueue;
     Atomic IPIConter;
 };

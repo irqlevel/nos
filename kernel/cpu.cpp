@@ -13,6 +13,7 @@ namespace Kernel
 Cpu::Cpu()
     : Index(0)
     , State(0)
+    , Task(nullptr)
 {
 }
 
@@ -67,6 +68,13 @@ void Cpu::Init(ulong index)
 
 Cpu::~Cpu()
 {
+    TaskQueue.Clear();
+
+    if (Task != nullptr)
+    {
+        Task->Put();
+        Task = nullptr;
+    }
 }
 
 CpuTable::CpuTable()
@@ -328,8 +336,13 @@ ulong CpuTable::GetRunningCpus()
 
 bool Cpu::Run(Task::Func func, void *ctx)
 {
-    Task.SetName("cpu%u", Index);
-    return Task.Run(TaskQueue, func, ctx);
+    Task = new class Task("idle%u", Index);
+    if (Task == nullptr)
+    {
+        return false;
+    }
+
+    return Task->Run(TaskQueue, func, ctx);
 }
 
 }

@@ -58,8 +58,6 @@ public:
     Task();
     Task(const char* fmt, ...);
 
-    ~Task();
-
     bool Run(class TaskQueue& taskQueue, Func func, void* ctx);
 
     static Task* GetCurrentTask();
@@ -106,6 +104,7 @@ private:
     Task(Task&& other) = delete;
     Task& operator=(const Task& other) = delete;
     Task& operator=(Task&& other) = delete;
+    ~Task();
 
     void Release();
     void Exit();

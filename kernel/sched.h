@@ -20,6 +20,8 @@ public:
 
     void Schedule();
 
+    void Clear();
+
 private:
     TaskQueue(const TaskQueue &other) = delete;
     TaskQueue(TaskQueue&& other) = delete;

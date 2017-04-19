@@ -149,13 +149,16 @@ void TaskQueue::Remove(Task* task)
     task->Put();
 }
 
-TaskQueue::~TaskQueue()
+void TaskQueue::Clear()
 {
     Shared::ListEntry taskList;
     {
         Shared::AutoLock lock(Lock);
         taskList.MoveTailList(&TaskList);
     }
+
+    if (taskList.IsEmpty())
+        return;
 
     while (!taskList.IsEmpty())
     {
@@ -168,7 +171,11 @@ TaskQueue::~TaskQueue()
 
     Trace(0, "TaskQueue 0x%p counters: sched %u switch context %u",
         this, ScheduleCounter.Get(), SwitchContextCounter.Get());
+}
 
+TaskQueue::~TaskQueue()
+{
+    Clear();
 }
 
 }

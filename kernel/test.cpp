@@ -280,7 +280,7 @@ bool TestMultiTasking()
         {
             for (size_t j = 0; j < i; j++)
             {
-                delete task[j];
+                task[j]->Put();
             }
             return false;
         }
@@ -311,7 +311,7 @@ bool TestMultiTasking()
 delTasks:
     for (size_t i = 0; i < Shared::ArraySize(task); i++)
     {
-        delete task[i];
+        task[i]->Put();
     }
 
     return result;

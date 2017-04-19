@@ -22,7 +22,7 @@ Cmd::~Cmd()
 {
     if (Task != nullptr)
     {
-        delete Task;
+        Task->Put();
         Task = nullptr;
     }
 }
@@ -117,7 +117,7 @@ bool Cmd::Start()
 
     if (Task != task)
     {
-        delete task;
+        task->Put();
         return false;
     }
 
@@ -128,7 +128,7 @@ bool Cmd::Start()
             task = Task;
             Task = nullptr;
         }
-        delete task;
+        task->Put();
         return false;
     }
 

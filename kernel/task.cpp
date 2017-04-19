@@ -33,7 +33,6 @@ Task::Task(const char* fmt, ...)
 
 Task::~Task()
 {
-    Put();
     BugOn(TaskQueue != nullptr);
     BugOn(Stack != nullptr);
 }
@@ -61,6 +60,7 @@ void Task::Put()
     if (RefCounter.DecAndTest())
     {
         Release();
+        delete this;
     }
 }
 
