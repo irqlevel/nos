@@ -159,7 +159,7 @@ bool CpuTable::StartAll()
         }
     }
 
-    Pit::GetInstance().Wait(10 * 1000000); // 10ms
+    Pit::GetInstance().Wait(10 * Shared::NanoSecsInMs); // 10ms
 
     {
         Shared::AutoLock lock(Lock);
@@ -172,7 +172,7 @@ bool CpuTable::StartAll()
         }
     }
 
-    Pit::GetInstance().Wait(100 * 1000000); // 100ms
+    Pit::GetInstance().Wait(100 * Shared::NanoSecsInMs); // 100ms
 
     {
         Shared::AutoLock lock(Lock);

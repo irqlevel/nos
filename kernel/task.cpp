@@ -113,7 +113,7 @@ void Task::Wait()
 {
     while (State.Get() != StateExited)
     {
-        GetCpu().Sleep(1000000);
+        GetCpu().Sleep(1 * Shared::NanoSecsInMs);
     }
 }
 
