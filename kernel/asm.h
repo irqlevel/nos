@@ -46,6 +46,7 @@ void InterruptDisable(void);
 void Hlt(void);
 
 void SetRsp(ulong newValue);
+u64 ReadTsc();
 
 void SwitchContext(ulong nextRsp, ulong* currRsp, void (*callback)(void* ctx), void* ctx);
 

@@ -20,6 +20,9 @@ Pit::Pit()
     , TickMs(0)
     , TickMsNs(0)
     , ReloadValue(0)
+    , StartTsc(0)
+    , PrevTsc(0)
+    , TickTsc(0)
 {
 }
 
@@ -40,6 +43,7 @@ void Pit::Setup()
     Outb(ModePort, 0b00110100); //channel 0, lobyte/hibyte, rate generator
     Outb(Channel0Port, Shared::LowPart(ReloadValue));
     Outb(Channel0Port, Shared::HighPart(ReloadValue));
+    PrevTsc = StartTsc = ReadTsc();
 }
 
 void Pit::OnInterruptRegister(u8 irq, u8 vector)
@@ -55,12 +59,24 @@ InterruptHandlerFn Pit::GetHandlerFn()
 
 void Pit::Interrupt(Context* ctx)
 {
-    InterruptEnable();
-
     (void)ctx;
+    InterruptEnable();
+    Lapic::EOI(IntVector);
 
     {
         Shared::AutoLock lock(Lock);
+
+        u64 tsc = ReadTsc();
+        if (tsc > PrevTsc)
+        {
+            u64 newTickTsc = tsc - PrevTsc;
+            if (newTickTsc > TickTsc)
+            {
+                TickTsc = newTickTsc;
+            }
+        }
+
+        PrevTsc = tsc;
 
         TimeMs += TickMs;
         TimeMsNs += TickMsNs;
@@ -70,8 +86,6 @@ void Pit::Interrupt(Context* ctx)
             TimeMs += 1;
         }
     }
-
-    Lapic::EOI(IntVector);
 
     TimerTable::GetInstance().ProcessTimers();
 
@@ -84,9 +98,21 @@ void Pit::Interrupt(Context* ctx)
 
 Shared::Time Pit::GetTime()
 {
+    u64 tsc = ReadTsc();
+
     Shared::AutoLock lock(Lock);
 
-    return TimeMs * Shared::NanoSecsInMs + TimeMsNs;
+    Shared::Time time(TimeMs * Shared::NanoSecsInMs + TimeMsNs);
+
+    if (TickTsc != 0)
+    {
+        if (tsc > PrevTsc)
+        {
+            time += ((TickMs * Shared::NanoSecsInMs + TickMsNs) * (tsc - PrevTsc)) / TickTsc;
+        }
+    }
+
+    return time;
 }
 
 extern "C" void PitInterrupt(Context* ctx)

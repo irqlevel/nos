@@ -60,6 +60,7 @@ global InterruptEnable
 global InterruptDisable
 global Hlt
 global SetRsp
+global ReadTsc
 global SwitchContext
 
 global AtomicInc
@@ -251,6 +252,13 @@ SetRsp:
 	mov rax, [rsp] ; save return address
 	mov rsp, rdi
 	push rax
+	ret
+
+ReadTsc:
+	rdtsc; result in edx:eax
+	shl rdx, 32
+	mov edx, eax
+	mov rax, rdx
 	ret
 
 %macro PushAll 0

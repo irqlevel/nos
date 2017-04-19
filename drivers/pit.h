@@ -54,6 +54,9 @@ private:
     ulong TickMsNs;
     u16 ReloadValue;
 
+    u64 StartTsc;
+    u64 PrevTsc;
+    u64 TickTsc;
     SpinLock Lock;
 };
 
