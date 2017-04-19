@@ -30,9 +30,9 @@ private:
 
     void Switch(Task* curr, Task* next);
 
-    void Unlock();
+    void SwitchComplete(Task* curr);
 
-    static void Unlock(void* ctx);
+    static void SwitchComplete(void* ctx);
 
     using ListEntry = Shared::ListEntry;
     ListEntry TaskList;

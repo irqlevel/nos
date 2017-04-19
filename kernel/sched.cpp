@@ -16,15 +16,20 @@ TaskQueue::TaskQueue()
     ScheduleCounter.Set(0);
 }
 
-void TaskQueue::Unlock()
+void TaskQueue::SwitchComplete(Task* curr)
 {
+    Task* prev = curr->Prev;
+    curr->Prev = nullptr;
+    curr->Lock.Unlock();
+    prev->Lock.Unlock();
     Lock.Unlock();
-    InterruptEnable();
+    //InterruptEnable(); //sti is at the end of SwitchContext()
 }
 
-void TaskQueue::Unlock(void* ctx)
+void TaskQueue::SwitchComplete(void* ctx)
 {
-    static_cast<TaskQueue*>(ctx)->Unlock();
+    Task* curr = static_cast<Task*>(ctx);
+    curr->TaskQueue->SwitchComplete(curr);
 }
 
 void TaskQueue::Switch(Task* next, Task* curr)
@@ -32,10 +37,12 @@ void TaskQueue::Switch(Task* next, Task* curr)
     SwitchContextCounter.Inc();
 
     BugOn(curr == next);
+    BugOn(next->Prev != nullptr);
     BugOn(next->Rsp == 0);
 
     if (curr->State.Get() != Task::StateExited)
         curr->State.Set(Task::StateWaiting);
+
     curr->ContextSwitches.Inc();
     auto now = GetBootTime();
     curr->Runtime += (now - curr->RunStartTime);
@@ -43,8 +50,8 @@ void TaskQueue::Switch(Task* next, Task* curr)
     BugOn(next->State.Get() == Task::StateExited);
     next->State.Set(Task::StateRunning);
     next->RunStartTime = now;
-
-    SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::Unlock, this);
+    next->Prev = curr;
+    SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
 
 void TaskQueue::Schedule()
@@ -69,7 +76,7 @@ void TaskQueue::Schedule()
 
     Task* next = nullptr;
     do {
-        Shared::AutoLock lock2(curr->Lock);
+        curr->Lock.Lock();
 
         BugOn(TaskList.IsEmpty());
 
@@ -99,7 +106,7 @@ void TaskQueue::Schedule()
             break;
         }
 
-        Shared::AutoLock lock3(next->Lock);
+        next->Lock.Lock();
         next->ListEntry.Remove();
         if (curr->TaskQueue != nullptr)
         {
@@ -111,13 +118,16 @@ void TaskQueue::Schedule()
 
     } while (false);
 
-    if (next != nullptr)
+    if (next == nullptr)
+    {
+        curr->Lock.Unlock();
+        Lock.Unlock();
+        InterruptEnable();
+    }
+    else
     {
         Switch(next, curr);
-        return;
     }
-
-    Unlock();
 }
 
 void TaskQueue::Insert(Task* task)

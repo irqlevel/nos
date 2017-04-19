@@ -99,6 +99,8 @@ public:
     Shared::Time StartTime;
     Shared::Time ExitTime;
 
+    Task* Prev;
+
 private:
     Task(const Task& other) = delete;
     Task(Task&& other) = delete;

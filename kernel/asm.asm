@@ -304,12 +304,14 @@ ReadTsc:
 SwitchContext:
 	;rdi = nextTask->Rsp
 	;rsi = &currTask->Rsp
+	;rdx = complete callback
+	;rcx = complete callback ctx
 	PushAll
 	mov rax, rsp
 	mov rsp, rdi
 	mov [rsi], rax
 	mov rdi, rcx
-	call rdx ; call callback
+	call rdx ; call complete callback
 	PopAll
 	sti
 	ret
