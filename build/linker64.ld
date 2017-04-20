@@ -15,6 +15,7 @@ SECTIONS
 	}
 
 	. = 0xFFFF800001000000;
+	KernelStart = .;
 
 	.multiboot : AT (ADDR (.multiboot) - 0xFFFF800000000000) {
 		*(.multiboot)

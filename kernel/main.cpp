@@ -21,6 +21,7 @@
 #include <mm/page_allocator.h>
 #include <mm/memory_map.h>
 #include <mm/allocator.h>
+#include <mm/page_table.h>
 
 #include <drivers/8042.h>
 #include <drivers/vga.h>
@@ -52,6 +53,8 @@ volatile bool PreemptOnWaiting = true;
 void ApStartup(void *ctx)
 {
     (void)ctx;
+
+    SetCr3(PageTable::GetInstance().GetRoot());
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
 
@@ -206,31 +209,43 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 
     Tracer::GetInstance().SetLevel(1);
 
-    auto& mmap = MemoryMap::GetInstance();
-    Trace(0, "Enter rflags 0x%p KernelSpace 0x%p KernelEnd 0x%p",
-        GetRflags(), mmap.GetKernelSpaceBase(), mmap.GetKernelEnd());
-
     VgaTerm::GetInstance().Printf("Hello!\n");
 
     Grub::ParseMultiBootInfo(MbInfo);
 
+    auto& mmap = MemoryMap::GetInstance();
+    Trace(0, "Enter kernel: start 0x%p end 0x%p",
+        mmap.GetKernelStart(), mmap.GetKernelEnd());
+
+    auto& pt = PageTable::GetInstance();
+    if (!pt.Setup())
+    {
+        Panic("Can't setup paging");
+        break;
+    }
+
+    Trace(0, "Paging root 0x%p old cr3 0x%p", pt.GetRoot(), GetCr3());
+
+    SetCr3(pt.GetRoot());
+
+    Trace(0, "Set new cr3 0x%p", GetCr3());
+
     ulong memStart, memEnd;
-    if (mmap.GetKernelEnd() <= (mmap.GetKernelSpaceBase() + MB))
+    if (mmap.GetKernelEnd() <= pt.PhysToVirt(MB))
     {
         Panic("Kernel end is lower than kernel space base");
         break;
     }
 
-    //boot64.asm only setup paging for first 4GB
-    if (!mmap.FindRegion(mmap.GetKernelEnd() - mmap.GetKernelSpaceBase(), 4 * GB, memStart, memEnd))
+    //Since paging only setup for first 4GB use only first 4GB
+    if (!mmap.FindRegion(pt.VirtToPhys(mmap.GetKernelEnd()), 4 * GB, memStart, memEnd))
     {
         Panic("Can't get available memory region");
         break;
     }
 
     Trace(0, "Memory region 0x%p 0x%p", memStart, memEnd);
-    if (!PageAllocatorImpl::GetInstance().Setup(mmap.GetKernelSpaceBase() + memStart,
-                                                mmap.GetKernelSpaceBase() + memEnd))
+    if (!PageAllocatorImpl::GetInstance().Setup(pt.PhysToVirt(memStart), pt.PhysToVirt(memEnd)))
     {
         Panic("Can't setup page allocator");
         break;

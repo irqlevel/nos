@@ -19,13 +19,14 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
         tag->Type != MultiBootTagTypeEnd;
         tag = reinterpret_cast<MultiBootTag*>(Shared::MemAdd(tag, (tag->Size + 7) & ~7)))
     {
-        Trace(0, "Tag %u Size %u", tag->Type, tag->Size);
+        Trace(0, "Tag %u Size %u", (ulong)tag->Type, (ulong)tag->Size);
         switch (tag->Type)
         {
         case MultiBootTagTypeBootDev:
         {
             MultiBootTagBootDev* bdev = reinterpret_cast<MultiBootTagBootDev*>(tag);
-            Trace(0, "Boot dev %u %u %u %u", (ulong)bdev->BiosDev, (ulong)bdev->Slice, (ulong)bdev->Part);
+            Trace(0, "Boot dev 0x%p 0x%p 0x%p",
+                (ulong)bdev->BiosDev, (ulong)bdev->Slice, (ulong)bdev->Part);
             break;
         }
         case MultiBootTagTypeMmap:
@@ -37,7 +38,7 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
                  Shared::MemAdd(entry, mmap->EntrySize) <= Shared::MemAdd(mmap, mmap->Size);
                  entry = reinterpret_cast<MultiBootMmapEntry*>(Shared::MemAdd(entry, mmap->EntrySize)))
             {
-                Trace(0, "Mmap addr %p len %p type %u",
+                Trace(0, "Mmap addr 0x%p len 0x%p type %u",
                     entry->Addr, entry->Len, (ulong)entry->Type);
 
                 if (!Kernel::MemoryMap::GetInstance().AddRegion(entry->Addr, entry->Len, entry->Type))

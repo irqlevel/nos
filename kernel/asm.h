@@ -13,6 +13,8 @@ ulong GetCr2(void);
 ulong GetCr3(void);
 ulong GetCr4(void);
 
+void SetCr3(ulong addr);
+
 ulong GetRsp(void);
 ulong GetRip(void);
 
@@ -95,6 +97,12 @@ void ExcControlProtectionStub();
 #endif
 
 #define Barrier() __asm__ __volatile__("": : :"memory")
+
+static inline void Invlpg(void* m)
+{
+    /* Clobber memory to avoid optimizer re-ordering access before invlpg, which may cause nasty bugs. */
+    asm volatile ( "invlpg (%0)" : : "b"(m) : "memory" );
+}
 
 namespace Kernel
 {

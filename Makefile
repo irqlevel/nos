@@ -46,6 +46,7 @@ CXX_SRC =   \
     mm/allocator.cpp   \
     mm/page_allocator.cpp  \
     mm/pool.cpp    \
+    mm/page_table.cpp \
 
 ASM_SRC =    \
     boot/boot64.asm \

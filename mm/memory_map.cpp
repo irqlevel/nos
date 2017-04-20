@@ -3,6 +3,7 @@
 #include <lib/stdlib.h>
 
 extern "C" char KernelEnd;
+extern "C" char KernelStart;
 
 namespace Kernel
 {
@@ -72,15 +73,32 @@ MemoryMap::~MemoryMap()
 {
 }
 
-
-ulong MemoryMap::GetKernelSpaceBase()
+ulong MemoryMap::GetKernelStart()
 {
-    return KernelSpaceBase;
+    return Shared::RoundDown((ulong)&KernelStart, Shared::PageSize);
 }
 
 ulong MemoryMap::GetKernelEnd()
 {
     return Shared::RoundUp((ulong)&KernelEnd, Shared::PageSize);
+}
+
+
+size_t MemoryMap::GetRegionCount()
+{
+    return Size;
+}
+
+bool MemoryMap::GetRegion(size_t index, u64& addr, u64& len, u32& type)
+{
+    if (index >= Size)
+        return false;
+
+    auto& region = Region[index];
+    addr = region.Addr;
+    len = region.Len;
+    type = region.Type;
+    return true;
 }
 
 }

@@ -36,6 +36,7 @@ global GetCr1
 global GetCr2
 global GetCr3
 global GetCr4
+global SetCr3
 global GetRsp
 global GetRip
 global GetRflags
@@ -61,6 +62,7 @@ global InterruptDisable
 global Hlt
 global SetRsp
 global ReadTsc
+
 global SwitchContext
 
 global AtomicInc
@@ -115,6 +117,10 @@ GetCr2:
 
 GetCr3:
 	mov rax, cr3
+	ret
+
+SetCr3:
+	mov cr3, rdi
 	ret
 
 GetCr4:

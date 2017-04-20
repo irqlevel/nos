@@ -251,7 +251,7 @@ void ExceptionTable::ExcPageFault(Context* ctx)
 
     ExcPageFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0xp cr3 0xp",
+    Trace(ExcLL, "EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0x%p cr3 0x%p",
         CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp,
         GetCr2(), GetCr3());
 }
