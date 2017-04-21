@@ -155,7 +155,7 @@ void BpStartup(void* ctx)
     idt.Save();
     pit.Setup();
 
-    //PageTable::GetInstance().UnmapNull();
+    PageTable::GetInstance().UnmapNull();
 
     InterruptEnable();
 

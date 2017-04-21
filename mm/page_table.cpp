@@ -114,7 +114,7 @@ bool PageTable::Setup()
 void PageTable::UnmapNull()
 {
     P2UserPage[0].Entry[0].Value = 0;
-    //Invlpg(0);
+    Invlpg(0);
 }
 
 ulong PageTable::GetRoot()

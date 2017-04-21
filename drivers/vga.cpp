@@ -1,12 +1,13 @@
 #include "vga.h"
 #include <kernel/asm.h>
 #include <lib/stdlib.h>
+#include <mm/page_table.h>
 
 namespace Kernel
 {
 
 VgaTerm::VgaTerm()
-    : Buf(reinterpret_cast<u16*>(BufAddr))
+    : Buf(reinterpret_cast<u16*>(PageTable::GetInstance().PhysToVirt(BufAddr)))
     , Row(0)
     , Column(0)
     , Width(80)
