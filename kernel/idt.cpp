@@ -28,7 +28,7 @@ void Idt::Save()
         .Limit = sizeof(Entry),
     };
 
-    PutIdt(&desc);
+    LoadIdt(&desc);
 
     Base = desc.Base;
     Limit = desc.Limit;

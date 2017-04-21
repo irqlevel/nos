@@ -111,6 +111,12 @@ bool PageTable::Setup()
     return true;
 }
 
+void PageTable::UnmapNull()
+{
+    P2UserPage[0].Entry[0].Value = 0;
+    //Invlpg(0);
+}
+
 ulong PageTable::GetRoot()
 {
     return VirtToPhys((ulong)&P4Page);

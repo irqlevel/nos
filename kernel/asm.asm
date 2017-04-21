@@ -48,9 +48,10 @@ global GetSs
 global GetEs
 global GetFs
 global GetGs
-global GetIdt
-global PutIdt
-global GetGdt
+global LoadIdt
+global StoreIdt
+global LoadGdt
+global StoreGdt
 global SpinLockLock
 global SpinLockUnlock
 global Outb
@@ -181,16 +182,20 @@ GetGs:
 	mov ax, gs
 	ret
 
-GetIdt:
+StoreIdt:
 	sidt [rdi]
 	ret
 
-PutIdt:
+LoadIdt:
 	lidt [rdi]
 	ret
 
-GetGdt:
+StoreGdt:
 	sgdt [rdi]
+	ret
+
+LoadGdt:
+	lgdt [rdi]
 	ret
 
 SpinLockLock:

@@ -29,6 +29,8 @@ CXX_SRC =   \
     kernel/panic.cpp    \
     kernel/debug.cpp    \
     kernel/atomic.cpp   \
+    kernel/gdt.cpp  \
+    kernel/gdt_descriptor.cpp   \
     kernel/idt_descriptor.cpp   \
     kernel/idt.cpp  \
     kernel/cpu.cpp  \

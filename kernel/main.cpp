@@ -2,6 +2,7 @@
 #include "panic.h"
 #include "debug.h"
 #include "atomic.h"
+#include "gdt.h"
 #include "idt.h"
 #include "test.h"
 #include "exception.h"
@@ -54,11 +55,7 @@ void ApStartup(void *ctx)
 {
     (void)ctx;
 
-    SetCr3(PageTable::GetInstance().GetRoot());
-
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
-
-    cpu.SetRunning();
 
     Trace(0, "Cpu %u running rflags 0x%p task 0x%p",
         cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
@@ -67,7 +64,11 @@ void ApStartup(void *ctx)
 
     Idt::GetInstance().Save();
 
+    SetCr3(PageTable::GetInstance().GetRoot());
+
     InterruptEnable();
+
+    cpu.SetRunning();
 
     while (PreemptOnWaiting)
     {
@@ -88,6 +89,9 @@ void ApStartup(void *ctx)
 
 extern "C" void ApMain()
 {
+    Gdt::GetInstance().Save();
+    Idt::GetInstance().Save();
+
     Lapic::Enable();
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
@@ -151,6 +155,8 @@ void BpStartup(void* ctx)
     idt.Save();
     pit.Setup();
 
+    //PageTable::GetInstance().UnmapNull();
+
     InterruptEnable();
 
     if (!cpus.StartAll())
@@ -206,6 +212,9 @@ void BpStartup(void* ctx)
 extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 {
     do {
+
+    Gdt::GetInstance().Save();
+    Idt::GetInstance().Save();
 
     Tracer::GetInstance().SetLevel(1);
 

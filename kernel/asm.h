@@ -30,9 +30,11 @@ ulong GetEs(void);
 ulong GetFs(void);
 ulong GetGs(void);
 
-void GetIdt(void *result);
-void PutIdt(void *result);
-void GetGdt(void *result);
+void StoreIdt(void *dest);
+void LoadIdt(void *src);
+
+void StoreGdt(void *dest);
+void LoadGdt(void *src);
 
 void SpinLockLock(ulong *lock);
 void SpinLockUnlock(ulong *lock);

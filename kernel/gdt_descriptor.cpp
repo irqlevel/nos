@@ -1,8 +1,12 @@
 #include "gdt_descriptor.h"
-#include "stdlib.h"
 
 namespace Kernel
 {
+
+GdtDescriptor::GdtDescriptor()
+	: Value(0)
+{
+}
 
 GdtDescriptor::GdtDescriptor(u64 value)
     : Value(value)
@@ -60,6 +64,11 @@ u8 GdtDescriptor::GetAccess()
 u64 GdtDescriptor::GetValue()
 {
     return Value;
+}
+
+void GdtDescriptor::SetValue(u64 value)
+{
+	Value = value;
 }
 
 GdtDescriptor GdtDescriptor::Encode(u32 base, u32 limit, u8 flag, u8 access)

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <include/types.h>
+#include <lib/stdlib.h>
 
 namespace Kernel
 {
@@ -8,6 +8,7 @@ namespace Kernel
 class GdtDescriptor final
 {
 public:
+    GdtDescriptor();
     GdtDescriptor(u64 value);
     ~GdtDescriptor();
 
@@ -17,6 +18,8 @@ public:
     u8 GetAccess();
 
     u64 GetValue();
+
+    void SetValue(u64 value);
 
     static GdtDescriptor Encode(u32 base, u32 limit, u8 flag, u8 access);
 

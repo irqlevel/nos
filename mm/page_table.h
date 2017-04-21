@@ -24,6 +24,8 @@ public:
 
     ulong GetRoot();
 
+    void UnmapNull();
+
 private:
     PageTable(const PageTable& other) = delete;
     PageTable(PageTable&& other) = delete;
@@ -88,7 +90,11 @@ private:
 
         static const ulong PresentBit = 0;
         static const ulong WritableBit = 1;
+        static const ulong UserBit = 2;
+        static const ulong WriteThrough = 3;
         static const ulong CacheDisabledBit = 4;
+        static const ulong AccessedBit = 5;
+        static const ulong DirtyBit = 6;
         static const ulong HugeBit = 7;
     };
 

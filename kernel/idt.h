@@ -45,7 +45,7 @@ private:
 	    u64 Base;
     } __attribute((packed));
 
-    u32 Base;
+    u64 Base;
     u16 Limit;
 
     IdtDescriptor Entry[256];

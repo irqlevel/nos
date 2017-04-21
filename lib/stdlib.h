@@ -238,9 +238,7 @@ static inline u8 LowPart(u16 value)
 
 static inline size_t RoundDown(size_t value, size_t align)
 {
-    size_t i = value / align;
-    return ((value % align) == 0) ? value :
-                                    ((i == 0) ? 0 : (i - 1) * align);
+    return (value / align) * align;
 }
 
 static inline size_t RoundUp(size_t value, size_t align)
