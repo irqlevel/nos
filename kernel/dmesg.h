@@ -3,35 +3,31 @@
 #include "spin_lock.h"
 
 #include <lib/stdlib.h>
-#include <lib/ring_buffer.h>
 #include <lib/printer.h>
+#include <mm/block_allocator.h>
 
 namespace Kernel
 {
 
 struct DmesgMsg final
 {
-    char Str[256];
-
-    DmesgMsg& operator=(const DmesgMsg& other)
-    {
-        if (this != &other)
-        {
-            Shared::MemCpy(Str, other.Str, sizeof(other.Str));
-        }
-        return *this;
-    }
+    char Str[256 - sizeof(Shared::ListEntry)];
+    Shared::ListEntry ListEntry;
 };
 
-class Dmesg final : public Shared::TypePrinter<DmesgMsg>
+static_assert(sizeof(DmesgMsg) == 256, "Invalid size");
+
+class Dmesg final
 {
 public:
 
     static Dmesg& GetInstance()
     {
-        static Dmesg instance;
-        return instance;
+        static Dmesg Instance;
+        return Instance;
     }
+
+    bool Setup();
 
     void VPrintf(const char *fmt, va_list args);
     void Printf(const char *fmt, ...);
@@ -39,22 +35,24 @@ public:
 
     void Dump(Shared::Printer& printer);
 
-    void PrintElement(const DmesgMsg& element) override;
-
 private:
     Dmesg();
     ~Dmesg();
-
-    void AppendMsg(const DmesgMsg& msg);
 
     Dmesg(const Dmesg& other) = delete;
     Dmesg(Dmesg&& other) = delete;
     Dmesg& operator=(const Dmesg& other) = delete;
     Dmesg& operator=(Dmesg&& other) = delete;
 
-    Shared::RingBuffer<DmesgMsg, 1000> MsgBuf;
+    char Buf[32 * Shared::PageSize]  __attribute__((aligned(sizeof(DmesgMsg))));
+
+    BlockAllocatorImpl MsgBuf;
+
+    Shared::ListEntry MsgList;
+
     SpinLock Lock;
-    Shared::Printer* Printer;
+
+    volatile bool Active;
 };
 
 }

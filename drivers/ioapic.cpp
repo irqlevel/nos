@@ -1,8 +1,10 @@
 #include "ioapic.h"
 #include "acpi.h"
 
+#include <kernel/asm.h>
 #include <kernel/trace.h>
 #include <mm/mmio.h>
+#include <lib/lock.h>
 
 namespace Kernel
 {
@@ -21,7 +23,7 @@ IoApic::~IoApic()
 
 u32 IoApic::ReadRegister(u8 reg)
 {
-    SpinLock lock(OpLock);
+    Shared::AutoLock lock(OpLock);
 
     MmIo::Write32(Shared::MemAdd(BaseAddress, RegSel), reg);
 
@@ -32,7 +34,7 @@ u32 IoApic::ReadRegister(u8 reg)
 
 void IoApic::WriteRegister(u8 reg, u32 value)
 {
-    SpinLock lock(OpLock);
+    Shared::AutoLock lock(OpLock);
 
     MmIo::Write32(Shared::MemAdd(BaseAddress, RegSel), reg);
 

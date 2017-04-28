@@ -85,6 +85,11 @@ struct Time
         return (NanoSecs >= other.NanoSecs) ? true : false;
     }
 
+    bool operator>(const Time& other) const
+    {
+        return (NanoSecs > other.NanoSecs) ? true : false;
+    }
+
     ulong GetSecs()
     {
         return NanoSecs / NanoSecsInSec;

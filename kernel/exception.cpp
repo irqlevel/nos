@@ -85,7 +85,7 @@ ExceptionTable::ExceptionTable()
     return;
 
 error:
-    Panic("Can't setup exception handler");
+    Panic("EXC: Can't setup exception handler");
 }
 
 ExceptionTable::~ExceptionTable()
@@ -116,7 +116,7 @@ void ExceptionTable::ExcDivideByZero(Context* ctx)
 
     ExcDivideByZeroCounter.Inc();
 
-    Trace(ExcLL, "EXC: DivideByZero");
+    Panic("EXC: DivideByZero");
 }
 
 void ExceptionTable::ExcDebugger(Context* ctx)
@@ -125,7 +125,7 @@ void ExceptionTable::ExcDebugger(Context* ctx)
 
     ExcDebuggerCounter.Inc();
 
-    Trace(ExcLL, "EXC: Debugger");
+    Panic("EXC: Debugger");
 }
 
 void ExceptionTable::ExcNMI(Context* ctx)
@@ -134,7 +134,7 @@ void ExceptionTable::ExcNMI(Context* ctx)
 
     ExcNMICounter.Inc();
 
-    Trace(ExcLL, "EXC: NMI");
+    Panic("EXC: NMI");
 }
 
 void ExceptionTable::ExcBreakpoint(Context* ctx)
@@ -143,7 +143,7 @@ void ExceptionTable::ExcBreakpoint(Context* ctx)
 
     ExcBreakpointCounter.Inc();
 
-    Trace(ExcLL, "EXC: Breakpoint");
+    Panic("EXC: Breakpoint");
 }
 
 void ExceptionTable::ExcOverflow(Context* ctx)
@@ -152,7 +152,7 @@ void ExceptionTable::ExcOverflow(Context* ctx)
 
     ExcOverflowCounter.Inc();
 
-    Trace(ExcLL, "EXC: Overflow");
+    Panic("EXC: Overflow");
 }
 
 void ExceptionTable::ExcBounds(Context* ctx)
@@ -161,7 +161,7 @@ void ExceptionTable::ExcBounds(Context* ctx)
 
     ExcBoundsCounter.Inc();
 
-    Trace(ExcLL, "EXC: Bounds");
+    Panic("EXC: Bounds");
 }
 
 void ExceptionTable::ExcInvalidOpcode(Context* ctx)
@@ -170,10 +170,8 @@ void ExceptionTable::ExcInvalidOpcode(Context* ctx)
 
     ExcInvalidOpcodeCounter.Inc();
 
-    Trace(ExcLL, "EXC: InvalidOpcode cpu %u rip 0x%p rsp 0x%p",
+    Panic("EXC: InvalidOpcode cpu %u rip 0x%p rsp 0x%p",
         CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp);
-
-    Panic("InvalidOpCode");
 }
 
 void ExceptionTable::ExcCoprocessorNotAvailable(Context* ctx)
@@ -182,7 +180,7 @@ void ExceptionTable::ExcCoprocessorNotAvailable(Context* ctx)
 
     ExcCoprocessorNotAvailableCounter.Inc();
 
-    Trace(ExcLL, "EXC: CoprocessorNotAvailable");
+    Panic("EXC: CoprocessorNotAvailable");
 }
 
 void ExceptionTable::ExcDoubleFault(Context* ctx)
@@ -191,10 +189,7 @@ void ExceptionTable::ExcDoubleFault(Context* ctx)
 
     ExcDoubleFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: DoubleFault cpu %u rip 0x%p rsp 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp);
-
-    Panic("DoubleFault");
+    Panic("EXC: DoubleFault");
 }
 
 void ExceptionTable::ExcCoprocessorSegmentOverrun(Context* ctx)
@@ -203,7 +198,7 @@ void ExceptionTable::ExcCoprocessorSegmentOverrun(Context* ctx)
 
     ExcCoprocessorSegmentOverrunCounter.Inc();
 
-    Trace(ExcLL, "EXC: CoprocessorSegmentOverrun");
+    Panic("EXC: CoprocessorSegmentOverrun");
 }
 
 void ExceptionTable::ExcInvalidTaskStateSegment(Context* ctx)
@@ -212,7 +207,7 @@ void ExceptionTable::ExcInvalidTaskStateSegment(Context* ctx)
 
     ExcInvalidTaskStateSegmentCounter.Inc();
 
-    Trace(ExcLL, "EXC: InvalidTaskStateSegment");
+    Panic("EXC: InvalidTaskStateSegment");
 }
 
 void ExceptionTable::ExcSegmentNotPresent(Context* ctx)
@@ -221,7 +216,7 @@ void ExceptionTable::ExcSegmentNotPresent(Context* ctx)
 
     ExcSegmentNotPresentCounter.Inc();
 
-    Trace(ExcLL, "EXC: SegmentNotPresent");
+    Panic("EXC: SegmentNotPresent");
 }
 
 void ExceptionTable::ExcStackFault(Context* ctx)
@@ -230,7 +225,7 @@ void ExceptionTable::ExcStackFault(Context* ctx)
 
     ExcStackFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: StackFault");
+    Panic("EXC: StackFault");
 }
 
 void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
@@ -239,10 +234,8 @@ void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
 
     ExcGeneralProtectionFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: GeneralProtectionFault cpu %u rip 0x%p rsp 0x%p",
+    Panic("EXC: GP cpu %u rip 0x%p rsp 0x%p",
         CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp);
-
-    Panic("GP");
 }
 
 void ExceptionTable::ExcPageFault(Context* ctx)
@@ -251,11 +244,9 @@ void ExceptionTable::ExcPageFault(Context* ctx)
 
     ExcPageFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0x%p cr3 0x%p",
+    Panic("EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0x%p cr3 0x%p",
         CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp,
         GetCr2(), GetCr3());
-
-    Panic("PageFault");
 }
 
 void ExceptionTable::ExcReserved(Context* ctx)
@@ -264,7 +255,7 @@ void ExceptionTable::ExcReserved(Context* ctx)
 
     ExcReservedCounter.Inc();
 
-    Trace(ExcLL, "EXC: Reserved");
+    Panic("EXC: Reserved");
 }
 
 void ExceptionTable::ExcMathFault(Context* ctx)
@@ -273,7 +264,7 @@ void ExceptionTable::ExcMathFault(Context* ctx)
 
     ExcMathFaultCounter.Inc();
 
-    Trace(ExcLL, "EXC: MathFault");
+    Panic("EXC: MathFault");
 }
 
 void ExceptionTable::ExcAlignmentCheck(Context* ctx)
@@ -282,7 +273,7 @@ void ExceptionTable::ExcAlignmentCheck(Context* ctx)
 
     ExcAlignmentCheckCounter.Inc();
 
-    Trace(ExcLL, "EXC: AlignmentCheck");
+    Panic("EXC: AlignmentCheck");
 }
 
 void ExceptionTable::ExcMachineCheck(Context* ctx)
@@ -291,7 +282,7 @@ void ExceptionTable::ExcMachineCheck(Context* ctx)
 
     ExcMachineCheckCounter.Inc();
 
-    Trace(ExcLL, "EXC: MachineCheck");
+    Panic("EXC: MachineCheck");
 }
 
 void ExceptionTable::ExcSIMDFpException(Context* ctx)
@@ -300,7 +291,7 @@ void ExceptionTable::ExcSIMDFpException(Context* ctx)
 
     ExcSIMDFpExceptionCounter.Inc();
 
-    Trace(ExcLL, "EXC: SIMDFpException");
+    Panic("EXC: SIMDFpException");
 }
 
 void ExceptionTable::ExcVirtException(Context* ctx)
@@ -309,7 +300,7 @@ void ExceptionTable::ExcVirtException(Context* ctx)
 
     ExcVirtExceptionCounter.Inc();
 
-    Trace(ExcLL, "EXC: VirtException");
+    Panic("EXC: VirtException");
 }
 
 void ExceptionTable::ExcControlProtection(Context* ctx)
@@ -318,7 +309,7 @@ void ExceptionTable::ExcControlProtection(Context* ctx)
 
     ExcControlProtectionCounter.Inc();
 
-    Trace(ExcLL, "EXC: ControlProtection");
+    Panic("EXC: ControlProtection");
 }
 
 extern "C" void ExcDivideByZero(Context* ctx)

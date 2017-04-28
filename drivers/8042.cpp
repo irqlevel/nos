@@ -40,8 +40,6 @@ InterruptHandlerFn IO8042::GetHandlerFn()
 
 void IO8042::Interrupt(Context* ctx)
 {
-    InterruptEnable();
-
     (void)ctx;
     Shared::AutoLock lock(Lock);
 

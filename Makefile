@@ -40,6 +40,7 @@ CXX_SRC =   \
     kernel/sched.cpp    \
     kernel/preempt.cpp  \
     kernel/time.cpp \
+    kernel/spin_lock.cpp \
     lib/stdlib.cpp  \
     lib/list_entry.cpp  \
     lib/error.cpp   \
@@ -49,6 +50,7 @@ CXX_SRC =   \
     mm/page_allocator.cpp  \
     mm/pool.cpp    \
     mm/page_table.cpp \
+    mm/block_allocator.cpp \
 
 ASM_SRC =    \
     boot/boot64.asm \

@@ -81,7 +81,7 @@ void Serial::PrintString(const char *str)
     }
 }
 
-void Serial::Vprintf(const char *fmt, va_list args)
+void Serial::VPrintf(const char *fmt, va_list args)
 {
 	char str[256];
 
@@ -96,7 +96,7 @@ void Serial::Printf(const char *fmt, ...)
 	va_list args;
 
 	va_start(args, fmt);
-	Vprintf(fmt, args);
+	VPrintf(fmt, args);
 	va_end(args);
 }
 
@@ -118,6 +118,7 @@ void Serial::Interrupt(Context* ctx)
 
     Shared::AutoLock lock(Lock);
     Send();
+
     Lapic::EOI(IntVector);
 }
 

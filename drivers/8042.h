@@ -5,6 +5,7 @@
 #include <kernel/timer.h>
 #include <kernel/spin_lock.h>
 #include <kernel/interrupt.h>
+#include <kernel/asm.h>
 #include <lib/ring_buffer.h>
 
 namespace Kernel

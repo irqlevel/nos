@@ -12,6 +12,7 @@
 #include "interrupt.h"
 #include "icxxabi.h"
 #include "preempt.h"
+#include "dmesg.h"
 
 #include <boot/grub.h>
 
@@ -215,6 +216,12 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 
     Gdt::GetInstance().Save();
     Idt::GetInstance().Save();
+
+    if (!Dmesg::GetInstance().Setup())
+    {
+        Panic("Can't setup dmesg");
+        return;
+    }
 
     Tracer::GetInstance().SetLevel(1);
 

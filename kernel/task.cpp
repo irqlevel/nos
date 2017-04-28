@@ -4,6 +4,7 @@
 #include "sched.h"
 #include "cpu.h"
 #include "sched.h"
+#include "preempt.h"
 
 namespace Kernel
 {
@@ -14,6 +15,7 @@ Task::Task()
     , State(0)
     , Flags(0)
     , Prev(nullptr)
+    , Magic(TaskMagic)
     , Stack(nullptr)
     , Function(nullptr)
     , Ctx(nullptr)
@@ -179,14 +181,25 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
 
 Task* Task::GetCurrentTask()
 {
-    struct Stack* stack = reinterpret_cast<struct Stack *>(GetRsp() & (~(StackSize - 1)));
+    ulong rsp = GetRsp();
+    struct Stack* stack = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
     if (BugOn(stack->Magic1 != StackMagic1))
         return nullptr;
 
     if (BugOn(stack->Magic2 != StackMagic2))
         return nullptr;
 
-    return stack->Task;
+    if (BugOn(rsp < ((ulong)&stack->StackBottom[0] + Shared::PageSize)))
+        return nullptr;
+
+    if (BugOn(rsp > (ulong)&stack->StackTop[0]))
+        return nullptr;
+
+    Task* task = stack->Task;
+    if (BugOn(task->Magic != TaskMagic))
+        return nullptr;
+
+    return task;
 }
 
 void Task::SetName(const char *fmt, ...)

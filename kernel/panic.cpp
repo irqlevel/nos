@@ -1,7 +1,8 @@
 #include "panic.h"
 #include "preempt.h"
+#include "asm.h"
 
-#include <drivers/vga.h>
+#include <drivers/serial.h>
 
 namespace Kernel
 {
@@ -16,13 +17,7 @@ Panicker::~Panicker()
 
 void Panicker::DoPanic(const char *fmt, ...)
 {
-    va_list args;
-    va_start(args, fmt);
-
-    auto& vga = VgaTerm::GetInstance();
-    vga.SetColor(VgaTerm::ColorRed, VgaTerm::ColorBlack);
-    vga.VPrintf(fmt, args);
-    va_end(args);
+    (void)fmt;
 
     InterruptDisable();
     Hlt();

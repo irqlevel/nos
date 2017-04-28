@@ -2,6 +2,7 @@
 #include "memory_map.h"
 
 #include <kernel/trace.h>
+#include <kernel/asm.h>
 
 namespace Kernel
 {

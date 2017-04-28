@@ -3,6 +3,7 @@
 #include "trace.h"
 #include "preempt.h"
 #include "time.h"
+#include "asm.h"
 
 namespace Kernel
 {

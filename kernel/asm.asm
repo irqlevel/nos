@@ -369,9 +369,6 @@ AtomicTestBit:
 AtomicCmpxchg:
 	mov rax, rdx
 	lock cmpxchg qword [rdi], rsi
-	jne .complete
-	mov rax, rsi
-.complete:
 	ret
 
 %macro InterruptStub 1

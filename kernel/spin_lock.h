@@ -1,8 +1,6 @@
 #pragma once
 
-#include "asm.h"
-#include "preempt.h"
-
+#include "atomic.h"
 #include <lib/lock.h>
 
 namespace Kernel
@@ -13,51 +11,30 @@ class SpinLock
 	, public Shared::SharedLockInterface
 {
 public:
-	SpinLock()
-		: RawLock(0)
-	{
-	}
+	SpinLock();
 
-	void Lock()
-	{
-		SpinLockLock(&RawLock);
-	}
+	void Lock();
 
-	void Unlock()
-	{
-		SpinLockUnlock(&RawLock);
-	}
+	void Unlock();
 
-	virtual void Lock(ulong& flags) override
-	{
-		flags = GetRflags();
-		InterruptDisable();
-		PreemptDisable();
-		SpinLockLock(&RawLock);
-	}
+	virtual void Lock(ulong& flags) override;
 
-	virtual void Unlock(ulong flags) override
-	{
-		SpinLockUnlock(&RawLock);
-		SetRflags(flags);
-		PreemptEnable();
-	}
+	virtual void Unlock(ulong flags) override;
 
-	virtual void SharedLock(ulong& flags) override
-	{
-		Lock(flags);
-	}
+	virtual void SharedLock(ulong& flags) override;
 
-	virtual void SharedUnlock(ulong flags) override
-	{
-		Unlock(flags);
-	}
+	virtual void SharedUnlock(ulong flags) override;
 
-	virtual ~SpinLock()
-	{
-	}
+	virtual ~SpinLock();
+
 private:
-	ulong RawLock;
+	SpinLock(const SpinLock& other) = delete;
+	SpinLock(SpinLock&& other) = delete;
+	SpinLock& operator=(const SpinLock& other) = delete;
+	SpinLock& operator=(SpinLock&& other) = delete;
+
+	Atomic RawLock;
+	volatile void* Owner;
 };
 
 }

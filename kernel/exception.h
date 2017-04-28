@@ -14,9 +14,9 @@ class ExceptionTable final
 public:
     static ExceptionTable& GetInstance()
     {
-        static ExceptionTable instance;
+        static ExceptionTable Instance;
 
-        return instance;
+        return Instance;
     }
 
     void RegisterExceptionHandlers();

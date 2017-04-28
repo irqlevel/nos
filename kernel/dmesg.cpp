@@ -4,7 +4,7 @@ namespace Kernel
 {
 
 Dmesg::Dmesg()
-    : Printer(nullptr)
+    : Active(false)
 {
 }
 
@@ -12,27 +12,33 @@ Dmesg::~Dmesg()
 {
 }
 
-void Dmesg::AppendMsg(const DmesgMsg& msg)
+bool Dmesg::Setup()
 {
-    if (MsgBuf.IsFull())
-    {
-        MsgBuf.PopHead();
-    }
+    if (Active)
+        return false;
 
-    if (!MsgBuf.Put(msg))
-        return;
+    Active = MsgBuf.Setup((ulong)&Buf[0], (ulong)&Buf[0] + sizeof(Buf), sizeof(DmesgMsg));
+    return Active;
 }
 
 void Dmesg::VPrintf(const char *fmt, va_list args)
 {
-    Shared::AutoLock lock(Lock);
-	DmesgMsg msg;
+    if (!Active)
+        return;
 
-	int size = Shared::VsnPrintf(msg.Str, sizeof(msg.Str), fmt, args);
+    DmesgMsg* msg = (DmesgMsg*)MsgBuf.Alloc();
+    if (msg == nullptr)
+        return;
+
+	int size = Shared::VsnPrintf(msg->Str, sizeof(msg->Str), fmt, args);
     if (size < 0)
+    {
+        MsgBuf.Free(msg);
 		return;
+    }
 
-    AppendMsg(msg);
+    Shared::AutoLock lock(Lock);
+    MsgList.InsertTail(&msg->ListEntry);
 }
 
 void Dmesg::Printf(const char *fmt, ...)
@@ -46,26 +52,34 @@ void Dmesg::Printf(const char *fmt, ...)
 
 void Dmesg::PrintString(const char *s)
 {
-    Shared::AutoLock lock(Lock);
-	DmesgMsg msg;
-
-    Shared::StrnCpy(msg.Str, s, Shared::ArraySize(msg.Str));
-    msg.Str[Shared::ArraySize(msg.Str) - 1] = '\0';
-
-    AppendMsg(msg);
-}
-
-void Dmesg::PrintElement(const DmesgMsg& msg)
-{
-    Printer->PrintString(msg.Str);
+    Printf("%s", s);
 }
 
 void Dmesg::Dump(Shared::Printer& printer)
 {
-    Shared::AutoLock lock(Lock);
-    Printer = &printer;
-    MsgBuf.Print(*this);
-    Printer = nullptr;
+    Shared::ListEntry msgList;
+
+    {
+        Shared::AutoLock lock(Lock);
+        msgList.MoveTailList(&MsgList);
+    }
+
+    for (Shared::ListEntry* entry = msgList.Flink;
+        entry != &msgList;
+        entry = entry->Flink)
+    {
+        DmesgMsg* msg = CONTAINING_RECORD(entry, DmesgMsg, ListEntry);
+        printer.PrintString(msg->Str);
+    }
+
+    {
+        Shared::AutoLock lock(Lock);
+        while (!msgList.IsEmpty())
+        {
+            DmesgMsg* msg = CONTAINING_RECORD(msgList.RemoveHead(), DmesgMsg, ListEntry);
+            MsgList.InsertTail(&msg->ListEntry);
+        }
+    }
 }
 
 }

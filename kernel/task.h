@@ -20,6 +20,8 @@ public:
     static const ulong StackMagic1 = 0xBCDEBCDE;
     static const ulong StackMagic2 = 0xCBDECBDE;
 
+    static const ulong TaskMagic = 0xCBDECBEF;
+
     struct Stack final
     {
         Stack(Task* task)
@@ -100,6 +102,8 @@ public:
     Shared::Time ExitTime;
 
     Task* Prev;
+
+    ulong Magic;
 
 private:
     Task(const Task& other) = delete;

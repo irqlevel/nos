@@ -3,6 +3,7 @@
 #include <include/types.h>
 #include <kernel/spin_lock.h>
 #include <kernel/interrupt.h>
+#include <kernel/asm.h>
 #include <lib/ring_buffer.h>
 
 namespace Kernel
@@ -20,7 +21,7 @@ public:
 
     void PrintString(const char *str);
 
-    void Vprintf(const char *fmt, va_list args);
+    void VPrintf(const char *fmt, va_list args);
     void Printf(const char *fmt, ...);
 
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;

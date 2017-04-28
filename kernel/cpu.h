@@ -4,6 +4,7 @@
 #include "spin_lock.h"
 #include "task.h"
 #include "sched.h"
+#include "asm.h"
 
 namespace Kernel
 {

@@ -4,6 +4,7 @@
 #include <kernel/atomic.h>
 #include <kernel/interrupt.h>
 #include <kernel/spin_lock.h>
+#include <kernel/asm.h>
 #include <lib/stdlib.h>
 
 namespace Kernel
@@ -48,8 +49,8 @@ private:
     static const int ModePort = 0x43;
     static const u32 HighestFrequency = 1193182;
 
-    ulong TimeMs;
-    ulong TimeMsNs;
+    volatile ulong TimeMs;
+    volatile ulong TimeMsNs;
     ulong TickMs;
     ulong TickMsNs;
     u16 ReloadValue;

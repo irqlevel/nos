@@ -60,9 +60,6 @@ InterruptHandlerFn Pit::GetHandlerFn()
 void Pit::Interrupt(Context* ctx)
 {
     (void)ctx;
-    InterruptEnable();
-    Lapic::EOI(IntVector);
-
     {
         Shared::AutoLock lock(Lock);
 
@@ -87,11 +84,15 @@ void Pit::Interrupt(Context* ctx)
         }
     }
 
-    TimerTable::GetInstance().ProcessTimers();
-
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
     //ask other cpu's to schedule tasks
     CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
+
+    InterruptEnable();
+    Lapic::EOI(IntVector);
+
+    TimerTable::GetInstance().ProcessTimers();
+
     //and self task scheduling
     cpu.Schedule();
 }
@@ -99,8 +100,6 @@ void Pit::Interrupt(Context* ctx)
 Shared::Time Pit::GetTime()
 {
     u64 tsc = ReadTsc();
-
-    Shared::AutoLock lock(Lock);
 
     Shared::Time time(TimeMs * Shared::NanoSecsInMs + TimeMsNs);
 
