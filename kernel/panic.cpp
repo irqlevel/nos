@@ -17,9 +17,13 @@ Panicker::~Panicker()
 
 void Panicker::DoPanic(const char *fmt, ...)
 {
-    (void)fmt;
-
     InterruptDisable();
+
+    va_list args;
+    va_start(args, fmt);
+    Serial::GetInstance().VPrintf(fmt, args);
+    va_end(args);
+
     Hlt();
 }
 

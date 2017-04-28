@@ -4,6 +4,7 @@
 #include "dmesg.h"
 #include "cpu.h"
 #include "time.h"
+#include "watchdog.h"
 
 #include <drivers/vga.h>
 
@@ -66,6 +67,10 @@ void Cmd::ProcessCmd(const char *cmd)
     {
         TaskTable::GetInstance().Ps(vga);
     }
+    else if (Shared::StrCmp(cmd, "watchdog") == 0)
+    {
+        Watchdog::GetInstance().Dump(vga);
+    }
     else if (Shared::StrCmp(cmd, "help") == 0)
     {
         vga.Printf("cls - clear screen\n");
@@ -73,6 +78,7 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Printf("dmesg - dump kernel log\n");
         vga.Printf("exit - shutdown kernel\n");
         vga.Printf("ps - show tasks\n");
+        vga.Printf("watchdog - show watchdog stats\n");
         vga.Printf("help - help\n");
     }
     else

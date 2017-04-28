@@ -7,6 +7,7 @@
 #include <kernel/timer.h>
 #include <kernel/trace.h>
 #include <kernel/cpu.h>
+#include <kernel/watchdog.h>
 
 #include <lib/stdlib.h>
 
@@ -91,6 +92,7 @@ void Pit::Interrupt(Context* ctx)
     InterruptEnable();
     Lapic::EOI(IntVector);
 
+    Watchdog::GetInstance().Check();
     TimerTable::GetInstance().ProcessTimers();
 
     //and self task scheduling

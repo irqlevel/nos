@@ -70,6 +70,11 @@ struct Time
         return NanoSecs;
     }
 
+    void Clear()
+    {
+        NanoSecs = 0;
+    }
+
     bool operator==(const Time& other) const
     {
         return (NanoSecs == other.NanoSecs) ? true : false;

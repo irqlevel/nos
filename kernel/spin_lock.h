@@ -2,11 +2,12 @@
 
 #include "atomic.h"
 #include <lib/lock.h>
+#include <lib/list_entry.h>
 
 namespace Kernel
 {
 
-class SpinLock
+class SpinLock final
 	: public Shared::LockInterface
 	, public Shared::SharedLockInterface
 {
@@ -35,6 +36,10 @@ private:
 
 	Atomic RawLock;
 	volatile void* Owner;
+
+public:
+	Shared::ListEntry ListEntry;
+	Atomic LockTime;
 };
 
 }

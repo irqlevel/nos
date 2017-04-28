@@ -3,6 +3,7 @@
 #include "asm.h"
 #include "preempt.h"
 #include "time.h"
+#include "watchdog.h"
 
 namespace Kernel
 {
@@ -10,7 +11,14 @@ namespace Kernel
 SpinLock::SpinLock()
     : RawLock(0)
     , Owner(nullptr)
+    , LockTime(0)
 {
+    Watchdog::GetInstance().RegisterSpinLock(*this);
+}
+
+SpinLock::~SpinLock()
+{
+    Watchdog::GetInstance().UnregisterSpinLock(*this);
 }
 
 void SpinLock::Lock()
@@ -31,10 +39,12 @@ void SpinLock::Lock()
     }
 
     Owner = (PreemptIsOn()) ? Task::GetCurrentTask() : nullptr;
+    LockTime.Set(GetBootTime().GetValue());
 }
 
 void SpinLock::Unlock()
 {
+    LockTime.Set(0);
     Owner = nullptr;
     RawLock.Set(0);
 }
@@ -64,7 +74,4 @@ void SpinLock::SharedUnlock(ulong flags)
     Unlock(flags);
 }
 
-SpinLock::~SpinLock()
-{
-}
 }

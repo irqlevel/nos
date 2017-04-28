@@ -13,6 +13,7 @@
 #include "icxxabi.h"
 #include "preempt.h"
 #include "dmesg.h"
+#include "watchdog.h"
 
 #include <boot/grub.h>
 
