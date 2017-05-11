@@ -35,7 +35,7 @@ private:
 
     void WriteChar(char c);
     void Send();
-    void Wait(size_t pauseCount);
+    void Wait();
 
     Serial(const Serial& other) = delete;
     Serial(Serial&& other) = delete;
@@ -45,7 +45,7 @@ private:
     bool IsTransmitEmpty();
     int IntVector;
 
-    Shared::RingBuffer<char, Shared::PageSize> Buf;
+    Shared::RingBuffer<char, 4 * Shared::PageSize> Buf;
     SpinLock Lock;
 
     static const int Port = 0x3F8;

@@ -3,6 +3,7 @@
 #include "preempt.h"
 #include "time.h"
 #include "panic.h"
+#include "trace.h"
 
 namespace Kernel
 {
@@ -19,9 +20,9 @@ Watchdog::Lock::~Lock()
 
 void Watchdog::Lock::Acquire()
 {
+    PreemptDisable();
     Flags = GetRflags();
     InterruptDisable();
-    PreemptDisable();
     for (;;)
     {
         if (RawLock.Cmpxchg(1, 0) == 0)
@@ -49,7 +50,7 @@ Watchdog::~Watchdog()
 void Watchdog::Check()
 {
     Shared::Time now = GetBootTime();
-    Shared::Time timeout(Shared::NanoSecsInMs);
+    Shared::Time timeout(20 * Shared::NanoSecsInMs);
 
     for (size_t i = 0; i < Shared::ArraySize(SpinLockList); i++)
     {
@@ -70,7 +71,7 @@ void Watchdog::Check()
                 Shared::Time delta = now - lockTime;
                 if (delta > timeout)
                 {
-                    Panic("Spinlock 0x%p is held too long %u", lock, delta.GetValue());
+                    Trace(0, "Spinlock 0x%p is held too long %u", lock, delta.GetValue());
                 }
             }
         }

@@ -1,6 +1,8 @@
 #include "cpu.h"
 #include "panic.h"
 #include "trace.h"
+#include "watchdog.h"
+#include "timer.h"
 
 #include <boot/boot64.h>
 
@@ -102,8 +104,6 @@ bool CpuTable::InsertCpu(ulong index)
 
 Cpu& CpuTable::GetCpu(ulong index)
 {
-    Shared::AutoLock lock(Lock);
-
     BugOn(index >= Shared::ArraySize(CpuArray));
     Cpu& cpu = CpuArray[index];
     return cpu;
@@ -239,14 +239,36 @@ void CpuTable::SendIPIAllExclude(ulong excludeIndex)
     }
 }
 
+void CpuTable::SendIPIAll()
+{
+    ulong cpuMask = GetRunningCpus();
+    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    {
+        if ((cpuMask & ((ulong)1 << i)))
+        {
+            auto& cpu = GetCpu(i);
+
+            cpu.SendIPISelf();
+        }
+    }
+}
+
+void Cpu::OnPanic()
+{
+    InterruptDisable();
+    Hlt();
+}
+
 void Cpu::IPI(Context* ctx)
 {
-    InterruptEnable();
-    Lapic::EOI(CpuTable::IPIVector);
-
     (void)ctx;
-
     IPIConter.Inc();
+
+    if (Panicker::GetInstance().IsActive())
+    {
+        OnPanic();
+        return;
+    }
 
     bool exit;
     {
@@ -265,6 +287,15 @@ void Cpu::IPI(Context* ctx)
         Hlt();
         return;
     }
+
+    Watchdog::GetInstance().Check();
+
+    if (Index == 0)
+    {
+        TimerTable::GetInstance().ProcessTimers();
+    }
+
+    Lapic::EOI(CpuTable::IPIVector);
 
     Schedule();
 }

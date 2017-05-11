@@ -49,6 +49,8 @@ private:
     Cpu& operator=(const Cpu& other) = delete;
     Cpu& operator=(Cpu&& other) = delete;
 
+    void OnPanic();
+
     ulong Index;
     ulong State;
     SpinLock Lock;
@@ -62,8 +64,8 @@ class CpuTable final
 public:
     static CpuTable& GetInstance()
     {
-        static CpuTable instance;
-        return instance;
+        static CpuTable Instance;
+        return Instance;
     }
 
     bool InsertCpu(ulong index);
@@ -89,6 +91,8 @@ public:
 
     void SendIPIAllExclude(ulong excludeIndex);
 
+    void SendIPIAll();
+
 private:
     CpuTable();
     ~CpuTable();
@@ -105,6 +109,7 @@ private:
     Cpu CpuArray[MaxCpu];
 
     ulong BspIndex;
+
 };
 
 static inline Cpu& GetCpu()

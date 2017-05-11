@@ -24,7 +24,6 @@ SpinLock::~SpinLock()
 void SpinLock::Lock()
 {
     void* owner = (PreemptIsOn()) ? Task::GetCurrentTask() : nullptr;
-    ulong attempts = 0;
 
     for (;;)
     {
@@ -33,9 +32,6 @@ void SpinLock::Lock()
 
         BugOn(owner != nullptr && owner == Owner);
         Pause();
-        attempts++;
-        if (attempts >= 1000000)
-            Panic("Can't acquire spin lock 0x%p", this);
     }
 
     Owner = (PreemptIsOn()) ? Task::GetCurrentTask() : nullptr;
@@ -44,6 +40,17 @@ void SpinLock::Lock()
 
 void SpinLock::Unlock()
 {
+    Shared::Time lockTime(LockTime.Get());
+    if (lockTime.GetValue() != 0)
+    {
+        Shared::Time now = GetBootTime();
+        Shared::Time delta = now - lockTime;
+        if (delta > Shared::Time(20 * Shared::NanoSecsInMs))
+        {
+            //Panic("Spin lock 0x%p was held too long %u", this, delta.GetValue());
+        }
+    }
+
     LockTime.Set(0);
     Owner = nullptr;
     RawLock.Set(0);
@@ -51,9 +58,9 @@ void SpinLock::Unlock()
 
 void SpinLock::Lock(ulong& flags)
 {
+    PreemptDisable();
     flags = GetRflags();
     InterruptDisable();
-    PreemptDisable();
     Lock();
 }
 

@@ -23,39 +23,42 @@ Serial::Serial()
 
 void Serial::Send()
 {
-    while (!Buf.IsEmpty() && IsTransmitEmpty())
+    ulong flags;
+
+    for (;;)
     {
-        Outb(Port, Buf.Get());
+        Lock.Lock(flags);
+
+        if (!Buf.IsEmpty())
+        {
+            Lock.Unlock(flags);
+            Wait();
+            Lock.Lock(flags);
+            Outb(Port, Buf.Get());
+            Lock.Unlock(flags);
+        }
+        else
+        {
+            Lock.Unlock(flags);
+            break;
+        }
     }
 }
 
-void Serial::Wait(size_t pauseCount)
+void Serial::Wait()
 {
-    for (size_t i = 0; i < pauseCount; i++)
+    size_t pauseCount = 1;
+
+    for (;;)
     {
         if (IsTransmitEmpty())
             break;
 
-        Pause();
-    }
-}
+        for (size_t i = 0; i < pauseCount; i++)
+            Pause();
 
-void Serial::WriteChar(char c)
-{
-    size_t pauseCount = 1;
-
-again:
-    if (Buf.IsFull())
-        Send();
-
-    if (!Buf.Put(c))
-    {
-        Wait(pauseCount);
         pauseCount *= 2;
-        goto again;
     }
-
-    Send();
 }
 
 bool Serial::IsTransmitEmpty()
@@ -65,20 +68,33 @@ bool Serial::IsTransmitEmpty()
 
 Serial::~Serial()
 {
+    Send();
 }
 
 void Serial::PrintString(const char *str)
 {
-    Shared::AutoLock lock(Lock);
+    Send();
 
+    ulong flags;
+    Lock.Lock(flags);
     for (;;)
     {
         char c = *str++;
         if (c == '\0')
+        {
             break;
+        }
 
-        WriteChar(c);
+        if (Buf.IsFull())
+        {
+            Lock.Unlock(flags);
+            Send();
+            Lock.Lock(flags);
+        }
+
+        Buf.Put(c);
     }
+    Lock.Unlock(flags);
 }
 
 void Serial::VPrintf(const char *fmt, va_list args)
@@ -109,14 +125,13 @@ void Serial::OnInterruptRegister(u8 irq, u8 vector)
 
 InterruptHandlerFn Serial::GetHandlerFn()
 {
-    return IO8042InterruptStub;
+    return SerialInterruptStub;
 }
 
 void Serial::Interrupt(Context* ctx)
 {
     (void)ctx;
 
-    Shared::AutoLock lock(Lock);
     Send();
 
     Lapic::EOI(IntVector);

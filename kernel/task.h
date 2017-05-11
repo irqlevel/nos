@@ -77,6 +77,8 @@ public:
     void SetName(const char *fmt, ...);
     const char* GetName();
 
+    void UpdateRuntime();
+
     static const long StateWaiting = 1;
     static const long StateRunning = 2;
     static const long StateExited = 3;
@@ -102,7 +104,6 @@ public:
     Shared::Time ExitTime;
 
     Task* Prev;
-
     ulong Magic;
 
 private:

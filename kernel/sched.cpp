@@ -4,6 +4,7 @@
 #include "preempt.h"
 #include "time.h"
 #include "asm.h"
+#include "debug.h"
 
 namespace Kernel
 {
@@ -20,11 +21,13 @@ TaskQueue::TaskQueue()
 void TaskQueue::SwitchComplete(Task* curr)
 {
     Task* prev = curr->Prev;
+
     curr->Prev = nullptr;
     curr->Lock.Unlock();
     prev->Lock.Unlock();
     Lock.Unlock();
-    //InterruptEnable(); //sti is at the end of SwitchContext()
+
+    prev->PreemptDisableCounter.Dec();
 }
 
 void TaskQueue::SwitchComplete(void* ctx)
@@ -45,20 +48,17 @@ void TaskQueue::Switch(Task* next, Task* curr)
         curr->State.Set(Task::StateWaiting);
 
     curr->ContextSwitches.Inc();
-    auto now = GetBootTime();
-    curr->Runtime += (now - curr->RunStartTime);
+    curr->UpdateRuntime();
 
     BugOn(next->State.Get() == Task::StateExited);
     next->State.Set(Task::StateRunning);
-    next->RunStartTime = now;
+    next->RunStartTime = GetBootTime();
     next->Prev = curr;
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
 
 void TaskQueue::Schedule()
 {
-    BugOn(!IsInterruptEnabled());
-
     ScheduleCounter.Inc();
 
     if (unlikely(!PreemptIsOn()))
@@ -69,16 +69,19 @@ void TaskQueue::Schedule()
     Task *curr = Task::GetCurrentTask();
     if (curr->PreemptDisableCounter.Get() != 0)
     {
+        Shared::AutoLock lock(curr->Lock);
+        curr->UpdateRuntime();
         return;
     }
 
+    curr->PreemptDisableCounter.Inc();
+    ulong flags = GetRflags();
     InterruptDisable();
     Lock.Lock();
 
     Task* next = nullptr;
     do {
         curr->Lock.Lock();
-
         BugOn(TaskList.IsEmpty());
 
         for (auto currEntry = TaskList.Flink;
@@ -121,14 +124,16 @@ void TaskQueue::Schedule()
 
     if (next == nullptr)
     {
+        curr->UpdateRuntime();
         curr->Lock.Unlock();
         Lock.Unlock();
-        InterruptEnable();
+        SetRflags(flags);
+        curr->PreemptDisableCounter.Dec();
+        return;
     }
-    else
-    {
-        Switch(next, curr);
-    }
+
+    Switch(next, curr);
+    SetRflags(flags);
 }
 
 void TaskQueue::Insert(Task* task)

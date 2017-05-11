@@ -63,6 +63,7 @@ global InterruptDisable
 global Hlt
 global SetRsp
 global ReadTsc
+global ReadTscp
 
 global SwitchContext
 
@@ -235,7 +236,8 @@ ReadMsr: ;Read MSR specified by ECX into EDX:EAX.
 	mov ecx, edi
 	rdmsr
 	shl rdx, 32
-	mov edx, eax
+	mov edi, eax
+	or rdx, rdi
 	mov rax, rdx
 	ret
 
@@ -268,7 +270,16 @@ SetRsp:
 ReadTsc:
 	rdtsc; result in edx:eax
 	shl rdx, 32
-	mov edx, eax
+	or rdx, rax
+	mov rax, rdx
+	ret
+
+ReadTscp:
+	; rdi - &cpuIndex
+	rdtsc; result in edx:eax
+	mov qword [rdi], rcx
+	shl rdx, 32
+	or rdx, rax
 	mov rax, rdx
 	ret
 
@@ -355,7 +366,7 @@ AtomicTestAndSetBit:
 	lock bts qword [rdi], rsi
 	jnc .return
 	inc rax
-.return
+.return:
 	ret
 
 AtomicTestBit:
@@ -363,7 +374,7 @@ AtomicTestBit:
 	bt qword [rdi], rsi
 	jnc .return
 	inc rax
-.return
+.return:
 	ret
 
 AtomicCmpxchg:

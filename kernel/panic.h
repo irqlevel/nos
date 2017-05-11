@@ -17,6 +17,8 @@ public:
 
     void DoPanic(const char *fmt, ...);
 
+    bool IsActive();
+
 private:
 
     Panicker();
@@ -25,6 +27,8 @@ private:
     Panicker(Panicker&& other) = delete;
     Panicker& operator=(const Panicker& other) = delete;
     Panicker& operator=(Panicker&& other) = delete;
+
+    volatile bool Active;
 };
 
 }

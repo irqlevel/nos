@@ -2,6 +2,7 @@
 #include "task.h"
 #include "panic.h"
 #include "asm.h"
+#include "debug.h"
 
 namespace Kernel
 {
@@ -22,12 +23,13 @@ void PreemptOff()
 
 bool PreemptIsOn()
 {
+    Barrier();
     return PreemptActive;
 }
 
 void PreemptDisable()
 {
-    if (likely(PreemptActive))
+    if (likely(PreemptIsOn()))
     {
         auto task = Task::GetCurrentTask();
         task->PreemptDisableCounter.Inc();
@@ -36,7 +38,7 @@ void PreemptDisable()
 
 void PreemptEnable()
 {
-    if (likely(PreemptActive))
+    if (likely(PreemptIsOn()))
     {
         auto task = Task::GetCurrentTask();
         BugOn(task->PreemptDisableCounter.Get() == 0);

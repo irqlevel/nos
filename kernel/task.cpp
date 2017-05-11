@@ -217,6 +217,13 @@ const char* Task::GetName()
     return Name;
 }
 
+void Task::UpdateRuntime()
+{
+    auto now = GetBootTime();
+    Runtime += (now - RunStartTime);
+    RunStartTime = now;
+}
+
 TaskTable::TaskTable()
 {
     TaskList.Init();
