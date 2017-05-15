@@ -2,3 +2,4 @@ target remote 127.0.0.1:1234
 symbol-file bin/kernel64.elf
 set print pretty on
 set height 20000
+thread apply all bt
