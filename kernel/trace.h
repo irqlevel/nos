@@ -28,9 +28,9 @@ class Tracer
 public:
     static Tracer& GetInstance()
     {
-        static Tracer instance;
+        static Tracer Instance;
 
-        return instance;
+        return Instance;
     }
 
     void Output(const char *fmt, ...);

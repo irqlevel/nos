@@ -11,8 +11,8 @@ class IoApic final
 public:
     static IoApic& GetInstance()
     {
-        static IoApic instance;
-        return instance;
+        static IoApic Instance;
+        return Instance;
     }
 
     void Enable();

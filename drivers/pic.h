@@ -10,8 +10,8 @@ class Pic final
 public:
     static Pic& GetInstance()
     {
-        static Pic instance;
-        return instance;
+        static Pic Instance;
+        return Instance;
     }
 
     void Remap(int offset1 = 0x20, int offset2 = 0x28);

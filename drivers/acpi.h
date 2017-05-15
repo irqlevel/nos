@@ -11,8 +11,8 @@ class Acpi final
 public:
     static Acpi& GetInstance()
     {
-        static Acpi instance;
-        return instance;
+        static Acpi Instance;
+        return Instance;
     }
 
     Shared::Error Parse();

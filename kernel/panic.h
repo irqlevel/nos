@@ -10,9 +10,9 @@ class Panicker
 public:
     static Panicker& GetInstance()
     {
-        static Panicker instance;
+        static Panicker Instance;
 
-        return instance;
+        return Instance;
     }
 
     void DoPanic(const char *fmt, ...);

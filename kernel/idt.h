@@ -14,8 +14,8 @@ public:
 
     static Idt& GetInstance()
     {
-        static Idt instance;
-        return instance;
+        static Idt Instance;
+        return Instance;
     }
 
     void Save();

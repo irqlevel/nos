@@ -12,8 +12,8 @@ class VgaTerm : public Shared::Printer
 public:
     static VgaTerm& GetInstance()
     {
-        static VgaTerm instance;
-        return instance;
+        static VgaTerm Instance;
+        return Instance;
     }
 
     void Puts(const char *s);

@@ -17,9 +17,9 @@ class TimerTable final
 public:
     static TimerTable& GetInstance()
     {
-        static TimerTable instance;
+        static TimerTable Instance;
 
-        return instance;
+        return Instance;
     }
 
     bool StartTimer(TimerCallback& callback, Shared::Time period);

@@ -14,9 +14,9 @@ class Serial final : public InterruptHandler
 public:
     static Serial& GetInstance()
     {
-        static Serial instance;
+        static Serial Instance;
 
-        return instance;
+        return Instance;
     }
 
     void PrintString(const char *str);

@@ -11,9 +11,9 @@ class MemoryMap final
 public:
     static MemoryMap& GetInstance()
     {
-        static MemoryMap instance;
+        static MemoryMap Instance;
 
-        return instance;
+        return Instance;
     }
     ~MemoryMap();
 

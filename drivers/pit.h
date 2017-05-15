@@ -15,9 +15,9 @@ class Pit final : public InterruptHandler
 public:
     static Pit& GetInstance()
     {
-        static Pit instance;
+        static Pit Instance;
 
-        return instance;
+        return Instance;
     }
 
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;

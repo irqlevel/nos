@@ -22,8 +22,8 @@ class AllocatorImpl : public Allocator
 public:
 	static AllocatorImpl& GetInstance(PageAllocator& pageAllocator)
 	{
-		static AllocatorImpl instance(pageAllocator);
-		return instance;
+		static AllocatorImpl Instance(pageAllocator);
+		return Instance;
 	}
 
 	virtual void* Alloc(size_t size) override;

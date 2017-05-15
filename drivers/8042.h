@@ -22,8 +22,8 @@ class IO8042 : public TimerCallback, public InterruptHandler
 public:
     static IO8042& GetInstance()
     {
-        static IO8042 instance;
-        return instance;
+        static IO8042 Instance;
+        return Instance;
     }
 
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;

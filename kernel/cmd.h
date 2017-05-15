@@ -15,8 +15,8 @@ class Cmd final
 public:
     static Cmd& GetInstance()
     {
-        static Cmd instance;
-        return instance;
+        static Cmd Instance;
+        return Instance;
     }
 
     virtual void OnChar(char c) override;
