@@ -18,7 +18,7 @@ public:
     void Insert(Task* task);
     void Remove(Task* task);
 
-    void Schedule();
+    void Schedule(Task* curr);
 
     void Clear();
 
@@ -41,5 +41,9 @@ private:
     Atomic ScheduleCounter;
     Atomic SwitchContextCounter;
 };
+
+
+void Schedule();
+void Sleep(ulong nanoSecs);
 
 }

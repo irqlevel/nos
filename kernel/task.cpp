@@ -16,6 +16,7 @@ Task::Task()
     , Flags(0)
     , Prev(nullptr)
     , Magic(TaskMagic)
+    , CpuAffinity(~((ulong)0))
     , Stack(nullptr)
     , Function(nullptr)
     , Ctx(nullptr)
@@ -81,21 +82,12 @@ void Task::Exit()
 {
     BugOn(this != GetCurrentTask());
 
-    PreemptDisable();
-
-    class TaskQueue *tq = TaskQueue;
-
-    BugOn(tq == nullptr);
-
-    tq->Remove(this);
     State.Set(StateExited);
     ExitTime = GetBootTime();
-
     TaskTable::GetInstance().Remove(this);
 
-    PreemptEnable();
+    Schedule();
 
-    tq->Schedule();
     Panic("Can't be here");
 }
 
@@ -116,7 +108,7 @@ void Task::Wait()
 {
     while (State.Get() != StateExited)
     {
-        GetCpu().Sleep(1 * Shared::NanoSecsInMs);
+        Sleep(1 * Shared::NanoSecsInMs);
     }
 }
 
@@ -222,6 +214,18 @@ void Task::UpdateRuntime()
     auto now = GetBootTime();
     Runtime += (now - RunStartTime);
     RunStartTime = now;
+}
+
+void Task::SetCpuAffinity(ulong affinity)
+{
+    Shared::AutoLock lock(Lock);
+    CpuAffinity = affinity;
+}
+
+ulong Task::GetCpuAffinity()
+{
+    Shared::AutoLock lock(Lock);
+    return CpuAffinity;
 }
 
 TaskTable::TaskTable()

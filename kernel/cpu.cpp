@@ -300,24 +300,9 @@ void Cpu::IPI(Context* ctx)
     Schedule();
 }
 
-void Cpu::Schedule()
-{
-    TaskQueue.Schedule();
-}
-
 TaskQueue& Cpu::GetTaskQueue()
 {
     return TaskQueue;
-}
-
-void Cpu::Sleep(ulong nanoSecs)
-{
-    auto expired = GetBootTime() + nanoSecs;
-
-    while (GetBootTime() < expired)
-    {
-        Schedule();
-    }
 }
 
 extern "C" void IPInterrupt(Context* ctx)
@@ -372,6 +357,8 @@ bool Cpu::Run(Task::Func func, void *ctx)
     {
         return false;
     }
+
+    Task->SetCpuAffinity((ulong)1 << Index);
 
     return Task->Run(TaskQueue, func, ctx);
 }

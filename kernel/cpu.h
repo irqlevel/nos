@@ -37,11 +37,7 @@ public:
 
     void SendIPISelf();
 
-    void Schedule();
-
     TaskQueue& GetTaskQueue();
-
-    void Sleep(ulong nanoSecs);
 
 private:
     Cpu(const Cpu& other) = delete;

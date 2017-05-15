@@ -79,6 +79,9 @@ public:
 
     void UpdateRuntime();
 
+    void SetCpuAffinity(ulong affinity);
+    ulong GetCpuAffinity();
+
     static const long StateWaiting = 1;
     static const long StateRunning = 2;
     static const long StateExited = 3;
@@ -105,6 +108,7 @@ public:
 
     Task* Prev;
     ulong Magic;
+    ulong CpuAffinity;
 
 private:
     Task(const Task& other) = delete;

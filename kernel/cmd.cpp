@@ -196,7 +196,7 @@ void Cmd::Run()
             }
         }
 
-        GetCpu().Sleep(10 * Shared::NanoSecsInMs);
+        Sleep(10 * Shared::NanoSecsInMs);
     }
 }
 

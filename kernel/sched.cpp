@@ -5,6 +5,7 @@
 #include "time.h"
 #include "asm.h"
 #include "debug.h"
+#include "cpu.h"
 
 namespace Kernel
 {
@@ -57,24 +58,10 @@ void TaskQueue::Switch(Task* next, Task* curr)
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
 
-void TaskQueue::Schedule()
+void TaskQueue::Schedule(Task* curr)
 {
     ScheduleCounter.Inc();
 
-    if (unlikely(!PreemptIsOn()))
-    {
-        return;
-    }
-
-    Task *curr = Task::GetCurrentTask();
-    if (curr->PreemptDisableCounter.Get() != 0)
-    {
-        Shared::AutoLock lock(curr->Lock);
-        curr->UpdateRuntime();
-        return;
-    }
-
-    curr->PreemptDisableCounter.Inc();
     ulong flags = GetRflags();
     InterruptDisable();
     Lock.Lock();
@@ -83,6 +70,15 @@ void TaskQueue::Schedule()
     do {
         curr->Lock.Lock();
         BugOn(TaskList.IsEmpty());
+
+        if (curr->State.Get() == Task::StateExited)
+        {
+            BugOn(curr->TaskQueue != this);
+            BugOn(curr->ListEntry.IsEmpty());
+            curr->TaskQueue = nullptr;
+            curr->ListEntry.RemoveInit();
+            curr->Put();
+        }
 
         for (auto currEntry = TaskList.Flink;
             currEntry != &TaskList;
@@ -192,6 +188,36 @@ void TaskQueue::Clear()
 TaskQueue::~TaskQueue()
 {
     Clear();
+}
+
+void Schedule()
+{
+    if (unlikely(!PreemptIsOn()))
+    {
+        return;
+    }
+
+    Task *curr = Task::GetCurrentTask();
+    curr->PreemptDisableCounter.Inc();
+    if (curr->PreemptDisableCounter.Get() > 1)
+    {
+        Shared::AutoLock lock(curr->Lock);
+        curr->UpdateRuntime();
+        curr->PreemptDisableCounter.Dec();
+        return;
+    }
+
+    curr->TaskQueue->Schedule(curr);
+}
+
+void Sleep(ulong nanoSecs)
+{
+    auto expired = GetBootTime() + nanoSecs;
+
+    while (GetBootTime() < expired)
+    {
+        Schedule();
+    }
 }
 
 }

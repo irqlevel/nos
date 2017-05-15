@@ -266,7 +266,7 @@ void TestMultiTaskingTaskFunc(void *ctx)
     {
         auto& cpu = GetCpu();
         Trace(0, "Hello from task 0x%p cpu %u", Task::GetCurrentTask(), cpu.GetIndex());
-        cpu.Sleep(100 * Shared::NanoSecsInMs);
+        Sleep(100 * Shared::NanoSecsInMs);
     }
 }
 
