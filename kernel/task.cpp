@@ -154,6 +154,7 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
     {
         delete Stack;
         Stack = nullptr;
+        return false;
     }
 
     SetRsp((ulong)&Stack->StackTop[0]);
