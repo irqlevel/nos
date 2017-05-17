@@ -133,12 +133,12 @@ void VgaTerm::Cls()
 
 void VgaTerm::VPrintf(const char *fmt, va_list args)
 {
-	Shared::AutoLock lock(Lock);
-
 	char str[256];
 
 	if (Shared::VsnPrintf(str, sizeof(str), fmt, args) < 0)
 		return;
+
+	Shared::AutoLock lock(Lock);
 
 	PutsLockHeld(str);
 }
