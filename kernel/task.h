@@ -82,6 +82,8 @@ public:
     void SetCpuAffinity(ulong affinity);
     ulong GetCpuAffinity();
 
+    TaskQueue* SelectNextTaskQueue();
+
     static const long StateWaiting = 1;
     static const long StateRunning = 2;
     static const long StateExited = 3;

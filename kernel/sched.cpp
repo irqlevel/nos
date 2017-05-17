@@ -28,6 +28,18 @@ void TaskQueue::SwitchComplete(Task* curr)
     prev->Lock.Unlock();
     Lock.Unlock();
 
+    if (prev->State.Get() != Task::StateExited)
+    {
+        auto taskQueue = prev->SelectNextTaskQueue();
+        if (taskQueue != nullptr)
+        {
+            prev->Get();
+            prev->TaskQueue->Remove(prev);
+            taskQueue->Insert(prev);
+            prev->Put();
+        }
+    }
+
     prev->PreemptDisableCounter.Dec();
 }
 
@@ -188,6 +200,11 @@ void TaskQueue::Clear()
 TaskQueue::~TaskQueue()
 {
     Clear();
+}
+
+long TaskQueue::GetSwitchContextCounter()
+{
+    return SwitchContextCounter.Get();
 }
 
 void Schedule()

@@ -22,6 +22,8 @@ public:
 
     void Clear();
 
+    long GetSwitchContextCounter();
+
 private:
     TaskQueue(const TaskQueue &other) = delete;
     TaskQueue(TaskQueue&& other) = delete;

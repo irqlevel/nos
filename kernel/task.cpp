@@ -132,8 +132,9 @@ bool Task::Start(Func func, void* ctx)
     Rsp = (ulong)regs;
 
     TaskTable::GetInstance().Insert(this);
-    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
-    cpu.GetTaskQueue().Insert(this);
+
+    auto taskQueue = SelectNextTaskQueue();
+    taskQueue->Insert(this);
     return true;
 }
 
@@ -226,6 +227,40 @@ ulong Task::GetCpuAffinity()
 {
     Shared::AutoLock lock(Lock);
     return CpuAffinity;
+}
+
+TaskQueue* Task::SelectNextTaskQueue()
+{
+    class TaskQueue* taskQueue = nullptr;
+    ulong cpuMask = CpuTable::GetInstance().GetRunningCpus() & CpuAffinity;
+    if (cpuMask != 0)
+    {
+        for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+        {
+            if (cpuMask & ((ulong)1 << i))
+            {
+                auto& candTaskQueue = CpuTable::GetInstance().GetCpu(i).GetTaskQueue();
+                if (&candTaskQueue == TaskQueue)
+                    continue;
+
+                if (taskQueue == nullptr)
+                {
+                    taskQueue = &candTaskQueue;
+                }
+                else
+                {
+                    if (taskQueue->GetSwitchContextCounter() > candTaskQueue.GetSwitchContextCounter())
+                    {
+                        taskQueue = &candTaskQueue;
+                    }
+                }
+
+                continue;
+            }
+        }
+    }
+
+    return taskQueue;
 }
 
 TaskTable::TaskTable()
