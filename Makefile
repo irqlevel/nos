@@ -42,6 +42,7 @@ CXX_SRC =   \
     kernel/time.cpp \
     kernel/spin_lock.cpp \
     kernel/watchdog.cpp \
+    kernel/object_table.cpp \
     lib/stdlib.cpp  \
     lib/list_entry.cpp  \
     lib/error.cpp   \

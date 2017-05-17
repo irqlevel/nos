@@ -17,6 +17,7 @@ Task::Task()
     , Prev(nullptr)
     , Magic(TaskMagic)
     , CpuAffinity(~((ulong)0))
+    , Pid(InvalidObjectId)
     , Stack(nullptr)
     , Function(nullptr)
     , Ctx(nullptr)
@@ -149,11 +150,16 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
         return false;
     }
 
+    if (!TaskTable::GetInstance().Insert(this))
+    {
+        delete Stack;
+        Stack = nullptr;
+    }
+
     SetRsp((ulong)&Stack->StackTop[0]);
     Function = func;
     Ctx = ctx;
 
-    TaskTable::GetInstance().Insert(this);
     taskQueue.Insert(this);
 
     {
@@ -287,22 +293,31 @@ TaskTable::~TaskTable()
     }
 }
 
-void TaskTable::Insert(Task *task)
+bool TaskTable::Insert(Task *task)
 {
+    ObjectId pid = TaskObjectTable.Insert(task);
+    if (pid == InvalidObjectId)
+    {
+        return false;
+    }
+    task->Pid = pid;
+
     task->Get();
-
     size_t i = Shared::HashPtr(task) % Shared::ArraySize(TaskList);
-
     Shared::AutoLock lock(Lock[i]);
 
     BugOn(!task->TableListEntry.IsEmpty());
     TaskList[i].InsertTail(&task->TableListEntry);
+
+    return true;
 }
 
 void TaskTable::Remove(Task *task)
 {
     {
         size_t i = Shared::HashPtr(task) % Shared::ArraySize(TaskList);
+
+        TaskObjectTable.Remove(task->Pid);
 
         Shared::AutoLock lock(Lock[i]);
 
@@ -313,9 +328,14 @@ void TaskTable::Remove(Task *task)
     task->Put();
 }
 
+Task* TaskTable::Lookup(ulong pid)
+{
+    return reinterpret_cast<Task*>(TaskObjectTable.Lookup(pid));
+}
+
 void TaskTable::Ps(Shared::Printer& printer)
 {
-    printer.Printf("id state flags runtime ctxswitches name\n");
+    printer.Printf("pid state flags runtime ctxswitches name\n");
 
     for (size_t i = 0; i < Shared::ArraySize(TaskList); i++)
     {
@@ -326,8 +346,8 @@ void TaskTable::Ps(Shared::Printer& printer)
             currEntry = currEntry->Flink)
         {
             Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
-            printer.Printf("0x%p %u 0x%p %u.%u %u %s\n",
-                task, task->State.Get(), task->Flags.Get(), task->Runtime.GetSecs(),
+            printer.Printf("%u %u 0x%p %u.%u %u %s\n",
+                task->Pid, task->State.Get(), task->Flags.Get(), task->Runtime.GetSecs(),
                 task->Runtime.GetUsecs(), task->ContextSwitches.Get(), task->GetName());
         }
     }

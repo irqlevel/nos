@@ -8,11 +8,12 @@
 #include "forward.h"
 #include "spin_lock.h"
 #include "panic.h"
+#include "object_table.h"
 
 namespace Kernel
 {
 
-class Task final
+class Task final : public Object
 {
 public:
 
@@ -64,8 +65,8 @@ public:
 
     static Task* GetCurrentTask();
 
-    void Get();
-    void Put();
+    virtual void Get() override;
+    virtual void Put() override;
 
     bool Start(Func func, void* ctx);
 
@@ -111,6 +112,7 @@ public:
     Task* Prev;
     ulong Magic;
     ulong CpuAffinity;
+    ulong Pid;
 
 private:
     Task(const Task& other) = delete;
@@ -141,8 +143,10 @@ public:
         return Instance;
     }
 
-    void Insert(Task *task);
+    bool Insert(Task *task);
     void Remove(Task *task);
+
+    Task* Lookup(ulong pid);
 
     void Ps(Shared::Printer& printer);
 
@@ -159,6 +163,8 @@ private:
 
     SpinLock Lock[TaskListCount];
     Shared::ListEntry TaskList[TaskListCount];
+
+    ObjectTable TaskObjectTable;
 };
 
 }

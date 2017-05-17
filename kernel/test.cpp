@@ -265,7 +265,8 @@ void TestMultiTaskingTaskFunc(void *ctx)
     for (size_t i = 0; i < 2; i++)
     {
         auto& cpu = GetCpu();
-        Trace(0, "Hello from task 0x%p cpu %u", Task::GetCurrentTask(), cpu.GetIndex());
+        auto task = Task::GetCurrentTask();
+        Trace(0, "Hello from task 0x%p pid %u cpu %u", task, task->Pid, cpu.GetIndex());
         Sleep(100 * Shared::NanoSecsInMs);
     }
 }
