@@ -81,7 +81,7 @@ void Watchdog::Check()
 
 void Watchdog::RegisterSpinLock(SpinLock& lock)
 {
-    size_t i = 0;
+    size_t i = Shared::HashPtr(&lock) % Shared::ArraySize(SpinLockList);
     auto& listLock = SpinLockListLock[i];
     auto& list = SpinLockList[i];
 
@@ -93,7 +93,7 @@ void Watchdog::RegisterSpinLock(SpinLock& lock)
 
 void Watchdog::UnregisterSpinLock(SpinLock& lock)
 {
-    size_t i = 0;
+    size_t i = Shared::HashPtr(&lock) % Shared::ArraySize(SpinLockList);
     auto& listLock = SpinLockListLock[i];
 
     listLock.Acquire();
