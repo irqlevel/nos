@@ -96,6 +96,9 @@ void ExcSIMDFpExceptionStub();
 void ExcVirtExceptionStub();
 void ExcControlProtectionStub();
 
+long SetJmp(void *ctx);
+void LongJmp(void *ctx, long result);
+
 #ifdef __cplusplus
 }
 #endif
@@ -110,6 +113,18 @@ static inline void Invlpg(void* m)
 
 namespace Kernel
 {
+
+struct JmpContext final
+{
+    ulong Rbx;
+    ulong Rsp;
+    ulong Rbp;
+    ulong R12;
+    ulong R13;
+    ulong R14;
+    ulong R15;
+    ulong RetAddr;
+};
 
 struct Context final
 {

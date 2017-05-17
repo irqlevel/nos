@@ -104,6 +104,8 @@ global ExcMachineCheckStub
 global ExcSIMDFpExceptionStub
 global ExcVirtExceptionStub
 global ExcControlProtectionStub
+global SetJmp
+global LongJmp
 
 GetCr0:
 	mov rax, cr0
@@ -430,3 +432,28 @@ ExceptionStub ExcMachineCheck
 ExceptionStub ExcSIMDFpException
 ExceptionStub ExcVirtException
 ExceptionStub ExcControlProtection
+
+SetJmp:
+	pop rsi
+	xor eax, eax
+	mov qword [rdi], rbx
+	mov qword [rdi + 8h], rsp
+	push rsi
+	mov qword [rdi + 10h], rbp
+	mov qword [rdi + 18h], r12
+	mov qword [rdi + 20h], r13
+	mov qword [rdi + 28h], r14
+	mov qword [rdi + 30h], r15
+	mov qword [rdi + 38h], rsi
+	ret
+
+LongJmp:
+	mov rax, rsi
+	mov rbx, qword [rdi]
+	mov rsp, qword [rdi + 8h]
+	mov rbp, qword [rdi + 10h]
+	mov r12, qword [rdi + 18h]
+	mov r13, qword [rdi + 20h]
+	mov r14, qword [rdi + 28h]
+	mov r15, qword [rdi + 30h]
+	jmp qword [rdi + 38h]
