@@ -126,6 +126,8 @@ private:
     void ExecCallback();
     static void Exec(void *task);
 
+    bool PrepareStart(Func func, void* ctx);
+
     Stack* Stack;
     Func Function;
     void* Ctx;

@@ -113,33 +113,7 @@ void Task::Wait()
     }
 }
 
-bool Task::Start(Func func, void* ctx)
-{
-    Stack = new struct Stack(this);
-    if (Stack == nullptr)
-    {
-        return false;
-    }
-
-    Function = func;
-    Ctx = ctx;
-
-    ulong* rsp = (ulong *)&Stack->StackTop[0];
-    *(--rsp) = (ulong)&Task::Exec;//setup return address
-    Context* regs = (Context*)((ulong)rsp - sizeof(*regs));
-    Shared::MemSet(regs, 0, sizeof(*regs));
-    regs->Rdi = (ulong)this; //setup 1arg for Task::Exec
-    regs->Rflags = (1 << 9); //setup IF
-    Rsp = (ulong)regs;
-
-    TaskTable::GetInstance().Insert(this);
-
-    auto taskQueue = SelectNextTaskQueue();
-    taskQueue->Insert(this);
-    return true;
-}
-
-bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
+bool Task::PrepareStart(Func func, void* ctx)
 {
     BugOn(Stack != nullptr);
     BugOn(Function != nullptr);
@@ -157,20 +131,48 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
         return false;
     }
 
-    SetRsp((ulong)&Stack->StackTop[0]);
     Function = func;
     Ctx = ctx;
 
-    taskQueue.Insert(this);
+    return true;
+}
 
-    {
-        Shared::AutoLock lock(Lock);
-        State = StateRunning;
-    }
+bool Task::Start(Func func, void* ctx)
+{
+    if (!PrepareStart(func, ctx))
+        return false;
+
+    ulong* rsp = (ulong *)&Stack->StackTop[0];
+    *(--rsp) = (ulong)&Task::Exec;//setup return address
+    Context* regs = (Context*)((ulong)rsp - sizeof(*regs));
+    Shared::MemSet(regs, 0, sizeof(*regs));
+    regs->Rdi = (ulong)this; //setup 1arg for Task::Exec
+    regs->Rflags = (1 << 9); //setup IF
+    Rsp = (ulong)regs;
+
+    StartTime = GetBootTime();
+    State.Set(StateWaiting);
+
+    auto taskQueue = SelectNextTaskQueue();
+    taskQueue->Insert(this);
+    return true;
+}
+
+bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
+{
+    if (!PrepareStart(func, ctx))
+        return false;
+
+    SetRsp((ulong)&Stack->StackTop[0]);
 
     StartTime = GetBootTime();
     RunStartTime = GetBootTime();
+    State.Set(StateRunning);
+
+    taskQueue.Insert(this);
+
     Function(Ctx);
+
     ExitTime = GetBootTime();
 
     taskQueue.Remove(this);
