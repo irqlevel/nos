@@ -343,4 +343,20 @@ size_t Log2(size_t size)
     return (size & (size - 1)) ? log : (log - 1);
 }
 
+size_t HashPtr(void *ptr)
+{
+    ulong val = (ulong)ptr;
+    size_t hash, i, c;
+
+    hash = 5381;
+    val = val >> 3;
+    for (i = 0; i < sizeof(val); i++) {
+        c = (unsigned char)val & 0xFF;
+        hash = ((hash << 5) + hash) + c;
+        val = val >> 8;
+    }
+
+    return hash;
+}
+
 }

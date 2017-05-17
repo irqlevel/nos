@@ -302,4 +302,6 @@ void StrnCpy(char *dst, const char *s, size_t size);
 
 size_t Log2(size_t size);
 
+size_t HashPtr(void *ptr);
+
 }
