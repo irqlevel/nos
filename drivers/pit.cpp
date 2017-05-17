@@ -82,7 +82,7 @@ void Pit::Wait(const Shared::Time& timeout)
 
     while (GetTime() < expired)
     {
-        Hlt();
+        Pause();
     }
 }
 

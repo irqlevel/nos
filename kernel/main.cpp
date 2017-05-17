@@ -74,7 +74,7 @@ void ApStartup(void *ctx)
 
     while (PreemptOnWaiting)
     {
-        cpu.Idle();
+        Pause();
     }
 
     if (!TestMultiTasking())
