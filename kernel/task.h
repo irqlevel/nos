@@ -155,8 +155,10 @@ private:
     TaskTable();
     ~TaskTable();
 
-    SpinLock Lock;
-    Shared::ListEntry TaskList;
+    static const size_t TaskListCount = 512;
+
+    SpinLock Lock[TaskListCount];
+    Shared::ListEntry TaskList[TaskListCount];
 };
 
 }
