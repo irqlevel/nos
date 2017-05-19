@@ -50,7 +50,7 @@ Watchdog::~Watchdog()
 void Watchdog::Check()
 {
     Shared::Time now = GetBootTime();
-    Shared::Time timeout(20 * Shared::NanoSecsInMs);
+    Shared::Time timeout(25 * Shared::NanoSecsInMs);
 
     for (size_t i = 0; i < Shared::ArraySize(SpinLockList); i++)
     {
