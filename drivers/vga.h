@@ -71,6 +71,9 @@ private:
 
     const ulong BufAddr = 0xB8000;
 
+    static const u8 MaxWidth = 80;
+    static const u8 MaxHeight = 25;
+
     u16 *Buf;
     u8 Row;
     u8 Column;

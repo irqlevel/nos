@@ -10,8 +10,8 @@ VgaTerm::VgaTerm()
     : Buf(reinterpret_cast<u16*>(PageTable::GetInstance().PhysToVirt(BufAddr)))
     , Row(0)
     , Column(0)
-    , Width(80)
-    , Height(25)
+    , Width(MaxWidth)
+    , Height(MaxHeight)
     , ColorCode(MakeColor(ColorWhite, ColorBlack))
 {
 	Shared::AutoLock lock(Lock);
@@ -92,6 +92,7 @@ void VgaTerm::PutChar(char c)
 	    PutCharAt(c, ColorCode, Column++, Row);
 		Overflow();
     }
+
 	Cursor();
 }
 
