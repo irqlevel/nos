@@ -28,7 +28,13 @@ void Dmesg::VPrintf(const char *fmt, va_list args)
 
     DmesgMsg* msg = (DmesgMsg*)MsgBuf.Alloc();
     if (msg == nullptr)
-        return;
+    {
+        Shared::AutoLock lock(Lock);
+        if (MsgList.IsEmpty())
+            return;
+
+        msg = CONTAINING_RECORD(MsgList.RemoveHead(), DmesgMsg, ListEntry);
+    }
 
 	int size = Shared::VsnPrintf(msg->Str, sizeof(msg->Str), fmt, args);
     if (size < 0)
@@ -55,30 +61,36 @@ void Dmesg::PrintString(const char *s)
     Printf("%s", s);
 }
 
+DmesgMsg* Dmesg::Next(DmesgMsg* current)
+{
+    Shared::AutoLock lock(Lock);
+
+    if (MsgList.IsEmpty())
+        return nullptr;
+
+    Shared::ListEntry* nextListEntry;
+    if (current == nullptr)
+    {
+        nextListEntry = MsgList.Flink;
+    }
+    else
+    {
+        nextListEntry = current->ListEntry.Flink;
+    }
+
+    if (nextListEntry == &MsgList)
+    {
+        return nullptr;
+    }
+
+    return CONTAINING_RECORD(nextListEntry, DmesgMsg, ListEntry);
+}
+
 void Dmesg::Dump(Shared::Printer& printer)
 {
-    Shared::ListEntry msgList;
-
+    for (DmesgMsg* msg = Next(nullptr); msg != nullptr; msg = Next(msg))
     {
-        Shared::AutoLock lock(Lock);
-        msgList.MoveTailList(&MsgList);
-    }
-
-    for (Shared::ListEntry* entry = msgList.Flink;
-        entry != &msgList;
-        entry = entry->Flink)
-    {
-        DmesgMsg* msg = CONTAINING_RECORD(entry, DmesgMsg, ListEntry);
         printer.PrintString(msg->Str);
-    }
-
-    {
-        Shared::AutoLock lock(Lock);
-        while (!msgList.IsEmpty())
-        {
-            DmesgMsg* msg = CONTAINING_RECORD(msgList.RemoveHead(), DmesgMsg, ListEntry);
-            MsgList.InsertTail(&msg->ListEntry);
-        }
     }
 }
 

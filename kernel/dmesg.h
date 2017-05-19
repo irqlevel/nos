@@ -35,6 +35,8 @@ public:
 
     void Dump(Shared::Printer& printer);
 
+    DmesgMsg* Next(DmesgMsg* current);
+
 private:
     Dmesg();
     ~Dmesg();
