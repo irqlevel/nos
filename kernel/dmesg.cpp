@@ -1,4 +1,5 @@
 #include "dmesg.h"
+#include "panic.h"
 
 namespace Kernel
 {
@@ -26,6 +27,7 @@ void Dmesg::VPrintf(const char *fmt, va_list args)
     if (!Active)
         return;
 
+restart:
     DmesgMsg* msg = (DmesgMsg*)MsgBuf.Alloc();
     if (msg == nullptr)
     {
@@ -33,7 +35,25 @@ void Dmesg::VPrintf(const char *fmt, va_list args)
         if (MsgList.IsEmpty())
             return;
 
-        msg = CONTAINING_RECORD(MsgList.RemoveHead(), DmesgMsg, ListEntry);
+        for (auto listEntry = MsgList.Flink; listEntry != &MsgList; listEntry = listEntry->Flink)
+        {
+            auto candMsg = CONTAINING_RECORD(listEntry, DmesgMsg, ListEntry);
+            if (candMsg->Usage.Get() == 0)
+            {
+                msg = candMsg;
+                msg->ListEntry.RemoveInit();
+                break;
+            }
+        }
+
+        if (msg == nullptr)
+        {
+            goto restart;
+        }
+    }
+    else
+    {
+        msg->Init();
     }
 
 	int size = Shared::VsnPrintf(msg->Str, sizeof(msg->Str), fmt, args);
@@ -44,6 +64,7 @@ void Dmesg::VPrintf(const char *fmt, va_list args)
     }
 
     Shared::AutoLock lock(Lock);
+    BugOn(msg->Usage.Get() != 0);
     MsgList.InsertTail(&msg->ListEntry);
 }
 
@@ -63,10 +84,9 @@ void Dmesg::PrintString(const char *s)
 
 DmesgMsg* Dmesg::Next(DmesgMsg* current)
 {
-    Shared::AutoLock lock(Lock);
+    BugOn(current != nullptr && current->Usage.Get() == 0);
 
-    if (MsgList.IsEmpty())
-        return nullptr;
+    Shared::AutoLock lock(Lock);
 
     Shared::ListEntry* nextListEntry;
     if (current == nullptr)
@@ -76,6 +96,8 @@ DmesgMsg* Dmesg::Next(DmesgMsg* current)
     else
     {
         nextListEntry = current->ListEntry.Flink;
+        BugOn(current->Usage.Get() <= 0);
+        current->Usage.Dec();
     }
 
     if (nextListEntry == &MsgList)
@@ -83,7 +105,9 @@ DmesgMsg* Dmesg::Next(DmesgMsg* current)
         return nullptr;
     }
 
-    return CONTAINING_RECORD(nextListEntry, DmesgMsg, ListEntry);
+    DmesgMsg* next = CONTAINING_RECORD(nextListEntry, DmesgMsg, ListEntry);
+    next->Usage.Inc();
+    return next;
 }
 
 void Dmesg::Dump(Shared::Printer& printer)

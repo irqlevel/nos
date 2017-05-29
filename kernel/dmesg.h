@@ -1,6 +1,7 @@
 #pragma once
 
 #include "spin_lock.h"
+#include "atomic.h"
 
 #include <lib/stdlib.h>
 #include <lib/printer.h>
@@ -11,8 +12,15 @@ namespace Kernel
 
 struct DmesgMsg final
 {
-    char Str[256 - sizeof(Shared::ListEntry)];
+    char Str[256 - sizeof(Shared::ListEntry) - sizeof(Atomic)];
     Shared::ListEntry ListEntry;
+    Atomic Usage;
+
+    void Init()
+    {
+        ListEntry.Init();
+        Usage.Set(0);
+    }
 };
 
 static_assert(sizeof(DmesgMsg) == 256, "Invalid size");

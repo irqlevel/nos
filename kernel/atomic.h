@@ -5,7 +5,7 @@
 namespace Kernel
 {
 
-class Atomic
+class Atomic final
 {
 public:
     Atomic();
@@ -31,5 +31,7 @@ private:
 
     volatile long Value;
 };
+
+static_assert(sizeof(Atomic) == sizeof(long), "Invalid size");
 
 }
