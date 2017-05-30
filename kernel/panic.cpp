@@ -7,7 +7,6 @@ namespace Kernel
 {
 
 Panicker::Panicker()
-    : Active(false)
 {
 }
 
@@ -17,14 +16,19 @@ Panicker::~Panicker()
 
 bool Panicker::IsActive()
 {
-    return Active;
+    return (Active.Get() != 0) ? true : false;
 }
 
 void Panicker::DoPanic(const char *fmt, ...)
 {
-    (void)fmt;
+    if (Active.Cmpxchg(1, 0) == 0)
+    {
+        va_list args;
 
-    Active = true;
+        va_start(args, fmt);
+        Shared::VsnPrintf(Message, sizeof(Message), fmt, args);
+        va_end(args);
+    }
 
     PreemptDisable();
     InterruptDisable();

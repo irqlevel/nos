@@ -1,6 +1,7 @@
 #pragma once
 
 #include <lib/stdlib.h>
+#include "atomic.h"
 
 namespace Kernel
 {
@@ -28,7 +29,8 @@ private:
     Panicker& operator=(const Panicker& other) = delete;
     Panicker& operator=(Panicker&& other) = delete;
 
-    volatile bool Active;
+    char Message[256];
+    Atomic Active;
 };
 
 }
