@@ -1,6 +1,7 @@
 #include "grub.h"
 
 #include <kernel/trace.h>
+#include <kernel/parameters.h>
 #include <mm/memory_map.h>
 #include <lib/stdlib.h>
 
@@ -52,6 +53,11 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
             MultiBootTagString* cmdLine = reinterpret_cast<MultiBootTagString*>(tag);
 
             Trace(0, "Cmdline %s", cmdLine->String);
+            if (!Kernel::Parameters::GetInstance().Parse(cmdLine->String)) {
+                Trace(0, "Can't parse command line");
+                Panic("Can't parse command line");
+            }
+
             break;
         }
         default:

@@ -12,6 +12,8 @@ public:
 
     static void Enable();
 
+    static void EOI();
+
     static void EOI(u8 vector);
 
     static u8 GetApicId();

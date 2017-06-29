@@ -2,6 +2,9 @@
 #include "preempt.h"
 #include "asm.h"
 #include "cpu.h"
+#include "parameters.h"
+
+#include <drivers/vga.h>
 
 namespace Kernel
 {
@@ -21,6 +24,8 @@ bool Panicker::IsActive()
 
 void Panicker::DoPanic(const char *fmt, ...)
 {
+    bool first = false;
+
     if (Active.Cmpxchg(1, 0) == 0)
     {
         va_list args;
@@ -28,6 +33,7 @@ void Panicker::DoPanic(const char *fmt, ...)
         va_start(args, fmt);
         Shared::VsnPrintf(Message, sizeof(Message), fmt, args);
         va_end(args);
+        first = true;
     }
 
     PreemptDisable();
@@ -35,6 +41,11 @@ void Panicker::DoPanic(const char *fmt, ...)
 
     Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
     CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
+
+    if (first && Parameters::GetInstance().IsPanicVga())
+    {
+        VgaTerm::GetInstance().PrintString(Message);
+    }
 
     Hlt();
 }

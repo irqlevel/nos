@@ -11,6 +11,8 @@ Idt::Idt()
     : Base(0)
     , Limit(0)
 {
+    Trace(0, "Idt 0x%p", this);
+
     for (size_t i = 0; i < Shared::ArraySize(Entry); i++)
     {
         Entry[i] = IdtDescriptor::Encode(DummyInterruptStub);
@@ -62,7 +64,7 @@ void Idt::SetDescriptor(u16 index, const IdtDescriptor& desc)
 
 void Idt::DummyInterrupt()
 {
-    DummyHandlerCounter.Inc();
+    DummyInterruptCounter.Inc();
 }
 
 extern "C" void DummyInterrupt()

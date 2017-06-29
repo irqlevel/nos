@@ -18,7 +18,7 @@ BlockAllocatorImpl::BlockAllocatorImpl()
 
 bool BlockAllocatorImpl::Setup(ulong startAddress, ulong endAddress, ulong blockSize)
 {
-    Trace(0, "Setup start 0x%p end 0x%p bsize %u", startAddress, endAddress, blockSize);
+    Trace(0, "0x%p start 0x%p end 0x%p bsize %u", this, startAddress, endAddress, blockSize);
 
     Shared::AutoLock lock(Lock);
     if (Total != 0)
@@ -39,13 +39,16 @@ bool BlockAllocatorImpl::Setup(ulong startAddress, ulong endAddress, ulong block
         Total++;
     }
 
-    Trace(0, "Setup start 0x%p end 0x%p bsize %u total %u", StartAddress, EndAddress, BlockSize, Total);
+    Trace(0, "0x%p start 0x%p end 0x%p bsize %u total %u", this, StartAddress, EndAddress, BlockSize, Total);
 
     return (Total != 0) ? true : false;
 }
 
 BlockAllocatorImpl::~BlockAllocatorImpl()
 {
+    if (Usage != 0)
+        Trace(0, "0x%p usage %u blockSize %u", this, Usage, BlockSize);
+
     BugOn(Usage != 0);
 }
 

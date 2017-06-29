@@ -300,6 +300,8 @@ int StrnCmp(const char *s1, const char *s2, size_t size);
 
 void StrnCpy(char *dst, const char *s, size_t size);
 
+const char* StrChrOnce(const char* s, char sep);
+
 size_t Log2(size_t size);
 
 size_t HashPtr(void *ptr);

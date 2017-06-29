@@ -359,4 +359,31 @@ size_t HashPtr(void *ptr)
     return hash;
 }
 
+const char* StrChrOnce(const char* s, char sep)
+{
+    const char* curr = s;
+    const char* res = nullptr;
+
+    for (;;)
+    {
+        if (*curr == '\0')
+        {
+            return res;
+        }
+
+        if (*curr == sep)
+        {
+            if (res == nullptr)
+            {
+                res = curr;
+            }
+            else
+            {
+                return nullptr;
+            }
+        }
+        curr++;
+    }
+}
+
 }

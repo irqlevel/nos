@@ -53,6 +53,11 @@ bool Lapic::CheckIsr(u8 vector)
     return (ReadReg(IsrBaseIndex + isrRegNumber) & (1 << regOffset)) ? true : false;
 }
 
+void Lapic::EOI()
+{
+    WriteReg(EoiIndex, 0x0);
+}
+
 void Lapic::EOI(u8 vector)
 {
     if (CheckIsr(vector))

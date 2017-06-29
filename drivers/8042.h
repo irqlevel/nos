@@ -6,6 +6,7 @@
 #include <kernel/spin_lock.h>
 #include <kernel/interrupt.h>
 #include <kernel/asm.h>
+#include <kernel/atomic.h>
 #include <lib/ring_buffer.h>
 
 namespace Kernel
@@ -57,6 +58,7 @@ private:
 
     static const size_t MaxObserver = 16;
     IO8042Observer* Observer[MaxObserver];
+    Atomic InterruptCounter;
 };
 
 }

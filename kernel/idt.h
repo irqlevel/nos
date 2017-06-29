@@ -49,7 +49,7 @@ private:
     u16 Limit;
 
     IdtDescriptor Entry[256];
-    Atomic DummyHandlerCounter;
+    Atomic DummyInterruptCounter;
 };
 
 }

@@ -68,6 +68,7 @@ void ApStartup(void *ctx)
 
     SetCr3(PageTable::GetInstance().GetRoot());
 
+    BugOn(IsInterruptEnabled());
     InterruptEnable();
 
     cpu.SetRunning();
@@ -159,6 +160,7 @@ void BpStartup(void* ctx)
 
     PageTable::GetInstance().UnmapNull();
 
+    BugOn(IsInterruptEnabled());
     InterruptEnable();
 
     if (!cpus.StartAll())

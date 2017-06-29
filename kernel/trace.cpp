@@ -1,7 +1,9 @@
 #include "trace.h"
 #include "dmesg.h"
+#include "parameters.h"
 
 #include <drivers/serial.h>
+#include <drivers/vga.h>
 
 namespace Kernel
 {
@@ -39,6 +41,11 @@ void Tracer::Output(const char *fmt, ...)
 
     Serial::GetInstance().PrintString(msg);
     Dmesg::GetInstance().PrintString(msg);
+
+    if (Parameters::GetInstance().IsTraceVga())
+    {
+        VgaTerm::GetInstance().PrintString(msg);
+    }
 }
 
 }

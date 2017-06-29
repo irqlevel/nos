@@ -14,6 +14,7 @@ IO8042::IO8042()
     : IntVector(-1)
     , Mod(0)
 {
+    Trace(0, "IO8042 0x%p", this);
     for (size_t i = 0; i < Shared::ArraySize(Observer); i++)
         Observer[i] = nullptr;
 }
@@ -40,6 +41,7 @@ InterruptHandlerFn IO8042::GetHandlerFn()
 
 void IO8042::Interrupt(Context* ctx)
 {
+    InterruptCounter.Inc();
     (void)ctx;
     Shared::AutoLock lock(Lock);
 
