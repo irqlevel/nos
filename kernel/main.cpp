@@ -14,6 +14,7 @@
 #include "preempt.h"
 #include "dmesg.h"
 #include "watchdog.h"
+#include "parameters.h"
 
 #include <boot/grub.h>
 
@@ -95,6 +96,9 @@ extern "C" void ApMain()
     Gdt::GetInstance().Save();
     Idt::GetInstance().Save();
 
+    if (Parameters::GetInstance().IsSmpOff())
+        Panic("AP cpu started while smp is off");
+
     Lapic::Enable();
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
@@ -153,20 +157,38 @@ void BpStartup(void* ctx)
     Interrupt::Register(kbd, 0x1, 0x21);
     Interrupt::Register(serial, 0x4, 0x24);
 
+    Trace(0, "Interrups registered");
+
     idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
 
+    Trace(0, "IPI registred");
+
     idt.Save();
+
+    Trace(0, "Idt saved");
+
     pit.Setup();
 
+    Trace(0, "Pit setup");
+
     PageTable::GetInstance().UnmapNull();
+
+    Trace(0, "Null unmapped");
+
+    Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
 
     BugOn(IsInterruptEnabled());
     InterruptEnable();
 
-    if (!cpus.StartAll())
+    Trace(0, "Interrupts enabled");
+
+    if (!Parameters::GetInstance().IsSmpOff())
     {
-        Panic("Can't start all cpus");
-        return;
+        if (!cpus.StartAll())
+        {
+            Panic("Can't start all cpus");
+            return;
+        }
     }
 
     PreemptOn();
@@ -179,7 +201,10 @@ void BpStartup(void* ctx)
     {
         if (cpuMask & ((ulong)1 << i))
         {
-            cpus.SendIPI(i);
+            if (i != cpu.GetIndex())
+            {
+                cpus.SendIPI(i);
+            }
         }
     }
 

@@ -57,8 +57,10 @@ void Watchdog::Check()
         auto& listLock = SpinLockListLock[i];
         auto& list = SpinLockList[i];
 
-        listLock.Acquire();
+        if (list.IsEmpty())
+            continue;
 
+        listLock.Acquire();
         for (Shared::ListEntry* entry = list.Flink;
             entry != &list;
             entry = entry->Flink)

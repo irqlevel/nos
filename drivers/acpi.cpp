@@ -168,6 +168,11 @@ Shared::Error Acpi::ParseMADT()
         Trace(AcpiLL, "Acpi: MADT entry 0x%p type %u len %u",
             entry, (ulong)entry->Type, (ulong)entry->Length);
 
+        if (entry->Length == 0)
+        {
+            break;
+        }
+
         switch (entry->Type)
         {
         case MadtEntryTypeLapic:

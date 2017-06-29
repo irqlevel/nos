@@ -16,6 +16,7 @@ public:
 
     bool IsTraceVga();
     bool IsPanicVga();
+    bool IsSmpOff();
 
     Parameters();
     ~Parameters();
@@ -25,5 +26,6 @@ private:
     char Cmdline[256];
     bool TraceVga;
     bool PanicVga;
+    bool SmpOff;
 };
 }

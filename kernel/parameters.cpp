@@ -7,6 +7,8 @@ namespace Kernel
 
 Parameters::Parameters()
     : TraceVga(false)
+    , PanicVga(false)
+    , SmpOff(false)
 {
 }
 
@@ -22,6 +24,11 @@ bool Parameters::IsTraceVga()
 bool Parameters::IsPanicVga()
 {
     return PanicVga;
+}
+
+bool Parameters::IsSmpOff()
+{
+    return SmpOff;
 }
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
@@ -76,6 +83,17 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         {
             Trace(0, "Unknown value %s, key %s", value, key);
         }        
+    }
+    if (Shared::StrCmp(key, "smp") == 0)
+    {
+        if (Shared::StrCmp(value, "off") == 0)
+        {
+            SmpOff = true;
+        }
+        else
+        {
+            Trace(0, "Unknown value %s, key %s", value, key);
+        }
     }
     else
     {
