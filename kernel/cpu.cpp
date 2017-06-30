@@ -256,7 +256,10 @@ void CpuTable::SendIPIAll()
 void Cpu::OnPanic()
 {
     InterruptDisable();
-    Hlt();
+    for (;;)
+    {
+        Pause();
+    }
 }
 
 void Cpu::IPI(Context* ctx)
@@ -284,7 +287,10 @@ void Cpu::IPI(Context* ctx)
             Index, State, IPIConter.Get());
 
         InterruptDisable();
-        Hlt();
+        for (;;)
+        {
+            Pause();
+        }
         return;
     }
 

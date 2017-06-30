@@ -11,6 +11,7 @@ Acpi::Acpi()
     , Rsdt(nullptr)
     , LapicAddress(nullptr)
     , IoApicAddress(nullptr)
+    , IrqToGsiSize(0)
 {
     OemId[0] = '\0';
     for (size_t i = 0; i < Shared::ArraySize(Table); i++)
@@ -213,6 +214,10 @@ Shared::Error Acpi::ParseMADT()
             Trace(AcpiLL, "Acpi: MADT bus 0x%p irq 0x%p gsi 0x%p flags 0x%p",
                 (ulong)isoEntry->BusSource, (ulong)isoEntry->IrqSource, (ulong)isoEntry->GlobalSystemInterrupt,
                 (ulong)isoEntry->Flags);
+
+            if (!RegisterIrqToGsi(isoEntry->IrqSource, isoEntry->GlobalSystemInterrupt))
+                return MakeError(Shared::Error::NoMemory);
+
             break;
         }
         default:
@@ -267,6 +272,32 @@ void* Acpi::GetLapicAddress()
 void* Acpi::GetIoApicAddress()
 {
     return IoApicAddress;
+}
+
+bool Acpi::RegisterIrqToGsi(u8 irq, u32 gsi)
+{
+    if (IrqToGsiSize >= Shared::ArraySize(IrqToGsi))
+        return false;
+
+    auto& entry = IrqToGsi[IrqToGsiSize];
+    entry.Irq = irq;
+    entry.Gsi = gsi;
+    IrqToGsiSize++;
+    return true;
+}
+
+u32 Acpi::GetGsiByIrq(u8 irq)
+{
+    for (size_t i = 0; i < IrqToGsiSize; i++)
+    {
+        auto& entry = IrqToGsi[i];
+        if (entry.Irq == irq)
+        {
+            return entry.Gsi;
+        }
+    }
+
+    return irq;
 }
 
 }

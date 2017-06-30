@@ -126,7 +126,10 @@ void Exit()
 
     __cxa_finalize(0);
     InterruptDisable();
-    Hlt();
+    for (;;)
+    {
+        Pause();
+    }
 }
 
 void BpStartup(void* ctx)
@@ -134,7 +137,6 @@ void BpStartup(void* ctx)
     (void)ctx;
 
     auto& idt = Idt::GetInstance();
-    auto& excTable = ExceptionTable::GetInstance();
     auto& pit = Pit::GetInstance();
     auto& kbd = IO8042::GetInstance();
     auto& serial = Serial::GetInstance();
@@ -142,6 +144,7 @@ void BpStartup(void* ctx)
     auto& ioApic = IoApic::GetInstance();
     auto& cpus = CpuTable::GetInstance();
     auto& cpu = cpus.GetCurrentCpu();
+    auto& acpi = Acpi::GetInstance();
 
     Trace(0, "Cpu %u running rflags 0x%p task 0x%p",
         cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
@@ -150,14 +153,12 @@ void BpStartup(void* ctx)
 
     ioApic.Enable();
 
-    excTable.RegisterExceptionHandlers();
-
     //TODO: irq -> gsi remap by ACPI MADT
-    Interrupt::Register(pit, 0x2, 0x20);
-    Interrupt::Register(kbd, 0x1, 0x21);
-    Interrupt::Register(serial, 0x4, 0x24);
+    Interrupt::Register(pit, acpi.GetGsiByIrq(0x2), 0x20);
+    Interrupt::Register(kbd, acpi.GetGsiByIrq(0x1), 0x21);
+    Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
 
-    Trace(0, "Interrups registered");
+    Trace(0, "Interrupts registered");
 
     idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
 
@@ -242,7 +243,12 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 {
     do {
 
+    auto& pic = Pic::GetInstance();
+    pic.Remap();
+    pic.Disable();
+
     Gdt::GetInstance().Save();
+    ExceptionTable::GetInstance().RegisterExceptionHandlers();
     Idt::GetInstance().Save();
 
     if (!Dmesg::GetInstance().Setup())
@@ -323,16 +329,12 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 
     auto& kbd = IO8042::GetInstance();
     auto& cmd = Cmd::GetInstance();
-    auto& pic = Pic::GetInstance();
     auto& cpus = CpuTable::GetInstance();
     if (!kbd.RegisterObserver(cmd))
     {
         Panic("Can't register cmd in kbd");
         break;
     }
-
-    pic.Remap();
-    pic.Disable();
 
     Lapic::Enable();
 

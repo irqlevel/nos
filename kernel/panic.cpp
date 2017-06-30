@@ -47,7 +47,10 @@ void Panicker::DoPanic(const char *fmt, ...)
         VgaTerm::GetInstance().PrintString(Message);
     }
 
-    Hlt();
+    for (;;)
+    {
+        Pause();
+    }
 }
 
 }

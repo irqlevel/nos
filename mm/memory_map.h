@@ -49,7 +49,7 @@ private:
         u32 Type;
     };
 
-    MemoryRegion Region[16];
+    MemoryRegion Region[64];
     size_t Size;
 };
 

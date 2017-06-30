@@ -65,6 +65,7 @@ void Idt::SetDescriptor(u16 index, const IdtDescriptor& desc)
 void Idt::DummyInterrupt()
 {
     DummyInterruptCounter.Inc();
+    Panic("Unknown interrupt");
 }
 
 extern "C" void DummyInterrupt()

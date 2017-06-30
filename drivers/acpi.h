@@ -21,6 +21,8 @@ public:
 
     void* GetIoApicAddress();
 
+    u32 GetGsiByIrq(u8 irq);
+
 private:
     Acpi();
     ~Acpi();
@@ -127,6 +129,18 @@ private:
 
     void* LapicAddress;
     void* IoApicAddress;
+
+    struct IrqToGsiEntry
+    {
+        u8 Irq;
+        u32 Gsi;
+    };
+
+    IrqToGsiEntry IrqToGsi[64];
+    size_t IrqToGsiSize;
+
+    bool RegisterIrqToGsi(u8 irq, u32 gsi);
+
 };
 
 }
