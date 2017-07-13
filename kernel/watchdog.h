@@ -5,6 +5,7 @@
 #include <lib/printer.h>
 
 #include "spin_lock.h"
+#include "raw_spin_lock.h"
 #include "atomic.h"
 
 namespace Kernel
@@ -32,27 +33,11 @@ private:
     Watchdog& operator=(const Watchdog& other) = delete;
     Watchdog& operator=(Watchdog&& other) = delete;
 
-    class Lock final
-    {
-    public:
-        Lock();
-        ~Lock();
-        void Acquire();
-        void Release();
-    private:
-        Lock(const Lock& other) = delete;
-        Lock(Lock&& other) = delete;
-        Lock& operator=(const Lock& other) = delete;
-        Lock& operator=(Lock&& other) = delete;
-
-        ulong Flags;
-        Atomic RawLock;
-    };
 
     static const size_t SpinLockHashSize = 512;
 
     Shared::ListEntry SpinLockList[SpinLockHashSize];
-    Lock SpinLockListLock[SpinLockHashSize];
+    RawSpinLock SpinLockListLock[SpinLockHashSize];
 
     Atomic CheckCounter;
     Atomic SpinLockCounter;

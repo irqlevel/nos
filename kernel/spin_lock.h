@@ -1,6 +1,6 @@
 #pragma once
 
-#include "atomic.h"
+#include "raw_spin_lock.h"
 #include <lib/lock.h>
 #include <lib/list_entry.h>
 
@@ -34,7 +34,7 @@ private:
 	SpinLock& operator=(const SpinLock& other) = delete;
 	SpinLock& operator=(SpinLock&& other) = delete;
 
-	Atomic RawLock;
+	RawSpinLock RawLock;
 	volatile void* Owner;
 
 public:

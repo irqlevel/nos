@@ -8,37 +8,6 @@
 namespace Kernel
 {
 
-Watchdog::Lock::Lock()
-    : Flags(0)
-    , RawLock(0)
-{
-}
-
-Watchdog::Lock::~Lock()
-{
-}
-
-void Watchdog::Lock::Acquire()
-{
-    PreemptDisable();
-    Flags = GetRflags();
-    InterruptDisable();
-    for (;;)
-    {
-        if (RawLock.Cmpxchg(1, 0) == 0)
-            break;
-
-        Pause();
-    }
-}
-
-void Watchdog::Lock::Release()
-{
-    RawLock.Set(0);
-    SetRflags(Flags);
-    PreemptEnable();
-}
-
 Watchdog::Watchdog()
 {
 }
@@ -60,7 +29,7 @@ void Watchdog::Check()
         if (list.IsEmpty())
             continue;
 
-        listLock.Acquire();
+        ulong flags = listLock.LockIrqSave();
         for (Shared::ListEntry* entry = list.Flink;
             entry != &list;
             entry = entry->Flink)
@@ -77,7 +46,7 @@ void Watchdog::Check()
                 }
             }
         }
-        listLock.Release();
+        listLock.UnlockIrqRestore(flags);
     }
 }
 
@@ -87,10 +56,10 @@ void Watchdog::RegisterSpinLock(SpinLock& lock)
     auto& listLock = SpinLockListLock[i];
     auto& list = SpinLockList[i];
 
-    listLock.Acquire();
+    ulong flags = listLock.LockIrqSave();
     list.InsertTail(&lock.ListEntry);
     SpinLockCounter.Inc();
-    listLock.Release();
+    listLock.UnlockIrqRestore(flags);
 }
 
 void Watchdog::UnregisterSpinLock(SpinLock& lock)
@@ -98,10 +67,10 @@ void Watchdog::UnregisterSpinLock(SpinLock& lock)
     size_t i = Shared::HashPtr(&lock) % Shared::ArraySize(SpinLockList);
     auto& listLock = SpinLockListLock[i];
 
-    listLock.Acquire();
+    ulong flags = listLock.LockIrqSave();
     lock.ListEntry.Remove();
     SpinLockCounter.Dec();
-    listLock.Release();
+    listLock.UnlockIrqRestore(flags);
 }
 
 void Watchdog::Dump(Shared::Printer& printer)
