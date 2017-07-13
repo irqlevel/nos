@@ -168,10 +168,6 @@ void BpStartup(void* ctx)
 
     Trace(0, "Idt saved");
 
-    pit.Setup();
-
-    Trace(0, "Pit setup");
-
     PageTable::GetInstance().UnmapNull();
 
     Trace(0, "Null unmapped");
@@ -180,6 +176,8 @@ void BpStartup(void* ctx)
 
     BugOn(IsInterruptEnabled());
     InterruptEnable();
+
+    pit.Setup();
 
     Trace(0, "Interrupts enabled");
 
