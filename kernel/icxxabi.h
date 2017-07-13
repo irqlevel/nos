@@ -1,5 +1,7 @@
 #pragma once
  
+#include <include/types.h>
+
 #define ATEXIT_MAX_FUNCS	128
  
 #ifdef __cplusplus
@@ -9,7 +11,7 @@ extern "C" {
 /* guard variables */
 
 /* The ABI requires a 64-bit type.  */
-__extension__ typedef int __guard __attribute__((mode(__DI__)));
+__extension__ typedef u64 __guard __attribute__((mode(__DI__)));
 
 int __cxa_guard_acquire(__guard *g);
 
@@ -17,7 +19,7 @@ void __cxa_guard_release(__guard *g);
 
 void __cxa_guard_abort(__guard *);
 
-typedef unsigned uarch_t;
+typedef unsigned long uarch_t;
  
 struct atexit_func_entry_t
 {
