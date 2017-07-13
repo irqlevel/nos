@@ -70,13 +70,13 @@ void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)
     u64 data = 0;
 
     data |= vector; // interrupt vector
-    data |= 0 << 8; // delivery mode: fixed
-    data |= 0 << 11; // destination: physical
-    data |= 0 << 12; // delivery status : relaxed
-    data |= 0 << 13; // pin polarity: active high
-    data |= 0 << 15; // trigger mode: edge
-    data |= 0 << 16; // disable: no
-    data |= apicId << 56; //destination id
+    data |= DmFixed << DelivModeShift; // delivery mode: fixed
+    data |= 0 << DestModeShift; // destination: physical
+    data |= 0 << DelivStatusShift; // delivery status : relaxed
+    data |= 0 << PolarityShift; // pin polarity: active high
+    data |= TriggerEdge << TriggerModeShift; // trigger mode: edge
+    data |= 0 << MaskedShift; // disable: no
+    data |= apicId << DestShift; //destination id
 
     Trace(IoApicLL, "SetIrq irq 0x%p apicId 0x%p vector 0x%p data 0x%p",
         (ulong)irq, (ulong)apicId, (ulong)vector, (ulong)data);

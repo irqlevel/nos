@@ -40,6 +40,20 @@ private:
     static const ulong ApicArb = 0x2;
     static const ulong RedTbl = 0x10;
 
+    static const ulong DelivModeShift = 8;
+    static const ulong DestModeShift = 11;
+    static const ulong DelivStatusShift = 12;
+    static const ulong PolarityShift = 13;
+    static const ulong RemoteIrrShift = 14;
+    static const ulong TriggerModeShift = 15;
+    static const ulong MaskedShift = 16;
+    static const ulong DestShift = 56;
+
+    static const ulong TriggerEdge = 0;
+    static const ulong TriggerLevel = 0;
+
+    static const ulong DmFixed = 0x0;
+
     void *BaseAddress;
     SpinLock OpLock;
 };
