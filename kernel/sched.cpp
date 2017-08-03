@@ -38,9 +38,13 @@ void TaskQueue::SwitchComplete(Task* curr)
             taskQueue->Insert(prev);
             prev->Put();
         }
-    }
 
-    prev->PreemptDisableCounter.Dec();
+        prev->PreemptDisableCounter.Dec();
+    } else {
+
+        prev->PreemptDisableCounter.Dec();
+        prev->Put();
+    }
 }
 
 void TaskQueue::SwitchComplete(void* ctx)
@@ -89,7 +93,6 @@ void TaskQueue::Schedule(Task* curr)
             BugOn(curr->ListEntry.IsEmpty());
             curr->TaskQueue = nullptr;
             curr->ListEntry.RemoveInit();
-            curr->Put();
         }
 
         for (auto currEntry = TaskList.Flink;
@@ -137,6 +140,7 @@ void TaskQueue::Schedule(Task* curr)
         Lock.Unlock();
         SetRflags(flags);
         curr->PreemptDisableCounter.Dec();
+        BugOn(curr->State.Get() == Task::StateExited);
         return;
     }
 
