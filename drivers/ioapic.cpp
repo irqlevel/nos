@@ -53,7 +53,7 @@ void IoApic::Enable()
     // Disable all entries
     for (size_t i = 0; i < pins; i++)
     {
-        SetEntry(i, 1 << 16);
+        SetEntry(i, 1 << MaskedShift);
     }
 
     Trace(IoApicLL, "IO Apic ver 0x%p pins %u", ver, pins);
