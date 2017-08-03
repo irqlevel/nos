@@ -74,6 +74,34 @@ void TaskQueue::Switch(Task* next, Task* curr)
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
 
+Task* TaskQueue::SelectNext(Task *curr)
+{
+    Task* next = nullptr;
+
+    for (auto currEntry = TaskList.Flink;
+        currEntry != &TaskList;
+        currEntry = currEntry->Flink)
+    {
+        Task* cand = CONTAINING_RECORD(currEntry, Task, ListEntry);
+        if (cand == curr)
+        {
+            BugOn(cand->State.Get() == Task::StateExited);
+            cand->ListEntry.Remove();
+            TaskList.InsertTail(&cand->ListEntry);
+            break;
+        }
+
+        if (cand->PreemptDisableCounter.Get() != 0)
+        {
+            continue;
+        }
+        next = cand;
+        break;
+    }
+
+    return next;
+}
+
 void TaskQueue::Schedule(Task* curr)
 {
     ScheduleCounter.Inc();
@@ -95,27 +123,7 @@ void TaskQueue::Schedule(Task* curr)
             curr->ListEntry.RemoveInit();
         }
 
-        for (auto currEntry = TaskList.Flink;
-            currEntry != &TaskList;
-            currEntry = currEntry->Flink)
-        {
-            Task* cand = CONTAINING_RECORD(currEntry, Task, ListEntry);
-            if (cand == curr)
-            {
-                BugOn(cand->State.Get() == Task::StateExited);
-                cand->ListEntry.Remove();
-                TaskList.InsertTail(&cand->ListEntry);
-                break;
-            }
-
-            if (cand->PreemptDisableCounter.Get() != 0)
-            {
-                continue;
-            }
-            next = cand;
-            break;
-        }
-
+        next = SelectNext(curr);
         if (next == nullptr)
         {
             break;

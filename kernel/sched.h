@@ -30,6 +30,8 @@ private:
     TaskQueue& operator=(const TaskQueue& other) = delete;
     TaskQueue& operator=(TaskQueue&& other) = delete;
 
+    Task* SelectNext(Task* curr);
+
     void Switch(Task* curr, Task* next);
 
     void SwitchComplete(Task* curr);
