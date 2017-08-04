@@ -6,6 +6,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 class MmIo
 {
 public:
@@ -23,4 +26,5 @@ public:
     }
 };
 
+}
 }

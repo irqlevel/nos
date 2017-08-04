@@ -8,6 +8,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 void* New(size_t size) noexcept
 {
 
@@ -20,23 +23,24 @@ void Delete(void* ptr) noexcept
 }
 
 }
+}
 
 void* operator new(size_t size) noexcept
 {
-	return Kernel::New(size);
+	return Kernel::Mm::New(size);
 }
 
 void* operator new[](size_t size) noexcept
 {
-	return Kernel::New(size);
+	return Kernel::Mm::New(size);
 }
 
 void operator delete(void* ptr) noexcept
 {
-	Kernel::Delete(ptr);
+	Kernel::Mm::Delete(ptr);
 }
 
 void operator delete[](void* ptr) noexcept
 {
-	Kernel::Delete(ptr);
+	Kernel::Mm::Delete(ptr);
 }

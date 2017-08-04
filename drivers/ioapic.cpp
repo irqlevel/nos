@@ -25,22 +25,22 @@ u32 IoApic::ReadRegister(u8 reg)
 {
     Shared::AutoLock lock(OpLock);
 
-    MmIo::Write32(Shared::MemAdd(BaseAddress, RegSel), reg);
+    Mm::MmIo::Write32(Shared::MemAdd(BaseAddress, RegSel), reg);
 
     Barrier();
 
-    return MmIo::Read32(Shared::MemAdd(BaseAddress, RegWin));
+    return Mm::MmIo::Read32(Shared::MemAdd(BaseAddress, RegWin));
 }
 
 void IoApic::WriteRegister(u8 reg, u32 value)
 {
     Shared::AutoLock lock(OpLock);
 
-    MmIo::Write32(Shared::MemAdd(BaseAddress, RegSel), reg);
+    Mm::MmIo::Write32(Shared::MemAdd(BaseAddress, RegSel), reg);
 
     Barrier();
 
-    MmIo::Write32(Shared::MemAdd(BaseAddress, RegWin), value);
+    Mm::MmIo::Write32(Shared::MemAdd(BaseAddress, RegWin), value);
 }
 
 void IoApic::Enable()

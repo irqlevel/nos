@@ -8,6 +8,9 @@ extern "C" char KernelStart;
 namespace Kernel
 {
 
+namespace Mm
+{
+
 MemoryMap::MemoryMap()
     : Size(0)
 {
@@ -101,4 +104,5 @@ bool MemoryMap::GetRegion(size_t index, u64& addr, u64& len, u32& type)
     return true;
 }
 
+}
 }

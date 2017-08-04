@@ -9,6 +9,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 class Pool
 {
 public:
@@ -37,4 +40,5 @@ private:
     PageAllocator* PageAllocator;
 };
 
+}
 }

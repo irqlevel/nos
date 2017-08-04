@@ -7,6 +7,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 class PageTable final
 {
 public:
@@ -26,6 +29,8 @@ public:
 
     void UnmapNull();
 
+    bool Setup2();
+
 private:
     PageTable(const PageTable& other) = delete;
     PageTable(PageTable&& other) = delete;
@@ -38,12 +43,16 @@ private:
 
     SpinLock Lock;
 
-    struct Entry final
+    struct Pte final
     {
         ulong Value;
 
-        Entry()
+        Pte()
             : Value(0)
+        {
+        }
+
+        ~Pte()
         {
         }
 
@@ -98,20 +107,36 @@ private:
         static const ulong HugeBit = 7;
     };
 
-    static_assert(sizeof(Entry) == 8, "Invalid size");
+    static_assert(sizeof(Pte) == 8, "Invalid size");
+
+    struct PtePage final
+    {
+        struct Pte Entry[512];
+    };
+
+    static_assert(sizeof(PtePage) == Shared::PageSize, "Invalid size");
+
+    PtePage P4Page __attribute__((aligned(Shared::PageSize)));
+    PtePage P3KernelPage __attribute__((aligned(Shared::PageSize)));
+    PtePage P3UserPage __attribute__((aligned(Shared::PageSize)));
+    PtePage P2KernelPage[4] __attribute__((aligned(Shared::PageSize)));
+    PtePage P2UserPage[4] __attribute__((aligned(Shared::PageSize)));
 
     struct Page final
     {
-        struct Entry Entry[512];
-    } __attribute__((aligned(Shared::PageSize)));
+        Shared::ListEntry ListEntry;
+        Kernel::Atomic RefCounter;
+        ulong Pfn;
+    };
 
-    Page P4Page;
-    Page P3KernelPage;
-    Page P3UserPage;
-    Page P2KernelPage[4];
-    Page P2UserPage[4];
+    static_assert(sizeof(Page) == 0x20, "Invalid size");
 
-    static_assert(sizeof(Page) == Shared::PageSize, "Invalid size");
+    struct Page *Pages;
+    size_t PageCount;
+    ulong State;
+
+    Shared::ListEntry FreePagesList;
 };
 
+}
 }

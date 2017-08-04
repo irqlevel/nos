@@ -9,6 +9,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 class PageAllocator
 {
 public:
@@ -45,4 +48,5 @@ private:
 
 };
 
+}
 }

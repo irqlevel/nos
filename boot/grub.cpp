@@ -42,7 +42,7 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
                 Trace(0, "Mmap addr 0x%p len 0x%p type %u",
                     entry->Addr, entry->Len, (ulong)entry->Type);
 
-                if (!Kernel::MemoryMap::GetInstance().AddRegion(entry->Addr, entry->Len, entry->Type))
+                if (!Kernel::Mm::MemoryMap::GetInstance().AddRegion(entry->Addr, entry->Len, entry->Type))
                     Panic("Can't add memory region");
 
             }

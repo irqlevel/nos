@@ -10,6 +10,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 Pool::Pool()
     : Usage(0)
     , Size(0)
@@ -112,4 +115,5 @@ void Pool::Free(void* ptr)
     Usage--;
 }
 
+}
 }

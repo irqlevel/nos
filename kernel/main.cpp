@@ -79,7 +79,7 @@ void ApStartup(void *ctx)
 
     Idt::GetInstance().Save();
 
-    SetCr3(PageTable::GetInstance().GetRoot());
+    SetCr3(Mm::PageTable::GetInstance().GetRoot());
 
     BugOn(IsInterruptEnabled());
     InterruptEnable();
@@ -184,7 +184,7 @@ void BpStartup(void* ctx)
 
     Trace(0, "Idt saved");
 
-    PageTable::GetInstance().UnmapNull();
+    Mm::PageTable::GetInstance().UnmapNull();
 
     Trace(0, "Null unmapped");
 
@@ -281,11 +281,11 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 
     Grub::ParseMultiBootInfo(MbInfo);
 
-    auto& mmap = MemoryMap::GetInstance();
+    auto& mmap = Mm::MemoryMap::GetInstance();
     Trace(0, "Enter kernel: start 0x%p end 0x%p",
         mmap.GetKernelStart(), mmap.GetKernelEnd());
 
-    auto& pt = PageTable::GetInstance();
+    auto& pt = Mm::PageTable::GetInstance();
     if (!pt.Setup())
     {
         Panic("Can't setup paging");
@@ -293,9 +293,17 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
     }
 
     Trace(0, "Paging root 0x%p old cr3 0x%p", pt.GetRoot(), GetCr3());
-
     SetCr3(pt.GetRoot());
+    Trace(0, "Set new cr3 0x%p", GetCr3());
 
+    if (!pt.Setup2())
+    {
+        Panic("Can't setup paging 2");
+        break;
+    }
+
+    Trace(0, "Paging root 0x%p old cr3 0x%p", pt.GetRoot(), GetCr3());
+    SetCr3(pt.GetRoot());
     Trace(0, "Set new cr3 0x%p", GetCr3());
 
     ulong memStart, memEnd;
@@ -313,13 +321,13 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
     }
 
     Trace(0, "Memory region 0x%p 0x%p", memStart, memEnd);
-    if (!PageAllocatorImpl::GetInstance().Setup(pt.PhysToVirt(memStart), pt.PhysToVirt(memEnd)))
+    if (!Mm::PageAllocatorImpl::GetInstance().Setup(pt.PhysToVirt(memStart), pt.PhysToVirt(memEnd)))
     {
         Panic("Can't setup page allocator");
         break;
     }
 
-    AllocatorImpl::GetInstance(PageAllocatorImpl::GetInstance());
+    Mm::AllocatorImpl::GetInstance(Mm::PageAllocatorImpl::GetInstance());
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
 

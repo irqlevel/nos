@@ -7,12 +7,17 @@
 namespace Kernel
 {
 
+namespace Mm
+{
 
 // N pages
 // N * sizeof(page)
 // N * 8 = sizeof page entries
 
 PageTable::PageTable()
+    : Pages(nullptr)
+    , PageCount(0)
+    , State(1)
 {
     Shared::MemSet(&P4Page, 0, sizeof(P4Page));
 
@@ -27,17 +32,33 @@ PageTable::PageTable()
 
 ulong PageTable::VirtToPhys(ulong virtAddr)
 {
-    BugOn(virtAddr > MemoryMap::UserSpaceMax && virtAddr < MemoryMap::KernelSpaceBase);
+    switch (State)
+    {
+    case 1:
+    case 2:
+        BugOn(virtAddr > MemoryMap::UserSpaceMax && virtAddr < MemoryMap::KernelSpaceBase);
 
-    if (virtAddr <= MemoryMap::UserSpaceMax)
-        return virtAddr;
+        if (virtAddr <= MemoryMap::UserSpaceMax)
+            return virtAddr;
 
-    return virtAddr - MemoryMap::KernelSpaceBase;
+        return virtAddr - MemoryMap::KernelSpaceBase;
+    default:
+        Panic("Invalid state");
+        return -1;
+    }
 }
 
 ulong PageTable::PhysToVirt(ulong phyAddr)
 {
-    return phyAddr + MemoryMap::KernelSpaceBase;
+    switch (State)
+    {
+    case 1:
+    case 2:
+        return phyAddr + MemoryMap::KernelSpaceBase;
+    default:
+        Panic("Invalid state");
+        return -1;
+    }
 }
 
 bool PageTable::Setup()
@@ -109,22 +130,81 @@ bool PageTable::Setup()
         }
     }
 
+    State = 2;
     return true;
 }
 
 void PageTable::UnmapNull()
 {
-    P2UserPage[0].Entry[0].Value = 0;
-    Invlpg(0);
+    switch (State)
+    {
+    case 2:
+        P2UserPage[0].Entry[0].Value = 0;
+        Invlpg(0);
+        return;
+    default:
+        Panic("Invalid state");
+    }
 }
 
 ulong PageTable::GetRoot()
 {
-    return VirtToPhys((ulong)&P4Page);
+    switch (State)
+    {
+    case 2:
+        return VirtToPhys((ulong)&P4Page);
+    default:
+        Panic("Invalid state");
+        return -1;
+    }
 }
 
 PageTable::~PageTable()
 {
 }
 
+bool PageTable::Setup2()
+{
+    auto& mmap = MemoryMap::GetInstance();
+    ulong memStart, memEnd;
+
+    if (!mmap.FindRegion(VirtToPhys(mmap.GetKernelEnd()), 4 * Shared::GB, memStart, memEnd))
+    {
+        Trace(0, "Can't get available memory region");
+        return false;
+    }
+
+    if (memStart % Shared::PageSize)
+    {
+        Trace(0, "Invalid memory start");
+        return false;
+    }
+
+    if (memEnd % Shared::PageSize)
+    {
+        Trace(0, "Invalid memory end");
+        return false;
+    }
+
+    size_t pageCount = memEnd / Shared::PageSize;
+    Trace(0, "Phy page count %u", pageCount);
+
+    Page* pageStart = (Page*)PhysToVirt(memStart);
+    for (size_t i = 0; i < pageCount; i++)
+    {
+        Page* page = &pageStart[i];
+        if ((ulong)Shared::MemAdd(page, sizeof(*page)) >= PhysToVirt(memEnd))
+        {
+            Trace(0, "Pages array overflow memory end");
+            return false;
+        }
+
+        page->Pfn = i;
+        FreePagesList.InsertTail(&page->ListEntry);
+    }
+
+    return true;
+}
+
+}
 }

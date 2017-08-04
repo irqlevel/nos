@@ -7,7 +7,7 @@ namespace Kernel
 {
 
 VgaTerm::VgaTerm()
-    : Buf(reinterpret_cast<u16*>(PageTable::GetInstance().PhysToVirt(BufAddr)))
+    : Buf(reinterpret_cast<u16*>(Mm::PageTable::GetInstance().PhysToVirt(BufAddr)))
     , Row(0)
     , Column(0)
     , Width(MaxWidth)

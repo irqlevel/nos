@@ -6,6 +6,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 class MemoryMap final
 {
 public:
@@ -53,4 +56,5 @@ private:
     size_t Size;
 };
 
+}
 }

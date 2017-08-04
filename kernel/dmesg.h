@@ -56,7 +56,7 @@ private:
 
     char Buf[32 * Shared::PageSize]  __attribute__((aligned(sizeof(DmesgMsg))));
 
-    BlockAllocatorImpl MsgBuf;
+    Mm::BlockAllocatorImpl MsgBuf;
 
     Shared::ListEntry MsgList;
 

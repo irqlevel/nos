@@ -6,6 +6,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 BlockAllocatorImpl::BlockAllocatorImpl()
     : Usage(0)
     , Total(0)
@@ -93,4 +96,5 @@ void BlockAllocatorImpl::Free(void *block)
     Usage--;
 }
 
+}
 }

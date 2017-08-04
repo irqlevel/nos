@@ -7,6 +7,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 class BlockAllocatorImpl
 {
 public:
@@ -38,4 +41,5 @@ private:
     SpinLock Lock;
 };
 
+}
 }

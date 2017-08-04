@@ -8,6 +8,9 @@
 namespace Kernel
 {
 
+namespace Mm
+{
+
 PageAllocatorImpl::PageAllocatorImpl()
 {
 }
@@ -62,4 +65,5 @@ void PageAllocatorImpl::Free(void* pages)
     Panic("Can't free pages 0x%p", pages);
 }
 
+}
 }
