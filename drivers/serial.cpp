@@ -34,7 +34,8 @@ void Serial::Send()
             Lock.Unlock(flags);
             Wait();
             Lock.Lock(flags);
-            Outb(Port, Buf.Get());
+            if (!Buf.IsEmpty())
+                Outb(Port, Buf.Get());
             Lock.Unlock(flags);
         }
         else
