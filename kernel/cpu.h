@@ -9,6 +9,8 @@
 namespace Kernel
 {
 
+const ulong MaxCpus = 8;
+
 class Cpu final
 {
 public:
@@ -99,10 +101,8 @@ private:
 
     ulong GetBspIndexLockHeld();
 
-    static const ulong MaxCpu = 8;
-
     SpinLock Lock;
-    Cpu CpuArray[MaxCpu];
+    Cpu CpuArray[MaxCpus];
 
     ulong BspIndex;
 

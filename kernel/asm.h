@@ -61,6 +61,8 @@ void AtomicDec(volatile long *pvalue);
 long AtomicRead(volatile long *pvalue);
 void AtomicWrite(volatile long *pvalue, long newValue);
 long AtomicReadAndDec(volatile long *pvalue);
+long AtomicReadAndInc(volatile long *pvalue);
+
 long AtomicCmpxchg(volatile long *pvalue, long exchange, long comparand);
 
 long AtomicTestAndSetBit(volatile long *pvalue, ulong bit);

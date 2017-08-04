@@ -39,6 +39,18 @@
 using namespace Kernel;
 using namespace Shared;
 
+const size_t CpuStackSize = 8 * Shared::PageSize;
+static char Stack[MaxCpus][8 * Shared::PageSize] __attribute__((aligned(Shared::PageSize)));
+static long StackIndex;
+
+#define ALLOC_CPU_STACK()                               \
+do {                                                    \
+    auto index = AtomicReadAndInc(&StackIndex);         \
+    if (index >= (long)MaxCpus)                         \
+        Panic("Can't allocate stack for cpu");          \
+    SetRsp((long)&Stack[index][CpuStackSize]);          \
+} while (false)
+
 void TraceCpuState(ulong cpu)
 {
     Trace(0, "Cpu %u cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
@@ -93,6 +105,8 @@ void ApStartup(void *ctx)
 
 extern "C" void ApMain()
 {
+    ALLOC_CPU_STACK();
+
     Gdt::GetInstance().Save();
     Idt::GetInstance().Save();
 
@@ -102,6 +116,8 @@ extern "C" void ApMain()
     Lapic::Enable();
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+
+    Trace(0, "Cpu %u rsp 0x%p", cpu.GetIndex(), GetRsp());
 
     if (!cpu.Run(ApStartup, nullptr))
     {
@@ -241,6 +257,8 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 {
     do {
 
+    ALLOC_CPU_STACK();
+
     auto& pic = Pic::GetInstance();
     pic.Remap();
     pic.Disable();
@@ -256,6 +274,8 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
     }
 
     Tracer::GetInstance().SetLevel(1);
+
+    Trace(0, "Cpu BP rsp 0x%p", GetRsp());
 
     VgaTerm::GetInstance().Printf("Hello!\n");
 
