@@ -4,8 +4,10 @@
 #include <kernel/atomic.h>
 #include <kernel/panic.h>
 
-namespace Kernel
+namespace Stdlib
 {
+
+const int SharedPtrLL = 5;
 
 template<typename T>
 class ObjectReference final
@@ -84,7 +86,7 @@ public:
     }
 
 private:
-    Atomic Counter;
+    Kernel::Atomic Counter;
     T* Object;
 
     ObjectReference() = delete;
@@ -239,7 +241,7 @@ SharedPtr<T> MakeShared(Args&&... args)
     if (objRef == nullptr)
         return SharedPtr<T>();
 
-    T* object = new T(Shared::Forward<Args>(args)...);
+    T* object = new T(Stdlib::Forward<Args>(args)...);
     if (object == nullptr)
     {
         delete objRef;

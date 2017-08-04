@@ -31,7 +31,7 @@ void Panicker::DoPanic(const char *fmt, ...)
         va_list args;
 
         va_start(args, fmt);
-        Shared::VsnPrintf(Message, sizeof(Message), fmt, args);
+        Stdlib::VsnPrintf(Message, sizeof(Message), fmt, args);
         va_end(args);
         first = true;
     }

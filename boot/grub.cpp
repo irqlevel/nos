@@ -18,7 +18,7 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
     MultiBootTag * tag;
     for (tag = reinterpret_cast<MultiBootTag*>(MbInfo + 1);
         tag->Type != MultiBootTagTypeEnd;
-        tag = reinterpret_cast<MultiBootTag*>(Shared::MemAdd(tag, (tag->Size + 7) & ~7)))
+        tag = reinterpret_cast<MultiBootTag*>(Stdlib::MemAdd(tag, (tag->Size + 7) & ~7)))
     {
         Trace(0, "Tag %u Size %u", (ulong)tag->Type, (ulong)tag->Size);
         switch (tag->Type)
@@ -36,8 +36,8 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
             MultiBootMmapEntry* entry;
 
             for (entry = &mmap->Entry[0];
-                 Shared::MemAdd(entry, mmap->EntrySize) <= Shared::MemAdd(mmap, mmap->Size);
-                 entry = reinterpret_cast<MultiBootMmapEntry*>(Shared::MemAdd(entry, mmap->EntrySize)))
+                 Stdlib::MemAdd(entry, mmap->EntrySize) <= Stdlib::MemAdd(mmap, mmap->Size);
+                 entry = reinterpret_cast<MultiBootMmapEntry*>(Stdlib::MemAdd(entry, mmap->EntrySize)))
             {
                 Trace(0, "Mmap addr 0x%p len 0x%p type %u",
                     entry->Addr, entry->Len, (ulong)entry->Type);

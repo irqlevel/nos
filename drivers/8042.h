@@ -51,7 +51,7 @@ private:
     static const ulong Port = 0x60;
 
     SpinLock Lock;
-    Shared::RingBuffer<u8, Shared::PageSize> Buf;
+    Stdlib::RingBuffer<u8, Const::PageSize> Buf;
 
     int IntVector;
     u8 Mod;

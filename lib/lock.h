@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 
-namespace Shared
+namespace Stdlib
 {
 
 class LockInterface
@@ -70,8 +70,8 @@ private:
 };
 
 class NopLock
-	: public Shared::LockInterface
-	, public Shared::SharedLockInterface
+	: public Stdlib::LockInterface
+	, public Stdlib::SharedLockInterface
 {
 public:
 	NopLock()

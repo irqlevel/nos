@@ -14,7 +14,7 @@ namespace Mm
 AllocatorImpl::AllocatorImpl(class PageAllocator& pageAllocator)
 	: PageAllocator(pageAllocator)
 {
-	for (size_t i = 0; i < Shared::ArraySize(Pool); i++)
+	for (size_t i = 0; i < Stdlib::ArraySize(Pool); i++)
 	{
 		Pool[i].Setup(static_cast<size_t>(1) << (StartLog + i), &PageAllocator);
 	}
@@ -34,7 +34,7 @@ size_t AllocatorImpl::Log2(size_t size)
 	}
 	else
 	{
-		log = Shared::Log2(size);
+		log = Stdlib::Log2(size);
 	}
 
 	BugOn((static_cast<size_t>(1) << log) < size);
@@ -48,15 +48,15 @@ void* AllocatorImpl::Alloc(size_t size)
 
 	Header* header;
 	size_t reqSize = (size + sizeof(*header));
-	if (reqSize >= (Shared::PageSize / 2))
+	if (reqSize >= (Const::PageSize / 2))
 	{
-		return PageAllocator.Alloc(Shared::SizeInPages(size));
+		return PageAllocator.Alloc(Stdlib::SizeInPages(size));
 	}
 
 	size_t log = Log2(reqSize);
 
 	Trace(AllocatorLL, "0x%p size 0x%p log 0x%p", this, size, log);
-	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Shared::ArraySize(Pool)))
+	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Stdlib::ArraySize(Pool)))
 	{
 		return nullptr;
 	}
@@ -76,7 +76,7 @@ void AllocatorImpl::Free(void* ptr)
 {
 	BugOn(ptr == nullptr);
 
-	if ((reinterpret_cast<ulong>(ptr) & (Shared::PageSize - 1)) == 0)
+	if ((reinterpret_cast<ulong>(ptr) & (Const::PageSize - 1)) == 0)
 	{
 		PageAllocator.Free(ptr);
 		return;
@@ -90,7 +90,7 @@ void AllocatorImpl::Free(void* ptr)
 	}
 
 	size_t log = Log2(header->Size + sizeof(*header));
-	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Shared::ArraySize(Pool)))
+	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Stdlib::ArraySize(Pool)))
 	{
 		return;
 	}

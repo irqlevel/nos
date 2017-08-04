@@ -12,7 +12,7 @@ namespace Kernel
 
 TaskQueue::TaskQueue()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     TaskList.Init();
 
     SwitchContextCounter.Set(0);
@@ -160,8 +160,8 @@ void TaskQueue::Insert(Task* task)
 {
     task->Get();
 
-    Shared::AutoLock lock(Lock);
-    Shared::AutoLock lock2(task->Lock);
+    Stdlib::AutoLock lock(Lock);
+    Stdlib::AutoLock lock2(task->Lock);
 
     BugOn(task->TaskQueue != nullptr);
     BugOn(!(task->ListEntry.IsEmpty()));
@@ -173,8 +173,8 @@ void TaskQueue::Insert(Task* task)
 void TaskQueue::Remove(Task* task)
 {
     {
-        Shared::AutoLock lock(Lock);
-        Shared::AutoLock lock2(task->Lock);
+        Stdlib::AutoLock lock(Lock);
+        Stdlib::AutoLock lock2(task->Lock);
 
         BugOn(task->TaskQueue != this);
         BugOn(task->ListEntry.IsEmpty());
@@ -187,9 +187,9 @@ void TaskQueue::Remove(Task* task)
 
 void TaskQueue::Clear()
 {
-    Shared::ListEntry taskList;
+    Stdlib::ListEntry taskList;
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
         taskList.MoveTailList(&TaskList);
     }
 
@@ -199,7 +199,7 @@ void TaskQueue::Clear()
     while (!taskList.IsEmpty())
     {
         Task* task = CONTAINING_RECORD(taskList.RemoveHead(), Task, ListEntry);
-        Shared::AutoLock lock2(task->Lock);
+        Stdlib::AutoLock lock2(task->Lock);
         BugOn(task->TaskQueue != this);
         task->TaskQueue = nullptr;
         task->Put();
@@ -230,7 +230,7 @@ void Schedule()
     curr->PreemptDisableCounter.Inc();
     if (curr->PreemptDisableCounter.Get() > 1)
     {
-        Shared::AutoLock lock(curr->Lock);
+        Stdlib::AutoLock lock(curr->Lock);
         curr->UpdateRuntime();
         curr->PreemptDisableCounter.Dec();
         return;

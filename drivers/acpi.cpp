@@ -14,7 +14,7 @@ Acpi::Acpi()
     , IrqToGsiSize(0)
 {
     OemId[0] = '\0';
-    for (size_t i = 0; i < Shared::ArraySize(Table); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Table); i++)
     {
         Table[i] = nullptr;
     }
@@ -45,7 +45,7 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
             rsdp, (ulong)ComputeSum(rsdp, sizeof(rsdp->FirstPart)));
     }
 
-    Shared::MemCpy(OemId, rsdp->FirstPart.OEMID, sizeof(rsdp->FirstPart.OEMID));
+    Stdlib::MemCpy(OemId, rsdp->FirstPart.OEMID, sizeof(rsdp->FirstPart.OEMID));
 
     Trace(AcpiLL, "Rsdp 0x%p revision %u OemId %s Rsdt 0x%p",
         rsdp, (ulong)rsdp->FirstPart.Revision, OemId, (ulong)rsdp->FirstPart.RsdtAddress);
@@ -75,12 +75,12 @@ Acpi::RSDPDescriptor20* Acpi::FindRsdp()
     return nullptr;
 }
 
-Shared::Error Acpi::ParseRsdt(ACPISDTHeader* rsdt)
+Stdlib::Error Acpi::ParseRsdt(ACPISDTHeader* rsdt)
 {
-    if (Shared::StrnCmp(rsdt->Signature, "RSDT", sizeof(rsdt->Signature)) != 0)
+    if (Stdlib::StrnCmp(rsdt->Signature, "RSDT", sizeof(rsdt->Signature)) != 0)
     {
         Trace(AcpiLL, "Rsdt 0x%p invalid signature", rsdt);
-        return MakeError(Shared::Error::NotFound);
+        return MakeError(Stdlib::Error::NotFound);
     }
 
     if (checkRsdtChecksum)
@@ -89,23 +89,23 @@ Shared::Error Acpi::ParseRsdt(ACPISDTHeader* rsdt)
         {
             Trace(AcpiLL, "Rsdt 0x%p checksum failed 0x%p vs 0x%p",
                 rsdt, (ulong)ComputeSum(rsdt, sizeof(rsdt->Length)), (ulong)rsdt->Checksum);
-             return MakeError(Shared::Error::NotFound);
+             return MakeError(Stdlib::Error::NotFound);
         }
     }
 
-    return MakeError(Shared::Error::Success);
+    return MakeError(Stdlib::Error::Success);
 }
 
 Acpi::ACPISDTHeader* Acpi::LookupTable(const char *name)
 {
-    if (Shared::StrLen(name) != 4)
+    if (Stdlib::StrLen(name) != 4)
     {
         return nullptr;
     }
 
-    for (size_t i = 0; i < Shared::ArraySize(Table); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Table); i++)
     {
-        if (Table[i] != nullptr && Shared::StrnCmp(Table[i]->Signature, name, 4) == 0)
+        if (Table[i] != nullptr && Stdlib::StrnCmp(Table[i]->Signature, name, 4) == 0)
         {
             return Table[i];
         }
@@ -114,12 +114,12 @@ Acpi::ACPISDTHeader* Acpi::LookupTable(const char *name)
     return nullptr;
 }
 
-Shared::Error Acpi::ParseTablePointers()
+Stdlib::Error Acpi::ParseTablePointers()
 {
-    Shared::Error err;
+    Stdlib::Error err;
 
     if (Rsdt->Length <= sizeof(*Rsdt))
-        return MakeError(Shared::Error::NotFound);
+        return MakeError(Stdlib::Error::NotFound);
 
     size_t tableCount = (Rsdt->Length - OFFSET_OF(ACPISDTHeader, Entry)) / sizeof(Rsdt->Entry[0]);
     Trace(AcpiLL, "Acpi: tableCount %u", tableCount);
@@ -129,29 +129,29 @@ Shared::Error Acpi::ParseTablePointers()
         ACPISDTHeader* header = reinterpret_cast<ACPISDTHeader*>(Rsdt->Entry[i]);
         char tableSignature[5];
 
-        Shared::MemCpy(tableSignature, header->Signature, sizeof(header->Signature));
+        Stdlib::MemCpy(tableSignature, header->Signature, sizeof(header->Signature));
         tableSignature[4] = '\0';
 
         Trace(AcpiLL, "Acpi: table 0x%p %s", header, tableSignature);
-        if (i >= Shared::ArraySize(Table))
+        if (i >= Stdlib::ArraySize(Table))
         {
             Trace(0, "Acpi: can't insert table %u", (ulong)i);
-            return MakeError(Shared::Error::NotFound);
+            return MakeError(Stdlib::Error::NotFound);
         }
 
         Table[i] = header;
         header++;
     }
 
-     return MakeError(Shared::Error::Success);
+     return MakeError(Stdlib::Error::Success);
 }
 
-Shared::Error Acpi::ParseMADT()
+Stdlib::Error Acpi::ParseMADT()
 {
     ACPISDTHeader* sdtHeader = LookupTable("APIC");
     if (sdtHeader == nullptr)
     {
-        return MakeError(Shared::Error::NotFound);
+        return MakeError(Stdlib::Error::NotFound);
     }
 
     Trace(AcpiLL, "Acpi: MADT 0x%p", sdtHeader);
@@ -164,7 +164,7 @@ Shared::Error Acpi::ParseMADT()
 
     MadtEntry* entry = &header->Entry[0];
 
-    while (Shared::MemAdd(entry, entry->Length) <= Shared::MemAdd(sdtHeader, sdtHeader->Length))
+    while (Stdlib::MemAdd(entry, entry->Length) <= Stdlib::MemAdd(sdtHeader, sdtHeader->Length))
     {
         Trace(AcpiLL, "Acpi: MADT entry 0x%p type %u len %u",
             entry, (ulong)entry->Type, (ulong)entry->Length);
@@ -180,7 +180,7 @@ Shared::Error Acpi::ParseMADT()
         {
             MadtLapicEntry* lapicEntry = reinterpret_cast<MadtLapicEntry*>(entry + 1);
             if (entry->Length < sizeof(*lapicEntry) + sizeof(*entry))
-                return MakeError(Shared::Error::InvalidValue);
+                return MakeError(Stdlib::Error::InvalidValue);
 
             Trace(AcpiLL, "Acpi: MADT lapic procId %u apicId %u flags 0x%p",
                 (ulong)lapicEntry->AcpiProcessId, (ulong)lapicEntry->ApicId, (ulong)lapicEntry->Flags);
@@ -188,7 +188,7 @@ Shared::Error Acpi::ParseMADT()
             if (lapicEntry->Flags & 0x1)
             {
                 if (!CpuTable::GetInstance().InsertCpu(lapicEntry->ApicId))
-                    return MakeError(Shared::Error::Unsuccessful);
+                    return MakeError(Stdlib::Error::Unsuccessful);
             }
             break;
         }
@@ -196,7 +196,7 @@ Shared::Error Acpi::ParseMADT()
         {
             MadtIoApicEntry* ioApicEntry = reinterpret_cast<MadtIoApicEntry*>(entry + 1);
             if (entry->Length < sizeof(*ioApicEntry) + sizeof(*entry))
-                return MakeError(Shared::Error::InvalidValue);
+                return MakeError(Stdlib::Error::InvalidValue);
 
             IoApicAddress = reinterpret_cast<void*>((ulong)ioApicEntry->IoApicAddress);
 
@@ -209,14 +209,14 @@ Shared::Error Acpi::ParseMADT()
         {
             MadtIntSrcOverrideEntry* isoEntry = reinterpret_cast<MadtIntSrcOverrideEntry*>(entry + 1);
             if (entry->Length < sizeof(*isoEntry) + sizeof(*entry))
-                return MakeError(Shared::Error::InvalidValue);
+                return MakeError(Stdlib::Error::InvalidValue);
 
             Trace(AcpiLL, "Acpi: MADT bus 0x%p irq 0x%p gsi 0x%p flags 0x%p",
                 (ulong)isoEntry->BusSource, (ulong)isoEntry->IrqSource, (ulong)isoEntry->GlobalSystemInterrupt,
                 (ulong)isoEntry->Flags);
 
             if (!RegisterIrqToGsi(isoEntry->IrqSource, isoEntry->GlobalSystemInterrupt))
-                return MakeError(Shared::Error::NoMemory);
+                return MakeError(Stdlib::Error::NoMemory);
 
             break;
         }
@@ -224,19 +224,19 @@ Shared::Error Acpi::ParseMADT()
             break;
         }
 
-        entry = static_cast<MadtEntry*>(Shared::MemAdd(entry, entry->Length));
+        entry = static_cast<MadtEntry*>(Stdlib::MemAdd(entry, entry->Length));
     }
 
-    return MakeError(Shared::Error::Success);
+    return MakeError(Stdlib::Error::Success);
 }
 
-Shared::Error Acpi::Parse()
+Stdlib::Error Acpi::Parse()
 {
-    Shared::Error err;
+    Stdlib::Error err;
     RSDPDescriptor20* rsdp = FindRsdp();
     if (rsdp == nullptr)
     {
-        return MakeError(Shared::Error::NotFound);
+        return MakeError(Stdlib::Error::NotFound);
     }
 
     Rsdp = rsdp;
@@ -260,7 +260,7 @@ Shared::Error Acpi::Parse()
         return err;
     }
 
-    return MakeError(Shared::Error::Success);
+    return MakeError(Stdlib::Error::Success);
 }
 
 
@@ -276,7 +276,7 @@ void* Acpi::GetIoApicAddress()
 
 bool Acpi::RegisterIrqToGsi(u8 irq, u32 gsi)
 {
-    if (IrqToGsiSize >= Shared::ArraySize(IrqToGsi))
+    if (IrqToGsiSize >= Stdlib::ArraySize(IrqToGsi))
         return false;
 
     auto& entry = IrqToGsi[IrqToGsiSize];

@@ -22,7 +22,7 @@ Pit::~Pit()
 
 void Pit::Setup()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     ReloadValue = 11932; // 1193182 / 11932.0 = 99.99849145155883
     TickMs = 10; // 1000 / 99.99849145155883 = 10.00015085711987
@@ -31,8 +31,8 @@ void Pit::Setup()
     TimeMsNs = 0;
 
     Outb(ModePort, 0b00110100); //channel 0, lobyte/hibyte, rate generator
-    Outb(Channel0Port, Shared::LowPart(ReloadValue));
-    Outb(Channel0Port, Shared::HighPart(ReloadValue));
+    Outb(Channel0Port, Stdlib::LowPart(ReloadValue));
+    Outb(Channel0Port, Stdlib::HighPart(ReloadValue));
 }
 
 void Pit::OnInterruptRegister(u8 irq, u8 vector)
@@ -50,13 +50,13 @@ void Pit::Interrupt(Context* ctx)
 {
     (void)ctx;
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         TimeMs += TickMs;
         TimeMsNs += TickMsNs;
-        while (TimeMsNs >= Shared::NanoSecsInMs)
+        while (TimeMsNs >= Const::NanoSecsInMs)
         {
-            TimeMsNs -= Shared::NanoSecsInMs;
+            TimeMsNs -= Const::NanoSecsInMs;
             TimeMs += 1;
         }
 
@@ -66,9 +66,9 @@ void Pit::Interrupt(Context* ctx)
     Lapic::EOI(IntVector);
 }
 
-Shared::Time Pit::GetTime()
+Stdlib::Time Pit::GetTime()
 {
-    return Shared::Time(TimeMs * Shared::NanoSecsInMs + TimeMsNs);
+    return Stdlib::Time(TimeMs * Const::NanoSecsInMs + TimeMsNs);
 }
 
 extern "C" void PitInterrupt(Context* ctx)
@@ -76,9 +76,9 @@ extern "C" void PitInterrupt(Context* ctx)
     Pit::GetInstance().Interrupt(ctx);
 }
 
-void Pit::Wait(const Shared::Time& timeout)
+void Pit::Wait(const Stdlib::Time& timeout)
 {
-    Shared::Time expired = GetTime() + timeout;
+    Stdlib::Time expired = GetTime() + timeout;
 
     while (GetTime() < expired)
     {
@@ -88,7 +88,7 @@ void Pit::Wait(const Shared::Time& timeout)
 
 void Pit::Wait(ulong nanoSecs)
 {
-    Shared::Time timeout(nanoSecs);
+    Stdlib::Time timeout(nanoSecs);
 
     Wait(timeout);
 }

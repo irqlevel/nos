@@ -4,5 +4,5 @@
 
 namespace Kernel
 {
-    Shared::Time GetBootTime();
+    Stdlib::Time GetBootTime();
 }

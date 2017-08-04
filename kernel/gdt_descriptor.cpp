@@ -22,8 +22,8 @@ u32 GdtDescriptor::GetBase()
 	u32 high, low;
 	u32 base;
 
-	high = Shared::HighPart(Value);
-	low = Shared::LowPart(Value);
+	high = Stdlib::HighPart(Value);
+	low = Stdlib::LowPart(Value);
 	base = 0;
 	base |= (low & 0xFFFF0000) >> 16;
 	base |= (high & 0x000000FF) << 16;
@@ -37,8 +37,8 @@ u32 GdtDescriptor::GetLimit()
 	u32 high, low;
 	u32 limit;
 
-	high = Shared::HighPart(Value);
-	low = Shared::LowPart(Value);
+	high = Stdlib::HighPart(Value);
+	low = Stdlib::LowPart(Value);
 	limit = 0;
 	limit |= (low & 0x0000FFFF);
 	limit |= (high & 0x000F0000) << 16;
@@ -49,7 +49,7 @@ u8 GdtDescriptor::GetFlag()
 {
 	u32 high;
 
-	high = Shared::HighPart(Value);
+	high = Stdlib::HighPart(Value);
 	return (high & 0x00F00000) >> 20;
 }
 
@@ -57,7 +57,7 @@ u8 GdtDescriptor::GetAccess()
 {
 	u32 high;
 
-	high = Shared::HighPart(Value);
+	high = Stdlib::HighPart(Value);
 	return (high & 0x0000FF00) >> 8;
 }
 

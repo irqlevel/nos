@@ -37,10 +37,11 @@
 #include <drivers/ioapic.h>
 
 using namespace Kernel;
-using namespace Shared;
+using namespace Stdlib;
+using namespace Const;
 
-const size_t CpuStackSize = 8 * Shared::PageSize;
-static char Stack[MaxCpus][8 * Shared::PageSize] __attribute__((aligned(Shared::PageSize)));
+const size_t CpuStackSize = 8 * Const::PageSize;
+static char Stack[MaxCpus][8 * Const::PageSize] __attribute__((aligned(Const::PageSize)));
 static long StackIndex;
 
 #define ALLOC_CPU_STACK()                               \

@@ -17,7 +17,7 @@ class Task final : public Object
 {
 public:
 
-    static const ulong StackSize = 8 * Shared::PageSize;
+    static const ulong StackSize = 8 * Const::PageSize;
     static const ulong StackMagic1 = 0xBCDEBCDE;
     static const ulong StackMagic2 = 0xCBDECBDE;
 
@@ -92,8 +92,8 @@ public:
     static const long FlagStoppingBit = 1;
 
 public:
-    Shared::ListEntry ListEntry;
-    Shared::ListEntry TableListEntry;
+    Stdlib::ListEntry ListEntry;
+    Stdlib::ListEntry TableListEntry;
 
     TaskQueue* TaskQueue;
     SpinLock Lock;
@@ -104,10 +104,10 @@ public:
     Atomic State;
     Atomic Flags;
 
-    Shared::Time RunStartTime;
-    Shared::Time Runtime;
-    Shared::Time StartTime;
-    Shared::Time ExitTime;
+    Stdlib::Time RunStartTime;
+    Stdlib::Time Runtime;
+    Stdlib::Time StartTime;
+    Stdlib::Time ExitTime;
 
     Task* Prev;
     ulong Magic;
@@ -150,7 +150,7 @@ public:
 
     Task* Lookup(ulong pid);
 
-    void Ps(Shared::Printer& printer);
+    void Ps(Stdlib::Printer& printer);
 
 private:
     TaskTable(const TaskTable& other) = delete;
@@ -164,7 +164,7 @@ private:
     static const size_t TaskListCount = 512;
 
     SpinLock Lock[TaskListCount];
-    Shared::ListEntry TaskList[TaskListCount];
+    Stdlib::ListEntry TaskList[TaskListCount];
 
     ObjectTable TaskObjectTable;
 };

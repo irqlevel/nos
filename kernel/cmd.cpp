@@ -32,17 +32,17 @@ void Cmd::ProcessCmd(const char *cmd)
 {
     auto& vga = VgaTerm::GetInstance();
 
-    if (Shared::StrCmp(cmd, "cls") == 0)
+    if (Stdlib::StrCmp(cmd, "cls") == 0)
     {
         vga.Cls();
     }
-    else if (Shared::StrCmp(cmd, "exit") == 0 ||
-             Shared::StrCmp(cmd, "quit") == 0)
+    else if (Stdlib::StrCmp(cmd, "exit") == 0 ||
+             Stdlib::StrCmp(cmd, "quit") == 0)
     {
         Exit = true;
         return;
     }
-    else if (Shared::StrCmp(cmd, "cpu") == 0)
+    else if (Stdlib::StrCmp(cmd, "cpu") == 0)
     {
         vga.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
             (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
@@ -54,24 +54,24 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
             GetCr0(), GetCr2(), GetCr3(), GetCr4());
     }
-    else if (Shared::StrCmp(cmd, "dmesg") == 0)
+    else if (Stdlib::StrCmp(cmd, "dmesg") == 0)
     {
         Dmesg::GetInstance().Dump(vga);
     }
-    else if (Shared::StrCmp(cmd, "uptime") == 0)
+    else if (Stdlib::StrCmp(cmd, "uptime") == 0)
     {
         auto time = GetBootTime();
         vga.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
     }
-    else if (Shared::StrCmp(cmd, "ps") == 0)
+    else if (Stdlib::StrCmp(cmd, "ps") == 0)
     {
         TaskTable::GetInstance().Ps(vga);
     }
-    else if (Shared::StrCmp(cmd, "watchdog") == 0)
+    else if (Stdlib::StrCmp(cmd, "watchdog") == 0)
     {
         Watchdog::GetInstance().Dump(vga);
     }
-    else if (Shared::StrCmp(cmd, "help") == 0)
+    else if (Stdlib::StrCmp(cmd, "help") == 0)
     {
         vga.Printf("cls - clear screen\n");
         vga.Printf("cpu - dump cpu state\n");
@@ -114,7 +114,7 @@ bool Cmd::Start()
         return false;
 
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
         if (Task == nullptr)
         {
             Task = task;
@@ -130,7 +130,7 @@ bool Cmd::Start()
     if (!Task->Start(&Cmd::RunFunc, this))
     {
         {
-            Shared::AutoLock lock(Lock);
+            Stdlib::AutoLock lock(Lock);
             task = Task;
             Task = nullptr;
         }
@@ -139,7 +139,7 @@ bool Cmd::Start()
     }
 
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
         VgaTerm::GetInstance().Printf("\n$");
         Active = true;
     }
@@ -158,7 +158,7 @@ void Cmd::Run()
         char c;
         bool hasChar = false;
         {
-            Shared::AutoLock lock(Lock);
+            Stdlib::AutoLock lock(Lock);
             if (!Buf.IsEmpty())
             {
                 c = Buf.Get();
@@ -171,7 +171,7 @@ void Cmd::Run()
             vga.Printf("%c", c);
             if (c == '\n')
             {
-                CmdLine[Shared::ArraySize(CmdLine) - 1] = '\0';
+                CmdLine[Stdlib::ArraySize(CmdLine) - 1] = '\0';
                 if (!overflow)
                 {
                     ProcessCmd(CmdLine);
@@ -182,12 +182,12 @@ void Cmd::Run()
                     vga.Printf("$");
                     overflow = false;
                 }
-                Shared::MemSet(CmdLine, 0, Shared::StrLen(CmdLine));
+                Stdlib::MemSet(CmdLine, 0, Stdlib::StrLen(CmdLine));
                 pos = 0;
             }
             else
             {
-                if (pos < (Shared::ArraySize(CmdLine) - 1))
+                if (pos < (Stdlib::ArraySize(CmdLine) - 1))
                     CmdLine[pos++] = c;
                 else
                 {
@@ -196,7 +196,7 @@ void Cmd::Run()
             }
         }
 
-        Sleep(10 * Shared::NanoSecsInMs);
+        Sleep(10 * Const::NanoSecsInMs);
     }
 }
 
@@ -208,7 +208,7 @@ void Cmd::RunFunc(void *ctx)
 
 void Cmd::OnChar(char c)
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     if (!Active)
         return;
 

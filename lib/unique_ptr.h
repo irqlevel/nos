@@ -5,7 +5,7 @@
 #include <kernel/panic.h>
 #include <mm/allocator.h>
 
-namespace Kernel
+namespace Stdlib
 {
 
 template<typename T>
@@ -101,7 +101,7 @@ private:
 template<typename T, class... Args>
 UniquePtr<T> MakeUnique(Args&&... args)
 {
-    return UniquePtr<T>(new T(Shared::Forward<Args>(args)...));
+    return UniquePtr<T>(new T(Stdlib::Forward<Args>(args)...));
 }
 
 }

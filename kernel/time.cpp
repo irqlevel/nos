@@ -4,7 +4,7 @@
 
 namespace Kernel
 {
-    Shared::Time GetBootTime()
+    Stdlib::Time GetBootTime()
     {
         return Pit::GetInstance().GetTime();
     }

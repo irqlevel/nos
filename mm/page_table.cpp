@@ -19,13 +19,13 @@ PageTable::PageTable()
     , PageCount(0)
     , State(1)
 {
-    Shared::MemSet(&P4Page, 0, sizeof(P4Page));
+    Stdlib::MemSet(&P4Page, 0, sizeof(P4Page));
 
-    Shared::MemSet(&P3KernelPage, 0, sizeof(P3KernelPage));
-    Shared::MemSet(&P3UserPage, 0, sizeof(P3UserPage));
+    Stdlib::MemSet(&P3KernelPage, 0, sizeof(P3KernelPage));
+    Stdlib::MemSet(&P3UserPage, 0, sizeof(P3UserPage));
 
-    Shared::MemSet(&P2KernelPage[0], 0, sizeof(P2KernelPage));
-    Shared::MemSet(&P2UserPage[0], 0, sizeof(P2UserPage));
+    Stdlib::MemSet(&P2KernelPage[0], 0, sizeof(P2KernelPage));
+    Stdlib::MemSet(&P2UserPage[0], 0, sizeof(P2UserPage));
 
     Trace(0, "PageTable 0x%p P4Page 0x%p", this, &P4Page);
 }
@@ -92,7 +92,7 @@ bool PageTable::Setup()
             p2Entry.SetHuge();
             p2Entry.SetPresent();
 
-            addr += (2 * Shared::MB);
+            addr += (2 * Const::MB);
         }
     }
 
@@ -126,7 +126,7 @@ bool PageTable::Setup()
             p2Entry.SetHuge();
             p2Entry.SetPresent();
 
-            addr += (2 * Shared::MB);
+            addr += (2 * Const::MB);
         }
     }
 
@@ -168,32 +168,32 @@ bool PageTable::Setup2()
     auto& mmap = MemoryMap::GetInstance();
     ulong memStart, memEnd;
 
-    if (!mmap.FindRegion(VirtToPhys(mmap.GetKernelEnd()), 4 * Shared::GB, memStart, memEnd))
+    if (!mmap.FindRegion(VirtToPhys(mmap.GetKernelEnd()), 4 * Const::GB, memStart, memEnd))
     {
         Trace(0, "Can't get available memory region");
         return false;
     }
 
-    if (memStart % Shared::PageSize)
+    if (memStart % Const::PageSize)
     {
         Trace(0, "Invalid memory start");
         return false;
     }
 
-    if (memEnd % Shared::PageSize)
+    if (memEnd % Const::PageSize)
     {
         Trace(0, "Invalid memory end");
         return false;
     }
 
-    size_t pageCount = memEnd / Shared::PageSize;
+    size_t pageCount = memEnd / Const::PageSize;
     Trace(0, "Phy page count %u", pageCount);
 
     Page* pageStart = (Page*)PhysToVirt(memStart);
     for (size_t i = 0; i < pageCount; i++)
     {
         Page* page = &pageStart[i];
-        if ((ulong)Shared::MemAdd(page, sizeof(*page)) >= PhysToVirt(memEnd))
+        if ((ulong)Stdlib::MemAdd(page, sizeof(*page)) >= PhysToVirt(memEnd))
         {
             Trace(0, "Pages array overflow memory end");
             return false;

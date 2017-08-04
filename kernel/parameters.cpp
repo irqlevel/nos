@@ -45,10 +45,10 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     if (len < 3)
         return false;
 
-    Shared::StrnCpy(param, &cmdline[start], len);
+    Stdlib::StrnCpy(param, &cmdline[start], len);
     param[len] = '\0';
     
-    const char* sep = Shared::StrChrOnce(param, '=');
+    const char* sep = Stdlib::StrChrOnce(param, '=');
     if (sep == nullptr)
         return false;
 
@@ -62,9 +62,9 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
 
     Trace(0, "Key %s value %s", key, value);
 
-    if (Shared::StrCmp(key, "trace") == 0)
+    if (Stdlib::StrCmp(key, "trace") == 0)
     {
-        if (Shared::StrCmp(value, "vga") == 0)
+        if (Stdlib::StrCmp(value, "vga") == 0)
         {
             TraceVga = true;
         }
@@ -73,9 +73,9 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
             Trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    if (Shared::StrCmp(key, "panic") == 0)
+    if (Stdlib::StrCmp(key, "panic") == 0)
     {
-        if (Shared::StrCmp(value, "vga") == 0)
+        if (Stdlib::StrCmp(value, "vga") == 0)
         {
             PanicVga = true;
         }
@@ -84,9 +84,9 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
             Trace(0, "Unknown value %s, key %s", value, key);
         }        
     }
-    if (Shared::StrCmp(key, "smp") == 0)
+    if (Stdlib::StrCmp(key, "smp") == 0)
     {
-        if (Shared::StrCmp(value, "off") == 0)
+        if (Stdlib::StrCmp(value, "off") == 0)
         {
             SmpOff = true;
         }
@@ -105,11 +105,11 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
 
 bool Parameters::Parse(const char *cmdline)
 {
-    if (Shared::SnPrintf(Cmdline, Shared::ArraySize(Cmdline), "%s", cmdline) < 0)
+    if (Stdlib::SnPrintf(Cmdline, Stdlib::ArraySize(Cmdline), "%s", cmdline) < 0)
         return false;
 
     size_t start = 0, i = 0;
-    for (; i < Shared::StrLen(Cmdline); i++)
+    for (; i < Stdlib::StrLen(Cmdline); i++)
     {
         if (Cmdline[i] == ' ')
         {

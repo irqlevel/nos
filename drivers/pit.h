@@ -27,9 +27,9 @@ public:
 
     void Setup();
 
-    Shared::Time GetTime();
+    Stdlib::Time GetTime();
 
-    void Wait(const Shared::Time& timeout);
+    void Wait(const Stdlib::Time& timeout);
     void Wait(ulong nanoSecs);
 
 private:

@@ -33,7 +33,7 @@ void Tracer::Output(const char *fmt, ...)
 
     va_list args;
     va_start(args, fmt);
-    int size = Shared::VsnPrintf(msg, sizeof(msg), fmt, args);
+    int size = Stdlib::VsnPrintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
     if (size < 0)

@@ -2,7 +2,7 @@
 
 #include "stdlib.h"
 
-namespace Shared
+namespace Stdlib
 {
 
 class Printer

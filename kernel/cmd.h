@@ -41,7 +41,7 @@ private:
     static void RunFunc(void *ctx);
 
     static const size_t CmdSizeMax = 80;
-    Shared::RingBuffer<char, Shared::PageSize> Buf;
+    Stdlib::RingBuffer<char, Const::PageSize> Buf;
     char CmdLine[CmdSizeMax + 1];
     SpinLock Lock;
     Task *Task;

@@ -15,7 +15,7 @@ IO8042::IO8042()
     , Mod(0)
 {
     Trace(0, "IO8042 0x%p", this);
-    for (size_t i = 0; i < Shared::ArraySize(Observer); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Observer); i++)
         Observer[i] = nullptr;
 }
 
@@ -29,7 +29,7 @@ void IO8042::OnInterruptRegister(u8 irq, u8 vector)
 
     IntVector = vector;
 
-    Shared::Time period(10 * Shared::NanoSecsInMs); //10ms
+    Stdlib::Time period(10 * Const::NanoSecsInMs); //10ms
 
     TimerTable::GetInstance().StartTimer(*this, period);
 }
@@ -43,7 +43,7 @@ void IO8042::Interrupt(Context* ctx)
 {
     InterruptCounter.Inc();
     (void)ctx;
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     if (!Buf.Put(Inb(Port)))
     {
@@ -56,7 +56,7 @@ void IO8042::Interrupt(Context* ctx)
 
 bool IO8042::RegisterObserver(IO8042Observer& observer)
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     for (size_t i = 0; i < MaxObserver; i++)
     {
@@ -72,7 +72,7 @@ bool IO8042::RegisterObserver(IO8042Observer& observer)
 
 void IO8042::UnregisterObserver(IO8042Observer& observer)
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     for (size_t i = 0; i < MaxObserver; i++)
     {
@@ -87,7 +87,7 @@ void IO8042::OnTick(TimerCallback& callback)
 {
     (void)callback;
 
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     while (!Buf.IsEmpty())
     {

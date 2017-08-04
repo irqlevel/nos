@@ -38,7 +38,7 @@ private:
 
     static void SwitchComplete(void* ctx);
 
-    using ListEntry = Shared::ListEntry;
+    using ListEntry = Stdlib::ListEntry;
     ListEntry TaskList;
     SpinLock Lock;
 

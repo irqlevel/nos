@@ -13,7 +13,7 @@ Idt::Idt()
 {
     Trace(0, "Idt 0x%p", this);
 
-    for (size_t i = 0; i < Shared::ArraySize(Entry); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Entry); i++)
     {
         Entry[i] = IdtDescriptor::Encode(DummyInterruptStub);
     }
@@ -48,7 +48,7 @@ u16 Idt::GetLimit()
 
 IdtDescriptor Idt::GetDescriptor(u16 index)
 {
-    if (index > Shared::ArraySize(Entry))
+    if (index > Stdlib::ArraySize(Entry))
 	    return IdtDescriptor(0);
 
     return Entry[index];
@@ -56,7 +56,7 @@ IdtDescriptor Idt::GetDescriptor(u16 index)
 
 void Idt::SetDescriptor(u16 index, const IdtDescriptor& desc)
 {
-    if (index > Shared::ArraySize(Entry))
+    if (index > Stdlib::ArraySize(Entry))
 	    return;
 
     Entry[index] = desc;

@@ -11,7 +11,7 @@ namespace Kernel
 
 ExceptionTable::ExceptionTable()
 {
-    for (size_t i = 0; i < Shared::ArraySize(Handler); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Handler); i++)
     {
         Handler[i] = nullptr;
     }
@@ -94,7 +94,7 @@ ExceptionTable::~ExceptionTable()
 
 bool ExceptionTable::SetHandler(size_t index, ExcHandler handler)
 {
-    if (index >= Shared::ArraySize(Handler))
+    if (index >= Stdlib::ArraySize(Handler))
         return false;
     Handler[index] = handler;
     return true;
@@ -104,7 +104,7 @@ void ExceptionTable::RegisterExceptionHandlers()
 {
     auto& idt = Idt::GetInstance();
 
-    for (size_t i = 0; i < Shared::ArraySize(Handler); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Handler); i++)
     {
         idt.SetDescriptor(i, IdtDescriptor::Encode(Handler[i]));
     }

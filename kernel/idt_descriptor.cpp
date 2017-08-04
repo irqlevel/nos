@@ -52,8 +52,8 @@ IdtDescriptor IdtDescriptor::Encode(u32 offset, u16 selector, u8 type)
 
 void IdtDescriptor::SetOffset(u32 offset)
 {
-    Value |= static_cast<u64>(Shared::HighPart(offset)) << 48;
-    Value |= Shared::LowPart(offset);
+    Value |= static_cast<u64>(Stdlib::HighPart(offset)) << 48;
+    Value |= Stdlib::LowPart(offset);
 }
 
 void IdtDescriptor::SetSelector(u16 selector)
@@ -64,68 +64,68 @@ void IdtDescriptor::SetSelector(u16 selector)
 void IdtDescriptor::SetType(u8 type)
 {
     if (type & (1 << 3))
-        Shared::SetBit(Value, 43);
+        Stdlib::SetBit(Value, 43);
     else
-        Shared::ClearBit(Value, 43);
+        Stdlib::ClearBit(Value, 43);
 
     if (type & (1 << 2))
-        Shared::SetBit(Value, 42);
+        Stdlib::SetBit(Value, 42);
     else
-        Shared::ClearBit(Value, 42);
+        Stdlib::ClearBit(Value, 42);
 
     if (type & (1 << 1))
-        Shared::SetBit(Value, 41);
+        Stdlib::SetBit(Value, 41);
     else
-        Shared::ClearBit(Value, 41);
+        Stdlib::ClearBit(Value, 41);
 
     if (type & (1 << 0))
-        Shared::SetBit(Value, 40);
+        Stdlib::SetBit(Value, 40);
     else
-        Shared::ClearBit(Value, 40);
+        Stdlib::ClearBit(Value, 40);
 }
 
 void IdtDescriptor::SetPresent(bool on)
 {
     if (on)
-        Shared::SetBit(Value, 47);
+        Stdlib::SetBit(Value, 47);
     else
-        Shared::ClearBit(Value, 47);
+        Stdlib::ClearBit(Value, 47);
 }
 
 void IdtDescriptor::SetStorageSegment(bool on)
 {
     if (on)
-        Shared::SetBit(Value, 44);
+        Stdlib::SetBit(Value, 44);
     else
-        Shared::ClearBit(Value, 44);
+        Stdlib::ClearBit(Value, 44);
 }
 
 void IdtDescriptor::SetDpl(u8 dpl)
 {
     if (dpl & (1 << 1))
-        Shared::SetBit(Value, 46);
+        Stdlib::SetBit(Value, 46);
     else
-        Shared::ClearBit(Value, 46);
+        Stdlib::ClearBit(Value, 46);
 
     if (dpl & (1 << 0))
-        Shared::SetBit(Value, 45);
+        Stdlib::SetBit(Value, 45);
     else
-        Shared::ClearBit(Value, 45);
+        Stdlib::ClearBit(Value, 45);
 }
 
 bool IdtDescriptor::GetPresent() const
 {
-    return (Shared::TestBit(Value, 47)) ? true : false;
+    return (Stdlib::TestBit(Value, 47)) ? true : false;
 }
 
 bool IdtDescriptor::GetStorageSegment() const
 {
-    return (Shared::TestBit(Value, 44)) ? true : false;
+    return (Stdlib::TestBit(Value, 44)) ? true : false;
 }
 
 u8 IdtDescriptor::GetDpl() const
 {
-    return (Shared::TestBit(Value, 46) << 1) | (Shared::TestBit(Value, 45) << 0);
+    return (Stdlib::TestBit(Value, 46) << 1) | (Stdlib::TestBit(Value, 45) << 0);
 }
 
 u64 IdtDescriptor::GetValue() const

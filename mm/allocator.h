@@ -51,7 +51,7 @@ private:
 	};
 
 	static const size_t StartLog = 3;
-	static const size_t EndLog = Shared::PageShift - 1;
+	static const size_t EndLog = Const::PageShift - 1;
 
 	Pool Pool[EndLog - StartLog + 1];
 	PageAllocator& PageAllocator;

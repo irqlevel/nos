@@ -37,13 +37,13 @@ void Cpu::Idle()
 
 ulong Cpu::GetState()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     return State;
 }
 
 void Cpu::SetRunning()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     if (BugOn(State & StateRunning))
         return;
 
@@ -52,13 +52,13 @@ void Cpu::SetRunning()
 
 void Cpu::SetExiting()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     State |= StateExiting;
 }
 
 void Cpu::Init(ulong index)
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     if (BugOn(State & StateInited))
         return;
 
@@ -90,8 +90,8 @@ CpuTable::~CpuTable()
 
 bool CpuTable::InsertCpu(ulong index)
 {
-    Shared::AutoLock lock(Lock);
-    if (index >= Shared::ArraySize(CpuArray))
+    Stdlib::AutoLock lock(Lock);
+    if (index >= Stdlib::ArraySize(CpuArray))
         return false;
 
     auto& cpu = CpuArray[index];
@@ -104,14 +104,14 @@ bool CpuTable::InsertCpu(ulong index)
 
 Cpu& CpuTable::GetCpu(ulong index)
 {
-    BugOn(index >= Shared::ArraySize(CpuArray));
+    BugOn(index >= Stdlib::ArraySize(CpuArray));
     Cpu& cpu = CpuArray[index];
     return cpu;
 }
 
 ulong CpuTable::GetBspIndex()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     return GetBspIndexLockHeld();
 }
 
@@ -122,9 +122,9 @@ ulong CpuTable::GetBspIndexLockHeld()
 
 bool CpuTable::SetBspIndex(ulong index)
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
-    if (BugOn(index >= Shared::ArraySize(CpuArray)))
+    if (BugOn(index >= Stdlib::ArraySize(CpuArray)))
         return false;
 
     auto& cpu = CpuArray[BspIndex];
@@ -142,15 +142,15 @@ bool CpuTable::StartAll()
 
     Trace(0, "Starting cpus, startupCode 0x%p", startupCode);
 
-    if (startupCode & (Shared::PageSize - 1))
+    if (startupCode & (Const::PageSize - 1))
         return false;
 
     if (startupCode >= 0x100000)
         return false;
 
     {
-        Shared::AutoLock lock(Lock);
-        for (ulong index = 0; index < Shared::ArraySize(CpuArray); index++)
+        Stdlib::AutoLock lock(Lock);
+        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
         {
             if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
             {
@@ -159,24 +159,24 @@ bool CpuTable::StartAll()
         }
     }
 
-    Pit::GetInstance().Wait(10 * Shared::NanoSecsInMs); // 10ms
+    Pit::GetInstance().Wait(10 * Const::NanoSecsInMs); // 10ms
 
     {
-        Shared::AutoLock lock(Lock);
-        for (ulong index = 0; index < Shared::ArraySize(CpuArray); index++)
+        Stdlib::AutoLock lock(Lock);
+        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
         {
             if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
             {
-                Lapic::SendStartup(index, startupCode >> Shared::PageShift);
+                Lapic::SendStartup(index, startupCode >> Const::PageShift);
             }
         }
     }
 
-    Pit::GetInstance().Wait(100 * Shared::NanoSecsInMs); // 100ms
+    Pit::GetInstance().Wait(100 * Const::NanoSecsInMs); // 100ms
 
     {
-        Shared::AutoLock lock(Lock);
-        for (ulong index = 0; index < Shared::ArraySize(CpuArray); index++)
+        Stdlib::AutoLock lock(Lock);
+        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
         {
             if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
             {
@@ -275,7 +275,7 @@ void Cpu::IPI(Context* ctx)
 
     bool exit;
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
         exit = (State & StateExiting) ? true : false;
         if (exit)
             State |= StateExited;
@@ -319,7 +319,7 @@ extern "C" void IPInterrupt(Context* ctx)
 
 void Cpu::SendIPISelf()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     if (BugOn(!(State & Cpu::StateRunning)))
         return;
@@ -332,9 +332,9 @@ void Cpu::SendIPISelf()
 
 void CpuTable::SendIPI(ulong index)
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
-    if (BugOn(index >= Shared::ArraySize(CpuArray)))
+    if (BugOn(index >= Stdlib::ArraySize(CpuArray)))
         return;
 
     auto& cpu = CpuArray[index];
@@ -343,10 +343,10 @@ void CpuTable::SendIPI(ulong index)
 
 ulong CpuTable::GetRunningCpus()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     ulong result = 0;
-    for (ulong i = 0; i < Shared::ArraySize(CpuArray); i++)
+    for (ulong i = 0; i < Stdlib::ArraySize(CpuArray); i++)
     {
         auto& cpu = CpuArray[i];
         if (cpu.GetState() & Cpu::StateRunning)

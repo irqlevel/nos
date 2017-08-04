@@ -5,7 +5,7 @@
 
 #include <kernel/panic.h>
 
-namespace Kernel
+namespace Stdlib
 {
 
 template<class T>
@@ -46,7 +46,7 @@ public:
         {
             for (size_t i = 0; i < Size; i++)
             {
-                newArr[i] = Shared::Move(Arr[i]);
+                newArr[i] = Stdlib::Move(Arr[i]);
             }
             delete[] Arr;
         }
@@ -79,7 +79,7 @@ public:
             if (!Reserve(2*Size + 1))
                 return false;
         }
-        Arr[Size++] = Shared::Move(e);
+        Arr[Size++] = Stdlib::Move(e);
         return true;
     }
 
@@ -137,7 +137,7 @@ public:
         return *this;
     }
 
-    Vector(const Vector& other, Shared::Error& err)
+    Vector(const Vector& other, Stdlib::Error& err)
         : Vector()
     {
         if (!err.Ok())
@@ -146,7 +146,7 @@ public:
         Arr = new T[other.Capacity];
         if (!Arr)
         {
-            err = MakeError(Shared::Error::NoMemory);
+            err = MakeError(Stdlib::Error::NoMemory);
             return;
         }
 
@@ -163,7 +163,7 @@ public:
         Panic("Not implemented yet!");
     }
 
-    Vector(const T* arr, size_t size, Shared::Error& err)
+    Vector(const T* arr, size_t size, Stdlib::Error& err)
     {
         if (!err.Ok())
             return;
@@ -171,7 +171,7 @@ public:
         Arr = new T[size];
         if (!Arr)
         {
-            err = MakeError(Shared::Error::NoMemory);
+            err = MakeError(Stdlib::Error::NoMemory);
             return;
         }
 

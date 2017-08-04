@@ -18,10 +18,10 @@ Watchdog::~Watchdog()
 
 void Watchdog::Check()
 {
-    Shared::Time now = GetBootTime();
-    Shared::Time timeout(25 * Shared::NanoSecsInMs);
+    Stdlib::Time now = GetBootTime();
+    Stdlib::Time timeout(25 * Const::NanoSecsInMs);
 
-    for (size_t i = 0; i < Shared::ArraySize(SpinLockList); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(SpinLockList); i++)
     {
         auto& listLock = SpinLockListLock[i];
         auto& list = SpinLockList[i];
@@ -30,16 +30,16 @@ void Watchdog::Check()
             continue;
 
         ulong flags = listLock.LockIrqSave();
-        for (Shared::ListEntry* entry = list.Flink;
+        for (Stdlib::ListEntry* entry = list.Flink;
             entry != &list;
             entry = entry->Flink)
         {
             SpinLock* lock = CONTAINING_RECORD(entry, SpinLock, ListEntry);
             CheckCounter.Inc();
-            Shared::Time lockTime(lock->LockTime.Get());
+            Stdlib::Time lockTime(lock->LockTime.Get());
             if (lockTime.GetValue() != 0)
             {
-                Shared::Time delta = now - lockTime;
+                Stdlib::Time delta = now - lockTime;
                 if (delta > timeout)
                 {
                     Trace(0, "Spinlock 0x%p is held too long %u", lock, delta.GetValue());
@@ -52,7 +52,7 @@ void Watchdog::Check()
 
 void Watchdog::RegisterSpinLock(SpinLock& lock)
 {
-    size_t i = Shared::HashPtr(&lock) % Shared::ArraySize(SpinLockList);
+    size_t i = Stdlib::HashPtr(&lock) % Stdlib::ArraySize(SpinLockList);
     auto& listLock = SpinLockListLock[i];
     auto& list = SpinLockList[i];
 
@@ -64,7 +64,7 @@ void Watchdog::RegisterSpinLock(SpinLock& lock)
 
 void Watchdog::UnregisterSpinLock(SpinLock& lock)
 {
-    size_t i = Shared::HashPtr(&lock) % Shared::ArraySize(SpinLockList);
+    size_t i = Stdlib::HashPtr(&lock) % Stdlib::ArraySize(SpinLockList);
     auto& listLock = SpinLockListLock[i];
 
     ulong flags = listLock.LockIrqSave();
@@ -73,7 +73,7 @@ void Watchdog::UnregisterSpinLock(SpinLock& lock)
     listLock.UnlockIrqRestore(flags);
 }
 
-void Watchdog::Dump(Shared::Printer& printer)
+void Watchdog::Dump(Stdlib::Printer& printer)
 {
     printer.Printf("%u %u\n", SpinLockCounter.Get(), CheckCounter.Get());
 }

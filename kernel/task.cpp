@@ -32,7 +32,7 @@ Task::Task(const char* fmt, ...)
 {
     va_list args;
     va_start(args, fmt);
-    Shared::VsnPrintf(Name, Shared::ArraySize(Name), fmt, args);
+    Stdlib::VsnPrintf(Name, Stdlib::ArraySize(Name), fmt, args);
     va_end(args);
 }
 
@@ -109,7 +109,7 @@ void Task::Wait()
 {
     while (State.Get() != StateExited)
     {
-        Sleep(1 * Shared::NanoSecsInMs);
+        Sleep(1 * Const::NanoSecsInMs);
     }
 }
 
@@ -145,7 +145,7 @@ bool Task::Start(Func func, void* ctx)
     ulong* rsp = (ulong *)&Stack->StackTop[0];
     *(--rsp) = (ulong)&Task::Exec;//setup return address
     Context* regs = (Context*)((ulong)rsp - sizeof(*regs));
-    Shared::MemSet(regs, 0, sizeof(*regs));
+    Stdlib::MemSet(regs, 0, sizeof(*regs));
     regs->Rdi = (ulong)this; //setup 1arg for Task::Exec
     regs->Rflags = (1 << 9); //setup IF
     Rsp = (ulong)regs;
@@ -191,7 +191,7 @@ Task* Task::GetCurrentTask()
     if (BugOn(stack->Magic2 != StackMagic2))
         return nullptr;
 
-    if (BugOn(rsp < ((ulong)&stack->StackBottom[0] + Shared::PageSize)))
+    if (BugOn(rsp < ((ulong)&stack->StackBottom[0] + Const::PageSize)))
         return nullptr;
 
     if (BugOn(rsp > (ulong)&stack->StackTop[0]))
@@ -210,7 +210,7 @@ void Task::SetName(const char *fmt, ...)
 
     va_list args;
     va_start(args, fmt);
-    Shared::VsnPrintf(Name, Shared::ArraySize(Name), fmt, args);
+    Stdlib::VsnPrintf(Name, Stdlib::ArraySize(Name), fmt, args);
     va_end(args);
 }
 
@@ -228,13 +228,13 @@ void Task::UpdateRuntime()
 
 void Task::SetCpuAffinity(ulong affinity)
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     CpuAffinity = affinity;
 }
 
 ulong Task::GetCpuAffinity()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     return CpuAffinity;
 }
 
@@ -278,12 +278,12 @@ TaskTable::TaskTable()
 
 TaskTable::~TaskTable()
 {
-    for (size_t i = 0; i < Shared::ArraySize(TaskList); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(TaskList); i++)
     {
-        Shared::ListEntry taskList;
+        Stdlib::ListEntry taskList;
 
         {
-            Shared::AutoLock lock(Lock[i]);
+            Stdlib::AutoLock lock(Lock[i]);
             taskList.MoveTailList(&TaskList[i]);
         }
 
@@ -306,8 +306,8 @@ bool TaskTable::Insert(Task *task)
     task->Pid = pid;
 
     task->Get();
-    size_t i = Shared::HashPtr(task) % Shared::ArraySize(TaskList);
-    Shared::AutoLock lock(Lock[i]);
+    size_t i = Stdlib::HashPtr(task) % Stdlib::ArraySize(TaskList);
+    Stdlib::AutoLock lock(Lock[i]);
 
     BugOn(!task->TableListEntry.IsEmpty());
     TaskList[i].InsertTail(&task->TableListEntry);
@@ -318,11 +318,11 @@ bool TaskTable::Insert(Task *task)
 void TaskTable::Remove(Task *task)
 {
     {
-        size_t i = Shared::HashPtr(task) % Shared::ArraySize(TaskList);
+        size_t i = Stdlib::HashPtr(task) % Stdlib::ArraySize(TaskList);
 
         TaskObjectTable.Remove(task->Pid);
 
-        Shared::AutoLock lock(Lock[i]);
+        Stdlib::AutoLock lock(Lock[i]);
 
         BugOn(task->TableListEntry.IsEmpty());
         task->TableListEntry.RemoveInit();
@@ -336,13 +336,13 @@ Task* TaskTable::Lookup(ulong pid)
     return reinterpret_cast<Task*>(TaskObjectTable.Lookup(pid));
 }
 
-void TaskTable::Ps(Shared::Printer& printer)
+void TaskTable::Ps(Stdlib::Printer& printer)
 {
     printer.Printf("pid state flags runtime ctxswitches name\n");
 
-    for (size_t i = 0; i < Shared::ArraySize(TaskList); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(TaskList); i++)
     {
-        Shared::AutoLock lock(Lock[i]);
+        Stdlib::AutoLock lock(Lock[i]);
 
         for (auto currEntry = TaskList[i].Flink;
             currEntry != &TaskList[i];

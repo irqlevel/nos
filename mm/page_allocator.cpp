@@ -20,12 +20,12 @@ bool PageAllocatorImpl::Setup(ulong startAddress, ulong endAddress)
     Trace(0, "Setup start 0x%p end 0x%p", startAddress, endAddress);
 
     BugOn(endAddress <= startAddress);
-    size_t sizePerBalloc = (endAddress - startAddress) / Shared::ArraySize(Balloc);
-    for (size_t i = 0; i < Shared::ArraySize(Balloc); i++)
+    size_t sizePerBalloc = (endAddress - startAddress) / Stdlib::ArraySize(Balloc);
+    for (size_t i = 0; i < Stdlib::ArraySize(Balloc); i++)
     {
         ulong start = startAddress + i * sizePerBalloc;
-        ulong blockSize = ((ulong)1 << i) * Shared::PageSize;
-        if (!Balloc[i].Setup(Shared::RoundUp(start, blockSize), start + sizePerBalloc, blockSize))
+        ulong blockSize = ((ulong)1 << i) * Const::PageSize;
+        if (!Balloc[i].Setup(Stdlib::RoundUp(start, blockSize), start + sizePerBalloc, blockSize))
         {
             return false;
         }
@@ -43,8 +43,8 @@ void* PageAllocatorImpl::Alloc(size_t numPages)
 {
     BugOn(numPages == 0);
 
-    size_t log = Shared::Log2(numPages);
-    if (log >= Shared::ArraySize(Balloc))
+    size_t log = Stdlib::Log2(numPages);
+    if (log >= Stdlib::ArraySize(Balloc))
         return nullptr;
 
     return Balloc[log].Alloc();
@@ -52,7 +52,7 @@ void* PageAllocatorImpl::Alloc(size_t numPages)
 
 void PageAllocatorImpl::Free(void* pages)
 {
-    for (size_t i = 0; i < Shared::ArraySize(Balloc); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Balloc); i++)
     {
         auto& balloc = Balloc[i];
         if (balloc.IsOwner(pages))

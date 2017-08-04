@@ -7,10 +7,12 @@
 #include <mm/new.h>
 #include <kernel/panic.h>
 
-namespace Kernel
+namespace Stdlib
 {
 
-template<typename K, typename V, size_t T, typename LockType = Shared::NopLock>
+const int BtreeLL = 6;
+
+template<typename K, typename V, size_t T, typename LockType = Stdlib::NopLock>
 class Btree
 {
 public:
@@ -28,7 +30,7 @@ public:
 
     bool Insert(const K& key, const V& value)
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         bool exist;
         LookupLocked(key, exist);
@@ -68,7 +70,7 @@ public:
 
     bool Delete(const K& key)
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         Trace(BtreeLL, "root 0x%p", Root.Get());
 
@@ -142,8 +144,8 @@ restart:
                         node.Get(), preChild.Get(), keyIndex);
 
                     preChild->Merge(sucChild,
-                                    Shared::Move(node->GetKey(i)),
-                                    Shared::Move(node->GetValue(i)));
+                                    Stdlib::Move(node->GetKey(i)),
+                                    Stdlib::Move(node->GetValue(i)));
                     node->DeleteKey(i);
                     node->DeleteChild(i + 1);
                     node->DecKeyCount();
@@ -188,13 +190,13 @@ restart:
 
     V Lookup(const K& key, bool& exist)
     {
-        Shared::SharedAutoLock lock(Lock);
+        Stdlib::SharedAutoLock lock(Lock);
         return LookupLocked(key, exist);
     }
 
     bool Check()
     {
-        Shared::SharedAutoLock lock(Lock);
+        Stdlib::SharedAutoLock lock(Lock);
         if (Root.Get() == nullptr)
             return true;
 
@@ -203,7 +205,7 @@ restart:
 
     void Clear()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         if (Root.Get() == nullptr)
             return;
@@ -263,7 +265,7 @@ finish:
 
     size_t MinDepth()
     {
-        Shared::SharedAutoLock lock(Lock);
+        Stdlib::SharedAutoLock lock(Lock);
         if (Root.Get() == nullptr)
         {
             return 0;
@@ -273,7 +275,7 @@ finish:
 
     size_t MaxDepth()
     {
-        Shared::SharedAutoLock lock(Lock);
+        Stdlib::SharedAutoLock lock(Lock);
         if (Root.Get() == nullptr)
         {
             return 0;
@@ -304,7 +306,7 @@ private:
 
         for (size_t i = 1; i < (node->GetKeyCount() + 1); i++)
         {
-            depth = Shared::Min<size_t>(depth, MinDepth(node->GetChild(i)));
+            depth = Stdlib::Min<size_t>(depth, MinDepth(node->GetChild(i)));
         }
 
         return 1 + depth;
@@ -324,7 +326,7 @@ private:
 
         for (size_t i = 1; i < (node->GetKeyCount() + 1); i++)
         {
-            depth = Shared::Max<size_t>(depth, MaxDepth(node->GetChild(i)));
+            depth = Stdlib::Max<size_t>(depth, MaxDepth(node->GetChild(i)));
         }
 
         return 1 + depth;
@@ -404,8 +406,8 @@ private:
 
             Trace(BtreeLL, "node 0x%p copy key %lu", this, index);
 
-            SetKey(index, Shared::Move(src->GetKey(srcIndex)));
-            SetValue(index, Shared::Move(src->GetValue(srcIndex)));
+            SetKey(index, Stdlib::Move(src->GetKey(srcIndex)));
+            SetValue(index, Stdlib::Move(src->GetValue(srcIndex)));
         }
 
         void CopyChild(size_t index, const BtreeNodePtr& src, size_t srcIndex)
@@ -418,7 +420,7 @@ private:
 
             Trace(BtreeLL, "node 0x%p copy child %lu", this, index);
 
-            SetChild(index, Shared::Move(src->Child[srcIndex]));
+            SetChild(index, Stdlib::Move(src->Child[srcIndex]));
         }
 
         void PutKey(size_t index, const K& key, const V& value)
@@ -431,8 +433,8 @@ private:
             /* free space */
             for (ssize_t i = KeyCount - 1; i >= static_cast<ssize_t>(index); i--)
             {
-                SetKey(i + 1, Shared::Move(GetKey(i)));
-                SetValue(i + 1, Shared::Move(GetValue(i)));
+                SetKey(i + 1, Stdlib::Move(GetKey(i)));
+                SetValue(i + 1, Stdlib::Move(GetValue(i)));
             }
 
             SetKey(index, key);
@@ -452,12 +454,12 @@ private:
             /* free space */
             for (ssize_t i = KeyCount - 1; i >= static_cast<ssize_t>(index); i--)
             {
-                SetKey(i + 1, Shared::Move(GetKey(i)));
-                SetValue(i + 1, Shared::Move(GetValue(i)));
+                SetKey(i + 1, Stdlib::Move(GetKey(i)));
+                SetValue(i + 1, Stdlib::Move(GetValue(i)));
             }
 
-            SetKey(index, Shared::Move(src->GetKey(srcIndex)));
-            SetValue(index, Shared::Move(src->GetValue(srcIndex)));
+            SetKey(index, Stdlib::Move(src->GetKey(srcIndex)));
+            SetValue(index, Stdlib::Move(src->GetValue(srcIndex)));
         }
 
         void SetValue(size_t index, const V& value)
@@ -474,7 +476,7 @@ private:
             if (BugOn(index < 0 || index >= (2 * T - 1)))
                 return;
 
-            Value[index] = Shared::Move(value);
+            Value[index] = Stdlib::Move(value);
             Trace(BtreeLL, "node 0x%p set value %lu", this, index);
         }
 
@@ -496,7 +498,7 @@ private:
             if (BugOn(index < 0 || index >= (2 * T - 1)))
                 return;
 
-            Key[index] = Shared::Move(key);
+            Key[index] = Stdlib::Move(key);
             Trace(BtreeLL, "node 0x%p set key %lu", this, index);
             SetKeyCheck(index);
         }
@@ -525,7 +527,7 @@ private:
             if (BugOn(index < 0 || index >= 2 * T))
                 return;
 
-            Child[index] = Shared::Move(child);
+            Child[index] = Stdlib::Move(child);
             Trace(BtreeLL, "node 0x%p set child %lu 0x%p", this, index, Child[index].Get());
         }
 
@@ -539,7 +541,7 @@ private:
             /* free space */
             for (ssize_t i = KeyCount; i >= static_cast<ssize_t>(index); i--)
             {
-                SetChild(i + 1, Shared::Move(Child[i]));
+                SetChild(i + 1, Stdlib::Move(Child[i]));
             }
 
             SetChild(index, child);
@@ -552,7 +554,7 @@ private:
             if (BugOn(srcIndex < 0 || srcIndex >= 2 * T))
                 return;
 
-            PutChild(index, Shared::Move(src->Child[srcIndex]));
+            PutChild(index, Stdlib::Move(src->Child[srcIndex]));
         }
 
         bool IsLeaf()
@@ -600,7 +602,7 @@ private:
 
             for (size_t i = (index + 1); i < (KeyCount + 1); i++)
             {
-                SetChild(i - 1, Shared::Move(Child[i]));
+                SetChild(i - 1, Stdlib::Move(Child[i]));
             }
         }
 
@@ -618,8 +620,8 @@ private:
 
             for (size_t i = (index + 1); i < KeyCount; i++)
             {
-                SetKey(i - 1, Shared::Move(GetKey(i)));
-                SetValue(i - 1, Shared::Move(GetValue(i)));
+                SetKey(i - 1, Stdlib::Move(GetKey(i)));
+                SetValue(i - 1, Stdlib::Move(GetValue(i)));
             }
         }
 
@@ -815,18 +817,18 @@ private:
 
         void Merge(const BtreeNodePtr& src, K&& key, V&& value)
         {
-            SetKey(KeyCount, Shared::Move(key));
-            SetValue(KeyCount, Shared::Move(value));
+            SetKey(KeyCount, Stdlib::Move(key));
+            SetValue(KeyCount, Stdlib::Move(value));
 
             size_t pos = KeyCount + 1, i;
             for (i = 0; i < src->KeyCount; i++, pos++)
             {
-                SetKey(pos, Shared::Move(src->GetKey(i)));
-                SetValue(pos, Shared::Move(src->GetValue(i)));
-                SetChild(pos, Shared::Move(src->Child[i]));
+                SetKey(pos, Stdlib::Move(src->GetKey(i)));
+                SetValue(pos, Stdlib::Move(src->GetValue(i)));
+                SetChild(pos, Stdlib::Move(src->Child[i]));
             }
 
-            SetChild(pos, Shared::Move(src->Child[i]));
+            SetChild(pos, Stdlib::Move(src->Child[i]));
             IncKeyCount(1 + src->KeyCount);
         }
 
@@ -836,11 +838,11 @@ private:
 
             for (i = 0; i < src->GetKeyCount(); i++)
             {
-                SetKey(i, Shared::Move(src->GetKey(i)));
-                SetValue(i, Shared::Move(src->GetValue(i)));
-                SetChild(i, Shared::Move(src->Child[i]));
+                SetKey(i, Stdlib::Move(src->GetKey(i)));
+                SetValue(i, Stdlib::Move(src->GetValue(i)));
+                SetChild(i, Stdlib::Move(src->Child[i]));
             }
-            SetChild(i, Shared::Move(src->Child[i]));
+            SetChild(i, Stdlib::Move(src->Child[i]));
             for (i = i + 1; i < 2 * T; i++)
             {
                 Child[i].Reset();
@@ -946,16 +948,16 @@ private:
                     return BtreeNodePtr();
 
                 sib->Merge(child,
-                        Shared::Move(GetKey(childIndex-1)),
-                        Shared::Move(GetValue(childIndex - 1)));
+                        Stdlib::Move(GetKey(childIndex-1)),
+                        Stdlib::Move(GetValue(childIndex - 1)));
                 DeleteKey(childIndex - 1);
                 DeleteChild(childIndex);
             }
             else
             {
                 child->Merge(sib,
-                        Shared::Move(GetKey(childIndex)),
-                        Shared::Move(GetValue(childIndex)));
+                        Stdlib::Move(GetKey(childIndex)),
+                        Stdlib::Move(GetValue(childIndex)));
                 DeleteKey(childIndex);
                 DeleteChild(childIndex + 1);
             }

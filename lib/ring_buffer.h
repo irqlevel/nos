@@ -7,10 +7,10 @@
 
 #include <kernel/panic.h>
 
-namespace Shared
+namespace Stdlib
 {
 
-template <typename T, size_t Capacity = Shared::PageSize, typename LockType = Shared::NopLock>
+template <typename T, size_t Capacity = Const::PageSize, typename LockType = Stdlib::NopLock>
 class RingBuffer final
 {
 public:
@@ -22,7 +22,7 @@ public:
 
     RingBuffer()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         Size = 0;
         StartIndex = 0;
@@ -31,12 +31,12 @@ public:
 
     ~RingBuffer()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
     }
 
     bool Put(const T& value)
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         if (Size == Capacity)
         {
@@ -52,7 +52,7 @@ public:
 
     bool Put(T&& value)
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         if (Size == Capacity)
         {
@@ -60,7 +60,7 @@ public:
         }
 
         size_t position = EndIndex;
-        Buf[position] = Shared::Move(value);
+        Buf[position] = Stdlib::Move(value);
         EndIndex = (EndIndex + 1) % Capacity;
         Size++;
         return true;
@@ -68,35 +68,35 @@ public:
 
     bool IsEmpty()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         return (Size == 0) ? true : false;
     }
 
     bool IsFull()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         return (Size == Capacity) ? true : false;
     }
 
     size_t GetSize()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         return Size;
     }
 
     size_t GetCapacity()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         return Capacity;
     }
 
     T Get()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         if (Size == 0)
         {
@@ -111,7 +111,7 @@ public:
 
     void PopHead()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         if (Size == 0)
             return;
@@ -122,7 +122,7 @@ public:
 
     void Clear()
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         Size = 0;
         StartIndex = 0;
@@ -131,7 +131,7 @@ public:
 
     void Print(TypePrinter<T>& printer)
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
 
         if (Size == 0)
             return;

@@ -22,7 +22,7 @@ public:
         return Instance;
     }
 
-    bool StartTimer(TimerCallback& callback, Shared::Time period);
+    bool StartTimer(TimerCallback& callback, Stdlib::Time period);
     void StopTimer(TimerCallback& callback);
 
     void ProcessTimers();
@@ -41,8 +41,8 @@ private:
         Timer();
 
         TimerCallback *Callback;
-        Shared::Time Period;
-        Shared::Time Expired;
+        Stdlib::Time Period;
+        Stdlib::Time Expired;
     };
 
     Timer Timer[16];

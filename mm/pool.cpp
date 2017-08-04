@@ -31,7 +31,7 @@ void Pool::Setup(size_t size, class PageAllocator* pageAllocator)
 {
     Trace(PoolLL, "0x%p setup size 0x%p", this, size);
 
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     while (!BlockList.IsEmpty())
     {
@@ -50,7 +50,7 @@ void Pool::Setup(size_t size, class PageAllocator* pageAllocator)
 
 bool Pool::CheckSize(size_t size)
 {
-    if (size == 0 || size >= Shared::PageSize)
+    if (size == 0 || size >= Const::PageSize)
         return false;
 
     return true;
@@ -60,7 +60,7 @@ void* Pool::Alloc()
 {
     Trace(PoolLL, "0x%p alloc block size 0x%p", this, Size);
 
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     if (!CheckSize(Size))
     {   
@@ -78,10 +78,10 @@ void* Pool::Alloc()
         PageList.InsertTail(&page->Link);
 
         ListEntry* block = reinterpret_cast<ListEntry*>(&page->Data[0]);
-        while (Shared::MemAdd(block, Size) <= Shared::MemAdd(page, Shared::PageSize))
+        while (Stdlib::MemAdd(block, Size) <= Stdlib::MemAdd(page, Const::PageSize))
         {
             BlockList.InsertTail(block);
-            block = static_cast<ListEntry*>(Shared::MemAdd(block, Size));
+            block = static_cast<ListEntry*>(Stdlib::MemAdd(block, Size));
         }
     }
 
@@ -94,7 +94,7 @@ void* Pool::Alloc()
 
 void Pool::Free(void* ptr)
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     Trace(PoolLL, "Free block %p", ptr);
 

@@ -1,6 +1,6 @@
 #include "list_entry.h"
 
-namespace Shared
+namespace Stdlib
 {
 
 ListEntry::ListEntry()

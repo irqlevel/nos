@@ -7,7 +7,7 @@
 namespace Kernel
 {
 
-class VgaTerm : public Shared::Printer
+class VgaTerm : public Stdlib::Printer
 {
 public:
     static VgaTerm& GetInstance()

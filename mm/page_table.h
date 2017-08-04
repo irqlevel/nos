@@ -58,7 +58,7 @@ private:
 
         ulong Address()
         {
-            return Value & (~((ulong)Shared::PageSize));
+            return Value & (~((ulong)Const::PageSize));
         }
 
         bool Present()
@@ -68,7 +68,7 @@ private:
 
         void SetAddress(ulong address)
         {
-            BugOn(address & (Shared::PageSize - 1));
+            BugOn(address & (Const::PageSize - 1));
             Value |= address;
         }
 
@@ -114,17 +114,17 @@ private:
         struct Pte Entry[512];
     };
 
-    static_assert(sizeof(PtePage) == Shared::PageSize, "Invalid size");
+    static_assert(sizeof(PtePage) == Const::PageSize, "Invalid size");
 
-    PtePage P4Page __attribute__((aligned(Shared::PageSize)));
-    PtePage P3KernelPage __attribute__((aligned(Shared::PageSize)));
-    PtePage P3UserPage __attribute__((aligned(Shared::PageSize)));
-    PtePage P2KernelPage[4] __attribute__((aligned(Shared::PageSize)));
-    PtePage P2UserPage[4] __attribute__((aligned(Shared::PageSize)));
+    PtePage P4Page __attribute__((aligned(Const::PageSize)));
+    PtePage P3KernelPage __attribute__((aligned(Const::PageSize)));
+    PtePage P3UserPage __attribute__((aligned(Const::PageSize)));
+    PtePage P2KernelPage[4] __attribute__((aligned(Const::PageSize)));
+    PtePage P2UserPage[4] __attribute__((aligned(Const::PageSize)));
 
     struct Page final
     {
-        Shared::ListEntry ListEntry;
+        Stdlib::ListEntry ListEntry;
         Kernel::Atomic RefCounter;
         ulong Pfn;
     };
@@ -135,7 +135,7 @@ private:
     size_t PageCount;
     ulong State;
 
-    Shared::ListEntry FreePagesList;
+    Stdlib::ListEntry FreePagesList;
 };
 
 }

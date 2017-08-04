@@ -8,8 +8,8 @@ namespace Kernel
 {
 
 class SpinLock final
-	: public Shared::LockInterface
-	, public Shared::SharedLockInterface
+	: public Stdlib::LockInterface
+	, public Stdlib::SharedLockInterface
 {
 public:
 	SpinLock();
@@ -38,7 +38,7 @@ private:
 	volatile void* Owner;
 
 public:
-	Shared::ListEntry ListEntry;
+	Stdlib::ListEntry ListEntry;
 	Atomic LockTime;
 };
 

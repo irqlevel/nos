@@ -39,7 +39,7 @@ private:
 do {                                                                \
     auto& panicker = Kernel::Panicker::GetInstance();               \
     panicker.DoPanic("PANIC:%s():%s,%u: " fmt "\n",                 \
-        __func__, Shared::TruncateFileName(__FILE__),               \
+        __func__, Stdlib::TruncateFileName(__FILE__),               \
         (ulong)__LINE__, ##__VA_ARGS__);                            \
 } while (false)
 
@@ -51,5 +51,5 @@ static inline bool DoBugOn(const char *func, const char *file, int line)
 }
 
 #define BugOn(condition)    \
-    (unlikely(condition)) ? DoBugOn(__func__, Shared::TruncateFileName(__FILE__), __LINE__) : \
+    (unlikely(condition)) ? DoBugOn(__func__, Stdlib::TruncateFileName(__FILE__), __LINE__) : \
     false

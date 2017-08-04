@@ -44,14 +44,14 @@ long Atomic::Get()
 
 void Atomic::SetBit(ulong bit)
 {
-    BugOn(bit >= Shared::SizeOfInBits<long>());
+    BugOn(bit >= Stdlib::SizeOfInBits<long>());
 
     AtomicTestAndSetBit(&Value, bit);
 }
 
 bool Atomic::TestBit(ulong bit)
 {
-    BugOn(bit >= Shared::SizeOfInBits<long>());
+    BugOn(bit >= Stdlib::SizeOfInBits<long>());
 
     return (AtomicTestBit(&Value, bit)) ? true : false;
 }

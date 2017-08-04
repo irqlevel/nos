@@ -23,7 +23,7 @@ public:
     void Free(void *ptr);
 
 private:
-    using ListEntry = Shared::ListEntry;
+    using ListEntry = Stdlib::ListEntry;
 
     bool CheckSize(size_t size);
 

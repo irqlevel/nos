@@ -5,7 +5,7 @@ namespace Kernel
 
 ObjectTable::ObjectTable()
 {
-    for (ObjectId objectId = 0; objectId < Shared::ArraySize(ObjectArray); objectId++)
+    for (ObjectId objectId = 0; objectId < Stdlib::ArraySize(ObjectArray); objectId++)
     {
         ObjectArray[objectId] = nullptr;
     }
@@ -15,8 +15,8 @@ ulong ObjectTable::Insert(Object *object)
 {
     object->Get();
     {
-        Shared::AutoLock lock(Lock);
-        for (ObjectId objectId = 0; objectId < Shared::ArraySize(ObjectArray); objectId++)
+        Stdlib::AutoLock lock(Lock);
+        for (ObjectId objectId = 0; objectId < Stdlib::ArraySize(ObjectArray); objectId++)
         {
             if (ObjectArray[objectId] == nullptr)
             {
@@ -31,12 +31,12 @@ ulong ObjectTable::Insert(Object *object)
 
 void ObjectTable::Remove(ulong objectId)
 {
-    if (objectId >= Shared::ArraySize(ObjectArray))
+    if (objectId >= Stdlib::ArraySize(ObjectArray))
         return;
 
     Object* object = nullptr;
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
         object = ObjectArray[objectId];
         ObjectArray[objectId] = nullptr;
     }
@@ -49,12 +49,12 @@ void ObjectTable::Remove(ulong objectId)
 
 Object* ObjectTable::Lookup(ulong objectId)
 {
-    if (objectId >= Shared::ArraySize(ObjectArray))
+    if (objectId >= Stdlib::ArraySize(ObjectArray))
         return nullptr;
 
     Object* object = nullptr;
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
         object = ObjectArray[objectId];
         if (object != nullptr)
         {
@@ -68,7 +68,7 @@ Object* ObjectTable::Lookup(ulong objectId)
 
 ObjectTable::~ObjectTable()
 {
-    for (size_t objectId = 0; objectId < Shared::ArraySize(ObjectArray); objectId++)
+    for (size_t objectId = 0; objectId < Stdlib::ArraySize(ObjectArray); objectId++)
     {
         Object* object = ObjectArray[objectId];
         ObjectArray[objectId] = nullptr;

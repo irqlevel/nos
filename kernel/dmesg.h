@@ -12,8 +12,8 @@ namespace Kernel
 
 struct DmesgMsg final
 {
-    char Str[256 - sizeof(Shared::ListEntry) - sizeof(Atomic)];
-    Shared::ListEntry ListEntry;
+    char Str[256 - sizeof(Stdlib::ListEntry) - sizeof(Atomic)];
+    Stdlib::ListEntry ListEntry;
     Atomic Usage;
 
     void Init()
@@ -41,7 +41,7 @@ public:
     void Printf(const char *fmt, ...);
     void PrintString(const char *s);
 
-    void Dump(Shared::Printer& printer);
+    void Dump(Stdlib::Printer& printer);
 
     DmesgMsg* Next(DmesgMsg* current);
 
@@ -54,11 +54,11 @@ private:
     Dmesg& operator=(const Dmesg& other) = delete;
     Dmesg& operator=(Dmesg&& other) = delete;
 
-    char Buf[32 * Shared::PageSize]  __attribute__((aligned(sizeof(DmesgMsg))));
+    char Buf[32 * Const::PageSize]  __attribute__((aligned(sizeof(DmesgMsg))));
 
     Mm::BlockAllocatorImpl MsgBuf;
 
-    Shared::ListEntry MsgList;
+    Stdlib::ListEntry MsgList;
 
     SpinLock Lock;
 

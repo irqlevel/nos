@@ -31,7 +31,7 @@ restart:
     DmesgMsg* msg = (DmesgMsg*)MsgBuf.Alloc();
     if (msg == nullptr)
     {
-        Shared::AutoLock lock(Lock);
+        Stdlib::AutoLock lock(Lock);
         if (MsgList.IsEmpty())
             return;
 
@@ -56,14 +56,14 @@ restart:
         msg->Init();
     }
 
-	int size = Shared::VsnPrintf(msg->Str, sizeof(msg->Str), fmt, args);
+	int size = Stdlib::VsnPrintf(msg->Str, sizeof(msg->Str), fmt, args);
     if (size < 0)
     {
         MsgBuf.Free(msg);
 		return;
     }
 
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     BugOn(msg->Usage.Get() != 0);
     MsgList.InsertTail(&msg->ListEntry);
 }
@@ -86,9 +86,9 @@ DmesgMsg* Dmesg::Next(DmesgMsg* current)
 {
     BugOn(current != nullptr && current->Usage.Get() == 0);
 
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
-    Shared::ListEntry* nextListEntry;
+    Stdlib::ListEntry* nextListEntry;
     if (current == nullptr)
     {
         nextListEntry = MsgList.Flink;
@@ -110,7 +110,7 @@ DmesgMsg* Dmesg::Next(DmesgMsg* current)
     return next;
 }
 
-void Dmesg::Dump(Shared::Printer& printer)
+void Dmesg::Dump(Stdlib::Printer& printer)
 {
     for (DmesgMsg* msg = Next(nullptr); msg != nullptr; msg = Next(msg))
     {

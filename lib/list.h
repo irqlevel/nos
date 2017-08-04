@@ -4,7 +4,7 @@
 #include <include/types.h>
 #include <include/panic.h>
 
-namespace Shared
+namespace Stdlib
 {
 
 template <typename T>
@@ -139,7 +139,7 @@ public:
 
     bool AddTail(T&& value)
     {
-        LinkedListNode* node = new LinkedListNode(Shared::Move(value));
+        LinkedListNode* node = new LinkedListNode(Stdlib::Move(value));
         if (!node)
         {
             return false;
@@ -214,7 +214,7 @@ public:
     LinkedList(LinkedList&& other)
     {
         ListHead.Init();
-        AddTail(Shared::Move(other));
+        AddTail(Stdlib::Move(other));
     }
 
     LinkedList& operator=(LinkedList&& other)
@@ -224,7 +224,7 @@ public:
             Release();
 
             ListHead.Init();
-            AddTail(Shared::Move(other));
+            AddTail(Stdlib::Move(other));
         }
         return *this;
     }
@@ -276,7 +276,7 @@ private:
         LinkedListNode(T&& value)
         {
             ListLink.Init();
-            Value = Shared::Move(value);
+            Value = Stdlib::Move(value);
         }
         ListEntry ListLink;
         T Value;

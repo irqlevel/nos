@@ -5,7 +5,7 @@
 namespace Kernel
 {
 
-Shared::Error Test();
+Stdlib::Error Test();
 
 bool TestMultiTasking();
 

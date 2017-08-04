@@ -13,42 +13,42 @@
 namespace Kernel
 {
 
-Shared::Error TestBtree()
+Stdlib::Error TestBtree()
 {
-    Shared::Error err;
+    Stdlib::Error err;
 
     Trace(TestLL, "TestBtree: started");
 
     size_t keyCount = 431;
 
-    Vector<size_t> pos;
+    Stdlib::Vector<size_t> pos;
     if (!pos.ReserveAndUse(keyCount))
-        return MakeError(Shared::Error::NoMemory);
+        return MakeError(Stdlib::Error::NoMemory);
 
     for (size_t i = 0; i < keyCount; i++)
     {
         pos[i] = i;
     }
 
-    Vector<u32> key;
+    Stdlib::Vector<u32> key;
     if (!key.ReserveAndUse(keyCount))
-        return MakeError(Shared::Error::NoMemory);
+        return MakeError(Stdlib::Error::NoMemory);
     for (size_t i = 0; i < keyCount; i++)
         key[i] = i;
 
-    Vector<u32> value;
+    Stdlib::Vector<u32> value;
     if (!value.ReserveAndUse(keyCount))
-        return MakeError(Shared::Error::NoMemory);
+        return MakeError(Stdlib::Error::NoMemory);
 
     for (size_t i = 0; i < keyCount; i++)
         value[i] = i;
 
-    Btree<u32, u32, 4> tree;
+    Stdlib::Btree<u32, u32, 4> tree;
 
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     for (size_t i = 0; i < keyCount; i++)
@@ -56,13 +56,13 @@ Shared::Error TestBtree()
         if (!tree.Insert(key[pos[i]], value[pos[i]]))
         {
             Trace(TestLL, "TestBtree: cant insert key %llu", key[pos[i]]);
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     for (size_t i = 0; i < keyCount; i++)
@@ -72,19 +72,19 @@ Shared::Error TestBtree()
         if (!exist)
         {
             Trace(TestLL, "TestBtree: cant find key");
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
 
         if (foundValue != value[pos[i]])
         {
             Trace(TestLL, "TestBtree: unexpected found value");
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     for (size_t i = 0; i < keyCount / 2; i++)
@@ -92,13 +92,13 @@ Shared::Error TestBtree()
         if (!tree.Delete(key[pos[i]]))
         {
             Trace(TestLL, "TestBtree: cant delete key[%lu][%lu]=%llu", i, pos[i], key[pos[i]]);
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     for (size_t i = keyCount / 2; i < keyCount; i++)
@@ -108,19 +108,19 @@ Shared::Error TestBtree()
         if (!exist)
         {
             Trace(TestLL, "TestBtree: cant find key");
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
 
         if (foundValue != value[pos[i]])
         {
             Trace(TestLL, "TestBtree: unexpected found value");
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     for (size_t i = keyCount / 2; i < keyCount; i++)
@@ -128,13 +128,13 @@ Shared::Error TestBtree()
         if (!tree.Delete(key[pos[i]]))
         {
             Trace(TestLL, "TestBtree: cant delete key");
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     for (size_t i = 0; i < keyCount; i++)
@@ -144,13 +144,13 @@ Shared::Error TestBtree()
         if (exist)
         {
             Trace(TestLL, "TestBtree: key still exist");
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     for (size_t i = 0; i < keyCount; i++)
@@ -158,13 +158,13 @@ Shared::Error TestBtree()
         if (!tree.Insert(key[pos[i]], value[pos[i]]))
         {
             Trace(TestLL, "TestBtree: can't insert key'");
-            return MakeError(Shared::Error::Unsuccessful);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     Trace(TestLL, "TestBtree: min depth %d max depth %d", tree.MinDepth(), tree.MaxDepth());
@@ -173,24 +173,24 @@ Shared::Error TestBtree()
     if (!tree.Check())
     {
         Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     Trace(TestLL, "TestBtree: complete");
 
-    return MakeError(Shared::Error::Success);
+    return MakeError(Stdlib::Error::Success);
 }
 
-Shared::Error TestAllocator()
+Stdlib::Error TestAllocator()
 {
-    Shared::Error err;
+    Stdlib::Error err;
 
-    for (size_t size = 1; size <= 8 * Shared::PageSize; size++)
+    for (size_t size = 1; size <= 8 * Const::PageSize; size++)
     {
         u8 *block = new u8[size];
         if (block == nullptr)
         {
-            return Shared::Error::NoMemory;
+            return Stdlib::Error::NoMemory;
         }
 
         block[0] = 1;
@@ -199,49 +199,49 @@ Shared::Error TestAllocator()
         delete [] block;
     }
 
-    return MakeError(Shared::Error::Success);
+    return MakeError(Stdlib::Error::Success);
 }
 
-Shared::Error TestRingBuffer()
+Stdlib::Error TestRingBuffer()
 {
-    Shared::RingBuffer<u8, 3> rb;
+    Stdlib::RingBuffer<u8, 3> rb;
 
     if (!rb.Put(0x1))
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (!rb.Put(0x2))
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (!rb.Put(0x3))
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (rb.Put(0x4))
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (!rb.IsFull())
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (rb.IsEmpty())
-        return MakeError(Shared::Error::Unsuccessful);    
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (rb.Get() != 0x1)
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (rb.Get() != 0x2)
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (rb.Get() != 0x3)
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
 
     if (!rb.IsEmpty())
-        return MakeError(Shared::Error::Unsuccessful);
+        return MakeError(Stdlib::Error::Unsuccessful);
    
-    return MakeError(Shared::Error::Success);
+    return MakeError(Stdlib::Error::Success);
 }
 
-Shared::Error Test()
+Stdlib::Error Test()
 {
-    Shared::Error err;
+    Stdlib::Error err;
 
     err = TestAllocator();
     if (!err.Ok())
@@ -267,14 +267,14 @@ void TestMultiTaskingTaskFunc(void *ctx)
         auto& cpu = GetCpu();
         auto task = Task::GetCurrentTask();
         Trace(0, "Hello from task 0x%p pid %u cpu %u", task, task->Pid, cpu.GetIndex());
-        Sleep(100 * Shared::NanoSecsInMs);
+        Sleep(100 * Const::NanoSecsInMs);
     }
 }
 
 bool TestMultiTasking()
 {
     Task *task[2] = {0};
-    for (size_t i = 0; i < Shared::ArraySize(task); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
     {
         task[i] = new Task();
         if (task[i] == nullptr)
@@ -289,7 +289,7 @@ bool TestMultiTasking()
 
     bool result;
 
-    for (size_t i = 0; i < Shared::ArraySize(task); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
     {
         if (!task[i]->Start(TestMultiTaskingTaskFunc, nullptr))
         {
@@ -302,7 +302,7 @@ bool TestMultiTasking()
         }
     }
 
-    for (size_t i = 0; i < Shared::ArraySize(task); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
     {
         task[i]->Wait();
     }
@@ -310,7 +310,7 @@ bool TestMultiTasking()
     result = true;
 
 delTasks:
-    for (size_t i = 0; i < Shared::ArraySize(task); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
     {
         task[i]->Put();
     }

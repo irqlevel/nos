@@ -23,24 +23,24 @@ IoApic::~IoApic()
 
 u32 IoApic::ReadRegister(u8 reg)
 {
-    Shared::AutoLock lock(OpLock);
+    Stdlib::AutoLock lock(OpLock);
 
-    Mm::MmIo::Write32(Shared::MemAdd(BaseAddress, RegSel), reg);
+    Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegSel), reg);
 
     Barrier();
 
-    return Mm::MmIo::Read32(Shared::MemAdd(BaseAddress, RegWin));
+    return Mm::MmIo::Read32(Stdlib::MemAdd(BaseAddress, RegWin));
 }
 
 void IoApic::WriteRegister(u8 reg, u32 value)
 {
-    Shared::AutoLock lock(OpLock);
+    Stdlib::AutoLock lock(OpLock);
 
-    Mm::MmIo::Write32(Shared::MemAdd(BaseAddress, RegSel), reg);
+    Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegSel), reg);
 
     Barrier();
 
-    Mm::MmIo::Write32(Shared::MemAdd(BaseAddress, RegWin), value);
+    Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegWin), value);
 }
 
 void IoApic::Enable()

@@ -10,7 +10,7 @@ namespace Kernel
 
 void* Lapic::GetRegBase(ulong index)
 {
-    return Shared::MemAdd(Acpi::GetInstance().GetLapicAddress(), index * 0x10);
+    return Stdlib::MemAdd(Acpi::GetInstance().GetLapicAddress(), index * 0x10);
 }
 
 u32 Lapic::ReadReg(ulong index)

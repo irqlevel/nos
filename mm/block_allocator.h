@@ -30,7 +30,7 @@ private:
     BlockAllocatorImpl& operator=(const BlockAllocatorImpl& other) = delete;
     BlockAllocatorImpl& operator=(BlockAllocatorImpl&& other) = delete;
 
-    using ListEntry = Shared::ListEntry;
+    using ListEntry = Stdlib::ListEntry;
 
     ListEntry BlockList;
     ulong Usage;

@@ -102,7 +102,7 @@ void Serial::VPrintf(const char *fmt, va_list args)
 {
 	char str[256];
 
-	if (Shared::VsnPrintf(str, sizeof(str), fmt, args) < 0)
+	if (Stdlib::VsnPrintf(str, sizeof(str), fmt, args) < 0)
 		return;
 
 	PrintString(str);

@@ -1,6 +1,6 @@
 #pragma once
 
-namespace Shared
+namespace Stdlib
 {
 
 struct ListEntry final

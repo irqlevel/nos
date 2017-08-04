@@ -45,7 +45,7 @@ private:
     bool IsTransmitEmpty();
     int IntVector;
 
-    Shared::RingBuffer<char, 4 * Shared::PageSize> Buf;
+    Stdlib::RingBuffer<char, 4 * Const::PageSize> Buf;
     SpinLock Lock;
 
     static const int Port = 0x3F8;

@@ -30,12 +30,12 @@ void SpinLock::Lock()
 
 void SpinLock::Unlock()
 {
-    Shared::Time lockTime(LockTime.Get());
+    Stdlib::Time lockTime(LockTime.Get());
     if (lockTime.GetValue() != 0)
     {
-        Shared::Time now = GetBootTime();
-        Shared::Time delta = now - lockTime;
-        if (delta > Shared::Time(20 * Shared::NanoSecsInMs))
+        Stdlib::Time now = GetBootTime();
+        Stdlib::Time delta = now - lockTime;
+        if (delta > Stdlib::Time(20 * Const::NanoSecsInMs))
         {
             //Panic("Spin lock 0x%p was held too long %u", this, delta.GetValue());
         }

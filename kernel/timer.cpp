@@ -17,9 +17,9 @@ TimerTable::~TimerTable()
 {
 }
 
-bool TimerTable::StartTimer(TimerCallback& callback, Shared::Time period)
+bool TimerTable::StartTimer(TimerCallback& callback, Stdlib::Time period)
 {
-    for (size_t i = 0; i < Shared::ArraySize(Timer); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Timer); i++)
     {
         auto& timer = Timer[i];
         if (timer.Callback == nullptr)
@@ -36,7 +36,7 @@ bool TimerTable::StartTimer(TimerCallback& callback, Shared::Time period)
 
 void TimerTable::StopTimer(TimerCallback& callback)
 {
-    for (size_t i = 0; i < Shared::ArraySize(Timer); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Timer); i++)
     {
         auto& timer = Timer[i];
         if (timer.Callback == &callback)
@@ -50,7 +50,7 @@ void TimerTable::ProcessTimers()
 {
     auto now = GetBootTime();
 
-    for (size_t i = 0; i < Shared::ArraySize(Timer); i++)
+    for (size_t i = 0; i < Stdlib::ArraySize(Timer); i++)
     {
         auto& timer = Timer[i];
 

@@ -14,7 +14,7 @@ VgaTerm::VgaTerm()
     , Height(MaxHeight)
     , ColorCode(MakeColor(ColorWhite, ColorBlack))
 {
-	Shared::AutoLock lock(Lock);
+	Stdlib::AutoLock lock(Lock);
 
 	ClsLockHeld();
     Cursor();
@@ -36,7 +36,7 @@ u16 VgaTerm::MakeEntry(char c, u8 color)
 
 void VgaTerm::SetColor(Color fg, Color bg)
 {
-	Shared::AutoLock lock(Lock);
+	Stdlib::AutoLock lock(Lock);
 
     ColorCode = MakeColor(fg, bg);
 }
@@ -110,7 +110,7 @@ void VgaTerm::PutsLockHeld(const char *str)
 
 void VgaTerm::Puts(const char *str)
 {
-	Shared::AutoLock lock(Lock);
+	Stdlib::AutoLock lock(Lock);
 
 	PutsLockHeld(str);
 }
@@ -124,7 +124,7 @@ void VgaTerm::ClsLockHeld()
 
 void VgaTerm::Cls()
 {
-	Shared::AutoLock lock(Lock);
+	Stdlib::AutoLock lock(Lock);
 
 	ClsLockHeld();
 	Row = 0;
@@ -136,10 +136,10 @@ void VgaTerm::VPrintf(const char *fmt, va_list args)
 {
 	char str[256];
 
-	if (Shared::VsnPrintf(str, sizeof(str), fmt, args) < 0)
+	if (Stdlib::VsnPrintf(str, sizeof(str), fmt, args) < 0)
 		return;
 
-	Shared::AutoLock lock(Lock);
+	Stdlib::AutoLock lock(Lock);
 
 	PutsLockHeld(str);
 }
@@ -155,7 +155,7 @@ void VgaTerm::Printf(const char *fmt, ...)
 
 void VgaTerm::PrintString(const char *s)
 {
-	Shared::AutoLock lock(Lock);
+	Stdlib::AutoLock lock(Lock);
 
 	PutsLockHeld(s);
 }

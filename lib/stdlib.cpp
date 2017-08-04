@@ -1,6 +1,6 @@
 #include "stdlib.h"
 
-namespace Shared
+namespace Stdlib
 {
 
 void *MemAdd(void *ptr, unsigned long len)

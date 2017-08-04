@@ -2,7 +2,7 @@
 
 #include "stdlib.h"
 
-namespace Shared
+namespace Stdlib
 {
 
 class Error final
@@ -100,4 +100,4 @@ private:
 }
 
 #define MakeError(code) \
-    Shared::Error(code, __FUNCTION__, Shared::TruncateFileName(__FILE__), __LINE__)
+    Stdlib::Error(code, __FUNCTION__, Stdlib::TruncateFileName(__FILE__), __LINE__)

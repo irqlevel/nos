@@ -23,7 +23,7 @@ bool BlockAllocatorImpl::Setup(ulong startAddress, ulong endAddress, ulong block
 {
     Trace(0, "0x%p start 0x%p end 0x%p bsize %u", this, startAddress, endAddress, blockSize);
 
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     if (Total != 0)
         return false;
 
@@ -57,7 +57,7 @@ BlockAllocatorImpl::~BlockAllocatorImpl()
 
 void* BlockAllocatorImpl::Alloc()
 {
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
 
     if (BlockList.IsEmpty())
     {
@@ -91,7 +91,7 @@ void BlockAllocatorImpl::Free(void *block)
     BugOn(block == nullptr);
     BugOn(!IsOwner(block));
 
-    Shared::AutoLock lock(Lock);
+    Stdlib::AutoLock lock(Lock);
     BlockList.InsertTail(reinterpret_cast<ListEntry*>(block));
     Usage--;
 }

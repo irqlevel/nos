@@ -18,7 +18,7 @@ MemoryMap::MemoryMap()
 
 bool MemoryMap::AddRegion(u64 addr, u64 len, u32 type)
 {
-    if (Size >= Shared::ArraySize(Region))
+    if (Size >= Stdlib::ArraySize(Region))
         return false;
 
     auto& region = Region[Size];
@@ -78,12 +78,12 @@ MemoryMap::~MemoryMap()
 
 ulong MemoryMap::GetKernelStart()
 {
-    return Shared::RoundDown((ulong)&KernelStart, Shared::PageSize);
+    return Stdlib::RoundDown((ulong)&KernelStart, Const::PageSize);
 }
 
 ulong MemoryMap::GetKernelEnd()
 {
-    return Shared::RoundUp((ulong)&KernelEnd, Shared::PageSize);
+    return Stdlib::RoundUp((ulong)&KernelEnd, Const::PageSize);
 }
 
 

@@ -1,6 +1,6 @@
 #include "error.h"
 
-namespace Shared
+namespace Stdlib
 {
 
 Error::Error()

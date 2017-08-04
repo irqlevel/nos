@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include <include/const.h>
 
-namespace Shared
+namespace Stdlib
 {
 
 struct Time
@@ -97,12 +97,12 @@ struct Time
 
     ulong GetSecs()
     {
-        return NanoSecs / NanoSecsInSec;
+        return NanoSecs / Const::NanoSecsInSec;
     }
 
     ulong GetUsecs()
     {
-        return (NanoSecs % NanoSecsInSec) / NanoSecsInUsec;
+        return (NanoSecs % Const::NanoSecsInSec) / Const::NanoSecsInUsec;
     }
 
     ulong NanoSecs;
@@ -259,7 +259,7 @@ static inline size_t RoundUp(size_t value, size_t align)
 
 static inline size_t SizeInPages(size_t size)
 {
-    return RoundUp(size, Shared::PageSize) / Shared::PageSize;
+    return RoundUp(size, Const::PageSize) / Const::PageSize;
 }
 
 void *MemAdd(void *ptr, unsigned long len);

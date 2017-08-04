@@ -25,7 +25,7 @@ public:
 
     void Check();
 
-    void Dump(Shared::Printer& printer);
+    void Dump(Stdlib::Printer& printer);
 
 private:
     Watchdog(const Watchdog& other) = delete;
@@ -36,7 +36,7 @@ private:
 
     static const size_t SpinLockHashSize = 512;
 
-    Shared::ListEntry SpinLockList[SpinLockHashSize];
+    Stdlib::ListEntry SpinLockList[SpinLockHashSize];
     RawSpinLock SpinLockListLock[SpinLockHashSize];
 
     Atomic CheckCounter;

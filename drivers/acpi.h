@@ -15,7 +15,7 @@ public:
         return Instance;
     }
 
-    Shared::Error Parse();
+    Stdlib::Error Parse();
 
     void* GetLapicAddress();
 
@@ -109,10 +109,10 @@ private:
 
     bool ParseRsdp(RSDPDescriptor20* rsdp);
     RSDPDescriptor20* FindRsdp();
-    Shared::Error ParseRsdt(ACPISDTHeader* rsdt);
+    Stdlib::Error ParseRsdt(ACPISDTHeader* rsdt);
 
-    Shared::Error ParseTablePointers();
-    Shared::Error ParseMADT();
+    Stdlib::Error ParseTablePointers();
+    Stdlib::Error ParseMADT();
 
     ACPISDTHeader* LookupTable(const char *name);
 
