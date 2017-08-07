@@ -15,7 +15,7 @@ namespace Kernel
 class IO8042Observer
 {
 public:
-    virtual void OnChar(char c) = 0;
+    virtual void OnChar(char c, u8 code) = 0;
 };
 
 class IO8042 : public TimerCallback, public InterruptHandler

@@ -83,7 +83,7 @@ void Cmd::ProcessCmd(const char *cmd)
     }
     else
     {
-        vga.Printf("command not found\n");
+        vga.Printf("command '%s' not found\n", cmd);
     }
     vga.Printf("$");
 }
@@ -155,21 +155,32 @@ void Cmd::Run()
 
     while (!Task::GetCurrentTask()->IsStopping())
     {
-        char c;
-        bool hasChar = false;
+        KeyEvent keyEvent = {};
+        bool hasEvent = false;
+        bool backspace = false;
         {
             Stdlib::AutoLock lock(Lock);
             if (!Buf.IsEmpty())
             {
-                c = Buf.Get();
-                hasChar = true;
+                keyEvent = Buf.Get();
+                hasEvent = true;
+                backspace = (keyEvent.Code == 0xE) ? true : false;
             }
         }
 
-        if (hasChar)
+        if (hasEvent)
         {
-            vga.Printf("%c", c);
-            if (c == '\n')
+            if (backspace)
+            {
+                if (pos > 0)
+                    vga.Backspace();
+            }
+            else
+            {
+                vga.Printf("%c", keyEvent.Char);
+            }
+
+            if (keyEvent.Char == '\n')
             {
                 CmdLine[Stdlib::ArraySize(CmdLine) - 1] = '\0';
                 if (!overflow)
@@ -188,7 +199,20 @@ void Cmd::Run()
             else
             {
                 if (pos < (Stdlib::ArraySize(CmdLine) - 1))
-                    CmdLine[pos++] = c;
+                {
+                    if (backspace)
+                    {
+                        if (pos > 0)
+                        {
+                            pos--;
+                            CmdLine[pos] = '\0';
+                        }
+                    }
+                    else
+                    {
+                        CmdLine[pos++] = keyEvent.Char;
+                    }
+                }
                 else
                 {
                     overflow = true;
@@ -206,13 +230,17 @@ void Cmd::RunFunc(void *ctx)
     cmd->Run();
 }
 
-void Cmd::OnChar(char c)
+void Cmd::OnChar(char c, u8 code)
 {
     Stdlib::AutoLock lock(Lock);
     if (!Active)
         return;
 
-    if (!Buf.Put(c))
+    KeyEvent e;
+    e.Char = c;
+    e.Code = code;
+
+    if (!Buf.Put(e))
     {
         Trace(0, "Can't save char");
         return;

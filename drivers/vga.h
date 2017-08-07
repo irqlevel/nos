@@ -22,6 +22,7 @@ public:
     virtual void VPrintf(const char *fmt, va_list args) override;
     virtual void Printf(const char *fmt, ...) override;
     virtual void PrintString(const char *s) override;
+    virtual void Backspace() override;
 
     /* VGA hardware text mode color constants. */
     enum Color {

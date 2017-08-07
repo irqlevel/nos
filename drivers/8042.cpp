@@ -101,14 +101,16 @@ void IO8042::OnTick(TimerCallback& callback)
         else if (code & 0x80) continue;
         else
         {
-            char c = map[(int)code] ^ Mod;
+            BugOn(code >= Stdlib::ArraySize(map));
+
+            char c = map[code] ^ Mod;
 
             Trace(KbdLL, "Kbd: char %c", c);
 
             for (size_t i = 0; i < MaxObserver; i++)
             {
                 if (Observer[i] != nullptr)
-                    Observer[i]->OnChar(c);
+                    Observer[i]->OnChar(c, code);
             }
         }
     }

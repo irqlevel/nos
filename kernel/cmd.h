@@ -19,7 +19,7 @@ public:
         return Instance;
     }
 
-    virtual void OnChar(char c) override;
+    virtual void OnChar(char c, u8 code) override;
 
     bool IsExit();
 
@@ -41,7 +41,13 @@ private:
     static void RunFunc(void *ctx);
 
     static const size_t CmdSizeMax = 80;
-    Stdlib::RingBuffer<char, Const::PageSize> Buf;
+
+    struct KeyEvent {
+        char Char;
+        u8 Code;
+    };
+
+    Stdlib::RingBuffer<KeyEvent, Const::PageSize> Buf;
     char CmdLine[CmdSizeMax + 1];
     SpinLock Lock;
     Task *Task;
