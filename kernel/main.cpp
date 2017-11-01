@@ -192,11 +192,18 @@ void BpStartup(void* ctx)
     Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
 
     BugOn(IsInterruptEnabled());
-    InterruptEnable();
+
+    Trace(0, "Before pit setup");
 
     pit.Setup();
 
-    Trace(0, "Interrupts enabled");
+    Trace(0, "Before interrupt enable");
+
+    InterruptEnable();
+
+    Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
+
+    Trace(0, "Before cpus start");
 
     if (!Parameters::GetInstance().IsSmpOff())
     {
@@ -206,6 +213,8 @@ void BpStartup(void* ctx)
             return;
         }
     }
+
+    Trace(0, "Before preempt on");
 
     PreemptOn();
     PreemptOnWaiting = false;

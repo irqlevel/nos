@@ -16,6 +16,8 @@ BlockAllocatorImpl::BlockAllocatorImpl()
     , EndAddress(0)
     , BlockSize(0)
 {
+    Stdlib::AutoLock lock(Lock);
+
     BlockList.Init();
 }
 
@@ -49,6 +51,8 @@ bool BlockAllocatorImpl::Setup(ulong startAddress, ulong endAddress, ulong block
 
 BlockAllocatorImpl::~BlockAllocatorImpl()
 {
+    Stdlib::AutoLock lock(Lock);
+
     if (Usage != 0)
         Trace(0, "0x%p usage %u blockSize %u", this, Usage, BlockSize);
 
