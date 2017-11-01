@@ -42,13 +42,15 @@ public:
 private:
     IO8042();
     virtual ~IO8042();
+    void ReadData();
 
     IO8042(const IO8042& other) = delete;
     IO8042(IO8042&& other) = delete;
     IO8042& operator=(const IO8042& other) = delete;
     IO8042& operator=(IO8042&& other) = delete;
 
-    static const ulong Port = 0x60;
+    static const ulong DataPort = 0x60;
+    static const ulong StatusPort = 0x64;
 
     SpinLock Lock;
     Stdlib::RingBuffer<u8, Const::PageSize> Buf;

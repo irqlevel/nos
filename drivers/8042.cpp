@@ -14,9 +14,14 @@ IO8042::IO8042()
     : IntVector(-1)
     , Mod(0)
 {
-    Trace(0, "IO8042 0x%p", this);
+    Trace(0, "IO8042 0x%p status 0x%p", this, (ulong)Inb(StatusPort));
+
+    VgaTerm::GetInstance().Printf("IO8042 status 0x%p\n", (ulong)Inb(StatusPort));
+
     for (size_t i = 0; i < Stdlib::ArraySize(Observer); i++)
         Observer[i] = nullptr;
+
+    ReadData();
 }
 
 IO8042::~IO8042()
@@ -39,17 +44,24 @@ InterruptHandlerFn IO8042::GetHandlerFn()
     return IO8042InterruptStub;
 }
 
-void IO8042::Interrupt(Context* ctx)
+void IO8042::ReadData()
 {
-    InterruptCounter.Inc();
-    (void)ctx;
     Stdlib::AutoLock lock(Lock);
 
-    if (!Buf.Put(Inb(Port)))
-    {
-        Trace(0, "Kbd: can't put new code");
+    while (Inb(StatusPort) & 0x1) {
+        if (!Buf.Put(Inb(DataPort)))
+        {
+            Trace(0, "Kbd: can't put new code");
+        }
     }
+}
 
+void IO8042::Interrupt(Context* ctx)
+{
+    (void)ctx;
+
+    InterruptCounter.Inc();
+    ReadData();
     Lapic::EOI(IntVector);
 }
 
