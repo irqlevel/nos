@@ -46,6 +46,11 @@ void Serial::Send()
     }
 }
 
+void Serial::Flush()
+{
+    Send();
+}
+
 void Serial::Wait()
 {
     size_t pauseCount = 1;

@@ -48,7 +48,8 @@ void IO8042::ReadData()
 {
     Stdlib::AutoLock lock(Lock);
 
-    while (Inb(StatusPort) & 0x1) {
+    while (Inb(StatusPort) & 0x1)
+    {
         if (!Buf.Put(Inb(DataPort)))
         {
             Trace(0, "Kbd: can't put new code");

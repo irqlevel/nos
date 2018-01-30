@@ -29,6 +29,8 @@ public:
 
     void Interrupt(Context* ctx);
 
+    void Flush();
+
 private:
     Serial();
     ~Serial();

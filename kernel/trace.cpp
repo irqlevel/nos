@@ -40,6 +40,8 @@ void Tracer::Output(const char *fmt, ...)
         return;
 
     Serial::GetInstance().PrintString(msg);
+    Serial::GetInstance().Flush();
+
     Dmesg::GetInstance().PrintString(msg);
 
     if (Parameters::GetInstance().IsTraceVga())
