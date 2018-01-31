@@ -291,10 +291,6 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 
     Grub::ParseMultiBootInfo(MbInfo);
 
-    auto& mmap = Mm::MemoryMap::GetInstance();
-    Trace(0, "Enter kernel: start 0x%p end 0x%p",
-        mmap.GetKernelStart(), mmap.GetKernelEnd());
-
     auto& pt = Mm::PageTable::GetInstance();
     if (!pt.Setup())
     {
@@ -306,20 +302,23 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
     SetCr3(pt.GetRoot());
     Trace(0, "Set new cr3 0x%p", GetCr3());
 
-    if (!pt.Setup2())
-    {
-        Panic("Can't setup paging 2");
-        break;
-    }
-
-    Trace(0, "Paging root 0x%p old cr3 0x%p", pt.GetRoot(), GetCr3());
-    SetCr3(pt.GetRoot());
-    Trace(0, "Set new cr3 0x%p", GetCr3());
+    auto& mmap = Mm::MemoryMap::GetInstance();
+    Trace(0, "Enter kernel: start 0x%p end 0x%p",
+        mmap.GetKernelStart(), mmap.GetKernelEnd());
 
     ulong memStart, memEnd;
     if (mmap.GetKernelEnd() <= pt.PhysToVirt(MB))
     {
         Panic("Kernel end is lower than kernel space base");
+        break;
+    }
+
+    auto& acpi = Acpi::GetInstance();
+    auto err = acpi.Parse();
+    if (!err.Ok())
+    {
+        TraceError(err, "Can't parse ACPI");
+        Panic("Can't parse ACPI");
         break;
     }
 
@@ -340,15 +339,6 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
     Mm::AllocatorImpl::GetInstance(Mm::PageAllocatorImpl::GetInstance());
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
-
-    auto& acpi = Acpi::GetInstance();
-    auto err = acpi.Parse();
-    if (!err.Ok())
-    {
-        TraceError(err, "Can't parse ACPI");
-        Panic("Can't parse ACPI");
-        break;
-    }
 
     Trace(0, "Before test");
 

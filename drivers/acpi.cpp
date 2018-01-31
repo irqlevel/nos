@@ -2,6 +2,7 @@
 
 #include <kernel/trace.h>
 #include <kernel/cpu.h>
+#include <mm/memory_map.h>
 
 namespace Kernel
 {
@@ -41,13 +42,13 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
 {
     if (ComputeSum(rsdp, sizeof(rsdp->FirstPart)) != 0)
     {
-        Trace(AcpiLL, "Rsdp 0x%p checksum failed 0x%p vs 0x%p",
+        Trace(0, "Rsdp 0x%p checksum failed 0x%p vs 0x%p",
             rsdp, (ulong)ComputeSum(rsdp, sizeof(rsdp->FirstPart)));
     }
 
     Stdlib::MemCpy(OemId, rsdp->FirstPart.OEMID, sizeof(rsdp->FirstPart.OEMID));
 
-    Trace(AcpiLL, "Rsdp 0x%p revision %u OemId %s Rsdt 0x%p",
+    Trace(0, "Rsdp 0x%p revision %u OemId %s Rsdt 0x%p",
         rsdp, (ulong)rsdp->FirstPart.Revision, OemId, (ulong)rsdp->FirstPart.RsdtAddress);
 
     return true;
@@ -55,21 +56,33 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
 
 Acpi::RSDPDescriptor20* Acpi::FindRsdp()
 {
-    // Search main BIOS area below 1MB
-    // TODO - Search Extended BIOS Area
-    u8 *p = reinterpret_cast<u8 *>(0x000e0000);
-    u8 *end = reinterpret_cast<u8 *>(0x000fffff);
-    while (p < end)
-    {
-        RSDPDescriptor20 *rsdp = reinterpret_cast<RSDPDescriptor20*>(p);
-        if (rsdp->FirstPart.Signature == RSDPSignature)
+    auto& mm = Kernel::Mm::MemoryMap::GetInstance();
+
+    for (size_t i = 0; i < mm.GetRegionCount(); i++) {
+        u64 addr, len;
+        u32 type;
+
+        if (!mm.GetRegion(i, addr, len, type))
+            return nullptr;
+
+        if (type != 1)
+            continue;
+
+        u8 *p = reinterpret_cast<u8 *>(addr);
+        u8 *end = reinterpret_cast<u8 *>(addr + len);
+        while (p < end)
         {
-            if (ParseRsdp(rsdp))
+            RSDPDescriptor20 *rsdp = reinterpret_cast<RSDPDescriptor20*>(p);
+            if (rsdp->FirstPart.Signature == RSDPSignature)
             {
-                return rsdp;
+                Trace(0, "Checking rsdp 0x%p", rsdp);
+                if (ParseRsdp(rsdp))
+                {
+                    return rsdp;
+                }
             }
+            p += 16;
         }
-        p += 16;
     }
 
     return nullptr;

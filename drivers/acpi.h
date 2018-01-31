@@ -125,7 +125,7 @@ private:
     ACPISDTHeader* Table[MaxTables];
 
     static const bool checkRsdtChecksum = false;
-    static const u64 RSDPSignature = 0x2052545020445352; //'RSD PTR '
+    static const u64 RSDPSignature = 0x2052545020445352ULL; //'RSD PTR '
 
     void* LapicAddress;
     void* IoApicAddress;

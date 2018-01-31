@@ -29,8 +29,6 @@ public:
 
     void UnmapNull();
 
-    bool Setup2();
-
 private:
     PageTable(const PageTable& other) = delete;
     PageTable(PageTable&& other) = delete;
@@ -131,8 +129,6 @@ private:
 
     static_assert(sizeof(Page) == 0x20, "Invalid size");
 
-    struct Page *Pages;
-    size_t PageCount;
     ulong State;
 
     Stdlib::ListEntry FreePagesList;

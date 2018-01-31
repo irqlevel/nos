@@ -10,14 +10,8 @@ namespace Kernel
 namespace Mm
 {
 
-// N pages
-// N * sizeof(page)
-// N * 8 = sizeof page entries
-
 PageTable::PageTable()
-    : Pages(nullptr)
-    , PageCount(0)
-    , State(1)
+    : State(1)
 {
     Stdlib::MemSet(&P4Page, 0, sizeof(P4Page));
 
@@ -161,49 +155,6 @@ ulong PageTable::GetRoot()
 
 PageTable::~PageTable()
 {
-}
-
-bool PageTable::Setup2()
-{
-    auto& mmap = MemoryMap::GetInstance();
-    ulong memStart, memEnd;
-
-    if (!mmap.FindRegion(VirtToPhys(mmap.GetKernelEnd()), 4 * Const::GB, memStart, memEnd))
-    {
-        Trace(0, "Can't get available memory region");
-        return false;
-    }
-
-    if (memStart % Const::PageSize)
-    {
-        Trace(0, "Invalid memory start");
-        return false;
-    }
-
-    if (memEnd % Const::PageSize)
-    {
-        Trace(0, "Invalid memory end");
-        return false;
-    }
-
-    size_t pageCount = memEnd / Const::PageSize;
-    Trace(0, "Phy page count %u", pageCount);
-
-    Page* pageStart = (Page*)PhysToVirt(memStart);
-    for (size_t i = 0; i < pageCount; i++)
-    {
-        Page* page = &pageStart[i];
-        if ((ulong)Stdlib::MemAdd(page, sizeof(*page)) >= PhysToVirt(memEnd))
-        {
-            Trace(0, "Pages array overflow memory end");
-            return false;
-        }
-
-        page->Pfn = i;
-        FreePagesList.InsertTail(&page->ListEntry);
-    }
-
-    return true;
 }
 
 }
