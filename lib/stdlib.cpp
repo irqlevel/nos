@@ -386,4 +386,11 @@ const char* StrChrOnce(const char* s, char sep)
     }
 }
 
+bool IsValueInRange(ulong value, ulong base, ulong limit)
+{
+    if (value >= base && value < limit)
+        return true;
+
+    return false;
+}
 }

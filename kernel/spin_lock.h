@@ -38,8 +38,8 @@ private:
 	volatile void* Owner;
 
 public:
-	Stdlib::ListEntry ListEntry;
-	Atomic LockTime;
+	Stdlib::ListEntry WatchdogListEntry;
+	Atomic WatchdogLockTime;
 };
 
 }

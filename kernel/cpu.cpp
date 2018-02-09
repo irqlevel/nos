@@ -68,8 +68,11 @@ void Cpu::Init(ulong index)
     Trace(0, "Cpu 0x%p %u inited", this, Index);
 }
 
-Cpu::~Cpu()
+void Cpu::Reset()
 {
+    Stdlib::AutoLock lock(Lock);
+
+    BugOn(State == StateRunning);
     TaskQueue.Clear();
 
     if (Task != nullptr)
@@ -79,6 +82,11 @@ Cpu::~Cpu()
     }
 }
 
+Cpu::~Cpu()
+{
+    Reset();
+}
+
 CpuTable::CpuTable()
     : BspIndex(0)
 {
@@ -86,6 +94,7 @@ CpuTable::CpuTable()
 
 CpuTable::~CpuTable()
 {
+    Reset();
 }
 
 bool CpuTable::InsertCpu(ulong index)
@@ -354,6 +363,17 @@ ulong CpuTable::GetRunningCpus()
     }
 
     return result;
+}
+
+void CpuTable::Reset()
+{
+    Stdlib::AutoLock lock(Lock);
+
+    for (ulong i = 0; i < Stdlib::ArraySize(CpuArray); i++)
+    {
+        auto& cpu = CpuArray[i];
+        cpu.Reset();
+    }
 }
 
 bool Cpu::Run(Task::Func func, void *ctx)

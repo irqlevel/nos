@@ -38,6 +38,7 @@ global GetCr3
 global GetCr4
 global SetCr3
 global GetRsp
+global GetRbp
 global GetRip
 global GetRflags
 global SetRflags
@@ -131,6 +132,10 @@ SetCr3:
 GetCr4:
 	mov rax, cr4
 	ret
+
+GetRbp:
+    mov rax, rbp
+    ret
 
 GetRsp:
 	mov rax, rsp

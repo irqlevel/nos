@@ -306,4 +306,6 @@ size_t Log2(size_t size);
 
 size_t HashPtr(void *ptr);
 
+bool IsValueInRange(ulong value, ulong base, ulong limit);
+
 }

@@ -11,6 +11,7 @@ Dmesg::Dmesg()
 
 Dmesg::~Dmesg()
 {
+    Reset();
 }
 
 bool Dmesg::Setup()
@@ -20,6 +21,17 @@ bool Dmesg::Setup()
 
     Active = MsgBuf.Setup((ulong)&Buf[0], (ulong)&Buf[0] + sizeof(Buf), sizeof(DmesgMsg));
     return Active;
+}
+
+void Dmesg::Reset()
+{
+    Active = false;
+    Stdlib::AutoLock lock(Lock);
+    while (!MsgList.IsEmpty())
+    {
+        DmesgMsg *msg = CONTAINING_RECORD(MsgList.RemoveHead(), DmesgMsg, ListEntry);
+        MsgBuf.Free(msg);
+    }
 }
 
 void Dmesg::VPrintf(const char *fmt, va_list args)

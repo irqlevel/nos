@@ -45,6 +45,8 @@ public:
 
     DmesgMsg* Next(DmesgMsg* current);
 
+    void Reset();
+
 private:
     Dmesg();
     ~Dmesg();

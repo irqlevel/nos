@@ -2,6 +2,7 @@
 
 #include <kernel/trace.h>
 #include <kernel/panic.h>
+#include <kernel/stack_trace.h>
 
 namespace Kernel
 {
@@ -18,7 +19,8 @@ BlockAllocatorImpl::BlockAllocatorImpl()
 {
     Stdlib::AutoLock lock(Lock);
 
-    BlockList.Init();
+    FreeBlockList.Init();
+    ActiveBlockList.Init();
 }
 
 bool BlockAllocatorImpl::Setup(ulong startAddress, ulong endAddress, ulong blockSize)
@@ -32,15 +34,19 @@ bool BlockAllocatorImpl::Setup(ulong startAddress, ulong endAddress, ulong block
     if (endAddress <= startAddress)
         return false;
 
-    if ((startAddress % blockSize) != 0)
+    if (sizeof(BlockEntry) > blockSize)
         return false;
 
     BlockSize = blockSize;
     StartAddress = EndAddress = startAddress;
-    for (ulong blockAddress = startAddress; (blockAddress + BlockSize) <= endAddress; blockAddress+= BlockSize)
+    for (ulong blockAddress = startAddress; (blockAddress + 2 * BlockSize) <= endAddress;
+        blockAddress+= (2 * BlockSize))
     {
-        BlockList.InsertTail(reinterpret_cast<ListEntry*>(blockAddress));
-        EndAddress = blockAddress + BlockSize;
+        BlockEntry* b = reinterpret_cast<BlockEntry*>(blockAddress + BlockSize);
+        b->Magic = Magic;
+        b->NumFrames = 0;
+        FreeBlockList.InsertTail(&b->ListLink);
+        EndAddress = blockAddress + 2 * BlockSize;
         Total++;
     }
 
@@ -54,7 +60,18 @@ BlockAllocatorImpl::~BlockAllocatorImpl()
     Stdlib::AutoLock lock(Lock);
 
     if (Usage != 0)
+    {
         Trace(0, "0x%p usage %u blockSize %u", this, Usage, BlockSize);
+        for (ListEntry* le = ActiveBlockList.Flink; le != &ActiveBlockList; le = le->Flink)
+        {
+            BlockEntry* b = CONTAINING_RECORD(le, BlockEntry, ListLink);
+            Trace(0, "leak entry 0x%p magic 0x%p frames %u", b, b->Magic, b->NumFrames);
+
+            for (size_t i = 0; i < b->NumFrames; i++)
+                Trace(0, "leak entry 0x%p stack[%u]=0x%p", b, i, b->Frames[i]);
+        }
+        Trace(0, "0x%p usage %u blockSize %u", this, Usage, BlockSize);
+    }
 
     BugOn(Usage != 0);
 }
@@ -63,40 +80,36 @@ void* BlockAllocatorImpl::Alloc()
 {
     Stdlib::AutoLock lock(Lock);
 
-    if (BlockList.IsEmpty())
+    if (FreeBlockList.IsEmpty())
     {
         return nullptr;
     }
 
     Usage++;
-    return BlockList.RemoveHead();
+    BlockEntry* b = CONTAINING_RECORD(FreeBlockList.RemoveHead(), BlockEntry, ListLink);
+    BugOn(b->Magic != Magic);
+    b->NumFrames = StackTrace::Capture(4096, b->Frames, Stdlib::ArraySize(b->Frames));
+    ActiveBlockList.InsertHead(&b->ListLink);
+
+    return reinterpret_cast<void*>(reinterpret_cast<ulong>(b) - BlockSize);
 }
 
 bool BlockAllocatorImpl::IsOwner(void *block)
 {
-    ulong blockAddr = (ulong)block;
-    if (blockAddr < StartAddress)
-        return false;
-
-    if (blockAddr >= EndAddress)
-        return false;
-
-    if (blockAddr > (EndAddress - BlockSize))
-        return false;
-
-    if ((blockAddr % BlockSize) != 0)
-        return false;
-
-    return true;
+    return Stdlib::IsValueInRange((ulong)block, StartAddress, EndAddress);
 }
 
 void BlockAllocatorImpl::Free(void *block)
 {
     BugOn(block == nullptr);
     BugOn(!IsOwner(block));
+    BlockEntry *b = reinterpret_cast<BlockEntry *>(reinterpret_cast<ulong>(block) + BlockSize);
+    BugOn(b->Magic != Magic);
 
     Stdlib::AutoLock lock(Lock);
-    BlockList.InsertTail(reinterpret_cast<ListEntry*>(block));
+    b->ListLink.Remove();
+    b->NumFrames = 0;
+    FreeBlockList.InsertTail(&b->ListLink);
     Usage--;
 }
 

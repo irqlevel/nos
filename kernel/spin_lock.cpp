@@ -10,7 +10,7 @@ namespace Kernel
 
 SpinLock::SpinLock()
     : Owner(nullptr)
-    , LockTime(0)
+    , WatchdogLockTime(0)
 {
     Watchdog::GetInstance().RegisterSpinLock(*this);
 }
@@ -20,17 +20,16 @@ SpinLock::~SpinLock()
     Watchdog::GetInstance().UnregisterSpinLock(*this);
 }
 
-
 void SpinLock::Lock()
 {
     RawLock.Lock();
     Owner = (PreemptIsOn()) ? Task::GetCurrentTask() : nullptr;
-    LockTime.Set(GetBootTime().GetValue());
+    WatchdogLockTime.Set(GetBootTime().GetValue());
 }
 
 void SpinLock::Unlock()
 {
-    Stdlib::Time lockTime(LockTime.Get());
+    Stdlib::Time lockTime(WatchdogLockTime.Get());
     if (lockTime.GetValue() != 0)
     {
         Stdlib::Time now = GetBootTime();
@@ -41,7 +40,7 @@ void SpinLock::Unlock()
         }
     }
 
-    LockTime.Set(0);
+    WatchdogLockTime.Set(0);
     Owner = nullptr;
     RawLock.Unlock();
 }

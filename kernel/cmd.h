@@ -21,7 +21,7 @@ public:
 
     virtual void OnChar(char c, u8 code) override;
 
-    bool IsExit();
+    bool ShouldShutdown();
 
     bool Start();
 
@@ -51,7 +51,7 @@ private:
     char CmdLine[CmdSizeMax + 1];
     SpinLock Lock;
     Task *Task;
-    bool Exit;
+    bool Shutdown;
     bool Active;
 };
 

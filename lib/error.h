@@ -101,3 +101,6 @@ private:
 
 #define MakeError(code) \
     Stdlib::Error(code, __FUNCTION__, Stdlib::TruncateFileName(__FILE__), __LINE__)
+
+#define MakeSuccess() \
+    Stdlib::Error(Stdlib::Error::Success, __FUNCTION__, Stdlib::TruncateFileName(__FILE__), __LINE__)

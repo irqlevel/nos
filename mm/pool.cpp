@@ -23,7 +23,7 @@ Pool::Pool()
 
 Pool::~Pool()
 {
-    BugOn(Usage != 0);
+    Trace(0, "0x%p usage %u size %u", this, Usage, Size);
     Setup(0);
 }
 

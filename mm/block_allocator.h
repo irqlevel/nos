@@ -32,7 +32,19 @@ private:
 
     using ListEntry = Stdlib::ListEntry;
 
-    ListEntry BlockList;
+    static const ulong Magic = 0xbeadbead;
+
+    struct BlockEntry
+    {
+        ulong Magic;
+        ListEntry ListLink;
+        ulong Frames[10];
+        size_t NumFrames;
+    };
+
+    ListEntry FreeBlockList;
+    ListEntry ActiveBlockList;
+
     ulong Usage;
     ulong Total;
     ulong StartAddress;

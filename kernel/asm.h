@@ -16,6 +16,7 @@ ulong GetCr4(void);
 void SetCr3(ulong addr);
 
 ulong GetRsp(void);
+ulong GetRbp(void);
 ulong GetRip(void);
 
 ulong GetRflags(void);

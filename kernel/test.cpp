@@ -3,6 +3,7 @@
 #include "task.h"
 #include "sched.h"
 #include "cpu.h"
+#include "stack_trace.h"
 
 #include <lib/btree.h>
 #include <lib/error.h>
@@ -239,9 +240,33 @@ Stdlib::Error TestRingBuffer()
     return MakeError(Stdlib::Error::Success);
 }
 
+Stdlib::Error TestStackTrace3()
+{
+    ulong frames[20];
+    size_t framesCount;
+
+    framesCount = StackTrace::Capture(4096, frames, Stdlib::ArraySize(frames));
+    for (size_t i = 0; i < framesCount; i++)
+        Trace(0, "frame[%u]=0x%p", i, frames[i]);
+
+    return MakeSuccess();
+}
+
+Stdlib::Error TestStackTrace2()
+{
+    return TestStackTrace3();
+}
+
+Stdlib::Error TestStackTrace()
+{
+    return TestStackTrace2();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
+
+    Trace(0, "Test");
 
     err = TestAllocator();
     if (!err.Ok())
@@ -252,6 +277,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestRingBuffer();
+    if (!err.Ok())
+        return err;
+
+    err = TestStackTrace();
     if (!err.Ok())
         return err;
 

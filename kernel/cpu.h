@@ -41,6 +41,8 @@ public:
 
     TaskQueue& GetTaskQueue();
 
+    void Reset();
+
 private:
     Cpu(const Cpu& other) = delete;
     Cpu(Cpu&& other) = delete;
@@ -90,6 +92,8 @@ public:
     void SendIPIAllExclude(ulong excludeIndex);
 
     void SendIPIAll();
+
+    void Reset();
 
 private:
     CpuTable();

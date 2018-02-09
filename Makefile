@@ -45,6 +45,7 @@ CXX_SRC =   \
     kernel/object_table.cpp \
     kernel/parameters.cpp \
     kernel/raw_spin_lock.cpp \
+    kernel/stack_trace.cpp \
     lib/stdlib.cpp  \
     lib/list_entry.cpp  \
     lib/error.cpp   \

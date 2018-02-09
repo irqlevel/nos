@@ -1,5 +1,6 @@
 #include "vga.h"
 #include <kernel/asm.h>
+#include <kernel/watchdog.h>
 #include <lib/stdlib.h>
 #include <mm/page_table.h>
 
@@ -14,6 +15,8 @@ VgaTerm::VgaTerm()
     , Height(MaxHeight)
     , ColorCode(MakeColor(ColorWhite, ColorBlack))
 {
+    Watchdog::GetInstance().UnregisterSpinLock(Lock);
+
     Stdlib::AutoLock lock(Lock);
 
     ClsLockHeld();

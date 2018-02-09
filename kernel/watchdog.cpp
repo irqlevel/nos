@@ -34,9 +34,9 @@ void Watchdog::Check()
             entry != &list;
             entry = entry->Flink)
         {
-            SpinLock* lock = CONTAINING_RECORD(entry, SpinLock, ListEntry);
+            SpinLock* lock = CONTAINING_RECORD(entry, SpinLock, WatchdogListEntry);
             CheckCounter.Inc();
-            Stdlib::Time lockTime(lock->LockTime.Get());
+            Stdlib::Time lockTime(lock->WatchdogLockTime.Get());
             if (lockTime.GetValue() != 0)
             {
                 Stdlib::Time delta = now - lockTime;
@@ -57,7 +57,7 @@ void Watchdog::RegisterSpinLock(SpinLock& lock)
     auto& list = SpinLockList[i];
 
     ulong flags = listLock.LockIrqSave();
-    list.InsertTail(&lock.ListEntry);
+    list.InsertTail(&lock.WatchdogListEntry);
     SpinLockCounter.Inc();
     listLock.UnlockIrqRestore(flags);
 }
@@ -68,8 +68,11 @@ void Watchdog::UnregisterSpinLock(SpinLock& lock)
     auto& listLock = SpinLockListLock[i];
 
     ulong flags = listLock.LockIrqSave();
-    lock.ListEntry.Remove();
-    SpinLockCounter.Dec();
+    if (!lock.WatchdogListEntry.IsEmpty())
+    {
+        lock.WatchdogListEntry.Remove();
+        SpinLockCounter.Dec();
+    }
     listLock.UnlockIrqRestore(flags);
 }
 

@@ -13,7 +13,7 @@ namespace Kernel
 
 Cmd::Cmd()
     : Task(nullptr)
-    , Exit(false)
+    , Shutdown(false)
     , Active(false)
 {
     CmdLine[0] = '\0';
@@ -37,9 +37,10 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Cls();
     }
     else if (Stdlib::StrCmp(cmd, "exit") == 0 ||
-             Stdlib::StrCmp(cmd, "quit") == 0)
+             Stdlib::StrCmp(cmd, "quit") == 0 ||
+             Stdlib::StrCmp(cmd, "shutdown") == 0)
     {
-        Exit = true;
+        Shutdown = true;
         return;
     }
     else if (Stdlib::StrCmp(cmd, "cpu") == 0)
@@ -88,9 +89,9 @@ void Cmd::ProcessCmd(const char *cmd)
     vga.Printf("$");
 }
 
-bool Cmd::IsExit()
+bool Cmd::ShouldShutdown()
 {
-    return Exit;
+    return Shutdown;
 }
 
 void Cmd::Stop()

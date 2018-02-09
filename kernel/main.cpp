@@ -127,21 +127,28 @@ extern "C" void ApMain()
     }
 }
 
-void Exit()
+void Shutdown()
 {
     PreemptDisable();
 
-    VgaTerm::GetInstance().Printf("Going to exit!\n");
-    Trace(0, "Exit begin");
+    VgaTerm::GetInstance().Printf("Shutting down!\n");
+
+    Trace(0, "Stopping cpu's");
 
     CpuTable::GetInstance().ExitAllExceptSelf();
 
-    VgaTerm::GetInstance().Printf("Bye!\n");
-    Trace(0, "Exit end");
+    Trace(0, "Cpu's stopped");
 
     PreemptOff();
 
+    CpuTable::GetInstance().Reset();
+    Dmesg::GetInstance().Reset();
+
     __cxa_finalize(0);
+
+    Trace(0, "Bye");
+    VgaTerm::GetInstance().Printf("Bye!\n");
+
     InterruptDisable();
     for (;;)
     {
@@ -252,15 +259,15 @@ void BpStartup(void* ctx)
     for (;;)
     {
         cpu.Idle();
-        if (cmd.IsExit())
+        if (cmd.ShouldShutdown())
         {
-            Trace(0, "Exit requested");
+            Trace(0, "Shutdown");
             cmd.Stop();
             break;
         }
     }
 
-    Exit();
+    Shutdown();
 }
 
 extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
@@ -381,5 +388,5 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 
     } while (false);
 
-    Exit();
+    Shutdown();
 }
