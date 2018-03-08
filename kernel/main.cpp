@@ -49,7 +49,7 @@ do {                                                    \
     auto index = AtomicReadAndInc(&StackIndex);         \
     if (index >= (long)MaxCpus)                         \
         Panic("Can't allocate stack for cpu");          \
-    SetRsp((long)&Stack[index][CpuStackSize]);          \
+    SetRsp((long)&Stack[index][CpuStackSize-128]);      \
 } while (false)
 
 void TraceCpuState(ulong cpu)
@@ -78,10 +78,6 @@ void ApStartup(void *ctx)
 
     TraceCpuState(cpu.GetIndex());
 
-    Idt::GetInstance().Save();
-
-    SetCr3(Mm::PageTable::GetInstance().GetRoot());
-
     BugOn(IsInterruptEnabled());
     InterruptEnable();
 
@@ -104,9 +100,9 @@ void ApStartup(void *ctx)
     }
 }
 
-extern "C" void ApMain()
+void ApMain2()
 {
-    ALLOC_CPU_STACK();
+    SetCr3(Mm::PageTable::GetInstance().GetRoot());
 
     Gdt::GetInstance().Save();
     Idt::GetInstance().Save();
@@ -127,6 +123,12 @@ extern "C" void ApMain()
     }
 }
 
+extern "C" void ApMain()
+{
+    ALLOC_CPU_STACK();
+    ApMain2();
+}
+
 void Shutdown()
 {
     PreemptDisable();
@@ -144,10 +146,10 @@ void Shutdown()
     CpuTable::GetInstance().Reset();
     Dmesg::GetInstance().Reset();
 
-    __cxa_finalize(0);
-
     Trace(0, "Bye");
     VgaTerm::GetInstance().Printf("Bye!\n");
+
+    __cxa_finalize(0);
 
     InterruptDisable();
     for (;;)
@@ -191,10 +193,6 @@ void BpStartup(void* ctx)
     idt.Save();
 
     Trace(0, "Idt saved");
-
-    Mm::PageTable::GetInstance().UnmapNull();
-
-    Trace(0, "Null unmapped");
 
     Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
 
@@ -270,19 +268,32 @@ void BpStartup(void* ctx)
     Shutdown();
 }
 
-extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
+void Main2(Grub::MultiBootInfoHeader *MbInfo)
 {
     do {
 
     ALLOC_CPU_STACK();
 
-    auto& pic = Pic::GetInstance();
-    pic.Remap();
-    pic.Disable();
+    Trace(0, "Cpu rsp 0x%p rbp 0x%p", GetRsp(), GetRbp());
+
+    auto& bpt = Mm::BuiltinPageTable::GetInstance();
+    if (!bpt.Setup())
+    {
+        Panic("Can't setup paging");
+        break;
+    }
+
+    Trace(0, "Paging root 0x%p old cr3 0x%p", bpt.GetRoot(), GetCr3());
+    SetCr3(bpt.GetRoot());
+    Trace(0, "Set new cr3 0x%p", GetCr3());
 
     Gdt::GetInstance().Save();
     ExceptionTable::GetInstance().RegisterExceptionHandlers();
     Idt::GetInstance().Save();
+
+    auto& pic = Pic::GetInstance();
+    pic.Remap();
+    pic.Disable();
 
     if (!Dmesg::GetInstance().Setup())
     {
@@ -292,11 +303,19 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 
     Tracer::GetInstance().SetLevel(1);
 
-    Trace(0, "Cpu BP rsp 0x%p", GetRsp());
+    //VgaTerm::GetInstance().Printf("Hello!\n");
 
-    VgaTerm::GetInstance().Printf("Hello!\n");
+    Grub::ParseMultiBootInfo((Grub::MultiBootInfoHeader *)bpt.PhysToVirt((ulong)MbInfo));
 
-    Grub::ParseMultiBootInfo(MbInfo);
+    auto& mmap = Mm::MemoryMap::GetInstance();
+    Trace(0, "Enter kernel: start 0x%p end 0x%p",
+        mmap.GetKernelStart(), mmap.GetKernelEnd());
+
+    if (mmap.GetKernelEnd() <= bpt.PhysToVirt(MB))
+    {
+        Panic("Kernel end is lower than kernel space base");
+        break;
+    }
 
     auto& pt = Mm::PageTable::GetInstance();
     if (!pt.Setup())
@@ -309,16 +328,26 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
     SetCr3(pt.GetRoot());
     Trace(0, "Set new cr3 0x%p", GetCr3());
 
-    auto& mmap = Mm::MemoryMap::GetInstance();
-    Trace(0, "Enter kernel: start 0x%p end 0x%p",
-        mmap.GetKernelStart(), mmap.GetKernelEnd());
+    Gdt::GetInstance().Save();
+    ExceptionTable::GetInstance().RegisterExceptionHandlers();
+    Idt::GetInstance().Save();
 
-    ulong memStart, memEnd;
-    if (mmap.GetKernelEnd() <= pt.PhysToVirt(MB))
+    //Test paging
     {
-        Panic("Kernel end is lower than kernel space base");
-        break;
+        auto page = pt.AllocPage();
+        if (!page) {
+            Panic("Can't alloc page");
+            break;
+        }
+        auto va = pt.MapPage(page);
+        Stdlib::MemSet((void *)va, 0, Const::PageSize);
+        pt.UnmapPage(va);
+        pt.FreePage(page);
     }
+
+    VgaTerm::GetInstance().Printf("Hello!\n");
+
+    Trace(0, "Parsing acpi...");
 
     auto& acpi = Acpi::GetInstance();
     auto err = acpi.Parse();
@@ -329,15 +358,7 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
-    //Since paging only setup for first 4GB use only first 4GB
-    if (!mmap.FindRegion(pt.VirtToPhys(mmap.GetKernelEnd()), 4 * GB, memStart, memEnd))
-    {
-        Panic("Can't get available memory region");
-        break;
-    }
-
-    Trace(0, "Memory region 0x%p 0x%p", memStart, memEnd);
-    if (!Mm::PageAllocatorImpl::GetInstance().Setup(pt.PhysToVirt(memStart), pt.PhysToVirt(memEnd)))
+    if (!Mm::PageAllocatorImpl::GetInstance().Setup())
     {
         Panic("Can't setup page allocator");
         break;
@@ -389,4 +410,10 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
     } while (false);
 
     Shutdown();
+}
+
+extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
+{
+    ALLOC_CPU_STACK();
+    Main2(MbInfo);
 }

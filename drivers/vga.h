@@ -70,7 +70,7 @@ private:
     void PutsLockHeld(const char *s);
     void ClsLockHeld();
 
-    const ulong BufAddr = 0xB8000;
+    const ulong BufPhyAddr = 0xB8000;
 
     static const u8 MaxWidth = 80;
     static const u8 MaxHeight = 25;

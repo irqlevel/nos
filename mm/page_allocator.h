@@ -28,7 +28,7 @@ public:
 		return Instance;
 	}
 
-    bool Setup(ulong startAddress, ulong endAddress);
+    bool Setup();
 
     virtual void* Alloc(size_t numPages) override;
     virtual void Free(void* pages) override;

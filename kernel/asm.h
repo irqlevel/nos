@@ -51,6 +51,8 @@ void InterruptDisable(void);
 void Hlt(void);
 
 void SetRsp(ulong newValue);
+void SetRbp(ulong newValue);
+
 u64 ReadTsc();
 
 u64 ReadTscp(u64 *cpuIndex);
@@ -108,10 +110,9 @@ void LongJmp(void *ctx, long result);
 
 #define Barrier() __asm__ __volatile__("": : :"memory")
 
-static inline void Invlpg(void* m)
+static inline void Invlpg(unsigned long addr)
 {
-    /* Clobber memory to avoid optimizer re-ordering access before invlpg, which may cause nasty bugs. */
-    asm volatile ( "invlpg (%0)" : : "b"(m) : "memory" );
+        asm volatile("invlpg (%0)" ::"r" (addr) : "memory");
 }
 
 namespace Kernel
@@ -151,7 +152,7 @@ struct Context final
 
     ulong GetRetRip()
     {
-        return *((ulong *)Rsp);
+        return *((ulong *)(Rsp + sizeof(ulong)));
     }
 private:
     Context(const Context& other) = delete;

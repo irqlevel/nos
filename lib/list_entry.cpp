@@ -64,7 +64,6 @@ ListEntry* ListEntry::RemoveTail()
 
 void ListEntry::InsertTail(ListEntry* entry)
 {
-
     ListEntry* blink;
 
     blink = Blink;
@@ -87,7 +86,6 @@ void ListEntry::AppendTail(ListEntry* listToAppend)
 
 void ListEntry::InsertHead(ListEntry* entry)
 {
-
     ListEntry* flink;
 
     flink = Flink;
@@ -106,6 +104,39 @@ void ListEntry::MoveTailList(ListEntry *list)
     ListEntry* entry = list->Flink;
     list->RemoveInit();
     AppendTail(entry);
+}
+
+ListEntry::ListEntry(ListEntry&& other)
+{
+    other.Flink->Blink = this;
+    other.Blink->Flink = this;
+    Flink = other.Flink;
+    Blink = other.Blink;
+    other.Init();
+}
+
+ListEntry& ListEntry::operator=(ListEntry&& other)
+{
+    if (this != &other) {
+        other.Flink->Blink = this;
+        other.Blink->Flink = this;
+        Flink = other.Flink;
+        Blink = other.Blink;
+        other.Init();
+    }
+    return *this;
+}
+
+size_t ListEntry::CountEntries()
+{
+    size_t count = 0;
+
+    for (ListEntry* e = Flink; e != this; e = e->Flink)
+    {
+        count++;
+    }
+
+    return count;
 }
 
 }

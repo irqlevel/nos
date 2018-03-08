@@ -1,6 +1,7 @@
 #include "vga.h"
 #include <kernel/asm.h>
 #include <kernel/watchdog.h>
+#include <kernel/trace.h>
 #include <lib/stdlib.h>
 #include <mm/page_table.h>
 
@@ -8,7 +9,7 @@ namespace Kernel
 {
 
 VgaTerm::VgaTerm()
-    : Buf(reinterpret_cast<u16*>(Mm::PageTable::GetInstance().PhysToVirt(BufAddr)))
+    : Buf(nullptr)
     , Row(0)
     , Column(0)
     , Width(MaxWidth)
@@ -19,12 +20,29 @@ VgaTerm::VgaTerm()
 
     Stdlib::AutoLock lock(Lock);
 
+    Buf = (u16*)Mm::PageTable::GetInstance().MapPage(BufPhyAddr);
+    if (Buf == nullptr)
+    {
+        Panic("Can't map page");
+    }
+
+    Trace(0, "Vga 0x%p buf 0x%p mapped at 0x%p", this, BufPhyAddr, Buf);
+
     ClsLockHeld();
     Cursor();
 }
 
 VgaTerm::~VgaTerm()
 {
+    Trace(0, "Vga 0x%p dtor", this);
+
+    Stdlib::AutoLock lock(Lock);
+
+    if (Buf != nullptr)
+    {
+        Mm::PageTable::GetInstance().UnmapPage((ulong)Buf);
+        Buf = nullptr;
+    }
 }
 
 u8 VgaTerm::MakeColor(Color fg, Color bg)

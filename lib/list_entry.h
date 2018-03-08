@@ -1,5 +1,7 @@
 #pragma once
 
+#include <include/types.h>
+
 namespace Stdlib
 {
 
@@ -30,11 +32,14 @@ struct ListEntry final
 
     void MoveTailList(ListEntry* list);
 
+    ListEntry(ListEntry&& other);
+    ListEntry& operator=(ListEntry&& other);
+
+    size_t CountEntries();
+
 private:
     ListEntry(const ListEntry& other) = delete;
-    ListEntry(ListEntry&& other) = delete;
     ListEntry& operator=(const ListEntry& other) = delete;
-    ListEntry& operator=(ListEntry&& other) = delete;
 };
 
 }

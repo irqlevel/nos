@@ -10,12 +10,103 @@ namespace Kernel
 namespace Mm
 {
 
-class PageTable final
+struct Pte final
+{
+    ulong Value;
+
+    Pte()
+        : Value(0)
+    {
+    }
+
+    ~Pte()
+    {
+    }
+
+    ulong Address()
+    {
+        ulong address =  Value & (~BitMask);
+        BugOn(address & BitMask);
+        return address;
+    }
+
+    bool Present()
+    {
+        return (Value & (1UL << PresentBit)) ? true : false;
+    }
+
+    void SetAddress(ulong address)
+    {
+        BugOn(address & BitMask);
+        Value |= address;
+    }
+
+    void SetPresent()
+    {
+        Value |= (1UL << PresentBit);
+    }
+
+    void SetCacheDisabled()
+    {
+        Value |= (1UL << CacheDisabledBit);
+    }
+
+    void SetHuge()
+    {
+        Value |= (1UL << HugeBit);
+    }
+
+    void SetWritable()
+    {
+        Value |= (1UL << WritableBit);
+    }
+
+    void ClearPresent()
+    {
+        Value &= ~(1UL << PresentBit);
+    }
+
+    void Clear()
+    {
+        Value = 0;
+    }
+
+    static const ulong PresentBit = 0;
+    static const ulong WritableBit = 1;
+    static const ulong UserBit = 2;
+    static const ulong WriteThrough = 3;
+    static const ulong CacheDisabledBit = 4;
+    static const ulong AccessedBit = 5;
+    static const ulong DirtyBit = 6;
+    static const ulong HugeBit = 7;
+    static const ulong MaxBit = 12;
+    static const ulong BitMask = (1UL << MaxBit) - 1;
+};
+
+static_assert(sizeof(Pte) == 8, "Invalid size");
+
+struct PtePage final
+{
+    struct Pte Entry[512];
+};
+
+static_assert(sizeof(PtePage) == Const::PageSize, "Invalid size");
+
+struct Page final
+{
+    Stdlib::ListEntry ListEntry;
+    Kernel::Atomic RefCounter;
+    ulong Pfn;
+};
+
+static_assert(sizeof(Page) == 0x20, "Invalid size");
+
+class BuiltinPageTable final
 {
 public:
-    static PageTable& GetInstance()
+    static BuiltinPageTable& GetInstance()
     {
-        static PageTable Instance;
+        static BuiltinPageTable Instance;
         return Instance;
     }
 
@@ -27,7 +118,47 @@ public:
 
     ulong GetRoot();
 
-    void UnmapNull();
+private:
+    BuiltinPageTable(const BuiltinPageTable& other) = delete;
+    BuiltinPageTable(BuiltinPageTable&& other) = delete;
+    BuiltinPageTable& operator=(const BuiltinPageTable& other) = delete;
+    BuiltinPageTable& operator=(BuiltinPageTable&& other) = delete;
+    BuiltinPageTable();
+    ~BuiltinPageTable();
+
+    PtePage P4Page __attribute__((aligned(Const::PageSize)));
+    PtePage P3KernelPage __attribute__((aligned(Const::PageSize)));
+    PtePage P3UserPage __attribute__((aligned(Const::PageSize)));
+    PtePage P2KernelPage[4] __attribute__((aligned(Const::PageSize)));
+    PtePage P2UserPage[4] __attribute__((aligned(Const::PageSize)));
+};
+
+class PageTable final
+{
+public:
+    static PageTable& GetInstance()
+    {
+        static PageTable Instance;
+        return Instance;
+    }
+
+    bool Setup();
+
+    ulong GetRoot();
+
+    ulong MapPage(ulong phyAddr);
+    ulong UnmapPage(ulong virtAddr);
+
+    ulong MapAddress(ulong phyAddr);
+
+    ulong AllocPage();
+    void FreePage(ulong phyAddr);
+
+    bool MapPage(ulong virtAddr, ulong phyAddr);
+
+    ulong GetAvailableFreePages();
+
+    ulong GetTmpMapEnd();
 
 private:
     PageTable(const PageTable& other) = delete;
@@ -37,101 +168,28 @@ private:
     PageTable();
     ~PageTable();
 
-    bool MapPage(ulong virtAddr, ulong phyAddr);
+    ulong GetFreePage();
+
+    bool SetupPage(ulong virtAddr, ulong phyAddr);
+
+    bool GetFreePages();
+
+    ulong TmpMapStart;
+    Kernel::SpinLock TmpMapLock;
+    PtePage *TmpMapL1Page;
+
+    static const size_t TmpMapPageCount = 512;
+    bool TmpMapUsage[TmpMapPageCount];
+
+    ulong GetL1Page(ulong virtAddr);
+
+    ulong Root;
 
     SpinLock Lock;
-
-    struct Pte final
-    {
-        ulong Value;
-
-        Pte()
-            : Value(0)
-        {
-        }
-
-        ~Pte()
-        {
-        }
-
-        ulong Address()
-        {
-            return Value & (~((ulong)Const::PageSize));
-        }
-
-        bool Present()
-        {
-            return (Value & (1 << PresentBit)) ? true : false;
-        }
-
-        void SetAddress(ulong address)
-        {
-            BugOn(address & (Const::PageSize - 1));
-            Value |= address;
-        }
-
-        void SetPresent()
-        {
-            Value |= (1 << PresentBit);
-        }
-
-        void SetCacheDisabled()
-        {
-            Value |= (1 << CacheDisabledBit);
-        }
-
-        void SetHuge()
-        {
-            Value |= (1 << HugeBit);
-        }
-
-        void SetWritable()
-        {
-            Value |= (1 << WritableBit);
-        }
-
-        void ClearPresent()
-        {
-            Value &= ~(1 << PresentBit);
-        }
-
-        static const ulong PresentBit = 0;
-        static const ulong WritableBit = 1;
-        static const ulong UserBit = 2;
-        static const ulong WriteThrough = 3;
-        static const ulong CacheDisabledBit = 4;
-        static const ulong AccessedBit = 5;
-        static const ulong DirtyBit = 6;
-        static const ulong HugeBit = 7;
-    };
-
-    static_assert(sizeof(Pte) == 8, "Invalid size");
-
-    struct PtePage final
-    {
-        struct Pte Entry[512];
-    };
-
-    static_assert(sizeof(PtePage) == Const::PageSize, "Invalid size");
-
-    PtePage P4Page __attribute__((aligned(Const::PageSize)));
-    PtePage P3KernelPage __attribute__((aligned(Const::PageSize)));
-    PtePage P3UserPage __attribute__((aligned(Const::PageSize)));
-    PtePage P2KernelPage[4] __attribute__((aligned(Const::PageSize)));
-    PtePage P2UserPage[4] __attribute__((aligned(Const::PageSize)));
-
-    struct Page final
-    {
-        Stdlib::ListEntry ListEntry;
-        Kernel::Atomic RefCounter;
-        ulong Pfn;
-    };
-
-    static_assert(sizeof(Page) == 0x20, "Invalid size");
-
-    ulong State;
-
-    Stdlib::ListEntry FreePagesList;
+    SpinLock FreePagesLock;
+    ulong FreePages;
+    ulong AvailableFreePagesCount;
+    ulong FreePagesCount;
 };
 
 }

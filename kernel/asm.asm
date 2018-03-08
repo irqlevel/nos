@@ -63,6 +63,7 @@ global InterruptEnable
 global InterruptDisable
 global Hlt
 global SetRsp
+global SetRbp
 global ReadTsc
 global ReadTscp
 
@@ -274,6 +275,10 @@ SetRsp:
 	mov rsp, rdi
 	push rax
 	ret
+
+SetRbp:
+    mov rbp, rdi
+    ret
 
 ReadTsc:
 	rdtsc; result in edx:eax

@@ -9,33 +9,9 @@ class IdtDescriptor final
 {
 public:
     IdtDescriptor();
-    IdtDescriptor(u64 value);
+    IdtDescriptor(u64 lowPart, u64 highPart);
+
     ~IdtDescriptor();
-
-    u32 GetOffset();
-    u16 GetSelector();
-    u8 GetType();
-
-    u64 GetValue();
-
-    static IdtDescriptor Encode(u32 offset, u16 selector, u8 type);
-
-    void SetOffset(u32 offset);
-    void SetSelector(u16 selector);
-    void SetType(u8 type);
-    void SetPresent(bool on);
-    void SetStorageSegment(bool on);
-    void SetDpl(u8 dpl);
-
-    u32 GetOffset() const;
-    u16 GetSelector() const;
-    u8 GetType() const;
-    bool GetPresent() const;
-    bool GetStorageSegment() const;
-    u8 GetDpl() const;
-    u64 GetValue() const;
-
-    static IdtDescriptor Encode(bool present, bool ss, u8 dpl, u32 offset, u16 selector, u8 type);
 
     IdtDescriptor(IdtDescriptor&& other);
     IdtDescriptor(const IdtDescriptor& other);
@@ -43,11 +19,12 @@ public:
     IdtDescriptor& operator=(IdtDescriptor&& other);
     IdtDescriptor& operator=(const IdtDescriptor& other);
 
+    static IdtDescriptor Encode(u64 offset, u16 selector, u8 type);
     static IdtDescriptor Encode(void (*handlerFn)());
 
 private:
-    u64 Value;
-    u64 HighValue;
+    u64 LowPart;
+    u64 HighPart;
 
     static const u8 FlagPresent = (1 << 7);
     static const u8 FlagDPL0 = 0;

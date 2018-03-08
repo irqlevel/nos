@@ -32,14 +32,16 @@ void Panicker::DoPanic(const char *fmt, ...)
         Stdlib::VsnPrintf(Message, sizeof(Message), fmt, args);
         va_end(args);
 
-        VgaTerm::GetInstance().PrintString(Message);
+        //VgaTerm::GetInstance().PrintString(Message);
     }
 
     PreemptDisable();
     InterruptDisable();
 
+/*
     Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
     CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
+*/
 
     for (;;)
     {

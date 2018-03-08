@@ -3,6 +3,7 @@
 #include <kernel/trace.h>
 #include <kernel/cpu.h>
 #include <mm/memory_map.h>
+#include <mm/page_table.h>
 
 namespace Kernel
 {
@@ -57,10 +58,11 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
 Acpi::RSDPDescriptor20* Acpi::FindRsdp()
 {
     auto& mm = Kernel::Mm::MemoryMap::GetInstance();
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
 
-    for (size_t i = 0; i < mm.GetRegionCount(); i++) {
-        u64 addr, len;
-        u32 type;
+    for (size_t i = 0; i < mm.GetRegionCount(); i++)
+    {
+        ulong addr, len, type;
 
         if (!mm.GetRegion(i, addr, len, type))
             return nullptr;
@@ -68,23 +70,32 @@ Acpi::RSDPDescriptor20* Acpi::FindRsdp()
         if (type != 1)
             continue;
 
-        u8 *p = reinterpret_cast<u8 *>(addr);
-        u8 *end = reinterpret_cast<u8 *>(addr + len);
-        while (p < end)
+        for (ulong curr = addr; curr < (addr + len); curr+= Const::PageSize)
         {
-            RSDPDescriptor20 *rsdp = reinterpret_cast<RSDPDescriptor20*>(p);
-            if (rsdp->FirstPart.Signature == RSDPSignature)
+            ulong pageVa = pt.MapPage(curr);
+            if (!pageVa)
             {
-                Trace(0, "Checking rsdp 0x%p", rsdp);
-                if (ParseRsdp(rsdp))
+                Trace(0, "Can't map 0x%p", curr);
+                return nullptr;
+            }
+
+            for (ulong va = pageVa; va < (pageVa + Const::PageSize); va += 16)
+            {
+                RSDPDescriptor20 *rsdp = reinterpret_cast<RSDPDescriptor20*>(va);
+                if (rsdp->FirstPart.Signature == RSDPSignature)
                 {
-                    return rsdp;
+                    Trace(0, "Checking rsdp va 0x%p pha 0x%p", rsdp, curr + (va - pageVa));
+                    if (ParseRsdp(rsdp))
+                    {
+                        return rsdp;
+                    }
                 }
             }
-            p += 16;
+            pt.UnmapPage(pageVa);
         }
     }
 
+    Trace(0, "Rsdp not found");
     return nullptr;
 }
 
@@ -139,7 +150,7 @@ Stdlib::Error Acpi::ParseTablePointers()
 
     for (size_t i = 0; i < tableCount; i++)
     {
-        ACPISDTHeader* header = reinterpret_cast<ACPISDTHeader*>(Rsdt->Entry[i]);
+        ACPISDTHeader* header = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().MapAddress(Rsdt->Entry[i]));
         char tableSignature[5];
 
         Stdlib::MemCpy(tableSignature, header->Signature, sizeof(header->Signature));
@@ -173,7 +184,11 @@ Stdlib::Error Acpi::ParseMADT()
     Trace(AcpiLL, "Acpi: MADT LIntCtrl 0x%p flags 0x%p",
         (ulong)header->LocalIntCtrlAddress, (ulong)header->Flags);
 
-    LapicAddress = reinterpret_cast<void*>((ulong)header->LocalIntCtrlAddress);
+    LapicAddress = (void *)Mm::PageTable::GetInstance().MapAddress(header->LocalIntCtrlAddress);
+    if (LapicAddress == nullptr)
+    {
+        return MakeError(Stdlib::Error::NoMemory);
+    }
 
     MadtEntry* entry = &header->Entry[0];
 
@@ -211,7 +226,11 @@ Stdlib::Error Acpi::ParseMADT()
             if (entry->Length < sizeof(*ioApicEntry) + sizeof(*entry))
                 return MakeError(Stdlib::Error::InvalidValue);
 
-            IoApicAddress = reinterpret_cast<void*>((ulong)ioApicEntry->IoApicAddress);
+            IoApicAddress = (void *)Mm::PageTable::GetInstance().MapAddress(ioApicEntry->IoApicAddress);
+            if (IoApicAddress == nullptr)
+            {
+                return MakeError(Stdlib::Error::NoMemory);
+            }
 
             Trace(AcpiLL, "Acpi: MADT ioApicId %u addr 0x%p gsi 0x%p",
                 (ulong)ioApicEntry->IoApicId, (ulong)ioApicEntry->IoApicAddress,
@@ -253,7 +272,7 @@ Stdlib::Error Acpi::Parse()
     }
 
     Rsdp = rsdp;
-    ACPISDTHeader* rsdt = reinterpret_cast<ACPISDTHeader*>(Rsdp->FirstPart.RsdtAddress);
+    ACPISDTHeader* rsdt = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().MapAddress(Rsdp->FirstPart.RsdtAddress));
     err = ParseRsdt(rsdt);
     if (!err.Ok())
     {

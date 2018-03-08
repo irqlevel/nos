@@ -16,7 +16,7 @@ MemoryMap::MemoryMap()
 {
 }
 
-bool MemoryMap::AddRegion(u64 addr, u64 len, u32 type)
+bool MemoryMap::AddRegion(ulong addr, ulong len, ulong type)
 {
     if (Size >= Stdlib::ArraySize(Region))
         return false;
@@ -92,7 +92,7 @@ size_t MemoryMap::GetRegionCount()
     return Size;
 }
 
-bool MemoryMap::GetRegion(size_t index, u64& addr, u64& len, u32& type)
+bool MemoryMap::GetRegion(size_t index, ulong& addr, ulong& len, ulong& type)
 {
     if (index >= Size)
         return false;

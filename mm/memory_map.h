@@ -20,7 +20,7 @@ public:
     }
     ~MemoryMap();
 
-    bool AddRegion(u64 addr, u64 len, u32 type);
+    bool AddRegion(ulong addr, ulong len, ulong type);
 
     bool FindRegion(ulong base, ulong limit, ulong& start, ulong& end);
 
@@ -30,7 +30,7 @@ public:
 
     size_t GetRegionCount();
 
-    bool GetRegion(size_t index, u64& addr, u64& len, u32& type);
+    bool GetRegion(size_t index, ulong& addr, ulong& len, ulong& type);
 
     static const ulong KernelSpaceBase = 0xFFFF800000000000;
 
@@ -47,9 +47,9 @@ private:
 
     struct MemoryRegion
     {
-        u64 Addr;
-        u64 Len;
-        u32 Type;
+        ulong Addr;
+        ulong Len;
+        ulong Type;
     };
 
     MemoryRegion Region[64];

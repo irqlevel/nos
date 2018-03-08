@@ -28,7 +28,7 @@ void Lapic::Enable()
 {
     ulong msr = ReadMsr(BaseMsr);
 
-    Trace(LapicLL, "Lapic: msr 0x%p", msr);
+    Trace(LapicLL, "Lapic: msr 0x%p base 0x%p", msr, Acpi::GetInstance().GetLapicAddress());
 
     WriteReg(DfrIndex, 0xffffffff);// Flat mode
     WriteReg(LdrIndex, 0x01000000);// All cpus use logical id 1

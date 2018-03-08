@@ -1,4 +1,5 @@
 #include "page_allocator.h"
+#include "page_table.h"
 
 #include <include/const.h>
 #include <kernel/panic.h>
@@ -15,16 +16,33 @@ PageAllocatorImpl::PageAllocatorImpl()
 {
 }
 
-bool PageAllocatorImpl::Setup(ulong startAddress, ulong endAddress)
+bool PageAllocatorImpl::Setup()
 {
-    Trace(0, "Setup start 0x%p end 0x%p", startAddress, endAddress);
+    auto& pt = PageTable::GetInstance();
+    ulong availablePages = pt.GetAvailableFreePages();
+    if (availablePages == 0)
+        return false;
 
-    BugOn(endAddress <= startAddress);
+    ulong startAddress = pt.GetTmpMapEnd();
+    ulong endAddress = startAddress + ((7 * availablePages) / 10) * Const::PageSize;
+
+    Trace(0, "Setup 0x%p start 0x%p end 0x%p pages %u", this, startAddress, endAddress, availablePages);
+
+    for (ulong va = startAddress; va < endAddress; va += Const::PageSize)
+    {
+        ulong page = pt.AllocPage();
+        if (!page)
+            return false;
+
+        if (!pt.MapPage(va, page))
+            return false;
+    }
+
     size_t sizePerBalloc = (endAddress - startAddress) / Stdlib::ArraySize(Balloc);
     for (size_t i = 0; i < Stdlib::ArraySize(Balloc); i++)
     {
         ulong start = startAddress + i * sizePerBalloc;
-        ulong blockSize = ((ulong)1 << i) * Const::PageSize;
+        ulong blockSize = (1UL << i) * Const::PageSize;
         if (!Balloc[i].Setup(Stdlib::RoundUp(start, blockSize), start + sizePerBalloc, blockSize))
         {
             return false;

@@ -63,11 +63,11 @@ ASM_SRC =    \
 
 OBJS = $(CXX_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
 
-.PHONY: all check clean %.o
+.PHONY: all check nocheck clean %.o
 
-all: clean check nos.iso
+all: check nos.iso
 
-nocheck: clean nos.iso
+nocheck: nos.iso
 
 check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 -q . || exit 1

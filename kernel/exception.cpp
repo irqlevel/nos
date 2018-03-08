@@ -5,12 +5,15 @@
 #include "panic.h"
 #include "trace.h"
 #include "cpu.h"
+#include "debug.h"
 
 namespace Kernel
 {
 
 ExceptionTable::ExceptionTable()
 {
+    Trace(0, "ExcTable 0x%p", this);
+
     for (size_t i = 0; i < Stdlib::ArraySize(Handler); i++)
     {
         Handler[i] = nullptr;
@@ -96,6 +99,7 @@ bool ExceptionTable::SetHandler(size_t index, ExcHandler handler)
 {
     if (index >= Stdlib::ArraySize(Handler))
         return false;
+    Trace(0, "Set handler[%u]=0x%p", index, handler);
     Handler[index] = handler;
     return true;
 }
@@ -242,10 +246,15 @@ void ExceptionTable::ExcPageFault(Context* ctx)
 {
     (void)ctx;
 
+    Trace(0, "PageFault cr2 0x%p cr3 0x%p rip 0x%p", GetCr2(), GetCr3(), ctx->GetRetRip());
+
     ExcPageFaultCounter.Inc();
 
     ulong cr2 = GetCr2();
     ulong cr3 = GetCr3();
+
+    InterruptDisable();
+    Hlt();
 
     Panic("EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0x%p cr3 0x%p",
         CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp,
