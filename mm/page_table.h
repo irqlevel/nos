@@ -155,6 +155,7 @@ public:
     void FreePage(ulong phyAddr);
 
     bool MapPage(ulong virtAddr, ulong phyAddr);
+    ulong UnmapPage2(ulong virtAddr);
 
     ulong GetAvailableFreePages();
 

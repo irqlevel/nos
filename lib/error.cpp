@@ -4,8 +4,8 @@ namespace Stdlib
 {
 
 Error::Error()
-    : Func(nullptr)
-    , File(nullptr)
+    : Func("unknown")
+    , File("unknown")
     , Line(0)
     , Code(Success)
 {

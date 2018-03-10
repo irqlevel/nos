@@ -23,16 +23,16 @@ public:
 class AllocatorImpl : public Allocator
 {
 public:
-	static AllocatorImpl& GetInstance(PageAllocator& pageAllocator)
+	static AllocatorImpl& GetInstance(PageAllocator* pgAlloc)
 	{
-		static AllocatorImpl Instance(pageAllocator);
+		static AllocatorImpl Instance(pgAlloc);
 		return Instance;
 	}
 
 	virtual void* Alloc(size_t size) override;
 	virtual void Free(void* ptr) override;
 private:
-	AllocatorImpl(PageAllocator& pageAllocator);
+	AllocatorImpl(PageAllocator* pgAlloc);
 	virtual ~AllocatorImpl();
 
 	AllocatorImpl(const AllocatorImpl& other) = delete;
@@ -54,7 +54,7 @@ private:
 	static const size_t EndLog = Const::PageShift - 1;
 
 	Pool Pool[EndLog - StartLog + 1];
-	PageAllocator& PageAllocator;
+	PageAllocator* PgAlloc;
 };
 
 }

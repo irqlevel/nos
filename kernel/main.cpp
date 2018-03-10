@@ -151,6 +151,8 @@ void Shutdown()
 
     __cxa_finalize(0);
 
+    Trace(0, "Finalized");
+
     InterruptDisable();
     for (;;)
     {
@@ -364,7 +366,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
-    Mm::AllocatorImpl::GetInstance(Mm::PageAllocatorImpl::GetInstance());
+    Mm::AllocatorImpl::GetInstance(&Mm::PageAllocatorImpl::GetInstance());
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
 

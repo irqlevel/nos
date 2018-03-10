@@ -47,6 +47,7 @@ CXX_SRC =   \
     kernel/raw_spin_lock.cpp \
     kernel/stack_trace.cpp \
     lib/stdlib.cpp  \
+    lib/bitmap.cpp \
     lib/list_entry.cpp  \
     lib/error.cpp   \
     mm/memory_map.cpp   \

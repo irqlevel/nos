@@ -424,17 +424,20 @@ ulong PageTable::AllocPage()
     if (currva == 0)
         return 0;
 
+    AvailableFreePagesCount--;
     ulong next = *(ulong *)currva;
     FreePages = next;
+    BugOn(FreePages == 0 && AvailableFreePagesCount != 0);
 
     Stdlib::MemSet((void *)currva, 0, Const::PageSize);
     UnmapPage(currva);
-    AvailableFreePagesCount--;
     return curr;
 }
 
 void PageTable::FreePage(ulong phyAddr)
 {
+    BugOn(!phyAddr);
+
     Stdlib::AutoLock lock(FreePagesLock);
 
     ulong currva = MapPage(phyAddr);
@@ -548,8 +551,83 @@ bool PageTable::MapPage(ulong virtAddr, ulong phyAddr)
         l1Entry->Clear();
     }
     UnmapPage((ulong)l1Page);
+    Invlpg(virtAddr);
 
     return true;
+}
+
+ulong PageTable::UnmapPage2(ulong virtAddr)
+{
+    Stdlib::AutoLock lock(Lock);
+
+    BugOn(virtAddr & (Const::PageSize - 1));
+    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapUsage)));
+
+    ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
+    ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
+    ulong l2Index = (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
+    ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+
+    if (Root == 0)
+    {
+        BugOn(1);
+        return 0;
+    }
+
+    PtePage* l4Page = (PtePage*)MapPage(Root);
+    if (l4Page == nullptr)
+        return 0;
+
+    Pte *l4Entry = &l4Page->Entry[l4Index];
+    if (!l4Entry->Present())
+    {
+        BugOn(1);
+        UnmapPage((ulong)l4Page);
+        return 0;
+    }
+
+    PtePage* l3Page = (PtePage*)MapPage(l4Entry->Address());
+    UnmapPage((ulong)l4Page);
+    if (l3Page == nullptr)
+        return 0;
+
+    Pte *l3Entry = &l3Page->Entry[l3Index];
+    if (!l3Entry->Present()) {
+        BugOn(1);
+        UnmapPage((ulong)l3Page);
+        return 0;
+    }
+
+    PtePage* l2Page = (PtePage*)MapPage(l3Entry->Address());
+    UnmapPage((ulong)l3Page);
+    if (l2Page == nullptr)
+        return 0;
+
+    Pte *l2Entry = &l2Page->Entry[l2Index];
+    if (!l2Entry->Present()) {
+        BugOn(1);
+        UnmapPage((ulong)l2Page);
+        return 0;
+    }
+
+    PtePage* l1Page = (PtePage*)MapPage(l2Entry->Address());
+    UnmapPage((ulong)l2Page);
+    if (l1Page == nullptr)
+        return 0;
+
+    Pte *l1Entry = &l1Page->Entry[l1Index];
+    if (!l1Entry->Present()) {
+        BugOn(1);
+        UnmapPage((ulong)l1Page);
+        return 0;
+    }
+
+    ulong phyAddr = l1Entry->Address();
+    l1Entry->Clear();
+    UnmapPage((ulong)l1Page);
+    BugOn(!phyAddr);
+    Invlpg(virtAddr);
+    return phyAddr;
 }
 
 ulong PageTable::GetAvailableFreePages()

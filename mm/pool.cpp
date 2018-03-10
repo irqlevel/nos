@@ -14,105 +14,114 @@ namespace Mm
 {
 
 Pool::Pool()
-    : Usage(0)
-    , Size(0)
+    : BlockSize(0)
+    , PgAlloc(nullptr)
+    , BlockCount(0)
+    , PeekBlockCount(0)
 {
-    BlockList.Init();
-    PageList.Init();
 }
 
 Pool::~Pool()
 {
-    Trace(0, "0x%p usage %u size %u", this, Usage, Size);
-    Setup(0);
+    Trace(0, "0x%p blockSize %u peekBlockCount %u", this, BlockSize, PeekBlockCount);
+
+    if (BlockCount != 0)
+        Trace(0, "0x%p blockSize %u blockCount %u", this, BlockSize, BlockCount);
+    Release();
 }
 
-void Pool::Setup(size_t size, class PageAllocator* pageAllocator)
+void Pool::Release()
 {
-    Trace(PoolLL, "0x%p setup size 0x%p", this, size);
-
     Stdlib::AutoLock lock(Lock);
 
-    while (!BlockList.IsEmpty())
+    while (!FreePageList.IsEmpty())
     {
-        BlockList.RemoveHead();
+        PgAlloc->Free(FreePageList.RemoveHead());
     }
 
     while (!PageList.IsEmpty())
     {
-        PageAllocator->Free(PageList.RemoveHead());
+        PgAlloc->Free(PageList.RemoveHead());
     }
-
-    Usage = 0;
-    Size = size;
-    PageAllocator = pageAllocator;
 }
 
-bool Pool::CheckSize(size_t size)
+void Pool::Init(size_t blockSize, class PageAllocator* pgAlloc)
 {
-    if (size == 0 || size >= Const::PageSize)
-        return false;
+    BugOn(BlockCount);
+    BugOn(BlockSize);
+    BugOn(PgAlloc != nullptr);
+    BugOn(!PageList.IsEmpty());
+    BugOn(!FreePageList.IsEmpty());
+    BugOn(PeekBlockCount);
 
-    return true;
+    BlockSize = blockSize;
+    PgAlloc = pgAlloc;
 }
 
-void* Pool::Alloc()
+void *Pool::Alloc()
 {
-    Trace(PoolLL, "0x%p alloc block size 0x%p", this, Size);
-
     Stdlib::AutoLock lock(Lock);
 
-    if (!CheckSize(Size))
-    {   
-        return nullptr;
-    }
-
-    if (BlockList.IsEmpty())
+    if (FreePageList.IsEmpty())
     {
-        Page* page = static_cast<Page*>(PageAllocator->Alloc(1));
+        Page* page = static_cast<Page*>(PgAlloc->Alloc(1));
         if (page == nullptr)
         {
             return nullptr;
         }
-
-        PageList.InsertTail(&page->Link);
+        page->BlockCount = 0;
+        page->BlockList.Init();
 
         ListEntry* block = reinterpret_cast<ListEntry*>(&page->Data[0]);
-        while (Stdlib::MemAdd(block, Size) <= Stdlib::MemAdd(page, Const::PageSize))
+        while (Stdlib::MemAdd(block, BlockSize) <= Stdlib::MemAdd(page, Const::PageSize))
         {
-            BlockList.InsertTail(block);
-            block = static_cast<ListEntry*>(Stdlib::MemAdd(block, Size));
+            page->BlockList.InsertTail(block);
+            block = static_cast<ListEntry*>(Stdlib::MemAdd(block, BlockSize));
+            page->BlockCount++;
         }
+        page->MaxBlockCount = page->BlockCount;
+        FreePageList.InsertHead(&page->Link);
     }
 
-    Usage++;
-    void* block = BlockList.RemoveHead();
-    Trace(PoolLL, "0x%p alloc block %p", this, block);
+    Page* page = CONTAINING_RECORD(FreePageList.Flink, Page, Link);
+    BugOn(page->BlockList.IsEmpty());
+    void* block = page->BlockList.RemoveHead();
+    page->BlockCount--;
+    if (page->BlockList.IsEmpty())
+    {
+        BugOn(page->BlockCount);
+        page->Link.RemoveInit();
+        PageList.InsertTail(&page->Link);
+    }
+
+    BlockCount++;
+    if (BlockCount > PeekBlockCount)
+        PeekBlockCount = BlockCount;
 
     return block;
 }
 
 void Pool::Free(void* ptr)
 {
+    BugOn(!ptr);
     Stdlib::AutoLock lock(Lock);
 
-    Trace(PoolLL, "Free block %p", ptr);
-
-    if (ptr == nullptr)
-    {
-        Panic("ptr is null");
-        return;
-    }
-
-    if (!CheckSize(Size))
-    {
-        Panic("Invalid size");
-        return;
-    }
+    BlockCount--;
+    Page* page = (Page*)((ulong)ptr & ~(Const::PageSize - 1));
+    BugOn((ulong)page & (Const::PageSize - 1));
 
     ListEntry* block = static_cast<ListEntry*>(ptr);
-    BlockList.InsertTail(block);
-    Usage--;
+    page->BlockList.InsertTail(block);
+    page->BlockCount++;
+    page->Link.RemoveInit();
+    if (page->BlockCount == page->MaxBlockCount)
+    {
+        PgAlloc->Free(page);
+    }
+    else
+    {
+        FreePageList.InsertTail(&page->Link);
+    }
 }
 
 }

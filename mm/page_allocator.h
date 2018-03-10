@@ -19,6 +19,33 @@ public:
     virtual void Free(void* ptr) = 0;
 };
 
+class FixedPageAllocator
+{
+public:
+    FixedPageAllocator();
+    virtual ~FixedPageAllocator();
+
+    bool Setup(ulong vaStart, ulong vaEnd, ulong pageCount);
+
+    void* Alloc();
+    bool Free(void* addr);
+
+private:
+    FixedPageAllocator(const FixedPageAllocator& other) = delete;
+    FixedPageAllocator(FixedPageAllocator&& other) = delete;
+    FixedPageAllocator& operator=(const FixedPageAllocator& other) = delete;
+    FixedPageAllocator& operator=(FixedPageAllocator&& other) = delete;
+
+    u8 BlockBitmap[Const::PageSize] __attribute__((aligned(Const::PageSize)));
+
+    SpinLock Lock;
+    ulong VaStart;
+    ulong VaEnd;
+    ulong PageCount;
+    ulong BlockCount;
+    ulong BlockSize;
+};
+
 class PageAllocatorImpl : public PageAllocator
 {
 public:
@@ -44,8 +71,7 @@ private:
 
     static const size_t PageLogLimit = 4;
 
-    BlockAllocatorImpl Balloc[PageLogLimit];
-
+    FixedPageAllocator FixedPgAlloc[PageLogLimit];
 };
 
 }

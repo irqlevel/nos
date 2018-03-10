@@ -14,12 +14,12 @@ namespace Mm
 void* New(size_t size) noexcept
 {
 
-	return AllocatorImpl::GetInstance(PageAllocatorImpl::GetInstance()).Alloc(size);
+	return AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Alloc(size);
 }
 
 void Delete(void* ptr) noexcept
 {
-	AllocatorImpl::GetInstance(PageAllocatorImpl::GetInstance()).Free(ptr);
+	AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Free(ptr);
 }
 
 }

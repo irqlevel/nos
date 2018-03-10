@@ -11,17 +11,18 @@ namespace Kernel
 namespace Mm
 {
 
-AllocatorImpl::AllocatorImpl(class PageAllocator& pageAllocator)
-	: PageAllocator(pageAllocator)
+AllocatorImpl::AllocatorImpl(class PageAllocator* pgAlloc)
+	: PgAlloc(pgAlloc)
 {
 	for (size_t i = 0; i < Stdlib::ArraySize(Pool); i++)
 	{
-		Pool[i].Setup(static_cast<size_t>(1) << (StartLog + i), &PageAllocator);
+		Pool[i].Init(static_cast<size_t>(1) << (StartLog + i), PgAlloc);
 	}
 }
 
 AllocatorImpl::~AllocatorImpl()
 {
+    Trace(0, "0x%p dtor");
 }
 
 size_t AllocatorImpl::Log2(size_t size)
@@ -50,7 +51,7 @@ void* AllocatorImpl::Alloc(size_t size)
 	size_t reqSize = (size + sizeof(*header));
 	if (reqSize >= (Const::PageSize / 2))
 	{
-		return PageAllocator.Alloc(Stdlib::SizeInPages(size));
+		return PgAlloc->Alloc(Stdlib::SizeInPages(size));
 	}
 
 	size_t log = Log2(reqSize);
@@ -78,7 +79,7 @@ void AllocatorImpl::Free(void* ptr)
 
 	if ((reinterpret_cast<ulong>(ptr) & (Const::PageSize - 1)) == 0)
 	{
-		PageAllocator.Free(ptr);
+		PgAlloc->Free(ptr);
 		return;
 	}
 

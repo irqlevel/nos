@@ -18,26 +18,32 @@ public:
     Pool();
     virtual ~Pool();
 
-    void Setup(size_t size, PageAllocator* pageAllocator = nullptr);
+    void Init(size_t blockSize, PageAllocator* pgAlloc);
     void* Alloc();
     void Free(void *ptr);
 
 private:
-    using ListEntry = Stdlib::ListEntry;
+    void Release();
 
-    bool CheckSize(size_t size);
+    using ListEntry = Stdlib::ListEntry;
 
     struct Page {
         ListEntry Link;
-        u8 Data[1]; 
+        ListEntry BlockList;
+        ulong MaxBlockCount;
+        ulong BlockCount;
+        u8 Data[Const::PageSize - 2 * sizeof(ListEntry) - 2 * sizeof(ulong)];
     };
 
-    ulong Usage;
-    size_t Size;
+    static_assert(sizeof(Page) == Const::PageSize, "invalid size");
+
+    size_t BlockSize;
+    ListEntry FreePageList;
     ListEntry PageList;
-    ListEntry BlockList;
     SpinLock Lock;
-    PageAllocator* PageAllocator;
+    PageAllocator* PgAlloc;
+    ulong BlockCount;
+    ulong PeekBlockCount;
 };
 
 }
