@@ -42,11 +42,18 @@ long Atomic::Get()
     return AtomicRead(&Value);
 }
 
-void Atomic::SetBit(ulong bit)
+bool Atomic::SetBit(ulong bit)
 {
     BugOn(bit >= Stdlib::SizeOfInBits<long>());
 
-    AtomicTestAndSetBit(&Value, bit);
+    return (AtomicTestAndSetBit(&Value, bit)) ? true : false;
+}
+
+bool Atomic::ClearBit(ulong bit)
+{
+    BugOn(bit >= Stdlib::SizeOfInBits<long>());
+
+    return (AtomicTestAndClearBit(&Value, bit)) ? true : false;
 }
 
 bool Atomic::TestBit(ulong bit)

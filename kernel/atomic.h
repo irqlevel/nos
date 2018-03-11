@@ -15,7 +15,8 @@ public:
     bool DecAndTest();
     long Get();
     void Set(long value);
-    void SetBit(ulong bit);
+    bool SetBit(ulong bit);
+    bool ClearBit(ulong bit);
     bool TestBit(ulong bit);
 
     long Cmpxchg(long exchange, long comparand);

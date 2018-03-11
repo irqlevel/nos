@@ -1,18 +1,55 @@
 #include "icxxabi.h"
 #include "panic.h"
+#include "asm.h"
+#include "preempt.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#define __GUARD_INIT_BIT 0UL
+#define __GUARD_LOCK_BIT 8UL
+#define __GUARD_IF_BIT 9UL
+
 int __cxa_guard_acquire (__guard *g) 
 {
-    return !*(char *)(g);
+    Kernel::PreemptDisable();
+    bool iflag = Kernel::IsInterruptEnabled();
+    if (iflag)
+        InterruptDisable();
+
+    while (true == g->SetBit(__GUARD_LOCK_BIT))
+    {
+        Pause();
+    }
+
+    if (!g->TestBit(__GUARD_INIT_BIT))
+    {
+        if (iflag)
+            g->SetBit(__GUARD_IF_BIT);
+        else
+            g->ClearBit(__GUARD_IF_BIT);
+        return 1;
+    }
+
+    g->ClearBit(__GUARD_LOCK_BIT);
+    if (iflag)
+        InterruptEnable();
+    return 0;
 }
 
 void __cxa_guard_release(__guard *g)
 {
-    *(char *)g = 1;
+    BugOn(g->TestBit(__GUARD_INIT_BIT));
+    BugOn(!g->TestBit(__GUARD_LOCK_BIT));
+
+    bool iflag = (g->TestBit(__GUARD_IF_BIT)) ? true : false;
+
+    g->SetBit(__GUARD_INIT_BIT);
+    g->ClearBit(__GUARD_LOCK_BIT);
+    if (iflag)
+        InterruptEnable();
+    Kernel::PreemptEnable();
 }
 
 void __cxa_guard_abort(__guard *)

@@ -1,6 +1,7 @@
 #pragma once
  
 #include <include/types.h>
+#include "atomic.h"
 
 #define ATEXIT_MAX_FUNCS	128
  
@@ -11,7 +12,9 @@ extern "C" {
 /* guard variables */
 
 /* The ABI requires a 64-bit type.  */
-__extension__ typedef u64 __guard __attribute__((mode(__DI__)));
+typedef Kernel::Atomic __guard;
+
+static_assert(sizeof(__guard) == sizeof(u64), "invalid size");
 
 int __cxa_guard_acquire(__guard *g);
 

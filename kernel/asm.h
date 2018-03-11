@@ -69,6 +69,7 @@ long AtomicReadAndInc(volatile long *pvalue);
 long AtomicCmpxchg(volatile long *pvalue, long exchange, long comparand);
 
 long AtomicTestAndSetBit(volatile long *pvalue, ulong bit);
+long AtomicTestAndClearBit(volatile long *pvalue, ulong bit);
 long AtomicTestBit(volatile long *pvalue, ulong bit);
 
 void IO8042InterruptStub();

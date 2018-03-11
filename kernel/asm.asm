@@ -76,6 +76,7 @@ global AtomicWrite
 global AtomicReadAndDec
 global AtomicReadAndInc
 global AtomicTestAndSetBit
+global AtomicTestAndClearBit
 global AtomicTestBit
 global AtomicCmpxchg
 
@@ -383,6 +384,14 @@ AtomicReadAndInc:
 AtomicTestAndSetBit:
 	xor rax, rax
 	lock bts qword [rdi], rsi
+	jnc .return
+	inc rax
+.return:
+	ret
+
+AtomicTestAndClearBit:
+	xor rax, rax
+	lock btr qword [rdi], rsi
 	jnc .return
 	inc rax
 .return:

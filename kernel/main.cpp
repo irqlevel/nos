@@ -273,6 +273,8 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     ALLOC_CPU_STACK();
 
+    Panicker::GetInstance();
+
     Trace(0, "Cpu rsp 0x%p rbp 0x%p", GetRsp(), GetRbp());
 
     auto& bpt = Mm::BuiltinPageTable::GetInstance();
