@@ -23,16 +23,12 @@ Pool::Pool()
 
 Pool::~Pool()
 {
+    Stdlib::AutoLock lock(Lock);
+
     Trace(0, "0x%p blockSize %u peekBlockCount %u", this, BlockSize, PeekBlockCount);
 
     if (BlockCount != 0)
         Trace(0, "0x%p blockSize %u blockCount %u", this, BlockSize, BlockCount);
-    Release();
-}
-
-void Pool::Release()
-{
-    Stdlib::AutoLock lock(Lock);
 
     while (!FreePageList.IsEmpty())
     {

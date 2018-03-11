@@ -3,6 +3,7 @@
 #include "asm.h"
 #include "cpu.h"
 #include "parameters.h"
+#include "trace.h"
 
 #include <drivers/vga.h>
 
@@ -31,17 +32,12 @@ void Panicker::DoPanic(const char *fmt, ...)
         va_start(args, fmt);
         Stdlib::VsnPrintf(Message, sizeof(Message), fmt, args);
         va_end(args);
-
-        //VgaTerm::GetInstance().PrintString(Message);
     }
 
-    PreemptDisable();
     InterruptDisable();
 
-/*
     Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
     CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
-*/
 
     for (;;)
     {

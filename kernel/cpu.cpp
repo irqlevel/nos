@@ -296,10 +296,7 @@ void Cpu::IPI(Context* ctx)
             Index, State, IPIConter.Get());
 
         InterruptDisable();
-        for (;;)
-        {
-            Pause();
-        }
+        Hlt();
         return;
     }
 

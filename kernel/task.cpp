@@ -34,12 +34,14 @@ Task::Task(const char* fmt, ...)
     va_start(args, fmt);
     Stdlib::VsnPrintf(Name, Stdlib::ArraySize(Name), fmt, args);
     va_end(args);
+    Trace(0, "task 0x%p %s", this, Name);
 }
 
 Task::~Task()
 {
     BugOn(TaskQueue != nullptr);
     BugOn(Stack != nullptr);
+    Trace(0, "task 0x%p %s dtor", this, Name);
 }
 
 void Task::Release()

@@ -149,15 +149,16 @@ void Shutdown()
     Trace(0, "Bye");
     VgaTerm::GetInstance().Printf("Bye!\n");
 
+    auto task = Task::GetCurrentTask();
+    task->Get();
+
+    InterruptDisable();
+
     __cxa_finalize(0);
 
     Trace(0, "Finalized");
 
-    InterruptDisable();
-    for (;;)
-    {
-        Pause();
-    }
+    Hlt();
 }
 
 void BpStartup(void* ctx)

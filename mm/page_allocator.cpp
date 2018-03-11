@@ -24,7 +24,7 @@ FixedPageAllocator::FixedPageAllocator()
 
 FixedPageAllocator::~FixedPageAllocator()
 {
-    Trace(0, "0x%p dtor");
+    Trace(0, "0x%p dtor", this);
 }
 
 bool FixedPageAllocator::Setup(ulong vaStart, ulong vaEnd, ulong pageCount)

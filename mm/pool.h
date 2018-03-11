@@ -23,7 +23,6 @@ public:
     void Free(void *ptr);
 
 private:
-    void Release();
 
     using ListEntry = Stdlib::ListEntry;
 
