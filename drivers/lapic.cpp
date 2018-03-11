@@ -15,6 +15,7 @@ void* Lapic::GetRegBase(ulong index)
 
 u32 Lapic::ReadReg(ulong index)
 {
+    Barrier();
     return Mm::MmIo::Read32(GetRegBase(index));
 }
 

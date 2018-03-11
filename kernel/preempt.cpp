@@ -3,28 +3,38 @@
 #include "panic.h"
 #include "asm.h"
 #include "debug.h"
+#include "atomic.h"
 
 namespace Kernel
 {
 
-volatile bool PreemptActive = false;
+Atomic PreemptActive;
+Atomic PreemptOnWaiting(1);
 
 void PreemptOn()
 {
-    PreemptActive = true;
-    Barrier();
+    PreemptActive.Inc();
+    BugOn(PreemptActive.Get() > 1);
+    PreemptOnWaiting.Dec();
+}
+
+void PreemptOnWait()
+{
+    while (PreemptOnWaiting.Get() != 0)
+    {
+        Pause();
+    }
 }
 
 void PreemptOff()
 {
-    PreemptActive = false;
-    Barrier();
+    PreemptActive.Dec();
+    BugOn(PreemptActive.Get() != 0);
 }
 
 bool PreemptIsOn()
 {
-    Barrier();
-    return PreemptActive;
+    return (PreemptActive.Get() != 0) ? true : false;
 }
 
 void PreemptDisable()

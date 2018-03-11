@@ -7,6 +7,8 @@ namespace Kernel
 
 void PreemptOn();
 
+void PreemptOnWait();
+
 void PreemptOff();
 
 bool PreemptIsOn();

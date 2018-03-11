@@ -41,6 +41,8 @@ void IoApic::WriteRegister(u8 reg, u32 value)
     Barrier();
 
     Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegWin), value);
+
+    Barrier();
 }
 
 void IoApic::Enable()

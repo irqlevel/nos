@@ -65,8 +65,6 @@ void TraceCpuState(ulong cpu)
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
 }
 
-volatile bool PreemptOnWaiting = true;
-
 void ApStartup(void *ctx)
 {
     (void)ctx;
@@ -83,10 +81,7 @@ void ApStartup(void *ctx)
 
     cpu.SetRunning();
 
-    while (PreemptOnWaiting)
-    {
-        Pause();
-    }
+    PreemptOnWait();
 
     if (!TestMultiTasking())
     {
@@ -225,7 +220,8 @@ void BpStartup(void* ctx)
     Trace(0, "Before preempt on");
 
     PreemptOn();
-    PreemptOnWaiting = false;
+
+    Trace(0, "Preempt is now on");
 
     VgaTerm::GetInstance().Printf("IPI test...\n");
 
