@@ -1,4 +1,5 @@
 #include "list_entry.h"
+#include <kernel/panic.h>
 
 namespace Stdlib
 {
@@ -67,6 +68,7 @@ void ListEntry::InsertTail(ListEntry* entry)
     ListEntry* blink;
 
     blink = Blink;
+    BugOn(!blink);
     entry->Flink = this;
     entry->Blink = blink;
     blink->Flink = entry;

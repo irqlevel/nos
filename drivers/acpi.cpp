@@ -72,7 +72,7 @@ Acpi::RSDPDescriptor20* Acpi::FindRsdp()
 
         for (ulong curr = addr; curr < (addr + len); curr+= Const::PageSize)
         {
-            ulong pageVa = pt.MapPage(curr);
+            ulong pageVa = pt.TmpMapPage(curr);
             if (!pageVa)
             {
                 Trace(0, "Can't map 0x%p", curr);
@@ -91,7 +91,7 @@ Acpi::RSDPDescriptor20* Acpi::FindRsdp()
                     }
                 }
             }
-            pt.UnmapPage(pageVa);
+            pt.TmpUnmapPage(pageVa);
         }
     }
 
@@ -150,7 +150,7 @@ Stdlib::Error Acpi::ParseTablePointers()
 
     for (size_t i = 0; i < tableCount; i++)
     {
-        ACPISDTHeader* header = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().MapAddress(Rsdt->Entry[i]));
+        ACPISDTHeader* header = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().TmpMapAddress(Rsdt->Entry[i]));
         char tableSignature[5];
 
         Stdlib::MemCpy(tableSignature, header->Signature, sizeof(header->Signature));
@@ -184,7 +184,7 @@ Stdlib::Error Acpi::ParseMADT()
     Trace(AcpiLL, "Acpi: MADT LIntCtrl 0x%p flags 0x%p",
         (ulong)header->LocalIntCtrlAddress, (ulong)header->Flags);
 
-    LapicAddress = (void *)Mm::PageTable::GetInstance().MapAddress(header->LocalIntCtrlAddress);
+    LapicAddress = (void *)Mm::PageTable::GetInstance().TmpMapAddress(header->LocalIntCtrlAddress);
     if (LapicAddress == nullptr)
     {
         return MakeError(Stdlib::Error::NoMemory);
@@ -226,7 +226,7 @@ Stdlib::Error Acpi::ParseMADT()
             if (entry->Length < sizeof(*ioApicEntry) + sizeof(*entry))
                 return MakeError(Stdlib::Error::InvalidValue);
 
-            IoApicAddress = (void *)Mm::PageTable::GetInstance().MapAddress(ioApicEntry->IoApicAddress);
+            IoApicAddress = (void *)Mm::PageTable::GetInstance().TmpMapAddress(ioApicEntry->IoApicAddress);
             if (IoApicAddress == nullptr)
             {
                 return MakeError(Stdlib::Error::NoMemory);
@@ -272,7 +272,7 @@ Stdlib::Error Acpi::Parse()
     }
 
     Rsdp = rsdp;
-    ACPISDTHeader* rsdt = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().MapAddress(Rsdp->FirstPart.RsdtAddress));
+    ACPISDTHeader* rsdt = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().TmpMapAddress(Rsdp->FirstPart.RsdtAddress));
     err = ParseRsdt(rsdt);
     if (!err.Ok())
     {

@@ -20,7 +20,7 @@ VgaTerm::VgaTerm()
 
     Stdlib::AutoLock lock(Lock);
 
-    Buf = (u16*)Mm::PageTable::GetInstance().MapPage(BufPhyAddr);
+    Buf = (u16*)Mm::PageTable::GetInstance().TmpMapPage(BufPhyAddr);
     if (Buf == nullptr)
     {
         Panic("Can't map page");
@@ -40,7 +40,7 @@ VgaTerm::~VgaTerm()
 
     if (Buf != nullptr)
     {
-        Mm::PageTable::GetInstance().UnmapPage((ulong)Buf);
+        Mm::PageTable::GetInstance().TmpUnmapPage((ulong)Buf);
         Buf = nullptr;
     }
 }

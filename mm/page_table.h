@@ -94,12 +94,36 @@ static_assert(sizeof(PtePage) == Const::PageSize, "Invalid size");
 
 struct Page final
 {
+    void Init(ulong phyAddr)
+    {
+        ListEntry.Init();
+        RefCount.Set(1);
+        PhyAddr = phyAddr;
+    }
+
+    void Get()
+    {
+        RefCount.Inc();
+    }
+
+    void Put()
+    {
+        BugOn(RefCount.Get() == 0);
+        RefCount.Dec();
+    }
+
+    ulong GetPhyAddress()
+    {
+        return PhyAddr;
+    }
+
     Stdlib::ListEntry ListEntry;
-    Kernel::Atomic RefCounter;
-    ulong Pfn;
+    Kernel::Atomic RefCount;
+    ulong PhyAddr;
 };
 
 static_assert(sizeof(Page) == 0x20, "Invalid size");
+static_assert((Const::PageSize % sizeof(Page)) == 0, "Invalid size");
 
 class BuiltinPageTable final
 {
@@ -146,20 +170,22 @@ public:
 
     ulong GetRoot();
 
-    ulong MapPage(ulong phyAddr);
-    ulong UnmapPage(ulong virtAddr);
+    ulong TmpMapPage(ulong phyAddr);
+    ulong TmpUnmapPage(ulong virtAddr);
 
-    ulong MapAddress(ulong phyAddr);
-
-    ulong AllocPage();
-    void FreePage(ulong phyAddr);
-
-    bool MapPage(ulong virtAddr, ulong phyAddr);
-    ulong UnmapPage2(ulong virtAddr);
+    ulong TmpMapAddress(ulong phyAddr);
 
     ulong GetAvailableFreePages();
 
-    ulong GetTmpMapEnd();
+    ulong GetVaEnd();
+
+    Page* GetPage(ulong phyAddr);
+
+    bool MapPage(ulong virtAddr, Page* page);
+    Page* UnmapPage(ulong virtAddr);
+
+    Page* AllocPage();
+    void FreePage(Page* page);
 
 private:
     PageTable(const PageTable& other) = delete;
@@ -174,13 +200,14 @@ private:
     bool SetupPage(ulong virtAddr, ulong phyAddr);
 
     bool GetFreePages();
+    void ExcludeFreePages(ulong phyLimit);
 
     ulong TmpMapStart;
     Kernel::SpinLock TmpMapLock;
     PtePage *TmpMapL1Page;
 
     static const size_t TmpMapPageCount = 512;
-    bool TmpMapUsage[TmpMapPageCount];
+    Page *TmpMapPageArray[TmpMapPageCount];
 
     ulong GetL1Page(ulong virtAddr);
 
@@ -189,7 +216,11 @@ private:
     SpinLock Lock;
     SpinLock FreePagesLock;
     ulong FreePages;
-    ulong AvailableFreePagesCount;
+
+    Page* PageArray;
+    ulong PageArrayCount;
+    ulong HighestPhyAddr;
+    Stdlib::ListEntry FreePagesList;
     ulong FreePagesCount;
 };
 

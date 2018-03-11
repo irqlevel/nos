@@ -274,6 +274,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     ALLOC_CPU_STACK();
 
     Panicker::GetInstance();
+    Watchdog::GetInstance();
 
     Trace(0, "Cpu rsp 0x%p rbp 0x%p", GetRsp(), GetRbp());
 
@@ -318,7 +319,9 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
+    Trace(0, "A");
     auto& pt = Mm::PageTable::GetInstance();
+    Trace(0, "A");
     if (!pt.Setup())
     {
         Panic("Can't setup paging");
@@ -335,14 +338,16 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     //Test paging
     {
+        Trace(0, "Test paging");
         auto page = pt.AllocPage();
         if (!page) {
             Panic("Can't alloc page");
             break;
         }
-        auto va = pt.MapPage(page);
+        auto va = pt.TmpMapPage(page->GetPhyAddress());
+        Trace(0, "va 0x%p pha 0x%p", va, page->GetPhyAddress());
         Stdlib::MemSet((void *)va, 0, Const::PageSize);
-        pt.UnmapPage(va);
+        pt.TmpUnmapPage(va);
         pt.FreePage(page);
     }
 

@@ -47,7 +47,7 @@ void* FixedPageAllocator::Alloc()
     Stdlib::AutoLock lock(Lock);
 
     auto& pt = PageTable::GetInstance();
-    ulong pages[PageCount];
+    Page* pages[PageCount];
 
     for (size_t i = 0; i < PageCount; i++)
     {
@@ -79,9 +79,13 @@ void* FixedPageAllocator::Alloc()
         if (!pt.MapPage(VaStart + blockIndex * BlockSize + i * Const::PageSize, pages[i]))
         {
             for (size_t j = 0; j < i; j++)
-                pt.UnmapPage2(VaStart + blockIndex * BlockSize + j * Const::PageSize);
+            {
+                Page* page = pt.UnmapPage(VaStart + blockIndex * BlockSize + j * Const::PageSize);
+                pt.FreePage(page);
+                page->Put();
+            }
 
-            for (size_t j = 0; j < PageCount; j++)
+            for (size_t j = i; j < PageCount; j++)
             {
                 pt.FreePage(pages[i]);
             }
@@ -109,7 +113,9 @@ bool FixedPageAllocator::Free(void* addr)
     auto& pt = PageTable::GetInstance();
     for (size_t i = 0; i < PageCount; i++)
     {
-        pt.FreePage(pt.UnmapPage2(VaStart + blockIndex * BlockSize + i * Const::PageSize));
+        Page* page = pt.UnmapPage(VaStart + blockIndex * BlockSize + i * Const::PageSize);
+        pt.FreePage(page);
+        page->Put();
     }
 
     return true;
@@ -126,7 +132,7 @@ bool PageAllocatorImpl::Setup()
     if (availablePages == 0)
         return false;
 
-    ulong startAddress = pt.GetTmpMapEnd();
+    ulong startAddress = pt.GetVaEnd();
     ulong endAddress = startAddress + ((7 * availablePages) / 10) * Const::PageSize;
 
     Trace(0, "setup 0x%p start 0x%p end 0x%p pages %u", this, startAddress, endAddress, availablePages);

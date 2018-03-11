@@ -12,7 +12,6 @@ namespace Kernel
 
 Panicker::Panicker()
 {
-    Trace(0, "Panicker 0x%p", this);
 }
 
 Panicker::~Panicker()
