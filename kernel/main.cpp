@@ -319,9 +319,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
-    Trace(0, "A");
     auto& pt = Mm::PageTable::GetInstance();
-    Trace(0, "A");
     if (!pt.Setup())
     {
         Panic("Can't setup paging");
@@ -331,6 +329,11 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     Trace(0, "Paging root 0x%p old cr3 0x%p", pt.GetRoot(), GetCr3());
     SetCr3(pt.GetRoot());
     Trace(0, "Set new cr3 0x%p", GetCr3());
+    if (!pt.SetupFreePagesList())
+    {
+        Panic("Can't setup paging");
+        break;
+    }
 
     Gdt::GetInstance().Save();
     ExceptionTable::GetInstance().RegisterExceptionHandlers();

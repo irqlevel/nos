@@ -167,15 +167,16 @@ public:
     }
 
     bool Setup();
+    bool SetupFreePagesList();
 
     ulong GetRoot();
 
     ulong TmpMapPage(ulong phyAddr);
     ulong TmpUnmapPage(ulong virtAddr);
-
     ulong TmpMapAddress(ulong phyAddr);
 
-    ulong GetAvailableFreePages();
+    ulong GetFreePagesCount();
+    ulong GetTotalPagesCount();
 
     ulong GetVaEnd();
 
@@ -196,11 +197,14 @@ private:
     ~PageTable();
 
     ulong GetFreePage();
+    ulong GetFreePageByTmpMap();
 
     bool SetupPage(ulong virtAddr, ulong phyAddr);
 
     bool GetFreePages();
     void ExcludeFreePages(ulong phyLimit);
+
+    Page* AllocPageNoLock();
 
     ulong TmpMapStart;
     Kernel::SpinLock TmpMapLock;
@@ -222,6 +226,7 @@ private:
     ulong HighestPhyAddr;
     Stdlib::ListEntry FreePagesList;
     ulong FreePagesCount;
+    ulong TotalPagesCount;
 };
 
 }
