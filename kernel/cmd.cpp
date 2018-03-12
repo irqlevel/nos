@@ -7,6 +7,7 @@
 #include "watchdog.h"
 
 #include <drivers/vga.h>
+#include <mm/page_table.h>
 
 namespace Kernel
 {
@@ -72,6 +73,13 @@ void Cmd::ProcessCmd(const char *cmd)
     {
         Watchdog::GetInstance().Dump(vga);
     }
+    else if (Stdlib::StrCmp(cmd, "memusage") == 0)
+    {
+        auto& pt = Mm::PageTable::GetInstance();
+
+        vga.Printf("freePages: %u\n", pt.GetFreePagesCount());
+        vga.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
+    }
     else if (Stdlib::StrCmp(cmd, "help") == 0)
     {
         vga.Printf("cls - clear screen\n");
@@ -80,6 +88,7 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Printf("exit - shutdown kernel\n");
         vga.Printf("ps - show tasks\n");
         vga.Printf("watchdog - show watchdog stats\n");
+        vga.Printf("memusage - show memory usage stats\n");
         vga.Printf("help - help\n");
     }
     else
