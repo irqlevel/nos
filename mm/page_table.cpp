@@ -134,6 +134,7 @@ PageTable::PageTable()
     , PageArrayCount(0)
     , HighestPhyAddr(0)
     , FreePagesCount(0)
+    , TotalPagesCount(0)
 {
     Trace(0, "PageTable 0x%p", this);
     for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
@@ -150,43 +151,58 @@ PageTable::~PageTable()
 bool PageTable::GetFreePages()
 {
     auto& mmap = MemoryMap::GetInstance();
-    ulong memStart, memEnd;
 
-    if (!mmap.FindRegion(BuiltinPageTable::GetInstance().VirtToPhys(mmap.GetKernelEnd()), 4 * Const::GB, memStart, memEnd))
+    for (size_t i = 0; i < mmap.GetRegionCount(); i++)
     {
-        Trace(0, "Can't get available memory region");
-        return false;
-    }
+        ulong addr, len, type;
 
-    Trace(0, "Phy memStart 0x%p memEnd 0x%p", memStart, memEnd);
+        if (!mmap.GetRegion(i, addr, len, type))
+            return false;
 
-    if (memStart % Const::PageSize)
-    {
-        Trace(0, "Invalid phy memory start 0x%p", memStart);
-        return false;
-    }
+        ulong limit = Stdlib::RoundUp(addr + len, Const::PageSize);
+        if (limit > HighestPhyAddr)
+            HighestPhyAddr = limit;
 
-    if (memEnd % Const::PageSize)
-    {
-        Trace(0, "Invalid phy memory end 0x%p", memEnd);
-        return false;
-    }
+        if (type != 1)
+            continue;
 
-    for (ulong address = memStart; address < memEnd; address+= Const::PageSize)
-    {
-        if (FreePages == 0)
+        ulong memStart = addr;
+        ulong memEnd = addr + len;
+
+        Trace(0, "Phy memStart 0x%p memEnd 0x%p", memStart, memEnd);
+
+        if (memStart % Const::PageSize)
         {
-            *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = 0;
-            FreePages = address;
+            Trace(0, "Not aligned phy memory start 0x%p", memStart);
+            continue;
         }
-        else
+
+        if (memEnd % Const::PageSize)
         {
-            ulong next = FreePages;
-            FreePages = address;
-            *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = next;
+            Trace(0, "Not aligned phy memory end 0x%p", memEnd);
+            continue;
         }
-        if (address > HighestPhyAddr)
-            HighestPhyAddr = address;
+
+        for (ulong address = memStart; address < memEnd; address+= Const::PageSize)
+        {
+            TotalPagesCount++;
+
+            if (BuiltinPageTable::GetInstance().PhysToVirt(address) >= mmap.GetKernelStart()
+                && BuiltinPageTable::GetInstance().PhysToVirt(address) < mmap.GetKernelEnd())
+                continue;
+
+            if (FreePages == 0)
+            {
+                *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = 0;
+                FreePages = address;
+            }
+            else
+            {
+                ulong next = FreePages;
+                FreePages = address;
+                *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = next;
+            }
+        }
     }
 
     return true;
@@ -202,6 +218,22 @@ ulong PageTable::GetFreePage()
     FreePages = next;
 
     Stdlib::MemSet((void *)BuiltinPageTable::GetInstance().PhysToVirt(curr), 0, Const::PageSize);
+    return curr;
+}
+
+ulong PageTable::GetFreePageByTmpMap()
+{
+    if (FreePages == 0)
+        return 0;
+
+    ulong curr = FreePages;
+    ulong va = TmpMapPage(curr);
+    ulong next = *(ulong *)va;
+    FreePages = next;
+
+    Stdlib::MemSet((void*)va, 0, Const::PageSize);
+    TmpUnmapPage(va);
+
     return curr;
 }
 
@@ -321,6 +353,7 @@ Page* PageTable::GetPage(ulong phyAddr)
 
     BugOn(index >= PageArrayCount);
     Page* page = &PageArray[index];
+    BugOn(page->GetPhyAddress() != phyAddr);
     page->Get();
     return page;
 }
@@ -335,7 +368,6 @@ void PageTable::ExcludeFreePages(ulong phyLimit)
         ulong next = *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(curr);
         if (curr < phyLimit)
         {
-            //Trace(0, "Exclude 0x%p", curr);
             if (prev)
                 *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(prev) = next;
             else
@@ -355,6 +387,7 @@ bool PageTable::Setup()
         return false;
 
     auto& mmap = MemoryMap::GetInstance();
+    TmpMapL1Page = (PtePage *)mmap.GetKernelEnd();
     TmpMapStart = Stdlib::RoundUp(mmap.GetKernelEnd() + Const::PageSize, 512 * Const::PageSize);
     PageArray = (Page*)(TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize);
     ulong pageArrayLimit = (ulong)PageArray + Stdlib::RoundUp((HighestPhyAddr/Const::PageSize + 1) * sizeof(Page), Const::PageSize);
@@ -370,7 +403,6 @@ bool PageTable::Setup()
         }
     }
 
-    TmpMapL1Page = (PtePage *)mmap.GetKernelEnd();
     Trace(0, "TmpMapStart 0x%p", TmpMapStart);
     for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
     {
@@ -392,47 +424,49 @@ bool PageTable::Setup()
 
     Trace(0, "PageArray setup, highestPhyAddr 0x%p", HighestPhyAddr);
 
-    Trace(0, "PageArray setup, pageArrayLimit 0x%p", pageArrayLimit);
+    Trace(0, "PageArray setup, pageArray 0x%p pageArrayLimit 0x%p", PageArray, pageArrayLimit);
 
     ulong virtAddr = (ulong)PageArray;
-    ulong virtSpace = 0;
+    ulong phaSpace = 0, pha;
     for (ulong phyAddr = 0; phyAddr <= HighestPhyAddr; phyAddr += Const::PageSize)
     {
-        if (virtSpace == 0)
+        if (phaSpace == 0)
         {
-            ulong pha = GetFreePage();
+            pha = GetFreePage();
             if (!pha)
                 return false;
 
             if (!SetupPage(virtAddr, pha))
                 return false;
-            virtSpace = Const::PageSize;
+            phaSpace = Const::PageSize;
         }
-        Page *page = (Page *)virtAddr;
+        Page *page = (Page *)BuiltinPageTable::GetInstance().PhysToVirt(pha + Const::PageSize - phaSpace);
         page->Init(phyAddr);
-        virtSpace -= sizeof(Page);
+        phaSpace -= sizeof(Page);
         virtAddr += sizeof(Page);
         PageArrayCount++;
     }
 
     Trace(0, "PageArray setup done, count %u", PageArrayCount);
+    return true;
+}
 
+bool PageTable::SetupFreePagesList()
+{
     FreePagesCount = 0;
     for (;;)
     {
-        ulong phyAddr = GetFreePage();
-        //Trace(0, "PhyAddr 0x%p", phyAddr);
+        ulong phyAddr = GetFreePageByTmpMap();
         if (!phyAddr)
             break;
 
         Page* page = GetPage(phyAddr);
-        //Trace(0, "Page 0x%p", page);
+        BugOn(!page);
         FreePagesList.InsertHead(&page->ListEntry);
         FreePagesCount++;
     }
 
     Trace(0, "FreePagesCount %u", FreePagesCount);
-    DebugWait();
     return true;
 }
 
@@ -440,6 +474,11 @@ Page* PageTable::AllocPage()
 {
     Stdlib::AutoLock lock(Lock);
 
+    return AllocPageNoLock();
+}
+
+Page* PageTable::AllocPageNoLock()
+{
     if (FreePagesList.IsEmpty())
     {
         return nullptr;
@@ -479,13 +518,14 @@ ulong PageTable::TmpMapPage(ulong phyAddr)
                 return 0;
 
             Page* page = GetPage(phyAddr);
+            BugOn(!page);
+
             l1Entry->SetAddress(phyAddr);
             l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
             l1Entry->SetPresent();
             Invlpg(virtAddr);
             TmpMapPageArray[i] = page;
-            //Trace(0, "Map 0x%p 0x%p -> 0x%p", l1Entry, phyAddr, virtAddr);
             return virtAddr;
         }
     }
@@ -514,7 +554,6 @@ ulong PageTable::TmpUnmapPage(ulong virtAddr)
     Invlpg(virtAddr);
     TmpMapPageArray[i] = nullptr;
     page->Put();
-    //Trace(0, "Unmap 0x%p 0x%p -> 0x%p", l1Entry, phyAddr, virtAddr);
 
     return phyAddr;
 }
@@ -558,7 +597,7 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
 
     Pte *l4Entry = &l4Page->Entry[l4Index];
     if (!l4Entry->Present()) {
-        Page* page = AllocPage();
+        Page* page = AllocPageNoLock();
         if (!page) {
             TmpUnmapPage((ulong)l4Page);
             return false;
@@ -577,7 +616,7 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
 
     Pte *l3Entry = &l3Page->Entry[l3Index];
     if (!l3Entry->Present()) {
-        Page *page = AllocPage();
+        Page *page = AllocPageNoLock();
         if (!page) {
             TmpUnmapPage((ulong)l3Page);
             return false;
@@ -595,7 +634,7 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
 
     Pte *l2Entry = &l2Page->Entry[l2Index];
     if (!l2Entry->Present()) {
-        Page* page = AllocPage();
+        Page* page = AllocPageNoLock();
         if (!page) {
             TmpUnmapPage((ulong)l2Page);
             return false;
@@ -710,10 +749,16 @@ Page* PageTable::UnmapPage(ulong virtAddr)
     return page;
 }
 
-ulong PageTable::GetAvailableFreePages()
+ulong PageTable::GetFreePagesCount()
 {
     Stdlib::AutoLock lock(Lock);
     return FreePagesCount;
+}
+
+ulong PageTable::GetTotalPagesCount()
+{
+    Stdlib::AutoLock lock(Lock);
+    return TotalPagesCount;
 }
 
 ulong PageTable::GetVaEnd()

@@ -128,14 +128,14 @@ PageAllocatorImpl::PageAllocatorImpl()
 bool PageAllocatorImpl::Setup()
 {
     auto& pt = PageTable::GetInstance();
-    ulong availablePages = pt.GetAvailableFreePages();
-    if (availablePages == 0)
+    ulong freePagesCount = pt.GetFreePagesCount();
+    if (freePagesCount == 0)
         return false;
 
     ulong startAddress = pt.GetVaEnd();
-    ulong endAddress = startAddress + ((7 * availablePages) / 10) * Const::PageSize;
+    ulong endAddress = startAddress + ((7 * freePagesCount) / 10) * Const::PageSize;
 
-    Trace(0, "setup 0x%p start 0x%p end 0x%p pages %u", this, startAddress, endAddress, availablePages);
+    Trace(0, "setup 0x%p start 0x%p end 0x%p free pages %u", this, startAddress, endAddress, freePagesCount);
 
     size_t sizePerBalloc = (endAddress - startAddress) / Stdlib::ArraySize(FixedPgAlloc);
     for (size_t i = 0; i < Stdlib::ArraySize(FixedPgAlloc); i++)
