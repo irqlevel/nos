@@ -35,6 +35,7 @@
 #include <drivers/acpi.h>
 #include <drivers/lapic.h>
 #include <drivers/ioapic.h>
+#include <drivers/pci.h>
 
 using namespace Kernel;
 using namespace Stdlib;
@@ -389,6 +390,9 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     Trace(0, "After test");
     VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
+
+    auto& pci = Pci::GetInstance();
+    pci.Scan();
 
     auto& kbd = IO8042::GetInstance();
     auto& cmd = Cmd::GetInstance();

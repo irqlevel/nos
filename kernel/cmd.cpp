@@ -7,6 +7,7 @@
 #include "watchdog.h"
 
 #include <drivers/vga.h>
+#include <drivers/pci.h>
 #include <mm/page_table.h>
 
 namespace Kernel
@@ -80,6 +81,10 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Printf("freePages: %u\n", pt.GetFreePagesCount());
         vga.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
     }
+    else if (Stdlib::StrCmp(cmd, "pci") == 0)
+    {
+        Pci::GetInstance().Dump(vga);
+    }
     else if (Stdlib::StrCmp(cmd, "help") == 0)
     {
         vga.Printf("cls - clear screen\n");
@@ -89,6 +94,7 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Printf("ps - show tasks\n");
         vga.Printf("watchdog - show watchdog stats\n");
         vga.Printf("memusage - show memory usage stats\n");
+        vga.Printf("pci - show pci devices\n");
         vga.Printf("help - help\n");
     }
     else
