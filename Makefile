@@ -19,6 +19,7 @@ CXX_SRC =   \
     drivers/lapic.cpp   \
     drivers/ioapic.cpp  \
     drivers/vga.cpp \
+    drivers/pci.cpp \
     kernel/icxxabi.cpp    \
     kernel/interrupt.cpp   \
     kernel/task.cpp \

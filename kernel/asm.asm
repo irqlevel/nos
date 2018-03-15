@@ -57,6 +57,8 @@ global SpinLockLock
 global SpinLockUnlock
 global Outb
 global Inb
+global Out
+global In
 global ReadMsr
 global WriteMsr
 global InterruptEnable
@@ -239,6 +241,22 @@ Inb:
 	mov rdx, rdi
 	xor rax, rax
 	in al, dx
+	pop rdx
+	ret
+
+Out:
+	push rdx
+	mov rdx, rdi
+	mov rax, rsi
+	out dx, eax
+	pop rdx
+	ret
+
+In:
+	push rdx
+	mov rdx, rdi
+	xor rax, rax
+	in eax, dx
 	pop rdx
 	ret
 
