@@ -14,7 +14,7 @@ Pci::~Pci()
 
 u16 Pci::ReadWord(u16 bus, u16 slot, u16 func, u16 offset)
 {
-	u64 address;
+    u64 address;
     u64 lbus = (u64)bus;
     u64 lslot = (u64)slot;
     u64 lfunc = (u64)func;
@@ -71,6 +71,7 @@ void Pci::Scan()
                 u16 vendor = GetVendorID(bus, slot, function);
                 if(vendor == 0xffff)
                     continue;
+
                 u16 device = GetDeviceID(bus, slot, function);
                 u16 cls = GetClassId(bus, slot, function);
                 u16 scls = GetSubClassId(bus, slot, function);
@@ -95,6 +96,7 @@ void Pci::Dump(Stdlib::Printer& printer)
                 u16 vendor = GetVendorID(bus, slot, function);
                 if(vendor == 0xffff)
                     continue;
+
                 u16 device = GetDeviceID(bus, slot, function);
                 u16 cls = GetClassId(bus, slot, function);
                 u16 scls = GetSubClassId(bus, slot, function);
