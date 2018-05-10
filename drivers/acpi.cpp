@@ -14,6 +14,7 @@ Acpi::Acpi()
     , LapicAddress(nullptr)
     , IoApicAddress(nullptr)
     , IrqToGsiSize(0)
+    , Parsed(false)
 {
     OemId[0] = '\0';
     for (size_t i = 0; i < Stdlib::ArraySize(Table); i++)
@@ -65,8 +66,12 @@ Acpi::RSDPDescriptor20* Acpi::FindRsdp()
         ulong addr, len, type;
 
         if (!mm.GetRegion(i, addr, len, type))
+        {
+            Trace(0, "Can't get region");
             return nullptr;
+        }
 
+        Trace(0, "Check region type %u addr 0x%p len 0x%p", type, addr, len);
         if (type != 1)
             continue;
 
@@ -292,18 +297,19 @@ Stdlib::Error Acpi::Parse()
         return err;
     }
 
+    Parsed = true;
     return MakeError(Stdlib::Error::Success);
 }
 
 
 void* Acpi::GetLapicAddress()
 {
-    return LapicAddress;
+    return (Parsed) ? LapicAddress : nullptr;
 }
 
 void* Acpi::GetIoApicAddress()
 {
-    return IoApicAddress;
+    return (Parsed) ? IoApicAddress : nullptr;
 }
 
 bool Acpi::RegisterIrqToGsi(u8 irq, u32 gsi)

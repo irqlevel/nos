@@ -8,6 +8,11 @@
 namespace Kernel
 {
 
+bool Lapic::Ready()
+{
+    return (Acpi::GetInstance().GetLapicAddress() != nullptr) ? true : false;
+}
+
 void* Lapic::GetRegBase(ulong index)
 {
     return Stdlib::MemAdd(Acpi::GetInstance().GetLapicAddress(), index * 0x10);

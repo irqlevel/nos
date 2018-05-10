@@ -31,6 +31,8 @@ private:
 
     char Message[256];
     Atomic Active;
+    ulong Frame[16];
+    size_t FrameCount;
 };
 
 }

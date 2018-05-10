@@ -10,6 +10,8 @@ class Lapic final
 {
 public:
 
+    static bool Ready();
+
     static void Enable();
 
     static void EOI();

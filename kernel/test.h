@@ -1,6 +1,6 @@
 #pragma once
 
-#include "error.h"
+#include <lib/error.h>
 
 namespace Kernel
 {

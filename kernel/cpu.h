@@ -1,6 +1,6 @@
 #pragma once
 
-#include "stdlib.h"
+#include <lib/stdlib.h>
 #include "spin_lock.h"
 #include "task.h"
 #include "sched.h"
@@ -94,6 +94,8 @@ public:
     void SendIPIAll();
 
     void Reset();
+
+    bool Ready();
 
 private:
     CpuTable();

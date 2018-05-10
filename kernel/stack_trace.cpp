@@ -1,12 +1,10 @@
 #include "stack_trace.h"
 #include "asm.h"
-#include "trace.h"
 
 namespace Kernel
 {
-    size_t StackTrace::Capture(ulong stackSize, ulong *frames, size_t maxFrames)
+    size_t StackTrace::CaptureByRbp(ulong currRbp, ulong stackSize, ulong *frames, size_t maxFrames)
     {
-        ulong currRbp = GetRbp();
         ulong base = currRbp & (~(stackSize - 1));
         ulong limit = base + stackSize;
         size_t i;
@@ -25,5 +23,10 @@ namespace Kernel
         }
 
         return i;
+    }
+
+    size_t StackTrace::Capture(ulong stackSize, ulong *frames, size_t maxFrames)
+    {
+        return CaptureByRbp(GetRbp(), stackSize, frames, maxFrames);
     }
 }

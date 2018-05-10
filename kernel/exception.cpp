@@ -1,11 +1,12 @@
 #include "exception.h"
 #include "idt.h"
-#include "stdlib.h"
+#include <lib/stdlib.h>
 #include "asm.h"
 #include "panic.h"
 #include "trace.h"
 #include "cpu.h"
 #include "debug.h"
+#include "stack_trace.h"
 
 namespace Kernel
 {
@@ -246,19 +247,26 @@ void ExceptionTable::ExcPageFault(Context* ctx)
 {
     (void)ctx;
 
-    Trace(0, "PageFault cr2 0x%p cr3 0x%p rip 0x%p", GetCr2(), GetCr3(), ctx->GetRetRip());
-
-    ExcPageFaultCounter.Inc();
+    ulong frame[16];
 
     ulong cr2 = GetCr2();
     ulong cr3 = GetCr3();
+    ulong rip = ctx->GetRetRip();
 
-    InterruptDisable();
-    Hlt();
+    Trace(0, "PageFault cr2 0x%p cr3 0x%p rip 0x%p ctx 0x%p rbp 0x%p",
+        cr2, cr3, rip, ctx, ctx->Rbp);
 
-    Panic("EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0x%p cr3 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp,
-        cr2, cr3);
+    if (ctx->Rbp)
+    {
+        ulong frameCount = StackTrace::CaptureByRbp(ctx->Rbp, 4096, frame, Stdlib::ArraySize(frame));
+        for (size_t i = 0; i < frameCount; i++)
+            Trace(0, "Frame[%u]=0x%p", i, frame[i]);
+    }
+
+    ExcPageFaultCounter.Inc();
+
+    Panic("EXC: PageFault rip 0x%p rsp 0x%p cr2 0x%p cr3 0x%p",
+        rip, ctx->Rsp, cr2, cr3);
 }
 
 void ExceptionTable::ExcReserved(Context* ctx)

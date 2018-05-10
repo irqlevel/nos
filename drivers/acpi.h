@@ -141,6 +141,7 @@ private:
 
     bool RegisterIrqToGsi(u8 irq, u32 gsi);
 
+    bool Parsed;
 };
 
 }

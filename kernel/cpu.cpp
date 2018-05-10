@@ -362,6 +362,11 @@ ulong CpuTable::GetRunningCpus()
     return result;
 }
 
+bool CpuTable::Ready()
+{
+    return Lapic::Ready();
+}
+
 void CpuTable::Reset()
 {
     Stdlib::AutoLock lock(Lock);
@@ -385,5 +390,6 @@ bool Cpu::Run(Task::Func func, void *ctx)
 
     return Task->Run(TaskQueue, func, ctx);
 }
+
 
 }
