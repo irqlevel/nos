@@ -12,6 +12,124 @@ Pci::~Pci()
 {
 }
 
+const char* Pci::ClassToStr(u16 cls)
+{
+    switch (cls)
+    {
+    case ClsUnclassified:
+        return "Unclassified";
+    case ClsMassStorageController:
+        return "Storage";
+    case ClsNetworkController:
+        return "Network";
+    case ClsDisplayController:
+        return "Display";
+    case ClsMultimediaController:
+        return "Multimedia";
+    case ClsMemoryController:
+        return "Memory";
+    case ClsBridgeDevice:
+        return "Bridge";
+    default:
+        return "Unknown";
+    }
+}
+
+const char* Pci::SubClassToStr(u16 cls, u16 subcls)
+{
+    switch (cls)
+    {
+    case ClsUnclassified:
+        return "Unknown";
+    case ClsMassStorageController:
+        switch (subcls)
+        {
+        case SubClsSCSIBusController:
+            return "SCSI";
+        case SubClsIDEController:
+            return "IDE";
+        default:
+            return "Unknown";
+        }
+    case ClsNetworkController:
+        switch (subcls)
+        {
+        case SubClsEthernetController:
+            return "Ethernet";
+        default:
+            return "Unknown";
+        }
+    case ClsDisplayController:
+        switch (subcls)
+        {
+        case SubClsVgaCompatibleController:
+            return "VGA";
+        default:
+            return "Unknown";
+        }
+    case ClsMultimediaController:
+        return "Unknown";
+    case ClsMemoryController:
+        return "Unknown";
+    case ClsBridgeDevice:
+        switch (subcls)
+        {
+        case SubClsHostBridge:
+            return "Host";
+        case SubClsISABridge:
+            return "ISA";
+        case SubClsOtherBridge:
+            return "Other";
+        default:
+            return "Unknown";
+        }
+    default:
+        return "Unknown";
+    }
+}
+
+const char* Pci::VendorToStr(u16 vendor)
+{
+    switch (vendor)
+    {
+    case VendorIntel:
+        return "Intel";
+    case VendorBochs:
+        return "Bochs";
+    case VendorVirtio:
+        return "Virtio";
+    default:
+        return "Unknown";
+    }
+}
+
+const char* Pci::DeviceToStr(u16 vendor, u16 dev)
+{
+    switch (vendor)
+    {
+    case VendorIntel:
+        return "Unknown";
+    case VendorBochs:
+        return "Unknown";
+    case VendorVirtio:
+        switch (dev)
+        {
+        case DevVirtioBlk:
+            return "Blk";
+        case DevVirtioRng:
+            return "Rng";
+        case DevVirtioNetwork:
+            return "Network";
+        case DevVirtioScsi:
+            return "Scsi";
+        default:
+            return "Unknown";
+        }
+    default:
+        return "Unknown";
+    }
+}
+
 u16 Pci::ReadWord(u16 bus, u16 slot, u16 func, u16 offset)
 {
     u64 address;
@@ -78,8 +196,8 @@ void Pci::Scan()
                 u16 progIf = GetProgIF(bus, slot, function);
                 u16 revId = GetRevisionID(bus, slot, function);
 
-                Trace(0, "vendor 0x%p dev 0x%p cls 0x%p subcls 0x%p progif 0x%p revid 0x%p",
-                    (ulong)vendor, (ulong)device, (ulong)cls, (ulong)scls, (ulong)progIf, (ulong)revId);
+                Trace(0, "vnd %s(0x%p) dev %s(0x%p) %s(0x%p) %s(0x%p) p 0x%p r 0x%p",
+                    VendorToStr(vendor), (ulong)vendor, DeviceToStr(vendor, device), (ulong)device, ClassToStr(cls), (ulong)cls, SubClassToStr(cls, scls), (ulong)scls, (ulong)progIf, (ulong)revId);
             }
         }
     }
@@ -103,8 +221,8 @@ void Pci::Dump(Stdlib::Printer& printer)
                 u16 progIf = GetProgIF(bus, slot, function);
                 u16 revId = GetRevisionID(bus, slot, function);
 
-                printer.Printf("vendor 0x%p dev 0x%p cls 0x%p subcls 0x%p progif 0x%p revid 0x%p\n",
-                    (ulong)vendor, (ulong)device, (ulong)cls, (ulong)scls, (ulong)progIf, (ulong)revId);
+                printer.Printf("vnd %s(0x%p) dev %s(0x%p) %s(0x%p) %s(0x%p) p 0x%p r 0x%p\n",
+                    VendorToStr(vendor), (ulong)vendor, DeviceToStr(vendor, device), (ulong)device, ClassToStr(cls), (ulong)cls, SubClassToStr(cls, scls), (ulong)scls, (ulong)progIf, (ulong)revId);
             }
         }
     }
