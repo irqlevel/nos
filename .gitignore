@@ -10,3 +10,5 @@ iso
 bin
 *.log
 *.out
+*.img
+*.disk
