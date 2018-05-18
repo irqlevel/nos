@@ -43,7 +43,7 @@ size_t AllocatorImpl::Log2(size_t size)
 	return log;
 }
 
-void* AllocatorImpl::Alloc(size_t size)
+void* AllocatorImpl::Alloc(size_t size, ulong tag)
 {
 	BugOn(size == 0);
 
@@ -62,7 +62,7 @@ void* AllocatorImpl::Alloc(size_t size)
 		return nullptr;
 	}
 
-	header = static_cast<Header*>(Pool[log - StartLog].Alloc());
+	header = static_cast<Header*>(Pool[log - StartLog].Alloc(tag));
 	if (header == nullptr)
 	{
 		return nullptr;

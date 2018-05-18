@@ -157,6 +157,15 @@ void Shutdown()
     Hlt();
 }
 
+void TaskRoutine(void *ctx)
+{
+    (void)ctx;
+
+    auto task = Task::GetCurrentTask();
+    while (!task->IsStopping())
+        Sleep(100 * Const::NanoSecsInMs);
+}
+
 void BpStartup(void* ctx)
 {
     (void)ctx;
@@ -254,6 +263,22 @@ void BpStartup(void* ctx)
         return;
     }
 
+    Task* tasks[1];
+    for (size_t i = 0; i < Stdlib::ArraySize(tasks); i++)
+    {
+        tasks[i] = Mm::TAlloc<Task, 'Task'>("task%d", i);
+        if (tasks[i] == nullptr)
+        {
+            Panic("Can't create task");
+            return;
+        }
+
+        if (!tasks[i]->Start(TaskRoutine, nullptr)) {
+            Panic("Can't start task");
+            return;
+        }
+    }
+
     for (;;)
     {
         cpu.Idle();
@@ -263,6 +288,13 @@ void BpStartup(void* ctx)
             cmd.Stop();
             break;
         }
+    }
+
+    for (size_t i = 0; i < Stdlib::ArraySize(tasks); i++)
+    {
+        tasks[i]->SetStopping();
+        tasks[i]->Wait();
+        tasks[i]->Put();
     }
 
     Shutdown();

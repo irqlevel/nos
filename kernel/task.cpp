@@ -5,6 +5,7 @@
 #include "cpu.h"
 #include "sched.h"
 #include "preempt.h"
+#include <mm/new.h>
 
 namespace Kernel
 {
@@ -18,7 +19,7 @@ Task::Task()
     , Magic(TaskMagic)
     , CpuAffinity(~((ulong)0))
     , Pid(InvalidObjectId)
-    , Stack(nullptr)
+    , StackPtr(nullptr)
     , Function(nullptr)
     , Ctx(nullptr)
 {
@@ -40,7 +41,7 @@ Task::Task(const char* fmt, ...)
 Task::~Task()
 {
     BugOn(TaskQueue != nullptr);
-    BugOn(Stack != nullptr);
+    BugOn(StackPtr != nullptr);
     Trace(0, "task 0x%p %s dtor", this, Name);
 }
 
@@ -48,10 +49,10 @@ void Task::Release()
 {
     BugOn(TaskQueue != nullptr);
 
-    if (Stack != nullptr)
+    if (StackPtr != nullptr)
     {
-        delete Stack;
-        Stack = nullptr;
+        delete StackPtr;
+        StackPtr = nullptr;
     }
 }
 
@@ -117,19 +118,19 @@ void Task::Wait()
 
 bool Task::PrepareStart(Func func, void* ctx)
 {
-    BugOn(Stack != nullptr);
+    BugOn(StackPtr != nullptr);
     BugOn(Function != nullptr);
 
-    Stack = new struct Stack(this);
-    if (Stack == nullptr)
+    StackPtr = Mm::TAlloc<Stack, 'Task'>(this);
+    if (StackPtr == nullptr)
     {
         return false;
     }
 
     if (!TaskTable::GetInstance().Insert(this))
     {
-        delete Stack;
-        Stack = nullptr;
+        delete StackPtr;
+        StackPtr = nullptr;
         return false;
     }
 
@@ -144,7 +145,7 @@ bool Task::Start(Func func, void* ctx)
     if (!PrepareStart(func, ctx))
         return false;
 
-    ulong* rsp = (ulong *)&Stack->StackTop[0];
+    ulong* rsp = (ulong *)&StackPtr->StackTop[0];
     *(--rsp) = (ulong)&Task::Exec;//setup return address
     Context* regs = (Context*)((ulong)rsp - sizeof(*regs));
     Stdlib::MemSet(regs, 0, sizeof(*regs));
@@ -165,7 +166,7 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
     if (!PrepareStart(func, ctx))
         return false;
 
-    SetRsp((ulong)&Stack->StackTop[0]);
+    SetRsp((ulong)&StackPtr->StackTop[0]);
 
     StartTime = GetBootTime();
     RunStartTime = GetBootTime();
@@ -186,20 +187,20 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
 Task* Task::GetCurrentTask()
 {
     ulong rsp = GetRsp();
-    struct Stack* stack = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
-    if (BugOn(stack->Magic1 != StackMagic1))
+    struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
+    if (BugOn(stackPtr->Magic1 != StackMagic1))
         return nullptr;
 
-    if (BugOn(stack->Magic2 != StackMagic2))
+    if (BugOn(stackPtr->Magic2 != StackMagic2))
         return nullptr;
 
-    if (BugOn(rsp < ((ulong)&stack->StackBottom[0] + Const::PageSize)))
+    if (BugOn(rsp < ((ulong)&stackPtr->StackBottom[0] + Const::PageSize)))
         return nullptr;
 
-    if (BugOn(rsp > (ulong)&stack->StackTop[0]))
+    if (BugOn(rsp > (ulong)&stackPtr->StackTop[0]))
         return nullptr;
 
-    Task* task = stack->Task;
+    Task* task = stackPtr->Task;
     if (BugOn(task->Magic != TaskMagic))
         return nullptr;
 
