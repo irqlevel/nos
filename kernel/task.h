@@ -128,12 +128,14 @@ private:
 
     bool PrepareStart(Func func, void* ctx);
 
-    Stack* Stack;
+    Stack* StackPtr;
     Func Function;
     void* Ctx;
     Atomic RefCounter;
 
     char Name[32];
+
+    static const ulong Tag = 'Task';
 };
 
 class TaskTable final

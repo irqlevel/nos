@@ -54,7 +54,7 @@ void Pool::Init(size_t blockSize, class PageAllocator* pgAlloc)
     PgAlloc = pgAlloc;
 }
 
-void *Pool::Alloc()
+void *Pool::Alloc(ulong tag)
 {
     Stdlib::AutoLock lock(Lock);
 
@@ -68,11 +68,11 @@ void *Pool::Alloc()
         page->BlockCount = 0;
         page->BlockList.Init();
 
-        ListEntry* block = reinterpret_cast<ListEntry*>(&page->Data[0]);
-        while (Stdlib::MemAdd(block, BlockSize) <= Stdlib::MemAdd(page, Const::PageSize))
+        Block* block = reinterpret_cast<Block*>(&page->Data[0]);
+        while (Stdlib::MemAdd(block, sizeof(*block) + BlockSize) <= Stdlib::MemAdd(page, Const::PageSize))
         {
-            page->BlockList.InsertTail(block);
-            block = static_cast<ListEntry*>(Stdlib::MemAdd(block, BlockSize));
+            page->BlockList.InsertTail(&block->Link);
+            block = static_cast<Block*>(Stdlib::MemAdd(block, sizeof(*block) + BlockSize));
             page->BlockCount++;
         }
         page->MaxBlockCount = page->BlockCount;
@@ -81,7 +81,7 @@ void *Pool::Alloc()
 
     Page* page = CONTAINING_RECORD(FreePageList.Flink, Page, Link);
     BugOn(page->BlockList.IsEmpty());
-    void* block = page->BlockList.RemoveHead();
+    Block* block = CONTAINING_RECORD(page->BlockList.RemoveHead(), Block, Link);
     page->BlockCount--;
     if (page->BlockList.IsEmpty())
     {
@@ -94,7 +94,8 @@ void *Pool::Alloc()
     if (BlockCount > PeekBlockCount)
         PeekBlockCount = BlockCount;
 
-    return block;
+    block->tag = tag;
+    return block + 1;
 }
 
 void Pool::Free(void* ptr)
@@ -106,8 +107,8 @@ void Pool::Free(void* ptr)
     Page* page = (Page*)((ulong)ptr & ~(Const::PageSize - 1));
     BugOn((ulong)page & (Const::PageSize - 1));
 
-    ListEntry* block = static_cast<ListEntry*>(ptr);
-    page->BlockList.InsertTail(block);
+    Block* block = static_cast<Block*>(ptr) - 1;
+    page->BlockList.InsertTail(&block->Link);
     page->BlockCount++;
     page->Link.RemoveInit();
     if (page->BlockCount == page->MaxBlockCount)

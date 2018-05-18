@@ -19,7 +19,7 @@ public:
     virtual ~Pool();
 
     void Init(size_t blockSize, PageAllocator* pgAlloc);
-    void* Alloc();
+    void* Alloc(ulong tag);
     void Free(void *ptr);
 
 private:
@@ -35,6 +35,11 @@ private:
     };
 
     static_assert(sizeof(Page) == Const::PageSize, "invalid size");
+
+    struct Block {
+        ListEntry Link;
+        ulong tag;
+    };
 
     size_t BlockSize;
     ListEntry FreePageList;

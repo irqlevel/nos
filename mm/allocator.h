@@ -16,7 +16,7 @@ namespace Mm
 class Allocator
 {
 public:
-	virtual void* Alloc(size_t size) = 0;
+	virtual void* Alloc(size_t size, ulong tag) = 0;
 	virtual void Free(void* ptr) = 0;
 };
 
@@ -29,7 +29,7 @@ public:
 		return Instance;
 	}
 
-	virtual void* Alloc(size_t size) override;
+	virtual void* Alloc(size_t size, ulong tag) override;
 	virtual void Free(void* ptr) override;
 private:
 	AllocatorImpl(PageAllocator* pgAlloc);

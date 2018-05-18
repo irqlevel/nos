@@ -7,40 +7,51 @@
 
 namespace Kernel
 {
-
 namespace Mm
 {
 
-void* New(size_t size) noexcept
+void* Alloc(size_t size, ulong tag)
 {
-
-	return AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Alloc(size);
+	return AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Alloc(size, tag);
 }
 
-void Delete(void* ptr) noexcept
+void Free(void* ptr)
 {
 	AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Free(ptr);
 }
 
+
 }
 }
 
-void* operator new(size_t size) noexcept
+void* operator new(size_t size)
 {
-	return Kernel::Mm::New(size);
+    return Kernel::Mm::Alloc(size, 0);
 }
 
-void* operator new[](size_t size) noexcept
+void* operator new[](size_t size)
 {
-	return Kernel::Mm::New(size);
+    return Kernel::Mm::Alloc(size, 0);
 }
 
-void operator delete(void* ptr) noexcept
+void* operator new(size_t size, void *ptr)
 {
-	Kernel::Mm::Delete(ptr);
+    (void)size;
+    return ptr;
 }
 
-void operator delete[](void* ptr) noexcept
+void* operator new[](size_t size, void *ptr)
 {
-	Kernel::Mm::Delete(ptr);
+    (void)size;
+    return ptr;
+}
+
+void operator delete(void* ptr)
+{
+	Kernel::Mm::Free(ptr);
+}
+
+void operator delete[](void* ptr)
+{
+	Kernel::Mm::Free(ptr);
 }

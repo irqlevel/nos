@@ -305,7 +305,7 @@ bool TestMultiTasking()
     Task *task[2] = {0};
     for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
     {
-        task[i] = new Task();
+        task[i] = Kernel::Mm::TAlloc<Task, 'Task'>();
         if (task[i] == nullptr)
         {
             for (size_t j = 0; j < i; j++)
