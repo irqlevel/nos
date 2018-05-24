@@ -5,8 +5,12 @@
 namespace Kernel
 {
 
+namespace Test {
+
 Stdlib::Error Test();
 
 bool TestMultiTasking();
+
+}
 
 }

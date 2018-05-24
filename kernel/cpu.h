@@ -54,9 +54,11 @@ private:
     ulong Index;
     ulong State;
     SpinLock Lock;
-    Task* Task;
+    Task* IdleTaskPtr;
     TaskQueue TaskQueue;
     Atomic IPIConter;
+
+    static const ulong Tag = 'Cpu ';
 };
 
 class CpuTable final

@@ -8,6 +8,7 @@
 
 #include <drivers/lapic.h>
 #include <drivers/pit.h>
+#include <mm/new.h>
 
 namespace Kernel
 {
@@ -15,7 +16,7 @@ namespace Kernel
 Cpu::Cpu()
     : Index(0)
     , State(0)
-    , Task(nullptr)
+    , IdleTaskPtr(nullptr)
 {
 }
 
@@ -75,10 +76,10 @@ void Cpu::Reset()
     BugOn(State == StateRunning);
     TaskQueue.Clear();
 
-    if (Task != nullptr)
+    if (IdleTaskPtr != nullptr)
     {
-        Task->Put();
-        Task = nullptr;
+        IdleTaskPtr->Put();
+        IdleTaskPtr = nullptr;
     }
 }
 
@@ -220,7 +221,7 @@ void CpuTable::ExitAllExceptSelf()
     ulong cpuMask = GetRunningCpus();
     for (ulong i = 0; i < 8 * sizeof(ulong); i++)
     {
-        if ((cpuMask & ((ulong)1 << i)) && (i != self.GetIndex()))
+        if ((cpuMask & (1UL << i)) && (i != self.GetIndex()))
         {
             auto& cpu = GetCpu(i);
             cpu.SetExiting();
@@ -239,7 +240,7 @@ void CpuTable::SendIPIAllExclude(ulong excludeIndex)
     ulong cpuMask = GetRunningCpus();
     for (ulong i = 0; i < 8 * sizeof(ulong); i++)
     {
-        if ((cpuMask & ((ulong)1 << i)) && (i != excludeIndex))
+        if ((cpuMask & (1UL << i)) && (i != excludeIndex))
         {
             auto& cpu = GetCpu(i);
 
@@ -253,7 +254,7 @@ void CpuTable::SendIPIAll()
     ulong cpuMask = GetRunningCpus();
     for (ulong i = 0; i < 8 * sizeof(ulong); i++)
     {
-        if ((cpuMask & ((ulong)1 << i)))
+        if ((cpuMask & (1UL << i)))
         {
             auto& cpu = GetCpu(i);
 
@@ -356,7 +357,7 @@ ulong CpuTable::GetRunningCpus()
     {
         auto& cpu = CpuArray[i];
         if (cpu.GetState() & Cpu::StateRunning)
-            result |= (ulong)1 << i;
+            result |= 1UL << i;
     }
 
     return result;
@@ -375,15 +376,15 @@ void CpuTable::Reset()
 
 bool Cpu::Run(Task::Func func, void *ctx)
 {
-    Task = new class Task("idle%u", Index);
-    if (Task == nullptr)
+    IdleTaskPtr = Mm::TAlloc<Task, Tag>("idle%u", Index);
+    if (IdleTaskPtr == nullptr)
     {
         return false;
     }
 
-    Task->SetCpuAffinity((ulong)1 << Index);
+    IdleTaskPtr->SetCpuAffinity(1UL << Index);
 
-    return Task->Run(TaskQueue, func, ctx);
+    return IdleTaskPtr->Run(TaskQueue, func, ctx);
 }
 
 }

@@ -50,9 +50,10 @@ private:
     Stdlib::RingBuffer<KeyEvent, Const::PageSize> Buf;
     char CmdLine[CmdSizeMax + 1];
     SpinLock Lock;
-    Task *Task;
+    Task *TaskPtr;
     bool Shutdown;
     bool Active;
+    static const ulong Tag = 'Cmd ';
 };
 
 }

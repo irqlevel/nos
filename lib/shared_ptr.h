@@ -3,6 +3,7 @@
 #include <kernel/trace.h>
 #include <kernel/atomic.h>
 #include <kernel/panic.h>
+#include <mm/new.h>
 
 namespace Stdlib
 {
@@ -217,7 +218,7 @@ public:
 
         if (object != nullptr)
         {
-            ObjectRef = new ObjectReference<T>(object);
+            ObjectRef = Kernel::Mm::TAlloc<ObjectReference<T>, 0>(object);
             if (ObjectRef == nullptr)
             {
                 return;
@@ -237,11 +238,11 @@ private:
 template<typename T, class... Args>
 SharedPtr<T> MakeShared(Args&&... args)
 {
-    ObjectReference<T>* objRef = new ObjectReference<T>(nullptr);
+    ObjectReference<T>* objRef = Kernel::Mm::TAlloc<ObjectReference<T>, 0>(nullptr);
     if (objRef == nullptr)
         return SharedPtr<T>();
 
-    T* object = new T(Stdlib::Forward<Args>(args)...);
+    T* object = Kernel::Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...);
     if (object == nullptr)
     {
         delete objRef;

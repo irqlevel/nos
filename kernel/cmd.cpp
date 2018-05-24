@@ -9,12 +9,13 @@
 #include <drivers/vga.h>
 #include <drivers/pci.h>
 #include <mm/page_table.h>
+#include <mm/new.h>
 
 namespace Kernel
 {
 
 Cmd::Cmd()
-    : Task(nullptr)
+    : TaskPtr(nullptr)
     , Shutdown(false)
     , Active(false)
 {
@@ -23,10 +24,10 @@ Cmd::Cmd()
 
 Cmd::~Cmd()
 {
-    if (Task != nullptr)
+    if (TaskPtr != nullptr)
     {
-        Task->Put();
-        Task = nullptr;
+        TaskPtr->Put();
+        TaskPtr = nullptr;
     }
 }
 
@@ -113,42 +114,42 @@ void Cmd::Stop()
 {
     if (Active)
     {
-        BugOn(Task == nullptr);
+        BugOn(TaskPtr == nullptr);
         Active = false;
-        Task->SetStopping();
-        Task->Wait();
+        TaskPtr->SetStopping();
+        TaskPtr->Wait();
     }
 }
 
 bool Cmd::Start()
 {
-    if (Task != nullptr)
+    if (TaskPtr != nullptr)
         return false;
 
-    auto task = new class Task("cmd");
+    auto task = Mm::TAlloc<Task, Tag>("cmd");
     if (task == nullptr)
         return false;
 
     {
         Stdlib::AutoLock lock(Lock);
-        if (Task == nullptr)
+        if (TaskPtr == nullptr)
         {
-            Task = task;
+            TaskPtr = task;
         }
     }
 
-    if (Task != task)
+    if (TaskPtr != task)
     {
         task->Put();
         return false;
     }
 
-    if (!Task->Start(&Cmd::RunFunc, this))
+    if (!TaskPtr->Start(&Cmd::RunFunc, this))
     {
         {
             Stdlib::AutoLock lock(Lock);
-            task = Task;
-            Task = nullptr;
+            task = TaskPtr;
+            TaskPtr = nullptr;
         }
         task->Put();
         return false;

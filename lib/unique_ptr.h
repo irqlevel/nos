@@ -3,7 +3,7 @@
 #include "stdlib.h"
 
 #include <kernel/panic.h>
-#include <mm/allocator.h>
+#include <mm/new.h>
 
 namespace Stdlib
 {
@@ -101,7 +101,7 @@ private:
 template<typename T, class... Args>
 UniquePtr<T> MakeUnique(Args&&... args)
 {
-    return UniquePtr<T>(new T(Stdlib::Forward<Args>(args)...));
+    return UniquePtr<T>(Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...));
 }
 
 }

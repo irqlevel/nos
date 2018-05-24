@@ -38,12 +38,13 @@ private:
 
     struct Block {
         ListEntry Link;
-        ulong tag;
+        ulong Tag;
     };
 
     size_t BlockSize;
     ListEntry FreePageList;
     ListEntry PageList;
+    ListEntry BlockList;
     SpinLock Lock;
     PageAllocator* PgAlloc;
     ulong BlockCount;

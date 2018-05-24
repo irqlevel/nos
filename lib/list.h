@@ -115,7 +115,7 @@ public:
 
     bool AddHead(const T& value)
     {
-        LinkedListNode* node = new LinkedListNode(value);
+        LinkedListNode* node = Kernel::Mm::TAlloc<LinkedListNode, 0>(value);
 
         if (!node)
         {
@@ -127,7 +127,7 @@ public:
 
     bool AddTail(const T& value)
     {
-        LinkedListNode* node = new LinkedListNode(value);
+        LinkedListNode* node = Kernel::Mm::TAlloc<LinkedListNode, 0>(value);
 
         if (!node)
         {
@@ -139,7 +139,7 @@ public:
 
     bool AddTail(T&& value)
     {
-        LinkedListNode* node = new LinkedListNode(Stdlib::Move(value));
+        LinkedListNode* node = Kernel::Mm::TAlloc<LinkedListNode, 0>(Stdlib::Move(value));
         if (!node)
         {
             return false;
