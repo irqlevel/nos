@@ -30,6 +30,11 @@ Pool::~Pool()
     if (BlockCount != 0)
         Trace(0, "0x%p blockSize %u blockCount %u", this, BlockSize, BlockCount);
 
+    for (auto link = BlockList.Flink; link != &BlockList; link = link->Flink) {
+        auto block = CONTAINING_RECORD(link, Block, Link);
+        Trace(0, "0x%p block 0x%p tag 0x%p", this, block, block->Tag);
+    }
+
     while (!FreePageList.IsEmpty())
     {
         PgAlloc->Free(FreePageList.RemoveHead());
@@ -94,7 +99,8 @@ void *Pool::Alloc(ulong tag)
     if (BlockCount > PeekBlockCount)
         PeekBlockCount = BlockCount;
 
-    block->tag = tag;
+    block->Tag = tag;
+    BlockList.InsertHead(&block->Link);
     return block + 1;
 }
 
@@ -108,6 +114,8 @@ void Pool::Free(void* ptr)
     BugOn((ulong)page & (Const::PageSize - 1));
 
     Block* block = static_cast<Block*>(ptr) - 1;
+    block->Link.RemoveInit();
+
     page->BlockList.InsertTail(&block->Link);
     page->BlockCount++;
     page->Link.RemoveInit();

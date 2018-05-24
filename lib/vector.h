@@ -4,6 +4,7 @@
 #include "error.h"
 
 #include <kernel/panic.h>
+#include <mm/new.h>
 
 namespace Stdlib
 {

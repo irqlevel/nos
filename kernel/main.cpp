@@ -84,7 +84,7 @@ void ApStartup(void *ctx)
 
     PreemptOnWait();
 
-    if (!TestMultiTasking())
+    if (!Test::TestMultiTasking())
     {
         Panic("Mulitasking test failed");
         return;
@@ -145,6 +145,8 @@ void Shutdown()
     Trace(0, "Bye");
     VgaTerm::GetInstance().Printf("Bye!\n");
 
+    //Prevent this idle0 task from destruction
+    //due too we now run inside it stack
     auto task = Task::GetCurrentTask();
     task->Get();
 
@@ -154,6 +156,8 @@ void Shutdown()
 
     Trace(0, "Finalized");
 
+    //Notify QEMU about shutdown through it's run with "-device isa-debug-exit,iobase=0xf4,iosize=0x04"
+    Outb(0xf4, 0x0);
     Hlt();
 }
 
@@ -164,6 +168,37 @@ void TaskRoutine(void *ctx)
     auto task = Task::GetCurrentTask();
     while (!task->IsStopping())
         Sleep(100 * Const::NanoSecsInMs);
+}
+
+static const ulong Tag = 'Main';
+static Task* SomeTasks[10];
+
+void StartSomeTasks()
+{
+    for (size_t i = 0; i < Stdlib::ArraySize(SomeTasks); i++)
+    {
+        SomeTasks[i] = Mm::TAlloc<Task, Tag>("SomeTask%u", i);
+        if (SomeTasks[i] == nullptr)
+        {
+            Panic("Can't create task");
+            return;
+        }
+
+        if (!SomeTasks[i]->Start(TaskRoutine, nullptr)) {
+            Panic("Can't start task");
+            return;
+        }
+    }
+}
+
+void StopSomeTasks()
+{
+    for (size_t i = 0; i < Stdlib::ArraySize(SomeTasks); i++)
+    {
+        SomeTasks[i]->SetStopping();
+        SomeTasks[i]->Wait();
+        SomeTasks[i]->Put();
+    }
 }
 
 void BpStartup(void* ctx)
@@ -238,7 +273,7 @@ void BpStartup(void* ctx)
     ulong cpuMask = cpus.GetRunningCpus();
     for (ulong i = 0; i < 8 * sizeof(ulong); i++)
     {
-        if (cpuMask & ((ulong)1 << i))
+        if (cpuMask & (1UL << i))
         {
             if (i != cpu.GetIndex())
             {
@@ -249,11 +284,13 @@ void BpStartup(void* ctx)
 
     VgaTerm::GetInstance().Printf("Task test...\n");
 
-    if (!TestMultiTasking())
+    if (!Test::TestMultiTasking())
     {
         Panic("Mulitasking test failed");
         return;
     }
+
+    StartSomeTasks();
 
     VgaTerm::GetInstance().Printf("Idle looping...\n");
 
@@ -261,22 +298,6 @@ void BpStartup(void* ctx)
     {
         Panic("Can't start cmd");
         return;
-    }
-
-    Task* tasks[1];
-    for (size_t i = 0; i < Stdlib::ArraySize(tasks); i++)
-    {
-        tasks[i] = Mm::TAlloc<Task, 'Task'>("task%d", i);
-        if (tasks[i] == nullptr)
-        {
-            Panic("Can't create task");
-            return;
-        }
-
-        if (!tasks[i]->Start(TaskRoutine, nullptr)) {
-            Panic("Can't start task");
-            return;
-        }
     }
 
     for (;;)
@@ -290,12 +311,7 @@ void BpStartup(void* ctx)
         }
     }
 
-    for (size_t i = 0; i < Stdlib::ArraySize(tasks); i++)
-    {
-        tasks[i]->SetStopping();
-        tasks[i]->Wait();
-        tasks[i]->Put();
-    }
+    StopSomeTasks();
 
     Shutdown();
 }
@@ -412,7 +428,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     Trace(0, "Before test");
 
-    err = Test();
+    err = Test::Test();
     if (!err.Ok())
     {
         TraceError(err, "Test failed");

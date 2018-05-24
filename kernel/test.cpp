@@ -14,6 +14,11 @@
 namespace Kernel
 {
 
+namespace Test
+{
+
+static const ulong Tag = 'Test';
+
 Stdlib::Error TestBtree()
 {
     Stdlib::Error err;
@@ -305,7 +310,7 @@ bool TestMultiTasking()
     Task *task[2] = {0};
     for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
     {
-        task[i] = Kernel::Mm::TAlloc<Task, 'Task'>();
+        task[i] = Kernel::Mm::TAlloc<Task, Tag>();
         if (task[i] == nullptr)
         {
             for (size_t j = 0; j < i; j++)
@@ -345,6 +350,8 @@ delTasks:
     }
 
     return result;
+}
+
 }
 
 }

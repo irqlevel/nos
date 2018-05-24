@@ -17,7 +17,7 @@ Task::Task()
     , Flags(0)
     , Prev(nullptr)
     , Magic(TaskMagic)
-    , CpuAffinity(~((ulong)0))
+    , CpuAffinity(~(0UL))
     , Pid(InvalidObjectId)
     , StackPtr(nullptr)
     , Function(nullptr)
@@ -121,7 +121,7 @@ bool Task::PrepareStart(Func func, void* ctx)
     BugOn(StackPtr != nullptr);
     BugOn(Function != nullptr);
 
-    StackPtr = Mm::TAlloc<Stack, 'Task'>(this);
+    StackPtr = Mm::TAlloc<Stack, Tag>(this);
     if (StackPtr == nullptr)
     {
         return false;
@@ -249,7 +249,7 @@ TaskQueue* Task::SelectNextTaskQueue()
     {
         for (ulong i = 0; i < 8 * sizeof(ulong); i++)
         {
-            if (cpuMask & ((ulong)1 << i))
+            if (cpuMask & (1UL << i))
             {
                 auto& candTaskQueue = CpuTable::GetInstance().GetCpu(i).GetTaskQueue();
                 if (&candTaskQueue == TaskQueue)
