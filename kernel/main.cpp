@@ -161,7 +161,7 @@ void Shutdown()
     Hlt();
 }
 
-void TaskRoutine(void *ctx)
+void SomeTaskRoutine(void *ctx)
 {
     (void)ctx;
 
@@ -184,7 +184,7 @@ void StartSomeTasks()
             return;
         }
 
-        if (!SomeTasks[i]->Start(TaskRoutine, nullptr)) {
+        if (!SomeTasks[i]->Start(SomeTaskRoutine, nullptr)) {
             Panic("Can't start task");
             return;
         }
