@@ -69,6 +69,8 @@ OBJS = $(CXX_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
 
 all: check nos.iso
 
+test: check nos-test.iso
+
 nocheck: nos.iso
 
 check: $(CXX_SRC)
@@ -83,6 +85,18 @@ nos.iso: build/grub.cfg kernel64.elf
 	cp kernel64.elf bin/kernel64.elf
 	rm -rf kernel64.elf
 	cp build/grub.cfg iso/boot/grub/grub.cfg
+	$(MKRESCUE) -o nos.iso iso
+	rm -rf iso
+
+nos-test.iso: build/grub-test.cfg kernel64.elf
+	rm -rf iso
+	rm -rf bin
+	mkdir -p iso/boot/grub
+	mkdir -p bin
+	cp kernel64.elf iso/boot/kernel64.elf
+	cp kernel64.elf bin/kernel64.elf
+	rm -rf kernel64.elf
+	cp build/grub-test.cfg iso/boot/grub/grub.cfg
 	$(MKRESCUE) -o nos.iso iso
 	rm -rf iso
 

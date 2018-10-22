@@ -17,6 +17,7 @@ Cpu::Cpu()
     : Index(0)
     , State(0)
     , IdleTaskPtr(nullptr)
+    , TaskQueue(this)
 {
 }
 
@@ -169,7 +170,7 @@ bool CpuTable::StartAll()
         }
     }
 
-    Pit::GetInstance().Wait(10 * Const::NanoSecsInMs); // 10ms
+    Pit::GetInstance().Wait(1000 * Const::NanoSecsInMs); // 1000ms
 
     {
         Stdlib::AutoLock lock(Lock);
@@ -182,7 +183,7 @@ bool CpuTable::StartAll()
         }
     }
 
-    Pit::GetInstance().Wait(100 * Const::NanoSecsInMs); // 100ms
+    Pit::GetInstance().Wait(1000 * Const::NanoSecsInMs); // 1000ms
 
     {
         Stdlib::AutoLock lock(Lock);
@@ -384,7 +385,13 @@ bool Cpu::Run(Task::Func func, void *ctx)
 
     IdleTaskPtr->SetCpuAffinity(1UL << Index);
 
-    return IdleTaskPtr->Run(TaskQueue, func, ctx);
+    if (!IdleTaskPtr->Run(TaskQueue, func, ctx)) {
+        IdleTaskPtr->Put();
+        IdleTaskPtr = nullptr;
+        return false;
+    }
+
+    return true;
 }
 
 }

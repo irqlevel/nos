@@ -5,6 +5,7 @@
 #include "cpu.h"
 #include "time.h"
 #include "watchdog.h"
+#include "parameters.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
@@ -86,6 +87,10 @@ void Cmd::ProcessCmd(const char *cmd)
     {
         Pci::GetInstance().Dump(vga);
     }
+    else if (Stdlib::StrCmp(cmd, "cmdline") == 0)
+    {
+        vga.Printf("%s\n", Parameters::GetInstance().GetCmdline());
+    }
     else if (Stdlib::StrCmp(cmd, "help") == 0)
     {
         vga.Printf("cls - clear screen\n");
@@ -96,6 +101,7 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Printf("watchdog - show watchdog stats\n");
         vga.Printf("memusage - show memory usage stats\n");
         vga.Printf("pci - show pci devices\n");
+        vga.Printf("cmdline - show cmdline\n");
         vga.Printf("help - help\n");
     }
     else

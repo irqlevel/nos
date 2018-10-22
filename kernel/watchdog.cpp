@@ -57,6 +57,7 @@ void Watchdog::RegisterSpinLock(SpinLock& lock)
     auto& list = SpinLockList[i];
 
     ulong flags = listLock.LockIrqSave();
+    BugOn(!lock.WatchdogListEntry.IsEmpty());
     list.InsertTail(&lock.WatchdogListEntry);
     SpinLockCounter.Inc();
     listLock.UnlockIrqRestore(flags);
@@ -68,9 +69,8 @@ void Watchdog::UnregisterSpinLock(SpinLock& lock)
     auto& listLock = SpinLockListLock[i];
 
     ulong flags = listLock.LockIrqSave();
-    if (!lock.WatchdogListEntry.IsEmpty())
-    {
-        lock.WatchdogListEntry.Remove();
+    if (!lock.WatchdogListEntry.IsEmpty()) {
+        lock.WatchdogListEntry.RemoveInit();
         SpinLockCounter.Dec();
     }
     listLock.UnlockIrqRestore(flags);

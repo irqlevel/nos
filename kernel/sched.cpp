@@ -10,7 +10,8 @@
 namespace Kernel
 {
 
-TaskQueue::TaskQueue()
+TaskQueue::TaskQueue(Cpu *owner)
+    : Owner(owner)
 {
     Stdlib::AutoLock lock(Lock);
     TaskList.Init();
@@ -22,29 +23,28 @@ TaskQueue::TaskQueue()
 void TaskQueue::SwitchComplete(Task* curr)
 {
     Task* prev = curr->Prev;
-
     curr->Prev = nullptr;
+
     curr->Lock.Unlock();
     prev->Lock.Unlock();
     Lock.Unlock();
 
     if (prev->State.Get() != Task::StateExited)
     {
+/*
         auto taskQueue = prev->SelectNextTaskQueue();
         if (taskQueue != nullptr)
         {
-            prev->Get();
             prev->TaskQueue->Remove(prev);
             taskQueue->Insert(prev);
-            prev->Put();
         }
-
+*/
         prev->PreemptDisableCounter.Dec();
     } else {
-
         prev->PreemptDisableCounter.Dec();
         prev->Put();
     }
+    prev->Put();
 }
 
 void TaskQueue::SwitchComplete(void* ctx)
@@ -70,6 +70,7 @@ void TaskQueue::Switch(Task* next, Task* curr)
     BugOn(next->State.Get() == Task::StateExited);
     next->State.Set(Task::StateRunning);
     next->RunStartTime = GetBootTime();
+    curr->Get();
     next->Prev = curr;
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
@@ -217,6 +218,11 @@ TaskQueue::~TaskQueue()
 long TaskQueue::GetSwitchContextCounter()
 {
     return SwitchContextCounter.Get();
+}
+
+Cpu* TaskQueue::GetCpu()
+{
+    return Owner;
 }
 
 void Schedule()

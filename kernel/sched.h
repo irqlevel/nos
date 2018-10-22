@@ -9,10 +9,11 @@
 namespace Kernel
 {
 
+class Cpu;
 class TaskQueue
 {
 public:
-    TaskQueue();
+    TaskQueue(Cpu* owner);
     ~TaskQueue();
 
     void Insert(Task* task);
@@ -23,6 +24,8 @@ public:
     void Clear();
 
     long GetSwitchContextCounter();
+
+    Cpu* GetCpu();
 
 private:
     TaskQueue(const TaskQueue &other) = delete;
@@ -44,6 +47,7 @@ private:
 
     Atomic ScheduleCounter;
     Atomic SwitchContextCounter;
+    Cpu* Owner;
 };
 
 

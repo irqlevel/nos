@@ -84,10 +84,13 @@ void ApStartup(void *ctx)
 
     PreemptOnWait();
 
-    if (!Test::TestMultiTasking())
+    if (Parameters::GetInstance().IsTest())
     {
-        Panic("Mulitasking test failed");
-        return;
+        if (!Test::TestMultiTasking())
+        {
+            Panic("Mulitasking test failed");
+            return;
+        }
     }
 
     for (;;)
@@ -103,8 +106,8 @@ void ApMain2()
     Gdt::GetInstance().Save();
     Idt::GetInstance().Save();
 
-    if (Parameters::GetInstance().IsSmpOff())
-        Panic("AP cpu started while smp is off");
+    if (!Parameters::GetInstance().IsSmp())
+        Panic("AP cpu started while smp disabled");
 
     Lapic::Enable();
 
@@ -146,7 +149,7 @@ void Shutdown()
     VgaTerm::GetInstance().Printf("Bye!\n");
 
     //Prevent this idle0 task from destruction
-    //due too we now run inside it stack
+    //due too we now run inside it's stack
     auto task = Task::GetCurrentTask();
     task->Get();
 
@@ -159,46 +162,6 @@ void Shutdown()
     //Notify QEMU about shutdown through it's run with "-device isa-debug-exit,iobase=0xf4,iosize=0x04"
     Outb(0xf4, 0x0);
     Hlt();
-}
-
-void SomeTaskRoutine(void *ctx)
-{
-    (void)ctx;
-
-    auto task = Task::GetCurrentTask();
-    while (!task->IsStopping())
-        Sleep(100 * Const::NanoSecsInMs);
-}
-
-static const ulong Tag = 'Main';
-static Task* SomeTasks[10];
-
-void StartSomeTasks()
-{
-    for (size_t i = 0; i < Stdlib::ArraySize(SomeTasks); i++)
-    {
-        SomeTasks[i] = Mm::TAlloc<Task, Tag>("SomeTask%u", i);
-        if (SomeTasks[i] == nullptr)
-        {
-            Panic("Can't create task");
-            return;
-        }
-
-        if (!SomeTasks[i]->Start(SomeTaskRoutine, nullptr)) {
-            Panic("Can't start task");
-            return;
-        }
-    }
-}
-
-void StopSomeTasks()
-{
-    for (size_t i = 0; i < Stdlib::ArraySize(SomeTasks); i++)
-    {
-        SomeTasks[i]->SetStopping();
-        SomeTasks[i]->Wait();
-        SomeTasks[i]->Put();
-    }
 }
 
 void BpStartup(void* ctx)
@@ -253,7 +216,7 @@ void BpStartup(void* ctx)
 
     Trace(0, "Before cpus start");
 
-    if (!Parameters::GetInstance().IsSmpOff())
+    if (Parameters::GetInstance().IsSmp())
     {
         if (!cpus.StartAll())
         {
@@ -282,15 +245,17 @@ void BpStartup(void* ctx)
         }
     }
 
-    VgaTerm::GetInstance().Printf("Task test...\n");
-
-    if (!Test::TestMultiTasking())
-    {
-        Panic("Mulitasking test failed");
-        return;
+    if (Parameters::GetInstance().IsTest()) {
+        VgaTerm::GetInstance().Printf("Task test...\n");
+        if (!Test::TestMultiTasking())
+        {
+            Panic("Mulitasking test failed");
+            return;
+        }
     }
 
-    StartSomeTasks();
+    if (Parameters::GetInstance().IsTest())
+        Test::TestStartSomeTasks();
 
     VgaTerm::GetInstance().Printf("Idle looping...\n");
 
@@ -303,7 +268,7 @@ void BpStartup(void* ctx)
     for (;;)
     {
         cpu.Idle();
-        if (cmd.ShouldShutdown())
+        if (cmd.ShouldShutdown() || Parameters::GetInstance().IsTest())
         {
             Trace(0, "Shutdown");
             cmd.Stop();
@@ -311,7 +276,8 @@ void BpStartup(void* ctx)
         }
     }
 
-    StopSomeTasks();
+    if (Parameters::GetInstance().IsTest())
+        Test::TestStopSomeTasks();
 
     Shutdown();
 }
@@ -388,20 +354,8 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     ExceptionTable::GetInstance().RegisterExceptionHandlers();
     Idt::GetInstance().Save();
 
-    //Test paging
-    {
-        Trace(0, "Test paging");
-        auto page = pt.AllocPage();
-        if (!page) {
-            Panic("Can't alloc page");
-            break;
-        }
-        auto va = pt.TmpMapPage(page->GetPhyAddress());
-        Trace(0, "va 0x%p pha 0x%p", va, page->GetPhyAddress());
-        Stdlib::MemSet((void *)va, 0, Const::PageSize);
-        pt.TmpUnmapPage(va);
-        pt.FreePage(page);
-    }
+    if (Parameters::GetInstance().IsTest())
+        Test::TestPaging();
 
     VgaTerm::GetInstance().Printf("Hello!\n");
 
@@ -424,20 +378,19 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     Mm::AllocatorImpl::GetInstance(&Mm::PageAllocatorImpl::GetInstance());
 
-    VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
-
-    Trace(0, "Before test");
-
-    err = Test::Test();
-    if (!err.Ok())
-    {
-        TraceError(err, "Test failed");
-        Panic("Self test failed");
-        break;
+    if (Parameters::GetInstance().IsTest()) {
+        VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
+        Trace(0, "Before test");
+        err = Test::Test();
+        if (!err.Ok())
+        {
+            TraceError(err, "Test failed");
+            Panic("Self test failed");
+            break;
+        }
+        Trace(0, "After test");
+        VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
     }
-
-    Trace(0, "After test");
-    VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
 
     auto& pci = Pci::GetInstance();
     pci.Scan();

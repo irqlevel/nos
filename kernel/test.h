@@ -11,6 +11,12 @@ Stdlib::Error Test();
 
 bool TestMultiTasking();
 
+void TestStartSomeTasks();
+
+void TestStopSomeTasks();
+
+void TestPaging();
+
 }
 
 }

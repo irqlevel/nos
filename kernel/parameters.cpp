@@ -8,8 +8,10 @@ namespace Kernel
 Parameters::Parameters()
     : TraceVga(false)
     , PanicVga(false)
-    , SmpOff(false)
+    , Smp(true)
+    , Test(false)
 {
+    Cmdline[0] = '\0';
 }
 
 Parameters::~Parameters()
@@ -26,9 +28,19 @@ bool Parameters::IsPanicVga()
     return PanicVga;
 }
 
-bool Parameters::IsSmpOff()
+bool Parameters::IsSmp()
 {
-    return SmpOff;
+    return Smp;
+}
+
+bool Parameters::IsTest()
+{
+    return Test;
+}
+
+const char* Parameters::GetCmdline()
+{
+    return Cmdline;
 }
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
@@ -60,7 +72,7 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     param[keyLen] = '\0';
     const char *value = &param[keyLen + 1];
 
-    Trace(0, "Key %s value %s", key, value);
+    Trace(0, "%s=%s", key, value);
 
     if (Stdlib::StrCmp(key, "trace") == 0)
     {
@@ -73,7 +85,7 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
             Trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    if (Stdlib::StrCmp(key, "panic") == 0)
+    else if (Stdlib::StrCmp(key, "panic") == 0)
     {
         if (Stdlib::StrCmp(value, "vga") == 0)
         {
@@ -84,11 +96,30 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
             Trace(0, "Unknown value %s, key %s", value, key);
         }        
     }
-    if (Stdlib::StrCmp(key, "smp") == 0)
+    else if (Stdlib::StrCmp(key, "smp") == 0)
     {
-        if (Stdlib::StrCmp(value, "off") == 0)
+        if (Stdlib::StrCmp(value, "y") == 0)
         {
-            SmpOff = true;
+            Smp = true;
+        }
+        else if (Stdlib::StrCmp(value, "n") == 0)
+        {
+            Smp = false;
+        }
+        else
+        {
+            Trace(0, "Unknown value %s, key %s", value, key);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "test") == 0)
+    {
+        if (Stdlib::StrCmp(value, "y") == 0)
+        {
+            Test = true;
+        }
+        else if (Stdlib::StrCmp(value, "n") == 0)
+        {
+            Test = false;
         }
         else
         {

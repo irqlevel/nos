@@ -203,6 +203,8 @@ Task* Task::GetCurrentTask()
     Task* task = stackPtr->Task;
     if (BugOn(task->Magic != TaskMagic))
         return nullptr;
+    if (BugOn(task->StackPtr != stackPtr))
+        return nullptr;
 
     return task;
 }
@@ -275,6 +277,12 @@ TaskQueue* Task::SelectNextTaskQueue()
     return taskQueue;
 }
 
+Cpu* Task::GetCpu()
+{
+    Stdlib::AutoLock lock(Lock);
+    return (TaskQueue != nullptr) ? TaskQueue->GetCpu() : nullptr;
+}
+
 TaskTable::TaskTable()
 {
 }
@@ -341,7 +349,7 @@ Task* TaskTable::Lookup(ulong pid)
 
 void TaskTable::Ps(Stdlib::Printer& printer)
 {
-    printer.Printf("pid state flags runtime ctxswitches name\n");
+    printer.Printf("pid cpu state flags runtime ctxswitches name\n");
 
     for (size_t i = 0; i < Stdlib::ArraySize(TaskList); i++)
     {
@@ -352,8 +360,9 @@ void TaskTable::Ps(Stdlib::Printer& printer)
             currEntry = currEntry->Flink)
         {
             Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
-            printer.Printf("%u %u 0x%p %u.%u %u %s\n",
-                task->Pid, task->State.Get(), task->Flags.Get(), task->Runtime.GetSecs(),
+            Cpu* cpu = task->GetCpu();
+            printer.Printf("%u %u %u 0x%p %u.%u %u %s\n",
+                task->Pid, (cpu != nullptr) ? cpu->GetIndex() : ~0UL, task->State.Get(), task->Flags.Get(), task->Runtime.GetSecs(),
                 task->Runtime.GetUsecs(), task->ContextSwitches.Get(), task->GetName());
         }
     }

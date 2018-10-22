@@ -16,7 +16,10 @@ public:
 
     bool IsTraceVga();
     bool IsPanicVga();
-    bool IsSmpOff();
+    bool IsSmp();
+    bool IsTest();
+
+    const char* GetCmdline();
 
     Parameters();
     ~Parameters();
@@ -26,6 +29,7 @@ private:
     char Cmdline[256];
     bool TraceVga;
     bool PanicVga;
-    bool SmpOff;
+    bool Smp;
+    bool Test;
 };
 }

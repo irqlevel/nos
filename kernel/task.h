@@ -13,6 +13,8 @@
 namespace Kernel
 {
 
+class Cpu;
+
 class Task final : public Object
 {
 public:
@@ -48,6 +50,7 @@ public:
         ulong Magic2;
 
     private:
+        Stack() = delete;
         Stack(const Stack& other) = delete;
         Stack(Stack&& other) = delete;
         Stack& operator=(const Stack& other) = delete;
@@ -90,6 +93,8 @@ public:
     static const long StateExited = 3;
 
     static const long FlagStoppingBit = 1;
+
+    Cpu* GetCpu();
 
 public:
     Stdlib::ListEntry ListEntry;

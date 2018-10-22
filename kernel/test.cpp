@@ -11,6 +11,8 @@
 #include <lib/ring_buffer.h>
 #include <lib/vector.h>
 
+#include <mm/page_table.h>
+
 namespace Kernel
 {
 
@@ -350,6 +352,61 @@ delTasks:
     }
 
     return result;
+}
+
+static Task* SomeTasks[10];
+
+void TestSomeTaskRoutine(void *ctx)
+{
+    (void)ctx;
+
+    auto task = Task::GetCurrentTask();
+    while (!task->IsStopping())
+        Sleep(100 * Const::NanoSecsInMs);
+}
+
+void TestStartSomeTasks()
+{
+    for (size_t i = 0; i < Stdlib::ArraySize(SomeTasks); i++)
+    {
+        SomeTasks[i] = Mm::TAlloc<Task, Tag>("SomeTask%u", i);
+        if (SomeTasks[i] == nullptr)
+        {
+            Panic("Can't create task");
+            return;
+        }
+
+        if (!SomeTasks[i]->Start(TestSomeTaskRoutine, nullptr)) {
+            Panic("Can't start task");
+            return;
+        }
+    }
+}
+
+void TestStopSomeTasks()
+{
+    for (size_t i = 0; i < Stdlib::ArraySize(SomeTasks); i++)
+    {
+        SomeTasks[i]->SetStopping();
+        SomeTasks[i]->Wait();
+        SomeTasks[i]->Put();
+    }
+}
+
+void TestPaging()
+{
+    auto& pt = Mm::PageTable::GetInstance();
+    Trace(0, "Test paging");
+    auto page = pt.AllocPage();
+    if (!page) {
+        Panic("Can't alloc page");
+        return;
+    }
+    auto va = pt.TmpMapPage(page->GetPhyAddress());
+    Trace(0, "va 0x%p pha 0x%p", va, page->GetPhyAddress());
+    Stdlib::MemSet((void *)va, 0, Const::PageSize);
+    pt.TmpUnmapPage(va);
+    pt.FreePage(page);
 }
 
 }
