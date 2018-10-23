@@ -2,6 +2,7 @@
 
 #include <lib/stdlib.h>
 #include "atomic.h"
+#include "asm.h"
 
 namespace Kernel
 {
@@ -43,13 +44,11 @@ do {                                                                \
         (ulong)__LINE__, ##__VA_ARGS__);                            \
 } while (false)
 
-static inline bool DoBugOn(const char *func, const char *file, int line)
-{
-    auto& panicker = Kernel::Panicker::GetInstance();
-    panicker.DoPanic("PANIC:%s():%s,%u: BUG\n", func, file, (ulong)line);
-    return true;
-}
-
 #define BugOn(condition)    \
-    (unlikely(condition)) ? DoBugOn(__func__, Stdlib::TruncateFileName(__FILE__), __LINE__) : \
-    false
+    do {    \
+        if (unlikely(condition))    \
+            InvalidOpcode();    \
+    } while (false)
+
+#define Bug()   \
+    BugOn(true)

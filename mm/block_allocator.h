@@ -32,7 +32,7 @@ private:
 
     using ListEntry = Stdlib::ListEntry;
 
-    static const ulong Magic = 0xbeadbead;
+    static const ulong Magic = 0xbeadbeadbeadbead;
 
     struct BlockEntry
     {

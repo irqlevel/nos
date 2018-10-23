@@ -45,8 +45,7 @@ const char* Parameters::GetCmdline()
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
 {
-    if (BugOn(start >= end))
-        return false;
+    BugOn(start >= end);
 
     const size_t maxLen = 20;
     char param[maxLen + 1];

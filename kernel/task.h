@@ -20,10 +20,10 @@ class Task final : public Object
 public:
 
     static const ulong StackSize = 8 * Const::PageSize;
-    static const ulong StackMagic1 = 0xBCDEBCDE;
-    static const ulong StackMagic2 = 0xCBDECBDE;
+    static const ulong StackMagic1 = 0xBCDEBCDEBCDEBCDE;
+    static const ulong StackMagic2 = 0xCBDECBDECBDECBDE;
 
-    static const ulong TaskMagic = 0xCBDECBEF;
+    static const ulong TaskMagic = 0xCBDECBEFCBDECBEF;
 
     struct Stack final
     {

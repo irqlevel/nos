@@ -57,10 +57,7 @@ void* AllocatorImpl::Alloc(size_t size, ulong tag)
 	size_t log = Log2(reqSize);
 
 	Trace(AllocatorLL, "0x%p size 0x%p log 0x%p", this, size, log);
-	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Stdlib::ArraySize(Pool)))
-	{
-		return nullptr;
-	}
+	BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Stdlib::ArraySize(Pool));
 
 	header = static_cast<Header*>(Pool[log - StartLog].Alloc(tag));
 	if (header == nullptr)
@@ -91,10 +88,7 @@ void AllocatorImpl::Free(void* ptr)
 	}
 
 	size_t log = Log2(header->Size + sizeof(*header));
-	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Stdlib::ArraySize(Pool)))
-	{
-		return;
-	}
+	BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Stdlib::ArraySize(Pool));
 
 	Pool[log - StartLog].Free(header);
 }

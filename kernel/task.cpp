@@ -188,23 +188,14 @@ Task* Task::GetCurrentTask()
 {
     ulong rsp = GetRsp();
     struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
-    if (BugOn(stackPtr->Magic1 != StackMagic1))
-        return nullptr;
-
-    if (BugOn(stackPtr->Magic2 != StackMagic2))
-        return nullptr;
-
-    if (BugOn(rsp < ((ulong)&stackPtr->StackBottom[0] + Const::PageSize)))
-        return nullptr;
-
-    if (BugOn(rsp > (ulong)&stackPtr->StackTop[0]))
-        return nullptr;
+    BugOn(stackPtr->Magic1 != StackMagic1);
+    BugOn(stackPtr->Magic2 != StackMagic2);
+    BugOn(rsp < ((ulong)&stackPtr->StackBottom[0] + Const::PageSize));
+    BugOn(rsp > (ulong)&stackPtr->StackTop[0]);
 
     Task* task = stackPtr->Task;
-    if (BugOn(task->Magic != TaskMagic))
-        return nullptr;
-    if (BugOn(task->StackPtr != stackPtr))
-        return nullptr;
+    BugOn(task->Magic != TaskMagic);
+    BugOn(task->StackPtr != stackPtr);
 
     return task;
 }

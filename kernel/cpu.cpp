@@ -28,11 +28,8 @@ ulong Cpu::GetIndex()
 
 void Cpu::Idle()
 {
-    if (BugOn(!(State & StateRunning)))
-        return;
-
-    if (BugOn(!IsInterruptEnabled()))
-        return;
+    BugOn(!(State & StateRunning));
+    BugOn(!IsInterruptEnabled());
 
     Hlt();
 }
@@ -46,8 +43,7 @@ ulong Cpu::GetState()
 void Cpu::SetRunning()
 {
     Stdlib::AutoLock lock(Lock);
-    if (BugOn(State & StateRunning))
-        return;
+    BugOn(State & StateRunning);
 
     State |= StateRunning;
 }
@@ -61,9 +57,7 @@ void Cpu::SetExiting()
 void Cpu::Init(ulong index)
 {
     Stdlib::AutoLock lock(Lock);
-    if (BugOn(State & StateInited))
-        return;
-
+    BugOn(State & StateInited);
     Index = index;
     State |= StateInited;
 
@@ -135,12 +129,10 @@ bool CpuTable::SetBspIndex(ulong index)
 {
     Stdlib::AutoLock lock(Lock);
 
-    if (BugOn(index >= Stdlib::ArraySize(CpuArray)))
-        return false;
+    BugOn(index >= Stdlib::ArraySize(CpuArray));
 
     auto& cpu = CpuArray[BspIndex];
-    if (BugOn(!(cpu.GetState() & Cpu::StateInited)))
-        return false;
+    BugOn(!(cpu.GetState() & Cpu::StateInited));
 
     cpu.SetRunning();
     BspIndex = index;
@@ -329,8 +321,7 @@ void Cpu::SendIPISelf()
 {
     Stdlib::AutoLock lock(Lock);
 
-    if (BugOn(!(State & Cpu::StateRunning)))
-        return;
+    BugOn(!(State & Cpu::StateRunning));
 
     if (State & Cpu::StateExited)
         return;
@@ -342,8 +333,7 @@ void CpuTable::SendIPI(ulong index)
 {
     Stdlib::AutoLock lock(Lock);
 
-    if (BugOn(index >= Stdlib::ArraySize(CpuArray)))
-        return;
+    BugOn(index >= Stdlib::ArraySize(CpuArray));
 
     auto& cpu = CpuArray[index];
     cpu.SendIPISelf();

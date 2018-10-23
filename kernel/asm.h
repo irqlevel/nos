@@ -113,6 +113,7 @@ void LongJmp(void *ctx, long result);
 #endif
 
 #define Barrier() __asm__ __volatile__("": : :"memory")
+#define InvalidOpcode() __asm__ __volatile__("ud2")
 
 static inline void Invlpg(unsigned long addr)
 {

@@ -99,19 +99,15 @@ restart:
             {
                 BtreeNodePtr preChild = node->GetChild(i);
                 BtreeNodePtr sucChild = node->GetChild(i + 1);
-                if (BugOn(preChild.Get() == nullptr))
-                    return false;
-
-                if (BugOn(sucChild.Get() == nullptr))
-                    return false;
+                BugOn(preChild.Get() == nullptr);
+                BugOn(sucChild.Get() == nullptr);
 
                 if (preChild->GetKeyCount() >= T)
                 {
                     size_t preIndex;
                     auto preNode = preChild->FindLeftMost(preChild, preIndex);
 
-                    if (BugOn(preNode.Get() == nullptr))
-                        return false;
+                    BugOn(preNode.Get() == nullptr);
 
                     node->CopyKey(i, preNode, preIndex);
                     node = preNode;
@@ -124,8 +120,7 @@ restart:
                     size_t sucIndex;
                     auto sucNode = sucChild->FindRightMost(sucChild, sucIndex);
 
-                    if (BugOn(sucNode.Get() == nullptr))
-                        return false;
+                    BugOn(sucNode.Get() == nullptr);
 
                     node->CopyKey(i, sucNode, sucIndex);
                     node = sucNode;
@@ -179,8 +174,7 @@ restart:
                 Trace(BtreeLL, "node 0x%p find key index %lu", node.Get(), i);
                 node = node->ChildBalance(node, i);
 
-                if (BugOn(node.Get() == nullptr))
-                    return false;
+                BugOn(node.Get() == nullptr);
 
                 goto restart;
             }
@@ -238,8 +232,7 @@ restart:
                 }
                 else
                 {
-                    if (BugOn(curr.Get() != Root.Get()))
-                        return;
+                    BugOn(curr.Get() != Root.Get());
 
                     goto finish;
                 }
@@ -257,8 +250,7 @@ restart:
         }
 
 finish:
-        if (BugOn(Root->GetChildCount() != 0))
-            return;
+        BugOn(Root->GetChildCount() != 0);
 
         Root.Reset();
     }
@@ -294,8 +286,7 @@ private:
 
     size_t MinDepth(const BtreeNodePtr& node)
     {
-        if (BugOn(node.Get() == nullptr))
-            return 0;
+        BugOn(node.Get() == nullptr);
 
         if (node->IsLeaf())
         {
@@ -314,8 +305,7 @@ private:
 
     size_t MaxDepth(const BtreeNodePtr& node)
     {
-        if (BugOn(node.Get() == nullptr))
-            return 0;
+        BugOn(node.Get() == nullptr);
 
         if (node->IsLeaf())
         {
@@ -359,8 +349,7 @@ private:
             else
             {
                 node = node->GetChild(i);
-                if (BugOn(node.Get() == nullptr))
-                    return EmptyValue;
+                BugOn(node.Get() == nullptr);
             }
         }
     }
@@ -380,8 +369,7 @@ private:
 
             for (size_t i = 0; i < 2 * T; i++)
             {
-                if (BugOn(Child[i].Get() != nullptr))
-                    return;
+                BugOn(Child[i].Get() != nullptr);
 
                 Child[i].Reset();
             }
@@ -398,11 +386,8 @@ private:
 
         void CopyKey(size_t index, const BtreeNodePtr& src, size_t srcIndex)
         {
-            if (BugOn(index < 0 || index >= (2 * T - 1)))
-                return;
-
-            if (BugOn(srcIndex < 0 || srcIndex >= (2 * T - 1)))
-                return;
+            BugOn(index < 0 || index >= (2 * T - 1));
+            BugOn(srcIndex < 0 || srcIndex >= (2 * T - 1));
 
             Trace(BtreeLL, "node 0x%p copy key %lu", this, index);
 
@@ -412,11 +397,8 @@ private:
 
         void CopyChild(size_t index, const BtreeNodePtr& src, size_t srcIndex)
         {
-            if (BugOn(index < 0 || index >= 2 * T))
-                return;
-
-            if (BugOn(srcIndex < 0 || srcIndex >= 2 * T))
-                return;
+            BugOn(index < 0 || index >= 2 * T);
+            BugOn(srcIndex < 0 || srcIndex >= 2 * T);
 
             Trace(BtreeLL, "node 0x%p copy child %lu", this, index);
 
@@ -425,8 +407,7 @@ private:
 
         void PutKey(size_t index, const K& key, const V& value)
         {
-            if (BugOn(index < 0 || index >= (2 * T - 1)))
-                return;
+            BugOn(index < 0 || index >= (2 * T - 1));
 
             Trace(BtreeLL, "node 0x%p put key %lu", this, index);
 
@@ -443,11 +424,8 @@ private:
 
         void PutKey(size_t index, const BtreeNodePtr& src, size_t srcIndex)
         {
-            if (BugOn(index < 0 || index >= (2 * T - 1)))
-                return;
-
-            if (BugOn(srcIndex < 0 || srcIndex >= (2 * T - 1)))
-                return;
+            BugOn(index < 0 || index >= (2 * T - 1));
+            BugOn(srcIndex < 0 || srcIndex >= (2 * T - 1));
 
             Trace(BtreeLL, "node 0x%p put key %lu", this, index);
 
@@ -464,8 +442,7 @@ private:
 
         void SetValue(size_t index, const V& value)
         {
-            if (BugOn(index < 0 || index >= (2 * T - 1)))
-                return;
+            BugOn(index < 0 || index >= (2 * T - 1));
 
             Value[index] = value;
             Trace(BtreeLL, "node 0x%p set value %lu", this, index);
@@ -473,8 +450,7 @@ private:
 
         void SetValue(size_t index, V&& value)
         {
-            if (BugOn(index < 0 || index >= (2 * T - 1)))
-                return;
+            BugOn(index < 0 || index >= (2 * T - 1));
 
             Value[index] = Stdlib::Move(value);
             Trace(BtreeLL, "node 0x%p set value %lu", this, index);
@@ -495,8 +471,7 @@ private:
 
         void SetKey(size_t index, K&& key)
         {
-            if (BugOn(index < 0 || index >= (2 * T - 1)))
-                return;
+            BugOn(index < 0 || index >= (2 * T - 1));
 
             Key[index] = Stdlib::Move(key);
             Trace(BtreeLL, "node 0x%p set key %lu", this, index);
@@ -505,8 +480,7 @@ private:
 
         void SetKey(size_t index, const K& key)
         {
-            if (BugOn(index < 0 || index >= (2 * T - 1)))
-                return;
+            BugOn(index < 0 || index >= (2 * T - 1));
 
             Key[index] = key;
             Trace(BtreeLL, "node 0x%p set key %lu", this, index);
@@ -515,8 +489,7 @@ private:
 
         void SetChild(size_t index, const BtreeNodePtr& child)
         {
-            if (BugOn(index < 0 || index >= 2 * T))
-                return;
+            BugOn(index < 0 || index >= 2 * T);
 
             Child[index] = child;
             Trace(BtreeLL, "node 0x%p set child %lu 0x%p", this, index, Child[index].Get());
@@ -524,8 +497,7 @@ private:
 
         void SetChild(size_t index, BtreeNodePtr&& child)
         {
-            if (BugOn(index < 0 || index >= 2 * T))
-                return;
+            BugOn(index < 0 || index >= 2 * T);
 
             Child[index] = Stdlib::Move(child);
             Trace(BtreeLL, "node 0x%p set child %lu 0x%p", this, index, Child[index].Get());
@@ -533,8 +505,7 @@ private:
 
         void PutChild(size_t index, const BtreeNodePtr& child)
         {
-            if (BugOn(index < 0 || index >= 2 * T))
-                return;
+            BugOn(index < 0 || index >= 2 * T);
 
             Trace(BtreeLL, "node 0x%p put child %lu", this, index);
 
@@ -549,10 +520,8 @@ private:
 
         void PutChild(size_t index, const BtreeNodePtr& src, size_t srcIndex)
         {
-            if (BugOn(index < 0 || index >= 2 * T))
-                return;
-            if (BugOn(srcIndex < 0 || srcIndex >= 2 * T))
-                return;
+            BugOn(index < 0 || index >= 2 * T);
+            BugOn(srcIndex < 0 || srcIndex >= 2 * T);
 
             PutChild(index, Stdlib::Move(src->Child[srcIndex]));
         }
@@ -570,8 +539,7 @@ private:
 
         void SetKeyCount(size_t keyCount)
         {
-            if (BugOn(keyCount < 0 || keyCount > (2 * T - 1)))
-                return;
+            BugOn(keyCount < 0 || keyCount > (2 * T - 1));
 
             size_t oldKeyCount = KeyCount;
             KeyCount = keyCount;
@@ -590,11 +558,8 @@ private:
 
         void DeleteChild(size_t index)
         {
-            if (BugOn(index < 0 || index >= 2 * T))
-                return;
-
-            if (BugOn(index >= (KeyCount + 1)))
-                return;
+            BugOn(index < 0 || index >= 2 * T);
+            BugOn(index >= (KeyCount + 1));
 
             Trace(BtreeLL, "node 0x%p delete child %lu 0x%p", this, index, Child[index].Get());
 
@@ -608,10 +573,8 @@ private:
 
         void DeleteKey(size_t index)
         {
-            if (BugOn(index < 0 || index >= (2 * T - 1)))
-                return;
-            if (BugOn(index >= KeyCount))
-                return;
+            BugOn(index < 0 || index >= (2 * T - 1));
+            BugOn(index >= KeyCount);
 
             Trace(BtreeLL, "node 0x%p delete key %lu", this, index);
 
@@ -632,11 +595,8 @@ private:
 
             auto child = GetChild(childIndex);
 
-            if (BugOn(child.Get() == nullptr))
-                return;
-
-            if (BugOn(sibling.Get() == nullptr))
-                return;
+            BugOn(child.Get() == nullptr);
+            BugOn(sibling.Get() == nullptr);
 
             sibling->SetLeaf(child->IsLeaf());
             /* copy T-1 keys from child to sibling */
@@ -729,8 +689,7 @@ private:
 
         bool InsertNonFull(const BtreeNodePtr& self, const K& key, const V& value)
         {
-            if (BugOn(self.Get() != this))
-                return false;
+            BugOn(self.Get() != this);
 
             BtreeNodePtr node = self;
 
@@ -753,8 +712,7 @@ private:
                 else
                 {
                     auto child = node->GetChild(i);
-                    if (BugOn(child.Get() == nullptr))
-                        return false;
+                    BugOn(child.Get() == nullptr);
 
                     if (child->IsFull())
                     {
@@ -773,8 +731,7 @@ private:
 
         BtreeNodePtr FindLeftMost(const BtreeNodePtr& self, size_t& index)
         {
-            if (BugOn(self.Get() != this))
-                return BtreeNodePtr();
+            BugOn(self.Get() != this);
 
             Trace(BtreeLL, "node 0x%p find left most", this);
 
@@ -794,8 +751,7 @@ private:
 
         BtreeNodePtr FindRightMost(const BtreeNodePtr& self, size_t& index)
         {
-            if (BugOn(self.Get() != this))
-                return BtreeNodePtr();
+            BugOn(self.Get() != this);
 
             Trace(BtreeLL, "node 0x%p find right most", this);
 
@@ -803,8 +759,7 @@ private:
 
             for (;;)
             {
-                if (BugOn(curr->KeyCount == 0))
-                    return BtreeNodePtr();
+                BugOn(curr->KeyCount == 0);
 
                 if (curr->Leaf)
                 {
@@ -861,28 +816,19 @@ private:
              * sibling into child
              */
 
-            if (BugOn(self.Get() != this))
-                return;
-
-            if (BugOn(childIndex < 0 || childIndex >= 2*T))
-                return;
+            BugOn(self.Get() != this);
+            BugOn(childIndex < 0 || childIndex >= 2*T);
 
             size_t sibIndex = (left) ? (childIndex - 1) : (childIndex + 1);
 
-            if (BugOn(sibIndex < 0 || sibIndex >= 2 *T))
-                return;
+            BugOn(sibIndex < 0 || sibIndex >= 2 *T);
 
             auto child = GetChild(childIndex);
             auto sib = GetChild(sibIndex);
 
-            if (BugOn(child.Get() == nullptr))
-                return;
-
-            if (BugOn(sib.Get() == nullptr))
-                return;
-
-            if (BugOn(child.Get() == sib.Get()))
-                return;
+            BugOn(child.Get() == nullptr);
+            BugOn(sib.Get() == nullptr);
+            BugOn(child.Get() == sib.Get());
 
             if (!left)
             {
@@ -896,11 +842,8 @@ private:
             }
             else
             {
-                if (BugOn(childIndex == 0))
-                    return;
-
-                if (BugOn(sib->GetKeyCount() == 0))
-                    return;
+                BugOn(childIndex == 0);
+                BugOn(sib->GetKeyCount() == 0);
 
                 child->PutKey(0, self, childIndex - 1);
 
@@ -916,36 +859,26 @@ private:
 
         BtreeNodePtr ChildMerge(const BtreeNodePtr& self, size_t childIndex, bool left)
         {
-            if (BugOn(self.Get() != this))
-                return BtreeNodePtr();
-
-            if (BugOn(childIndex < 0 || childIndex >= 2*T))
-                return BtreeNodePtr();
+            BugOn(self.Get() != this);
+            BugOn(childIndex < 0 || childIndex >= 2*T);
 
             size_t sibIndex = (left) ? (childIndex - 1) : (childIndex + 1);
 
-            if (BugOn(sibIndex < 0 || sibIndex >= 2 *T))
-                return BtreeNodePtr();
+            BugOn(sibIndex < 0 || sibIndex >= 2 *T);
 
             auto child = GetChild(childIndex);
             auto sib = GetChild(sibIndex);
 
-            if (BugOn(child.Get() == nullptr))
-                return BtreeNodePtr();
-
-            if (BugOn(sib.Get() == nullptr))
-                return BtreeNodePtr();
-
-            if (BugOn(child.Get() == sib.Get()))
-                return BtreeNodePtr();
+            BugOn(child.Get() == nullptr);
+            BugOn(sib.Get() == nullptr);
+            BugOn(child.Get() == sib.Get());
 
             Trace(BtreeLL, "node 0x%p child %lu 0x%p merge sib %lu 0x%p",
                 this, childIndex, child.Get(), sibIndex, sib.Get());
 
             if (left)
             {
-                if (BugOn(childIndex == 0))
-                    return BtreeNodePtr();
+                BugOn(childIndex == 0);
 
                 sib->Merge(child,
                         Stdlib::Move(GetKey(childIndex-1)),
@@ -986,18 +919,12 @@ private:
         {
             Trace(BtreeLL, "node 0x%p child %lu balance", this, childIndex);
 
-            if (BugOn(self.Get() != this))
-                return BtreeNodePtr();
-
-            if (BugOn(Leaf))
-                return BtreeNodePtr();
-
-            if (BugOn(childIndex < 0 || childIndex >= 2*T))
-                return BtreeNodePtr();
+            BugOn(self.Get() != this);
+            BugOn(Leaf);
+            BugOn(childIndex < 0 || childIndex >= 2*T);
 
             auto child = GetChild(childIndex);
-            if (BugOn(child.Get() == nullptr))
-                return BtreeNodePtr();
+            BugOn(child.Get() == nullptr);
 
             if (child->KeyCount < T)
             {
@@ -1024,8 +951,7 @@ private:
                 }
                 else
                 {
-                    if (BugOn(true))
-                        return BtreeNodePtr();
+                    BugOn(true);
                 }
             }
 
@@ -1045,8 +971,7 @@ private:
             childCount = i;
             for (; i < 2 * T; i++)
             {
-                if (BugOn(Child[i].Get() != nullptr))
-                    return 0;
+                BugOn(Child[i].Get() != nullptr);
             }
 
             return childCount;
@@ -1056,8 +981,7 @@ private:
         {
             Trace(BtreeLL, "node 0x%p get child %lu", this, childIndex);
 
-            if (BugOn(childIndex < 0 || childIndex >= 2*T))
-                return BtreeNodePtr();
+            BugOn(childIndex < 0 || childIndex >= 2*T);
 
             return Child[childIndex];
         }
@@ -1066,11 +990,8 @@ private:
         {
             Trace(BtreeLL, "node 0x%p get key %lu", this, keyIndex);
 
-            if (BugOn(keyIndex < 0 || keyIndex >= (2*T - 1)))
-                return EmptyKey;
-
-            if (BugOn(keyIndex >= KeyCount))
-                return EmptyKey;
+            BugOn(keyIndex < 0 || keyIndex >= (2*T - 1));
+            BugOn(keyIndex >= KeyCount);
 
             return Key[keyIndex];
         }
@@ -1079,11 +1000,8 @@ private:
         {
             Trace(BtreeLL, "node 0x%p get value %lu", this, keyIndex);
 
-            if (BugOn(keyIndex < 0 || keyIndex >= (2*T - 1)))
-                return EmptyValue;
-
-            if (BugOn(keyIndex >= KeyCount))
-                return EmptyValue;
+            BugOn(keyIndex < 0 || keyIndex >= (2*T - 1));
+            BugOn(keyIndex >= KeyCount);
 
             return Value[keyIndex];
         }

@@ -109,6 +109,8 @@ void Pool::Free(void* ptr)
     BugOn(!ptr);
     Stdlib::AutoLock lock(Lock);
 
+    Stdlib::MemSet(ptr, 0xCC, BlockSize);
+
     BlockCount--;
     Page* page = (Page*)((ulong)ptr & ~(Const::PageSize - 1));
     BugOn((ulong)page & (Const::PageSize - 1));
