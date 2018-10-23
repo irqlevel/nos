@@ -30,12 +30,14 @@ void Watchdog::Check()
             continue;
 
         ulong flags = listLock.LockIrqSave();
-        for (Stdlib::ListEntry* entry = list.Flink;
-            entry != &list;
-            entry = entry->Flink)
+        Stdlib::ListEntry* entry = list.Flink;
+        Stdlib::ListEntry* prevEntry = nullptr;
+
+        while (entry != &list)
         {
-            SpinLock* lock = CONTAINING_RECORD(entry, SpinLock, WatchdogListEntry);
             CheckCounter.Inc();
+            BugOn(entry == nullptr);
+            SpinLock* lock = CONTAINING_RECORD(entry, SpinLock, WatchdogListEntry);
             Stdlib::Time lockTime(lock->WatchdogLockTime.Get());
             if (lockTime.GetValue() != 0)
             {
@@ -45,6 +47,8 @@ void Watchdog::Check()
                     Trace(0, "Spinlock 0x%p is held too long %u", lock, delta.GetValue());
                 }
             }
+            prevEntry = entry;
+            entry = entry->Flink;
         }
         listLock.UnlockIrqRestore(flags);
     }
