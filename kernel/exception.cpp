@@ -1,6 +1,6 @@
 #include "exception.h"
 #include "idt.h"
-#include "stdlib.h"
+#include <lib/stdlib.h>
 #include "asm.h"
 #include "panic.h"
 #include "trace.h"

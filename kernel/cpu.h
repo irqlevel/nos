@@ -1,6 +1,6 @@
 #pragma once
 
-#include "stdlib.h"
+#include <lib/stdlib.h>
 #include "spin_lock.h"
 #include "task.h"
 #include "sched.h"
