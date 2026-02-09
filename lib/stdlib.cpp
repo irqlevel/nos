@@ -239,6 +239,8 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 size_t val_len;
 
                 val = va_arg(arg, char *);
+                if (val == nullptr)
+                    val = "(null)";
                 val_len = StrLen(val);
                 if (val_len > (size - pos))
                     return -1;

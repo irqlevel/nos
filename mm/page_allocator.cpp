@@ -87,7 +87,7 @@ void* FixedPageAllocator::Alloc()
 
             for (size_t j = i; j < PageCount; j++)
             {
-                pt.FreePage(pages[i]);
+                pt.FreePage(pages[j]);
             }
             BugOn(1);
             return nullptr;

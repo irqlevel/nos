@@ -45,6 +45,7 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
     {
         Trace(0, "Rsdp 0x%p checksum failed 0x%p vs 0x%p",
             rsdp, (ulong)ComputeSum(rsdp, sizeof(rsdp->FirstPart)));
+        return false;
     }
 
     Stdlib::MemCpy(OemId, rsdp->FirstPart.OEMID, sizeof(rsdp->FirstPart.OEMID));
@@ -109,10 +110,10 @@ Stdlib::Error Acpi::ParseRsdt(ACPISDTHeader* rsdt)
 
     if (checkRsdtChecksum)
     {
-        if (ComputeSum(rsdt, sizeof(rsdt->Length)) != 0)
+        if (ComputeSum(rsdt, rsdt->Length) != 0)
         {
             Trace(AcpiLL, "Rsdt 0x%p checksum failed 0x%p vs 0x%p",
-                rsdt, (ulong)ComputeSum(rsdt, sizeof(rsdt->Length)), (ulong)rsdt->Checksum);
+                rsdt, (ulong)ComputeSum(rsdt, rsdt->Length), (ulong)rsdt->Checksum);
              return MakeError(Stdlib::Error::NotFound);
         }
     }
@@ -164,7 +165,6 @@ Stdlib::Error Acpi::ParseTablePointers()
         }
 
         Table[i] = header;
-        header++;
     }
 
      return MakeError(Stdlib::Error::Success);
@@ -206,9 +206,9 @@ Stdlib::Error Acpi::ParseMADT()
         {
         case MadtEntryTypeLapic:
         {
-            MadtLapicEntry* lapicEntry = reinterpret_cast<MadtLapicEntry*>(entry + 1);
-            if (entry->Length < sizeof(*lapicEntry) + sizeof(*entry))
+            if (entry->Length < sizeof(MadtLapicEntry) + sizeof(*entry))
                 return MakeError(Stdlib::Error::InvalidValue);
+            MadtLapicEntry* lapicEntry = reinterpret_cast<MadtLapicEntry*>(entry + 1);
 
             Trace(AcpiLL, "Acpi: MADT lapic procId %u apicId %u flags 0x%p",
                 (ulong)lapicEntry->AcpiProcessId, (ulong)lapicEntry->ApicId, (ulong)lapicEntry->Flags);
@@ -222,9 +222,9 @@ Stdlib::Error Acpi::ParseMADT()
         }
         case MadtEntryTypeIoApic:
         {
-            MadtIoApicEntry* ioApicEntry = reinterpret_cast<MadtIoApicEntry*>(entry + 1);
-            if (entry->Length < sizeof(*ioApicEntry) + sizeof(*entry))
+            if (entry->Length < sizeof(MadtIoApicEntry) + sizeof(*entry))
                 return MakeError(Stdlib::Error::InvalidValue);
+            MadtIoApicEntry* ioApicEntry = reinterpret_cast<MadtIoApicEntry*>(entry + 1);
 
             IoApicAddress = (void *)Mm::PageTable::GetInstance().TmpMapAddress(ioApicEntry->IoApicAddress);
             if (IoApicAddress == nullptr)
@@ -239,9 +239,9 @@ Stdlib::Error Acpi::ParseMADT()
         }
         case MadtEntryTypeIntSrcOverride:
         {
-            MadtIntSrcOverrideEntry* isoEntry = reinterpret_cast<MadtIntSrcOverrideEntry*>(entry + 1);
-            if (entry->Length < sizeof(*isoEntry) + sizeof(*entry))
+            if (entry->Length < sizeof(MadtIntSrcOverrideEntry) + sizeof(*entry))
                 return MakeError(Stdlib::Error::InvalidValue);
+            MadtIntSrcOverrideEntry* isoEntry = reinterpret_cast<MadtIntSrcOverrideEntry*>(entry + 1);
 
             Trace(AcpiLL, "Acpi: MADT bus 0x%p irq 0x%p gsi 0x%p flags 0x%p",
                 (ulong)isoEntry->BusSource, (ulong)isoEntry->IrqSource, (ulong)isoEntry->GlobalSystemInterrupt,

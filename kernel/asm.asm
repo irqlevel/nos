@@ -177,7 +177,7 @@ GetDs:
 
 GetSs:
 	xor rax, rax
-	mov ax, es
+	mov ax, ss
 	ret
 
 GetEs:
@@ -308,7 +308,7 @@ ReadTsc:
 
 ReadTscp:
 	; rdi - &cpuIndex
-	rdtsc; result in edx:eax
+	rdtscp; result in edx:eax, cpuIndex in ecx
 	mov qword [rdi], rcx
 	shl rdx, 32
 	or rdx, rax
