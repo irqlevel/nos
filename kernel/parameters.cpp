@@ -73,7 +73,7 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
             Trace(0, "Unknown value %s, key %s", value, key);
         }
     }
-    if (Stdlib::StrCmp(key, "panic") == 0)
+    else if (Stdlib::StrCmp(key, "panic") == 0)
     {
         if (Stdlib::StrCmp(value, "vga") == 0)
         {
@@ -82,9 +82,9 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         else
         {
             Trace(0, "Unknown value %s, key %s", value, key);
-        }        
+        }
     }
-    if (Stdlib::StrCmp(key, "smp") == 0)
+    else if (Stdlib::StrCmp(key, "smp") == 0)
     {
         if (Stdlib::StrCmp(value, "off") == 0)
         {

@@ -86,7 +86,7 @@ void ApStartup(void *ctx)
 
     if (!Test::TestMultiTasking())
     {
-        Panic("Mulitasking test failed");
+        Panic("Multitasking test failed");
         return;
     }
 
@@ -286,7 +286,7 @@ void BpStartup(void* ctx)
 
     if (!Test::TestMultiTasking())
     {
-        Panic("Mulitasking test failed");
+        Panic("Multitasking test failed");
         return;
     }
 
