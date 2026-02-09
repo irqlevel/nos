@@ -32,7 +32,7 @@ private:
 
     Task* SelectNext(Task* curr);
 
-    void Switch(Task* curr, Task* next);
+    void Switch(Task* next, Task* curr);
 
     void SwitchComplete(Task* curr);
 
