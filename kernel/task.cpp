@@ -157,6 +157,8 @@ bool Task::Start(Func func, void* ctx)
     State.Set(StateWaiting);
 
     auto taskQueue = SelectNextTaskQueue();
+    if (taskQueue == nullptr)
+        return false;
     taskQueue->Insert(this);
     return true;
 }
