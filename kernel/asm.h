@@ -154,9 +154,11 @@ struct Context final
     ulong Rflags;
     ulong Rsp;
 
-    ulong GetRetRip()
+    ulong GetRetRip(bool hasErrorCode = false)
     {
-        return *((ulong *)(Rsp + sizeof(ulong)));
+        if (hasErrorCode)
+            return *((ulong *)(Rsp + sizeof(ulong)));
+        return *((ulong *)Rsp);
     }
 private:
     Context(const Context& other) = delete;

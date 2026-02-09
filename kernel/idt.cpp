@@ -48,7 +48,7 @@ u16 Idt::GetLimit()
 
 IdtDescriptor Idt::GetDescriptor(u16 index)
 {
-    if (index > Stdlib::ArraySize(Entry))
+    if (index >= Stdlib::ArraySize(Entry))
 	    return IdtDescriptor();
 
     return Entry[index];
@@ -56,7 +56,7 @@ IdtDescriptor Idt::GetDescriptor(u16 index)
 
 void Idt::SetDescriptor(u16 index, const IdtDescriptor& desc)
 {
-    if (index > Stdlib::ArraySize(Entry))
+    if (index >= Stdlib::ArraySize(Entry))
 	    return;
 
     Entry[index] = desc;

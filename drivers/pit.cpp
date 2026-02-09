@@ -68,6 +68,7 @@ void Pit::Interrupt(Context* ctx)
 
 Stdlib::Time Pit::GetTime()
 {
+    Stdlib::AutoLock lock(Lock);
     return Stdlib::Time(TimeMs * Const::NanoSecsInMs + TimeMsNs);
 }
 
