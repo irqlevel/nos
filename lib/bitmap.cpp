@@ -5,7 +5,7 @@
 namespace Stdlib
 {
 
-Bitmap::Bitmap(void* addr, size_t bitCount)
+Bitmap::Bitmap(void* addr, ulong bitCount)
     : Addr(addr)
     , BitCount(bitCount)
 {
