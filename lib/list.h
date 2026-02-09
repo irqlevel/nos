@@ -2,7 +2,7 @@
 
 #include "list_entry.h"
 #include <include/types.h>
-#include <include/panic.h>
+#include <kernel/panic.h>
 
 namespace Stdlib
 {
@@ -58,7 +58,7 @@ public:
 
         T& Get()
         {
-            panic(CurrListEntry == EndList);
+            BugOn(CurrListEntry == EndList);
             LinkedListNode* node = CONTAINING_RECORD(CurrListEntry,
                                                      LinkedListNode,
                                                      ListLink);
@@ -87,7 +87,7 @@ public:
 
         void Erase()
         {
-            panic(!IsValid());
+            BugOn(!IsValid());
 
             ListEntry* next = CurrListEntry->Flink;
 

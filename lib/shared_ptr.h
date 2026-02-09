@@ -21,12 +21,6 @@ public:
         Object = object;
 
         Trace(SharedPtrLL, "objref 0x%p obj 0x%p ctor", this, Object);
-
-#if defined(__DEBUG__)
-        if (Object != nullptr)
-            BugOn(get_kapi()->unique_key_register(Object, this, get_kapi_pool_type(PoolType)) != 0);
-#endif
-
     }
 
     ~ObjectReference()
@@ -54,11 +48,6 @@ public:
             return;
 
         Object = object;
-
-#if defined(__DEBUG__)
-        BugOn(get_kapi()->unique_key_register(Object, this, get_kapi_pool_type(PoolType)) != 0);
-#endif
-
     }
 
     T* GetObject()
@@ -71,11 +60,6 @@ public:
         if (Counter.DecAndTest())
         {
             Trace(SharedPtrLL, "objref 0x%p obj 0x%p dec counter %d", this, Object, Counter.Get());
-
-#if defined(__DEBUG__)
-            if (BugOn(get_kapi()->unique_key_unregister(Object, this) != 0))
-                return false;
-#endif
 
             delete Object;
             Object = nullptr;

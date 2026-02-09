@@ -30,7 +30,7 @@ public:
 
     T& operator[](size_t index)
     {
-        BugOn(index < 0 || index >= Size);
+        BugOn(index >= Size);
         return Arr[index];
     }
 
@@ -165,6 +165,7 @@ public:
     }
 
     Vector(const T* arr, size_t size, Stdlib::Error& err)
+        : Vector()
     {
         if (!err.Ok())
             return;

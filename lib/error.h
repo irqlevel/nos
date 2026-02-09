@@ -48,7 +48,7 @@ public:
 
     static const int EOF = 506;
 
-    static const int BufToBig = 507;
+    static const int BufTooBig = 507;
 
     static const int IO = 508;
 
