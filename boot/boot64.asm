@@ -76,9 +76,9 @@ align 8
     dd 8    ; size
 
 section .trampoline
-align 8
+align 4
 stack_counter:
-    dq 0
+    dd 0
 align 8
 mbinfo:
     dq 0
@@ -89,7 +89,7 @@ mbsig:
 %macro AllocStack 0
     xor eax, eax
     inc eax
-    lock xadd qword [stack_counter], rax
+    lock xadd dword [stack_counter], eax
     cmp eax, MAX_CPUS
     jge .nostack
     mov ebx, CPU_STACK_SIZE

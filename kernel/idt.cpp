@@ -26,8 +26,8 @@ Idt::~Idt()
 void Idt::Save()
 {
     TableDesc desc = {
-        .Base = reinterpret_cast<u64>(&Entry[0]),
         .Limit = sizeof(Entry),
+        .Base = reinterpret_cast<u64>(&Entry[0]),
     };
 
     LoadIdt(&desc);

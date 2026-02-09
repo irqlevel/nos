@@ -235,7 +235,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 break;
             }
             case 's': {
-                char *val;
+                const char *val;
                 size_t val_len;
 
                 val = va_arg(arg, char *);
@@ -331,8 +331,9 @@ void StrnCpy(char *dst, const char *src, size_t size)
 // find n : 2^n >= size
 size_t Log2(size_t size)
 {
-    if (size < 2)
+    if (size < 2) {
         return 0;
+    }
 
 	size_t log = 0;
     size_t restSize = size;
