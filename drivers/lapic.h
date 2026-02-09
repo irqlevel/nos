@@ -61,7 +61,7 @@ private:
     static const u32 IcrDeassert = 0x0;
     static const u32 IcrAssert = 0x4000;
     static const u32 IcrEdge = 0x0;
-    static const u32 IcrLebel = 0x8000;
+    static const u32 IcrLevel = 0x8000;
     static const u32 IcrNoShorthand = 0x0;
     static const u32 IcrSelf = 0x40000;
     static const u32 IcrAllIncludingSelf = 0x80000;
