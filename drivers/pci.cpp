@@ -169,7 +169,7 @@ u8 Pci::GetSubClassId(u16 bus, u16 device, u16 function)
 u8 Pci::GetProgIF(u16 bus, u16 device, u16 function)
 {
     u16 r0 = ReadWord(bus, device, function, 0x8);
-    return (r0 & 0xFF00);
+    return (r0 >> 8) & 0xFF;
 }
 
 u8 Pci::GetRevisionID(u16 bus, u16 device, u16 function)

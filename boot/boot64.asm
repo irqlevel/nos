@@ -89,7 +89,7 @@ mbsig:
 %macro AllocStack 0
     xor eax, eax
     inc eax
-    lock xadd dword [stack_counter], eax
+    lock xadd qword [stack_counter], rax
     cmp eax, MAX_CPUS
     jge .nostack
     mov ebx, CPU_STACK_SIZE

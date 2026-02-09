@@ -50,7 +50,7 @@ private:
     static const ulong DestShift = 56;
 
     static const ulong TriggerEdge = 0;
-    static const ulong TriggerLevel = 0;
+    static const ulong TriggerLevel = 1;
 
     static const ulong DmFixed = 0x0;
 

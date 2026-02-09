@@ -782,13 +782,15 @@ private:
 
             for (;;)
             {
-                BugOn(curr->KeyCount == 0);
+                if (BugOn(curr->KeyCount == 0))
+                    return BtreeNodePtr();
+
                 if (curr->Leaf)
                 {
-                    index = curr->KeyCount - 1;
+                    index = 0;
                     return curr;
                 }
-                curr = curr->ChildBalance(curr, curr->KeyCount);
+                curr = curr->ChildBalance(curr, 0);
             }
         }
 
@@ -803,15 +805,13 @@ private:
 
             for (;;)
             {
-                if (BugOn(curr->KeyCount == 0))
-                    return BtreeNodePtr();
-
+                BugOn(curr->KeyCount == 0);
                 if (curr->Leaf)
                 {
-                    index = 0;
+                    index = curr->KeyCount - 1;
                     return curr;
                 }
-                curr = curr->ChildBalance(curr, 0);
+                curr = curr->ChildBalance(curr, curr->KeyCount);
             }
         }
 
