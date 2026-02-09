@@ -579,7 +579,7 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
     Stdlib::AutoLock lock(Lock);
 
     BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray)));
+    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
 
     ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
     ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
@@ -678,7 +678,7 @@ Page* PageTable::UnmapPage(ulong virtAddr)
     Stdlib::AutoLock lock(Lock);
 
     BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray)));
+    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
 
     ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
     ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);

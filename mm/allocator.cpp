@@ -22,7 +22,7 @@ AllocatorImpl::AllocatorImpl(class PageAllocator* pgAlloc)
 
 AllocatorImpl::~AllocatorImpl()
 {
-    Trace(0, "0x%p dtor");
+    Trace(0, "0x%p dtor", this);
 }
 
 size_t AllocatorImpl::Log2(size_t size)
