@@ -61,7 +61,7 @@ void Lapic::EOI()
 
 void Lapic::EOI(u8 vector)
 {
-    if (CheckIsr(vector))
+    if (vector != 0xFF)
         WriteReg(EoiIndex, 0x0);
 }
 

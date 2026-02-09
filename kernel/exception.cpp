@@ -175,7 +175,7 @@ void ExceptionTable::ExcInvalidOpcode(Context* ctx)
     ExcInvalidOpcodeCounter.Inc();
 
     Panic("EXC: InvalidOpcode cpu %u rip 0x%p rsp 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp);
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(false), ctx->Rsp);
 }
 
 void ExceptionTable::ExcCoprocessorNotAvailable(Context* ctx)
@@ -239,14 +239,14 @@ void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
     ExcGeneralProtectionFaultCounter.Inc();
 
     Panic("EXC: GP cpu %u rip 0x%p rsp 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp);
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(true), ctx->Rsp);
 }
 
 void ExceptionTable::ExcPageFault(Context* ctx)
 {
     (void)ctx;
 
-    Trace(0, "PageFault cr2 0x%p cr3 0x%p rip 0x%p", GetCr2(), GetCr3(), ctx->GetRetRip());
+    Trace(0, "PageFault cr2 0x%p cr3 0x%p rip 0x%p", GetCr2(), GetCr3(), ctx->GetRetRip(true));
 
     ExcPageFaultCounter.Inc();
 
@@ -257,7 +257,7 @@ void ExceptionTable::ExcPageFault(Context* ctx)
     Hlt();
 
     Panic("EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0x%p cr3 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(), ctx->Rsp,
+        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(true), ctx->Rsp,
         cr2, cr3);
 }
 
