@@ -367,7 +367,6 @@ SwitchContext:
 	mov rdi, rcx
 	call rdx ; call complete callback
 	PopAll
-	sti
 	ret
 
 AtomicInc:
