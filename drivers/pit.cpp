@@ -59,16 +59,14 @@ void Pit::Interrupt(Context* ctx)
             TimeMsNs -= Const::NanoSecsInMs;
             TimeMs += 1;
         }
-
-        CpuTable::GetInstance().SendIPIAll();
     }
 
+    CpuTable::GetInstance().SendIPIAll();
     Lapic::EOI(IntVector);
 }
 
 Stdlib::Time Pit::GetTime()
 {
-    Stdlib::AutoLock lock(Lock);
     return Stdlib::Time(TimeMs * Const::NanoSecsInMs + TimeMsNs);
 }
 
