@@ -159,29 +159,23 @@ bool PageTable::GetFreePages()
         if (!mmap.GetRegion(i, addr, len, type))
             return false;
 
+        if (type != 1)
+            continue;
+
         ulong limit = Stdlib::RoundUp(addr + len, Const::PageSize);
         if (limit > HighestPhyAddr)
             HighestPhyAddr = limit;
 
-        if (type != 1)
-            continue;
+        ulong memStart = Stdlib::RoundUp(addr, Const::PageSize);
+        ulong memEnd = ((addr + len) / Const::PageSize) * Const::PageSize;
 
-        ulong memStart = addr;
-        ulong memEnd = addr + len;
+        if (memStart < Const::MB)
+            memStart = Stdlib::RoundUp(Const::MB, Const::PageSize);
 
         Trace(0, "Phy memStart 0x%p memEnd 0x%p", memStart, memEnd);
 
-        if (memStart % Const::PageSize)
-        {
-            Trace(0, "Not aligned phy memory start 0x%p", memStart);
+        if (memStart >= memEnd)
             continue;
-        }
-
-        if (memEnd % Const::PageSize)
-        {
-            Trace(0, "Not aligned phy memory end 0x%p", memEnd);
-            continue;
-        }
 
         for (ulong address = memStart; address < memEnd; address+= Const::PageSize)
         {
@@ -204,6 +198,8 @@ bool PageTable::GetFreePages()
             }
         }
     }
+
+    Trace(0, "GetFreePages done, HighestPhyAddr 0x%p TotalPages %u", HighestPhyAddr, TotalPagesCount);
 
     return true;
 }

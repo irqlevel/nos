@@ -5,6 +5,7 @@
 #include "parameters.h"
 #include "trace.h"
 
+#include <drivers/acpi.h>
 #include <drivers/vga.h>
 
 namespace Kernel
@@ -34,8 +35,11 @@ void Panicker::DoPanic(const char *fmt, ...)
         Stdlib::VsnPrintf(Message, sizeof(Message), fmt, args);
         va_end(args);
 
-        Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
-        CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
+        if (Acpi::GetInstance().GetLapicAddress() != nullptr)
+        {
+            Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
+            CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
+        }
     }
 
     for (;;)
