@@ -68,10 +68,12 @@ Acpi::RSDPDescriptor20* Acpi::FindRsdp()
         if (!mm.GetRegion(i, addr, len, type))
             return nullptr;
 
-        if (type != 1)
+        /* Type 1 = usable RAM, type 2 = reserved (e.g. BIOS/ACPI at 0xE0000-0xFFFFF). */
+        if (type != 1 && type != 2)
             continue;
 
-        for (ulong curr = addr; curr < (addr + len); curr+= Const::PageSize)
+        ulong pageStart = Stdlib::RoundDown(addr, Const::PageSize);
+        for (ulong curr = pageStart; curr < (addr + len); curr+= Const::PageSize)
         {
             ulong pageVa = pt.TmpMapPage(curr);
             if (!pageVa)

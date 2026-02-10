@@ -498,11 +498,16 @@ void PageTable::FreePage(Page* page)
     FreePagesList.InsertHead(&page->ListEntry);
 }
 
+/* Sentinel for TmpMapPageArray when page was mapped without a Page struct (e.g. reserved ACPI region). */
+static Page* const TmpMapDirectSentinel = (Page*)1;
+
 ulong PageTable::TmpMapPage(ulong phyAddr)
 {
     Stdlib::AutoLock lock(TmpMapLock);
 
     BugOn(phyAddr & (Const::PageSize - 1));
+
+    bool havePage = (phyAddr / Const::PageSize) < PageArrayCount;
 
     for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
     {
@@ -513,15 +518,20 @@ ulong PageTable::TmpMapPage(ulong phyAddr)
             if (l1Entry->Present())
                 return 0;
 
-            Page* page = GetPage(phyAddr);
-            BugOn(!page);
-
             l1Entry->SetAddress(phyAddr);
             l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
             l1Entry->SetPresent();
             Invlpg(virtAddr);
-            TmpMapPageArray[i] = page;
+
+            if (havePage) {
+                Page* page = GetPage(phyAddr);
+                BugOn(!page);
+                TmpMapPageArray[i] = page;
+            } else {
+                /* Map reserved physical range (e.g. ACPI tables) without a Page struct. */
+                TmpMapPageArray[i] = TmpMapDirectSentinel;
+            }
             return virtAddr;
         }
     }
@@ -545,11 +555,13 @@ ulong PageTable::TmpUnmapPage(ulong virtAddr)
     Pte *l1Entry = &TmpMapL1Page->Entry[l1Index];
     BugOn(!l1Entry->Present());
     auto phyAddr = l1Entry->Address();
-    BugOn(page->GetPhyAddress() != phyAddr);
     l1Entry->Clear();
     Invlpg(virtAddr);
     TmpMapPageArray[i] = nullptr;
-    page->Put();
+    if (page != TmpMapDirectSentinel) {
+        BugOn(page->GetPhyAddress() != phyAddr);
+        page->Put();
+    }
 
     return phyAddr;
 }
