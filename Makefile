@@ -81,7 +81,6 @@ nos.iso: build/grub.cfg kernel64.elf
 	mkdir -p bin
 	cp kernel64.elf iso/boot/kernel64.elf
 	cp kernel64.elf bin/kernel64.elf
-	rm -rf kernel64.elf
 	cp build/grub.cfg iso/boot/grub/grub.cfg
 	$(MKRESCUE) -o nos.iso iso
 	rm -rf iso
