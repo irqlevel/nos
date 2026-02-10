@@ -227,6 +227,14 @@ void Schedule()
     }
 
     Task *curr = Task::GetCurrentTask();
+    if (!curr)
+    {
+        static long diagOnce = 0;
+        if (AtomicReadAndInc(&diagOnce) == 0)
+            Task::DiagnoseGetCurrentTask();
+        return;
+    }
+
     curr->PreemptDisableCounter.Inc();
     if (curr->PreemptDisableCounter.Get() > 1)
     {

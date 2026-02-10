@@ -38,6 +38,8 @@ public:
     bool Run(Task::Func func, void *ctx);
 
     void SendIPISelf();
+    void RequestTlbFlush();
+    void FlushTlbIfNeeded();
 
     TaskQueue& GetTaskQueue();
 
@@ -57,6 +59,7 @@ private:
     Task* IdleTaskPtr;
     TaskQueue TaskQueue;
     Atomic IPIConter;
+    Atomic TlbFlushPending;
 
     static const ulong Tag = 'Cpu ';
 };
@@ -94,6 +97,11 @@ public:
     void SendIPIAllExclude(ulong excludeIndex);
 
     void SendIPIAll();
+
+    void InvalidateTlbAll();
+
+    Atomic TlbFlushAckCounter;
+    Atomic TlbShootdownActive;
 
     void Reset();
 

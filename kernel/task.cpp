@@ -51,6 +51,8 @@ void Task::Release()
 
     if (StackPtr != nullptr)
     {
+        Trace(0, "task 0x%p %s free stack 0x%p",
+            this, Name, (ulong)StackPtr);
         delete StackPtr;
         StackPtr = nullptr;
     }
@@ -97,7 +99,14 @@ void Task::Exit()
 
 void Task::ExecCallback()
 {
-    BugOn(this != GetCurrentTask());
+    Task* curr = GetCurrentTask();
+    if (this != curr)
+    {
+        DiagnoseGetCurrentTask();
+        Trace(0, "ExecCallback: this 0x%p GetCurrentTask 0x%p rsp 0x%p",
+            (ulong)this, (ulong)curr, GetRsp());
+        BugOn(true);
+    }
     StartTime = GetBootTime();
     Function(Ctx);
     Exit();
@@ -126,6 +135,9 @@ bool Task::PrepareStart(Func func, void* ctx)
     {
         return false;
     }
+
+    Trace(0, "task 0x%p %s stack 0x%p top 0x%p",
+        this, Name, (ulong)StackPtr, (ulong)&StackPtr->StackTop[0]);
 
     if (!TaskTable::GetInstance().Insert(this))
     {
@@ -188,25 +200,52 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
 
 Task* Task::GetCurrentTask()
 {
+    /* Derive the task from RSP by rounding down to StackSize boundary.
+       Returns nullptr if the stack doesn't look valid (e.g. during SwitchComplete
+       before the new stack is fully set up, or on a non-task stack).
+       NOTE: no Trace() calls here — Trace takes a lock which calls
+       PreemptDisable -> GetCurrentTask, causing infinite recursion. */
     ulong rsp = GetRsp();
     struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
-    if (BugOn(stackPtr->Magic1 != StackMagic1))
+    if (stackPtr->Magic1 != StackMagic1)
         return nullptr;
 
-    if (BugOn(stackPtr->Magic2 != StackMagic2))
+    if (stackPtr->Magic2 != StackMagic2)
         return nullptr;
 
-    if (BugOn(rsp < ((ulong)&stackPtr->StackBottom[0] + Const::PageSize)))
+    if (rsp < ((ulong)&stackPtr->StackBottom[0] + Const::PageSize))
         return nullptr;
 
-    if (BugOn(rsp > (ulong)&stackPtr->StackTop[0]))
+    if (rsp > (ulong)&stackPtr->StackTop[0])
         return nullptr;
 
     Task* task = stackPtr->Task;
-    if (BugOn(task->Magic != TaskMagic))
+    if (task->Magic != TaskMagic)
         return nullptr;
 
     return task;
+}
+
+void Task::DiagnoseGetCurrentTask()
+{
+    /* Safe to call from contexts where Trace is allowed (e.g. Schedule).
+       Re-checks the same conditions as GetCurrentTask but logs the failure. */
+    ulong rsp = GetRsp();
+    struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
+
+    Trace(0, "DiagTask: rsp 0x%p base 0x%p", rsp, (ulong)stackPtr);
+    Trace(0, "DiagTask: Magic1 0x%p expect 0x%p", stackPtr->Magic1, StackMagic1);
+    Trace(0, "DiagTask: Magic2 0x%p expect 0x%p", stackPtr->Magic2, StackMagic2);
+    Trace(0, "DiagTask: StackBottom+page 0x%p StackTop 0x%p",
+        (ulong)&stackPtr->StackBottom[0] + Const::PageSize,
+        (ulong)&stackPtr->StackTop[0]);
+
+    if (stackPtr->Magic1 == StackMagic1 && stackPtr->Magic2 == StackMagic2)
+    {
+        Task* task = stackPtr->Task;
+        Trace(0, "DiagTask: Task 0x%p TaskMagic 0x%p expect 0x%p",
+            (ulong)task, task->Magic, TaskMagic);
+    }
 }
 
 void Task::SetName(const char *fmt, ...)

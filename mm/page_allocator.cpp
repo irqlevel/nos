@@ -4,6 +4,7 @@
 #include <include/const.h>
 #include <kernel/panic.h>
 #include <kernel/trace.h>
+#include <kernel/cpu.h>
 #include <lib/list_entry.h>
 #include <lib/bitmap.h>
 
@@ -44,80 +45,88 @@ bool FixedPageAllocator::Setup(ulong vaStart, ulong vaEnd, ulong pageCount)
 
 void* FixedPageAllocator::Alloc()
 {
-    Stdlib::AutoLock lock(Lock);
-
-    auto& pt = PageTable::GetInstance();
-    Page* pages[PageCount];
-
-    for (size_t i = 0; i < PageCount; i++)
+    void* addr = nullptr;
     {
-        pages[i] = pt.AllocPage();
-        if (pages[i] == 0)
-        {
-            for (size_t j = 0; j < i; j++)
-            {
-                pt.FreePage(pages[j]);
-            }
-            BugOn(1);
-            return nullptr;
-        }
-    }
+        Stdlib::AutoLock lock(Lock);
 
-    long blockIndex = Stdlib::Bitmap(BlockBitmap, BlockCount).FindSetZeroBit();
-    if (blockIndex < 0)
-    {
+        auto& pt = PageTable::GetInstance();
+        Page* pages[PageCount];
+
         for (size_t i = 0; i < PageCount; i++)
         {
-            pt.FreePage(pages[i]);
-        }
-        BugOn(1);
-        return nullptr;
-    }
-
-    for (size_t i = 0; i < PageCount; i++)
-    {
-        if (!pt.MapPage(VaStart + blockIndex * BlockSize + i * Const::PageSize, pages[i]))
-        {
-            for (size_t j = 0; j < i; j++)
+            pages[i] = pt.AllocPage();
+            if (pages[i] == 0)
             {
-                Page* page = pt.UnmapPage(VaStart + blockIndex * BlockSize + j * Const::PageSize);
-                pt.FreePage(page);
-                page->Put();
+                for (size_t j = 0; j < i; j++)
+                {
+                    pt.FreePage(pages[j]);
+                }
+                BugOn(1);
+                return nullptr;
             }
+        }
 
-            for (size_t j = i; j < PageCount; j++)
+        long blockIndex = Stdlib::Bitmap(BlockBitmap, BlockCount).FindSetZeroBit();
+        if (blockIndex < 0)
+        {
+            for (size_t i = 0; i < PageCount; i++)
             {
-                pt.FreePage(pages[j]);
+                pt.FreePage(pages[i]);
             }
             BugOn(1);
             return nullptr;
         }
+
+        for (size_t i = 0; i < PageCount; i++)
+        {
+            if (!pt.MapPage(VaStart + blockIndex * BlockSize + i * Const::PageSize, pages[i]))
+            {
+                for (size_t j = 0; j < i; j++)
+                {
+                    Page* page = pt.UnmapPage(VaStart + blockIndex * BlockSize + j * Const::PageSize);
+                    pt.FreePage(page);
+                    page->Put();
+                }
+
+                for (size_t j = i; j < PageCount; j++)
+                {
+                    pt.FreePage(pages[j]);
+                }
+                BugOn(1);
+                return nullptr;
+            }
+        }
+
+        addr = (void *)(VaStart + blockIndex * BlockSize);
     }
 
-    void* addr = (void *)(VaStart + blockIndex * BlockSize);
+    Kernel::CpuTable::GetInstance().InvalidateTlbAll();
     return addr;
 }
 
 bool FixedPageAllocator::Free(void* addr)
 {
-    Stdlib::AutoLock lock(Lock);
-
-    if ((ulong)addr < VaStart || (ulong)addr >= VaEnd)
-        return false;
-
-    BugOn(((ulong)addr % BlockSize) != 0);
-
-    ulong blockIndex = ((ulong)addr - VaStart) / BlockSize;
-    Stdlib::Bitmap(BlockBitmap, BlockCount).ClearBit(blockIndex);
-
-    auto& pt = PageTable::GetInstance();
-    for (size_t i = 0; i < PageCount; i++)
     {
-        Page* page = pt.UnmapPage(VaStart + blockIndex * BlockSize + i * Const::PageSize);
-        pt.FreePage(page);
-        page->Put();
+        Stdlib::AutoLock lock(Lock);
+
+        if ((ulong)addr < VaStart || (ulong)addr >= VaEnd)
+            return false;
+
+        BugOn(((ulong)addr % BlockSize) != 0);
+
+        ulong blockIndex = ((ulong)addr - VaStart) / BlockSize;
+        Stdlib::Bitmap(BlockBitmap, BlockCount).ClearBit(blockIndex);
+
+        auto& pt = PageTable::GetInstance();
+        for (size_t i = 0; i < PageCount; i++)
+        {
+            Page* page = pt.UnmapPage(VaStart + blockIndex * BlockSize + i * Const::PageSize);
+            pt.FreePage(page);
+            page->Put();
+        }
     }
 
+    Kernel::CpuTable::GetInstance().InvalidateTlbAll();
     return true;
 }
 

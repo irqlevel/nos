@@ -272,10 +272,73 @@ void Cpu::OnPanic()
     }
 }
 
+void Cpu::RequestTlbFlush()
+{
+    TlbFlushPending.Set(1);
+}
+
+void Cpu::FlushTlbIfNeeded()
+{
+    if (TlbFlushPending.Get())
+    {
+        TlbFlushPending.Set(0);
+        SetCr3(GetCr3());
+        CpuTable::GetInstance().TlbFlushAckCounter.Dec();
+    }
+}
+
+void CpuTable::InvalidateTlbAll()
+{
+    /* Flush TLB on local CPU and request flush on all remote CPUs.
+       Waits until every remote CPU has acknowledged the flush.
+       Serialized via TlbShootdownActive (spin with IRQs enabled so
+       the waiting CPU can still service IPIs). */
+    SetCr3(GetCr3());
+
+    while (TlbShootdownActive.Cmpxchg(1, 0) != 0)
+        Pause();
+
+    ulong localId = GetCurrentCpuId();
+    ulong cpuMask = GetRunningCpus() & ~(1UL << localId);
+    long remoteCount = 0;
+
+    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    {
+        if (cpuMask & (1UL << i))
+            remoteCount++;
+    }
+
+    if (remoteCount == 0)
+    {
+        TlbShootdownActive.Set(0);
+        return;
+    }
+
+    TlbFlushAckCounter.Set(remoteCount);
+
+    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    {
+        if (cpuMask & (1UL << i))
+        {
+            CpuArray[i].RequestTlbFlush();
+            CpuArray[i].SendIPISelf();
+        }
+    }
+
+    while (TlbFlushAckCounter.Get() > 0)
+    {
+        Pause();
+    }
+
+    TlbShootdownActive.Set(0);
+}
+
 void Cpu::IPI(Context* ctx)
 {
     (void)ctx;
     IPIConter.Inc();
+
+    FlushTlbIfNeeded();
 
     if (Panicker::GetInstance().IsActive())
     {

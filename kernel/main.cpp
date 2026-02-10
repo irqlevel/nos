@@ -110,7 +110,7 @@ void ApMain2()
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
 
-    Trace(0, "Cpu %u rsp 0x%p", cpu.GetIndex(), GetRsp());
+    Trace(0, "Cpu %u rsp 0x%p (static stack)", cpu.GetIndex(), GetRsp());
 
     if (!cpu.Run(ApStartup, nullptr))
     {
@@ -326,6 +326,11 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     Watchdog::GetInstance();
 
     Trace(0, "Cpu rsp 0x%p rbp 0x%p", GetRsp(), GetRbp());
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        Trace(0, "Static stack[%u] base 0x%p top 0x%p",
+            i, (ulong)&Stack[i][0], (ulong)&Stack[i][CpuStackSize]);
+    }
 
     auto& bpt = Mm::BuiltinPageTable::GetInstance();
     if (!bpt.Setup())
