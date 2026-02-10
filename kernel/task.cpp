@@ -207,20 +207,20 @@ Task* Task::GetCurrentTask()
        PreemptDisable -> GetCurrentTask, causing infinite recursion. */
     ulong rsp = GetRsp();
     struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
-    if (stackPtr->Magic1 != StackMagic1)
+    if (BugOn(stackPtr->Magic1 != StackMagic1))
         return nullptr;
 
-    if (stackPtr->Magic2 != StackMagic2)
+    if (BugOn(stackPtr->Magic2 != StackMagic2))
         return nullptr;
 
-    if (rsp < ((ulong)&stackPtr->StackBottom[0] + Const::PageSize))
+    if (BugOn(rsp < ((ulong)&stackPtr->StackBottom[0] + Const::PageSize)))
         return nullptr;
 
-    if (rsp > (ulong)&stackPtr->StackTop[0])
+    if (BugOn(rsp > (ulong)&stackPtr->StackTop[0]))
         return nullptr;
 
     Task* task = stackPtr->Task;
-    if (task->Magic != TaskMagic)
+    if (BugOn(task->Magic != TaskMagic))
         return nullptr;
 
     return task;
