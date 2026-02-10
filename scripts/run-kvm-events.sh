@@ -1,4 +1,5 @@
 #!/bin/bash -xv
+cd "$(dirname "$0")/.."
 trap ctrl_c INT
 
 function ctrl_c() {
