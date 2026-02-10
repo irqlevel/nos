@@ -64,6 +64,7 @@ public:
     bool Run(class TaskQueue& taskQueue, Func func, void* ctx);
 
     static Task* GetCurrentTask();
+    static void DiagnoseGetCurrentTask();
 
     virtual void Get() override;
     virtual void Put() override;

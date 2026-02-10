@@ -246,19 +246,17 @@ void ExceptionTable::ExcPageFault(Context* ctx)
 {
     (void)ctx;
 
-    Trace(0, "PageFault cr2 0x%p cr3 0x%p rip 0x%p", GetCr2(), GetCr3(), ctx->GetRetRip(true));
-
     ExcPageFaultCounter.Inc();
 
     ulong cr2 = GetCr2();
     ulong cr3 = GetCr3();
+    ulong rip = ctx->GetRetRip(true);
+    /* Original RSP from CPU exception frame (past error code + RIP + CS + RFLAGS) */
+    ulong origRsp = *((ulong *)(ctx->Rsp + 4 * sizeof(ulong)));
+    ulong errCode = *((ulong *)ctx->Rsp);
 
-    InterruptDisable();
-    Hlt();
-
-    Panic("EXC: PageFault cpu %u rip 0x%p rsp 0x%p cr2 0x%p cr3 0x%p",
-        CpuTable::GetInstance().GetCurrentCpuId(), ctx->GetRetRip(true), ctx->Rsp,
-        cr2, cr3);
+    Panic("EXC: PageFault cr2 0x%p rip 0x%p rsp 0x%p err 0x%p cr3 0x%p",
+        cr2, rip, origRsp, errCode, cr3);
 }
 
 void ExceptionTable::ExcReserved(Context* ctx)
