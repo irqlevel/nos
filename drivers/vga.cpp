@@ -28,6 +28,12 @@ VgaTerm::VgaTerm()
 
     Trace(0, "Vga 0x%p buf 0x%p mapped at 0x%p", this, BufPhyAddr, Buf);
 
+    /* Set cursor shape to underline (scan lines 13-15) */
+    Outb(VgaBase, 0x0A);
+    Outb(VgaBase + 1, 0x0D);
+    Outb(VgaBase, 0x0B);
+    Outb(VgaBase + 1, 0x0F);
+
     ClsLockHeld();
     Cursor();
 }
@@ -210,6 +216,8 @@ void VgaTerm::Backspace()
             PutCharAt('\0', MakeColor(ColorBlack, ColorBlack), Column, Row);
         }
     }
+
+    Cursor();
 }
 
 }

@@ -12,6 +12,9 @@ namespace Kernel
 Serial::Serial()
     : IntVector(-1)
 {
+    for (size_t i = 0; i < MaxObserver; i++)
+        RxObserver[i] = nullptr;
+
     Outb(Port + 1, 0x00);    // Disable all interrupts
     Outb(Port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
     Outb(Port + 0, 0x01);    // Set divisor to 1 (lo byte) 115200 baud
@@ -101,6 +104,8 @@ void Serial::PrintString(const char *str)
         Buf.Put(c);
     }
     Lock.Unlock(flags);
+
+    Send();
 }
 
 void Serial::VPrintf(const char *fmt, va_list args)
@@ -122,11 +127,55 @@ void Serial::Printf(const char *fmt, ...)
 	va_end(args);
 }
 
+void Serial::Backspace()
+{
+    /* Send BS, space, BS to erase character on serial terminal */
+    PrintString("\b \b");
+}
+
+bool Serial::RegisterObserver(SerialObserver& observer)
+{
+    ulong flags;
+    Lock.Lock(flags);
+
+    for (size_t i = 0; i < MaxObserver; i++)
+    {
+        if (RxObserver[i] == nullptr)
+        {
+            RxObserver[i] = &observer;
+            Lock.Unlock(flags);
+            return true;
+        }
+    }
+
+    Lock.Unlock(flags);
+    return false;
+}
+
+void Serial::UnregisterObserver(SerialObserver& observer)
+{
+    ulong flags;
+    Lock.Lock(flags);
+
+    for (size_t i = 0; i < MaxObserver; i++)
+    {
+        if (RxObserver[i] == &observer)
+        {
+            RxObserver[i] = nullptr;
+        }
+    }
+
+    Lock.Unlock(flags);
+}
+
 void Serial::OnInterruptRegister(u8 irq, u8 vector)
 {
     (void)irq;
 
     IntVector = vector;
+
+    /* Enable Received Data Available interrupt (IER bit 0) */
+    Outb(Port + 1, 0x01);
 }
 
 InterruptHandlerFn Serial::GetHandlerFn()
@@ -137,6 +186,30 @@ InterruptHandlerFn Serial::GetHandlerFn()
 void Serial::Interrupt(Context* ctx)
 {
     (void)ctx;
+
+    /* Check for received data (LSR bit 0 = Data Ready) */
+    while (Inb(Port + 5) & 0x01)
+    {
+        u8 data = Inb(Port);
+        char c = (char)data;
+        u8 code = 0;
+
+        if (c == '\r')
+        {
+            c = '\n';
+        }
+        else if (c == 0x7F || c == 0x08) /* DEL or BS */
+        {
+            c = '\b';
+            code = 0x0E; /* PS/2 backspace scan code */
+        }
+
+        for (size_t i = 0; i < MaxObserver; i++)
+        {
+            if (RxObserver[i] != nullptr)
+                RxObserver[i]->OnChar(c, code);
+        }
+    }
 
     Send();
 

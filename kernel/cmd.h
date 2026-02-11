@@ -2,6 +2,7 @@
 #include "task.h"
 
 #include <drivers/8042.h>
+#include <drivers/serial.h>
 #include <lib/stdlib.h>
 #include <lib/ring_buffer.h>
 #include <lib/printer.h>
@@ -11,6 +12,7 @@ namespace Kernel
 
 class Cmd final
     : public IO8042Observer
+    , public SerialObserver
 {
 public:
     static Cmd& GetInstance()
@@ -37,6 +39,7 @@ private:
     Cmd& operator=(const Cmd& other) = delete;
     Cmd& operator=(Cmd&& other) = delete;
 
+    void ShowBanner(Stdlib::Printer& out);
     void Run();
     static void RunFunc(void *ctx);
 

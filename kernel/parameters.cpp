@@ -9,6 +9,7 @@ Parameters::Parameters()
     : TraceVga(false)
     , PanicVga(false)
     , SmpOff(false)
+    , ConMode(ConsoleBoth)
 {
 }
 
@@ -29,6 +30,21 @@ bool Parameters::IsPanicVga()
 bool Parameters::IsSmpOff()
 {
     return SmpOff;
+}
+
+bool Parameters::IsConsoleSerial()
+{
+    return ConMode == ConsoleSerialOnly;
+}
+
+bool Parameters::IsConsoleVga()
+{
+    return ConMode == ConsoleVgaOnly;
+}
+
+bool Parameters::IsConsoleBoth()
+{
+    return ConMode == ConsoleBoth;
 }
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
@@ -89,6 +105,25 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         if (Stdlib::StrCmp(value, "off") == 0)
         {
             SmpOff = true;
+        }
+        else
+        {
+            Trace(0, "Unknown value %s, key %s", value, key);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "console") == 0)
+    {
+        if (Stdlib::StrCmp(value, "serial") == 0)
+        {
+            ConMode = ConsoleSerialOnly;
+        }
+        else if (Stdlib::StrCmp(value, "vga") == 0)
+        {
+            ConMode = ConsoleVgaOnly;
+        }
+        else if (Stdlib::StrCmp(value, "both") == 0)
+        {
+            ConMode = ConsoleBoth;
         }
         else
         {
