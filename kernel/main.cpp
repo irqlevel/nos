@@ -16,6 +16,7 @@
 #include "watchdog.h"
 #include "parameters.h"
 #include "console.h"
+#include "softirq.h"
 
 #include <boot/grub.h>
 
@@ -326,6 +327,12 @@ void BpStartup(void* ctx)
 
     StartSomeTasks();
 
+    if (!SoftIrq::GetInstance().Init())
+    {
+        Panic("Can't init softirq");
+        return;
+    }
+
     VgaTerm::GetInstance().Printf("Idle looping...\n");
 
     if (!cmd.Start())
@@ -346,9 +353,12 @@ void BpStartup(void* ctx)
             else
                 Trace(0, "Shutdown requested");
             cmd.Stop();
+            cmd.StopDhcp();
             break;
         }
     }
+
+    SoftIrq::GetInstance().Stop();
 
     StopSomeTasks();
 

@@ -40,7 +40,10 @@ CXX_SRC =   \
     kernel/cpu.cpp  \
     kernel/cmd.cpp  \
     kernel/block_device.cpp \
-    kernel/net_device.cpp \
+    net/net_device.cpp \
+    net/arp.cpp \
+    net/dhcp.cpp \
+    kernel/softirq.cpp \
     kernel/exception.cpp    \
     kernel/dmesg.cpp    \
     kernel/sched.cpp    \
@@ -69,8 +72,11 @@ ASM_SRC =    \
     kernel/asm.asm
 
 OBJS = $(CXX_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
+DEPS = $(CXX_SRC:.cpp=.d)
 
 .PHONY: all check nocheck clean %.o
+
+-include $(DEPS)
 
 all: check nos.iso
 
@@ -93,9 +99,9 @@ nos.iso: build/grub.cfg kernel64.elf
 %.o: %.asm
 	$(ASM) -felf64 $< -o $@
 %.o: %.cpp
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -c $< -o $@
 
 kernel64.elf: build/linker64.ld $(OBJS)
 	$(LD) $(LDFLAGS) -T $< -o kernel64.elf $(OBJS)
 clean:
-	rm -rf $(OBJS) *.elf *.bin *.iso iso
+	rm -rf $(OBJS) $(DEPS) *.elf *.bin *.iso iso

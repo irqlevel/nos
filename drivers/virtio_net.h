@@ -2,7 +2,8 @@
 
 #include <include/types.h>
 #include <kernel/interrupt.h>
-#include <kernel/net_device.h>
+#include <net/net_device.h>
+#include <net/net.h>
 #include <kernel/spin_lock.h>
 #include <kernel/atomic.h>
 #include <kernel/asm.h>
@@ -27,6 +28,9 @@ public:
     virtual u64 GetTxPackets() override;
     virtual u64 GetRxPackets() override;
     virtual u64 GetRxDropped() override;
+    virtual u32 GetIp() override;
+    virtual void SetIp(u32 ip) override;
+    virtual void SetRxCallback(RxCallback cb, void* ctx) override;
 
     /* Higher-level UDP send */
     bool SendUdp(u32 dstIp, u16 dstPort, u32 srcIp, u16 srcPort,
@@ -37,6 +41,9 @@ public:
     virtual InterruptHandlerFn GetHandlerFn() override;
 
     void Interrupt(Context* ctx);
+
+    /* Called from soft IRQ task to process received packets */
+    void DrainRx();
 
     /* Discover and initialize all virtio-net devices. */
     static void InitAll();
@@ -80,89 +87,11 @@ private:
 
     static_assert(sizeof(VirtioNetHdr) == 10, "Invalid size");
 
-    /* Ethernet header */
-    struct EthHdr
-    {
-        u8 DstMac[6];
-        u8 SrcMac[6];
-        u16 EtherType;
-    } __attribute__((packed));
-
-    static_assert(sizeof(EthHdr) == 14, "Invalid size");
-
-    /* ARP packet */
-    struct ArpPacket
-    {
-        u16 HwType;
-        u16 ProtoType;
-        u8 HwSize;
-        u8 ProtoSize;
-        u16 Opcode;
-        u8 SenderMac[6];
-        u32 SenderIp;
-        u8 TargetMac[6];
-        u32 TargetIp;
-    } __attribute__((packed));
-
-    static_assert(sizeof(ArpPacket) == 28, "Invalid size");
-
-    /* IP header */
-    struct IpHdr
-    {
-        u8 VersionIhl;
-        u8 Tos;
-        u16 TotalLen;
-        u16 Id;
-        u16 FragOff;
-        u8 Ttl;
-        u8 Protocol;
-        u16 Checksum;
-        u32 SrcAddr;
-        u32 DstAddr;
-    } __attribute__((packed));
-
-    static_assert(sizeof(IpHdr) == 20, "Invalid size");
-
-    /* UDP header */
-    struct UdpHdr
-    {
-        u16 SrcPort;
-        u16 DstPort;
-        u16 Length;
-        u16 Checksum;
-    } __attribute__((packed));
-
-    static_assert(sizeof(UdpHdr) == 8, "Invalid size");
-
-    /* ARP cache */
-    struct ArpEntry
-    {
-        u32 Ip;
-        u8 Mac[6];
-        bool Valid;
-    };
-
-    static const ulong ArpCacheSize = 16;
-    ArpEntry ArpCache[ArpCacheSize];
-
-    bool ArpLookup(u32 ip, u8 mac[6]);
-    void ArpInsert(u32 ip, const u8 mac[6]);
-    bool ArpRequest(u32 ip);
-    void ArpProcess(const u8* frame, ulong len);
-    void ArpSendReply(const u8* reqFrame);
-
     /* RX buffer management */
     static const ulong RxBufCount = 16;
     static const ulong RxBufSize = 2048;
     void PostRxBuf(ulong index);
     void PostAllRxBufs();
-    void DrainRx();
-
-    static u16 Htons(u16 v);
-    static u32 Htonl(u32 v);
-    static u16 Ntohs(u16 v);
-    static u32 Ntohl(u32 v);
-    static u16 IpChecksum(const void* data, ulong len);
 
     u16 IoBase;
     VirtQueue RxQueue;
@@ -177,6 +106,10 @@ private:
     Atomic TxPktCount;
     Atomic RxPktCount;
     Atomic RxDropCount;
+
+    RxCallback RxCb;
+    void* RxCbCtx;
+    SpinLock RxCbLock;
 
     /* DMA buffers */
     u8* TxBuf;

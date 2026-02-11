@@ -8,12 +8,24 @@
 #include <kernel/panic.h>
 #include <kernel/interrupt.h>
 #include <kernel/idt.h>
+#include <kernel/softirq.h>
+#include <net/arp.h>
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
 #include <mm/new.h>
 
 namespace Kernel
 {
+
+using Net::EthHdr;
+using Net::IpHdr;
+using Net::UdpHdr;
+using Net::ArpPacket;
+using Net::Htons;
+using Net::Htonl;
+using Net::Ntohs;
+using Net::Ntohl;
+using Net::IpChecksum;
 
 VirtioNet VirtioNet::Instances[MaxInstances];
 ulong VirtioNet::InstanceCount = 0;
@@ -23,6 +35,8 @@ VirtioNet::VirtioNet()
     , MyIp(0)
     , IntVector(-1)
     , Initialized(false)
+    , RxCb(nullptr)
+    , RxCbCtx(nullptr)
     , TxBuf(nullptr)
     , TxBufPhys(0)
     , RxBufs(nullptr)
@@ -30,55 +44,10 @@ VirtioNet::VirtioNet()
 {
     DevName[0] = '\0';
     Stdlib::MemSet(MacAddr, 0, sizeof(MacAddr));
-    Stdlib::MemSet(ArpCache, 0, sizeof(ArpCache));
 }
 
 VirtioNet::~VirtioNet()
 {
-}
-
-u16 VirtioNet::Htons(u16 v)
-{
-    return (u16)((v >> 8) | (v << 8));
-}
-
-u32 VirtioNet::Htonl(u32 v)
-{
-    return ((v >> 24) & 0xFF) |
-           ((v >> 8) & 0xFF00) |
-           ((v << 8) & 0xFF0000) |
-           ((v << 24) & 0xFF000000);
-}
-
-u16 VirtioNet::Ntohs(u16 v)
-{
-    return Htons(v);
-}
-
-u32 VirtioNet::Ntohl(u32 v)
-{
-    return Htonl(v);
-}
-
-u16 VirtioNet::IpChecksum(const void* data, ulong len)
-{
-    const u8* p = (const u8*)data;
-    u32 sum = 0;
-
-    for (ulong i = 0; i < len; i += 2)
-    {
-        u16 word;
-        if (i + 1 < len)
-            word = (u16)((p[i] << 8) | p[i + 1]);
-        else
-            word = (u16)(p[i] << 8);
-        sum += word;
-    }
-
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
-
-    return (u16)(~sum);
 }
 
 bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
@@ -295,9 +264,46 @@ void VirtioNet::DrainRx()
                 EthHdr* eth = (EthHdr*)frame;
                 u16 etherType = Ntohs(eth->EtherType);
 
-                if (etherType == 0x0806)
+                if (etherType == Net::EtherTypeArp)
                 {
-                    ArpProcess(frame, frameLen);
+                    ArpTable::GetInstance().Process(this, frame, frameLen);
+                }
+                else if (etherType == Net::EtherTypeIp)
+                {
+                    /* Snapshot callback pointer under lock */
+                    RxCallback cb;
+                    void* cbCtx;
+                    {
+                        Stdlib::AutoLock lock(RxCbLock);
+                        cb = RxCb;
+                        cbCtx = RxCbCtx;
+                    }
+
+                    /* Check for UDP dst port 68 (DHCP client) */
+                    if (cb && frameLen >= sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
+                    {
+                        IpHdr* ip = (IpHdr*)(frame + sizeof(EthHdr));
+                        if (ip->Protocol == 17) /* UDP */
+                        {
+                            UdpHdr* udp = (UdpHdr*)(frame + sizeof(EthHdr) + sizeof(IpHdr));
+                            if (Ntohs(udp->DstPort) == 68)
+                            {
+                                cb(frame, frameLen, cbCtx);
+                            }
+                            else
+                            {
+                                RxDropCount.Inc();
+                            }
+                        }
+                        else
+                        {
+                            RxDropCount.Inc();
+                        }
+                    }
+                    else
+                    {
+                        RxDropCount.Inc();
+                    }
                 }
                 else
                 {
@@ -326,201 +332,6 @@ void VirtioNet::DrainRx()
     {
         RxQueue.Kick(IoBase + RegQueueNotify, 0);
     }
-}
-
-/* --- ARP --- */
-
-bool VirtioNet::ArpLookup(u32 ip, u8 mac[6])
-{
-    for (ulong i = 0; i < ArpCacheSize; i++)
-    {
-        if (ArpCache[i].Valid && ArpCache[i].Ip == ip)
-        {
-            Stdlib::MemCpy(mac, ArpCache[i].Mac, 6);
-            return true;
-        }
-    }
-    return false;
-}
-
-void VirtioNet::ArpInsert(u32 ip, const u8 mac[6])
-{
-    /* Look for existing entry first */
-    for (ulong i = 0; i < ArpCacheSize; i++)
-    {
-        if (ArpCache[i].Valid && ArpCache[i].Ip == ip)
-        {
-            Stdlib::MemCpy(ArpCache[i].Mac, mac, 6);
-            return;
-        }
-    }
-
-    /* Find an empty slot */
-    for (ulong i = 0; i < ArpCacheSize; i++)
-    {
-        if (!ArpCache[i].Valid)
-        {
-            ArpCache[i].Ip = ip;
-            Stdlib::MemCpy(ArpCache[i].Mac, mac, 6);
-            ArpCache[i].Valid = true;
-            return;
-        }
-    }
-
-    /* Cache full, overwrite first entry */
-    ArpCache[0].Ip = ip;
-    Stdlib::MemCpy(ArpCache[0].Mac, mac, 6);
-    ArpCache[0].Valid = true;
-}
-
-void VirtioNet::ArpProcess(const u8* frame, ulong len)
-{
-    if (len < sizeof(EthHdr) + sizeof(ArpPacket))
-        return;
-
-    const ArpPacket* arp = (const ArpPacket*)(frame + sizeof(EthHdr));
-
-    u16 opcode = Ntohs(arp->Opcode);
-
-    if (opcode == 1) /* ARP Request */
-    {
-        /* If they're asking for our IP, send a reply */
-        if (Ntohl(arp->TargetIp) == MyIp)
-        {
-            ArpSendReply(frame);
-        }
-        /* Also learn the sender's MAC */
-        ArpInsert(Ntohl(arp->SenderIp), arp->SenderMac);
-    }
-    else if (opcode == 2) /* ARP Reply */
-    {
-        ArpInsert(Ntohl(arp->SenderIp), arp->SenderMac);
-    }
-}
-
-void VirtioNet::ArpSendReply(const u8* reqFrame)
-{
-    const EthHdr* reqEth = (const EthHdr*)reqFrame;
-    const ArpPacket* reqArp = (const ArpPacket*)(reqFrame + sizeof(EthHdr));
-
-    /* Build reply in TX buffer */
-    u8* pkt = TxBuf;
-    Stdlib::MemSet(pkt, 0, sizeof(VirtioNetHdr) + sizeof(EthHdr) + sizeof(ArpPacket));
-
-    /* Virtio net header (all zeros) */
-    ulong off = sizeof(VirtioNetHdr);
-
-    /* Ethernet header */
-    EthHdr* eth = (EthHdr*)(pkt + off);
-    Stdlib::MemCpy(eth->DstMac, reqEth->SrcMac, 6);
-    Stdlib::MemCpy(eth->SrcMac, MacAddr, 6);
-    eth->EtherType = Htons(0x0806);
-    off += sizeof(EthHdr);
-
-    /* ARP reply */
-    ArpPacket* arp = (ArpPacket*)(pkt + off);
-    arp->HwType = Htons(1);
-    arp->ProtoType = Htons(0x0800);
-    arp->HwSize = 6;
-    arp->ProtoSize = 4;
-    arp->Opcode = Htons(2); /* Reply */
-    Stdlib::MemCpy(arp->SenderMac, MacAddr, 6);
-    arp->SenderIp = Htonl(MyIp);
-    Stdlib::MemCpy(arp->TargetMac, reqArp->SenderMac, 6);
-    arp->TargetIp = reqArp->SenderIp;
-    off += sizeof(ArpPacket);
-
-    /* Send via TX queue */
-    VirtQueue::BufDesc buf;
-    buf.Addr = TxBufPhys;
-    buf.Len = (u32)off;
-    buf.Writable = false;
-
-    Stdlib::AutoLock lock(TxLock);
-
-    TxQueue.AddBufs(&buf, 1);
-    TxQueue.Kick(IoBase + RegQueueNotify, 1);
-
-    /* Poll for completion */
-    for (ulong i = 0; i < 10000000; i++)
-    {
-        if (TxQueue.HasUsed())
-            break;
-        Pause();
-    }
-
-    u32 usedId, usedLen;
-    TxQueue.GetUsed(usedId, usedLen);
-}
-
-bool VirtioNet::ArpRequest(u32 ip)
-{
-    /* Build ARP request in TX buffer */
-    u8* pkt = TxBuf;
-    Stdlib::MemSet(pkt, 0, sizeof(VirtioNetHdr) + sizeof(EthHdr) + sizeof(ArpPacket));
-
-    ulong off = sizeof(VirtioNetHdr);
-
-    /* Ethernet header -- broadcast */
-    EthHdr* eth = (EthHdr*)(pkt + off);
-    Stdlib::MemSet(eth->DstMac, 0xFF, 6);
-    Stdlib::MemCpy(eth->SrcMac, MacAddr, 6);
-    eth->EtherType = Htons(0x0806);
-    off += sizeof(EthHdr);
-
-    /* ARP request */
-    ArpPacket* arp = (ArpPacket*)(pkt + off);
-    arp->HwType = Htons(1);
-    arp->ProtoType = Htons(0x0800);
-    arp->HwSize = 6;
-    arp->ProtoSize = 4;
-    arp->Opcode = Htons(1); /* Request */
-    Stdlib::MemCpy(arp->SenderMac, MacAddr, 6);
-    arp->SenderIp = Htonl(MyIp);
-    Stdlib::MemSet(arp->TargetMac, 0, 6);
-    arp->TargetIp = Htonl(ip);
-    off += sizeof(ArpPacket);
-
-    /* Send */
-    VirtQueue::BufDesc buf;
-    buf.Addr = TxBufPhys;
-    buf.Len = (u32)off;
-    buf.Writable = false;
-
-    {
-        Stdlib::AutoLock lock(TxLock);
-
-        TxQueue.AddBufs(&buf, 1);
-        TxQueue.Kick(IoBase + RegQueueNotify, 1);
-
-        for (ulong i = 0; i < 10000000; i++)
-        {
-            if (TxQueue.HasUsed())
-                break;
-            Pause();
-        }
-
-        u32 usedId, usedLen;
-        TxQueue.GetUsed(usedId, usedLen);
-    }
-
-    TxPktCount.Inc();
-
-    /* Wait for ARP reply -- poll RX a few times */
-    for (ulong attempt = 0; attempt < 100; attempt++)
-    {
-        DrainRx();
-
-        u8 mac[6];
-        if (ArpLookup(ip, mac))
-            return true;
-
-        /* Brief delay */
-        for (ulong j = 0; j < 100000; j++)
-            Pause();
-    }
-
-    return false;
 }
 
 /* --- Send --- */
@@ -581,14 +392,11 @@ bool VirtioNet::SendUdp(u32 dstIp, u16 dstPort, u32 srcIp, u16 srcPort,
 
     /* Resolve destination MAC via ARP */
     u8 dstMac[6];
-    if (!ArpLookup(dstIp, dstMac))
+    if (!ArpTable::GetInstance().Resolve(this, dstIp, dstMac))
     {
-        if (!ArpRequest(dstIp))
-        {
-            Trace(0, "VirtioNet %s: ARP failed for 0x%p", DevName, (ulong)dstIp);
-            /* Fall back to broadcast */
-            Stdlib::MemSet(dstMac, 0xFF, 6);
-        }
+        Trace(0, "VirtioNet %s: ARP failed for 0x%p", DevName, (ulong)dstIp);
+        /* Fall back to broadcast */
+        Stdlib::MemSet(dstMac, 0xFF, 6);
     }
 
     ulong udpLen = sizeof(UdpHdr) + len;
@@ -670,6 +478,23 @@ u64 VirtioNet::GetRxDropped()
     return (u64)RxDropCount.Get();
 }
 
+u32 VirtioNet::GetIp()
+{
+    return MyIp;
+}
+
+void VirtioNet::SetIp(u32 ip)
+{
+    MyIp = ip;
+}
+
+void VirtioNet::SetRxCallback(RxCallback cb, void* ctx)
+{
+    Stdlib::AutoLock lock(RxCbLock);
+    RxCb = cb;
+    RxCbCtx = ctx;
+}
+
 /* --- Interrupt --- */
 
 void VirtioNet::OnInterruptRegister(u8 irq, u8 vector)
@@ -691,8 +516,20 @@ void VirtioNet::Interrupt(Context* ctx)
     /* Acknowledge interrupt */
     Inb(IoBase + RegISRStatus);
 
-    /* Drain RX queue */
-    DrainRx();
+    /* Defer RX processing to the soft IRQ task */
+    SoftIrq::GetInstance().Raise(SoftIrq::TypeNetRx);
+}
+
+/* --- Soft IRQ handler --- */
+
+static void NetRxSoftIrqHandler(void* ctx)
+{
+    (void)ctx;
+
+    for (ulong i = 0; i < VirtioNet::InstanceCount; i++)
+    {
+        VirtioNet::Instances[i].DrainRx();
+    }
 }
 
 /* --- InitAll --- */
@@ -726,6 +563,11 @@ void VirtioNet::InitAll()
         {
             InstanceCount++;
         }
+    }
+
+    if (InstanceCount > 0)
+    {
+        SoftIrq::GetInstance().Register(SoftIrq::TypeNetRx, NetRxSoftIrqHandler, nullptr);
     }
 
     Trace(0, "VirtioNet: initialized %u devices", InstanceCount);

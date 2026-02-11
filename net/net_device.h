@@ -16,6 +16,12 @@ public:
     virtual u64 GetTxPackets() = 0;
     virtual u64 GetRxPackets() = 0;
     virtual u64 GetRxDropped() = 0;
+
+    virtual u32 GetIp() { return 0; }
+    virtual void SetIp(u32 ip) { (void)ip; }
+
+    typedef void (*RxCallback)(const u8* frame, ulong len, void* ctx);
+    virtual void SetRxCallback(RxCallback cb, void* ctx) { (void)cb; (void)ctx; }
 };
 
 class NetDeviceTable

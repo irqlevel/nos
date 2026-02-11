@@ -12,9 +12,9 @@ A hobby x86-64 operating system kernel written in C++14 and NASM.
 - **Interrupts** — IDT with exception handlers, IOAPIC routing, LAPIC IPI, PIC (remapped then disabled)
 - **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**
 - **Block I/O** — virtio-blk driver with virtqueue DMA, block device abstraction, disk discovery and enumeration
-- **Networking** — virtio-net driver, ARP (cache, request, reply), IPv4/UDP transmit, network device abstraction
+- **Networking** — virtio-net driver, ARP (cache, request, reply), IPv4/UDP transmit, DHCP client with lease renewal, network device abstraction
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `cls`, `help`, `poweroff`, `reboot`
+- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `dhcp`, `cls`, `help`, `poweroff`, `reboot`
 - **Kernel infrastructure** — spinlocks, atomics, timers, watchdog, stack traces, dmesg ring buffer, panic handler
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc, parsing helpers, block device table
 
@@ -97,6 +97,7 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 | `help` | List commands |
 | `net` | List network devices and stats |
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
+| `dhcp [dev]` | Obtain IP address via DHCP |
 | `poweroff` / `shutdown` | Power off (ACPI S5) |
 | `reboot` | Reset system (keyboard controller) |
 
@@ -105,7 +106,8 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 ```
 boot/       Multiboot2 entry, 32→64-bit transition, AP trampoline
 kernel/     Core: scheduling, tasks, interrupts, shell, timers, locks
-drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI, virtio-blk
+drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI, virtio-blk, virtio-net
+net/        Networking: device abstraction, protocol headers, ARP, DHCP
 mm/         Memory: page tables, page allocator, pool allocator
 lib/        Utilities: list, vector, btree, ring buffer, bitmap, stdlib
 build/      Linker script, GRUB configs

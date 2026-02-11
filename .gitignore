@@ -13,3 +13,4 @@ bin
 *.img
 *.disk
 *.qcow2
+*.d

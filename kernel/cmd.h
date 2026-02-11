@@ -29,6 +29,7 @@ public:
     bool Start();
 
     void Stop();
+    void StopDhcp();
 
 private:
     void ProcessCmd(const char *cmd);
