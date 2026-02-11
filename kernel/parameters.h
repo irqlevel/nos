@@ -24,6 +24,9 @@ public:
     bool IsConsoleVga();
     bool IsConsoleBoth();
 
+    bool IsDhcpAuto();
+    bool IsDhcpOff();
+
     Parameters();
     ~Parameters();
 private:
@@ -35,10 +38,17 @@ private:
         ConsoleVgaOnly,
     };
 
+    enum DhcpMode {
+        DhcpOn = 0,    /* start only by cmd (default) */
+        DhcpAuto,      /* start automatically at boot */
+        DhcpOff,       /* disabled entirely */
+    };
+
     char Cmdline[256];
     bool TraceVga;
     bool PanicVga;
     bool SmpOff;
     ConsoleMode ConMode;
+    DhcpMode DhcpMd;
 };
 }

@@ -6,17 +6,26 @@
 #include "time.h"
 #include "watchdog.h"
 #include "block_device.h"
-#include "net_device.h"
+#include "parameters.h"
+#include <net/net_device.h>
+#include <net/net.h>
+#include <net/arp.h>
+#include <net/dhcp.h>
 #include "console.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
-#include <drivers/virtio_net.h>
 #include <mm/page_table.h>
 #include <mm/new.h>
 
 namespace Kernel
 {
+
+static DhcpClient& GetDhcpClient()
+{
+    static DhcpClient instance;
+    return instance;
+}
 
 Cmd::Cmd()
     : TaskPtr(nullptr)
@@ -320,25 +329,134 @@ void Cmd::ProcessCmd(const char *cmd)
                             }
                             else
                             {
-                                VirtioNet* vnet = (VirtioNet*)dev;
                                 ulong msgLen = Stdlib::StrLen(msg);
-                                u32 srcIp = (10 << 24) | (0 << 16) | (2 << 8) | 15;
+                                u32 srcIp = dev->GetIp();
 
-                                if (vnet->SendUdp(dstIp, (u16)port,
-                                    srcIp, 12345, msg, msgLen))
+                                /* Resolve destination MAC via ARP */
+                                u8 dstMac[6];
+                                if (!ArpTable::GetInstance().Resolve(dev, dstIp, dstMac))
+                                    Stdlib::MemSet(dstMac, 0xFF, 6);
+
+                                /* Build UDP frame */
+                                ulong udpPayLen = sizeof(Net::UdpHdr) + msgLen;
+                                ulong ipPayLen = sizeof(Net::IpHdr) + udpPayLen;
+                                ulong frameLen = sizeof(Net::EthHdr) + ipPayLen;
+
+                                if (frameLen > 1514)
                                 {
-                                    con.Printf("sent %u bytes to %s:%u\n",
-                                        msgLen, ipBuf, port);
+                                    con.Printf("message too large\n");
                                 }
                                 else
                                 {
-                                    con.Printf("send failed\n");
+                                    u8 frame[1514];
+                                    Stdlib::MemSet(frame, 0, sizeof(frame));
+                                    ulong off = 0;
+
+                                    Net::EthHdr* eth = (Net::EthHdr*)(frame + off);
+                                    Stdlib::MemCpy(eth->DstMac, dstMac, 6);
+                                    dev->GetMac(eth->SrcMac);
+                                    eth->EtherType = Net::Htons(Net::EtherTypeIp);
+                                    off += sizeof(Net::EthHdr);
+
+                                    Net::IpHdr* ip = (Net::IpHdr*)(frame + off);
+                                    ip->VersionIhl = 0x45;
+                                    ip->TotalLen = Net::Htons((u16)ipPayLen);
+                                    ip->Ttl = 64;
+                                    ip->Protocol = 17;
+                                    ip->SrcAddr = Net::Htonl(srcIp);
+                                    ip->DstAddr = Net::Htonl(dstIp);
+                                    ip->Checksum = Net::Htons(Net::IpChecksum(ip, sizeof(Net::IpHdr)));
+                                    off += sizeof(Net::IpHdr);
+
+                                    Net::UdpHdr* udp = (Net::UdpHdr*)(frame + off);
+                                    udp->SrcPort = Net::Htons(12345);
+                                    udp->DstPort = Net::Htons((u16)port);
+                                    udp->Length = Net::Htons((u16)udpPayLen);
+                                    off += sizeof(Net::UdpHdr);
+
+                                    Stdlib::MemCpy(frame + off, msg, msgLen);
+                                    off += msgLen;
+
+                                    if (dev->SendRaw(frame, off))
+                                    {
+                                        con.Printf("sent %u bytes to %s:%u\n",
+                                            msgLen, ipBuf, port);
+                                    }
+                                    else
+                                    {
+                                        con.Printf("send failed\n");
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+    else if (Stdlib::MemCmp(cmd, "dhcp", 4) == 0)
+    {
+        if (Parameters::GetInstance().IsDhcpOff())
+        {
+            con.Printf("DHCP disabled (dhcp=off)\n");
+        }
+        else
+        {
+        const char* devName = "eth0";
+        if (cmd[4] == ' ' && cmd[5] != '\0')
+            devName = cmd + 5;
+
+        NetDevice* dev = NetDeviceTable::GetInstance().Find(devName);
+        if (!dev)
+        {
+            con.Printf("device '%s' not found\n", devName);
+        }
+        else
+        {
+            if (GetDhcpClient().IsReady())
+            {
+                DhcpResult r = GetDhcpClient().GetResult();
+                con.Printf("already bound: %u.%u.%u.%u\n",
+                    (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
+                    (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
+            }
+            else
+            {
+                con.Printf("DHCP discovering on %s...\n", devName);
+                if (!GetDhcpClient().Start(dev))
+                {
+                    con.Printf("failed to start DHCP\n");
+                }
+                else
+                {
+                    /* Wait up to 10 seconds for a lease */
+                    for (ulong i = 0; i < 100 && !GetDhcpClient().IsReady(); i++)
+                        Sleep(100 * Const::NanoSecsInMs);
+
+                    if (GetDhcpClient().IsReady())
+                    {
+                        DhcpResult r = GetDhcpClient().GetResult();
+                        con.Printf("ip:     %u.%u.%u.%u\n",
+                            (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
+                            (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
+                        con.Printf("mask:   %u.%u.%u.%u\n",
+                            (r.Mask >> 24) & 0xFF, (r.Mask >> 16) & 0xFF,
+                            (r.Mask >> 8) & 0xFF, r.Mask & 0xFF);
+                        con.Printf("router: %u.%u.%u.%u\n",
+                            (r.Router >> 24) & 0xFF, (r.Router >> 16) & 0xFF,
+                            (r.Router >> 8) & 0xFF, r.Router & 0xFF);
+                        con.Printf("dns:    %u.%u.%u.%u\n",
+                            (r.Dns >> 24) & 0xFF, (r.Dns >> 16) & 0xFF,
+                            (r.Dns >> 8) & 0xFF, r.Dns & 0xFF);
+                        con.Printf("lease:  %u seconds\n", r.LeaseTime);
+                    }
+                    else
+                    {
+                        con.Printf("DHCP timeout\n");
+                    }
+                }
+            }
+        }
         }
     }
     else if (Stdlib::StrCmp(cmd, "help") == 0)
@@ -357,6 +475,7 @@ void Cmd::ProcessCmd(const char *cmd)
         con.Printf("diskwrite <disk> <sector> <hex> - write sector\n");
         con.Printf("net - list network devices\n");
         con.Printf("udpsend <ip> <port> <msg> - send UDP packet\n");
+        con.Printf("dhcp [dev] - obtain IP via DHCP\n");
         con.Printf("help - help\n");
     }
     else
@@ -385,6 +504,11 @@ void Cmd::Stop()
         TaskPtr->SetStopping();
         TaskPtr->Wait();
     }
+}
+
+void Cmd::StopDhcp()
+{
+    GetDhcpClient().Stop();
 }
 
 bool Cmd::Start()
@@ -448,6 +572,37 @@ void Cmd::Run()
 
     /* Wait for startup trace output to settle before showing banner */
     Sleep(100 * Const::NanoSecsInMs);
+
+    if (Parameters::GetInstance().IsDhcpAuto())
+    {
+        NetDevice* dev = NetDeviceTable::GetInstance().Find("eth0");
+        if (dev)
+        {
+            con.Printf("DHCP auto on eth0...\n");
+            if (GetDhcpClient().Start(dev))
+            {
+                for (ulong i = 0; i < 100 && !GetDhcpClient().IsReady(); i++)
+                    Sleep(100 * Const::NanoSecsInMs);
+
+                if (GetDhcpClient().IsReady())
+                {
+                    DhcpResult r = GetDhcpClient().GetResult();
+                    con.Printf("ip: %u.%u.%u.%u\n",
+                        (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
+                        (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
+                }
+                else
+                {
+                    con.Printf("DHCP auto timeout\n");
+                }
+            }
+            else
+            {
+                con.Printf("DHCP auto failed\n");
+            }
+        }
+    }
+
     ShowBanner(con);
 
     while (!Task::GetCurrentTask()->IsStopping())

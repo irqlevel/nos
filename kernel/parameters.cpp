@@ -10,6 +10,7 @@ Parameters::Parameters()
     , PanicVga(false)
     , SmpOff(false)
     , ConMode(ConsoleBoth)
+    , DhcpMd(DhcpOn)
 {
 }
 
@@ -45,6 +46,16 @@ bool Parameters::IsConsoleVga()
 bool Parameters::IsConsoleBoth()
 {
     return ConMode == ConsoleBoth;
+}
+
+bool Parameters::IsDhcpAuto()
+{
+    return DhcpMd == DhcpAuto;
+}
+
+bool Parameters::IsDhcpOff()
+{
+    return DhcpMd == DhcpOff;
 }
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
@@ -124,6 +135,25 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         else if (Stdlib::StrCmp(value, "both") == 0)
         {
             ConMode = ConsoleBoth;
+        }
+        else
+        {
+            Trace(0, "Unknown value %s, key %s", value, key);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "dhcp") == 0)
+    {
+        if (Stdlib::StrCmp(value, "auto") == 0)
+        {
+            DhcpMd = DhcpAuto;
+        }
+        else if (Stdlib::StrCmp(value, "on") == 0)
+        {
+            DhcpMd = DhcpOn;
+        }
+        else if (Stdlib::StrCmp(value, "off") == 0)
+        {
+            DhcpMd = DhcpOff;
         }
         else
         {
