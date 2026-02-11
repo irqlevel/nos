@@ -8,6 +8,7 @@
 #include <kernel/asm.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
+#include <drivers/virtio_pci.h>
 
 namespace Kernel
 {
@@ -44,24 +45,6 @@ private:
 
     bool DoIO(u32 type, u64 sector, void* buf);
 
-    /* Virtio legacy PCI BAR0 register offsets */
-    static const u16 RegDeviceFeatures = 0x00;
-    static const u16 RegGuestFeatures  = 0x04;
-    static const u16 RegQueuePfn       = 0x08;
-    static const u16 RegQueueSize      = 0x0C;
-    static const u16 RegQueueSelect    = 0x0E;
-    static const u16 RegQueueNotify    = 0x10;
-    static const u16 RegDeviceStatus   = 0x12;
-    static const u16 RegISRStatus      = 0x13;
-    static const u16 RegConfig         = 0x14;
-
-    /* Device status bits */
-    static const u8 StatusAcknowledge = 1;
-    static const u8 StatusDriver      = 2;
-    static const u8 StatusDriverOk    = 4;
-    static const u8 StatusFeaturesOk  = 8;
-    static const u8 StatusFailed      = 128;
-
     /* Virtio-blk request types */
     static const u32 TypeIn  = 0; /* Read */
     static const u32 TypeOut = 1; /* Write */
@@ -75,7 +58,8 @@ private:
 
     static_assert(sizeof(VirtioBlkReq) == 16, "Invalid size");
 
-    u16 IoBase;
+    VirtioPci Transport;
+    volatile void* QueueNotifyAddr;
     VirtQueue Queue;
     u64 CapacitySectors;
     SpinLock IoLock;

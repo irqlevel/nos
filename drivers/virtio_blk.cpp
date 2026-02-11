@@ -19,7 +19,7 @@ VirtioBlk VirtioBlk::Instances[MaxInstances];
 ulong VirtioBlk::InstanceCount = 0;
 
 VirtioBlk::VirtioBlk()
-    : IoBase(0)
+    : QueueNotifyAddr(nullptr)
     , CapacitySectors(0)
     , IntVector(-1)
     , Initialized(false)
@@ -47,67 +47,83 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     Stdlib::MemCpy(DevName, name, nameLen);
     DevName[nameLen] = '\0';
 
-    /* Read BAR0 -- I/O port base */
-    u32 bar0 = pci.GetBAR(pciDev->Bus, pciDev->Slot, pciDev->Func, 0);
-    if (!(bar0 & 1))
-    {
-        Trace(0, "VirtioBlk %s: BAR0 is MMIO, expected I/O port", name);
-        return false;
-    }
-    IoBase = bar0 & 0xFFFC;
-
-    Trace(0, "VirtioBlk %s: BAR0 iobase 0x%p irq %u",
-        name, (ulong)IoBase, (ulong)pciDev->InterruptLine);
-
     /* Enable PCI bus mastering */
     pci.EnableBusMastering(pciDev->Bus, pciDev->Slot, pciDev->Func);
 
+    /* Probe modern virtio-pci capabilities and map MMIO BARs */
+    if (!Transport.Probe(pciDev))
+    {
+        Trace(0, "VirtioBlk %s: Transport.Probe failed", name);
+        return false;
+    }
+
+    Trace(0, "VirtioBlk %s: modern virtio-pci probed, irq %u",
+        name, (ulong)pciDev->InterruptLine);
+
     /* Reset device */
-    Outb(IoBase + RegDeviceStatus, 0);
+    Transport.Reset();
 
     /* Acknowledge */
-    Outb(IoBase + RegDeviceStatus, StatusAcknowledge);
+    Transport.SetStatus(VirtioPci::StatusAcknowledge);
 
     /* Driver */
-    Outb(IoBase + RegDeviceStatus, StatusAcknowledge | StatusDriver);
+    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver);
 
-    /* Read and negotiate features */
-    u32 devFeatures = In(IoBase + RegDeviceFeatures);
-    Trace(0, "VirtioBlk %s: device features 0x%p", name, (ulong)devFeatures);
+    /* Read and negotiate features (64-bit via select) */
+    u32 devFeatures0 = Transport.ReadDeviceFeature(0);
+    Trace(0, "VirtioBlk %s: device features[0] 0x%p", name, (ulong)devFeatures0);
 
     /* We don't need any special features for basic operation. */
-    u32 guestFeatures = 0;
-    Out(IoBase + RegGuestFeatures, guestFeatures);
+    Transport.WriteDriverFeature(0, 0);
+    /* features[1]: set VIRTIO_F_VERSION_1 (bit 32 = index 1 bit 0) */
+    u32 devFeatures1 = Transport.ReadDeviceFeature(1);
+    u32 drvFeatures1 = devFeatures1 & (1 << 0); /* VIRTIO_F_VERSION_1 */
+    Transport.WriteDriverFeature(1, drvFeatures1);
+
+    /* Set FEATURES_OK */
+    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
+                        VirtioPci::StatusFeaturesOk);
+
+    /* Verify FEATURES_OK is still set */
+    if (!(Transport.GetStatus() & VirtioPci::StatusFeaturesOk))
+    {
+        Trace(0, "VirtioBlk %s: FEATURES_OK not set by device", name);
+        Transport.SetStatus(VirtioPci::StatusFailed);
+        return false;
+    }
 
     /* Setup virtqueue 0 (request queue) */
-    Outw(IoBase + RegQueueSelect, 0);
-    u16 queueSize = Inw(IoBase + RegQueueSize);
+    Transport.SelectQueue(0);
+    u16 queueSize = Transport.GetQueueSize();
     Trace(0, "VirtioBlk %s: queue size %u", name, (ulong)queueSize);
 
     if (queueSize == 0)
     {
         Trace(0, "VirtioBlk %s: queue size is 0", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
     if (!Queue.Setup(queueSize))
     {
         Trace(0, "VirtioBlk %s: failed to setup queue", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
-    /* Tell device the queue physical page frame number */
-    Out(IoBase + RegQueuePfn, (u32)(Queue.GetPhysAddr() / Const::PageSize));
+    Transport.SetQueueDesc(Queue.GetDescPhys());
+    Transport.SetQueueDriver(Queue.GetAvailPhys());
+    Transport.SetQueueDevice(Queue.GetUsedPhys());
+    Transport.EnableQueue();
+
+    QueueNotifyAddr = Transport.GetNotifyAddr(0);
 
     /* Set DRIVER_OK */
-    Outb(IoBase + RegDeviceStatus, StatusAcknowledge | StatusDriver | StatusDriverOk);
+    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
+                        VirtioPci::StatusFeaturesOk | VirtioPci::StatusDriverOk);
 
     /* Read device config: capacity (u64 at offset 0) */
-    u32 capLow = In(IoBase + RegConfig + 0);
-    u32 capHigh = In(IoBase + RegConfig + 4);
-    CapacitySectors = ((u64)capHigh << 32) | capLow;
+    CapacitySectors = Transport.ReadDevCfg64(0);
 
     Trace(0, "VirtioBlk %s: capacity %u sectors (%u MB)",
         name, CapacitySectors, (CapacitySectors * 512) / (1024 * 1024));
@@ -118,7 +134,7 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     if (!dmaPage)
     {
         Trace(0, "VirtioBlk %s: failed to alloc DMA pages", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
@@ -131,7 +147,7 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
         if (!pt.MapPage(va, &dmaPage[i]))
         {
             Trace(0, "VirtioBlk %s: failed to map DMA page %u", name, i);
-            Outb(IoBase + RegDeviceStatus, StatusFailed);
+            Transport.SetStatus(VirtioPci::StatusFailed);
             return false;
         }
     }
@@ -230,7 +246,7 @@ bool VirtioBlk::DoIO(u32 type, u64 sector, void* buf)
     }
 
     /* Kick the device */
-    Queue.Kick(IoBase + RegQueueNotify);
+    Queue.Kick(QueueNotifyAddr, 0);
 
     /* Poll for completion */
     for (ulong i = 0; i < 10000000; i++)
@@ -290,7 +306,7 @@ void VirtioBlk::Interrupt(Context* ctx)
     InterruptCounter.Inc();
 
     /* Read ISR status to acknowledge interrupt */
-    Inb(IoBase + RegISRStatus);
+    Transport.ReadISR();
 }
 
 void VirtioBlk::InitAll()
@@ -310,7 +326,9 @@ void VirtioBlk::InitAll()
         if (!dev)
             break;
 
-        if (dev->Vendor != Pci::VendorVirtio || dev->Device != Pci::DevVirtioBlk)
+        if (dev->Vendor != Pci::VendorVirtio)
+            continue;
+        if (dev->Device != Pci::DevVirtioBlk && dev->Device != Pci::DevVirtioBlkModern)
             continue;
 
         char name[8];

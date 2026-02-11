@@ -185,6 +185,11 @@ public:
     bool MapPage(ulong virtAddr, Page* page);
     Page* UnmapPage(ulong virtAddr);
 
+    /* Map a physical MMIO range into kernel virtual space.
+       physAddr must be page-aligned.
+       Returns kernel virtual address, or 0 on failure. */
+    ulong MapMmioRegion(ulong physAddr, ulong sizeBytes);
+
     Page* AllocPage();
     Page* AllocContiguousPages(ulong count);
     void FreePage(Page* page);

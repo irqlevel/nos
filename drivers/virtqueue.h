@@ -63,9 +63,14 @@ public:
 
     int AddBufs(BufDesc* bufs, ulong count);
 
-    /* Notify the device that new buffers are available.
-       queueIdx is the virtqueue index written to the notify port. */
-    void Kick(u16 ioPort, u16 queueIdx = 0);
+    /* Notify the device that new buffers are available (MMIO). */
+    void Kick(volatile void* notifyAddr, u16 queueIdx);
+
+    /* Physical addresses of the three ring components
+       (needed by modern virtio-pci queue setup). */
+    ulong GetDescPhys();
+    ulong GetAvailPhys();
+    ulong GetUsedPhys();
 
     /* Check if there are used buffers to process. */
     bool HasUsed();

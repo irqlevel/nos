@@ -9,6 +9,7 @@
 #include <kernel/asm.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
+#include <drivers/virtio_pci.h>
 
 namespace Kernel
 {
@@ -54,27 +55,10 @@ private:
     VirtioNet& operator=(const VirtioNet& other) = delete;
     VirtioNet& operator=(VirtioNet&& other) = delete;
 
-    /* Virtio legacy PCI BAR0 register offsets */
-    static const u16 RegDeviceFeatures = 0x00;
-    static const u16 RegGuestFeatures  = 0x04;
-    static const u16 RegQueuePfn       = 0x08;
-    static const u16 RegQueueSize      = 0x0C;
-    static const u16 RegQueueSelect    = 0x0E;
-    static const u16 RegQueueNotify    = 0x10;
-    static const u16 RegDeviceStatus   = 0x12;
-    static const u16 RegISRStatus      = 0x13;
-    static const u16 RegConfig         = 0x14;
-
-    /* Device status bits */
-    static const u8 StatusAcknowledge = 1;
-    static const u8 StatusDriver      = 2;
-    static const u8 StatusDriverOk    = 4;
-    static const u8 StatusFailed      = 128;
-
     /* Feature bits */
     static const u32 FeatureMac = (1 << 5); /* VIRTIO_NET_F_MAC */
 
-    /* Virtio net header (no mergeable buffers) */
+    /* Virtio net header (v1.0 -- includes NumBuffers for VIRTIO_F_VERSION_1) */
     struct VirtioNetHdr
     {
         u8 Flags;
@@ -83,9 +67,10 @@ private:
         u16 GsoSize;
         u16 CsumStart;
         u16 CsumOffset;
+        u16 NumBuffers;
     } __attribute__((packed));
 
-    static_assert(sizeof(VirtioNetHdr) == 10, "Invalid size");
+    static_assert(sizeof(VirtioNetHdr) == 12, "Invalid size");
 
     /* RX buffer management */
     static const ulong RxBufCount = 16;
@@ -93,7 +78,9 @@ private:
     void PostRxBuf(ulong index);
     void PostAllRxBufs();
 
-    u16 IoBase;
+    VirtioPci Transport;
+    volatile void* RxNotifyAddr;
+    volatile void* TxNotifyAddr;
     VirtQueue RxQueue;
     VirtQueue TxQueue;
     u8 MacAddr[6];
