@@ -451,12 +451,25 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     pci.Scan();
 
     auto& kbd = IO8042::GetInstance();
+    auto& serial = Serial::GetInstance();
     auto& cmd = Cmd::GetInstance();
     auto& cpus = CpuTable::GetInstance();
-    if (!kbd.RegisterObserver(cmd))
+    auto& params = Parameters::GetInstance();
+    if (!params.IsConsoleSerial())
     {
-        Panic("Can't register cmd in kbd");
-        break;
+        if (!kbd.RegisterObserver(cmd))
+        {
+            Panic("Can't register cmd in kbd");
+            break;
+        }
+    }
+    if (!params.IsConsoleVga())
+    {
+        if (!serial.RegisterObserver(cmd))
+        {
+            Panic("Can't register cmd in serial");
+            break;
+        }
     }
 
     Lapic::Enable();

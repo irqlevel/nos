@@ -6,6 +6,7 @@
 #include "time.h"
 #include "watchdog.h"
 #include "block_device.h"
+#include "console.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
@@ -34,11 +35,11 @@ Cmd::~Cmd()
 
 void Cmd::ProcessCmd(const char *cmd)
 {
-    auto& vga = VgaTerm::GetInstance();
+    auto& con = Console::GetInstance();
 
     if (Stdlib::StrCmp(cmd, "cls") == 0)
     {
-        vga.Cls();
+        con.Cls();
     }
     else if (Stdlib::StrCmp(cmd, "exit") == 0 ||
              Stdlib::StrCmp(cmd, "quit") == 0 ||
@@ -49,47 +50,47 @@ void Cmd::ProcessCmd(const char *cmd)
     }
     else if (Stdlib::StrCmp(cmd, "cpu") == 0)
     {
-        vga.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
+        con.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
             (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
             (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
 
-        vga.Printf("rflags 0x%p rsp 0x%p rip 0x%p\n",
+        con.Printf("rflags 0x%p rsp 0x%p rip 0x%p\n",
             GetRflags(), GetRsp(), GetRip());
 
-        vga.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
+        con.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
             GetCr0(), GetCr2(), GetCr3(), GetCr4());
     }
     else if (Stdlib::StrCmp(cmd, "dmesg") == 0)
     {
-        Dmesg::GetInstance().Dump(vga);
+        Dmesg::GetInstance().Dump(con);
     }
     else if (Stdlib::StrCmp(cmd, "uptime") == 0)
     {
         auto time = GetBootTime();
-        vga.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
+        con.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
     }
     else if (Stdlib::StrCmp(cmd, "ps") == 0)
     {
-        TaskTable::GetInstance().Ps(vga);
+        TaskTable::GetInstance().Ps(con);
     }
     else if (Stdlib::StrCmp(cmd, "watchdog") == 0)
     {
-        Watchdog::GetInstance().Dump(vga);
+        Watchdog::GetInstance().Dump(con);
     }
     else if (Stdlib::StrCmp(cmd, "memusage") == 0)
     {
         auto& pt = Mm::PageTable::GetInstance();
 
-        vga.Printf("freePages: %u\n", pt.GetFreePagesCount());
-        vga.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
+        con.Printf("freePages: %u\n", pt.GetFreePagesCount());
+        con.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
     }
     else if (Stdlib::StrCmp(cmd, "pci") == 0)
     {
-        Pci::GetInstance().Dump(vga);
+        Pci::GetInstance().Dump(con);
     }
     else if (Stdlib::StrCmp(cmd, "disks") == 0)
     {
-        BlockDeviceTable::GetInstance().Dump(vga);
+        BlockDeviceTable::GetInstance().Dump(con);
     }
     else if (Stdlib::MemCmp(cmd, "diskread ", 9) == 0)
     {
@@ -98,7 +99,7 @@ void Cmd::ProcessCmd(const char *cmd)
         const char* nameStart = Stdlib::NextToken(args, end);
         if (!nameStart)
         {
-            vga.Printf("usage: diskread <disk> <sector>\n");
+            con.Printf("usage: diskread <disk> <sector>\n");
         }
         else
         {
@@ -109,7 +110,7 @@ void Cmd::ProcessCmd(const char *cmd)
             ulong sector = 0;
             if (!secStart)
             {
-                vga.Printf("usage: diskread <disk> <sector>\n");
+                con.Printf("usage: diskread <disk> <sector>\n");
             }
             else
             {
@@ -118,32 +119,32 @@ void Cmd::ProcessCmd(const char *cmd)
 
                 if (!Stdlib::ParseUlong(secBuf, sector))
                 {
-                    vga.Printf("invalid sector number\n");
+                    con.Printf("invalid sector number\n");
                 }
                 else
                 {
                     BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
                     if (!dev)
                     {
-                        vga.Printf("disk '%s' not found\n", diskName);
+                        con.Printf("disk '%s' not found\n", diskName);
                     }
                     else
                     {
                         u8 buf[512];
                         if (!dev->ReadSector(sector, buf))
                         {
-                            vga.Printf("read error\n");
+                            con.Printf("read error\n");
                         }
                         else
                         {
                             for (ulong i = 0; i < 512; i += 16)
                             {
-                                vga.Printf("%p: ", sector * 512 + i);
+                                con.Printf("%p: ", sector * 512 + i);
                                 for (ulong j = 0; j < 16 && (i + j) < 512; j++)
                                 {
-                                    vga.Printf("%p ", (ulong)buf[i + j]);
+                                    con.Printf("%p ", (ulong)buf[i + j]);
                                 }
-                                vga.Printf("\n");
+                                con.Printf("\n");
                             }
                         }
                     }
@@ -158,7 +159,7 @@ void Cmd::ProcessCmd(const char *cmd)
         const char* nameStart = Stdlib::NextToken(args, end);
         if (!nameStart)
         {
-            vga.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+            con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
         }
         else
         {
@@ -169,7 +170,7 @@ void Cmd::ProcessCmd(const char *cmd)
             ulong sector = 0;
             if (!secStart)
             {
-                vga.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+                con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
             }
             else
             {
@@ -179,14 +180,14 @@ void Cmd::ProcessCmd(const char *cmd)
                 const char* hexStart = Stdlib::NextToken(end, end);
                 if (!Stdlib::ParseUlong(secBuf, sector) || !hexStart)
                 {
-                    vga.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+                    con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
                 }
                 else
                 {
                     BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
                     if (!dev)
                     {
-                        vga.Printf("disk '%s' not found\n", diskName);
+                        con.Printf("disk '%s' not found\n", diskName);
                     }
                     else
                     {
@@ -196,14 +197,14 @@ void Cmd::ProcessCmd(const char *cmd)
                         ulong byteCount = 0;
                         if (!Stdlib::HexDecode(hexStart, hexLen, buf, 512, byteCount))
                         {
-                            vga.Printf("invalid hex data\n");
+                            con.Printf("invalid hex data\n");
                         }
                         else if (byteCount > 0)
                         {
                             if (!dev->WriteSector(sector, buf))
-                                vga.Printf("write error\n");
+                                con.Printf("write error\n");
                             else
-                                vga.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
+                                con.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
                         }
                     }
                 }
@@ -212,24 +213,24 @@ void Cmd::ProcessCmd(const char *cmd)
     }
     else if (Stdlib::StrCmp(cmd, "help") == 0)
     {
-        vga.Printf("cls - clear screen\n");
-        vga.Printf("cpu - dump cpu state\n");
-        vga.Printf("dmesg - dump kernel log\n");
-        vga.Printf("exit - shutdown kernel\n");
-        vga.Printf("ps - show tasks\n");
-        vga.Printf("watchdog - show watchdog stats\n");
-        vga.Printf("memusage - show memory usage stats\n");
-        vga.Printf("pci - show pci devices\n");
-        vga.Printf("disks - list block devices\n");
-        vga.Printf("diskread <disk> <sector> - read sector\n");
-        vga.Printf("diskwrite <disk> <sector> <hex> - write sector\n");
-        vga.Printf("help - help\n");
+        con.Printf("cls - clear screen\n");
+        con.Printf("cpu - dump cpu state\n");
+        con.Printf("dmesg - dump kernel log\n");
+        con.Printf("exit - shutdown kernel\n");
+        con.Printf("ps - show tasks\n");
+        con.Printf("watchdog - show watchdog stats\n");
+        con.Printf("memusage - show memory usage stats\n");
+        con.Printf("pci - show pci devices\n");
+        con.Printf("disks - list block devices\n");
+        con.Printf("diskread <disk> <sector> - read sector\n");
+        con.Printf("diskwrite <disk> <sector> <hex> - write sector\n");
+        con.Printf("help - help\n");
     }
     else
     {
-        vga.Printf("command '%s' not found\n", cmd);
+        con.Printf("command '%s' not found\n", cmd);
     }
-    vga.Printf("$");
+    con.Printf("$");
 }
 
 bool Cmd::ShouldShutdown()
@@ -284,10 +285,20 @@ bool Cmd::Start()
 
     {
         Stdlib::AutoLock lock(Lock);
-        VgaTerm::GetInstance().Printf("\n$");
         Active = true;
     }
     return true;
+}
+
+void Cmd::ShowBanner(Stdlib::Printer& out)
+{
+    out.Printf("\n");
+    out.Printf("  _   _  ___  ____\n");
+    out.Printf(" | \\ | |/ _ \\/ ___|\n");
+    out.Printf(" |  \\| | | | \\___ \\\n");
+    out.Printf(" | |\\  | |_| |___) |\n");
+    out.Printf(" |_| \\_|\\___/|____/\n");
+    out.Printf("\n$");
 }
 
 void Cmd::Run()
@@ -295,7 +306,11 @@ void Cmd::Run()
     size_t pos = 0;
     bool overflow = false;
 
-    auto& vga = VgaTerm::GetInstance();
+    auto& con = Console::GetInstance();
+
+    /* Wait for startup trace output to settle before showing banner */
+    Sleep(100 * Const::NanoSecsInMs);
+    ShowBanner(con);
 
     while (!Task::GetCurrentTask()->IsStopping())
     {
@@ -317,27 +332,27 @@ void Cmd::Run()
             if (backspace)
             {
                 if (pos > 0)
-                    vga.Backspace();
+                    con.Backspace();
             }
             else
             {
-                vga.Printf("%c", keyEvent.Char);
+                con.Printf("%c", keyEvent.Char);
             }
 
             if (keyEvent.Char == '\n')
             {
-                CmdLine[Stdlib::ArraySize(CmdLine) - 1] = '\0';
+                CmdLine[pos] = '\0';
                 if (!overflow)
                 {
                     ProcessCmd(CmdLine);
                 }
                 else
                 {
-                    vga.Printf("command too large\n");
-                    vga.Printf("$");
+                    con.Printf("command too large\n");
+                    con.Printf("$");
                     overflow = false;
                 }
-                Stdlib::MemSet(CmdLine, 0, Stdlib::StrLen(CmdLine));
+                Stdlib::MemSet(CmdLine, 0, sizeof(CmdLine));
                 pos = 0;
             }
             else

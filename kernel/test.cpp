@@ -670,7 +670,7 @@ Stdlib::Error Test()
 {
     Stdlib::Error err;
 
-    Trace(0, "Test");
+    Trace(0, "Test in progress, please wait...");
 
     err = TestAllocator();
     if (!err.Ok())
