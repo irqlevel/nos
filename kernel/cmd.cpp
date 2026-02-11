@@ -6,10 +6,12 @@
 #include "time.h"
 #include "watchdog.h"
 #include "block_device.h"
+#include "net_device.h"
 #include "console.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
+#include <drivers/virtio_net.h>
 #include <mm/page_table.h>
 #include <mm/new.h>
 
@@ -211,6 +213,129 @@ void Cmd::ProcessCmd(const char *cmd)
             }
         }
     }
+    else if (Stdlib::StrCmp(cmd, "net") == 0)
+    {
+        NetDeviceTable::GetInstance().Dump(con);
+    }
+    else if (Stdlib::MemCmp(cmd, "udpsend ", 8) == 0)
+    {
+        const char* args = cmd + 8;
+        const char* end;
+        const char* ipStart = Stdlib::NextToken(args, end);
+        if (!ipStart)
+        {
+            con.Printf("usage: udpsend <ip> <port> <message>\n");
+        }
+        else
+        {
+            char ipBuf[16];
+            Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
+
+            const char* portStart = Stdlib::NextToken(end, end);
+            if (!portStart)
+            {
+                con.Printf("usage: udpsend <ip> <port> <message>\n");
+            }
+            else
+            {
+                char portBuf[8];
+                Stdlib::TokenCopy(portStart, end, portBuf, sizeof(portBuf));
+
+                ulong port = 0;
+                if (!Stdlib::ParseUlong(portBuf, port) || port > 65535)
+                {
+                    con.Printf("invalid port\n");
+                }
+                else
+                {
+                    /* Skip whitespace to get message */
+                    const char* msg = end;
+                    while (*msg == ' ')
+                        msg++;
+
+                    if (*msg == '\0')
+                    {
+                        con.Printf("usage: udpsend <ip> <port> <message>\n");
+                    }
+                    else
+                    {
+                        /* Parse IP: a.b.c.d */
+                        u32 dstIp = 0;
+                        bool ipOk = true;
+                        ulong octet = 0;
+                        ulong shift = 24;
+                        const char* p = ipBuf;
+                        ulong dots = 0;
+
+                        while (*p && ipOk)
+                        {
+                            if (*p == '.')
+                            {
+                                if (octet > 255) { ipOk = false; break; }
+                                dstIp |= (octet << shift);
+                                if (shift == 0) { ipOk = false; break; }
+                                shift -= 8;
+                                octet = 0;
+                                dots++;
+                            }
+                            else if (*p >= '0' && *p <= '9')
+                            {
+                                octet = octet * 10 + (*p - '0');
+                            }
+                            else
+                            {
+                                ipOk = false;
+                            }
+                            p++;
+                        }
+
+                        if (ipOk && dots == 3 && octet <= 255)
+                        {
+                            dstIp |= (octet << shift);
+                        }
+                        else
+                        {
+                            ipOk = false;
+                        }
+
+                        if (!ipOk)
+                        {
+                            con.Printf("invalid IP '%s'\n", ipBuf);
+                        }
+                        else
+                        {
+                            /* Find first net device */
+                            NetDevice* dev = nullptr;
+                            if (NetDeviceTable::GetInstance().GetCount() > 0)
+                                dev = NetDeviceTable::GetInstance().Find("eth0");
+
+                            if (!dev)
+                            {
+                                con.Printf("no network device\n");
+                            }
+                            else
+                            {
+                                VirtioNet* vnet = (VirtioNet*)dev;
+                                ulong msgLen = Stdlib::StrLen(msg);
+                                u32 srcIp = (10 << 24) | (0 << 16) | (2 << 8) | 15;
+
+                                if (vnet->SendUdp(dstIp, (u16)port,
+                                    srcIp, 12345, msg, msgLen))
+                                {
+                                    con.Printf("sent %u bytes to %s:%u\n",
+                                        msgLen, ipBuf, port);
+                                }
+                                else
+                                {
+                                    con.Printf("send failed\n");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     else if (Stdlib::StrCmp(cmd, "help") == 0)
     {
         con.Printf("cls - clear screen\n");
@@ -224,6 +349,8 @@ void Cmd::ProcessCmd(const char *cmd)
         con.Printf("disks - list block devices\n");
         con.Printf("diskread <disk> <sector> - read sector\n");
         con.Printf("diskwrite <disk> <sector> <hex> - write sector\n");
+        con.Printf("net - list network devices\n");
+        con.Printf("udpsend <ip> <port> <msg> - send UDP packet\n");
         con.Printf("help - help\n");
     }
     else

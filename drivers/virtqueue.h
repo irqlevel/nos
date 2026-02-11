@@ -63,8 +63,9 @@ public:
 
     int AddBufs(BufDesc* bufs, ulong count);
 
-    /* Notify the device that new buffers are available. */
-    void Kick(u16 ioPort);
+    /* Notify the device that new buffers are available.
+       queueIdx is the virtqueue index written to the notify port. */
+    void Kick(u16 ioPort, u16 queueIdx = 0);
 
     /* Check if there are used buffers to process. */
     bool HasUsed();

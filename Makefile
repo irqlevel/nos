@@ -22,6 +22,7 @@ CXX_SRC =   \
     drivers/pci.cpp \
     drivers/virtqueue.cpp \
     drivers/virtio_blk.cpp \
+    drivers/virtio_net.cpp \
     kernel/icxxabi.cpp    \
     kernel/interrupt.cpp   \
     kernel/task.cpp \
@@ -39,6 +40,7 @@ CXX_SRC =   \
     kernel/cpu.cpp  \
     kernel/cmd.cpp  \
     kernel/block_device.cpp \
+    kernel/net_device.cpp \
     kernel/exception.cpp    \
     kernel/dmesg.cpp    \
     kernel/sched.cpp    \
