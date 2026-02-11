@@ -18,6 +18,7 @@ public:
     void Enable();
 
     void SetIrq(u8 irq, u64 apicId, u8 vector);
+    void SetIrqLevel(u8 irq, u64 apicId, u8 vector);
 
 private:
     IoApic();

@@ -171,7 +171,7 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     u8 irq = pciDev->InterruptLine;
     u8 vector = 0x25 + (u8)InstanceCount;
     auto& acpi = Acpi::GetInstance();
-    Interrupt::Register(*this, acpi.GetGsiByIrq(irq), vector);
+    Interrupt::RegisterLevel(*this, acpi.GetGsiByIrq(irq), vector);
 
     /* Register as block device */
     BlockDeviceTable::GetInstance().Register(this);
