@@ -749,6 +749,94 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
     return true;
 }
 
+ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
+{
+    if (physAddr & (Const::PageSize - 1))
+        return 0;
+
+    ulong pages = (sizeBytes + Const::PageSize - 1) / Const::PageSize;
+    if (pages == 0)
+        pages = 1;
+
+    for (ulong i = 0; i < pages; i++)
+    {
+        ulong pa = physAddr + i * Const::PageSize;
+        ulong va = pa + MemoryMap::KernelSpaceBase;
+
+        Stdlib::AutoLock lock(Lock);
+
+        ulong l4Index = (va >> (12 + 3 * 9)) & ((1 << 9) - 1);
+        ulong l3Index = (va >> (12 + 2 * 9)) & ((1 << 9) - 1);
+        ulong l2Index = (va >> (12 + 1 * 9)) & ((1 << 9) - 1);
+        ulong l1Index = (va >> (12 + 0 * 9)) & ((1 << 9) - 1);
+
+        if (Root == 0)
+            return 0;
+
+        PtePage* l4Page = (PtePage*)TmpMapPage(Root);
+        if (l4Page == nullptr)
+            return 0;
+
+        Pte *l4Entry = &l4Page->Entry[l4Index];
+        if (!l4Entry->Present()) {
+            Page* p = AllocPageNoLock();
+            if (!p) { TmpUnmapPage((ulong)l4Page); return 0; }
+            l4Entry->SetAddress(p->GetPhyAddress());
+            l4Entry->SetCacheDisabled();
+            l4Entry->SetWritable();
+            l4Entry->SetPresent();
+        }
+
+        PtePage* l3Page = (PtePage*)TmpMapPage(l4Entry->Address());
+        TmpUnmapPage((ulong)l4Page);
+        if (l3Page == nullptr)
+            return 0;
+
+        Pte *l3Entry = &l3Page->Entry[l3Index];
+        if (!l3Entry->Present()) {
+            Page* p = AllocPageNoLock();
+            if (!p) { TmpUnmapPage((ulong)l3Page); return 0; }
+            l3Entry->SetAddress(p->GetPhyAddress());
+            l3Entry->SetCacheDisabled();
+            l3Entry->SetWritable();
+            l3Entry->SetPresent();
+        }
+
+        PtePage* l2Page = (PtePage*)TmpMapPage(l3Entry->Address());
+        TmpUnmapPage((ulong)l3Page);
+        if (l2Page == nullptr)
+            return 0;
+
+        Pte *l2Entry = &l2Page->Entry[l2Index];
+        if (!l2Entry->Present()) {
+            Page* p = AllocPageNoLock();
+            if (!p) { TmpUnmapPage((ulong)l2Page); return 0; }
+            l2Entry->SetAddress(p->GetPhyAddress());
+            l2Entry->SetCacheDisabled();
+            l2Entry->SetWritable();
+            l2Entry->SetPresent();
+        }
+
+        PtePage* l1Page = (PtePage*)TmpMapPage(l2Entry->Address());
+        TmpUnmapPage((ulong)l2Page);
+        if (l1Page == nullptr)
+            return 0;
+
+        Pte *l1Entry = &l1Page->Entry[l1Index];
+        if (!l1Entry->Present())
+        {
+            l1Entry->SetAddress(pa);
+            l1Entry->SetCacheDisabled();
+            l1Entry->SetWritable();
+            l1Entry->SetPresent();
+        }
+        TmpUnmapPage((ulong)l1Page);
+        Invlpg(va);
+    }
+
+    return physAddr + MemoryMap::KernelSpaceBase;
+}
+
 Page* PageTable::UnmapPage(ulong virtAddr)
 {
     Stdlib::AutoLock lock(Lock);

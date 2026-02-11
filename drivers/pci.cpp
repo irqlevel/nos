@@ -123,6 +123,10 @@ const char* Pci::DeviceToStr(u16 vendor, u16 dev)
             return "Network";
         case DevVirtioScsi:
             return "Scsi";
+        case DevVirtioNetModern:
+            return "Network";
+        case DevVirtioBlkModern:
+            return "Blk";
         default:
             return "Unknown";
         }
@@ -176,6 +180,51 @@ void Pci::WriteWord(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
     dword &= ~(0xFFFF << shift);
     dword |= ((u32)value << shift);
     WriteDword(bus, slot, func, offset, dword);
+}
+
+u8 Pci::ReadByte(u16 bus, u16 slot, u16 func, u16 offset)
+{
+    u32 dword = ReadDword(bus, slot, func, offset);
+    return (u8)((dword >> ((offset & 3) * 8)) & 0xFF);
+}
+
+void Pci::WriteByte(u16 bus, u16 slot, u16 func, u16 offset, u8 value)
+{
+    u32 dword = ReadDword(bus, slot, func, offset);
+    u16 shift = (offset & 3) * 8;
+    dword &= ~(0xFF << shift);
+    dword |= ((u32)value << shift);
+    WriteDword(bus, slot, func, offset, dword);
+}
+
+u8 Pci::FindCapability(u16 bus, u16 slot, u16 func, u8 capId, u8 startOffset)
+{
+    /* Check status register bit 4 (Capabilities List) */
+    u16 status = ReadWord(bus, slot, func, 0x06);
+    if (!(status & (1 << 4)))
+        return 0;
+
+    u8 offset;
+    if (startOffset != 0)
+    {
+        /* Resume from a previous capability's next pointer */
+        offset = ReadByte(bus, slot, func, startOffset + 1) & 0xFC;
+    }
+    else
+    {
+        /* Start from the capabilities pointer at offset 0x34 */
+        offset = ReadByte(bus, slot, func, 0x34) & 0xFC;
+    }
+
+    for (int i = 0; i < 48 && offset != 0; i++)
+    {
+        u8 id = ReadByte(bus, slot, func, offset);
+        if (id == capId)
+            return offset;
+        offset = ReadByte(bus, slot, func, offset + 1) & 0xFC;
+    }
+
+    return 0;
 }
 
 u32 Pci::GetBAR(u16 bus, u16 slot, u16 func, u8 bar)

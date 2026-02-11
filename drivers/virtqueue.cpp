@@ -1,4 +1,5 @@
 #include "virtqueue.h"
+#include "mmio.h"
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>
@@ -146,10 +147,25 @@ int VirtQueue::AddBufs(BufDesc* bufs, ulong count)
     return (int)head;
 }
 
-void VirtQueue::Kick(u16 ioPort, u16 queueIdx)
+void VirtQueue::Kick(volatile void* notifyAddr, u16 queueIdx)
 {
     Barrier();
-    Outw(ioPort, queueIdx);
+    MmioWrite16(notifyAddr, queueIdx);
+}
+
+ulong VirtQueue::GetDescPhys()
+{
+    return PhysAddr;
+}
+
+ulong VirtQueue::GetAvailPhys()
+{
+    return PhysAddr + ((ulong)Avail - (ulong)VirtAddr);
+}
+
+ulong VirtQueue::GetUsedPhys()
+{
+    return PhysAddr + ((ulong)Used - (ulong)VirtAddr);
 }
 
 bool VirtQueue::HasUsed()

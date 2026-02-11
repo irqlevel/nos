@@ -31,7 +31,8 @@ VirtioNet VirtioNet::Instances[MaxInstances];
 ulong VirtioNet::InstanceCount = 0;
 
 VirtioNet::VirtioNet()
-    : IoBase(0)
+    : RxNotifyAddr(nullptr)
+    , TxNotifyAddr(nullptr)
     , MyIp(0)
     , IntVector(-1)
     , Initialized(false)
@@ -60,91 +61,115 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     Stdlib::MemCpy(DevName, name, nameLen);
     DevName[nameLen] = '\0';
 
-    /* Read BAR0 -- I/O port base */
-    u32 bar0 = pci.GetBAR(pciDev->Bus, pciDev->Slot, pciDev->Func, 0);
-    if (!(bar0 & 1))
-    {
-        Trace(0, "VirtioNet %s: BAR0 is MMIO, expected I/O port", name);
-        return false;
-    }
-    IoBase = bar0 & 0xFFFC;
-
-    Trace(0, "VirtioNet %s: BAR0 iobase 0x%p irq %u",
-        name, (ulong)IoBase, (ulong)pciDev->InterruptLine);
-
     /* Enable PCI bus mastering */
     pci.EnableBusMastering(pciDev->Bus, pciDev->Slot, pciDev->Func);
 
+    /* Probe modern virtio-pci capabilities and map MMIO BARs */
+    if (!Transport.Probe(pciDev))
+    {
+        Trace(0, "VirtioNet %s: Transport.Probe failed", name);
+        return false;
+    }
+
+    Trace(0, "VirtioNet %s: modern virtio-pci probed, irq %u",
+        name, (ulong)pciDev->InterruptLine);
+
     /* Reset device */
-    Outb(IoBase + RegDeviceStatus, 0);
+    Transport.Reset();
 
     /* Acknowledge */
-    Outb(IoBase + RegDeviceStatus, StatusAcknowledge);
+    Transport.SetStatus(VirtioPci::StatusAcknowledge);
 
     /* Driver */
-    Outb(IoBase + RegDeviceStatus, StatusAcknowledge | StatusDriver);
+    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver);
 
-    /* Read and negotiate features */
-    u32 devFeatures = In(IoBase + RegDeviceFeatures);
-    Trace(0, "VirtioNet %s: device features 0x%p", name, (ulong)devFeatures);
+    /* Read and negotiate features (64-bit via select) */
+    u32 devFeatures0 = Transport.ReadDeviceFeature(0);
+    Trace(0, "VirtioNet %s: device features[0] 0x%p", name, (ulong)devFeatures0);
 
-    /* Request MAC feature */
-    u32 guestFeatures = 0;
-    if (devFeatures & FeatureMac)
-        guestFeatures |= FeatureMac;
-    Out(IoBase + RegGuestFeatures, guestFeatures);
+    u32 drvFeatures0 = 0;
+    if (devFeatures0 & FeatureMac)
+        drvFeatures0 |= FeatureMac;
+
+    Transport.WriteDriverFeature(0, drvFeatures0);
+    /* features[1]: set VIRTIO_F_VERSION_1 (bit 32 = index 1 bit 0) */
+    u32 devFeatures1 = Transport.ReadDeviceFeature(1);
+    u32 drvFeatures1 = devFeatures1 & (1 << 0); /* VIRTIO_F_VERSION_1 */
+    Transport.WriteDriverFeature(1, drvFeatures1);
+
+    /* Set FEATURES_OK */
+    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
+                        VirtioPci::StatusFeaturesOk);
+
+    /* Verify FEATURES_OK is still set */
+    if (!(Transport.GetStatus() & VirtioPci::StatusFeaturesOk))
+    {
+        Trace(0, "VirtioNet %s: FEATURES_OK not set by device", name);
+        Transport.SetStatus(VirtioPci::StatusFailed);
+        return false;
+    }
 
     /* Setup RX virtqueue (queue 0) */
-    Outw(IoBase + RegQueueSelect, 0);
-    u16 rxQueueSize = Inw(IoBase + RegQueueSize);
+    Transport.SelectQueue(0);
+    u16 rxQueueSize = Transport.GetQueueSize();
     Trace(0, "VirtioNet %s: RX queue size %u", name, (ulong)rxQueueSize);
 
     if (rxQueueSize == 0)
     {
         Trace(0, "VirtioNet %s: RX queue size is 0", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
     if (!RxQueue.Setup(rxQueueSize))
     {
         Trace(0, "VirtioNet %s: failed to setup RX queue", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
-    Out(IoBase + RegQueuePfn, (u32)(RxQueue.GetPhysAddr() / Const::PageSize));
+    Transport.SetQueueDesc(RxQueue.GetDescPhys());
+    Transport.SetQueueDriver(RxQueue.GetAvailPhys());
+    Transport.SetQueueDevice(RxQueue.GetUsedPhys());
+    Transport.EnableQueue();
+
+    RxNotifyAddr = Transport.GetNotifyAddr(0);
 
     /* Setup TX virtqueue (queue 1) */
-    Outw(IoBase + RegQueueSelect, 1);
-    u16 txQueueSize = Inw(IoBase + RegQueueSize);
+    Transport.SelectQueue(1);
+    u16 txQueueSize = Transport.GetQueueSize();
     Trace(0, "VirtioNet %s: TX queue size %u", name, (ulong)txQueueSize);
 
     if (txQueueSize == 0)
     {
         Trace(0, "VirtioNet %s: TX queue size is 0", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
     if (!TxQueue.Setup(txQueueSize))
     {
         Trace(0, "VirtioNet %s: failed to setup TX queue", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
-    Outw(IoBase + RegQueueSelect, 1);
-    Out(IoBase + RegQueuePfn, (u32)(TxQueue.GetPhysAddr() / Const::PageSize));
+    Transport.SetQueueDesc(TxQueue.GetDescPhys());
+    Transport.SetQueueDriver(TxQueue.GetAvailPhys());
+    Transport.SetQueueDevice(TxQueue.GetUsedPhys());
+    Transport.EnableQueue();
+
+    TxNotifyAddr = Transport.GetNotifyAddr(1);
 
     /* Set DRIVER_OK */
-    Outb(IoBase + RegDeviceStatus, StatusAcknowledge | StatusDriver | StatusDriverOk);
+    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
+                        VirtioPci::StatusFeaturesOk | VirtioPci::StatusDriverOk);
 
     /* Read MAC address from device config */
-    if (guestFeatures & FeatureMac)
+    if (drvFeatures0 & FeatureMac)
     {
         for (ulong i = 0; i < 6; i++)
-            MacAddr[i] = Inb(IoBase + RegConfig + i);
+            MacAddr[i] = Transport.ReadDevCfg8(i);
     }
 
     Trace(0, "VirtioNet %s: MAC %p:%p:%p:%p:%p:%p",
@@ -158,7 +183,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     if (!txPage)
     {
         Trace(0, "VirtioNet %s: failed to alloc TX DMA pages", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
@@ -169,7 +194,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
         if (!pt.MapPage(va, &txPage[i]))
         {
             Trace(0, "VirtioNet %s: failed to map TX page %u", name, i);
-            Outb(IoBase + RegDeviceStatus, StatusFailed);
+            Transport.SetStatus(VirtioPci::StatusFailed);
             return false;
         }
     }
@@ -181,7 +206,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     if (!rxPage)
     {
         Trace(0, "VirtioNet %s: failed to alloc RX DMA pages", name);
-        Outb(IoBase + RegDeviceStatus, StatusFailed);
+        Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
@@ -192,7 +217,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
         if (!pt.MapPage(va, &rxPage[i]))
         {
             Trace(0, "VirtioNet %s: failed to map RX page %u", name, i);
-            Outb(IoBase + RegDeviceStatus, StatusFailed);
+            Transport.SetStatus(VirtioPci::StatusFailed);
             return false;
         }
     }
@@ -235,7 +260,7 @@ void VirtioNet::PostAllRxBufs()
         PostRxBuf(i);
 
     /* Notify device about available RX buffers */
-    RxQueue.Kick(IoBase + RegQueueNotify, 0);
+    RxQueue.Kick(RxNotifyAddr, 0);
 }
 
 void VirtioNet::DrainRx()
@@ -330,7 +355,7 @@ void VirtioNet::DrainRx()
 
     if (reposted)
     {
-        RxQueue.Kick(IoBase + RegQueueNotify, 0);
+        RxQueue.Kick(RxNotifyAddr, 0);
     }
 }
 
@@ -363,7 +388,7 @@ bool VirtioNet::SendRaw(const void* buf, ulong len)
         return false;
     }
 
-    TxQueue.Kick(IoBase + RegQueueNotify, 1);
+    TxQueue.Kick(TxNotifyAddr, 1);
 
     /* Poll for completion */
     for (ulong i = 0; i < 10000000; i++)
@@ -514,7 +539,7 @@ void VirtioNet::Interrupt(Context* ctx)
     (void)ctx;
 
     /* Acknowledge interrupt */
-    Inb(IoBase + RegISRStatus);
+    Transport.ReadISR();
 
     /* Defer RX processing to the soft IRQ task */
     SoftIrq::GetInstance().Raise(SoftIrq::TypeNetRx);
@@ -548,7 +573,9 @@ void VirtioNet::InitAll()
         if (!dev)
             break;
 
-        if (dev->Vendor != Pci::VendorVirtio || dev->Device != Pci::DevVirtioNetwork)
+        if (dev->Vendor != Pci::VendorVirtio)
+            continue;
+        if (dev->Device != Pci::DevVirtioNetwork && dev->Device != Pci::DevVirtioNetModern)
             continue;
 
         char name[8];

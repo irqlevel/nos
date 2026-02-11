@@ -36,9 +36,16 @@ public:
     DeviceInfo* GetDevice(ulong index);
     ulong GetDeviceCount();
 
+    u8 ReadByte(u16 bus, u16 slot, u16 func, u16 offset);
     u32 ReadDword(u16 bus, u16 slot, u16 func, u16 offset);
+    void WriteByte(u16 bus, u16 slot, u16 func, u16 offset, u8 value);
     void WriteDword(u16 bus, u16 slot, u16 func, u16 offset, u32 value);
     void WriteWord(u16 bus, u16 slot, u16 func, u16 offset, u16 value);
+
+    /* Walk PCI capability list. Returns config-space offset of capability
+       with matching capId, or 0 if not found. Pass previous cap's next
+       pointer as startOffset to find subsequent caps of the same type. */
+    u8 FindCapability(u16 bus, u16 slot, u16 func, u8 capId, u8 startOffset = 0);
 
     u32 GetBAR(u16 bus, u16 slot, u16 func, u8 bar);
     u8 GetInterruptLine(u16 bus, u16 slot, u16 func);
@@ -69,6 +76,8 @@ public:
     static const u16 DevVirtioBlk = 0x1001;
     static const u16 DevVirtioScsi = 0x1004;
     static const u16 DevVirtioRng = 0x1005;
+    static const u16 DevVirtioNetModern = 0x1041;
+    static const u16 DevVirtioBlkModern = 0x1042;
 
     const char* ClassToStr(u16 cls);
 

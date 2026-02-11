@@ -21,6 +21,7 @@ CXX_SRC =   \
     drivers/vga.cpp \
     drivers/pci.cpp \
     drivers/virtqueue.cpp \
+    drivers/virtio_pci.cpp \
     drivers/virtio_blk.cpp \
     drivers/virtio_net.cpp \
     kernel/icxxabi.cpp    \
