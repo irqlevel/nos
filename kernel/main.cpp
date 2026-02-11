@@ -202,37 +202,6 @@ void SomeTaskRoutine(void *ctx)
         Sleep(100 * Const::NanoSecsInMs);
 }
 
-static const ulong Tag = 'Main';
-static Task* SomeTasks[10];
-
-void StartSomeTasks()
-{
-    for (size_t i = 0; i < Stdlib::ArraySize(SomeTasks); i++)
-    {
-        SomeTasks[i] = Mm::TAlloc<Task, Tag>("SomeTask%u", i);
-        if (SomeTasks[i] == nullptr)
-        {
-            Panic("Can't create task");
-            return;
-        }
-
-        if (!SomeTasks[i]->Start(SomeTaskRoutine, nullptr)) {
-            Panic("Can't start task");
-            return;
-        }
-    }
-}
-
-void StopSomeTasks()
-{
-    for (size_t i = 0; i < Stdlib::ArraySize(SomeTasks); i++)
-    {
-        SomeTasks[i]->SetStopping();
-        SomeTasks[i]->Wait();
-        SomeTasks[i]->Put();
-    }
-}
-
 void BpStartup(void* ctx)
 {
     (void)ctx;
@@ -325,8 +294,6 @@ void BpStartup(void* ctx)
         return;
     }
 
-    StartSomeTasks();
-
     if (!SoftIrq::GetInstance().Init())
     {
         Panic("Can't init softirq");
@@ -359,8 +326,6 @@ void BpStartup(void* ctx)
     }
 
     SoftIrq::GetInstance().Stop();
-
-    StopSomeTasks();
 
     if (doReboot)
         Reboot();
