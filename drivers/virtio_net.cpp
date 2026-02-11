@@ -235,7 +235,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     u8 irq = pciDev->InterruptLine;
     u8 vector = 0x30 + (u8)InstanceCount;
     auto& acpi = Acpi::GetInstance();
-    Interrupt::Register(*this, acpi.GetGsiByIrq(irq), vector);
+    Interrupt::RegisterLevel(*this, acpi.GetGsiByIrq(irq), vector);
 
     /* Register as net device */
     NetDeviceTable::GetInstance().Register(this);

@@ -18,6 +18,7 @@ class Interrupt
 {
 public:
     static void Register(InterruptHandler& handler, u8 irq, u8 vector);
+    static void RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector);
 private:
     Interrupt() = delete;
     ~Interrupt() = delete;
