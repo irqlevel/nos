@@ -8,6 +8,7 @@ extern SerialInterrupt
 extern PitInterrupt
 extern IPInterrupt
 extern VirtioBlkInterrupt
+extern VirtioNetInterrupt
 
 extern ExcDivideByZero
 extern ExcDebugger
@@ -91,6 +92,7 @@ global SerialInterruptStub
 global PitInterruptStub
 global IPInterruptStub
 global VirtioBlkInterruptStub
+global VirtioNetInterruptStub
 
 global ExcDivideByZeroStub
 global ExcDebuggerStub
@@ -473,6 +475,7 @@ InterruptStub Serial
 InterruptStub Pit
 InterruptStub IP
 InterruptStub VirtioBlk
+InterruptStub VirtioNet
 
 ExceptionStub ExcDivideByZero
 ExceptionStub ExcDebugger

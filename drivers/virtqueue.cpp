@@ -146,10 +146,10 @@ int VirtQueue::AddBufs(BufDesc* bufs, ulong count)
     return (int)head;
 }
 
-void VirtQueue::Kick(u16 ioPort)
+void VirtQueue::Kick(u16 ioPort, u16 queueIdx)
 {
     Barrier();
-    Outw(ioPort, 0); /* Queue index 0 */
+    Outw(ioPort, queueIdx);
 }
 
 bool VirtQueue::HasUsed()
