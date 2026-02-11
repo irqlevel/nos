@@ -94,13 +94,23 @@ void Serial::PrintString(const char *str)
             break;
         }
 
+        if (c == '\n')
+        {
+            if (Buf.IsFull())
+            {
+                Lock.Unlock(flags);
+                Send();
+                Lock.Lock(flags);
+            }
+            Buf.Put('\r');
+        }
+
         if (Buf.IsFull())
         {
             Lock.Unlock(flags);
             Send();
             Lock.Lock(flags);
         }
-
         Buf.Put(c);
     }
     Lock.Unlock(flags);

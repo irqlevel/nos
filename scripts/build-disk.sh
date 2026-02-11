@@ -18,7 +18,7 @@ set -e
 
 IMG=/src/nos.raw
 QCOW=/src/nos.qcow2
-SIZE=256  # MB
+SIZE=1024  # MB
 P1_OFFSET=1048576     # 1 MiB  - partition 1 start
 P1_SIZELIMIT=33554432 # 32 MiB - partition 1 size
 
@@ -58,6 +58,9 @@ cp -r /usr/lib/grub/i386-pc $MNTDIR/boot/grub/
 # Build custom GRUB core.img with hardcoded root device.
 # This avoids the default UUID-based search which fails in QEMU.
 cat > /tmp/grub-early.cfg << EOFCFG
+serial --unit=0 --speed=115200
+terminal_input serial console
+terminal_output serial console
 set root=(hd0,msdos1)
 set prefix=(hd0,msdos1)/boot/grub
 EOFCFG
@@ -66,7 +69,7 @@ echo "Building GRUB core image..."
 grub-mkimage -O i386-pc -o /tmp/core.img \
     -c /tmp/grub-early.cfg \
     -p "(hd0,msdos1)/boot/grub" \
-    biosdisk part_msdos ext2 normal multiboot2
+    biosdisk part_msdos ext2 normal multiboot2 serial terminal
 
 echo "Installing GRUB boot sector and core image..."
 dd if=/usr/lib/grub/i386-pc/boot.img of=$LOOP_DISK bs=440 count=1 conv=notrunc
