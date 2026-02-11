@@ -15,6 +15,7 @@
 #include "dmesg.h"
 #include "watchdog.h"
 #include "parameters.h"
+#include "console.h"
 
 #include <boot/grub.h>
 
@@ -127,11 +128,9 @@ extern "C" void ApMain()
     ApMain2();
 }
 
-void Shutdown()
+void PrepareHalt()
 {
     PreemptDisable();
-
-    VgaTerm::GetInstance().Printf("Shutting down!\n");
 
     Trace(0, "Stopping cpu's");
 
@@ -144,11 +143,8 @@ void Shutdown()
     CpuTable::GetInstance().Reset();
     Dmesg::GetInstance().Reset();
 
-    Trace(0, "Bye");
-    VgaTerm::GetInstance().Printf("Bye!\n");
-
-    //Prevent this idle0 task from destruction
-    //due too we now run inside it stack
+    /* Prevent this idle0 task from destruction
+       because we are still running on its stack */
     auto task = Task::GetCurrentTask();
     task->Get();
 
@@ -157,9 +153,42 @@ void Shutdown()
     __cxa_finalize(0);
 
     Trace(0, "Finalized");
+}
 
-    //Notify QEMU about shutdown through it's run with "-device isa-debug-exit,iobase=0xf4,iosize=0x04"
+void Shutdown()
+{
+    auto& con = Console::GetInstance();
+    con.Printf("Shutting down!\n");
+
+    PrepareHalt();
+
+    Trace(0, "ACPI shutdown");
+
+    /* ACPI S5 (soft-off): write SLP_TYP | SLP_EN to PM1a_CNT.
+       QEMU/KVM uses PM1a_CNT port 0x604, SLP_TYP=0 for S5. */
+    Outw(0x604, (1 << 13));
+
+    /* Fallback: QEMU debug exit device */
     Outb(0xf4, 0x0);
+
+    Hlt();
+}
+
+void Reboot()
+{
+    auto& con = Console::GetInstance();
+    con.Printf("Rebooting!\n");
+
+    PrepareHalt();
+
+    Trace(0, "Reboot");
+
+    /* Keyboard controller reset (pulse CPU reset line) */
+    Outb(0x64, 0xFE);
+
+    /* Fallback: PCI reset register */
+    Outb(0xCF9, 0x06);
+
     Hlt();
 }
 
@@ -305,12 +334,17 @@ void BpStartup(void* ctx)
         return;
     }
 
+    bool doReboot = false;
     for (;;)
     {
         cpu.Idle();
-        if (cmd.ShouldShutdown())
+        if (cmd.ShouldShutdown() || cmd.ShouldReboot())
         {
-            Trace(0, "Shutdown");
+            doReboot = cmd.ShouldReboot();
+            if (doReboot)
+                Trace(0, "Reboot requested");
+            else
+                Trace(0, "Shutdown requested");
             cmd.Stop();
             break;
         }
@@ -318,7 +352,10 @@ void BpStartup(void* ctx)
 
     StopSomeTasks();
 
-    Shutdown();
+    if (doReboot)
+        Reboot();
+    else
+        Shutdown();
 }
 
 void Main2(Grub::MultiBootInfoHeader *MbInfo)
