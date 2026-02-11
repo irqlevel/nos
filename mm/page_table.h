@@ -186,6 +186,7 @@ public:
     Page* UnmapPage(ulong virtAddr);
 
     Page* AllocPage();
+    Page* AllocContiguousPages(ulong count);
     void FreePage(Page* page);
 
 private:

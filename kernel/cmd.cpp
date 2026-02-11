@@ -5,6 +5,7 @@
 #include "cpu.h"
 #include "time.h"
 #include "watchdog.h"
+#include "block_device.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
@@ -86,6 +87,129 @@ void Cmd::ProcessCmd(const char *cmd)
     {
         Pci::GetInstance().Dump(vga);
     }
+    else if (Stdlib::StrCmp(cmd, "disks") == 0)
+    {
+        BlockDeviceTable::GetInstance().Dump(vga);
+    }
+    else if (Stdlib::MemCmp(cmd, "diskread ", 9) == 0)
+    {
+        const char* args = cmd + 9;
+        const char* end;
+        const char* nameStart = Stdlib::NextToken(args, end);
+        if (!nameStart)
+        {
+            vga.Printf("usage: diskread <disk> <sector>\n");
+        }
+        else
+        {
+            char diskName[16];
+            Stdlib::TokenCopy(nameStart, end, diskName, sizeof(diskName));
+
+            const char* secStart = Stdlib::NextToken(end, end);
+            ulong sector = 0;
+            if (!secStart)
+            {
+                vga.Printf("usage: diskread <disk> <sector>\n");
+            }
+            else
+            {
+                char secBuf[32];
+                Stdlib::TokenCopy(secStart, end, secBuf, sizeof(secBuf));
+
+                if (!Stdlib::ParseUlong(secBuf, sector))
+                {
+                    vga.Printf("invalid sector number\n");
+                }
+                else
+                {
+                    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
+                    if (!dev)
+                    {
+                        vga.Printf("disk '%s' not found\n", diskName);
+                    }
+                    else
+                    {
+                        u8 buf[512];
+                        if (!dev->ReadSector(sector, buf))
+                        {
+                            vga.Printf("read error\n");
+                        }
+                        else
+                        {
+                            for (ulong i = 0; i < 512; i += 16)
+                            {
+                                vga.Printf("%p: ", sector * 512 + i);
+                                for (ulong j = 0; j < 16 && (i + j) < 512; j++)
+                                {
+                                    vga.Printf("%p ", (ulong)buf[i + j]);
+                                }
+                                vga.Printf("\n");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    else if (Stdlib::MemCmp(cmd, "diskwrite ", 10) == 0)
+    {
+        const char* args = cmd + 10;
+        const char* end;
+        const char* nameStart = Stdlib::NextToken(args, end);
+        if (!nameStart)
+        {
+            vga.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+        }
+        else
+        {
+            char diskName[16];
+            Stdlib::TokenCopy(nameStart, end, diskName, sizeof(diskName));
+
+            const char* secStart = Stdlib::NextToken(end, end);
+            ulong sector = 0;
+            if (!secStart)
+            {
+                vga.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+            }
+            else
+            {
+                char secBuf[32];
+                Stdlib::TokenCopy(secStart, end, secBuf, sizeof(secBuf));
+
+                const char* hexStart = Stdlib::NextToken(end, end);
+                if (!Stdlib::ParseUlong(secBuf, sector) || !hexStart)
+                {
+                    vga.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+                }
+                else
+                {
+                    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
+                    if (!dev)
+                    {
+                        vga.Printf("disk '%s' not found\n", diskName);
+                    }
+                    else
+                    {
+                        u8 buf[512];
+                        Stdlib::MemSet(buf, 0, 512);
+                        ulong hexLen = (ulong)(end - hexStart);
+                        ulong byteCount = 0;
+                        if (!Stdlib::HexDecode(hexStart, hexLen, buf, 512, byteCount))
+                        {
+                            vga.Printf("invalid hex data\n");
+                        }
+                        else if (byteCount > 0)
+                        {
+                            if (!dev->WriteSector(sector, buf))
+                                vga.Printf("write error\n");
+                            else
+                                vga.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
+                        }
+                    }
+                }
+            }
+        }
+    }
     else if (Stdlib::StrCmp(cmd, "help") == 0)
     {
         vga.Printf("cls - clear screen\n");
@@ -96,6 +220,9 @@ void Cmd::ProcessCmd(const char *cmd)
         vga.Printf("watchdog - show watchdog stats\n");
         vga.Printf("memusage - show memory usage stats\n");
         vga.Printf("pci - show pci devices\n");
+        vga.Printf("disks - list block devices\n");
+        vga.Printf("diskread <disk> <sector> - read sector\n");
+        vga.Printf("diskwrite <disk> <sector> <hex> - write sector\n");
         vga.Printf("help - help\n");
     }
     else

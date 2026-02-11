@@ -10,10 +10,11 @@ A hobby x86-64 operating system kernel written in C++14 and NASM.
 - **Page allocator** — fixed-size block allocator (1/2/4/8 pages), pool allocator (32 B – 2 KB), `new`/`delete` support
 - **ACPI** — RSDP/RSDT/MADT parsing for LAPIC/IOAPIC discovery and IRQ→GSI routing
 - **Interrupts** — IDT with exception handlers, IOAPIC routing, LAPIC IPI, PIC (remapped then disabled)
-- **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC
-- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `cls`, `help`, `shutdown`
+- **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**
+- **Block I/O** — virtio-blk driver with virtqueue DMA, block device abstraction, disk discovery and enumeration
+- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `cls`, `help`, `shutdown`
 - **Kernel infrastructure** — spinlocks, atomics, timers, watchdog, stack traces, dmesg ring buffer, panic handler
-- **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking
+- **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc, parsing helpers, block device table
 
 #### Build
 
@@ -31,6 +32,14 @@ Via Docker (works on macOS / Apple Silicon):
 
 This produces `nos.iso` and `bin/kernel64.elf` (for GDB symbols).
 
+Build a bootable qcow2 disk image (MBR, 2 partitions):
+
+```sh
+./scripts/build-disk.sh
+```
+
+This produces `nos.qcow2` (256 MB, virtio-blk compatible).
+
 #### Run
 
 With KVM (Linux):
@@ -44,6 +53,12 @@ Without KVM (macOS with TCG):
 
 ```sh
 qemu-system-x86_64 -smp 2 -cdrom nos.iso -serial file:nos.log -s -vga std
+```
+
+Boot from disk image (with virtio-blk):
+
+```sh
+./scripts/qemu-disk.sh
 ```
 
 #### Debug
@@ -62,14 +77,32 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 
 - `smp=off` — disable SMP, run on BSP only
 
+#### Shell commands
+
+| Command | Description |
+|---------|-------------|
+| `cls` | Clear screen |
+| `cpu` | Dump CPU state |
+| `dmesg` | Dump kernel log |
+| `uptime` | Show uptime |
+| `ps` | Show tasks |
+| `watchdog` | Show watchdog stats |
+| `memusage` | Show memory usage |
+| `pci` | Show PCI devices |
+| `disks` | List block devices |
+| `diskread <disk> <sector>` | Read and hex-dump a sector |
+| `diskwrite <disk> <sector> <hex>` | Write hex data to a sector |
+| `help` | List commands |
+| `exit` / `shutdown` | Shut down kernel |
+
 #### Project layout
 
 ```
 boot/       Multiboot2 entry, 32→64-bit transition, AP trampoline
 kernel/     Core: scheduling, tasks, interrupts, shell, timers, locks
-drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI
+drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI, virtio-blk
 mm/         Memory: page tables, page allocator, pool allocator
 lib/        Utilities: list, vector, btree, ring buffer, bitmap, stdlib
-build/      Linker script, GRUB config
-scripts/    GDB and KVM perf helpers
+build/      Linker script, GRUB configs
+scripts/    Build, run, debug, and GDB helpers
 ```

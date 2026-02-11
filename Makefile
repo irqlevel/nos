@@ -20,6 +20,8 @@ CXX_SRC =   \
     drivers/ioapic.cpp  \
     drivers/vga.cpp \
     drivers/pci.cpp \
+    drivers/virtqueue.cpp \
+    drivers/virtio_blk.cpp \
     kernel/icxxabi.cpp    \
     kernel/interrupt.cpp   \
     kernel/task.cpp \
@@ -36,6 +38,7 @@ CXX_SRC =   \
     kernel/idt.cpp  \
     kernel/cpu.cpp  \
     kernel/cmd.cpp  \
+    kernel/block_device.cpp \
     kernel/exception.cpp    \
     kernel/dmesg.cpp    \
     kernel/sched.cpp    \

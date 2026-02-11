@@ -4,6 +4,7 @@
 #include <kernel/asm.h>
 
 Pci::Pci()
+    : DeviceCount(0)
 {
     Trace(0, "Pci 0x%p", this);
 }
@@ -144,6 +145,61 @@ u16 Pci::ReadWord(u16 bus, u16 slot, u16 func, u16 offset)
     return (tmp);
 }
 
+u32 Pci::ReadDword(u16 bus, u16 slot, u16 func, u16 offset)
+{
+    u64 address;
+    u64 lbus = (u64)bus;
+    u64 lslot = (u64)slot;
+    u64 lfunc = (u64)func;
+
+    address = (u64)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((u32)0x80000000));
+    Out(0xCF8, address);
+    return In(0xCFC);
+}
+
+void Pci::WriteDword(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
+{
+    u64 address;
+    u64 lbus = (u64)bus;
+    u64 lslot = (u64)slot;
+    u64 lfunc = (u64)func;
+
+    address = (u64)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((u32)0x80000000));
+    Out(0xCF8, address);
+    Out(0xCFC, value);
+}
+
+void Pci::WriteWord(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
+{
+    u32 dword = ReadDword(bus, slot, func, offset);
+    u16 shift = (offset & 2) * 8;
+    dword &= ~(0xFFFF << shift);
+    dword |= ((u32)value << shift);
+    WriteDword(bus, slot, func, offset, dword);
+}
+
+u32 Pci::GetBAR(u16 bus, u16 slot, u16 func, u8 bar)
+{
+    return ReadDword(bus, slot, func, 0x10 + bar * 4);
+}
+
+u8 Pci::GetInterruptLine(u16 bus, u16 slot, u16 func)
+{
+    return ReadWord(bus, slot, func, 0x3C) & 0xFF;
+}
+
+u8 Pci::GetInterruptPin(u16 bus, u16 slot, u16 func)
+{
+    return (ReadWord(bus, slot, func, 0x3C) >> 8) & 0xFF;
+}
+
+void Pci::EnableBusMastering(u16 bus, u16 slot, u16 func)
+{
+    u16 cmd = ReadWord(bus, slot, func, 0x04);
+    cmd |= (1 << 2); /* Bus Master Enable */
+    WriteWord(bus, slot, func, 0x04, cmd);
+}
+
 u16 Pci::GetVendorID(u16 bus, u16 device, u16 function)
 {
     return ReadWord(bus, device, function, 0);
@@ -180,6 +236,7 @@ u8 Pci::GetRevisionID(u16 bus, u16 device, u16 function)
 
 void Pci::Scan()
 {
+    DeviceCount = 0;
 	for(u32 bus = 0; bus < 256; bus++)
     {
         for(u32 slot = 0; slot < 32; slot++)
@@ -198,32 +255,60 @@ void Pci::Scan()
 
                 Trace(0, "vnd %s(0x%p) dev %s(0x%p) %s(0x%p) %s(0x%p) p 0x%p r 0x%p",
                     VendorToStr(vendor), (ulong)vendor, DeviceToStr(vendor, device), (ulong)device, ClassToStr(cls), (ulong)cls, SubClassToStr(cls, scls), (ulong)scls, (ulong)progIf, (ulong)revId);
+
+                if (DeviceCount < MaxDevices)
+                {
+                    auto& d = Devices[DeviceCount];
+                    d.Bus = bus;
+                    d.Slot = slot;
+                    d.Func = function;
+                    d.Vendor = vendor;
+                    d.Device = device;
+                    d.Class = cls;
+                    d.SubClass = scls;
+                    d.ProgIF = progIf;
+                    d.RevisionID = revId;
+                    d.InterruptLine = GetInterruptLine(bus, slot, function);
+                    d.InterruptPin = GetInterruptPin(bus, slot, function);
+                    d.Valid = true;
+                    DeviceCount++;
+                }
             }
         }
     }
 }
 
+Pci::DeviceInfo* Pci::FindDevice(u16 vendor, u16 device, ulong startIndex)
+{
+    for (ulong i = startIndex; i < DeviceCount; i++)
+    {
+        if (Devices[i].Valid && Devices[i].Vendor == vendor && Devices[i].Device == device)
+            return &Devices[i];
+    }
+    return nullptr;
+}
+
+Pci::DeviceInfo* Pci::GetDevice(ulong index)
+{
+    if (index >= DeviceCount)
+        return nullptr;
+    return &Devices[index];
+}
+
+ulong Pci::GetDeviceCount()
+{
+    return DeviceCount;
+}
+
 void Pci::Dump(Stdlib::Printer& printer)
 {
-	for(u32 bus = 0; bus < 256; bus++)
+    for (ulong i = 0; i < DeviceCount; i++)
     {
-        for(u32 slot = 0; slot < 32; slot++)
-        {
-            for(u32 function = 0; function < 8; function++)
-            {
-                u16 vendor = GetVendorID(bus, slot, function);
-                if(vendor == 0xffff)
-                    continue;
+        auto& d = Devices[i];
+        if (!d.Valid)
+            continue;
 
-                u16 device = GetDeviceID(bus, slot, function);
-                u16 cls = GetClassId(bus, slot, function);
-                u16 scls = GetSubClassId(bus, slot, function);
-                u16 progIf = GetProgIF(bus, slot, function);
-                u16 revId = GetRevisionID(bus, slot, function);
-
-                printer.Printf("vnd %s(0x%p) dev %s(0x%p) %s(0x%p) %s(0x%p) p 0x%p r 0x%p\n",
-                    VendorToStr(vendor), (ulong)vendor, DeviceToStr(vendor, device), (ulong)device, ClassToStr(cls), (ulong)cls, SubClassToStr(cls, scls), (ulong)scls, (ulong)progIf, (ulong)revId);
-            }
-        }
+        printer.Printf("vnd %s(0x%p) dev %s(0x%p) %s(0x%p) %s(0x%p) p 0x%p r 0x%p\n",
+            VendorToStr(d.Vendor), (ulong)d.Vendor, DeviceToStr(d.Vendor, d.Device), (ulong)d.Device, ClassToStr(d.Class), (ulong)d.Class, SubClassToStr(d.Class, d.SubClass), (ulong)d.SubClass, (ulong)d.ProgIF, (ulong)d.RevisionID);
     }
 }
