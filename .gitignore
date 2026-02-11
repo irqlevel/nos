@@ -12,3 +12,4 @@ bin
 *.out
 *.img
 *.disk
+*.qcow2

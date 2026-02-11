@@ -36,6 +36,7 @@
 #include <drivers/lapic.h>
 #include <drivers/ioapic.h>
 #include <drivers/pci.h>
+#include <drivers/virtio_blk.h>
 
 using namespace Kernel;
 using namespace Stdlib;
@@ -226,6 +227,8 @@ void BpStartup(void* ctx)
     Interrupt::Register(pit, acpi.GetGsiByIrq(0x2), 0x20);
     Interrupt::Register(kbd, acpi.GetGsiByIrq(0x1), 0x21);
     Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
+
+    VirtioBlk::InitAll();
 
     Trace(0, "Interrupts registered");
 

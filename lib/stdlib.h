@@ -308,4 +308,14 @@ size_t HashPtr(void *ptr);
 
 bool IsValueInRange(ulong value, ulong base, ulong limit);
 
+bool ParseUlong(const char* s, ulong& result);
+
+u8 HexCharToNibble(char c);
+
+bool HexDecode(const char* hex, ulong hexLen, u8* out, ulong outSize, ulong& bytesWritten);
+
+const char* NextToken(const char* s, const char*& end);
+
+ulong TokenCopy(const char* start, const char* end, char* dst, ulong dstSize);
+
 }

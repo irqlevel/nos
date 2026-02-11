@@ -482,12 +482,80 @@ Page* PageTable::AllocPageNoLock()
 
     //DebugWait();
     Page* page = CONTAINING_RECORD(FreePagesList.RemoveHead(), Page, ListEntry);
+    page->ListEntry.Init(); /* Self-pointing = not on any list */
     ulong va = TmpMapPage(page->GetPhyAddress());
     BugOn(!va);
     Stdlib::MemSet((void*)va, 0, Const::PageSize);
     TmpUnmapPage(va);
     FreePagesCount--;
     return page;
+}
+
+Page* PageTable::AllocContiguousPages(ulong count)
+{
+    Stdlib::AutoLock lock(Lock);
+
+    if (count == 0 || count > 16 || FreePagesList.IsEmpty())
+        return nullptr;
+
+    /* Walk the free list and for each free page, check if the next
+       count-1 pages in the PageArray are also on the free list and
+       physically contiguous.  A page is on the free list if its
+       ListEntry is NOT self-pointing (AllocPageNoLock re-inits the
+       ListEntry to self-pointing upon removal). */
+    auto* entry = FreePagesList.Flink;
+    while (entry != &FreePagesList)
+    {
+        Page* first = CONTAINING_RECORD(entry, Page, ListEntry);
+        ulong basePhyAddr = first->GetPhyAddress();
+        ulong baseIndex = (ulong)(first - PageArray);
+
+        if (baseIndex + count > PageArrayCount)
+        {
+            entry = entry->Flink;
+            continue;
+        }
+
+        bool ok = true;
+        for (ulong j = 0; j < count; j++)
+        {
+            Page* p = &PageArray[baseIndex + j];
+            if (p->GetPhyAddress() != basePhyAddr + j * Const::PageSize)
+            {
+                ok = false;
+                break;
+            }
+            /* Self-pointing ListEntry means the page is NOT on the free list. */
+            if (p->ListEntry.Flink == &p->ListEntry)
+            {
+                ok = false;
+                break;
+            }
+        }
+
+        if (!ok)
+        {
+            entry = entry->Flink;
+            continue;
+        }
+
+        /* Found a contiguous run.  Remove all pages from the free list
+           and zero them. */
+        for (ulong j = 0; j < count; j++)
+        {
+            Page* p = &PageArray[baseIndex + j];
+            p->ListEntry.RemoveInit();
+            FreePagesCount--;
+            ulong va = TmpMapPage(p->GetPhyAddress());
+            BugOn(!va);
+            Stdlib::MemSet((void*)va, 0, Const::PageSize);
+            TmpUnmapPage(va);
+        }
+
+        return first;
+    }
+
+    return nullptr;
 }
 
 void PageTable::FreePage(Page* page)

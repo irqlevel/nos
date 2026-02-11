@@ -13,8 +13,37 @@ public:
     Pci();
     virtual ~Pci();
 
+    struct DeviceInfo
+    {
+        u16 Bus;
+        u16 Slot;
+        u16 Func;
+        u16 Vendor;
+        u16 Device;
+        u8 Class;
+        u8 SubClass;
+        u8 ProgIF;
+        u8 RevisionID;
+        u8 InterruptLine;
+        u8 InterruptPin;
+        bool Valid;
+    };
+
     void Dump(Stdlib::Printer& printer);
     void Scan();
+
+    DeviceInfo* FindDevice(u16 vendor, u16 device, ulong startIndex = 0);
+    DeviceInfo* GetDevice(ulong index);
+    ulong GetDeviceCount();
+
+    u32 ReadDword(u16 bus, u16 slot, u16 func, u16 offset);
+    void WriteDword(u16 bus, u16 slot, u16 func, u16 offset, u32 value);
+    void WriteWord(u16 bus, u16 slot, u16 func, u16 offset, u16 value);
+
+    u32 GetBAR(u16 bus, u16 slot, u16 func, u8 bar);
+    u8 GetInterruptLine(u16 bus, u16 slot, u16 func);
+    u8 GetInterruptPin(u16 bus, u16 slot, u16 func);
+    void EnableBusMastering(u16 bus, u16 slot, u16 func);
 
     static const u16 ClsUnclassified = 0x0;
     static const u16 ClsMassStorageController = 0x1;
@@ -68,4 +97,8 @@ private:
     u8 GetProgIF(u16 bus, u16 device, u16 function);
 
     u8 GetRevisionID(u16 bus, u16 device, u16 function);
+
+    static const ulong MaxDevices = 64;
+    DeviceInfo Devices[MaxDevices];
+    ulong DeviceCount;
 };

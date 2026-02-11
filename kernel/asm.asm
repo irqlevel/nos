@@ -7,6 +7,7 @@ extern IO8042Interrupt
 extern SerialInterrupt
 extern PitInterrupt
 extern IPInterrupt
+extern VirtioBlkInterrupt
 
 extern ExcDivideByZero
 extern ExcDebugger
@@ -57,6 +58,8 @@ global SpinLockLock
 global SpinLockUnlock
 global Outb
 global Inb
+global Outw
+global Inw
 global Out
 global In
 global ReadMsr
@@ -87,6 +90,7 @@ global IO8042InterruptStub
 global SerialInterruptStub
 global PitInterruptStub
 global IPInterruptStub
+global VirtioBlkInterruptStub
 
 global ExcDivideByZeroStub
 global ExcDebuggerStub
@@ -241,6 +245,22 @@ Inb:
 	mov rdx, rdi
 	xor rax, rax
 	in al, dx
+	pop rdx
+	ret
+
+Outw:
+	push rdx
+	mov rdx, rdi
+	mov rax, rsi
+	out dx, ax
+	pop rdx
+	ret
+
+Inw:
+	push rdx
+	mov rdx, rdi
+	xor rax, rax
+	in ax, dx
 	pop rdx
 	ret
 
@@ -452,6 +472,7 @@ InterruptStub IO8042
 InterruptStub Serial
 InterruptStub Pit
 InterruptStub IP
+InterruptStub VirtioBlk
 
 ExceptionStub ExcDivideByZero
 ExceptionStub ExcDebugger

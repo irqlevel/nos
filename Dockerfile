@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y \
     grub-pc-bin \
     xorriso \
     cppcheck \
+    parted \
+    e2fsprogs \
+    qemu-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

@@ -396,4 +396,63 @@ bool IsValueInRange(ulong value, ulong base, ulong limit)
 
     return false;
 }
+
+bool ParseUlong(const char* s, ulong& result)
+{
+    result = 0;
+    if (!s || *s == '\0')
+        return false;
+
+    while (*s)
+    {
+        if (*s < '0' || *s > '9')
+            return false;
+        result = result * 10 + (*s - '0');
+        s++;
+    }
+    return true;
+}
+
+u8 HexCharToNibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0xFF;
+}
+
+bool HexDecode(const char* hex, ulong hexLen, u8* out, ulong outSize, ulong& bytesWritten)
+{
+    bytesWritten = 0;
+    for (ulong i = 0; i + 1 < hexLen && bytesWritten < outSize; i += 2)
+    {
+        u8 hi = HexCharToNibble(hex[i]);
+        u8 lo = HexCharToNibble(hex[i + 1]);
+        if (hi == 0xFF || lo == 0xFF)
+            return false;
+        out[bytesWritten++] = (hi << 4) | lo;
+    }
+    return true;
+}
+
+const char* NextToken(const char* s, const char*& end)
+{
+    while (*s == ' ') s++;
+    if (*s == '\0') { end = s; return nullptr; }
+    const char* start = s;
+    while (*s && *s != ' ') s++;
+    end = s;
+    return start;
+}
+
+ulong TokenCopy(const char* start, const char* end, char* dst, ulong dstSize)
+{
+    ulong len = (ulong)(end - start);
+    if (len >= dstSize)
+        len = dstSize - 1;
+    MemCpy(dst, start, len);
+    dst[len] = '\0';
+    return len;
+}
+
 }

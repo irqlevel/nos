@@ -43,6 +43,9 @@ void SpinLockUnlock(ulong *lock);
 void Outb(u16 port, u8 data);
 u8 Inb(u16 port);
 
+void Outw(u16 port, u16 data);
+u16 Inw(u16 port);
+
 void Out(u16 port, u32 data);
 u32 In(u16 port);
 
@@ -79,6 +82,7 @@ void IO8042InterruptStub();
 void SerialInterruptStub();
 void PitInterruptStub();
 void IPInterruptStub();
+void VirtioBlkInterruptStub();
 
 void DummyInterruptStub();
 
