@@ -21,6 +21,7 @@ namespace Kernel
 Cmd::Cmd()
     : TaskPtr(nullptr)
     , Shutdown(false)
+    , Reboot(false)
     , Active(false)
 {
     CmdLine[0] = '\0';
@@ -43,11 +44,15 @@ void Cmd::ProcessCmd(const char *cmd)
     {
         con.Cls();
     }
-    else if (Stdlib::StrCmp(cmd, "exit") == 0 ||
-             Stdlib::StrCmp(cmd, "quit") == 0 ||
+    else if (Stdlib::StrCmp(cmd, "poweroff") == 0 ||
              Stdlib::StrCmp(cmd, "shutdown") == 0)
     {
         Shutdown = true;
+        return;
+    }
+    else if (Stdlib::StrCmp(cmd, "reboot") == 0)
+    {
+        Reboot = true;
         return;
     }
     else if (Stdlib::StrCmp(cmd, "cpu") == 0)
@@ -341,7 +346,8 @@ void Cmd::ProcessCmd(const char *cmd)
         con.Printf("cls - clear screen\n");
         con.Printf("cpu - dump cpu state\n");
         con.Printf("dmesg - dump kernel log\n");
-        con.Printf("exit - shutdown kernel\n");
+        con.Printf("poweroff - power off (ACPI S5)\n");
+        con.Printf("reboot - reset system\n");
         con.Printf("ps - show tasks\n");
         con.Printf("watchdog - show watchdog stats\n");
         con.Printf("memusage - show memory usage stats\n");
@@ -363,6 +369,11 @@ void Cmd::ProcessCmd(const char *cmd)
 bool Cmd::ShouldShutdown()
 {
     return Shutdown;
+}
+
+bool Cmd::ShouldReboot()
+{
+    return Reboot;
 }
 
 void Cmd::Stop()

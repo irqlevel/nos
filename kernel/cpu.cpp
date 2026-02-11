@@ -300,8 +300,17 @@ void CpuTable::InvalidateTlbAll()
 
     ulong localId = GetCurrentCpuId();
     ulong cpuMask = GetRunningCpus() & ~(1UL << localId);
-    long remoteCount = 0;
 
+    /* Skip CPUs that have already exited (halted with IRQs off) —
+       they can never acknowledge an IPI. */
+    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    {
+        if ((cpuMask & (1UL << i)) &&
+            (CpuArray[i].GetState() & Cpu::StateExited))
+            cpuMask &= ~(1UL << i);
+    }
+
+    long remoteCount = 0;
     for (ulong i = 0; i < 8 * sizeof(ulong); i++)
     {
         if (cpuMask & (1UL << i))

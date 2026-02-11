@@ -24,6 +24,7 @@ public:
     virtual void OnChar(char c, u8 code) override;
 
     bool ShouldShutdown();
+    bool ShouldReboot();
 
     bool Start();
 
@@ -55,6 +56,7 @@ private:
     SpinLock Lock;
     Task *TaskPtr;
     bool Shutdown;
+    bool Reboot;
     bool Active;
     static const ulong Tag = 'Cmd ';
 };
