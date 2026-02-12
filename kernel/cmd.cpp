@@ -12,6 +12,8 @@
 #include <net/arp.h>
 #include <net/dhcp.h>
 #include <net/icmp.h>
+#include <fs/vfs.h>
+#include <fs/ramfs.h>
 #include "console.h"
 
 #include <drivers/vga.h>
@@ -26,6 +28,697 @@ static DhcpClient& GetDhcpClient()
 {
     static DhcpClient instance;
     return instance;
+}
+
+struct CmdEntry
+{
+    const char* Name;
+    void (*Handler)(const char* args, Stdlib::Printer& con);
+    const char* Help;
+};
+
+static void CmdCls(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Console::GetInstance().Cls();
+    (void)con;
+}
+
+static void CmdPoweroff(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    (void)con;
+    Cmd::GetInstance().RequestShutdown();
+}
+
+static void CmdReboot(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    (void)con;
+    Cmd::GetInstance().RequestReboot();
+}
+
+static void CmdCpu(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    con.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
+        (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
+        (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
+
+    con.Printf("rflags 0x%p rsp 0x%p rip 0x%p\n",
+        GetRflags(), GetRsp(), GetRip());
+
+    con.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
+        GetCr0(), GetCr2(), GetCr3(), GetCr4());
+}
+
+static void CmdDmesg(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Dmesg::GetInstance().Dump(con);
+}
+
+static void CmdUptime(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    auto time = GetBootTime();
+    con.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
+}
+
+static void CmdPs(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    TaskTable::GetInstance().Ps(con);
+}
+
+static void CmdWatchdog(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Watchdog::GetInstance().Dump(con);
+}
+
+static void CmdMemusage(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    auto& pt = Mm::PageTable::GetInstance();
+
+    con.Printf("freePages: %u\n", pt.GetFreePagesCount());
+    con.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
+}
+
+static void CmdPci(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Pci::GetInstance().Dump(con);
+}
+
+static void CmdDisks(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    BlockDeviceTable::GetInstance().Dump(con);
+}
+
+static void CmdDiskread(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* nameStart = Stdlib::NextToken(args, end);
+    if (!nameStart)
+    {
+        con.Printf("usage: diskread <disk> <sector>\n");
+        return;
+    }
+
+    char diskName[16];
+    Stdlib::TokenCopy(nameStart, end, diskName, sizeof(diskName));
+
+    const char* secStart = Stdlib::NextToken(end, end);
+    ulong sector = 0;
+    if (!secStart)
+    {
+        con.Printf("usage: diskread <disk> <sector>\n");
+        return;
+    }
+
+    char secBuf[32];
+    Stdlib::TokenCopy(secStart, end, secBuf, sizeof(secBuf));
+
+    if (!Stdlib::ParseUlong(secBuf, sector))
+    {
+        con.Printf("invalid sector number\n");
+        return;
+    }
+
+    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
+    if (!dev)
+    {
+        con.Printf("disk '%s' not found\n", diskName);
+        return;
+    }
+
+    u8 buf[512];
+    if (!dev->ReadSector(sector, buf))
+    {
+        con.Printf("read error\n");
+        return;
+    }
+
+    for (ulong i = 0; i < 512; i += 16)
+    {
+        con.Printf("%p: ", sector * 512 + i);
+        for (ulong j = 0; j < 16 && (i + j) < 512; j++)
+        {
+            con.Printf("%p ", (ulong)buf[i + j]);
+        }
+        con.Printf("\n");
+    }
+}
+
+static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* nameStart = Stdlib::NextToken(args, end);
+    if (!nameStart)
+    {
+        con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+        return;
+    }
+
+    char diskName[16];
+    Stdlib::TokenCopy(nameStart, end, diskName, sizeof(diskName));
+
+    const char* secStart = Stdlib::NextToken(end, end);
+    ulong sector = 0;
+    if (!secStart)
+    {
+        con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+        return;
+    }
+
+    char secBuf[32];
+    Stdlib::TokenCopy(secStart, end, secBuf, sizeof(secBuf));
+
+    const char* hexStart = Stdlib::NextToken(end, end);
+    if (!Stdlib::ParseUlong(secBuf, sector) || !hexStart)
+    {
+        con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
+        return;
+    }
+
+    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
+    if (!dev)
+    {
+        con.Printf("disk '%s' not found\n", diskName);
+        return;
+    }
+
+    u8 buf[512];
+    Stdlib::MemSet(buf, 0, 512);
+    ulong hexLen = (ulong)(end - hexStart);
+    ulong byteCount = 0;
+    if (!Stdlib::HexDecode(hexStart, hexLen, buf, 512, byteCount))
+    {
+        con.Printf("invalid hex data\n");
+        return;
+    }
+
+    if (byteCount > 0)
+    {
+        if (!dev->WriteSector(sector, buf))
+            con.Printf("write error\n");
+        else
+            con.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
+    }
+}
+
+static void CmdNet(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    NetDeviceTable::GetInstance().Dump(con);
+}
+
+static bool ParseIp(const char* ipBuf, u32& dstIp)
+{
+    dstIp = 0;
+    bool ipOk = true;
+    ulong octet = 0;
+    ulong shift = 24;
+    const char* p = ipBuf;
+    ulong dots = 0;
+
+    while (*p && ipOk)
+    {
+        if (*p == '.')
+        {
+            if (octet > 255) { ipOk = false; break; }
+            dstIp |= (octet << shift);
+            if (shift == 0) { ipOk = false; break; }
+            shift -= 8;
+            octet = 0;
+            dots++;
+        }
+        else if (*p >= '0' && *p <= '9')
+        {
+            octet = octet * 10 + (*p - '0');
+        }
+        else
+        {
+            ipOk = false;
+        }
+        p++;
+    }
+
+    if (ipOk && dots == 3 && octet <= 255)
+    {
+        dstIp |= (octet << shift);
+    }
+    else
+    {
+        ipOk = false;
+    }
+
+    return ipOk;
+}
+
+static void CmdUdpsend(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* ipStart = Stdlib::NextToken(args, end);
+    if (!ipStart)
+    {
+        con.Printf("usage: udpsend <ip> <port> <message>\n");
+        return;
+    }
+
+    char ipBuf[16];
+    Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
+
+    const char* portStart = Stdlib::NextToken(end, end);
+    if (!portStart)
+    {
+        con.Printf("usage: udpsend <ip> <port> <message>\n");
+        return;
+    }
+
+    char portBuf[8];
+    Stdlib::TokenCopy(portStart, end, portBuf, sizeof(portBuf));
+
+    ulong port = 0;
+    if (!Stdlib::ParseUlong(portBuf, port) || port > 65535)
+    {
+        con.Printf("invalid port\n");
+        return;
+    }
+
+    /* Skip whitespace to get message */
+    const char* msg = end;
+    while (*msg == ' ')
+        msg++;
+
+    if (*msg == '\0')
+    {
+        con.Printf("usage: udpsend <ip> <port> <message>\n");
+        return;
+    }
+
+    u32 dstIp = 0;
+    if (!ParseIp(ipBuf, dstIp))
+    {
+        con.Printf("invalid IP '%s'\n", ipBuf);
+        return;
+    }
+
+    /* Find first net device */
+    NetDevice* dev = nullptr;
+    if (NetDeviceTable::GetInstance().GetCount() > 0)
+        dev = NetDeviceTable::GetInstance().Find("eth0");
+
+    if (!dev)
+    {
+        con.Printf("no network device\n");
+        return;
+    }
+
+    ulong msgLen = Stdlib::StrLen(msg);
+    u32 srcIp = dev->GetIp();
+
+    /* Resolve destination MAC via ARP */
+    u8 dstMac[6];
+    if (!ArpTable::GetInstance().Resolve(dev, dstIp, dstMac))
+        Stdlib::MemSet(dstMac, 0xFF, 6);
+
+    /* Build UDP frame */
+    ulong udpPayLen = sizeof(Net::UdpHdr) + msgLen;
+    ulong ipPayLen = sizeof(Net::IpHdr) + udpPayLen;
+    ulong frameLen = sizeof(Net::EthHdr) + ipPayLen;
+
+    if (frameLen > 1514)
+    {
+        con.Printf("message too large\n");
+        return;
+    }
+
+    u8 frame[1514];
+    Stdlib::MemSet(frame, 0, sizeof(frame));
+    ulong off = 0;
+
+    Net::EthHdr* eth = (Net::EthHdr*)(frame + off);
+    Stdlib::MemCpy(eth->DstMac, dstMac, 6);
+    dev->GetMac(eth->SrcMac);
+    eth->EtherType = Net::Htons(Net::EtherTypeIp);
+    off += sizeof(Net::EthHdr);
+
+    Net::IpHdr* ip = (Net::IpHdr*)(frame + off);
+    ip->VersionIhl = 0x45;
+    ip->TotalLen = Net::Htons((u16)ipPayLen);
+    ip->Ttl = 64;
+    ip->Protocol = 17;
+    ip->SrcAddr = Net::Htonl(srcIp);
+    ip->DstAddr = Net::Htonl(dstIp);
+    ip->Checksum = Net::Htons(Net::IpChecksum(ip, sizeof(Net::IpHdr)));
+    off += sizeof(Net::IpHdr);
+
+    Net::UdpHdr* udp = (Net::UdpHdr*)(frame + off);
+    udp->SrcPort = Net::Htons(12345);
+    udp->DstPort = Net::Htons((u16)port);
+    udp->Length = Net::Htons((u16)udpPayLen);
+    off += sizeof(Net::UdpHdr);
+
+    Stdlib::MemCpy(frame + off, msg, msgLen);
+    off += msgLen;
+
+    if (dev->SendRaw(frame, off))
+    {
+        con.Printf("sent %u bytes to %s:%u\n",
+            msgLen, ipBuf, port);
+    }
+    else
+    {
+        con.Printf("send failed\n");
+    }
+}
+
+static void CmdPing(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* ipStart = Stdlib::NextToken(args, end);
+    if (!ipStart)
+    {
+        con.Printf("usage: ping <ip>\n");
+        return;
+    }
+
+    char ipBuf[16];
+    Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
+
+    u32 dstIp = 0;
+    if (!ParseIp(ipBuf, dstIp))
+    {
+        con.Printf("invalid IP '%s'\n", ipBuf);
+        return;
+    }
+
+    NetDevice* dev = nullptr;
+    if (NetDeviceTable::GetInstance().GetCount() > 0)
+        dev = NetDeviceTable::GetInstance().Find("eth0");
+
+    if (!dev)
+    {
+        con.Printf("no network device\n");
+        return;
+    }
+
+    con.Printf("PING %s\n", ipBuf);
+    ulong received = 0;
+
+    for (u16 seq = 0; seq < 5; seq++)
+    {
+        if (!Icmp::GetInstance().SendEchoRequest(dev, dstIp, 0x1234, seq))
+        {
+            con.Printf("send failed seq=%u\n", (ulong)seq);
+        }
+        else
+        {
+            ulong rttNs = 0;
+            if (Icmp::GetInstance().WaitReply(0x1234, seq, 3000, rttNs))
+            {
+                ulong rttMs = rttNs / Const::NanoSecsInMs;
+                con.Printf("reply from %s: seq=%u time=%u ms\n",
+                    ipBuf, (ulong)seq, rttMs);
+                received++;
+            }
+            else
+            {
+                con.Printf("request timeout seq=%u\n", (ulong)seq);
+            }
+        }
+
+        if (seq < 4)
+            Sleep(1000 * Const::NanoSecsInMs);
+    }
+
+    con.Printf("%u/5 received\n", received);
+}
+
+static void CmdDhcp(const char* args, Stdlib::Printer& con)
+{
+    if (Parameters::GetInstance().IsDhcpOff())
+    {
+        con.Printf("DHCP disabled (dhcp=off)\n");
+        return;
+    }
+
+    const char* devName = "eth0";
+    if (args[0] != '\0')
+        devName = args;
+
+    NetDevice* dev = NetDeviceTable::GetInstance().Find(devName);
+    if (!dev)
+    {
+        con.Printf("device '%s' not found\n", devName);
+        return;
+    }
+
+    if (GetDhcpClient().IsReady())
+    {
+        DhcpResult r = GetDhcpClient().GetResult();
+        con.Printf("already bound: %u.%u.%u.%u\n",
+            (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
+            (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
+        return;
+    }
+
+    con.Printf("DHCP discovering on %s...\n", devName);
+    if (!GetDhcpClient().Start(dev))
+    {
+        con.Printf("failed to start DHCP\n");
+        return;
+    }
+
+    /* Wait up to 10 seconds for a lease */
+    for (ulong i = 0; i < 100 && !GetDhcpClient().IsReady(); i++)
+        Sleep(100 * Const::NanoSecsInMs);
+
+    if (GetDhcpClient().IsReady())
+    {
+        DhcpResult r = GetDhcpClient().GetResult();
+        con.Printf("ip:     %u.%u.%u.%u\n",
+            (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
+            (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
+        con.Printf("mask:   %u.%u.%u.%u\n",
+            (r.Mask >> 24) & 0xFF, (r.Mask >> 16) & 0xFF,
+            (r.Mask >> 8) & 0xFF, r.Mask & 0xFF);
+        con.Printf("router: %u.%u.%u.%u\n",
+            (r.Router >> 24) & 0xFF, (r.Router >> 16) & 0xFF,
+            (r.Router >> 8) & 0xFF, r.Router & 0xFF);
+        con.Printf("dns:    %u.%u.%u.%u\n",
+            (r.Dns >> 24) & 0xFF, (r.Dns >> 16) & 0xFF,
+            (r.Dns >> 8) & 0xFF, r.Dns & 0xFF);
+        con.Printf("lease:  %u seconds\n", r.LeaseTime);
+    }
+    else
+    {
+        con.Printf("DHCP timeout\n");
+    }
+}
+
+static void CmdMount(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* fsType = Stdlib::NextToken(args, end);
+    if (fsType == nullptr)
+    {
+        con.Printf("usage: mount ramfs <path>\n");
+        return;
+    }
+    char fsName[16];
+    Stdlib::TokenCopy(fsType, end, fsName, sizeof(fsName));
+
+    const char* pathStart = Stdlib::NextToken(end, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: mount ramfs <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+    if (Stdlib::StrCmp(fsName, "ramfs") != 0)
+    {
+        con.Printf("unknown filesystem '%s'\n", fsName);
+    }
+    else
+    {
+        RamFs* fs = new RamFs();
+        if (fs == nullptr)
+        {
+            con.Printf("failed to allocate ramfs\n");
+        }
+        else if (!Vfs::GetInstance().Mount(path, fs))
+        {
+            delete fs;
+            con.Printf("mount failed\n");
+        }
+        else
+        {
+            con.Printf("mounted ramfs on %s\n", path);
+        }
+    }
+}
+
+static void CmdUmount(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: umount <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+    FileSystem* fs = Vfs::GetInstance().Unmount(path);
+    if (fs == nullptr)
+    {
+        con.Printf("not mounted\n");
+    }
+    else
+    {
+        delete fs;
+        con.Printf("unmounted %s\n", path);
+    }
+}
+
+static void CmdMounts(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Vfs::GetInstance().DumpMounts(con);
+}
+
+static void CmdLs(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: ls <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+    Vfs::GetInstance().ListDir(path, con);
+}
+
+static void CmdCat(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: cat <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+    Vfs::GetInstance().ReadFile(path, con);
+}
+
+static void CmdWrite(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: write <path> <text>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+    // Rest of the line after path is the content
+    const char* content = end;
+    while (*content == ' ')
+        content++;
+
+    ulong len = Stdlib::StrLen(content);
+    if (Vfs::GetInstance().WriteFile(path, content, len))
+    {
+        con.Printf("wrote %u bytes\n", len);
+    }
+    else
+    {
+        con.Printf("write failed\n");
+    }
+}
+
+static void CmdMkdir(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: mkdir <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+    if (Vfs::GetInstance().CreateDir(path))
+    {
+        con.Printf("created %s\n", path);
+    }
+    else
+    {
+        con.Printf("mkdir failed\n");
+    }
+}
+
+static void CmdVersion(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    con.Printf("nos %s\n", KERNEL_VERSION);
+}
+
+// Forward declaration - CmdHelp needs the Commands array defined below
+static void CmdHelp(const char* args, Stdlib::Printer& con);
+
+static const CmdEntry Commands[] = {
+    { "cls",       CmdCls,       "cls - clear screen" },
+    { "cpu",       CmdCpu,       "cpu - dump cpu state" },
+    { "dmesg",     CmdDmesg,     "dmesg - dump kernel log" },
+    { "uptime",    CmdUptime,    "uptime - show uptime" },
+    { "ps",        CmdPs,        "ps - show tasks" },
+    { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
+    { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },
+    { "pci",       CmdPci,       "pci - show pci devices" },
+    { "disks",     CmdDisks,     "disks - list block devices" },
+    { "diskread",  CmdDiskread,  "diskread <disk> <sector> - read sector" },
+    { "diskwrite", CmdDiskwrite, "diskwrite <disk> <sector> <hex> - write sector" },
+    { "net",       CmdNet,       "net - list network devices" },
+    { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
+    { "ping",      CmdPing,      "ping <ip> - send ICMP echo" },
+    { "dhcp",      CmdDhcp,      "dhcp [dev] - obtain IP via DHCP" },
+    { "mount",     CmdMount,     "mount ramfs <path> - mount ramfs" },
+    { "umount",    CmdUmount,    "umount <path> - unmount filesystem" },
+    { "mounts",    CmdMounts,    "mounts - list mount points" },
+    { "ls",        CmdLs,        "ls <path> - list directory" },
+    { "cat",       CmdCat,       "cat <path> - show file content" },
+    { "write",     CmdWrite,     "write <path> <text> - write to file" },
+    { "mkdir",     CmdMkdir,     "mkdir <path> - create directory" },
+    { "version",   CmdVersion,   "version - show kernel version" },
+    { "poweroff",  CmdPoweroff,  "poweroff - power off (ACPI S5)" },
+    { "shutdown",  CmdPoweroff,  nullptr },
+    { "reboot",    CmdReboot,    "reboot - reset system" },
+    { "help",      CmdHelp,      "help - help" },
+    { nullptr,     nullptr,      nullptr },
+};
+
+static void CmdHelp(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    for (ulong i = 0; Commands[i].Name != nullptr; i++)
+    {
+        if (Commands[i].Help != nullptr)
+            con.Printf("%s\n", Commands[i].Help);
+    }
 }
 
 Cmd::Cmd()
@@ -50,549 +743,38 @@ void Cmd::ProcessCmd(const char *cmd)
 {
     auto& con = Console::GetInstance();
 
-    if (Stdlib::StrCmp(cmd, "cls") == 0)
+    bool found = false;
+    for (ulong i = 0; Commands[i].Name != nullptr; i++)
     {
-        con.Cls();
-    }
-    else if (Stdlib::StrCmp(cmd, "poweroff") == 0 ||
-             Stdlib::StrCmp(cmd, "shutdown") == 0)
-    {
-        Shutdown = true;
-        return;
-    }
-    else if (Stdlib::StrCmp(cmd, "reboot") == 0)
-    {
-        Reboot = true;
-        return;
-    }
-    else if (Stdlib::StrCmp(cmd, "cpu") == 0)
-    {
-        con.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
-            (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
-            (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
-
-        con.Printf("rflags 0x%p rsp 0x%p rip 0x%p\n",
-            GetRflags(), GetRsp(), GetRip());
-
-        con.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
-            GetCr0(), GetCr2(), GetCr3(), GetCr4());
-    }
-    else if (Stdlib::StrCmp(cmd, "dmesg") == 0)
-    {
-        Dmesg::GetInstance().Dump(con);
-    }
-    else if (Stdlib::StrCmp(cmd, "uptime") == 0)
-    {
-        auto time = GetBootTime();
-        con.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
-    }
-    else if (Stdlib::StrCmp(cmd, "ps") == 0)
-    {
-        TaskTable::GetInstance().Ps(con);
-    }
-    else if (Stdlib::StrCmp(cmd, "watchdog") == 0)
-    {
-        Watchdog::GetInstance().Dump(con);
-    }
-    else if (Stdlib::StrCmp(cmd, "memusage") == 0)
-    {
-        auto& pt = Mm::PageTable::GetInstance();
-
-        con.Printf("freePages: %u\n", pt.GetFreePagesCount());
-        con.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
-    }
-    else if (Stdlib::StrCmp(cmd, "pci") == 0)
-    {
-        Pci::GetInstance().Dump(con);
-    }
-    else if (Stdlib::StrCmp(cmd, "disks") == 0)
-    {
-        BlockDeviceTable::GetInstance().Dump(con);
-    }
-    else if (Stdlib::MemCmp(cmd, "diskread ", 9) == 0)
-    {
-        const char* args = cmd + 9;
-        const char* end;
-        const char* nameStart = Stdlib::NextToken(args, end);
-        if (!nameStart)
+        ulong nameLen = Stdlib::StrLen(Commands[i].Name);
+        if (Stdlib::StrCmp(cmd, Commands[i].Name) == 0)
         {
-            con.Printf("usage: diskread <disk> <sector>\n");
+            Commands[i].Handler("", con);
+            found = true;
+            break;
         }
-        else
+        else if (Stdlib::MemCmp(cmd, Commands[i].Name, nameLen) == 0 && cmd[nameLen] == ' ')
         {
-            char diskName[16];
-            Stdlib::TokenCopy(nameStart, end, diskName, sizeof(diskName));
-
-            const char* secStart = Stdlib::NextToken(end, end);
-            ulong sector = 0;
-            if (!secStart)
-            {
-                con.Printf("usage: diskread <disk> <sector>\n");
-            }
-            else
-            {
-                char secBuf[32];
-                Stdlib::TokenCopy(secStart, end, secBuf, sizeof(secBuf));
-
-                if (!Stdlib::ParseUlong(secBuf, sector))
-                {
-                    con.Printf("invalid sector number\n");
-                }
-                else
-                {
-                    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
-                    if (!dev)
-                    {
-                        con.Printf("disk '%s' not found\n", diskName);
-                    }
-                    else
-                    {
-                        u8 buf[512];
-                        if (!dev->ReadSector(sector, buf))
-                        {
-                            con.Printf("read error\n");
-                        }
-                        else
-                        {
-                            for (ulong i = 0; i < 512; i += 16)
-                            {
-                                con.Printf("%p: ", sector * 512 + i);
-                                for (ulong j = 0; j < 16 && (i + j) < 512; j++)
-                                {
-                                    con.Printf("%p ", (ulong)buf[i + j]);
-                                }
-                                con.Printf("\n");
-                            }
-                        }
-                    }
-                }
-            }
+            Commands[i].Handler(cmd + nameLen + 1, con);
+            found = true;
+            break;
         }
     }
-    else if (Stdlib::MemCmp(cmd, "diskwrite ", 10) == 0)
-    {
-        const char* args = cmd + 10;
-        const char* end;
-        const char* nameStart = Stdlib::NextToken(args, end);
-        if (!nameStart)
-        {
-            con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
-        }
-        else
-        {
-            char diskName[16];
-            Stdlib::TokenCopy(nameStart, end, diskName, sizeof(diskName));
 
-            const char* secStart = Stdlib::NextToken(end, end);
-            ulong sector = 0;
-            if (!secStart)
-            {
-                con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
-            }
-            else
-            {
-                char secBuf[32];
-                Stdlib::TokenCopy(secStart, end, secBuf, sizeof(secBuf));
-
-                const char* hexStart = Stdlib::NextToken(end, end);
-                if (!Stdlib::ParseUlong(secBuf, sector) || !hexStart)
-                {
-                    con.Printf("usage: diskwrite <disk> <sector> <hex>\n");
-                }
-                else
-                {
-                    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
-                    if (!dev)
-                    {
-                        con.Printf("disk '%s' not found\n", diskName);
-                    }
-                    else
-                    {
-                        u8 buf[512];
-                        Stdlib::MemSet(buf, 0, 512);
-                        ulong hexLen = (ulong)(end - hexStart);
-                        ulong byteCount = 0;
-                        if (!Stdlib::HexDecode(hexStart, hexLen, buf, 512, byteCount))
-                        {
-                            con.Printf("invalid hex data\n");
-                        }
-                        else if (byteCount > 0)
-                        {
-                            if (!dev->WriteSector(sector, buf))
-                                con.Printf("write error\n");
-                            else
-                                con.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    else if (Stdlib::StrCmp(cmd, "net") == 0)
-    {
-        NetDeviceTable::GetInstance().Dump(con);
-    }
-    else if (Stdlib::MemCmp(cmd, "udpsend ", 8) == 0)
-    {
-        const char* args = cmd + 8;
-        const char* end;
-        const char* ipStart = Stdlib::NextToken(args, end);
-        if (!ipStart)
-        {
-            con.Printf("usage: udpsend <ip> <port> <message>\n");
-        }
-        else
-        {
-            char ipBuf[16];
-            Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
-
-            const char* portStart = Stdlib::NextToken(end, end);
-            if (!portStart)
-            {
-                con.Printf("usage: udpsend <ip> <port> <message>\n");
-            }
-            else
-            {
-                char portBuf[8];
-                Stdlib::TokenCopy(portStart, end, portBuf, sizeof(portBuf));
-
-                ulong port = 0;
-                if (!Stdlib::ParseUlong(portBuf, port) || port > 65535)
-                {
-                    con.Printf("invalid port\n");
-                }
-                else
-                {
-                    /* Skip whitespace to get message */
-                    const char* msg = end;
-                    while (*msg == ' ')
-                        msg++;
-
-                    if (*msg == '\0')
-                    {
-                        con.Printf("usage: udpsend <ip> <port> <message>\n");
-                    }
-                    else
-                    {
-                        /* Parse IP: a.b.c.d */
-                        u32 dstIp = 0;
-                        bool ipOk = true;
-                        ulong octet = 0;
-                        ulong shift = 24;
-                        const char* p = ipBuf;
-                        ulong dots = 0;
-
-                        while (*p && ipOk)
-                        {
-                            if (*p == '.')
-                            {
-                                if (octet > 255) { ipOk = false; break; }
-                                dstIp |= (octet << shift);
-                                if (shift == 0) { ipOk = false; break; }
-                                shift -= 8;
-                                octet = 0;
-                                dots++;
-                            }
-                            else if (*p >= '0' && *p <= '9')
-                            {
-                                octet = octet * 10 + (*p - '0');
-                            }
-                            else
-                            {
-                                ipOk = false;
-                            }
-                            p++;
-                        }
-
-                        if (ipOk && dots == 3 && octet <= 255)
-                        {
-                            dstIp |= (octet << shift);
-                        }
-                        else
-                        {
-                            ipOk = false;
-                        }
-
-                        if (!ipOk)
-                        {
-                            con.Printf("invalid IP '%s'\n", ipBuf);
-                        }
-                        else
-                        {
-                            /* Find first net device */
-                            NetDevice* dev = nullptr;
-                            if (NetDeviceTable::GetInstance().GetCount() > 0)
-                                dev = NetDeviceTable::GetInstance().Find("eth0");
-
-                            if (!dev)
-                            {
-                                con.Printf("no network device\n");
-                            }
-                            else
-                            {
-                                ulong msgLen = Stdlib::StrLen(msg);
-                                u32 srcIp = dev->GetIp();
-
-                                /* Resolve destination MAC via ARP */
-                                u8 dstMac[6];
-                                if (!ArpTable::GetInstance().Resolve(dev, dstIp, dstMac))
-                                    Stdlib::MemSet(dstMac, 0xFF, 6);
-
-                                /* Build UDP frame */
-                                ulong udpPayLen = sizeof(Net::UdpHdr) + msgLen;
-                                ulong ipPayLen = sizeof(Net::IpHdr) + udpPayLen;
-                                ulong frameLen = sizeof(Net::EthHdr) + ipPayLen;
-
-                                if (frameLen > 1514)
-                                {
-                                    con.Printf("message too large\n");
-                                }
-                                else
-                                {
-                                    u8 frame[1514];
-                                    Stdlib::MemSet(frame, 0, sizeof(frame));
-                                    ulong off = 0;
-
-                                    Net::EthHdr* eth = (Net::EthHdr*)(frame + off);
-                                    Stdlib::MemCpy(eth->DstMac, dstMac, 6);
-                                    dev->GetMac(eth->SrcMac);
-                                    eth->EtherType = Net::Htons(Net::EtherTypeIp);
-                                    off += sizeof(Net::EthHdr);
-
-                                    Net::IpHdr* ip = (Net::IpHdr*)(frame + off);
-                                    ip->VersionIhl = 0x45;
-                                    ip->TotalLen = Net::Htons((u16)ipPayLen);
-                                    ip->Ttl = 64;
-                                    ip->Protocol = 17;
-                                    ip->SrcAddr = Net::Htonl(srcIp);
-                                    ip->DstAddr = Net::Htonl(dstIp);
-                                    ip->Checksum = Net::Htons(Net::IpChecksum(ip, sizeof(Net::IpHdr)));
-                                    off += sizeof(Net::IpHdr);
-
-                                    Net::UdpHdr* udp = (Net::UdpHdr*)(frame + off);
-                                    udp->SrcPort = Net::Htons(12345);
-                                    udp->DstPort = Net::Htons((u16)port);
-                                    udp->Length = Net::Htons((u16)udpPayLen);
-                                    off += sizeof(Net::UdpHdr);
-
-                                    Stdlib::MemCpy(frame + off, msg, msgLen);
-                                    off += msgLen;
-
-                                    if (dev->SendRaw(frame, off))
-                                    {
-                                        con.Printf("sent %u bytes to %s:%u\n",
-                                            msgLen, ipBuf, port);
-                                    }
-                                    else
-                                    {
-                                        con.Printf("send failed\n");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    else if (Stdlib::MemCmp(cmd, "ping ", 5) == 0)
-    {
-        const char* args = cmd + 5;
-        const char* end;
-        const char* ipStart = Stdlib::NextToken(args, end);
-        if (!ipStart)
-        {
-            con.Printf("usage: ping <ip>\n");
-        }
-        else
-        {
-            char ipBuf[16];
-            Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
-
-            /* Parse IP: a.b.c.d */
-            u32 dstIp = 0;
-            bool ipOk = true;
-            ulong octet = 0;
-            ulong shift = 24;
-            const char* p = ipBuf;
-            ulong dots = 0;
-
-            while (*p && ipOk)
-            {
-                if (*p == '.')
-                {
-                    if (octet > 255) { ipOk = false; break; }
-                    dstIp |= (octet << shift);
-                    if (shift == 0) { ipOk = false; break; }
-                    shift -= 8;
-                    octet = 0;
-                    dots++;
-                }
-                else if (*p >= '0' && *p <= '9')
-                {
-                    octet = octet * 10 + (*p - '0');
-                }
-                else
-                {
-                    ipOk = false;
-                }
-                p++;
-            }
-
-            if (ipOk && dots == 3 && octet <= 255)
-            {
-                dstIp |= (octet << shift);
-            }
-            else
-            {
-                ipOk = false;
-            }
-
-            if (!ipOk)
-            {
-                con.Printf("invalid IP '%s'\n", ipBuf);
-            }
-            else
-            {
-                NetDevice* dev = nullptr;
-                if (NetDeviceTable::GetInstance().GetCount() > 0)
-                    dev = NetDeviceTable::GetInstance().Find("eth0");
-
-                if (!dev)
-                {
-                    con.Printf("no network device\n");
-                }
-                else
-                {
-                    con.Printf("PING %s\n", ipBuf);
-                    ulong received = 0;
-
-                    for (u16 seq = 0; seq < 5; seq++)
-                    {
-                        if (!Icmp::GetInstance().SendEchoRequest(dev, dstIp, 0x1234, seq))
-                        {
-                            con.Printf("send failed seq=%u\n", (ulong)seq);
-                        }
-                        else
-                        {
-                            ulong rttNs = 0;
-                            if (Icmp::GetInstance().WaitReply(0x1234, seq, 3000, rttNs))
-                            {
-                                ulong rttMs = rttNs / Const::NanoSecsInMs;
-                                con.Printf("reply from %s: seq=%u time=%u ms\n",
-                                    ipBuf, (ulong)seq, rttMs);
-                                received++;
-                            }
-                            else
-                            {
-                                con.Printf("request timeout seq=%u\n", (ulong)seq);
-                            }
-                        }
-
-                        if (seq < 4)
-                            Sleep(1000 * Const::NanoSecsInMs);
-                    }
-
-                    con.Printf("%u/5 received\n", received);
-                }
-            }
-        }
-    }
-    else if (Stdlib::MemCmp(cmd, "dhcp", 4) == 0)
-    {
-        if (Parameters::GetInstance().IsDhcpOff())
-        {
-            con.Printf("DHCP disabled (dhcp=off)\n");
-        }
-        else
-        {
-        const char* devName = "eth0";
-        if (cmd[4] == ' ' && cmd[5] != '\0')
-            devName = cmd + 5;
-
-        NetDevice* dev = NetDeviceTable::GetInstance().Find(devName);
-        if (!dev)
-        {
-            con.Printf("device '%s' not found\n", devName);
-        }
-        else
-        {
-            if (GetDhcpClient().IsReady())
-            {
-                DhcpResult r = GetDhcpClient().GetResult();
-                con.Printf("already bound: %u.%u.%u.%u\n",
-                    (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
-                    (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
-            }
-            else
-            {
-                con.Printf("DHCP discovering on %s...\n", devName);
-                if (!GetDhcpClient().Start(dev))
-                {
-                    con.Printf("failed to start DHCP\n");
-                }
-                else
-                {
-                    /* Wait up to 10 seconds for a lease */
-                    for (ulong i = 0; i < 100 && !GetDhcpClient().IsReady(); i++)
-                        Sleep(100 * Const::NanoSecsInMs);
-
-                    if (GetDhcpClient().IsReady())
-                    {
-                        DhcpResult r = GetDhcpClient().GetResult();
-                        con.Printf("ip:     %u.%u.%u.%u\n",
-                            (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
-                            (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
-                        con.Printf("mask:   %u.%u.%u.%u\n",
-                            (r.Mask >> 24) & 0xFF, (r.Mask >> 16) & 0xFF,
-                            (r.Mask >> 8) & 0xFF, r.Mask & 0xFF);
-                        con.Printf("router: %u.%u.%u.%u\n",
-                            (r.Router >> 24) & 0xFF, (r.Router >> 16) & 0xFF,
-                            (r.Router >> 8) & 0xFF, r.Router & 0xFF);
-                        con.Printf("dns:    %u.%u.%u.%u\n",
-                            (r.Dns >> 24) & 0xFF, (r.Dns >> 16) & 0xFF,
-                            (r.Dns >> 8) & 0xFF, r.Dns & 0xFF);
-                        con.Printf("lease:  %u seconds\n", r.LeaseTime);
-                    }
-                    else
-                    {
-                        con.Printf("DHCP timeout\n");
-                    }
-                }
-            }
-        }
-        }
-    }
-    else if (Stdlib::StrCmp(cmd, "version") == 0)
-    {
-        con.Printf("nos %s\n", KERNEL_VERSION);
-    }
-    else if (Stdlib::StrCmp(cmd, "help") == 0)
-    {
-        con.Printf("cls - clear screen\n");
-        con.Printf("cpu - dump cpu state\n");
-        con.Printf("dmesg - dump kernel log\n");
-        con.Printf("poweroff - power off (ACPI S5)\n");
-        con.Printf("reboot - reset system\n");
-        con.Printf("ps - show tasks\n");
-        con.Printf("watchdog - show watchdog stats\n");
-        con.Printf("memusage - show memory usage stats\n");
-        con.Printf("pci - show pci devices\n");
-        con.Printf("disks - list block devices\n");
-        con.Printf("diskread <disk> <sector> - read sector\n");
-        con.Printf("diskwrite <disk> <sector> <hex> - write sector\n");
-        con.Printf("net - list network devices\n");
-        con.Printf("udpsend <ip> <port> <msg> - send UDP packet\n");
-        con.Printf("ping <ip> - send ICMP echo\n");
-        con.Printf("dhcp [dev] - obtain IP via DHCP\n");
-        con.Printf("version - show kernel version\n");
-        con.Printf("help - help\n");
-    }
-    else
-    {
+    if (!found)
         con.Printf("command '%s' not found\n", cmd);
-    }
+
     con.Printf("$");
+}
+
+void Cmd::RequestShutdown()
+{
+    Shutdown = true;
+}
+
+void Cmd::RequestReboot()
+{
+    Reboot = true;
 }
 
 bool Cmd::ShouldShutdown()

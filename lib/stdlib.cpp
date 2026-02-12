@@ -456,3 +456,20 @@ ulong TokenCopy(const char* start, const char* end, char* dst, ulong dstSize)
 }
 
 }
+
+extern "C"
+{
+
+void *memcpy(void *dst, const void *src, size_t size)
+{
+    Stdlib::MemCpy(dst, src, size);
+    return dst;
+}
+
+void *memset(void *ptr, int c, size_t size)
+{
+    Stdlib::MemSet(ptr, static_cast<unsigned char>(c), size);
+    return ptr;
+}
+
+}
