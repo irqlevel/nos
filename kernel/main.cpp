@@ -223,8 +223,8 @@ void BpStartup(void* ctx)
 
     ioApic.Enable();
 
-    //TODO: irq -> gsi remap by ACPI MADT
-    Interrupt::Register(pit, acpi.GetGsiByIrq(0x2), 0x20);
+    // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
+    Interrupt::Register(pit, acpi.GetGsiByIrq(0x0), 0x20);
     Interrupt::Register(kbd, acpi.GetGsiByIrq(0x1), 0x21);
     Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
 
