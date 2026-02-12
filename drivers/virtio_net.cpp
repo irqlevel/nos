@@ -10,6 +10,7 @@
 #include <kernel/idt.h>
 #include <kernel/softirq.h>
 #include <net/arp.h>
+#include <net/icmp.h>
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
 #include <mm/new.h>
@@ -295,25 +296,36 @@ void VirtioNet::DrainRx()
                 }
                 else if (etherType == Net::EtherTypeIp)
                 {
-                    /* Snapshot callback pointer under lock */
-                    RxCallback cb;
-                    void* cbCtx;
-                    {
-                        Stdlib::AutoLock lock(RxCbLock);
-                        cb = RxCb;
-                        cbCtx = RxCbCtx;
-                    }
-
-                    /* Check for UDP dst port 68 (DHCP client) */
-                    if (cb && frameLen >= sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
+                    if (frameLen >= sizeof(EthHdr) + sizeof(IpHdr))
                     {
                         IpHdr* ip = (IpHdr*)(frame + sizeof(EthHdr));
-                        if (ip->Protocol == 17) /* UDP */
+
+                        if (ip->Protocol == 1) /* ICMP */
                         {
-                            UdpHdr* udp = (UdpHdr*)(frame + sizeof(EthHdr) + sizeof(IpHdr));
-                            if (Ntohs(udp->DstPort) == 68)
+                            Icmp::GetInstance().Process(this, frame, frameLen);
+                        }
+                        else if (ip->Protocol == 17) /* UDP */
+                        {
+                            /* Snapshot callback pointer under lock */
+                            RxCallback cb;
+                            void* cbCtx;
                             {
-                                cb(frame, frameLen, cbCtx);
+                                Stdlib::AutoLock lock(RxCbLock);
+                                cb = RxCb;
+                                cbCtx = RxCbCtx;
+                            }
+
+                            if (cb && frameLen >= sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
+                            {
+                                UdpHdr* udp = (UdpHdr*)(frame + sizeof(EthHdr) + sizeof(IpHdr));
+                                if (Ntohs(udp->DstPort) == 68)
+                                {
+                                    cb(frame, frameLen, cbCtx);
+                                }
+                                else
+                                {
+                                    RxDropCount.Inc();
+                                }
                             }
                             else
                             {
