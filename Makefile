@@ -46,6 +46,9 @@ CXX_SRC =   \
     net/arp.cpp \
     net/dhcp.cpp \
     net/icmp.cpp \
+    fs/vfs.cpp \
+    fs/ramfs.cpp \
+    kernel/mutex.cpp \
     kernel/softirq.cpp \
     kernel/exception.cpp    \
     kernel/dmesg.cpp    \

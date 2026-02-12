@@ -26,6 +26,9 @@ public:
     bool ShouldShutdown();
     bool ShouldReboot();
 
+    void RequestShutdown();
+    void RequestReboot();
+
     bool Start();
 
     void Stop();
