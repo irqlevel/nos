@@ -13,9 +13,9 @@ A hobby x86-64 operating system kernel written in C++14 and NASM.
 - **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net** (modern virtio-pci 1.0 MMIO transport)
 - **Block I/O** — virtio-blk driver with virtqueue DMA, block device abstraction, disk discovery and enumeration
 - **Networking** — virtio-net driver, ARP (cache, request, reply), IPv4/UDP transmit, ICMP echo (ping reply + send), DHCP client with lease renewal, network device abstraction
-- **Filesystem** — VFS layer with mount points, ramfs (in-memory filesystem with directories and files)
+- **Filesystem** — VFS layer with mount points, ramfs (in-memory filesystem), nanofs (on-disk filesystem with superblock, inodes, bitmaps, CRC32 checksums)
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `ping`, `dhcp`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `version`, `cls`, `help`, `poweroff`, `reboot`
+- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `ping`, `dhcp`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `version`, `cls`, `help`, `poweroff`, `reboot`
 - **Kernel infrastructure** — spinlocks, atomics, timers, watchdog, stack traces, dmesg ring buffer, panic handler
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc, parsing helpers, block device table
 
@@ -105,7 +105,9 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
 | `ping <ip>` | Send 5 ICMP echo requests with RTT |
 | `dhcp [dev]` | Obtain IP address via DHCP |
+| `format nanofs <disk>` | Format disk with nanofs |
 | `mount ramfs <path>` | Mount a ramfs at path |
+| `mount nanofs <disk> <path>` | Mount nanofs from disk at path |
 | `umount <path>` | Unmount filesystem |
 | `mounts` | List mount points |
 | `ls <path>` | List directory contents |
@@ -125,7 +127,7 @@ boot/       Multiboot2 entry, 32→64-bit transition, AP trampoline
 kernel/     Core: scheduling, tasks, interrupts, shell, timers, locks
 drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI, virtio-blk, virtio-net
 net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP
-fs/         Filesystem: VFS, ramfs
+fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
 mm/         Memory: page tables, page allocator, pool allocator
 lib/        Utilities: list, vector, btree, ring buffer, bitmap, stdlib
 build/      Linker script, GRUB configs

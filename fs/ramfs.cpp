@@ -2,6 +2,7 @@
 
 #include <lib/stdlib.h>
 #include <mm/new.h>
+#include <kernel/trace.h>
 
 namespace Kernel
 {
@@ -38,7 +39,10 @@ VNode* RamFs::AllocNode(const char* name, VNode::Type type)
 {
     VNode* node = new VNode();
     if (node == nullptr)
+    {
+        Trace(0, "RamFs::AllocNode: alloc failed for '%s'", name);
         return nullptr;
+    }
 
     Stdlib::MemSet(node, 0, sizeof(VNode));
     Stdlib::StrnCpy(node->Name, name, sizeof(node->Name));
@@ -115,14 +119,23 @@ VNode* RamFs::Lookup(VNode* dir, const char* name)
 VNode* RamFs::CreateFile(VNode* dir, const char* name)
 {
     if (dir == nullptr || name == nullptr)
+    {
+        Trace(0, "RamFs::CreateFile: null dir or name");
         return nullptr;
+    }
 
     if (dir->NodeType != VNode::TypeDir)
+    {
+        Trace(0, "RamFs::CreateFile: parent is not a dir");
         return nullptr;
+    }
 
     // Check if already exists
     if (Lookup(dir, name) != nullptr)
+    {
+        Trace(0, "RamFs::CreateFile: '%s' already exists", name);
         return nullptr;
+    }
 
     VNode* node = AllocNode(name, VNode::TypeFile);
     if (node == nullptr)
@@ -136,14 +149,23 @@ VNode* RamFs::CreateFile(VNode* dir, const char* name)
 VNode* RamFs::CreateDir(VNode* dir, const char* name)
 {
     if (dir == nullptr || name == nullptr)
+    {
+        Trace(0, "RamFs::CreateDir: null dir or name");
         return nullptr;
+    }
 
     if (dir->NodeType != VNode::TypeDir)
+    {
+        Trace(0, "RamFs::CreateDir: parent is not a dir");
         return nullptr;
+    }
 
     // Check if already exists
     if (Lookup(dir, name) != nullptr)
+    {
+        Trace(0, "RamFs::CreateDir: '%s' already exists", name);
         return nullptr;
+    }
 
     VNode* node = AllocNode(name, VNode::TypeDir);
     if (node == nullptr)
@@ -157,7 +179,10 @@ VNode* RamFs::CreateDir(VNode* dir, const char* name)
 bool RamFs::Write(VNode* file, const void* data, ulong len)
 {
     if (file == nullptr || file->NodeType != VNode::TypeFile)
+    {
+        Trace(0, "RamFs::Write: null file or not a file");
         return false;
+    }
 
     if (len == 0)
     {
@@ -174,7 +199,10 @@ bool RamFs::Write(VNode* file, const void* data, ulong len)
 
         u8* newBuf = (u8*)Mm::Alloc(newCap, 0);
         if (newBuf == nullptr)
+        {
+            Trace(0, "RamFs::Write: alloc %u bytes failed", (ulong)newCap);
             return false;
+        }
 
         if (file->Data != nullptr)
             Mm::Free(file->Data);
@@ -191,10 +219,16 @@ bool RamFs::Write(VNode* file, const void* data, ulong len)
 bool RamFs::Read(VNode* file, void* buf, ulong len, ulong offset)
 {
     if (file == nullptr || file->NodeType != VNode::TypeFile)
+    {
+        Trace(0, "RamFs::Read: null file or not a file");
         return false;
+    }
 
     if (offset >= file->Size)
+    {
+        Trace(0, "RamFs::Read: offset %u beyond size %u", (ulong)offset, (ulong)file->Size);
         return false;
+    }
 
     ulong avail = file->Size - offset;
     ulong toRead = (len < avail) ? len : avail;
@@ -206,11 +240,17 @@ bool RamFs::Read(VNode* file, void* buf, ulong len, ulong offset)
 bool RamFs::Remove(VNode* node)
 {
     if (node == nullptr)
+    {
+        Trace(0, "RamFs::Remove: null node");
         return false;
+    }
 
     // Cannot remove root
     if (node->Parent == nullptr)
+    {
+        Trace(0, "RamFs::Remove: cannot remove root");
         return false;
+    }
 
     // If directory, recursively free all children
     if (node->NodeType == VNode::TypeDir)

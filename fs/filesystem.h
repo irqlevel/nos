@@ -10,6 +10,7 @@ class FileSystem
 public:
     virtual ~FileSystem() {}
     virtual const char* GetName() = 0;
+    virtual void GetInfo(char* buf, ulong bufSize) { if (buf && bufSize) buf[0] = '\0'; }
     virtual VNode* GetRoot() = 0;
     virtual VNode* Lookup(VNode* dir, const char* name) = 0;
     virtual VNode* CreateFile(VNode* dir, const char* name) = 0;

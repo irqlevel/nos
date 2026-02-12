@@ -1,6 +1,8 @@
 #include "vfs.h"
 
 #include <lib/stdlib.h>
+#include <mm/new.h>
+#include <kernel/trace.h>
 
 namespace Kernel
 {
@@ -18,10 +20,16 @@ Vfs::~Vfs()
 bool Vfs::Mount(const char* path, FileSystem* fs)
 {
     if (path == nullptr || fs == nullptr)
+    {
+        Trace(0, "Vfs::Mount: null path or fs");
         return false;
+    }
 
     if (path[0] != '/')
+    {
+        Trace(0, "Vfs::Mount: path must start with /");
         return false;
+    }
 
     Stdlib::AutoLock lock(Lock);
 
@@ -29,11 +37,17 @@ bool Vfs::Mount(const char* path, FileSystem* fs)
     for (ulong i = 0; i < MountCount; i++)
     {
         if (Stdlib::StrCmp(Mounts[i].Path, path) == 0)
+        {
+            Trace(0, "Vfs::Mount: already mounted on %s", path);
             return false;
+        }
     }
 
     if (MountCount >= MaxMounts)
+    {
+        Trace(0, "Vfs::Mount: max mounts reached");
         return false;
+    }
 
     Stdlib::StrnCpy(Mounts[MountCount].Path, path, MaxPath);
     Mounts[MountCount].Fs = fs;
@@ -44,7 +58,10 @@ bool Vfs::Mount(const char* path, FileSystem* fs)
 FileSystem* Vfs::Unmount(const char* path)
 {
     if (path == nullptr)
+    {
+        Trace(0, "Vfs::Unmount: null path");
         return nullptr;
+    }
 
     Stdlib::AutoLock lock(Lock);
 
@@ -64,6 +81,7 @@ FileSystem* Vfs::Unmount(const char* path)
             return fs;
         }
     }
+    Trace(0, "Vfs::Unmount: %s not found", path);
     return nullptr;
 }
 
@@ -98,7 +116,10 @@ bool Vfs::FindMount(const char* path, ulong& mountIdx, const char*& remainder)
     }
 
     if (!found)
+    {
+        Trace(0, "Vfs::FindMount: no mount for %s", path);
         return false;
+    }
 
     mountIdx = bestIdx;
     remainder = path + bestLen;
@@ -121,7 +142,10 @@ bool Vfs::ResolvePath(const char* path, FileSystem*& fs, VNode*& node,
     const char* remainder;
 
     if (!FindMount(path, mountIdx, remainder))
+    {
+        Trace(0, "Vfs::ResolvePath: no mount for %s", path);
         return false;
+    }
 
     fs = Mounts[mountIdx].Fs;
     VNode* cur = fs->GetRoot();
@@ -156,7 +180,10 @@ bool Vfs::ResolvePath(const char* path, FileSystem*& fs, VNode*& node,
         {
             VNode* child = fs->Lookup(cur, component);
             if (child == nullptr || child->NodeType != VNode::TypeDir)
+            {
+                Trace(0, "Vfs::ResolvePath: component '%s' not found or not dir", component);
                 return false;
+            }
             cur = child;
         }
         else
@@ -249,13 +276,31 @@ bool Vfs::ReadFile(const char* path, Stdlib::Printer& printer)
     if (node->Size == 0)
         return true;
 
-    // Print content character by character to handle non-null-terminated data
-    for (ulong i = 0; i < node->Size; i++)
+    // Read content through fs->Read() so on-disk filesystems work
+    ulong size = node->Size;
+    u8* buf = (u8*)Mm::Alloc(size + 1, 0);
+    if (buf == nullptr)
     {
-        char c = (char)node->Data[i];
-        char buf[2] = { c, '\0' };
-        printer.PrintString(buf);
+        Trace(0, "Vfs::ReadFile: alloc %u bytes failed", (ulong)size);
+        printer.Printf("read failed\n");
+        return false;
     }
+
+    if (!fs->Read(node, buf, size, 0))
+    {
+        Mm::Free(buf);
+        printer.Printf("read failed\n");
+        return false;
+    }
+
+    // Print content character by character to handle non-null-terminated data
+    for (ulong i = 0; i < size; i++)
+    {
+        char c = (char)buf[i];
+        char tmp[2] = { c, '\0' };
+        printer.PrintString(tmp);
+    }
+    Mm::Free(buf);
     printer.Printf("\n");
     return true;
 }
@@ -270,20 +315,32 @@ bool Vfs::WriteFile(const char* path, const void* data, ulong len)
     char lastName[64];
 
     if (!ResolvePath(path, fs, node, parent, lastName, sizeof(lastName)))
+    {
+        Trace(0, "Vfs::WriteFile: resolve failed for %s", path);
         return false;
+    }
 
     if (node == nullptr)
     {
         // Create file
         if (parent == nullptr || lastName[0] == '\0')
+        {
+            Trace(0, "Vfs::WriteFile: no parent dir for %s", path);
             return false;
+        }
         node = fs->CreateFile(parent, lastName);
         if (node == nullptr)
+        {
+            Trace(0, "Vfs::WriteFile: create failed for %s", path);
             return false;
+        }
     }
 
     if (node->NodeType != VNode::TypeFile)
+    {
+        Trace(0, "Vfs::WriteFile: %s is not a file", path);
         return false;
+    }
 
     return fs->Write(node, data, len);
 }
@@ -298,13 +355,22 @@ bool Vfs::CreateDir(const char* path)
     char lastName[64];
 
     if (!ResolvePath(path, fs, node, parent, lastName, sizeof(lastName)))
+    {
+        Trace(0, "Vfs::CreateDir: resolve failed for %s", path);
         return false;
+    }
 
     if (node != nullptr)
+    {
+        Trace(0, "Vfs::CreateDir: %s already exists", path);
         return false; // already exists
+    }
 
     if (parent == nullptr || lastName[0] == '\0')
+    {
+        Trace(0, "Vfs::CreateDir: no parent dir for %s", path);
         return false;
+    }
 
     return (fs->CreateDir(parent, lastName) != nullptr);
 }
@@ -319,13 +385,22 @@ bool Vfs::CreateFile(const char* path)
     char lastName[64];
 
     if (!ResolvePath(path, fs, node, parent, lastName, sizeof(lastName)))
+    {
+        Trace(0, "Vfs::CreateFile: resolve failed for %s", path);
         return false;
+    }
 
     if (node != nullptr)
+    {
+        Trace(0, "Vfs::CreateFile: %s already exists", path);
         return false; // already exists
+    }
 
     if (parent == nullptr || lastName[0] == '\0')
+    {
+        Trace(0, "Vfs::CreateFile: no parent dir for %s", path);
         return false;
+    }
 
     return (fs->CreateFile(parent, lastName) != nullptr);
 }
@@ -339,10 +414,16 @@ bool Vfs::Remove(const char* path)
     VNode* parent;
 
     if (!ResolvePath(path, fs, node, parent, nullptr, 0))
+    {
+        Trace(0, "Vfs::Remove: resolve failed for %s", path);
         return false;
+    }
 
     if (node == nullptr)
+    {
+        Trace(0, "Vfs::Remove: %s not found", path);
         return false;
+    }
 
     return fs->Remove(node);
 }
@@ -353,7 +434,12 @@ void Vfs::DumpMounts(Stdlib::Printer& printer)
 
     for (ulong i = 0; i < MountCount; i++)
     {
-        printer.Printf("%s on %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path);
+        char info[64];
+        Mounts[i].Fs->GetInfo(info, sizeof(info));
+        if (info[0] != '\0')
+            printer.Printf("%s on %s  %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path, info);
+        else
+            printer.Printf("%s on %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path);
     }
 }
 
