@@ -212,9 +212,16 @@ bool RamFs::Remove(VNode* node)
     if (node->Parent == nullptr)
         return false;
 
-    // If directory, must be empty
-    if (node->NodeType == VNode::TypeDir && !node->Children.IsEmpty())
-        return false;
+    // If directory, recursively free all children
+    if (node->NodeType == VNode::TypeDir)
+    {
+        while (!node->Children.IsEmpty())
+        {
+            Stdlib::ListEntry* entry = node->Children.RemoveHead();
+            VNode* child = CONTAINING_RECORD(entry, VNode, SiblingLink);
+            FreeTree(child);
+        }
+    }
 
     FreeNode(node);
     return true;

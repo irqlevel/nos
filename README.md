@@ -15,7 +15,7 @@ A hobby x86-64 operating system kernel written in C++14 and NASM.
 - **Networking** — virtio-net driver, ARP (cache, request, reply), IPv4/UDP transmit, ICMP echo (ping reply + send), DHCP client with lease renewal, network device abstraction
 - **Filesystem** — VFS layer with mount points, ramfs (in-memory filesystem with directories and files)
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `ping`, `dhcp`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `version`, `cls`, `help`, `poweroff`, `reboot`
+- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `ping`, `dhcp`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `version`, `cls`, `help`, `poweroff`, `reboot`
 - **Kernel infrastructure** — spinlocks, atomics, timers, watchdog, stack traces, dmesg ring buffer, panic handler
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc, parsing helpers, block device table
 
@@ -112,6 +112,8 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 | `cat <path>` | Show file contents |
 | `write <path> <text>` | Write text to file (creates if needed) |
 | `mkdir <path>` | Create directory |
+| `touch <path>` | Create empty file |
+| `del <path>` | Remove file or directory |
 | `version` | Show kernel version |
 | `poweroff` / `shutdown` | Power off (ACPI S5) |
 | `reboot` | Reset system (keyboard controller) |
