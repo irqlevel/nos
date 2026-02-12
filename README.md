@@ -14,7 +14,7 @@ A hobby x86-64 operating system kernel written in C++14 and NASM.
 - **Block I/O** — virtio-blk driver with virtqueue DMA, block device abstraction, disk discovery and enumeration
 - **Networking** — virtio-net driver, ARP (cache, request, reply), IPv4/UDP transmit, ICMP echo (ping reply + send), DHCP client with lease renewal, network device abstraction
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `ping`, `dhcp`, `cls`, `help`, `poweroff`, `reboot`
+- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `ping`, `dhcp`, `version`, `cls`, `help`, `poweroff`, `reboot`
 - **Kernel infrastructure** — spinlocks, atomics, timers, watchdog, stack traces, dmesg ring buffer, panic handler
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc, parsing helpers, block device table
 
@@ -104,6 +104,7 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
 | `ping <ip>` | Send 5 ICMP echo requests with RTT |
 | `dhcp [dev]` | Obtain IP address via DHCP |
+| `version` | Show kernel version |
 | `poweroff` / `shutdown` | Power off (ACPI S5) |
 | `reboot` | Reset system (keyboard controller) |
 
