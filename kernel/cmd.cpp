@@ -671,6 +671,48 @@ static void CmdMkdir(const char* args, Stdlib::Printer& con)
     }
 }
 
+static void CmdTouch(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: touch <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+    if (Vfs::GetInstance().CreateFile(path))
+    {
+        con.Printf("created %s\n", path);
+    }
+    else
+    {
+        con.Printf("touch failed\n");
+    }
+}
+
+static void CmdDel(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: del <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+    if (Vfs::GetInstance().Remove(path))
+    {
+        con.Printf("removed %s\n", path);
+    }
+    else
+    {
+        con.Printf("del failed\n");
+    }
+}
+
 static void CmdVersion(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -703,6 +745,8 @@ static const CmdEntry Commands[] = {
     { "cat",       CmdCat,       "cat <path> - show file content" },
     { "write",     CmdWrite,     "write <path> <text> - write to file" },
     { "mkdir",     CmdMkdir,     "mkdir <path> - create directory" },
+    { "touch",     CmdTouch,     "touch <path> - create empty file" },
+    { "del",       CmdDel,       "del <path> - remove file or directory" },
     { "version",   CmdVersion,   "version - show kernel version" },
     { "poweroff",  CmdPoweroff,  "poweroff - power off (ACPI S5)" },
     { "shutdown",  CmdPoweroff,  nullptr },
