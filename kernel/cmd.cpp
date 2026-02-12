@@ -563,6 +563,10 @@ void Cmd::ProcessCmd(const char *cmd)
         }
         }
     }
+    else if (Stdlib::StrCmp(cmd, "version") == 0)
+    {
+        con.Printf("nos %s\n", KERNEL_VERSION);
+    }
     else if (Stdlib::StrCmp(cmd, "help") == 0)
     {
         con.Printf("cls - clear screen\n");
@@ -581,6 +585,7 @@ void Cmd::ProcessCmd(const char *cmd)
         con.Printf("udpsend <ip> <port> <msg> - send UDP packet\n");
         con.Printf("ping <ip> - send ICMP echo\n");
         con.Printf("dhcp [dev] - obtain IP via DHCP\n");
+        con.Printf("version - show kernel version\n");
         con.Printf("help - help\n");
     }
     else
