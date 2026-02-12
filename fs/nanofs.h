@@ -66,9 +66,9 @@ public:
     virtual ~NanoFs();
 
     bool Init();
-    static bool Format(BlockDevice* dev);
 
     virtual const char* GetName() override;
+    virtual bool Format(BlockDevice* dev) override;
     virtual void GetInfo(char* buf, ulong bufSize) override;
     virtual VNode* GetRoot() override;
     virtual VNode* Lookup(VNode* dir, const char* name) override;
