@@ -31,6 +31,7 @@ public:
     /* InterruptHandler interface */
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;
     virtual InterruptHandlerFn GetHandlerFn() override;
+    virtual void OnInterrupt(Context* ctx) override;
 
     void Interrupt(Context* ctx);
 

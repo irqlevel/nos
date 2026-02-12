@@ -84,6 +84,7 @@ void PitInterruptStub();
 void IPInterruptStub();
 void VirtioBlkInterruptStub();
 void VirtioNetInterruptStub();
+void SharedInterruptStub();
 
 void DummyInterruptStub();
 

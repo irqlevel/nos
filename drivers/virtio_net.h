@@ -40,6 +40,7 @@ public:
     /* InterruptHandler interface */
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;
     virtual InterruptHandlerFn GetHandlerFn() override;
+    virtual void OnInterrupt(Context* ctx) override;
 
     void Interrupt(Context* ctx);
 
@@ -72,6 +73,19 @@ private:
 
     static_assert(sizeof(VirtioNetHdr) == 12, "Invalid size");
 
+    /* Legacy virtio net header (without NumBuffers) */
+    struct VirtioNetHdrLegacy
+    {
+        u8 Flags;
+        u8 GsoType;
+        u16 HdrLen;
+        u16 GsoSize;
+        u16 CsumStart;
+        u16 CsumOffset;
+    } __attribute__((packed));
+
+    static_assert(sizeof(VirtioNetHdrLegacy) == 10, "Invalid size");
+
     /* RX buffer management */
     static const ulong RxBufCount = 16;
     static const ulong RxBufSize = 2048;
@@ -88,6 +102,7 @@ private:
     SpinLock TxLock;
     int IntVector;
     bool Initialized;
+    ulong NetHdrSize; /* 10 for legacy, 12 for modern */
     char DevName[8];
 
     Atomic TxPktCount;
