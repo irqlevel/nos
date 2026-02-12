@@ -14,6 +14,7 @@
 #include <net/icmp.h>
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
+#include <fs/nanofs.h>
 #include "console.h"
 
 #include <drivers/vga.h>
@@ -528,26 +529,23 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
     if (fsType == nullptr)
     {
         con.Printf("usage: mount ramfs <path>\n");
+        con.Printf("       mount nanofs <disk> <path>\n");
         return;
     }
     char fsName[16];
     Stdlib::TokenCopy(fsType, end, fsName, sizeof(fsName));
 
-    const char* pathStart = Stdlib::NextToken(end, end);
-    if (pathStart == nullptr)
+    if (Stdlib::StrCmp(fsName, "ramfs") == 0)
     {
-        con.Printf("usage: mount ramfs <path>\n");
-        return;
-    }
-    char path[Vfs::MaxPath];
-    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+        const char* pathStart = Stdlib::NextToken(end, end);
+        if (pathStart == nullptr)
+        {
+            con.Printf("usage: mount ramfs <path>\n");
+            return;
+        }
+        char path[Vfs::MaxPath];
+        Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
-    if (Stdlib::StrCmp(fsName, "ramfs") != 0)
-    {
-        con.Printf("unknown filesystem '%s'\n", fsName);
-    }
-    else
-    {
         RamFs* fs = new RamFs();
         if (fs == nullptr)
         {
@@ -562,6 +560,61 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
         {
             con.Printf("mounted ramfs on %s\n", path);
         }
+    }
+    else if (Stdlib::StrCmp(fsName, "nanofs") == 0)
+    {
+        const char* diskStart = Stdlib::NextToken(end, end);
+        if (diskStart == nullptr)
+        {
+            con.Printf("usage: mount nanofs <disk> <path>\n");
+            return;
+        }
+        char diskName[16];
+        Stdlib::TokenCopy(diskStart, end, diskName, sizeof(diskName));
+
+        const char* pathStart = Stdlib::NextToken(end, end);
+        if (pathStart == nullptr)
+        {
+            con.Printf("usage: mount nanofs <disk> <path>\n");
+            return;
+        }
+        char path[Vfs::MaxPath];
+        Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+        BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
+        if (dev == nullptr)
+        {
+            con.Printf("disk '%s' not found\n", diskName);
+            return;
+        }
+
+        NanoFs* fs = new NanoFs(dev);
+        if (fs == nullptr)
+        {
+            con.Printf("failed to allocate nanofs\n");
+            return;
+        }
+
+        if (!fs->Init())
+        {
+            delete fs;
+            con.Printf("nanofs init failed (not formatted?)\n");
+            return;
+        }
+
+        if (!Vfs::GetInstance().Mount(path, fs))
+        {
+            delete fs;
+            con.Printf("mount failed\n");
+        }
+        else
+        {
+            con.Printf("mounted nanofs on %s\n", path);
+        }
+    }
+    else
+    {
+        con.Printf("unknown filesystem '%s'\n", fsName);
     }
 }
 
@@ -713,6 +766,50 @@ static void CmdDel(const char* args, Stdlib::Printer& con)
     }
 }
 
+static void CmdFormat(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* fsType = Stdlib::NextToken(args, end);
+    if (fsType == nullptr)
+    {
+        con.Printf("usage: format nanofs <disk>\n");
+        return;
+    }
+    char fsName[16];
+    Stdlib::TokenCopy(fsType, end, fsName, sizeof(fsName));
+
+    if (Stdlib::StrCmp(fsName, "nanofs") != 0)
+    {
+        con.Printf("unknown filesystem '%s'\n", fsName);
+        return;
+    }
+
+    const char* diskStart = Stdlib::NextToken(end, end);
+    if (diskStart == nullptr)
+    {
+        con.Printf("usage: format nanofs <disk>\n");
+        return;
+    }
+    char diskName[16];
+    Stdlib::TokenCopy(diskStart, end, diskName, sizeof(diskName));
+
+    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
+    if (dev == nullptr)
+    {
+        con.Printf("disk '%s' not found\n", diskName);
+        return;
+    }
+
+    if (NanoFs::Format(dev))
+    {
+        con.Printf("formatted %s as nanofs\n", diskName);
+    }
+    else
+    {
+        con.Printf("format failed\n");
+    }
+}
+
 static void CmdVersion(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -738,7 +835,8 @@ static const CmdEntry Commands[] = {
     { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
     { "ping",      CmdPing,      "ping <ip> - send ICMP echo" },
     { "dhcp",      CmdDhcp,      "dhcp [dev] - obtain IP via DHCP" },
-    { "mount",     CmdMount,     "mount ramfs <path> - mount ramfs" },
+    { "format",    CmdFormat,    "format nanofs <disk> - format disk" },
+    { "mount",     CmdMount,     "mount <ramfs|nanofs> ... - mount filesystem" },
     { "umount",    CmdUmount,    "umount <path> - unmount filesystem" },
     { "mounts",    CmdMounts,    "mounts - list mount points" },
     { "ls",        CmdLs,        "ls <path> - list directory" },

@@ -48,6 +48,8 @@ CXX_SRC =   \
     net/icmp.cpp \
     fs/vfs.cpp \
     fs/ramfs.cpp \
+    fs/block_io.cpp \
+    fs/nanofs.cpp \
     kernel/mutex.cpp \
     kernel/softirq.cpp \
     kernel/exception.cpp    \
@@ -63,6 +65,7 @@ CXX_SRC =   \
     kernel/stack_trace.cpp \
     lib/stdlib.cpp  \
     lib/bitmap.cpp \
+    lib/checksum.cpp \
     lib/list_entry.cpp  \
     lib/error.cpp   \
     mm/memory_map.cpp   \
