@@ -15,87 +15,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential clang nasm \
-            grub2-common grub-pc-bin xorriso \
-            parted e2fsprogs qemu-utils
-
-      - name: Extract version from tag
-        id: version
-        run: echo "VERSION=${GITHUB_REF_NAME}" >> "$GITHUB_ENV"
-
-      - name: Build ISO
-        run: make clean && make nocheck VERSION=${{ env.VERSION }}
-
-      - name: Build disk image
-        run: |
-          set -e
-
-          IMG=nos.raw
-          QCOW=nos.qcow2
-          SIZE=1024
-          P1_OFFSET=1048576
-          P1_SIZELIMIT=33554432
-
-          echo "Creating ${SIZE}MB raw disk image..."
-          dd if=/dev/zero of=$IMG bs=1M count=$SIZE status=none
-
-          echo "Creating MBR partition table..."
-          parted -s $IMG mklabel msdos
-          parted -s $IMG mkpart primary ext2 1MiB 33MiB
-          parted -s $IMG mkpart primary 33MiB 100%
-          parted -s $IMG set 1 boot on
-
-          echo "Setting up loop devices..."
-          LOOP_DISK=$(sudo losetup --show -f $IMG)
-          LOOP_P1=$(sudo losetup --show -f --offset $P1_OFFSET --sizelimit $P1_SIZELIMIT $IMG)
-
-          echo "Formatting partition 1 as ext2..."
-          sudo mkfs.ext2 -q $LOOP_P1
-
-          MNTDIR=$(mktemp -d)
-          sudo mount $LOOP_P1 $MNTDIR
-
-          sudo mkdir -p $MNTDIR/boot/grub
-          sudo cp bin/kernel64.elf $MNTDIR/boot/kernel64.elf
-          sudo cp build/grub-disk.cfg $MNTDIR/boot/grub/grub.cfg
-          sudo cp -r /usr/lib/grub/i386-pc $MNTDIR/boot/grub/
-
-          cat > /tmp/grub-early.cfg << 'EOFCFG'
-          serial --unit=0 --speed=115200
-          terminal_input serial console
-          terminal_output serial console
-          set root=(hd0,msdos1)
-          set prefix=(hd0,msdos1)/boot/grub
-          EOFCFG
-
-          echo "Building GRUB core image..."
-          grub-mkimage -O i386-pc -o /tmp/core.img \
-              -c /tmp/grub-early.cfg \
-              -p "(hd0,msdos1)/boot/grub" \
-              biosdisk part_msdos ext2 normal multiboot2 serial terminal
-
-          echo "Installing GRUB boot sector and core image..."
-          sudo dd if=/usr/lib/grub/i386-pc/boot.img of=$LOOP_DISK bs=440 count=1 conv=notrunc
-          sudo dd if=/tmp/core.img of=$LOOP_DISK bs=512 seek=1 conv=notrunc
-
-          echo "Unmounting..."
-          sudo umount $MNTDIR
-          rmdir $MNTDIR
-          sudo losetup -d $LOOP_P1
-          sudo losetup -d $LOOP_DISK
-
-          echo "Converting to qcow2..."
-          qemu-img convert -f raw -O qcow2 $IMG $QCOW
-          rm -f $IMG
+      - name: Build ISO and disk image
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: ./scripts/build-disk.sh
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          name: nos ${{ env.VERSION }}
+          name: nos ${{ github.ref_name }}
           generate_release_notes: true
           files: |
             nos.iso
