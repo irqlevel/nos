@@ -800,7 +800,8 @@ static void CmdFormat(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    if (NanoFs::Format(dev))
+    NanoFs fs(dev);
+    if (fs.Format(dev))
     {
         con.Printf("formatted %s as nanofs\n", diskName);
     }
