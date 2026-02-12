@@ -72,6 +72,7 @@ void DhcpClient::Stop()
     {
         TaskPtr->SetStopping();
         TaskPtr->Wait();
+        TaskPtr->Put();
         TaskPtr = nullptr;
     }
     if (Dev)
