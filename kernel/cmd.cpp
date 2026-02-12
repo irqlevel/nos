@@ -11,6 +11,7 @@
 #include <net/net.h>
 #include <net/arp.h>
 #include <net/dhcp.h>
+#include <net/icmp.h>
 #include "console.h"
 
 #include <drivers/vga.h>
@@ -394,6 +395,109 @@ void Cmd::ProcessCmd(const char *cmd)
             }
         }
     }
+    else if (Stdlib::MemCmp(cmd, "ping ", 5) == 0)
+    {
+        const char* args = cmd + 5;
+        const char* end;
+        const char* ipStart = Stdlib::NextToken(args, end);
+        if (!ipStart)
+        {
+            con.Printf("usage: ping <ip>\n");
+        }
+        else
+        {
+            char ipBuf[16];
+            Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
+
+            /* Parse IP: a.b.c.d */
+            u32 dstIp = 0;
+            bool ipOk = true;
+            ulong octet = 0;
+            ulong shift = 24;
+            const char* p = ipBuf;
+            ulong dots = 0;
+
+            while (*p && ipOk)
+            {
+                if (*p == '.')
+                {
+                    if (octet > 255) { ipOk = false; break; }
+                    dstIp |= (octet << shift);
+                    if (shift == 0) { ipOk = false; break; }
+                    shift -= 8;
+                    octet = 0;
+                    dots++;
+                }
+                else if (*p >= '0' && *p <= '9')
+                {
+                    octet = octet * 10 + (*p - '0');
+                }
+                else
+                {
+                    ipOk = false;
+                }
+                p++;
+            }
+
+            if (ipOk && dots == 3 && octet <= 255)
+            {
+                dstIp |= (octet << shift);
+            }
+            else
+            {
+                ipOk = false;
+            }
+
+            if (!ipOk)
+            {
+                con.Printf("invalid IP '%s'\n", ipBuf);
+            }
+            else
+            {
+                NetDevice* dev = nullptr;
+                if (NetDeviceTable::GetInstance().GetCount() > 0)
+                    dev = NetDeviceTable::GetInstance().Find("eth0");
+
+                if (!dev)
+                {
+                    con.Printf("no network device\n");
+                }
+                else
+                {
+                    con.Printf("PING %s\n", ipBuf);
+                    ulong received = 0;
+
+                    for (u16 seq = 0; seq < 5; seq++)
+                    {
+                        if (!Icmp::GetInstance().SendEchoRequest(dev, dstIp, 0x1234, seq))
+                        {
+                            con.Printf("send failed seq=%u\n", (ulong)seq);
+                        }
+                        else
+                        {
+                            ulong rttNs = 0;
+                            if (Icmp::GetInstance().WaitReply(0x1234, seq, 3000, rttNs))
+                            {
+                                ulong rttMs = rttNs / Const::NanoSecsInMs;
+                                con.Printf("reply from %s: seq=%u time=%u ms\n",
+                                    ipBuf, (ulong)seq, rttMs);
+                                received++;
+                            }
+                            else
+                            {
+                                con.Printf("request timeout seq=%u\n", (ulong)seq);
+                            }
+                        }
+
+                        if (seq < 4)
+                            Sleep(1000 * Const::NanoSecsInMs);
+                    }
+
+                    con.Printf("%u/5 received\n", received);
+                }
+            }
+        }
+    }
     else if (Stdlib::MemCmp(cmd, "dhcp", 4) == 0)
     {
         if (Parameters::GetInstance().IsDhcpOff())
@@ -475,6 +579,7 @@ void Cmd::ProcessCmd(const char *cmd)
         con.Printf("diskwrite <disk> <sector> <hex> - write sector\n");
         con.Printf("net - list network devices\n");
         con.Printf("udpsend <ip> <port> <msg> - send UDP packet\n");
+        con.Printf("ping <ip> - send ICMP echo\n");
         con.Printf("dhcp [dev] - obtain IP via DHCP\n");
         con.Printf("help - help\n");
     }

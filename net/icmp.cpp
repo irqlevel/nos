@@ -1,0 +1,193 @@
+#include "icmp.h"
+#include "net.h"
+#include "arp.h"
+
+#include <kernel/trace.h>
+#include <kernel/time.h>
+#include <kernel/sched.h>
+#include <lib/stdlib.h>
+#include <include/const.h>
+
+namespace Kernel
+{
+
+using Net::EthHdr;
+using Net::IpHdr;
+using Net::IcmpHdr;
+using Net::Htons;
+using Net::Htonl;
+using Net::Ntohs;
+using Net::Ntohl;
+using Net::IpChecksum;
+using Net::EtherTypeIp;
+
+Icmp::Icmp()
+{
+    Reply.Valid = false;
+    Reply.Id = 0;
+    Reply.Seq = 0;
+}
+
+Icmp::~Icmp()
+{
+}
+
+void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
+{
+    if (len < sizeof(EthHdr) + sizeof(IpHdr) + sizeof(IcmpHdr))
+        return;
+
+    const EthHdr* eth = (const EthHdr*)frame;
+    const IpHdr* ip = (const IpHdr*)(frame + sizeof(EthHdr));
+    const IcmpHdr* icmp = (const IcmpHdr*)(frame + sizeof(EthHdr) + sizeof(IpHdr));
+
+    if (icmp->Type == TypeEchoRequest && icmp->Code == 0)
+    {
+        /* Build echo reply */
+        ulong ipTotalLen = Ntohs(ip->TotalLen);
+        if (ipTotalLen < sizeof(IpHdr) + sizeof(IcmpHdr))
+            return;
+        if (sizeof(EthHdr) + ipTotalLen > len)
+            return;
+
+        ulong icmpLen = ipTotalLen - sizeof(IpHdr);
+        ulong replyFrameLen = sizeof(EthHdr) + sizeof(IpHdr) + icmpLen;
+
+        if (replyFrameLen > 1514)
+            return;
+
+        u8 reply[1514];
+        Stdlib::MemSet(reply, 0, sizeof(reply));
+
+        /* Ethernet header -- swap src/dst */
+        EthHdr* rEth = (EthHdr*)reply;
+        Stdlib::MemCpy(rEth->DstMac, eth->SrcMac, 6);
+        dev->GetMac(rEth->SrcMac);
+        rEth->EtherType = Htons(EtherTypeIp);
+
+        /* IP header -- swap src/dst, recalculate checksum */
+        IpHdr* rIp = (IpHdr*)(reply + sizeof(EthHdr));
+        rIp->VersionIhl = 0x45;
+        rIp->Tos = 0;
+        rIp->TotalLen = Htons((u16)(sizeof(IpHdr) + icmpLen));
+        rIp->Id = 0;
+        rIp->FragOff = 0;
+        rIp->Ttl = 64;
+        rIp->Protocol = 1; /* ICMP */
+        rIp->Checksum = 0;
+        rIp->SrcAddr = ip->DstAddr;
+        rIp->DstAddr = ip->SrcAddr;
+        rIp->Checksum = Htons(IpChecksum(rIp, sizeof(IpHdr)));
+
+        /* ICMP -- copy entire ICMP payload, change type to reply */
+        u8* rIcmpRaw = reply + sizeof(EthHdr) + sizeof(IpHdr);
+        const u8* srcIcmpRaw = frame + sizeof(EthHdr) + sizeof(IpHdr);
+        Stdlib::MemCpy(rIcmpRaw, srcIcmpRaw, icmpLen);
+
+        IcmpHdr* rIcmp = (IcmpHdr*)rIcmpRaw;
+        rIcmp->Type = TypeEchoReply;
+        rIcmp->Code = 0;
+        rIcmp->Checksum = 0;
+        rIcmp->Checksum = Htons(IpChecksum(rIcmpRaw, icmpLen));
+
+        dev->SendRaw(reply, replyFrameLen);
+    }
+    else if (icmp->Type == TypeEchoReply && icmp->Code == 0)
+    {
+        /* Store reply for WaitReply() */
+        Stdlib::AutoLock lock(Lock);
+        Reply.Valid = true;
+        Reply.Id = Ntohs(icmp->Id);
+        Reply.Seq = Ntohs(icmp->Seq);
+        Reply.Timestamp = GetBootTime();
+    }
+}
+
+bool Icmp::SendEchoRequest(NetDevice* dev, u32 dstIp, u16 id, u16 seq)
+{
+    /* Resolve destination MAC via ARP */
+    u8 dstMac[6];
+    if (!ArpTable::GetInstance().Resolve(dev, dstIp, dstMac))
+    {
+        Stdlib::MemSet(dstMac, 0xFF, 6);
+    }
+
+    static const ulong PayloadSize = 32;
+    ulong icmpLen = sizeof(IcmpHdr) + PayloadSize;
+    ulong ipLen = sizeof(IpHdr) + icmpLen;
+    ulong frameLen = sizeof(EthHdr) + ipLen;
+
+    u8 frame[1514];
+    Stdlib::MemSet(frame, 0, sizeof(frame));
+
+    ulong off = 0;
+
+    /* Ethernet header */
+    EthHdr* eth = (EthHdr*)(frame + off);
+    Stdlib::MemCpy(eth->DstMac, dstMac, 6);
+    dev->GetMac(eth->SrcMac);
+    eth->EtherType = Htons(EtherTypeIp);
+    off += sizeof(EthHdr);
+
+    /* IP header */
+    IpHdr* ip = (IpHdr*)(frame + off);
+    ip->VersionIhl = 0x45;
+    ip->TotalLen = Htons((u16)ipLen);
+    ip->Ttl = 64;
+    ip->Protocol = 1; /* ICMP */
+    ip->SrcAddr = Htonl(dev->GetIp());
+    ip->DstAddr = Htonl(dstIp);
+    ip->Checksum = Htons(IpChecksum(ip, sizeof(IpHdr)));
+    off += sizeof(IpHdr);
+
+    /* ICMP echo request */
+    IcmpHdr* icmp = (IcmpHdr*)(frame + off);
+    icmp->Type = TypeEchoRequest;
+    icmp->Code = 0;
+    icmp->Id = Htons(id);
+    icmp->Seq = Htons(seq);
+    off += sizeof(IcmpHdr);
+
+    /* Payload -- fill with pattern */
+    for (ulong i = 0; i < PayloadSize; i++)
+        frame[off + i] = (u8)(i & 0xFF);
+    off += PayloadSize;
+
+    /* Compute ICMP checksum over header + payload */
+    icmp->Checksum = 0;
+    icmp->Checksum = Htons(IpChecksum(icmp, icmpLen));
+
+    /* Clear reply slot and record send time */
+    {
+        Stdlib::AutoLock lock(Lock);
+        Reply.Valid = false;
+        SendTime = GetBootTime();
+    }
+
+    return dev->SendRaw(frame, frameLen);
+}
+
+bool Icmp::WaitReply(u16 id, u16 seq, ulong timeoutMs, ulong& rttNs)
+{
+    Stdlib::Time deadline = GetBootTime() + Stdlib::Time(timeoutMs * Const::NanoSecsInMs);
+
+    while (GetBootTime() < deadline)
+    {
+        {
+            Stdlib::AutoLock lock(Lock);
+            if (Reply.Valid && Reply.Id == id && Reply.Seq == seq)
+            {
+                Stdlib::Time rtt = Reply.Timestamp - SendTime;
+                rttNs = rtt.GetValue();
+                Reply.Valid = false;
+                return true;
+            }
+        }
+
+        Sleep(10 * Const::NanoSecsInMs);
+    }
+
+    return false;
+}
+
+}

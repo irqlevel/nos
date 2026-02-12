@@ -14,3 +14,4 @@ bin
 *.disk
 *.qcow2
 *.d
+*.vmdk
