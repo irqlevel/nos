@@ -57,8 +57,9 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
         return false;
     }
 
-    Trace(0, "VirtioBlk %s: modern virtio-pci probed, irq %u",
-        name, (ulong)pciDev->InterruptLine);
+    Trace(0, "VirtioBlk %s: %s virtio-pci probed, irq %u",
+        name, Transport.IsLegacy() ? "legacy" : "modern",
+        (ulong)pciDev->InterruptLine);
 
     /* Reset device */
     Transport.Reset();
@@ -75,21 +76,28 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
 
     /* We don't need any special features for basic operation. */
     Transport.WriteDriverFeature(0, 0);
-    /* features[1]: set VIRTIO_F_VERSION_1 (bit 32 = index 1 bit 0) */
-    u32 devFeatures1 = Transport.ReadDeviceFeature(1);
-    u32 drvFeatures1 = devFeatures1 & (1 << 0); /* VIRTIO_F_VERSION_1 */
-    Transport.WriteDriverFeature(1, drvFeatures1);
 
-    /* Set FEATURES_OK */
-    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                        VirtioPci::StatusFeaturesOk);
-
-    /* Verify FEATURES_OK is still set */
-    if (!(Transport.GetStatus() & VirtioPci::StatusFeaturesOk))
+    if (!Transport.IsLegacy())
     {
-        Trace(0, "VirtioBlk %s: FEATURES_OK not set by device", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
-        return false;
+        /* features[1]: set VIRTIO_F_VERSION_1 (bit 32 = index 1 bit 0) */
+        u32 devFeatures1 = Transport.ReadDeviceFeature(1);
+        u32 drvFeatures1 = devFeatures1 & (1 << 0); /* VIRTIO_F_VERSION_1 */
+        Transport.WriteDriverFeature(1, drvFeatures1);
+    }
+
+    if (!Transport.IsLegacy())
+    {
+        /* Set FEATURES_OK (modern only; legacy doesn't have this bit) */
+        Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
+                            VirtioPci::StatusFeaturesOk);
+
+        /* Verify FEATURES_OK is still set */
+        if (!(Transport.GetStatus() & VirtioPci::StatusFeaturesOk))
+        {
+            Trace(0, "VirtioBlk %s: FEATURES_OK not set by device", name);
+            Transport.SetStatus(VirtioPci::StatusFailed);
+            return false;
+        }
     }
 
     /* Setup virtqueue 0 (request queue) */
@@ -116,11 +124,15 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     Transport.SetQueueDevice(Queue.GetUsedPhys());
     Transport.EnableQueue();
 
-    QueueNotifyAddr = Transport.GetNotifyAddr(0);
+    if (!Transport.IsLegacy())
+        QueueNotifyAddr = Transport.GetNotifyAddr(0);
 
     /* Set DRIVER_OK */
-    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                        VirtioPci::StatusFeaturesOk | VirtioPci::StatusDriverOk);
+    u8 okStatus = VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
+                  VirtioPci::StatusDriverOk;
+    if (!Transport.IsLegacy())
+        okStatus |= VirtioPci::StatusFeaturesOk;
+    Transport.SetStatus(okStatus);
 
     /* Read device config: capacity (u64 at offset 0) */
     CapacitySectors = Transport.ReadDevCfg64(0);
@@ -246,7 +258,7 @@ bool VirtioBlk::DoIO(u32 type, u64 sector, void* buf)
     }
 
     /* Kick the device */
-    Queue.Kick(QueueNotifyAddr, 0);
+    Transport.NotifyQueue(0);
 
     /* Poll for completion */
     for (ulong i = 0; i < 10000000; i++)
@@ -298,6 +310,12 @@ void VirtioBlk::OnInterruptRegister(u8 irq, u8 vector)
 InterruptHandlerFn VirtioBlk::GetHandlerFn()
 {
     return VirtioBlkInterruptStub;
+}
+
+void VirtioBlk::OnInterrupt(Context* ctx)
+{
+    /* Called by shared interrupt dispatch (no EOI here). */
+    Interrupt(ctx);
 }
 
 void VirtioBlk::Interrupt(Context* ctx)

@@ -34,13 +34,20 @@ public:
     void SetQueueDevice(u64 physAddr);
     void EnableQueue();
 
-    /* Returns the MMIO address to write for notifying a queue */
+    /* Returns the MMIO address to write for notifying a queue.
+       For legacy mode returns nullptr; use NotifyQueue() instead. */
     volatile void* GetNotifyAddr(u16 queueIdx);
+
+    /* Notify a queue (works for both legacy and modern) */
+    void NotifyQueue(u16 queueIdx);
 
     /* Device-specific config access */
     u8   ReadDevCfg8(ulong offset);
     u32  ReadDevCfg32(ulong offset);
     u64  ReadDevCfg64(ulong offset);
+
+    /* True if legacy (transitional) transport is in use */
+    bool IsLegacy() const { return Legacy; }
 
     /* Virtio PCI capability cfg_type values */
     static const u8 CapCommonCfg  = 1;
@@ -65,9 +72,15 @@ private:
     VirtioPci& operator=(const VirtioPci& other) = delete;
     VirtioPci& operator=(VirtioPci&& other) = delete;
 
+    bool ProbeModern(Pci::DeviceInfo* dev);
+    bool ProbeLegacy(Pci::DeviceInfo* dev);
+
     /* Map a BAR and return the kernel virtual base.
        Caches results so the same BAR is only mapped once. */
     ulong MapBar(Pci::DeviceInfo* dev, u8 bar);
+
+    bool Legacy;
+    u16  IoBase;     /* BAR0 I/O port base for legacy transport */
 
     volatile u8* CommonCfg;
     volatile u8* NotifyBase;
@@ -75,11 +88,15 @@ private:
     volatile u8* IsrCfg;
     volatile u8* DeviceCfg;
 
+    /* Cached per-queue notify addresses (modern only) */
+    static const ulong MaxCachedQueues = 4;
+    volatile u8* NotifyAddr[MaxCachedQueues];
+
     /* Cached mapped BAR virtual addresses */
     static const ulong MaxBars = 6;
     ulong MappedBars[MaxBars];
 
-    /* Common config register offsets */
+    /* Modern common config register offsets */
     static const ulong CfgDeviceFeatureSelect = 0x00;
     static const ulong CfgDeviceFeature       = 0x04;
     static const ulong CfgDriverFeatureSelect = 0x08;
@@ -96,6 +113,17 @@ private:
     static const ulong CfgQueueDesc           = 0x20;
     static const ulong CfgQueueDriver         = 0x28;
     static const ulong CfgQueueDevice         = 0x30;
+
+    /* Legacy I/O port register offsets (relative to IoBase) */
+    static const u16 LegDeviceFeatures  = 0x00;
+    static const u16 LegDriverFeatures  = 0x04;
+    static const u16 LegQueueAddress    = 0x08;
+    static const u16 LegQueueSize       = 0x0C;
+    static const u16 LegQueueSelect     = 0x0E;
+    static const u16 LegQueueNotify     = 0x10;
+    static const u16 LegDeviceStatus    = 0x12;
+    static const u16 LegISRStatus       = 0x13;
+    static const u16 LegDeviceConfig    = 0x14;
 };
 
 }
