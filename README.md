@@ -9,12 +9,12 @@ A hobby x86-64 operating system kernel written in C++14 and NASM.
 - **Virtual memory** — 4-level paging (4 KB pages), high-half kernel at `0xFFFF800001000000`, TLB shootdown across CPUs via IPI
 - **Page allocator** — fixed-size block allocator (1/2/4/8 pages), pool allocator (32 B – 2 KB), `new`/`delete` support
 - **ACPI** — RSDP/RSDT/MADT parsing for LAPIC/IOAPIC discovery and IRQ→GSI routing
-- **Interrupts** — IDT with exception handlers, IOAPIC routing, LAPIC IPI, PIC (remapped then disabled)
-- **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**
+- **Interrupts** — IDT with exception handlers, IOAPIC routing (edge + level-triggered), LAPIC IPI, PIC (remapped then disabled)
+- **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net** (modern virtio-pci 1.0 MMIO transport)
 - **Block I/O** — virtio-blk driver with virtqueue DMA, block device abstraction, disk discovery and enumeration
-- **Networking** — virtio-net driver, ARP (cache, request, reply), IPv4/UDP transmit, DHCP client with lease renewal, network device abstraction
+- **Networking** — virtio-net driver, ARP (cache, request, reply), IPv4/UDP transmit, ICMP echo (ping reply + send), DHCP client with lease renewal, network device abstraction
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `dhcp`, `cls`, `help`, `poweroff`, `reboot`
+- **Interactive shell** — commands: `ps`, `cpu`, `dmesg`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `udpsend`, `ping`, `dhcp`, `cls`, `help`, `poweroff`, `reboot`
 - **Kernel infrastructure** — spinlocks, atomics, timers, watchdog, stack traces, dmesg ring buffer, panic handler
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc, parsing helpers, block device table
 
@@ -40,7 +40,7 @@ Build a bootable qcow2 disk image (MBR, 2 partitions):
 ./scripts/build-disk.sh
 ```
 
-This produces `nos.qcow2` (256 MB, virtio-blk compatible).
+This produces `nos.qcow2` (1 GB, MBR, virtio-blk compatible, suitable for KVM-based public clouds).
 
 #### Run
 
@@ -78,6 +78,11 @@ gdb -ex "symbol-file bin/kernel64.elf" \
 Pass via GRUB command line (edit `build/grub.cfg`):
 
 - `smp=off` — disable SMP, run on BSP only
+- `console=serial` — direct shell output to serial port only
+- `console=vga` — direct shell output to VGA only
+- `dhcp=auto` — start DHCP on `eth0` automatically at boot
+- `dhcp=off` — disable DHCP entirely (even via shell command)
+- `dhcp=on` — enable DHCP only via shell command (default)
 
 #### Shell commands
 
@@ -97,6 +102,7 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 | `help` | List commands |
 | `net` | List network devices and stats |
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
+| `ping <ip>` | Send 5 ICMP echo requests with RTT |
 | `dhcp [dev]` | Obtain IP address via DHCP |
 | `poweroff` / `shutdown` | Power off (ACPI S5) |
 | `reboot` | Reset system (keyboard controller) |
@@ -107,7 +113,7 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 boot/       Multiboot2 entry, 32→64-bit transition, AP trampoline
 kernel/     Core: scheduling, tasks, interrupts, shell, timers, locks
 drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI, virtio-blk, virtio-net
-net/        Networking: device abstraction, protocol headers, ARP, DHCP
+net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP
 mm/         Memory: page tables, page allocator, pool allocator
 lib/        Utilities: list, vector, btree, ring buffer, bitmap, stdlib
 build/      Linker script, GRUB configs
