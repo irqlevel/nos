@@ -8,7 +8,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Step 1: Build kernel inside Docker
 docker build --platform linux/amd64 -t nos-builder "$PROJECT_ROOT"
-docker run --platform linux/amd64 --rm -e VERSION -v "$PROJECT_ROOT:/src" -w /src nos-builder bash -c 'make clean && make nocheck'
+docker run --platform linux/amd64 --rm -e "VERSION=${VERSION:-dev}" -v "$PROJECT_ROOT:/src" -w /src nos-builder bash -c 'make clean && make nocheck'
 
 # Step 2: Build disk image inside Docker (needs --privileged for loop mounts)
 docker run --platform linux/amd64 --rm --privileged \
