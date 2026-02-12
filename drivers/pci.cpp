@@ -31,6 +31,28 @@ const char* Pci::ClassToStr(u16 cls)
         return "Memory";
     case ClsBridgeDevice:
         return "Bridge";
+    case ClsSimpleComm:
+        return "Comm";
+    case ClsBaseSystemPeripheral:
+        return "System";
+    case ClsInputDevice:
+        return "Input";
+    case ClsDockingStation:
+        return "Dock";
+    case ClsProcessor:
+        return "Processor";
+    case ClsSerialBus:
+        return "SerialBus";
+    case ClsWireless:
+        return "Wireless";
+    case ClsIntelligentIO:
+        return "I2O";
+    case ClsSatelliteComm:
+        return "Satellite";
+    case ClsEncryption:
+        return "Crypto";
+    case ClsSignalProcessing:
+        return "DSP";
     default:
         return "Unknown";
     }
@@ -49,6 +71,10 @@ const char* Pci::SubClassToStr(u16 cls, u16 subcls)
             return "SCSI";
         case SubClsIDEController:
             return "IDE";
+        case SubClsSATA:
+            return "SATA";
+        case SubClsNVMe:
+            return "NVMe";
         default:
             return "Unknown";
         }
@@ -71,7 +97,15 @@ const char* Pci::SubClassToStr(u16 cls, u16 subcls)
     case ClsMultimediaController:
         return "Unknown";
     case ClsMemoryController:
-        return "Unknown";
+        switch (subcls)
+        {
+        case 0x0:
+            return "RAM";
+        case 0x1:
+            return "Flash";
+        default:
+            return "Unknown";
+        }
     case ClsBridgeDevice:
         switch (subcls)
         {
@@ -79,7 +113,73 @@ const char* Pci::SubClassToStr(u16 cls, u16 subcls)
             return "Host";
         case SubClsISABridge:
             return "ISA";
+        case 0x2:
+            return "EISA";
+        case 0x3:
+            return "MCA";
+        case SubClsPCIBridge:
+            return "PCI";
+        case 0x5:
+            return "PCMCIA";
         case SubClsOtherBridge:
+            return "Other";
+        default:
+            return "Unknown";
+        }
+    case ClsSimpleComm:
+        switch (subcls)
+        {
+        case 0x0:
+            return "Serial";
+        case 0x1:
+            return "Parallel";
+        default:
+            return "Unknown";
+        }
+    case ClsBaseSystemPeripheral:
+        switch (subcls)
+        {
+        case 0x0:
+            return "PIC";
+        case 0x1:
+            return "DMA";
+        case 0x2:
+            return "Timer";
+        case 0x3:
+            return "RTC";
+        case 0x80:
+            return "Other";
+        default:
+            return "Unknown";
+        }
+    case ClsInputDevice:
+        switch (subcls)
+        {
+        case 0x0:
+            return "Keyboard";
+        case 0x1:
+            return "Pen";
+        case 0x2:
+            return "Mouse";
+        case 0x3:
+            return "Scanner";
+        case 0x4:
+            return "Gameport";
+        case 0x80:
+            return "Other";
+        default:
+            return "Unknown";
+        }
+    case ClsSerialBus:
+        switch (subcls)
+        {
+        case SubClsFireWire:
+            return "FireWire";
+        case SubClsUSB:
+            return "USB";
+        case SubClsSMBus:
+            return "SMBus";
+        case 0x80:
             return "Other";
         default:
             return "Unknown";
@@ -99,6 +199,12 @@ const char* Pci::VendorToStr(u16 vendor)
         return "Bochs";
     case VendorVirtio:
         return "Virtio";
+    case VendorRedHat:
+        return "RedHat";
+    case VendorAMD:
+        return "AMD";
+    case VendorRealtek:
+        return "Realtek";
     default:
         return "Unknown";
     }
@@ -109,24 +215,64 @@ const char* Pci::DeviceToStr(u16 vendor, u16 dev)
     switch (vendor)
     {
     case VendorIntel:
-        return "Unknown";
+        switch (dev)
+        {
+        case 0x29C0:
+            return "82G33 MCH";
+        case 0x2918:
+            return "ICH9 LPC";
+        case 0x2930:
+            return "ICH9 SMBus";
+        default:
+            return "Unknown";
+        }
     case VendorBochs:
-        return "Unknown";
+        switch (dev)
+        {
+        case 0x1111:
+            return "VGA";
+        default:
+            return "Unknown";
+        }
     case VendorVirtio:
         switch (dev)
         {
         case DevVirtioBlk:
             return "Blk";
+        case DevVirtioBalloon:
+            return "Balloon";
+        case DevVirtioConsole:
+            return "Console";
         case DevVirtioRng:
             return "Rng";
         case DevVirtioNetwork:
             return "Network";
         case DevVirtioScsi:
             return "Scsi";
+        case DevVirtioGpu:
+            return "Gpu";
+        case DevVirtioInput:
+            return "Input";
+        case DevVirtioSocket:
+            return "Socket";
         case DevVirtioNetModern:
             return "Network";
         case DevVirtioBlkModern:
             return "Blk";
+        default:
+            return "Unknown";
+        }
+    case VendorRedHat:
+        switch (dev)
+        {
+        case DevRedHatPcieBridge:
+            return "PCIe Bridge";
+        case 0x000D:
+            return "XHCI USB";
+        case 0x0010:
+            return "QXL GPU";
+        case 0x0100:
+            return "QXL VGA";
         default:
             return "Unknown";
         }

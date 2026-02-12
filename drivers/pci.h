@@ -59,25 +59,51 @@ public:
     static const u16 ClsMultimediaController = 0x4;
     static const u16 ClsMemoryController = 0x5;
     static const u16 ClsBridgeDevice = 0x6;
+    static const u16 ClsSimpleComm = 0x7;
+    static const u16 ClsBaseSystemPeripheral = 0x8;
+    static const u16 ClsInputDevice = 0x9;
+    static const u16 ClsDockingStation = 0xA;
+    static const u16 ClsProcessor = 0xB;
+    static const u16 ClsSerialBus = 0xC;
+    static const u16 ClsWireless = 0xD;
+    static const u16 ClsIntelligentIO = 0xE;
+    static const u16 ClsSatelliteComm = 0xF;
+    static const u16 ClsEncryption = 0x10;
+    static const u16 ClsSignalProcessing = 0x11;
 
     static const u16 SubClsEthernetController = 0x0;
     static const u16 SubClsVgaCompatibleController = 0x0;
     static const u16 SubClsSCSIBusController = 0x0;
     static const u16 SubClsIDEController = 0x1;
+    static const u16 SubClsSATA = 0x6;
+    static const u16 SubClsNVMe = 0x8;
     static const u16 SubClsHostBridge = 0x0;
     static const u16 SubClsISABridge = 0x1;
+    static const u16 SubClsPCIBridge = 0x4;
     static const u16 SubClsOtherBridge = 0x80;
+    static const u16 SubClsFireWire = 0x0;
+    static const u16 SubClsUSB = 0x3;
+    static const u16 SubClsSMBus = 0x5;
 
     static const u16 VendorIntel = 0x8086;
     static const u16 VendorVirtio = 0x1Af4;
     static const u16 VendorBochs = 0x1234;
+    static const u16 VendorRedHat = 0x1B36;
+    static const u16 VendorAMD = 0x1022;
+    static const u16 VendorRealtek = 0x10EC;
 
     static const u16 DevVirtioNetwork = 0x1000;
     static const u16 DevVirtioBlk = 0x1001;
+    static const u16 DevVirtioConsole = 0x1003;
     static const u16 DevVirtioScsi = 0x1004;
     static const u16 DevVirtioRng = 0x1005;
+    static const u16 DevVirtioBalloon = 0x1002;
+    static const u16 DevVirtioGpu = 0x1050;
+    static const u16 DevVirtioInput = 0x1052;
+    static const u16 DevVirtioSocket = 0x1053;
     static const u16 DevVirtioNetModern = 0x1041;
     static const u16 DevVirtioBlkModern = 0x1042;
+    static const u16 DevRedHatPcieBridge = 0x000E;
 
     const char* ClassToStr(u16 cls);
 
