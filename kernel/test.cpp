@@ -977,6 +977,336 @@ Stdlib::Error TestPageAllocator()
     return MakeSuccess();
 }
 
+Stdlib::Error TestMemSet()
+{
+    Trace(0, "TestMemSet: started");
+
+    /* Basic fill */
+    {
+        u8 buf[128];
+        Stdlib::MemSet(buf, 0xAA, sizeof(buf));
+        for (ulong i = 0; i < sizeof(buf); i++)
+        {
+            if (buf[i] != 0xAA)
+            {
+                Trace(0, "TestMemSet: basic fill mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+    }
+
+    /* Zero fill */
+    {
+        u8 buf[64];
+        Stdlib::MemSet(buf, 0xFF, sizeof(buf));
+        Stdlib::MemSet(buf, 0, sizeof(buf));
+        for (ulong i = 0; i < sizeof(buf); i++)
+        {
+            if (buf[i] != 0)
+            {
+                Trace(0, "TestMemSet: zero fill mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+    }
+
+    /* Odd sizes (not multiple of 8) */
+    {
+        for (ulong sz = 0; sz <= 17; sz++)
+        {
+            u8 buf[32];
+            Stdlib::MemSet(buf, 0, sizeof(buf));
+            Stdlib::MemSet(buf, 0xCD, sz);
+            for (ulong i = 0; i < sz; i++)
+            {
+                if (buf[i] != 0xCD)
+                {
+                    Trace(0, "TestMemSet: odd size %u mismatch at %u", sz, i);
+                    return MakeError(Stdlib::Error::Unsuccessful);
+                }
+            }
+            /* Bytes beyond sz must be untouched */
+            for (ulong i = sz; i < sizeof(buf); i++)
+            {
+                if (buf[i] != 0)
+                {
+                    Trace(0, "TestMemSet: odd size %u overflow at %u", sz, i);
+                    return MakeError(Stdlib::Error::Unsuccessful);
+                }
+            }
+        }
+    }
+
+    Trace(0, "TestMemSet: complete");
+    return MakeSuccess();
+}
+
+Stdlib::Error TestMemCpy()
+{
+    Trace(0, "TestMemCpy: started");
+
+    /* Basic copy */
+    {
+        u8 src[128], dst[128];
+        for (ulong i = 0; i < sizeof(src); i++)
+            src[i] = (u8)(i & 0xFF);
+        Stdlib::MemSet(dst, 0, sizeof(dst));
+        Stdlib::MemCpy(dst, src, sizeof(src));
+        for (ulong i = 0; i < sizeof(src); i++)
+        {
+            if (dst[i] != src[i])
+            {
+                Trace(0, "TestMemCpy: basic copy mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+    }
+
+    /* Odd sizes (not multiple of 8) */
+    {
+        for (ulong sz = 0; sz <= 17; sz++)
+        {
+            u8 src[32], dst[32];
+            for (ulong i = 0; i < sizeof(src); i++)
+                src[i] = (u8)((i + 0x30) & 0xFF);
+            Stdlib::MemSet(dst, 0, sizeof(dst));
+            Stdlib::MemCpy(dst, src, sz);
+            for (ulong i = 0; i < sz; i++)
+            {
+                if (dst[i] != src[i])
+                {
+                    Trace(0, "TestMemCpy: odd size %u mismatch at %u", sz, i);
+                    return MakeError(Stdlib::Error::Unsuccessful);
+                }
+            }
+            /* Bytes beyond sz must be untouched */
+            for (ulong i = sz; i < sizeof(dst); i++)
+            {
+                if (dst[i] != 0)
+                {
+                    Trace(0, "TestMemCpy: odd size %u overflow at %u", sz, i);
+                    return MakeError(Stdlib::Error::Unsuccessful);
+                }
+            }
+        }
+    }
+
+    Trace(0, "TestMemCpy: complete");
+    return MakeSuccess();
+}
+
+Stdlib::Error TestMemCmp()
+{
+    Trace(0, "TestMemCmp: started");
+
+    /* Equal buffers */
+    {
+        u8 a[64], b[64];
+        Stdlib::MemSet(a, 0xAB, sizeof(a));
+        Stdlib::MemSet(b, 0xAB, sizeof(b));
+        if (Stdlib::MemCmp(a, b, sizeof(a)) != 0)
+        {
+            Trace(0, "TestMemCmp: equal buffers returned non-zero");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* First < second */
+    {
+        u8 a[] = {1, 2, 3};
+        u8 b[] = {1, 2, 4};
+        if (Stdlib::MemCmp(a, b, 3) >= 0)
+        {
+            Trace(0, "TestMemCmp: a < b not detected");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* First > second */
+    {
+        u8 a[] = {1, 2, 5};
+        u8 b[] = {1, 2, 4};
+        if (Stdlib::MemCmp(a, b, 3) <= 0)
+        {
+            Trace(0, "TestMemCmp: a > b not detected");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Difference at first byte */
+    {
+        u8 a[] = {0x00, 0xFF};
+        u8 b[] = {0xFF, 0x00};
+        if (Stdlib::MemCmp(a, b, 2) >= 0)
+        {
+            Trace(0, "TestMemCmp: first byte a < b not detected");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Zero length */
+    {
+        u8 a[] = {1};
+        u8 b[] = {2};
+        if (Stdlib::MemCmp(a, b, 0) != 0)
+        {
+            Trace(0, "TestMemCmp: zero length not equal");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Odd sizes */
+    {
+        u8 a[17], b[17];
+        for (ulong i = 0; i < sizeof(a); i++)
+        {
+            a[i] = (u8)i;
+            b[i] = (u8)i;
+        }
+        if (Stdlib::MemCmp(a, b, sizeof(a)) != 0)
+        {
+            Trace(0, "TestMemCmp: odd size equal mismatch");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+        b[16] = 0xFF;
+        if (Stdlib::MemCmp(a, b, sizeof(a)) >= 0)
+        {
+            Trace(0, "TestMemCmp: odd size diff at end not detected");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    Trace(0, "TestMemCmp: complete");
+    return MakeSuccess();
+}
+
+Stdlib::Error TestStrLen()
+{
+    Trace(0, "TestStrLen: started");
+
+    /* Empty string */
+    if (Stdlib::StrLen("") != 0)
+    {
+        Trace(0, "TestStrLen: empty string failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Single char */
+    if (Stdlib::StrLen("A") != 1)
+    {
+        Trace(0, "TestStrLen: single char failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Known string */
+    if (Stdlib::StrLen("hello") != 5)
+    {
+        Trace(0, "TestStrLen: 'hello' failed, got %u", Stdlib::StrLen("hello"));
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* String with embedded high bytes */
+    {
+        char buf[10] = {'\xFF', '\xFE', '\x01', '\0', 'X', '\0'};
+        if (Stdlib::StrLen(buf) != 3)
+        {
+            Trace(0, "TestStrLen: high bytes failed, got %u", Stdlib::StrLen(buf));
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Longer string (> 8 bytes, tests qword boundary) */
+    if (Stdlib::StrLen("abcdefghijklmnop") != 16)
+    {
+        Trace(0, "TestStrLen: 16-char string failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    Trace(0, "TestStrLen: complete");
+    return MakeSuccess();
+}
+
+Stdlib::Error TestStrCmp()
+{
+    Trace(0, "TestStrCmp: started");
+
+    /* Equal strings */
+    if (Stdlib::StrCmp("abc", "abc") != 0)
+    {
+        Trace(0, "TestStrCmp: equal strings failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Empty strings */
+    if (Stdlib::StrCmp("", "") != 0)
+    {
+        Trace(0, "TestStrCmp: empty strings failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* First < second */
+    if (Stdlib::StrCmp("abc", "abd") >= 0)
+    {
+        Trace(0, "TestStrCmp: abc < abd failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* First > second */
+    if (Stdlib::StrCmp("abd", "abc") <= 0)
+    {
+        Trace(0, "TestStrCmp: abd > abc failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Prefix: shorter < longer */
+    if (Stdlib::StrCmp("ab", "abc") >= 0)
+    {
+        Trace(0, "TestStrCmp: ab < abc failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Prefix: longer > shorter */
+    if (Stdlib::StrCmp("abc", "ab") <= 0)
+    {
+        Trace(0, "TestStrCmp: abc > ab failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Single char difference */
+    if (Stdlib::StrCmp("a", "b") >= 0)
+    {
+        Trace(0, "TestStrCmp: a < b failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Empty vs non-empty */
+    if (Stdlib::StrCmp("", "a") >= 0)
+    {
+        Trace(0, "TestStrCmp: '' < 'a' failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+    if (Stdlib::StrCmp("a", "") <= 0)
+    {
+        Trace(0, "TestStrCmp: 'a' > '' failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Longer strings (cross qword boundary) */
+    if (Stdlib::StrCmp("abcdefghij", "abcdefghij") != 0)
+    {
+        Trace(0, "TestStrCmp: long equal failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+    if (Stdlib::StrCmp("abcdefghij", "abcdefghik") >= 0)
+    {
+        Trace(0, "TestStrCmp: long diff at end failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    Trace(0, "TestStrCmp: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
@@ -1024,6 +1354,26 @@ Stdlib::Error Test()
         return err;
 
     err = TestPageAllocator();
+    if (!err.Ok())
+        return err;
+
+    err = TestMemSet();
+    if (!err.Ok())
+        return err;
+
+    err = TestMemCpy();
+    if (!err.Ok())
+        return err;
+
+    err = TestMemCmp();
+    if (!err.Ok())
+        return err;
+
+    err = TestStrLen();
+    if (!err.Ok())
+        return err;
+
+    err = TestStrCmp();
     if (!err.Ok())
         return err;
 
