@@ -304,6 +304,14 @@ const char* StrChrOnce(const char* s, char sep);
 
 size_t Log2(size_t size);
 
+constexpr size_t CLog2(size_t v)
+{
+    size_t r = 0;
+    while ((1UL << r) < v)
+        r++;
+    return r;
+}
+
 size_t HashPtr(void *ptr);
 
 bool IsValueInRange(ulong value, ulong base, ulong limit);

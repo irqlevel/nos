@@ -514,13 +514,6 @@ Stdlib::Error TestContiguousPages()
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    /* count > 32 must fail */
-    if (pt.AllocContiguousPages(33) != nullptr)
-    {
-        Trace(0, "TestContiguousPages: count=33 should fail");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
     /* Alloc 1 page */
     ulong freeBefore = pt.GetFreePagesCount();
     Trace(0, "TestContiguousPages: free pages before %u", freeBefore);
@@ -933,6 +926,48 @@ Stdlib::Error TestPageAllocator()
         if (pt.GetFreePagesCount() != freePagesBefore)
         {
             Trace(0, "TestPageAllocator: AllocMapPages(32) free count mismatch: %u expected %u",
+                pt.GetFreePagesCount(), freePagesBefore);
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Test AllocMapPages / UnmapFreePages with 128 pages (large VirtQueue) */
+    {
+        ulong freePagesBefore = pt.GetFreePagesCount();
+        ulong physAddr = 0;
+        void* ptr = Mm::AllocMapPages(128, &physAddr);
+        if (!ptr)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(128) failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+        if (physAddr == 0)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(128) physAddr is 0");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+
+        u8* p = (u8*)ptr;
+        for (ulong pg = 0; pg < 128; pg++)
+        {
+            Stdlib::MemSet(p + pg * Const::PageSize, (u8)(pg & 0xFF), Const::PageSize);
+        }
+        for (ulong pg = 0; pg < 128; pg++)
+        {
+            u8 expected = (u8)(pg & 0xFF);
+            u8* base = p + pg * Const::PageSize;
+            if (base[0] != expected || base[Const::PageSize - 1] != expected)
+            {
+                Trace(0, "TestPageAllocator: AllocMapPages(128) page %u mismatch", pg);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+
+        Mm::UnmapFreePages(ptr);
+
+        if (pt.GetFreePagesCount() != freePagesBefore)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(128) free count mismatch: %u expected %u",
                 pt.GetFreePagesCount(), freePagesBefore);
             return MakeError(Stdlib::Error::Unsuccessful);
         }

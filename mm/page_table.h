@@ -193,6 +193,7 @@ public:
     ulong MapMmioRegion(ulong physAddr, ulong sizeBytes);
 
     Page* AllocPage();
+    static const ulong MaxContiguousPages = 128;
     Page* AllocContiguousPages(ulong count);
     void FreePage(Page* page);
 
