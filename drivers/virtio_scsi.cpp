@@ -28,6 +28,8 @@ VirtioScsi::VirtioScsi()
     , SectorSz(DefaultSectorSize)
     , IntVector(-1)
     , Initialized(false)
+    , ReqHdrSize(0)
+    , RespHdrSize(0)
     , CmdReq(nullptr)
     , CmdReqPhys(0)
     , CmdResp(nullptr)
@@ -55,7 +57,8 @@ void VirtioScsi::EncodeLun(u8 lun[8], u8 target, u16 lunId)
 }
 
 bool VirtioScsi::Init(VirtioPci* transport, VirtQueue* reqQueue, SpinLock* ioLock,
-                       u8 target, u16 lun, u64 capacity, u64 sectorSize, const char* name)
+                       u8 target, u16 lun, u64 capacity, u64 sectorSize, const char* name,
+                       u32 reqHdrSize, u32 respHdrSize)
 {
     Transport = transport;
     ReqQueue = reqQueue;
@@ -64,6 +67,8 @@ bool VirtioScsi::Init(VirtioPci* transport, VirtQueue* reqQueue, SpinLock* ioLoc
     LunId = lun;
     CapacitySectors = capacity;
     SectorSz = sectorSize;
+    ReqHdrSize = reqHdrSize;
+    RespHdrSize = respHdrSize;
 
     ulong nameLen = Stdlib::StrLen(name);
     if (nameLen >= sizeof(DevName))
@@ -71,25 +76,28 @@ bool VirtioScsi::Init(VirtioPci* transport, VirtQueue* reqQueue, SpinLock* ioLoc
     Stdlib::MemCpy(DevName, name, nameLen);
     DevName[nameLen] = '\0';
 
-    /* Allocate DMA pages for SCSI command buffers.
+    /* Allocate DMA pages for SCSI command buffers (reuse if already allocated).
        Page 0: VirtioScsiCmdReq (51 bytes) + VirtioScsiCmdResp (108 bytes)
        Page 1: data buffer (sector-sized) */
-    ulong dmaPhys;
-    void* dmaPtr = Mm::AllocMapPages(DmaPages, &dmaPhys);
-    if (!dmaPtr)
+    if (!CmdReq)
     {
-        Trace(0, "VirtioScsi %s: failed to alloc DMA pages", name);
-        return false;
+        ulong dmaPhys;
+        void* dmaPtr = Mm::AllocMapPages(DmaPages, &dmaPhys);
+        if (!dmaPtr)
+        {
+            Trace(0, "VirtioScsi %s: failed to alloc DMA pages", name);
+            return false;
+        }
+
+        ulong dmaVirt = (ulong)dmaPtr;
+
+        CmdReq = (VirtioScsiCmdReq*)dmaVirt;
+        CmdReqPhys = dmaPhys;
+        CmdResp = (VirtioScsiCmdResp*)(dmaVirt + sizeof(VirtioScsiCmdReq));
+        CmdRespPhys = dmaPhys + sizeof(VirtioScsiCmdReq);
+        DataBuf = (u8*)(dmaVirt + Const::PageSize);
+        DataBufPhys = dmaPhys + Const::PageSize;
     }
-
-    ulong dmaVirt = (ulong)dmaPtr;
-
-    CmdReq = (VirtioScsiCmdReq*)dmaVirt;
-    CmdReqPhys = dmaPhys;
-    CmdResp = (VirtioScsiCmdResp*)(dmaVirt + sizeof(VirtioScsiCmdReq));
-    CmdRespPhys = dmaPhys + sizeof(VirtioScsiCmdReq);
-    DataBuf = (u8*)(dmaVirt + Const::PageSize);
-    DataBufPhys = dmaPhys + Const::PageSize;
 
     Initialized = true;
     return true;
@@ -144,7 +152,7 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
         VirtQueue::BufDesc bufs[3];
 
         bufs[0].Addr = CmdReqPhys;
-        bufs[0].Len = sizeof(VirtioScsiCmdReq);
+        bufs[0].Len = ReqHdrSize;
         bufs[0].Writable = false;
 
         bufs[1].Addr = DataBufPhys;
@@ -152,7 +160,7 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
         bufs[1].Writable = false;
 
         bufs[2].Addr = CmdRespPhys;
-        bufs[2].Len = sizeof(VirtioScsiCmdResp);
+        bufs[2].Len = RespHdrSize;
         bufs[2].Writable = true;
 
         int head = ReqQueue->AddBufs(bufs, 3);
@@ -168,11 +176,11 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
         VirtQueue::BufDesc bufs[3];
 
         bufs[0].Addr = CmdReqPhys;
-        bufs[0].Len = sizeof(VirtioScsiCmdReq);
+        bufs[0].Len = ReqHdrSize;
         bufs[0].Writable = false;
 
         bufs[1].Addr = CmdRespPhys;
-        bufs[1].Len = sizeof(VirtioScsiCmdResp);
+        bufs[1].Len = RespHdrSize;
         bufs[1].Writable = true;
 
         bufs[2].Addr = DataBufPhys;
@@ -192,11 +200,11 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
         VirtQueue::BufDesc bufs[2];
 
         bufs[0].Addr = CmdReqPhys;
-        bufs[0].Len = sizeof(VirtioScsiCmdReq);
+        bufs[0].Len = ReqHdrSize;
         bufs[0].Writable = false;
 
         bufs[1].Addr = CmdRespPhys;
-        bufs[1].Len = sizeof(VirtioScsiCmdResp);
+        bufs[1].Len = RespHdrSize;
         bufs[1].Writable = true;
 
         int head = ReqQueue->AddBufs(bufs, 2);
@@ -221,14 +229,20 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
     u32 usedId, usedLen;
     if (!ReqQueue->GetUsed(usedId, usedLen))
     {
+        Transport->ReadISR();
         Trace(0, "VirtioScsi %s: timeout waiting for SCSI command", DevName);
         return false;
     }
 
+    /* Clear ISR so the device deasserts its level-triggered IRQ line.
+       Without this, a shared IRQ (e.g. with virtio-net) would storm. */
+    Transport->ReadISR();
+
     /* Check virtio-level response */
     if (CmdResp->Response != ResponseOk)
     {
-        Trace(0, "VirtioScsi %s: response error %u", DevName, (ulong)CmdResp->Response);
+        if (CmdResp->Response != ResponseBadTarget)
+            Trace(0, "VirtioScsi %s: response error %u", DevName, (ulong)CmdResp->Response);
         return false;
     }
 
@@ -385,6 +399,32 @@ bool VirtioScsi::InitHba(Pci::DeviceInfo* pciDev, HbaState* hba)
         }
     }
 
+    /* Read device-specific configuration */
+    u32 numQueues = hba->Transport.ReadDevCfg32(0);
+    u32 segMax = hba->Transport.ReadDevCfg32(4);
+    u32 maxSectors = hba->Transport.ReadDevCfg32(8);
+    u32 cmdPerLun = hba->Transport.ReadDevCfg32(12);
+    u32 senseSize = hba->Transport.ReadDevCfg32(20);
+    u32 cdbSize = hba->Transport.ReadDevCfg32(24);
+    u16 maxChannel = hba->Transport.ReadDevCfg8(28) | ((u16)hba->Transport.ReadDevCfg8(29) << 8);
+    u16 maxTarget = hba->Transport.ReadDevCfg8(30) | ((u16)hba->Transport.ReadDevCfg8(31) << 8);
+    u32 maxLun = hba->Transport.ReadDevCfg32(32);
+
+    Trace(0, "VirtioScsi: numQueues %u segMax %u maxSectors %u cmdPerLun %u",
+        (ulong)numQueues, (ulong)segMax, (ulong)maxSectors, (ulong)cmdPerLun);
+    Trace(0, "VirtioScsi: cdbSize %u senseSize %u maxChannel %u maxTarget %u maxLun %u",
+        (ulong)cdbSize, (ulong)senseSize, (ulong)maxChannel, (ulong)maxTarget, (ulong)maxLun);
+
+    /* Clamp to our struct limits (CdbLen=32, SenseLen=96) */
+    if (cdbSize == 0 || cdbSize > CdbLen)
+        cdbSize = CdbLen;
+    if (senseSize == 0 || senseSize > SenseLen)
+        senseSize = SenseLen;
+
+    hba->CdbSize = cdbSize;
+    hba->SenseSize = senseSize;
+    hba->MaxTarget = (maxTarget > 255) ? 255 : maxTarget;
+
     /* Queue 0 = control queue -- used for task management (abort, LUN reset).
        Not needed for basic synchronous I/O. Skip allocation. */
     hba->Transport.SelectQueue(QueueControl);
@@ -444,7 +484,10 @@ bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
     tmpName[2] = (char)('a' + InstanceCount);
     tmpName[3] = '\0';
 
-    if (!inst.Init(&hba->Transport, &hba->ReqQueue, &hba->Lock, target, lun, 0, DefaultSectorSize, tmpName))
+    u32 reqHdrSize = 19 + hba->CdbSize;
+    u32 respHdrSize = 12 + hba->SenseSize;
+    if (!inst.Init(&hba->Transport, &hba->ReqQueue, &hba->Lock, target, lun, 0, DefaultSectorSize, tmpName,
+                   reqHdrSize, respHdrSize))
         return false;
 
     /* INQUIRY: identify device type */
@@ -457,11 +500,7 @@ bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
     Stdlib::MemSet(inquiryData, 0, sizeof(inquiryData));
 
     if (!inst.ScsiCommand(cdb, inquiryData, sizeof(inquiryData), true))
-    {
-        Mm::UnmapFreePages(inst.CmdReq);
-        inst.Initialized = false;
         return false;
-    }
 
     u8 deviceType = inquiryData[0] & InquiryTypeMask;
     u8 qualifier = (inquiryData[0] >> InquiryQualShift) & InquiryQualMask;
@@ -471,11 +510,7 @@ bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
 
     /* Direct access block device with peripheral qualifier 0 (connected) */
     if (deviceType != ScsiTypeDirectAccess || qualifier != 0)
-    {
-        Mm::UnmapFreePages(inst.CmdReq);
-        inst.Initialized = false;
         return false;
-    }
 
     /* TEST UNIT READY: clear any pending UNIT ATTENTION conditions.
        After device init, the first command may get CHECK CONDITION with
@@ -496,11 +531,7 @@ bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
     Stdlib::MemSet(capData, 0, sizeof(capData));
 
     if (!inst.ScsiCommand(cdb, capData, sizeof(capData), true))
-    {
-        Mm::UnmapFreePages(inst.CmdReq);
-        inst.Initialized = false;
         return false;
-    }
 
     /* READ CAPACITY(10) returns:
        Bytes 0-3: last LBA (big-endian)
@@ -519,8 +550,6 @@ bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
     if (blockSize == 0 || blockSize > Const::PageSize)
     {
         Trace(0, "VirtioScsi %s: unsupported block size %u", tmpName, (ulong)blockSize);
-        Mm::UnmapFreePages(inst.CmdReq);
-        inst.Initialized = false;
         return false;
     }
 
@@ -564,8 +593,22 @@ void VirtioScsi::InitAll()
         /* Remember which instance index this HBA starts at */
         ulong firstInst = InstanceCount;
 
-        /* Scan target 0, LUN 0 */
-        ProbeLun(hba, 0, 0);
+        /* Scan all targets, LUN 0 */
+        for (u16 t = 0; t <= hba->MaxTarget && InstanceCount < MaxInstances; t++)
+        {
+            ProbeLun(hba, (u8)t, 0);
+        }
+
+        /* Free DMA pages left over from the last failed probe attempt.
+           Instances[InstanceCount] is the slot used by ProbeLun but never
+           committed (InstanceCount was not incremented). */
+        if (InstanceCount < MaxInstances && Instances[InstanceCount].CmdReq &&
+            InstanceCount >= firstInst)
+        {
+            Mm::UnmapFreePages(Instances[InstanceCount].CmdReq);
+            Instances[InstanceCount].CmdReq = nullptr;
+            Instances[InstanceCount].Initialized = false;
+        }
 
         /* Register interrupt using the first instance discovered on this HBA */
         if (InstanceCount > firstInst)
@@ -573,6 +616,13 @@ void VirtioScsi::InitAll()
             u8 irq = dev->InterruptLine;
             u8 vector = BaseVector + (u8)HbaCount;
             Interrupt::RegisterLevel(Instances[firstInst], irq, vector);
+        }
+        else
+        {
+            /* No devices found -- reset the device to deassert any
+               pending level-triggered IRQ that could storm when
+               interrupts are enabled (shared IRQ line with virtio-net). */
+            hba->Transport.Reset();
         }
 
         HbaCount++;
