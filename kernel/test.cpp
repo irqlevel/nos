@@ -1312,9 +1312,7 @@ Stdlib::Error TestStrStr()
     Trace(0, "TestStrStr: started");
 
     /* Empty needle always matches at start */
-    if (Stdlib::StrStr("hello", "") != (const char*)"hello")
     {
-        /* StrStr returns haystack pointer for empty needle */
         const char* h = "hello";
         if (Stdlib::StrStr(h, "") != h)
         {
@@ -1367,15 +1365,12 @@ Stdlib::Error TestStrStr()
 
     /* Partial match then fail */
     {
-        if (Stdlib::StrStr("abcabd", "abd") != (const char*)"abcabd" + 3)
+        const char* h = "abcabd";
+        const char* r = Stdlib::StrStr(h, "abd");
+        if (r != h + 3)
         {
-            const char* h = "abcabd";
-            const char* r = Stdlib::StrStr(h, "abd");
-            if (r != h + 3)
-            {
-                Trace(0, "TestStrStr: partial match failed");
-                return MakeError(Stdlib::Error::Unsuccessful);
-            }
+            Trace(0, "TestStrStr: partial match failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
 

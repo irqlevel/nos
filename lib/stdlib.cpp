@@ -7,6 +7,7 @@ void asm_memcpy(void* dst, const void* src, size_t size);
 int asm_memcmp(const void* p1, const void* p2, size_t size);
 size_t asm_strlen(const char* s);
 int asm_strcmp(const char* s1, const char* s2);
+const char* asm_strstr(const char* haystack, const char* needle);
 }
 
 namespace Stdlib
@@ -417,25 +418,7 @@ ulong TokenCopy(const char* start, const char* end, char* dst, ulong dstSize)
 
 const char* StrStr(const char* haystack, const char* needle)
 {
-    if (*needle == '\0')
-        return haystack;
-
-    for (; *haystack != '\0'; haystack++)
-    {
-        if (*haystack == *needle)
-        {
-            const char* h = haystack;
-            const char* n = needle;
-            while (*n != '\0' && *h == *n)
-            {
-                h++;
-                n++;
-            }
-            if (*n == '\0')
-                return haystack;
-        }
-    }
-    return nullptr;
+    return asm_strstr(haystack, needle);
 }
 
 }
