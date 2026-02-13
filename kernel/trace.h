@@ -39,6 +39,9 @@ public:
 
     int GetLevel();
 
+    void SetConsoleSuppressed(bool suppressed);
+    bool IsConsoleSuppressed();
+
 private:
     Tracer();
     virtual ~Tracer();
@@ -48,6 +51,7 @@ private:
     Tracer& operator=(Tracer&& other) = delete;
 
     int Level;
+    bool ConsoleSuppressed;
 };
 
 }

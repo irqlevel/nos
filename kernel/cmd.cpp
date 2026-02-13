@@ -1093,6 +1093,8 @@ void Cmd::Run()
         }
     }
 
+    Tracer::GetInstance().SetConsoleSuppressed(true);
+
     ShowBanner(con);
 
     while (!Task::GetCurrentTask()->IsStopping())
@@ -1164,6 +1166,8 @@ void Cmd::Run()
 
         Sleep(10 * Const::NanoSecsInMs);
     }
+
+    Tracer::GetInstance().SetConsoleSuppressed(false);
 }
 
 void Cmd::RunFunc(void *ctx)
