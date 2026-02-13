@@ -1,5 +1,14 @@
 #include "stdlib.h"
 
+extern "C"
+{
+void asm_memset(void* ptr, unsigned char c, size_t size);
+void asm_memcpy(void* dst, const void* src, size_t size);
+int asm_memcmp(const void* p1, const void* p2, size_t size);
+size_t asm_strlen(const char* s);
+int asm_strcmp(const char* s1, const char* s2);
+}
+
 namespace Stdlib
 {
 
@@ -15,55 +24,22 @@ const void *MemAdd(const void *ptr, unsigned long len)
 
 void MemSet(void* ptr, unsigned char c, size_t size)
 {
-    unsigned char *p = static_cast<unsigned char *>(ptr);
-
-    for (size_t i = 0; i < size; i++)
-    {
-        *p = c;
-        p++;
-    }
+    asm_memset(ptr, c, size);
 }
 
 int MemCmp(const void* ptr1, const void* ptr2, size_t size)
 {
-    const unsigned char *p1 = static_cast<const unsigned char *>(ptr1);
-    const unsigned char *p2 = static_cast<const unsigned char *>(ptr2);
-
-    for (size_t i = 0; i < size; i++)
-    {
-        if (*p1 > *p2)
-            return 1;
-        else if (*p1 < *p2)
-            return -1;
-
-        p1++;
-        p2++;
-    }
-
-    return 0;
+    return asm_memcmp(ptr1, ptr2, size);
 }
 
 void MemCpy(void* dst, const void* src, size_t size)
 {
-    unsigned char *pdst = static_cast<unsigned char *>(dst);
-    const unsigned char *psrc = static_cast<const unsigned char *>(src);
-
-    for (size_t i = 0; i < size; i++)
-    {
-        *pdst = *psrc;
-        pdst++;
-        psrc++;
-    }
+    asm_memcpy(dst, src, size);
 }
 
 size_t StrLen(const char* s)
 {
-    size_t i = 0;
-    while (s[i] != 0)
-    {
-        i++;
-    }
-    return i;
+    return asm_strlen(s);
 }
 
 const char *TruncateFileName(const char *fileName)
@@ -275,23 +251,7 @@ int SnPrintf(char* buf, size_t size, const char* fmt, ...)
 
 int StrCmp(const char *s1, const char *s2)
 {
-    for (;;)
-    {
-        const char c1 = *s1, c2 = *s2;
-
-        if (c1 < c2)
-            return -1;
-        if (c1 > c2)
-            return 1;
-        else
-            if (c1 == '\0')
-                break;
-
-        s1++;
-        s2++;
-    }
-
-    return 0;
+    return asm_strcmp(s1, s2);
 }
 
 int StrnCmp(const char *s1, const char *s2, size_t size)

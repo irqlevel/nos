@@ -83,7 +83,8 @@ CXX_SRC =   \
 
 ASM_SRC =    \
     boot/boot64.asm \
-    kernel/asm.asm
+    kernel/asm.asm \
+    lib/stdlib_asm.asm
 
 OBJS = $(CXX_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
 DEPS = $(CXX_SRC:.cpp=.d)
