@@ -46,7 +46,8 @@ public:
     virtual ~VirtioScsi();
 
     bool Init(VirtioPci* transport, VirtQueue* reqQueue, SpinLock* ioLock,
-              u8 target, u16 lun, u64 capacity, u64 sectorSize, const char* name);
+              u8 target, u16 lun, u64 capacity, u64 sectorSize, const char* name,
+              u32 reqHdrSize, u32 respHdrSize);
 
     /* BlockDevice interface */
     virtual const char* GetName() override;
@@ -67,6 +68,7 @@ public:
 
     /* Virtio-SCSI response codes */
     static const u8 ResponseOk = 0;
+    static const u8 ResponseBadTarget = 3;
 
     /* SCSI status codes */
     static const u8 ScsiStatusGood = 0;
@@ -118,6 +120,10 @@ private:
     char DevName[8];
     bool Initialized;
 
+    /* Descriptor lengths derived from device config */
+    u32 ReqHdrSize;    /* 19 + cdb_size */
+    u32 RespHdrSize;   /* 12 + sense_size */
+
     /* DMA buffers */
     VirtioScsiCmdReq* CmdReq;
     ulong CmdReqPhys;
@@ -131,7 +137,8 @@ private:
     static const u8 BaseVector      = 0x35;
     static const ulong DmaPages     = 2;
     static const ulong DefaultSectorSize = 512;
-    static const ulong CdbLen       = 32;
+    static const ulong CdbLen       = 32;   /* Must match VirtioScsiCmdReq::Cdb[] */
+    static const ulong SenseLen     = 96;   /* Must match VirtioScsiCmdResp::Sense[] */
 
     /* Virtio-SCSI queue indices */
     static const u16 QueueControl   = 0;
@@ -145,6 +152,9 @@ private:
         VirtioPci Transport;
         VirtQueue ReqQueue;
         SpinLock Lock;        /* Serializes all I/O on this HBA */
+        u32 CdbSize;          /* Actual CDB size from device config */
+        u32 SenseSize;        /* Actual sense data size from device config */
+        u16 MaxTarget;        /* Max target number from device config */
     };
     static HbaState Hbas[MaxHbas];
     static ulong HbaCount;
