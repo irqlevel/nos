@@ -6,6 +6,7 @@
 
 #include "block_allocator.h"
 #include "va_allocator.h"
+#include "page_table.h"
 
 namespace Kernel
 {
@@ -32,6 +33,8 @@ public:
     FixedPageAllocator();
     virtual ~FixedPageAllocator();
 
+    static const size_t MaxPageCount = PageTable::MaxContiguousPages;
+
     bool Setup(ulong vaStart, ulong vaEnd, ulong pageCount);
 
     void* Alloc();
@@ -45,8 +48,6 @@ private:
     FixedPageAllocator(FixedPageAllocator&& other) = delete;
     FixedPageAllocator& operator=(const FixedPageAllocator& other) = delete;
     FixedPageAllocator& operator=(FixedPageAllocator&& other) = delete;
-
-    static const size_t MaxPageCount = 32;
 
     VaAllocator VaAlloc;
     ulong PageCount;
@@ -79,7 +80,7 @@ private:
     PageAllocatorImpl& operator=(const PageAllocatorImpl& other) = delete;
     PageAllocatorImpl& operator=(PageAllocatorImpl&& other) = delete;
 
-    static const size_t PageLogLimit = 6;
+    static const size_t PageLogLimit = Stdlib::CLog2(PageTable::MaxContiguousPages) + 1;
 
     FixedPageAllocator FixedPgAlloc[PageLogLimit];
 };
