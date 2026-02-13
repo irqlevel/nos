@@ -49,6 +49,9 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
     if (icmp->Type == TypeEchoRequest && icmp->Code == 0)
     {
         EchoReqRx.Inc();
+        Trace(0, "ICMP echo request: srcIp %p dstIp %p id %u seq %u",
+            (ulong)Ntohl(ip->SrcAddr), (ulong)Ntohl(ip->DstAddr),
+            (ulong)Ntohs(icmp->Id), (ulong)Ntohs(icmp->Seq));
         /* Build echo reply */
         ulong ipTotalLen = Ntohs(ip->TotalLen);
         if (ipTotalLen < sizeof(IpHdr) + sizeof(IcmpHdr))
@@ -95,6 +98,14 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         rIcmp->Code = 0;
         rIcmp->Checksum = 0;
         rIcmp->Checksum = Htons(IpChecksum(rIcmpRaw, icmpLen));
+
+        Trace(0, "ICMP echo reply: srcIp %p dstIp %p len %u",
+            (ulong)Ntohl(rIp->SrcAddr), (ulong)Ntohl(rIp->DstAddr), replyFrameLen);
+        Trace(0, "ICMP echo reply: dstMac %p:%p:%p:%p:%p:%p srcMac %p:%p:%p:%p:%p:%p",
+            (ulong)rEth->DstMac[0], (ulong)rEth->DstMac[1], (ulong)rEth->DstMac[2],
+            (ulong)rEth->DstMac[3], (ulong)rEth->DstMac[4], (ulong)rEth->DstMac[5],
+            (ulong)rEth->SrcMac[0], (ulong)rEth->SrcMac[1], (ulong)rEth->SrcMac[2],
+            (ulong)rEth->SrcMac[3], (ulong)rEth->SrcMac[4], (ulong)rEth->SrcMac[5]);
 
         if (dev->SendRaw(reply, replyFrameLen))
             EchoReplyTx.Inc();
