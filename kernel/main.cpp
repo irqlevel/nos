@@ -41,6 +41,8 @@
 #include <drivers/virtio_blk.h>
 #include <drivers/virtio_net.h>
 
+#include <block/partition.h>
+
 using namespace Kernel;
 using namespace Stdlib;
 using namespace Const;
@@ -261,6 +263,7 @@ void BpStartup(void* ctx)
     Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
 
     VirtioBlk::InitAll();
+    PartitionDevice::ProbeAll();
     VirtioNet::InitAll();
 
     Trace(0, "Interrupts registered");

@@ -68,4 +68,11 @@ ulong BlockDeviceTable::GetCount()
     return Count;
 }
 
+BlockDevice* BlockDeviceTable::GetDevice(ulong index)
+{
+    if (index >= Count)
+        return nullptr;
+    return Devices[index];
+}
+
 }

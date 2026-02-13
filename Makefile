@@ -41,7 +41,8 @@ CXX_SRC =   \
     kernel/idt.cpp  \
     kernel/cpu.cpp  \
     kernel/cmd.cpp  \
-    kernel/block_device.cpp \
+    block/block_device.cpp \
+    block/partition.cpp \
     net/net_device.cpp \
     net/arp.cpp \
     net/dhcp.cpp \

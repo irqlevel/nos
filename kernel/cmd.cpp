@@ -5,7 +5,8 @@
 #include "cpu.h"
 #include "time.h"
 #include "watchdog.h"
-#include "block_device.h"
+#include <block/block_device.h>
+#include <block/partition.h>
 #include "parameters.h"
 #include <net/net_device.h>
 #include <net/net.h>
@@ -117,6 +118,56 @@ static void CmdDisks(const char* args, Stdlib::Printer& con)
 {
     (void)args;
     BlockDeviceTable::GetInstance().Dump(con);
+}
+
+static void CmdPartitions(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* nameStart = Stdlib::NextToken(args, end);
+    if (!nameStart)
+    {
+        con.Printf("usage: partitions <disk>\n");
+        return;
+    }
+
+    char diskName[16];
+    Stdlib::TokenCopy(nameStart, end, diskName, sizeof(diskName));
+
+    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
+    if (!dev)
+    {
+        con.Printf("disk '%s' not found\n", diskName);
+        return;
+    }
+
+    u8 buf[512];
+    if (!dev->ReadSector(0, buf))
+    {
+        con.Printf("failed to read sector 0\n");
+        return;
+    }
+
+    auto* mbr = reinterpret_cast<Mbr*>(buf);
+    if (mbr->Signature != Mbr::ValidSignature)
+    {
+        con.Printf("no MBR partition table (signature 0x%p)\n", (ulong)mbr->Signature);
+        return;
+    }
+
+    con.Printf("  #  Type  LBA Start   LBA Size    Size\n");
+    for (ulong i = 0; i < Mbr::MaxParts; i++)
+    {
+        auto& entry = mbr->Parts[i];
+        if (entry.Type == 0 && entry.LbaSize == 0)
+            continue;
+
+        u64 sizeBytes = (u64)entry.LbaSize * dev->GetSectorSize();
+        u64 mb = sizeBytes / (1024 * 1024);
+
+        con.Printf("  %u  0x%p  %u  %u  %u MB\n",
+            i + 1, (ulong)entry.Type,
+            (ulong)entry.LbaStart, (ulong)entry.LbaSize, mb);
+    }
 }
 
 static void CmdDiskread(const char* args, Stdlib::Printer& con)
@@ -830,6 +881,7 @@ static const CmdEntry Commands[] = {
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },
     { "pci",       CmdPci,       "pci - show pci devices" },
     { "disks",     CmdDisks,     "disks - list block devices" },
+    { "partitions", CmdPartitions, "partitions <disk> - show partition table" },
     { "diskread",  CmdDiskread,  "diskread <disk> <sector> - read sector" },
     { "diskwrite", CmdDiskwrite, "diskwrite <disk> <sector> <hex> - write sector" },
     { "net",       CmdNet,       "net - list network devices" },

@@ -34,7 +34,9 @@ public:
 
     ulong GetCount();
 
-    static const ulong MaxDevices = 16;
+    BlockDevice* GetDevice(ulong index);
+
+    static const ulong MaxDevices = 48;
 
 private:
     BlockDeviceTable();
