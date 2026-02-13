@@ -8,8 +8,6 @@
 #include <kernel/panic.h>
 #include <kernel/interrupt.h>
 #include <kernel/idt.h>
-#include <mm/page_table.h>
-#include <mm/memory_map.h>
 #include <mm/new.h>
 
 namespace Kernel
@@ -141,30 +139,16 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
         name, CapacitySectors, (CapacitySectors * 512) / (1024 * 1024));
 
     /* Allocate pages for DMA buffers (request header, data, status). */
-    auto& pt = Mm::PageTable::GetInstance();
-    Mm::Page* dmaPage = pt.AllocContiguousPages(2);
-    if (!dmaPage)
+    ulong dmaPhys;
+    void* dmaPtr = Mm::AllocMapPages(2, &dmaPhys);
+    if (!dmaPtr)
     {
         Trace(0, "VirtioBlk %s: failed to alloc DMA pages", name);
         Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
-    ulong dmaPhys = dmaPage->GetPhyAddress();
-
-    /* Map the DMA pages into the virtual address space. */
-    for (ulong i = 0; i < 2; i++)
-    {
-        ulong va = dmaPage[i].GetPhyAddress() + Mm::MemoryMap::KernelSpaceBase;
-        if (!pt.MapPage(va, &dmaPage[i]))
-        {
-            Trace(0, "VirtioBlk %s: failed to map DMA page %u", name, i);
-            Transport.SetStatus(VirtioPci::StatusFailed);
-            return false;
-        }
-    }
-
-    ulong dmaVirt = dmaPhys + Mm::MemoryMap::KernelSpaceBase;
+    ulong dmaVirt = (ulong)dmaPtr;
 
     /* Layout within the 2 DMA pages:
        Offset 0:   VirtioBlkReq header (16 bytes)

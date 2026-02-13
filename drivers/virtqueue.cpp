@@ -3,8 +3,7 @@
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>
-#include <mm/page_table.h>
-#include <mm/memory_map.h>
+#include <mm/new.h>
 
 namespace Kernel
 {
@@ -49,28 +48,12 @@ bool VirtQueue::Setup(u16 queueSize)
 
     Trace(0, "VirtQueue setup size %u pages %u", (ulong)queueSize, TotalPages);
 
-    auto& pt = Mm::PageTable::GetInstance();
-    Mm::Page* page = pt.AllocContiguousPages(TotalPages);
-    if (!page)
+    VirtAddr = Mm::AllocMapPages(TotalPages, &PhysAddr);
+    if (!VirtAddr)
     {
-        Trace(0, "VirtQueue: failed to alloc %u contiguous pages", TotalPages);
+        Trace(0, "VirtQueue: failed to alloc %u pages", TotalPages);
         return false;
     }
-
-    PhysAddr = page->GetPhyAddress();
-
-    /* Map the contiguous pages into the virtual address space. */
-    for (ulong i = 0; i < TotalPages; i++)
-    {
-        ulong va = page[i].GetPhyAddress() + Mm::MemoryMap::KernelSpaceBase;
-        if (!pt.MapPage(va, &page[i]))
-        {
-            Trace(0, "VirtQueue: failed to map page %u", i);
-            return false;
-        }
-    }
-
-    VirtAddr = (void*)(PhysAddr + Mm::MemoryMap::KernelSpaceBase);
 
     Trace(0, "VirtQueue phys 0x%p virt 0x%p pages %u", PhysAddr, (ulong)VirtAddr, TotalPages);
 

@@ -11,8 +11,6 @@
 #include <kernel/softirq.h>
 #include <net/arp.h>
 #include <net/icmp.h>
-#include <mm/page_table.h>
-#include <mm/memory_map.h>
 #include <mm/new.h>
 
 namespace Kernel
@@ -197,50 +195,23 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
         (ulong)MacAddr[3], (ulong)MacAddr[4], (ulong)MacAddr[5]);
 
     /* Allocate DMA pages for TX buffer (2 pages) */
-    auto& pt = Mm::PageTable::GetInstance();
-    Mm::Page* txPage = pt.AllocContiguousPages(2);
-    if (!txPage)
+    TxBuf = (u8*)Mm::AllocMapPages(2, &TxBufPhys);
+    if (!TxBuf)
     {
         Trace(0, "VirtioNet %s: failed to alloc TX DMA pages", name);
         Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
-    TxBufPhys = txPage->GetPhyAddress();
-    for (ulong i = 0; i < 2; i++)
-    {
-        ulong va = txPage[i].GetPhyAddress() + Mm::MemoryMap::KernelSpaceBase;
-        if (!pt.MapPage(va, &txPage[i]))
-        {
-            Trace(0, "VirtioNet %s: failed to map TX page %u", name, i);
-            Transport.SetStatus(VirtioPci::StatusFailed);
-            return false;
-        }
-    }
-    TxBuf = (u8*)(TxBufPhys + Mm::MemoryMap::KernelSpaceBase);
-
     /* Allocate DMA pages for RX buffers (RxBufCount * RxBufSize = 32KB = 8 pages) */
     ulong rxPages = (RxBufCount * RxBufSize + Const::PageSize - 1) / Const::PageSize;
-    Mm::Page* rxPage = pt.AllocContiguousPages(rxPages);
-    if (!rxPage)
+    RxBufs = (u8*)Mm::AllocMapPages(rxPages, &RxBufsPhys);
+    if (!RxBufs)
     {
         Trace(0, "VirtioNet %s: failed to alloc RX DMA pages", name);
         Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
-
-    RxBufsPhys = rxPage->GetPhyAddress();
-    for (ulong i = 0; i < rxPages; i++)
-    {
-        ulong va = rxPage[i].GetPhyAddress() + Mm::MemoryMap::KernelSpaceBase;
-        if (!pt.MapPage(va, &rxPage[i]))
-        {
-            Trace(0, "VirtioNet %s: failed to map RX page %u", name, i);
-            Transport.SetStatus(VirtioPci::StatusFailed);
-            return false;
-        }
-    }
-    RxBufs = (u8*)(RxBufsPhys + Mm::MemoryMap::KernelSpaceBase);
 
     /* Default IP for QEMU user-mode networking */
     MyIp = (10 << 24) | (0 << 16) | (2 << 8) | 15; /* 10.0.2.15 */

@@ -13,6 +13,14 @@ void* Alloc(size_t size, ulong tag);
 
 void Free(void* ptr);
 
+void* AllocMapPages(size_t numPages, ulong* physAddr);
+
+void UnmapFreePages(void* ptr);
+
+void* MapPages(size_t numPages, ulong* physAddrs);
+
+void UnmapPages(void* ptr, size_t numPages);
+
 template<typename T, ulong tag, class... Args>
 T* TAlloc(Args&&... args)
 {
