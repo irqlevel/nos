@@ -6,6 +6,30 @@
 namespace Kernel
 {
 
+NetDevice::NetDevice()
+{
+}
+
+Net::MacAddress NetDevice::GetMac()
+{
+    return Mac;
+}
+
+void NetDevice::SetMac(const Net::MacAddress& mac)
+{
+    Mac = mac;
+}
+
+Net::IpAddress NetDevice::GetIp()
+{
+    return Ip;
+}
+
+void NetDevice::SetIp(Net::IpAddress ip)
+{
+    Ip = ip;
+}
+
 NetDeviceTable::NetDeviceTable()
     : Count(0)
 {
@@ -25,13 +49,12 @@ bool NetDeviceTable::Register(NetDevice* dev)
     Devices[Count] = dev;
     Count++;
 
-    u8 mac[6];
-    dev->GetMac(mac);
+    Net::MacAddress mac = dev->GetMac();
 
     Trace(0, "NetDevice registered: %s mac %p:%p:%p:%p:%p:%p",
         dev->GetName(),
-        (ulong)mac[0], (ulong)mac[1], (ulong)mac[2],
-        (ulong)mac[3], (ulong)mac[4], (ulong)mac[5]);
+        (ulong)mac.Bytes[0], (ulong)mac.Bytes[1], (ulong)mac.Bytes[2],
+        (ulong)mac.Bytes[3], (ulong)mac.Bytes[4], (ulong)mac.Bytes[5]);
 
     return true;
 }
@@ -59,17 +82,18 @@ void NetDeviceTable::Dump(Stdlib::Printer& printer)
         if (!Devices[i])
             continue;
 
-        u8 mac[6];
-        Devices[i]->GetMac(mac);
+        Net::MacAddress mac = Devices[i]->GetMac();
+        Net::IpAddress ip = Devices[i]->GetIp();
 
         NetStats st;
         Stdlib::MemSet(&st, 0, sizeof(st));
         Devices[i]->GetStats(st);
 
-        printer.Printf("%s  %p:%p:%p:%p:%p:%p  tx:%u rx:%u drop:%u\n",
-            Devices[i]->GetName(),
-            (ulong)mac[0], (ulong)mac[1], (ulong)mac[2],
-            (ulong)mac[3], (ulong)mac[4], (ulong)mac[5],
+        printer.Printf("%s  ", Devices[i]->GetName());
+        mac.Print(printer);
+        printer.Printf("  ip:");
+        ip.Print(printer);
+        printer.Printf("  tx:%u rx:%u drop:%u\n",
             st.TxTotal, st.RxTotal, st.RxDrop);
         printer.Printf("  rx  icmp:%u udp:%u tcp:%u arp:%u other:%u\n",
             st.RxIcmp, st.RxUdp, st.RxTcp, st.RxArp, st.RxOther);

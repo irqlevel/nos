@@ -12,6 +12,8 @@ namespace Kernel
 
 using Net::EthHdr;
 using Net::ArpPacket;
+using Net::MacAddress;
+using Net::IpAddress;
 using Net::Htons;
 using Net::Htonl;
 using Net::Ntohs;
@@ -27,21 +29,21 @@ ArpTable::~ArpTable()
 {
 }
 
-bool ArpTable::Lookup(u32 ip, u8 mac[6])
+bool ArpTable::Lookup(IpAddress ip, MacAddress& mac)
 {
     Stdlib::AutoLock lock(Lock);
     for (ulong i = 0; i < CacheSize; i++)
     {
         if (Cache[i].Valid && Cache[i].Ip == ip)
         {
-            Stdlib::MemCpy(mac, Cache[i].Mac, 6);
+            mac = Cache[i].Mac;
             return true;
         }
     }
     return false;
 }
 
-void ArpTable::Insert(u32 ip, const u8 mac[6])
+void ArpTable::Insert(IpAddress ip, const MacAddress& mac)
 {
     Stdlib::AutoLock lock(Lock);
 
@@ -50,7 +52,7 @@ void ArpTable::Insert(u32 ip, const u8 mac[6])
     {
         if (Cache[i].Valid && Cache[i].Ip == ip)
         {
-            Stdlib::MemCpy(Cache[i].Mac, mac, 6);
+            Cache[i].Mac = mac;
             return;
         }
     }
@@ -61,7 +63,7 @@ void ArpTable::Insert(u32 ip, const u8 mac[6])
         if (!Cache[i].Valid)
         {
             Cache[i].Ip = ip;
-            Stdlib::MemCpy(Cache[i].Mac, mac, 6);
+            Cache[i].Mac = mac;
             Cache[i].Valid = true;
             return;
         }
@@ -69,7 +71,7 @@ void ArpTable::Insert(u32 ip, const u8 mac[6])
 
     /* Cache full, overwrite first entry */
     Cache[0].Ip = ip;
-    Stdlib::MemCpy(Cache[0].Mac, mac, 6);
+    Cache[0].Mac = mac;
     Cache[0].Valid = true;
 }
 
@@ -85,15 +87,15 @@ void ArpTable::Process(NetDevice* dev, const u8* frame, ulong len)
 
     if (opcode == 1) /* ARP Request */
     {
-        if (Ntohl(arp->TargetIp) == dev->GetIp())
+        if (IpAddress::FromNetwork(arp->TargetIp) == dev->GetIp())
             needReply = true;
 
         /* Learn the sender's MAC (Insert acquires lock internally) */
-        Insert(Ntohl(arp->SenderIp), arp->SenderMac);
+        Insert(IpAddress::FromNetwork(arp->SenderIp), MacAddress(arp->SenderMac));
     }
     else if (opcode == 2) /* ARP Reply */
     {
-        Insert(Ntohl(arp->SenderIp), arp->SenderMac);
+        Insert(IpAddress::FromNetwork(arp->SenderIp), MacAddress(arp->SenderMac));
     }
 
     /* Send reply outside any lock */
@@ -112,7 +114,7 @@ void ArpTable::SendReply(NetDevice* dev, const u8* reqFrame)
     /* Ethernet header */
     EthHdr* eth = (EthHdr*)frame;
     Stdlib::MemCpy(eth->DstMac, reqEth->SrcMac, 6);
-    dev->GetMac(eth->SrcMac);
+    dev->GetMac().CopyTo(eth->SrcMac);
     eth->EtherType = Htons(EtherTypeArp);
 
     /* ARP reply */
@@ -122,15 +124,15 @@ void ArpTable::SendReply(NetDevice* dev, const u8* reqFrame)
     arp->HwSize = 6;
     arp->ProtoSize = 4;
     arp->Opcode = Htons(2); /* Reply */
-    dev->GetMac(arp->SenderMac);
-    arp->SenderIp = Htonl(dev->GetIp());
+    dev->GetMac().CopyTo(arp->SenderMac);
+    arp->SenderIp = dev->GetIp().ToNetwork();
     Stdlib::MemCpy(arp->TargetMac, reqArp->SenderMac, 6);
     arp->TargetIp = reqArp->SenderIp;
 
     dev->SendRaw(frame, sizeof(frame));
 }
 
-void ArpTable::SendRequest(NetDevice* dev, u32 ip)
+void ArpTable::SendRequest(NetDevice* dev, IpAddress ip)
 {
     u8 frame[sizeof(EthHdr) + sizeof(ArpPacket)];
     Stdlib::MemSet(frame, 0, sizeof(frame));
@@ -138,7 +140,7 @@ void ArpTable::SendRequest(NetDevice* dev, u32 ip)
     /* Ethernet header -- broadcast */
     EthHdr* eth = (EthHdr*)frame;
     Stdlib::MemSet(eth->DstMac, 0xFF, 6);
-    dev->GetMac(eth->SrcMac);
+    dev->GetMac().CopyTo(eth->SrcMac);
     eth->EtherType = Htons(EtherTypeArp);
 
     /* ARP request */
@@ -148,10 +150,10 @@ void ArpTable::SendRequest(NetDevice* dev, u32 ip)
     arp->HwSize = 6;
     arp->ProtoSize = 4;
     arp->Opcode = Htons(1); /* Request */
-    dev->GetMac(arp->SenderMac);
-    arp->SenderIp = Htonl(dev->GetIp());
+    dev->GetMac().CopyTo(arp->SenderMac);
+    arp->SenderIp = dev->GetIp().ToNetwork();
     Stdlib::MemSet(arp->TargetMac, 0, 6);
-    arp->TargetIp = Htonl(ip);
+    arp->TargetIp = ip.ToNetwork();
 
     dev->SendRaw(frame, sizeof(frame));
 }
@@ -166,15 +168,10 @@ void ArpTable::Dump(Stdlib::Printer& printer)
         if (!Cache[i].Valid)
             continue;
 
-        u32 ip = Cache[i].Ip;
-        const u8* m = Cache[i].Mac;
-        printer.Printf("%u.%u.%u.%u  %p:%p:%p:%p:%p:%p\n",
-            (ulong)((ip >> 24) & 0xFF),
-            (ulong)((ip >> 16) & 0xFF),
-            (ulong)((ip >> 8) & 0xFF),
-            (ulong)(ip & 0xFF),
-            (ulong)m[0], (ulong)m[1], (ulong)m[2],
-            (ulong)m[3], (ulong)m[4], (ulong)m[5]);
+        Cache[i].Ip.Print(printer);
+        printer.Printf("  ");
+        Cache[i].Mac.Print(printer);
+        printer.Printf("\n");
         any = true;
     }
 
@@ -182,7 +179,7 @@ void ArpTable::Dump(Stdlib::Printer& printer)
         printer.Printf("arp table empty\n");
 }
 
-bool ArpTable::Resolve(NetDevice* dev, u32 ip, u8 mac[6])
+bool ArpTable::Resolve(NetDevice* dev, IpAddress ip, MacAddress& mac)
 {
     /* Check cache first */
     if (Lookup(ip, mac))

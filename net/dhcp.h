@@ -2,6 +2,7 @@
 
 #include <include/types.h>
 #include <net/net_device.h>
+#include <net/net.h>
 #include <kernel/task.h>
 #include <kernel/spin_lock.h>
 
@@ -51,11 +52,11 @@ static const u8 DhcpNak      = 6;
 
 struct DhcpResult
 {
-    u32 Ip;
-    u32 Mask;
-    u32 Router;
-    u32 Dns;
-    u32 ServerIp;
+    Net::IpAddress Ip;
+    Net::IpAddress Mask;
+    Net::IpAddress Router;
+    Net::IpAddress Dns;
+    Net::IpAddress ServerIp;
     u32 LeaseTime; /* seconds */
 };
 
@@ -96,8 +97,8 @@ private:
     bool Ready;
 
     u32 Xid;
-    u32 OfferedIp;
-    u32 ServerId;
+    Net::IpAddress OfferedIp;
+    Net::IpAddress ServerId;
 
     /* RX buffer for DHCP responses */
     static const ulong RxBufMaxLen = 1500;

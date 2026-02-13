@@ -31,7 +31,6 @@ ulong VirtioNet::InstanceCount = 0;
 VirtioNet::VirtioNet()
     : RxNotifyAddr(nullptr)
     , TxNotifyAddr(nullptr)
-    , MyIp(0)
     , IntVector(-1)
     , Initialized(false)
     , NetHdrSize(sizeof(VirtioNetHdr)) /* Updated in Init() for legacy */
@@ -43,7 +42,6 @@ VirtioNet::VirtioNet()
     , RxBufsPhys(0)
 {
     DevName[0] = '\0';
-    Stdlib::MemSet(MacAddr, 0, sizeof(MacAddr));
 }
 
 VirtioNet::~VirtioNet()
@@ -184,14 +182,16 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     /* Read MAC address from device config */
     if (drvFeatures0 & FeatureMac)
     {
+        u8 macBytes[6];
         for (ulong i = 0; i < 6; i++)
-            MacAddr[i] = Transport.ReadDevCfg8(i);
+            macBytes[i] = Transport.ReadDevCfg8(i);
+        Mac = Net::MacAddress(macBytes);
     }
 
     Trace(0, "VirtioNet %s: MAC %p:%p:%p:%p:%p:%p",
         name,
-        (ulong)MacAddr[0], (ulong)MacAddr[1], (ulong)MacAddr[2],
-        (ulong)MacAddr[3], (ulong)MacAddr[4], (ulong)MacAddr[5]);
+        (ulong)Mac.Bytes[0], (ulong)Mac.Bytes[1], (ulong)Mac.Bytes[2],
+        (ulong)Mac.Bytes[3], (ulong)Mac.Bytes[4], (ulong)Mac.Bytes[5]);
 
     /* Allocate DMA pages for TX buffer (2 pages) */
     TxBuf = (u8*)Mm::AllocMapPages(2, &TxBufPhys);
@@ -213,7 +213,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     }
 
     /* Default IP for QEMU user-mode networking */
-    MyIp = (10 << 24) | (0 << 16) | (2 << 8) | 15; /* 10.0.2.15 */
+    Ip = Net::IpAddress(10, 0, 2, 15);
 
     Initialized = true;
 
@@ -444,19 +444,19 @@ bool VirtioNet::SendRaw(const void* buf, ulong len)
     return true;
 }
 
-bool VirtioNet::SendUdp(u32 dstIp, u16 dstPort, u32 srcIp, u16 srcPort,
+bool VirtioNet::SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
                          const void* data, ulong len)
 {
     if (!Initialized)
         return false;
 
     /* Resolve destination MAC via ARP */
-    u8 dstMac[6];
+    Net::MacAddress dstMac;
     if (!ArpTable::GetInstance().Resolve(this, dstIp, dstMac))
     {
-        Trace(0, "VirtioNet %s: ARP failed for 0x%p", DevName, (ulong)dstIp);
+        Trace(0, "VirtioNet %s: ARP failed for 0x%p", DevName, (ulong)dstIp.Addr4);
         /* Fall back to broadcast */
-        Stdlib::MemSet(dstMac, 0xFF, 6);
+        dstMac = Net::MacAddress::Broadcast();
     }
 
     ulong udpLen = sizeof(UdpHdr) + len;
@@ -473,8 +473,8 @@ bool VirtioNet::SendUdp(u32 dstIp, u16 dstPort, u32 srcIp, u16 srcPort,
 
     /* Ethernet header */
     EthHdr* eth = (EthHdr*)(frame + off);
-    Stdlib::MemCpy(eth->DstMac, dstMac, 6);
-    Stdlib::MemCpy(eth->SrcMac, MacAddr, 6);
+    dstMac.CopyTo(eth->DstMac);
+    Mac.CopyTo(eth->SrcMac);
     eth->EtherType = Htons(0x0800);
     off += sizeof(EthHdr);
 
@@ -488,8 +488,8 @@ bool VirtioNet::SendUdp(u32 dstIp, u16 dstPort, u32 srcIp, u16 srcPort,
     ip->Ttl = 64;
     ip->Protocol = 17; /* UDP */
     ip->Checksum = 0;
-    ip->SrcAddr = Htonl(srcIp);
-    ip->DstAddr = Htonl(dstIp);
+    ip->SrcAddr = srcIp.ToNetwork();
+    ip->DstAddr = dstIp.ToNetwork();
     ip->Checksum = Htons(IpChecksum(ip, sizeof(IpHdr)));
     off += sizeof(IpHdr);
 
@@ -516,11 +516,6 @@ bool VirtioNet::SendUdp(u32 dstIp, u16 dstPort, u32 srcIp, u16 srcPort,
 const char* VirtioNet::GetName()
 {
     return DevName;
-}
-
-void VirtioNet::GetMac(u8 mac[6])
-{
-    Stdlib::MemCpy(mac, MacAddr, 6);
 }
 
 u64 VirtioNet::GetTxPackets()
@@ -553,16 +548,6 @@ void VirtioNet::GetStats(NetStats& stats)
     stats.TxTcp = (u64)TxTcp.Get();
     stats.TxArp = (u64)TxArp.Get();
     stats.TxOther = (u64)TxOther.Get();
-}
-
-u32 VirtioNet::GetIp()
-{
-    return MyIp;
-}
-
-void VirtioNet::SetIp(u32 ip)
-{
-    MyIp = ip;
 }
 
 void VirtioNet::SetRxCallback(RxCallback cb, void* ctx)

@@ -14,6 +14,7 @@ namespace Kernel
 using Net::EthHdr;
 using Net::IpHdr;
 using Net::UdpHdr;
+using Net::IpAddress;
 using Net::Htons;
 using Net::Htonl;
 using Net::Ntohs;
@@ -26,12 +27,10 @@ DhcpClient::DhcpClient()
     , TaskPtr(nullptr)
     , Ready(false)
     , Xid(0)
-    , OfferedIp(0)
-    , ServerId(0)
     , RxBufLen(0)
     , RxBufReady(false)
 {
-    Stdlib::MemSet(&Result, 0, sizeof(Result));
+    Result.LeaseTime = 0;
 }
 
 DhcpClient::~DhcpClient()
@@ -138,13 +137,13 @@ void DhcpClient::Run()
         Ready = true;
 
         Trace(0, "DHCP: bound ip %u.%u.%u.%u mask %u.%u.%u.%u gw %u.%u.%u.%u lease %u",
-            (Result.Ip >> 24) & 0xFF, (Result.Ip >> 16) & 0xFF,
-            (Result.Ip >> 8) & 0xFF, Result.Ip & 0xFF,
-            (Result.Mask >> 24) & 0xFF, (Result.Mask >> 16) & 0xFF,
-            (Result.Mask >> 8) & 0xFF, Result.Mask & 0xFF,
-            (Result.Router >> 24) & 0xFF, (Result.Router >> 16) & 0xFF,
-            (Result.Router >> 8) & 0xFF, Result.Router & 0xFF,
-            Result.LeaseTime);
+            (ulong)((Result.Ip.Addr4 >> 24) & 0xFF), (ulong)((Result.Ip.Addr4 >> 16) & 0xFF),
+            (ulong)((Result.Ip.Addr4 >> 8) & 0xFF), (ulong)(Result.Ip.Addr4 & 0xFF),
+            (ulong)((Result.Mask.Addr4 >> 24) & 0xFF), (ulong)((Result.Mask.Addr4 >> 16) & 0xFF),
+            (ulong)((Result.Mask.Addr4 >> 8) & 0xFF), (ulong)(Result.Mask.Addr4 & 0xFF),
+            (ulong)((Result.Router.Addr4 >> 24) & 0xFF), (ulong)((Result.Router.Addr4 >> 16) & 0xFF),
+            (ulong)((Result.Router.Addr4 >> 8) & 0xFF), (ulong)(Result.Router.Addr4 & 0xFF),
+            (ulong)Result.LeaseTime);
 
         /* Sleep until T1 (half the lease time) for renewal */
         ulong t1Secs = Result.LeaseTime / 2;
@@ -276,7 +275,7 @@ ulong DhcpClient::BuildDiscover(u8* frame, ulong maxLen)
     /* Ethernet header -- broadcast */
     EthHdr* eth = (EthHdr*)(frame + off);
     Stdlib::MemSet(eth->DstMac, 0xFF, 6);
-    Dev->GetMac(eth->SrcMac);
+    Dev->GetMac().CopyTo(eth->SrcMac);
     eth->EtherType = Htons(EtherTypeIp);
     off += sizeof(EthHdr);
 
@@ -306,7 +305,7 @@ ulong DhcpClient::BuildDiscover(u8* frame, ulong maxLen)
     dhcp->HLen = 6;
     dhcp->Xid = Htonl(Xid);
     dhcp->Flags = Htons(0x8000); /* Broadcast */
-    Dev->GetMac(dhcp->CHAddr);
+    Dev->GetMac().CopyTo(dhcp->CHAddr);
     off += sizeof(DhcpPacket);
 
     /* Magic cookie */
@@ -353,7 +352,7 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
     /* Ethernet header -- broadcast */
     EthHdr* eth = (EthHdr*)(frame + off);
     Stdlib::MemSet(eth->DstMac, 0xFF, 6);
-    Dev->GetMac(eth->SrcMac);
+    Dev->GetMac().CopyTo(eth->SrcMac);
     eth->EtherType = Htons(EtherTypeIp);
     off += sizeof(EthHdr);
 
@@ -383,7 +382,7 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
     dhcp->HLen = 6;
     dhcp->Xid = Htonl(Xid);
     dhcp->Flags = Htons(0x8000);
-    Dev->GetMac(dhcp->CHAddr);
+    Dev->GetMac().CopyTo(dhcp->CHAddr);
     off += sizeof(DhcpPacket);
 
     /* Magic cookie */
@@ -402,18 +401,18 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
     /* Option 50: Requested IP */
     frame[off++] = DhcpOptRequestedIp;
     frame[off++] = 4;
-    frame[off++] = (OfferedIp >> 24) & 0xFF;
-    frame[off++] = (OfferedIp >> 16) & 0xFF;
-    frame[off++] = (OfferedIp >> 8) & 0xFF;
-    frame[off++] = OfferedIp & 0xFF;
+    frame[off++] = (u8)((OfferedIp.Addr4 >> 24) & 0xFF);
+    frame[off++] = (u8)((OfferedIp.Addr4 >> 16) & 0xFF);
+    frame[off++] = (u8)((OfferedIp.Addr4 >> 8) & 0xFF);
+    frame[off++] = (u8)(OfferedIp.Addr4 & 0xFF);
 
     /* Option 54: Server Identifier */
     frame[off++] = DhcpOptServerId;
     frame[off++] = 4;
-    frame[off++] = (ServerId >> 24) & 0xFF;
-    frame[off++] = (ServerId >> 16) & 0xFF;
-    frame[off++] = (ServerId >> 8) & 0xFF;
-    frame[off++] = ServerId & 0xFF;
+    frame[off++] = (u8)((ServerId.Addr4 >> 24) & 0xFF);
+    frame[off++] = (u8)((ServerId.Addr4 >> 16) & 0xFF);
+    frame[off++] = (u8)((ServerId.Addr4 >> 8) & 0xFF);
+    frame[off++] = (u8)(ServerId.Addr4 & 0xFF);
 
     /* End */
     frame[off++] = DhcpOptEnd;
@@ -435,16 +434,15 @@ bool DhcpClient::ParseResponse(const u8* frame, ulong len, u8 expectedType)
         return false;
 
     /* Check our MAC */
-    u8 mac[6];
-    Dev->GetMac(mac);
-    if (Stdlib::MemCmp(dhcp->CHAddr, mac, 6) != 0)
+    Net::MacAddress mac = Dev->GetMac();
+    if (Stdlib::MemCmp(dhcp->CHAddr, mac.Bytes, 6) != 0)
         return false;
 
     /* Check op = BOOTREPLY */
     if (dhcp->Op != 2)
         return false;
 
-    OfferedIp = Ntohl(dhcp->YIAddr);
+    OfferedIp = IpAddress::FromNetwork(dhcp->YIAddr);
 
     /* Parse options (after magic cookie) */
     const u8* opts = frame + hdrLen + sizeof(DhcpPacket);
@@ -463,10 +461,10 @@ bool DhcpClient::ParseResponse(const u8* frame, ulong len, u8 expectedType)
     optsLen -= 4;
 
     u8 msgType = 0;
-    u32 mask = 0;
-    u32 router = 0;
-    u32 dns = 0;
-    u32 serverId = 0;
+    IpAddress mask;
+    IpAddress router;
+    IpAddress dns;
+    IpAddress serverId;
     u32 leaseTime = 0;
 
     ulong i = 0;
@@ -495,23 +493,19 @@ bool DhcpClient::ParseResponse(const u8* frame, ulong len, u8 expectedType)
         }
         else if (optCode == DhcpOptSubnetMask && optLen >= 4)
         {
-            mask = ((u32)optData[0] << 24) | ((u32)optData[1] << 16) |
-                   ((u32)optData[2] << 8) | (u32)optData[3];
+            mask = IpAddress(optData[0], optData[1], optData[2], optData[3]);
         }
         else if (optCode == DhcpOptRouter && optLen >= 4)
         {
-            router = ((u32)optData[0] << 24) | ((u32)optData[1] << 16) |
-                     ((u32)optData[2] << 8) | (u32)optData[3];
+            router = IpAddress(optData[0], optData[1], optData[2], optData[3]);
         }
         else if (optCode == DhcpOptDns && optLen >= 4)
         {
-            dns = ((u32)optData[0] << 24) | ((u32)optData[1] << 16) |
-                  ((u32)optData[2] << 8) | (u32)optData[3];
+            dns = IpAddress(optData[0], optData[1], optData[2], optData[3]);
         }
         else if (optCode == DhcpOptServerId && optLen >= 4)
         {
-            serverId = ((u32)optData[0] << 24) | ((u32)optData[1] << 16) |
-                       ((u32)optData[2] << 8) | (u32)optData[3];
+            serverId = IpAddress(optData[0], optData[1], optData[2], optData[3]);
         }
         else if (optCode == DhcpOptLeaseTime && optLen >= 4)
         {

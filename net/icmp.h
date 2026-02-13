@@ -39,7 +39,7 @@ public:
     void Process(NetDevice* dev, const u8* frame, ulong len);
 
     /* Send an ICMP echo request to dstIp with given id and seq. */
-    bool SendEchoRequest(NetDevice* dev, u32 dstIp, u16 id, u16 seq);
+    bool SendEchoRequest(NetDevice* dev, Net::IpAddress dstIp, u16 id, u16 seq);
 
     /* Wait for a matching echo reply. Returns true and sets rttNs on success. */
     bool WaitReply(u16 id, u16 seq, ulong timeoutMs, ulong& rttNs);

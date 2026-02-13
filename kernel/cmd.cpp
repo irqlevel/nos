@@ -300,49 +300,6 @@ static void CmdIcmpstat(const char* args, Stdlib::Printer& con)
     Icmp::GetInstance().Dump(con);
 }
 
-static bool ParseIp(const char* ipBuf, u32& dstIp)
-{
-    dstIp = 0;
-    bool ipOk = true;
-    ulong octet = 0;
-    ulong shift = 24;
-    const char* p = ipBuf;
-    ulong dots = 0;
-
-    while (*p && ipOk)
-    {
-        if (*p == '.')
-        {
-            if (octet > 255) { ipOk = false; break; }
-            dstIp |= (octet << shift);
-            if (shift == 0) { ipOk = false; break; }
-            shift -= 8;
-            octet = 0;
-            dots++;
-        }
-        else if (*p >= '0' && *p <= '9')
-        {
-            octet = octet * 10 + (*p - '0');
-        }
-        else
-        {
-            ipOk = false;
-        }
-        p++;
-    }
-
-    if (ipOk && dots == 3 && octet <= 255)
-    {
-        dstIp |= (octet << shift);
-    }
-    else
-    {
-        ipOk = false;
-    }
-
-    return ipOk;
-}
-
 static void CmdUdpsend(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -384,8 +341,8 @@ static void CmdUdpsend(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    u32 dstIp = 0;
-    if (!ParseIp(ipBuf, dstIp))
+    Net::IpAddress dstIp;
+    if (!Net::IpAddress::Parse(ipBuf, dstIp))
     {
         con.Printf("invalid IP '%s'\n", ipBuf);
         return;
@@ -403,12 +360,12 @@ static void CmdUdpsend(const char* args, Stdlib::Printer& con)
     }
 
     ulong msgLen = Stdlib::StrLen(msg);
-    u32 srcIp = dev->GetIp();
+    Net::IpAddress srcIp = dev->GetIp();
 
     /* Resolve destination MAC via ARP */
-    u8 dstMac[6];
+    Net::MacAddress dstMac;
     if (!ArpTable::GetInstance().Resolve(dev, dstIp, dstMac))
-        Stdlib::MemSet(dstMac, 0xFF, 6);
+        dstMac = Net::MacAddress::Broadcast();
 
     /* Build UDP frame */
     ulong udpPayLen = sizeof(Net::UdpHdr) + msgLen;
@@ -426,8 +383,8 @@ static void CmdUdpsend(const char* args, Stdlib::Printer& con)
     ulong off = 0;
 
     Net::EthHdr* eth = (Net::EthHdr*)(frame + off);
-    Stdlib::MemCpy(eth->DstMac, dstMac, 6);
-    dev->GetMac(eth->SrcMac);
+    dstMac.CopyTo(eth->DstMac);
+    dev->GetMac().CopyTo(eth->SrcMac);
     eth->EtherType = Net::Htons(Net::EtherTypeIp);
     off += sizeof(Net::EthHdr);
 
@@ -436,8 +393,8 @@ static void CmdUdpsend(const char* args, Stdlib::Printer& con)
     ip->TotalLen = Net::Htons((u16)ipPayLen);
     ip->Ttl = 64;
     ip->Protocol = 17;
-    ip->SrcAddr = Net::Htonl(srcIp);
-    ip->DstAddr = Net::Htonl(dstIp);
+    ip->SrcAddr = srcIp.ToNetwork();
+    ip->DstAddr = dstIp.ToNetwork();
     ip->Checksum = Net::Htons(Net::IpChecksum(ip, sizeof(Net::IpHdr)));
     off += sizeof(Net::IpHdr);
 
@@ -474,8 +431,8 @@ static void CmdPing(const char* args, Stdlib::Printer& con)
     char ipBuf[16];
     Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
 
-    u32 dstIp = 0;
-    if (!ParseIp(ipBuf, dstIp))
+    Net::IpAddress dstIp;
+    if (!Net::IpAddress::Parse(ipBuf, dstIp))
     {
         con.Printf("invalid IP '%s'\n", ipBuf);
         return;
@@ -545,9 +502,9 @@ static void CmdDhcp(const char* args, Stdlib::Printer& con)
     if (GetDhcpClient().IsReady())
     {
         DhcpResult r = GetDhcpClient().GetResult();
-        con.Printf("already bound: %u.%u.%u.%u\n",
-            (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
-            (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
+        con.Printf("already bound: ");
+        r.Ip.Print(con);
+        con.Printf("\n");
         return;
     }
 
@@ -565,18 +522,10 @@ static void CmdDhcp(const char* args, Stdlib::Printer& con)
     if (GetDhcpClient().IsReady())
     {
         DhcpResult r = GetDhcpClient().GetResult();
-        con.Printf("ip:     %u.%u.%u.%u\n",
-            (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
-            (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
-        con.Printf("mask:   %u.%u.%u.%u\n",
-            (r.Mask >> 24) & 0xFF, (r.Mask >> 16) & 0xFF,
-            (r.Mask >> 8) & 0xFF, r.Mask & 0xFF);
-        con.Printf("router: %u.%u.%u.%u\n",
-            (r.Router >> 24) & 0xFF, (r.Router >> 16) & 0xFF,
-            (r.Router >> 8) & 0xFF, r.Router & 0xFF);
-        con.Printf("dns:    %u.%u.%u.%u\n",
-            (r.Dns >> 24) & 0xFF, (r.Dns >> 16) & 0xFF,
-            (r.Dns >> 8) & 0xFF, r.Dns & 0xFF);
+        con.Printf("ip:     "); r.Ip.Print(con); con.Printf("\n");
+        con.Printf("mask:   "); r.Mask.Print(con); con.Printf("\n");
+        con.Printf("router: "); r.Router.Print(con); con.Printf("\n");
+        con.Printf("dns:    "); r.Dns.Print(con); con.Printf("\n");
         con.Printf("lease:  %u seconds\n", r.LeaseTime);
     }
     else
@@ -1088,9 +1037,9 @@ void Cmd::Run()
                 if (GetDhcpClient().IsReady())
                 {
                     DhcpResult r = GetDhcpClient().GetResult();
-                    con.Printf("ip: %u.%u.%u.%u\n",
-                        (r.Ip >> 24) & 0xFF, (r.Ip >> 16) & 0xFF,
-                        (r.Ip >> 8) & 0xFF, r.Ip & 0xFF);
+                    con.Printf("ip: ");
+                    r.Ip.Print(con);
+                    con.Printf("\n");
                 }
                 else
                 {

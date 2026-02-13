@@ -2,6 +2,7 @@
 
 #include <include/types.h>
 #include <lib/printer.h>
+#include <net/net.h>
 
 namespace Kernel
 {
@@ -26,20 +27,26 @@ struct NetStats
 class NetDevice
 {
 public:
+    NetDevice();
     virtual ~NetDevice() {}
     virtual const char* GetName() = 0;
-    virtual void GetMac(u8 mac[6]) = 0;
     virtual bool SendRaw(const void* buf, ulong len) = 0;
     virtual u64 GetTxPackets() = 0;
     virtual u64 GetRxPackets() = 0;
     virtual u64 GetRxDropped() = 0;
     virtual void GetStats(NetStats& stats) { (void)stats; }
 
-    virtual u32 GetIp() { return 0; }
-    virtual void SetIp(u32 ip) { (void)ip; }
+    Net::MacAddress GetMac();
+    void SetMac(const Net::MacAddress& mac);
+    Net::IpAddress GetIp();
+    void SetIp(Net::IpAddress ip);
 
     typedef void (*RxCallback)(const u8* frame, ulong len, void* ctx);
     virtual void SetRxCallback(RxCallback cb, void* ctx) { (void)cb; (void)ctx; }
+
+protected:
+    Net::MacAddress Mac;
+    Net::IpAddress Ip;
 };
 
 class NetDeviceTable
