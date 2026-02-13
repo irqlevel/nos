@@ -2,7 +2,7 @@
 
 #include <include/types.h>
 #include <kernel/interrupt.h>
-#include <kernel/block_device.h>
+#include <block/block_device.h>
 #include <kernel/spin_lock.h>
 #include <kernel/atomic.h>
 #include <kernel/asm.h>

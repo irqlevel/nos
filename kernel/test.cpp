@@ -4,7 +4,7 @@
 #include "sched.h"
 #include "cpu.h"
 #include "stack_trace.h"
-#include "block_device.h"
+#include <block/block_device.h>
 
 #include <lib/btree.h>
 #include <lib/error.h>
