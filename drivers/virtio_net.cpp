@@ -279,6 +279,7 @@ void VirtioNet::DrainRx()
 
                 if (etherType == Net::EtherTypeArp)
                 {
+                    RxArp.Inc();
                     ArpTable::GetInstance().Process(this, frame, frameLen);
                 }
                 else if (etherType == Net::EtherTypeIp)
@@ -289,10 +290,18 @@ void VirtioNet::DrainRx()
 
                         if (ip->Protocol == 1) /* ICMP */
                         {
+                            RxIcmp.Inc();
                             Icmp::GetInstance().Process(this, frame, frameLen);
+                        }
+                        else if (ip->Protocol == 6) /* TCP */
+                        {
+                            RxTcp.Inc();
+                            RxDropCount.Inc();
                         }
                         else if (ip->Protocol == 17) /* UDP */
                         {
+                            RxUdp.Inc();
+
                             /* Snapshot callback pointer under lock */
                             RxCallback cb;
                             void* cbCtx;
@@ -321,16 +330,19 @@ void VirtioNet::DrainRx()
                         }
                         else
                         {
+                            RxOther.Inc();
                             RxDropCount.Inc();
                         }
                     }
                     else
                     {
+                        RxOther.Inc();
                         RxDropCount.Inc();
                     }
                 }
                 else
                 {
+                    RxOther.Inc();
                     RxDropCount.Inc();
                 }
             }
@@ -405,6 +417,30 @@ bool VirtioNet::SendRaw(const void* buf, ulong len)
     }
 
     TxPktCount.Inc();
+
+    /* Classify TX packet by protocol */
+    if (len >= sizeof(EthHdr))
+    {
+        const EthHdr* eth = (const EthHdr*)buf;
+        u16 etherType = Ntohs(eth->EtherType);
+        if (etherType == Net::EtherTypeArp)
+        {
+            TxArp.Inc();
+        }
+        else if (etherType == Net::EtherTypeIp && len >= sizeof(EthHdr) + sizeof(IpHdr))
+        {
+            const IpHdr* ip = (const IpHdr*)((const u8*)buf + sizeof(EthHdr));
+            if (ip->Protocol == 1) TxIcmp.Inc();
+            else if (ip->Protocol == 6) TxTcp.Inc();
+            else if (ip->Protocol == 17) TxUdp.Inc();
+            else TxOther.Inc();
+        }
+        else
+        {
+            TxOther.Inc();
+        }
+    }
+
     return true;
 }
 
@@ -500,6 +536,23 @@ u64 VirtioNet::GetRxPackets()
 u64 VirtioNet::GetRxDropped()
 {
     return (u64)RxDropCount.Get();
+}
+
+void VirtioNet::GetStats(NetStats& stats)
+{
+    stats.TxTotal = (u64)TxPktCount.Get();
+    stats.RxTotal = (u64)RxPktCount.Get();
+    stats.RxDrop = (u64)RxDropCount.Get();
+    stats.RxIcmp = (u64)RxIcmp.Get();
+    stats.RxUdp = (u64)RxUdp.Get();
+    stats.RxTcp = (u64)RxTcp.Get();
+    stats.RxArp = (u64)RxArp.Get();
+    stats.RxOther = (u64)RxOther.Get();
+    stats.TxIcmp = (u64)TxIcmp.Get();
+    stats.TxUdp = (u64)TxUdp.Get();
+    stats.TxTcp = (u64)TxTcp.Get();
+    stats.TxArp = (u64)TxArp.Get();
+    stats.TxOther = (u64)TxOther.Get();
 }
 
 u32 VirtioNet::GetIp()

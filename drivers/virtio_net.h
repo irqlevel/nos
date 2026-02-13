@@ -29,6 +29,7 @@ public:
     virtual u64 GetTxPackets() override;
     virtual u64 GetRxPackets() override;
     virtual u64 GetRxDropped() override;
+    virtual void GetStats(NetStats& stats) override;
     virtual u32 GetIp() override;
     virtual void SetIp(u32 ip) override;
     virtual void SetRxCallback(RxCallback cb, void* ctx) override;
@@ -108,6 +109,17 @@ private:
     Atomic TxPktCount;
     Atomic RxPktCount;
     Atomic RxDropCount;
+
+    Atomic RxIcmp;
+    Atomic RxUdp;
+    Atomic RxTcp;
+    Atomic RxArp;
+    Atomic RxOther;
+    Atomic TxIcmp;
+    Atomic TxUdp;
+    Atomic TxTcp;
+    Atomic TxArp;
+    Atomic TxOther;
 
     RxCallback RxCb;
     void* RxCbCtx;
