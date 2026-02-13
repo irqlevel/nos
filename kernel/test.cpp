@@ -1307,6 +1307,122 @@ Stdlib::Error TestStrCmp()
     return MakeSuccess();
 }
 
+Stdlib::Error TestStrStr()
+{
+    Trace(0, "TestStrStr: started");
+
+    /* Empty needle always matches at start */
+    if (Stdlib::StrStr("hello", "") != (const char*)"hello")
+    {
+        /* StrStr returns haystack pointer for empty needle */
+        const char* h = "hello";
+        if (Stdlib::StrStr(h, "") != h)
+        {
+            Trace(0, "TestStrStr: empty needle failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Match at beginning */
+    {
+        const char* h = "abcdef";
+        const char* r = Stdlib::StrStr(h, "abc");
+        if (r != h)
+        {
+            Trace(0, "TestStrStr: match at start failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Match in middle */
+    {
+        const char* h = "hello world";
+        const char* r = Stdlib::StrStr(h, "world");
+        if (r != h + 6)
+        {
+            Trace(0, "TestStrStr: match in middle failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Match at end */
+    {
+        const char* h = "abcxyz";
+        const char* r = Stdlib::StrStr(h, "xyz");
+        if (r != h + 3)
+        {
+            Trace(0, "TestStrStr: match at end failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* No match */
+    {
+        if (Stdlib::StrStr("abcdef", "xyz") != nullptr)
+        {
+            Trace(0, "TestStrStr: no match returned non-null");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Partial match then fail */
+    {
+        if (Stdlib::StrStr("abcabd", "abd") != (const char*)"abcabd" + 3)
+        {
+            const char* h = "abcabd";
+            const char* r = Stdlib::StrStr(h, "abd");
+            if (r != h + 3)
+            {
+                Trace(0, "TestStrStr: partial match failed");
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+    }
+
+    /* Needle longer than haystack */
+    {
+        if (Stdlib::StrStr("ab", "abcdef") != nullptr)
+        {
+            Trace(0, "TestStrStr: needle longer returned non-null");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Both empty */
+    {
+        const char* h = "";
+        if (Stdlib::StrStr(h, "") != h)
+        {
+            Trace(0, "TestStrStr: both empty failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Single char match */
+    {
+        const char* h = "abcdef";
+        const char* r = Stdlib::StrStr(h, "d");
+        if (r != h + 3)
+        {
+            Trace(0, "TestStrStr: single char match failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Exact match */
+    {
+        const char* h = "exact";
+        if (Stdlib::StrStr(h, "exact") != h)
+        {
+            Trace(0, "TestStrStr: exact match failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    Trace(0, "TestStrStr: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
@@ -1374,6 +1490,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestStrCmp();
+    if (!err.Ok())
+        return err;
+
+    err = TestStrStr();
     if (!err.Ok())
         return err;
 

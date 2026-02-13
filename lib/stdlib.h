@@ -326,4 +326,6 @@ const char* NextToken(const char* s, const char*& end);
 
 ulong TokenCopy(const char* start, const char* end, char* dst, ulong dstSize);
 
+const char* StrStr(const char* haystack, const char* needle);
+
 }

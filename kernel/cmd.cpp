@@ -77,8 +77,25 @@ static void CmdCpu(const char* args, Stdlib::Printer& con)
 
 static void CmdDmesg(const char* args, Stdlib::Printer& con)
 {
-    (void)args;
-    Dmesg::GetInstance().Dump(con);
+    const char* end;
+    const char* filterStart = Stdlib::NextToken(args, end);
+
+    if (!filterStart)
+    {
+        Dmesg::GetInstance().Dump(con);
+        return;
+    }
+
+    char filter[64];
+    Stdlib::TokenCopy(filterStart, end, filter, sizeof(filter));
+
+    for (DmesgMsg* msg = Dmesg::GetInstance().Next(nullptr);
+         msg != nullptr;
+         msg = Dmesg::GetInstance().Next(msg))
+    {
+        if (Stdlib::StrStr(msg->Str, filter))
+            con.PrintString(msg->Str);
+    }
 }
 
 static void CmdUptime(const char* args, Stdlib::Printer& con)
@@ -874,7 +891,7 @@ static void CmdHelp(const char* args, Stdlib::Printer& con);
 static const CmdEntry Commands[] = {
     { "cls",       CmdCls,       "cls - clear screen" },
     { "cpu",       CmdCpu,       "cpu - dump cpu state" },
-    { "dmesg",     CmdDmesg,     "dmesg - dump kernel log" },
+    { "dmesg",     CmdDmesg,     "dmesg [filter] - dump kernel log" },
     { "uptime",    CmdUptime,    "uptime - show uptime" },
     { "ps",        CmdPs,        "ps - show tasks" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
