@@ -41,6 +41,7 @@
 #include <drivers/virtio_blk.h>
 #include <drivers/virtio_scsi.h>
 #include <drivers/virtio_net.h>
+#include <drivers/virtio_rng.h>
 
 #include <block/partition.h>
 
@@ -267,6 +268,7 @@ void BpStartup(void* ctx)
     VirtioScsi::InitAll();
     PartitionDevice::ProbeAll();
     VirtioNet::InitAll();
+    VirtioRng::InitAll();
 
     Trace(0, "Interrupts registered");
 
