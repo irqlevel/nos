@@ -35,7 +35,10 @@ Icmp::~Icmp()
 void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
 {
     if (len < sizeof(EthHdr) + sizeof(IpHdr) + sizeof(IcmpHdr))
+    {
+        RxTooShort.Inc();
         return;
+    }
 
     const EthHdr* eth = (const EthHdr*)frame;
     const IpHdr* ip = (const IpHdr*)(frame + sizeof(EthHdr));
@@ -43,6 +46,7 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
 
     if (icmp->Type == TypeEchoRequest && icmp->Code == 0)
     {
+        EchoReqRx.Inc();
         /* Build echo reply */
         ulong ipTotalLen = Ntohs(ip->TotalLen);
         if (ipTotalLen < sizeof(IpHdr) + sizeof(IcmpHdr))
@@ -90,16 +94,24 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         rIcmp->Checksum = 0;
         rIcmp->Checksum = Htons(IpChecksum(rIcmpRaw, icmpLen));
 
-        dev->SendRaw(reply, replyFrameLen);
+        if (dev->SendRaw(reply, replyFrameLen))
+            EchoReplyTx.Inc();
+        else
+            EchoReplyTxFail.Inc();
     }
     else if (icmp->Type == TypeEchoReply && icmp->Code == 0)
     {
+        EchoReplyRx.Inc();
         /* Store reply for WaitReply() */
         Stdlib::AutoLock lock(Lock);
         Reply.Valid = true;
         Reply.Id = Ntohs(icmp->Id);
         Reply.Seq = Ntohs(icmp->Seq);
         Reply.Timestamp = GetBootTime();
+    }
+    else
+    {
+        RxOther.Inc();
     }
 }
 
@@ -164,7 +176,10 @@ bool Icmp::SendEchoRequest(NetDevice* dev, u32 dstIp, u16 id, u16 seq)
         SendTime = GetBootTime();
     }
 
-    return dev->SendRaw(frame, frameLen);
+    bool ok = dev->SendRaw(frame, frameLen);
+    if (ok)
+        EchoReqTx.Inc();
+    return ok;
 }
 
 bool Icmp::WaitReply(u16 id, u16 seq, ulong timeoutMs, ulong& rttNs)
@@ -188,6 +203,16 @@ bool Icmp::WaitReply(u16 id, u16 seq, ulong timeoutMs, ulong& rttNs)
     }
 
     return false;
+}
+
+void Icmp::Dump(Stdlib::Printer& printer)
+{
+    printer.Printf("echo request  rx:%u tx:%u\n",
+        EchoReqRx.Get(), EchoReqTx.Get());
+    printer.Printf("echo reply    rx:%u tx:%u tx-fail:%u\n",
+        EchoReplyRx.Get(), EchoReplyTx.Get(), EchoReplyTxFail.Get());
+    printer.Printf("other         rx:%u short:%u\n",
+        RxOther.Get(), RxTooShort.Get());
 }
 
 }

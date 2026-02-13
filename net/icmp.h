@@ -3,7 +3,9 @@
 #include <include/types.h>
 #include <net/net_device.h>
 #include <kernel/spin_lock.h>
+#include <kernel/atomic.h>
 #include <lib/stdlib.h>
+#include <lib/printer.h>
 
 namespace Kernel
 {
@@ -42,6 +44,9 @@ public:
     /* Wait for a matching echo reply. Returns true and sets rttNs on success. */
     bool WaitReply(u16 id, u16 seq, ulong timeoutMs, ulong& rttNs);
 
+    /* Dump ICMP statistics. */
+    void Dump(Stdlib::Printer& printer);
+
     static const u8 TypeEchoReply   = 0;
     static const u8 TypeEchoRequest = 8;
 
@@ -64,6 +69,14 @@ private:
     ReplySlot Reply;
     Stdlib::Time SendTime;
     SpinLock Lock;
+
+    Atomic EchoReqRx;      /* echo requests received */
+    Atomic EchoReplyTx;    /* echo replies sent */
+    Atomic EchoReplyTxFail;/* echo replies failed to send */
+    Atomic EchoReqTx;      /* echo requests sent */
+    Atomic EchoReplyRx;    /* echo replies received */
+    Atomic RxTooShort;     /* packets too short */
+    Atomic RxOther;        /* other ICMP types received */
 };
 
 }
