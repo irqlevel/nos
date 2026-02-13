@@ -7,6 +7,7 @@ global asm_memcpy
 global asm_memcmp
 global asm_strlen
 global asm_strcmp
+global asm_strstr
 
 ; void asm_memset(void* ptr, u8 c, size_t size)
 ; rdi = ptr, sil = fill byte, rdx = size
@@ -99,4 +100,56 @@ asm_strcmp:
 	ret
 .strcmp_equal:
 	xor eax, eax
+	ret
+
+; const char* asm_strstr(const char* haystack, const char* needle)
+; rdi = haystack, rsi = needle
+; Uses first-byte scan + repe cmpsb verification
+asm_strstr:
+	cmp byte [rsi], 0
+	je .strstr_return_hay	; empty needle -> return haystack
+
+	mov r8, rsi		; r8 = needle start (preserved)
+
+	; Compute needle length
+	push rdi
+	mov rdi, rsi
+	mov rcx, -1
+	xor al, al
+	cld
+	repne scasb
+	not rcx
+	dec rcx
+	pop rdi
+
+	mov r9, rcx		; r9 = needle length
+	movzx eax, byte [r8]	; al = first char of needle
+
+.strstr_scan:
+	cmp byte [rdi], 0
+	je .strstr_not_found
+	cmp byte [rdi], al
+	je .strstr_check
+	inc rdi
+	jmp .strstr_scan
+
+.strstr_check:
+	mov r10, rdi		; save match start
+	mov rsi, r8		; rsi = needle start
+	mov rcx, r9		; rcx = needle length
+	repe cmpsb
+	je .strstr_found
+	lea rdi, [r10 + 1]	; resume after match start
+	jmp .strstr_scan
+
+.strstr_found:
+	mov rax, r10
+	ret
+
+.strstr_not_found:
+	xor eax, eax
+	ret
+
+.strstr_return_hay:
+	mov rax, rdi
 	ret
