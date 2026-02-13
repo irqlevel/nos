@@ -218,7 +218,10 @@ Stdlib::Error Acpi::ParseMADT()
             if (lapicEntry->Flags & 0x1)
             {
                 if (!CpuTable::GetInstance().InsertCpu(lapicEntry->ApicId))
-                    return MakeError(Stdlib::Error::Unsuccessful);
+                {
+                    Trace(AcpiLL, "Acpi: MADT lapic apicId %u ignored (max %u)",
+                        (ulong)lapicEntry->ApicId, (ulong)MaxCpus);
+                }
             }
             break;
         }

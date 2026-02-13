@@ -650,6 +650,11 @@ ulong PageTable::GetRoot()
     return Root;
 }
 
+void PageTable::InvalidateLocalTlb()
+{
+    SetCr3(GetCr3());
+}
+
 ulong PageTable::TmpMapAddress(ulong phyAddr)
 {
     ulong phyPage = phyAddr & ~(Const::PageSize - 1);

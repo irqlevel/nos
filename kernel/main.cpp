@@ -369,8 +369,6 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 {
     do {
 
-    ALLOC_CPU_STACK();
-
     Panicker::GetInstance();
     Watchdog::GetInstance();
 

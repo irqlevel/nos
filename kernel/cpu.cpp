@@ -9,6 +9,7 @@
 #include <drivers/lapic.h>
 #include <drivers/pit.h>
 #include <mm/new.h>
+#include <mm/page_table.h>
 
 namespace Kernel
 {
@@ -282,7 +283,7 @@ void Cpu::FlushTlbIfNeeded()
     if (TlbFlushPending.Get())
     {
         TlbFlushPending.Set(0);
-        SetCr3(GetCr3());
+        Mm::PageTable::InvalidateLocalTlb();
         CpuTable::GetInstance().TlbFlushAckCounter.Dec();
     }
 }
@@ -293,7 +294,7 @@ void CpuTable::InvalidateTlbAll()
        Waits until every remote CPU has acknowledged the flush.
        Serialized via TlbShootdownActive (spin with IRQs enabled so
        the waiting CPU can still service IPIs). */
-    SetCr3(GetCr3());
+    Mm::PageTable::InvalidateLocalTlb();
 
     while (TlbShootdownActive.Cmpxchg(1, 0) != 0)
         Pause();

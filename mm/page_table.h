@@ -171,6 +171,8 @@ public:
 
     ulong GetRoot();
 
+    static void InvalidateLocalTlb();
+
     ulong TmpMapPage(ulong phyAddr);
     ulong TmpUnmapPage(ulong virtAddr);
     ulong TmpMapAddress(ulong phyAddr);
