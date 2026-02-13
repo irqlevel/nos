@@ -151,6 +151,7 @@ PageTable::~PageTable()
 bool PageTable::GetFreePages()
 {
     auto& mmap = MemoryMap::GetInstance();
+    const ulong BuiltinMapLimit = 4UL * Const::GB;
 
     for (size_t i = 0; i < mmap.GetRegionCount(); i++)
     {
@@ -163,6 +164,8 @@ bool PageTable::GetFreePages()
             continue;
 
         ulong limit = Stdlib::RoundUp(addr + len, Const::PageSize);
+        if (limit > BuiltinMapLimit)
+            limit = BuiltinMapLimit;
         if (limit > HighestPhyAddr)
             HighestPhyAddr = limit;
 
@@ -172,13 +175,19 @@ bool PageTable::GetFreePages()
         if (memStart < Const::MB)
             memStart = Stdlib::RoundUp(Const::MB, Const::PageSize);
 
+        if (memEnd > BuiltinMapLimit)
+            memEnd = BuiltinMapLimit;
+
         Trace(0, "Phy memStart 0x%p memEnd 0x%p", memStart, memEnd);
 
         if (memStart >= memEnd)
             continue;
 
+        Trace(0, "GetFreePages: entering inner loop memStart 0x%p memEnd 0x%p", memStart, memEnd);
         for (ulong address = memStart; address < memEnd; address+= Const::PageSize)
         {
+            if (address == memStart || (TotalPagesCount % 100000) == 0)
+                Trace(0, "GetFreePages: addr 0x%p total %u", address, TotalPagesCount);
             TotalPagesCount++;
 
             if (BuiltinPageTable::GetInstance().PhysToVirt(address) >= mmap.GetKernelStart()
@@ -197,6 +206,7 @@ bool PageTable::GetFreePages()
                 *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = next;
             }
         }
+        Trace(0, "GetFreePages: inner loop done, total %u", TotalPagesCount);
     }
 
     Trace(0, "GetFreePages done, HighestPhyAddr 0x%p TotalPages %u", HighestPhyAddr, TotalPagesCount);
