@@ -294,6 +294,12 @@ static void CmdArp(const char* args, Stdlib::Printer& con)
     ArpTable::GetInstance().Dump(con);
 }
 
+static void CmdIcmpstat(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Icmp::GetInstance().Dump(con);
+}
+
 static bool ParseIp(const char* ipBuf, u32& dstIp)
 {
     dstIp = 0;
@@ -892,6 +898,7 @@ static const CmdEntry Commands[] = {
     { "diskwrite", CmdDiskwrite, "diskwrite <disk> <sector> <hex> - write sector" },
     { "net",       CmdNet,       "net - list network devices" },
     { "arp",       CmdArp,       "arp - show ARP table" },
+    { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
     { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
     { "ping",      CmdPing,      "ping <ip> - send ICMP echo" },
     { "dhcp",      CmdDhcp,      "dhcp [dev] - obtain IP via DHCP" },
