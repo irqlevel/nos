@@ -1,7 +1,7 @@
 #!/bin/bash
 cd "$(dirname "$0")/.."
 qemu-system-x86_64 \
-    -smp 2 \
+    -smp 4 \
     -m 8G \
     -drive file=nos.qcow2,format=qcow2,id=drive0,if=none \
     -device virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off \
