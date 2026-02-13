@@ -24,6 +24,7 @@ CXX_SRC =   \
     drivers/virtqueue.cpp \
     drivers/virtio_pci.cpp \
     drivers/virtio_blk.cpp \
+    drivers/virtio_scsi.cpp \
     drivers/virtio_net.cpp \
     kernel/icxxabi.cpp    \
     kernel/interrupt.cpp   \
