@@ -43,7 +43,7 @@ Build a bootable qcow2 disk image (MBR, 2 partitions):
 ./scripts/build-disk.sh
 ```
 
-This produces `nos.qcow2` (1 GB, MBR, virtio-blk compatible, suitable for KVM-based public clouds).
+This produces `nos.qcow2` (1 GB, MBR, virtio-blk compatible, suitable for KVM-based public clouds including Google Cloud Compute Engine).
 
 #### Run
 
@@ -64,6 +64,26 @@ Boot from disk image (with virtio-blk):
 
 ```sh
 ./scripts/qemu-disk.sh
+```
+
+Deploy to Google Cloud Compute Engine:
+
+```sh
+# Upload disk image to a GCS bucket
+gcloud storage cp nos.qcow2 gs://YOUR_BUCKET/nos.qcow2
+
+# Create a Compute Engine image from the disk
+gcloud compute images create nos-image \
+    --source-uri=gs://YOUR_BUCKET/nos.qcow2
+
+# Launch a VM (serial console recommended)
+gcloud compute instances create nos-vm \
+    --image=nos-image \
+    --machine-type=e2-small \
+    --metadata=serial-port-enable=true
+
+# Connect via serial console
+gcloud compute connect-to-serial-port nos-vm
 ```
 
 #### Debug
