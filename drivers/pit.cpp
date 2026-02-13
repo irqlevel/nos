@@ -52,12 +52,12 @@ void Pit::Interrupt(Context* ctx)
     {
         Stdlib::AutoLock lock(Lock);
 
-        TimeMs += TickMs;
-        TimeMsNs += TickMsNs;
+        TimeMs = TimeMs + TickMs;
+        TimeMsNs = TimeMsNs + TickMsNs;
         while (TimeMsNs >= Const::NanoSecsInMs)
         {
-            TimeMsNs -= Const::NanoSecsInMs;
-            TimeMs += 1;
+            TimeMsNs = TimeMsNs - Const::NanoSecsInMs;
+            TimeMs = TimeMs + 1;
         }
     }
 
