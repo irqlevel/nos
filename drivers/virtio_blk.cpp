@@ -1,7 +1,6 @@
 #include "virtio_blk.h"
 #include "lapic.h"
 #include "ioapic.h"
-#include "acpi.h"
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>
@@ -166,8 +165,7 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     /* Register IRQ handler.  Use vector 0x25 + instance offset. */
     u8 irq = pciDev->InterruptLine;
     u8 vector = 0x25 + (u8)InstanceCount;
-    auto& acpi = Acpi::GetInstance();
-    Interrupt::RegisterLevel(*this, acpi.GetGsiByIrq(irq), vector);
+    Interrupt::RegisterLevel(*this, irq, vector);
 
     /* Register as block device */
     BlockDeviceTable::GetInstance().Register(this);

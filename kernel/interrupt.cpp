@@ -4,6 +4,7 @@
 #include "trace.h"
 #include "asm.h"
 
+#include <drivers/acpi.h>
 #include <drivers/ioapic.h>
 #include <drivers/lapic.h>
 
@@ -25,11 +26,21 @@ void Interrupt::Register(InterruptHandler& handler, u8 irq, u8 vector)
 
 void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
 {
+    auto& acpi = Acpi::GetInstance();
+    u8 gsi = (u8)acpi.GetGsiByIrq(irq);
+
+    /* Decode ACPI MADT polarity flags for this IRQ.
+       Bits [1:0]: 00=bus default, 01=active high, 11=active low.
+       PCI bus default is active low. */
+    u16 acpiFlags = acpi.GetIrqFlags(irq);
+    u8 polarity = acpiFlags & 3;
+    bool activeHigh = (polarity == 1);
+
     /* Check if this GSI is already registered on another vector */
     for (ulong v = 0; v < MaxVectors; v++)
     {
         VectorEntry& ve = Vectors[v];
-        if (ve.HandlerCount > 0 && ve.Gsi == irq)
+        if (ve.HandlerCount > 0 && ve.Gsi == gsi)
         {
             /* GSI already registered -- chain this handler onto the existing vector */
             if (ve.HandlerCount >= MaxSharedHandlers)
@@ -52,14 +63,14 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
         }
     }
 
-    Trace(0, "Register level interrupt irq 0x%p vector 0x%p fn 0x%p",
-        (ulong)irq, (ulong)vector, handler.GetHandlerFn());
+    Trace(0, "Register level interrupt irq 0x%p gsi 0x%p vector 0x%p fn 0x%p activeHigh %u",
+        (ulong)irq, (ulong)gsi, (ulong)vector, handler.GetHandlerFn(), (ulong)activeHigh);
 
-    IoApic::GetInstance().SetIrqLevel(irq, CpuTable::GetInstance().GetCurrentCpuId(), vector);
+    IoApic::GetInstance().SetIrqLevel(gsi, CpuTable::GetInstance().GetCurrentCpuId(), vector, activeHigh);
 
     /* Record in the shared table */
     VectorEntry& ve = Vectors[vector];
-    ve.Gsi = irq;
+    ve.Gsi = gsi;
     ve.Handlers[0] = &handler;
     ve.HandlerCount = 1;
 

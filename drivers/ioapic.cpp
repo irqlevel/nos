@@ -86,7 +86,7 @@ void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)
     SetEntry(irq, data);
 }
 
-void IoApic::SetIrqLevel(u8 irq, u64 apicId, u8 vector)
+void IoApic::SetIrqLevel(u8 irq, u64 apicId, u8 vector, bool activeHigh)
 {
     u64 data = 0;
 
@@ -94,13 +94,13 @@ void IoApic::SetIrqLevel(u8 irq, u64 apicId, u8 vector)
     data |= DmFixed << DelivModeShift; // delivery mode: fixed
     data |= 0 << DestModeShift; // destination: physical
     data |= 0 << DelivStatusShift; // delivery status : relaxed
-    data |= 1 << PolarityShift; // pin polarity: active low
+    data |= (activeHigh ? 0UL : 1UL) << PolarityShift; // pin polarity
     data |= TriggerLevel << TriggerModeShift; // trigger mode: level
     data |= 0 << MaskedShift; // disable: no
     data |= apicId << DestShift; //destination id
 
-    Trace(IoApicLL, "SetIrqLevel irq 0x%p apicId 0x%p vector 0x%p data 0x%p",
-        (ulong)irq, (ulong)apicId, (ulong)vector, (ulong)data);
+    Trace(IoApicLL, "SetIrqLevel irq 0x%p apicId 0x%p vector 0x%p data 0x%p activeHigh %u",
+        (ulong)irq, (ulong)apicId, (ulong)vector, (ulong)data, (ulong)activeHigh);
 
     SetEntry(irq, data);
 }

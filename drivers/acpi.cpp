@@ -252,7 +252,7 @@ Stdlib::Error Acpi::ParseMADT()
                 (ulong)isoEntry->BusSource, (ulong)isoEntry->IrqSource, (ulong)isoEntry->GlobalSystemInterrupt,
                 (ulong)isoEntry->Flags);
 
-            if (!RegisterIrqToGsi(isoEntry->IrqSource, isoEntry->GlobalSystemInterrupt))
+            if (!RegisterIrqToGsi(isoEntry->IrqSource, isoEntry->GlobalSystemInterrupt, isoEntry->Flags))
                 return MakeError(Stdlib::Error::NoMemory);
 
             break;
@@ -311,7 +311,7 @@ void* Acpi::GetIoApicAddress()
     return IoApicAddress;
 }
 
-bool Acpi::RegisterIrqToGsi(u8 irq, u32 gsi)
+bool Acpi::RegisterIrqToGsi(u8 irq, u32 gsi, u16 flags)
 {
     if (IrqToGsiSize >= Stdlib::ArraySize(IrqToGsi))
         return false;
@@ -319,8 +319,20 @@ bool Acpi::RegisterIrqToGsi(u8 irq, u32 gsi)
     auto& entry = IrqToGsi[IrqToGsiSize];
     entry.Irq = irq;
     entry.Gsi = gsi;
+    entry.Flags = flags;
     IrqToGsiSize++;
     return true;
+}
+
+u16 Acpi::GetIrqFlags(u8 irq)
+{
+    for (size_t i = 0; i < IrqToGsiSize; i++)
+    {
+        auto& entry = IrqToGsi[i];
+        if (entry.Irq == irq)
+            return entry.Flags;
+    }
+    return 0; /* Default: conforms to bus specification */
 }
 
 u32 Acpi::GetGsiByIrq(u8 irq)

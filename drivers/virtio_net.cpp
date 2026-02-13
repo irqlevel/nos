@@ -1,7 +1,6 @@
 #include "virtio_net.h"
 #include "lapic.h"
 #include "ioapic.h"
-#include "acpi.h"
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>
@@ -224,8 +223,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     /* Register IRQ handler */
     u8 irq = pciDev->InterruptLine;
     u8 vector = 0x30 + (u8)InstanceCount;
-    auto& acpi = Acpi::GetInstance();
-    Interrupt::RegisterLevel(*this, acpi.GetGsiByIrq(irq), vector);
+    Interrupt::RegisterLevel(*this, irq, vector);
 
     /* Register as net device */
     NetDeviceTable::GetInstance().Register(this);
