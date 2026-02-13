@@ -24,18 +24,15 @@ public:
 
     /* NetDevice interface */
     virtual const char* GetName() override;
-    virtual void GetMac(u8 mac[6]) override;
     virtual bool SendRaw(const void* buf, ulong len) override;
     virtual u64 GetTxPackets() override;
     virtual u64 GetRxPackets() override;
     virtual u64 GetRxDropped() override;
     virtual void GetStats(NetStats& stats) override;
-    virtual u32 GetIp() override;
-    virtual void SetIp(u32 ip) override;
     virtual void SetRxCallback(RxCallback cb, void* ctx) override;
 
     /* Higher-level UDP send */
-    bool SendUdp(u32 dstIp, u16 dstPort, u32 srcIp, u16 srcPort,
+    bool SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
                  const void* data, ulong len);
 
     /* InterruptHandler interface */
@@ -98,8 +95,6 @@ private:
     volatile void* TxNotifyAddr;
     VirtQueue RxQueue;
     VirtQueue TxQueue;
-    u8 MacAddr[6];
-    u32 MyIp;
     SpinLock TxLock;
     int IntVector;
     bool Initialized;

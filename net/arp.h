@@ -17,11 +17,11 @@ public:
         return instance;
     }
 
-    bool Lookup(u32 ip, u8 mac[6]);
-    void Insert(u32 ip, const u8 mac[6]);
+    bool Lookup(Net::IpAddress ip, Net::MacAddress& mac);
+    void Insert(Net::IpAddress ip, const Net::MacAddress& mac);
 
     /* Resolve IP to MAC. Sends ARP request and polls for reply. */
-    bool Resolve(NetDevice* dev, u32 ip, u8 mac[6]);
+    bool Resolve(NetDevice* dev, Net::IpAddress ip, Net::MacAddress& mac);
 
     /* Process incoming ARP frame (request or reply). */
     void Process(NetDevice* dev, const u8* frame, ulong len);
@@ -37,13 +37,13 @@ private:
     ArpTable& operator=(const ArpTable& other) = delete;
     ArpTable& operator=(ArpTable&& other) = delete;
 
-    void SendRequest(NetDevice* dev, u32 ip);
+    void SendRequest(NetDevice* dev, Net::IpAddress ip);
     void SendReply(NetDevice* dev, const u8* reqFrame);
 
     struct ArpEntry
     {
-        u32 Ip;
-        u8 Mac[6];
+        Net::IpAddress Ip;
+        Net::MacAddress Mac;
         bool Valid;
     };
 

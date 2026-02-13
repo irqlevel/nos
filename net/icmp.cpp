@@ -14,6 +14,8 @@ namespace Kernel
 using Net::EthHdr;
 using Net::IpHdr;
 using Net::IcmpHdr;
+using Net::MacAddress;
+using Net::IpAddress;
 using Net::Htons;
 using Net::Htonl;
 using Net::Ntohs;
@@ -66,7 +68,7 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         /* Ethernet header -- swap src/dst */
         EthHdr* rEth = (EthHdr*)reply;
         Stdlib::MemCpy(rEth->DstMac, eth->SrcMac, 6);
-        dev->GetMac(rEth->SrcMac);
+        dev->GetMac().CopyTo(rEth->SrcMac);
         rEth->EtherType = Htons(EtherTypeIp);
 
         /* IP header -- swap src/dst, recalculate checksum */
@@ -115,13 +117,13 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
     }
 }
 
-bool Icmp::SendEchoRequest(NetDevice* dev, u32 dstIp, u16 id, u16 seq)
+bool Icmp::SendEchoRequest(NetDevice* dev, IpAddress dstIp, u16 id, u16 seq)
 {
     /* Resolve destination MAC via ARP */
-    u8 dstMac[6];
+    MacAddress dstMac;
     if (!ArpTable::GetInstance().Resolve(dev, dstIp, dstMac))
     {
-        Stdlib::MemSet(dstMac, 0xFF, 6);
+        dstMac = MacAddress::Broadcast();
     }
 
     static const ulong PayloadSize = 32;
@@ -136,8 +138,8 @@ bool Icmp::SendEchoRequest(NetDevice* dev, u32 dstIp, u16 id, u16 seq)
 
     /* Ethernet header */
     EthHdr* eth = (EthHdr*)(frame + off);
-    Stdlib::MemCpy(eth->DstMac, dstMac, 6);
-    dev->GetMac(eth->SrcMac);
+    dstMac.CopyTo(eth->DstMac);
+    dev->GetMac().CopyTo(eth->SrcMac);
     eth->EtherType = Htons(EtherTypeIp);
     off += sizeof(EthHdr);
 
@@ -147,8 +149,8 @@ bool Icmp::SendEchoRequest(NetDevice* dev, u32 dstIp, u16 id, u16 seq)
     ip->TotalLen = Htons((u16)ipLen);
     ip->Ttl = 64;
     ip->Protocol = 1; /* ICMP */
-    ip->SrcAddr = Htonl(dev->GetIp());
-    ip->DstAddr = Htonl(dstIp);
+    ip->SrcAddr = dev->GetIp().ToNetwork();
+    ip->DstAddr = dstIp.ToNetwork();
     ip->Checksum = Htons(IpChecksum(ip, sizeof(IpHdr)));
     off += sizeof(IpHdr);
 
