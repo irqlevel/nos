@@ -26,6 +26,7 @@ CXX_SRC =   \
     drivers/virtio_blk.cpp \
     drivers/virtio_scsi.cpp \
     drivers/virtio_net.cpp \
+    drivers/virtio_rng.cpp \
     kernel/icxxabi.cpp    \
     kernel/interrupt.cpp   \
     kernel/task.cpp \
@@ -65,6 +66,7 @@ CXX_SRC =   \
     kernel/parameters.cpp \
     kernel/raw_spin_lock.cpp \
     kernel/stack_trace.cpp \
+    kernel/entropy.cpp \
     lib/stdlib.cpp  \
     lib/bitmap.cpp \
     lib/checksum.cpp \

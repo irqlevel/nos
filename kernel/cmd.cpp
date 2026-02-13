@@ -16,6 +16,7 @@
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
 #include <fs/nanofs.h>
+#include "entropy.h"
 #include "console.h"
 
 #include <drivers/vga.h>
@@ -829,6 +830,44 @@ static void CmdVersion(const char* args, Stdlib::Printer& con)
     con.Printf("nos %s\n", KERNEL_VERSION);
 }
 
+static void CmdRandom(const char* args, Stdlib::Printer& con)
+{
+    ulong len = 16;
+    if (args[0] != '\0')
+    {
+        if (!Stdlib::ParseUlong(args, len) || len == 0 || len > 1024)
+        {
+            con.Printf("usage: random [len] (1..1024, default 16)\n");
+            return;
+        }
+    }
+
+    EntropySource* src = EntropySourceTable::GetInstance().GetDefault();
+    if (!src)
+    {
+        con.Printf("no entropy source\n");
+        return;
+    }
+
+    u8 buf[1024];
+    if (!src->GetRandom(buf, len))
+    {
+        con.Printf("failed to get random bytes\n");
+        return;
+    }
+
+    static const char hex[] = "0123456789abcdef";
+    for (ulong i = 0; i < len; i++)
+    {
+        char s[3];
+        s[0] = hex[(buf[i] >> 4) & 0xF];
+        s[1] = hex[buf[i] & 0xF];
+        s[2] = '\0';
+        con.PrintString(s);
+    }
+    con.Printf("\n");
+}
+
 // Forward declaration - CmdHelp needs the Commands array defined below
 static void CmdHelp(const char* args, Stdlib::Printer& con);
 
@@ -861,6 +900,7 @@ static const CmdEntry Commands[] = {
     { "mkdir",     CmdMkdir,     "mkdir <path> - create directory" },
     { "touch",     CmdTouch,     "touch <path> - create empty file" },
     { "del",       CmdDel,       "del <path> - remove file or directory" },
+    { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
     { "version",   CmdVersion,   "version - show kernel version" },
     { "poweroff",  CmdPoweroff,  "poweroff - power off (ACPI S5)" },
     { "shutdown",  CmdPoweroff,  nullptr },

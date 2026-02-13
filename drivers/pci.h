@@ -103,6 +103,7 @@ public:
     static const u16 DevVirtioSocket = 0x1053;
     static const u16 DevVirtioNetModern = 0x1041;
     static const u16 DevVirtioBlkModern = 0x1042;
+    static const u16 DevVirtioRngModern = 0x1044;
     static const u16 DevVirtioScsiModern = 0x1048;
     static const u16 DevRedHatPcieBridge = 0x000E;
 

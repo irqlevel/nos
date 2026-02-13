@@ -10,4 +10,5 @@ qemu-system-x86_64 \
     -device virtio-scsi-pci,id=scsi,disable-legacy=off,disable-modern=on \
     -device scsi-hd,drive=scsi0,bus=scsi.0,channel=0,scsi-id=0,lun=0 \
     -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off -netdev user,id=net0 \
+    -device virtio-rng-pci \
     -s -nographic
