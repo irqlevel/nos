@@ -10,6 +10,7 @@ namespace Kernel
 
 Tracer::Tracer()
     : Level(0)
+    , ConsoleSuppressed(false)
 {
 }
 
@@ -21,6 +22,16 @@ void Tracer::SetLevel(int level)
 int Tracer::GetLevel()
 {
     return Level;
+}
+
+void Tracer::SetConsoleSuppressed(bool suppressed)
+{
+    ConsoleSuppressed = suppressed;
+}
+
+bool Tracer::IsConsoleSuppressed()
+{
+    return ConsoleSuppressed;
 }
 
 Tracer::~Tracer()
@@ -39,14 +50,17 @@ void Tracer::Output(const char *fmt, ...)
     if (size < 0)
         return;
 
-    Serial::GetInstance().PrintString(msg);
-    Serial::GetInstance().Flush();
-
     Dmesg::GetInstance().PrintString(msg);
 
-    if (Parameters::GetInstance().IsTraceVga())
+    if (!ConsoleSuppressed)
     {
-        VgaTerm::GetInstance().PrintString(msg);
+        Serial::GetInstance().PrintString(msg);
+        Serial::GetInstance().Flush();
+
+        if (Parameters::GetInstance().IsTraceVga())
+        {
+            VgaTerm::GetInstance().PrintString(msg);
+        }
     }
 }
 

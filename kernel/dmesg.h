@@ -56,7 +56,7 @@ private:
     Dmesg& operator=(const Dmesg& other) = delete;
     Dmesg& operator=(Dmesg&& other) = delete;
 
-    char Buf[32 * Const::PageSize]  __attribute__((aligned(sizeof(DmesgMsg))));
+    char Buf[128 * Const::PageSize]  __attribute__((aligned(sizeof(DmesgMsg))));
 
     Mm::BlockAllocatorImpl MsgBuf;
 
