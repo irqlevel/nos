@@ -39,6 +39,7 @@
 #include <drivers/ioapic.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_blk.h>
+#include <drivers/virtio_scsi.h>
 #include <drivers/virtio_net.h>
 
 #include <block/partition.h>
@@ -263,6 +264,7 @@ void BpStartup(void* ctx)
     Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
 
     VirtioBlk::InitAll();
+    VirtioScsi::InitAll();
     PartitionDevice::ProbeAll();
     VirtioNet::InitAll();
 
