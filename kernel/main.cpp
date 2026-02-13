@@ -129,7 +129,26 @@ extern "C" void ApMain()
     ApMain2();
 }
 
-void PrepareHalt()
+typedef void (*HaltAction)();
+
+/* Runs entirely on the static stack with its own stack frame.
+   Releases the idle task, runs static destructors, then
+   performs the final halt/reboot action. Never returns. */
+static void __attribute__((noinline, noreturn))
+FinalizeOnStaticStack(Task* task, HaltAction action)
+{
+    task->Put();
+
+    __cxa_finalize(0);
+
+    Trace(0, "Finalized");
+
+    action();
+
+    while (1) Hlt();
+}
+
+static void PrepareHalt(HaltAction action)
 {
     PreemptDisable();
 
@@ -141,28 +160,30 @@ void PrepareHalt()
 
     PreemptOff();
 
-    CpuTable::GetInstance().Reset();
-    Dmesg::GetInstance().Reset();
-
-    /* Prevent this idle0 task from destruction
-       because we are still running on its stack */
+    /* Hold an extra reference so CpuTable::Reset()'s Put()
+       only drops refcount 2→1 instead of freeing the task
+       while we are still running on its stack. */
     auto task = Task::GetCurrentTask();
     task->Get();
 
+    CpuTable::GetInstance().Reset();
+    Dmesg::GetInstance().Reset();
+
     InterruptDisable();
 
-    __cxa_finalize(0);
-
-    Trace(0, "Finalized");
+    /* Switch back to CPU 0's static stack so we can release
+       the idle task.  FinalizeOnStaticStack gets its own
+       stack frame on the static stack, calls task->Put()
+       (refcount 1→0, frees the idle task and its dynamic
+       stack), runs static destructors, and then performs the
+       halt action.  It never returns, so PrepareHalt's stale
+       RBP is harmless. */
+    SetRsp((long)&Stack[0][CpuStackSize - 128]);
+    FinalizeOnStaticStack(task, action);
 }
 
-void Shutdown()
+static void __attribute__((noreturn)) DoShutdown()
 {
-    auto& con = Console::GetInstance();
-    con.Printf("Shutting down!\n");
-
-    PrepareHalt();
-
     Trace(0, "ACPI shutdown");
 
     /* ACPI S5 (soft-off): write SLP_TYP | SLP_EN to PM1a_CNT.
@@ -172,16 +193,11 @@ void Shutdown()
     /* Fallback: QEMU debug exit device */
     Outb(0xf4, 0x0);
 
-    Hlt();
+    while (1) Hlt();
 }
 
-void Reboot()
+static void __attribute__((noreturn)) DoReboot()
 {
-    auto& con = Console::GetInstance();
-    con.Printf("Rebooting!\n");
-
-    PrepareHalt();
-
     Trace(0, "Reboot");
 
     /* Keyboard controller reset (pulse CPU reset line) */
@@ -190,7 +206,23 @@ void Reboot()
     /* Fallback: PCI reset register */
     Outb(0xCF9, 0x06);
 
-    Hlt();
+    while (1) Hlt();
+}
+
+void Shutdown()
+{
+    auto& con = Console::GetInstance();
+    con.Printf("Shutting down!\n");
+
+    PrepareHalt(DoShutdown);
+}
+
+void Reboot()
+{
+    auto& con = Console::GetInstance();
+    con.Printf("Rebooting!\n");
+
+    PrepareHalt(DoReboot);
 }
 
 void SomeTaskRoutine(void *ctx)
