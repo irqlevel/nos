@@ -13,6 +13,7 @@
 #include <lib/vector.h>
 #include <mm/page_table.h>
 #include <mm/memory_map.h>
+#include <mm/new.h>
 
 namespace Kernel
 {
@@ -666,6 +667,239 @@ Stdlib::Error TestContiguousPages()
     return MakeSuccess();
 }
 
+Stdlib::Error TestPageAllocator()
+{
+    Trace(0, "TestPageAllocator: started");
+
+    auto& pt = Mm::PageTable::GetInstance();
+
+    /* Test AllocMapPages / UnmapFreePages with 1 page */
+    {
+        ulong physAddr = 0;
+        void* ptr = Mm::AllocMapPages(1, &physAddr);
+        if (!ptr)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(1) failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+        if (physAddr == 0)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(1) physAddr is 0");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+
+        Stdlib::MemSet(ptr, 0xAA, Const::PageSize);
+        u8* p = (u8*)ptr;
+        for (ulong i = 0; i < Const::PageSize; i++)
+        {
+            if (p[i] != 0xAA)
+            {
+                Trace(0, "TestPageAllocator: AllocMapPages(1) mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+
+        Mm::UnmapFreePages(ptr);
+    }
+
+    /* Test AllocMapPages / UnmapFreePages with 2 pages */
+    {
+        ulong physAddr = 0;
+        void* ptr = Mm::AllocMapPages(2, &physAddr);
+        if (!ptr)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(2) failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+        if (physAddr == 0)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(2) physAddr is 0");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+
+        u8* p = (u8*)ptr;
+        Stdlib::MemSet(p, 0xBB, Const::PageSize);
+        Stdlib::MemSet(p + Const::PageSize, 0xCC, Const::PageSize);
+
+        for (ulong i = 0; i < Const::PageSize; i++)
+        {
+            if (p[i] != 0xBB)
+            {
+                Trace(0, "TestPageAllocator: AllocMapPages(2) page0 mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+        for (ulong i = 0; i < Const::PageSize; i++)
+        {
+            if (p[Const::PageSize + i] != 0xCC)
+            {
+                Trace(0, "TestPageAllocator: AllocMapPages(2) page1 mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+
+        Mm::UnmapFreePages(ptr);
+    }
+
+    /* Test MapPages / UnmapPages with pre-allocated physical pages */
+    {
+        ulong freePagesBefore = pt.GetFreePagesCount();
+
+        Mm::Page* pages = pt.AllocContiguousPages(2);
+        if (!pages)
+        {
+            Trace(0, "TestPageAllocator: AllocContiguousPages(2) failed");
+            return MakeError(Stdlib::Error::NoMemory);
+        }
+
+        ulong physAddrs[2];
+        physAddrs[0] = pages[0].GetPhyAddress();
+        physAddrs[1] = pages[1].GetPhyAddress();
+
+        void* ptr = Mm::MapPages(2, physAddrs);
+        if (!ptr)
+        {
+            Trace(0, "TestPageAllocator: MapPages(2) failed");
+            pt.FreePage(&pages[0]);
+            pt.FreePage(&pages[1]);
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+
+        /* Write via mapped VA */
+        u8* p = (u8*)ptr;
+        Stdlib::MemSet(p, 0xDD, Const::PageSize);
+        Stdlib::MemSet(p + Const::PageSize, 0xEE, Const::PageSize);
+
+        for (ulong i = 0; i < Const::PageSize; i++)
+        {
+            if (p[i] != 0xDD)
+            {
+                Trace(0, "TestPageAllocator: MapPages page0 mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+        for (ulong i = 0; i < Const::PageSize; i++)
+        {
+            if (p[Const::PageSize + i] != 0xEE)
+            {
+                Trace(0, "TestPageAllocator: MapPages page1 mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+
+        /* UnmapPages - releases VA but does NOT free physical pages */
+        Mm::UnmapPages(ptr, 2);
+
+        /* Verify physical pages still contain written data via TmpMap */
+        ulong va0 = pt.TmpMapPage(physAddrs[0]);
+        if (!va0)
+        {
+            Trace(0, "TestPageAllocator: TmpMapPage page0 after UnmapPages failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+        u8* t0 = (u8*)va0;
+        for (ulong i = 0; i < Const::PageSize; i++)
+        {
+            if (t0[i] != 0xDD)
+            {
+                Trace(0, "TestPageAllocator: post-unmap page0 mismatch at %u", i);
+                pt.TmpUnmapPage(va0);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+        pt.TmpUnmapPage(va0);
+
+        ulong va1 = pt.TmpMapPage(physAddrs[1]);
+        if (!va1)
+        {
+            Trace(0, "TestPageAllocator: TmpMapPage page1 after UnmapPages failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+        u8* t1 = (u8*)va1;
+        for (ulong i = 0; i < Const::PageSize; i++)
+        {
+            if (t1[i] != 0xEE)
+            {
+                Trace(0, "TestPageAllocator: post-unmap page1 mismatch at %u", i);
+                pt.TmpUnmapPage(va1);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+        pt.TmpUnmapPage(va1);
+
+        /* Now free the physical pages */
+        pt.FreePage(&pages[0]);
+        pt.FreePage(&pages[1]);
+
+        if (pt.GetFreePagesCount() != freePagesBefore)
+        {
+            Trace(0, "TestPageAllocator: free count mismatch: %u expected %u",
+                pt.GetFreePagesCount(), freePagesBefore);
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Repeated alloc/map/unmap/free cycles for stability */
+    {
+        for (ulong round = 0; round < 5; round++)
+        {
+            ulong physAddr = 0;
+            void* ptr = Mm::AllocMapPages(1, &physAddr);
+            if (!ptr)
+            {
+                Trace(0, "TestPageAllocator: round %u AllocMapPages failed", round);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+
+            u8* p = (u8*)ptr;
+            Stdlib::MemSet(p, (u8)(0x10 + round), Const::PageSize);
+            if (p[0] != (u8)(0x10 + round))
+            {
+                Trace(0, "TestPageAllocator: round %u pattern mismatch", round);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+
+            Mm::UnmapFreePages(ptr);
+        }
+    }
+
+    /* Repeated MapPages / UnmapPages cycles */
+    {
+        for (ulong round = 0; round < 5; round++)
+        {
+            Mm::Page* page = pt.AllocContiguousPages(1);
+            if (!page)
+            {
+                Trace(0, "TestPageAllocator: MapPages round %u alloc failed", round);
+                return MakeError(Stdlib::Error::NoMemory);
+            }
+
+            ulong pa = page->GetPhyAddress();
+            void* ptr = Mm::MapPages(1, &pa);
+            if (!ptr)
+            {
+                Trace(0, "TestPageAllocator: MapPages round %u map failed", round);
+                pt.FreePage(page);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+
+            u8* p = (u8*)ptr;
+            Stdlib::MemSet(p, (u8)(0x50 + round), Const::PageSize);
+            if (p[0] != (u8)(0x50 + round))
+            {
+                Trace(0, "TestPageAllocator: MapPages round %u pattern mismatch", round);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+
+            Mm::UnmapPages(ptr, 1);
+            pt.FreePage(page);
+        }
+    }
+
+    Trace(0, "TestPageAllocator: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
@@ -709,6 +943,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestContiguousPages();
+    if (!err.Ok())
+        return err;
+
+    err = TestPageAllocator();
     if (!err.Ok())
         return err;
 

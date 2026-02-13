@@ -20,6 +20,25 @@ void Free(void* ptr)
 	AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Free(ptr);
 }
 
+void* AllocMapPages(size_t numPages, ulong* physAddr)
+{
+	return PageAllocatorImpl::GetInstance().AllocMapPages(numPages, physAddr);
+}
+
+void UnmapFreePages(void* ptr)
+{
+	PageAllocatorImpl::GetInstance().UnmapFreePages(ptr);
+}
+
+void* MapPages(size_t numPages, ulong* physAddrs)
+{
+	return PageAllocatorImpl::GetInstance().MapPages(numPages, physAddrs);
+}
+
+void UnmapPages(void* ptr, size_t numPages)
+{
+	PageAllocatorImpl::GetInstance().UnmapPages(ptr, numPages);
+}
 
 }
 }

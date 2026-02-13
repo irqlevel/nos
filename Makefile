@@ -72,6 +72,7 @@ CXX_SRC =   \
     mm/new.cpp  \
     mm/allocator.cpp   \
     mm/page_allocator.cpp  \
+    mm/va_allocator.cpp \
     mm/pool.cpp    \
     mm/page_table.cpp \
     mm/block_allocator.cpp \

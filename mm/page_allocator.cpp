@@ -6,7 +6,6 @@
 #include <kernel/trace.h>
 #include <kernel/cpu.h>
 #include <lib/list_entry.h>
-#include <lib/bitmap.h>
 
 namespace Kernel
 {
@@ -15,12 +14,8 @@ namespace Mm
 {
 
 FixedPageAllocator::FixedPageAllocator()
-    : VaStart(0)
-    , VaEnd(0)
-    , PageCount(0)
-    , BlockCount(0)
+    : PageCount(0)
 {
-    Stdlib::MemSet(BlockBitmap, 0, sizeof(BlockBitmap));
 }
 
 FixedPageAllocator::~FixedPageAllocator()
@@ -30,101 +25,159 @@ FixedPageAllocator::~FixedPageAllocator()
 
 bool FixedPageAllocator::Setup(ulong vaStart, ulong vaEnd, ulong pageCount)
 {
-    BlockCount = Stdlib::Min((vaEnd - vaStart) / (pageCount * Const::PageSize), 8*sizeof(BlockBitmap));
-    if (!BlockCount)
-        return false;
-
-    VaStart = vaStart;
-    VaEnd = vaEnd;
     PageCount = pageCount;
-    BlockSize = pageCount * Const::PageSize;
+    ulong blockSize = pageCount * Const::PageSize;
 
-    Trace(0, "0x%p start 0x%p end 0x%p pages %u bcount %u", this, VaStart, VaEnd, PageCount, BlockCount);
-    return true;
+    Trace(0, "0x%p start 0x%p end 0x%p pages %u", this, vaStart, vaEnd, PageCount);
+    return VaAlloc.Setup(vaStart, vaEnd, blockSize);
 }
 
 void* FixedPageAllocator::Alloc()
 {
-    void* addr = nullptr;
+    auto& pt = PageTable::GetInstance();
+    BugOn(PageCount > MaxPageCount);
+    Page* pages[MaxPageCount];
+
+    for (size_t i = 0; i < PageCount; i++)
     {
-        Stdlib::AutoLock lock(Lock);
-
-        auto& pt = PageTable::GetInstance();
-        Page* pages[PageCount];
-
-        for (size_t i = 0; i < PageCount; i++)
+        pages[i] = pt.AllocPage();
+        if (pages[i] == 0)
         {
-            pages[i] = pt.AllocPage();
-            if (pages[i] == 0)
-            {
-                for (size_t j = 0; j < i; j++)
-                {
-                    pt.FreePage(pages[j]);
-                }
-                BugOn(1);
-                return nullptr;
-            }
-        }
-
-        long blockIndex = Stdlib::Bitmap(BlockBitmap, BlockCount).FindSetZeroBit();
-        if (blockIndex < 0)
-        {
-            for (size_t i = 0; i < PageCount; i++)
-            {
-                pt.FreePage(pages[i]);
-            }
+            for (size_t j = 0; j < i; j++)
+                pt.FreePage(pages[j]);
             BugOn(1);
             return nullptr;
         }
+    }
 
+    ulong va = VaAlloc.Alloc();
+    if (va == 0)
+    {
         for (size_t i = 0; i < PageCount; i++)
+            pt.FreePage(pages[i]);
+        BugOn(1);
+        return nullptr;
+    }
+
+    for (size_t i = 0; i < PageCount; i++)
+    {
+        if (!pt.MapPage(va + i * Const::PageSize, pages[i]))
         {
-            if (!pt.MapPage(VaStart + blockIndex * BlockSize + i * Const::PageSize, pages[i]))
+            for (size_t j = 0; j < i; j++)
             {
-                for (size_t j = 0; j < i; j++)
-                {
-                    Page* page = pt.UnmapPage(VaStart + blockIndex * BlockSize + j * Const::PageSize);
-                    pt.FreePage(page);
-                    page->Put();
-                }
-
-                for (size_t j = i; j < PageCount; j++)
-                {
-                    pt.FreePage(pages[j]);
-                }
-                BugOn(1);
-                return nullptr;
+                Page* page = pt.UnmapPage(va + j * Const::PageSize);
+                pt.FreePage(page);
+                page->Put();
             }
+            for (size_t j = i; j < PageCount; j++)
+                pt.FreePage(pages[j]);
+            VaAlloc.Free(va);
+            BugOn(1);
+            return nullptr;
         }
-
-        addr = (void *)(VaStart + blockIndex * BlockSize);
     }
 
     Kernel::CpuTable::GetInstance().InvalidateTlbAll();
-    return addr;
+    return (void*)va;
+}
+
+void* FixedPageAllocator::Map(Page* pages)
+{
+    ulong va = VaAlloc.Alloc();
+    if (va == 0)
+    {
+        BugOn(1);
+        return nullptr;
+    }
+
+    auto& pt = PageTable::GetInstance();
+    for (size_t i = 0; i < PageCount; i++)
+    {
+        if (!pt.MapPage(va + i * Const::PageSize, &pages[i]))
+        {
+            for (size_t j = 0; j < i; j++)
+            {
+                Page* page = pt.UnmapPage(va + j * Const::PageSize);
+                page->Put();
+            }
+            VaAlloc.Free(va);
+            BugOn(1);
+            return nullptr;
+        }
+    }
+
+    Kernel::CpuTable::GetInstance().InvalidateTlbAll();
+    return (void*)va;
+}
+
+void* FixedPageAllocator::MapPhys(ulong* physAddrs, size_t count)
+{
+    BugOn(count == 0 || count > PageCount);
+
+    ulong va = VaAlloc.Alloc();
+    if (va == 0)
+    {
+        BugOn(1);
+        return nullptr;
+    }
+
+    auto& pt = PageTable::GetInstance();
+    for (size_t i = 0; i < count; i++)
+    {
+        Page* page = pt.GetPage(physAddrs[i]);
+        if (!pt.MapPage(va + i * Const::PageSize, page))
+        {
+            page->Put(); /* Balance GetPage's Get for failed page */
+            for (size_t j = 0; j < i; j++)
+            {
+                Page* p = pt.UnmapPage(va + j * Const::PageSize);
+                p->Put(); /* Undo MapPage's Get */
+            }
+            VaAlloc.Free(va);
+            BugOn(1);
+            return nullptr;
+        }
+        page->Put(); /* Balance GetPage's Get after MapPage succeeded */
+    }
+
+    Kernel::CpuTable::GetInstance().InvalidateTlbAll();
+    return (void*)va;
+}
+
+bool FixedPageAllocator::Unmap(void* addr, size_t count)
+{
+    if (!VaAlloc.Contains((ulong)addr))
+        return false;
+
+    BugOn(count == 0 || count > PageCount);
+
+    auto& pt = PageTable::GetInstance();
+    for (size_t i = 0; i < count; i++)
+    {
+        Page* page = pt.UnmapPage((ulong)addr + i * Const::PageSize);
+        page->Put(); /* Undo MapPage's Get */
+    }
+
+    VaAlloc.Free((ulong)addr);
+
+    Kernel::CpuTable::GetInstance().InvalidateTlbAll();
+    return true;
 }
 
 bool FixedPageAllocator::Free(void* addr)
 {
+    if (!VaAlloc.Contains((ulong)addr))
+        return false;
+
+    auto& pt = PageTable::GetInstance();
+    for (size_t i = 0; i < PageCount; i++)
     {
-        Stdlib::AutoLock lock(Lock);
-
-        if ((ulong)addr < VaStart || (ulong)addr >= VaEnd)
-            return false;
-
-        BugOn(((ulong)addr % BlockSize) != 0);
-
-        ulong blockIndex = ((ulong)addr - VaStart) / BlockSize;
-        Stdlib::Bitmap(BlockBitmap, BlockCount).ClearBit(blockIndex);
-
-        auto& pt = PageTable::GetInstance();
-        for (size_t i = 0; i < PageCount; i++)
-        {
-            Page* page = pt.UnmapPage(VaStart + blockIndex * BlockSize + i * Const::PageSize);
-            pt.FreePage(page);
-            page->Put();
-        }
+        Page* page = pt.UnmapPage((ulong)addr + i * Const::PageSize);
+        pt.FreePage(page);
+        page->Put();
     }
+
+    VaAlloc.Free((ulong)addr);
 
     Kernel::CpuTable::GetInstance().InvalidateTlbAll();
     return true;
@@ -187,6 +240,62 @@ void PageAllocatorImpl::Free(void* addr)
     }
 
     Panic("Can't free addr 0x%p", addr);
+}
+
+void* PageAllocatorImpl::AllocMapPages(size_t numPages, ulong* physAddr)
+{
+    BugOn(numPages == 0);
+
+    size_t log = Stdlib::Log2(numPages);
+    if (log >= Stdlib::ArraySize(FixedPgAlloc))
+        return nullptr;
+
+    size_t roundedPages = 1UL << log;
+    auto& pt = PageTable::GetInstance();
+    Page* pages = pt.AllocContiguousPages(roundedPages);
+    if (!pages)
+        return nullptr;
+
+    *physAddr = pages->GetPhyAddress();
+    void* result = FixedPgAlloc[log].Map(pages);
+    if (!result)
+    {
+        for (size_t i = 0; i < roundedPages; i++)
+            pt.FreePage(&pages[i]);
+        return nullptr;
+    }
+    return result;
+}
+
+void PageAllocatorImpl::UnmapFreePages(void* ptr)
+{
+    Free(ptr);
+}
+
+void* PageAllocatorImpl::MapPages(size_t numPages, ulong* physAddrs)
+{
+    BugOn(numPages == 0);
+
+    size_t log = Stdlib::Log2(numPages);
+    if (log >= Stdlib::ArraySize(FixedPgAlloc))
+        return nullptr;
+
+    return FixedPgAlloc[log].MapPhys(physAddrs, numPages);
+}
+
+void PageAllocatorImpl::UnmapPages(void* ptr, size_t numPages)
+{
+    BugOn(numPages == 0);
+
+    size_t log = Stdlib::Log2(numPages);
+    if (log >= Stdlib::ArraySize(FixedPgAlloc))
+    {
+        Panic("Can't unmap addr 0x%p numPages %u", ptr, numPages);
+        return;
+    }
+
+    if (!FixedPgAlloc[log].Unmap(ptr, numPages))
+        Panic("Can't unmap addr 0x%p numPages %u", ptr, numPages);
 }
 
 }
