@@ -46,7 +46,7 @@ private:
     FixedPageAllocator& operator=(const FixedPageAllocator& other) = delete;
     FixedPageAllocator& operator=(FixedPageAllocator&& other) = delete;
 
-    static const size_t MaxPageCount = 8;
+    static const size_t MaxPageCount = 32;
 
     VaAllocator VaAlloc;
     ulong PageCount;
@@ -79,7 +79,7 @@ private:
     PageAllocatorImpl& operator=(const PageAllocatorImpl& other) = delete;
     PageAllocatorImpl& operator=(PageAllocatorImpl&& other) = delete;
 
-    static const size_t PageLogLimit = 4;
+    static const size_t PageLogLimit = 6;
 
     FixedPageAllocator FixedPgAlloc[PageLogLimit];
 };
