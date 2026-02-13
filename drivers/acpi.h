@@ -22,6 +22,7 @@ public:
     void* GetIoApicAddress();
 
     u32 GetGsiByIrq(u8 irq);
+    u16 GetIrqFlags(u8 irq);
 
 private:
     Acpi();
@@ -134,12 +135,13 @@ private:
     {
         u8 Irq;
         u32 Gsi;
+        u16 Flags;
     };
 
     IrqToGsiEntry IrqToGsi[64];
     size_t IrqToGsiSize;
 
-    bool RegisterIrqToGsi(u8 irq, u32 gsi);
+    bool RegisterIrqToGsi(u8 irq, u32 gsi, u16 flags);
 
 };
 
