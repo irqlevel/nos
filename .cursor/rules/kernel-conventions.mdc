@@ -1,0 +1,88 @@
+---
+description: NOS kernel coding conventions and architecture rules
+alwaysApply: true
+---
+
+# NOS Kernel — x86-64, C++20, freestanding
+
+This is a bare-metal OS kernel for x86-64. There is no standard library, no libc, no STL. The project provides its own equivalents under `lib/` and `mm/`.
+
+## Environment constraints
+
+- Compiler: Clang, `-std=c++20 -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin`
+- No `std::` namespace; use `Stdlib::` equivalents from `lib/stdlib.h`
+- No heap before `PageAllocatorImpl::Setup()` completes
+- No C++ exceptions or RTTI
+- No lambdas/closures (no runtime support for captures)
+- No `thread_local` or `__thread`
+- `volatile` compound assignments (`+=`, `-=`) are deprecated in C++20; use explicit `x = x + y`
+
+## Initialization pattern
+
+Static constructors are unreliable in freestanding. Use the singleton + explicit init pattern:
+
+```cpp
+static Foo& GetInstance() { static Foo Instance; return Instance; }
+bool Setup();   // called once at boot, may fail
+```
+
+Never rely on static instance constructors for initialization. Allocate the object and call `Init()` / `Setup()` explicitly.
+
+## Error handling and resource cleanup
+
+- Simple pass/fail: return `bool` or pointer (nullptr = failure)
+- Rich error info: return `Stdlib::Error` (`lib/error.h`) — carries error code, file, line, function
+- Value + error together: return `Stdlib::Result<T>` (`lib/result.h`) — holds a value and an `Error`
+- Create errors with `MakeError(Stdlib::Error::NoMemory)` — captures source location automatically
+- Create success with `MakeSuccess()`
+- `Result<T>` has implicit constructors from both `T` and `Error`, so you can write:
+
+```cpp
+Stdlib::Result<int> Foo() {
+    if (failed)
+        return MakeError(Stdlib::Error::NoMemory);
+    return 42;   // implicit success
+}
+```
+
+- Always check return values — never ignore a potentially failing call
+- On error paths: release every resource acquired so far (pages, VA slots, mappings, allocations) before returning
+- Order of cleanup is reverse order of acquisition
+- Use `BugOn(condition)` for invariant violations (panics the kernel)
+- Use `Panic("fmt", ...)` for unrecoverable errors with a message
+
+## Page / memory refcounting rules
+
+- `PageTable::MapPage(va, page)` calls `page->Get()` (+1 refcount)
+- `PageTable::UnmapPage(va)` internally does `GetPage(Get) + Put` — net 0 on refcount; returns `Page*`
+- `PageTable::GetPage(phyAddr)` calls `page->Get()` (+1 refcount) — caller must balance with `Put()`
+- To fully undo a `MapPage`, call `UnmapPage` then `page->Put()`
+- To free a mapped page: `UnmapPage` + `FreePage` + `Put`
+- `FreePage` alone just returns the page to the free list; it does not touch refcount
+
+## Memory allocation API (`mm/new.h`)
+
+| Function | Allocates phys pages? | Maps at tracked VA? | Frees phys pages on unmap? |
+|---|---|---|---|
+| `Mm::Alloc / Free` | yes | yes (via slab) | yes |
+| `Mm::AllocMapPages / UnmapFreePages` | yes (contiguous) | yes | yes |
+| `Mm::MapPages / UnmapPages` | no (caller provides physAddrs) | yes | no (caller retains ownership) |
+
+## Virtual address management
+
+`VaAllocator` (`mm/va_allocator.h`) tracks which VA ranges are free/used via a bitmap. Each `FixedPageAllocator` instance owns a `VaAllocator`. Never map DMA or device buffers at `physAddr + KernelSpaceBase` directly — always go through `Mm::MapPages` or `Mm::AllocMapPages` so the VA is tracked.
+
+## Code style
+
+- Namespaces: `Kernel::Mm::`, `Kernel::`, `Stdlib::`
+- `auto` is fine for type-deduced locals (e.g. `auto& pt = PageTable::GetInstance()`)
+- Smart pointers from `lib/` are OK where applicable
+- Preserve existing formatting; do not re-indent or reflow unchanged code
+- Use C-style block comments `/* ... */` for multi-line, `//` for single-line
+- Trace with `Trace(level, "fmt", ...)` — level 0 is always visible
+
+## Build
+
+- `make` builds the kernel ELF
+- QEMU scripts are in `scripts/`
+- Self-tests live in `kernel/test.cpp`; each test is a `Stdlib::Error TestXxx()` function registered in `Test()`
