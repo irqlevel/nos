@@ -1050,7 +1050,7 @@ void Cmd::ShowBanner(Stdlib::Printer& out)
     out.Printf(" |  \\| | | | \\___ \\\n");
     out.Printf(" | |\\  | |_| |___) |\n");
     out.Printf(" |_| \\_|\\___/|____/\n");
-    out.Printf("\n$");
+    out.Printf("\n");
 }
 
 void Cmd::Run()
@@ -1060,8 +1060,12 @@ void Cmd::Run()
 
     auto& con = Console::GetInstance();
 
-    /* Wait for startup trace output to settle before showing banner */
+    /* Wait for startup trace output to settle before suppressing console */
     Sleep(100 * Const::NanoSecsInMs);
+
+    Tracer::GetInstance().SetConsoleSuppressed(true);
+
+    ShowBanner(con);
 
     if (Parameters::GetInstance().IsDhcpAuto())
     {
@@ -1077,7 +1081,7 @@ void Cmd::Run()
                 if (GetDhcpClient().IsReady())
                 {
                     DhcpResult r = GetDhcpClient().GetResult();
-                    con.Printf("ip: ");
+                    con.Printf("DHCP ip: ");
                     r.Ip.Print(con);
                     con.Printf("\n");
                 }
@@ -1093,9 +1097,7 @@ void Cmd::Run()
         }
     }
 
-    Tracer::GetInstance().SetConsoleSuppressed(true);
-
-    ShowBanner(con);
+    con.Printf("$");
 
     while (!Task::GetCurrentTask()->IsStopping())
     {
