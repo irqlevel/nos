@@ -156,6 +156,32 @@ void ArpTable::SendRequest(NetDevice* dev, u32 ip)
     dev->SendRaw(frame, sizeof(frame));
 }
 
+void ArpTable::Dump(Stdlib::Printer& printer)
+{
+    Stdlib::AutoLock lock(Lock);
+
+    bool any = false;
+    for (ulong i = 0; i < CacheSize; i++)
+    {
+        if (!Cache[i].Valid)
+            continue;
+
+        u32 ip = Cache[i].Ip;
+        const u8* m = Cache[i].Mac;
+        printer.Printf("%u.%u.%u.%u  %p:%p:%p:%p:%p:%p\n",
+            (ulong)((ip >> 24) & 0xFF),
+            (ulong)((ip >> 16) & 0xFF),
+            (ulong)((ip >> 8) & 0xFF),
+            (ulong)(ip & 0xFF),
+            (ulong)m[0], (ulong)m[1], (ulong)m[2],
+            (ulong)m[3], (ulong)m[4], (ulong)m[5]);
+        any = true;
+    }
+
+    if (!any)
+        printer.Printf("arp table empty\n");
+}
+
 bool ArpTable::Resolve(NetDevice* dev, u32 ip, u8 mac[6])
 {
     /* Check cache first */

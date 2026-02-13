@@ -3,6 +3,7 @@
 #include <include/types.h>
 #include <net/net_device.h>
 #include <kernel/spin_lock.h>
+#include <lib/printer.h>
 
 namespace Kernel
 {
@@ -24,6 +25,9 @@ public:
 
     /* Process incoming ARP frame (request or reply). */
     void Process(NetDevice* dev, const u8* frame, ulong len);
+
+    /* Dump ARP cache contents. */
+    void Dump(Stdlib::Printer& printer);
 
 private:
     ArpTable();
