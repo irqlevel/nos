@@ -107,26 +107,33 @@ void *Pool::Alloc(ulong tag)
 void Pool::Free(void* ptr)
 {
     BugOn(!ptr);
-    Stdlib::AutoLock lock(Lock);
+    Page* freePage = nullptr;
 
-    BlockCount--;
-    Page* page = (Page*)((ulong)ptr & ~(Const::PageSize - 1));
-    BugOn((ulong)page & (Const::PageSize - 1));
-
-    Block* block = static_cast<Block*>(ptr) - 1;
-    block->Link.RemoveInit();
-
-    page->BlockList.InsertTail(&block->Link);
-    page->BlockCount++;
-    page->Link.RemoveInit();
-    if (page->BlockCount == page->MaxBlockCount)
     {
-        PgAlloc->Free(page);
+        Stdlib::AutoLock lock(Lock);
+
+        BlockCount--;
+        Page* page = (Page*)((ulong)ptr & ~(Const::PageSize - 1));
+        BugOn((ulong)page & (Const::PageSize - 1));
+
+        Block* block = static_cast<Block*>(ptr) - 1;
+        block->Link.RemoveInit();
+
+        page->BlockList.InsertTail(&block->Link);
+        page->BlockCount++;
+        page->Link.RemoveInit();
+        if (page->BlockCount == page->MaxBlockCount)
+        {
+            freePage = page;
+        }
+        else
+        {
+            FreePageList.InsertTail(&page->Link);
+        }
     }
-    else
-    {
-        FreePageList.InsertTail(&page->Link);
-    }
+
+    if (freePage)
+        PgAlloc->Free(freePage);
 }
 
 }
