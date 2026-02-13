@@ -505,7 +505,7 @@ Page* PageTable::AllocContiguousPages(ulong count)
 {
     Stdlib::AutoLock lock(Lock);
 
-    if (count == 0 || count > 16 || FreePagesList.IsEmpty())
+    if (count == 0 || count > 32 || FreePagesList.IsEmpty())
         return nullptr;
 
     /* Walk the free list and for each free page, check if the next

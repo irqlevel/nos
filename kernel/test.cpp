@@ -514,10 +514,10 @@ Stdlib::Error TestContiguousPages()
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    /* count > 16 must fail */
-    if (pt.AllocContiguousPages(17) != nullptr)
+    /* count > 32 must fail */
+    if (pt.AllocContiguousPages(33) != nullptr)
     {
-        Trace(0, "TestContiguousPages: count=17 should fail");
+        Trace(0, "TestContiguousPages: count=33 should fail");
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
@@ -893,6 +893,48 @@ Stdlib::Error TestPageAllocator()
 
             Mm::UnmapPages(ptr, 1);
             pt.FreePage(page);
+        }
+    }
+
+    /* Test AllocMapPages / UnmapFreePages with 32 pages (large DMA buffer) */
+    {
+        ulong freePagesBefore = pt.GetFreePagesCount();
+        ulong physAddr = 0;
+        void* ptr = Mm::AllocMapPages(32, &physAddr);
+        if (!ptr)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(32) failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+        if (physAddr == 0)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(32) physAddr is 0");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+
+        u8* p = (u8*)ptr;
+        for (ulong pg = 0; pg < 32; pg++)
+        {
+            Stdlib::MemSet(p + pg * Const::PageSize, (u8)(0xA0 + pg), Const::PageSize);
+        }
+        for (ulong pg = 0; pg < 32; pg++)
+        {
+            u8 expected = (u8)(0xA0 + pg);
+            u8* base = p + pg * Const::PageSize;
+            if (base[0] != expected || base[Const::PageSize - 1] != expected)
+            {
+                Trace(0, "TestPageAllocator: AllocMapPages(32) page %u mismatch", pg);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+
+        Mm::UnmapFreePages(ptr);
+
+        if (pt.GetFreePagesCount() != freePagesBefore)
+        {
+            Trace(0, "TestPageAllocator: AllocMapPages(32) free count mismatch: %u expected %u",
+                pt.GetFreePagesCount(), freePagesBefore);
+            return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
 
