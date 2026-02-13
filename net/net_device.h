@@ -6,6 +6,23 @@
 namespace Kernel
 {
 
+struct NetStats
+{
+    u64 TxTotal;
+    u64 RxTotal;
+    u64 RxDrop;
+    u64 RxIcmp;
+    u64 RxUdp;
+    u64 RxTcp;
+    u64 RxArp;
+    u64 RxOther;
+    u64 TxIcmp;
+    u64 TxUdp;
+    u64 TxTcp;
+    u64 TxArp;
+    u64 TxOther;
+};
+
 class NetDevice
 {
 public:
@@ -16,6 +33,7 @@ public:
     virtual u64 GetTxPackets() = 0;
     virtual u64 GetRxPackets() = 0;
     virtual u64 GetRxDropped() = 0;
+    virtual void GetStats(NetStats& stats) { (void)stats; }
 
     virtual u32 GetIp() { return 0; }
     virtual void SetIp(u32 ip) { (void)ip; }

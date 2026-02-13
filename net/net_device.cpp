@@ -62,13 +62,19 @@ void NetDeviceTable::Dump(Stdlib::Printer& printer)
         u8 mac[6];
         Devices[i]->GetMac(mac);
 
+        NetStats st;
+        Stdlib::MemSet(&st, 0, sizeof(st));
+        Devices[i]->GetStats(st);
+
         printer.Printf("%s  %p:%p:%p:%p:%p:%p  tx:%u rx:%u drop:%u\n",
             Devices[i]->GetName(),
             (ulong)mac[0], (ulong)mac[1], (ulong)mac[2],
             (ulong)mac[3], (ulong)mac[4], (ulong)mac[5],
-            Devices[i]->GetTxPackets(),
-            Devices[i]->GetRxPackets(),
-            Devices[i]->GetRxDropped());
+            st.TxTotal, st.RxTotal, st.RxDrop);
+        printer.Printf("  rx  icmp:%u udp:%u tcp:%u arp:%u other:%u\n",
+            st.RxIcmp, st.RxUdp, st.RxTcp, st.RxArp, st.RxOther);
+        printer.Printf("  tx  icmp:%u udp:%u tcp:%u arp:%u other:%u\n",
+            st.TxIcmp, st.TxUdp, st.TxTcp, st.TxArp, st.TxOther);
     }
 }
 
