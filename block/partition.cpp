@@ -55,26 +55,29 @@ u64 PartitionDevice::GetSectorSize()
     return Parent->GetSectorSize();
 }
 
-bool PartitionDevice::ReadSector(u64 sector, void* buf)
+bool PartitionDevice::Flush()
 {
-    if (sector >= SectorCount)
-        return false;
-
-    return Parent->ReadSector(StartSector + sector, buf);
+    return Parent->Flush();
 }
 
-bool PartitionDevice::WriteSector(u64 sector, const void* buf)
+bool PartitionDevice::ReadSectors(u64 sector, void* buf, u32 count)
 {
-    if (sector >= SectorCount)
+    if (sector + count > SectorCount)
         return false;
+    return Parent->ReadSectors(StartSector + sector, buf, count);
+}
 
-    return Parent->WriteSector(StartSector + sector, buf);
+bool PartitionDevice::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
+{
+    if (sector + count > SectorCount)
+        return false;
+    return Parent->WriteSectors(StartSector + sector, buf, count, fua);
 }
 
 bool PartitionDevice::ProbeDevice(BlockDevice* dev)
 {
     u8 buf[512];
-    if (!dev->ReadSector(0, buf))
+    if (!dev->ReadSectors(0, buf, 1))
         return false;
 
     auto* mbr = reinterpret_cast<Mbr*>(buf);

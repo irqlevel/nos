@@ -13,7 +13,8 @@ public:
     ~BlockIo();
 
     bool ReadBlock(u32 blockIdx, void* buf);
-    bool WriteBlock(u32 blockIdx, const void* buf);
+    bool WriteBlock(u32 blockIdx, const void* buf, bool fua = false);
+    bool Flush();
 
     BlockDevice* GetDevice();
 

@@ -25,8 +25,9 @@ public:
     virtual const char* GetName() override;
     virtual u64 GetCapacity() override;
     virtual u64 GetSectorSize() override;
-    virtual bool ReadSector(u64 sector, void* buf) override;
-    virtual bool WriteSector(u64 sector, const void* buf) override;
+    virtual bool Flush() override;
+    virtual bool ReadSectors(u64 sector, void* buf, u32 count) override;
+    virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) override;
 
     /* InterruptHandler interface */
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;
@@ -44,11 +45,15 @@ private:
     VirtioBlk& operator=(const VirtioBlk& other) = delete;
     VirtioBlk& operator=(VirtioBlk&& other) = delete;
 
-    bool DoIO(u32 type, u64 sector, void* buf);
+    bool DoIO(u32 type, u64 sector, void* buf, u32 sectorCount);
 
     /* Virtio-blk request types */
-    static const u32 TypeIn  = 0; /* Read */
-    static const u32 TypeOut = 1; /* Write */
+    static const u32 TypeIn    = 0; /* Read */
+    static const u32 TypeOut   = 1; /* Write */
+    static const u32 TypeFlush = 4; /* Flush */
+
+    /* Feature bits */
+    static const u32 FeatureFlush = (1 << 9);
 
     struct VirtioBlkReq
     {
@@ -69,6 +74,7 @@ private:
 
     char DevName[8];
     bool Initialized;
+    bool HasFlush;
 
     /* DMA buffers (identity-mapped) */
     VirtioBlkReq* ReqHeader;

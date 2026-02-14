@@ -160,7 +160,7 @@ static void CmdPartitions(const char* args, Stdlib::Printer& con)
     }
 
     u8 buf[512];
-    if (!dev->ReadSector(0, buf))
+    if (!dev->ReadSectors(0, buf, 1))
     {
         con.Printf("failed to read sector 0\n");
         return;
@@ -227,7 +227,7 @@ static void CmdDiskread(const char* args, Stdlib::Printer& con)
     }
 
     u8 buf[512];
-    if (!dev->ReadSector(sector, buf))
+    if (!dev->ReadSectors(sector, buf, 1))
     {
         con.Printf("read error\n");
         return;
@@ -294,7 +294,7 @@ static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
 
     if (byteCount > 0)
     {
-        if (!dev->WriteSector(sector, buf))
+        if (!dev->WriteSectors(sector, buf, 1))
             con.Printf("write error\n");
         else
             con.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
