@@ -625,13 +625,6 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
             return;
         }
 
-        if (!fs->Init())
-        {
-            delete fs;
-            con.Printf("nanofs init failed (not formatted?)\n");
-            return;
-        }
-
         if (!Vfs::GetInstance().Mount(path, fs))
         {
             delete fs;

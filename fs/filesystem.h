@@ -14,6 +14,8 @@ public:
     virtual const char* GetName() = 0;
     virtual void GetInfo(char* buf, ulong bufSize) { if (buf && bufSize) buf[0] = '\0'; }
     virtual bool Format(BlockDevice* dev) { (void)dev; return false; }
+    virtual bool Mount() { return true; }
+    virtual void Unmount() {}
     virtual VNode* GetRoot() = 0;
     virtual VNode* Lookup(VNode* dir, const char* name) = 0;
     virtual VNode* CreateFile(VNode* dir, const char* name) = 0;

@@ -49,6 +49,12 @@ bool Vfs::Mount(const char* path, FileSystem* fs)
         return false;
     }
 
+    if (!fs->Mount())
+    {
+        Trace(0, "Vfs::Mount: fs->Mount() failed for %s", path);
+        return false;
+    }
+
     Stdlib::StrnCpy(Mounts[MountCount].Path, path, MaxPath);
     Mounts[MountCount].Fs = fs;
     MountCount++;
@@ -70,6 +76,8 @@ FileSystem* Vfs::Unmount(const char* path)
         if (Stdlib::StrCmp(Mounts[i].Path, path) == 0)
         {
             FileSystem* fs = Mounts[i].Fs;
+
+            fs->Unmount();
 
             // Shift remaining entries
             for (ulong j = i; j + 1 < MountCount; j++)

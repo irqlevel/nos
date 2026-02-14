@@ -20,6 +20,11 @@ NanoFs::NanoFs(BlockDevice* dev)
 
 NanoFs::~NanoFs()
 {
+    Unmount();
+}
+
+void NanoFs::Unmount()
+{
     for (u32 i = 0; i < NanoInodeCount; i++)
     {
         if (VNodes[i] != nullptr)
@@ -30,7 +35,7 @@ NanoFs::~NanoFs()
     }
 }
 
-bool NanoFs::Init()
+bool NanoFs::Mount()
 {
     if (!Io.ReadBlock(0, &Super))
     {
