@@ -34,8 +34,6 @@ VirtioNet::VirtioNet()
     , IntVector(-1)
     , Initialized(false)
     , NetHdrSize(sizeof(VirtioNetHdr)) /* Updated in Init() for legacy */
-    , RxCb(nullptr)
-    , RxCbCtx(nullptr)
     , TxBuf(nullptr)
     , TxBufPhys(0)
     , RxBufs(nullptr)
@@ -302,26 +300,25 @@ void VirtioNet::DrainRx()
                         {
                             RxUdp.Inc();
 
-                            /* Snapshot callback pointer under lock */
-                            RxCallback cb;
-                            void* cbCtx;
-                            {
-                                Stdlib::AutoLock lock(RxCbLock);
-                                cb = RxCb;
-                                cbCtx = RxCbCtx;
-                            }
-
-                            if (cb && frameLen >= sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
+                            if (frameLen >= sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
                             {
                                 UdpHdr* udp = (UdpHdr*)(frame + sizeof(EthHdr) + sizeof(IpHdr));
-                                if (Ntohs(udp->DstPort) == 68)
+                                u16 dstPort = Ntohs(udp->DstPort);
+                                bool delivered = false;
+
+                                Stdlib::AutoLock lock(UdpListenerLock);
+                                for (ulong li = 0; li < UdpListenerCount; li++)
                                 {
-                                    cb(frame, frameLen, cbCtx);
+                                    if (UdpListeners[li].Port == dstPort && UdpListeners[li].Cb)
+                                    {
+                                        UdpListeners[li].Cb(frame, frameLen, UdpListeners[li].Ctx);
+                                        delivered = true;
+                                        break;
+                                    }
                                 }
-                                else
-                                {
+
+                                if (!delivered)
                                     RxDropCount.Inc();
-                                }
                             }
                             else
                             {
@@ -548,13 +545,6 @@ void VirtioNet::GetStats(NetStats& stats)
     stats.TxTcp = (u64)TxTcp.Get();
     stats.TxArp = (u64)TxArp.Get();
     stats.TxOther = (u64)TxOther.Get();
-}
-
-void VirtioNet::SetRxCallback(RxCallback cb, void* ctx)
-{
-    Stdlib::AutoLock lock(RxCbLock);
-    RxCb = cb;
-    RxCbCtx = ctx;
 }
 
 /* --- Interrupt --- */

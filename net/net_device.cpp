@@ -7,7 +7,50 @@ namespace Kernel
 {
 
 NetDevice::NetDevice()
+    : UdpListenerCount(0)
 {
+    Stdlib::MemSet(UdpListeners, 0, sizeof(UdpListeners));
+}
+
+bool NetDevice::RegisterUdpListener(u16 port, RxCallback cb, void* ctx)
+{
+    Stdlib::AutoLock lock(UdpListenerLock);
+
+    for (ulong i = 0; i < UdpListenerCount; i++)
+    {
+        if (UdpListeners[i].Port == port)
+        {
+            UdpListeners[i].Cb = cb;
+            UdpListeners[i].Ctx = ctx;
+            return true;
+        }
+    }
+
+    if (UdpListenerCount >= MaxUdpListeners)
+        return false;
+
+    UdpListeners[UdpListenerCount].Port = port;
+    UdpListeners[UdpListenerCount].Cb = cb;
+    UdpListeners[UdpListenerCount].Ctx = ctx;
+    UdpListenerCount++;
+    return true;
+}
+
+void NetDevice::UnregisterUdpListener(u16 port)
+{
+    Stdlib::AutoLock lock(UdpListenerLock);
+
+    for (ulong i = 0; i < UdpListenerCount; i++)
+    {
+        if (UdpListeners[i].Port == port)
+        {
+            for (ulong j = i; j + 1 < UdpListenerCount; j++)
+                UdpListeners[j] = UdpListeners[j + 1];
+            UdpListenerCount--;
+            Stdlib::MemSet(&UdpListeners[UdpListenerCount], 0, sizeof(UdpListener));
+            return;
+        }
+    }
 }
 
 Net::MacAddress NetDevice::GetMac()

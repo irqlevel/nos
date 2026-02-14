@@ -27,6 +27,8 @@ public:
     bool IsDhcpAuto();
     bool IsDhcpOff();
 
+    u16 GetUdpShellPort();
+
     Parameters();
     ~Parameters();
 private:
@@ -50,5 +52,6 @@ private:
     bool SmpOff;
     ConsoleMode ConMode;
     DhcpMode DhcpMd;
+    u16 UdpShellPort;
 };
 }

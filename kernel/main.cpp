@@ -44,6 +44,7 @@
 #include <drivers/virtio_rng.h>
 
 #include <block/partition.h>
+#include <net/udp_shell.h>
 
 using namespace Kernel;
 using namespace Stdlib;
@@ -347,6 +348,22 @@ void BpStartup(void* ctx)
         return;
     }
 
+    UdpShell udpShell;
+    u16 udpShellPort = Parameters::GetInstance().GetUdpShellPort();
+    if (udpShellPort != 0)
+    {
+        NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
+        if (netDev)
+        {
+            if (!udpShell.Start(netDev, udpShellPort))
+                Trace(0, "UdpShell: failed to start on port %u", (ulong)udpShellPort);
+        }
+        else
+        {
+            Trace(0, "UdpShell: eth0 not found");
+        }
+    }
+
     bool doReboot = false;
     for (;;)
     {
@@ -358,6 +375,7 @@ void BpStartup(void* ctx)
                 Trace(0, "Reboot requested");
             else
                 Trace(0, "Shutdown requested");
+            udpShell.Stop();
             cmd.Stop();
             cmd.StopDhcp();
             break;

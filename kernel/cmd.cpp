@@ -18,6 +18,7 @@
 #include <fs/nanofs.h>
 #include "entropy.h"
 #include "console.h"
+#include "mutex.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
@@ -466,19 +467,21 @@ static void CmdPing(const char* args, Stdlib::Printer& con)
         return;
     }
 
+    u16 pingId = (u16)(ReadTsc() & 0xFFFF);
+
     con.Printf("PING %s\n", ipBuf);
     ulong received = 0;
 
     for (u16 seq = 0; seq < 5; seq++)
     {
-        if (!Icmp::GetInstance().SendEchoRequest(dev, dstIp, 0x1234, seq))
+        if (!Icmp::GetInstance().SendEchoRequest(dev, dstIp, pingId, seq))
         {
             con.Printf("send failed seq=%u\n", (ulong)seq);
         }
         else
         {
             ulong rttNs = 0;
-            if (Icmp::GetInstance().WaitReply(0x1234, seq, 3000, rttNs))
+            if (Icmp::GetInstance().WaitReply(pingId, seq, 3000, rttNs))
             {
                 ulong rttMs = rttNs / Const::NanoSecsInMs;
                 con.Printf("reply from %s: seq=%u time=%u ms\n",
@@ -505,6 +508,9 @@ static void CmdDhcp(const char* args, Stdlib::Printer& con)
         con.Printf("DHCP disabled (dhcp=off)\n");
         return;
     }
+
+    static Mutex dhcpLock;
+    Stdlib::AutoLock lock(dhcpLock);
 
     const char* devName = "eth0";
     if (args[0] != '\0')
@@ -947,31 +953,34 @@ Cmd::~Cmd()
     }
 }
 
-void Cmd::ProcessCmd(const char *cmd)
+void Cmd::Dispatch(const char *cmd, Stdlib::Printer& out)
 {
-    auto& con = Console::GetInstance();
-
     bool found = false;
     for (ulong i = 0; Commands[i].Name != nullptr; i++)
     {
         ulong nameLen = Stdlib::StrLen(Commands[i].Name);
         if (Stdlib::StrCmp(cmd, Commands[i].Name) == 0)
         {
-            Commands[i].Handler("", con);
+            Commands[i].Handler("", out);
             found = true;
             break;
         }
         else if (Stdlib::MemCmp(cmd, Commands[i].Name, nameLen) == 0 && cmd[nameLen] == ' ')
         {
-            Commands[i].Handler(cmd + nameLen + 1, con);
+            Commands[i].Handler(cmd + nameLen + 1, out);
             found = true;
             break;
         }
     }
 
     if (!found)
-        con.Printf("command '%s' not found\n", cmd);
+        out.Printf("command '%s' not found\n", cmd);
+}
 
+void Cmd::ProcessCmd(const char *cmd)
+{
+    auto& con = Console::GetInstance();
+    Dispatch(cmd, con);
     con.Printf("$");
 }
 

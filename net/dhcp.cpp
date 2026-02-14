@@ -76,7 +76,7 @@ void DhcpClient::Stop()
     }
     if (Dev)
     {
-        Dev->SetRxCallback(nullptr, nullptr);
+        Dev->UnregisterUdpListener(68);
         Dev = nullptr;
     }
 }
@@ -104,7 +104,7 @@ void DhcpClient::Run()
     while (!task->IsStopping())
     {
         /* Register RX callback */
-        Dev->SetRxCallback(RxCallbackFn, this);
+        Dev->RegisterUdpListener(68, RxCallbackFn, this);
 
         bool success = false;
 
@@ -123,7 +123,7 @@ void DhcpClient::Run()
         }
 
         /* Unregister callback */
-        Dev->SetRxCallback(nullptr, nullptr);
+        Dev->UnregisterUdpListener(68);
 
         if (!success)
         {
@@ -162,12 +162,12 @@ void DhcpClient::Run()
         /* Renew: send REQUEST directly to server */
         Trace(0, "DHCP: renewing lease");
 
-        Dev->SetRxCallback(RxCallbackFn, this);
+        Dev->RegisterUdpListener(68, RxCallbackFn, this);
         Xid++;
 
         bool renewed = DoRequest();
 
-        Dev->SetRxCallback(nullptr, nullptr);
+        Dev->UnregisterUdpListener(68);
 
         if (renewed)
         {
