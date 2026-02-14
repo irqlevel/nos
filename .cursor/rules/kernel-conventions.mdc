@@ -80,6 +80,7 @@ Stdlib::Result<int> Foo() {
 - Preserve existing formatting; do not re-indent or reflow unchanged code
 - Use C-style block comments `/* ... */` for multi-line, `//` for single-line
 - Trace with `Trace(level, "fmt", ...)` — level 0 is always visible
+- No magic numbers: define named constants (`static const`, `constexpr`, or `enum`) in the relevant header/class instead of embedding raw numeric literals in code
 
 ## Build
 
