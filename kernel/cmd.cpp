@@ -51,14 +51,14 @@ static void CmdCls(const char* args, Stdlib::Printer& con)
 static void CmdPoweroff(const char* args, Stdlib::Printer& con)
 {
     (void)args;
-    (void)con;
+    con.Printf("shutting down...\n");
     Cmd::GetInstance().RequestShutdown();
 }
 
 static void CmdReboot(const char* args, Stdlib::Printer& con)
 {
     (void)args;
-    (void)con;
+    con.Printf("rebooting...\n");
     Cmd::GetInstance().RequestReboot();
 }
 
