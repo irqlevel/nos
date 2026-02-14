@@ -177,6 +177,12 @@ bool NanoFs::Format(BlockDevice* dev)
         return false;
     }
 
+    if (!io.Flush())
+    {
+        Trace(0, "NanoFs::Format: flush failed");
+        return false;
+    }
+
     Trace(0, "NanoFs::Format: done");
     return true;
 }
@@ -251,7 +257,7 @@ bool NanoFs::WriteInode(u32 idx, const NanoInode* in)
 bool NanoFs::FlushSuper()
 {
     ComputeSuperChecksum();
-    if (!Io.WriteBlock(0, &Super))
+    if (!Io.WriteBlock(0, &Super, true))
     {
         Trace(0, "NanoFs::FlushSuper: write failed");
         return false;
@@ -1189,7 +1195,10 @@ bool NanoFs::Remove(VNode* node)
 
     // Parent VNode Size stays 0 for directories; no update needed.
 
-    return RemoveRecursive(node);
+    if (!RemoveRecursive(node))
+        return false;
+
+    return Io.Flush();
 }
 
 }

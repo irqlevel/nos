@@ -39,8 +39,9 @@ public:
     virtual const char* GetName() override;
     virtual u64 GetCapacity() override;
     virtual u64 GetSectorSize() override;
-    virtual bool ReadSector(u64 sector, void* buf) override;
-    virtual bool WriteSector(u64 sector, const void* buf) override;
+    virtual bool Flush() override;
+    virtual bool ReadSectors(u64 sector, void* buf, u32 count) override;
+    virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) override;
 
     static void ProbeAll();
 

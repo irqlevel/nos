@@ -53,8 +53,9 @@ public:
     virtual const char* GetName() override;
     virtual u64 GetCapacity() override;
     virtual u64 GetSectorSize() override;
-    virtual bool ReadSector(u64 sector, void* buf) override;
-    virtual bool WriteSector(u64 sector, const void* buf) override;
+    virtual bool Flush() override;
+    virtual bool ReadSectors(u64 sector, void* buf, u32 count) override;
+    virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) override;
 
     /* InterruptHandler interface */
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;
@@ -79,6 +80,7 @@ public:
     static const u8 ScsiOpReadCapacity  = 0x25;
     static const u8 ScsiOpRead10        = 0x28;
     static const u8 ScsiOpWrite10       = 0x2A;
+    static const u8 ScsiOpSyncCache     = 0x35;
 
     /* SCSI device types */
     static const u8 ScsiTypeDirectAccess = 0;
@@ -105,7 +107,7 @@ private:
     bool ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, bool dataIn);
 
     /* Read/write helper */
-    bool DoIO(u64 sector, void* buf, bool read);
+    bool DoIO(u64 sector, void* buf, u32 sectorCount, bool read, bool fua);
 
     VirtioPci* Transport;
     VirtQueue* ReqQueue;

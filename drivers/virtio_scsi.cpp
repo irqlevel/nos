@@ -263,9 +263,13 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
     return true;
 }
 
-bool VirtioScsi::DoIO(u64 sector, void* buf, bool read)
+bool VirtioScsi::DoIO(u64 sector, void* buf, u32 sectorCount, bool read, bool fua)
 {
     if (!Initialized || !IoLock)
+        return false;
+
+    ulong dataLen = (ulong)SectorSz * sectorCount;
+    if (dataLen > Const::PageSize)
         return false;
 
     Stdlib::AutoLock lock(*IoLock);
@@ -278,8 +282,13 @@ bool VirtioScsi::DoIO(u64 sector, void* buf, bool read)
     else
         cdb[0] = ScsiOpWrite10;
 
+    /* FUA bit: byte 1, bit 3 of READ(10)/WRITE(10) CDB */
+    if (fua && !read)
+        cdb[1] = 0x08;
+
     /* READ(10)/WRITE(10) CDB layout:
        Byte 0: opcode
+       Byte 1: flags (bit 3 = FUA)
        Byte 2-5: LBA (big-endian)
        Byte 7-8: transfer length in sectors (big-endian) */
     u32 lba = (u32)sector;
@@ -288,25 +297,49 @@ bool VirtioScsi::DoIO(u64 sector, void* buf, bool read)
     cdb[4] = (u8)(lba >> 8);
     cdb[5] = (u8)(lba);
 
-    /* Transfer 1 sector */
-    cdb[7] = 0;
-    cdb[8] = 1;
+    /* Transfer length in sectors (big-endian u16) */
+    cdb[7] = (u8)(sectorCount >> 8);
+    cdb[8] = (u8)(sectorCount);
 
-    return ScsiCommand(cdb, buf, (ulong)SectorSz, read);
+    return ScsiCommand(cdb, buf, dataLen, read);
 }
 
-bool VirtioScsi::ReadSector(u64 sector, void* buf)
+bool VirtioScsi::ReadSectors(u64 sector, void* buf, u32 count)
 {
-    if (sector >= CapacitySectors)
+    if (count == 0)
+        return true;
+    if (sector + count > CapacitySectors)
         return false;
-    return DoIO(sector, buf, true);
+    if ((u64)SectorSz * count > Const::PageSize)
+        return false;
+    return DoIO(sector, buf, count, true, false);
 }
 
-bool VirtioScsi::WriteSector(u64 sector, const void* buf)
+bool VirtioScsi::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
 {
-    if (sector >= CapacitySectors)
+    if (count == 0)
+        return true;
+    if (sector + count > CapacitySectors)
         return false;
-    return DoIO(sector, (void*)buf, false);
+    if ((u64)SectorSz * count > Const::PageSize)
+        return false;
+    return DoIO(sector, (void*)buf, count, false, fua);
+}
+
+bool VirtioScsi::Flush()
+{
+    if (!Initialized || !IoLock)
+        return false;
+
+    Stdlib::AutoLock lock(*IoLock);
+
+    u8 cdb[CdbLen];
+    Stdlib::MemSet(cdb, 0, sizeof(cdb));
+    cdb[0] = ScsiOpSyncCache;
+    /* Bytes 2-5: LBA = 0 (flush entire cache) */
+    /* Bytes 7-8: number of blocks = 0 (flush all) */
+
+    return ScsiCommand(cdb, nullptr, 0, false);
 }
 
 const char* VirtioScsi::GetName()

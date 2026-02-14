@@ -13,8 +13,9 @@ public:
     virtual const char* GetName() = 0;
     virtual u64 GetCapacity() = 0;         /* Total sectors */
     virtual u64 GetSectorSize() = 0;       /* Bytes per sector */
-    virtual bool ReadSector(u64 sector, void* buf) = 0;
-    virtual bool WriteSector(u64 sector, const void* buf) = 0;
+    virtual bool Flush() { return true; }
+    virtual bool ReadSectors(u64 sector, void* buf, u32 count) = 0;
+    virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) = 0;
 };
 
 class BlockDeviceTable

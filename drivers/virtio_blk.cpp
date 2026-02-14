@@ -20,6 +20,7 @@ VirtioBlk::VirtioBlk()
     , CapacitySectors(0)
     , IntVector(-1)
     , Initialized(false)
+    , HasFlush(false)
     , ReqHeader(nullptr)
     , ReqHeaderPhys(0)
     , DataBuf(nullptr)
@@ -71,8 +72,10 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     u32 devFeatures0 = Transport.ReadDeviceFeature(0);
     Trace(0, "VirtioBlk %s: device features[0] 0x%p", name, (ulong)devFeatures0);
 
-    /* We don't need any special features for basic operation. */
-    Transport.WriteDriverFeature(0, 0);
+    /* Negotiate FLUSH if device offers it. */
+    u32 drvFeatures0 = devFeatures0 & FeatureFlush;
+    Transport.WriteDriverFeature(0, drvFeatures0);
+    HasFlush = (drvFeatures0 & FeatureFlush) != 0;
 
     if (!Transport.IsLegacy())
     {
@@ -152,7 +155,7 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     /* Layout within the 2 DMA pages:
        Offset 0:   VirtioBlkReq header (16 bytes)
        Offset 16:  status byte (1 byte)
-       Offset 4096: 512-byte data buffer (on page boundary for alignment) */
+       Offset 4096: data buffer (up to 4096 bytes, on page boundary for alignment) */
     ReqHeader = (VirtioBlkReq*)dmaVirt;
     ReqHeaderPhys = dmaPhys;
     StatusBuf = (u8*)(dmaVirt + sizeof(VirtioBlkReq));
@@ -189,9 +192,13 @@ u64 VirtioBlk::GetSectorSize()
     return 512;
 }
 
-bool VirtioBlk::DoIO(u32 type, u64 sector, void* buf)
+bool VirtioBlk::DoIO(u32 type, u64 sector, void* buf, u32 sectorCount)
 {
     if (!Initialized)
+        return false;
+
+    u32 dataLen = 512 * sectorCount;
+    if (dataLen > Const::PageSize)
         return false;
 
     Stdlib::AutoLock lock(IoLock);
@@ -202,41 +209,65 @@ bool VirtioBlk::DoIO(u32 type, u64 sector, void* buf)
     ReqHeader->Sector = sector;
     *StatusBuf = 0xFF; /* Will be overwritten by device */
 
-    /* Copy data for write */
-    if (type == TypeOut)
+    if (type == TypeFlush)
     {
-        Stdlib::MemCpy(DataBuf, buf, 512);
+        /* Flush: 2-descriptor chain (header + status, no data) */
+        Barrier();
+
+        VirtQueue::BufDesc bufs[2];
+        bufs[0].Addr = ReqHeaderPhys;
+        bufs[0].Len = sizeof(VirtioBlkReq);
+        bufs[0].Writable = false;
+
+        bufs[1].Addr = StatusBufPhys;
+        bufs[1].Len = 1;
+        bufs[1].Writable = true;
+
+        int head = Queue.AddBufs(bufs, 2);
+        if (head < 0)
+        {
+            Trace(0, "VirtioBlk %s: AddBufs failed", DevName);
+            return false;
+        }
     }
     else
     {
-        Stdlib::MemSet(DataBuf, 0, 512);
-    }
+        /* Copy data for write */
+        if (type == TypeOut)
+        {
+            Stdlib::MemCpy(DataBuf, buf, dataLen);
+        }
+        else
+        {
+            Stdlib::MemSet(DataBuf, 0, dataLen);
+        }
 
-    Barrier();
+        Barrier();
 
-    /* Build 3-descriptor chain: header, data, status */
-    VirtQueue::BufDesc bufs[3];
+        /* Build 3-descriptor chain: header, data, status */
+        VirtQueue::BufDesc bufs[3];
 
-    /* Descriptor 0: request header (device-readable) */
-    bufs[0].Addr = ReqHeaderPhys;
-    bufs[0].Len = sizeof(VirtioBlkReq);
-    bufs[0].Writable = false;
+        /* Descriptor 0: request header (device-readable) */
+        bufs[0].Addr = ReqHeaderPhys;
+        bufs[0].Len = sizeof(VirtioBlkReq);
+        bufs[0].Writable = false;
 
-    /* Descriptor 1: data buffer */
-    bufs[1].Addr = DataBufPhys;
-    bufs[1].Len = 512;
-    bufs[1].Writable = (type == TypeIn); /* Writable for reads */
+        /* Descriptor 1: data buffer */
+        bufs[1].Addr = DataBufPhys;
+        bufs[1].Len = dataLen;
+        bufs[1].Writable = (type == TypeIn); /* Writable for reads */
 
-    /* Descriptor 2: status byte (device-writable) */
-    bufs[2].Addr = StatusBufPhys;
-    bufs[2].Len = 1;
-    bufs[2].Writable = true;
+        /* Descriptor 2: status byte (device-writable) */
+        bufs[2].Addr = StatusBufPhys;
+        bufs[2].Len = 1;
+        bufs[2].Writable = true;
 
-    int head = Queue.AddBufs(bufs, 3);
-    if (head < 0)
-    {
-        Trace(0, "VirtioBlk %s: AddBufs failed", DevName);
-        return false;
+        int head = Queue.AddBufs(bufs, 3);
+        if (head < 0)
+        {
+            Trace(0, "VirtioBlk %s: AddBufs failed", DevName);
+            return false;
+        }
     }
 
     /* Kick the device */
@@ -266,20 +297,39 @@ bool VirtioBlk::DoIO(u32 type, u64 sector, void* buf)
     /* Copy data for read */
     if (type == TypeIn)
     {
-        Stdlib::MemCpy(buf, DataBuf, 512);
+        Stdlib::MemCpy(buf, DataBuf, dataLen);
     }
 
     return true;
 }
 
-bool VirtioBlk::ReadSector(u64 sector, void* buf)
+bool VirtioBlk::ReadSectors(u64 sector, void* buf, u32 count)
 {
-    return DoIO(TypeIn, sector, buf);
+    if (count == 0)
+        return true;
+    if ((u64)count * 512 > Const::PageSize)
+        return false;
+    return DoIO(TypeIn, sector, buf, count);
 }
 
-bool VirtioBlk::WriteSector(u64 sector, const void* buf)
+bool VirtioBlk::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
 {
-    return DoIO(TypeOut, sector, (void*)buf);
+    if (count == 0)
+        return true;
+    if ((u64)count * 512 > Const::PageSize)
+        return false;
+    if (!DoIO(TypeOut, sector, (void*)buf, count))
+        return false;
+    if (fua)
+        return Flush();
+    return true;
+}
+
+bool VirtioBlk::Flush()
+{
+    if (!HasFlush)
+        return true;  /* no write cache, nothing to flush */
+    return DoIO(TypeFlush, 0, nullptr, 0);
 }
 
 void VirtioBlk::OnInterruptRegister(u8 irq, u8 vector)
