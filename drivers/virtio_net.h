@@ -29,11 +29,8 @@ public:
     virtual u64 GetRxPackets() override;
     virtual u64 GetRxDropped() override;
     virtual void GetStats(NetStats& stats) override;
-    virtual void SetRxCallback(RxCallback cb, void* ctx) override;
-
-    /* Higher-level UDP send */
-    bool SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
-                 const void* data, ulong len);
+    virtual bool SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
+                         const void* data, ulong len) override;
 
     /* InterruptHandler interface */
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;
@@ -115,10 +112,6 @@ private:
     Atomic TxTcp;
     Atomic TxArp;
     Atomic TxOther;
-
-    RxCallback RxCb;
-    void* RxCbCtx;
-    SpinLock RxCbLock;
 
     /* DMA buffers */
     u8* TxBuf;

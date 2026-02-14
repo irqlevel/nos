@@ -34,6 +34,8 @@ public:
     void Stop();
     void StopDhcp();
 
+    static void Dispatch(const char *cmd, Stdlib::Printer& out);
+
 private:
     void ProcessCmd(const char *cmd);
 

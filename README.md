@@ -12,7 +12,7 @@ A hobby x86-64 operating system kernel written in C++20 and NASM.
 - **Interrupts** — IDT with exception handlers, IOAPIC routing (edge + level-triggered), LAPIC IPI, PIC (remapped then disabled)
 - **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**, **virtio-scsi**, **virtio-rng** (legacy + modern virtio-pci transport)
 - **Block I/O** — virtio-blk driver with virtqueue DMA, block device abstraction, disk discovery and enumeration
-- **Networking** — virtio-net driver, ARP (cache, request, reply, dump), IPv4/UDP transmit, ICMP echo (ping reply + send, per-type statistics), DHCP client with lease renewal, network device abstraction with per-protocol packet counters, `MacAddress`/`IpAddress` structs (IPv6-ready tagged union)
+- **Networking** — virtio-net driver, ARP (cache, request, reply, dump), IPv4/UDP transmit, ICMP echo (ping reply + send, per-type statistics), DHCP client with lease renewal, UDP remote shell (execute kernel commands over the network), network device abstraction with per-protocol packet counters, `MacAddress`/`IpAddress` structs (IPv6-ready tagged union)
 - **Filesystem** — VFS layer with mount points and path resolution, ramfs (in-memory), nanofs (on-disk filesystem with 4 KB blocks, superblock with UUID, inode/data bitmaps, CRC32 checksums for superblock/inodes/data, file and recursive directory deletion, persistent across remount)
 - **Entropy** — `EntropySource` interface, `EntropySourceTable` registry, virtio-rng hardware random number generator
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
@@ -106,6 +106,22 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 - `dhcp=auto` — start DHCP on `eth0` automatically at boot
 - `dhcp=off` — disable DHCP entirely (even via shell command)
 - `dhcp=on` — enable DHCP only via shell command (default)
+- `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`)
+
+#### UDP remote shell
+
+When `udpshell=PORT` is set, the kernel listens for commands on that UDP port.
+A lightweight protocol header (16 bytes: magic, sequence number, chunk index, flags, payload length) frames every packet, enabling the client to validate replies, reassemble multi-chunk responses in order, and detect the end of a response without relying on timeouts.
+
+Connect with the included Python client:
+
+```sh
+python3 scripts/udpsh.py <vm-ip> [port] [timeout]
+```
+
+- Default port is `9000`, default timeout is `30` seconds (long enough for blocking commands like `ping`).
+- On protocol errors or timeouts, the client reconnects automatically and resets state.
+- All shell commands work over the UDP session (including blocking ones like `ping`).
 
 #### Shell commands
 
@@ -151,7 +167,7 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 boot/       Multiboot2 entry, 32→64-bit transition, AP trampoline
 kernel/     Core: scheduling, tasks, interrupts, shell, timers, locks
 drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI, virtio-blk, virtio-net, virtio-scsi, virtio-rng
-net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP
+net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, UDP shell
 fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
 mm/         Memory: page tables, page allocator, pool allocator
 lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, stdlib

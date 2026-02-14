@@ -11,6 +11,7 @@ Parameters::Parameters()
     , SmpOff(false)
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
+    , UdpShellPort(0)
 {
 }
 
@@ -56,6 +57,11 @@ bool Parameters::IsDhcpAuto()
 bool Parameters::IsDhcpOff()
 {
     return DhcpMd == DhcpOff;
+}
+
+u16 Parameters::GetUdpShellPort()
+{
+    return UdpShellPort;
 }
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
@@ -158,6 +164,18 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         else
         {
             Trace(0, "Unknown value %s, key %s", value, key);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "udpshell") == 0)
+    {
+        ulong port = 0;
+        if (Stdlib::ParseUlong(value, port) && port > 0 && port <= 65535)
+        {
+            UdpShellPort = (u16)port;
+        }
+        else
+        {
+            Trace(0, "Invalid udpshell port %s", value);
         }
     }
     else

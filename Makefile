@@ -49,6 +49,7 @@ CXX_SRC =   \
     net/arp.cpp \
     net/dhcp.cpp \
     net/icmp.cpp \
+    net/udp_shell.cpp \
     fs/vfs.cpp \
     fs/ramfs.cpp \
     fs/block_io.cpp \
