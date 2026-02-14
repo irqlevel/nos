@@ -22,6 +22,11 @@ RamFs::RamFs()
 
 RamFs::~RamFs()
 {
+    Unmount();
+}
+
+void RamFs::Unmount()
+{
     FreeTree(&Root);
 }
 

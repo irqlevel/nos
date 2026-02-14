@@ -65,11 +65,11 @@ public:
     NanoFs(BlockDevice* dev);
     virtual ~NanoFs();
 
-    bool Init();
-
     virtual const char* GetName() override;
     virtual bool Format(BlockDevice* dev) override;
     virtual void GetInfo(char* buf, ulong bufSize) override;
+    virtual bool Mount() override;
+    virtual void Unmount() override;
     virtual VNode* GetRoot() override;
     virtual VNode* Lookup(VNode* dir, const char* name) override;
     virtual VNode* CreateFile(VNode* dir, const char* name) override;

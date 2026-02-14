@@ -12,6 +12,7 @@ public:
     virtual ~RamFs();
 
     virtual const char* GetName() override;
+    virtual void Unmount() override;
     virtual VNode* GetRoot() override;
     virtual VNode* Lookup(VNode* dir, const char* name) override;
     virtual VNode* CreateFile(VNode* dir, const char* name) override;
