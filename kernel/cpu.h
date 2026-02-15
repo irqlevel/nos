@@ -17,6 +17,7 @@ struct IPITask
 {
     using Func = void (*)(void* ctx, Context* ipiCtx);
 
+    IPITask();
     IPITask(Func func, void* ctx);
 
     Func Function;
@@ -52,10 +53,9 @@ public:
     bool Run(Task::Func func, void *ctx);
 
     void SendIPISelf();
-    void RequestTlbFlush();
-    void FlushTlbIfNeeded();
 
     void QueueIPITask(IPITask& task);
+    void QueueIPITaskAsync(IPITask& task);
 
     TaskQueue& GetTaskQueue();
 
@@ -76,7 +76,6 @@ private:
     Task* IdleTaskPtr;
     TaskQueue TaskQueue;
     Atomic IPIConter;
-    Atomic TlbFlushPending;
 
     RawSpinLock IPITaskLock;
     Stdlib::ListEntry IPITaskList;
@@ -119,9 +118,6 @@ public:
     void SendIPIAll();
 
     void InvalidateTlbAll();
-
-    Atomic TlbFlushAckCounter;
-    Atomic TlbShootdownActive;
 
     void Reset();
 
