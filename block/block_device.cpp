@@ -6,6 +6,18 @@
 namespace Kernel
 {
 
+bool BlockDevice::InterruptsStarted = false;
+
+void BlockDevice::SetInterruptsStarted()
+{
+    InterruptsStarted = true;
+}
+
+bool BlockDevice::GetInterruptsStarted()
+{
+    return InterruptsStarted;
+}
+
 BlockDeviceTable::BlockDeviceTable()
     : Count(0)
 {

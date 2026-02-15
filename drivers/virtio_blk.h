@@ -3,9 +3,12 @@
 #include <include/types.h>
 #include <kernel/interrupt.h>
 #include <block/block_device.h>
+#include <block/block_request.h>
 #include <kernel/spin_lock.h>
+#include <kernel/raw_spin_lock.h>
 #include <kernel/atomic.h>
 #include <kernel/asm.h>
+#include <lib/list_entry.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_pci.h>
@@ -36,6 +39,15 @@ public:
 
     void Interrupt(Context* ctx);
 
+    /* Submit a block request (caller context). */
+    void Submit(BlockRequest* req);
+
+    /* Drain pending requests and submit to hardware (softirq context). */
+    void DrainQueue();
+
+    /* Complete finished I/Os (interrupt context). */
+    void CompleteIO();
+
     /* Discover and initialize all virtio-blk devices. */
     static void InitAll();
 
@@ -44,8 +56,6 @@ private:
     VirtioBlk(VirtioBlk&& other) = delete;
     VirtioBlk& operator=(const VirtioBlk& other) = delete;
     VirtioBlk& operator=(VirtioBlk&& other) = delete;
-
-    bool DoIO(u32 type, u64 sector, void* buf, u32 sectorCount);
 
     /* Virtio-blk request types */
     static const u32 TypeIn    = 0; /* Read */
@@ -64,11 +74,27 @@ private:
 
     static_assert(sizeof(VirtioBlkReq) == 16, "Invalid size");
 
+    static const ulong MaxSlots = 8;
+
+    struct DmaSlot
+    {
+        VirtioBlkReq* ReqHeader;
+        ulong ReqHeaderPhys;
+        u8* StatusBuf;
+        ulong StatusBufPhys;
+        BlockRequest* Request;
+        int Head;
+    };
+
+    void WaitForCompletion(BlockRequest& req);
+    int AllocSlot();
+    void FreeSlot(int idx);
+
     VirtioPci Transport;
     volatile void* QueueNotifyAddr;
     VirtQueue Queue;
+    RawSpinLock VirtQueueLock; /* Protects Queue (AddBufs/GetUsed share free chain) */
     u64 CapacitySectors;
-    SpinLock IoLock;
     Atomic InterruptCounter;
     int IntVector;
 
@@ -76,13 +102,14 @@ private:
     bool Initialized;
     bool HasFlush;
 
-    /* DMA buffers (identity-mapped) */
-    VirtioBlkReq* ReqHeader;
-    ulong ReqHeaderPhys;
-    u8* DataBuf;
-    ulong DataBufPhys;
-    u8* StatusBuf;
-    ulong StatusBufPhys;
+    /* Request queue (protected by QueueLock) */
+    SpinLock QueueLock;
+    Stdlib::ListEntry RequestQueue;
+
+    /* DMA slot pool */
+    DmaSlot Slots[MaxSlots];
+    DmaSlot* SlotByHead[256]; /* descriptor head -> slot lookup */
+    Atomic FreeSlotMask;      /* bitmap, bit set = slot free */
 
     static const ulong MaxInstances = 8;
 

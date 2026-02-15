@@ -27,6 +27,7 @@ public:
     void Register(ulong type, void (*handler)(void* ctx), void* ctx);
 
     static const ulong TypeNetRx = 0;
+    static const ulong TypeBlkIo = 1;
     static const ulong MaxTypes = 8;
 
 private:

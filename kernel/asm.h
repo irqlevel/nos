@@ -127,6 +127,12 @@ static inline void Invlpg(unsigned long addr)
         asm volatile("invlpg (%0)" ::"r" (addr) : "memory");
 }
 
+static inline void Pause(ulong count)
+{
+    for (ulong i = 0; i < count; i++)
+        Pause();
+}
+
 namespace Kernel
 {
 

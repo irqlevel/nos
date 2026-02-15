@@ -177,6 +177,8 @@ public:
     ulong TmpUnmapPage(ulong virtAddr);
     ulong TmpMapAddress(ulong phyAddr);
 
+    ulong VirtToPhys(ulong virtAddr);
+
     ulong GetFreePagesCount();
     ulong GetTotalPagesCount();
 

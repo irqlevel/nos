@@ -16,6 +16,14 @@ public:
     virtual bool Flush() { return true; }
     virtual bool ReadSectors(u64 sector, void* buf, u32 count) = 0;
     virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) = 0;
+
+    /* Set once interrupts and the scheduler are running.
+       Before this, synchronous I/O must poll for completion. */
+    static void SetInterruptsStarted();
+    static bool GetInterruptsStarted();
+
+private:
+    static bool InterruptsStarted;
 };
 
 class BlockDeviceTable
