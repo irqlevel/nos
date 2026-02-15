@@ -19,6 +19,9 @@
 #include "entropy.h"
 #include "console.h"
 #include "mutex.h"
+#include "task.h"
+#include "stack_trace.h"
+#include "symtab.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
@@ -884,6 +887,130 @@ static void CmdRandom(const char* args, Stdlib::Printer& con)
     con.Printf("\n");
 }
 
+static void DumpStackTrace(ulong* frames, size_t count, Stdlib::Printer& con)
+{
+    auto& symtab = SymbolTable::GetInstance();
+    for (size_t i = 0; i < count; i++)
+    {
+        const char* name;
+        ulong offset;
+        if (symtab.Resolve(frames[i], name, offset))
+            con.Printf("  [%u] 0x%p %s+0x%p\n", (ulong)i, frames[i], name, offset);
+        else
+            con.Printf("  [%u] 0x%p\n", (ulong)i, frames[i]);
+    }
+}
+
+struct BtCtx
+{
+    ulong Frames[16];
+    size_t Count;
+};
+
+static void CmdBtIPIFunc(void* ctx, Context* ipiCtx)
+{
+    auto* bt = static_cast<BtCtx*>(ctx);
+    bt->Count = StackTrace::CaptureFrom(ipiCtx->Rbp, bt->Frames, Stdlib::ArraySize(bt->Frames));
+}
+
+static void CmdBt(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pidStart = Stdlib::NextToken(args, end);
+    if (!pidStart)
+    {
+        con.Printf("usage: bt <pid>\n");
+        return;
+    }
+
+    char pidBuf[16];
+    Stdlib::TokenCopy(pidStart, end, pidBuf, sizeof(pidBuf));
+
+    ulong pid = 0;
+    if (!Stdlib::ParseUlong(pidBuf, pid))
+    {
+        con.Printf("invalid pid\n");
+        return;
+    }
+
+    ObjectPtr<Task> task(TaskTable::GetInstance().Lookup(pid));
+    if (!task)
+    {
+        con.Printf("task %u not found\n", pid);
+        return;
+    }
+
+    ulong frames[16];
+    size_t count = 0;
+
+    Task* self = Task::GetCurrentTask();
+    if (task.Get() == self)
+    {
+        /* Target is the current task on this CPU */
+        count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
+        con.Printf("task %u (%s) running on current cpu:\n", task->Pid, task->GetName());
+        DumpStackTrace(frames, count, con);
+        return;
+    }
+
+    long state = task->State.Get();
+    if (state == Task::StateRunning)
+    {
+        /* Task is running on another CPU — find which one */
+        ulong cpuMask = CpuTable::GetInstance().GetRunningCpus();
+        ulong runCpu = ~0UL;
+        for (ulong i = 0; i < MaxCpus; i++)
+        {
+            if (!(cpuMask & (1UL << i)))
+                continue;
+            auto& cpuTaskQueue = CpuTable::GetInstance().GetCpu(i).GetTaskQueue();
+            if (task->TaskQueue == &cpuTaskQueue)
+            {
+                runCpu = i;
+                break;
+            }
+        }
+
+        if (runCpu == ~0UL)
+        {
+            con.Printf("task %u (%s) running but cpu not found\n",
+                task->Pid, task->GetName());
+            return;
+        }
+
+        BtCtx btCtx;
+        btCtx.Count = 0;
+
+        IPITask ipiTask(CmdBtIPIFunc, &btCtx);
+        CpuTable::GetInstance().GetCpu(runCpu).QueueIPITask(ipiTask);
+
+        con.Printf("task %u (%s) running on cpu %u:\n",
+            task->Pid, task->GetName(), runCpu);
+        DumpStackTrace(btCtx.Frames, btCtx.Count, con);
+        return;
+    }
+
+    if (state == Task::StateExited)
+    {
+        con.Printf("task %u (%s) has exited\n", task->Pid, task->GetName());
+        return;
+    }
+
+    /* Task is waiting/sleeping — walk from saved context */
+    ulong savedRsp = task->Rsp;
+    if (savedRsp == 0)
+    {
+        con.Printf("task %u (%s) has no saved context\n", task->Pid, task->GetName());
+        return;
+    }
+
+    Context* ctx = reinterpret_cast<Context*>(savedRsp);
+    count = StackTrace::CaptureFrom(ctx->Rbp, frames, Stdlib::ArraySize(frames));
+
+    con.Printf("task %u (%s) state %u:\n", task->Pid, task->GetName(), (ulong)state);
+    DumpStackTrace(frames, count, con);
+}
+
 static void CmdPanic(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -959,6 +1086,7 @@ static const CmdEntry Commands[] = {
     { "del",       CmdDel,       "del <path> - remove file or directory" },
     { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
     { "version",   CmdVersion,   "version - show kernel version" },
+    { "bt",        CmdBt,        "bt <pid> - show task backtrace" },
     { "panic",     CmdPanic,     "panic [pf|div0|ud] - trigger kernel panic" },
     { "poweroff",  CmdPoweroff,  "poweroff - power off (ACPI S5)" },
     { "shutdown",  CmdPoweroff,  nullptr },

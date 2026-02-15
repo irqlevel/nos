@@ -79,6 +79,7 @@ global SwitchContext
 
 global AtomicInc
 global AtomicDec
+global AtomicAdd
 global AtomicRead
 global AtomicWrite
 global AtomicReadAndDec
@@ -401,6 +402,11 @@ AtomicInc:
 
 AtomicDec:
 	lock dec qword [rdi]
+	ret
+
+AtomicAdd:
+	; rdi = *pvalue, rsi = delta
+	lock xadd qword [rdi], rsi
 	ret
 
 AtomicRead:

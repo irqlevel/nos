@@ -14,11 +14,19 @@
 namespace Kernel
 {
 
+IPITask::IPITask(Func func, void* ctx)
+    : Function(func)
+    , Ctx(ctx)
+    , Completion(1)
+{
+}
+
 Cpu::Cpu()
     : Index(0)
     , State(0)
     , IdleTaskPtr(nullptr)
 {
+    IPITaskList.Init();
 }
 
 ulong Cpu::GetIndex()
@@ -345,10 +353,11 @@ void CpuTable::InvalidateTlbAll()
 
 void Cpu::IPI(Context* ctx)
 {
-    (void)ctx;
     IPIConter.Inc();
 
     FlushTlbIfNeeded();
+
+    ProcessIPITasks(ctx);
 
     if (Panicker::GetInstance().IsActive())
     {
@@ -384,6 +393,34 @@ void Cpu::IPI(Context* ctx)
     Lapic::EOI(CpuTable::IPIVector);
 
     Schedule();
+}
+
+void Cpu::QueueIPITask(IPITask& task)
+{
+    ulong flags = IPITaskLock.LockIrqSave();
+    IPITaskList.InsertTail(&task.ListEntry);
+    IPITaskLock.UnlockIrqRestore(flags);
+
+    SendIPISelf();
+    task.Completion.Wait();
+}
+
+void Cpu::ProcessIPITasks(Context* ctx)
+{
+    Stdlib::ListEntry localList;
+    localList.Init();
+
+    ulong flags = IPITaskLock.LockIrqSave();
+    localList.MoveTailList(&IPITaskList);
+    IPITaskLock.UnlockIrqRestore(flags);
+
+    while (!localList.IsEmpty())
+    {
+        auto* entry = localList.RemoveHead();
+        IPITask* task = CONTAINING_RECORD(entry, IPITask, ListEntry);
+        task->Function(task->Ctx, ctx);
+        task->Completion.Done();
+    }
 }
 
 TaskQueue& Cpu::GetTaskQueue()

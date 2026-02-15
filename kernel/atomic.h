@@ -12,6 +12,7 @@ public:
     Atomic(long value);
     void Inc();
     void Dec();
+    void Add(long delta);
     bool DecAndTest();
     long Get();
     void Set(long value);
