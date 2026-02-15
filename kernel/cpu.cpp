@@ -14,6 +14,13 @@
 namespace Kernel
 {
 
+IPITask::IPITask()
+    : Function(nullptr)
+    , Ctx(nullptr)
+    , Completion(1)
+{
+}
+
 IPITask::IPITask(Func func, void* ctx)
     : Function(func)
     , Ctx(ctx)
@@ -228,7 +235,7 @@ void CpuTable::ExitAllExceptSelf()
     auto& self = GetCurrentCpu();
 
     ulong cpuMask = GetRunningCpus();
-    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    for (ulong i = 0; i < MaxCpus; i++)
     {
         if ((cpuMask & (1UL << i)) && (i != self.GetIndex()))
         {
@@ -247,7 +254,7 @@ void CpuTable::ExitAllExceptSelf()
 void CpuTable::SendIPIAllExclude(ulong excludeIndex)
 {
     ulong cpuMask = GetRunningCpus();
-    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    for (ulong i = 0; i < MaxCpus; i++)
     {
         if ((cpuMask & (1UL << i)) && (i != excludeIndex))
         {
@@ -261,7 +268,7 @@ void CpuTable::SendIPIAllExclude(ulong excludeIndex)
 void CpuTable::SendIPIAll()
 {
     ulong cpuMask = GetRunningCpus();
-    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    for (ulong i = 0; i < MaxCpus; i++)
     {
         if ((cpuMask & (1UL << i)))
         {
@@ -281,81 +288,54 @@ void Cpu::OnPanic()
     }
 }
 
-void Cpu::RequestTlbFlush()
+static void TlbFlushFunc(void* ctx, Context* ipiCtx)
 {
-    TlbFlushPending.Set(1);
-}
-
-void Cpu::FlushTlbIfNeeded()
-{
-    if (TlbFlushPending.Get())
-    {
-        TlbFlushPending.Set(0);
-        Mm::PageTable::InvalidateLocalTlb();
-        CpuTable::GetInstance().TlbFlushAckCounter.Dec();
-    }
+    (void)ctx;
+    (void)ipiCtx;
+    Mm::PageTable::InvalidateLocalTlb();
 }
 
 void CpuTable::InvalidateTlbAll()
 {
-    /* Flush TLB on local CPU and request flush on all remote CPUs.
-       Waits until every remote CPU has acknowledged the flush.
-       Serialized via TlbShootdownActive (spin with IRQs enabled so
-       the waiting CPU can still service IPIs). */
     Mm::PageTable::InvalidateLocalTlb();
-
-    while (TlbShootdownActive.Cmpxchg(1, 0) != 0)
-        Pause();
 
     ulong localId = GetCurrentCpuId();
     ulong cpuMask = GetRunningCpus() & ~(1UL << localId);
 
-    /* Skip CPUs that have already exited (halted with IRQs off) —
-       they can never acknowledge an IPI. */
-    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    /* Skip CPUs that have already exited (halted with IRQs off) */
+    for (ulong i = 0; i < MaxCpus; i++)
     {
         if ((cpuMask & (1UL << i)) &&
             (CpuArray[i].GetState() & Cpu::StateExited))
             cpuMask &= ~(1UL << i);
     }
 
-    long remoteCount = 0;
-    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
-    {
-        if (cpuMask & (1UL << i))
-            remoteCount++;
-    }
-
-    if (remoteCount == 0)
-    {
-        TlbShootdownActive.Set(0);
+    if (cpuMask == 0)
         return;
-    }
 
-    TlbFlushAckCounter.Set(remoteCount);
+    IPITask tasks[MaxCpus];
 
-    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    for (ulong i = 0; i < MaxCpus; i++)
     {
         if (cpuMask & (1UL << i))
         {
-            CpuArray[i].RequestTlbFlush();
-            CpuArray[i].SendIPISelf();
+            tasks[i].Function = TlbFlushFunc;
+            CpuArray[i].QueueIPITaskAsync(tasks[i]);
         }
     }
 
-    while (TlbFlushAckCounter.Get() > 0)
+    for (ulong i = 0; i < MaxCpus; i++)
     {
-        Pause();
+        if (cpuMask & (1UL << i))
+            tasks[i].Completion.Wait();
+        else
+            tasks[i].Completion.Done();
     }
-
-    TlbShootdownActive.Set(0);
 }
 
 void Cpu::IPI(Context* ctx)
 {
     IPIConter.Inc();
-
-    FlushTlbIfNeeded();
 
     ProcessIPITasks(ctx);
 
@@ -395,13 +375,18 @@ void Cpu::IPI(Context* ctx)
     Schedule();
 }
 
-void Cpu::QueueIPITask(IPITask& task)
+void Cpu::QueueIPITaskAsync(IPITask& task)
 {
     ulong flags = IPITaskLock.LockIrqSave();
     IPITaskList.InsertTail(&task.ListEntry);
     IPITaskLock.UnlockIrqRestore(flags);
 
     SendIPISelf();
+}
+
+void Cpu::QueueIPITask(IPITask& task)
+{
+    QueueIPITaskAsync(task);
     task.Completion.Wait();
 }
 
