@@ -69,6 +69,7 @@ CXX_SRC =   \
     kernel/stack_trace.cpp \
     kernel/entropy.cpp \
     lib/stdlib.cpp  \
+    lib/format.cpp \
     lib/bitmap.cpp \
     lib/checksum.cpp \
     lib/list_entry.cpp  \

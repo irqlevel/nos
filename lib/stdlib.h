@@ -286,9 +286,11 @@ char GetDecDigit(u8 val);
 
 char GetHexDigit(u8 val);
 
-int __UlongToString(ulong src, u8 dst_base, char *dst, size_t dst_size);
+char GetHexDigitLower(u8 val);
 
-int UlongToString(ulong src, u8 dst_base, char *dst, size_t dst_size);
+int __UlongToString(ulong src, u8 dst_base, char *dst, size_t dst_size, bool lowercase = false);
+
+int UlongToString(ulong src, u8 dst_base, char *dst, size_t dst_size, bool lowercase = false);
 
 int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg);
 
