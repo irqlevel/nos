@@ -312,7 +312,7 @@ TaskQueue* Task::SelectNextTaskQueue()
     ulong cpuMask = CpuTable::GetInstance().GetRunningCpus() & CpuAffinity;
     if (cpuMask != 0)
     {
-        for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+        for (ulong i = 0; i < MaxCpus; i++)
         {
             if (cpuMask & (1UL << i))
             {
