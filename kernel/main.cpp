@@ -317,7 +317,7 @@ void BpStartup(void* ctx)
     VgaTerm::GetInstance().Printf("IPI test...\n");
 
     ulong cpuMask = cpus.GetRunningCpus();
-    for (ulong i = 0; i < 8 * sizeof(ulong); i++)
+    for (ulong i = 0; i < MaxCpus; i++)
     {
         if (cpuMask & (1UL << i))
         {
