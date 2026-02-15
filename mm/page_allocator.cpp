@@ -77,7 +77,7 @@ void* FixedPageAllocator::Alloc()
         }
     }
 
-    PageTable::InvalidateLocalTlb();
+    PageTable::InvalidateLocalTlbRange(va, PageCount);
     return (void*)va;
 }
 
@@ -106,7 +106,7 @@ void* FixedPageAllocator::Map(Page* pages)
         }
     }
 
-    PageTable::InvalidateLocalTlb();
+    PageTable::InvalidateLocalTlbRange(va, PageCount);
     return (void*)va;
 }
 
@@ -140,7 +140,7 @@ void* FixedPageAllocator::MapPhys(ulong* physAddrs, size_t count)
         page->Put(); /* Balance GetPage's Get after MapPage succeeded */
     }
 
-    PageTable::InvalidateLocalTlb();
+    PageTable::InvalidateLocalTlbRange(va, count);
     return (void*)va;
 }
 
@@ -158,7 +158,7 @@ bool FixedPageAllocator::Unmap(void* addr, size_t count)
         page->Put(); /* Undo MapPage's Get */
     }
 
-    Kernel::CpuTable::GetInstance().InvalidateTlbAll();
+    Kernel::CpuTable::GetInstance().InvalidateTlbRange((ulong)addr, count);
     VaAlloc.Free((ulong)addr);
     return true;
 }
@@ -176,7 +176,7 @@ bool FixedPageAllocator::Free(void* addr)
         page->Put();
     }
 
-    Kernel::CpuTable::GetInstance().InvalidateTlbAll();
+    Kernel::CpuTable::GetInstance().InvalidateTlbRange((ulong)addr, PageCount);
     VaAlloc.Free((ulong)addr);
     return true;
 }

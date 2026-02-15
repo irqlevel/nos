@@ -296,14 +296,25 @@ static void TlbFlushFunc(void* ctx, Context* ipiCtx)
     Mm::PageTable::InvalidateLocalTlb();
 }
 
-void CpuTable::InvalidateTlbAll()
+struct TlbRangeCtx
 {
-    Mm::PageTable::InvalidateLocalTlb();
+    ulong VirtAddr;
+    ulong Count;
+};
 
+static void TlbFlushRangeFunc(void* ctx, Context* ipiCtx)
+{
+    (void)ipiCtx;
+    auto* rc = (TlbRangeCtx*)ctx;
+    Mm::PageTable::InvalidateLocalTlbRange(rc->VirtAddr, rc->Count);
+}
+
+/* Build a running-CPU mask excluding the local CPU and exited CPUs. */
+ulong CpuTable::GetRemoteCpuMask()
+{
     ulong localId = GetCurrentCpuId();
     ulong cpuMask = GetRunningCpus() & ~(1UL << localId);
 
-    /* Skip CPUs that have already exited (halted with IRQs off) */
     for (ulong i = 0; i < MaxCpus; i++)
     {
         if ((cpuMask & (1UL << i)) &&
@@ -311,18 +322,15 @@ void CpuTable::InvalidateTlbAll()
             cpuMask &= ~(1UL << i);
     }
 
-    if (cpuMask == 0)
-        return;
+    return cpuMask;
+}
 
-    IPITask tasks[MaxCpus];
-
+void CpuTable::SendTlbIPI(ulong cpuMask, IPITask tasks[MaxCpus])
+{
     for (ulong i = 0; i < MaxCpus; i++)
     {
         if (cpuMask & (1UL << i))
-        {
-            tasks[i].Function = TlbFlushFunc;
             CpuArray[i].QueueIPITaskAsync(tasks[i]);
-        }
     }
 
     for (ulong i = 0; i < MaxCpus; i++)
@@ -332,6 +340,77 @@ void CpuTable::InvalidateTlbAll()
         else
             tasks[i].Completion.Done();
     }
+}
+
+void CpuTable::InvalidateTlbAll()
+{
+    Mm::PageTable::InvalidateLocalTlb();
+
+    ulong cpuMask = GetRemoteCpuMask();
+    if (cpuMask == 0)
+        return;
+
+    IPITask tasks[MaxCpus];
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (cpuMask & (1UL << i))
+            tasks[i].Function = TlbFlushFunc;
+    }
+
+    SendTlbIPI(cpuMask, tasks);
+}
+
+void CpuTable::InvalidateTlbAddress(ulong virtAddr)
+{
+    Mm::PageTable::InvalidateLocalTlbAddress(virtAddr);
+
+    ulong cpuMask = GetRemoteCpuMask();
+    if (cpuMask == 0)
+        return;
+
+    TlbRangeCtx rc;
+    rc.VirtAddr = virtAddr;
+    rc.Count = 1;
+
+    IPITask tasks[MaxCpus];
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (cpuMask & (1UL << i))
+        {
+            tasks[i].Function = TlbFlushRangeFunc;
+            tasks[i].Ctx = &rc;
+        }
+    }
+
+    SendTlbIPI(cpuMask, tasks);
+}
+
+void CpuTable::InvalidateTlbRange(ulong virtAddr, ulong count)
+{
+    Mm::PageTable::InvalidateLocalTlbRange(virtAddr, count);
+
+    ulong cpuMask = GetRemoteCpuMask();
+    if (cpuMask == 0)
+        return;
+
+    TlbRangeCtx rc;
+    rc.VirtAddr = virtAddr;
+    rc.Count = count;
+
+    IPITask tasks[MaxCpus];
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (cpuMask & (1UL << i))
+        {
+            tasks[i].Function = TlbFlushRangeFunc;
+            tasks[i].Ctx = &rc;
+        }
+    }
+
+    SendTlbIPI(cpuMask, tasks);
 }
 
 void Cpu::IPI(Context* ctx)
