@@ -1418,6 +1418,214 @@ Stdlib::Error TestStrStr()
     return MakeSuccess();
 }
 
+Stdlib::Error TestSnPrintf()
+{
+    Trace(0, "TestSnPrintf: started");
+
+    char buf[128];
+    int rc;
+
+    /* Existing specifiers still work */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "hello %s", "world");
+    if (rc < 0 || Stdlib::StrCmp(buf, "hello world") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%s failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%u", (ulong)42);
+    if (rc < 0 || Stdlib::StrCmp(buf, "42") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%u failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%c", (int)'A');
+    if (rc < 0 || Stdlib::StrCmp(buf, "A") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%c failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%u", (ulong)0);
+    if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%u zero failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* %% literal percent */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "100%%");
+    if (rc < 0 || Stdlib::StrCmp(buf, "100%") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%%% failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%%start");
+    if (rc < 0 || Stdlib::StrCmp(buf, "%start") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%%% at start failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* %d signed decimal */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d", (long)42);
+    if (rc < 0 || Stdlib::StrCmp(buf, "42") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%d positive failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d", (long)-1);
+    if (rc < 0 || Stdlib::StrCmp(buf, "-1") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%d -1 failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d", (long)-12345);
+    if (rc < 0 || Stdlib::StrCmp(buf, "-12345") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%d negative failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d", (long)0);
+    if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%d zero failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* %x lowercase hex */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%x", (ulong)0);
+    if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%x zero failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%x", (ulong)0xDEAD);
+    if (rc < 0 || Stdlib::StrCmp(buf, "dead") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%x deadbeef failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%x", (ulong)255);
+    if (rc < 0 || Stdlib::StrCmp(buf, "ff") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%x 255 failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* %X uppercase hex */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%X", (ulong)0xDEAD);
+    if (rc < 0 || Stdlib::StrCmp(buf, "DEAD") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%X failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%X", (ulong)255);
+    if (rc < 0 || Stdlib::StrCmp(buf, "FF") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%X 255 failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Zero-padded width: %08x */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%08x", (ulong)0xFF);
+    if (rc < 0 || Stdlib::StrCmp(buf, "000000ff") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%08x failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%016X", (ulong)0xABCD1234);
+    if (rc < 0 || Stdlib::StrCmp(buf, "00000000ABCD1234") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%016X failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Zero-padded decimal: %05u */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%05u", (ulong)42);
+    if (rc < 0 || Stdlib::StrCmp(buf, "00042") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%05u failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Zero-padded signed: %05d with negative */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%05d", (long)-42);
+    if (rc < 0 || Stdlib::StrCmp(buf, "-0042") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%05d negative failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Zero-padded signed: value fills width */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%03d", (long)12345);
+    if (rc < 0 || Stdlib::StrCmp(buf, "12345") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%03d overflow failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Width with no zero-pad (space padding) */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%5u", (ulong)42);
+    if (rc < 0 || Stdlib::StrCmp(buf, "   42") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%5u space pad failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%8x", (ulong)0xFF);
+    if (rc < 0 || Stdlib::StrCmp(buf, "      ff") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%8x space pad failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* String with width */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%10s", "hi");
+    if (rc < 0 || Stdlib::StrCmp(buf, "        hi") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%10s failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Mixed specifiers in one format string */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d %u %x %X %s %%",
+                          (long)-7, (ulong)100, (ulong)0xAB, (ulong)0xCD, "ok");
+    if (rc < 0 || Stdlib::StrCmp(buf, "-7 100 ab CD ok %") != 0)
+    {
+        Trace(0, "TestSnPrintf: mixed failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Null string */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%s", (const char*)nullptr);
+    if (rc < 0 || Stdlib::StrCmp(buf, "(null)") != 0)
+    {
+        Trace(0, "TestSnPrintf: null string failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* %p still works (uppercase hex) */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%p", (void*)(ulong)0xABCDEF);
+    if (rc < 0 || Stdlib::StrCmp(buf, "ABCDEF") != 0)
+    {
+        Trace(0, "TestSnPrintf: %%p failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    Trace(0, "TestSnPrintf: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
@@ -1489,6 +1697,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestStrStr();
+    if (!err.Ok())
+        return err;
+
+    err = TestSnPrintf();
     if (!err.Ok())
         return err;
 
