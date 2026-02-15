@@ -708,6 +708,17 @@ void PageTable::InvalidateLocalTlb()
     SetCr3(GetCr3());
 }
 
+void PageTable::InvalidateLocalTlbAddress(ulong virtAddr)
+{
+    Invlpg(virtAddr);
+}
+
+void PageTable::InvalidateLocalTlbRange(ulong virtAddr, ulong count)
+{
+    for (ulong i = 0; i < count; i++)
+        Invlpg(virtAddr + i * Const::PageSize);
+}
+
 ulong PageTable::TmpMapAddress(ulong phyAddr)
 {
     ulong phyPage = phyAddr & ~(Const::PageSize - 1);

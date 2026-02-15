@@ -118,6 +118,8 @@ public:
     void SendIPIAll();
 
     void InvalidateTlbAll();
+    void InvalidateTlbAddress(ulong virtAddr);
+    void InvalidateTlbRange(ulong virtAddr, ulong count);
 
     void Reset();
 
@@ -130,6 +132,8 @@ private:
     CpuTable& operator=(CpuTable&& other) = delete;
 
     ulong GetBspIndexLockHeld();
+    ulong GetRemoteCpuMask();
+    void SendTlbIPI(ulong cpuMask, IPITask tasks[MaxCpus]);
 
     SpinLock Lock;
     Cpu CpuArray[MaxCpus];
