@@ -2,6 +2,8 @@
 
 #include <lib/stdlib.h>
 
+#include "atomic.h"
+
 namespace Kernel
 {
 
@@ -18,6 +20,35 @@ public:
     /* Called by shared interrupt dispatch. Override to handle the interrupt.
        Must NOT call Lapic::EOI() -- the shared dispatcher does that. */
     virtual void OnInterrupt(Context* ctx) { (void)ctx; }
+};
+
+enum InterruptSource : u8
+{
+    IrqPit = 0,
+    IrqIO8042,
+    IrqSerial,
+    IrqVirtioBlk,
+    IrqVirtioNet,
+    IrqVirtioScsi,
+    IrqIPI,
+    IrqShared,
+    IrqDummy,
+    IrqMax,
+};
+
+class InterruptStats
+{
+public:
+    static void Inc(InterruptSource src);
+    static long Get(InterruptSource src);
+    static const char* GetName(InterruptSource src);
+    static constexpr ulong Count = IrqMax;
+
+private:
+    InterruptStats() = delete;
+    ~InterruptStats() = delete;
+
+    static Atomic Counters[IrqMax];
 };
 
 class Interrupt

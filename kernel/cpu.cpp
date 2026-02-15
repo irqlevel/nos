@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include "interrupt.h"
 #include "panic.h"
 #include "trace.h"
 #include "watchdog.h"
@@ -415,6 +416,7 @@ TaskQueue& Cpu::GetTaskQueue()
 
 extern "C" void IPInterrupt(Context* ctx)
 {
+    InterruptStats::Inc(IrqIPI);
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
     cpu.IPI(ctx);
 }

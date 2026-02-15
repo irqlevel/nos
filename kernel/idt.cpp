@@ -1,5 +1,6 @@
 #include "idt.h"
 #include "asm.h"
+#include "interrupt.h"
 #include "trace.h"
 
 #include <lib/stdlib.h>
@@ -70,6 +71,7 @@ void Idt::DummyInterrupt()
 
 extern "C" void DummyInterrupt()
 {
+    InterruptStats::Inc(IrqDummy);
     Idt::GetInstance().DummyInterrupt();
 }
 

@@ -4,6 +4,7 @@
 
 #include <kernel/asm.h>
 #include <kernel/idt.h>
+#include <kernel/interrupt.h>
 #include <lib/stdlib.h>
 
 namespace Kernel
@@ -249,6 +250,7 @@ void Serial::Interrupt(Context* ctx)
 
 extern "C" void SerialInterrupt(Context* ctx)
 {
+    InterruptStats::Inc(IrqSerial);
     Serial::GetInstance().Interrupt(ctx);
 }
 

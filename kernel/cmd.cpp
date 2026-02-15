@@ -3,6 +3,7 @@
 #include "asm.h"
 #include "dmesg.h"
 #include "cpu.h"
+#include "interrupt.h"
 #include "time.h"
 #include "watchdog.h"
 #include <block/block_device.h>
@@ -128,6 +129,18 @@ static void CmdMemusage(const char* args, Stdlib::Printer& con)
 
     con.Printf("freePages: %u\n", pt.GetFreePagesCount());
     con.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
+}
+
+static void CmdIrqstat(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    for (ulong i = 0; i < InterruptStats::Count; i++)
+    {
+        InterruptSource src = (InterruptSource)i;
+        long count = InterruptStats::Get(src);
+        if (count > 0)
+            con.Printf("%s: %u\n", InterruptStats::GetName(src), count);
+    }
 }
 
 static void CmdPci(const char* args, Stdlib::Printer& con)
@@ -1063,6 +1076,7 @@ static const CmdEntry Commands[] = {
     { "ps",        CmdPs,        "ps - show tasks" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },
+    { "irqstat",   CmdIrqstat,   "irqstat - show interrupt statistics" },
     { "pci",       CmdPci,       "pci - show pci devices" },
     { "disks",     CmdDisks,     "disks - list block devices" },
     { "partitions", CmdPartitions, "partitions <disk> - show partition table" },
