@@ -1,4 +1,5 @@
 #include "virtio_blk.h"
+#include "virtio_scsi.h"
 #include "lapic.h"
 #include "ioapic.h"
 
@@ -7,7 +8,10 @@
 #include <kernel/panic.h>
 #include <kernel/interrupt.h>
 #include <kernel/idt.h>
+#include <kernel/softirq.h>
 #include <mm/new.h>
+#include <mm/page_table.h>
+#include <include/const.h>
 
 namespace Kernel
 {
@@ -21,14 +25,10 @@ VirtioBlk::VirtioBlk()
     , IntVector(-1)
     , Initialized(false)
     , HasFlush(false)
-    , ReqHeader(nullptr)
-    , ReqHeaderPhys(0)
-    , DataBuf(nullptr)
-    , DataBufPhys(0)
-    , StatusBuf(nullptr)
-    , StatusBufPhys(0)
 {
     DevName[0] = '\0';
+    Stdlib::MemSet(Slots, 0, sizeof(Slots));
+    Stdlib::MemSet(SlotByHead, 0, sizeof(SlotByHead));
 }
 
 VirtioBlk::~VirtioBlk()
@@ -140,28 +140,36 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     Trace(0, "VirtioBlk %s: capacity %u sectors (%u MB)",
         name, CapacitySectors, (CapacitySectors * 512) / (1024 * 1024));
 
-    /* Allocate pages for DMA buffers (request header, data, status). */
+    /* Allocate 1 DMA page for all slot headers and status bytes.
+       Layout: MaxSlots * VirtioBlkReq (16 bytes each) followed by
+               MaxSlots * 1-byte status buffers.
+       Total: MaxSlots * 17 bytes = 136 bytes, fits in one 4KB page. */
     ulong dmaPhys;
-    void* dmaPtr = Mm::AllocMapPages(2, &dmaPhys);
+    void* dmaPtr = Mm::AllocMapPages(1, &dmaPhys);
     if (!dmaPtr)
     {
-        Trace(0, "VirtioBlk %s: failed to alloc DMA pages", name);
+        Trace(0, "VirtioBlk %s: failed to alloc DMA page", name);
         Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
     ulong dmaVirt = (ulong)dmaPtr;
+    Stdlib::MemSet(dmaPtr, 0, Const::PageSize);
 
-    /* Layout within the 2 DMA pages:
-       Offset 0:   VirtioBlkReq header (16 bytes)
-       Offset 16:  status byte (1 byte)
-       Offset 4096: data buffer (up to 4096 bytes, on page boundary for alignment) */
-    ReqHeader = (VirtioBlkReq*)dmaVirt;
-    ReqHeaderPhys = dmaPhys;
-    StatusBuf = (u8*)(dmaVirt + sizeof(VirtioBlkReq));
-    StatusBufPhys = dmaPhys + sizeof(VirtioBlkReq);
-    DataBuf = (u8*)(dmaVirt + Const::PageSize);
-    DataBufPhys = dmaPhys + Const::PageSize;
+    for (ulong i = 0; i < MaxSlots; i++)
+    {
+        Slots[i].ReqHeader = (VirtioBlkReq*)(dmaVirt + i * sizeof(VirtioBlkReq));
+        Slots[i].ReqHeaderPhys = dmaPhys + i * sizeof(VirtioBlkReq);
+        Slots[i].StatusBuf = (u8*)(dmaVirt + MaxSlots * sizeof(VirtioBlkReq) + i);
+        Slots[i].StatusBufPhys = dmaPhys + MaxSlots * sizeof(VirtioBlkReq) + i;
+        Slots[i].Request = nullptr;
+        Slots[i].Head = -1;
+    }
+
+    /* All slots start free */
+    FreeSlotMask.Set((1L << MaxSlots) - 1);
+
+    RequestQueue.Init();
 
     Initialized = true;
 
@@ -192,115 +200,243 @@ u64 VirtioBlk::GetSectorSize()
     return 512;
 }
 
-bool VirtioBlk::DoIO(u32 type, u64 sector, void* buf, u32 sectorCount)
+int VirtioBlk::AllocSlot()
 {
-    if (!Initialized)
-        return false;
-
-    u32 dataLen = 512 * sectorCount;
-    if (dataLen > Const::PageSize)
-        return false;
-
-    Stdlib::AutoLock lock(IoLock);
-
-    /* Build the request header */
-    ReqHeader->Type = type;
-    ReqHeader->Reserved = 0;
-    ReqHeader->Sector = sector;
-    *StatusBuf = 0xFF; /* Will be overwritten by device */
-
-    if (type == TypeFlush)
+    for (ulong i = 0; i < MaxSlots; i++)
     {
-        /* Flush: 2-descriptor chain (header + status, no data) */
-        Barrier();
-
-        VirtQueue::BufDesc bufs[2];
-        bufs[0].Addr = ReqHeaderPhys;
-        bufs[0].Len = sizeof(VirtioBlkReq);
-        bufs[0].Writable = false;
-
-        bufs[1].Addr = StatusBufPhys;
-        bufs[1].Len = 1;
-        bufs[1].Writable = true;
-
-        int head = Queue.AddBufs(bufs, 2);
-        if (head < 0)
+        if (FreeSlotMask.TestBit(i))
         {
-            Trace(0, "VirtioBlk %s: AddBufs failed", DevName);
-            return false;
+            if (FreeSlotMask.ClearBit(i))
+                return (int)i;
         }
     }
-    else
+    return -1;
+}
+
+void VirtioBlk::FreeSlot(int idx)
+{
+    if (idx >= 0 && (ulong)idx < MaxSlots)
     {
-        /* Copy data for write */
-        if (type == TypeOut)
+        Slots[idx].Request = nullptr;
+        Slots[idx].Head = -1;
+        FreeSlotMask.SetBit((ulong)idx);
+    }
+}
+
+void VirtioBlk::Submit(BlockRequest* req)
+{
+    {
+        Stdlib::AutoLock lock(QueueLock);
+        RequestQueue.InsertTail(&req->Link);
+    }
+    DrainQueue();
+}
+
+void VirtioBlk::DrainQueue()
+{
+    if (!Initialized)
+        return;
+
+    /* Dequeue up to MaxSlots requests under the lock */
+    BlockRequest* batch[MaxSlots];
+    ulong batchCount = 0;
+
+    {
+        Stdlib::AutoLock lock(QueueLock);
+        while (batchCount < MaxSlots && !RequestQueue.IsEmpty())
         {
-            Stdlib::MemCpy(DataBuf, buf, dataLen);
+            Stdlib::ListEntry* entry = RequestQueue.RemoveHead();
+            if (!entry)
+                break;
+            BlockRequest* req = CONTAINING_RECORD(entry, BlockRequest, Link);
+            batch[batchCount] = req;
+            batchCount++;
+        }
+    }
+
+    if (batchCount == 0)
+        return;
+
+    auto& pt = Mm::PageTable::GetInstance();
+    bool kicked = false;
+
+    for (ulong i = 0; i < batchCount; i++)
+    {
+        BlockRequest* req = batch[i];
+
+        int slotIdx = AllocSlot();
+        if (slotIdx < 0)
+        {
+            /* No free slots -- put request back at the head */
+            Stdlib::AutoLock lock(QueueLock);
+            RequestQueue.InsertHead(&req->Link);
+            /* Remaining requests stay in batch but we re-enqueue them too */
+            for (ulong j = i + 1; j < batchCount; j++)
+                RequestQueue.InsertTail(&batch[j]->Link);
+            break;
+        }
+
+        DmaSlot& slot = Slots[slotIdx];
+        slot.Request = req;
+
+        /* Build request header */
+        VirtioBlkReq* hdr = slot.ReqHeader;
+        if (req->RequestType == BlockRequest::Flush)
+        {
+            hdr->Type = TypeFlush;
+            hdr->Reserved = 0;
+            hdr->Sector = 0;
         }
         else
         {
-            Stdlib::MemSet(DataBuf, 0, dataLen);
+            hdr->Type = (req->RequestType == BlockRequest::Write) ? TypeOut : TypeIn;
+            hdr->Reserved = 0;
+            hdr->Sector = req->Sector;
         }
+
+        *slot.StatusBuf = 0xFF;
 
         Barrier();
 
-        /* Build 3-descriptor chain: header, data, status */
-        VirtQueue::BufDesc bufs[3];
+        int head = -1;
 
-        /* Descriptor 0: request header (device-readable) */
-        bufs[0].Addr = ReqHeaderPhys;
-        bufs[0].Len = sizeof(VirtioBlkReq);
-        bufs[0].Writable = false;
+        if (req->RequestType == BlockRequest::Flush)
+        {
+            /* Flush: 2-descriptor chain (header + status, no data) */
+            VirtQueue::BufDesc bufs[2];
+            bufs[0].Addr = slot.ReqHeaderPhys;
+            bufs[0].Len = sizeof(VirtioBlkReq);
+            bufs[0].Writable = false;
 
-        /* Descriptor 1: data buffer */
-        bufs[1].Addr = DataBufPhys;
-        bufs[1].Len = dataLen;
-        bufs[1].Writable = (type == TypeIn); /* Writable for reads */
+            bufs[1].Addr = slot.StatusBufPhys;
+            bufs[1].Len = 1;
+            bufs[1].Writable = true;
 
-        /* Descriptor 2: status byte (device-writable) */
-        bufs[2].Addr = StatusBufPhys;
-        bufs[2].Len = 1;
-        bufs[2].Writable = true;
+            ulong flags = VirtQueueLock.LockIrqSave();
+            head = Queue.AddBufs(bufs, 2);
+            VirtQueueLock.UnlockIrqRestore(flags);
+        }
+        else
+        {
+            /* Data I/O: 3-descriptor chain (header, data, status) */
+            ulong bufPhys = pt.VirtToPhys((ulong)req->Buffer);
+            if (bufPhys == 0)
+            {
+                Trace(0, "VirtioBlk %s: VirtToPhys failed for buf 0x%p", DevName, (ulong)req->Buffer);
+                req->Success = false;
+                req->Completion.Done();
+                FreeSlot(slotIdx);
+                continue;
+            }
 
-        int head = Queue.AddBufs(bufs, 3);
+            u32 dataLen = req->SectorCount * 512;
+
+            VirtQueue::BufDesc bufs[3];
+            bufs[0].Addr = slot.ReqHeaderPhys;
+            bufs[0].Len = sizeof(VirtioBlkReq);
+            bufs[0].Writable = false;
+
+            bufs[1].Addr = bufPhys;
+            bufs[1].Len = dataLen;
+            bufs[1].Writable = (req->RequestType == BlockRequest::Read);
+
+            bufs[2].Addr = slot.StatusBufPhys;
+            bufs[2].Len = 1;
+            bufs[2].Writable = true;
+
+            ulong flags = VirtQueueLock.LockIrqSave();
+            head = Queue.AddBufs(bufs, 3);
+            VirtQueueLock.UnlockIrqRestore(flags);
+        }
+
         if (head < 0)
         {
-            Trace(0, "VirtioBlk %s: AddBufs failed", DevName);
-            return false;
-        }
-    }
-
-    /* Kick the device */
-    Transport.NotifyQueue(0);
-
-    /* Poll for completion */
-    for (ulong i = 0; i < 10000000; i++)
-    {
-        if (Queue.HasUsed())
+            /* Ring full -- return this and remaining requests to the queue */
+            FreeSlot(slotIdx);
+            Stdlib::AutoLock lock(QueueLock);
+            RequestQueue.InsertHead(&req->Link);
+            for (ulong j = i + 1; j < batchCount; j++)
+                RequestQueue.InsertTail(&batch[j]->Link);
             break;
-        Pause();
+        }
+
+        if ((ulong)head >= sizeof(SlotByHead) / sizeof(SlotByHead[0]))
+        {
+            Trace(0, "VirtioBlk %s: head %u out of range", DevName, (ulong)head);
+            req->Success = false;
+            req->Completion.Done();
+            FreeSlot(slotIdx);
+            continue;
+        }
+
+        slot.Head = head;
+        SlotByHead[head] = &slot;
+        kicked = true;
     }
 
-    u32 usedId, usedLen;
-    if (!Queue.GetUsed(usedId, usedLen))
+    if (kicked)
+        Transport.NotifyQueue(0);
+}
+
+void VirtioBlk::CompleteIO()
+{
+    bool completed = false;
+
+    for (;;)
     {
-        Trace(0, "VirtioBlk %s: timeout waiting for IO", DevName);
-        return false;
+        u32 usedId, usedLen;
+
+        ulong flags = VirtQueueLock.LockIrqSave();
+        bool got = Queue.GetUsed(usedId, usedLen);
+        VirtQueueLock.UnlockIrqRestore(flags);
+
+        if (!got)
+            break;
+
+        if (usedId >= sizeof(SlotByHead) / sizeof(SlotByHead[0]))
+        {
+            Trace(0, "VirtioBlk %s: bad used id %u", DevName, (ulong)usedId);
+            continue;
+        }
+
+        DmaSlot* slot = SlotByHead[usedId];
+        if (!slot || !slot->Request)
+        {
+            Trace(0, "VirtioBlk %s: no slot for used id %u", DevName, (ulong)usedId);
+            continue;
+        }
+
+        SlotByHead[usedId] = nullptr;
+
+        BlockRequest* req = slot->Request;
+        req->Success = (*slot->StatusBuf == 0);
+
+        int slotIdx = (int)(slot - Slots);
+        FreeSlot(slotIdx);
+
+        req->Completion.Done();
+        completed = true;
     }
 
-    if (*StatusBuf != 0)
+    /* If we freed slots, there may be pending requests to drain */
+    if (completed)
+        SoftIrq::GetInstance().Raise(SoftIrq::TypeBlkIo);
+}
+
+void VirtioBlk::WaitForCompletion(BlockRequest& req)
+{
+    if (GetInterruptsStarted())
     {
-        Trace(0, "VirtioBlk %s: IO error status %u", DevName, (ulong)*StatusBuf);
-        return false;
+        req.Completion.Wait();
+        return;
     }
 
-    /* Copy data for read */
-    if (type == TypeIn)
+    /* Early boot: interrupts not yet enabled, poll for completion */
+    while (req.Completion.GetCounter() != 0)
     {
-        Stdlib::MemCpy(buf, DataBuf, dataLen);
+        CompleteIO();
+        Pause(100);
     }
-
-    return true;
 }
 
 bool VirtioBlk::ReadSectors(u64 sector, void* buf, u32 count)
@@ -309,7 +445,17 @@ bool VirtioBlk::ReadSectors(u64 sector, void* buf, u32 count)
         return true;
     if ((u64)count * 512 > Const::PageSize)
         return false;
-    return DoIO(TypeIn, sector, buf, count);
+
+    BlockRequest req;
+    req.RequestType = BlockRequest::Read;
+    req.Sector = sector;
+    req.SectorCount = count;
+    req.Buffer = buf;
+
+    Submit(&req);
+    WaitForCompletion(req);
+
+    return req.Success;
 }
 
 bool VirtioBlk::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
@@ -318,7 +464,17 @@ bool VirtioBlk::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
         return true;
     if ((u64)count * 512 > Const::PageSize)
         return false;
-    if (!DoIO(TypeOut, sector, (void*)buf, count))
+
+    BlockRequest req;
+    req.RequestType = BlockRequest::Write;
+    req.Sector = sector;
+    req.SectorCount = count;
+    req.Buffer = (void*)buf;
+
+    Submit(&req);
+    WaitForCompletion(req);
+
+    if (!req.Success)
         return false;
     if (fua)
         return Flush();
@@ -329,7 +485,14 @@ bool VirtioBlk::Flush()
 {
     if (!HasFlush)
         return true;  /* no write cache, nothing to flush */
-    return DoIO(TypeFlush, 0, nullptr, 0);
+
+    BlockRequest req;
+    req.RequestType = BlockRequest::Flush;
+
+    Submit(&req);
+    WaitForCompletion(req);
+
+    return req.Success;
 }
 
 void VirtioBlk::OnInterruptRegister(u8 irq, u8 vector)
@@ -361,6 +524,21 @@ void VirtioBlk::Interrupt(Context* ctx)
 
     InterruptCounter.Inc();
     InterruptStats::Inc(IrqVirtioBlk);
+
+    /* Complete finished I/Os */
+    CompleteIO();
+}
+
+/* --- SoftIrq handler for block I/O --- */
+
+static void BlkIoSoftIrqHandler(void* ctx)
+{
+    (void)ctx;
+
+    for (ulong i = 0; i < VirtioBlk::InstanceCount; i++)
+        VirtioBlk::Instances[i].DrainQueue();
+
+    VirtioScsi::DrainAllQueues();
 }
 
 void VirtioBlk::InitAll()
@@ -397,6 +575,9 @@ void VirtioBlk::InitAll()
             InstanceCount++;
         }
     }
+
+    /* Register the block I/O softirq handler (shared by VirtioBlk and VirtioScsi). */
+    SoftIrq::GetInstance().Register(SoftIrq::TypeBlkIo, BlkIoSoftIrqHandler, nullptr);
 
     Trace(0, "VirtioBlk: initialized %u devices", InstanceCount);
 }

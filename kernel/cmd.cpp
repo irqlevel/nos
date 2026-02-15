@@ -242,10 +242,17 @@ static void CmdDiskread(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    u8 buf[512];
+    u8* buf = (u8*)Mm::Alloc(512, 0);
+    if (!buf)
+    {
+        con.Printf("alloc failed\n");
+        return;
+    }
+
     if (!dev->ReadSectors(sector, buf, 1))
     {
         con.Printf("read error\n");
+        Mm::Free(buf);
         return;
     }
 
@@ -258,6 +265,8 @@ static void CmdDiskread(const char* args, Stdlib::Printer& con)
         }
         con.Printf("\n");
     }
+
+    Mm::Free(buf);
 }
 
 static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
@@ -298,13 +307,20 @@ static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    u8 buf[512];
+    u8* buf = (u8*)Mm::Alloc(512, 0);
+    if (!buf)
+    {
+        con.Printf("alloc failed\n");
+        return;
+    }
+
     Stdlib::MemSet(buf, 0, 512);
     ulong hexLen = (ulong)(end - hexStart);
     ulong byteCount = 0;
     if (!Stdlib::HexDecode(hexStart, hexLen, buf, 512, byteCount))
     {
         con.Printf("invalid hex data\n");
+        Mm::Free(buf);
         return;
     }
 
@@ -315,6 +331,8 @@ static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
         else
             con.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
     }
+
+    Mm::Free(buf);
 }
 
 static void CmdNet(const char* args, Stdlib::Printer& con)

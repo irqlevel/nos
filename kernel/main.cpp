@@ -43,6 +43,7 @@
 #include <drivers/virtio_net.h>
 #include <drivers/virtio_rng.h>
 
+#include <block/block_device.h>
 #include <block/partition.h>
 #include <net/udp_shell.h>
 
@@ -294,6 +295,8 @@ void BpStartup(void* ctx)
     Trace(0, "Before interrupt enable");
 
     InterruptEnable();
+
+    BlockDevice::SetInterruptsStarted();
 
     Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
 

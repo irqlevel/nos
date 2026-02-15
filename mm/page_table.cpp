@@ -273,6 +273,59 @@ ulong PageTable::GetL1Page(ulong virtAddr)
     return l2Entry->Address();
 }
 
+ulong PageTable::VirtToPhys(ulong virtAddr)
+{
+    if (!Root)
+        return 0;
+
+    ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
+    ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
+    ulong l2Index = (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
+    ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+    ulong offset  = virtAddr & (Const::PageSize - 1);
+
+    PtePage* l4Page = (PtePage*)TmpMapPage(Root);
+    if (!l4Page)
+        return 0;
+    Pte l4Entry = l4Page->Entry[l4Index];
+    TmpUnmapPage((ulong)l4Page);
+    if (!l4Entry.Present())
+        return 0;
+
+    PtePage* l3Page = (PtePage*)TmpMapPage(l4Entry.Address());
+    if (!l3Page)
+        return 0;
+    Pte l3Entry = l3Page->Entry[l3Index];
+    TmpUnmapPage((ulong)l3Page);
+    if (!l3Entry.Present())
+        return 0;
+
+    PtePage* l2Page = (PtePage*)TmpMapPage(l3Entry.Address());
+    if (!l2Page)
+        return 0;
+    Pte l2Entry = l2Page->Entry[l2Index];
+    TmpUnmapPage((ulong)l2Page);
+    if (!l2Entry.Present())
+        return 0;
+
+    /* 2MB huge page at L2 level */
+    if (l2Entry.Value & (1UL << Pte::HugeBit))
+    {
+        ulong hugeOffset = virtAddr & ((1UL << 21) - 1);
+        return l2Entry.Address() + hugeOffset;
+    }
+
+    PtePage* l1Page = (PtePage*)TmpMapPage(l2Entry.Address());
+    if (!l1Page)
+        return 0;
+    Pte l1Entry = l1Page->Entry[l1Index];
+    TmpUnmapPage((ulong)l1Page);
+    if (!l1Entry.Present())
+        return 0;
+
+    return l1Entry.Address() + offset;
+}
+
 bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
 {
     BugOn(virtAddr & (Const::PageSize - 1));

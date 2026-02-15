@@ -7,7 +7,10 @@
 #include <kernel/panic.h>
 #include <kernel/interrupt.h>
 #include <kernel/idt.h>
+#include <kernel/softirq.h>
 #include <mm/new.h>
+#include <mm/page_table.h>
+#include <include/const.h>
 
 namespace Kernel
 {
@@ -36,6 +39,7 @@ VirtioScsi::VirtioScsi()
     , CmdRespPhys(0)
     , DataBuf(nullptr)
     , DataBufPhys(0)
+    , Hba(nullptr)
 {
     DevName[0] = '\0';
 }
@@ -102,6 +106,8 @@ bool VirtioScsi::Init(VirtioPci* transport, VirtQueue* reqQueue, SpinLock* ioLoc
     Initialized = true;
     return true;
 }
+
+/* --- Synchronous SCSI command (used for probing only) --- */
 
 bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, bool dataIn)
 {
@@ -263,45 +269,306 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
     return true;
 }
 
-bool VirtioScsi::DoIO(u64 sector, void* buf, u32 sectorCount, bool read, bool fua)
+/* --- Async I/O path --- */
+
+void VirtioScsi::Submit(BlockRequest* req)
 {
-    if (!Initialized || !IoLock)
-        return false;
+    {
+        Stdlib::AutoLock lock(QueueLock);
+        RequestQueue.InsertTail(&req->Link);
+    }
+    DrainQueue();
+}
 
-    ulong dataLen = (ulong)SectorSz * sectorCount;
-    if (dataLen > Const::PageSize)
-        return false;
+void VirtioScsi::DrainQueue()
+{
+    if (!Initialized || !Hba)
+        return;
 
-    Stdlib::AutoLock lock(*IoLock);
+    /* Dequeue up to MaxSlots requests under the lock */
+    BlockRequest* batch[MaxSlots];
+    ulong batchCount = 0;
 
-    u8 cdb[CdbLen];
-    Stdlib::MemSet(cdb, 0, sizeof(cdb));
+    {
+        Stdlib::AutoLock lock(QueueLock);
+        while (batchCount < MaxSlots && !RequestQueue.IsEmpty())
+        {
+            Stdlib::ListEntry* entry = RequestQueue.RemoveHead();
+            if (!entry)
+                break;
+            BlockRequest* req = CONTAINING_RECORD(entry, BlockRequest, Link);
+            batch[batchCount] = req;
+            batchCount++;
+        }
+    }
 
-    if (read)
-        cdb[0] = ScsiOpRead10;
-    else
-        cdb[0] = ScsiOpWrite10;
+    if (batchCount == 0)
+        return;
 
-    /* FUA bit: byte 1, bit 3 of READ(10)/WRITE(10) CDB */
-    if (fua && !read)
-        cdb[1] = 0x08;
+    auto& pt = Mm::PageTable::GetInstance();
+    bool kicked = false;
 
-    /* READ(10)/WRITE(10) CDB layout:
-       Byte 0: opcode
-       Byte 1: flags (bit 3 = FUA)
-       Byte 2-5: LBA (big-endian)
-       Byte 7-8: transfer length in sectors (big-endian) */
-    u32 lba = (u32)sector;
-    cdb[2] = (u8)(lba >> 24);
-    cdb[3] = (u8)(lba >> 16);
-    cdb[4] = (u8)(lba >> 8);
-    cdb[5] = (u8)(lba);
+    for (ulong i = 0; i < batchCount; i++)
+    {
+        BlockRequest* req = batch[i];
 
-    /* Transfer length in sectors (big-endian u16) */
-    cdb[7] = (u8)(sectorCount >> 8);
-    cdb[8] = (u8)(sectorCount);
+        int slotIdx = Hba->AllocSlot();
+        if (slotIdx < 0)
+        {
+            /* No free slots -- put requests back */
+            Stdlib::AutoLock lock(QueueLock);
+            RequestQueue.InsertHead(&req->Link);
+            for (ulong j = i + 1; j < batchCount; j++)
+                RequestQueue.InsertTail(&batch[j]->Link);
+            break;
+        }
 
-    return ScsiCommand(cdb, buf, dataLen, read);
+        DmaSlot& slot = Hba->Slots[slotIdx];
+        slot.Request = req;
+        slot.Owner = this;
+
+        /* Build SCSI CDB from BlockRequest */
+        VirtioScsiCmdReq* cmdReq = slot.CmdReq;
+        Stdlib::MemSet(cmdReq, 0, sizeof(VirtioScsiCmdReq));
+        EncodeLun(cmdReq->Lun, Target, LunId);
+        cmdReq->Tag = 0;
+        cmdReq->TaskAttr = 0;
+        cmdReq->Prio = 0;
+        cmdReq->Crn = 0;
+
+        u8* cdb = cmdReq->Cdb;
+        Stdlib::MemSet(cdb, 0, CdbLen);
+
+        /* Clear response */
+        Stdlib::MemSet(slot.CmdResp, 0, sizeof(VirtioScsiCmdResp));
+
+        if (req->RequestType == BlockRequest::Flush)
+        {
+            cdb[0] = ScsiOpSyncCache;
+            /* Bytes 2-5: LBA = 0 (flush entire cache) */
+            /* Bytes 7-8: number of blocks = 0 (flush all) */
+        }
+        else
+        {
+            if (req->RequestType == BlockRequest::Read)
+                cdb[0] = ScsiOpRead10;
+            else
+                cdb[0] = ScsiOpWrite10;
+
+            /* FUA bit: byte 1, bit 3 */
+            if (req->Fua && req->RequestType == BlockRequest::Write)
+                cdb[1] = 0x08;
+
+            u32 lba = (u32)req->Sector;
+            cdb[2] = (u8)(lba >> 24);
+            cdb[3] = (u8)(lba >> 16);
+            cdb[4] = (u8)(lba >> 8);
+            cdb[5] = (u8)(lba);
+
+            cdb[7] = (u8)(req->SectorCount >> 8);
+            cdb[8] = (u8)(req->SectorCount);
+        }
+
+        Barrier();
+
+        int head = -1;
+
+        if (req->RequestType == BlockRequest::Flush)
+        {
+            /* No data: CmdReq(R) -> CmdResp(W) */
+            VirtQueue::BufDesc bufs[2];
+
+            bufs[0].Addr = slot.CmdReqPhys;
+            bufs[0].Len = Hba->ReqHdrSize;
+            bufs[0].Writable = false;
+
+            bufs[1].Addr = slot.CmdRespPhys;
+            bufs[1].Len = Hba->RespHdrSize;
+            bufs[1].Writable = true;
+
+            ulong flags = Hba->VirtQueueLock.LockIrqSave();
+            head = Hba->ReqQueue.AddBufs(bufs, 2);
+            Hba->VirtQueueLock.UnlockIrqRestore(flags);
+        }
+        else
+        {
+            ulong bufPhys = pt.VirtToPhys((ulong)req->Buffer);
+            if (bufPhys == 0)
+            {
+                Trace(0, "VirtioScsi %s: VirtToPhys failed for buf 0x%p", DevName, (ulong)req->Buffer);
+                req->Success = false;
+                req->Completion.Done();
+                Hba->FreeSlot(slotIdx);
+                continue;
+            }
+
+            u32 dataLen = req->SectorCount * (u32)SectorSz;
+
+            VirtQueue::BufDesc bufs[3];
+
+            if (req->RequestType == BlockRequest::Write)
+            {
+                /* Data-out: CmdReq(R) -> DataBuf(R) -> CmdResp(W) */
+                bufs[0].Addr = slot.CmdReqPhys;
+                bufs[0].Len = Hba->ReqHdrSize;
+                bufs[0].Writable = false;
+
+                bufs[1].Addr = bufPhys;
+                bufs[1].Len = dataLen;
+                bufs[1].Writable = false;
+
+                bufs[2].Addr = slot.CmdRespPhys;
+                bufs[2].Len = Hba->RespHdrSize;
+                bufs[2].Writable = true;
+            }
+            else
+            {
+                /* Data-in: CmdReq(R) -> CmdResp(W) -> DataBuf(W) */
+                bufs[0].Addr = slot.CmdReqPhys;
+                bufs[0].Len = Hba->ReqHdrSize;
+                bufs[0].Writable = false;
+
+                bufs[1].Addr = slot.CmdRespPhys;
+                bufs[1].Len = Hba->RespHdrSize;
+                bufs[1].Writable = true;
+
+                bufs[2].Addr = bufPhys;
+                bufs[2].Len = dataLen;
+                bufs[2].Writable = true;
+            }
+
+            ulong flags = Hba->VirtQueueLock.LockIrqSave();
+            head = Hba->ReqQueue.AddBufs(bufs, 3);
+            Hba->VirtQueueLock.UnlockIrqRestore(flags);
+        }
+
+        if (head < 0)
+        {
+            /* Ring full -- return this and remaining requests to the queue */
+            Hba->FreeSlot(slotIdx);
+            Stdlib::AutoLock lock(QueueLock);
+            RequestQueue.InsertHead(&req->Link);
+            for (ulong j = i + 1; j < batchCount; j++)
+                RequestQueue.InsertTail(&batch[j]->Link);
+            break;
+        }
+
+        if ((ulong)head >= sizeof(Hba->SlotByHead) / sizeof(Hba->SlotByHead[0]))
+        {
+            Trace(0, "VirtioScsi %s: head %u out of range", DevName, (ulong)head);
+            req->Success = false;
+            req->Completion.Done();
+            Hba->FreeSlot(slotIdx);
+            continue;
+        }
+
+        slot.Head = head;
+        Hba->SlotByHead[head] = &slot;
+        kicked = true;
+    }
+
+    if (kicked)
+        Hba->Transport.NotifyQueue(QueueRequest);
+}
+
+void VirtioScsi::DrainAllQueues()
+{
+    for (ulong i = 0; i < InstanceCount; i++)
+        Instances[i].DrainQueue();
+}
+
+/* --- HBA-level slot management and completion --- */
+
+int VirtioScsi::HbaState::AllocSlot()
+{
+    for (ulong i = 0; i < MaxSlots; i++)
+    {
+        if (FreeSlotMask.TestBit(i))
+        {
+            if (FreeSlotMask.ClearBit(i))
+                return (int)i;
+        }
+    }
+    return -1;
+}
+
+void VirtioScsi::HbaState::FreeSlot(int idx)
+{
+    if (idx >= 0 && (ulong)idx < MaxSlots)
+    {
+        Slots[idx].Request = nullptr;
+        Slots[idx].Owner = nullptr;
+        Slots[idx].Head = -1;
+        FreeSlotMask.SetBit((ulong)idx);
+    }
+}
+
+void VirtioScsi::HbaState::CompleteIO()
+{
+    bool completed = false;
+
+    for (;;)
+    {
+        u32 usedId, usedLen;
+
+        ulong flags = VirtQueueLock.LockIrqSave();
+        bool got = ReqQueue.GetUsed(usedId, usedLen);
+        VirtQueueLock.UnlockIrqRestore(flags);
+
+        if (!got)
+            break;
+
+        if (usedId >= sizeof(SlotByHead) / sizeof(SlotByHead[0]))
+        {
+            Trace(0, "VirtioScsi: bad used id %u", (ulong)usedId);
+            continue;
+        }
+
+        DmaSlot* slot = SlotByHead[usedId];
+        if (!slot || !slot->Request)
+        {
+            Trace(0, "VirtioScsi: no slot for used id %u", (ulong)usedId);
+            continue;
+        }
+
+        SlotByHead[usedId] = nullptr;
+
+        BlockRequest* req = slot->Request;
+
+        /* Check response */
+        if (slot->CmdResp->Response != ResponseOk || slot->CmdResp->Status != ScsiStatusGood)
+            req->Success = false;
+        else
+            req->Success = true;
+
+        int slotIdx = (int)(slot - Slots);
+        FreeSlot(slotIdx);
+
+        req->Completion.Done();
+        completed = true;
+    }
+
+    if (completed)
+        SoftIrq::GetInstance().Raise(SoftIrq::TypeBlkIo);
+}
+
+/* --- Block device operations using async path --- */
+
+void VirtioScsi::WaitForCompletion(BlockRequest& req)
+{
+    if (GetInterruptsStarted())
+    {
+        req.Completion.Wait();
+        return;
+    }
+
+    /* Early boot: interrupts not yet enabled, poll for completion */
+    while (req.Completion.GetCounter() != 0)
+    {
+        if (Hba)
+            Hba->CompleteIO();
+        Pause(100);
+    }
 }
 
 bool VirtioScsi::ReadSectors(u64 sector, void* buf, u32 count)
@@ -312,7 +579,17 @@ bool VirtioScsi::ReadSectors(u64 sector, void* buf, u32 count)
         return false;
     if ((u64)SectorSz * count > Const::PageSize)
         return false;
-    return DoIO(sector, buf, count, true, false);
+
+    BlockRequest req;
+    req.RequestType = BlockRequest::Read;
+    req.Sector = sector;
+    req.SectorCount = count;
+    req.Buffer = buf;
+
+    Submit(&req);
+    WaitForCompletion(req);
+
+    return req.Success;
 }
 
 bool VirtioScsi::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
@@ -323,23 +600,32 @@ bool VirtioScsi::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
         return false;
     if ((u64)SectorSz * count > Const::PageSize)
         return false;
-    return DoIO(sector, (void*)buf, count, false, fua);
+
+    BlockRequest req;
+    req.RequestType = BlockRequest::Write;
+    req.Fua = fua;
+    req.Sector = sector;
+    req.SectorCount = count;
+    req.Buffer = (void*)buf;
+
+    Submit(&req);
+    WaitForCompletion(req);
+
+    return req.Success;
 }
 
 bool VirtioScsi::Flush()
 {
-    if (!Initialized || !IoLock)
+    if (!Initialized)
         return false;
 
-    Stdlib::AutoLock lock(*IoLock);
+    BlockRequest req;
+    req.RequestType = BlockRequest::Flush;
 
-    u8 cdb[CdbLen];
-    Stdlib::MemSet(cdb, 0, sizeof(cdb));
-    cdb[0] = ScsiOpSyncCache;
-    /* Bytes 2-5: LBA = 0 (flush entire cache) */
-    /* Bytes 7-8: number of blocks = 0 (flush all) */
+    Submit(&req);
+    WaitForCompletion(req);
 
-    return ScsiCommand(cdb, nullptr, 0, false);
+    return req.Success;
 }
 
 const char* VirtioScsi::GetName()
@@ -378,12 +664,61 @@ void VirtioScsi::Interrupt(Context* ctx)
 {
     (void)ctx;
 
-    u8 isr = Transport->ReadISR();
+    if (!Hba)
+    {
+        /* During probing, just clear ISR */
+        if (Transport)
+            Transport->ReadISR();
+        return;
+    }
+
+    u8 isr = Hba->Transport.ReadISR();
     if (isr == 0)
         return;
 
     InterruptCounter.Inc();
     InterruptStats::Inc(IrqVirtioScsi);
+
+    /* Complete finished I/Os at HBA level */
+    Hba->CompleteIO();
+}
+
+/* --- HBA and device initialization --- */
+
+bool VirtioScsi::SetupHbaSlots(HbaState* hba)
+{
+    ulong dmaPhys;
+    void* dmaPtr = Mm::AllocMapPages(1, &dmaPhys);
+    if (!dmaPtr)
+    {
+        Trace(0, "VirtioScsi: failed to alloc DMA page for HBA slots");
+        return false;
+    }
+
+    Stdlib::MemSet(dmaPtr, 0, Const::PageSize);
+    ulong dmaVirt = (ulong)dmaPtr;
+
+    /* Layout within the DMA page:
+       MaxSlots * VirtioScsiCmdReq (51 bytes each) followed by
+       MaxSlots * VirtioScsiCmdResp (108 bytes each).
+       Total: MaxSlots * (51 + 108) = 8 * 159 = 1272 bytes. */
+    for (ulong i = 0; i < MaxSlots; i++)
+    {
+        hba->Slots[i].CmdReq = (VirtioScsiCmdReq*)(dmaVirt + i * sizeof(VirtioScsiCmdReq));
+        hba->Slots[i].CmdReqPhys = dmaPhys + i * sizeof(VirtioScsiCmdReq);
+        hba->Slots[i].CmdResp = (VirtioScsiCmdResp*)(dmaVirt +
+            MaxSlots * sizeof(VirtioScsiCmdReq) + i * sizeof(VirtioScsiCmdResp));
+        hba->Slots[i].CmdRespPhys = dmaPhys +
+            MaxSlots * sizeof(VirtioScsiCmdReq) + i * sizeof(VirtioScsiCmdResp);
+        hba->Slots[i].Request = nullptr;
+        hba->Slots[i].Owner = nullptr;
+        hba->Slots[i].Head = -1;
+    }
+
+    hba->FreeSlotMask.Set((1L << MaxSlots) - 1);
+    Stdlib::MemSet(hba->SlotByHead, 0, sizeof(hba->SlotByHead));
+
+    return true;
 }
 
 bool VirtioScsi::InitHba(Pci::DeviceInfo* pciDev, HbaState* hba)
@@ -462,6 +797,8 @@ bool VirtioScsi::InitHba(Pci::DeviceInfo* pciDev, HbaState* hba)
     hba->CdbSize = cdbSize;
     hba->SenseSize = senseSize;
     hba->MaxTarget = (maxTarget > 255) ? 255 : maxTarget;
+    hba->ReqHdrSize = 19 + cdbSize;
+    hba->RespHdrSize = 12 + senseSize;
 
     /* Queue 0 = control queue -- used for task management (abort, LUN reset).
        Not needed for basic synchronous I/O. Skip allocation. */
@@ -648,9 +985,38 @@ void VirtioScsi::InitAll()
             Instances[InstanceCount].Initialized = false;
         }
 
-        /* Register interrupt using the first instance discovered on this HBA */
+        /* Free per-instance probe DMA pages and set up HBA slot pool.
+           The per-instance DMA pages were used for synchronous probing;
+           after this point, all I/O goes through the HBA slot pool. */
+        for (ulong j = firstInst; j < InstanceCount; j++)
+        {
+            if (Instances[j].CmdReq)
+            {
+                Mm::UnmapFreePages(Instances[j].CmdReq);
+                Instances[j].CmdReq = nullptr;
+                Instances[j].CmdReqPhys = 0;
+                Instances[j].CmdResp = nullptr;
+                Instances[j].CmdRespPhys = 0;
+                Instances[j].DataBuf = nullptr;
+                Instances[j].DataBufPhys = 0;
+            }
+            Instances[j].Hba = hba;
+            Instances[j].RequestQueue.Init();
+        }
+
         if (InstanceCount > firstInst)
         {
+            if (!SetupHbaSlots(hba))
+            {
+                Trace(0, "VirtioScsi: failed to setup HBA slot pool, disabling %u devices",
+                      InstanceCount - firstInst);
+
+                /* Clear Hba pointers so async I/O is rejected */
+                for (ulong j = firstInst; j < InstanceCount; j++)
+                    Instances[j].Hba = nullptr;
+            }
+
+            /* Register interrupt using the first instance discovered on this HBA */
             u8 irq = dev->InterruptLine;
             u8 vector = BaseVector + (u8)HbaCount;
             Interrupt::RegisterLevel(Instances[firstInst], irq, vector);

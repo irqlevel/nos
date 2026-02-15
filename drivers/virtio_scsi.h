@@ -3,9 +3,12 @@
 #include <include/types.h>
 #include <kernel/interrupt.h>
 #include <block/block_device.h>
+#include <block/block_request.h>
 #include <kernel/spin_lock.h>
+#include <kernel/raw_spin_lock.h>
 #include <kernel/atomic.h>
 #include <kernel/asm.h>
+#include <lib/list_entry.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_pci.h>
@@ -64,6 +67,15 @@ public:
 
     void Interrupt(Context* ctx);
 
+    /* Submit a block request (caller context). */
+    void Submit(BlockRequest* req);
+
+    /* Drain pending requests and submit to hardware (softirq context). */
+    void DrainQueue();
+
+    /* Called from softirq handler to drain all HBA queues. */
+    static void DrainAllQueues();
+
     /* Discover and initialize all virtio-scsi devices. */
     static void InitAll();
 
@@ -103,11 +115,10 @@ private:
     /* Encode SAM LUN representation */
     void EncodeLun(u8 lun[8], u8 target, u16 lunId);
 
-    /* Send a SCSI command and wait for completion */
+    /* Send a SCSI command and wait for completion (used for probing only) */
     bool ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, bool dataIn);
 
-    /* Read/write helper */
-    bool DoIO(u64 sector, void* buf, u32 sectorCount, bool read, bool fua);
+    void WaitForCompletion(BlockRequest& req);
 
     VirtioPci* Transport;
     VirtQueue* ReqQueue;
@@ -126,7 +137,11 @@ private:
     u32 ReqHdrSize;    /* 19 + cdb_size */
     u32 RespHdrSize;   /* 12 + sense_size */
 
-    /* DMA buffers */
+    /* Per-instance request queue (for async I/O) */
+    SpinLock QueueLock;
+    Stdlib::ListEntry RequestQueue;
+
+    /* DMA buffers (used during probing only) */
     VirtioScsiCmdReq* CmdReq;
     ulong CmdReqPhys;
     VirtioScsiCmdResp* CmdResp;
@@ -149,21 +164,50 @@ private:
 
     /* Shared transport and queue objects (one per PCI device) */
     static const ulong MaxHbas = 4;
+    static const ulong MaxSlots = 8;
+
+    struct DmaSlot
+    {
+        VirtioScsiCmdReq* CmdReq;
+        ulong CmdReqPhys;
+        VirtioScsiCmdResp* CmdResp;
+        ulong CmdRespPhys;
+        BlockRequest* Request;
+        VirtioScsi* Owner;     /* Which instance owns this slot (for LUN encoding) */
+        int Head;
+    };
+
     struct HbaState
     {
         VirtioPci Transport;
         VirtQueue ReqQueue;
-        SpinLock Lock;        /* Serializes all I/O on this HBA */
+        RawSpinLock VirtQueueLock; /* Protects ReqQueue (AddBufs/GetUsed share free chain) */
+        SpinLock Lock;        /* Serializes probing I/O on this HBA */
         u32 CdbSize;          /* Actual CDB size from device config */
         u32 SenseSize;        /* Actual sense data size from device config */
         u16 MaxTarget;        /* Max target number from device config */
+        u32 ReqHdrSize;
+        u32 RespHdrSize;
+
+        /* DMA slot pool (shared by all LUNs on this HBA) */
+        DmaSlot Slots[MaxSlots];
+        DmaSlot* SlotByHead[256];
+        Atomic FreeSlotMask;
+
+        int AllocSlot();
+        void FreeSlot(int idx);
+        void CompleteIO();
     };
     static HbaState Hbas[MaxHbas];
     static ulong HbaCount;
 
+    /* Pointer to owning HBA state (set after probing) */
+    HbaState* Hba;
+
     /* Init helpers */
     static bool InitHba(Pci::DeviceInfo* pciDev, HbaState* hba);
     static bool ProbeLun(HbaState* hba, u8 target, u16 lun);
+    static bool SetupHbaSlots(HbaState* hba);
 
 public:
     static VirtioScsi Instances[MaxInstances];
