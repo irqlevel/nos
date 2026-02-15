@@ -13,6 +13,7 @@ namespace Kernel
 
 NanoFs::NanoFs(BlockDevice* dev)
     : Io(dev, NanoBlockSize)
+    , Mounted(false)
 {
     Stdlib::MemSet(&Super, 0, sizeof(Super));
     Stdlib::MemSet(VNodes, 0, sizeof(VNodes));
@@ -25,6 +26,13 @@ NanoFs::~NanoFs()
 
 void NanoFs::Unmount()
 {
+    if (!Mounted)
+        return;
+
+    FlushSuper();
+    Io.Flush();
+    Mounted = false;
+
     for (u32 i = 0; i < NanoInodeCount; i++)
     {
         if (VNodes[i] != nullptr)
@@ -35,8 +43,19 @@ void NanoFs::Unmount()
     }
 }
 
+BlockDevice* NanoFs::GetDevice()
+{
+    return Io.GetDevice();
+}
+
 bool NanoFs::Mount()
 {
+    if (Mounted)
+    {
+        Trace(0, "NanoFs: already mounted");
+        return false;
+    }
+
     if (!Io.ReadBlock(0, &Super))
     {
         Trace(0, "NanoFs: failed to read superblock");
@@ -68,6 +87,7 @@ bool NanoFs::Mount()
         return false;
     }
 
+    Mounted = true;
     Trace(0, "NanoFs: mounted, %u inodes, %u data blocks",
           (ulong)Super.InodeCount, (ulong)Super.DataBlockCount);
     return true;
