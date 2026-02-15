@@ -26,6 +26,11 @@ void Atomic::Dec()
     AtomicDec(&Value);
 }
 
+void Atomic::Add(long delta)
+{
+    AtomicAdd(&Value, delta);
+}
+
 bool Atomic::DecAndTest()
 {
     long oldValue = AtomicReadAndDec(&Value);

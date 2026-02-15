@@ -88,9 +88,9 @@ void Task::Exit()
 {
     BugOn(this != GetCurrentTask());
 
-    State.Set(StateExited);
     ExitTime = GetBootTime();
     TaskTable::GetInstance().Remove(this);
+    State.Set(StateExited);
 
     Schedule();
 

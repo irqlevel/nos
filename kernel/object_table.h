@@ -13,6 +13,64 @@ public:
     virtual void Put() = 0;
 };
 
+template<typename T>
+class ObjectPtr final
+{
+public:
+    ObjectPtr()
+        : Ptr(nullptr)
+    {
+    }
+
+    explicit ObjectPtr(T* ptr)
+        : Ptr(ptr)
+    {
+    }
+
+    ~ObjectPtr()
+    {
+        if (Ptr != nullptr)
+            Ptr->Put();
+    }
+
+    ObjectPtr(ObjectPtr&& other)
+        : Ptr(other.Ptr)
+    {
+        other.Ptr = nullptr;
+    }
+
+    ObjectPtr& operator=(ObjectPtr&& other)
+    {
+        if (this != &other)
+        {
+            if (Ptr != nullptr)
+                Ptr->Put();
+            Ptr = other.Ptr;
+            other.Ptr = nullptr;
+        }
+        return *this;
+    }
+
+    ObjectPtr(const ObjectPtr& other) = delete;
+    ObjectPtr& operator=(const ObjectPtr& other) = delete;
+
+    T* Get() const { return Ptr; }
+    T* operator->() const { return Ptr; }
+    T& operator*() const { return *Ptr; }
+
+    explicit operator bool() const { return Ptr != nullptr; }
+
+    T* Release()
+    {
+        T* p = Ptr;
+        Ptr = nullptr;
+        return p;
+    }
+
+private:
+    T* Ptr;
+};
+
 using ObjectId = ulong;
 
 const ObjectId InvalidObjectId = ~((ObjectId)0);

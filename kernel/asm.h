@@ -67,6 +67,7 @@ void SwitchContext(ulong nextRsp, ulong* currRsp, void (*callback)(void* ctx), v
 
 void AtomicInc(volatile long *pvalue);
 void AtomicDec(volatile long *pvalue);
+void AtomicAdd(volatile long *pvalue, long delta);
 long AtomicRead(volatile long *pvalue);
 void AtomicWrite(volatile long *pvalue, long newValue);
 long AtomicReadAndDec(volatile long *pvalue);

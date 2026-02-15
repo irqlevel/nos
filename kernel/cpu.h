@@ -2,6 +2,8 @@
 
 #include "stdlib.h"
 #include "spin_lock.h"
+#include "raw_spin_lock.h"
+#include "wait_group.h"
 #include "task.h"
 #include "sched.h"
 #include "asm.h"
@@ -10,6 +12,18 @@ namespace Kernel
 {
 
 const ulong MaxCpus = 8;
+
+struct IPITask
+{
+    using Func = void (*)(void* ctx, Context* ipiCtx);
+
+    IPITask(Func func, void* ctx);
+
+    Func Function;
+    void* Ctx;
+    WaitGroup Completion;
+    Stdlib::ListEntry ListEntry;
+};
 
 class Cpu final
 {
@@ -41,6 +55,8 @@ public:
     void RequestTlbFlush();
     void FlushTlbIfNeeded();
 
+    void QueueIPITask(IPITask& task);
+
     TaskQueue& GetTaskQueue();
 
     void Reset();
@@ -52,6 +68,7 @@ private:
     Cpu& operator=(Cpu&& other) = delete;
 
     void OnPanic();
+    void ProcessIPITasks(Context* ctx);
 
     ulong Index;
     ulong State;
@@ -60,6 +77,9 @@ private:
     TaskQueue TaskQueue;
     Atomic IPIConter;
     Atomic TlbFlushPending;
+
+    RawSpinLock IPITaskLock;
+    Stdlib::ListEntry IPITaskList;
 
     static const ulong Tag = 'Cpu ';
 };
