@@ -473,6 +473,17 @@ AtomicCmpxchg:
 	iretq
 %endmacro
 
+%macro ExceptionStubErr 1
+%1Stub:
+	PushAll
+	mov rdi, rsp
+	cld
+	call %1
+	PopAll
+	add rsp, 8 ; remove error code pushed by CPU
+	iretq
+%endmacro
+
 InterruptStub Dummy
 InterruptStub IO8042
 InterruptStub Serial
@@ -491,20 +502,20 @@ ExceptionStub ExcOverflow
 ExceptionStub ExcBounds
 ExceptionStub ExcInvalidOpcode
 ExceptionStub ExcCoprocessorNotAvailable
-ExceptionStub ExcDoubleFault
+ExceptionStubErr ExcDoubleFault
 ExceptionStub ExcCoprocessorSegmentOverrun
-ExceptionStub ExcInvalidTaskStateSegment
-ExceptionStub ExcSegmentNotPresent
-ExceptionStub ExcStackFault
-ExceptionStub ExcGeneralProtectionFault
-ExceptionStub ExcPageFault
+ExceptionStubErr ExcInvalidTaskStateSegment
+ExceptionStubErr ExcSegmentNotPresent
+ExceptionStubErr ExcStackFault
+ExceptionStubErr ExcGeneralProtectionFault
+ExceptionStubErr ExcPageFault
 ExceptionStub ExcReserved
 ExceptionStub ExcMathFault
-ExceptionStub ExcAlignmentCheck
+ExceptionStubErr ExcAlignmentCheck
 ExceptionStub ExcMachineCheck
 ExceptionStub ExcSIMDFpException
 ExceptionStub ExcVirtException
-ExceptionStub ExcControlProtection
+ExceptionStubErr ExcControlProtection
 
 SetJmp:
 	pop rsi

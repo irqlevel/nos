@@ -190,6 +190,18 @@ void VgaTerm::PrintString(const char *s)
     PutsLockHeld(s);
 }
 
+void VgaTerm::PanicPrintString(const char *s)
+{
+    /*
+     * Bypass lock — write directly to VGA buffer.
+     * Safe only in panic context with interrupts disabled.
+     */
+    if (Buf == nullptr)
+        return;
+
+    PutsLockHeld(s);
+}
+
 void VgaTerm::Cursor()
 {
     u16 offset = ((Row % Height) * Width + (Column % Width)) % (Width * Height);

@@ -24,6 +24,8 @@ public:
     virtual void PrintString(const char *s) override;
     virtual void Backspace() override;
 
+    void PanicPrintString(const char *s);
+
     /* VGA hardware text mode color constants. */
     enum Color {
         ColorBlack = 0,

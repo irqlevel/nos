@@ -142,6 +142,8 @@ typedef void (*HaltAction)();
 static void __attribute__((noinline, noreturn))
 FinalizeOnStaticStack(Task* task, HaltAction action)
 {
+    Trace(0, "FinalizeOnStaticStack");
+
     task->Put();
 
     __cxa_finalize(0);
@@ -155,6 +157,12 @@ FinalizeOnStaticStack(Task* task, HaltAction action)
 
 static void PrepareHalt(HaltAction action)
 {
+    /* Hold an extra reference so CpuTable::Reset()'s Put()
+    only drops refcount 2→1 instead of freeing the task
+    while we are still running on its stack. */
+    auto task = Task::GetCurrentTask();
+    task->Get();
+
     PreemptDisable();
 
     Trace(0, "Stopping cpu's");
@@ -164,12 +172,6 @@ static void PrepareHalt(HaltAction action)
     Trace(0, "Cpu's stopped");
 
     PreemptOff();
-
-    /* Hold an extra reference so CpuTable::Reset()'s Put()
-       only drops refcount 2→1 instead of freeing the task
-       while we are still running on its stack. */
-    auto task = Task::GetCurrentTask();
-    task->Get();
 
     CpuTable::GetInstance().Reset();
     Dmesg::GetInstance().Reset();

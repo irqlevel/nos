@@ -884,6 +884,47 @@ static void CmdRandom(const char* args, Stdlib::Printer& con)
     con.Printf("\n");
 }
 
+static void CmdPanic(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* typeStart = Stdlib::NextToken(args, end);
+
+    if (!typeStart)
+    {
+        Panic("user requested panic");
+    }
+
+    char type[16];
+    Stdlib::TokenCopy(typeStart, end, type, sizeof(type));
+
+    if (Stdlib::StrCmp(type, "pf") == 0)
+    {
+        con.Printf("triggering page fault...\n");
+        volatile int* p = nullptr;
+        *p = 0;
+    }
+    else if (Stdlib::StrCmp(type, "div0") == 0)
+    {
+        con.Printf("triggering divide by zero...\n");
+        volatile int zero = 0;
+        volatile int x = 1 / zero;
+        (void)x;
+    }
+    else if (Stdlib::StrCmp(type, "ud") == 0)
+    {
+        con.Printf("triggering invalid opcode...\n");
+        asm volatile("ud2");
+    }
+    else
+    {
+        con.Printf("usage: panic [pf|div0|ud]\n");
+        con.Printf("  (no arg) - direct panic\n");
+        con.Printf("  pf       - page fault (null deref)\n");
+        con.Printf("  div0     - divide by zero\n");
+        con.Printf("  ud       - invalid opcode\n");
+    }
+}
+
 // Forward declaration - CmdHelp needs the Commands array defined below
 static void CmdHelp(const char* args, Stdlib::Printer& con);
 
@@ -918,6 +959,7 @@ static const CmdEntry Commands[] = {
     { "del",       CmdDel,       "del <path> - remove file or directory" },
     { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
     { "version",   CmdVersion,   "version - show kernel version" },
+    { "panic",     CmdPanic,     "panic [pf|div0|ud] - trigger kernel panic" },
     { "poweroff",  CmdPoweroff,  "poweroff - power off (ACPI S5)" },
     { "shutdown",  CmdPoweroff,  nullptr },
     { "reboot",    CmdReboot,    "reboot - reset system" },
