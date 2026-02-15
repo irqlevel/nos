@@ -353,10 +353,14 @@ void VirtioBlk::OnInterrupt(Context* ctx)
 void VirtioBlk::Interrupt(Context* ctx)
 {
     (void)ctx;
-    InterruptCounter.Inc();
 
     /* Read ISR status to acknowledge interrupt */
-    Transport.ReadISR();
+    u8 isr = Transport.ReadISR();
+    if (isr == 0)
+        return;
+
+    InterruptCounter.Inc();
+    InterruptStats::Inc(IrqVirtioBlk);
 }
 
 void VirtioBlk::InitAll()

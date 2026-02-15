@@ -377,8 +377,13 @@ void VirtioScsi::OnInterrupt(Context* ctx)
 void VirtioScsi::Interrupt(Context* ctx)
 {
     (void)ctx;
+
+    u8 isr = Transport->ReadISR();
+    if (isr == 0)
+        return;
+
     InterruptCounter.Inc();
-    Transport->ReadISR();
+    InterruptStats::Inc(IrqVirtioScsi);
 }
 
 bool VirtioScsi::InitHba(Pci::DeviceInfo* pciDev, HbaState* hba)

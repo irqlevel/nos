@@ -5,6 +5,7 @@
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>
+#include <kernel/interrupt.h>
 #include <mm/memory_map.h>
 
 namespace Kernel
@@ -131,6 +132,7 @@ void IO8042::OnTick(TimerCallback& callback)
 
 extern "C" void IO8042Interrupt(Context* ctx)
 {
+    InterruptStats::Inc(IrqIO8042);
     IO8042::GetInstance().Interrupt(ctx);
 }
 

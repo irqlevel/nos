@@ -572,7 +572,11 @@ void VirtioNet::Interrupt(Context* ctx)
     (void)ctx;
 
     /* Acknowledge interrupt */
-    Transport.ReadISR();
+    u8 isr = Transport.ReadISR();
+    if (isr == 0)
+        return;
+
+    InterruptStats::Inc(IrqVirtioNet);
 
     /* Defer RX processing to the soft IRQ task */
     SoftIrq::GetInstance().Raise(SoftIrq::TypeNetRx);

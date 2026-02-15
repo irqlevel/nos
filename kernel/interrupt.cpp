@@ -11,6 +11,38 @@
 namespace Kernel
 {
 
+Atomic InterruptStats::Counters[IrqMax];
+
+void InterruptStats::Inc(InterruptSource src)
+{
+    if (src < IrqMax)
+        Counters[src].Inc();
+}
+
+long InterruptStats::Get(InterruptSource src)
+{
+    if (src < IrqMax)
+        return Counters[src].Get();
+    return 0;
+}
+
+const char* InterruptStats::GetName(InterruptSource src)
+{
+    switch (src)
+    {
+    case IrqPit:        return "pit";
+    case IrqIO8042:     return "8042";
+    case IrqSerial:     return "serial";
+    case IrqVirtioBlk:  return "virtio-blk";
+    case IrqVirtioNet:  return "virtio-net";
+    case IrqVirtioScsi: return "virtio-scsi";
+    case IrqIPI:        return "ipi";
+    case IrqShared:     return "shared";
+    case IrqDummy:      return "dummy";
+    default:            return "unknown";
+    }
+}
+
 Interrupt::VectorEntry Interrupt::Vectors[MaxVectors];
 
 void Interrupt::Register(InterruptHandler& handler, u8 irq, u8 vector)
@@ -82,6 +114,8 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
 
 void Interrupt::SharedDispatch(Context* ctx)
 {
+    InterruptStats::Inc(IrqShared);
+
     for (ulong v = 0; v < MaxVectors; v++)
     {
         VectorEntry& ve = Vectors[v];

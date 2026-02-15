@@ -2,6 +2,7 @@
 #include "lapic.h"
 
 #include <kernel/cpu.h>
+#include <kernel/interrupt.h>
 
 namespace Kernel
 {
@@ -72,6 +73,7 @@ Stdlib::Time Pit::GetTime()
 
 extern "C" void PitInterrupt(Context* ctx)
 {
+    InterruptStats::Inc(IrqPit);
     Pit::GetInstance().Interrupt(ctx);
 }
 
