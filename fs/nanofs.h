@@ -77,6 +77,7 @@ public:
     virtual bool Write(VNode* file, const void* data, ulong len) override;
     virtual bool Read(VNode* file, void* buf, ulong len, ulong offset) override;
     virtual bool Remove(VNode* node) override;
+    virtual BlockDevice* GetDevice() override;
 
 private:
     NanoFs(const NanoFs& other) = delete;
@@ -111,6 +112,7 @@ private:
     BlockIo Io;
     NanoSuperBlock Super;
     VNode* VNodes[NanoInodeCount]; // in-memory VNode cache by inode index
+    bool Mounted;
 };
 
 }

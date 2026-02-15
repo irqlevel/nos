@@ -1,5 +1,6 @@
 #include "vfs.h"
 
+#include <block/block_device.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>
 #include <kernel/trace.h>
@@ -33,13 +34,28 @@ bool Vfs::Mount(const char* path, FileSystem* fs)
 
     Stdlib::AutoLock lock(Lock);
 
-    // Check for duplicate mount
+    // Check for duplicate mount path
     for (ulong i = 0; i < MountCount; i++)
     {
         if (Stdlib::StrCmp(Mounts[i].Path, path) == 0)
         {
             Trace(0, "Vfs::Mount: already mounted on %s", path);
             return false;
+        }
+    }
+
+    // Check for duplicate block device
+    BlockDevice* dev = fs->GetDevice();
+    if (dev != nullptr)
+    {
+        for (ulong i = 0; i < MountCount; i++)
+        {
+            if (Mounts[i].Fs->GetDevice() == dev)
+            {
+                Trace(0, "Vfs::Mount: device %s already mounted on %s",
+                      dev->GetName(), Mounts[i].Path);
+                return false;
+            }
         }
     }
 

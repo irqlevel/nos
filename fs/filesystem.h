@@ -23,6 +23,7 @@ public:
     virtual bool Write(VNode* file, const void* data, ulong len) = 0;
     virtual bool Read(VNode* file, void* buf, ulong len, ulong offset) = 0;
     virtual bool Remove(VNode* node) = 0;
+    virtual BlockDevice* GetDevice() { return nullptr; }
 };
 
 }
