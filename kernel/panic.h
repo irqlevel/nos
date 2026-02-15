@@ -6,6 +6,8 @@
 namespace Kernel
 {
 
+struct Context;
+
 class Panicker
 {
 public:
@@ -18,6 +20,8 @@ public:
 
     void DoPanic(const char *fmt, ...);
 
+    void DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...);
+
     bool IsActive();
 
 private:
@@ -29,6 +33,9 @@ private:
     Panicker& operator=(const Panicker& other) = delete;
     Panicker& operator=(Panicker&& other) = delete;
 
+    void PrintOutput(const char* str);
+    void DumpBacktrace(ulong* frames, size_t count);
+
     char Message[256];
     Atomic Active;
 };
@@ -39,6 +46,15 @@ private:
 do {                                                                \
     auto& panicker = Kernel::Panicker::GetInstance();               \
     panicker.DoPanic("PANIC:%s():%s,%u: " fmt "\n",                 \
+        __func__, Stdlib::TruncateFileName(__FILE__),               \
+        (ulong)__LINE__, ##__VA_ARGS__);                            \
+} while (false)
+
+#define PanicCtx(ctx, hasErrCode, fmt, ...)                         \
+do {                                                                \
+    auto& panicker = Kernel::Panicker::GetInstance();               \
+    panicker.DoPanicCtx(ctx, hasErrCode,                            \
+        "PANIC:%s():%s,%u: " fmt "\n",                              \
         __func__, Stdlib::TruncateFileName(__FILE__),               \
         (ulong)__LINE__, ##__VA_ARGS__);                            \
 } while (false)

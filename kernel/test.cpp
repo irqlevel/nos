@@ -4,6 +4,7 @@
 #include "sched.h"
 #include "cpu.h"
 #include "stack_trace.h"
+#include "asm.h"
 #include <block/block_device.h>
 
 #include <lib/btree.h>
@@ -249,26 +250,109 @@ Stdlib::Error TestRingBuffer()
     return MakeError(Stdlib::Error::Success);
 }
 
-Stdlib::Error TestStackTrace3()
+/* noinline helpers to create a known call-depth difference */
+static __attribute__((noinline)) size_t CaptureAtDepth0()
 {
     ulong frames[20];
-    size_t framesCount;
-
-    framesCount = StackTrace::Capture(4096, frames, Stdlib::ArraySize(frames));
-    for (size_t i = 0; i < framesCount; i++)
-        Trace(0, "frame[%u]=0x%p", i, frames[i]);
-
-    return MakeSuccess();
+    return StackTrace::Capture(frames, Stdlib::ArraySize(frames));
 }
 
-Stdlib::Error TestStackTrace2()
+static __attribute__((noinline)) size_t CaptureAtDepth1()
 {
-    return TestStackTrace3();
+    return CaptureAtDepth0();
+}
+
+static __attribute__((noinline)) size_t CaptureAtDepth2()
+{
+    return CaptureAtDepth1();
+}
+
+static __attribute__((noinline)) size_t CaptureAtDepth3()
+{
+    return CaptureAtDepth2();
 }
 
 Stdlib::Error TestStackTrace()
 {
-    return TestStackTrace2();
+    Trace(0, "TestStackTrace: started");
+
+    ulong frames[20];
+    size_t count;
+
+    /* Auto-detect: must capture at least 1 frame */
+    count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
+    if (count == 0)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* All return addresses must be in kernel space */
+    for (size_t i = 0; i < count; i++)
+    {
+        if (frames[i] < 0xFFFF800001000000UL)
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* maxFrames = 0 must return 0 */
+    count = StackTrace::Capture(frames, 0);
+    if (count != 0)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* maxFrames = 1 must return exactly 1 */
+    count = StackTrace::Capture(frames, 1);
+    if (count != 1)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Explicit bounds: empty range (base == limit) must return 0 */
+    count = StackTrace::Capture(0, 0, frames, Stdlib::ArraySize(frames));
+    if (count != 0)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Explicit bounds: range not containing our stack must return 0 */
+    count = StackTrace::Capture(0x1000, 0x2000, frames, Stdlib::ArraySize(frames));
+    if (count != 0)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Explicit bounds with correct task stack range */
+    ulong rsp = GetRsp();
+    ulong base = rsp & (~(Task::StackSize - 1));
+    Task::Stack* stackPtr = reinterpret_cast<Task::Stack*>(base);
+    if (stackPtr->Magic1 == Task::StackMagic1 &&
+        stackPtr->Magic2 == Task::StackMagic2)
+    {
+        count = StackTrace::Capture(base, base + Task::StackSize,
+                                    frames, Stdlib::ArraySize(frames));
+        if (count == 0)
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Deeper nesting must capture more frames:
+       CaptureAtDepth0 adds 1 extra function on the chain,
+       CaptureAtDepth3 adds 4.  Difference must be exactly 3. */
+    size_t shallow = CaptureAtDepth0();
+    size_t deep = CaptureAtDepth3();
+    if (deep < shallow + 3)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Consecutive captures at the same depth must match */
+    size_t count1 = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
+    ulong frames2[20];
+    size_t count2 = StackTrace::Capture(frames2, Stdlib::ArraySize(frames2));
+    if (count1 != count2)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Return addresses from consecutive captures must be identical
+       (same call chain, same function, same callers above) */
+    for (size_t i = 0; i < count1; i++)
+    {
+        /* frame[0] is the return site inside this function; it
+           differs between the two calls.  Compare from frame[1] up. */
+        if (i == 0)
+            continue;
+        if (frames[i] != frames2[i])
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    Trace(0, "TestStackTrace: complete");
+    return MakeSuccess();
 }
 
 Stdlib::Error TestParseUlong()

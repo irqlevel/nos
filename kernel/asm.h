@@ -167,6 +167,18 @@ struct Context final
             return *((ulong *)(Rsp + sizeof(ulong)));
         return *((ulong *)Rsp);
     }
+
+    ulong GetErrorCode()
+    {
+        return *((ulong *)Rsp);
+    }
+
+    ulong GetOrigRsp(bool hasErrorCode = false)
+    {
+        if (hasErrorCode)
+            return *((ulong *)(Rsp + 4 * sizeof(ulong)));
+        return *((ulong *)(Rsp + 3 * sizeof(ulong)));
+    }
 private:
     Context(const Context& other) = delete;
     Context(Context&& other) = delete;

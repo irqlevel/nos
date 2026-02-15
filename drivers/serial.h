@@ -26,6 +26,7 @@ public:
     }
 
     void PrintString(const char *str);
+    void PanicPrintString(const char *str);
 
     void VPrintf(const char *fmt, va_list args);
     void Printf(const char *fmt, ...);

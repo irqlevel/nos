@@ -118,6 +118,27 @@ void Serial::PrintString(const char *str)
     Send();
 }
 
+void Serial::PanicPrintString(const char *str)
+{
+    /*
+     * Bypass lock and ring buffer — poll-write directly to UART.
+     * Safe only in panic context with interrupts disabled.
+     */
+    while (*str)
+    {
+        char c = *str++;
+        if (c == '\n')
+        {
+            while (!IsTransmitEmpty())
+                Pause();
+            Outb(Port, '\r');
+        }
+        while (!IsTransmitEmpty())
+            Pause();
+        Outb(Port, c);
+    }
+}
+
 void Serial::VPrintf(const char *fmt, va_list args)
 {
 	char str[256];

@@ -1,12 +1,13 @@
 TARGET64 = x86_64-none-elf
 VERSION ?= dev
 CPPFLAGS = -I$(CURDIR) -I$(CURDIR)/lib
-CXXFLAGS = --target=$(TARGET64) -std=c++20 -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -Wall -Wextra -Werror -mcmodel=kernel -mcmodel=large -mno-red-zone -DKERNEL_VERSION=\"$(VERSION)\"
+CXXFLAGS = --target=$(TARGET64) -std=c++20 -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -fno-omit-frame-pointer -Wall -Wextra -Werror -mcmodel=kernel -mcmodel=large -mno-red-zone -DKERNEL_VERSION=\"$(VERSION)\"
 LDFLAGS = -nostdlib -z max-page-size=4096
 LD = ld
 CC = clang
 CXX = clang -x c++
 ASM = nasm
+NM = nm
 AR = ar
 MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 
@@ -67,6 +68,7 @@ CXX_SRC =   \
     kernel/parameters.cpp \
     kernel/raw_spin_lock.cpp \
     kernel/stack_trace.cpp \
+    kernel/symtab.cpp \
     kernel/entropy.cpp \
     lib/stdlib.cpp  \
     lib/format.cpp \
@@ -118,7 +120,20 @@ nos.iso: build/grub.cfg kernel64.elf
 %.o: %.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -c $< -o $@
 
-kernel64.elf: build/linker64.ld $(OBJS)
-	$(LD) $(LDFLAGS) -T $< -o kernel64.elf $(OBJS)
+kernel64_pass1.elf: build/linker64.ld $(OBJS)
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS)
+
+kernel/symtab_data.cpp: kernel64_pass1.elf
+	@echo "Generating symbol table..."
+	@printf '#include "symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $@
+	@$(NM) -Cn $< | awk '/^[0-9a-fA-F]+ [Tt] / { name=$$3; sub(/\(.*/, "", name); printf "    { 0x%s, \"%s\" },\n", $$1, name }' >> $@
+	@printf '};\nconst size_t SymbolTable::SymbolCount = sizeof(Symbols)/sizeof(Symbols[0]);\n}\n' >> $@
+
+kernel/symtab_data.o: kernel/symtab_data.cpp kernel/symtab.h
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+kernel64.elf: build/linker64.ld $(OBJS) kernel/symtab_data.o
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) kernel/symtab_data.o
+
 clean:
-	rm -rf $(OBJS) $(DEPS) *.elf *.bin *.iso iso
+	rm -rf $(OBJS) $(DEPS) kernel/symtab_data.cpp kernel/symtab_data.o kernel64_pass1.elf *.elf *.bin *.iso iso

@@ -88,7 +88,7 @@ void* BlockAllocatorImpl::Alloc()
     Usage++;
     BlockEntry* b = CONTAINING_RECORD(FreeBlockList.RemoveHead(), BlockEntry, ListLink);
     BugOn(b->Magic != Magic);
-    b->NumFrames = StackTrace::Capture(4096, b->Frames, Stdlib::ArraySize(b->Frames));
+    b->NumFrames = StackTrace::Capture(b->Frames, Stdlib::ArraySize(b->Frames));
     ActiveBlockList.InsertHead(&b->ListLink);
 
     return reinterpret_cast<void*>(reinterpret_cast<ulong>(b) - BlockSize);
