@@ -34,6 +34,7 @@ private:
     Panicker& operator=(Panicker&& other) = delete;
 
     void PrintOutput(const char* str);
+    void DumpContext();
     void DumpBacktrace(ulong* frames, size_t count);
 
     char Message[256];

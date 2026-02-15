@@ -226,6 +226,30 @@ Task* Task::GetCurrentTask()
     return task;
 }
 
+Task* Task::TryGetCurrentTask()
+{
+    /*
+     * Same as GetCurrentTask but without BugOn — returns nullptr
+     * on any invalid state. Safe to call from panic context.
+     */
+    ulong rsp = GetRsp();
+    struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
+    if (stackPtr->Magic1 != StackMagic1 || stackPtr->Magic2 != StackMagic2)
+        return nullptr;
+
+    if (rsp < ((ulong)&stackPtr->StackBottom[0] + Const::PageSize))
+        return nullptr;
+
+    if (rsp > (ulong)&stackPtr->StackTop[0])
+        return nullptr;
+
+    Task* task = stackPtr->Task;
+    if (task == nullptr || task->Magic != TaskMagic)
+        return nullptr;
+
+    return task;
+}
+
 void Task::DiagnoseGetCurrentTask()
 {
     /* Safe to call from contexts where Trace is allowed (e.g. Schedule).

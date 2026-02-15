@@ -1714,7 +1714,7 @@ Stdlib::Error Test()
 {
     Stdlib::Error err;
 
-    Trace(0, "Test in progress, please wait...");
+    Trace(0, "Self-test in progress, please wait...");
 
     err = TestAllocator();
     if (!err.Ok())

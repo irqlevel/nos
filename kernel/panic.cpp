@@ -6,6 +6,7 @@
 #include "trace.h"
 #include "stack_trace.h"
 #include "symtab.h"
+#include "task.h"
 
 #include <drivers/acpi.h>
 #include <drivers/serial.h>
@@ -31,6 +32,28 @@ void Panicker::PrintOutput(const char* str)
 {
     Serial::GetInstance().PanicPrintString(str);
     VgaTerm::GetInstance().PanicPrintString(str);
+}
+
+void Panicker::DumpContext()
+{
+    char buf[128];
+
+    /* CPU ID — safe if LAPIC is mapped */
+    if (Acpi::GetInstance().GetLapicAddress() != nullptr)
+    {
+        ulong cpuId = CpuTable::GetInstance().GetCurrentCpuId();
+        Stdlib::SnPrintf(buf, sizeof(buf), "CPU: %u\n", cpuId);
+        PrintOutput(buf);
+    }
+
+    /* Task — use TryGetCurrentTask to avoid BugOn/recursive panic */
+    Task* task = Task::TryGetCurrentTask();
+    if (task != nullptr)
+    {
+        Stdlib::SnPrintf(buf, sizeof(buf), "Task: pid %u name %s\n",
+            task->Pid, task->GetName());
+        PrintOutput(buf);
+    }
 }
 
 void Panicker::DumpBacktrace(ulong* frames, size_t count)
@@ -65,6 +88,7 @@ void Panicker::DoPanic(const char *fmt, ...)
         va_end(args);
 
         PrintOutput(Message);
+        DumpContext();
 
         ulong frames[16];
         size_t count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
@@ -96,6 +120,7 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
         va_end(args);
 
         PrintOutput(Message);
+        DumpContext();
 
         /* Walk backtrace from the faulting code's RBP */
         ulong frames[16];
