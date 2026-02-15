@@ -11,13 +11,13 @@ A hobby x86-64 operating system kernel written in C++20 and NASM.
 - **ACPI** — RSDP/RSDT/MADT parsing for LAPIC/IOAPIC discovery and IRQ→GSI routing
 - **Interrupts** — IDT with exception handlers, IOAPIC routing (edge + level-triggered), LAPIC IPI, PIC (remapped then disabled)
 - **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**, **virtio-scsi**, **virtio-rng** (legacy + modern virtio-pci transport)
-- **Block I/O** — virtio-blk driver with virtqueue DMA, block device abstraction, disk discovery and enumeration
+- **Block I/O** — asynchronous, interrupt-driven block request queue with DMA slot pool, `BlockRequest` submission with `WaitGroup` completion, direct DMA from caller buffers (page-aligned), virtqueue locking (`RawSpinLock`) for safe interrupt/task concurrency, early-boot polling fallback, SoftIrq-based retry for ring-full conditions, block device abstraction, MBR partition discovery
 - **Networking** — virtio-net driver, ARP (cache, request, reply, dump), IPv4/UDP transmit, ICMP echo (ping reply + send, per-type statistics), DHCP client with lease renewal, UDP remote shell (execute kernel commands over the network), network device abstraction with per-protocol packet counters, `MacAddress`/`IpAddress` structs (IPv6-ready tagged union)
 - **Filesystem** — VFS layer with mount points and path resolution, ramfs (in-memory), nanofs (on-disk filesystem with 4 KB blocks, superblock with UUID, inode/data bitmaps, CRC32 checksums for superblock/inodes/data, file and recursive directory deletion, persistent across remount)
 - **Entropy** — `EntropySource` interface, `EntropySourceTable` registry, virtio-rng hardware random number generator
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `cpu`, `dmesg [filter]`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `net`, `arp`, `icmpstat`, `udpsend`, `ping`, `dhcp`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `version`, `cls`, `help`, `poweroff`, `reboot`
-- **Kernel infrastructure** — spinlocks, mutexes, atomics, timers, watchdog, stack traces, dmesg ring buffer (512 KB, 2048 messages), panic handler, byte-order helpers (`Htons`/`Htonl`/`Ntohs`/`Ntohl`)
+- **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `cpu`, `bt <pid>`, `dmesg [filter]`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `irqstat`, `net`, `arp`, `icmpstat`, `udpsend`, `ping`, `dhcp`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `panic`, `version`, `cls`, `help`, `poweroff`, `reboot`
+- **Kernel infrastructure** — spinlocks, mutexes, atomics, wait groups, SoftIrq deferred processing, IPI tasks, timers, watchdog, stack traces with symbol resolution, dmesg ring buffer (512 KB, 2048 messages), panic handler with backtrace and CPU/task context, per-device interrupt statistics, virtual-to-physical address translation (4-level page table walk), byte-order helpers (`Htons`/`Htonl`/`Ntohs`/`Ntohl`)
 - **Optimized stdlib** — `MemSet`, `MemCpy`, `MemCmp`, `StrLen`, `StrCmp`, `StrStr` implemented in x86-64 assembly using `rep stosq`/`rep movsq`/`repe cmpsb`/`repne scasb`
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc (up to 128 pages), parsing helpers, block device table, memset, memcpy, memcmp, strlen, strcmp, strstr
 
@@ -132,12 +132,14 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 | `dmesg [filter]` | Dump kernel log (optional substring filter) |
 | `uptime` | Show uptime |
 | `ps` | Show tasks |
+| `bt <pid>` | Dump stack trace of a task (uses IPI for remote CPUs) |
 | `watchdog` | Show watchdog stats |
 | `memusage` | Show memory usage |
 | `pci` | Show PCI devices |
 | `disks` | List block devices |
 | `diskread <disk> <sector>` | Read and hex-dump a sector |
 | `diskwrite <disk> <sector> <hex>` | Write hex data to a sector |
+| `irqstat` | Show per-device interrupt counters |
 | `help` | List commands |
 | `net` | List network devices and per-protocol stats |
 | `arp` | Show ARP table |
@@ -157,6 +159,7 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 | `mkdir <path>` | Create directory |
 | `touch <path>` | Create empty file |
 | `del <path>` | Remove file or directory |
+| `panic [type]` | Trigger kernel panic (direct, pagefault, divzero, ud) |
 | `version` | Show kernel version |
 | `poweroff` / `shutdown` | Power off (ACPI S5) |
 | `reboot` | Reset system (keyboard controller) |
@@ -165,11 +168,12 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 
 ```
 boot/       Multiboot2 entry, 32→64-bit transition, AP trampoline
-kernel/     Core: scheduling, tasks, interrupts, shell, timers, locks
+kernel/     Core: scheduling, tasks, interrupts, SoftIrq, shell, timers, locks, panic, symbol table
 drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI, virtio-blk, virtio-net, virtio-scsi, virtio-rng
+block/      Block I/O: device abstraction, async request queue, MBR partition discovery
 net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, UDP shell
 fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
-mm/         Memory: page tables, page allocator, pool allocator
+mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
 lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, stdlib
 build/      Linker script, GRUB configs
 scripts/    Build, run, debug, and GDB helpers
