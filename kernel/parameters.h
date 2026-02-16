@@ -29,6 +29,8 @@ public:
 
     u16 GetUdpShellPort();
 
+    bool IsDnsEnabled();
+
     Parameters();
     ~Parameters();
 private:
@@ -53,5 +55,6 @@ private:
     ConsoleMode ConMode;
     DhcpMode DhcpMd;
     u16 UdpShellPort;
+    bool DnsEnabled;
 };
 }
