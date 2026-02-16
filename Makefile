@@ -47,6 +47,7 @@ CXX_SRC =   \
     block/block_device.cpp \
     block/partition.cpp \
     net/net_device.cpp \
+    net/net_frame.cpp \
     net/arp.cpp \
     net/dhcp.cpp \
     net/icmp.cpp \

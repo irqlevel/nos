@@ -191,7 +191,7 @@ private:
 
         /* DMA slot pool (shared by all LUNs on this HBA) */
         DmaSlot Slots[MaxSlots];
-        DmaSlot* SlotByHead[256];
+        DmaSlot* SlotByHead[VirtQueue::MaxDescriptors];
         Atomic FreeSlotMask;
 
         int AllocSlot();

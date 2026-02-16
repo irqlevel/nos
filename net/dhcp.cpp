@@ -284,7 +284,7 @@ ulong DhcpClient::BuildDiscover(u8* frame, ulong maxLen)
     ip->VersionIhl = 0x45;
     ip->TotalLen = Htons((u16)ipLen);
     ip->Ttl = 128;
-    ip->Protocol = 17; /* UDP */
+    ip->Protocol = Net::IpProtoUdp;
     ip->SrcAddr = 0;
     ip->DstAddr = 0xFFFFFFFF;
     ip->Checksum = Htons(IpChecksum(ip, sizeof(IpHdr)));
@@ -361,7 +361,7 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
     ip->VersionIhl = 0x45;
     ip->TotalLen = Htons((u16)ipLen);
     ip->Ttl = 128;
-    ip->Protocol = 17;
+    ip->Protocol = Net::IpProtoUdp;
     ip->SrcAddr = 0;
     ip->DstAddr = 0xFFFFFFFF;
     ip->Checksum = Htons(IpChecksum(ip, sizeof(IpHdr)));

@@ -81,6 +81,8 @@ public:
 
     u16 GetQueueSize();
 
+    static const ulong MaxDescriptors = 256;
+
 private:
     VirtQueue(const VirtQueue& other) = delete;
     VirtQueue(VirtQueue&& other) = delete;

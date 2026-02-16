@@ -82,7 +82,7 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         rIp->Id = 0;
         rIp->FragOff = 0;
         rIp->Ttl = 64;
-        rIp->Protocol = 1; /* ICMP */
+        rIp->Protocol = Net::IpProtoIcmp;
         rIp->Checksum = 0;
         rIp->SrcAddr = ip->DstAddr;
         rIp->DstAddr = ip->SrcAddr;
@@ -159,7 +159,7 @@ bool Icmp::SendEchoRequest(NetDevice* dev, IpAddress dstIp, u16 id, u16 seq)
     ip->VersionIhl = 0x45;
     ip->TotalLen = Htons((u16)ipLen);
     ip->Ttl = 64;
-    ip->Protocol = 1; /* ICMP */
+    ip->Protocol = Net::IpProtoIcmp;
     ip->SrcAddr = dev->GetIp().ToNetwork();
     ip->DstAddr = dstIp.ToNetwork();
     ip->Checksum = Htons(IpChecksum(ip, sizeof(IpHdr)));

@@ -108,7 +108,7 @@ private:
 
     /* DMA slot pool */
     DmaSlot Slots[MaxSlots];
-    DmaSlot* SlotByHead[256]; /* descriptor head -> slot lookup */
+    DmaSlot* SlotByHead[VirtQueue::MaxDescriptors]; /* descriptor head -> slot lookup */
     Atomic FreeSlotMask;      /* bitmap, bit set = slot free */
 
     static const ulong MaxInstances = 8;

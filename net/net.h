@@ -23,6 +23,10 @@ static_assert(sizeof(EthHdr) == 14, "Invalid size");
 static const u16 EtherTypeIp  = 0x0800;
 static const u16 EtherTypeArp = 0x0806;
 
+static const u8 IpProtoIcmp = 1;
+static const u8 IpProtoTcp  = 6;
+static const u8 IpProtoUdp  = 17;
+
 /* ARP packet */
 struct ArpPacket
 {

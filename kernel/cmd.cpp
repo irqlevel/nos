@@ -445,7 +445,7 @@ static void CmdUdpsend(const char* args, Stdlib::Printer& con)
     ip->VersionIhl = 0x45;
     ip->TotalLen = Net::Htons((u16)ipPayLen);
     ip->Ttl = 64;
-    ip->Protocol = 17;
+    ip->Protocol = Net::IpProtoUdp;
     ip->SrcAddr = srcIp.ToNetwork();
     ip->DstAddr = dstIp.ToNetwork();
     ip->Checksum = Net::Htons(Net::IpChecksum(ip, sizeof(Net::IpHdr)));
