@@ -12,11 +12,11 @@ A hobby x86-64 operating system kernel written in C++20 and NASM.
 - **Interrupts** — IDT with exception handlers, IOAPIC routing (edge + level-triggered), LAPIC IPI, PIC (remapped then disabled)
 - **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**, **virtio-scsi**, **virtio-rng** (legacy + modern virtio-pci transport)
 - **Block I/O** — asynchronous, interrupt-driven block request queue with DMA slot pool, `BlockRequest` submission with `WaitGroup` completion, direct DMA from caller buffers (page-aligned), virtqueue locking (`RawSpinLock`) for safe interrupt/task concurrency, early-boot polling fallback, SoftIrq-based retry for ring-full conditions, block device abstraction, MBR partition discovery
-- **Networking** — virtio-net driver, ARP (cache, request, reply, dump), IPv4/UDP transmit, ICMP echo (ping reply + send, per-type statistics), DHCP client with lease renewal, UDP remote shell (execute kernel commands over the network), network device abstraction with per-protocol packet counters, `MacAddress`/`IpAddress` structs (IPv6-ready tagged union)
+- **Networking** — virtio-net driver with asynchronous interrupt-driven TX/RX, software frame queues (256-entry TX/RX) in `NetDevice` base class, reference-counted `NetFrame` descriptors for zero-copy DMA, TX slot pool with bitmask allocation, SoftIrq-based TX retry and RX processing, ARP (cache, request, reply, dump), IPv4/UDP transmit, ICMP echo (ping reply + send, per-type statistics), DHCP client with lease renewal, DNS resolver with 32-entry cache (A-record queries, name compression, DHCP-provided server), UDP remote shell (execute kernel commands over the network), network device abstraction with per-protocol packet counters, `MacAddress`/`IpAddress` structs (IPv6-ready tagged union)
 - **Filesystem** — VFS layer with mount points and path resolution, ramfs (in-memory), nanofs (on-disk filesystem with 4 KB blocks, superblock with UUID, inode/data bitmaps, CRC32 checksums for superblock/inodes/data, file and recursive directory deletion, persistent across remount)
 - **Entropy** — `EntropySource` interface, `EntropySourceTable` registry, virtio-rng hardware random number generator
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `cpu`, `bt <pid>`, `dmesg [filter]`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `irqstat`, `net`, `arp`, `icmpstat`, `udpsend`, `ping`, `dhcp`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `panic`, `version`, `cls`, `help`, `poweroff`, `reboot`
+- **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `cpu`, `bt <pid>`, `dmesg [filter]`, `uptime`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `irqstat`, `net`, `arp`, `icmpstat`, `udpsend`, `ping`, `nslookup`, `dnsflush`, `dhcp`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `panic`, `version`, `cls`, `help`, `poweroff`, `reboot`
 - **Kernel infrastructure** — spinlocks, mutexes, atomics, wait groups, SoftIrq deferred processing, IPI tasks, timers, watchdog, stack traces with symbol resolution, dmesg ring buffer (512 KB, 2048 messages), panic handler with backtrace and CPU/task context, per-device interrupt statistics, virtual-to-physical address translation (4-level page table walk), byte-order helpers (`Htons`/`Htonl`/`Ntohs`/`Ntohl`)
 - **Optimized stdlib** — `MemSet`, `MemCpy`, `MemCmp`, `StrLen`, `StrCmp`, `StrStr` implemented in x86-64 assembly using `rep stosq`/`rep movsq`/`repe cmpsb`/`repne scasb`
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc (up to 128 pages), parsing helpers, block device table, memset, memcpy, memcmp, strlen, strcmp, strstr
@@ -106,6 +106,7 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 - `dhcp=auto` — start DHCP on `eth0` automatically at boot
 - `dhcp=off` — disable DHCP entirely (even via shell command)
 - `dhcp=on` — enable DHCP only via shell command (default)
+- `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`)
 
 #### UDP remote shell
@@ -145,7 +146,9 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 | `arp` | Show ARP table |
 | `icmpstat` | Show ICMP statistics |
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
-| `ping <ip>` | Send 5 ICMP echo requests with RTT |
+| `ping <ip\|hostname>` | Send 5 ICMP echo requests with RTT (resolves hostnames via DNS) |
+| `nslookup <hostname>` | Resolve hostname to IP via DNS |
+| `dnsflush` | Flush DNS cache |
 | `dhcp [dev]` | Obtain IP address via DHCP |
 | `random [len]` | Get random bytes as hex string |
 | `format nanofs <disk>` | Format disk with nanofs |
@@ -171,7 +174,7 @@ boot/       Multiboot2 entry, 32→64-bit transition, AP trampoline
 kernel/     Core: scheduling, tasks, interrupts, SoftIrq, shell, timers, locks, panic, symbol table
 drivers/    Hardware: serial, VGA, PIT, 8042, PCI, PIC, LAPIC, IOAPIC, ACPI, virtio-blk, virtio-net, virtio-scsi, virtio-rng
 block/      Block I/O: device abstraction, async request queue, MBR partition discovery
-net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, UDP shell
+net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, UDP shell
 fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
 mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
 lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, stdlib
