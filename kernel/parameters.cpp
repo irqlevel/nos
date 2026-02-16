@@ -12,6 +12,7 @@ Parameters::Parameters()
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
+    , DnsEnabled(false)
 {
 }
 
@@ -62,6 +63,11 @@ bool Parameters::IsDhcpOff()
 u16 Parameters::GetUdpShellPort()
 {
     return UdpShellPort;
+}
+
+bool Parameters::IsDnsEnabled()
+{
+    return DnsEnabled;
 }
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
@@ -176,6 +182,17 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         else
         {
             Trace(0, "Invalid udpshell port %s", value);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "dns") == 0)
+    {
+        if (Stdlib::StrCmp(value, "on") == 0)
+        {
+            DnsEnabled = true;
+        }
+        else
+        {
+            Trace(0, "Unknown value %s, key %s", value, key);
         }
     }
     else

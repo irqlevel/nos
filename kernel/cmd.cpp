@@ -14,6 +14,7 @@
 #include <net/arp.h>
 #include <net/dhcp.h>
 #include <net/icmp.h>
+#include <net/dns.h>
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
 #include <fs/nanofs.h>
@@ -477,18 +478,22 @@ static void CmdPing(const char* args, Stdlib::Printer& con)
     const char* ipStart = Stdlib::NextToken(args, end);
     if (!ipStart)
     {
-        con.Printf("usage: ping <ip>\n");
+        con.Printf("usage: ping <ip|hostname>\n");
         return;
     }
 
-    char ipBuf[16];
-    Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
+    char hostBuf[DnsResolver::MaxDomainLen + 1];
+    Stdlib::TokenCopy(ipStart, end, hostBuf, sizeof(hostBuf));
 
     Net::IpAddress dstIp;
-    if (!Net::IpAddress::Parse(ipBuf, dstIp))
+    if (!Net::IpAddress::Parse(hostBuf, dstIp))
     {
-        con.Printf("invalid IP '%s'\n", ipBuf);
-        return;
+        if (!DnsResolver::GetInstance().IsInitialized() ||
+            !DnsResolver::GetInstance().Resolve(hostBuf, dstIp))
+        {
+            con.Printf("cannot resolve '%s'\n", hostBuf);
+            return;
+        }
     }
 
     NetDevice* dev = nullptr;
@@ -503,7 +508,7 @@ static void CmdPing(const char* args, Stdlib::Printer& con)
 
     u16 pingId = (u16)(ReadTsc() & 0xFFFF);
 
-    con.Printf("PING %s\n", ipBuf);
+    con.Printf("PING %s\n", hostBuf);
     ulong received = 0;
 
     for (u16 seq = 0; seq < 5; seq++)
@@ -519,7 +524,7 @@ static void CmdPing(const char* args, Stdlib::Printer& con)
             {
                 ulong rttMs = rttNs / Const::NanoSecsInMs;
                 con.Printf("reply from %s: seq=%u time=%u ms\n",
-                    ipBuf, (ulong)seq, rttMs);
+                    hostBuf, (ulong)seq, rttMs);
                 received++;
             }
             else
@@ -533,6 +538,47 @@ static void CmdPing(const char* args, Stdlib::Printer& con)
     }
 
     con.Printf("%u/5 received\n", received);
+}
+
+static void CmdNslookup(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* nameStart = Stdlib::NextToken(args, end);
+    if (!nameStart)
+    {
+        con.Printf("usage: nslookup <hostname>\n");
+        return;
+    }
+
+    char hostBuf[DnsResolver::MaxDomainLen + 1];
+    Stdlib::TokenCopy(nameStart, end, hostBuf, sizeof(hostBuf));
+
+    if (!DnsResolver::GetInstance().IsInitialized())
+    {
+        con.Printf("DNS resolver not initialized\n");
+        return;
+    }
+
+    Net::IpAddress ip;
+    if (DnsResolver::GetInstance().Resolve(hostBuf, ip))
+    {
+        con.Printf("%s -> %u.%u.%u.%u\n", hostBuf,
+            (ulong)((ip.Addr4 >> 24) & 0xFF),
+            (ulong)((ip.Addr4 >> 16) & 0xFF),
+            (ulong)((ip.Addr4 >> 8) & 0xFF),
+            (ulong)(ip.Addr4 & 0xFF));
+    }
+    else
+    {
+        con.Printf("failed to resolve '%s'\n", hostBuf);
+    }
+}
+
+static void CmdDnsflush(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    DnsResolver::GetInstance().Flush();
+    con.Printf("dns cache flushed\n");
 }
 
 static void CmdDhcp(const char* args, Stdlib::Printer& con)
@@ -585,6 +631,17 @@ static void CmdDhcp(const char* args, Stdlib::Printer& con)
         con.Printf("router: "); r.Router.Print(con); con.Printf("\n");
         con.Printf("dns:    "); r.Dns.Print(con); con.Printf("\n");
         con.Printf("lease:  %u seconds\n", r.LeaseTime);
+
+        if (Parameters::GetInstance().IsDnsEnabled() && !r.Dns.IsZero() &&
+            !DnsResolver::GetInstance().IsInitialized())
+        {
+            if (DnsResolver::GetInstance().Init(dev, r.Dns))
+            {
+                con.Printf("DNS resolver started, server: ");
+                r.Dns.Print(con);
+                con.Printf("\n");
+            }
+        }
     }
     else
     {
@@ -1104,7 +1161,9 @@ static const CmdEntry Commands[] = {
     { "arp",       CmdArp,       "arp - show ARP table" },
     { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
     { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
-    { "ping",      CmdPing,      "ping <ip> - send ICMP echo" },
+    { "ping",      CmdPing,      "ping <ip|hostname> - send ICMP echo" },
+    { "nslookup",  CmdNslookup,  "nslookup <hostname> - resolve hostname" },
+    { "dnsflush",  CmdDnsflush,  "dnsflush - flush DNS cache" },
     { "dhcp",      CmdDhcp,      "dhcp [dev] - obtain IP via DHCP" },
     { "format",    CmdFormat,    "format nanofs <disk> - format disk" },
     { "mount",     CmdMount,     "mount <ramfs|nanofs> ... - mount filesystem" },
@@ -1305,6 +1364,16 @@ void Cmd::Run()
                     con.Printf("DHCP ip: ");
                     r.Ip.Print(con);
                     con.Printf("\n");
+
+                    if (Parameters::GetInstance().IsDnsEnabled() && !r.Dns.IsZero())
+                    {
+                        if (DnsResolver::GetInstance().Init(dev, r.Dns))
+                        {
+                            con.Printf("DNS resolver started, server: ");
+                            r.Dns.Print(con);
+                            con.Printf("\n");
+                        }
+                    }
                 }
                 else
                 {
