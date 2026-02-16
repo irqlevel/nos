@@ -2,14 +2,61 @@
 
 #include <kernel/trace.h>
 #include <lib/stdlib.h>
+#include <mm/new.h>
 
 namespace Kernel
 {
 
 NetDevice::NetDevice()
-    : UdpListenerCount(0)
+    : TxCount(0)
+    , RxCount(0)
+    , UdpListenerCount(0)
 {
     Stdlib::MemSet(UdpListeners, 0, sizeof(UdpListeners));
+}
+
+bool NetDevice::SubmitTx(NetFrame* frame)
+{
+    ulong flags = TxQueueLock.LockIrqSave();
+    if (TxCount >= TxQueueCapacity)
+    {
+        TxQueueLock.UnlockIrqRestore(flags);
+        frame->Put();
+        return false;
+    }
+    TxQueue.InsertTail(&frame->Link);
+    TxCount++;
+    FlushTx();
+    TxQueueLock.UnlockIrqRestore(flags);
+    return true;
+}
+
+bool NetDevice::SendRaw(const void* buf, ulong len)
+{
+    if (len == 0)
+        return false;
+
+    NetFrame* frame = NetFrame::AllocTx(len);
+    if (!frame)
+        return false;
+
+    Stdlib::MemCpy(frame->Data, buf, len);
+    frame->Length = len;
+    return SubmitTx(frame);
+}
+
+bool NetDevice::EnqueueRx(NetFrame* frame)
+{
+    ulong flags = RxQueueLock.LockIrqSave();
+    if (RxCount >= RxQueueCapacity)
+    {
+        RxQueueLock.UnlockIrqRestore(flags);
+        return false;
+    }
+    RxQueue.InsertTail(&frame->Link);
+    RxCount++;
+    RxQueueLock.UnlockIrqRestore(flags);
+    return true;
 }
 
 bool NetDevice::RegisterUdpListener(u16 port, RxCallback cb, void* ctx)

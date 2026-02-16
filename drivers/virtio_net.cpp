@@ -34,12 +34,16 @@ VirtioNet::VirtioNet()
     , IntVector(-1)
     , Initialized(false)
     , NetHdrSize(sizeof(VirtioNetHdr)) /* Updated in Init() for legacy */
-    , TxBuf(nullptr)
-    , TxBufPhys(0)
+    , FreeTxSlotMask(0)
+    , TxHdrPage(nullptr)
+    , TxHdrPagePhys(0)
     , RxBufs(nullptr)
     , RxBufsPhys(0)
+    , RxNeedNotify(false)
 {
     DevName[0] = '\0';
+    Stdlib::MemSet(TxSlots, 0, sizeof(TxSlots));
+    Stdlib::MemSet(TxSlotByHead, 0, sizeof(TxSlotByHead));
 }
 
 VirtioNet::~VirtioNet()
@@ -128,16 +132,16 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
         return false;
     }
 
-    if (!RxQueue.Setup(rxQueueSize))
+    if (!HwRxQueue.Setup(rxQueueSize))
     {
         Trace(0, "VirtioNet %s: failed to setup RX queue", name);
         Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
-    Transport.SetQueueDesc(RxQueue.GetDescPhys());
-    Transport.SetQueueDriver(RxQueue.GetAvailPhys());
-    Transport.SetQueueDevice(RxQueue.GetUsedPhys());
+    Transport.SetQueueDesc(HwRxQueue.GetDescPhys());
+    Transport.SetQueueDriver(HwRxQueue.GetAvailPhys());
+    Transport.SetQueueDevice(HwRxQueue.GetUsedPhys());
     Transport.EnableQueue();
 
     if (!Transport.IsLegacy())
@@ -155,16 +159,16 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
         return false;
     }
 
-    if (!TxQueue.Setup(txQueueSize))
+    if (!HwTxQueue.Setup(txQueueSize))
     {
         Trace(0, "VirtioNet %s: failed to setup TX queue", name);
         Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
 
-    Transport.SetQueueDesc(TxQueue.GetDescPhys());
-    Transport.SetQueueDriver(TxQueue.GetAvailPhys());
-    Transport.SetQueueDevice(TxQueue.GetUsedPhys());
+    Transport.SetQueueDesc(HwTxQueue.GetDescPhys());
+    Transport.SetQueueDriver(HwTxQueue.GetAvailPhys());
+    Transport.SetQueueDevice(HwTxQueue.GetUsedPhys());
     Transport.EnableQueue();
 
     if (!Transport.IsLegacy())
@@ -191,14 +195,25 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
         (ulong)Mac.Bytes[0], (ulong)Mac.Bytes[1], (ulong)Mac.Bytes[2],
         (ulong)Mac.Bytes[3], (ulong)Mac.Bytes[4], (ulong)Mac.Bytes[5]);
 
-    /* Allocate DMA pages for TX buffer (2 pages) */
-    TxBuf = (u8*)Mm::AllocMapPages(2, &TxBufPhys);
-    if (!TxBuf)
+    /* Allocate DMA page for TX slot headers (8 slots, each NetHdrSize bytes) */
+    TxHdrPage = (u8*)Mm::AllocMapPages(1, &TxHdrPagePhys);
+    if (!TxHdrPage)
     {
-        Trace(0, "VirtioNet %s: failed to alloc TX DMA pages", name);
+        Trace(0, "VirtioNet %s: failed to alloc TX header page", name);
         Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
     }
+    Stdlib::MemSet(TxHdrPage, 0, Const::PageSize);
+
+    /* Init TX slot pool */
+    for (ulong s = 0; s < MaxTxSlots; s++)
+    {
+        TxSlots[s].HdrBuf = TxHdrPage + s * NetHdrSize;
+        TxSlots[s].HdrBufPhys = TxHdrPagePhys + s * NetHdrSize;
+        TxSlots[s].Frame = nullptr;
+        TxSlots[s].Head = -1;
+    }
+    FreeTxSlotMask = (1UL << MaxTxSlots) - 1; /* all slots free */
 
     /* Allocate DMA pages for RX buffers (RxBufCount * RxBufSize = 32KB = 8 pages) */
     ulong rxPages = (RxBufCount * RxBufSize + Const::PageSize - 1) / Const::PageSize;
@@ -206,8 +221,19 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     if (!RxBufs)
     {
         Trace(0, "VirtioNet %s: failed to alloc RX DMA pages", name);
+        Mm::UnmapFreePages(TxHdrPage);
+        TxHdrPage = nullptr;
         Transport.SetStatus(VirtioPci::StatusFailed);
         return false;
+    }
+
+    /* Init pre-allocated RX frame descriptors */
+    for (ulong r = 0; r < RxBufCount; r++)
+    {
+        RxFrames[r].Init();
+        RxFrames[r].Direction = NetFrame::Rx;
+        RxFrames[r].Release = RxFrameRelease;
+        RxFrames[r].ReleaseCtx = this;
     }
 
     /* Default IP for QEMU user-mode networking */
@@ -237,7 +263,7 @@ void VirtioNet::PostRxBuf(ulong index)
     buf.Len = RxBufSize;
     buf.Writable = true;
 
-    RxQueue.AddBufs(&buf, 1);
+    HwRxQueue.AddBufs(&buf, 1);
 }
 
 void VirtioNet::PostAllRxBufs()
@@ -249,196 +275,298 @@ void VirtioNet::PostAllRxBufs()
     Transport.NotifyQueue(0);
 }
 
-void VirtioNet::DrainRx()
-{
-    bool reposted = false;
+/* --- TX slot management (caller holds TxQueueLock) --- */
 
-    while (RxQueue.HasUsed())
+int VirtioNet::AllocTxSlot()
+{
+    if (FreeTxSlotMask == 0)
+        return -1;
+
+    for (ulong i = 0; i < MaxTxSlots; i++)
+    {
+        if (FreeTxSlotMask & (1UL << i))
+        {
+            FreeTxSlotMask &= ~(1UL << i);
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+void VirtioNet::FreeTxSlot(int idx)
+{
+    TxSlots[idx].Frame = nullptr;
+    TxSlots[idx].Head = -1;
+    FreeTxSlotMask |= (1UL << (ulong)idx);
+}
+
+/* --- TX: classify frame for per-protocol stats --- */
+
+void VirtioNet::ClassifyTxFrame(NetFrame* frame)
+{
+    if (frame->Length < sizeof(EthHdr))
+        return;
+
+    const EthHdr* eth = (const EthHdr*)frame->Data;
+    u16 etherType = Ntohs(eth->EtherType);
+
+    if (etherType == Net::EtherTypeArp)
+    {
+        TxArp.Inc();
+        return;
+    }
+
+    if (etherType != Net::EtherTypeIp || frame->Length < sizeof(EthHdr) + sizeof(IpHdr))
+    {
+        TxOther.Inc();
+        return;
+    }
+
+    const IpHdr* ip = (const IpHdr*)(frame->Data + sizeof(EthHdr));
+    switch (ip->Protocol)
+    {
+    case Net::IpProtoIcmp: TxIcmp.Inc(); break;
+    case Net::IpProtoTcp:  TxTcp.Inc();  break;
+    case Net::IpProtoUdp:  TxUdp.Inc();  break;
+    default:               TxOther.Inc(); break;
+    }
+}
+
+/* --- TX: drain SW TxQueue to hardware (caller holds TxQueueLock) --- */
+
+void VirtioNet::FlushTx()
+{
+    bool submitted = false;
+
+    while (!TxQueue.IsEmpty())
+    {
+        int slotIdx = AllocTxSlot();
+        if (slotIdx < 0)
+            break; /* all DMA slots in-flight */
+
+        Stdlib::ListEntry* entry = TxQueue.RemoveHead();
+        TxCount--;
+        NetFrame* frame = CONTAINING_RECORD(entry, NetFrame, Link);
+
+        /* Fill slot header with zeroed virtio_net_hdr */
+        Stdlib::MemSet(TxSlots[slotIdx].HdrBuf, 0, NetHdrSize);
+
+        /* Build 2-descriptor chain: [hdr, data] */
+        VirtQueue::BufDesc descs[2];
+        descs[0].Addr = TxSlots[slotIdx].HdrBufPhys;
+        descs[0].Len = (u32)NetHdrSize;
+        descs[0].Writable = false;
+        descs[1].Addr = frame->DataPhys;
+        descs[1].Len = (u32)frame->Length;
+        descs[1].Writable = false;
+
+        int head = HwTxQueue.AddBufs(descs, 2);
+        if (head < 0 || (ulong)head >= VirtQueue::MaxDescriptors)
+        {
+            FreeTxSlot(slotIdx);
+            TxQueue.InsertHead(&frame->Link);
+            TxCount++;
+            break;
+        }
+
+        TxPktCount.Inc();
+        ClassifyTxFrame(frame);
+
+        TxSlots[slotIdx].Frame = frame;
+        TxSlots[slotIdx].Head = head;
+        TxSlotByHead[head] = &TxSlots[slotIdx];
+        submitted = true;
+    }
+
+    if (submitted)
+        Transport.NotifyQueue(1);
+
+    if (!TxQueue.IsEmpty())
+        SoftIrq::GetInstance().Raise(SoftIrq::TypeNetTx);
+}
+
+/* --- TX: complete hardware TX (caller holds TxQueueLock) --- */
+
+void VirtioNet::CompleteTx()
+{
+    u32 usedId, usedLen;
+    while (HwTxQueue.GetUsed(usedId, usedLen))
+    {
+        if (usedId >= VirtQueue::MaxDescriptors)
+            continue;
+
+        TxSlot* slot = TxSlotByHead[usedId];
+        if (!slot)
+            continue;
+
+        NetFrame* frame = slot->Frame;
+        FreeTxSlot((int)(slot - TxSlots));
+        if (frame)
+            frame->Put();
+    }
+}
+
+/* --- TX: called from softirq to retry pending TX --- */
+
+void VirtioNet::DrainTx()
+{
+    ulong flags = TxQueueLock.LockIrqSave();
+    CompleteTx();
+    FlushTx();
+    TxQueueLock.UnlockIrqRestore(flags);
+}
+
+/* --- RX: reap completed buffers from HW into SW RxQueue --- */
+
+void VirtioNet::ReapRx()
+{
+    while (HwRxQueue.HasUsed())
     {
         u32 usedId, usedLen;
-        if (!RxQueue.GetUsed(usedId, usedLen))
+        if (!HwRxQueue.GetUsed(usedId, usedLen))
             break;
 
         RxPktCount.Inc();
 
-        /* The buffer contains virtio_net_hdr + ethernet frame.
-           usedId is the descriptor index which maps to our buffer index. */
-        if (usedId < RxBufCount && usedLen > NetHdrSize)
-        {
-            u8* pkt = RxBufs + usedId * RxBufSize;
-            u8* frame = pkt + NetHdrSize;
-            ulong frameLen = usedLen - NetHdrSize;
-
-            /* Check EtherType */
-            if (frameLen >= sizeof(EthHdr))
-            {
-                EthHdr* eth = (EthHdr*)frame;
-                u16 etherType = Ntohs(eth->EtherType);
-
-                if (etherType == Net::EtherTypeArp)
-                {
-                    RxArp.Inc();
-                    ArpTable::GetInstance().Process(this, frame, frameLen);
-                }
-                else if (etherType == Net::EtherTypeIp)
-                {
-                    if (frameLen >= sizeof(EthHdr) + sizeof(IpHdr))
-                    {
-                        IpHdr* ip = (IpHdr*)(frame + sizeof(EthHdr));
-
-                        if (ip->Protocol == 1) /* ICMP */
-                        {
-                            RxIcmp.Inc();
-                            Icmp::GetInstance().Process(this, frame, frameLen);
-                        }
-                        else if (ip->Protocol == 6) /* TCP */
-                        {
-                            RxTcp.Inc();
-                            RxDropCount.Inc();
-                        }
-                        else if (ip->Protocol == 17) /* UDP */
-                        {
-                            RxUdp.Inc();
-
-                            if (frameLen >= sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
-                            {
-                                UdpHdr* udp = (UdpHdr*)(frame + sizeof(EthHdr) + sizeof(IpHdr));
-                                u16 dstPort = Ntohs(udp->DstPort);
-                                bool delivered = false;
-
-                                Stdlib::AutoLock lock(UdpListenerLock);
-                                for (ulong li = 0; li < UdpListenerCount; li++)
-                                {
-                                    if (UdpListeners[li].Port == dstPort && UdpListeners[li].Cb)
-                                    {
-                                        UdpListeners[li].Cb(frame, frameLen, UdpListeners[li].Ctx);
-                                        delivered = true;
-                                        break;
-                                    }
-                                }
-
-                                if (!delivered)
-                                    RxDropCount.Inc();
-                            }
-                            else
-                            {
-                                RxDropCount.Inc();
-                            }
-                        }
-                        else
-                        {
-                            RxOther.Inc();
-                            RxDropCount.Inc();
-                        }
-                    }
-                    else
-                    {
-                        RxOther.Inc();
-                        RxDropCount.Inc();
-                    }
-                }
-                else
-                {
-                    RxOther.Inc();
-                    RxDropCount.Inc();
-                }
-            }
-            else
-            {
-                RxDropCount.Inc();
-            }
-        }
-        else
+        if (usedId >= RxBufCount)
         {
             RxDropCount.Inc();
+            continue;
         }
 
-        /* Repost the buffer */
-        if (usedId < RxBufCount)
+        if (usedLen <= NetHdrSize)
         {
+            RxDropCount.Inc();
             PostRxBuf(usedId);
-            reposted = true;
+            RxNeedNotify = true;
+            continue;
         }
-    }
 
-    if (reposted)
-    {
-        Transport.NotifyQueue(0);
+        NetFrame* frame = &RxFrames[usedId];
+        frame->Data = RxBufs + usedId * RxBufSize + NetHdrSize;
+        frame->DataPhys = RxBufsPhys + usedId * RxBufSize + NetHdrSize;
+        frame->Length = usedLen - NetHdrSize;
+        frame->Refcount.Set(1);
+        frame->Direction = NetFrame::Rx;
+        frame->Release = RxFrameRelease;
+        frame->ReleaseCtx = this;
+
+        if (!EnqueueRx(frame))
+        {
+            RxDropCount.Inc();
+            frame->Put(); /* reposts DMA buffer via RxFrameRelease */
+        }
     }
 }
 
-/* --- Send --- */
+/* --- RX: process frames from SW RxQueue (protocol dispatch) --- */
 
-bool VirtioNet::SendRaw(const void* buf, ulong len)
+void VirtioNet::ProcessRx()
 {
-    if (!Initialized || len == 0)
-        return false;
-
-    /* Prepend virtio_net_hdr */
-    ulong totalLen = NetHdrSize + len;
-    if (totalLen > 2 * Const::PageSize)
-        return false;
-
-    Stdlib::AutoLock lock(TxLock);
-
-    Stdlib::MemSet(TxBuf, 0, NetHdrSize);
-    Stdlib::MemCpy(TxBuf + NetHdrSize, buf, len);
-
-    VirtQueue::BufDesc desc;
-    desc.Addr = TxBufPhys;
-    desc.Len = (u32)totalLen;
-    desc.Writable = false;
-
-    int head = TxQueue.AddBufs(&desc, 1);
-    if (head < 0)
+    while (true)
     {
-        Trace(0, "VirtioNet %s: AddBufs failed", DevName);
-        return false;
-    }
-
-    Transport.NotifyQueue(1);
-
-    /* Poll for completion */
-    for (ulong i = 0; i < 10000000; i++)
-    {
-        if (TxQueue.HasUsed())
+        ulong flags = RxQueueLock.LockIrqSave();
+        if (RxQueue.IsEmpty())
+        {
+            RxQueueLock.UnlockIrqRestore(flags);
             break;
-        Pause();
+        }
+        Stdlib::ListEntry* entry = RxQueue.RemoveHead();
+        RxCount--;
+        RxQueueLock.UnlockIrqRestore(flags);
+
+        NetFrame* frame = CONTAINING_RECORD(entry, NetFrame, Link);
+        u8* data = frame->Data;
+        ulong dataLen = frame->Length;
+
+        /* Protocol dispatch */
+        if (dataLen < sizeof(EthHdr))
+        {
+            RxDropCount.Inc();
+            goto done;
+        }
+
+        {
+            EthHdr* eth = (EthHdr*)data;
+            u16 etherType = Ntohs(eth->EtherType);
+
+            if (etherType == Net::EtherTypeArp)
+            {
+                RxArp.Inc();
+                ArpTable::GetInstance().Process(this, data, dataLen);
+                goto done;
+            }
+
+            if (etherType != Net::EtherTypeIp || dataLen < sizeof(EthHdr) + sizeof(IpHdr))
+            {
+                RxOther.Inc();
+                RxDropCount.Inc();
+                goto done;
+            }
+
+            IpHdr* ip = (IpHdr*)(data + sizeof(EthHdr));
+            switch (ip->Protocol)
+            {
+            case Net::IpProtoIcmp:
+                RxIcmp.Inc();
+                Icmp::GetInstance().Process(this, data, dataLen);
+                break;
+            case Net::IpProtoTcp:
+                RxTcp.Inc();
+                RxDropCount.Inc();
+                break;
+            case Net::IpProtoUdp:
+            {
+                RxUdp.Inc();
+                if (dataLen < sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
+                {
+                    RxDropCount.Inc();
+                    break;
+                }
+                UdpHdr* udp = (UdpHdr*)(data + sizeof(EthHdr) + sizeof(IpHdr));
+                u16 dstPort = Ntohs(udp->DstPort);
+                bool delivered = false;
+
+                Stdlib::AutoLock lock(UdpListenerLock);
+                for (ulong li = 0; li < UdpListenerCount; li++)
+                {
+                    if (UdpListeners[li].Port == dstPort && UdpListeners[li].Cb)
+                    {
+                        UdpListeners[li].Cb(data, dataLen, UdpListeners[li].Ctx);
+                        delivered = true;
+                        break;
+                    }
+                }
+                if (!delivered)
+                    RxDropCount.Inc();
+                break;
+            }
+            default:
+                RxOther.Inc();
+                RxDropCount.Inc();
+                break;
+            }
+        }
+done:
+
+        frame->Put(); /* refcount -> 0 -> RxFrameRelease -> PostRxBuf */
     }
 
-    u32 usedId, usedLen;
-    if (!TxQueue.GetUsed(usedId, usedLen))
+    if (RxNeedNotify)
     {
-        Trace(0, "VirtioNet %s: TX timeout", DevName);
-        return false;
+        Transport.NotifyQueue(0);
+        RxNeedNotify = false;
     }
+}
 
-    TxPktCount.Inc();
+/* --- RX frame release callback --- */
 
-    /* Classify TX packet by protocol */
-    if (len >= sizeof(EthHdr))
-    {
-        const EthHdr* eth = (const EthHdr*)buf;
-        u16 etherType = Ntohs(eth->EtherType);
-        if (etherType == Net::EtherTypeArp)
-        {
-            TxArp.Inc();
-        }
-        else if (etherType == Net::EtherTypeIp && len >= sizeof(EthHdr) + sizeof(IpHdr))
-        {
-            const IpHdr* ip = (const IpHdr*)((const u8*)buf + sizeof(EthHdr));
-            if (ip->Protocol == 1) TxIcmp.Inc();
-            else if (ip->Protocol == 6) TxTcp.Inc();
-            else if (ip->Protocol == 17) TxUdp.Inc();
-            else TxOther.Inc();
-        }
-        else
-        {
-            TxOther.Inc();
-        }
-    }
-
-    return true;
+void VirtioNet::RxFrameRelease(NetFrame* frame, void* ctx)
+{
+    VirtioNet* dev = (VirtioNet*)ctx;
+    ulong idx = (ulong)(frame - dev->RxFrames);
+    dev->PostRxBuf(idx);
+    dev->RxNeedNotify = true;
 }
 
 bool VirtioNet::SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
@@ -483,7 +611,7 @@ bool VirtioNet::SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp,
     ip->Id = 0;
     ip->FragOff = 0;
     ip->Ttl = 64;
-    ip->Protocol = 17; /* UDP */
+    ip->Protocol = Net::IpProtoUdp;
     ip->Checksum = 0;
     ip->SrcAddr = srcIp.ToNetwork();
     ip->DstAddr = dstIp.ToNetwork();
@@ -578,11 +706,17 @@ void VirtioNet::Interrupt(Context* ctx)
 
     InterruptStats::Inc(IrqVirtioNet);
 
+    /* Complete TX and try to drain pending frames under TxQueueLock */
+    ulong flags = TxQueueLock.LockIrqSave();
+    CompleteTx();
+    FlushTx();
+    TxQueueLock.UnlockIrqRestore(flags);
+
     /* Defer RX processing to the soft IRQ task */
     SoftIrq::GetInstance().Raise(SoftIrq::TypeNetRx);
 }
 
-/* --- Soft IRQ handler --- */
+/* --- Soft IRQ handlers --- */
 
 static void NetRxSoftIrqHandler(void* ctx)
 {
@@ -590,7 +724,18 @@ static void NetRxSoftIrqHandler(void* ctx)
 
     for (ulong i = 0; i < VirtioNet::InstanceCount; i++)
     {
-        VirtioNet::Instances[i].DrainRx();
+        VirtioNet::Instances[i].ReapRx();
+        VirtioNet::Instances[i].ProcessRx();
+    }
+}
+
+static void NetTxSoftIrqHandler(void* ctx)
+{
+    (void)ctx;
+
+    for (ulong i = 0; i < VirtioNet::InstanceCount; i++)
+    {
+        VirtioNet::Instances[i].DrainTx();
     }
 }
 
@@ -632,6 +777,7 @@ void VirtioNet::InitAll()
     if (InstanceCount > 0)
     {
         SoftIrq::GetInstance().Register(SoftIrq::TypeNetRx, NetRxSoftIrqHandler, nullptr);
+        SoftIrq::GetInstance().Register(SoftIrq::TypeNetTx, NetTxSoftIrqHandler, nullptr);
     }
 
     Trace(0, "VirtioNet: initialized %u devices", InstanceCount);

@@ -2,8 +2,11 @@
 
 #include <include/types.h>
 #include <lib/printer.h>
+#include <lib/list_entry.h>
 #include <kernel/spin_lock.h>
+#include <kernel/raw_spin_lock.h>
 #include <net/net.h>
+#include <net/net_frame.h>
 
 namespace Kernel
 {
@@ -31,11 +34,19 @@ public:
     NetDevice();
     virtual ~NetDevice() {}
     virtual const char* GetName() = 0;
-    virtual bool SendRaw(const void* buf, ulong len) = 0;
     virtual u64 GetTxPackets() = 0;
     virtual u64 GetRxPackets() = 0;
     virtual u64 GetRxDropped() = 0;
     virtual void GetStats(NetStats& stats) { (void)stats; }
+
+    /* TX: enqueue frame to TxQueue, call FlushTx() */
+    bool SubmitTx(NetFrame* frame);
+
+    /* TX: convenience wrapper -- alloc frame, copy data, SubmitTx */
+    bool SendRaw(const void* buf, ulong len);
+
+    /* RX: enqueue frame to RxQueue; returns false if full (caller must Put) */
+    bool EnqueueRx(NetFrame* frame);
 
     Net::MacAddress GetMac();
     void SetMac(const Net::MacAddress& mac);
@@ -64,7 +75,24 @@ public:
         void* Ctx;
     };
 
+    /* Driver must implement: drain TxQueue to hardware (called under TxQueueLock) */
+    virtual void FlushTx() = 0;
+
+    /* Driver must implement: process frames from RxQueue (called from softirq) */
+    virtual void ProcessRx() = 0;
+
 protected:
+    static const ulong TxQueueCapacity = 256;
+    static const ulong RxQueueCapacity = 256;
+
+    Stdlib::ListEntry TxQueue;
+    ulong TxCount;
+    RawSpinLock TxQueueLock;
+
+    Stdlib::ListEntry RxQueue;
+    ulong RxCount;
+    RawSpinLock RxQueueLock;
+
     UdpListener UdpListeners[MaxUdpListeners];
     ulong UdpListenerCount;
     SpinLock UdpListenerLock;

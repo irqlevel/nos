@@ -28,6 +28,7 @@ public:
 
     static const ulong TypeNetRx = 0;
     static const ulong TypeBlkIo = 1;
+    static const ulong TypeNetTx = 2;
     static const ulong MaxTypes = 8;
 
 private:
