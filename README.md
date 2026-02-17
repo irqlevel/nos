@@ -1,6 +1,7 @@
 ### nos
 
 A hobby x86-64 operating system kernel written in C++20 and NASM.
+Code is partially written by AI models (Claude, GPT) with human control over architecture decisions, testing, and code review.
 Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices). Real hardware support has not been tested.
 
 #### Features
@@ -68,13 +69,13 @@ Boot from disk image (with virtio-blk):
 ./scripts/qemu-disk.sh
 ```
 
-Deploy to Google Cloud Compute Engine:
+Deploy to Google Cloud Compute Engine (select **Skip OS adaptation** when importing the image — the kernel already has the necessary drivers and no guest agent):
 
 ```sh
 # Upload disk image to a GCS bucket
 gcloud storage cp nos.qcow2 gs://YOUR_BUCKET/nos.qcow2
 
-# Create a Compute Engine image from the disk
+# Create a Compute Engine image from the disk (skip OS adaptation)
 gcloud compute images create nos-image \
     --source-uri=gs://YOUR_BUCKET/nos.qcow2
 
@@ -125,6 +126,7 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 - Default port is `9000`, default timeout is `30` seconds (long enough for blocking commands like `ping`).
 - On protocol errors or timeouts, the client reconnects automatically and resets state.
 - All shell commands work over the UDP session (including blocking ones like `ping`).
+- **Warning:** the UDP shell has no authentication — anyone who can reach the port has full kernel shell access. Use only for testing or behind a firewall.
 
 #### Shell commands
 
