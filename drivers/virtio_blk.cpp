@@ -445,6 +445,11 @@ bool VirtioBlk::ReadSectors(u64 sector, void* buf, u32 count)
         return true;
     if ((u64)count * 512 > Const::PageSize)
         return false;
+    if ((ulong)buf & (Const::PageSize - 1))
+    {
+        Trace(0, "VirtioBlk %s: ReadSectors buf 0x%p not page-aligned", DevName, (ulong)buf);
+        return false;
+    }
 
     BlockRequest req;
     req.RequestType = BlockRequest::Read;
@@ -464,6 +469,11 @@ bool VirtioBlk::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
         return true;
     if ((u64)count * 512 > Const::PageSize)
         return false;
+    if ((ulong)buf & (Const::PageSize - 1))
+    {
+        Trace(0, "VirtioBlk %s: WriteSectors buf 0x%p not page-aligned", DevName, (ulong)buf);
+        return false;
+    }
 
     BlockRequest req;
     req.RequestType = BlockRequest::Write;
