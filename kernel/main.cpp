@@ -186,7 +186,15 @@ static void PrepareHalt(HaltAction action)
        (refcount 1→0, frees the idle task and its dynamic
        stack), runs static destructors, and then performs the
        halt action.  It never returns, so PrepareHalt's stale
-       RBP is harmless. */
+       RBP is harmless.
+
+       WARNING: SetRsp abandons the caller's stack without
+       unwinding.  Any C++ objects still alive on that stack
+       (the idle task's stack) will NOT have their destructors
+       called.  Callers of Shutdown()/Reboot() must ensure all
+       stack-local objects with non-trivial destructors (e.g.
+       SpinLock, or anything containing one) are destroyed
+       before reaching this point. */
     SetRsp((long)&Stack[0][CpuStackSize - 128]);
     FinalizeOnStaticStack(task, action);
 }
@@ -243,154 +251,161 @@ void SomeTaskRoutine(void *ctx)
         Sleep(100 * Const::NanoSecsInMs);
 }
 
+/* Shutdown()/Reboot() end up in PrepareHalt which abandons this
+   stack via SetRsp without unwinding (see the WARNING there).
+   All C++ objects with non-trivial destructors must go out of
+   scope before those calls, so the body is wrapped in a block. */
 void BpStartup(void* ctx)
 {
     (void)ctx;
 
-    auto& idt = Idt::GetInstance();
-    auto& pit = Pit::GetInstance();
-    auto& kbd = IO8042::GetInstance();
-    auto& serial = Serial::GetInstance();
-    auto& cmd = Cmd::GetInstance();
-    auto& ioApic = IoApic::GetInstance();
-    auto& cpus = CpuTable::GetInstance();
-    auto& cpu = cpus.GetCurrentCpu();
-    auto& acpi = Acpi::GetInstance();
+    bool doReboot = false;
 
-    Trace(0, "Cpu %u running rflags 0x%p task 0x%p",
-        cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
-
-    TraceCpuState(cpu.GetIndex());
-
-    ioApic.Enable();
-
-    // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
-    Interrupt::Register(pit, acpi.GetGsiByIrq(0x0), 0x20);
-    Interrupt::Register(kbd, acpi.GetGsiByIrq(0x1), 0x21);
-    Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
-
-    VirtioBlk::InitAll();
-    VirtioScsi::InitAll();
-    PartitionDevice::ProbeAll();
-    VirtioNet::InitAll();
-    VirtioRng::InitAll();
-
-    Trace(0, "Interrupts registered");
-
-    idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
-
-    Trace(0, "IPI registred");
-
-    idt.Save();
-
-    Trace(0, "Idt saved");
-
-    Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
-
-    BugOn(IsInterruptEnabled());
-
-    Trace(0, "Before pit setup");
-
-    pit.Setup();
-
-    TimeInit();
-
-    Trace(0, "Before interrupt enable");
-
-    InterruptEnable();
-
-    BlockDevice::SetInterruptsStarted();
-
-    Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
-
-    Trace(0, "Before cpus start");
-
-    if (!Parameters::GetInstance().IsSmpOff())
     {
-        if (!cpus.StartAll())
+        auto& idt = Idt::GetInstance();
+        auto& pit = Pit::GetInstance();
+        auto& kbd = IO8042::GetInstance();
+        auto& serial = Serial::GetInstance();
+        auto& cmd = Cmd::GetInstance();
+        auto& ioApic = IoApic::GetInstance();
+        auto& cpus = CpuTable::GetInstance();
+        auto& cpu = cpus.GetCurrentCpu();
+        auto& acpi = Acpi::GetInstance();
+
+        Trace(0, "Cpu %u running rflags 0x%p task 0x%p",
+            cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
+
+        TraceCpuState(cpu.GetIndex());
+
+        ioApic.Enable();
+
+        // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
+        Interrupt::Register(pit, acpi.GetGsiByIrq(0x0), 0x20);
+        Interrupt::Register(kbd, acpi.GetGsiByIrq(0x1), 0x21);
+        Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
+
+        VirtioBlk::InitAll();
+        VirtioScsi::InitAll();
+        PartitionDevice::ProbeAll();
+        VirtioNet::InitAll();
+        VirtioRng::InitAll();
+
+        Trace(0, "Interrupts registered");
+
+        idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
+
+        Trace(0, "IPI registred");
+
+        idt.Save();
+
+        Trace(0, "Idt saved");
+
+        Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
+
+        BugOn(IsInterruptEnabled());
+
+        Trace(0, "Before pit setup");
+
+        pit.Setup();
+
+        TimeInit();
+
+        Trace(0, "Before interrupt enable");
+
+        InterruptEnable();
+
+        BlockDevice::SetInterruptsStarted();
+
+        Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
+
+        Trace(0, "Before cpus start");
+
+        if (!Parameters::GetInstance().IsSmpOff())
         {
-            Panic("Can't start all cpus");
-            return;
-        }
-    }
-
-    Trace(0, "Before preempt on");
-
-    PreemptOn();
-
-    Trace(0, "Preempt is now on");
-
-    VgaTerm::GetInstance().Printf("IPI test...\n");
-
-    ulong cpuMask = cpus.GetRunningCpus();
-    for (ulong i = 0; i < MaxCpus; i++)
-    {
-        if (cpuMask & (1UL << i))
-        {
-            if (i != cpu.GetIndex())
+            if (!cpus.StartAll())
             {
-                cpus.SendIPI(i);
+                Panic("Can't start all cpus");
+                return;
             }
         }
-    }
 
-    VgaTerm::GetInstance().Printf("Task test...\n");
+        Trace(0, "Before preempt on");
 
-    if (!Test::TestMultiTasking())
-    {
-        Panic("Multitasking test failed");
-        return;
-    }
+        PreemptOn();
 
-    if (!SoftIrq::GetInstance().Init())
-    {
-        Panic("Can't init softirq");
-        return;
-    }
+        Trace(0, "Preempt is now on");
 
-    VgaTerm::GetInstance().Printf("Idle looping...\n");
+        VgaTerm::GetInstance().Printf("IPI test...\n");
 
-    if (!cmd.Start())
-    {
-        Panic("Can't start cmd");
-        return;
-    }
-
-    UdpShell udpShell;
-    u16 udpShellPort = Parameters::GetInstance().GetUdpShellPort();
-    if (udpShellPort != 0)
-    {
-        NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
-        if (netDev)
+        ulong cpuMask = cpus.GetRunningCpus();
+        for (ulong i = 0; i < MaxCpus; i++)
         {
-            if (!udpShell.Start(netDev, udpShellPort))
-                Trace(0, "UdpShell: failed to start on port %u", (ulong)udpShellPort);
+            if (cpuMask & (1UL << i))
+            {
+                if (i != cpu.GetIndex())
+                {
+                    cpus.SendIPI(i);
+                }
+            }
         }
-        else
-        {
-            Trace(0, "UdpShell: eth0 not found");
-        }
-    }
 
-    bool doReboot = false;
-    for (;;)
-    {
-        cpu.Idle();
-        if (cmd.ShouldShutdown() || cmd.ShouldReboot())
+        VgaTerm::GetInstance().Printf("Task test...\n");
+
+        if (!Test::TestMultiTasking())
         {
-            doReboot = cmd.ShouldReboot();
-            if (doReboot)
-                Trace(0, "Reboot requested");
+            Panic("Multitasking test failed");
+            return;
+        }
+
+        if (!SoftIrq::GetInstance().Init())
+        {
+            Panic("Can't init softirq");
+            return;
+        }
+
+        VgaTerm::GetInstance().Printf("Idle looping...\n");
+
+        if (!cmd.Start())
+        {
+            Panic("Can't start cmd");
+            return;
+        }
+
+        UdpShell udpShell;
+        u16 udpShellPort = Parameters::GetInstance().GetUdpShellPort();
+        if (udpShellPort != 0)
+        {
+            NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
+            if (netDev)
+            {
+                if (!udpShell.Start(netDev, udpShellPort))
+                    Trace(0, "UdpShell: failed to start on port %u", (ulong)udpShellPort);
+            }
             else
-                Trace(0, "Shutdown requested");
-            udpShell.Stop();
-            cmd.Stop();
-            cmd.StopDhcp();
-            break;
+            {
+                Trace(0, "UdpShell: eth0 not found");
+            }
         }
-    }
 
-    SoftIrq::GetInstance().Stop();
+        for (;;)
+        {
+            cpu.Idle();
+            if (cmd.ShouldShutdown() || cmd.ShouldReboot())
+            {
+                doReboot = cmd.ShouldReboot();
+                if (doReboot)
+                    Trace(0, "Reboot requested");
+                else
+                    Trace(0, "Shutdown requested");
+                udpShell.Stop();
+                cmd.Stop();
+                cmd.StopDhcp();
+                break;
+            }
+        }
+
+        SoftIrq::GetInstance().Stop();
+    } /* all locals destroyed before stack is abandoned */
 
     if (doReboot)
         Reboot();
