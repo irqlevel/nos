@@ -1,18 +1,13 @@
 #pragma once
 
 #include "stdlib.h"
+#include "deleter.h"
 
 #include <kernel/panic.h>
 #include <mm/new.h>
 
 namespace Stdlib
 {
-
-template<typename T>
-struct DefaultDeleter
-{
-    void operator()(T* ptr) const { delete ptr; }
-};
 
 template<typename T, typename Deleter = DefaultDeleter<T>>
 class UniquePtr final
