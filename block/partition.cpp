@@ -1,7 +1,9 @@
 #include "partition.h"
 
+#include <include/const.h>
 #include <kernel/trace.h>
 #include <lib/stdlib.h>
+#include <lib/unique_ptr.h>
 #include <mm/new.h>
 
 namespace Kernel
@@ -76,11 +78,14 @@ bool PartitionDevice::WriteSectors(u64 sector, const void* buf, u32 count, bool 
 
 bool PartitionDevice::ProbeDevice(BlockDevice* dev)
 {
-    u8 buf[512];
-    if (!dev->ReadSectors(0, buf, 1))
+    Stdlib::UniquePtr<u8, Mm::FreeDeleter> buf(static_cast<u8*>(Mm::Alloc(Const::PageSize, 0)));
+    if (!buf.Get())
         return false;
 
-    auto* mbr = reinterpret_cast<Mbr*>(buf);
+    if (!dev->ReadSectors(0, buf.Get(), 1))
+        return false;
+
+    auto* mbr = reinterpret_cast<Mbr*>(buf.Get());
     if (mbr->Signature != Mbr::ValidSignature)
         return false;
 

@@ -31,6 +31,11 @@ T* TAlloc(Args&&... args)
     return new (p) T(Stdlib::Forward<Args>(args)...);
 }
 
+struct FreeDeleter
+{
+    void operator()(void* ptr) const { Free(ptr); }
+};
+
 }
 }
 
