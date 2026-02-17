@@ -75,9 +75,14 @@ bool Tsc::Calibrate()
     Trace(0, "TSC: invariant=%u", (ulong)Invariant);
 
     /* Calibrate using PIT channel 2 */
+    u8 savedGate = Inb(PitGatePort);
+
     ulong samples[CalibrationRounds];
     for (ulong i = 0; i < CalibrationRounds; i++)
         samples[i] = CalibratePitCh2();
+
+    /* Restore port 0x61 to pre-calibration state (gate off, original bits) */
+    Outb(PitGatePort, savedGate & GateOff);
 
     /* Sort and take median */
     for (ulong i = 0; i < CalibrationRounds - 1; i++)

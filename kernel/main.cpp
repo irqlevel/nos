@@ -308,8 +308,6 @@ void BpStartup(void* ctx)
 
         pit.Setup();
 
-        TimeInit();
-
         Trace(0, "Before interrupt enable");
 
         InterruptEnable();
@@ -317,6 +315,14 @@ void BpStartup(void* ctx)
         BlockDevice::SetInterruptsStarted();
 
         Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
+
+        /*
+         * TSC calibration uses PIT channel 2 with busy-polling (~150ms).
+         * Done after InterruptEnable so PIT channel 0 interrupts flow
+         * normally, and before cpus.StartAll so the clock source is ready
+         * for per-CPU time queries.
+         */
+        TimeInit();
 
         Trace(0, "Before cpus start");
 
