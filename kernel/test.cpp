@@ -1017,6 +1017,17 @@ Stdlib::Error TestPageAllocator()
 
     /* Test AllocMapPages / UnmapFreePages with 128 pages (large VirtQueue) */
     {
+        /* Pre-warm: the first mapping in this VA range may allocate
+           intermediate page table pages (L1/L2/L3) that are never
+           reclaimed on unmap.  Do a throwaway cycle so that the page
+           table structure is already in place before we snapshot. */
+        {
+            ulong warmPhys = 0;
+            void* warmPtr = Mm::AllocMapPages(128, &warmPhys);
+            if (warmPtr)
+                Mm::UnmapFreePages(warmPtr);
+        }
+
         ulong freePagesBefore = pt.GetFreePagesCount();
         ulong physAddr = 0;
         void* ptr = Mm::AllocMapPages(128, &physAddr);
