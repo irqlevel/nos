@@ -23,15 +23,20 @@ Pit::~Pit()
 
 void Pit::Setup()
 {
-    Stdlib::AutoLock lock(Lock);
-
-    ReloadValue = 11932; // 1193182 / 11932.0 = 99.99849145155883
-    TickMs = 10; // 1000 / 99.99849145155883 = 10.00015085711987
-    TickMsNs = 150857;
+    /*
+     * Reload = 11932 → actual rate = 1193182 / 11932 = 99.99849... Hz
+     * Period = 10.000150857... ms = 10 ms + 151 ns
+     */
+    ReloadValue = DesiredReload;
+    TickMs = 1000 / DesiredHz;
+    /* Sub-ms nanosecond remainder per tick (rounded) */
+    u64 periodNs = (u64)DesiredReload * Const::NanoSecsInSec;
+    u64 wholeMsNs = (u64)TickMs * Const::NanoSecsInMs * BaseFrequency;
+    TickMsNs = (ulong)((periodNs - wholeMsNs + BaseFrequency / 2) / BaseFrequency);
     TimeMs = 0;
     TimeMsNs = 0;
 
-    Outb(ModePort, 0b00110100); //channel 0, lobyte/hibyte, rate generator
+    Outb(ModePort, ModeCh0RateGen);
     Outb(Channel0Port, Stdlib::LowPart(ReloadValue));
     Outb(Channel0Port, Stdlib::HighPart(ReloadValue));
 }
@@ -51,7 +56,7 @@ void Pit::Interrupt(Context* ctx)
 {
     (void)ctx;
     {
-        Stdlib::AutoLock lock(Lock);
+        TimeLock.WriteBegin();
 
         TimeMs = TimeMs + TickMs;
         TimeMsNs = TimeMsNs + TickMsNs;
@@ -60,6 +65,8 @@ void Pit::Interrupt(Context* ctx)
             TimeMsNs = TimeMsNs - Const::NanoSecsInMs;
             TimeMs = TimeMs + 1;
         }
+
+        TimeLock.WriteEnd();
     }
 
     CpuTable::GetInstance().SendIPIAll();
@@ -68,7 +75,15 @@ void Pit::Interrupt(Context* ctx)
 
 Stdlib::Time Pit::GetTime()
 {
-    return Stdlib::Time(TimeMs * Const::NanoSecsInMs + TimeMsNs);
+    ulong ms, msNs;
+    long seq;
+    do {
+        seq = TimeLock.ReadBegin();
+        ms = TimeMs;
+        msNs = TimeMsNs;
+    } while (TimeLock.ReadRetry(seq));
+
+    return Stdlib::Time(ms * Const::NanoSecsInMs + msNs);
 }
 
 extern "C" void PitInterrupt(Context* ctx)

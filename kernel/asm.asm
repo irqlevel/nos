@@ -74,6 +74,7 @@ global SetRsp
 global SetRbp
 global ReadTsc
 global ReadTscp
+global CpuidCall
 
 global SwitchContext
 
@@ -340,6 +341,20 @@ ReadTscp:
 	shl rdx, 32
 	or rdx, rax
 	mov rax, rdx
+	ret
+
+CpuidCall:
+	; rdi = leaf, rsi = subleaf, rdx = &CpuidResult
+	push rbx
+	mov eax, edi
+	mov ecx, esi
+	mov r8, rdx
+	cpuid
+	mov dword [r8], eax
+	mov dword [r8 + 4], ebx
+	mov dword [r8 + 8], ecx
+	mov dword [r8 + 12], edx
+	pop rbx
 	ret
 
 %macro PushAll 0

@@ -2,8 +2,8 @@
 
 #include <include/types.h>
 #include <kernel/atomic.h>
+#include <kernel/seq_lock.h>
 #include <kernel/interrupt.h>
-#include <kernel/spin_lock.h>
 #include <kernel/asm.h>
 #include <lib/stdlib.h>
 
@@ -43,19 +43,28 @@ private:
 
     int IntVector;
 
-    static const int Channel0Port = 0x40;
-    static const int Channel1Port = 0x41;
-    static const int Channel2Port = 0x42;
-    static const int ModePort = 0x43;
-    static const u32 HighestFrequency = 1193182;
+    /* I/O ports */
+    static const u16 Channel0Port = 0x40;
+    static const u16 Channel2Port = 0x42;
+    static const u16 ModePort     = 0x43;
 
-    volatile ulong TimeMs;
-    volatile ulong TimeMsNs;
+    /* Base oscillator frequency in Hz */
+    static const u32 BaseFrequency = 1193182;
+
+    /* Desired tick rate and derived reload value */
+    static const u32 DesiredHz = 100;
+    static const u16 DesiredReload = (BaseFrequency + DesiredHz / 2) / DesiredHz;
+
+    /* Mode command: channel 0, lobyte/hibyte access, mode 2 (rate generator), binary */
+    static const u8 ModeCh0RateGen = 0x34;
+
+    ulong TimeMs;
+    ulong TimeMsNs;
     ulong TickMs;
     ulong TickMsNs;
     u16 ReloadValue;
 
-    SpinLock Lock;
+    SeqLock TimeLock;
 };
 
 }

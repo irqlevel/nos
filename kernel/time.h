@@ -4,5 +4,9 @@
 
 namespace Kernel
 {
+    void TimeInit();
+
     Stdlib::Time GetBootTime();
+
+    ulong GetWallTimeSecs();
 }

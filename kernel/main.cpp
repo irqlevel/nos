@@ -17,6 +17,7 @@
 #include "parameters.h"
 #include "console.h"
 #include "softirq.h"
+#include "time.h"
 
 #include <boot/grub.h>
 
@@ -291,6 +292,8 @@ void BpStartup(void* ctx)
     Trace(0, "Before pit setup");
 
     pit.Setup();
+
+    TimeInit();
 
     Trace(0, "Before interrupt enable");
 
