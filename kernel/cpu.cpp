@@ -186,20 +186,58 @@ bool CpuTable::StartAll()
         }
     }
 
-    Pit::GetInstance().Wait(10 * Const::NanoSecsInMs); // 10ms
+    Pit::GetInstance().Wait(10 * Const::NanoSecsInMs); /* 10ms after INIT */
 
+    /*
+     * Intel MP spec: send two SIPIs, 200µs apart.
+     * The first SIPI can be lost on some hardware/hypervisors.
+     */
+    static const ulong SipiRetries = 2;
+    static const ulong SipiDelayUs = 200;
+
+    for (ulong sipi = 0; sipi < SipiRetries; sipi++)
     {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
         {
-            if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
+            Stdlib::AutoLock lock(Lock);
+            for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
             {
-                Lapic::SendStartup(index, startupCode >> Const::PageShift);
+                if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
+                {
+                    if (!(CpuArray[index].GetState() & Cpu::StateRunning))
+                        Lapic::SendStartup(index, startupCode >> Const::PageShift);
+                }
             }
         }
+
+        Pit::GetInstance().Wait(SipiDelayUs * Const::NanoSecsInUsec); /* 200µs */
     }
 
-    Pit::GetInstance().Wait(100 * Const::NanoSecsInMs); // 100ms
+    /* Poll for APs to finish startup, up to 500ms */
+    static const ulong ApTimeoutMs = 500;
+    static const ulong ApPollIntervalMs = 10;
+
+    for (ulong waited = 0; waited < ApTimeoutMs; waited += ApPollIntervalMs)
+    {
+        Pit::GetInstance().Wait(ApPollIntervalMs * Const::NanoSecsInMs);
+
+        bool allRunning = true;
+        {
+            Stdlib::AutoLock lock(Lock);
+            for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
+            {
+                if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
+                {
+                    if (!(CpuArray[index].GetState() & Cpu::StateRunning))
+                    {
+                        allRunning = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (allRunning)
+            break;
+    }
 
     {
         Stdlib::AutoLock lock(Lock);
@@ -209,7 +247,7 @@ bool CpuTable::StartAll()
             {
                 if (!(CpuArray[index].GetState() & Cpu::StateRunning))
                 {
-                    Trace(0, "Cpu %u still not running", index);
+                    Trace(0, "Cpu %u still not running after %u ms", index, ApTimeoutMs);
                     return false;
                 }
             }
