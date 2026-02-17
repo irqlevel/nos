@@ -10,6 +10,7 @@
 #include <kernel/softirq.h>
 #include <net/arp.h>
 #include <net/icmp.h>
+#include <net/tcp.h>
 #include <mm/new.h>
 
 namespace Kernel
@@ -513,7 +514,7 @@ void VirtioNet::ProcessRx()
                 break;
             case Net::IpProtoTcp:
                 RxTcp.Inc();
-                RxDropCount.Inc();
+                Tcp::GetInstance().Process(this, data, dataLen);
                 break;
             case Net::IpProtoUdp:
             {
@@ -575,9 +576,11 @@ bool VirtioNet::SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp,
     if (!Initialized)
         return false;
 
-    /* Resolve destination MAC via ARP */
+    /* Resolve destination MAC via ARP.
+       For off-subnet destinations, resolve the gateway MAC. */
+    Net::IpAddress arpTarget = RouteIp(dstIp);
     Net::MacAddress dstMac;
-    if (!ArpTable::GetInstance().Resolve(this, dstIp, dstMac))
+    if (!ArpTable::GetInstance().Resolve(this, arpTarget, dstMac))
     {
         Trace(0, "VirtioNet %s: ARP failed for 0x%p", DevName, (ulong)dstIp.Addr4);
         /* Fall back to broadcast */

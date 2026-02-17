@@ -47,6 +47,7 @@
 #include <block/block_device.h>
 #include <block/partition.h>
 #include <net/udp_shell.h>
+#include <net/tcp.h>
 
 using namespace Kernel;
 using namespace Stdlib;
@@ -368,6 +369,8 @@ void BpStartup(void* ctx)
             Panic("Can't init softirq");
             return;
         }
+
+        Tcp::GetInstance().Init();
 
         VgaTerm::GetInstance().Printf("Idle looping...\n");
 
