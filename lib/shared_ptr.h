@@ -1,5 +1,7 @@
 #pragma once
 
+#include "deleter.h"
+
 #include <kernel/trace.h>
 #include <kernel/atomic.h>
 #include <kernel/panic.h>
@@ -10,7 +12,7 @@ namespace Stdlib
 
 const int SharedPtrLL = 5;
 
-template<typename T>
+template<typename T, typename Deleter = DefaultDeleter<T>>
 class ObjectReference final
 {
 public:
@@ -61,7 +63,7 @@ public:
         {
             Trace(SharedPtrLL, "objref 0x%p obj 0x%p dec counter %d", this, Object, Counter.Get());
 
-            delete Object;
+            Deleter()(Object);
             Object = nullptr;
             return true;
         }
@@ -81,7 +83,7 @@ private:
     ObjectReference& operator=(ObjectReference&& other) = delete;
 };
 
-template<typename T>
+template<typename T, typename Deleter = DefaultDeleter<T>>
 class SharedPtr final
 {
 public:
@@ -92,7 +94,7 @@ public:
         Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
     }
 
-    SharedPtr(ObjectReference<T> *objectRef)
+    SharedPtr(ObjectReference<T, Deleter> *objectRef)
     {
         ObjectRef = objectRef;
 
@@ -107,7 +109,7 @@ public:
         Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
     }
 
-    SharedPtr(const SharedPtr<T>& other)
+    SharedPtr(const SharedPtr& other)
         : SharedPtr()
     {
         ObjectRef = other.ObjectRef;
@@ -119,7 +121,7 @@ public:
         Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
     }
 
-    SharedPtr(SharedPtr<T>&& other)
+    SharedPtr(SharedPtr&& other)
         : SharedPtr()
     {
         ObjectRef = other.ObjectRef;
@@ -128,7 +130,7 @@ public:
         Trace(SharedPtrLL, "ptr 0x%p ctor obj 0x%p", this, Get());
     }
 
-    SharedPtr<T>& operator=(const SharedPtr<T>& other)
+    SharedPtr& operator=(const SharedPtr& other)
     {
         if (this != &other)
         {
@@ -145,7 +147,7 @@ public:
         return *this;
     }
 
-    SharedPtr<T>& operator=(SharedPtr<T>&& other)
+    SharedPtr& operator=(SharedPtr&& other)
     {
         if (this != &other)
         {
@@ -202,7 +204,7 @@ public:
 
         if (object != nullptr)
         {
-            ObjectRef = Kernel::Mm::TAlloc<ObjectReference<T>, 0>(object);
+            ObjectRef = Kernel::Mm::TAlloc<ObjectReference<T, Deleter>, 0>(object);
             if (ObjectRef == nullptr)
             {
                 return;
@@ -216,7 +218,7 @@ public:
     }
 
 private:
-    ObjectReference<T>* ObjectRef;
+    ObjectReference<T, Deleter>* ObjectRef;
 };
 
 template<typename T, class... Args>
@@ -235,6 +237,24 @@ SharedPtr<T> MakeShared(Args&&... args)
 
     objRef->SetObject(object);
     return SharedPtr<T>(objRef);
+}
+
+template<typename T, typename Deleter, class... Args>
+SharedPtr<T, Deleter> MakeSharedWith(Args&&... args)
+{
+    ObjectReference<T, Deleter>* objRef = Kernel::Mm::TAlloc<ObjectReference<T, Deleter>, 0>(nullptr);
+    if (objRef == nullptr)
+        return SharedPtr<T, Deleter>();
+
+    T* object = Kernel::Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...);
+    if (object == nullptr)
+    {
+        delete objRef;
+        return SharedPtr<T, Deleter>();
+    }
+
+    objRef->SetObject(object);
+    return SharedPtr<T, Deleter>(objRef);
 }
 
 }
