@@ -52,6 +52,13 @@ public:
     void SetMac(const Net::MacAddress& mac);
     Net::IpAddress GetIp();
     void SetIp(Net::IpAddress ip);
+    Net::IpAddress GetSubnetMask();
+    void SetSubnetMask(Net::IpAddress mask);
+    Net::IpAddress GetGateway();
+    void SetGateway(Net::IpAddress gw);
+
+    /* Return the IP to ARP for: gateway if dstIp is off-subnet, else dstIp */
+    Net::IpAddress RouteIp(Net::IpAddress dstIp);
 
     typedef void (*RxCallback)(const u8* frame, ulong len, void* ctx);
 
@@ -98,6 +105,8 @@ protected:
     SpinLock UdpListenerLock;
     Net::MacAddress Mac;
     Net::IpAddress Ip;
+    Net::IpAddress Mask;
+    Net::IpAddress Gw;
 };
 
 class NetDeviceTable

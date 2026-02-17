@@ -15,6 +15,8 @@
 #include <net/dhcp.h>
 #include <net/icmp.h>
 #include <net/dns.h>
+#include <net/tcp.h>
+#include <net/http.h>
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
 #include <fs/nanofs.h>
@@ -410,6 +412,59 @@ static void CmdIcmpstat(const char* args, Stdlib::Printer& con)
 {
     (void)args;
     Icmp::GetInstance().Dump(con);
+}
+
+static void CmdTcpstat(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Tcp::GetInstance().Dump(con);
+}
+
+static void CmdWget(const char* args, Stdlib::Printer& con)
+{
+    if (!args || args[0] == '\0')
+    {
+        con.Printf("usage: wget <url>\n");
+        return;
+    }
+
+    NetDevice* dev = NetDeviceTable::GetInstance().Find("eth0");
+    if (!dev)
+    {
+        con.Printf("eth0 not found\n");
+        return;
+    }
+
+    HttpClient client(dev);
+    HttpResponse resp = client.Get(args);
+
+    if (!resp.Ok)
+    {
+        con.Printf("wget: failed\n");
+        return;
+    }
+
+    con.Printf("HTTP %u, %u bytes\n", (ulong)resp.StatusCode, resp.BodyLen);
+
+    if (resp.Location[0] != '\0')
+        con.Printf("Location: %s\n", resp.Location);
+
+    if (resp.Body && resp.BodyLen > 0)
+    {
+        /* Print body as text, truncate to 4 KB for display */
+        static const ulong MaxDisplay = 4096;
+        ulong displayLen = resp.BodyLen;
+        if (displayLen > MaxDisplay)
+            displayLen = MaxDisplay;
+        for (ulong i = 0; i < displayLen; i++)
+            con.Printf("%c", (ulong)resp.Body[i]);
+        con.Printf("\n");
+        if (resp.BodyLen > MaxDisplay)
+            con.Printf("... (%u bytes truncated)\n", resp.BodyLen - MaxDisplay);
+    }
+
+    if (resp.Body)
+        Mm::Free(resp.Body);
 }
 
 static void CmdUdpsend(const char* args, Stdlib::Printer& con)
@@ -1219,6 +1274,8 @@ static const CmdEntry Commands[] = {
     { "net",       CmdNet,       "net - list network devices" },
     { "arp",       CmdArp,       "arp - show ARP table" },
     { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
+    { "tcpstat",   CmdTcpstat,   "tcpstat - show TCP connections and statistics" },
+    { "wget",      CmdWget,      "wget <url> - HTTP GET request" },
     { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
     { "ping",      CmdPing,      "ping <ip|hostname> - send ICMP echo" },
     { "nslookup",  CmdNslookup,  "nslookup <hostname> - resolve hostname" },

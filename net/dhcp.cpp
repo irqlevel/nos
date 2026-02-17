@@ -134,6 +134,8 @@ void DhcpClient::Run()
 
         /* Apply the lease */
         Dev->SetIp(Result.Ip);
+        Dev->SetSubnetMask(Result.Mask);
+        Dev->SetGateway(Result.Router);
         Ready = true;
 
         Trace(0, "DHCP: bound ip %u.%u.%u.%u mask %u.%u.%u.%u gw %u.%u.%u.%u lease %u",

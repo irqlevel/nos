@@ -130,9 +130,11 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
 
 bool Icmp::SendEchoRequest(NetDevice* dev, IpAddress dstIp, u16 id, u16 seq)
 {
-    /* Resolve destination MAC via ARP */
+    /* Resolve destination MAC via ARP.
+       For off-subnet destinations, resolve the gateway MAC. */
+    IpAddress arpTarget = dev->RouteIp(dstIp);
     MacAddress dstMac;
-    if (!ArpTable::GetInstance().Resolve(dev, dstIp, dstMac))
+    if (!ArpTable::GetInstance().Resolve(dev, arpTarget, dstMac))
     {
         dstMac = MacAddress::Broadcast();
     }

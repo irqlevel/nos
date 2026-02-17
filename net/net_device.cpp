@@ -120,6 +120,36 @@ void NetDevice::SetIp(Net::IpAddress ip)
     Ip = ip;
 }
 
+Net::IpAddress NetDevice::GetSubnetMask()
+{
+    return Mask;
+}
+
+void NetDevice::SetSubnetMask(Net::IpAddress mask)
+{
+    Mask = mask;
+}
+
+Net::IpAddress NetDevice::GetGateway()
+{
+    return Gw;
+}
+
+void NetDevice::SetGateway(Net::IpAddress gw)
+{
+    Gw = gw;
+}
+
+Net::IpAddress NetDevice::RouteIp(Net::IpAddress dstIp)
+{
+    if (Mask.Addr4 != 0 && Gw.Addr4 != 0)
+    {
+        if ((dstIp.Addr4 & Mask.Addr4) != (Ip.Addr4 & Mask.Addr4))
+            return Gw;
+    }
+    return dstIp;
+}
+
 NetDeviceTable::NetDeviceTable()
     : Count(0)
 {

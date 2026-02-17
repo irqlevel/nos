@@ -71,6 +71,34 @@ struct UdpHdr
 
 static_assert(sizeof(UdpHdr) == 8, "Invalid size");
 
+/* TCP header */
+struct TcpHdr
+{
+    u16 SrcPort;
+    u16 DstPort;
+    u32 SeqNum;
+    u32 AckNum;
+    u8  DataOff;  /* upper 4 bits = header length in 32-bit words */
+    u8  Flags;
+    u16 Window;
+    u16 Checksum;
+    u16 UrgentPtr;
+} __attribute__((packed));
+
+static_assert(sizeof(TcpHdr) == 20, "Invalid size");
+
+/* TCP pseudo-header for checksum (not transmitted on the wire) */
+struct TcpPseudoHdr
+{
+    u32 SrcAddr;   /* network byte order */
+    u32 DstAddr;   /* network byte order */
+    u8  Zero;
+    u8  Protocol;  /* 6 */
+    u16 TcpLen;    /* network byte order */
+} __attribute__((packed));
+
+static_assert(sizeof(TcpPseudoHdr) == 12, "Invalid size");
+
 /* Byte-order helpers (aliases from Stdlib) */
 using Stdlib::Htons;
 using Stdlib::Htonl;
@@ -90,6 +118,41 @@ inline u16 IpChecksum(const void* data, ulong len)
             word = (u16)((p[i] << 8) | p[i + 1]);
         else
             word = (u16)(p[i] << 8);
+        sum += word;
+    }
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    return (u16)(~sum);
+}
+
+/* TCP checksum: pseudo-header + TCP header + payload */
+inline u16 TcpChecksum(u32 srcAddrNet, u32 dstAddrNet,
+                       const void* tcpData, ulong tcpLen)
+{
+    TcpPseudoHdr ph;
+    ph.SrcAddr = srcAddrNet;
+    ph.DstAddr = dstAddrNet;
+    ph.Zero = 0;
+    ph.Protocol = IpProtoTcp;
+    ph.TcpLen = Htons((u16)tcpLen);
+
+    /* Sum pseudo-header */
+    u32 sum = 0;
+    const u8* p = (const u8*)&ph;
+    for (ulong i = 0; i < sizeof(ph); i += 2)
+        sum += (u16)((p[i] << 8) | p[i + 1]);
+
+    /* Sum TCP segment (header + data) */
+    const u8* t = (const u8*)tcpData;
+    for (ulong i = 0; i < tcpLen; i += 2)
+    {
+        u16 word;
+        if (i + 1 < tcpLen)
+            word = (u16)((t[i] << 8) | t[i + 1]);
+        else
+            word = (u16)(t[i] << 8);
         sum += word;
     }
 
