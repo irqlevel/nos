@@ -9,6 +9,12 @@ namespace Stdlib
 {
 
 template<typename T>
+struct DefaultDeleter
+{
+    void operator()(T* ptr) const { delete ptr; }
+};
+
+template<typename T, typename Deleter = DefaultDeleter<T>>
 class UniquePtr final
 {
 public:
@@ -48,7 +54,7 @@ public:
 
         if (Object != nullptr)
         {
-            delete Object;
+            Deleter()(Object);
             Object = nullptr;
         }
 
@@ -94,7 +100,7 @@ private:
 template<typename T, class... Args>
 UniquePtr<T> MakeUnique(Args&&... args)
 {
-    return UniquePtr<T>(Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...));
+    return UniquePtr<T>(Kernel::Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...));
 }
 
 }
