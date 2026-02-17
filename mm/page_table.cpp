@@ -699,7 +699,15 @@ ulong PageTable::TmpUnmapPage(ulong virtAddr)
 
 ulong PageTable::GetRoot()
 {
-    Stdlib::AutoLock lock(Lock);
+    /*
+     * Root is set once in Setup() before any AP starts
+     * and never changes — no lock needed.  Taking the
+     * SpinLock here is unsafe for APs that call GetRoot()
+     * before SetCr3: SpinLock::Lock() invokes GetBootTime()
+     * which reads kvmclock PvClock memory through a VA that
+     * only resolves correctly under the kernel PageTable,
+     * not the boot page tables the AP still uses.
+     */
     return Root;
 }
 

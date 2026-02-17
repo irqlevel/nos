@@ -56,6 +56,7 @@ using namespace Const;
 const size_t CpuStackSize = 8 * Const::PageSize;
 static char Stack[MaxCpus][8 * Const::PageSize] __attribute__((aligned(Const::PageSize)));
 static long StackIndex;
+static volatile long ApStartedFlag;
 
 #define ALLOC_CPU_STACK()                               \
 do {                                                    \
@@ -110,15 +111,20 @@ void ApStartup(void *ctx)
 
 void ApMain2()
 {
+    AtomicReadAndInc(&ApStartedFlag); /* 2: entered ApMain2 */
+
     SetCr3(Mm::PageTable::GetInstance().GetRoot());
+    AtomicReadAndInc(&ApStartedFlag); /* 3: page tables loaded */
 
     Gdt::GetInstance().Save();
     Idt::GetInstance().Save();
+    AtomicReadAndInc(&ApStartedFlag); /* 4: GDT+IDT loaded */
 
     if (Parameters::GetInstance().IsSmpOff())
         Panic("AP cpu started while smp is off");
 
     Lapic::Enable();
+    AtomicReadAndInc(&ApStartedFlag); /* 5: LAPIC enabled */
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
 
@@ -133,6 +139,7 @@ void ApMain2()
 
 extern "C" void ApMain()
 {
+    AtomicReadAndInc(&ApStartedFlag);
     ALLOC_CPU_STACK();
     ApMain2();
 }
@@ -331,6 +338,9 @@ void BpStartup(void* ctx)
         {
             if (!cpus.StartAll())
             {
+                /* Diagnostic: did the AP reach ApMain()? */
+                Trace(0, "AP diag: ApStartedFlag=%u",
+                      (ulong)ApStartedFlag);
                 Panic("Can't start all cpus");
                 return;
             }
