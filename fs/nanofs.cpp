@@ -13,15 +13,17 @@ namespace Kernel
 
 NanoFs::NanoFs(BlockDevice* dev)
     : Io(dev, NanoBlockSize)
+    , Super(nullptr)
     , Mounted(false)
 {
-    Stdlib::MemSet(&Super, 0, sizeof(Super));
     Stdlib::MemSet(VNodes, 0, sizeof(VNodes));
 }
 
 NanoFs::~NanoFs()
 {
     Unmount();
+    delete Super;
+    Super = nullptr;
 }
 
 void NanoFs::Unmount()
@@ -56,21 +58,31 @@ bool NanoFs::Mount()
         return false;
     }
 
-    if (!Io.ReadBlock(0, &Super))
+    if (Super == nullptr)
+    {
+        Super = new NanoSuperBlock();
+        if (Super == nullptr)
+        {
+            Trace(0, "NanoFs: failed to alloc superblock");
+            return false;
+        }
+    }
+
+    if (!Io.ReadBlock(0, Super))
     {
         Trace(0, "NanoFs: failed to read superblock");
         return false;
     }
 
-    if (Super.Magic != NanoMagic)
+    if (Super->Magic != NanoMagic)
     {
-        Trace(0, "NanoFs: bad magic 0x%p", (ulong)Super.Magic);
+        Trace(0, "NanoFs: bad magic 0x%p", (ulong)Super->Magic);
         return false;
     }
 
-    if (Super.Version != NanoVersion)
+    if (Super->Version != NanoVersion)
     {
-        Trace(0, "NanoFs: unsupported version %u", (ulong)Super.Version);
+        Trace(0, "NanoFs: unsupported version %u", (ulong)Super->Version);
         return false;
     }
 
@@ -89,7 +101,7 @@ bool NanoFs::Mount()
 
     Mounted = true;
     Trace(0, "NanoFs: mounted, %u inodes, %u data blocks",
-          (ulong)Super.InodeCount, (ulong)Super.DataBlockCount);
+          (ulong)Super->InodeCount, (ulong)Super->DataBlockCount);
     return true;
 }
 
@@ -229,8 +241,8 @@ void NanoFs::GetInfo(char* buf, ulong bufSize)
         buf[pos++] = prefix[i];
     for (ulong i = 0; i < 16 && pos + 1 < bufSize; i++)
     {
-        buf[pos++] = hex[(Super.Uuid[i] >> 4) & 0xF];
-        buf[pos++] = hex[Super.Uuid[i] & 0xF];
+        buf[pos++] = hex[(Super->Uuid[i] >> 4) & 0xF];
+        buf[pos++] = hex[Super->Uuid[i] & 0xF];
     }
     buf[pos] = '\0';
 }
@@ -250,7 +262,7 @@ bool NanoFs::ReadInode(u32 idx, NanoInode* out)
         return false;
     }
 
-    if (!Io.ReadBlock(Super.InodeStartBlock + idx, out))
+    if (!Io.ReadBlock(Super->InodeStartBlock + idx, out))
     {
         Trace(0, "NanoFs::ReadInode: read block failed idx %u", (ulong)idx);
         return false;
@@ -266,7 +278,7 @@ bool NanoFs::WriteInode(u32 idx, const NanoInode* in)
         return false;
     }
 
-    if (!Io.WriteBlock(Super.InodeStartBlock + idx, in))
+    if (!Io.WriteBlock(Super->InodeStartBlock + idx, in))
     {
         Trace(0, "NanoFs::WriteInode: write block failed idx %u", (ulong)idx);
         return false;
@@ -277,7 +289,7 @@ bool NanoFs::WriteInode(u32 idx, const NanoInode* in)
 bool NanoFs::FlushSuper()
 {
     ComputeSuperChecksum();
-    if (!Io.WriteBlock(0, &Super, true))
+    if (!Io.WriteBlock(0, Super, true))
     {
         Trace(0, "NanoFs::FlushSuper: write failed");
         return false;
@@ -289,7 +301,7 @@ bool NanoFs::FlushSuper()
 
 long NanoFs::AllocInode()
 {
-    Stdlib::Bitmap bm(Super.InodeBitmap, NanoInodeCount);
+    Stdlib::Bitmap bm(Super->InodeBitmap, NanoInodeCount);
     long idx = bm.FindSetZeroBit();
     if (idx < 0)
     {
@@ -304,14 +316,14 @@ void NanoFs::FreeInode(u32 idx)
 {
     if (idx >= NanoInodeCount)
         return;
-    Stdlib::Bitmap bm(Super.InodeBitmap, NanoInodeCount);
+    Stdlib::Bitmap bm(Super->InodeBitmap, NanoInodeCount);
     bm.ClearBit(idx);
     FlushSuper();
 }
 
 long NanoFs::AllocDataBlock()
 {
-    Stdlib::Bitmap bm(Super.DataBitmap, NanoDataBlockCount);
+    Stdlib::Bitmap bm(Super->DataBitmap, NanoDataBlockCount);
     long idx = bm.FindSetZeroBit();
     if (idx < 0)
     {
@@ -326,7 +338,7 @@ void NanoFs::FreeDataBlock(u32 idx)
 {
     if (idx >= NanoDataBlockCount)
         return;
-    Stdlib::Bitmap bm(Super.DataBitmap, NanoDataBlockCount);
+    Stdlib::Bitmap bm(Super->DataBitmap, NanoDataBlockCount);
     bm.ClearBit(idx);
     FlushSuper();
 }
@@ -335,16 +347,16 @@ void NanoFs::FreeDataBlock(u32 idx)
 
 void NanoFs::ComputeSuperChecksum()
 {
-    Super.Checksum = 0;
-    Super.Checksum = Stdlib::Crc32(&Super, sizeof(Super));
+    Super->Checksum = 0;
+    Super->Checksum = Stdlib::Crc32(Super, sizeof(*Super));
 }
 
 bool NanoFs::VerifySuperChecksum()
 {
-    u32 saved = Super.Checksum;
-    Super.Checksum = 0;
-    u32 computed = Stdlib::Crc32(&Super, sizeof(Super));
-    Super.Checksum = saved;
+    u32 saved = Super->Checksum;
+    Super->Checksum = 0;
+    u32 computed = Stdlib::Crc32(Super, sizeof(*Super));
+    Super->Checksum = saved;
     return computed == saved;
 }
 
@@ -377,7 +389,7 @@ u32 NanoFs::ComputeDataChecksum(NanoInode* inode)
 
     for (u32 i = 0; i < NanoMaxBlocks && remaining > 0; i++)
     {
-        if (!Io.ReadBlock(Super.DataStartBlock + inode->Blocks[i], buf))
+        if (!Io.ReadBlock(Super->DataStartBlock + inode->Blocks[i], buf))
         {
             Mm::Free(buf);
             return 0;
@@ -462,7 +474,7 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx)
         {
             Trace(0, "NanoFs::LoadVNode: alloc dir buf failed for inode %u", (ulong)inodeIdx);
         }
-        else if (!Io.ReadBlock(Super.DataStartBlock + inode->Blocks[0], dirBuf))
+        else if (!Io.ReadBlock(Super->DataStartBlock + inode->Blocks[0], dirBuf))
         {
             Trace(0, "NanoFs::LoadVNode: read dir block failed for inode %u", (ulong)inodeIdx);
             Mm::Free(dirBuf);
@@ -556,7 +568,7 @@ bool NanoFs::AddDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
         return false;
     }
 
-    if (!Io.ReadBlock(Super.DataStartBlock + dirInode->Blocks[0], dirBuf))
+    if (!Io.ReadBlock(Super->DataStartBlock + dirInode->Blocks[0], dirBuf))
     {
         Trace(0, "NanoFs::AddDirEntry: read dir block failed for inode %u", (ulong)dirInodeIdx);
         Mm::Free(dirBuf);
@@ -570,7 +582,7 @@ bool NanoFs::AddDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
 
     dirInode->Size++;
 
-    bool ok = Io.WriteBlock(Super.DataStartBlock + dirInode->Blocks[0], dirBuf);
+    bool ok = Io.WriteBlock(Super->DataStartBlock + dirInode->Blocks[0], dirBuf);
     Mm::Free(dirBuf);
 
     if (!ok)
@@ -619,7 +631,7 @@ bool NanoFs::RemoveDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
         return false;
     }
 
-    if (!Io.ReadBlock(Super.DataStartBlock + dirInode->Blocks[0], dirBuf))
+    if (!Io.ReadBlock(Super->DataStartBlock + dirInode->Blocks[0], dirBuf))
     {
         Trace(0, "NanoFs::RemoveDirEntry: read dir block failed for inode %u", (ulong)dirInodeIdx);
         Mm::Free(dirBuf);
@@ -655,7 +667,7 @@ bool NanoFs::RemoveDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
         return false;
     }
 
-    bool ok = Io.WriteBlock(Super.DataStartBlock + dirInode->Blocks[0], dirBuf);
+    bool ok = Io.WriteBlock(Super->DataStartBlock + dirInode->Blocks[0], dirBuf);
     Mm::Free(dirBuf);
 
     if (!ok)
@@ -822,7 +834,7 @@ VNode* NanoFs::CreateDir(VNode* dir, const char* name)
         return nullptr;
     }
     Stdlib::MemSet(zeroBuf, 0, NanoBlockSize);
-    bool zeroOk = Io.WriteBlock(Super.DataStartBlock + (u32)dataIdx, zeroBuf);
+    bool zeroOk = Io.WriteBlock(Super->DataStartBlock + (u32)dataIdx, zeroBuf);
     Mm::Free(zeroBuf);
     if (!zeroOk)
     {
@@ -989,7 +1001,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         Stdlib::MemSet(wbuf, 0, NanoBlockSize);
         Stdlib::MemCpy(wbuf, src, chunkSize);
 
-        if (!Io.WriteBlock(Super.DataStartBlock + newBlocks[i], wbuf))
+        if (!Io.WriteBlock(Super->DataStartBlock + newBlocks[i], wbuf))
         {
             Trace(0, "NanoFs::Write: write data block %u failed for inode %u",
                   (ulong)newBlocks[i], (ulong)inodeIdx);
@@ -1095,7 +1107,7 @@ bool NanoFs::Read(VNode* file, void* buf, ulong len, ulong offset)
 
     while (bytesRead < toRead && blockOff < NanoMaxBlocks)
     {
-        if (!Io.ReadBlock(Super.DataStartBlock + inode->Blocks[blockOff], blockBuf))
+        if (!Io.ReadBlock(Super->DataStartBlock + inode->Blocks[blockOff], blockBuf))
         {
             Trace(0, "NanoFs::Read: read data block %u failed for inode %u",
                   (ulong)inode->Blocks[blockOff], (ulong)inodeIdx);

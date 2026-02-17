@@ -110,7 +110,7 @@ private:
     bool RemoveRecursive(VNode* node);
 
     BlockIo Io;
-    NanoSuperBlock Super;
+    NanoSuperBlock* Super;
     VNode* VNodes[NanoInodeCount]; // in-memory VNode cache by inode index
     bool Mounted;
 };
