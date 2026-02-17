@@ -1,6 +1,7 @@
 ### nos
 
 A hobby x86-64 operating system kernel written in C++20 and NASM.
+Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices). Real hardware support has not been tested.
 
 #### Features
 
