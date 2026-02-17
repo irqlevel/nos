@@ -207,6 +207,7 @@ public:
             ObjectRef = Kernel::Mm::TAlloc<ObjectReference<T, Deleter>, 0>(object);
             if (ObjectRef == nullptr)
             {
+                Deleter()(object);
                 return;
             }
         }
