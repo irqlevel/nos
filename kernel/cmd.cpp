@@ -111,6 +111,64 @@ static void CmdUptime(const char* args, Stdlib::Printer& con)
     con.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
 }
 
+static void CmdDate(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+
+    static const ulong SecsPerMin  = 60;
+    static const ulong MinsPerHour = 60;
+    static const ulong HoursPerDay = 24;
+    static const ulong DaysPerYear = 365;
+    static const ulong DaysPerLeapYear = 366;
+    static const ulong MonthsPerYear = 12;
+    static const ulong FebruaryIndex = 2;
+    static const ulong UnixEpochYear = 1970;
+
+    ulong epoch = GetWallTimeSecs();
+    if (epoch == 0)
+    {
+        con.Printf("wall clock not available\n");
+        return;
+    }
+
+    /* Decompose Unix epoch into Y/M/D H:M:S */
+    ulong secs = epoch;
+    ulong s = secs % SecsPerMin; secs /= SecsPerMin;
+    ulong m = secs % MinsPerHour; secs /= MinsPerHour;
+    ulong h = secs % HoursPerDay; secs /= HoursPerDay;
+
+    ulong days = secs; /* days since 1970-01-01 */
+    ulong y = UnixEpochYear;
+    while (true)
+    {
+        bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        ulong daysInYear = leap ? DaysPerLeapYear : DaysPerYear;
+        if (days < daysInYear)
+            break;
+        days -= daysInYear;
+        y++;
+    }
+
+    static const u16 daysInMonth[13] = {
+        0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    bool leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    ulong mo = 1;
+    while (mo <= MonthsPerYear)
+    {
+        ulong dim = daysInMonth[mo];
+        if (mo == FebruaryIndex && leap)
+            dim++;
+        if (days < dim)
+            break;
+        days -= dim;
+        mo++;
+    }
+    ulong d = days + 1;
+
+    con.Printf("%u-%u-%u %u:%u:%u UTC\n", y, mo, d, h, m, s);
+}
+
 static void CmdPs(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -1148,6 +1206,7 @@ static const CmdEntry Commands[] = {
     { "cpu",       CmdCpu,       "cpu - dump cpu state" },
     { "dmesg",     CmdDmesg,     "dmesg [filter] - dump kernel log" },
     { "uptime",    CmdUptime,    "uptime - show uptime" },
+    { "date",      CmdDate,      "date - show wall clock time" },
     { "ps",        CmdPs,        "ps - show tasks" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },

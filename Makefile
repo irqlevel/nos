@@ -28,6 +28,7 @@ CXX_SRC =   \
     drivers/virtio_scsi.cpp \
     drivers/virtio_net.cpp \
     drivers/virtio_rng.cpp \
+    drivers/rtc.cpp \
     kernel/icxxabi.cpp    \
     kernel/interrupt.cpp   \
     kernel/task.cpp \
@@ -65,6 +66,7 @@ CXX_SRC =   \
     kernel/sched.cpp    \
     kernel/preempt.cpp  \
     kernel/time.cpp \
+    kernel/tsc.cpp \
     kernel/spin_lock.cpp \
     kernel/watchdog.cpp \
     kernel/object_table.cpp \
