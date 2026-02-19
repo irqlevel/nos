@@ -13,6 +13,7 @@ Parameters::Parameters()
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
     , DnsEnabled(false)
+    , RootAuto(false)
 {
 }
 
@@ -68,6 +69,11 @@ u16 Parameters::GetUdpShellPort()
 bool Parameters::IsDnsEnabled()
 {
     return DnsEnabled;
+}
+
+bool Parameters::IsRootAuto()
+{
+    return RootAuto;
 }
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
@@ -182,6 +188,17 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         else
         {
             Trace(0, "Invalid udpshell port %s", value);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "root") == 0)
+    {
+        if (Stdlib::StrCmp(value, "auto") == 0)
+        {
+            RootAuto = true;
+        }
+        else
+        {
+            Trace(0, "Unknown value %s, key %s", value, key);
         }
     }
     else if (Stdlib::StrCmp(key, "dns") == 0)

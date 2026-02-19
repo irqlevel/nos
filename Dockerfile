@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     parted \
     e2fsprogs \
     qemu-utils \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

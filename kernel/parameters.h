@@ -31,6 +31,8 @@ public:
 
     bool IsDnsEnabled();
 
+    bool IsRootAuto();
+
     Parameters();
     ~Parameters();
 private:
@@ -56,5 +58,6 @@ private:
     DhcpMode DhcpMd;
     u16 UdpShellPort;
     bool DnsEnabled;
+    bool RootAuto;
 };
 }

@@ -18,7 +18,7 @@ Vfs::~Vfs()
 {
 }
 
-bool Vfs::Mount(const char* path, FileSystem* fs)
+bool Vfs::Mount(const char* path, FileSystem* fs, bool readOnly)
 {
     if (path == nullptr || fs == nullptr)
     {
@@ -73,6 +73,7 @@ bool Vfs::Mount(const char* path, FileSystem* fs)
 
     Stdlib::StrnCpy(Mounts[MountCount].Path, path, MaxPath);
     Mounts[MountCount].Fs = fs;
+    Mounts[MountCount].ReadOnly = readOnly;
     MountCount++;
     return true;
 }
@@ -151,6 +152,15 @@ bool Vfs::FindMount(const char* path, ulong& mountIdx, const char*& remainder)
         remainder++;
 
     return true;
+}
+
+bool Vfs::IsMountReadOnly(const char* path)
+{
+    ulong mountIdx;
+    const char* remainder;
+    if (!FindMount(path, mountIdx, remainder))
+        return false;
+    return Mounts[mountIdx].ReadOnly;
 }
 
 bool Vfs::ResolvePath(const char* path, FileSystem*& fs, VNode*& node,
@@ -333,6 +343,12 @@ bool Vfs::WriteFile(const char* path, const void* data, ulong len)
 {
     Stdlib::AutoLock lock(Lock);
 
+    if (IsMountReadOnly(path))
+    {
+        Trace(0, "Vfs::WriteFile: %s is on a readonly mount", path);
+        return false;
+    }
+
     FileSystem* fs;
     VNode* node;
     VNode* parent;
@@ -373,6 +389,12 @@ bool Vfs::CreateDir(const char* path)
 {
     Stdlib::AutoLock lock(Lock);
 
+    if (IsMountReadOnly(path))
+    {
+        Trace(0, "Vfs::CreateDir: %s is on a readonly mount", path);
+        return false;
+    }
+
     FileSystem* fs;
     VNode* node;
     VNode* parent;
@@ -402,6 +424,12 @@ bool Vfs::CreateDir(const char* path)
 bool Vfs::CreateFile(const char* path)
 {
     Stdlib::AutoLock lock(Lock);
+
+    if (IsMountReadOnly(path))
+    {
+        Trace(0, "Vfs::CreateFile: %s is on a readonly mount", path);
+        return false;
+    }
 
     FileSystem* fs;
     VNode* node;
@@ -433,6 +461,12 @@ bool Vfs::Remove(const char* path)
 {
     Stdlib::AutoLock lock(Lock);
 
+    if (IsMountReadOnly(path))
+    {
+        Trace(0, "Vfs::Remove: %s is on a readonly mount", path);
+        return false;
+    }
+
     FileSystem* fs;
     VNode* node;
     VNode* parent;
@@ -458,12 +492,47 @@ void Vfs::DumpMounts(Stdlib::Printer& printer)
 
     for (ulong i = 0; i < MountCount; i++)
     {
+        const char* rwStr = Mounts[i].ReadOnly ? "ro" : "rw";
         char info[64];
         Mounts[i].Fs->GetInfo(info, sizeof(info));
         if (info[0] != '\0')
-            printer.Printf("%s on %s  %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path, info);
+            printer.Printf("%s on %s  %s  %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path, info, rwStr);
         else
-            printer.Printf("%s on %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path);
+            printer.Printf("%s on %s  %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path, rwStr);
+    }
+}
+
+void Vfs::UnmountAll()
+{
+    Stdlib::AutoLock lock(Lock);
+
+    /* Unmount in reverse path-length order (deepest first)
+       so child mounts are torn down before parents. */
+    while (MountCount > 0)
+    {
+        ulong longest = 0;
+        ulong longestIdx = 0;
+        for (ulong i = 0; i < MountCount; i++)
+        {
+            ulong len = Stdlib::StrLen(Mounts[i].Path);
+            if (len >= longest)
+            {
+                longest = len;
+                longestIdx = i;
+            }
+        }
+
+        Trace(0, "Vfs::UnmountAll: unmounting %s (%s)",
+              Mounts[longestIdx].Path, Mounts[longestIdx].Fs->GetName());
+
+        FileSystem* fs = Mounts[longestIdx].Fs;
+        fs->Unmount();
+        delete fs;
+
+        for (ulong j = longestIdx; j + 1 < MountCount; j++)
+            Mounts[j] = Mounts[j + 1];
+        MountCount--;
+        Stdlib::MemSet(&Mounts[MountCount], 0, sizeof(MountEntry));
     }
 }
 

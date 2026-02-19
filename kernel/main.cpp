@@ -48,6 +48,10 @@
 #include <block/partition.h>
 #include <net/udp_shell.h>
 #include <net/tcp.h>
+#include <fs/vfs.h>
+#include <fs/ramfs.h>
+#include <fs/ext2.h>
+#include <fs/nanofs.h>
 
 using namespace Kernel;
 using namespace Stdlib;
@@ -173,6 +177,8 @@ static void PrepareHalt(HaltAction action)
     auto task = Task::GetCurrentTask();
     task->Get();
 
+    Vfs::GetInstance().UnmountAll();
+
     PreemptDisable();
 
     Trace(0, "Stopping cpu's");
@@ -259,6 +265,54 @@ void SomeTaskRoutine(void *ctx)
         Sleep(100 * Const::NanoSecsInMs);
 }
 
+void MountRootFs()
+{
+    if (!Parameters::GetInstance().IsRootAuto())
+        return;
+
+    auto& vfs = Vfs::GetInstance();
+
+    RamFs* ramfs = new RamFs();
+    if (ramfs == nullptr || !vfs.Mount("/", ramfs))
+    {
+        Trace(0, "MountRootFs: failed to mount ramfs on /");
+        delete ramfs;
+        return;
+    }
+    Trace(0, "MountRootFs: mounted ramfs on / (rw)");
+
+    vfs.CreateDir("/boot");
+
+    auto& table = BlockDeviceTable::GetInstance();
+    for (ulong i = 0; i < table.GetCount(); i++)
+    {
+        BlockDevice* dev = table.GetDevice(i);
+        Ext2Fs* ext2 = new Ext2Fs(dev);
+        if (ext2 != nullptr && vfs.Mount("/boot", ext2, true))
+        {
+            Trace(0, "MountRootFs: mounted ext2 on /boot from %s (ro)",
+                dev->GetName());
+            break;
+        }
+        delete ext2;
+    }
+
+    vfs.CreateDir("/data");
+
+    for (ulong i = 0; i < table.GetCount(); i++)
+    {
+        BlockDevice* dev = table.GetDevice(i);
+        NanoFs* nanofs = new NanoFs(dev);
+        if (nanofs != nullptr && vfs.Mount("/data", nanofs))
+        {
+            Trace(0, "MountRootFs: mounted nanofs on /data from %s (rw)",
+                dev->GetName());
+            break;
+        }
+        delete nanofs;
+    }
+}
+
 /* Shutdown()/Reboot() end up in PrepareHalt which abandons this
    stack via SetRsp without unwinding (see the WARNING there).
    All C++ objects with non-trivial destructors must go out of
@@ -295,6 +349,7 @@ void BpStartup(void* ctx)
         VirtioBlk::InitAll();
         VirtioScsi::InitAll();
         PartitionDevice::ProbeAll();
+        MountRootFs();
         VirtioNet::InitAll();
         VirtioRng::InitAll();
 
