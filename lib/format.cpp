@@ -116,20 +116,34 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 continue;
             }
 
-            /* Parse optional '0' pad flag */
+            /* Parse flags */
             bool zeroPad = false;
-            if (tp == '0') {
-                zeroPad = true;
+            bool leftAlign = false;
+            while (tp == '0' || tp == '-') {
+                if (tp == '0')
+                    zeroPad = true;
+                else
+                    leftAlign = true;
+                i++;
+                tp = fmt[i];
+                if (tp == '\0')
+                    return -1;
+            }
+            if (leftAlign)
+                zeroPad = false;
+
+            /* Parse optional width */
+            int width = 0;
+            while (tp >= '0' && tp <= '9') {
+                width = width * 10 + (tp - '0');
                 i++;
                 tp = fmt[i];
                 if (tp == '\0')
                     return -1;
             }
 
-            /* Parse optional width */
-            int width = 0;
-            while (tp >= '0' && tp <= '9') {
-                width = width * 10 + (tp - '0');
+            /* Skip optional 'l' length modifier */
+            if (tp == 'l') {
                 i++;
                 tp = fmt[i];
                 if (tp == '\0')
@@ -145,13 +159,21 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 rc = __UlongToString(val, 10, tmp, sizeof(tmp));
                 if (rc < 0)
                     return -1;
-                for (int p = 0; p < width - rc; p++) {
-                    if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                        return -1;
+                if (!leftAlign) {
+                    for (int p = 0; p < width - rc; p++) {
+                        if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
+                            return -1;
+                    }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
                         return -1;
+                }
+                if (leftAlign) {
+                    for (int p = 0; p < width - rc; p++) {
+                        if (!PutChar(' ', s, size, pos++))
+                            return -1;
+                    }
                 }
                 break;
             }
@@ -164,19 +186,26 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 if (rc < 0)
                     return -1;
                 int totalLen = rc + (negative ? 1 : 0);
-                if (negative && zeroPad) {
-                    /* Sign before zero padding: -00042 */
-                    if (!PutChar('-', s, size, pos++))
-                        return -1;
-                    for (int p = 0; p < width - totalLen; p++) {
-                        if (!PutChar('0', s, size, pos++))
+                if (!leftAlign) {
+                    if (negative && zeroPad) {
+                        /* Sign before zero padding: -00042 */
+                        if (!PutChar('-', s, size, pos++))
                             return -1;
+                        for (int p = 0; p < width - totalLen; p++) {
+                            if (!PutChar('0', s, size, pos++))
+                                return -1;
+                        }
+                    } else {
+                        for (int p = 0; p < width - totalLen; p++) {
+                            if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
+                                return -1;
+                        }
+                        if (negative) {
+                            if (!PutChar('-', s, size, pos++))
+                                return -1;
+                        }
                     }
                 } else {
-                    for (int p = 0; p < width - totalLen; p++) {
-                        if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                            return -1;
-                    }
                     if (negative) {
                         if (!PutChar('-', s, size, pos++))
                             return -1;
@@ -185,6 +214,12 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
                         return -1;
+                }
+                if (leftAlign) {
+                    for (int p = 0; p < width - totalLen; p++) {
+                        if (!PutChar(' ', s, size, pos++))
+                            return -1;
+                    }
                 }
                 break;
             }
@@ -195,13 +230,21 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 rc = __UlongToString(val, 16, tmp, sizeof(tmp), tp == 'x');
                 if (rc < 0)
                     return -1;
-                for (int p = 0; p < width - rc; p++) {
-                    if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                        return -1;
+                if (!leftAlign) {
+                    for (int p = 0; p < width - rc; p++) {
+                        if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
+                            return -1;
+                    }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
                         return -1;
+                }
+                if (leftAlign) {
+                    for (int p = 0; p < width - rc; p++) {
+                        if (!PutChar(' ', s, size, pos++))
+                            return -1;
+                    }
                 }
                 break;
             }
@@ -214,13 +257,21 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 rc = __UlongToString(uval, 16, tmp, sizeof(tmp));
                 if (rc < 0)
                     return -1;
-                for (int p = 0; p < width - rc; p++) {
-                    if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                        return -1;
+                if (!leftAlign) {
+                    for (int p = 0; p < width - rc; p++) {
+                        if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
+                            return -1;
+                    }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
                         return -1;
+                }
+                if (leftAlign) {
+                    for (int p = 0; p < width - rc; p++) {
+                        if (!PutChar(' ', s, size, pos++))
+                            return -1;
+                    }
                 }
                 break;
             }
@@ -235,14 +286,22 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 if (val == nullptr)
                     val = "(null)";
                 size_t val_len = StrLen(val);
-                for (int p = 0; p < width - (int)val_len; p++) {
-                    if (!PutChar(' ', s, size, pos++))
-                        return -1;
+                if (!leftAlign) {
+                    for (int p = 0; p < width - (int)val_len; p++) {
+                        if (!PutChar(' ', s, size, pos++))
+                            return -1;
+                    }
                 }
                 if (val_len > (size - pos))
                     return -1;
                 MemCpy(&s[pos], val, val_len);
                 pos += val_len;
+                if (leftAlign) {
+                    for (int p = 0; p < width - (int)val_len; p++) {
+                        if (!PutChar(' ', s, size, pos++))
+                            return -1;
+                    }
+                }
                 break;
             }
             default:

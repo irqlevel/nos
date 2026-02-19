@@ -52,6 +52,7 @@
 #include <fs/ramfs.h>
 #include <fs/ext2.h>
 #include <fs/nanofs.h>
+#include <fs/procfs.h>
 
 using namespace Kernel;
 using namespace Stdlib;
@@ -310,6 +311,18 @@ void MountRootFs()
             break;
         }
         delete nanofs;
+    }
+
+    vfs.CreateDir("/proc");
+
+    ProcFs* procfs = new ProcFs();
+    if (procfs != nullptr && vfs.Mount("/proc", procfs, true))
+    {
+        Trace(0, "MountRootFs: mounted procfs on /proc (ro)");
+    }
+    else
+    {
+        delete procfs;
     }
 }
 

@@ -33,6 +33,8 @@ public:
 
     bool IsRootAuto();
 
+    const char* GetCmdline();
+
     Parameters();
     ~Parameters();
 private:
