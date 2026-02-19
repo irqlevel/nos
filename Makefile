@@ -60,6 +60,7 @@ CXX_SRC =   \
     fs/ramfs.cpp \
     fs/block_io.cpp \
     fs/nanofs.cpp \
+    fs/ext2.cpp \
     kernel/mutex.cpp \
     kernel/wait_group.cpp \
     kernel/softirq.cpp \

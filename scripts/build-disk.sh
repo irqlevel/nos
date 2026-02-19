@@ -31,6 +31,9 @@ parted -s $IMG mkpart primary ext2 1MiB 33MiB
 parted -s $IMG mkpart primary 33MiB 100%
 parted -s $IMG set 1 boot on
 
+echo "Formatting partition 2 as NanoFs..."
+python3 /src/scripts/mkfs_nanofs.py $IMG
+
 # Whole-disk loop device (for grub-install to write MBR boot code)
 echo "Setting up whole-disk loop device..."
 LOOP_DISK=$(losetup --show -f $IMG)
@@ -48,12 +51,12 @@ echo "Mounting partition 1..."
 MNTDIR=$(mktemp -d)
 mount $LOOP_P1 $MNTDIR
 
-mkdir -p $MNTDIR/boot/grub
-cp /src/bin/kernel64.elf $MNTDIR/boot/kernel64.elf
-cp /src/build/grub-disk.cfg $MNTDIR/boot/grub/grub.cfg
+mkdir -p $MNTDIR/grub
+cp /src/bin/kernel64.elf $MNTDIR/kernel64.elf
+cp /src/build/grub-disk.cfg $MNTDIR/grub/grub.cfg
 
 # Copy GRUB modules so normal.mod etc. are available at boot
-cp -r /usr/lib/grub/i386-pc $MNTDIR/boot/grub/
+cp -r /usr/lib/grub/i386-pc $MNTDIR/grub/
 
 # Build custom GRUB core.img with hardcoded root device.
 # This avoids the default UUID-based search which fails in QEMU.
@@ -62,13 +65,13 @@ serial --unit=0 --speed=115200
 terminal_input serial console
 terminal_output serial console
 set root=(hd0,msdos1)
-set prefix=(hd0,msdos1)/boot/grub
+set prefix=(hd0,msdos1)/grub
 EOFCFG
 
 echo "Building GRUB core image..."
 grub-mkimage -O i386-pc -o /tmp/core.img \
     -c /tmp/grub-early.cfg \
-    -p "(hd0,msdos1)/boot/grub" \
+    -p "(hd0,msdos1)/grub" \
     biosdisk part_msdos ext2 normal multiboot2 serial terminal
 
 echo "Installing GRUB boot sector and core image..."

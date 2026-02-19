@@ -16,7 +16,7 @@ public:
         return instance;
     }
 
-    bool Mount(const char* path, FileSystem* fs);
+    bool Mount(const char* path, FileSystem* fs, bool readOnly = false);
     FileSystem* Unmount(const char* path);
 
     bool ListDir(const char* path, Stdlib::Printer& printer);
@@ -27,6 +27,7 @@ public:
     bool Remove(const char* path);
 
     void DumpMounts(Stdlib::Printer& printer);
+    void UnmountAll();
 
     static const ulong MaxMounts = 16;
     static const ulong MaxPath = 256;
@@ -43,10 +44,12 @@ private:
     {
         char Path[MaxPath];
         FileSystem* Fs;
+        bool ReadOnly;
     };
 
     bool ResolvePath(const char* path, FileSystem*& fs, VNode*& node, VNode*& parent, char* lastName, ulong lastNameSize);
     bool FindMount(const char* path, ulong& mountIdx, const char*& remainder);
+    bool IsMountReadOnly(const char* path);
 
     MountEntry Mounts[MaxMounts];
     ulong MountCount;
