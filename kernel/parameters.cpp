@@ -76,6 +76,11 @@ bool Parameters::IsRootAuto()
     return RootAuto;
 }
 
+const char* Parameters::GetCmdline()
+{
+    return Cmdline;
+}
+
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
 {
     if (BugOn(start >= end))
