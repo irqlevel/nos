@@ -15,5 +15,5 @@ bin
 *.qcow2
 *.d
 *.vmdk
-kernel/symtab_data.cpp
-rust/target/
+src/cpp/kernel/symtab_data.cpp
+src/rust/target/

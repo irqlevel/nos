@@ -5,12 +5,12 @@ alwaysApply: true
 
 # NOS Kernel — x86-64, C++20, freestanding
 
-This is a bare-metal OS kernel for x86-64. There is no standard library, no libc, no STL. The project provides its own equivalents under `lib/` and `mm/`.
+This is a bare-metal OS kernel for x86-64. There is no standard library, no libc, no STL. The project provides its own equivalents under `src/cpp/lib/` and `src/cpp/mm/`.
 
 ## Environment constraints
 
 - Compiler: Clang, `-std=c++20 -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin`
-- No `std::` namespace; use `Stdlib::` equivalents from `lib/stdlib.h`
+- No `std::` namespace; use `Stdlib::` equivalents from `src/cpp/lib/stdlib.h`
 - No heap before `PageAllocatorImpl::Setup()` completes
 - No C++ exceptions or RTTI
 - No lambdas/closures (no runtime support for captures)
@@ -31,8 +31,8 @@ Never rely on static instance constructors for initialization. Allocate the obje
 ## Error handling and resource cleanup
 
 - Simple pass/fail: return `bool` or pointer (nullptr = failure)
-- Rich error info: return `Stdlib::Error` (`lib/error.h`) — carries error code, file, line, function
-- Value + error together: return `Stdlib::Result<T>` (`lib/result.h`) — holds a value and an `Error`
+- Rich error info: return `Stdlib::Error` (`src/cpp/lib/error.h`) — carries error code, file, line, function
+- Value + error together: return `Stdlib::Result<T>` (`src/cpp/lib/result.h`) — holds a value and an `Error`
 - Create errors with `MakeError(Stdlib::Error::NoMemory)` — captures source location automatically
 - Create success with `MakeSuccess()`
 - `Result<T>` has implicit constructors from both `T` and `Error`, so you can write:
@@ -60,7 +60,7 @@ Stdlib::Result<int> Foo() {
 - To free a mapped page: `UnmapPage` + `FreePage` + `Put`
 - `FreePage` alone just returns the page to the free list; it does not touch refcount
 
-## Memory allocation API (`mm/new.h`)
+## Memory allocation API (`src/cpp/mm/new.h`)
 
 | Function | Allocates phys pages? | Maps at tracked VA? | Frees phys pages on unmap? |
 |---|---|---|---|
@@ -70,7 +70,7 @@ Stdlib::Result<int> Foo() {
 
 ## Virtual address management
 
-`VaAllocator` (`mm/va_allocator.h`) tracks which VA ranges are free/used via a bitmap. Each `FixedPageAllocator` instance owns a `VaAllocator`. Never map DMA or device buffers at `physAddr + KernelSpaceBase` directly — always go through `Mm::MapPages` or `Mm::AllocMapPages` so the VA is tracked.
+`VaAllocator` (`src/cpp/mm/va_allocator.h`) tracks which VA ranges are free/used via a bitmap. Each `FixedPageAllocator` instance owns a `VaAllocator`. Never map DMA or device buffers at `physAddr + KernelSpaceBase` directly — always go through `Mm::MapPages` or `Mm::AllocMapPages` so the VA is tracked.
 
 ## Code style
 
@@ -86,4 +86,4 @@ Stdlib::Result<int> Foo() {
 
 - `make` builds the kernel ELF
 - QEMU scripts are in `scripts/`
-- Self-tests live in `kernel/test.cpp`; each test is a `Stdlib::Error TestXxx()` function registered in `Test()`
+- Self-tests live in `src/cpp/kernel/test.cpp`; each test is a `Stdlib::Error TestXxx()` function registered in `Test()`
