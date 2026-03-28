@@ -119,6 +119,13 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
         return false;
     }
 
+    if (!Transport.IsLegacy() && Transport.IsMsixEnabled())
+    {
+        u8 vec = Transport.EnableMsixVector(0, *this);
+        if (vec == 0)
+            Trace(0, "VirtioBlk %s: MSI-X unavailable, using INTx", name);
+    }
+
     Transport.SetQueueDesc(Queue.GetDescPhys());
     Transport.SetQueueDriver(Queue.GetAvailPhys());
     Transport.SetQueueDevice(Queue.GetUsedPhys());
@@ -173,10 +180,13 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
 
     Initialized = true;
 
-    /* Register IRQ handler.  Use vector 0x25 + instance offset. */
-    u8 irq = pciDev->InterruptLine;
-    u8 vector = 0x25 + (u8)InstanceCount;
-    Interrupt::RegisterLevel(*this, irq, vector);
+    if (!Transport.UsingMsix())
+    {
+        /* Legacy INTx: vector 0x25 + instance offset. */
+        u8 irq = pciDev->InterruptLine;
+        u8 vector = 0x25 + (u8)InstanceCount;
+        Interrupt::RegisterLevel(*this, irq, vector);
+    }
 
     /* Register as block device */
     BlockDeviceTable::GetInstance().Register(this);

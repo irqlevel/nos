@@ -16,6 +16,9 @@ VirtioPci::VirtioPci()
     , NotifyOffMultiplier(0)
     , IsrCfg(nullptr)
     , DeviceCfg(nullptr)
+    , PciDev(nullptr)
+    , MsixActive(false)
+    , MsixEntry(0)
 {
     for (ulong i = 0; i < MaxCachedQueues; i++)
         NotifyAddr[i] = nullptr;
@@ -144,8 +147,11 @@ bool VirtioPci::ProbeModern(Pci::DeviceInfo* dev)
         return false;
     }
 
-    /* Disable MSI-X -- use legacy INTx */
-    MmioWrite16(CommonCfg + CfgMsixConfig, 0xFFFF);
+    if (!Msix.Setup(dev, MappedBars))
+    {
+        Trace(0, "VirtioPci: MSI-X not available, using INTx");
+        MmioWrite16(CommonCfg + CfgMsixConfig, 0xFFFF);
+    }
 
     Legacy = false;
     Trace(0, "VirtioPci: modern transport probed");
@@ -178,6 +184,10 @@ bool VirtioPci::ProbeLegacy(Pci::DeviceInfo* dev)
 
 bool VirtioPci::Probe(Pci::DeviceInfo* dev)
 {
+    PciDev = dev;
+    MsixActive = false;
+    MsixEntry = 0;
+
     /* Try modern transport first */
     if (ProbeModern(dev))
         return true;
@@ -327,8 +337,10 @@ void VirtioPci::EnableQueue()
 {
     if (Legacy)
         return; /* Legacy queues are enabled by setting the PFN */
-    /* Disable MSI-X for this queue -- use legacy INTx */
-    MmioWrite16(CommonCfg + CfgQueueMsixVector, 0xFFFF);
+    if (MsixActive)
+        MmioWrite16(CommonCfg + CfgQueueMsixVector, MsixEntry);
+    else
+        MmioWrite16(CommonCfg + CfgQueueMsixVector, 0xFFFF);
     MmioWrite16(CommonCfg + CfgQueueEnable, 1);
 
     /* Cache the notify address for this queue */
@@ -399,6 +411,24 @@ u64 VirtioPci::ReadDevCfg64(ulong offset)
     if (!DeviceCfg)
         return 0;
     return MmioRead64(DeviceCfg + offset);
+}
+
+u8 VirtioPci::EnableMsixVector(u16 index, InterruptHandler& handler)
+{
+    if (!Msix.IsReady())
+        return 0;
+    u8 v = Msix.EnableVector(index, handler);
+    if (v != 0)
+    {
+        MsixEntry = index;
+        if (!MsixActive)
+        {
+            MsixActive = true;
+            if (CommonCfg)
+                MmioWrite16(CommonCfg + CfgMsixConfig, index);
+        }
+    }
+    return v;
 }
 
 }

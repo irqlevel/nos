@@ -15,6 +15,25 @@
 namespace Kernel
 {
 
+/* Registers MSI-X with the common VirtioScsiInterruptStub before VirtioScsi
+   instances exist (one stub serves all LUNs). */
+class VirtioScsiMsixRegistrar final : public InterruptHandler
+{
+public:
+    void OnInterruptRegister(u8 irq, u8 vector) override
+    {
+        (void)irq;
+        (void)vector;
+    }
+
+    InterruptHandlerFn GetHandlerFn() override
+    {
+        return VirtioScsiInterruptStub;
+    }
+};
+
+static VirtioScsiMsixRegistrar ScsiMsixRegistrar;
+
 VirtioScsi VirtioScsi::Instances[MaxInstances];
 ulong VirtioScsi::InstanceCount = 0;
 
@@ -841,6 +860,14 @@ bool VirtioScsi::InitHba(Pci::DeviceInfo* pciDev, HbaState* hba)
     hba->Transport.SetQueueDesc(hba->ReqQueue.GetDescPhys());
     hba->Transport.SetQueueDriver(hba->ReqQueue.GetAvailPhys());
     hba->Transport.SetQueueDevice(hba->ReqQueue.GetUsedPhys());
+
+    if (!hba->Transport.IsLegacy() && hba->Transport.IsMsixEnabled())
+    {
+        u8 vec = hba->Transport.EnableMsixVector(0, ScsiMsixRegistrar);
+        if (vec == 0)
+            Trace(0, "VirtioScsi: MSI-X unavailable, using INTx");
+    }
+
     hba->Transport.EnableQueue();
 
     /* Set DRIVER_OK */
@@ -1026,10 +1053,12 @@ void VirtioScsi::InitAll()
                     Instances[j].Hba = nullptr;
             }
 
-            /* Register interrupt using the first instance discovered on this HBA */
-            u8 irq = dev->InterruptLine;
-            u8 vector = BaseVector + (u8)HbaCount;
-            Interrupt::RegisterLevel(Instances[firstInst], irq, vector);
+            if (!hba->Transport.UsingMsix())
+            {
+                u8 irq = dev->InterruptLine;
+                u8 vector = BaseVector + (u8)HbaCount;
+                Interrupt::RegisterLevel(Instances[firstInst], irq, vector);
+            }
         }
         else
         {

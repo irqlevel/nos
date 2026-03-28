@@ -38,6 +38,7 @@ const char* InterruptStats::GetName(InterruptSource src)
     case IrqVirtioScsi: return "virtio-scsi";
     case IrqIPI:        return "ipi";
     case IrqShared:     return "shared";
+    case IrqMsix:       return "msix";
     case IrqDummy:      return "dummy";
     default:            return "unknown";
     }

@@ -37,6 +37,7 @@ public:
     ulong GetDeviceCount();
 
     u8 ReadByte(u16 bus, u16 slot, u16 func, u16 offset);
+    u16 ReadWord(u16 bus, u16 slot, u16 func, u16 offset);
     u32 ReadDword(u16 bus, u16 slot, u16 func, u16 offset);
     void WriteByte(u16 bus, u16 slot, u16 func, u16 offset, u8 value);
     void WriteDword(u16 bus, u16 slot, u16 func, u16 offset, u32 value);
@@ -120,8 +121,6 @@ private:
     Pci(Pci&& other) = delete;
     Pci& operator=(const Pci& other) = delete;
     Pci& operator=(Pci&& other) = delete;
-
-    u16 ReadWord(u16 bus, u16 slot, u16 func, u16 offset);
 
     u16 GetVendorID(u16 bus, u16 device, u16 function);
 
