@@ -32,12 +32,12 @@ extern "C" {
 
 void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long len)
 {
-    char buf[256];
+    char buf[512];
     unsigned long n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
     Stdlib::MemCpy(buf, msg, n);
     buf[n] = '\0';
     auto time = Kernel::GetBootTime();
-    Kernel::Tracer::GetInstance().Output("%u:%u.%06u:rust: %s\n",
+    Kernel::Tracer::GetInstance().Output("%u:%u.%06u:%s\n",
         level, time.GetSecs(), time.GetUsecs(), buf);
 }
 

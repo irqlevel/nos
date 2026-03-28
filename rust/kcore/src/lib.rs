@@ -24,6 +24,12 @@ macro_rules! trace {
     ($level:expr, $($arg:tt)*) => {{
         use core::fmt::Write;
         let mut buf = $crate::trace::__TraceBuf::new();
+        let f = file!();
+        let fname = match f.rfind('/') {
+            Some(i) => &f[i + 1..],
+            None => f,
+        };
+        let _ = write!(buf, "{}(),{},{}: ", module_path!(), fname, line!());
         let _ = write!(buf, $($arg)*);
         $crate::trace::trace($level, buf.as_str());
     }};

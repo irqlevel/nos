@@ -12,6 +12,7 @@ extern VirtioNetInterrupt
 extern VirtioScsiInterrupt
 extern SharedInterrupt
 extern RustInterruptDispatch
+extern RustMsixDispatch
 
 extern ExcDivideByZero
 extern ExcDebugger
