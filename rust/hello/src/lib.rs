@@ -3,7 +3,6 @@
 extern crate alloc;
 
 use alloc::vec;
-use core::fmt::Write;
 
 pub fn hello() {
     kcore::trace!(0, "Hello from Rust!");
