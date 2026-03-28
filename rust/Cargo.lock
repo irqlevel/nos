@@ -10,6 +10,13 @@ version = "0.1.0"
 name = "hello"
 version = "0.1.0"
 dependencies = [
+ "kcore",
+]
+
+[[package]]
+name = "kcore"
+version = "0.1.0"
+dependencies = [
  "ffi",
 ]
 
@@ -19,4 +26,5 @@ version = "0.1.0"
 dependencies = [
  "ffi",
  "hello",
+ "kcore",
 ]

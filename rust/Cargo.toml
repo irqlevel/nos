@@ -1,5 +1,5 @@
 [workspace]
-members = ["ffi", "kernel", "hello"]
+members = ["ffi", "kernel", "hello", "kcore"]
 resolver = "2"
 
 [profile.release]

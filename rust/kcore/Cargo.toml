@@ -1,7 +1,9 @@
 [package]
-name = "hello"
+name = "kcore"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+
 [dependencies]
-kcore = { path = "../kcore" }
+ffi = { path = "../ffi" }
