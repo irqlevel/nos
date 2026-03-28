@@ -99,6 +99,23 @@ void RustInterruptStub5();
 void RustInterruptStub6();
 void RustInterruptStub7();
 
+void RustMsixStub0();
+void RustMsixStub1();
+void RustMsixStub2();
+void RustMsixStub3();
+void RustMsixStub4();
+void RustMsixStub5();
+void RustMsixStub6();
+void RustMsixStub7();
+void RustMsixStub8();
+void RustMsixStub9();
+void RustMsixStub10();
+void RustMsixStub11();
+void RustMsixStub12();
+void RustMsixStub13();
+void RustMsixStub14();
+void RustMsixStub15();
+
 void ExcDivideByZeroStub();
 void ExcDebuggerStub();
 void ExcNMIStub();

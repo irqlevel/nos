@@ -40,6 +40,19 @@ impl Drop for TaskHandle {
     }
 }
 
+pub fn spawn_on(affinity_mask: u64, f: fn()) -> Option<TaskHandle> {
+    let boxed = Box::new(RustSpawnCtx { f });
+    let ptr = Box::into_raw(boxed).cast::<u8>();
+    let h = unsafe {
+        task::kernel_task_spawn_on(rust_spawn_trampoline, ptr, affinity_mask as usize)
+    };
+    if h == 0 {
+        unsafe { drop(Box::from_raw(ptr.cast::<RustSpawnCtx>())); }
+        return None;
+    }
+    Some(TaskHandle { handle: h })
+}
+
 pub fn spawn(f: fn()) -> Option<TaskHandle> {
     let boxed = Box::new(RustSpawnCtx { f });
     let ptr = Box::into_raw(boxed).cast::<u8>();
@@ -63,6 +76,26 @@ pub fn sleep_ms(ms: u64) {
     sleep(Duration::from_millis(ms));
 }
 
+/// Spawn a task that receives a raw context pointer.
+/// The caller is responsible for the lifetime and safety of `ctx`.
+pub fn spawn_with_ctx(
+    func: extern "C" fn(*mut u8), ctx: *mut u8,
+) -> Option<TaskHandle> {
+    let h = unsafe { task::kernel_task_spawn_ctx(func, ctx) };
+    if h == 0 { None } else { Some(TaskHandle { handle: h }) }
+}
+
+/// Spawn a task with a raw context pointer, bound to `affinity_mask` CPUs.
+pub fn spawn_on_with_ctx(
+    affinity_mask: u64,
+    func: extern "C" fn(*mut u8), ctx: *mut u8,
+) -> Option<TaskHandle> {
+    let h = unsafe {
+        task::kernel_task_spawn_on_ctx(func, ctx, affinity_mask as usize)
+    };
+    if h == 0 { None } else { Some(TaskHandle { handle: h }) }
+}
+
 pub fn cpu_id() -> u32 {
-    unsafe { task::kernel_get_cpu_id() }
+    crate::cpu::id()
 }

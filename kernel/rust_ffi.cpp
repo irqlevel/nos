@@ -2,7 +2,10 @@
 #include "panic.h"
 #include "time.h"
 #include "mutex.h"
+#include "wait_group.h"
 #include "spin_lock.h"
+#include "raw_spin_lock.h"
+#include "raw_rw_spin_lock.h"
 #include "task.h"
 #include "sched.h"
 #include "cpu.h"
@@ -11,6 +14,7 @@
 #include "interrupt.h"
 #include "asm.h"
 #include "softirq.h"
+#include "timer.h"
 #include <mm/new.h>
 #include <mm/page_allocator.h>
 #include <mm/page_table.h>
@@ -18,6 +22,9 @@
 #include <drivers/pci.h>
 #include <drivers/msix.h>
 #include <drivers/lapic.h>
+#include <block/block_device.h>
+#include <net/net_device.h>
+#include <net/net_frame.h>
 
 static const ulong RustAllocTag = 'rust';
 
@@ -122,11 +129,57 @@ void kernel_spinlock_unlock(unsigned long handle, unsigned long long flags)
     reinterpret_cast<Kernel::SpinLock*>(handle)->Unlock((unsigned long)flags);
 }
 
+unsigned long kernel_waitgroup_create()
+{
+    Kernel::WaitGroup* wg = Kernel::Mm::TAlloc<Kernel::WaitGroup, RustAllocTag>();
+    return (unsigned long)wg;
+}
+
+void kernel_waitgroup_destroy(unsigned long handle)
+{
+    if (handle == 0)
+        return;
+    Kernel::WaitGroup* wg = reinterpret_cast<Kernel::WaitGroup*>(handle);
+    wg->~WaitGroup();
+    Kernel::Mm::Free(wg);
+}
+
+void kernel_waitgroup_add(unsigned long handle, long delta)
+{
+    reinterpret_cast<Kernel::WaitGroup*>(handle)->Add(delta);
+}
+
+void kernel_waitgroup_done(unsigned long handle)
+{
+    reinterpret_cast<Kernel::WaitGroup*>(handle)->Done();
+}
+
+void kernel_waitgroup_wait(unsigned long handle)
+{
+    reinterpret_cast<Kernel::WaitGroup*>(handle)->Wait();
+}
+
 unsigned long kernel_task_spawn(void (*func)(void*), void* ctx)
 {
     Kernel::Task* t = Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>("rust");
     if (!t)
         return 0;
+    if (!t->Start(func, ctx))
+    {
+        t->Put();
+        return 0;
+    }
+    return (unsigned long)t;
+}
+
+unsigned long kernel_task_spawn_on(
+    void (*func)(void*), void* ctx,
+    unsigned long affinity_mask)
+{
+    Kernel::Task* t = Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>("rust");
+    if (!t)
+        return 0;
+    t->SetCpuAffinity(affinity_mask);
     if (!t->Start(func, ctx))
     {
         t->Put();
@@ -158,6 +211,46 @@ void kernel_sleep_ns(unsigned long long ns)
 unsigned int kernel_get_cpu_id()
 {
     return (unsigned int)Kernel::GetCpu().GetIndex();
+}
+
+unsigned int kernel_cpu_count()
+{
+    ulong mask = Kernel::CpuTable::GetInstance().GetRunningCpus();
+    unsigned int count = 0;
+    while (mask) { count += mask & 1; mask >>= 1; }
+    return count;
+}
+
+unsigned long kernel_cpu_online_mask()
+{
+    return Kernel::CpuTable::GetInstance().GetRunningCpus();
+}
+
+} /* extern "C" */
+
+struct RustIPIAdapter
+{
+    void (*Handler)(void*);
+    void* Ctx;
+};
+
+static void RustIPITrampoline(void* actx, Kernel::Context*)
+{
+    auto* a = static_cast<RustIPIAdapter*>(actx);
+    a->Handler(a->Ctx);
+}
+
+extern "C" {
+
+void kernel_cpu_run_on(unsigned int cpu,
+    void (*handler)(void*), void* ctx)
+{
+    if (!handler || cpu >= (unsigned int)Kernel::MaxCpus)
+        return;
+
+    RustIPIAdapter a{handler, ctx};
+    Kernel::IPITask task(RustIPITrampoline, &a);
+    Kernel::CpuTable::GetInstance().GetCpu(cpu).QueueIPITask(task);
 }
 
 void* kernel_alloc_dma_pages(unsigned long count,
@@ -203,6 +296,13 @@ void kernel_unmap_phys(void* virt_addr, unsigned long num_pages)
 {
     if (virt_addr && num_pages > 0)
         Kernel::Mm::UnmapPages(virt_addr, (size_t)num_pages);
+}
+
+unsigned long kernel_virt_to_phys(const void* virt_addr)
+{
+    if (!virt_addr)
+        return 0;
+    return Kernel::Mm::PageTable::GetInstance().VirtToPhys((ulong)virt_addr);
 }
 
 int kernel_get_random(unsigned char* buf, unsigned long len)
@@ -447,6 +547,19 @@ int kernel_msix_is_ready(unsigned long handle)
     return reinterpret_cast<Kernel::MsixTable*>(handle)->IsReady() ? 1 : 0;
 }
 
+unsigned long kernel_task_spawn_ctx(
+    void (*func)(void*), void* ctx)
+{
+    return kernel_task_spawn(func, ctx);
+}
+
+unsigned long kernel_task_spawn_on_ctx(
+    void (*func)(void*), void* ctx,
+    unsigned long affinity_mask)
+{
+    return kernel_task_spawn_on(func, ctx, affinity_mask);
+}
+
 } /* extern "C" */
 
 /* ---- Legacy (INTx) interrupts ---- */
@@ -463,6 +576,7 @@ struct RustIrqSlot
 };
 
 static RustIrqSlot RustIrqSlots[RustIrqSlotCount];
+static Kernel::RawRwSpinLock RustIrqLock;
 
 static Kernel::InterruptHandlerFn RustStubTable[RustIrqSlotCount] = {
     RustInterruptStub0,
@@ -494,9 +608,12 @@ public:
     void OnInterrupt(Kernel::Context* ctx) override
     {
         (void)ctx;
-        auto& slot = RustIrqSlots[SlotIndex];
-        if (slot.Handler)
-            slot.Handler(slot.Ctx);
+        RustIrqLock.ReadLock();
+        auto handler = RustIrqSlots[SlotIndex].Handler;
+        auto uctx = RustIrqSlots[SlotIndex].Ctx;
+        RustIrqLock.ReadUnlock();
+        if (handler)
+            handler(uctx);
     }
 };
 
@@ -512,9 +629,12 @@ void RustInterruptDispatch(Kernel::Context* ctx, int slot)
         Kernel::Lapic::EOI();
         return;
     }
-    auto& s = RustIrqSlots[slot];
-    if (s.Handler)
-        s.Handler(s.Ctx);
+    RustIrqLock.ReadLock();
+    auto handler = RustIrqSlots[slot].Handler;
+    auto uctx = RustIrqSlots[slot].Ctx;
+    RustIrqLock.ReadUnlock();
+    if (handler)
+        handler(uctx);
     Kernel::Lapic::EOI();
 }
 
@@ -526,6 +646,7 @@ unsigned long kernel_interrupt_register_level(
     if (!handler || !out_vector)
         return 0;
 
+    ulong flags = RustIrqLock.WriteLockIrqSave();
     for (ulong i = 0; i < RustIrqSlotCount; i++)
     {
         if (!RustIrqSlots[i].Used)
@@ -541,9 +662,11 @@ unsigned long kernel_interrupt_register_level(
             Kernel::Interrupt::RegisterLevel(RustLegacyHandlers[i], irq_line, vector);
 
             *out_vector = RustIrqSlots[i].Vector;
+            RustIrqLock.WriteUnlockIrqRestore(flags);
             return i + 1;
         }
     }
+    RustIrqLock.WriteUnlockIrqRestore(flags);
 
     Trace(0, "kernel_interrupt_register_level: no free slots");
     return 0;
@@ -554,10 +677,471 @@ void kernel_interrupt_unregister(unsigned long handle)
     if (handle == 0 || handle > RustIrqSlotCount)
         return;
     ulong i = handle - 1;
+    ulong flags = RustIrqLock.WriteLockIrqSave();
     RustIrqSlots[i].Handler = nullptr;
     RustIrqSlots[i].Ctx = nullptr;
     RustIrqSlots[i].Used = false;
     RustIrqSlots[i].Vector = 0;
+    RustIrqLock.WriteUnlockIrqRestore(flags);
+}
+
+} /* extern "C" */
+
+/* ---- Periodic timers ---- */
+
+static const ulong RustTimerSlotCount = 8;
+
+struct RustTimerSlot
+{
+    void (*Handler)(void*);
+    void* Ctx;
+    bool Active;
+};
+
+static RustTimerSlot RustTimerSlots[RustTimerSlotCount];
+static Kernel::RawRwSpinLock RustTimerLock;
+
+class RustTimerAdapter : public Kernel::TimerCallback
+{
+public:
+    ulong SlotIndex;
+
+    void OnTick(Kernel::TimerCallback& callback) override
+    {
+        (void)callback;
+        RustTimerLock.ReadLock();
+        auto handler = RustTimerSlots[SlotIndex].Handler;
+        auto ctx = RustTimerSlots[SlotIndex].Ctx;
+        RustTimerLock.ReadUnlock();
+        if (handler)
+            handler(ctx);
+    }
+};
+
+static RustTimerAdapter RustTimerAdapters[RustTimerSlotCount];
+
+extern "C" {
+
+unsigned long kernel_timer_start(
+    void (*handler)(void*), void* ctx,
+    unsigned long long period_ns)
+{
+    if (!handler || period_ns == 0)
+        return 0;
+
+    ulong flags = RustTimerLock.WriteLockIrqSave();
+    for (ulong i = 0; i < RustTimerSlotCount; i++)
+    {
+        if (!RustTimerSlots[i].Active)
+        {
+            RustTimerSlots[i].Handler = handler;
+            RustTimerSlots[i].Ctx = ctx;
+            RustTimerSlots[i].Active = true;
+
+            RustTimerAdapters[i].SlotIndex = i;
+
+            Stdlib::Time period(period_ns);
+            if (!Kernel::TimerTable::GetInstance().StartTimer(
+                    RustTimerAdapters[i], period))
+            {
+                RustTimerSlots[i].Active = false;
+                RustTimerSlots[i].Handler = nullptr;
+                RustTimerSlots[i].Ctx = nullptr;
+                RustTimerLock.WriteUnlockIrqRestore(flags);
+                return 0;
+            }
+            RustTimerLock.WriteUnlockIrqRestore(flags);
+            return i + 1;
+        }
+    }
+    RustTimerLock.WriteUnlockIrqRestore(flags);
+    return 0;
+}
+
+void kernel_timer_stop(unsigned long handle)
+{
+    if (handle == 0 || handle > RustTimerSlotCount)
+        return;
+    ulong i = handle - 1;
+    ulong flags = RustTimerLock.WriteLockIrqSave();
+    Kernel::TimerTable::GetInstance().StopTimer(RustTimerAdapters[i]);
+    RustTimerSlots[i].Handler = nullptr;
+    RustTimerSlots[i].Ctx = nullptr;
+    RustTimerSlots[i].Active = false;
+    RustTimerLock.WriteUnlockIrqRestore(flags);
+}
+
+} /* extern "C" */
+
+/* ---- MSI-X callback slots ---- */
+
+static const ulong RustMsixSlotCount = 16;
+
+struct RustMsixSlot
+{
+    void (*Handler)(void*);
+    void* Ctx;
+    bool Used;
+};
+
+static RustMsixSlot RustMsixSlots[RustMsixSlotCount];
+static Kernel::RawRwSpinLock RustMsixLock;
+
+static Kernel::InterruptHandlerFn RustMsixStubTable[RustMsixSlotCount] = {
+    RustMsixStub0,
+    RustMsixStub1,
+    RustMsixStub2,
+    RustMsixStub3,
+    RustMsixStub4,
+    RustMsixStub5,
+    RustMsixStub6,
+    RustMsixStub7,
+    RustMsixStub8,
+    RustMsixStub9,
+    RustMsixStub10,
+    RustMsixStub11,
+    RustMsixStub12,
+    RustMsixStub13,
+    RustMsixStub14,
+    RustMsixStub15,
+};
+
+class RustMsixSlotHandler : public Kernel::InterruptHandler
+{
+public:
+    ulong SlotIndex;
+
+    void OnInterruptRegister(u8 irq, u8 vector) override
+    {
+        (void)irq;
+        (void)vector;
+    }
+
+    Kernel::InterruptHandlerFn GetHandlerFn() override
+    {
+        return RustMsixStubTable[SlotIndex];
+    }
+};
+
+static RustMsixSlotHandler RustMsixSlotHandlers[RustMsixSlotCount];
+
+extern "C" {
+
+void RustMsixDispatch(Kernel::Context* ctx, int slot)
+{
+    (void)ctx;
+    if (slot < 0 || (ulong)slot >= RustMsixSlotCount)
+    {
+        Kernel::Lapic::EOI();
+        return;
+    }
+    RustMsixLock.ReadLock();
+    auto handler = RustMsixSlots[slot].Handler;
+    auto uctx = RustMsixSlots[slot].Ctx;
+    RustMsixLock.ReadUnlock();
+    if (handler)
+        handler(uctx);
+    Kernel::Lapic::EOI();
+}
+
+unsigned long kernel_msix_register_handler(
+    unsigned long msix_handle, unsigned short msix_index,
+    void (*handler)(void*), void* ctx,
+    unsigned char* out_vector)
+{
+    if (!handler || !out_vector || msix_handle == 0)
+        return 0;
+
+    ulong flags = RustMsixLock.WriteLockIrqSave();
+    for (ulong i = 0; i < RustMsixSlotCount; i++)
+    {
+        if (!RustMsixSlots[i].Used)
+        {
+            RustMsixSlots[i].Handler = handler;
+            RustMsixSlots[i].Ctx = ctx;
+            RustMsixSlots[i].Used = true;
+
+            RustMsixSlotHandlers[i].SlotIndex = i;
+
+            auto* t = reinterpret_cast<Kernel::MsixTable*>(msix_handle);
+            u8 vector = t->EnableVector(msix_index, RustMsixSlotHandlers[i]);
+            if (vector == 0)
+            {
+                RustMsixSlots[i].Handler = nullptr;
+                RustMsixSlots[i].Ctx = nullptr;
+                RustMsixSlots[i].Used = false;
+                RustMsixLock.WriteUnlockIrqRestore(flags);
+                return 0;
+            }
+            *out_vector = vector;
+            RustMsixLock.WriteUnlockIrqRestore(flags);
+            return i + 1;
+        }
+    }
+    RustMsixLock.WriteUnlockIrqRestore(flags);
+    Trace(0, "kernel_msix_register_handler: no free slots");
+    return 0;
+}
+
+void kernel_msix_unregister_handler(unsigned long handle)
+{
+    if (handle == 0 || handle > RustMsixSlotCount)
+        return;
+    ulong i = handle - 1;
+    ulong flags = RustMsixLock.WriteLockIrqSave();
+    RustMsixSlots[i].Handler = nullptr;
+    RustMsixSlots[i].Ctx = nullptr;
+    RustMsixSlots[i].Used = false;
+    RustMsixLock.WriteUnlockIrqRestore(flags);
+}
+
+} /* extern "C" */
+
+/* ---- Block device bridge ---- */
+
+struct RustBlockDeviceOps
+{
+    const char* Name;
+    unsigned long long Capacity;
+    unsigned long long SectorSize;
+    int (*ReadSectors)(void* ctx, unsigned long long sector,
+                       void* buf, unsigned int count);
+    int (*WriteSectors)(void* ctx, unsigned long long sector,
+                        const void* buf, unsigned int count, int fua);
+    int (*Flush)(void* ctx);    /* may be nullptr */
+    void* Ctx;
+};
+
+class RustBlockDevice : public Kernel::BlockDevice
+{
+public:
+    RustBlockDeviceOps Ops;
+
+    const char* GetName() override { return Ops.Name; }
+    u64 GetCapacity() override { return (u64)Ops.Capacity; }
+    u64 GetSectorSize() override { return (u64)Ops.SectorSize; }
+
+    bool ReadSectors(u64 sector, void* buf, u32 count) override
+    {
+        return Ops.ReadSectors(Ops.Ctx, (unsigned long long)sector, buf,
+                               (unsigned int)count) != 0;
+    }
+
+    bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua) override
+    {
+        return Ops.WriteSectors(Ops.Ctx, (unsigned long long)sector, buf,
+                                (unsigned int)count, fua ? 1 : 0) != 0;
+    }
+
+    bool Flush() override
+    {
+        if (!Ops.Flush)
+            return true;
+        return Ops.Flush(Ops.Ctx) != 0;
+    }
+};
+
+static const ulong RustBlockDevSlotCount = 8;
+static RustBlockDevice RustBlockDevSlots[RustBlockDevSlotCount];
+static bool RustBlockDevUsed[RustBlockDevSlotCount];
+
+extern "C" {
+
+unsigned long kernel_blockdev_register(const RustBlockDeviceOps* ops)
+{
+    if (!ops || !ops->Name || !ops->ReadSectors || !ops->WriteSectors)
+        return 0;
+    for (ulong i = 0; i < RustBlockDevSlotCount; i++)
+    {
+        if (!RustBlockDevUsed[i])
+        {
+            RustBlockDevSlots[i].Ops = *ops;
+            RustBlockDevUsed[i] = true;
+            if (!Kernel::BlockDeviceTable::GetInstance().Register(
+                    &RustBlockDevSlots[i]))
+            {
+                RustBlockDevUsed[i] = false;
+                return 0;
+            }
+            return i + 1;
+        }
+    }
+    Trace(0, "kernel_blockdev_register: no free slots");
+    return 0;
+}
+
+} /* extern "C" */
+
+/* ---- Net device bridge ---- */
+
+struct RustNetDeviceOps
+{
+    const char* Name;
+    unsigned char Mac[6];
+    void (*FlushTx)(void* ctx);
+    void (*ProcessRx)(void* ctx);
+    void* Ctx;
+};
+
+class RustNetDevice : public Kernel::NetDevice
+{
+public:
+    RustNetDeviceOps Ops;
+    u64 TxPackets;
+    u64 RxPackets;
+    u64 RxDropped;
+
+    const char* GetName() override { return Ops.Name; }
+    u64 GetTxPackets() override { return TxPackets; }
+    u64 GetRxPackets() override { return RxPackets; }
+    u64 GetRxDropped() override { return RxDropped; }
+
+    /* Called while TxQueueLock is held by base SubmitTx. */
+    void FlushTx() override
+    {
+        Ops.FlushTx(Ops.Ctx);
+    }
+
+    void ProcessRx() override
+    {
+        Ops.ProcessRx(Ops.Ctx);
+    }
+
+    /* Dequeue one TX frame without acquiring TxQueueLock (lock already held). */
+    Kernel::NetFrame* TxDequeue()
+    {
+        if (TxQueue.IsEmpty())
+            return nullptr;
+        Stdlib::ListEntry* entry = TxQueue.RemoveHead();
+        TxCount--;
+        TxPackets++;
+        return CONTAINING_RECORD(entry, Kernel::NetFrame, Link);
+    }
+};
+
+static const ulong RustNetDevSlotCount = 4;
+static RustNetDevice RustNetDevSlots[RustNetDevSlotCount];
+static bool RustNetDevUsed[RustNetDevSlotCount];
+
+extern "C" {
+
+unsigned long kernel_netdev_register(const RustNetDeviceOps* ops)
+{
+    if (!ops || !ops->Name || !ops->FlushTx || !ops->ProcessRx)
+        return 0;
+    for (ulong i = 0; i < RustNetDevSlotCount; i++)
+    {
+        if (!RustNetDevUsed[i])
+        {
+            RustNetDevSlots[i].Ops = *ops;
+            RustNetDevSlots[i].TxPackets = 0;
+            RustNetDevSlots[i].RxPackets = 0;
+            RustNetDevSlots[i].RxDropped = 0;
+            Kernel::Net::MacAddress mac;
+            Stdlib::MemCpy(mac.Bytes, ops->Mac, 6);
+            RustNetDevSlots[i].SetMac(mac);
+            RustNetDevUsed[i] = true;
+            if (!Kernel::NetDeviceTable::GetInstance().Register(
+                    &RustNetDevSlots[i]))
+            {
+                RustNetDevUsed[i] = false;
+                return 0;
+            }
+            return i + 1;
+        }
+    }
+    Trace(0, "kernel_netdev_register: no free slots");
+    return 0;
+}
+
+void kernel_netdev_set_ip(unsigned long handle, unsigned int ip)
+{
+    if (handle == 0 || handle > RustNetDevSlotCount) return;
+    RustNetDevSlots[handle - 1].SetIp(Kernel::Net::IpAddress(ip));
+}
+
+void kernel_netdev_set_mask(unsigned long handle, unsigned int mask)
+{
+    if (handle == 0 || handle > RustNetDevSlotCount) return;
+    RustNetDevSlots[handle - 1].SetSubnetMask(Kernel::Net::IpAddress(mask));
+}
+
+void kernel_netdev_set_gw(unsigned long handle, unsigned int gw)
+{
+    if (handle == 0 || handle > RustNetDevSlotCount) return;
+    RustNetDevSlots[handle - 1].SetGateway(Kernel::Net::IpAddress(gw));
+}
+
+/* Called from inside Rust FlushTx callback. TxQueueLock is already held. */
+unsigned long kernel_netdev_tx_dequeue(unsigned long handle)
+{
+    if (handle == 0 || handle > RustNetDevSlotCount)
+        return 0;
+    Kernel::NetFrame* frame = RustNetDevSlots[handle - 1].TxDequeue();
+    return (unsigned long)frame;
+}
+
+void kernel_netdev_tx_notify(unsigned long handle)
+{
+    (void)handle;
+    /* No explicit notification needed -- FlushTx returns to SubmitTx which
+       raises SoftIrq if needed; placeholder for hardware doorbell use. */
+}
+
+unsigned long kernel_netframe_alloc_rx(unsigned long data_len)
+{
+    Kernel::NetFrame* frame = Kernel::NetFrame::AllocTx((ulong)data_len);
+    if (!frame)
+        return 0;
+    frame->Direction = Kernel::NetFrame::Rx;
+    return (unsigned long)frame;
+}
+
+void kernel_netdev_enqueue_rx(unsigned long dev_handle, unsigned long frame_handle)
+{
+    if (dev_handle == 0 || dev_handle > RustNetDevSlotCount || frame_handle == 0)
+        return;
+    auto& dev = RustNetDevSlots[dev_handle - 1];
+    auto* frame = reinterpret_cast<Kernel::NetFrame*>(frame_handle);
+    if (!dev.EnqueueRx(frame))
+    {
+        dev.RxDropped++;
+        frame->Put();
+    }
+    else
+    {
+        dev.RxPackets++;
+    }
+}
+
+unsigned char* kernel_netframe_data(unsigned long handle)
+{
+    if (!handle) return nullptr;
+    return reinterpret_cast<Kernel::NetFrame*>(handle)->Data;
+}
+
+unsigned long kernel_netframe_data_phys(unsigned long handle)
+{
+    if (!handle) return 0;
+    return reinterpret_cast<Kernel::NetFrame*>(handle)->DataPhys;
+}
+
+unsigned long kernel_netframe_len(unsigned long handle)
+{
+    if (!handle) return 0;
+    return reinterpret_cast<Kernel::NetFrame*>(handle)->Length;
+}
+
+void kernel_netframe_set_len(unsigned long handle, unsigned long len)
+{
+    if (!handle) return;
+    reinterpret_cast<Kernel::NetFrame*>(handle)->Length = len;
+}
+
+void kernel_netframe_put(unsigned long handle)
+{
+    if (!handle) return;
+    reinterpret_cast<Kernel::NetFrame*>(handle)->Put();
 }
 
 } /* extern "C" */

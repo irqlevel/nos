@@ -76,6 +76,26 @@ impl MmioRegion {
         Self { base, size }
     }
 
+    pub fn read8(&self, offset: usize) -> u8 {
+        assert!(offset < self.size);
+        unsafe { self.base.add(offset).read_volatile() }
+    }
+
+    pub fn write8(&self, offset: usize, val: u8) {
+        assert!(offset < self.size);
+        unsafe { self.base.add(offset).write_volatile(val) }
+    }
+
+    pub fn read16(&self, offset: usize) -> u16 {
+        assert!(offset % 2 == 0 && offset + 2 <= self.size);
+        unsafe { (self.base.add(offset) as *const u16).read_volatile() }
+    }
+
+    pub fn write16(&self, offset: usize, val: u16) {
+        assert!(offset % 2 == 0 && offset + 2 <= self.size);
+        unsafe { (self.base.add(offset) as *mut u16).write_volatile(val) }
+    }
+
     pub fn read32(&self, offset: usize) -> u32 {
         assert!(offset % 4 == 0 && offset + 4 <= self.size);
         unsafe { (self.base.add(offset) as *const u32).read_volatile() }

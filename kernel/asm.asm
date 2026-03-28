@@ -108,6 +108,22 @@ global RustInterruptStub4
 global RustInterruptStub5
 global RustInterruptStub6
 global RustInterruptStub7
+global RustMsixStub0
+global RustMsixStub1
+global RustMsixStub2
+global RustMsixStub3
+global RustMsixStub4
+global RustMsixStub5
+global RustMsixStub6
+global RustMsixStub7
+global RustMsixStub8
+global RustMsixStub9
+global RustMsixStub10
+global RustMsixStub11
+global RustMsixStub12
+global RustMsixStub13
+global RustMsixStub14
+global RustMsixStub15
 
 global ExcDivideByZeroStub
 global ExcDebuggerStub
@@ -543,6 +559,34 @@ RustInterruptSlot 4
 RustInterruptSlot 5
 RustInterruptSlot 6
 RustInterruptSlot 7
+
+%macro RustMsixSlot 1
+RustMsixStub%1:
+	PushAll
+	mov rdi, rsp
+	mov esi, %1
+	cld
+	call RustMsixDispatch
+	PopAll
+	iretq
+%endmacro
+
+RustMsixSlot 0
+RustMsixSlot 1
+RustMsixSlot 2
+RustMsixSlot 3
+RustMsixSlot 4
+RustMsixSlot 5
+RustMsixSlot 6
+RustMsixSlot 7
+RustMsixSlot 8
+RustMsixSlot 9
+RustMsixSlot 10
+RustMsixSlot 11
+RustMsixSlot 12
+RustMsixSlot 13
+RustMsixSlot 14
+RustMsixSlot 15
 
 ExceptionStub ExcDivideByZero
 ExceptionStub ExcDebugger

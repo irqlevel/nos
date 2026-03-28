@@ -61,6 +61,13 @@ impl PciDevice {
         unsafe { pci::kernel_pci_get_bar(self.bus, self.slot, self.func, bar) }
     }
 
+    /* Read a 64-bit memory BAR.  `bar` must be even; `bar+1` holds the high 32 bits. */
+    pub fn get_bar64(&self, bar: u8) -> u64 {
+        let low = self.get_bar(bar) as u64;
+        let high = self.get_bar(bar + 1) as u64;
+        (high << 32) | (low & !0xF)
+    }
+
     pub fn enable_bus_mastering(&self) {
         unsafe { pci::kernel_pci_enable_bus_mastering(self.bus, self.slot, self.func) }
     }

@@ -30,19 +30,15 @@ void RawSpinLock::Unlock()
 
 ulong RawSpinLock::LockIrqSave()
 {
-    PreemptDisable();
-    ulong flags = GetRflags();
-    InterruptDisable();
+    ulong flags = PreemptIrqSave();
     Lock();
-
     return flags;
 }
 
 void RawSpinLock::UnlockIrqRestore(ulong flags)
 {
     Unlock();
-    SetRflags(flags);
-    PreemptEnable();
+    PreemptIrqRestore(flags);
 }
 
 }
