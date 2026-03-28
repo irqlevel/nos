@@ -8,4 +8,5 @@ crate-type = ["staticlib"]
 
 [dependencies]
 ffi = { path = "../ffi" }
+kcore = { path = "../kcore" }
 hello = { path = "../hello" }

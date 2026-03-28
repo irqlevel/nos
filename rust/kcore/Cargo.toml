@@ -1,0 +1,9 @@
+[package]
+name = "kcore"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+ffi = { path = "../ffi" }
