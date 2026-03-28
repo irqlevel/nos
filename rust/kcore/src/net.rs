@@ -49,6 +49,15 @@ impl NetDeviceHandle {
 
     /// Dequeue one pending TX frame. Call this from inside `flush_tx` callback.
     /// Returns `None` when the TX queue is empty.
+    ///
+    /// # Lifetime contract
+    ///
+    /// The returned `NetFrame` wraps a reference-counted DMA buffer. You must
+    /// keep the `NetFrame` alive (i.e. stored in a TX slot) until the hardware
+    /// signals completion of the DMA transfer. Dropping the frame early (while
+    /// the hardware is still reading from `data_phys()`) is a use-after-free.
+    /// Only drop (or explicitly `put`) the frame after the hardware completion
+    /// interrupt fires and you have confirmed the descriptor is done.
     pub fn tx_dequeue(&self) -> Option<NetFrame> {
         let h = unsafe { net::kernel_netdev_tx_dequeue(self.handle) };
         if h == 0 { None } else { Some(NetFrame { handle: h }) }
@@ -77,23 +86,41 @@ pub struct NetFrame {
 
 impl NetFrame {
     /// Allocate a new RX frame with `data_len` bytes of DMA-backed buffer.
-    /// Direction is set to Rx. Returns `None` on allocation failure.
+    /// Direction is set to Rx. `Length` is initialised to 0; call `set_len`
+    /// after the hardware fills the buffer.
+    /// Returns `None` on allocation failure.
     pub fn alloc_rx(data_len: usize) -> Option<Self> {
         let h = unsafe { net::kernel_netframe_alloc_rx(data_len) };
         if h == 0 { None } else { Some(Self { handle: h }) }
     }
 
-    /// Virtual address of the frame data buffer.
+    /// Slice of the received/transmitted data (length = `self.len()`).
+    ///
+    /// Note: for a freshly allocated RX frame `len()` is 0 until `set_len` is
+    /// called. Use `data_raw_mut(capacity)` to access the full buffer before
+    /// the length is known (e.g. for memcpy-based drivers).
     pub fn data(&self) -> &[u8] {
         let ptr = unsafe { net::kernel_netframe_data(self.handle) };
         let len = unsafe { net::kernel_netframe_len(self.handle) };
         unsafe { core::slice::from_raw_parts(ptr, len) }
     }
 
+    /// Mutable slice of the received/transmitted data (length = `self.len()`).
+    /// See `data()` for the note on freshly allocated RX frames.
     pub fn data_mut(&mut self) -> &mut [u8] {
         let ptr = unsafe { net::kernel_netframe_data(self.handle) };
         let len = unsafe { net::kernel_netframe_len(self.handle) };
         unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+    }
+
+    /// Mutable slice of the full allocated buffer up to `capacity` bytes.
+    ///
+    /// Use this when you need to write into a freshly allocated RX frame
+    /// before calling `set_len`. `capacity` must not exceed the value passed
+    /// to `alloc_rx`; the caller is responsible for not exceeding it.
+    pub fn data_raw_mut(&mut self, capacity: usize) -> &mut [u8] {
+        let ptr = unsafe { net::kernel_netframe_data(self.handle) };
+        unsafe { core::slice::from_raw_parts_mut(ptr, capacity) }
     }
 
     /// Physical address of the data buffer (for DMA descriptor programming).
@@ -101,6 +128,7 @@ impl NetFrame {
         unsafe { net::kernel_netframe_data_phys(self.handle) }
     }
 
+    /// Current valid data length (0 for a freshly allocated RX frame).
     pub fn len(&self) -> usize {
         unsafe { net::kernel_netframe_len(self.handle) }
     }

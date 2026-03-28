@@ -1,0 +1,111 @@
+---
+description: Rust driver and kcore conventions for the NOS kernel
+globs: rust/**/*.rs
+alwaysApply: false
+---
+
+# Rust in NOS Kernel
+
+## Crate layout
+
+```
+rust/ffi/       — raw extern "C" bindings (unsafe, no logic)
+rust/kcore/     — safe wrappers used by drivers (alloc available, no std)
+rust/hello/     — example / self-test crate
+```
+
+Add a new kernel service in three steps:
+1. C++ FFI function in `kernel/rust_ffi.cpp`
+2. Raw declaration in `rust/ffi/src/<module>.rs` + `pub mod` in `ffi/src/lib.rs`
+3. Safe wrapper in `rust/kcore/src/<module>.rs` + `pub mod` in `kcore/src/lib.rs`
+
+## FFI layer (`rust/ffi`)
+
+- Only `extern "C"` declarations and `#[repr(C)]` structs — no logic.
+- All pointers are raw (`*mut u8`, `*const u8`). No references cross the FFI boundary.
+- Opaque kernel objects are passed as `usize` handles (0 = null/error).
+
+## kcore layer (`rust/kcore`)
+
+- Every kernel object that needs cleanup implements `Drop` calling the matching `kernel_*_destroy` / `kernel_*_stop` / `kernel_*_put` FFI.
+- RAII handles that must not be `Send` / `Sync` carry `PhantomData<*const ()>`.
+- Use `core::mem::forget(x)` when transferring ownership to C++ (e.g. `enqueue_rx`).
+
+## Available modules (kcore)
+
+| Module | Purpose |
+|---|---|
+| `consts` | `PAGE_SIZE`, `SECTOR_SIZE`, `KB`/`MB`/`GB`, `NS_PER_SEC`/`MS`/`US` |
+| `trace` | `trace!(level, "fmt {}", arg)` macro — level 0 always visible |
+| `time` | `Duration`, `boot_time()`, `wall_clock_secs()` |
+| `random` | `fill_random(&mut [u8])`, `random_u64()` |
+| `pci` | Device scan, config r/w, BAR access (`get_bar`, `get_bar64`) |
+| `dma` | `DmaBuffer` (contiguous DMA alloc), `PhysMapping`, `virt_to_phys` |
+| `io` | `MmioRegion` (8/16/32/64-bit), `Port<T>`, `read_msr`/`write_msr` |
+| `msix` | `MsixTable`, `MsixInterrupt` (Rust callback, 16 slots) |
+| `interrupt` | `LegacyInterrupt` (INTx, 8 slots) |
+| `sync` | `Mutex`, `SpinLock` (RAII guards), `WaitGroup` |
+| `task` | `spawn`, `spawn_on`, `spawn_with_ctx`, `TaskHandle`, `sleep` |
+| `softirq` | `raise`, `register` (types: `TYPE_NET_RX`, `TYPE_BLK_IO`, etc.) |
+| `timer` | `Timer` (periodic, 8 slots, fires on CPU 0 via IPI) |
+| `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI) |
+| `block` | `register` → `BlockDeviceRegistration` |
+| `net` | `register` → `NetDeviceHandle`, `NetFrame` |
+
+## Interrupt handlers
+
+- **MSI-X with Rust callback**: use `MsixInterrupt::register(table, index, handler, ctx)` — no assembly needed, 16 slots shared across all Rust drivers.
+- **Legacy INTx**: use `LegacyInterrupt::register_level(dev, handler, ctx)`, 8 slots.
+- Handler signature: `extern "C" fn handler(ctx: *mut u8)` — called from IRQ context, no sleeping, no allocation.
+
+## Block driver registration
+
+```rust
+extern "C" fn my_read(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32) -> i32 { ... }
+extern "C" fn my_write(ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32) -> i32 { ... }
+
+let reg = kcore::block::register(&kcore::block::BlockDeviceOps {
+    name: b"nvme0\0".as_ptr(),
+    capacity: total_sectors,
+    sector_size: 512,
+    read_sectors: my_read,
+    write_sectors: my_write,
+    flush: None,
+    ctx: driver_ptr,
+}).unwrap();
+// reg lives forever (boot-lifetime); no unregister
+```
+
+## Net driver registration
+
+```rust
+extern "C" fn flush_tx(ctx: *mut u8) {
+    let dev = unsafe { &*(ctx as *const MyNic) };
+    while let Some(frame) = dev.net_handle.tx_dequeue() {
+        // submit frame.data_phys() to HW ring
+        // store `frame` in a TX slot -- MUST keep alive until HW completion
+        dev.tx_slots[slot] = Some(frame);
+    }
+}
+extern "C" fn process_rx(ctx: *mut u8) { /* dequeue from RxQueue, process */ }
+
+let handle = kcore::net::register(&kcore::net::NetDeviceOps {
+    name: b"eth0\0".as_ptr(),
+    mac: [0x52,0x54,0x00,0x01,0x02,0x03],
+    flush_tx,
+    process_rx,
+    ctx: driver_ptr,
+}).unwrap();
+handle.set_ip(0xC0A80001); // 192.168.0.1 host order
+```
+
+**TX frame lifetime**: a `NetFrame` from `tx_dequeue()` wraps the DMA buffer. Keep it alive until the HW completion interrupt fires. Dropping it early is a use-after-free.
+
+**RX frame**: `NetFrame::alloc_rx(max_size)` gives a frame with `len() == 0`. Use `data_phys()` for the HW ring entry. After HW fills the buffer, call `set_len(received)` then `handle.enqueue_rx(frame)`.
+
+## C++ FFI conventions (`kernel/rust_ffi.cpp`)
+
+- Register/create functions: heap-allocate adapters with `Mm::TAlloc<T, RustAllocTag>()` — never use static arrays of non-trivial C++ objects (static constructors are unreliable in freestanding).
+- Slot pools for IRQ/timer/MSI-X callbacks: protect with `RawRwSpinLock` — read-lock in handlers, write-lock+IRQ-save for registration/deregistration.
+- Block/net device adapters: no slot lock needed — registration is boot-time only, no unregister.
+- Handles are raw pointers cast to `unsigned long`; 0 = failure.
