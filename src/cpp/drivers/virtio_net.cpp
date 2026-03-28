@@ -718,13 +718,14 @@ void VirtioNet::Interrupt(Context* ctx)
 
     InterruptStats::Inc(IrqVirtioNet);
 
-    /* Complete TX and try to drain pending frames under TxQueueLock */
-    ulong flags = TxQueueLock.LockIrqSave();
-    CompleteTx();
-    FlushTx();
-    TxQueueLock.UnlockIrqRestore(flags);
-
-    /* Defer RX processing to the soft IRQ task */
+    /* Defer TX completion + flush and RX processing to soft IRQ.
+     * CompleteTx() calls frame->Put() which may call Mm::Free(),
+     * and Mm::Free() can trigger a TLB shootdown IPI.  If another
+     * CPU has IRQs disabled (e.g. holding a spinlock), the IPI
+     * cannot be acknowledged, causing a deadlock.  By deferring to
+     * the soft IRQ task (which runs with IRQs enabled), the free
+     * is safe. */
+    SoftIrq::GetInstance().Raise(SoftIrq::TypeNetTx);
     SoftIrq::GetInstance().Raise(SoftIrq::TypeNetRx);
 }
 

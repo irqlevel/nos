@@ -111,6 +111,10 @@ impl WaitGroup {
     pub fn wait(&self) {
         unsafe { sync::kernel_waitgroup_wait(self.handle) }
     }
+
+    pub fn raw_handle(&self) -> usize {
+        self.handle
+    }
 }
 
 impl Drop for WaitGroup {

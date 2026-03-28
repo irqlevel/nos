@@ -27,4 +27,12 @@ dependencies = [
  "ffi",
  "hello",
  "kcore",
+ "nvme",
+]
+
+[[package]]
+name = "nvme"
+version = "0.1.0"
+dependencies = [
+ "kcore",
 ]
