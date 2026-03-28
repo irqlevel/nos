@@ -22,6 +22,7 @@ CXX_SRC =   \
     drivers/ioapic.cpp  \
     drivers/vga.cpp \
     drivers/pci.cpp \
+    drivers/msix.cpp \
     drivers/virtqueue.cpp \
     drivers/virtio_pci.cpp \
     drivers/virtio_blk.cpp \

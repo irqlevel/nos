@@ -22,3 +22,8 @@ fn alloc_error(_layout: core::alloc::Layout) -> ! {
 pub extern "C" fn rust_init() {
     hello::hello();
 }
+
+#[no_mangle]
+pub extern "C" fn rust_test() {
+    hello::test();
+}

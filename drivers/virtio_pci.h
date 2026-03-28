@@ -2,6 +2,7 @@
 
 #include <include/types.h>
 #include <drivers/pci.h>
+#include <drivers/msix.h>
 
 namespace Kernel
 {
@@ -49,6 +50,11 @@ public:
     /* True if legacy (transitional) transport is in use */
     bool IsLegacy() const { return Legacy; }
 
+    /* MSI-X (modern only); Setup runs during Probe. */
+    bool IsMsixEnabled() const { return Msix.IsReady(); }
+    u8 EnableMsixVector(u16 index, InterruptHandler& handler);
+    bool UsingMsix() const { return MsixActive; }
+
     /* Virtio PCI capability cfg_type values */
     static const u8 CapCommonCfg  = 1;
     static const u8 CapNotifyCfg  = 2;
@@ -95,6 +101,11 @@ private:
     /* Cached mapped BAR virtual addresses */
     static const ulong MaxBars = 6;
     ulong MappedBars[MaxBars];
+
+    Pci::DeviceInfo* PciDev;
+    bool MsixActive;
+    u16 MsixEntry;
+    MsixTable Msix;
 
     /* Modern common config register offsets */
     static const ulong CfgDeviceFeatureSelect = 0x00;

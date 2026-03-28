@@ -331,6 +331,7 @@ void MountRootFs()
    All C++ objects with non-trivial destructors must go out of
    scope before those calls, so the body is wrapped in a block. */
 extern "C" void rust_init();
+extern "C" void rust_test();
 
 void BpStartup(void* ctx)
 {
@@ -446,6 +447,8 @@ void BpStartup(void* ctx)
             Panic("Multitasking test failed");
             return;
         }
+
+        rust_test();
 
         if (!SoftIrq::GetInstance().Init())
         {

@@ -121,6 +121,13 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     NetHdrSize = Transport.IsLegacy() ? sizeof(VirtioNetHdrLegacy) : sizeof(VirtioNetHdr);
     Trace(0, "VirtioNet %s: net hdr size %u", name, NetHdrSize);
 
+    if (!Transport.IsLegacy() && Transport.IsMsixEnabled())
+    {
+        u8 vec = Transport.EnableMsixVector(0, *this);
+        if (vec == 0)
+            Trace(0, "VirtioNet %s: MSI-X unavailable, using INTx", name);
+    }
+
     /* Setup RX virtqueue (queue 0) */
     Transport.SelectQueue(0);
     u16 rxQueueSize = Transport.GetQueueSize();
@@ -245,10 +252,12 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     /* Pre-post RX buffers */
     PostAllRxBufs();
 
-    /* Register IRQ handler */
-    u8 irq = pciDev->InterruptLine;
-    u8 vector = 0x30 + (u8)InstanceCount;
-    Interrupt::RegisterLevel(*this, irq, vector);
+    if (!Transport.UsingMsix())
+    {
+        u8 irq = pciDev->InterruptLine;
+        u8 vector = 0x30 + (u8)InstanceCount;
+        Interrupt::RegisterLevel(*this, irq, vector);
+    }
 
     /* Register as net device */
     NetDeviceTable::GetInstance().Register(this);
