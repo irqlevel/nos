@@ -941,33 +941,27 @@ public:
     }
 };
 
-static const ulong RustBlockDevSlotCount = 8;
-static RustBlockDevice RustBlockDevSlots[RustBlockDevSlotCount];
-static bool RustBlockDevUsed[RustBlockDevSlotCount];
-
 extern "C" {
 
 unsigned long kernel_blockdev_register(const RustBlockDeviceOps* ops)
 {
     if (!ops || !ops->Name || !ops->ReadSectors || !ops->WriteSectors)
         return 0;
-    for (ulong i = 0; i < RustBlockDevSlotCount; i++)
+
+    RustBlockDevice* dev = Kernel::Mm::TAlloc<RustBlockDevice, RustAllocTag>();
+    if (!dev)
+        return 0;
+
+    dev->Ops = *ops;
+
+    if (!Kernel::BlockDeviceTable::GetInstance().Register(dev))
     {
-        if (!RustBlockDevUsed[i])
-        {
-            RustBlockDevSlots[i].Ops = *ops;
-            RustBlockDevUsed[i] = true;
-            if (!Kernel::BlockDeviceTable::GetInstance().Register(
-                    &RustBlockDevSlots[i]))
-            {
-                RustBlockDevUsed[i] = false;
-                return 0;
-            }
-            return i + 1;
-        }
+        dev->~RustBlockDevice();
+        Kernel::Mm::Free(dev);
+        return 0;
     }
-    Trace(0, "kernel_blockdev_register: no free slots");
-    return 0;
+
+    return (unsigned long)dev;
 }
 
 } /* extern "C" */
@@ -1019,73 +1013,76 @@ public:
     }
 };
 
-static const ulong RustNetDevSlotCount = 4;
-static RustNetDevice RustNetDevSlots[RustNetDevSlotCount];
-static bool RustNetDevUsed[RustNetDevSlotCount];
-
 extern "C" {
 
 unsigned long kernel_netdev_register(const RustNetDeviceOps* ops)
 {
     if (!ops || !ops->Name || !ops->FlushTx || !ops->ProcessRx)
         return 0;
-    for (ulong i = 0; i < RustNetDevSlotCount; i++)
+
+    /* Heap-allocate so that NetDevice's constructor (which calls
+       ListEntry::Init on TxQueue/RxQueue) runs reliably -- static arrays
+       of non-trivial objects are forbidden in this freestanding kernel. */
+    RustNetDevice* dev = Kernel::Mm::TAlloc<RustNetDevice, RustAllocTag>();
+    if (!dev)
+        return 0;
+
+    dev->Ops = *ops;
+    dev->TxPackets = 0;
+    dev->RxPackets = 0;
+    dev->RxDropped = 0;
+
+    Kernel::Net::MacAddress mac;
+    Stdlib::MemCpy(mac.Bytes, ops->Mac, 6);
+    dev->SetMac(mac);
+
+    if (!Kernel::NetDeviceTable::GetInstance().Register(dev))
     {
-        if (!RustNetDevUsed[i])
-        {
-            RustNetDevSlots[i].Ops = *ops;
-            RustNetDevSlots[i].TxPackets = 0;
-            RustNetDevSlots[i].RxPackets = 0;
-            RustNetDevSlots[i].RxDropped = 0;
-            Kernel::Net::MacAddress mac;
-            Stdlib::MemCpy(mac.Bytes, ops->Mac, 6);
-            RustNetDevSlots[i].SetMac(mac);
-            RustNetDevUsed[i] = true;
-            if (!Kernel::NetDeviceTable::GetInstance().Register(
-                    &RustNetDevSlots[i]))
-            {
-                RustNetDevUsed[i] = false;
-                return 0;
-            }
-            return i + 1;
-        }
+        dev->~RustNetDevice();
+        Kernel::Mm::Free(dev);
+        return 0;
     }
-    Trace(0, "kernel_netdev_register: no free slots");
-    return 0;
+
+    return (unsigned long)dev;
+}
+
+static RustNetDevice* NetDevFromHandle(unsigned long handle)
+{
+    return reinterpret_cast<RustNetDevice*>(handle);
 }
 
 void kernel_netdev_set_ip(unsigned long handle, unsigned int ip)
 {
-    if (handle == 0 || handle > RustNetDevSlotCount) return;
-    RustNetDevSlots[handle - 1].SetIp(Kernel::Net::IpAddress(ip));
+    if (!handle) return;
+    NetDevFromHandle(handle)->SetIp(Kernel::Net::IpAddress(ip));
 }
 
 void kernel_netdev_set_mask(unsigned long handle, unsigned int mask)
 {
-    if (handle == 0 || handle > RustNetDevSlotCount) return;
-    RustNetDevSlots[handle - 1].SetSubnetMask(Kernel::Net::IpAddress(mask));
+    if (!handle) return;
+    NetDevFromHandle(handle)->SetSubnetMask(Kernel::Net::IpAddress(mask));
 }
 
 void kernel_netdev_set_gw(unsigned long handle, unsigned int gw)
 {
-    if (handle == 0 || handle > RustNetDevSlotCount) return;
-    RustNetDevSlots[handle - 1].SetGateway(Kernel::Net::IpAddress(gw));
+    if (!handle) return;
+    NetDevFromHandle(handle)->SetGateway(Kernel::Net::IpAddress(gw));
 }
 
 /* Called from inside Rust FlushTx callback. TxQueueLock is already held. */
 unsigned long kernel_netdev_tx_dequeue(unsigned long handle)
 {
-    if (handle == 0 || handle > RustNetDevSlotCount)
+    if (!handle)
         return 0;
-    Kernel::NetFrame* frame = RustNetDevSlots[handle - 1].TxDequeue();
+    Kernel::NetFrame* frame = NetDevFromHandle(handle)->TxDequeue();
     return (unsigned long)frame;
 }
 
 void kernel_netdev_tx_notify(unsigned long handle)
 {
     (void)handle;
-    /* No explicit notification needed -- FlushTx returns to SubmitTx which
-       raises SoftIrq if needed; placeholder for hardware doorbell use. */
+    /* Placeholder for hardware doorbell. FlushTx returns to SubmitTx
+       which raises SoftIrq for any retry if frames remain. */
 }
 
 unsigned long kernel_netframe_alloc_rx(unsigned long data_len)
@@ -1099,18 +1096,18 @@ unsigned long kernel_netframe_alloc_rx(unsigned long data_len)
 
 void kernel_netdev_enqueue_rx(unsigned long dev_handle, unsigned long frame_handle)
 {
-    if (dev_handle == 0 || dev_handle > RustNetDevSlotCount || frame_handle == 0)
+    if (!dev_handle || !frame_handle)
         return;
-    auto& dev = RustNetDevSlots[dev_handle - 1];
+    RustNetDevice* dev = NetDevFromHandle(dev_handle);
     auto* frame = reinterpret_cast<Kernel::NetFrame*>(frame_handle);
-    if (!dev.EnqueueRx(frame))
+    if (!dev->EnqueueRx(frame))
     {
-        dev.RxDropped++;
+        dev->RxDropped++;
         frame->Put();
     }
     else
     {
-        dev.RxPackets++;
+        dev->RxPackets++;
     }
 }
 
