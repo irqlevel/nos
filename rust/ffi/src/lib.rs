@@ -9,3 +9,7 @@ pub mod task;
 pub mod io;
 pub mod dma;
 pub mod random;
+pub mod pci;
+pub mod msix;
+pub mod interrupt;
+pub mod softirq;

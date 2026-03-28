@@ -11,6 +11,7 @@ extern VirtioBlkInterrupt
 extern VirtioNetInterrupt
 extern VirtioScsiInterrupt
 extern SharedInterrupt
+extern RustInterruptDispatch
 
 extern ExcDivideByZero
 extern ExcDebugger
@@ -99,6 +100,14 @@ global VirtioBlkInterruptStub
 global VirtioNetInterruptStub
 global VirtioScsiInterruptStub
 global SharedInterruptStub
+global RustInterruptStub0
+global RustInterruptStub1
+global RustInterruptStub2
+global RustInterruptStub3
+global RustInterruptStub4
+global RustInterruptStub5
+global RustInterruptStub6
+global RustInterruptStub7
 
 global ExcDivideByZeroStub
 global ExcDebuggerStub
@@ -514,6 +523,26 @@ InterruptStub VirtioBlk
 InterruptStub VirtioNet
 InterruptStub VirtioScsi
 InterruptStub Shared
+
+%macro RustInterruptSlot 1
+RustInterruptStub%1:
+	PushAll
+	mov rdi, rsp
+	mov esi, %1
+	cld
+	call RustInterruptDispatch
+	PopAll
+	iretq
+%endmacro
+
+RustInterruptSlot 0
+RustInterruptSlot 1
+RustInterruptSlot 2
+RustInterruptSlot 3
+RustInterruptSlot 4
+RustInterruptSlot 5
+RustInterruptSlot 6
+RustInterruptSlot 7
 
 ExceptionStub ExcDivideByZero
 ExceptionStub ExcDebugger

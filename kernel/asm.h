@@ -90,6 +90,15 @@ void SharedInterruptStub();
 
 void DummyInterruptStub();
 
+void RustInterruptStub0();
+void RustInterruptStub1();
+void RustInterruptStub2();
+void RustInterruptStub3();
+void RustInterruptStub4();
+void RustInterruptStub5();
+void RustInterruptStub6();
+void RustInterruptStub7();
+
 void ExcDivideByZeroStub();
 void ExcDebuggerStub();
 void ExcNMIStub();
