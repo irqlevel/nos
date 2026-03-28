@@ -4,6 +4,7 @@ section .text
 
 global asm_memset
 global asm_memcpy
+global asm_memmove
 global asm_memcmp
 global asm_strlen
 global asm_strcmp
@@ -41,6 +42,40 @@ asm_memcpy:
 	mov rcx, rdx
 	and rcx, 7
 	rep movsb
+	ret
+
+; void asm_memmove(void* dst, const void* src, size_t size)
+; rdi = dst, rsi = src, rdx = size
+; Forward copy uses qword+byte like memcpy.
+; Backward copy (overlapping dst > src) uses std + rep movsb.
+asm_memmove:
+	mov rcx, rdx
+	test rcx, rcx
+	jz .memmove_done
+	cmp rdi, rsi
+	je .memmove_done
+	jb .memmove_forward
+	; dst > src: check if regions overlap
+	lea rax, [rsi + rcx]
+	cmp rdi, rax
+	jae .memmove_forward
+	; Backward copy: point to last byte
+	lea rdi, [rdi + rcx - 1]
+	lea rsi, [rsi + rcx - 1]
+	std
+	rep movsb
+	cld
+	ret
+.memmove_forward:
+	; Same as asm_memcpy
+	mov rdx, rcx
+	shr rcx, 3
+	cld
+	rep movsq
+	mov rcx, rdx
+	and rcx, 7
+	rep movsb
+.memmove_done:
 	ret
 
 ; int asm_memcmp(const void* p1, const void* p2, size_t size)

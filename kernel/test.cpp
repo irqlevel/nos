@@ -1190,6 +1190,147 @@ Stdlib::Error TestMemCpy()
     return MakeSuccess();
 }
 
+Stdlib::Error TestMemMove()
+{
+    Trace(0, "TestMemMove: started");
+
+    /* Non-overlapping forward */
+    {
+        u8 src[128], dst[128];
+        for (ulong i = 0; i < sizeof(src); i++)
+            src[i] = (u8)(i & 0xFF);
+        Stdlib::MemSet(dst, 0, sizeof(dst));
+        Stdlib::MemMove(dst, src, sizeof(src));
+        for (ulong i = 0; i < sizeof(src); i++)
+        {
+            if (dst[i] != src[i])
+            {
+                Trace(0, "TestMemMove: non-overlap mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+    }
+
+    /* Overlapping forward: src before dst */
+    {
+        u8 buf[64];
+        for (ulong i = 0; i < sizeof(buf); i++)
+            buf[i] = (u8)(i & 0xFF);
+        Stdlib::MemMove(buf + 8, buf, 32);
+        for (ulong i = 0; i < 32; i++)
+        {
+            if (buf[8 + i] != (u8)(i & 0xFF))
+            {
+                Trace(0, "TestMemMove: overlap fwd mismatch at %u: 0x%p expected 0x%p",
+                    i, (ulong)buf[8 + i], (ulong)(u8)(i & 0xFF));
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+    }
+
+    /* Overlapping backward: dst before src */
+    {
+        u8 buf[64];
+        for (ulong i = 0; i < sizeof(buf); i++)
+            buf[i] = (u8)(i & 0xFF);
+        Stdlib::MemMove(buf, buf + 8, 32);
+        for (ulong i = 0; i < 32; i++)
+        {
+            if (buf[i] != (u8)((i + 8) & 0xFF))
+            {
+                Trace(0, "TestMemMove: overlap bwd mismatch at %u: 0x%p expected 0x%p",
+                    i, (ulong)buf[i], (ulong)(u8)((i + 8) & 0xFF));
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+    }
+
+    /* dst == src (no-op) */
+    {
+        u8 buf[32];
+        for (ulong i = 0; i < sizeof(buf); i++)
+            buf[i] = (u8)(i & 0xFF);
+        Stdlib::MemMove(buf, buf, sizeof(buf));
+        for (ulong i = 0; i < sizeof(buf); i++)
+        {
+            if (buf[i] != (u8)(i & 0xFF))
+            {
+                Trace(0, "TestMemMove: same ptr mismatch at %u", i);
+                return MakeError(Stdlib::Error::Unsuccessful);
+            }
+        }
+    }
+
+    /* Zero size */
+    {
+        u8 buf[16];
+        Stdlib::MemSet(buf, 0xAA, sizeof(buf));
+        Stdlib::MemMove(buf + 4, buf, 0);
+        if (buf[4] != 0xAA)
+        {
+            Trace(0, "TestMemMove: zero size modified data");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    /* Odd sizes (not multiple of 8) */
+    {
+        for (ulong sz = 1; sz <= 17; sz++)
+        {
+            u8 buf[64];
+            for (ulong i = 0; i < sizeof(buf); i++)
+                buf[i] = (u8)(i & 0xFF);
+            u8 expected[64];
+            for (ulong i = 0; i < sizeof(expected); i++)
+                expected[i] = (u8)(i & 0xFF);
+
+            Stdlib::MemMove(buf + 3, buf, sz);
+            for (ulong i = 0; i < sz; i++)
+            {
+                if (buf[3 + i] != expected[i])
+                {
+                    Trace(0, "TestMemMove: odd sz %u overlap fwd mismatch at %u", sz, i);
+                    return MakeError(Stdlib::Error::Unsuccessful);
+                }
+            }
+        }
+    }
+
+    /* Odd sizes backward overlap */
+    {
+        for (ulong sz = 1; sz <= 17; sz++)
+        {
+            u8 buf[64];
+            for (ulong i = 0; i < sizeof(buf); i++)
+                buf[i] = (u8)(i & 0xFF);
+
+            Stdlib::MemMove(buf, buf + 3, sz);
+            for (ulong i = 0; i < sz; i++)
+            {
+                if (buf[i] != (u8)((i + 3) & 0xFF))
+                {
+                    Trace(0, "TestMemMove: odd sz %u overlap bwd mismatch at %u", sz, i);
+                    return MakeError(Stdlib::Error::Unsuccessful);
+                }
+            }
+        }
+    }
+
+    /* Single byte */
+    {
+        u8 a = 0x42, b = 0;
+        Stdlib::MemMove(&b, &a, 1);
+        if (b != 0x42)
+        {
+            Trace(0, "TestMemMove: single byte failed");
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    Trace(0, "TestMemMove: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error TestMemCmp()
 {
     Trace(0, "TestMemCmp: started");
@@ -1776,6 +1917,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestMemCpy();
+    if (!err.Ok())
+        return err;
+
+    err = TestMemMove();
     if (!err.Ok())
         return err;
 

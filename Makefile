@@ -79,6 +79,7 @@ CXX_SRC =   \
     kernel/stack_trace.cpp \
     kernel/symtab.cpp \
     kernel/entropy.cpp \
+    kernel/rust_ffi.cpp \
     lib/stdlib.cpp  \
     lib/format.cpp \
     lib/bitmap.cpp \
@@ -102,7 +103,10 @@ ASM_SRC =    \
 OBJS = $(CXX_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
 DEPS = $(CXX_SRC:.cpp=.d)
 
-.PHONY: all check nocheck clean %.o
+RUST_TARGET = x86_64-unknown-none
+RUST_LIB = rust/target/$(RUST_TARGET)/release/libkernel.a
+
+.PHONY: all check nocheck clean %.o rust
 
 -include $(DEPS)
 
@@ -129,20 +133,24 @@ nos.iso: build/grub.cfg kernel64.elf
 %.o: %.cpp
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -c $< -o $@
 
-kernel64_pass1.elf: build/linker64.ld $(OBJS)
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS)
+rust $(RUST_LIB):
+	cd rust && cargo build --release
+
+kernel64_pass1.elf: build/linker64.ld $(OBJS) $(RUST_LIB)
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(RUST_LIB)
 
 kernel/symtab_data.cpp: kernel64_pass1.elf
 	@echo "Generating symbol table..."
 	@printf '#include "symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $@
-	@$(NM) -Cn $< | awk '/^[0-9a-fA-F]+ [Tt] / { name=$$3; sub(/\(.*/, "", name); printf "    { 0x%s, \"%s\" },\n", $$1, name }' >> $@
+	@$(NM) -Cn $< | awk '/^[0-9a-fA-F]+ [Tt] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $@
 	@printf '};\nconst size_t SymbolTable::SymbolCount = sizeof(Symbols)/sizeof(Symbols[0]);\n}\n' >> $@
 
 kernel/symtab_data.o: kernel/symtab_data.cpp kernel/symtab.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-kernel64.elf: build/linker64.ld $(OBJS) kernel/symtab_data.o
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) kernel/symtab_data.o
+kernel64.elf: build/linker64.ld $(OBJS) kernel/symtab_data.o $(RUST_LIB)
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) kernel/symtab_data.o $(RUST_LIB)
 
 clean:
 	rm -rf $(OBJS) $(DEPS) kernel/symtab_data.cpp kernel/symtab_data.o kernel64_pass1.elf *.elf *.bin *.iso iso
+	cd rust && cargo clean 2>/dev/null || true

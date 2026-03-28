@@ -4,6 +4,7 @@ extern "C"
 {
 void asm_memset(void* ptr, unsigned char c, size_t size);
 void asm_memcpy(void* dst, const void* src, size_t size);
+void asm_memmove(void* dst, const void* src, size_t size);
 int asm_memcmp(const void* p1, const void* p2, size_t size);
 size_t asm_strlen(const char* s);
 int asm_strcmp(const char* s1, const char* s2);
@@ -36,6 +37,11 @@ int MemCmp(const void* ptr1, const void* ptr2, size_t size)
 void MemCpy(void* dst, const void* src, size_t size)
 {
     asm_memcpy(dst, src, size);
+}
+
+void MemMove(void* dst, const void* src, size_t size)
+{
+    asm_memmove(dst, src, size);
 }
 
 size_t StrLen(const char* s)
@@ -268,6 +274,17 @@ void *memset(void *ptr, int c, size_t size)
 {
     Stdlib::MemSet(ptr, static_cast<unsigned char>(c), size);
     return ptr;
+}
+
+int memcmp(const void *s1, const void *s2, size_t n)
+{
+    return Stdlib::MemCmp(s1, s2, n);
+}
+
+void *memmove(void *dst, const void *src, size_t size)
+{
+    Stdlib::MemMove(dst, src, size);
+    return dst;
 }
 
 }

@@ -272,6 +272,8 @@ int MemCmp(const void* ptr1, const void* ptr2, size_t size);
 
 void MemCpy(void* dst, const void* src, size_t size);
 
+void MemMove(void* dst, const void* src, size_t size);
+
 size_t StrLen(const char* s);
 
 const char *TruncateFileName(const char *fileName);

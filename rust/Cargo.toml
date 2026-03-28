@@ -1,0 +1,10 @@
+[workspace]
+members = ["ffi", "kernel", "hello"]
+resolver = "2"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+
+[profile.dev]
+panic = "abort"

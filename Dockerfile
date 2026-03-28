@@ -14,7 +14,12 @@ RUN apt-get update && apt-get install -y \
     e2fsprogs \
     qemu-utils \
     python3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+    --default-toolchain nightly --component rust-src
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
 CMD ["make", "nocheck"]
