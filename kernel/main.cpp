@@ -330,6 +330,8 @@ void MountRootFs()
    stack via SetRsp without unwinding (see the WARNING there).
    All C++ objects with non-trivial destructors must go out of
    scope before those calls, so the body is wrapped in a block. */
+extern "C" void rust_init();
+
 void BpStartup(void* ctx)
 {
     (void)ctx;
@@ -363,6 +365,9 @@ void BpStartup(void* ctx)
         VirtioScsi::InitAll();
         PartitionDevice::ProbeAll();
         MountRootFs();
+
+        rust_init();
+
         VirtioNet::InitAll();
         VirtioRng::InitAll();
 

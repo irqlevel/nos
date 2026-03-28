@@ -1,0 +1,9 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = ["-Ccode-model=large"]
+
+[unstable]
+build-std = ["core", "alloc"]
+build-std-features = []

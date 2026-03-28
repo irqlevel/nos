@@ -45,19 +45,34 @@ void SpinLock::Unlock()
     RawLock.Unlock();
 }
 
+/*
+ * Bit 63 of saved rflags is always zero in hardware.
+ * We borrow it to record whether PreemptDisable() was
+ * actually called, so Unlock uses the same decision.
+ * This closes a race where PreemptIsOn() changes between
+ * Lock and Unlock (e.g. PreemptOn() called by another CPU).
+ */
+static constexpr ulong PreemptWasOnBit = (1UL << 63);
+
 void SpinLock::Lock(ulong& flags)
 {
-    PreemptDisable();
+    bool preemptOn = PreemptIsOn();
+    if (preemptOn)
+        PreemptDisable();
     flags = GetRflags();
+    if (preemptOn)
+        flags |= PreemptWasOnBit;
     InterruptDisable();
     Lock();
 }
 
 void SpinLock::Unlock(ulong flags)
 {
+    bool preemptWasOn = (flags & PreemptWasOnBit) != 0;
     Unlock();
-    SetRflags(flags);
-    PreemptEnable();
+    SetRflags(flags & ~PreemptWasOnBit);
+    if (preemptWasOn)
+        PreemptEnable();
 }
 
 void SpinLock::SharedLock(ulong& flags)

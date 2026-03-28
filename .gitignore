@@ -16,3 +16,4 @@ bin
 *.d
 *.vmdk
 kernel/symtab_data.cpp
+rust/target/
