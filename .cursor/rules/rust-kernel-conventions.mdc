@@ -1,6 +1,6 @@
 ---
 description: Rust driver and kcore conventions for the NOS kernel
-globs: rust/**/*.rs
+globs: src/rust/**/*.rs
 alwaysApply: false
 ---
 
@@ -9,15 +9,15 @@ alwaysApply: false
 ## Crate layout
 
 ```
-rust/ffi/       — raw extern "C" bindings (unsafe, no logic)
-rust/kcore/     — safe wrappers used by drivers (alloc available, no std)
-rust/hello/     — example / self-test crate
+src/rust/ffi/       — raw extern "C" bindings (unsafe, no logic)
+src/rust/kcore/     — safe wrappers used by drivers (alloc available, no std)
+src/rust/hello/     — example / self-test crate
 ```
 
 Add a new kernel service in three steps:
-1. C++ FFI function in `kernel/rust_ffi.cpp`
-2. Raw declaration in `rust/ffi/src/<module>.rs` + `pub mod` in `ffi/src/lib.rs`
-3. Safe wrapper in `rust/kcore/src/<module>.rs` + `pub mod` in `kcore/src/lib.rs`
+1. C++ FFI function in `src/cpp/kernel/rust_ffi.cpp`
+2. Raw declaration in `src/rust/ffi/src/<module>.rs` + `pub mod` in `ffi/src/lib.rs`
+3. Safe wrapper in `src/rust/kcore/src/<module>.rs` + `pub mod` in `kcore/src/lib.rs`
 
 ## FFI layer (`rust/ffi`)
 
@@ -105,6 +105,7 @@ handle.set_ip(0xC0A80001); // 192.168.0.1 host order
 
 ## C++ FFI conventions (`kernel/rust_ffi.cpp`)
 
+- All FFI implementation lives in `src/cpp/kernel/rust_ffi.cpp`.
 - Register/create functions: heap-allocate adapters with `Mm::TAlloc<T, RustAllocTag>()` — never use static arrays of non-trivial C++ objects (static constructors are unreliable in freestanding).
 - Slot pools for IRQ/timer/MSI-X callbacks: protect with `RawRwSpinLock` — read-lock in handlers, write-lock+IRQ-save for registration/deregistration.
 - Block/net device adapters: no slot lock needed — registration is boot-time only, no unregister.
