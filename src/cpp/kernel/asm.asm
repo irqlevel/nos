@@ -125,6 +125,22 @@ global RustMsixStub12
 global RustMsixStub13
 global RustMsixStub14
 global RustMsixStub15
+global RustMsixStub16
+global RustMsixStub17
+global RustMsixStub18
+global RustMsixStub19
+global RustMsixStub20
+global RustMsixStub21
+global RustMsixStub22
+global RustMsixStub23
+global RustMsixStub24
+global RustMsixStub25
+global RustMsixStub26
+global RustMsixStub27
+global RustMsixStub28
+global RustMsixStub29
+global RustMsixStub30
+global RustMsixStub31
 
 global ExcDivideByZeroStub
 global ExcDebuggerStub
@@ -588,6 +604,22 @@ RustMsixSlot 12
 RustMsixSlot 13
 RustMsixSlot 14
 RustMsixSlot 15
+RustMsixSlot 16
+RustMsixSlot 17
+RustMsixSlot 18
+RustMsixSlot 19
+RustMsixSlot 20
+RustMsixSlot 21
+RustMsixSlot 22
+RustMsixSlot 23
+RustMsixSlot 24
+RustMsixSlot 25
+RustMsixSlot 26
+RustMsixSlot 27
+RustMsixSlot 28
+RustMsixSlot 29
+RustMsixSlot 30
+RustMsixSlot 31
 
 ExceptionStub ExcDivideByZero
 ExceptionStub ExcDebugger

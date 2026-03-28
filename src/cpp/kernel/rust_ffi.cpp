@@ -775,7 +775,7 @@ void kernel_timer_stop(unsigned long handle)
 
 /* ---- MSI-X callback slots ---- */
 
-static const ulong RustMsixSlotCount = 16;
+static const ulong RustMsixSlotCount = 32;
 
 struct RustMsixSlot
 {
@@ -804,6 +804,22 @@ static Kernel::InterruptHandlerFn RustMsixStubTable[RustMsixSlotCount] = {
     RustMsixStub13,
     RustMsixStub14,
     RustMsixStub15,
+    RustMsixStub16,
+    RustMsixStub17,
+    RustMsixStub18,
+    RustMsixStub19,
+    RustMsixStub20,
+    RustMsixStub21,
+    RustMsixStub22,
+    RustMsixStub23,
+    RustMsixStub24,
+    RustMsixStub25,
+    RustMsixStub26,
+    RustMsixStub27,
+    RustMsixStub28,
+    RustMsixStub29,
+    RustMsixStub30,
+    RustMsixStub31,
 };
 
 class RustMsixSlotHandler : public Kernel::InterruptHandler
