@@ -59,3 +59,48 @@ impl Drop for MsixTable {
         }
     }
 }
+
+/// A registered MSI-X interrupt backed by a kernel callback slot.
+///
+/// The assembly stub handles register save/restore and LAPIC EOI.
+/// The interrupt slot is freed when this handle is dropped.
+pub struct MsixInterrupt {
+    slot_handle: usize,
+    vector: u8,
+}
+
+impl MsixInterrupt {
+    /// Register a Rust callback for MSI-X table entry `msix_index`.
+    ///
+    /// `handler(ctx)` will be called from the assembly stub's ISR context
+    /// (registers saved, LAPIC EOI sent automatically after return).
+    ///
+    /// Returns `None` if all 16 MSI-X callback slots are in use or
+    /// if `MsixTable::EnableVector` fails (no free CPU vectors).
+    pub fn register(
+        table: &MsixTable,
+        msix_index: u16,
+        handler: extern "C" fn(*mut u8),
+        ctx: *mut u8,
+    ) -> Option<Self> {
+        let mut vector: u8 = 0;
+        let h = unsafe {
+            msix::kernel_msix_register_handler(
+                table.handle, msix_index, handler, ctx, &mut vector,
+            )
+        };
+        if h == 0 { None } else { Some(Self { slot_handle: h, vector }) }
+    }
+
+    pub fn vector(&self) -> u8 {
+        self.vector
+    }
+}
+
+impl Drop for MsixInterrupt {
+    fn drop(&mut self) {
+        if self.slot_handle != 0 {
+            unsafe { msix::kernel_msix_unregister_handler(self.slot_handle) }
+        }
+    }
+}

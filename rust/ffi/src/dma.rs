@@ -7,4 +7,5 @@ extern "C" {
     pub fn kernel_free_dma_pages(ptr: *mut u8);
     pub fn kernel_map_phys(phys_base: u64, num_pages: usize) -> *mut u8;
     pub fn kernel_unmap_phys(virt_addr: *mut u8, num_pages: usize);
+    pub fn kernel_virt_to_phys(virt_addr: *const u8) -> u64;
 }

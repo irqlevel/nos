@@ -14,6 +14,10 @@ pub mod pci;
 pub mod msix;
 pub mod interrupt;
 pub mod softirq;
+pub mod timer;
+pub mod cpu;
+pub mod block;
+pub mod net;
 
 #[macro_export]
 macro_rules! trace {

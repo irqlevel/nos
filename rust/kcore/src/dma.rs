@@ -97,3 +97,7 @@ impl Drop for PhysMapping {
         }
     }
 }
+
+pub fn virt_to_phys(ptr: *const u8) -> u64 {
+    unsafe { dma::kernel_virt_to_phys(ptr) }
+}

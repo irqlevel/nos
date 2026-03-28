@@ -89,3 +89,32 @@ impl<'a> Drop for SpinLockGuard<'a> {
         }
     }
 }
+
+pub struct WaitGroup {
+    handle: usize,
+}
+
+impl WaitGroup {
+    pub fn new() -> Option<Self> {
+        let h = unsafe { sync::kernel_waitgroup_create() };
+        if h == 0 { None } else { Some(Self { handle: h }) }
+    }
+
+    pub fn add(&self, delta: isize) {
+        unsafe { sync::kernel_waitgroup_add(self.handle, delta) }
+    }
+
+    pub fn done(&self) {
+        unsafe { sync::kernel_waitgroup_done(self.handle) }
+    }
+
+    pub fn wait(&self) {
+        unsafe { sync::kernel_waitgroup_wait(self.handle) }
+    }
+}
+
+impl Drop for WaitGroup {
+    fn drop(&mut self) {
+        unsafe { sync::kernel_waitgroup_destroy(self.handle) }
+    }
+}

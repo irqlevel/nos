@@ -58,4 +58,26 @@ void PreemptEnable()
     }
 }
 
+static constexpr ulong PreemptWasOnBit = (1UL << 63);
+
+ulong PreemptIrqSave()
+{
+    bool preemptOn = PreemptIsOn();
+    if (preemptOn)
+        PreemptDisable();
+    ulong flags = GetRflags();
+    if (preemptOn)
+        flags |= PreemptWasOnBit;
+    InterruptDisable();
+    return flags;
+}
+
+void PreemptIrqRestore(ulong flags)
+{
+    bool preemptWasOn = (flags & PreemptWasOnBit) != 0;
+    SetRflags(flags & ~PreemptWasOnBit);
+    if (preemptWasOn)
+        PreemptEnable();
+}
+
 }
