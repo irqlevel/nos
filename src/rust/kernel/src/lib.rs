@@ -21,9 +21,15 @@ fn alloc_error(_layout: core::alloc::Layout) -> ! {
 #[no_mangle]
 pub extern "C" fn rust_init() {
     hello::hello();
+    nvme::init();
 }
 
 #[no_mangle]
 pub extern "C" fn rust_test() {
     hello::test();
+}
+
+#[no_mangle]
+pub extern "C" fn rust_fini() {
+    nvme::shutdown();
 }

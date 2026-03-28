@@ -151,6 +151,8 @@ extern "C" void ApMain()
 
 typedef void (*HaltAction)();
 
+extern "C" void rust_fini();
+
 /* Runs entirely on the static stack with its own stack frame.
    Releases the idle task, runs static destructors, then
    performs the final halt/reboot action. Never returns. */
@@ -160,6 +162,8 @@ FinalizeOnStaticStack(Task* task, HaltAction action)
     Trace(0, "FinalizeOnStaticStack");
 
     task->Put();
+
+    rust_fini();
 
     __cxa_finalize(0);
 

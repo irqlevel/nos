@@ -281,21 +281,23 @@ void kernel_free_dma_pages(void* ptr)
 
 void* kernel_map_phys(unsigned long phys_base, unsigned long num_pages)
 {
-    if (num_pages == 0 ||
-        num_pages > Kernel::Mm::PageTable::MaxContiguousPages)
+    if (num_pages == 0)
         return nullptr;
 
-    unsigned long addrs[Kernel::Mm::PageTable::MaxContiguousPages];
-    for (unsigned long i = 0; i < num_pages; i++)
-        addrs[i] = phys_base + i * Const::PageSize;
-
-    return Kernel::Mm::MapPages((size_t)num_pages, addrs);
+    ulong size = num_pages * Const::PageSize;
+    ulong va = Kernel::Mm::PageTable::GetInstance().MapMmioRegion(phys_base, size);
+    if (va == 0)
+        return nullptr;
+    return (void*)va;
 }
 
 void kernel_unmap_phys(void* virt_addr, unsigned long num_pages)
 {
-    if (virt_addr && num_pages > 0)
-        Kernel::Mm::UnmapPages(virt_addr, (size_t)num_pages);
+    /* MapMmioRegion maps at physAddr + KernelSpaceBase via direct PTEs;
+     * these mappings are permanent and cannot be unmapped in the current
+     * page-table implementation. */
+    (void)virt_addr;
+    (void)num_pages;
 }
 
 unsigned long kernel_virt_to_phys(const void* virt_addr)
@@ -617,7 +619,18 @@ public:
     }
 };
 
-static RustLegacyHandler RustLegacyHandlers[RustIrqSlotCount];
+static char RustLegacyHandlersBuf[RustIrqSlotCount][sizeof(RustLegacyHandler)];
+static bool RustLegacyHandlersInit[RustIrqSlotCount];
+
+static RustLegacyHandler& GetLegacyHandler(ulong i)
+{
+    if (!RustLegacyHandlersInit[i])
+    {
+        new (&RustLegacyHandlersBuf[i]) RustLegacyHandler();
+        RustLegacyHandlersInit[i] = true;
+    }
+    return *reinterpret_cast<RustLegacyHandler*>(&RustLegacyHandlersBuf[i]);
+}
 
 extern "C" {
 
@@ -656,10 +669,11 @@ unsigned long kernel_interrupt_register_level(
             RustIrqSlots[i].Used = true;
             RustIrqSlots[i].Vector = 0;
 
-            RustLegacyHandlers[i].SlotIndex = i;
+            auto& lh = GetLegacyHandler(i);
+            lh.SlotIndex = i;
 
             u8 vector = (u8)(RustIrqVectorBase + i);
-            Kernel::Interrupt::RegisterLevel(RustLegacyHandlers[i], irq_line, vector);
+            Kernel::Interrupt::RegisterLevel(lh, irq_line, vector);
 
             *out_vector = RustIrqSlots[i].Vector;
             RustIrqLock.WriteUnlockIrqRestore(flags);
@@ -718,7 +732,18 @@ public:
     }
 };
 
-static RustTimerAdapter RustTimerAdapters[RustTimerSlotCount];
+static char RustTimerAdaptersBuf[RustTimerSlotCount][sizeof(RustTimerAdapter)];
+static bool RustTimerAdaptersInit[RustTimerSlotCount];
+
+static RustTimerAdapter& GetTimerAdapter(ulong i)
+{
+    if (!RustTimerAdaptersInit[i])
+    {
+        new (&RustTimerAdaptersBuf[i]) RustTimerAdapter();
+        RustTimerAdaptersInit[i] = true;
+    }
+    return *reinterpret_cast<RustTimerAdapter*>(&RustTimerAdaptersBuf[i]);
+}
 
 extern "C" {
 
@@ -738,11 +763,12 @@ unsigned long kernel_timer_start(
             RustTimerSlots[i].Ctx = ctx;
             RustTimerSlots[i].Active = true;
 
-            RustTimerAdapters[i].SlotIndex = i;
+            auto& ta = GetTimerAdapter(i);
+            ta.SlotIndex = i;
 
             Stdlib::Time period(period_ns);
             if (!Kernel::TimerTable::GetInstance().StartTimer(
-                    RustTimerAdapters[i], period))
+                    ta, period))
             {
                 RustTimerSlots[i].Active = false;
                 RustTimerSlots[i].Handler = nullptr;
@@ -764,7 +790,7 @@ void kernel_timer_stop(unsigned long handle)
         return;
     ulong i = handle - 1;
     ulong flags = RustTimerLock.WriteLockIrqSave();
-    Kernel::TimerTable::GetInstance().StopTimer(RustTimerAdapters[i]);
+    Kernel::TimerTable::GetInstance().StopTimer(GetTimerAdapter(i));
     RustTimerSlots[i].Handler = nullptr;
     RustTimerSlots[i].Ctx = nullptr;
     RustTimerSlots[i].Active = false;
@@ -839,7 +865,18 @@ public:
     }
 };
 
-static RustMsixSlotHandler RustMsixSlotHandlers[RustMsixSlotCount];
+static char RustMsixSlotHandlersBuf[RustMsixSlotCount][sizeof(RustMsixSlotHandler)];
+static bool RustMsixSlotHandlersInit[RustMsixSlotCount];
+
+static RustMsixSlotHandler& GetMsixSlotHandler(ulong i)
+{
+    if (!RustMsixSlotHandlersInit[i])
+    {
+        new (&RustMsixSlotHandlersBuf[i]) RustMsixSlotHandler();
+        RustMsixSlotHandlersInit[i] = true;
+    }
+    return *reinterpret_cast<RustMsixSlotHandler*>(&RustMsixSlotHandlersBuf[i]);
+}
 
 extern "C" {
 
@@ -877,10 +914,11 @@ unsigned long kernel_msix_register_handler(
             RustMsixSlots[i].Ctx = ctx;
             RustMsixSlots[i].Used = true;
 
-            RustMsixSlotHandlers[i].SlotIndex = i;
+            auto& mh = GetMsixSlotHandler(i);
+            mh.SlotIndex = i;
 
             auto* t = reinterpret_cast<Kernel::MsixTable*>(msix_handle);
-            u8 vector = t->EnableVector(msix_index, RustMsixSlotHandlers[i]);
+            u8 vector = t->EnableVector(msix_index, mh);
             if (vector == 0)
             {
                 RustMsixSlots[i].Handler = nullptr;
@@ -939,21 +977,22 @@ public:
 
     bool ReadSectors(u64 sector, void* buf, u32 count) override
     {
-        return Ops.ReadSectors(Ops.Ctx, (unsigned long long)sector, buf,
-                               (unsigned int)count) != 0;
+        int rc = Ops.ReadSectors(Ops.Ctx, (unsigned long long)sector, buf,
+                                 (unsigned int)count);
+        return rc == 0;
     }
 
     bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua) override
     {
         return Ops.WriteSectors(Ops.Ctx, (unsigned long long)sector, buf,
-                                (unsigned int)count, fua ? 1 : 0) != 0;
+                                (unsigned int)count, fua ? 1 : 0) == 0;
     }
 
     bool Flush() override
     {
         if (!Ops.Flush)
             return true;
-        return Ops.Flush(Ops.Ctx) != 0;
+        return Ops.Flush(Ops.Ctx) == 0;
     }
 };
 

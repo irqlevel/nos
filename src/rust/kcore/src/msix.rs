@@ -50,6 +50,13 @@ impl MsixTable {
     pub fn is_ready(&self) -> bool {
         unsafe { msix::kernel_msix_is_ready(self.handle) != 0 }
     }
+
+    pub fn disarm(&mut self) {
+        if self.handle != 0 {
+            unsafe { msix::kernel_msix_destroy(self.handle) }
+            self.handle = 0;
+        }
+    }
 }
 
 impl Drop for MsixTable {
@@ -70,6 +77,12 @@ pub struct MsixInterrupt {
 }
 
 impl MsixInterrupt {
+    /// An empty handle that owns no interrupt slot.
+    /// Drop is a safe no-op (slot_handle == 0).
+    pub fn empty() -> Self {
+        Self { slot_handle: 0, vector: 0 }
+    }
+
     /// Register a Rust callback for MSI-X table entry `msix_index`.
     ///
     /// `handler(ctx)` will be called from the assembly stub's ISR context
@@ -94,6 +107,14 @@ impl MsixInterrupt {
 
     pub fn vector(&self) -> u8 {
         self.vector
+    }
+
+    /// Unregister the interrupt and disarm the implicit Drop.
+    pub fn disarm(&mut self) {
+        if self.slot_handle != 0 {
+            unsafe { msix::kernel_msix_unregister_handler(self.slot_handle) }
+            self.slot_handle = 0;
+        }
     }
 }
 
