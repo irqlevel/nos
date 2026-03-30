@@ -3,7 +3,9 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use kcore::{trace, dma, io, msix, pci, block, sync};
+use kcore::bitmap::BitMap;
 use kcore::consts::PAGE_SIZE;
+use kcore::time::poll_until_busy;
 
 mod spec;
 mod queue;
@@ -22,12 +24,10 @@ static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /* A note on inflight_status[]:
  * The ISR writes inflight_status[cid] BEFORE calling wg_done, so by the
- * time wg_wait() returns the write is visible (wg_done/wg_wait provide the
- * happens-before guarantee).  There is a theoretical race where a second
- * thread re-uses the same CID and the ISR for the new command overwrites the
- * slot before the first waiter reads it; in practice this requires another
- * full NVMe round-trip to complete in the nanoseconds between wg_wait()
- * unblocking and the status read, which is impossible on real hardware. */
+ * time completion.wait() returns the write is visible (wg_done/wg_wait
+ * provide the happens-before guarantee).  CID reuse while a command is
+ * in flight is impossible because alloc_cid() uses a BitMap — the slot
+ * stays allocated until the submitter calls free_cid() after wait(). */
 
 /* NVMe PCI class/subclass/prog_if */
 const PCI_CLASS_STORAGE:   u8 = 0x01;
@@ -57,7 +57,10 @@ struct NvmeDevice {
     _msix_irq:   msix::MsixInterrupt,
 
     db_stride:   usize,
-    next_cid:    u16,
+    /* Bitmask of in-use CID slots (1 = in use).  Replaces the linear
+     * next_cid counter — avoids CID reuse while a previous command is still
+     * in flight.  W=1 → 64 slots, matches IO_QUEUE_DEPTH=64. */
+    cid_map: BitMap<1>,
 
     /* capacity and geometry */
     capacity:    u64,    /* total LBA count */
@@ -320,7 +323,7 @@ fn init_device(dev: pci::PciDevice) {
         _msix_table: msix_table,
         _msix_irq: msix::MsixInterrupt::empty(),
         db_stride: db_stride as usize,
-        next_cid: 0,
+        cid_map: BitMap::new(),
         capacity,
         sector_size,
         max_transfer,
@@ -423,47 +426,40 @@ fn admin_exec(ctx: &mut AdminCtx, regs: &io::MmioRegion, cmd: SubmissionEntry) -
     ctx.sq.ring_sq_doorbell(regs);
 
     /* Spin-poll the admin CQ.  Global interrupts are disabled during init. */
-    for _ in 0..1_000_000u32 {
+    let mut result: Option<bool> = None;
+    let completed = poll_until_busy(1_000_000, || {
+        let _ = regs.read32(REG_VS); /* cheap delay */
         if let Some(cqe) = ctx.cq.poll_completion() {
             ctx.cq.ring_cq_doorbell(regs);
             if cqe.cid != cid {
                 trace!(0, "NVMe: admin CQE cid mismatch: got {} expected {}", cqe.cid, cid);
-                return false;
-            }
-            if cqe.status_code() != 0 {
+                result = Some(false);
+            } else if cqe.status_code() != 0 {
                 trace!(0, "NVMe: admin cmd {} status={:#x}", cid, cqe.status_code());
-                return false;
+                result = Some(false);
+            } else {
+                result = Some(true);
             }
-            return true;
+            return true; /* stop polling */
         }
-        /* Small delay: read VS (a cheap MMIO read). */
-        let _ = regs.read32(REG_VS);
+        false
+    });
+    if !completed {
+        trace!(0, "NVMe: admin command {} timed out", cid);
+        return false;
     }
-    trace!(0, "NVMe: admin command {} timed out", cid);
-    false
+    result.unwrap_or(false)
 }
 
-/* Poll until CSTS bit is set, or timeout. */
+/* Poll until CSTS bit is set, or timeout.
+ * Each iteration is ~1 µs of MMIO read; use 1000 * timeout_ms iterations. */
 fn wait_csts_set(regs: &io::MmioRegion, bit: u32, timeout_ms: u64) -> bool {
-    /* Each iteration ~1 µs of MMIO reads; use 1000 * timeout_ms iterations. */
-    let iters = timeout_ms * 1000;
-    for _ in 0..iters {
-        if regs.read32(REG_CSTS) & bit != 0 {
-            return true;
-        }
-    }
-    false
+    poll_until_busy((timeout_ms * 1000) as usize, || regs.read32(REG_CSTS) & bit != 0)
 }
 
-/* Poll until CSTS bit is clear. */
+/* Poll until CSTS bit is clear, or timeout. */
 fn wait_csts_clear(regs: &io::MmioRegion, bit: u32, timeout_ms: u64) -> bool {
-    let iters = timeout_ms * 1000;
-    for _ in 0..iters {
-        if regs.read32(REG_CSTS) & bit == 0 {
-            return true;
-        }
-    }
-    false
+    poll_until_busy((timeout_ms * 1000) as usize, || regs.read32(REG_CSTS) & bit == 0)
 }
 
 /* ------------------------------------------------------------------ */
@@ -514,33 +510,35 @@ extern "C" fn nvme_write_sectors(
 extern "C" fn nvme_flush(ctx: *mut u8) -> i32 {
     let dev = ctx as *mut NvmeDevice;
 
-    let wg = match sync::WaitGroup::new() {
-        Some(w) => w,
+    let completion = match sync::Completion::new() {
+        Some(c) => c,
         None => return -1,
     };
-    wg.add(1);
 
-    let slot = {
+    let cid = {
         let _guard = unsafe { (*dev).io_lock.lock() };
-        let cid = alloc_cid(dev);
-        let slot = cid as usize % IO_QUEUE_DEPTH;
+        let cid = match alloc_cid(dev) {
+            Some(c) => c,
+            None => {
+                trace!(0, "NVMe: flush: all CID slots busy");
+                return -1;
+            }
+        };
 
-        if unsafe { (*dev).inflight[slot].load(Ordering::Relaxed) } != 0 {
-            trace!(0, "NVMe: flush: inflight slot {} still busy", slot);
-            return -1;
-        }
-
-        unsafe { (*dev).inflight_status[slot].store(0, Ordering::Relaxed) };
-        unsafe { (*dev).inflight[slot].store(wg_handle(&wg), Ordering::Relaxed) };
+        unsafe { (*dev).inflight_status[cid as usize].store(0, Ordering::Relaxed) };
+        unsafe { (*dev).inflight[cid as usize].store(completion.raw_handle(), Ordering::Relaxed) };
         let mut cmd = SubmissionEntry::new(OPC_FLUSH, cid);
         cmd.nsid = 1;
         unsafe { (*dev).io_sq.submit(&cmd) };
         unsafe { (*dev).io_sq.ring_sq_doorbell(&(*dev).regs) };
-        slot
+        cid
     };
 
-    wg.wait();
-    let status = unsafe { (*dev).inflight_status[slot].load(Ordering::Acquire) };
+    completion.wait();
+
+    let status = unsafe { (*dev).inflight_status[cid as usize].load(Ordering::Acquire) };
+    { let _guard = unsafe { (*dev).io_lock.lock() }; free_cid(dev, cid); }
+
     if status != 0 {
         trace!(0, "NVMe: flush status={:#x}", status);
         return -1;
@@ -562,11 +560,10 @@ fn submit_io(
         return -1;
     }
 
-    let wg = match sync::WaitGroup::new() {
-        Some(w) => w,
+    let completion = match sync::Completion::new() {
+        Some(c) => c,
         None => return -1,
     };
-    wg.add(1);
 
     /* Build PRP entries before taking the lock. */
     let prp1 = dma::virt_to_phys(buf as *const u8);
@@ -581,18 +578,18 @@ fn submit_io(
 
     let opcode = if is_write { OPC_WRITE } else { OPC_READ };
 
-    let slot = {
+    let cid = {
         let _guard = unsafe { (*dev).io_lock.lock() };
-        let cid = alloc_cid(dev);
-        let slot = cid as usize % IO_QUEUE_DEPTH;
+        let cid = match alloc_cid(dev) {
+            Some(c) => c,
+            None => {
+                trace!(0, "NVMe: submit_io: all CID slots busy");
+                return -1;
+            }
+        };
 
-        if unsafe { (*dev).inflight[slot].load(Ordering::Relaxed) } != 0 {
-            trace!(0, "NVMe: submit_io: inflight slot {} still busy", slot);
-            return -1;
-        }
-
-        unsafe { (*dev).inflight_status[slot].store(0, Ordering::Relaxed) };
-        unsafe { (*dev).inflight[slot].store(wg_handle(&wg), Ordering::Relaxed) };
+        unsafe { (*dev).inflight_status[cid as usize].store(0, Ordering::Relaxed) };
+        unsafe { (*dev).inflight[cid as usize].store(completion.raw_handle(), Ordering::Relaxed) };
 
         let mut cmd = SubmissionEntry::new(opcode, cid);
         cmd.nsid  = 1;
@@ -605,11 +602,14 @@ fn submit_io(
 
         unsafe { (*dev).io_sq.submit(&cmd) };
         unsafe { (*dev).io_sq.ring_sq_doorbell(&(*dev).regs) };
-        slot
+        cid
     };
 
-    wg.wait();
-    let status = unsafe { (*dev).inflight_status[slot].load(Ordering::Acquire) };
+    completion.wait();
+
+    let status = unsafe { (*dev).inflight_status[cid as usize].load(Ordering::Acquire) };
+    { let _guard = unsafe { (*dev).io_lock.lock() }; free_cid(dev, cid); }
+
     if status != 0 {
         trace!(0, "NVMe: I/O status={:#x} sector={} count={}", status, sector, count);
         return -1;
@@ -617,19 +617,18 @@ fn submit_io(
     0
 }
 
-/* Allocate the next command ID, wrapping within IO_QUEUE_DEPTH.
- * Caller must hold io_lock. */
-fn alloc_cid(dev: *mut NvmeDevice) -> u16 {
-    unsafe {
-        let cid = (*dev).next_cid;
-        (*dev).next_cid = (cid + 1) % IO_QUEUE_DEPTH as u16;
-        cid
-    }
+/* Allocate a free command ID slot.  Returns None when all IO_QUEUE_DEPTH
+ * slots are in use.  Caller must hold io_lock. */
+fn alloc_cid(dev: *mut NvmeDevice) -> Option<u16> {
+    unsafe { (*dev).cid_map.alloc().map(|c| c as u16) }
 }
 
-fn wg_handle(wg: &sync::WaitGroup) -> usize {
-    wg.raw_handle()
+/* Free a command ID slot after its completion has been consumed.
+ * Caller must hold io_lock. */
+fn free_cid(dev: *mut NvmeDevice, cid: u16) {
+    unsafe { (*dev).cid_map.free(cid as usize) }
 }
+
 
 /* ------------------------------------------------------------------ */
 /* FFI glue                                                             */

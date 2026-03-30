@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod consts;
+pub mod error;
 pub mod trace;
 pub mod time;
 pub mod sync;
@@ -18,6 +19,8 @@ pub mod timer;
 pub mod cpu;
 pub mod block;
 pub mod net;
+pub mod bitmap;
+pub mod ring_buffer;
 
 #[macro_export]
 macro_rules! trace {
