@@ -25,6 +25,7 @@ public:
 enum InterruptSource : u8
 {
     IrqPit = 0,
+    IrqHpet,
     IrqIO8042,
     IrqSerial,
     IrqVirtioBlk,

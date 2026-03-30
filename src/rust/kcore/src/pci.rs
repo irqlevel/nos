@@ -106,6 +106,34 @@ pub fn find_device_from(vendor: u16, device: u16, start: usize)
     }
 }
 
+/// Look up a PCI device by bus/slot/func. Returns None if not found or vendor is 0xFFFF.
+pub fn get_device_by_bdf(bus: u16, slot: u16, func: u16) -> Option<PciDevice> {
+    let vendor = unsafe {
+        pci::kernel_pci_read_config16(bus, slot, func, 0x00)
+    };
+    if vendor == 0xFFFF || vendor == 0 {
+        return None;
+    }
+    let device = unsafe {
+        pci::kernel_pci_read_config16(bus, slot, func, 0x02)
+    };
+    /* Populate the remaining fields from a scan search */
+    for i in 0..device_count() {
+        let d = get_device(i)?;
+        if d.bus == bus && d.slot == slot && d.func == func {
+            return Some(d);
+        }
+    }
+    /* Device not in scan list -- build a minimal descriptor */
+    Some(PciDevice {
+        bus, slot, func,
+        vendor,
+        device,
+        class: 0, subclass: 0, prog_if: 0, revision: 0,
+        irq_line: 0, irq_pin: 0,
+    })
+}
+
 pub fn device_count() -> usize {
     unsafe { pci::kernel_pci_device_count() }
 }

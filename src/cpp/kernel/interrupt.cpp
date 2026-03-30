@@ -31,6 +31,7 @@ const char* InterruptStats::GetName(InterruptSource src)
     switch (src)
     {
     case IrqPit:        return "pit";
+    case IrqHpet:       return "hpet";
     case IrqIO8042:     return "8042";
     case IrqSerial:     return "serial";
     case IrqVirtioBlk:  return "virtio-blk";

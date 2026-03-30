@@ -82,6 +82,7 @@ long AtomicTestBit(volatile long *pvalue, ulong bit);
 void IO8042InterruptStub();
 void SerialInterruptStub();
 void PitInterruptStub();
+void HpetInterruptStub();
 void IPInterruptStub();
 void VirtioBlkInterruptStub();
 void VirtioNetInterruptStub();

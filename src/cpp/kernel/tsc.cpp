@@ -5,6 +5,7 @@
 
 #include <include/const.h>
 #include <mm/new.h>
+#include <drivers/hpet.h>
 
 namespace Kernel
 {
@@ -54,6 +55,25 @@ ulong Tsc::CalibratePitCh2()
     return (ulong)(tscEnd - tscStart);
 }
 
+ulong Tsc::CalibrateHpet()
+{
+    auto& hpet = Hpet::GetInstance();
+    if (!hpet.IsAvailable())
+        return 0;
+
+    Stdlib::Time tStart = hpet.GetTime();
+    Stdlib::Time tEnd = tStart + Stdlib::Time(CalibrationMs * Const::NanoSecsInMs);
+
+    u64 tscStart = ReadTsc();
+    while (hpet.GetTime() < tEnd)
+    {
+        Pause();
+    }
+    u64 tscEnd = ReadTsc();
+
+    return (ulong)(tscEnd - tscStart);
+}
+
 bool Tsc::Calibrate()
 {
     /* Check TSC presence */
@@ -74,15 +94,24 @@ bool Tsc::Calibrate()
 
     Trace(0, "TSC: invariant=%u", (ulong)Invariant);
 
-    /* Calibrate using PIT channel 2 */
-    u8 savedGate = Inb(PitGatePort);
-
     ulong samples[CalibrationRounds];
-    for (ulong i = 0; i < CalibrationRounds; i++)
-        samples[i] = CalibratePitCh2();
 
-    /* Restore port 0x61 to pre-calibration state (gate off, original bits) */
-    Outb(PitGatePort, savedGate & GateOff);
+    /* Prefer HPET calibration over PIT channel 2 */
+    if (Hpet::GetInstance().IsAvailable())
+    {
+        Trace(0, "TSC: calibrating via HPET");
+        for (ulong i = 0; i < CalibrationRounds; i++)
+            samples[i] = CalibrateHpet();
+    }
+    else
+    {
+        /* Calibrate using PIT channel 2 */
+        u8 savedGate = Inb(PitGatePort);
+        for (ulong i = 0; i < CalibrationRounds; i++)
+            samples[i] = CalibratePitCh2();
+        /* Restore port 0x61 to pre-calibration state (gate off, original bits) */
+        Outb(PitGatePort, savedGate & GateOff);
+    }
 
     /* Sort and take median */
     for (ulong i = 0; i < CalibrationRounds - 1; i++)

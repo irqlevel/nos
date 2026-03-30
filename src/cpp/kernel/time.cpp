@@ -3,6 +3,7 @@
 #include "trace.h"
 
 #include <drivers/pit.h>
+#include <drivers/hpet.h>
 #include <drivers/rtc.h>
 
 namespace Kernel
@@ -73,6 +74,10 @@ Stdlib::Time GetBootTime()
     default:
         break;
     }
+
+    /* Fallback to HPET if available, otherwise PIT */
+    if (Hpet::GetInstance().IsAvailable())
+        return Hpet::GetInstance().GetTime();
 
     return Pit::GetInstance().GetTime();
 }

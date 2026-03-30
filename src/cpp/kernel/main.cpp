@@ -35,6 +35,7 @@
 #include <drivers/serial.h>
 #include <drivers/pic.h>
 #include <drivers/pit.h>
+#include <drivers/hpet.h>
 #include <drivers/acpi.h>
 #include <drivers/lapic.h>
 #include <drivers/ioapic.h>
@@ -222,11 +223,19 @@ static void __attribute__((noreturn)) DoShutdown()
 {
     Trace(0, "ACPI shutdown");
 
-    /* ACPI S5 (soft-off): write SLP_TYP | SLP_EN to PM1a_CNT.
-       QEMU/KVM uses PM1a_CNT port 0x604, SLP_TYP=0 for S5. */
+    /* Try PM1a_CNT from FADT with SLP_TYP=5 (S5) | SLP_EN */
+    ulong pm1a = Acpi::GetInstance().GetPm1aCntPort();
+    if (pm1a != 0)
+    {
+        Outw((u16)pm1a, (5 << 10) | (1 << 13));
+        /* Brief busy-wait for the hardware to respond */
+        for (volatile int i = 0; i < 1000000; i = i + 1) {}
+    }
+
+    /* QEMU/KVM fallback: PM1a_CNT port 0x604, SLP_TYP=0 for S5 */
     Outw(0x604, (1 << 13));
 
-    /* Fallback: QEMU debug exit device */
+    /* QEMU debug exit device fallback */
     Outb(0xf4, 0x0);
 
     while (1) Hlt();
@@ -235,6 +244,14 @@ static void __attribute__((noreturn)) DoShutdown()
 static void __attribute__((noreturn)) DoReboot()
 {
     Trace(0, "Reboot");
+
+    /* Try ACPI FADT RESET_REG first */
+    auto& acpi = Acpi::GetInstance();
+    if (acpi.HasResetReg())
+    {
+        Outb((u16)acpi.GetResetRegPort(), acpi.GetResetValue());
+        for (volatile int i = 0; i < 1000000; i = i + 1) {}
+    }
 
     /* Keyboard controller reset (pulse CPU reset line) */
     Outb(0x64, 0xFE);
@@ -361,8 +378,23 @@ void BpStartup(void* ctx)
 
         ioApic.Enable();
 
-        // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
-        Interrupt::Register(pit, acpi.GetGsiByIrq(0x0), 0x20);
+        /* Choose tick source: HPET if available, otherwise PIT (ISA IRQ 0). */
+        auto& hpet = Hpet::GetInstance();
+        if (hpet.IsAvailable())
+        {
+            /* HPET in legacy replacement mode: timer 0 replaces PIT on IRQ 0.
+               Use the same GSI that PIT would use (MADT may remap IRQ 0 → GSI 2). */
+            Interrupt::Register(hpet, acpi.GetGsiByIrq(0x0), 0x20);
+            Trace(0, "Using HPET as tick source (legacy replacement, IRQ 0)");
+        }
+        else
+        {
+            // PIT is ISA IRQ 0; ACPI MADT may remap it to GSI 2
+            Interrupt::Register(pit, acpi.GetGsiByIrq(0x0), 0x20);
+            pit.Setup();
+            Trace(0, "Using PIT as tick source");
+        }
+
         Interrupt::Register(kbd, acpi.GetGsiByIrq(0x1), 0x21);
         Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
 
@@ -389,10 +421,6 @@ void BpStartup(void* ctx)
         Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
 
         BugOn(IsInterruptEnabled());
-
-        Trace(0, "Before pit setup");
-
-        pit.Setup();
 
         Trace(0, "Before interrupt enable");
 
@@ -622,6 +650,10 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     }
 
     Mm::AllocatorImpl::GetInstance(&Mm::PageAllocatorImpl::GetInstance());
+
+    /* Setup HPET after page allocator is ready (MMIO mapping requires it).
+       HPET may not be available on all hardware; Setup() returns false silently. */
+    Hpet::GetInstance().Setup();
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
 
