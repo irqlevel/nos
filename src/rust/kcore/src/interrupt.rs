@@ -10,6 +10,13 @@ pub struct LegacyInterrupt {
 }
 
 impl LegacyInterrupt {
+    /// Construct a no-op placeholder handle (handle == 0).
+    /// Drop of an empty interrupt is a no-op.
+    /// Use as a field initialiser when the real interrupt is registered later.
+    pub fn empty() -> Self {
+        Self { handle: 0, vector: 0 }
+    }
+
     /// Register a level-triggered PCI interrupt for `dev`.
     ///
     /// `handler` is called on every interrupt with `ctx` as its argument.

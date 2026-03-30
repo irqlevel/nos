@@ -11,3 +11,4 @@ ffi = { path = "../ffi" }
 kcore = { path = "../kcore" }
 hello = { path = "../hello" }
 nvme = { path = "../drivers/nvme" }
+r8168 = { path = "../drivers/r8168" }
