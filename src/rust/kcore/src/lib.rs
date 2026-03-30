@@ -21,6 +21,8 @@ pub mod block;
 pub mod net;
 pub mod bitmap;
 pub mod ring_buffer;
+pub mod hpet;
+pub mod tco_wdt;
 
 #[macro_export]
 macro_rules! trace {

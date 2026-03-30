@@ -16,6 +16,7 @@ CXX_SRC =   \
     src/cpp/drivers/serial.cpp  \
     src/cpp/drivers/pic.cpp \
     src/cpp/drivers/pit.cpp \
+    src/cpp/drivers/hpet.cpp \
     src/cpp/drivers/8042.cpp    \
     src/cpp/drivers/acpi.cpp    \
     src/cpp/drivers/lapic.cpp   \

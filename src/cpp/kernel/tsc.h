@@ -57,6 +57,7 @@ private:
     Tsc& operator=(Tsc&& other) = delete;
 
     ulong CalibratePitCh2();
+    ulong CalibrateHpet();
     Stdlib::Time KvmClockTime();
 
     /* PIT channel 2 calibration */

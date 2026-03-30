@@ -26,6 +26,7 @@
 #include <block/block_device.h>
 #include <net/net_device.h>
 #include <net/net_frame.h>
+#include <drivers/hpet.h>
 
 static const ulong RustAllocTag = 'rust';
 
@@ -1265,6 +1266,18 @@ void kernel_netframe_put(unsigned long handle)
 {
     if (!handle) return;
     reinterpret_cast<Kernel::NetFrame*>(handle)->Put();
+}
+
+unsigned long long kernel_hpet_read_ns()
+{
+    auto& hpet = Kernel::Hpet::GetInstance();
+    if (!hpet.IsAvailable()) return 0;
+    return hpet.GetTime().GetValue();
+}
+
+bool kernel_hpet_is_available()
+{
+    return Kernel::Hpet::GetInstance().IsAvailable();
 }
 
 } /* extern "C" */

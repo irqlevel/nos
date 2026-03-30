@@ -6,6 +6,7 @@ extern DummyInterrupt
 extern IO8042Interrupt
 extern SerialInterrupt
 extern PitInterrupt
+extern HpetInterrupt
 extern IPInterrupt
 extern VirtioBlkInterrupt
 extern VirtioNetInterrupt
@@ -96,6 +97,7 @@ global DummyInterruptStub
 global IO8042InterruptStub
 global SerialInterruptStub
 global PitInterruptStub
+global HpetInterruptStub
 global IPInterruptStub
 global VirtioBlkInterruptStub
 global VirtioNetInterruptStub
@@ -551,6 +553,7 @@ InterruptStub Dummy
 InterruptStub IO8042
 InterruptStub Serial
 InterruptStub Pit
+InterruptStub Hpet
 InterruptStub IP
 InterruptStub VirtioBlk
 InterruptStub VirtioNet

@@ -14,6 +14,12 @@ Acpi::Acpi()
     , LapicAddress(nullptr)
     , IoApicAddress(nullptr)
     , IrqToGsiSize(0)
+    , Pm1aCntPort(0)
+    , ResetRegValid(false)
+    , ResetRegPort(0)
+    , ResetVal(0)
+    , HpetBasePhys(0)
+    , HpetMinTick(0)
 {
     OemId[0] = '\0';
     for (size_t i = 0; i < Stdlib::ArraySize(Table); i++)
@@ -267,6 +273,70 @@ Stdlib::Error Acpi::ParseMADT()
     return MakeError(Stdlib::Error::Success);
 }
 
+void Acpi::ParseFADT()
+{
+    ACPISDTHeader* sdtHeader = LookupTable("FACP");
+    if (sdtHeader == nullptr)
+    {
+        Trace(AcpiLL, "Acpi: no FADT table");
+        return;
+    }
+
+    if (sdtHeader->Length < sizeof(ACPISDTHeader) + sizeof(FadtFields))
+    {
+        Trace(0, "Acpi: FADT too short: %u", (ulong)sdtHeader->Length);
+        return;
+    }
+
+    FadtFields* fadt = reinterpret_cast<FadtFields*>(sdtHeader + 1);
+
+    Pm1aCntPort = fadt->Pm1aCntBlk;
+    Trace(AcpiLL, "Acpi: FADT PM1a_CNT port 0x%p flags 0x%p",
+        Pm1aCntPort, (ulong)fadt->Flags);
+
+    /* RESET_REG_SUP is bit 10 of Flags */
+    static const u32 ResetRegSup = (1u << 10);
+    if ((fadt->Flags & ResetRegSup) && fadt->ResetReg.AddressSpaceId == 1 /* I/O */)
+    {
+        ResetRegValid = true;
+        ResetRegPort = (ulong)fadt->ResetReg.Address;
+        ResetVal = fadt->ResetValue;
+        Trace(AcpiLL, "Acpi: FADT RESET_REG port 0x%p value 0x%p",
+            ResetRegPort, (ulong)ResetVal);
+    }
+}
+
+void Acpi::ParseHPET()
+{
+    ACPISDTHeader* sdtHeader = LookupTable("HPET");
+    if (sdtHeader == nullptr)
+    {
+        Trace(AcpiLL, "Acpi: no HPET table");
+        return;
+    }
+
+    if (sdtHeader->Length < sizeof(ACPISDTHeader) + sizeof(HpetTableBody))
+    {
+        Trace(0, "Acpi: HPET table too short: %u", (ulong)sdtHeader->Length);
+        return;
+    }
+
+    HpetTableBody* hpet = reinterpret_cast<HpetTableBody*>(sdtHeader + 1);
+
+    /* BaseAddress must be system memory (AddressSpaceId == 0) */
+    if (hpet->BaseAddress.AddressSpaceId != 0)
+    {
+        Trace(0, "Acpi: HPET base not in system memory (id %u)", (ulong)hpet->BaseAddress.AddressSpaceId);
+        return;
+    }
+
+    HpetBasePhys = (ulong)hpet->BaseAddress.Address;
+    HpetMinTick  = hpet->MinimumClockTick;
+
+    Trace(AcpiLL, "Acpi: HPET base 0x%p minTick %u blockId 0x%p",
+        HpetBasePhys, (ulong)HpetMinTick, (ulong)hpet->EventTimerBlockId);
+}
+
 Stdlib::Error Acpi::Parse()
 {
     Stdlib::Error err;
@@ -296,6 +366,9 @@ Stdlib::Error Acpi::Parse()
     {
         return err;
     }
+
+    ParseFADT();
+    ParseHPET();
 
     return MakeError(Stdlib::Error::Success);
 }
@@ -347,6 +420,36 @@ u32 Acpi::GetGsiByIrq(u8 irq)
     }
 
     return irq;
+}
+
+ulong Acpi::GetPm1aCntPort()
+{
+    return Pm1aCntPort;
+}
+
+bool Acpi::HasResetReg()
+{
+    return ResetRegValid;
+}
+
+ulong Acpi::GetResetRegPort()
+{
+    return ResetRegPort;
+}
+
+u8 Acpi::GetResetValue()
+{
+    return ResetVal;
+}
+
+ulong Acpi::GetHpetBasePhys()
+{
+    return HpetBasePhys;
+}
+
+u16 Acpi::GetHpetMinTick()
+{
+    return HpetMinTick;
 }
 
 }
