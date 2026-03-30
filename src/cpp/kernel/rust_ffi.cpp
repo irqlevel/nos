@@ -6,6 +6,7 @@
 #include "spin_lock.h"
 #include "raw_spin_lock.h"
 #include "raw_rw_spin_lock.h"
+#include "rw_mutex.h"
 #include "task.h"
 #include "sched.h"
 #include "cpu.h"
@@ -162,6 +163,41 @@ unsigned long long kernel_rw_spinlock_write_lock(unsigned long handle)
 void kernel_rw_spinlock_write_unlock(unsigned long handle, unsigned long long flags)
 {
     reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->WriteUnlockIrqRestore((unsigned long)flags);
+}
+
+unsigned long kernel_rw_mutex_create()
+{
+    Kernel::RwMutex* rw = Kernel::Mm::TAlloc<Kernel::RwMutex, RustAllocTag>();
+    return (unsigned long)rw;
+}
+
+void kernel_rw_mutex_destroy(unsigned long handle)
+{
+    if (handle == 0)
+        return;
+    Kernel::RwMutex* rw = reinterpret_cast<Kernel::RwMutex*>(handle);
+    rw->~RwMutex();
+    Kernel::Mm::Free(rw);
+}
+
+void kernel_rw_mutex_read_lock(unsigned long handle)
+{
+    reinterpret_cast<Kernel::RwMutex*>(handle)->ReadLock();
+}
+
+void kernel_rw_mutex_read_unlock(unsigned long handle)
+{
+    reinterpret_cast<Kernel::RwMutex*>(handle)->ReadUnlock();
+}
+
+void kernel_rw_mutex_write_lock(unsigned long handle)
+{
+    reinterpret_cast<Kernel::RwMutex*>(handle)->WriteLock();
+}
+
+void kernel_rw_mutex_write_unlock(unsigned long handle)
+{
+    reinterpret_cast<Kernel::RwMutex*>(handle)->WriteUnlock();
 }
 
 unsigned long kernel_waitgroup_create()
