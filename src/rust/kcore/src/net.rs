@@ -35,6 +35,13 @@ pub fn register(ops: &NetDeviceOps) -> Option<NetDeviceHandle> {
 }
 
 impl NetDeviceHandle {
+    /// Construct a null placeholder (handle == 0).
+    /// Used as a field initialiser before the real handle is assigned.
+    /// Calling any method on a placeholder is a no-op or returns None.
+    pub fn placeholder() -> Self {
+        Self { handle: 0 }
+    }
+
     pub fn set_ip(&self, ip: u32) {
         unsafe { net::kernel_netdev_set_ip(self.handle, ip) }
     }
@@ -135,6 +142,25 @@ impl NetFrame {
 
     pub fn set_len(&mut self, len: usize) {
         unsafe { net::kernel_netframe_set_len(self.handle, len) }
+    }
+
+    /// Consume the frame, returning the raw handle without decrementing
+    /// the refcount.  The caller must eventually call `from_raw()` or
+    /// invoke `kernel_netframe_put(handle)` directly (e.g. from an ISR).
+    pub fn into_raw(self) -> usize {
+        let h = self.handle;
+        core::mem::forget(self);
+        h
+    }
+
+    /// Reconstruct a `NetFrame` from a raw handle returned by `into_raw()`.
+    ///
+    /// # Safety
+    /// `handle` must be a valid non-zero handle previously obtained from
+    /// `into_raw()`.  The caller must not use the original raw handle after
+    /// this call.
+    pub unsafe fn from_raw(handle: usize) -> Self {
+        Self { handle }
     }
 }
 
