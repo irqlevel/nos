@@ -129,6 +129,41 @@ void kernel_spinlock_unlock(unsigned long handle, unsigned long long flags)
     reinterpret_cast<Kernel::SpinLock*>(handle)->Unlock((unsigned long)flags);
 }
 
+unsigned long kernel_rw_spinlock_create()
+{
+    Kernel::RawRwSpinLock* rw = Kernel::Mm::TAlloc<Kernel::RawRwSpinLock, RustAllocTag>();
+    return (unsigned long)rw;
+}
+
+void kernel_rw_spinlock_destroy(unsigned long handle)
+{
+    if (handle == 0)
+        return;
+    Kernel::RawRwSpinLock* rw = reinterpret_cast<Kernel::RawRwSpinLock*>(handle);
+    rw->~RawRwSpinLock();
+    Kernel::Mm::Free(rw);
+}
+
+void kernel_rw_spinlock_read_lock(unsigned long handle)
+{
+    reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->ReadLock();
+}
+
+void kernel_rw_spinlock_read_unlock(unsigned long handle)
+{
+    reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->ReadUnlock();
+}
+
+unsigned long long kernel_rw_spinlock_write_lock(unsigned long handle)
+{
+    return (unsigned long long)reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->WriteLockIrqSave();
+}
+
+void kernel_rw_spinlock_write_unlock(unsigned long handle, unsigned long long flags)
+{
+    reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->WriteUnlockIrqRestore((unsigned long)flags);
+}
+
 unsigned long kernel_waitgroup_create()
 {
     Kernel::WaitGroup* wg = Kernel::Mm::TAlloc<Kernel::WaitGroup, RustAllocTag>();

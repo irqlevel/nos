@@ -60,3 +60,40 @@ pub fn boot_time() -> Duration {
 pub fn wall_clock_secs() -> u64 {
     unsafe { time::kernel_get_wall_time_secs() }
 }
+
+/// Busy-poll `condition` for up to `iterations` iterations without sleeping.
+///
+/// Intended for early-boot or IRQ-disabled contexts where sleeping is not
+/// possible.  Each iteration is roughly one function call + some work done
+/// by the caller's closure.
+///
+/// Returns `true` if `condition` returned `true` before iterations ran out,
+/// `false` on timeout.
+pub fn poll_until_busy<F: FnMut() -> bool>(iterations: usize, mut condition: F) -> bool {
+    for _ in 0..iterations {
+        if condition() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sleep-poll `condition` until it returns `true` or `timeout` elapses.
+///
+/// Sleeps `interval` between polls so the calling task yields the CPU.
+/// Use this in task context where sleeping is safe.
+///
+/// Returns `true` if `condition` returned `true` within the timeout,
+/// `false` otherwise.
+pub fn poll_until<F: FnMut() -> bool>(timeout: Duration, interval: Duration, mut condition: F) -> bool {
+    let deadline = boot_time().saturating_add(timeout);
+    loop {
+        if condition() {
+            return true;
+        }
+        if boot_time() >= deadline {
+            return false;
+        }
+        crate::task::sleep(interval);
+    }
+}
