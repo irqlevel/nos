@@ -78,6 +78,7 @@ CXX_SRC =   \
     src/cpp/kernel/parameters.cpp \
     src/cpp/kernel/raw_spin_lock.cpp \
     src/cpp/kernel/raw_rw_spin_lock.cpp \
+    src/cpp/kernel/rw_mutex.cpp \
     src/cpp/kernel/stack_trace.cpp \
     src/cpp/kernel/symtab.cpp \
     src/cpp/kernel/entropy.cpp \

@@ -181,6 +181,60 @@ impl<'a> Drop for RwWriteGuard<'a> {
     }
 }
 
+/// Read-write mutex with writer priority.
+///
+/// Like `RwSpinLock` but yields the CPU (`Schedule()`) when contending instead
+/// of busy-spinning.  Use in task context only — must not be called from IRQ
+/// handlers or with interrupts disabled.
+pub struct RwMutex {
+    handle: usize,
+}
+
+impl RwMutex {
+    pub fn new() -> Option<Self> {
+        let h = unsafe { sync::kernel_rw_mutex_create() };
+        if h == 0 { None } else { Some(Self { handle: h }) }
+    }
+
+    pub fn read(&self) -> RwMutexReadGuard<'_> {
+        unsafe { sync::kernel_rw_mutex_read_lock(self.handle) }
+        RwMutexReadGuard { lock: self, _not_send: PhantomData }
+    }
+
+    pub fn write(&self) -> RwMutexWriteGuard<'_> {
+        unsafe { sync::kernel_rw_mutex_write_lock(self.handle) }
+        RwMutexWriteGuard { lock: self, _not_send: PhantomData }
+    }
+}
+
+impl Drop for RwMutex {
+    fn drop(&mut self) {
+        unsafe { sync::kernel_rw_mutex_destroy(self.handle) }
+    }
+}
+
+pub struct RwMutexReadGuard<'a> {
+    lock: &'a RwMutex,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<'a> Drop for RwMutexReadGuard<'a> {
+    fn drop(&mut self) {
+        unsafe { sync::kernel_rw_mutex_read_unlock(self.lock.handle) }
+    }
+}
+
+pub struct RwMutexWriteGuard<'a> {
+    lock: &'a RwMutex,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<'a> Drop for RwMutexWriteGuard<'a> {
+    fn drop(&mut self) {
+        unsafe { sync::kernel_rw_mutex_write_unlock(self.lock.handle) }
+    }
+}
+
 /// One-shot completion event.
 ///
 /// Wraps a `WaitGroup` pre-armed with `add(1)`.  Call `complete()` exactly
