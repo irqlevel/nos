@@ -1,6 +1,7 @@
 #include "time.h"
 #include "tsc.h"
 #include "trace.h"
+#include "asm.h"
 
 #include <drivers/pit.h>
 #include <drivers/hpet.h>
@@ -80,6 +81,15 @@ Stdlib::Time GetBootTime()
         return Hpet::GetInstance().GetTime();
 
     return Pit::GetInstance().GetTime();
+}
+
+void BusyWait(ulong nanoSecs)
+{
+    Stdlib::Time expired = GetBootTime() + Stdlib::Time(nanoSecs);
+    while (GetBootTime() < expired)
+    {
+        Pause();
+    }
 }
 
 ulong GetWallTimeSecs()
