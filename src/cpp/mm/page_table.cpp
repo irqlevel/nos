@@ -737,6 +737,62 @@ ulong PageTable::TmpMapAddress(ulong phyAddr)
     return vaPage + (phyAddr - phyPage);
 }
 
+ulong PageTable::TmpMapRange(ulong phyAddr, size_t len)
+{
+    ulong phyBase = phyAddr & ~(Const::PageSize - 1);
+    ulong offset = phyAddr - phyBase;
+    size_t pageCount = (offset + len + Const::PageSize - 1) / Const::PageSize;
+
+    if (pageCount <= 1)
+        return TmpMapAddress(phyAddr);
+
+    Stdlib::AutoLock lock(TmpMapLock);
+
+    for (size_t i = 0; i + pageCount <= Stdlib::ArraySize(TmpMapPageArray); i++)
+    {
+        bool allFree = true;
+        for (size_t j = 0; j < pageCount; j++)
+        {
+            if (TmpMapPageArray[i + j])
+            {
+                allFree = false;
+                i += j; /* skip to after the occupied slot */
+                break;
+            }
+        }
+        if (!allFree)
+            continue;
+
+        for (size_t j = 0; j < pageCount; j++)
+        {
+            ulong thisPhyPage = phyBase + j * Const::PageSize;
+            ulong virtAddr = TmpMapStart + (i + j) * Const::PageSize;
+            ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+            Pte *l1Entry = &TmpMapL1Page->Entry[l1Index];
+            if (l1Entry->Present())
+                return 0;
+
+            l1Entry->SetAddress(thisPhyPage);
+            l1Entry->SetCacheDisabled();
+            l1Entry->SetWritable();
+            l1Entry->SetPresent();
+            Invlpg(virtAddr);
+
+            bool havePage = (thisPhyPage / Const::PageSize) < PageArrayCount;
+            if (havePage) {
+                Page* page = GetPage(thisPhyPage);
+                BugOn(!page);
+                TmpMapPageArray[i + j] = page;
+            } else {
+                TmpMapPageArray[i + j] = TmpMapDirectSentinel;
+            }
+        }
+        return TmpMapStart + i * Const::PageSize + offset;
+    }
+
+    return 0;
+}
+
 bool PageTable::MapPage(ulong virtAddr, Page* page)
 {
     Stdlib::AutoLock lock(Lock);

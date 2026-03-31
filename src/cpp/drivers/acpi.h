@@ -131,7 +131,6 @@ private:
 
     char OemId[7];
 
-    RSDPDescriptor20* Rsdp;
     ACPISDTHeader* Rsdt;
 
     static const size_t MaxTables = 32;

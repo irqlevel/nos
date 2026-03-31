@@ -178,6 +178,7 @@ public:
     ulong TmpMapPage(ulong phyAddr);
     ulong TmpUnmapPage(ulong virtAddr);
     ulong TmpMapAddress(ulong phyAddr);
+    ulong TmpMapRange(ulong phyAddr, size_t len);
 
     ulong VirtToPhys(ulong virtAddr);
 
