@@ -8,7 +8,7 @@
 #include <boot/boot64.h>
 
 #include <drivers/lapic.h>
-#include <drivers/pit.h>
+#include <kernel/time.h>
 #include <mm/new.h>
 #include <mm/page_table.h>
 
@@ -186,7 +186,7 @@ bool CpuTable::StartAll()
         }
     }
 
-    Pit::GetInstance().Wait(10 * Const::NanoSecsInMs); /* 10ms after INIT */
+    BusyWait(10 * Const::NanoSecsInMs); /* 10ms after INIT */
 
     /*
      * Intel MP spec: send two SIPIs, 200µs apart.
@@ -209,7 +209,7 @@ bool CpuTable::StartAll()
             }
         }
 
-        Pit::GetInstance().Wait(SipiDelayUs * Const::NanoSecsInUsec); /* 200µs */
+        BusyWait(SipiDelayUs * Const::NanoSecsInUsec); /* 200µs */
     }
 
     /* Poll for APs to finish startup, up to 500ms */
@@ -218,7 +218,7 @@ bool CpuTable::StartAll()
 
     for (ulong waited = 0; waited < ApTimeoutMs; waited += ApPollIntervalMs)
     {
-        Pit::GetInstance().Wait(ApPollIntervalMs * Const::NanoSecsInMs);
+        BusyWait(ApPollIntervalMs * Const::NanoSecsInMs);
 
         bool allRunning = true;
         {

@@ -8,5 +8,7 @@ namespace Kernel
 
     Stdlib::Time GetBootTime();
 
+    void BusyWait(ulong nanoSecs);
+
     ulong GetWallTimeSecs();
 }

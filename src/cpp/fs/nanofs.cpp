@@ -5,8 +5,8 @@
 #include <lib/checksum.h>
 #include <mm/new.h>
 #include <kernel/trace.h>
+#include <kernel/time.h>
 #include <kernel/asm.h>
-#include <drivers/pit.h>
 
 namespace Kernel
 {
@@ -128,7 +128,7 @@ bool NanoFs::Format(BlockDevice* dev)
 
     // Generate UUID from TSC + uptime
     u64 tsc = ReadTsc();
-    u64 uptime = Pit::GetInstance().GetTime().NanoSecs;
+    u64 uptime = GetBootTime().GetValue();
     u8 seed[16];
     Stdlib::MemCpy(&seed[0], &tsc, 8);
     Stdlib::MemCpy(&seed[8], &uptime, 8);
