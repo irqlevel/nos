@@ -9,8 +9,7 @@ namespace Kernel
 {
 
 Acpi::Acpi()
-    : Rsdp(nullptr)
-    , Rsdt(nullptr)
+    : Rsdt(nullptr)
     , LapicAddress(nullptr)
     , IoApicAddress(nullptr)
     , IrqToGsiSize(0)
@@ -49,12 +48,13 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
 {
     if (ComputeSum(rsdp, sizeof(rsdp->FirstPart)) != 0)
     {
-        Trace(0, "Rsdp 0x%p checksum failed 0x%p vs 0x%p",
+        Trace(0, "Rsdp 0x%p checksum failed (sum 0x%p)",
             rsdp, (ulong)ComputeSum(rsdp, sizeof(rsdp->FirstPart)));
         return false;
     }
 
     Stdlib::MemCpy(OemId, rsdp->FirstPart.OEMID, sizeof(rsdp->FirstPart.OEMID));
+    OemId[sizeof(rsdp->FirstPart.OEMID)] = '\0';
 
     Trace(0, "Rsdp 0x%p revision %u OemId %s Rsdt 0x%p",
         rsdp, (ulong)rsdp->FirstPart.Revision, OemId, (ulong)rsdp->FirstPart.RsdtAddress);
@@ -157,20 +157,53 @@ Stdlib::Error Acpi::ParseTablePointers()
     size_t tableCount = (Rsdt->Length - OFFSET_OF(ACPISDTHeader, Entry)) / sizeof(Rsdt->Entry[0]);
     Trace(AcpiLL, "Acpi: tableCount %u", tableCount);
 
+    auto& pt = Mm::PageTable::GetInstance();
+
     for (size_t i = 0; i < tableCount; i++)
     {
-        ACPISDTHeader* header = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().TmpMapAddress(Rsdt->Entry[i]));
-        char tableSignature[5];
-
-        Stdlib::MemCpy(tableSignature, header->Signature, sizeof(header->Signature));
-        tableSignature[4] = '\0';
-
-        Trace(AcpiLL, "Acpi: table 0x%p %s", header, tableSignature);
         if (i >= Stdlib::ArraySize(Table))
         {
             Trace(0, "Acpi: can't insert table %u", (ulong)i);
             return MakeError(Stdlib::Error::NotFound);
         }
+
+        /*
+         * First map just the header page to read Length, then re-map
+         * the full table so that parsers have a contiguous VA range.
+         */
+        ACPISDTHeader* header = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(Rsdt->Entry[i]));
+        if (!header)
+        {
+            Trace(0, "Acpi: can't map table %u phys 0x%p", (ulong)i, (ulong)Rsdt->Entry[i]);
+            return MakeError(Stdlib::Error::NoMemory);
+        }
+
+        u32 tableLength = header->Length;
+        if (tableLength < sizeof(ACPISDTHeader))
+        {
+            Trace(0, "Acpi: table %u length %u too small", (ulong)i, (ulong)tableLength);
+            return MakeError(Stdlib::Error::InvalidValue);
+        }
+
+        ulong physOffset = Rsdt->Entry[i] & (Const::PageSize - 1);
+        if (physOffset + tableLength > Const::PageSize)
+        {
+            /* Table spans pages — unmap the single-page mapping and re-map the full range */
+            pt.TmpUnmapPage(reinterpret_cast<ulong>(header) & ~(Const::PageSize - 1));
+            header = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(Rsdt->Entry[i], tableLength));
+            if (!header)
+            {
+                Trace(0, "Acpi: can't map table %u range phys 0x%p len %u",
+                    (ulong)i, (ulong)Rsdt->Entry[i], (ulong)tableLength);
+                return MakeError(Stdlib::Error::NoMemory);
+            }
+        }
+
+        char tableSignature[5];
+        Stdlib::MemCpy(tableSignature, header->Signature, sizeof(header->Signature));
+        tableSignature[4] = '\0';
+
+        Trace(AcpiLL, "Acpi: table 0x%p %s len %u", header, tableSignature, (ulong)tableLength);
 
         Table[i] = header;
     }
@@ -282,27 +315,33 @@ void Acpi::ParseFADT()
         return;
     }
 
-    if (sdtHeader->Length < sizeof(ACPISDTHeader) + sizeof(FadtFields))
-    {
-        Trace(0, "Acpi: FADT too short: %u", (ulong)sdtHeader->Length);
-        return;
-    }
-
+    ulong bodyLen = sdtHeader->Length - sizeof(ACPISDTHeader);
     FadtFields* fadt = reinterpret_cast<FadtFields*>(sdtHeader + 1);
 
-    Pm1aCntPort = fadt->Pm1aCntBlk;
-    Trace(AcpiLL, "Acpi: FADT PM1a_CNT port 0x%p flags 0x%p",
-        Pm1aCntPort, (ulong)fadt->Flags);
-
-    /* RESET_REG_SUP is bit 10 of Flags */
-    static const u32 ResetRegSup = (1u << 10);
-    if ((fadt->Flags & ResetRegSup) && fadt->ResetReg.AddressSpaceId == 1 /* I/O */)
+    /* Pm1aCntBlk sits at body offset +28; need at least 32 bytes of body */
+    static const ulong Pm1aCntBlkEnd = OFFSET_OF(FadtFields, Pm1aCntBlk) + sizeof(fadt->Pm1aCntBlk);
+    if (bodyLen >= Pm1aCntBlkEnd)
     {
-        ResetRegValid = true;
-        ResetRegPort = (ulong)fadt->ResetReg.Address;
-        ResetVal = fadt->ResetValue;
-        Trace(AcpiLL, "Acpi: FADT RESET_REG port 0x%p value 0x%p",
-            ResetRegPort, (ulong)ResetVal);
+        Pm1aCntPort = fadt->Pm1aCntBlk;
+        Trace(AcpiLL, "Acpi: FADT PM1a_CNT port 0x%p", Pm1aCntPort);
+    }
+
+    /* Flags + ResetReg + ResetValue require at least 93 bytes of body (ACPI 2.0+) */
+    static const ulong ResetValueEnd = OFFSET_OF(FadtFields, ResetValue) + sizeof(fadt->ResetValue);
+    if (bodyLen >= ResetValueEnd)
+    {
+        Trace(AcpiLL, "Acpi: FADT flags 0x%p", (ulong)fadt->Flags);
+
+        /* RESET_REG_SUP is bit 10 of Flags */
+        static const u32 ResetRegSup = (1u << 10);
+        if ((fadt->Flags & ResetRegSup) && fadt->ResetReg.AddressSpaceId == 1 /* I/O */)
+        {
+            ResetRegValid = true;
+            ResetRegPort = (ulong)fadt->ResetReg.Address;
+            ResetVal = fadt->ResetValue;
+            Trace(AcpiLL, "Acpi: FADT RESET_REG port 0x%p value 0x%p",
+                ResetRegPort, (ulong)ResetVal);
+        }
     }
 }
 
@@ -346,12 +385,30 @@ Stdlib::Error Acpi::Parse()
         return MakeError(Stdlib::Error::NotFound);
     }
 
-    Rsdp = rsdp;
-    ACPISDTHeader* rsdt = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().TmpMapAddress(Rsdp->FirstPart.RsdtAddress));
+    /* Extract RsdtAddress and free the RSDP temp-map slot */
+    u32 rsdtPhysAddr = rsdp->FirstPart.RsdtAddress;
+    auto& pt = Mm::PageTable::GetInstance();
+    pt.TmpUnmapPage(reinterpret_cast<ulong>(rsdp) & ~(Const::PageSize - 1));
+
+    ACPISDTHeader* rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(rsdtPhysAddr));
+    if (!rsdt)
+        return MakeError(Stdlib::Error::NoMemory);
+
     err = ParseRsdt(rsdt);
     if (!err.Ok())
     {
         return err;
+    }
+
+    /* Re-map the full RSDT if it spans a page boundary */
+    ulong rsdtPhysOff = rsdtPhysAddr & (Const::PageSize - 1);
+    u32 rsdtLength = rsdt->Length;
+    if (rsdtPhysOff + rsdtLength > Const::PageSize)
+    {
+        pt.TmpUnmapPage(reinterpret_cast<ulong>(rsdt) & ~(Const::PageSize - 1));
+        rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rsdtPhysAddr, rsdtLength));
+        if (!rsdt)
+            return MakeError(Stdlib::Error::NoMemory);
     }
     Rsdt = rsdt;
 
