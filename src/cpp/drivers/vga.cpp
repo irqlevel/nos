@@ -8,6 +8,8 @@
 namespace Kernel
 {
 
+bool VgaTerm::ReadyFlag = false;
+
 VgaTerm::VgaTerm()
     : Buf(nullptr)
     , Row(0)
@@ -36,6 +38,8 @@ VgaTerm::VgaTerm()
 
     ClsLockHeld();
     Cursor();
+
+    ReadyFlag = true;
 }
 
 VgaTerm::~VgaTerm()

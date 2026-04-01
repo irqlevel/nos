@@ -57,7 +57,7 @@ void Tracer::Output(const char *fmt, ...)
         Serial::GetInstance().PrintString(msg);
         Serial::GetInstance().Flush();
 
-        if (Parameters::GetInstance().IsTraceVga())
+        if (Parameters::GetInstance().IsTraceVga() && VgaTerm::IsReady())
         {
             VgaTerm::GetInstance().PrintString(msg);
         }
