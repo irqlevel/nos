@@ -198,6 +198,11 @@ Stdlib::Error TestAllocator()
 
     for (size_t size = 1; size <= 8 * Const::PageSize; size++)
     {
+        if (size % 500 == 0)
+        {
+            Trace(0, "TestAllocator: alloc size %u", size);
+        }
+
         u8 *block = new u8[size];
         if (block == nullptr)
         {
