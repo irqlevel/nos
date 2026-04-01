@@ -16,6 +16,8 @@ public:
         return Instance;
     }
 
+    static bool IsReady() { return ReadyFlag; }
+
     void Puts(const char *s);
     void Cls();
 
@@ -88,6 +90,8 @@ private:
     const u16 VgaIndex = 0x0E;
 
     SpinLock Lock;
+
+    static bool ReadyFlag;
 };
 
 }

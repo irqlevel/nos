@@ -31,7 +31,8 @@ bool Panicker::IsActive()
 void Panicker::PrintOutput(const char* str)
 {
     Serial::GetInstance().PanicPrintString(str);
-    VgaTerm::GetInstance().PanicPrintString(str);
+    if (VgaTerm::IsReady())
+        VgaTerm::GetInstance().PanicPrintString(str);
 }
 
 void Panicker::DumpContext()
