@@ -85,6 +85,70 @@ void TraceCpuState(ulong cpu)
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
 }
 
+/*
+ * Halt the Intel TCO (Total Cost of Ownership) hardware watchdog.
+ *
+ * The BIOS may leave the TCO timer running with a short timeout.  If
+ * nothing kicks it before the second expiry the PCH resets the system.
+ * We halt it here so the kernel can run self-tests in peace; the Rust
+ * tco_wdt driver re-enables it later with a proper timeout.
+ *
+ * Discovery mirrors the Rust TcoWatchdog::probe():
+ *   1. Read TCOBASE from LPC bridge PCI config reg 0x50.
+ *   2. Fallback: ACPI PMBASE (reg 0x40) + 0x60.
+ *   3. Set TMR_HLT (bit 11) in TCO1_CNT to stop the timer.
+ */
+static void HaltTcoWatchdog()
+{
+    static const u16 PciCfgAddr  = 0xCF8;
+    static const u16 PciCfgData  = 0xCFC;
+    static const u32 LpcBdf      = (0U << 16) | (0x1FU << 11) | (0U << 8);
+    static const u16 VendorReg   = 0x00;
+    static const u16 TcoBaseReg  = 0x50;
+    static const u16 AcpiBaseReg = 0x40;
+    static const u16 AcpiTcoOff  = 0x60;
+    static const u16 Tco1Sts     = 0x04;
+    static const u16 Tco2Sts     = 0x06;
+    static const u16 Tco1Cnt     = 0x08;
+    static const u16 TmrHlt      = 1 << 11;
+    static const u16 IntelVendor = 0x8086;
+
+    Trace(0, "HaltTcoWatchdog: started");
+
+    /* Only Intel PCH has a TCO watchdog */
+    Out(PciCfgAddr, 0x80000000 | LpcBdf | VendorReg);
+    u16 vendor = (u16)In(PciCfgData);
+    if (vendor != IntelVendor)
+        return;
+
+    u16 tcoBase = 0;
+
+    Out(PciCfgAddr, 0x80000000 | LpcBdf | TcoBaseReg);
+    u16 raw = (u16)In(PciCfgData);
+    if (raw != 0 && raw != 0xFFFF)
+        tcoBase = raw & 0xFFE0;
+
+    if (tcoBase == 0) {
+        Out(PciCfgAddr, 0x80000000 | LpcBdf | AcpiBaseReg);
+        u16 pmBase = (u16)In(PciCfgData) & 0xFFFE;
+        if (pmBase != 0 && pmBase != 0xFFFE)
+            tcoBase = pmBase + AcpiTcoOff;
+    }
+
+    if (tcoBase == 0)
+        return;
+
+    /* Halt the timer */
+    u16 cnt = Inw(tcoBase + Tco1Cnt);
+    Outw(tcoBase + Tco1Cnt, cnt | TmrHlt);
+
+    /* Clear stale timeout status so the first-expiry latch is reset */
+    Outw(tcoBase + Tco1Sts, 1 << 3);
+    Outw(tcoBase + Tco2Sts, 1 << 1);
+
+    Trace(0, "TCO watchdog halted (tcoBase 0x%p)", (ulong)tcoBase);
+}
+
 void ApStartup(void *ctx)
 {
     (void)ctx;
@@ -654,6 +718,8 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     /* Setup HPET after page allocator is ready (MMIO mapping requires it).
        HPET may not be available on all hardware; Setup() returns false silently. */
     Hpet::GetInstance().Setup();
+
+    HaltTcoWatchdog();
 
     VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
 
