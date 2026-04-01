@@ -28,7 +28,7 @@ Stdlib::Error TestBtree()
 {
     Stdlib::Error err;
 
-    Trace(TestLL, "TestBtree: started");
+    Trace(0, "TestBtree: started");
 
     size_t keyCount = 431;
 
@@ -194,13 +194,14 @@ Stdlib::Error TestBtree()
 
 Stdlib::Error TestAllocator()
 {
-    Stdlib::Error err;
+    Trace(0, "TestAllocator: started");
 
     for (size_t size = 1; size <= 8 * Const::PageSize; size++)
     {
         u8 *block = new u8[size];
         if (block == nullptr)
         {
+            Trace(0, "TestAllocator: alloc failed at size %u", size);
             return Stdlib::Error::NoMemory;
         }
 
@@ -210,11 +211,14 @@ Stdlib::Error TestAllocator()
         delete [] block;
     }
 
+    Trace(0, "TestAllocator: complete");
     return MakeError(Stdlib::Error::Success);
 }
 
 Stdlib::Error TestRingBuffer()
 {
+    Trace(0, "TestRingBuffer: started");
+
     Stdlib::RingBuffer<u8, 3> rb;
 
     if (!rb.Put(0x1))
