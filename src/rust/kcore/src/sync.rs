@@ -235,6 +235,15 @@ impl<'a> Drop for RwMutexWriteGuard<'a> {
     }
 }
 
+/// Signal a WaitGroup by raw handle from ISR context, where no `&WaitGroup`
+/// borrow is possible (e.g. the handle was stashed in an inflight slot).
+///
+/// `handle` must come from `WaitGroup::raw_handle()` (or
+/// `Completion::raw_handle()`) on a WaitGroup that is still alive.
+pub fn waitgroup_done_raw(handle: usize) {
+    unsafe { sync::kernel_waitgroup_done(handle) }
+}
+
 /// One-shot completion event.
 ///
 /// Wraps a `WaitGroup` pre-armed with `add(1)`.  Call `complete()` exactly

@@ -47,6 +47,17 @@ impl DmaBuffer {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len()) }
     }
+
+    /// Raw pointer access for buffers that a device writes concurrently
+    /// (descriptor rings, completion queues).  Forming a `&`/`&mut` slice
+    /// over such memory is unsound; use these with volatile reads/writes.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr
+    }
 }
 
 impl Drop for DmaBuffer {

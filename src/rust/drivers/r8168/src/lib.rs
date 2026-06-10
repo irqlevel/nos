@@ -77,13 +77,15 @@ struct R8168Device {
 
 impl Drop for R8168Device {
     fn drop(&mut self) {
-        /* Mask all interrupts at the hardware level before any fields are
-         * dropped.  This prevents a last in-flight interrupt (already
-         * delivered to the CPU but not yet handled) from calling the ISR
-         * after we start freeing resources.  The interrupt gate ensures
-         * interrupts are disabled in the ISR, so there is no race with
-         * an ISR that is currently executing when Drop is called from
-         * kernel shutdown context (interrupts enabled). */
+        /* Stop the TX/RX DMA engines, then mask all interrupts at the
+         * hardware level, before any fields are dropped.  This prevents
+         * the NIC from DMAing into rings we are about to free and a last
+         * in-flight interrupt (already delivered to the CPU but not yet
+         * handled) from calling the ISR after we start freeing resources.
+         * The interrupt gate ensures interrupts are disabled in the ISR,
+         * so there is no race with an ISR that is currently executing when
+         * Drop is called from kernel shutdown context (interrupts enabled). */
+        self.regs.write8(CMD_REG, 0);
         self.regs.write16(INTR_MASK, 0);
     }
 }
@@ -180,8 +182,8 @@ fn init_device(pci_dev: &pci::PciDevice) {
             Some(frame) => rx_ring.post(i, frame),
             None => {
                 trace!(0, "r8168: RX frame alloc failed at slot {}", i);
-                /* Ring is partially filled; stop here.  process_rx will not
-                 * advance past unfilled slots (frames[i] == 0). */
+                /* Ring is partially filled; stop here.  process_rx refills
+                 * empty slots at its loop head once memory is available. */
                 break;
             }
         }
@@ -221,10 +223,18 @@ fn init_device(pci_dev: &pci::PciDevice) {
         regs.write8(MAR0 + i, 0xFF);
     }
 
-    /* Device index is allocated later, after successful registration.
-     * Use a placeholder for the name; it will be overwritten once we
-     * know the real index. */
-    let name_buf = [0u8; 16];
+    /* Name the device with the next free index before registering (the
+     * C++ side traces the name at registration time).  Init runs
+     * single-threaded, so the provisional index is stable; DEVICE_COUNT
+     * itself is only incremented after registration succeeds, so it is
+     * never inflated by failed initialisations. */
+    let idx = DEVICE_COUNT.load(Ordering::Relaxed);
+    if idx as usize >= MAX_DEVICES {
+        trace!(0, "r8168: too many devices (max {})", MAX_DEVICES);
+        return;
+    }
+    let mut name_buf = [0u8; 16];
+    write_device_name(&mut name_buf, idx);
 
     /* Box the device so it has a stable address for ISR callbacks.
      * _irq and net_handle are placeholders (handle=0, no-op Drop); they are
@@ -283,16 +293,8 @@ fn init_device(pci_dev: &pci::PciDevice) {
     };
     unsafe { (*raw).net_handle = handle };
 
-    /* Allocate device slot only after everything has succeeded so that
-     * DEVICE_COUNT is never inflated by failed initialisations. */
-    let idx = DEVICE_COUNT.fetch_add(1, Ordering::Relaxed);
-    if idx as usize >= MAX_DEVICES {
-        trace!(0, "r8168: too many devices (max {})", MAX_DEVICES);
-        unsafe { drop(Box::from_raw(raw)) };
-        return;
-    }
-    write_device_name(unsafe { &mut (*raw).name_buf }, idx);
-
+    /* Commit the device slot only after everything has succeeded. */
+    DEVICE_COUNT.store(idx + 1, Ordering::Relaxed);
     DEVICES[idx as usize].store(raw, Ordering::Release);
     trace!(0, "r8168: registered as {} (irq={})",
         core::str::from_utf8(unsafe { &(*raw).name_buf }).unwrap_or("?"),
@@ -440,24 +442,32 @@ extern "C" fn r8168_process_rx(ctx: *mut u8) {
 
     /* Walk the RX ring until we hit a hardware-owned descriptor */
     loop {
-        let (mut frame, rx_len) = match dev.rx_ring.harvest() {
+        let idx = dev.rx_ring.head;
+
+        /* Refill a slot left empty by an earlier NetFrame allocation
+         * failure.  The hardware stalls on a descriptor it does not own,
+         * so RX cannot make progress until the slot is reposted. */
+        if dev.rx_ring.frames[idx] == 0 {
+            match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+                Some(frame) => dev.rx_ring.post(idx, frame),
+                None => break, /* still no memory; retry on next softirq */
+            }
+        }
+
+        let (mut frame, opts1) = match dev.rx_ring.harvest() {
             None => break,
             Some(pair) => pair,
         };
 
-        if rx_len < 4 {
-            /* Discard runt frames (hardware glitch or error) */
+        let rx_len = opts1 & RX_LEN_MASK;
+        let whole_frame = opts1 & RX_FF != 0 && opts1 & RX_LF != 0;
+        if opts1 & RX_ERR_MASK != 0 || !whole_frame || rx_len < 4 {
+            /* Error frame, multi-descriptor fragment (cannot happen while
+             * RX_MAX_SIZE < RX_BUF_SIZE, but check anyway), or runt:
+             * drop it and give the buffer straight back to hardware. */
             dev.rx_dropped.fetch_add(1, Ordering::Relaxed);
-            /* Re-post the frame to hardware */
-            let idx = (dev.rx_ring.head + RING_SIZE - 1) % RING_SIZE; /* prev slot */
-            match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-                Some(new_frame) => dev.rx_ring.post(idx, new_frame),
-                None => {
-                    /* No memory: repost the original frame with reset length */
-                    frame.set_len(0);
-                    dev.rx_ring.post(idx, frame);
-                }
-            }
+            frame.set_len(0);
+            dev.rx_ring.post(idx, frame);
             continue;
         }
 
@@ -469,14 +479,12 @@ extern "C" fn r8168_process_rx(ctx: *mut u8) {
         /* Enqueue to kernel net stack (transfers ownership) */
         dev.net_handle.enqueue_rx(frame);
 
-        /* Refill this slot: compute the descriptor index we just harvested
-         * (head has already advanced in harvest()). */
-        let prev = (dev.rx_ring.head + RING_SIZE - 1) % RING_SIZE;
+        /* Refill the slot we just harvested */
         match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-            Some(new_frame) => dev.rx_ring.post(prev, new_frame),
+            Some(new_frame) => dev.rx_ring.post(idx, new_frame),
             None => {
-                /* Memory pressure: leave slot empty; process_rx will skip it
-                 * next time (frames[prev] == 0). */
+                /* Memory pressure: leave the slot empty; the refill at the
+                 * top of this loop reposts it once allocation succeeds. */
                 dev.rx_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }

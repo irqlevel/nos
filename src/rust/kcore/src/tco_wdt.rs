@@ -53,6 +53,9 @@ const TCO_TICK_NS: u64 = 600_000_000; /* 0.6 s */
 
 pub struct TcoWatchdog {
     tco_base: u16,
+    /* Tick value programmed into TCO_TMR by start(); used by is_counting()
+       to detect a timer that never runs (e.g. NO_REBOOT still set). */
+    armed_ticks: u16,
 }
 
 impl TcoWatchdog {
@@ -86,13 +89,18 @@ impl TcoWatchdog {
             return None;
         }
 
-        let wdt = Self { tco_base };
+        let wdt = Self { tco_base, armed_ticks: 0 };
 
         /* Clear TMR_HLT so the watchdog can be started */
         let cnt = Port::<u16>::new(tco_base + TCO1_CNT).read();
         Port::<u16>::new(tco_base + TCO1_CNT).write(cnt & !TMR_HLT);
 
-        /* Disable No Reboot bit in PMC GCS so the second expiry triggers a reset */
+        /* Disable No Reboot so the second expiry triggers a reset.
+           CAVEAT: the NO_REBOOT location is chipset-specific.  Config
+           register 0xAC works on PCH generations where the PMC exposes GCS
+           there; on ICH9-class chipsets it lives in RCBA MMIO (+0x3410)
+           and this write has no effect.  Callers should verify the timer
+           actually counts (is_counting()) before relying on it for reset. */
         let gcs = dev.read_config32(PMC_GCS_REG);
         dev.write_config32(PMC_GCS_REG, gcs & !GCS_NO_REBOOT);
 
@@ -105,7 +113,7 @@ impl TcoWatchdog {
 
     /// Start the watchdog with the given timeout in seconds.
     /// The actual timeout is rounded to the nearest 0.6-second boundary.
-    pub fn start(&self, timeout_secs: u32) {
+    pub fn start(&mut self, timeout_secs: u32) {
         /* Convert seconds to TCO ticks (round up, minimum 2 ticks) */
         let ticks = {
             let t = ((timeout_secs as u64) * 1_000_000_000 + TCO_TICK_NS - 1) / TCO_TICK_NS;
@@ -116,6 +124,7 @@ impl TcoWatchdog {
         let tmr = Port::<u16>::new(self.tco_base + TCO_TMR);
         let cur = tmr.read() & !0x1FF;
         tmr.write(cur | ticks);
+        self.armed_ticks = ticks;
 
         /* Reload (kick) to arm with the new value */
         self.kick();
@@ -134,5 +143,19 @@ impl TcoWatchdog {
     /// Kick (pet) the watchdog to prevent reset.
     pub fn kick(&self) {
         Port::<u16>::new(self.tco_base + TCO_RLD).write(0x0001);
+    }
+
+    /// Current countdown value (9-bit field of TCO_RLD).
+    pub fn current_count(&self) -> u16 {
+        Port::<u16>::new(self.tco_base + TCO_RLD).read() & 0x1FF
+    }
+
+    /// Returns `true` if the timer appears to be running.  Call this at
+    /// least one tick (~0.6s) after `start()`/`kick()`: a count still equal
+    /// to the armed value means the watchdog never started counting (e.g.
+    /// NO_REBOOT could not be cleared on this chipset) and a hang will NOT
+    /// trigger a reset.
+    pub fn is_counting(&self) -> bool {
+        self.current_count() != self.armed_ticks
     }
 }

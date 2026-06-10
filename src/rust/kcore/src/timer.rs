@@ -22,6 +22,13 @@ impl Timer {
     pub fn stop(self) {
         /* Drop handles the call. */
     }
+
+    /// Leak the handle so the timer keeps firing for the kernel's lifetime.
+    /// Dropping the returned `Timer` would stop it, so callers that want a
+    /// permanent periodic timer must call this (or store the handle).
+    pub fn leak(self) {
+        core::mem::forget(self);
+    }
 }
 
 impl Drop for Timer {

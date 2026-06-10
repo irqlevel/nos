@@ -86,9 +86,16 @@ pub const TX_LEN_MASK: u32 = 0x0000_FFFF; /* frame length in bits 15:0 */
 /* RX descriptor opts1 bits */
 pub const RX_OWN:    u32 = 1 << 31; /* owned by hardware */
 pub const RX_EOR:    u32 = 1 << 30; /* end of ring */
+pub const RX_FF:     u32 = 1 << 29; /* first fragment of a frame */
+pub const RX_LF:     u32 = 1 << 28; /* last fragment of a frame */
 pub const RX_MAR:    u32 = 1 << 26; /* multicast frame */
 pub const RX_PAM:    u32 = 1 << 25; /* physical address match */
 pub const RX_BAR:    u32 = 1 << 24; /* broadcast */
+pub const RX_RWT:    u32 = 1 << 22; /* receive watchdog timer expired */
+pub const RX_RES:    u32 = 1 << 21; /* receive error summary */
+pub const RX_RUNT:   u32 = 1 << 20; /* runt packet (< 64 bytes) */
+pub const RX_CRC:    u32 = 1 << 19; /* CRC error */
+pub const RX_ERR_MASK: u32 = RX_RWT | RX_RES | RX_RUNT | RX_CRC;
 pub const RX_LEN_MASK: u32 = 0x0000_3FFF; /* received frame length in bits 13:0 */
 
 /* ================================================================== */
