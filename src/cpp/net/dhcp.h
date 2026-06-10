@@ -82,11 +82,11 @@ private:
     void Run();
 
     bool DoDiscover();
-    bool DoRequest();
+    bool DoRequest(bool renewing = false);
     bool WaitForResponse(u8 expectedType, ulong timeoutMs);
 
     ulong BuildDiscover(u8* frame, ulong maxLen);
-    ulong BuildRequest(u8* frame, ulong maxLen);
+    ulong BuildRequest(u8* frame, ulong maxLen, bool renewing);
     bool ParseResponse(const u8* frame, ulong len, u8 expectedType);
 
     static void RxCallbackFn(const u8* frame, ulong len, void* ctx);
@@ -99,6 +99,7 @@ private:
     u32 Xid;
     Net::IpAddress OfferedIp;
     Net::IpAddress ServerId;
+    bool NakReceived; /* set by ParseResponse when the server NAKs our request */
 
     /* RX buffer for DHCP responses */
     static const ulong RxBufMaxLen = 1500;

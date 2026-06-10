@@ -173,6 +173,9 @@ struct TcpConn
     Atomic ConnReady;   /* set when state changes from SynSent/SynReceived */
     bool NeedCleanup;
     bool FinAcked;      /* our FIN has been ACKed */
+    bool OwnedByApp;    /* an application still holds this pointer; the cleanup
+                          timer must not recycle the slot until Close() clears it */
+    bool Accepted;      /* a passive connection already handed out by Accept() */
 
     /* Per-connection lock */
     RawSpinLock Lock;
@@ -265,6 +268,10 @@ private:
     void HandleState(TcpConn* conn, const Net::IpHdr* ip,
                      const Net::TcpHdr* tcp, const u8* payload,
                      ulong payloadLen);
+
+    /* Advance SndUna / drain SendBuf for an incoming ACK (wrap-safe).
+       Shared by every state that may have unacked data outstanding. */
+    void ProcessAck(TcpConn* conn, u32 ack, u16 wnd, ulong now);
 
     ulong GetBootTimeMs();
 

@@ -27,6 +27,7 @@ DhcpClient::DhcpClient()
     , TaskPtr(nullptr)
     , Ready(false)
     , Xid(0)
+    , NakReceived(false)
     , RxBufLen(0)
     , RxBufReady(false)
 {
@@ -167,7 +168,7 @@ void DhcpClient::Run()
         Dev->RegisterUdpListener(68, RxCallbackFn, this);
         Xid++;
 
-        bool renewed = DoRequest();
+        bool renewed = DoRequest(true);
 
         Dev->UnregisterUdpListener(68);
 
@@ -200,10 +201,10 @@ bool DhcpClient::DoDiscover()
     return true;
 }
 
-bool DhcpClient::DoRequest()
+bool DhcpClient::DoRequest(bool renewing)
 {
     u8 frame[600];
-    ulong len = BuildRequest(frame, sizeof(frame));
+    ulong len = BuildRequest(frame, sizeof(frame), renewing);
     if (len == 0)
         return false;
 
@@ -222,6 +223,8 @@ bool DhcpClient::WaitForResponse(u8 expectedType, ulong timeoutMs)
         Stdlib::AutoLock lock(RxLock);
         RxBufReady = false;
     }
+
+    NakReceived = false;
 
     ulong deadline = timeoutMs;
     while (deadline > 0)
@@ -246,6 +249,11 @@ bool DhcpClient::WaitForResponse(u8 expectedType, ulong timeoutMs)
         {
             if (ParseResponse(localBuf, localLen, expectedType))
                 return true;
+
+            /* A NAK for our transaction means the server rejected the lease;
+               fail immediately instead of waiting out the whole timeout. */
+            if (NakReceived)
+                return false;
         }
 
         /* Sleep 10ms */
@@ -336,9 +344,15 @@ ulong DhcpClient::BuildDiscover(u8* frame, ulong maxLen)
     return off;
 }
 
-ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
+ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen, bool renewing)
 {
-    ulong dhcpOptLen = 3 + 6 + 6 + 1; /* type(3) + requested_ip(6) + server_id(6) + end(1) */
+    /* SELECTING request (after an OFFER): include requested-IP + server-id.
+       RENEWING/REBINDING request: omit those options and carry the bound
+       address in ciaddr instead, per RFC 2131 -- some servers NAK or ignore a
+       renewal that still carries option 50/54. */
+    ulong dhcpOptLen = renewing
+        ? (3 + 1)             /* type(3) + end(1) */
+        : (3 + 6 + 6 + 1);    /* type(3) + requested_ip(6) + server_id(6) + end(1) */
     ulong dhcpLen = sizeof(DhcpPacket) + 4 + dhcpOptLen;
     ulong udpLen = sizeof(UdpHdr) + dhcpLen;
     ulong ipLen = sizeof(IpHdr) + udpLen;
@@ -358,13 +372,14 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
     eth->EtherType = Htons(EtherTypeIp);
     off += sizeof(EthHdr);
 
-    /* IP header */
+    /* IP header. When renewing we already hold an address, so source it from
+       our bound IP (REBINDING broadcast); otherwise send from 0.0.0.0. */
     IpHdr* ip = (IpHdr*)(frame + off);
     ip->VersionIhl = 0x45;
     ip->TotalLen = Htons((u16)ipLen);
     ip->Ttl = 128;
     ip->Protocol = Net::IpProtoUdp;
-    ip->SrcAddr = 0;
+    ip->SrcAddr = renewing ? Result.Ip.ToNetwork() : 0;
     ip->DstAddr = 0xFFFFFFFF;
     ip->Checksum = Htons(IpChecksum(ip, sizeof(IpHdr)));
     off += sizeof(IpHdr);
@@ -384,6 +399,8 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
     dhcp->HLen = 6;
     dhcp->Xid = Htonl(Xid);
     dhcp->Flags = Htons(0x8000);
+    if (renewing)
+        dhcp->CIAddr = Result.Ip.ToNetwork(); /* the address we are renewing */
     Dev->GetMac().CopyTo(dhcp->CHAddr);
     off += sizeof(DhcpPacket);
 
@@ -400,21 +417,24 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
     frame[off++] = 1;
     frame[off++] = DhcpRequest;
 
-    /* Option 50: Requested IP */
-    frame[off++] = DhcpOptRequestedIp;
-    frame[off++] = 4;
-    frame[off++] = (u8)((OfferedIp.Addr4 >> 24) & 0xFF);
-    frame[off++] = (u8)((OfferedIp.Addr4 >> 16) & 0xFF);
-    frame[off++] = (u8)((OfferedIp.Addr4 >> 8) & 0xFF);
-    frame[off++] = (u8)(OfferedIp.Addr4 & 0xFF);
+    if (!renewing)
+    {
+        /* Option 50: Requested IP */
+        frame[off++] = DhcpOptRequestedIp;
+        frame[off++] = 4;
+        frame[off++] = (u8)((OfferedIp.Addr4 >> 24) & 0xFF);
+        frame[off++] = (u8)((OfferedIp.Addr4 >> 16) & 0xFF);
+        frame[off++] = (u8)((OfferedIp.Addr4 >> 8) & 0xFF);
+        frame[off++] = (u8)(OfferedIp.Addr4 & 0xFF);
 
-    /* Option 54: Server Identifier */
-    frame[off++] = DhcpOptServerId;
-    frame[off++] = 4;
-    frame[off++] = (u8)((ServerId.Addr4 >> 24) & 0xFF);
-    frame[off++] = (u8)((ServerId.Addr4 >> 16) & 0xFF);
-    frame[off++] = (u8)((ServerId.Addr4 >> 8) & 0xFF);
-    frame[off++] = (u8)(ServerId.Addr4 & 0xFF);
+        /* Option 54: Server Identifier */
+        frame[off++] = DhcpOptServerId;
+        frame[off++] = 4;
+        frame[off++] = (u8)((ServerId.Addr4 >> 24) & 0xFF);
+        frame[off++] = (u8)((ServerId.Addr4 >> 16) & 0xFF);
+        frame[off++] = (u8)((ServerId.Addr4 >> 8) & 0xFF);
+        frame[off++] = (u8)(ServerId.Addr4 & 0xFF);
+    }
 
     /* End */
     frame[off++] = DhcpOptEnd;
@@ -453,7 +473,10 @@ bool DhcpClient::ParseResponse(const u8* frame, ulong len, u8 expectedType)
     if (dhcp->Op != 2)
         return false;
 
-    OfferedIp = IpAddress::FromNetwork(dhcp->YIAddr);
+    /* Keep the offered address in a local until the message is validated --
+       a NAK (or a mismatched type) must not clobber a good OfferedIp that a
+       subsequent REQUEST still needs. */
+    IpAddress yiAddr = IpAddress::FromNetwork(dhcp->YIAddr);
 
     /* Parse options (after magic cookie) */
     const u8* opts = frame + hdrLen + sizeof(DhcpPacket);
@@ -527,11 +550,19 @@ bool DhcpClient::ParseResponse(const u8* frame, ulong len, u8 expectedType)
         i += 2 + optLen;
     }
 
+    /* Server rejected us -- signal the waiter to restart from DISCOVER. */
+    if (msgType == DhcpNak)
+    {
+        NakReceived = true;
+        return false;
+    }
+
     if (msgType != expectedType)
         return false;
 
+    OfferedIp = yiAddr;
     ServerId = serverId;
-    Result.Ip = OfferedIp;
+    Result.Ip = yiAddr;
     Result.Mask = mask;
     Result.Router = router;
     Result.Dns = dns;

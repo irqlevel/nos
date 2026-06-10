@@ -109,6 +109,9 @@ protected:
     Net::IpAddress Gw;
 };
 
+/* Not internally synchronized: Register() is expected to run only at boot
+   (driver probe) before any concurrent Find()/Dump() readers exist. Devices are
+   never unregistered, so steady-state reads need no lock. */
 class NetDeviceTable
 {
 public:

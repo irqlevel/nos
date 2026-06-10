@@ -77,6 +77,7 @@ private:
     Atomic EchoReplyRx;    /* echo replies received */
     Atomic RxTooShort;     /* packets too short */
     Atomic RxOther;        /* other ICMP types received */
+    Atomic RxBadCsum;      /* packets dropped for bad ICMP checksum */
 };
 
 }

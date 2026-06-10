@@ -40,6 +40,8 @@ void TcpConn::Init()
     ConnReady.Set(0);
     NeedCleanup = false;
     FinAcked = false;
+    OwnedByApp = false;
+    Accepted = false;
     HashLink.Init();
 }
 
@@ -364,6 +366,36 @@ static u16 ParseMssOption(const TcpHdr* tcp)
     return TcpDefaultMss;
 }
 
+/* --- ACK bookkeeping shared by all states with unacked data --- */
+
+void Tcp::ProcessAck(TcpConn* conn, u32 ack, u16 wnd, ulong now)
+{
+    /* Wrap-safe range check: SndUna < ack <= SndNxt. */
+    long ackAdvance = (long)(ack - conn->SndUna);
+    if (ackAdvance <= 0 || (long)(conn->SndNxt - ack) < 0)
+    {
+        /* Out-of-range ACK: still track the latest window advertisement. */
+        conn->SndWnd = wnd;
+        return;
+    }
+
+    /* SendBuf holds only data bytes; a pending FIN consumes one extra sequence
+       number that is not buffered, so cap the drain at the buffer contents. */
+    ulong used = conn->SendBuf.Used();
+    ulong dataAcked = (ulong)ackAdvance;
+    if (dataAcked > used)
+        dataAcked = used;
+    conn->SendBuf.Consume(dataAcked);
+
+    conn->SndUna = ack;
+    conn->SndWnd = wnd;
+    conn->RtoMs = TcpInitialRtoMs;
+    if (conn->SndUna == conn->SndNxt)
+        conn->RetransmitDeadlineMs = 0; /* everything acked */
+    else
+        conn->RetransmitDeadlineMs = now + conn->RtoMs;
+}
+
 /* --- State machine --- */
 
 void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
@@ -377,9 +409,21 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     u16 wnd = Ntohs(tcp->Window);
     ulong now = GetBootTimeMs();
 
-    /* RST handling -- valid in all states except Free/Listen */
+    /* RST handling -- valid in all states except Free/Listen, but only if the
+       segment is in-window. Without this check any host that can guess the
+       4-tuple could tear down the connection with a blind RST. */
     if ((flags & TcpFlagRst) && conn->State != TcpStateListen)
     {
+        bool acceptable;
+        if (conn->State == TcpStateSynSent)
+            /* In SYN-SENT the RST is only valid if it acks our SYN. */
+            acceptable = (flags & TcpFlagAck) && ack == conn->SndNxt;
+        else
+            acceptable = (seq == conn->RcvNxt);
+
+        if (!acceptable)
+            return;
+
         Trace(0, "Tcp: RST received, conn %u:%u -> %u:%u",
               (ulong)conn->LocalPort, (ulong)conn->RemotePort,
               (ulong)Ntohs(tcp->SrcPort), (ulong)Ntohs(tcp->DstPort));
@@ -446,21 +490,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     {
         /* ACK processing */
         if (flags & TcpFlagAck)
-        {
-            /* Advance SndUna if ACK is in range */
-            long ackAdvance = (long)(ack - conn->SndUna);
-            if (ackAdvance > 0 && ack <= conn->SndNxt) /* valid forward ACK, note: wrapping not handled for simplicity */
-            {
-                conn->SendBuf.Consume((ulong)ackAdvance);
-                conn->SndUna = ack;
-                conn->SndWnd = wnd;
-                conn->RtoMs = TcpInitialRtoMs;
-                if (conn->SndUna == conn->SndNxt)
-                    conn->RetransmitDeadlineMs = 0; /* all acked */
-                else
-                    conn->RetransmitDeadlineMs = now + conn->RtoMs;
-            }
-        }
+            ProcessAck(conn, ack, wnd, now);
 
         /* Data processing -- in-order only */
         if (payloadLen > 0 && seq == conn->RcvNxt)
@@ -498,13 +528,14 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     }
     case TcpStateFinWait1:
     {
+        /* Drain any data the peer acked alongside (or before) our FIN, so the
+           retransmit timer stops resending stale bytes and our FIN can finally
+           be acknowledged once SndUna catches up to SndNxt. */
         if (flags & TcpFlagAck)
         {
-            if (ack == conn->SndNxt)
-            {
-                conn->SndUna = ack;
+            ProcessAck(conn, ack, wnd, now);
+            if (conn->SndUna == conn->SndNxt)
                 conn->FinAcked = true;
-            }
         }
 
         if (flags & TcpFlagFin)
@@ -552,19 +583,27 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     }
     case TcpStateClosing:
     {
-        if ((flags & TcpFlagAck) && ack == conn->SndNxt)
+        if (flags & TcpFlagAck)
         {
-            conn->State = TcpStateTimeWait;
-            conn->TimeWaitDeadlineMs = GetBootTimeMs() + TcpTimeWaitMs;
+            ProcessAck(conn, ack, wnd, now);
+            if (conn->SndUna == conn->SndNxt)
+            {
+                conn->State = TcpStateTimeWait;
+                conn->TimeWaitDeadlineMs = GetBootTimeMs() + TcpTimeWaitMs;
+            }
         }
         break;
     }
     case TcpStateLastAck:
     {
-        if ((flags & TcpFlagAck) && ack == conn->SndNxt)
+        if (flags & TcpFlagAck)
         {
-            conn->State = TcpStateClosed;
-            conn->ConnReady.Set(1);
+            ProcessAck(conn, ack, wnd, now);
+            if (conn->SndUna == conn->SndNxt)
+            {
+                conn->State = TcpStateClosed;
+                conn->ConnReady.Set(1);
+            }
         }
         break;
     }
@@ -572,14 +611,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     {
         /* ACK processing for any pending data */
         if (flags & TcpFlagAck)
-        {
-            long ackAdvance = (long)(ack - conn->SndUna);
-            if (ackAdvance > 0 && ack <= conn->SndNxt)
-            {
-                conn->SendBuf.Consume((ulong)ackAdvance);
-                conn->SndUna = ack;
-            }
-        }
+            ProcessAck(conn, ack, wnd, now);
         break;
     }
     case TcpStateTimeWait:
@@ -794,6 +826,7 @@ TcpConn* Tcp::Connect(NetDevice* dev, IpAddress dstIp, u16 dstPort, u16 srcPort)
     conn->SndNxt = conn->Iss;
     conn->SndUna = conn->Iss;
     conn->State = TcpStateSynSent;
+    conn->OwnedByApp = true; /* caller holds this pointer until Close() */
 
     InsertHash(conn);
     conn->Lock.Lock();
@@ -850,6 +883,7 @@ TcpConn* Tcp::Listen(NetDevice* dev, u16 port)
     conn->LocalIp = dev->GetIp();
     conn->LocalPort = port;
     conn->State = TcpStateListen;
+    conn->OwnedByApp = true; /* caller holds this pointer until Close() */
     /* Listener is NOT in the hash table -- FindListenerLocked scans the pool */
     PoolLock.Unlock();
     return conn;
@@ -868,13 +902,18 @@ TcpConn* Tcp::Accept(TcpConn* listener)
             TcpConn* c = &Pool[i];
             if (c == listener)
                 continue;
-            if (c->LocalPort == listener->LocalPort &&
+            if (c->LocalPort == listener->LocalPort && !c->Accepted &&
                 (c->State == TcpStateEstablished ||
                  c->State == TcpStateSynReceived))
             {
                 c->Lock.Lock();
-                if (c->State == TcpStateEstablished)
+                /* Re-check under the lock: only hand out each established
+                   connection once, and take ownership so the cleanup timer
+                   won't recycle the slot from under the accepting task. */
+                if (c->State == TcpStateEstablished && !c->Accepted)
                 {
+                    c->Accepted = true;
+                    c->OwnedByApp = true;
                     PoolLock.Unlock();
                     c->Lock.Unlock();
                     return c;
@@ -914,6 +953,27 @@ long Tcp::Send(TcpConn* conn, const void* data, ulong len)
             continue;
         }
 
+        /* Respect the peer's advertised receive window: never let the bytes in
+           flight (SndNxt - SndUna, wrap-safe) exceed SndWnd. */
+        u32 inFlight = conn->SndNxt - conn->SndUna;
+        ulong wndAvail;
+        if (conn->SndWnd > inFlight)
+        {
+            wndAvail = conn->SndWnd - inFlight;
+        }
+        else if (conn->SndWnd == 0 && inFlight == 0)
+        {
+            /* Zero-window probe: send a single byte so the peer is forced to
+               re-advertise its window, even if an earlier update was lost. */
+            wndAvail = 1;
+        }
+        else
+        {
+            conn->Lock.Unlock();
+            Sleep(1 * Const::NanoSecsInMs);
+            continue;
+        }
+
         ulong chunk = len - sent;
         if (chunk > avail)
             chunk = avail;
@@ -921,6 +981,10 @@ long Tcp::Send(TcpConn* conn, const void* data, ulong len)
         /* Limit to PeerMss for segment sizing */
         if (chunk > conn->PeerMss)
             chunk = conn->PeerMss;
+
+        /* Limit to the available send window */
+        if (chunk > wndAvail)
+            chunk = wndAvail;
 
         conn->SendBuf.Write(src + sent, chunk);
 
@@ -1020,6 +1084,10 @@ void Tcp::Close(TcpConn* conn)
     default:
         break;
     }
+
+    /* The application is done with this pointer. From here the cleanup timer
+       owns the slot and may recycle it once the connection reaches Closed. */
+    conn->OwnedByApp = false;
 
     conn->Lock.Unlock();
 }
@@ -1157,17 +1225,20 @@ void Tcp::ProcessRetransmits()
         {
             TcpConn* conn = &Pool[i];
             conn->Lock.Lock();
-            if (conn->NeedCleanup && conn->State == TcpStateClosed)
+            if (conn->NeedCleanup && conn->State == TcpStateClosed &&
+                !conn->OwnedByApp)
             {
                 RemoveHash(conn);
                 conn->State = TcpStateFree;
                 conn->NeedCleanup = false;
                 ConnCount.Dec();
             }
-            else
+            else if (conn->State != TcpStateClosed)
             {
                 conn->NeedCleanup = false;
             }
+            /* A Closed connection still owned by the app keeps NeedCleanup set
+               so the next tick retries the reclaim after Close() runs. */
             conn->Lock.Unlock();
         }
         PoolLock.Unlock();
