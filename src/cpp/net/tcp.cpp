@@ -611,8 +611,8 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
 
     const EthHdr* eth = (const EthHdr*)frame;
     const IpHdr* ip = (const IpHdr*)(frame + sizeof(EthHdr));
-    ulong ipHdrLen = (ip->VersionIhl & 0x0F) * 4;
-    if (ipHdrLen < sizeof(IpHdr))
+    ulong ipHdrLen = Net::IpHeaderLen(ip);
+    if (ipHdrLen == 0)
     {
         RxTooShort.Inc();
         return;
@@ -625,13 +625,17 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
         return;
     }
 
-    const TcpHdr* tcp = (const TcpHdr*)(frame + sizeof(EthHdr) + ipHdrLen);
-    ulong tcpLen = ipTotalLen - ipHdrLen;
-    if (tcpLen < sizeof(TcpHdr))
+    /* ipHdrLen comes from the attacker-controlled IHL field; guard against
+       ipTotalLen < ipHdrLen so the tcpLen subtraction below cannot underflow
+       (which would let TcpChecksum read far out of bounds). */
+    if (ipTotalLen < ipHdrLen + sizeof(TcpHdr))
     {
         RxTooShort.Inc();
         return;
     }
+
+    const TcpHdr* tcp = (const TcpHdr*)(frame + sizeof(EthHdr) + ipHdrLen);
+    ulong tcpLen = ipTotalLen - ipHdrLen;
 
     /* Verify TCP checksum */
     u16 ck = TcpChecksum(ip->SrcAddr, ip->DstAddr, tcp, tcpLen);

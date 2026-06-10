@@ -528,12 +528,14 @@ void VirtioNet::ProcessRx()
             case Net::IpProtoUdp:
             {
                 RxUdp.Inc();
-                if (dataLen < sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
+                /* Honor IHL so IP options shift the UDP offset. */
+                ulong ipHdrLen = Net::IpHeaderLen(ip);
+                if (ipHdrLen == 0 || dataLen < sizeof(EthHdr) + ipHdrLen + sizeof(UdpHdr))
                 {
                     RxDropCount.Inc();
                     break;
                 }
-                UdpHdr* udp = (UdpHdr*)(data + sizeof(EthHdr) + sizeof(IpHdr));
+                UdpHdr* udp = (UdpHdr*)(data + sizeof(EthHdr) + ipHdrLen);
                 u16 dstPort = Ntohs(udp->DstPort);
                 bool delivered = false;
 
