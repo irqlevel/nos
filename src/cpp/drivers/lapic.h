@@ -69,6 +69,8 @@ private:
     static const u32 IcrDestinationShift = 24;
 
     static const ulong BaseMsr = 0x1B;
+    static const ulong BaseMsrGlobalEnable = (1UL << 11);
+    static const ulong BaseMsrX2ApicEnable = (1UL << 10);
 
 };
 

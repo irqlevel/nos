@@ -87,6 +87,21 @@ ulong MemoryMap::GetKernelEnd()
 }
 
 
+bool MemoryMap::IsUsableRam(ulong phyAddr)
+{
+    for (size_t i = 0; i < Size; i++)
+    {
+        auto& region = Region[i];
+        if (region.Type != 1)
+            continue;
+
+        if (phyAddr >= region.Addr && phyAddr < (region.Addr + region.Len))
+            return true;
+    }
+
+    return false;
+}
+
 size_t MemoryMap::GetRegionCount()
 {
     return Size;

@@ -31,6 +31,23 @@ void Lapic::Enable()
 
     Trace(LapicLL, "Lapic: msr 0x%p base 0x%p", msr, Acpi::GetInstance().GetLapicAddress());
 
+    /* Firmware may hand off with the APIC in x2APIC mode, where the
+       MMIO window is dead. The SDM forbids switching x2APIC->xAPIC
+       directly: go through the globally-disabled state first. */
+    if (msr & BaseMsrX2ApicEnable)
+    {
+        Trace(0, "Lapic: firmware left x2APIC mode, switching to xAPIC");
+        WriteMsr(BaseMsr, msr & ~(BaseMsrX2ApicEnable | BaseMsrGlobalEnable));
+        msr = msr & ~BaseMsrX2ApicEnable;
+    }
+
+    /* Make sure the APIC is globally enabled (xAPIC MMIO mode) */
+    if (!(msr & BaseMsrGlobalEnable))
+    {
+        msr = msr | BaseMsrGlobalEnable;
+        WriteMsr(BaseMsr, msr);
+    }
+
     WriteReg(DfrIndex, 0xffffffff);// Flat mode
     WriteReg(LdrIndex, 0x01000000);// All cpus use logical id 1
     WriteReg(TprIndex, 0xFF);// Disable all interrupts

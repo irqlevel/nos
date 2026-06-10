@@ -43,11 +43,14 @@ ulong BuiltinPageTable::PhysToVirt(ulong phyAddr)
 
 bool BuiltinPageTable::Setup()
 {
+    /* The whole 4GB range is mapped write-back: MTRRs keep MMIO holes
+       (LAPIC, IOAPIC, PCI) uncached on real hardware. Setting PCD here
+       would run the entire kernel uncached on bare metal. */
+
     //Map first 4GB of kernel address space
     auto& p4Entry = P4Page.Entry[256];
 
     p4Entry.SetAddress(VirtToPhys((ulong)&P3KernelPage));
-    p4Entry.SetCacheDisabled();
     p4Entry.SetWritable();
     p4Entry.SetPresent();
 
@@ -58,7 +61,6 @@ bool BuiltinPageTable::Setup()
         auto& p2Page = P2KernelPage[i];
 
         p3Entry.SetAddress(VirtToPhys((ulong)&p2Page));
-        p3Entry.SetCacheDisabled();
         p3Entry.SetWritable();
         p3Entry.SetPresent();
 
@@ -67,7 +69,6 @@ bool BuiltinPageTable::Setup()
             auto& p2Entry = p2Page.Entry[j];
 
             p2Entry.SetAddress(VirtToPhys(addr));
-            p2Entry.SetCacheDisabled();
             p2Entry.SetWritable();
             p2Entry.SetHuge();
             p2Entry.SetPresent();
@@ -82,7 +83,6 @@ bool BuiltinPageTable::Setup()
     auto& p4Entry2 = P4Page.Entry[0];
 
     p4Entry2.SetAddress(VirtToPhys((ulong)&P3UserPage));
-    p4Entry2.SetCacheDisabled();
     p4Entry2.SetWritable();
     p4Entry2.SetPresent();
 
@@ -93,7 +93,6 @@ bool BuiltinPageTable::Setup()
         auto& p2Page = P2UserPage[i];
 
         p3Entry.SetAddress(VirtToPhys((ulong)&p2Page));
-        p3Entry.SetCacheDisabled();
         p3Entry.SetWritable();
         p3Entry.SetPresent();
         Invlpg((ulong)&p2Page);
@@ -103,7 +102,6 @@ bool BuiltinPageTable::Setup()
             auto& p2Entry = p2Page.Entry[j];
 
             p2Entry.SetAddress(VirtToPhys(addr));
-            p2Entry.SetCacheDisabled();
             p2Entry.SetWritable();
             p2Entry.SetHuge();
             p2Entry.SetPresent();
@@ -352,7 +350,6 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
             return false;
 
         l4Entry->SetAddress(addr);
-        l4Entry->SetCacheDisabled();
         l4Entry->SetWritable();
         l4Entry->SetPresent();
     }
@@ -365,7 +362,6 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
             return false;
 
         l3Entry->SetAddress(addr);
-        l3Entry->SetCacheDisabled();
         l3Entry->SetWritable();
         l3Entry->SetPresent();
     }
@@ -378,7 +374,6 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
             return false;
 
         l2Entry->SetAddress(addr);
-        l2Entry->SetCacheDisabled();
         l2Entry->SetWritable();
         l2Entry->SetPresent();
     }
@@ -395,7 +390,6 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
     if (phyAddr)
     {
         l1Entry->SetAddress(phyAddr);
-        l1Entry->SetCacheDisabled();
         l1Entry->SetWritable();
         l1Entry->SetPresent();
     } else {
@@ -650,7 +644,10 @@ ulong PageTable::TmpMapPage(ulong phyAddr)
                 return 0;
 
             l1Entry->SetAddress(phyAddr);
-            l1Entry->SetCacheDisabled();
+            /* TmpMap serves both RAM (free pages, ACPI tables) and MMIO
+               (LAPIC, IOAPIC): only non-RAM gets mapped uncached. */
+            if (!MemoryMap::GetInstance().IsUsableRam(phyAddr))
+                l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
             l1Entry->SetPresent();
             Invlpg(virtAddr);
@@ -773,7 +770,8 @@ ulong PageTable::TmpMapRange(ulong phyAddr, size_t len)
                 return 0;
 
             l1Entry->SetAddress(thisPhyPage);
-            l1Entry->SetCacheDisabled();
+            if (!MemoryMap::GetInstance().IsUsableRam(thisPhyPage))
+                l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
             l1Entry->SetPresent();
             Invlpg(virtAddr);
@@ -823,7 +821,6 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
         }
 
         l4Entry->SetAddress(page->GetPhyAddress());
-        l4Entry->SetCacheDisabled();
         l4Entry->SetWritable();
         l4Entry->SetPresent();
     }
@@ -841,7 +838,6 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
             return false;
         }
         l3Entry->SetAddress(page->GetPhyAddress());
-        l3Entry->SetCacheDisabled();
         l3Entry->SetWritable();
         l3Entry->SetPresent();
     }
@@ -860,7 +856,6 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
         }
 
         l2Entry->SetAddress(page->GetPhyAddress());
-        l2Entry->SetCacheDisabled();
         l2Entry->SetWritable();
         l2Entry->SetPresent();
     }
@@ -880,7 +875,6 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
     {
         page->Get();
         l1Entry->SetAddress(page->GetPhyAddress());
-        l1Entry->SetCacheDisabled();
         l1Entry->SetWritable();
         l1Entry->SetPresent();
     } else {
@@ -925,7 +919,6 @@ ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
             Page* p = AllocPageNoLock();
             if (!p) { TmpUnmapPage((ulong)l4Page); return 0; }
             l4Entry->SetAddress(p->GetPhyAddress());
-            l4Entry->SetCacheDisabled();
             l4Entry->SetWritable();
             l4Entry->SetPresent();
         }
@@ -940,7 +933,6 @@ ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
             Page* p = AllocPageNoLock();
             if (!p) { TmpUnmapPage((ulong)l3Page); return 0; }
             l3Entry->SetAddress(p->GetPhyAddress());
-            l3Entry->SetCacheDisabled();
             l3Entry->SetWritable();
             l3Entry->SetPresent();
         }
@@ -955,7 +947,6 @@ ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
             Page* p = AllocPageNoLock();
             if (!p) { TmpUnmapPage((ulong)l2Page); return 0; }
             l2Entry->SetAddress(p->GetPhyAddress());
-            l2Entry->SetCacheDisabled();
             l2Entry->SetWritable();
             l2Entry->SetPresent();
         }
@@ -969,6 +960,7 @@ ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
         if (!l1Entry->Present())
         {
             l1Entry->SetAddress(pa);
+            /* Device memory: must stay uncached */
             l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
             l1Entry->SetPresent();

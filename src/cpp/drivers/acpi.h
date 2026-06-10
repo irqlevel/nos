@@ -121,7 +121,8 @@ private:
     int ComputeSum(void* table, size_t len);
 
     bool ParseRsdp(RSDPDescriptor20* rsdp);
-    RSDPDescriptor20* FindRsdp();
+    bool FindRsdtAddress(u32& rsdtPhysAddr);
+    bool ScanRsdpRange(ulong phyStart, ulong phyEnd, u32& rsdtPhysAddr);
     Stdlib::Error ParseRsdt(ACPISDTHeader* rsdt);
 
     Stdlib::Error ParseTablePointers();

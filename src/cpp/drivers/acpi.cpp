@@ -4,6 +4,7 @@
 #include <kernel/cpu.h>
 #include <mm/memory_map.h>
 #include <mm/page_table.h>
+#include <boot/grub.h>
 
 namespace Kernel
 {
@@ -62,50 +63,94 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
     return true;
 }
 
-Acpi::RSDPDescriptor20* Acpi::FindRsdp()
+/* Scan a physical range (16-byte aligned slots) for the RSDP signature.
+   Only used for the legacy BIOS areas (EBDA, 0xE0000-0xFFFFF); reading
+   arbitrary reserved regions is unsafe on real hardware (MMIO). */
+bool Acpi::ScanRsdpRange(ulong phyStart, ulong phyEnd, u32& rsdtPhysAddr)
 {
-    auto& mm = Kernel::Mm::MemoryMap::GetInstance();
     auto& pt = Kernel::Mm::PageTable::GetInstance();
 
-    for (size_t i = 0; i < mm.GetRegionCount(); i++)
+    ulong pageStart = Stdlib::RoundDown(phyStart, Const::PageSize);
+    for (ulong curr = pageStart; curr < phyEnd; curr += Const::PageSize)
     {
-        ulong addr, len, type;
-
-        if (!mm.GetRegion(i, addr, len, type))
-            return nullptr;
-
-        /* Type 1 = usable RAM, type 2 = reserved (e.g. BIOS/ACPI at 0xE0000-0xFFFFF). */
-        if (type != 1 && type != 2)
-            continue;
-
-        ulong pageStart = Stdlib::RoundDown(addr, Const::PageSize);
-        for (ulong curr = pageStart; curr < (addr + len); curr+= Const::PageSize)
+        ulong pageVa = pt.TmpMapPage(curr);
+        if (!pageVa)
         {
-            ulong pageVa = pt.TmpMapPage(curr);
-            if (!pageVa)
-            {
-                Trace(0, "Can't map 0x%p", curr);
-                return nullptr;
-            }
+            Trace(0, "Can't map 0x%p", curr);
+            return false;
+        }
 
-            for (ulong va = pageVa; va < (pageVa + Const::PageSize); va += 16)
+        ulong scanStart = (curr < phyStart) ? pageVa + (phyStart - curr) : pageVa;
+        ulong scanEnd = ((curr + Const::PageSize) > phyEnd)
+            ? pageVa + (phyEnd - curr) : pageVa + Const::PageSize;
+
+        for (ulong va = scanStart; va + sizeof(RSDPDescriptor) <= scanEnd; va += 16)
+        {
+            RSDPDescriptor20 *rsdp = reinterpret_cast<RSDPDescriptor20*>(va);
+            if (rsdp->FirstPart.Signature == RSDPSignature)
             {
-                RSDPDescriptor20 *rsdp = reinterpret_cast<RSDPDescriptor20*>(va);
-                if (rsdp->FirstPart.Signature == RSDPSignature)
+                Trace(0, "Checking rsdp va 0x%p pha 0x%p", rsdp, curr + (va - pageVa));
+                if (ParseRsdp(rsdp))
                 {
-                    Trace(0, "Checking rsdp va 0x%p pha 0x%p", rsdp, curr + (va - pageVa));
-                    if (ParseRsdp(rsdp))
-                    {
-                        return rsdp;
-                    }
+                    rsdtPhysAddr = rsdp->FirstPart.RsdtAddress;
+                    pt.TmpUnmapPage(pageVa);
+                    return true;
                 }
             }
-            pt.TmpUnmapPage(pageVa);
+        }
+        pt.TmpUnmapPage(pageVa);
+    }
+
+    return false;
+}
+
+bool Acpi::FindRsdtAddress(u32& rsdtPhysAddr)
+{
+    /* 1. RSDP copy from the Multiboot2 ACPI tag. On UEFI this is the
+       only way to find it: the RSDP lives in ACPI-reclaimable memory,
+       not in the legacy BIOS area. */
+    size_t grubRsdpSize = 0;
+    const void* grubRsdp = Grub::GetAcpiRsdp(grubRsdpSize);
+    if (grubRsdp != nullptr && grubRsdpSize >= sizeof(RSDPDescriptor))
+    {
+        RSDPDescriptor20 copy;
+        Stdlib::MemSet(&copy, 0, sizeof(copy));
+        Stdlib::MemCpy(&copy, grubRsdp,
+            (grubRsdpSize < sizeof(copy)) ? grubRsdpSize : sizeof(copy));
+
+        if (copy.FirstPart.Signature == RSDPSignature && ParseRsdp(&copy))
+        {
+            Trace(0, "Rsdp from multiboot tag, Rsdt 0x%p",
+                (ulong)copy.FirstPart.RsdtAddress);
+            rsdtPhysAddr = copy.FirstPart.RsdtAddress;
+            return true;
+        }
+
+        Trace(0, "Multiboot rsdp tag invalid");
+    }
+
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
+
+    /* 2. First KB of the EBDA; its segment is at BDA 0x40E */
+    ulong bdaVa = pt.TmpMapPage(0);
+    if (bdaVa != 0)
+    {
+        ulong ebda = ((ulong)*(u16*)(bdaVa + 0x40E)) << 4;
+        pt.TmpUnmapPage(bdaVa);
+
+        if (ebda >= 0x80000 && ebda < 0xA0000)
+        {
+            if (ScanRsdpRange(ebda, ebda + 1024, rsdtPhysAddr))
+                return true;
         }
     }
 
+    /* 3. BIOS read-only area 0xE0000-0xFFFFF */
+    if (ScanRsdpRange(0xE0000, 0x100000, rsdtPhysAddr))
+        return true;
+
     Trace(0, "Rsdp not found");
-    return nullptr;
+    return false;
 }
 
 Stdlib::Error Acpi::ParseRsdt(ACPISDTHeader* rsdt)
@@ -379,17 +424,13 @@ void Acpi::ParseHPET()
 Stdlib::Error Acpi::Parse()
 {
     Stdlib::Error err;
-    RSDPDescriptor20* rsdp = FindRsdp();
-    if (rsdp == nullptr)
+    u32 rsdtPhysAddr = 0;
+    if (!FindRsdtAddress(rsdtPhysAddr))
     {
         return MakeError(Stdlib::Error::NotFound);
     }
 
-    /* Extract RsdtAddress and free the RSDP temp-map slot */
-    u32 rsdtPhysAddr = rsdp->FirstPart.RsdtAddress;
     auto& pt = Mm::PageTable::GetInstance();
-    pt.TmpUnmapPage(reinterpret_cast<ulong>(rsdp) & ~(Const::PageSize - 1));
-
     ACPISDTHeader* rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(rsdtPhysAddr));
     if (!rsdt)
         return MakeError(Stdlib::Error::NoMemory);
