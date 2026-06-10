@@ -236,12 +236,21 @@ void DnsResolver::RxCallback(const u8* frame, ulong len, void* ctx)
 {
     DnsResolver* self = static_cast<DnsResolver*>(ctx);
 
-    static const ulong MinFrameLen = sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr) + sizeof(DnsHeader);
-    if (len < MinFrameLen)
+    if (len < sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr) + sizeof(DnsHeader))
         return;
 
-    const u8* dnsPayload = frame + sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr);
-    ulong dnsLen = len - sizeof(EthHdr) - sizeof(IpHdr) - sizeof(UdpHdr);
+    /* Honor IHL so IP options shift the UDP/DNS offset. */
+    const IpHdr* ip = (const IpHdr*)(frame + sizeof(EthHdr));
+    ulong ipHdrLen = Net::IpHeaderLen(ip);
+    if (ipHdrLen == 0)
+        return;
+
+    ulong hdrLen = sizeof(EthHdr) + ipHdrLen + sizeof(UdpHdr);
+    if (len < hdrLen + sizeof(DnsHeader))
+        return;
+
+    const u8* dnsPayload = frame + hdrLen;
+    ulong dnsLen = len - hdrLen;
 
     self->ProcessResponse(dnsPayload, dnsLen);
 }

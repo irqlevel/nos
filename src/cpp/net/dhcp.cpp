@@ -424,8 +424,17 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen)
 
 bool DhcpClient::ParseResponse(const u8* frame, ulong len, u8 expectedType)
 {
-    /* frame = Ethernet + IP + UDP + DHCP */
-    ulong hdrLen = sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr);
+    /* frame = Ethernet + IP (+ options) + UDP + DHCP */
+    if (len < sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
+        return false;
+
+    /* Honor IHL so IP options shift the UDP/DHCP offset. */
+    const IpHdr* ip = (const IpHdr*)(frame + sizeof(EthHdr));
+    ulong ipHdrLen = Net::IpHeaderLen(ip);
+    if (ipHdrLen == 0)
+        return false;
+
+    ulong hdrLen = sizeof(EthHdr) + ipHdrLen + sizeof(UdpHdr);
     if (len < hdrLen + sizeof(DhcpPacket) + 4)
         return false;
 

@@ -127,6 +127,16 @@ inline u16 IpChecksum(const void* data, ulong len)
     return (u16)(~sum);
 }
 
+/* IPv4 header length in bytes, derived from the IHL field.  Returns 0 if the
+   IHL encodes a value smaller than the minimum 20-byte header (malformed).
+   Callers must use this — not sizeof(IpHdr) — to locate the L4 header on the
+   receive path, since a sender may include IP options (IHL > 5). */
+inline ulong IpHeaderLen(const IpHdr* ip)
+{
+    ulong len = (ulong)(ip->VersionIhl & 0x0F) * 4;
+    return (len < sizeof(IpHdr)) ? 0 : len;
+}
+
 /* TCP checksum: pseudo-header + TCP header + payload */
 inline u16 TcpChecksum(u32 srcAddrNet, u32 dstAddrNet,
                        const void* tcpData, ulong tcpLen)

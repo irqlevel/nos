@@ -254,9 +254,15 @@ void UdpShell::RxCallbackFn(const u8* frame, ulong len, void* ctx)
 
     const EthHdr* eth = (const EthHdr*)frame;
     const IpHdr* ip = (const IpHdr*)(frame + sizeof(EthHdr));
-    const UdpHdr* udp = (const UdpHdr*)(frame + sizeof(EthHdr) + sizeof(IpHdr));
 
-    ulong hdrLen = sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr);
+    /* Honor IHL so IP options shift the UDP offset. */
+    ulong ipHdrLen = Net::IpHeaderLen(ip);
+    if (ipHdrLen == 0)
+        return;
+
+    const UdpHdr* udp = (const UdpHdr*)(frame + sizeof(EthHdr) + ipHdrLen);
+
+    ulong hdrLen = sizeof(EthHdr) + ipHdrLen + sizeof(UdpHdr);
     if (len <= hdrLen)
         return;
 

@@ -44,7 +44,16 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
 
     const EthHdr* eth = (const EthHdr*)frame;
     const IpHdr* ip = (const IpHdr*)(frame + sizeof(EthHdr));
-    const IcmpHdr* icmp = (const IcmpHdr*)(frame + sizeof(EthHdr) + sizeof(IpHdr));
+
+    /* Honor the IP header length (IHL) so options shift the ICMP offset. */
+    ulong ipHdrLen = Net::IpHeaderLen(ip);
+    if (ipHdrLen == 0 || len < sizeof(EthHdr) + ipHdrLen + sizeof(IcmpHdr))
+    {
+        RxTooShort.Inc();
+        return;
+    }
+
+    const IcmpHdr* icmp = (const IcmpHdr*)(frame + sizeof(EthHdr) + ipHdrLen);
 
     if (icmp->Type == TypeEchoRequest && icmp->Code == 0)
     {
@@ -54,12 +63,12 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
             (ulong)Ntohs(icmp->Id), (ulong)Ntohs(icmp->Seq));
         /* Build echo reply */
         ulong ipTotalLen = Ntohs(ip->TotalLen);
-        if (ipTotalLen < sizeof(IpHdr) + sizeof(IcmpHdr))
+        if (ipTotalLen < ipHdrLen + sizeof(IcmpHdr))
             return;
         if (sizeof(EthHdr) + ipTotalLen > len)
             return;
 
-        ulong icmpLen = ipTotalLen - sizeof(IpHdr);
+        ulong icmpLen = ipTotalLen - ipHdrLen;
         ulong replyFrameLen = sizeof(EthHdr) + sizeof(IpHdr) + icmpLen;
 
         if (replyFrameLen > 1514)
@@ -88,9 +97,11 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         rIp->DstAddr = ip->SrcAddr;
         rIp->Checksum = Htons(IpChecksum(rIp, sizeof(IpHdr)));
 
-        /* ICMP -- copy entire ICMP payload, change type to reply */
+        /* ICMP -- copy entire ICMP payload, change type to reply.
+           The reply uses a fresh 20-byte IP header (no options), but the
+           source ICMP starts after the request's IP header + options. */
         u8* rIcmpRaw = reply + sizeof(EthHdr) + sizeof(IpHdr);
-        const u8* srcIcmpRaw = frame + sizeof(EthHdr) + sizeof(IpHdr);
+        const u8* srcIcmpRaw = frame + sizeof(EthHdr) + ipHdrLen;
         Stdlib::MemCpy(rIcmpRaw, srcIcmpRaw, icmpLen);
 
         IcmpHdr* rIcmp = (IcmpHdr*)rIcmpRaw;
