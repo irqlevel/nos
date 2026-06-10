@@ -4,6 +4,10 @@
  * contiguous DMA buffer.  The hardware identifies the end of the ring by
  * the EOR (End Of Ring) bit in the last descriptor's opts1 field.
  *
+ * The descriptor memory is written by the NIC concurrently with the CPU,
+ * so it is never accessed through references: all loads and stores go
+ * through volatile operations on raw pointers (see desc_ptr()).
+ *
  * TX ring ownership protocol:
  *   - Software fills descriptor, sets TX_OWN to hand off to hardware.
  *   - Hardware clears TX_OWN after transmission.
@@ -18,6 +22,7 @@
  *     new one via post().
  */
 
+use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use kcore::dma::DmaBuffer;
 use kcore::net::NetFrame;
 use crate::regs::*;
@@ -68,7 +73,7 @@ impl TxRing {
     pub fn new(mut dma: DmaBuffer) -> Self {
         /* Zero the entire DMA page so no leftover TX_OWN bits can cause
          * the hardware to DMA from garbage addresses at TX_POLL time. */
-        for b in dma.as_mut_slice().iter_mut() { *b = 0; }
+        unsafe { core::ptr::write_bytes(dma.as_mut_ptr(), 0, dma.len()) };
 
         let mut ring = Self {
             dma,
@@ -77,21 +82,17 @@ impl TxRing {
             head: 0,
         };
         /* Mark the last descriptor as EOR so the hardware wraps to index 0 */
-        ring.descs_mut()[RING_SIZE - 1].opts1 = TX_EOR;
+        unsafe {
+            write_volatile(addr_of_mut!((*ring.desc_ptr(RING_SIZE - 1)).opts1), TX_EOR);
+        }
         ring
     }
 
-    /* Virtual-address pointer to the descriptor array in DMA memory */
-    pub fn descs_mut(&mut self) -> &mut [TxDesc; RING_SIZE] {
-        unsafe {
-            &mut *(self.dma.as_mut_slice().as_mut_ptr() as *mut [TxDesc; RING_SIZE])
-        }
-    }
-
-    pub fn descs(&self) -> &[TxDesc; RING_SIZE] {
-        unsafe {
-            &*(self.dma.as_slice().as_ptr() as *const [TxDesc; RING_SIZE])
-        }
+    /* Raw pointer to descriptor `idx` in DMA memory.  All descriptor
+     * access must be volatile through this pointer; the NIC reads and
+     * writes the ring concurrently. */
+    fn desc_ptr(&mut self, idx: usize) -> *mut TxDesc {
+        unsafe { (self.dma.as_mut_ptr() as *mut TxDesc).add(idx) }
     }
 
     /* True if there is at least one free descriptor slot */
@@ -114,14 +115,17 @@ impl TxRing {
         /* Transfer ownership into shadow array without calling Drop */
         let handle = frame.into_raw();
 
-        let descs = self.descs_mut();
-        descs[idx].addr_lo = phys as u32;
-        descs[idx].addr_hi = (phys >> 32) as u32;
-        descs[idx].opts2   = 0;
-        /* Write opts1 (with TX_OWN) last; compiler_fence prevents reorder.
-         * This ensures hardware sees a valid address before it sees OWN=1. */
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        descs[idx].opts1   = TX_OWN | TX_FS | TX_LS | eor | (len & TX_LEN_MASK);
+        let d = self.desc_ptr(idx);
+        unsafe {
+            write_volatile(addr_of_mut!((*d).addr_lo), phys as u32);
+            write_volatile(addr_of_mut!((*d).addr_hi), (phys >> 32) as u32);
+            write_volatile(addr_of_mut!((*d).opts2), 0);
+            /* Write opts1 (with TX_OWN) last; compiler_fence prevents reorder.
+             * This ensures hardware sees a valid address before it sees OWN=1. */
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+            write_volatile(addr_of_mut!((*d).opts1),
+                TX_OWN | TX_FS | TX_LS | eor | (len & TX_LEN_MASK));
+        }
 
         self.frames[idx] = handle;
         self.tail = (idx + 1) % RING_SIZE;
@@ -136,12 +140,8 @@ impl TxRing {
                 break; /* ring empty */
             }
             let idx = self.head;
-            /* Volatile read: hardware clears TX_OWN asynchronously via DMA.
-             * Without read_volatile the compiler may hoist or cache this load. */
-            let opts1 = unsafe {
-                let p = &self.descs()[idx].opts1 as *const u32;
-                core::ptr::read_volatile(p)
-            };
+            /* Volatile read: hardware clears TX_OWN asynchronously via DMA. */
+            let opts1 = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).opts1)) };
             if opts1 & TX_OWN != 0 {
                 break; /* hardware still owns */
             }
@@ -176,16 +176,9 @@ impl RxRing {
         }
     }
 
-    pub fn descs_mut(&mut self) -> &mut [RxDesc; RING_SIZE] {
-        unsafe {
-            &mut *(self.dma.as_mut_slice().as_mut_ptr() as *mut [RxDesc; RING_SIZE])
-        }
-    }
-
-    pub fn descs(&self) -> &[RxDesc; RING_SIZE] {
-        unsafe {
-            &*(self.dma.as_slice().as_ptr() as *const [RxDesc; RING_SIZE])
-        }
+    /* Raw pointer to descriptor `idx`; see TxRing::desc_ptr. */
+    fn desc_ptr(&mut self, idx: usize) -> *mut RxDesc {
+        unsafe { (self.dma.as_mut_ptr() as *mut RxDesc).add(idx) }
     }
 
     /* Post a NetFrame at descriptor slot `idx`, giving ownership to hardware.
@@ -197,23 +190,28 @@ impl RxRing {
 
         let handle = frame.into_raw();
 
-        let descs = self.descs_mut();
-        descs[idx].addr_lo = phys as u32;
-        descs[idx].addr_hi = (phys >> 32) as u32;
-        descs[idx].opts2   = 0;
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        /* Program buffer capacity into len field; hardware replaces it with
-         * the actual received frame length when it clears RX_OWN. */
-        descs[idx].opts1   = RX_OWN | eor | (RX_BUF_SIZE as u32 & RX_LEN_MASK);
+        let d = self.desc_ptr(idx);
+        unsafe {
+            write_volatile(addr_of_mut!((*d).addr_lo), phys as u32);
+            write_volatile(addr_of_mut!((*d).addr_hi), (phys >> 32) as u32);
+            write_volatile(addr_of_mut!((*d).opts2), 0);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+            /* Program buffer capacity into len field; hardware replaces it with
+             * the actual received frame length when it clears RX_OWN. */
+            write_volatile(addr_of_mut!((*d).opts1),
+                RX_OWN | eor | (RX_BUF_SIZE as u32 & RX_LEN_MASK));
+        }
 
         self.frames[idx] = handle;
     }
 
     /* Attempt to harvest a received frame from the current head slot.
-     * Returns Some(frame) with the received data if hardware has filled it,
-     * or None if the hardware still owns the descriptor or the slot is empty.
-     * The caller is responsible for calling `set_len` on the returned frame
-     * before passing it to `enqueue_rx`. */
+     * Returns Some((frame, opts1)) if hardware has filled it, or None if
+     * the hardware still owns the descriptor or the slot is empty (a slot
+     * is left empty when a refill allocation failed; the caller is
+     * responsible for reposting it before harvesting again).
+     * The caller extracts the length from opts1 and must check its error
+     * bits (RX_ERR_MASK, RX_FF/RX_LF) before passing the frame on. */
     pub fn harvest(&mut self) -> Option<(NetFrame, u32)> {
         let idx = self.head;
         let h = self.frames[idx];
@@ -221,19 +219,13 @@ impl RxRing {
             return None;
         }
         /* Volatile read: hardware clears RX_OWN and writes the received
-         * length via DMA.  Without read_volatile the compiler may cache
-         * a stale value from a previous iteration. */
-        let opts1 = unsafe {
-            let p = &self.descs()[idx].opts1 as *const u32;
-            core::ptr::read_volatile(p)
-        };
+         * length via DMA. */
+        let opts1 = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).opts1)) };
         if opts1 & RX_OWN != 0 {
             return None; /* hardware still owns */
         }
-        /* Extract received length before we clear the slot */
-        let rx_len = opts1 & RX_LEN_MASK;
         self.frames[idx] = 0;
         self.head = (idx + 1) % RING_SIZE;
-        Some((unsafe { NetFrame::from_raw(h) }, rx_len))
+        Some((unsafe { NetFrame::from_raw(h) }, opts1))
     }
 }

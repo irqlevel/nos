@@ -31,7 +31,7 @@ fn tco_init() {
     use kcore::timer::Timer;
     use kcore::time::Duration;
 
-    let wdt = match TcoWatchdog::probe() {
+    let mut wdt = match TcoWatchdog::probe() {
         Some(w) => w,
         None => {
             kcore::trace!(0, "TCO watchdog: not found");
@@ -49,13 +49,29 @@ fn tco_init() {
     let wdt_ptr = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(wdt));
 
     extern "C" fn kick_wdt(ctx: *mut u8) {
+        use core::sync::atomic::{AtomicBool, Ordering};
+
         let wdt = unsafe { &*(ctx as *const TcoWatchdog) };
+
+        /* ~16 ticks (0.6s each) have elapsed since the last kick, so a
+           count still at the armed value means the timer never ran
+           (chipset-specific NO_REBOOT clearing failed) and a hang will
+           not reset the machine.  Warn once. */
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !wdt.is_counting() && !WARNED.swap(true, Ordering::Relaxed) {
+            kcore::trace!(0, "TCO watchdog: timer not counting, reset-on-hang is not armed");
+        }
+
         wdt.kick();
     }
 
     let period = Duration::from_secs(10);
-    if Timer::start(period, kick_wdt, wdt_ptr as *mut u8).is_none() {
-        kcore::trace!(0, "TCO watchdog: failed to start kick timer");
+    match Timer::start(period, kick_wdt, wdt_ptr as *mut u8) {
+        /* Dropping the handle would stop the timer (and the unkicked
+           watchdog would then reset the machine); leak it so the kick
+           runs for the kernel's lifetime. */
+        Some(t) => t.leak(),
+        None => kcore::trace!(0, "TCO watchdog: failed to start kick timer"),
     }
 }
 
@@ -64,6 +80,9 @@ pub extern "C" fn rust_test() {
     hello::test();
 }
 
+/* Contract: rust_fini must be the last thing before halt.  Block/net
+   registrations are permanent, so the C++ ops tables keep pointing at the
+   devices freed here -- any I/O issued after this call is a use-after-free. */
 #[no_mangle]
 pub extern "C" fn rust_fini() {
     nvme::shutdown();

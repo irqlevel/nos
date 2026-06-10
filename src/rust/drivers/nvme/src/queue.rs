@@ -66,23 +66,33 @@ impl Queue {
     pub fn submit(&mut self, cmd: &SubmissionEntry) {
         let slot = self.sq_tail % self.depth;
         let dst = unsafe {
-            (self.sq_dma.as_mut_slice().as_mut_ptr() as *mut SubmissionEntry).add(slot)
+            (self.sq_dma.as_mut_ptr() as *mut SubmissionEntry).add(slot)
         };
         unsafe { core::ptr::write_volatile(dst, *cmd) };
         self.sq_tail = (self.sq_tail + 1) % self.depth;
     }
 
+    /* Read the CQE at `slot` if the controller has posted it.
+     *
+     * The status word (which holds the phase bit) is read first, on its
+     * own: a single volatile read of the whole 16-byte entry lets the
+     * compiler load the dwords in any order, which could pair a valid
+     * phase bit with stale cid/status from before the controller's write. */
+    fn read_cqe(&self, slot: usize) -> Option<CompletionEntry> {
+        let src = unsafe {
+            (self.cq_dma.as_ptr() as *const CompletionEntry).add(slot)
+        };
+        let status = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*src).status)) };
+        if (status & 1 != 0) != self.cq_phase {
+            return None;
+        }
+        Some(unsafe { core::ptr::read_volatile(src) })
+    }
+
     /* Poll for one completed entry.
      * Returns Some(cqe) if a completion is available, None if CQ is empty. */
     pub fn poll_completion(&mut self) -> Option<CompletionEntry> {
-        let slot = self.cq_head;
-        let src = unsafe {
-            (self.cq_dma.as_slice().as_ptr() as *const CompletionEntry).add(slot)
-        };
-        let cqe = unsafe { core::ptr::read_volatile(src) };
-        if cqe.phase() != self.cq_phase {
-            return None;
-        }
+        let cqe = self.read_cqe(self.cq_head)?;
         /* Consume the entry: advance head and flip phase on wrap-around. */
         self.cq_head = self.cq_head + 1;
         if self.cq_head >= self.depth {
@@ -106,15 +116,7 @@ impl Queue {
 
     /* Peek at the next CQ entry without consuming it (diagnostic). */
     pub fn peek_cq(&self) -> Option<CompletionEntry> {
-        let src = unsafe {
-            (self.cq_dma.as_slice().as_ptr() as *const CompletionEntry).add(self.cq_head)
-        };
-        let cqe = unsafe { core::ptr::read_volatile(src) };
-        if cqe.phase() != self.cq_phase {
-            None
-        } else {
-            Some(cqe)
-        }
+        self.read_cqe(self.cq_head)
     }
 }
 

@@ -59,13 +59,16 @@ struct NvmeDevice {
     db_stride:   usize,
     /* Bitmask of in-use CID slots (1 = in use).  Replaces the linear
      * next_cid counter — avoids CID reuse while a previous command is still
-     * in flight.  W=1 → 64 slots, matches IO_QUEUE_DEPTH=64. */
+     * in flight.  W=1 → 64 slots, matches IO_QUEUE_DEPTH=64.  Slots beyond
+     * the actual queue depth are permanently reserved at init so in-flight
+     * commands never exceed what the SQ can hold (spec full condition is
+     * depth-1 entries). */
     cid_map: BitMap<1>,
 
     /* capacity and geometry */
     capacity:    u64,    /* total LBA count */
     sector_size: u32,    /* bytes per LBA */
-    max_transfer: u32,   /* max sectors per command (2-page limit) */
+    max_transfer: u32,   /* max sectors per command (2-PRP-entry limit) */
 
     /* In-flight WaitGroup handles indexed by CID.  0 = empty slot.
      * Accessed from both the I/O submission path and the ISR. */
@@ -83,10 +86,17 @@ struct NvmeDevice {
 impl Drop for NvmeDevice {
     fn drop(&mut self) {
         /* Tear down in reverse dependency order:
-         * 1. Unregister MSI-X ISR — stops new interrupt delivery
-         * 2. Destroy MSI-X table — releases PCI vectors
-         * 3. Destroy spinlock — after no more concurrent access
+         * 1. Disable the controller — stops command fetching and DMA into
+         *    the queue buffers we are about to free
+         * 2. Unregister MSI-X ISR — stops new interrupt delivery
+         * 3. Destroy MSI-X table — releases PCI vectors
+         * 4. Destroy spinlock — after no more concurrent access
          * Remaining fields (queues, BAR mapping) drop implicitly after. */
+        let cc = self.regs.read32(REG_CC);
+        self.regs.write32(REG_CC, cc & !CC_EN);
+        if !wait_csts_clear(&self.regs, CSTS_RDY, 100) {
+            trace!(0, "NVMe: controller did not go not-ready on shutdown");
+        }
         self._msix_irq.disarm();
         self._msix_table.disarm();
         /* io_lock is dropped implicitly after this (SpinLock::drop calls destroy) */
@@ -162,6 +172,15 @@ fn init_device(dev: pci::PciDevice) {
     trace!(0, "NVMe CAP: mqes={} dstrd_bytes={} to={}ms",
         mqes, db_stride, to_ms);
 
+    /* The fixed-size BAR0 mapping must cover the doorbells we use (qid 0
+     * and 1, SQ+CQ each).  An unusually large CAP.DSTRD would otherwise
+     * trip MmioRegion's bounds assert at doorbell-ring time. */
+    let max_db_end = DB_BASE + 3 * db_stride as usize + 4;
+    if max_db_end > BAR0_MAP_PAGES * PAGE_SIZE {
+        trace!(0, "NVMe: doorbell stride {} exceeds BAR0 mapping, skipping", db_stride);
+        return;
+    }
+
     /* --- Disable controller --- */
     let cc = regs.read32(REG_CC);
     if cc & CC_EN != 0 {
@@ -223,12 +242,6 @@ fn init_device(dev: pci::PciDevice) {
 
     let id_ctrl = unsafe { &*(id_buf.as_slice().as_ptr() as *const IdentifyController) };
     let mdts = id_ctrl.mdts;
-    let max_transfer = if mdts == 0 {
-        (2 * PAGE_SIZE / 512) as u32  /* 2-page default */
-    } else {
-        let pages = 1usize << (mdts as usize);
-        ((pages * PAGE_SIZE) / 512).min((2 * PAGE_SIZE) / 512) as u32
-    };
 
     let sn = core::str::from_utf8(&id_ctrl.sn).unwrap_or("?").trim();
     let mn = core::str::from_utf8(&id_ctrl.mn).unwrap_or("?").trim();
@@ -254,6 +267,17 @@ fn init_device(dev: pci::PciDevice) {
     let lbaf = unsafe { &*lbaf_ptr.add(lbaf_idx) };
     let sector_size: u32 = 1 << lbaf.lbads;
     trace!(0, "NVMe: ns1 capacity={} sectors sector_size={}", capacity, sector_size);
+    if sector_size < 512 || sector_size as usize > PAGE_SIZE {
+        trace!(0, "NVMe: unsupported sector size {}, skipping", sector_size);
+        return;
+    }
+
+    /* Max sectors per command.  The I/O path supplies at most two PRP
+     * entries (no PRP lists), so a command may span at most two memory
+     * pages.  MDTS is either 0 (unlimited) or at least one page (2^mdts
+     * pages, mdts >= 1 -> >= 2 pages), so the 2-page cap is always the
+     * binding limit.  Computed in device sectors, not 512-byte units. */
+    let max_transfer = (2 * PAGE_SIZE / sector_size as usize) as u32;
 
     /* --- Allocate I/O queues --- */
     let io_depth = IO_QUEUE_DEPTH.min(mqes);
@@ -323,7 +347,15 @@ fn init_device(dev: pci::PciDevice) {
         _msix_table: msix_table,
         _msix_irq: msix::MsixInterrupt::empty(),
         db_stride: db_stride as usize,
-        cid_map: BitMap::new(),
+        cid_map: {
+            let mut m = BitMap::new();
+            /* Permanently reserve slots the SQ cannot hold: at most
+             * depth-1 commands may be outstanding (NVMe full condition). */
+            for b in io_depth.saturating_sub(1)..IO_QUEUE_DEPTH {
+                m.set(b);
+            }
+            m
+        },
         capacity,
         sector_size,
         max_transfer,
@@ -352,12 +384,16 @@ fn init_device(dev: pci::PciDevice) {
     trace!(0, "NVMe: MSI-X vector={} registered", msix_irq.vector());
     dev_box._msix_irq = msix_irq;
 
-    let idx = DEVICE_COUNT.fetch_add(1, Ordering::Relaxed);
+    /* Name the device with the next free index before registering (the
+     * C++ side traces the name at registration time).  Init runs
+     * single-threaded, so the provisional index is stable; DEVICE_COUNT
+     * itself is only incremented after registration succeeds, so it is
+     * never inflated by failed initialisations. */
+    let idx = DEVICE_COUNT.load(Ordering::Relaxed);
     if idx as usize >= MAX_DEVICES {
         trace!(0, "NVMe: too many devices (max {})", MAX_DEVICES);
         return;
     }
-
     /* Build device name: "nvme0\0" .. "nvme7\0" */
     let _ = write_name(&mut dev_box.name_buf, idx);
 
@@ -376,7 +412,8 @@ fn init_device(dev: pci::PciDevice) {
 
     match block::register(&ops) {
         Some(_reg) => {
-            core::mem::forget(_reg);
+            /* Registration is permanent; the handle has no Drop. */
+            DEVICE_COUNT.store(idx + 1, Ordering::Relaxed);
             DEVICES[idx as usize].store(raw, Ordering::Release);
             trace!(0, "NVMe: registered as block device, capacity={} sectors", unsafe { (*raw).capacity });
         }
@@ -483,11 +520,12 @@ extern "C" fn nvme_msix_handler(ctx: *mut u8) {
         if wg_handle != 0 {
             unsafe { (*dev).inflight_status[cid].store(cqe.status_code(), Ordering::Relaxed) };
             unsafe { (*dev).inflight[cid].store(0, Ordering::Release) };
-            unsafe { ffi::sync::kernel_waitgroup_done(wg_handle) };
+            sync::waitgroup_done_raw(wg_handle);
         }
     }
     if completed == 0 {
-        trace!(0, "NVMe: IRQ spurious (no CQEs)");
+        /* Not level 0: a shared/stray vector would otherwise spam the log */
+        trace!(3, "NVMe: IRQ spurious (no CQEs)");
     }
 }
 
@@ -569,6 +607,13 @@ fn submit_io(
     let prp1 = dma::virt_to_phys(buf as *const u8);
     let offset_in_page = prp1 as usize & (PAGE_SIZE - 1);
     let bytes_needed = count as usize * unsafe { (*dev).sector_size } as usize;
+    if offset_in_page + bytes_needed > 2 * PAGE_SIZE {
+        /* Would span 3+ pages: per spec the controller then treats PRP2 as
+         * a PRP *list* pointer and would DMA through garbage addresses. */
+        trace!(0, "NVMe: transfer spans >2 pages (offset={} bytes={}), rejecting",
+            offset_in_page, bytes_needed);
+        return -1;
+    }
     let prp2 = if offset_in_page + bytes_needed > PAGE_SIZE {
         let next_page_virt = unsafe { buf.add(PAGE_SIZE - offset_in_page) };
         dma::virt_to_phys(next_page_virt as *const u8)
@@ -627,16 +672,4 @@ fn alloc_cid(dev: *mut NvmeDevice) -> Option<u16> {
  * Caller must hold io_lock. */
 fn free_cid(dev: *mut NvmeDevice, cid: u16) {
     unsafe { (*dev).cid_map.free(cid as usize) }
-}
-
-
-/* ------------------------------------------------------------------ */
-/* FFI glue                                                             */
-/* ------------------------------------------------------------------ */
-mod ffi {
-    pub mod sync {
-        extern "C" {
-            pub fn kernel_waitgroup_done(handle: usize);
-        }
-    }
 }
