@@ -4,6 +4,7 @@
 #include <kernel/trace.h>
 #include <lib/stdlib.h>
 #include <mm/page_table.h>
+#include <boot/grub.h>
 
 namespace Kernel
 {
@@ -21,6 +22,16 @@ VgaTerm::VgaTerm()
     Watchdog::GetInstance().UnregisterSpinLock(Lock);
 
     Stdlib::AutoLock lock(Lock);
+
+    /* On UEFI there is no EGA text mode: GRUB reports a pixel
+       framebuffer instead. Writing to 0xB8000 would scribble over
+       plain RAM, so leave the terminal disabled (ReadyFlag stays
+       false, Buf stays null and all output methods are no-ops). */
+    if (Grub::HasFramebufferInfo() && !Grub::IsFramebufferEgaText())
+    {
+        Trace(0, "Vga: no EGA text mode (pixel framebuffer), output disabled");
+        return;
+    }
 
     Buf = (u16*)Mm::PageTable::GetInstance().TmpMapPage(BufPhyAddr);
     if (Buf == nullptr)
@@ -146,6 +157,9 @@ void VgaTerm::Puts(const char *str)
 {
     Stdlib::AutoLock lock(Lock);
 
+    if (Buf == nullptr)
+        return;
+
     PutsLockHeld(str);
 }
 
@@ -159,6 +173,9 @@ void VgaTerm::ClsLockHeld()
 void VgaTerm::Cls()
 {
     Stdlib::AutoLock lock(Lock);
+
+    if (Buf == nullptr)
+        return;
 
     ClsLockHeld();
     Row = 0;
@@ -175,6 +192,9 @@ void VgaTerm::VPrintf(const char *fmt, va_list args)
 
     Stdlib::AutoLock lock(Lock);
 
+    if (Buf == nullptr)
+        return;
+
     PutsLockHeld(str);
 }
 
@@ -190,6 +210,9 @@ void VgaTerm::Printf(const char *fmt, ...)
 void VgaTerm::PrintString(const char *s)
 {
     Stdlib::AutoLock lock(Lock);
+
+    if (Buf == nullptr)
+        return;
 
     PutsLockHeld(s);
 }
@@ -218,6 +241,9 @@ void VgaTerm::Cursor()
 void VgaTerm::Backspace()
 {
     Stdlib::AutoLock lock(Lock);
+
+    if (Buf == nullptr)
+        return;
 
     if (Column > 0)
     {

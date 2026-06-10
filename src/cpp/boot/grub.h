@@ -139,12 +139,52 @@ struct MultiBootTagMmap
     MultiBootMmapEntry Entry[0];  
 };
 
+struct MultiBootTagFramebuffer
+{
+    u32 Type;
+    u32 Size;
+    u64 Addr;
+    u32 Pitch;
+    u32 Width;
+    u32 Height;
+    u8 Bpp;
+    u8 FbType;
+    u8 Reserved;
+} __attribute__((packed));
+
+const u8 MultiBootFramebufferTypeIndexed = 0;
+const u8 MultiBootFramebufferTypeRgb = 1;
+const u8 MultiBootFramebufferTypeEgaText = 2;
+
+/* Tags 14/15 carry a verbatim copy of the ACPI RSDP (v1/v2). */
+struct MultiBootTagAcpi
+{
+    u32 Type;
+    u32 Size;
+    u8 Rsdp[0];
+};
+
 const u32 MultiBootTagTypeEnd = 0;
 const u32 MultiBootTagTypeMmap = 6;
 const u32 MultiBootTagTypeBootDev = 5;
 const u32 MultiBootTagTypeCmdline = 1;
+const u32 MultiBootTagTypeFramebuffer = 8;
+const u32 MultiBootTagTypeAcpiOld = 14;
+const u32 MultiBootTagTypeAcpiNew = 15;
 
 void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo);
+
+/* RSDP copy saved from the ACPI tag, if GRUB provided one (it always
+   does on UEFI, where the legacy BIOS-area scan cannot find the RSDP).
+   Returns nullptr and size 0 if no ACPI tag was present. */
+const void* GetAcpiRsdp(size_t& size);
+
+/* True if GRUB provided a framebuffer tag. */
+bool HasFramebufferInfo();
+
+/* True if the framebuffer is legacy EGA text mode at 0xB8000.
+   Only meaningful when HasFramebufferInfo() is true. */
+bool IsFramebufferEgaText();
 
 }
 }

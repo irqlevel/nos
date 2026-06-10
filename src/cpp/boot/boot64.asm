@@ -180,7 +180,7 @@ check_long_mode:
 setup_low_page_tables:
     ; map first P4 entry to P3 table
     mov eax, p3_low_table
-    or eax, 0b10011 ; present + writable + cache disabled
+    or eax, 0b00011 ; present + writable
     mov [p4_table], eax
 
     mov ebx, 0
@@ -190,7 +190,7 @@ setup_low_page_tables:
     ; map first P3 entry to P2 table
 
     mov eax, esi
-    or eax, 0b10011 ; present + writable + cache disabled
+    or eax, 0b00011 ; present + writable
     mov [p3_low_table + edi * 8], eax
 
    ; map each P2 entry to a huge 2MiB page
@@ -203,7 +203,10 @@ setup_low_page_tables:
 
     add eax, ebx
 
-    or eax, 0b10010011 ; present + writable + cache disabled + huge
+    ; Write-back cacheable: MTRRs keep MMIO holes (LAPIC, IOAPIC, PCI)
+    ; uncached on real hardware. Mapping RAM with PCD set would run the
+    ; whole kernel uncached on bare metal.
+    or eax, 0b10000011 ; present + writable + huge
     mov [esi + ecx * 8], eax ; map ecx-th entry
 
     inc ecx            ; increase counter
@@ -220,7 +223,7 @@ setup_low_page_tables:
 setup_high_page_tables:
     ; map first P4 entry to P3 table
     mov eax, p3_high_table
-    or eax, 0b10011 ; present + writable + cache disabled
+    or eax, 0b00011 ; present + writable
     mov [p4_table + 256 * 8], eax
 
     mov ebx, 0
@@ -230,7 +233,7 @@ setup_high_page_tables:
     ; map first P3 entry to P2 table
 
     mov eax, esi
-    or eax, 0b10011 ; present + writable + cache disabled
+    or eax, 0b00011 ; present + writable
     mov [p3_high_table + edi * 8], eax
 
    ; map each P2 entry to a huge 2MiB page
@@ -243,7 +246,7 @@ setup_high_page_tables:
 
     add eax, ebx
 
-    or eax, 0b10010011 ; present + writable + cache disabled + huge
+    or eax, 0b10000011 ; present + writable + huge (write-back, see above)
     mov [esi + ecx * 8], eax ; map ecx-th entry
 
     inc ecx            ; increase counter

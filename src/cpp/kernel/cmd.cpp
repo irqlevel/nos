@@ -1227,12 +1227,14 @@ static void CmdPanic(const char* args, Stdlib::Printer& con)
     {
         con.Printf("triggering page fault...\n");
         volatile int* p = nullptr;
+        // cppcheck-suppress nullPointer
         *p = 0;
     }
     else if (Stdlib::StrCmp(type, "div0") == 0)
     {
         con.Printf("triggering divide by zero...\n");
         volatile int zero = 0;
+        // cppcheck-suppress zerodiv
         volatile int x = 1 / zero;
         (void)x;
     }

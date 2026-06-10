@@ -119,7 +119,7 @@ all: check nos.iso
 nocheck: nos.iso
 
 check: $(CXX_SRC)
-	cppcheck --error-exitcode=22 -q src/cpp || exit 1
+	cppcheck --error-exitcode=22 --inline-suppr -q src/cpp || exit 1
 
 nos.iso: build/grub.cfg kernel64.elf
 	rm -rf iso
