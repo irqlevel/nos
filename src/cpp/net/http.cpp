@@ -112,11 +112,13 @@ bool HttpClient::SendRequest(TcpConn* conn, const char* method,
     for (ulong i = 0; i < sizeof(parts) / sizeof(parts[0]); i++)
     {
         ulong slen = Stdlib::StrLen(parts[i]);
-        if (off + slen < MaxReqLen)
-        {
-            Stdlib::MemCpy(req + off, parts[i], slen);
-            off += slen;
-        }
+        /* Fail rather than silently dropping a part: a truncated request line
+           or missing Host header would otherwise go out as a plausible but
+           wrong request. */
+        if (off + slen >= MaxReqLen)
+            return false;
+        Stdlib::MemCpy(req + off, parts[i], slen);
+        off += slen;
     }
 
     long sent = Tcp::GetInstance().Send(conn, req, off);
@@ -201,6 +203,7 @@ bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp)
         resp.BodyLen = total;
         resp.ContentLength = total;
         resp.Ok = true;
+        resp.Err = MakeSuccess();
         return true;
     }
 
@@ -253,6 +256,7 @@ bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp)
     ExtractLocation(buf, headerEnd, resp.Location, sizeof(resp.Location));
 
     resp.Ok = true;
+    resp.Err = MakeSuccess();
     Mm::Free(buf);
     return true;
 }

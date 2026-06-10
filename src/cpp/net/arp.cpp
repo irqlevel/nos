@@ -185,16 +185,23 @@ bool ArpTable::Resolve(NetDevice* dev, IpAddress ip, MacAddress& mac)
     if (Lookup(ip, mac))
         return true;
 
-    /* Send request and poll for reply.
+    /* Send a request and poll for the reply, retransmitting once per second so a
+       single dropped broadcast does not cost the whole timeout.
        DrainRx now runs in the soft IRQ task, so we Sleep to let it process. */
-    SendRequest(dev, ip);
+    static const ulong MaxTries = 3;
+    static const ulong PollPerTryMs = 1000;
 
-    for (ulong attempt = 0; attempt < 3000; attempt++)
+    for (ulong tries = 0; tries < MaxTries; tries++)
     {
-        if (Lookup(ip, mac))
-            return true;
+        SendRequest(dev, ip);
 
-        Sleep(1 * Const::NanoSecsInMs);
+        for (ulong i = 0; i < PollPerTryMs; i++)
+        {
+            if (Lookup(ip, mac))
+                return true;
+
+            Sleep(1 * Const::NanoSecsInMs);
+        }
     }
 
     return false;

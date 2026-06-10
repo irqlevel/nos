@@ -281,22 +281,28 @@ struct IpAddress
         ulong octet = 0;
         ulong shift = 24;
         ulong dots = 0;
+        ulong digits = 0; /* digits accumulated into the current octet */
         const char* p = s;
 
         while (*p)
         {
             if (*p == '.')
             {
-                if (octet > 255) return false;
+                /* Reject empty octets such as "1..2.3", ".1.2.3" or "1.2.3." */
+                if (digits == 0) return false;
                 ip |= (u32)(octet << shift);
-                if (shift == 0) return false;
+                if (shift == 0) return false; /* more than four octets */
                 shift -= 8;
                 octet = 0;
+                digits = 0;
                 dots++;
             }
             else if (*p >= '0' && *p <= '9')
             {
                 octet = octet * 10 + (ulong)(*p - '0');
+                /* Reject before the value can wrap or exceed a byte */
+                if (octet > 255) return false;
+                digits++;
             }
             else
             {
@@ -305,7 +311,7 @@ struct IpAddress
             p++;
         }
 
-        if (dots != 3 || octet > 255)
+        if (dots != 3 || digits == 0)
             return false;
 
         ip |= (u32)(octet << shift);

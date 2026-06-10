@@ -55,20 +55,38 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
 
     const IcmpHdr* icmp = (const IcmpHdr*)(frame + sizeof(EthHdr) + ipHdrLen);
 
+    /* Locate the full ICMP message (header + payload) from the IP total length
+       and bounds-check it before touching the body. */
+    ulong ipTotalLen = Ntohs(ip->TotalLen);
+    if (ipTotalLen < ipHdrLen + sizeof(IcmpHdr) ||
+        sizeof(EthHdr) + ipTotalLen > len)
+    {
+        RxTooShort.Inc();
+        return;
+    }
+    ulong icmpLen = ipTotalLen - ipHdrLen;
+
+    /* Verify the ICMP checksum; drop corrupt packets instead of echoing them. */
+    if (IpChecksum(icmp, icmpLen) != 0)
+    {
+        RxBadCsum.Inc();
+        return;
+    }
+
     if (icmp->Type == TypeEchoRequest && icmp->Code == 0)
     {
         EchoReqRx.Inc();
+
+        /* Only answer pings addressed directly to us. Replying to broadcast or
+           someone else's address turns the host into a smurf amplifier. */
+        if (IpAddress::FromNetwork(ip->DstAddr) != dev->GetIp())
+            return;
+
         Trace(0, "ICMP echo request: srcIp %p dstIp %p id %u seq %u",
             (ulong)Ntohl(ip->SrcAddr), (ulong)Ntohl(ip->DstAddr),
             (ulong)Ntohs(icmp->Id), (ulong)Ntohs(icmp->Seq));
-        /* Build echo reply */
-        ulong ipTotalLen = Ntohs(ip->TotalLen);
-        if (ipTotalLen < ipHdrLen + sizeof(IcmpHdr))
-            return;
-        if (sizeof(EthHdr) + ipTotalLen > len)
-            return;
 
-        ulong icmpLen = ipTotalLen - ipHdrLen;
+        /* Build echo reply */
         ulong replyFrameLen = sizeof(EthHdr) + sizeof(IpHdr) + icmpLen;
 
         if (replyFrameLen > 1514)
@@ -237,8 +255,8 @@ void Icmp::Dump(Stdlib::Printer& printer)
         EchoReqRx.Get(), EchoReqTx.Get());
     printer.Printf("echo reply    rx:%u tx:%u tx-fail:%u\n",
         EchoReplyRx.Get(), EchoReplyTx.Get(), EchoReplyTxFail.Get());
-    printer.Printf("other         rx:%u short:%u\n",
-        RxOther.Get(), RxTooShort.Get());
+    printer.Printf("other         rx:%u short:%u badcsum:%u\n",
+        RxOther.Get(), RxTooShort.Get(), RxBadCsum.Get());
 }
 
 }

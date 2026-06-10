@@ -4,6 +4,7 @@
 #include <kernel/trace.h>
 #include <kernel/sched.h>
 #include <kernel/time.h>
+#include <kernel/asm.h>
 #include <lib/stdlib.h>
 #include <include/const.h>
 
@@ -38,6 +39,11 @@ bool DnsResolver::Init(NetDevice* dev, Net::IpAddress dnsServerIp)
 
     Dev = dev;
     ServerIp = dnsServerIp;
+
+    /* Seed the transaction ID from the TSC so it is not predictably 1,2,3...
+       which (together with the source check in RxCallback) raises the bar for
+       off-path answer forgery. */
+    NextId = (u16)(ReadTsc() | 1);
 
     if (!Dev->RegisterUdpListener(ClientPort, RxCallback, this))
     {
@@ -249,6 +255,15 @@ void DnsResolver::RxCallback(const u8* frame, ulong len, void* ctx)
     if (len < hdrLen + sizeof(DnsHeader))
         return;
 
+    /* Only accept replies that actually came from the configured resolver on
+       the DNS service port. Without this an off-path host could inject a forged
+       answer (the transaction ID alone is weak protection). */
+    const UdpHdr* udp = (const UdpHdr*)(frame + sizeof(EthHdr) + ipHdrLen);
+    if (Net::IpAddress::FromNetwork(ip->SrcAddr) != self->ServerIp)
+        return;
+    if (Ntohs(udp->SrcPort) != ServerPort)
+        return;
+
     const u8* dnsPayload = frame + hdrLen;
     ulong dnsLen = len - hdrLen;
 
@@ -278,9 +293,13 @@ void DnsResolver::ProcessResponse(const u8* dnsPayload, ulong dnsLen)
         return;
     }
 
-    /* Check ID matches pending query */
-    if (id != Pending.Id)
-        return;
+    /* Check ID matches pending query (read under the lock that also guards the
+       writes below -- this runs in softirq context concurrently with Resolve). */
+    {
+        Stdlib::AutoLock lock(CacheLock);
+        if (id != Pending.Id)
+            return;
+    }
 
     if (anCount == 0)
         return;
@@ -321,8 +340,14 @@ void DnsResolver::ProcessResponse(const u8* dnsPayload, ulong dnsLen)
         {
             u32 ipNet;
             Stdlib::MemCpy(&ipNet, dnsPayload + off, 4);
-            Pending.Result = IpAddress::FromNetwork(ipNet);
-            Pending.Answered = true;
+            Stdlib::AutoLock lock(CacheLock);
+            /* Re-check the id under the lock: Resolve may have moved on to a new
+               query between our earlier check and here. */
+            if (id == Pending.Id && !Pending.Answered)
+            {
+                Pending.Result = IpAddress::FromNetwork(ipNet);
+                Pending.Answered = true;
+            }
             return;
         }
 
@@ -354,8 +379,11 @@ bool DnsResolver::Resolve(const char* name, Net::IpAddress& ip, ulong timeoutMs)
 
     u16 id = NextId++;
 
-    Pending.Id = id;
-    Pending.Answered = false;
+    {
+        Stdlib::AutoLock lock(CacheLock);
+        Pending.Id = id;
+        Pending.Answered = false;
+    }
 
     if (!SendQuery(name, id))
     {
@@ -372,9 +400,17 @@ bool DnsResolver::Resolve(const char* name, Net::IpAddress& ip, ulong timeoutMs)
         Sleep(PollIntervalMs * Const::NanoSecsInMs);
         elapsed += PollIntervalMs;
 
-        if (Pending.Answered)
+        bool answered;
+        Net::IpAddress result;
         {
-            ip = Pending.Result;
+            Stdlib::AutoLock lock(CacheLock);
+            answered = Pending.Answered;
+            result = Pending.Result;
+        }
+
+        if (answered)
+        {
+            ip = result;
             Insert(name, ip);
             Trace(0, "DNS: resolved %s -> %u.%u.%u.%u",
                 name,
