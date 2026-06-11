@@ -20,6 +20,9 @@ public:
     void SetIrq(u8 irq, u64 apicId, u8 vector);
     void SetIrqLevel(u8 irq, u64 apicId, u8 vector, bool activeHigh);
 
+    /* Rewrite only the destination of an already programmed entry */
+    void SetIrqDestination(u8 irq, u64 apicId);
+
 private:
     IoApic();
     ~IoApic();

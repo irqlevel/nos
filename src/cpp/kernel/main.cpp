@@ -17,6 +17,7 @@
 #include "parameters.h"
 #include "console.h"
 #include "softirq.h"
+#include "irq_balance.h"
 #include "time.h"
 
 #include <boot/grub.h>
@@ -515,6 +516,9 @@ void BpStartup(void* ctx)
                 return;
             }
         }
+
+        /* All CPUs are running: spread device IRQs across them */
+        IrqBalance::GetInstance().Balance();
 
         Trace(0, "Before preempt on");
 

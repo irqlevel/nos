@@ -3,6 +3,7 @@
 #include <include/types.h>
 #include <drivers/pci.h>
 #include <kernel/interrupt.h>
+#include <kernel/spin_lock.h>
 
 namespace Kernel
 {
@@ -23,6 +24,9 @@ public:
 
     void Mask(u16 index);
     void Unmask(u16 index);
+
+    /* Redirect an enabled entry to another CPU (used by IrqBalance) */
+    void Retarget(u16 index, u32 apicId);
 
     u16 GetTableSize() const { return Count; }
     bool IsReady() const { return Table != nullptr && Count > 0; }
@@ -48,6 +52,11 @@ private:
 
     /* Per-table-entry assigned CPU vector; 0 = none. */
     u8* EntryVector;
+
+    /* Serializes table entry updates (EnableVector/Mask/Unmask/Retarget)
+       so a concurrent Mask cannot be clobbered by Retarget restoring a
+       stale control value. Not taken from IRQ context. */
+    SpinLock EntryLock;
 
     static u8 NextVector;
 };

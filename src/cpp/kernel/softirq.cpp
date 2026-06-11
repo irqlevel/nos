@@ -1,7 +1,9 @@
 #include "softirq.h"
 #include "trace.h"
 #include "sched.h"
+#include "cpu.h"
 
+#include <drivers/lapic.h>
 #include <mm/new.h>
 #include <lib/stdlib.h>
 #include <include/const.h>
@@ -10,10 +12,15 @@ namespace Kernel
 {
 
 SoftIrq::SoftIrq()
-    : Pending(0)
-    , TaskPtr(nullptr)
+    : Running(0)
+    , Ready(0)
 {
     Stdlib::MemSet(Handlers, 0, sizeof(Handlers));
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        CpuStates[i].Pending.Set(0);
+        CpuStates[i].TaskPtr = nullptr;
+    }
 }
 
 SoftIrq::~SoftIrq()
@@ -22,16 +29,32 @@ SoftIrq::~SoftIrq()
 
 bool SoftIrq::Init()
 {
-    TaskPtr = Mm::TAlloc<Task, Tag>("softirq");
-    if (!TaskPtr)
-        return false;
+    ulong cpuMask = CpuTable::GetInstance().GetRunningCpus();
 
-    if (!TaskPtr->Start(&SoftIrq::TaskFunc, this))
+    for (ulong i = 0; i < MaxCpus; i++)
     {
-        TaskPtr->Put();
-        TaskPtr = nullptr;
-        return false;
+        if (!(cpuMask & (1UL << i)))
+            continue;
+
+        Task* task = Mm::TAlloc<Task, Tag>("softirq/%u", i);
+        if (!task)
+        {
+            Stop();
+            return false;
+        }
+
+        task->SetCpuAffinity(1UL << i);
+        if (!task->Start(&SoftIrq::TaskFunc, &CpuStates[i]))
+        {
+            task->Put();
+            Stop();
+            return false;
+        }
+
+        CpuStates[i].TaskPtr = task;
     }
+
+    Ready.Set(1);
 
     Trace(0, "SoftIrq: initialized");
     return true;
@@ -39,12 +62,18 @@ bool SoftIrq::Init()
 
 void SoftIrq::Stop()
 {
-    if (TaskPtr)
+    Ready.Set(0);
+
+    for (ulong i = 0; i < MaxCpus; i++)
     {
-        TaskPtr->SetStopping();
-        TaskPtr->Wait();
-        TaskPtr->Put();
-        TaskPtr = nullptr;
+        Task* task = CpuStates[i].TaskPtr;
+        if (task)
+        {
+            task->SetStopping();
+            task->Wait();
+            task->Put();
+            CpuStates[i].TaskPtr = nullptr;
+        }
     }
 }
 
@@ -53,7 +82,19 @@ void SoftIrq::Raise(ulong type)
     if (type >= MaxTypes)
         return;
 
-    Pending.SetBit(type);
+    ulong cpu = CpuTable::GetInstance().GetCurrentCpuId();
+    if (BugOn(cpu >= MaxCpus))
+        return;
+
+    if (CpuStates[cpu].Pending.SetBit(type))
+        return; /* was already pending */
+
+    /* Scheduling is IPI-driven: without a kick an idle CPU would not
+       run its softirq task until the next timer tick IPI. Send the
+       IPI directly -- CpuTable::SendIPI takes spinlocks which are not
+       safe in hard IRQ context. */
+    if (Ready.Get())
+        Lapic::SendIPI(cpu, CpuTable::IPIVector);
 }
 
 void SoftIrq::Register(ulong type, void (*handler)(void* ctx), void* ctx)
@@ -67,13 +108,13 @@ void SoftIrq::Register(ulong type, void (*handler)(void* ctx), void* ctx)
 
 void SoftIrq::TaskFunc(void* ctx)
 {
-    SoftIrq* self = static_cast<SoftIrq*>(ctx);
-    self->Run();
+    SoftIrq::GetInstance().Run(*static_cast<CpuState*>(ctx));
 }
 
-void SoftIrq::Run()
+void SoftIrq::Run(CpuState& state)
 {
     auto* task = Task::GetCurrentTask();
+    ulong self = (ulong)(&state - &CpuStates[0]);
 
     while (!task->IsStopping())
     {
@@ -81,15 +122,33 @@ void SoftIrq::Run()
 
         for (ulong i = 0; i < MaxTypes; i++)
         {
-            if (Pending.TestBit(i))
-            {
-                Pending.ClearBit(i);
+            if (!state.Pending.TestBit(i))
+                continue;
 
-                if (Handlers[i].Func)
-                {
-                    Handlers[i].Func(Handlers[i].Ctx);
-                    handled = true;
-                }
+            if (Running.SetBit(i))
+            {
+                /* Type is being handled on another CPU: keep the
+                   pending bit set and retry on the next pass. */
+                continue;
+            }
+
+            state.Pending.ClearBit(i);
+
+            if (Handlers[i].Func)
+            {
+                Handlers[i].Func(Handlers[i].Ctx);
+                handled = true;
+            }
+
+            Running.ClearBit(i);
+
+            /* Kick CPUs which lost the Running race while we held it,
+               so their pending work is not delayed until the next
+               timer tick. */
+            for (ulong c = 0; c < MaxCpus; c++)
+            {
+                if (c != self && CpuStates[c].Pending.TestBit(i))
+                    Lapic::SendIPI(c, CpuTable::IPIVector);
             }
         }
 

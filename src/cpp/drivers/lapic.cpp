@@ -111,6 +111,12 @@ void Lapic::SendStartup(u32 apicId, u32 vector)
 
 void Lapic::SendIPI(u32 apicId, u32 vector)
 {
+    /* The two ICR writes must not be interleaved with another SendIPI
+       on this CPU (e.g. from an interrupt handler): the second sender
+       would clobber IcrHigh and redirect the first IPI. */
+    ulong flags = GetRflags();
+    InterruptDisable();
+
     WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
     WriteReg(IcrLowIndex, vector | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
 
@@ -118,6 +124,8 @@ void Lapic::SendIPI(u32 apicId, u32 vector)
     {
         Pause();
     }
+
+    SetRflags(flags);
 }
 
 }

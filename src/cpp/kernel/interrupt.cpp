@@ -1,6 +1,7 @@
 #include "interrupt.h"
 #include "idt.h"
 #include "cpu.h"
+#include "irq_balance.h"
 #include "trace.h"
 #include "asm.h"
 
@@ -100,7 +101,8 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
     Trace(0, "Register level interrupt irq 0x%p gsi 0x%p vector 0x%p fn 0x%p activeHigh %u",
         (ulong)irq, (ulong)gsi, (ulong)vector, handler.GetHandlerFn(), (ulong)activeHigh);
 
-    IoApic::GetInstance().SetIrqLevel(gsi, CpuTable::GetInstance().GetCurrentCpuId(), vector, activeHigh);
+    ulong cpu = IrqBalance::GetInstance().AssignIoApicIrq(gsi);
+    IoApic::GetInstance().SetIrqLevel(gsi, cpu, vector, activeHigh);
 
     /* Record in the shared table */
     VectorEntry& ve = Vectors[vector];
