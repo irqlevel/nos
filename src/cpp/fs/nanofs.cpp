@@ -389,7 +389,8 @@ u32 NanoFs::ComputeDataChecksum(NanoInode* inode)
 
     for (u32 i = 0; i < NanoMaxBlocks && remaining > 0; i++)
     {
-        if (!Io.ReadBlock(Super->DataStartBlock + inode->Blocks[i], buf))
+        if (inode->Blocks[i] >= NanoDataBlockCount ||
+            !Io.ReadBlock(Super->DataStartBlock + inode->Blocks[i], buf))
         {
             Mm::Free(buf);
             return 0;
@@ -474,9 +475,11 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx)
         {
             Trace(0, "NanoFs::LoadVNode: alloc dir buf failed for inode %u", (ulong)inodeIdx);
         }
-        else if (!Io.ReadBlock(Super->DataStartBlock + inode->Blocks[0], dirBuf))
+        else if (inode->Blocks[0] >= NanoDataBlockCount ||
+                 !Io.ReadBlock(Super->DataStartBlock + inode->Blocks[0], dirBuf))
         {
-            Trace(0, "NanoFs::LoadVNode: read dir block failed for inode %u", (ulong)inodeIdx);
+            Trace(0, "NanoFs::LoadVNode: bad or unreadable dir block %u for inode %u",
+                  (ulong)inode->Blocks[0], (ulong)inodeIdx);
             Mm::Free(dirBuf);
             dirBuf = nullptr;
         }
@@ -487,7 +490,10 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx)
             for (u32 i = 0; i < inode->Size && i < NanoMaxDirEntries; i++)
             {
                 VNode* child = LoadVNode(entries[i].InodeIndex);
-                if (child != nullptr)
+                /* Guard against corrupted images: an entry referencing this
+                   dir itself or an inode already linked elsewhere would
+                   corrupt the sibling list. */
+                if (child != nullptr && child != vnode && child->SiblingLink.IsEmpty())
                 {
                     child->Parent = vnode;
                     vnode->Children.InsertTail(&child->SiblingLink);
@@ -560,6 +566,14 @@ bool NanoFs::AddDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
         return false;
     }
 
+    if (dirInode->Blocks[0] >= NanoDataBlockCount)
+    {
+        Trace(0, "NanoFs::AddDirEntry: dir %u bad data block %u",
+              (ulong)dirInodeIdx, (ulong)dirInode->Blocks[0]);
+        delete dirInode;
+        return false;
+    }
+
     u8* dirBuf = (u8*)Mm::Alloc(NanoBlockSize, 0);
     if (dirBuf == nullptr)
     {
@@ -619,6 +633,14 @@ bool NanoFs::RemoveDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
     if (dirInode->Type != NanoInodeTypeDir)
     {
         Trace(0, "NanoFs::RemoveDirEntry: inode %u is not a dir", (ulong)dirInodeIdx);
+        delete dirInode;
+        return false;
+    }
+
+    if (dirInode->Blocks[0] >= NanoDataBlockCount)
+    {
+        Trace(0, "NanoFs::RemoveDirEntry: dir %u bad data block %u",
+              (ulong)dirInodeIdx, (ulong)dirInode->Blocks[0]);
         delete dirInode;
         return false;
     }
@@ -1107,6 +1129,14 @@ bool NanoFs::Read(VNode* file, void* buf, ulong len, ulong offset)
 
     while (bytesRead < toRead && blockOff < NanoMaxBlocks)
     {
+        if (inode->Blocks[blockOff] >= NanoDataBlockCount)
+        {
+            Trace(0, "NanoFs::Read: bad data block %u for inode %u",
+                  (ulong)inode->Blocks[blockOff], (ulong)inodeIdx);
+            ok = false;
+            break;
+        }
+
         if (!Io.ReadBlock(Super->DataStartBlock + inode->Blocks[blockOff], blockBuf))
         {
             Trace(0, "NanoFs::Read: read data block %u failed for inode %u",

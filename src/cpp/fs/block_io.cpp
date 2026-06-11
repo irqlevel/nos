@@ -45,6 +45,8 @@ bool BlockIo::WriteBlock(u32 blockIdx, const void* buf, bool fua)
 
 bool BlockIo::Flush()
 {
+    if (Dev == nullptr)
+        return false;
     return Dev->Flush();
 }
 
