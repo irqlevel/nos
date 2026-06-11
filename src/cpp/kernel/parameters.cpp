@@ -95,8 +95,7 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     if (len < 3)
         return false;
 
-    Stdlib::StrnCpy(param, &cmdline[start], len);
-    param[len] = '\0';
+    Stdlib::StrnCpy(param, &cmdline[start], len + 1);
     
     const char* sep = Stdlib::StrChrOnce(param, '=');
     if (sep == nullptr)

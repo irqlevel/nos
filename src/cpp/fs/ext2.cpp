@@ -50,6 +50,13 @@ bool Ext2Fs::ReadBlock(u32 blockNum, void* buf)
         return false;
 
     u32 sectorsPerBlock = BlockSize / (u32)Dev->GetSectorSize();
+    if (sectorsPerBlock == 0)
+    {
+        Trace(0, "Ext2Fs: block size %u smaller than sector size %u",
+              (ulong)BlockSize, (ulong)Dev->GetSectorSize());
+        return false;
+    }
+
     u64 startSector = (u64)blockNum * sectorsPerBlock;
     return Dev->ReadSectors(startSector, buf, sectorsPerBlock);
 }
@@ -76,11 +83,22 @@ bool Ext2Fs::Mount()
     }
 
     /* Read superblock: it starts at byte offset 1024 from partition start.
-       For a 512-byte sector device, that is sector 2 (2 sectors). */
-    u32 sbSectorStart = Ext2SuperBlockOffset / (u32)Dev->GetSectorSize();
-    u32 sbSectorCount = sizeof(Ext2SuperBlock) / (u32)Dev->GetSectorSize();
-    if (sbSectorCount == 0)
-        sbSectorCount = 1;
+       For sector sizes <= 1024 that is a whole-sector offset; for larger
+       sectors (e.g. 4096) it sits inside the first sector. */
+    u32 sectorSize = (u32)Dev->GetSectorSize();
+    u32 sbSectorStart = 0;
+    u32 sbOffsetInSector = 0;
+    u32 sbSectorCount = 0;
+
+    if (sectorSize == 0 || sectorSize > Const::PageSize)
+    {
+        Trace(0, "Ext2Fs: unsupported sector size %u", (ulong)sectorSize);
+        goto fail;
+    }
+
+    sbSectorStart = Ext2SuperBlockOffset / sectorSize;
+    sbOffsetInSector = Ext2SuperBlockOffset % sectorSize;
+    sbSectorCount = (sbOffsetInSector + (u32)sizeof(Ext2SuperBlock) + sectorSize - 1) / sectorSize;
 
     /* Use TmpBlock as scratch; copy superblock out of it */
     Stdlib::MemSet(TmpBlock, 0, Const::PageSize);
@@ -96,7 +114,7 @@ bool Ext2Fs::Mount()
         Trace(0, "Ext2Fs: alloc superblock failed");
         goto fail;
     }
-    Stdlib::MemCpy(Super, TmpBlock, sizeof(Ext2SuperBlock));
+    Stdlib::MemCpy(Super, TmpBlock + sbOffsetInSector, sizeof(Ext2SuperBlock));
 
     if (Super->Magic != Ext2Magic)
     {
@@ -105,9 +123,10 @@ bool Ext2Fs::Mount()
     }
 
     BlockSize = 1024u << Super->LogBlockSize;
-    if (BlockSize < 1024 || BlockSize > Const::PageSize)
+    if (BlockSize < 1024 || BlockSize > Const::PageSize || BlockSize < sectorSize)
     {
-        Trace(0, "Ext2Fs: unsupported block size %u", (ulong)BlockSize);
+        Trace(0, "Ext2Fs: unsupported block size %u (sector size %u)",
+              (ulong)BlockSize, (ulong)sectorSize);
         goto fail;
     }
 
@@ -483,8 +502,13 @@ VNode* Ext2Fs::LoadDir(u32 inodeNum)
     {
         Ext2DirEntry* de = reinterpret_cast<Ext2DirEntry*>(dirBuf + pos);
 
-        if (de->RecLen == 0)
+        if (de->RecLen < sizeof(Ext2DirEntry) + de->NameLen ||
+            de->RecLen > dirSize - pos)
+        {
+            Trace(0, "Ext2Fs::LoadDir: bad dirent at offset %u in inode %u",
+                  (ulong)pos, (ulong)inodeNum);
             break;
+        }
 
         if (de->Inode != 0 && de->NameLen > 0)
         {

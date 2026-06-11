@@ -32,6 +32,12 @@ bool Vfs::Mount(const char* path, FileSystem* fs, bool readOnly)
         return false;
     }
 
+    if (Stdlib::StrLen(path) >= MaxPath)
+    {
+        Trace(0, "Vfs::Mount: path too long");
+        return false;
+    }
+
     Stdlib::AutoLock lock(Lock);
 
     // Check for duplicate mount path

@@ -64,14 +64,14 @@ bool PartitionDevice::Flush()
 
 bool PartitionDevice::ReadSectors(u64 sector, void* buf, u32 count)
 {
-    if (sector + count > SectorCount)
+    if (sector > SectorCount || count > SectorCount - sector)
         return false;
     return Parent->ReadSectors(StartSector + sector, buf, count);
 }
 
 bool PartitionDevice::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
 {
-    if (sector + count > SectorCount)
+    if (sector > SectorCount || count > SectorCount - sector)
         return false;
     return Parent->WriteSectors(StartSector + sector, buf, count, fua);
 }
@@ -137,6 +137,9 @@ bool PartitionDevice::ProbeDevice(BlockDevice* dev)
 
 void PartitionDevice::ProbeAll()
 {
+    /* Boot-only: there is no way to unregister from BlockDeviceTable,
+       so running this twice would re-init instances that are still
+       registered and register duplicates. */
     InstanceCount = 0;
 
     for (ulong i = 0; i < MaxPartitions; i++)

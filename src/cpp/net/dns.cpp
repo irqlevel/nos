@@ -100,8 +100,7 @@ void DnsResolver::Insert(const char* name, Net::IpAddress ip)
     {
         if (!Cache[i].Valid)
         {
-            Stdlib::StrnCpy(Cache[i].Name, name, MaxDomainLen);
-            Cache[i].Name[MaxDomainLen] = '\0';
+            Stdlib::StrnCpy(Cache[i].Name, name, sizeof(Cache[i].Name));
             Cache[i].Ip = ip;
             Cache[i].Valid = true;
             return;
@@ -109,8 +108,7 @@ void DnsResolver::Insert(const char* name, Net::IpAddress ip)
     }
 
     /* Evict slot 0 (simple strategy) */
-    Stdlib::StrnCpy(Cache[0].Name, name, MaxDomainLen);
-    Cache[0].Name[MaxDomainLen] = '\0';
+    Stdlib::StrnCpy(Cache[0].Name, name, sizeof(Cache[0].Name));
     Cache[0].Ip = ip;
     Cache[0].Valid = true;
 }
