@@ -56,7 +56,14 @@ private:
 class Interrupt
 {
 public:
+    /* Edge-triggered system IRQs (PIT/HPET/8042/serial). These stay
+       pinned to the registering CPU (the BSP): timekeeping and the
+       scheduling tick depend on it. Not balanced by IrqBalance. */
     static void Register(InterruptHandler& handler, u8 irq, u8 vector);
+
+    /* Level-triggered device IRQs (PCI INTx). The destination CPU is
+       chosen by IrqBalance and spread across CPUs after SMP bringup.
+       MSI-X vectors are likewise balanced via MsixTable::EnableVector. */
     static void RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector);
 
     /* Shared interrupt dispatch (called from SharedInterruptStub) */

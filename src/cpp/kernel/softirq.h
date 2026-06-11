@@ -3,6 +3,7 @@
 #include <include/types.h>
 #include "atomic.h"
 #include "task.h"
+#include "cpu.h"
 
 namespace Kernel
 {
@@ -16,11 +17,12 @@ public:
         return instance;
     }
 
-    /* Called during boot: creates the soft IRQ task */
+    /* Called during boot: creates a soft IRQ task per running CPU */
     bool Init();
     void Stop();
 
-    /* Called from hard IRQ handler to schedule deferred work */
+    /* Called from hard IRQ handler to schedule deferred work.
+       The work runs on the CPU which raised it. */
     void Raise(ulong type);
 
     /* Register a handler for a soft IRQ type */
@@ -46,12 +48,24 @@ private:
         void* Ctx;
     };
 
-    Handler Handlers[MaxTypes];
-    Atomic Pending; /* bitmask of pending soft IRQ types */
+    struct CpuState
+    {
+        Atomic Pending; /* bitmask of pending soft IRQ types */
+        Task* TaskPtr;
+    };
 
-    Task* TaskPtr;
+    Handler Handlers[MaxTypes];
+    CpuState CpuStates[MaxCpus];
+
+    /* Handlers are not reentrant: a type runs on at most one CPU
+       at a time. A CPU which loses the race keeps its pending bit
+       set and retries. */
+    Atomic Running; /* bitmask of soft IRQ types being handled */
+
+    Atomic Ready; /* set once the per-CPU tasks are started */
+
     static void TaskFunc(void* ctx);
-    void Run();
+    void Run(CpuState& state);
 
     static const ulong Tag = 'SIrq';
 };

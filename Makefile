@@ -67,6 +67,7 @@ CXX_SRC =   \
     src/cpp/kernel/mutex.cpp \
     src/cpp/kernel/wait_group.cpp \
     src/cpp/kernel/softirq.cpp \
+    src/cpp/kernel/irq_balance.cpp \
     src/cpp/kernel/exception.cpp    \
     src/cpp/kernel/dmesg.cpp    \
     src/cpp/kernel/sched.cpp    \

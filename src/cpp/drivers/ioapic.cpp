@@ -86,6 +86,19 @@ void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)
     SetEntry(irq, data);
 }
 
+void IoApic::SetIrqDestination(u8 irq, u64 apicId)
+{
+    /* The destination id occupies bits 56-63 of the redirection entry,
+       i.e. bits 24-31 of the high register. A single 32-bit write
+       switches the destination without touching mask/trigger/vector. */
+    u32 high = ReadRegister(RedTbl + 2 * irq + 1);
+    high = (high & 0x00FFFFFFU) | ((u32)apicId << 24);
+    WriteRegister(RedTbl + 2 * irq + 1, high);
+
+    Trace(IoApicLL, "SetIrqDestination irq 0x%p apicId 0x%p",
+        (ulong)irq, (ulong)apicId);
+}
+
 void IoApic::SetIrqLevel(u8 irq, u64 apicId, u8 vector, bool activeHigh)
 {
     u64 data = 0;

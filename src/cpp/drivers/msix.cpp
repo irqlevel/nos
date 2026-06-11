@@ -8,6 +8,7 @@
 #include <kernel/trace.h>
 
 #include "lapic.h"
+#include <kernel/irq_balance.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>
 #include <mm/page_table.h>
@@ -37,6 +38,8 @@ MsixTable::MsixTable()
 
 MsixTable::~MsixTable()
 {
+    IrqBalance::GetInstance().RemoveMsix(this);
+
     if (Dev && CapOffset != 0 && PciMsixEnabled)
     {
         auto& pci = Pci::GetInstance();
@@ -211,19 +214,30 @@ u8 MsixTable::EnableVector(u16 index, InterruptHandler& handler)
         return 0;
     }
 
-    volatile u8* entry = Table + (ulong)index * 16;
-    u32 apicId = Lapic::GetApicId();
+    /* AssignMsix takes the IrqBalance lock; it must complete before
+       EntryLock is taken because Balance() nests them the other way
+       around (IrqBalance lock -> Retarget -> EntryLock). */
+    u32 apicId = (u32)IrqBalance::GetInstance().AssignMsix(this, index);
     u32 addrLow = MsixAddrBase | (apicId << 12);
 
-    MmioWrite32(entry + 0, addrLow);
-    MmioWrite32(entry + 4, 0);
-    MmioWrite32(entry + 8, (u32)vector);
-    MmioWrite32(entry + 12, 1);
+    volatile u8* entry = Table + (ulong)index * 16;
+
+    {
+        Stdlib::AutoLock lock(EntryLock);
+
+        MmioWrite32(entry + 0, addrLow);
+        MmioWrite32(entry + 4, 0);
+        MmioWrite32(entry + 8, (u32)vector);
+        MmioWrite32(entry + 12, 1);
+    }
 
     Idt::GetInstance().SetDescriptor(vector, IdtDescriptor::Encode(handler.GetHandlerFn()));
     handler.OnInterruptRegister(0, vector);
 
-    MmioWrite32(entry + 12, 0);
+    {
+        Stdlib::AutoLock lock(EntryLock);
+        MmioWrite32(entry + 12, 0);
+    }
 
     if (!PciMsixEnabled)
     {
@@ -244,6 +258,8 @@ void MsixTable::Mask(u16 index)
     if (!Table || index >= Count)
         return;
 
+    Stdlib::AutoLock lock(EntryLock);
+
     volatile u8* entry = Table + (ulong)index * 16;
     u32 ctrl = MmioRead32(entry + 12);
     MmioWrite32(entry + 12, ctrl | 1);
@@ -254,9 +270,29 @@ void MsixTable::Unmask(u16 index)
     if (!Table || index >= Count)
         return;
 
+    Stdlib::AutoLock lock(EntryLock);
+
     volatile u8* entry = Table + (ulong)index * 16;
     u32 ctrl = MmioRead32(entry + 12);
     MmioWrite32(entry + 12, ctrl & ~1u);
+}
+
+void MsixTable::Retarget(u16 index, u32 apicId)
+{
+    if (!Table || index >= Count || EntryVector[index] == 0)
+        return;
+
+    Stdlib::AutoLock lock(EntryLock);
+
+    volatile u8* entry = Table + (ulong)index * 16;
+
+    /* The address must not change while the entry is unmasked */
+    u32 ctrl = MmioRead32(entry + 12);
+    MmioWrite32(entry + 12, ctrl | 1);
+
+    MmioWrite32(entry + 0, MsixAddrBase | (apicId << 12));
+
+    MmioWrite32(entry + 12, ctrl);
 }
 
 }
