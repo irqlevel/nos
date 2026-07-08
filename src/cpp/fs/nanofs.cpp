@@ -959,15 +959,18 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
 
     u32 oldBlockCount = (inode->Size > 0)
         ? (inode->Size + NanoBlockSize - 1) / NanoBlockSize : 0;
+    if (oldBlockCount > NanoMaxBlocks)
+        oldBlockCount = NanoMaxBlocks;
+
+    // Old blocks must be freed only after the new inode is committed: the
+    // bitmap is FUA-flushed by FreeDataBlock, so freeing first leaves a crash
+    // window where the on-disk inode references blocks marked free.
+    u32 oldBlocks[NanoMaxBlocks];
+    Stdlib::MemCpy(oldBlocks, inode->Blocks, sizeof(oldBlocks));
 
     if (len == 0)
     {
-        // Free old data blocks
-        for (u32 i = 0; i < oldBlockCount; i++)
-        {
-            FreeDataBlock(inode->Blocks[i]);
-            inode->Blocks[i] = 0;
-        }
+        Stdlib::MemSet(inode->Blocks, 0, sizeof(inode->Blocks));
         inode->Size = 0;
         inode->DataChecksum = 0;
         ComputeInodeChecksum(inode);
@@ -978,6 +981,8 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
             Trace(0, "NanoFs::Write: truncate inode %u failed", (ulong)inodeIdx);
             return false;
         }
+        for (u32 i = 0; i < oldBlockCount; i++)
+            FreeDataBlock(oldBlocks[i]);
         file->Size = 0;
         return true;
     }
@@ -1047,10 +1052,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         return false;
     }
 
-    // Success path: free old blocks, commit new blocks into inode
-    for (u32 i = 0; i < oldBlockCount; i++)
-        FreeDataBlock(inode->Blocks[i]);
-
+    // Success path: commit the new inode first, then free the old blocks
     Stdlib::MemSet(inode->Blocks, 0, sizeof(inode->Blocks));
     for (u32 i = 0; i < newBlockCount; i++)
         inode->Blocks[i] = newBlocks[i];
@@ -1064,8 +1066,15 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     if (!ok)
     {
         Trace(0, "NanoFs::Write: commit inode %u failed", (ulong)inodeIdx);
+        // The old on-disk inode still references the old blocks; release the
+        // new blocks instead.
+        for (u32 j = 0; j < newBlockCount; j++)
+            FreeDataBlock(newBlocks[j]);
         return false;
     }
+
+    for (u32 i = 0; i < oldBlockCount; i++)
+        FreeDataBlock(oldBlocks[i]);
 
     file->Size = len;
     return true;

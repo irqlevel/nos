@@ -88,6 +88,14 @@ public:
     /* Driver must implement: process frames from RxQueue (called from softirq) */
     virtual void ProcessRx() = 0;
 
+    /* Driver hook: reap completed RX buffers from hardware into RxQueue
+       (called from the net RX softirq before ProcessRx) */
+    virtual void ReapRx() {}
+
+    /* Driver hook: retry pending TX (called from the net TX softirq).
+       Default: flush TxQueue under TxQueueLock. */
+    virtual void DrainTx();
+
 protected:
     static const ulong TxQueueCapacity = 256;
     static const ulong RxQueueCapacity = 256;
@@ -128,6 +136,10 @@ public:
     void Dump(Stdlib::Printer& printer);
 
     ulong GetCount();
+
+    /* Softirq-driven RX/TX processing across all registered devices */
+    void ProcessAllRx();
+    void ProcessAllTx();
 
     static const ulong MaxDevices = 16;
 

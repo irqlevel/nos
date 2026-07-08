@@ -273,11 +273,20 @@ void VirtioNet::PostRxBuf(ulong index)
     buf.Len = RxBufSize;
     buf.Writable = true;
 
-    HwRxQueue.AddBufs(&buf, 1);
+    int head = HwRxQueue.AddBufs(&buf, 1);
+    if (head < 0)
+    {
+        Trace(0, "VirtioNet %s: RX post failed for buf %u", DevName, index);
+        return;
+    }
+    if ((ulong)head < VirtQueue::MaxDescriptors)
+        RxBufByDesc[head] = index;
 }
 
 void VirtioNet::PostAllRxBufs()
 {
+    Stdlib::MemSet(RxBufByDesc, 0, sizeof(RxBufByDesc));
+
     for (ulong i = 0; i < RxBufCount; i++)
         PostRxBuf(i);
 
@@ -438,7 +447,16 @@ void VirtioNet::ReapRx()
 
         RxPktCount.Inc();
 
-        if (usedId >= RxBufCount)
+        if (usedId >= VirtQueue::MaxDescriptors)
+        {
+            RxDropCount.Inc();
+            continue;
+        }
+
+        /* Map the completed descriptor back to its buffer (the ids diverge
+           from buffer indexes once descriptors are recycled). */
+        ulong bufIdx = RxBufByDesc[usedId];
+        if (bufIdx >= RxBufCount)
         {
             RxDropCount.Inc();
             continue;
@@ -447,14 +465,14 @@ void VirtioNet::ReapRx()
         if (usedLen <= NetHdrSize)
         {
             RxDropCount.Inc();
-            PostRxBuf(usedId);
+            PostRxBuf(bufIdx);
             RxNeedNotify = true;
             continue;
         }
 
-        NetFrame* frame = &RxFrames[usedId];
-        frame->Data = RxBufs + usedId * RxBufSize + NetHdrSize;
-        frame->DataPhys = RxBufsPhys + usedId * RxBufSize + NetHdrSize;
+        NetFrame* frame = &RxFrames[bufIdx];
+        frame->Data = RxBufs + bufIdx * RxBufSize + NetHdrSize;
+        frame->DataPhys = RxBufsPhys + bufIdx * RxBufSize + NetHdrSize;
         frame->Length = usedLen - NetHdrSize;
         frame->Refcount.Set(1);
         frame->Direction = NetFrame::Rx;
@@ -731,29 +749,6 @@ void VirtioNet::Interrupt(Context* ctx)
     SoftIrq::GetInstance().Raise(SoftIrq::TypeNetRx);
 }
 
-/* --- Soft IRQ handlers --- */
-
-static void NetRxSoftIrqHandler(void* ctx)
-{
-    (void)ctx;
-
-    for (ulong i = 0; i < VirtioNet::InstanceCount; i++)
-    {
-        VirtioNet::Instances[i].ReapRx();
-        VirtioNet::Instances[i].ProcessRx();
-    }
-}
-
-static void NetTxSoftIrqHandler(void* ctx)
-{
-    (void)ctx;
-
-    for (ulong i = 0; i < VirtioNet::InstanceCount; i++)
-    {
-        VirtioNet::Instances[i].DrainTx();
-    }
-}
-
 /* --- InitAll --- */
 
 void VirtioNet::InitAll()
@@ -789,12 +784,8 @@ void VirtioNet::InitAll()
         }
     }
 
-    if (InstanceCount > 0)
-    {
-        SoftIrq::GetInstance().Register(SoftIrq::TypeNetRx, NetRxSoftIrqHandler, nullptr);
-        SoftIrq::GetInstance().Register(SoftIrq::TypeNetTx, NetTxSoftIrqHandler, nullptr);
-    }
-
+    /* The TypeNetRx/TypeNetTx softirq handlers are registered by
+       NetDeviceTable and dispatch to every registered device. */
     Trace(0, "VirtioNet: initialized %u devices", InstanceCount);
 }
 

@@ -324,6 +324,14 @@ void VirtioBlk::DrainQueue()
 
             ulong flags = VirtQueueLock.LockIrqSave();
             head = Queue.AddBufs(bufs, 2);
+            /* Publish the slot mapping in the same critical section as
+               AddBufs: once the lock drops, a completion on another CPU may
+               already reference this head. */
+            if (head >= 0 && (ulong)head < sizeof(SlotByHead) / sizeof(SlotByHead[0]))
+            {
+                slot.Head = head;
+                SlotByHead[head] = &slot;
+            }
             VirtQueueLock.UnlockIrqRestore(flags);
         }
         else
@@ -356,6 +364,11 @@ void VirtioBlk::DrainQueue()
 
             ulong flags = VirtQueueLock.LockIrqSave();
             head = Queue.AddBufs(bufs, 3);
+            if (head >= 0 && (ulong)head < sizeof(SlotByHead) / sizeof(SlotByHead[0]))
+            {
+                slot.Head = head;
+                SlotByHead[head] = &slot;
+            }
             VirtQueueLock.UnlockIrqRestore(flags);
         }
 
@@ -379,8 +392,6 @@ void VirtioBlk::DrainQueue()
             continue;
         }
 
-        slot.Head = head;
-        SlotByHead[head] = &slot;
         kicked = true;
     }
 
@@ -395,9 +406,19 @@ void VirtioBlk::CompleteIO()
     for (;;)
     {
         u32 usedId, usedLen;
+        DmaSlot* slot = nullptr;
 
+        /* Claim the slot mapping in the same critical section as GetUsed:
+           the freed descriptors may be reused (and SlotByHead[usedId]
+           rewritten for a new request) by DrainQueue on another CPU the
+           moment the lock drops. */
         ulong flags = VirtQueueLock.LockIrqSave();
         bool got = Queue.GetUsed(usedId, usedLen);
+        if (got && usedId < sizeof(SlotByHead) / sizeof(SlotByHead[0]))
+        {
+            slot = SlotByHead[usedId];
+            SlotByHead[usedId] = nullptr;
+        }
         VirtQueueLock.UnlockIrqRestore(flags);
 
         if (!got)
@@ -409,14 +430,11 @@ void VirtioBlk::CompleteIO()
             continue;
         }
 
-        DmaSlot* slot = SlotByHead[usedId];
         if (!slot || !slot->Request)
         {
             Trace(0, "VirtioBlk %s: no slot for used id %u", DevName, (ulong)usedId);
             continue;
         }
-
-        SlotByHead[usedId] = nullptr;
 
         BlockRequest* req = slot->Request;
         req->Success = (*slot->StatusBuf == 0);

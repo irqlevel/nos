@@ -35,6 +35,7 @@ void TcpConn::Init()
     RecvBuf.Init(TcpRecvBufSize);
     RtoMs = TcpInitialRtoMs;
     RetransmitDeadlineMs = 0;
+    RetransmitCount = 0;
     TimeWaitDeadlineMs = 0;
     DataReady.Set(0);
     ConnReady.Set(0);
@@ -390,6 +391,7 @@ void Tcp::ProcessAck(TcpConn* conn, u32 ack, u16 wnd, ulong now)
     conn->SndUna = ack;
     conn->SndWnd = wnd;
     conn->RtoMs = TcpInitialRtoMs;
+    conn->RetransmitCount = 0;
     if (conn->SndUna == conn->SndNxt)
         conn->RetransmitDeadlineMs = 0; /* everything acked */
     else
@@ -1207,6 +1209,25 @@ void Tcp::ProcessRetransmits()
             if (retransmitted)
             {
                 Retransmits.Inc();
+                conn->RetransmitCount++;
+                if (conn->RetransmitCount > TcpMaxRetransmits)
+                {
+                    /* No ACK progress after TcpMaxRetransmits retries: abort
+                       so the slot is reclaimed. Otherwise a dead peer pins the
+                       connection forever (half-open SYNs, unacked FINs and
+                       unacked data all retransmit with no retry limit). */
+                    Trace(0, "Tcp: conn %u:%u -> %u aborted after %u retransmits",
+                          (ulong)conn->LocalPort, (ulong)conn->RemotePort,
+                          (ulong)conn->State, (ulong)conn->RetransmitCount);
+                    conn->State = TcpStateClosed;
+                    conn->RetransmitDeadlineMs = 0;
+                    conn->NeedCleanup = true;
+                    conn->ConnReady.Set(1);
+                    conn->DataReady.Set(1);
+                    anyCleanup = true;
+                    conn->Lock.Unlock();
+                    continue;
+                }
                 conn->RtoMs *= 2;
                 if (conn->RtoMs > TcpMaxRtoMs)
                     conn->RtoMs = TcpMaxRtoMs;

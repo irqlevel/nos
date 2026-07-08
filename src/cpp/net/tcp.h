@@ -35,6 +35,7 @@ static const u16   TcpDefaultMss       = 536;
 static const u16   TcpOurMss           = 1460;
 static const ulong TcpInitialRtoMs     = 1000;
 static const ulong TcpMaxRtoMs         = 8000;
+static const ulong TcpMaxRetransmits   = 8;
 static const ulong TcpTimeWaitMs       = 2000;
 static const ulong TcpConnectTimeoutMs = 5000;
 static const u8    TcpDefaultTtl       = 64;
@@ -166,6 +167,7 @@ struct TcpConn
     /* Retransmit state */
     ulong RtoMs;
     ulong RetransmitDeadlineMs; /* boot-time ms when retransmit fires */
+    ulong RetransmitCount;      /* consecutive retransmits with no ACK progress */
     ulong TimeWaitDeadlineMs;
 
     /* Flags */
