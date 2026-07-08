@@ -1,6 +1,7 @@
 #include "net_device.h"
 
 #include <kernel/trace.h>
+#include <kernel/softirq.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>
 
@@ -43,6 +44,14 @@ bool NetDevice::SendRaw(const void* buf, ulong len)
     Stdlib::MemCpy(frame->Data, buf, len);
     frame->Length = len;
     return SubmitTx(frame);
+}
+
+void NetDevice::DrainTx()
+{
+    ulong flags = TxQueueLock.LockIrqSave();
+    if (TxCount > 0)
+        FlushTx();
+    TxQueueLock.UnlockIrqRestore(flags);
 }
 
 bool NetDevice::EnqueueRx(NetFrame* frame)
@@ -161,6 +170,18 @@ NetDeviceTable::~NetDeviceTable()
 {
 }
 
+static void NetRxSoftIrqHandler(void* ctx)
+{
+    (void)ctx;
+    NetDeviceTable::GetInstance().ProcessAllRx();
+}
+
+static void NetTxSoftIrqHandler(void* ctx)
+{
+    (void)ctx;
+    NetDeviceTable::GetInstance().ProcessAllTx();
+}
+
 bool NetDeviceTable::Register(NetDevice* dev)
 {
     if (Count >= MaxDevices || dev == nullptr)
@@ -168,6 +189,15 @@ bool NetDeviceTable::Register(NetDevice* dev)
 
     Devices[Count] = dev;
     Count++;
+
+    if (Count == 1)
+    {
+        /* One handler per softirq type (SoftIrq allows a single handler),
+           dispatching RX/TX to every registered device -- virtio-net and
+           Rust drivers alike raise TypeNetRx/TypeNetTx from their ISRs. */
+        SoftIrq::GetInstance().Register(SoftIrq::TypeNetRx, NetRxSoftIrqHandler, nullptr);
+        SoftIrq::GetInstance().Register(SoftIrq::TypeNetTx, NetTxSoftIrqHandler, nullptr);
+    }
 
     Net::MacAddress mac = dev->GetMac();
 
@@ -177,6 +207,21 @@ bool NetDeviceTable::Register(NetDevice* dev)
         (ulong)mac.Bytes[3], (ulong)mac.Bytes[4], (ulong)mac.Bytes[5]);
 
     return true;
+}
+
+void NetDeviceTable::ProcessAllRx()
+{
+    for (ulong i = 0; i < Count; i++)
+    {
+        Devices[i]->ReapRx();
+        Devices[i]->ProcessRx();
+    }
+}
+
+void NetDeviceTable::ProcessAllTx()
+{
+    for (ulong i = 0; i < Count; i++)
+        Devices[i]->DrainTx();
 }
 
 NetDevice* NetDeviceTable::Find(const char* name)

@@ -42,11 +42,11 @@ public:
 
     void Interrupt(Context* ctx);
 
-    /* Called from soft IRQ task to reap received packets from HW */
-    void ReapRx();
+    /* Called from the net RX softirq to reap received packets from HW */
+    virtual void ReapRx() override;
 
-    /* Called from soft IRQ task to retry pending TX */
-    void DrainTx();
+    /* Called from the net TX softirq to retry pending TX */
+    virtual void DrainTx() override;
 
     /* Discover and initialize all virtio-net devices. */
     static void InitAll();
@@ -150,6 +150,11 @@ private:
     /* Pre-allocated RX frame descriptors */
     NetFrame RxFrames[RxBufCount];
     bool RxNeedNotify;
+
+    /* Descriptor head -> RX buffer index. The virtqueue recycles freed
+       descriptors in LIFO order, so usedId == buffer index only holds for
+       the initial linear posting. */
+    ulong RxBufByDesc[VirtQueue::MaxDescriptors];
 
     static const ulong MaxInstances = 4;
 

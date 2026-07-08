@@ -407,6 +407,14 @@ void VirtioScsi::DrainQueue()
 
             ulong flags = Hba->VirtQueueLock.LockIrqSave();
             head = Hba->ReqQueue.AddBufs(bufs, 2);
+            /* Publish the slot mapping in the same critical section as
+               AddBufs: once the lock drops, a completion on another CPU may
+               already reference this head. */
+            if (head >= 0 && (ulong)head < sizeof(Hba->SlotByHead) / sizeof(Hba->SlotByHead[0]))
+            {
+                slot.Head = head;
+                Hba->SlotByHead[head] = &slot;
+            }
             Hba->VirtQueueLock.UnlockIrqRestore(flags);
         }
         else
@@ -458,6 +466,11 @@ void VirtioScsi::DrainQueue()
 
             ulong flags = Hba->VirtQueueLock.LockIrqSave();
             head = Hba->ReqQueue.AddBufs(bufs, 3);
+            if (head >= 0 && (ulong)head < sizeof(Hba->SlotByHead) / sizeof(Hba->SlotByHead[0]))
+            {
+                slot.Head = head;
+                Hba->SlotByHead[head] = &slot;
+            }
             Hba->VirtQueueLock.UnlockIrqRestore(flags);
         }
 
@@ -481,8 +494,6 @@ void VirtioScsi::DrainQueue()
             continue;
         }
 
-        slot.Head = head;
-        Hba->SlotByHead[head] = &slot;
         kicked = true;
     }
 
@@ -529,9 +540,19 @@ void VirtioScsi::HbaState::CompleteIO()
     for (;;)
     {
         u32 usedId, usedLen;
+        DmaSlot* slot = nullptr;
 
+        /* Claim the slot mapping in the same critical section as GetUsed:
+           the freed descriptors may be reused (and SlotByHead[usedId]
+           rewritten for a new request) by DrainQueue on another CPU the
+           moment the lock drops. */
         ulong flags = VirtQueueLock.LockIrqSave();
         bool got = ReqQueue.GetUsed(usedId, usedLen);
+        if (got && usedId < sizeof(SlotByHead) / sizeof(SlotByHead[0]))
+        {
+            slot = SlotByHead[usedId];
+            SlotByHead[usedId] = nullptr;
+        }
         VirtQueueLock.UnlockIrqRestore(flags);
 
         if (!got)
@@ -543,14 +564,11 @@ void VirtioScsi::HbaState::CompleteIO()
             continue;
         }
 
-        DmaSlot* slot = SlotByHead[usedId];
         if (!slot || !slot->Request)
         {
             Trace(0, "VirtioScsi: no slot for used id %u", (ulong)usedId);
             continue;
         }
-
-        SlotByHead[usedId] = nullptr;
 
         BlockRequest* req = slot->Request;
 
