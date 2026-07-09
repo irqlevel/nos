@@ -16,6 +16,7 @@ static const u32 NanoDataStart     = 1 + NanoInodeCount; // 1025
 static const u32 NanoMaxBlocks     = 256;
 static const u32 NanoMaxDirEntries = 256;
 static const u32 NanoMaxFileSize   = NanoMaxBlocks * NanoBlockSize; // 1 MB
+static const u32 NanoMaxDirDepth   = 32; // recursion cap for LoadVNode (32 KB kernel stack)
 
 struct NanoSuperBlock
 {
@@ -86,7 +87,7 @@ private:
     NanoFs& operator=(NanoFs&& other) = delete;
 
     bool ReadInode(u32 idx, NanoInode* out);
-    bool WriteInode(u32 idx, const NanoInode* in);
+    bool WriteInode(u32 idx, const NanoInode* in, bool fua = false);
     bool FlushSuper();
 
     long AllocInode();
@@ -100,7 +101,7 @@ private:
     bool VerifyInodeChecksum(NanoInode* inode);
     u32  ComputeDataChecksum(NanoInode* inode);
 
-    VNode* LoadVNode(u32 inodeIdx);
+    VNode* LoadVNode(u32 inodeIdx, u32 depth = 0);
     VNode* FindVNode(u32 inodeIdx);
     void   FreeVNode(VNode* vnode);
     u32    VNodeToInode(VNode* vnode);
@@ -112,6 +113,10 @@ private:
     BlockIo Io;
     NanoSuperBlock* Super;
     VNode* VNodes[NanoInodeCount]; // in-memory VNode cache by inode index
+    // Inodes whose LoadVNode is still on the recursion stack. A dir entry
+    // referencing such an inode is a directory cycle in the on-disk image;
+    // linking it would put a cycle in the VFS tree (infinite recursion later).
+    u8 LoadInProgress[NanoInodeCount];
     bool Mounted;
 };
 

@@ -22,6 +22,8 @@ static const u32 Ext2DIndirectBlock = 13;
 
 static const u32 Ext2SuperBlockOffset = 1024;
 
+static const u32 Ext2MaxDirDepth = 32; // recursion cap for LoadDir (32 KB kernel stack)
+
 struct Ext2SuperBlock
 {
     u32 InodeCount;
@@ -139,7 +141,7 @@ private:
     bool ReadInodeData(Ext2Inode* inode, void* buf, ulong len, ulong offset);
     u32  GetBlockNum(Ext2Inode* inode, u32 logicalBlock);
     bool ReadBlock(u32 blockNum, void* buf);
-    VNode* LoadDir(u32 inodeNum);
+    VNode* LoadDir(u32 inodeNum, u32 depth = 0);
     VNode* FindVNode(u32 inodeNum);
     void   FreeVNode(VNode* vnode);
 

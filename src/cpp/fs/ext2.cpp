@@ -134,6 +134,14 @@ bool Ext2Fs::Mount()
     if (Super->RevLevel >= 1 && Super->InodeSize > 0)
         InodeSize = Super->InodeSize;
 
+    /* Both fields are divisors (here and in ReadInode); a corrupt image with
+       either at 0 would raise a division exception. */
+    if (Super->BlocksPerGroup == 0 || Super->InodesPerGroup == 0)
+    {
+        Trace(0, "Ext2Fs: zero blocks/inodes per group");
+        goto fail;
+    }
+
     GroupCount = (Super->BlockCount + Super->BlocksPerGroup - 1) / Super->BlocksPerGroup;
     if (GroupCount == 0)
     {
@@ -434,11 +442,20 @@ void Ext2Fs::FreeVNode(VNode* vnode)
 
 /* --- Directory loading --- */
 
-VNode* Ext2Fs::LoadDir(u32 inodeNum)
+VNode* Ext2Fs::LoadDir(u32 inodeNum, u32 depth)
 {
     VNode* existing = FindVNode(inodeNum);
     if (existing != nullptr)
         return existing;
+
+    /* A crafted image with deeply nested directories must not overflow the
+       32 KB kernel stack (each frame holds two Ext2Inode locals). */
+    if (depth >= Ext2MaxDirDepth)
+    {
+        Trace(0, "Ext2Fs::LoadDir: dir depth limit %u hit at inode %u",
+              (ulong)Ext2MaxDirDepth, (ulong)inodeNum);
+        return nullptr;
+    }
 
     Ext2Inode inode;
     if (!ReadInode(inodeNum, &inode))
@@ -526,7 +543,7 @@ VNode* Ext2Fs::LoadDir(u32 inodeNum)
                 VNode* child;
                 if (isDir)
                 {
-                    child = LoadDir(de->Inode);
+                    child = LoadDir(de->Inode, depth + 1);
                 }
                 else
                 {
