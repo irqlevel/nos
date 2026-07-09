@@ -28,6 +28,18 @@ VirtQueue::~VirtQueue()
 
 bool VirtQueue::Setup(u16 queueSize)
 {
+    /* The drivers' SlotByHead[]/RxBufByDesc[] bookkeeping is sized to
+       MaxDescriptors. A larger device-reported queue would hand out heads the
+       completion path cannot attribute -- and in legacy mode the size cannot
+       be negotiated down -- so refuse the device instead of corrupting I/O.
+       (QEMU reports 256; this only rejects out-of-the-ordinary devices.) */
+    if (queueSize == 0 || queueSize > MaxDescriptors)
+    {
+        Trace(0, "VirtQueue: unsupported queue size %u (max %u)",
+              (ulong)queueSize, (ulong)MaxDescriptors);
+        return false;
+    }
+
     QueueSize = queueSize;
 
     /* Calculate total size per virtio legacy spec:
