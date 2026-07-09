@@ -28,6 +28,7 @@ void TcpConn::Init()
     SndWnd = 0;
     RcvNxt = 0;
     RcvWnd = TcpRecvBufSize;
+    AdvertisedWnd = TcpRecvBufSize;
     Iss = 0;
     Irs = 0;
     PeerMss = TcpDefaultMss;
@@ -37,6 +38,7 @@ void TcpConn::Init()
     RetransmitDeadlineMs = 0;
     RetransmitCount = 0;
     TimeWaitDeadlineMs = 0;
+    PersistDeadlineMs = 0;
     DataReady.Set(0);
     ConnReady.Set(0);
     NeedCleanup = false;
@@ -280,6 +282,7 @@ void Tcp::SendSegment(TcpConn* conn, u8 flags, const u8* data, ulong dataLen)
                                       tcp, tcpLen));
 
     conn->Dev->SendRaw(frame, frameLen);
+    conn->AdvertisedWnd = conn->RcvWnd;
     TxSegments.Inc();
 }
 
@@ -398,6 +401,25 @@ void Tcp::ProcessAck(TcpConn* conn, u32 ack, u16 wnd, ulong now)
         conn->RetransmitDeadlineMs = now + conn->RtoMs;
 }
 
+/* In-order payload delivery to RecvBuf plus the ACK it requires (a duplicate
+   ACK when out-of-order). Shared by Established and the FIN-WAIT states -- the
+   peer may keep sending data after our FIN (RFC 793 half-close). */
+void Tcp::ProcessPayload(TcpConn* conn, u32 seq, const u8* payload,
+                         ulong payloadLen)
+{
+    if (seq == conn->RcvNxt)
+    {
+        ulong written = conn->RecvBuf.Write(payload, payloadLen);
+        conn->RcvNxt += (u32)written;
+        conn->RcvWnd = (u32)conn->RecvBuf.Free();
+        conn->DataReady.Set(1);
+    }
+
+    u32 savedNxt = conn->SndNxt;
+    SendSegment(conn, TcpFlagAck, nullptr, 0);
+    conn->SndNxt = savedNxt;
+}
+
 /* --- State machine --- */
 
 void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
@@ -495,25 +517,8 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
             ProcessAck(conn, ack, wnd, now);
 
         /* Data processing -- in-order only */
-        if (payloadLen > 0 && seq == conn->RcvNxt)
-        {
-            ulong written = conn->RecvBuf.Write(payload, payloadLen);
-            conn->RcvNxt += (u32)written;
-            conn->RcvWnd = (u32)conn->RecvBuf.Free();
-            conn->DataReady.Set(1);
-
-            /* Send ACK */
-            u32 savedNxt = conn->SndNxt;
-            SendSegment(conn, TcpFlagAck, nullptr, 0);
-            conn->SndNxt = savedNxt;
-        }
-        else if (payloadLen > 0 && seq != conn->RcvNxt)
-        {
-            /* Out-of-order: send duplicate ACK */
-            u32 savedNxt = conn->SndNxt;
-            SendSegment(conn, TcpFlagAck, nullptr, 0);
-            conn->SndNxt = savedNxt;
-        }
+        if (payloadLen > 0)
+            ProcessPayload(conn, seq, payload, payloadLen);
 
         /* FIN processing (passive close) -- only accept in-order FIN */
         if ((flags & TcpFlagFin) && (seq + (u32)payloadLen == conn->RcvNxt))
@@ -540,9 +545,13 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
                 conn->FinAcked = true;
         }
 
-        if (flags & TcpFlagFin)
+        /* Half-close: the peer may keep sending data after our FIN */
+        if (payloadLen > 0)
+            ProcessPayload(conn, seq, payload, payloadLen);
+
+        if ((flags & TcpFlagFin) && (seq + (u32)payloadLen == conn->RcvNxt))
         {
-            conn->RcvNxt = seq + 1;
+            conn->RcvNxt = seq + (u32)payloadLen + 1;
 
             u32 savedNxt = conn->SndNxt;
             SendSegment(conn, TcpFlagAck, nullptr, 0);
@@ -562,17 +571,24 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
         }
         else if (conn->FinAcked)
         {
-            /* Our FIN was ACKed, waiting for their FIN */
+            /* Our FIN was ACKed, waiting for their FIN. RFC 1122 4.2.2.20
+               requires a FIN-WAIT-2 timer: a peer that never sends its FIN
+               must not pin the connection slot forever. */
             conn->State = TcpStateFinWait2;
             conn->RetransmitDeadlineMs = 0;
+            conn->TimeWaitDeadlineMs = now + TcpFinWait2TimeoutMs;
         }
         break;
     }
     case TcpStateFinWait2:
     {
-        if (flags & TcpFlagFin)
+        /* Half-close: the peer may keep sending data after our FIN */
+        if (payloadLen > 0)
+            ProcessPayload(conn, seq, payload, payloadLen);
+
+        if ((flags & TcpFlagFin) && (seq + (u32)payloadLen == conn->RcvNxt))
         {
-            conn->RcvNxt = seq + 1;
+            conn->RcvNxt = seq + (u32)payloadLen + 1;
 
             u32 savedNxt = conn->SndNxt;
             SendSegment(conn, TcpFlagAck, nullptr, 0);
@@ -1026,6 +1042,23 @@ long Tcp::Recv(TcpConn* conn, void* buf, ulong len)
             conn->RcvWnd = (u32)conn->RecvBuf.Free();
             if (conn->RecvBuf.Used() == 0)
                 conn->DataReady.Set(0);
+
+            /* Window update: if the last window we advertised was too small
+               for a full segment, the peer may have stopped sending entirely.
+               Now that the app drained the buffer, tell the peer unsolicited
+               -- no other path would, and the peer would stay stuck probing
+               a "zero" window that has long since reopened. */
+            if (conn->AdvertisedWnd < TcpOurMss &&
+                conn->RcvWnd >= TcpOurMss &&
+                (conn->State == TcpStateEstablished ||
+                 conn->State == TcpStateFinWait1 ||
+                 conn->State == TcpStateFinWait2))
+            {
+                u32 savedNxt = conn->SndNxt;
+                SendSegment(conn, TcpFlagAck, nullptr, 0);
+                conn->SndNxt = savedNxt;
+            }
+
             conn->Lock.Unlock();
             return (long)got;
         }
@@ -1113,13 +1146,17 @@ void Tcp::ProcessRetransmits()
             continue;
         }
 
-        /* TimeWait -> Closed */
-        if (conn->State == TcpStateTimeWait &&
+        /* TimeWait -> Closed; FinWait2 -> Closed when the peer never sends
+           its FIN (the FIN-WAIT-2 timer, RFC 1122 4.2.2.20) */
+        if ((conn->State == TcpStateTimeWait ||
+             conn->State == TcpStateFinWait2) &&
             conn->TimeWaitDeadlineMs != 0 &&
             now >= conn->TimeWaitDeadlineMs)
         {
             conn->State = TcpStateClosed;
             conn->NeedCleanup = true;
+            conn->ConnReady.Set(1);
+            conn->DataReady.Set(1);
             anyCleanup = true;
             conn->Lock.Unlock();
             continue;
@@ -1233,6 +1270,40 @@ void Tcp::ProcessRetransmits()
                     conn->RtoMs = TcpMaxRtoMs;
             }
             conn->RetransmitDeadlineMs = now + conn->RtoMs;
+        }
+
+        /* Persist timer (RFC 9293 3.8.6.1): the peer advertised a zero window
+           and everything we sent is ACKed, so no retransmit is pending and we
+           will never send on our own. Probe periodically so a lost window
+           update cannot stall the connection forever. The probe's sequence
+           number sits below the peer's window, which forces a duplicate ACK
+           reply carrying the peer's current window. */
+        if ((conn->State == TcpStateEstablished ||
+             conn->State == TcpStateCloseWait) &&
+            conn->SndWnd == 0 &&
+            conn->SndUna == conn->SndNxt &&
+            conn->RetransmitDeadlineMs == 0)
+        {
+            if (conn->PersistDeadlineMs == 0)
+            {
+                conn->PersistDeadlineMs = now + conn->RtoMs;
+            }
+            else if (now >= conn->PersistDeadlineMs)
+            {
+                u32 savedNxt = conn->SndNxt;
+                conn->SndNxt = conn->SndUna - 1;
+                SendSegment(conn, TcpFlagAck, nullptr, 0);
+                conn->SndNxt = savedNxt;
+
+                conn->RtoMs *= 2;
+                if (conn->RtoMs > TcpMaxRtoMs)
+                    conn->RtoMs = TcpMaxRtoMs;
+                conn->PersistDeadlineMs = now + conn->RtoMs;
+            }
+        }
+        else
+        {
+            conn->PersistDeadlineMs = 0;
         }
 
         conn->Lock.Unlock();
