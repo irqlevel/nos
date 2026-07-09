@@ -32,6 +32,12 @@ public:
     bool Calibrate();
     bool SetupKvmClock();
 
+    /* Arm kvmclock for the calling CPU. KVM updates a pvclock entry only for
+       the vcpu that wrote the MSR, so every CPU needs its own entry + MSR
+       write. The BSP arms itself in SetupKvmClock; APs call this from
+       ApMain2. */
+    bool EnableKvmClockSelf();
+
     ulong GetFreqHz();
     bool IsCalibrated();
     bool IsInvariant();
@@ -96,8 +102,11 @@ private:
     bool Invariant;
     bool Calibrated;
 
+    /* One 32-byte pvclock entry per APIC id in a single shared page */
+    static const ulong PvClockEntryCount = 128;
+
     bool KvmClockAvail;
-    PvClockVcpuTimeInfo* PvClock;
+    PvClockVcpuTimeInfo* PvClock; /* page base: entry array indexed by APIC id */
     ulong PvClockPhys;
 };
 

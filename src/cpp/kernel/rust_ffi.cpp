@@ -320,9 +320,22 @@ void kernel_cpu_run_on(unsigned int cpu,
     if (!handler || cpu >= (unsigned int)Kernel::MaxCpus)
         return;
 
+    /* A CPU that never started or already exited will not drain its IPI task
+       list; queueing would block Completion.Wait() forever (SendIPISelf
+       silently refuses to send in those states). */
+    auto& target = Kernel::CpuTable::GetInstance().GetCpu(cpu);
+    ulong state = target.GetState();
+    if (!(state & Kernel::Cpu::StateRunning) ||
+        (state & (Kernel::Cpu::StateExiting | Kernel::Cpu::StateExited)))
+    {
+        Trace(0, "kernel_cpu_run_on: cpu %u not running (state 0x%p)",
+              (ulong)cpu, state);
+        return;
+    }
+
     RustIPIAdapter a{handler, ctx};
     Kernel::IPITask task(RustIPITrampoline, &a);
-    Kernel::CpuTable::GetInstance().GetCpu(cpu).QueueIPITask(task);
+    target.QueueIPITask(task);
 }
 
 void* kernel_alloc_dma_pages(unsigned long count,
@@ -647,6 +660,7 @@ struct RustIrqSlot
     void* Ctx;
     u8 Vector;
     bool Used;
+    Kernel::Atomic InFlight; /* ISRs currently executing Handler */
 };
 
 static RustIrqSlot RustIrqSlots[RustIrqSlotCount];
@@ -685,9 +699,14 @@ public:
         RustIrqLock.ReadLock();
         auto handler = RustIrqSlots[SlotIndex].Handler;
         auto uctx = RustIrqSlots[SlotIndex].Ctx;
+        if (handler)
+            RustIrqSlots[SlotIndex].InFlight.Inc();
         RustIrqLock.ReadUnlock();
         if (handler)
+        {
             handler(uctx);
+            RustIrqSlots[SlotIndex].InFlight.Dec();
+        }
     }
 };
 
@@ -714,12 +733,20 @@ void RustInterruptDispatch(Kernel::Context* ctx, int slot)
         Kernel::Lapic::EOI();
         return;
     }
+    /* InFlight is raised inside the read-locked section so unregister (which
+       nulls Handler under the write lock) can wait out a mid-call ISR before
+       its caller frees ctx. */
     RustIrqLock.ReadLock();
     auto handler = RustIrqSlots[slot].Handler;
     auto uctx = RustIrqSlots[slot].Ctx;
+    if (handler)
+        RustIrqSlots[slot].InFlight.Inc();
     RustIrqLock.ReadUnlock();
     if (handler)
+    {
         handler(uctx);
+        RustIrqSlots[slot].InFlight.Dec();
+    }
     Kernel::Lapic::EOI();
 }
 
@@ -769,6 +796,12 @@ void kernel_interrupt_unregister(unsigned long handle)
     RustIrqSlots[i].Used = false;
     RustIrqSlots[i].Vector = 0;
     RustIrqLock.WriteUnlockIrqRestore(flags);
+
+    /* Wait out an ISR mid-call on another CPU: the caller may free ctx the
+       moment we return. An ISR on this CPU cannot be mid-call here --
+       interrupts run to completion. */
+    while (RustIrqSlots[i].InFlight.Get() != 0)
+        Pause();
 }
 
 } /* extern "C" */
@@ -880,6 +913,7 @@ struct RustMsixSlot
     void (*Handler)(void*);
     void* Ctx;
     bool Used;
+    Kernel::Atomic InFlight; /* ISRs currently executing Handler */
 };
 
 static RustMsixSlot RustMsixSlots[RustMsixSlotCount];
@@ -960,12 +994,18 @@ void RustMsixDispatch(Kernel::Context* ctx, int slot)
         Kernel::Lapic::EOI();
         return;
     }
+    /* Same in-flight discipline as RustInterruptDispatch */
     RustMsixLock.ReadLock();
     auto handler = RustMsixSlots[slot].Handler;
     auto uctx = RustMsixSlots[slot].Ctx;
+    if (handler)
+        RustMsixSlots[slot].InFlight.Inc();
     RustMsixLock.ReadUnlock();
     if (handler)
+    {
         handler(uctx);
+        RustMsixSlots[slot].InFlight.Dec();
+    }
     Kernel::Lapic::EOI();
 }
 
@@ -1019,6 +1059,10 @@ void kernel_msix_unregister_handler(unsigned long handle)
     RustMsixSlots[i].Ctx = nullptr;
     RustMsixSlots[i].Used = false;
     RustMsixLock.WriteUnlockIrqRestore(flags);
+
+    /* Wait out an ISR mid-call on another CPU (see kernel_interrupt_unregister) */
+    while (RustMsixSlots[i].InFlight.Get() != 0)
+        Pause();
 }
 
 } /* extern "C" */
