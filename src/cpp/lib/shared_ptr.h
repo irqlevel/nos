@@ -225,36 +225,40 @@ private:
 template<typename T, class... Args>
 SharedPtr<T> MakeShared(Args&&... args)
 {
-    ObjectReference<T>* objRef = Kernel::Mm::TAlloc<ObjectReference<T>, 0>(nullptr);
-    if (objRef == nullptr)
-        return SharedPtr<T>();
-
     T* object = Kernel::Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...);
     if (object == nullptr)
+        return SharedPtr<T>();
+
+    /* Construct the ObjectReference around the live object so a failed
+       allocation here never destroys a refcounted-but-armed control block
+       (its dtor asserts Counter == 0). */
+    ObjectReference<T>* objRef = Kernel::Mm::TAlloc<ObjectReference<T>, 0>(object);
+    if (objRef == nullptr)
     {
-        delete objRef;
+        delete object;
         return SharedPtr<T>();
     }
 
-    objRef->SetObject(object);
     return SharedPtr<T>(objRef);
 }
 
 template<typename T, typename Deleter, class... Args>
 SharedPtr<T, Deleter> MakeSharedWith(Args&&... args)
 {
-    ObjectReference<T, Deleter>* objRef = Kernel::Mm::TAlloc<ObjectReference<T, Deleter>, 0>(nullptr);
-    if (objRef == nullptr)
-        return SharedPtr<T, Deleter>();
-
     T* object = Kernel::Mm::TAlloc<T, 0>(Stdlib::Forward<Args>(args)...);
     if (object == nullptr)
+        return SharedPtr<T, Deleter>();
+
+    /* Construct the ObjectReference around the live object so a failed
+       allocation here never destroys a refcounted-but-armed control block
+       (its dtor asserts Counter == 0). */
+    ObjectReference<T, Deleter>* objRef = Kernel::Mm::TAlloc<ObjectReference<T, Deleter>, 0>(object);
+    if (objRef == nullptr)
     {
-        delete objRef;
+        delete object;
         return SharedPtr<T, Deleter>();
     }
 
-    objRef->SetObject(object);
     return SharedPtr<T, Deleter>(objRef);
 }
 

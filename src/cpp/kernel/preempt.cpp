@@ -9,18 +9,21 @@ namespace Kernel
 {
 
 Atomic PreemptActive;
-Atomic PreemptOnWaiting(1);
 
 void PreemptOn()
 {
     PreemptActive.Inc();
     BugOn(PreemptActive.Get() > 1);
-    PreemptOnWaiting.Dec();
 }
 
 void PreemptOnWait()
 {
-    while (PreemptOnWaiting.Get() != 0)
+    /* Block until the BSP has globally enabled preemption. PreemptActive is
+       zero-initialized (BSS) and set to 1 by PreemptOn(); gating on it rather
+       than on a separately-constructed flag avoids depending on a global
+       constructor -- this kernel runs no .init_array, so a dynamically
+       initialized `Atomic x(1)` would in fact be left at 0. */
+    while (PreemptActive.Get() == 0)
     {
         Pause();
     }

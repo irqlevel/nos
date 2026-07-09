@@ -75,4 +75,12 @@ extern "C" void DummyInterrupt()
     Idt::GetInstance().DummyInterrupt();
 }
 
+extern "C" void SpuriousInterrupt()
+{
+    /* LAPIC spurious-interrupt vector (Lapic::SpuriousVector). Per the SDM a
+       spurious interrupt must NOT be acknowledged with an EOI -- just count
+       it and return, rather than falling through to DummyInterrupt's panic. */
+    InterruptStats::Inc(IrqSpurious);
+}
+
 }

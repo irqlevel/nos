@@ -24,6 +24,11 @@ public:
 
     long GetSwitchContextCounter();
 
+    /* Free tasks that exited on this queue's CPU. Must be called with
+       interrupts enabled (it frees stacks, which triggers a blocking TLB
+       shootdown) -- see SwitchComplete. */
+    void ReapExited();
+
 private:
     TaskQueue(const TaskQueue &other) = delete;
     TaskQueue(TaskQueue&& other) = delete;
@@ -45,6 +50,11 @@ private:
     using ListEntry = Stdlib::ListEntry;
     ListEntry TaskList;
     SpinLock Lock;
+
+    /* Tasks that exited on this CPU, pending a stack free with interrupts
+       enabled (ReapExited), rather than in the IRQs-off switch path. */
+    ListEntry ExitedList;
+    SpinLock ExitedLock;
 
     Atomic ScheduleCounter;
     Atomic SwitchContextCounter;

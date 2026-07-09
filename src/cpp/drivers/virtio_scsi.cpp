@@ -58,6 +58,7 @@ VirtioScsi::VirtioScsi()
     , CmdRespPhys(0)
     , DataBuf(nullptr)
     , DataBufPhys(0)
+    , ProbeTimedOut(false)
     , Hba(nullptr)
 {
     DevName[0] = '\0';
@@ -131,6 +132,12 @@ bool VirtioScsi::Init(VirtioPci* transport, VirtQueue* reqQueue, SpinLock* ioLoc
 bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, bool dataIn)
 {
     if (!Initialized || !Transport || !ReqQueue)
+        return false;
+
+    /* A prior command on this probe instance timed out; its descriptors may
+       still reference the shared DMA buffers, so refuse to reuse them (a stale
+       completion would otherwise be misattributed to this command). */
+    if (ProbeTimedOut)
         return false;
 
     if (dataLen > Const::PageSize)
@@ -256,6 +263,10 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
     {
         Transport->ReadISR();
         Trace(0, "VirtioScsi %s: timeout waiting for SCSI command", DevName);
+        /* The command's descriptor chain is still published; the device may
+           complete it (DMA into the buffers) later. Mark the instance so its
+           buffers are neither reused nor freed. */
+        ProbeTimedOut = true;
         return false;
     }
 
@@ -299,10 +310,37 @@ void VirtioScsi::Submit(BlockRequest* req)
     DrainQueue();
 }
 
+void VirtioScsi::FailQueuedRequests()
+{
+    /* Complete queued requests with failure so their waiters
+       (WaitForCompletion) don't spin forever when the device can never make
+       progress -- e.g. SetupHbaSlots failed and this BlockDevice stayed
+       registered with Hba == nullptr. */
+    for (;;)
+    {
+        BlockRequest* req = nullptr;
+        {
+            Stdlib::AutoLock lock(QueueLock);
+            if (RequestQueue.IsEmpty())
+                break;
+            Stdlib::ListEntry* entry = RequestQueue.RemoveHead();
+            req = CONTAINING_RECORD(entry, BlockRequest, Link);
+        }
+        req->Success = false;
+        req->Completion.Done();
+    }
+}
+
 void VirtioScsi::DrainQueue()
 {
-    if (!Initialized || !Hba)
+    if (!Initialized)
         return;
+
+    if (!Hba)
+    {
+        FailQueuedRequests();
+        return;
+    }
 
     /* Dequeue up to MaxSlots requests under the lock */
     BlockRequest* batch[MaxSlots];
@@ -720,9 +758,15 @@ void VirtioScsi::Interrupt(Context* ctx)
         return;
     }
 
-    u8 isr = Hba->Transport.ReadISR();
-    if (isr == 0)
-        return;
+    /* Read ISR only on the INTx path; under MSI-X the ISR status register is
+       not the notification mechanism (virtio 1.x 4.1.4.5) and a spec-conforming
+       device leaves it 0, so gating on it would drop every completion. */
+    if (!Hba->Transport.UsingMsix())
+    {
+        u8 isr = Hba->Transport.ReadISR();
+        if (isr == 0)
+            return;
+    }
 
     InterruptCounter.Inc();
     InterruptStats::Inc(IrqVirtioScsi);
@@ -1034,7 +1078,7 @@ void VirtioScsi::InitAll()
            Instances[InstanceCount] is the slot used by ProbeLun but never
            committed (InstanceCount was not incremented). */
         if (InstanceCount < MaxInstances && Instances[InstanceCount].CmdReq &&
-            InstanceCount >= firstInst)
+            InstanceCount >= firstInst && !Instances[InstanceCount].ProbeTimedOut)
         {
             Mm::UnmapFreePages(Instances[InstanceCount].CmdReq);
             Instances[InstanceCount].CmdReq = nullptr;
@@ -1046,7 +1090,7 @@ void VirtioScsi::InitAll()
            after this point, all I/O goes through the HBA slot pool. */
         for (ulong j = firstInst; j < InstanceCount; j++)
         {
-            if (Instances[j].CmdReq)
+            if (Instances[j].CmdReq && !Instances[j].ProbeTimedOut)
             {
                 Mm::UnmapFreePages(Instances[j].CmdReq);
                 Instances[j].CmdReq = nullptr;

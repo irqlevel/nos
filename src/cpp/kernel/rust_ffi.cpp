@@ -914,12 +914,19 @@ void kernel_timer_stop(unsigned long handle)
     if (handle == 0 || handle > RustTimerSlotCount)
         return;
     ulong i = handle - 1;
+
+    /* Clear the slot under the lock, then release it BEFORE StopTimer. StopTimer
+       spin-waits for an in-flight OnTick on another CPU to finish, and OnTick
+       needs RustTimerLock in read mode; holding the write lock across that wait
+       would deadlock (AB/BA). Clearing Handler first makes a racing OnTick a
+       no-op once it acquires the read lock. */
     ulong flags = RustTimerLock.WriteLockIrqSave();
-    Kernel::TimerTable::GetInstance().StopTimer(GetTimerAdapter(i));
     RustTimerSlots[i].Handler = nullptr;
     RustTimerSlots[i].Ctx = nullptr;
     RustTimerSlots[i].Active = false;
     RustTimerLock.WriteUnlockIrqRestore(flags);
+
+    Kernel::TimerTable::GetInstance().StopTimer(GetTimerAdapter(i));
 }
 
 } /* extern "C" */
@@ -1187,9 +1194,19 @@ public:
         Ops.FlushTx(Ops.Ctx);
     }
 
-    void ProcessRx() override
+    /* Ops.ProcessRx (e.g. r8168_process_rx) harvests hardware into the base
+       RxQueue -- that is the reap phase, so run it as ReapRx(). ProcessRx()
+       then drains and dispatches the RxQueue like every other device; without
+       this split, reaped frames would sit in RxQueue and never reach the
+       protocol stack. */
+    void ReapRx() override
     {
         Ops.ProcessRx(Ops.Ctx);
+    }
+
+    void ProcessRx() override
+    {
+        DrainRxQueueAndDispatch();
     }
 
     /* Dequeue one TX frame without acquiring TxQueueLock (lock already held). */

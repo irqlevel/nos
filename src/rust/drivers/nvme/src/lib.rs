@@ -219,10 +219,12 @@ fn init_device(dev: pci::PciDevice) {
     regs.write32(REG_CC, new_cc);
     if !wait_csts_set(&regs, CSTS_RDY, to_ms) {
         trace!(0, "NVMe: timeout waiting for controller ready");
+        disable_controller_on_error(&regs, to_ms);
         return;
     }
     if regs.read32(REG_CSTS) & CSTS_FATAL != 0 {
         trace!(0, "NVMe: controller fatal status");
+        disable_controller_on_error(&regs, to_ms);
         return;
     }
 
@@ -234,7 +236,7 @@ fn init_device(dev: pci::PciDevice) {
     /* --- Identify Controller --- */
     let id_buf = match dma::DmaBuffer::new(1) {
         Some(b) => b,
-        None => { trace!(0, "NVMe: identify DMA alloc failed"); return; }
+        None => { trace!(0, "NVMe: identify DMA alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
     let id_phys = id_buf.phys();
 
@@ -243,6 +245,7 @@ fn init_device(dev: pci::PciDevice) {
     cmd.prp1  = id_phys;
     if !admin_exec(&mut admin, &regs, cmd) {
         trace!(0, "NVMe: Identify Controller failed");
+        disable_controller_on_error(&regs, to_ms);
         return;
     }
 
@@ -260,6 +263,7 @@ fn init_device(dev: pci::PciDevice) {
     cmd.prp1  = id_phys;
     if !admin_exec(&mut admin, &regs, cmd) {
         trace!(0, "NVMe: Identify Namespace 1 failed");
+        disable_controller_on_error(&regs, to_ms);
         return;
     }
 
@@ -275,12 +279,14 @@ fn init_device(dev: pci::PciDevice) {
      * (masked in release builds -> plausible-but-wrong sector size). */
     if lbaf.lbads >= 32 {
         trace!(0, "NVMe: invalid lbads {}, skipping", lbaf.lbads);
+        disable_controller_on_error(&regs, to_ms);
         return;
     }
     let sector_size: u32 = 1 << lbaf.lbads;
     trace!(0, "NVMe: ns1 capacity={} sectors sector_size={}", capacity, sector_size);
     if sector_size < 512 || sector_size as usize > PAGE_SIZE {
         trace!(0, "NVMe: unsupported sector size {}, skipping", sector_size);
+        disable_controller_on_error(&regs, to_ms);
         return;
     }
 
@@ -295,22 +301,22 @@ fn init_device(dev: pci::PciDevice) {
     let io_depth = IO_QUEUE_DEPTH.min(mqes);
     let io_sq = match Queue::new(io_depth, 1, db_stride as usize) {
         Some(q) => q,
-        None => { trace!(0, "NVMe: I/O SQ alloc failed"); return; }
+        None => { trace!(0, "NVMe: I/O SQ alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
     let io_cq = match Queue::new(io_depth, 1, db_stride as usize) {
         Some(q) => q,
-        None => { trace!(0, "NVMe: I/O CQ alloc failed"); return; }
+        None => { trace!(0, "NVMe: I/O CQ alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
 
     let io_lock = match sync::SpinLock::new() {
         Some(l) => l,
-        None => { trace!(0, "NVMe: spinlock alloc failed"); return; }
+        None => { trace!(0, "NVMe: spinlock alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
 
     /* --- Setup MSI-X --- */
     let msix_table = match msix::MsixTable::new(&dev) {
         Some(t) => t,
-        None => { trace!(0, "NVMe: MSI-X setup failed"); return; }
+        None => { trace!(0, "NVMe: MSI-X setup failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
 
     /* Enable MSI-X in PCI config space BEFORE creating the I/O CQ.
@@ -331,6 +337,7 @@ fn init_device(dev: pci::PciDevice) {
     cmd.cdw11  = (0u32 << 16) | (CQ_IEN as u32) | (CQ_PC as u32); /* IV=0, IEN, PC */
     if !admin_exec(&mut admin, &regs, cmd) {
         trace!(0, "NVMe: Create I/O CQ failed");
+        disable_controller_on_error(&regs, to_ms);
         return;
     }
 
@@ -342,6 +349,7 @@ fn init_device(dev: pci::PciDevice) {
     cmd.cdw11  = (1u32 << 16) | (SQ_PC as u32);      /* CQID=1, PC */
     if !admin_exec(&mut admin, &regs, cmd) {
         trace!(0, "NVMe: Create I/O SQ failed");
+        disable_controller_on_error(&regs, to_ms);
         return;
     }
 
@@ -512,6 +520,18 @@ fn wait_csts_clear(regs: &io::MmioRegion, bit: u32, timeout_ms: u64) -> bool {
     poll_until_busy((timeout_ms * 1000) as usize, || regs.read32(REG_CSTS) & bit == 0)
 }
 
+/* Disable the controller and wait for it to go not-ready. Called on init error
+ * paths after CC.EN was set: it must run before the admin/IO queue and Identify
+ * DMA buffers are freed, otherwise a late/timed-out completion would DMA into
+ * memory the page allocator has already reused. */
+fn disable_controller_on_error(regs: &io::MmioRegion, to_ms: u64) {
+    let cc = regs.read32(REG_CC);
+    regs.write32(REG_CC, cc & !CC_EN);
+    if !wait_csts_clear(regs, CSTS_RDY, to_ms) {
+        trace!(0, "NVMe: controller did not go not-ready on init error");
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* MSI-X interrupt handler                                             */
 /* ------------------------------------------------------------------ */
@@ -573,6 +593,8 @@ extern "C" fn nvme_flush(ctx: *mut u8) -> i32 {
             Some(c) => c,
             None => {
                 trace!(0, "NVMe: flush: all CID slots busy");
+                /* Disarm the completion (never submitted) before it drops. */
+                completion.complete();
                 return -1;
             }
         };
@@ -628,6 +650,10 @@ fn submit_io(
          * a PRP *list* pointer and would DMA through garbage addresses. */
         trace!(0, "NVMe: transfer spans >2 pages (offset={} bytes={}), rejecting",
             offset_in_page, bytes_needed);
+        /* Disarm the completion before it drops: its handle was never handed
+         * to the device, so no ISR will complete it, and ~WaitGroup asserts a
+         * zero counter. */
+        completion.complete();
         return -1;
     }
     let prp2 = if offset_in_page + bytes_needed > PAGE_SIZE {
@@ -645,6 +671,8 @@ fn submit_io(
             Some(c) => c,
             None => {
                 trace!(0, "NVMe: submit_io: all CID slots busy");
+                /* Disarm the completion (never submitted) before it drops. */
+                completion.complete();
                 return -1;
             }
         };

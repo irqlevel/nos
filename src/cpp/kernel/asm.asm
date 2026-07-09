@@ -3,6 +3,7 @@ BITS 64
 section .text
 
 extern DummyInterrupt
+extern SpuriousInterrupt
 extern IO8042Interrupt
 extern SerialInterrupt
 extern PitInterrupt
@@ -94,6 +95,7 @@ global AtomicTestBit
 global AtomicCmpxchg
 
 global DummyInterruptStub
+global SpuriousInterruptStub
 global IO8042InterruptStub
 global SerialInterruptStub
 global PitInterruptStub
@@ -550,6 +552,7 @@ AtomicCmpxchg:
 %endmacro
 
 InterruptStub Dummy
+InterruptStub Spurious
 InterruptStub IO8042
 InterruptStub Serial
 InterruptStub Pit

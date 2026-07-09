@@ -45,7 +45,6 @@ void* FixedPageAllocator::Alloc()
         {
             for (size_t j = 0; j < i; j++)
                 pt.FreePage(pages[j]);
-            BugOn(1);
             return nullptr;
         }
     }
@@ -55,7 +54,6 @@ void* FixedPageAllocator::Alloc()
     {
         for (size_t i = 0; i < PageCount; i++)
             pt.FreePage(pages[i]);
-        BugOn(1);
         return nullptr;
     }
 
@@ -72,7 +70,6 @@ void* FixedPageAllocator::Alloc()
             for (size_t j = i; j < PageCount; j++)
                 pt.FreePage(pages[j]);
             VaAlloc.Free(va);
-            BugOn(1);
             return nullptr;
         }
     }
@@ -86,7 +83,6 @@ void* FixedPageAllocator::Map(Page* pages)
     ulong va = VaAlloc.Alloc();
     if (va == 0)
     {
-        BugOn(1);
         return nullptr;
     }
 
@@ -101,7 +97,6 @@ void* FixedPageAllocator::Map(Page* pages)
                 page->Put();
             }
             VaAlloc.Free(va);
-            BugOn(1);
             return nullptr;
         }
     }
@@ -117,7 +112,6 @@ void* FixedPageAllocator::MapPhys(ulong* physAddrs, size_t count)
     ulong va = VaAlloc.Alloc();
     if (va == 0)
     {
-        BugOn(1);
         return nullptr;
     }
 
@@ -134,7 +128,6 @@ void* FixedPageAllocator::MapPhys(ulong* physAddrs, size_t count)
                 p->Put(); /* Undo MapPage's Get */
             }
             VaAlloc.Free(va);
-            BugOn(1);
             return nullptr;
         }
         page->Put(); /* Balance GetPage's Get after MapPage succeeded */

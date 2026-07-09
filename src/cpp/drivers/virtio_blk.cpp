@@ -555,10 +555,16 @@ void VirtioBlk::Interrupt(Context* ctx)
 {
     (void)ctx;
 
-    /* Read ISR status to acknowledge interrupt */
-    u8 isr = Transport.ReadISR();
-    if (isr == 0)
-        return;
+    /* Read ISR status to acknowledge the interrupt on the INTx path only.
+       Under MSI-X the ISR status register is not the notification mechanism
+       (virtio 1.x 4.1.4.5) and a spec-conforming device leaves it 0, so
+       gating on it there would drop every completion. */
+    if (!Transport.UsingMsix())
+    {
+        u8 isr = Transport.ReadISR();
+        if (isr == 0)
+            return;
+    }
 
     InterruptCounter.Inc();
     InterruptStats::Inc(IrqVirtioBlk);

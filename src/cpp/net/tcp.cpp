@@ -26,6 +26,8 @@ void TcpConn::Init()
     SndUna = 0;
     SndNxt = 0;
     SndWnd = 0;
+    SndWl1 = 0;
+    SndWl2 = 0;
     RcvNxt = 0;
     RcvWnd = TcpRecvBufSize;
     AdvertisedWnd = TcpRecvBufSize;
@@ -157,15 +159,20 @@ TcpConn* Tcp::LookupLocked(u32 localIp, u16 localPort,
 }
 
 /* Caller must hold PoolLock. Returns listener with Lock held, or nullptr. */
-TcpConn* Tcp::FindListenerLocked(u16 localPort)
+TcpConn* Tcp::FindListenerLocked(u32 localIp, u16 localPort)
 {
     for (ulong i = 0; i < TcpMaxConnections; i++)
     {
         TcpConn* conn = &Pool[i];
-        if (conn->State == TcpStateListen && conn->LocalPort == localPort)
+        /* Match the destination IP as well as the port: a listener bound to a
+           specific IP must not accept a SYN aimed at some other address, while
+           a wildcard listener (LocalIp == 0) accepts any. */
+        if (conn->State == TcpStateListen && conn->LocalPort == localPort &&
+            (conn->LocalIp.Addr4 == localIp || conn->LocalIp.Addr4 == 0))
         {
             conn->Lock.Lock();
-            if (conn->State == TcpStateListen && conn->LocalPort == localPort)
+            if (conn->State == TcpStateListen && conn->LocalPort == localPort &&
+                (conn->LocalIp.Addr4 == localIp || conn->LocalIp.Addr4 == 0))
                 return conn;
             conn->Lock.Unlock();
         }
@@ -372,14 +379,25 @@ static u16 ParseMssOption(const TcpHdr* tcp)
 
 /* --- ACK bookkeeping shared by all states with unacked data --- */
 
-void Tcp::ProcessAck(TcpConn* conn, u32 ack, u16 wnd, ulong now)
+void Tcp::ProcessAck(TcpConn* conn, u32 segSeq, u32 ack, u16 wnd, ulong now)
 {
+    /* RFC 793 send-window update: accept the advertisement only from a segment
+       newer than the one that last set the window (SND.WL1 < SEG.SEQ, or equal
+       SEQ with SND.WL2 <= SEG.ACK), so a reordered stale advertisement cannot
+       clobber SndWnd. Wrap-safe via 32-bit signed differences. */
+    if ((int)(conn->SndWl1 - segSeq) < 0 ||
+        (conn->SndWl1 == segSeq && (int)(conn->SndWl2 - ack) <= 0))
+    {
+        conn->SndWnd = wnd;
+        conn->SndWl1 = segSeq;
+        conn->SndWl2 = ack;
+    }
+
     /* Wrap-safe range check: SndUna < ack <= SndNxt. */
     long ackAdvance = (long)(ack - conn->SndUna);
     if (ackAdvance <= 0 || (long)(conn->SndNxt - ack) < 0)
     {
-        /* Out-of-range ACK: still track the latest window advertisement. */
-        conn->SndWnd = wnd;
+        /* Out-of-range ACK: window already tracked above. */
         return;
     }
 
@@ -392,7 +410,6 @@ void Tcp::ProcessAck(TcpConn* conn, u32 ack, u16 wnd, ulong now)
     conn->SendBuf.Consume(dataAcked);
 
     conn->SndUna = ack;
-    conn->SndWnd = wnd;
     conn->RtoMs = TcpInitialRtoMs;
     conn->RetransmitCount = 0;
     if (conn->SndUna == conn->SndNxt)
@@ -480,6 +497,8 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
             conn->RcvNxt = seq + 1;
             conn->SndUna = ack;
             conn->SndWnd = wnd;
+            conn->SndWl1 = seq;
+            conn->SndWl2 = ack;
             conn->PeerMss = ParseMssOption(tcp);
             conn->State = TcpStateEstablished;
             conn->RtoMs = TcpInitialRtoMs;
@@ -504,6 +523,8 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
         {
             conn->SndUna = ack;
             conn->SndWnd = wnd;
+            conn->SndWl1 = seq;
+            conn->SndWl2 = ack;
             conn->State = TcpStateEstablished;
             conn->RtoMs = TcpInitialRtoMs;
             conn->RetransmitDeadlineMs = 0;
@@ -533,7 +554,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
 
         /* ACK processing */
         if (flags & TcpFlagAck)
-            ProcessAck(conn, ack, wnd, now);
+            ProcessAck(conn, seq, ack, wnd, now);
 
         /* Data processing -- in-order only */
         if (payloadLen > 0)
@@ -559,7 +580,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
            be acknowledged once SndUna catches up to SndNxt. */
         if (flags & TcpFlagAck)
         {
-            ProcessAck(conn, ack, wnd, now);
+            ProcessAck(conn, seq, ack, wnd, now);
             if (conn->SndUna == conn->SndNxt)
                 conn->FinAcked = true;
         }
@@ -622,7 +643,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     {
         if (flags & TcpFlagAck)
         {
-            ProcessAck(conn, ack, wnd, now);
+            ProcessAck(conn, seq, ack, wnd, now);
             if (conn->SndUna == conn->SndNxt)
             {
                 conn->State = TcpStateTimeWait;
@@ -643,7 +664,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     {
         if (flags & TcpFlagAck)
         {
-            ProcessAck(conn, ack, wnd, now);
+            ProcessAck(conn, seq, ack, wnd, now);
             if (conn->SndUna == conn->SndNxt)
             {
                 conn->State = TcpStateClosed;
@@ -656,7 +677,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     {
         /* ACK processing for any pending data */
         if (flags & TcpFlagAck)
-            ProcessAck(conn, ack, wnd, now);
+            ProcessAck(conn, seq, ack, wnd, now);
 
         /* Retransmitted FIN (our ACK was lost) -- re-ACK */
         if (flags & TcpFlagFin)
@@ -762,7 +783,7 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
     /* Try listener match (incoming SYN) */
     if (tcp->Flags & TcpFlagSyn)
     {
-        TcpConn* listener = FindListenerLocked(localPort);
+        TcpConn* listener = FindListenerLocked(localIp, localPort);
         if (listener)
         {
             /* Allocate a new connection for this SYN */
@@ -787,6 +808,8 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
             newConn->SndNxt = newConn->Iss;
             newConn->SndUna = newConn->Iss;
             newConn->SndWnd = Ntohs(tcp->Window);
+            newConn->SndWl1 = newConn->Irs;
+            newConn->SndWl2 = 0;
             newConn->PeerMss = ParseMssOption(tcp);
 
             /* Resolve MAC from the incoming frame's source */
@@ -830,7 +853,7 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
 }
 
 void Tcp::OnIcmpUnreachable(u32 localIp, u16 localPort,
-                            u32 remoteIp, u16 remotePort)
+                            u32 remoteIp, u16 remotePort, u32 quotedSeq)
 {
     if (!Initialized)
         return;
@@ -840,6 +863,16 @@ void Tcp::OnIcmpUnreachable(u32 localIp, u16 localPort,
     PoolLock.Unlock();
     if (!conn)
         return;
+
+    /* RFC 5927: only honor the hard error if the quoted sequence number is one
+       we actually sent and have not yet fully acknowledged, i.e. it lies in
+       [SndUna, SndNxt] (wrap-safe). This blocks off-path forged ICMP teardowns
+       from a peer that merely guesses the 4-tuple. */
+    if ((int)(quotedSeq - conn->SndUna) < 0 || (int)(conn->SndNxt - quotedSeq) < 0)
+    {
+        conn->Lock.Unlock();
+        return;
+    }
 
     Trace(0, "Tcp: ICMP unreachable, conn %u -> %u aborted",
           (ulong)localPort, (ulong)remotePort);

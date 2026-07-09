@@ -32,6 +32,9 @@ public:
     ulong GetResetRegPort();
     u8 GetResetValue();
 
+    /* FADT: RTC century CMOS register selector (0 if the platform has none) */
+    u8 GetCenturyRegister();
+
     /* HPET: physical base address (0 if no HPET ACPI table) */
     ulong GetHpetBasePhys();
     u16 GetHpetMinTick();
@@ -231,6 +234,7 @@ private:
     bool ResetRegValid;
     ulong ResetRegPort;
     u8 ResetVal;
+    u8 CenturyRegister;
 
     /* HPET-derived values */
     ulong HpetBasePhys;

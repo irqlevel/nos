@@ -395,9 +395,13 @@ extern "C" fn r8168_isr(ctx: *mut u8) {
     if status & ISR_TER != 0 {
         trace!(0, "r8168: TX error in ISR");
     }
-    /* TX completion (TOK/TDU) is handled by reap_completed() at the start
-     * of flush_tx — NOT here.  Reaping in the ISR would race with flush_tx
-     * on a different CPU (ISR-disable is per-CPU only). */
+    /* TX completion: reaping stays in flush_tx (reaping here would race it on
+     * another CPU), but schedule a DrainTx so frames left in the C++ TxQueue
+     * while the ring was full are flushed now that slots have freed -- without
+     * this they stall until an unrelated future SubmitTx. */
+    if status & (ISR_TOK | ISR_TDU | ISR_TER) != 0 {
+        softirq::raise(softirq::TYPE_NET_TX);
+    }
 
     if status & (ISR_ROK | ISR_RER | ISR_RX_OVFLOW | ISR_RX_FIFO_OV) != 0 {
         /* Defer frame processing to softirq task.  The C++ net layer calls
@@ -410,32 +414,38 @@ extern "C" fn r8168_isr(ctx: *mut u8) {
 /* TX path: called by C++ net stack under TxQueueLock */
 
 extern "C" fn r8168_flush_tx(ctx: *mut u8) {
-    let dev = unsafe { &mut *(ctx as *mut R8168Device) };
+    /* Raw pointer, not `&mut`: process_rx may hold its own reference to this
+     * device on another CPU (softirq exclusivity is per-type and TxQueueLock
+     * does not cover process_rx), and two live `&mut` to the same object are
+     * UB. Access only the disjoint fields we need, through the raw pointer.
+     * Safe without a lock: flush_tx is the only path that mutates tx_ring, and
+     * the C++ TxQueueLock serialises flush_tx callers. */
+    let dev = ctx as *mut R8168Device;
 
-    /* Reap any already-completed TX slots to make room.
-     * Safe without a lock: flush_tx is the only code path that accesses
-     * tx_ring, and the C++ TxQueueLock serialises callers. */
-    dev.tx_ring.reap_completed();
+    unsafe {
+        /* Reap any already-completed TX slots to make room. */
+        (*dev).tx_ring.reap_completed();
 
-    let mut submitted: u32 = 0;
-    loop {
-        if !dev.tx_ring.has_space() {
-            break;
-        }
-        match dev.net_handle.tx_dequeue() {
-            None => break,
-            Some(frame) => {
-                dev.tx_ring.submit(frame);
-                submitted = submitted + 1;
+        let mut submitted: u32 = 0;
+        loop {
+            if !(*dev).tx_ring.has_space() {
+                break;
+            }
+            match (*dev).net_handle.tx_dequeue() {
+                None => break,
+                Some(frame) => {
+                    (*dev).tx_ring.submit(frame);
+                    submitted = submitted + 1;
+                }
             }
         }
-    }
 
-    if submitted > 0 {
-        dev.tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
-        /* Kick the TX DMA engine.  Must be written after the descriptor
-         * stores (already guaranteed by tx_ring.submit's compiler_fence). */
-        dev.regs.write8(TX_POLL, TX_POLL_NPQ);
+        if submitted > 0 {
+            (*dev).tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
+            /* Kick the TX DMA engine.  Must be written after the descriptor
+             * stores (already guaranteed by tx_ring.submit's compiler_fence). */
+            (*dev).regs.write8(TX_POLL, TX_POLL_NPQ);
+        }
     }
 }
 
@@ -443,23 +453,28 @@ extern "C" fn r8168_flush_tx(ctx: *mut u8) {
 /* RX path: called from softirq task by the C++ net layer */
 
 extern "C" fn r8168_process_rx(ctx: *mut u8) {
-    let dev = unsafe { &mut *(ctx as *mut R8168Device) };
+    /* Raw pointer, not `&mut`: flush_tx may hold its own reference to this
+     * device on another CPU, and two live `&mut` to the same object are UB.
+     * process_rx touches only rx_ring / rx_* / net_handle, disjoint from
+     * flush_tx's tx_ring. */
+    let dev = ctx as *mut R8168Device;
 
+    unsafe {
     /* Walk the RX ring until we hit a hardware-owned descriptor */
     loop {
-        let idx = dev.rx_ring.head;
+        let idx = (*dev).rx_ring.head;
 
         /* Refill a slot left empty by an earlier NetFrame allocation
          * failure.  The hardware stalls on a descriptor it does not own,
          * so RX cannot make progress until the slot is reposted. */
-        if dev.rx_ring.frames[idx] == 0 {
+        if (*dev).rx_ring.frames[idx] == 0 {
             match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-                Some(frame) => dev.rx_ring.post(idx, frame),
+                Some(frame) => (*dev).rx_ring.post(idx, frame),
                 None => break, /* still no memory; retry on next softirq */
             }
         }
 
-        let (mut frame, opts1) = match dev.rx_ring.harvest() {
+        let (mut frame, opts1) = match (*dev).rx_ring.harvest() {
             None => break,
             Some(pair) => pair,
         };
@@ -470,28 +485,29 @@ extern "C" fn r8168_process_rx(ctx: *mut u8) {
             /* Error frame, multi-descriptor fragment (cannot happen while
              * RX_MAX_SIZE < RX_BUF_SIZE, but check anyway), or runt:
              * drop it and give the buffer straight back to hardware. */
-            dev.rx_dropped.fetch_add(1, Ordering::Relaxed);
+            (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
             frame.set_len(0);
-            dev.rx_ring.post(idx, frame);
+            (*dev).rx_ring.post(idx, frame);
             continue;
         }
 
         /* The length field includes the 4-byte CRC; strip it */
         let data_len = (rx_len - 4) as usize;
         frame.set_len(data_len);
-        dev.rx_packets.fetch_add(1, Ordering::Relaxed);
+        (*dev).rx_packets.fetch_add(1, Ordering::Relaxed);
 
         /* Enqueue to kernel net stack (transfers ownership) */
-        dev.net_handle.enqueue_rx(frame);
+        (*dev).net_handle.enqueue_rx(frame);
 
         /* Refill the slot we just harvested */
         match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-            Some(new_frame) => dev.rx_ring.post(idx, new_frame),
+            Some(new_frame) => (*dev).rx_ring.post(idx, new_frame),
             None => {
                 /* Memory pressure: leave the slot empty; the refill at the
                  * top of this loop reposts it once allocation succeeds. */
-                dev.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
     }
 }

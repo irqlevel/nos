@@ -18,6 +18,7 @@ Acpi::Acpi()
     , ResetRegValid(false)
     , ResetRegPort(0)
     , ResetVal(0)
+    , CenturyRegister(0)
     , HpetBasePhys(0)
     , HpetMinTick(0)
 {
@@ -99,6 +100,13 @@ bool Acpi::ScanRsdpRange(ulong phyStart, ulong phyEnd, u32& rsdtPhysAddr)
             if (rsdp->FirstPart.Signature == RSDPSignature)
             {
                 Trace(0, "Checking rsdp va 0x%p pha 0x%p", rsdp, curr + (va - pageVa));
+                /* ParseRsdp reads the full 36-byte RSDPDescriptor20 when
+                   Revision >= 2; the loop bound only guarantees the 20-byte
+                   FirstPart, so skip a 2.0 RSDP whose extended fields would
+                   read past this single mapped page. */
+                if (rsdp->FirstPart.Revision >= 2 &&
+                    va + sizeof(RSDPDescriptor20) > scanEnd)
+                    continue;
                 if (ParseRsdp(rsdp))
                 {
                     rsdtPhysAddr = rsdp->FirstPart.RsdtAddress;
@@ -225,7 +233,15 @@ Stdlib::Error Acpi::ParseTablePointers()
          * First map just the header page to read Length, then re-map
          * the full table so that parsers have a contiguous VA range.
          */
-        ACPISDTHeader* header = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(Rsdt->Entry[i]));
+        ulong physOffset = Rsdt->Entry[i] & (Const::PageSize - 1);
+
+        /* TmpMapAddress maps only the entry's page; if the SDT header (whose
+           Length field at offset 4 we read next) would straddle the page
+           boundary, map the header range instead so the read stays in bounds. */
+        bool headerStraddles = (physOffset + sizeof(ACPISDTHeader) > Const::PageSize);
+        ACPISDTHeader* header = headerStraddles
+            ? reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(Rsdt->Entry[i], sizeof(ACPISDTHeader)))
+            : reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(Rsdt->Entry[i]));
         if (!header)
         {
             Trace(0, "Acpi: can't map table %u phys 0x%p", (ulong)i, (ulong)Rsdt->Entry[i]);
@@ -239,11 +255,14 @@ Stdlib::Error Acpi::ParseTablePointers()
             return MakeError(Stdlib::Error::InvalidValue);
         }
 
-        ulong physOffset = Rsdt->Entry[i] & (Const::PageSize - 1);
         if (physOffset + tableLength > Const::PageSize)
         {
-            /* Table spans pages — unmap the single-page mapping and re-map the full range */
-            pt.TmpUnmapPage(reinterpret_cast<ulong>(header) & ~(Const::PageSize - 1));
+            /* Table spans pages — unmap the header mapping (one page, or two if
+               it straddled) and re-map the full range contiguously. */
+            ulong hdrVaPage = reinterpret_cast<ulong>(header) & ~(Const::PageSize - 1);
+            pt.TmpUnmapPage(hdrVaPage);
+            if (headerStraddles)
+                pt.TmpUnmapPage(hdrVaPage + Const::PageSize);
             header = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(Rsdt->Entry[i], tableLength));
             if (!header)
             {
@@ -286,8 +305,13 @@ Stdlib::Error Acpi::ParseMADT()
     }
 
     MadtEntry* entry = &header->Entry[0];
+    void* madtEnd = Stdlib::MemAdd(sdtHeader, sdtHeader->Length);
 
-    while (Stdlib::MemAdd(entry, entry->Length) <= Stdlib::MemAdd(sdtHeader, sdtHeader->Length))
+    /* Check the 2-byte entry header is within the table before reading
+       entry->Length, then that the whole entry fits -- a truncated or corrupt
+       MADT would otherwise read Length past the end of the mapped table. */
+    while (Stdlib::MemAdd(entry, sizeof(MadtEntry)) <= madtEnd &&
+           Stdlib::MemAdd(entry, entry->Length) <= madtEnd)
     {
         Trace(AcpiLL, "Acpi: MADT entry 0x%p type %u len %u",
             entry, (ulong)entry->Type, (ulong)entry->Length);
@@ -397,6 +421,20 @@ void Acpi::ParseFADT()
                 ResetRegPort, (ulong)ResetVal);
         }
     }
+
+    /* Century CMOS register selector (ACPI 2.0+, body offset +72). 0 means the
+       platform has no century register, so the RTC year must not trust it. */
+    static const ulong CenturyEnd = OFFSET_OF(FadtFields, Century) + sizeof(fadt->Century);
+    if (bodyLen >= CenturyEnd)
+    {
+        CenturyRegister = fadt->Century;
+        Trace(AcpiLL, "Acpi: FADT century register 0x%p", (ulong)CenturyRegister);
+    }
+}
+
+u8 Acpi::GetCenturyRegister()
+{
+    return CenturyRegister;
 }
 
 void Acpi::ParseHPET()

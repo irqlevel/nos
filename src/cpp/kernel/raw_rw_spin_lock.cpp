@@ -48,7 +48,7 @@ void RawRwSpinLock::ReadUnlock()
 
 void RawRwSpinLock::WriteLock()
 {
-    WriterWaiting.Set(1);
+    WriterWaiting.Inc();
     for (;;)
     {
         if (Value.Cmpxchg(-1, 0) == 0)
@@ -61,7 +61,7 @@ void RawRwSpinLock::WriteLock()
 void RawRwSpinLock::WriteUnlock()
 {
     Value.Set(0);
-    WriterWaiting.Set(0);
+    WriterWaiting.Dec();
 }
 
 ulong RawRwSpinLock::WriteLockIrqSave()

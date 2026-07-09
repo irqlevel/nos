@@ -108,7 +108,7 @@ restart:
                 if (preChild->GetKeyCount() >= T)
                 {
                     size_t preIndex;
-                    auto preNode = preChild->FindLeftMost(preChild, preIndex);
+                    auto preNode = preChild->FindRightMost(preChild, preIndex);
 
                     if (BugOn(preNode.Get() == nullptr))
                         return false;
@@ -122,7 +122,7 @@ restart:
                 else if (sucChild->GetKeyCount() >= T)
                 {
                     size_t sucIndex;
-                    auto sucNode = sucChild->FindRightMost(sucChild, sucIndex);
+                    auto sucNode = sucChild->FindLeftMost(sucChild, sucIndex);
 
                     if (BugOn(sucNode.Get() == nullptr))
                         return false;

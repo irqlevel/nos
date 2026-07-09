@@ -483,6 +483,10 @@ void BpStartup(void* ctx)
 
         idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
 
+        /* Install a benign handler for the LAPIC spurious-interrupt vector so a
+           spurious IRQ counts a stat instead of hitting DummyInterrupt's panic. */
+        idt.SetDescriptor(Lapic::SpuriousVector, IdtDescriptor::Encode(SpuriousInterruptStub));
+
         Trace(0, "IPI registred");
 
         idt.Save();

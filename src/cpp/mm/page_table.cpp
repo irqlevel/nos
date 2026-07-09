@@ -4,6 +4,7 @@
 #include <kernel/trace.h>
 #include <kernel/asm.h>
 #include <kernel/debug.h>
+#include <kernel/preempt.h>
 
 namespace Kernel
 {
@@ -273,6 +274,18 @@ ulong PageTable::GetL1Page(ulong virtAddr)
 }
 
 ulong PageTable::VirtToPhys(ulong virtAddr)
+{
+    /* The walk below maps and unmaps shared TmpMap slots, and TmpUnmapPage
+       only invalidates the local TLB. Disable preemption across the whole
+       walk so a migration mid-walk cannot leave a stale mapping on the
+       original CPU that a later slot reuse would mistranslate. */
+    ulong flags = PreemptIrqSave();
+    ulong phys = VirtToPhysLocked(virtAddr);
+    PreemptIrqRestore(flags);
+    return phys;
+}
+
+ulong PageTable::VirtToPhysLocked(ulong virtAddr)
 {
     if (!Root)
         return 0;

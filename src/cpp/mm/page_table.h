@@ -181,6 +181,7 @@ public:
     ulong TmpMapRange(ulong phyAddr, size_t len);
 
     ulong VirtToPhys(ulong virtAddr);
+    ulong VirtToPhysLocked(ulong virtAddr);
 
     ulong GetFreePagesCount();
     ulong GetTotalPagesCount();

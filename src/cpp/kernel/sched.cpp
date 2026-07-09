@@ -14,9 +14,29 @@ TaskQueue::TaskQueue()
 {
     Stdlib::AutoLock lock(Lock);
     TaskList.Init();
+    ExitedList.Init();
 
     SwitchContextCounter.Set(0);
     ScheduleCounter.Set(0);
+}
+
+void TaskQueue::ReapExited()
+{
+    for (;;)
+    {
+        Task* task = nullptr;
+        {
+            Stdlib::AutoLock lock(ExitedLock);
+            if (ExitedList.IsEmpty())
+                break;
+            Stdlib::ListEntry* entry = ExitedList.RemoveHead();
+            task = CONTAINING_RECORD(entry, Task, ListEntry);
+        }
+        /* Put() here (interrupts enabled) may free the 32KB stack via a
+           blocking cross-CPU TLB shootdown; that is safe now but was not in
+           the IRQs-off SwitchComplete path where the task was enqueued. */
+        task->Put();
+    }
 }
 
 void TaskQueue::SwitchComplete(Task* curr)
@@ -43,7 +63,14 @@ void TaskQueue::SwitchComplete(Task* curr)
     } else {
 
         prev->PreemptDisableCounter.Dec();
-        prev->Put();
+        /* Defer the final Put() -- which frees the 32KB stack via a blocking
+           cross-CPU TLB shootdown -- out of this IRQs-disabled context. Two
+           CPUs freeing exited stacks here concurrently could deadlock on each
+           other's shootdown IPI. Enqueue the task and let ReapExited() free it
+           from the idle loop with interrupts enabled. prev->ListEntry was
+           RemoveInit'd in Schedule, so it is free to reuse. */
+        Stdlib::AutoLock lock(ExitedLock);
+        ExitedList.InsertTail(&prev->ListEntry);
     }
 }
 

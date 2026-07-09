@@ -35,6 +35,7 @@ enum InterruptSource : u8
     IrqShared,
     IrqMsix,
     IrqDummy,
+    IrqSpurious,
     IrqMax,
 };
 

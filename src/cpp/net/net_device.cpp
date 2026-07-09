@@ -1,4 +1,7 @@
 #include "net_device.h"
+#include "arp.h"
+#include "icmp.h"
+#include "tcp.h"
 
 #include <kernel/trace.h>
 #include <kernel/softirq.h>
@@ -207,6 +210,82 @@ bool NetDeviceTable::Register(NetDevice* dev)
         (ulong)mac.Bytes[3], (ulong)mac.Bytes[4], (ulong)mac.Bytes[5]);
 
     return true;
+}
+
+void NetDevice::DrainRxQueueAndDispatch()
+{
+    /* Drain the SW RxQueue (filled by ReapRx) and dispatch each frame to the
+       protocol stack. Shared by drivers whose ProcessRx has no dispatch of its
+       own (e.g. the Rust NIC bridge, whose reap callback runs as ReapRx). */
+    while (true)
+    {
+        ulong flags = RxQueueLock.LockIrqSave();
+        if (RxQueue.IsEmpty())
+        {
+            RxQueueLock.UnlockIrqRestore(flags);
+            break;
+        }
+        Stdlib::ListEntry* entry = RxQueue.RemoveHead();
+        RxCount--;
+        RxQueueLock.UnlockIrqRestore(flags);
+
+        NetFrame* frame = CONTAINING_RECORD(entry, NetFrame, Link);
+        u8* data = frame->Data;
+        ulong dataLen = frame->Length;
+
+        if (dataLen < sizeof(Net::EthHdr))
+            goto done;
+
+        {
+            Net::EthHdr* eth = (Net::EthHdr*)data;
+            u16 etherType = Net::Ntohs(eth->EtherType);
+
+            if (etherType == Net::EtherTypeArp)
+            {
+                ArpTable::GetInstance().Process(this, data, dataLen);
+                goto done;
+            }
+
+            if (etherType != Net::EtherTypeIp ||
+                dataLen < sizeof(Net::EthHdr) + sizeof(Net::IpHdr))
+                goto done;
+
+            Net::IpHdr* ip = (Net::IpHdr*)(data + sizeof(Net::EthHdr));
+            switch (ip->Protocol)
+            {
+            case Net::IpProtoIcmp:
+                Icmp::GetInstance().Process(this, data, dataLen);
+                break;
+            case Net::IpProtoTcp:
+                Tcp::GetInstance().Process(this, data, dataLen);
+                break;
+            case Net::IpProtoUdp:
+            {
+                ulong ipHdrLen = Net::IpHeaderLen(ip);
+                if (ipHdrLen == 0 ||
+                    dataLen < sizeof(Net::EthHdr) + ipHdrLen + sizeof(Net::UdpHdr))
+                    break;
+                Net::UdpHdr* udp = (Net::UdpHdr*)(data + sizeof(Net::EthHdr) + ipHdrLen);
+                u16 dstPort = Net::Ntohs(udp->DstPort);
+
+                Stdlib::AutoLock lock(UdpListenerLock);
+                for (ulong li = 0; li < UdpListenerCount; li++)
+                {
+                    if (UdpListeners[li].Port == dstPort && UdpListeners[li].Cb)
+                    {
+                        UdpListeners[li].Cb(data, dataLen, UdpListeners[li].Ctx);
+                        break;
+                    }
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+done:
+        frame->Put();
+    }
 }
 
 void NetDeviceTable::ProcessAllRx()

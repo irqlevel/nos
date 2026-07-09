@@ -325,7 +325,9 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 { TerminateOnError(s, size, (size_t)pos); return -1; }
     }
 
-    if (!PutChar('\0', s, size, pos++))
+    /* NUL-terminate but do not count the terminator: the return value is the
+       length of the formatted string (standard vsnprintf semantics). */
+    if (!PutChar('\0', s, size, pos))
         { TerminateOnError(s, size, (size_t)pos); return -1; }
 
     return pos;
