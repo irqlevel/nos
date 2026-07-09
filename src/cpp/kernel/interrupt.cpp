@@ -53,8 +53,37 @@ void Interrupt::Register(InterruptHandler& handler, u8 irq, u8 vector)
     Trace(0, "Register interrupt irq 0x%p vector 0x%p fn 0x%p",
         (ulong)irq, (ulong)vector, handler.GetHandlerFn());
 
+    /* `irq` is a GSI (callers pass acpi.GetGsiByIrq()). Claiming a GSI or
+       vector that is already owned would silently reprogram the IOAPIC pin
+       or overwrite the IDT entry, and the loser's interrupts would be
+       EOI'd unhandled by the winner's stub -- refuse loudly instead. */
+    for (ulong v = 0; v < MaxVectors; v++)
+    {
+        VectorEntry& other = Vectors[v];
+        if (other.HandlerCount > 0 && other.Gsi == irq)
+        {
+            Trace(0, "Register interrupt: gsi 0x%p already owned by vector 0x%p, refused",
+                (ulong)irq, v);
+            return;
+        }
+    }
+    if (Vectors[vector].HandlerCount > 0)
+    {
+        Trace(0, "Register interrupt: vector 0x%p already in use, refused",
+            (ulong)vector);
+        return;
+    }
+
     IoApic::GetInstance().SetIrq(irq, CpuTable::GetInstance().GetCurrentCpuId(), vector);
     Idt::GetInstance().SetDescriptor(vector, IdtDescriptor::Encode(handler.GetHandlerFn()));
+
+    /* Record the claim so RegisterLevel cannot land a PCI device on the
+       same GSI/vector behind this handler's back */
+    VectorEntry& ve = Vectors[vector];
+    ve.Gsi = irq;
+    ve.Level = false;
+    ve.Handlers[0] = &handler;
+    ve.HandlerCount = 1;
 
     handler.OnInterruptRegister(irq, vector);
 }
@@ -77,6 +106,17 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
         VectorEntry& ve = Vectors[v];
         if (ve.HandlerCount > 0 && ve.Gsi == gsi)
         {
+            if (!ve.Level)
+            {
+                /* An edge-triggered system IRQ (PIT/HPET/8042/serial) owns
+                   this GSI. Chaining a level PCI handler onto it would
+                   re-program the pin and feed the edge handler phantom
+                   interrupts -- refuse loudly instead. */
+                Trace(0, "Register level interrupt irq 0x%p: gsi 0x%p owned by edge vector 0x%p, refused",
+                    (ulong)irq, (ulong)gsi, v);
+                return;
+            }
+
             /* GSI already registered -- chain this handler onto the existing vector */
             if (ve.HandlerCount >= MaxSharedHandlers)
             {
@@ -98,6 +138,15 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
         }
     }
 
+    /* Fresh GSI: the requested vector must be free, or we would silently
+       overwrite another device's IDT entry */
+    if (Vectors[vector].HandlerCount > 0)
+    {
+        Trace(0, "Register level interrupt irq 0x%p: vector 0x%p already in use, refused",
+            (ulong)irq, (ulong)vector);
+        return;
+    }
+
     Trace(0, "Register level interrupt irq 0x%p gsi 0x%p vector 0x%p fn 0x%p activeHigh %u",
         (ulong)irq, (ulong)gsi, (ulong)vector, handler.GetHandlerFn(), (ulong)activeHigh);
 
@@ -107,6 +156,7 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
     /* Record in the shared table */
     VectorEntry& ve = Vectors[vector];
     ve.Gsi = gsi;
+    ve.Level = true;
     ve.Handlers[0] = &handler;
     ve.HandlerCount = 1;
 

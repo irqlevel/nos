@@ -85,6 +85,9 @@ private:
     {
         u8 Gsi;
         u8 HandlerCount;
+        /* True for RegisterLevel (PCI INTx) entries; only those may chain.
+           Edge entries (Register) own their GSI + vector exclusively. */
+        bool Level;
         InterruptHandler* Handlers[MaxSharedHandlers];
     };
 
