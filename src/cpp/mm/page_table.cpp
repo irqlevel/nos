@@ -128,6 +128,7 @@ BuiltinPageTable::~BuiltinPageTable()
 
 PageTable::PageTable()
     : Root(0)
+    , ExcludedPages(0)
     , PageArray(nullptr)
     , PageArrayCount(0)
     , HighestPhyAddr(0)
@@ -425,6 +426,15 @@ void PageTable::ExcludeFreePages(ulong phyLimit)
                 *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(prev) = next;
             else
                 FreePages = next;
+
+            /* Park the page on a side list instead of dropping it: it is
+               ordinary usable RAM that only must not back Setup's
+               identity-accessed allocations. SetupFreePagesList hands it to
+               the runtime allocator (which accesses pages via TmpMap only),
+               instead of leaking ~1-2% of low memory for the kernel's
+               lifetime. */
+            *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(curr) = ExcludedPages;
+            ExcludedPages = curr;
         } else {
             prev = curr;
         }
@@ -507,16 +517,26 @@ bool PageTable::Setup()
 bool PageTable::SetupFreePagesList()
 {
     FreePagesCount = 0;
-    for (;;)
-    {
-        ulong phyAddr = GetFreePageByTmpMap();
-        if (!phyAddr)
-            break;
 
-        Page* page = GetPage(phyAddr);
-        BugOn(!page);
-        FreePagesList.InsertHead(&page->ListEntry);
-        FreePagesCount++;
+    /* Pass 1 drains the early free list; pass 2 drains the pages Setup
+       parked below the PageArray limit (plain usable RAM, safe now that all
+       page access goes through TmpMap). */
+    for (ulong pass = 0; pass < 2; pass++)
+    {
+        for (;;)
+        {
+            ulong phyAddr = GetFreePageByTmpMap();
+            if (!phyAddr)
+                break;
+
+            Page* page = GetPage(phyAddr);
+            BugOn(!page);
+            FreePagesList.InsertHead(&page->ListEntry);
+            FreePagesCount++;
+        }
+
+        FreePages = ExcludedPages;
+        ExcludedPages = 0;
     }
 
     Trace(0, "FreePagesCount %u", FreePagesCount);

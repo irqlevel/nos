@@ -234,6 +234,9 @@ private:
     SpinLock Lock;
     SpinLock FreePagesLock;
     ulong FreePages;
+    /* Usable RAM below the PageArray limit, parked by ExcludeFreePages so
+       Setup never allocates it; reclaimed in SetupFreePagesList. */
+    ulong ExcludedPages;
 
     Page* PageArray;
     ulong PageArrayCount;

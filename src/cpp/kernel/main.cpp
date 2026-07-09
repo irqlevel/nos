@@ -19,6 +19,7 @@
 #include "softirq.h"
 #include "irq_balance.h"
 #include "time.h"
+#include "tsc.h"
 
 #include <boot/grub.h>
 
@@ -196,6 +197,11 @@ void ApMain2()
 
     Lapic::Enable();
     AtomicReadAndInc(&ApStartedFlag); /* 5: LAPIC enabled */
+
+    /* KVM updates a pvclock entry only for the vcpu that armed it; without
+       this the AP would read the BSP's entry with its own TSC. No-op when
+       kvmclock is unavailable. */
+    Tsc::GetInstance().EnableKvmClockSelf();
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
 

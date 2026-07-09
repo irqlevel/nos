@@ -6,6 +6,7 @@
 #include <include/const.h>
 #include <mm/new.h>
 #include <drivers/hpet.h>
+#include <drivers/lapic.h>
 
 namespace Kernel
 {
@@ -166,7 +167,7 @@ bool Tsc::SetupKvmClock()
         return false;
     }
 
-    /* Allocate a page for the pvclock struct */
+    /* Allocate a page of pvclock entries (one per APIC id) */
     PvClock = static_cast<PvClockVcpuTimeInfo*>(
         Mm::AllocMapPages(1, &PvClockPhys));
     if (!PvClock)
@@ -177,8 +178,9 @@ bool Tsc::SetupKvmClock()
 
     Stdlib::MemSet(PvClock, 0, Const::PageSize);
 
-    /* Enable kvmclock: write physical address | 1 (enable bit) to MSR */
-    WriteMsr(KvmMsrSystemTime, PvClockPhys | KvmMsrEnable);
+    /* Enable kvmclock for the BSP; each AP arms its own entry in ApMain2 */
+    if (!EnableKvmClockSelf())
+        return false;
 
     KvmClockAvail = true;
 
@@ -188,26 +190,51 @@ bool Tsc::SetupKvmClock()
     return true;
 }
 
+bool Tsc::EnableKvmClockSelf()
+{
+    if (PvClock == nullptr)
+        return false;
+
+    ulong idx = Lapic::GetApicId();
+    if (idx >= PvClockEntryCount)
+    {
+        Trace(0, "TSC: apic id %u exceeds pvclock entries", idx);
+        return false;
+    }
+
+    /* Write this entry's physical address | 1 (enable bit) to the MSR. KVM
+       updates the entry only for the vcpu that wrote it. */
+    WriteMsr(KvmMsrSystemTime,
+             (PvClockPhys + idx * sizeof(PvClockVcpuTimeInfo)) | KvmMsrEnable);
+    return true;
+}
+
 Stdlib::Time Tsc::KvmClockTime()
 {
     u32 version;
     u64 ns;
 
+    /* Read this CPU's own entry: an AP reading the BSP's entry would compute
+       AP_tsc - BSP_timestamp, which is wrong unless TSCs are perfectly
+       synchronized. A never-armed entry is all-zero (mul = 0) and yields 0,
+       which GetBootTime treats as "fall back to HPET/PIT". */
+    PvClockVcpuTimeInfo* pv = &PvClock[Lapic::GetApicId() % PvClockEntryCount];
+
     do {
-        version = PvClock->Version;
+        version = pv->Version;
         Barrier();
 
-        u64 delta = ReadTsc() - PvClock->TscTimestamp;
-        if (PvClock->TscShift >= 0)
-            delta <<= PvClock->TscShift;
+        u64 delta = ReadTsc() - pv->TscTimestamp;
+        if (pv->TscShift >= 0)
+            delta <<= pv->TscShift;
         else
-            delta >>= (u8)(-PvClock->TscShift);
+            delta >>= (u8)(-pv->TscShift);
 
-        ns = PvClock->SystemTime +
-             (u64)(((__uint128_t)delta * PvClock->TscToSystemMul) >> 32);
+        ns = pv->SystemTime +
+             (u64)(((__uint128_t)delta * pv->TscToSystemMul) >> 32);
 
         Barrier();
-    } while ((PvClock->Version & 1) || PvClock->Version != version);
+    } while ((pv->Version & 1) || pv->Version != version);
 
     return Stdlib::Time(ns);
 }
