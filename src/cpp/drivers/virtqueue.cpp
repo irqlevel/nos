@@ -163,6 +163,12 @@ ulong VirtQueue::GetUsedPhys()
     return PhysAddr + ((ulong)Used - (ulong)VirtAddr);
 }
 
+void VirtQueue::DisableDeviceInterrupts()
+{
+    Avail->Flags = Avail->Flags | VirtqAvail::FlagNoInterrupt;
+    Barrier();
+}
+
 bool VirtQueue::HasUsed()
 {
     Barrier();

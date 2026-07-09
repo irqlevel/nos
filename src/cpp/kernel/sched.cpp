@@ -111,11 +111,12 @@ void TaskQueue::Schedule(Task* curr)
     Lock.Lock();
 
     Task* next = nullptr;
-    do {
+    ulong exitedRetries = 0;
+    for (;;) {
         curr->Lock.Lock();
         BugOn(TaskList.IsEmpty());
 
-        if (curr->State.Get() == Task::StateExited)
+        if (curr->State.Get() == Task::StateExited && curr->TaskQueue != nullptr)
         {
             BugOn(curr->TaskQueue != this);
             BugOn(curr->ListEntry.IsEmpty());
@@ -124,22 +125,34 @@ void TaskQueue::Schedule(Task* curr)
         }
 
         next = SelectNext(curr);
-        if (next == nullptr)
+        if (next != nullptr)
+        {
+            next->Lock.Lock();
+            next->ListEntry.Remove();
+            if (curr->TaskQueue != nullptr)
+            {
+                BugOn(curr->TaskQueue != this);
+                curr->ListEntry.Remove();
+                TaskList.InsertTail(&curr->ListEntry);
+            }
+            TaskList.InsertTail(&next->ListEntry);
+            break;
+        }
+
+        if (curr->State.Get() != Task::StateExited)
         {
             break;
         }
 
-        next->Lock.Lock();
-        next->ListEntry.Remove();
-        if (curr->TaskQueue != nullptr)
-        {
-            BugOn(curr->TaskQueue != this);
-            curr->ListEntry.Remove();
-            TaskList.InsertTail(&curr->ListEntry);
-        }
-        TaskList.InsertTail(&next->ListEntry);
-
-    } while (false);
+        /* An exited task can't be returned to: drop the locks and wait
+           for a runnable candidate (the idle task at the latest) */
+        curr->Lock.Unlock();
+        Lock.Unlock();
+        if (++exitedRetries > MaxExitedRetries)
+            Panic("Schedule: exited task but no runnable candidate");
+        Pause();
+        Lock.Lock();
+    }
 
     if (next == nullptr)
     {

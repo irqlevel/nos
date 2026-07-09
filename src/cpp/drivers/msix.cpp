@@ -21,10 +21,11 @@ static const u8 PciCapIdMsix = 0x11;
 static const u16 PciCommandIntxDisable = (u16)(1 << 10);
 
 static const u16 MsixControlEnable = (u16)(1 << 15);
+static const u16 MsixControlFuncMask = (u16)(1 << 14);
 
 static const u32 MsixAddrBase = 0xFEE00000U;
 
-u8 MsixTable::NextVector = MsixVectorBase;
+Atomic MsixTable::NextVectorOffset;
 
 MsixTable::MsixTable()
     : Table(nullptr)
@@ -82,21 +83,32 @@ bool MsixTable::MapBarForTable(Pci::DeviceInfo* dev, u8 bar, ulong offsetInBar,
 
     ulong physAddr = barVal & ~0xFUL;
 
-    if ((barVal & 0x6) == 0x4 && bar + 1 < 6)
+    bool is64 = ((barVal & 0x6) == 0x4) && (bar + 1 < 6);
+    u32 barHigh = 0;
+    if (is64)
     {
-        u32 barHigh = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, (u8)(bar + 1));
+        barHigh = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, (u8)(bar + 1));
         physAddr |= ((ulong)barHigh << 32);
     }
 
     if (physAddr == 0)
         return false;
 
+    /* Size-probe both halves of a 64-bit BAR; probing only the low half
+       computes a bogus size for BARs >= 4 GB */
     pci.WriteDword(dev->Bus, dev->Slot, dev->Func, (u16)(0x10 + bar * 4), 0xFFFFFFFF);
-    u32 sizeMask = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar);
+    u32 sizeMaskLow = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar);
+    u32 sizeMaskHigh = 0xFFFFFFFF;
+    if (is64)
+    {
+        pci.WriteDword(dev->Bus, dev->Slot, dev->Func, (u16)(0x10 + (bar + 1) * 4), 0xFFFFFFFF);
+        sizeMaskHigh = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, (u8)(bar + 1));
+        pci.WriteDword(dev->Bus, dev->Slot, dev->Func, (u16)(0x10 + (bar + 1) * 4), barHigh);
+    }
     pci.WriteDword(dev->Bus, dev->Slot, dev->Func, (u16)(0x10 + bar * 4), barVal);
 
-    u32 sizeMask32 = sizeMask & ~0xFU;
-    ulong barSize = (ulong)(~sizeMask32) + 1;
+    ulong sizeMask = ((ulong)sizeMaskHigh << 32) | (ulong)(sizeMaskLow & ~0xFU);
+    ulong barSize = ~sizeMask + 1;
     if (barSize == 0)
         barSize = Const::PageSize;
 
@@ -186,9 +198,15 @@ bool MsixTable::Setup(Pci::DeviceInfo* dev, const ulong* mappedBars)
 
 u8 MsixTable::AllocVector()
 {
-    if (NextVector > MsixVectorLimit)
-        return 0;
-    return NextVector++;
+    for (;;)
+    {
+        long curr = NextVectorOffset.Get();
+        ulong vector = MsixVectorBase + (ulong)curr;
+        if (vector > MsixVectorLimit)
+            return 0;
+        if (NextVectorOffset.Cmpxchg(curr + 1, curr) == curr)
+            return (u8)vector;
+    }
 }
 
 void MsixTable::DisableLegacyIntx(Pci::DeviceInfo* dev)
@@ -244,7 +262,9 @@ u8 MsixTable::EnableVector(u16 index, InterruptHandler& handler)
         DisableLegacyIntx(Dev);
         auto& pci = Pci::GetInstance();
         u16 mc = pci.ReadWord(Dev->Bus, Dev->Slot, Dev->Func, (u16)(CapOffset + 2));
-        mc = (u16)(mc | MsixControlEnable);
+        /* Clear Function Mask too: firmware may have left it set, which
+           would keep every vector masked after enable */
+        mc = (u16)((mc | MsixControlEnable) & ~MsixControlFuncMask);
         pci.WriteWord(Dev->Bus, Dev->Slot, Dev->Func, (u16)(CapOffset + 2), mc);
         PciMsixEnabled = true;
     }

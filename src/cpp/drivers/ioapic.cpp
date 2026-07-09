@@ -63,8 +63,10 @@ void IoApic::Enable()
 
 void IoApic::SetEntry(u8 index, u64 data)
 {
-    WriteRegister(RedTbl + 2 * index, (u32)data);
+    /* High (destination) first: writing the low half first can briefly
+       unmask the entry with a stale destination */
     WriteRegister(RedTbl + 2 * index + 1, (u32)(data >> 32));
+    WriteRegister(RedTbl + 2 * index, (u32)data);
 }
 
 void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)

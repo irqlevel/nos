@@ -2,6 +2,7 @@
 
 #include <include/types.h>
 #include <drivers/pci.h>
+#include <kernel/atomic.h>
 #include <kernel/interrupt.h>
 #include <kernel/spin_lock.h>
 
@@ -58,7 +59,9 @@ private:
        stale control value. Not taken from IRQ context. */
     SpinLock EntryLock;
 
-    static u8 NextVector;
+    /* Count of vectors handed out (vector = MsixVectorBase + offset);
+       atomic so concurrent device init can't double-allocate */
+    static Atomic NextVectorOffset;
 };
 
 }

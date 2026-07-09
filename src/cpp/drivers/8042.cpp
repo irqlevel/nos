@@ -49,8 +49,12 @@ void IO8042::ReadData()
 {
     Stdlib::AutoLock lock(Lock);
 
-    while (Inb(StatusPort) & 0x1)
+    /* Bounded drain: a stuck status bit must not hang the boot or the ISR */
+    for (size_t i = 0; i < MaxDrainIterations; i++)
     {
+        if (!(Inb(StatusPort) & 0x1))
+            break;
+
         if (!Buf.Put(Inb(DataPort)))
         {
             Trace(0, "Kbd: can't put new code");
@@ -106,18 +110,19 @@ void IO8042::OnTick(TimerCallback& callback)
     while (!Buf.IsEmpty())
     {
         static char map[0x80] = "__1234567890-=_" "\tqwertyuiop[]\n" "_asdfghjkl;'`" "_\\zxcvbnm,./_" "*_ _";
+        static char shiftMap[0x80] = "__!@#$%^&*()_+_" "\tQWERTYUIOP{}\n" "_ASDFGHJKL:\"~" "_|ZXCVBNM<>?_" "*_ _";
         u8 code = Buf.Get();
 
         Trace(KbdLL, "Kbd: code 0x%p", (ulong)code);
 
-        if (code == 0x2a || code == 0x36) Mod = 0x20;
-        else if (code == 0xaa || code == 0xb6) Mod = 0x00;
+        if (code == 0x2a || code == 0x36) Mod = 1;
+        else if (code == 0xaa || code == 0xb6) Mod = 0;
         else if (code & 0x80) continue;
         else
         {
             BugOn(code >= Stdlib::ArraySize(map));
 
-            char c = map[code] ^ Mod;
+            char c = Mod ? shiftMap[code] : map[code];
 
             Trace(KbdLL, "Kbd: char %c", c);
 

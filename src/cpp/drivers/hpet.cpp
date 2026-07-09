@@ -76,6 +76,15 @@ bool Hpet::Setup()
     Trace(0, "HPET: phys 0x%p va 0x%p period %u fs freq %u Hz timers %u",
         basePhys, va, (ulong)PeriodFs, FreqHz_, numTimers);
 
+    /* Timer 0 must support periodic mode: the TYPE_CNF bit is ignored
+       otherwise, the timer fires once and the system tick stops */
+    if (!(ReadReg(RegTimer0Cfg) & TimerPerIntCap))
+    {
+        Trace(0, "HPET: timer 0 has no periodic mode, using PIT");
+        Mmio = nullptr;
+        return false;
+    }
+
     /* Disable counter while we configure */
     u64 conf = ReadReg(RegGenConf);
     conf &= ~ConfEnableCnf;

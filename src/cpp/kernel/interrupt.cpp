@@ -123,7 +123,9 @@ void Interrupt::SharedDispatch(Context* ctx)
     for (ulong v = 0; v < MaxVectors; v++)
     {
         VectorEntry& ve = Vectors[v];
-        if (ve.HandlerCount > 1)
+        /* Only dispatch the vector that is actually in service; handlers
+           of unrelated shared vectors must not see phantom interrupts */
+        if (ve.HandlerCount > 1 && Lapic::CheckIsr((u8)v))
         {
             for (u8 i = 0; i < ve.HandlerCount; i++)
             {

@@ -26,6 +26,8 @@ struct VirtqAvail
     u16 Idx;
     u16 Ring[];
     /* Followed by: u16 UsedEvent (if VIRTIO_F_EVENT_IDX) */
+
+    static const u16 FlagNoInterrupt = 1; /* VIRTQ_AVAIL_F_NO_INTERRUPT */
 };
 
 struct VirtqUsedElem
@@ -71,6 +73,10 @@ public:
     ulong GetDescPhys();
     ulong GetAvailPhys();
     ulong GetUsedPhys();
+
+    /* Ask the device not to send completion interrupts (polling drivers).
+       Advisory per the virtio spec, but honored by QEMU. */
+    void DisableDeviceInterrupts();
 
     /* Check if there are used buffers to process. */
     bool HasUsed();

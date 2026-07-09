@@ -25,7 +25,17 @@ void RawRwSpinLock::ReadLock()
 
         long v = Value.Get();
         if (v >= 0 && Value.Cmpxchg(v + 1, v) == v)
+        {
+            /* A writer may have started waiting between the check above
+               and the cmpxchg; back out so it isn't starved */
+            if (WriterWaiting.Get() != 0)
+            {
+                Value.Dec();
+                Pause();
+                continue;
+            }
             break;
+        }
 
         Pause();
     }

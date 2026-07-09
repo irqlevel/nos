@@ -147,6 +147,11 @@ ulong CpuTable::GetBspIndexLockHeld()
     return BspIndex;
 }
 
+ulong CpuTable::GetBspIndexNoLock()
+{
+    return (ulong)BspIndexCached.Get();
+}
+
 bool CpuTable::SetBspIndex(ulong index)
 {
     Stdlib::AutoLock lock(Lock);
@@ -160,6 +165,7 @@ bool CpuTable::SetBspIndex(ulong index)
 
     cpu.SetRunning();
     BspIndex = index;
+    BspIndexCached.Set((long)index);
     return true;
 }
 
@@ -483,7 +489,8 @@ void Cpu::IPI(Context* ctx)
 
     Watchdog::GetInstance().Check();
 
-    if (Index == 0)
+    /* Index is the LAPIC APIC ID; the BSP's is not necessarily 0 */
+    if (Index == CpuTable::GetInstance().GetBspIndexNoLock())
     {
         TimerTable::GetInstance().ProcessTimers();
     }

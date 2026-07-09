@@ -22,6 +22,10 @@ TimerTable::~TimerTable()
 
 bool TimerTable::StartTimer(TimerCallback& callback, Stdlib::Time period)
 {
+    /* A zero period would re-fire the callback on every tick */
+    if (period.GetValue() == 0)
+        return false;
+
     ulong flags = Lock.LockIrqSave();
     for (size_t i = 0; i < Stdlib::ArraySize(Timer); i++)
     {
@@ -89,7 +93,9 @@ void TimerTable::ProcessTimers()
             continue;
         }
 
-        timer.Expired += timer.Period;
+        /* Skip missed ticks: += Period after a long delay would fire
+           the callback on every tick until it catches up */
+        timer.Expired = now + timer.Period;
         timer.Running = callback;
         timer.RunningCpu = CpuTable::GetInstance().GetCurrentCpuId();
         Lock.UnlockIrqRestore(flags);
