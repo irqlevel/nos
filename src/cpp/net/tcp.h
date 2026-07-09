@@ -36,7 +36,9 @@ static const u16   TcpOurMss           = 1460;
 static const ulong TcpInitialRtoMs     = 1000;
 static const ulong TcpMaxRtoMs         = 8000;
 static const ulong TcpMaxRetransmits   = 8;
-static const ulong TcpTimeWaitMs       = 2000;
+/* Linux-style 60 s stand-in for 2*MSL: an old-incarnation segment must
+   not be matched by a new connection reusing the 4-tuple */
+static const ulong TcpTimeWaitMs       = 60000;
 static const ulong TcpFinWait2TimeoutMs = 60000;
 static const ulong TcpConnectTimeoutMs = 5000;
 static const u8    TcpDefaultTtl       = 64;
@@ -223,6 +225,11 @@ public:
 
     /* Called from VirtioNet::ProcessRx for IpProtoTcp */
     void Process(NetDevice* dev, const u8* frame, ulong frameLen);
+
+    /* Called by Icmp for a hard Destination Unreachable (protocol/port)
+       quoting a TCP segment we sent -- aborts the matching connection */
+    void OnIcmpUnreachable(u32 localIp, u16 localPort,
+                           u32 remoteIp, u16 remotePort);
 
     /* Called from TypeTcpTimer SoftIrq handler -- retransmits + cleanup */
     void ProcessRetransmits();

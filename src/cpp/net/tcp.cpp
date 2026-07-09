@@ -443,7 +443,10 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
             /* In SYN-SENT the RST is only valid if it acks our SYN. */
             acceptable = (flags & TcpFlagAck) && ack == conn->SndNxt;
         else
-            acceptable = (seq == conn->RcvNxt);
+            /* RFC 793 in-window check (seq == RcvNxt also covers a
+               zero receive window) */
+            acceptable = (seq == conn->RcvNxt) ||
+                ((u32)(seq - conn->RcvNxt) < conn->RcvWnd);
 
         if (!acceptable)
             return;
@@ -512,6 +515,22 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     }
     case TcpStateEstablished:
     {
+        /* RFC 793: an in-window SYN in ESTABLISHED is an error -- reset.
+           (A retransmitted handshake SYN sits below the window and is
+           ignored here.) */
+        if ((flags & TcpFlagSyn) &&
+            ((seq == conn->RcvNxt) || ((u32)(seq - conn->RcvNxt) < conn->RcvWnd)))
+        {
+            SendRst(conn->Dev, conn->ResolvedMac,
+                    conn->LocalIp, conn->RemoteIp,
+                    conn->LocalPort, conn->RemotePort,
+                    conn->SndNxt, 0);
+            conn->State = TcpStateClosed;
+            conn->ConnReady.Set(1);
+            conn->DataReady.Set(1);
+            break;
+        }
+
         /* ACK processing */
         if (flags & TcpFlagAck)
             ProcessAck(conn, ack, wnd, now);
@@ -610,6 +629,14 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
                 conn->TimeWaitDeadlineMs = GetBootTimeMs() + TcpTimeWaitMs;
             }
         }
+
+        /* Retransmitted FIN (our ACK was lost) -- re-ACK */
+        if (flags & TcpFlagFin)
+        {
+            u32 savedNxt = conn->SndNxt;
+            SendSegment(conn, TcpFlagAck, nullptr, 0);
+            conn->SndNxt = savedNxt;
+        }
         break;
     }
     case TcpStateLastAck:
@@ -630,6 +657,14 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
         /* ACK processing for any pending data */
         if (flags & TcpFlagAck)
             ProcessAck(conn, ack, wnd, now);
+
+        /* Retransmitted FIN (our ACK was lost) -- re-ACK */
+        if (flags & TcpFlagFin)
+        {
+            u32 savedNxt = conn->SndNxt;
+            SendSegment(conn, TcpFlagAck, nullptr, 0);
+            conn->SndNxt = savedNxt;
+        }
         break;
     }
     case TcpStateTimeWait:
@@ -783,6 +818,8 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
         u32 rstAck = Ntohl(tcp->SeqNum) + payloadLen;
         if (tcp->Flags & TcpFlagSyn)
             rstAck++;
+        if (tcp->Flags & TcpFlagFin)
+            rstAck++; /* FIN occupies a sequence number too */
         if (tcp->Flags & TcpFlagAck)
             rstSeq = Ntohl(tcp->AckNum);
 
@@ -790,6 +827,28 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
                 IpAddress(localIp), IpAddress(remoteIp),
                 localPort, remotePort, rstSeq, rstAck);
     }
+}
+
+void Tcp::OnIcmpUnreachable(u32 localIp, u16 localPort,
+                            u32 remoteIp, u16 remotePort)
+{
+    if (!Initialized)
+        return;
+
+    PoolLock.Lock();
+    TcpConn* conn = LookupLocked(localIp, localPort, remoteIp, remotePort);
+    PoolLock.Unlock();
+    if (!conn)
+        return;
+
+    Trace(0, "Tcp: ICMP unreachable, conn %u -> %u aborted",
+          (ulong)localPort, (ulong)remotePort);
+    conn->State = TcpStateClosed;
+    conn->RetransmitDeadlineMs = 0;
+    conn->NeedCleanup = true;
+    conn->ConnReady.Set(1);
+    conn->DataReady.Set(1);
+    conn->Lock.Unlock();
 }
 
 /* --- User-facing API --- */
@@ -821,6 +880,21 @@ TcpConn* Tcp::Connect(NetDevice* dev, IpAddress dstIp, u16 dstPort, u16 srcPort)
             PoolLock.Unlock();
             PortMutex.Unlock();
             Trace(0, "Tcp: no ephemeral ports available");
+            return nullptr;
+        }
+    }
+    else
+    {
+        /* Caller-supplied port: two conns with the same 4-tuple would
+           steal each other's segments */
+        TcpConn* dup = LookupLocked(dev->GetIp().Addr4, srcPort,
+                                    dstIp.Addr4, dstPort);
+        if (dup)
+        {
+            dup->Lock.Unlock();
+            PoolLock.Unlock();
+            PortMutex.Unlock();
+            Trace(0, "Tcp: 4-tuple already in use, port %u", (ulong)srcPort);
             return nullptr;
         }
     }
@@ -890,6 +964,19 @@ TcpConn* Tcp::Listen(NetDevice* dev, u16 port)
         return nullptr;
 
     PoolLock.Lock();
+
+    /* A second listener on the same port would never receive anything
+       (FindListenerLocked returns the first match) */
+    for (ulong i = 0; i < TcpMaxConnections; i++)
+    {
+        if (Pool[i].State == TcpStateListen && Pool[i].LocalPort == port)
+        {
+            PoolLock.Unlock();
+            Trace(0, "Tcp: listener on port %u already exists", (ulong)port);
+            return nullptr;
+        }
+    }
+
     TcpConn* conn = AllocConn();
     if (!conn)
     {

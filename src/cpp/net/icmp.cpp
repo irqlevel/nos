@@ -1,6 +1,7 @@
 #include "icmp.h"
 #include "net.h"
 #include "arp.h"
+#include "tcp.h"
 
 #include <kernel/trace.h>
 #include <kernel/time.h>
@@ -150,6 +151,35 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         Reply.Id = Ntohs(icmp->Id);
         Reply.Seq = Ntohs(icmp->Seq);
         Reply.Timestamp = GetBootTime();
+    }
+    else if (icmp->Type == TypeDestUnreach)
+    {
+        RxOther.Inc();
+
+        /* Hard errors (protocol/port unreachable) abort the quoted TCP
+           connection instead of leaving it to retransmit into a void */
+        if (icmp->Code != CodeProtoUnreach && icmp->Code != CodePortUnreach)
+            return;
+
+        /* Payload: original IP header + first 8 bytes of its datagram */
+        if (icmpLen < sizeof(IcmpHdr) + sizeof(IpHdr) + 8)
+            return;
+
+        const IpHdr* origIp = (const IpHdr*)((const u8*)icmp + sizeof(IcmpHdr));
+        ulong origIpHdrLen = Net::IpHeaderLen(origIp);
+        if (origIpHdrLen == 0 ||
+            icmpLen < sizeof(IcmpHdr) + origIpHdrLen + 8 ||
+            origIp->Protocol != Net::IpProtoTcp)
+            return;
+
+        /* The quoted segment is one we sent: src is our side */
+        const u8* origTcp = (const u8*)origIp + origIpHdrLen;
+        u16 srcPort = (u16)(((u16)origTcp[0] << 8) | origTcp[1]);
+        u16 dstPort = (u16)(((u16)origTcp[2] << 8) | origTcp[3]);
+
+        Tcp::GetInstance().OnIcmpUnreachable(
+            Ntohl(origIp->SrcAddr), srcPort,
+            Ntohl(origIp->DstAddr), dstPort);
     }
     else
     {

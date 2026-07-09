@@ -209,11 +209,40 @@ bool Vfs::ResolvePath(const char* path, FileSystem*& fs, VNode*& node,
         }
         component[i] = '\0';
 
+        // A component that doesn't fit is an error, not two components
+        if (*p != '\0' && *p != '/')
+        {
+            Trace(0, "Vfs::ResolvePath: component too long in %s", path);
+            return false;
+        }
+
         if (*p == '/')
             p++;
 
         if (i == 0)
             continue;
+
+        // "." and ".." are not stored as children; resolve them here
+        if (component[0] == '.' && component[1] == '\0')
+        {
+            if (*p == '\0')
+            {
+                node = cur;
+                return true;
+            }
+            continue;
+        }
+        if (component[0] == '.' && component[1] == '.' && component[2] == '\0')
+        {
+            if (cur->Parent != nullptr)
+                cur = cur->Parent; // the mount root stays put
+            if (*p == '\0')
+            {
+                node = cur;
+                return true;
+            }
+            continue;
+        }
 
         // If there are more components, this must be a directory
         if (*p != '\0')

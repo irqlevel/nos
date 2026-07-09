@@ -291,13 +291,18 @@ bool Ext2Fs::ReadInode(u32 inodeNum, Ext2Inode* out)
 
 /* --- Block mapping --- */
 
-u32 Ext2Fs::GetBlockNum(Ext2Inode* inode, u32 logicalBlock)
+/* Returns false on error (I/O failure, unsupported triple indirect);
+   on success physBlock == 0 means a sparse hole. */
+bool Ext2Fs::GetBlockNum(Ext2Inode* inode, u32 logicalBlock, u32& physBlock)
 {
     u32 ptrsPerBlock = BlockSize / sizeof(u32);
 
     /* Direct blocks (0..11) */
     if (logicalBlock < Ext2DirectBlocks)
-        return inode->Block[logicalBlock];
+    {
+        physBlock = inode->Block[logicalBlock];
+        return true;
+    }
 
     logicalBlock -= Ext2DirectBlocks;
 
@@ -306,13 +311,17 @@ u32 Ext2Fs::GetBlockNum(Ext2Inode* inode, u32 logicalBlock)
     {
         u32 indBlock = inode->Block[Ext2IndirectBlock];
         if (indBlock == 0)
-            return 0;
+        {
+            physBlock = 0;
+            return true;
+        }
 
         if (!ReadBlock(indBlock, TmpBlock))
-            return 0;
+            return false;
 
         u32* ptrs = reinterpret_cast<u32*>(TmpBlock);
-        return ptrs[logicalBlock];
+        physBlock = ptrs[logicalBlock];
+        return true;
     }
 
     logicalBlock -= ptrsPerBlock;
@@ -322,10 +331,13 @@ u32 Ext2Fs::GetBlockNum(Ext2Inode* inode, u32 logicalBlock)
     {
         u32 dindBlock = inode->Block[Ext2DIndirectBlock];
         if (dindBlock == 0)
-            return 0;
+        {
+            physBlock = 0;
+            return true;
+        }
 
         if (!ReadBlock(dindBlock, TmpBlock))
-            return 0;
+            return false;
 
         u32* l1 = reinterpret_cast<u32*>(TmpBlock);
         u32 l1Index = logicalBlock / ptrsPerBlock;
@@ -333,17 +345,22 @@ u32 Ext2Fs::GetBlockNum(Ext2Inode* inode, u32 logicalBlock)
 
         u32 indBlock = l1[l1Index];
         if (indBlock == 0)
-            return 0;
+        {
+            physBlock = 0;
+            return true;
+        }
 
         if (!ReadBlock(indBlock, TmpBlock))
-            return 0;
+            return false;
 
         u32* l2 = reinterpret_cast<u32*>(TmpBlock);
-        return l2[l2Index];
+        physBlock = l2[l2Index];
+        return true;
     }
 
+    /* Failing beats silently returning zeros for the block's data */
     Trace(0, "Ext2Fs::GetBlockNum: triple indirect not supported");
-    return 0;
+    return false;
 }
 
 /* --- Data read --- */
@@ -374,7 +391,13 @@ bool Ext2Fs::ReadInodeData(Ext2Inode* inode, void* buf, ulong len, ulong offset)
 
     while (bytesRead < len)
     {
-        u32 physBlock = GetBlockNum(inode, blockIdx);
+        u32 physBlock;
+        if (!GetBlockNum(inode, blockIdx, physBlock))
+        {
+            Trace(0, "Ext2Fs::ReadInodeData: block %u unmappable", (ulong)blockIdx);
+            Mm::Free(readBuf);
+            return false;
+        }
         if (physBlock == 0)
         {
             /* Sparse block — fill with zeros */
@@ -535,6 +558,15 @@ VNode* Ext2Fs::LoadDir(u32 inodeNum, u32 depth)
                 skip = true;
             if (de->NameLen == 2 && de->Name[0] == '.' && de->Name[1] == '.')
                 skip = true;
+
+            /* A truncated name would collide with other long names in
+               Lookup; skip the entry instead of silently truncating */
+            if (!skip && de->NameLen >= sizeof(VNode::Name))
+            {
+                Trace(0, "Ext2Fs::LoadDir: name too long (%u) in inode %u, skipped",
+                      (ulong)de->NameLen, (ulong)inodeNum);
+                skip = true;
+            }
 
             if (!skip)
             {
