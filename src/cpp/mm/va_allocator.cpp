@@ -99,7 +99,10 @@ void VaAllocator::Free(ulong va)
     BugOn((va - VaStart) % BlockSize != 0);
 
     ulong blockIndex = (va - VaStart) / BlockSize;
-    Stdlib::Bitmap(BitmapPtr, BlockCount).ClearBit(blockIndex);
+    Stdlib::Bitmap bitmap(BitmapPtr, BlockCount);
+    /* Double-free: the same VA would be handed out to two callers */
+    BugOn(!bitmap.TestBit(blockIndex));
+    bitmap.ClearBit(blockIndex);
 }
 
 bool VaAllocator::Contains(ulong va)

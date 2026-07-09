@@ -36,6 +36,16 @@ void Bitmap::ClearBit(ulong bitNum)
     *((ulong *)Addr + offset) &= ~(1UL << shift);    
 }
 
+bool Bitmap::TestBit(ulong bitNum)
+{
+    BugOn(bitNum >= BitCount);
+
+    ulong offset = bitNum / (8 * sizeof(ulong));
+    ulong shift = bitNum % (8 * sizeof(ulong));
+
+    return (*((ulong *)Addr + offset) & (1UL << shift)) ? true : false;
+}
+
 long Bitmap::FindSetZeroBit()
 {
     ulong* curr = (ulong*)Addr;

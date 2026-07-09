@@ -99,7 +99,7 @@ int StrnCmp(const char *s1, const char *s2, size_t size)
 
     for (i = 0; i < size; i++)
     {
-        const char c1 = *s1, c2 = *s2;
+        const unsigned char c1 = (unsigned char)*s1, c2 = (unsigned char)*s2;
 
         if (c1 < c2)
             return -1;
@@ -207,11 +207,15 @@ bool ParseUlong(const char* s, ulong& result)
     if (!s || *s == '\0')
         return false;
 
+    const ulong maxValue = (ulong)-1;
     while (*s)
     {
         if (*s < '0' || *s > '9')
             return false;
-        result = result * 10 + (*s - '0');
+        ulong digit = (ulong)(*s - '0');
+        if (result > (maxValue - digit) / 10)
+            return false;
+        result = result * 10 + digit;
         s++;
     }
     return true;

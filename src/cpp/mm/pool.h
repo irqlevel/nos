@@ -41,6 +41,9 @@ private:
         ulong Tag;
     };
 
+    /* Tag stamped on freed blocks to detect double-free */
+    static const ulong FreedTag = 0xF7EEF7EEF7EEF7EEUL;
+
     size_t BlockSize;
     ListEntry FreePageList;
     ListEntry PageList;
