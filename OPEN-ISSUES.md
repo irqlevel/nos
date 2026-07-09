@@ -69,82 +69,93 @@ Review of each component, focusing on correctness bugs (medium depth). Each find
 
 ## Medium
 
-### 3. [ ] TimerTable: cross-CPU data race (UAF latent, not currently reachable) — MEDIUM (downgraded from HIGH)
+### 3. [x] TimerTable: cross-CPU data race (UAF latent, not currently reachable) — MEDIUM (downgraded from HIGH) (fixed in d57f74e)
 - **Files**: `src/cpp/kernel/timer.cpp` (whole file); call site `src/cpp/kernel/cpu.cpp:486-488`; callers `src/cpp/net/tcp.cpp:79`, `src/cpp/drivers/8042.cpp:40`, `src/cpp/kernel/rust_ffi.cpp:842/865`.
 - **Summary**: `StartTimer`/`StopTimer`/`ProcessTimers` have **zero synchronization** (no lock, no IRQ disable, no atomics). `ProcessTimers()` runs in hard-IPI context on CPU 0 (`Cpu::IPI` → `cpu.cpp:488`), while `StartTimer`/`StopTimer` run in task context on any CPU. Plain data race on every field of `Timer[i]` (e.g. the `Expired += Period` RMW at `timer.cpp:61` races concurrent `StartTimer`/`StopTimer` writes); a handler can fire after `StopTimer` returns.
 - **Verified (2026-07-08)**: downgraded from HIGH. The data race is real, but the originally-claimed use-after-free is **not reachable with current callers**: all three `TimerCallback` implementers are never freed (`Tcp` and `IO8042` are never-stopped singletons; `RustTimerAdapter` lives in a static buffer and re-checks its `Handler` under `RustTimerLock` with a null guard, `rust_ffi.cpp:795-804`). Any future heap-allocated callback freed after `StopTimer` becomes a genuine UAF, since `StopTimer` does not synchronize with an in-flight `ProcessTimers`.
 - **Fix**: a lock (or IRQ-disable + seqlock) around timer array mutation; ensure `StopTimer` synchronizes with any in-flight `ProcessTimers`.
+- **Fixed (2026-07-09)**: the timer array is now guarded by a `RawSpinLock` (IRQ-save) in `StartTimer`/`StopTimer`/`ProcessTimers`; callbacks run outside the lock with a per-slot `Running`/`RunningCpu` marker, and `StopTimer` spin-waits for an in-flight callback on another CPU before returning (skipping the wait when called from inside the callback itself).
 
-### 6. [ ] TCP FIN-WAIT-1 / FIN-WAIT-2 drop all incoming data
+### 6. [x] TCP FIN-WAIT-1 / FIN-WAIT-2 drop all incoming data (fixed in 5e37ea5)
 - **File**: `src/cpp/net/tcp.cpp:529-583`.
 - **Summary**: Neither state has a payload-processing branch; only ACK/FIN are handled. Any data the peer sends after our local `Close()` is silently discarded and never ACKed (RFC 793 half-close violation).
 - **Scenario**: Local side closes before the peer finishes sending; peer's data segments are dropped, peer retransmits until RST. (Does not affect the in-tree HTTP client, which recvs to EOF before close.)
 - **Fix**: add a `payloadLen > 0 && seq == RcvNxt` branch that writes to `RecvBuf` and ACKs, as in the `Established` case.
 - **Verified (2026-07-08)**: CONFIRMED. Neither state has a `payloadLen > 0` branch; a pure-data segment isn't even ACKed (only a FIN triggers `SendSegment` at `:546/:576`).
+- **Fixed (2026-07-09)**: FIN-WAIT-1/2 deliver in-order payload to `RecvBuf` and ACK it via the new shared `ProcessPayload` helper (also used by Established).
 
-### 7. [ ] TCP FIN-WAIT-1 / FIN-WAIT-2 / CLOSING compute `RcvNxt` wrong on FIN+data
+### 7. [x] TCP FIN-WAIT-1 / FIN-WAIT-2 / CLOSING compute `RcvNxt` wrong on FIN+data (fixed in 5e37ea5)
 - **File**: `src/cpp/net/tcp.cpp:543, 573`.
 - **Summary**: When a segment carries both data and FIN, `RcvNxt = seq + 1` rather than `seq + payloadLen + 1`.
 - **Scenario**: The ACK we send back mis-states next-expected sequence number, causing retransmit loops / desync. Compounds #6.
 - **Fix**: `conn->RcvNxt = seq + (u32)payloadLen + 1`.
 - **Verified (2026-07-08)**: CONFIRMED at `:543/:573`. Nit: the CLOSING case (`:584-596`) never assigns `RcvNxt` itself — it is reached via FIN-WAIT-1's already-buggy `:543`, so the two cited lines are the actual defects.
+- **Fixed (2026-07-09)**: the FIN branches in FIN-WAIT-1/2 now require the FIN in-order (`seq + payloadLen == RcvNxt`) and set `RcvNxt = seq + payloadLen + 1`; CLOSING inherits the fix via FIN-WAIT-1.
 
-### 8. [ ] TCP: no receive-window update ACK after app drains `RecvBuf`
+### 8. [x] TCP: no receive-window update ACK after app drains `RecvBuf` (fixed in 5e37ea5)
 - **Files**: `src/cpp/net/tcp.cpp:1009-1045` (`Recv`), `:489-527` (`Established`).
 - **Summary**: `RcvWnd` is refreshed inside `Recv` and advertised only on data-path ACKs; there is no path that sends an unsolicited window-update ACK when the buffer is drained.
 - **Scenario**: We advertise a near-zero window, the app reads everything out, but the peer is never told the window reopened. Throughput collapses to one byte per zero-window probe interval.
 - **Fix**: send a window-update ACK when the window grows by ≥1 MSS or to half the buffer.
 - **Verified (2026-07-08)**: CONFIRMED. `Recv` refreshes `RcvWnd` at `:1024` but never sends; the window is only advertised on reactive segments (`SendSegment`, `:258`), and `ProcessRetransmits` sends no updates either.
+- **Fixed (2026-07-09)**: `SendSegment` records `AdvertisedWnd`; `Recv` sends an unsolicited window-update ACK when the last advertised window was < 1 MSS and draining reopened it to >= 1 MSS (Established/FIN-WAIT-1/FIN-WAIT-2).
 
-### 9. [ ] kvmclock enabled only on the BSP; APs read the BSP's pvclock page
+### 9. [x] kvmclock enabled only on the BSP; APs read the BSP's pvclock page (fixed in d57f74e)
 - **Files**: `src/cpp/kernel/tsc.cpp:149-213` (`SetupKvmClock`, `KvmClockTime`), `src/cpp/kernel/tsc.h:26-28` (singleton), `src/cpp/kernel/main.cpp:504` (`TimeInit` only in `BpStartup`).
 - **Summary**: `Tsc` is a singleton; `SetupKvmClock` writes `MSR_KVM_SYSTEM_TIME` once on the BSP and stores one shared `PvClock` page. APs (`ApMain2`) never write the MSR, yet `Tsc::GetTime()` returns `KvmClockTime()` on every CPU whenever `KvmClockAvail` is set. APs compute `AP_ReadTsc() − BSP_TscTimestamp` against a page KVM updates only for the BSP vcpu.
 - **Scenario**: AP time queries (`GetBootTime` via `Sleep`, runtime accounting) can drift or jump; correctness relies on TSCs being perfectly synchronized across vcpus (not guaranteed by KVM).
 - **Fix**: each AP needs its own pvclock page + MSR write (per-vcpu pvclock).
 - **Verified (2026-07-08)**: CONFIRMED. `TimeInit` is called only from `BpStartup` (`main.cpp:504`); `ApMain2`/`ApStartup` never write the MSR, yet `GetTime()` (`tsc.cpp:215-224`) uses the shared pvclock page on every CPU.
+- **Fixed (2026-07-09)**: the pvclock page now holds one 32-byte entry per APIC id; `EnableKvmClockSelf()` writes `MSR_KVM_SYSTEM_TIME` for the calling CPU (BSP in `SetupKvmClock`, APs in `ApMain2` right after `Lapic::Enable`), and `KvmClockTime` reads the current CPU's entry. A never-armed entry yields 0, which `GetBootTime` treats as fall-back-to-HPET/PIT.
 
-### 10. [ ] lib: `TokenCopy` underflow when `dstSize == 0`
+### 10. [x] lib: `TokenCopy` underflow when `dstSize == 0` (fixed in 3dd96d7)
 - **File**: `src/cpp/lib/stdlib.cpp:252-260`.
 - **Summary**: No guard for `dstSize == 0`. `len = dstSize - 1` underflows to `ULONG_MAX`, then `MemCpy` overrun + OOB write at `dst[ULONG_MAX]`.
 - **Scenario**: Any caller that computes buffer size dynamically and passes 0.
 - **Fix**: early `return 0;` when `dstSize == 0`.
 - **Verified (2026-07-08)**: CONFIRMED, latent: every current caller (cmd.cpp, test.cpp) passes `sizeof(fixedArray)` — none can pass 0 today.
+- **Fixed (2026-07-09)**: early `return 0` when `dstSize == 0`.
 
-### 11. [ ] lib: `Vector::ReserveAndUse` sets `Size = Capacity` instead of `Size = capacity`
+### 11. [x] lib: `Vector::ReserveAndUse` sets `Size = Capacity` instead of `Size = capacity` (fixed in 3dd96d7)
 - **File**: `src/cpp/lib/vector.h:59-65`.
 - **Summary**: `Reserve(capacity)` only allocates when `capacity > Capacity`; if the vector already has `Capacity > capacity`, `Reserve` returns true without changing `Capacity`, and `Size = Capacity` exposes stale/uninitialized elements at `[capacity..Capacity)`.
 - **Scenario**: `ReserveAndUse(10)` on a vector with `Capacity == 20` sets `Size = 20`, exposing 10 stale elements.
 - **Fix**: `Size = capacity`.
 - **Verified (2026-07-08)**: CONFIRMED, latent: all three callers (test.cpp) invoke it on freshly-constructed vectors (`Capacity == 0`), so the stale-exposure path is currently unreachable.
+- **Fixed (2026-07-09)**: `Size = capacity`.
 
-### 12. [ ] NVMe `Drop`: hardcoded 100ms disable timeout
+### 12. [x] NVMe `Drop`: hardcoded 100ms disable timeout (fixed in 3dd96d7)
 - **File**: `src/rust/drivers/nvme/src/lib.rs:97`.
 - **Summary**: Shutdown uses `wait_csts_clear(&self.regs, CSTS_RDY, 100)` instead of the controller-reported `to_ms` (up to ~127s; `MIN_TIMEOUT_MS = 5000`) used during init.
 - **Scenario**: If the controller takes >100ms to clear CSTS.RDY, the driver frees queue DMA buffers while the controller may still be fetching/posting entries → DMA into freed memory.
 - **Fix**: use `to_ms` (capped at `MIN_TIMEOUT_MS`) as in init.
 - **Verified (2026-07-08)**: CONFIRMED. Correction: `MIN_TIMEOUT_MS` is a floor applied when `CAP.TO == 0`, not a cap — init's effective timeout can be up to ~127 s, making the 100 ms Drop value even more of an outlier. Drop disarms MSI-X then implicitly frees queue DMA on scope exit.
+- **Fixed (2026-07-09)**: `NvmeDevice` stores the CAP.TO-derived init timeout (`disable_timeout_ms`) and `Drop` uses it instead of the hardcoded 100 ms.
 
-### 13. [ ] NanoFs: `Write`/`RemoveRecursive` trust on-disk `Size` without clamp
+### 13. [x] NanoFs: `Write`/`RemoveRecursive` trust on-disk `Size` without clamp (fixed in 315329f)
 - **Files**: `src/cpp/fs/nanofs.cpp:960-966` (truncate path), `:1050-1052` (overwrite path), `:1210-1214` (`RemoveRecursive`).
 - **Summary**: `blockCount = (inode->Size + NanoBlockSize - 1) / NanoBlockSize` is computed from the just-read on-disk inode and `Blocks[i]` iterated up to `blockCount` with no clamp to `NanoMaxBlocks` (256). A corrupted/crafted inode with `Size > NanoMaxFileSize` makes `blockCount > 256`, walking past `Blocks[256]` into `Padding` and calling `FreeDataBlock` on garbage → arbitrary data-bitmap corruption.
 - **Caveat**: the missing clamp is confirmed; whether `ReadInode` validates the checksum first was not verified. If it does, the exploit requires a forged-but-valid checksum. Either way the clamp is a real defense-in-depth gap.
 - **Fix**: clamp `blockCount` to `NanoMaxBlocks` and verify the inode checksum before trusting `Size`/`Blocks`.
 - **Verified (2026-07-08)**: CONFIRMED, and the open caveat is resolved: `ReadInode` does **not** verify the checksum, and neither `Write` nor `RemoveRecursive` calls `VerifyInodeChecksum` afterward — no forged CRC is needed. `FreeDataBlock` does clamp `idx >= NanoDataBlockCount`, so only in-range garbage corrupts the bitmap, but the OOB `Blocks[]`/`Padding` walk stands.
+- **Fixed (2026-07-09)**: `Write` and `RemoveRecursive` verify the inode checksum before trusting `Size`/`Blocks` (`Write` fails; `RemoveRecursive` skips block freeing, leaking rather than corrupting), and `RemoveRecursive` clamps `blockCount` to `NanoMaxBlocks` (the `Write` clamp landed with #5).
 
-### 14. [ ] NanoFs: `Write` never flushes
+### 14. [x] NanoFs: `Write` never flushes (fixed in 315329f)
 - **File**: `src/cpp/fs/nanofs.cpp:931-1072` (`Write`).
 - **Summary**: `Write` never calls `Io.Flush()`; data block writes (`:1026`) and the final `WriteInode` (`:1062`) are issued without FUA/flush, even though the bitmap (via `FlushSuper`) is persisted.
 - **Scenario**: Crash without clean unmount can lose file data + inode update despite the bitmap showing them allocated.
 - **Caveat**: no `Io.Flush()` is visible in the success path; whether `WriteInode`/`WriteBlock` internally flush/FUA was not verified.
 - **Fix**: issue a device flush (or FUA) on the data and inode writes, or at the end of `Write`.
 - **Verified (2026-07-08)**: CONFIRMED, caveat resolved: `BlockIo::WriteBlock` just forwards `fua` (default false) to `Dev->WriteSectors` with no internal flush, so data and inode writes are genuinely unflushed while the bitmap is FUA-committed.
+- **Fixed (2026-07-09)**: `Write` flushes the device write cache after the data-block writes and commits the inode with FUA (both truncate and overwrite paths), matching the already-FUA'd bitmap.
 
-### 15. [ ] ext2: division by zero on crafted superblock
+### 15. [x] ext2: division by zero on crafted superblock (fixed in 315329f)
 - **Files**: `src/cpp/fs/ext2.cpp:137` (`Mount`), `:259-260` (`ReadInode`).
 - **Summary**: `GroupCount = (BlockCount + BlocksPerGroup - 1) / BlocksPerGroup` and `group = (inodeNum - 1) / InodesPerGroup` are computed without checking that `BlocksPerGroup` / `InodesPerGroup` are non-zero.
 - **Scenario**: Mount a crafted/corrupt ext2 image with either field set to 0 → kernel division exception.
 - **Fix**: reject the image (or `goto fail`) if `BlocksPerGroup == 0` or `InodesPerGroup == 0`.
 - **Verified (2026-07-08)**: CONFIRMED. Both sites are independently triggerable (`InodesPerGroup == 0` crashes in `ReadInode(2)` during mount even if `BlocksPerGroup` is valid).
+- **Fixed (2026-07-09)**: `Mount` rejects images with `BlocksPerGroup == 0` or `InodesPerGroup == 0`.
 
 ### 16. [ ] virtio-blk shared-INTx stub unconditionally EOIs
 - **File**: `src/cpp/drivers/virtio_blk.cpp:606-616`.
@@ -152,94 +163,107 @@ Review of each component, focusing on correctness bugs (medium depth). Each find
 - **Scenario**: On legacy INTx (supported at `:186-189`) with a genuinely shared IRQ, drops another device's interrupt. Harmless under MSI-X.
 - **Fix**: only EOI if some instance claimed the interrupt; otherwise let the shared-dispatch framework handle it.
 - **Verified (2026-07-08)**: PARTIAL. The code claims are true, but the stated consequence is largely refuted: `Interrupt::RegisterLevel` chains handlers by GSI and swaps the IDT entry to `SharedInterruptStub` once a GSI has ≥2 handlers (`interrupt.cpp:91`), so the EOI-ing blk stub is only installed while virtio-blk solely owns its vector — where the EOI is correct. Genuine sharing (e.g. blk+scsi on one GSI) dispatches via `SharedDispatch`, which EOIs itself (`:137`). Theft would require a co-located device registering via the non-GSI-tracking `Interrupt::Register` path — a narrow edge case.
+- **Reviewed (2026-07-09), no code change**: the suggested fix (skip the EOI) is unsafe -- whenever the blk stub is installed it is the vector's sole IDT owner, and a LAPIC EOI is mandatory for any vector taken in service; skipping it would leave the in-service bit set and block further interrupts at that priority. Genuine sharing dispatches via `SharedDispatch` (which EOIs itself), per the verification note. Left open as a latent design wart only.
 
-### 17. [ ] virtio `SlotByHead` arrays sized to `MaxDescriptors=256`, queue size unclamped
+### 17. [x] virtio `SlotByHead` arrays sized to `MaxDescriptors=256`, queue size unclamped (fixed in 3dd96d7)
 - **Files**: `src/cpp/drivers/virtqueue.h:84` (`MaxDescriptors = 256`), `src/cpp/drivers/virtqueue.cpp:29-31` (no clamp on `queueSize`), `src/cpp/drivers/virtio_blk.h:111`, `src/cpp/drivers/virtio_net.h:141` (`SlotByHead[MaxDescriptors]`), `src/cpp/drivers/virtio_blk.cpp:373` (post-hoc bounds check), `src/cpp/drivers/virtio_scsi.cpp:475`.
 - **Summary**: Virtio queues can be up to 32768. `VirtQueue::Setup` does not clamp `queueSize` to 256. If the device reports a queue size >256, `AddBufs` returns a head ≥256; the bounds check at `virtio_blk.cpp:373` rejects it **after** the descriptors have already been consumed from the free chain and published in the avail ring. The completion path drops it too, so those descriptors are never returned → permanent descriptor leak.
 - **Scenario**: Latent under QEMU defaults (queue size 256); real for larger queue sizes.
 - **Fix**: clamp `queueSize` to `MaxDescriptors` in `Setup`, or size `SlotByHead` to the actual queue size.
 - **Verified (2026-07-08)**: PARTIAL. Structure confirmed (no clamp; bounds check after the descriptors are published), but the "permanent descriptor leak" is refuted: `GetUsed` unconditionally returns the whole chain to the free list before `CompleteIO` drops the unknown id, so descriptors are reclaimed on completion. The real bug is worse in kind: a head ≥256 request is failed and its slot freed at submit time while it is already published in the avail ring — the device will still DMA into the freed/reused buffer. Still latent under QEMU (queue size 256).
+- **Fixed (2026-07-09)**: `VirtQueue::Setup` fails for `queueSize == 0` or `> MaxDescriptors` (256), refusing the device instead of mis-driving it -- in legacy mode the size cannot be negotiated down, so clamping would desynchronize the ring layout from the device.
 
-### 47. [ ] mm: `ExcludeFreePages` permanently leaks ~1-2% of low physical RAM — MEDIUM
+### 47. [x] mm: `ExcludeFreePages` permanently leaks ~1-2% of low physical RAM — MEDIUM (fixed in d57f74e)
 - **File**: `src/cpp/mm/page_table.cpp:414-433` (function), `:448` (call), `:507-524` (`SetupFreePagesList`).
 - **Summary**: `ExcludeFreePages(VirtToPhys(pageArrayLimit))` (`:448`) unlinks **every** free page whose physical address is below `pageArrayLimit` (the end of the `PageArray`) from the early singly-linked free list. Only the `PageArray`'s own backing range needs excluding (to avoid `PhysToVirt` aliasing during `Setup`), but the function excludes everything below the limit — including usable RAM between the kernel image and the `PageArray` and the TmpMap range. `SetupFreePagesList` (`:507-524`) draws from the same pruned `FreePages` list via `GetFreePageByTmpMap`, so those pages are never recovered.
 - **Failure scenario**: For a 2 GB QEMU VM with a ~2 MB kernel, `pageArrayLimit ≈ 22 MB`, leaking ~20 MB of low RAM; for 512 MB, ~8 MB. Permanently unavailable to the page allocator for the kernel's lifetime.
 - **Fix**: exclude only `[VirtToPhys(PageArray), VirtToPhys(pageArrayLimit))` (a range, not "everything below"), and after `SetCr3` re-scan e820 and add the previously-excluded usable pages back to `FreePagesList`.
 - **Verified (2026-07-08)**: CONFIRMED. The unlink test is `if (curr < phyLimit)` — everything below, not a range; `FreePagesList` is populated only from the already-pruned `FreePages` (`:518`) and runtime `FreePage` (`:623`), with no e820 re-scan. Permanent leak stands.
+- **Fixed (2026-07-09)**: `ExcludeFreePages` parks below-limit pages on a side list (`ExcludedPages`) instead of dropping them; `SetupFreePagesList` drains that list into `FreePagesList` after the main list. Safe because all runtime page access goes through TmpMap; `Setup`'s own identity-accessed allocations still come exclusively from above the limit.
 
-### 48. [ ] NanoFs: `RemoveDirEntry` trusts on-disk dir `Size` without clamp or checksum — MEDIUM
+### 48. [x] NanoFs: `RemoveDirEntry` trusts on-disk dir `Size` without clamp or checksum — MEDIUM (fixed in 315329f)
 - **File**: `src/cpp/fs/nanofs.cpp:617-704`.
 - **Summary**: `RemoveDirEntry` reads the dir inode fresh via `ReadInode` (`:626`) with **no** `VerifyInodeChecksum` (unlike `LoadVNode` at `:442`), then iterates `for (u32 i = 0; i < dirInode->Size; i++)` (`:668`) and writes `entries[dirInode->Size - 1]` (`:677`) with no clamp to `NanoMaxDirEntries` (256) or the 4096-byte `dirBuf` capacity (512 entries). `AddDirEntry` (`:562`) and `LoadVNode` (`:490`) both clamp; only `RemoveDirEntry` is missing the guard.
 - **Failure scenario**: A crafted NanoFs image with a dir inode (valid CRC32 — CRC32 is not cryptographically secure, so an attacker can forge it) with `Size = 1000` → `RemoveDirEntry` reads/writes `entries[0..999]` past the 4096-byte heap buffer → heap corruption or crash.
 - **Fix**: clamp `dirInode->Size` to `NanoMaxDirEntries` and call `VerifyInodeChecksum(dirInode)` before trusting `Size`/`Blocks[0]`.
 - **Caveat**: Sibling of #13 (file-block-count in `Write`/`RemoveRecursive`); this is dir-entry-count in `RemoveDirEntry`.
 - **Verified (2026-07-08)**: CONFIRMED. The asymmetry is real: `AddDirEntry` (`:562`) and `LoadVNode` (`:490`) clamp; only `RemoveDirEntry` lacks both the clamp and the checksum verify. `Size > 512` produces OOB heap read/write past the 4096-byte `dirBuf`.
+- **Fixed (2026-07-09)**: `RemoveDirEntry` verifies the dir inode checksum and rejects `Size > NanoMaxDirEntries` before iterating.
 
-### 49. [ ] NanoFs: `LoadVNode` has no recursion depth limit → stack overflow at mount — MEDIUM
+### 49. [x] NanoFs: `LoadVNode` has no recursion depth limit → stack overflow at mount — MEDIUM (fixed in 315329f)
 - **File**: `src/cpp/fs/nanofs.cpp:410-508` (recursive at `:492`).
 - **Summary**: `LoadVNode` recurses for every directory entry. The `VNodes[inodeIdx] != nullptr` guard (`:418`) bounds total work to `NanoInodeCount` (1024) but not recursion **depth**. The dir buffer is heap-allocated (`:473`), so each frame is small (~150-250 bytes), but a chain of 1024 nested single-entry directories still recurses ~1024 deep → overflows the 32 KB kernel stack (≈ frame 160).
 - **Failure scenario**: Crafted NanoFs image with a deeply nested directory chain. `Mount` → `LoadVNode(0)` → stack overflow → panic at mount.
 - **Fix**: convert the directory-tree load to an iterative worklist, or cap recursion depth and return an error.
 - **Verified (2026-07-08)**: CONFIRMED. Kernel stack is 32 KB (`Task::StackSize = 8 * PageSize`, task.h:20; boot stacks likewise); the `VNodes[]` guard bounds work to 1024 inodes but not depth.
+- **Fixed (2026-07-09)**: `LoadVNode` takes a depth parameter capped at `NanoMaxDirDepth` (32).
 
-### 50. [ ] NanoFs: directory cycle in `LoadVNode` → `RemoveRecursive` infinite recursion — MEDIUM
+### 50. [x] NanoFs: directory cycle in `LoadVNode` → `RemoveRecursive` infinite recursion — MEDIUM (fixed in 315329f)
 - **Files**: `src/cpp/fs/nanofs.cpp:418, 489-501` (cycle forms), `:1174-1230` (`RemoveRecursive`).
 - **Summary**: `LoadVNode` sets `VNodes[inodeIdx] = vnode` (`:467`) before loading children. If dir A references B and B references A, `LoadVNode(B)` returns the partially-constructed `vnodeA` (its `SiblingLink` is still `IsEmpty()` because A has not yet been linked into a parent). The guard at `:496` (`child != vnode && child->SiblingLink.IsEmpty()`) does **not** prevent the cross-link: both links are empty at the moment of the mutual reference, so A becomes a child of B and B becomes a child of A → a Parent/Children cycle. `RemoveRecursive` does not remove the child from `node->Children` before recursing (removal happens only in `FreeVNode` after the while-loop, `:1227`), so it re-picks the same child and recurses forever.
 - **Failure scenario**: Crafted NanoFs image with two directories mutually referencing each other. `Vfs::Remove` on either → infinite recursion → stack overflow → panic.
 - **Fix**: remove the child from `node->Children` before recursing (so the loop can't re-pick it), and/or detect cycles in `LoadVNode` (check if `child` is an ancestor of `vnode`).
 - **Caveat**: Distinct from #23 (inode-0 root reparenting); #23's "skip inode 0" fix does not prevent general A↔B cycles.
 - **Verified (2026-07-08)**: CONFIRMED. Cycle formation traced (`VNodes[inodeIdx]` set at `:467` before children load; both `SiblingLink`s empty at cross-link time); `RemoveRecursive`'s only unlink is in `FreeVNode` (`:526`), reached only after the `while (!Children.IsEmpty())` loop returns — with a cycle it never does.
+- **Fixed (2026-07-09)**: fixed at cycle formation -- `LoadVNode` marks inodes load-in-progress and refuses to link a child whose own `LoadVNode` is still on the recursion stack, so A<->B cycles (and any ancestor link) can never enter the VFS tree; `RemoveRecursive` therefore always terminates. Also fixes #23: inode 0 is in-progress for the entire mount, so root can never be reparented.
 
-### 51. [ ] ext2: `LoadDir` has no recursion depth limit → stack overflow at mount — MEDIUM
+### 51. [x] ext2: `LoadDir` has no recursion depth limit → stack overflow at mount — MEDIUM (fixed in 315329f)
 - **File**: `src/cpp/fs/ext2.cpp:437-584` (recursive at `:529`).
 - **Summary**: `LoadDir` recurses for each subdirectory entry. `MaxCachedVNodes = 512` (`:473`) bounds total VNodes but not depth. Each frame has `Ext2Inode inode` on the stack (128 bytes, `:443`) plus call overhead (~200-350 bytes/frame). A chain of 512 nested directories recurses ~512 deep → overflows the 32 KB stack (≈ frame 90-160).
 - **Failure scenario**: Crafted ext2 image with deeply nested directories. `Mount` → `LoadDir(2)` → stack overflow → panic at mount.
 - **Fix**: iterative worklist or depth cap (same as #49).
 - **Verified (2026-07-08)**: CONFIRMED, if anything worse than estimated: two 128-byte `Ext2Inode` stack locals per frame (`:443`, `:548`) → ~250-400 B/frame; the 32 KB stack (`Task::StackSize`, `task.h:20`) overflows near frame ~130, well before the 512-VNode cap.
+- **Fixed (2026-07-09)**: `LoadDir` takes a depth parameter capped at `Ext2MaxDirDepth` (32).
 
-### 52. [ ] lib: `VsnPrintf` does not NUL-terminate on exact-fill / truncation — MEDIUM
+### 52. [x] lib: `VsnPrintf` does not NUL-terminate on exact-fill / truncation — MEDIUM (fixed in 3dd96d7)
 - **File**: `src/cpp/lib/format.cpp:295-296` (`%s` bounds check), `:315-316` (final terminator).
 - **Summary**: The `%s` check is `val_len > (size - pos)` (`:295`), which allows `val_len == size - pos` (exact fit). After `MemCpy` + `pos += val_len`, `pos == size`. The final `PutChar('\0', s, size, pos++)` (`:315`) then sees `pos >= size` → returns false → `VsnPrintf` returns -1 **without** writing `'\0'`. Standard `vsnprintf` always NUL-terminates when `size > 0`. The same happens whenever regular chars or padding fill the buffer exactly.
 - **Failure scenario**: `SnPrintf(buf, 5, "ab%s", "cde")` writes `"abcde"` (5 bytes) and returns -1 with no terminator. Several callers don't check the return value (e.g. `procfs.cpp` `SnPrintf(buf, sizeof(buf), "nos %s", KERNEL_VERSION)`, `ext2.cpp:42` `SnPrintf(buf, bufSize, "%s", Dev->GetName())`) → the buffer is used as a non-terminated string → unbounded read past the buffer.
 - **Fix**: before returning -1, always write `'\0'` at `s[min(pos, size-1)]` when `size > 0`; or tighten the `%s` check to `val_len + 1 > (size - pos)` and NUL-terminate on every early-return path.
 - **Verified (2026-07-08)**: CONFIRMED (boundary arithmetic checked; both cited callers ignore the return value). Exploitability note: `KERNEL_VERSION` defaults to `"dev"` so the procfs case never fills its 128-byte buffer in practice; the ext2 case depends on device-name length. The NUL-termination defect itself is real regardless.
+- **Fixed (2026-07-09)**: every error/truncation return in `VsnPrintf` now NUL-terminates at `s[min(pos, size-1)]` via a `TerminateOnError` helper (33 return sites).
 
-### 53. [ ] TCP: no FIN-WAIT-2 timeout — permanent stall if peer never sends FIN — MEDIUM
+### 53. [x] TCP: no FIN-WAIT-2 timeout — permanent stall if peer never sends FIN — MEDIUM (fixed in 5e37ea5)
 - **Files**: `src/cpp/net/tcp.cpp:569-583` (FIN-WAIT-2 handler), `:1097-1218` (`ProcessRetransmits` has no `TcpStateFinWait2` case).
 - **Summary**: In FIN-WAIT-2 we sent our FIN, it was ACKed, `RetransmitDeadlineMs` is cleared on entry (`:565`), and there is no timer for the state. If the peer ACKs our FIN then crashes without sending its own FIN, the connection sits in FIN-WAIT-2 forever; `Recv()` never returns EOF and the slot is leaked.
 - **Failure scenario**: Local closes, peer ACKs the FIN (→ FIN-WAIT-2), then the peer dies. Slot leaked permanently; `Recv` blocks forever.
 - **Fix**: implement a FIN-WAIT-2 timer (RFC 1122 §4.2.2.20 requires one) → transition to `Closed` after a timeout.
 - **Verified (2026-07-08)**: CONFIRMED. Entry to FIN-WAIT-2 zeroes `RetransmitDeadlineMs` (`:565`), so even the generic deadline guard (`:1136`) is skipped; `Recv`'s EOF state set (`:1032-1036`) omits FinWait2, so `Recv` sleeps forever.
+- **Fixed (2026-07-09)**: entering FIN-WAIT-2 arms `TimeWaitDeadlineMs` with `TcpFinWait2TimeoutMs` (60 s); `ProcessRetransmits` transitions an expired FIN-WAIT-2 to Closed, wakes waiters, and reclaims the slot.
 
-### 54. [ ] TCP: no persist timer — permanent deadlock on zero window — MEDIUM
+### 54. [x] TCP: no persist timer — permanent deadlock on zero window — MEDIUM (fixed in 5e37ea5)
 - **Files**: `src/cpp/net/tcp.cpp:929-1007` (`Send`), `:371-397` (`ProcessAck`), `:1097-1218` (`ProcessRetransmits`).
 - **Summary**: When the peer advertises a zero window and all outstanding data is ACKed, `ProcessAck` clears `RetransmitDeadlineMs` (`:393-394`, because `SndUna == SndNxt`). No timer runs, nothing is in flight, and `ProcessRetransmits` has no persist case. The only zero-window-probe path is in `Send` (`:964-969`), and only when the app actively calls `Send`. If the app is blocked in `Recv` (not sending), no probe is ever sent.
 - **Failure scenario**: App sends a request; peer ACKs all data with window=0 (its buffer is full), drains its buffer and sends a window-update ACK that is lost. App is in `Recv`, not `Send`. We wait for a window update; the peer waits for data. Permanent deadlock.
 - **Fix**: add a persist timer in `ProcessRetransmits` that sends a zero-window probe when `SndWnd == 0`, `SndUna == SndNxt`, and no timer is running, with exponential backoff (RFC 9293).
 - **Verified (2026-07-08)**: CONFIRMED. `ProcessAck` clears the deadline at `:393-394` when fully ACKed; the only `SndWnd == 0` probe is inside `Send` (`:964-969`); `ProcessRetransmits` never inspects `SndWnd`.
+- **Fixed (2026-07-09)**: `ProcessRetransmits` implements a persist timer -- when `SndWnd == 0`, everything is ACKed and no retransmit is pending, it sends a probe with `seq = SndUna - 1` (below the window, forcing a duplicate ACK that carries the peer's current window) with exponential backoff via `PersistDeadlineMs`.
 
-### 55. [ ] HTTP client: no `Transfer-Encoding: chunked` support — MEDIUM
+### 55. [x] HTTP client: no `Transfer-Encoding: chunked` support — MEDIUM (fixed in 5e37ea5)
 - **File**: `src/cpp/net/http.cpp:128-262` (`RecvResponse`).
 - **Summary**: The response parser finds the `\r\n\r\n` boundary (`:189-196`) and treats everything after it as the body, honoring `Content-Length` but never checking for `Transfer-Encoding: chunked`. If the server uses chunked encoding (common for dynamic HTTP/1.1 responses with no Content-Length), the chunk-size markers and trailing CRLF are included verbatim in `resp.Body`.
 - **Failure scenario**: `GET` with `Connection: close`; server responds `Transfer-Encoding: chunked`. Body contains lines like `1a\r\n...data...\r\n0\r\n\r\n` → corrupt parsed content.
 - **Fix**: detect `Transfer-Encoding: chunked` in the headers and dechunk the body by parsing chunk sizes.
 - **Verified (2026-07-08)**: CONFIRMED. No `chunk`/`Transfer-Encoding` handling anywhere in http.cpp/.h; the body is copied verbatim from `buf + headerEnd` (`:241-251`).
+- **Fixed (2026-07-09)**: `RecvResponse` detects `Transfer-Encoding: chunked` and dechunks the body (chunk extensions skipped, trailers ignored, a truncated final chunk keeps the bytes that arrived); `ContentLength` reports the decoded length.
 
-### 56. [ ] `kernel_cpu_run_on` hangs forever if the target CPU has exited — MEDIUM
+### 56. [x] `kernel_cpu_run_on` hangs forever if the target CPU has exited — MEDIUM (fixed in d57f74e)
 - **Files**: `src/cpp/kernel/rust_ffi.cpp:317-326`, `src/cpp/kernel/cpu.cpp:505-509` (`QueueIPITask`), `:541-552` (`SendIPISelf`).
 - **Summary**: `kernel_cpu_run_on` calls `GetCpu(cpu).QueueIPITask(task)` (which queues + `SendIPISelf`) then `task.Completion.Wait()`. If the target has `StateExited`, `SendIPISelf` returns at `cpu.cpp:548` without sending the IPI; the task sits in `IPITaskList` forever and `Completion.Wait()` blocks forever.
 - **Failure scenario**: During shutdown, `ExitAllExceptSelf` sets remote CPUs to `StateExited`. If Rust code (a driver finalizer) calls `kernel_cpu_run_on(cpu, ...)` on an already-exited CPU, the call hangs permanently.
 - **Fix**: check `!(GetState() & StateRunning)` / `StateExited` before queuing and return an error instead of blocking.
 - **Caveat**: Shutdown-path issue; requires the caller to target an exited CPU.
 - **Verified (2026-07-08)**: CONFIRMED. `SendIPISelf` returns at `cpu.cpp:548-549` on `StateExited` without sending; nothing drains `IPITaskList`, so `Completion.Wait()` blocks forever. Bonus hazard: the `RustIPIAdapter` is stack-local (`rust_ffi.cpp:323`), so a late completion would also be a stale-pointer access.
+- **Fixed (2026-07-09)**: `kernel_cpu_run_on` checks the target CPU state (`StateRunning` and not `StateExiting`/`StateExited`) and returns without queueing instead of blocking forever.
 
-### 57. [ ] Rust FFI interrupt/MSI-X dispatch: unregister-while-in-flight use-after-free — MEDIUM
+### 57. [x] Rust FFI interrupt/MSI-X dispatch: unregister-while-in-flight use-after-free — MEDIUM (fixed in d57f74e)
 - **Files**: `src/cpp/kernel/rust_ffi.cpp:709-724` (`RustInterruptDispatch`), `:955-970` (`RustMsixDispatch`), `:761-772` (`kernel_interrupt_unregister`), `:1012-1022` (`kernel_msix_unregister_handler`).
 - **Summary**: Both dispatch functions read `Handler`/`Ctx` under a read lock, release the lock, then call `handler(ctx)` outside the lock. The unregister functions null `Handler`/`Ctx` under the write lock but do not synchronize with an in-flight ISR. If unregister runs on one CPU between an ISR's read and call on another CPU, and the caller then frees the `ctx` memory, the ISR calls `handler(freed_ctx)`.
 - **Failure scenario**: CPU 0 ISR reads `handler`/`ctx`, releases lock; CPU 1 unregisters (nulls fields), returns to caller, caller frees `ctx`; CPU 0 calls `handler(freed_ctx)` → UAF.
 - **Fix**: reference count or generation counter / RCU-style grace period so unregister does not return while an ISR is mid-call.
 - **Caveat**: Standard "unregister while in-flight" problem; requires precise cross-CPU timing and the caller freeing `ctx` immediately after unregister. The timer variant of this pattern is already #3.
 - **Verified (2026-07-08)**: CONFIRMED for both the interrupt path (`ReadUnlock` at `:720`, call at `:722`) and the MSI-X path (`:966/:968`); neither unregister has a barrier/refcount against an in-flight ISR.
+- **Fixed (2026-07-09)**: the dispatch paths raise a per-slot `InFlight` counter inside the read-locked section and drop it after the handler returns; unregister nulls the slot under the write lock, then spins until `InFlight == 0`, so it cannot return while an ISR is mid-call on another CPU. Covers the vector, legacy-INTx (`RustLegacyHandler::OnInterrupt`) and MSI-X paths.
 
 ---
 
@@ -278,12 +302,13 @@ Review of each component, focusing on correctness bugs (medium depth). Each find
 - **Fix**: commit the bitmap after the inode/block contents are written, or use a journal.
 - **Verified (2026-07-08)**: CONFIRMED. `FindSetZeroBit` sets the bit in-place and `FlushSuper` (FUA) runs at `:311/:333` before callers write contents (`CreateFile` `WriteInode` at `:775`, `CreateDir` at `:887`).
 
-### 23. [ ] NanoFs: `LoadVNode` can link root into a subdirectory via back-reference
+### 23. [x] NanoFs: `LoadVNode` can link root into a subdirectory via back-reference (fixed via #50 in 315329f)
 - **File**: `src/cpp/fs/nanofs.cpp:490-501`.
 - **Summary**: When loading a directory, each dir entry's target inode is loaded and, if `child != vnode && child->SiblingLink.IsEmpty()`, linked into the current dir. For inode 0 (root), `SiblingLink` is always empty, so any directory entry referencing inode 0 reparents root.
 - **Scenario**: A crafted/corrupted image where a subdirectory's dir block contains an entry with `InodeIndex = 0` → root reparented, VFS tree broken.
 - **Fix**: skip inode 0 in the reparenting logic.
 - **Verified (2026-07-08)**: CONFIRMED. Root is never inserted into any parent's `Children`, so its `SiblingLink` stays empty and the `:496` guard passes; no `inodeIdx == 0` skip exists.
+- **Fixed (2026-07-09)**: by the #50 fix -- inode 0 is marked load-in-progress for the entire mount, so the `LoadVNode` linking guard skips any dir entry referencing it.
 
 ### 24. [ ] ext2: triple-indirect blocks silently return zeros
 - **File**: `src/cpp/fs/ext2.cpp:337-339`.
@@ -621,11 +646,14 @@ Review of each component, focusing on correctness bugs (medium depth). Each find
 
 ## Status
 
-- **Total open issues**: 77 (0 Critical/High, 24 Medium, 53 Low)
-- **Fixed**: 6 (#1, #2, #4, #5, #44, #45 — all Critical/High, fixed in 11c608e)
+- **Total open issues**: 53 (0 Critical/High, 1 Medium, 52 Low)
+- **Fixed**: 30 — Critical/High: #1, #2, #4, #5, #44, #45 (11c608e); Medium: #3, #6, #7, #8, #9, #10, #11, #12, #13, #14, #15, #17, #47, #48, #49, #50, #51, #52, #53, #54, #55, #56, #57; Low: #23 (via #50)
+- **Reviewed, no code change**: #16 (the suggested skip-EOI fix is unsafe; see the issue's 2026-07-09 note)
 - **Retracted (not bugs)**: 3 (mm "FreePage before Put", #46 PIT/HPET tick-handler deadlock, #29 LAPIC DFR flat-mode value)
 
 **Fix pass (2026-07-09, commit 11c608e)**: all six Critical/High issues fixed. Validated by a full Docker build (`make nocheck` + `make check`/cppcheck clean) and a headless QEMU boot: self-tests pass, DHCP acquires a lease (RX through the new `NetDeviceTable` softirq dispatch + descriptor map), `wget example.com/` completes an HTTP GET over TCP (`tcpstat` shows the connection slot reclaimed), and nanofs format/mount/write/cat/overwrite round-trips on a virtio-blk disk.
+
+**Medium fix pass (2026-07-09)**: 23 of the 24 Medium issues fixed (all but #16, which was resolved as reviewed-no-change), prioritized by real-world impact: TCP protocol correctness first (#8 window updates, #54 persist timer, #53 FIN-WAIT-2 timer, #6/#7 half-close data handling), then SMP/data-integrity (#3 timer locking, #14 NanoFs durability, #12 NVMe shutdown, #57 ISR unregister sync, #56 run-on-exited-CPU hang), then crafted-image/robustness hardening (#13, #15, #48, #49, #50, #51, plus lib fixes #10, #11, #52 and #17 virtqueue size), and finally #9 (per-CPU kvmclock), #47 (low-RAM reclaim, ~8-20 MB back to the allocator), #55 (HTTP chunked decoding).
 
 To mark an issue fixed, change its `- [ ]` to `- [x]` and optionally append a commit/PR reference on the same line, e.g.:
 
