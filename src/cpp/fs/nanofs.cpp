@@ -17,6 +17,7 @@ NanoFs::NanoFs(BlockDevice* dev)
     , Mounted(false)
 {
     Stdlib::MemSet(VNodes, 0, sizeof(VNodes));
+    Stdlib::MemSet(LoadInProgress, 0, sizeof(LoadInProgress));
 }
 
 NanoFs::~NanoFs()
@@ -270,7 +271,7 @@ bool NanoFs::ReadInode(u32 idx, NanoInode* out)
     return true;
 }
 
-bool NanoFs::WriteInode(u32 idx, const NanoInode* in)
+bool NanoFs::WriteInode(u32 idx, const NanoInode* in, bool fua)
 {
     if (idx >= NanoInodeCount)
     {
@@ -278,7 +279,7 @@ bool NanoFs::WriteInode(u32 idx, const NanoInode* in)
         return false;
     }
 
-    if (!Io.WriteBlock(Super->InodeStartBlock + idx, in))
+    if (!Io.WriteBlock(Super->InodeStartBlock + idx, in, fua))
     {
         Trace(0, "NanoFs::WriteInode: write block failed idx %u", (ulong)idx);
         return false;
@@ -407,11 +408,18 @@ u32 NanoFs::ComputeDataChecksum(NanoInode* inode)
 
 // --- VNode management ---
 
-VNode* NanoFs::LoadVNode(u32 inodeIdx)
+VNode* NanoFs::LoadVNode(u32 inodeIdx, u32 depth)
 {
     if (inodeIdx >= NanoInodeCount)
     {
         Trace(0, "NanoFs::LoadVNode: idx %u out of range", (ulong)inodeIdx);
+        return nullptr;
+    }
+
+    if (depth >= NanoMaxDirDepth)
+    {
+        Trace(0, "NanoFs::LoadVNode: dir depth limit %u hit at inode %u",
+              (ulong)NanoMaxDirDepth, (ulong)inodeIdx);
         return nullptr;
     }
 
@@ -465,6 +473,7 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx)
     vnode->Capacity = inodeIdx; // Repurpose Capacity to store inode index
 
     VNodes[inodeIdx] = vnode;
+    LoadInProgress[inodeIdx] = 1;
 
     // If directory, load children
     if (inode->Type == NanoInodeTypeDir && inode->Size > 0)
@@ -489,11 +498,15 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx)
             NanoDirEntry* entries = (NanoDirEntry*)dirBuf;
             for (u32 i = 0; i < inode->Size && i < NanoMaxDirEntries; i++)
             {
-                VNode* child = LoadVNode(entries[i].InodeIndex);
+                u32 childIdx = entries[i].InodeIndex;
+                VNode* child = LoadVNode(childIdx, depth + 1);
                 /* Guard against corrupted images: an entry referencing this
-                   dir itself or an inode already linked elsewhere would
-                   corrupt the sibling list. */
-                if (child != nullptr && child != vnode && child->SiblingLink.IsEmpty())
+                   dir itself, an ancestor still being loaded (a directory
+                   cycle, including the root), or an inode already linked
+                   elsewhere would corrupt the tree. */
+                if (child != nullptr && child != vnode &&
+                    !LoadInProgress[childIdx] &&
+                    child->SiblingLink.IsEmpty())
                 {
                     child->Parent = vnode;
                     vnode->Children.InsertTail(&child->SiblingLink);
@@ -503,6 +516,7 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx)
         }
     }
 
+    LoadInProgress[inodeIdx] = 0;
     delete inode;
     return vnode;
 }
@@ -633,6 +647,23 @@ bool NanoFs::RemoveDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
     if (dirInode->Type != NanoInodeTypeDir)
     {
         Trace(0, "NanoFs::RemoveDirEntry: inode %u is not a dir", (ulong)dirInodeIdx);
+        delete dirInode;
+        return false;
+    }
+
+    // Size drives entry iteration and an entries[Size - 1] write below; an
+    // unclamped on-disk value would walk past the 4 KB dir buffer.
+    if (!VerifyInodeChecksum(dirInode))
+    {
+        Trace(0, "NanoFs::RemoveDirEntry: dir inode %u checksum mismatch", (ulong)dirInodeIdx);
+        delete dirInode;
+        return false;
+    }
+
+    if (dirInode->Size > NanoMaxDirEntries)
+    {
+        Trace(0, "NanoFs::RemoveDirEntry: dir %u size %u exceeds max %u",
+              (ulong)dirInodeIdx, (ulong)dirInode->Size, (ulong)NanoMaxDirEntries);
         delete dirInode;
         return false;
     }
@@ -957,6 +988,15 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         return false;
     }
 
+    // A corrupted inode's Size/Blocks cannot be trusted for freeing: an
+    // in-range garbage block index would free a block another file owns.
+    if (!VerifyInodeChecksum(inode))
+    {
+        Trace(0, "NanoFs::Write: inode %u checksum mismatch", (ulong)inodeIdx);
+        delete inode;
+        return false;
+    }
+
     u32 oldBlockCount = (inode->Size > 0)
         ? (inode->Size + NanoBlockSize - 1) / NanoBlockSize : 0;
     if (oldBlockCount > NanoMaxBlocks)
@@ -974,7 +1014,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         inode->Size = 0;
         inode->DataChecksum = 0;
         ComputeInodeChecksum(inode);
-        bool ok = WriteInode(inodeIdx, inode);
+        bool ok = WriteInode(inodeIdx, inode, true);
         delete inode;
         if (!ok)
         {
@@ -1052,7 +1092,20 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         return false;
     }
 
-    // Success path: commit the new inode first, then free the old blocks
+    // Success path: commit the new inode first, then free the old blocks.
+    // The data blocks must be durable before the FUA inode commit references
+    // them, and the commit itself must be durable before the old blocks are
+    // freed (the bitmap is FUA-flushed by FreeDataBlock) -- otherwise a crash
+    // loses data the bitmap already accounts for.
+    if (!Io.Flush())
+    {
+        Trace(0, "NanoFs::Write: data flush failed for inode %u", (ulong)inodeIdx);
+        for (u32 j = 0; j < newBlockCount; j++)
+            FreeDataBlock(newBlocks[j]);
+        delete inode;
+        return false;
+    }
+
     Stdlib::MemSet(inode->Blocks, 0, sizeof(inode->Blocks));
     for (u32 i = 0; i < newBlockCount; i++)
         inode->Blocks[i] = newBlocks[i];
@@ -1061,7 +1114,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     inode->DataChecksum = ComputeDataChecksum(inode);
     ComputeInodeChecksum(inode);
 
-    bool ok = WriteInode(inodeIdx, inode);
+    bool ok = WriteInode(inodeIdx, inode, true);
     delete inode;
     if (!ok)
     {
@@ -1210,7 +1263,10 @@ bool NanoFs::RemoveRecursive(VNode* node)
     }
     if (inode != nullptr)
     {
-        if (ReadInode(inodeIdx, inode))
+        // Only free data blocks if Size/Blocks can be trusted: a corrupted
+        // inode could reference blocks another file owns, and an unclamped
+        // Size would walk past Blocks[] into Padding.
+        if (ReadInode(inodeIdx, inode) && VerifyInodeChecksum(inode))
         {
             if (inode->Type == NanoInodeTypeDir)
             {
@@ -1219,6 +1275,8 @@ bool NanoFs::RemoveRecursive(VNode* node)
             else if (inode->Type == NanoInodeTypeFile && inode->Size > 0)
             {
                 u32 blockCount = (inode->Size + NanoBlockSize - 1) / NanoBlockSize;
+                if (blockCount > NanoMaxBlocks)
+                    blockCount = NanoMaxBlocks;
                 for (u32 i = 0; i < blockCount; i++)
                     FreeDataBlock(inode->Blocks[i]);
             }
