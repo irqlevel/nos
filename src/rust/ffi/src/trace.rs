@@ -22,7 +22,16 @@ impl TraceBuf {
     }
 
     pub fn as_str(&self) -> &str {
-        unsafe { core::str::from_utf8_unchecked(&self.buf[..self.pos]) }
+        /* write_str truncates byte-wise at the buffer boundary, which can
+         * split a multi-byte UTF-8 sequence; only expose the valid prefix
+         * (an unchecked conversion of the full buffer would be UB). */
+        match core::str::from_utf8(&self.buf[..self.pos]) {
+            Ok(s) => s,
+            Err(e) => {
+                let valid = e.valid_up_to();
+                unsafe { core::str::from_utf8_unchecked(&self.buf[..valid]) }
+            }
+        }
     }
 }
 
