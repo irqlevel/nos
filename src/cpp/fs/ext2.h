@@ -139,7 +139,7 @@ private:
 
     bool ReadInode(u32 inodeNum, Ext2Inode* out);
     bool ReadInodeData(Ext2Inode* inode, void* buf, ulong len, ulong offset);
-    u32  GetBlockNum(Ext2Inode* inode, u32 logicalBlock);
+    bool GetBlockNum(Ext2Inode* inode, u32 logicalBlock, u32& physBlock);
     bool ReadBlock(u32 blockNum, void* buf);
     VNode* LoadDir(u32 inodeNum, u32 depth = 0);
     VNode* FindVNode(u32 inodeNum);

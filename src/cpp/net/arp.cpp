@@ -4,6 +4,7 @@
 #include <kernel/trace.h>
 #include <kernel/asm.h>
 #include <kernel/sched.h>
+#include <kernel/time.h>
 #include <lib/stdlib.h>
 #include <include/const.h>
 
@@ -32,10 +33,17 @@ ArpTable::~ArpTable()
 bool ArpTable::Lookup(IpAddress ip, MacAddress& mac)
 {
     Stdlib::AutoLock lock(Lock);
+    ulong now = GetBootTime().GetValue() / Const::NanoSecsInMs;
     for (ulong i = 0; i < CacheSize; i++)
     {
         if (Cache[i].Valid && Cache[i].Ip == ip)
         {
+            if (now - Cache[i].CreatedMs >= ArpTtlMs)
+            {
+                /* Expired: force a fresh resolution */
+                Cache[i].Valid = false;
+                return false;
+            }
             mac = Cache[i].Mac;
             return true;
         }
@@ -46,6 +54,7 @@ bool ArpTable::Lookup(IpAddress ip, MacAddress& mac)
 void ArpTable::Insert(IpAddress ip, const MacAddress& mac)
 {
     Stdlib::AutoLock lock(Lock);
+    ulong now = GetBootTime().GetValue() / Const::NanoSecsInMs;
 
     /* Look for existing entry first */
     for (ulong i = 0; i < CacheSize; i++)
@@ -53,6 +62,7 @@ void ArpTable::Insert(IpAddress ip, const MacAddress& mac)
         if (Cache[i].Valid && Cache[i].Ip == ip)
         {
             Cache[i].Mac = mac;
+            Cache[i].CreatedMs = now;
             return;
         }
     }
@@ -64,6 +74,7 @@ void ArpTable::Insert(IpAddress ip, const MacAddress& mac)
         {
             Cache[i].Ip = ip;
             Cache[i].Mac = mac;
+            Cache[i].CreatedMs = now;
             Cache[i].Valid = true;
             return;
         }
@@ -72,6 +83,7 @@ void ArpTable::Insert(IpAddress ip, const MacAddress& mac)
     /* Cache full, overwrite first entry */
     Cache[0].Ip = ip;
     Cache[0].Mac = mac;
+    Cache[0].CreatedMs = now;
     Cache[0].Valid = true;
 }
 

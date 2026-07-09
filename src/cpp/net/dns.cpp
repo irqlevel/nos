@@ -70,10 +70,17 @@ bool DnsResolver::IsInitialized()
 bool DnsResolver::Lookup(const char* name, Net::IpAddress& ip)
 {
     Stdlib::AutoLock lock(CacheLock);
+    ulong now = GetBootTime().GetValue() / Const::NanoSecsInMs;
     for (ulong i = 0; i < CacheSize; i++)
     {
         if (Cache[i].Valid && Stdlib::StrCmp(Cache[i].Name, name) == 0)
         {
+            if (now >= Cache[i].ExpiryMs)
+            {
+                /* Record TTL expired: re-resolve */
+                Cache[i].Valid = false;
+                return false;
+            }
             ip = Cache[i].Ip;
             return true;
         }
@@ -81,9 +88,14 @@ bool DnsResolver::Lookup(const char* name, Net::IpAddress& ip)
     return false;
 }
 
-void DnsResolver::Insert(const char* name, Net::IpAddress ip)
+void DnsResolver::Insert(const char* name, Net::IpAddress ip, ulong ttlSec)
 {
+    if (ttlSec > MaxTtlSec)
+        ttlSec = MaxTtlSec;
+
     Stdlib::AutoLock lock(CacheLock);
+    ulong expiryMs = GetBootTime().GetValue() / Const::NanoSecsInMs
+        + ttlSec * 1000;
 
     /* Check if already cached */
     for (ulong i = 0; i < CacheSize; i++)
@@ -91,6 +103,7 @@ void DnsResolver::Insert(const char* name, Net::IpAddress ip)
         if (Cache[i].Valid && Stdlib::StrCmp(Cache[i].Name, name) == 0)
         {
             Cache[i].Ip = ip;
+            Cache[i].ExpiryMs = expiryMs;
             return;
         }
     }
@@ -102,6 +115,7 @@ void DnsResolver::Insert(const char* name, Net::IpAddress ip)
         {
             Stdlib::StrnCpy(Cache[i].Name, name, sizeof(Cache[i].Name));
             Cache[i].Ip = ip;
+            Cache[i].ExpiryMs = expiryMs;
             Cache[i].Valid = true;
             return;
         }
@@ -110,6 +124,7 @@ void DnsResolver::Insert(const char* name, Net::IpAddress ip)
     /* Evict slot 0 (simple strategy) */
     Stdlib::StrnCpy(Cache[0].Name, name, sizeof(Cache[0].Name));
     Cache[0].Ip = ip;
+    Cache[0].ExpiryMs = expiryMs;
     Cache[0].Valid = true;
 }
 
@@ -327,7 +342,10 @@ void DnsResolver::ProcessResponse(const u8* dnsPayload, ulong dnsLen)
 
         u16 rType = (u16)((dnsPayload[off] << 8) | dnsPayload[off + 1]);
         u16 rClass = (u16)((dnsPayload[off + 2] << 8) | dnsPayload[off + 3]);
-        /* TTL at off+4..off+7, skip */
+        u32 rTtl = ((u32)dnsPayload[off + 4] << 24) |
+                   ((u32)dnsPayload[off + 5] << 16) |
+                   ((u32)dnsPayload[off + 6] << 8) |
+                   (u32)dnsPayload[off + 7];
         u16 rdLength = (u16)((dnsPayload[off + 8] << 8) | dnsPayload[off + 9]);
         off += 10;
 
@@ -344,6 +362,7 @@ void DnsResolver::ProcessResponse(const u8* dnsPayload, ulong dnsLen)
             if (id == Pending.Id && !Pending.Answered)
             {
                 Pending.Result = IpAddress::FromNetwork(ipNet);
+                Pending.TtlSec = rTtl;
                 Pending.Answered = true;
             }
             return;
@@ -400,16 +419,20 @@ bool DnsResolver::Resolve(const char* name, Net::IpAddress& ip, ulong timeoutMs)
 
         bool answered;
         Net::IpAddress result;
+        ulong ttlSec;
         {
             Stdlib::AutoLock lock(CacheLock);
             answered = Pending.Answered;
             result = Pending.Result;
+            ttlSec = Pending.TtlSec;
         }
 
         if (answered)
         {
             ip = result;
-            Insert(name, ip);
+            /* RFC 1035: TTL 0 means do not cache */
+            if (ttlSec > 0)
+                Insert(name, ip, ttlSec);
             Trace(0, "DNS: resolved %s -> %u.%u.%u.%u",
                 name,
                 (ulong)((ip.Addr4 >> 24) & 0xFF),

@@ -69,8 +69,12 @@ private:
     {
         char Name[MaxDomainLen + 1];
         Net::IpAddress Ip;
+        ulong ExpiryMs; /* boot-time ms after which the entry is stale */
         bool Valid;
     };
+
+    /* Cap on server-supplied TTLs */
+    static const ulong MaxTtlSec = 86400;
 
     CacheEntry Cache[CacheSize];
     SpinLock CacheLock;
@@ -81,6 +85,7 @@ private:
         u16 Id;
         bool Answered;
         Net::IpAddress Result;
+        u32 TtlSec;
     };
 
     PendingQuery Pending;
@@ -92,7 +97,7 @@ private:
 
     bool SendQuery(const char* name, u16 id);
     bool Lookup(const char* name, Net::IpAddress& ip);
-    void Insert(const char* name, Net::IpAddress ip);
+    void Insert(const char* name, Net::IpAddress ip, ulong ttlSec);
     static void RxCallback(const u8* frame, ulong len, void* ctx);
     void ProcessResponse(const u8* dnsPayload, ulong dnsLen);
 

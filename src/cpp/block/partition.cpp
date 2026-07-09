@@ -98,6 +98,13 @@ bool PartitionDevice::ProbeDevice(BlockDevice* dev)
         if (entry.Type == 0 || entry.LbaSize == 0)
             continue;
 
+        /* A partition starting at LBA 0 would alias the MBR itself */
+        if (entry.LbaStart == 0)
+        {
+            Trace(0, "PartitionDevice: partition %u starts at LBA 0, skipped", i + 1);
+            continue;
+        }
+
         u64 endSector = (u64)entry.LbaStart + entry.LbaSize;
         if (endSector > dev->GetCapacity())
         {
@@ -140,6 +147,11 @@ void PartitionDevice::ProbeAll()
     /* Boot-only: there is no way to unregister from BlockDeviceTable,
        so running this twice would re-init instances that are still
        registered and register duplicates. */
+    static bool probed;
+    if (BugOn(probed))
+        return;
+    probed = true;
+
     InstanceCount = 0;
 
     for (ulong i = 0; i < MaxPartitions; i++)

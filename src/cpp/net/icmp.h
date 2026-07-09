@@ -48,7 +48,13 @@ public:
     void Dump(Stdlib::Printer& printer);
 
     static const u8 TypeEchoReply   = 0;
+    static const u8 TypeDestUnreach = 3;
     static const u8 TypeEchoRequest = 8;
+
+    /* Destination Unreachable codes that are hard errors for TCP
+       (RFC 1122 4.2.3.9) */
+    static const u8 CodeProtoUnreach = 2;
+    static const u8 CodePortUnreach  = 3;
 
 private:
     Icmp();

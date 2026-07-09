@@ -1,5 +1,6 @@
 #include "dhcp.h"
 #include "net.h"
+#include "arp.h"
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>
@@ -363,24 +364,36 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen, bool renewing)
 
     Stdlib::MemSet(frame, 0, totalLen);
 
+    /* RFC 2131 4.3.2: the RENEWING (T1) REQUEST must be unicast to the
+       granting server. Fall back to broadcast if the server's MAC cannot
+       be resolved (equivalent to REBINDING). */
+    Net::MacAddress serverMac;
+    bool unicast = false;
+    if (renewing && Result.ServerIp.Addr4 != 0)
+        unicast = ArpTable::GetInstance().Resolve(
+            Dev, Dev->RouteIp(Result.ServerIp), serverMac);
+
     ulong off = 0;
 
-    /* Ethernet header -- broadcast */
+    /* Ethernet header */
     EthHdr* eth = (EthHdr*)(frame + off);
-    Stdlib::MemSet(eth->DstMac, 0xFF, 6);
+    if (unicast)
+        serverMac.CopyTo(eth->DstMac);
+    else
+        Stdlib::MemSet(eth->DstMac, 0xFF, 6);
     Dev->GetMac().CopyTo(eth->SrcMac);
     eth->EtherType = Htons(EtherTypeIp);
     off += sizeof(EthHdr);
 
     /* IP header. When renewing we already hold an address, so source it from
-       our bound IP (REBINDING broadcast); otherwise send from 0.0.0.0. */
+       our bound IP; otherwise send from 0.0.0.0. */
     IpHdr* ip = (IpHdr*)(frame + off);
     ip->VersionIhl = 0x45;
     ip->TotalLen = Htons((u16)ipLen);
     ip->Ttl = 128;
     ip->Protocol = Net::IpProtoUdp;
     ip->SrcAddr = renewing ? Result.Ip.ToNetwork() : 0;
-    ip->DstAddr = 0xFFFFFFFF;
+    ip->DstAddr = unicast ? Result.ServerIp.ToNetwork() : 0xFFFFFFFF;
     ip->Checksum = Htons(IpChecksum(ip, sizeof(IpHdr)));
     off += sizeof(IpHdr);
 
@@ -398,7 +411,9 @@ ulong DhcpClient::BuildRequest(u8* frame, ulong maxLen, bool renewing)
     dhcp->HType = 1;
     dhcp->HLen = 6;
     dhcp->Xid = Htonl(Xid);
-    dhcp->Flags = Htons(0x8000);
+    /* Renewing: we hold a routable address, so the server can (and per the
+       RFC should) reply unicast to ciaddr -- no broadcast flag */
+    dhcp->Flags = Htons(renewing ? (u16)0 : (u16)0x8000);
     if (renewing)
         dhcp->CIAddr = Result.Ip.ToNetwork(); /* the address we are renewing */
     Dev->GetMac().CopyTo(dhcp->CHAddr);

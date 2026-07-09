@@ -44,8 +44,12 @@ private:
     {
         Net::IpAddress Ip;
         Net::MacAddress Mac;
+        ulong CreatedMs;
         bool Valid;
     };
+
+    /* Entries expire so a host changing its MAC is re-resolved */
+    static const ulong ArpTtlMs = 300000;
 
     static const ulong CacheSize = 16;
     ArpEntry Cache[CacheSize];

@@ -93,6 +93,21 @@ bool NanoFs::Mount()
         return false;
     }
 
+    /* All I/O uses the on-disk layout fields directly; a forged image
+       (e.g. InodeStartBlock = 0) would alias the superblock */
+    if (Super->BlockSize != NanoBlockSize ||
+        Super->InodeCount != NanoInodeCount ||
+        Super->DataBlockCount != NanoDataBlockCount ||
+        Super->InodeStartBlock != NanoInodeStart ||
+        Super->DataStartBlock != NanoDataStart)
+    {
+        Trace(0, "NanoFs: unsupported layout (blockSize %u inodes %u dataBlocks %u inodeStart %u dataStart %u)",
+              (ulong)Super->BlockSize, (ulong)Super->InodeCount,
+              (ulong)Super->DataBlockCount, (ulong)Super->InodeStartBlock,
+              (ulong)Super->DataStartBlock);
+        return false;
+    }
+
     // Load root VNode (inode 0)
     if (LoadVNode(0) == nullptr)
     {
@@ -300,6 +315,9 @@ bool NanoFs::FlushSuper()
 
 // --- Bitmap helpers ---
 
+/* Alloc* only set the bit in memory; the caller commits the bitmap with
+   FlushSuper *after* the inode/block contents are written, so a crash in
+   between leaves the slot free instead of leaked. Free* flush themselves. */
 long NanoFs::AllocInode()
 {
     Stdlib::Bitmap bm(Super->InodeBitmap, NanoInodeCount);
@@ -309,7 +327,6 @@ long NanoFs::AllocInode()
         Trace(0, "NanoFs::AllocInode: no free inodes");
         return -1;
     }
-    FlushSuper();
     return idx;
 }
 
@@ -331,7 +348,6 @@ long NanoFs::AllocDataBlock()
         Trace(0, "NanoFs::AllocDataBlock: no free data blocks");
         return -1;
     }
-    FlushSuper();
     return idx;
 }
 
@@ -812,6 +828,14 @@ VNode* NanoFs::CreateFile(VNode* dir, const char* name)
     }
     delete inode;
 
+    /* Commit the inode bitmap now that the inode contents are on disk */
+    if (!FlushSuper())
+    {
+        Trace(0, "NanoFs::CreateFile: bitmap commit failed for '%s'", name);
+        FreeInode((u32)inodeIdx);
+        return nullptr;
+    }
+
     if (!AddDirEntry(dirInodeIdx, (u32)inodeIdx))
     {
         Trace(0, "NanoFs::CreateFile: add dir entry failed for '%s'", name);
@@ -924,6 +948,15 @@ VNode* NanoFs::CreateDir(VNode* dir, const char* name)
         return nullptr;
     }
     delete inode;
+
+    /* Commit the bitmaps now that the inode and data block are on disk */
+    if (!FlushSuper())
+    {
+        Trace(0, "NanoFs::CreateDir: bitmap commit failed for '%s'", name);
+        FreeDataBlock((u32)dataIdx);
+        FreeInode((u32)inodeIdx);
+        return nullptr;
+    }
 
     if (!AddDirEntry(dirInodeIdx, (u32)inodeIdx))
     {
@@ -1106,6 +1139,17 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         return false;
     }
 
+    /* Commit the data bitmap (new blocks used) before the inode that
+       references them; AllocDataBlock only set the bits in memory */
+    if (!FlushSuper())
+    {
+        Trace(0, "NanoFs::Write: bitmap commit failed for inode %u", (ulong)inodeIdx);
+        for (u32 j = 0; j < newBlockCount; j++)
+            FreeDataBlock(newBlocks[j]);
+        delete inode;
+        return false;
+    }
+
     Stdlib::MemSet(inode->Blocks, 0, sizeof(inode->Blocks));
     for (u32 i = 0; i < newBlockCount; i++)
         inode->Blocks[i] = newBlocks[i];
@@ -1163,6 +1207,16 @@ bool NanoFs::Read(VNode* file, void* buf, ulong len, ulong offset)
         return false;
     }
 
+    /* A forged Size > NanoMaxFileSize would make the block loop exit
+       early and silently return uninitialized buffer bytes */
+    if (inode->Size > NanoMaxFileSize)
+    {
+        Trace(0, "NanoFs::Read: inode %u size %u exceeds max %u",
+              (ulong)inodeIdx, (ulong)inode->Size, (ulong)NanoMaxFileSize);
+        delete inode;
+        return false;
+    }
+
     if (offset >= inode->Size)
     {
         Trace(0, "NanoFs::Read: offset %u beyond size %u inode %u",
@@ -1215,6 +1269,14 @@ bool NanoFs::Read(VNode* file, void* buf, ulong len, ulong offset)
         bytesRead += chunkSize;
         byteOff = 0;
         blockOff++;
+    }
+
+    /* A short read means the caller would consume garbage after bytesRead */
+    if (ok && bytesRead < toRead)
+    {
+        Trace(0, "NanoFs::Read: short read %u/%u inode %u",
+              (ulong)bytesRead, (ulong)toRead, (ulong)inodeIdx);
+        ok = false;
     }
 
     // Verify data checksum
