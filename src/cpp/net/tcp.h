@@ -37,6 +37,7 @@ static const ulong TcpInitialRtoMs     = 1000;
 static const ulong TcpMaxRtoMs         = 8000;
 static const ulong TcpMaxRetransmits   = 8;
 static const ulong TcpTimeWaitMs       = 2000;
+static const ulong TcpFinWait2TimeoutMs = 60000;
 static const ulong TcpConnectTimeoutMs = 5000;
 static const u8    TcpDefaultTtl       = 64;
 static const ulong TcpTimerPeriodMs    = 200;
@@ -156,6 +157,7 @@ struct TcpConn
     u32 SndWnd;   /* peer window */
     u32 RcvNxt;   /* next expected */
     u32 RcvWnd;   /* our window */
+    u32 AdvertisedWnd; /* window advertised in our last outgoing segment */
     u32 Iss;      /* initial send sequence */
     u32 Irs;      /* initial receive sequence */
     u16 PeerMss;
@@ -168,7 +170,8 @@ struct TcpConn
     ulong RtoMs;
     ulong RetransmitDeadlineMs; /* boot-time ms when retransmit fires */
     ulong RetransmitCount;      /* consecutive retransmits with no ACK progress */
-    ulong TimeWaitDeadlineMs;
+    ulong TimeWaitDeadlineMs;   /* also the FIN-WAIT-2 timeout deadline */
+    ulong PersistDeadlineMs;    /* zero-window probe deadline (persist timer) */
 
     /* Flags */
     Atomic DataReady;   /* set when data arrives in RecvBuf */
@@ -270,6 +273,11 @@ private:
     void HandleState(TcpConn* conn, const Net::IpHdr* ip,
                      const Net::TcpHdr* tcp, const u8* payload,
                      ulong payloadLen);
+
+    /* In-order payload delivery to RecvBuf + the ACK it requires. Shared by
+       Established and the FIN-WAIT states (RFC 793 half-close). */
+    void ProcessPayload(TcpConn* conn, u32 seq, const u8* payload,
+                        ulong payloadLen);
 
     /* Advance SndUna / drain SendBuf for an incoming ACK (wrap-safe).
        Shared by every state that may have unacked data outstanding. */

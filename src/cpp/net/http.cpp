@@ -125,6 +125,111 @@ bool HttpClient::SendRequest(TcpConn* conn, const char* method,
     return (sent > 0);
 }
 
+/* True when the headers contain "Transfer-Encoding: ... chunked" */
+static bool HasChunkedEncoding(const u8* buf, ulong headerLen)
+{
+    static const char teHeader[] = "Transfer-Encoding:";
+    static const ulong teHeaderLen = 18;
+    static const char chunked[] = "chunked";
+    static const ulong chunkedLen = 7;
+
+    for (ulong j = 0; j + teHeaderLen < headerLen; j++)
+    {
+        /* Match only at start of a line (j==0 or preceded by \n) */
+        if (j != 0 && buf[j - 1] != '\n')
+            continue;
+
+        bool match = true;
+        for (ulong k = 0; k < teHeaderLen; k++)
+        {
+            char a = (char)buf[j + k];
+            char b = teHeader[k];
+            if (a >= 'A' && a <= 'Z') a = a + ('a' - 'A');
+            if (b >= 'A' && b <= 'Z') b = b + ('a' - 'A');
+            if (a != b) { match = false; break; }
+        }
+        if (!match)
+            continue;
+
+        /* Look for "chunked" anywhere in the header value */
+        for (ulong v = j + teHeaderLen;
+             v < headerLen && buf[v] != '\r' && buf[v] != '\n'; v++)
+        {
+            bool m = (v + chunkedLen <= headerLen);
+            for (ulong k = 0; m && k < chunkedLen; k++)
+            {
+                char a = (char)buf[v + k];
+                if (a >= 'A' && a <= 'Z') a = a + ('a' - 'A');
+                if (a != chunked[k])
+                    m = false;
+            }
+            if (m)
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+/* Decode chunk-size/CRLF framing (RFC 9112 7.1) from src into dst and return
+   the decoded length. dst must hold srcLen bytes (the decoded body is never
+   longer than the wire form). Trailers after the 0-size chunk are ignored;
+   a truncated final chunk keeps the bytes that did arrive. */
+static ulong DechunkBody(const u8* src, ulong srcLen, u8* dst)
+{
+    ulong pos = 0;
+    ulong out = 0;
+
+    for (;;)
+    {
+        /* Hex chunk size, optionally followed by ";extension", then CRLF */
+        ulong size = 0;
+        bool sawDigit = false;
+        while (pos < srcLen)
+        {
+            char c = (char)src[pos];
+            ulong digit;
+            if (c >= '0' && c <= '9')
+                digit = (ulong)(c - '0');
+            else if (c >= 'a' && c <= 'f')
+                digit = (ulong)(c - 'a') + 10;
+            else if (c >= 'A' && c <= 'F')
+                digit = (ulong)(c - 'A') + 10;
+            else
+                break;
+            size = size * 16 + digit;
+            sawDigit = true;
+            pos++;
+        }
+        if (!sawDigit)
+            break;
+
+        while (pos < srcLen && src[pos] != '\n')
+            pos++;
+        if (pos >= srcLen)
+            break;
+        pos++; /* skip \n */
+
+        if (size == 0)
+            break; /* last chunk */
+
+        if (size > srcLen - pos)
+            size = srcLen - pos;
+
+        Stdlib::MemCpy(dst + out, src + pos, size);
+        out += size;
+        pos += size;
+
+        /* Skip the CRLF that terminates the chunk data */
+        if (pos + 1 < srcLen && src[pos] == '\r' && src[pos + 1] == '\n')
+            pos += 2;
+        else if (pos < srcLen && src[pos] == '\n')
+            pos += 1;
+    }
+
+    return out;
+}
+
 bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp)
 {
     /* Receive into a temp buffer */
@@ -239,18 +344,26 @@ bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp)
     }
 
     /* Body starts after header boundary */
+    bool chunked = HasChunkedEncoding(buf, headerEnd);
     ulong bodyLen = total - headerEnd;
     if (bodyLen > 0)
     {
         resp.Body = (u8*)Mm::Alloc(bodyLen, 'Http');
         if (resp.Body)
         {
-            Stdlib::MemCpy(resp.Body, buf + headerEnd, bodyLen);
-            resp.BodyLen = bodyLen;
+            if (chunked)
+            {
+                resp.BodyLen = DechunkBody(buf + headerEnd, bodyLen, resp.Body);
+            }
+            else
+            {
+                Stdlib::MemCpy(resp.Body, buf + headerEnd, bodyLen);
+                resp.BodyLen = bodyLen;
+            }
         }
     }
-    if (resp.ContentLength == 0)
-        resp.ContentLength = bodyLen;
+    if (resp.ContentLength == 0 || chunked)
+        resp.ContentLength = resp.BodyLen;
 
     /* Extract Location header for redirects */
     ExtractLocation(buf, headerEnd, resp.Location, sizeof(resp.Location));
