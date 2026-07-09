@@ -269,38 +269,43 @@ Review of each component, focusing on correctness bugs (medium depth). Each find
 
 ## Low
 
-### 18. [ ] TCP RST acceptance window is too strict
+### 18. [x] TCP RST acceptance window is too strict (fixed in d037195)
 - **File**: `src/cpp/net/tcp.cpp:422`.
 - **Summary**: For all states except SYN-SENT a RST is only accepted when `SEG.SEQ == RcvNxt` exactly, rather than the RFC 793 in-window check `RCV.NXT <= SEG.SEQ < RCV.NXT + RCV.WND`. A valid RST elsewhere in the window is dropped. (Deliberate per the comment at `:412-414`; helps against blind RSTs but is a correctness deviation.)
 - **Fix**: use the in-window check.
 - **Verified (2026-07-08)**: CONFIRMED (`:415-422`). The exact-match rule aligns with RFC 5961's spirit but without the paired challenge-ACK, so it remains an RFC 793 deviation as filed.
+- **Fixed (2026-07-09)**: RST acceptance now uses the RFC 793 in-window check (`seq == RcvNxt` is kept so a zero-window RST at the expected sequence still lands).
 
-### 19. [ ] TCP RST-ACK computation ignores the FIN flag
+### 19. [x] TCP RST-ACK computation ignores the FIN flag (fixed in d037195)
 - **File**: `src/cpp/net/tcp.cpp:765-767`.
 - **Summary**: When generating an RST in response to an unknown segment, `rstAck = Ntohl(tcp->SeqNum) + payloadLen` adds 1 for SYN but not for FIN.
 - **Scenario**: A stray FIN to a closed port produces an RST whose ack is one byte low; some stacks treat it as malformed.
 - **Fix**: `if (tcp->Flags & TcpFlagFin) rstAck++;`.
 - **Verified (2026-07-08)**: CONFIRMED (`:764-767`); SYN is incremented, FIN is not.
+- **Fixed (2026-07-09)**: `rstAck` now also counts a FIN.
 
-### 20. [ ] TCP `Connect` with caller-supplied `srcPort` skips collision check
+### 20. [x] TCP `Connect` with caller-supplied `srcPort` skips collision check (fixed in d037195)
 - **File**: `src/cpp/net/tcp.cpp:798-808`.
 - **Summary**: Only the `srcPort == 0` branch calls `AllocEphemeralPort`. A non-zero `srcPort` is inserted via `InsertHash` with no 4-tuple uniqueness check; `LookupLocked` returns whichever entry it hits first.
 - **Scenario**: Two conns with the same 4-tuple; incoming segments routed to the wrong connection. (Only triggers on caller misuse, but the API permits it.)
 - **Fix**: check for an existing conn with the same 4-tuple before inserting.
 - **Verified (2026-07-08)**: CONFIRMED (`:798-808`, insert at `:831`); only the `srcPort == 0` branch allocates/checks.
+- **Fixed (2026-07-09)**: a caller-supplied `srcPort` is rejected when a connection with the same 4-tuple already exists (checked under `PoolLock` via `LookupLocked`).
 
-### 21. [ ] TCP `Listen` allows duplicate listeners on the same port
+### 21. [x] TCP `Listen` allows duplicate listeners on the same port (fixed in d037195)
 - **File**: `src/cpp/net/tcp.cpp:869-890`.
 - **Summary**: `Listen` doesn't scan for an existing listener on `port`; a second `Listen` silently succeeds, wasting a pool slot, and `FindListenerLocked` always returns the first.
 - **Fix**: reject a duplicate listener.
 - **Verified (2026-07-08)**: CONFIRMED (`:869-890`); no duplicate scan, `FindListenerLocked` returns the first match.
+- **Fixed (2026-07-09)**: `Listen` scans the pool and rejects a duplicate listener on the same port.
 
-### 22. [ ] NanoFs: `AllocInode`/`AllocDataBlock` commit bitmap before inode/block is initialized
+### 22. [x] NanoFs: `AllocInode`/`AllocDataBlock` commit bitmap before inode/block is initialized (fixed in d037195)
 - **File**: `src/cpp/fs/nanofs.cpp:302-313, 324-335`.
 - **Summary**: `AllocInode`/`AllocDataBlock` call `FlushSuper` (FUA write of the bitmap) immediately after marking the bit, before the caller has written the inode/block contents.
 - **Scenario**: Crash between the bitmap flush and the subsequent `WriteInode` → inode permanently marked allocated but zeroed/`Type=Free` → leaked forever.
 - **Fix**: commit the bitmap after the inode/block contents are written, or use a journal.
 - **Verified (2026-07-08)**: CONFIRMED. `FindSetZeroBit` sets the bit in-place and `FlushSuper` (FUA) runs at `:311/:333` before callers write contents (`CreateFile` `WriteInode` at `:775`, `CreateDir` at `:887`).
+- **Fixed (2026-07-09)**: `AllocInode`/`AllocDataBlock` now only set the bit in memory; callers commit with one `FlushSuper` *after* the inode/block contents are written (CreateFile/CreateDir after `WriteInode`, `Write` after the data flush and before the inode commit). A crash in between leaves the slot free instead of leaked, and the Write path issues one FUA bitmap write instead of up to 256.
 
 ### 23. [x] NanoFs: `LoadVNode` can link root into a subdirectory via back-reference (fixed via #50 in 315329f)
 - **File**: `src/cpp/fs/nanofs.cpp:490-501`.
@@ -310,312 +315,359 @@ Review of each component, focusing on correctness bugs (medium depth). Each find
 - **Verified (2026-07-08)**: CONFIRMED. Root is never inserted into any parent's `Children`, so its `SiblingLink` stays empty and the `:496` guard passes; no `inodeIdx == 0` skip exists.
 - **Fixed (2026-07-09)**: by the #50 fix -- inode 0 is marked load-in-progress for the entire mount, so the `LoadVNode` linking guard skips any dir entry referencing it.
 
-### 24. [ ] ext2: triple-indirect blocks silently return zeros
+### 24. [x] ext2: triple-indirect blocks silently return zeros (fixed in d037195)
 - **File**: `src/cpp/fs/ext2.cpp:337-339`.
 - **Summary**: Files using triple-indirect blocks are not supported; `GetBlockNum` returns 0, which `ReadInodeData` interprets as a sparse hole and fills with zeros, silently returning wrong data instead of an error.
 - **Fix**: return an error / `Trace` for triple-indirect blocks rather than 0.
 - **Verified (2026-07-08)**: CONFIRMED (a `Trace` is already emitted at `:337`, but 0 is still returned and treated as a hole). Reachable: with 1 KB block size, double-indirect covers only ~64 MB, so files above that hit triple-indirect and silently read zeros.
+- **Fixed (2026-07-09)**: `GetBlockNum` returns bool with a `physBlock` out-param; triple-indirect blocks (and indirect-block read failures) now fail the read instead of silently returning zeros.
 
-### 25. [ ] Vfs: path components longer than 63 characters are silently truncated
+### 25. [x] Vfs: path components longer than 63 characters are silently truncated (fixed in d037195)
 - **File**: `src/cpp/fs/vfs.cpp:204-216`.
 - **Summary**: The `component` buffer is 64 bytes; the copy loop stops at 63 chars. When truncation occurs, `*p` is not `/` or `\0`, so the remaining characters are reinterpreted as the next path component(s).
 - **Scenario**: A path with a >63-char component is mis-parsed (wrong lookup or spurious failure) instead of yielding "name too long".
 - **Fix**: return an ENAMETOOLONG-style error when a component exceeds the buffer.
 - **Verified (2026-07-08)**: CONFIRMED. On truncation `*p` is not `/`, so `if (*p == '/') p++` doesn't advance and the outer loop re-parses the remainder as new components, exactly as filed.
+- **Fixed (2026-07-09)**: a component that does not fit the 64-byte buffer fails resolution with a trace instead of being re-parsed as extra components.
 
-### 26. [ ] mm: `SetupFreePagesList` leaks a refcount on every free page
+### 26. [x] mm: `SetupFreePagesList` leaks a refcount on every free page (fixed in 49debda)
 - **File**: `src/cpp/mm/page_table.cpp:516`.
 - **Summary**: `GetPage(phyAddr)` increments every free page's refcount (+1), but that reference is never balanced by a `Put`. Free-list pages sit at refcount 2 instead of 1, violating the "free page == refcount 1" invariant.
 - **Scenario**: Functionally harmless (refcount is not consulted for free-list decisions; `FreePage` just pushes onto the list), but the invariant is violated and masks the (retracted) race in mm #2-below.
 - **Fix**: drop the extra `GetPage`/`Put` pair, or document the invariant.
 - **Verified (2026-07-08)**: CONFIRMED. `Page::Init` sets refcount 1, `GetPage` at `:516` makes it 2, never balanced; "functionally harmless" verified — no free-list path consults `RefCount`.
+- **Fixed (2026-07-09)**: `SetupFreePagesList` drops `GetPage`'s lookup reference with `Put()`, restoring the free-page == refcount-1 invariant.
 
-### 27. [ ] mm: `MapMmioRegion` maps at `physAddr + KernelSpaceBase`, bypassing `VaAllocator`, no cross-CPU TLB shootdown
+### 27. [x] mm: `MapMmioRegion` maps at `physAddr + KernelSpaceBase`, bypassing `VaAllocator`, no cross-CPU TLB shootdown (documented in 49debda)
 - **File**: `src/cpp/mm/page_table.cpp:889-973` (returns `physAddr + KernelSpaceBase` at `:972`; local `Invlpg` at `:969`).
 - **Summary**: Violates the CLAUDE.md rule that device memory must go through `Mm::MapPages`/`AllocMapPages` so the `VaAllocator` tracks the VA. Only local `Invlpg`, no global shootdown. `kernel_unmap_phys` is a no-op (mappings are permanent).
 - **Scenario**: Safe under current boot ordering (all `MapMmioRegion` callers run in `Main2`/`BpStartup` before `cpus.StartAll()`). Becomes a real bug if any driver is initialized after APs start or if MMIO regions need to be unmapped/remapped.
 - **Fix**: route through `VaAllocator` and issue a cross-CPU shootdown (or document the boot-ordering constraint).
 - **Verified (2026-07-08)**: CONFIRMED, including the mitigation: every `MapMmioRegion`/`kernel_map_phys` caller (HPET at `main.cpp:724`, virtio + `rust_init` at `:466-474`) runs strictly before `cpus.StartAll()` (`:510`), so it is safe under current boot ordering as filed.
+- **Fixed (2026-07-09)**: resolved by documenting the constraint in `page_table.h`: `MapMmioRegion` mappings are permanent, live at `physAddr + KernelSpaceBase` outside the VaAllocator, and only invalidate the local TLB, so callers must run on the BSP before APs start -- which every current caller does.
 
-### 28. [ ] drivers: `Pic::EOI` only EOIs the master PIC
+### 28. [x] drivers: `Pic::EOI` only EOIs the master PIC (fixed in 7a88822)
 - **File**: `src/cpp/drivers/pic.cpp:53-56`.
 - **Summary**: `EOI()` sends `PIC_EOI` to `PIC1` (0x20) only. For interrupts originating from the slave PIC (IRQ 8–15), the slave at 0xA0 also requires an EOI; without it the slave stops delivering. The standard cascaded-8259 EOI is: if IRQ > 7, EOI slave then master.
 - **Scenario**: Effectively dead code (kernel switches to LAPIC/IOAPIC and calls `Pic::Disable()`), but broken if ever used for slave IRQs.
 - **Fix**: EOI slave then master for IRQ > 7.
 - **Verified (2026-07-08)**: CONFIRMED, and fully dead code: grep finds zero callers of `Pic::EOI`; the only Pic use is `Remap()` + `Disable()` in main.cpp.
+- **Fixed (2026-07-09)**: `EOI(int irq)` EOIs the slave PIC first for IRQ >= 8.
 
-### 30. [ ] drivers: MSI-X vector allocation is non-atomic
+### 30. [x] drivers: MSI-X vector allocation is non-atomic (fixed in 7a88822)
 - **File**: `src/cpp/drivers/msix.cpp:187-192`.
 - **Summary**: `MsixTable::NextVector` is a `static u8` incremented by `AllocVector()` with no atomicity or lock.
 - **Scenario**: Safe only because device initialization is serialized on the BSP; if two devices were ever initialized concurrently this would double-allocate vectors.
 - **Fix**: make `NextVector` atomic or guard allocation with a lock.
 - **Verified (2026-07-08)**: CONFIRMED (`return NextVector++` on a plain static u8, `msix.cpp:187-192`).
+- **Fixed (2026-07-09)**: vector allocation is a cmpxchg loop over an `Atomic` offset from `MsixVectorBase` (BSS zero-init, so no static-constructor hazard).
 
-### 31. [ ] kernel: `TaskQueue::Schedule` panics if an exiting task finds no runnable next
+### 31. [x] kernel: `TaskQueue::Schedule` panics if an exiting task finds no runnable next (fixed in 7a88822)
 - **File**: `src/cpp/kernel/sched.cpp:144-153`.
 - **Summary**: When the current task is `StateExited` (removed at `:122-124`) and `SelectNext` returns `nullptr`, the no-switch branch ends with `BugOn(curr->State.Get() == Task::StateExited)` → panic. Currently avoided only because every CPU queue always contains a non-preempt-disabled idle task.
 - **Scenario**: Panics if that invariant is ever broken (e.g. an idle task that exits or a stuck preempt-disable count).
 - **Fix**: handle the no-runnable-next-exiting case gracefully instead of `BugOn`.
 - **Verified (2026-07-08)**: CONFIRMED (removal at `sched.cpp:118-124`, `BugOn` at `:151`; `SelectNext` returns nullptr when all other candidates are preempt-disabled).
+- **Fixed (2026-07-09)**: an exited task that finds no runnable candidate drops the locks and retries (bounded by `MaxExitedRetries`, then a diagnosable Panic) instead of tripping the BugOn.
 
-### 32. [ ] kernel: `RawRwSpinLock` / `RwMutex` reader can sneak past a waiting writer
+### 32. [x] kernel: `RawRwSpinLock` / `RwMutex` reader can sneak past a waiting writer (fixed in 7a88822)
 - **Files**: `src/cpp/kernel/raw_rw_spin_lock.cpp:16-32` (same pattern in `src/cpp/kernel/rw_mutex.cpp:15-31`).
 - **Summary**: `ReadLock` checks `WriterWaiting` then does a cmpxchg on `Value`. A writer may set `WriterWaiting=1` (and acquire `Value=-1`) in the window between the reader's check and its cmpxchg; the reader's cmpxchg still succeeds against a stale `Value==0` and enters with the writer waiting. Violates the "no new readers once a writer is waiting" intent; can starve writers under contention. Not a safety violation.
 - **Fix**: re-check `WriterWaiting` after acquiring, or use a single atomic that encodes both writer-waiting and reader count.
 - **Verified (2026-07-08)**: CONFIRMED (fairness only — the `v < 0` cmpxchg guard preserves safety once the writer holds `Value = -1`).
+- **Fixed (2026-07-09)**: `ReadLock` re-checks `WriterWaiting` after the cmpxchg and backs out if a writer started waiting (both `RawRwSpinLock` and `RwMutex`).
 
-### 33. [ ] kernel: `Interrupt::SharedDispatch` fires every shared handler on every shared IRQ
+### 33. [x] kernel: `Interrupt::SharedDispatch` fires every shared handler on every shared IRQ (fixed in 7a88822)
 - **File**: `src/cpp/kernel/interrupt.cpp:119-138`.
 - **Summary**: When any shared vector fires, `SharedDispatch` iterates **all** `MaxVectors` entries and invokes every handler of every vector with `HandlerCount > 1`, regardless of which vector actually asserted.
 - **Scenario**: Handlers on an unrelated GSI get called spuriously. Only safe if every shared handler no-ops when its device's interrupt-pending bit is clear (virtio ISR reads clear-on-read, so a spurious call reads 0 and returns); any handler that doesn't check will process phantom interrupts.
 - **Fix**: dispatch only the handlers registered for the vector that fired.
 - **Verified (2026-07-08)**: CONFIRMED. The firing vector isn't even a parameter of `SharedDispatch`; it loops all `MaxVectors` and calls every handler where `HandlerCount > 1`.
+- **Fixed (2026-07-09)**: `SharedDispatch` dispatches only vectors that are actually in service per `Lapic::CheckIsr` (made public), so handlers of unrelated shared vectors no longer see phantom interrupts.
 
-### 34. [ ] lib: `StrnCmp` uses signed `char` comparison
+### 34. [x] lib: `StrnCmp` uses signed `char` comparison (fixed in 49debda)
 - **File**: `src/cpp/lib/stdlib.cpp:96-117`.
 - **Summary**: `char` is signed on x86-64, so bytes with the high bit set (0x80–0xFF) compare as negative and sort before ASCII. The C standard for `strncmp` requires comparison as `unsigned char`.
 - **Scenario**: Comparing strings containing non-ASCII/binary bytes yields incorrect ordering.
 - **Fix**: cast to `unsigned char` before comparing.
 - **Verified (2026-07-08)**: CONFIRMED (`stdlib.cpp:102`, plain signed `char` compares).
+- **Fixed (2026-07-09)**: comparison is done on `unsigned char`.
 
-### 35. [ ] lib: `ParseUlong` has no overflow check
+### 35. [x] lib: `ParseUlong` has no overflow check (fixed in 49debda)
 - **File**: `src/cpp/lib/stdlib.cpp:204-218`.
 - **Summary**: `result = result * 10 + (*s - '0')` silently wraps on unsigned overflow for long numeric input, returning a bogus value with no error.
 - **Fix**: check for overflow before the multiply/add and return false.
 - **Verified (2026-07-08)**: CONFIRMED (`stdlib.cpp:214`, silent unsigned wrap, returns true).
+- **Fixed (2026-07-09)**: overflow is detected before the multiply/add and returns false.
 
-### 36. [ ] rust: NVMe `1 << lbaf.lbads` shift overflow from device-supplied data
+### 36. [x] rust: NVMe `1 << lbaf.lbads` shift overflow from device-supplied data (fixed in 78d0960)
 - **File**: `src/rust/drivers/nvme/src/lib.rs:268`.
 - **Summary**: `let sector_size: u32 = 1 << lbaf.lbads;` where `lbaf.lbads: u8` is read directly from the device's Identify Namespace response with no range check. If `lbads >= 32`, the shift overflows: debug builds panic (aborting the kernel via the panic handler); release builds yield `sector_size = 1`, which the subsequent `< 512` check rejects.
 - **Fix**: guard `lbads` (e.g. `> 12` or `> 15`) before the shift.
 - **Verified (2026-07-08)**: CONFIRMED. Correction: in release builds the shift is masked (`lbads & 31`), so it doesn't always yield 1 — `lbads % 32 ∈ {9..12}` produces a plausible-but-wrong sector size that passes the range check. Debug builds panic as filed.
+- **Fixed (2026-07-09)**: `lbads >= 32` is rejected before the shift; values 13..31 were already caught by the existing `> PAGE_SIZE` check.
 
-### 37. [ ] rust: `from_utf8_unchecked` on possibly-truncated trace buffers is UB
+### 37. [x] rust: `from_utf8_unchecked` on possibly-truncated trace buffers is UB (fixed in 78d0960)
 - **File**: `src/rust/ffi/src/trace.rs:25` (and indirectly `ffi/src/panic.rs:9`).
 - **Summary**: `TraceBuf::as_str` returns `core::str::from_utf8_unchecked(&self.buf[..self.pos])`. The buffer can be truncated mid-multibyte-UTF-8 sequence (or the panic formatting can produce non-UTF8), so producing a `&str` that is not valid UTF-8 is undefined behavior. Practically safe (bytes are only ever copied byte-wise), but technically UB.
 - **Fix**: validate UTF-8 before constructing `&str`, or pass `&[u8]`.
 - **Verified (2026-07-08)**: CONFIRMED. `write_str` truncates byte-wise at the 512-byte boundary; both consumers only take `.as_ptr()`/`.len()`, so practically safe, technically UB — as filed.
+- **Fixed (2026-07-09)**: `as_str` returns the valid UTF-8 prefix (`from_utf8` + `valid_up_to`) instead of an unchecked conversion of a possibly-split sequence.
 
-### 38. [ ] rust: r8168 ISR forms `&mut` that can alias `&mut` held by `flush_tx`/`process_rx`
+### 38. [x] rust: r8168 ISR forms `&mut` that can alias `&mut` held by `flush_tx`/`process_rx` (fixed in 78d0960)
 - **File**: `src/rust/drivers/r8168/src/lib.rs:377`.
 - **Summary**: `r8168_isr` does `let dev = unsafe { &mut *(ctx as *mut R8168Device) }`; `r8168_flush_tx` (`:408`) and `r8168_process_rx` (`:441`) do the same. If the ISR fires on one CPU while `flush_tx` runs on another, two `&mut` references to the same `R8168Device` exist simultaneously — aliasing UB. In practice the ISR only touches `INTR_STATUS` MMIO and raises softirq, so no actual data race.
 - **Fix**: use raw `(*dev).field` dereferences and shared `&MmioRegion` references as the NVMe ISR does.
 - **Verified (2026-07-08)**: CONFIRMED. `flush_tx` runs under the C++ `TxQueueLock` but the ISR takes no lock (per-CPU IRQ-disable only, comment at `:393-395`); the NVMe ISR contrast holds (raw `(*dev)` derefs at nvme `lib.rs:507`).
+- **Fixed (2026-07-09)**: the ISR takes a raw `*mut R8168Device` and a shared `&regs` reference, matching the NVMe ISR pattern.
 
-### 39. [ ] rust: NVMe `inflight` handle stored with `Relaxed` ordering before doorbell write
+### 39. [x] rust: NVMe `inflight` handle stored with `Relaxed` ordering before doorbell write (fixed in 78d0960)
 - **File**: `src/rust/drivers/nvme/src/lib.rs:636-637` (submit_io) and `:566-567` (flush).
 - **Summary**: The submitter stores `inflight[cid].store(handle, Ordering::Relaxed)` then writes the SQE + rings the SQ doorbell (volatile MMIO). The ISR loads `inflight[cid].load(Ordering::Relaxed)`. Relaxed atomics provide no ordering with respect to the volatile doorbell write in Rust's abstract machine; if the ISR fired before the store became visible, it would see `inflight[cid] == 0`, skip `wg_done`, and deadlock the submitter. On x86 (TSO) with current LLVM codegen this does not occur in practice.
 - **Fix**: use `Ordering::Release` for the store and `Ordering::Acquire` for the ISR load.
 - **Verified (2026-07-08)**: CONFIRMED for the submit→ISR handle-visibility path. Note the completion path (`inflight_status`) already uses Release/Acquire correctly; only the handle store/load pair is Relaxed.
+- **Fixed (2026-07-09)**: the inflight handle store is `Release` (both `submit_io` and `nvme_flush`) and the ISR load is `Acquire`.
 
-### 40. [ ] block: MBR accepts `LbaStart == 0` (aliases boot sector)
+### 40. [x] block: MBR accepts `LbaStart == 0` (aliases boot sector) (fixed in d037195)
 - **File**: `src/cpp/block/partition.cpp:101-106`.
 - **Summary**: A partition entry with `LbaStart == 0` is accepted; only `endSector > capacity` is rejected, not `LbaStart == 0`. It would alias the MBR boot sector.
 - **Scenario**: Real partition tables never do this, so latent.
 - **Fix**: reject `LbaStart == 0`.
 - **Verified (2026-07-08)**: CONFIRMED (`partition.cpp:98-106`; only `Type == 0 || LbaSize == 0` and `endSector > capacity` are rejected).
+- **Fixed (2026-07-09)**: entries with `LbaStart == 0` are skipped with a trace.
 
-### 41. [ ] block: `PartitionDevice::ProbeAll` is non-idempotent
+### 41. [x] block: `PartitionDevice::ProbeAll` is non-idempotent (fixed in d037195)
 - **File**: `src/cpp/block/partition.cpp:138-161`.
 - **Summary**: Calling `ProbeAll` more than once resets `InstanceCount = 0` and placement-news over `Instances[]` that are still registered in `BlockDeviceTable`, producing stale pointers and duplicate registrations with no way to unregister. Documented in a comment; called once at boot (`main.cpp:468`).
 - **Fix**: add an `Unregister` path or assert/guard against double-probing.
 - **Verified (2026-07-08)**: CONFIRMED; exactly one call site (`main.cpp:468`), so latent as documented.
+- **Fixed (2026-07-09)**: a second `ProbeAll` call is rejected by a `BugOn`'d static flag.
 
-### 42. [ ] boot: no bounds check on `tag->Size` before advancing
+### 42. [x] boot: no bounds check on `tag->Size` before advancing (fixed in 49debda)
 - **File**: `src/cpp/boot/grub.cpp:64-66`.
 - **Summary**: The tag-advancement expression `(tag->Size + 7) & ~7` is read from the Multiboot info. A malformed tag with `Size == 0` would not advance and spin forever. GRUB always produces well-formed tags, so theoretical.
 - **Fix**: break the loop if the advanced pointer does not move past `tag`.
 - **Verified (2026-07-08)**: CONFIRMED (`(0 + 7) & ~7 == 0` → `MemAdd(tag, 0) == tag`, no advance).
+- **Fixed (2026-07-09)**: a tag with `Size < sizeof(MultiBootTag)` (or extending past `TotalSize`) stops parsing instead of spinning; the advance always moves forward.
 
-### 43. [ ] boot: mmap loop trusts `mmap->EntrySize` is non-zero
+### 43. [x] boot: mmap loop trusts `mmap->EntrySize` is non-zero (fixed in 49debda)
 - **File**: `src/cpp/boot/grub.cpp:83-85`.
 - **Summary**: If `EntrySize == 0`, the loop never advances and spins. The Multiboot2 spec guarantees `EntrySize >= 16`, so not triggerable in practice.
 - **Fix**: break if `EntrySize == 0`.
 - **Verified (2026-07-08)**: CONFIRMED (same non-advance shape as #42).
+- **Fixed (2026-07-09)**: `EntrySize < sizeof(MultiBootMmapEntry)` (including 0) skips the mmap tag.
 
-### 58. [ ] TCP: CLOSING / CLOSE-WAIT do not re-ACK a retransmitted FIN — LOW
+### 58. [x] TCP: CLOSING / CLOSE-WAIT do not re-ACK a retransmitted FIN — LOW (fixed in d037195)
 - **File**: `src/cpp/net/tcp.cpp:584-616`.
 - **Summary**: Neither state has a `flags & TcpFlagFin` branch (only ACK is handled), unlike TIME-WAIT (`:617-628`) which re-ACKs. If our ACK of the peer's FIN is lost, the peer retransmits the FIN; we silently drop it and the peer retransmits until its RTO expires.
 - **Fix**: add a `TcpFlagFin` branch that sends a duplicate ACK.
 - **Verified (2026-07-08)**: CONFIRMED. CLOSING (`:584-595`) and CLOSE-WAIT (`:610-615`) handle only ACK; TIME-WAIT (`:617-628`) re-ACKs as claimed.
+- **Fixed (2026-07-09)**: both states re-ACK a retransmitted FIN, mirroring TIME-WAIT.
 
-### 59. [ ] TCP: TIME-WAIT duration is 2 s (RFC recommends 2·MSL ≈ 60-120 s) — LOW
+### 59. [x] TCP: TIME-WAIT duration is 2 s (RFC recommends 2·MSL ≈ 60-120 s) — LOW (fixed in d037195)
 - **File**: `src/cpp/net/tcp.h:38` (`TcpTimeWaitMs = 2000`).
 - **Summary**: A delayed duplicate segment from the old incarnation could arrive after TIME-WAIT expires and be matched by a new connection reusing the same 4-tuple.
 - **Fix**: raise toward 2·MSL (or accept the deviation for a hobby OS).
 - **Verified (2026-07-08)**: CONFIRMED (`tcp.h:38`).
+- **Fixed (2026-07-09)**: raised to 60 s (Linux-style stand-in for 2*MSL).
 
-### 60. [ ] TCP: SYN in ESTABLISHED is silently ignored (RFC 793 requires RST) — LOW
+### 60. [x] TCP: SYN in ESTABLISHED is silently ignored (RFC 793 requires RST) — LOW (fixed in d037195)
 - **File**: `src/cpp/net/tcp.cpp:489-527`.
 - **Summary**: The Established handler processes ACK/data/FIN but never checks `TcpFlagSyn`. RFC 793 §3.9 requires a RST.
 - **Fix**: send a RST for a segment with SYN set in ESTABLISHED.
 - **Verified (2026-07-08)**: CONFIRMED. The Established handler (`:489-527`) never tests `TcpFlagSyn`.
+- **Fixed (2026-07-09)**: an in-window SYN in ESTABLISHED sends a RST and closes the connection; a below-window retransmitted handshake SYN stays ignored.
 
-### 61. [ ] TCP: no ICMP unreachable handling for connections — LOW
+### 61. [x] TCP: no ICMP unreachable handling for connections — LOW (fixed in d037195)
 - **File**: `src/cpp/net/icmp.cpp:154-157` (type 3 counted as `RxOther`, dropped).
 - **Summary**: ICMP Destination Unreachable is silently dropped; TCP is never notified. Dead-peer / PMTU-black-hole detection relies solely on the retransmit timeout (which, per #45, may never expire).
 - **Fix**: notify TCP on ICMP type 3 (abort the connection / reduce path MTU).
 - **Verified (2026-07-08)**: CONFIRMED. Only echo request/reply are handled; every other type hits the `RxOther` else-branch; no TCP notification path exists.
+- **Fixed (2026-07-09)**: `Icmp::Process` parses type 3; codes 2/3 (protocol/port unreachable, the RFC 1122 hard errors) abort the quoted connection via the new `Tcp::OnIcmpUnreachable`, whose slot the cleanup pass then reclaims.
 
-### 62. [ ] ARP and DNS cache entries never expire (no TTL) — LOW
+### 62. [x] ARP and DNS cache entries never expire (no TTL) — LOW (fixed in d037195)
 - **Files**: `src/cpp/net/arp.cpp:46-76` (`ArpEntry` has no timestamp); `src/cpp/net/dns.cpp:84-114` (`CacheEntry` has no TTL).
 - **Summary**: Neither cache honors a TTL. If a host's MAC or a hostname's IP changes, the stale entry is served until evicted by cache pressure.
 - **Fix**: store insertion time + TTL; treat expired entries as invalid in `Lookup`.
 - **Verified (2026-07-08)**: CONFIRMED. `ArpEntry` (`arp.h:43-48`) and DNS `CacheEntry` (`dns.h:68-72`) carry no timestamp/TTL; the DNS response parser explicitly skips the TTL field (`dns.cpp:330`).
+- **Fixed (2026-07-09)**: ARP entries carry `CreatedMs` and expire after 5 minutes (expiry forces re-resolution); the DNS cache stores a per-record expiry from the response TTL, which is now parsed instead of skipped (TTL 0 is not cached per RFC 1035, TTLs are capped at 1 day).
 
-### 63. [ ] DHCP: renewal REQUEST is broadcast instead of unicast to the server — LOW
+### 63. [x] DHCP: renewal REQUEST is broadcast instead of unicast to the server — LOW (fixed in d037195)
 - **File**: `src/cpp/net/dhcp.cpp:383` (broadcast), `:420-437` (renewing path omits server-id).
 - **Summary**: RFC 2131 §4.1.4 requires the RENEWING (T1) `DHCPREQUEST` to be **unicast** to the granting server. The code broadcasts it (correct for REBINDING/T2, wrong for RENEWING).
 - **Failure scenario**: Some servers ignore broadcast renewals, or a different server NAKs → lease renewal fails and the client restarts from DISCOVER (`:182-184`), causing brief connectivity loss.
 - **Fix**: in the renewing path, unicast to `Result.ServerIp` (ARP-resolve its MAC).
 - **Verified (2026-07-08)**: CONFIRMED, with a correction: there is no separate REBINDING/T2 path — a single `renewing` bool drives one T1 renewal that always broadcasts (`:370/:383`), so the "correct for REBINDING" framing doesn't match the code. The `if (!renewing)` server-id omission is actually RFC-correct for renewal; the core broadcast-instead-of-unicast claim holds (`Result.ServerIp` is stored at `:564/:569`).
+- **Fixed (2026-07-09)**: the T1 renewal is unicast to `Result.ServerIp` (ARP-resolved, gateway-aware via `RouteIp`; broadcast fallback if resolution fails), and the broadcast flag is cleared while renewing.
 
-### 64. [ ] Vfs: `ResolvePath` does not handle `.` and `..` components — LOW
+### 64. [x] Vfs: `ResolvePath` does not handle `.` and `..` components — LOW (fixed in d037195)
 - **File**: `src/cpp/fs/vfs.cpp:200-246`.
 - **Summary**: `Lookup(cur, ".")` / `Lookup(cur, "..")` always return nullptr (neither NanoFs nor ext2 stores them as children). Any path with an intermediate `.`/`..` fails resolution; a trailing `..` can mislead `CreateFile`/`CreateDir` into targeting a literal `..`.
 - **Fix**: special-case `.` (skip) and `..` (walk to `cur->Parent`, or the mount root).
 - **Caveat**: Not triggered by the current shell (absolute paths, no `cd`).
 - **Verified (2026-07-08)**: CONFIRMED. ext2 `LoadDir` skips `.`/`..` when building children and NanoFs never creates them, so `Lookup` returns nullptr for both. The trailing-`..` create-mislead only bites NanoFs (ext2's `Create*` are stubs); the resolution failure affects both.
+- **Fixed (2026-07-09)**: `.` is skipped and `..` walks to `Parent` (the mount root stays put); both are also handled as the last component.
 
-### 65. [ ] NanoFs: superblock layout fields trusted without validation — LOW
+### 65. [x] NanoFs: superblock layout fields trusted without validation — LOW (fixed in d037195)
 - **File**: `src/cpp/fs/nanofs.cpp:53-106` (`Mount`); used at `:265`, `:281`, `:479/585/599/692`.
 - **Summary**: `Mount` validates `Magic`/`Version`/CRC32 but not `InodeStartBlock`/`DataStartBlock`/`BlockSize`/`InodeCount`/`DataBlockCount` against the compile-time constants. All I/O uses the on-disk values directly. A forged-but-valid-CRC image (e.g. `InodeStartBlock = 0`) makes `ReadInode` read the superblock as an inode, or data writes overwrite inodes.
 - **Fix**: validate each layout field equals its `Nano*` constant in `Mount`.
 - **Verified (2026-07-08)**: CONFIRMED. `Mount` checks Magic/Version/CRC only; all I/O uses on-disk `InodeStartBlock`/`DataStartBlock` directly.
+- **Fixed (2026-07-09)**: `Mount` validates `BlockSize`/`InodeCount`/`DataBlockCount`/`InodeStartBlock`/`DataStartBlock` against the compiled-in geometry.
 
-### 66. [ ] ext2: directory entries with `NameLen > 63` are silently truncated — LOW
+### 66. [x] ext2: directory entries with `NameLen > 63` are silently truncated — LOW (fixed in d037195)
 - **File**: `src/cpp/fs/ext2.cpp:566-570`.
 - **Summary**: ext2 allows 255-byte names; `VNode::Name` is 64 bytes. `LoadDir` clamps and truncates without error. Two files sharing a 63-byte prefix become unreachable-by-name collisions in `Lookup`.
 - **Fix**: reject `NameLen >= sizeof(VNode::Name)` during `LoadDir`, or widen `VNode::Name`.
 - **Verified (2026-07-08)**: CONFIRMED (`ext2.cpp:566-570`; `VNode::Name` is `char[64]`, ext2 `NameLen` is u8 up to 255; clamp-and-continue with no error).
+- **Fixed (2026-07-09)**: entries with `NameLen >= sizeof(VNode::Name)` are skipped with a trace instead of truncated into colliding names.
 
-### 67. [ ] NanoFs: `Read` silently short-reads when `Size > NanoMaxFileSize` — LOW
+### 67. [x] NanoFs: `Read` silently short-reads when `Size > NanoMaxFileSize` — LOW (fixed in d037195)
 - **File**: `src/cpp/fs/nanofs.cpp:1130-1167`.
 - **Summary**: The read loop is bounded by `blockOff < NanoMaxBlocks` (256). A crafted inode (valid CRC) with `Size > NanoMaxFileSize` (1 MB) makes `toRead` exceed 1 MB, but the loop exits at 256 blocks with `bytesRead < toRead` and `ok` still true; `Read` returns true. `ComputeDataChecksum` (`:1161`) also covers only the first 256 blocks, so the checksum check passes. The caller uses the full `toRead` length → reads uninitialized heap (info leak / wrong data).
 - **Fix**: return false when `bytesRead < toRead`, or clamp `inode->Size` to `NanoMaxFileSize` after verifying the checksum.
 - **Caveat**: Read-side sibling of #13.
 - **Verified (2026-07-08)**: CONFIRMED. Note `Read` does verify the inode checksum (`:1097`) — unlike `Write`/`RemoveRecursive` (#13) — so this one does require a forged-but-valid CRC32 (feasible; CRC32 is not cryptographic). The data-checksum check is also skipped entirely when `DataChecksum == 0`.
+- **Fixed (2026-07-09)**: `Read` rejects `Size > NanoMaxFileSize` right after the checksum verify, and a short read now fails instead of returning success with garbage in the tail.
 
-### 68. [ ] virtio_blk/scsi: `DrainQueue` re-enqueue reorders remaining requests — LOW
+### 68. [x] virtio_blk/scsi: `DrainQueue` re-enqueue reorders remaining requests — LOW (fixed in 7a88822)
 - **Files**: `src/cpp/drivers/virtio_blk.cpp:280-286`, `:364-370`; same in `src/cpp/drivers/virtio_scsi.cpp:337-342, 464-472`.
 - **Summary**: On `AllocSlot` failure or ring-full mid-batch, the code does `InsertHead(&batch[i]->Link)` then `InsertTail(&batch[j]->Link)` for j=i+1.., putting `batch[i]` at the head but the rest at the tail (behind pre-existing items). Original order `batch[i..], existing` becomes `batch[i], existing, batch[i+1..]` — a reordering that can let a later-enqueued flush leapfrog earlier writes.
 - **Fix**: re-enqueue all remaining batch items at the head in reverse order to preserve the original order.
 - **Verified (2026-07-08)**: CONFIRMED in both drivers and both failure paths (blk `:280-286`/`:362-371`, scsi `:335-342`/`:464-472`).
 - **Caveat**: Limited impact under the current synchronous I/O model (one in-flight per caller); matters under concurrent I/O.
+- **Fixed (2026-07-09)**: failed batches are re-inserted at the queue head in reverse order, preserving the original request order (both drivers, both failure paths).
 
-### 69. [ ] virtio_rng: never suppresses interrupts, registers no handler, ISR never read — LOW
+### 69. [x] virtio_rng: never suppresses interrupts, registers no handler, ISR never read — LOW (fixed in 7a88822)
 - **File**: `src/cpp/drivers/virtio_rng.cpp` (whole file); `src/cpp/drivers/virtqueue.cpp:77` (`Avail->Flags = 0`).
 - **Summary**: The driver is polling-based (`GetRandom` polls `HasUsed`) but never sets `VIRTQ_AVAIL_F_NO_INTERRUPT`, never enables MSI-X, and never registers an INTx handler. On completion the device asserts INTx (clear-on-read ISR); since the ISR is never read, the level line stays asserted.
 - **Failure scenario**: If virtio-rng's GSI is shared with another INTx device whose handler unmasks the shared line, the asserted level is re-delivered in a tight loop (handler reads its own ISR=0, returns, line still asserted) → interrupt storm / hang. If the GSI stays masked (no handler registered), it is latent.
 - **Fix**: set `Avail->Flags = VIRTQ_AVAIL_F_NO_INTERRUPT` after `Queue.Setup`.
 - **Verified (2026-07-08)**: CONFIRMED end-to-end (no ISR read, no MSI-X, no INTx handler; `Avail->Flags` stays 0). Supporting evidence: virtio-scsi explicitly `Reset()`s an empty HBA to avoid exactly this shared-line storm — a mitigation the RNG driver lacks.
 - **Caveat**: Latent under QEMU default PCI slot assignment (GSI stays masked). Same shape as #16.
+- **Fixed (2026-07-09)**: the queue sets `VIRTQ_AVAIL_F_NO_INTERRUPT` via the new `VirtQueue::DisableDeviceInterrupts()` right after setup.
 
-### 70. [ ] mm: `Pool::Free` and `VaAllocator::Free` have no double-free detection — LOW
+### 70. [x] mm: `Pool::Free` and `VaAllocator::Free` have no double-free detection — LOW (fixed in 49debda)
 - **Files**: `src/cpp/mm/pool.cpp:107-137` (`BlockCount++` with no check); `src/cpp/mm/va_allocator.cpp:94-103` (`ClearBit` unconditional).
 - **Summary**: `Pool::Free` increments `BlockCount` without checking the block was already freed → `BlockCount` inflates past `MaxBlockCount`, the page is never seen as full-free, and a later free can prematurely return the page to the page allocator while blocks are still live → UAF. `VaAllocator::Free` clears an already-clear bit silently → the next `Alloc` can return the same VA to two callers → overlapping allocations.
 - **Fix**: `BugOn` on double-free (Pool: a self-pointing `Link` / allocated flag; VaAllocator: bit already clear).
 - **Verified (2026-07-08)**: CONFIRMED. Nuance: the Pool release trigger is an equality check (`BlockCount == MaxBlockCount`), so a double-free that lands the count exactly on the max while live blocks remain releases the page prematurely (UAF); overshooting past it instead skips the release. VaAllocator double-VA-handout confirmed.
+- **Fixed (2026-07-09)**: `Pool::Free` stamps freed blocks with a `FreedTag` sentinel and BugOns on a re-free (plus a `BlockCount >= MaxBlockCount` bound); `VaAllocator::Free` BugOns when the bit is already clear (new `Bitmap::TestBit`).
 
-### 71. [ ] mm: `AllocatorImpl::Alloc` integer overflow in `size + sizeof(Header)` — LOW
+### 71. [x] mm: `AllocatorImpl::Alloc` integer overflow in `size + sizeof(Header)` — LOW (fixed in 49debda)
 - **File**: `src/cpp/mm/allocator.cpp:51-54`.
 - **Summary**: `reqSize = size + sizeof(*header)` with no overflow check. A near-`SIZE_MAX` `size` wraps to a small value, bypassing the `reqSize >= PageSize/2` page path; `Log2(reqSize)` returns a small log and a tiny block is returned for a huge `size` → caller overwrites adjacent pool memory.
 - **Fix**: reject `size > SIZE_MAX - sizeof(Header)`.
 - **Verified (2026-07-08)**: CONFIRMED. The internal `BugOn((1 << log) < size)` compares against the already-wrapped `reqSize`, so it does not catch the overflow.
+- **Fixed (2026-07-09)**: sizes that would overflow `size + sizeof(Header)` return nullptr.
 
-### 72. [ ] lib: `ListEntry` move ctor/assignment corrupts state when the source is empty — LOW
+### 72. [x] lib: `ListEntry` move ctor/assignment corrupts state when the source is empty — LOW (fixed in 49debda)
 - **File**: `src/cpp/lib/list_entry.cpp:111-130`.
 - **Summary**: Move-constructing from an empty source (`Flink == Blink == &other`) leaves the destination's `Flink` pointing at the source's sentinel rather than itself → `IsEmpty()` returns false and traversal loops forever treating the sentinel as a data node. The move-assignment operator has the same bug.
 - **Fix**: `Init()` first and bail if `other.IsEmpty()` before splicing.
 - **Caveat**: Latent — no current code move-constructs a `ListEntry` from an empty source (containing structs `delete` their move ctors).
 - **Verified (2026-07-08)**: CONFIRMED. Splice traced: empty source leaves `this->Flink == &other`, `IsEmpty()` false, traversal loops via the source sentinel. Move-assignment has the identical defect. No invocation exists anywhere in src/cpp — latent as filed.
+- **Fixed (2026-07-09)**: move ctor/assignment `Init()` the destination and leave the source alone when the source is empty.
 
-### 73. [ ] TimerTable: `StartTimer` does not reject `Period == 0` (infinite re-fire) — LOW
+### 73. [x] TimerTable: `StartTimer` does not reject `Period == 0` (infinite re-fire) — LOW (fixed in 7a88822)
 - **File**: `src/cpp/kernel/timer.cpp:20-35` (`StartTimer`), `:49-64` (`ProcessTimers`).
 - **Summary**: `ProcessTimers` always does `Expired += Period` (`:61`). With `Period == 0`, `Expired` never advances and the callback fires on every tick (100 Hz) until `StopTimer`. The Rust FFI bridge rejects `period_ns == 0` (`rust_ffi.cpp:826`), but C++ callers (tcp.cpp, 8042.cpp) are unguarded.
 - **Fix**: reject `period == 0` in `StartTimer`, or make 0 mean one-shot.
 - **Verified (2026-07-08)**: CONFIRMED, latent: the Rust bridge rejects `period_ns == 0` (`rust_ffi.cpp:826`); both C++ callers currently pass nonzero constants, so it's defense-in-depth as filed.
+- **Fixed (2026-07-09)**: `StartTimer` rejects a zero period.
 
-### 74. [ ] TimerTable: `ProcessTimers` catch-up storm after a delayed tick — LOW
+### 74. [x] TimerTable: `ProcessTimers` catch-up storm after a delayed tick — LOW (fixed in 7a88822)
 - **File**: `src/cpp/kernel/timer.cpp:49-64`.
 - **Summary**: After a callback fires, `Expired += Period` (`:61`). If `ProcessTimers` was delayed (long IRQ handler / long `ProcessIPITasks`), `now` can be far ahead of `Expired`; after `+= Period`, `Expired` may still be `<= now`, so the callback fires again next tick — a burst of rapid callbacks (e.g. a 100 ms timer firing 10× in 100 ms after a 1 s delay).
 - **Fix**: set `Expired = now + Period` (skip missed ticks) instead of `Expired += Period`.
 - **Verified (2026-07-08)**: CONFIRMED. The loop fires at most once per `ProcessTimers` call, so the burst is one fire per 10 ms tick until `Expired` catches up — the "10× in 100 ms" example is accurate.
+- **Fixed (2026-07-09)**: `Expired = now + Period` -- missed ticks are skipped instead of replayed.
 
-### 75. [ ] `Cpu::IPI` uses `Index == 0` instead of `BspIndex` to gate `ProcessTimers` — LOW
+### 75. [x] `Cpu::IPI` uses `Index == 0` instead of `BspIndex` to gate `ProcessTimers` — LOW (fixed in 7a88822)
 - **File**: `src/cpp/kernel/cpu.cpp:486-488`.
 - **Summary**: The `if (Index == 0)` check assumes the BSP's index is always 0, but `BspIndex` is the LAPIC APIC ID (`main.cpp:771`). On hardware where the BSP's APIC ID is non-zero, `ProcessTimers` never runs on any CPU → TCP retransmits, keyboard autorepeat, and Rust periodic timers silently stop firing.
 - **Fix**: compare against `GetBspIndexLockHeld()` (or cache it in a lock-free variable).
 - **Caveat**: On QEMU/KVM the BSP APIC ID is always 0, so latent.
 - **Verified (2026-07-08)**: CONFIRMED. `Index` is genuinely the LAPIC APIC ID (`InsertCpu(lapicEntry->ApicId)`, `acpi.cpp:304`; `SendIPISelf` uses `Index` as the IPI destination). Nuance: if some AP happens to have APIC ID 0, timers run on that AP instead of the BSP (works, wrong core); the hard failure is when no CPU has APIC ID 0.
+- **Fixed (2026-07-09)**: the check compares against a lock-free cached BSP index (`BspIndexCached`, mirrored by `SetBspIndex`).
 
-### 76. [ ] LAPIC `SendInit`/`SendStartup` race with the tick IPI on ICR — LOW
+### 76. [x] LAPIC `SendInit`/`SendStartup` race with the tick IPI on ICR — LOW (fixed in 7a88822)
 - **File**: `src/cpp/drivers/lapic.cpp:90-110`.
 - **Summary**: `SendInit`/`SendStartup` write ICR-high then ICR-low **without disabling interrupts**, unlike `SendIPI` (`:112-118`) which does `InterruptDisable()` first (with a comment at `:114-116` explicitly warning that two senders must not interleave or the second clobbers IcrHigh). The PIT/HPET handler's `SendIPI` (via `SendIPIAll`) can fire between `SendInit`'s two writes and clobber ICR-high → INIT/SIPI sent to the wrong CPU → the AP never starts → `StartAll` times out → panic.
 - **Fix**: `InterruptDisable()` around the two ICR writes, as in `SendIPI`.
 - **Caveat**: Extremely small window (~20 ns vs 10 ms tick); effectively never on QEMU. Related to the (since-retracted) #46 but a distinct mechanism.
 - **Verified (2026-07-08)**: PARTIAL — the missing `InterruptDisable` in `SendInit`/`SendStartup` is real, but the failure scenario is **not currently reachable**: both are called only inside `StartAll`'s `AutoLock(Lock)` scopes (`cpu.cpp:178-187`, `:200-210`), and `AutoLock` disables IRQs via `PreemptIrqSave`, so the tick cannot interrupt between the two ICR writes (the ICR is per-CPU; other CPUs write their own). Latent fragility only — any future call site outside a lock would be exposed.
+- **Fixed (2026-07-09)**: both functions disable IRQs around the ICR write pair, like `SendIPI`.
 
-### 77. [ ] MSI-X: 64-bit BAR size probe writes only the low 32 bits — LOW
+### 77. [x] MSI-X: 64-bit BAR size probe writes only the low 32 bits — LOW (fixed in 7a88822)
 - **File**: `src/cpp/drivers/msix.cpp:94-96`.
 - **Summary**: BAR size probing writes `0xFFFFFFFF` to only the low register. For a 64-bit BAR the PCI spec requires writing both halves; with only the low half probed, `barSize` computes as 1 for any BAR ≥ 4 GB and the table mapping is rejected.
 - **Fix**: write `0xFFFFFFFF` to both `bar` and `bar+1`, compute `barSize` from the combined 64-bit mask.
 - **Caveat**: MSI-X table BARs are small; never triggered in practice.
 - **Verified (2026-07-08)**: CONFIRMED, one correction: for a ≥4 GB 64-bit BAR the computed `barSize` is 16, not 1 — same outcome (table mapping wrongly rejected).
+- **Fixed (2026-07-09)**: both halves of a 64-bit BAR are size-probed (and the high half restored); the size comes from the combined 64-bit mask.
 
-### 78. [ ] IOAPIC: `SetEntry` writes the low redirection register before the high — LOW
+### 78. [x] IOAPIC: `SetEntry` writes the low redirection register before the high — LOW (fixed in 7a88822)
 - **File**: `src/cpp/drivers/ioapic.cpp:64-68`.
 - **Summary**: Low (vector/mask/trigger) is written first, then high (destination). When unmasking an already-asserted level interrupt, there is a brief window where the entry is unmasked with the old (default BSP) destination → a spurious interrupt is delivered to APIC ID 0.
 - **Fix**: write the high register first, then the low; or mask before modifying and unmask after.
 - **Verified (2026-07-08)**: CONFIRMED (`ioapic.cpp:64-68`; the stale destination is the masking-pass default from `Enable`).
+- **Fixed (2026-07-09)**: the high (destination) register is written before the low (vector/mask) one.
 
-### 79. [ ] HPET: `Setup` doesn't check timer 0 periodic-mode capability — LOW
+### 79. [x] HPET: `Setup` doesn't check timer 0 periodic-mode capability — LOW (fixed in 7a88822)
 - **File**: `src/cpp/drivers/hpet.cpp:96-99`.
 - **Summary**: Timer 0 is programmed with `TimerTypePer` (periodic) without checking `TN_PER_INT_CAP` (bit 4). If the timer lacks periodic support, the bit is ignored, the timer fires once, and the system tick stops.
 - **Fix**: read the timer config; if periodic is unsupported, fall back to the PIT or one-shot with re-arming.
 - **Caveat**: QEMU's timer 0 supports periodic mode.
 - **Verified (2026-07-08)**: CONFIRMED (`TimerTypePer` written unconditionally; the timer config register is never read back).
+- **Fixed (2026-07-09)**: `Setup` checks `TN_PER_INT_CAP` and falls back to the PIT when timer 0 lacks periodic mode.
 
-### 80. [ ] MSI-X: `EnableVector` doesn't clear the Function Mask bit — LOW
+### 80. [x] MSI-X: `EnableVector` doesn't clear the Function Mask bit — LOW (fixed in 7a88822)
 - **File**: `src/cpp/drivers/msix.cpp:246-248`.
 - **Summary**: Enabling MSI-X sets `MsixControlEnable` (bit 15) but never clears Function Mask (bit 14). If bit 14 was left set by the BIOS/previous driver, all vectors stay masked after enable → no interrupts delivered.
 - **Fix**: `mc = (mc | MsixControlEnable) & ~MsixControlFuncMask`.
 - **Caveat**: Bit 14 is 0 after PCI reset.
 - **Verified (2026-07-08)**: CONFIRMED (no Function-Mask constant even exists in msix.cpp; bit 14 is never touched).
+- **Fixed (2026-07-09)**: the enable write also clears Function Mask (bit 14).
 
-### 81. [ ] Serial `Wait` and 8042 `ReadData` have no timeout — LOW
+### 81. [x] Serial `Wait` and 8042 `ReadData` have no timeout — LOW (fixed in 7a88822)
 - **Files**: `src/cpp/drivers/serial.cpp:58-72`; `src/cpp/drivers/8042.cpp:52-58` (also the ctor at `:25` and ISR at `:66`).
 - **Summary**: Both poll a status bit with backoff but no maximum iteration count. A stuck transmitter (serial) or stuck 8042 output buffer hangs the kernel indefinitely (at boot for the 8042 ctor, or in the ISR).
 - **Fix**: bounded iteration count; drop the char / break out when exceeded.
 - **Caveat**: QEMU's serial and 8042 are always ready.
 - **Verified (2026-07-08)**: CONFIRMED. Nuance: the 8042 `ReadData` loop is a drain loop (`while (status & 1)`), not wait-for-ready, but the unbounded-on-status-bit hang is real for both.
+- **Fixed (2026-07-09)**: `Serial::Wait` gives up after 20 doubling rounds (~1M pauses total); `IO8042::ReadData` drains at most `MaxDrainIterations` (4096) bytes per call.
 
-### 82. [ ] ACPI: `ParseRsdp` doesn't validate the extended checksum for ACPI 2.0+ — LOW
+### 82. [x] ACPI: `ParseRsdp` doesn't validate the extended checksum for ACPI 2.0+ — LOW (fixed in 7a88822)
 - **File**: `src/cpp/drivers/acpi.cpp:48-64`.
 - **Summary**: Only the first-part checksum is validated. For Revision ≥ 2 the `ExtendedChecksum` (covering the whole `RSDPDescriptor20`) is not checked, nor is `Revision` consulted. A corrupted ACPI 2.0 RSDP with a valid first-part checksum is accepted.
 - **Fix**: for `Revision >= 2`, validate `ComputeSum(rsdp, sizeof(RSDPDescriptor20)) == 0`.
 - **Verified (2026-07-08)**: CONFIRMED (`Revision` is read only for tracing; `ExtendedChecksum` never verified).
+- **Fixed (2026-07-09)**: for `Revision >= 2` the extended checksum over the whole descriptor is validated.
 
-### 83. [ ] 8042: shift + number/symbol keys produce wrong characters — LOW
+### 83. [x] 8042: shift + number/symbol keys produce wrong characters — LOW (fixed in 7a88822)
 - **File**: `src/cpp/drivers/8042.cpp:108-120`.
 - **Summary**: `char c = map[code] ^ Mod;` with `Mod = 0x20` for shift only toggles case for letters (`'a'^0x20='A'`). For numbers/symbols it produces control chars (e.g. `'1'`(0x31)`^0x20 = 0x11` instead of `'!'`).
 - **Failure scenario**: Shifted number/symbol keys produce garbage; only letters shift correctly.
 - **Fix**: use a separate shifted scancode map (or special-case non-letter keys).
 - **Verified (2026-07-08)**: CONFIRMED (`'1' ^ 0x20 = 0x11` (DC1); only letters toggle correctly).
+- **Fixed (2026-07-09)**: a dedicated shifted scancode map replaces the XOR-0x20 hack; shifted digits/symbols now produce the right characters (`:`, `!`, `_`, `?` verified typeable in QEMU).
 
-### 84. [ ] boot: Multiboot2 tag parsing lacks several bounds checks — LOW
+### 84. [x] boot: Multiboot2 tag parsing lacks several bounds checks — LOW (fixed in 49debda)
 - **File**: `src/cpp/boot/grub.cpp:64-129`.
 - **Summary**: Three defense-in-depth gaps in the same tag loop: (a) the loop terminates only on `Type == End` with no check that `tag` stays within `MbInfo->TotalSize` — a missing/clobbered End tag walks past the buffer; (b) the framebuffer (`:120-129`) and bootdev (`:71-77`) handlers cast and access fields without verifying `tag->Size >= sizeof(...)`; (c) the cmdline (`:96-107`) is passed to unbounded `StrLen`/`SnPrintf` without verifying a NUL within the tag. (The ACPI handler at `:46` does check `tag->Size` — the pattern is just inconsistent.)
 - **Fix**: bound the loop by `TotalSize`; check `tag->Size >= sizeof(struct)` before field access; use bounded string copy for cmdline.
 - **Caveat**: GRUB always produces well-formed tags; defense-in-depth (siblings of #42/#43).
 - **Verified (2026-07-08)**: CONFIRMED, all three sub-claims plus the inconsistency (the ACPI handler does check `tag->Size` at `grub.cpp:46`).
+- **Fixed (2026-07-09)**: the tag loop is bounded by `TotalSize`; bootdev/mmap/framebuffer handlers check `tag->Size >= sizeof(struct)`; the cmdline must be NUL-terminated within the tag or it is ignored.
 
-### 85. [ ] rust: `kernel_alloc` / `kernel_alloc_dma_pages` bridge gaps — LOW
+### 85. [x] rust: `kernel_alloc` / `kernel_alloc_dma_pages` bridge gaps — LOW (fixed in 78d0960)
 - **Files**: `src/cpp/kernel/rust_ffi.cpp:46-51` (`kernel_alloc`), `:344` (`kernel_alloc_dma_pages`).
 - **Summary**: (a) `kernel_alloc(size, align)` validates `align` is a power of 2 and `<= 8` but then calls `Mm::Alloc(size, RustAllocTag)` **without passing `align`**; any future Rust type needing alignment > 8 (e.g. `#[repr(align(16))]`, SIMD) hits the `Panic` for `align > 8`. (b) `*actual_pages_out = 1UL << Log2(count)` ceiling-rounds to the next power of 2; if `AllocMapPages` allocates exactly `count` (non-power-of-2) pages, `DmaBuffer::len()` overestimates by up to a page → potential access to unmapped memory.
 - **Fix**: pass `align` through (or over-allocate + align); set `*actual_pages_out = count` (or verify `AllocMapPages` also ceiling-rounds).
 - **Caveat**: Latent — all current Rust allocations use alignment ≤ 8 and 1-page DMA buffers.
 - **Verified (2026-07-08)**: PARTIAL — (a) `align` dropped: CONFIRMED (`Mm::Alloc` has no align parameter). (b) `actual_pages_out` overestimate: REFUTED — `Mm::AllocMapPages` (`page_allocator.cpp:247-258`) ceiling-rounds with the same `1UL << Log2(count)`, so the reported count exactly matches what was mapped; no unmapped-access risk. Only sub-claim (a) remains open.
+- **Fixed (2026-07-09)**: sub-claim (a): `kernel_alloc` over-allocates for `align > 8` and stashes the original pointer just below the aligned address; `kernel_free` now receives `(ptr, size, align)` (Rust's `GlobalAlloc` passes the layout) and unwraps the stash. Sub-claim (b) was refuted on verification.
 
 ---
 
@@ -646,14 +698,16 @@ Review of each component, focusing on correctness bugs (medium depth). Each find
 
 ## Status
 
-- **Total open issues**: 53 (0 Critical/High, 1 Medium, 52 Low)
-- **Fixed**: 30 — Critical/High: #1, #2, #4, #5, #44, #45 (11c608e); Medium: #3, #6, #7, #8, #9, #10, #11, #12, #13, #14, #15, #17, #47, #48, #49, #50, #51, #52, #53, #54, #55, #56, #57; Low: #23 (via #50)
+- **Total open issues**: 1 (0 Critical/High, 1 Medium — #16, reviewed-no-change; 0 Low)
+- **Fixed**: 82 — Critical/High: #1, #2, #4, #5, #44, #45 (11c608e); Medium: #3, #6, #7, #8, #9, #10, #11, #12, #13, #14, #15, #17, #47, #48, #49, #50, #51, #52, #53, #54, #55, #56, #57; Low: #23 (via #50), #26/#27/#34/#35/#42/#43/#70/#71/#72/#84 (49debda), #28/#30–#33/#68/#69/#73–#83 (7a88822), #18–#22/#24/#25/#40/#41/#58–#67 (d037195), #36–#39/#85 (78d0960)
 - **Reviewed, no code change**: #16 (the suggested skip-EOI fix is unsafe; see the issue's 2026-07-09 note)
 - **Retracted (not bugs)**: 3 (mm "FreePage before Put", #46 PIT/HPET tick-handler deadlock, #29 LAPIC DFR flat-mode value)
 
 **Fix pass (2026-07-09, commit 11c608e)**: all six Critical/High issues fixed. Validated by a full Docker build (`make nocheck` + `make check`/cppcheck clean) and a headless QEMU boot: self-tests pass, DHCP acquires a lease (RX through the new `NetDeviceTable` softirq dispatch + descriptor map), `wget example.com/` completes an HTTP GET over TCP (`tcpstat` shows the connection slot reclaimed), and nanofs format/mount/write/cat/overwrite round-trips on a virtio-blk disk.
 
 **Medium fix pass (2026-07-09)**: 23 of the 24 Medium issues fixed (all but #16, which was resolved as reviewed-no-change), prioritized by real-world impact: TCP protocol correctness first (#8 window updates, #54 persist timer, #53 FIN-WAIT-2 timer, #6/#7 half-close data handling), then SMP/data-integrity (#3 timer locking, #14 NanoFs durability, #12 NVMe shutdown, #57 ISR unregister sync, #56 run-on-exited-CPU hang), then crafted-image/robustness hardening (#13, #15, #48, #49, #50, #51, plus lib fixes #10, #11, #52 and #17 virtqueue size), and finally #9 (per-CPU kvmclock), #47 (low-RAM reclaim, ~8-20 MB back to the allocator), #55 (HTTP chunked decoding).
+
+**Low fix pass (2026-07-09, commits 49debda/7a88822/d037195/78d0960)**: all 52 remaining Low issues fixed (#27 by documenting the boot-ordering constraint, per the issue's own fix suggestion). Notable behavior changes: TIME-WAIT is now 60 s (#59), NanoFs commits allocation bitmaps after content writes with a single FUA instead of one per AllocDataBlock (#22), the Rust `kernel_free` FFI now takes `(ptr, size, align)` (#85), and shifted digits/symbols finally type correctly in the shell (#83). Validated by a full Docker build (`make rust` + `make nocheck` + `make check`/cppcheck clean) and headless QEMU boots on both the plain-ISO and blk/scsi/nvme/rng-attached configurations: all self-tests pass, DHCP + DNS + `wget example.com/` work (`tcpstat` conns=0 after), `HI: Test_1!?` types correctly (#83), NanoFs format/mkdir/write/cat/overwrite round-trips, the file survives a guest reboot (#22 ordering), `ls /mnt/dir1/..` resolves (#64), and `random 8` returns entropy from the polled virtio-rng (#69).
 
 To mark an issue fixed, change its `- [ ]` to `- [x]` and optionally append a commit/PR reference on the same line, e.g.:
 
