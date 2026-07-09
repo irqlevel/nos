@@ -374,14 +374,19 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
 /* Interrupt service routine */
 
 extern "C" fn r8168_isr(ctx: *mut u8) {
-    let dev = unsafe { &mut *(ctx as *mut R8168Device) };
+    /* Raw derefs, not `&mut`: flush_tx/process_rx may hold their own
+     * `&mut R8168Device` on another CPU at this moment (per-CPU IRQ
+     * disable does not exclude them), and two live `&mut` to the same
+     * object are UB. The ISR only touches MMIO registers. */
+    let dev = ctx as *mut R8168Device;
+    let regs = unsafe { &(*dev).regs };
 
     /* Read and clear (write-1-to-clear) interrupt status */
-    let status = dev.regs.read16(INTR_STATUS);
+    let status = regs.read16(INTR_STATUS);
     if status == 0 {
         return; /* spurious */
     }
-    dev.regs.write16(INTR_STATUS, status);
+    regs.write16(INTR_STATUS, status);
 
     if status & ISR_SYS_ERR != 0 {
         trace!(0, "r8168: fatal PCI system error in ISR");

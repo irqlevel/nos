@@ -271,6 +271,12 @@ fn init_device(dev: pci::PciDevice) {
         (id_ns as *const IdentifyNamespace as *const u8).add(128) as *const LbaFormat
     };
     let lbaf = unsafe { &*lbaf_ptr.add(lbaf_idx) };
+    /* lbads comes from the device; a value >= 32 would overflow the shift
+     * (masked in release builds -> plausible-but-wrong sector size). */
+    if lbaf.lbads >= 32 {
+        trace!(0, "NVMe: invalid lbads {}, skipping", lbaf.lbads);
+        return;
+    }
     let sector_size: u32 = 1 << lbaf.lbads;
     trace!(0, "NVMe: ns1 capacity={} sectors sector_size={}", capacity, sector_size);
     if sector_size < 512 || sector_size as usize > PAGE_SIZE {
@@ -522,7 +528,8 @@ extern "C" fn nvme_msix_handler(ctx: *mut u8) {
         unsafe { (*dev).io_cq.ring_cq_doorbell(&(*dev).regs) };
 
         let cid = cqe.cid as usize % IO_QUEUE_DEPTH;
-        let wg_handle = unsafe { (*dev).inflight[cid].load(Ordering::Relaxed) };
+        /* Acquire pairs with the submitter's Release store of the handle */
+        let wg_handle = unsafe { (*dev).inflight[cid].load(Ordering::Acquire) };
         completed = completed + 1;
         if wg_handle != 0 {
             unsafe { (*dev).inflight_status[cid].store(cqe.status_code(), Ordering::Relaxed) };
@@ -571,7 +578,9 @@ extern "C" fn nvme_flush(ctx: *mut u8) -> i32 {
         };
 
         unsafe { (*dev).inflight_status[cid as usize].store(0, Ordering::Relaxed) };
-        unsafe { (*dev).inflight[cid as usize].store(completion.raw_handle(), Ordering::Relaxed) };
+        /* Release: the handle must be visible to the ISR before the
+         * doorbell write can trigger the completion */
+        unsafe { (*dev).inflight[cid as usize].store(completion.raw_handle(), Ordering::Release) };
         let mut cmd = SubmissionEntry::new(OPC_FLUSH, cid);
         cmd.nsid = 1;
         unsafe { (*dev).io_sq.submit(&cmd) };
@@ -641,7 +650,9 @@ fn submit_io(
         };
 
         unsafe { (*dev).inflight_status[cid as usize].store(0, Ordering::Relaxed) };
-        unsafe { (*dev).inflight[cid as usize].store(completion.raw_handle(), Ordering::Relaxed) };
+        /* Release: the handle must be visible to the ISR before the
+         * doorbell write can trigger the completion */
+        unsafe { (*dev).inflight[cid as usize].store(completion.raw_handle(), Ordering::Release) };
 
         let mut cmd = SubmissionEntry::new(opcode, cid);
         cmd.nsid  = 1;

@@ -45,13 +45,33 @@ void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long le
 
 void* kernel_alloc(unsigned long size, unsigned long align)
 {
-    if (align == 0 || (align & (align - 1)) != 0 || align > 8)
+    if (align == 0 || (align & (align - 1)) != 0)
         Panic("kernel_alloc: bad align %u", align);
-    return Kernel::Mm::Alloc(size, RustAllocTag);
+
+    /* Mm::Alloc guarantees 8-byte alignment */
+    if (align <= 8)
+        return Kernel::Mm::Alloc(size, RustAllocTag);
+
+    /* Over-aligned (#[repr(align)] / SIMD types): over-allocate and stash
+       the original pointer just below the aligned address for kernel_free */
+    if (size > (unsigned long)-1 - align - sizeof(void*))
+        return nullptr;
+    void* raw = Kernel::Mm::Alloc(size + align + sizeof(void*), RustAllocTag);
+    if (raw == nullptr)
+        return nullptr;
+    unsigned long aligned =
+        Stdlib::RoundUp((unsigned long)raw + sizeof(void*), align);
+    ((void**)aligned)[-1] = raw;
+    return (void*)aligned;
 }
 
-void kernel_free(void* ptr)
+void kernel_free(void* ptr, unsigned long size, unsigned long align)
 {
+    (void)size;
+    if (ptr == nullptr)
+        return;
+    if (align > 8)
+        ptr = ((void**)ptr)[-1];
     Kernel::Mm::Free(ptr);
 }
 
