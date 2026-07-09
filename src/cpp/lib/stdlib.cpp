@@ -251,6 +251,9 @@ const char* NextToken(const char* s, const char*& end)
 
 ulong TokenCopy(const char* start, const char* end, char* dst, ulong dstSize)
 {
+    if (dstSize == 0)
+        return 0;
+
     ulong len = (ulong)(end - start);
     if (len >= dstSize)
         len = dstSize - 1;

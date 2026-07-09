@@ -57,6 +57,12 @@ struct NvmeDevice {
     _msix_irq:   msix::MsixInterrupt,
 
     db_stride:   usize,
+
+    /* CAP.TO-derived controller enable/disable timeout (ms), as used during
+     * init.  Drop must honor it too: freeing queue DMA while the controller
+     * is still fetching entries is DMA into freed memory. */
+    disable_timeout_ms: u64,
+
     /* Bitmask of in-use CID slots (1 = in use).  Replaces the linear
      * next_cid counter — avoids CID reuse while a previous command is still
      * in flight.  W=1 → 64 slots, matches IO_QUEUE_DEPTH=64.  Slots beyond
@@ -94,7 +100,7 @@ impl Drop for NvmeDevice {
          * Remaining fields (queues, BAR mapping) drop implicitly after. */
         let cc = self.regs.read32(REG_CC);
         self.regs.write32(REG_CC, cc & !CC_EN);
-        if !wait_csts_clear(&self.regs, CSTS_RDY, 100) {
+        if !wait_csts_clear(&self.regs, CSTS_RDY, self.disable_timeout_ms) {
             trace!(0, "NVMe: controller did not go not-ready on shutdown");
         }
         self._msix_irq.disarm();
@@ -347,6 +353,7 @@ fn init_device(dev: pci::PciDevice) {
         _msix_table: msix_table,
         _msix_irq: msix::MsixInterrupt::empty(),
         db_stride: db_stride as usize,
+        disable_timeout_ms: to_ms,
         cid_map: {
             let mut m = BitMap::new();
             /* Permanently reserve slots the SQ cannot hold: at most

@@ -89,6 +89,19 @@ int UlongToString(ulong src, u8 dst_base, char *dst, size_t dst_size, bool lower
     return 0;
 }
 
+/* Standard vsnprintf always NUL-terminates when size > 0. Terminate at the
+   last written position on every error/truncation path, so callers that
+   ignore a -1 can never read past the buffer through an unterminated
+   string. */
+static void TerminateOnError(char *s, size_t size, size_t pos)
+{
+    if (size == 0)
+        return;
+    if (pos >= size)
+        pos = size - 1;
+    s[pos] = '\0';
+}
+
 int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
 {
     size_t i;
@@ -106,12 +119,12 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
             char tp = fmt[i];
 
             if (tp == '\0')
-                return -1;
+                { TerminateOnError(s, size, (size_t)pos); return -1; }
 
             /* Literal %% */
             if (tp == '%') {
                 if (!PutChar('%', s, size, pos++))
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
                 i++;
                 continue;
             }
@@ -127,7 +140,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 i++;
                 tp = fmt[i];
                 if (tp == '\0')
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
             }
             if (leftAlign)
                 zeroPad = false;
@@ -139,7 +152,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 i++;
                 tp = fmt[i];
                 if (tp == '\0')
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
             }
 
             /* Skip optional 'l' length modifier */
@@ -147,7 +160,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 i++;
                 tp = fmt[i];
                 if (tp == '\0')
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
             }
 
             i++; /* consume the specifier */
@@ -158,21 +171,21 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 char tmp[24];
                 rc = __UlongToString(val, 10, tmp, sizeof(tmp));
                 if (rc < 0)
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
                 if (!leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
-                        return -1;
+                        { TerminateOnError(s, size, (size_t)pos); return -1; }
                 }
                 if (leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 break;
@@ -184,41 +197,41 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 char tmp[24];
                 rc = __UlongToString(uval, 10, tmp, sizeof(tmp));
                 if (rc < 0)
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
                 int totalLen = rc + (negative ? 1 : 0);
                 if (!leftAlign) {
                     if (negative && zeroPad) {
                         /* Sign before zero padding: -00042 */
                         if (!PutChar('-', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                         for (int p = 0; p < width - totalLen; p++) {
                             if (!PutChar('0', s, size, pos++))
-                                return -1;
+                                { TerminateOnError(s, size, (size_t)pos); return -1; }
                         }
                     } else {
                         for (int p = 0; p < width - totalLen; p++) {
                             if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                                return -1;
+                                { TerminateOnError(s, size, (size_t)pos); return -1; }
                         }
                         if (negative) {
                             if (!PutChar('-', s, size, pos++))
-                                return -1;
+                                { TerminateOnError(s, size, (size_t)pos); return -1; }
                         }
                     }
                 } else {
                     if (negative) {
                         if (!PutChar('-', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
-                        return -1;
+                        { TerminateOnError(s, size, (size_t)pos); return -1; }
                 }
                 if (leftAlign) {
                     for (int p = 0; p < width - totalLen; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 break;
@@ -229,48 +242,48 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 char tmp[24];
                 rc = __UlongToString(val, 16, tmp, sizeof(tmp), tp == 'x');
                 if (rc < 0)
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
                 if (!leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
-                        return -1;
+                        { TerminateOnError(s, size, (size_t)pos); return -1; }
                 }
                 if (leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 break;
             }
             case 'p': {
                 if (sizeof(void *) != sizeof(ulong))
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
                 void *val = va_arg(arg, void *);
                 ulong uval = (ulong)val;
                 char tmp[24];
                 rc = __UlongToString(uval, 16, tmp, sizeof(tmp));
                 if (rc < 0)
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
                 if (!leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
-                        return -1;
+                        { TerminateOnError(s, size, (size_t)pos); return -1; }
                 }
                 if (leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 break;
@@ -278,7 +291,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
             case 'c': {
                 int val = va_arg(arg, int);
                 if (!PutChar(val & 0xFF, s, size, pos++))
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
                 break;
             }
             case 's': {
@@ -289,31 +302,31 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 if (!leftAlign) {
                     for (int p = 0; p < width - (int)val_len; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 if (val_len > (size - pos))
-                    return -1;
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
                 MemCpy(&s[pos], val, val_len);
                 pos += val_len;
                 if (leftAlign) {
                     for (int p = 0; p < width - (int)val_len; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            return -1;
+                            { TerminateOnError(s, size, (size_t)pos); return -1; }
                     }
                 }
                 break;
             }
             default:
-                return -1;
+                { TerminateOnError(s, size, (size_t)pos); return -1; }
             }
         } else
             if (!PutChar(t, s, size, pos++))
-                return -1;
+                { TerminateOnError(s, size, (size_t)pos); return -1; }
     }
 
     if (!PutChar('\0', s, size, pos++))
-        return -1;
+        { TerminateOnError(s, size, (size_t)pos); return -1; }
 
     return pos;
 }
