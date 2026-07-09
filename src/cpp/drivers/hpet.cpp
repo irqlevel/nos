@@ -60,6 +60,12 @@ bool Hpet::Setup()
     PeriodFs = gcap >> GcapPeriodShift;
     ulong numTimers = (ulong)((gcap & GcapNumTimMask) >> GcapNumTimShift) + 1;
 
+    /* GetTime assumes a full-width 64-bit main counter. A 32-bit counter
+       (COUNT_SIZE_CAP == 0) wraps ~every 43s and breaks TSC calibration and
+       the GetBootTime fallback. QEMU's HPET is 64-bit; warn on anything else. */
+    if (!(gcap & GcapCountSizeCap))
+        Trace(0, "HPET: 32-bit main counter -- timekeeping wraps ~43s (unsupported hardware)");
+
     if (PeriodFs == 0 || PeriodFs > 0x05F5E100ULL /* 100 ns max per spec */)
     {
         Trace(0, "HPET: invalid period %u fs", (ulong)PeriodFs);

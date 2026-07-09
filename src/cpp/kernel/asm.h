@@ -91,6 +91,8 @@ void SharedInterruptStub();
 
 void DummyInterruptStub();
 
+void SpuriousInterruptStub();
+
 void RustInterruptStub0();
 void RustInterruptStub1();
 void RustInterruptStub2();

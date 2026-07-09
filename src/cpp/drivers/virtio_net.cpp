@@ -470,6 +470,12 @@ void VirtioNet::ReapRx()
             continue;
         }
 
+        /* usedLen is device-controlled; clamp to the RX buffer so a bogus
+           length cannot make frame->Length exceed the allocation and let
+           protocol parsers read past RxBufs. */
+        if (usedLen > RxBufSize)
+            usedLen = RxBufSize;
+
         NetFrame* frame = &RxFrames[bufIdx];
         frame->Data = RxBufs + bufIdx * RxBufSize + NetHdrSize;
         frame->DataPhys = RxBufsPhys + bufIdx * RxBufSize + NetHdrSize;
@@ -731,10 +737,16 @@ void VirtioNet::Interrupt(Context* ctx)
 {
     (void)ctx;
 
-    /* Acknowledge interrupt */
-    u8 isr = Transport.ReadISR();
-    if (isr == 0)
-        return;
+    /* Acknowledge the interrupt on the INTx path only. Under MSI-X the ISR
+       status register is not the notification mechanism (virtio 1.x 4.1.4.5)
+       and a spec-conforming device leaves it 0, so gating on it there would
+       drop every RX/TX notification. */
+    if (!Transport.UsingMsix())
+    {
+        u8 isr = Transport.ReadISR();
+        if (isr == 0)
+            return;
+    }
 
     InterruptStats::Inc(IrqVirtioNet);
 

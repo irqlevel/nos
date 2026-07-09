@@ -2,6 +2,7 @@
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>
+#include <kernel/raw_spin_lock.h>
 
 Pci::Pci()
     : DeviceCount(0)
@@ -281,51 +282,67 @@ const char* Pci::DeviceToStr(u16 vendor, u16 dev)
     }
 }
 
+namespace {
+
+/* Serializes the 0xCF8 (address) / 0xCFC (data) port pair. Config access is
+   BSP-serialized at boot, but the surface is exported to Rust drivers that run
+   post-SMP, where two CPUs could otherwise interleave their address/data writes
+   and read or write the wrong register. The RMW helpers (word/byte writes) hold
+   the lock across the whole read-modify-write. */
+Kernel::RawSpinLock ConfigLock;
+
+u64 ConfigAddress(u16 bus, u16 slot, u16 func, u16 offset)
+{
+    return (u64)(((u64)bus << 16) | ((u64)slot << 11) | ((u64)func << 8) |
+                 (offset & 0xfc) | ((u32)0x80000000));
+}
+
+u32 ConfigReadDwordRaw(u16 bus, u16 slot, u16 func, u16 offset)
+{
+    Out(0xCF8, ConfigAddress(bus, slot, func, offset));
+    return In(0xCFC);
+}
+
+void ConfigWriteDwordRaw(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
+{
+    Out(0xCF8, ConfigAddress(bus, slot, func, offset));
+    Out(0xCFC, value);
+}
+
+}
+
 u16 Pci::ReadWord(u16 bus, u16 slot, u16 func, u16 offset)
 {
-    u64 address;
-    u64 lbus = (u64)bus;
-    u64 lslot = (u64)slot;
-    u64 lfunc = (u64)func;
-    u16 tmp = 0;
-
-    address = (u64)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((u32)0x80000000));
-    Out(0xCF8, address);
-    tmp = (u16)((In(0xCFC) >> ((offset & 2) * 8)) & 0xffff);
-    return (tmp);
+    ulong flags = ConfigLock.LockIrqSave();
+    u32 dword = ConfigReadDwordRaw(bus, slot, func, offset);
+    ConfigLock.UnlockIrqRestore(flags);
+    return (u16)((dword >> ((offset & 2) * 8)) & 0xffff);
 }
 
 u32 Pci::ReadDword(u16 bus, u16 slot, u16 func, u16 offset)
 {
-    u64 address;
-    u64 lbus = (u64)bus;
-    u64 lslot = (u64)slot;
-    u64 lfunc = (u64)func;
-
-    address = (u64)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((u32)0x80000000));
-    Out(0xCF8, address);
-    return In(0xCFC);
+    ulong flags = ConfigLock.LockIrqSave();
+    u32 dword = ConfigReadDwordRaw(bus, slot, func, offset);
+    ConfigLock.UnlockIrqRestore(flags);
+    return dword;
 }
 
 void Pci::WriteDword(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
 {
-    u64 address;
-    u64 lbus = (u64)bus;
-    u64 lslot = (u64)slot;
-    u64 lfunc = (u64)func;
-
-    address = (u64)((lbus << 16) | (lslot << 11) | (lfunc << 8) | (offset & 0xfc) | ((u32)0x80000000));
-    Out(0xCF8, address);
-    Out(0xCFC, value);
+    ulong flags = ConfigLock.LockIrqSave();
+    ConfigWriteDwordRaw(bus, slot, func, offset, value);
+    ConfigLock.UnlockIrqRestore(flags);
 }
 
 void Pci::WriteWord(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
 {
-    u32 dword = ReadDword(bus, slot, func, offset);
+    ulong flags = ConfigLock.LockIrqSave();
+    u32 dword = ConfigReadDwordRaw(bus, slot, func, offset);
     u16 shift = (offset & 2) * 8;
     dword &= ~(0xFFFF << shift);
     dword |= ((u32)value << shift);
-    WriteDword(bus, slot, func, offset, dword);
+    ConfigWriteDwordRaw(bus, slot, func, offset, dword);
+    ConfigLock.UnlockIrqRestore(flags);
 }
 
 u8 Pci::ReadByte(u16 bus, u16 slot, u16 func, u16 offset)
@@ -336,11 +353,13 @@ u8 Pci::ReadByte(u16 bus, u16 slot, u16 func, u16 offset)
 
 void Pci::WriteByte(u16 bus, u16 slot, u16 func, u16 offset, u8 value)
 {
-    u32 dword = ReadDword(bus, slot, func, offset);
+    ulong flags = ConfigLock.LockIrqSave();
+    u32 dword = ConfigReadDwordRaw(bus, slot, func, offset);
     u16 shift = (offset & 3) * 8;
     dword &= ~(0xFF << shift);
     dword |= ((u32)value << shift);
-    WriteDword(bus, slot, func, offset, dword);
+    ConfigWriteDwordRaw(bus, slot, func, offset, dword);
+    ConfigLock.UnlockIrqRestore(flags);
 }
 
 u8 Pci::FindCapability(u16 bus, u16 slot, u16 func, u8 capId, u8 startOffset)

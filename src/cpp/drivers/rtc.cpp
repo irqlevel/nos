@@ -1,4 +1,5 @@
 #include "rtc.h"
+#include "acpi.h"
 
 #include <kernel/asm.h>
 #include <kernel/trace.h>
@@ -91,7 +92,11 @@ bool Rtc::ReadTime(RtcTime& t)
     t.Day    = day1;
     t.Month  = mon1;
 
-    if (cen1 != 0)
+    /* Only trust the century CMOS register if the FADT advertises one;
+       on a board without a century register, RegCentury (0x32) holds
+       unrelated data and would yield a wildly wrong year. */
+    u8 centuryReg = Acpi::GetInstance().GetCenturyRegister();
+    if (centuryReg != 0 && cen1 != 0)
         t.Year = (u16)cen1 * 100 + yr1;
     else
         t.Year = DefaultCentury + yr1;

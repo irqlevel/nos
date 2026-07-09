@@ -64,8 +64,8 @@ void ProcFs::RefreshInterrupts()
         const char* name = InterruptStats::GetName(src);
         int n = Stdlib::SnPrintf(buf + pos, BufSize - pos,
                                  "%-12s %10ld\n", name, count);
-        if (n > 1)
-            pos = pos + (ulong)(n - 1);
+        if (n > 0)
+            pos = pos + (ulong)n;
     }
 
     RamFs::Write(InterruptsNode, buf, pos);

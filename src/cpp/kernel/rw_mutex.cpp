@@ -47,7 +47,7 @@ void RwMutex::ReadUnlock()
 
 void RwMutex::WriteLock()
 {
-    WriterWaiting.Set(1);
+    WriterWaiting.Inc();
     for (;;)
     {
         if (Value.Cmpxchg(-1, 0) == 0)
@@ -60,7 +60,7 @@ void RwMutex::WriteLock()
 void RwMutex::WriteUnlock()
 {
     Value.Set(0);
-    WriterWaiting.Set(0);
+    WriterWaiting.Dec();
 }
 
 }

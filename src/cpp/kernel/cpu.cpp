@@ -33,6 +33,7 @@ Cpu::Cpu()
     : Index(0)
     , State(0)
     , IdleTaskPtr(nullptr)
+    , IPITasksClosed(false)
 {
     IPITaskList.Init();
 }
@@ -49,6 +50,10 @@ void Cpu::Idle()
 
     if (BugOn(!IsInterruptEnabled()))
         return;
+
+    /* Free tasks that exited on this CPU (deferred out of the IRQs-off switch
+       path); safe here because interrupts are enabled. */
+    GetTaskQueue().ReapExited();
 
     Hlt();
 }
@@ -482,6 +487,10 @@ void Cpu::IPI(Context* ctx)
         Trace(0, "Cpu %u exited, state 0x%p, IPI count %u",
             Index, State, IPIConter.Get());
 
+        /* Complete any IPI tasks queued during the exit transition and refuse
+           future ones, so a CPU that queued work to us never waits forever. */
+        DrainAndCloseIPITasks(ctx);
+
         InterruptDisable();
         Hlt();
         return;
@@ -503,8 +512,19 @@ void Cpu::IPI(Context* ctx)
 void Cpu::QueueIPITaskAsync(IPITask& task)
 {
     ulong flags = IPITaskLock.LockIrqSave();
-    IPITaskList.InsertTail(&task.ListEntry);
+    bool closed = IPITasksClosed;
+    if (!closed)
+        IPITaskList.InsertTail(&task.ListEntry);
     IPITaskLock.UnlockIrqRestore(flags);
+
+    if (closed)
+    {
+        /* Target CPU has stopped processing IPI tasks (exiting/exited); the
+           task will never run there, so complete it now to unblock the waiter
+           instead of leaving it queued forever. */
+        task.Completion.Done();
+        return;
+    }
 
     SendIPISelf();
 }
@@ -521,6 +541,29 @@ void Cpu::ProcessIPITasks(Context* ctx)
     localList.Init();
 
     ulong flags = IPITaskLock.LockIrqSave();
+    localList.MoveTailList(&IPITaskList);
+    IPITaskLock.UnlockIrqRestore(flags);
+
+    while (!localList.IsEmpty())
+    {
+        auto* entry = localList.RemoveHead();
+        IPITask* task = CONTAINING_RECORD(entry, IPITask, ListEntry);
+        task->Function(task->Ctx, ctx);
+        task->Completion.Done();
+    }
+}
+
+void Cpu::DrainAndCloseIPITasks(Context* ctx)
+{
+    Stdlib::ListEntry localList;
+    localList.Init();
+
+    /* Close the queue and take everything still on it under the same lock, so
+       a concurrent QueueIPITaskAsync either lands here (and is completed below)
+       or observes the closed flag and self-completes -- never both, never
+       neither. */
+    ulong flags = IPITaskLock.LockIrqSave();
+    IPITasksClosed = true;
     localList.MoveTailList(&IPITaskList);
     IPITaskLock.UnlockIrqRestore(flags);
 

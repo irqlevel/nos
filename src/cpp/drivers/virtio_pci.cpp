@@ -51,22 +51,38 @@ ulong VirtioPci::MapBar(Pci::DeviceInfo* dev, u8 bar)
     ulong physAddr = barVal & ~0xFUL;
 
     /* Check if 64-bit BAR */
-    if ((barVal & 0x6) == 0x4 && bar + 1 < MaxBars)
+    bool is64 = ((barVal & 0x6) == 0x4) && (bar + 1 < MaxBars);
+    u32 barHigh = 0;
+    if (is64)
     {
-        u32 barHigh = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar + 1);
+        barHigh = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar + 1);
         physAddr |= ((ulong)barHigh << 32);
     }
 
     if (physAddr == 0)
         return 0;
 
-    /* Determine BAR size by writing all-ones and reading back */
+    /* Determine BAR size by writing all-ones and reading back. Probe both
+       halves of a 64-bit BAR; probing only the low half computes a bogus
+       size for BARs >= 4 GB. */
     pci.WriteDword(dev->Bus, dev->Slot, dev->Func, 0x10 + bar * 4, 0xFFFFFFFF);
-    u32 sizeMask = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar);
+    u32 sizeMaskLow = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar);
     pci.WriteDword(dev->Bus, dev->Slot, dev->Func, 0x10 + bar * 4, barVal);
 
-    u32 sizeMask32 = sizeMask & ~0xFU;
-    ulong barSize = (ulong)(~sizeMask32) + 1;
+    ulong sizeMask;
+    if (is64)
+    {
+        pci.WriteDword(dev->Bus, dev->Slot, dev->Func, 0x10 + (bar + 1) * 4, 0xFFFFFFFF);
+        u32 sizeMaskHigh = pci.GetBAR(dev->Bus, dev->Slot, dev->Func, bar + 1);
+        pci.WriteDword(dev->Bus, dev->Slot, dev->Func, 0x10 + (bar + 1) * 4, barHigh);
+        sizeMask = ((ulong)sizeMaskHigh << 32) | (ulong)(sizeMaskLow & ~0xFU);
+    }
+    else
+    {
+        sizeMask = 0xFFFFFFFF00000000UL | (ulong)(sizeMaskLow & ~0xFU);
+    }
+
+    ulong barSize = ~sizeMask + 1;
     if (barSize == 0)
         barSize = Const::PageSize;
 

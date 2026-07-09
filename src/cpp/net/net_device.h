@@ -96,6 +96,10 @@ public:
        Default: flush TxQueue under TxQueueLock. */
     virtual void DrainTx();
 
+    /* Drain the SW RxQueue and dispatch frames to the protocol stack. Drivers
+       whose reap runs as ReapRx() can use this as their ProcessRx(). */
+    void DrainRxQueueAndDispatch();
+
 protected:
     static const ulong TxQueueCapacity = 256;
     static const ulong RxQueueCapacity = 256;

@@ -134,6 +134,17 @@ bool Ext2Fs::Mount()
     if (Super->RevLevel >= 1 && Super->InodeSize > 0)
         InodeSize = Super->InodeSize;
 
+    /* InodeSize is on-disk data. ReadInode copies a fixed sizeof(Ext2Inode)
+       struct from an offset within a single BlockSize buffer, so InodeSize
+       must be at least that size and divide BlockSize evenly -- otherwise a
+       crafted image could make the copy straddle the end of TmpBlock. */
+    if (InodeSize < sizeof(Ext2Inode) || (BlockSize % InodeSize) != 0)
+    {
+        Trace(0, "Ext2Fs: unsupported inode size %u (block size %u)",
+              (ulong)InodeSize, (ulong)BlockSize);
+        goto fail;
+    }
+
     /* Both fields are divisors (here and in ReadInode); a corrupt image with
        either at 0 would raise a division exception. */
     if (Super->BlocksPerGroup == 0 || Super->InodesPerGroup == 0)

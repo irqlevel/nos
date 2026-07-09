@@ -176,10 +176,14 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         const u8* origTcp = (const u8*)origIp + origIpHdrLen;
         u16 srcPort = (u16)(((u16)origTcp[0] << 8) | origTcp[1]);
         u16 dstPort = (u16)(((u16)origTcp[2] << 8) | origTcp[3]);
+        /* The first 8 bytes of the quoted datagram are guaranteed present
+           (length checked above); bytes 4..7 are the TCP sequence number. */
+        u32 seq = ((u32)origTcp[4] << 24) | ((u32)origTcp[5] << 16) |
+                  ((u32)origTcp[6] << 8) | (u32)origTcp[7];
 
         Tcp::GetInstance().OnIcmpUnreachable(
             Ntohl(origIp->SrcAddr), srcPort,
-            Ntohl(origIp->DstAddr), dstPort);
+            Ntohl(origIp->DstAddr), dstPort, seq);
     }
     else
     {

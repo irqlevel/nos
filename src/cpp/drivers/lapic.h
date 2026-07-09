@@ -10,6 +10,10 @@ class Lapic final
 {
 public:
 
+    /* LAPIC spurious-interrupt vector. The APIC delivers this vector on a
+       spurious interrupt; its handler must NOT issue an EOI. */
+    static const u8 SpuriousVector = 0xFF;
+
     static void Enable();
 
     static void EOI();

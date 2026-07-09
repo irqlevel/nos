@@ -38,7 +38,7 @@ void Lapic::Enable()
     {
         Trace(0, "Lapic: firmware left x2APIC mode, switching to xAPIC");
         WriteMsr(BaseMsr, msr & ~(BaseMsrX2ApicEnable | BaseMsrGlobalEnable));
-        msr = msr & ~BaseMsrX2ApicEnable;
+        msr = msr & ~(BaseMsrX2ApicEnable | BaseMsrGlobalEnable);
     }
 
     /* Make sure the APIC is globally enabled (xAPIC MMIO mode) */
@@ -51,7 +51,7 @@ void Lapic::Enable()
     WriteReg(DfrIndex, 0xffffffff);// Flat mode
     WriteReg(LdrIndex, 0x01000000);// All cpus use logical id 1
     WriteReg(TprIndex, 0xFF);// Disable all interrupts
-    WriteReg(SpIvIndex, 0x1FF);
+    WriteReg(SpIvIndex, 0x100 | SpuriousVector);// bit 8 = APIC software enable
 
     Trace(LapicLL, "Lapic: tpr 0x%p dfr 0x%p ldr 0x%p spiv 0x%p",
         (ulong)ReadReg(TprIndex), (ulong)ReadReg(DfrIndex), (ulong)ReadReg(LdrIndex), (ulong)ReadReg(SpIvIndex));
@@ -78,7 +78,7 @@ void Lapic::EOI()
 
 void Lapic::EOI(u8 vector)
 {
-    if (vector != 0xFF)
+    if (vector != SpuriousVector)
         WriteReg(EoiIndex, 0x0);
 }
 

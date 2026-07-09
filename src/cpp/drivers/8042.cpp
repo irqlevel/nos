@@ -14,6 +14,7 @@ namespace Kernel
 IO8042::IO8042()
     : IntVector(-1)
     , Mod(0)
+    , Extended(0)
 {
     Trace(0, "IO8042 0x%p status 0x%p", this, (ulong)Inb(StatusPort));
 
@@ -115,6 +116,22 @@ void IO8042::OnTick(TimerCallback& callback)
 
         Trace(KbdLL, "Kbd: code 0x%p", (ulong)code);
 
+        if (code == 0xE0)
+        {
+            /* Extended-key prefix: the next make/break code is an extended
+               scancode (arrows, nav keys, right-side modifiers). */
+            Extended = 1;
+            continue;
+        }
+
+        if (Extended)
+        {
+            /* Ignore the extended code rather than misdecoding it into a
+               bogus character (or a NUL) via the base scancode map. */
+            Extended = 0;
+            continue;
+        }
+
         if (code == 0x2a || code == 0x36) Mod = 1;
         else if (code == 0xaa || code == 0xb6) Mod = 0;
         else if (code & 0x80) continue;
@@ -123,6 +140,8 @@ void IO8042::OnTick(TimerCallback& callback)
             BugOn(code >= Stdlib::ArraySize(map));
 
             char c = Mod ? shiftMap[code] : map[code];
+            if (c == '\0')
+                continue; /* unmapped key: never deliver a NUL to observers */
 
             Trace(KbdLL, "Kbd: char %c", c);
 

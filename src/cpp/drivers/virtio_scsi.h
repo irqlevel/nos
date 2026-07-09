@@ -69,6 +69,7 @@ public:
 
     /* Submit a block request (caller context). */
     void Submit(BlockRequest* req);
+    void FailQueuedRequests();
 
     /* Drain pending requests and submit to hardware (softirq context). */
     void DrainQueue();
@@ -148,6 +149,9 @@ private:
     ulong CmdRespPhys;
     u8* DataBuf;
     ulong DataBufPhys;
+    /* Set when a synchronous probe command timed out: its descriptors may still
+       reference the shared DMA buffers, so they must not be reused or freed. */
+    bool ProbeTimedOut;
 
     static const ulong MaxInstances = 8;
     static const ulong PollTimeout  = 10000000;

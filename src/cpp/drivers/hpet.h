@@ -88,6 +88,7 @@ private:
     static const u64 GcapPeriodShift = 32; /* counter period in femtoseconds */
     static const u64 GcapNumTimMask  = 0x1F00; /* bits 12:8 */
     static const u64 GcapNumTimShift = 8;
+    static const u64 GcapCountSizeCap = (1ULL << 13); /* 1 = 64-bit main counter */
 
     /* Desired tick rate (same as PIT) */
     static const ulong DesiredHz = 100;

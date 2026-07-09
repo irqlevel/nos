@@ -60,6 +60,7 @@ private:
 
     int IntVector;
     u8 Mod;
+    u8 Extended; /* set after a 0xE0 prefix byte */
 
     static const size_t MaxObserver = 16;
     IO8042Observer* Observer[MaxObserver];

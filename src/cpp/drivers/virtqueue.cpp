@@ -186,9 +186,18 @@ bool VirtQueue::GetUsed(u32& id, u32& len)
     len = Used->Ring[usedIdx].Len;
     LastUsedIdx++;
 
-    /* Return the descriptors to the free chain. */
+    /* id and len are device-controlled. A head index outside the ring would
+       index past the descriptor table and poison FreeHead, and a cyclic Next
+       would loop forever -- report the completion to the caller (which
+       validates the id against its own slot table) but refuse to walk an
+       out-of-range chain. */
+    if (id >= QueueSize)
+        return true;
+
+    /* Return the descriptors to the free chain, bounding the walk to the ring
+       size so a corrupt Next cannot loop forever or index out of range. */
     u16 descIdx = (u16)id;
-    while (true)
+    for (u32 walked = 0; walked < QueueSize; walked++)
     {
         u16 next = Descs[descIdx].Next;
         bool hasNext = (Descs[descIdx].Flags & VirtqDesc::FlagNext) != 0;
@@ -196,7 +205,7 @@ bool VirtQueue::GetUsed(u32& id, u32& len)
         Descs[descIdx].Next = FreeHead;
         FreeHead = descIdx;
         NumFree++;
-        if (!hasNext)
+        if (!hasNext || next >= QueueSize)
             break;
         descIdx = next;
     }

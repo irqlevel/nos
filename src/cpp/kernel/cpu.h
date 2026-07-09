@@ -69,6 +69,7 @@ private:
 
     void OnPanic();
     void ProcessIPITasks(Context* ctx);
+    void DrainAndCloseIPITasks(Context* ctx);
 
     ulong Index;
     ulong State;
@@ -79,6 +80,7 @@ private:
 
     RawSpinLock IPITaskLock;
     Stdlib::ListEntry IPITaskList;
+    bool IPITasksClosed; /* set on exit: queuers self-complete instead of waiting */
 
     static const ulong Tag = 'Cpu ';
 };

@@ -157,6 +157,8 @@ struct TcpConn
     u32 SndUna;   /* oldest unacked */
     u32 SndNxt;   /* next to send */
     u32 SndWnd;   /* peer window */
+    u32 SndWl1;   /* SEG.SEQ of the segment that last updated SndWnd (RFC 793) */
+    u32 SndWl2;   /* SEG.ACK of the segment that last updated SndWnd (RFC 793) */
     u32 RcvNxt;   /* next expected */
     u32 RcvWnd;   /* our window */
     u32 AdvertisedWnd; /* window advertised in our last outgoing segment */
@@ -227,9 +229,11 @@ public:
     void Process(NetDevice* dev, const u8* frame, ulong frameLen);
 
     /* Called by Icmp for a hard Destination Unreachable (protocol/port)
-       quoting a TCP segment we sent -- aborts the matching connection */
+       quoting a TCP segment we sent -- aborts the matching connection.
+       `quotedSeq` is the SEG.SEQ from the quoted segment; it is validated
+       against the send window (RFC 5927) to reject off-path forgeries. */
     void OnIcmpUnreachable(u32 localIp, u16 localPort,
-                           u32 remoteIp, u16 remotePort);
+                           u32 remoteIp, u16 remotePort, u32 quotedSeq);
 
     /* Called from TypeTcpTimer SoftIrq handler -- retransmits + cleanup */
     void ProcessRetransmits();
@@ -266,7 +270,7 @@ private:
     TcpConn* AllocConn();
     TcpConn* LookupLocked(u32 localIp, u16 localPort,
                           u32 remoteIp, u16 remotePort);
-    TcpConn* FindListenerLocked(u16 localPort);
+    TcpConn* FindListenerLocked(u32 localIp, u16 localPort);
     void InsertHash(TcpConn* conn);
     void RemoveHash(TcpConn* conn);
     ulong HashIndex(u32 localIp, u16 localPort,
@@ -288,7 +292,7 @@ private:
 
     /* Advance SndUna / drain SendBuf for an incoming ACK (wrap-safe).
        Shared by every state that may have unacked data outstanding. */
-    void ProcessAck(TcpConn* conn, u32 ack, u16 wnd, ulong now);
+    void ProcessAck(TcpConn* conn, u32 segSeq, u32 ack, u16 wnd, ulong now);
 
     ulong GetBootTimeMs();
 
