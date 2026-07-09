@@ -110,6 +110,10 @@ void ListEntry::MoveTailList(ListEntry *list)
 
 ListEntry::ListEntry(ListEntry&& other)
 {
+    if (other.IsEmpty()) {
+        Init();
+        return;
+    }
     other.Flink->Blink = this;
     other.Blink->Flink = this;
     Flink = other.Flink;
@@ -120,6 +124,10 @@ ListEntry::ListEntry(ListEntry&& other)
 ListEntry& ListEntry::operator=(ListEntry&& other)
 {
     if (this != &other) {
+        if (other.IsEmpty()) {
+            Init();
+            return *this;
+        }
         other.Flink->Blink = this;
         other.Blink->Flink = this;
         Flink = other.Flink;

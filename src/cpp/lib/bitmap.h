@@ -14,6 +14,7 @@ public:
 
     void SetBit(ulong bitNum);
     void ClearBit(ulong bitNum);
+    bool TestBit(ulong bitNum);
     long FindSetZeroBit();
 
 private:

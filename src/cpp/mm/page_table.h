@@ -194,7 +194,13 @@ public:
 
     /* Map a physical MMIO range into kernel virtual space.
        physAddr must be page-aligned.
-       Returns kernel virtual address, or 0 on failure. */
+       Returns kernel virtual address, or 0 on failure.
+
+       Boot-ordering constraint: the mapping is placed at
+       physAddr + KernelSpaceBase outside the VaAllocator, is permanent
+       (never unmapped), and only the local TLB is invalidated. Callers
+       must therefore run on the BSP before the APs are started
+       (currently: HPET and driver init in Main2/BpStartup). */
     ulong MapMmioRegion(ulong physAddr, ulong sizeBytes);
 
     Page* AllocPage();

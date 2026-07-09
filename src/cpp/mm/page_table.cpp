@@ -531,6 +531,9 @@ bool PageTable::SetupFreePagesList()
 
             Page* page = GetPage(phyAddr);
             BugOn(!page);
+            /* GetPage's +1 was only for the lookup; a page on the free
+               list must sit at refcount 1 */
+            page->Put();
             FreePagesList.InsertHead(&page->ListEntry);
             FreePagesCount++;
         }

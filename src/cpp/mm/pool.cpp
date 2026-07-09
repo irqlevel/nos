@@ -117,7 +117,10 @@ void Pool::Free(void* ptr)
         BugOn((ulong)page & (Const::PageSize - 1));
 
         Block* block = static_cast<Block*>(ptr) - 1;
+        BugOn(block->Tag == FreedTag);
+        block->Tag = FreedTag;
         block->Link.RemoveInit();
+        BugOn(page->BlockCount >= page->MaxBlockCount);
 
         page->BlockList.InsertTail(&block->Link);
         page->BlockCount++;

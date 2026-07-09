@@ -48,6 +48,9 @@ void* AllocatorImpl::Alloc(size_t size, ulong tag)
 	BugOn(size == 0);
 
 	Header* header;
+	if (size > static_cast<size_t>(-1) - sizeof(*header))
+		return nullptr;
+
 	size_t reqSize = (size + sizeof(*header));
 	if (reqSize >= (Const::PageSize / 2))
 	{

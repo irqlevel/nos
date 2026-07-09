@@ -60,16 +60,29 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
 {
     Trace(0, "MbInfo %p", MbInfo);
 
+    const void* mbInfoEnd = Stdlib::MemAdd(MbInfo, MbInfo->TotalSize);
     MultiBootTag * tag;
     for (tag = reinterpret_cast<MultiBootTag*>(MbInfo + 1);
         tag->Type != MultiBootTagTypeEnd;
-        tag = reinterpret_cast<MultiBootTag*>(Stdlib::MemAdd(tag, (tag->Size + 7) & ~7)))
+        )
     {
+        /* A malformed tag must not walk past the info buffer or spin forever */
+        if (Stdlib::MemAdd(tag, sizeof(*tag)) > mbInfoEnd ||
+            Stdlib::MemAdd(tag, tag->Size) > mbInfoEnd ||
+            tag->Size < sizeof(*tag))
+        {
+            Trace(0, "Malformed tag %u size %u, stop parsing", (ulong)tag->Type, (ulong)tag->Size);
+            break;
+        }
+
         Trace(0, "Tag %u Size %u", (ulong)tag->Type, (ulong)tag->Size);
         switch (tag->Type)
         {
         case MultiBootTagTypeBootDev:
         {
+            if (tag->Size < sizeof(MultiBootTagBootDev))
+                break;
+
             MultiBootTagBootDev* bdev = reinterpret_cast<MultiBootTagBootDev*>(tag);
             Trace(0, "Boot dev 0x%p 0x%p 0x%p",
                 (ulong)bdev->BiosDev, (ulong)bdev->Slice, (ulong)bdev->Part);
@@ -77,8 +90,14 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
         }
         case MultiBootTagTypeMmap:
         {
+            if (tag->Size < sizeof(MultiBootTagMmap))
+                break;
+
             MultiBootTagMmap* mmap = reinterpret_cast<MultiBootTagMmap*>(tag);
             MultiBootMmapEntry* entry;
+
+            if (mmap->EntrySize < sizeof(MultiBootMmapEntry))
+                break;
 
             for (entry = &mmap->Entry[0];
                  Stdlib::MemAdd(entry, mmap->EntrySize) <= Stdlib::MemAdd(mmap, mmap->Size);
@@ -95,7 +114,27 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
         }
         case MultiBootTagTypeCmdline:
         {
+            if (tag->Size <= sizeof(MultiBootTagString))
+                break;
+
             MultiBootTagString* cmdLine = reinterpret_cast<MultiBootTagString*>(tag);
+
+            /* The string must be NUL-terminated within the tag */
+            size_t maxLen = tag->Size - sizeof(MultiBootTagString);
+            bool terminated = false;
+            for (size_t i = 0; i < maxLen; i++)
+            {
+                if (cmdLine->String[i] == '\0')
+                {
+                    terminated = true;
+                    break;
+                }
+            }
+            if (!terminated)
+            {
+                Trace(0, "Cmdline tag is not NUL-terminated, ignored");
+                break;
+            }
 
             Trace(0, "Cmdline %s", cmdLine->String);
             if (!Kernel::Parameters::GetInstance().Parse(cmdLine->String)) {
@@ -119,6 +158,9 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
         }
         case MultiBootTagTypeFramebuffer:
         {
+            if (tag->Size < sizeof(MultiBootTagFramebuffer))
+                break;
+
             MultiBootTagFramebuffer* fb = reinterpret_cast<MultiBootTagFramebuffer*>(tag);
             FramebufferPresent = true;
             FramebufferType = fb->FbType;
@@ -132,6 +174,9 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
             break;
         }
         }
+
+        /* Size >= sizeof(*tag) was checked above, so this always advances */
+        tag = reinterpret_cast<MultiBootTag*>(Stdlib::MemAdd(tag, (tag->Size + 7) & ~7));
     }
 }
 
