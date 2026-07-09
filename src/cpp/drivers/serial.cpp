@@ -59,7 +59,9 @@ void Serial::Wait()
 {
     size_t pauseCount = 1;
 
-    for (;;)
+    /* Bounded: a stuck transmitter must not hang the kernel; give up
+       and let the caller drop the character (~1M pauses total) */
+    for (size_t round = 0; round < 20; round++)
     {
         if (IsTransmitEmpty())
             break;

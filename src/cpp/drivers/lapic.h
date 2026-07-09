@@ -24,6 +24,10 @@ public:
 
     static void SendIPI(u32 apicId, u32 vector);
 
+    /* Is `vector` currently in service on this CPU? Used by the shared
+       interrupt dispatch to identify the vector that actually fired. */
+    static bool CheckIsr(u8 vector);
+
 private:
     Lapic() = delete;
     ~Lapic() = delete;
@@ -35,7 +39,6 @@ private:
     static u32 ReadReg(ulong index);
     static void WriteReg(ulong index, u32 value);
     static void* GetRegBase(ulong index);
-    static bool CheckIsr(u8 vector);
 
     static const ulong ApicIdIndex = 2;
     static const ulong TprIndex = 0x8;

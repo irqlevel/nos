@@ -105,6 +105,11 @@ bool VirtioRng::Init(Pci::DeviceInfo* pciDev, const char* name)
         return false;
     }
 
+    /* This driver polls and never reads the ISR; without this the device
+       would keep a level INTx asserted forever after the first completion,
+       storming any handler that shares the line */
+    Queue.DisableDeviceInterrupts();
+
     Transport.SetQueueDesc(Queue.GetDescPhys());
     Transport.SetQueueDriver(Queue.GetAvailPhys());
     Transport.SetQueueDevice(Queue.GetUsedPhys());

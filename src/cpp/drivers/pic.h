@@ -18,7 +18,7 @@ public:
 
     void Disable();
 
-    void EOI();
+    void EOI(int irq);
 
 private:
     Pic();

@@ -50,8 +50,11 @@ void Pic::Remap(int offset1, int offset2)
 	Outb(PIC2_DATA, a2);    
 }
 
-void Pic::EOI()
+void Pic::EOI(int irq)
 {
+    /* Slave-PIC IRQs (8-15) need an EOI to the slave as well */
+    if (irq >= 8)
+        Outb(PIC2, PIC_EOI);
     Outb(PIC1, PIC_EOI);
 }
 

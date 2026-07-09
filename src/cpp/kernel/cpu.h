@@ -101,6 +101,9 @@ public:
     ulong GetBspIndex();
     bool SetBspIndex(ulong index);
 
+    /* Lock-free BSP index for IRQ context (e.g. the tick IPI) */
+    ulong GetBspIndexNoLock();
+
     ulong GetCurrentCpuId();
 
     Cpu& GetCurrentCpu();
@@ -139,6 +142,8 @@ private:
     Cpu CpuArray[MaxCpus];
 
     ulong BspIndex;
+    /* Mirror of BspIndex readable without taking Lock */
+    Atomic BspIndexCached;
 
 };
 

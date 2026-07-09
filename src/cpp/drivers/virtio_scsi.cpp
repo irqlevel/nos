@@ -334,11 +334,12 @@ void VirtioScsi::DrainQueue()
         int slotIdx = Hba->AllocSlot();
         if (slotIdx < 0)
         {
-            /* No free slots -- put requests back */
+            /* No free slots -- put the whole remaining batch back at the
+               head in reverse so the original order is preserved (a later
+               flush must not leapfrog earlier writes) */
             Stdlib::AutoLock lock(QueueLock);
-            RequestQueue.InsertHead(&req->Link);
-            for (ulong j = i + 1; j < batchCount; j++)
-                RequestQueue.InsertTail(&batch[j]->Link);
+            for (ulong j = batchCount; j > i; j--)
+                RequestQueue.InsertHead(&batch[j - 1]->Link);
             break;
         }
 
@@ -476,12 +477,12 @@ void VirtioScsi::DrainQueue()
 
         if (head < 0)
         {
-            /* Ring full -- return this and remaining requests to the queue */
+            /* Ring full -- return the remaining batch to the queue head
+               in reverse to preserve the original order */
             Hba->FreeSlot(slotIdx);
             Stdlib::AutoLock lock(QueueLock);
-            RequestQueue.InsertHead(&req->Link);
-            for (ulong j = i + 1; j < batchCount; j++)
-                RequestQueue.InsertTail(&batch[j]->Link);
+            for (ulong j = batchCount; j > i; j--)
+                RequestQueue.InsertHead(&batch[j - 1]->Link);
             break;
         }
 

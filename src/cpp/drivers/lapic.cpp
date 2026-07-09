@@ -89,6 +89,10 @@ u8 Lapic::GetApicId()
 
 void Lapic::SendInit(u32 apicId)
 {
+    /* Same ICR interleaving hazard as SendIPI below */
+    ulong flags = GetRflags();
+    InterruptDisable();
+
     WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
     WriteReg(IcrLowIndex, IcrInit | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
 
@@ -96,10 +100,16 @@ void Lapic::SendInit(u32 apicId)
     {
         Pause();
     }
+
+    SetRflags(flags);
 }
 
 void Lapic::SendStartup(u32 apicId, u32 vector)
 {
+    /* Same ICR interleaving hazard as SendIPI below */
+    ulong flags = GetRflags();
+    InterruptDisable();
+
     WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
     WriteReg(IcrLowIndex, vector | IcrStartup | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
 
@@ -107,6 +117,8 @@ void Lapic::SendStartup(u32 apicId, u32 vector)
     {
         Pause();
     }
+
+    SetRflags(flags);
 }
 
 void Lapic::SendIPI(u32 apicId, u32 vector)

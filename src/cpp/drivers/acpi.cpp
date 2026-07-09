@@ -54,6 +54,15 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
         return false;
     }
 
+    /* ACPI 2.0+: the extended checksum covers the whole descriptor */
+    if (rsdp->FirstPart.Revision >= 2 &&
+        ComputeSum(rsdp, sizeof(*rsdp)) != 0)
+    {
+        Trace(0, "Rsdp 0x%p extended checksum failed (sum 0x%p)",
+            rsdp, (ulong)ComputeSum(rsdp, sizeof(*rsdp)));
+        return false;
+    }
+
     Stdlib::MemCpy(OemId, rsdp->FirstPart.OEMID, sizeof(rsdp->FirstPart.OEMID));
     OemId[sizeof(rsdp->FirstPart.OEMID)] = '\0';
 

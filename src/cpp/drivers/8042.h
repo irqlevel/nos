@@ -52,6 +52,9 @@ private:
     static const ulong DataPort = 0x60;
     static const ulong StatusPort = 0x64;
 
+    /* Bound on the ReadData drain loop (stuck status bit) */
+    static const size_t MaxDrainIterations = 4096;
+
     SpinLock Lock;
     Stdlib::RingBuffer<u8, Const::PageSize> Buf;
 

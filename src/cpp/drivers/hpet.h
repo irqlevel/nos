@@ -80,6 +80,7 @@ private:
     /* Timer config bits */
     static const u64 TimerIntEnb    = (1ULL << 2); /* enable interrupt */
     static const u64 TimerTypePer   = (1ULL << 3); /* periodic mode */
+    static const u64 TimerPerIntCap = (1ULL << 4); /* periodic mode supported (RO) */
     static const u64 TimerValSet    = (1ULL << 6); /* set accumulator in periodic mode */
     static const u64 Timer32Mode    = (1ULL << 8); /* force 32-bit comparator */
 

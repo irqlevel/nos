@@ -32,6 +32,10 @@ private:
 
     Task* SelectNext(Task* curr);
 
+    /* Spins allowed in Schedule while an exited task waits for a
+       runnable candidate before declaring the queue broken */
+    static const ulong MaxExitedRetries = 100000000;
+
     void Switch(Task* next, Task* curr);
 
     void SwitchComplete(Task* curr);
