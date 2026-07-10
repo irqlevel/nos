@@ -1,10 +1,10 @@
-# Stage 4 — Live host-kernel update (kexec-style) under running guests
+# Stage 5 — Live host-kernel update (kexec-style) under running guests
 
 **Goal:** Replace the running `nos` host kernel with a new build **without
 killing the guests** — a warm handover that keeps guest RAM in place, restores
 each vCPU and device, and resumes with sub-100 ms guest downtime.
 
-**Depends on:** Stage 2/3, *and* on the POD-state / drainable-device discipline
+**Depends on:** Stage 3/4, *and* on the POD-state / drainable-device discipline
 those stages were required to follow.
 
 **Demo:** Kernel update of the hypervisor under live Linux guests via one
@@ -42,7 +42,7 @@ Kilobytes, not gigabytes.
    it, the new kernel reads it, and the version guards against layout drift.
 3. **Drain DMA.** Wait for in-flight NVMe and NIC requests to complete. This is
    where owning every driver pays off: device queue state need not be migrated —
-   quiesce the devices and re-init them after the jump. (Stage 3 device models
+   quiesce the devices and re-init them after the jump. (Stage 4 device models
    must be *drainable* for the same reason.)
 4. Stop APs. Then a classic kexec trampoline: the kernel is linked at a fixed
    physical address (16 MB — `build/linker64.ld`, virtual base
@@ -75,7 +75,7 @@ A failed jump into a new kernel on a remote box with no console is a dead box.
   v1 rollback semantics: failed update → cold reboot → guests die but the machine
   stays alive and manageable.
 
-## Design constraints (the whole reason Stages 2–3 followed the POD rule)
+## Design constraints (the whole reason Stages 3–4 followed the POD rule)
 
 - All VM state is serializable POD.
 - Guest pages are tracked in a single ownership table.
@@ -91,7 +91,7 @@ version of Linux's KHO pain.
 The kexec mechanism itself (load ELF, trampoline, warm flag in the boot
 protocol) is **a couple of weekends** *after* `nos` runs on hardware. The
 handover part (manifest, drain, reserved-ranges allocator, VMCS/EPT restore) is
-**a few weeks of evenings** — *conditional* on Stages 2–3 having been built to
+**a few weeks of evenings** — *conditional* on Stages 3–4 having been built to
 the POD/drainable discipline.
 
 ## Exit criteria

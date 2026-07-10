@@ -1,11 +1,10 @@
-# Stage "HAL + arm64" — a portability foundation, sequenced BEFORE the hypervisor
+# Stage 2 — HAL + arm64: a portability foundation before the hypervisor
 
-> **Document number vs. execution order.** This file keeps its historical
-> `05-` name as a stable identifier, but the **decision recorded here reorders
-> the roadmap**: HAL + arm64 is now executed **after Stage 1 (Rust strategy)
-> and before Stage 2 (hypervisor)**. The authoritative execution order lives in
-> [README.md](README.md#execution-order). See "Sequencing decision" below for
-> the rationale.
+> **Reordered.** This stage was originally the final one (arm64 last). It has
+> been pulled forward to run **after Stage 1 (Rust strategy) and before Stage 3
+> (hypervisor)**, and the docs were renumbered so stage numbers match execution
+> order. See [README.md](README.md#reordering-history) for the roadmap and
+> "Sequencing decision" below for the rationale.
 
 **Goal (this stage):** Introduce a hardware abstraction layer (HAL) and bring
 `nos` up on **arm64 under QEMU `virt` + Apple HVF**, so the codebase runs on two
@@ -23,7 +22,7 @@ below.
 
 **Original roadmap:** arm64 was the last stage, after the hypervisor and live
 update. **Revised roadmap:** the HAL refactor plus arm64-under-QEMU is pulled
-**forward, before the hypervisor (Stage 2).**
+**forward to Stage 2, before the hypervisor (now Stage 3).**
 
 ### Why earlier is better
 
@@ -47,7 +46,7 @@ update. **Revised roadmap:** the HAL refactor plus arm64-under-QEMU is pulled
    first establishes that pattern and moves the project off its NASM dependency
    before the hypervisor needs its own arch crate.
 5. **The eventual arm64 hypervisor becomes cheap.** Once the arch tax is paid,
-   Stage 2's EL2 + stage-2 arm64 backend is a small addition rather than a second
+   Stage 3's EL2 + stage-2 arm64 backend is a small addition rather than a second
    project.
 
 ### The trade-off, stated honestly

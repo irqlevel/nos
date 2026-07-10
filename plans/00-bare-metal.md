@@ -62,7 +62,7 @@ These only surface on real silicon:
 - **Memory map:** allocator was exercised on small VMs. Validate on 64+ GB with
   reserved regions and holes. Feed the full E820/EFI map into
   `PageAllocatorImpl::Setup()` and exclude reserved ranges. (This same
-  reserved-ranges capability is later reused by Stage 4 live update.)
+  reserved-ranges capability is later reused by Stage 5 live update.)
 - **PCIe bridges:** QEMU topology is flat; real chipsets have bridges. Verify
   `pci.cpp` enumeration recurses through bridges. Consider ECAM/MMCONFIG access
   in addition to legacy CF8/CFC.
@@ -101,4 +101,4 @@ by new code. Buying a local box up front is the single biggest schedule lever.
 - DHCP + UDP shell reachable within the first second of boot.
 - `dmesg` observable over the network.
 - Storage (NVMe) and NIC (r8168 or the machine's actual NIC) both functional.
-- TCO watchdog usable (needed as the safety net in Stage 4).
+- TCO watchdog usable (needed as the safety net in Stage 5).
