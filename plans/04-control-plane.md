@@ -1,11 +1,11 @@
-# Stage 3 — Control plane: HTTP API, host-side virtio, guest networking
+# Stage 4 — Control plane: HTTP API, host-side virtio, guest networking
 
 **Goal:** Manage VMs remotely over an HTTP API — create, destroy, list, and
 attach to a guest console — and give guests real block and network devices via
 host-side virtio. This is the step that makes `nos` a *cloud node*, not just a
 hypervisor.
 
-**Depends on:** Stage 2 (a bootable guest).
+**Depends on:** Stage 3 (a bootable guest).
 
 **Demo:**
 ```
@@ -27,14 +27,14 @@ Endpoints (v1):
 - `GET /vms`, `GET /vms/{id}` — list / inspect.
 - `DELETE /vms/{id}` — destroy.
 - `GET /vms/{id}/console` — stream serial console (chunked / long-poll).
-- `POST /system/update` — used in Stage 4 (live host update).
+- `POST /system/update` — used in Stage 5 (live host update).
 
 Image storage is nearly free: `bzImage`/initramfs/rootfs can be uploaded through
 the same API and kept in **nanofs/ext2**, which already exist.
 
 ## The two genuinely new pieces of work
 
-### 3.1 Host-side virtio (the main effort)
+### 4.1 Host-side virtio (the main effort)
 Today `nos`'s virtio drivers are **guest-side** (`nos` as a KVM guest). For
 `nos`'s *own* guests, the roles invert: `nos` must **emulate** a virtio device
 and service the virtqueues from the device side.
@@ -48,7 +48,7 @@ and service the virtqueues from the device side.
   side; here it is the mirror image. All descriptor/ring access goes through the
   `GuestMemory` volatile accessors from Stage 1 — never raw references.
 
-### 3.2 Guest networking
+### 4.2 Guest networking
 - A simple L2 bridge between guests' virtio-net and the physical NIC, **or** NAT
   using the existing IP stack.
 - Give each guest a MAC; optionally run the existing DHCP logic host-side to hand
@@ -64,7 +64,7 @@ virtio-blk needs a backend. Options, simplest first:
 
 Every device model added in this stage (virtio-net, virtio-blk, the bridge)
 must keep its state as **serializable POD** and must be **drainable** (finish or
-cancel in-flight virtqueue work on request). Stage 4 depends on being able to
+cancel in-flight virtqueue work on request). Stage 5 depends on being able to
 quiesce and snapshot every emulated device. Designing it in now is free;
 retrofitting it is not.
 
@@ -86,4 +86,4 @@ storage are comparatively quick because the substrate exists.
 - Guest gets a working virtio-net link and can reach the network.
 - Guest gets a virtio-blk disk backed by host storage.
 - VM lifecycle (create/list/destroy) is clean, and every device model is
-  POD-serializable and drainable (Stage 4 readiness).
+  POD-serializable and drainable (Stage 5 readiness).
