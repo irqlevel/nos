@@ -4,8 +4,17 @@
 Linux `bzImage` with an initramfs, on one vCPU, to an interactive shell on an
 emulated serial port. No BIOS, no disk emulation.
 
-**Depends on:** Stage 1 (crate layout, `GuestMemory`). Runs on Stage 0 hardware,
-but early bring-up happens under QEMU with nested virtualization.
+**Depends on:** Stage 1 (crate layout, `GuestMemory`) **and the HAL from
+[05-arm64.md](05-arm64.md)**, which now precedes this stage (see the roadmap
+[execution order](README.md#execution-order)). Runs on Stage 0 hardware, but
+early bring-up happens under QEMU with nested virtualization (x86) or HVF (arm64).
+
+**arm64 backend folds in here.** With the HAL and the safe `hv` logic crate in
+place, the AArch64 hypervisor — running at **EL2** with **stage-2 translation**
+(`HCR_EL2`/`VTTBR_EL2`/`VTCR_EL2`, `ESR_EL2` syndrome decoding, Linux `Image` +
+DTB loader) — is a second `hv-arch` backend under the same safe logic, not a
+separate stage. The x86 VMX/SVM path below is written first; the arm64 backend
+reuses everything above the arch line.
 
 **Demo, staged:** (1) VMXON + a trivial 16-byte guest halts as expected → (2) EPT
 + a guest in long mode → (3) `bzImage` prints its early console → (4) full boot
