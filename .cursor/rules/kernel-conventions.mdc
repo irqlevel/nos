@@ -68,6 +68,30 @@ Stdlib::Result<int> Foo() {
 | `Mm::AllocMapPages / UnmapFreePages` | yes (contiguous) | yes | yes |
 | `Mm::MapPages / UnmapPages` | no (caller provides physAddrs) | yes | no (caller retains ownership) |
 
+## operator new: plain form panics, fallible form is `Mm::NoThrow`
+
+Plain `new T(...)` **panics on OOM and never returns nullptr**. It must not
+return null: the replaceable plain form is implicitly declared
+potentially-throwing, so the compiler runs the constructor on the result
+unchecked and may delete callers' nullptr tests. It also cannot be fixed to
+be nullable — a `noexcept` redeclaration does not compile, and the
+toolchain's clang 14 parses `-fcheck-new` but does not implement it.
+A nullptr check after plain `new` is dead code; do not write one.
+
+Any allocation that wants to observe OOM gracefully must use the fallible
+placement form (the compiler is required to null-check it before running
+the constructor) and test the result:
+
+```cpp
+NanoInode* inode = new (Mm::NoThrow) NanoInode();
+if (inode == nullptr)
+    return false;
+```
+
+From `Stdlib::` code, spell it `new (Kernel::Mm::NoThrow) T[...]` (see
+`lib/vector.h`). `Mm::TAlloc<T, Tag>()` remains the tagged fallible
+alternative. Rationale and declarations: `mm/new.h`.
+
 ## Virtual address management
 
 `VaAllocator` (`src/cpp/mm/va_allocator.h`) tracks which VA ranges are free/used via a bitmap. Each `FixedPageAllocator` instance owns a `VaAllocator`. Never map DMA or device buffers at `physAddr + KernelSpaceBase` directly — always go through `Mm::MapPages` or `Mm::AllocMapPages` so the VA is tracked.
