@@ -418,6 +418,10 @@ void VirtioNet::CompleteTx()
         if (!slot)
             continue;
 
+        /* Clear the mapping so a duplicated/spurious used-ring entry for
+           this head cannot double-free the slot and its frame. */
+        TxSlotByHead[usedId] = nullptr;
+
         NetFrame* frame = slot->Frame;
         FreeTxSlot((int)(slot - TxSlots));
         if (frame)

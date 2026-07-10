@@ -1,10 +1,16 @@
 #pragma once
 
+#include "atomic.h"
+
 #include <include/types.h>
 #include <lib/stdlib.h>
 
 namespace Kernel
 {
+
+/* PVCLOCK_TSC_STABLE_BIT: the host keeps all vcpu entries in lockstep
+   (masterclock), so readings are cross-CPU monotonic by construction. */
+static const u8 PvClockTscStableBit = 1;
 
 struct PvClockVcpuTimeInfo
 {
@@ -108,6 +114,10 @@ private:
     bool KvmClockAvail;
     PvClockVcpuTimeInfo* PvClock; /* page base: entry array indexed by APIC id */
     ulong PvClockPhys;
+
+    /* Highest ns ever returned; enforces monotonicity when the host does
+       not report PVCLOCK_TSC_STABLE_BIT (see KvmClockTime). */
+    Atomic LastNs;
 };
 
 }

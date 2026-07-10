@@ -392,7 +392,7 @@ private:
         bool IsFull()
         {
             bool result = ((2 * T - 1) == KeyCount) ? true : false;
-            Trace(BtreeLL, "node 0x%p full %d keyCount %lu", this, result, KeyCount);
+            Trace(BtreeLL, "node 0x%p full %u keyCount %lu", this, (ulong)result, KeyCount);
             return result;
         }
 
@@ -565,7 +565,7 @@ private:
         void SetLeaf(bool leaf)
         {
             Leaf = leaf;
-            Trace(BtreeLL, "node 0x%p set leaf %d", this, leaf);
+            Trace(BtreeLL, "node 0x%p set leaf %u", this, (ulong)leaf);
         }
 
         void SetKeyCount(size_t keyCount)

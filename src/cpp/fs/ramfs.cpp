@@ -42,7 +42,7 @@ VNode* RamFs::GetRoot()
 
 VNode* RamFs::AllocNode(const char* name, VNode::Type type)
 {
-    VNode* node = new VNode();
+    VNode* node = new (Mm::NoThrow) VNode();
     if (node == nullptr)
     {
         Trace(0, "RamFs::AllocNode: alloc failed for '%s'", name);

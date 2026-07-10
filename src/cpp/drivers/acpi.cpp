@@ -478,9 +478,38 @@ Stdlib::Error Acpi::Parse()
     }
 
     auto& pt = Mm::PageTable::GetInstance();
-    ACPISDTHeader* rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(rsdtPhysAddr));
+
+    /* TmpMapAddress maps a single page and SDTs are only 4-byte aligned:
+       if the RSDT header (Length at offset 4) straddles the page boundary,
+       map the header range instead -- the same defense ParseTablePointers
+       applies to every other SDT. */
+    ulong rsdtPhysOff = rsdtPhysAddr & (Const::PageSize - 1);
+    bool headerStraddles = (rsdtPhysOff + sizeof(ACPISDTHeader) > Const::PageSize);
+    ACPISDTHeader* rsdt = headerStraddles
+        ? reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rsdtPhysAddr, sizeof(ACPISDTHeader)))
+        : reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(rsdtPhysAddr));
     if (!rsdt)
         return MakeError(Stdlib::Error::NoMemory);
+
+    u32 rsdtLength = rsdt->Length;
+    if (rsdtLength < sizeof(ACPISDTHeader))
+    {
+        Trace(0, "Acpi: rsdt length %u too small", (ulong)rsdtLength);
+        return MakeError(Stdlib::Error::InvalidValue);
+    }
+
+    /* Re-map the full table before ParseRsdt: its checksum walks all
+       Length bytes, which may extend past the header mapping. */
+    if (rsdtPhysOff + rsdtLength > Const::PageSize)
+    {
+        ulong hdrVaPage = reinterpret_cast<ulong>(rsdt) & ~(Const::PageSize - 1);
+        pt.TmpUnmapPage(hdrVaPage);
+        if (headerStraddles)
+            pt.TmpUnmapPage(hdrVaPage + Const::PageSize);
+        rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rsdtPhysAddr, rsdtLength));
+        if (!rsdt)
+            return MakeError(Stdlib::Error::NoMemory);
+    }
 
     err = ParseRsdt(rsdt);
     if (!err.Ok())
@@ -488,16 +517,6 @@ Stdlib::Error Acpi::Parse()
         return err;
     }
 
-    /* Re-map the full RSDT if it spans a page boundary */
-    ulong rsdtPhysOff = rsdtPhysAddr & (Const::PageSize - 1);
-    u32 rsdtLength = rsdt->Length;
-    if (rsdtPhysOff + rsdtLength > Const::PageSize)
-    {
-        pt.TmpUnmapPage(reinterpret_cast<ulong>(rsdt) & ~(Const::PageSize - 1));
-        rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rsdtPhysAddr, rsdtLength));
-        if (!rsdt)
-            return MakeError(Stdlib::Error::NoMemory);
-    }
     Rsdt = rsdt;
 
     err = ParseTablePointers();

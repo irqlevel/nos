@@ -108,7 +108,7 @@ bool Ext2Fs::Mount()
         goto fail;
     }
 
-    Super = new Ext2SuperBlock();
+    Super = new (Mm::NoThrow) Ext2SuperBlock();
     if (Super == nullptr)
     {
         Trace(0, "Ext2Fs: alloc superblock failed");
@@ -119,6 +119,27 @@ bool Ext2Fs::Mount()
     if (Super->Magic != Ext2Magic)
     {
         Trace(0, "Ext2Fs: bad magic 0x%p", (ulong)Super->Magic);
+        goto fail;
+    }
+
+    /* Refuse formats this driver cannot parse: mounting e.g. an ext4 image
+       (same magic) would return unrelated disk blocks as file data with
+       success status. Rev 0 lacks the required filetype dirent feature. */
+    if (Super->RevLevel < 1 ||
+        (Super->FeatureIncompat & ~Ext2IncompatSupported) != 0 ||
+        (Super->FeatureIncompat & Ext2IncompatFileType) == 0)
+    {
+        Trace(0, "Ext2Fs: unsupported rev %u / incompat features 0x%p",
+              (ulong)Super->RevLevel, (ulong)Super->FeatureIncompat);
+        goto fail;
+    }
+
+    /* LogBlockSize is raw disk data feeding a shift: bound it before
+       shifting (a count >= 32 is UB, and the x86-masked result could pass
+       the range check below for an incoherent image). */
+    if (Super->LogBlockSize > Ext2MaxLogBlockSize)
+    {
+        Trace(0, "Ext2Fs: unsupported log block size %u", (ulong)Super->LogBlockSize);
         goto fail;
     }
 
@@ -228,14 +249,12 @@ void Ext2Fs::Unmount()
     if (!Mounted)
         return;
 
-    for (ulong i = 0; i < VNodeCount; i++)
-    {
-        if (VNodes[i].Node != nullptr)
-        {
-            delete VNodes[i].Node;
-            VNodes[i].Node = nullptr;
-        }
-    }
+    /* Vnodes created after the cache filled are linked into the tree but
+       not tracked in VNodes[], so free by walking the tree, not the cache
+       (every vnode is linked into exactly one Children list; see LoadDir). */
+    if (RootNode != nullptr)
+        FreeTree(RootNode);
+    Stdlib::MemSet(VNodes, 0, sizeof(VNodes));
     VNodeCount = 0;
     RootNode = nullptr;
 
@@ -455,6 +474,20 @@ VNode* Ext2Fs::FindVNode(u32 inodeNum)
     return nullptr;
 }
 
+/* Depth is bounded by Ext2MaxDirDepth: LoadDir refuses to build a deeper
+   tree, and every vnode sits in exactly one Children list. */
+void Ext2Fs::FreeTree(VNode* node)
+{
+    while (!node->Children.IsEmpty())
+    {
+        Stdlib::ListEntry* entry = node->Children.RemoveHead();
+        VNode* child = CONTAINING_RECORD(entry, VNode, SiblingLink);
+        child->SiblingLink.Init();
+        FreeTree(child);
+    }
+    delete node;
+}
+
 void Ext2Fs::FreeVNode(VNode* vnode)
 {
     if (vnode == nullptr)
@@ -504,7 +537,7 @@ VNode* Ext2Fs::LoadDir(u32 inodeNum, u32 depth)
         return nullptr;
     }
 
-    VNode* dirNode = new VNode();
+    VNode* dirNode = new (Mm::NoThrow) VNode();
     if (dirNode == nullptr)
     {
         Trace(0, "Ext2Fs::LoadDir: alloc vnode failed for inode %u", (ulong)inodeNum);
@@ -583,17 +616,23 @@ VNode* Ext2Fs::LoadDir(u32 inodeNum, u32 depth)
             {
                 bool isDir = (de->FileType == Ext2DirTypeDir);
 
-                VNode* child;
-                if (isDir)
+                /* Only a vnode created by this dirent may be named,
+                   parented and linked. An inode already in the cache is
+                   either linked elsewhere (hard link -- first sighting
+                   wins) or is an ancestor whose LoadDir frame is still on
+                   the stack (crafted cyclic image); renaming or re-linking
+                   it would corrupt the tree ('..' escaping the mount root,
+                   cycles double-freed at Unmount). */
+                VNode* child = nullptr;
+                if (FindVNode(de->Inode) == nullptr)
                 {
-                    child = LoadDir(de->Inode, depth + 1);
-                }
-                else
-                {
-                    child = FindVNode(de->Inode);
-                    if (child == nullptr)
+                    if (isDir)
                     {
-                        child = new VNode();
+                        child = LoadDir(de->Inode, depth + 1);
+                    }
+                    else
+                    {
+                        child = new (Mm::NoThrow) VNode();
                         if (child != nullptr)
                         {
                             Stdlib::MemSet(child, 0, sizeof(VNode));
@@ -630,8 +669,7 @@ VNode* Ext2Fs::LoadDir(u32 inodeNum, u32 depth)
                     child->Name[nameLen] = '\0';
 
                     child->Parent = dirNode;
-                    if (child->SiblingLink.IsEmpty())
-                        dirNode->Children.InsertTail(&child->SiblingLink);
+                    dirNode->Children.InsertTail(&child->SiblingLink);
                 }
             }
         }

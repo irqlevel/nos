@@ -393,9 +393,11 @@ void Tcp::ProcessAck(TcpConn* conn, u32 segSeq, u32 ack, u16 wnd, ulong now)
         conn->SndWl2 = ack;
     }
 
-    /* Wrap-safe range check: SndUna < ack <= SndNxt. */
-    long ackAdvance = (long)(ack - conn->SndUna);
-    if (ackAdvance <= 0 || (long)(conn->SndNxt - ack) < 0)
+    /* Wrap-safe range check: SndUna < ack <= SndNxt. The differences must be
+       evaluated as 32-bit signed values -- widening the u32 subtraction to
+       long zero-extends and can never be negative. */
+    int ackAdvance = (int)(ack - conn->SndUna);
+    if (ackAdvance <= 0 || (int)(conn->SndNxt - ack) < 0)
     {
         /* Out-of-range ACK: window already tracked above. */
         return;

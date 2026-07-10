@@ -94,6 +94,7 @@ private:
     void FreeInode(u32 idx);
     long AllocDataBlock();
     void FreeDataBlock(u32 idx);
+    void MarkReachableAllocated();
 
     void ComputeSuperChecksum();
     bool VerifySuperChecksum();

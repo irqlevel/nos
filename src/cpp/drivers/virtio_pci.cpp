@@ -108,8 +108,21 @@ bool VirtioPci::ProbeModern(Pci::DeviceInfo* dev)
     if (capOffset == 0)
         return false;
 
+    /* FindCapability bounds a single walk, but this loop chains walks: a
+       corrupt/malicious device with a cyclic capability list that contains
+       a vendor cap would keep this loop spinning forever. 256 bytes of
+       config space fit at most 48 4-byte-aligned capabilities. */
+    static const ulong MaxCaps = 48;
+    ulong capIters = 0;
+
     while (capOffset != 0)
     {
+        if (++capIters > MaxCaps)
+        {
+            Trace(0, "VirtioPci: capability list cyclic or too long");
+            return false;
+        }
+
         u8 cfgType = pci.ReadByte(dev->Bus, dev->Slot, dev->Func, capOffset + 3);
         u8 bar     = pci.ReadByte(dev->Bus, dev->Slot, dev->Func, capOffset + 4);
         u32 offset = pci.ReadDword(dev->Bus, dev->Slot, dev->Func, capOffset + 8);

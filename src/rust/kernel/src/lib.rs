@@ -31,7 +31,7 @@ fn tco_init() {
     use kcore::timer::Timer;
     use kcore::time::Duration;
 
-    let mut wdt = match TcoWatchdog::probe() {
+    let wdt = match TcoWatchdog::probe() {
         Some(w) => w,
         None => {
             kcore::trace!(0, "TCO watchdog: not found");
@@ -39,12 +39,7 @@ fn tco_init() {
         }
     };
 
-    /* Start with a 30-second timeout */
-    wdt.start(30);
-    kcore::trace!(0, "TCO watchdog: started, timeout=30s");
-
-    /* Kick every 10 seconds from a periodic timer.
-       The timer callback holds a raw pointer to the TcoWatchdog; the watchdog
+    /* The timer callback holds a raw pointer to the TcoWatchdog; the watchdog
        is deliberately leaked so it lives for the kernel's lifetime. */
     let wdt_ptr = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(wdt));
 
@@ -65,13 +60,24 @@ fn tco_init() {
         wdt.kick();
     }
 
+    /* Secure the kick timer BEFORE arming the hardware: a timer failure
+       after start() would leave the watchdog counting with nobody kicking
+       it -- a spontaneous, unattributable hard reset ~30-60s into boot on
+       machines where NO_REBOOT was cleared. Kick every 10 seconds against
+       a 30-second timeout. */
     let period = Duration::from_secs(10);
     match Timer::start(period, kick_wdt, wdt_ptr as *mut u8) {
         /* Dropping the handle would stop the timer (and the unkicked
            watchdog would then reset the machine); leak it so the kick
            runs for the kernel's lifetime. */
-        Some(t) => t.leak(),
-        None => kcore::trace!(0, "TCO watchdog: failed to start kick timer"),
+        Some(t) => {
+            t.leak();
+            unsafe { (&mut *wdt_ptr).start(30) };
+            kcore::trace!(0, "TCO watchdog: started, timeout=30s");
+        }
+        None => {
+            kcore::trace!(0, "TCO watchdog: kick timer unavailable, not arming");
+        }
     }
 }
 

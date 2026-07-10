@@ -300,6 +300,15 @@ Start32:
     jmp gdt64.code:long_mode_start
 
 ap_start32:
+    ; The far jump above reloaded only CS. SS/DS/ES still hold the
+    ; post-INIT real-mode descriptor caches (base 0, limit 0xFFFF, B=0),
+    ; so a 32-bit push would truncate ESP mod 64K and the write would land
+    ; inside the boot page tables. Load the 32-bit data descriptor before
+    ; touching the stack or memory.
+    mov ax, gdt32.data
+    mov ss, ax
+    mov ds, ax
+    mov es, ax
     AllocStack
     mov esp, eax
     call enable_paging

@@ -155,12 +155,23 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                     { TerminateOnError(s, size, (size_t)pos); return -1; }
             }
 
-            /* Skip optional 'l' length modifier */
+            /* Skip optional 'l'/'ll' length modifiers: every integer
+               conversion consumes a full 64-bit vararg slot (callers cast
+               to ulong/long per project convention, and long == long long
+               on LP64), so the modifiers are consumed, never interpreted.
+               Without the second skip, %llu left 'l' as the conversion
+               character and the whole message was dropped as an error. */
             if (tp == 'l') {
                 i++;
                 tp = fmt[i];
                 if (tp == '\0')
                     { TerminateOnError(s, size, (size_t)pos); return -1; }
+                if (tp == 'l') {
+                    i++;
+                    tp = fmt[i];
+                    if (tp == '\0')
+                        { TerminateOnError(s, size, (size_t)pos); return -1; }
+                }
             }
 
             i++; /* consume the specifier */

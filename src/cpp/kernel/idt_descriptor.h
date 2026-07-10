@@ -19,8 +19,9 @@ public:
     IdtDescriptor& operator=(IdtDescriptor&& other);
     IdtDescriptor& operator=(const IdtDescriptor& other);
 
-    static IdtDescriptor Encode(u64 offset, u16 selector, u8 type);
-    static IdtDescriptor Encode(void (*handlerFn)());
+    /* ist 1..7 selects a TSS IST stack for the gate; 0 = no stack switch */
+    static IdtDescriptor Encode(u64 offset, u16 selector, u8 type, u8 ist = 0);
+    static IdtDescriptor Encode(void (*handlerFn)(), u8 ist = 0);
 
 private:
     u64 LowPart;
