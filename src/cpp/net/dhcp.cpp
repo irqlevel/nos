@@ -176,7 +176,7 @@ void DhcpClient::Run()
         if (renewed)
         {
             Dev->SetIp(Result.Ip);
-            Trace(0, "DHCP: lease renewed, lease %u", Result.LeaseTime);
+            Trace(0, "DHCP: lease renewed, lease %u", (ulong)Result.LeaseTime);
         }
         else
         {

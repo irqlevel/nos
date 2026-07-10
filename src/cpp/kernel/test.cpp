@@ -203,7 +203,7 @@ Stdlib::Error TestAllocator()
             Trace(0, "TestAllocator: alloc size %u", size);
         }
 
-        u8 *block = new u8[size];
+        u8 *block = new (Mm::NoThrow) u8[size];
         if (block == nullptr)
         {
             Trace(0, "TestAllocator: alloc failed at size %u", size);

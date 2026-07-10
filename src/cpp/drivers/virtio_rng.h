@@ -38,6 +38,10 @@ private:
     u8* DmaBuf;
     ulong DmaBufPhys;
     bool Initialized;
+    /* A timed-out request left its descriptor (and DmaBuf) owned by the
+       device; no new request may be posted until its completion is
+       reclaimed (see GetRandom). */
+    bool RequestStuck;
     char DevName[8];
 
     static const ulong MaxInstances = 4;

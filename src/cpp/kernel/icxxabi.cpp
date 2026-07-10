@@ -35,6 +35,7 @@ int __cxa_guard_acquire (__guard *g)
     g->ClearBit(__GUARD_LOCK_BIT);
     if (iflag)
         InterruptEnable();
+    Kernel::PreemptEnable();
     return 0;
 }
 

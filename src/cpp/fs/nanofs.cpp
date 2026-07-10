@@ -61,7 +61,7 @@ bool NanoFs::Mount()
 
     if (Super == nullptr)
     {
-        Super = new NanoSuperBlock();
+        Super = new (Mm::NoThrow) NanoSuperBlock();
         if (Super == nullptr)
         {
             Trace(0, "NanoFs: failed to alloc superblock");
@@ -115,6 +115,8 @@ bool NanoFs::Mount()
         return false;
     }
 
+    MarkReachableAllocated();
+
     Mounted = true;
     Trace(0, "NanoFs: mounted, %u inodes, %u data blocks",
           (ulong)Super->InodeCount, (ulong)Super->DataBlockCount);
@@ -125,7 +127,7 @@ bool NanoFs::Format(BlockDevice* dev)
 {
     BlockIo io(dev, NanoBlockSize);
 
-    NanoSuperBlock* super = new NanoSuperBlock();
+    NanoSuperBlock* super = new (Mm::NoThrow) NanoSuperBlock();
     if (super == nullptr)
     {
         Trace(0, "NanoFs::Format: alloc superblock failed");
@@ -180,7 +182,7 @@ bool NanoFs::Format(BlockDevice* dev)
     }
 
     // Write root inode (inode 0)
-    NanoInode* rootInode = new NanoInode();
+    NanoInode* rootInode = new (Mm::NoThrow) NanoInode();
     if (rootInode == nullptr)
     {
         Trace(0, "NanoFs::Format: alloc root inode failed");
@@ -360,6 +362,68 @@ void NanoFs::FreeDataBlock(u32 idx)
     FlushSuper();
 }
 
+/* Checksums are integrity, not authentication: a crafted image can carry a
+   valid, checksummed, reachable inode whose allocation bit is clear, or
+   live data blocks unmarked in the data bitmap. AllocInode/AllocDataBlock
+   would then hand out live metadata and the next create/write would clobber
+   the tree (e.g. the root directory's data block). Re-mark everything
+   reachable from the root as allocated; repairs persist with the next
+   superblock flush. Runs at mount, after LoadVNode(0) filled VNodes[]. */
+void NanoFs::MarkReachableAllocated()
+{
+    Stdlib::Bitmap inodeBm(Super->InodeBitmap, NanoInodeCount);
+    Stdlib::Bitmap dataBm(Super->DataBitmap, NanoDataBlockCount);
+
+    NanoInode* inode = new (Mm::NoThrow) NanoInode();
+    if (inode == nullptr)
+    {
+        Trace(0, "NanoFs: alloc inode failed, bitmap repair skipped");
+        return;
+    }
+
+    bool repaired = false;
+    for (u32 i = 0; i < NanoInodeCount; i++)
+    {
+        if (VNodes[i] == nullptr)
+            continue;
+
+        if (!inodeBm.TestBit(i))
+        {
+            Trace(0, "NanoFs: reachable inode %u not marked allocated, repairing",
+                  (ulong)i);
+            inodeBm.SetBit(i);
+            repaired = true;
+        }
+
+        if (!ReadInode(i, inode))
+            continue;
+
+        u32 usedBlocks;
+        if (inode->Type == NanoInodeTypeDir)
+            usedBlocks = (inode->Size > 0) ? 1 : 0;
+        else
+            usedBlocks = (u32)(((u64)inode->Size + NanoBlockSize - 1) / NanoBlockSize);
+        if (usedBlocks > NanoMaxBlocks)
+            usedBlocks = NanoMaxBlocks;
+
+        for (u32 j = 0; j < usedBlocks; j++)
+        {
+            u32 b = inode->Blocks[j];
+            if (b >= NanoDataBlockCount || dataBm.TestBit(b))
+                continue;
+            Trace(0, "NanoFs: live data block %u (inode %u) not marked allocated, repairing",
+                  (ulong)b, (ulong)i);
+            dataBm.SetBit(b);
+            repaired = true;
+        }
+    }
+
+    delete inode;
+
+    if (repaired)
+        FlushSuper();
+}
+
 // --- Checksum helpers ---
 
 void NanoFs::ComputeSuperChecksum()
@@ -442,7 +506,7 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx, u32 depth)
     if (VNodes[inodeIdx] != nullptr)
         return VNodes[inodeIdx];
 
-    NanoInode* inode = new NanoInode();
+    NanoInode* inode = new (Mm::NoThrow) NanoInode();
     if (inode == nullptr)
     {
         Trace(0, "NanoFs::LoadVNode: alloc inode failed for %u", (ulong)inodeIdx);
@@ -470,7 +534,7 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx, u32 depth)
         return nullptr;
     }
 
-    VNode* vnode = new VNode();
+    VNode* vnode = new (Mm::NoThrow) VNode();
     if (vnode == nullptr)
     {
         Trace(0, "NanoFs::LoadVNode: alloc vnode failed for %u", (ulong)inodeIdx);
@@ -568,7 +632,7 @@ u32 NanoFs::VNodeToInode(VNode* vnode)
 
 bool NanoFs::AddDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
 {
-    NanoInode* dirInode = new NanoInode();
+    NanoInode* dirInode = new (Mm::NoThrow) NanoInode();
     if (dirInode == nullptr)
     {
         Trace(0, "NanoFs::AddDirEntry: alloc inode failed");
@@ -646,7 +710,7 @@ bool NanoFs::AddDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
 
 bool NanoFs::RemoveDirEntry(u32 dirInodeIdx, u32 childInodeIdx)
 {
-    NanoInode* dirInode = new NanoInode();
+    NanoInode* dirInode = new (Mm::NoThrow) NanoInode();
     if (dirInode == nullptr)
     {
         Trace(0, "NanoFs::RemoveDirEntry: alloc inode failed");
@@ -803,7 +867,7 @@ VNode* NanoFs::CreateFile(VNode* dir, const char* name)
     if (inodeIdx < 0)
         return nullptr;
 
-    NanoInode* inode = new NanoInode();
+    NanoInode* inode = new (Mm::NoThrow) NanoInode();
     if (inode == nullptr)
     {
         Trace(0, "NanoFs::CreateFile: alloc inode failed for '%s'", name);
@@ -843,7 +907,7 @@ VNode* NanoFs::CreateFile(VNode* dir, const char* name)
         return nullptr;
     }
 
-    VNode* vnode = new VNode();
+    VNode* vnode = new (Mm::NoThrow) VNode();
     if (vnode == nullptr)
     {
         Trace(0, "NanoFs::CreateFile: alloc vnode failed for '%s'", name);
@@ -921,7 +985,7 @@ VNode* NanoFs::CreateDir(VNode* dir, const char* name)
         return nullptr;
     }
 
-    NanoInode* inode = new NanoInode();
+    NanoInode* inode = new (Mm::NoThrow) NanoInode();
     if (inode == nullptr)
     {
         Trace(0, "NanoFs::CreateDir: alloc inode failed for '%s'", name);
@@ -966,7 +1030,7 @@ VNode* NanoFs::CreateDir(VNode* dir, const char* name)
         return nullptr;
     }
 
-    VNode* vnode = new VNode();
+    VNode* vnode = new (Mm::NoThrow) VNode();
     if (vnode == nullptr)
     {
         Trace(0, "NanoFs::CreateDir: alloc vnode failed for '%s'", name);
@@ -1007,7 +1071,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     }
 
     u32 inodeIdx = VNodeToInode(file);
-    NanoInode* inode = new NanoInode();
+    NanoInode* inode = new (Mm::NoThrow) NanoInode();
     if (inode == nullptr)
     {
         Trace(0, "NanoFs::Write: alloc inode failed");
@@ -1186,7 +1250,7 @@ bool NanoFs::Read(VNode* file, void* buf, ulong len, ulong offset)
     }
 
     u32 inodeIdx = VNodeToInode(file);
-    NanoInode* inode = new NanoInode();
+    NanoInode* inode = new (Mm::NoThrow) NanoInode();
     if (inode == nullptr)
     {
         Trace(0, "NanoFs::Read: alloc inode failed");
@@ -1318,7 +1382,7 @@ bool NanoFs::RemoveRecursive(VNode* node)
     }
 
     // Read inode from disk to find allocated blocks
-    NanoInode* inode = new NanoInode();
+    NanoInode* inode = new (Mm::NoThrow) NanoInode();
     if (inode == nullptr)
     {
         Trace(0, "NanoFs::RemoveRecursive: alloc inode failed for %u", (ulong)inodeIdx);

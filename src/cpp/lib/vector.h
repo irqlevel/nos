@@ -146,7 +146,7 @@ public:
         if (!err.Ok())
             return;
 
-        Arr = new T[other.Capacity];
+        Arr = new (Kernel::Mm::NoThrow) T[other.Capacity];
         if (!Arr)
         {
             err = MakeError(Stdlib::Error::NoMemory);
@@ -172,7 +172,7 @@ public:
         if (!err.Ok())
             return;
 
-        Arr = new T[size];
+        Arr = new (Kernel::Mm::NoThrow) T[size];
         if (!Arr)
         {
             err = MakeError(Stdlib::Error::NoMemory);

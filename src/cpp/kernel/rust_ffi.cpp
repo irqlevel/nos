@@ -794,6 +794,23 @@ unsigned long kernel_interrupt_register_level(
             u8 vector = (u8)(RustIrqVectorBase + i);
             Kernel::Interrupt::RegisterLevel(lh, irq_line, vector);
 
+            /* RegisterLevel is void and refuses silently (GSI owned by an
+               edge handler, vector already claimed, shared list full). Its
+               OnInterruptRegister callback sets the slot's Vector; still 0
+               means no IOAPIC pin was programmed -- roll the slot back
+               instead of handing the driver a dead handle it would trust
+               (NIC enabled, no interrupts ever delivered). */
+            if (RustIrqSlots[i].Vector == 0)
+            {
+                RustIrqSlots[i].Handler = nullptr;
+                RustIrqSlots[i].Ctx = nullptr;
+                RustIrqSlots[i].Used = false;
+                RustIrqLock.WriteUnlockIrqRestore(flags);
+                Trace(0, "kernel_interrupt_register_level: irq %u refused",
+                      (ulong)irq_line);
+                return 0;
+            }
+
             *out_vector = RustIrqSlots[i].Vector;
             RustIrqLock.WriteUnlockIrqRestore(flags);
             return i + 1;

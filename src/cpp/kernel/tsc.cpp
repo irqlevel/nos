@@ -2,6 +2,7 @@
 #include "cpuid.h"
 #include "asm.h"
 #include "trace.h"
+#include "preempt.h"
 
 #include <include/const.h>
 #include <mm/new.h>
@@ -213,18 +214,30 @@ Stdlib::Time Tsc::KvmClockTime()
 {
     u32 version;
     u64 ns;
+    u8 flags;
 
     /* Read this CPU's own entry: an AP reading the BSP's entry would compute
        AP_tsc - BSP_timestamp, which is wrong unless TSCs are perfectly
        synchronized. A never-armed entry is all-zero (mul = 0) and yields 0,
-       which GetBootTime treats as "fall back to HPET/PIT". */
+       which GetBootTime treats as "fall back to HPET/PIT".
+
+       The entry and the TSC must be sampled on the same vcpu: with
+       interrupts enabled the task could be migrated between selecting the
+       entry and executing rdtsc, mixing CPU A's parameters with CPU B's
+       TSC. */
+    ulong irq = PreemptIrqSave();
+
     PvClockVcpuTimeInfo* pv = &PvClock[Lapic::GetApicId() % PvClockEntryCount];
 
     do {
         version = pv->Version;
         Barrier();
 
-        u64 delta = ReadTsc() - pv->TscTimestamp;
+        /* Same-vcpu rdtsc cannot precede the entry's timestamp; if the host
+           republishes the entry mid-read the version loop retries, so only
+           avoid the transient huge unsigned delta. */
+        u64 now = ReadTsc();
+        u64 delta = (now >= pv->TscTimestamp) ? now - pv->TscTimestamp : 0;
         if (pv->TscShift >= 0)
             delta <<= pv->TscShift;
         else
@@ -233,8 +246,29 @@ Stdlib::Time Tsc::KvmClockTime()
         ns = pv->SystemTime +
              (u64)(((__uint128_t)delta * pv->TscToSystemMul) >> 32);
 
+        flags = pv->Flags;
         Barrier();
     } while ((pv->Version & 1) || pv->Version != version);
+
+    PreemptIrqRestore(irq);
+
+    /* Without the stable bit (host left masterclock mode: live migration,
+       host suspend, unstable host TSC) per-vcpu readings are not cross-CPU
+       monotonic. Latch a global maximum so time never goes backwards --
+       callers latch "now + timeout" deadlines, and a transient forward jump
+       followed by correct readings would hang them forever. */
+    if ((flags & PvClockTscStableBit) == 0)
+    {
+        long seen = LastNs.Get();
+        while ((long)ns > seen)
+        {
+            long old = LastNs.Cmpxchg((long)ns, seen);
+            if (old == seen)
+                return Stdlib::Time(ns);
+            seen = old;
+        }
+        return Stdlib::Time((u64)seen);
+    }
 
     return Stdlib::Time(ns);
 }

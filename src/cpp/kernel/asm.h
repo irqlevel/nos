@@ -37,6 +37,8 @@ void LoadIdt(void *src);
 void StoreGdt(void *dest);
 void LoadGdt(void *src);
 
+void LoadTr(u16 selector);
+
 void SpinLockLock(ulong *lock);
 void SpinLockUnlock(ulong *lock);
 

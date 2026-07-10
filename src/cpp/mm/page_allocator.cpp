@@ -69,6 +69,11 @@ void* FixedPageAllocator::Alloc()
             }
             for (size_t j = i; j < PageCount; j++)
                 pt.FreePage(pages[j]);
+            /* Remote CPUs may have cached the just-torn-down translations
+               (UnmapPage only invalidates locally); flush everywhere before
+               the VA block and the pages become reusable. */
+            if (i > 0)
+                Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, i);
             VaAlloc.Free(va);
             return nullptr;
         }
@@ -96,6 +101,9 @@ void* FixedPageAllocator::Map(Page* pages)
                 Page* page = pt.UnmapPage(va + j * Const::PageSize);
                 page->Put();
             }
+            /* See Alloc: shoot down remote TLBs before reusing the VA. */
+            if (i > 0)
+                Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, i);
             VaAlloc.Free(va);
             return nullptr;
         }
@@ -127,6 +135,9 @@ void* FixedPageAllocator::MapPhys(ulong* physAddrs, size_t count)
                 Page* p = pt.UnmapPage(va + j * Const::PageSize);
                 p->Put(); /* Undo MapPage's Get */
             }
+            /* See Alloc: shoot down remote TLBs before reusing the VA. */
+            if (i > 0)
+                Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, i);
             VaAlloc.Free(va);
             return nullptr;
         }

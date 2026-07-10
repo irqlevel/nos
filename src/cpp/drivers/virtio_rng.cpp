@@ -16,6 +16,7 @@ VirtioRng::VirtioRng()
     : DmaBuf(nullptr)
     , DmaBufPhys(0)
     , Initialized(false)
+    , RequestStuck(false)
 {
     DevName[0] = '\0';
 }
@@ -148,6 +149,23 @@ bool VirtioRng::GetRandom(u8* buf, ulong len)
 
     Stdlib::AutoLock lock(Lock);
 
+    /* A previously timed-out request's descriptor is still device-owned and
+       points at DmaBuf. Posting another descriptor for the same buffer
+       would credit whichever completion arrives first to the new request
+       (off-by-one attribution from then on) and leak a descriptor per
+       timeout. Reclaim the stale completion if it has arrived since;
+       otherwise refuse. */
+    if (RequestStuck)
+    {
+        u32 staleId, staleLen;
+        if (!Queue.GetUsed(staleId, staleLen))
+        {
+            Trace(0, "VirtioRng %s: stale request still pending", DevName);
+            return false;
+        }
+        RequestStuck = false;
+    }
+
     ulong offset = 0;
     while (offset < len)
     {
@@ -182,6 +200,7 @@ bool VirtioRng::GetRandom(u8* buf, ulong len)
         if (!Queue.GetUsed(usedId, usedLen))
         {
             Trace(0, "VirtioRng %s: timeout", DevName);
+            RequestStuck = true;
             return false;
         }
 

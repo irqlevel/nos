@@ -205,6 +205,9 @@ void ApMain2()
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
 
+    /* GDT is loaded (above); give this CPU its TSS so #DF has an IST stack */
+    Gdt::GetInstance().SetupTssSelf(cpu.GetIndex());
+
     Trace(0, "Cpu %u rsp 0x%p (static stack)", cpu.GetIndex(), GetRsp());
 
     if (!cpu.Run(ApStartup, nullptr))
@@ -365,7 +368,7 @@ void MountRootFs()
 
     auto& vfs = Vfs::GetInstance();
 
-    RamFs* ramfs = new RamFs();
+    RamFs* ramfs = new (Mm::NoThrow) RamFs();
     if (ramfs == nullptr || !vfs.Mount("/", ramfs))
     {
         Trace(0, "MountRootFs: failed to mount ramfs on /");
@@ -380,7 +383,7 @@ void MountRootFs()
     for (ulong i = 0; i < table.GetCount(); i++)
     {
         BlockDevice* dev = table.GetDevice(i);
-        Ext2Fs* ext2 = new Ext2Fs(dev);
+        Ext2Fs* ext2 = new (Mm::NoThrow) Ext2Fs(dev);
         if (ext2 != nullptr && vfs.Mount("/boot", ext2, true))
         {
             Trace(0, "MountRootFs: mounted ext2 on /boot from %s (ro)",
@@ -395,7 +398,7 @@ void MountRootFs()
     for (ulong i = 0; i < table.GetCount(); i++)
     {
         BlockDevice* dev = table.GetDevice(i);
-        NanoFs* nanofs = new NanoFs(dev);
+        NanoFs* nanofs = new (Mm::NoThrow) NanoFs(dev);
         if (nanofs != nullptr && vfs.Mount("/data", nanofs))
         {
             Trace(0, "MountRootFs: mounted nanofs on /data from %s (rw)",
@@ -407,7 +410,7 @@ void MountRootFs()
 
     vfs.CreateDir("/proc");
 
-    ProcFs* procfs = new ProcFs();
+    ProcFs* procfs = new (Mm::NoThrow) ProcFs();
     if (procfs != nullptr && vfs.Mount("/proc", procfs, true))
     {
         Trace(0, "MountRootFs: mounted procfs on /proc (ro)");
@@ -446,6 +449,10 @@ void BpStartup(void* ctx)
             cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
 
         TraceCpuState(cpu.GetIndex());
+
+        /* GDT is loaded (Main2); give the BSP its TSS so #DF has an IST
+           stack */
+        Gdt::GetInstance().SetupTssSelf(cpu.GetIndex());
 
         ioApic.Enable();
 

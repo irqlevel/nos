@@ -16,6 +16,18 @@ static const u8 Ext2DirTypeDir  = 2;
 
 static const u32 Ext2RootInode = 2;
 
+/* FeatureIncompat bits. FileType is required: LoadDir keys directory
+   detection off the dirent FileType byte, which without this feature is the
+   high half of a 16-bit NameLen. Any other incompat bit (ext3 journal
+   recovery, ext4 extents/64bit, meta_bg, ...) changes the on-disk format in
+   ways this driver cannot parse and must refuse -- ext3/ext4 share the same
+   magic, so the magic check alone does not reject them. */
+static const u32 Ext2IncompatFileType  = 0x0002;
+static const u32 Ext2IncompatSupported = Ext2IncompatFileType;
+
+/* BlockSize = 1024 << LogBlockSize must not exceed PageSize (4096). */
+static const u32 Ext2MaxLogBlockSize = 2;
+
 static const u32 Ext2DirectBlocks   = 12;
 static const u32 Ext2IndirectBlock  = 12;
 static const u32 Ext2DIndirectBlock = 13;
@@ -144,6 +156,7 @@ private:
     VNode* LoadDir(u32 inodeNum, u32 depth = 0);
     VNode* FindVNode(u32 inodeNum);
     void   FreeVNode(VNode* vnode);
+    void   FreeTree(VNode* node);
 
     static const ulong MaxCachedVNodes = 512;
 

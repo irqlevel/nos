@@ -106,11 +106,19 @@ bool ExceptionTable::SetHandler(size_t index, ExcHandler handler)
 
 void ExceptionTable::RegisterExceptionHandlers()
 {
+    /* #DF is delivered on its own per-CPU IST stack (Gdt::SetupTssSelf):
+       it fires exactly when the current stack is unusable, and pushing the
+       exception frame onto that bad stack would triple-fault instead of
+       reaching the panic handler. */
+    static const size_t DoubleFaultVector = 0x8;
+    static const u8 DoubleFaultIst = 1;
+
     auto& idt = Idt::GetInstance();
 
     for (size_t i = 0; i < Stdlib::ArraySize(Handler); i++)
     {
-        idt.SetDescriptor(i, IdtDescriptor::Encode(Handler[i]));
+        u8 ist = (i == DoubleFaultVector) ? DoubleFaultIst : 0;
+        idt.SetDescriptor(i, IdtDescriptor::Encode(Handler[i], ist));
     }
 }
 

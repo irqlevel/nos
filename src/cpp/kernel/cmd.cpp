@@ -238,7 +238,17 @@ static void CmdPartitions(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    u8 buf[512];
+    /* ReadSectors transfers a full hardware sector (may exceed 512, e.g.
+       4K-LBA NVMe), so size the buffer from the device, not the MBR. */
+    Stdlib::UniquePtr<u8, Mm::FreeDeleter> bufPtr(
+        static_cast<u8*>(Mm::Alloc(dev->GetSectorSize(), 0)));
+    if (!bufPtr.Get())
+    {
+        con.Printf("alloc failed\n");
+        return;
+    }
+    u8* buf = bufPtr.Get();
+
     if (!dev->ReadSectors(0, buf, 1))
     {
         con.Printf("failed to read sector 0\n");
@@ -784,7 +794,7 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
         char path[Vfs::MaxPath];
         Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
-        RamFs* fs = new RamFs();
+        RamFs* fs = new (Mm::NoThrow) RamFs();
         if (fs == nullptr)
         {
             con.Printf("failed to allocate ramfs\n");
@@ -826,7 +836,7 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
             return;
         }
 
-        NanoFs* fs = new NanoFs(dev);
+        NanoFs* fs = new (Mm::NoThrow) NanoFs(dev);
         if (fs == nullptr)
         {
             con.Printf("failed to allocate nanofs\n");

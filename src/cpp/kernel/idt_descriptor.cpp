@@ -55,24 +55,26 @@ IdtDescriptor& IdtDescriptor::operator=(const IdtDescriptor& other)
     return *this;
 }
 
-IdtDescriptor IdtDescriptor::Encode(u64 offset, u16 selector, u8 type)
+IdtDescriptor IdtDescriptor::Encode(u64 offset, u16 selector, u8 type, u8 ist)
 {
 	u64 lowPart = 0, highPart = 0;
 
     lowPart |= (offset & 0xFFFFULL);
     lowPart |= selector << 16ULL;
+    lowPart |= ((u64)(ist & 0x7)) << 32ULL;
     lowPart |= ((u64)type) << 40ULL;
     lowPart |= ((offset >> 16ULL) & 0xFFFFULL) << 48ULL;
     highPart |= offset >> 32ULL;
 	return IdtDescriptor(lowPart, highPart);
 }
 
-IdtDescriptor IdtDescriptor::Encode(void (*handlerFn)())
+IdtDescriptor IdtDescriptor::Encode(void (*handlerFn)(), u8 ist)
 {
     if (handlerFn != nullptr)
     {
         return Encode(reinterpret_cast<u64>(handlerFn), GetCs(),
-            IdtDescriptor::FlagPresent | IdtDescriptor::FlagGateInterrupt80386_32);
+            IdtDescriptor::FlagPresent | IdtDescriptor::FlagGateInterrupt80386_32,
+            ist);
     }
     else
     {

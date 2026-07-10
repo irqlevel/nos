@@ -43,26 +43,55 @@ void UnmapPages(void* ptr, size_t numPages)
 }
 }
 
+/* The plain forms must not return nullptr (see NoThrowT in new.h): the
+   compiler runs the constructor on the result unchecked, so returning null
+   here would mean a write to VA 0 instead of a diagnosable panic. */
 void* operator new(size_t size)
 {
-    return Kernel::Mm::Alloc(size, 0);
+    void* ptr = Kernel::Mm::Alloc(size, 0);
+    if (ptr == nullptr)
+        Panic("operator new: out of memory (size %u)", (ulong)size);
+    return ptr;
 }
 
 void* operator new[](size_t size)
 {
+    void* ptr = Kernel::Mm::Alloc(size, 0);
+    if (ptr == nullptr)
+        Panic("operator new[]: out of memory (size %u)", (ulong)size);
+    return ptr;
+}
+
+void* operator new(size_t size, void *ptr) noexcept
+{
+    (void)size;
+    return ptr;
+}
+
+void* operator new[](size_t size, void *ptr) noexcept
+{
+    (void)size;
+    return ptr;
+}
+
+void* operator new(size_t size, const Kernel::Mm::NoThrowT&) noexcept
+{
     return Kernel::Mm::Alloc(size, 0);
 }
 
-void* operator new(size_t size, void *ptr)
+void* operator new[](size_t size, const Kernel::Mm::NoThrowT&) noexcept
 {
-    (void)size;
-    return ptr;
+    return Kernel::Mm::Alloc(size, 0);
 }
 
-void* operator new[](size_t size, void *ptr)
+void operator delete(void* ptr, const Kernel::Mm::NoThrowT&) noexcept
 {
-    (void)size;
-    return ptr;
+    Kernel::Mm::Free(ptr);
+}
+
+void operator delete[](void* ptr, const Kernel::Mm::NoThrowT&) noexcept
+{
+    Kernel::Mm::Free(ptr);
 }
 
 void operator delete(void* ptr)

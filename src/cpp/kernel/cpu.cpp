@@ -164,7 +164,7 @@ bool CpuTable::SetBspIndex(ulong index)
     if (BugOn(index >= Stdlib::ArraySize(CpuArray)))
         return false;
 
-    auto& cpu = CpuArray[BspIndex];
+    auto& cpu = CpuArray[index];
     if (BugOn(!(cpu.GetState() & Cpu::StateInited)))
         return false;
 

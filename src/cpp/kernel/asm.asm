@@ -61,6 +61,7 @@ global LoadIdt
 global StoreIdt
 global LoadGdt
 global StoreGdt
+global LoadTr
 global SpinLockLock
 global SpinLockUnlock
 global Outb
@@ -267,6 +268,10 @@ StoreGdt:
 
 LoadGdt:
 	lgdt [rdi]
+	ret
+
+LoadTr:
+	ltr di
 	ret
 
 SpinLockLock:
