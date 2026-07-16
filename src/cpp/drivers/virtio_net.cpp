@@ -32,7 +32,8 @@ VirtioNet VirtioNet::Instances[MaxInstances];
 ulong VirtioNet::InstanceCount = 0;
 
 VirtioNet::VirtioNet()
-    : RxNotifyAddr(nullptr)
+    : Transport(&PciTransport)
+    , RxNotifyAddr(nullptr)
     , TxNotifyAddr(nullptr)
     , IntVector(-1)
     , Initialized(false)
@@ -67,136 +68,136 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     pci.EnableBusMastering(pciDev->Bus, pciDev->Slot, pciDev->Func);
 
     /* Probe modern virtio-pci capabilities and map MMIO BARs */
-    if (!Transport.Probe(pciDev))
+    if (!PciTransport.Probe(pciDev))
     {
-        Trace(0, "VirtioNet %s: Transport.Probe failed", name);
+        Trace(0, "VirtioNet %s: Transport->Probe failed", name);
         return false;
     }
 
     Trace(0, "VirtioNet %s: %s virtio-pci probed, irq %u",
-        name, Transport.IsLegacy() ? "legacy" : "modern",
+        name, Transport->IsLegacy() ? "legacy" : "modern",
         (ulong)pciDev->InterruptLine);
 
     /* Reset device */
-    Transport.Reset();
+    Transport->Reset();
 
     /* Acknowledge */
-    Transport.SetStatus(VirtioPci::StatusAcknowledge);
+    Transport->SetStatus(VirtioTransport::StatusAcknowledge);
 
     /* Driver */
-    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver);
+    Transport->SetStatus(VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver);
 
     /* Read and negotiate features (64-bit via select) */
-    u32 devFeatures0 = Transport.ReadDeviceFeature(0);
+    u32 devFeatures0 = Transport->ReadDeviceFeature(0);
     Trace(0, "VirtioNet %s: device features[0] 0x%p", name, (ulong)devFeatures0);
 
     u32 drvFeatures0 = 0;
     if (devFeatures0 & FeatureMac)
         drvFeatures0 |= FeatureMac;
 
-    Transport.WriteDriverFeature(0, drvFeatures0);
+    Transport->WriteDriverFeature(0, drvFeatures0);
 
-    if (!Transport.IsLegacy())
+    if (!Transport->IsLegacy())
     {
         /* features[1]: set VIRTIO_F_VERSION_1 (bit 32 = index 1 bit 0) */
-        u32 devFeatures1 = Transport.ReadDeviceFeature(1);
+        u32 devFeatures1 = Transport->ReadDeviceFeature(1);
         u32 drvFeatures1 = devFeatures1 & (1 << 0); /* VIRTIO_F_VERSION_1 */
-        Transport.WriteDriverFeature(1, drvFeatures1);
+        Transport->WriteDriverFeature(1, drvFeatures1);
     }
 
-    if (!Transport.IsLegacy())
+    if (!Transport->IsLegacy())
     {
         /* Set FEATURES_OK (modern only; legacy doesn't have this bit) */
-        Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                            VirtioPci::StatusFeaturesOk);
+        Transport->SetStatus(VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver |
+                            VirtioTransport::StatusFeaturesOk);
 
         /* Verify FEATURES_OK is still set */
-        if (!(Transport.GetStatus() & VirtioPci::StatusFeaturesOk))
+        if (!(Transport->GetStatus() & VirtioTransport::StatusFeaturesOk))
         {
             Trace(0, "VirtioNet %s: FEATURES_OK not set by device", name);
-            Transport.SetStatus(VirtioPci::StatusFailed);
+            Transport->SetStatus(VirtioTransport::StatusFailed);
             return false;
         }
     }
 
     /* Legacy mode uses 10-byte header (no NumBuffers field) */
-    NetHdrSize = Transport.IsLegacy() ? sizeof(VirtioNetHdrLegacy) : sizeof(VirtioNetHdr);
+    NetHdrSize = Transport->IsLegacy() ? sizeof(VirtioNetHdrLegacy) : sizeof(VirtioNetHdr);
     Trace(0, "VirtioNet %s: net hdr size %u", name, NetHdrSize);
 
-    if (!Transport.IsLegacy() && Transport.IsMsixEnabled())
+    if (!Transport->IsLegacy() && Transport->IsMsixEnabled())
     {
-        u8 vec = Transport.EnableMsixVector(0, *this);
+        u8 vec = Transport->EnableMsixVector(0, *this);
         if (vec == 0)
             Trace(0, "VirtioNet %s: MSI-X unavailable, using INTx", name);
     }
 
     /* Setup RX virtqueue (queue 0) */
-    Transport.SelectQueue(0);
-    u16 rxQueueSize = Transport.GetQueueSize();
+    Transport->SelectQueue(0);
+    u16 rxQueueSize = Transport->GetQueueSize();
     Trace(0, "VirtioNet %s: RX queue size %u", name, (ulong)rxQueueSize);
 
     if (rxQueueSize == 0)
     {
         Trace(0, "VirtioNet %s: RX queue size is 0", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
     if (!HwRxQueue.Setup(rxQueueSize))
     {
         Trace(0, "VirtioNet %s: failed to setup RX queue", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
-    Transport.SetQueueDesc(HwRxQueue.GetDescPhys());
-    Transport.SetQueueDriver(HwRxQueue.GetAvailPhys());
-    Transport.SetQueueDevice(HwRxQueue.GetUsedPhys());
-    Transport.EnableQueue();
+    Transport->SetQueueDesc(HwRxQueue.GetDescPhys());
+    Transport->SetQueueDriver(HwRxQueue.GetAvailPhys());
+    Transport->SetQueueDevice(HwRxQueue.GetUsedPhys());
+    Transport->EnableQueue();
 
-    if (!Transport.IsLegacy())
-        RxNotifyAddr = Transport.GetNotifyAddr(0);
+    if (!Transport->IsLegacy())
+        RxNotifyAddr = Transport->GetNotifyAddr(0);
 
     /* Setup TX virtqueue (queue 1) */
-    Transport.SelectQueue(1);
-    u16 txQueueSize = Transport.GetQueueSize();
+    Transport->SelectQueue(1);
+    u16 txQueueSize = Transport->GetQueueSize();
     Trace(0, "VirtioNet %s: TX queue size %u", name, (ulong)txQueueSize);
 
     if (txQueueSize == 0)
     {
         Trace(0, "VirtioNet %s: TX queue size is 0", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
     if (!HwTxQueue.Setup(txQueueSize))
     {
         Trace(0, "VirtioNet %s: failed to setup TX queue", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
-    Transport.SetQueueDesc(HwTxQueue.GetDescPhys());
-    Transport.SetQueueDriver(HwTxQueue.GetAvailPhys());
-    Transport.SetQueueDevice(HwTxQueue.GetUsedPhys());
-    Transport.EnableQueue();
+    Transport->SetQueueDesc(HwTxQueue.GetDescPhys());
+    Transport->SetQueueDriver(HwTxQueue.GetAvailPhys());
+    Transport->SetQueueDevice(HwTxQueue.GetUsedPhys());
+    Transport->EnableQueue();
 
-    if (!Transport.IsLegacy())
-        TxNotifyAddr = Transport.GetNotifyAddr(1);
+    if (!Transport->IsLegacy())
+        TxNotifyAddr = Transport->GetNotifyAddr(1);
 
     /* Set DRIVER_OK */
-    u8 okStatus = VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                  VirtioPci::StatusDriverOk;
-    if (!Transport.IsLegacy())
-        okStatus |= VirtioPci::StatusFeaturesOk;
-    Transport.SetStatus(okStatus);
+    u8 okStatus = VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver |
+                  VirtioTransport::StatusDriverOk;
+    if (!Transport->IsLegacy())
+        okStatus |= VirtioTransport::StatusFeaturesOk;
+    Transport->SetStatus(okStatus);
 
     /* Read MAC address from device config */
     if (drvFeatures0 & FeatureMac)
     {
         u8 macBytes[6];
         for (ulong i = 0; i < 6; i++)
-            macBytes[i] = Transport.ReadDevCfg8(i);
+            macBytes[i] = Transport->ReadDevCfg8(i);
         Mac = Net::MacAddress(macBytes);
     }
 
@@ -210,7 +211,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     if (!TxHdrPage)
     {
         Trace(0, "VirtioNet %s: failed to alloc TX header page", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
     Stdlib::MemSet(TxHdrPage, 0, Const::PageSize);
@@ -233,7 +234,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
         Trace(0, "VirtioNet %s: failed to alloc RX DMA pages", name);
         Mm::UnmapFreePages(TxHdrPage);
         TxHdrPage = nullptr;
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
@@ -254,7 +255,7 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
     /* Pre-post RX buffers */
     PostAllRxBufs();
 
-    if (!Transport.UsingMsix())
+    if (!Transport->UsingMsix())
     {
         u8 irq = pciDev->InterruptLine;
         u8 vector = 0x30 + (u8)InstanceCount;
@@ -293,7 +294,7 @@ void VirtioNet::PostAllRxBufs()
         PostRxBuf(i);
 
     /* Notify device about available RX buffers */
-    Transport.NotifyQueue(0);
+    Transport->NotifyQueue(0);
 }
 
 /* --- TX slot management (caller holds TxQueueLock) --- */
@@ -400,7 +401,7 @@ void VirtioNet::FlushTx()
     }
 
     if (submitted)
-        Transport.NotifyQueue(1);
+        Transport->NotifyQueue(1);
 
     if (!TxQueue.IsEmpty())
         SoftIrq::GetInstance().Raise(SoftIrq::TypeNetTx);
@@ -596,7 +597,7 @@ done:
 
     if (RxNeedNotify)
     {
-        Transport.NotifyQueue(0);
+        Transport->NotifyQueue(0);
         RxNeedNotify = false;
     }
 }
@@ -747,9 +748,9 @@ void VirtioNet::Interrupt(Context* ctx)
        status register is not the notification mechanism (virtio 1.x 4.1.4.5)
        and a spec-conforming device leaves it 0, so gating on it there would
        drop every RX/TX notification. */
-    if (!Transport.UsingMsix())
+    if (!Transport->UsingMsix())
     {
-        u8 isr = Transport.ReadISR();
+        u8 isr = Transport->ReadISR();
         if (isr == 0)
             return;
     }

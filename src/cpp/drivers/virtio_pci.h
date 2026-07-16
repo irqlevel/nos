@@ -3,11 +3,12 @@
 #include <include/types.h>
 #include <drivers/pci.h>
 #include <drivers/msix.h>
+#include <drivers/virtio_transport.h>
 
 namespace Kernel
 {
 
-class VirtioPci
+class VirtioPci : public VirtioTransport
 {
 public:
     VirtioPci();
@@ -15,45 +16,45 @@ public:
 
     bool Probe(Pci::DeviceInfo* dev);
 
-    void Reset();
-    u8   GetStatus();
-    void SetStatus(u8 s);
+    void Reset() override;
+    u8   GetStatus() override;
+    void SetStatus(u8 s) override;
 
-    u32  ReadDeviceFeature(ulong index);
-    void WriteDriverFeature(ulong index, u32 val);
+    u32  ReadDeviceFeature(ulong index) override;
+    void WriteDriverFeature(ulong index, u32 val) override;
 
-    u16  GetNumQueues();
-    u8   ReadISR();
-    u8   ReadConfigGeneration();
+    u16  GetNumQueues() override;
+    u8   ReadISR() override;
+    u8   ReadConfigGeneration() override;
 
     /* Per-queue operations (call SelectQueue first) */
-    void SelectQueue(u16 idx);
-    u16  GetQueueSize();
-    u16  GetQueueNotifyOff();
-    void SetQueueDesc(u64 physAddr);
-    void SetQueueDriver(u64 physAddr);
-    void SetQueueDevice(u64 physAddr);
-    void EnableQueue();
+    void SelectQueue(u16 idx) override;
+    u16  GetQueueSize() override;
+    u16  GetQueueNotifyOff() override;
+    void SetQueueDesc(u64 physAddr) override;
+    void SetQueueDriver(u64 physAddr) override;
+    void SetQueueDevice(u64 physAddr) override;
+    void EnableQueue() override;
 
     /* Returns the MMIO address to write for notifying a queue.
        For legacy mode returns nullptr; use NotifyQueue() instead. */
-    volatile void* GetNotifyAddr(u16 queueIdx);
+    volatile void* GetNotifyAddr(u16 queueIdx) override;
 
     /* Notify a queue (works for both legacy and modern) */
-    void NotifyQueue(u16 queueIdx);
+    void NotifyQueue(u16 queueIdx) override;
 
     /* Device-specific config access */
-    u8   ReadDevCfg8(ulong offset);
-    u32  ReadDevCfg32(ulong offset);
-    u64  ReadDevCfg64(ulong offset);
+    u8   ReadDevCfg8(ulong offset) override;
+    u32  ReadDevCfg32(ulong offset) override;
+    u64  ReadDevCfg64(ulong offset) override;
 
     /* True if legacy (transitional) transport is in use */
-    bool IsLegacy() const { return Legacy; }
+    bool IsLegacy() const override { return Legacy; }
 
     /* MSI-X (modern only); Setup runs during Probe. */
-    bool IsMsixEnabled() const { return Msix.IsReady(); }
-    u8 EnableMsixVector(u16 index, InterruptHandler& handler);
-    bool UsingMsix() const { return MsixActive; }
+    bool IsMsixEnabled() const override { return Msix.IsReady(); }
+    u8 EnableMsixVector(u16 index, InterruptHandler& handler) override;
+    bool UsingMsix() const override { return MsixActive; }
 
     /* Virtio PCI capability cfg_type values */
     static const u8 CapCommonCfg  = 1;
@@ -64,13 +65,6 @@ public:
 
     /* PCI capability ID for vendor-specific */
     static const u8 PciCapIdVndr  = 0x09;
-
-    /* Device status bits */
-    static const u8 StatusAcknowledge = 1;
-    static const u8 StatusDriver      = 2;
-    static const u8 StatusDriverOk    = 4;
-    static const u8 StatusFeaturesOk  = 8;
-    static const u8 StatusFailed      = 128;
 
 private:
     VirtioPci(const VirtioPci& other) = delete;

@@ -23,7 +23,8 @@ VirtioBlk VirtioBlk::Instances[MaxInstances];
 ulong VirtioBlk::InstanceCount = 0;
 
 VirtioBlk::VirtioBlk()
-    : QueueNotifyAddr(nullptr)
+    : Transport(&PciTransport)
+    , QueueNotifyAddr(nullptr)
     , CapacitySectors(0)
     , IntVector(-1)
     , Initialized(false)
@@ -52,100 +53,100 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     pci.EnableBusMastering(pciDev->Bus, pciDev->Slot, pciDev->Func);
 
     /* Probe modern virtio-pci capabilities and map MMIO BARs */
-    if (!Transport.Probe(pciDev))
+    if (!PciTransport.Probe(pciDev))
     {
-        Trace(0, "VirtioBlk %s: Transport.Probe failed", name);
+        Trace(0, "VirtioBlk %s: Transport->Probe failed", name);
         return false;
     }
 
     Trace(0, "VirtioBlk %s: %s virtio-pci probed, irq %u",
-        name, Transport.IsLegacy() ? "legacy" : "modern",
+        name, Transport->IsLegacy() ? "legacy" : "modern",
         (ulong)pciDev->InterruptLine);
 
     /* Reset device */
-    Transport.Reset();
+    Transport->Reset();
 
     /* Acknowledge */
-    Transport.SetStatus(VirtioPci::StatusAcknowledge);
+    Transport->SetStatus(VirtioTransport::StatusAcknowledge);
 
     /* Driver */
-    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver);
+    Transport->SetStatus(VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver);
 
     /* Read and negotiate features (64-bit via select) */
-    u32 devFeatures0 = Transport.ReadDeviceFeature(0);
+    u32 devFeatures0 = Transport->ReadDeviceFeature(0);
     Trace(0, "VirtioBlk %s: device features[0] 0x%p", name, (ulong)devFeatures0);
 
     /* Negotiate FLUSH if device offers it. */
     u32 drvFeatures0 = devFeatures0 & FeatureFlush;
-    Transport.WriteDriverFeature(0, drvFeatures0);
+    Transport->WriteDriverFeature(0, drvFeatures0);
     HasFlush = (drvFeatures0 & FeatureFlush) != 0;
 
-    if (!Transport.IsLegacy())
+    if (!Transport->IsLegacy())
     {
         /* features[1]: set VIRTIO_F_VERSION_1 (bit 32 = index 1 bit 0) */
-        u32 devFeatures1 = Transport.ReadDeviceFeature(1);
+        u32 devFeatures1 = Transport->ReadDeviceFeature(1);
         u32 drvFeatures1 = devFeatures1 & (1 << 0); /* VIRTIO_F_VERSION_1 */
-        Transport.WriteDriverFeature(1, drvFeatures1);
+        Transport->WriteDriverFeature(1, drvFeatures1);
     }
 
-    if (!Transport.IsLegacy())
+    if (!Transport->IsLegacy())
     {
         /* Set FEATURES_OK (modern only; legacy doesn't have this bit) */
-        Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                            VirtioPci::StatusFeaturesOk);
+        Transport->SetStatus(VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver |
+                            VirtioTransport::StatusFeaturesOk);
 
         /* Verify FEATURES_OK is still set */
-        if (!(Transport.GetStatus() & VirtioPci::StatusFeaturesOk))
+        if (!(Transport->GetStatus() & VirtioTransport::StatusFeaturesOk))
         {
             Trace(0, "VirtioBlk %s: FEATURES_OK not set by device", name);
-            Transport.SetStatus(VirtioPci::StatusFailed);
+            Transport->SetStatus(VirtioTransport::StatusFailed);
             return false;
         }
     }
 
     /* Setup virtqueue 0 (request queue) */
-    Transport.SelectQueue(0);
-    u16 queueSize = Transport.GetQueueSize();
+    Transport->SelectQueue(0);
+    u16 queueSize = Transport->GetQueueSize();
     Trace(0, "VirtioBlk %s: queue size %u", name, (ulong)queueSize);
 
     if (queueSize == 0)
     {
         Trace(0, "VirtioBlk %s: queue size is 0", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
     if (!Queue.Setup(queueSize))
     {
         Trace(0, "VirtioBlk %s: failed to setup queue", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
-    if (!Transport.IsLegacy() && Transport.IsMsixEnabled())
+    if (!Transport->IsLegacy() && Transport->IsMsixEnabled())
     {
-        u8 vec = Transport.EnableMsixVector(0, *this);
+        u8 vec = Transport->EnableMsixVector(0, *this);
         if (vec == 0)
             Trace(0, "VirtioBlk %s: MSI-X unavailable, using INTx", name);
     }
 
-    Transport.SetQueueDesc(Queue.GetDescPhys());
-    Transport.SetQueueDriver(Queue.GetAvailPhys());
-    Transport.SetQueueDevice(Queue.GetUsedPhys());
-    Transport.EnableQueue();
+    Transport->SetQueueDesc(Queue.GetDescPhys());
+    Transport->SetQueueDriver(Queue.GetAvailPhys());
+    Transport->SetQueueDevice(Queue.GetUsedPhys());
+    Transport->EnableQueue();
 
-    if (!Transport.IsLegacy())
-        QueueNotifyAddr = Transport.GetNotifyAddr(0);
+    if (!Transport->IsLegacy())
+        QueueNotifyAddr = Transport->GetNotifyAddr(0);
 
     /* Set DRIVER_OK */
-    u8 okStatus = VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                  VirtioPci::StatusDriverOk;
-    if (!Transport.IsLegacy())
-        okStatus |= VirtioPci::StatusFeaturesOk;
-    Transport.SetStatus(okStatus);
+    u8 okStatus = VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver |
+                  VirtioTransport::StatusDriverOk;
+    if (!Transport->IsLegacy())
+        okStatus |= VirtioTransport::StatusFeaturesOk;
+    Transport->SetStatus(okStatus);
 
     /* Read device config: capacity (u64 at offset 0) */
-    CapacitySectors = Transport.ReadDevCfg64(0);
+    CapacitySectors = Transport->ReadDevCfg64(0);
 
     Trace(0, "VirtioBlk %s: capacity %u sectors (%u MB)",
         name, CapacitySectors, (CapacitySectors * 512) / (1024 * 1024));
@@ -159,7 +160,7 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
     if (!dmaPtr)
     {
         Trace(0, "VirtioBlk %s: failed to alloc DMA page", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
@@ -183,7 +184,7 @@ bool VirtioBlk::Init(Pci::DeviceInfo* pciDev, const char* name)
 
     Initialized = true;
 
-    if (!Transport.UsingMsix())
+    if (!Transport->UsingMsix())
     {
         /* Legacy INTx: vector 0x25 + instance offset. */
         u8 irq = pciDev->InterruptLine;
@@ -399,7 +400,7 @@ void VirtioBlk::DrainQueue()
     }
 
     if (kicked)
-        Transport.NotifyQueue(0);
+        Transport->NotifyQueue(0);
 }
 
 void VirtioBlk::CompleteIO()
@@ -562,9 +563,9 @@ void VirtioBlk::Interrupt(Context* ctx)
        Under MSI-X the ISR status register is not the notification mechanism
        (virtio 1.x 4.1.4.5) and a spec-conforming device leaves it 0, so
        gating on it there would drop every completion. */
-    if (!Transport.UsingMsix())
+    if (!Transport->UsingMsix())
     {
-        u8 isr = Transport.ReadISR();
+        u8 isr = Transport->ReadISR();
         if (isr == 0)
             return;
     }

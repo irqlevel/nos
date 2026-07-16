@@ -32,7 +32,8 @@ private:
     VirtioRng& operator=(const VirtioRng& other) = delete;
     VirtioRng& operator=(VirtioRng&& other) = delete;
 
-    VirtioPci Transport;
+    VirtioPci PciTransport;
+    VirtioTransport* Transport;
     VirtQueue Queue;
     SpinLock Lock;
     u8* DmaBuf;
