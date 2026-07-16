@@ -5,7 +5,7 @@
 #include "watchdog.h"
 #include "timer.h"
 
-#include <boot/boot64.h>
+#include <arch/x86_64/boot64.h>
 
 #include <drivers/lapic.h>
 #include <kernel/time.h>

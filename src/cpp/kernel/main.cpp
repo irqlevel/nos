@@ -21,7 +21,7 @@
 #include "time.h"
 #include "tsc.h"
 
-#include <boot/grub.h>
+#include <arch/x86_64/grub.h>
 
 #include <lib/error.h>
 #include <lib/stdlib.h>

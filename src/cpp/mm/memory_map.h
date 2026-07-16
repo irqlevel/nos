@@ -1,7 +1,7 @@
 #pragma once
 
 #include <include/types.h>
-#include <boot/grub.h>
+#include <arch/x86_64/grub.h>
 
 namespace Kernel
 {

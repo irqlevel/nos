@@ -9,7 +9,7 @@ ARCH_CXXFLAGS_x86_64 = -mno-sse -mcmodel=kernel -mcmodel=large -mno-red-zone
 LD_x86_64 = ld
 NM_x86_64 = nm
 RUST_TARGET_x86_64 = x86_64-unknown-none
-LDSCRIPT_x86_64 = build/linker64.ld
+LDSCRIPT_x86_64 = build/linker-x86_64.ld
 KERNEL_x86_64 = kernel64.elf
 
 TARGET_aarch64 = aarch64-none-elf
@@ -37,7 +37,7 @@ AR = ar
 MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 
 CXX_SRC =   \
-    src/cpp/boot/grub.cpp    \
+    src/cpp/arch/x86_64/grub.cpp    \
     src/cpp/drivers/serial.cpp  \
     src/cpp/drivers/pic.cpp \
     src/cpp/drivers/pit.cpp \
@@ -126,9 +126,9 @@ CXX_SRC =   \
     src/cpp/mm/block_allocator.cpp \
 
 ASM_SRC =    \
-    src/cpp/boot/boot64.asm \
-    src/cpp/kernel/asm.asm \
-    src/cpp/lib/stdlib_asm.asm
+    src/cpp/arch/x86_64/boot64.asm \
+    src/cpp/arch/x86_64/asm.asm \
+    src/cpp/arch/x86_64/stdlib_asm.asm
 
 OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC))
 DEPS = $(patsubst src/cpp/%.cpp,$(OUT)/%.d,$(CXX_SRC))
