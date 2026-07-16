@@ -4,6 +4,7 @@
 #include <kernel/entropy.h>
 #include <kernel/spin_lock.h>
 #include <hal/cpu.h>
+#include <drivers/virtio_mmio.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_pci.h>
@@ -18,6 +19,7 @@ public:
     virtual ~VirtioRng();
 
     bool Init(Pci::DeviceInfo* pciDev, const char* name);
+    bool InitMmio(ulong base, ulong size, u32 intId, const char* name);
 
     /* EntropySource interface */
     virtual const char* GetName() override;
@@ -25,6 +27,7 @@ public:
 
     /* Discover and initialize all virtio-rng devices. */
     static void InitAll();
+    static void InitAllMmio(const VirtioMmioSlot* slots, ulong count);
 
 private:
     VirtioRng(const VirtioRng& other) = delete;
@@ -33,7 +36,10 @@ private:
     VirtioRng& operator=(VirtioRng&& other) = delete;
 
     VirtioPci PciTransport;
+    VirtioMmio MmioTransport;
     VirtioTransport* Transport;
+
+    bool InitCommon(const char* name);
     VirtQueue Queue;
     SpinLock Lock;
     u8* DmaBuf;

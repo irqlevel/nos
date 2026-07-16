@@ -18,7 +18,15 @@
 #include <kernel/cpu.h>
 #include <kernel/preempt.h>
 #include <kernel/cmd.h>
+#include <kernel/softirq.h>
 #include <hal/power.h>
+
+#include <drivers/virtio_mmio.h>
+#include <drivers/virtio_blk.h>
+#include <drivers/virtio_net.h>
+#include <drivers/virtio_rng.h>
+
+#include <net/tcp.h>
 
 /* arm64 boot orchestrator, the Main2 twin (kernel/main.cpp). Milestone M2:
    full memory management + boot self-tests on one CPU; the interrupt/
@@ -92,6 +100,31 @@ static void BpStartupArm(void* ctx)
 
     InterruptEnable();
 
+    /* Discover virtio-mmio devices from the DTB slots (all inside the
+       premapped device GiB). Must run on the BSP before the APs start
+       (MapMmioRegion boot-ordering constraint). */
+    {
+        static VirtioMmioSlot Slots[Board::MaxVirtioMmio];
+        ulong count = 0;
+        for (ulong i = 0; i < board.VirtioMmioCount; i++)
+        {
+            ulong va = Mm::MemoryMap::KernelSpaceBase + board.VirtioMmio[i].Base;
+            u32 devId = VirtioMmio::ReadDeviceId(va);
+            if (devId == 0)
+                continue;
+            Slots[count].Base = va;
+            Slots[count].Size = board.VirtioMmio[i].Size;
+            Slots[count].IntId = board.VirtioMmio[i].IntId;
+            Slots[count].DeviceId = devId;
+            count++;
+        }
+        Trace(0, "virtio-mmio: %u devices", count);
+
+        VirtioBlk::InitAllMmio(Slots, count);
+        VirtioNet::InitAllMmio(Slots, count);
+        VirtioRng::InitAllMmio(Slots, count);
+    }
+
     auto& cpus = CpuTable::GetInstance();
     if (!cpus.StartAll())
     {
@@ -117,6 +150,14 @@ static void BpStartupArm(void* ctx)
     }
 
     Trace(0, "After test");
+
+    if (!SoftIrq::GetInstance().Init())
+    {
+        Panic("Can't init softirq");
+        return;
+    }
+
+    Tcp::GetInstance().Init();
 
     auto& cmd = Cmd::GetInstance();
     if (!Pl011::GetInstance().RegisterObserver(cmd))
