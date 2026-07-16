@@ -15,14 +15,14 @@ void* Lapic::GetRegBase(ulong index)
 
 u32 Lapic::ReadReg(ulong index)
 {
-    Barrier();
+    Hal::DmaRmb();
     return Mm::MmIo::Read32(GetRegBase(index));
 }
 
 void Lapic::WriteReg(ulong index, u32 value)
 {
     Mm::MmIo::Write32(GetRegBase(index), value);
-    Barrier();
+    Hal::DmaWmb();
 }
 
 void Lapic::Enable()

@@ -309,7 +309,7 @@ void VirtioBlk::DrainQueue()
 
         *slot.StatusBuf = 0xFF;
 
-        Barrier();
+        Hal::DmaWmb();
 
         int head = -1;
 

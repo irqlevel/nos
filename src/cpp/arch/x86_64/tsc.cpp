@@ -231,7 +231,7 @@ Stdlib::Time Tsc::KvmClockTime()
 
     do {
         version = pv->Version;
-        Barrier();
+        Hal::SmpRmb();
 
         /* Same-vcpu rdtsc cannot precede the entry's timestamp; if the host
            republishes the entry mid-read the version loop retries, so only
@@ -247,7 +247,7 @@ Stdlib::Time Tsc::KvmClockTime()
              (u64)(((__uint128_t)delta * pv->TscToSystemMul) >> 32);
 
         flags = pv->Flags;
-        Barrier();
+        Hal::SmpRmb();
     } while ((pv->Version & 1) || pv->Version != version);
 
     PreemptIrqRestore(irq);

@@ -33,7 +33,3 @@ static inline __attribute__((always_inline)) void DmaRmb() { CompilerBarrier(); 
 #endif
 
 }
-
-// Transitional alias for unclassified call sites; removed once every
-// Barrier() use is converted to the semantic variant above.
-#define Barrier() Hal::CompilerBarrier()
