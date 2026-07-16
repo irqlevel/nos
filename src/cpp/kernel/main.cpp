@@ -7,6 +7,7 @@
 #include "test.h"
 #include <arch/x86_64/exception.h>
 #include <arch/x86_64/asm.h>
+#include <hal/power.h>
 #include "cpu.h"
 #include "cmd.h"
 #include "interrupt.h"
@@ -293,55 +294,12 @@ static void PrepareHalt(HaltAction action)
     FinalizeOnStaticStack(task, action);
 }
 
-static void __attribute__((noreturn)) DoShutdown()
-{
-    Trace(0, "ACPI shutdown");
-
-    /* Try PM1a_CNT from FADT with SLP_TYP=5 (S5) | SLP_EN */
-    ulong pm1a = Acpi::GetInstance().GetPm1aCntPort();
-    if (pm1a != 0)
-    {
-        Outw((u16)pm1a, (5 << 10) | (1 << 13));
-        /* Brief busy-wait for the hardware to respond */
-        for (volatile int i = 0; i < 1000000; i = i + 1) {}
-    }
-
-    /* QEMU/KVM fallback: PM1a_CNT port 0x604, SLP_TYP=0 for S5 */
-    Outw(0x604, (1 << 13));
-
-    /* QEMU debug exit device fallback */
-    Outb(0xf4, 0x0);
-
-    while (1) Hlt();
-}
-
-static void __attribute__((noreturn)) DoReboot()
-{
-    Trace(0, "Reboot");
-
-    /* Try ACPI FADT RESET_REG first */
-    auto& acpi = Acpi::GetInstance();
-    if (acpi.HasResetReg())
-    {
-        Outb((u16)acpi.GetResetRegPort(), acpi.GetResetValue());
-        for (volatile int i = 0; i < 1000000; i = i + 1) {}
-    }
-
-    /* Keyboard controller reset (pulse CPU reset line) */
-    Outb(0x64, 0xFE);
-
-    /* Fallback: PCI reset register */
-    Outb(0xCF9, 0x06);
-
-    while (1) Hlt();
-}
-
 void Shutdown()
 {
     auto& con = Console::GetInstance();
     con.Printf("Shutting down!\n");
 
-    PrepareHalt(DoShutdown);
+    PrepareHalt(Hal::PowerOff);
 }
 
 void Reboot()
@@ -349,7 +307,7 @@ void Reboot()
     auto& con = Console::GetInstance();
     con.Printf("Rebooting!\n");
 
-    PrepareHalt(DoReboot);
+    PrepareHalt(Hal::Reset);
 }
 
 void SomeTaskRoutine(void *ctx)

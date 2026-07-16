@@ -10,8 +10,7 @@
 #include "task.h"
 
 #include <drivers/acpi.h>
-#include <drivers/serial.h>
-#include <drivers/vga.h>
+#include <hal/console.h>
 
 namespace Kernel
 {
@@ -31,9 +30,7 @@ bool Panicker::IsActive()
 
 void Panicker::PrintOutput(const char* str)
 {
-    Serial::GetInstance().PanicPrintString(str);
-    if (VgaTerm::IsReady())
-        VgaTerm::GetInstance().PanicPrintString(str);
+    Hal::ConsolePanicWrite(str);
 }
 
 void Panicker::DumpContext()
