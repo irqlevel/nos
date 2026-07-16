@@ -104,6 +104,9 @@ impl Queue {
 
     /* Ring the SQ tail doorbell to notify the controller. */
     pub fn ring_sq_doorbell(&self, regs: &MmioRegion) {
+        /* The SQE stores must be visible to the device before the doorbell
+           write; Release orders them on weakly-ordered arches (free on x86). */
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         let off = sq_doorbell_offset(self.qid, self.db_stride);
         regs.write32(off, self.sq_tail as u32);
     }

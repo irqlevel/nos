@@ -22,6 +22,7 @@ pub mod net;
 pub mod bitmap;
 pub mod ring_buffer;
 pub mod hpet;
+#[cfg(target_arch = "x86_64")]
 pub mod tco_wdt;
 
 #[macro_export]

@@ -1,11 +1,15 @@
+#[cfg(target_arch = "x86_64")]
 use core::marker::PhantomData;
+#[cfg(target_arch = "x86_64")]
 use ffi::io;
 
+#[cfg(target_arch = "x86_64")]
 pub trait PortWidth: Copy {
     fn read_port(port: u16) -> Self;
     fn write_port(port: u16, val: Self);
 }
 
+#[cfg(target_arch = "x86_64")]
 impl PortWidth for u8 {
     fn read_port(port: u16) -> Self {
         unsafe { io::Inb(port) }
@@ -16,6 +20,7 @@ impl PortWidth for u8 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl PortWidth for u16 {
     fn read_port(port: u16) -> Self {
         unsafe { io::Inw(port) }
@@ -26,6 +31,7 @@ impl PortWidth for u16 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl PortWidth for u32 {
     fn read_port(port: u16) -> Self {
         unsafe { io::In(port) }
@@ -36,11 +42,13 @@ impl PortWidth for u32 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub struct Port<T: PortWidth> {
     port: u16,
     _p: PhantomData<T>,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl<T: PortWidth> Port<T> {
     pub const fn new(port: u16) -> Self {
         Self {
@@ -58,10 +66,12 @@ impl<T: PortWidth> Port<T> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn read_msr(msr: u32) -> u64 {
     io::ReadMsr(msr)
 }
 
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn write_msr(msr: u32, value: u64) {
     io::WriteMsr(msr, value);
 }

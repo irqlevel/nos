@@ -120,9 +120,10 @@ impl TxRing {
             write_volatile(addr_of_mut!((*d).addr_lo), phys as u32);
             write_volatile(addr_of_mut!((*d).addr_hi), (phys >> 32) as u32);
             write_volatile(addr_of_mut!((*d).opts2), 0);
-            /* Write opts1 (with TX_OWN) last; compiler_fence prevents reorder.
+            /* Write opts1 (with TX_OWN) last; the Release fence orders the
+             * descriptor stores on weakly-ordered arches too (free on x86).
              * This ensures hardware sees a valid address before it sees OWN=1. */
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             write_volatile(addr_of_mut!((*d).opts1),
                 TX_OWN | TX_FS | TX_LS | eor | (len & TX_LEN_MASK));
         }
@@ -195,7 +196,7 @@ impl RxRing {
             write_volatile(addr_of_mut!((*d).addr_lo), phys as u32);
             write_volatile(addr_of_mut!((*d).addr_hi), (phys >> 32) as u32);
             write_volatile(addr_of_mut!((*d).opts2), 0);
-            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
             /* Program buffer capacity into len field; hardware replaces it with
              * the actual received frame length when it clears RX_OWN. */
             write_volatile(addr_of_mut!((*d).opts1),
