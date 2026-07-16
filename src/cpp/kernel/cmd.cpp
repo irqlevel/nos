@@ -1,6 +1,7 @@
 #include "cmd.h"
 #include "trace.h"
-#include <arch/x86_64/asm.h>
+#include <hal/cpu.h>
+#include <hal/console.h>
 #include "dmesg.h"
 #include "cpu.h"
 #include "interrupt.h"
@@ -74,15 +75,7 @@ static void CmdReboot(const char* args, Stdlib::Printer& con)
 static void CmdCpu(const char* args, Stdlib::Printer& con)
 {
     (void)args;
-    con.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
-        (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
-        (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
-
-    con.Printf("rflags 0x%p rsp 0x%p rip 0x%p\n",
-        GetRflags(), GetRsp(), GetRip());
-
-    con.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
-        GetCr0(), GetCr2(), GetCr3(), GetCr4());
+    Hal::PrintCpuState(con);
 }
 
 static void CmdDmesg(const char* args, Stdlib::Printer& con)
@@ -627,7 +620,7 @@ static void CmdPing(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    u16 pingId = (u16)(ReadTsc() & 0xFFFF);
+    u16 pingId = (u16)(Hal::ReadCycleCounter() & 0xFFFF);
 
     con.Printf("PING %s\n", hostBuf);
     ulong received = 0;
@@ -1119,7 +1112,7 @@ struct BtCtx
 static void CmdBtIPIFunc(void* ctx, Context* ipiCtx)
 {
     auto* bt = static_cast<BtCtx*>(ctx);
-    bt->Count = StackTrace::CaptureFrom(ipiCtx->Rbp, bt->Frames, Stdlib::ArraySize(bt->Frames));
+    bt->Count = StackTrace::CaptureFrom(ipiCtx->GetFramePointer(), bt->Frames, Stdlib::ArraySize(bt->Frames));
 }
 
 static void CmdBt(const char* args, Stdlib::Printer& con)
@@ -1213,8 +1206,8 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    Context* ctx = reinterpret_cast<Context*>(savedRsp);
-    count = StackTrace::CaptureFrom(ctx->Rbp, frames, Stdlib::ArraySize(frames));
+    count = StackTrace::CaptureFrom(Hal::TaskSavedFramePointer(savedRsp),
+        frames, Stdlib::ArraySize(frames));
 
     con.Printf("task %u (%s) state %u:\n", task->Pid, task->GetName(), (ulong)state);
     DumpStackTrace(frames, count, con);
@@ -1251,7 +1244,7 @@ static void CmdPanic(const char* args, Stdlib::Printer& con)
     else if (Stdlib::StrCmp(type, "ud") == 0)
     {
         con.Printf("triggering invalid opcode...\n");
-        asm volatile("ud2");
+        Hal::UndefInstr();
     }
     else
     {

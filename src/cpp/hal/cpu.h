@@ -57,6 +57,27 @@ namespace Hal
    brand-new task; returns the initial stack pointer. Defined per arch
    (x86: arch/x86_64/hal_x86.cpp, arm64: arch/arm64/cpu_arm64.cpp). */
 ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg);
+
+/* Frame pointer recorded in a suspended task's SwitchContext frame
+   (task->Rsp on x86 points at a Context; arm64 at the asm.S frame). */
+ulong TaskSavedFramePointer(ulong savedSp);
+
+/* Switch to a fresh stack and call fn(ctx) there, never returning.
+   Switching SP mid-function is not expressible safely in C++ (the
+   compiler may address temporaries SP-relative, arm64 does at -O0), so
+   the switch+call is one indivisible per-arch primitive. Used for the
+   never-returning idle/boot task bodies. */
+void __attribute__((noreturn)) RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx);
+
+/* Execute a guaranteed-undefined instruction (crash/panic testing) */
+static inline __attribute__((always_inline)) void UndefInstr()
+{
+#if defined(__x86_64__)
+    asm volatile("ud2");
+#elif defined(__aarch64__)
+    asm volatile("udf #0");
+#endif
+}
 }
 
 // Provides namespace Hal { IsInterruptEnabled, IrqSave, IrqRestore,

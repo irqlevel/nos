@@ -7,6 +7,7 @@
 #include "task.h"
 #include "sched.h"
 #include <hal/cpu.h>
+#include <hal/irqchip.h>
 #include <hal/context.h>
 
 namespace Kernel
@@ -111,7 +112,7 @@ public:
 
     Cpu& GetCurrentCpu();
 
-    static const u8 IPIVector = 0xFE;
+    static const u8 IPIVector = Hal::IpiVector;
 
     void SendIPI(ulong index);
 

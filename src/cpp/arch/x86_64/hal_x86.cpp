@@ -7,6 +7,7 @@
 
 #include <arch/x86_64/context.h>
 #include <lib/stdlib.h>
+#include <lib/printer.h>
 
 #include <kernel/trace.h>
 #include <kernel/parameters.h>
@@ -33,6 +34,78 @@ ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
     regs->Rdi = arg;         /* 1st argument for the entry function */
     regs->Rflags = (1 << 9); /* IF */
     return (ulong)regs;
+}
+
+void PrintCpuState(Stdlib::Printer& con)
+{
+    con.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
+        (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
+        (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
+
+    con.Printf("rflags 0x%p rsp 0x%p rip 0x%p\n",
+        GetRflags(), GetRsp(), GetRip());
+
+    con.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
+        GetCr0(), GetCr2(), GetCr3(), GetCr4());
+}
+
+ulong TaskSavedFramePointer(ulong savedSp)
+{
+    return ((Kernel::Context*)savedSp)->Rbp;
+}
+
+void RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx)
+{
+    asm volatile(
+        "movq %1, %%rsp\n\t"
+        "callq *%0\n\t"
+        :: "a"(fn), "r"(stackTop), "D"(ctx)
+        : "memory");
+    Trace(0, "RunOnStack: fn returned");
+    while (1)
+        Hlt();
+}
+
+namespace
+{
+
+bool UseVga()
+{
+    return !Kernel::Parameters::GetInstance().IsConsoleSerial();
+}
+
+bool UseSerial()
+{
+    return !Kernel::Parameters::GetInstance().IsConsoleVga();
+}
+
+}
+
+void ConsoleOut(const char *s)
+{
+    if (UseVga())
+        Kernel::VgaTerm::GetInstance().PrintString(s);
+    if (UseSerial())
+        Kernel::Serial::GetInstance().PrintString(s);
+}
+
+void ConsoleOutBackspace()
+{
+    if (UseVga())
+        Kernel::VgaTerm::GetInstance().Backspace();
+    if (UseSerial())
+        Kernel::Serial::GetInstance().Backspace();
+}
+
+void ConsoleOutClear()
+{
+    if (UseVga())
+        Kernel::VgaTerm::GetInstance().Cls();
+    if (UseSerial())
+    {
+        /* ANSI escape: clear screen and move cursor home */
+        Kernel::Serial::GetInstance().PrintString("\033[2J\033[H");
+    }
 }
 
 void ConsoleWrite(const char *msg)

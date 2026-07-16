@@ -1,5 +1,9 @@
 #include <hal/console.h>
 #include <hal/power.h>
+#include <hal/cpu.h>
+#include <hal/irqchip.h>
+
+#include <lib/printer.h>
 
 #include "pl011.h"
 #include "board.h"
@@ -28,6 +32,41 @@ void PsciCall(u32 fn)
 
 namespace Hal
 {
+
+void PrintCpuState(Stdlib::Printer& con)
+{
+    ulong v;
+    asm volatile("mrs %0, CurrentEL" : "=r"(v));
+    con.Printf("el %u sp 0x%p", v >> 2, Hal::GetSp());
+    asm volatile("mrs %0, sctlr_el1" : "=r"(v));
+    con.Printf(" sctlr 0x%p", v);
+    asm volatile("mrs %0, tcr_el1" : "=r"(v));
+    con.Printf(" tcr 0x%p\n", v);
+    asm volatile("mrs %0, ttbr1_el1" : "=r"(v));
+    con.Printf("ttbr1 0x%p", v);
+    asm volatile("mrs %0, mair_el1" : "=r"(v));
+    con.Printf(" mair 0x%p", v);
+    asm volatile("mrs %0, daif" : "=r"(v));
+    con.Printf(" daif 0x%p", v);
+    asm volatile("mrs %0, vbar_el1" : "=r"(v));
+    con.Printf(" vbar 0x%p mpidr %u\n", v, Hal::GetCurrentCpuHwId());
+}
+
+void ConsoleOut(const char *s)
+{
+    Kernel::Pl011::PrintString(s);
+}
+
+void ConsoleOutBackspace()
+{
+    Kernel::Pl011::PrintString("\b \b");
+}
+
+void ConsoleOutClear()
+{
+    /* ANSI escape: clear screen and move cursor home */
+    Kernel::Pl011::PrintString("\033[2J\033[H");
+}
 
 void ConsoleWrite(const char *msg)
 {

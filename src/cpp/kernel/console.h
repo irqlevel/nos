@@ -2,9 +2,7 @@
 
 #include <lib/printer.h>
 #include <lib/stdlib.h>
-#include <drivers/vga.h>
-#include <drivers/serial.h>
-#include <kernel/parameters.h>
+#include <hal/console.h>
 
 namespace Kernel
 {
@@ -16,16 +14,6 @@ public:
     {
         static Console Instance;
         return Instance;
-    }
-
-    bool UseVga()
-    {
-        return !Parameters::GetInstance().IsConsoleSerial();
-    }
-
-    bool UseSerial()
-    {
-        return !Parameters::GetInstance().IsConsoleVga();
     }
 
     virtual void Printf(const char *fmt, ...) override
@@ -42,37 +30,22 @@ public:
         if (Stdlib::VsnPrintf(str, sizeof(str), fmt, args) < 0)
             return;
 
-        if (UseVga())
-            VgaTerm::GetInstance().PrintString(str);
-        if (UseSerial())
-            Serial::GetInstance().PrintString(str);
+        Hal::ConsoleOut(str);
     }
 
     virtual void PrintString(const char *s) override
     {
-        if (UseVga())
-            VgaTerm::GetInstance().PrintString(s);
-        if (UseSerial())
-            Serial::GetInstance().PrintString(s);
+        Hal::ConsoleOut(s);
     }
 
     virtual void Backspace() override
     {
-        if (UseVga())
-            VgaTerm::GetInstance().Backspace();
-        if (UseSerial())
-            Serial::GetInstance().Backspace();
+        Hal::ConsoleOutBackspace();
     }
 
     void Cls()
     {
-        if (UseVga())
-            VgaTerm::GetInstance().Cls();
-        if (UseSerial())
-        {
-            /* ANSI escape: clear screen and move cursor home */
-            Serial::GetInstance().PrintString("\033[2J\033[H");
-        }
+        Hal::ConsoleOutClear();
     }
 
 private:

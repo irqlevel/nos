@@ -176,22 +176,14 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
     if (!PrepareStart(func, ctx))
         return false;
 
-    Hal::SetSp((ulong)&StackPtr->StackTop[0]);
-
     StartTime = GetBootTime();
     RunStartTime = GetBootTime();
     State.Set(StateRunning);
 
     taskQueue.Insert(this);
 
-    Function(Ctx);
-
-    ExitTime = GetBootTime();
-
-    taskQueue.Remove(this);
-    TaskTable::GetInstance().Remove(this);
-
-    return true;
+    /* Never returns: Run is only used for the idle/boot task bodies */
+    Hal::RunOnStack((ulong)&StackPtr->StackTop[0], Function, Ctx);
 }
 
 Task* Task::GetCurrentTask()
