@@ -1,6 +1,6 @@
 #include "hpet.h"
 #include "acpi.h"
-#include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 
 #include <kernel/trace.h>
 #include <kernel/cpu.h>
@@ -181,7 +181,7 @@ void Hpet::Interrupt(Context* ctx)
     }
 
     CpuTable::GetInstance().SendIPIAll();
-    Lapic::EOI(IntVector);
+    Hal::IrqEoi(IntVector);
 }
 
 extern "C" void HpetInterrupt(Context* ctx)

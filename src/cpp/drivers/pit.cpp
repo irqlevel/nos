@@ -1,6 +1,6 @@
 #include "pit.h"
 #include <arch/x86_64/asm.h>
-#include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 
 #include <kernel/cpu.h>
 #include <kernel/interrupt.h>
@@ -71,7 +71,7 @@ void Pit::Interrupt(Context* ctx)
     }
 
     CpuTable::GetInstance().SendIPIAll();
-    Lapic::EOI(IntVector);
+    Hal::IrqEoi(IntVector);
 }
 
 Stdlib::Time Pit::GetTime()

@@ -1,5 +1,5 @@
 #include "virtio_net.h"
-#include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 #include <arch/x86_64/ioapic.h>
 
 #include <kernel/trace.h>
@@ -815,7 +815,7 @@ extern "C" void VirtioNetInterrupt(Context* ctx)
         VirtioNet::Instances[i].Interrupt(ctx);
     }
 
-    Lapic::EOI();
+    Hal::IrqEoi();
 }
 
 }

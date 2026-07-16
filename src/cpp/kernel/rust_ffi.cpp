@@ -24,7 +24,7 @@
 #include <lib/stdlib.h>
 #include <drivers/pci.h>
 #include <drivers/msix.h>
-#include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 #include <block/block_device.h>
 #include <net/net_device.h>
 #include <net/net_frame.h>
@@ -752,7 +752,7 @@ void RustInterruptDispatch(Kernel::Context* ctx, int slot)
     (void)ctx;
     if (slot < 0 || (ulong)slot >= RustIrqSlotCount)
     {
-        Kernel::Lapic::EOI();
+        Hal::IrqEoi();
         return;
     }
     /* InFlight is raised inside the read-locked section so unregister (which
@@ -769,7 +769,7 @@ void RustInterruptDispatch(Kernel::Context* ctx, int slot)
         handler(uctx);
         RustIrqSlots[slot].InFlight.Dec();
     }
-    Kernel::Lapic::EOI();
+    Hal::IrqEoi();
 }
 
 unsigned long kernel_interrupt_register_level(
@@ -1037,7 +1037,7 @@ void RustMsixDispatch(Kernel::Context* ctx, int slot)
     (void)ctx;
     if (slot < 0 || (ulong)slot >= RustMsixSlotCount)
     {
-        Kernel::Lapic::EOI();
+        Hal::IrqEoi();
         return;
     }
     /* Same in-flight discipline as RustInterruptDispatch */
@@ -1052,7 +1052,7 @@ void RustMsixDispatch(Kernel::Context* ctx, int slot)
         handler(uctx);
         RustMsixSlots[slot].InFlight.Dec();
     }
-    Kernel::Lapic::EOI();
+    Hal::IrqEoi();
 }
 
 unsigned long kernel_msix_register_handler(

@@ -18,7 +18,7 @@ public:
     virtual InterruptHandlerFn GetHandlerFn() = 0;
 
     /* Called by shared interrupt dispatch. Override to handle the interrupt.
-       Must NOT call Lapic::EOI() -- the shared dispatcher does that. */
+       Must NOT signal EOI -- the shared dispatcher does that. */
     virtual void OnInterrupt(Context* ctx) { (void)ctx; }
 };
 
