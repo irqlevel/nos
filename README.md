@@ -179,9 +179,11 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 
 ```
 src/cpp/
-  boot/       Multiboot2 entry, 32→64-bit transition, AP trampoline
-  kernel/     Core: scheduling, tasks, interrupts, SoftIrq, shell, timers, timekeeping (TSC, kvmclock), locks, panic, Rust FFI bridge, symbol table
-  drivers/    Hardware: serial, VGA, PIT, RTC, 8042, PCI, MSI-X, PIC, LAPIC, IOAPIC, ACPI, virtio-blk, virtio-net, virtio-scsi, virtio-rng
+  hal/        Portable HAL contracts: cpu, barriers, mmu/pte, irqchip, console, power, context, irq stubs
+  arch/
+    x86_64/   Multiboot2 entry + AP trampoline (NASM), CPU primitives (asm.asm), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding, GRUB info parsing, HAL backends
+  kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, Rust FFI bridge, symbol table
+  drivers/    Hardware: serial, VGA, PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio transport/blk/net/scsi/rng
   block/      Block I/O: device abstraction, async request queue, MBR partition discovery
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell
   fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
