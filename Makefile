@@ -1,13 +1,38 @@
-TARGET64 = x86_64-none-elf
+ARCH ?= x86_64
 VERSION ?= dev
+OUT = out/$(ARCH)
+
+# Per-arch toolchain and flags. x86_64 flags are verbatim the historical ones
+# (order preserved: -mcmodel=kernel then -mcmodel=large, large wins).
+TARGET_x86_64 = x86_64-none-elf
+ARCH_CXXFLAGS_x86_64 = -mno-sse -mcmodel=kernel -mcmodel=large -mno-red-zone
+LD_x86_64 = ld
+NM_x86_64 = nm
+RUST_TARGET_x86_64 = x86_64-unknown-none
+LDSCRIPT_x86_64 = build/linker64.ld
+KERNEL_x86_64 = kernel64.elf
+
+TARGET_aarch64 = aarch64-none-elf
+ARCH_CXXFLAGS_aarch64 = -mgeneral-regs-only -mno-outline-atomics
+LD_aarch64 = ld.lld
+NM_aarch64 = llvm-nm
+RUST_TARGET_aarch64 = aarch64-unknown-none-softfloat
+LDSCRIPT_aarch64 = build/linker-arm64.ld
+KERNEL_aarch64 = kernel-arm64.elf
+
+TARGET = $(TARGET_$(ARCH))
+LD = $(LD_$(ARCH))
+NM = $(NM_$(ARCH))
+RUST_TARGET = $(RUST_TARGET_$(ARCH))
+LDSCRIPT = $(LDSCRIPT_$(ARCH))
+KERNEL = $(KERNEL_$(ARCH))
+
 CPPFLAGS = -I$(CURDIR)/src/cpp -I$(CURDIR)/src/cpp/lib
-CXXFLAGS = --target=$(TARGET64) -std=c++20 -g3 -ggdb3 -mno-sse -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -fno-omit-frame-pointer -Wall -Wextra -Werror -mcmodel=kernel -mcmodel=large -mno-red-zone -DKERNEL_VERSION=\"$(VERSION)\"
+CXXFLAGS = --target=$(TARGET) -std=c++20 -g3 -ggdb3 -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -fno-omit-frame-pointer -Wall -Wextra -Werror $(ARCH_CXXFLAGS_$(ARCH)) -DKERNEL_VERSION=\"$(VERSION)\"
 LDFLAGS = -nostdlib -z max-page-size=4096
-LD = ld
 CC = clang
 CXX = clang -x c++
 ASM = nasm
-NM = nm
 AR = ar
 MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 
@@ -105,60 +130,65 @@ ASM_SRC =    \
     src/cpp/kernel/asm.asm \
     src/cpp/lib/stdlib_asm.asm
 
-OBJS = $(CXX_SRC:.cpp=.o) $(ASM_SRC:.asm=.o)
-DEPS = $(CXX_SRC:.cpp=.d)
+OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC))
+DEPS = $(patsubst src/cpp/%.cpp,$(OUT)/%.d,$(CXX_SRC))
 
-RUST_TARGET = x86_64-unknown-none
 RUST_LIB = src/rust/target/$(RUST_TARGET)/release/libkernel.a
 
-.PHONY: all check nocheck clean %.o rust smoke
+.PHONY: all check nocheck clean rust smoke
 
 -include $(DEPS)
 
+ifeq ($(ARCH),x86_64)
 all: check nos.iso
-
 nocheck: nos.iso
+else
+all: check $(KERNEL)
+nocheck: $(KERNEL)
+endif
 
 check: $(CXX_SRC)
 	cppcheck --error-exitcode=22 --inline-suppr -q src/cpp || exit 1
 
-nos.iso: build/grub.cfg kernel64.elf
+nos.iso: build/grub.cfg $(KERNEL)
 	rm -rf iso
 	rm -rf bin
 	mkdir -p iso/boot/grub
 	mkdir -p bin
-	cp kernel64.elf iso/boot/kernel64.elf
-	cp kernel64.elf bin/kernel64.elf
+	cp $(KERNEL) iso/boot/kernel64.elf
+	cp $(KERNEL) bin/kernel64.elf
 	cp build/grub.cfg iso/boot/grub/grub.cfg
 	$(MKRESCUE) -o nos.iso iso
 	rm -rf iso
 
-%.o: %.asm
+$(OUT)/%.o: src/cpp/%.asm
+	@mkdir -p $(dir $@)
 	$(ASM) -felf64 $< -o $@
-%.o: %.cpp
+$(OUT)/%.o: src/cpp/%.cpp
+	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -c $< -o $@
 
 rust $(RUST_LIB):
-	cd src/rust && cargo build --release
+	cd src/rust && cargo build --release --target $(RUST_TARGET)
 
 smoke:
 	./scripts/smoke-test.sh
 
-kernel64_pass1.elf: build/linker64.ld $(OBJS) $(RUST_LIB)
+$(OUT)/pass1.elf: $(LDSCRIPT) $(OBJS) $(RUST_LIB)
 	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(RUST_LIB)
 
-src/cpp/kernel/symtab_data.cpp: kernel64_pass1.elf
+$(OUT)/symtab_data.cpp: $(OUT)/pass1.elf
 	@echo "Generating symbol table..."
-	@printf '#include "symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $@
+	@printf '#include "kernel/symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $@
 	@$(NM) -Cn $< | awk '/^[0-9a-fA-F]+ [Tt] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $@
 	@printf '};\nconst size_t SymbolTable::SymbolCount = sizeof(Symbols)/sizeof(Symbols[0]);\n}\n' >> $@
 
-src/cpp/kernel/symtab_data.o: src/cpp/kernel/symtab_data.cpp src/cpp/kernel/symtab.h
+$(OUT)/symtab_data.o: $(OUT)/symtab_data.cpp src/cpp/kernel/symtab.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-kernel64.elf: build/linker64.ld $(OBJS) src/cpp/kernel/symtab_data.o $(RUST_LIB)
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) src/cpp/kernel/symtab_data.o $(RUST_LIB)
+$(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/symtab_data.o $(RUST_LIB)
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/symtab_data.o $(RUST_LIB)
 
 clean:
-	rm -rf $(OBJS) $(DEPS) src/cpp/kernel/symtab_data.cpp src/cpp/kernel/symtab_data.o kernel64_pass1.elf *.elf *.bin *.iso iso
+	rm -rf out kernel64.elf kernel-arm64.elf *.bin *.iso iso
 	cd src/rust && cargo clean 2>/dev/null || true
