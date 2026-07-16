@@ -3,7 +3,7 @@
 #include "sched.h"
 #include "cpu.h"
 
-#include <drivers/lapic.h>
+#include <arch/x86_64/lapic.h>
 #include <mm/new.h>
 #include <lib/stdlib.h>
 #include <include/const.h>

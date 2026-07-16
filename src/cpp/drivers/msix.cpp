@@ -3,11 +3,11 @@
 #include "mmio.h"
 
 #include <include/const.h>
-#include <kernel/idt.h>
-#include <kernel/idt_descriptor.h>
+#include <arch/x86_64/idt.h>
+#include <arch/x86_64/idt_descriptor.h>
 #include <kernel/trace.h>
 
-#include "lapic.h"
+#include <arch/x86_64/lapic.h>
 #include <kernel/irq_balance.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>

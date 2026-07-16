@@ -1,5 +1,5 @@
 #include "ioapic.h"
-#include "acpi.h"
+#include <drivers/acpi.h>
 
 #include <kernel/asm.h>
 #include <kernel/trace.h>

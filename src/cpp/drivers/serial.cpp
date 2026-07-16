@@ -1,9 +1,9 @@
 #include "serial.h"
-#include "pic.h"
-#include "lapic.h"
+#include <arch/x86_64/pic.h>
+#include <arch/x86_64/lapic.h>
 
 #include <kernel/asm.h>
-#include <kernel/idt.h>
+#include <arch/x86_64/idt.h>
 #include <kernel/interrupt.h>
 #include <lib/stdlib.h>
 

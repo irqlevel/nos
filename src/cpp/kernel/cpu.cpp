@@ -7,7 +7,7 @@
 
 #include <arch/x86_64/boot64.h>
 
-#include <drivers/lapic.h>
+#include <arch/x86_64/lapic.h>
 #include <kernel/time.h>
 #include <mm/new.h>
 #include <mm/page_table.h>

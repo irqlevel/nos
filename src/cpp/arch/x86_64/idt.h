@@ -1,7 +1,7 @@
 #pragma once
 
 #include "idt_descriptor.h"
-#include "atomic.h"
+#include <kernel/atomic.h>
 
 #include <include/types.h>
 

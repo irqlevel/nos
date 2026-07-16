@@ -1,5 +1,5 @@
 #include "time.h"
-#include "tsc.h"
+#include <arch/x86_64/tsc.h>
 #include "trace.h"
 #include "asm.h"
 

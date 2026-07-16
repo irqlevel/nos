@@ -1,6 +1,6 @@
 #pragma once
 
-#include "atomic.h"
+#include <kernel/atomic.h>
 
 #include <include/types.h>
 #include <lib/stdlib.h>

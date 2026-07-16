@@ -2,10 +2,10 @@
 #include "idt.h"
 #include "stdlib.h"
 #include "asm.h"
-#include "panic.h"
-#include "trace.h"
-#include "cpu.h"
-#include "debug.h"
+#include <kernel/panic.h>
+#include <kernel/trace.h>
+#include <kernel/cpu.h>
+#include <kernel/debug.h>
 
 namespace Kernel
 {

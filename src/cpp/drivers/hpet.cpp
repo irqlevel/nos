@@ -1,6 +1,6 @@
 #include "hpet.h"
 #include "acpi.h"
-#include "lapic.h"
+#include <arch/x86_64/lapic.h>
 
 #include <kernel/trace.h>
 #include <kernel/cpu.h>

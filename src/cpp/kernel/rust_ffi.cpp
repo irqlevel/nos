@@ -11,7 +11,7 @@
 #include "sched.h"
 #include "cpu.h"
 #include "entropy.h"
-#include "idt.h"
+#include <arch/x86_64/idt.h>
 #include "interrupt.h"
 #include "asm.h"
 #include "softirq.h"
@@ -22,7 +22,7 @@
 #include <lib/stdlib.h>
 #include <drivers/pci.h>
 #include <drivers/msix.h>
-#include <drivers/lapic.h>
+#include <arch/x86_64/lapic.h>
 #include <block/block_device.h>
 #include <net/net_device.h>
 #include <net/net_frame.h>

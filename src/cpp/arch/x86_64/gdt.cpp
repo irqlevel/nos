@@ -1,8 +1,8 @@
 #include "gdt.h"
 #include "asm.h"
-#include "trace.h"
-#include "panic.h"
-#include "cpu.h"
+#include <kernel/trace.h>
+#include <kernel/panic.h>
+#include <kernel/cpu.h>
 
 #include <lib/stdlib.h>
 
