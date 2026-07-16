@@ -27,6 +27,8 @@
 #include <drivers/virtio_rng.h>
 
 #include <net/tcp.h>
+#include <net/udp_shell.h>
+#include <net/net_device.h>
 
 /* arm64 boot orchestrator, the Main2 twin (kernel/main.cpp). Milestone M2:
    full memory management + boot self-tests on one CPU; the interrupt/
@@ -170,6 +172,22 @@ static void BpStartupArm(void* ctx)
     {
         Panic("Can't start cmd");
         return;
+    }
+
+    UdpShell udpShell;
+    u16 udpShellPort = Parameters::GetInstance().GetUdpShellPort();
+    if (udpShellPort != 0)
+    {
+        NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
+        if (netDev)
+        {
+            if (!udpShell.Start(netDev, udpShellPort))
+                Trace(0, "UdpShell: failed to start on port %u", (ulong)udpShellPort);
+        }
+        else
+        {
+            Trace(0, "UdpShell: eth0 not found");
+        }
     }
 
     Trace(0, "boot: complete");

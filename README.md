@@ -190,6 +190,7 @@ src/cpp/
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
   lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, stdlib
   include/    Shared headers
+  arm64/     arm64 backend: Linux-Image boot + PSCI SMP (boot.S), GICv3, generic timer, PL011, EL1 vectors, FDT parser, virtio-mmio glue
 src/rust/
   ffi/        Raw extern "C" FFI declarations for kernel services
   kcore/      Safe Rust wrappers: sync, DMA, MMIO, MSI-X, interrupts, timers, tasks, PCI, block/net device

@@ -41,6 +41,17 @@ Run in QEMU (serial console is logged to `nos.log`):
 ./scripts/run.sh         # Linux/KVM, all host CPUs, isa-debug-exit device
 ```
 
+arm64 (QEMU `virt`, HVF-accelerated on Apple Silicon — the fast dev loop):
+
+```sh
+make nocheck ARCH=aarch64      # (in Docker on macOS) -> kernel-arm64.elf + nos-arm64.img
+./scripts/qemu-arm64.sh        # boots nos-arm64.img with virtio-mmio blk/net/rng,
+                               # serial -> nos-arm64.log, UDP shell on :9000
+                               # (NOS_TCG=1 forces TCG; HVF is ~4x faster)
+./scripts/smoke-arm64.sh       # arm64 boot smoke test (SMOKE_HVF=1 for HVF)
+python3 scripts/udpsh.py 127.0.0.1   # remote shell over UDP
+```
+
 Debug with GDB (QEMU must be started with `-s`):
 
 ```sh

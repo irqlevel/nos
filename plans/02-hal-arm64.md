@@ -116,6 +116,33 @@ and that implementation is the expensive part:
   interface, Rust `target_arch` gates + Release fences on nvme/r8168 DMA
   paths. x86 stayed boot-green (smoke) after every step.
 
+## Progress record (Phase B, implemented on the arm64-hal branch)
+
+Milestones M1-M6 landed 2026-07-16/17; `nos` boots on QEMU `virt`
+(gic-version=3) under **TCG and Apple HVF** to the interactive serial +
+UDP shell with `-smp 4`:
+
+- Linux `Image` boot + DTB (own minimal FDT parser, QEMU-virt fallbacks),
+  higher-half at `KernelSpaceBase + phys` preserving the linear-map
+  invariant; EL2->EL1 drop in boot.S.
+- MMU: shared 9-9-9-9-12 walk with an arm64 `Pte` encoding; the real
+  table carries a 1GiB Device-nGnRE block so MMIO survives the root
+  switch (`Hal::MmioPremappedVa`).
+- GICv3 (dist + redist + ICC sysregs), EL1 vectors with full ESR decode
+  and symbolized backtraces, generic-timer 100 Hz tick broadcast as
+  SGI IPIs (unchanged scheduler), PL011 console with observer-based
+  shell input, SMP via PSCI `CPU_ON`, PSCI SYSTEM_OFF/RESET.
+- virtio-mmio (modern v2) behind `VirtioTransport`: blk/net/rng work
+  end-to-end (nanofs format/mount/write, DHCP + ping, entropy).
+- Verified: `scripts/smoke-arm64.sh` green under TCG (16s) and HVF (4s);
+  x86 smoke green after every step.
+
+**Deferred / follow-ups:** Rust on arm64 (rust_ffi.cpp still couples to
+the IDT; the drivers and kcore are already `target_arch`-gated),
+virtio-scsi over mmio, PL031 wall clock, graceful shutdown teardown
+(arm64 goes straight to PSCI), PCIe ECAM + GIC ITS + NVMe/r8168,
+`.l*`/W^X hardening of the arm64 mappings.
+
 ## Work items
 
 Split into the reusable, low-regret refactor (A) and the large implementation (B).
