@@ -21,11 +21,15 @@ fn alloc_error(_layout: core::alloc::Layout) -> ! {
 #[no_mangle]
 pub extern "C" fn rust_init() {
     hello::hello();
-    nvme::init();
-    r8168::init();
-    tco_init();
+    #[cfg(target_arch = "x86_64")]
+    {
+        nvme::init();
+        r8168::init();
+        tco_init();
+    }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn tco_init() {
     use kcore::tco_wdt::TcoWatchdog;
     use kcore::timer::Timer;
@@ -91,6 +95,9 @@ pub extern "C" fn rust_test() {
    devices freed here -- any I/O issued after this call is a use-after-free. */
 #[no_mangle]
 pub extern "C" fn rust_fini() {
-    nvme::shutdown();
-    r8168::shutdown();
+    #[cfg(target_arch = "x86_64")]
+    {
+        nvme::shutdown();
+        r8168::shutdown();
+    }
 }

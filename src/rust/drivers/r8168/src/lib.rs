@@ -443,7 +443,7 @@ extern "C" fn r8168_flush_tx(ctx: *mut u8) {
         if submitted > 0 {
             (*dev).tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
             /* Kick the TX DMA engine.  Must be written after the descriptor
-             * stores (already guaranteed by tx_ring.submit's compiler_fence). */
+             * stores (already guaranteed by tx_ring.submit's Release fence). */
             (*dev).regs.write8(TX_POLL, TX_POLL_NPQ);
         }
     }
