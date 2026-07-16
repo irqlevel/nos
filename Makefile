@@ -19,6 +19,7 @@ NM_aarch64 = llvm-nm
 RUST_TARGET_aarch64 = aarch64-unknown-none-softfloat
 LDSCRIPT_aarch64 = build/linker-arm64.ld
 KERNEL_aarch64 = kernel-arm64.elf
+OBJCOPY = llvm-objcopy
 
 TARGET = $(TARGET_$(ARCH))
 LD = $(LD_$(ARCH))
@@ -36,7 +37,7 @@ ASM = nasm
 AR = ar
 MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 
-CXX_SRC =   \
+CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/grub.cpp    \
     src/cpp/arch/x86_64/cpu_start.cpp \
     src/cpp/arch/x86_64/hal_x86.cpp \
@@ -127,15 +128,35 @@ CXX_SRC =   \
     src/cpp/mm/page_table.cpp \
     src/cpp/mm/block_allocator.cpp \
 
-ASM_SRC =    \
+CXX_SRC_aarch64 = \
+    src/cpp/arch/arm64/main_arm64.cpp \
+    src/cpp/arch/arm64/pl011.cpp \
+    src/cpp/arch/arm64/stdlib_c.cpp \
+    src/cpp/lib/stdlib.cpp \
+    src/cpp/lib/format.cpp \
+
+CXX_SRC = $(CXX_SRC_$(ARCH))
+
+# NASM sources (x86 only)
+ASM_SRC_x86_64 =    \
     src/cpp/arch/x86_64/boot64.asm \
     src/cpp/arch/x86_64/asm.asm \
     src/cpp/arch/x86_64/stdlib_asm.asm
+ASM_SRC_aarch64 =
+ASM_SRC = $(ASM_SRC_$(ARCH))
 
-OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC))
+# GNU-as sources assembled by clang (arm64 only)
+ASM_S_SRC_x86_64 =
+ASM_S_SRC_aarch64 = \
+    src/cpp/arch/arm64/boot.S
+ASM_S_SRC = $(ASM_S_SRC_$(ARCH))
+
+OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC)) $(patsubst src/cpp/%.S,$(OUT)/%.o,$(ASM_S_SRC))
 DEPS = $(patsubst src/cpp/%.cpp,$(OUT)/%.d,$(CXX_SRC))
 
-RUST_LIB = src/rust/target/$(RUST_TARGET)/release/libkernel.a
+RUST_LIB_x86_64 = src/rust/target/$(RUST_TARGET)/release/libkernel.a
+RUST_LIB_aarch64 =
+RUST_LIB = $(RUST_LIB_$(ARCH))
 
 .PHONY: all check nocheck clean rust smoke
 
@@ -145,8 +166,8 @@ ifeq ($(ARCH),x86_64)
 all: check nos.iso
 nocheck: nos.iso
 else
-all: check $(KERNEL)
-nocheck: $(KERNEL)
+all: check nos-arm64.img
+nocheck: nos-arm64.img
 endif
 
 check: $(CXX_SRC)
@@ -166,12 +187,21 @@ nos.iso: build/grub.cfg $(KERNEL)
 $(OUT)/%.o: src/cpp/%.asm
 	@mkdir -p $(dir $@)
 	$(ASM) -felf64 $< -o $@
+$(OUT)/%.o: src/cpp/%.S
+	@mkdir -p $(dir $@)
+	$(CC) --target=$(TARGET) $(CPPFLAGS) -c $< -o $@
 $(OUT)/%.o: src/cpp/%.cpp
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -c $< -o $@
 
-rust $(RUST_LIB):
+rust:
 	cd src/rust && cargo build --release --target $(RUST_TARGET)
+
+src/rust/target/$(RUST_TARGET)/release/libkernel.a:
+	cd src/rust && cargo build --release --target $(RUST_TARGET)
+
+nos-arm64.img: $(KERNEL)
+	$(OBJCOPY) -O binary $< $@
 
 smoke:
 	./scripts/smoke-test.sh
@@ -192,5 +222,5 @@ $(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/symtab_data.o $(RUST_LIB)
 	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/symtab_data.o $(RUST_LIB)
 
 clean:
-	rm -rf out kernel64.elf kernel-arm64.elf *.bin *.iso iso
+	rm -rf out kernel64.elf kernel-arm64.elf nos-arm64.img *.bin *.iso iso
 	cd src/rust && cargo clean 2>/dev/null || true
