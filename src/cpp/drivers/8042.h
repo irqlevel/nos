@@ -1,7 +1,7 @@
 #pragma once
 
 #include <include/types.h>
-#include <kernel/idt.h>
+#include <arch/x86_64/idt.h>
 #include <kernel/timer.h>
 #include <kernel/spin_lock.h>
 #include <kernel/interrupt.h>

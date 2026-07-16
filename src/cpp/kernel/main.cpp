@@ -2,10 +2,10 @@
 #include "panic.h"
 #include "debug.h"
 #include "atomic.h"
-#include "gdt.h"
-#include "idt.h"
+#include <arch/x86_64/gdt.h>
+#include <arch/x86_64/idt.h>
 #include "test.h"
-#include "exception.h"
+#include <arch/x86_64/exception.h>
 #include "asm.h"
 #include "cpu.h"
 #include "cmd.h"
@@ -19,7 +19,7 @@
 #include "softirq.h"
 #include "irq_balance.h"
 #include "time.h"
-#include "tsc.h"
+#include <arch/x86_64/tsc.h>
 
 #include <arch/x86_64/grub.h>
 
@@ -35,12 +35,12 @@
 #include <drivers/8042.h>
 #include <drivers/vga.h>
 #include <drivers/serial.h>
-#include <drivers/pic.h>
+#include <arch/x86_64/pic.h>
 #include <drivers/pit.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
-#include <drivers/lapic.h>
-#include <drivers/ioapic.h>
+#include <arch/x86_64/lapic.h>
+#include <arch/x86_64/ioapic.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_blk.h>
 #include <drivers/virtio_scsi.h>

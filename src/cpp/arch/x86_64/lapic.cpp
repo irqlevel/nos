@@ -1,5 +1,5 @@
 #include "lapic.h"
-#include "acpi.h"
+#include <drivers/acpi.h>
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>

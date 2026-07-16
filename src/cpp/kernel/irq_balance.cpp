@@ -2,7 +2,7 @@
 #include "cpu.h"
 #include "trace.h"
 
-#include <drivers/ioapic.h>
+#include <arch/x86_64/ioapic.h>
 #include <drivers/msix.h>
 
 namespace Kernel

@@ -1,13 +1,13 @@
 #include "interrupt.h"
-#include "idt.h"
+#include <arch/x86_64/idt.h>
 #include "cpu.h"
 #include "irq_balance.h"
 #include "trace.h"
 #include "asm.h"
 
 #include <drivers/acpi.h>
-#include <drivers/ioapic.h>
-#include <drivers/lapic.h>
+#include <arch/x86_64/ioapic.h>
+#include <arch/x86_64/lapic.h>
 
 namespace Kernel
 {

@@ -1,7 +1,7 @@
 #include "idt.h"
 #include "asm.h"
-#include "interrupt.h"
-#include "trace.h"
+#include <kernel/interrupt.h>
+#include <kernel/trace.h>
 
 #include <lib/stdlib.h>
 

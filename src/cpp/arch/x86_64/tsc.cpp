@@ -1,13 +1,13 @@
 #include "tsc.h"
 #include "cpuid.h"
 #include "asm.h"
-#include "trace.h"
-#include "preempt.h"
+#include <kernel/trace.h>
+#include <kernel/preempt.h>
 
 #include <include/const.h>
 #include <mm/new.h>
 #include <drivers/hpet.h>
-#include <drivers/lapic.h>
+#include <arch/x86_64/lapic.h>
 
 namespace Kernel
 {

@@ -1,5 +1,5 @@
 #include "pit.h"
-#include "lapic.h"
+#include <arch/x86_64/lapic.h>
 
 #include <kernel/cpu.h>
 #include <kernel/interrupt.h>

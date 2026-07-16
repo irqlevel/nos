@@ -39,13 +39,13 @@ MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 CXX_SRC =   \
     src/cpp/arch/x86_64/grub.cpp    \
     src/cpp/drivers/serial.cpp  \
-    src/cpp/drivers/pic.cpp \
+    src/cpp/arch/x86_64/pic.cpp \
     src/cpp/drivers/pit.cpp \
     src/cpp/drivers/hpet.cpp \
     src/cpp/drivers/8042.cpp    \
     src/cpp/drivers/acpi.cpp    \
-    src/cpp/drivers/lapic.cpp   \
-    src/cpp/drivers/ioapic.cpp  \
+    src/cpp/arch/x86_64/lapic.cpp   \
+    src/cpp/arch/x86_64/ioapic.cpp  \
     src/cpp/drivers/vga.cpp \
     src/cpp/drivers/pci.cpp \
     src/cpp/drivers/msix.cpp \
@@ -66,10 +66,10 @@ CXX_SRC =   \
     src/cpp/kernel/panic.cpp    \
     src/cpp/kernel/debug.cpp    \
     src/cpp/kernel/atomic.cpp   \
-    src/cpp/kernel/gdt.cpp  \
-    src/cpp/kernel/gdt_descriptor.cpp   \
-    src/cpp/kernel/idt_descriptor.cpp   \
-    src/cpp/kernel/idt.cpp  \
+    src/cpp/arch/x86_64/gdt.cpp  \
+    src/cpp/arch/x86_64/gdt_descriptor.cpp   \
+    src/cpp/arch/x86_64/idt_descriptor.cpp   \
+    src/cpp/arch/x86_64/idt.cpp  \
     src/cpp/kernel/cpu.cpp  \
     src/cpp/kernel/cmd.cpp  \
     src/cpp/block/block_device.cpp \
@@ -93,12 +93,12 @@ CXX_SRC =   \
     src/cpp/kernel/wait_group.cpp \
     src/cpp/kernel/softirq.cpp \
     src/cpp/kernel/irq_balance.cpp \
-    src/cpp/kernel/exception.cpp    \
+    src/cpp/arch/x86_64/exception.cpp    \
     src/cpp/kernel/dmesg.cpp    \
     src/cpp/kernel/sched.cpp    \
     src/cpp/kernel/preempt.cpp  \
     src/cpp/kernel/time.cpp \
-    src/cpp/kernel/tsc.cpp \
+    src/cpp/arch/x86_64/tsc.cpp \
     src/cpp/kernel/spin_lock.cpp \
     src/cpp/kernel/watchdog.cpp \
     src/cpp/kernel/object_table.cpp \

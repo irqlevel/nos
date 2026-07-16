@@ -1,12 +1,12 @@
 #include "virtio_net.h"
-#include "lapic.h"
-#include "ioapic.h"
+#include <arch/x86_64/lapic.h>
+#include <arch/x86_64/ioapic.h>
 
 #include <kernel/trace.h>
 #include <kernel/asm.h>
 #include <kernel/panic.h>
 #include <kernel/interrupt.h>
-#include <kernel/idt.h>
+#include <arch/x86_64/idt.h>
 #include <kernel/softirq.h>
 #include <net/arp.h>
 #include <net/icmp.h>
