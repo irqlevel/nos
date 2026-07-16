@@ -4,7 +4,7 @@
 #include <kernel/trace.h>
 #include <lib/stdlib.h>
 #include <mm/page_table.h>
-#include <boot/grub.h>
+#include <arch/x86_64/grub.h>
 
 namespace Kernel
 {

@@ -4,7 +4,7 @@
 #include <kernel/cpu.h>
 #include <mm/memory_map.h>
 #include <mm/page_table.h>
-#include <boot/grub.h>
+#include <arch/x86_64/grub.h>
 
 namespace Kernel
 {
