@@ -111,7 +111,8 @@ private:
 
     static void RxFrameRelease(NetFrame* frame, void* ctx);
 
-    VirtioPci Transport;
+    VirtioPci PciTransport;
+    VirtioTransport* Transport;
     volatile void* RxNotifyAddr;
     volatile void* TxNotifyAddr;
     VirtQueue HwRxQueue;

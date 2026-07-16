@@ -83,7 +83,7 @@ void VirtioScsi::EncodeLun(u8 lun[8], u8 target, u16 lunId)
     lun[7] = 0;
 }
 
-bool VirtioScsi::Init(VirtioPci* transport, VirtQueue* reqQueue, SpinLock* ioLock,
+bool VirtioScsi::Init(VirtioTransport* transport, VirtQueue* reqQueue, SpinLock* ioLock,
                        u8 target, u16 lun, u64 capacity, u64 sectorSize, const char* name,
                        u32 reqHdrSize, u32 respHdrSize)
 {
@@ -540,7 +540,7 @@ void VirtioScsi::DrainQueue()
     }
 
     if (kicked)
-        Hba->Transport.NotifyQueue(QueueRequest);
+        Hba->Transport->NotifyQueue(QueueRequest);
 }
 
 void VirtioScsi::DrainAllQueues()
@@ -764,9 +764,9 @@ void VirtioScsi::Interrupt(Context* ctx)
     /* Read ISR only on the INTx path; under MSI-X the ISR status register is
        not the notification mechanism (virtio 1.x 4.1.4.5) and a spec-conforming
        device leaves it 0, so gating on it would drop every completion. */
-    if (!Hba->Transport.UsingMsix())
+    if (!Hba->Transport->UsingMsix())
     {
-        u8 isr = Hba->Transport.ReadISR();
+        u8 isr = Hba->Transport->ReadISR();
         if (isr == 0)
             return;
     }
@@ -822,61 +822,63 @@ bool VirtioScsi::InitHba(Pci::DeviceInfo* pciDev, HbaState* hba)
 
     pci.EnableBusMastering(pciDev->Bus, pciDev->Slot, pciDev->Func);
 
-    if (!hba->Transport.Probe(pciDev))
+    if (!hba->PciTransport.Probe(pciDev))
     {
-        Trace(0, "VirtioScsi: Transport.Probe failed");
+        Trace(0, "VirtioScsi: transport probe failed");
         return false;
     }
 
+    hba->Transport = &hba->PciTransport;
+
     Trace(0, "VirtioScsi: %s virtio-pci probed, irq %u",
-        hba->Transport.IsLegacy() ? "legacy" : "modern",
+        hba->Transport->IsLegacy() ? "legacy" : "modern",
         (ulong)pciDev->InterruptLine);
 
     /* Reset */
-    hba->Transport.Reset();
+    hba->Transport->Reset();
 
     /* Acknowledge */
-    hba->Transport.SetStatus(VirtioPci::StatusAcknowledge);
+    hba->Transport->SetStatus(VirtioTransport::StatusAcknowledge);
 
     /* Driver */
-    hba->Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver);
+    hba->Transport->SetStatus(VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver);
 
     /* Feature negotiation */
-    u32 devFeatures0 = hba->Transport.ReadDeviceFeature(0);
+    u32 devFeatures0 = hba->Transport->ReadDeviceFeature(0);
     Trace(0, "VirtioScsi: device features[0] 0x%p", (ulong)devFeatures0);
 
-    hba->Transport.WriteDriverFeature(0, 0);
+    hba->Transport->WriteDriverFeature(0, 0);
 
-    if (!hba->Transport.IsLegacy())
+    if (!hba->Transport->IsLegacy())
     {
-        u32 devFeatures1 = hba->Transport.ReadDeviceFeature(1);
+        u32 devFeatures1 = hba->Transport->ReadDeviceFeature(1);
         u32 drvFeatures1 = devFeatures1 & (1 << 0); /* VIRTIO_F_VERSION_1 */
-        hba->Transport.WriteDriverFeature(1, drvFeatures1);
+        hba->Transport->WriteDriverFeature(1, drvFeatures1);
     }
 
-    if (!hba->Transport.IsLegacy())
+    if (!hba->Transport->IsLegacy())
     {
-        hba->Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                                  VirtioPci::StatusFeaturesOk);
+        hba->Transport->SetStatus(VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver |
+                                  VirtioTransport::StatusFeaturesOk);
 
-        if (!(hba->Transport.GetStatus() & VirtioPci::StatusFeaturesOk))
+        if (!(hba->Transport->GetStatus() & VirtioTransport::StatusFeaturesOk))
         {
             Trace(0, "VirtioScsi: FEATURES_OK not set by device");
-            hba->Transport.SetStatus(VirtioPci::StatusFailed);
+            hba->Transport->SetStatus(VirtioTransport::StatusFailed);
             return false;
         }
     }
 
     /* Read device-specific configuration */
-    u32 numQueues = hba->Transport.ReadDevCfg32(0);
-    u32 segMax = hba->Transport.ReadDevCfg32(4);
-    u32 maxSectors = hba->Transport.ReadDevCfg32(8);
-    u32 cmdPerLun = hba->Transport.ReadDevCfg32(12);
-    u32 senseSize = hba->Transport.ReadDevCfg32(20);
-    u32 cdbSize = hba->Transport.ReadDevCfg32(24);
-    u16 maxChannel = hba->Transport.ReadDevCfg8(28) | ((u16)hba->Transport.ReadDevCfg8(29) << 8);
-    u16 maxTarget = hba->Transport.ReadDevCfg8(30) | ((u16)hba->Transport.ReadDevCfg8(31) << 8);
-    u32 maxLun = hba->Transport.ReadDevCfg32(32);
+    u32 numQueues = hba->Transport->ReadDevCfg32(0);
+    u32 segMax = hba->Transport->ReadDevCfg32(4);
+    u32 maxSectors = hba->Transport->ReadDevCfg32(8);
+    u32 cmdPerLun = hba->Transport->ReadDevCfg32(12);
+    u32 senseSize = hba->Transport->ReadDevCfg32(20);
+    u32 cdbSize = hba->Transport->ReadDevCfg32(24);
+    u16 maxChannel = hba->Transport->ReadDevCfg8(28) | ((u16)hba->Transport->ReadDevCfg8(29) << 8);
+    u16 maxTarget = hba->Transport->ReadDevCfg8(30) | ((u16)hba->Transport->ReadDevCfg8(31) << 8);
+    u32 maxLun = hba->Transport->ReadDevCfg32(32);
 
     Trace(0, "VirtioScsi: numQueues %u segMax %u maxSectors %u cmdPerLun %u",
         (ulong)numQueues, (ulong)segMax, (ulong)maxSectors, (ulong)cmdPerLun);
@@ -897,51 +899,51 @@ bool VirtioScsi::InitHba(Pci::DeviceInfo* pciDev, HbaState* hba)
 
     /* Queue 0 = control queue -- used for task management (abort, LUN reset).
        Not needed for basic synchronous I/O. Skip allocation. */
-    hba->Transport.SelectQueue(QueueControl);
+    hba->Transport->SelectQueue(QueueControl);
 
     /* Queue 1 = event queue -- used for async notifications (hotplug, live resize).
        Not needed without hotplug support. Skip allocation. */
-    hba->Transport.SelectQueue(QueueEvent);
+    hba->Transport->SelectQueue(QueueEvent);
 
     /* Queue 2 = first request queue -- used for SCSI commands (read, write, inquiry).
        This is the only queue we need for block I/O. */
-    hba->Transport.SelectQueue(QueueRequest);
-    u16 queueSize = hba->Transport.GetQueueSize();
+    hba->Transport->SelectQueue(QueueRequest);
+    u16 queueSize = hba->Transport->GetQueueSize();
     Trace(0, "VirtioScsi: request queue size %u", (ulong)queueSize);
 
     if (queueSize == 0)
     {
         Trace(0, "VirtioScsi: request queue size is 0");
-        hba->Transport.SetStatus(VirtioPci::StatusFailed);
+        hba->Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
     if (!hba->ReqQueue.Setup(queueSize))
     {
         Trace(0, "VirtioScsi: failed to setup request queue");
-        hba->Transport.SetStatus(VirtioPci::StatusFailed);
+        hba->Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
-    hba->Transport.SetQueueDesc(hba->ReqQueue.GetDescPhys());
-    hba->Transport.SetQueueDriver(hba->ReqQueue.GetAvailPhys());
-    hba->Transport.SetQueueDevice(hba->ReqQueue.GetUsedPhys());
+    hba->Transport->SetQueueDesc(hba->ReqQueue.GetDescPhys());
+    hba->Transport->SetQueueDriver(hba->ReqQueue.GetAvailPhys());
+    hba->Transport->SetQueueDevice(hba->ReqQueue.GetUsedPhys());
 
-    if (!hba->Transport.IsLegacy() && hba->Transport.IsMsixEnabled())
+    if (!hba->Transport->IsLegacy() && hba->Transport->IsMsixEnabled())
     {
-        u8 vec = hba->Transport.EnableMsixVector(0, ScsiMsixRegistrar);
+        u8 vec = hba->Transport->EnableMsixVector(0, ScsiMsixRegistrar);
         if (vec == 0)
             Trace(0, "VirtioScsi: MSI-X unavailable, using INTx");
     }
 
-    hba->Transport.EnableQueue();
+    hba->Transport->EnableQueue();
 
     /* Set DRIVER_OK */
-    u8 okStatus = VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                  VirtioPci::StatusDriverOk;
-    if (!hba->Transport.IsLegacy())
-        okStatus |= VirtioPci::StatusFeaturesOk;
-    hba->Transport.SetStatus(okStatus);
+    u8 okStatus = VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver |
+                  VirtioTransport::StatusDriverOk;
+    if (!hba->Transport->IsLegacy())
+        okStatus |= VirtioTransport::StatusFeaturesOk;
+    hba->Transport->SetStatus(okStatus);
 
     return true;
 }
@@ -964,7 +966,7 @@ bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
 
     u32 reqHdrSize = 19 + hba->CdbSize;
     u32 respHdrSize = 12 + hba->SenseSize;
-    if (!inst.Init(&hba->Transport, &hba->ReqQueue, &hba->Lock, target, lun, 0, DefaultSectorSize, tmpName,
+    if (!inst.Init(hba->Transport, &hba->ReqQueue, &hba->Lock, target, lun, 0, DefaultSectorSize, tmpName,
                    reqHdrSize, respHdrSize))
         return false;
 
@@ -1119,7 +1121,7 @@ void VirtioScsi::InitAll()
                     Instances[j].Hba = nullptr;
             }
 
-            if (!hba->Transport.UsingMsix())
+            if (!hba->Transport->UsingMsix())
             {
                 u8 irq = dev->InterruptLine;
                 u8 vector = BaseVector + (u8)HbaCount;
@@ -1131,7 +1133,7 @@ void VirtioScsi::InitAll()
             /* No devices found -- reset the device to deassert any
                pending level-triggered IRQ that could storm when
                interrupts are enabled (shared IRQ line with virtio-net). */
-            hba->Transport.Reset();
+            hba->Transport->Reset();
         }
 
         HbaCount++;

@@ -90,7 +90,8 @@ private:
     int AllocSlot();
     void FreeSlot(int idx);
 
-    VirtioPci Transport;
+    VirtioPci PciTransport;
+    VirtioTransport* Transport;
     volatile void* QueueNotifyAddr;
     VirtQueue Queue;
     RawSpinLock VirtQueueLock; /* Protects Queue (AddBufs/GetUsed share free chain) */

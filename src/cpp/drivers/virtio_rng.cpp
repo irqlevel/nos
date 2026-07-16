@@ -13,7 +13,8 @@ VirtioRng VirtioRng::Instances[MaxInstances];
 ulong VirtioRng::InstanceCount = 0;
 
 VirtioRng::VirtioRng()
-    : DmaBuf(nullptr)
+    : Transport(&PciTransport)
+    , DmaBuf(nullptr)
     , DmaBufPhys(0)
     , Initialized(false)
     , RequestStuck(false)
@@ -39,70 +40,70 @@ bool VirtioRng::Init(Pci::DeviceInfo* pciDev, const char* name)
     pci.EnableBusMastering(pciDev->Bus, pciDev->Slot, pciDev->Func);
 
     /* Probe modern virtio-pci capabilities and map MMIO BARs */
-    if (!Transport.Probe(pciDev))
+    if (!PciTransport.Probe(pciDev))
     {
-        Trace(0, "VirtioRng %s: Transport.Probe failed", name);
+        Trace(0, "VirtioRng %s: Transport->Probe failed", name);
         return false;
     }
 
     Trace(0, "VirtioRng %s: %s virtio-pci probed, irq %u",
-        name, Transport.IsLegacy() ? "legacy" : "modern",
+        name, Transport->IsLegacy() ? "legacy" : "modern",
         (ulong)pciDev->InterruptLine);
 
     /* Reset device */
-    Transport.Reset();
+    Transport->Reset();
 
     /* Acknowledge */
-    Transport.SetStatus(VirtioPci::StatusAcknowledge);
+    Transport->SetStatus(VirtioTransport::StatusAcknowledge);
 
     /* Driver */
-    Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver);
+    Transport->SetStatus(VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver);
 
     /* Read and negotiate features -- virtio-rng has no device-specific features */
-    u32 devFeatures0 = Transport.ReadDeviceFeature(0);
+    u32 devFeatures0 = Transport->ReadDeviceFeature(0);
     Trace(0, "VirtioRng %s: device features[0] 0x%p", name, (ulong)devFeatures0);
 
-    Transport.WriteDriverFeature(0, 0);
+    Transport->WriteDriverFeature(0, 0);
 
-    if (!Transport.IsLegacy())
+    if (!Transport->IsLegacy())
     {
         /* features[1]: set VIRTIO_F_VERSION_1 (bit 32 = index 1 bit 0) */
-        u32 devFeatures1 = Transport.ReadDeviceFeature(1);
+        u32 devFeatures1 = Transport->ReadDeviceFeature(1);
         u32 drvFeatures1 = devFeatures1 & (1 << 0); /* VIRTIO_F_VERSION_1 */
-        Transport.WriteDriverFeature(1, drvFeatures1);
+        Transport->WriteDriverFeature(1, drvFeatures1);
     }
 
-    if (!Transport.IsLegacy())
+    if (!Transport->IsLegacy())
     {
         /* Set FEATURES_OK (modern only) */
-        Transport.SetStatus(VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                            VirtioPci::StatusFeaturesOk);
+        Transport->SetStatus(VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver |
+                            VirtioTransport::StatusFeaturesOk);
 
         /* Verify FEATURES_OK is still set */
-        if (!(Transport.GetStatus() & VirtioPci::StatusFeaturesOk))
+        if (!(Transport->GetStatus() & VirtioTransport::StatusFeaturesOk))
         {
             Trace(0, "VirtioRng %s: FEATURES_OK not set by device", name);
-            Transport.SetStatus(VirtioPci::StatusFailed);
+            Transport->SetStatus(VirtioTransport::StatusFailed);
             return false;
         }
     }
 
     /* Setup requestq (queue 0) */
-    Transport.SelectQueue(0);
-    u16 queueSize = Transport.GetQueueSize();
+    Transport->SelectQueue(0);
+    u16 queueSize = Transport->GetQueueSize();
     Trace(0, "VirtioRng %s: queue size %u", name, (ulong)queueSize);
 
     if (queueSize == 0)
     {
         Trace(0, "VirtioRng %s: queue size is 0", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
     if (!Queue.Setup(queueSize))
     {
         Trace(0, "VirtioRng %s: failed to setup queue", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
@@ -111,24 +112,24 @@ bool VirtioRng::Init(Pci::DeviceInfo* pciDev, const char* name)
        storming any handler that shares the line */
     Queue.DisableDeviceInterrupts();
 
-    Transport.SetQueueDesc(Queue.GetDescPhys());
-    Transport.SetQueueDriver(Queue.GetAvailPhys());
-    Transport.SetQueueDevice(Queue.GetUsedPhys());
-    Transport.EnableQueue();
+    Transport->SetQueueDesc(Queue.GetDescPhys());
+    Transport->SetQueueDriver(Queue.GetAvailPhys());
+    Transport->SetQueueDevice(Queue.GetUsedPhys());
+    Transport->EnableQueue();
 
     /* Set DRIVER_OK */
-    u8 okStatus = VirtioPci::StatusAcknowledge | VirtioPci::StatusDriver |
-                  VirtioPci::StatusDriverOk;
-    if (!Transport.IsLegacy())
-        okStatus |= VirtioPci::StatusFeaturesOk;
-    Transport.SetStatus(okStatus);
+    u8 okStatus = VirtioTransport::StatusAcknowledge | VirtioTransport::StatusDriver |
+                  VirtioTransport::StatusDriverOk;
+    if (!Transport->IsLegacy())
+        okStatus |= VirtioTransport::StatusFeaturesOk;
+    Transport->SetStatus(okStatus);
 
     /* Allocate DMA buffer (1 page) */
     DmaBuf = (u8*)Mm::AllocMapPages(1, &DmaBufPhys);
     if (!DmaBuf)
     {
         Trace(0, "VirtioRng %s: failed to alloc DMA page", name);
-        Transport.SetStatus(VirtioPci::StatusFailed);
+        Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
 
@@ -186,7 +187,7 @@ bool VirtioRng::GetRandom(u8* buf, ulong len)
             return false;
         }
 
-        Transport.NotifyQueue(0);
+        Transport->NotifyQueue(0);
 
         /* Poll for completion */
         for (ulong i = 0; i < 10000000; i++)

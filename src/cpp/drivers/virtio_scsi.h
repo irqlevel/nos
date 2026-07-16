@@ -48,7 +48,7 @@ public:
     VirtioScsi();
     virtual ~VirtioScsi();
 
-    bool Init(VirtioPci* transport, VirtQueue* reqQueue, SpinLock* ioLock,
+    bool Init(VirtioTransport* transport, VirtQueue* reqQueue, SpinLock* ioLock,
               u8 target, u16 lun, u64 capacity, u64 sectorSize, const char* name,
               u32 reqHdrSize, u32 respHdrSize);
 
@@ -121,7 +121,7 @@ private:
 
     void WaitForCompletion(BlockRequest& req);
 
-    VirtioPci* Transport;
+    VirtioTransport* Transport;
     VirtQueue* ReqQueue;
     SpinLock* IoLock;          /* Points to shared HBA lock */
     u8 Target;
@@ -183,7 +183,8 @@ private:
 
     struct HbaState
     {
-        VirtioPci Transport;
+        VirtioPci PciTransport;
+        VirtioTransport* Transport;
         VirtQueue ReqQueue;
         RawSpinLock VirtQueueLock; /* Protects ReqQueue (AddBufs/GetUsed share free chain) */
         SpinLock Lock;        /* Serializes probing I/O on this HBA */
