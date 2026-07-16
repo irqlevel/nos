@@ -1,10 +1,13 @@
-# Build nos x86_64 kernel ISO. Use on Mac: ./build-iso-docker.sh
+# Build nos kernels (x86_64 ISO and arm64 image). Use on Mac: ./build-iso-docker.sh
 # Platform amd64 so the toolchain produces x86_64 ELF (runs via emulation on Apple Silicon).
+# clang is multi-target: the same image cross-compiles aarch64 (linked with ld.lld).
 FROM --platform=linux/amd64 ubuntu:22.04
 
 RUN apt-get update && apt-get install -y \
     build-essential \
     clang \
+    lld \
+    llvm \
     nasm \
     grub2-common \
     grub-pc-bin \
@@ -13,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     parted \
     e2fsprogs \
     qemu-utils \
+    qemu-system-x86 \
     python3 \
     curl \
     && rm -rf /var/lib/apt/lists/*

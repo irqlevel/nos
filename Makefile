@@ -111,7 +111,7 @@ DEPS = $(CXX_SRC:.cpp=.d)
 RUST_TARGET = x86_64-unknown-none
 RUST_LIB = src/rust/target/$(RUST_TARGET)/release/libkernel.a
 
-.PHONY: all check nocheck clean %.o rust
+.PHONY: all check nocheck clean %.o rust smoke
 
 -include $(DEPS)
 
@@ -140,6 +140,9 @@ nos.iso: build/grub.cfg kernel64.elf
 
 rust $(RUST_LIB):
 	cd src/rust && cargo build --release
+
+smoke:
+	./scripts/smoke-test.sh
 
 kernel64_pass1.elf: build/linker64.ld $(OBJS) $(RUST_LIB)
 	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(RUST_LIB)
