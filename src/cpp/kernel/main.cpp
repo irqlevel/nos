@@ -599,6 +599,8 @@ void BpStartup(void* ctx)
             }
         }
 
+        Trace(0, "boot: complete");
+
         for (;;)
         {
             cpu.Idle();

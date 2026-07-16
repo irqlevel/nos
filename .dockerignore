@@ -1,0 +1,3 @@
+# The Dockerfile never COPYs sources (the repo is bind-mounted at run time),
+# so exclude everything from the build context to keep `docker build` fast.
+*
