@@ -3,7 +3,7 @@
 #include "sched.h"
 #include "cpu.h"
 
-#include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 #include <mm/new.h>
 #include <lib/stdlib.h>
 #include <include/const.h>
@@ -94,7 +94,7 @@ void SoftIrq::Raise(ulong type)
        IPI directly -- CpuTable::SendIPI takes spinlocks which are not
        safe in hard IRQ context. */
     if (Ready.Get())
-        Lapic::SendIPI(cpu, CpuTable::IPIVector);
+        Hal::SendIpi(cpu, CpuTable::IPIVector);
 }
 
 void SoftIrq::Register(ulong type, void (*handler)(void* ctx), void* ctx)
@@ -148,7 +148,7 @@ void SoftIrq::Run(CpuState& state)
             for (ulong c = 0; c < MaxCpus; c++)
             {
                 if (c != self && CpuStates[c].Pending.TestBit(i))
-                    Lapic::SendIPI(c, CpuTable::IPIVector);
+                    Hal::SendIpi(c, CpuTable::IPIVector);
             }
         }
 

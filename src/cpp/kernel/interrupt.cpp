@@ -9,7 +9,7 @@
 
 #include <drivers/acpi.h>
 #include <arch/x86_64/ioapic.h>
-#include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 
 namespace Kernel
 {
@@ -178,7 +178,7 @@ void Interrupt::SharedDispatch(Context* ctx)
         VectorEntry& ve = Vectors[v];
         /* Only dispatch the vector that is actually in service; handlers
            of unrelated shared vectors must not see phantom interrupts */
-        if (ve.HandlerCount > 1 && Lapic::CheckIsr((u8)v))
+        if (ve.HandlerCount > 1 && Hal::IrqIsInService((u8)v))
         {
             for (u8 i = 0; i < ve.HandlerCount; i++)
             {
@@ -189,7 +189,7 @@ void Interrupt::SharedDispatch(Context* ctx)
         }
     }
 
-    Lapic::EOI();
+    Hal::IrqEoi();
 }
 
 }

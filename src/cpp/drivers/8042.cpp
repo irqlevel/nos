@@ -1,7 +1,7 @@
 #include "8042.h"
 #include <arch/x86_64/pic.h>
 #include "vga.h"
-#include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 
 #include <kernel/trace.h>
 #include <arch/x86_64/asm.h>
@@ -69,7 +69,7 @@ void IO8042::Interrupt(Context* ctx)
 
     InterruptCounter.Inc();
     ReadData();
-    Lapic::EOI(IntVector);
+    Hal::IrqEoi(IntVector);
 }
 
 

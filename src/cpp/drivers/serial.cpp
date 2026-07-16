@@ -1,6 +1,6 @@
 #include "serial.h"
 #include <arch/x86_64/pic.h>
-#include <arch/x86_64/lapic.h>
+#include <hal/irqchip.h>
 
 #include <arch/x86_64/asm.h>
 #include <arch/x86_64/idt.h>
@@ -247,7 +247,7 @@ void Serial::Interrupt(Context* ctx)
 
     Send();
 
-    Lapic::EOI(IntVector);
+    Hal::IrqEoi(IntVector);
 }
 
 extern "C" void SerialInterrupt(Context* ctx)

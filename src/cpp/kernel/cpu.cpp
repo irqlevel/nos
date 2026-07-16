@@ -5,9 +5,8 @@
 #include "watchdog.h"
 #include "timer.h"
 
-#include <arch/x86_64/boot64.h>
+#include <hal/irqchip.h>
 
-#include <arch/x86_64/lapic.h>
 #include <kernel/time.h>
 #include <mm/new.h>
 #include <mm/page_table.h>
@@ -174,105 +173,9 @@ bool CpuTable::SetBspIndex(ulong index)
     return true;
 }
 
-bool CpuTable::StartAll()
-{
-    ulong startupCode = (ulong)ApStart16;
-
-    Trace(0, "Starting cpus, startupCode 0x%p", startupCode);
-
-    if (startupCode & (Const::PageSize - 1))
-        return false;
-
-    if (startupCode >= 0x100000)
-        return false;
-
-    {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-        {
-            if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
-            {
-                Lapic::SendInit(index);
-            }
-        }
-    }
-
-    BusyWait(10 * Const::NanoSecsInMs); /* 10ms after INIT */
-
-    /*
-     * Intel MP spec: send two SIPIs, 200µs apart.
-     * The first SIPI can be lost on some hardware/hypervisors.
-     */
-    static const ulong SipiRetries = 2;
-    static const ulong SipiDelayUs = 200;
-
-    for (ulong sipi = 0; sipi < SipiRetries; sipi++)
-    {
-        {
-            Stdlib::AutoLock lock(Lock);
-            for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-            {
-                if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
-                {
-                    if (!(CpuArray[index].GetState() & Cpu::StateRunning))
-                        Lapic::SendStartup(index, startupCode >> Const::PageShift);
-                }
-            }
-        }
-
-        BusyWait(SipiDelayUs * Const::NanoSecsInUsec); /* 200µs */
-    }
-
-    /* Poll for APs to finish startup, up to 500ms */
-    static const ulong ApTimeoutMs = 500;
-    static const ulong ApPollIntervalMs = 10;
-
-    for (ulong waited = 0; waited < ApTimeoutMs; waited += ApPollIntervalMs)
-    {
-        BusyWait(ApPollIntervalMs * Const::NanoSecsInMs);
-
-        bool allRunning = true;
-        {
-            Stdlib::AutoLock lock(Lock);
-            for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-            {
-                if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
-                {
-                    if (!(CpuArray[index].GetState() & Cpu::StateRunning))
-                    {
-                        allRunning = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if (allRunning)
-            break;
-    }
-
-    {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-        {
-            if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
-            {
-                if (!(CpuArray[index].GetState() & Cpu::StateRunning))
-                {
-                    Trace(0, "Cpu %u still not running after %u ms", index, ApTimeoutMs);
-                    return false;
-                }
-            }
-        }
-    }
-
-    Trace(0, "Cpus started");
-
-    return true;
-}
-
 ulong CpuTable::GetCurrentCpuId()
 {
-    return Lapic::GetApicId();
+    return Hal::GetCurrentCpuHwId();
 }
 
 Cpu& CpuTable::GetCurrentCpu()
@@ -504,7 +407,7 @@ void Cpu::IPI(Context* ctx)
         TimerTable::GetInstance().ProcessTimers();
     }
 
-    Lapic::EOI(CpuTable::IPIVector);
+    Hal::IrqEoi(CpuTable::IPIVector);
 
     Schedule();
 }
@@ -598,7 +501,7 @@ void Cpu::SendIPISelf()
     if (State & Cpu::StateExited)
         return;
 
-    Lapic::SendIPI(Index, CpuTable::IPIVector);
+    Hal::SendIpi(Index, CpuTable::IPIVector);
 }
 
 void CpuTable::SendIPI(ulong index)
