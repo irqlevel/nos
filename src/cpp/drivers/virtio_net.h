@@ -10,6 +10,7 @@
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_pci.h>
+#include <drivers/virtio_mmio.h>
 
 namespace Kernel
 {
@@ -21,6 +22,7 @@ public:
     virtual ~VirtioNet();
 
     bool Init(Pci::DeviceInfo* pciDev, const char* name);
+    bool InitMmio(ulong base, ulong size, u32 intId, const char* name);
 
     /* NetDevice interface */
     virtual const char* GetName() override;
@@ -50,6 +52,7 @@ public:
 
     /* Discover and initialize all virtio-net devices. */
     static void InitAll();
+    static void InitAllMmio(const VirtioMmioSlot* slots, ulong count);
 
 private:
     VirtioNet(const VirtioNet& other) = delete;
@@ -112,7 +115,10 @@ private:
     static void RxFrameRelease(NetFrame* frame, void* ctx);
 
     VirtioPci PciTransport;
+    VirtioMmio MmioTransport;
     VirtioTransport* Transport;
+
+    bool InitCommon(const char* name, u8 irq, u8 vector);
     volatile void* RxNotifyAddr;
     volatile void* TxNotifyAddr;
     VirtQueue HwRxQueue;

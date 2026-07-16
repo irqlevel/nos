@@ -58,25 +58,46 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
 {
     auto& pci = Pci::GetInstance();
 
-    ulong nameLen = Stdlib::StrLen(name);
-    if (nameLen >= sizeof(DevName))
-        nameLen = sizeof(DevName) - 1;
-    Stdlib::MemCpy(DevName, name, nameLen);
-    DevName[nameLen] = '\0';
-
     /* Enable PCI bus mastering */
     pci.EnableBusMastering(pciDev->Bus, pciDev->Slot, pciDev->Func);
 
     /* Probe modern virtio-pci capabilities and map MMIO BARs */
     if (!PciTransport.Probe(pciDev))
     {
-        Trace(0, "VirtioNet %s: Transport->Probe failed", name);
+        Trace(0, "VirtioNet %s: transport probe failed", name);
         return false;
     }
+    Transport = &PciTransport;
 
     Trace(0, "VirtioNet %s: %s virtio-pci probed, irq %u",
         name, Transport->IsLegacy() ? "legacy" : "modern",
         (ulong)pciDev->InterruptLine);
+
+    return InitCommon(name, pciDev->InterruptLine, (u8)(0x30 + InstanceCount));
+}
+
+bool VirtioNet::InitMmio(ulong base, ulong size, u32 intId, const char* name)
+{
+    if (!MmioTransport.Probe(base, size))
+    {
+        Trace(0, "VirtioNet %s: mmio probe failed", name);
+        return false;
+    }
+    Transport = &MmioTransport;
+
+    Trace(0, "VirtioNet %s: virtio-mmio probed at 0x%p, intid %u",
+        name, base, (ulong)intId);
+
+    return InitCommon(name, (u8)intId, (u8)intId);
+}
+
+bool VirtioNet::InitCommon(const char* name, u8 irq, u8 vector)
+{
+    ulong nameLen = Stdlib::StrLen(name);
+    if (nameLen >= sizeof(DevName))
+        nameLen = sizeof(DevName) - 1;
+    Stdlib::MemCpy(DevName, name, nameLen);
+    DevName[nameLen] = '\0';
 
     /* Reset device */
     Transport->Reset();
@@ -257,8 +278,6 @@ bool VirtioNet::Init(Pci::DeviceInfo* pciDev, const char* name)
 
     if (!Transport->UsingMsix())
     {
-        u8 irq = pciDev->InterruptLine;
-        u8 vector = 0x30 + (u8)InstanceCount;
         Interrupt::RegisterLevel(*this, irq, vector);
     }
 
@@ -805,6 +824,33 @@ void VirtioNet::InitAll()
 
     /* The TypeNetRx/TypeNetTx softirq handlers are registered by
        NetDeviceTable and dispatch to every registered device. */
+    Trace(0, "VirtioNet: initialized %u devices", InstanceCount);
+}
+
+void VirtioNet::InitAllMmio(const VirtioMmioSlot* slots, ulong count)
+{
+    InstanceCount = 0;
+
+    for (ulong i = 0; i < MaxInstances; i++)
+        new (&Instances[i]) VirtioNet();
+
+    for (ulong i = 0; i < count && InstanceCount < MaxInstances; i++)
+    {
+        if (slots[i].DeviceId != 1 /* virtio-net */)
+            continue;
+
+        char name[8];
+        name[0] = 'e';
+        name[1] = 't';
+        name[2] = 'h';
+        name[3] = (char)('0' + InstanceCount);
+        name[4] = '\0';
+
+        VirtioNet& inst = Instances[InstanceCount];
+        if (inst.InitMmio(slots[i].Base, slots[i].Size, slots[i].IntId, name))
+            InstanceCount++;
+    }
+
     Trace(0, "VirtioNet: initialized %u devices", InstanceCount);
 }
 

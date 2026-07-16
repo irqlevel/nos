@@ -54,6 +54,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/drivers/pci.cpp \
     src/cpp/drivers/msix.cpp \
     src/cpp/drivers/virtqueue.cpp \
+    src/cpp/drivers/virtio_mmio.cpp \
     src/cpp/drivers/virtio_pci.cpp \
     src/cpp/drivers/virtio_blk.cpp \
     src/cpp/drivers/virtio_scsi.cpp \
@@ -146,6 +147,7 @@ CXX_SRC_aarch64 = \
     src/cpp/arch/arm64/interrupt_arm64.cpp \
     src/cpp/arch/arm64/generic_timer.cpp \
     src/cpp/arch/arm64/pci_stub.cpp \
+    src/cpp/arch/arm64/x86_driver_stubs.cpp \
     src/cpp/kernel/icxxabi.cpp \
     src/cpp/kernel/trace.cpp \
     src/cpp/kernel/dmesg.cpp \
@@ -189,6 +191,11 @@ CXX_SRC_aarch64 = \
     src/cpp/fs/nanofs.cpp \
     src/cpp/fs/ext2.cpp \
     src/cpp/fs/procfs.cpp \
+    src/cpp/drivers/virtqueue.cpp \
+    src/cpp/drivers/virtio_mmio.cpp \
+    src/cpp/drivers/virtio_blk.cpp \
+    src/cpp/drivers/virtio_net.cpp \
+    src/cpp/drivers/virtio_rng.cpp \
     src/cpp/lib/stdlib.cpp \
     src/cpp/lib/format.cpp \
     src/cpp/lib/error.cpp \

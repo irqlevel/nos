@@ -30,25 +30,47 @@ bool VirtioRng::Init(Pci::DeviceInfo* pciDev, const char* name)
 {
     auto& pci = Pci::GetInstance();
 
-    ulong nameLen = Stdlib::StrLen(name);
-    if (nameLen >= sizeof(DevName))
-        nameLen = sizeof(DevName) - 1;
-    Stdlib::MemCpy(DevName, name, nameLen);
-    DevName[nameLen] = '\0';
-
     /* Enable PCI bus mastering */
     pci.EnableBusMastering(pciDev->Bus, pciDev->Slot, pciDev->Func);
 
     /* Probe modern virtio-pci capabilities and map MMIO BARs */
     if (!PciTransport.Probe(pciDev))
     {
-        Trace(0, "VirtioRng %s: Transport->Probe failed", name);
+        Trace(0, "VirtioRng %s: transport probe failed", name);
         return false;
     }
+    Transport = &PciTransport;
 
     Trace(0, "VirtioRng %s: %s virtio-pci probed, irq %u",
         name, Transport->IsLegacy() ? "legacy" : "modern",
         (ulong)pciDev->InterruptLine);
+
+    return InitCommon(name);
+}
+
+bool VirtioRng::InitMmio(ulong base, ulong size, u32 intId, const char* name)
+{
+    (void)intId; /* virtio-rng is polled */
+
+    if (!MmioTransport.Probe(base, size))
+    {
+        Trace(0, "VirtioRng %s: mmio probe failed", name);
+        return false;
+    }
+    Transport = &MmioTransport;
+
+    Trace(0, "VirtioRng %s: virtio-mmio probed at 0x%p", name, base);
+
+    return InitCommon(name);
+}
+
+bool VirtioRng::InitCommon(const char* name)
+{
+    ulong nameLen = Stdlib::StrLen(name);
+    if (nameLen >= sizeof(DevName))
+        nameLen = sizeof(DevName) - 1;
+    Stdlib::MemCpy(DevName, name, nameLen);
+    DevName[nameLen] = '\0';
 
     /* Reset device */
     Transport->Reset();
@@ -252,6 +274,35 @@ void VirtioRng::InitAll()
 
         VirtioRng& inst = Instances[InstanceCount];
         if (inst.Init(dev, name))
+        {
+            EntropySourceTable::GetInstance().Register(&inst);
+            InstanceCount++;
+        }
+    }
+
+    Trace(0, "VirtioRng: initialized %u devices", InstanceCount);
+}
+
+void VirtioRng::InitAllMmio(const VirtioMmioSlot* slots, ulong count)
+{
+    InstanceCount = 0;
+    for (ulong i = 0; i < MaxInstances; i++)
+        new (&Instances[i]) VirtioRng();
+
+    for (ulong i = 0; i < count && InstanceCount < MaxInstances; i++)
+    {
+        if (slots[i].DeviceId != 4 /* virtio-rng */)
+            continue;
+
+        char name[8];
+        name[0] = 'r';
+        name[1] = 'n';
+        name[2] = 'g';
+        name[3] = (char)('0' + InstanceCount);
+        name[4] = '\0';
+
+        VirtioRng& inst = Instances[InstanceCount];
+        if (inst.InitMmio(slots[i].Base, slots[i].Size, slots[i].IntId, name))
         {
             EntropySourceTable::GetInstance().Register(&inst);
             InstanceCount++;

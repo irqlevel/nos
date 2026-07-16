@@ -8,6 +8,7 @@
 #include <kernel/raw_spin_lock.h>
 #include <kernel/atomic.h>
 #include <hal/context.h>
+#include <drivers/virtio_mmio.h>
 #include <lib/list_entry.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
@@ -23,6 +24,7 @@ public:
     virtual ~VirtioBlk();
 
     bool Init(Pci::DeviceInfo* pciDev, const char* name);
+    bool InitMmio(ulong base, ulong size, u32 intId, const char* name);
 
     /* BlockDevice interface */
     virtual const char* GetName() override;
@@ -50,6 +52,7 @@ public:
 
     /* Discover and initialize all virtio-blk devices. */
     static void InitAll();
+    static void InitAllMmio(const VirtioMmioSlot* slots, ulong count);
 
 private:
     VirtioBlk(const VirtioBlk& other) = delete;
@@ -91,7 +94,10 @@ private:
     void FreeSlot(int idx);
 
     VirtioPci PciTransport;
+    VirtioMmio MmioTransport;
     VirtioTransport* Transport;
+
+    bool InitCommon(const char* name, u8 irq, u8 vector);
     volatile void* QueueNotifyAddr;
     VirtQueue Queue;
     RawSpinLock VirtQueueLock; /* Protects Queue (AddBufs/GetUsed share free chain) */
