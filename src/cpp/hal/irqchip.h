@@ -8,6 +8,8 @@
 // the second irqchip exists.
 #if defined(__x86_64__)
 #include <arch/x86_64/hal_irqchip_inline.h>
+#elif defined(__aarch64__)
+#include <arch/arm64/hal_irqchip_inline.h>
 #else
 #error "unsupported architecture"
 #endif
