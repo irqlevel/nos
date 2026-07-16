@@ -2,7 +2,7 @@
 #include <drivers/acpi.h>
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
+#include "asm.h"
 #include <mm/mmio.h>
 
 namespace Kernel

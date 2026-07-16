@@ -1,6 +1,6 @@
 #include "icxxabi.h"
 #include "panic.h"
-#include "asm.h"
+#include <hal/cpu.h>
 #include "preempt.h"
 
 #ifdef __cplusplus
@@ -14,7 +14,7 @@ extern "C" {
 int __cxa_guard_acquire (__guard *g) 
 {
     Kernel::PreemptDisable();
-    bool iflag = Kernel::IsInterruptEnabled();
+    bool iflag = Hal::IsInterruptEnabled();
     if (iflag)
         InterruptDisable();
 

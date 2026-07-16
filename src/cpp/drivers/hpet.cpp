@@ -5,7 +5,9 @@
 #include <kernel/trace.h>
 #include <kernel/cpu.h>
 #include <kernel/interrupt.h>
-#include <kernel/asm.h>
+#include <hal/cpu.h>
+#include <hal/context.h>
+#include <hal/irq_stubs.h>
 #include <mm/page_table.h>
 #include <include/const.h>
 

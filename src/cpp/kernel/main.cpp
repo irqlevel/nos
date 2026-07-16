@@ -6,7 +6,7 @@
 #include <arch/x86_64/idt.h>
 #include "test.h"
 #include <arch/x86_64/exception.h>
-#include "asm.h"
+#include <arch/x86_64/asm.h>
 #include "cpu.h"
 #include "cmd.h"
 #include "interrupt.h"
@@ -162,7 +162,7 @@ void ApStartup(void *ctx)
 
     TraceCpuState(cpu.GetIndex());
 
-    BugOn(IsInterruptEnabled());
+    BugOn(Hal::IsInterruptEnabled());
     InterruptEnable();
 
     cpu.SetRunning();
@@ -500,9 +500,9 @@ void BpStartup(void* ctx)
 
         Trace(0, "Idt saved");
 
-        Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
+        Trace(0, "Interrupts enabled %u", (ulong)Hal::IsInterruptEnabled());
 
-        BugOn(IsInterruptEnabled());
+        BugOn(Hal::IsInterruptEnabled());
 
         Trace(0, "Before interrupt enable");
 
@@ -510,7 +510,7 @@ void BpStartup(void* ctx)
 
         BlockDevice::SetInterruptsStarted();
 
-        Trace(0, "Interrupts enabled %u", (ulong)IsInterruptEnabled());
+        Trace(0, "Interrupts enabled %u", (ulong)Hal::IsInterruptEnabled());
 
         /*
          * TSC calibration uses PIT channel 2 with busy-polling (~150ms).

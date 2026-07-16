@@ -48,7 +48,7 @@ void Cpu::Idle()
     if (BugOn(!(State & StateRunning)))
         return;
 
-    if (BugOn(!IsInterruptEnabled()))
+    if (BugOn(!Hal::IsInterruptEnabled()))
         return;
 
     /* Free tasks that exited on this CPU (deferred out of the IRQs-off switch

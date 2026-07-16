@@ -3,7 +3,10 @@
 #include <arch/x86_64/ioapic.h>
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
+#include <hal/cpu.h>
+#include <hal/context.h>
+#include <hal/irq_stubs.h>
+#include <hal/barrier.h>
 #include <kernel/panic.h>
 #include <kernel/interrupt.h>
 #include <arch/x86_64/idt.h>

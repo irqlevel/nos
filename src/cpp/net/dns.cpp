@@ -4,7 +4,7 @@
 #include <kernel/trace.h>
 #include <kernel/sched.h>
 #include <kernel/time.h>
-#include <kernel/asm.h>
+#include <hal/cpu.h>
 #include <lib/stdlib.h>
 #include <include/const.h>
 
@@ -43,7 +43,7 @@ bool DnsResolver::Init(NetDevice* dev, Net::IpAddress dnsServerIp)
     /* Seed the transaction ID from the TSC so it is not predictably 1,2,3...
        which (together with the source check in RxCallback) raises the bar for
        off-path answer forgery. */
-    NextId = (u16)(ReadTsc() | 1);
+    NextId = (u16)(Hal::ReadCycleCounter() | 1);
 
     if (!Dev->RegisterUdpListener(ClientPort, RxCallback, this))
     {

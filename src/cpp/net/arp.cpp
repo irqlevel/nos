@@ -2,7 +2,6 @@
 #include "net.h"
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
 #include <kernel/sched.h>
 #include <kernel/time.h>
 #include <lib/stdlib.h>

@@ -1,6 +1,6 @@
 #include "pic.h"
 
-#include <kernel/asm.h>
+#include "asm.h"
 
 namespace Kernel
 {

@@ -6,7 +6,7 @@
 #include <net/net_frame.h>
 #include <net/net.h>
 #include <kernel/atomic.h>
-#include <kernel/asm.h>
+#include <hal/context.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_pci.h>

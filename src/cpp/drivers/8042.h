@@ -5,7 +5,7 @@
 #include <kernel/timer.h>
 #include <kernel/spin_lock.h>
 #include <kernel/interrupt.h>
-#include <kernel/asm.h>
+#include <hal/context.h>
 #include <kernel/atomic.h>
 #include <lib/ring_buffer.h>
 

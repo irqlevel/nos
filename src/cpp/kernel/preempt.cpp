@@ -1,7 +1,7 @@
 #include "preempt.h"
 #include "task.h"
 #include "panic.h"
-#include "asm.h"
+#include <hal/cpu.h>
 #include "debug.h"
 #include "atomic.h"
 
@@ -68,17 +68,16 @@ ulong PreemptIrqSave()
     bool preemptOn = PreemptIsOn();
     if (preemptOn)
         PreemptDisable();
-    ulong flags = GetRflags();
+    ulong flags = Hal::IrqSave();
     if (preemptOn)
         flags |= PreemptWasOnBit;
-    InterruptDisable();
     return flags;
 }
 
 void PreemptIrqRestore(ulong flags)
 {
     bool preemptWasOn = (flags & PreemptWasOnBit) != 0;
-    SetRflags(flags & ~PreemptWasOnBit);
+    Hal::IrqRestore(flags & ~PreemptWasOnBit);
     if (preemptWasOn)
         PreemptEnable();
 }

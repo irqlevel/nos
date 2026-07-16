@@ -1,7 +1,7 @@
 #include "ioapic.h"
 #include <drivers/acpi.h>
 
-#include <kernel/asm.h>
+#include "asm.h"
 #include <kernel/trace.h>
 #include <mm/mmio.h>
 #include <lib/lock.h>

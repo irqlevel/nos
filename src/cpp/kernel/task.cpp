@@ -1,6 +1,7 @@
 #include "task.h"
 #include "trace.h"
-#include "asm.h"
+#include <hal/cpu.h>
+#include <hal/context.h>
 #include "sched.h"
 #include "cpu.h"
 #include "sched.h"
@@ -104,7 +105,7 @@ void Task::ExecCallback()
     {
         DiagnoseGetCurrentTask();
         Trace(0, "ExecCallback: this 0x%p GetCurrentTask 0x%p rsp 0x%p",
-            (ulong)this, (ulong)curr, GetRsp());
+            (ulong)this, (ulong)curr, Hal::GetSp());
         BugOn(true);
     }
     StartTime = GetBootTime();
@@ -180,7 +181,7 @@ bool Task::Run(class TaskQueue& taskQueue, Func func, void* ctx)
     if (!PrepareStart(func, ctx))
         return false;
 
-    SetRsp((ulong)&StackPtr->StackTop[0]);
+    Hal::SetSp((ulong)&StackPtr->StackTop[0]);
 
     StartTime = GetBootTime();
     RunStartTime = GetBootTime();
@@ -205,7 +206,7 @@ Task* Task::GetCurrentTask()
        before the new stack is fully set up, or on a non-task stack).
        NOTE: no Trace() calls here — Trace takes a lock which calls
        PreemptDisable -> GetCurrentTask, causing infinite recursion. */
-    ulong rsp = GetRsp();
+    ulong rsp = Hal::GetSp();
     struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
     if (BugOn(stackPtr->Magic1 != StackMagic1))
         return nullptr;
@@ -232,7 +233,7 @@ Task* Task::TryGetCurrentTask()
      * Same as GetCurrentTask but without BugOn — returns nullptr
      * on any invalid state. Safe to call from panic context.
      */
-    ulong rsp = GetRsp();
+    ulong rsp = Hal::GetSp();
     struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
     if (stackPtr->Magic1 != StackMagic1 || stackPtr->Magic2 != StackMagic2)
         return nullptr;
@@ -254,7 +255,7 @@ void Task::DiagnoseGetCurrentTask()
 {
     /* Safe to call from contexts where Trace is allowed (e.g. Schedule).
        Re-checks the same conditions as GetCurrentTask but logs the failure. */
-    ulong rsp = GetRsp();
+    ulong rsp = Hal::GetSp();
     struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
 
     Trace(0, "DiagTask: rsp 0x%p base 0x%p", rsp, (ulong)stackPtr);

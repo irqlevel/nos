@@ -1,7 +1,7 @@
 #include "rtc.h"
 #include "acpi.h"
 
-#include <kernel/asm.h>
+#include <arch/x86_64/asm.h>
 #include <kernel/trace.h>
 
 namespace Kernel

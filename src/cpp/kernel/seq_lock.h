@@ -1,7 +1,7 @@
 #pragma once
 
 #include "atomic.h"
-#include "asm.h"
+#include <hal/barrier.h>
 
 namespace Kernel
 {

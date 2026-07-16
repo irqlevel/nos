@@ -3,7 +3,9 @@
 #include "cpu.h"
 #include "irq_balance.h"
 #include "trace.h"
-#include "asm.h"
+#include <hal/cpu.h>
+#include <hal/context.h>
+#include <hal/irq_stubs.h>
 
 #include <drivers/acpi.h>
 #include <arch/x86_64/ioapic.h>

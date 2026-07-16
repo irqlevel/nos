@@ -1,5 +1,5 @@
 #include "raw_rw_spin_lock.h"
-#include "asm.h"
+#include <hal/cpu.h>
 #include "preempt.h"
 
 namespace Kernel

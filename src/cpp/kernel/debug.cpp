@@ -1,5 +1,5 @@
 #include "debug.h"
-#include "asm.h"
+#include <hal/cpu.h>
 
 namespace Kernel
 {

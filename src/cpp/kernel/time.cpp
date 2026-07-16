@@ -1,7 +1,7 @@
 #include "time.h"
 #include <arch/x86_64/tsc.h>
 #include "trace.h"
-#include "asm.h"
+#include <hal/cpu.h>
 
 #include <drivers/pit.h>
 #include <drivers/hpet.h>

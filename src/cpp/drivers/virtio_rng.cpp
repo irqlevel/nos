@@ -1,7 +1,7 @@
 #include "virtio_rng.h"
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
+#include <hal/cpu.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>
 #include <include/const.h>

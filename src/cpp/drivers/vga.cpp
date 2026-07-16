@@ -1,5 +1,5 @@
 #include "vga.h"
-#include <kernel/asm.h>
+#include <arch/x86_64/asm.h>
 #include <kernel/watchdog.h>
 #include <kernel/trace.h>
 #include <lib/stdlib.h>

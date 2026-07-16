@@ -1,7 +1,7 @@
 #include "pci.h"
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
+#include <arch/x86_64/asm.h>
 #include <kernel/raw_spin_lock.h>
 
 Pci::Pci()

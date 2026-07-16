@@ -3,7 +3,7 @@
 #include <include/types.h>
 #include <kernel/entropy.h>
 #include <kernel/spin_lock.h>
-#include <kernel/asm.h>
+#include <hal/cpu.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_pci.h>
