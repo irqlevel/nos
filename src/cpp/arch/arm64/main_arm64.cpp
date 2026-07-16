@@ -41,6 +41,35 @@ bool InstallEarlyDeviceBlock(ulong realRoot); /* arch/arm64/builtin_pt.cpp */
 
 void SetupVectors(); /* arch/arm64/exception_arm64.cpp */
 
+/* AP idle-task body (the x86 twin: ApStartup in kernel/main.cpp) */
+static void ApStartupArm(void* ctx)
+{
+    (void)ctx;
+
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+
+    Trace(0, "Cpu %u running task 0x%p", cpu.GetIndex(),
+        Task::GetCurrentTask());
+
+    BugOn(Hal::IsInterruptEnabled());
+    InterruptEnable();
+
+    cpu.SetRunning();
+
+    PreemptOnWait();
+
+    if (!Test::TestMultiTasking())
+    {
+        Panic("Multitasking test failed");
+        return;
+    }
+
+    for (;;)
+    {
+        cpu.Idle();
+    }
+}
+
 /* The BpStartup twin (kernel/main.cpp): runs as the BSP idle task */
 static void BpStartupArm(void* ctx)
 {
@@ -63,8 +92,23 @@ static void BpStartupArm(void* ctx)
 
     InterruptEnable();
 
+    auto& cpus = CpuTable::GetInstance();
+    if (!cpus.StartAll())
+    {
+        Panic("Can't start all cpus");
+        return;
+    }
+
     PreemptOn();
     Trace(0, "Preempt is now on");
+
+    /* IPI round-trip test (mirrors kernel/main.cpp BpStartup) */
+    ulong cpuMask = cpus.GetRunningCpus();
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if ((cpuMask & (1UL << i)) && i != cpu.GetIndex())
+            cpus.SendIPI(i);
+    }
 
     if (!Test::TestMultiTasking())
     {
@@ -109,6 +153,26 @@ static void BpStartupArm(void* ctx)
         }
     }
 }
+}
+
+/* PSCI CPU_ON lands here (via boot.S SecondaryEntry) on the AP boot stack */
+extern "C" void ApMainArm64(ulong index)
+{
+    using namespace Kernel;
+
+    SetupVectors();
+
+    if (!Gic::GetInstance().CpuInit())
+        Panic("Can't init gic on cpu %u", index);
+
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    BugOn(cpu.GetIndex() != index);
+
+    if (!cpu.Run(ApStartupArm, nullptr))
+    {
+        Trace(0, "Can't run cpu %u task", cpu.GetIndex());
+        return;
+    }
 }
 
 extern "C" void MainArm64(void* dtb)
@@ -216,8 +280,11 @@ extern "C" void MainArm64(void* dtb)
         Panic("Can't setup gic");
 
     auto& cpus = CpuTable::GetInstance();
-    if (!cpus.InsertCpu(Hal::GetCurrentCpuHwId()))
-        Panic("Can't insert cpu");
+    for (ulong i = 0; i < board.CpuCount && i < MaxCpus; i++)
+    {
+        if (!cpus.InsertCpu(i))
+            Panic("Can't insert cpu");
+    }
 
     auto& cpu = cpus.GetCurrentCpu();
     if (!cpus.SetBspIndex(cpu.GetIndex()))

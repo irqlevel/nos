@@ -1,11 +1,13 @@
 #include "pl011.h"
 
 #include <kernel/trace.h>
+#include <hal/cpu.h>
 
 namespace Kernel
 {
 
 ulong Pl011::Base;
+RawSpinLock Pl011::OutLock;
 
 namespace
 {
@@ -42,7 +44,7 @@ void Pl011::PutChar(char c)
     MmioWrite32(Base + Dr, (u32)(u8)c);
 }
 
-void Pl011::PrintString(const char* s)
+void Pl011::PanicPrintString(const char* s)
 {
     while (*s != '\0')
     {
@@ -51,6 +53,15 @@ void Pl011::PrintString(const char* s)
         PutChar(*s);
         s++;
     }
+}
+
+void Pl011::PrintString(const char* s)
+{
+    ulong flags = Hal::IrqSave();
+    OutLock.Lock();
+    PanicPrintString(s);
+    OutLock.Unlock();
+    Hal::IrqRestore(flags);
 }
 
 bool Pl011::Setup(u32 intId)

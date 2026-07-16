@@ -75,7 +75,7 @@ void ConsoleWrite(const char *msg)
 
 void ConsolePanicWrite(const char *msg)
 {
-    Kernel::Pl011::PrintString(msg);
+    Kernel::Pl011::PanicPrintString(msg);
 }
 
 void PowerOff()
