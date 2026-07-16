@@ -9,7 +9,7 @@
 #include "symtab.h"
 #include "task.h"
 
-#include <drivers/acpi.h>
+#include <hal/irqchip.h>
 #include <hal/console.h>
 
 namespace Kernel
@@ -38,7 +38,7 @@ void Panicker::DumpContext()
     char buf[128];
 
     /* CPU ID — safe if LAPIC is mapped */
-    if (Acpi::GetInstance().GetLapicAddress() != nullptr)
+    if (Hal::IrqChipReady())
     {
         ulong cpuId = CpuTable::GetInstance().GetCurrentCpuId();
         Stdlib::SnPrintf(buf, sizeof(buf), "CPU: %u\n", cpuId);
@@ -93,7 +93,7 @@ void Panicker::DoPanic(const char *fmt, ...)
         size_t count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
         DumpBacktrace(frames, count);
 
-        if (Acpi::GetInstance().GetLapicAddress() != nullptr)
+        if (Hal::IrqChipReady())
         {
             Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
             CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
@@ -123,10 +123,10 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
 
         /* Walk backtrace from the faulting code's RBP */
         ulong frames[16];
-        size_t count = StackTrace::CaptureFrom(ctx->Rbp, frames, Stdlib::ArraySize(frames));
+        size_t count = StackTrace::CaptureFrom(ctx->GetFramePointer(), frames, Stdlib::ArraySize(frames));
         DumpBacktrace(frames, count);
 
-        if (Acpi::GetInstance().GetLapicAddress() != nullptr)
+        if (Hal::IrqChipReady())
         {
             Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
             CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());

@@ -49,6 +49,11 @@ struct Context final
         return *((ulong *)Rsp);
     }
 
+    ulong GetFramePointer()
+    {
+        return Rbp;
+    }
+
     ulong GetOrigRsp(bool hasErrorCode = false)
     {
         if (hasErrorCode)

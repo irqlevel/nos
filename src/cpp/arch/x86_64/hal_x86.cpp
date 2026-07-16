@@ -1,8 +1,12 @@
 #include <hal/console.h>
 #include <hal/power.h>
 #include <hal/cpu.h>
+#include <hal/mmu.h>
 
 #include <arch/x86_64/asm.h>
+
+#include <arch/x86_64/context.h>
+#include <lib/stdlib.h>
 
 #include <kernel/trace.h>
 #include <kernel/parameters.h>
@@ -12,6 +16,24 @@
 
 namespace Hal
 {
+
+ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes)
+{
+    (void)physAddr;
+    (void)sizeBytes;
+    return 0;
+}
+
+ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
+{
+    ulong* rsp = (ulong *)stackTop;
+    *(--rsp) = entry; /* return address SwitchContext's ret pops */
+    Kernel::Context* regs = (Kernel::Context*)((ulong)rsp - sizeof(*regs));
+    Stdlib::MemSet(regs, 0, sizeof(*regs));
+    regs->Rdi = arg;         /* 1st argument for the entry function */
+    regs->Rflags = (1 << 9); /* IF */
+    return (ulong)regs;
+}
 
 void ConsoleWrite(const char *msg)
 {

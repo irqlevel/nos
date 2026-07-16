@@ -51,10 +51,20 @@ static inline void Pause(ulong count)
         Pause();
 }
 
+namespace Hal
+{
+/* Fabricate the initial stack frame that SwitchContext pops for a
+   brand-new task; returns the initial stack pointer. Defined per arch
+   (x86: arch/x86_64/hal_x86.cpp, arm64: arch/arm64/cpu_arm64.cpp). */
+ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg);
+}
+
 // Provides namespace Hal { IsInterruptEnabled, IrqSave, IrqRestore,
 // GetSp, SetSp, GetFp, ReadCycleCounter }.
 #if defined(__x86_64__)
 #include <arch/x86_64/hal_cpu_inline.h>
+#elif defined(__aarch64__)
+#include <arch/arm64/hal_cpu_inline.h>
 #else
 #error "unsupported architecture"
 #endif

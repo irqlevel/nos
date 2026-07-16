@@ -158,13 +158,8 @@ bool Task::Start(Func func, void* ctx)
     if (!PrepareStart(func, ctx))
         return false;
 
-    ulong* rsp = (ulong *)&StackPtr->StackTop[0];
-    *(--rsp) = (ulong)&Task::Exec;//setup return address
-    Context* regs = (Context*)((ulong)rsp - sizeof(*regs));
-    Stdlib::MemSet(regs, 0, sizeof(*regs));
-    regs->Rdi = (ulong)this; //setup 1arg for Task::Exec
-    regs->Rflags = (1 << 9); //setup IF
-    Rsp = (ulong)regs;
+    Rsp = Hal::BuildTaskFrame((ulong)&StackPtr->StackTop[0],
+        (ulong)&Task::Exec, (ulong)this);
 
     StartTime = GetBootTime();
     State.Set(StateWaiting);

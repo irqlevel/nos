@@ -28,6 +28,14 @@ static inline __attribute__((always_inline)) void SmpMb() { __asm__ __volatile__
 static inline __attribute__((always_inline)) void DmaWmb() { CompilerBarrier(); }
 static inline __attribute__((always_inline)) void DmaRmb() { CompilerBarrier(); }
 
+#elif defined(__aarch64__)
+
+static inline __attribute__((always_inline)) void SmpWmb() { __asm__ __volatile__("dmb ishst" : : : "memory"); }
+static inline __attribute__((always_inline)) void SmpRmb() { __asm__ __volatile__("dmb ishld" : : : "memory"); }
+static inline __attribute__((always_inline)) void SmpMb() { __asm__ __volatile__("dmb ish" : : : "memory"); }
+static inline __attribute__((always_inline)) void DmaWmb() { __asm__ __volatile__("dmb oshst" : : : "memory"); }
+static inline __attribute__((always_inline)) void DmaRmb() { __asm__ __volatile__("dmb oshld" : : : "memory"); }
+
 #else
 #error "unsupported architecture"
 #endif

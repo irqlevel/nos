@@ -2,12 +2,19 @@
 
 #include <include/types.h>
 #include <arch/x86_64/lapic.h>
+#include <drivers/acpi.h>
 
 // x86_64 bodies for the Hal:: irqchip wrappers (see hal/irqchip.h).
 // "hwId" is the LAPIC id, which this kernel keeps equal to the cpu index.
 
 namespace Hal
 {
+
+/* True once the LAPIC MMIO is discovered: cpu-id reads and IPIs are safe */
+static inline __attribute__((always_inline)) bool IrqChipReady()
+{
+    return Kernel::Acpi::GetInstance().GetLapicAddress() != nullptr;
+}
 
 static inline __attribute__((always_inline)) void IrqEoi()
 {

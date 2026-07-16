@@ -41,6 +41,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/grub.cpp    \
     src/cpp/arch/x86_64/cpu_start.cpp \
     src/cpp/arch/x86_64/hal_x86.cpp \
+    src/cpp/arch/x86_64/builtin_pt.cpp \
     src/cpp/drivers/serial.cpp  \
     src/cpp/arch/x86_64/pic.cpp \
     src/cpp/drivers/pit.cpp \
@@ -61,6 +62,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/drivers/rtc.cpp \
     src/cpp/kernel/icxxabi.cpp    \
     src/cpp/kernel/interrupt.cpp   \
+    src/cpp/kernel/interrupt_stats.cpp \
     src/cpp/kernel/task.cpp \
     src/cpp/kernel/test.cpp \
     src/cpp/kernel/main.cpp \
@@ -130,10 +132,54 @@ CXX_SRC_x86_64 =   \
 
 CXX_SRC_aarch64 = \
     src/cpp/arch/arm64/main_arm64.cpp \
+    src/cpp/arch/arm64/fdt.cpp \
+    src/cpp/arch/arm64/board.cpp \
     src/cpp/arch/arm64/pl011.cpp \
     src/cpp/arch/arm64/stdlib_c.cpp \
+    src/cpp/arch/arm64/cpu_arm64.cpp \
+    src/cpp/arch/arm64/cpu_start_arm64.cpp \
+    src/cpp/arch/arm64/hal_arm64.cpp \
+    src/cpp/arch/arm64/time_arm64.cpp \
+    src/cpp/arch/arm64/builtin_pt.cpp \
+    src/cpp/kernel/icxxabi.cpp \
+    src/cpp/kernel/trace.cpp \
+    src/cpp/kernel/dmesg.cpp \
+    src/cpp/kernel/panic.cpp \
+    src/cpp/kernel/debug.cpp \
+    src/cpp/kernel/stack_trace.cpp \
+    src/cpp/kernel/symtab.cpp \
+    src/cpp/kernel/atomic.cpp \
+    src/cpp/kernel/spin_lock.cpp \
+    src/cpp/kernel/raw_spin_lock.cpp \
+    src/cpp/kernel/raw_rw_spin_lock.cpp \
+    src/cpp/kernel/preempt.cpp \
+    src/cpp/kernel/parameters.cpp \
+    src/cpp/kernel/watchdog.cpp \
+    src/cpp/kernel/task.cpp \
+    src/cpp/kernel/sched.cpp \
+    src/cpp/kernel/cpu.cpp \
+    src/cpp/kernel/timer.cpp \
+    src/cpp/kernel/mutex.cpp \
+    src/cpp/kernel/wait_group.cpp \
+    src/cpp/kernel/object_table.cpp \
+    src/cpp/kernel/softirq.cpp \
+    src/cpp/kernel/interrupt_stats.cpp \
+    src/cpp/block/block_device.cpp \
+    src/cpp/kernel/test.cpp \
     src/cpp/lib/stdlib.cpp \
     src/cpp/lib/format.cpp \
+    src/cpp/lib/error.cpp \
+    src/cpp/lib/bitmap.cpp \
+    src/cpp/lib/checksum.cpp \
+    src/cpp/lib/list_entry.cpp \
+    src/cpp/mm/memory_map.cpp \
+    src/cpp/mm/new.cpp \
+    src/cpp/mm/allocator.cpp \
+    src/cpp/mm/page_allocator.cpp \
+    src/cpp/mm/va_allocator.cpp \
+    src/cpp/mm/pool.cpp \
+    src/cpp/mm/page_table.cpp \
+    src/cpp/mm/block_allocator.cpp \
 
 CXX_SRC = $(CXX_SRC_$(ARCH))
 
@@ -148,7 +194,8 @@ ASM_SRC = $(ASM_SRC_$(ARCH))
 # GNU-as sources assembled by clang (arm64 only)
 ASM_S_SRC_x86_64 =
 ASM_S_SRC_aarch64 = \
-    src/cpp/arch/arm64/boot.S
+    src/cpp/arch/arm64/boot.S \
+    src/cpp/arch/arm64/asm.S
 ASM_S_SRC = $(ASM_S_SRC_$(ARCH))
 
 OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC)) $(patsubst src/cpp/%.S,$(OUT)/%.o,$(ASM_S_SRC))

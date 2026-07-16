@@ -8,7 +8,8 @@ if [ "$(uname -sm)" = "Darwin arm64" ] && [ -z "$NOS_TCG" ]; then
     ACCEL_OPTS="-accel hvf -cpu host"
 fi
 
-qemu-system-aarch64 \
+# exec so this script's PID is qemu's PID (kill-able by callers)
+exec qemu-system-aarch64 \
     -M virt,gic-version=3 \
     -smp 2 \
     -m 1024 \
