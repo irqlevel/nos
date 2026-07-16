@@ -101,6 +101,21 @@ and that implementation is the expensive part:
 - **Exceptions:** IDT/vectors → AArch64 exception vectors and exception levels.
 - **Serial:** 8250 → **PL011**.
 
+## Decision record (Phase A, implemented)
+
+- **NASM stays on x86.** The three x86 `.asm` files are untouched and moved
+  under `src/cpp/arch/x86_64/`; the HAL contract is defined at the
+  link-symbol level (portable extern "C" names each arch's asm provides),
+  not by rewriting x86 asm into a Rust `hal-arch` crate. All arm64 assembly
+  is written new (GNU as `.S` compiled by clang). Revisit NASM removal as a
+  separate stage if desired.
+- Phase A (HAL split of existing x86) landed as steps S0-S11 on the
+  `arm64-hal` branch: smoke test, `ARCH=` build with `out/$(ARCH)/`
+  objects, `src/cpp/hal/*` headers (cpu, semantic barriers, mmu/pte,
+  irqchip, console, power, context, irq stubs), `VirtioTransport`
+  interface, Rust `target_arch` gates + Release fences on nvme/r8168 DMA
+  paths. x86 stayed boot-green (smoke) after every step.
+
 ## Work items
 
 Split into the reusable, low-regret refactor (A) and the large implementation (B).
