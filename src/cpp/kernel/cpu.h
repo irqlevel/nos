@@ -6,7 +6,8 @@
 #include "wait_group.h"
 #include "task.h"
 #include "sched.h"
-#include "asm.h"
+#include <hal/cpu.h>
+#include <hal/context.h>
 
 namespace Kernel
 {

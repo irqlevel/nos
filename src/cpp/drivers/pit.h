@@ -4,7 +4,8 @@
 #include <kernel/atomic.h>
 #include <kernel/seq_lock.h>
 #include <kernel/interrupt.h>
-#include <kernel/asm.h>
+#include <hal/context.h>
+#include <hal/irq_stubs.h>
 #include <lib/stdlib.h>
 
 namespace Kernel

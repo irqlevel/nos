@@ -2,7 +2,7 @@
 #include "mmio.h"
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
+#include <arch/x86_64/asm.h>
 #include <mm/page_table.h>
 
 namespace Kernel

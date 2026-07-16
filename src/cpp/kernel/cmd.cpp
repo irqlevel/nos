@@ -1,6 +1,6 @@
 #include "cmd.h"
 #include "trace.h"
-#include "asm.h"
+#include <arch/x86_64/asm.h>
 #include "dmesg.h"
 #include "cpu.h"
 #include "interrupt.h"

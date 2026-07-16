@@ -4,7 +4,7 @@
 #include <arch/x86_64/lapic.h>
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
+#include <arch/x86_64/asm.h>
 #include <kernel/interrupt.h>
 #include <mm/memory_map.h>
 

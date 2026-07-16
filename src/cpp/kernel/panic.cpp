@@ -1,6 +1,7 @@
 #include "panic.h"
 #include "preempt.h"
-#include "asm.h"
+#include <hal/cpu.h>
+#include <hal/context.h>
 #include "cpu.h"
 #include "parameters.h"
 #include "trace.h"

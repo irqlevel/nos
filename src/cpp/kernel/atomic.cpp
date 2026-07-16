@@ -1,5 +1,5 @@
 #include "atomic.h"
-#include "asm.h"
+#include <hal/cpu.h>
 
 #include <kernel/panic.h>
 

@@ -1,6 +1,6 @@
 #include "spin_lock.h"
 #include "task.h"
-#include "asm.h"
+#include <hal/cpu.h>
 #include "preempt.h"
 #include "time.h"
 #include "watchdog.h"

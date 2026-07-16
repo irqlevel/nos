@@ -1,5 +1,5 @@
 #include "stack_trace.h"
-#include "asm.h"
+#include <hal/cpu.h>
 #include "trace.h"
 #include "task.h"
 
@@ -60,11 +60,11 @@ namespace Kernel
 
     size_t StackTrace::Capture(ulong stackBase, ulong stackLimit, ulong *frames, size_t maxFrames)
     {
-        return CaptureFrom(GetRbp(), stackBase, stackLimit, frames, maxFrames);
+        return CaptureFrom(Hal::GetFp(), stackBase, stackLimit, frames, maxFrames);
     }
 
     size_t StackTrace::Capture(ulong *frames, size_t maxFrames)
     {
-        return DetectBoundsAndCapture(GetRbp(), frames, maxFrames);
+        return DetectBoundsAndCapture(Hal::GetFp(), frames, maxFrames);
     }
 }

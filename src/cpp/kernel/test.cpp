@@ -4,7 +4,7 @@
 #include "sched.h"
 #include "cpu.h"
 #include "stack_trace.h"
-#include "asm.h"
+#include <hal/cpu.h>
 #include <block/block_device.h>
 
 #include <lib/btree.h>
@@ -321,7 +321,7 @@ Stdlib::Error TestStackTrace()
         return MakeError(Stdlib::Error::Unsuccessful);
 
     /* Explicit bounds with correct task stack range */
-    ulong rsp = GetRsp();
+    ulong rsp = Hal::GetSp();
     ulong base = rsp & (~(Task::StackSize - 1));
     Task::Stack* stackPtr = reinterpret_cast<Task::Stack*>(base);
     if (stackPtr->Magic1 == Task::StackMagic1 &&

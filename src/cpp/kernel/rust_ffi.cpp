@@ -13,7 +13,9 @@
 #include "entropy.h"
 #include <arch/x86_64/idt.h>
 #include "interrupt.h"
-#include "asm.h"
+#include <hal/cpu.h>
+#include <hal/context.h>
+#include <hal/irq_stubs.h>
 #include "softirq.h"
 #include "timer.h"
 #include <mm/new.h>

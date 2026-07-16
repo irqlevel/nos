@@ -2,7 +2,7 @@
 #include "memory_map.h"
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
+#include <arch/x86_64/asm.h>
 #include <kernel/debug.h>
 #include <kernel/preempt.h>
 

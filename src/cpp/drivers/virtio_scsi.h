@@ -7,7 +7,7 @@
 #include <kernel/spin_lock.h>
 #include <kernel/raw_spin_lock.h>
 #include <kernel/atomic.h>
-#include <kernel/asm.h>
+#include <hal/context.h>
 #include <lib/list_entry.h>
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>

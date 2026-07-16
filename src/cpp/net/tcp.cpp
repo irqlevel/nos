@@ -2,7 +2,7 @@
 #include <kernel/trace.h>
 #include <kernel/sched.h>
 #include <kernel/softirq.h>
-#include <kernel/asm.h>
+#include <hal/cpu.h>
 #include <kernel/time.h>
 #include <net/arp.h>
 #include <lib/stdlib.h>
@@ -806,7 +806,7 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
             newConn->State = TcpStateSynReceived;
             newConn->Irs = Ntohl(tcp->SeqNum);
             newConn->RcvNxt = newConn->Irs + 1;
-            newConn->Iss = (u32)(ReadTsc() & 0xFFFFFFFF);
+            newConn->Iss = (u32)(Hal::ReadCycleCounter() & 0xFFFFFFFF);
             newConn->SndNxt = newConn->Iss;
             newConn->SndUna = newConn->Iss;
             newConn->SndWnd = Ntohs(tcp->Window);
@@ -949,7 +949,7 @@ TcpConn* Tcp::Connect(NetDevice* dev, IpAddress dstIp, u16 dstPort, u16 srcPort)
     conn->RemoteIp = dstIp;
     conn->RemotePort = dstPort;
     conn->ResolvedMac = dstMac;
-    conn->Iss = (u32)(ReadTsc() & 0xFFFFFFFF);
+    conn->Iss = (u32)(Hal::ReadCycleCounter() & 0xFFFFFFFF);
     conn->SndNxt = conn->Iss;
     conn->SndUna = conn->Iss;
     conn->State = TcpStateSynSent;

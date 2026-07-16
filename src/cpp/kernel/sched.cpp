@@ -3,7 +3,7 @@
 #include "trace.h"
 #include "preempt.h"
 #include "time.h"
-#include "asm.h"
+#include <hal/cpu.h>
 #include "debug.h"
 #include "cpu.h"
 
@@ -133,8 +133,7 @@ void TaskQueue::Schedule(Task* curr)
 {
     ScheduleCounter.Inc();
 
-    ulong flags = GetRflags();
-    InterruptDisable();
+    ulong flags = Hal::IrqSave();
     Lock.Lock();
 
     Task* next = nullptr;
@@ -186,14 +185,14 @@ void TaskQueue::Schedule(Task* curr)
         curr->UpdateRuntime();
         curr->Lock.Unlock();
         Lock.Unlock();
-        SetRflags(flags);
+        Hal::IrqRestore(flags);
         curr->PreemptDisableCounter.Dec();
         BugOn(curr->State.Get() == Task::StateExited);
         return;
     }
 
     Switch(next, curr);
-    SetRflags(flags);
+    Hal::IrqRestore(flags);
 }
 
 void TaskQueue::Insert(Task* task)

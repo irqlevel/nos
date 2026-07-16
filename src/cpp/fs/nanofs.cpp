@@ -6,7 +6,7 @@
 #include <mm/new.h>
 #include <kernel/trace.h>
 #include <kernel/time.h>
-#include <kernel/asm.h>
+#include <hal/cpu.h>
 
 namespace Kernel
 {
@@ -145,7 +145,7 @@ bool NanoFs::Format(BlockDevice* dev)
     super->DataStartBlock = NanoDataStart;
 
     // Generate UUID from TSC + uptime
-    u64 tsc = ReadTsc();
+    u64 tsc = Hal::ReadCycleCounter();
     u64 uptime = GetBootTime().GetValue();
     u8 seed[16];
     Stdlib::MemCpy(&seed[0], &tsc, 8);

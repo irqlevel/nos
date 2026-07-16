@@ -2,7 +2,7 @@
 #include "mmio.h"
 
 #include <kernel/trace.h>
-#include <kernel/asm.h>
+#include <hal/barrier.h>
 #include <mm/new.h>
 
 namespace Kernel
