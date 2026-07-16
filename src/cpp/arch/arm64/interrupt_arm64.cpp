@@ -86,14 +86,20 @@ void Interrupt::SharedDispatch(Context* ctx)
 
 extern "C" void ArmIrqEntry(Context* ctx)
 {
+    bool handled = false;
+
     for (;;)
     {
         u32 intId = Gic::ReadIar();
         if (intId >= Gic::SpuriousIntId)
         {
-            InterruptStats::Inc(IrqSpurious);
+            /* An empty first read is a real spurious interrupt; an empty
+               re-read is just the dispatch loop draining */
+            if (!handled)
+                InterruptStats::Inc(IrqSpurious);
             return;
         }
+        handled = true;
 
         if (intId == CpuTable::IPIVector)
         {

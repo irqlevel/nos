@@ -2,6 +2,7 @@
 
 #include <include/types.h>
 #include <kernel/interrupt.h>
+#include <kernel/raw_spin_lock.h>
 #include <drivers/serial.h> /* SerialObserver interface */
 
 namespace Kernel
@@ -22,7 +23,12 @@ public:
 
     static void EarlyInit(ulong virtBase);
     static void PutChar(char c);
+
+    /* Serialized against concurrent CPUs; IRQs off while held */
     static void PrintString(const char* s);
+
+    /* Panic path: no locks (the panicking CPU may hold them) */
+    static void PanicPrintString(const char* s);
 
     /* Enable the RX interrupt (INTID from the DTB) */
     bool Setup(u32 intId);
@@ -42,6 +48,7 @@ private:
     Pl011& operator=(Pl011&& other) = delete;
 
     static ulong Base;
+    static RawSpinLock OutLock;
 
     static const ulong MaxObservers = 4;
     SerialObserver* Observers[MaxObservers] = {};

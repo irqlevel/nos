@@ -161,6 +161,68 @@ high_entry:
 3:  wfi
     b       3b
 
+    /* PSCI CPU_ON secondary entry: x0 = cpu index (context id). MMU off
+       at the physical address; the BSP filled Arm64ApTtbr1 with the real
+       kernel table root and Arm64ApStackTop[index] with virtual stack
+       tops before the CPU_ON call. TTBR0 reuses the boot identity table
+       for the switch, exactly like the BSP path. */
+    .globl SecondaryEntry
+SecondaryEntry:
+    mov     x27, x0                 /* cpu index */
+
+    mrs     x1, CurrentEL
+    lsr     x1, x1, #2
+    cmp     x1, #2
+    b.ne    ap_el1
+    mov     x2, #(1 << 31)
+    msr     hcr_el2, x2
+    mrs     x2, cnthctl_el2
+    orr     x2, x2, #3
+    msr     cnthctl_el2, x2
+    msr     cntvoff_el2, xzr
+    ldr     x2, =SCTLR_EL1_RES1
+    msr     sctlr_el1, x2
+    adr     x2, ap_el1
+    msr     elr_el2, x2
+    mov     x2, #SPSR_EL1H_DAIF
+    msr     spsr_el2, x2
+    eret
+ap_el1:
+    ldr     x1, =MAIR_VALUE
+    msr     mair_el1, x1
+    ldr     x1, =TCR_VALUE
+    msr     tcr_el1, x1
+
+    adrp    x1, BootPgTblIdL0
+    msr     ttbr0_el1, x1
+    adrp    x1, Arm64ApTtbr1
+    add     x1, x1, :lo12:Arm64ApTtbr1
+    ldr     x1, [x1]
+    msr     ttbr1_el1, x1
+
+    dsb     ish
+    isb
+
+    mrs     x1, sctlr_el1
+    ldr     x2, =(SCTLR_M | SCTLR_C | SCTLR_I)
+    orr     x1, x1, x2
+    msr     sctlr_el1, x1
+    isb
+
+    ldr     x1, =ap_high_entry
+    br      x1
+
+ap_high_entry:
+    msr     daifset, #0xf
+    adrp    x1, Arm64ApStackTop
+    add     x1, x1, :lo12:Arm64ApStackTop
+    ldr     x1, [x1, x27, lsl #3]
+    mov     sp, x1
+    mov     x0, x27
+    bl      ApMainArm64
+4:  wfi
+    b       4b
+
     /* Bootstrap page tables and boot stack (BSS, page-aligned) */
     .section .bss
     .align 12
@@ -177,3 +239,9 @@ BootPgTblIdL1:
 BootStack:
     .space 16384
 BootStackTop:
+    .globl Arm64ApTtbr1
+Arm64ApTtbr1:
+    .space 8
+    .globl Arm64ApStackTop
+Arm64ApStackTop:
+    .space (8 * 8)
