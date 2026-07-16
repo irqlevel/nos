@@ -2,7 +2,7 @@
 #include "memory_map.h"
 
 #include <kernel/trace.h>
-#include <arch/x86_64/asm.h>
+#include <hal/mmu.h>
 #include <kernel/debug.h>
 #include <kernel/preempt.h>
 
@@ -73,7 +73,7 @@ bool BuiltinPageTable::Setup()
             p2Entry.SetWritable();
             p2Entry.SetHuge();
             p2Entry.SetPresent();
-            Invlpg(PhysToVirt(addr));
+            Hal::TlbFlushPage(PhysToVirt(addr));
 
             addr += (2 * Const::MB);
         }
@@ -96,7 +96,7 @@ bool BuiltinPageTable::Setup()
         p3Entry.SetAddress(VirtToPhys((ulong)&p2Page));
         p3Entry.SetWritable();
         p3Entry.SetPresent();
-        Invlpg((ulong)&p2Page);
+        Hal::TlbFlushPage((ulong)&p2Page);
 
         for (size_t j = 0; j < 512; j++)
         {
@@ -106,14 +106,14 @@ bool BuiltinPageTable::Setup()
             p2Entry.SetWritable();
             p2Entry.SetHuge();
             p2Entry.SetPresent();
-            Invlpg(PhysToVirt(addr));
+            Hal::TlbFlushPage(PhysToVirt(addr));
 
             addr += (2 * Const::MB);
         }
     }
 
     P2UserPage[0].Entry[0].Value = 0;
-    Invlpg(0);
+    Hal::TlbFlushPage(0);
 
     return true;
 }
@@ -248,9 +248,9 @@ ulong PageTable::GetL1Page(ulong virtAddr)
     BugOn(virtAddr & (Const::PageSize - 1));
     BugOn(!virtAddr);
 
-    ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
-    ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
-    ulong l2Index = (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
+    ulong l4Index = Pte::L4Index(virtAddr);
+    ulong l3Index = Pte::L3Index(virtAddr);
+    ulong l2Index = Pte::L2Index(virtAddr);
 
     if (!Root)
         return 0;
@@ -290,10 +290,10 @@ ulong PageTable::VirtToPhysLocked(ulong virtAddr)
     if (!Root)
         return 0;
 
-    ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
-    ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
-    ulong l2Index = (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
-    ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+    ulong l4Index = Pte::L4Index(virtAddr);
+    ulong l3Index = Pte::L3Index(virtAddr);
+    ulong l2Index = Pte::L2Index(virtAddr);
+    ulong l1Index = Pte::L1Index(virtAddr);
     ulong offset  = virtAddr & (Const::PageSize - 1);
 
     PtePage* l4Page = (PtePage*)TmpMapPage(Root);
@@ -321,9 +321,9 @@ ulong PageTable::VirtToPhysLocked(ulong virtAddr)
         return 0;
 
     /* 2MB huge page at L2 level */
-    if (l2Entry.Value & (1UL << Pte::HugeBit))
+    if (l2Entry.Huge())
     {
-        ulong hugeOffset = virtAddr & ((1UL << 21) - 1);
+        ulong hugeOffset = Pte::HugeOffset(virtAddr);
         return l2Entry.Address() + hugeOffset;
     }
 
@@ -343,10 +343,10 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
     BugOn(virtAddr & (Const::PageSize - 1));
     BugOn(phyAddr & (Const::PageSize - 1));
 
-    ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
-    ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
-    ulong l2Index = (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
-    ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+    ulong l4Index = Pte::L4Index(virtAddr);
+    ulong l3Index = Pte::L3Index(virtAddr);
+    ulong l2Index = Pte::L2Index(virtAddr);
+    ulong l1Index = Pte::L1Index(virtAddr);
 
     if (Root == 0)
     {
@@ -409,7 +409,7 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
     } else {
         l1Entry->Clear();
     }
-    Invlpg(virtAddr);
+    Hal::TlbFlushPage(virtAddr);
     return true;
 }
 
@@ -674,7 +674,7 @@ ulong PageTable::TmpMapPage(ulong phyAddr)
     {
         if (!TmpMapPageArray[i]) {
             ulong virtAddr = TmpMapStart + i * Const::PageSize;
-            ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+            ulong l1Index = Pte::L1Index(virtAddr);
             Pte *l1Entry = &TmpMapL1Page->Entry[l1Index];
             if (l1Entry->Present())
                 return 0;
@@ -686,7 +686,7 @@ ulong PageTable::TmpMapPage(ulong phyAddr)
                 l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
             l1Entry->SetPresent();
-            Invlpg(virtAddr);
+            Hal::TlbFlushPage(virtAddr);
 
             if (havePage) {
                 Page* page = GetPage(phyAddr);
@@ -715,12 +715,12 @@ ulong PageTable::TmpUnmapPage(ulong virtAddr)
     Page* page = TmpMapPageArray[i];
     BugOn(!page);
 
-    ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+    ulong l1Index = Pte::L1Index(virtAddr);
     Pte *l1Entry = &TmpMapL1Page->Entry[l1Index];
     BugOn(!l1Entry->Present());
     auto phyAddr = l1Entry->Address();
     l1Entry->Clear();
-    Invlpg(virtAddr);
+    Hal::TlbFlushPage(virtAddr);
     TmpMapPageArray[i] = nullptr;
     if (page != TmpMapDirectSentinel) {
         BugOn(page->GetPhyAddress() != phyAddr);
@@ -746,18 +746,18 @@ ulong PageTable::GetRoot()
 
 void PageTable::InvalidateLocalTlb()
 {
-    SetCr3(GetCr3());
+    Hal::TlbFlushAll();
 }
 
 void PageTable::InvalidateLocalTlbAddress(ulong virtAddr)
 {
-    Invlpg(virtAddr);
+    Hal::TlbFlushPage(virtAddr);
 }
 
 void PageTable::InvalidateLocalTlbRange(ulong virtAddr, ulong count)
 {
     for (ulong i = 0; i < count; i++)
-        Invlpg(virtAddr + i * Const::PageSize);
+        Hal::TlbFlushPage(virtAddr + i * Const::PageSize);
 }
 
 ulong PageTable::TmpMapAddress(ulong phyAddr)
@@ -800,7 +800,7 @@ ulong PageTable::TmpMapRange(ulong phyAddr, size_t len)
         {
             ulong thisPhyPage = phyBase + j * Const::PageSize;
             ulong virtAddr = TmpMapStart + (i + j) * Const::PageSize;
-            ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+            ulong l1Index = Pte::L1Index(virtAddr);
             Pte *l1Entry = &TmpMapL1Page->Entry[l1Index];
             if (l1Entry->Present())
                 return 0;
@@ -810,7 +810,7 @@ ulong PageTable::TmpMapRange(ulong phyAddr, size_t len)
                 l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
             l1Entry->SetPresent();
-            Invlpg(virtAddr);
+            Hal::TlbFlushPage(virtAddr);
 
             bool havePage = (thisPhyPage / Const::PageSize) < PageArrayCount;
             if (havePage) {
@@ -834,10 +834,10 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
     BugOn(virtAddr & (Const::PageSize - 1));
     BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
 
-    ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
-    ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
-    ulong l2Index = (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
-    ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+    ulong l4Index = Pte::L4Index(virtAddr);
+    ulong l3Index = Pte::L3Index(virtAddr);
+    ulong l2Index = Pte::L2Index(virtAddr);
+    ulong l1Index = Pte::L1Index(virtAddr);
 
     if (Root == 0)
     {
@@ -917,7 +917,7 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
         l1Entry->Clear();
     }
     TmpUnmapPage((ulong)l1Page);
-    Invlpg(virtAddr);
+    Hal::TlbFlushPage(virtAddr);
 
     return true;
 }
@@ -938,10 +938,10 @@ ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
 
         Stdlib::AutoLock lock(Lock);
 
-        ulong l4Index = (va >> (12 + 3 * 9)) & ((1 << 9) - 1);
-        ulong l3Index = (va >> (12 + 2 * 9)) & ((1 << 9) - 1);
-        ulong l2Index = (va >> (12 + 1 * 9)) & ((1 << 9) - 1);
-        ulong l1Index = (va >> (12 + 0 * 9)) & ((1 << 9) - 1);
+        ulong l4Index = Pte::L4Index(va);
+        ulong l3Index = Pte::L3Index(va);
+        ulong l2Index = Pte::L2Index(va);
+        ulong l1Index = Pte::L1Index(va);
 
         if (Root == 0)
             return 0;
@@ -1002,7 +1002,7 @@ ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
             l1Entry->SetPresent();
         }
         TmpUnmapPage((ulong)l1Page);
-        Invlpg(va);
+        Hal::TlbFlushPage(va);
     }
 
     return physAddr + MemoryMap::KernelSpaceBase;
@@ -1015,10 +1015,10 @@ Page* PageTable::UnmapPage(ulong virtAddr)
     BugOn(virtAddr & (Const::PageSize - 1));
     BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
 
-    ulong l4Index = (virtAddr >> (12 + 3 * 9)) & ((1 << 9) - 1);
-    ulong l3Index = (virtAddr >> (12 + 2 * 9)) & ((1 << 9) - 1);
-    ulong l2Index = (virtAddr >> (12 + 1 * 9)) & ((1 << 9) - 1);
-    ulong l1Index = (virtAddr >> (12 + 0 * 9)) & ((1 << 9) - 1);
+    ulong l4Index = Pte::L4Index(virtAddr);
+    ulong l3Index = Pte::L3Index(virtAddr);
+    ulong l2Index = Pte::L2Index(virtAddr);
+    ulong l1Index = Pte::L1Index(virtAddr);
 
     if (Root == 0)
     {
@@ -1078,7 +1078,7 @@ Page* PageTable::UnmapPage(ulong virtAddr)
     l1Entry->Clear();
     TmpUnmapPage((ulong)l1Page);
     BugOn(!phyAddr);
-    Invlpg(virtAddr);
+    Hal::TlbFlushPage(virtAddr);
     Page* page = GetPage(phyAddr);
     page->Put();
     return page;
