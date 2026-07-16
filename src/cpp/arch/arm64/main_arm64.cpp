@@ -1,5 +1,7 @@
 #include "pl011.h"
 #include "board.h"
+#include "gicv3.h"
+#include "generic_timer.h"
 
 #include <lib/stdlib.h>
 #include <mm/memory_map.h>
@@ -13,6 +15,10 @@
 #include <kernel/parameters.h>
 #include <kernel/time.h>
 #include <kernel/test.h>
+#include <kernel/cpu.h>
+#include <kernel/preempt.h>
+#include <kernel/cmd.h>
+#include <hal/power.h>
 
 /* arm64 boot orchestrator, the Main2 twin (kernel/main.cpp). Milestone M2:
    full memory management + boot self-tests on one CPU; the interrupt/
@@ -32,11 +38,84 @@ namespace Mm
 {
 bool InstallEarlyDeviceBlock(ulong realRoot); /* arch/arm64/builtin_pt.cpp */
 }
+
+void SetupVectors(); /* arch/arm64/exception_arm64.cpp */
+
+/* The BpStartup twin (kernel/main.cpp): runs as the BSP idle task */
+static void BpStartupArm(void* ctx)
+{
+    (void)ctx;
+
+    auto& board = Board::GetInstance();
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+
+    if (!GenericTimer::GetInstance().Setup())
+    {
+        Panic("Can't setup timer");
+        return;
+    }
+
+    if (!Pl011::GetInstance().Setup(board.Pl011IntId))
+    {
+        Panic("Can't setup uart irq");
+        return;
+    }
+
+    InterruptEnable();
+
+    PreemptOn();
+    Trace(0, "Preempt is now on");
+
+    if (!Test::TestMultiTasking())
+    {
+        Panic("Multitasking test failed");
+        return;
+    }
+
+    Trace(0, "After test");
+
+    auto& cmd = Cmd::GetInstance();
+    if (!Pl011::GetInstance().RegisterObserver(cmd))
+    {
+        Panic("Can't register cmd in uart");
+        return;
+    }
+
+    if (!cmd.Start())
+    {
+        Panic("Can't start cmd");
+        return;
+    }
+
+    Trace(0, "boot: complete");
+
+    for (;;)
+    {
+        cpu.Idle();
+        if (cmd.ShouldShutdown() || cmd.ShouldReboot())
+        {
+            /* Graceful task/fs teardown mirrors main.cpp later; for now
+               go straight to PSCI */
+            if (cmd.ShouldReboot())
+            {
+                Trace(0, "Reboot requested");
+                Hal::Reset();
+            }
+            else
+            {
+                Trace(0, "Shutdown requested");
+                Hal::PowerOff();
+            }
+        }
+    }
+}
 }
 
 extern "C" void MainArm64(void* dtb)
 {
     using namespace Kernel;
+
+    SetupVectors();
 
     auto& board = Board::GetInstance();
     board.Setup(dtb);
@@ -130,9 +209,24 @@ extern "C" void MainArm64(void* dtb)
         Panic("Self test failed");
     }
 
-    Trace(0, "After test");
+    Trace(0, "Self test passed");
 
-    Trace(0, "boot: m2 complete");
+    auto& gic = Gic::GetInstance();
+    if (!gic.Setup(board.GicdBase, board.GicrBase, board.GicrSize))
+        Panic("Can't setup gic");
+
+    auto& cpus = CpuTable::GetInstance();
+    if (!cpus.InsertCpu(Hal::GetCurrentCpuHwId()))
+        Panic("Can't insert cpu");
+
+    auto& cpu = cpus.GetCurrentCpu();
+    if (!cpus.SetBspIndex(cpu.GetIndex()))
+        Panic("Can't set boot processor index");
+
+    Trace(0, "Before cpu run");
+
+    if (!cpu.Run(BpStartupArm, nullptr))
+        Panic("Can't run cpu task");
 
     for (;;)
     {

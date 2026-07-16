@@ -141,6 +141,11 @@ CXX_SRC_aarch64 = \
     src/cpp/arch/arm64/hal_arm64.cpp \
     src/cpp/arch/arm64/time_arm64.cpp \
     src/cpp/arch/arm64/builtin_pt.cpp \
+    src/cpp/arch/arm64/gicv3.cpp \
+    src/cpp/arch/arm64/exception_arm64.cpp \
+    src/cpp/arch/arm64/interrupt_arm64.cpp \
+    src/cpp/arch/arm64/generic_timer.cpp \
+    src/cpp/arch/arm64/pci_stub.cpp \
     src/cpp/kernel/icxxabi.cpp \
     src/cpp/kernel/trace.cpp \
     src/cpp/kernel/dmesg.cpp \
@@ -165,7 +170,25 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/softirq.cpp \
     src/cpp/kernel/interrupt_stats.cpp \
     src/cpp/block/block_device.cpp \
+    src/cpp/block/partition.cpp \
     src/cpp/kernel/test.cpp \
+    src/cpp/kernel/cmd.cpp \
+    src/cpp/kernel/entropy.cpp \
+    src/cpp/net/net_device.cpp \
+    src/cpp/net/net_frame.cpp \
+    src/cpp/net/arp.cpp \
+    src/cpp/net/dhcp.cpp \
+    src/cpp/net/icmp.cpp \
+    src/cpp/net/udp_shell.cpp \
+    src/cpp/net/dns.cpp \
+    src/cpp/net/tcp.cpp \
+    src/cpp/net/http.cpp \
+    src/cpp/fs/vfs.cpp \
+    src/cpp/fs/ramfs.cpp \
+    src/cpp/fs/block_io.cpp \
+    src/cpp/fs/nanofs.cpp \
+    src/cpp/fs/ext2.cpp \
+    src/cpp/fs/procfs.cpp \
     src/cpp/lib/stdlib.cpp \
     src/cpp/lib/format.cpp \
     src/cpp/lib/error.cpp \
@@ -195,7 +218,8 @@ ASM_SRC = $(ASM_SRC_$(ARCH))
 ASM_S_SRC_x86_64 =
 ASM_S_SRC_aarch64 = \
     src/cpp/arch/arm64/boot.S \
-    src/cpp/arch/arm64/asm.S
+    src/cpp/arch/arm64/asm.S \
+    src/cpp/arch/arm64/vectors.S
 ASM_S_SRC = $(ASM_S_SRC_$(ARCH))
 
 OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC)) $(patsubst src/cpp/%.S,$(OUT)/%.o,$(ASM_S_SRC))

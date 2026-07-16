@@ -1,14 +1,16 @@
 #pragma once
 
 #include <include/types.h>
+#include <arch/arm64/gicv3.h>
 
 // arm64 bodies for the Hal:: irqchip wrappers (see hal/irqchip.h).
 // "hwId" is MPIDR_EL1.Aff0, which QEMU virt numbers linearly 0..N-1.
-// EOI/IPI/in-service arrive with the GICv3 driver (milestone M3/M4);
-// until then they are inert, which is correct for a 1-CPU no-IRQ kernel.
 
 namespace Hal
 {
+
+/* IPI vector: IDT slot on x86, SGI INTID on arm64 */
+constexpr u8 IpiVector = 1;
 
 static inline __attribute__((always_inline)) ulong GetCurrentCpuHwId()
 {
@@ -17,19 +19,20 @@ static inline __attribute__((always_inline)) ulong GetCurrentCpuHwId()
     return mpidr & 0xFF;
 }
 
-/* Cpu-id reads (MPIDR) are always safe; IPIs become real with the GIC */
 static inline __attribute__((always_inline)) bool IrqChipReady()
 {
-    return true;
+    return true; /* cpu-id reads (MPIDR) never need the GIC */
 }
 
+/* No-arg EOI is x86-only (LAPIC); on arm64 the IRQ dispatch loop owns
+   the IAR/EOIR pairing (see arch/arm64/interrupt_arm64.cpp). */
 static inline __attribute__((always_inline)) void IrqEoi()
 {
 }
 
 static inline __attribute__((always_inline)) void IrqEoi(u8 vector)
 {
-    (void)vector;
+    Kernel::Gic::WriteEoir(vector);
 }
 
 static inline __attribute__((always_inline)) bool IrqIsInService(u8 vector)
@@ -40,8 +43,7 @@ static inline __attribute__((always_inline)) bool IrqIsInService(u8 vector)
 
 static inline __attribute__((always_inline)) void SendIpi(ulong hwId, u8 vector)
 {
-    (void)hwId;
-    (void)vector;
+    Kernel::Gic::GetInstance().SendSgi(hwId, vector);
 }
 
 }

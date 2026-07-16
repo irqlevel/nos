@@ -10,6 +10,9 @@
 namespace Hal
 {
 
+/* IPI vector: IDT slot on x86, SGI INTID on arm64 */
+constexpr u8 IpiVector = 0xFE;
+
 /* True once the LAPIC MMIO is discovered: cpu-id reads and IPIs are safe */
 static inline __attribute__((always_inline)) bool IrqChipReady()
 {

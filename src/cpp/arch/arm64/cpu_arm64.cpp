@@ -6,6 +6,7 @@
    -mno-outline-atomics. SwitchContext/SetJmp/LongJmp live in asm.S. */
 
 extern "C" void Arm64TaskEntryThunk();
+extern "C" void __attribute__((noreturn)) Arm64RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx);
 
 namespace Hal
 {
@@ -23,6 +24,17 @@ ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
     sp[3] = entry;                      /* x20 */
     sp[13] = (ulong)&Arm64TaskEntryThunk; /* x30 */
     return (ulong)sp;
+}
+
+ulong TaskSavedFramePointer(ulong savedSp)
+{
+    /* SwitchContext frame slot 12 = x29 (see asm.S layout comment) */
+    return ((ulong*)savedSp)[12];
+}
+
+void RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx)
+{
+    Arm64RunOnStack(stackTop, fn, ctx);
 }
 
 }

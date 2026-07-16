@@ -48,6 +48,15 @@ Arm64TaskEntryThunk:
     mov     x0, x19
     br      x20
 
+    /* void Arm64RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx) */
+    .globl Arm64RunOnStack
+Arm64RunOnStack:
+    mov     sp, x0
+    mov     x0, x2
+    blr     x1
+1:  wfi
+    b       1b
+
     /* long SetJmp(void* ctx) — ctx is Kernel::JmpContext */
     .globl SetJmp
 SetJmp:
