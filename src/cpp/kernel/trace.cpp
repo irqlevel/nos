@@ -2,8 +2,7 @@
 #include "dmesg.h"
 #include "parameters.h"
 
-#include <drivers/serial.h>
-#include <drivers/vga.h>
+#include <hal/console.h>
 
 namespace Kernel
 {
@@ -54,13 +53,7 @@ void Tracer::Output(const char *fmt, ...)
 
     if (!ConsoleSuppressed)
     {
-        Serial::GetInstance().PrintString(msg);
-        Serial::GetInstance().Flush();
-
-        if (Parameters::GetInstance().IsTraceVga() && VgaTerm::IsReady())
-        {
-            VgaTerm::GetInstance().PrintString(msg);
-        }
+        Hal::ConsoleWrite(msg);
     }
 }
 

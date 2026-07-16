@@ -39,6 +39,7 @@ MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 CXX_SRC =   \
     src/cpp/arch/x86_64/grub.cpp    \
     src/cpp/arch/x86_64/cpu_start.cpp \
+    src/cpp/arch/x86_64/hal_x86.cpp \
     src/cpp/drivers/serial.cpp  \
     src/cpp/arch/x86_64/pic.cpp \
     src/cpp/drivers/pit.cpp \
