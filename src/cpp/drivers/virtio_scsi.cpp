@@ -172,7 +172,7 @@ bool VirtioScsi::ScsiCommand(const u8 cdb[32], void* dataBuf, ulong dataLen, boo
         Stdlib::MemSet(DataBuf, 0, dataLen);
     }
 
-    Barrier();
+    Hal::DmaWmb();
 
     /* Build descriptor chain (virtio-scsi spec 5.6.6.1):
        All device-readable (out) descriptors must come before device-writable (in).
@@ -430,7 +430,7 @@ void VirtioScsi::DrainQueue()
             cdb[8] = (u8)(req->SectorCount);
         }
 
-        Barrier();
+        Hal::DmaWmb();
 
         int head = -1;
 

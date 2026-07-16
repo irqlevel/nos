@@ -20,12 +20,12 @@ public:
     void WriteBegin()
     {
         Seq.Inc();
-        Barrier();
+        Hal::SmpWmb();
     }
 
     void WriteEnd()
     {
-        Barrier();
+        Hal::SmpWmb();
         Seq.Inc();
     }
 
@@ -36,13 +36,13 @@ public:
         do {
             s = Seq.Get();
         } while (s & 1); /* spin while writer is active (odd) */
-        Barrier();
+        Hal::SmpRmb();
         return s;
     }
 
     bool ReadRetry(long start)
     {
-        Barrier();
+        Hal::SmpRmb();
         return Seq.Get() != start;
     }
 

@@ -135,16 +135,16 @@ int VirtQueue::AddBufs(BufDesc* bufs, ulong count)
     /* Add to available ring. */
     u16 availIdx = Avail->Idx;
     Avail->Ring[availIdx % QueueSize] = head;
-    Barrier();
+    Hal::DmaWmb();
     Avail->Idx = availIdx + 1;
-    Barrier();
+    Hal::DmaWmb();
 
     return (int)head;
 }
 
 void VirtQueue::Kick(volatile void* notifyAddr, u16 queueIdx)
 {
-    Barrier();
+    Hal::DmaWmb();
     MmioWrite16(notifyAddr, queueIdx);
 }
 
@@ -166,18 +166,18 @@ ulong VirtQueue::GetUsedPhys()
 void VirtQueue::DisableDeviceInterrupts()
 {
     Avail->Flags = Avail->Flags | VirtqAvail::FlagNoInterrupt;
-    Barrier();
+    Hal::DmaWmb();
 }
 
 bool VirtQueue::HasUsed()
 {
-    Barrier();
+    Hal::DmaRmb();
     return LastUsedIdx != Used->Idx;
 }
 
 bool VirtQueue::GetUsed(u32& id, u32& len)
 {
-    Barrier();
+    Hal::DmaRmb();
     if (LastUsedIdx == Used->Idx)
         return false;
 

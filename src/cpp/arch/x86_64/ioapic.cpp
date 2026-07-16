@@ -27,7 +27,7 @@ u32 IoApic::ReadRegister(u8 reg)
 
     Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegSel), reg);
 
-    Barrier();
+    Hal::DmaWmb();
 
     return Mm::MmIo::Read32(Stdlib::MemAdd(BaseAddress, RegWin));
 }
@@ -38,11 +38,11 @@ void IoApic::WriteRegister(u8 reg, u32 value)
 
     Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegSel), reg);
 
-    Barrier();
+    Hal::DmaWmb();
 
     Mm::MmIo::Write32(Stdlib::MemAdd(BaseAddress, RegWin), value);
 
-    Barrier();
+    Hal::DmaWmb();
 }
 
 void IoApic::Enable()

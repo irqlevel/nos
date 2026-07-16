@@ -392,7 +392,7 @@ volatile void* VirtioPci::GetNotifyAddr(u16 queueIdx)
 
 void VirtioPci::NotifyQueue(u16 queueIdx)
 {
-    Barrier();
+    Hal::DmaWmb();
     if (Legacy)
     {
         Outw(IoBase + LegQueueNotify, queueIdx);
