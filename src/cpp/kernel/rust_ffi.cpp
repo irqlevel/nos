@@ -999,6 +999,8 @@ static Kernel::InterruptHandlerFn RustMsixStubTable[RustMsixSlotCount] = {
     RustMsixStub31,
 };
 
+extern "C" void RustMsixDispatch(Kernel::Context* ctx, int slot);
+
 class RustMsixSlotHandler : public Kernel::InterruptHandler
 {
 public:
@@ -1013,6 +1015,14 @@ public:
     Kernel::InterruptHandlerFn GetHandlerFn() override
     {
         return RustMsixStubTable[SlotIndex];
+    }
+
+    /* Object-based dispatch path (arm64 GIC/ITS LPIs). On x86 MSI-X goes
+       through the IDT stub -> RustMsixDispatch instead, so this override is
+       unused there. */
+    void OnInterrupt(Kernel::Context* ctx) override
+    {
+        RustMsixDispatch(ctx, (int)SlotIndex);
     }
 };
 

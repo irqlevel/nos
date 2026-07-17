@@ -1,7 +1,7 @@
 #include "pci.h"
 
 #include <kernel/trace.h>
-#include <arch/x86_64/asm.h>
+#include <hal/pci.h>
 #include <kernel/raw_spin_lock.h>
 
 Pci::Pci()
@@ -284,29 +284,21 @@ const char* Pci::DeviceToStr(u16 vendor, u16 dev)
 
 namespace {
 
-/* Serializes the 0xCF8 (address) / 0xCFC (data) port pair. Config access is
-   BSP-serialized at boot, but the surface is exported to Rust drivers that run
-   post-SMP, where two CPUs could otherwise interleave their address/data writes
-   and read or write the wrong register. The RMW helpers (word/byte writes) hold
-   the lock across the whole read-modify-write. */
+/* Serializes config access. Config access is BSP-serialized at boot, but
+   the surface is exported to Rust drivers that run post-SMP, where two CPUs
+   could otherwise interleave a read-modify-write. The RMW helpers (word/byte
+   writes) hold the lock across the whole read-modify-write. The raw dword
+   accessors are the arch backend (x86: port CAM; arm64: ECAM). */
 Kernel::RawSpinLock ConfigLock;
-
-u64 ConfigAddress(u16 bus, u16 slot, u16 func, u16 offset)
-{
-    return (u64)(((u64)bus << 16) | ((u64)slot << 11) | ((u64)func << 8) |
-                 (offset & 0xfc) | ((u32)0x80000000));
-}
 
 u32 ConfigReadDwordRaw(u16 bus, u16 slot, u16 func, u16 offset)
 {
-    Out(0xCF8, ConfigAddress(bus, slot, func, offset));
-    return In(0xCFC);
+    return Hal::PciConfigRead32(bus, slot, func, offset);
 }
 
 void ConfigWriteDwordRaw(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
 {
-    Out(0xCF8, ConfigAddress(bus, slot, func, offset));
-    Out(0xCFC, value);
+    Hal::PciConfigWrite32(bus, slot, func, offset, value);
 }
 
 }
@@ -490,6 +482,9 @@ void Pci::Scan()
             }
         }
     }
+
+    /* Firmware programs BARs on x86; bare -kernel arm64 must assign them. */
+    Hal::PciAssignResources(Devices, DeviceCount, sizeof(DeviceInfo));
 }
 
 Pci::DeviceInfo* Pci::FindDevice(u16 vendor, u16 device, ulong startIndex)

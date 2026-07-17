@@ -40,6 +40,7 @@ MKRESCUE ?= $(shell which grub2-mkrescue grub-mkrescue 2> /dev/null | head -n1)
 CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/grub.cpp    \
     src/cpp/arch/x86_64/cpu_start.cpp \
+    src/cpp/arch/x86_64/pci_x86.cpp \
     src/cpp/arch/x86_64/hal_x86.cpp \
     src/cpp/arch/x86_64/builtin_pt.cpp \
     src/cpp/drivers/serial.cpp  \
@@ -146,8 +147,11 @@ CXX_SRC_aarch64 = \
     src/cpp/arch/arm64/exception_arm64.cpp \
     src/cpp/arch/arm64/interrupt_arm64.cpp \
     src/cpp/arch/arm64/generic_timer.cpp \
-    src/cpp/arch/arm64/pci_stub.cpp \
+    src/cpp/arch/arm64/pci_ecam.cpp \
+    src/cpp/arch/arm64/its.cpp \
+    src/cpp/arch/arm64/msix_its.cpp \
     src/cpp/arch/arm64/x86_driver_stubs.cpp \
+    src/cpp/drivers/pci.cpp \
     src/cpp/kernel/icxxabi.cpp \
     src/cpp/kernel/trace.cpp \
     src/cpp/kernel/dmesg.cpp \

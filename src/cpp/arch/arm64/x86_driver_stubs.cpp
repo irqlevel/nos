@@ -31,38 +31,6 @@ void __attribute__((noreturn)) StubTrap()
 
 }
 
-MsixTable::MsixTable()
-{
-}
-
-MsixTable::~MsixTable()
-{
-}
-
-bool MsixTable::Setup(Pci::DeviceInfo* dev, const ulong* mappedBars)
-{
-    (void)dev;
-    (void)mappedBars;
-    return false;
-}
-
-u8 MsixTable::EnableVector(u16 index, InterruptHandler& handler)
-{
-    (void)index;
-    (void)handler;
-    return 0;
-}
-
-void MsixTable::Mask(u16 index)
-{
-    (void)index;
-}
-
-void MsixTable::Unmask(u16 index)
-{
-    (void)index;
-}
-
 Hpet::Hpet()
 {
 }
@@ -143,70 +111,6 @@ u8   VirtioPci::EnableMsixVector(u16 index, InterruptHandler& handler)
     return 0;
 }
 
-}
-
-/* Pci methods beyond the Dump stub (see pci_stub.cpp) */
-void Pci::EnableBusMastering(u16 bus, u16 slot, u16 func)
-{
-    (void)bus;
-    (void)slot;
-    (void)func;
-}
-
-Pci::DeviceInfo* Pci::GetDevice(ulong index)
-{
-    (void)index;
-    return nullptr;
-}
-
-ulong Pci::GetDeviceCount()
-{
-    return 0;
-}
-
-u8 Pci::ReadByte(u16 bus, u16 slot, u16 func, u16 offset)
-{
-    (void)bus; (void)slot; (void)func; (void)offset;
-    return 0xFF;
-}
-
-u16 Pci::ReadWord(u16 bus, u16 slot, u16 func, u16 offset)
-{
-    (void)bus; (void)slot; (void)func; (void)offset;
-    return 0xFFFF;
-}
-
-u32 Pci::ReadDword(u16 bus, u16 slot, u16 func, u16 offset)
-{
-    (void)bus; (void)slot; (void)func; (void)offset;
-    return 0xFFFFFFFF;
-}
-
-void Pci::WriteByte(u16 bus, u16 slot, u16 func, u16 offset, u8 value)
-{
-    (void)bus; (void)slot; (void)func; (void)offset; (void)value;
-}
-
-void Pci::WriteWord(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
-{
-    (void)bus; (void)slot; (void)func; (void)offset; (void)value;
-}
-
-void Pci::WriteDword(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
-{
-    (void)bus; (void)slot; (void)func; (void)offset; (void)value;
-}
-
-u8 Pci::FindCapability(u16 bus, u16 slot, u16 func, u8 capId, u8 startOffset)
-{
-    (void)bus; (void)slot; (void)func; (void)capId; (void)startOffset;
-    return 0;
-}
-
-u32 Pci::GetBAR(u16 bus, u16 slot, u16 func, u8 bar)
-{
-    (void)bus; (void)slot; (void)func; (void)bar;
-    return 0;
 }
 
 /* x86 asm interrupt entry points (hal/irq_stubs.h); GetHandlerFn return

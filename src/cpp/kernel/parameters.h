@@ -19,6 +19,7 @@ public:
     bool IsTraceVga();
     bool IsPanicVga();
     bool IsSmpOff();
+    bool IsItsEnabled();
 
     bool IsConsoleSerial();
     bool IsConsoleVga();
@@ -56,6 +57,7 @@ private:
     bool TraceVga;
     bool PanicVga;
     bool SmpOff;
+    bool ItsEnabled;
     ConsoleMode ConMode;
     DhcpMode DhcpMd;
     u16 UdpShellPort;
