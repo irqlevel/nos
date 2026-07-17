@@ -4,6 +4,12 @@
 
 namespace Hal
 {
+/* Enable hardware support required for W^X. x86: set EFER.NXE so the NX
+   PTE bit is honored (must run before any PTE has bit 63 set, i.e. before
+   loading a CR3 whose table carries NX bits). arm64: no-op (PXN/UXN are
+   always active). Defined per arch. */
+void EnableWxSupport();
+
 /* Nonzero if the arch guarantees [physAddr, physAddr+size) is permanently
    mapped (arm64: the boot device-GiB block covering all QEMU-virt MMIO);
    MapMmioRegion returns it directly instead of building 4K mappings.

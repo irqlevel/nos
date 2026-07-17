@@ -18,6 +18,24 @@
 namespace Hal
 {
 
+void EnableWxSupport()
+{
+    /* EFER (MSR 0xC0000080) bit 11 = NXE: honor the NX bit in PTEs. */
+    static const u32 EferMsr = 0xC0000080;
+    static const u64 EferNxe = 1ULL << 11;
+    u64 efer = ReadMsr(EferMsr);
+    if (!(efer & EferNxe))
+        WriteMsr(EferMsr, efer | EferNxe);
+
+    /* CR0.WP (bit 16): without it, ring-0 writes ignore the read-only PTE
+       bit, so the kernel could still write .text. Enforce it for W^X. */
+    asm volatile(
+        "mov %%cr0, %%rax\n\t"
+        "or $0x10000, %%rax\n\t"
+        "mov %%rax, %%cr0\n\t"
+        ::: "rax", "memory");
+}
+
 ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes)
 {
     (void)physAddr;

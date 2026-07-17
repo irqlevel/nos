@@ -29,6 +29,11 @@ static inline __attribute__((always_inline)) void TlbFlushAll()
     SetCr3(GetCr3());
 }
 
+static inline __attribute__((always_inline)) bool TlbShootdownNeedsIpi()
+{
+    return true; /* invlpg/CR3 are CPU-local; remote CPUs need an IPI */
+}
+
 static inline __attribute__((always_inline)) ulong GetTranslationRoot()
 {
     return GetCr3();
