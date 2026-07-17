@@ -24,6 +24,7 @@
 #include <drivers/virtio_mmio.h>
 #include <drivers/virtio_blk.h>
 #include <drivers/virtio_net.h>
+#include <drivers/virtio_scsi.h>
 #include <drivers/virtio_rng.h>
 
 #include <net/tcp.h>
@@ -126,6 +127,7 @@ static void BpStartupArm(void* ctx)
         Trace(0, "virtio-mmio: %u devices", count);
 
         VirtioBlk::InitAllMmio(Slots, count);
+        VirtioScsi::InitAllMmio(Slots, count);
         VirtioNet::InitAllMmio(Slots, count);
         VirtioRng::InitAllMmio(Slots, count);
     }

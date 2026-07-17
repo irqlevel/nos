@@ -12,6 +12,7 @@
 #include <drivers/virtqueue.h>
 #include <drivers/pci.h>
 #include <drivers/virtio_pci.h>
+#include <drivers/virtio_mmio.h>
 
 namespace Kernel
 {
@@ -79,6 +80,7 @@ public:
 
     /* Discover and initialize all virtio-scsi devices. */
     static void InitAll();
+    static void InitAllMmio(const VirtioMmioSlot* slots, ulong count);
 
     /* Virtio-SCSI response codes */
     static const u8 ResponseOk = 0;
@@ -184,6 +186,7 @@ private:
     struct HbaState
     {
         VirtioPci PciTransport;
+        VirtioMmio MmioTransport;
         VirtioTransport* Transport;
         VirtQueue ReqQueue;
         RawSpinLock VirtQueueLock; /* Protects ReqQueue (AddBufs/GetUsed share free chain) */
@@ -211,6 +214,9 @@ private:
 
     /* Init helpers */
     static bool InitHba(Pci::DeviceInfo* pciDev, HbaState* hba);
+    static bool InitHbaMmio(ulong base, ulong size, HbaState* hba);
+    static bool InitHbaCommon(HbaState* hba);
+    static void SetupHbaDevices(HbaState* hba, u8 irq, u8 vector);
     static bool ProbeLun(HbaState* hba, u8 target, u16 lun);
     static bool SetupHbaSlots(HbaState* hba);
 

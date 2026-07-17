@@ -834,6 +834,26 @@ bool VirtioScsi::InitHba(Pci::DeviceInfo* pciDev, HbaState* hba)
         hba->Transport->IsLegacy() ? "legacy" : "modern",
         (ulong)pciDev->InterruptLine);
 
+    return InitHbaCommon(hba);
+}
+
+bool VirtioScsi::InitHbaMmio(ulong base, ulong size, HbaState* hba)
+{
+    if (!hba->MmioTransport.Probe(base, size))
+    {
+        Trace(0, "VirtioScsi: mmio probe failed");
+        return false;
+    }
+
+    hba->Transport = &hba->MmioTransport;
+
+    Trace(0, "VirtioScsi: virtio-mmio probed at 0x%p", base);
+
+    return InitHbaCommon(hba);
+}
+
+bool VirtioScsi::InitHbaCommon(HbaState* hba)
+{
     /* Reset */
     hba->Transport->Reset();
 
@@ -1070,6 +1090,43 @@ void VirtioScsi::InitAll()
         if (!InitHba(dev, hba))
             continue;
 
+        SetupHbaDevices(hba, dev->InterruptLine, (u8)(BaseVector + HbaCount));
+        HbaCount++;
+    }
+
+    Trace(0, "VirtioScsi: initialized %u devices on %u HBAs", InstanceCount, HbaCount);
+}
+
+void VirtioScsi::InitAllMmio(const VirtioMmioSlot* slots, ulong count)
+{
+    InstanceCount = 0;
+    HbaCount = 0;
+
+    for (ulong i = 0; i < MaxInstances; i++)
+        new (&Instances[i]) VirtioScsi();
+
+    for (ulong i = 0; i < MaxHbas; i++)
+        new (&Hbas[i]) HbaState();
+
+    for (ulong i = 0; i < count && HbaCount < MaxHbas; i++)
+    {
+        if (slots[i].DeviceId != 8 /* virtio-scsi */)
+            continue;
+
+        HbaState* hba = &Hbas[HbaCount];
+        if (!InitHbaMmio(slots[i].Base, slots[i].Size, hba))
+            continue;
+
+        SetupHbaDevices(hba, (u8)slots[i].IntId, (u8)slots[i].IntId);
+        HbaCount++;
+    }
+
+    Trace(0, "VirtioScsi: initialized %u devices on %u HBAs", InstanceCount, HbaCount);
+}
+
+void VirtioScsi::SetupHbaDevices(HbaState* hba, u8 irq, u8 vector)
+{
+    {
         /* Remember which instance index this HBA starts at */
         ulong firstInst = InstanceCount;
 
@@ -1123,8 +1180,6 @@ void VirtioScsi::InitAll()
 
             if (!hba->Transport->UsingMsix())
             {
-                u8 irq = dev->InterruptLine;
-                u8 vector = BaseVector + (u8)HbaCount;
                 Interrupt::RegisterLevel(Instances[firstInst], irq, vector);
             }
         }
@@ -1135,11 +1190,7 @@ void VirtioScsi::InitAll()
                interrupts are enabled (shared IRQ line with virtio-net). */
             hba->Transport->Reset();
         }
-
-        HbaCount++;
     }
-
-    Trace(0, "VirtioScsi: initialized %u devices on %u HBAs", InstanceCount, HbaCount);
 }
 
 /* Global interrupt handler called from assembly stub. */
