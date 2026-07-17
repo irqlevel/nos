@@ -1,5 +1,7 @@
 #include "gicv3.h"
 #include "its.h"
+#include "generic_timer.h"
+#include "board.h"
 
 #include <kernel/interrupt.h>
 #include <kernel/cpu.h>
@@ -117,6 +119,14 @@ extern "C" void ArmIrqEntry(Context* ctx)
         {
             Its::GetInstance().HandleLpi(intId);
             Gic::WriteEoir(intId);
+            continue;
+        }
+
+        if (intId == GenericTimer::GetInstance().IntId())
+        {
+            /* Per-CPU scheduler tick: LocalTick EOIs before it may
+               Schedule() away, so it is not part of the generic path. */
+            GenericTimer::GetInstance().LocalTick(ctx);
             continue;
         }
 
