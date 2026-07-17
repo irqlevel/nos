@@ -52,6 +52,11 @@ void PrintCpuState(Stdlib::Printer& con)
     con.Printf(" vbar 0x%p mpidr %u\n", v, Hal::GetCurrentCpuHwId());
 }
 
+void EnableWxSupport()
+{
+    /* PXN/UXN are always active on arm64 — nothing to enable. */
+}
+
 void ConsoleOut(const char *s)
 {
     Kernel::Pl011::PrintString(s);
