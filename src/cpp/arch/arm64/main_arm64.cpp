@@ -129,6 +129,10 @@ static void ApStartupArm(void* ctx)
         Task::GetCurrentTask());
 
     BugOn(Hal::IsInterruptEnabled());
+
+    /* Arm this CPU's own generic timer (per-CPU tick) before enabling IRQs */
+    GenericTimer::GetInstance().ArmSelf();
+
     InterruptEnable();
 
     cpu.SetRunning();
