@@ -27,6 +27,9 @@
 #include <drivers/virtio_rng.h>
 
 #include <net/tcp.h>
+
+extern "C" void rust_init();
+extern "C" void rust_test();
 #include <net/udp_shell.h>
 #include <net/net_device.h>
 
@@ -127,6 +130,8 @@ static void BpStartupArm(void* ctx)
         VirtioRng::InitAllMmio(Slots, count);
     }
 
+    rust_init();
+
     auto& cpus = CpuTable::GetInstance();
     if (!cpus.StartAll())
     {
@@ -152,6 +157,8 @@ static void BpStartupArm(void* ctx)
     }
 
     Trace(0, "After test");
+
+    rust_test();
 
     if (!SoftIrq::GetInstance().Init())
     {

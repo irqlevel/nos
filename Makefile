@@ -168,9 +168,11 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/timer.cpp \
     src/cpp/kernel/mutex.cpp \
     src/cpp/kernel/wait_group.cpp \
+    src/cpp/kernel/rw_mutex.cpp \
     src/cpp/kernel/object_table.cpp \
     src/cpp/kernel/softirq.cpp \
     src/cpp/kernel/interrupt_stats.cpp \
+    src/cpp/kernel/rust_ffi.cpp \
     src/cpp/block/block_device.cpp \
     src/cpp/block/partition.cpp \
     src/cpp/kernel/test.cpp \
@@ -232,8 +234,8 @@ ASM_S_SRC = $(ASM_S_SRC_$(ARCH))
 OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC)) $(patsubst src/cpp/%.S,$(OUT)/%.o,$(ASM_S_SRC))
 DEPS = $(patsubst src/cpp/%.cpp,$(OUT)/%.d,$(CXX_SRC))
 
-RUST_LIB_x86_64 = src/rust/target/$(RUST_TARGET)/release/libkernel.a
-RUST_LIB_aarch64 =
+RUST_LIB_x86_64 = src/rust/target/x86_64-unknown-none/release/libkernel.a
+RUST_LIB_aarch64 = src/rust/target/aarch64-unknown-none-softfloat/release/libkernel.a
 RUST_LIB = $(RUST_LIB_$(ARCH))
 
 .PHONY: all check nocheck clean rust smoke

@@ -11,7 +11,6 @@
 #include "sched.h"
 #include "cpu.h"
 #include "entropy.h"
-#include <arch/x86_64/idt.h>
 #include "interrupt.h"
 #include <hal/cpu.h>
 #include <hal/context.h>
