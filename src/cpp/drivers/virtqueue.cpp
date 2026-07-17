@@ -181,6 +181,13 @@ bool VirtQueue::GetUsed(u32& id, u32& len)
     if (LastUsedIdx == Used->Idx)
         return false;
 
+    /* Order the Idx load above before the Ring/payload loads below: usedIdx
+       derives from LastUsedIdx (no address dependency), and a control
+       dependency does not order load->load on arm64 — without this fence a
+       fresh Idx can pair with a stale Ring entry. Also fences the callers'
+       reads of device-written buffers (status bytes, RX data) that follow. */
+    Hal::DmaRmb();
+
     u16 usedIdx = LastUsedIdx % QueueSize;
     id = Used->Ring[usedIdx].Id;
     len = Used->Ring[usedIdx].Len;

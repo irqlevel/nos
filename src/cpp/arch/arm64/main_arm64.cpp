@@ -319,6 +319,24 @@ extern "C" void MainArm64(void* dtb)
     auto& board = Board::GetInstance();
     board.Setup(dtb);
 
+    /* Re-seed TPIDR_EL1 with this CPU's linear index in the DTB CPU list:
+       boot.S could only guess MPIDR.Aff0, which matches the index on QEMU
+       virt but not on clustered-affinity hardware. APs get the real index
+       via the PSCI context argument, so only the BSP needs this. */
+    {
+        const ulong AffMask = 0xFF00FFFFFFUL; /* Aff3:Aff2:Aff1:Aff0 */
+        ulong mpidr;
+        asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
+        for (ulong i = 0; i < board.CpuCount; i++)
+        {
+            if (board.CpuMpidr[i] == (mpidr & AffMask))
+            {
+                asm volatile("msr tpidr_el1, %0" :: "r"(i));
+                break;
+            }
+        }
+    }
+
     Pl011::EarlyInit(Mm::MemoryMap::KernelSpaceBase + board.Pl011Base);
     Pl011::PrintString("nos arm64: hello from EL1 (higher half)\n");
 

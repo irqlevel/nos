@@ -36,6 +36,10 @@ void ArmTimer(u64 ticks)
 {
     asm volatile("msr cntv_tval_el0, %0" :: "r"(ticks));
     asm volatile("msr cntv_ctl_el0, %0" :: "r"(1UL)); /* ENABLE, no IMASK */
+    /* The timer-output (PPI line) update takes effect only after context
+       synchronization — required so the EOI that follows a re-arm cannot
+       race a still-asserted level line */
+    asm volatile("isb");
 }
 
 }
@@ -58,8 +62,10 @@ bool GenericTimer::Setup()
     /* Register the handler object once (the INTID -> handler table is
        global). ArmIrqEntry dispatches the timer PPI to LocalTick directly;
        registration also enables the PPI in the BSP's redistributor and
-       arms this CPU's CNTV. */
-    Interrupt::Register(*this, (u8)TimerIntId, (u8)TimerIntId);
+       arms this CPU's CNTV. The architected timer output is a LEVEL
+       source (DT says so too); LocalTick deasserts it by re-arming CNTV
+       before the EOI. */
+    Interrupt::RegisterLevel(*this, (u8)TimerIntId, (u8)TimerIntId);
 
     ArmTimer(TickInterval);
 
@@ -74,7 +80,7 @@ void GenericTimer::ArmSelf()
        arm this CPU's CNTV. Called by each AP during startup. */
     ulong mpidr;
     asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
-    Gic::GetInstance().EnableIrq(TimerIntId, mpidr, true);
+    Gic::GetInstance().EnableIrq(TimerIntId, mpidr, false /* level */);
     ArmTimer(TickInterval);
 }
 

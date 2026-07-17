@@ -118,6 +118,11 @@ bool PageTable::GetFreePages()
                 && BuiltinPageTable::GetInstance().PhysToVirt(address) < mmap.GetKernelEnd())
                 continue;
 
+            /* Reserved carve-outs (e.g. the DTB) overlap usable-RAM
+               regions; free-listing them would clobber their contents */
+            if (mmap.IsReserved(address, Const::PageSize))
+                continue;
+
             if (FreePages == 0)
             {
                 *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = 0;
@@ -186,12 +191,12 @@ ulong PageTable::GetL1Page(ulong virtAddr)
 
     PtePage* l3Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(l4Entry->Address());
     Pte *l3Entry = &l3Page->Entry[l3Index];
-    if (!l3Entry->Present())
+    if (!l3Entry->Present() || l3Entry->Huge())
         return 0;
 
     PtePage* l2Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(l3Entry->Address());
     Pte *l2Entry = &l2Page->Entry[l2Index];
-    if (!l2Entry->Present())
+    if (!l2Entry->Present() || l2Entry->Huge())
         return 0;
 
     return l2Entry->Address();
@@ -235,6 +240,11 @@ ulong PageTable::VirtToPhysLocked(ulong virtAddr)
     TmpUnmapPage((ulong)l3Page);
     if (!l3Entry.Present())
         return 0;
+
+    /* 1GB block at the L3 level (the arm64 early device GiB); without this
+       check the walk would treat the block's output address as an L2 table */
+    if (l3Entry.Huge())
+        return l3Entry.Address() + (virtAddr & (Const::GB - 1));
 
     PtePage* l2Page = (PtePage*)TmpMapPage(l3Entry.Address());
     if (!l2Page)
@@ -362,7 +372,11 @@ bool PageTable::ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable,
 
         PtePage* l3 = (PtePage*)TmpMapPage(l3phys);
         Pte* l3e = &l3->Entry[Pte::L3Index(va)];
-        if (!l3e->Present()) { TmpUnmapPage((ulong)l3); return false; }
+        if (!l3e->Present() || l3e->Huge())
+        {
+            TmpUnmapPage((ulong)l3); /* kernel image is 4KiB-mapped */
+            return false;
+        }
         ulong l2phys = l3e->Address();
         TmpUnmapPage((ulong)l3);
 

@@ -37,6 +37,11 @@ public:
        ACPI) is mapped uncached. */
     bool IsUsableRam(ulong phyAddr);
 
+    /* True if [phyAddr, phyAddr+len) overlaps any reserved (non-type-1)
+       region — e.g. the DTB carve-out on arm64. The free-page scan must
+       skip such pages even when a usable-RAM region covers them. */
+    bool IsReserved(ulong phyAddr, ulong len);
+
     static const ulong KernelSpaceBase = 0xFFFF800000000000;
 
     static const ulong UserSpaceMax = 0x00007FFFFFFFFFFF;

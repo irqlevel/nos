@@ -4,7 +4,8 @@
 #include <arch/arm64/gicv3.h>
 
 // arm64 bodies for the Hal:: irqchip wrappers (see hal/irqchip.h).
-// "hwId" is MPIDR_EL1.Aff0, which QEMU virt numbers linearly 0..N-1.
+// "hwId" is the kernel's linear CPU index (cached in TPIDR_EL1); SendSgi
+// resolves it to the MPIDR affinity via the Board CPU list.
 
 namespace Hal
 {

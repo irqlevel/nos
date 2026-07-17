@@ -120,10 +120,12 @@ impl TxRing {
             write_volatile(addr_of_mut!((*d).addr_lo), phys as u32);
             write_volatile(addr_of_mut!((*d).addr_hi), (phys >> 32) as u32);
             write_volatile(addr_of_mut!((*d).opts2), 0);
-            /* Write opts1 (with TX_OWN) last; the Release fence orders the
-             * descriptor stores on weakly-ordered arches too (free on x86).
-             * This ensures hardware sees a valid address before it sees OWN=1. */
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            /* Write opts1 (with TX_OWN) last; dma_wmb orders the descriptor
+             * stores against the OWN store as seen by the NIC (dmb oshst on
+             * arm64 — an atomic fence is only dmb ish, whose domain excludes
+             * a PCIe master; free on x86). Hardware must see a valid address
+             * before it sees OWN=1. */
+            kcore::barrier::dma_wmb();
             write_volatile(addr_of_mut!((*d).opts1),
                 TX_OWN | TX_FS | TX_LS | eor | (len & TX_LEN_MASK));
         }
@@ -196,7 +198,7 @@ impl RxRing {
             write_volatile(addr_of_mut!((*d).addr_lo), phys as u32);
             write_volatile(addr_of_mut!((*d).addr_hi), (phys >> 32) as u32);
             write_volatile(addr_of_mut!((*d).opts2), 0);
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+            kcore::barrier::dma_wmb(); /* see TxRing::submit */
             /* Program buffer capacity into len field; hardware replaces it with
              * the actual received frame length when it clears RX_OWN. */
             write_volatile(addr_of_mut!((*d).opts1),
@@ -225,6 +227,11 @@ impl RxRing {
         if opts1 & RX_OWN != 0 {
             return None; /* hardware still owns */
         }
+        /* The frame payload pointer comes from the shadow array, not the
+         * descriptor — no address dependency — so the caller's reads of the
+         * packet bytes must be fenced after the OWN-bit load (dma_rmb; a
+         * control dependency does not order load->load on arm64). */
+        kcore::barrier::dma_rmb();
         self.frames[idx] = 0;
         self.head = (idx + 1) % RING_SIZE;
         Some((unsafe { NetFrame::from_raw(h) }, opts1))

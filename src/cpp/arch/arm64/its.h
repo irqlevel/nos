@@ -61,7 +61,7 @@ private:
     void CmdInv(u32 deviceId, u32 eventId);
     void CmdSync(u64 rdBase);
     void PostCommand(const u64 cmd[4]);
-    void WaitCommands();
+    bool WaitCommands();
 
     u32 AllocLpi();
 

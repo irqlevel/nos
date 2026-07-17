@@ -51,7 +51,10 @@ Arm64TaskEntryThunk:
     /* void Arm64RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx) */
     .globl Arm64RunOnStack
 Arm64RunOnStack:
-    mov     sp, x0
+    /* Task::Stack::StackTop sits 8 below a 16-byte boundary; SP must stay
+       16-aligned (AAPCS64, and an SP-alignment fault wherever SCTLR.SA=1) */
+    and     x9, x0, #0xFFFFFFFFFFFFFFF0
+    mov     sp, x9
     mov     x0, x2
     blr     x1
 1:  wfi

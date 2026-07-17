@@ -51,6 +51,34 @@ const char* Fdt::String(u32 off) const
     return reinterpret_cast<const char*>(Base + StringsOff + off);
 }
 
+ulong Fdt::BoundedNameLen(ulong off) const
+{
+    ulong limit = StructOff + StructSize;
+    for (ulong i = off; i < limit; i++)
+    {
+        if (Base[i] == '\0')
+            return i - off;
+    }
+    return (ulong)-1;
+}
+
+bool Fdt::StringMatches(u32 nameOff, const char* name) const
+{
+    if (nameOff >= StringsSize)
+        return false;
+
+    const char* s = String(nameOff);
+    ulong maxLen = StringsSize - nameOff;
+    for (ulong i = 0; i < maxLen; i++)
+    {
+        if (s[i] != name[i])
+            return false;
+        if (s[i] == '\0')
+            return true;
+    }
+    return false; /* unterminated within the strings block */
+}
+
 bool Fdt::Setup(const void* dtb)
 {
     if (dtb == nullptr)
@@ -68,6 +96,14 @@ bool Fdt::Setup(const void* dtb)
     StructOff = Be32(&hdr.OffDtStruct);
     StructSize = Be32(&hdr.SizeDtStruct);
     StringsOff = Be32(&hdr.OffDtStrings);
+    StringsSize = Be32(&hdr.SizeDtStrings);
+
+    /* A truncated/corrupt header must not steer the walkers out of the
+       blob; every later bound derives from these */
+    if (StructOff > TotalSize || StructSize > TotalSize - StructOff ||
+        StringsOff > TotalSize || StringsSize > TotalSize - StringsOff)
+        return false;
+
     Valid = true;
     return true;
 }
@@ -92,8 +128,10 @@ bool Fdt::NextNode(Node& node)
     {
         /* Resume after the previously returned node: skip its BEGIN_NODE
            token + name, then continue scanning. */
-        const char* name = reinterpret_cast<const char*>(Base + node.Offset + 4);
-        off = node.Offset + 4 + AlignUp4(Stdlib::StrLen(name) + 1);
+        ulong nameLen = BoundedNameLen(node.Offset + 4);
+        if (nameLen == (ulong)-1)
+            return false;
+        off = node.Offset + 4 + AlignUp4(nameLen + 1);
         depth = node.Depth;
     }
 
@@ -104,6 +142,8 @@ bool Fdt::NextNode(Node& node)
 
         if (tok == TokBeginNode)
         {
+            if (BoundedNameLen(off + 4) == (ulong)-1)
+                return false; /* unterminated name: corrupt blob */
             const char* name = reinterpret_cast<const char*>(Base + off + 4);
             if (depth + 1 >= MaxDepth)
                 return false;
@@ -139,7 +179,11 @@ bool Fdt::NextNode(Node& node)
         }
         else if (tok == TokProp)
         {
+            if (off + 12 > limit)
+                return false;
             u32 len = Be32(Base + off + 4);
+            if (len > limit - off - 12)
+                return false;
             off += 12 + AlignUp4(len);
         }
         else if (tok == TokNop)
@@ -162,8 +206,10 @@ const void* Fdt::GetProp(const Node& node, const char* name, u32& lenOut)
         return nullptr;
 
     /* Properties come right after BEGIN_NODE + name, before any subnode */
-    const char* nodeName = reinterpret_cast<const char*>(Base + node.Offset + 4);
-    ulong off = node.Offset + 4 + AlignUp4(Stdlib::StrLen(nodeName) + 1);
+    ulong nameLen = BoundedNameLen(node.Offset + 4);
+    if (nameLen == (ulong)-1)
+        return nullptr;
+    ulong off = node.Offset + 4 + AlignUp4(nameLen + 1);
     ulong limit = StructOff + StructSize;
 
     while (off + 4 <= limit)
@@ -171,9 +217,13 @@ const void* Fdt::GetProp(const Node& node, const char* name, u32& lenOut)
         u32 tok = TokenAt(off);
         if (tok == TokProp)
         {
+            if (off + 12 > limit)
+                return nullptr;
             u32 len = Be32(Base + off + 4);
             u32 nameOff = Be32(Base + off + 8);
-            if (Stdlib::StrCmp(String(nameOff), name) == 0)
+            if (len > limit - off - 12)
+                return nullptr; /* value would run past the struct block */
+            if (StringMatches(nameOff, name))
             {
                 lenOut = len;
                 return Base + off + 12;
@@ -221,6 +271,9 @@ bool Fdt::IsCompatible(const Node& node, const char* compat)
         return false;
 
     const char* s = static_cast<const char*>(p);
+    if (len == 0 || s[len - 1] != '\0')
+        return false; /* a compatible list is NUL-terminated by definition */
+
     ulong pos = 0;
     while (pos < len)
     {
