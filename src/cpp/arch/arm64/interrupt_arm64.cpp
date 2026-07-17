@@ -67,16 +67,20 @@ void RegisterCommon(InterruptHandler& handler, u8 intId, bool edge, bool level)
 
 }
 
+/* "irq" is the GIC INTID and is the identity here; the x86-style
+   "vector" argument is advisory and ignored (callers like the Rust FFI
+   pass an x86 vector-space value). OnInterruptRegister reports the
+   INTID back as the effective vector. */
 void Interrupt::Register(InterruptHandler& handler, u8 irq, u8 vector)
 {
-    BugOn(irq != vector);
-    RegisterCommon(handler, vector, true, false);
+    (void)vector;
+    RegisterCommon(handler, irq, true, false);
 }
 
 void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
 {
-    BugOn(irq != vector);
-    RegisterCommon(handler, vector, false, true);
+    (void)vector;
+    RegisterCommon(handler, irq, false, true);
 }
 
 void Interrupt::SharedDispatch(Context* ctx)
