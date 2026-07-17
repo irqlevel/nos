@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm nasm cppcheck \
+            grub2-common grub-pc-bin xorriso \
+            qemu-system-x86 qemu-system-arm
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain nightly --component rust-src
+
+      - name: Static analysis (cppcheck)
+        run: make check
+
+      - name: Build ${{ matrix.arch }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          make nocheck ARCH=${{ matrix.arch }}
+
+      - name: Boot smoke test (${{ matrix.arch }}, TCG)
+        run: |
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            ./scripts/smoke-test.sh --skip-build
+          else
+            ./scripts/smoke-arm64.sh --skip-build
+          fi

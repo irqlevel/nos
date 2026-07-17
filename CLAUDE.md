@@ -50,7 +50,13 @@ make nocheck ARCH=aarch64      # (in Docker on macOS) -> kernel-arm64.elf + nos-
                                # (NOS_TCG=1 forces TCG; HVF is ~4x faster)
 ./scripts/smoke-arm64.sh       # arm64 boot smoke test (SMOKE_HVF=1 for HVF)
 python3 scripts/udpsh.py 127.0.0.1   # remote shell over UDP
+./scripts/gdb-arm64.sh         # attach GDB (qemu-arm64.sh -s), needs gdb-multiarch
 ```
+
+PCIe on arm64 (ECAM + GICv3 ITS) is present but MSI *delivery* has an open
+GIC-ITS bug, so it is opt-in: boot with `its=on` to exercise NVMe-over-MSI
+(enumeration/identify/registration work; interrupt-driven completion
+wedges the GIC). Default (`its=off`) degrades MSI gracefully.
 
 Debug with GDB (QEMU must be started with `-s`):
 
