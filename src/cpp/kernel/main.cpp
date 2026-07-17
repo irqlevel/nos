@@ -8,6 +8,7 @@
 #include <arch/x86_64/exception.h>
 #include <arch/x86_64/asm.h>
 #include <hal/power.h>
+#include <hal/mmu.h>
 #include "cpu.h"
 #include "cmd.h"
 #include "interrupt.h"
@@ -186,6 +187,7 @@ void ApMain2()
 {
     AtomicReadAndInc(&ApStartedFlag); /* 2: entered ApMain2 */
 
+    Hal::EnableWxSupport(); /* honor NX before loading the W^X page table */
     SetCr3(Mm::PageTable::GetInstance().GetRoot());
     AtomicReadAndInc(&ApStartedFlag); /* 3: page tables loaded */
 
@@ -654,6 +656,25 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     {
         Panic("Can't setup paging");
         break;
+    }
+
+    /* W^X: enable NXE, then make .text RX, .rodata RO+NX, .data/.bss RW+NX */
+    {
+        extern char KernelStart[], KernelText[], KernelRodata[], KernelEnd[];
+        Hal::EnableWxSupport();
+        ulong t0 = (ulong)KernelStart, t1 = (ulong)KernelText;
+        ulong r1 = (ulong)KernelRodata, e = (ulong)KernelEnd;
+        pt.ProtectRange(t0, t1 - t0, false, true);   /* RX */
+        pt.ProtectRange(t1, r1 - t1, false, false);  /* RO+NX */
+        pt.ProtectRange(r1, e - r1, true, false);    /* RW+NX */
+        Trace(0, "W^X: text [0x%p,0x%p) rodata [0x%p,0x%p) data [0x%p,0x%p)",
+            t0, t1, t1, r1, r1, e);
+        if (Parameters::GetInstance().IsWxProbe())
+        {
+            Trace(0, "W^X probe: writing to text 0x%p (expect page fault)", t0);
+            *reinterpret_cast<volatile u32*>(t0) = 0;
+            Trace(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
+        }
     }
 
     Gdt::GetInstance().Save();
