@@ -19,6 +19,7 @@
 #include <kernel/preempt.h>
 #include <kernel/cmd.h>
 #include <kernel/softirq.h>
+#include <fs/vfs.h>
 #include <hal/power.h>
 
 #include <drivers/virtio_mmio.h>
@@ -31,6 +32,9 @@
 
 extern "C" void rust_init();
 extern "C" void rust_test();
+extern "C" void rust_fini();
+extern "C" void __cxa_finalize(void*);
+extern "C" char BootStackTop[];
 #include <net/udp_shell.h>
 #include <net/net_device.h>
 
@@ -54,6 +58,61 @@ bool InstallEarlyDeviceBlock(ulong realRoot); /* arch/arm64/builtin_pt.cpp */
 }
 
 void SetupVectors(); /* arch/arm64/exception_arm64.cpp */
+
+typedef void (*HaltAction)();
+
+/* Finalization context passed across the stack switch */
+static Task* HaltTask;
+static HaltAction HaltActionFn;
+
+/* Runs on the static boot stack: releases the idle task, runs static
+   destructors and Rust teardown, then powers off/resets. Never returns
+   (the x86 twin: FinalizeOnStaticStack in kernel/main.cpp). */
+static void FinalizeOnBootStack(void* ctx)
+{
+    (void)ctx;
+
+    Trace(0, "FinalizeOnBootStack");
+
+    HaltTask->Put();
+
+    rust_fini();
+
+    __cxa_finalize(0);
+
+    Trace(0, "Finalized");
+
+    HaltActionFn();
+}
+
+static void __attribute__((noreturn)) PrepareHaltArm(HaltAction action)
+{
+    /* Extra ref so the idle task is not freed while we still run on its
+       stack (released in FinalizeOnBootStack after the stack switch) */
+    auto task = Task::GetCurrentTask();
+    task->Get();
+
+    Vfs::GetInstance().UnmountAll();
+
+    PreemptDisable();
+
+    Trace(0, "Stopping cpu's");
+
+    CpuTable::GetInstance().ExitAllExceptSelf();
+
+    Trace(0, "Cpu's stopped");
+
+    PreemptOff();
+
+    CpuTable::GetInstance().Reset();
+    Dmesg::GetInstance().Reset();
+
+    InterruptDisable();
+
+    HaltTask = task;
+    HaltActionFn = action;
+    Hal::RunOnStack((ulong)&BootStackTop[0], FinalizeOnBootStack, nullptr);
+}
 
 /* AP idle-task body (the x86 twin: ApStartup in kernel/main.cpp) */
 static void ApStartupArm(void* ctx)
@@ -206,18 +265,17 @@ static void BpStartupArm(void* ctx)
         cpu.Idle();
         if (cmd.ShouldShutdown() || cmd.ShouldReboot())
         {
-            /* Graceful task/fs teardown mirrors main.cpp later; for now
-               go straight to PSCI */
-            if (cmd.ShouldReboot())
-            {
+            bool reboot = cmd.ShouldReboot();
+            if (reboot)
                 Trace(0, "Reboot requested");
-                Hal::Reset();
-            }
             else
-            {
                 Trace(0, "Shutdown requested");
-                Hal::PowerOff();
-            }
+
+            udpShell.Stop();
+            cmd.Stop();
+            cmd.StopDhcp();
+
+            PrepareHaltArm(reboot ? Hal::Reset : Hal::PowerOff);
         }
     }
 }
