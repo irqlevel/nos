@@ -2,6 +2,9 @@
 #include "board.h"
 #include "gicv3.h"
 #include "generic_timer.h"
+#include "its.h"
+
+#include <drivers/pci.h>
 
 #include <lib/stdlib.h>
 #include <mm/memory_map.h>
@@ -33,6 +36,7 @@
 extern "C" void rust_init();
 extern "C" void rust_test();
 extern "C" void rust_fini();
+namespace Kernel { bool PciEcamSetup(); }
 extern "C" void __cxa_finalize(void*);
 extern "C" char BootStackTop[];
 #include <net/udp_shell.h>
@@ -191,8 +195,6 @@ static void BpStartupArm(void* ctx)
         VirtioRng::InitAllMmio(Slots, count);
     }
 
-    rust_init();
-
     auto& cpus = CpuTable::GetInstance();
     if (!cpus.StartAll())
     {
@@ -219,6 +221,7 @@ static void BpStartupArm(void* ctx)
 
     Trace(0, "After test");
 
+    rust_init();
     rust_test();
 
     if (!SoftIrq::GetInstance().Init())
@@ -404,6 +407,19 @@ extern "C" void MainArm64(void* dtb)
     auto& gic = Gic::GetInstance();
     if (!gic.Setup(board.GicdBase, board.GicrBase, board.GicrSize))
         Panic("Can't setup gic");
+
+    /* MSI via the ITS (best-effort: virtio-mmio works without it) */
+    if (board.ItsBase != 0 && Parameters::GetInstance().IsItsEnabled())
+    {
+        if (!Its::GetInstance().Setup(board.ItsBase, board.GicrBase, board.GicrSize))
+            Trace(0, "ITS setup failed; PCIe MSI unavailable");
+    }
+
+    /* PCIe over ECAM: map config space, enumerate, assign BARs */
+    if (PciEcamSetup())
+    {
+        Pci::GetInstance().Scan();
+    }
 
     auto& cpus = CpuTable::GetInstance();
     for (ulong i = 0; i < board.CpuCount && i < MaxCpus; i++)

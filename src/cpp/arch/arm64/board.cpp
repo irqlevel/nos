@@ -71,6 +71,59 @@ bool Board::Setup(void* dtbVa)
                 if (method != nullptr)
                     PsciUseHvc = (Stdlib::StrCmp(method, "hvc") == 0);
             }
+            else if (fdt.IsCompatible(node, "arm,gic-v3-its"))
+            {
+                const void* reg = fdt.GetProp(node, "reg", len);
+                if (reg != nullptr)
+                    ItsBase = Fdt::ReadCells(reg, 0, node.AddressCells);
+            }
+            else if (fdt.IsCompatible(node, "pci-host-ecam-generic"))
+            {
+                /* reg = ECAM config window (address-cells/size-cells of the
+                   parent, i.e. 2/2 here) */
+                const void* reg = fdt.GetProp(node, "reg", len);
+                if (reg != nullptr)
+                {
+                    EcamBase = Fdt::ReadCells(reg, 0, node.AddressCells);
+                    EcamSize = Fdt::ReadCells(
+                        static_cast<const u8*>(reg) + node.AddressCells * 4,
+                        0, node.SizeCells);
+                }
+                /* bus-range = <start end> */
+                const void* br = fdt.GetProp(node, "bus-range", len);
+                if (br != nullptr && len >= 8)
+                {
+                    PciBusStart = (u8)Fdt::Be32(br);
+                    PciBusEnd = (u8)Fdt::Be32(static_cast<const u8*>(br) + 4);
+                }
+                /* ranges: entries of <pci-addr(3) cpu-addr(2) size(2)>; the
+                   host node's own #address-cells is 3, #size-cells 2. Pick
+                   the 32-bit non-prefetch MMIO window (hi cell bits 25:24 =
+                   0b10 -> space code 2). */
+                const void* ranges = fdt.GetProp(node, "ranges", len);
+                if (ranges != nullptr)
+                {
+                    const u8* p = static_cast<const u8*>(ranges);
+                    ulong entry = (3 + 2 + 2) * 4;
+                    ulong count = len / entry;
+                    for (ulong e = 0; e < count; e++)
+                    {
+                        const u8* r = p + e * entry;
+                        u32 hi = Fdt::Be32(r);
+                        u32 space = (hi >> 24) & 3;
+                        if (space == 2) /* 32-bit MMIO */
+                        {
+                            PciMmio32Base = Fdt::ReadCells(r + 12, 0, 2); /* cpu addr */
+                            PciMmio32Size = Fdt::ReadCells(r + 20, 0, 2); /* size */
+                        }
+                        else if (space == 3) /* 64-bit MMIO */
+                        {
+                            PciMmio64Base = Fdt::ReadCells(r + 12, 0, 2);
+                            PciMmio64Size = Fdt::ReadCells(r + 20, 0, 2);
+                        }
+                    }
+                }
+            }
             else if (fdt.IsCompatible(node, "arm,gic-v3"))
             {
                 const void* reg = fdt.GetProp(node, "reg", len);
@@ -170,6 +223,19 @@ void Board::ApplyFallbacks()
     }
     if (TimerIntId == 0)
         TimerIntId = 27;
+    if (ItsBase == 0)
+        ItsBase = 0x08080000;
+    if (EcamBase == 0)
+    {
+        EcamBase = 0x4010000000;
+        EcamSize = 0x10000000;
+        PciMmio32Base = 0x10000000;
+        PciMmio32Size = 0x2eff0000;
+        PciMmio64Base = 0x8000000000;
+        PciMmio64Size = 0x8000000000;
+        PciBusStart = 0;
+        PciBusEnd = 0xff;
+    }
     if (CpuCount == 0)
     {
         CpuMpidr[0] = 0;

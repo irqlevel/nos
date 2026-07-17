@@ -9,6 +9,7 @@ Parameters::Parameters()
     : TraceVga(false)
     , PanicVga(false)
     , SmpOff(false)
+    , ItsEnabled(false)  /* PCIe MSI via ITS is opt-in: its=on */
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
@@ -34,6 +35,11 @@ bool Parameters::IsPanicVga()
 bool Parameters::IsSmpOff()
 {
     return SmpOff;
+}
+
+bool Parameters::IsItsEnabled()
+{
+    return ItsEnabled;
 }
 
 bool Parameters::IsConsoleSerial()
@@ -132,6 +138,10 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         {
             Trace(0, "Unknown value %s, key %s", value, key);
         }
+    }
+    else if (Stdlib::StrCmp(key, "its") == 0)
+    {
+        ItsEnabled = (Stdlib::StrCmp(value, "off") != 0);
     }
     else if (Stdlib::StrCmp(key, "smp") == 0)
     {

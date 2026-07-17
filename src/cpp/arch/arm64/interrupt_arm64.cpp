@@ -1,4 +1,5 @@
 #include "gicv3.h"
+#include "its.h"
 
 #include <kernel/interrupt.h>
 #include <kernel/cpu.h>
@@ -109,6 +110,13 @@ extern "C" void ArmIrqEntry(Context* ctx)
         {
             /* EOIs itself (Hal::IrqEoi in Cpu::IPI) before Schedule */
             IPInterrupt(ctx);
+            continue;
+        }
+
+        if (intId >= Its::LpiIntIdBase)
+        {
+            Its::GetInstance().HandleLpi(intId);
+            Gic::WriteEoir(intId);
             continue;
         }
 

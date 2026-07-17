@@ -59,6 +59,19 @@ public:
 
     u32 TimerIntId = 0; /* virtual timer PPI */
 
+    /* GICv3 ITS (MSI). Zero base = no ITS found. */
+    ulong ItsBase = 0;
+
+    /* PCIe ECAM host bridge (pci-host-ecam-generic). Zero = no PCIe. */
+    ulong EcamBase = 0;
+    ulong EcamSize = 0;
+    ulong PciMmio32Base = 0;   /* CPU addr of the 32-bit non-prefetch window */
+    ulong PciMmio32Size = 0;
+    ulong PciMmio64Base = 0;   /* CPU addr of the 64-bit prefetch window */
+    ulong PciMmio64Size = 0;
+    u8   PciBusStart = 0;
+    u8   PciBusEnd = 0;
+
     ulong VirtioMmioCount = 0;
     VirtioMmioDev VirtioMmio[MaxVirtioMmio];
 
