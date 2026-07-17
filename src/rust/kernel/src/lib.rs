@@ -22,9 +22,9 @@ fn alloc_error(_layout: core::alloc::Layout) -> ! {
 pub extern "C" fn rust_init() {
     hello::hello();
     nvme::init();
+    r8168::init();
     #[cfg(target_arch = "x86_64")]
     {
-        r8168::init();
         tco_init();
     }
 }
@@ -96,8 +96,5 @@ pub extern "C" fn rust_test() {
 #[no_mangle]
 pub extern "C" fn rust_fini() {
     nvme::shutdown();
-    #[cfg(target_arch = "x86_64")]
-    {
-        r8168::shutdown();
-    }
+    r8168::shutdown();
 }

@@ -140,6 +140,21 @@ void PciAssignResources(void* devices, ulong count, ulong stride)
         for (u8 bar = 0; bar < 6; )
             bar += AssignBar(pci, d, bar);
 
+        /* Program the INTx routing (firmware's job; bare -kernel must do it).
+           QEMU virt's interrupt-map swizzle: for INTx pin p (1..4) on device
+           slot s, SPI = 3 + ((s + p - 1) % 4), i.e. GIC INTID 35..38. Write
+           it into the config-space InterruptLine so drivers register level
+           IRQs on the routed INTID unchanged. */
+        u8 pin = pci.ReadByte(d->Bus, d->Slot, d->Func, 0x3D);
+        if (pin >= 1 && pin <= 4)
+        {
+            u8 intId = (u8)(32 + 3 + ((d->Slot + pin - 1) % 4));
+            pci.WriteByte(d->Bus, d->Slot, d->Func, 0x3C, intId);
+            d->InterruptLine = intId;
+            Trace(0, "PciIntx: %u:%u.%u pin %u -> intid %u",
+                (ulong)d->Bus, (ulong)d->Slot, (ulong)d->Func, (ulong)pin, (ulong)intId);
+        }
+
         /* Enable memory space + bus mastering */
         u16 cmd = pci.ReadWord(d->Bus, d->Slot, d->Func, 0x04);
         cmd |= (1 << 1) | (1 << 2);
