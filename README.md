@@ -1,17 +1,19 @@
 ### nos
 
-A hobby x86-64 operating system kernel written in C++20, Rust, and NASM.
+A hobby operating system kernel for x86-64 and arm64 (aarch64), written in C++20, Rust, and assembly.
 Code is partially written by AI models (Claude, GPT) with human control over architecture decisions, testing, and code review.
-Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices). Real hardware support has not been tested.
+Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices), and on QEMU `virt` with HVF acceleration on Apple Silicon for the arm64 build. Real hardware support has not been tested.
 
 #### Features
 
-- **SMP** — up to 8 CPUs with INIT/SIPI AP bootstrap
+- **Two architectures** — x86-64 (Multiboot2/GRUB, ISO or MBR disk boot) and arm64 (QEMU `virt` board, Linux `Image` boot protocol); portable code goes through a HAL layer (`src/cpp/hal/`), arch backends live in `src/cpp/arch/`
+- **SMP** — up to 8 CPUs; AP bootstrap via INIT/SIPI on x86-64, PSCI `CPU_ON` on arm64
 - **Preemptive multitasking** — per-CPU task queues, round-robin scheduling, load-balanced task placement
 - **Virtual memory** — 4-level paging (4 KB pages), high-half kernel at `0xFFFF800001000000`, TLB shootdown across CPUs via IPI
 - **Page allocator** — fixed-size block allocator (1–128 contiguous pages), pool allocator (32 B – 2 KB), `new`/`delete` support
 - **ACPI** — RSDP/RSDT/MADT parsing for LAPIC/IOAPIC discovery and IRQ→GSI routing
 - **Interrupts** — IDT with exception handlers, IOAPIC routing (edge + level-triggered), LAPIC IPI, PIC (remapped then disabled)
+- **arm64 port** — GICv3 interrupt controller with ITS (PCIe MSI delivered as LPIs, `its=on` by default), EL1 exception vectors, ARM generic timer (per-CPU), PL011 UART, FDT (device tree) parsing, PCIe ECAM, virtio-mmio transport, broadcast TLBI, semantic memory barriers (`dmb`) throughout; NVMe over ITS-delivered MSI works end-to-end
 - **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick, SeqLock-protected counters), RTC (CMOS wall clock), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**, **virtio-scsi**, **virtio-rng** (legacy + modern virtio-pci transport), **NVMe** (Rust, MSI-X interrupt-driven)
 - **Block I/O** — asynchronous, interrupt-driven block request queue with DMA slot pool, `BlockRequest` submission with `WaitGroup` completion, direct DMA from caller buffers (page-aligned), virtqueue locking (`RawSpinLock`) for safe interrupt/task concurrency, early-boot polling fallback, SoftIrq-based retry for ring-full conditions, block device abstraction, MBR partition discovery
 - **Networking** — virtio-net driver with asynchronous interrupt-driven TX/RX, software frame queues (256-entry TX/RX) in `NetDevice` base class, reference-counted `NetFrame` descriptors for zero-copy DMA, TX slot pool with bitmask allocation, SoftIrq-based TX retry and RX processing, IP routing (subnet mask + gateway from DHCP, off-subnet traffic forwarded to gateway), ARP (cache, request, reply, dump), IPv4/UDP transmit, ICMP echo (ping reply + send, per-type statistics), DHCP client with lease renewal (sets IP, subnet mask, gateway, DNS server), DNS resolver with 32-entry cache (A-record queries, name compression, DHCP-provided server), **TCP** (connection state machine, 3-way handshake, sequence/ack tracking, retransmission timers, MSS negotiation, send/receive ring buffers, graceful close with FIN exchange, RST handling, ephemeral port allocation, granular locking: `Mutex` for ports, `RawSpinLock` for pool and per-connection state, SoftIrq-driven timer processing), **HTTP client** (URL parsing, DNS resolution, TCP connection, request/response, redirect following for 301/302/303/307/308 with loop limit, `wget` shell command), UDP remote shell (execute kernel commands over the network), network device abstraction with per-protocol packet counters, `MacAddress`/`IpAddress` structs (IPv6-ready tagged union)
@@ -21,11 +23,13 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
 - **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `cpu`, `bt <pid>`, `dmesg [filter]`, `uptime`, `date`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `irqstat`, `net`, `arp`, `icmpstat`, `tcpstat`, `udpsend`, `ping`, `nslookup`, `dnsflush`, `dhcp`, `wget`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `panic`, `version`, `cls`, `help`, `poweroff`, `reboot`
 - **Timekeeping** — TSC calibration via PIT channel 2 (multi-round median), KVM paravirt clock (`kvmclock`) for accurate VM time, RTC wall clock, layered clock source selection (kvmclock → calibrated TSC → PIT fallback), `GetBootTime()` / `GetWallTimeSecs()` API
 - **Kernel infrastructure** — spinlocks, mutexes, SeqLock (single-writer/multi-reader), atomics, wait groups, SoftIrq deferred processing, IPI tasks, timers, watchdog, stack traces with symbol resolution, dmesg ring buffer (512 KB, 2048 messages), panic handler with backtrace and CPU/task context, per-device interrupt statistics, AP startup diagnostics, virtual-to-physical address translation (4-level page table walk), byte-order helpers (`Htons`/`Htonl`/`Ntohs`/`Ntohl`)
-- **Optimized stdlib** — `MemSet`, `MemCpy`, `MemCmp`, `StrLen`, `StrCmp`, `StrStr` implemented in x86-64 assembly using `rep stosq`/`rep movsq`/`repe cmpsb`/`repne scasb`
+- **Optimized stdlib** — `MemSet`, `MemCpy`, `MemCmp`, `StrLen`, `StrCmp`, `StrStr` implemented in x86-64 assembly using `rep stosq`/`rep movsq`/`repe cmpsb`/`repne scasb` (portable C versions on arm64)
 - **Rust support** — `#![no_std]` Rust crates linked into the kernel via `staticlib`, FFI bridge (`rust_ffi.cpp`) exposing kernel services to Rust: spinlocks, mutexes, wait groups, timers, SoftIRQ, MSI-X interrupts, legacy interrupts, DMA allocation, MMIO mapping, PCI config space, block device and network device registration, CPU/IPI/task APIs. **kcore** library provides safe Rust wrappers around kernel primitives. **NVMe driver** written entirely in Rust — PCI BAR mapping, admin + I/O queue pairs, MSI-X interrupt-driven completion, WaitGroup-based synchronous I/O, multi-device support, proper RAII cleanup on shutdown
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc (up to 128 pages), parsing helpers, block device table, memset, memcpy, memcmp, strlen, strcmp, strstr
 
 #### Build
+
+The build is parameterized by `ARCH` (default `x86_64`, or `aarch64`); objects go to `out/$(ARCH)/`.
 
 Native (requires clang, nasm, ld, grub-mkrescue, rustup with `x86_64-unknown-none` target):
 
@@ -40,6 +44,14 @@ Via Docker (works on macOS / Apple Silicon):
 ```
 
 This produces `nos.iso` and `bin/kernel64.elf` (for GDB symbols).
+
+arm64 (requires `ld.lld`, `llvm-nm`, rustup with `aarch64-unknown-none-softfloat` target; on macOS build in Docker):
+
+```sh
+make nocheck ARCH=aarch64
+```
+
+This produces `kernel-arm64.elf` and `nos-arm64.img` (Linux `Image` format, bootable with QEMU `-kernel`).
 
 Build a bootable qcow2 disk image (MBR, 2 partitions):
 
@@ -68,6 +80,14 @@ Boot from disk image (with virtio-blk):
 
 ```sh
 ./scripts/qemu-disk.sh
+```
+
+arm64 on QEMU `virt` (HVF-accelerated on Apple Silicon, `NOS_TCG=1` forces TCG; virtio-mmio blk/net/rng attached, serial goes to `nos-arm64.log`, UDP shell forwarded on `:9000`):
+
+```sh
+./scripts/qemu-arm64.sh
+./scripts/smoke-arm64.sh              # boot smoke test (SMOKE_HVF=1 for HVF)
+python3 scripts/udpsh.py 127.0.0.1    # remote shell over UDP
 ```
 
 Deploy to Google Cloud Compute Engine (select **Skip OS adaptation** when importing the image — the kernel already has the necessary drivers and no guest agent):
@@ -100,9 +120,15 @@ gdb -ex "symbol-file bin/kernel64.elf" \
     -ex "target remote :1234"
 ```
 
+arm64 (start `./scripts/qemu-arm64.sh -s`, needs `gdb-multiarch`):
+
+```sh
+./scripts/gdb-arm64.sh
+```
+
 #### Kernel parameters
 
-Pass via GRUB command line (edit `build/grub.cfg`):
+Pass via GRUB command line on x86-64 (edit `build/grub.cfg`) or QEMU `-append` on arm64:
 
 - `smp=off` — disable SMP, run on BSP only
 - `console=serial` — direct shell output to serial port only
@@ -112,6 +138,7 @@ Pass via GRUB command line (edit `build/grub.cfg`):
 - `dhcp=on` — enable DHCP only via shell command (default)
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`)
+- `its=off` — arm64 only: disable the GICv3 ITS and degrade PCIe MSI gracefully (default `its=on`; virtio-mmio devices don't need it)
 
 #### UDP remote shell
 
@@ -182,20 +209,21 @@ src/cpp/
   hal/        Portable HAL contracts: cpu, barriers, mmu/pte, irqchip, console, power, context, irq stubs
   arch/
     x86_64/   Multiboot2 entry + AP trampoline (NASM), CPU primitives (asm.asm), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding, GRUB info parsing, HAL backends
+    arm64/    Linux-Image boot + PSCI SMP (boot.S), EL1 vectors, GICv3 + ITS (LPIs for PCIe MSI), generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, HAL backends
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, Rust FFI bridge, symbol table
-  drivers/    Hardware: serial, VGA, PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio transport/blk/net/scsi/rng
+  drivers/    Hardware: serial, VGA, PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi/rng (virtio-pci on x86-64, virtio-mmio on arm64)
   block/      Block I/O: device abstraction, async request queue, MBR partition discovery
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell
   fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
   lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, stdlib
   include/    Shared headers
-  arm64/     arm64 backend: Linux-Image boot + PSCI SMP (boot.S), GICv3, generic timer, PL011, EL1 vectors, FDT parser, virtio-mmio glue
 src/rust/
   ffi/        Raw extern "C" FFI declarations for kernel services
   kcore/      Safe Rust wrappers: sync, DMA, MMIO, MSI-X, interrupts, timers, tasks, PCI, block/net device
   drivers/
     nvme/     NVMe block device driver (PCI, MSI-X, admin/IO queues)
+    r8168/    Realtek r8168 network device driver
   hello/      Rust self-test module
   kernel/     Rust entry points (rust_main, rust_fini), global allocator
 build/        Linker script, GRUB configs
