@@ -140,15 +140,21 @@ UDP shell with `-smp 4`:
 **Follow-ups landed (branch arm64-follow-ups):** Rust on arm64
 (rust_ffi is arch-clean; nvme runs, r8168/tco stay x86-only), virtio-scsi
 over mmio, PL031 wall clock, graceful shutdown/PSCI teardown, PCIe ECAM
-+ GICv3 ITS + NVMe (enumeration/identify/block-registration + MSI mapping
-all work; MSI *delivery* wedges the GIC — opt-in via `its=on`), CI matrix
-(x86_64 + aarch64 build + TCG smoke), cppcheck over the arm64 tree,
-scripts/gdb-arm64.sh.
++ GICv3 ITS + NVMe (enumeration/identify/block-registration + full
+interrupt-driven I/O), CI matrix (x86_64 + aarch64 build + TCG smoke),
+cppcheck over the arm64 tree, scripts/gdb-arm64.sh.
 
-**Still deferred:** the GIC-ITS MSI-delivery bug (NVMe interrupt-driven
-I/O), r8168 on arm64, W^X / RX-text hardening of the arm64 mappings,
-per-CPU timers, broadcast-TLBI, TPIDR_EL1 per-CPU caching, real arm64
-hardware, the EL2 hypervisor.
+**Hardening landed (branches arm64-hardening / arm64-hardening2):** per-CPU
+generic timers, W^X on arm64 and x86 (EFER.NXE), r8168 on arm64,
+broadcast-TLBI (inner-shareable `tlbi`, no IPI shootdown), TPIDR_EL1 per-CPU
+caching, and the **GICv3 ITS MSI-delivery fix**: the IRQ dispatcher's spurious
+check (`intId >= 1020`) was swallowing LPIs (INTID ≥ 8192) as spurious and
+returning without EOI, leaving the CPU-interface running priority pinned and
+masking every subsequent interrupt; bounding the check to the special-INTID
+range [1020, LpiIntIdBase) lets LPIs dispatch. NVMe interrupt-driven I/O now
+works end-to-end; ITS/MSI is on by default (`its=off` to disable).
+
+**Still deferred:** real arm64 hardware, the EL2 hypervisor.
 
 ## Work items
 

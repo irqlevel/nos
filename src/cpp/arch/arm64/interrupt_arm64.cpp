@@ -98,7 +98,14 @@ extern "C" void ArmIrqEntry(Context* ctx)
     for (;;)
     {
         u32 intId = Gic::ReadIar();
-        if (intId >= Gic::SpuriousIntId)
+        /* The special INTIDs 1020..1023 mean "no (further) interrupt to
+           acknowledge" — 1023 is the normal drain-loop terminator. Bound the
+           check to that range: LPIs (>= LpiIntIdBase, i.e. 8192) are numerically
+           above it and MUST fall through to the LPI dispatch below, otherwise
+           they are acknowledged (IAR read raises the running priority) but
+           never EOI'd, wedging the CPU interface against every lower/equal
+           priority interrupt. */
+        if (intId >= Gic::SpuriousIntId && intId < Its::LpiIntIdBase)
         {
             /* An empty first read is a real spurious interrupt; an empty
                re-read is just the dispatch loop draining */

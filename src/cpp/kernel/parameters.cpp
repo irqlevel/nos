@@ -9,7 +9,7 @@ Parameters::Parameters()
     : TraceVga(false)
     , PanicVga(false)
     , SmpOff(false)
-    , ItsEnabled(false)  /* PCIe MSI via ITS is opt-in: its=on */
+    , ItsEnabled(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
     , WxProbe(false)
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
