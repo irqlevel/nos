@@ -150,6 +150,11 @@ high_entry:
     /* SPSel already 1 (EL1h); set the boot stack (virtual, via adrp on a
        virtual PC) and enter C++ with the DTB pointer as a linear-map VA */
     msr     daifset, #0xf
+
+    /* Cache this CPU's index in TPIDR_EL1 (Hal::GetCurrentCpuHwId reads it) */
+    mrs     x0, mpidr_el1
+    and     x0, x0, #0xFF
+    msr     tpidr_el1, x0
     adrp    x1, BootStackTop
     add     x1, x1, :lo12:BootStackTop
     mov     sp, x1
@@ -214,6 +219,7 @@ ap_el1:
 
 ap_high_entry:
     msr     daifset, #0xf
+    msr     tpidr_el1, x27      /* cache this CPU's index */
     adrp    x1, Arm64ApStackTop
     add     x1, x1, :lo12:Arm64ApStackTop
     ldr     x1, [x1, x27, lsl #3]

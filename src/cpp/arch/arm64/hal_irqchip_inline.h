@@ -14,9 +14,12 @@ constexpr u8 IpiVector = 1;
 
 static inline __attribute__((always_inline)) ulong GetCurrentCpuHwId()
 {
-    ulong mpidr;
-    asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
-    return mpidr & 0xFF;
+    /* Per-CPU index cached in TPIDR_EL1 at CPU startup (boot.S), so this is
+       a single sysreg read and does not depend on the MPIDR affinity
+       encoding (Aff0 is not necessarily the linear index on real hw). */
+    ulong idx;
+    asm volatile("mrs %0, tpidr_el1" : "=r"(idx));
+    return idx;
 }
 
 static inline __attribute__((always_inline)) bool IrqChipReady()
