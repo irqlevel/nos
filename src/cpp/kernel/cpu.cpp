@@ -6,6 +6,7 @@
 #include "timer.h"
 
 #include <hal/irqchip.h>
+#include <hal/mmu.h>
 
 #include <kernel/time.h>
 #include <mm/new.h>
@@ -298,6 +299,9 @@ void CpuTable::InvalidateTlbAll()
 {
     Mm::PageTable::InvalidateLocalTlb();
 
+    if (!Hal::TlbShootdownNeedsIpi())
+        return; /* the local TLBI already broadcast to all CPUs */
+
     ulong cpuMask = GetRemoteCpuMask();
     if (cpuMask == 0)
         return;
@@ -316,6 +320,9 @@ void CpuTable::InvalidateTlbAll()
 void CpuTable::InvalidateTlbAddress(ulong virtAddr)
 {
     Mm::PageTable::InvalidateLocalTlbAddress(virtAddr);
+
+    if (!Hal::TlbShootdownNeedsIpi())
+        return;
 
     ulong cpuMask = GetRemoteCpuMask();
     if (cpuMask == 0)
@@ -342,6 +349,9 @@ void CpuTable::InvalidateTlbAddress(ulong virtAddr)
 void CpuTable::InvalidateTlbRange(ulong virtAddr, ulong count)
 {
     Mm::PageTable::InvalidateLocalTlbRange(virtAddr, count);
+
+    if (!Hal::TlbShootdownNeedsIpi())
+        return;
 
     ulong cpuMask = GetRemoteCpuMask();
     if (cpuMask == 0)
