@@ -12,7 +12,10 @@
  *          block 0 = Device-nGnRE (PL011/GIC/virtio visible immediately),
  *          blocks 1-3 = Normal WB (RAM; kernel image is in block 1).
  *   TTBR0: L0[0] -> L1[1] identity 1GiB Normal block covering the kernel,
- *          used only for the instant the MMU turns on.
+ *          used only for the instant the MMU turns on; once execution
+ *          lands in the high half, TTBR0 walks are disabled for good via
+ *          TCR.EPD0 (the identity alias would otherwise leave kernel RAM
+ *          writable+executable at its physical address, bypassing W^X).
  */
 
 #define SCTLR_EL1_RES1   0x30D00800
@@ -28,9 +31,11 @@
    WBWA inner/outer, inner-shareable walks, IPS=40 bits */
 #define TCR_VALUE        0x2B5103510
 
-/* Block descriptor low attributes: AF | SH | AttrIndx | valid block */
+/* Block descriptor attributes: AF | SH | AttrIndx | valid block; device
+   memory additionally gets UXN|PXN (bits 54:53) so speculative instruction
+   fetch can never touch MMIO. */
 #define BLOCK_NORMAL     0x701   /* AF=1 SH=11(inner) AttrIndx=0 valid */
-#define BLOCK_DEVICE     0x405   /* AF=1 SH=00 AttrIndx=1 valid */
+#define BLOCK_DEVICE     0x0060000000000405   /* UXN|PXN AF=1 AttrIndx=1 valid */
 
 #define SPSR_EL1H_DAIF   0x3C5   /* EL1h, DAIF masked */
 
@@ -67,6 +72,12 @@ Start64:
     orr     x2, x2, #3              /* EL1PCTEN|EL1PCEN: timers at EL1 */
     msr     cnthctl_el2, x2
     msr     cntvoff_el2, xzr
+    /* GICv3 sysreg access from EL1 must not trap to EL2 (ICC_SRE_EL2
+       resets with Enable=0 on real hardware) */
+    mrs     x2, icc_sre_el2
+    orr     x2, x2, #(1 << 3)       /* Enable */
+    orr     x2, x2, #1              /* SRE */
+    msr     icc_sre_el2, x2
     ldr     x2, =SCTLR_EL1_RES1
     msr     sctlr_el1, x2
     adr     x2, el1_entry
@@ -76,6 +87,13 @@ Start64:
     eret
 
 el1_entry:
+    /* Known-good SCTLR regardless of how we got here: the EL2 path wrote
+       it before eret, but a direct EL1 entry inherits the CPU model's
+       reset value (SA/A/WXN/EE vary by implementation). */
+    ldr     x1, =SCTLR_EL1_RES1
+    msr     sctlr_el1, x1
+    isb
+
     /* Zero BSS (the bootstrap tables live there) */
     adrp    x1, __bss_start
     add     x1, x1, :lo12:__bss_start
@@ -135,6 +153,30 @@ el1_entry:
     dsb     ish
     isb
 
+    /* Invalidate any stale cache lines over the just-written bootstrap
+       tables: the stores above went straight to memory (MMU off), but
+       reset-time D-cache contents are architecturally UNKNOWN and could
+       shadow them once SCTLR.C goes on. The four table pages are
+       contiguous in BSS. */
+    adrp    x1, BootPgTblHighL0
+    adrp    x2, BootPgTblIdL1
+    add     x2, x2, #4096
+    mrs     x9, ctr_el0
+    ubfx    x9, x9, #16, #4         /* DminLine: log2(words) */
+    mov     x10, #4
+    lsl     x9, x10, x9             /* D-cache line size in bytes */
+5:  dc      ivac, x1
+    add     x1, x1, x9
+    cmp     x1, x2
+    b.lo    5b
+    dsb     sy
+
+    /* Reset-time TLB and I-cache contents are UNKNOWN too */
+    tlbi    vmalle1
+    ic      iallu
+    dsb     nsh
+    isb
+
     /* MMU + caches on */
     mrs     x1, sctlr_el1
     ldr     x2, =(SCTLR_M | SCTLR_C | SCTLR_I)
@@ -150,6 +192,19 @@ high_entry:
     /* SPSel already 1 (EL1h); set the boot stack (virtual, via adrp on a
        virtual PC) and enter C++ with the DTB pointer as a linear-map VA */
     msr     daifset, #0xf
+
+    /* The identity map has done its one job (the MMU-on transition ran at
+       the physical PC). Disable TTBR0 walks for good — a live identity
+       alias would keep kernel RAM writable+executable at its physical
+       address (bypassing W^X) and let wild low-half pointers silently hit
+       RAM instead of faulting. */
+    mrs     x1, tcr_el1
+    orr     x1, x1, #(1 << 7)       /* EPD0 */
+    msr     tcr_el1, x1
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
 
     /* Cache this CPU's index in TPIDR_EL1 (Hal::GetCurrentCpuHwId reads it) */
     mrs     x0, mpidr_el1
@@ -185,6 +240,10 @@ SecondaryEntry:
     orr     x2, x2, #3
     msr     cnthctl_el2, x2
     msr     cntvoff_el2, xzr
+    mrs     x2, icc_sre_el2
+    orr     x2, x2, #(1 << 3)       /* Enable (see BSP path) */
+    orr     x2, x2, #1              /* SRE */
+    msr     icc_sre_el2, x2
     ldr     x2, =SCTLR_EL1_RES1
     msr     sctlr_el1, x2
     adr     x2, ap_el1
@@ -193,6 +252,12 @@ SecondaryEntry:
     msr     spsr_el2, x2
     eret
 ap_el1:
+    /* Known-good SCTLR (see el1_entry): PSCI hands secondaries over with
+       an implementation-defined reset value when we enter at EL1 */
+    ldr     x1, =SCTLR_EL1_RES1
+    msr     sctlr_el1, x1
+    isb
+
     ldr     x1, =MAIR_VALUE
     msr     mair_el1, x1
     ldr     x1, =TCR_VALUE
@@ -208,6 +273,12 @@ ap_el1:
     dsb     ish
     isb
 
+    /* Post-CPU_ON TLB and I-cache contents are UNKNOWN */
+    tlbi    vmalle1
+    ic      iallu
+    dsb     nsh
+    isb
+
     mrs     x1, sctlr_el1
     ldr     x2, =(SCTLR_M | SCTLR_C | SCTLR_I)
     orr     x1, x1, x2
@@ -219,6 +290,16 @@ ap_el1:
 
 ap_high_entry:
     msr     daifset, #0xf
+
+    /* Disable TTBR0 walks, exactly like the BSP path (see high_entry) */
+    mrs     x1, tcr_el1
+    orr     x1, x1, #(1 << 7)       /* EPD0 */
+    msr     tcr_el1, x1
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+
     msr     tpidr_el1, x27      /* cache this CPU's index */
     adrp    x1, Arm64ApStackTop
     add     x1, x1, :lo12:Arm64ApStackTop

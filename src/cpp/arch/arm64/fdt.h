@@ -53,6 +53,7 @@ private:
     ulong StructOff = 0;
     ulong StructSize = 0;
     ulong StringsOff = 0;
+    ulong StringsSize = 0;
     bool Valid = false;
 
     static const u32 Magic = 0xD00DFEED;
@@ -64,6 +65,12 @@ private:
 
     u32 TokenAt(ulong off) const;
     const char* String(u32 off) const;
+    /* Length of the NUL-terminated string at structure offset `off`,
+       bounded by the structure block; (ulong)-1 if unterminated. */
+    ulong BoundedNameLen(ulong off) const;
+    /* StrCmp(String(nameOff), name), refusing to run past the strings
+       block on a corrupt nameOff / unterminated string. */
+    bool StringMatches(u32 nameOff, const char* name) const;
 };
 
 }

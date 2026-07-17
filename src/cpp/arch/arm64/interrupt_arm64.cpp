@@ -137,6 +137,15 @@ extern "C" void ArmIrqEntry(Context* ctx)
             continue;
         }
 
+        /* Registration is bounded to u8 INTIDs, but the GIC can report up
+           to 1019 — never index IntIds with an unregistered-range id */
+        if (intId >= MaxIntIds)
+        {
+            InterruptStats::Inc(IrqDummy);
+            Gic::WriteEoir(intId);
+            continue;
+        }
+
         auto& ve = IntIds[intId];
         if (ve.HandlerCount == 0)
         {

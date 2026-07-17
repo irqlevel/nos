@@ -30,7 +30,9 @@ public:
        route is ignored, the enable lands in this CPU's redistributor. */
     void EnableIrq(u32 intId, ulong mpidr, bool edge);
 
-    void SendSgi(ulong targetCpuAff0, u32 intId);
+    /* targetCpu is the kernel's linear CPU index; the MPIDR affinity is
+       looked up in the Board CPU list (DTB order == linear index). */
+    void SendSgi(ulong targetCpu, u32 intId);
 
     static u32 ReadIar();
     static void WriteEoir(u32 intId);

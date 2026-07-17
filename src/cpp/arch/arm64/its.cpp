@@ -47,7 +47,7 @@ const u64 CmdInvOp = 0x0C;
    Both set Normal Inner WB write-allocate + Inner shareable. Mixing a
    shareable + non-cacheable encoding (the bug of using the BASER layout for
    PROPBASER) wedges the redistributor. */
-const u64 BaserCacheShare = (1ULL << 59) | (1ULL << 10);       /* BASER/CBASER */
+const u64 BaserCacheShare = (0x7ULL << 59) | (1ULL << 10);     /* BASER/CBASER */
 const u64 RedistCacheShare = (0x7ULL << 7) | (1ULL << 10);     /* PROP/PENDBASER */
 
 const u8 LpiPriority = 0xA0;
@@ -129,7 +129,8 @@ bool Its::Setup(ulong itsPhys, ulong gicrBase, ulong gicrSize)
     BootIcid = 0;
     CmdMapc(BootIcid, BootRdBase, true);
     CmdSync(BootRdBase);
-    WaitCommands();
+    if (!WaitCommands())
+        return false;
 
     Ready = true;
     Trace(0, "Its: ready");
@@ -190,10 +191,12 @@ bool Its::EnableLpisOnRedist(ulong gicrBase, ulong gicrSize)
     asm volatile("dsb sy" ::: "memory");
 
     /* RDbase for MAPC/SYNC: PTA=1 -> RD_base phys >> 16; PTA=0 -> processor
-       number (0 for the boot CPU on QEMU virt). */
+       number (0 for the boot CPU on QEMU virt). The phys is derived
+       arithmetically: rd lives in the premapped device GiB, which
+       VirtToPhys cannot walk (same reason ItsPhys is stored explicitly). */
     if (Pta)
     {
-        ulong rdPhys = Mm::PageTable::GetInstance().VirtToPhys(rd);
+        ulong rdPhys = gicrBase + (rd - gicrVa);
         BootRdBase = rdPhys >> 16;
     }
     else
@@ -250,8 +253,8 @@ bool Its::ProvisionTables()
 
         Write64(reg, val);
         u64 readback = Read64(reg);
-        Trace(0, "Its: baser[%d] type %u entsz %u pages %u -> 0x%p",
-            i, type, entrySize, pages, readback);
+        Trace(0, "Its: baser[%u] type %u entsz %u pages %u -> 0x%p",
+            (ulong)i, (ulong)type, (ulong)entrySize, pages, readback);
     }
     return true;
 }
@@ -286,17 +289,18 @@ void Its::PostCommand(const u64 cmd[4])
     Write64(ItsBase + GitsCwriter, CmdWriteOff);
 }
 
-void Its::WaitCommands()
+bool Its::WaitCommands()
 {
     /* Command processed when CREADR catches up to CWRITER */
     for (ulong spin = 0; spin < 1000000; spin++)
     {
         if ((Read64(ItsBase + GitsCreadr) & ~0x1FULL) == CmdWriteOff)
-            return;
+            return true;
         asm volatile("yield");
     }
     Trace(0, "Its: command queue stall (creadr 0x%p cwriter 0x%p)",
         Read64(ItsBase + GitsCreadr), CmdWriteOff);
+    return false;
 }
 
 void Its::CmdMapd(u32 deviceId, u64 ittPhys, u32 sizeBits, bool valid)
@@ -373,7 +377,8 @@ bool Its::MapDevice(u32 deviceId, u32 numEvents)
 
     CmdMapd(deviceId, ittPhys, eventBits, true);
     CmdSync(BootRdBase);
-    WaitCommands();
+    if (!WaitCommands())
+        return false; /* the ITT allocation is leaked by design (never freed) */
 
     Devices[free].DeviceId = deviceId;
     Devices[free].Used = true;
@@ -412,7 +417,13 @@ u32 Its::MapEvent(u32 deviceId, u32 eventId, InterruptHandler& handler,
     CmdMapti(deviceId, eventId, lpi, BootIcid);
     CmdInv(deviceId, eventId);
     CmdSync(BootRdBase);
-    WaitCommands();
+    if (!WaitCommands())
+    {
+        /* Don't hand the driver a dead interrupt: report failure (the
+           LPI id and config-table slot stay burned, which is fine) */
+        LpiHandlers[slot].Handler = nullptr;
+        return 0;
+    }
 
     /* The device DMA-writes the eventId to the ITS translate register; hand
        back its PHYSICAL address. (VirtToPhys can't resolve ItsBase: it lives

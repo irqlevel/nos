@@ -19,7 +19,11 @@ ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
     sp -= 14;
     for (int i = 0; i < 14; i++)
         sp[i] = 0;
-    sp[0] = 0;                          /* DAIF: IRQs enabled */
+    /* DAIF: IRQs enabled, D/A/F stay masked — the PSTATE every other
+       context runs with (boot masks all four, InterruptEnable clears only
+       I), so SError delivery does not depend on which task is current */
+    const ulong DaifDAF = (1UL << 9) | (1UL << 8) | (1UL << 6);
+    sp[0] = DaifDAF;
     sp[2] = arg;                        /* x19 */
     sp[3] = entry;                      /* x20 */
     sp[13] = (ulong)&Arm64TaskEntryThunk; /* x30 */

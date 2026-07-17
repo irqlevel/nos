@@ -53,10 +53,10 @@ python3 scripts/udpsh.py 127.0.0.1   # remote shell over UDP
 ./scripts/gdb-arm64.sh         # attach GDB (qemu-arm64.sh -s), needs gdb-multiarch
 ```
 
-PCIe on arm64 (ECAM + GICv3 ITS) is present but MSI *delivery* has an open
-GIC-ITS bug, so it is opt-in: boot with `its=on` to exercise NVMe-over-MSI
-(enumeration/identify/registration work; interrupt-driven completion
-wedges the GIC). Default (`its=off`) degrades MSI gracefully.
+PCIe on arm64 (ECAM + GICv3 ITS) works end-to-end: NVMe-over-MSI delivers
+interrupt-driven completions via ITS LPIs. `its=on` is the default; boot
+with `its=off` to disable the ITS and degrade MSI gracefully (virtio-mmio
+devices don't need it).
 
 Debug with GDB (QEMU must be started with `-s`):
 
@@ -83,7 +83,7 @@ Source layout (detailed in `README.md` "Project layout"):
 - `src/cpp/arch/x86_64/` — everything x86-specific: Multiboot2 entry + AP trampoline (`boot64.asm`), CPU primitives (`asm.asm`, `asm.h`), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding (`pte.h`), GRUB parsing, HAL inline/impl backends. Only arch code, the documented exemptions (`kernel/main.cpp`, `kernel/cmd.cpp`, `kernel/irq_balance.cpp`) and x86-only drivers may include these headers
 - `src/cpp/kernel/` — scheduling, tasks, interrupt dispatch, SoftIrq, timers, timekeeping seam (`time.h`), locks (spinlock/mutex/seqlock/rwlock), panic/backtrace, dmesg ring buffer, the interactive shell (`cmd.cpp`), the Rust FFI bridge (`rust_ffi.cpp`), symbol table
 - `src/cpp/mm/` — 4-level page tables (`VirtToPhys` walk), page allocator (fixed-size block allocator), pool allocator, VA allocator, `new`/`delete`
-- `src/cpp/drivers/` — serial, VGA, PIT/HPET/RTC, 8042 keyboard, PCI, MSI-X, ACPI, virtio (blk/net/scsi/rng) behind the `VirtioTransport` interface (legacy+modern virtio-pci today)
+- `src/cpp/drivers/` — serial, VGA, PIT/HPET/RTC, 8042 keyboard, PCI, MSI-X, ACPI, virtio (blk/net/scsi/rng) behind the `VirtioTransport` interface (legacy+modern virtio-pci on x86, virtio-mmio on arm64)
 - `src/cpp/block/` — async interrupt-driven block request queue, MBR partitions
 - `src/cpp/net/` — device abstraction, ARP/ICMP/DHCP/DNS/TCP/UDP, HTTP client, UDP shell
 - `src/cpp/fs/` — VFS with mount points, ramfs, nanofs (on-disk), ext2 (ro), procfs
@@ -101,7 +101,7 @@ These come from `.cursor/rules/kernel-conventions.mdc` (C++) and `rust-kernel-co
 - **OOM and `operator new`**: plain `new T(...)` **panics on OOM** and never returns `nullptr` — the compiler assumes the plain form is non-null, so a null check after it is dead code. Fallible allocations must use `new (Mm::NoThrow) T(...)` (the compiler keeps that null check) or `Mm::TAlloc<T, Tag>()`, and check the result. See the comment in `mm/new.h` for why the plain form cannot be made nullable.
 - **Memory refcounting** is explicit and easy to get wrong — `MapPage` does `+1`, `GetPage` does `+1` (caller must `Put()`), `UnmapPage` is net-0. To free a mapped page: `UnmapPage` + `FreePage` + `Put`. See the table in the cursor rule.
 - **Never map DMA/device memory at `physAddr + KernelSpaceBase` directly.** Always go through `Mm::MapPages` / `Mm::AllocMapPages` so the `VaAllocator` tracks the VA. See the allocation API table in `mm/new.h`.
-- **Memory barriers**: `Barrier()` is gone. Pick the semantic variant from `hal/barrier.h`: `Hal::SmpWmb/SmpRmb` (CPU↔CPU publish/consume, e.g. seqlock), `Hal::DmaWmb/DmaRmb` (CPU↔device rings/doorbells/OWN bits), `Hal::CompilerBarrier` (compiler-only). On x86 they all compile to a compiler barrier; on arm64 they become `dmb` — misclassification is invisible on x86 and bites on arm64.
+- **Memory barriers**: `Barrier()` is gone. Pick the semantic variant from `hal/barrier.h`: `Hal::SmpWmb/SmpRmb` (CPU↔CPU publish/consume, e.g. seqlock), `Hal::DmaWmb/DmaRmb` (CPU↔device rings/doorbells/OWN bits), `Hal::CompilerBarrier` (compiler-only). On x86 they all compile to a compiler barrier; on arm64 they become `dmb` — misclassification is invisible on x86 and bites on arm64. In Rust, device ordering uses `kcore::barrier::dma_wmb/dma_rmb` (`dmb oshst/oshld` on arm64) — `core::sync::atomic::fence` is NOT a substitute: it emits `dmb ish`, whose inner-shareable domain does not order against a PCIe master. Consuming device-written state needs a read barrier *after* the index/phase/OWN check and before the payload reads (an address-independent load pair is not ordered by a control dependency on arm64) — see `VirtQueue::GetUsed`, nvme `read_cqe`, r8168 `harvest`.
 - **Arch discipline**: common code includes `hal/*` headers only. `Hal::` wrappers: `IsInterruptEnabled`, `IrqSave/IrqRestore` (not RFLAGS), `GetSp/SetSp/GetFp` (not GetRsp/GetRbp), `ReadCycleCounter` (not ReadTsc), `IrqEoi/SendIpi/GetCurrentCpuHwId` (not Lapic::), `TlbFlushPage/TlbFlushAll` (not Invlpg/CR3). Per-arch member functions (e.g. `CpuTable::StartAll`) live in arch TUs.
 - **Style**: namespaces `Kernel::`, `Kernel::Mm::`, `Stdlib::`. Trace with `Trace(level, "fmt", …)` (level 0 always visible) / Rust `trace!(...)`. No magic numbers — name constants. Preserve existing formatting; don't reflow unchanged code. 4-space indent.
 - The C++ build uses `-Wall -Wextra -Werror`, so warnings break the build.

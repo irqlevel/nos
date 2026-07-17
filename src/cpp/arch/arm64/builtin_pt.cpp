@@ -17,8 +17,10 @@ namespace Mm
    at KernelSpaceBase. Same 9-9-9-9-12 geometry as x86, so the same class
    layout (P4Page = L0, P3KernelPage = L1, P2KernelPage = L2) is reused.
    Differences from x86: physical ranges below the RAM base are mapped
-   Device-nGnRE (no MTRRs to fix cacheability), and there is no low-half
-   identity map — user VAs go through TTBR0, which stays empty. */
+   Device-nGnRE (no MTRRs to fix cacheability), ranges past the end of RAM
+   are left unmapped (a Normal-cacheable mapping would license speculative
+   reads of unbacked bus space), and there is no low-half identity map —
+   TTBR0 walks are disabled for good via TCR.EPD0 (boot.S). */
 
 /* All QEMU-virt MMIO sits below the RAM base and is covered by the 1GiB
    Device-nGnRE L1 block InstallEarlyDeviceBlock puts into the real table. */
@@ -28,6 +30,13 @@ bool BuiltinPageTable::Setup()
 {
     auto& board = Board::GetInstance();
     ulong ramBase = board.MemRegions[0].Addr;
+    ulong ramEnd = ramBase;
+    for (ulong i = 0; i < board.MemRegionCount; i++)
+    {
+        ulong end = board.MemRegions[i].Addr + board.MemRegions[i].Size;
+        if (end > ramEnd)
+            ramEnd = end;
+    }
 
     auto& l0Entry = P4Page.Entry[256];
 
@@ -48,12 +57,20 @@ bool BuiltinPageTable::Setup()
         for (size_t j = 0; j < 512; j++)
         {
             auto& l2Entry = l2Page.Entry[j];
+            ulong phys = VirtToPhys(addr);
 
-            l2Entry.SetAddress(VirtToPhys(addr));
+            /* Past the end of RAM there is nothing to map */
+            if (phys >= ramEnd && phys >= ramBase)
+            {
+                addr += (2 * Const::MB);
+                continue;
+            }
+
+            l2Entry.SetAddress(phys);
             l2Entry.SetWritable();
             l2Entry.SetHuge();
             l2Entry.SetPresent();
-            if (VirtToPhys(addr) < ramBase)
+            if (phys < ramBase)
                 l2Entry.SetCacheDisabled();
 
             addr += (2 * Const::MB);

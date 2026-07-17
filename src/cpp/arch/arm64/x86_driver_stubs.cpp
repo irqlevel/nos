@@ -7,8 +7,9 @@
 
 /* Link stubs for the x86-only device paths still referenced from common
    driver code on arm64:
-   - the PCI Init(...) overloads of the virtio drivers (never called: PCI
-     enumeration does not exist here until the ECAM work lands),
+   - the PCI Init(...) overloads of the virtio drivers (never called:
+     VirtioPci::Probe returns false, so ECAM enumeration never binds them
+     — virtio devices arrive over virtio-mmio here),
    - the x86 asm interrupt entry stubs returned by GetHandlerFn (unused:
      arm64 dispatch is object-based),
    - VirtioScsi (not yet ported to the mmio transport).
@@ -108,7 +109,7 @@ u8   VirtioPci::EnableMsixVector(u16 index, InterruptHandler& handler)
 {
     (void)index;
     (void)handler;
-    return 0;
+    StubTrap();
 }
 
 }

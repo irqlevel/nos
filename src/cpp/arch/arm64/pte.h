@@ -20,8 +20,9 @@ namespace Mm
      used for 2MiB mappings at the L2 level — same geometry as x86.
    - SetWritable() is a no-op: AP[7]=0 (the default) is EL1-RW, and this
      kernel maps everything writable today (x86 also always sets W).
-   - SetCacheDisabled() selects MAIR AttrIndx 1 = Device-nGnRE and clears
-     SH (ignored for device memory). Default AttrIndx 0 = Normal WB.
+   - SetCacheDisabled() selects MAIR AttrIndx 1 = Device-nGnRE, clears SH
+     (ignored for device memory) and sets PXN|UXN. Default AttrIndx 0 =
+     Normal WB.
    - No hardware AF management: a valid entry without AF faults, so AF is
      always set together with the valid bit. */
 struct Pte final
@@ -71,7 +72,9 @@ struct Pte final
     void SetCacheDisabled()
     {
         Value &= ~(AttrIdxMask | ShInner);
-        Value |= AttrIdxDevice;
+        /* Device memory is never executable: a speculative instruction
+           fetch from MMIO can trigger read side effects on real hardware */
+        Value |= AttrIdxDevice | PxnBit | UxnBit;
     }
 
     void SetHuge()

@@ -77,7 +77,11 @@ impl Queue {
      * The status word (which holds the phase bit) is read first, on its
      * own: a single volatile read of the whole 16-byte entry lets the
      * compiler load the dwords in any order, which could pair a valid
-     * phase bit with stale cid/status from before the controller's write. */
+     * phase bit with stale cid/status from before the controller's write.
+     * The dma_rmb closes the CPU half of the same hazard: a control
+     * dependency does not order load->load on arm64, so without it the
+     * full-entry read (and any later read of DMA'd data buffers) could be
+     * satisfied before the phase-bit load. */
     fn read_cqe(&self, slot: usize) -> Option<CompletionEntry> {
         let src = unsafe {
             (self.cq_dma.as_ptr() as *const CompletionEntry).add(slot)
@@ -86,6 +90,7 @@ impl Queue {
         if (status & 1 != 0) != self.cq_phase {
             return None;
         }
+        kcore::barrier::dma_rmb();
         Some(unsafe { core::ptr::read_volatile(src) })
     }
 
@@ -104,9 +109,10 @@ impl Queue {
 
     /* Ring the SQ tail doorbell to notify the controller. */
     pub fn ring_sq_doorbell(&self, regs: &MmioRegion) {
-        /* The SQE stores must be visible to the device before the doorbell
-           write; Release orders them on weakly-ordered arches (free on x86). */
-        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        /* The SQE stores must be visible to the DEVICE before the doorbell
+           write: dma_wmb (dmb oshst on arm64 — an atomic Release fence is
+           only dmb ish, whose domain excludes a PCIe master; free on x86). */
+        kcore::barrier::dma_wmb();
         let off = sq_doorbell_offset(self.qid, self.db_stride);
         regs.write32(off, self.sq_tail as u32);
     }

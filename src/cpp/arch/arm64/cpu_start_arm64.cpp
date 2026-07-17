@@ -19,7 +19,12 @@ namespace
 
 const u32 PsciCpuOn = 0xC4000003;
 
-/* PSCI return codes: 0 success */
+/* PSCI return codes: 0 success. SMCCC allows the callee to clobber
+   x4-x17 (QEMU's PSCI happens to preserve them; TF-A does not). */
+#define SMCCC_CLOBBERS \
+    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", \
+    "x12", "x13", "x14", "x15", "x16", "x17", "memory"
+
 long PsciCall(u32 fn, ulong a1, ulong a2, ulong a3)
 {
     register ulong x0 asm("x0") = fn;
@@ -28,9 +33,11 @@ long PsciCall(u32 fn, ulong a1, ulong a2, ulong a3)
     register ulong x3 asm("x3") = a3;
 
     if (Board::GetInstance().PsciUseHvc)
-        asm volatile("hvc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+        asm volatile("hvc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3)
+            : SMCCC_CLOBBERS);
     else
-        asm volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3) : "memory");
+        asm volatile("smc #0" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3)
+            : SMCCC_CLOBBERS);
     return (long)x0;
 }
 

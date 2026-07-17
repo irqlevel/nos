@@ -1,4 +1,5 @@
 #include "gicv3.h"
+#include "board.h"
 
 #include <kernel/trace.h>
 #include <kernel/panic.h>
@@ -192,14 +193,28 @@ void Gic::EnableIrq(u32 intId, ulong mpidr, bool edge)
         1U << (intId % 32));
 }
 
-void Gic::SendSgi(ulong targetCpuAff0, u32 intId)
+void Gic::SendSgi(ulong targetCpu, u32 intId)
 {
     BugOn(intId >= 16);
-    BugOn(targetCpuAff0 >= 16);
 
-    /* Aff3/2/1 = 0 (QEMU virt numbers CPUs linearly in Aff0),
-       target list = bit per Aff0 */
-    u64 sgir = ((u64)intId << 24) | (1UL << targetCpuAff0);
+    auto& board = Board::GetInstance();
+    ulong mpidr = (targetCpu < board.CpuCount)
+        ? board.CpuMpidr[targetCpu]
+        : targetCpu; /* pre-Board fallback: linear Aff0 (QEMU virt) */
+
+    u64 aff0 = mpidr & 0xFF;
+    u64 aff1 = (mpidr >> 8) & 0xFF;
+    u64 aff2 = (mpidr >> 16) & 0xFF;
+    u64 aff3 = (mpidr >> 32) & 0xFF;
+    /* One ICC_SGI1R write targets a single 16-CPU Aff0 group */
+    BugOn(aff0 >= 16);
+
+    u64 sgir = (aff3 << 48) | (aff2 << 32) | (aff1 << 16) |
+               ((u64)intId << 24) | (1UL << aff0);
+
+    /* Publish before kicking: stores queued for the target CPU (IPI work
+       lists etc.) must be observable before the SGI arrives */
+    asm volatile("dsb ishst" ::: "memory");
     asm volatile("msr icc_sgi1r_el1, %0" :: "r"(sgir));
     asm volatile("isb");
 }

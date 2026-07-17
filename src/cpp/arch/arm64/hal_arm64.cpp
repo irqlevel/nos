@@ -19,13 +19,18 @@ namespace
 const u32 PsciSystemOff = 0x84000008;
 const u32 PsciSystemReset = 0x84000009;
 
+/* SMCCC: the callee may clobber x1-x17 */
+#define SMCCC_CLOBBERS \
+    "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", \
+    "x12", "x13", "x14", "x15", "x16", "x17", "memory"
+
 void PsciCall(u32 fn)
 {
     register ulong x0 asm("x0") = fn;
     if (Kernel::Board::GetInstance().PsciUseHvc)
-        asm volatile("hvc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
+        asm volatile("hvc #0" : "+r"(x0) :: SMCCC_CLOBBERS);
     else
-        asm volatile("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
+        asm volatile("smc #0" : "+r"(x0) :: SMCCC_CLOBBERS);
 }
 
 }
