@@ -1,5 +1,8 @@
 #include <kernel/time.h>
 #include <kernel/trace.h>
+#include <mm/memory_map.h>
+
+#include "board.h"
 
 /* arm64 implementation of the kernel/time.h API over the ARM generic
    timer: CNTVCT_EL0 at CNTFRQ_EL0 Hz, architecturally specified — no
@@ -14,6 +17,7 @@ namespace
 
 u64 BootCount;
 u64 FreqHz;
+ulong BootEpochSecs;
 
 u64 ReadCntvct()
 {
@@ -48,6 +52,19 @@ void TimeInit()
         BootCount = ReadCntvct();
     }
     Trace(0, "TimeInit: generic timer freq %u Hz", FreqHz);
+
+    /* PL031 RTC: seconds since the Unix epoch (QEMU virt), through the
+       premapped device GiB. The x86 twin reads the CMOS RTC. */
+    ulong pl031 = Board::GetInstance().Pl031Base;
+    if (pl031 != 0)
+    {
+        u32 now = *reinterpret_cast<volatile u32*>(
+            Mm::MemoryMap::KernelSpaceBase + pl031);
+        ulong bootedSecs = CountToNs(ReadCntvct() - BootCount) /
+            Const::NanoSecsInSec;
+        BootEpochSecs = now - bootedSecs;
+        Trace(0, "TimeInit: rtc epoch %u", (ulong)now);
+    }
 }
 
 Stdlib::Time GetBootTime()
@@ -80,8 +97,7 @@ void BusyWait(ulong nanoSecs)
 
 ulong GetWallTimeSecs()
 {
-    /* PL031 RTC lands in M3; boot-relative until then */
-    return GetBootTime().NanoSecs / Const::NanoSecsInSec;
+    return BootEpochSecs + GetBootTime().NanoSecs / Const::NanoSecsInSec;
 }
 
 }
