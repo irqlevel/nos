@@ -287,6 +287,8 @@ src/rust/target/$(RUST_TARGET)/release/libkernel.a:
 
 nos-arm64.img: $(KERNEL)
 	$(OBJCOPY) -O binary $< $@
+	@mkdir -p bin
+	cp $(KERNEL) bin/kernel-arm64.elf
 
 smoke:
 	./scripts/smoke-test.sh

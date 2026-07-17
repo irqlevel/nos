@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     e2fsprogs \
     qemu-utils \
     qemu-system-x86 \
+    qemu-system-arm \
     python3 \
     curl \
     && rm -rf /var/lib/apt/lists/*

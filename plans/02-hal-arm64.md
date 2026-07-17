@@ -137,11 +137,18 @@ UDP shell with `-smp 4`:
 - Verified: `scripts/smoke-arm64.sh` green under TCG (16s) and HVF (4s);
   x86 smoke green after every step.
 
-**Deferred / follow-ups:** Rust on arm64 (rust_ffi.cpp still couples to
-the IDT; the drivers and kcore are already `target_arch`-gated),
-virtio-scsi over mmio, PL031 wall clock, graceful shutdown teardown
-(arm64 goes straight to PSCI), PCIe ECAM + GIC ITS + NVMe/r8168,
-`.l*`/W^X hardening of the arm64 mappings.
+**Follow-ups landed (branch arm64-follow-ups):** Rust on arm64
+(rust_ffi is arch-clean; nvme runs, r8168/tco stay x86-only), virtio-scsi
+over mmio, PL031 wall clock, graceful shutdown/PSCI teardown, PCIe ECAM
++ GICv3 ITS + NVMe (enumeration/identify/block-registration + MSI mapping
+all work; MSI *delivery* wedges the GIC — opt-in via `its=on`), CI matrix
+(x86_64 + aarch64 build + TCG smoke), cppcheck over the arm64 tree,
+scripts/gdb-arm64.sh.
+
+**Still deferred:** the GIC-ITS MSI-delivery bug (NVMe interrupt-driven
+I/O), r8168 on arm64, W^X / RX-text hardening of the arm64 mappings,
+per-CPU timers, broadcast-TLBI, TPIDR_EL1 per-CPU caching, real arm64
+hardware, the EL2 hypervisor.
 
 ## Work items
 
