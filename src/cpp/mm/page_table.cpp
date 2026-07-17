@@ -337,6 +337,61 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
     return true;
 }
 
+bool PageTable::ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable,
+    bool executable)
+{
+    Stdlib::AutoLock lock(Lock);
+
+    if (Root == 0)
+        return false;
+
+    BugOn(virtAddr & (Const::PageSize - 1));
+
+    ulong end = virtAddr + Stdlib::RoundUp(sizeBytes, Const::PageSize);
+
+    /* Runs after the real page table is active, so the page-table pages are
+       reached through the TmpMap window (the builtin linear map is gone),
+       exactly like MapPage/UnmapPage. */
+    for (ulong va = virtAddr; va < end; va += Const::PageSize)
+    {
+        PtePage* l4 = (PtePage*)TmpMapPage(Root);
+        Pte* l4e = &l4->Entry[Pte::L4Index(va)];
+        if (!l4e->Present()) { TmpUnmapPage((ulong)l4); return false; }
+        ulong l3phys = l4e->Address();
+        TmpUnmapPage((ulong)l4);
+
+        PtePage* l3 = (PtePage*)TmpMapPage(l3phys);
+        Pte* l3e = &l3->Entry[Pte::L3Index(va)];
+        if (!l3e->Present()) { TmpUnmapPage((ulong)l3); return false; }
+        ulong l2phys = l3e->Address();
+        TmpUnmapPage((ulong)l3);
+
+        PtePage* l2 = (PtePage*)TmpMapPage(l2phys);
+        Pte* l2e = &l2->Entry[Pte::L2Index(va)];
+        if (!l2e->Present() || l2e->Huge())
+        {
+            TmpUnmapPage((ulong)l2); /* kernel image is 4KiB-mapped */
+            return false;
+        }
+        ulong l1phys = l2e->Address();
+        TmpUnmapPage((ulong)l2);
+
+        PtePage* l1 = (PtePage*)TmpMapPage(l1phys);
+        Pte* l1e = &l1->Entry[Pte::L1Index(va)];
+        if (!l1e->Present()) { TmpUnmapPage((ulong)l1); return false; }
+
+        if (!writable)
+            l1e->SetReadOnly();
+        if (!executable)
+            l1e->SetNoExecute();
+        TmpUnmapPage((ulong)l1);
+
+        InvalidateLocalTlbAddress(va);
+    }
+
+    return true;
+}
+
 Page* PageTable::GetPage(ulong phyAddr)
 {
     BugOn(phyAddr & (Const::PageSize - 1));

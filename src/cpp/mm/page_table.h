@@ -123,6 +123,12 @@ public:
        (currently: HPET and driver init in Main2/BpStartup). */
     ulong MapMmioRegion(ulong physAddr, ulong sizeBytes);
 
+    /* Tighten permissions on an existing kernel-image mapping to enforce
+       W^X: writable=false makes the range read-only, executable=false makes
+       it non-executable (NX/PXN). Walks the 4KiB leaf PTEs in [virtAddr,
+       virtAddr+sizeBytes) and invalidates the local TLB. */
+    bool ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable, bool executable);
+
     Page* AllocPage();
     static const ulong MaxContiguousPages = 128;
     Page* AllocContiguousPages(ulong count);

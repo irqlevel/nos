@@ -65,6 +65,16 @@ struct Pte final
         Value |= (1UL << WritableBit);
     }
 
+    void SetReadOnly()
+    {
+        Value &= ~(1UL << WritableBit);
+    }
+
+    void SetNoExecute()
+    {
+        Value |= NxBit; /* requires EFER.NXE; unused until x86 W^X lands */
+    }
+
     void ClearPresent()
     {
         Value &= ~(1UL << PresentBit);
@@ -112,6 +122,8 @@ struct Pte final
     static const ulong HugeBit = 7;
     static const ulong MaxBit = 12;
     static const ulong BitMask = (1UL << MaxBit) - 1;
+
+    static const ulong NxBit = 1UL << 63;
 
     static const ulong HugePageShift = 21;
     static const ulong HugePageSize = 1UL << HugePageShift;
