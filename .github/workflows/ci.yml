@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld llvm nasm cppcheck \
-            grub2-common grub-pc-bin xorriso \
+            grub2-common grub-pc-bin xorriso mtools \
             qemu-system-x86 qemu-system-arm
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
             sh -s -- -y --default-toolchain nightly --component rust-src
