@@ -54,6 +54,8 @@ const ulong MemRegionReserved = 2;
 
 }
 
+extern "C" char KernelStart[], KernelText[], KernelRodata[], KernelEnd[];
+
 namespace Kernel
 {
 namespace Mm
@@ -376,6 +378,29 @@ extern "C" void MainArm64(void* dtb)
 
     if (!pt.SetupFreePagesList())
         Panic("Can't setup free pages list");
+
+    /* W^X: kernel text is RX, everything else in the image is RW+NX.
+       Runs after the free-pages list so the walk sees the final image
+       mapping. (x86 keeps its historical RWX for now.) */
+    {
+        ulong textStart = (ulong)KernelStart;
+        ulong textEnd = (ulong)KernelText;
+        ulong rodataEnd = (ulong)KernelRodata;
+        ulong imgEnd = (ulong)KernelEnd;
+        pt.ProtectRange(textStart, textEnd - textStart, false, true);     /* RX */
+        pt.ProtectRange(textEnd, rodataEnd - textEnd, false, false);      /* RO+NX */
+        pt.ProtectRange(rodataEnd, imgEnd - rodataEnd, true, false);      /* RW+NX */
+        asm volatile("dsb ish; isb");
+        Trace(0, "W^X: text [0x%p,0x%p) rodata [0x%p,0x%p) data [0x%p,0x%p)",
+            textStart, textEnd, textEnd, rodataEnd, rodataEnd, imgEnd);
+
+        if (Parameters::GetInstance().IsWxProbe())
+        {
+            Trace(0, "W^X probe: writing to text 0x%p (expect data abort)", textStart);
+            *reinterpret_cast<volatile u32*>(textStart) = 0;
+            Trace(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
+        }
+    }
 
     /* Test paging (mirrors Main2) */
     {

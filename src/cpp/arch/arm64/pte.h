@@ -85,6 +85,16 @@ struct Pte final
         /* AP[7]=0 (default) is already EL1 read-write */
     }
 
+    void SetReadOnly()
+    {
+        Value |= ApReadOnly; /* AP[2] (bit 7) -> read-only at EL1 */
+    }
+
+    void SetNoExecute()
+    {
+        Value |= PxnBit | UxnBit; /* never executable */
+    }
+
     void ClearPresent()
     {
         Value &= ~(1UL << PresentBit);
@@ -130,6 +140,9 @@ struct Pte final
     static const ulong AttrIdxDevice = 1UL << 2; /* MAIR idx1 = Device-nGnRE */
     static const ulong ShInner = 3UL << 8;
     static const ulong AfBit = 1UL << 10;
+    static const ulong ApReadOnly = 1UL << 7;    /* AP[2]: read-only */
+    static const ulong PxnBit = 1UL << 53;       /* privileged execute-never */
+    static const ulong UxnBit = 1UL << 54;       /* unprivileged execute-never */
     static const ulong HugeSwBit = 1UL << 55;    /* software bit: block entry */
 
     static const ulong AddrMask = 0x0000FFFFFFFFF000UL;

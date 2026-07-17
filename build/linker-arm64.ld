@@ -21,7 +21,11 @@ SECTIONS
         *(.text.*)
     }
 
+    /* W^X boundaries (page-aligned): [KernelStart, KernelText) = RX,
+       [KernelText, KernelRodata) = RO+NX, [KernelRodata, KernelEnd) = RW+NX. */
     . = ALIGN(4K);
+    KernelText = .;
+
     .rodata : AT (ADDR(.rodata) - 0xFFFF800000000000)
     {
         *(.rodata)
@@ -29,6 +33,8 @@ SECTIONS
     }
 
     . = ALIGN(4K);
+    KernelRodata = .;
+
     .data : AT (ADDR(.data) - 0xFFFF800000000000)
     {
         *(.data)

@@ -20,6 +20,7 @@ public:
     bool IsPanicVga();
     bool IsSmpOff();
     bool IsItsEnabled();
+    bool IsWxProbe();
 
     bool IsConsoleSerial();
     bool IsConsoleVga();
@@ -58,6 +59,7 @@ private:
     bool PanicVga;
     bool SmpOff;
     bool ItsEnabled;
+    bool WxProbe;
     ConsoleMode ConMode;
     DhcpMode DhcpMd;
     u16 UdpShellPort;

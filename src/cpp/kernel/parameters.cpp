@@ -10,6 +10,7 @@ Parameters::Parameters()
     , PanicVga(false)
     , SmpOff(false)
     , ItsEnabled(false)  /* PCIe MSI via ITS is opt-in: its=on */
+    , WxProbe(false)
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
@@ -40,6 +41,11 @@ bool Parameters::IsSmpOff()
 bool Parameters::IsItsEnabled()
 {
     return ItsEnabled;
+}
+
+bool Parameters::IsWxProbe()
+{
+    return WxProbe;
 }
 
 bool Parameters::IsConsoleSerial()
@@ -142,6 +148,10 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     else if (Stdlib::StrCmp(key, "its") == 0)
     {
         ItsEnabled = (Stdlib::StrCmp(value, "off") != 0);
+    }
+    else if (Stdlib::StrCmp(key, "wxprobe") == 0)
+    {
+        WxProbe = (Stdlib::StrCmp(value, "on") == 0);
     }
     else if (Stdlib::StrCmp(key, "smp") == 0)
     {
