@@ -196,6 +196,7 @@ CXX_SRC_aarch64 = \
     src/cpp/drivers/virtqueue.cpp \
     src/cpp/drivers/virtio_mmio.cpp \
     src/cpp/drivers/virtio_blk.cpp \
+    src/cpp/drivers/virtio_scsi.cpp \
     src/cpp/drivers/virtio_net.cpp \
     src/cpp/drivers/virtio_rng.cpp \
     src/cpp/lib/stdlib.cpp \

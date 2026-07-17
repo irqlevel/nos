@@ -143,11 +143,6 @@ u8   VirtioPci::EnableMsixVector(u16 index, InterruptHandler& handler)
     return 0;
 }
 
-void VirtioScsi::DrainAllQueues()
-{
-    /* No scsi instances on arm64 yet */
-}
-
 }
 
 /* Pci methods beyond the Dump stub (see pci_stub.cpp) */
