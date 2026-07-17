@@ -238,6 +238,7 @@ BootPgTblIdL1:
     .space 4096
 BootStack:
     .space 16384
+    .globl BootStackTop
 BootStackTop:
     .globl Arm64ApTtbr1
 Arm64ApTtbr1:
