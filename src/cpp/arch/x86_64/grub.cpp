@@ -20,6 +20,7 @@ static bool AcpiRsdpIsNew;
 
 static bool FramebufferPresent;
 static u8 FramebufferType;
+static FramebufferInfo Framebuffer;
 
 const void* GetAcpiRsdp(size_t& size)
 {
@@ -35,6 +36,11 @@ bool HasFramebufferInfo()
 bool IsFramebufferEgaText()
 {
     return FramebufferType == MultiBootFramebufferTypeEgaText;
+}
+
+const FramebufferInfo* GetFramebufferInfo()
+{
+    return FramebufferPresent ? &Framebuffer : nullptr;
 }
 
 static void SaveAcpiRsdp(MultiBootTag* tag, bool isNew)
@@ -158,15 +164,45 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
         }
         case MultiBootTagTypeFramebuffer:
         {
-            if (tag->Size < sizeof(MultiBootTagFramebuffer))
+            if (tag->Size < MultiBootTagFramebufferCommonSize)
                 break;
 
             MultiBootTagFramebuffer* fb = reinterpret_cast<MultiBootTagFramebuffer*>(tag);
             FramebufferPresent = true;
             FramebufferType = fb->FbType;
-            Trace(0, "Framebuffer addr 0x%p %ux%u bpp %u type %u",
+
+            Framebuffer.Addr = fb->Addr;
+            Framebuffer.Pitch = fb->Pitch;
+            Framebuffer.Width = fb->Width;
+            Framebuffer.Height = fb->Height;
+            Framebuffer.Bpp = fb->Bpp;
+            Framebuffer.Type = fb->FbType;
+
+            /* Color field layout only exists in the RGB variant */
+            if (fb->FbType == MultiBootFramebufferTypeRgb &&
+                tag->Size >= sizeof(MultiBootTagFramebuffer))
+            {
+                Framebuffer.RedPos = fb->RedFieldPosition;
+                Framebuffer.RedSize = fb->RedMaskSize;
+                Framebuffer.GreenPos = fb->GreenFieldPosition;
+                Framebuffer.GreenSize = fb->GreenMaskSize;
+                Framebuffer.BluePos = fb->BlueFieldPosition;
+                Framebuffer.BlueSize = fb->BlueMaskSize;
+            }
+            else if (fb->FbType == MultiBootFramebufferTypeRgb)
+            {
+                /* Truncated tag: assume the usual little-endian xRGB8888 */
+                Framebuffer.RedPos = 16;
+                Framebuffer.RedSize = 8;
+                Framebuffer.GreenPos = 8;
+                Framebuffer.GreenSize = 8;
+                Framebuffer.BluePos = 0;
+                Framebuffer.BlueSize = 8;
+            }
+
+            Trace(0, "Framebuffer addr 0x%p %ux%u pitch %u bpp %u type %u",
                 fb->Addr, (ulong)fb->Width, (ulong)fb->Height,
-                (ulong)fb->Bpp, (ulong)fb->FbType);
+                (ulong)fb->Pitch, (ulong)fb->Bpp, (ulong)fb->FbType);
             break;
         }
         default:

@@ -14,7 +14,7 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
 - **ACPI** — RSDP/RSDT/MADT parsing for LAPIC/IOAPIC discovery and IRQ→GSI routing
 - **Interrupts** — IDT with exception handlers, IOAPIC routing (edge + level-triggered), LAPIC IPI, PIC (remapped then disabled)
 - **arm64 port** — GICv3 interrupt controller with ITS (PCIe MSI delivered as LPIs, `its=on` by default), EL1 exception vectors, ARM generic timer (per-CPU), PL011 UART, FDT (device tree) parsing, PCIe ECAM, virtio-mmio transport, broadcast TLBI, semantic memory barriers (`dmb`) throughout; NVMe over ITS-delivered MSI works end-to-end
-- **Drivers** — serial (COM1), VGA text mode, PIT (10 ms tick, SeqLock-protected counters), RTC (CMOS wall clock), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**, **virtio-scsi**, **virtio-rng** (legacy + modern virtio-pci transport), **NVMe** (Rust, MSI-X interrupt-driven)
+- **Drivers** — serial (COM1), screen console (EGA text on BIOS, 8x16 font on the bootloader's pixel framebuffer under UEFI), PIT (10 ms tick, SeqLock-protected counters), RTC (CMOS wall clock), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**, **virtio-scsi**, **virtio-rng** (legacy + modern virtio-pci transport), **NVMe** (Rust, MSI-X interrupt-driven)
 - **Block I/O** — asynchronous, interrupt-driven block request queue with DMA slot pool, `BlockRequest` submission with `WaitGroup` completion, direct DMA from caller buffers (page-aligned), virtqueue locking (`RawSpinLock`) for safe interrupt/task concurrency, early-boot polling fallback, SoftIrq-based retry for ring-full conditions, block device abstraction, MBR partition discovery
 - **Networking** — virtio-net driver with asynchronous interrupt-driven TX/RX, software frame queues (256-entry TX/RX) in `NetDevice` base class, reference-counted `NetFrame` descriptors for zero-copy DMA, TX slot pool with bitmask allocation, SoftIrq-based TX retry and RX processing, IP routing (subnet mask + gateway from DHCP, off-subnet traffic forwarded to gateway), ARP (cache, request, reply, dump), IPv4/UDP transmit, ICMP echo (ping reply + send, per-type statistics), DHCP client with lease renewal (sets IP, subnet mask, gateway, DNS server), DNS resolver with 32-entry cache (A-record queries, name compression, DHCP-provided server), **TCP** (connection state machine, 3-way handshake, sequence/ack tracking, retransmission timers, MSS negotiation, send/receive ring buffers, graceful close with FIN exchange, RST handling, ephemeral port allocation, granular locking: `Mutex` for ports, `RawSpinLock` for pool and per-connection state, SoftIrq-driven timer processing), **HTTP client** (URL parsing, DNS resolution, TCP connection, request/response, redirect following for 301/302/303/307/308 with loop limit, `wget` shell command), UDP remote shell (execute kernel commands over the network), network device abstraction with per-protocol packet counters, `MacAddress`/`IpAddress` structs (IPv6-ready tagged union)
 - **Filesystem** — VFS layer with mount points and path resolution, ramfs (in-memory), nanofs (on-disk filesystem with 4 KB blocks, superblock with UUID, inode/data bitmaps, CRC32 checksums for superblock/inodes/data, file and recursive directory deletion, persistent across remount)
@@ -78,6 +78,18 @@ Without KVM (macOS with TCG):
 qemu-system-x86_64 -smp 2 -cdrom nos.iso -serial file:nos.log -s -vga std
 ```
 
+UEFI boot (OVMF instead of the legacy BIOS). There is no EGA text mode
+under UEFI, so GRUB hands the kernel a pixel framebuffer and the screen is
+drawn with the 8x16 font console; the PS/2 keyboard is emulated by QEMU, so
+the shell is usable on screen as well as on serial:
+
+```sh
+cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/ovmf_vars.fd
+qemu-system-x86_64 -smp 2 -m 1G -cdrom nos.iso -serial file:nos.log \
+    -drive if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+    -drive if=pflash,format=raw,unit=1,file=/tmp/ovmf_vars.fd
+```
+
 Boot from disk image (with virtio-blk):
 
 ```sh
@@ -134,7 +146,7 @@ Pass via GRUB command line on x86-64 (edit `build/grub.cfg`) or QEMU `-append` o
 
 - `smp=off` — disable SMP, run on BSP only
 - `console=serial` — direct shell output to serial port only
-- `console=vga` — direct shell output to VGA only
+- `console=vga` — direct shell output to the screen only (VGA text or framebuffer)
 - `dhcp=auto` — start DHCP on `eth0` automatically at boot
 - `dhcp=off` — disable DHCP entirely (even via shell command)
 - `dhcp=on` — enable DHCP only via shell command (default)
@@ -213,7 +225,7 @@ src/cpp/
     x86_64/   Multiboot2 entry + AP trampoline (NASM), CPU primitives (asm.asm), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding, GRUB info parsing, HAL backends
     arm64/    Linux-Image boot + PSCI SMP (boot.S), EL1 vectors, GICv3 + ITS (LPIs for PCIe MSI), generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, HAL backends
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, Rust FFI bridge, symbol table
-  drivers/    Hardware: serial, VGA, PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi/rng (virtio-pci on x86-64, virtio-mmio on arm64)
+  drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi/rng (virtio-pci on x86-64, virtio-mmio on arm64)
   block/      Block I/O: device abstraction, async request queue, MBR partition discovery
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell
   fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers

@@ -1,6 +1,6 @@
 #include "8042.h"
 #include <arch/x86_64/pic.h>
-#include "vga.h"
+#include "screen.h"
 #include <hal/irqchip.h>
 
 #include <kernel/trace.h>
@@ -18,7 +18,7 @@ IO8042::IO8042()
 {
     Trace(0, "IO8042 0x%p status 0x%p", this, (ulong)Inb(StatusPort));
 
-    VgaTerm::GetInstance().Printf("IO8042 status 0x%p\n", (ulong)Inb(StatusPort));
+    Screen::Printf("IO8042 status 0x%p\n", (ulong)Inb(StatusPort));
 
     for (size_t i = 0; i < Stdlib::ArraySize(Observer); i++)
         Observer[i] = nullptr;

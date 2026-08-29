@@ -35,7 +35,7 @@
 #include <mm/page_table.h>
 
 #include <drivers/8042.h>
-#include <drivers/vga.h>
+#include <drivers/screen.h>
 #include <drivers/serial.h>
 #include <arch/x86_64/pic.h>
 #include <drivers/pit.h>
@@ -550,7 +550,7 @@ void BpStartup(void* ctx)
 
         Trace(0, "Preempt is now on");
 
-        VgaTerm::GetInstance().Printf("IPI test...\n");
+        Screen::Printf("IPI test...\n");
 
         ulong cpuMask = cpus.GetRunningCpus();
         for (ulong i = 0; i < MaxCpus; i++)
@@ -564,7 +564,7 @@ void BpStartup(void* ctx)
             }
         }
 
-        VgaTerm::GetInstance().Printf("Task test...\n");
+        Screen::Printf("Task test...\n");
 
         if (!Test::TestMultiTasking())
         {
@@ -582,7 +582,7 @@ void BpStartup(void* ctx)
 
         Tcp::GetInstance().Init();
 
-        VgaTerm::GetInstance().Printf("Idle looping...\n");
+        Screen::Printf("Idle looping...\n");
 
         if (!cmd.Start())
         {
@@ -675,7 +675,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     Tracer::GetInstance().SetLevel(1);
 
-    //VgaTerm::GetInstance().Printf("Hello!\n");
+    //Screen::Printf("Hello!\n");
 
     Grub::ParseMultiBootInfo((Grub::MultiBootInfoHeader *)bpt.PhysToVirt((ulong)MbInfo));
 
@@ -743,7 +743,13 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         pt.FreePage(page);
     }
 
-    VgaTerm::GetInstance().Printf("Hello!\n");
+    /* Pick the video console now that MMIO can be mapped: under UEFI the
+       only screen is the pixel framebuffer GRUB hands over, and mapping it
+       needs the page table (but not yet the heap). Must happen on the BSP
+       before the APs start -- see MapMmioRegion. */
+    Screen::Setup();
+
+    Screen::Printf("Hello!\n");
 
     Trace(0, "Parsing acpi...");
 
@@ -770,7 +776,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     HaltTcoWatchdog();
 
-    VgaTerm::GetInstance().Printf("Self test begin, please wait...\n");
+    Screen::Printf("Self test begin, please wait...\n");
 
     Trace(0, "Before test");
 
@@ -783,7 +789,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     }
 
     Trace(0, "After test");
-    VgaTerm::GetInstance().Printf("Self test complete, error %u\n", (ulong)err.GetCode());
+    Screen::Printf("Self test complete, error %u\n", (ulong)err.GetCode());
 
     auto& pci = Pci::GetInstance();
     pci.Scan();
