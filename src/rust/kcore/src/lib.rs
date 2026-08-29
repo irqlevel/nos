@@ -23,6 +23,7 @@ pub mod net;
 pub mod bitmap;
 pub mod ring_buffer;
 pub mod hpet;
+pub mod acpi;
 #[cfg(target_arch = "x86_64")]
 pub mod tco_wdt;
 

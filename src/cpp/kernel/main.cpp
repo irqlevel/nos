@@ -97,18 +97,31 @@ void TraceCpuState(ulong cpu)
  * We halt it here so the kernel can run self-tests in peace; the Rust
  * tco_wdt driver re-enables it later with a proper timeout.
  *
- * Discovery mirrors the Rust TcoWatchdog::probe():
- *   1. Read TCOBASE from LPC bridge PCI config reg 0x50.
- *   2. Fallback: ACPI PMBASE (reg 0x40) + 0x60.
- *   3. Set TMR_HLT (bit 11) in TCO1_CNT to stop the timer.
+ * Discovery mirrors the Rust TcoWatchdog::probe() (keep the two in sync):
+ *   1. 100-series PCH ("Sunrise Point") and later: TCOBASE from the SMBus
+ *      function 0:1F.4 config reg 0x50, valid only while TCO_BASE_EN
+ *      (TCOCTL, reg 0x54 bit 8) is set.  The LPC registers below read back
+ *      as zero on these chipsets, so this comes first.
+ *   2. Read TCOBASE from LPC bridge PCI config reg 0x50.
+ *   3. Fallback: ACPI PMBASE (reg 0x40) + 0x60.
+ *   4. Set TMR_HLT (bit 11) in TCO1_CNT to stop the timer.
+ *
+ * This runs before the PCI subsystem exists, hence the raw CF8/CFC access,
+ * but after Acpi::Parse(), so the WDAT verdict is already available.
  */
 static void HaltTcoWatchdog()
 {
     static const u16 PciCfgAddr  = 0xCF8;
     static const u16 PciCfgData  = 0xCFC;
     static const u32 LpcBdf      = (0U << 16) | (0x1FU << 11) | (0U << 8);
+    static const u32 SmbusBdf    = (0U << 16) | (0x1FU << 11) | (4U << 8);
     static const u16 VendorReg   = 0x00;
+    static const u16 ClassReg    = 0x08;
     static const u16 TcoBaseReg  = 0x50;
+    static const u16 TcoCtlReg   = 0x54;
+    static const u32 TcoBaseEn   = 1U << 8;
+    static const u8  SerialBusCls = 0x0C;
+    static const u8  SmbusSubCls  = 0x05;
     static const u16 AcpiBaseReg = 0x40;
     static const u16 AcpiTcoOff  = 0x60;
     static const u16 Tco1Sts     = 0x04;
@@ -119,24 +132,57 @@ static void HaltTcoWatchdog()
 
     Trace(0, "HaltTcoWatchdog: started");
 
-    /* Only Intel PCH has a TCO watchdog */
-    Out(PciCfgAddr, 0x80000000 | LpcBdf | VendorReg);
-    u16 vendor = (u16)In(PciCfgData);
-    if (vendor != IntelVendor)
-        return;
+    /* An ACPI WDAT table means the firmware owns the watchdog and the Rust
+       tco_wdt driver stands down.  The halt below still runs: WDAT normally
+       describes this very TCO block, and a timer the firmware left running
+       would reset the box in the middle of the boot-time self-tests with
+       nothing left to kick it. */
+    const bool firmwareWatchdog = Acpi::GetInstance().HasFirmwareWatchdog();
 
     u16 tcoBase = 0;
+    const char* source = "SMBus 0:1F.4";
 
-    Out(PciCfgAddr, 0x80000000 | LpcBdf | TcoBaseReg);
-    u16 raw = (u16)In(PciCfgData);
-    if (raw != 0 && raw != 0xFFFF)
-        tcoBase = raw & 0xFFE0;
+    /* 1. 100-series PCH and later.  0:1F.4 is not the SMBus controller on
+       every chipset, so check the class code before trusting its 0x50. */
+    Out(PciCfgAddr, 0x80000000 | SmbusBdf | VendorReg);
+    if ((u16)In(PciCfgData) == IntelVendor)
+    {
+        Out(PciCfgAddr, 0x80000000 | SmbusBdf | ClassReg);
+        u32 classCode = In(PciCfgData);
+        if ((u8)(classCode >> 24) == SerialBusCls && (u8)(classCode >> 16) == SmbusSubCls)
+        {
+            /* Without TCO_BASE_EN the window is not decoded */
+            Out(PciCfgAddr, 0x80000000 | SmbusBdf | TcoCtlReg);
+            if ((In(PciCfgData) & TcoBaseEn) != 0)
+            {
+                Out(PciCfgAddr, 0x80000000 | SmbusBdf | TcoBaseReg);
+                tcoBase = (u16)In(PciCfgData) & 0xFFE0;
+            }
+        }
+    }
 
-    if (tcoBase == 0) {
-        Out(PciCfgAddr, 0x80000000 | LpcBdf | AcpiBaseReg);
-        u16 pmBase = (u16)In(PciCfgData) & 0xFFFE;
-        if (pmBase != 0 && pmBase != 0xFFFE)
-            tcoBase = pmBase + AcpiTcoOff;
+    /* 2./3. ICH9-class chipsets, including QEMU's q35 */
+    if (tcoBase == 0)
+    {
+        source = "LPC 0:1F.0";
+
+        /* Only Intel PCH has a TCO watchdog */
+        Out(PciCfgAddr, 0x80000000 | LpcBdf | VendorReg);
+        u16 vendor = (u16)In(PciCfgData);
+        if (vendor != IntelVendor)
+            return;
+
+        Out(PciCfgAddr, 0x80000000 | LpcBdf | TcoBaseReg);
+        u16 raw = (u16)In(PciCfgData);
+        if (raw != 0 && raw != 0xFFFF)
+            tcoBase = raw & 0xFFE0;
+
+        if (tcoBase == 0) {
+            Out(PciCfgAddr, 0x80000000 | LpcBdf | AcpiBaseReg);
+            u16 pmBase = (u16)In(PciCfgData) & 0xFFFE;
+            if (pmBase != 0 && pmBase != 0xFFFE)
+                tcoBase = pmBase + AcpiTcoOff;
+        }
     }
 
     if (tcoBase == 0)
@@ -150,7 +196,8 @@ static void HaltTcoWatchdog()
     Outw(tcoBase + Tco1Sts, 1 << 3);
     Outw(tcoBase + Tco2Sts, 1 << 1);
 
-    Trace(0, "TCO watchdog halted (tcoBase 0x%p)", (ulong)tcoBase);
+    Trace(0, "TCO watchdog halted (tcoBase 0x%p via %s%s)", (ulong)tcoBase, source,
+        firmwareWatchdog ? ", ACPI WDAT owns it" : "");
 }
 
 void ApStartup(void *ctx)

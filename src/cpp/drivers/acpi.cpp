@@ -21,6 +21,7 @@ Acpi::Acpi()
     , CenturyRegister(0)
     , HpetBasePhys(0)
     , HpetMinTick(0)
+    , FirmwareWatchdog(false)
 {
     OemId[0] = '\0';
     for (size_t i = 0; i < Stdlib::ArraySize(Table); i++)
@@ -468,6 +469,60 @@ void Acpi::ParseHPET()
         HpetBasePhys, (ulong)HpetMinTick, (ulong)hpet->EventTimerBlockId);
 }
 
+/*
+ * WDAT (ACPI "Watchdog Action Table") describes a watchdog the firmware
+ * hands to the OS as a list of register instructions.  Its presence means
+ * the platform expects the OS to drive the watchdog through those
+ * instructions rather than through a native driver -- and it usually
+ * describes the very same TCO block the tco_wdt driver would grab.  We do
+ * not implement the WDAT instruction interpreter, so all we do here is
+ * record the fact and let tco_wdt keep its hands off the hardware.
+ */
+void Acpi::ParseWDAT()
+{
+    ACPISDTHeader* sdtHeader = LookupTable("WDAT");
+    if (sdtHeader == nullptr)
+    {
+        Trace(AcpiLL, "Acpi: no WDAT table");
+        return;
+    }
+
+    if (sdtHeader->Length < sizeof(ACPISDTHeader) + sizeof(WdatTableBody))
+    {
+        Trace(0, "Acpi: WDAT table too short: %u", (ulong)sdtHeader->Length);
+        return;
+    }
+
+    WdatTableBody* wdat = reinterpret_cast<WdatTableBody*>(sdtHeader + 1);
+
+    /* Trust the table length over the Entries count */
+    size_t maxEntries = (sdtHeader->Length - sizeof(ACPISDTHeader) - sizeof(WdatTableBody))
+        / sizeof(WdatEntry);
+    size_t entries = wdat->Entries;
+    if (entries > maxEntries)
+    {
+        Trace(0, "Acpi: WDAT claims %u entries, table holds %u",
+            (ulong)entries, (ulong)maxEntries);
+        entries = maxEntries;
+    }
+
+    const WdatEntry* entry = reinterpret_cast<const WdatEntry*>(wdat + 1);
+    for (size_t i = 0; i < entries; i++)
+    {
+        if (entry[i].RegisterRegion.AddressSpaceId == GasSpaceSystemIo &&
+            entry[i].RegisterRegion.Address == RtcPortBase)
+        {
+            Trace(0, "Acpi: WDAT drives the RTC, ignoring it");
+            return;
+        }
+    }
+
+    FirmwareWatchdog = true;
+
+    Trace(0, "Acpi: WDAT present (%u entries, period %u ms), firmware owns the watchdog",
+        (ulong)entries, (ulong)wdat->TimerPeriod);
+}
+
 Stdlib::Error Acpi::Parse()
 {
     Stdlib::Error err;
@@ -533,6 +588,8 @@ Stdlib::Error Acpi::Parse()
 
     ParseFADT();
     ParseHPET();
+
+    ParseWDAT();
 
     return MakeError(Stdlib::Error::Success);
 }
@@ -614,6 +671,11 @@ ulong Acpi::GetHpetBasePhys()
 u16 Acpi::GetHpetMinTick()
 {
     return HpetMinTick;
+}
+
+bool Acpi::HasFirmwareWatchdog()
+{
+    return FirmwareWatchdog;
 }
 
 }
