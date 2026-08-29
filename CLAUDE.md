@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`nos` is a hobby x86-64 OS kernel written in C++20, Rust, and NASM. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB. It targets QEMU/KVM and KVM-based clouds (Google Cloud, Yandex Cloud). See `README.md` for the full feature list and shell command reference.
+`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on one real machine — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels. See `README.md` for the full feature list and shell command reference, and `plans/README.md` for the roadmap (the long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor — stages 0–5, currently at the end of stage 2).
 
 ## Build, run, test
 
@@ -29,9 +29,23 @@ arm64 toolchain/linker-script/Rust-target leg). Objects live in `out/$(ARCH)/`.
 After moving or renaming headers run a clean build — stale `.d` files in
 `out/` reference old paths.
 
+**Both architectures must stay green.** CI (`.github/workflows/ci.yml`) runs
+`make check` plus a build *and* a boot smoke test for `x86_64` and `aarch64`.
+A change to common code that only builds on x86 is a broken change.
+
+**Source lists are explicit, not globbed.** The Makefile has two hand-written
+lists, `CXX_SRC_x86_64` and `CXX_SRC_aarch64` (plus `ASM_SRC_*` for NASM and
+`ASM_S_SRC_*` for GNU-as). A new `.cpp` that is not added to the right list is
+silently not compiled; portable code must be added to **both**. Common driver
+code that references x86-only entry points gets an unreachable link stub in
+`src/cpp/arch/arm64/x86_driver_stubs.cpp` rather than an `#ifdef`.
+
 **Every refactor step must keep `./scripts/smoke-test.sh` green** (markers
-`After test` → `Preempt is now on` → `boot: complete`, fail-fast on `PANIC:`).
-Gate on its exit code, never on grepping its output.
+`After test` → `Preempt is now on` → `boot: complete`, fail-fast on `PANIC:`;
+`scripts/smoke-arm64.sh` is the arm64 equivalent). Gate on its exit code,
+never on grepping its output. The x86 smoke boot attaches virtio-blk (modern),
+virtio-scsi (legacy), NVMe, virtio-net and virtio-rng, so it covers the
+Rust/MSI-X path too.
 
 Run in QEMU (serial console is logged to `nos.log`):
 
@@ -65,6 +79,14 @@ gdb -ex "symbol-file bin/kernel64.elf" -ex "set architecture i386:x86-64" -ex "t
 # or: ./scripts/gdb64.sh
 ```
 
+### Kernel command line
+
+Set via GRUB (`build/grub.cfg`) on x86-64, or QEMU `-append` on arm64. Useful
+when bisecting a boot failure: `smp=off` (BSP only), `console=serial` /
+`console=vga`, `dhcp=auto|on|off`, `dns=on`, `udpshell=PORT`, `usb=off`
+(x86-64: skip xHCI bring-up), `its=off` (arm64). Parsing lives in
+`kernel/parameters.cpp`.
+
 ### Tests run at boot, not via a test runner
 
 There is no separate test binary. Self-tests live in `src/cpp/kernel/test.cpp`; each is a `Stdlib::Error TestXxx()` function. They are run from `Test::Test()` (called in `main.cpp:Main2`) and `Test::TestMultiTasking()`, early during boot. To add a test, write a `TestXxx()` and register it in the `Test()` dispatcher. **To run a single test, edit `Test()` to call only that function**, rebuild, and boot — watch `nos.log`. A failing test returns a non-success `Stdlib::Error`.
@@ -75,19 +97,20 @@ Stack traces resolve symbols from a table baked into the kernel. The build links
 
 ## Architecture
 
-Boot flow: `arch/x86_64/boot64.asm` (Multiboot2 entry, 32→64-bit transition, AP trampoline) → `kernel/main.cpp` `Main2` (BSP: paging, dmesg, page allocator, runs `Test()`) → `BpStartup` (interrupts, IOAPIC, timers, brings up APs via INIT/SIPI, starts SoftIrq/TCP/shell). APs enter via `ApMain` → `ApStartup`.
+Boot flow (x86-64): `arch/x86_64/boot64.asm` (Multiboot2 entry, 32→64-bit transition, AP trampoline) → `kernel/main.cpp` `Main2` (BSP: paging, dmesg, page allocator, runs `Test()`) → `BpStartup` (interrupts, IOAPIC, timers, brings up APs via INIT/SIPI, starts SoftIrq/TCP/shell, prints `boot: complete`). APs enter via `ApMain` → `ApStartup`. On arm64 the equivalent path is `arch/arm64/boot.S` → `arch/arm64/main_arm64.cpp`, with PSCI `CPU_ON` for APs.
 
 Source layout (detailed in `README.md` "Project layout"):
 
-- `src/cpp/hal/` — portable HAL contracts (cpu/atomics, semantic barriers, mmu+pte, irqchip, console, power, Context, IRQ stub symbols); each header selects the arch backend at compile time
+- `src/cpp/hal/` — portable HAL contracts (cpu/atomics, semantic barriers, mmu+pte, irqchip, console, pci, power, Context, IRQ stub symbols); each header selects the arch backend at compile time
 - `src/cpp/arch/x86_64/` — everything x86-specific: Multiboot2 entry + AP trampoline (`boot64.asm`), CPU primitives (`asm.asm`, `asm.h`), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding (`pte.h`), GRUB parsing, HAL inline/impl backends. Only arch code, the documented exemptions (`kernel/main.cpp`, `kernel/cmd.cpp`, `kernel/irq_balance.cpp`) and x86-only drivers may include these headers
-- `src/cpp/kernel/` — scheduling, tasks, interrupt dispatch, SoftIrq, timers, timekeeping seam (`time.h`), locks (spinlock/mutex/seqlock/rwlock), panic/backtrace, dmesg ring buffer, the interactive shell (`cmd.cpp`), the Rust FFI bridge (`rust_ffi.cpp`), symbol table
-- `src/cpp/mm/` — 4-level page tables (`VirtToPhys` walk), page allocator (fixed-size block allocator), pool allocator, VA allocator, `new`/`delete`
-- `src/cpp/drivers/` — serial, VGA, PIT/HPET/RTC, 8042 keyboard, PCI, MSI-X, ACPI, virtio (blk/net/scsi/rng) behind the `VirtioTransport` interface (legacy+modern virtio-pci on x86, virtio-mmio on arm64)
+- `src/cpp/arch/arm64/` — Linux-Image boot + PSCI SMP (`boot.S`), EL1 vectors, GICv3 + ITS, generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, HAL backends
+- `src/cpp/kernel/` — scheduling, tasks, interrupt dispatch, SoftIrq, timers, timekeeping seam (`time.h`), locks (spinlock/mutex/seqlock/rwlock), panic/backtrace, dmesg ring buffer, the interactive shell (`cmd.cpp`), input layer (`input.cpp`), the Rust FFI bridge (`rust_ffi.cpp`), symbol table
+- `src/cpp/mm/` — 4-level page tables (`VirtToPhys` walk, `ProtectRange`), page allocator (fixed-size block allocator), pool allocator, VA allocator, `new`/`delete`
+- `src/cpp/drivers/` — serial, console (`screen.cpp` picks EGA text on BIOS vs. the 8x16-font pixel framebuffer under UEFI), PIT/HPET/RTC, 8042 keyboard, `usb/` (xHCI host controller + HID boot keyboard, for UEFI laptops with no PS/2), PCI, MSI-X, ACPI, virtio (blk/net/scsi/rng) behind the `VirtioTransport` interface (legacy+modern virtio-pci on x86, virtio-mmio on arm64)
 - `src/cpp/block/` — async interrupt-driven block request queue, MBR partitions
 - `src/cpp/net/` — device abstraction, ARP/ICMP/DHCP/DNS/TCP/UDP, HTTP client, UDP shell
 - `src/cpp/fs/` — VFS with mount points, ramfs, nanofs (on-disk), ext2 (ro), procfs
-- `src/cpp/lib/` — freestanding stdlib equivalents (`Stdlib::`), containers (list/vector/btree/ringbuffer/bitmap), CRC32, formatting; some routines (`MemSet`/`MemCpy`/`StrLen`…) are in `arch/x86_64/stdlib_asm.asm`
+- `src/cpp/lib/` — freestanding stdlib equivalents (`Stdlib::`), containers (list/vector/btree/ringbuffer/bitmap), CRC32, formatting; some routines (`MemSet`/`MemCpy`/`StrLen`…) are in `arch/x86_64/stdlib_asm.asm` (portable C in `arch/arm64/stdlib_c.cpp`)
 
 Rust (`src/rust/`, a cargo workspace) compiles to a `#![no_std]` `staticlib` (`libkernel.a`) linked into the kernel. The **NVMe driver is written entirely in Rust**. Layers: `ffi/` (raw `extern "C"` declarations only), `kcore/` (safe RAII wrappers around kernel services), `drivers/` (nvme, r8168), `kernel/` (entry points + global allocator), `hello/` (self-test). Adding a kernel service to Rust is a three-step process across `rust_ffi.cpp`, `ffi/`, and `kcore/` — see `.cursor/rules/rust-kernel-conventions.mdc`.
 
@@ -101,7 +124,8 @@ These come from `.cursor/rules/kernel-conventions.mdc` (C++) and `rust-kernel-co
 - **OOM and `operator new`**: plain `new T(...)` **panics on OOM** and never returns `nullptr` — the compiler assumes the plain form is non-null, so a null check after it is dead code. Fallible allocations must use `new (Mm::NoThrow) T(...)` (the compiler keeps that null check) or `Mm::TAlloc<T, Tag>()`, and check the result. See the comment in `mm/new.h` for why the plain form cannot be made nullable.
 - **Memory refcounting** is explicit and easy to get wrong — `MapPage` does `+1`, `GetPage` does `+1` (caller must `Put()`), `UnmapPage` is net-0. To free a mapped page: `UnmapPage` + `FreePage` + `Put`. See the table in the cursor rule.
 - **Never map DMA/device memory at `physAddr + KernelSpaceBase` directly.** Always go through `Mm::MapPages` / `Mm::AllocMapPages` so the `VaAllocator` tracks the VA. See the allocation API table in `mm/new.h`.
+- **The kernel image is W^X on both arches.** Late in boot `ProtectRange` splits it into text RX / rodata RO+NX / data RW+NX (`main.cpp`, `main_arm64.cpp`), and MMIO mappings are NX. Self-modifying code, executing from a heap buffer, or writing through a pointer into `.rodata` faults instead of silently working.
 - **Memory barriers**: `Barrier()` is gone. Pick the semantic variant from `hal/barrier.h`: `Hal::SmpWmb/SmpRmb` (CPU↔CPU publish/consume, e.g. seqlock), `Hal::DmaWmb/DmaRmb` (CPU↔device rings/doorbells/OWN bits), `Hal::CompilerBarrier` (compiler-only). On x86 they all compile to a compiler barrier; on arm64 they become `dmb` — misclassification is invisible on x86 and bites on arm64. In Rust, device ordering uses `kcore::barrier::dma_wmb/dma_rmb` (`dmb oshst/oshld` on arm64) — `core::sync::atomic::fence` is NOT a substitute: it emits `dmb ish`, whose inner-shareable domain does not order against a PCIe master. Consuming device-written state needs a read barrier *after* the index/phase/OWN check and before the payload reads (an address-independent load pair is not ordered by a control dependency on arm64) — see `VirtQueue::GetUsed`, nvme `read_cqe`, r8168 `harvest`.
 - **Arch discipline**: common code includes `hal/*` headers only. `Hal::` wrappers: `IsInterruptEnabled`, `IrqSave/IrqRestore` (not RFLAGS), `GetSp/SetSp/GetFp` (not GetRsp/GetRbp), `ReadCycleCounter` (not ReadTsc), `IrqEoi/SendIpi/GetCurrentCpuHwId` (not Lapic::), `TlbFlushPage/TlbFlushAll` (not Invlpg/CR3). Per-arch member functions (e.g. `CpuTable::StartAll`) live in arch TUs.
-- **Style**: namespaces `Kernel::`, `Kernel::Mm::`, `Stdlib::`. Trace with `Trace(level, "fmt", …)` (level 0 always visible) / Rust `trace!(...)`. No magic numbers — name constants. Preserve existing formatting; don't reflow unchanged code. 4-space indent.
+- **Style**: namespaces `Kernel::`, `Kernel::Mm::`, `Stdlib::`. Trace with `Trace(level, "fmt", …)` / Rust `trace!(...)`; level 0 is always visible and per-subsystem level constants (`KbdLL`, `UsbLL`, `PageAllocatorLL`, …) live at the top of `kernel/trace.h` — raise one there to debug a subsystem. No magic numbers — name constants. Preserve existing formatting; don't reflow unchanged code. 4-space indent.
 - The C++ build uses `-Wall -Wextra -Werror`, so warnings break the build.
