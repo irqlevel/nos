@@ -7,6 +7,11 @@
 //   SmpMb           - CPU<->CPU full fence.
 //   DmaWmb/DmaRmb   - CPU<->device DMA descriptor/ring ordering
 //                     (virtio rings, doorbells, OWN bits).
+//   WcFlush         - drain buffered write-combining stores so what was
+//                     written to WC memory (a framebuffer) actually reaches
+//                     the bus. The variants above do NOT do this: on x86
+//                     they are compiler barriers, while WC stores sit in the
+//                     fill buffers until a fence or an eviction.
 //
 // On x86 (TSO) everything except SmpMb compiles to a compiler barrier, so
 // classifying a site never changes x86 codegen. On arm64 these become dmb
@@ -27,6 +32,7 @@ static inline __attribute__((always_inline)) void SmpRmb() { CompilerBarrier(); 
 static inline __attribute__((always_inline)) void SmpMb() { __asm__ __volatile__("mfence" : : : "memory"); }
 static inline __attribute__((always_inline)) void DmaWmb() { CompilerBarrier(); }
 static inline __attribute__((always_inline)) void DmaRmb() { CompilerBarrier(); }
+static inline __attribute__((always_inline)) void WcFlush() { __asm__ __volatile__("sfence" : : : "memory"); }
 
 #elif defined(__aarch64__)
 
@@ -35,6 +41,7 @@ static inline __attribute__((always_inline)) void SmpRmb() { __asm__ __volatile_
 static inline __attribute__((always_inline)) void SmpMb() { __asm__ __volatile__("dmb ish" : : : "memory"); }
 static inline __attribute__((always_inline)) void DmaWmb() { __asm__ __volatile__("dmb oshst" : : : "memory"); }
 static inline __attribute__((always_inline)) void DmaRmb() { __asm__ __volatile__("dmb oshld" : : : "memory"); }
+static inline __attribute__((always_inline)) void WcFlush() { __asm__ __volatile__("dsb oshst" : : : "memory"); }
 
 #else
 #error "unsupported architecture"

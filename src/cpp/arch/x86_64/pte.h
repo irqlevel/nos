@@ -55,6 +55,16 @@ struct Pte final
         Value |= (1UL << CacheDisabledBit);
     }
 
+    /* Write-combining: PAT=1, PCD=0, PWT=0 selects IA32_PAT entry 4, which
+       Hal::SetupMemoryTypes() programs to WC. Only valid on a 4KiB leaf
+       entry -- at L2/L3 the same bit 7 means "huge page" (HugeBit), and
+       those levels carry the PAT bit at bit 12 instead. */
+    void SetWriteCombining()
+    {
+        Value &= ~((1UL << CacheDisabledBit) | (1UL << WriteThrough));
+        Value |= (1UL << PatBit);
+    }
+
     void SetHuge()
     {
         Value |= (1UL << HugeBit);
@@ -120,6 +130,9 @@ struct Pte final
     static const ulong AccessedBit = 5;
     static const ulong DirtyBit = 6;
     static const ulong HugeBit = 7;
+    /* Same bit as HugeBit: it is the PAT selector on 4KiB leaf entries and
+       the page-size bit on L2/L3 entries. */
+    static const ulong PatBit = 7;
     static const ulong MaxBit = 12;
     static const ulong BitMask = (1UL << MaxBit) - 1;
 

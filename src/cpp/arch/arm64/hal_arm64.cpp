@@ -62,6 +62,18 @@ void EnableWxSupport()
     /* PXN/UXN are always active on arm64 — nothing to enable. */
 }
 
+void SetupMemoryTypes()
+{
+    /* boot.S loads the same MAIR_EL1 on the boot CPU and on every
+       secondary, and idx2 is already Normal non-cacheable — the arm64
+       equivalent of write-combining. Nothing to do per CPU. */
+}
+
+bool IsWriteCombiningAvailable()
+{
+    return true;
+}
+
 void ConsoleOut(const char *s)
 {
     Kernel::Pl011::PrintString(s);

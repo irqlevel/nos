@@ -5,6 +5,7 @@
 #include <lib/stdlib.h>
 #include <mm/page_table.h>
 #include <drivers/mmio.h>
+#include <hal/barrier.h>
 
 namespace Kernel
 {
@@ -171,9 +172,18 @@ void FbTerm::DrawCursor(bool on)
     if (Row >= Rows || Column >= Cols)
         return;
 
+    if (!on)
+    {
+        /* Repaint the cell instead of clearing those rows: the underline
+           sits exactly where the font draws '_' and the descenders, so
+           painting background over it would eat part of the glyph. */
+        DrawGlyph(Row, Column, Cells[Row][Column]);
+        return;
+    }
+
     FillRect(Column * Font8x16Width,
         Row * Font8x16Height + Font8x16Height - CursorHeight,
-        Font8x16Width, CursorHeight, on ? FgColor : BgColor);
+        Font8x16Width, CursorHeight, FgColor);
 }
 
 void FbTerm::Repaint()
@@ -252,6 +262,10 @@ void FbTerm::PutsLockHeld(const char *str)
     }
 
     DrawCursor(true);
+
+    /* Write-combining stores may sit in the CPU's fill buffers; without
+       this the last line of output can stay invisible indefinitely. */
+    Hal::WcFlush();
 }
 
 void FbTerm::ClsLockHeld()
@@ -298,8 +312,13 @@ bool FbTerm::Setup(const FbInfo& info)
         return false;
     }
 
+    /* Framebuffer memory has no read side effects, so it is mapped
+       write-combining: stores get buffered and merged instead of going out
+       one bus transaction at a time. Everything that draws ends with
+       Hal::WcFlush() so the pixels actually appear. */
     ulong sizeBytes = (ulong)info.Pitch * info.Height;
-    ulong va = Mm::PageTable::GetInstance().MapMmioRegion(info.PhyAddr, sizeBytes);
+    ulong va = Mm::PageTable::GetInstance().MapMmioRegion(info.PhyAddr, sizeBytes,
+        Mm::PageTable::MmioWriteCombining);
     if (va == 0)
     {
         Trace(0, "Fb: can't map framebuffer 0x%p size %u", info.PhyAddr, sizeBytes);
@@ -326,6 +345,7 @@ bool FbTerm::Setup(const FbInfo& info)
 
     ClsLockHeld();
     DrawCursor(true);
+    Hal::WcFlush();
 
     ReadyFlag = true;
 
@@ -345,6 +365,7 @@ void FbTerm::Cls()
 
     ClsLockHeld();
     DrawCursor(true);
+    Hal::WcFlush();
 }
 
 void FbTerm::VPrintf(const char *fmt, va_list args)
@@ -420,6 +441,7 @@ void FbTerm::Backspace()
     }
 
     DrawCursor(true);
+    Hal::WcFlush();
 }
 
 }

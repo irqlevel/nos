@@ -235,6 +235,9 @@ void ApMain2()
     AtomicReadAndInc(&ApStartedFlag); /* 2: entered ApMain2 */
 
     Hal::EnableWxSupport(); /* honor NX before loading the W^X page table */
+    /* Same PAT as the BSP before this CPU can touch a write-combining
+       mapping (the framebuffer console is already mapped by now). */
+    Hal::SetupMemoryTypes();
     SetCr3(Mm::PageTable::GetInstance().GetRoot());
     AtomicReadAndInc(&ApStartedFlag); /* 3: page tables loaded */
 
@@ -709,6 +712,9 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     {
         extern char KernelStart[], KernelText[], KernelRodata[], KernelEnd[];
         Hal::EnableWxSupport();
+        /* Before the first MapMmioRegion: NX in a PTE needs EFER.NXE, and a
+           write-combining one needs the PAT entry to exist. */
+        Hal::SetupMemoryTypes();
         ulong t0 = (ulong)KernelStart, t1 = (ulong)KernelText;
         ulong r1 = (ulong)KernelRodata, e = (ulong)KernelEnd;
         pt.ProtectRange(t0, t1 - t0, false, true);   /* RX */
