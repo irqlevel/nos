@@ -58,9 +58,56 @@ void Lapic::Enable()
 
     Trace(LapicLL, "Lapic: apicId 0x%p", (ulong)GetApicId());
 
+    MaskAllLvt();
+
     WriteReg(EoiIndex, 0x0); // Acknowledge any outstanding interrupts
 
     WriteReg(TprIndex, 0x0);// Clear task priority to enable all interrupts
+}
+
+void Lapic::MaskLvt(ulong index, const char* name)
+{
+    u32 value = ReadReg(index);
+
+    if (value & LvtMasked)
+        return;
+
+    Trace(0, "Lapic: masking lvt %s 0x%p", name, (ulong)value);
+
+    WriteReg(index, value | LvtMasked);
+}
+
+void Lapic::MaskAllLvt()
+{
+    /* Firmware hands the APIC over configured for itself: virtual wire
+       mode (LINT0 = ExtINT, so the 8259's INTR line reaches the CPU
+       directly, and LINT1 = NMI) plus whatever timer, thermal or
+       performance-counter entries it was using. nos routes every
+       interrupt through the IOAPIC and masks the 8259 -- but a masked
+       8259 still answers an ExtINT INTA cycle with its spurious IRQ7
+       vector, and a leftover firmware LVT fires on a vector no driver
+       owns. QEMU leaves the LVTs at their masked reset value, so an
+       unmasked one only ever shows up on real machines.
+
+       "Max LVT Entry" (version register bits 23:16) is the entry count
+       minus one; reading the entries past it is undefined. */
+    u32 maxLvt = (ReadReg(VersionIndex) >> 16) & 0xFF;
+
+    MaskLvt(LvtTimerIndex, "timer");
+    MaskLvt(LvtLint0Index, "lint0");
+    MaskLvt(LvtLint1Index, "lint1");
+
+    if (maxLvt >= 3)
+        MaskLvt(LvtErrorIndex, "error");
+
+    if (maxLvt >= 4)
+        MaskLvt(LvtPerfCntIndex, "perfcnt");
+
+    if (maxLvt >= 5)
+        MaskLvt(LvtThermalIndex, "thermal");
+
+    if (maxLvt >= 6)
+        MaskLvt(LvtCmciIndex, "cmci");
 }
 
 bool Lapic::CheckIsr(u8 vector)

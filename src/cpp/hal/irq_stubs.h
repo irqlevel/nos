@@ -22,8 +22,6 @@ void VirtioNetInterruptStub();
 void VirtioScsiInterruptStub();
 void SharedInterruptStub();
 
-void DummyInterruptStub();
-
 void SpuriousInterruptStub();
 
 void RustInterruptStub0();

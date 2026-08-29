@@ -44,13 +44,30 @@ private:
     static void WriteReg(ulong index, u32 value);
     static void* GetRegBase(ulong index);
 
+    static void MaskLvt(ulong index, const char* name);
+    static void MaskAllLvt();
+
     static const ulong ApicIdIndex = 2;
+    static const ulong VersionIndex = 0x3;
     static const ulong TprIndex = 0x8;
     static const ulong LdrIndex = 0xD;
     static const ulong DfrIndex = 0xE;
     static const ulong EoiIndex = 0xB;
     static const ulong SpIvIndex = 0xF;
     static const ulong IsrBaseIndex = 0x10;
+
+    /* Local vector table (SDM vol.3 "Local Vector Table"); CMCI and the
+       entries past the version register's Max LVT Entry field are absent
+       on older CPUs */
+    static const ulong LvtCmciIndex = 0x2F;
+    static const ulong LvtTimerIndex = 0x32;
+    static const ulong LvtThermalIndex = 0x33;
+    static const ulong LvtPerfCntIndex = 0x34;
+    static const ulong LvtLint0Index = 0x35;
+    static const ulong LvtLint1Index = 0x36;
+    static const ulong LvtErrorIndex = 0x37;
+
+    static const u32 LvtMasked = (1U << 16);
 
     static const ulong IcrLowIndex = 0x30;
     static const ulong IcrHighIndex = 0x31;
