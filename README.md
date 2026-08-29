@@ -2,11 +2,11 @@
 
 A hobby operating system kernel for x86-64 and arm64 (aarch64), written in C++20, Rust, and assembly.
 Code is partially written by AI models (Claude, GPT) with human control over architecture decisions, testing, and code review.
-Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices), and on QEMU `virt` with HVF acceleration on Apple Silicon for the arm64 build. Real hardware support has not been tested.
+Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices), and on QEMU `virt` with HVF acceleration on Apple Silicon for the arm64 build. On x86-64 it boots under both legacy BIOS and UEFI. It also runs on real hardware — see [Real hardware](#real-hardware) — though only one machine has been tried, so anything beyond it is untested.
 
 #### Features
 
-- **Two architectures** — x86-64 (Multiboot2/GRUB, ISO or MBR disk boot) and arm64 (QEMU `virt` board, Linux `Image` boot protocol); portable code goes through a HAL layer (`src/cpp/hal/`), arch backends live in `src/cpp/arch/`
+- **Two architectures** — x86-64 (Multiboot2/GRUB, ISO or MBR disk boot, **legacy BIOS and UEFI firmware**) and arm64 (QEMU `virt` board, Linux `Image` boot protocol); portable code goes through a HAL layer (`src/cpp/hal/`), arch backends live in `src/cpp/arch/`
 - **SMP** — up to 8 CPUs; AP bootstrap via INIT/SIPI on x86-64, PSCI `CPU_ON` on arm64
 - **Preemptive multitasking** — per-CPU task queues, round-robin scheduling, load-balanced task placement
 - **Virtual memory** — 4-level paging (4 KB pages), high-half kernel at `0xFFFF800001000000`, TLB shootdown across CPUs via IPI
@@ -63,6 +63,37 @@ Build a bootable qcow2 disk image (MBR, 2 partitions):
 
 This produces `nos.qcow2` (1 GB, MBR, virtio-blk compatible, suitable for KVM-based public clouds including Google Cloud Compute Engine).
 
+#### Firmware: BIOS and UEFI
+
+Both firmware flavours are supported by the same `nos.iso`: `grub-mkrescue`
+writes a hybrid image whose El Torito catalog carries an `i386-pc` boot image
+*and* an EFI system partition (`/efi/boot/bootx64.efi`), and the kernel then
+adapts to whichever firmware it woke up under.
+
+| | Legacy BIOS | UEFI |
+|---|---|---|
+| GRUB platform | `i386-pc` El Torito image + MBR boot code | ESP with `bootx64.efi` |
+| Console | EGA text at `0xB8000` (`drivers/vga.cpp`) | GOP pixel framebuffer, 8x16 font (`drivers/fb_console.cpp`) |
+| Keyboard | 8042 PS/2 | USB HID over xHCI (`drivers/usb/`); real UEFI laptops often have no 8042 at all |
+
+The multiboot2 header asks GRUB for a framebuffer but marks both the console and
+framebuffer tags optional, so BIOS boots keep legacy text mode while UEFI boots
+get a linear framebuffer; `drivers/screen.cpp` picks the console at runtime from
+what actually arrived, and `insmod all_video` in `build/grub.cfg` is what lets
+GRUB set the mode at all.
+
+Two limits worth knowing:
+
+- The UEFI half of the ISO only exists if `grub-mkrescue` finds the
+  `x86_64-efi` modules (`grub-efi-amd64-bin`) plus `mtools` — the FAT ESP is
+  built with them — on the build host. The Docker builder image and the CI
+  runner both install them, so `scripts/build-iso-docker.sh`, a native `make`
+  and the release artifacts all produce the hybrid ISO; a bare host missing
+  those two packages silently gets a BIOS-only ISO instead.
+- `nos.qcow2` from `scripts/build-disk.sh` is MBR with `i386-pc` GRUB in the
+  boot code — BIOS-only by design, since that is how the KVM clouds boot it.
+  There is no ESP on that image.
+
 #### Run
 
 With KVM (Linux):
@@ -78,10 +109,12 @@ Without KVM (macOS with TCG):
 qemu-system-x86_64 -smp 2 -cdrom nos.iso -serial file:nos.log -s -vga std
 ```
 
-UEFI boot (OVMF instead of the legacy BIOS). There is no EGA text mode
+UEFI boot (OVMF instead of the legacy BIOS — see
+[Firmware: BIOS and UEFI](#firmware-bios-and-uefi)). There is no EGA text mode
 under UEFI, so GRUB hands the kernel a pixel framebuffer and the screen is
 drawn with the 8x16 font console; the PS/2 keyboard is emulated by QEMU, so
-the shell is usable on screen as well as on serial:
+the shell is usable on screen as well as on serial (on a real UEFI laptop it
+would come from the xHCI USB keyboard instead):
 
 ```sh
 cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/ovmf_vars.fd
@@ -123,6 +156,35 @@ gcloud compute instances create nos-vm \
 # Connect via serial console
 gcloud compute connect-to-serial-port nos-vm
 ```
+
+#### Real hardware
+
+`nos` boots on bare metal. Verified on one machine so far: a **Dell Latitude
+5480** (Intel Core i5-6200U, Skylake-U / 100-series PCH, BIOS 1.16.0) booted
+under UEFI. That laptop has no serial port and no 8042/PS/2 controller, yet the
+kernel comes up on its own screen and gives an interactive shell driven by the
+built-in USB keyboard.
+
+That machine is the reason for four pieces of the tree, none of which QEMU
+ever demanded:
+
+- **Screen** — under UEFI there is no EGA text mode. GRUB hands the kernel the
+  pixel framebuffer and `drivers/fb_console.cpp` draws the console with an 8x16
+  font; without it a UEFI boot is simply blind.
+- **Keyboard** — a real UEFI laptop often has no 8042 at all, so the emulated
+  PS/2 controller QEMU and the KVM clouds provide is not there. The xHCI driver
+  (`drivers/usb/`) enumerates a USB HID boot keyboard and publishes into the
+  same `KeyboardInput` sink the 8042 driver uses. `usb=off` skips it.
+- **Firmware leftovers** — LAPIC LVTs the firmware left armed are masked, and a
+  stray interrupt is named instead of panicking anonymously. The TCO watchdog is
+  located on 100-series PCH and left alone when the ACPI WDAT table says the
+  firmware owns it, so it cannot reset the box mid-boot.
+- **Diagnostics** — with no UART the screen is the only channel, so boot-path
+  failures print through the screen console and the panic handler rather than
+  `Trace` alone.
+
+Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
+as "works on the machine it was debugged on".
 
 #### Debug
 
