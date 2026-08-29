@@ -28,6 +28,7 @@
 #include <net/net_device.h>
 #include <net/net_frame.h>
 #include <drivers/hpet.h>
+#include <drivers/acpi.h>
 
 static const ulong RustAllocTag = 'rust';
 
@@ -1387,6 +1388,11 @@ unsigned long long kernel_hpet_read_ns()
 bool kernel_hpet_is_available()
 {
     return Kernel::Hpet::GetInstance().IsAvailable();
+}
+
+bool kernel_acpi_has_firmware_watchdog()
+{
+    return Kernel::Acpi::GetInstance().HasFirmwareWatchdog();
 }
 
 } /* extern "C" */

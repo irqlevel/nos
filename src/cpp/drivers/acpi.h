@@ -39,6 +39,12 @@ public:
     ulong GetHpetBasePhys();
     u16 GetHpetMinTick();
 
+    /* WDAT: true when the firmware describes a watchdog for the OS to drive
+       through the ACPI instruction set.  Native watchdog drivers (the Rust
+       tco_wdt) must then leave the hardware alone -- the same rule Linux
+       applies in acpi_has_watchdog(). */
+    bool HasFirmwareWatchdog();
+
 private:
     Acpi();
     ~Acpi();
@@ -226,8 +232,47 @@ private:
         u8  PageProtection;             /* +19 */
     } __attribute__((packed));
 
+    /* WDAT ACPI table body (beyond the SDT header), followed by Entries
+       WdatEntry records */
+    struct WdatTableBody
+    {
+        u32 HeaderLength;       /* +0  */
+        u16 PciSegment;         /* +4  */
+        u8  PciBus;             /* +6  */
+        u8  PciDevice;          /* +7  */
+        u8  PciFunction;        /* +8  */
+        u8  Reserved[3];        /* +9  */
+        u32 TimerPeriod;        /* +12, milliseconds per count */
+        u32 MaxCount;           /* +16 */
+        u32 MinCount;           /* +20 */
+        u8  Flags;              /* +24 */
+        u8  Reserved2[3];       /* +25 */
+        u32 Entries;            /* +28 */
+    } __attribute__((packed));
+
+    static_assert(sizeof(WdatTableBody) == 32, "Invalid WDAT body size");
+
+    struct WdatEntry
+    {
+        u8  Action;             /* +0  */
+        u8  Instruction;        /* +1  */
+        u16 Reserved;           /* +2  */
+        GenericAddressStructure RegisterRegion; /* +4  */
+        u32 Value;              /* +16 */
+        u32 Mask;               /* +20 */
+    } __attribute__((packed));
+
+    static_assert(sizeof(WdatEntry) == 24, "Invalid WDAT entry size");
+
+    /* A WDAT whose instructions poke the RTC is ignored: the CMOS ports are
+       not the watchdog's alone (Linux does the same in
+       acpi_watchdog_uses_rtc). */
+    static const u8 GasSpaceSystemIo = 1;
+    static const u64 RtcPortBase = 0x70;
+
     void ParseFADT();
     void ParseHPET();
+    void ParseWDAT();
 
     /* FADT-derived values */
     ulong Pm1aCntPort;
@@ -239,6 +284,9 @@ private:
     /* HPET-derived values */
     ulong HpetBasePhys;
     u16 HpetMinTick;
+
+    /* WDAT-derived value */
+    bool FirmwareWatchdog;
 
 };
 

@@ -3,6 +3,7 @@
 #include <drivers/virtio_scsi.h>
 #include <drivers/msix.h>
 #include <drivers/hpet.h>
+#include <drivers/acpi.h>
 #include <hal/irq_stubs.h>
 
 /* Link stubs for the x86-only device paths still referenced from common
@@ -30,6 +31,34 @@ void __attribute__((noreturn)) StubTrap()
     }
 }
 
+}
+
+/* arm64 boots from a device tree, so drivers/acpi.cpp is not built here;
+   these keep the rust_ffi ACPI query linkable. */
+Acpi::Acpi()
+    : Rsdt(nullptr)
+    , LapicAddress(nullptr)
+    , IoApicAddress(nullptr)
+    , IrqToGsiSize(0)
+    , Pm1aCntPort(0)
+    , ResetRegValid(false)
+    , ResetRegPort(0)
+    , ResetVal(0)
+    , CenturyRegister(0)
+    , HpetBasePhys(0)
+    , HpetMinTick(0)
+    , FirmwareWatchdog(false)
+{
+    OemId[0] = '\0';
+}
+
+Acpi::~Acpi()
+{
+}
+
+bool Acpi::HasFirmwareWatchdog()
+{
+    return false;
 }
 
 Hpet::Hpet()

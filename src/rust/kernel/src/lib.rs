@@ -35,6 +35,16 @@ fn tco_init() {
     use kcore::timer::Timer;
     use kcore::time::Duration;
 
+    /* An ACPI WDAT table means the firmware owns the watchdog and expects
+       the OS to drive it through WDAT instructions -- which nos does not
+       implement.  Grabbing the TCO registers underneath it would be fighting
+       the platform over the same hardware, so stand down; Linux skips the
+       native iTCO driver on these systems for the same reason. */
+    if kcore::acpi::has_firmware_watchdog() {
+        kcore::trace!(0, "TCO watchdog: ACPI WDAT present, firmware owns the watchdog");
+        return;
+    }
+
     let wdt = match TcoWatchdog::probe() {
         Some(w) => w,
         None => {
@@ -42,6 +52,10 @@ fn tco_init() {
             return;
         }
     };
+
+    kcore::trace!(0, "TCO watchdog: TCOBASE 0x{:04X} via {}{}",
+        wdt.base(), wdt.source().as_str(),
+        if wdt.source().no_reboot_cleared() { "" } else { ", NO_REBOOT left as firmware set it" });
 
     /* The timer callback holds a raw pointer to the TcoWatchdog; the watchdog
        is deliberately leaked so it lives for the kernel's lifetime. */
