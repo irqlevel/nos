@@ -11,7 +11,9 @@ RUN apt-get update && apt-get install -y \
     nasm \
     grub2-common \
     grub-pc-bin \
+    grub-efi-amd64-bin \
     xorriso \
+    mtools \
     cppcheck \
     parted \
     e2fsprogs \
