@@ -19,3 +19,4 @@ bin
 src/cpp/kernel/symtab_data.cpp
 src/rust/target/
 out/
+.claude/
