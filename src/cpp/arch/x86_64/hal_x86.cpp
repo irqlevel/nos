@@ -36,6 +36,62 @@ void EnableWxSupport()
         ::: "rax", "memory");
 }
 
+namespace
+{
+
+/* Set once SetupMemoryTypes() has programmed the PAT; every CPU writes the
+   same value, so the racy stores are benign. */
+bool WriteCombiningReady;
+
+bool CpuHasPat()
+{
+    /* CPUID.01H:EDX[16] = PAT */
+    u32 eax, ebx, ecx, edx;
+
+    asm volatile("cpuid"
+        : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+        : "a"(1U), "c"(0U));
+
+    return (edx & (1U << 16)) != 0;
+}
+
+}
+
+void SetupMemoryTypes()
+{
+    static const u32 PatMsr = 0x277;
+    static const u32 WcEntry = 4;      /* PTE bit PAT=1, PCD=0, PWT=0 */
+    static const u64 PatTypeWc = 0x01;
+    static const u64 PatEntryMask = 0xFF;
+
+    if (!CpuHasPat())
+    {
+        Trace(0, "PAT: not supported, MMIO stays uncached");
+        return;
+    }
+
+    u64 pat = ReadMsr(PatMsr);
+    pat &= ~(PatEntryMask << (WcEntry * 8));
+    pat |= PatTypeWc << (WcEntry * 8);
+
+    /* Changing a memory type wants the caches flushed and the TLB clean
+       (SDM 11.11.8). Interrupts are still off here on both the BSP and the
+       APs, and entry 4 is not used by any existing mapping. */
+    asm volatile("wbinvd" ::: "memory");
+    WriteMsr(PatMsr, pat);
+    asm volatile("wbinvd" ::: "memory");
+    TlbFlushAll();
+
+    WriteCombiningReady = true;
+
+    Trace(0, "PAT: 0x%p, entry %u = WC", (ulong)pat, (ulong)WcEntry);
+}
+
+bool IsWriteCombiningAvailable()
+{
+    return WriteCombiningReady;
+}
+
 ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes)
 {
     (void)physAddr;

@@ -10,6 +10,20 @@ namespace Hal
    always active). Defined per arch. */
 void EnableWxSupport();
 
+/* Program this CPU's memory-type table so write-combining MMIO mappings
+   work. x86: IA32_PAT entry 4 (the entry a 4K PTE selects with the PAT
+   bit) becomes WC, leaving the other seven entries at their power-on
+   meaning so existing mappings keep their type. The architecture requires
+   every CPU to run with the same PAT, so this must be called on the BSP
+   and on each AP before it loads the kernel page table. arm64: no-op, the
+   MAIR (idx2 = Normal non-cacheable) is set up in boot.S for every CPU.
+   Defined per arch. */
+void SetupMemoryTypes();
+
+/* True once SetupMemoryTypes() has made write-combining usable (x86: the
+   CPU has PAT). MapMmioRegion falls back to uncached when it is false. */
+bool IsWriteCombiningAvailable();
+
 /* Nonzero if the arch guarantees [physAddr, physAddr+size) is permanently
    mapped (arm64: the boot device-GiB block covering all QEMU-virt MMIO);
    MapMmioRegion returns it directly instead of building 4K mappings.

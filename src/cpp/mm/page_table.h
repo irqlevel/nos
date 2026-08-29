@@ -112,16 +112,38 @@ public:
     bool MapPage(ulong virtAddr, Page* page);
     Page* UnmapPage(ulong virtAddr);
 
+    /* Cache policy for MapMmioRegion.
+
+       MmioUncached is the only correct choice for device registers: every
+       load and store reaches the device, in program order.
+
+       MmioWriteCombining is for memory-like device RAM with no read side
+       effects -- a framebuffer. Stores may be buffered, merged and
+       reordered, which is what makes drawing affordable; the writer must
+       call Hal::WcFlush() when the pixels have to be visible, and must
+       never use it for registers. Falls back to uncached if the CPU cannot
+       do write-combining (Hal::IsWriteCombiningAvailable). */
+    enum MmioCachePolicy
+    {
+        MmioUncached = 0,
+        MmioWriteCombining = 1,
+    };
+
     /* Map a physical MMIO range into kernel virtual space.
        physAddr must be page-aligned.
        Returns kernel virtual address, or 0 on failure.
+
+       The mapping is always non-executable: nothing is ever fetched from
+       MMIO, and on real hardware a speculative fetch from device memory can
+       trigger read side effects.
 
        Boot-ordering constraint: the mapping is placed at
        physAddr + KernelSpaceBase outside the VaAllocator, is permanent
        (never unmapped), and only the local TLB is invalidated. Callers
        must therefore run on the BSP before the APs are started
        (currently: HPET and driver init in Main2/BpStartup). */
-    ulong MapMmioRegion(ulong physAddr, ulong sizeBytes);
+    ulong MapMmioRegion(ulong physAddr, ulong sizeBytes,
+        MmioCachePolicy policy = MmioUncached);
 
     /* Tighten permissions on an existing kernel-image mapping to enforce
        W^X: writable=false makes the range read-only, executable=false makes

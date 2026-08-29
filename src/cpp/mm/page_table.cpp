@@ -915,11 +915,19 @@ bool PageTable::MapPage(ulong virtAddr, Page* page)
     return true;
 }
 
-ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
+ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes, MmioCachePolicy policy)
 {
-    ulong premapped = Hal::MmioPremappedVa(physAddr, sizeBytes);
-    if (premapped != 0)
-        return premapped;
+    const bool writeCombining =
+        (policy == MmioWriteCombining) && Hal::IsWriteCombiningAvailable();
+
+    /* The arch's premapped window is device-typed, so it can only serve an
+       uncached request; a write-combining one builds its own leaf PTEs. */
+    if (policy == MmioUncached)
+    {
+        ulong premapped = Hal::MmioPremappedVa(physAddr, sizeBytes);
+        if (premapped != 0)
+            return premapped;
+    }
 
     if (physAddr & (Const::PageSize - 1))
         return 0;
@@ -993,8 +1001,12 @@ ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes)
         if (!l1Entry->Present())
         {
             l1Entry->SetAddress(pa);
-            /* Device memory: must stay uncached */
-            l1Entry->SetCacheDisabled();
+            if (writeCombining)
+                l1Entry->SetWriteCombining();
+            else
+                l1Entry->SetCacheDisabled();   /* device memory: uncached */
+            /* Nothing is ever executed out of MMIO */
+            l1Entry->SetNoExecute();
             l1Entry->SetWritable();
             l1Entry->SetPresent();
         }

@@ -77,6 +77,15 @@ struct Pte final
         Value |= AttrIdxDevice | PxnBit | UxnBit;
     }
 
+    /* Write-combining equivalent: MAIR idx2 = Normal non-cacheable, so
+       stores may be merged and reordered the way x86 WC does. Kept
+       execute-never like device memory -- the only user is a framebuffer. */
+    void SetWriteCombining()
+    {
+        Value &= ~AttrIdxMask;
+        Value |= AttrIdxNonCacheable | ShInner | PxnBit | UxnBit;
+    }
+
     void SetHuge()
     {
         Value |= HugeSwBit;
@@ -141,6 +150,7 @@ struct Pte final
 
     static const ulong AttrIdxMask = 7UL << 2;
     static const ulong AttrIdxDevice = 1UL << 2; /* MAIR idx1 = Device-nGnRE */
+    static const ulong AttrIdxNonCacheable = 2UL << 2; /* MAIR idx2 = Normal NC */
     static const ulong ShInner = 3UL << 8;
     static const ulong AfBit = 1UL << 10;
     static const ulong ApReadOnly = 1UL << 7;    /* AP[2]: read-only */
