@@ -2,7 +2,7 @@ BITS 64
 
 section .text
 
-extern DummyInterrupt
+extern DummyInterruptDispatch
 extern SpuriousInterrupt
 extern IO8042Interrupt
 extern SerialInterrupt
@@ -95,7 +95,7 @@ global AtomicTestAndClearBit
 global AtomicTestBit
 global AtomicCmpxchg
 
-global DummyInterruptStub
+global DummyInterruptStubTable
 global SpuriousInterruptStub
 global IO8042InterruptStub
 global SerialInterruptStub
@@ -556,7 +556,6 @@ AtomicCmpxchg:
 	iretq
 %endmacro
 
-InterruptStub Dummy
 InterruptStub Spurious
 InterruptStub IO8042
 InterruptStub Serial
@@ -567,6 +566,35 @@ InterruptStub VirtioBlk
 InterruptStub VirtioNet
 InterruptStub VirtioScsi
 InterruptStub Shared
+
+; One entry point per IDT vector. Every slot starts out pointing here
+; (Idt::Idt), and the vector number is baked into the stub so a stray
+; interrupt can name itself: firmware that leaves an LVT armed, or a
+; masked 8259 answering an ExtINT INTA cycle, otherwise lands in an
+; anonymous panic with nothing to chase.
+%assign DummyVector 0
+%rep 256
+DummyInterruptStub%+DummyVector:
+	PushAll
+	mov rdi, rsp
+	mov esi, DummyVector
+	cld
+	call DummyInterruptDispatch
+	PopAll
+	iretq
+%assign DummyVector DummyVector+1
+%endrep
+
+section .rodata
+align 8
+DummyInterruptStubTable:
+%assign DummyVector 0
+%rep 256
+	dq DummyInterruptStub%+DummyVector
+%assign DummyVector DummyVector+1
+%endrep
+
+section .text
 
 %macro RustInterruptSlot 1
 RustInterruptStub%1:

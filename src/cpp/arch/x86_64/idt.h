@@ -8,6 +8,8 @@
 namespace Kernel
 {
 
+struct Context;
+
 class Idt final
 {
 public:
@@ -28,7 +30,7 @@ public:
 
     u16 GetLimit();
 
-    void DummyInterrupt();
+    void DummyInterrupt(Context* ctx, u8 vector);
 
 private:
     Idt();
@@ -39,6 +41,14 @@ private:
 
     Idt& operator=(const Idt& other) = delete;
     Idt& operator=(Idt&& other) = delete;
+
+    /* Slots below this are CPU exceptions (Intel reserved); device
+       interrupts start at 0x20 */
+    static const u8 FirstDeviceVector = 0x20;
+
+    /* Report a stray interrupt this many times, then only count it: a
+       level-triggered source nobody can acknowledge repeats forever */
+    static const long MaxDummyReports = 8;
 
     struct TableDesc {
 	    u16 Limit;
