@@ -31,7 +31,9 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
 
 The build is parameterized by `ARCH` (default `x86_64`, or `aarch64`); objects go to `out/$(ARCH)/`.
 
-Native (requires clang, nasm, ld, grub-mkrescue, rustup with `x86_64-unknown-none` target):
+Native (requires clang, nasm, ld, grub-mkrescue with `xorriso` + `mtools`, and a **nightly**
+rustup toolchain with the `rust-src` component — the Rust staticlib uses `-Z build-std`
+to rebuild `core`/`alloc` with `-Ccode-model=large`; `src/rust/rust-toolchain.toml` pins it):
 
 ```sh
 make
@@ -45,7 +47,7 @@ Via Docker (works on macOS / Apple Silicon):
 
 This produces `nos.iso` and `bin/kernel64.elf` (for GDB symbols).
 
-arm64 (requires `ld.lld`, `llvm-nm`, rustup with `aarch64-unknown-none-softfloat` target; on macOS build in Docker):
+arm64 (requires `ld.lld`, `llvm-nm` and the same nightly Rust toolchain; on macOS build in Docker):
 
 ```sh
 make nocheck ARCH=aarch64
