@@ -11,6 +11,7 @@ Parameters::Parameters()
     , SmpOff(false)
     , ItsEnabled(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
     , WxProbe(false)
+    , UsbOff(false)
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
@@ -46,6 +47,11 @@ bool Parameters::IsItsEnabled()
 bool Parameters::IsWxProbe()
 {
     return WxProbe;
+}
+
+bool Parameters::IsUsbOff()
+{
+    return UsbOff;
 }
 
 bool Parameters::IsConsoleSerial()
@@ -148,6 +154,10 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     else if (Stdlib::StrCmp(key, "its") == 0)
     {
         ItsEnabled = (Stdlib::StrCmp(value, "off") != 0);
+    }
+    else if (Stdlib::StrCmp(key, "usb") == 0)
+    {
+        UsbOff = (Stdlib::StrCmp(value, "off") == 0);
     }
     else if (Stdlib::StrCmp(key, "wxprobe") == 0)
     {

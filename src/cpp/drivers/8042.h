@@ -6,16 +6,11 @@
 #include <kernel/interrupt.h>
 #include <hal/context.h>
 #include <kernel/atomic.h>
+#include <kernel/input.h>
 #include <lib/ring_buffer.h>
 
 namespace Kernel
 {
-
-class IO8042Observer
-{
-public:
-    virtual void OnChar(char c, u8 code) = 0;
-};
 
 class IO8042 : public TimerCallback, public InterruptHandler
 {
@@ -34,9 +29,6 @@ public:
     virtual void OnTick(TimerCallback& callback) override;
 
     char GetCmd();
-
-    bool RegisterObserver(IO8042Observer& observer);
-    void UnregisterObserver(IO8042Observer& observer);
 
 private:
     IO8042();
@@ -61,8 +53,6 @@ private:
     u8 Mod;
     u8 Extended; /* set after a 0xE0 prefix byte */
 
-    static const size_t MaxObserver = 16;
-    IO8042Observer* Observer[MaxObserver];
     Atomic InterruptCounter;
 };
 
