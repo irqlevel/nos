@@ -644,12 +644,17 @@ Page* PageTable::AllocContiguousPages(ulong count)
     return nullptr;
 }
 
+void PageTable::FreePageNoLock(Page* page)
+{
+    FreePagesCount++;
+    FreePagesList.InsertHead(&page->ListEntry);
+}
+
 void PageTable::FreePage(Page* page)
 {
     Stdlib::AutoLock lock(Lock);
 
-    FreePagesCount++;
-    FreePagesList.InsertHead(&page->ListEntry);
+    FreePageNoLock(page);
 }
 
 /* Sentinel for TmpMapPageArray when page was mapped without a Page struct (e.g. reserved ACPI region). */
@@ -820,99 +825,239 @@ ulong PageTable::TmpMapRange(ulong phyAddr, size_t len)
     return 0;
 }
 
+Page* PageTable::SourcePage(const MapSource& src, size_t index)
+{
+    if (src.Ptrs != nullptr)
+        return src.Ptrs[index];
+
+    if (src.Array != nullptr)
+        return &src.Array[index];
+
+    /* GetPage's reference is only for the lookup; MapRangeLocked takes the
+       mapping reference of its own and releases this one. */
+    return GetPage(src.PhyAddrs[index]);
+}
+
+/* Walk down to the L1 table that maps virtAddr and return it temp-mapped,
+   or nullptr. With create set, a missing L4/L3/L2 entry is filled in with
+   a fresh table; without it a missing level means the caller asked about a
+   VA that was never mapped, which is a bug in the caller. Lock must be
+   held, and the caller TmpUnmapPage()s the result. */
+PtePage* PageTable::WalkToL1Locked(ulong virtAddr, bool create)
+{
+    /* No BugOn: MapPage answered a missing Root with a plain failure, and
+       a walk can also fail on a legitimately exhausted TmpMap. */
+    if (Root == 0)
+        return nullptr;
+
+    PtePage* table = (PtePage*)TmpMapPage(Root);
+    if (table == nullptr)
+        return nullptr;
+
+    /* L4 -> L3 -> L2; each step consumes that level's slice of the VA and
+       leaves the next table temp-mapped in its place. */
+    for (ulong level = 4; level > 1; level--)
+    {
+        ulong index = (level == 4) ? Pte::L4Index(virtAddr)
+                    : (level == 3) ? Pte::L3Index(virtAddr)
+                                   : Pte::L2Index(virtAddr);
+
+        Pte* entry = &table->Entry[index];
+        if (!entry->Present())
+        {
+            if (!create)
+            {
+                BugOn(1);
+                TmpUnmapPage((ulong)table);
+                return nullptr;
+            }
+
+            Page* page = AllocPageNoLock();
+            if (page == nullptr)
+            {
+                TmpUnmapPage((ulong)table);
+                return nullptr;
+            }
+
+            entry->SetAddress(page->GetPhyAddress());
+            entry->SetWritable();
+            entry->SetPresent();
+        }
+
+        PtePage* next = (PtePage*)TmpMapPage(entry->Address());
+        TmpUnmapPage((ulong)table);
+        if (next == nullptr)
+            return nullptr;
+
+        table = next;
+    }
+
+    return table;
+}
+
+/* The one range mapper behind MapPage and the three MapXxxPages forms.
+   The walk is redone only when the run steps into the next L1 table, which
+   for a naturally aligned block of at most MaxContiguousPages pages never
+   happens. Lock must be held. */
+bool PageTable::MapRangeLocked(ulong virtAddr, size_t count, const MapSource& src)
+{
+    BugOn(virtAddr & (Const::PageSize - 1));
+
+    PtePage* l1Page = nullptr;
+    size_t mapped = 0;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        ulong va = virtAddr + i * Const::PageSize;
+        ulong l1Index = Pte::L1Index(va);
+
+        BugOn(va >= TmpMapStart && va < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
+
+        if (l1Page == nullptr)
+        {
+            l1Page = WalkToL1Locked(va, true);
+            if (l1Page == nullptr)
+                break;
+        }
+
+        Pte* l1Entry = &l1Page->Entry[l1Index];
+        if (l1Entry->Present())
+            break;
+
+        Page* page = SourcePage(src, i);
+        if (page != nullptr)
+        {
+            page->Get();
+            l1Entry->SetAddress(page->GetPhyAddress());
+            l1Entry->SetWritable();
+            l1Entry->SetPresent();
+            if (src.PhyAddrs != nullptr)
+                page->Put(); /* balance SourcePage's GetPage */
+        }
+        else
+        {
+            l1Entry->Clear();
+        }
+
+        Hal::TlbFlushPage(va);
+        mapped++;
+
+        /* Last entry of this table: the next VA starts a new walk. */
+        if (l1Index == (Stdlib::ArraySize(l1Page->Entry) - 1))
+        {
+            TmpUnmapPage((ulong)l1Page);
+            l1Page = nullptr;
+        }
+    }
+
+    if (l1Page != nullptr)
+        TmpUnmapPage((ulong)l1Page);
+
+    if (mapped == count)
+        return true;
+
+    /* All-or-nothing: undo the prefix that did get mapped, leaving the
+       pages themselves to the caller. */
+    if (mapped != 0)
+        UnmapRangeLocked(virtAddr, mapped, false);
+
+    return false;
+}
+
+/* Range twin of MapRangeLocked. A missing entry is a caller bug (BugOn),
+   but the walk carries on so the rest of the range is still torn down.
+   Lock must be held. */
+void PageTable::UnmapRangeLocked(ulong virtAddr, size_t count, bool freePages)
+{
+    BugOn(virtAddr & (Const::PageSize - 1));
+
+    PtePage* l1Page = nullptr;
+
+    for (size_t i = 0; i < count; i++)
+    {
+        ulong va = virtAddr + i * Const::PageSize;
+        ulong l1Index = Pte::L1Index(va);
+
+        BugOn(va >= TmpMapStart && va < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
+
+        if (l1Page == nullptr)
+        {
+            l1Page = WalkToL1Locked(va, false);
+            if (l1Page == nullptr)
+                return;
+        }
+
+        Pte* l1Entry = &l1Page->Entry[l1Index];
+        if (!l1Entry->Present())
+        {
+            BugOn(1);
+        }
+        else
+        {
+            ulong phyAddr = l1Entry->Address();
+            l1Entry->Clear();
+            BugOn(!phyAddr);
+            Hal::TlbFlushPage(va);
+
+            Page* page = GetPage(phyAddr);
+            page->Put(); /* balance GetPage's lookup reference */
+            if (freePages)
+                FreePageNoLock(page);
+            page->Put(); /* the mapping reference MapRangeLocked took */
+        }
+
+        if (l1Index == (Stdlib::ArraySize(l1Page->Entry) - 1))
+        {
+            TmpUnmapPage((ulong)l1Page);
+            l1Page = nullptr;
+        }
+    }
+
+    if (l1Page != nullptr)
+        TmpUnmapPage((ulong)l1Page);
+}
+
 bool PageTable::MapPage(ulong virtAddr, Page* page)
 {
     Stdlib::AutoLock lock(Lock);
 
-    BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
+    MapSource src = { &page, nullptr, nullptr };
 
-    ulong l4Index = Pte::L4Index(virtAddr);
-    ulong l3Index = Pte::L3Index(virtAddr);
-    ulong l2Index = Pte::L2Index(virtAddr);
-    ulong l1Index = Pte::L1Index(virtAddr);
+    return MapRangeLocked(virtAddr, 1, src);
+}
 
-    if (Root == 0)
-    {
-        return false;
-    }
+bool PageTable::MapPages(ulong virtAddr, Page* const* pages, size_t count)
+{
+    Stdlib::AutoLock lock(Lock);
 
-    PtePage* l4Page = (PtePage*)TmpMapPage(Root);
-    if (l4Page == nullptr)
-        return false;
+    MapSource src = { pages, nullptr, nullptr };
 
-    Pte *l4Entry = &l4Page->Entry[l4Index];
-    if (!l4Entry->Present()) {
-        Page* page = AllocPageNoLock();
-        if (!page) {
-            TmpUnmapPage((ulong)l4Page);
-            return false;
-        }
+    return MapRangeLocked(virtAddr, count, src);
+}
 
-        l4Entry->SetAddress(page->GetPhyAddress());
-        l4Entry->SetWritable();
-        l4Entry->SetPresent();
-    }
+bool PageTable::MapContiguousPages(ulong virtAddr, Page* pages, size_t count)
+{
+    Stdlib::AutoLock lock(Lock);
 
-    PtePage* l3Page = (PtePage*)TmpMapPage(l4Entry->Address());
-    TmpUnmapPage((ulong)l4Page);
-    if (l3Page == nullptr)
-        return false;
+    MapSource src = { nullptr, pages, nullptr };
 
-    Pte *l3Entry = &l3Page->Entry[l3Index];
-    if (!l3Entry->Present()) {
-        Page *page = AllocPageNoLock();
-        if (!page) {
-            TmpUnmapPage((ulong)l3Page);
-            return false;
-        }
-        l3Entry->SetAddress(page->GetPhyAddress());
-        l3Entry->SetWritable();
-        l3Entry->SetPresent();
-    }
+    return MapRangeLocked(virtAddr, count, src);
+}
 
-    PtePage* l2Page = (PtePage*)TmpMapPage(l3Entry->Address());
-    TmpUnmapPage((ulong)l3Page);
-    if (l2Page == nullptr)
-        return false;
+bool PageTable::MapPhysPages(ulong virtAddr, const ulong* phyAddrs, size_t count)
+{
+    Stdlib::AutoLock lock(Lock);
 
-    Pte *l2Entry = &l2Page->Entry[l2Index];
-    if (!l2Entry->Present()) {
-        Page* page = AllocPageNoLock();
-        if (!page) {
-            TmpUnmapPage((ulong)l2Page);
-            return false;
-        }
+    MapSource src = { nullptr, nullptr, phyAddrs };
 
-        l2Entry->SetAddress(page->GetPhyAddress());
-        l2Entry->SetWritable();
-        l2Entry->SetPresent();
-    }
+    return MapRangeLocked(virtAddr, count, src);
+}
 
-    PtePage* l1Page = (PtePage*)TmpMapPage(l2Entry->Address());
-    TmpUnmapPage((ulong)l2Page);
-    if (l1Page == nullptr)
-        return false;
+void PageTable::UnmapPages(ulong virtAddr, size_t count, bool freePages)
+{
+    Stdlib::AutoLock lock(Lock);
 
-    Pte *l1Entry = &l1Page->Entry[l1Index];
-    if (l1Entry->Present()) {
-        TmpUnmapPage((ulong)l1Page);
-        return false;
-    }
-
-    if (page)
-    {
-        page->Get();
-        l1Entry->SetAddress(page->GetPhyAddress());
-        l1Entry->SetWritable();
-        l1Entry->SetPresent();
-    } else {
-        l1Entry->Clear();
-    }
-    TmpUnmapPage((ulong)l1Page);
-    Hal::TlbFlushPage(virtAddr);
-
-    return true;
+    UnmapRangeLocked(virtAddr, count, freePages);
 }
 
 ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes, MmioCachePolicy policy)
@@ -1017,67 +1162,22 @@ ulong PageTable::MapMmioRegion(ulong physAddr, ulong sizeBytes, MmioCachePolicy 
     return physAddr + MemoryMap::KernelSpaceBase;
 }
 
+/* Legacy single-page form: returns the page so the caller can pair its own
+   FreePage/Put with it, the way it did before UnmapPages existed. */
 Page* PageTable::UnmapPage(ulong virtAddr)
 {
     Stdlib::AutoLock lock(Lock);
 
-    BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
-
-    ulong l4Index = Pte::L4Index(virtAddr);
-    ulong l3Index = Pte::L3Index(virtAddr);
-    ulong l2Index = Pte::L2Index(virtAddr);
-    ulong l1Index = Pte::L1Index(virtAddr);
-
-    if (Root == 0)
-    {
-        BugOn(1);
-        return nullptr;
-    }
-
-    PtePage* l4Page = (PtePage*)TmpMapPage(Root);
-    if (l4Page == nullptr)
-        return nullptr;
-
-    Pte *l4Entry = &l4Page->Entry[l4Index];
-    if (!l4Entry->Present())
-    {
-        BugOn(1);
-        TmpUnmapPage((ulong)l4Page);
-        return nullptr;
-    }
-
-    PtePage* l3Page = (PtePage*)TmpMapPage(l4Entry->Address());
-    TmpUnmapPage((ulong)l4Page);
-    if (l3Page == nullptr)
-        return nullptr;
-
-    Pte *l3Entry = &l3Page->Entry[l3Index];
-    if (!l3Entry->Present()) {
-        BugOn(1);
-        TmpUnmapPage((ulong)l3Page);
-        return nullptr;
-    }
-
-    PtePage* l2Page = (PtePage*)TmpMapPage(l3Entry->Address());
-    TmpUnmapPage((ulong)l3Page);
-    if (l2Page == nullptr)
-        return nullptr;
-
-    Pte *l2Entry = &l2Page->Entry[l2Index];
-    if (!l2Entry->Present()) {
-        BugOn(1);
-        TmpUnmapPage((ulong)l2Page);
-        return nullptr;
-    }
-
-    PtePage* l1Page = (PtePage*)TmpMapPage(l2Entry->Address());
-    TmpUnmapPage((ulong)l2Page);
+    PtePage* l1Page = WalkToL1Locked(virtAddr, false);
     if (l1Page == nullptr)
         return nullptr;
 
-    Pte *l1Entry = &l1Page->Entry[l1Index];
-    if (!l1Entry->Present()) {
+    BugOn(virtAddr & (Const::PageSize - 1));
+    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
+
+    Pte* l1Entry = &l1Page->Entry[Pte::L1Index(virtAddr)];
+    if (!l1Entry->Present())
+    {
         BugOn(1);
         TmpUnmapPage((ulong)l1Page);
         return nullptr;
@@ -1088,6 +1188,7 @@ Page* PageTable::UnmapPage(ulong virtAddr)
     TmpUnmapPage((ulong)l1Page);
     BugOn(!phyAddr);
     Hal::TlbFlushPage(virtAddr);
+
     Page* page = GetPage(phyAddr);
     page->Put();
     return page;

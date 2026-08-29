@@ -112,6 +112,25 @@ public:
     bool MapPage(ulong virtAddr, Page* page);
     Page* UnmapPage(ulong virtAddr);
 
+    /* Range forms of MapPage/UnmapPage. A run of consecutive VAs shares
+       one walk down L4/L3/L2 and one temp mapping of the L1 table, so an
+       n-page block costs 4 temp mappings instead of 4n; MapPage is the
+       n == 1 case. Only the local TLB is invalidated, as with MapPage --
+       the caller shoots down remote CPUs once for the whole range.
+
+       MapPages takes an array of Page*, MapContiguousPages a run of Page
+       structs, MapPhysPages the physical addresses of pages that already
+       exist (it takes the mapping reference itself, like the others).
+       All three are all-or-nothing: on failure nothing is left mapped and
+       no mapping reference is left outstanding. */
+    bool MapPages(ulong virtAddr, Page* const* pages, size_t count);
+    bool MapContiguousPages(ulong virtAddr, Page* pages, size_t count);
+    bool MapPhysPages(ulong virtAddr, const ulong* phyAddrs, size_t count);
+
+    /* Drop the mapping reference on count pages; with freePages set they
+       also go back to the free list (the AllocPage/MapPages pairing). */
+    void UnmapPages(ulong virtAddr, size_t count, bool freePages);
+
     /* Cache policy for MapMmioRegion.
 
        MmioUncached is the only correct choice for device registers: every
@@ -173,6 +192,23 @@ private:
     void ExcludeFreePages(ulong phyLimit);
 
     Page* AllocPageNoLock();
+    void FreePageNoLock(Page* page);
+
+    /* Where a range map takes its frames from: exactly one member is set.
+       A tagged source keeps one range walk serving all three public forms
+       -- this kernel has no lambdas to parameterize it with. */
+    struct MapSource
+    {
+        Page* const* Ptrs;
+        Page* Array;
+        const ulong* PhyAddrs;
+    };
+
+    Page* SourcePage(const MapSource& src, size_t index);
+
+    PtePage* WalkToL1Locked(ulong virtAddr, bool create);
+    bool MapRangeLocked(ulong virtAddr, size_t count, const MapSource& src);
+    void UnmapRangeLocked(ulong virtAddr, size_t count, bool freePages);
 
     ulong TmpMapStart;
     Kernel::SpinLock TmpMapLock;

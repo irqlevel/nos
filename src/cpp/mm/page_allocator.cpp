@@ -57,29 +57,18 @@ void* FixedPageAllocator::Alloc()
         return nullptr;
     }
 
-    for (size_t i = 0; i < PageCount; i++)
+    if (!pt.MapPages(va, pages, PageCount))
     {
-        if (!pt.MapPage(va + i * Const::PageSize, pages[i]))
-        {
-            for (size_t j = 0; j < i; j++)
-            {
-                Page* page = pt.UnmapPage(va + j * Const::PageSize);
-                pt.FreePage(page);
-                page->Put();
-            }
-            for (size_t j = i; j < PageCount; j++)
-                pt.FreePage(pages[j]);
-            /* Remote CPUs may have cached the just-torn-down translations
-               (UnmapPage only invalidates locally); flush everywhere before
-               the VA block and the pages become reusable. */
-            if (i > 0)
-                Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, i);
-            VaAlloc.Free(va);
-            return nullptr;
-        }
+        for (size_t i = 0; i < PageCount; i++)
+            pt.FreePage(pages[i]);
+        /* Remote CPUs may have cached translations from the prefix MapPages
+           rolled back (it only invalidates locally); flush everywhere before
+           the VA block and the pages become reusable. */
+        Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, PageCount);
+        VaAlloc.Free(va);
+        return nullptr;
     }
 
-    PageTable::InvalidateLocalTlbRange(va, PageCount);
     return (void*)va;
 }
 
@@ -92,24 +81,14 @@ void* FixedPageAllocator::Map(Page* pages)
     }
 
     auto& pt = PageTable::GetInstance();
-    for (size_t i = 0; i < PageCount; i++)
+    if (!pt.MapContiguousPages(va, pages, PageCount))
     {
-        if (!pt.MapPage(va + i * Const::PageSize, &pages[i]))
-        {
-            for (size_t j = 0; j < i; j++)
-            {
-                Page* page = pt.UnmapPage(va + j * Const::PageSize);
-                page->Put();
-            }
-            /* See Alloc: shoot down remote TLBs before reusing the VA. */
-            if (i > 0)
-                Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, i);
-            VaAlloc.Free(va);
-            return nullptr;
-        }
+        /* See Alloc: shoot down remote TLBs before reusing the VA. */
+        Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, PageCount);
+        VaAlloc.Free(va);
+        return nullptr;
     }
 
-    PageTable::InvalidateLocalTlbRange(va, PageCount);
     return (void*)va;
 }
 
@@ -124,27 +103,14 @@ void* FixedPageAllocator::MapPhys(ulong* physAddrs, size_t count)
     }
 
     auto& pt = PageTable::GetInstance();
-    for (size_t i = 0; i < count; i++)
+    if (!pt.MapPhysPages(va, physAddrs, count))
     {
-        Page* page = pt.GetPage(physAddrs[i]);
-        if (!pt.MapPage(va + i * Const::PageSize, page))
-        {
-            page->Put(); /* Balance GetPage's Get for failed page */
-            for (size_t j = 0; j < i; j++)
-            {
-                Page* p = pt.UnmapPage(va + j * Const::PageSize);
-                p->Put(); /* Undo MapPage's Get */
-            }
-            /* See Alloc: shoot down remote TLBs before reusing the VA. */
-            if (i > 0)
-                Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, i);
-            VaAlloc.Free(va);
-            return nullptr;
-        }
-        page->Put(); /* Balance GetPage's Get after MapPage succeeded */
+        /* See Alloc: shoot down remote TLBs before reusing the VA. */
+        Kernel::CpuTable::GetInstance().InvalidateTlbRange(va, count);
+        VaAlloc.Free(va);
+        return nullptr;
     }
 
-    PageTable::InvalidateLocalTlbRange(va, count);
     return (void*)va;
 }
 
@@ -155,12 +121,7 @@ bool FixedPageAllocator::Unmap(void* addr, size_t count)
 
     BugOn(count == 0 || count > PageCount);
 
-    auto& pt = PageTable::GetInstance();
-    for (size_t i = 0; i < count; i++)
-    {
-        Page* page = pt.UnmapPage((ulong)addr + i * Const::PageSize);
-        page->Put(); /* Undo MapPage's Get */
-    }
+    PageTable::GetInstance().UnmapPages((ulong)addr, count, false);
 
     Kernel::CpuTable::GetInstance().InvalidateTlbRange((ulong)addr, count);
     VaAlloc.Free((ulong)addr);
@@ -172,13 +133,7 @@ bool FixedPageAllocator::Free(void* addr)
     if (!VaAlloc.Contains((ulong)addr))
         return false;
 
-    auto& pt = PageTable::GetInstance();
-    for (size_t i = 0; i < PageCount; i++)
-    {
-        Page* page = pt.UnmapPage((ulong)addr + i * Const::PageSize);
-        pt.FreePage(page);
-        page->Put();
-    }
+    PageTable::GetInstance().UnmapPages((ulong)addr, PageCount, true);
 
     Kernel::CpuTable::GetInstance().InvalidateTlbRange((ulong)addr, PageCount);
     VaAlloc.Free((ulong)addr);
