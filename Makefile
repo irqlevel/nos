@@ -52,6 +52,9 @@ CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/lapic.cpp   \
     src/cpp/arch/x86_64/ioapic.cpp  \
     src/cpp/drivers/vga.cpp \
+    src/cpp/drivers/font8x16.cpp \
+    src/cpp/drivers/fb_console.cpp \
+    src/cpp/drivers/screen.cpp \
     src/cpp/drivers/pci.cpp \
     src/cpp/drivers/msix.cpp \
     src/cpp/drivers/virtqueue.cpp \

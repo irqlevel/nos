@@ -62,18 +62,43 @@ ap_start32_stub:
 BITS 32
 section .multiboot
 align 8
+multiboot_header:
     dd 0xe85250d6                ; magic number (multiboot 2)
     dd 0                         ; architecture 0 (protected mode i386)
-    dd 0x18			 ; header length
+    dd multiboot_header_end - multiboot_header  ; header length
     ; checksum
-    dd 0x17ADAF12
+    dd -(0xe85250d6 + 0 + (multiboot_header_end - multiboot_header))
 
-    ; insert optional multiboot tags here
+align 8
+    ; console flags tag: we can also live with EGA text (bit 1), and do
+    ; not require a console at all (bit 0 clear) -- this is what lets GRUB
+    ; keep legacy text mode on BIOS if it cannot set a graphics mode.
+    dw 4    ; type: console flags
+    dw 1    ; flags: optional
+    dd 12   ; size
+    dd 2    ; console_flags: EGA text supported
 
+align 8
+    ; framebuffer request tag: without it GRUB only ever tries EGA text,
+    ; which does not exist under UEFI -- it then reports no framebuffer at
+    ; all and everything written to 0xB8000 lands in plain RAM.
+    ; A modest fixed mode is requested on purpose: the console grid stays
+    ; readable (128x48 cells of the 8x16 font) and one scroll repaints a
+    ; bounded number of pixels over uncached framebuffer memory. GRUB falls
+    ; back to the firmware's own mode if this one is unavailable.
+    dw 5    ; type: framebuffer
+    dw 1    ; flags: optional
+    dd 20   ; size
+    dd 1024 ; width
+    dd 768  ; height
+    dd 32   ; depth
+
+align 8
     ; required end tag
     dw 0    ; type
     dw 0    ; flags
     dd 8    ; size
+multiboot_header_end:
 
 section .trampoline
 align 4

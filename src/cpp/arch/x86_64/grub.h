@@ -149,8 +149,20 @@ struct MultiBootTagFramebuffer
     u32 Height;
     u8 Bpp;
     u8 FbType;
-    u8 Reserved;
+    u16 Reserved;
+    /* Present only when FbType == Rgb (the indexed variant carries a
+       palette here instead), so a tag may legitimately be shorter. */
+    u8 RedFieldPosition;
+    u8 RedMaskSize;
+    u8 GreenFieldPosition;
+    u8 GreenMaskSize;
+    u8 BlueFieldPosition;
+    u8 BlueMaskSize;
 } __attribute__((packed));
+
+/* Bytes of MultiBootTagFramebuffer every framebuffer tag has, i.e. up to
+   and including Reserved. */
+const u32 MultiBootTagFramebufferCommonSize = 32;
 
 const u8 MultiBootFramebufferTypeIndexed = 0;
 const u8 MultiBootFramebufferTypeRgb = 1;
@@ -179,12 +191,33 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo);
    Returns nullptr and size 0 if no ACPI tag was present. */
 const void* GetAcpiRsdp(size_t& size);
 
+/* The framebuffer GRUB set up for us, saved from the framebuffer tag.
+   Color fields are only filled in for Type == Rgb. */
+struct FramebufferInfo
+{
+    u64 Addr;
+    u32 Pitch;
+    u32 Width;
+    u32 Height;
+    u8 Bpp;
+    u8 Type;
+    u8 RedPos;
+    u8 RedSize;
+    u8 GreenPos;
+    u8 GreenSize;
+    u8 BluePos;
+    u8 BlueSize;
+};
+
 /* True if GRUB provided a framebuffer tag. */
 bool HasFramebufferInfo();
 
 /* True if the framebuffer is legacy EGA text mode at 0xB8000.
    Only meaningful when HasFramebufferInfo() is true. */
 bool IsFramebufferEgaText();
+
+/* The saved framebuffer tag, or nullptr if GRUB provided none. */
+const FramebufferInfo* GetFramebufferInfo();
 
 }
 }

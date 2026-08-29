@@ -12,7 +12,7 @@
 #include <kernel/trace.h>
 #include <kernel/parameters.h>
 #include <drivers/serial.h>
-#include <drivers/vga.h>
+#include <drivers/screen.h>
 #include <drivers/acpi.h>
 
 namespace Hal
@@ -102,7 +102,7 @@ bool UseSerial()
 void ConsoleOut(const char *s)
 {
     if (UseVga())
-        Kernel::VgaTerm::GetInstance().PrintString(s);
+        Kernel::Screen::PrintString(s);
     if (UseSerial())
         Kernel::Serial::GetInstance().PrintString(s);
 }
@@ -110,7 +110,7 @@ void ConsoleOut(const char *s)
 void ConsoleOutBackspace()
 {
     if (UseVga())
-        Kernel::VgaTerm::GetInstance().Backspace();
+        Kernel::Screen::Backspace();
     if (UseSerial())
         Kernel::Serial::GetInstance().Backspace();
 }
@@ -118,7 +118,7 @@ void ConsoleOutBackspace()
 void ConsoleOutClear()
 {
     if (UseVga())
-        Kernel::VgaTerm::GetInstance().Cls();
+        Kernel::Screen::Cls();
     if (UseSerial())
     {
         /* ANSI escape: clear screen and move cursor home */
@@ -131,17 +131,17 @@ void ConsoleWrite(const char *msg)
     Kernel::Serial::GetInstance().PrintString(msg);
     Kernel::Serial::GetInstance().Flush();
 
-    if (Kernel::Parameters::GetInstance().IsTraceVga() && Kernel::VgaTerm::IsReady())
+    if (Kernel::Parameters::GetInstance().IsTraceVga() && Kernel::Screen::IsReady())
     {
-        Kernel::VgaTerm::GetInstance().PrintString(msg);
+        Kernel::Screen::PrintString(msg);
     }
 }
 
 void ConsolePanicWrite(const char *msg)
 {
     Kernel::Serial::GetInstance().PanicPrintString(msg);
-    if (Kernel::VgaTerm::IsReady())
-        Kernel::VgaTerm::GetInstance().PanicPrintString(msg);
+    if (Kernel::Screen::IsReady())
+        Kernel::Screen::PanicPrintString(msg);
 }
 
 void PowerOff()
