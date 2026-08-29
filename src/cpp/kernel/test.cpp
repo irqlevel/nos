@@ -984,6 +984,20 @@ Stdlib::Error TestPageAllocator()
 
     /* Test AllocMapPages / UnmapFreePages with 32 pages (large DMA buffer) */
     {
+        /* Pre-warm: the first mapping in this VA range may allocate
+           intermediate page table pages (L1/L2/L3) that are never
+           reclaimed on unmap.  Do a throwaway cycle so that the page
+           table structure is already in place before we snapshot.
+           Without it the check fails wherever this mapping is the first
+           to touch a fresh L1 -- which is what a UEFI boot does, the
+           framebuffer mapping having moved the VA cursor along. */
+        {
+            ulong warmPhys = 0;
+            void* warmPtr = Mm::AllocMapPages(32, &warmPhys);
+            if (warmPtr)
+                Mm::UnmapFreePages(warmPtr);
+        }
+
         ulong freePagesBefore = pt.GetFreePagesCount();
         ulong physAddr = 0;
         void* ptr = Mm::AllocMapPages(32, &physAddr);
