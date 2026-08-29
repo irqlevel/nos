@@ -243,6 +243,15 @@ RUST_LIB_x86_64 = src/rust/target/x86_64-unknown-none/release/libkernel.a
 RUST_LIB_aarch64 = src/rust/target/aarch64-unknown-none-softfloat/release/libkernel.a
 RUST_LIB = $(RUST_LIB_$(ARCH))
 
+# Cargo works out what to recompile, but make has to know when to call it at
+# all: without these prerequisites the $(RUST_LIB) rule never re-runs once the
+# archive exists, and a plain `make` after editing Rust silently links the
+# stale staticlib.  Hence `make rust && make nocheck` in scripts/smoke-test.sh.
+RUST_SRC = $(shell find src/rust -name '*.rs' -not -path 'src/rust/target/*') \
+    $(wildcard src/rust/Cargo.toml src/rust/Cargo.lock src/rust/*/Cargo.toml \
+        src/rust/drivers/*/Cargo.toml src/rust/.cargo/config.toml \
+        src/rust/rust-toolchain.toml)
+
 .PHONY: all check nocheck clean rust smoke
 
 -include $(DEPS)
@@ -282,7 +291,7 @@ $(OUT)/%.o: src/cpp/%.cpp
 rust:
 	cd src/rust && cargo build --release --target $(RUST_TARGET)
 
-src/rust/target/$(RUST_TARGET)/release/libkernel.a:
+$(RUST_LIB): $(RUST_SRC)
 	cd src/rust && cargo build --release --target $(RUST_TARGET)
 
 nos-arm64.img: $(KERNEL)
