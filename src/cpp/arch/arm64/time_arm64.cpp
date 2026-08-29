@@ -81,6 +81,16 @@ Stdlib::Time GetBootTime()
     return time;
 }
 
+ulong CycleCounterDeltaToNs(u64 delta)
+{
+    /* Hal::ReadCycleCounter is CNTVCT_EL0, the same counter GetBootTime
+       reads, so FreqHz converts it directly. */
+    if (FreqHz == 0)
+        return 0;
+
+    return CountToNs(delta);
+}
+
 void BusyWait(ulong nanoSecs)
 {
     if (FreqHz == 0)

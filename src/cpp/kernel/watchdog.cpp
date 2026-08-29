@@ -18,8 +18,12 @@ Watchdog::~Watchdog()
 
 void Watchdog::Check()
 {
-    Stdlib::Time now = GetBootTime();
-    Stdlib::Time timeout(25 * Const::NanoSecsInMs);
+    /* Same counter SpinLock::Lock stamps with. A lock taken on another CPU
+       is timed against this CPU's counter: on a machine whose cycle
+       counters do not run together that can over- or under-state the hold
+       time, which only ever costs this trace a false or missed report. */
+    u64 now = Hal::ReadCycleCounter();
+    const ulong timeoutNs = 25 * Const::NanoSecsInMs;
 
     for (size_t i = 0; i < Stdlib::ArraySize(SpinLockList); i++)
     {
@@ -36,13 +40,15 @@ void Watchdog::Check()
         {
             SpinLock* lock = CONTAINING_RECORD(entry, SpinLock, WatchdogListEntry);
             CheckCounter.Inc();
-            Stdlib::Time lockTime(lock->WatchdogLockTime.Get());
-            if (lockTime.GetValue() != 0)
+            u64 lockTime = lock->WatchdogLockTime.Get();
+            if (lockTime != 0 && now > lockTime)
             {
-                Stdlib::Time delta = now - lockTime;
-                if (delta > timeout)
+                /* 0 until the counter's rate is known -- no report then,
+                   rather than a report built on a guessed frequency. */
+                ulong deltaNs = CycleCounterDeltaToNs(now - lockTime);
+                if (deltaNs > timeoutNs)
                 {
-                    Trace(0, "Spinlock 0x%p is held too long %u", lock, delta.GetValue());
+                    Trace(0, "Spinlock 0x%p is held too long %u", lock, deltaNs);
                 }
             }
         }
