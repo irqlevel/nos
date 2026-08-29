@@ -178,6 +178,13 @@ Stdlib::Time GetBootTime()
     return Stdlib::Time((raw > back) ? (raw - back) : 0);
 }
 
+ulong CycleCounterDeltaToNs(u64 delta)
+{
+    /* Hal::ReadCycleCounter is the TSC here; TscToNs returns 0 until
+       Calibrate() has run. */
+    return Tsc::GetInstance().TscToNs(delta);
+}
+
 void BusyWait(ulong nanoSecs)
 {
     Stdlib::Time expired = GetBootTime() + Stdlib::Time(nanoSecs);
