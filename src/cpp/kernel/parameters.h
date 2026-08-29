@@ -21,6 +21,7 @@ public:
     bool IsSmpOff();
     bool IsItsEnabled();
     bool IsWxProbe();
+    bool IsUsbOff();
 
     bool IsConsoleSerial();
     bool IsConsoleVga();
@@ -60,6 +61,7 @@ private:
     bool SmpOff;
     bool ItsEnabled;
     bool WxProbe;
+    bool UsbOff;
     ConsoleMode ConMode;
     DhcpMode DhcpMd;
     u16 UdpShellPort;

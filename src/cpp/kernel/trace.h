@@ -13,6 +13,7 @@ const int ExcLL = 0;
 const int AcpiLL = 0;
 const int CmdLL = 0;
 const int KbdLL = 3;
+const int UsbLL = 3;
 const int PageAllocatorLL = 4;
 const int AllocatorLL = 4;
 const int PoolLL = 4;

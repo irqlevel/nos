@@ -18,6 +18,7 @@
 #include "watchdog.h"
 #include "parameters.h"
 #include "console.h"
+#include "input.h"
 #include "softirq.h"
 #include "irq_balance.h"
 #include "time.h"
@@ -48,6 +49,7 @@
 #include <drivers/virtio_scsi.h>
 #include <drivers/virtio_net.h>
 #include <drivers/virtio_rng.h>
+#include <drivers/usb/xhci.h>
 
 #include <block/block_device.h>
 #include <block/partition.h>
@@ -582,6 +584,18 @@ void BpStartup(void* ctx)
 
         Tcp::GetInstance().Init();
 
+        /* On a machine with no PS/2 controller the xHCI HID keyboard is the
+           only way in, so bring it up before the shell starts: enumeration
+           happens here, synchronously, while trace output still reaches the
+           console, and the polling task takes over afterwards. */
+        if (!Parameters::GetInstance().IsUsbOff())
+        {
+            Usb::Init();
+
+            if (!Usb::Start())
+                Trace(0, "Usb: failed to start the poll task");
+        }
+
         VgaTerm::GetInstance().Printf("Idle looping...\n");
 
         if (!cmd.Start())
@@ -619,6 +633,7 @@ void BpStartup(void* ctx)
                 else
                     Trace(0, "Shutdown requested");
                 udpShell.Stop();
+                Usb::Stop();
                 cmd.Stop();
                 cmd.StopDhcp();
                 break;
@@ -788,16 +803,18 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     auto& pci = Pci::GetInstance();
     pci.Scan();
 
-    auto& kbd = IO8042::GetInstance();
+    IO8042::GetInstance();
     auto& serial = Serial::GetInstance();
     auto& cmd = Cmd::GetInstance();
     auto& cpus = CpuTable::GetInstance();
     auto& params = Parameters::GetInstance();
     if (!params.IsConsoleSerial())
     {
-        if (!kbd.RegisterObserver(cmd))
+        /* One sink for every keyboard: the 8042 and the USB HID driver both
+           publish into KeyboardInput. */
+        if (!KeyboardInput::GetInstance().RegisterObserver(cmd))
         {
-            Panic("Can't register cmd in kbd");
+            Panic("Can't register cmd in keyboard input");
             break;
         }
     }

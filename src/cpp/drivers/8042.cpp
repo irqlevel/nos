@@ -20,9 +20,6 @@ IO8042::IO8042()
 
     VgaTerm::GetInstance().Printf("IO8042 status 0x%p\n", (ulong)Inb(StatusPort));
 
-    for (size_t i = 0; i < Stdlib::ArraySize(Observer); i++)
-        Observer[i] = nullptr;
-
     ReadData();
 }
 
@@ -73,35 +70,6 @@ void IO8042::Interrupt(Context* ctx)
 }
 
 
-bool IO8042::RegisterObserver(IO8042Observer& observer)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    for (size_t i = 0; i < MaxObserver; i++)
-    {
-        if (Observer[i] == nullptr)
-        {
-            Observer[i] = &observer;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-void IO8042::UnregisterObserver(IO8042Observer& observer)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    for (size_t i = 0; i < MaxObserver; i++)
-    {
-        if (Observer[i] == &observer)
-        {
-            Observer[i] = nullptr;
-        }
-    }
-}
-
 void IO8042::OnTick(TimerCallback& callback)
 {
     (void)callback;
@@ -145,11 +113,7 @@ void IO8042::OnTick(TimerCallback& callback)
 
             Trace(KbdLL, "Kbd: char %c", c);
 
-            for (size_t i = 0; i < MaxObserver; i++)
-            {
-                if (Observer[i] != nullptr)
-                    Observer[i]->OnChar(c, code);
-            }
+            KeyboardInput::GetInstance().Emit(c, code);
         }
     }
 }
