@@ -257,6 +257,13 @@ RUST_SRC = $(shell find src/rust -name '*.rs' -not -path 'src/rust/target/*') \
 
 .PHONY: all check nocheck clean rust smoke
 
+# The generated .d files are ordinary makefiles, so the first target of the
+# first one make reads becomes the default goal -- on an incremental build a
+# bare `make` built one .o instead of the kernel, while a clean tree (no .d
+# files yet) built everything. Pin the goal so it does not depend on what
+# out/ happens to contain.
+.DEFAULT_GOAL := all
+
 -include $(DEPS)
 
 ifeq ($(ARCH),x86_64)
