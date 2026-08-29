@@ -40,6 +40,10 @@ public:
 
     void Flush();
 
+    /* False when nothing decodes the UART port -- the machine has no
+       serial console and the screen is the only diagnostic channel. */
+    bool IsPresent();
+
     bool RegisterObserver(SerialObserver& observer);
     void UnregisterObserver(SerialObserver& observer);
 
@@ -57,6 +61,8 @@ private:
     Serial& operator=(Serial&& other) = delete;
 
     bool IsTransmitEmpty();
+
+    bool Present;
     int IntVector;
 
     Stdlib::RingBuffer<char, 4 * Const::PageSize> Buf;

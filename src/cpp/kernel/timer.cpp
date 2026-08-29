@@ -87,8 +87,22 @@ void TimerTable::ProcessTimers()
 
         ulong flags = Lock.LockIrqSave();
         TimerCallback* callback = timer.Callback;
-        if (callback == nullptr || now < timer.Expired)
+        if (callback == nullptr)
         {
+            Lock.UnlockIrqRestore(flags);
+            continue;
+        }
+
+        if (now < timer.Expired)
+        {
+            /* A deadline further out than one period cannot have been set
+               by this timer: the clock moved backwards underneath it (a
+               clock source switch, a migrated VM). Re-anchor it rather
+               than let the callback go quiet until the new clock catches
+               up with the old one's reading. */
+            if (timer.Expired > now + timer.Period)
+                timer.Expired = now + timer.Period;
+
             Lock.UnlockIrqRestore(flags);
             continue;
         }
