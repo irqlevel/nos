@@ -1,7 +1,8 @@
 #include "spin_lock.h"
 #include "task.h"
 
-#include <drivers/8042.h>
+#include "input.h"
+
 #include <drivers/serial.h>
 #include <lib/stdlib.h>
 #include <lib/ring_buffer.h>
@@ -11,7 +12,7 @@ namespace Kernel
 {
 
 class Cmd final
-    : public IO8042Observer
+    : public KeyboardObserver
     , public SerialObserver
 {
 public:

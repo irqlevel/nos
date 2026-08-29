@@ -30,6 +30,9 @@
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
+#ifdef __x86_64__
+#include <drivers/usb/xhci.h>
+#endif
 #include <include/const.h>
 #include <mm/page_table.h>
 #include <mm/new.h>
@@ -203,6 +206,16 @@ static void CmdPci(const char* args, Stdlib::Printer& con)
 {
     (void)args;
     Pci::GetInstance().Dump(con);
+}
+
+static void CmdUsb(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+#ifdef __x86_64__
+    Usb::Controller::Dump(con);
+#else
+    con.Printf("usb: not supported on this architecture\n");
+#endif
 }
 
 static void CmdDisks(const char* args, Stdlib::Printer& con)
@@ -1270,6 +1283,7 @@ static const CmdEntry Commands[] = {
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },
     { "irqstat",   CmdIrqstat,   "irqstat - show interrupt statistics" },
     { "pci",       CmdPci,       "pci - show pci devices" },
+    { "usb",       CmdUsb,       "usb - show usb controllers and ports" },
     { "disks",     CmdDisks,     "disks - list block devices" },
     { "partitions", CmdPartitions, "partitions <disk> - show partition table" },
     { "diskread",  CmdDiskread,  "diskread <disk> <sector> - read sector" },

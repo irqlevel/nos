@@ -48,6 +48,8 @@ CXX_SRC_x86_64 =   \
     src/cpp/drivers/pit.cpp \
     src/cpp/drivers/hpet.cpp \
     src/cpp/drivers/8042.cpp    \
+    src/cpp/drivers/usb/xhci.cpp \
+    src/cpp/drivers/usb/hid_kbd.cpp \
     src/cpp/drivers/acpi.cpp    \
     src/cpp/arch/x86_64/lapic.cpp   \
     src/cpp/arch/x86_64/ioapic.cpp  \
@@ -82,6 +84,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/idt.cpp  \
     src/cpp/kernel/cpu.cpp  \
     src/cpp/kernel/cmd.cpp  \
+    src/cpp/kernel/input.cpp \
     src/cpp/block/block_device.cpp \
     src/cpp/block/partition.cpp \
     src/cpp/net/net_device.cpp \
@@ -184,6 +187,7 @@ CXX_SRC_aarch64 = \
     src/cpp/block/partition.cpp \
     src/cpp/kernel/test.cpp \
     src/cpp/kernel/cmd.cpp \
+    src/cpp/kernel/input.cpp \
     src/cpp/kernel/entropy.cpp \
     src/cpp/net/net_device.cpp \
     src/cpp/net/net_frame.cpp \

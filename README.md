@@ -14,7 +14,7 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
 - **ACPI** — RSDP/RSDT/MADT parsing for LAPIC/IOAPIC discovery and IRQ→GSI routing
 - **Interrupts** — IDT with exception handlers, IOAPIC routing (edge + level-triggered), LAPIC IPI, PIC (remapped then disabled)
 - **arm64 port** — GICv3 interrupt controller with ITS (PCIe MSI delivered as LPIs, `its=on` by default), EL1 exception vectors, ARM generic timer (per-CPU), PL011 UART, FDT (device tree) parsing, PCIe ECAM, virtio-mmio transport, broadcast TLBI, semantic memory barriers (`dmb`) throughout; NVMe over ITS-delivered MSI works end-to-end
-- **Drivers** — serial (COM1), screen console (EGA text on BIOS, 8x16 font on the bootloader's pixel framebuffer under UEFI), PIT (10 ms tick, SeqLock-protected counters), RTC (CMOS wall clock), PS/2 keyboard (8042), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**, **virtio-scsi**, **virtio-rng** (legacy + modern virtio-pci transport), **NVMe** (Rust, MSI-X interrupt-driven)
+- **Drivers** — serial (COM1), screen console (EGA text on BIOS, 8x16 font on the bootloader's pixel framebuffer under UEFI), PIT (10 ms tick, SeqLock-protected counters), RTC (CMOS wall clock), PS/2 keyboard (8042), **USB HID keyboard over xHCI** (BIOS/UEFI handoff, root-port and hub enumeration, boot-protocol reports), PCI bus scan, LAPIC, IOAPIC, **virtio-blk**, **virtio-net**, **virtio-scsi**, **virtio-rng** (legacy + modern virtio-pci transport), **NVMe** (Rust, MSI-X interrupt-driven)
 - **Block I/O** — asynchronous, interrupt-driven block request queue with DMA slot pool, `BlockRequest` submission with `WaitGroup` completion, direct DMA from caller buffers (page-aligned), virtqueue locking (`RawSpinLock`) for safe interrupt/task concurrency, early-boot polling fallback, SoftIrq-based retry for ring-full conditions, block device abstraction, MBR partition discovery
 - **Networking** — virtio-net driver with asynchronous interrupt-driven TX/RX, software frame queues (256-entry TX/RX) in `NetDevice` base class, reference-counted `NetFrame` descriptors for zero-copy DMA, TX slot pool with bitmask allocation, SoftIrq-based TX retry and RX processing, IP routing (subnet mask + gateway from DHCP, off-subnet traffic forwarded to gateway), ARP (cache, request, reply, dump), IPv4/UDP transmit, ICMP echo (ping reply + send, per-type statistics), DHCP client with lease renewal (sets IP, subnet mask, gateway, DNS server), DNS resolver with 32-entry cache (A-record queries, name compression, DHCP-provided server), **TCP** (connection state machine, 3-way handshake, sequence/ack tracking, retransmission timers, MSS negotiation, send/receive ring buffers, graceful close with FIN exchange, RST handling, ephemeral port allocation, granular locking: `Mutex` for ports, `RawSpinLock` for pool and per-connection state, SoftIrq-driven timer processing), **HTTP client** (URL parsing, DNS resolution, TCP connection, request/response, redirect following for 301/302/303/307/308 with loop limit, `wget` shell command), UDP remote shell (execute kernel commands over the network), network device abstraction with per-protocol packet counters, `MacAddress`/`IpAddress` structs (IPv6-ready tagged union)
 - **Filesystem** — VFS layer with mount points and path resolution, ramfs (in-memory), nanofs (on-disk filesystem with 4 KB blocks, superblock with UUID, inode/data bitmaps, CRC32 checksums for superblock/inodes/data, file and recursive directory deletion, persistent across remount)
@@ -153,6 +153,7 @@ Pass via GRUB command line on x86-64 (edit `build/grub.cfg`) or QEMU `-append` o
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`)
 - `its=off` — arm64 only: disable the GICv3 ITS and degrade PCIe MSI gracefully (default `its=on`; virtio-mmio devices don't need it)
+- `usb=off` — x86-64 only: skip xHCI bring-up (no USB keyboard; the 8042 keyboard is unaffected)
 
 #### UDP remote shell
 
@@ -211,6 +212,7 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 | `mkdir <path>` | Create directory |
 | `touch <path>` | Create empty file |
 | `del <path>` | Remove file or directory |
+| `usb` | Show xHCI controllers, connected root ports and keyboard report counters |
 | `panic [type]` | Trigger kernel panic (direct, pagefault, divzero, ud) |
 | `version` | Show kernel version |
 | `poweroff` / `shutdown` | Power off (ACPI S5) |
@@ -226,6 +228,7 @@ src/cpp/
     arm64/    Linux-Image boot + PSCI SMP (boot.S), EL1 vectors, GICv3 + ITS (LPIs for PCIe MSI), generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, HAL backends
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, Rust FFI bridge, symbol table
   drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi/rng (virtio-pci on x86-64, virtio-mmio on arm64)
+    usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
   block/      Block I/O: device abstraction, async request queue, MBR partition discovery
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell
   fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
