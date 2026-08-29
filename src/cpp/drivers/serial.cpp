@@ -11,10 +11,23 @@ namespace Kernel
 {
 
 Serial::Serial()
-    : IntVector(-1)
+    : Present(false)
+    , IntVector(-1)
 {
     for (size_t i = 0; i < MaxObserver; i++)
         RxObserver[i] = nullptr;
+
+    /* Scratch-register probe before anything is configured: a 16550 holds
+       whatever is written to register 7, an undecoded port reads back 0xFF
+       (or 0x00 when something else answers). Laptops that expose no UART
+       fail this, and every serial write below is then skipped -- otherwise
+       Wait() burns its full ~1M pause budget per character on a port whose
+       transmitter never reports empty. */
+    Outb(Port + 7, 0xAE);
+    Present = (Inb(Port + 7) == 0xAE);
+
+    if (!Present)
+        return;
 
     Outb(Port + 1, 0x00);    // Disable all interrupts
     Outb(Port + 3, 0x80);    // Enable DLAB (set baud rate divisor)
@@ -25,9 +38,17 @@ Serial::Serial()
     Outb(Port + 4, 0x0B);    // IRQs enabled, RTS/DSR set
 }
 
+bool Serial::IsPresent()
+{
+    return Present;
+}
+
 void Serial::Send()
 {
     ulong flags;
+
+    if (!Present)
+        return;
 
     for (;;)
     {
@@ -85,6 +106,9 @@ Serial::~Serial()
 
 void Serial::PrintString(const char *str)
 {
+    if (!Present)
+        return;
+
     Send();
 
     ulong flags;
@@ -127,6 +151,9 @@ void Serial::PanicPrintString(const char *str)
      * Bypass lock and ring buffer — poll-write directly to UART.
      * Safe only in panic context with interrupts disabled.
      */
+    if (!Present)
+        return;
+
     while (*str)
     {
         char c = *str++;

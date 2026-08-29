@@ -187,7 +187,13 @@ void ConsoleWrite(const char *msg)
     Kernel::Serial::GetInstance().PrintString(msg);
     Kernel::Serial::GetInstance().Flush();
 
-    if (Kernel::Parameters::GetInstance().IsTraceVga() && Kernel::Screen::IsReady())
+    /* The boot trace goes out the serial port and is mirrored on the screen
+       only on request -- redrawing glyphs for every line costs a full
+       repaint per scrolled row. A machine with no UART has nowhere else to
+       put it, so there the mirror is the default rather than the option. */
+    if ((Kernel::Parameters::GetInstance().IsTraceVga() ||
+         !Kernel::Serial::GetInstance().IsPresent()) &&
+        Kernel::Screen::IsReady())
     {
         Kernel::Screen::PrintString(msg);
     }
