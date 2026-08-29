@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build, run, test
 
-The kernel needs an x86-64 cross toolchain (clang, nasm, ld, grub-mkrescue, cppcheck, rustup with the `x86_64-unknown-none` target). On macOS / Apple Silicon you almost always build inside Docker, which packages the whole toolchain:
+The kernel needs an x86-64 cross toolchain (clang, nasm, ld, grub-mkrescue + `xorriso`/`mtools`, cppcheck, and a **nightly** rustup toolchain with the `rust-src` component — pinned by `src/rust/rust-toolchain.toml`; the Rust staticlib needs nightly for `-Z build-std` and `#![feature(alloc_error_handler)]`). On macOS / Apple Silicon you almost always build inside Docker, which packages the whole toolchain:
 
 ```sh
 ./scripts/build-iso-docker.sh   # produces nos.iso + bin/kernel64.elf (GDB symbols)

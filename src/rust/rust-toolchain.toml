@@ -1,0 +1,9 @@
+# The kernel staticlib needs nightly: `#![feature(alloc_error_handler)]` in
+# kernel/src/lib.rs and `-Z build-std` (see .cargo/config.toml), which rebuilds
+# core/alloc with -Ccode-model=large so they can be linked at 0xFFFF800001000000.
+# Pinned here so the build does not depend on the machine's default toolchain
+# (matches the Dockerfile: rustup ... --default-toolchain nightly --component rust-src).
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+profile = "minimal"
