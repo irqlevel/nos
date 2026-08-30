@@ -12,6 +12,13 @@ global ApStart16
 %define MAX_CPUS 64
 %define CPU_STACK_SIZE 4096
 
+; Control-register bits touched by enable_paging (SDM Vol. 3, 2.5)
+%define CR0_PG (1 << 31)
+%define CR0_CD (1 << 30)
+%define CR0_NW (1 << 29)
+%define CR4_MCE (1 << 6)
+%define CR4_PAE (1 << 5)
+
 section .trampolinedata nobits
 align 4096
 p4_table:
@@ -295,9 +302,13 @@ enable_paging:
     mov eax, p4_table
     mov cr3, eax
 
-    ; enable PAE-flag in cr4 (Physical Address Extension)
+    ; PAE (bit 5), and MCE (bit 6) so a machine check raises #MC instead of
+    ; putting the processor into shutdown -- which the platform turns into a
+    ; reset, indistinguishable from a spontaneous reboot. INIT clears cr4, so
+    ; an AP arrives here with neither bit set while the firmware left both on
+    ; for the BSP.
     mov eax, cr4
-    or eax, 1 << 5
+    or eax, CR4_PAE | CR4_MCE
     mov cr4, eax
 
     ; set the long mode bit in the EFER MSR (model specific register)
@@ -306,9 +317,17 @@ enable_paging:
     or eax, 1 << 8
     wrmsr
 
-    ; enable paging in the cr0 register
+    ; Enable paging, and clear CD/NW in the same write. A processor comes out
+    ; of RESET *and out of INIT* with CD=NW=1 (SDM Vol. 3, "Processor State
+    ; After Reset or INIT"): caches disabled, no-fill mode. Firmware clears
+    ; them for the BSP long before GRUB runs, so only the APs arrive here that
+    ; way -- and only on real hardware, because KVM and TCG both ignore CD.
+    ; Left set, every AP runs uncached, and the SDM requires the two logical
+    ; processors of one core to hold identical CD/NW, so the BSP's hyperthread
+    ; sibling coming up with caches off is undefined behaviour outright.
     mov eax, cr0
-    or eax, 1 << 31
+    and eax, ~(CR0_CD | CR0_NW) & 0xFFFFFFFF
+    or eax, CR0_PG
     mov cr0, eax
 
     ret
