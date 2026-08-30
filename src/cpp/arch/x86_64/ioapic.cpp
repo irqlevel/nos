@@ -69,9 +69,25 @@ void IoApic::SetEntry(u8 index, u64 data)
     WriteRegister(RedTbl + 2 * index, (u32)data);
 }
 
+u64 IoApic::CheckDest(u8 irq, u64 apicId)
+{
+    if (CanTarget(apicId))
+        return apicId;
+
+    /* Never silently alias onto whatever apic id the low four bits happen to
+       name -- that is how an interrupt goes missing for good. Fall back to
+       the boot CPU, which is always addressable, and say so. */
+    Trace(0, "IoApic: irq 0x%p apicId %u exceeds physical destination range %u, using 0",
+        (ulong)irq, (ulong)apicId, (ulong)MaxPhysicalDest);
+
+    return 0;
+}
+
 void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)
 {
     u64 data = 0;
+
+    apicId = CheckDest(irq, apicId);
 
     data |= vector; // interrupt vector
     data |= DmFixed << DelivModeShift; // delivery mode: fixed
@@ -90,6 +106,8 @@ void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)
 
 void IoApic::SetIrqDestination(u8 irq, u64 apicId)
 {
+    apicId = CheckDest(irq, apicId);
+
     /* The destination id occupies bits 56-63 of the redirection entry,
        i.e. bits 24-31 of the high register. A single 32-bit write
        switches the destination without touching mask/trigger/vector. */
@@ -104,6 +122,8 @@ void IoApic::SetIrqDestination(u8 irq, u64 apicId)
 void IoApic::SetIrqLevel(u8 irq, u64 apicId, u8 vector, bool activeHigh)
 {
     u64 data = 0;
+
+    apicId = CheckDest(irq, apicId);
 
     data |= vector; // interrupt vector
     data |= DmFixed << DelivModeShift; // delivery mode: fixed

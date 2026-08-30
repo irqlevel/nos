@@ -14,6 +14,13 @@ class MsixTable;
  * across running CPUs once SMP bringup completes (Balance()).
  * Devices which register after Balance() get the next CPU immediately.
  * System IRQs (PIT/HPET/8042/serial) are not recorded and stay on the BSP.
+ *
+ * The two kinds do not share a cursor, because they cannot address the same
+ * set of CPUs: an MSI-X entry carries a full 8-bit destination, while an
+ * IOAPIC redirection entry in physical mode has four bits and reaches apic
+ * ids 0..15 only (IoApic::CanTarget). Handing an IOAPIC line a higher id
+ * does not spread it, it aliases it -- onto another CPU, or on a hybrid part
+ * onto an id no CPU has, which loses the interrupt for good.
  */
 class IrqBalance
 {
@@ -59,14 +66,15 @@ private:
     };
 
     ulong Assign(Entry entry);
-    ulong NextCpuLockHeld();
+    ulong NextCpuLockHeld(bool ioApic);
     void ApplyLockHeld(Entry& entry);
 
     static const ulong MaxEntries = 64;
 
     Entry Entries[MaxEntries];
     ulong EntryCount;
-    ulong NextCpu;
+    ulong NextCpu;       /* round-robin cursor for MSI-X vectors */
+    ulong NextIoApicCpu; /* and for IOAPIC lines, over a smaller CPU set */
     bool Balanced;
     SpinLock Lock;
 };
