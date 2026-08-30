@@ -35,7 +35,9 @@ public:
 
     static const ulong MaxMemRegions = 8;
     static const ulong MaxVirtioMmio = 32;
-    static const ulong MaxBoardCpus = 8;
+    /* CPUs taken from the device tree. Kept at Kernel::MaxCpus so the FDT
+       parser is not the thing that silently caps SMP. */
+    static const ulong MaxBoardCpus = 64;
 
     ulong MemRegionCount = 0;
     Region MemRegions[MaxMemRegions];
