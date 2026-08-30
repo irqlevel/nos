@@ -3,6 +3,7 @@
 #include "parameters.h"
 
 #include <hal/console.h>
+#include <net/netconsole.h>
 
 namespace Kernel
 {
@@ -50,6 +51,10 @@ void Tracer::Output(const char *fmt, ...)
         return;
 
     Dmesg::GetInstance().PrintString(msg);
+
+    /* Capture is a memcpy into a ring buffer -- the send happens later, on the
+       netconsole task, so this stays safe in IRQ context. */
+    Netconsole::GetInstance().Log(msg);
 
     if (!ConsoleSuppressed)
     {

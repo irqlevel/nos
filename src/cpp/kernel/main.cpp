@@ -54,6 +54,7 @@
 #include <block/block_device.h>
 #include <block/partition.h>
 #include <net/udp_shell.h>
+#include <net/netconsole.h>
 #include <net/tcp.h>
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
@@ -607,6 +608,16 @@ void BpStartup(void* ctx)
             return;
         }
 
+        auto& netconsole = Netconsole::GetInstance();
+        if (netconsole.IsEnabled())
+        {
+            NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
+            if (netDev == nullptr)
+                Trace(0, "Netconsole: eth0 not found");
+            else if (!netconsole.Start(netDev))
+                Trace(0, "Netconsole: failed to start");
+        }
+
         UdpShell udpShell;
         u16 udpShellPort = Parameters::GetInstance().GetUdpShellPort();
         if (udpShellPort != 0)
@@ -636,6 +647,7 @@ void BpStartup(void* ctx)
                 else
                     Trace(0, "Shutdown requested");
                 udpShell.Stop();
+                netconsole.Stop();
                 Usb::Stop();
                 cmd.Stop();
                 cmd.StopDhcp();
@@ -696,6 +708,10 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     //Screen::Printf("Hello!\n");
 
     Grub::ParseMultiBootInfo((Grub::MultiBootInfoHeader *)bpt.PhysToVirt((ulong)MbInfo));
+
+    /* Arm log capture as soon as the command line is known: the ring buffers
+       everything until the network can carry it away. */
+    Netconsole::GetInstance().Setup();
 
     auto& mmap = Mm::MemoryMap::GetInstance();
     Trace(0, "Enter kernel: start 0x%p end 0x%p",

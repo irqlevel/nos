@@ -85,7 +85,10 @@ Set via GRUB (`build/grub.cfg`) on x86-64, or QEMU `-append` on arm64. Useful
 when bisecting a boot failure: `smp=off` (BSP only), `console=serial` /
 `console=vga`, `dhcp=auto|on|off`, `dns=on`, `udpshell=PORT`, `usb=off`
 (x86-64: skip xHCI bring-up), `its=off` (arm64). Parsing lives in
-`kernel/parameters.cpp`.
+`kernel/parameters.cpp`. `netconsole=ip:port` streams the whole kernel log to
+that UDP collector as each line is produced (buffered until the network is up,
+panic report included) -- receive it with `scripts/netconsole.py`; on a machine
+with no serial port this is the only way to see the log of a boot that dies.
 
 ### Tests run at boot, not via a test runner
 
@@ -108,7 +111,7 @@ Source layout (detailed in `README.md` "Project layout"):
 - `src/cpp/mm/` — 4-level page tables (`VirtToPhys` walk, `ProtectRange`), page allocator (fixed-size block allocator), pool allocator, VA allocator, `new`/`delete`
 - `src/cpp/drivers/` — serial, console (`screen.cpp` picks EGA text on BIOS vs. the 8x16-font pixel framebuffer under UEFI), PIT/HPET/RTC, 8042 keyboard, `usb/` (xHCI host controller + HID boot keyboard, for UEFI laptops with no PS/2), PCI, MSI-X, ACPI, virtio (blk/net/scsi/rng) behind the `VirtioTransport` interface (legacy+modern virtio-pci on x86, virtio-mmio on arm64)
 - `src/cpp/block/` — async interrupt-driven block request queue, MBR partitions
-- `src/cpp/net/` — device abstraction, ARP/ICMP/DHCP/DNS/TCP/UDP, HTTP client, UDP shell
+- `src/cpp/net/` — device abstraction, ARP/ICMP/DHCP/DNS/TCP/UDP, HTTP client, UDP shell, netconsole (kernel log over UDP)
 - `src/cpp/fs/` — VFS with mount points, ramfs, nanofs (on-disk), ext2 (ro), procfs
 - `src/cpp/lib/` — freestanding stdlib equivalents (`Stdlib::`), containers (list/vector/btree/ringbuffer/bitmap), CRC32, formatting; some routines (`MemSet`/`MemCpy`/`StrLen`…) are in `arch/x86_64/stdlib_asm.asm` (portable C in `arch/arm64/stdlib_c.cpp`)
 

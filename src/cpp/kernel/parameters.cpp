@@ -15,6 +15,7 @@ Parameters::Parameters()
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
+    , NetconsolePort(0)
     , DnsEnabled(false)
     , RootAuto(false)
 {
@@ -84,6 +85,21 @@ u16 Parameters::GetUdpShellPort()
     return UdpShellPort;
 }
 
+bool Parameters::IsNetconsoleEnabled()
+{
+    return NetconsolePort != 0;
+}
+
+Net::IpAddress Parameters::GetNetconsoleIp()
+{
+    return NetconsoleIp;
+}
+
+u16 Parameters::GetNetconsolePort()
+{
+    return NetconsolePort;
+}
+
 bool Parameters::IsDnsEnabled()
 {
     return DnsEnabled;
@@ -104,7 +120,8 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     if (BugOn(start >= end))
         return false;
 
-    const size_t maxLen = 20;
+    /* Long enough for the widest value we take: netconsole=255.255.255.255:65535 */
+    const size_t maxLen = 48;
     char param[maxLen + 1];
     size_t len = end - start;
     if (len > maxLen)
@@ -222,6 +239,44 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         else
         {
             Trace(0, "Invalid udpshell port %s", value);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "netconsole") == 0)
+    {
+        /* netconsole=ip:port */
+        const char* colon = Stdlib::StrChrOnce(value, ':');
+        if (colon == nullptr || colon == value || *(colon + 1) == '\0')
+        {
+            Trace(0, "Invalid netconsole value %s, expected ip:port", value);
+        }
+        else
+        {
+            char ipBuf[16];
+            size_t ipLen = colon - value;
+            ulong port = 0;
+
+            Net::IpAddress ip;
+            if (ipLen >= sizeof(ipBuf))
+            {
+                Trace(0, "Invalid netconsole ip in %s", value);
+            }
+            else
+            {
+                Stdlib::StrnCpy(ipBuf, value, ipLen + 1);
+                if (!Net::IpAddress::Parse(ipBuf, ip))
+                {
+                    Trace(0, "Invalid netconsole ip %s", ipBuf);
+                }
+                else if (!Stdlib::ParseUlong(colon + 1, port) || port == 0 || port > 65535)
+                {
+                    Trace(0, "Invalid netconsole port %s", colon + 1);
+                }
+                else
+                {
+                    NetconsoleIp = ip;
+                    NetconsolePort = (u16)port;
+                }
+            }
         }
     }
     else if (Stdlib::StrCmp(key, "root") == 0)

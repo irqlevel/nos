@@ -214,6 +214,7 @@ Pass via GRUB command line on x86-64 (edit `build/grub.cfg`) or QEMU `-append` o
 - `dhcp=on` — enable DHCP only via shell command (default)
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`)
+- `netconsole=ip:port` — stream the kernel log over UDP to that collector (e.g. `netconsole=10.0.2.2:6666`); needs an address, so pair it with `dhcp=auto`
 - `its=off` — arm64 only: disable the GICv3 ITS and degrade PCIe MSI gracefully (default `its=on`; virtio-mmio devices don't need it)
 - `usb=off` — x86-64 only: skip xHCI bring-up (no USB keyboard; the 8042 keyboard is unaffected)
 
@@ -232,6 +233,44 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 - On protocol errors or timeouts, the client reconnects automatically and resets state.
 - All shell commands work over the UDP session (including blocking ones like `ping`).
 - **Warning:** the UDP shell has no authentication — anyone who can reach the port has full kernel shell access. Use only for testing or behind a firewall.
+
+#### Netconsole
+
+With `netconsole=ip:port` the kernel ships its whole log to a UDP collector as
+each line is produced -- the debugging channel of choice on a machine with no
+serial port (a laptop over Wi-Fi, a cloud VM).
+
+Every line the tracer emits is copied into a 128 KiB ring buffer the moment it
+is produced, from any context including IRQ; a dedicated `netcon` task drains
+the ring and sends whole lines in ~1400-byte datagrams. Nothing is lost while
+the network is still coming up: the ring is primed from `dmesg` at boot and
+keeps buffering until the device has an IP, then the entire backlog goes out
+and live lines follow within a couple of milliseconds. When the ring fills, the
+oldest lines are evicted and counted (`netconsole` shell command). Panics are
+included -- the panic report is captured and flushed synchronously, best-effort
+and only if the collector MAC is already in the ARP cache, since a blocking ARP
+resolve could never complete with the other CPUs halted.
+
+Receive with the included collector:
+
+```sh
+python3 scripts/netconsole.py                    # listen on 0.0.0.0:6666
+python3 scripts/netconsole.py -p 5555 -o boot.log
+```
+
+It reassembles lines per sender, prefixes each with the host receive time, and
+optionally appends to a file. Under QEMU user networking the host is `10.0.2.2`,
+so `netconsole=10.0.2.2:6666 dhcp=auto` plus a collector on the host works with
+no port forwarding (outbound UDP needs none).
+
+The stream carries the kernel log (everything `Trace()` writes, which is what
+`dmesg` holds), not the interactive shell's own console echo. Lines the
+netconsole task itself produces are deliberately not captured -- feeding the TX
+path's own traces back into the ring would make the drain loop generate its own
+work forever. They still reach `dmesg` and the console.
+
+**Warning:** the log is sent in the clear and to whoever holds the address; use
+it on a network you trust.
 
 #### Shell commands
 
@@ -254,6 +293,7 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 | `help` | List commands |
 | `net` | List network devices and per-protocol stats |
 | `arp` | Show ARP table |
+| `netconsole` | Show netconsole target, buffered bytes, drop/send counters |
 | `icmpstat` | Show ICMP statistics |
 | `tcpstat` | Show TCP connections and statistics |
 | `wget <url>` | Fetch a URL via HTTP GET (follows redirects) |
@@ -292,7 +332,7 @@ src/cpp/
   drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi/rng (virtio-pci on x86-64, virtio-mmio on arm64)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
   block/      Block I/O: device abstraction, async request queue, MBR partition discovery
-  net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell
+  net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell, netconsole
   fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
   lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, stdlib
