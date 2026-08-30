@@ -8,9 +8,17 @@
 namespace Kernel
 {
 
+/* Running-CPU bits an IOAPIC redirection entry can name, for the diagnostic
+   below: everything from apic id 0 up to IoApic::MaxPhysicalDest. */
+static const ulong IoApicTargetMask =
+    (IoApic::MaxPhysicalDest >= MaxCpus - 1)
+        ? ~0UL
+        : ((1UL << (IoApic::MaxPhysicalDest + 1)) - 1);
+
 IrqBalance::IrqBalance()
     : EntryCount(0)
     , NextCpu(0)
+    , NextIoApicCpu(0)
     , Balanced(false)
 {
     Stdlib::MemSet(Entries, 0, sizeof(Entries));
@@ -20,24 +28,40 @@ IrqBalance::~IrqBalance()
 {
 }
 
-ulong IrqBalance::NextCpuLockHeld()
+ulong IrqBalance::NextCpuLockHeld(bool ioApic)
 {
-    ulong cpuMask = CpuTable::GetInstance().GetRunningCpus();
+    auto& cpus = CpuTable::GetInstance();
+
+    /* An IOAPIC line that cannot be delivered is worse than one that is not
+       balanced, so its fallback is the BSP rather than whichever CPU happens
+       to be running this. */
+    ulong fallback = ioApic ? cpus.GetBspIndex() : cpus.GetCurrentCpuId();
+
+    ulong cpuMask = cpus.GetRunningCpus();
     if (cpuMask == 0)
-        return CpuTable::GetInstance().GetCurrentCpuId();
+        return fallback;
+
+    ulong& cursor = ioApic ? NextIoApicCpu : NextCpu;
 
     /* Cycle through running CPUs starting after the last assigned one */
     for (ulong i = 1; i <= MaxCpus; i++)
     {
-        ulong cpu = (NextCpu + i) % MaxCpus;
-        if (cpuMask & (1UL << cpu))
-        {
-            NextCpu = cpu;
-            return cpu;
-        }
+        ulong cpu = (cursor + i) % MaxCpus;
+
+        if (!(cpuMask & (1UL << cpu)))
+            continue;
+
+        /* On x86 the CPU index is the apic id, and an IOAPIC entry in
+           physical mode can only name the low ones -- see IoApic::CanTarget.
+           MSI-X has the full 8-bit field and takes any of them. */
+        if (ioApic && !IoApic::CanTarget(cpu))
+            continue;
+
+        cursor = cpu;
+        return cpu;
     }
 
-    return CpuTable::GetInstance().GetCurrentCpuId();
+    return fallback;
 }
 
 void IrqBalance::ApplyLockHeld(Entry& entry)
@@ -62,7 +86,8 @@ ulong IrqBalance::Assign(Entry entry)
     /* Before Balance() all IRQs stay on the registering CPU (the BSP)
        and get spread once SMP bringup completes; afterwards new IRQs
        join the round-robin immediately. */
-    entry.Cpu = Balanced ? NextCpuLockHeld() : CpuTable::GetInstance().GetCurrentCpuId();
+    entry.Cpu = Balanced ? NextCpuLockHeld(entry.Kind == KindIoApic)
+                         : CpuTable::GetInstance().GetCurrentCpuId();
 
     if (EntryCount < MaxEntries)
         Entries[EntryCount++] = entry;
@@ -122,15 +147,19 @@ void IrqBalance::Balance()
     /* Start the round-robin after the BSP so device IRQs prefer
        the other CPUs (the BSP keeps the system IRQs) */
     NextCpu = CpuTable::GetInstance().GetBspIndex();
+    NextIoApicCpu = NextCpu;
 
     for (ulong i = 0; i < EntryCount; i++)
     {
-        Entries[i].Cpu = NextCpuLockHeld();
+        Entries[i].Cpu = NextCpuLockHeld(Entries[i].Kind == KindIoApic);
         ApplyLockHeld(Entries[i]);
     }
 
-    Trace(0, "IrqBalance: %u irqs balanced over cpu mask 0x%p",
-        EntryCount, CpuTable::GetInstance().GetRunningCpus());
+    ulong cpuMask = CpuTable::GetInstance().GetRunningCpus();
+    ulong ioApicMask = cpuMask & IoApicTargetMask;
+
+    Trace(0, "IrqBalance: %u irqs balanced over cpu mask 0x%p, ioapic-reachable 0x%p",
+        EntryCount, cpuMask, ioApicMask);
 }
 
 }
