@@ -82,8 +82,9 @@ gdb -ex "symbol-file bin/kernel64.elf" -ex "set architecture i386:x86-64" -ex "t
 ### Kernel command line
 
 Set via GRUB (`build/grub.cfg`) on x86-64, or QEMU `-append` on arm64. Useful
-when bisecting a boot failure: `smp=off` (BSP only), `console=serial` /
-`console=vga`, `dhcp=auto|on|off`, `dns=on`, `udpshell=PORT`, `usb=off`
+when bisecting a boot failure: `smp=off` (BSP only), `maxcpus=N` (start at most
+N CPUs, the BSP included), `console=serial` / `console=vga`,
+`dhcp=auto|on|off`, `dns=on`, `udpshell=PORT`, `usb=off`
 (x86-64: skip xHCI bring-up), `its=off` (arm64). Parsing lives in
 `kernel/parameters.cpp`. `netconsole=ip:port` streams the whole kernel log to
 that UDP collector as each line is produced (buffered until the network is up,

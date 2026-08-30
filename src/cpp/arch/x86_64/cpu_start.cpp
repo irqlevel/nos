@@ -1,4 +1,5 @@
 #include <kernel/cpu.h>
+#include <kernel/parameters.h>
 #include <kernel/time.h>
 #include <kernel/trace.h>
 #include <arch/x86_64/lapic.h>
@@ -13,6 +14,54 @@ namespace Kernel
    Defined in an arch TU so another architecture can supply its own
    CpuTable::StartAll (e.g. PSCI CPU_ON) with full private access. */
 
+namespace
+{
+
+/* Bring one AP up and wait for it to report in.
+
+   One CPU at a time, rather than INIT-ing all of them and then waiting for
+   the crowd: the trace line below names the CPU that is being poked, so a
+   machine that dies during bring-up says which one it choked on, and the APs
+   no longer race each other through the dmesg lock, the heap and the shared
+   GDT on their way up. The cost is the 10ms INIT delay per CPU -- the polling
+   ends as soon as that one AP reports running. */
+bool StartCpu(Cpu& cpu, ulong index, ulong startupVector)
+{
+    static const ulong InitDelayMs = 10;   /* 10ms after INIT */
+    static const ulong SipiRetries = 2;    /* the first SIPI can be lost */
+    static const ulong SipiDelayUs = 200;  /* Intel MP spec: 200us apart */
+    static const ulong ApTimeoutMs = 1000;
+    static const ulong ApPollIntervalMs = 1;
+
+    Trace(0, "Cpu %u: INIT+SIPI vector 0x%p", index, startupVector);
+
+    Lapic::SendInit(index);
+    BusyWait(InitDelayMs * Const::NanoSecsInMs);
+
+    for (ulong sipi = 0; sipi < SipiRetries; sipi++)
+    {
+        if (cpu.GetState() & Cpu::StateRunning)
+            return true;
+
+        Lapic::SendStartup(index, startupVector);
+        BusyWait(SipiDelayUs * Const::NanoSecsInUsec);
+    }
+
+    for (ulong waited = 0; waited < ApTimeoutMs; waited += ApPollIntervalMs)
+    {
+        if (cpu.GetState() & Cpu::StateRunning)
+            return true;
+
+        BusyWait(ApPollIntervalMs * Const::NanoSecsInMs);
+    }
+
+    Trace(0, "Cpu %u still not running after %u ms", index, ApTimeoutMs);
+
+    return false;
+}
+
+}
+
 bool CpuTable::StartAll()
 {
     ulong startupCode = (ulong)ApStart16;
@@ -25,106 +74,30 @@ bool CpuTable::StartAll()
     if (startupCode >= 0x100000)
         return false;
 
+    const ulong bspIndex = GetBspIndex();
+    const ulong maxCpus = Parameters::GetInstance().GetMaxCpus();
+    ulong running = 1; /* the BSP */
+
+    for (ulong index = 0; index < MaxCpus; index++)
     {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
+        auto& cpu = GetCpu(index);
+
+        if (index == bspIndex || !(cpu.GetState() & Cpu::StateInited))
+            continue;
+
+        if (maxCpus != 0 && running >= maxCpus)
         {
-            if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
-            {
-                Lapic::SendInit(index);
-            }
-        }
-    }
-
-    BusyWait(10 * Const::NanoSecsInMs); /* 10ms after INIT */
-
-    /*
-     * Intel MP spec: send two SIPIs, 200µs apart.
-     * The first SIPI can be lost on some hardware/hypervisors.
-     */
-    static const ulong SipiRetries = 2;
-    static const ulong SipiDelayUs = 200;
-
-    for (ulong sipi = 0; sipi < SipiRetries; sipi++)
-    {
-        {
-            Stdlib::AutoLock lock(Lock);
-            for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-            {
-                if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
-                {
-                    if (!(CpuArray[index].GetState() & Cpu::StateRunning))
-                        Lapic::SendStartup(index, startupCode >> Const::PageShift);
-                }
-            }
+            Trace(0, "Cpu %u left parked, maxcpus is %u", index, maxCpus);
+            continue;
         }
 
-        BusyWait(SipiDelayUs * Const::NanoSecsInUsec); /* 200µs */
+        if (!StartCpu(cpu, index, startupCode >> Const::PageShift))
+            return false;
+
+        running++;
     }
 
-    /* Poll for the APs to finish startup.  The budget has to scale with the
-       number of them: every AP serialises against the others on the dmesg
-       lock and the heap while it brings itself up, so the wall time grows
-       with the CPU count rather than staying constant.  Measured with the
-       kernel booted under QEMU/KVM: 19 APs are all running 162ms after the
-       SIPI, 63 APs (on a host with fewer cores than that) take 5.4s.  The
-       loop exits as soon as the last AP reports in, so a generous ceiling
-       only costs time on a machine where an AP is genuinely dead. */
-    static const ulong ApTimeoutBaseMs = 500;
-    static const ulong ApTimeoutPerCpuMs = 250;
-    static const ulong ApPollIntervalMs = 10;
-
-    ulong apCount = 0;
-    {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-        {
-            if (index != GetBspIndexLockHeld() &&
-                (CpuArray[index].GetState() & Cpu::StateInited))
-                apCount++;
-        }
-    }
-    const ulong ApTimeoutMs = ApTimeoutBaseMs + ApTimeoutPerCpuMs * apCount;
-
-    for (ulong waited = 0; waited < ApTimeoutMs; waited += ApPollIntervalMs)
-    {
-        BusyWait(ApPollIntervalMs * Const::NanoSecsInMs);
-
-        bool allRunning = true;
-        {
-            Stdlib::AutoLock lock(Lock);
-            for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-            {
-                if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
-                {
-                    if (!(CpuArray[index].GetState() & Cpu::StateRunning))
-                    {
-                        allRunning = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if (allRunning)
-            break;
-    }
-
-    {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-        {
-            if (index != GetBspIndexLockHeld() && (CpuArray[index].GetState() & Cpu::StateInited))
-            {
-                if (!(CpuArray[index].GetState() & Cpu::StateRunning))
-                {
-                    Trace(0, "Cpu %u still not running after %u ms", index, ApTimeoutMs);
-                    return false;
-                }
-            }
-        }
-    }
-
-    Trace(0, "Cpus started");
+    Trace(0, "Cpus started, %u running", running);
 
     return true;
 }
