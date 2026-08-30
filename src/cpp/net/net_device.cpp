@@ -35,6 +35,72 @@ bool NetDevice::SubmitTx(NetFrame* frame)
     return true;
 }
 
+bool NetDevice::SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
+                        const void* data, ulong len)
+{
+    /* Resolve the destination MAC via ARP. For an off-subnet destination
+       RouteIp() hands back the gateway, so that is what gets resolved. */
+    Net::IpAddress arpTarget = RouteIp(dstIp);
+    Net::MacAddress dstMac;
+    if (!ArpTable::GetInstance().Resolve(this, arpTarget, dstMac))
+    {
+        Trace(0, "NetDevice %s: ARP failed for 0x%p", GetName(), (ulong)dstIp.Addr4);
+        /* Fall back to broadcast */
+        dstMac = Net::MacAddress::Broadcast();
+    }
+
+    ulong udpLen = sizeof(Net::UdpHdr) + len;
+    ulong ipLen = sizeof(Net::IpHdr) + udpLen;
+    ulong frameLen = sizeof(Net::EthHdr) + ipLen;
+
+    if (frameLen > 1514) /* Ethernet MTU */
+        return false;
+
+    u8 frame[1514];
+    Stdlib::MemSet(frame, 0, sizeof(frame));
+
+    ulong off = 0;
+
+    /* Ethernet header */
+    Net::EthHdr* eth = (Net::EthHdr*)(frame + off);
+    dstMac.CopyTo(eth->DstMac);
+    GetMac().CopyTo(eth->SrcMac);
+    eth->EtherType = Net::Htons(0x0800);
+    off += sizeof(Net::EthHdr);
+
+    /* IP header */
+    Net::IpHdr* ip = (Net::IpHdr*)(frame + off);
+    ip->VersionIhl = 0x45; /* IPv4, IHL=5 */
+    ip->Tos = 0;
+    ip->TotalLen = Net::Htons((u16)ipLen);
+    ip->Id = 0;
+    ip->FragOff = 0;
+    ip->Ttl = 64;
+    ip->Protocol = Net::IpProtoUdp;
+    ip->Checksum = 0;
+    ip->SrcAddr = srcIp.ToNetwork();
+    ip->DstAddr = dstIp.ToNetwork();
+    ip->Checksum = Net::Htons(Net::IpChecksum(ip, sizeof(Net::IpHdr)));
+    off += sizeof(Net::IpHdr);
+
+    /* UDP header */
+    Net::UdpHdr* udp = (Net::UdpHdr*)(frame + off);
+    udp->SrcPort = Net::Htons(srcPort);
+    udp->DstPort = Net::Htons(dstPort);
+    udp->Length = Net::Htons((u16)udpLen);
+    udp->Checksum = 0; /* Valid per RFC 768 */
+    off += sizeof(Net::UdpHdr);
+
+    /* Payload */
+    if (len > 0)
+    {
+        Stdlib::MemCpy(frame + off, data, len);
+        off += len;
+    }
+
+    return SendRaw(frame, off);
+}
+
 bool NetDevice::SendRaw(const void* buf, ulong len)
 {
     if (len == 0)
