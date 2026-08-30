@@ -28,11 +28,19 @@ dependencies = [
  "hello",
  "kcore",
  "nvme",
+ "r8125",
  "r8168",
 ]
 
 [[package]]
 name = "nvme"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+]
+
+[[package]]
+name = "r8125"
 version = "0.1.0"
 dependencies = [
  "kcore",
