@@ -65,13 +65,13 @@ public:
     bool RegisterUdpListener(u16 port, RxCallback cb, void* ctx);
     void UnregisterUdpListener(u16 port);
 
-    /* Higher-level UDP send (implemented by drivers that support it) */
+    /* Higher-level UDP send: builds the Ethernet/IP/UDP headers, resolves the
+       destination MAC through ARP and hands the frame to SendRaw. Generic
+       protocol code, so it lives here rather than in any one driver -- a
+       driver that returned false from this is a driver whose UDP replies
+       (the UDP shell, DNS) silently never leave the box. */
     virtual bool SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
-                         const void* data, ulong len)
-    {
-        (void)dstIp; (void)dstPort; (void)srcIp; (void)srcPort; (void)data; (void)len;
-        return false;
-    }
+                         const void* data, ulong len);
 
     static const ulong MaxUdpListeners = 4;
 

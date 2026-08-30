@@ -108,7 +108,21 @@ bool UdpShell::Start(NetDevice* dev, u16 port)
         return false;
     }
 
-    Dev->RegisterUdpListener(Port, RxCallbackFn, this);
+    /* MaxUdpListeners is small and DHCP and DNS have already taken slots by
+       now, so a full table is a real outcome -- and one that used to be
+       invisible: the task was running and the trace said "started", while
+       nothing was ever dispatched to it. */
+    if (!Dev->RegisterUdpListener(Port, RxCallbackFn, this))
+    {
+        Trace(0, "UdpShell: no free UDP listener slot for port %u", (ulong)Port);
+        TaskPtr->SetStopping();
+        TaskPtr->Wait();
+        TaskPtr->Put();
+        TaskPtr = nullptr;
+        Dev = nullptr;
+        Port = 0;
+        return false;
+    }
 
     Trace(0, "UdpShell: started on port %u", (ulong)Port);
     return true;

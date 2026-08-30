@@ -30,8 +30,6 @@ public:
     virtual u64 GetRxPackets() override;
     virtual u64 GetRxDropped() override;
     virtual void GetStats(NetStats& stats) override;
-    virtual bool SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
-                         const void* data, ulong len) override;
 
     /* NetDevice TX/RX virtual methods */
     virtual void FlushTx() override;
