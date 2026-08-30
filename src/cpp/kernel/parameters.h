@@ -20,6 +20,10 @@ public:
     bool IsTraceVga();
     bool IsPanicVga();
     bool IsSmpOff();
+
+    /* maxcpus=N -- bring up at most N CPUs, the BSP included. 0 = no cap. */
+    ulong GetMaxCpus();
+
     bool IsItsEnabled();
     bool IsWxProbe();
     bool IsUsbOff();
@@ -65,6 +69,7 @@ private:
     bool TraceVga;
     bool PanicVga;
     bool SmpOff;
+    ulong MaxCpusLimit;
     bool ItsEnabled;
     bool WxProbe;
     bool UsbOff;

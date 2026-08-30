@@ -1,4 +1,5 @@
 #include "parameters.h"
+#include "cpu.h"
 #include "panic.h"
 #include "trace.h"
 
@@ -9,6 +10,7 @@ Parameters::Parameters()
     : TraceVga(false)
     , PanicVga(false)
     , SmpOff(false)
+    , MaxCpusLimit(0)
     , ItsEnabled(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
     , WxProbe(false)
     , UsbOff(false)
@@ -38,6 +40,11 @@ bool Parameters::IsPanicVga()
 bool Parameters::IsSmpOff()
 {
     return SmpOff;
+}
+
+ulong Parameters::GetMaxCpus()
+{
+    return MaxCpusLimit;
 }
 
 bool Parameters::IsItsEnabled()
@@ -189,6 +196,18 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         else
         {
             Trace(0, "Unknown value %s, key %s", value, key);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "maxcpus") == 0)
+    {
+        ulong count = 0;
+        if (Stdlib::ParseUlong(value, count) && count > 0 && count <= MaxCpus)
+        {
+            MaxCpusLimit = count;
+        }
+        else
+        {
+            Trace(0, "Invalid maxcpus %s", value);
         }
     }
     else if (Stdlib::StrCmp(key, "console") == 0)

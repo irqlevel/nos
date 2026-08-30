@@ -207,6 +207,7 @@ arm64 (start `./scripts/qemu-arm64.sh -s`, needs `gdb-multiarch`):
 Pass via GRUB command line on x86-64 (edit `build/grub.cfg`) or QEMU `-append` on arm64:
 
 - `smp=off` — disable SMP, run on BSP only
+- `maxcpus=N` — bring up at most N CPUs, the BSP included (`maxcpus=2` = BSP + one AP); the rest stay parked. Bisects an SMP bring-up failure without giving up SMP entirely
 - `console=serial` — direct shell output to serial port only
 - `console=vga` — direct shell output to the screen only (VGA text or framebuffer)
 - `dhcp=auto` — start DHCP on `eth0` automatically at boot

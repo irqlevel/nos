@@ -1,6 +1,7 @@
 #include "board.h"
 
 #include <kernel/cpu.h>
+#include <kernel/parameters.h>
 #include <kernel/trace.h>
 #include <kernel/time.h>
 #include <mm/page_table.h>
@@ -83,25 +84,39 @@ bool CpuTable::StartAll()
         CleanDcacheLine(&Arm64ApStackTop[i]);
     asm volatile("dsb sy" ::: "memory");
 
+    const ulong bspIndex = GetBspIndex();
+    const ulong maxCpus = Parameters::GetInstance().GetMaxCpus();
+    /* Only the CPUs CPU_ON actually accepted are waited for below: with
+       maxcpus=N the rest stay parked in the firmware and never report in. */
+    ulong startedMask = 0;
+    ulong running = 1; /* the BSP */
+
+    for (ulong index = 0; index < MaxCpus; index++)
     {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
+        auto& cpu = GetCpu(index);
+
+        if (index == bspIndex || !(cpu.GetState() & Cpu::StateInited))
+            continue;
+
+        if (index >= board.CpuCount)
+            continue;
+
+        if (maxCpus != 0 && running >= maxCpus)
         {
-            if (index == GetBspIndexLockHeld() ||
-                !(CpuArray[index].GetState() & Cpu::StateInited))
-                continue;
-
-            if (index >= board.CpuCount)
-                continue;
-
-            long err = PsciCall(PsciCpuOn, board.CpuMpidr[index],
-                entryPhys, index);
-            if (err != 0)
-            {
-                Trace(0, "Cpu %u CPU_ON failed %d", index, err);
-                return false;
-            }
+            Trace(0, "Cpu %u left parked, maxcpus is %u", index, maxCpus);
+            continue;
         }
+
+        long err = PsciCall(PsciCpuOn, board.CpuMpidr[index],
+            entryPhys, index);
+        if (err != 0)
+        {
+            Trace(0, "Cpu %u CPU_ON failed %d", index, err);
+            return false;
+        }
+
+        startedMask |= 1UL << index;
+        running++;
     }
 
     /* Poll for the APs to finish startup (mirrors x86): the budget scales
@@ -111,60 +126,42 @@ bool CpuTable::StartAll()
     static const ulong ApTimeoutPerCpuMs = 250;
     static const ulong ApPollIntervalMs = 10;
 
-    ulong apCount = 0;
-    {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
-        {
-            if (index != GetBspIndexLockHeld() &&
-                (CpuArray[index].GetState() & Cpu::StateInited))
-                apCount++;
-        }
-    }
-    const ulong ApTimeoutMs = ApTimeoutBaseMs + ApTimeoutPerCpuMs * apCount;
+    const ulong ApTimeoutMs = ApTimeoutBaseMs + ApTimeoutPerCpuMs * (running - 1);
 
     for (ulong waited = 0; waited < ApTimeoutMs; waited += ApPollIntervalMs)
     {
         BusyWait(ApPollIntervalMs * Const::NanoSecsInMs);
 
         bool allRunning = true;
+        for (ulong index = 0; index < MaxCpus; index++)
         {
-            Stdlib::AutoLock lock(Lock);
-            for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
+            if (!(startedMask & (1UL << index)))
+                continue;
+
+            if (!(GetCpu(index).GetState() & Cpu::StateRunning))
             {
-                if (index != GetBspIndexLockHeld() &&
-                    (CpuArray[index].GetState() & Cpu::StateInited))
-                {
-                    if (!(CpuArray[index].GetState() & Cpu::StateRunning))
-                    {
-                        allRunning = false;
-                        break;
-                    }
-                }
+                allRunning = false;
+                break;
             }
         }
         if (allRunning)
             break;
     }
 
+    for (ulong index = 0; index < MaxCpus; index++)
     {
-        Stdlib::AutoLock lock(Lock);
-        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
+        if (!(startedMask & (1UL << index)))
+            continue;
+
+        if (!(GetCpu(index).GetState() & Cpu::StateRunning))
         {
-            if (index != GetBspIndexLockHeld() &&
-                (CpuArray[index].GetState() & Cpu::StateInited))
-            {
-                if (!(CpuArray[index].GetState() & Cpu::StateRunning))
-                {
-                    Trace(0, "Cpu %u still not running after %u ms",
-                        index, ApTimeoutMs);
-                    return false;
-                }
-            }
+            Trace(0, "Cpu %u still not running after %u ms",
+                index, ApTimeoutMs);
+            return false;
         }
     }
 
-    Trace(0, "Cpus started");
+    Trace(0, "Cpus started, %u running", running);
 
     return true;
 }
