@@ -216,6 +216,7 @@ Pass via GRUB command line on x86-64 (edit `build/grub.cfg`) or QEMU `-append` o
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
 - `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`)
 - `netconsole=ip:port` — stream the kernel log over UDP to that collector (e.g. `netconsole=10.0.2.2:6666`); needs an address, so pair it with `dhcp=auto`
+- `nctail=N` — ship only the newest N KiB of the log buffered before the link came up (e.g. `nctail=16`); the rest is dropped. For a machine that wedges shortly after the network appears, this spends the little airtime it has on the lines around the wedge instead of on the head of the boot log
 - `its=off` — arm64 only: disable the GICv3 ITS and degrade PCIe MSI gracefully (default `its=on`; virtio-mmio devices don't need it)
 - `usb=off` — x86-64 only: skip xHCI bring-up (no USB keyboard; the 8042 keyboard is unaffected)
 
@@ -243,14 +244,27 @@ serial port (a laptop over Wi-Fi, a cloud VM).
 
 Every line the tracer emits is copied into a 128 KiB ring buffer the moment it
 is produced, from any context including IRQ; a dedicated `netcon` task drains
-the ring and sends whole lines in ~1400-byte datagrams. Nothing is lost while
-the network is still coming up: the ring is primed from `dmesg` at boot and
-keeps buffering until the device has an IP, then the entire backlog goes out
-and live lines follow within a couple of milliseconds. When the ring fills, the
-oldest lines are evicted and counted (`netconsole` shell command). Panics are
-included -- the panic report is captured and flushed synchronously, best-effort
-and only if the collector MAC is already in the ARP cache, since a blocking ARP
-resolve could never complete with the other CPUs halted.
+the ring and sends whole lines in ~1400-byte datagrams, one per millisecond.
+Nothing is lost while the network is still coming up: the ring is primed from
+`dmesg` at boot and keeps buffering until the device has an IP, then the
+backlog goes out and live lines follow within a couple of milliseconds. When
+the ring fills, the oldest lines are evicted and counted (`netconsole` shell
+command). Panics are included -- the panic report is captured and flushed
+synchronously, best-effort and only if the collector MAC is already in the ARP
+cache, since a blocking ARP resolve could never complete with the other CPUs
+halted.
+
+Each datagram carries an eight-byte header: `NOSC` and a little-endian
+sequence number, which the collector uses to report gaps. UDP drops datagrams
+without saying so, and a log that ends because the network ate the rest of a
+burst reads exactly like a log that ends because the machine wedged -- which
+is the one distinction that matters when debugging a hang. The same reasoning
+sets the pace: by the time the link comes up there can be a hundred datagrams
+of boot log queued, and sending them at the rate the NIC accepts overruns
+whatever is narrowest on the way to the collector, losing the far end of the
+burst. `nctail=N` goes further and caps that backlog at the newest N KiB, so
+a machine with a few milliseconds of network left spends them on the lines
+nearest its death.
 
 Receive with the included collector:
 
@@ -259,8 +273,11 @@ python3 scripts/netconsole.py                    # listen on 0.0.0.0:6666
 python3 scripts/netconsole.py -p 5555 -o boot.log
 ```
 
-It reassembles lines per sender, prefixes each with the host receive time, and
-optionally appends to a file. Under QEMU user networking the host is `10.0.2.2`,
+It reassembles lines per sender, prefixes each with the host receive time,
+marks any gap in the sequence (`--- netconsole: N datagram(s) lost ---`) and a
+sender that restarted, and optionally appends to a file. Datagrams with no
+header, from an older kernel, are still printed -- just without gap
+detection. Under QEMU user networking the host is `10.0.2.2`,
 so `netconsole=10.0.2.2:6666 dhcp=auto` plus a collector on the host works with
 no port forwarding (outbound UDP needs none).
 

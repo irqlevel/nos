@@ -90,6 +90,12 @@ N CPUs, the BSP included), `console=serial` / `console=vga`,
 that UDP collector as each line is produced (buffered until the network is up,
 panic report included) -- receive it with `scripts/netconsole.py`; on a machine
 with no serial port this is the only way to see the log of a boot that dies.
+Each datagram carries a sequence number so the collector can report gaps, and
+the drain is paced at one datagram per millisecond -- an unpaced backlog burst
+is dropped by the first narrow queue on the way out, which looks exactly like
+a hang. `nctail=N` caps the pre-link backlog at the newest N KiB, so a machine
+that wedges just after the network comes up sends the lines around the wedge
+rather than the head of the boot log.
 
 ### Tests run at boot, not via a test runner
 

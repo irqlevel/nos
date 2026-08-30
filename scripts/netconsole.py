@@ -2,9 +2,17 @@
 """Netconsole collector for the nos kernel.
 
 The kernel streams its log over UDP when booted with `netconsole=ip:port`
-(see build/grub.cfg on x86-64, -append on arm64). Each datagram carries one or
-more whole log lines as plain text; this script binds the port, reassembles
-lines per sender and prints them, optionally to a file as well.
+(see build/grub.cfg on x86-64, -append on arm64). Each datagram carries a
+short header -- b"NOSC" and a little-endian u32 sequence number -- followed by
+one or more whole log lines as plain text. This script binds the port,
+reassembles lines per sender, reports any gap in the sequence and prints the
+result, optionally to a file as well.
+
+The gap report is the point of the sequence number: UDP loses datagrams
+silently, and a log that stops because the uplink dropped the rest of a burst
+looks exactly like a log that stops because the machine wedged. Datagrams
+with no header (an older kernel) are still printed, just without gap
+detection.
 
     ./scripts/netconsole.py                 # listen on 0.0.0.0:6666
     ./scripts/netconsole.py -p 5555 -o boot.log
@@ -30,6 +38,10 @@ import time
 
 DEFAULT_PORT = 6666
 DEFAULT_BIND = "0.0.0.0"
+
+# Datagram header written by Netconsole::SendBatch.
+MAGIC = b"NOSC"
+HDR_LEN = 8
 
 # Flush a sender's partial line if nothing more arrives within this window, so
 # a panic message that never got its newline still shows up.
@@ -86,11 +98,50 @@ class Reassembler:
                 self.partial[source] = ""
                 self.sink.write_line(source, rest.rstrip("\r"))
 
+    def flush_source(self, source):
+        """Emit a sender's partial line as-is, before something interrupts it."""
+        rest = self.partial.pop(source, "")
+        if rest:
+            self.sink.write_line(source, rest.rstrip("\r"))
+
     def flush_all(self):
         for source in list(self.partial):
             rest = self.partial.pop(source)
             if rest:
                 self.sink.write_line(source, rest.rstrip("\r"))
+
+
+def split_header(data):
+    """Split a datagram into (sequence, payload); sequence is None if absent."""
+    if len(data) >= HDR_LEN and data[:4] == MAGIC:
+        return int.from_bytes(data[4:HDR_LEN], "little"), data[HDR_LEN:]
+    return None, data
+
+
+class SeqTracker:
+    """Per-sender datagram sequence, so a gap is reported rather than implied."""
+
+    def __init__(self):
+        self.expect = {}
+        self.lost = 0
+
+    def check(self, source, seq):
+        """Return a note about what happened before this datagram, or None."""
+        expect = self.expect.get(source)
+        self.expect[source] = seq + 1
+
+        if expect is None or seq == expect:
+            return None
+
+        if seq < expect:
+            # The kernel numbers datagrams from zero, so going backwards
+            # means the sender restarted.
+            return "--- netconsole: sender restarted at seq %d ---" % seq
+
+        missing = seq - expect
+        self.lost += missing
+        return "--- netconsole: %d datagram(s) lost, seq %d..%d ---" % (
+            missing, expect, seq - 1)
 
 
 def on_sigterm(signum, frame):
@@ -131,6 +182,7 @@ def main():
     sink = Sink(args.output, not args.no_stamp, args.show_source,
                 multi_source=False)
     asm = Reassembler(sink)
+    seq = SeqTracker()
     seen_sources = set()
     packets = 0
     total = 0
@@ -159,15 +211,26 @@ def main():
 
             packets += 1
             total += len(data)
-            asm.feed(source, data)
+
+            number, payload = split_header(data)
+            if number is not None:
+                note = seq.check(source, number)
+                if note:
+                    # Whatever line was still open ended in the gap; close it
+                    # before the marker so the two do not run together.
+                    asm.flush_source(source)
+                    sink.write_line(source, note)
+
+            asm.feed(source, payload)
     except KeyboardInterrupt:
         pass
     finally:
         asm.flush_all()
         sink.close()
         sock.close()
-        print("\nnetconsole: %d packets, %d bytes from %d sender(s)" %
-              (packets, total, len(seen_sources)), file=sys.stderr)
+        print("\nnetconsole: %d packets, %d bytes from %d sender(s), "
+              "%d datagram(s) lost" %
+              (packets, total, len(seen_sources), seq.lost), file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -32,9 +32,12 @@ Netconsole::Netconsole()
     , DstPort(0)
     , SrcPort(0)
     , Enabled(false)
+    , TailKeepBytes(0)
+    , BacklogTrimmed(false)
     , Dropped(0)
     , Sent(0)
     , TxFailed(0)
+    , Seq(0)
     , PanicBacklog(0)
 {
 }
@@ -62,6 +65,15 @@ bool Netconsole::Setup()
     DstPort = params.GetNetconsolePort();
     SrcPort = DstPort;
 
+    /* nctail=N caps what the link-up drain carries; a bound at or above the
+       ring is the same as no bound at all. */
+    ulong tailKb = params.GetNetconsoleTailKb();
+    if (tailKb != 0)
+    {
+        ulong bytes = tailKb * Const::KB;
+        TailKeepBytes = (bytes < BufSize) ? bytes : 0;
+    }
+
     /* Everything traced before this point is still in dmesg -- replay it into
        the ring so the collector sees the whole boot, not just the tail. */
     for (DmesgMsg* msg = Dmesg::GetInstance().Next(nullptr); msg != nullptr;
@@ -77,10 +89,10 @@ bool Netconsole::Setup()
 
     Enabled = true;
 
-    Trace(0, "Netconsole: capturing for %u.%u.%u.%u:%u",
+    Trace(0, "Netconsole: capturing for %u.%u.%u.%u:%u, backlog cap %u bytes",
         (ulong)((DstIp.Addr4 >> 24) & 0xFF), (ulong)((DstIp.Addr4 >> 16) & 0xFF),
         (ulong)((DstIp.Addr4 >> 8) & 0xFF), (ulong)(DstIp.Addr4 & 0xFF),
-        (ulong)DstPort);
+        (ulong)DstPort, TailKeepBytes);
 
     return true;
 }
@@ -225,6 +237,24 @@ void Netconsole::DropOldest()
     Dropped++;
 }
 
+void Netconsole::TrimHead(ulong region, ulong keepBytes)
+{
+    while (region > keepBytes)
+    {
+        u16 len;
+        if (!PeekRecordLen(len))
+            break;
+
+        ulong record = RecordHdrSize + (ulong)len;
+        if (record > region)
+            break;
+
+        PopBytes(nullptr, record);
+        Dropped++;
+        region = region - record;
+    }
+}
+
 void Netconsole::Append(const char* s, ulong len)
 {
     ulong need = RecordHdrSize + len;
@@ -288,12 +318,28 @@ ulong Netconsole::PeekBatch(u8* buf, ulong bufSize, ulong& consumed)
     return filled;
 }
 
-bool Netconsole::SendBatch(const u8* buf, ulong len)
+bool Netconsole::SendBatch(ulong textLen)
 {
-    if (Dev == nullptr || len == 0)
+    if (Dev == nullptr || textLen == 0)
         return false;
 
-    return Dev->SendUdp(DstIp, DstPort, Dev->GetIp(), SrcPort, buf, len);
+    PktBuf[0] = DgramMagic0;
+    PktBuf[1] = DgramMagic1;
+    PktBuf[2] = DgramMagic2;
+    PktBuf[3] = DgramMagic3;
+    PktBuf[4] = (u8)(Seq & 0xFF);
+    PktBuf[5] = (u8)((Seq >> 8) & 0xFF);
+    PktBuf[6] = (u8)((Seq >> 16) & 0xFF);
+    PktBuf[7] = (u8)((Seq >> 24) & 0xFF);
+
+    if (!Dev->SendUdp(DstIp, DstPort, Dev->GetIp(), SrcPort,
+            PktBuf, DgramHdrSize + textLen))
+        return false;
+
+    /* Only a datagram the device actually took gets a number, so a gap in
+       the sequence at the collector means the network lost it. */
+    Seq++;
+    return true;
 }
 
 void Netconsole::TaskFunc(void* ctx)
@@ -316,12 +362,34 @@ void Netconsole::Run()
             continue;
         }
 
+        /* First moment there is anywhere to send to. With nctail=N the boot
+           log queued behind this point is cut down to the newest N KiB: on a
+           machine that wedges seconds later, the whole network it will ever
+           get goes on the lines nearest the wedge instead of on the head of
+           the log, which is the part already understood. */
+        if (!BacklogTrimmed)
+        {
+            ulong trimmed;
+            {
+                Stdlib::AutoLock lock(Lock);
+                trimmed = Dropped;
+                if (TailKeepBytes != 0)
+                    TrimHead(Used, TailKeepBytes);
+                trimmed = Dropped - trimmed;
+                BacklogTrimmed = true;
+            }
+
+            if (trimmed != 0)
+                Trace(0, "Netconsole: link up, dropped %u backlog msgs over the %u byte cap",
+                    trimmed, TailKeepBytes);
+        }
+
         ulong len;
         ulong consumed;
         ulong dropped;
         {
             Stdlib::AutoLock lock(Lock);
-            len = PeekBatch(PktBuf, sizeof(PktBuf), consumed);
+            len = PeekBatch(PktBuf + DgramHdrSize, sizeof(PktBuf) - DgramHdrSize, consumed);
             dropped = Dropped;
         }
 
@@ -331,7 +399,7 @@ void Netconsole::Run()
             continue;
         }
 
-        if (!SendBatch(PktBuf, len))
+        if (!SendBatch(len))
         {
             /* The records are still in the ring: on a machine whose only
                console is this one, consuming them first turned any TX hiccup
@@ -345,14 +413,22 @@ void Netconsole::Run()
 
         Sent++;
 
-        Stdlib::AutoLock lock(Lock);
+        {
+            Stdlib::AutoLock lock(Lock);
 
-        /* Append() may have evicted from the head while the lock was down, in
-           which case what was just sent is already gone and popping again
-           would eat live records. Dropped is the only thing that moves Head
-           besides this task. */
-        if (Dropped == dropped)
-            PopBytes(nullptr, consumed);
+            /* Append() may have evicted from the head while the lock was down,
+               in which case what was just sent is already gone and popping
+               again would eat live records. Dropped is the only thing that
+               moves Head besides this task. */
+            if (Dropped == dropped)
+                PopBytes(nullptr, consumed);
+        }
+
+        /* Pace the next one. Sending a backlog as fast as the NIC takes it
+           put tens of datagrams on the wire in a couple of milliseconds, and
+           everything past the first few died in the narrowest queue on the
+           way to the collector. */
+        Sleep(SendPaceMs * Const::NanoSecsInMs);
     }
 }
 
@@ -383,31 +459,19 @@ void Netconsole::PanicFlush()
        thing worth reading would never leave. Drop the old end of that backlog,
        keep a little for context. */
     ulong backlog = (PanicBacklog < Used) ? PanicBacklog : Used;
-    while (backlog > PanicBacklogKeep)
-    {
-        u16 len;
-        if (!PeekRecordLen(len))
-            break;
-
-        ulong record = RecordHdrSize + (ulong)len;
-        if (record > backlog)
-            break;
-
-        PopBytes(nullptr, record);
-        Dropped++;
-        backlog = backlog - record;
-    }
+    TrimHead(backlog, PanicBacklogKeep);
 
     ulong failures = 0;
     for (ulong i = 0; i < PanicMaxPackets; i++)
     {
         /* Unlocked on purpose -- see the comment in Log(). */
         ulong consumed;
-        ulong len = PeekBatch(PktBuf, sizeof(PktBuf), consumed);
+        ulong len = PeekBatch(PktBuf + DgramHdrSize, sizeof(PktBuf) - DgramHdrSize,
+            consumed);
         if (len == 0)
             break;
 
-        if (SendBatch(PktBuf, len))
+        if (SendBatch(len))
         {
             Sent++;
             PopBytes(nullptr, consumed);
@@ -437,17 +501,20 @@ void Netconsole::Dump(Stdlib::Printer& printer)
     printer.Printf(":%u src port %u dev %s\n", (ulong)DstPort, (ulong)SrcPort,
         (Dev != nullptr) ? Dev->GetName() : "none");
 
-    ulong used, dropped, sent, txFailed;
+    ulong used, dropped, sent, txFailed, seq;
     {
         Stdlib::AutoLock lock(Lock);
         used = Used;
         dropped = Dropped;
         sent = Sent;
         txFailed = TxFailed;
+        seq = Seq;
     }
 
     printer.Printf("  buffered %u/%u bytes, dropped %u msgs, sent %u pkts, tx failed %u\n",
         used, (ulong)BufSize, dropped, sent, txFailed);
+    printer.Printf("  next seq %u, backlog cap %u bytes%s\n",
+        seq, TailKeepBytes, BacklogTrimmed ? ", applied" : "");
 }
 
 }
