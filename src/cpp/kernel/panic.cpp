@@ -86,6 +86,11 @@ void Panicker::DoPanic(const char *fmt, ...)
     InterruptDisable();
     if (Active.Cmpxchg(1, 0) == 0)
     {
+        /* Before the first PrintOutput: the report is appended behind whatever
+           backlog the drain task still owes the collector, and PanicFlush()
+           needs to know how much of it to skip. */
+        Netconsole::GetInstance().PanicMark();
+
         va_list args;
 
         va_start(args, fmt);
@@ -123,6 +128,11 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
     InterruptDisable();
     if (Active.Cmpxchg(1, 0) == 0)
     {
+        /* Before the first PrintOutput: the report is appended behind whatever
+           backlog the drain task still owes the collector, and PanicFlush()
+           needs to know how much of it to skip. */
+        Netconsole::GetInstance().PanicMark();
+
         va_list args;
 
         va_start(args, fmt);

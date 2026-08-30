@@ -15,6 +15,15 @@ namespace Kernel
    cannot turn a panic into an endless loop. */
 static const ulong PanicMaxPackets = 64;
 
+/* Consecutive refusals after which the panic path gives up on the device.
+   A TX ring that is merely full drains on its own while we retry the same
+   datagram; one that is wedged never will. */
+static const ulong PanicMaxTxRetries = 8;
+
+/* How much of the undrained backlog the panic path keeps in front of the
+   report, for context. The rest is dropped -- see PanicFlush(). */
+static const ulong PanicBacklogKeep = 8 * 1024;
+
 Netconsole::Netconsole()
     : Head(0)
     , Used(0)
@@ -26,6 +35,7 @@ Netconsole::Netconsole()
     , Dropped(0)
     , Sent(0)
     , TxFailed(0)
+    , PanicBacklog(0)
 {
 }
 
@@ -235,22 +245,44 @@ void Netconsole::Append(const char* s, ulong len)
     PushBytes((const u8*)s, len);
 }
 
-ulong Netconsole::PopBatch(u8* buf, ulong bufSize)
+ulong Netconsole::PeekBatch(u8* buf, ulong bufSize, ulong& consumed)
 {
     ulong filled = 0;
+    ulong pos = Head;   /* read cursor, left where it is until the send works */
+    ulong left = Used;
+
+    consumed = 0;
 
     for (;;)
     {
-        u16 len;
-        if (!PeekRecordLen(len))
+        if (left < RecordHdrSize)
             break;
 
-        if (filled + (ulong)len > bufSize)
+        ulong lo = Buf[pos];
+        ulong hi = Buf[(pos + 1) % BufSize];
+        ulong len = lo | (hi << 8);
+
+        if (len + RecordHdrSize > left)
             break;
 
-        PopBytes(nullptr, RecordHdrSize);
-        PopBytes(buf + filled, len);
+        if (filled + len > bufSize)
+            break;
+
+        pos = (pos + RecordHdrSize) % BufSize;
+        left = left - RecordHdrSize;
+
+        ulong first = BufSize - pos;
+        if (first > len)
+            first = len;
+
+        Stdlib::MemCpy(buf + filled, &Buf[pos], first);
+        if (len > first)
+            Stdlib::MemCpy(buf + filled + first, &Buf[0], len - first);
+
+        pos = (pos + len) % BufSize;
+        left = left - len;
         filled += len;
+        consumed += RecordHdrSize + len;
     }
 
     return filled;
@@ -285,9 +317,12 @@ void Netconsole::Run()
         }
 
         ulong len;
+        ulong consumed;
+        ulong dropped;
         {
             Stdlib::AutoLock lock(Lock);
-            len = PopBatch(PktBuf, sizeof(PktBuf));
+            len = PeekBatch(PktBuf, sizeof(PktBuf), consumed);
+            dropped = Dropped;
         }
 
         if (len == 0)
@@ -296,11 +331,38 @@ void Netconsole::Run()
             continue;
         }
 
-        if (SendBatch(PktBuf, len))
-            Sent++;
-        else
+        if (!SendBatch(PktBuf, len))
+        {
+            /* The records are still in the ring: on a machine whose only
+               console is this one, consuming them first turned any TX hiccup
+               into a silent blackout -- the loop has no sleep while the ring
+               is non-empty, so it shredded the whole backlog at full speed and
+               every line traced afterwards with it. Back off and retry. */
             TxFailed++;
+            Sleep(TxRetryMs * Const::NanoSecsInMs);
+            continue;
+        }
+
+        Sent++;
+
+        Stdlib::AutoLock lock(Lock);
+
+        /* Append() may have evicted from the head while the lock was down, in
+           which case what was just sent is already gone and popping again
+           would eat live records. Dropped is the only thing that moves Head
+           besides this task. */
+        if (Dropped == dropped)
+            PopBytes(nullptr, consumed);
     }
+}
+
+void Netconsole::PanicMark()
+{
+    if (!Enabled)
+        return;
+
+    /* Unlocked on purpose -- see the comment in Log(). */
+    PanicBacklog = Used;
 }
 
 void Netconsole::PanicFlush()
@@ -315,17 +377,50 @@ void Netconsole::PanicFlush()
     if (!ArpTable::GetInstance().Lookup(Dev->RouteIp(DstIp), mac))
         return;
 
+    /* The report is at the tail, behind whatever the drain task had not
+       shipped yet. A machine that dies just after DHCP has the entire boot log
+       in front of it -- far more than PanicMaxPackets carries -- so the one
+       thing worth reading would never leave. Drop the old end of that backlog,
+       keep a little for context. */
+    ulong backlog = (PanicBacklog < Used) ? PanicBacklog : Used;
+    while (backlog > PanicBacklogKeep)
+    {
+        u16 len;
+        if (!PeekRecordLen(len))
+            break;
+
+        ulong record = RecordHdrSize + (ulong)len;
+        if (record > backlog)
+            break;
+
+        PopBytes(nullptr, record);
+        Dropped++;
+        backlog = backlog - record;
+    }
+
+    ulong failures = 0;
     for (ulong i = 0; i < PanicMaxPackets; i++)
     {
         /* Unlocked on purpose -- see the comment in Log(). */
-        ulong len = PopBatch(PktBuf, sizeof(PktBuf));
+        ulong consumed;
+        ulong len = PeekBatch(PktBuf, sizeof(PktBuf), consumed);
         if (len == 0)
             break;
 
         if (SendBatch(PktBuf, len))
+        {
             Sent++;
-        else
-            TxFailed++;
+            PopBytes(nullptr, consumed);
+            failures = 0;
+            continue;
+        }
+
+        /* Retry the same datagram: a TX ring that is only full drains while
+           we spin here. Give up before the report is spent on a dead one. */
+        TxFailed++;
+        failures++;
+        if (failures >= PanicMaxTxRetries)
+            break;
     }
 }
 
