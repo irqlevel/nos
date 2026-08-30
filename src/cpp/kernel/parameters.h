@@ -42,6 +42,10 @@ public:
     Net::IpAddress GetNetconsoleIp();
     u16 GetNetconsolePort();
 
+    /* nctail=N -- when the link comes up, ship only the newest N KiB of the
+       buffered boot log. 0 (the default) ships all of it. */
+    ulong GetNetconsoleTailKb();
+
     bool IsDnsEnabled();
 
     bool IsRootAuto();
@@ -78,6 +82,7 @@ private:
     u16 UdpShellPort;
     Net::IpAddress NetconsoleIp;
     u16 NetconsolePort;
+    ulong NetconsoleTailKb;
     bool DnsEnabled;
     bool RootAuto;
 };

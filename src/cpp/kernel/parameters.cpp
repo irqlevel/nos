@@ -6,6 +6,11 @@
 namespace Kernel
 {
 
+/* Upper bound on nctail=N. The netconsole ring is smaller than this, and it
+   treats a cap at or above its own size as no cap at all -- this only keeps
+   a typo from being taken for a number. */
+static const ulong NetconsoleTailKbMax = 1024;
+
 Parameters::Parameters()
     : TraceVga(false)
     , PanicVga(false)
@@ -18,6 +23,7 @@ Parameters::Parameters()
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
     , NetconsolePort(0)
+    , NetconsoleTailKb(0)
     , DnsEnabled(false)
     , RootAuto(false)
 {
@@ -105,6 +111,11 @@ Net::IpAddress Parameters::GetNetconsoleIp()
 u16 Parameters::GetNetconsolePort()
 {
     return NetconsolePort;
+}
+
+ulong Parameters::GetNetconsoleTailKb()
+{
+    return NetconsoleTailKb;
 }
 
 bool Parameters::IsDnsEnabled()
@@ -296,6 +307,18 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
                     NetconsolePort = (u16)port;
                 }
             }
+        }
+    }
+    else if (Stdlib::StrCmp(key, "nctail") == 0)
+    {
+        ulong kb = 0;
+        if (Stdlib::ParseUlong(value, kb) && kb > 0 && kb <= NetconsoleTailKbMax)
+        {
+            NetconsoleTailKb = kb;
+        }
+        else
+        {
+            Trace(0, "Invalid nctail %s", value);
         }
     }
     else if (Stdlib::StrCmp(key, "root") == 0)

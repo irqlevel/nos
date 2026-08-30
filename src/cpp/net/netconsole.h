@@ -20,6 +20,19 @@ namespace Kernel
  * had to drop. As soon as the device has an IP the whole backlog goes out, and
  * after that every new line follows within a couple of milliseconds.
  *
+ * Each datagram carries a short header with a sequence number, so the
+ * collector can tell a gap in the stream from a machine that stopped
+ * logging. The two look identical without it, and the difference is the
+ * whole answer when debugging a hang.
+ *
+ * The backlog goes out paced rather than at wire speed: by the time the link
+ * comes up there can be a hundred datagrams of boot log queued, and a burst
+ * that size overruns whatever is narrowest between here and the collector --
+ * which drops the far end of the log, the part worth reading. `nctail=N`
+ * caps the backlog at the newest N KiB, so a machine that dies just after
+ * the link comes up spends its few milliseconds of network on the lines
+ * around the death rather than on the beginning of the boot.
+ *
  * Messages produced by the drain task itself are not captured: the TX path
  * traces (ARP failures, driver errors), and feeding those back into the ring
  * would make the drain loop generate its own work forever. They still reach
@@ -86,17 +99,34 @@ private:
        The caller pops that many once the datagram is actually out. */
     ulong PeekBatch(u8* buf, ulong bufSize, ulong& consumed);
 
-    bool SendBatch(const u8* buf, ulong len);
+    /* Send PktBuf: the datagram header, then the textLen bytes of log text
+       already placed after it. Bumps Seq once the device takes it. */
+    bool SendBatch(ulong textLen);
+
+    /* Drop whole records from the head of the ring until the leading region
+       of that many bytes is down to keepBytes. The caller holds Lock, or is
+       the panic path. */
+    void TrimHead(ulong region, ulong keepBytes);
 
     /* A record is a 2-byte length prefix followed by that many payload bytes.
        Either may straddle the wrap, so both go through PushBytes/PopBytes. */
     static const ulong RecordHdrSize = 2;
     static const ulong MaxRecordLen = 512;
 
+    /* Datagram header: the four bytes 'N','O','S','C' then a little-endian
+       u32 sequence number, counting datagrams from the first one sent. A
+       collector that does not know the header treats the whole datagram as
+       text, so an old one still works -- it just cannot report gaps. */
+    static const ulong DgramHdrSize = 8;
+    static const u8 DgramMagic0 = 'N';
+    static const u8 DgramMagic1 = 'O';
+    static const u8 DgramMagic2 = 'S';
+    static const u8 DgramMagic3 = 'C';
+
     /* Enough for a full boot log, so a collector started late still gets it. */
     static const ulong BufSize = 128 * 1024;
 
-    /* One UDP datagram of log text; stays well under the 1500-byte MTU. */
+    /* One UDP datagram, header included; stays well under the 1500-byte MTU. */
     static const ulong PayloadMaxLen = 1400;
 
     /* Poll interval of the drain task while the ring is empty, and while the
@@ -108,6 +138,14 @@ private:
        ring, so this is how fast a wedged TX path is retried -- without it the
        drain loop spins a CPU and shreds the backlog. */
     static const ulong TxRetryMs = 20;
+
+    /* Gap between two datagrams that both had something to send. The drain
+       loop used to have none, so a backlog left the machine as one burst at
+       whatever rate the NIC accepted -- tens of datagrams in a couple of
+       milliseconds, far past what a home uplink or a NAT will pass, and the
+       tail of the burst was simply gone. One millisecond still ships the
+       128 KiB ring in about a tenth of a second. */
+    static const ulong SendPaceMs = 1;
 
     u8 Buf[BufSize];
     ulong Head;      /* oldest byte */
@@ -124,10 +162,16 @@ private:
 
     volatile bool Enabled;
 
+    /* nctail=N: bytes of backlog to keep when the link first comes up, 0 to
+       keep all of it. */
+    ulong TailKeepBytes;
+    bool BacklogTrimmed;
+
     /* Stats, for the "netconsole" shell command. */
     ulong Dropped;     /* records evicted because the ring was full */
     ulong Sent;        /* datagrams sent */
     ulong TxFailed;    /* datagrams the device refused */
+    u32 Seq;           /* sequence number of the next datagram */
 
     /* Bytes of pre-panic backlog, sampled by PanicMark(). */
     ulong PanicBacklog;
