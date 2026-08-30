@@ -2,12 +2,12 @@
 
 A hobby operating system kernel for x86-64 and arm64 (aarch64), written in C++20, Rust, and assembly.
 Code is partially written by AI models (Claude, GPT) with human control over architecture decisions, testing, and code review.
-Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices), and on QEMU `virt` with HVF acceleration on Apple Silicon for the arm64 build. On x86-64 it boots under both legacy BIOS and UEFI. It also runs on real hardware — see [Real hardware](#real-hardware) — though only one machine has been tried, so anything beyond it is untested.
+Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices), and on QEMU `virt` with HVF acceleration on Apple Silicon for the arm64 build. On x86-64 it boots under both legacy BIOS and UEFI. It also runs on real hardware — a laptop and a dedicated server, see [Real hardware](#real-hardware) — though only those two machines have been tried, so anything beyond them is untested.
 
 #### Features
 
 - **Two architectures** — x86-64 (Multiboot2/GRUB, ISO or MBR disk boot, **legacy BIOS and UEFI firmware**) and arm64 (QEMU `virt` board, Linux `Image` boot protocol); portable code goes through a HAL layer (`src/cpp/hal/`), arch backends live in `src/cpp/arch/`
-- **SMP** — up to 8 CPUs; AP bootstrap via INIT/SIPI on x86-64, PSCI `CPU_ON` on arm64
+- **SMP** — up to 64 CPUs (20 exercised on real hardware); AP bootstrap via INIT/SIPI on x86-64, PSCI `CPU_ON` on arm64, APs started one at a time, `maxcpus=N` to cap them
 - **Preemptive multitasking** — per-CPU task queues, round-robin scheduling, load-balanced task placement
 - **Virtual memory** — 4-level paging (4 KB pages), high-half kernel at `0xFFFF800001000000`, TLB shootdown across CPUs via IPI
 - **Page allocator** — fixed-size block allocator (1–128 contiguous pages), pool allocator (32 B – 2 KB), `new`/`delete` support
@@ -159,11 +159,16 @@ gcloud compute connect-to-serial-port nos-vm
 
 #### Real hardware
 
-`nos` boots on bare metal. Verified on one machine so far: a **Dell Latitude
-5480** (Intel Core i5-6200U, Skylake-U / 100-series PCH, BIOS 1.16.0) booted
-under UEFI. That laptop has no serial port and no 8042/PS/2 controller, yet the
-kernel comes up on its own screen and gives an interactive shell driven by the
-built-in USB keyboard.
+`nos` boots on bare metal. Two machines so far, and they pull in opposite
+directions: a laptop whose only console is its own screen, and a dedicated
+server whose only console is the network.
+
+##### Dell Latitude 5480
+
+A **Dell Latitude 5480** (Intel Core i5-6200U, Skylake-U / 100-series PCH, BIOS
+1.16.0) booted under UEFI. That laptop has no serial port and no 8042/PS/2
+controller, yet the kernel comes up on its own screen and gives an interactive
+shell driven by the built-in USB keyboard.
 
 That machine is the reason for four pieces of the tree, none of which QEMU
 ever demanded:
@@ -183,8 +188,40 @@ ever demanded:
   failures print through the screen console and the panic handler rather than
   `Trace` alone.
 
+##### Hetzner EX44 dedicated server
+
+A **Hetzner EX44** (Intel Core i5-13500 — Raptor Lake, 6 P-cores + 8 E-cores,
+20 threads) booted with `maxcpus=20`, which on that box is every CPU it has.
+All 20 come up and stay scheduled: `ps` lists 20 `idleN` and 20 `softirq/N`
+tasks, and the load balancer spreads the multitasking self-test across them.
+
+The hybrid topology is what makes it worth recording. The APIC IDs are sparse
+and non-contiguous — `0, 1, 8, 9 … 40, 41` for the SMT pairs on the P-cores,
+then `48, 50 … 62`, even-numbered, for the E-cores — so the largest apic id is
+62 on a 20-CPU machine. That is why `MaxCpus` is 64 rather than a number near
+the CPU count, and why IOAPIC redirection entries are only aimed at apic ids a
+physical-mode entry can actually name: that field is four bits wide, ids 0..15,
+so round-robining an IOAPIC line onto an E-core silently aliased it onto an id
+no CPU has and the line stopped being delivered. MSI-X keeps the full 8-bit
+destination and the whole CPU mask.
+
+Networking works on the real internet, and this is the first machine to
+exercise the Rust **RTL8125** driver against silicon rather than a datasheet —
+QEMU has no model of that chip, so until this boot `drivers/r8125` had never
+seen the hardware it was written for. The DHCP client takes a public /26 lease
+from the host's network, the DNS resolver comes up on the server handed out
+with it, the box answers pings from anywhere, and the UDP shell
+(`udpshell=9000` + `scripts/udpsh.py`) is usable across the internet — `ps` and
+friends answer from a remote machine.
+
+`netconsole=ip:port` is how any of this was seen at all. With no screen and no
+serial console reachable from outside, the whole boot log — self-tests, AP
+bring-up, xHCI enumeration, DHCP — went out over UDP to `scripts/netconsole.py`
+as it was produced. xHCI also came up on that board: 26 root ports, three hubs,
+and a USB keyboard enumerated behind one of them.
+
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
-as "works on the machine it was debugged on".
+as "works on the two machines it was debugged on".
 
 #### Debug
 
@@ -361,6 +398,7 @@ src/rust/
   drivers/
     nvme/     NVMe block device driver (PCI, MSI-X, admin/IO queues)
     r8168/    Realtek r8168 network device driver
+    r8125/    Realtek RTL8125 2.5GbE network device driver
   hello/      Rust self-test module
   kernel/     Rust entry points (rust_main, rust_fini), global allocator
 build/        Linker script, GRUB configs
