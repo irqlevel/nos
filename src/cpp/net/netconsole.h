@@ -47,6 +47,11 @@ public:
        the panic printer. Must be safe at any IRQ level. */
     void Log(const char* s);
 
+    /* Called once a panic has started, before anything is printed: remembers
+       how much undrained backlog sits in front of the report so PanicFlush()
+       can get past it. */
+    void PanicMark();
+
     /* Best-effort synchronous drain from panic context: no locks, and only if
        the collector MAC is already in the ARP cache (a blocking ARP resolve
        would never complete with the other CPUs halted). */
@@ -76,8 +81,10 @@ private:
     void DropOldest();
     void Append(const char* s, ulong len);
 
-    /* Fill buf with as many whole records as fit; returns bytes filled. */
-    ulong PopBatch(u8* buf, ulong bufSize);
+    /* Fill buf with as many whole records as fit, without consuming them;
+       returns bytes filled and, in consumed, how many ring bytes they occupy.
+       The caller pops that many once the datagram is actually out. */
+    ulong PeekBatch(u8* buf, ulong bufSize, ulong& consumed);
 
     bool SendBatch(const u8* buf, ulong len);
 
@@ -96,6 +103,11 @@ private:
        device has no IP yet. */
     static const ulong IdlePollMs = 2;
     static const ulong NoLinkPollMs = 200;
+
+    /* Backoff after a datagram the device refused. The records stay in the
+       ring, so this is how fast a wedged TX path is retried -- without it the
+       drain loop spins a CPU and shreds the backlog. */
+    static const ulong TxRetryMs = 20;
 
     u8 Buf[BufSize];
     ulong Head;      /* oldest byte */
@@ -116,6 +128,9 @@ private:
     ulong Dropped;     /* records evicted because the ring was full */
     ulong Sent;        /* datagrams sent */
     ulong TxFailed;    /* datagrams the device refused */
+
+    /* Bytes of pre-panic backlog, sampled by PanicMark(). */
+    ulong PanicBacklog;
 
     u8 PktBuf[PayloadMaxLen];
 
