@@ -12,6 +12,8 @@
 #include <hal/irqchip.h>
 #include <hal/console.h>
 
+#include <net/netconsole.h>
+
 namespace Kernel
 {
 
@@ -31,6 +33,10 @@ bool Panicker::IsActive()
 void Panicker::PrintOutput(const char* str)
 {
     Hal::ConsolePanicWrite(str);
+
+    /* Also into the netconsole ring; PanicFlush() below pushes it out while
+       the machine still can. */
+    Netconsole::GetInstance().Log(str);
 }
 
 void Panicker::DumpContext()
@@ -98,6 +104,11 @@ void Panicker::DoPanic(const char *fmt, ...)
             Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
             CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
         }
+
+        /* Last thing done, and best-effort by construction: the console
+           already has the whole report, so a TX path that turns out to be
+           wedged costs nothing that was still needed. */
+        Netconsole::GetInstance().PanicFlush();
     }
 
     for (;;)
@@ -131,6 +142,11 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
             Cpu& cpu = CpuTable::GetInstance().GetCurrentCpu();
             CpuTable::GetInstance().SendIPIAllExclude(cpu.GetIndex());
         }
+
+        /* Last thing done, and best-effort by construction: the console
+           already has the whole report, so a TX path that turns out to be
+           wedged costs nothing that was still needed. */
+        Netconsole::GetInstance().PanicFlush();
     }
 
     for (;;)

@@ -40,6 +40,7 @@ namespace Kernel { bool PciEcamSetup(); }
 extern "C" void __cxa_finalize(void*);
 extern "C" char BootStackTop[];
 #include <net/udp_shell.h>
+#include <net/netconsole.h>
 #include <net/net_device.h>
 
 /* arm64 boot orchestrator, the Main2 twin (kernel/main.cpp). Milestone M2:
@@ -251,6 +252,16 @@ static void BpStartupArm(void* ctx)
         return;
     }
 
+    auto& netconsole = Netconsole::GetInstance();
+    if (netconsole.IsEnabled())
+    {
+        NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
+        if (netDev == nullptr)
+            Trace(0, "Netconsole: eth0 not found");
+        else if (!netconsole.Start(netDev))
+            Trace(0, "Netconsole: failed to start");
+    }
+
     UdpShell udpShell;
     u16 udpShellPort = Parameters::GetInstance().GetUdpShellPort();
     if (udpShellPort != 0)
@@ -281,6 +292,7 @@ static void BpStartupArm(void* ctx)
                 Trace(0, "Shutdown requested");
 
             udpShell.Stop();
+            netconsole.Stop();
             cmd.Stop();
             cmd.StopDhcp();
 
@@ -367,6 +379,10 @@ extern "C" void MainArm64(void* dtb)
     }
 
     Parameters::GetInstance().Parse(board.BootArgs);
+
+    /* Arm log capture as soon as the command line is known: the ring buffers
+       everything until the network can carry it away. */
+    Netconsole::GetInstance().Setup();
 
     Trace(0, "Enter kernel: start 0x%p end 0x%p",
         mmap.GetKernelStart(), mmap.GetKernelEnd());

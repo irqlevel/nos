@@ -18,6 +18,7 @@
 #include <net/dns.h>
 #include <net/tcp.h>
 #include <net/http.h>
+#include <net/netconsole.h>
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
 #include <fs/nanofs.h>
@@ -420,6 +421,12 @@ static void CmdArp(const char* args, Stdlib::Printer& con)
 {
     (void)args;
     ArpTable::GetInstance().Dump(con);
+}
+
+static void CmdNetconsole(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Netconsole::GetInstance().Dump(con);
 }
 
 static void CmdIcmpstat(const char* args, Stdlib::Printer& con)
@@ -1290,6 +1297,7 @@ static const CmdEntry Commands[] = {
     { "diskwrite", CmdDiskwrite, "diskwrite <disk> <sector> <hex> - write sector" },
     { "net",       CmdNet,       "net - list network devices" },
     { "arp",       CmdArp,       "arp - show ARP table" },
+    { "netconsole", CmdNetconsole, "netconsole - show netconsole state" },
     { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
     { "tcpstat",   CmdTcpstat,   "tcpstat - show TCP connections and statistics" },
     { "wget",      CmdWget,      "wget <url> - HTTP GET request" },

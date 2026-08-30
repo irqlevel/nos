@@ -1,6 +1,7 @@
 #pragma once
 
 #include <lib/stdlib.h>
+#include <net/net.h>
 
 namespace Kernel
 {
@@ -31,6 +32,11 @@ public:
     bool IsDhcpOff();
 
     u16 GetUdpShellPort();
+
+    /* netconsole=ip:port -- stream the kernel log to that collector */
+    bool IsNetconsoleEnabled();
+    Net::IpAddress GetNetconsoleIp();
+    u16 GetNetconsolePort();
 
     bool IsDnsEnabled();
 
@@ -65,6 +71,8 @@ private:
     ConsoleMode ConMode;
     DhcpMode DhcpMd;
     u16 UdpShellPort;
+    Net::IpAddress NetconsoleIp;
+    u16 NetconsolePort;
     bool DnsEnabled;
     bool RootAuto;
 };

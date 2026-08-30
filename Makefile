@@ -93,6 +93,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/net/dhcp.cpp \
     src/cpp/net/icmp.cpp \
     src/cpp/net/udp_shell.cpp \
+    src/cpp/net/netconsole.cpp \
     src/cpp/net/dns.cpp \
     src/cpp/net/tcp.cpp \
     src/cpp/net/http.cpp \
@@ -195,6 +196,7 @@ CXX_SRC_aarch64 = \
     src/cpp/net/dhcp.cpp \
     src/cpp/net/icmp.cpp \
     src/cpp/net/udp_shell.cpp \
+    src/cpp/net/netconsole.cpp \
     src/cpp/net/dns.cpp \
     src/cpp/net/tcp.cpp \
     src/cpp/net/http.cpp \
