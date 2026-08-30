@@ -13,7 +13,18 @@
 namespace Kernel
 {
 
-const ulong MaxCpus = 8;
+/* Upper bound on the CPUs the kernel tracks.  64 is a ceiling rather than a
+   tuning knob: CPU sets travel as a ulong bitmask (GetRunningCpus,
+   Task::CpuAffinity, SoftIrq), so index 63 is the last one that fits.
+
+   On x86 the index *is* the LAPIC ID, not a dense counter, so this bound has
+   to clear the largest APIC ID the firmware reports rather than the CPU
+   count: a 14-core Raptor Lake numbers its 20 threads 0,1,8,9,...,62, and at
+   MaxCpus = 8 everything above the first two threads was dropped.  Anything
+   sized by this constant is per-CPU static storage (kernel/main.cpp Stack[],
+   gdt.h DfStack[], arm64 ApBootStack[]), so raising it further costs BSS in
+   proportion. */
+const ulong MaxCpus = 64;
 
 struct IPITask
 {

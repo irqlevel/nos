@@ -330,6 +330,9 @@ BootStackTop:
     .globl Arm64ApTtbr1
 Arm64ApTtbr1:
     .space 8
+    /* One stack-top pointer per CPU, indexed by the CPU index PSCI CPU_ON
+       passes back in x0. Must hold Kernel::MaxCpus entries; a static_assert
+       in cpu_start_arm64.cpp checks the two agree. */
     .globl Arm64ApStackTop
 Arm64ApStackTop:
-    .space (8 * 8)
+    .space (64 * 8)

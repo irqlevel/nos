@@ -14,6 +14,13 @@ SECTIONS
 		*(.trampolinedata)
 	}
 
+	/* The AP boot stacks in here are sized by MAX_CPUS (boot64.asm), so
+	   this section grows with the CPU cap. It lives in low memory, which
+	   the kernel shares with the BIOS data area, the EBDA and whatever
+	   GRUB puts below 640K -- fail the build rather than discover the
+	   overlap as a boot-time corruption. At 64 CPUs it ends at 0x55000. */
+	ASSERT(. <= 0x80000, "trampolinedata (AP boot stacks) runs into the top of low memory")
+
 	. = 0xFFFF800001000000;
 	KernelStart = .;
 

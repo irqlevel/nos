@@ -58,7 +58,13 @@ void CleanDcacheLine(const void* p)
 
 extern "C" char SecondaryEntry[];
 extern "C" ulong Arm64ApTtbr1;
-extern "C" ulong Arm64ApStackTop[8];
+extern "C" ulong Arm64ApStackTop[64];
+/* sizeof arithmetic rather than Stdlib::ArraySize: that helper is not
+   constexpr, so it cannot be used in a static_assert. */
+static_assert(sizeof(Arm64ApStackTop) / sizeof(Arm64ApStackTop[0]) == MaxCpus,
+    "Arm64ApStackTop (boot.S) must hold one entry per CPU");
+static_assert(Board::MaxBoardCpus <= MaxCpus,
+    "the FDT CPU table must not outgrow the kernel's CPU cap");
 
 bool CpuTable::StartAll()
 {
@@ -98,9 +104,24 @@ bool CpuTable::StartAll()
         }
     }
 
-    /* Poll for APs to finish startup, up to 500ms (mirrors x86) */
-    static const ulong ApTimeoutMs = 500;
+    /* Poll for the APs to finish startup (mirrors x86): the budget scales
+       with the number of them, because each one contends with the others on
+       the dmesg lock and the heap on its way up. */
+    static const ulong ApTimeoutBaseMs = 500;
+    static const ulong ApTimeoutPerCpuMs = 250;
     static const ulong ApPollIntervalMs = 10;
+
+    ulong apCount = 0;
+    {
+        Stdlib::AutoLock lock(Lock);
+        for (ulong index = 0; index < Stdlib::ArraySize(CpuArray); index++)
+        {
+            if (index != GetBspIndexLockHeld() &&
+                (CpuArray[index].GetState() & Cpu::StateInited))
+                apCount++;
+        }
+    }
+    const ulong ApTimeoutMs = ApTimeoutBaseMs + ApTimeoutPerCpuMs * apCount;
 
     for (ulong waited = 0; waited < ApTimeoutMs; waited += ApPollIntervalMs)
     {

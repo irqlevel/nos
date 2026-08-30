@@ -4,7 +4,12 @@ extern ApMain
 global Start32
 global ApStart16
 
-%define MAX_CPUS 8
+; Must equal Kernel::MaxCpus (kernel/cpu.h). Each CPU gets one CPU_STACK_SIZE
+; page of .trampolinedata to run on between the SIPI and the switch to its
+; real stack in kernel/main.cpp, so this directly sizes a low-memory
+; reservation: 64 CPUs put the end of .trampolinedata at 0x55000. The linker
+; script asserts it stays clear of the top of low memory.
+%define MAX_CPUS 64
 %define CPU_STACK_SIZE 4096
 
 section .trampolinedata nobits

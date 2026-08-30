@@ -51,7 +51,7 @@ public:
 
     /* Must equal MaxCpus (static_assert in gdt.cpp); gdt.h cannot include
        cpu.h without an include cycle. */
-    static const ulong TssMaxCpus = 8;
+    static const ulong TssMaxCpus = 64;
 
 private:
     Gdt();
