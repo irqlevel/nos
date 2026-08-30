@@ -237,16 +237,34 @@ void ApMain2()
 {
     AtomicReadAndInc(&ApStartedFlag); /* 2: entered ApMain2 */
 
-    Hal::EnableWxSupport(); /* honor NX before loading the W^X page table */
-    /* Same PAT as the BSP before this CPU can touch a write-combining
-       mapping (the framebuffer console is already mapped by now). */
-    Hal::SetupMemoryTypes();
+    /* Until the CR3 below, this CPU is still on the boot page table from
+       boot64.asm, which maps exactly two windows: the low 4GiB identity and
+       the same 4GiB at KernelSpaceBase. Nothing here may touch a virtual
+       address outside them -- and the console is one. MapMmioRegion places a
+       device at physAddr + KernelSpaceBase, so a framebuffer above 4GiB (the
+       Raptor Lake iGPU aperture sits at 0x40_0000_0000) lands at a VA the
+       boot table has no L3 entry for. An AP has no IDT yet either, so that
+       page fault is a triple fault: the machine resets during StartAll with
+       nothing on the screen and nothing in any log.
+
+       Hence the order: NXE first (the W^X page table sets NX bits, which
+       fault as reserved without it), then the real page table, then the GDT
+       and IDT so a fault from here on is a panic report rather than a reset,
+       and only then anything that can print. */
+    Hal::EnableWxSupport();
     SetCr3(Mm::PageTable::GetInstance().GetRoot());
     AtomicReadAndInc(&ApStartedFlag); /* 3: page tables loaded */
 
     Gdt::GetInstance().Save();
     Idt::GetInstance().Save();
     AtomicReadAndInc(&ApStartedFlag); /* 4: GDT+IDT loaded */
+
+    /* Same PAT as the BSP before this CPU can touch a write-combining
+       mapping (the framebuffer console is already mapped by now). Its trace
+       is the first console write an AP makes, which is why it has to come
+       after the CR3 load; the only mapping the two disagree about in between
+       is the framebuffer, and nothing above touches it. */
+    Hal::SetupMemoryTypes();
 
     if (Parameters::GetInstance().IsSmpOff())
         Panic("AP cpu started while smp is off");
