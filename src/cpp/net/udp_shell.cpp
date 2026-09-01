@@ -20,11 +20,13 @@ using Net::Ntohl;
 
 /* --- UdpPrinter --- */
 
-UdpPrinter::UdpPrinter()
-    : Pos(0)
+UdpPrinter::UdpPrinter(u8* buf, ulong capacity)
+    : Buf(buf)
+    , Capacity(capacity)
+    , Pos(0)
     , Truncated(false)
 {
-    Stdlib::MemSet(Buf, 0, sizeof(Buf));
+    Stdlib::MemSet(Buf, 0, Capacity);
 }
 
 void UdpPrinter::Printf(const char *fmt, ...)
@@ -37,7 +39,7 @@ void UdpPrinter::Printf(const char *fmt, ...)
 
 void UdpPrinter::VPrintf(const char *fmt, va_list args)
 {
-    if (Pos >= BufSize)
+    if (Pos >= Capacity)
     {
         Truncated = true;
         return;
@@ -49,9 +51,9 @@ void UdpPrinter::VPrintf(const char *fmt, va_list args)
         return;
 
     ulong len = (ulong)n;
-    if (Pos + len > BufSize)
+    if (Pos + len > Capacity)
     {
-        len = BufSize - Pos;
+        len = Capacity - Pos;
         Truncated = true;
     }
 
@@ -64,16 +66,16 @@ void UdpPrinter::PrintString(const char *s)
     if (s == nullptr)
         return;
 
-    if (Pos >= BufSize)
+    if (Pos >= Capacity)
     {
         Truncated = true;
         return;
     }
 
     ulong len = Stdlib::StrLen(s);
-    if (Pos + len > BufSize)
+    if (Pos + len > Capacity)
     {
-        len = BufSize - Pos;
+        len = Capacity - Pos;
         Truncated = true;
     }
 
@@ -93,12 +95,14 @@ void UdpPrinter::Finish()
 
     static const char marker[] = "\n[output truncated]\n";
     static const ulong markerLen = sizeof(marker) - 1;
-    static_assert(markerLen < BufSize, "Marker does not fit");
+
+    if (Capacity < markerLen)
+        return;
 
     /* There is by definition no room left to append it, so it goes over the
        tail of what did fit. */
-    Stdlib::MemCpy(Buf + BufSize - markerLen, marker, markerLen);
-    Pos = BufSize;
+    Stdlib::MemCpy(Buf + Capacity - markerLen, marker, markerLen);
+    Pos = Capacity;
 }
 
 /* --- UdpShell --- */
@@ -111,6 +115,7 @@ UdpShell::UdpShell()
     , RxBufReady(false)
     , SenderPort(0)
     , RxSeqNo(0)
+    , ReplyBuf(nullptr)
 {
 }
 
@@ -128,14 +133,27 @@ bool UdpShell::Start(NetDevice* dev, u16 port)
     Port = port;
     RxBufReady = false;
 
+    ReplyBuf = (u8*)Mm::Alloc(ReplyBufSize, Tag);
+    if (ReplyBuf == nullptr)
+    {
+        Trace(0, "UdpShell: no memory for the %u byte reply buffer", ReplyBufSize);
+        return false;
+    }
+
     TaskPtr = Mm::TAlloc<Task, Tag>("udpsh");
     if (!TaskPtr)
+    {
+        Mm::Free(ReplyBuf);
+        ReplyBuf = nullptr;
         return false;
+    }
 
     if (!TaskPtr->Start(&UdpShell::TaskFunc, this))
     {
         TaskPtr->Put();
         TaskPtr = nullptr;
+        Mm::Free(ReplyBuf);
+        ReplyBuf = nullptr;
         return false;
     }
 
@@ -150,6 +168,8 @@ bool UdpShell::Start(NetDevice* dev, u16 port)
         TaskPtr->Wait();
         TaskPtr->Put();
         TaskPtr = nullptr;
+        Mm::Free(ReplyBuf);
+        ReplyBuf = nullptr;
         Dev = nullptr;
         Port = 0;
         return false;
@@ -171,6 +191,12 @@ void UdpShell::Stop()
         TaskPtr->Wait();
         TaskPtr->Put();
         TaskPtr = nullptr;
+    }
+    /* After the task is joined, never before: Run() prints into it. */
+    if (ReplyBuf)
+    {
+        Mm::Free(ReplyBuf);
+        ReplyBuf = nullptr;
     }
     Dev = nullptr;
     Port = 0;
@@ -234,7 +260,7 @@ void UdpShell::Run()
             cmd, (ulong)Ntohl(senderIp.ToNetwork()), (ulong)senderPort);
 
         /* Execute command */
-        UdpPrinter printer;
+        UdpPrinter printer(ReplyBuf, ReplyBufSize);
         Cmd::Dispatch(cmd, printer);
         printer.Finish();
 
@@ -287,6 +313,13 @@ void UdpShell::Run()
             offset += chunk;
             remaining -= chunk;
             chunkIdx++;
+
+            /* Pace the burst, for the reason the netconsole drain is paced:
+               a reply is now up to twenty-odd datagrams, and the narrowest
+               queue between here and the client passes the first few of an
+               unpaced burst and silently drops the rest. */
+            if (remaining > 0)
+                Sleep(SendPaceMs * Const::NanoSecsInMs);
         }
     }
 }
