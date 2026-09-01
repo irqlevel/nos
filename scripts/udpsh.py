@@ -38,14 +38,38 @@ class UdpShellClient:
         self.sock.sendto(hdr + cmd_bytes, (self.host, self.port))
         return True
 
+    @staticmethod
+    def _emit(chunks, last_idx):
+        """Print the chunks in order, naming any that never arrived."""
+        end = (last_idx if last_idx is not None else max(chunks)) + 1
+        missing = [i for i in range(end) if i not in chunks]
+
+        for i in range(end):
+            if i in chunks:
+                print(chunks[i].decode(errors="replace"), end="")
+            else:
+                print(f"\n[chunk {i} lost]\n", end="")
+
+        if missing:
+            print(f"[{len(missing)} of {end} chunks lost: "
+                  f"{', '.join(str(i) for i in missing)}]", file=sys.stderr)
+
     def recv(self):
-        """Receive all reply chunks. Returns True on success, False on error."""
-        expect_idx = 0
+        """Receive all reply chunks. Returns True on success, False on error.
+
+        Chunks are collected by index rather than required in order: a reply
+        can be twenty-odd datagrams, and one reordered on the way across the
+        internet used to throw the whole answer away.
+        """
+        chunks = {}
+        last_idx = None
 
         while True:
             try:
                 data, _ = self.sock.recvfrom(4096)
             except socket.timeout:
+                if chunks:
+                    self._emit(chunks, last_idx)
                 print("[timeout, reconnecting]", file=sys.stderr)
                 return False
 
@@ -61,16 +85,13 @@ class UdpShellClient:
             if payload_len > len(data) - HDR_SIZE:
                 print("\n[protocol error: payload_len mismatch, reconnecting]", file=sys.stderr)
                 return False
-            if chunk_idx != expect_idx:
-                print(f"\n[protocol error: expected chunk {expect_idx}, got {chunk_idx}, reconnecting]", file=sys.stderr)
-                return False
 
-            if payload_len > 0:
-                print(data[HDR_SIZE:HDR_SIZE + payload_len].decode(errors="replace"), end="")
-
-            expect_idx += 1
-
+            chunks[chunk_idx] = data[HDR_SIZE:HDR_SIZE + payload_len]
             if flags & FLAG_LAST:
+                last_idx = chunk_idx
+
+            if last_idx is not None and len(chunks) == last_idx + 1:
+                self._emit(chunks, last_idx)
                 return True
 
     def execute(self, cmd):

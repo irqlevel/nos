@@ -14,7 +14,10 @@ namespace Kernel
 class UdpPrinter : public Stdlib::Printer
 {
 public:
-    UdpPrinter();
+    /* The buffer belongs to the caller and outlives the printer. It is not a
+       member because a reply worth reading is tens of kilobytes and the shell
+       task's whole stack is 32 KiB. */
+    UdpPrinter(u8* buf, ulong capacity);
 
     virtual void Printf(const char *fmt, ...) override;
     virtual void VPrintf(const char *fmt, va_list args) override;
@@ -31,10 +34,9 @@ public:
     ulong GetLen() const { return Pos; }
     void Reset() { Pos = 0; Truncated = false; }
 
-    static const ulong BufSize = 4096;
-
 private:
-    u8 Buf[BufSize];
+    u8* Buf;
+    ulong Capacity;
     ulong Pos;
     bool Truncated;
 };
@@ -90,6 +92,19 @@ private:
     Net::IpAddress SenderIp;
     u16 SenderPort;
     u32 RxSeqNo;
+
+    /* One reply buffer for the life of the shell, heap-allocated because it
+       is far too big for the task stack. 4 KiB used to be the whole of it,
+       and on a 20-CPU box that is not enough for `ps` (45 tasks) or `pci`
+       (a server's worth of devices) -- both arrived cut in half. */
+    static const ulong ReplyBufSize = 32 * Const::KB;
+    u8* ReplyBuf;
+
+    /* Gap between two reply datagrams. A 32 KiB reply is twenty-odd of them,
+       and a burst that size is what c2b1baa had to pace the netconsole drain
+       for: whatever is narrowest on the way to the client passes the first
+       few and drops the rest, and UDP says nothing about it. */
+    static const ulong SendPaceMs = 1;
 
     static const ulong Tag = 'UdpS';
 };
