@@ -13,6 +13,7 @@ namespace Mm
 {
 
 BuiltinPageTable::BuiltinPageTable()
+    : MappedLimit(0)
 {
     Stdlib::MemSet(&P4Page, 0, sizeof(P4Page));
 
@@ -47,6 +48,11 @@ ulong BuiltinPageTable::GetRoot()
     return VirtToPhys((ulong)&P4Page);
 }
 
+ulong BuiltinPageTable::GetMappedLimit()
+{
+    return MappedLimit;
+}
+
 BuiltinPageTable::~BuiltinPageTable()
 {
 }
@@ -75,7 +81,17 @@ PageTable::~PageTable()
 bool PageTable::GetFreePages()
 {
     auto& mmap = MemoryMap::GetInstance();
-    const ulong BuiltinMapLimit = 4UL * Const::GB;
+
+    /* Free-listing a page means writing a next-pointer into it, so the list
+       can only hold what the bootstrap linear map reaches. RAM above that
+       is real, reported by the firmware, and unusable to us. */
+    const ulong BuiltinMapLimit = BuiltinPageTable::GetInstance().GetMappedLimit();
+    BugOn(BuiltinMapLimit == 0);
+
+    /* Progress every so many pages, so a scan that dies part way through
+       says where. Only visible at PageAllocatorLL: at level 0 this is a
+       screenful of nothing at the head of every boot log. */
+    const ulong PageScanTraceInterval = 100000;
 
     for (size_t i = 0; i < mmap.GetRegionCount(); i++)
     {
@@ -102,16 +118,15 @@ bool PageTable::GetFreePages()
         if (memEnd > BuiltinMapLimit)
             memEnd = BuiltinMapLimit;
 
-        Trace(0, "Phy memStart 0x%p memEnd 0x%p", memStart, memEnd);
+        Trace(PageAllocatorLL, "Phy memStart 0x%p memEnd 0x%p", memStart, memEnd);
 
         if (memStart >= memEnd)
             continue;
 
-        Trace(0, "GetFreePages: entering inner loop memStart 0x%p memEnd 0x%p", memStart, memEnd);
         for (ulong address = memStart; address < memEnd; address+= Const::PageSize)
         {
-            if (address == memStart || (TotalPagesCount % 100000) == 0)
-                Trace(0, "GetFreePages: addr 0x%p total %u", address, TotalPagesCount);
+            if (address == memStart || (TotalPagesCount % PageScanTraceInterval) == 0)
+                Trace(PageAllocatorLL, "GetFreePages: addr 0x%p total %u", address, TotalPagesCount);
             TotalPagesCount++;
 
             if (BuiltinPageTable::GetInstance().PhysToVirt(address) >= mmap.GetKernelStart()
@@ -135,10 +150,26 @@ bool PageTable::GetFreePages()
                 *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = next;
             }
         }
-        Trace(0, "GetFreePages: inner loop done, total %u", TotalPagesCount);
+        Trace(PageAllocatorLL, "GetFreePages: inner loop done, total %u", TotalPagesCount);
     }
 
-    Trace(0, "GetFreePages done, HighestPhyAddr 0x%p TotalPages %u", HighestPhyAddr, TotalPagesCount);
+    Trace(PageAllocatorLL, "GetFreePages done, HighestPhyAddr 0x%p TotalPages %u",
+        HighestPhyAddr, TotalPagesCount);
+
+    /* Say plainly how much of the machine's RAM the kernel actually took.
+       The per-region traces above print the clamped end, so a box with more
+       memory than the bootstrap map covers looked, in the log, exactly like
+       a box with 4GiB in it. */
+    ulong usable = mmap.GetUsableRamBytes();
+    ulong unreachable = mmap.GetUsableRamBytesAbove(BuiltinMapLimit);
+
+    Trace(0, "mm: %u MiB usable RAM reported, %u MiB reachable (%u pages)",
+        usable / Const::MB, (TotalPagesCount * Const::PageSize) / Const::MB,
+        TotalPagesCount);
+
+    if (unreachable != 0)
+        Trace(0, "mm: %u MiB of it is above the bootstrap map at 0x%p and is not used",
+            unreachable / Const::MB, BuiltinMapLimit);
 
     return true;
 }

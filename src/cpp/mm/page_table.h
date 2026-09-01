@@ -61,6 +61,13 @@ public:
 
     ulong GetRoot();
 
+    /* One past the highest physical address the bootstrap linear map
+       reaches. Setup() sets it; it is the hard ceiling on what
+       PageTable::GetFreePages can put on the free list, because building
+       that list threads a next-pointer through the free pages themselves,
+       which means writing to every one of them through this map. */
+    ulong GetMappedLimit();
+
 private:
     BuiltinPageTable(const BuiltinPageTable& other) = delete;
     BuiltinPageTable(BuiltinPageTable&& other) = delete;
@@ -74,6 +81,8 @@ private:
     PtePage P3UserPage __attribute__((aligned(Const::PageSize)));
     PtePage P2KernelPage[4] __attribute__((aligned(Const::PageSize)));
     PtePage P2UserPage[4] __attribute__((aligned(Const::PageSize)));
+
+    ulong MappedLimit;
 };
 
 class PageTable final
