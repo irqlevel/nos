@@ -391,6 +391,8 @@ extern "C" void MainArm64(void* dtb)
     if (!bpt.Setup())
         Panic("Can't setup builtin paging");
 
+    bpt.MapHighRam();
+
     Trace(0, "Builtin paging root 0x%p", bpt.GetRoot());
     Hal::SetTranslationRoot(bpt.GetRoot());
     Trace(0, "Builtin paging active");

@@ -39,6 +39,11 @@ public:
     ulong GetUsableRamEnd();
     ulong GetUsableRamBytesAbove(ulong limit);
 
+    /* True if any usable RAM falls in [start, end). The bootstrap map grows
+       in 1GiB blocks; a block with no RAM in it is left unmapped rather than
+       mapped cacheable over unbacked bus space. */
+    bool HasUsableRamIn(ulong start, ulong end);
+
     /* Name of a firmware region type, for the shell. */
     static const char* GetRegionTypeName(ulong type);
 

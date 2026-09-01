@@ -63,16 +63,26 @@ These only surface on real silicon:
   reserved regions and holes. Feed the full E820/EFI map into
   `PageAllocatorImpl::Setup()` and exclude reserved ranges. (This same
   reserved-ranges capability is later reused by Stage 5 live update.)
-  **Status: the full map is parsed and reserved ranges are excluded, but the
-  page allocator is capped at 4 GiB** — the bootstrap linear map
-  (`BuiltinPageTable::Setup`, 4 PDPT entries of 2 MiB pages) reaches no
-  further, and `GetFreePages` threads the free list through the pages
-  themselves, so it cannot list a page it cannot write to. The EX44's 64 GiB
-  runs the kernel on 4 GiB. `meminfo` and the `mm:` boot lines report the
-  gap; closing it means mapping the rest (1 GiB blocks in the same PDPT reach
-  512 GiB and cost no extra tables, gated on CPUID PDPE1GB) and paying for a
-  `PageArray` that scales with RAM at 32 bytes per 4 KiB page — 512 MiB on a
-  64 GiB box, 0.8%, which is the normal price.
+  **Status: done.** The full map is parsed, reserved ranges are excluded, and
+  `BuiltinPageTable::MapHighRam` extends the bootstrap linear map over RAM
+  above 4 GiB with one 1 GiB block per GiB — no extra tables, since the
+  kernel's PDPT (arm64: L1) already has 512 entries, which is also the
+  512 GiB ceiling. x86-64 gates on CPUID PDPE1GB and falls back to 4 GiB
+  without it; arm64 needs no feature check. Verified on 8 GiB guests on both
+  arches, and on the x86 fallback path.
+
+  **What it costs, and the next step.** Both remaining O(RAM) passes touch
+  every page: `GetFreePages` writes a next-pointer into each free page, and
+  `SetupFreePagesList` reads it back through a temp mapping. Measured on
+  arm64/HVF with 8 GiB: 0.7 s and 2.4 s, so boot goes from ~1 s to ~4 s;
+  extrapolated to 64 GiB that is tens of seconds, against a project whose
+  pitch is booting in milliseconds. Two things would remove most of it —
+  a temporary linear window for the drain instead of a per-page temp mapping
+  (one TLB invalidation per page is the bulk of the 1.15 µs), and not
+  threading the early free list through page contents at all (a bump
+  allocator over a reserved window for `Setup`'s own allocations, then
+  enumerate free pages from the memory map, which touches nothing). Both are
+  contained; neither is needed until a big machine is actually in hand.
 - **PCIe bridges:** QEMU topology is flat; real chipsets have bridges. Verify
   `pci.cpp` enumeration recurses through bridges. Consider ECAM/MMCONFIG access
   in addition to legacy CF8/CFC.

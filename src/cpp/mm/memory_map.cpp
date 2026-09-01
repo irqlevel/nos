@@ -184,6 +184,20 @@ ulong MemoryMap::GetUsableRamEnd()
     return end;
 }
 
+bool MemoryMap::HasUsableRamIn(ulong start, ulong end)
+{
+    for (size_t i = 0; i < Size; i++)
+    {
+        if (Region[i].Type != UsableRamType)
+            continue;
+
+        if (Region[i].Addr < end && (Region[i].Addr + Region[i].Len) > start)
+            return true;
+    }
+
+    return false;
+}
+
 ulong MemoryMap::GetUsableRamBytesAbove(ulong limit)
 {
     ulong total = 0;
