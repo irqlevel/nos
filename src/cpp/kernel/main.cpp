@@ -741,6 +741,11 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
+    /* Now that the firmware map is known, grow the bootstrap map over the
+       RAM above 4GiB -- Setup() ran before the Multiboot tags were parsed
+       and could not know there was any. */
+    bpt.MapHighRam();
+
     auto& pt = Mm::PageTable::GetInstance();
     if (!pt.Setup())
     {

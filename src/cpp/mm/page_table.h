@@ -68,6 +68,15 @@ public:
        which means writing to every one of them through this map. */
     ulong GetMappedLimit();
 
+    /* Extend the map over usable RAM above what Setup() could reach, and
+       raise MappedLimit to match. Best effort: on hardware that cannot do
+       it the map keeps the extent Setup() gave it, which is why there is no
+       status to return -- the two mm: lines GetFreePages prints report the
+       outcome either way. Must be called once the memory map is populated,
+       which on x86 is after the Multiboot tags are parsed and therefore
+       after Setup(). */
+    void MapHighRam();
+
 private:
     BuiltinPageTable(const BuiltinPageTable& other) = delete;
     BuiltinPageTable(BuiltinPageTable&& other) = delete;
@@ -193,7 +202,9 @@ private:
     ~PageTable();
 
     ulong GetFreePage();
-    ulong GetFreePageByTmpMap();
+
+    /* Move every page on the early physical free list onto FreePagesList. */
+    void DrainEarlyFreeList();
 
     bool SetupPage(ulong virtAddr, ulong phyAddr);
 

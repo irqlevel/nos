@@ -187,20 +187,48 @@ ulong PageTable::GetFreePage()
     return curr;
 }
 
-ulong PageTable::GetFreePageByTmpMap()
+void PageTable::DrainEarlyFreeList()
 {
-    if (FreePages == 0)
-        return 0;
+    /* The early list is threaded through the free pages themselves, so every
+       step has to read one, and there are as many of them as the machine has
+       RAM. Doing it with the general TmpMapPage/TmpUnmapPage pair costs two
+       TLB invalidations, two lock round trips and two PageArray lookups per
+       page; one slot held across the whole walk costs one of each. Safe
+       because this runs on the BSP before any AP is started. */
+    const ulong virtAddr = TmpMapStart;
+    Pte* l1Entry = &TmpMapL1Page->Entry[Pte::L1Index(virtAddr)];
 
-    ulong curr = FreePages;
-    ulong va = TmpMapPage(curr);
-    ulong next = *(ulong *)va;
-    FreePages = next;
+    BugOn(l1Entry->Present());
 
-    Stdlib::MemSet((void*)va, 0, Const::PageSize);
-    TmpUnmapPage(va);
+    while (FreePages != 0)
+    {
+        ulong phyAddr = FreePages;
 
-    return curr;
+        l1Entry->Value = 0;
+        l1Entry->SetAddress(phyAddr);
+        l1Entry->SetWritable();
+        l1Entry->SetPresent();
+        Hal::TlbFlushPage(virtAddr);
+
+        FreePages = *(ulong *)virtAddr;
+
+        /* Nothing is zeroed on the way to the list. AllocPageNoLock zeroes
+           every page it hands out and FreePageNoLock does not, so a page
+           sitting on the free list is not expected to be clean by anyone.
+           Zeroing here was a write pass over every byte of RAM the machine
+           has -- two thirds of the time this took, and all of it redone at
+           the first allocation. */
+        Page* page = GetPage(phyAddr);
+        BugOn(!page);
+        /* GetPage's +1 was only for the lookup; a page on the free list must
+           sit at refcount 1 */
+        page->Put();
+        FreePagesList.InsertHead(&page->ListEntry);
+        FreePagesCount++;
+    }
+
+    l1Entry->Value = 0;
+    Hal::TlbFlushPage(virtAddr);
 }
 
 ulong PageTable::GetL1Page(ulong virtAddr)
@@ -560,20 +588,7 @@ bool PageTable::SetupFreePagesList()
        page access goes through TmpMap). */
     for (ulong pass = 0; pass < 2; pass++)
     {
-        for (;;)
-        {
-            ulong phyAddr = GetFreePageByTmpMap();
-            if (!phyAddr)
-                break;
-
-            Page* page = GetPage(phyAddr);
-            BugOn(!page);
-            /* GetPage's +1 was only for the lookup; a page on the free
-               list must sit at refcount 1 */
-            page->Put();
-            FreePagesList.InsertHead(&page->ListEntry);
-            FreePagesCount++;
-        }
+        DrainEarlyFreeList();
 
         FreePages = ExcludedPages;
         ExcludedPages = 0;

@@ -85,6 +85,59 @@ bool BuiltinPageTable::Setup()
     return true;
 }
 
+void BuiltinPageTable::MapHighRam()
+{
+    /* The first 4GiB is what Setup()'s four L2 tables cover. Past that one
+       L1 block per GiB is enough, and with a 4KiB granule an L1 block
+       descriptor is architectural -- no feature bit to test, unlike x86. */
+    static const ulong LowMapLimit = 4 * Const::GB;
+    static const ulong BlockSize = Const::GB;
+
+    const ulong TopLimit = Stdlib::ArraySize(P3KernelPage.Entry) * BlockSize;
+
+    BugOn(MappedLimit != LowMapLimit);
+
+    auto& mmap = MemoryMap::GetInstance();
+    ulong ramEnd = mmap.GetUsableRamEnd();
+    if (ramEnd <= LowMapLimit)
+        return;
+
+    if (ramEnd > TopLimit)
+    {
+        Trace(0, "mm: usable RAM ends at 0x%p, past what one L1 table covers",
+            ramEnd);
+        ramEnd = TopLimit;
+    }
+
+    ulong blocks = 0;
+    for (ulong block = LowMapLimit; block < ramEnd; block += BlockSize)
+    {
+        /* Normal-cacheable over a GiB with no RAM in it would license
+           speculative reads of unbacked bus space -- the same reason Setup()
+           leaves the space past ramEnd alone. */
+        if (!mmap.HasUsableRamIn(block, block + BlockSize))
+            continue;
+
+        auto& l1Entry = P3KernelPage.Entry[block / BlockSize];
+        BugOn(l1Entry.Present());
+
+        l1Entry.SetAddress(block);
+        l1Entry.SetWritable();
+        l1Entry.SetHuge();
+        l1Entry.SetPresent();
+        Hal::TlbFlushPage(PhysToVirt(block));
+
+        blocks++;
+    }
+
+    if (blocks == 0)
+        return;
+
+    MappedLimit = ramEnd;
+    Trace(0, "mm: bootstrap map extended to 0x%p with %u 1GiB blocks",
+        MappedLimit, blocks);
+}
+
 /* Install one 1GiB Device-nGnRE L1 block covering phys [0, ramBase-ish)
    into the freshly built real page table, so PL011/GIC/virtio survive the
    builtin->real root switch (x86 has no such need: its console is port
