@@ -22,6 +22,7 @@ using Net::Ntohl;
 
 UdpPrinter::UdpPrinter()
     : Pos(0)
+    , Truncated(false)
 {
     Stdlib::MemSet(Buf, 0, sizeof(Buf));
 }
@@ -37,7 +38,10 @@ void UdpPrinter::Printf(const char *fmt, ...)
 void UdpPrinter::VPrintf(const char *fmt, va_list args)
 {
     if (Pos >= BufSize)
+    {
+        Truncated = true;
         return;
+    }
 
     char tmp[256];
     int n = Stdlib::VsnPrintf(tmp, sizeof(tmp), fmt, args);
@@ -46,7 +50,10 @@ void UdpPrinter::VPrintf(const char *fmt, va_list args)
 
     ulong len = (ulong)n;
     if (Pos + len > BufSize)
+    {
         len = BufSize - Pos;
+        Truncated = true;
+    }
 
     Stdlib::MemCpy(Buf + Pos, tmp, len);
     Pos += len;
@@ -54,12 +61,21 @@ void UdpPrinter::VPrintf(const char *fmt, va_list args)
 
 void UdpPrinter::PrintString(const char *s)
 {
-    if (s == nullptr || Pos >= BufSize)
+    if (s == nullptr)
         return;
+
+    if (Pos >= BufSize)
+    {
+        Truncated = true;
+        return;
+    }
 
     ulong len = Stdlib::StrLen(s);
     if (Pos + len > BufSize)
+    {
         len = BufSize - Pos;
+        Truncated = true;
+    }
 
     Stdlib::MemCpy(Buf + Pos, s, len);
     Pos += len;
@@ -68,6 +84,21 @@ void UdpPrinter::PrintString(const char *s)
 void UdpPrinter::Backspace()
 {
     /* no-op for UDP */
+}
+
+void UdpPrinter::Finish()
+{
+    if (!Truncated)
+        return;
+
+    static const char marker[] = "\n[output truncated]\n";
+    static const ulong markerLen = sizeof(marker) - 1;
+    static_assert(markerLen < BufSize, "Marker does not fit");
+
+    /* There is by definition no room left to append it, so it goes over the
+       tail of what did fit. */
+    Stdlib::MemCpy(Buf + BufSize - markerLen, marker, markerLen);
+    Pos = BufSize;
 }
 
 /* --- UdpShell --- */
@@ -205,6 +236,7 @@ void UdpShell::Run()
         /* Execute command */
         UdpPrinter printer;
         Cmd::Dispatch(cmd, printer);
+        printer.Finish();
 
         /* Send reply in chunks with protocol header */
         const u8* data = printer.GetData();

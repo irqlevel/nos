@@ -20,9 +20,9 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
 - **Filesystem** — VFS layer with mount points and path resolution, ramfs (in-memory), nanofs (on-disk filesystem with 4 KB blocks, superblock with UUID, inode/data bitmaps, CRC32 checksums for superblock/inodes/data, file and recursive directory deletion, persistent across remount)
 - **Entropy** — `EntropySource` interface, `EntropySourceTable` registry, virtio-rng hardware random number generator
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `cpu`, `bt <pid>`, `dmesg [filter]`, `uptime`, `date`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `irqstat`, `net`, `arp`, `icmpstat`, `tcpstat`, `udpsend`, `ping`, `nslookup`, `dnsflush`, `dhcp`, `wget`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `panic`, `version`, `cls`, `help`, `poweroff`, `reboot`
+- **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `cpu`, `bt <pid>`, `dmesg [lines] [filter]`, `loglevel [N]`, `uptime`, `date`, `memusage`, `pci`, `disks`, `diskread`, `diskwrite`, `irqstat`, `net`, `arp`, `icmpstat`, `tcpstat`, `udpsend`, `ping`, `nslookup`, `dnsflush`, `dhcp`, `wget`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `panic`, `version`, `cls`, `help`, `poweroff`, `reboot`
 - **Timekeeping** — TSC calibration via PIT channel 2 (multi-round median), KVM paravirt clock (`kvmclock`) for accurate VM time, RTC wall clock, layered clock source selection (kvmclock → calibrated TSC → PIT fallback), `GetBootTime()` / `GetWallTimeSecs()` API
-- **Kernel infrastructure** — spinlocks, mutexes, SeqLock (single-writer/multi-reader), atomics, wait groups, SoftIrq deferred processing, IPI tasks, timers, watchdog, stack traces with symbol resolution, dmesg ring buffer (512 KB, 2048 messages), panic handler with backtrace and CPU/task context, per-device interrupt statistics, AP startup diagnostics, virtual-to-physical address translation (4-level page table walk), byte-order helpers (`Htons`/`Htonl`/`Ntohs`/`Ntohl`)
+- **Kernel infrastructure** — spinlocks, mutexes, SeqLock (single-writer/multi-reader), atomics, wait groups, SoftIrq deferred processing, IPI tasks, timers, watchdog, stack traces with symbol resolution, dmesg ring buffer (512 KB, 2048 messages, recycled lines counted and reported), panic handler with backtrace and CPU/task context, per-device interrupt statistics, AP startup diagnostics, virtual-to-physical address translation (4-level page table walk), byte-order helpers (`Htons`/`Htonl`/`Ntohs`/`Ntohl`)
 - **Optimized stdlib** — `MemSet`, `MemCpy`, `MemCmp`, `StrLen`, `StrCmp`, `StrStr` implemented in x86-64 assembly using `rep stosq`/`rep movsq`/`repe cmpsb`/`repne scasb` (portable C versions on arm64)
 - **Rust support** — `#![no_std]` Rust crates linked into the kernel via `staticlib`, FFI bridge (`rust_ffi.cpp`) exposing kernel services to Rust: spinlocks, mutexes, wait groups, timers, SoftIRQ, MSI-X interrupts, legacy interrupts, DMA allocation, MMIO mapping, PCI config space, block device and network device registration, CPU/IPI/task APIs. **kcore** library provides safe Rust wrappers around kernel primitives. **NVMe driver** written entirely in Rust — PCI BAR mapping, admin + I/O queue pairs, MSI-X interrupt-driven completion, WaitGroup-based synchronous I/O, multi-device support, proper RAII cleanup on shutdown
 - **Boot tests** — allocator, btree, ring buffer, stack trace, multitasking, contiguous page alloc (up to 128 pages), parsing helpers, block device table, memset, memcpy, memcmp, strlen, strcmp, strstr
@@ -271,6 +271,16 @@ python3 scripts/udpsh.py <vm-ip> [port] [timeout]
 - Default port is `9000`, default timeout is `30` seconds (long enough for blocking commands like `ping`).
 - On protocol errors or timeouts, the client reconnects automatically and resets state.
 - All shell commands work over the UDP session (including blocking ones like `ping`).
+- A reply is assembled in a 4 KB buffer -- about forty lines -- and whatever
+  does not fit is dropped and marked `[output truncated]`. This is why `dmesg`
+  takes a line count: the log holds 2048 messages and a dump from its head
+  returns the first minute of boot and nothing since, so on a machine that has
+  been up a while `dmesg 40` is the useful form. The same reasoning as
+  `nctail=N` for the netconsole backlog -- what you want is the end.
+- `loglevel N` raises the trace level on the running kernel, which is the only
+  way to see a subsystem whose level constant is above the default 1 (`UsbLL`
+  and `KbdLL` are 3, the allocators and MMIO are 4) without a rebuild and a
+  reflash. It is loud: level 4 traces every allocation.
 - **Warning:** the UDP shell has no authentication — anyone who can reach the port has full kernel shell access. Use only for testing or behind a firewall.
 
 #### Netconsole
@@ -333,7 +343,8 @@ it on a network you trust.
 |---------|-------------|
 | `cls` | Clear screen |
 | `cpu` | Dump CPU state |
-| `dmesg [filter]` | Dump kernel log (optional substring filter) |
+| `dmesg [lines] [filter]` | Dump kernel log: newest `lines` messages (all of it if omitted), optional substring filter |
+| `loglevel [N]` | Show or set the trace level (0-5) on a running kernel |
 | `uptime` | Show uptime |
 | `date` | Show wall clock date and time (RTC + boot time) |
 | `ps` | Show tasks |
