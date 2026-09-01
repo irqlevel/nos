@@ -38,7 +38,7 @@ bool MemoryMap::FindRegion(ulong base, ulong limit, ulong& start, ulong& end)
     for (size_t i = 0; i < Size; i++)
     {
         auto& region = Region[i];
-        if (region.Type != 1)
+        if (region.Type != UsableRamType)
             continue;
 
         if (region.Len == 0)
@@ -92,7 +92,7 @@ bool MemoryMap::IsReserved(ulong phyAddr, ulong len)
     for (size_t i = 0; i < Size; i++)
     {
         auto& region = Region[i];
-        if (region.Type == 1)
+        if (region.Type == UsableRamType)
             continue;
 
         if (phyAddr < (region.Addr + region.Len) &&
@@ -108,7 +108,7 @@ bool MemoryMap::IsUsableRam(ulong phyAddr)
     for (size_t i = 0; i < Size; i++)
     {
         auto& region = Region[i];
-        if (region.Type != 1)
+        if (region.Type != UsableRamType)
             continue;
 
         if (phyAddr >= region.Addr && phyAddr < (region.Addr + region.Len))
@@ -133,6 +133,74 @@ bool MemoryMap::GetRegion(size_t index, ulong& addr, ulong& len, ulong& type)
     len = region.Len;
     type = region.Type;
     return true;
+}
+
+const char* MemoryMap::GetRegionTypeName(ulong type)
+{
+    /* e820 / EFI-derived types as Multiboot2 and the FDT parser hand them
+       over; anything else is firmware being creative and is treated as
+       reserved either way. */
+    static const ulong ReservedType = 2;
+    static const ulong AcpiReclaimableType = 3;
+    static const ulong AcpiNvsType = 4;
+    static const ulong BadRamType = 5;
+
+    switch (type)
+    {
+    case UsableRamType:        return "usable";
+    case ReservedType:         return "reserved";
+    case AcpiReclaimableType:  return "acpi-reclaim";
+    case AcpiNvsType:          return "acpi-nvs";
+    case BadRamType:           return "bad";
+    default:                   return "unknown";
+    }
+}
+
+ulong MemoryMap::GetUsableRamBytes()
+{
+    ulong total = 0;
+    for (size_t i = 0; i < Size; i++)
+    {
+        if (Region[i].Type == UsableRamType)
+            total += Region[i].Len;
+    }
+
+    return total;
+}
+
+ulong MemoryMap::GetUsableRamEnd()
+{
+    ulong end = 0;
+    for (size_t i = 0; i < Size; i++)
+    {
+        if (Region[i].Type != UsableRamType)
+            continue;
+
+        ulong regionEnd = Region[i].Addr + Region[i].Len;
+        if (regionEnd > end)
+            end = regionEnd;
+    }
+
+    return end;
+}
+
+ulong MemoryMap::GetUsableRamBytesAbove(ulong limit)
+{
+    ulong total = 0;
+    for (size_t i = 0; i < Size; i++)
+    {
+        if (Region[i].Type != UsableRamType)
+            continue;
+
+        ulong end = Region[i].Addr + Region[i].Len;
+        if (end <= limit)
+            continue;
+
+        ulong start = (Region[i].Addr < limit) ? limit : Region[i].Addr;
+        total += end - start;
+    }
+
+    return total;
 }
 
 }

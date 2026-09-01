@@ -63,6 +63,16 @@ These only surface on real silicon:
   reserved regions and holes. Feed the full E820/EFI map into
   `PageAllocatorImpl::Setup()` and exclude reserved ranges. (This same
   reserved-ranges capability is later reused by Stage 5 live update.)
+  **Status: the full map is parsed and reserved ranges are excluded, but the
+  page allocator is capped at 4 GiB** — the bootstrap linear map
+  (`BuiltinPageTable::Setup`, 4 PDPT entries of 2 MiB pages) reaches no
+  further, and `GetFreePages` threads the free list through the pages
+  themselves, so it cannot list a page it cannot write to. The EX44's 64 GiB
+  runs the kernel on 4 GiB. `meminfo` and the `mm:` boot lines report the
+  gap; closing it means mapping the rest (1 GiB blocks in the same PDPT reach
+  512 GiB and cost no extra tables, gated on CPUID PDPE1GB) and paying for a
+  `PageArray` that scales with RAM at 32 bytes per 4 KiB page — 512 MiB on a
+  64 GiB box, 0.8%, which is the normal price.
 - **PCIe bridges:** QEMU topology is flat; real chipsets have bridges. Verify
   `pci.cpp` enumeration recurses through bridges. Consider ECAM/MMCONFIG access
   in addition to legacy CF8/CFC.

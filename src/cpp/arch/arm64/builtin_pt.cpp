@@ -77,6 +77,11 @@ bool BuiltinPageTable::Setup()
         }
     }
 
+    /* Four L1 entries of 512 2MiB blocks: 4GiB of physical space, whatever
+       part of it is RAM. The ceiling on what the page allocator can take
+       (see GetMappedLimit). */
+    MappedLimit = 4 * Const::GB;
+
     return true;
 }
 

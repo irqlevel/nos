@@ -36,6 +36,7 @@
 #endif
 #include <include/const.h>
 #include <mm/page_table.h>
+#include <mm/memory_map.h>
 #include <mm/new.h>
 #include <lib/unique_ptr.h>
 
@@ -228,6 +229,43 @@ static void CmdMemusage(const char* args, Stdlib::Printer& con)
 
     con.Printf("freePages: %u\n", pt.GetFreePagesCount());
     con.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
+}
+
+static void CmdMeminfo(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    auto& mmap = Mm::MemoryMap::GetInstance();
+    auto& pt = Mm::PageTable::GetInstance();
+
+    ulong usableRegions = 0;
+    for (size_t i = 0; i < mmap.GetRegionCount(); i++)
+    {
+        ulong addr, len, type;
+        if (!mmap.GetRegion(i, addr, len, type))
+            break;
+
+        con.Printf("0x%p 0x%p %s\n", addr, len,
+            Mm::MemoryMap::GetRegionTypeName(type));
+
+        if (type == Mm::MemoryMap::UsableRamType)
+            usableRegions++;
+    }
+
+    /* The interesting number on a big machine is the third one: the kernel
+       can only free-list RAM the bootstrap linear map reaches, and until
+       that map grows, everything above it is memory the box has and the
+       kernel does not know how to touch. */
+    ulong mapLimit = Mm::BuiltinPageTable::GetInstance().GetMappedLimit();
+    ulong usable = mmap.GetUsableRamBytes();
+    ulong unused = mmap.GetUsableRamBytesAbove(mapLimit);
+
+    con.Printf("usable: %u MiB in %u regions\n", usable / Const::MB, usableRegions);
+    con.Printf("mapped: %u MiB, bootstrap map ends at 0x%p\n",
+        (usable - unused) / Const::MB, mapLimit);
+    if (unused != 0)
+        con.Printf("unused: %u MiB above the bootstrap map\n", unused / Const::MB);
+    con.Printf("pages: %u free of %u\n",
+        pt.GetFreePagesCount(), pt.GetTotalPagesCount());
 }
 
 static void CmdIrqstat(const char* args, Stdlib::Printer& con)
@@ -1328,6 +1366,7 @@ static const CmdEntry Commands[] = {
     { "ps",        CmdPs,        "ps - show tasks" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },
+    { "meminfo",   CmdMeminfo,   "meminfo - show the firmware memory map and what of it is used" },
     { "irqstat",   CmdIrqstat,   "irqstat - show interrupt statistics" },
     { "pci",       CmdPci,       "pci - show pci devices" },
     { "usb",       CmdUsb,       "usb - show usb controllers and ports" },

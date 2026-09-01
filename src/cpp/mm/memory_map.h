@@ -31,6 +31,17 @@ public:
 
     bool GetRegion(size_t index, ulong& addr, ulong& len, ulong& type);
 
+    /* Usable (type 1) RAM the firmware reported: all of it, the end of the
+       highest such region, and how much of it lies at or above limit. The
+       kernel can only free-list what the bootstrap linear map reaches, so
+       the last one is the RAM the machine has and does not use. */
+    ulong GetUsableRamBytes();
+    ulong GetUsableRamEnd();
+    ulong GetUsableRamBytesAbove(ulong limit);
+
+    /* Name of a firmware region type, for the shell. */
+    static const char* GetRegionTypeName(ulong type);
+
     /* True if the physical page containing phyAddr lies in a usable RAM
        (e820 type 1) region. Used to pick cacheability for mappings:
        usable RAM is mapped write-back, everything else (MMIO, reserved,
@@ -41,6 +52,10 @@ public:
        region — e.g. the DTB carve-out on arm64. The free-page scan must
        skip such pages even when a usable-RAM region covers them. */
     bool IsReserved(ulong phyAddr, ulong len);
+
+    /* e820/EFI region type for ordinary usable RAM; everything else is
+       MMIO, firmware-reserved or ACPI. */
+    static const ulong UsableRamType = 1;
 
     static const ulong KernelSpaceBase = 0xFFFF800000000000;
 

@@ -20,6 +20,11 @@ bool BuiltinPageTable::Setup()
        (LAPIC, IOAPIC, PCI) uncached on real hardware. Setting PCD here
        would run the entire kernel uncached on bare metal. */
 
+    /* Four PDPT entries, each a page directory of 512 2MiB pages: 4GiB.
+       That is the whole extent of the bootstrap map, and therefore the
+       ceiling on the RAM the page allocator can take (see GetMappedLimit). */
+    static const ulong KernelMapSize = 4 * Const::GB;
+
     //Map first 4GB of kernel address space
     auto& p4Entry = P4Page.Entry[256];
 
@@ -50,6 +55,8 @@ bool BuiltinPageTable::Setup()
             addr += (2 * Const::MB);
         }
     }
+
+    MappedLimit = KernelMapSize;
 
     //Map first 4GB of user address space
 
