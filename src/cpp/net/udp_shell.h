@@ -21,15 +21,22 @@ public:
     virtual void PrintString(const char *s) override;
     virtual void Backspace() override;
 
+    /* Stamp the truncation marker if anything was dropped. Call once, after
+       the command has finished printing and before the reply goes out: a
+       silently short reply reads as a command that produced nothing more,
+       which is how a truncated dmesg passes for a complete one. */
+    void Finish();
+
     const u8* GetData() const { return Buf; }
     ulong GetLen() const { return Pos; }
-    void Reset() { Pos = 0; }
+    void Reset() { Pos = 0; Truncated = false; }
 
     static const ulong BufSize = 4096;
 
 private:
     u8 Buf[BufSize];
     ulong Pos;
+    bool Truncated;
 };
 
 struct UdpShellHdr

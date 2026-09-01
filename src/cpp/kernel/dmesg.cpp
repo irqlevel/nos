@@ -6,6 +6,7 @@ namespace Kernel
 
 Dmesg::Dmesg()
     : Active(false)
+    , Lost(0)
 {
 }
 
@@ -19,6 +20,7 @@ bool Dmesg::Setup()
     if (Active)
         return false;
 
+    Lost = 0;
     Active = MsgBuf.Setup((ulong)&Buf[0], (ulong)&Buf[0] + sizeof(Buf), sizeof(DmesgMsg));
     return Active;
 }
@@ -39,13 +41,18 @@ void Dmesg::VPrintf(const char *fmt, va_list args)
     if (!Active)
         return;
 
+    ulong retries = 0;
+
 restart:
     DmesgMsg* msg = (DmesgMsg*)MsgBuf.Alloc();
     if (msg == nullptr)
     {
         Stdlib::AutoLock lock(Lock);
         if (MsgList.IsEmpty())
+        {
+            Lost++;
             return;
+        }
 
         for (auto listEntry = MsgList.Flink; listEntry != &MsgList; listEntry = listEntry->Flink)
         {
@@ -60,8 +67,18 @@ restart:
 
         if (msg == nullptr)
         {
-            goto restart;
+            /* Nothing free and nothing recyclable: every message in the list
+               is pinned by a walk. Retrying bets on a walk stepping on within
+               the next few instructions -- past that this is a spin in the
+               trace path, and a CPU stuck printing is worse than a lost line. */
+            if (++retries < MaxRecycleRetries)
+                goto restart;
+
+            Lost++;
+            return;
         }
+
+        Lost++;
     }
     else
     {
@@ -122,11 +139,98 @@ DmesgMsg* Dmesg::Next(DmesgMsg* current)
     return next;
 }
 
-void Dmesg::Dump(Stdlib::Printer& printer)
+DmesgMsg* Dmesg::Prev(DmesgMsg* current)
 {
-    for (DmesgMsg* msg = Next(nullptr); msg != nullptr; msg = Next(msg))
+    BugOn(current != nullptr && current->Usage.Get() == 0);
+
+    Stdlib::AutoLock lock(Lock);
+
+    Stdlib::ListEntry* prevListEntry;
+    if (current == nullptr)
     {
-        printer.PrintString(msg->Str);
+        prevListEntry = MsgList.Blink;
+    }
+    else
+    {
+        prevListEntry = current->ListEntry.Blink;
+        BugOn(current->Usage.Get() <= 0);
+        current->Usage.Dec();
+    }
+
+    if (prevListEntry == &MsgList)
+    {
+        return nullptr;
+    }
+
+    DmesgMsg* prev = CONTAINING_RECORD(prevListEntry, DmesgMsg, ListEntry);
+    prev->Usage.Inc();
+    return prev;
+}
+
+void Dmesg::Release(DmesgMsg* msg)
+{
+    if (msg == nullptr)
+        return;
+
+    Stdlib::AutoLock lock(Lock);
+    BugOn(msg->Usage.Get() <= 0);
+    msg->Usage.Dec();
+}
+
+ulong Dmesg::GetLost()
+{
+    Stdlib::AutoLock lock(Lock);
+    return Lost;
+}
+
+DmesgMsg* Dmesg::TailStart(ulong lastLines)
+{
+    DmesgMsg* msg = Prev(nullptr);
+
+    for (ulong i = 1; msg != nullptr && i < lastLines; i++)
+    {
+        DmesgMsg* prev = Prev(msg);
+        if (prev == nullptr)
+        {
+            /* The log is shorter than the walk asked for. Prev() released the
+               pin on its way off the head, so start over from the head rather
+               than try to resurrect it. */
+            return Next(nullptr);
+        }
+
+        msg = prev;
+    }
+
+    return msg;
+}
+
+void Dmesg::Dump(Stdlib::Printer& printer, ulong lastLines, const char* filter)
+{
+    if (lastLines > MaxMsgs)
+        lastLines = MaxMsgs;
+
+    /* A walk longer than the list can be is following a tail another CPU keeps
+       extending, so it would never return. Bound both flavours. */
+    const ulong limit = (lastLines != 0) ? lastLines : MaxMsgs;
+
+    ulong lost = GetLost();
+    if (lost != 0)
+        printer.Printf("dmesg: %u earlier lines lost\n", lost);
+
+    DmesgMsg* msg = (lastLines != 0) ? TailStart(lastLines) : Next(nullptr);
+
+    for (ulong visited = 0; msg != nullptr; visited++)
+    {
+        if (filter == nullptr || Stdlib::StrStr(msg->Str, filter) != nullptr)
+            printer.PrintString(msg->Str);
+
+        if (visited + 1 == limit)
+        {
+            Release(msg);
+            break;
+        }
+
+        msg = Next(msg);
     }
 }
 

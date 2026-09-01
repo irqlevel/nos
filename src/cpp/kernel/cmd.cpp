@@ -85,24 +85,63 @@ static void CmdCpu(const char* args, Stdlib::Printer& con)
 static void CmdDmesg(const char* args, Stdlib::Printer& con)
 {
     const char* end;
-    const char* filterStart = Stdlib::NextToken(args, end);
+    const char* tok = Stdlib::NextToken(args, end);
 
-    if (!filterStart)
+    char filter[64];
+    filter[0] = '\0';
+    if (tok)
+        Stdlib::TokenCopy(tok, end, filter, sizeof(filter));
+
+    /* A numeric first argument is a line count, not a filter: "dmesg 40" is
+       the newest 40 lines, "dmesg nvme" filters the whole log, "dmesg 40 nvme"
+       does both. The count is what makes the command usable over the remote
+       shell, whose reply buffer holds about forty lines and drops the rest --
+       so without it every dmesg returns the first minute of boot. */
+    ulong lastLines = 0;
+    ulong count;
+    if (filter[0] != '\0' && Stdlib::ParseUlong(filter, count))
     {
-        Dmesg::GetInstance().Dump(con);
+        lastLines = count;
+        filter[0] = '\0';
+
+        tok = Stdlib::NextToken(end, end);
+        if (tok)
+            Stdlib::TokenCopy(tok, end, filter, sizeof(filter));
+    }
+
+    Dmesg::GetInstance().Dump(con, lastLines,
+                              (filter[0] != '\0') ? filter : nullptr);
+}
+
+static void CmdLoglevel(const char* args, Stdlib::Printer& con)
+{
+    auto& tracer = Tracer::GetInstance();
+
+    const char* end;
+    const char* tok = Stdlib::NextToken(args, end);
+    if (!tok)
+    {
+        con.Printf("loglevel %u\n", (ulong)tracer.GetLevel());
         return;
     }
 
-    char filter[64];
-    Stdlib::TokenCopy(filterStart, end, filter, sizeof(filter));
+    char buf[16];
+    Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
 
-    for (DmesgMsg* msg = Dmesg::GetInstance().Next(nullptr);
-         msg != nullptr;
-         msg = Dmesg::GetInstance().Next(msg))
+    ulong level;
+    if (!Stdlib::ParseUlong(buf, level) || level > (ulong)MaxTraceLevel)
     {
-        if (Stdlib::StrStr(msg->Str, filter))
-            con.PrintString(msg->Str);
+        con.Printf("usage: loglevel [0-%u]\n", (ulong)MaxTraceLevel);
+        return;
     }
+
+    /* The per-subsystem levels in trace.h are compile-time constants, so the
+       only way to see what xHCI or the page allocator is doing used to be a
+       rebuild and a reflash -- on a machine whose console is a UDP socket that
+       is most of an afternoon. Raising the level is loud: level 4 traces every
+       allocation, and every line also goes out the serial port. */
+    tracer.SetLevel((int)level);
+    con.Printf("loglevel %u\n", level);
 }
 
 static void CmdUptime(const char* args, Stdlib::Printer& con)
@@ -1282,7 +1321,8 @@ static void CmdHelp(const char* args, Stdlib::Printer& con);
 static const CmdEntry Commands[] = {
     { "cls",       CmdCls,       "cls - clear screen" },
     { "cpu",       CmdCpu,       "cpu - dump cpu state" },
-    { "dmesg",     CmdDmesg,     "dmesg [filter] - dump kernel log" },
+    { "dmesg",     CmdDmesg,     "dmesg [lines] [filter] - dump kernel log" },
+    { "loglevel",  CmdLoglevel,  "loglevel [N] - show or set trace level" },
     { "uptime",    CmdUptime,    "uptime - show uptime" },
     { "date",      CmdDate,      "date - show wall clock time" },
     { "ps",        CmdPs,        "ps - show tasks" },

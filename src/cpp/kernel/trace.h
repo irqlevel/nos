@@ -22,6 +22,10 @@ const int IoApicLL = 0;
 const int MmIoLL = 4;
 const int TestLL = 3;
 
+/* The highest level any call site above uses, and the bound the shell's
+   loglevel command accepts. Raise it together with a noisier call site. */
+const int MaxTraceLevel = 5;
+
 class Tracer
 {
 public:
@@ -51,7 +55,9 @@ private:
     Tracer& operator=(const Tracer& other) = delete;
     Tracer& operator=(Tracer&& other) = delete;
 
-    int Level;
+    /* Written from the shell on one CPU while every other CPU reads it in
+       Trace(); a stale read costs at most one line. */
+    volatile int Level;
     bool ConsoleSuppressed;
 };
 

@@ -76,15 +76,25 @@ bool Netconsole::Setup()
 
     /* Everything traced before this point is still in dmesg -- replay it into
        the ring so the collector sees the whole boot, not just the tail. */
-    for (DmesgMsg* msg = Dmesg::GetInstance().Next(nullptr); msg != nullptr;
-         msg = Dmesg::GetInstance().Next(msg))
+    DmesgMsg* msg = Dmesg::GetInstance().Next(nullptr);
+    for (ulong replayed = 0; msg != nullptr; replayed++)
     {
         ulong len = Stdlib::StrLen(msg->Str);
-        if (len == 0)
-            continue;
+        if (len != 0)
+        {
+            Stdlib::AutoLock lock(Lock);
+            Append(msg->Str, len);
+        }
 
-        Stdlib::AutoLock lock(Lock);
-        Append(msg->Str, len);
+        /* Never outlast the log itself: a walk past its capacity is chasing a
+           tail someone else is still extending. */
+        if (replayed + 1 == Dmesg::MaxMsgs)
+        {
+            Dmesg::GetInstance().Release(msg);
+            break;
+        }
+
+        msg = Dmesg::GetInstance().Next(msg);
     }
 
     Enabled = true;
