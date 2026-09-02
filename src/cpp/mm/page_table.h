@@ -208,8 +208,19 @@ private:
 
     bool SetupPage(ulong virtAddr, ulong phyAddr);
 
-    bool GetFreePages();
-    void ExcludeFreePages(ulong phyLimit);
+    /* SetupPage stopping one level short: a 2MiB leaf at L2 instead of a
+       4KiB one at L1. Only PageArray uses it, and only because it is the one
+       runtime mapping large enough for the page size to matter. */
+    bool SetupHugePage(ulong virtAddr, ulong phyAddr);
+
+    /* Find a physically contiguous, huge-page-aligned home for PageArray at
+       or above lowerBound, clear of the kernel image and of every reserved
+       region. Returns 0 if the machine's map has no window that fits. */
+    ulong ReservePageArray(ulong bytes, ulong lowerBound);
+
+    /* Build the early physical free list from the memory map. Pages below
+       excludeLimit go on the side list instead (see the comment there). */
+    bool GetFreePages(ulong excludeLimit);
 
     Page* AllocPageNoLock();
     void FreePageNoLock(Page* page);
@@ -248,7 +259,15 @@ private:
        Setup never allocates it; reclaimed in SetupFreePagesList. */
     ulong ExcludedPages;
 
+    /* PageArray is one Page per 4KiB frame of physical memory, so on a big
+       machine it is hundreds of megabytes and every free-list walk touches
+       it at random. It gets a physically contiguous home of its own, mapped
+       with 2MiB pages: 512 times fewer leaf entries, and a TLB that can
+       actually cover it. */
+    static const ulong HugePageSize = 512 * Const::PageSize;
+
     Page* PageArray;
+    ulong PageArrayPhys;
     ulong PageArrayCount;
     ulong HighestPhyAddr;
     Stdlib::ListEntry FreePagesList;

@@ -61,6 +61,7 @@ PageTable::PageTable()
     : Root(0)
     , ExcludedPages(0)
     , PageArray(nullptr)
+    , PageArrayPhys(0)
     , PageArrayCount(0)
     , HighestPhyAddr(0)
     , FreePagesCount(0)
@@ -78,7 +79,7 @@ PageTable::~PageTable()
 {
 }
 
-bool PageTable::GetFreePages()
+bool PageTable::GetFreePages(ulong excludeLimit)
 {
     auto& mmap = MemoryMap::GetInstance();
 
@@ -100,14 +101,8 @@ bool PageTable::GetFreePages()
         if (!mmap.GetRegion(i, addr, len, type))
             return false;
 
-        if (type != 1)
+        if (type != MemoryMap::UsableRamType)
             continue;
-
-        ulong limit = Stdlib::RoundUp(addr + len, Const::PageSize);
-        if (limit > BuiltinMapLimit)
-            limit = BuiltinMapLimit;
-        if (limit > HighestPhyAddr)
-            HighestPhyAddr = limit;
 
         ulong memStart = Stdlib::RoundUp(addr, Const::PageSize);
         ulong memEnd = ((addr + len) / Const::PageSize) * Const::PageSize;
@@ -138,17 +133,20 @@ bool PageTable::GetFreePages()
             if (mmap.IsReserved(address, Const::PageSize))
                 continue;
 
-            if (FreePages == 0)
-            {
-                *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = 0;
-                FreePages = address;
-            }
-            else
-            {
-                ulong next = FreePages;
-                FreePages = address;
-                *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = next;
-            }
+            /* Pages whose identity address is shadowed by the kernel's own
+               VA window go on a side list rather than the main one: they are
+               ordinary usable RAM, but Setup reaches its allocations through
+               the bootstrap map, and these are exactly the addresses that map
+               to something else once the real table is live.
+               SetupFreePagesList hands them to the runtime allocator (which
+               only ever touches a page through TmpMap) in a second pass, so
+               nothing is leaked. Sorting them here costs one comparison; it
+               used to be a second walk of the whole list, and the whole list
+               is as long as the machine has memory. */
+            ulong* head = (address < excludeLimit) ? &ExcludedPages : &FreePages;
+
+            *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = *head;
+            *head = address;
         }
         Trace(PageAllocatorLL, "GetFreePages: inner loop done, total %u", TotalPagesCount);
     }
@@ -406,6 +404,107 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
     return true;
 }
 
+bool PageTable::SetupHugePage(ulong virtAddr, ulong phyAddr)
+{
+    BugOn(virtAddr & (HugePageSize - 1));
+    BugOn(phyAddr & (HugePageSize - 1));
+    BugOn(Root == 0);
+
+    auto& bpt = BuiltinPageTable::GetInstance();
+
+    PtePage* l4Page = (PtePage*)bpt.PhysToVirt(Root);
+    Pte* l4Entry = &l4Page->Entry[Pte::L4Index(virtAddr)];
+    if (!l4Entry->Present())
+    {
+        ulong addr = GetFreePage();
+        if (addr == 0)
+            return false;
+
+        l4Entry->SetAddress(addr);
+        l4Entry->SetWritable();
+        l4Entry->SetPresent();
+    }
+
+    PtePage* l3Page = (PtePage*)bpt.PhysToVirt(l4Entry->Address());
+    Pte* l3Entry = &l3Page->Entry[Pte::L3Index(virtAddr)];
+    if (!l3Entry->Present())
+    {
+        ulong addr = GetFreePage();
+        if (addr == 0)
+            return false;
+
+        l3Entry->SetAddress(addr);
+        l3Entry->SetWritable();
+        l3Entry->SetPresent();
+    }
+
+    /* A 1GiB block here instead of a table would swallow everything else
+       living in this GiB of kernel VA. */
+    if (l3Entry->Huge())
+        return false;
+
+    PtePage* l2Page = (PtePage*)bpt.PhysToVirt(l3Entry->Address());
+    Pte* l2Entry = &l2Page->Entry[Pte::L2Index(virtAddr)];
+    if (l2Entry->Present())
+        return false;
+
+    /* The permissions SetupPage's 4KiB leaf gets, no more and no less. */
+    l2Entry->SetAddress(phyAddr);
+    l2Entry->SetWritable();
+    l2Entry->SetHuge();
+    l2Entry->SetPresent();
+    Hal::TlbFlushPage(virtAddr);
+    return true;
+}
+
+ulong PageTable::ReservePageArray(ulong bytes, ulong lowerBound)
+{
+    auto& mmap = MemoryMap::GetInstance();
+    auto& bpt = BuiltinPageTable::GetInstance();
+
+    /* It has to be writable through the bootstrap map: Setup fills PageArray
+       in through PhysToVirt, while the real table is not live yet. */
+    const ulong mapLimit = bpt.GetMappedLimit();
+
+    const ulong kernelStart = bpt.VirtToPhys(mmap.GetKernelStart());
+    const ulong kernelEnd = bpt.VirtToPhys(mmap.GetKernelEnd());
+
+    for (size_t i = 0; i < mmap.GetRegionCount(); i++)
+    {
+        ulong addr, len, type;
+        if (!mmap.GetRegion(i, addr, len, type))
+            break;
+
+        if (type != MemoryMap::UsableRamType)
+            continue;
+
+        ulong start = Stdlib::RoundUp((addr < lowerBound) ? lowerBound : addr,
+            HugePageSize);
+
+        ulong end = addr + len;
+        if (end > mapLimit)
+            end = mapLimit;
+
+        if (start >= end || (end - start) < bytes)
+            continue;
+
+        for (ulong cand = start; (cand + bytes) <= end; cand += HugePageSize)
+        {
+            /* The kernel image is plain usable RAM as far as the firmware is
+               concerned; nobody marks it reserved. */
+            if (cand < kernelEnd && (cand + bytes) > kernelStart)
+                continue;
+
+            if (mmap.IsReserved(cand, bytes))
+                continue;
+
+            return cand;
+        }
+    }
+
+    return 0;
+}
+
 bool PageTable::ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable,
     bool executable)
 {
@@ -477,50 +576,55 @@ Page* PageTable::GetPage(ulong phyAddr)
     return page;
 }
 
-void PageTable::ExcludeFreePages(ulong phyLimit)
-{
-    ulong curr = FreePages;
-    ulong prev = 0;
-
-    while (curr)
-    {
-        ulong next = *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(curr);
-        if (curr < phyLimit)
-        {
-            if (prev)
-                *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(prev) = next;
-            else
-                FreePages = next;
-
-            /* Park the page on a side list instead of dropping it: it is
-               ordinary usable RAM that only must not back Setup's
-               identity-accessed allocations. SetupFreePagesList hands it to
-               the runtime allocator (which accesses pages via TmpMap only),
-               instead of leaking ~1-2% of low memory for the kernel's
-               lifetime. */
-            *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(curr) = ExcludedPages;
-            ExcludedPages = curr;
-        } else {
-            prev = curr;
-        }
-        curr = next;
-    }
-}
-
 bool PageTable::Setup()
 {
     Trace(0, "PageTable setup");
 
-    if (!GetFreePages())
-        return false;
-
     auto& mmap = MemoryMap::GetInstance();
-    TmpMapL1Page = (PtePage *)mmap.GetKernelEnd();
-    TmpMapStart = Stdlib::RoundUp(mmap.GetKernelEnd() + Const::PageSize, 512 * Const::PageSize);
-    PageArray = (Page*)(TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize);
-    ulong pageArrayLimit = (ulong)PageArray + Stdlib::RoundUp((HighestPhyAddr/Const::PageSize + 1) * sizeof(Page), Const::PageSize);
+    auto& bpt = BuiltinPageTable::GetInstance();
 
-    ExcludeFreePages(BuiltinPageTable::GetInstance().VirtToPhys(pageArrayLimit));
+    /* PageArray has to be sized and placed before the free list is built --
+       its home is carved out of the map so the list never sees those pages --
+       so the top of usable memory is computed here rather than picked up
+       from GetFreePages. Same clamp GetFreePages applies per region: the
+       list can only hold what the bootstrap map reaches. */
+    HighestPhyAddr = Stdlib::RoundUp(mmap.GetUsableRamEnd(), Const::PageSize);
+    if (HighestPhyAddr > bpt.GetMappedLimit())
+        HighestPhyAddr = bpt.GetMappedLimit();
+
+    TmpMapL1Page = (PtePage *)mmap.GetKernelEnd();
+    TmpMapStart = Stdlib::RoundUp(mmap.GetKernelEnd() + Const::PageSize, HugePageSize);
+    PageArray = (Page*)(TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize);
+    BugOn((ulong)PageArray & (HugePageSize - 1));
+
+    ulong pageArrayCount = HighestPhyAddr / Const::PageSize + 1;
+    ulong pageArrayBytes = Stdlib::RoundUp(pageArrayCount * sizeof(Page), HugePageSize);
+    ulong pageArrayLimit = (ulong)PageArray + pageArrayBytes;
+
+    /* Above the VA window's own physical shadow, so the carve-out is nowhere
+       near the pages ExcludeFreePages parks. */
+    PageArrayPhys = ReservePageArray(pageArrayBytes,
+        Stdlib::RoundUp(bpt.VirtToPhys(pageArrayLimit), HugePageSize));
+    if (PageArrayPhys == 0)
+    {
+        Trace(0, "mm: no %u MiB contiguous window for PageArray",
+            pageArrayBytes / Const::MB);
+        return false;
+    }
+
+    /* Reserving it in the map is the whole mechanism: GetFreePages already
+       skips any page a reserved region covers. */
+    if (!mmap.AddRegion(PageArrayPhys, pageArrayBytes, MemoryMap::ReservedType))
+    {
+        Trace(0, "mm: no room in the memory map to reserve PageArray");
+        return false;
+    }
+
+    Trace(0, "mm: PageArray %u MiB at phys 0x%p, %u huge pages",
+        pageArrayBytes / Const::MB, PageArrayPhys, pageArrayBytes / HugePageSize);
+
+    if (!GetFreePages(bpt.VirtToPhys(pageArrayLimit)))
+        return false;
 
     for (ulong address = mmap.GetKernelStart(); address < mmap.GetKernelEnd(); address+= Const::PageSize)
     {
@@ -554,26 +658,23 @@ bool PageTable::Setup()
 
     Trace(0, "PageArray setup, pageArray 0x%p pageArrayLimit 0x%p", PageArray, pageArrayLimit);
 
-    ulong virtAddr = (ulong)PageArray;
-    ulong phaSpace = 0, pha;
-    for (ulong phyAddr = 0; phyAddr <= HighestPhyAddr; phyAddr += Const::PageSize)
+    for (ulong offset = 0; offset < pageArrayBytes; offset += HugePageSize)
     {
-        if (phaSpace == 0)
+        if (!SetupHugePage((ulong)PageArray + offset, PageArrayPhys + offset))
         {
-            pha = GetFreePage();
-            if (!pha)
-                return false;
-
-            if (!SetupPage(virtAddr, pha))
-                return false;
-            phaSpace = Const::PageSize;
+            Trace(0, "mm: can't map PageArray at 0x%p", (ulong)PageArray + offset);
+            return false;
         }
-        Page *page = (Page *)BuiltinPageTable::GetInstance().PhysToVirt(pha + Const::PageSize - phaSpace);
-        page->Init(phyAddr);
-        phaSpace -= sizeof(Page);
-        virtAddr += sizeof(Page);
-        PageArrayCount++;
     }
+
+    /* Filled through the bootstrap map rather than through PageArray's own
+       virtual address: the real table is not live yet, and the backing is
+       one contiguous physical run, so this is a straight linear write. */
+    Page* pages = (Page*)bpt.PhysToVirt(PageArrayPhys);
+    for (ulong i = 0; i < pageArrayCount; i++)
+        pages[i].Init(i * Const::PageSize);
+
+    PageArrayCount = pageArrayCount;
 
     Trace(0, "PageArray setup done, count %u", PageArrayCount);
     return true;
@@ -1254,7 +1355,11 @@ ulong PageTable::GetTotalPagesCount()
 
 ulong PageTable::GetVaEnd()
 {
-    return Stdlib::RoundUp((ulong)&PageArray[PageArrayCount], Const::PageSize);
+    /* Rounded to the huge page, not to the 4KiB one: PageArray is mapped in
+       2MiB blocks, and the VA allocator starts here. Handing it the tail of
+       a block that is already mapped would have it build 4KiB mappings under
+       an L2 entry that is a leaf. */
+    return Stdlib::RoundUp((ulong)&PageArray[PageArrayCount], HugePageSize);
 }
 
 }

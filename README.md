@@ -30,8 +30,12 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
   usable RAM in them are left unmapped. Where the hardware cannot do it the
   kernel falls back to 4 GiB and says so; `meminfo` and two `mm:` lines at
   boot always report RAM reported vs. RAM reachable, so the difference is
-  never silent. Cost: building the free list touches every page once, about
-  0.3 µs each, so a 64 GiB machine spends seconds of its boot there.
+  never silent. The page-descriptor array that comes with all that RAM (one
+  32-byte `Page` per 4 KiB frame, so 512 MiB on a 64 GiB box) gets a
+  contiguous carve-out of its own and is mapped with 2 MiB pages, since every
+  free-list walk touches it at random. Cost: building the free list still
+  touches every page twice, about 0.6 µs in total each, so a 64 GiB machine
+  spends around ten seconds of its boot there.
 - **Kernel infrastructure** — spinlocks, mutexes, SeqLock (single-writer/multi-reader), atomics, wait groups, SoftIrq deferred processing, IPI tasks, timers, watchdog, stack traces with symbol resolution, dmesg ring buffer (512 KB, 2048 messages, recycled lines counted and reported), panic handler with backtrace and CPU/task context, per-device interrupt statistics, AP startup diagnostics, virtual-to-physical address translation (4-level page table walk), byte-order helpers (`Htons`/`Htonl`/`Ntohs`/`Ntohl`)
 - **Optimized stdlib** — `MemSet`, `MemCpy`, `MemCmp`, `StrLen`, `StrCmp`, `StrStr` implemented in x86-64 assembly using `rep stosq`/`rep movsq`/`repe cmpsb`/`repne scasb` (portable C versions on arm64)
 - **Rust support** — `#![no_std]` Rust crates linked into the kernel via `staticlib`, FFI bridge (`rust_ffi.cpp`) exposing kernel services to Rust: spinlocks, mutexes, wait groups, timers, SoftIRQ, MSI-X interrupts, legacy interrupts, DMA allocation, MMIO mapping, PCI config space, block device and network device registration, CPU/IPI/task APIs. **kcore** library provides safe Rust wrappers around kernel primitives. **NVMe driver** written entirely in Rust — PCI BAR mapping, admin + I/O queue pairs, MSI-X interrupt-driven completion, WaitGroup-based synchronous I/O, multi-device support, proper RAII cleanup on shutdown

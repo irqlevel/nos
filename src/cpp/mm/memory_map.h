@@ -58,9 +58,12 @@ public:
        skip such pages even when a usable-RAM region covers them. */
     bool IsReserved(ulong phyAddr, ulong len);
 
-    /* e820/EFI region type for ordinary usable RAM; everything else is
-       MMIO, firmware-reserved or ACPI. */
+    /* e820/EFI region types. Ordinary usable RAM is 1; everything else is
+       MMIO, firmware-reserved or ACPI, and the page allocator stays out of
+       it. The kernel adds regions of its own (the arm64 DTB, PageArray's
+       backing) as reserved, which is what keeps GetFreePages off them. */
     static const ulong UsableRamType = 1;
+    static const ulong ReservedType = 2;
 
     static const ulong KernelSpaceBase = 0xFFFF800000000000;
 
