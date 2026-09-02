@@ -155,6 +155,52 @@ const char* MemoryMap::GetRegionTypeName(ulong type)
     }
 }
 
+ulong MemoryMap::GetReservedEnd(ulong phyAddr)
+{
+    ulong end = 0;
+
+    for (size_t i = 0; i < Size; i++)
+    {
+        auto& region = Region[i];
+        if (region.Type == UsableRamType || region.Len == 0)
+            continue;
+
+        /* The overlap test IsReserved does, for the page at phyAddr. */
+        if (phyAddr < (region.Addr + region.Len) &&
+            region.Addr < (phyAddr + Const::PageSize))
+        {
+            ulong regionEnd = Stdlib::RoundUp(region.Addr + region.Len,
+                Const::PageSize);
+            if (regionEnd > end)
+                end = regionEnd;
+        }
+    }
+
+    /* Two reserved regions that touch are two calls: the caller re-asks at
+       the end of the first and walks off the second. */
+    return end;
+}
+
+ulong MemoryMap::GetNextReservedStart(ulong phyAddr, ulong limit)
+{
+    ulong next = limit;
+
+    for (size_t i = 0; i < Size; i++)
+    {
+        auto& region = Region[i];
+        if (region.Type == UsableRamType || region.Len == 0)
+            continue;
+
+        /* Rounded down: a region starting mid-page makes that whole page
+           reserved, exactly as IsReserved would have said. */
+        ulong start = Stdlib::RoundDown(region.Addr, Const::PageSize);
+        if (start > phyAddr && start < next)
+            next = start;
+    }
+
+    return next;
+}
+
 ulong MemoryMap::GetUsableRamBytes()
 {
     ulong total = 0;
