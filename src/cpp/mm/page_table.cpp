@@ -89,10 +89,18 @@ bool PageTable::GetFreePages(ulong excludeLimit)
     const ulong BuiltinMapLimit = BuiltinPageTable::GetInstance().GetMappedLimit();
     BugOn(BuiltinMapLimit == 0);
 
-    /* Progress every so many pages, so a scan that dies part way through
-       says where. Only visible at PageAllocatorLL: at level 0 this is a
-       screenful of nothing at the head of every boot log. */
-    const ulong PageScanTraceInterval = 100000;
+    /* A 64 GiB machine spends seconds in this loop and seconds more in the
+       drain, and to a log read after the fact silence and a hang look the
+       same. One line per 8 GiB is eight of them on the largest machine this
+       kernel can address and none at all on a small one. */
+    const ulong ProgressPages = (8 * Const::GB) / Const::PageSize;
+    const ulong usableMiB = mmap.GetUsableRamBytes() / Const::MB;
+    ulong nextProgress = ProgressPages;
+
+    /* Hoisted: the kernel image is one physical range, and comparing against
+       it beat calling PhysToVirt twice per page. */
+    const ulong kernelPhysStart = BuiltinPageTable::GetInstance().VirtToPhys(mmap.GetKernelStart());
+    const ulong kernelPhysEnd = BuiltinPageTable::GetInstance().VirtToPhys(mmap.GetKernelEnd());
 
     for (size_t i = 0; i < mmap.GetRegionCount(); i++)
     {
@@ -118,35 +126,58 @@ bool PageTable::GetFreePages(ulong excludeLimit)
         if (memStart >= memEnd)
             continue;
 
-        for (ulong address = memStart; address < memEnd; address+= Const::PageSize)
+        Trace(PageAllocatorLL, "GetFreePages: region 0x%p-0x%p", memStart, memEnd);
+
+        ulong address = memStart;
+        while (address < memEnd)
         {
-            if (address == memStart || (TotalPagesCount % PageScanTraceInterval) == 0)
-                Trace(PageAllocatorLL, "GetFreePages: addr 0x%p total %u", address, TotalPagesCount);
-            TotalPagesCount++;
+            /* Reserved carve-outs (the arm64 DTB, PageArray's backing, the
+               firmware's own) overlap usable-RAM regions; free-listing them
+               would clobber their contents. Skipped a run at a time rather
+               than a page at a time -- there are a handful of boundaries and
+               millions of pages. */
+            ulong reservedEnd = mmap.GetReservedEnd(address);
+            if (reservedEnd != 0)
+            {
+                if (reservedEnd > memEnd)
+                    reservedEnd = memEnd;
 
-            if (BuiltinPageTable::GetInstance().PhysToVirt(address) >= mmap.GetKernelStart()
-                && BuiltinPageTable::GetInstance().PhysToVirt(address) < mmap.GetKernelEnd())
+                TotalPagesCount += (reservedEnd - address) / Const::PageSize;
+                address = reservedEnd;
                 continue;
+            }
 
-            /* Reserved carve-outs (e.g. the DTB) overlap usable-RAM
-               regions; free-listing them would clobber their contents */
-            if (mmap.IsReserved(address, Const::PageSize))
-                continue;
+            ulong runEnd = mmap.GetNextReservedStart(address, memEnd);
+            for (; address < runEnd; address += Const::PageSize)
+            {
+                TotalPagesCount++;
 
-            /* Pages whose identity address is shadowed by the kernel's own
-               VA window go on a side list rather than the main one: they are
-               ordinary usable RAM, but Setup reaches its allocations through
-               the bootstrap map, and these are exactly the addresses that map
-               to something else once the real table is live.
-               SetupFreePagesList hands them to the runtime allocator (which
-               only ever touches a page through TmpMap) in a second pass, so
-               nothing is leaked. Sorting them here costs one comparison; it
-               used to be a second walk of the whole list, and the whole list
-               is as long as the machine has memory. */
-            ulong* head = (address < excludeLimit) ? &ExcludedPages : &FreePages;
+                if (TotalPagesCount >= nextProgress)
+                {
+                    Trace(0, "mm: free list, %u of %u MiB",
+                        (TotalPagesCount * Const::PageSize) / Const::MB, usableMiB);
+                    nextProgress += ProgressPages;
+                }
 
-            *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = *head;
-            *head = address;
+                if (address >= kernelPhysStart && address < kernelPhysEnd)
+                    continue;
+
+                /* Pages whose identity address is shadowed by the kernel's
+                   own VA window go on a side list rather than the main one:
+                   they are ordinary usable RAM, but Setup reaches its
+                   allocations through the bootstrap map, and these are
+                   exactly the addresses that map to something else once the
+                   real table is live. SetupFreePagesList hands them to the
+                   runtime allocator (which only ever touches a page through
+                   TmpMap) in a second pass, so nothing is leaked. Sorting
+                   them here costs one comparison; it used to be a second walk
+                   of the whole list, and the whole list is as long as the
+                   machine has memory. */
+                ulong* head = (address < excludeLimit) ? &ExcludedPages : &FreePages;
+
+                *(ulong *)BuiltinPageTable::GetInstance().PhysToVirt(address) = *head;
+                *head = address;
+            }
         }
         Trace(PageAllocatorLL, "GetFreePages: inner loop done, total %u", TotalPagesCount);
     }
@@ -198,6 +229,10 @@ void PageTable::DrainEarlyFreeList()
 
     BugOn(l1Entry->Present());
 
+    /* Same eight-lines-on-the-biggest-machine budget as the scan. */
+    const ulong ProgressPages = (8 * Const::GB) / Const::PageSize;
+    ulong nextProgress = ((FreePagesCount / ProgressPages) + 1) * ProgressPages;
+
     while (FreePages != 0)
     {
         ulong phyAddr = FreePages;
@@ -223,6 +258,13 @@ void PageTable::DrainEarlyFreeList()
         page->Put();
         FreePagesList.InsertHead(&page->ListEntry);
         FreePagesCount++;
+
+        if (FreePagesCount >= nextProgress)
+        {
+            Trace(0, "mm: %u MiB onto the free list",
+                (FreePagesCount * Const::PageSize) / Const::MB);
+            nextProgress += ProgressPages;
+        }
     }
 
     l1Entry->Value = 0;

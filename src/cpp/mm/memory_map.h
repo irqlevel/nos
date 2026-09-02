@@ -44,6 +44,19 @@ public:
        mapped cacheable over unbacked bus space. */
     bool HasUsableRamIn(ulong start, ulong end);
 
+    /* The two queries a page scan wants instead of IsReserved per page. A
+       real server's map has twenty-odd reserved regions and sixteen million
+       pages, and asking "is this one reserved" about each of them is thirty
+       million interval tests for a handful of boundaries.
+
+       GetReservedEnd: if the page at phyAddr overlaps a reserved region, the
+       page-aligned end of the reserved run it is in; 0 if it does not.
+       GetNextReservedStart: the page-aligned start of the next reserved
+       region above phyAddr, or limit if none is below limit. Between the two
+       a scan moves boundary to boundary. */
+    ulong GetReservedEnd(ulong phyAddr);
+    ulong GetNextReservedStart(ulong phyAddr, ulong limit);
+
     /* Name of a firmware region type, for the shell. */
     static const char* GetRegionTypeName(ulong type);
 

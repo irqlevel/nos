@@ -71,20 +71,50 @@ These only surface on real silicon:
   without it; arm64 needs no feature check. Verified on 8 GiB guests on both
   arches, and on the x86 fallback path.
 
+  **The EX44's actual map** (read off the rescue system, 2026-09-02; UEFI,
+  AMI v2.8, i5-13500, `pdpe1gb` present) turns out to be about as friendly as
+  it could be:
+
+  ```
+  0x0000000000100000-0x0000000072dcefff  usable   1837 MiB, no holes inside
+  0x0000000100000000-0x000000107f7fffff  usable  63488 MiB, one piece
+  ```
+  plus two fragments below 1 MiB, one stray page at `0x79fff000`, and 17
+  reserved/ACPI entries — **21 e820 entries in all**, against `Region[64]`.
+  63.79 GiB usable of 64. Consequences, all favourable:
+
+  - `PageArray` needs 528 MiB (17.3M pages, 264 huge pages) and the low
+    region has 1286 MiB free above the VA window's shadow, so it lands around
+    physical 552 MiB.
+  - all MMIO is below 4 GiB except the 64-bit PCIe window at
+    `0x4000000000-0x7fffffffff` (256–512 GiB), four times higher than the top
+    of RAM: no 1 GiB block can mix RAM and MMIO, so the MTRR question is moot.
+  - RAM ends at `0x107f800000`, which is *not* GiB-aligned; the last block
+    covers 8 MiB past the end. Linux labels that same span "RAM buffer" — it
+    is not MMIO, and `MappedLimit` is the exact top, so nothing is ever
+    free-listed there.
+  - the 64-bit PCIe window does set the real ceiling on this design: identity
+    MMIO at `phys + KernelSpaceBase` would collide with the RAM identity
+    window somewhere past 256 GiB of RAM, well before the PDPT's 512 GiB.
+
   **What it costs.** Two O(RAM) passes remain, both touching every page:
   `GetFreePages` writes a next-pointer into each free page (0.26 µs each) and
   `SetupFreePagesList` reads it back through a temp mapping (0.38 µs each).
   On arm64/HVF with 8 GiB that is 0.55 s and 0.80 s, and boot: complete lands
-  at 2.4 s against ~1 s on a small machine. Extrapolated to 64 GiB it is
-  around ten seconds — worth knowing for a project whose pitch is booting in
-  milliseconds, and measured rather than guessed.
+  at 2.4 s against ~1 s on a small machine. Those per-page numbers are a VM's,
+  though, and a VM's first touch of guest memory faults a page into the host;
+  on real hardware a page-stride write is one cache line per page, ~1.1 GB of
+  traffic over 64 GiB rather than 64 GB. Expect 4–5 s rather than the ten a
+  straight extrapolation gives — but measure it, do not trust either number.
 
-  Three rounds of work got there from 10.4 s: dropping a redundant zeroing
+  Several rounds of work got there from 10.4 s: dropping a redundant zeroing
   pass over every byte of RAM, holding one temp slot across the drain instead
   of a map/unmap pair per page, mapping `PageArray` with 2 MiB pages out of a
   contiguous carve-out (37 entries instead of ~19000, which is what the drain
-  walks at random), and sorting the excluded pages while the list is built
-  rather than walking the whole list a second time.
+  walks at random), sorting the excluded pages while the list is built rather
+  than walking the whole list a second time, and skipping reserved space a run
+  at a time instead of asking `IsReserved` about every page (17 reserved
+  regions × 17.3M pages is 300M interval tests on the EX44).
 
   **The next step, if it matters.** Both remaining passes exist only because
   the early free list is threaded through the free pages themselves. Give
