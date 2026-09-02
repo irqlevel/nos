@@ -140,7 +140,6 @@ const char* MemoryMap::GetRegionTypeName(ulong type)
     /* e820 / EFI-derived types as Multiboot2 and the FDT parser hand them
        over; anything else is firmware being creative and is treated as
        reserved either way. */
-    static const ulong ReservedType = 2;
     static const ulong AcpiReclaimableType = 3;
     static const ulong AcpiNvsType = 4;
     static const ulong BadRamType = 5;

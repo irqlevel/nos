@@ -71,18 +71,28 @@ These only surface on real silicon:
   without it; arm64 needs no feature check. Verified on 8 GiB guests on both
   arches, and on the x86 fallback path.
 
-  **What it costs, and the next step.** Both remaining O(RAM) passes touch
-  every page: `GetFreePages` writes a next-pointer into each free page, and
-  `SetupFreePagesList` reads it back through a temp mapping. Measured on
-  arm64/HVF with 8 GiB: 0.7 s and 2.4 s, so boot goes from ~1 s to ~4 s;
-  extrapolated to 64 GiB that is tens of seconds, against a project whose
-  pitch is booting in milliseconds. Two things would remove most of it —
-  a temporary linear window for the drain instead of a per-page temp mapping
-  (one TLB invalidation per page is the bulk of the 1.15 µs), and not
-  threading the early free list through page contents at all (a bump
-  allocator over a reserved window for `Setup`'s own allocations, then
-  enumerate free pages from the memory map, which touches nothing). Both are
-  contained; neither is needed until a big machine is actually in hand.
+  **What it costs.** Two O(RAM) passes remain, both touching every page:
+  `GetFreePages` writes a next-pointer into each free page (0.26 µs each) and
+  `SetupFreePagesList` reads it back through a temp mapping (0.38 µs each).
+  On arm64/HVF with 8 GiB that is 0.55 s and 0.80 s, and boot: complete lands
+  at 2.4 s against ~1 s on a small machine. Extrapolated to 64 GiB it is
+  around ten seconds — worth knowing for a project whose pitch is booting in
+  milliseconds, and measured rather than guessed.
+
+  Three rounds of work got there from 10.4 s: dropping a redundant zeroing
+  pass over every byte of RAM, holding one temp slot across the drain instead
+  of a map/unmap pair per page, mapping `PageArray` with 2 MiB pages out of a
+  contiguous carve-out (37 entries instead of ~19000, which is what the drain
+  walks at random), and sorting the excluded pages while the list is built
+  rather than walking the whole list a second time.
+
+  **The next step, if it matters.** Both remaining passes exist only because
+  the early free list is threaded through the free pages themselves. Give
+  `Setup`'s own allocations a bump allocator over a reserved window and the
+  list can be enumerated from the memory map instead, touching no page at
+  all — O(RAM/128) rather than O(RAM), since only `PageArray` still has to be
+  written. Contained, but not worth doing before there is a big machine to
+  measure it on.
 - **PCIe bridges:** QEMU topology is flat; real chipsets have bridges. Verify
   `pci.cpp` enumeration recurses through bridges. Consider ECAM/MMCONFIG access
   in addition to legacy CF8/CFC.
