@@ -24,6 +24,7 @@
 
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use kcore::dma::DmaBuffer;
+use kcore::net;
 use kcore::net::NetFrame;
 use crate::regs::*;
 
@@ -137,7 +138,7 @@ impl TxRing {
     /* Walk the ring from head and free all descriptors that hardware has
      * finished with (TX_OWN cleared).  Called only from flush_tx under
      * tx_lock; never from the ISR. */
-    pub fn reap_completed(&mut self) {
+    pub fn reap_completed(&mut self, net: net::NetDeviceHandle) {
         loop {
             if self.head == self.tail {
                 break; /* ring empty */
@@ -151,8 +152,11 @@ impl TxRing {
             let h = self.frames[idx];
             self.frames[idx] = 0;
             if h != 0 {
-                /* Release the shadow NetFrame (decrements kernel refcount) */
-                drop(unsafe { NetFrame::from_raw(h) });
+                /* Handed back, not dropped: this runs under the C++
+                 * TxQueueLock with interrupts off, and dropping reaches
+                 * Mm::Free -> a TLB shootdown that waits for every other CPU.
+                 * A CPU spinning on that lock cannot answer it. */
+                net.tx_done(unsafe { NetFrame::from_raw(h) });
             }
             self.head = (idx + 1) % RING_SIZE;
         }

@@ -280,19 +280,48 @@ ulong CpuTable::GetRemoteCpuMask()
 
 void CpuTable::SendTlbIPI(ulong cpuMask, IPITask tasks[MaxCpus])
 {
+    /* A shootdown that never completes means some CPU cannot take the IPI,
+       and in this kernel that has exactly one cause: it is spinning on a
+       lock with interrupts off -- usually a lock this CPU is holding while
+       it frees the page it is shooting down. Waiting for it forever produces
+       a machine that stops dead with no fault to report and, if the lock is
+       in the network path, no way to report it either. Ten seconds is far
+       past any legitimate round of IPIs; name the CPUs that never answered
+       and panic, which at least prints and can be read afterwards. */
+    static const ulong AckTimeoutNs = 10 * Const::NanoSecsInSec;
+
     for (ulong i = 0; i < MaxCpus; i++)
     {
         if (cpuMask & (1UL << i))
             CpuArray[i].QueueIPITaskAsync(tasks[i]);
     }
 
+    Stdlib::Time deadline = GetBootTime() + Stdlib::Time(AckTimeoutNs);
+    ulong silent = 0;
+
     for (ulong i = 0; i < MaxCpus; i++)
     {
-        if (cpuMask & (1UL << i))
-            tasks[i].Completion.Wait();
-        else
+        if (!(cpuMask & (1UL << i)))
+        {
             tasks[i].Completion.Done();
+            continue;
+        }
+
+        while (tasks[i].Completion.GetCounter() != 0)
+        {
+            if (GetBootTime() >= deadline)
+            {
+                silent |= (1UL << i);
+                break;
+            }
+
+            Schedule();
+        }
     }
+
+    if (silent != 0)
+        Panic("TLB shootdown: cpus 0x%p never acknowledged (asked 0x%p)",
+            silent, cpuMask);
 }
 
 void CpuTable::InvalidateTlbAll()

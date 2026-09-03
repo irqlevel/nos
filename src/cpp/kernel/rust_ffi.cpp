@@ -1331,6 +1331,20 @@ unsigned long kernel_netframe_alloc_rx(unsigned long data_len)
     return (unsigned long)frame;
 }
 
+/* Hand a finished TX frame back for release once TxQueueLock is down. The
+   driver calls this from flush_tx, which runs under that lock with
+   interrupts off; releasing there reaches Mm::Free and a TLB shootdown that
+   waits for every other CPU, one of which may be spinning on the very lock
+   the caller holds. See NetDevice::TxDone. */
+void kernel_netdev_tx_done(unsigned long dev_handle, unsigned long frame_handle)
+{
+    if (!dev_handle || !frame_handle)
+        return;
+    RustNetDevice* dev = NetDevFromHandle(dev_handle);
+    auto* frame = reinterpret_cast<Kernel::NetFrame*>(frame_handle);
+    dev->TxDone(frame);
+}
+
 void kernel_netdev_enqueue_rx(unsigned long dev_handle, unsigned long frame_handle)
 {
     if (!dev_handle || !frame_handle)

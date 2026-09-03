@@ -21,4 +21,5 @@ extern "C" {
     pub fn kernel_netframe_len(handle: usize) -> usize;
     pub fn kernel_netframe_set_len(handle: usize, len: usize);
     pub fn kernel_netframe_put(handle: usize);
+    pub fn kernel_netdev_tx_done(dev_handle: usize, frame_handle: usize);
 }

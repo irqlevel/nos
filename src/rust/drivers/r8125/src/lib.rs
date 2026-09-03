@@ -609,7 +609,8 @@ extern "C" fn r8125_flush_tx(ctx: *mut u8) {
     let dev = ctx as *mut R8125Device;
 
     unsafe {
-        (*dev).tx_ring.reap_completed();
+        let net = (*dev).net_handle;
+        (*dev).tx_ring.reap_completed(net);
 
         let mut submitted: u32 = 0;
         loop {

@@ -19,6 +19,30 @@ NetDevice::NetDevice()
     Stdlib::MemSet(UdpListeners, 0, sizeof(UdpListeners));
 }
 
+void NetDevice::TxDone(NetFrame* frame)
+{
+    TxDoneQueue.InsertTail(&frame->Link);
+}
+
+void NetDevice::ReleaseTxDone()
+{
+    for (;;)
+    {
+        ulong flags = TxQueueLock.LockIrqSave();
+        if (TxDoneQueue.IsEmpty())
+        {
+            TxQueueLock.UnlockIrqRestore(flags);
+            return;
+        }
+
+        NetFrame* frame = CONTAINING_RECORD(TxDoneQueue.RemoveHead(), NetFrame, Link);
+        TxQueueLock.UnlockIrqRestore(flags);
+
+        /* Outside the lock, always: see the note on TxDone. */
+        frame->Put();
+    }
+}
+
 bool NetDevice::SubmitTx(NetFrame* frame)
 {
     ulong flags = TxQueueLock.LockIrqSave();
@@ -32,6 +56,8 @@ bool NetDevice::SubmitTx(NetFrame* frame)
     TxCount++;
     FlushTx();
     TxQueueLock.UnlockIrqRestore(flags);
+
+    ReleaseTxDone();
     return true;
 }
 
@@ -121,6 +147,8 @@ void NetDevice::DrainTx()
     if (TxCount > 0)
         FlushTx();
     TxQueueLock.UnlockIrqRestore(flags);
+
+    ReleaseTxDone();
 }
 
 bool NetDevice::EnqueueRx(NetFrame* frame)

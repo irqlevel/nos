@@ -1,7 +1,9 @@
 use ffi::net;
 
 /// Handle to a registered net device.
-/// Registration is permanent (boot-lifetime); there is no unregister.
+/// Registration is permanent (boot-lifetime); there is no unregister, so the
+/// handle is a plain value a driver may copy where it needs one.
+#[derive(Clone, Copy)]
 pub struct NetDeviceHandle {
     handle: usize,
 }
@@ -81,6 +83,20 @@ impl NetDeviceHandle {
         let h = frame.handle;
         core::mem::forget(frame);
         unsafe { net::kernel_netdev_enqueue_rx(self.handle, h) }
+    }
+
+    /// Hand a transmitted frame back for release, instead of dropping it.
+    ///
+    /// A driver reaps its TX ring from `flush_tx`, which the C++ net stack
+    /// calls under TxQueueLock with interrupts off. Dropping a `NetFrame`
+    /// there calls `kernel_netframe_put` -> `Mm::Free`, which shoots down the
+    /// TLB on every other CPU and waits for each to acknowledge -- and a CPU
+    /// spinning on TxQueueLock has interrupts off and never will. The two
+    /// then wait for each other forever. This queues the frame instead; the
+    /// C++ side releases it once the lock is down.
+    pub fn tx_done(&self, frame: NetFrame) {
+        let h = frame.into_raw();
+        unsafe { net::kernel_netdev_tx_done(self.handle, h) }
     }
 }
 
