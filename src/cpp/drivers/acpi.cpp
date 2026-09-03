@@ -10,7 +10,8 @@ namespace Kernel
 {
 
 Acpi::Acpi()
-    : Rsdt(nullptr)
+    : Root(nullptr)
+    , RootIsXsdt(false)
     , LapicAddress(nullptr)
     , IoApicAddress(nullptr)
     , IrqToGsiSize(0)
@@ -47,7 +48,7 @@ int Acpi::ComputeSum(void* table, size_t len)
     return sum & 0xFF;
 }
 
-bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
+bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp, ulong& rootPhysAddr, bool& isXsdt)
 {
     if (ComputeSum(rsdp, sizeof(rsdp->FirstPart)) != 0)
     {
@@ -68,16 +69,35 @@ bool Acpi::ParseRsdp(RSDPDescriptor20 *rsdp)
     Stdlib::MemCpy(OemId, rsdp->FirstPart.OEMID, sizeof(rsdp->FirstPart.OEMID));
     OemId[sizeof(rsdp->FirstPart.OEMID)] = '\0';
 
-    Trace(0, "Rsdp 0x%p revision %u OemId %s Rsdt 0x%p",
-        rsdp, (ulong)rsdp->FirstPart.Revision, OemId, (ulong)rsdp->FirstPart.RsdtAddress);
+    /* ACPI 2.0 deprecated the RSDT: its entries are 32-bit, so it cannot
+       name a table above 4 GiB, and firmware is free to leave RsdtAddress
+       at zero once it supplies an XSDT. Prefer the XSDT whenever the RSDP
+       is new enough to have one. The EX44's AMI firmware happens to supply
+       both -- Linux uses the XSDT there and this kernel used to use the
+       RSDT, which worked only because that firmware is generous. */
+    if (rsdp->FirstPart.Revision >= 2 && rsdp->XsdtAddress != 0)
+    {
+        rootPhysAddr = (ulong)rsdp->XsdtAddress;
+        isXsdt = true;
+    }
+    else
+    {
+        rootPhysAddr = rsdp->FirstPart.RsdtAddress;
+        isXsdt = false;
+    }
 
-    return true;
+    Trace(0, "Rsdp 0x%p revision %u OemId %s %s 0x%p",
+        rsdp, (ulong)rsdp->FirstPart.Revision, OemId,
+        isXsdt ? "Xsdt" : "Rsdt", rootPhysAddr);
+
+    return rootPhysAddr != 0;
 }
 
 /* Scan a physical range (16-byte aligned slots) for the RSDP signature.
    Only used for the legacy BIOS areas (EBDA, 0xE0000-0xFFFFF); reading
    arbitrary reserved regions is unsafe on real hardware (MMIO). */
-bool Acpi::ScanRsdpRange(ulong phyStart, ulong phyEnd, u32& rsdtPhysAddr)
+bool Acpi::ScanRsdpRange(ulong phyStart, ulong phyEnd, ulong& rootPhysAddr,
+    bool& isXsdt)
 {
     auto& pt = Kernel::Mm::PageTable::GetInstance();
 
@@ -108,9 +128,8 @@ bool Acpi::ScanRsdpRange(ulong phyStart, ulong phyEnd, u32& rsdtPhysAddr)
                 if (rsdp->FirstPart.Revision >= 2 &&
                     va + sizeof(RSDPDescriptor20) > scanEnd)
                     continue;
-                if (ParseRsdp(rsdp))
+                if (ParseRsdp(rsdp, rootPhysAddr, isXsdt))
                 {
-                    rsdtPhysAddr = rsdp->FirstPart.RsdtAddress;
                     pt.TmpUnmapPage(pageVa);
                     return true;
                 }
@@ -122,7 +141,7 @@ bool Acpi::ScanRsdpRange(ulong phyStart, ulong phyEnd, u32& rsdtPhysAddr)
     return false;
 }
 
-bool Acpi::FindRsdtAddress(u32& rsdtPhysAddr)
+bool Acpi::FindRootTable(ulong& rootPhysAddr, bool& isXsdt)
 {
     /* 1. RSDP copy from the Multiboot2 ACPI tag. On UEFI this is the
        only way to find it: the RSDP lives in ACPI-reclaimable memory,
@@ -136,11 +155,11 @@ bool Acpi::FindRsdtAddress(u32& rsdtPhysAddr)
         Stdlib::MemCpy(&copy, grubRsdp,
             (grubRsdpSize < sizeof(copy)) ? grubRsdpSize : sizeof(copy));
 
-        if (copy.FirstPart.Signature == RSDPSignature && ParseRsdp(&copy))
+        if (copy.FirstPart.Signature == RSDPSignature &&
+            ParseRsdp(&copy, rootPhysAddr, isXsdt))
         {
-            Trace(0, "Rsdp from multiboot tag, Rsdt 0x%p",
-                (ulong)copy.FirstPart.RsdtAddress);
-            rsdtPhysAddr = copy.FirstPart.RsdtAddress;
+            Trace(0, "Rsdp from multiboot tag, %s 0x%p",
+                isXsdt ? "Xsdt" : "Rsdt", rootPhysAddr);
             return true;
         }
 
@@ -158,38 +177,57 @@ bool Acpi::FindRsdtAddress(u32& rsdtPhysAddr)
 
         if (ebda >= 0x80000 && ebda < 0xA0000)
         {
-            if (ScanRsdpRange(ebda, ebda + 1024, rsdtPhysAddr))
+            if (ScanRsdpRange(ebda, ebda + 1024, rootPhysAddr, isXsdt))
                 return true;
         }
     }
 
     /* 3. BIOS read-only area 0xE0000-0xFFFFF */
-    if (ScanRsdpRange(0xE0000, 0x100000, rsdtPhysAddr))
+    if (ScanRsdpRange(0xE0000, 0x100000, rootPhysAddr, isXsdt))
         return true;
 
     Trace(0, "Rsdp not found");
     return false;
 }
 
-Stdlib::Error Acpi::ParseRsdt(ACPISDTHeader* rsdt)
+Stdlib::Error Acpi::ParseRootTable(ACPISDTHeader* root)
 {
-    if (Stdlib::StrnCmp(rsdt->Signature, "RSDT", sizeof(rsdt->Signature)) != 0)
+    const char* signature = RootIsXsdt ? "XSDT" : "RSDT";
+
+    if (Stdlib::StrnCmp(root->Signature, signature, sizeof(root->Signature)) != 0)
     {
-        Trace(AcpiLL, "Rsdt 0x%p invalid signature", rsdt);
+        Trace(AcpiLL, "%s 0x%p invalid signature", signature, root);
         return MakeError(Stdlib::Error::NotFound);
     }
 
     if (checkRsdtChecksum)
     {
-        if (ComputeSum(rsdt, rsdt->Length) != 0)
+        if (ComputeSum(root, root->Length) != 0)
         {
-            Trace(AcpiLL, "Rsdt 0x%p checksum failed 0x%p vs 0x%p",
-                rsdt, (ulong)ComputeSum(rsdt, rsdt->Length), (ulong)rsdt->Checksum);
+            Trace(AcpiLL, "%s 0x%p checksum failed 0x%p vs 0x%p", signature,
+                root, (ulong)ComputeSum(root, root->Length), (ulong)root->Checksum);
              return MakeError(Stdlib::Error::NotFound);
         }
     }
 
     return MakeError(Stdlib::Error::Success);
+}
+
+ulong Acpi::RootEntry(size_t index)
+{
+    const u8* base = reinterpret_cast<const u8*>(Root) +
+        OFFSET_OF(ACPISDTHeader, Entry);
+
+    if (RootIsXsdt)
+    {
+        u64 value;
+        Stdlib::MemCpy(&value, base + index * sizeof(u64), sizeof(value));
+        return (ulong)value;
+    }
+
+    u32 value;
+    Stdlib::MemCpy(&value, base + index * sizeof(u32), sizeof(value));
+    return (ulong)value;
 }
 
 Acpi::ACPISDTHeader* Acpi::LookupTable(const char *name)
@@ -214,11 +252,12 @@ Stdlib::Error Acpi::ParseTablePointers()
 {
     Stdlib::Error err;
 
-    if (Rsdt->Length <= sizeof(*Rsdt))
+    if (Root->Length <= sizeof(*Root))
         return MakeError(Stdlib::Error::NotFound);
 
-    size_t tableCount = (Rsdt->Length - OFFSET_OF(ACPISDTHeader, Entry)) / sizeof(Rsdt->Entry[0]);
-    Trace(AcpiLL, "Acpi: tableCount %u", tableCount);
+    const size_t entrySize = RootIsXsdt ? sizeof(u64) : sizeof(u32);
+    size_t tableCount = (Root->Length - OFFSET_OF(ACPISDTHeader, Entry)) / entrySize;
+    Trace(0, "Acpi: %s, %u tables", RootIsXsdt ? "Xsdt" : "Rsdt", tableCount);
 
     auto& pt = Mm::PageTable::GetInstance();
 
@@ -226,26 +265,32 @@ Stdlib::Error Acpi::ParseTablePointers()
     {
         if (i >= Stdlib::ArraySize(Table))
         {
-            Trace(0, "Acpi: can't insert table %u", (ulong)i);
-            return MakeError(Stdlib::Error::NotFound);
+            /* Keep what was collected rather than losing ACPI altogether:
+               the tables this kernel looks up are APIC, FACP, HPET, MCFG and
+               WDAT, and a machine missing one SSDT still boots, while a
+               machine with no ACPI at all panics. */
+            Trace(0, "Acpi: table array full at %u of %u, ignoring the rest",
+                (ulong)i, (ulong)tableCount);
+            break;
         }
 
         /*
          * First map just the header page to read Length, then re-map
          * the full table so that parsers have a contiguous VA range.
          */
-        ulong physOffset = Rsdt->Entry[i] & (Const::PageSize - 1);
+        ulong entryPhys = RootEntry(i);
+        ulong physOffset = entryPhys & (Const::PageSize - 1);
 
         /* TmpMapAddress maps only the entry's page; if the SDT header (whose
            Length field at offset 4 we read next) would straddle the page
            boundary, map the header range instead so the read stays in bounds. */
         bool headerStraddles = (physOffset + sizeof(ACPISDTHeader) > Const::PageSize);
         ACPISDTHeader* header = headerStraddles
-            ? reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(Rsdt->Entry[i], sizeof(ACPISDTHeader)))
-            : reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(Rsdt->Entry[i]));
+            ? reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(entryPhys, sizeof(ACPISDTHeader)))
+            : reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(entryPhys));
         if (!header)
         {
-            Trace(0, "Acpi: can't map table %u phys 0x%p", (ulong)i, (ulong)Rsdt->Entry[i]);
+            Trace(0, "Acpi: can't map table %u phys 0x%p", (ulong)i, entryPhys);
             return MakeError(Stdlib::Error::NoMemory);
         }
 
@@ -264,11 +309,11 @@ Stdlib::Error Acpi::ParseTablePointers()
             pt.TmpUnmapPage(hdrVaPage);
             if (headerStraddles)
                 pt.TmpUnmapPage(hdrVaPage + Const::PageSize);
-            header = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(Rsdt->Entry[i], tableLength));
+            header = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(entryPhys, tableLength));
             if (!header)
             {
                 Trace(0, "Acpi: can't map table %u range phys 0x%p len %u",
-                    (ulong)i, (ulong)Rsdt->Entry[i], (ulong)tableLength);
+                    (ulong)i, entryPhys, (ulong)tableLength);
                 return MakeError(Stdlib::Error::NoMemory);
             }
         }
@@ -526,8 +571,8 @@ void Acpi::ParseWDAT()
 Stdlib::Error Acpi::Parse()
 {
     Stdlib::Error err;
-    u32 rsdtPhysAddr = 0;
-    if (!FindRsdtAddress(rsdtPhysAddr))
+    ulong rootPhysAddr = 0;
+    if (!FindRootTable(rootPhysAddr, RootIsXsdt))
     {
         return MakeError(Stdlib::Error::NotFound);
     }
@@ -538,41 +583,41 @@ Stdlib::Error Acpi::Parse()
        if the RSDT header (Length at offset 4) straddles the page boundary,
        map the header range instead -- the same defense ParseTablePointers
        applies to every other SDT. */
-    ulong rsdtPhysOff = rsdtPhysAddr & (Const::PageSize - 1);
-    bool headerStraddles = (rsdtPhysOff + sizeof(ACPISDTHeader) > Const::PageSize);
+    ulong rootPhysOff = rootPhysAddr & (Const::PageSize - 1);
+    bool headerStraddles = (rootPhysOff + sizeof(ACPISDTHeader) > Const::PageSize);
     ACPISDTHeader* rsdt = headerStraddles
-        ? reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rsdtPhysAddr, sizeof(ACPISDTHeader)))
-        : reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(rsdtPhysAddr));
+        ? reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rootPhysAddr, sizeof(ACPISDTHeader)))
+        : reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(rootPhysAddr));
     if (!rsdt)
         return MakeError(Stdlib::Error::NoMemory);
 
-    u32 rsdtLength = rsdt->Length;
-    if (rsdtLength < sizeof(ACPISDTHeader))
+    u32 rootLength = rsdt->Length;
+    if (rootLength < sizeof(ACPISDTHeader))
     {
-        Trace(0, "Acpi: rsdt length %u too small", (ulong)rsdtLength);
+        Trace(0, "Acpi: rsdt length %u too small", (ulong)rootLength);
         return MakeError(Stdlib::Error::InvalidValue);
     }
 
-    /* Re-map the full table before ParseRsdt: its checksum walks all
+    /* Re-map the full table before ParseRootTable: its checksum walks all
        Length bytes, which may extend past the header mapping. */
-    if (rsdtPhysOff + rsdtLength > Const::PageSize)
+    if (rootPhysOff + rootLength > Const::PageSize)
     {
         ulong hdrVaPage = reinterpret_cast<ulong>(rsdt) & ~(Const::PageSize - 1);
         pt.TmpUnmapPage(hdrVaPage);
         if (headerStraddles)
             pt.TmpUnmapPage(hdrVaPage + Const::PageSize);
-        rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rsdtPhysAddr, rsdtLength));
+        rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rootPhysAddr, rootLength));
         if (!rsdt)
             return MakeError(Stdlib::Error::NoMemory);
     }
 
-    err = ParseRsdt(rsdt);
+    err = ParseRootTable(rsdt);
     if (!err.Ok())
     {
         return err;
     }
 
-    Rsdt = rsdt;
+    Root = rsdt;
 
     err = ParseTablePointers();
     if (!err.Ok())
