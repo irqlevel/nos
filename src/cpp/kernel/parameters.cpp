@@ -24,6 +24,7 @@ Parameters::Parameters()
     , UdpShellPort(0)
     , NetconsolePort(0)
     , NetconsoleTailKb(0)
+    , LogLevel(DefaultLogLevel)
     , DnsEnabled(false)
     , RootAuto(false)
 {
@@ -116,6 +117,11 @@ u16 Parameters::GetNetconsolePort()
 ulong Parameters::GetNetconsoleTailKb()
 {
     return NetconsoleTailKb;
+}
+
+int Parameters::GetLogLevel()
+{
+    return LogLevel;
 }
 
 bool Parameters::IsDnsEnabled()
@@ -319,6 +325,21 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
         else
         {
             Trace(0, "Invalid nctail %s", value);
+        }
+    }
+    else if (Stdlib::StrCmp(key, "loglevel") == 0)
+    {
+        /* The runtime `loglevel` shell command cannot help with a boot that
+           has already happened, and the chattier levels are exactly the ones
+           worth having during bring-up on a machine you cannot log into. */
+        ulong level = 0;
+        if (Stdlib::ParseUlong(value, level) && level <= (ulong)MaxTraceLevel)
+        {
+            LogLevel = (int)level;
+        }
+        else
+        {
+            Trace(0, "Invalid loglevel %s", value);
         }
     }
     else if (Stdlib::StrCmp(key, "root") == 0)

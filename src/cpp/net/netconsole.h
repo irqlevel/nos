@@ -123,8 +123,13 @@ private:
     static const u8 DgramMagic2 = 'S';
     static const u8 DgramMagic3 = 'C';
 
-    /* Enough for a full boot log, so a collector started late still gets it. */
-    static const ulong BufSize = 128 * 1024;
+    /* Enough for a full boot log, so a collector started late still gets it.
+       Everything traced before the device has an address lives here, and on a
+       20-CPU server that is most of a boot: measured at 74 KiB in QEMU, and
+       a real machine prints more -- 25 ACPI tables against QEMU's four, 26
+       xHCI ports, twenty PCI functions. 128 KiB used to overflow, silently,
+       taking the beginning of the boot with it. */
+    static const ulong BufSize = 1024 * 1024;
 
     /* One UDP datagram, header included; stays well under the 1500-byte MTU. */
     static const ulong PayloadMaxLen = 1400;

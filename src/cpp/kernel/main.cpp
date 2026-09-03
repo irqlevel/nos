@@ -721,11 +721,15 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         return;
     }
 
-    Tracer::GetInstance().SetLevel(1);
+    /* Until the command line has been read there is nothing to read it from,
+       so the earliest traces are always at the default level. */
+    Tracer::GetInstance().SetLevel(Parameters::DefaultLogLevel);
 
     //Screen::Printf("Hello!\n");
 
     Grub::ParseMultiBootInfo((Grub::MultiBootInfoHeader *)bpt.PhysToVirt((ulong)MbInfo));
+
+    Tracer::GetInstance().SetLevel(Parameters::GetInstance().GetLogLevel());
 
     /* Arm log capture as soon as the command line is known: the ring buffers
        everything until the network can carry it away. */
