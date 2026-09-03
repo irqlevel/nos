@@ -100,6 +100,19 @@ public:
        whose reap runs as ReapRx() can use this as their ProcessRx(). */
     void DrainRxQueueAndDispatch();
 
+    /* A driver must never release a transmitted frame from inside FlushTx.
+       FlushTx runs under TxQueueLock with interrupts off, and NetFrame::Put
+       reaches Mm::Free, which shoots down the TLB on every other CPU and
+       waits for each one to acknowledge -- and a CPU spinning on TxQueueLock
+       has interrupts off, so it never can. The two then wait for each other
+       forever and the machine stops dead, with no fault to panic on and the
+       netconsole drain blocked on the same lock, so it cannot even say so.
+
+       Hand the frame here instead. SubmitTx and DrainTx empty the queue once
+       the lock is down. */
+    void TxDone(NetFrame* frame);
+    void ReleaseTxDone();
+
 protected:
     static const ulong TxQueueCapacity = 256;
     static const ulong RxQueueCapacity = 256;
@@ -107,6 +120,9 @@ protected:
     Stdlib::ListEntry TxQueue;
     ulong TxCount;
     RawSpinLock TxQueueLock;
+
+    /* Transmitted frames waiting to be released outside the lock. */
+    Stdlib::ListEntry TxDoneQueue;
 
     Stdlib::ListEntry RxQueue;
     ulong RxCount;

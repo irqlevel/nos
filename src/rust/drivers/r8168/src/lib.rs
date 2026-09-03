@@ -424,7 +424,8 @@ extern "C" fn r8168_flush_tx(ctx: *mut u8) {
 
     unsafe {
         /* Reap any already-completed TX slots to make room. */
-        (*dev).tx_ring.reap_completed();
+        let net = (*dev).net_handle;
+        (*dev).tx_ring.reap_completed(net);
 
         let mut submitted: u32 = 0;
         loop {
