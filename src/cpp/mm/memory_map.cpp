@@ -13,6 +13,7 @@ namespace Mm
 
 MemoryMap::MemoryMap()
     : Size(0)
+    , LastUsableRegion(0)
 {
 }
 
@@ -105,6 +106,19 @@ bool MemoryMap::IsReserved(ulong phyAddr, ulong len)
 
 bool MemoryMap::IsUsableRam(ulong phyAddr)
 {
+    /* Every temp mapping asks this, and a temp mapping is on the path of
+       every page allocation and every page-table walk; a real server's map
+       has twenty-odd regions to walk past. The queries come in bursts inside
+       one region, so try the region that answered last before scanning. */
+    size_t hint = LastUsableRegion;
+    if (hint < Size)
+    {
+        auto& region = Region[hint];
+        if (region.Type == UsableRamType &&
+            phyAddr >= region.Addr && phyAddr < (region.Addr + region.Len))
+            return true;
+    }
+
     for (size_t i = 0; i < Size; i++)
     {
         auto& region = Region[i];
@@ -112,7 +126,10 @@ bool MemoryMap::IsUsableRam(ulong phyAddr)
             continue;
 
         if (phyAddr >= region.Addr && phyAddr < (region.Addr + region.Len))
+        {
+            LastUsableRegion = i;
             return true;
+        }
     }
 
     return false;
