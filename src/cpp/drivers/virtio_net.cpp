@@ -428,7 +428,7 @@ void VirtioNet::FlushTx()
 
 /* --- TX: complete hardware TX (caller holds TxQueueLock) --- */
 
-void VirtioNet::CompleteTx()
+void VirtioNet::CompleteTx(Stdlib::ListEntry& done)
 {
     u32 usedId, usedLen;
     while (HwTxQueue.GetUsed(usedId, usedLen))
@@ -447,7 +447,7 @@ void VirtioNet::CompleteTx()
         NetFrame* frame = slot->Frame;
         FreeTxSlot((int)(slot - TxSlots));
         if (frame)
-            frame->Put();
+            done.InsertTail(&frame->Link);
     }
 }
 
@@ -455,10 +455,28 @@ void VirtioNet::CompleteTx()
 
 void VirtioNet::DrainTx()
 {
+    Stdlib::ListEntry done;
+    done.Init();
+
     ulong flags = TxQueueLock.LockIrqSave();
-    CompleteTx();
+    CompleteTx(done);
     FlushTx();
     TxQueueLock.UnlockIrqRestore(flags);
+
+    /* Only now. Put() reaches Mm::Free, Mm::Free shoots down the TLB on
+       every other CPU and waits for all of them, and a CPU spinning on
+       TxQueueLock has interrupts off and cannot answer -- which is a
+       deadlock that takes the whole machine with it, silently, since the
+       netconsole drain wants this same lock to report it.
+
+       The interrupt handler already defers TX completion here for exactly
+       this reason; the deferral was necessary but not sufficient, because
+       the softirq then took the lock and did the free under it anyway. */
+    while (!done.IsEmpty())
+    {
+        NetFrame* frame = CONTAINING_RECORD(done.RemoveHead(), NetFrame, Link);
+        frame->Put();
+    }
 }
 
 /* --- RX: reap completed buffers from HW into SW RxQueue --- */
