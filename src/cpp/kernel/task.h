@@ -167,6 +167,15 @@ private:
 
     static const size_t TaskListCount = 512;
 
+    /* Ps walks each bucket holding that bucket's lock with interrupts off. A
+       damaged list -- a cycle, a half-written link -- turns that walk into an
+       infinite loop on a CPU nobody can interrupt, holding a lock the
+       scheduler wants, and the machine stops without a panic and without a
+       reset. There is no legitimate way for one of 512 buckets to hold this
+       many tasks, so passing it means the list is broken; say so and stop,
+       which leaves a diagnosis instead of a brick. */
+    static const size_t MaxTasksPerList = 4096;
+
     SpinLock Lock[TaskListCount];
     Stdlib::ListEntry TaskList[TaskListCount];
 
