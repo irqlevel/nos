@@ -36,7 +36,8 @@ void __attribute__((noreturn)) StubTrap()
 /* arm64 boots from a device tree, so drivers/acpi.cpp is not built here;
    these keep the rust_ffi ACPI query linkable. */
 Acpi::Acpi()
-    : Rsdt(nullptr)
+    : Root(nullptr)
+    , RootIsXsdt(false)
     , LapicAddress(nullptr)
     , IoApicAddress(nullptr)
     , IrqToGsiSize(0)

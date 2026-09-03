@@ -129,10 +129,19 @@ private:
 
     int ComputeSum(void* table, size_t len);
 
-    bool ParseRsdp(RSDPDescriptor20* rsdp);
-    bool FindRsdtAddress(u32& rsdtPhysAddr);
-    bool ScanRsdpRange(ulong phyStart, ulong phyEnd, u32& rsdtPhysAddr);
-    Stdlib::Error ParseRsdt(ACPISDTHeader* rsdt);
+    /* All three yield the physical address of the root table and which of
+       the two kinds it is. See ParseRsdp for why there are two. */
+    bool ParseRsdp(RSDPDescriptor20* rsdp, ulong& rootPhysAddr, bool& isXsdt);
+    bool FindRootTable(ulong& rootPhysAddr, bool& isXsdt);
+    bool ScanRsdpRange(ulong phyStart, ulong phyEnd, ulong& rootPhysAddr,
+        bool& isXsdt);
+    Stdlib::Error ParseRootTable(ACPISDTHeader* root);
+
+    /* Root entry index -> physical address of that table. The entries are
+       32-bit in an RSDT and 64-bit in an XSDT, and in an XSDT they are not
+       naturally aligned (the header is 36 bytes), so they are copied out
+       rather than dereferenced. */
+    ulong RootEntry(size_t index);
 
     Stdlib::Error ParseTablePointers();
     Stdlib::Error ParseMADT();
@@ -141,9 +150,14 @@ private:
 
     char OemId[7];
 
-    ACPISDTHeader* Rsdt;
+    ACPISDTHeader* Root;
+    bool RootIsXsdt;
 
-    static const size_t MaxTables = 32;
+    /* Firmware table counts are not small and not predictable: the Hetzner
+       EX44 lists 25, eleven of them SSDTs, and the SSDT count moves with
+       every BIOS revision. Overrunning this used to abort the whole parse,
+       which the caller turns into a boot panic. 128 pointers is a kilobyte. */
+    static const size_t MaxTables = 128;
     ACPISDTHeader* Table[MaxTables];
 
     static const bool checkRsdtChecksum = false;
