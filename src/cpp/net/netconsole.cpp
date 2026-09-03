@@ -404,8 +404,28 @@ void Netconsole::Run()
             }
 
             if (trimmed != 0)
+            {
+                /* This one line has to reach the collector, and Log() drops
+                   whatever the drain task produces -- so it is put into the
+                   ring by hand, ahead of the backlog it is explaining. Every
+                   other drain-task message is suppressed for a good reason
+                   (the TX path traces, and feeding that back makes the loop
+                   generate its own work); this one is emitted exactly once,
+                   under BacklogTrimmed, and it is the difference between a
+                   log that starts in the middle and a log that says why. */
+                char msg[MaxRecordLen];
+                int len = Stdlib::SnPrintf(msg, sizeof(msg),
+                    "Netconsole: link up, dropped %u backlog msgs over the %u byte cap\n",
+                    trimmed, TailKeepBytes);
+                if (len > 0)
+                {
+                    Stdlib::AutoLock lock(Lock);
+                    Append(msg, (ulong)len);
+                }
+
                 Trace(0, "Netconsole: link up, dropped %u backlog msgs over the %u byte cap",
                     trimmed, TailKeepBytes);
+            }
         }
 
         ulong len;
