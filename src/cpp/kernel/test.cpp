@@ -1978,7 +1978,7 @@ void TestMultiTaskingTaskFunc(void *ctx)
     {
         auto& cpu = GetCpu();
         auto task = Task::GetCurrentTask();
-        Trace(0, "Hello from task 0x%p pid %u cpu %u", task, task->Pid, cpu.GetIndex());
+        Trace(TestLL, "Hello from task 0x%p pid %u cpu %u", task, task->Pid, cpu.GetIndex());
         Sleep(100 * Const::NanoSecsInMs);
     }
 }

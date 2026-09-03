@@ -36,14 +36,14 @@ Task::Task(const char* fmt, ...)
     va_start(args, fmt);
     Stdlib::VsnPrintf(Name, Stdlib::ArraySize(Name), fmt, args);
     va_end(args);
-    Trace(0, "task 0x%p %s", this, Name);
+    Trace(TaskLL, "task 0x%p %s", this, Name);
 }
 
 Task::~Task()
 {
     BugOn(TaskQueue != nullptr);
     BugOn(StackPtr != nullptr);
-    Trace(0, "task 0x%p %s dtor", this, Name);
+    Trace(TaskLL, "task 0x%p %s dtor", this, Name);
 }
 
 void Task::Release()
@@ -52,7 +52,7 @@ void Task::Release()
 
     if (StackPtr != nullptr)
     {
-        Trace(0, "task 0x%p %s free stack 0x%p",
+        Trace(TaskLL, "task 0x%p %s free stack 0x%p",
             this, Name, (ulong)StackPtr);
         delete StackPtr;
         StackPtr = nullptr;
@@ -137,7 +137,7 @@ bool Task::PrepareStart(Func func, void* ctx)
         return false;
     }
 
-    Trace(0, "task 0x%p %s stack 0x%p top 0x%p",
+    Trace(TaskLL, "task 0x%p %s stack 0x%p top 0x%p",
         this, Name, (ulong)StackPtr, (ulong)&StackPtr->StackTop[0]);
 
     if (!TaskTable::GetInstance().Insert(this))
@@ -400,10 +400,20 @@ void TaskTable::Ps(Stdlib::Printer& printer)
     {
         Stdlib::AutoLock lock(Lock[i]);
 
+        size_t walked = 0;
         for (auto currEntry = TaskList[i].Flink;
             currEntry != &TaskList[i];
             currEntry = currEntry->Flink)
         {
+            if (++walked > MaxTasksPerList)
+            {
+                printer.Printf("task list %u does not end after %u entries\n",
+                    (ulong)i, (ulong)MaxTasksPerList);
+                Trace(0, "Ps: task list %u does not end after %u entries",
+                    (ulong)i, (ulong)MaxTasksPerList);
+                break;
+            }
+
             Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
             printer.Printf("%u %u 0x%p %u.%u %u %s\n",
                 task->Pid, task->State.Get(), task->Flags.Get(), task->Runtime.GetSecs(),

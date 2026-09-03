@@ -46,6 +46,11 @@ public:
        buffered boot log. 0 (the default) ships all of it. */
     ulong GetNetconsoleTailKb();
 
+    /* loglevel=N: the trace level to boot with. Defaults to what main sets
+       today; the `loglevel` shell command moves it afterwards. */
+    int GetLogLevel();
+    static const int DefaultLogLevel = 1;
+
     bool IsDnsEnabled();
 
     bool IsRootAuto();
@@ -83,6 +88,7 @@ private:
     Net::IpAddress NetconsoleIp;
     u16 NetconsolePort;
     ulong NetconsoleTailKb;
+    int LogLevel;
     bool DnsEnabled;
     bool RootAuto;
 };

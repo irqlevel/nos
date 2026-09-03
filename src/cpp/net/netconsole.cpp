@@ -133,6 +133,20 @@ bool Netconsole::Start(NetDevice* dev)
         return false;
     }
 
+    /* Say it in the stream, not just in the shell command's counters: a
+       backlog that overflowed before the link came up produces a log that
+       simply starts in the middle, and nothing about it says so. This is the
+       one line that turns "the log is truncated" into a number. */
+    ulong dropped;
+    {
+        Stdlib::AutoLock lock(Lock);
+        dropped = Dropped;
+    }
+
+    if (dropped != 0)
+        Trace(0, "Netconsole: %u lines were dropped before the link came up",
+            dropped);
+
     Trace(0, "Netconsole: started on %s", dev->GetName());
     return true;
 }

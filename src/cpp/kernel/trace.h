@@ -22,6 +22,13 @@ const int IoApicLL = 0;
 const int MmIoLL = 4;
 const int TestLL = 3;
 
+/* Task create/start/free/destroy. Six lines per task, and the multitasking
+   self-test makes one task per CPU twice over: on a 20-CPU box that is a
+   third of everything printed before the network exists, all of it competing
+   for room in the netconsole ring with the lines someone actually needs.
+   `loglevel 3` brings it back on a running kernel. */
+const int TaskLL = 3;
+
 /* The highest level any call site above uses, and the bound the shell's
    loglevel command accepts. Raise it together with a noisier call site. */
 const int MaxTraceLevel = 5;
