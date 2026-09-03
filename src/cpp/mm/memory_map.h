@@ -100,6 +100,11 @@ private:
 
     MemoryRegion Region[64];
     size_t Size;
+
+    /* Index of the region that last answered IsUsableRam. A hint only: it is
+       written without a lock and bounds-checked on read, so a stale value
+       costs a full scan and never a wrong answer. */
+    size_t LastUsableRegion;
 };
 
 }

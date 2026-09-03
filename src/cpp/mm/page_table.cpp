@@ -714,7 +714,21 @@ bool PageTable::Setup()
        one contiguous physical run, so this is a straight linear write. */
     Page* pages = (Page*)bpt.PhysToVirt(PageArrayPhys);
     for (ulong i = 0; i < pageArrayCount; i++)
+    {
         pages[i].Init(i * Const::PageSize);
+
+        /* ListEntry::Init stores `this`, and `this` here is the descriptor's
+           address in the bootstrap map, not the one PageArray gets in the
+           real table. The drain repairs every descriptor it inserts, but one
+           that never reaches the free list would keep a self-pointer that is
+           not equal to its own address -- and "self-pointing means not on the
+           free list" is exactly the test AllocContiguousPages uses to decide
+           whether it may take a page. It would read a reserved page, or a
+           page below the start of RAM, as free, hand out the run and zero
+           it. Point them at the address the descriptor will answer to. */
+        pages[i].ListEntry.Flink = &PageArray[i].ListEntry;
+        pages[i].ListEntry.Blink = &PageArray[i].ListEntry;
+    }
 
     PageArrayCount = pageArrayCount;
 
@@ -739,6 +753,80 @@ bool PageTable::SetupFreePagesList()
 
     Trace(0, "FreePagesCount %u", FreePagesCount);
     return true;
+}
+
+void PageTable::CheckFreeList(Stdlib::Printer& printer)
+{
+    auto& mmap = MemoryMap::GetInstance();
+    auto& bpt = BuiltinPageTable::GetInstance();
+
+    const ulong kernelPhysStart = bpt.VirtToPhys(mmap.GetKernelStart());
+    const ulong kernelPhysEnd = bpt.VirtToPhys(mmap.GetKernelEnd());
+
+    ulong onList = 0;
+    ulong inReserved = 0;
+    ulong inKernel = 0;
+    ulong outsideRam = 0;
+    ulong wrongPhys = 0;
+
+    /* Reserved-ness changes only at region boundaries, so carry a window
+       forward instead of asking about every page. */
+    ulong windowEnd = 0;
+    bool windowReserved = false;
+
+    for (ulong pfn = 0; pfn < PageArrayCount; pfn++)
+    {
+        ulong phyAddr = pfn * Const::PageSize;
+
+        if (phyAddr >= windowEnd)
+        {
+            ulong reservedEnd = mmap.GetReservedEnd(phyAddr);
+            if (reservedEnd != 0)
+            {
+                windowReserved = true;
+                windowEnd = reservedEnd;
+            }
+            else
+            {
+                windowReserved = false;
+                windowEnd = mmap.GetNextReservedStart(phyAddr,
+                    PageArrayCount * Const::PageSize);
+            }
+        }
+
+        Page* page = &PageArray[pfn];
+        if (page->GetPhyAddress() != phyAddr)
+        {
+            wrongPhys++;
+            continue;
+        }
+
+        /* A self-pointing ListEntry means the page is not on the free list,
+           the same test AllocContiguousPages uses. */
+        if (page->ListEntry.Flink == &page->ListEntry)
+            continue;
+
+        onList++;
+
+        if (windowReserved)
+            inReserved++;
+        if (phyAddr >= kernelPhysStart && phyAddr < kernelPhysEnd)
+            inKernel++;
+        if (!mmap.IsUsableRam(phyAddr))
+            outsideRam++;
+    }
+
+    printer.Printf("pages: %u descriptors, %u on the free list (counter says %u)\n",
+        PageArrayCount, onList, FreePagesCount);
+    printer.Printf("free pages inside a reserved region: %u\n", inReserved);
+    printer.Printf("free pages inside the kernel image:  %u\n", inKernel);
+    printer.Printf("free pages outside usable RAM:       %u\n", outsideRam);
+    printer.Printf("descriptors with a wrong phys addr:  %u\n", wrongPhys);
+
+    bool ok = (inReserved == 0) && (inKernel == 0) && (outsideRam == 0) &&
+        (wrongPhys == 0);
+    printer.Printf("memcheck: %s (live snapshot, not locked)\n",
+        ok ? "ok" : "FAILED");
 }
 
 Page* PageTable::AllocPage()
@@ -778,9 +866,18 @@ Page* PageTable::AllocContiguousPages(ulong count)
        physically contiguous.  A page is on the free list if its
        ListEntry is NOT self-pointing (AllocPageNoLock re-inits the
        ListEntry to self-pointing upon removal). */
+    /* The walk below is unbounded by design: capping it would turn a slow
+       allocation into a spurious out-of-memory, and plain operator new
+       panics on that. What it must not do is be invisible -- it runs with
+       this lock held and interrupts off, so a long one is a stall every
+       other CPU feels. Say so once it gets there. */
+    static const ulong LongSearchEntries = 1024;
+    ulong examined = 0;
+
     auto* entry = FreePagesList.Flink;
     while (entry != &FreePagesList)
     {
+        examined++;
         Page* first = CONTAINING_RECORD(entry, Page, ListEntry);
         ulong basePhyAddr = first->GetPhyAddress();
         ulong baseIndex = (ulong)(first - PageArray);
@@ -827,9 +924,15 @@ Page* PageTable::AllocContiguousPages(ulong count)
             TmpUnmapPage(va);
         }
 
+        if (examined > LongSearchEntries)
+            Trace(0, "AllocContiguousPages: %u pages found after %u entries",
+                count, examined);
+
         return first;
     }
 
+    Trace(0, "AllocContiguousPages: no run of %u pages in %u entries",
+        count, examined);
     return nullptr;
 }
 

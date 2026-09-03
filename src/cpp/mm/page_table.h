@@ -1,6 +1,7 @@
 #pragma once
 
 #include <lib/stdlib.h>
+#include <lib/printer.h>
 #include <kernel/spin_lock.h>
 #include <kernel/panic.h>
 #include <hal/pte.h>
@@ -187,6 +188,16 @@ public:
        it non-executable (NX/PXN). Walks the 4KiB leaf PTEs in [virtAddr,
        virtAddr+sizeBytes) and invalidates the local TLB. */
     bool ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable, bool executable);
+
+    /* Walk every page descriptor and report any page that is on the free
+       list but must not be: inside a reserved region, inside the kernel
+       image, or outside usable RAM. That is the invariant the whole
+       memory-map carve-out scheme rests on, and its violation is silent
+       until something overwrites PageArray or an ACPI table. Deliberately
+       runs without the lock -- it is a diagnostic, and holding this lock
+       across sixteen million pages would stall the machine harder than any
+       fault it could find. */
+    void CheckFreeList(Stdlib::Printer& printer);
 
     Page* AllocPage();
     static const ulong MaxContiguousPages = 128;

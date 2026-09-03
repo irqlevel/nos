@@ -231,6 +231,12 @@ static void CmdMemusage(const char* args, Stdlib::Printer& con)
     con.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
 }
 
+static void CmdMemcheck(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    Mm::PageTable::GetInstance().CheckFreeList(con);
+}
+
 static void CmdMeminfo(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -1367,6 +1373,7 @@ static const CmdEntry Commands[] = {
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },
     { "meminfo",   CmdMeminfo,   "meminfo - show the firmware memory map and what of it is used" },
+    { "memcheck",  CmdMemcheck,  "memcheck - verify no reserved page reached the free list" },
     { "irqstat",   CmdIrqstat,   "irqstat - show interrupt statistics" },
     { "pci",       CmdPci,       "pci - show pci devices" },
     { "usb",       CmdUsb,       "usb - show usb controllers and ports" },
