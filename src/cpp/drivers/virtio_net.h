@@ -107,7 +107,13 @@ private:
 
     int AllocTxSlot();
     void FreeTxSlot(int idx);
-    void CompleteTx();
+    /* Moves every frame the device is done with onto done, rather than
+       releasing them: the caller holds TxQueueLock with interrupts off, and
+       NetFrame::Put reaches Mm::Free, which shoots down TLBs on every other
+       CPU and waits for each to acknowledge. A CPU spinning on TxQueueLock
+       has interrupts off and can never acknowledge, so the two wait for each
+       other forever. The caller drains done after unlocking. */
+    void CompleteTx(Stdlib::ListEntry& done);
     void ClassifyTxFrame(NetFrame* frame);
 
     static void RxFrameRelease(NetFrame* frame, void* ctx);
