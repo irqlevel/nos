@@ -362,6 +362,8 @@ static void CmdTop(const char* args, Stdlib::Printer& con)
 
     Mm::Free(after);
     Mm::Free(before);
+
+    con.Printf("task migrations since boot: %u\n", (ulong)GetTaskMigrationCount());
 }
 
 /* Sampled on the per-CPU tick, so the resolution is the tick rate: enough

@@ -92,6 +92,12 @@ public:
     void SetCpuAffinity(ulong affinity);
     ulong GetCpuAffinity();
 
+    /* How much lighter another CPU's queue has to be before a running task
+       is moved to it. Two, because the task is still counted where it is. */
+    static const long MigrateThreshold = 2;
+
+    /* The queue this task should be on: the lightest one its affinity
+       allows, or nullptr to say it is already on the right one. */
     TaskQueue* SelectNextTaskQueue();
 
     static const long StateWaiting = 1;

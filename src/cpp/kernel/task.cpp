@@ -301,40 +301,57 @@ ulong Task::GetCpuAffinity()
 
 TaskQueue* Task::SelectNextTaskQueue()
 {
-    class TaskQueue* taskQueue = nullptr;
     /* The mirror, not the locked walk: this runs on every context switch,
        and GetRunningCpus takes the table lock and then each of the 64 CPUs'
        own locks to read one flag apiece. Nothing ever clears StateRunning,
        so the two answers agree once a CPU has published itself. */
     ulong cpuMask = CpuTable::GetInstance().GetRunningCpusNoLock() & CpuAffinity;
-    if (cpuMask != 0)
+    if (cpuMask == 0)
+        return nullptr;
+
+    /* Read once: Remove() clears it, and the caller may be about to. */
+    class TaskQueue* current = TaskQueue;
+
+    class TaskQueue* best = nullptr;
+    long bestCount = 0;
+
+    for (ulong i = 0; i < MaxCpus; i++)
     {
-        for (ulong i = 0; i < MaxCpus; i++)
+        if (!(cpuMask & (1UL << i)))
+            continue;
+
+        auto& cand = CpuTable::GetInstance().GetCpu(i).GetTaskQueue();
+        long count = cand.GetTaskCount();
+
+        /* The queue this task is already on competes like any other. It used
+           to be skipped outright, which meant every task was moved to another
+           CPU on every context switch -- not balancing, just motion, and it
+           threw away whatever the task had warm in that core's caches. */
+        if (best == nullptr || count < bestCount)
         {
-            if (cpuMask & (1UL << i))
-            {
-                auto& candTaskQueue = CpuTable::GetInstance().GetCpu(i).GetTaskQueue();
-                if (&candTaskQueue == TaskQueue)
-                    continue;
-
-                if (taskQueue == nullptr)
-                {
-                    taskQueue = &candTaskQueue;
-                }
-                else
-                {
-                    if (taskQueue->GetSwitchContextCounter() > candTaskQueue.GetSwitchContextCounter())
-                    {
-                        taskQueue = &candTaskQueue;
-                    }
-                }
-
-                continue;
-            }
+            best = &cand;
+            bestCount = count;
         }
     }
 
-    return taskQueue;
+    if (best == nullptr)
+        return nullptr;
+
+    /* Placing a task for the first time: there is nowhere to stay. */
+    if (current == nullptr)
+        return best;
+
+    if (best == current)
+        return nullptr;
+
+    /* This task is still counted on its own queue, so moving it takes one
+       off that side and puts one on the other: a difference of one would
+       only be reversed on the next switch, and the task would trade places
+       forever. Move for two. */
+    if (bestCount + MigrateThreshold > current->GetTaskCount())
+        return nullptr;
+
+    return best;
 }
 
 TaskTable::TaskTable()

@@ -24,6 +24,11 @@ public:
 
     long GetSwitchContextCounter();
 
+    /* How many tasks sit on this queue. Maintained by every membership
+       change, which is not the same set as every list operation: SelectNext
+       rotates the list without changing what is on it. */
+    long GetTaskCount();
+
     /* Free tasks that exited on this queue's CPU. Must be called with
        interrupts enabled (it frees stacks, which triggers a blocking TLB
        shootdown) -- see SwitchComplete. */
@@ -58,10 +63,14 @@ private:
 
     Atomic ScheduleCounter;
     Atomic SwitchContextCounter;
+    Atomic TaskCount;
 };
 
 
 void Schedule();
 void Sleep(ulong nanoSecs);
+
+/* Tasks moved between CPU queues since boot. */
+long GetTaskMigrationCount();
 
 }
