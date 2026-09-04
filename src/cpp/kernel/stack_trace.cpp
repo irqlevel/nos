@@ -45,7 +45,12 @@ namespace Kernel
         if (stackPtr->Magic1 == Task::StackMagic1 &&
             stackPtr->Magic2 == Task::StackMagic2)
         {
-            return StackTrace::CaptureFrom(rbp, base, base + Task::StackSize, frames, maxFrames);
+            /* Up to StackTop, not to the end of the struct: the last word is
+               Magic2, and a walk allowed to read it reports the guard value
+               as a return address -- 0xCBDECBDE appearing as this task's
+               outermost caller, which is not a caller at all. */
+            return StackTrace::CaptureFrom(rbp, base,
+                (ulong)&stackPtr->StackTop[0], frames, maxFrames);
         }
 
         /* Fallback: conservative page-aligned bounds */
