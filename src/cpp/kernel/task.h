@@ -83,6 +83,10 @@ public:
     void SetName(const char *fmt, ...);
     const char* GetName();
 
+    /* Bytes of this task's stack that the poison scan still finds intact --
+       the part it has never reached. 0 when it has no stack yet. */
+    ulong GetStackFree();
+
     void UpdateRuntime();
 
     void SetCpuAffinity(ulong affinity);
@@ -158,6 +162,9 @@ public:
     Task* Lookup(ulong pid);
 
     void Ps(Stdlib::Printer& printer);
+
+    /* High-water marks of every task stack, worst free tracked in worstFree. */
+    void Stacks(Stdlib::Printer& printer, ulong& worstFree);
 
     /* One task's accumulated CPU time, copied out under the bucket lock so
        the sample stays readable after the task itself is gone -- `top` takes

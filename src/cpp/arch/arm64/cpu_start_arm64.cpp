@@ -1,6 +1,7 @@
 #include "board.h"
 
 #include <kernel/cpu.h>
+#include <kernel/stack_probe.h>
 #include <kernel/parameters.h>
 #include <kernel/trace.h>
 #include <kernel/time.h>
@@ -67,6 +68,48 @@ static_assert(sizeof(Arm64ApStackTop) / sizeof(Arm64ApStackTop[0]) == MaxCpus,
 static_assert(Board::MaxBoardCpus <= MaxCpus,
     "the FDT CPU table must not outgrow the kernel's CPU cap");
 
+/* boot.S */
+extern "C" char BootStack[];
+extern "C" char BootStackTop[];
+
+void ReportCpuStacks(Stdlib::Printer& printer, ulong& worstFree)
+{
+    /* The BSP's boot stack carries all of MainArm64 -- the deepest code on
+       this arch -- and the AP stacks carry bring-up until Cpu::Run moves each
+       one onto an idle-task stack. None of them has the magic word or the
+       one-page tripwire a task stack gets. */
+    struct { const char* Name; char* Base; ulong Size; ulong Id; } stacks[MaxCpus + 1];
+    ulong count = 0;
+
+    stacks[count].Name = "boot";
+    stacks[count].Base = &BootStack[0];
+    stacks[count].Size = (ulong)&BootStackTop[0] - (ulong)&BootStack[0];
+    stacks[count].Id = 0;
+    count++;
+
+    for (ulong i = 0; i < MaxCpus && count < Stdlib::ArraySize(stacks); i++)
+    {
+        stacks[count].Name = "cpu-boot";
+        stacks[count].Base = &ApBootStack[i][0];
+        stacks[count].Size = ApBootStackSize;
+        stacks[count].Id = i;
+        count++;
+    }
+
+    for (ulong i = 0; i < count; i++)
+    {
+        ulong free = StackProbe::Untouched(stacks[i].Base, stacks[i].Size);
+        if (free == stacks[i].Size)
+            continue;
+
+        printer.Printf("static %u %u %u %s\n", stacks[i].Id,
+            stacks[i].Size - free, stacks[i].Size, stacks[i].Name);
+
+        if (free < worstFree)
+            worstFree = free;
+    }
+}
+
 bool CpuTable::StartAll()
 {
     auto& board = Board::GetInstance();
@@ -77,7 +120,12 @@ bool CpuTable::StartAll()
 
     Arm64ApTtbr1 = Mm::PageTable::GetInstance().GetRoot();
     for (ulong i = 0; i < Stdlib::ArraySize(Arm64ApStackTop) && i < MaxCpus; i++)
+    {
+        /* Filled before any AP is on it, so what survives is what it never
+           reached. */
+        StackProbe::Poison(&ApBootStack[i][0], ApBootStackSize);
         Arm64ApStackTop[i] = (ulong)&ApBootStack[i][ApBootStackSize - 16];
+    }
 
     CleanDcacheLine(&Arm64ApTtbr1);
     for (ulong i = 0; i < Stdlib::ArraySize(Arm64ApStackTop); i++)

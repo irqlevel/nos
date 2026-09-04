@@ -62,6 +62,7 @@
 #include <fs/ext2.h>
 #include <fs/nanofs.h>
 #include <fs/procfs.h>
+#include <kernel/stack_probe.h>
 
 using namespace Kernel;
 using namespace Stdlib;
@@ -737,6 +738,32 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
             i, (ulong)&Stack[i][0], (ulong)&Stack[i][CpuStackSize]);
     }
 
+    /* Fill the per-CPU static stacks with the pattern whose survival tells us
+       later how deep they went. Only the BSP is running here, so every other
+       stack can be filled whole; the one this code is standing on is filled
+       from its base to a margin below the stack pointer, since the fill runs
+       on it. */
+    {
+        const ulong sp = GetRsp();
+        const ulong PoisonMargin = 2048;
+
+        for (ulong i = 0; i < MaxCpus; i++)
+        {
+            ulong base = (ulong)&Stack[i][0];
+            ulong size = CpuStackSize;
+
+            if (sp > base && sp < base + CpuStackSize)
+            {
+                if (sp - base <= PoisonMargin)
+                    continue;
+
+                size = (sp - base - PoisonMargin) & ~(sizeof(ulong) - 1);
+            }
+
+            StackProbe::Poison((void*)base, size);
+        }
+    }
+
     auto& bpt = Mm::BuiltinPageTable::GetInstance();
     if (!bpt.Setup())
     {
@@ -949,4 +976,29 @@ extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 {
     ALLOC_CPU_STACK();
     Main2(MbInfo);
+}
+
+namespace Kernel
+{
+
+void ReportCpuStacks(Stdlib::Printer& printer, ulong& worstFree)
+{
+    /* These carry the deepest code in the kernel -- all of Main2 and the
+       bring-up path run here, before the first task stack exists -- and
+       unlike a task stack they have neither a magic word nor the one-page
+       tripwire GetCurrentTask checks. */
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        ulong free = StackProbe::Untouched(&Stack[i][0], CpuStackSize);
+        if (free == CpuStackSize)
+            continue;
+
+        printer.Printf("static %u %u %u cpu-boot\n", i,
+            (ulong)CpuStackSize - free, (ulong)CpuStackSize);
+
+        if (free < worstFree)
+            worstFree = free;
+    }
+}
+
 }

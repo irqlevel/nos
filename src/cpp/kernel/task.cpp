@@ -1,4 +1,5 @@
 #include "task.h"
+#include "stack_probe.h"
 #include "trace.h"
 #include <hal/cpu.h>
 #include <hal/context.h>
@@ -136,6 +137,10 @@ bool Task::PrepareStart(Func func, void* ctx)
     {
         return false;
     }
+
+    /* Before the task runs, so what survives the fill is exactly what it
+       never touched. */
+    StackProbe::Poison(&StackPtr->StackBottom[0], sizeof(StackPtr->StackBottom));
 
     Trace(TaskLL, "task 0x%p %s stack 0x%p top 0x%p",
         this, Name, (ulong)StackPtr, (ulong)&StackPtr->StackTop[0]);
@@ -423,6 +428,47 @@ size_t TaskTable::SampleCpu(CpuSample* out, size_t max)
     }
 
     return n;
+}
+
+ulong Task::GetStackFree()
+{
+    if (StackPtr == nullptr)
+        return 0;
+
+    return StackProbe::Untouched(&StackPtr->StackBottom[0],
+        sizeof(StackPtr->StackBottom));
+}
+
+void TaskTable::Stacks(Stdlib::Printer& printer, ulong& worstFree)
+{
+    for (size_t i = 0; i < Stdlib::ArraySize(TaskList); i++)
+    {
+        Stdlib::AutoLock lock(Lock[i]);
+
+        size_t walked = 0;
+        for (auto currEntry = TaskList[i].Flink;
+            currEntry != &TaskList[i];
+            currEntry = currEntry->Flink)
+        {
+            if (++walked > MaxTasksPerList)
+            {
+                printer.Printf("task list %u does not end after %u entries\n",
+                    (ulong)i, (ulong)MaxTasksPerList);
+                break;
+            }
+
+            Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
+            ulong free = task->GetStackFree();
+            if (free == 0)
+                continue;
+
+            printer.Printf("task %u %u %u %s\n", task->Pid,
+                (ulong)Task::StackSize - free, (ulong)Task::StackSize, task->GetName());
+
+            if (free < worstFree)
+                worstFree = free;
+        }
+    }
 }
 
 void TaskTable::Ps(Stdlib::Printer& printer)
