@@ -302,7 +302,11 @@ ulong Task::GetCpuAffinity()
 TaskQueue* Task::SelectNextTaskQueue()
 {
     class TaskQueue* taskQueue = nullptr;
-    ulong cpuMask = CpuTable::GetInstance().GetRunningCpus() & CpuAffinity;
+    /* The mirror, not the locked walk: this runs on every context switch,
+       and GetRunningCpus takes the table lock and then each of the 64 CPUs'
+       own locks to read one flag apiece. Nothing ever clears StateRunning,
+       so the two answers agree once a CPU has published itself. */
+    ulong cpuMask = CpuTable::GetInstance().GetRunningCpusNoLock() & CpuAffinity;
     if (cpuMask != 0)
     {
         for (ulong i = 0; i < MaxCpus; i++)
