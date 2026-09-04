@@ -210,6 +210,137 @@ static void CmdDate(const char* args, Stdlib::Printer& con)
     con.Printf("%u-%u-%u %u:%u:%u UTC\n", y, mo, d, h, m, s);
 }
 
+/* Percentages are per CPU, the way top has always reported them: a thread
+   pinning one core reads 100%, and on a 20-CPU box the column can total
+   2000%. Two samples a moment apart, because a cumulative runtime tells you
+   what a task has ever done, not what it is doing. */
+static void CmdTop(const char* args, Stdlib::Printer& con)
+{
+    static const ulong MaxSamples = 256;
+    static const ulong DefaultIntervalMs = 500;
+    static const ulong MaxIntervalMs = 10000;
+    static const ulong Tag = 'Top ';
+
+    const char* end;
+    const char* tok = Stdlib::NextToken(args, end);
+
+    ulong intervalMs = DefaultIntervalMs;
+    if (tok)
+    {
+        char buf[16];
+        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+
+        ulong ms;
+        if (!Stdlib::ParseUlong(buf, ms) || ms == 0 || ms > MaxIntervalMs)
+        {
+            con.Printf("usage: top [interval-ms, 1-%u]\n", MaxIntervalMs);
+            return;
+        }
+        intervalMs = ms;
+    }
+
+    ulong bytes = MaxSamples * sizeof(TaskTable::CpuSample);
+    auto* before = (TaskTable::CpuSample*)Mm::Alloc(bytes, Tag);
+    if (!before)
+    {
+        con.Printf("top: out of memory\n");
+        return;
+    }
+
+    auto* after = (TaskTable::CpuSample*)Mm::Alloc(bytes, Tag);
+    if (!after)
+    {
+        Mm::Free(before);
+        con.Printf("top: out of memory\n");
+        return;
+    }
+
+    auto& table = TaskTable::GetInstance();
+
+    /* Clock read before the first sample and after the second, so the window
+       is never narrower than the runtime it is dividing: a task then reads a
+       shade under its true share rather than a shade over 100%. */
+    ulong t0 = GetBootTime().GetValue();
+    size_t n0 = table.SampleCpu(before, MaxSamples);
+
+    Sleep(intervalMs * Const::NanoSecsInMs);
+
+    size_t n1 = table.SampleCpu(after, MaxSamples);
+    ulong elapsed = GetBootTime().GetValue() - t0;
+
+    if (elapsed == 0)
+    {
+        Mm::Free(after);
+        Mm::Free(before);
+        con.Printf("top: no time passed\n");
+        return;
+    }
+
+    /* Tenths of a percent, so the column keeps one decimal without floats. */
+    ulong permille[MaxSamples];
+    for (size_t i = 0; i < n1; i++)
+    {
+        ulong was = 0;
+        for (size_t j = 0; j < n0; j++)
+        {
+            if (before[j].Pid == after[i].Pid)
+            {
+                was = before[j].RuntimeNs;
+                break;
+            }
+        }
+
+        ulong delta = (after[i].RuntimeNs > was) ? (after[i].RuntimeNs - was) : 0;
+        permille[i] = (delta * 1000) / elapsed;
+    }
+
+    /* Selection sort: a couple of hundred entries at most, and it keeps the
+       shell free of anything that allocates. */
+    for (size_t i = 0; i < n1; i++)
+    {
+        size_t best = i;
+        for (size_t j = i + 1; j < n1; j++)
+        {
+            if (permille[j] > permille[best])
+                best = j;
+        }
+
+        if (best != i)
+        {
+            ulong p = permille[i]; permille[i] = permille[best]; permille[best] = p;
+            TaskTable::CpuSample t = after[i]; after[i] = after[best]; after[best] = t;
+        }
+    }
+
+    ulong cpus = 0;
+    ulong mask = CpuTable::GetInstance().GetRunningCpus();
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (mask & (1UL << i))
+            cpus++;
+    }
+
+    ulong busy = 0;
+    for (size_t i = 0; i < n1; i++)
+    {
+        if (Stdlib::StrStr(after[i].Name, "idle") != after[i].Name)
+            busy += permille[i];
+    }
+
+    con.Printf("cpus %u, %u tasks, %u ms window, busy %u.%u%% of %u00%%\n",
+        cpus, (ulong)n1, intervalMs, busy / 10, busy % 10, cpus);
+    con.Printf("  pid    cpu%%  name\n");
+
+    for (size_t i = 0; i < n1; i++)
+    {
+        con.Printf("%u %u.%u %s\n", after[i].Pid,
+            permille[i] / 10, permille[i] % 10, after[i].Name);
+    }
+
+    Mm::Free(after);
+    Mm::Free(before);
+}
+
 static void CmdPs(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -1370,6 +1501,7 @@ static const CmdEntry Commands[] = {
     { "uptime",    CmdUptime,    "uptime - show uptime" },
     { "date",      CmdDate,      "date - show wall clock time" },
     { "ps",        CmdPs,        "ps - show tasks" },
+    { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },
     { "meminfo",   CmdMeminfo,   "meminfo - show the firmware memory map and what of it is used" },

@@ -392,6 +392,39 @@ Task* TaskTable::Lookup(ulong pid)
     return reinterpret_cast<Task*>(TaskObjectTable.Lookup(pid));
 }
 
+size_t TaskTable::SampleCpu(CpuSample* out, size_t max)
+{
+    size_t n = 0;
+
+    for (size_t i = 0; i < Stdlib::ArraySize(TaskList) && n < max; i++)
+    {
+        Stdlib::AutoLock lock(Lock[i]);
+
+        size_t walked = 0;
+        for (auto currEntry = TaskList[i].Flink;
+            currEntry != &TaskList[i] && n < max;
+            currEntry = currEntry->Flink)
+        {
+            if (++walked > MaxTasksPerList)
+            {
+                Trace(0, "SampleCpu: task list %u does not end after %u entries",
+                    (ulong)i, (ulong)MaxTasksPerList);
+                break;
+            }
+
+            Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
+
+            out[n].Pid = task->Pid;
+            out[n].RuntimeNs = task->Runtime.GetValue();
+            Stdlib::MemCpy(out[n].Name, task->GetName(), sizeof(out[n].Name));
+            out[n].Name[sizeof(out[n].Name) - 1] = '\0';
+            n++;
+        }
+    }
+
+    return n;
+}
+
 void TaskTable::Ps(Stdlib::Printer& printer)
 {
     printer.Printf("pid state flags runtime ctxswitches name\n");

@@ -13,6 +13,9 @@
 namespace Kernel
 {
 
+/* Task name buffer, shared by Task and by TaskTable::CpuSample. */
+static const size_t TaskNameLen = 32;
+
 class Task final : public Object
 {
 public:
@@ -135,7 +138,7 @@ private:
     void* Ctx;
     Atomic RefCounter;
 
-    char Name[32];
+    char Name[TaskNameLen];
 
     static const ulong Tag = 'Task';
 };
@@ -155,6 +158,18 @@ public:
     Task* Lookup(ulong pid);
 
     void Ps(Stdlib::Printer& printer);
+
+    /* One task's accumulated CPU time, copied out under the bucket lock so
+       the sample stays readable after the task itself is gone -- `top` takes
+       two of these a moment apart and subtracts. */
+    struct CpuSample
+    {
+        ulong Pid;
+        ulong RuntimeNs;
+        char Name[TaskNameLen];
+    };
+
+    size_t SampleCpu(CpuSample* out, size_t max);
 
 private:
     TaskTable(const TaskTable& other) = delete;
