@@ -153,8 +153,8 @@ void Profiler::Sample(Context* ctx)
        not a walk from in here, which would have to guess how many of its own
        frames to skip. */
     record.Frame[0] = ctx->GetRetRip();
-    record.Depth = 1 + StackTrace::CaptureFrom(ctx->GetFramePointer(),
-        &record.Frame[1], MaxDepth - 1);
+    record.Depth = 1 + StackTrace::CaptureFromSp(ctx->GetFramePointer(),
+        ctx->GetOrigRsp(), &record.Frame[1], MaxDepth - 1);
 
     cpu.Count++;
 }
