@@ -11,6 +11,7 @@
 #include <block/partition.h>
 #include "parameters.h"
 #include <net/net_device.h>
+#include <net/net_frame_pool.h>
 #include <net/net.h>
 #include <net/arp.h>
 #include <net/dhcp.h>
@@ -629,6 +630,12 @@ static void CmdNet(const char* args, Stdlib::Printer& con)
 {
     (void)args;
     NetDeviceTable::GetInstance().Dump(con);
+}
+
+static void CmdNetpool(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    NetFramePool::GetInstance().Dump(con);
 }
 
 static void CmdArp(const char* args, Stdlib::Printer& con)
@@ -1515,6 +1522,7 @@ static const CmdEntry Commands[] = {
     { "diskwrite", CmdDiskwrite, "diskwrite <disk> <sector> <hex> - write sector" },
     { "net",       CmdNet,       "net - list network devices" },
     { "arp",       CmdArp,       "arp - show ARP table" },
+    { "netpool",   CmdNetpool,   "netpool - show the recycled net frame pool" },
     { "netconsole", CmdNetconsole, "netconsole - show netconsole state" },
     { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
     { "tcpstat",   CmdTcpstat,   "tcpstat - show TCP connections and statistics" },

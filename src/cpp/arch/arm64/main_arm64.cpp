@@ -41,6 +41,7 @@ extern "C" void __cxa_finalize(void*);
 extern "C" char BootStackTop[];
 #include <net/udp_shell.h>
 #include <net/netconsole.h>
+#include <net/net_frame_pool.h>
 #include <net/net_device.h>
 
 /* arm64 boot orchestrator, the Main2 twin (kernel/main.cpp). Milestone M2:
@@ -198,6 +199,8 @@ static void BpStartupArm(void* ctx)
 
         VirtioBlk::InitAllMmio(Slots, count);
         VirtioScsi::InitAllMmio(Slots, count);
+        NetFramePool::GetInstance().Setup(NetFramePool::DefaultFrameCount);
+
         VirtioNet::InitAllMmio(Slots, count);
         VirtioRng::InitAllMmio(Slots, count);
     }

@@ -1,4 +1,5 @@
 #include "net_frame.h"
+#include "net_frame_pool.h"
 
 #include <lib/stdlib.h>
 #include <mm/new.h>
@@ -35,6 +36,15 @@ void NetFrame::Put()
 
 NetFrame* NetFrame::AllocTx(ulong dataLen)
 {
+    /* The pool holds frames that were built once and never handed back to
+       the allocator: no Mm::Alloc, no VirtToPhys walk, and on release no
+       Mm::Free and so no cross-CPU TLB shootdown. Anything it cannot serve
+       -- too large, or the pool exhausted -- falls through to the slow path
+       below, which is what this used to be. */
+    NetFrame* pooled = NetFramePool::GetInstance().Alloc(dataLen);
+    if (pooled != nullptr)
+        return pooled;
+
     ulong totalSize = sizeof(NetFrame) + dataLen;
     NetFrame* frame = (NetFrame*)Mm::Alloc(totalSize, 'NtFr');
     if (!frame)

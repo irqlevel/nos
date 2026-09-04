@@ -54,6 +54,7 @@
 #include <block/block_device.h>
 #include <block/partition.h>
 #include <net/udp_shell.h>
+#include <net/net_frame_pool.h>
 #include <net/netconsole.h>
 #include <net/tcp.h>
 #include <fs/vfs.h>
@@ -513,6 +514,11 @@ void BpStartup(void* ctx)
         MountRootFs();
 
         rust_init();
+
+        /* Before any driver can want a frame: the pool is what keeps the
+           datapath clear of the allocator, and of the TLB shootdown that
+           freeing a frame would otherwise cost. */
+        NetFramePool::GetInstance().Setup(NetFramePool::DefaultFrameCount);
 
         VirtioNet::InitAll();
         VirtioRng::InitAll();
