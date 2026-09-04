@@ -10,6 +10,16 @@
 namespace Kernel
 {
 
+/* Tasks moved from one CPU's queue to another. This used to happen on every
+   context switch by construction; it is now supposed to be rare, and a
+   number is the only way to know whether it is. */
+static Atomic TaskMigrations;
+
+long GetTaskMigrationCount()
+{
+    return TaskMigrations.Get();
+}
+
 TaskQueue::TaskQueue()
 {
     Stdlib::AutoLock lock(Lock);
@@ -18,6 +28,7 @@ TaskQueue::TaskQueue()
 
     SwitchContextCounter.Set(0);
     ScheduleCounter.Set(0);
+    TaskCount.Set(0);
 }
 
 void TaskQueue::ReapExited()
@@ -53,6 +64,7 @@ void TaskQueue::SwitchComplete(Task* curr)
         auto taskQueue = prev->SelectNextTaskQueue();
         if (taskQueue != nullptr)
         {
+            TaskMigrations.Inc();
             prev->Get();
             prev->TaskQueue->Remove(prev);
             taskQueue->Insert(prev);
@@ -148,6 +160,8 @@ void TaskQueue::Schedule(Task* curr)
             BugOn(curr->ListEntry.IsEmpty());
             curr->TaskQueue = nullptr;
             curr->ListEntry.RemoveInit();
+            TaskCount.Dec();
+            BugOn(TaskCount.Get() < 0);
         }
 
         next = SelectNext(curr);
@@ -207,6 +221,7 @@ void TaskQueue::Insert(Task* task)
 
     task->TaskQueue = this;
     TaskList.InsertTail(&task->ListEntry);
+    TaskCount.Inc();
 }
 
 void TaskQueue::Remove(Task* task)
@@ -219,6 +234,8 @@ void TaskQueue::Remove(Task* task)
         BugOn(task->ListEntry.IsEmpty());
         task->TaskQueue = nullptr;
         task->ListEntry.RemoveInit();
+        TaskCount.Dec();
+        BugOn(TaskCount.Get() < 0);
     }
 
     task->Put();
@@ -230,6 +247,7 @@ void TaskQueue::Clear()
     {
         Stdlib::AutoLock lock(Lock);
         taskList.MoveTailList(&TaskList);
+        TaskCount.Set(0);
     }
 
     if (taskList.IsEmpty())
@@ -251,6 +269,11 @@ void TaskQueue::Clear()
 TaskQueue::~TaskQueue()
 {
     Clear();
+}
+
+long TaskQueue::GetTaskCount()
+{
+    return TaskCount.Get();
 }
 
 long TaskQueue::GetSwitchContextCounter()

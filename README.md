@@ -378,7 +378,7 @@ it on a network you trust.
 | `date` | Show wall clock date and time (RTC + boot time) |
 | `stacks` | Stack high-water marks: every stack is filled with a pattern when it is created, and what is still intact is what it never reached. Catches a spike that lasted microseconds during boot, and costs nothing while the machine runs |
 | `ps` | Show tasks |
-| `top [ms]` | Per-task CPU use over a sampling window, percent per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%) |
+| `top [ms]` | Per-task CPU use over a sampling window, percent per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%), plus the number of tasks moved between CPU queues since boot |
 | `profile [ms] [pid]` | Sampling profiler: where the kernel spends its time, as whole call chains -- samples are folded by their entire stack, not by the leaf symbol, and the hottest chains are printed in full. Every frame carries its offset: the leaf as the instruction the sample landed on (a span when they spread across the body, so a hot spinlock says whether it sat on the exchange or in the pause loop), each caller as the return address that names which call site led there. Samples on a performance counter overflowing into an NMI (~1 kHz, and catches code running with interrupts off) where the CPU has architectural perfmon; falls back to the 100 Hz per-CPU tick where it does not. The report names which |
 | `bt <pid>` | Dump stack trace of a task (uses IPI for remote CPUs) |
 | `watchdog` | Watchdog stats: locks watched, table walks, and the slice of the bucket table each CPU walks (the table is divided among the CPUs, so a bucket is visited once per tick rather than once per tick per CPU) |
