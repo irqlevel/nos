@@ -20,7 +20,7 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
 - **Filesystem** — VFS layer with mount points and path resolution, ramfs (in-memory), nanofs (on-disk filesystem with 4 KB blocks, superblock with UUID, inode/data bitmaps, CRC32 checksums for superblock/inodes/data, file and recursive directory deletion, persistent across remount)
 - **Entropy** — `EntropySource` interface, `EntropySourceTable` registry, virtio-rng hardware random number generator
 - **Power management** — ACPI S5 shutdown, keyboard controller reset/reboot
-- **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `cpu`, `bt <pid>`, `dmesg [lines] [filter]`, `loglevel [N]`, `uptime`, `date`, `memusage`, `meminfo`, `memcheck`, `pci`, `disks`, `diskread`, `diskwrite`, `irqstat`, `net`, `arp`, `icmpstat`, `tcpstat`, `udpsend`, `ping`, `nslookup`, `dnsflush`, `dhcp`, `wget`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `panic`, `version`, `cls`, `help`, `poweroff`, `reboot`
+- **Interactive shell** — trace output suppressed during shell session (dmesg only), restored on shutdown; commands: `ps`, `top`, `cpu`, `bt <pid>`, `dmesg [lines] [filter]`, `loglevel [N]`, `uptime`, `date`, `memusage`, `meminfo`, `memcheck`, `pci`, `disks`, `diskread`, `diskwrite`, `irqstat`, `net`, `arp`, `icmpstat`, `tcpstat`, `udpsend`, `ping`, `nslookup`, `dnsflush`, `dhcp`, `wget`, `random`, `format`, `mount`, `umount`, `ls`, `cat`, `write`, `mkdir`, `touch`, `del`, `panic`, `version`, `cls`, `help`, `poweroff`, `reboot`
 - **Timekeeping** — TSC calibration via PIT channel 2 (multi-round median), KVM paravirt clock (`kvmclock`) for accurate VM time, RTC wall clock, layered clock source selection (kvmclock → calibrated TSC → PIT fallback), `GetBootTime()` / `GetWallTimeSecs()` API
 - **All of the machine's RAM, up to 512 GiB** — the bootstrap linear map
   covers the first 4 GiB at 2 MiB granularity, then one 1 GiB block per GiB
@@ -369,6 +369,7 @@ it on a network you trust.
 | `uptime` | Show uptime |
 | `date` | Show wall clock date and time (RTC + boot time) |
 | `ps` | Show tasks |
+| `top [ms]` | Per-task CPU use over a sampling window, percent per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%) |
 | `bt <pid>` | Dump stack trace of a task (uses IPI for remote CPUs) |
 | `watchdog` | Show watchdog stats |
 | `memusage` | Show memory usage |
