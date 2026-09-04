@@ -92,13 +92,52 @@ void NetLoad::OnFrame(const u8* frame, ulong len)
     if (!Echo)
         return;
 
-    IpAddress senderIp = IpAddress::FromNetwork(ip->SrcAddr);
-    u16 senderPort = Ntohs(udp->SrcPort);
+    (void)payload;
+    (void)payloadLen;
 
-    /* Straight back out from the receive path, the way Icmp answers a ping.
-       The payload pointer is into the receive frame and SendUdp copies it,
-       so nothing here outlives the call. */
-    if (Dev->SendUdp(senderIp, senderPort, Dev->GetIp(), Port, payload, payloadLen))
+    if (len > MaxFrameLen)
+    {
+        cpu.TxFailed++;
+        return;
+    }
+
+    /* The reply is the frame that arrived, with its addresses swapped -- the
+       way Icmp answers a ping, and for the same reason.
+
+       NetDevice::SendUdp must never be called from here. It resolves the
+       destination through ArpTable::Resolve, which on a cache miss sends a
+       request and then sleeps up to three seconds waiting for the answer.
+       This is the receive dispatch path: sleeping in it stops every packet
+       the machine would otherwise process, including the ICMP it needs to
+       answer a ping and the datagrams carrying the shell. ARP entries expire
+       after five minutes, so that miss is not a rare case -- it is one every
+       load test long enough to be interesting.
+
+       Swapping also costs less: SendUdp clears and rebuilds a 1514-byte
+       frame per packet, where everything needed is already here. */
+    u8 reply[MaxFrameLen];
+    Stdlib::MemCpy(reply, frame, len);
+
+    EthHdr* rEth = (EthHdr*)reply;
+    Stdlib::MemCpy(rEth->DstMac, ((const EthHdr*)frame)->SrcMac, 6);
+    Dev->GetMac().CopyTo(rEth->SrcMac);
+
+    IpHdr* rIp = (IpHdr*)(reply + sizeof(EthHdr));
+    rIp->SrcAddr = ip->DstAddr;
+    rIp->DstAddr = ip->SrcAddr;
+    rIp->Ttl = 64;
+    rIp->Checksum = 0;
+    rIp->Checksum = Htons(IpChecksum(rIp, ipHdrLen));
+
+    UdpHdr* rUdp = (UdpHdr*)(reply + sizeof(EthHdr) + ipHdrLen);
+    rUdp->SrcPort = udp->DstPort;
+    rUdp->DstPort = udp->SrcPort;
+
+    /* Zero means "not computed", which IPv4 allows and which is what this
+       saves a pass over the payload for. */
+    rUdp->Checksum = 0;
+
+    if (Dev->SendRaw(reply, len))
         cpu.TxPackets++;
     else
         cpu.TxFailed++;
