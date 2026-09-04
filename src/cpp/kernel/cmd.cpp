@@ -28,6 +28,7 @@
 #include "mutex.h"
 #include "task.h"
 #include "stack_probe.h"
+#include <net/net_load.h>
 #include "stack_trace.h"
 #include "symtab.h"
 #include "profiler.h"
@@ -444,6 +445,100 @@ static void CmdStacks(const char* args, Stdlib::Printer& con)
     }
 
     con.Printf("closest any stack came to its end: %u bytes free\n", worstFree);
+}
+
+static void CmdNetload(const char* args, Stdlib::Printer& con)
+{
+    auto& load = NetLoad::GetInstance();
+
+    const char* end;
+    const char* tok = Stdlib::NextToken(args, end);
+
+    if (tok == nullptr)
+    {
+        load.Dump(con);
+        return;
+    }
+
+    char buf[16];
+    Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+
+    if (Stdlib::StrCmp(buf, "stop") == 0)
+    {
+        if (!load.IsRunning())
+        {
+            con.Printf("netload: not running\n");
+            return;
+        }
+
+        load.Stop();
+        con.Printf("netload: stopped\n");
+        return;
+    }
+
+    if (Stdlib::StrCmp(buf, "reset") == 0)
+    {
+        load.ResetCounters();
+        con.Printf("netload: counters cleared\n");
+        return;
+    }
+
+    if (Stdlib::StrCmp(buf, "start") != 0)
+    {
+        con.Printf("usage: netload [start [port] [sink] | stop | reset]\n");
+        return;
+    }
+
+    if (load.IsRunning())
+    {
+        con.Printf("netload: already running\n");
+        return;
+    }
+
+    ulong port = NetLoad::DefaultPort;
+    bool echo = true;
+
+    tok = Stdlib::NextToken(end, end);
+    if (tok != nullptr)
+    {
+        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+
+        if (Stdlib::StrCmp(buf, "sink") == 0)
+        {
+            echo = false;
+        }
+        else
+        {
+            if (!Stdlib::ParseUlong(buf, port) || port == 0 || port > 65535)
+            {
+                con.Printf("usage: netload [start [port] [sink] | stop | reset]\n");
+                return;
+            }
+
+            tok = Stdlib::NextToken(end, end);
+            if (tok != nullptr)
+            {
+                Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+                if (Stdlib::StrCmp(buf, "sink") == 0)
+                    echo = false;
+            }
+        }
+    }
+
+    NetDevice* dev = NetDeviceTable::GetInstance().Find("eth0");
+    if (dev == nullptr)
+    {
+        con.Printf("netload: no eth0\n");
+        return;
+    }
+
+    if (!load.Start(dev, (u16)port, echo))
+    {
+        con.Printf("netload: could not start on port %u\n", port);
+        return;
+    }
+
+    con.Printf("netload: listening on udp %u, %s\n", port, echo ? "echo" : "sink");
 }
 
 static void CmdPs(const char* args, Stdlib::Printer& con)
@@ -1614,6 +1709,7 @@ static const CmdEntry Commands[] = {
     { "date",      CmdDate,      "date - show wall clock time" },
     { "ps",        CmdPs,        "ps - show tasks" },
     { "stacks",    CmdStacks,    "stacks - stack high-water marks" },
+    { "netload",   CmdNetload,   "netload [start [port] [sink]|stop|reset] - udp load target" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
     { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },

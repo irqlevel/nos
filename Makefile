@@ -92,6 +92,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/net/net_device.cpp \
     src/cpp/net/net_frame.cpp \
     src/cpp/net/net_frame_pool.cpp \
+    src/cpp/net/net_load.cpp \
     src/cpp/net/arp.cpp \
     src/cpp/net/dhcp.cpp \
     src/cpp/net/icmp.cpp \
@@ -202,6 +203,7 @@ CXX_SRC_aarch64 = \
     src/cpp/net/net_device.cpp \
     src/cpp/net/net_frame.cpp \
     src/cpp/net/net_frame_pool.cpp \
+    src/cpp/net/net_load.cpp \
     src/cpp/net/arp.cpp \
     src/cpp/net/dhcp.cpp \
     src/cpp/net/icmp.cpp \
