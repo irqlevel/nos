@@ -37,10 +37,33 @@ namespace Kernel
         return i;
     }
 
-    static size_t DetectBoundsAndCapture(ulong rbp, ulong *frames, size_t maxFrames)
+    static size_t DetectBoundsAndCapture(ulong rbp, ulong sp, ulong *frames, size_t maxFrames)
     {
-        /* Try task stack first (StackSize-aligned, validated by magic) */
-        ulong base = rbp & (~(Task::StackSize - 1));
+        /* The window comes from the stack pointer, never from the frame
+           pointer.
+
+           This walk runs on the very stack it is describing -- neither arch
+           switches stacks for a same-privilege interrupt, and NMI has no IST
+           here -- so the stack pointer is always a real address. The frame
+           pointer is not: it is whatever the interrupted code had in RBP, and
+           hand-written assembly uses that register for its own purposes
+           (asm.asm's RunOnStack loads it from an argument, SetJmp and LongJmp
+           save and restore it). A profiler sampling on a performance counter
+           lands in exactly that code, because the leaves of a hot path are
+           AtomicRead, SetRflags, ReadTsc and Pause.
+
+           Deriving the window from a garbage RBP and then reading the magic
+           word out of it dereferences an address that need not be mapped, or
+           even canonical, inside an NMI handler -- a fault with nothing left
+           to report it. Bounded by the stack pointer instead, a garbage frame
+           pointer simply fails CaptureFrom's range check and the walk returns
+           no frames, which is the honest answer.
+
+           `sp` is the stack pointer of the code being described, which is not
+           always this function's own: #DF is delivered on its own IST stack,
+           and its report is about the stack it came from. Callers holding a
+           Context pass GetOrigRsp(); the rest pass their own. */
+        ulong base = sp & (~(Task::StackSize - 1));
         Task::Stack* stackPtr = reinterpret_cast<Task::Stack*>(base);
         if (stackPtr->Magic1 == Task::StackMagic1 &&
             stackPtr->Magic2 == Task::StackMagic2)
@@ -53,14 +76,20 @@ namespace Kernel
                 (ulong)&stackPtr->StackTop[0], frames, maxFrames);
         }
 
-        /* Fallback: conservative page-aligned bounds */
-        base = rbp & (~(Const::PageSize - 1));
+        /* Not a task stack -- a per-CPU static stack, or the boot stack.
+           Still bounded by the stack pointer, so still a mapped page. */
+        base = sp & (~(Const::PageSize - 1));
         return StackTrace::CaptureFrom(rbp, base, base + Const::PageSize, frames, maxFrames);
     }
 
     size_t StackTrace::CaptureFrom(ulong rbp, ulong *frames, size_t maxFrames)
     {
-        return DetectBoundsAndCapture(rbp, frames, maxFrames);
+        return DetectBoundsAndCapture(rbp, Hal::GetSp(), frames, maxFrames);
+    }
+
+    size_t StackTrace::CaptureFromSp(ulong rbp, ulong sp, ulong *frames, size_t maxFrames)
+    {
+        return DetectBoundsAndCapture(rbp, sp, frames, maxFrames);
     }
 
     size_t StackTrace::Capture(ulong stackBase, ulong stackLimit, ulong *frames, size_t maxFrames)
@@ -70,6 +99,6 @@ namespace Kernel
 
     size_t StackTrace::Capture(ulong *frames, size_t maxFrames)
     {
-        return DetectBoundsAndCapture(Hal::GetFp(), frames, maxFrames);
+        return DetectBoundsAndCapture(Hal::GetFp(), Hal::GetSp(), frames, maxFrames);
     }
 }

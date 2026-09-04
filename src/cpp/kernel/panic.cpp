@@ -218,7 +218,6 @@ void Panicker::DoPanic(const char *fmt, ...)
 
 void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
 {
-    (void)hasErrorCode;
     InterruptDisable();
     if (Active.Cmpxchg(1, 0) == 0)
     {
@@ -236,9 +235,12 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
         PrintOutput(Message);
         DumpContext();
 
-        /* Walk backtrace from the faulting code's RBP */
+        /* Walk from the faulting code's RBP, over the stack its own RSP
+           names: #DF arrives on a separate IST stack, and the report wanted
+           is about the stack it came from. */
         ulong frames[16];
-        size_t count = StackTrace::CaptureFrom(ctx->GetFramePointer(), frames, Stdlib::ArraySize(frames));
+        size_t count = StackTrace::CaptureFromSp(ctx->GetFramePointer(),
+            ctx->GetOrigRsp(hasErrorCode), frames, Stdlib::ArraySize(frames));
         DumpBacktrace(frames, count);
 
         CollectRemoteStacks();
