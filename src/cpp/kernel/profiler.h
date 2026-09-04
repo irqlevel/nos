@@ -73,10 +73,10 @@ private:
        the machine's real width rather than MaxCpus. */
     static const ulong SamplesPerCpu = 1024;
 
-    /* How many distinct symbols a report can name, and how many it prints. */
-    static const ulong MaxSymbols = 128;
-    static const ulong TopSymbols = 12;
-    static const ulong TopCallers = 3;
+    /* How many distinct call chains a report can hold, and how many it
+       prints. A chain that does not fit is counted, not silently lost. */
+    static const ulong MaxChains = 128;
+    static const ulong TopChains = 8;
 
     struct Record
     {
@@ -96,7 +96,6 @@ private:
     };
 
     bool Allocate();
-    void ReportCallers(Stdlib::Printer& printer, const char* leaf, ulong pidFilter);
 
     volatile bool Active;
 
