@@ -59,6 +59,12 @@ public:
 
     void Dump(Stdlib::Printer& printer);
 
+    /* For a caller that wants to report pool health somewhere Dump cannot
+       reach -- a periodic trace, say, on a machine that has stopped
+       answering the shell. */
+    ulong GetAllocMisses();
+    ulong GetInFlight();
+
 private:
     NetFramePool();
     ~NetFramePool();

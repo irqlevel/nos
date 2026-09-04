@@ -232,6 +232,24 @@ void NetFramePool::PoolFrameRelease(NetFrame* frame, void* ctx)
     ((NetFramePool*)ctx)->Release(frame);
 }
 
+ulong NetFramePool::GetAllocMisses()
+{
+    return AllocMisses.Get();
+}
+
+ulong NetFramePool::GetInFlight()
+{
+    if (!Ready)
+        return 0;
+
+    ulong cached = 0;
+    for (ulong i = 0; i < MaxCpus; i++)
+        cached += Cache[i].Count;
+
+    ulong held = Ring.Count() + cached;
+    return (FrameCount > held) ? (FrameCount - held) : 0;
+}
+
 void NetFramePool::Dump(Stdlib::Printer& printer)
 {
     if (!Ready)
