@@ -323,6 +323,7 @@ BootPgTblIdL0:
     .space 4096
 BootPgTblIdL1:
     .space 4096
+    .globl BootStack
 BootStack:
     .space 16384
     .globl BootStackTop

@@ -22,6 +22,7 @@
 #include <kernel/preempt.h>
 #include <kernel/cmd.h>
 #include <kernel/softirq.h>
+#include <kernel/stack_probe.h>
 #include <fs/vfs.h>
 #include <hal/power.h>
 
@@ -66,6 +67,10 @@ bool InstallEarlyDeviceBlock(ulong realRoot); /* arch/arm64/builtin_pt.cpp */
 }
 
 void SetupVectors(); /* arch/arm64/exception_arm64.cpp */
+
+/* boot.S */
+extern "C" char BootStack[];
+extern "C" char BootStackTop[];
 
 typedef void (*HaltAction)();
 
@@ -335,6 +340,19 @@ extern "C" void MainArm64(void* dtb)
     using namespace Kernel;
 
     SetupVectors();
+
+    /* Fill the boot stack below the current stack pointer with the pattern
+       whose survival says later how deep this got. Everything above the
+       pointer is live and is left alone. */
+    {
+        ulong sp = Hal::GetSp();
+        ulong base = (ulong)&BootStack[0];
+        const ulong PoisonMargin = 2048;
+
+        if (sp > base + PoisonMargin)
+            StackProbe::Poison(&BootStack[0],
+                (sp - base - PoisonMargin) & ~(sizeof(ulong) - 1));
+    }
 
     auto& board = Board::GetInstance();
     board.Setup(dtb);

@@ -125,6 +125,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/kernel/raw_rw_spin_lock.cpp \
     src/cpp/kernel/rw_mutex.cpp \
     src/cpp/kernel/stack_trace.cpp \
+    src/cpp/kernel/stack_probe.cpp \
     src/cpp/kernel/symtab.cpp \
     src/cpp/kernel/entropy.cpp \
     src/cpp/kernel/rust_ffi.cpp \
@@ -169,6 +170,7 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/panic.cpp \
     src/cpp/kernel/debug.cpp \
     src/cpp/kernel/stack_trace.cpp \
+    src/cpp/kernel/stack_probe.cpp \
     src/cpp/kernel/symtab.cpp \
     src/cpp/kernel/atomic.cpp \
     src/cpp/kernel/spin_lock.cpp \

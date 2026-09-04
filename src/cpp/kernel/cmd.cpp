@@ -27,6 +27,7 @@
 #include "console.h"
 #include "mutex.h"
 #include "task.h"
+#include "stack_probe.h"
 #include "stack_trace.h"
 #include "symtab.h"
 #include "profiler.h"
@@ -418,6 +419,29 @@ static void CmdProfile(const char* args, Stdlib::Printer& con)
     con.Printf("\n");
 
     profiler.Report(con, pid);
+}
+
+static void CmdStacks(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+
+    /* High-water marks, not a snapshot: each stack was filled with a pattern
+       when it was created, and what is still intact is what it never
+       reached. A spike that lasted a microsecond during boot shows up here
+       just as clearly as a steady load. */
+    ulong worstFree = (ulong)-1;
+
+    con.Printf("kind id used size name\n");
+    ReportCpuStacks(con, worstFree);
+    TaskTable::GetInstance().Stacks(con, worstFree);
+
+    if (worstFree == (ulong)-1)
+    {
+        con.Printf("no stack has been touched yet\n");
+        return;
+    }
+
+    con.Printf("closest any stack came to its end: %u bytes free\n", worstFree);
 }
 
 static void CmdPs(const char* args, Stdlib::Printer& con)
@@ -1587,6 +1611,7 @@ static const CmdEntry Commands[] = {
     { "uptime",    CmdUptime,    "uptime - show uptime" },
     { "date",      CmdDate,      "date - show wall clock time" },
     { "ps",        CmdPs,        "ps - show tasks" },
+    { "stacks",    CmdStacks,    "stacks - stack high-water marks" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
     { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
