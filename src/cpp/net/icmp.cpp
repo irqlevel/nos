@@ -83,7 +83,7 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         if (IpAddress::FromNetwork(ip->DstAddr) != dev->GetIp())
             return;
 
-        Trace(0, "ICMP echo request: srcIp %p dstIp %p id %u seq %u",
+        Trace(IcmpLL, "ICMP echo request: srcIp %p dstIp %p id %u seq %u",
             (ulong)Ntohl(ip->SrcAddr), (ulong)Ntohl(ip->DstAddr),
             (ulong)Ntohs(icmp->Id), (ulong)Ntohs(icmp->Seq));
 
@@ -129,9 +129,9 @@ void Icmp::Process(NetDevice* dev, const u8* frame, ulong len)
         rIcmp->Checksum = 0;
         rIcmp->Checksum = Htons(IpChecksum(rIcmpRaw, icmpLen));
 
-        Trace(0, "ICMP echo reply: srcIp %p dstIp %p len %u",
+        Trace(IcmpLL, "ICMP echo reply: srcIp %p dstIp %p len %u",
             (ulong)Ntohl(rIp->SrcAddr), (ulong)Ntohl(rIp->DstAddr), replyFrameLen);
-        Trace(0, "ICMP echo reply: dstMac %p:%p:%p:%p:%p:%p srcMac %p:%p:%p:%p:%p:%p",
+        Trace(IcmpLL, "ICMP echo reply: dstMac %p:%p:%p:%p:%p:%p srcMac %p:%p:%p:%p:%p:%p",
             (ulong)rEth->DstMac[0], (ulong)rEth->DstMac[1], (ulong)rEth->DstMac[2],
             (ulong)rEth->DstMac[3], (ulong)rEth->DstMac[4], (ulong)rEth->DstMac[5],
             (ulong)rEth->SrcMac[0], (ulong)rEth->SrcMac[1], (ulong)rEth->SrcMac[2],
