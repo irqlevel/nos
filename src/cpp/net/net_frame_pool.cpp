@@ -1,6 +1,7 @@
 #include "net_frame_pool.h"
 
 #include <kernel/trace.h>
+#include <kernel/panic.h>
 #include <kernel/preempt.h>
 #include <hal/irqchip.h>
 #include <mm/new.h>
@@ -13,14 +14,16 @@ NetFramePool::NetFramePool()
     : Ready(false)
     , FrameCount(0)
     , Cells(nullptr)
-    , AllocHits(0)
     , AllocMisses(0)
     , Oversized(0)
     , RingRefills(0)
     , RingFlushes(0)
 {
     for (ulong i = 0; i < MaxCpus; i++)
+    {
         Cache[i].Count = 0;
+        Cache[i].Hits = 0;
+    }
 }
 
 NetFramePool::~NetFramePool()
@@ -118,17 +121,26 @@ NetFrame* NetFramePool::Alloc(ulong dataLen)
         return nullptr;
     }
 
-    ulong index = Hal::GetCurrentCpuHwId();
-    if (index >= MaxCpus)
-        return nullptr;
-
     NetFrame* frame = nullptr;
 
     {
         /* Interrupts off rather than a lock: the cache belongs to this CPU
            and nothing else touches it, so there is nothing to contend for
-           and no atomic to pay for. */
+           and no atomic to pay for.
+
+           The order matters. Reading the CPU id first and disabling
+           interrupts after leaves a window in which this task can be
+           preempted onto another CPU, and then two CPUs are inside one
+           per-CPU cache at once -- which is not a per-CPU cache at all. */
         ulong flags = PreemptIrqSave();
+
+        ulong index = Hal::GetCurrentCpuHwId();
+        if (index >= MaxCpus)
+        {
+            PreemptIrqRestore(flags);
+            return nullptr;
+        }
+
         PerCpuCache& cache = Cache[index];
 
         if (cache.Count == 0)
@@ -147,7 +159,10 @@ NetFrame* NetFramePool::Alloc(ulong dataLen)
         }
 
         if (cache.Count != 0)
+        {
             frame = cache.Frame[--cache.Count];
+            cache.Hits++;
+        }
 
         PreemptIrqRestore(flags);
     }
@@ -161,21 +176,31 @@ NetFrame* NetFramePool::Alloc(ulong dataLen)
     frame->Link.Init();
     frame->Length = 0;
     frame->Refcount.Set(1);
-    AllocHits.Inc();
     return frame;
 }
 
 void NetFramePool::Release(NetFrame* frame)
 {
+    /* Put() only calls a release function after the count reached zero, so
+       anything else here means the frame was released twice -- and a frame
+       in the cache twice is handed to two owners. Catch it where it happens
+       rather than where it corrupts. */
+    BugOn(frame->Refcount.Get() != 0);
+
+    /* Interrupts off before the CPU id, for the reason spelled out in
+       Alloc: read the other way round, the id can be stale by the time it
+       indexes the array. */
+    ulong flags = PreemptIrqSave();
+
     ulong index = Hal::GetCurrentCpuHwId();
     if (index >= MaxCpus)
     {
         /* No cache to put it in; the ring always has room for every frame. */
+        PreemptIrqRestore(flags);
         Ring.Enqueue(frame);
         return;
     }
 
-    ulong flags = PreemptIrqSave();
     PerCpuCache& cache = Cache[index];
 
     if (cache.Count == CacheSize)
@@ -216,15 +241,25 @@ void NetFramePool::Dump(Stdlib::Printer& printer)
     }
 
     ulong cached = 0;
+    ulong hits = 0;
     for (ulong i = 0; i < MaxCpus; i++)
+    {
         cached += Cache[i].Count;
+        hits += Cache[i].Hits;
+    }
+
+    /* Ring.Count() is a snapshot of two independently moving positions, so
+       held can read a little high; clamp rather than print a huge number
+       that is really a negative one. */
+    ulong ring = Ring.Count();
+    ulong held = ring + cached;
+    ulong inFlight = (FrameCount > held) ? (FrameCount - held) : 0;
 
     printer.Printf("frames %u of %u bytes, %u in the ring, %u in cpu caches\n",
-        FrameCount, FrameCapacity, Ring.Count(), cached);
-    printer.Printf("in flight %u\n",
-        FrameCount - Ring.Count() - cached);
+        FrameCount, FrameCapacity, ring, cached);
+    printer.Printf("in flight %u\n", inFlight);
     printer.Printf("alloc hits %u, misses %u, oversized %u\n",
-        AllocHits.Get(), AllocMisses.Get(), Oversized.Get());
+        hits, AllocMisses.Get(), Oversized.Get());
     printer.Printf("ring refills %u, flushes %u\n",
         RingRefills.Get(), RingFlushes.Get());
 }

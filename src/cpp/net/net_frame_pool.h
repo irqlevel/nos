@@ -65,13 +65,18 @@ private:
     static const ulong CacheSize = 64;
     static const ulong Batch = 32;
 
-    struct PerCpuCache
+    /* Own cache lines: two CPUs must never share one, and the alignment has
+       to be on the type -- padding the size alone leaves the whole array
+       free to start mid-line. */
+    struct __attribute__((aligned(64))) PerCpuCache
     {
         NetFrame* Frame[CacheSize];
         ulong Count;
 
-        /* Own cache lines: two CPUs must never share one. */
-        u8 Pad[64 - ((CacheSize * sizeof(void*) + sizeof(ulong)) % 64)];
+        /* Counted here rather than in a shared Atomic: one increment per
+           packet on a line every CPU writes would put back exactly the
+           contention this pool exists to remove. Summed only by Dump. */
+        ulong Hits;
     };
 
     bool Ready;
@@ -80,7 +85,6 @@ private:
     LocklessRing::Cell* Cells;
     PerCpuCache Cache[MaxCpus];
 
-    Atomic AllocHits;
     Atomic AllocMisses;
     Atomic Oversized;
     Atomic RingRefills;
