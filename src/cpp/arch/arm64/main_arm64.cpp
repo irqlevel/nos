@@ -209,7 +209,11 @@ static void BpStartupArm(void* ctx)
 
         VirtioBlk::InitAllMmio(Slots, count);
         VirtioScsi::InitAllMmio(Slots, count);
-        NetFramePool::GetInstance().Setup(NetFramePool::DefaultFrameCount);
+        ulong netFrames = Parameters::GetInstance().GetNetFrameCount();
+        if (netFrames == 0)
+            netFrames = NetFramePool::DefaultFrameCount;
+
+        NetFramePool::GetInstance().Setup(netFrames);
 
         VirtioNet::InitAllMmio(Slots, count);
         VirtioRng::InitAllMmio(Slots, count);

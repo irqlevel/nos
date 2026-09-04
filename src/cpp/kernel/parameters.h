@@ -46,6 +46,13 @@ public:
        buffered boot log. 0 (the default) ships all of it. */
     ulong GetNetconsoleTailKb();
 
+    /* netframes=N -- how many frames the network pool is built with. 0 (the
+       default) means NetFramePool::DefaultFrameCount. Worth having as a knob
+       rather than a rebuild: how many frames a driver keeps in flight is a
+       property of that driver and that load, and the only way to find out is
+       to raise it on the machine in question and watch `netpool` for misses. */
+    ulong GetNetFrameCount();
+
     /* loglevel=N: the trace level to boot with. Defaults to what main sets
        today; the `loglevel` shell command moves it afterwards. */
     int GetLogLevel();
@@ -88,6 +95,7 @@ private:
     Net::IpAddress NetconsoleIp;
     u16 NetconsolePort;
     ulong NetconsoleTailKb;
+    ulong NetFrameCount;
     int LogLevel;
     bool DnsEnabled;
     bool RootAuto;

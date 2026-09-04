@@ -200,7 +200,7 @@ ever demanded:
 - **Keyboard** — a real UEFI laptop often has no 8042 at all, so the emulated
   PS/2 controller QEMU and the KVM clouds provide is not there. The xHCI driver
   (`drivers/usb/`) enumerates a USB HID boot keyboard and publishes into the
-  same `KeyboardInput` sink the 8042 driver uses. `usb=off` skips it.
+  same `KeyboardInput` sink the 8042 driver uses. `netframes=N` (frames in the network pool; watch `netpool` for misses), `usb=off` skips it.
 - **Firmware leftovers** — LAPIC LVTs the firmware left armed are masked, and a
   stray interrupt is named instead of panicking anonymously. The TCO watchdog is
   located on 100-series PCH and left alone when the ACPI WDAT table says the

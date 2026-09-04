@@ -37,10 +37,19 @@ public:
        headers a driver prepends, and keeps the whole frame inside one page. */
     static const ulong FrameCapacity = 2048;
 
-    /* Enough to keep every ring on the box full several times over: the
-       drivers use 256-entry rings, and 1024 frames is about 4 MiB of a
-       machine that has gigabytes. */
-    static const ulong DefaultFrameCount = 1024;
+    /* Headroom, not a measured need. On virtio at 14000 packets a second
+       the pool never once ran dry -- `netpool` reported no misses and two
+       frames in flight out of a thousand, because transmits complete as fast
+       as they are posted and the frame comes straight back. What that does
+       not say is how many a different driver holds: the r8125 on the bare
+       metal box has never been measured under load, and the cost of being
+       wrong upward is 8 MiB on a machine with sixty-four gigabytes, while
+       the cost of being wrong downward is drops on a datapath.
+ 
+       netframes=N overrides this, which is the part that actually helps:
+       the number can be raised on the machine in question and checked
+       against `netpool` without a rebuild. */
+    static const ulong DefaultFrameCount = 4096;
 
     bool Setup(ulong frameCount);
 
