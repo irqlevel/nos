@@ -50,4 +50,17 @@ static inline __attribute__((always_inline)) void SendIpi(ulong hwId, u8 vector)
     Kernel::Gic::GetInstance().SendSgi(hwId, vector);
 }
 
+/* ARMv8.0 has no NMI, and GICv3 pseudo-NMI (interrupt priorities plus
+   FEAT_IRQ priority masking) is not wired up here yet: the panic path asks
+   first and skips remote stack capture when the answer is no. */
+static inline __attribute__((always_inline)) bool NmiIpiSupported()
+{
+    return false;
+}
+
+static inline __attribute__((always_inline)) void SendNmiIpi(ulong hwId)
+{
+    (void)hwId;
+}
+
 }

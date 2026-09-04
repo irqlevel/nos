@@ -142,6 +142,15 @@ void ExceptionTable::ExcNMI(Context* ctx)
 {
     ExcNMICounter.Inc();
 
+    /* A panic on another CPU asking for this one's stack. It gets recorded
+       and this CPU stops here: the panic is halting everything anyway, and
+       panicking about the NMI itself would bury the report that sent it. */
+    if (Panicker::GetInstance().CollectRemoteStack())
+    {
+        for (;;)
+            Hlt();
+    }
+
     PanicCtx(ctx, false, "EXC: NMI rip 0x%p rsp 0x%p",
         ctx->GetRetRip(), ctx->GetOrigRsp());
 }

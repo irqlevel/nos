@@ -168,6 +168,24 @@ void Lapic::SendStartup(u32 apicId, u32 vector)
     SetRflags(flags);
 }
 
+/* Delivery mode NMI: reaches a CPU with interrupts disabled, which an
+   ordinary IPI cannot. No vector -- NMI is always vector 2. */
+void Lapic::SendNmi(u32 apicId)
+{
+    ulong flags = GetRflags();
+    InterruptDisable();
+
+    WriteReg(IcrHighIndex, apicId << IcrDestinationShift);
+    WriteReg(IcrLowIndex, IcrNmi | IcrPhysical | IcrAssert | IcrEdge | IcrNoShorthand);
+
+    while (ReadReg(IcrLowIndex) & IcrSendPending)
+    {
+        Pause();
+    }
+
+    SetRflags(flags);
+}
+
 void Lapic::SendIPI(u32 apicId, u32 vector)
 {
     /* The two ICR writes must not be interleaved with another SendIPI
