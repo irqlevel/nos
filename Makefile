@@ -333,7 +333,7 @@ $(OUT)/pass1.elf: $(LDSCRIPT) $(OBJS) $(RUST_LIB)
 $(OUT)/symtab_data.cpp: $(OUT)/pass1.elf
 	@echo "Generating symbol table..."
 	@printf '#include "kernel/symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $@
-	@$(NM) -Cn $< | awk '/^[0-9a-fA-F]+ [Tt] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $@
+	@$(NM) -Cn $< | awk '/^[0-9a-fA-F]+ [TtWw] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $@
 	@printf '};\nconst size_t SymbolTable::SymbolCount = sizeof(Symbols)/sizeof(Symbols[0]);\n}\n' >> $@
 
 $(OUT)/symtab_data.o: $(OUT)/symtab_data.cpp src/cpp/kernel/symtab.h
