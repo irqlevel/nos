@@ -16,6 +16,13 @@ namespace Hal
    used by the shell "cpu" command. Defined per arch. */
 void PrintCpuState(Stdlib::Printer& out);
 
+/* What this machine is, and which of the things the kernel actually depends
+   on it provides. Written for the moment a new box is booted for the first
+   time: the answer to "will this work here" is a handful of feature bits,
+   and reading them off the running kernel beats inferring them from a
+   model number. Defined per arch. */
+void PrintCpuInfo(Stdlib::Printer& out);
+
 void ConsoleWrite(const char *msg);
 
 /* Panic-context variant: must be usable with interrupts off and locks

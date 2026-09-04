@@ -4,6 +4,7 @@
 #include <hal/mmu.h>
 
 #include <arch/x86_64/asm.h>
+#include <arch/x86_64/cpuid.h>
 
 #include <arch/x86_64/context.h>
 #include <lib/stdlib.h>
@@ -108,6 +109,92 @@ ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
     regs->Rdi = arg;         /* 1st argument for the entry function */
     regs->Rflags = (1 << 9); /* IF */
     return (ulong)regs;
+}
+
+namespace
+{
+
+void PrintFeature(Stdlib::Printer& con, const char* name, bool present,
+    const char* why)
+{
+    con.Printf("  %s %s  %s\n", present ? "yes" : "NO ", name, why);
+}
+
+}
+
+void PrintCpuInfo(Stdlib::Printer& con)
+{
+    static const u32 ExtendedLeafBase = 0x80000000;
+
+    CpuidResult r0 = Cpuid(0);
+
+    /* Vendor string is EBX:EDX:ECX, in that order. */
+    char vendor[13];
+    Stdlib::MemCpy(&vendor[0], &r0.Ebx, 4);
+    Stdlib::MemCpy(&vendor[4], &r0.Edx, 4);
+    Stdlib::MemCpy(&vendor[8], &r0.Ecx, 4);
+    vendor[12] = '\0';
+
+    u32 maxExtended = Cpuid(ExtendedLeafBase).Eax;
+
+    char brand[49];
+    brand[0] = '\0';
+    if (maxExtended >= ExtendedLeafBase + 4)
+    {
+        for (u32 i = 0; i < 3; i++)
+        {
+            CpuidResult b = Cpuid(ExtendedLeafBase + 2 + i);
+            Stdlib::MemCpy(&brand[i * 16 + 0], &b.Eax, 4);
+            Stdlib::MemCpy(&brand[i * 16 + 4], &b.Ebx, 4);
+            Stdlib::MemCpy(&brand[i * 16 + 8], &b.Ecx, 4);
+            Stdlib::MemCpy(&brand[i * 16 + 12], &b.Edx, 4);
+        }
+        brand[48] = '\0';
+    }
+
+    CpuidResult r1 = Cpuid(1);
+
+    /* Family and model carry their extended halves above 0xF / 0x6
+       respectively (SDM 3-217). */
+    ulong family = (r1.Eax >> 8) & 0xF;
+    ulong model = (r1.Eax >> 4) & 0xF;
+    ulong stepping = r1.Eax & 0xF;
+    if (family == 0xF)
+        family = family + ((r1.Eax >> 20) & 0xFF);
+    if (family == 0x6 || family == 0xF)
+        model = model + (((r1.Eax >> 16) & 0xF) << 4);
+
+    con.Printf("vendor %s\n", vendor);
+    if (brand[0] != '\0')
+        con.Printf("model  %s\n", brand);
+    con.Printf("family %u model %u stepping %u, max leaf 0x%p ext 0x%p\n",
+        family, model, stepping, (ulong)r0.Eax, (ulong)maxExtended);
+
+    CpuidResult ext1 = (maxExtended >= ExtendedLeafBase + 1)
+        ? Cpuid(ExtendedLeafBase + 1) : CpuidResult{0, 0, 0, 0};
+    CpuidResult ext7 = (maxExtended >= ExtendedLeafBase + 7)
+        ? Cpuid(ExtendedLeafBase + 7) : CpuidResult{0, 0, 0, 0};
+    CpuidResult r6 = (r0.Eax >= 6) ? Cpuid(6) : CpuidResult{0, 0, 0, 0};
+
+    con.Printf("features the kernel depends on:\n");
+    PrintFeature(con, "pdpe1gb ", (ext1.Edx & (1u << 26)) != 0,
+        "1GiB pages: RAM above 4GiB");
+    PrintFeature(con, "nx      ", (ext1.Edx & (1u << 20)) != 0,
+        "no-execute: W^X");
+    PrintFeature(con, "pat     ", (r1.Edx & (1u << 16)) != 0,
+        "write-combining framebuffer");
+    PrintFeature(con, "invtsc  ", (ext7.Edx & (1u << 8)) != 0,
+        "invariant tsc: timekeeping");
+    PrintFeature(con, "arat    ", (r6.Eax & (1u << 2)) != 0,
+        "always-running apic timer: the per-cpu tick");
+    PrintFeature(con, "x2apic  ", (r1.Ecx & (1u << 21)) != 0,
+        "firmware may hand off in this mode");
+    PrintFeature(con, "tscdl   ", (r1.Ecx & (1u << 24)) != 0,
+        "tsc-deadline timer (unused)");
+    PrintFeature(con, "cx16    ", (r1.Ecx & (1u << 13)) != 0,
+        "cmpxchg16b (unused)");
+    PrintFeature(con, "hyperv  ", (r1.Ecx & (1u << 31)) != 0,
+        "running under a hypervisor");
 }
 
 void PrintCpuState(Stdlib::Printer& con)

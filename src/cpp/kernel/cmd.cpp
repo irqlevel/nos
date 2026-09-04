@@ -78,6 +78,26 @@ static void CmdReboot(const char* args, Stdlib::Printer& con)
     Cmd::GetInstance().RequestReboot();
 }
 
+static void CmdLscpu(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+
+    auto& cpus = CpuTable::GetInstance();
+    ulong mask = cpus.GetRunningCpus();
+
+    ulong count = 0;
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (mask & (1UL << i))
+            count++;
+    }
+
+    con.Printf("cpus %u running, id mask 0x%p, bsp %u\n",
+        count, mask, cpus.GetBspIndexNoLock());
+
+    Hal::PrintCpuInfo(con);
+}
+
 static void CmdCpu(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -1503,6 +1523,7 @@ static void CmdHelp(const char* args, Stdlib::Printer& con);
 static const CmdEntry Commands[] = {
     { "cls",       CmdCls,       "cls - clear screen" },
     { "cpu",       CmdCpu,       "cpu - dump cpu state" },
+    { "lscpu",     CmdLscpu,     "lscpu - identify the cpu and the features the kernel needs" },
     { "dmesg",     CmdDmesg,     "dmesg [lines] [filter] - dump kernel log" },
     { "loglevel",  CmdLoglevel,  "loglevel [N] - show or set trace level" },
     { "uptime",    CmdUptime,    "uptime - show uptime" },

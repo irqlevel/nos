@@ -38,6 +38,44 @@ void PsciCall(u32 fn)
 namespace Hal
 {
 
+void PrintCpuInfo(Stdlib::Printer& con)
+{
+    ulong midr, ctr, mmfr0;
+    asm volatile("mrs %0, midr_el1" : "=r"(midr));
+    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    asm volatile("mrs %0, id_aa64mmfr0_el1" : "=r"(mmfr0));
+
+    ulong implementer = (midr >> 24) & 0xFF;
+    const char* name = "unknown";
+    switch (implementer)
+    {
+    case 0x41: name = "ARM"; break;
+    case 0x42: name = "Broadcom"; break;
+    case 0x43: name = "Cavium"; break;
+    case 0x4E: name = "NVIDIA"; break;
+    case 0x50: name = "APM"; break;
+    case 0x51: name = "Qualcomm"; break;
+    case 0x61: name = "Apple"; break;
+    case 0x00: name = "reserved/emulated"; break;
+    default: break;
+    }
+
+    con.Printf("implementer 0x%p (%s)\n", implementer, name);
+    con.Printf("part 0x%p variant %u revision %u, midr 0x%p\n",
+        (midr >> 4) & 0xFFF, (midr >> 20) & 0xF, midr & 0xF, midr);
+
+    /* Log2 of the words in the smallest cache line, per CTR_EL0. */
+    con.Printf("cache line: i %u bytes, d %u bytes\n",
+        4UL << (ctr & 0xF), 4UL << ((ctr >> 16) & 0xF));
+
+    /* PARange, the physical address width this core can address. */
+    static const u8 ParangeBits[] = { 32, 36, 40, 42, 44, 48, 52, 56 };
+    ulong parange = mmfr0 & 0xF;
+    con.Printf("physical address bits %u\n",
+        (parange < Stdlib::ArraySize(ParangeBits))
+            ? (ulong)ParangeBits[parange] : 0UL);
+}
+
 void PrintCpuState(Stdlib::Printer& con)
 {
     ulong v;
