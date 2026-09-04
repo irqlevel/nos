@@ -171,16 +171,25 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
     struct Chain
     {
         ulong Depth;
-        const char* Name[MaxDepth];
         ulong Count;
 
-        /* Where inside the leaf the samples landed. Folding compares symbol
-           names, so every address in a function collapses into one chain --
-           which is the point for the callers, but loses the one offset worth
-           having. Keeping the span says whether the samples sat on a single
-           instruction or were spread across the function. */
+        /* The leaf folds by symbol, the callers by exact address.
+ 
+           A sample can land on any instruction of the function it
+           interrupted, so folding the leaf by address would shatter one hot
+           function into a chain per instruction; it folds by name instead
+           and carries the span of offsets seen, which says whether the
+           samples sat on one instruction or spread across the body.
+ 
+           A return address is not like that. Each call site has exactly one,
+           so folding the callers by address does not shatter anything -- it
+           separates paths that really are different, and keeps the offset
+           that names which call in the function this came through. */
+        const char* LeafName;
         ulong LeafLow;
         ulong LeafHigh;
+
+        ulong Frame[MaxDepth];
     };
 
     /* On the heap rather than on the stack: Report runs in task context,
@@ -228,20 +237,15 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
 
             /* Resolved here rather than at sample time: a symbol lookup has
                no place in an interrupt handler, and the addresses keep just
-               as well. */
-            const char* name[MaxDepth];
-            ulong leafOffset = 0;
-            for (ulong f = 0; f < depth; f++)
+               as well. Only the leaf is resolved during the walk -- the
+               callers fold as raw addresses and are named at print time,
+               for the few chains that actually get printed. */
+            const char* leafName;
+            ulong leafOffset;
+            if (!symtab.Resolve(record.Frame[0], leafName, leafOffset))
             {
-                ulong offset;
-                if (!symtab.Resolve(record.Frame[f], name[f], offset))
-                {
-                    name[f] = nullptr;
-                    offset = 0;
-                }
-
-                if (f == 0)
-                    leafOffset = offset;
+                leafName = nullptr;
+                leafOffset = 0;
             }
 
             ulong c = 0;
@@ -250,14 +254,15 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
                 if (chains[c].Depth != depth)
                     continue;
 
-                ulong f = 0;
                 /* Resolve hands back a pointer into the static table, so the
-                   same symbol is the same pointer and the whole chain
-                   compares as pointers. Two addresses in one function fold
-                   together, which is the point. */
+                   same symbol is the same pointer. */
+                if (chains[c].LeafName != leafName)
+                    continue;
+
+                ulong f = 1;
                 for (; f < depth; f++)
                 {
-                    if (chains[c].Name[f] != name[f])
+                    if (chains[c].Frame[f] != record.Frame[f])
                         break;
                 }
 
@@ -274,8 +279,9 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
                 }
 
                 chains[c].Depth = depth;
-                for (ulong f = 0; f < depth; f++)
-                    chains[c].Name[f] = name[f];
+                chains[c].LeafName = leafName;
+                for (ulong f = 1; f < depth; f++)
+                    chains[c].Frame[f] = record.Frame[f];
                 chains[c].Count = 0;
                 chains[c].LeafLow = leafOffset;
                 chains[c].LeafHigh = leafOffset;
@@ -334,19 +340,26 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
 
         if (chains[i].LeafLow == chains[i].LeafHigh)
             printer.Printf("%u.%u%% %u %s+0x%p\n", permille / 10, permille % 10,
-                chains[i].Count, SymbolName(chains[i].Name[0]),
+                chains[i].Count, SymbolName(chains[i].LeafName),
                 chains[i].LeafLow);
         else
             printer.Printf("%u.%u%% %u %s+0x%p..0x%p\n",
                 permille / 10, permille % 10, chains[i].Count,
-                SymbolName(chains[i].Name[0]),
+                SymbolName(chains[i].LeafName),
                 chains[i].LeafLow, chains[i].LeafHigh);
 
-        /* Callers stay bare: a return address offset names the call site,
-           which is a lot of noise for a line that is there to say which path
-           got here. */
+        /* The offset is into the caller and points just past the call that
+           led here -- these are return addresses, the same ones the panic
+           backtrace prints, so the two read alike. */
         for (ulong f = 1; f < chains[i].Depth; f++)
-            printer.Printf("        <- %s\n", SymbolName(chains[i].Name[f]));
+        {
+            const char* name;
+            ulong offset;
+            if (symtab.Resolve(chains[i].Frame[f], name, offset))
+                printer.Printf("        <- %s+0x%p\n", name, offset);
+            else
+                printer.Printf("        <- 0x%p\n", chains[i].Frame[f]);
+        }
     }
 
     Mm::Free(chains);
