@@ -23,6 +23,7 @@ const char* InterruptStats::GetName(InterruptSource src)
     case IrqVirtioNet:  return "virtio-net";
     case IrqVirtioScsi: return "virtio-scsi";
     case IrqIPI:        return "ipi";
+    case IrqLapicTimer: return "lapic-timer";
     case IrqShared:     return "shared";
     case IrqMsix:       return "msix";
     case IrqDummy:      return "dummy";

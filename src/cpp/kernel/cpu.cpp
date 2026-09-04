@@ -438,15 +438,49 @@ void Cpu::IPI(Context* ctx)
         return;
     }
 
-    Watchdog::GetInstance().Check();
-
-    /* Index is the LAPIC APIC ID; the BSP's is not necessarily 0 */
-    if (Index == CpuTable::GetInstance().GetBspIndexNoLock())
+    /* The periodic work moved to this CPU's own timer (Cpu::TimerTick).
+       While that timer is running the IPI carries only queued work; on a
+       machine where it could not be calibrated, the tick still arrives here
+       as a broadcast from whichever CPU owns the HPET. */
+    if (!CpuTable::GetInstance().HasPerCpuTimer())
     {
-        TimerTable::GetInstance().ProcessTimers();
+        Watchdog::GetInstance().Check();
+
+        /* Index is the LAPIC APIC ID; the BSP's is not necessarily 0 */
+        if (Index == CpuTable::GetInstance().GetBspIndexNoLock())
+            TimerTable::GetInstance().ProcessTimers();
     }
 
     Hal::IrqEoi(CpuTable::IPIVector);
+
+    Schedule();
+}
+
+/* This CPU's own periodic tick. One interrupt per CPU delivered by its own
+   local APIC, instead of one interrupt on one CPU followed by an IPI to
+   every other -- which cost a fan of ICR writes per tick and, worse, made
+   the machine's entire sense of time depend on one CPU still answering
+   interrupts. A CPU that wedges now stops only its own tick, and the others
+   go on ticking and notice. */
+void Cpu::TimerTick(Context* ctx)
+{
+    (void)ctx;
+
+    if (Panicker::GetInstance().IsActive())
+    {
+        Hal::IrqEoi(CpuTable::TimerVector);
+        return;
+    }
+
+    Watchdog::GetInstance().Check();
+
+    /* Software timers stay on one CPU: they are a handful of periodic
+       callbacks, not a per-CPU wheel, and running them everywhere would
+       just fire each one N times. */
+    if (Index == CpuTable::GetInstance().GetBspIndexNoLock())
+        TimerTable::GetInstance().ProcessTimers();
+
+    Hal::IrqEoi(CpuTable::TimerVector);
 
     Schedule();
 }
@@ -530,6 +564,13 @@ extern "C" void IPInterrupt(Context* ctx)
     cpu.IPI(ctx);
 }
 
+extern "C" void LapicTimerInterrupt(Context* ctx)
+{
+    InterruptStats::Inc(IrqLapicTimer);
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+    cpu.TimerTick(ctx);
+}
+
 void Cpu::SendIPISelf()
 {
     Stdlib::AutoLock lock(Lock);
@@ -552,6 +593,16 @@ void CpuTable::SendIPI(ulong index)
 
     auto& cpu = CpuArray[index];
     cpu.SendIPISelf();
+}
+
+bool CpuTable::HasPerCpuTimer()
+{
+    return PerCpuTimer;
+}
+
+void CpuTable::SetPerCpuTimer()
+{
+    PerCpuTimer = true;
 }
 
 ulong CpuTable::GetRunningCpus()

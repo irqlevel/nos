@@ -180,7 +180,12 @@ void Hpet::Interrupt(Context* ctx)
         TimeLock.WriteEnd();
     }
 
-    CpuTable::GetInstance().SendIPIAll();
+    /* Timekeeping above is the job that stays here. The fan-out below is
+       only the tick, and once every CPU runs its own local timer there is
+       nobody left to wake. */
+    if (!CpuTable::GetInstance().HasPerCpuTimer())
+        CpuTable::GetInstance().SendIPIAll();
+
     Hal::IrqEoi(IntVector);
 }
 

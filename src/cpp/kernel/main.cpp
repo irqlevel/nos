@@ -204,6 +204,11 @@ static void HaltTcoWatchdog()
         firmwareWatchdog ? ", ACPI WDAT owns it" : "");
 }
 
+/* Calibrated once on the BSP; every core's local timer runs off the same bus
+   clock, so one measurement arms all of them. Zero means calibration failed
+   and the old broadcast tick stays in charge. */
+static u32 LapicTimerCount;
+
 void ApStartup(void *ctx)
 {
     (void)ctx;
@@ -214,6 +219,11 @@ void ApStartup(void *ctx)
         cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
 
     TraceCpuState(cpu.GetIndex());
+
+    /* Before interrupts: this CPU's own periodic tick, so it never depends
+       on another CPU still answering one. */
+    if (LapicTimerCount != 0)
+        Lapic::StartTimer(CpuTable::TimerVector, LapicTimerCount);
 
     BugOn(Hal::IsInterruptEnabled());
     InterruptEnable();
@@ -526,6 +536,8 @@ void BpStartup(void* ctx)
         Trace(0, "Interrupts registered");
 
         idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
+        idt.SetDescriptor(CpuTable::TimerVector,
+            IdtDescriptor::Encode(LapicTimerInterruptStub));
 
         /* Install a benign handler for the LAPIC spurious-interrupt vector so a
            spurious IRQ counts a stat instead of hitting DummyInterrupt's panic. */
@@ -556,6 +568,29 @@ void BpStartup(void* ctx)
          * for per-CPU time queries.
          */
         TimeInit();
+
+        /* One local APIC timer per CPU in place of one HPET interrupt fanned
+           out to everybody by IPI. The fan-out cost a write to the interrupt
+           command register per CPU per tick, but the real problem was that it
+           made every CPU's sense of time depend on one CPU still answering
+           interrupts: when that one wedged, nothing anywhere ticked, so
+           nothing preempted and no watchdog ran to notice. Now a wedged CPU
+           stops only its own tick and the others go on watching it.
+
+           Calibration needs a clock, which is why this sits after TimeInit,
+           and it must precede StartAll so an AP can arm its timer as it comes
+           up. arm64 has worked this way from the start (GenericTimer). */
+        LapicTimerCount = Lapic::CalibrateTimer(Hpet::DesiredHz);
+        if (LapicTimerCount != 0)
+        {
+            Lapic::StartTimer(CpuTable::TimerVector, LapicTimerCount);
+            cpus.SetPerCpuTimer();
+            Trace(0, "Tick: per-cpu local apic timer at %u Hz", (ulong)Hpet::DesiredHz);
+        }
+        else
+        {
+            Trace(0, "Tick: local apic timer unavailable, keeping the broadcast tick");
+        }
 
         Trace(0, "Before cpus start");
 

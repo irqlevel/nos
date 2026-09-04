@@ -30,6 +30,15 @@ public:
 
     static void SendNmi(u32 apicId);
 
+    /* Counts the local timer against the established clock and returns the
+       initial-count value for hz ticks a second, or 0 if it could not be
+       measured. Runs once, on the BSP: the count is a property of the bus
+       clock, which every core shares. */
+    static u32 CalibrateTimer(ulong hz);
+
+    /* Arm this CPU's local timer, periodic, on the given vector. */
+    static void StartTimer(u8 vector, u32 initialCount);
+
     /* Is `vector` currently in service on this CPU? Used by the shared
        interrupt dispatch to identify the vector that actually fired. */
     static bool CheckIsr(u8 vector);
@@ -70,6 +79,15 @@ private:
     static const ulong LvtErrorIndex = 0x37;
 
     static const u32 LvtMasked = (1U << 16);
+
+    static const ulong TimerInitialCountIndex = 0x38;
+    static const ulong TimerCurrentCountIndex = 0x39;
+    static const ulong TimerDivideIndex = 0x3E;
+
+    /* Divide-configuration encoding for /16 (SDM 11.5.4). */
+    static const u32 TimerDivideBy16 = 0x3;
+
+    static const u32 LvtTimerPeriodic = (1u << 17);
 
     static const ulong IcrLowIndex = 0x30;
     static const ulong IcrHighIndex = 0x31;

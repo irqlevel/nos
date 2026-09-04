@@ -32,6 +32,7 @@ enum InterruptSource : u8
     IrqVirtioNet,
     IrqVirtioScsi,
     IrqIPI,
+    IrqLapicTimer,
     IrqShared,
     IrqMsix,
     IrqDummy,
