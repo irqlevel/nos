@@ -45,6 +45,10 @@ public:
     /* TX: convenience wrapper -- alloc frame, copy data, SubmitTx */
     bool SendRaw(const void* buf, ulong len);
 
+    /* Frames reaped from the hardware and waiting to be dispatched. Read
+       without the lock: it is a hint for the receive poll, not an invariant. */
+    ulong GetRxPending() { return RxCount; }
+
     /* RX: enqueue frame to RxQueue; returns false if full (caller must Put) */
     bool EnqueueRx(NetFrame* frame);
 
@@ -161,7 +165,45 @@ public:
     void ProcessAllRx();
     void ProcessAllTx();
 
+    /* Look at the receive path without waiting to be asked.
+
+       A driver whose only source of liveness is its own interrupt has no
+       recovery from a lost one: r8125 reaps only from the receive softirq,
+       which is raised only from its ISR, so a wakeup lost while the ring is
+       full means nothing ever looks at that ring again -- which is exactly
+       how the bare metal machine goes permanently deaf while the rest of the
+       kernel runs on. This is the fallback: a lost wakeup then costs a tick
+       instead of the rest of the uptime.
+
+       Raised only when the softirq is not already pending, so that a pass it
+       causes can be told from one an interrupt caused -- which is what makes
+       RxStalls evidence rather than a guess. */
+    void PollRx();
+
+    /* Polls issued; polls that found frames waiting; and polls that found
+       frames waiting with no interrupt-driven pass since the previous poll.
+
+       Only the third is evidence of a lost wakeup. The second is mostly a
+       race that means nothing is wrong: under load the poll often gets there
+       before an interrupt that is already on its way, which is why it counts
+       in the hundreds on QEMU, where nothing is lost at all. A wakeup that
+       is genuinely gone shows as poll after poll finding work with no
+       interrupt in between. */
+    ulong GetRxPolls();
+    ulong GetRxPollWork();
+    ulong GetRxStalls();
+
     static const ulong MaxDevices = 16;
+
+private:
+    Atomic PollPending;
+    Atomic RxPolls;
+    Atomic RxPollWork;
+    Atomic RxStalls;
+
+    /* Whether the previous receive pass was one this poll caused. */
+    bool LastPassWasPoll;
+public:
 
 private:
     NetDeviceTable();

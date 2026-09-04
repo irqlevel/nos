@@ -285,6 +285,8 @@ Net::IpAddress NetDevice::RouteIp(Net::IpAddress dstIp)
 NetDeviceTable::NetDeviceTable()
     : Count(0)
 {
+    LastPassWasPoll = false;
+
     for (ulong i = 0; i < MaxDevices; i++)
         Devices[i] = nullptr;
 }
@@ -410,11 +412,62 @@ done:
 
 void NetDeviceTable::ProcessAllRx()
 {
+    /* Test and clear: whoever gets the 1 owns the attribution for this pass. */
+    bool polled = (PollPending.Cmpxchg(0, 1) == 1);
+    ulong pending = 0;
+
     for (ulong i = 0; i < Count; i++)
     {
         Devices[i]->ReapRx();
+
+        /* After the reap, before the dispatch: what the hardware had waiting. */
+        pending += Devices[i]->GetRxPending();
+
         Devices[i]->ProcessRx();
     }
+
+    if (polled && pending != 0)
+    {
+        RxPollWork.Inc();
+
+        /* Two polls in a row finding work, with no interrupt-driven pass
+           between them, is the shape of a wakeup that is not coming. One on
+           its own is just the poll winning a race against an interrupt
+           already in flight. */
+        if (LastPassWasPoll)
+            RxStalls.Inc();
+    }
+
+    LastPassWasPoll = polled;
+}
+
+void NetDeviceTable::PollRx()
+{
+    if (Count == 0)
+        return;
+
+    /* An interrupt has already asked; leave it to say so. */
+    if (SoftIrq::GetInstance().IsPending(SoftIrq::TypeNetRx))
+        return;
+
+    RxPolls.Inc();
+    PollPending.Set(1);
+    SoftIrq::GetInstance().Raise(SoftIrq::TypeNetRx);
+}
+
+ulong NetDeviceTable::GetRxPolls()
+{
+    return RxPolls.Get();
+}
+
+ulong NetDeviceTable::GetRxPollWork()
+{
+    return RxPollWork.Get();
+}
+
+ulong NetDeviceTable::GetRxStalls()
+{
+    return RxStalls.Get();
 }
 
 void NetDeviceTable::ProcessAllTx()

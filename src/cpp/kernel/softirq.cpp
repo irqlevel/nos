@@ -77,6 +77,18 @@ void SoftIrq::Stop()
     }
 }
 
+bool SoftIrq::IsPending(ulong type)
+{
+    if (type >= MaxTypes)
+        return false;
+
+    ulong cpu = CpuTable::GetInstance().GetCurrentCpuId();
+    if (cpu >= MaxCpus)
+        return false;
+
+    return CpuStates[cpu].Pending.TestBit(type);
+}
+
 void SoftIrq::Raise(ulong type)
 {
     if (type >= MaxTypes)

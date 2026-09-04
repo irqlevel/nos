@@ -1,4 +1,5 @@
 #include "generic_timer.h"
+#include <net/net_device.h>
 #include "board.h"
 #include "gicv3.h"
 
@@ -106,7 +107,13 @@ void GenericTimer::LocalTick(Context* ctx)
 
     /* Global software timers (Sleep, Rust Timer) are processed on the BSP */
     if (cpu.GetIndex() == cpus.GetBspIndexNoLock())
+    {
         TimerTable::GetInstance().ProcessTimers();
+
+        /* And look at the receive path, whether or not a NIC asked. See
+           NetDeviceTable::PollRx. */
+        NetDeviceTable::GetInstance().PollRx();
+    }
 
     /* EOI before Schedule(): it may context-switch away and only return
        when this task is rescheduled, so the PPI must be deactivated first
