@@ -1,4 +1,5 @@
 #include "lapic.h"
+#include "percpu.h"
 #include <kernel/time.h>
 #include <drivers/acpi.h>
 
@@ -58,6 +59,10 @@ void Lapic::Enable()
         (ulong)ReadReg(TprIndex), (ulong)ReadReg(DfrIndex), (ulong)ReadReg(LdrIndex), (ulong)ReadReg(SpIvIndex));
 
     Trace(LapicLL, "Lapic: apicId 0x%p", (ulong)GetApicId());
+
+    /* The ID is known and the MMIO window is live: give this CPU its GS slot
+       so nothing has to come back here to ask again. */
+    PerCpuPublish(GetApicId());
 
     MaskAllLvt();
 

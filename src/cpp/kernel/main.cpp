@@ -63,6 +63,7 @@
 #include <fs/nanofs.h>
 #include <fs/procfs.h>
 #include <kernel/stack_probe.h>
+#include <arch/x86_64/percpu.h>
 
 using namespace Kernel;
 using namespace Stdlib;
@@ -305,6 +306,12 @@ void ApMain2()
 
 extern "C" void ApMain()
 {
+    /* Before anything can ask which CPU this is: the GS base firmware left
+       behind is not a slot of ours, and reading through it would be a wild
+       load. Until Lapic::Enable() publishes the real one, this reads as
+       "not set up" and the answer comes from the APIC as it always did. */
+    PerCpuSetupBoot();
+
     AtomicReadAndInc(&ApStartedFlag);
     ALLOC_CPU_STACK();
     ApMain2();
@@ -974,6 +981,8 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
 extern "C" void Main(Grub::MultiBootInfoHeader *MbInfo)
 {
+    PerCpuSetupBoot();
+
     ALLOC_CPU_STACK();
     Main2(MbInfo);
 }
