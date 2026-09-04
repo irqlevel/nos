@@ -19,7 +19,7 @@ VgaTerm::VgaTerm()
     , Height(MaxHeight)
     , ColorCode(MakeColor(ColorWhite, ColorBlack))
 {
-    Watchdog::GetInstance().UnregisterSpinLock(Lock);
+    Lock.Unwatch();
 
     Stdlib::AutoLock lock(Lock);
 

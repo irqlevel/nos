@@ -8,6 +8,25 @@
 namespace Kernel
 {
 
+ulong Watchdog::ListLock::LockIrqSave()
+{
+    ulong flags = PreemptIrqSave();
+    for (;;)
+    {
+        if (Value.Cmpxchg(1, 0) == 0)
+            break;
+
+        Pause();
+    }
+    return flags;
+}
+
+void Watchdog::ListLock::UnlockIrqRestore(ulong flags)
+{
+    Value.Set(0);
+    PreemptIrqRestore(flags);
+}
+
 Watchdog::Watchdog()
 {
 }
@@ -25,6 +44,17 @@ void Watchdog::Check()
     u64 now = Hal::ReadCycleCounter();
     const ulong timeoutNs = 25 * Const::NanoSecsInMs;
 
+    /* Past this the lock is not slow, it is stuck: nothing in this kernel
+       legitimately holds a spinlock for ten seconds. Reporting it as one more
+       trace line is not enough -- the line goes into rings whose way out may
+       be the very lock that is stuck, which is exactly how the machine dies
+       in silence. Panic instead: the panic path is allowed to send without
+       that lock, so the report actually leaves. */
+    const ulong stuckNs = 10 * Const::NanoSecsInSec;
+
+    RawSpinLock* stuck = nullptr;
+    ulong stuckHeldNs = 0;
+
     for (size_t i = 0; i < Stdlib::ArraySize(SpinLockList); i++)
     {
         auto& listLock = SpinLockListLock[i];
@@ -38,7 +68,7 @@ void Watchdog::Check()
             entry != &list;
             entry = entry->Flink)
         {
-            SpinLock* lock = CONTAINING_RECORD(entry, SpinLock, WatchdogListEntry);
+            RawSpinLock* lock = CONTAINING_RECORD(entry, RawSpinLock, WatchdogListEntry);
             CheckCounter.Inc();
             u64 lockTime = lock->WatchdogLockTime.Get();
             if (lockTime != 0 && now > lockTime)
@@ -46,17 +76,28 @@ void Watchdog::Check()
                 /* 0 until the counter's rate is known -- no report then,
                    rather than a report built on a guessed frequency. */
                 ulong deltaNs = CycleCounterDeltaToNs(now - lockTime);
-                if (deltaNs > timeoutNs)
+                if (deltaNs > timeoutNs && lock->WatchdogReported.Cmpxchg(1, 0) == 0)
                 {
                     Trace(0, "Spinlock 0x%p is held too long %u", lock, deltaNs);
+                }
+
+                if (deltaNs > stuckNs && stuck == nullptr)
+                {
+                    stuck = lock;
+                    stuckHeldNs = deltaNs;
                 }
             }
         }
         listLock.UnlockIrqRestore(flags);
+
+        /* Outside the list lock: Panic prints, and printing must not run with
+           this held. */
+        if (stuck != nullptr)
+            Panic("Spinlock 0x%p stuck, held %u ns", (ulong)stuck, stuckHeldNs);
     }
 }
 
-void Watchdog::RegisterSpinLock(SpinLock& lock)
+void Watchdog::RegisterSpinLock(RawSpinLock& lock)
 {
     size_t i = Stdlib::HashPtr(&lock) % Stdlib::ArraySize(SpinLockList);
     auto& listLock = SpinLockListLock[i];
@@ -68,7 +109,7 @@ void Watchdog::RegisterSpinLock(SpinLock& lock)
     listLock.UnlockIrqRestore(flags);
 }
 
-void Watchdog::UnregisterSpinLock(SpinLock& lock)
+void Watchdog::UnregisterSpinLock(RawSpinLock& lock)
 {
     size_t i = Stdlib::HashPtr(&lock) % Stdlib::ArraySize(SpinLockList);
     auto& listLock = SpinLockListLock[i];

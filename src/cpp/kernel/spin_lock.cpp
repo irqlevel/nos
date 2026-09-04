@@ -9,38 +9,26 @@ namespace Kernel
 
 SpinLock::SpinLock()
     : Owner(nullptr)
-    , WatchdogLockTime(0)
 {
-    Watchdog::GetInstance().RegisterSpinLock(*this);
 }
 
 SpinLock::~SpinLock()
 {
-    Watchdog::GetInstance().UnregisterSpinLock(*this);
+}
+
+void SpinLock::Unwatch()
+{
+    Watchdog::GetInstance().UnregisterSpinLock(RawLock);
 }
 
 void SpinLock::Lock()
 {
     RawLock.Lock();
     Owner = (PreemptIsOn()) ? Task::GetCurrentTask() : nullptr;
-
-    /* Raw cycle counter, not GetBootTime(): this runs on every lock in the
-       kernel, and until TimeInit() picks the TSC, GetBootTime() reads the
-       HPET -- an uncached MMIO access per acquire and per release. The page
-       allocator takes ~22 locks per page, which made a self-test page cost
-       ~0.2ms on real hardware. Watchdog::Check converts to nanoseconds only
-       when it has something to report.
-
-       0 is the "not held" marker below and in Watchdog::Check, so a counter
-       that happens to read exactly 0 is nudged rather than losing the
-       timestamp. */
-    u64 now = Hal::ReadCycleCounter();
-    WatchdogLockTime.Set((now != 0) ? now : 1);
 }
 
 void SpinLock::Unlock()
 {
-    WatchdogLockTime.Set(0);
     Owner = nullptr;
     RawLock.Unlock();
 }
