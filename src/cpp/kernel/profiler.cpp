@@ -173,6 +173,14 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
         ulong Depth;
         const char* Name[MaxDepth];
         ulong Count;
+
+        /* Where inside the leaf the samples landed. Folding compares symbol
+           names, so every address in a function collapses into one chain --
+           which is the point for the callers, but loses the one offset worth
+           having. Keeping the span says whether the samples sat on a single
+           instruction or were spread across the function. */
+        ulong LeafLow;
+        ulong LeafHigh;
     };
 
     /* On the heap rather than on the stack: Report runs in task context,
@@ -222,11 +230,18 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
                no place in an interrupt handler, and the addresses keep just
                as well. */
             const char* name[MaxDepth];
+            ulong leafOffset = 0;
             for (ulong f = 0; f < depth; f++)
             {
                 ulong offset;
                 if (!symtab.Resolve(record.Frame[f], name[f], offset))
+                {
                     name[f] = nullptr;
+                    offset = 0;
+                }
+
+                if (f == 0)
+                    leafOffset = offset;
             }
 
             ulong c = 0;
@@ -262,8 +277,15 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
                 for (ulong f = 0; f < depth; f++)
                     chains[c].Name[f] = name[f];
                 chains[c].Count = 0;
+                chains[c].LeafLow = leafOffset;
+                chains[c].LeafHigh = leafOffset;
                 chainCount++;
             }
+
+            if (leafOffset < chains[c].LeafLow)
+                chains[c].LeafLow = leafOffset;
+            if (leafOffset > chains[c].LeafHigh)
+                chains[c].LeafHigh = leafOffset;
 
             chains[c].Count++;
         }
@@ -309,9 +331,20 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
         }
 
         ulong permille = (chains[i].Count * 1000) / total;
-        printer.Printf("%u.%u%% %u %s\n", permille / 10, permille % 10,
-            chains[i].Count, SymbolName(chains[i].Name[0]));
 
+        if (chains[i].LeafLow == chains[i].LeafHigh)
+            printer.Printf("%u.%u%% %u %s+0x%p\n", permille / 10, permille % 10,
+                chains[i].Count, SymbolName(chains[i].Name[0]),
+                chains[i].LeafLow);
+        else
+            printer.Printf("%u.%u%% %u %s+0x%p..0x%p\n",
+                permille / 10, permille % 10, chains[i].Count,
+                SymbolName(chains[i].Name[0]),
+                chains[i].LeafLow, chains[i].LeafHigh);
+
+        /* Callers stay bare: a return address offset names the call site,
+           which is a lot of noise for a line that is there to say which path
+           got here. */
         for (ulong f = 1; f < chains[i].Depth; f++)
             printer.Printf("        <- %s\n", SymbolName(chains[i].Name[f]));
     }
