@@ -43,6 +43,10 @@ public:
 
     static const u16 DefaultPort = 9999;
 
+    /* Ethernet MTU plus headers: the reply is the request with its addresses
+       swapped, so it is never larger than what arrived. */
+    static const ulong MaxFrameLen = 1514;
+
 private:
     NetLoad();
     ~NetLoad();
