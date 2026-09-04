@@ -6,6 +6,12 @@
 namespace Kernel
 {
 
+/* Bounds on netframes=N. The floor keeps a typo from starving the datapath;
+   the ceiling keeps one from reserving a quarter of a gigabyte at boot, since
+   the pool is built once and never grows. */
+static const ulong NetFrameCountMin = 64;
+static const ulong NetFrameCountMax = 65536;
+
 /* Upper bound on nctail=N. The netconsole ring is smaller than this, and it
    treats a cap at or above its own size as no cap at all -- this only keeps
    a typo from being taken for a number. */
@@ -24,6 +30,7 @@ Parameters::Parameters()
     , UdpShellPort(0)
     , NetconsolePort(0)
     , NetconsoleTailKb(0)
+    , NetFrameCount(0)
     , LogLevel(DefaultLogLevel)
     , DnsEnabled(false)
     , RootAuto(false)
@@ -117,6 +124,11 @@ u16 Parameters::GetNetconsolePort()
 ulong Parameters::GetNetconsoleTailKb()
 {
     return NetconsoleTailKb;
+}
+
+ulong Parameters::GetNetFrameCount()
+{
+    return NetFrameCount;
 }
 
 int Parameters::GetLogLevel()
@@ -313,6 +325,19 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
                     NetconsolePort = (u16)port;
                 }
             }
+        }
+    }
+    else if (Stdlib::StrCmp(key, "netframes") == 0)
+    {
+        ulong count = 0;
+        if (Stdlib::ParseUlong(value, count) &&
+            count >= NetFrameCountMin && count <= NetFrameCountMax)
+        {
+            NetFrameCount = count;
+        }
+        else
+        {
+            Trace(0, "Invalid netframes %s", value);
         }
     }
     else if (Stdlib::StrCmp(key, "nctail") == 0)

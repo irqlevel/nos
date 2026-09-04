@@ -536,7 +536,11 @@ void BpStartup(void* ctx)
         /* Before any driver can want a frame: the pool is what keeps the
            datapath clear of the allocator, and of the TLB shootdown that
            freeing a frame would otherwise cost. */
-        NetFramePool::GetInstance().Setup(NetFramePool::DefaultFrameCount);
+        ulong netFrames = Parameters::GetInstance().GetNetFrameCount();
+        if (netFrames == 0)
+            netFrames = NetFramePool::DefaultFrameCount;
+
+        NetFramePool::GetInstance().Setup(netFrames);
 
         VirtioNet::InitAll();
         VirtioRng::InitAll();
