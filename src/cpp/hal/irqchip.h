@@ -2,7 +2,7 @@
 
 // Interrupt-controller CPU-side operations. Provides namespace Hal {
 // IrqEoi(), IrqEoi(vector), IrqIsInService(vector), GetCurrentCpuHwId(),
-// SendIpi(hwId, vector) }. IRQ *routing* (route/mask a line to a CPU) is
+// SendIpi(hwId, vector), NmiIpiSupported(), SendNmiIpi(hwId) }. IRQ *routing* (route/mask a line to a CPU) is
 // deliberately not abstracted yet: drivers request lines through
 // Interrupt::Register/RegisterLevel, whose backend stays arch code until
 // the second irqchip exists.

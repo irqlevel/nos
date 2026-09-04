@@ -24,7 +24,25 @@ public:
 
     bool IsActive();
 
+    /* Called from the NMI handler. Returns true when a panic asked for this
+       CPU's stack, in which case it has been recorded and the caller must
+       not go on to panic about the NMI itself. */
+    bool CollectRemoteStack();
+
 private:
+
+    /* The CPU that wedged the machine is, by definition, one that stopped
+       answering interrupts -- so an ordinary IPI never reaches it and its
+       stack, the one worth having, is the one missing from the report. An
+       NMI does reach it. Each CPU writes its own slot from inside the NMI
+       handler and the panicking CPU prints them. */
+    void CollectRemoteStacks();
+
+    static const size_t RemoteFrameCount = 12;
+
+    /* Kept in step with Kernel::MaxCpus by a static_assert in panic.cpp;
+       including cpu.h here would be circular. */
+    static const size_t RemoteCpuCount = 64;
 
     Panicker();
     virtual ~Panicker();
@@ -39,6 +57,11 @@ private:
 
     char Message[256];
     Atomic Active;
+
+    Atomic Collecting;
+    ulong RemoteFrame[RemoteCpuCount][RemoteFrameCount];
+    u8 RemoteCount[RemoteCpuCount];
+    Atomic RemoteDone[RemoteCpuCount];
 };
 
 }

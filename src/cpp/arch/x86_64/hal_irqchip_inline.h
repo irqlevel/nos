@@ -44,4 +44,17 @@ static inline __attribute__((always_inline)) void SendIpi(ulong hwId, u8 vector)
     Kernel::Lapic::SendIPI(hwId, vector);
 }
 
+/* An NMI reaches a CPU that has interrupts disabled -- which is exactly the
+   CPU worth asking about when the machine has wedged, and exactly the one an
+   ordinary IPI cannot reach. */
+static inline __attribute__((always_inline)) bool NmiIpiSupported()
+{
+    return true;
+}
+
+static inline __attribute__((always_inline)) void SendNmiIpi(ulong hwId)
+{
+    Kernel::Lapic::SendNmi(hwId);
+}
+
 }

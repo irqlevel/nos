@@ -28,6 +28,8 @@ public:
 
     static void SendIPI(u32 apicId, u32 vector);
 
+    static void SendNmi(u32 apicId);
+
     /* Is `vector` currently in service on this CPU? Used by the shared
        interrupt dispatch to identify the vector that actually fired. */
     static bool CheckIsr(u8 vector);
