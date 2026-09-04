@@ -28,6 +28,10 @@ namespace Kernel
 class Hpet final : public InterruptHandler
 {
 public:
+    /* Tick rate, shared with whatever drives the tick: the HPET's own
+       comparator, or each CPU's local APIC timer. */
+    static const ulong DesiredHz = 100;
+
     static Hpet& GetInstance()
     {
         static Hpet Instance;
@@ -91,7 +95,7 @@ private:
     static const u64 GcapCountSizeCap = (1ULL << 13); /* 1 = 64-bit main counter */
 
     /* Desired tick rate (same as PIT) */
-    static const ulong DesiredHz = 100;
+
 
     /* 1 femtosecond = 1e-15 s; GCAP period is in femtoseconds */
     static const u64 FemtoSecsPerNanoSec = 1000000ULL;

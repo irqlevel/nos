@@ -1,4 +1,5 @@
 #include "lapic.h"
+#include <kernel/time.h>
 #include <drivers/acpi.h>
 
 #include <kernel/trace.h>
@@ -184,6 +185,61 @@ void Lapic::SendNmi(u32 apicId)
     }
 
     SetRflags(flags);
+}
+
+u32 Lapic::CalibrateTimer(ulong hz)
+{
+    static const ulong SampleNs = 50 * Const::NanoSecsInMs;
+
+    if (hz == 0)
+        return 0;
+
+    /* Free-running and masked: nothing is delivered, the counter just
+       counts down so we can see how fast it goes. */
+    WriteReg(TimerDivideIndex, TimerDivideBy16);
+    WriteReg(LvtTimerIndex, LvtMasked);
+    WriteReg(TimerInitialCountIndex, 0xFFFFFFFF);
+
+    Stdlib::Time start = GetBootTime();
+    Stdlib::Time deadline = start + Stdlib::Time(SampleNs);
+    while (GetBootTime() < deadline)
+        Pause();
+
+    u32 remaining = ReadReg(TimerCurrentCountIndex);
+    ulong elapsed = (GetBootTime() - start).GetValue();
+
+    WriteReg(TimerInitialCountIndex, 0);
+
+    if (remaining == 0 || elapsed == 0)
+    {
+        /* Ran the counter to zero, or the clock did not move: either way
+           the measurement is not one to build a tick on. */
+        Trace(0, "Lapic: timer calibration failed (remaining %u, elapsed %u)",
+            (ulong)remaining, elapsed);
+        return 0;
+    }
+
+    ulong ticks = 0xFFFFFFFFUL - remaining;
+    ulong ticksPerSec = (ticks * Const::NanoSecsInSec) / elapsed;
+    ulong count = ticksPerSec / hz;
+
+    if (count == 0 || count > 0xFFFFFFFFUL)
+    {
+        Trace(0, "Lapic: timer count %u out of range", count);
+        return 0;
+    }
+
+    Trace(0, "Lapic: timer %u ticks/s, count %u for %u Hz",
+        ticksPerSec, count, hz);
+
+    return (u32)count;
+}
+
+void Lapic::StartTimer(u8 vector, u32 initialCount)
+{
+    WriteReg(TimerDivideIndex, TimerDivideBy16);
+    WriteReg(LvtTimerIndex, (u32)vector | LvtTimerPeriodic);
+    WriteReg(TimerInitialCountIndex, initialCount);
 }
 
 void Lapic::SendIPI(u32 apicId, u32 vector)

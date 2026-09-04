@@ -57,6 +57,7 @@ public:
     ulong GetState();
 
     void IPI(Context* ctx);
+    void TimerTick(Context* ctx);
 
     static const ulong StateInited = 0x1;
     static const ulong StateRunning = 0x2;
@@ -125,6 +126,14 @@ public:
 
     static const u8 IPIVector = Hal::IpiVector;
 
+    /* The local APIC timer's own vector, below the IPI's. */
+    static const u8 TimerVector = 0xFD;
+
+    /* True once every CPU is ticking off its own local timer; until then the
+       tick arrives as a broadcast IPI from whichever CPU owns the HPET. */
+    bool HasPerCpuTimer();
+    void SetPerCpuTimer();
+
     void SendIPI(ulong index);
 
     ulong GetRunningCpus();
@@ -160,6 +169,9 @@ private:
     /* Mirror of BspIndex readable without taking Lock */
     Atomic BspIndexCached;
 
+
+    /* Read on the tick path from every CPU; written once, at boot. */
+    volatile bool PerCpuTimer;
 };
 
 static inline Cpu& GetCpu()

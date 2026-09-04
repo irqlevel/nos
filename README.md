@@ -36,6 +36,13 @@ Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Clo
   free-list walk touches it at random. Cost: building the free list still
   touches every page twice, about 0.6 µs in total each, so a 64 GiB machine
   spends around ten seconds of its boot there.
+- **Per-CPU tick** — each CPU runs its own periodic timer (x86-64: the local
+  APIC timer, calibrated once against the established clock; arm64: the
+  generic timer), rather than one HPET interrupt on one CPU fanned out to
+  every other by IPI. That removes a write to the interrupt command register
+  per CPU per tick, and removes the single point of failure: a CPU that stops
+  answering interrupts now stops only its own tick, while the others keep
+  ticking and the watchdog notices it. The HPET stays as the timekeeper.
 - **Kernel infrastructure** — spinlocks, mutexes, SeqLock (single-writer/multi-reader), atomics, wait groups, SoftIrq deferred processing, IPI tasks, timers, watchdog, stack traces with symbol resolution, dmesg ring buffer (512 KB, 2048 messages, recycled lines counted and reported), panic handler with backtrace and CPU/task context, per-device interrupt statistics, AP startup diagnostics, virtual-to-physical address translation (4-level page table walk), byte-order helpers (`Htons`/`Htonl`/`Ntohs`/`Ntohl`)
 - **Optimized stdlib** — `MemSet`, `MemCpy`, `MemCmp`, `StrLen`, `StrCmp`, `StrStr` implemented in x86-64 assembly using `rep stosq`/`rep movsq`/`repe cmpsb`/`repne scasb` (portable C versions on arm64)
 - **Rust support** — `#![no_std]` Rust crates linked into the kernel via `staticlib`, FFI bridge (`rust_ffi.cpp`) exposing kernel services to Rust: spinlocks, mutexes, wait groups, timers, SoftIRQ, MSI-X interrupts, legacy interrupts, DMA allocation, MMIO mapping, PCI config space, block device and network device registration, CPU/IPI/task APIs. **kcore** library provides safe Rust wrappers around kernel primitives. **NVMe driver** written entirely in Rust — PCI BAR mapping, admin + I/O queue pairs, MSI-X interrupt-driven completion, WaitGroup-based synchronous I/O, multi-device support, proper RAII cleanup on shutdown

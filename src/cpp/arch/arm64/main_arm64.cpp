@@ -169,6 +169,11 @@ static void BpStartupArm(void* ctx)
         return;
     }
 
+    /* The generic timer is per core by construction, and every CPU arms its
+       own in ApStartupArm -- so the tick work on the IPI path is a duplicate
+       here, and has been since the port. */
+    CpuTable::GetInstance().SetPerCpuTimer();
+
     if (!Pl011::GetInstance().Setup(board.Pl011IntId))
     {
         Panic("Can't setup uart irq");
