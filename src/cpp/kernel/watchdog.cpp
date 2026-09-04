@@ -4,6 +4,10 @@
 #include "time.h"
 #include "panic.h"
 #include "trace.h"
+#include "cpu.h"
+
+static_assert(Kernel::Watchdog::SliceCpus == Kernel::MaxCpus,
+    "SliceCpus must track MaxCpus");
 
 namespace Kernel
 {
@@ -27,8 +31,31 @@ void Watchdog::ListLock::UnlockIrqRestore(ulong flags)
     PreemptIrqRestore(flags);
 }
 
+namespace
+{
+
+/* Kernighan: one iteration per set bit, so at most the CPU count. Called once
+   per walk, not per lock. */
+ulong PopCount(ulong value)
+{
+    ulong count = 0;
+    while (value != 0)
+    {
+        value &= value - 1;
+        count++;
+    }
+    return count;
+}
+
+}
+
 Watchdog::Watchdog()
 {
+    for (ulong i = 0; i < SliceCpus; i++)
+    {
+        CpuSlice[i].First = 0;
+        CpuSlice[i].Stride = 0;
+    }
 }
 
 Watchdog::~Watchdog()
@@ -52,10 +79,49 @@ void Watchdog::Check()
        that lock, so the report actually leaves. */
     const ulong stuckNs = 10 * Const::NanoSecsInSec;
 
+    /* Divide the table among the CPUs instead of having each of them walk
+       all of it. The list is global and a bucket needs looking at once, so
+       twenty CPUs each walking all 512 buckets a hundred times a second was
+       doing the same work twenty times over -- and contending on the same
+       bucket locks to do it. Every bucket is still visited every tick, by
+       exactly one CPU: the coverage and the detection latency do not change,
+       only the redundancy. */
+    ulong first = 0;
+    ulong stride = 1;
+
+    auto& table = CpuTable::GetInstance();
+    ulong mask = table.GetRunningCpusNoLock();
+    ulong index = table.GetCurrentCpu().GetIndex();
+
+    if (index < MaxCpus && (mask & (1UL << index)) != 0)
+    {
+        /* Rank among the running CPUs rather than the index itself: on x86
+           the index is the APIC ID, which a hybrid part leaves full of holes
+           (0,1,8,9,...,62 for twenty threads). Ranks are dense, so every
+           bucket falls to exactly one CPU. */
+        stride = PopCount(mask);
+        first = PopCount(mask & ((1UL << index) - 1));
+    }
+
+    /* Recorded so `watchdog` can show how the table is divided. Written only
+       when the split changes, which after bring-up is never: a store every
+       tick would put every CPU back on a shared line. */
+    if (index < SliceCpus &&
+        (CpuSlice[index].First != first || CpuSlice[index].Stride != stride))
+    {
+        CpuSlice[index].First = first;
+        CpuSlice[index].Stride = stride;
+    }
+
+    /* Once per walk. This used to be incremented for every lock examined --
+       one global atomic, touched by every CPU, as many times a second as
+       there are watched locks times the tick rate. */
+    CheckCounter.Inc();
+
     RawSpinLock* stuck = nullptr;
     ulong stuckHeldNs = 0;
 
-    for (size_t i = 0; i < Stdlib::ArraySize(SpinLockList); i++)
+    for (size_t i = first; i < Stdlib::ArraySize(SpinLockList); i += stride)
     {
         auto& listLock = SpinLockListLock[i];
         auto& list = SpinLockList[i];
@@ -69,7 +135,6 @@ void Watchdog::Check()
             entry = entry->Flink)
         {
             RawSpinLock* lock = CONTAINING_RECORD(entry, RawSpinLock, WatchdogListEntry);
-            CheckCounter.Inc();
             u64 lockTime = lock->WatchdogLockTime.Get();
             if (lockTime != 0 && now > lockTime)
             {
@@ -125,7 +190,23 @@ void Watchdog::UnregisterSpinLock(RawSpinLock& lock)
 
 void Watchdog::Dump(Stdlib::Printer& printer)
 {
-    printer.Printf("%u %u\n", SpinLockCounter.Get(), CheckCounter.Get());
+    printer.Printf("locks watched: %u\n", SpinLockCounter.Get());
+    printer.Printf("table walks:   %u\n", CheckCounter.Get());
+    printer.Printf("buckets:       %u\n", (ulong)Stdlib::ArraySize(SpinLockList));
+
+    /* Which slice of the table each CPU walks. The slices have to be dense
+       and disjoint, or a bucket belongs to nobody and a lock stuck in it is
+       never noticed. */
+    for (ulong i = 0; i < SliceCpus; i++)
+    {
+        if (CpuSlice[i].Stride == 0)
+            continue;
+
+        printer.Printf("cpu %u: %u buckets, from %u every %u\n", i,
+            (ulong)((Stdlib::ArraySize(SpinLockList) - CpuSlice[i].First +
+                CpuSlice[i].Stride - 1) / CpuSlice[i].Stride),
+            CpuSlice[i].First, CpuSlice[i].Stride);
+    }
 }
 
 }

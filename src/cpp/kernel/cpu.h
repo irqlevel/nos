@@ -138,6 +138,17 @@ public:
 
     ulong GetRunningCpus();
 
+    /* Mirror of the above, readable without taking Lock. The watchdog reads
+       it from every CPU's tick, and taking the table lock there would be both
+       the contention the reader exists to remove and a spinlock acquired
+       from an interrupt with interrupts off -- the shape that wedges
+       machines. Published by NoteCpuRunning as each CPU comes up, and
+       refreshed by every locked call above. Nothing clears StateRunning
+       today, so nothing takes a bit back out. */
+    ulong GetRunningCpusNoLock();
+
+    void NoteCpuRunning(ulong index);
+
     void ExitAllExceptSelf();
 
     void SendIPIAllExclude(ulong excludeIndex);
@@ -168,6 +179,9 @@ private:
     ulong BspIndex;
     /* Mirror of BspIndex readable without taking Lock */
     Atomic BspIndexCached;
+
+    /* Mirror of the running-CPU set, read on the tick path */
+    Atomic RunningMaskCached;
 
 
     /* Read on the tick path from every CPU; written once, at boot. */
