@@ -1,6 +1,7 @@
 #include "net_load.h"
 
 #include <net/net.h>
+#include <net/net_frame_pool.h>
 #include <kernel/trace.h>
 #include <kernel/time.h>
 #include <kernel/sched.h>
@@ -173,6 +174,19 @@ void NetLoad::Run()
         RxPps = rxPackets - lastRxPackets;
         TxPps = txPackets - lastTxPackets;
         RxBps = rxBytes - lastRxBytes;
+
+        /* One line a second, over the netconsole, for as long as the load
+           runs. The point is not the numbers: it is that the line keeps
+           arriving. This machine goes deaf under load -- the shell stops
+           answering and so does ping -- and every channel that could say why
+           is a network channel. The netconsole only sends, so if these lines
+           continue after the machine has stopped receiving, the machine is
+           alive and the receive path is what died; if they stop with it, the
+           kernel itself is wedged. Nothing else here can tell those apart. */
+        Trace(0, "NetLoad: rx %u (+%u), tx %u, failed %u, pool misses %u, in flight %u",
+            rxPackets, RxPps, txPackets, txFailed,
+            NetFramePool::GetInstance().GetAllocMisses(),
+            NetFramePool::GetInstance().GetInFlight());
 
         lastRxPackets = rxPackets;
         lastRxBytes = rxBytes;
