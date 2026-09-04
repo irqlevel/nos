@@ -4,7 +4,6 @@
 #include <lib/list_entry.h>
 #include <lib/printer.h>
 
-#include "spin_lock.h"
 #include "raw_spin_lock.h"
 #include "atomic.h"
 
@@ -20,8 +19,8 @@ public:
         return Instance;
     }
 
-    void RegisterSpinLock(SpinLock& lock);
-    void UnregisterSpinLock(SpinLock& lock);
+    void RegisterSpinLock(RawSpinLock& lock);
+    void UnregisterSpinLock(RawSpinLock& lock);
 
     void Check();
 
@@ -36,8 +35,22 @@ private:
 
     static const size_t SpinLockHashSize = 512;
 
+    /* The watchdog's own locks cannot be RawSpinLocks: a RawSpinLock
+       registers itself with the watchdog when it is constructed, and these
+       are constructed as part of constructing the watchdog. Same two
+       instructions, no registration. */
+    class ListLock final
+    {
+    public:
+        ulong LockIrqSave();
+        void UnlockIrqRestore(ulong flags);
+
+    private:
+        Atomic Value;
+    };
+
     Stdlib::ListEntry SpinLockList[SpinLockHashSize];
-    RawSpinLock SpinLockListLock[SpinLockHashSize];
+    ListLock SpinLockListLock[SpinLockHashSize];
 
     Atomic CheckCounter;
     Atomic SpinLockCounter;

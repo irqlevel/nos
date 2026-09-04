@@ -281,7 +281,7 @@ void FbTerm::ClsLockHeld()
 
 bool FbTerm::Setup(const FbInfo& info)
 {
-    Watchdog::GetInstance().UnregisterSpinLock(Lock);
+    Lock.Unwatch();
 
     Stdlib::AutoLock lock(Lock);
 

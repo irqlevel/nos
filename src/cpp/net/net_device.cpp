@@ -5,6 +5,8 @@
 
 #include <kernel/trace.h>
 #include <kernel/softirq.h>
+#include <kernel/panic.h>
+#include <kernel/preempt.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>
 
@@ -45,17 +47,41 @@ void NetDevice::ReleaseTxDone()
 
 bool NetDevice::SubmitTx(NetFrame* frame)
 {
-    ulong flags = TxQueueLock.LockIrqSave();
+    /* A panic report has to leave through this function, and the lock it
+       needs may be held by a CPU that is never going to release it -- that
+       is precisely the failure a panic is most often reporting. Blocking
+       here means the report is never written, which is how a deadlocked TX
+       path produces a machine that dies in complete silence.
+
+       So once a panic has begun, take the lock if it is free and go on
+       without it if it is not. Going on without it can race the holder into
+       the driver's ring; on a machine that is already dying, a corrupted
+       TX ring costs nothing and the report is worth everything. */
+    bool acquired = true;
+    ulong flags;
+
+    if (Panicker::GetInstance().IsActive())
+        flags = TxQueueLock.TryLockIrqSave(acquired);
+    else
+        flags = TxQueueLock.LockIrqSave();
+
     if (TxCount >= TxQueueCapacity)
     {
-        TxQueueLock.UnlockIrqRestore(flags);
+        if (acquired)
+            TxQueueLock.UnlockIrqRestore(flags);
+        else
+            PreemptIrqRestore(flags);
         frame->Put();
         return false;
     }
     TxQueue.InsertTail(&frame->Link);
     TxCount++;
     FlushTx();
-    TxQueueLock.UnlockIrqRestore(flags);
+
+    if (acquired)
+        TxQueueLock.UnlockIrqRestore(flags);
+    else
+        PreemptIrqRestore(flags);
 
     ReleaseTxDone();
     return true;
