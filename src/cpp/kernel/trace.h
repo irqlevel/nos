@@ -22,6 +22,13 @@ const int IoApicLL = 0;
 const int MmIoLL = 4;
 const int TestLL = 3;
 
+/* Three lines per ping, on the normal path. A machine someone is checking
+   with `ping -f`, or just a host that gets scanned, buries everything else
+   in the dmesg ring and in the netconsole stream. The counters behind
+   `icmpstat` already say how many arrived and how many were answered;
+   `loglevel 3` brings the per-packet detail back. */
+const int IcmpLL = 3;
+
 /* Task create/start/free/destroy. Six lines per task, and the multitasking
    self-test makes one task per CPU twice over: on a 20-CPU box that is a
    third of everything printed before the network exists, all of it competing
