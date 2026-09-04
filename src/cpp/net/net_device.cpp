@@ -4,6 +4,7 @@
 #include "tcp.h"
 
 #include <kernel/trace.h>
+#include <kernel/parameters.h>
 #include <kernel/softirq.h>
 #include <kernel/panic.h>
 #include <kernel/preempt.h>
@@ -444,6 +445,9 @@ void NetDeviceTable::ProcessAllRx()
 void NetDeviceTable::PollRx()
 {
     if (Count == 0)
+        return;
+
+    if (!Parameters::GetInstance().IsRxPollEnabled())
         return;
 
     /* An interrupt has already asked; leave it to say so. */
