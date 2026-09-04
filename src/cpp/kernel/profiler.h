@@ -19,13 +19,18 @@ namespace Kernel
    because the whole kernel is built with -fno-omit-frame-pointer. What is
    left is to take a sample on each tick and count them up.
  
-   Samples are taken on the per-CPU tick, so the rate is the tick rate --
-   100 Hz per CPU, which finds a hot function but will not show fine
-   structure. Sampling at kilohertz needs the performance counters and an
-   NMI, which is a separate piece of work; this one costs no new interrupt.
+   Samples come from one of two places. Where the hardware has architectural
+   performance counters, a cycle counter is set to overflow into an NMI about
+   every millisecond: ten times the tick rate, and -- because it arrives as
+   an NMI -- it also samples code running with interrupts disabled, which a
+   tick by construction never catches. Everywhere else the tick itself takes
+   the sample, at 100 Hz per CPU: enough to find a hot function, not enough
+   to show its shape. Report() says which of the two produced the numbers.
  
-   Each CPU writes only its own buffer, from its own tick, with interrupts
-   already off -- so there is no lock here and nothing to contend for. */
+   Each CPU writes only its own buffer, from its own interrupt, with
+   interrupts already off -- so there is no lock here and nothing to contend
+   for. An NMI cannot be nested by another NMI on the same CPU, so that
+   holds for the counter path too. */
 class Profiler final
 {
 public:
@@ -40,7 +45,13 @@ public:
     /* Cheap enough to call from every tick: one read of a flag. */
     bool IsActive() { return Active; }
 
-    /* Called from the per-CPU tick, interrupts already off. */
+    /* Called from the per-CPU tick, interrupts already off. Arms and disarms
+       this CPU's performance counter, and takes the sample itself when there
+       is no counter to do it. */
+    void Tick(Context* ctx);
+
+    /* Called from the NMI handler once the counter overflow has been
+       acknowledged as this profiler's. */
     void Sample(Context* ctx);
 
     bool Start();
@@ -57,8 +68,10 @@ private:
     Profiler(const Profiler& other) = delete;
     Profiler& operator=(const Profiler& other) = delete;
 
-    /* 2.5 seconds of headroom per CPU at the tick rate. */
-    static const ulong SamplesPerCpu = 256;
+    /* One second per CPU at the counter rate, ten at the tick rate. Buffers
+       are allocated for the CPUs that are actually running, so the cost is
+       the machine's real width rather than MaxCpus. */
+    static const ulong SamplesPerCpu = 1024;
 
     /* How many distinct symbols a report can name, and how many it prints. */
     static const ulong MaxSymbols = 128;
@@ -77,12 +90,18 @@ private:
         Record* Records;
         ulong Count;
         ulong Dropped;
+
+        /* Written only by its own CPU, from its own tick. */
+        bool PmuArmed;
     };
 
     bool Allocate();
     void ReportCallers(Stdlib::Printer& printer, const char* leaf, ulong pidFilter);
 
     volatile bool Active;
+
+    /* Set at Start from CPUID; read by every tick. */
+    volatile bool UsePmu;
     bool Allocated;
 
     PerCpu Cpu_[MaxCpus];

@@ -473,8 +473,7 @@ void Cpu::TimerTick(Context* ctx)
 
     Watchdog::GetInstance().Check();
 
-    if (Profiler::GetInstance().IsActive())
-        Profiler::GetInstance().Sample(ctx);
+    Profiler::GetInstance().Tick(ctx);
 
     /* Software timers stay on one CPU: they are a handful of periodic
        callbacks, not a per-CPU wheel, and running them everywhere would

@@ -1,4 +1,7 @@
 #include "exception.h"
+#include "pmu.h"
+
+#include <kernel/profiler.h>
 #include "idt.h"
 #include "stdlib.h"
 #include "asm.h"
@@ -149,6 +152,15 @@ void ExceptionTable::ExcNMI(Context* ctx)
     {
         for (;;)
             Hlt();
+    }
+
+    /* A performance counter overflowing: a profiler sample, not a fault.
+       Asked after the panic case and before the panic itself -- an NMI this
+       kernel raised on purpose is the one kind it must return from. */
+    if (Pmu::AckOverflow())
+    {
+        Profiler::GetInstance().Sample(ctx);
+        return;
     }
 
     PanicCtx(ctx, false, "EXC: NMI rip 0x%p rsp 0x%p",

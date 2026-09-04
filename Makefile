@@ -52,6 +52,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/drivers/usb/hid_kbd.cpp \
     src/cpp/drivers/acpi.cpp    \
     src/cpp/arch/x86_64/lapic.cpp   \
+	src/cpp/arch/x86_64/pmu.cpp	\
     src/cpp/arch/x86_64/ioapic.cpp  \
     src/cpp/drivers/vga.cpp \
     src/cpp/drivers/font8x16.cpp \
