@@ -67,11 +67,17 @@ ulong Cpu::GetState()
 
 void Cpu::SetRunning()
 {
-    Stdlib::AutoLock lock(Lock);
-    if (BugOn(State & StateRunning))
-        return;
+    {
+        Stdlib::AutoLock lock(Lock);
+        if (BugOn(State & StateRunning))
+            return;
 
-    State |= StateRunning;
+        State |= StateRunning;
+    }
+
+    /* Published outside this CPU's own lock and without the table's: the
+       watchdog's tick path reads this mirror on every CPU. */
+    CpuTable::GetInstance().NoteCpuRunning(Index);
 }
 
 void Cpu::SetExiting()
@@ -606,6 +612,28 @@ void CpuTable::SetPerCpuTimer()
     PerCpuTimer = true;
 }
 
+ulong CpuTable::GetRunningCpusNoLock()
+{
+    return (ulong)RunningMaskCached.Get();
+}
+
+void CpuTable::NoteCpuRunning(ulong index)
+{
+    if (index >= MaxCpus)
+        return;
+
+    ulong bit = 1UL << index;
+    for (;;)
+    {
+        ulong old = (ulong)RunningMaskCached.Get();
+        if ((old & bit) != 0)
+            return;
+
+        if ((ulong)RunningMaskCached.Cmpxchg((long)(old | bit), (long)old) == old)
+            return;
+    }
+}
+
 ulong CpuTable::GetRunningCpus()
 {
     Stdlib::AutoLock lock(Lock);
@@ -618,6 +646,7 @@ ulong CpuTable::GetRunningCpus()
             result |= 1UL << i;
     }
 
+    RunningMaskCached.Set((long)result);
     return result;
 }
 

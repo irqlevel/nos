@@ -26,6 +26,10 @@ public:
 
     void Dump(Stdlib::Printer& printer);
 
+    /* Checked against MaxCpus in the .cpp; kept here so this header does not
+       have to pull in cpu.h. */
+    static const ulong SliceCpus = 64;
+
 private:
     Watchdog(const Watchdog& other) = delete;
     Watchdog(Watchdog&& other) = delete;
@@ -51,6 +55,15 @@ private:
 
     Stdlib::ListEntry SpinLockList[SpinLockHashSize];
     ListLock SpinLockListLock[SpinLockHashSize];
+
+    /* The slice of the bucket table each CPU walks, for Dump. */
+    struct Slice
+    {
+        ulong First;
+        ulong Stride;
+    };
+
+    Slice CpuSlice[SliceCpus];
 
     Atomic CheckCounter;
     Atomic SpinLockCounter;
