@@ -53,6 +53,14 @@ public:
        to raise it on the machine in question and watch `netpool` for misses. */
     ulong GetNetFrameCount();
 
+    /* rxpoll=on -- have the tick look at the receive path as well as the
+       NIC's own interrupt. Off by default: it is a hypothesis about a driver
+       stall, not a proven fix, and on the machine it was meant to help the
+       stall arrived sooner with it on than with it off. Left behind a switch
+       so the two can be compared without a rebuild, which is the only way to
+       tell on a box whose console is a UDP socket. */
+    bool IsRxPollEnabled();
+
     /* loglevel=N: the trace level to boot with. Defaults to what main sets
        today; the `loglevel` shell command moves it afterwards. */
     int GetLogLevel();
@@ -96,6 +104,7 @@ private:
     u16 NetconsolePort;
     ulong NetconsoleTailKb;
     ulong NetFrameCount;
+    bool RxPoll;
     int LogLevel;
     bool DnsEnabled;
     bool RootAuto;

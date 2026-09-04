@@ -31,6 +31,7 @@ Parameters::Parameters()
     , NetconsolePort(0)
     , NetconsoleTailKb(0)
     , NetFrameCount(0)
+    , RxPoll(false)
     , LogLevel(DefaultLogLevel)
     , DnsEnabled(false)
     , RootAuto(false)
@@ -129,6 +130,11 @@ ulong Parameters::GetNetconsoleTailKb()
 ulong Parameters::GetNetFrameCount()
 {
     return NetFrameCount;
+}
+
+bool Parameters::IsRxPollEnabled()
+{
+    return RxPoll;
 }
 
 int Parameters::GetLogLevel()
@@ -326,6 +332,10 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
                 }
             }
         }
+    }
+    else if (Stdlib::StrCmp(key, "rxpoll") == 0)
+    {
+        RxPoll = (Stdlib::StrCmp(value, "on") == 0);
     }
     else if (Stdlib::StrCmp(key, "netframes") == 0)
     {
