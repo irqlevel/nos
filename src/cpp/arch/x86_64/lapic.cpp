@@ -187,6 +187,16 @@ void Lapic::SendNmi(u32 apicId)
     SetRflags(flags);
 }
 
+void Lapic::WriteLvtPerfCounterNmi()
+{
+    WriteReg(LvtPerfCntIndex, IcrNmi);
+}
+
+void Lapic::MaskLvtPerfCounter()
+{
+    WriteReg(LvtPerfCntIndex, LvtMasked);
+}
+
 u32 Lapic::CalibrateTimer(ulong hz)
 {
     static const ulong SampleNs = 50 * Const::NanoSecsInMs;

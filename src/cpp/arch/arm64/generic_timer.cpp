@@ -102,8 +102,7 @@ void GenericTimer::LocalTick(Context* ctx)
 
     Watchdog::GetInstance().Check();
 
-    if (Profiler::GetInstance().IsActive())
-        Profiler::GetInstance().Sample(ctx);
+    Profiler::GetInstance().Tick(ctx);
 
     /* Global software timers (Sleep, Rust Timer) are processed on the BSP */
     if (cpu.GetIndex() == cpus.GetBspIndexNoLock())

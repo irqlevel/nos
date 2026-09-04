@@ -1,4 +1,5 @@
 #include <hal/console.h>
+#include <hal/pmu.h>
 #include <hal/power.h>
 #include <hal/cpu.h>
 #include <hal/irqchip.h>
@@ -37,6 +38,22 @@ void PsciCall(u32 fn)
 
 namespace Hal
 {
+
+/* PMUv3 exists on the hardware but is not wired up here, and Apple's
+   hypervisor does not hand the guest one to test against. */
+bool PmuAvailable()
+{
+    return false;
+}
+
+bool PmuStart()
+{
+    return false;
+}
+
+void PmuStop()
+{
+}
 
 void PrintCpuInfo(Stdlib::Printer& con)
 {

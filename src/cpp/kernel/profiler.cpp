@@ -5,6 +5,7 @@
 #include "trace.h"
 
 #include <hal/irqchip.h>
+#include <hal/pmu.h>
 #include <mm/new.h>
 
 namespace Kernel
@@ -12,6 +13,7 @@ namespace Kernel
 
 Profiler::Profiler()
     : Active(false)
+    , UsePmu(false)
     , Allocated(false)
 {
     for (ulong i = 0; i < MaxCpus; i++)
@@ -19,6 +21,7 @@ Profiler::Profiler()
         Cpu_[i].Records = nullptr;
         Cpu_[i].Count = 0;
         Cpu_[i].Dropped = 0;
+        Cpu_[i].PmuArmed = false;
     }
 }
 
@@ -31,8 +34,16 @@ bool Profiler::Allocate()
     if (Allocated)
         return true;
 
+    /* Only the CPUs that are up: a buffer for every slot MaxCpus allows
+       would be megabytes held for the life of the kernel to serve cores this
+       machine does not have. */
+    ulong running = CpuTable::GetInstance().GetRunningCpus();
+
     for (ulong i = 0; i < MaxCpus; i++)
     {
+        if (!(running & (1UL << i)))
+            continue;
+
         Cpu_[i].Records = (Record*)Mm::Alloc(SamplesPerCpu * sizeof(Record), Tag);
         if (Cpu_[i].Records == nullptr)
         {
@@ -63,6 +74,11 @@ bool Profiler::Start()
         Cpu_[i].Dropped = 0;
     }
 
+    /* Asked once, on the CPU running the shell: the answer is a property of
+       the part, and the fixed counters are the one thing the two core types
+       of a hybrid CPU do agree about. */
+    UsePmu = Hal::PmuAvailable();
+
     Active = true;
     return true;
 }
@@ -70,10 +86,50 @@ bool Profiler::Start()
 void Profiler::Stop()
 {
     Active = false;
+
+    /* Each CPU disarms its own counter on its next tick -- the control
+       registers are per CPU and cannot be written from here. Until then it
+       keeps overflowing, and Sample() drops what arrives because Active is
+       already false. */
+}
+
+void Profiler::Tick(Context* ctx)
+{
+    ulong index = Hal::GetCurrentCpuHwId();
+    if (index >= MaxCpus)
+        return;
+
+    PerCpu& cpu = Cpu_[index];
+
+    if (!Active)
+    {
+        if (cpu.PmuArmed)
+        {
+            Hal::PmuStop();
+            cpu.PmuArmed = false;
+        }
+        return;
+    }
+
+    if (UsePmu)
+    {
+        if (!cpu.PmuArmed)
+            cpu.PmuArmed = Hal::PmuStart();
+
+        /* Armed: the samples arrive as counter overflows, and taking one here
+           as well would count this tick twice. */
+        if (cpu.PmuArmed)
+            return;
+    }
+
+    Sample(ctx);
 }
 
 void Profiler::Sample(Context* ctx)
 {
+    if (!Active)
+        return;
+
     ulong index = Hal::GetCurrentCpuHwId();
     if (index >= MaxCpus)
         return;
@@ -171,7 +227,11 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
         }
     }
 
-    printer.Printf("%u samples on %u cpus, %u dropped\n", total, cpus, dropped);
+    /* Which clock these came off matters for reading them: at 100 Hz a
+       function has to be very hot to appear at all, and nothing that runs
+       with interrupts off appears ever. */
+    printer.Printf("%u samples on %u cpus, %u dropped, source %s\n",
+        total, cpus, dropped, UsePmu ? "pmu/nmi" : "tick");
 
     if (total == 0)
     {

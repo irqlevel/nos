@@ -30,6 +30,12 @@ public:
 
     static void SendNmi(u32 apicId);
 
+    /* The local APIC's performance-counter LVT entry, in NMI delivery mode.
+       Rewritten after every delivery: the hardware masks the entry as it
+       delivers. */
+    static void WriteLvtPerfCounterNmi();
+    static void MaskLvtPerfCounter();
+
     /* Counts the local timer against the established clock and returns the
        initial-count value for hz ticks a second, or 0 if it could not be
        measured. Runs once, on the BSP: the count is a property of the bus

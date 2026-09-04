@@ -2,6 +2,8 @@
 #include <hal/power.h>
 #include <hal/cpu.h>
 #include <hal/mmu.h>
+#include <hal/pmu.h>
+#include <arch/x86_64/pmu.h>
 
 #include <arch/x86_64/asm.h>
 #include <arch/x86_64/cpuid.h>
@@ -195,6 +197,31 @@ void PrintCpuInfo(Stdlib::Printer& con)
         "cmpxchg16b (unused)");
     PrintFeature(con, "hyperv  ", (r1.Ecx & (1u << 31)) != 0,
         "running under a hypervisor");
+
+    /* CPUID.0AH: architectural performance monitoring. Version 0 means the
+       counters are not there to program -- which is the case under TCG, and
+       is what decides whether this machine can sample faster than its tick. */
+    CpuidResult r10 = (r0.Eax >= 0xA) ? Cpuid(0xA) : CpuidResult{0, 0, 0, 0};
+    ulong perfVersion = r10.Eax & 0xFF;
+    con.Printf("arch perfmon: version %u, %u general counters %u bits, "
+        "%u fixed counters %u bits\n",
+        perfVersion, (r10.Eax >> 8) & 0xFF, (r10.Eax >> 16) & 0xFF,
+        (ulong)(r10.Edx & 0x1F), (ulong)((r10.Edx >> 5) & 0xFF));
+}
+
+bool PmuAvailable()
+{
+    return Kernel::Pmu::Available();
+}
+
+bool PmuStart()
+{
+    return Kernel::Pmu::Start(Kernel::Pmu::DefaultPeriod);
+}
+
+void PmuStop()
+{
+    Kernel::Pmu::Stop();
 }
 
 void PrintCpuState(Stdlib::Printer& con)

@@ -371,14 +371,14 @@ it on a network you trust.
 |---------|-------------|
 | `cls` | Clear screen |
 | `cpu` | Dump CPU state |
-| `lscpu` | Identify the CPU and report the features the kernel depends on (1 GiB pages, NX, PAT, invariant TSC, ARAT) |
+| `lscpu` | Identify the CPU and report the features the kernel depends on (1 GiB pages, NX, PAT, invariant TSC, ARAT, architectural perfmon) |
 | `dmesg [lines] [filter]` | Dump kernel log: newest `lines` messages (all of it if omitted), optional substring filter |
 | `loglevel [N]` | Show or set the trace level (0-5) on a running kernel |
 | `uptime` | Show uptime |
 | `date` | Show wall clock date and time (RTC + boot time) |
 | `ps` | Show tasks |
 | `top [ms]` | Per-task CPU use over a sampling window, percent per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%) |
-| `profile [ms] [pid]` | Sampling profiler: where the kernel spends its time, by symbol with callers, sampled on the per-CPU tick |
+| `profile [ms] [pid]` | Sampling profiler: where the kernel spends its time, by symbol with callers. Samples on a performance counter overflowing into an NMI (~1 kHz, and catches code running with interrupts off) where the CPU has architectural perfmon; falls back to the 100 Hz per-CPU tick where it does not. The report names which |
 | `bt <pid>` | Dump stack trace of a task (uses IPI for remote CPUs) |
 | `watchdog` | Show watchdog stats |
 | `memusage` | Show memory usage |
