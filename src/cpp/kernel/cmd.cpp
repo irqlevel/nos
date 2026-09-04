@@ -829,6 +829,10 @@ static void CmdNet(const char* args, Stdlib::Printer& con)
 {
     (void)args;
     NetDeviceTable::GetInstance().Dump(con);
+    con.Printf("rx polls %u, poll work %u, stalls %u\n",
+        NetDeviceTable::GetInstance().GetRxPolls(),
+        NetDeviceTable::GetInstance().GetRxPollWork(),
+        NetDeviceTable::GetInstance().GetRxStalls());
 }
 
 static void CmdNetpool(const char* args, Stdlib::Printer& con)

@@ -183,10 +183,14 @@ void NetLoad::Run()
            continue after the machine has stopped receiving, the machine is
            alive and the receive path is what died; if they stop with it, the
            kernel itself is wedged. Nothing else here can tell those apart. */
-        Trace(0, "NetLoad: rx %u (+%u), tx %u, failed %u, pool misses %u, in flight %u",
+        Trace(0, "NetLoad: rx %u (+%u), tx %u, failed %u, pool misses %u, "
+            "in flight %u, rx polls %u, poll work %u, stalls %u",
             rxPackets, RxPps, txPackets, txFailed,
             NetFramePool::GetInstance().GetAllocMisses(),
-            NetFramePool::GetInstance().GetInFlight());
+            NetFramePool::GetInstance().GetInFlight(),
+            NetDeviceTable::GetInstance().GetRxPolls(),
+            NetDeviceTable::GetInstance().GetRxPollWork(),
+            NetDeviceTable::GetInstance().GetRxStalls());
 
         lastRxPackets = rxPackets;
         lastRxBytes = rxBytes;

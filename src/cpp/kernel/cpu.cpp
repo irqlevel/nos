@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include <net/net_device.h>
 #include "interrupt.h"
 #include "panic.h"
 #include "trace.h"
@@ -485,7 +486,13 @@ void Cpu::TimerTick(Context* ctx)
        callbacks, not a per-CPU wheel, and running them everywhere would
        just fire each one N times. */
     if (Index == CpuTable::GetInstance().GetBspIndexNoLock())
+    {
         TimerTable::GetInstance().ProcessTimers();
+
+        /* And look at the receive path, whether or not a NIC asked. See
+           NetDeviceTable::PollRx. */
+        NetDeviceTable::GetInstance().PollRx();
+    }
 
     Hal::IrqEoi(CpuTable::TimerVector);
 

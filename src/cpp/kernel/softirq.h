@@ -25,6 +25,11 @@ public:
        The work runs on the CPU which raised it. */
     void Raise(ulong type);
 
+    /* Whether this CPU already has work of this type queued. A poll that
+       wants to cover a lost interrupt must not raise on top of a wakeup that
+       has already happened, or it cannot tell the two apart afterwards. */
+    bool IsPending(ulong type);
+
     /* Register a handler for a soft IRQ type */
     void Register(ulong type, void (*handler)(void* ctx), void* ctx);
 

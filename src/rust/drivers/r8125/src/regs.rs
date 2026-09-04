@@ -137,8 +137,16 @@ pub const ISR_SYS_ERR: u32 = 1 << 15; /* fatal bus error */
 /* What the chip is asked to report.  SYSErr is deliberately not enabled:
  * on this generation it fires spuriously and the vendor driver leaves it
  * masked from the 8168 onwards. */
-pub const INTR_MASK_BITS: u32 =
-    ISR_ROK | ISR_RER | ISR_TOK | ISR_TER | ISR_LINK_CHG | ISR_RX_OVERFLOW;
+/* ISR_RX_FIFO_OVER was checked by the interrupt handler but never armed
+   here, so a receive FIFO overflow -- one of the ways this chip tells the
+   driver it is falling behind -- could not wake it. */
+pub const INTR_MASK_BITS: u32 = ISR_ROK
+    | ISR_RER
+    | ISR_TOK
+    | ISR_TER
+    | ISR_LINK_CHG
+    | ISR_RX_OVERFLOW
+    | ISR_RX_FIFO_OVER;
 
 /* ================================================================== */
 /* TX descriptor opts1 bits (legacy 16-byte format; hw.rs clears the
