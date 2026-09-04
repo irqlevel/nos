@@ -7,6 +7,7 @@
 #include <kernel/sched.h>
 #include <kernel/timer.h>
 #include <kernel/watchdog.h>
+#include <kernel/profiler.h>
 #include <kernel/panic.h>
 #include <kernel/trace.h>
 #include <hal/irqchip.h>
@@ -100,6 +101,9 @@ void GenericTimer::LocalTick(Context* ctx)
     auto& cpu = cpus.GetCurrentCpu();
 
     Watchdog::GetInstance().Check();
+
+    if (Profiler::GetInstance().IsActive())
+        Profiler::GetInstance().Sample(ctx);
 
     /* Global software timers (Sleep, Rust Timer) are processed on the BSP */
     if (cpu.GetIndex() == cpus.GetBspIndexNoLock())

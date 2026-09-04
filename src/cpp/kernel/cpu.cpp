@@ -3,6 +3,7 @@
 #include "panic.h"
 #include "trace.h"
 #include "watchdog.h"
+#include "profiler.h"
 #include "timer.h"
 
 #include <hal/irqchip.h>
@@ -464,8 +465,6 @@ void Cpu::IPI(Context* ctx)
    go on ticking and notice. */
 void Cpu::TimerTick(Context* ctx)
 {
-    (void)ctx;
-
     if (Panicker::GetInstance().IsActive())
     {
         Hal::IrqEoi(CpuTable::TimerVector);
@@ -473,6 +472,9 @@ void Cpu::TimerTick(Context* ctx)
     }
 
     Watchdog::GetInstance().Check();
+
+    if (Profiler::GetInstance().IsActive())
+        Profiler::GetInstance().Sample(ctx);
 
     /* Software timers stay on one CPU: they are a handful of periodic
        callbacks, not a per-CPU wheel, and running them everywhere would

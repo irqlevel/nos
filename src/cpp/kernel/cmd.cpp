@@ -29,6 +29,7 @@
 #include "task.h"
 #include "stack_trace.h"
 #include "symtab.h"
+#include "profiler.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
@@ -360,6 +361,63 @@ static void CmdTop(const char* args, Stdlib::Printer& con)
 
     Mm::Free(after);
     Mm::Free(before);
+}
+
+/* Sampled on the per-CPU tick, so the resolution is the tick rate: enough
+   to find where the time goes, not enough to see inside a short function. */
+static void CmdProfile(const char* args, Stdlib::Printer& con)
+{
+    static const ulong DefaultMs = 1000;
+    static const ulong MaxMs = 2000;
+
+    const char* end;
+    const char* tok = Stdlib::NextToken(args, end);
+
+    ulong ms = DefaultMs;
+    ulong pid = Profiler::NoPidFilter;
+
+    if (tok)
+    {
+        char buf[24];
+        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+
+        ulong value;
+        if (!Stdlib::ParseUlong(buf, value) || value == 0 || value > MaxMs)
+        {
+            con.Printf("usage: profile [ms, 1-%u] [pid]\n", MaxMs);
+            return;
+        }
+        ms = value;
+
+        tok = Stdlib::NextToken(end, end);
+        if (tok)
+        {
+            Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+            if (!Stdlib::ParseUlong(buf, value))
+            {
+                con.Printf("usage: profile [ms, 1-%u] [pid]\n", MaxMs);
+                return;
+            }
+            pid = value;
+        }
+    }
+
+    auto& profiler = Profiler::GetInstance();
+    if (!profiler.Start())
+    {
+        con.Printf("profile: could not start\n");
+        return;
+    }
+
+    Sleep(ms * Const::NanoSecsInMs);
+    profiler.Stop();
+
+    con.Printf("profiled %u ms", ms);
+    if (pid != Profiler::NoPidFilter)
+        con.Printf(", pid %u only", pid);
+    con.Printf("\n");
+
+    profiler.Report(con, pid);
 }
 
 static void CmdPs(const char* args, Stdlib::Printer& con)
@@ -1530,6 +1588,7 @@ static const CmdEntry Commands[] = {
     { "date",      CmdDate,      "date - show wall clock time" },
     { "ps",        CmdPs,        "ps - show tasks" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
+    { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
     { "memusage",  CmdMemusage,  "memusage - show memory usage stats" },
     { "meminfo",   CmdMeminfo,   "meminfo - show the firmware memory map and what of it is used" },
