@@ -85,6 +85,28 @@ impl NetDeviceHandle {
         unsafe { net::kernel_netdev_enqueue_rx(self.handle, h) }
     }
 
+    /// Hand a whole harvest over at once.
+    ///
+    /// The receive queue's lock is taken once for the batch rather than once
+    /// per frame, which at tens of thousands of packets a second is the
+    /// difference between a lock acquisition being noise and being the top of
+    /// the receive path in a profile.
+    ///
+    /// The handles are consumed: whatever the queue had no room for is
+    /// released on the other side, so the caller must not touch them again.
+    pub fn enqueue_rx_batch(&self, handles: &[usize]) {
+        if handles.is_empty() {
+            return;
+        }
+        unsafe {
+            net::kernel_netdev_enqueue_rx_batch(
+                self.handle,
+                handles.as_ptr(),
+                handles.len(),
+            )
+        };
+    }
+
     /// Hand a transmitted frame back for release, instead of dropping it.
     ///
     /// A driver reaps its TX ring from `flush_tx`, which the C++ net stack

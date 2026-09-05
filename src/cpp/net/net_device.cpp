@@ -179,6 +179,24 @@ void NetDevice::DrainTx()
     ReleaseTxDone();
 }
 
+ulong NetDevice::EnqueueRxBatch(NetFrame** frames, ulong count)
+{
+    /* One acquisition for the whole harvest, rather than one per frame.
+       Returns how many were taken; the caller releases the rest. */
+    ulong taken = 0;
+
+    ulong flags = RxQueueLock.LockIrqSave();
+    while (taken < count && RxCount < RxQueueCapacity)
+    {
+        RxQueue.InsertTail(&frames[taken]->Link);
+        RxCount++;
+        taken++;
+    }
+    RxQueueLock.UnlockIrqRestore(flags);
+
+    return taken;
+}
+
 bool NetDevice::EnqueueRx(NetFrame* frame)
 {
     ulong flags = RxQueueLock.LockIrqSave();
@@ -351,20 +369,26 @@ bool NetDeviceTable::Register(NetDevice* dev)
 
 void NetDevice::DrainRxQueueAndDispatch()
 {
-    /* Drain the SW RxQueue (filled by ReapRx) and dispatch each frame to the
-       protocol stack. Shared by drivers whose ProcessRx has no dispatch of its
-       own (e.g. the Rust NIC bridge, whose reap callback runs as ReapRx). */
-    while (true)
+    /* Take the whole queue in one go, then dispatch with the lock down.
+       Frames arrive one at a time but they are dispatched in a run, and the
+       queue lock was being taken and released -- with interrupts disabled --
+       once per packet on each side of it. At 37000 packets a second that
+       showed up in a profile as the top of the receive path: two acquisitions
+       here and one in EnqueueRx, per frame, on the one CPU doing all of it.
+       Splicing the list costs one acquisition per batch instead. */
+    Stdlib::ListEntry batch;
+    batch.Init();
+
     {
         ulong flags = RxQueueLock.LockIrqSave();
-        if (RxQueue.IsEmpty())
-        {
-            RxQueueLock.UnlockIrqRestore(flags);
-            break;
-        }
-        Stdlib::ListEntry* entry = RxQueue.RemoveHead();
-        RxCount--;
+        batch.MoveTailList(&RxQueue);
+        RxCount = 0;
         RxQueueLock.UnlockIrqRestore(flags);
+    }
+
+    while (!batch.IsEmpty())
+    {
+        Stdlib::ListEntry* entry = batch.RemoveHead();
 
         NetFrame* frame = CONTAINING_RECORD(entry, NetFrame, Link);
         u8* data = frame->Data;
