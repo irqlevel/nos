@@ -29,8 +29,26 @@ use kcore::net::NetFrame;
 use crate::regs::*;
 
 /* 256 * 16 bytes = 4096 bytes = exactly one DMA page. */
-pub const RING_SIZE: usize = 256;
-const _: () = assert!(RING_SIZE * core::mem::size_of::<TxDesc>() <= 4096);
+/* Descriptors per ring.
+ *
+ * 256 was one page of them, and one page was not enough: the bare metal
+ * machine starts reporting RX descriptor unavailable at two thousand packets
+ * a second, which is a ring that fills faster than the receive softirq
+ * empties it, not a chip that cannot keep up. Every RDU is a burst of
+ * packets the chip had nowhere to put.
+ *
+ * A thousand is four pages and four times the slack, at the cost of 16 KiB
+ * of DMA memory and a thousand pooled frames posted for receive -- against a
+ * frame pool of four thousand, which `netpool` has never seen dip. */
+pub const RING_SIZE: usize = 1024;
+
+/* Pages the ring needs, rounded up. Must stay a power of two: the DMA
+   allocator hands back `1 << log2(requested)` pages, so asking for three
+   would quietly get two. */
+pub const RING_PAGES: usize = (RING_SIZE * 16 + 4095) / 4096;
+const _: () = assert!(RING_PAGES.is_power_of_two());
+const _: () = assert!(RING_SIZE * core::mem::size_of::<TxDesc>() <= RING_PAGES * 4096);
+const _: () = assert!(RING_SIZE * core::mem::size_of::<RxDesc>() <= RING_PAGES * 4096);
 
 /* ================================================================== */
 /* Descriptor layout (must match the chip's legacy format) */

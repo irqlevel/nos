@@ -21,48 +21,91 @@ import sys
 import threading
 import time
 
+# Datagrams between reply drains, and the shortest gap worth sleeping for.
+BURST = 32
+MIN_SLEEP = 0.001
+
 
 class Sender:
-    def __init__(self, host, port, size, deadline, pace):
+    def __init__(self, host, port, size, deadline, pace, pps):
         self.host = host
         self.port = port
         self.payload = b"L" * size
         self.deadline = deadline
         self.pace = pace
+        # Datagrams a second this thread aims for; 0 sends as fast as it can.
+        self.pps = pps
         self.sent = 0
         self.received = 0
         self.errors = 0
+        # Seconds spent sending, which is not the same as the thread's
+        # lifetime: the drain at the end would otherwise be counted against
+        # the send rate and understate it by however long it took.
+        self.send_seconds = 0.0
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(0.02)
+        # Non-blocking, not a short timeout: a blocking recv between bursts
+        # caps the sender at burst/timeout datagrams a second no matter how
+        # fast it could send -- at 32 per burst and 20 ms that is 1600 pps,
+        # which is nowhere near what the sender or the target can do.
+        sock.setblocking(False)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        except OSError:
+            pass
+
+        started = time.time()
         try:
             while time.time() < self.deadline:
-                for _ in range(32):
+                for _ in range(BURST):
                     try:
                         sock.sendto(self.payload, (self.host, self.port))
                         self.sent += 1
+                    except BlockingIOError:
+                        pass
                     except OSError:
+                        # ICMP port-unreachable comes back as an error on the
+                        # next send; it means the target is not listening, not
+                        # that the sender broke.
                         self.errors += 1
-                try:
-                    while True:
-                        sock.recv(65535)
-                        self.received += 1
-                except OSError:
-                    pass
+
+                self.drain(sock)
+
+                if self.pps:
+                    # Sleep only once the debt is worth a syscall: sleeping per
+                    # datagram costs more than the gap it is meant to create,
+                    # and the granularity of sleep then sets the rate instead
+                    # of the argument.
+                    due = started + self.sent / self.pps
+                    behind = due - time.time()
+                    if behind > MIN_SLEEP:
+                        time.sleep(behind)
+
                 if self.pace:
                     time.sleep(self.pace)
 
+            self.send_seconds = time.time() - started
+
             # Drain whatever is still in flight.
-            drain = time.time() + 0.5
-            while time.time() < drain:
-                try:
-                    sock.recv(65535)
-                    self.received += 1
-                except OSError:
-                    break
+            drain_until = time.time() + 0.5
+            while time.time() < drain_until:
+                if not self.drain(sock):
+                    time.sleep(0.005)
         finally:
             sock.close()
+
+    def drain(self, sock):
+        """Take every reply waiting right now. Returns True if any arrived."""
+        got = False
+        while True:
+            try:
+                sock.recv(65535)
+                self.received += 1
+                got = True
+            except (BlockingIOError, OSError):
+                return got
 
 
 def main():
@@ -73,6 +116,12 @@ def main():
     p.add_argument("-b", "--size", type=int, default=512,
                    help="payload bytes per datagram (default 512)")
     p.add_argument("-t", "--threads", type=int, default=1)
+    p.add_argument("--pps", type=float, default=0.0,
+                   help="datagrams a second to aim for, across all threads; "
+                        "0 (the default) sends as fast as the sender can. "
+                        "Worth setting: the interesting range for a NIC is "
+                        "usually well below what a laptop can emit, and a "
+                        "flat-out sender mostly measures the path in between")
     p.add_argument("--pace", type=float, default=0.0,
                    help="seconds to sleep between bursts of 32; 0 sends flat out")
     args = p.parse_args()
@@ -82,12 +131,15 @@ def main():
         return 2
 
     deadline = time.time() + args.seconds
-    senders = [Sender(args.host, args.port, args.size, deadline, args.pace)
+    per_thread_pps = (args.pps / args.threads) if args.pps else 0.0
+    senders = [Sender(args.host, args.port, args.size, deadline, args.pace,
+                      per_thread_pps)
                for _ in range(args.threads)]
     threads = [threading.Thread(target=s.run, daemon=True) for s in senders]
 
-    print("sending to %s:%d for %.1fs, %d bytes, %d thread(s)"
-          % (args.host, args.port, args.seconds, args.size, args.threads))
+    print("sending to %s:%d for %.1fs, %d bytes, %d thread(s), %s"
+          % (args.host, args.port, args.seconds, args.size, args.threads,
+             ("%g pps" % args.pps) if args.pps else "flat out"))
     started = time.time()
     for t in threads:
         t.start()
@@ -99,9 +151,13 @@ def main():
     received = sum(s.received for s in senders)
     errors = sum(s.errors for s in senders)
 
+    # Over the sending window, not the whole run: the drain at the end is not
+    # time spent sending, and counting it makes every rate read low.
+    window = max((s.send_seconds for s in senders), default=elapsed) or elapsed
+
     print("sent     %d (%.0f pps, %.1f Mbit/s)"
-          % (sent, sent / elapsed, sent * args.size * 8 / elapsed / 1e6))
-    print("echoed   %d (%.0f pps)" % (received, received / elapsed))
+          % (sent, sent / window, sent * args.size * 8 / window / 1e6))
+    print("echoed   %d (%.0f pps)" % (received, received / window))
     if sent:
         print("returned %.1f%%" % (100.0 * received / sent))
     if errors:
