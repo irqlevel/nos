@@ -4,6 +4,7 @@
 #include "panic.h"
 #include "trace.h"
 #include "watchdog.h"
+#include "softirq.h"
 #include "profiler.h"
 #include "timer.h"
 
@@ -493,6 +494,11 @@ void Cpu::TimerTick(Context* ctx)
            NetDeviceTable::PollRx. */
         NetDeviceTable::GetInstance().PollRx();
     }
+
+    /* Repairs a wakeup that went missing, and nothing else -- see
+       SoftIrq::TickKick. Before the reschedule below, so the kick has an
+       effect on this very tick. */
+    SoftIrq::GetInstance().TickKick(Index);
 
     Hal::IrqEoi(CpuTable::TimerVector);
 

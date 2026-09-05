@@ -101,6 +101,15 @@ public:
     void SetIdle();
     bool IsIdle();
 
+    /* A task that has asked not to be scheduled until someone wakes it.
+       Block() is called by the task itself, immediately before the Schedule()
+       that switches it out; Unblock() may be called from any CPU and from
+       hard IRQ context -- both are a single atomic bit operation and take no
+       lock. */
+    void Block();
+    void Unblock();
+    bool IsBlocked();
+
     TaskQueue* SelectNextTaskQueue();
 
     static const long StateWaiting = 1;
@@ -112,6 +121,10 @@ public:
     /* The CPU's idle task. Marked so the scheduler can treat it as the last
        resort it is, rather than as one more task to take a turn. */
     static const long FlagIdleBit = 2;
+
+    /* Set while a task is waiting to be woken. The scheduler passes over it
+       entirely -- unlike the idle task, which is merely last. */
+    static const long FlagBlockedBit = 3;
 
 public:
     Stdlib::ListEntry ListEntry;

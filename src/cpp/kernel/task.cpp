@@ -96,6 +96,21 @@ bool Task::IsIdle()
     return Flags.TestBit(FlagIdleBit);
 }
 
+void Task::Block()
+{
+    Flags.SetBit(FlagBlockedBit);
+}
+
+void Task::Unblock()
+{
+    Flags.ClearBit(FlagBlockedBit);
+}
+
+bool Task::IsBlocked()
+{
+    return Flags.TestBit(FlagBlockedBit);
+}
+
 void Task::Exit()
 {
     BugOn(this != GetCurrentTask());

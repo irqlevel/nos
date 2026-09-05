@@ -25,6 +25,14 @@ public:
        The work runs on the CPU which raised it. */
     void Raise(ulong type);
 
+    /* Safety net, called from this CPU's timer tick. Nothing here should be
+       needed: every path that makes work available also wakes the task. But
+       a wakeup that goes missing would wedge this CPU's deferred work for
+       good, on a machine whose only console is a UDP socket. One atomic read
+       per tick turns that whole class of bug into at most a tick of latency,
+       visible in a profile rather than as a dead box. */
+    void TickKick(ulong cpu);
+
     /* Whether this CPU already has work of this type queued. A poll that
        wants to cover a lost interrupt must not raise on top of a wakeup that
        has already happened, or it cannot tell the two apart afterwards. */
@@ -71,6 +79,10 @@ private:
 
     static void TaskFunc(void* ctx);
     void Run(CpuState& state);
+
+    /* Whether this CPU has a pending type that is not already running
+       somewhere else -- the condition its task blocks on. */
+    bool HasRunnableWork(CpuState& state);
 
     static const ulong Tag = 'SIrq';
 };

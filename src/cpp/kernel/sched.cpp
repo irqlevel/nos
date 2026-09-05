@@ -136,6 +136,15 @@ Task* TaskQueue::SelectNext(Task *curr)
             continue;
         }
 
+        /* Asked to be left alone until woken. Skipped outright, and not
+           kept as a fallback the way idle is: a blocked task has nothing to
+           run. The flag is cleared by whoever has work for it, which is what
+           brings it back into this walk. */
+        if (cand->IsBlocked())
+        {
+            continue;
+        }
+
         /* The idle task takes its turn only when there is no other turn to
            take. It used to sit in this list as an equal, so a reschedule --
            and every raise of a softirq from an interrupt handler forces one,
