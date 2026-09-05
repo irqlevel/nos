@@ -4,6 +4,7 @@
 #include "tcp.h"
 
 #include <kernel/trace.h>
+#include <kernel/sched.h>
 #include <kernel/parameters.h>
 #include <kernel/softirq.h>
 #include <kernel/panic.h>
@@ -218,19 +219,32 @@ bool NetDevice::RegisterUdpListener(u16 port, RxCallback cb, void* ctx)
 
 void NetDevice::UnregisterUdpListener(u16 port)
 {
-    Stdlib::AutoLock lock(UdpListenerLock);
-
-    for (ulong i = 0; i < UdpListenerCount; i++)
     {
-        if (UdpListeners[i].Port == port)
+        Stdlib::AutoLock lock(UdpListenerLock);
+
+        for (ulong i = 0; i < UdpListenerCount; i++)
         {
-            for (ulong j = i; j + 1 < UdpListenerCount; j++)
-                UdpListeners[j] = UdpListeners[j + 1];
-            UdpListenerCount--;
-            Stdlib::MemSet(&UdpListeners[UdpListenerCount], 0, sizeof(UdpListener));
-            return;
+            if (UdpListeners[i].Port == port)
+            {
+                for (ulong j = i; j + 1 < UdpListenerCount; j++)
+                    UdpListeners[j] = UdpListeners[j + 1];
+                UdpListenerCount--;
+                Stdlib::MemSet(&UdpListeners[UdpListenerCount], 0, sizeof(UdpListener));
+                break;
+            }
         }
     }
+
+    /* No new dispatch can find the listener now; wait out any that took it
+       before the lock, so the caller may free its context on return. The
+       count covers every listener on the device, not just this port -- the
+       table is compacted on removal, so a per-slot count would not stay
+       with its slot -- and a callback is microseconds, so waiting for a
+       neighbour's costs nothing worth a second data structure. Task context
+       only: a listener that unregistered itself from inside its own
+       callback would wait here for itself. */
+    while (UdpListenerInFlight.Get() != 0)
+        Sleep(1 * Const::NanoSecsInMs);
 }
 
 Net::MacAddress NetDevice::GetMac()
@@ -391,14 +405,34 @@ void NetDevice::DrainRxQueueAndDispatch()
                 Net::UdpHdr* udp = (Net::UdpHdr*)(data + sizeof(Net::EthHdr) + ipHdrLen);
                 u16 dstPort = Net::Ntohs(udp->DstPort);
 
-                Stdlib::AutoLock lock(UdpListenerLock);
-                for (ulong li = 0; li < UdpListenerCount; li++)
+                /* The callback ran under UdpListenerLock -- a spinlock, so
+                   with interrupts off -- on every datagram. On the CPU the
+                   NIC's MSI-X targets that held the card's own interrupt
+                   back for the length of every callback, and forbade the
+                   callback anything that might block. Take the listener out
+                   under the lock, then call it with the lock down; the
+                   in-flight count is what keeps the context alive until it
+                   returns. */
+                RxCallback cb = nullptr;
+                void* cbCtx = nullptr;
                 {
-                    if (UdpListeners[li].Port == dstPort && UdpListeners[li].Cb)
+                    Stdlib::AutoLock lock(UdpListenerLock);
+                    for (ulong li = 0; li < UdpListenerCount; li++)
                     {
-                        UdpListeners[li].Cb(data, dataLen, UdpListeners[li].Ctx);
-                        break;
+                        if (UdpListeners[li].Port == dstPort && UdpListeners[li].Cb)
+                        {
+                            cb = UdpListeners[li].Cb;
+                            cbCtx = UdpListeners[li].Ctx;
+                            UdpListenerInFlight.Inc();
+                            break;
+                        }
                     }
+                }
+
+                if (cb != nullptr)
+                {
+                    cb(data, dataLen, cbCtx);
+                    UdpListenerInFlight.Dec();
                 }
                 break;
             }
