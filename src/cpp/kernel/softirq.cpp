@@ -1,4 +1,5 @@
 #include "softirq.h"
+#include "task.h"
 #include "trace.h"
 #include "sched.h"
 #include "cpu.h"
@@ -101,12 +102,28 @@ void SoftIrq::Raise(ulong type)
     if (CpuStates[cpu].Pending.SetBit(type))
         return; /* was already pending */
 
-    /* Scheduling is IPI-driven: without a kick an idle CPU would not
-       run its softirq task until the next timer tick IPI. Send the
-       IPI directly -- CpuTable::SendIPI takes spinlocks which are not
-       safe in hard IRQ context. */
-    if (Ready.Get())
-        Hal::SendIpi(cpu, CpuTable::IPIVector);
+    if (!Ready.Get())
+        return;
+
+    /* The softirq task raising work for its own CPU needs no kick. It is
+       running; its loop looks at Pending again the moment the handler
+       returns.
+
+       The IPI would be worse than useless there. It is delivered as a
+       reschedule -- Cpu::IPI ends in Schedule() -- so it takes the CPU away
+       from the one task that has work to do, and that task does not run
+       again until the next tick. A handler that asks for another pass, which
+       is how the receive poll yields on its budget, was therefore getting
+       exactly one pass per tick: 64 frames at 100 Hz, a ceiling of 6600
+       packets a second no matter how many arrived. */
+    if (Task::TryGetCurrentTask() == CpuStates[cpu].TaskPtr)
+        return;
+
+    /* Otherwise the kick is what gets the task scheduled: without it an idle
+       CPU would not run its softirq task until the next timer tick. Sent
+       directly -- CpuTable::SendIPI takes spinlocks that are not safe in
+       hard IRQ context. */
+    Hal::SendIpi(cpu, CpuTable::IPIVector);
 }
 
 void SoftIrq::Register(ulong type, void (*handler)(void* ctx), void* ctx)
