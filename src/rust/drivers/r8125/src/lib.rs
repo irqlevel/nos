@@ -30,6 +30,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::fmt::Write;
+use core::ptr::{addr_of, read_volatile};
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use kcore::{dma, interrupt, io, msix, net, pci, softirq, trace};
 
@@ -679,6 +680,68 @@ extern "C" fn r8125_flush_tx(ctx: *mut u8) {
 
 /* ================================================================== */
 /* RX path: called from the softirq task by the C++ net layer */
+
+/* A window into the chip, for a machine that has stopped receiving and can
+ * still be typed at. Six explanations for that stall were built by reasoning
+ * about what the hardware must be doing; every one was wrong. This reads it.
+ *
+ * CMD_RX_EN is the first thing to look at: if the chip has cleared it, the
+ * receiver is off and no amount of draining or reposting will bring it back.
+ * head_posted and head_opts1 say whose the head descriptor is -- ours and
+ * unposted, or the chip's and never written. */
+#[repr(C)]
+pub struct R8125State {
+    pub present: u32,
+    pub cmd: u32,
+    pub intr_status: u32,
+    pub intr_mask: u32,
+    pub rx_config: u32,
+    pub rx_head: u32,
+    pub head_posted: u32,
+    pub head_opts1: u32,
+    pub rx_err_events: u64,
+    pub rx_packets: u64,
+    pub rx_dropped: u64,
+}
+
+#[no_mangle]
+pub extern "C" fn r8125_get_state(out: *mut R8125State) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+
+    let dev = DEVICES[0].load(Ordering::Acquire);
+    if dev.is_null() {
+        unsafe { (*out).present = 0 };
+        return -1;
+    }
+
+    unsafe {
+        let regs = &(*dev).regs;
+        let head = (*dev).rx_ring.head;
+        let posted = (*dev).rx_ring.frames[head] != 0;
+
+        /* Read straight out of the descriptor the chip would fill next. */
+        let opts1 = {
+            let d = ((*dev).rx_ring.dma.as_ptr() as *const desc::RxDesc).add(head);
+            read_volatile(addr_of!((*d).opts1))
+        };
+
+        (*out).present = 1;
+        (*out).cmd = regs.read8(CMD_REG) as u32;
+        (*out).intr_status = regs.read32(INTR_STATUS);
+        (*out).intr_mask = regs.read32(INTR_MASK);
+        (*out).rx_config = regs.read32(RX_CONFIG);
+        (*out).rx_head = head as u32;
+        (*out).head_posted = if posted { 1 } else { 0 };
+        (*out).head_opts1 = opts1;
+        (*out).rx_err_events = RX_ERR_EVENTS.load(Ordering::Relaxed);
+        (*out).rx_packets = (*dev).rx_packets.load(Ordering::Relaxed);
+        (*out).rx_dropped = (*dev).rx_dropped.load(Ordering::Relaxed);
+    }
+
+    0
+}
 
 extern "C" fn r8125_process_rx(ctx: *mut u8) {
     /* Raw pointer for the same reason as flush_tx; process_rx touches only

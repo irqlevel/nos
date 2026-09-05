@@ -471,6 +471,57 @@ static void CmdStacks(const char* args, Stdlib::Printer& con)
     con.Printf("closest any stack came to its end: %u bytes free\n", worstFree);
 }
 
+
+/* Mirrors R8125State in src/rust/drivers/r8125/src/lib.rs. */
+struct R8125State
+{
+    u32 Present;
+    u32 Cmd;
+    u32 IntrStatus;
+    u32 IntrMask;
+    u32 RxConfig;
+    u32 RxHead;
+    u32 HeadPosted;
+    u32 HeadOpts1;
+    u64 RxErrEvents;
+    u64 RxPackets;
+    u64 RxDropped;
+};
+
+extern "C" int r8125_get_state(R8125State* out);
+
+static void CmdNicdump(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+
+    R8125State st;
+    Stdlib::MemSet(&st, 0, sizeof(st));
+
+    if (r8125_get_state(&st) != 0 || st.Present == 0)
+    {
+        con.Printf("nicdump: no r8125\n");
+        return;
+    }
+
+    /* Bit 3 of the command register is the receiver. If it is clear the chip
+       has switched itself off and nothing the driver does to descriptors will
+       bring it back -- which is the one thing six guesses about this stall
+       never checked. */
+    static const u32 CmdRxEn = 0x08;
+    static const u32 CmdTxEn = 0x04;
+    static const u32 RxOwn = 0x80000000;
+
+    con.Printf("cmd 0x%p rx-en %u tx-en %u\n", (ulong)st.Cmd,
+        (ulong)((st.Cmd & CmdRxEn) ? 1 : 0), (ulong)((st.Cmd & CmdTxEn) ? 1 : 0));
+    con.Printf("isr 0x%p imr 0x%p rxcfg 0x%p\n",
+        (ulong)st.IntrStatus, (ulong)st.IntrMask, (ulong)st.RxConfig);
+    con.Printf("rx head %u posted %u opts1 0x%p own %u\n",
+        (ulong)st.RxHead, (ulong)st.HeadPosted, (ulong)st.HeadOpts1,
+        (ulong)((st.HeadOpts1 & RxOwn) ? 1 : 0));
+    con.Printf("rx packets %u dropped %u err events %u\n",
+        (ulong)st.RxPackets, (ulong)st.RxDropped, (ulong)st.RxErrEvents);
+}
+
 static void CmdNetload(const char* args, Stdlib::Printer& con)
 {
     auto& load = NetLoad::GetInstance();
@@ -1738,6 +1789,7 @@ static const CmdEntry Commands[] = {
     { "ps",        CmdPs,        "ps - show tasks" },
     { "stacks",    CmdStacks,    "stacks - stack high-water marks" },
     { "netload",   CmdNetload,   "netload [start [port] [sink]|stop|reset] - udp load target" },
+    { "nicdump",   CmdNicdump,   "nicdump - r8125 chip and ring state" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
     { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
