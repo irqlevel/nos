@@ -902,23 +902,43 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
                 return;
             }
 
-            arm(dev, INTR_MASK_BITS);
-
+            /* Round again while the ring still has frames, with the receive
+             * sources left masked -- the repeating path touches no device
+             * register at all (has_work reads the descriptor's OWN bit out of
+             * DMA memory). This used to arm here and mask again a handful of
+             * instructions later, which reopened the window on every single
+             * round; at line rate a packet lands in it every time, and the
+             * chip answered with 7.5M interrupts for 38.7M frames -- one per
+             * five, each costing an interrupt entry and two register reads on
+             * the CPU already busy draining the ring. */
             if !(*dev).rx_ring.has_work() {
-                return;
+                /* Empty: hand the ring back to the interrupt. */
+                arm(dev, INTR_MASK_BITS);
+
+                /* Re-checked after arming. A packet landing between the
+                 * harvest above and the write to the mask register was
+                 * already counted in the status cleared at the top of this
+                 * round, so nothing would come for it. */
+                if !(*dev).rx_ring.has_work() {
+                    return;
+                }
+
+                /* Raced: it is ours to take, so go silent again. */
+                arm(dev, INTR_MASK_BITS & !RX_INTR_BITS);
             }
 
             polls += 1;
             if polls >= MAX_POLLS {
                 /* Work left and out of rounds -- which is also how a run of
                  * failed frame allocations looks, since an empty head slot
-                 * reads as work to do. Ask for another softirq rather than
-                 * trust an interrupt for a status that may already be set. */
+                 * reads as work to do. Come back through the softirq, silent,
+                 * exactly as the budget does above: arming with frames
+                 * already waiting would be arming onto a status the chip has
+                 * set again, and no later packet could make that a 0->1
+                 * transition. */
                 softirq::raise(softirq::TYPE_NET_RX);
                 return;
             }
-
-            arm(dev, INTR_MASK_BITS & !RX_INTR_BITS);
         }
     }
 }
