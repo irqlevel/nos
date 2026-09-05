@@ -83,6 +83,12 @@ struct R8125Device {
     net_handle: net::NetDeviceHandle, /* no Drop; just a usize */
     mac: [u8; 6],
     name_buf: [u8; 16],
+    /* What is currently armed in INTR_MASK. Both the ISR and the receive
+     * poll write that register -- the ISR to stop receive interrupts while a
+     * poll is outstanding, the poll to arm them again when it has drained --
+     * and the ISR needs to know which bits are armed to tell a signal it will
+     * be given from one it will not. */
+    intr_mask: AtomicU32,
     /* Statistics, atomic so any context can update them */
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
@@ -325,6 +331,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
         net_handle: net::NetDeviceHandle::placeholder(),
         mac,
         name_buf,
+        intr_mask: AtomicU32::new(0),
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
@@ -340,6 +347,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     }
 
     /* Arm the sources we handle. */
+    dev_box.intr_mask.store(INTR_MASK_BITS, Ordering::Relaxed);
     dev_box.regs.write32(INTR_MASK, INTR_MASK_BITS);
 
     trace_link(&dev_box.regs);
@@ -553,6 +561,23 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
    needs no device pointer can be read from anywhere. */
 static RX_ERR_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/* The sources a receive poll silences. Everything else -- transmit, link
+ * change -- keeps interrupting, because nothing is polling those. */
+const RX_INTR_BITS: u32 = ISR_ROK | ISR_RER | ISR_RDU | ISR_RX_FIFO_OVER;
+
+/// Arm exactly `bits` in the mask register, and remember what was armed.
+///
+/// The remembered value is what makes the acknowledge loop in the ISR
+/// correct: the chip raises MSI-X on the 0->1 transition of
+/// `(status & mask)`, so a bit that is set in the status but not armed is
+/// not a signal that is coming, and looping until it clears would spin.
+fn arm(dev: *mut R8125Device, bits: u32) {
+    unsafe {
+        (*dev).intr_mask.store(bits, Ordering::Relaxed);
+        (*dev).regs.write32(INTR_MASK, bits);
+    }
+}
+
 pub fn rx_err_events() -> u64 {
     RX_ERR_EVENTS.load(Ordering::Relaxed)
 }
@@ -561,50 +586,37 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
     /* Raw dereference, not `&mut`: flush_tx or process_rx may hold their own
      * reference to this device on another CPU right now (a per-CPU interrupt
      * disable does not exclude them), and two live `&mut` to one object are
-     * UB.  The ISR only touches MMIO registers. */
+     * UB. The ISR only touches MMIO registers and atomics. */
     let dev = ctx as *mut R8125Device;
     let regs = unsafe { &(*dev).regs };
 
-    /* The status register is write-1-to-clear, and the chip signals MSI-X on
-     * the 0->1 transition of (status & mask) -- of the aggregate, not per
-     * event. That combination makes a single read-then-acknowledge lose
-     * interrupts for good:
+    /* Receive interrupts are silenced here and armed again by the poll, once
+     * it has drained the ring. Without that, this card interrupts once per
+     * packet -- measured at 0.93 interrupts per packet delivered -- and under
+     * overload it interrupts far more often than it delivers: 9.48 per packet
+     * at the point where throughput had collapsed from 25000 packets a second
+     * to 15000. The work is the same either way; what changes is how much of
+     * the CPU is left to do it.
      *
-     *   read status            -> ROK
-     *   [chip sets TOK]           aggregate already non-zero: no message
-     *   write status (ROK)     -> clears ROK, leaves TOK set
-     *   return                    TOK set, mask open, no message pending,
-     *                             and none ever coming: the aggregate can
-     *                             not go 0->1 again because it never went
-     *                             back to 0.
-     *
-     * Every later event only adds a bit to a status that is already
-     * non-zero. The bare metal machine was caught in exactly this state:
-     * isr 0x40D5 with the mask open and the handler not running -- and the
-     * race is hit at random, which is why the stall arrived after anything
-     * from 276 packets to 44000 of the same load.
-     *
-     * So: loop until the status reads back as zero. Only then is the next
-     * event a 0->1 transition the chip will signal. Bounded, and if the bound
-     * is hit the whole register is acknowledged at once -- both softirqs are
-     * raised on every pass, so no work is lost by that, and a status that
-     * will not go quiet after this many rounds is a chip that is going to
-     * storm regardless. */
+     * The loop exits on `status & mask`, not on `status`. The chip raises
+     * MSI-X on the 0->1 transition of that product, so a bit set in the
+     * status but not armed is not a signal that is coming -- and looping
+     * until a masked receive bit cleared would spin for as long as packets
+     * keep arriving. */
     const MAX_ROUNDS: u32 = 32;
-
     let mut round = 0;
-    let mut status = regs.read32(INTR_STATUS);
-
-    if status == 0 {
-        return; /* shared line, not us */
-    }
 
     loop {
+        let mask = unsafe { (*dev).intr_mask.load(Ordering::Relaxed) };
+        let status = regs.read32(INTR_STATUS);
+
         if status == u32::MAX {
             /* All-ones is what a vanished device reads back, not a status
-             * with every event set at once.  Acknowledging it would be
-             * pointless and raising both softirqs would spin the net layer
-             * on dead hardware. */
+             * with every event set at once. */
+            return;
+        }
+
+        if status & mask == 0 {
             return;
         }
 
@@ -624,7 +636,6 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
             trace!(0, "r8125: TX error in ISR");
         }
 
-        /* Receive-side error bits, counted, the first few traced. */
         if status & (ISR_RDU | ISR_RX_FIFO_OVER | ISR_RER) != 0 {
             let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
             if n < 10 {
@@ -634,23 +645,18 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
         }
 
         /* TX reaping stays in flush_tx -- doing it here would race a
-         * flush_tx running on another CPU.  Raising the softirq drains
-         * frames that piled up in the C++ TxQueue while the ring was full;
-         * without it they would wait for an unrelated future SubmitTx. */
+         * flush_tx running on another CPU. Raising the softirq drains frames
+         * that piled up in the C++ TxQueue while the ring was full. */
         if status & (ISR_TOK | ISR_TDU | ISR_TER) != 0 {
             softirq::raise(softirq::TYPE_NET_TX);
         }
 
-        /* On every pass, not only when the receive bits are set: a harvest
-         * that finds nothing is cheap, and a receive wakeup that depends on
-         * a particular bit being seen is one more thing this register can
-         * lose. */
+        /* Hand the receive side to the poll and go quiet on it. Raised
+         * whenever anything at all arrived, not only on the receive bits: a
+         * harvest that finds nothing is cheap, and it is one less thing this
+         * register can lose. */
+        arm(dev, mask & !RX_INTR_BITS);
         softirq::raise(softirq::TYPE_NET_RX);
-
-        status = regs.read32(INTR_STATUS);
-        if status == 0 {
-            return;
-        }
 
         round += 1;
         if round >= MAX_ROUNDS {
@@ -769,52 +775,81 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
      * rx_ring / rx_* / net_handle, all disjoint from flush_tx's tx_ring. */
     let dev = ctx as *mut R8125Device;
 
+    /* Poll to completion, then arm receive interrupts again -- the second
+     * half of what the ISR started when it silenced them.
+     *
+     * The re-check after arming is the part that cannot be skipped. A packet
+     * landing between the last empty harvest and the write to the mask
+     * register would otherwise sit in the ring with nothing on its way to
+     * collect it: the chip signals on the 0->1 transition of
+     * `(status & mask)`, and whether arming a bit whose status is already set
+     * counts as that transition is not something to bet a receive path on.
+     * So: arm, look again, and if anything is there, go quiet and go round.
+     *
+     * Bounded, because one of the ways the drain ends is a frame allocation
+     * that failed, and that leaves the head slot empty -- which reads as work
+     * to do and would send this round again forever. On the bound, receive
+     * interrupts are armed and the next one starts a fresh poll. */
+    const MAX_POLLS: u32 = 8;
+    let mut polls = 0;
+
     unsafe {
         loop {
-            let idx = (*dev).rx_ring.head;
+            loop {
+                let idx = (*dev).rx_ring.head;
 
-            /* Refill a slot an earlier allocation failure left empty: the
-             * chip stalls on a descriptor it does not own, so RX makes no
-             * progress until the slot is posted again. */
-            if (*dev).rx_ring.frames[idx] == 0 {
-                match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-                    Some(frame) => (*dev).rx_ring.post(idx, frame),
-                    None => break, /* still no memory; retry next softirq */
+                /* Refill a slot an earlier allocation failure left empty: the
+                 * chip stalls on a descriptor it does not own, so RX makes no
+                 * progress until the slot is posted again. */
+                if (*dev).rx_ring.frames[idx] == 0 {
+                    match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+                        Some(frame) => (*dev).rx_ring.post(idx, frame),
+                        None => break, /* still no memory; retry next softirq */
+                    }
                 }
-            }
 
-            let (mut frame, opts1) = match (*dev).rx_ring.harvest() {
-                None => break,
-                Some(pair) => pair,
-            };
+                let (mut frame, opts1) = match (*dev).rx_ring.harvest() {
+                    None => break,
+                    Some(pair) => pair,
+                };
 
-            let rx_len = opts1 & RX_LEN_MASK;
-            let whole_frame = opts1 & RX_FF != 0 && opts1 & RX_LF != 0;
-            if opts1 & RX_ERR_MASK != 0 || !whole_frame || rx_len < 4 {
-                /* Error frame, a fragment of a multi-descriptor frame (the
-                 * RX_MAX_SIZE filter should prevent those), or a runt: drop
-                 * it and give the buffer straight back to the chip. */
-                (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
-                frame.set_len(0);
-                (*dev).rx_ring.post(idx, frame);
-                continue;
-            }
-
-            /* The reported length includes the 4-byte CRC. */
-            let data_len = (rx_len - 4) as usize;
-            frame.set_len(data_len);
-            (*dev).rx_packets.fetch_add(1, Ordering::Relaxed);
-
-            (*dev).net_handle.enqueue_rx(frame);
-
-            match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-                Some(new_frame) => (*dev).rx_ring.post(idx, new_frame),
-                None => {
-                    /* Under memory pressure leave the slot empty; the refill
-                     * at the top of this loop posts it once allocation works. */
+                let rx_len = opts1 & RX_LEN_MASK;
+                let whole_frame = opts1 & RX_FF != 0 && opts1 & RX_LF != 0;
+                if opts1 & RX_ERR_MASK != 0 || !whole_frame || rx_len < 4 {
+                    /* Error frame, a fragment of a multi-descriptor frame (the
+                     * RX_MAX_SIZE filter should prevent those), or a runt: drop
+                     * it and give the buffer straight back to the chip. */
                     (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
+                    frame.set_len(0);
+                    (*dev).rx_ring.post(idx, frame);
+                    continue;
+                }
+
+                /* The reported length includes the 4-byte CRC. */
+                let data_len = (rx_len - 4) as usize;
+                frame.set_len(data_len);
+                (*dev).rx_packets.fetch_add(1, Ordering::Relaxed);
+
+                (*dev).net_handle.enqueue_rx(frame);
+
+                match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+                    Some(new_frame) => (*dev).rx_ring.post(idx, new_frame),
+                    None => {
+                        /* Under memory pressure leave the slot empty; the refill
+                         * at the top of this loop posts it once allocation works. */
+                        (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
+
+            arm(dev, INTR_MASK_BITS);
+
+            polls += 1;
+            if polls >= MAX_POLLS || !(*dev).rx_ring.has_work() {
+                return;
+            }
+
+            arm(dev, INTR_MASK_BITS & !RX_INTR_BITS);
         }
     }
 }

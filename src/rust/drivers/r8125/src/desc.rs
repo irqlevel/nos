@@ -227,6 +227,19 @@ impl RxRing {
         self.frames[idx] = handle;
     }
 
+    /// Whether the head slot needs attention: either the chip has completed
+    /// it, or an earlier refill left it empty and it must be reposted. Used
+    /// to close the poll: unmasking and then finding work is the race NAPI
+    /// has to re-check for.
+    pub fn has_work(&mut self) -> bool {
+        let idx = self.head;
+        if self.frames[idx] == 0 {
+            return true;
+        }
+        let opts1 = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).opts1)) };
+        opts1 & RX_OWN == 0
+    }
+
     /// Take the frame at the head slot if the chip has filled it.
     /// Returns None when hardware still owns the descriptor, or when the slot
     /// is empty because an earlier refill failed -- the caller reposts it.
