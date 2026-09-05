@@ -1239,14 +1239,9 @@ public:
     void GetStats(Kernel::NetStats& stats) override
     {
         GetRxProtoTotals(stats);
-        stats.TxTotal = TxPackets;
+        GetTxProtoTotals(stats);
         stats.RxTotal = RxPackets;
         stats.RxDrop += RxDropped;
-        stats.TxIcmp = 0;
-        stats.TxUdp = 0;
-        stats.TxTcp = 0;
-        stats.TxArp = 0;
-        stats.TxOther = 0;
     }
 
     /* Called while TxQueueLock is held by base SubmitTx. */

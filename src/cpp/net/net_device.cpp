@@ -21,6 +21,7 @@ NetDevice::NetDevice()
     , UdpListenerCount(0)
 {
     Stdlib::MemSet(RxProto, 0, sizeof(RxProto));
+    Stdlib::MemSet(TxProto, 0, sizeof(TxProto));
     Stdlib::MemSet(UdpListeners, 0, sizeof(UdpListeners));
 }
 
@@ -60,6 +61,10 @@ bool NetDevice::SubmitTx(NetFrame* frame)
        without it if it is not. Going on without it can race the holder into
        the driver's ring; on a machine that is already dying, a corrupted
        TX ring costs nothing and the report is worth everything. */
+    /* Before the lock: this is bookkeeping, and the section below is the
+       narrowest one on the transmit path. */
+    CountTxFrame(frame);
+
     bool acquired = true;
     ulong flags;
 
@@ -178,6 +183,67 @@ void NetDevice::DrainTx()
     TxQueueLock.UnlockIrqRestore(flags);
 
     ReleaseTxDone();
+}
+
+void NetDevice::CountTxFrame(NetFrame* frame)
+{
+    ulong cpuIndex = Hal::GetCurrentCpuHwId();
+    if (cpuIndex >= MaxCpus)
+        cpuIndex = 0;
+
+    TxProtoCounters& proto = TxProto[cpuIndex];
+    proto.Total++;
+
+    if (frame->Length < sizeof(Net::EthHdr))
+    {
+        proto.Other++;
+        return;
+    }
+
+    const Net::EthHdr* eth = (const Net::EthHdr*)frame->Data;
+    u16 etherType = Net::Ntohs(eth->EtherType);
+
+    if (etherType == Net::EtherTypeArp)
+    {
+        proto.Arp++;
+        return;
+    }
+
+    if (etherType != Net::EtherTypeIp ||
+        frame->Length < sizeof(Net::EthHdr) + sizeof(Net::IpHdr))
+    {
+        proto.Other++;
+        return;
+    }
+
+    const Net::IpHdr* ip = (const Net::IpHdr*)(frame->Data + sizeof(Net::EthHdr));
+    switch (ip->Protocol)
+    {
+    case Net::IpProtoIcmp: proto.Icmp++; break;
+    case Net::IpProtoTcp:  proto.Tcp++;  break;
+    case Net::IpProtoUdp:  proto.Udp++;  break;
+    default:               proto.Other++; break;
+    }
+}
+
+void NetDevice::GetTxProtoTotals(NetStats& stats)
+{
+    stats.TxTotal = 0;
+    stats.TxIcmp = 0;
+    stats.TxUdp = 0;
+    stats.TxTcp = 0;
+    stats.TxArp = 0;
+    stats.TxOther = 0;
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        stats.TxTotal += TxProto[i].Total;
+        stats.TxIcmp += TxProto[i].Icmp;
+        stats.TxUdp += TxProto[i].Udp;
+        stats.TxTcp += TxProto[i].Tcp;
+        stats.TxArp += TxProto[i].Arp;
+        stats.TxOther += TxProto[i].Other;
+    }
 }
 
 void NetDevice::GetRxProtoTotals(NetStats& stats)
