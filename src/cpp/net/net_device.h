@@ -86,6 +86,14 @@ public:
         void* Ctx;
     };
 
+    /* Listener callbacks running right now. The dispatcher takes a listener
+       out of the table under UdpListenerLock and then calls it with the lock
+       released -- so a callback runs with interrupts on, may take locks of
+       its own, and no longer stalls the NIC's interrupt for its duration.
+       UnregisterUdpListener waits for this to drain before returning, which
+       is what makes freeing the callback's context after it safe. */
+    Atomic UdpListenerInFlight;
+
     /* Driver must implement: drain TxQueue to hardware (called under TxQueueLock) */
     virtual void FlushTx() = 0;
 
