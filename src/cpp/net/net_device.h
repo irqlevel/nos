@@ -52,6 +52,11 @@ public:
     /* RX: enqueue frame to RxQueue; returns false if full (caller must Put) */
     bool EnqueueRx(NetFrame* frame);
 
+    /* Enqueue a run of frames under one lock acquisition. Returns how many
+       were taken -- the queue may fill part way -- and the caller releases
+       the remainder. */
+    ulong EnqueueRxBatch(NetFrame** frames, ulong count);
+
     Net::MacAddress GetMac();
     void SetMac(const Net::MacAddress& mac);
     Net::IpAddress GetIp();

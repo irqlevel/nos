@@ -802,9 +802,15 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
     let mut polls = 0;
 
     unsafe {
+        /* Harvested frames wait here until the drain ends, so the receive
+         * queue's lock is taken once for the batch instead of once per
+         * frame. Sized by the budget, which is what bounds the drain. */
+        let mut batch: [usize; RX_BUDGET as usize] = [0; RX_BUDGET as usize];
+
         loop {
             let mut taken = 0u32;
             let mut budget_hit = false;
+            let mut batched = 0usize;
 
             loop {
                 if taken >= RX_BUDGET {
@@ -848,7 +854,8 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
                 frame.set_len(data_len);
                 (*dev).rx_packets.fetch_add(1, Ordering::Relaxed);
 
-                (*dev).net_handle.enqueue_rx(frame);
+                batch[batched] = frame.into_raw();
+                batched += 1;
 
                 match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
                     Some(new_frame) => (*dev).rx_ring.post(idx, new_frame),
@@ -860,6 +867,11 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
                     }
                 }
             }
+
+            /* Hand the harvest over in one piece. Done before the status is
+             * touched so that nothing sits in a local array while the chip is
+             * being told it may signal again. */
+            (*dev).net_handle.enqueue_rx_batch(&batch[..batched]);
 
             /* Clear what the chip has reported, so the next packet is a
              * transition rather than an addition to a status already set. */

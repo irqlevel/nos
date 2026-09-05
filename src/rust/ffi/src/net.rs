@@ -16,6 +16,11 @@ extern "C" {
     pub fn kernel_netdev_tx_notify(handle: usize);
     pub fn kernel_netframe_alloc_rx(data_len: usize) -> usize;
     pub fn kernel_netdev_enqueue_rx(dev_handle: usize, frame_handle: usize);
+    pub fn kernel_netdev_enqueue_rx_batch(
+        dev_handle: usize,
+        frame_handles: *const usize,
+        count: usize,
+    ) -> usize;
     pub fn kernel_netframe_data(handle: usize) -> *mut u8;
     pub fn kernel_netframe_data_phys(handle: usize) -> u64;
     pub fn kernel_netframe_len(handle: usize) -> usize;

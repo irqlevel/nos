@@ -1360,6 +1360,32 @@ void kernel_netdev_tx_done(unsigned long dev_handle, unsigned long frame_handle)
     dev->TxDone(frame);
 }
 
+/* Hand a whole harvest over under one lock acquisition. `count` is bounded
+   by the driver's receive budget, so the array is a small stack one there.
+   Frames the queue had no room for are released here, which is what the
+   single-frame path does too. */
+unsigned long kernel_netdev_enqueue_rx_batch(unsigned long dev_handle,
+    const unsigned long* frame_handles, unsigned long count)
+{
+    if (!dev_handle || !frame_handles || count == 0)
+        return 0;
+
+    RustNetDevice* dev = NetDevFromHandle(dev_handle);
+    auto** frames = reinterpret_cast<Kernel::NetFrame**>(
+        const_cast<unsigned long*>(frame_handles));
+
+    unsigned long taken = dev->EnqueueRxBatch(frames, count);
+
+    dev->RxPackets += taken;
+    for (unsigned long i = taken; i < count; i++)
+    {
+        dev->RxDropped++;
+        frames[i]->Put();
+    }
+
+    return taken;
+}
+
 void kernel_netdev_enqueue_rx(unsigned long dev_handle, unsigned long frame_handle)
 {
     if (!dev_handle || !frame_handle)
