@@ -183,6 +183,15 @@ void SoftIrq::Run(CpuState& state)
 
         if (!handled)
         {
+            /* Reaping is the idle task's job, and the idle task is now the
+               scheduler's last resort -- so on a CPU with something always
+               runnable it may not get a turn for a while. This costs nothing
+               here (the list is empty unless a task exited on this CPU) and
+               it runs in task context with interrupts on, which is what
+               freeing a stack requires: it triggers a TLB shootdown that
+               waits for every other CPU to answer. */
+            CpuTable::GetInstance().GetCurrentCpu().GetTaskQueue().ReapExited();
+
             /* Nothing pending -- sleep briefly to yield CPU */
             Sleep(1 * Const::NanoSecsInMs);
         }

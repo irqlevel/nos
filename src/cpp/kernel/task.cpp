@@ -86,6 +86,16 @@ bool Task::IsStopping()
     return Flags.TestBit(FlagStoppingBit);
 }
 
+void Task::SetIdle()
+{
+    Flags.SetBit(FlagIdleBit);
+}
+
+bool Task::IsIdle()
+{
+    return Flags.TestBit(FlagIdleBit);
+}
+
 void Task::Exit()
 {
     BugOn(this != GetCurrentTask());
