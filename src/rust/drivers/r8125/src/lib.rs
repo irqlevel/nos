@@ -565,78 +565,99 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
     let dev = ctx as *mut R8125Device;
     let regs = unsafe { &(*dev).regs };
 
-    /* 32-bit status on this chip, write-1-to-clear.  Clearing matters on the
-     * INTx path: a level-triggered line that is never acknowledged re-fires
-     * forever. */
-    let status = regs.read32(INTR_STATUS);
+    /* The status register is write-1-to-clear, and the chip signals MSI-X on
+     * the 0->1 transition of (status & mask) -- of the aggregate, not per
+     * event. That combination makes a single read-then-acknowledge lose
+     * interrupts for good:
+     *
+     *   read status            -> ROK
+     *   [chip sets TOK]           aggregate already non-zero: no message
+     *   write status (ROK)     -> clears ROK, leaves TOK set
+     *   return                    TOK set, mask open, no message pending,
+     *                             and none ever coming: the aggregate can
+     *                             not go 0->1 again because it never went
+     *                             back to 0.
+     *
+     * Every later event only adds a bit to a status that is already
+     * non-zero. The bare metal machine was caught in exactly this state:
+     * isr 0x40D5 with the mask open and the handler not running -- and the
+     * race is hit at random, which is why the stall arrived after anything
+     * from 276 packets to 44000 of the same load.
+     *
+     * So: loop until the status reads back as zero. Only then is the next
+     * event a 0->1 transition the chip will signal. Bounded, and if the bound
+     * is hit the whole register is acknowledged at once -- both softirqs are
+     * raised on every pass, so no work is lost by that, and a status that
+     * will not go quiet after this many rounds is a chip that is going to
+     * storm regardless. */
+    const MAX_ROUNDS: u32 = 32;
+
+    let mut round = 0;
+    let mut status = regs.read32(INTR_STATUS);
+
     if status == 0 {
         return; /* shared line, not us */
     }
-    if status == u32::MAX {
-        /* All-ones is what a vanished device reads back, not a status with
-         * every event set at once.  Acknowledging it would be pointless and
-         * raising both softirqs would spin the net layer on dead hardware. */
-        return;
-    }
-    regs.write32(INTR_STATUS, status);
 
-    if status & ISR_LINK_CHG != 0 {
-        trace_link(regs);
-    }
+    loop {
+        if status == u32::MAX {
+            /* All-ones is what a vanished device reads back, not a status
+             * with every event set at once.  Acknowledging it would be
+             * pointless and raising both softirqs would spin the net layer
+             * on dead hardware. */
+            return;
+        }
 
-    /* Not in INTR_MASK_BITS, but the chip still latches it: a set bit here
-     * means a bus error the driver should not silently ignore. */
-    if status & ISR_SYS_ERR != 0 {
-        trace!(0, "r8125: fatal PCI system error in ISR");
-    }
+        regs.write32(INTR_STATUS, status);
 
-    if status & ISR_TER != 0 {
-        trace!(0, "r8125: TX error in ISR");
-    }
+        if status & ISR_LINK_CHG != 0 {
+            trace_link(regs);
+        }
 
-    /* The receive-side error bits, which nothing has ever reported. The chip
-       raises these when it falls behind, and on this family a FIFO overflow
-       can leave the receiver needing to be restarted rather than merely
-       drained -- which would look exactly like what this machine does: dead
-       receive, live transmit, interrupts still arriving.
+        /* Not in INTR_MASK_BITS, but the chip still latches it: a set bit
+         * here means a bus error the driver should not silently ignore. */
+        if status & ISR_SYS_ERR != 0 {
+            trace!(0, "r8125: fatal PCI system error in ISR");
+        }
 
-       Traced for the first few only. If they turn out to storm, the count is
-       still there and the log is not the thing that dies. */
-    if status & (ISR_RX_OVERFLOW | ISR_RX_FIFO_OVER | ISR_RER) != 0 {
-        let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
-        if n < 10 {
-            trace!(0, "r8125: rx error in ISR, status 0x{:x} (event {})",
-                status, n + 1);
+        if status & ISR_TER != 0 {
+            trace!(0, "r8125: TX error in ISR");
+        }
+
+        /* Receive-side error bits, counted, the first few traced. */
+        if status & (ISR_RX_OVERFLOW | ISR_RX_FIFO_OVER | ISR_RER) != 0 {
+            let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                trace!(0, "r8125: rx error in ISR, status 0x{:x} (event {})",
+                    status, n + 1);
+            }
+        }
+
+        /* TX reaping stays in flush_tx -- doing it here would race a
+         * flush_tx running on another CPU.  Raising the softirq drains
+         * frames that piled up in the C++ TxQueue while the ring was full;
+         * without it they would wait for an unrelated future SubmitTx. */
+        if status & (ISR_TOK | ISR_TDU | ISR_TER) != 0 {
+            softirq::raise(softirq::TYPE_NET_TX);
+        }
+
+        /* On every pass, not only when the receive bits are set: a harvest
+         * that finds nothing is cheap, and a receive wakeup that depends on
+         * a particular bit being seen is one more thing this register can
+         * lose. */
+        softirq::raise(softirq::TYPE_NET_RX);
+
+        status = regs.read32(INTR_STATUS);
+        if status == 0 {
+            return;
+        }
+
+        round += 1;
+        if round >= MAX_ROUNDS {
+            regs.write32(INTR_STATUS, u32::MAX);
+            return;
         }
     }
-
-    /* TX reaping stays in flush_tx -- doing it here would race a flush_tx
-     * running on another CPU.  Raising the softirq drains frames that piled
-     * up in the C++ TxQueue while the ring was full; without it they would
-     * wait for an unrelated future SubmitTx. */
-    if status & (ISR_TOK | ISR_TDU | ISR_TER) != 0 {
-        softirq::raise(softirq::TYPE_NET_TX);
-    }
-
-    /* Raised on every interrupt, not only when the receive bits are set.
-
-       The chip stops setting ROK once it runs out of descriptors it owns,
-       which is what happens when the drain falls behind under load: the ring
-       fills with completed-but-unharvested slots, the chip has nowhere to
-       write, and receive is over. RDU announces that state, but only as a
-       single edge on the way into it -- and the acknowledge above, which
-       writes back the status word it read, can swallow a bit the chip set in
-       between. Lose that one edge and nothing ever raises the receive
-       softirq again, because only these status bits do.
-
-       Measured on the machine this was found on: while receiving, this vector
-       fired 197 times a second; after the stall it kept firing 3.4 times a
-       second for transmit completions, ran this handler each time, and never
-       once looked at the receive ring. Raising unconditionally costs a
-       harvest that usually finds nothing and makes a lost wakeup impossible
-       to sit on. It also stays on the CPU the interrupt targets, which a poll
-       from elsewhere did not -- that attempt made the stall arrive sooner. */
-    softirq::raise(softirq::TYPE_NET_RX);
 }
 
 /* ================================================================== */
