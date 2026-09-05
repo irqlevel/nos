@@ -60,7 +60,10 @@ public:
     /* Report every task, rather than one. */
     static const ulong NoPidFilter = (ulong)-1;
 
-    void Report(Stdlib::Printer& printer, ulong pidFilter);
+    /* `chains` caps how many are printed. The default is TopChains; a
+       smaller number is what makes the report readable on a console with no
+       scrollback, where the hottest chain is the one that scrolls away. */
+    void Report(Stdlib::Printer& printer, ulong pidFilter, ulong chains = TopChains);
 
 private:
     Profiler();
@@ -76,7 +79,10 @@ private:
     /* How many distinct call chains a report can hold, and how many it
        prints. A chain that does not fit is counted, not silently lost. */
     static const ulong MaxChains = 128;
+
+public:
     static const ulong TopChains = 8;
+private:
 
     struct Record
     {

@@ -379,6 +379,10 @@ static void CmdProfile(const char* args, Stdlib::Printer& con)
 
     ulong ms = DefaultMs;
     ulong pid = Profiler::NoPidFilter;
+    ulong chains = Profiler::TopChains;
+
+    static const char* Usage =
+        "usage: profile [ms, 1-%u] [pid|all] [chains]\n";
 
     if (tok)
     {
@@ -388,7 +392,7 @@ static void CmdProfile(const char* args, Stdlib::Printer& con)
         ulong value;
         if (!Stdlib::ParseUlong(buf, value) || value == 0 || value > MaxMs)
         {
-            con.Printf("usage: profile [ms, 1-%u] [pid]\n", MaxMs);
+            con.Printf(Usage, MaxMs);
             return;
         }
         ms = value;
@@ -397,12 +401,32 @@ static void CmdProfile(const char* args, Stdlib::Printer& con)
         if (tok)
         {
             Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
-            if (!Stdlib::ParseUlong(buf, value))
+
+            /* `all` is how a chain count is given without a pid filter: the
+               argument that matters on a console with no scrollback is the
+               third one, and it should not require inventing a pid. */
+            if (Stdlib::StrCmp(buf, "all") != 0)
             {
-                con.Printf("usage: profile [ms, 1-%u] [pid]\n", MaxMs);
-                return;
+                if (!Stdlib::ParseUlong(buf, value))
+                {
+                    con.Printf(Usage, MaxMs);
+                    return;
+                }
+                pid = value;
             }
-            pid = value;
+
+            tok = Stdlib::NextToken(end, end);
+            if (tok)
+            {
+                Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
+                if (!Stdlib::ParseUlong(buf, value) || value == 0 ||
+                    value > Profiler::TopChains)
+                {
+                    con.Printf(Usage, MaxMs);
+                    return;
+                }
+                chains = value;
+            }
         }
     }
 
@@ -421,7 +445,7 @@ static void CmdProfile(const char* args, Stdlib::Printer& con)
         con.Printf(", pid %u only", pid);
     con.Printf("\n");
 
-    profiler.Report(con, pid);
+    profiler.Report(con, pid, chains);
 }
 
 static void CmdStacks(const char* args, Stdlib::Printer& con)
