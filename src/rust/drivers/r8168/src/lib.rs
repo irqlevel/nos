@@ -8,7 +8,7 @@
  *  - TX: flush_tx() is called by the C++ net stack under TxQueueLock.
  *    It drains the TX queue, fills TX descriptors, and kicks the hardware.
  *    The ISR reaps completed TX descriptors and releases shadow frames.
- *  - RX: the ISR raises softirq TYPE_NET_RX on ROK/RxOverflow.
+ *  - RX: the ISR raises softirq TYPE_NET_RX on every interrupt.
  *    The C++ net layer calls process_rx() on every registered RustNetDevice
  *    from the softirq task.  process_rx() harvests received descriptors,
  *    calls enqueue_rx(), and reposts fresh RX frames.
@@ -403,11 +403,16 @@ extern "C" fn r8168_isr(ctx: *mut u8) {
         softirq::raise(softirq::TYPE_NET_TX);
     }
 
-    if status & (ISR_ROK | ISR_RER | ISR_RX_OVFLOW | ISR_RX_FIFO_OV) != 0 {
-        /* Defer frame processing to softirq task.  The C++ net layer calls
-         * process_rx() on all registered RustNetDevices from the softirq. */
-        softirq::raise(softirq::TYPE_NET_RX);
-    }
+    /* Raised on every interrupt, not only when the receive bits are set --
+     * see the same place in the r8125 driver, where this was diagnosed. The
+     * chip stops setting ROK once it owns no descriptors, RDU announces that
+     * only as a single edge, and the acknowledge above can swallow it; after
+     * that nothing raises this softirq again and receive is over for good,
+     * while the handler keeps running for transmit completions.
+     *
+     * Deferred, not done here: the C++ net layer calls process_rx() on every
+     * registered RustNetDevice from the softirq task. */
+    softirq::raise(softirq::TYPE_NET_RX);
 }
 
 /* ================================================================== */
