@@ -381,38 +381,57 @@ extern "C" fn r8168_isr(ctx: *mut u8) {
     let dev = ctx as *mut R8168Device;
     let regs = unsafe { &(*dev).regs };
 
-    /* Read and clear (write-1-to-clear) interrupt status */
-    let status = regs.read16(INTR_STATUS);
+    /* Loop until the status reads back as zero. The register is
+     * write-1-to-clear and the chip signals MSI on the 0->1 transition of
+     * the aggregate (status & mask), so a bit the chip sets between one read
+     * and its acknowledge is neither cleared nor signalled -- and every later
+     * event only adds to a status that is already non-zero. That is a lost
+     * interrupt with nothing left to recover it. Diagnosed on the 8125, which
+     * has the same register with the same semantics; see r8125_isr. */
+    const MAX_ROUNDS: u32 = 32;
+
+    let mut round = 0;
+    let mut status = regs.read16(INTR_STATUS);
     if status == 0 {
         return; /* spurious */
     }
-    regs.write16(INTR_STATUS, status);
 
-    if status & ISR_SYS_ERR != 0 {
-        trace!(0, "r8168: fatal PCI system error in ISR");
-    }
+    loop {
+        regs.write16(INTR_STATUS, status);
 
-    if status & ISR_TER != 0 {
-        trace!(0, "r8168: TX error in ISR");
-    }
-    /* TX completion: reaping stays in flush_tx (reaping here would race it on
-     * another CPU), but schedule a DrainTx so frames left in the C++ TxQueue
-     * while the ring was full are flushed now that slots have freed -- without
-     * this they stall until an unrelated future SubmitTx. */
-    if status & (ISR_TOK | ISR_TDU | ISR_TER) != 0 {
-        softirq::raise(softirq::TYPE_NET_TX);
-    }
+        if status & ISR_SYS_ERR != 0 {
+            trace!(0, "r8168: fatal PCI system error in ISR");
+        }
 
-    /* Raised on every interrupt, not only when the receive bits are set --
-     * see the same place in the r8125 driver, where this was diagnosed. The
-     * chip stops setting ROK once it owns no descriptors, RDU announces that
-     * only as a single edge, and the acknowledge above can swallow it; after
-     * that nothing raises this softirq again and receive is over for good,
-     * while the handler keeps running for transmit completions.
-     *
-     * Deferred, not done here: the C++ net layer calls process_rx() on every
-     * registered RustNetDevice from the softirq task. */
-    softirq::raise(softirq::TYPE_NET_RX);
+        if status & ISR_TER != 0 {
+            trace!(0, "r8168: TX error in ISR");
+        }
+
+        /* TX completion: reaping stays in flush_tx (reaping here would race
+         * it on another CPU), but schedule a DrainTx so frames left in the
+         * C++ TxQueue while the ring was full are flushed now that slots
+         * have freed -- without this they stall until an unrelated future
+         * SubmitTx. */
+        if status & (ISR_TOK | ISR_TDU | ISR_TER) != 0 {
+            softirq::raise(softirq::TYPE_NET_TX);
+        }
+
+        /* On every pass. Deferred, not done here: the C++ net layer calls
+         * process_rx() on every registered RustNetDevice from the softirq
+         * task. */
+        softirq::raise(softirq::TYPE_NET_RX);
+
+        status = regs.read16(INTR_STATUS);
+        if status == 0 {
+            return;
+        }
+
+        round += 1;
+        if round >= MAX_ROUNDS {
+            regs.write16(INTR_STATUS, u16::MAX);
+            return;
+        }
+    }
 }
 
 /* ================================================================== */
