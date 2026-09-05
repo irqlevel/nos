@@ -592,9 +592,25 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
         softirq::raise(softirq::TYPE_NET_TX);
     }
 
-    if status & (ISR_ROK | ISR_RER | ISR_RX_OVERFLOW | ISR_RX_FIFO_OVER) != 0 {
-        softirq::raise(softirq::TYPE_NET_RX);
-    }
+    /* Raised on every interrupt, not only when the receive bits are set.
+
+       The chip stops setting ROK once it runs out of descriptors it owns,
+       which is what happens when the drain falls behind under load: the ring
+       fills with completed-but-unharvested slots, the chip has nowhere to
+       write, and receive is over. RDU announces that state, but only as a
+       single edge on the way into it -- and the acknowledge above, which
+       writes back the status word it read, can swallow a bit the chip set in
+       between. Lose that one edge and nothing ever raises the receive
+       softirq again, because only these status bits do.
+
+       Measured on the machine this was found on: while receiving, this vector
+       fired 197 times a second; after the stall it kept firing 3.4 times a
+       second for transmit completions, ran this handler each time, and never
+       once looked at the receive ring. Raising unconditionally costs a
+       harvest that usually finds nothing and makes a lost wakeup impossible
+       to sit on. It also stays on the CPU the interrupt targets, which a poll
+       from elsewhere did not -- that attempt made the stall arrive sooner. */
+    softirq::raise(softirq::TYPE_NET_RX);
 }
 
 /* ================================================================== */
