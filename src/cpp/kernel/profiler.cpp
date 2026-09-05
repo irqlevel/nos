@@ -164,7 +164,7 @@ static const char* SymbolName(const char* name)
     return (name != nullptr) ? name : "(unknown)";
 }
 
-void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
+void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimit)
 {
     /* Whole chains, not leaves. Every sample already carries MaxDepth frames;
        counting them by leaf alone threw away all but the first two. */
@@ -320,7 +320,7 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter)
         printer.Printf("%u samples past the %u chains this report holds\n",
             unfolded, (ulong)MaxChains);
 
-    for (ulong i = 0; i < chainCount && i < TopChains; i++)
+    for (ulong i = 0; i < chainCount && i < chainLimit; i++)
     {
         ulong best = i;
         for (ulong j = i + 1; j < chainCount; j++)
