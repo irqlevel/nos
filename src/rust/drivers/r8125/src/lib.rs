@@ -547,6 +547,15 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
 /* ================================================================== */
 /* Interrupt service routine */
 
+/* Receive-side error events seen by the ISR. Static rather than per-device:
+   there is one of these cards in the machine that matters, and a counter that
+   needs no device pointer can be read from anywhere. */
+static RX_ERR_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+pub fn rx_err_events() -> u64 {
+    RX_ERR_EVENTS.load(Ordering::Relaxed)
+}
+
 extern "C" fn r8125_isr(ctx: *mut u8) {
     /* Raw dereference, not `&mut`: flush_tx or process_rx may hold their own
      * reference to this device on another CPU right now (a per-CPU interrupt
@@ -582,6 +591,22 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
 
     if status & ISR_TER != 0 {
         trace!(0, "r8125: TX error in ISR");
+    }
+
+    /* The receive-side error bits, which nothing has ever reported. The chip
+       raises these when it falls behind, and on this family a FIFO overflow
+       can leave the receiver needing to be restarted rather than merely
+       drained -- which would look exactly like what this machine does: dead
+       receive, live transmit, interrupts still arriving.
+
+       Traced for the first few only. If they turn out to storm, the count is
+       still there and the log is not the thing that dies. */
+    if status & (ISR_RX_OVERFLOW | ISR_RX_FIFO_OVER | ISR_RER) != 0 {
+        let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if n < 10 {
+            trace!(0, "r8125: rx error in ISR, status 0x{:x} (event {})",
+                status, n + 1);
+        }
     }
 
     /* TX reaping stays in flush_tx -- doing it here would race a flush_tx
