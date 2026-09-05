@@ -750,6 +750,12 @@ extern "C" {
 void RustInterruptDispatch(Kernel::Context* ctx, int slot)
 {
     (void)ctx;
+
+    /* The legacy line, counted for the same reason as the MSI-X path below:
+       the driver falls back to INTx when MSI-X is unavailable, and which of
+       the two a card ended up on was not visible from the running machine. */
+    Kernel::InterruptStats::Inc(Kernel::IrqShared);
+
     if (slot < 0 || (ulong)slot >= RustIrqSlotCount)
     {
         Hal::IrqEoi();
@@ -1045,6 +1051,15 @@ extern "C" {
 void RustMsixDispatch(Kernel::Context* ctx, int slot)
 {
     (void)ctx;
+
+    /* Counted here because nothing counted it anywhere: IrqMsix existed only
+       to name a row in `irqstat`, so that row read zero for the life of every
+       boot -- including on a machine whose NIC had just delivered thirteen
+       thousand packets. Asking whether the card's interrupts had stopped was
+       therefore unanswerable, which is most of why its receive stall took so
+       long to corner. */
+    Kernel::InterruptStats::Inc(Kernel::IrqMsix);
+
     if (slot < 0 || (ulong)slot >= RustMsixSlotCount)
     {
         Hal::IrqEoi();
