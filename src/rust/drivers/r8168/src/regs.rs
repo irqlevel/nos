@@ -63,7 +63,7 @@ pub const ISR_ROK:        u16 = 1 << 0;  /* RX OK */
 pub const ISR_RER:        u16 = 1 << 1;  /* RX error */
 pub const ISR_TOK:        u16 = 1 << 2;  /* TX OK */
 pub const ISR_TER:        u16 = 1 << 3;  /* TX error */
-pub const ISR_RX_OVFLOW:  u16 = 1 << 4;  /* RX overflow */
+pub const ISR_RDU:        u16 = 1 << 4;  /* Rx descriptor unavailable */
 pub const ISR_LINK_CHG:   u16 = 1 << 5;  /* Link status change */
 pub const ISR_RX_FIFO_OV: u16 = 1 << 6;  /* RX FIFO overflow */
 pub const ISR_TDU:        u16 = 1 << 7;  /* TX descriptor unavailable */
@@ -73,7 +73,7 @@ pub const ISR_SYS_ERR:    u16 = 1 << 15; /* fatal PCI bus error */
 
 /* Enabled interrupt sources */
 pub const INTR_MASK_BITS: u16 = ISR_ROK | ISR_RER | ISR_TOK | ISR_TER
-    | ISR_RX_OVFLOW | ISR_LINK_CHG | ISR_RX_FIFO_OV | ISR_SYS_ERR;
+    | ISR_RDU | ISR_LINK_CHG | ISR_RX_FIFO_OV | ISR_SYS_ERR;
 
 /* ================================================================== */
 /* TX descriptor opts1 bits */
