@@ -341,38 +341,6 @@ void VirtioNet::FreeTxSlot(int idx)
     FreeTxSlotMask |= (1UL << (ulong)idx);
 }
 
-/* --- TX: classify frame for per-protocol stats --- */
-
-void VirtioNet::ClassifyTxFrame(NetFrame* frame)
-{
-    if (frame->Length < sizeof(EthHdr))
-        return;
-
-    const EthHdr* eth = (const EthHdr*)frame->Data;
-    u16 etherType = Ntohs(eth->EtherType);
-
-    if (etherType == Net::EtherTypeArp)
-    {
-        TxArp.Inc();
-        return;
-    }
-
-    if (etherType != Net::EtherTypeIp || frame->Length < sizeof(EthHdr) + sizeof(IpHdr))
-    {
-        TxOther.Inc();
-        return;
-    }
-
-    const IpHdr* ip = (const IpHdr*)(frame->Data + sizeof(EthHdr));
-    switch (ip->Protocol)
-    {
-    case Net::IpProtoIcmp: TxIcmp.Inc(); break;
-    case Net::IpProtoTcp:  TxTcp.Inc();  break;
-    case Net::IpProtoUdp:  TxUdp.Inc();  break;
-    default:               TxOther.Inc(); break;
-    }
-}
-
 /* --- TX: drain SW TxQueue to hardware (caller holds TxQueueLock) --- */
 
 void VirtioNet::FlushTx()
@@ -409,9 +377,6 @@ void VirtioNet::FlushTx()
             TxCount++;
             break;
         }
-
-        TxPktCount.Inc();
-        ClassifyTxFrame(frame);
 
         TxSlots[slotIdx].Frame = frame;
         TxSlots[slotIdx].Head = head;
@@ -568,7 +533,9 @@ const char* VirtioNet::GetName()
 
 u64 VirtioNet::GetTxPackets()
 {
-    return (u64)TxPktCount.Get();
+    NetStats st;
+    GetTxProtoTotals(st);
+    return st.TxTotal;
 }
 
 u64 VirtioNet::GetRxPackets()
@@ -583,15 +550,10 @@ u64 VirtioNet::GetRxDropped()
 
 void VirtioNet::GetStats(NetStats& stats)
 {
-    stats.TxTotal = (u64)TxPktCount.Get();
+    GetTxProtoTotals(stats);
     stats.RxTotal = (u64)RxPktCount.Get();
     GetRxProtoTotals(stats);
     stats.RxDrop += (u64)RxDropCount.Get();
-    stats.TxIcmp = (u64)TxIcmp.Get();
-    stats.TxUdp = (u64)TxUdp.Get();
-    stats.TxTcp = (u64)TxTcp.Get();
-    stats.TxArp = (u64)TxArp.Get();
-    stats.TxOther = (u64)TxOther.Get();
 }
 
 /* --- Interrupt --- */

@@ -179,8 +179,33 @@ protected:
 
     RxProtoCounters RxProto[MaxCpus];
 
+    /* The same on the way out. These were six shared atomics per frame
+       taken inside FlushTx, which runs under TxQueueLock with interrupts
+       off -- the narrowest section on the transmit path. */
+    struct TxProtoCounters
+    {
+        ulong Icmp;
+        ulong Udp;
+        ulong Tcp;
+        ulong Arp;
+        ulong Other;
+        ulong Total;
+        ulong Pad[2];
+    };
+
+    static_assert(sizeof(TxProtoCounters) == 64, "one counter set per line");
+
+    TxProtoCounters TxProto[MaxCpus];
+
+    /* Classify one outgoing frame. Called from SubmitTx, which is where
+       every driver's frames leave, so the Rust NIC bridge is counted too --
+       it reported zeros for the transmit breakdown, having no classifier of
+       its own. */
+    void CountTxFrame(NetFrame* frame);
+
     /* Summed across CPUs; for GetStats, never for the datapath. */
     void GetRxProtoTotals(NetStats& stats);
+    void GetTxProtoTotals(NetStats& stats);
 
     UdpListener UdpListeners[MaxUdpListeners];
     ulong UdpListenerCount;

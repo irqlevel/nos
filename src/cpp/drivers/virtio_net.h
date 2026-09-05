@@ -110,7 +110,6 @@ private:
     /* Hands every frame the device is done with to NetDevice::TxDone rather
        than releasing it: the caller holds TxQueueLock. See the note there. */
     void CompleteTx();
-    void ClassifyTxFrame(NetFrame* frame);
 
     static void RxFrameRelease(NetFrame* frame, void* ctx);
 
@@ -128,15 +127,9 @@ private:
     ulong NetHdrSize; /* 10 for legacy, 12 for modern */
     char DevName[8];
 
-    Atomic TxPktCount;
     Atomic RxPktCount;
     Atomic RxDropCount;
 
-    Atomic TxIcmp;
-    Atomic TxUdp;
-    Atomic TxTcp;
-    Atomic TxArp;
-    Atomic TxOther;
 
     /* TX DMA slot pool */
     TxSlot TxSlots[MaxTxSlots];
