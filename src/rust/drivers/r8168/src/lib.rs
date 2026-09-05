@@ -31,7 +31,7 @@ use kcore::{trace, dma, io, interrupt, net, pci, softirq};
 mod desc;
 mod regs;
 
-use desc::{RxRing, TxRing, RING_SIZE};
+use desc::{RxRing, TxRing, RING_PAGES, RING_SIZE};
 use regs::*;
 
 /* ================================================================== */
@@ -158,14 +158,14 @@ fn init_device(pci_dev: &pci::PciDevice) {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     /* --- Allocate TX and RX descriptor rings (1 page each = 256 descs) --- */
-    let tx_dma = match dma::DmaBuffer::new(1) {
+    let tx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
             trace!(0, "r8168: TX DMA alloc failed");
             return;
         }
     };
-    let rx_dma = match dma::DmaBuffer::new(1) {
+    let rx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
             trace!(0, "r8168: RX DMA alloc failed");

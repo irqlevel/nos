@@ -38,7 +38,7 @@ mod desc;
 mod hw;
 mod regs;
 
-use desc::{RxRing, TxRing, RING_SIZE};
+use desc::{RxRing, TxRing, RING_PAGES, RING_SIZE};
 use hw::Chip;
 use regs::*;
 
@@ -218,14 +218,14 @@ fn init_device(pci_dev: &pci::PciDevice) {
     );
 
     /* --- Descriptor rings: one page each = 256 descriptors --- */
-    let tx_dma = match dma::DmaBuffer::new(1) {
+    let tx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
             trace!(0, "r8125: TX ring alloc failed");
             return;
         }
     };
-    let rx_dma = match dma::DmaBuffer::new(1) {
+    let rx_dma = match dma::DmaBuffer::new(RING_PAGES) {
         Some(d) => d,
         None => {
             trace!(0, "r8125: RX ring alloc failed");
