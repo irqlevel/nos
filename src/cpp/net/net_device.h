@@ -7,6 +7,7 @@
 #include <kernel/raw_spin_lock.h>
 #include <net/net.h>
 #include <net/net_frame.h>
+#include <kernel/cpu.h>
 
 namespace Kernel
 {
@@ -150,13 +151,36 @@ protected:
        `net` command reported zeros for any device whose driver had not
        written its own copy of the dispatch loop, which is how the Rust NIC
        bridge came to show tx:0 rx:0 on a machine forwarding thousands of
-       packets a second. */
-    Atomic RxProtoIcmp;
-    Atomic RxProtoUdp;
-    Atomic RxProtoTcp;
-    Atomic RxProtoArp;
-    Atomic RxProtoOther;
-    Atomic RxProtoDrop;
+       packets a second.
+
+       Per CPU and plain, not shared and atomic. This is a datapath, and a
+       counter every arriving packet increments on one cache line is the
+       thing this kernel has spent a day removing from other datapaths --
+       the frame pool and the load target both count this way for the same
+       reason. The CPU is read once per batch, not once per frame. */
+    struct RxProtoCounters
+    {
+        ulong Icmp;
+        ulong Udp;
+        ulong Tcp;
+        ulong Arp;
+        ulong Other;
+        ulong Drop;
+
+        /* Padded to a cache line rather than aligned to one: alignas here
+           would over-align NetDevice itself, and deleting an over-aligned
+           object calls operator delete(void*, align_val_t), which this
+           freestanding runtime does not provide. Sizing to 64 keeps two CPUs
+           off the same line everywhere except the array's own ends. */
+        ulong Pad[2];
+    };
+
+    static_assert(sizeof(RxProtoCounters) == 64, "one counter set per line");
+
+    RxProtoCounters RxProto[MaxCpus];
+
+    /* Summed across CPUs; for GetStats, never for the datapath. */
+    void GetRxProtoTotals(NetStats& stats);
 
     UdpListener UdpListeners[MaxUdpListeners];
     ulong UdpListenerCount;

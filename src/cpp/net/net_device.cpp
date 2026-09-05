@@ -20,6 +20,7 @@ NetDevice::NetDevice()
     , RxCount(0)
     , UdpListenerCount(0)
 {
+    Stdlib::MemSet(RxProto, 0, sizeof(RxProto));
     Stdlib::MemSet(UdpListeners, 0, sizeof(UdpListeners));
 }
 
@@ -177,6 +178,26 @@ void NetDevice::DrainTx()
     TxQueueLock.UnlockIrqRestore(flags);
 
     ReleaseTxDone();
+}
+
+void NetDevice::GetRxProtoTotals(NetStats& stats)
+{
+    stats.RxIcmp = 0;
+    stats.RxUdp = 0;
+    stats.RxTcp = 0;
+    stats.RxArp = 0;
+    stats.RxOther = 0;
+    stats.RxDrop = 0;
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        stats.RxIcmp += RxProto[i].Icmp;
+        stats.RxUdp += RxProto[i].Udp;
+        stats.RxTcp += RxProto[i].Tcp;
+        stats.RxArp += RxProto[i].Arp;
+        stats.RxOther += RxProto[i].Other;
+        stats.RxDrop += RxProto[i].Drop;
+    }
 }
 
 ulong NetDevice::EnqueueRxBatch(NetFrame** frames, ulong count)
@@ -401,6 +422,13 @@ void NetDevice::DrainRxQueueAndDispatch()
        The in-flight count is raised once for the batch and dropped at the
        end, which is what lets UnregisterUdpListener keep waiting for
        callbacks to finish before its caller frees their context. */
+    /* Read once for the batch: the counters below are per CPU, and the poll
+       that produced this batch does not migrate part way through it. */
+    ulong cpuIndex = Hal::GetCurrentCpuHwId();
+    if (cpuIndex >= MaxCpus)
+        cpuIndex = 0;
+    RxProtoCounters& proto = RxProto[cpuIndex];
+
     UdpListener listeners[MaxUdpListeners];
     ulong listenerCount = 0;
 
@@ -423,7 +451,7 @@ void NetDevice::DrainRxQueueAndDispatch()
 
         if (dataLen < sizeof(Net::EthHdr))
         {
-            RxProtoDrop.Inc();
+            proto.Drop++;
             goto done;
         }
 
@@ -433,7 +461,7 @@ void NetDevice::DrainRxQueueAndDispatch()
 
             if (etherType == Net::EtherTypeArp)
             {
-                RxProtoArp.Inc();
+                proto.Arp++;
                 ArpTable::GetInstance().Process(this, data, dataLen);
                 goto done;
             }
@@ -441,8 +469,8 @@ void NetDevice::DrainRxQueueAndDispatch()
             if (etherType != Net::EtherTypeIp ||
                 dataLen < sizeof(Net::EthHdr) + sizeof(Net::IpHdr))
             {
-                RxProtoOther.Inc();
-                RxProtoDrop.Inc();
+                proto.Other++;
+                proto.Drop++;
                 goto done;
             }
 
@@ -450,16 +478,16 @@ void NetDevice::DrainRxQueueAndDispatch()
             switch (ip->Protocol)
             {
             case Net::IpProtoIcmp:
-                RxProtoIcmp.Inc();
+                proto.Icmp++;
                 Icmp::GetInstance().Process(this, data, dataLen);
                 break;
             case Net::IpProtoTcp:
-                RxProtoTcp.Inc();
+                proto.Tcp++;
                 Tcp::GetInstance().Process(this, data, dataLen);
                 break;
             case Net::IpProtoUdp:
             {
-                RxProtoUdp.Inc();
+                proto.Udp++;
                 ulong ipHdrLen = Net::IpHeaderLen(ip);
                 if (ipHdrLen == 0 ||
                     dataLen < sizeof(Net::EthHdr) + ipHdrLen + sizeof(Net::UdpHdr))
@@ -486,8 +514,8 @@ void NetDevice::DrainRxQueueAndDispatch()
                 break;
             }
             default:
-                RxProtoOther.Inc();
-                RxProtoDrop.Inc();
+                proto.Other++;
+                proto.Drop++;
                 break;
             }
         }

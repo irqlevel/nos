@@ -553,6 +553,15 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
    needs no device pointer can be read from anywhere. */
 static RX_ERR_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/* How the receive poll is being driven, which is the question a throughput
+ * ceiling of "polls per second times budget" asks and nothing so far could
+ * answer. POLLS counts entries into the poll; BUDGET_HITS counts the ones
+ * that ran out of budget and asked for another pass instead of arming the
+ * chip. If nearly every poll is a budget hit, the cadence is the softirq
+ * loop's; if nearly none are, it is the chip's interrupt rate. */
+static RX_POLLS: AtomicU64 = AtomicU64::new(0);
+static RX_BUDGET_HITS: AtomicU64 = AtomicU64::new(0);
+
 /* The sources a receive poll silences. Everything else -- transmit, link
  * change -- keeps interrupting, because nothing is polling those. */
 const RX_INTR_BITS: u32 = ISR_ROK | ISR_RER | ISR_RDU | ISR_RX_FIFO_OVER;
@@ -724,6 +733,8 @@ pub struct R8125State {
     pub head_posted: u32,
     pub head_opts1: u32,
     pub rx_err_events: u64,
+    pub rx_polls: u64,
+    pub rx_budget_hits: u64,
     pub rx_packets: u64,
     pub rx_dropped: u64,
 }
@@ -760,6 +771,8 @@ pub extern "C" fn r8125_get_state(out: *mut R8125State) -> i32 {
         (*out).head_posted = if posted { 1 } else { 0 };
         (*out).head_opts1 = opts1;
         (*out).rx_err_events = RX_ERR_EVENTS.load(Ordering::Relaxed);
+        (*out).rx_polls = RX_POLLS.load(Ordering::Relaxed);
+        (*out).rx_budget_hits = RX_BUDGET_HITS.load(Ordering::Relaxed);
         (*out).rx_packets = (*dev).rx_packets.load(Ordering::Relaxed);
         (*out).rx_dropped = (*dev).rx_dropped.load(Ordering::Relaxed);
     }
@@ -808,6 +821,8 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
         let mut batch: [usize; RX_BUDGET as usize] = [0; RX_BUDGET as usize];
 
         loop {
+            RX_POLLS.fetch_add(1, Ordering::Relaxed);
+
             let mut taken = 0u32;
             let mut budget_hit = false;
             let mut batched = 0usize;
@@ -878,6 +893,8 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
             (*dev).regs.write32(INTR_STATUS, RX_INTR_BITS);
 
             if budget_hit {
+                RX_BUDGET_HITS.fetch_add(1, Ordering::Relaxed);
+
                 /* Still ours to finish. Stay silent, come back through the
                  * softirq, and let the dispatch that follows this harvest --
                  * and everything else on this CPU -- have its turn. */
