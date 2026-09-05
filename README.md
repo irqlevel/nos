@@ -376,6 +376,7 @@ it on a network you trust.
 | `loglevel [N]` | Show or set the trace level (0-5) on a running kernel |
 | `uptime` | Show uptime |
 | `date` | Show wall clock date and time (RTC + boot time) |
+| `nicdump` | The r8125's own state: command register (is the receiver still enabled?), interrupt status and mask, and whose the head receive descriptor is. For a machine that has stopped receiving and can still be typed at |
 | `netload [start [port] [sink]\|stop\|reset]` | UDP load target, so `profile` has something to look at other than an idle machine: echoes every datagram from the receive softirq (or drops it, in sink mode) and counts packets, bytes and rate per CPU. Drive it with `scripts/netload.py` |
 | `stacks` | Stack high-water marks: every stack is filled with a pattern when it is created, and what is still intact is what it never reached. Catches a spike that lasted microseconds during boot, and costs nothing while the machine runs |
 | `ps` | Show tasks |
