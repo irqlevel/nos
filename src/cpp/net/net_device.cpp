@@ -386,6 +386,33 @@ void NetDevice::DrainRxQueueAndDispatch()
         RxQueueLock.UnlockIrqRestore(flags);
     }
 
+    /* Nothing arrived: no table to copy, no hold to take, no lock. The drain
+       runs on every softirq pass, most of which have no frames. */
+    if (batch.IsEmpty())
+        return;
+
+    /* One look at the listener table for the whole batch. It was a spinlock
+       acquire and release per UDP datagram -- with interrupts off, plus the
+       pair of atomics on the in-flight count -- which a profile put among the
+       top entries of the receive path at 37000 packets a second. The table
+       has four slots and changes when a server starts or stops, so copying it
+       per batch costs nothing and the copy is good for the length of one.
+
+       The in-flight count is raised once for the batch and dropped at the
+       end, which is what lets UnregisterUdpListener keep waiting for
+       callbacks to finish before its caller frees their context. */
+    UdpListener listeners[MaxUdpListeners];
+    ulong listenerCount = 0;
+
+    {
+        Stdlib::AutoLock lock(UdpListenerLock);
+        listenerCount = UdpListenerCount;
+        for (ulong i = 0; i < listenerCount; i++)
+            listeners[i] = UdpListeners[i];
+        if (listenerCount != 0)
+            UdpListenerInFlight.Inc();
+    }
+
     while (!batch.IsEmpty())
     {
         Stdlib::ListEntry* entry = batch.RemoveHead();
@@ -448,26 +475,13 @@ void NetDevice::DrainRxQueueAndDispatch()
                    under the lock, then call it with the lock down; the
                    in-flight count is what keeps the context alive until it
                    returns. */
-                RxCallback cb = nullptr;
-                void* cbCtx = nullptr;
+                for (ulong li = 0; li < listenerCount; li++)
                 {
-                    Stdlib::AutoLock lock(UdpListenerLock);
-                    for (ulong li = 0; li < UdpListenerCount; li++)
+                    if (listeners[li].Port == dstPort && listeners[li].Cb)
                     {
-                        if (UdpListeners[li].Port == dstPort && UdpListeners[li].Cb)
-                        {
-                            cb = UdpListeners[li].Cb;
-                            cbCtx = UdpListeners[li].Ctx;
-                            UdpListenerInFlight.Inc();
-                            break;
-                        }
+                        listeners[li].Cb(data, dataLen, listeners[li].Ctx);
+                        break;
                     }
-                }
-
-                if (cb != nullptr)
-                {
-                    cb(data, dataLen, cbCtx);
-                    UdpListenerInFlight.Dec();
                 }
                 break;
             }
@@ -480,6 +494,9 @@ void NetDevice::DrainRxQueueAndDispatch()
 done:
         frame->Put();
     }
+
+    if (listenerCount != 0)
+        UdpListenerInFlight.Dec();
 }
 
 void NetDeviceTable::ProcessAllRx()
