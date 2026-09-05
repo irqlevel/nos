@@ -32,16 +32,22 @@ use crate::regs::*;
  * 256 * 16 bytes = 4096 bytes = exactly one DMA page. */
 /* Descriptors per ring.
  *
- * 256 was one page of them, and one page was not enough: the bare metal
- * machine starts reporting RX descriptor unavailable at two thousand packets
- * a second, which is a ring that fills faster than the receive softirq
- * empties it, not a chip that cannot keep up. Every RDU is a burst of
- * packets the chip had nowhere to put.
+ * 256, which is one page of them, and measured to be the better number.
  *
- * A thousand is four pages and four times the slack, at the cost of 16 KiB
- * of DMA memory and a thousand pooled frames posted for receive -- against a
- * frame pool of four thousand, which `netpool` has never seen dip. */
-pub const RING_SIZE: usize = 1024;
+ * RDU -- the chip finding no descriptor it owns -- starts at around two
+ * thousand packets a second here, so the obvious move was a bigger ring, and
+ * it was tried: 1024, four pages. It made throughput worse, not better. The
+ * ceiling on packets actually received fell from about 5000 a second to about
+ * 2000, consistently, across a rate ladder and a two-minute sustained run.
+ *
+ * The reason a ring cannot fix this is that it does not change how fast the
+ * receive softirq drains, and the drain is the ceiling: one queue, one vector,
+ * one CPU (`netload` reports every packet arriving on cpu 9). A ring only
+ * decides how long a burst can be absorbed before RDU, and paying for that in
+ * cache footprint -- 1024 buffers of 2 KiB is 2 MiB cycled through, against
+ * 512 KiB here -- costs more than the RDU did. Going past this needs multiple
+ * receive queues spread over CPUs, not more descriptors on one. */
+pub const RING_SIZE: usize = 256;
 
 /* Pages the ring needs, rounded up. Must stay a power of two: the DMA
    allocator hands back `1 << log2(requested)` pages, so asking for three
