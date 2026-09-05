@@ -1238,14 +1238,10 @@ public:
        own. */
     void GetStats(Kernel::NetStats& stats) override
     {
+        GetRxProtoTotals(stats);
         stats.TxTotal = TxPackets;
         stats.RxTotal = RxPackets;
-        stats.RxDrop = RxDropped + (u64)RxProtoDrop.Get();
-        stats.RxIcmp = (u64)RxProtoIcmp.Get();
-        stats.RxUdp = (u64)RxProtoUdp.Get();
-        stats.RxTcp = (u64)RxProtoTcp.Get();
-        stats.RxArp = (u64)RxProtoArp.Get();
-        stats.RxOther = (u64)RxProtoOther.Get();
+        stats.RxDrop += RxDropped;
         stats.TxIcmp = 0;
         stats.TxUdp = 0;
         stats.TxTcp = 0;

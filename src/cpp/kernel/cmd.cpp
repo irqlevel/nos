@@ -484,6 +484,8 @@ struct R8125State
     u32 HeadPosted;
     u32 HeadOpts1;
     u64 RxErrEvents;
+    u64 RxPolls;
+    u64 RxBudgetHits;
     u64 RxPackets;
     u64 RxDropped;
 };
@@ -520,6 +522,11 @@ static void CmdNicdump(const char* args, Stdlib::Printer& con)
         (ulong)((st.HeadOpts1 & RxOwn) ? 1 : 0));
     con.Printf("rx packets %u dropped %u err events %u\n",
         (ulong)st.RxPackets, (ulong)st.RxDropped, (ulong)st.RxErrEvents);
+
+    /* A ceiling that reads as polls-per-second times budget is either the
+       softirq loop's cadence or the chip's interrupt rate; these tell which. */
+    con.Printf("rx polls %u, of them budget-limited %u\n",
+        (ulong)st.RxPolls, (ulong)st.RxBudgetHits);
 }
 
 static void CmdNetload(const char* args, Stdlib::Printer& con)

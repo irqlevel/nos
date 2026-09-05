@@ -585,12 +585,8 @@ void VirtioNet::GetStats(NetStats& stats)
 {
     stats.TxTotal = (u64)TxPktCount.Get();
     stats.RxTotal = (u64)RxPktCount.Get();
-    stats.RxDrop = (u64)(RxDropCount.Get() + RxProtoDrop.Get());
-    stats.RxIcmp = (u64)RxProtoIcmp.Get();
-    stats.RxUdp = (u64)RxProtoUdp.Get();
-    stats.RxTcp = (u64)RxProtoTcp.Get();
-    stats.RxArp = (u64)RxProtoArp.Get();
-    stats.RxOther = (u64)RxProtoOther.Get();
+    GetRxProtoTotals(stats);
+    stats.RxDrop += (u64)RxDropCount.Get();
     stats.TxIcmp = (u64)TxIcmp.Get();
     stats.TxUdp = (u64)TxUdp.Get();
     stats.TxTcp = (u64)TxTcp.Get();
