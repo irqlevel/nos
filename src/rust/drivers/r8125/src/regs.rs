@@ -128,7 +128,11 @@ pub const ISR_ROK: u32 = 1 << 0; /* RX OK */
 pub const ISR_RER: u32 = 1 << 1; /* RX error */
 pub const ISR_TOK: u32 = 1 << 2; /* TX OK */
 pub const ISR_TER: u32 = 1 << 3; /* TX error */
-pub const ISR_RX_OVERFLOW: u32 = 1 << 4;
+/* Rx Descriptor Unavailable: the chip has a packet and the descriptor it
+ * reached is owned by the driver, so there is nowhere to put it. Named
+ * "overflow" here until 2026-09-05, which cost a whole round of chasing a
+ * receive-FIFO problem that was never happening -- the FIFO is bit 6. */
+pub const ISR_RDU: u32 = 1 << 4;
 pub const ISR_LINK_CHG: u32 = 1 << 5;
 pub const ISR_RX_FIFO_OVER: u32 = 1 << 6;
 pub const ISR_TDU: u32 = 1 << 7; /* TX descriptor unavailable */
@@ -145,7 +149,7 @@ pub const INTR_MASK_BITS: u32 = ISR_ROK
     | ISR_TOK
     | ISR_TER
     | ISR_LINK_CHG
-    | ISR_RX_OVERFLOW
+    | ISR_RDU
     | ISR_RX_FIFO_OVER;
 
 /* ================================================================== */

@@ -625,7 +625,7 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
         }
 
         /* Receive-side error bits, counted, the first few traced. */
-        if status & (ISR_RX_OVERFLOW | ISR_RX_FIFO_OVER | ISR_RER) != 0 {
+        if status & (ISR_RDU | ISR_RX_FIFO_OVER | ISR_RER) != 0 {
             let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
             if n < 10 {
                 trace!(0, "r8125: rx error in ISR, status 0x{:x} (event {})",
