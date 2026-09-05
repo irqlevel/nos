@@ -395,7 +395,10 @@ void NetDevice::DrainRxQueueAndDispatch()
         ulong dataLen = frame->Length;
 
         if (dataLen < sizeof(Net::EthHdr))
+        {
+            RxProtoDrop.Inc();
             goto done;
+        }
 
         {
             Net::EthHdr* eth = (Net::EthHdr*)data;
@@ -403,25 +406,33 @@ void NetDevice::DrainRxQueueAndDispatch()
 
             if (etherType == Net::EtherTypeArp)
             {
+                RxProtoArp.Inc();
                 ArpTable::GetInstance().Process(this, data, dataLen);
                 goto done;
             }
 
             if (etherType != Net::EtherTypeIp ||
                 dataLen < sizeof(Net::EthHdr) + sizeof(Net::IpHdr))
+            {
+                RxProtoOther.Inc();
+                RxProtoDrop.Inc();
                 goto done;
+            }
 
             Net::IpHdr* ip = (Net::IpHdr*)(data + sizeof(Net::EthHdr));
             switch (ip->Protocol)
             {
             case Net::IpProtoIcmp:
+                RxProtoIcmp.Inc();
                 Icmp::GetInstance().Process(this, data, dataLen);
                 break;
             case Net::IpProtoTcp:
+                RxProtoTcp.Inc();
                 Tcp::GetInstance().Process(this, data, dataLen);
                 break;
             case Net::IpProtoUdp:
             {
+                RxProtoUdp.Inc();
                 ulong ipHdrLen = Net::IpHeaderLen(ip);
                 if (ipHdrLen == 0 ||
                     dataLen < sizeof(Net::EthHdr) + ipHdrLen + sizeof(Net::UdpHdr))
@@ -461,6 +472,8 @@ void NetDevice::DrainRxQueueAndDispatch()
                 break;
             }
             default:
+                RxProtoOther.Inc();
+                RxProtoDrop.Inc();
                 break;
             }
         }

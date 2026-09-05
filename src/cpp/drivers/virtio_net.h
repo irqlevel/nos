@@ -132,11 +132,6 @@ private:
     Atomic RxPktCount;
     Atomic RxDropCount;
 
-    Atomic RxIcmp;
-    Atomic RxUdp;
-    Atomic RxTcp;
-    Atomic RxArp;
-    Atomic RxOther;
     Atomic TxIcmp;
     Atomic TxUdp;
     Atomic TxTcp;

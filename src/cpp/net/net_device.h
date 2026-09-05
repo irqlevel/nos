@@ -145,6 +145,19 @@ protected:
     ulong RxCount;
     RawSpinLock RxQueueLock;
 
+    /* Counted by DrainRxQueueAndDispatch, which is the one place every
+       driver's frames pass through -- they used to be per-driver, so the
+       `net` command reported zeros for any device whose driver had not
+       written its own copy of the dispatch loop, which is how the Rust NIC
+       bridge came to show tx:0 rx:0 on a machine forwarding thousands of
+       packets a second. */
+    Atomic RxProtoIcmp;
+    Atomic RxProtoUdp;
+    Atomic RxProtoTcp;
+    Atomic RxProtoArp;
+    Atomic RxProtoOther;
+    Atomic RxProtoDrop;
+
     UdpListener UdpListeners[MaxUdpListeners];
     ulong UdpListenerCount;
     SpinLock UdpListenerLock;

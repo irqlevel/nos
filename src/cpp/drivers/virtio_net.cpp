@@ -530,96 +530,17 @@ void VirtioNet::ReapRx()
 
 void VirtioNet::ProcessRx()
 {
-    while (true)
-    {
-        ulong flags = RxQueueLock.LockIrqSave();
-        if (RxQueue.IsEmpty())
-        {
-            RxQueueLock.UnlockIrqRestore(flags);
-            break;
-        }
-        Stdlib::ListEntry* entry = RxQueue.RemoveHead();
-        RxCount--;
-        RxQueueLock.UnlockIrqRestore(flags);
+    /* The shared drain, not a copy of it. This driver carried its own for
+       long enough to miss two fixes made to the original: frames are taken
+       off the queue in one splice rather than one lock acquisition each, and
+       a UDP listener's callback runs with the listener table unlocked
+       instead of with interrupts off for its duration.
 
-        NetFrame* frame = CONTAINING_RECORD(entry, NetFrame, Link);
-        u8* data = frame->Data;
-        ulong dataLen = frame->Length;
-
-        /* Protocol dispatch */
-        if (dataLen < sizeof(EthHdr))
-        {
-            RxDropCount.Inc();
-            goto done;
-        }
-
-        {
-            EthHdr* eth = (EthHdr*)data;
-            u16 etherType = Ntohs(eth->EtherType);
-
-            if (etherType == Net::EtherTypeArp)
-            {
-                RxArp.Inc();
-                ArpTable::GetInstance().Process(this, data, dataLen);
-                goto done;
-            }
-
-            if (etherType != Net::EtherTypeIp || dataLen < sizeof(EthHdr) + sizeof(IpHdr))
-            {
-                RxOther.Inc();
-                RxDropCount.Inc();
-                goto done;
-            }
-
-            IpHdr* ip = (IpHdr*)(data + sizeof(EthHdr));
-            switch (ip->Protocol)
-            {
-            case Net::IpProtoIcmp:
-                RxIcmp.Inc();
-                Icmp::GetInstance().Process(this, data, dataLen);
-                break;
-            case Net::IpProtoTcp:
-                RxTcp.Inc();
-                Tcp::GetInstance().Process(this, data, dataLen);
-                break;
-            case Net::IpProtoUdp:
-            {
-                RxUdp.Inc();
-                /* Honor IHL so IP options shift the UDP offset. */
-                ulong ipHdrLen = Net::IpHeaderLen(ip);
-                if (ipHdrLen == 0 || dataLen < sizeof(EthHdr) + ipHdrLen + sizeof(UdpHdr))
-                {
-                    RxDropCount.Inc();
-                    break;
-                }
-                UdpHdr* udp = (UdpHdr*)(data + sizeof(EthHdr) + ipHdrLen);
-                u16 dstPort = Ntohs(udp->DstPort);
-                bool delivered = false;
-
-                Stdlib::AutoLock lock(UdpListenerLock);
-                for (ulong li = 0; li < UdpListenerCount; li++)
-                {
-                    if (UdpListeners[li].Port == dstPort && UdpListeners[li].Cb)
-                    {
-                        UdpListeners[li].Cb(data, dataLen, UdpListeners[li].Ctx);
-                        delivered = true;
-                        break;
-                    }
-                }
-                if (!delivered)
-                    RxDropCount.Inc();
-                break;
-            }
-            default:
-                RxOther.Inc();
-                RxDropCount.Inc();
-                break;
-            }
-        }
-done:
-
-        frame->Put(); /* refcount -> 0 -> RxFrameRelease -> PostRxBuf */
-    }
+       It also means QEMU exercises the path the bare metal drivers use.
+       While the copy existed, nothing here ran it -- the Rust NIC bridge is
+       the only other user, and that hardware is not something a test can
+       boot. */
+    DrainRxQueueAndDispatch();
 
     if (RxNeedNotify)
     {
@@ -664,12 +585,12 @@ void VirtioNet::GetStats(NetStats& stats)
 {
     stats.TxTotal = (u64)TxPktCount.Get();
     stats.RxTotal = (u64)RxPktCount.Get();
-    stats.RxDrop = (u64)RxDropCount.Get();
-    stats.RxIcmp = (u64)RxIcmp.Get();
-    stats.RxUdp = (u64)RxUdp.Get();
-    stats.RxTcp = (u64)RxTcp.Get();
-    stats.RxArp = (u64)RxArp.Get();
-    stats.RxOther = (u64)RxOther.Get();
+    stats.RxDrop = (u64)(RxDropCount.Get() + RxProtoDrop.Get());
+    stats.RxIcmp = (u64)RxProtoIcmp.Get();
+    stats.RxUdp = (u64)RxProtoUdp.Get();
+    stats.RxTcp = (u64)RxProtoTcp.Get();
+    stats.RxArp = (u64)RxProtoArp.Get();
+    stats.RxOther = (u64)RxProtoOther.Get();
     stats.TxIcmp = (u64)TxIcmp.Get();
     stats.TxUdp = (u64)TxUdp.Get();
     stats.TxTcp = (u64)TxTcp.Get();

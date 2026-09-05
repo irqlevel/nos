@@ -1232,6 +1232,27 @@ public:
     u64 GetRxPackets() override { return RxPackets; }
     u64 GetRxDropped() override { return RxDropped; }
 
+    /* Was never implemented, so `net` reported zeros for this device on a
+       machine that had just forwarded thousands of packets. The receive
+       breakdown comes from the shared drain now; the totals are the bridge's
+       own. */
+    void GetStats(Kernel::NetStats& stats) override
+    {
+        stats.TxTotal = TxPackets;
+        stats.RxTotal = RxPackets;
+        stats.RxDrop = RxDropped + (u64)RxProtoDrop.Get();
+        stats.RxIcmp = (u64)RxProtoIcmp.Get();
+        stats.RxUdp = (u64)RxProtoUdp.Get();
+        stats.RxTcp = (u64)RxProtoTcp.Get();
+        stats.RxArp = (u64)RxProtoArp.Get();
+        stats.RxOther = (u64)RxProtoOther.Get();
+        stats.TxIcmp = 0;
+        stats.TxUdp = 0;
+        stats.TxTcp = 0;
+        stats.TxArp = 0;
+        stats.TxOther = 0;
+    }
+
     /* Called while TxQueueLock is held by base SubmitTx. */
     void FlushTx() override
     {
