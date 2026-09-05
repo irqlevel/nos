@@ -98,6 +98,9 @@ public:
 
     /* The queue this task should be on: the lightest one its affinity
        allows, or nullptr to say it is already on the right one. */
+    void SetIdle();
+    bool IsIdle();
+
     TaskQueue* SelectNextTaskQueue();
 
     static const long StateWaiting = 1;
@@ -105,6 +108,10 @@ public:
     static const long StateExited = 3;
 
     static const long FlagStoppingBit = 1;
+
+    /* The CPU's idle task. Marked so the scheduler can treat it as the last
+       resort it is, rather than as one more task to take a turn. */
+    static const long FlagIdleBit = 2;
 
 public:
     Stdlib::ListEntry ListEntry;

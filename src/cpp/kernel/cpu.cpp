@@ -677,6 +677,7 @@ bool Cpu::Run(Task::Func func, void *ctx)
     }
 
     IdleTaskPtr->SetCpuAffinity(1UL << Index);
+    IdleTaskPtr->SetIdle();
 
     return IdleTaskPtr->Run(TaskQueue, func, ctx);
 }

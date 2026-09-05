@@ -116,6 +116,7 @@ void TaskQueue::Switch(Task* next, Task* curr)
 Task* TaskQueue::SelectNext(Task *curr)
 {
     Task* next = nullptr;
+    Task* idle = nullptr;
 
     for (auto currEntry = TaskList.Flink;
         currEntry != &TaskList;
@@ -134,11 +135,25 @@ Task* TaskQueue::SelectNext(Task *curr)
         {
             continue;
         }
+
+        /* The idle task takes its turn only when there is no other turn to
+           take. It used to sit in this list as an equal, so a reschedule --
+           and every raise of a softirq from an interrupt handler forces one,
+           by way of the IPI -- could pick it over the task that had just
+           been given work. It then halted the CPU, and the work waited for
+           whatever interrupt came next. */
+        if (cand->IsIdle())
+        {
+            if (idle == nullptr)
+                idle = cand;
+            continue;
+        }
+
         next = cand;
         break;
     }
 
-    return next;
+    return (next != nullptr) ? next : idle;
 }
 
 void TaskQueue::Schedule(Task* curr)
