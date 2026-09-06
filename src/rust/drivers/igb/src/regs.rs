@@ -202,6 +202,27 @@ pub const SRRCTL_DROP_EN: u32 = 1 << 31;
 /* ---- RXDCTL / TXDCTL ---- */
 pub const XDCTL_QUEUE_ENABLE: u32 = 1 << 25;
 
+/* Descriptor prefetch thresholds, and the reason the enable bit cannot be
+   written on its own: these share the register, and zeroing them stops the
+   chip prefetching descriptors at all. PTHRESH is how few it may hold on the
+   die before it considers fetching more -- at zero the count would have to
+   fall below zero, so it never fetches, and packets are dropped with a full
+   ring in host memory. The values are the ones the part resets to, which is
+   what it was designed around. */
+pub const XDCTL_PTHRESH_SHIFT: u32 = 0;
+pub const XDCTL_HTHRESH_SHIFT: u32 = 8;
+pub const XDCTL_WTHRESH_SHIFT: u32 = 16;
+pub const XDCTL_THRESH_MASK: u32 =
+    (0x1F << XDCTL_PTHRESH_SHIFT) | (0x1F << XDCTL_HTHRESH_SHIFT) | (0x1F << XDCTL_WTHRESH_SHIFT);
+
+pub const XDCTL_PTHRESH: u32 = 12;
+pub const XDCTL_HTHRESH: u32 = 10;
+pub const XDCTL_WTHRESH: u32 = 1;
+
+pub const XDCTL_THRESH_DEFAULT: u32 = (XDCTL_PTHRESH << XDCTL_PTHRESH_SHIFT)
+    | (XDCTL_HTHRESH << XDCTL_HTHRESH_SHIFT)
+    | (XDCTL_WTHRESH << XDCTL_WTHRESH_SHIFT);
+
 /* ---- Receive address high ---- */
 pub const RAH_AV: u32 = 1 << 31; /* address valid */
 

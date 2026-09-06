@@ -586,8 +586,13 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
        here that a device reset does not clear, and it caps the receive rate
        on its own. */
     con.Printf("interrupt throttle %u us\n", (ulong)st.Eitr);
-    con.Printf("rxdctl 0x%p queue-en %u srrctl 0x%p\n", (ulong)st.Rxdctl,
-        (ulong)((st.Rxdctl & XdctlEnable) ? 1 : 0), (ulong)st.Srrctl);
+    /* The prefetch thresholds live in the low fields of RXDCTL. Zero there
+       means the chip never prefetches descriptors and drops packets with a
+       full ring, so they are worth reading back rather than assuming. */
+    con.Printf("rxdctl 0x%p queue-en %u (pthresh %u hthresh %u wthresh %u) srrctl 0x%p\n",
+        (ulong)st.Rxdctl, (ulong)((st.Rxdctl & XdctlEnable) ? 1 : 0),
+        (ulong)(st.Rxdctl & 0x1F), (ulong)((st.Rxdctl >> 8) & 0x1F),
+        (ulong)((st.Rxdctl >> 16) & 0x1F), (ulong)st.Srrctl);
     con.Printf("rx ring: rdh %u rdt %u  clean %u use %u\n",
         (ulong)st.Rdh, (ulong)st.Rdt, (ulong)st.NextToClean, (ulong)st.NextToUse);
     con.Printf("rx head: status 0x%p dd %u posted %u\n", (ulong)st.HeadStatus,
