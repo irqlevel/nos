@@ -14,14 +14,23 @@
  * `desc_unused` is what enforces it, and it is why the ring holds
  * RING_SIZE - 1 buffers rather than RING_SIZE. */
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 use kcore::dma::DmaBuffer;
 use kcore::net::{NetDeviceHandle, NetFrame};
 
 use crate::regs::*;
 
-/// Descriptors per ring. 256 * 16 bytes is exactly one page.
-pub const RING_SIZE: usize = 256;
+/// Descriptors per ring.
+///
+/// 1024 * 16 bytes is four pages, which the allocator hands out contiguously
+/// because it rounds to a power of two. Raised from 256 to find out whether
+/// ring depth has anything to do with the chip dropping packets while it owns
+/// every descriptor in the ring -- at 256 it dropped 408,000 a second with
+/// all 255 available, which is not the shape of a ring that is too short, but
+/// measuring beats arguing about it.
+pub const RING_SIZE: usize = 1024;
 pub const DESC_BYTES: usize = 16;
 pub const RING_PAGES: usize = (RING_SIZE * DESC_BYTES + 4095) / 4096;
 
@@ -59,7 +68,12 @@ struct Desc {
 pub struct RxRing {
     pub dma: DmaBuffer,
     /// Raw NetFrame handles, one per slot; 0 where a refill has not happened.
-    frames: [usize; RING_SIZE],
+    ///
+    /// Heap, not an inline array. Two of these inline is 16 KiB inside a
+    /// struct that Box::new builds on the stack before moving, and a kernel
+    /// stack is 32 KiB in total -- at RING_SIZE 1024 that is a double fault
+    /// during device init, which is how this was found.
+    frames: Vec<usize>,
     /// The slot the chip will complete next, from software's point of view.
     next_to_clean: usize,
     /// The slot to hand over next.
@@ -76,7 +90,7 @@ impl RxRing {
         unsafe { core::ptr::write_bytes(dma.as_mut_ptr(), 0, dma.len()) };
         Self {
             dma,
-            frames: [0usize; RING_SIZE],
+            frames: vec![0usize; RING_SIZE],
             next_to_clean: 0,
             next_to_use: 0,
             rdt_written: 0,
@@ -223,7 +237,7 @@ impl Drop for RxRing {
 
 pub struct TxRing {
     pub dma: DmaBuffer,
-    frames: [usize; RING_SIZE],
+    frames: Vec<usize>,
     next_to_use: usize,
     next_to_clean: usize,
 }
@@ -233,7 +247,7 @@ impl TxRing {
         unsafe { core::ptr::write_bytes(dma.as_mut_ptr(), 0, dma.len()) };
         Self {
             dma,
-            frames: [0usize; RING_SIZE],
+            frames: vec![0usize; RING_SIZE],
             next_to_use: 0,
             next_to_clean: 0,
         }
