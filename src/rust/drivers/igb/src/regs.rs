@@ -197,6 +197,11 @@ pub const SRRCTL_BSIZEPKT_SHIFT: u32 = 10;
 /* Advanced descriptors, one buffer per descriptor: the header-split modes
  * would hand back a frame in two pieces, which the net layer has no use for. */
 pub const SRRCTL_DESCTYPE_ADV_ONEBUF: u32 = 1 << 25;
+/* Drop a frame the moment the on-chip descriptor cache is empty, instead of
+ * holding it in the packet buffer until the next fetch from the ring. Meant
+ * for keeping one of several queues from stalling the others; on a single
+ * queue it turns every fetch latency into loss, so it is not set. Kept for
+ * the day there is a second queue. */
 pub const SRRCTL_DROP_EN: u32 = 1 << 31;
 
 /* ---- RXDCTL / TXDCTL ---- */
