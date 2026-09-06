@@ -12,9 +12,10 @@
  *  - TX: the C++ net stack calls flush_tx() under TxQueueLock. It reaps
  *    finished descriptors, drains the software queue into the ring and
  *    writes the tail once. Reaping never happens in the ISR.
- *  - RX: the ISR masks the receive sources and raises softirq TYPE_NET_RX;
- *    process_rx() then polls to a budget, hands frames up in one batch,
- *    refills, and re-arms only on its way out.
+ *  - RX: the ISR raises softirq TYPE_NET_RX and nothing else -- the chip
+ *    masks the vector and clears the cause by itself; process_rx() then
+ *    polls to a budget, hands frames up in one batch, refills, and re-arms
+ *    only on its way out.
  *  - One RX and one TX queue. The per-queue register blocks are strided, so
  *    more queues are a later change of arithmetic, not of structure.
  *
@@ -22,10 +23,12 @@
  * is no OWN bit, ownership is a pair of ring pointers, and the tail is a
  * register write.
  *
- * Interrupts are legacy INTx. This part offers MSI-X, but using it means
- * routing queues to vectors through the IVAR registers and driving the
- * extended EICR block, and none of that buys anything until there is more
- * than one queue to spread.
+ * Interrupts are MSI-X, two vectors: the queues on one, everything that is
+ * not a queue -- the link, in practice -- on the other. The split is what
+ * lets the ring's handler run without touching a register: link changes
+ * are the one cause that has to be read out of ICR, and they have their
+ * own vector to do it from. INTx is the fallback, with every cause read
+ * from ICR.
  *
  * Locking:
  *  - tx_ring is touched only by flush_tx, which the C++ TxQueueLock
@@ -119,6 +122,7 @@ const MAX_POLLS: u32 = 8;
 
 struct IgbDevice {
     _msix_irq: msix::MsixInterrupt,
+    _msix_irq_other: msix::MsixInterrupt,
     _msix_table: Option<msix::MsixTable>,
     _intx: interrupt::LegacyInterrupt,
     /// Whether causes arrive through the extended block rather than ICR/IMS.
@@ -143,10 +147,12 @@ struct IgbDevice {
 }
 
 impl IgbDevice {
-    /// Go quiet on receive for the duration of a poll.
+    /// Go quiet on receive. In MSI-X mode the chip masks the vector itself
+    /// when it fires; the poll still needs this for work that turns up
+    /// between re-arming and leaving.
     fn mask_rx(&self) {
         if self.msix {
-            self.regs.write32(EIMC, EICR_VECTOR0);
+            self.regs.write32(EIMC, EICR_RING);
         } else {
             self.regs.write32(IMC, RX_INTR_BITS);
         }
@@ -155,7 +161,7 @@ impl IgbDevice {
     /// Hand the ring back to the interrupt.
     fn arm_rx(&self) {
         if self.msix {
-            self.regs.write32(EIMS, EICR_VECTOR0);
+            self.regs.write32(EIMS, EICR_RING);
         } else {
             self.regs.write32(IMS, RX_INTR_BITS);
         }
@@ -1021,6 +1027,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
 
     let mut dev_box = Box::new(IgbDevice {
         _msix_irq: msix::MsixInterrupt::empty(),
+        _msix_irq_other: msix::MsixInterrupt::empty(),
         _msix_table: None,
         _intx: interrupt::LegacyInterrupt::empty(),
         msix: false,
@@ -1087,24 +1094,41 @@ fn attach_interrupt(
     dev_box: &mut Box<IgbDevice>,
     ctx_ptr: *mut u8,
 ) -> bool {
-    /* One vector for everything. The point of this part's 25 vectors is to
-     * give each queue its own, and there is one queue. */
+    /* Two vectors: the ring, and everything that is not a queue. Both or
+     * neither -- a ring vector that also carried link changes would have to
+     * read ICR to tell them apart, which is the round trip the split is
+     * there to avoid. The I210 has five entries, the 82576 ten. */
     if let Some(table) = msix::MsixTable::new(pci_dev) {
-        match msix::MsixInterrupt::register(&table, 0, igb_isr, ctx_ptr) {
-            Some(irq) => {
+        let ring = msix::MsixInterrupt::register(&table, MSIX_ENTRY_RING, igb_isr_ring, ctx_ptr);
+        let other = match ring {
+            Some(_) => {
+                msix::MsixInterrupt::register(&table, MSIX_ENTRY_OTHER, igb_isr_other, ctx_ptr)
+            }
+            None => None,
+        };
+        match (ring, other) {
+            (Some(ring), Some(other)) => {
                 trace!(
                     0,
-                    "igb: MSI-X vector={} ({} entries available)",
-                    irq.vector(),
+                    "igb: MSI-X vectors ring={} other={} ({} entries available)",
+                    ring.vector(),
+                    other.vector(),
                     table.table_size()
                 );
-                dev_box._msix_irq = irq;
+                dev_box._msix_irq = ring;
+                dev_box._msix_irq_other = other;
                 dev_box._msix_table = Some(table);
                 dev_box.msix = true;
                 return true;
             }
-            None => {
-                trace!(0, "igb: MSI-X entry 0 unavailable, falling back to INTx");
+            (ring, _) => {
+                trace!(
+                    0,
+                    "igb: MSI-X entry {} unavailable, falling back to INTx",
+                    if ring.is_some() { MSIX_ENTRY_OTHER } else { MSIX_ENTRY_RING }
+                );
+                /* `ring` and the table drop here, which unregisters the
+                 * handler and tears the table down before INTx is set up. */
             }
         }
     }
@@ -1117,7 +1141,7 @@ fn attach_interrupt(
         pci_dev.write_config16(PCI_COMMAND, cmd & !PCI_COMMAND_INTX_DISABLE);
     }
 
-    match interrupt::LegacyInterrupt::register_level(pci_dev, igb_isr, ctx_ptr) {
+    match interrupt::LegacyInterrupt::register_level(pci_dev, igb_isr_intx, ctx_ptr) {
         Some(irq) => {
             trace!(0, "igb: INTx vector={} (irq {})", irq.vector(), pci_dev.irq_line);
             dev_box._intx = irq;
@@ -1127,7 +1151,8 @@ fn attach_interrupt(
     }
 }
 
-/// Route every cause to MSI-X vector 0 and arm it.
+/// Route the queues to one MSI-X vector and everything else to another, and
+/// arm both.
 ///
 /// IVAR maps queues to vectors a byte apiece -- receive queue 0 in the low
 /// byte of IVAR0, transmit queue 0 in the next, everything that is not a
@@ -1153,23 +1178,88 @@ fn arm_msix(regs: &io::MmioRegion) {
         EITR_INTERVAL_US
     );
 
-    regs.write32(IVAR0, IVAR_VALID | (IVAR_VALID << 8));
-    regs.write32(IVAR_MISC, IVAR_VALID << 8);
+    let ring = MSIX_ENTRY_RING as u32 | IVAR_VALID;
+    let other = MSIX_ENTRY_OTHER as u32 | IVAR_VALID;
+    regs.write32(IVAR0, ring | (ring << 8));
+    regs.write32(IVAR_MISC, other << 8);
 
-    /* No auto-clear: the handler reads EICR, and having the hardware clear
-     * causes behind its back is how a driver loses an event it never saw. */
-    regs.write32(EIAC, 0);
-    regs.write32(EIAM, 0);
+    /* Auto-clear and auto-mask, both vectors: the cause bit drops when the
+     * message goes out, and the vector masks itself until whoever handles
+     * it writes EIMS. That is the whole of what the ring's handler does not
+     * have to do. An event cannot be lost to it: a cause that arrives while
+     * the vector is masked stays pending in EICR and fires on re-arm. This
+     * is the configuration the Linux driver runs the part in. */
+    regs.write32(EIAC, EICR_RING | EICR_OTHER);
+    regs.write32(EIAM, EICR_RING | EICR_OTHER);
 
-    /* Link changes still arrive through the legacy mask even in this mode. */
+    /* Link changes still arrive through the legacy mask even in this mode;
+     * IVAR_MISC decides which vector they land on. Nothing else is enabled
+     * there: an overrun would fire on every frame under load. */
     regs.write32(IMS, ICR_LSC);
-    regs.write32(EIMS, EICR_VECTOR0);
+    regs.write32(EIMS, EICR_RING | EICR_OTHER);
 }
 
 /* ================================================================== */
 /* Interrupt */
 
-extern "C" fn igb_isr(ctx: *mut u8) {
+/// The ring's vector. Nothing here touches the device: the cause bit went
+/// down when the message was sent and the vector masked itself, and the poll
+/// re-arms it on the way out. What this handler used to do -- read EICR,
+/// write it back, read ICR, write EIMC -- was four bus round trips per
+/// interrupt, two of them reads the CPU stands and waits for.
+extern "C" fn igb_isr_ring(ctx: *mut u8) {
+    if ctx.is_null() {
+        return;
+    }
+
+    /* Both queues share the vector, and without ICR there is no telling
+     * which one fired, so both softirqs run. The transmit pass is a lock and
+     * one DD check when there is nothing to reap, and it cannot be skipped:
+     * with the ring full and frames queued behind it, this interrupt is what
+     * drains them. Reaping itself stays in flush_tx, which the TX lock
+     * serialises; doing it here would race a flush_tx on another CPU. */
+    softirq::raise(softirq::TYPE_NET_TX);
+    softirq::raise(softirq::TYPE_NET_RX);
+}
+
+/// The other vector: everything that is not a queue, which is the link.
+/// These causes have to be read out of ICR to be cleared, and paying for
+/// that read here, on a vector that fires when the cable moves, is the
+/// reason the ring has a vector of its own.
+extern "C" fn igb_isr_other(ctx: *mut u8) {
+    let dev = ctx as *mut IgbDevice;
+    if dev.is_null() {
+        return;
+    }
+
+    unsafe {
+        let regs = &(*dev).regs;
+        let icr = regs.read32(ICR);
+
+        if icr & ICR_LSC != 0 {
+            (*dev).link_event.store(1, Ordering::Release);
+            /* Acted on at the top of the poll, not here: it wants the PHY
+             * semaphore and a handful of MDIO reads. */
+            softirq::raise(softirq::TYPE_NET_RX);
+        }
+
+        /* Not enabled in IMS, so this is seen only in passing, when the link
+         * changes while the receiver is being overrun. */
+        if icr & ICR_RXO != 0 {
+            let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                trace!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
+            }
+        }
+
+        /* Auto-masked when it fired. The causes were cleared by the read, so
+         * re-arming cannot land on a stale one. */
+        regs.write32(EIMS, EICR_OTHER);
+    }
+}
+
+/// The INTx fallback: one line, shared, every cause read out of ICR.
+extern "C" fn igb_isr_intx(ctx: *mut u8) {
     let dev = ctx as *mut IgbDevice;
     if dev.is_null() {
         return;
@@ -1178,35 +1268,17 @@ extern "C" fn igb_isr(ctx: *mut u8) {
     unsafe {
         let regs = &(*dev).regs;
 
-        /* In MSI-X mode the vector's own cause register says whether this
-         * interrupt is ours; the per-event detail still arrives in ICR. */
-        if (*dev).msix {
-            let eicr = regs.read32(EICR);
-            if eicr & EICR_VECTOR0 == 0 {
-                return;
-            }
-
-            /* Clear it by writing the bits back. EICR is documented as
-             * cleared on read only when GPIE.Multiple_MSIX is zero, and this
-             * driver sets that bit -- so a read alone leaves the cause
-             * standing and the interrupt re-asserts the moment it is armed
-             * again. Measured on an I210 before this line existed: 434
-             * million interrupts and 144 million poll rounds, with not one
-             * frame received. (333016 rev 3.7, section 8.8.3.) */
-            regs.write32(EICR, eicr);
-        }
-
         /* Reading the cause register clears it, so this is the only chance to
          * see these bits: everything they ask for has to be started here.
-         * A zero read means the line belongs to somebody else -- INTx is
-         * shared. */
+         * A zero read means the line belongs to somebody else. */
         let icr = regs.read32(ICR);
-        if icr == 0 && !(*dev).msix {
+        if icr == 0 {
             return;
         }
 
         if icr & ICR_LSC != 0 {
             (*dev).link_event.store(1, Ordering::Release);
+            softirq::raise(softirq::TYPE_NET_RX);
         }
 
         if icr & ICR_RXO != 0 {
@@ -1225,12 +1297,8 @@ extern "C" fn igb_isr(ctx: *mut u8) {
 
         /* Go quiet on receive and hand the ring to the poll. Unlike the
          * Realtek parts there is no edge to lose here: the causes are cleared
-         * by the reads above, so re-arming later cannot land on a stale one.
-         *
-         * On the single MSI-X vector every cause shares the interrupt, so the
-         * poll is entered whenever it fires; a harvest that finds nothing is
-         * cheap, and it is one fewer thing this register can lose. */
-        if (*dev).msix || icr & RX_INTR_BITS != 0 {
+         * by the read above, so re-arming later cannot land on a stale one. */
+        if icr & RX_INTR_BITS != 0 {
             (*dev).mask_rx();
             softirq::raise(softirq::TYPE_NET_RX);
         }
