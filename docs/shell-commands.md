@@ -13,6 +13,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `loglevel [N]` | Show or set the trace level (0-5) on a running kernel |
 | `uptime` | Show uptime |
 | `date` | Show wall clock date and time (RTC + boot time) |
+| `igbdump` | The igb chip's own state: MAC command/status registers, ring head and tail, receive statistics, and the PHY's view of the link — what it advertised, what the partner offered, both 1000BASE-T registers. What made the I210's 10 Mb/s latch diagnosable |
 | `nicdump` | The r8125's own state: command register (is the receiver still enabled?), interrupt status and mask, and whose the head receive descriptor is. For a machine that has stopped receiving and can still be typed at |
 | `netload [start [port] [sink]\|stop\|reset]` | UDP load target, so `profile` has something to look at other than an idle machine: echoes every datagram from the receive softirq (or drops it, in sink mode) and counts packets, bytes and rate per CPU. Drive it with `scripts/netload.py` (`--pps` to hold a rate, `--threads` to raise the ceiling) |
 | `stacks` | Stack high-water marks: every stack is filled with a pattern when it is created, and what is still intact is what it never reached. Catches a spike that lasted microseconds during boot, and costs nothing while the machine runs |
@@ -28,6 +29,8 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `disks` | List block devices |
 | `diskread <disk> <sector>` | Read and hex-dump a sector |
 | `diskwrite <disk> <sector> <hex>` | Write hex data to a sector |
+| `partitions <disk>` | Show the partition table (MBR or GPT) |
+| `disklog` | Kernel-log-to-disk state: the prepared area it found (if any), boot number, sectors written, lines dropped. The area is laid down under the host OS with `scripts/disklog.py format` and read back with `scripts/disklog.py read` |
 | `irqstat` | Show per-device interrupt counters |
 | `help` | List commands |
 | `net` | List network devices and per-protocol stats |

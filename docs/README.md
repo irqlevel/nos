@@ -3,7 +3,7 @@
 - [Features](features.md) — everything the kernel does today, by subsystem
 - [Build](build.md) — native and Docker builds, arm64, the disk image, BIOS vs. UEFI on the ISO
 - [Run](run.md) — QEMU on x86-64 (KVM, TCG, OVMF) and arm64 (HVF), Google Cloud
-- [Real hardware](real-hardware.md) — the Dell Latitude 5480 laptop and the Hetzner EX44 server
+- [Real hardware](real-hardware.md) — the Dell Latitude 5480 laptop and the Hetzner EX44 (Intel) and AX41 (AMD) servers
 - [Debug](debug.md) — GDB, boot tests and smoke tests, getting a log off a box with no serial port
 - [Kernel parameters](kernel-parameters.md) — `smp=`, `maxcpus=`, `console=`, `dhcp=`, `udpshell=`, `netconsole=`, `loglevel=`, …
 - [UDP remote shell](udp-shell.md) — run shell commands over the network with `scripts/udpsh.py`
