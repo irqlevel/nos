@@ -14,8 +14,8 @@
  *    writes the tail once. Reaping never happens in the ISR.
  *  - RX: the ISR raises softirq TYPE_NET_RX and nothing else -- the chip
  *    masks the vector and clears the cause by itself; process_rx() then
- *    polls to a budget, hands frames up in one batch, refills, and re-arms
- *    only on its way out.
+ *    polls to a budget, hands frames up in one batch, refills every
+ *    sixteen frames and on the way out, and re-arms only when it leaves.
  *  - One RX and one TX queue. The per-queue register blocks are strided, so
  *    more queues are a later change of arithmetic, not of structure.
  *
@@ -118,6 +118,14 @@ const SUPPORTED: [(u16, Generation); 10] = [
  * gives the CPU back through a softirq. The product bounds how long one
  * entry into process_rx can hold the CPU. */
 const RX_BUDGET: u32 = 64;
+
+/* Hand descriptors back to the chip every this many frames within a poll,
+ * not only at the end of it. The chip holds sixteen descriptors per queue
+ * on chip and fetches from the ring when that runs low; a tail written once
+ * per poll leaves it, for the length of the poll, with whatever it had
+ * prefetched. Linux writes the tail on the same cadence
+ * (IGB_RX_BUFFER_WRITE). */
+const RX_REFILL_BATCH: u32 = 16;
 const MAX_POLLS: u32 = 8;
 
 struct IgbDevice {
@@ -1392,6 +1400,13 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
                 if taken >= RX_BUDGET {
                     budget_hit = true;
                     break;
+                }
+
+                /* Before the harvest, not after it: the error path below
+                 * reposts its frame into the slot the harvest just freed,
+                 * and a refill in between would take that slot. */
+                if taken != 0 && taken % RX_REFILL_BATCH == 0 {
+                    refill_rx(dev);
                 }
 
                 let (mut frame, status, len) = match (*dev).rx_ring.harvest() {
