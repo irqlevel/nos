@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on one real machine — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels. See `README.md` for the full feature list and shell command reference, and `plans/README.md` for the roadmap (the long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor — stages 0–5, currently at the end of stage 2).
+`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on one real machine — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels. See `docs/features.md` for the full feature list, `docs/shell-commands.md` for the shell command reference (index in `docs/README.md`), and `plans/README.md` for the roadmap (the long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor — stages 0–5, currently at the end of stage 2).
 
 ## Build, run, test
 
@@ -109,7 +109,7 @@ Stack traces resolve symbols from a table baked into the kernel. The build links
 
 Boot flow (x86-64): `arch/x86_64/boot64.asm` (Multiboot2 entry, 32→64-bit transition, AP trampoline) → `kernel/main.cpp` `Main2` (BSP: paging, dmesg, page allocator, runs `Test()`) → `BpStartup` (interrupts, IOAPIC, timers, brings up APs via INIT/SIPI, starts SoftIrq/TCP/shell, prints `boot: complete`). APs enter via `ApMain` → `ApStartup`. On arm64 the equivalent path is `arch/arm64/boot.S` → `arch/arm64/main_arm64.cpp`, with PSCI `CPU_ON` for APs.
 
-Source layout (detailed in `README.md` "Project layout"):
+Source layout (detailed in `docs/project-layout.md`):
 
 - `src/cpp/hal/` — portable HAL contracts (cpu/atomics, semantic barriers, mmu+pte, irqchip, console, pci, power, Context, IRQ stub symbols); each header selects the arch backend at compile time
 - `src/cpp/arch/x86_64/` — everything x86-specific: Multiboot2 entry + AP trampoline (`boot64.asm`), CPU primitives (`asm.asm`, `asm.h`), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding (`pte.h`), GRUB parsing, HAL inline/impl backends. Only arch code, the documented exemptions (`kernel/main.cpp`, `kernel/cmd.cpp`, `kernel/irq_balance.cpp`) and x86-only drivers may include these headers
