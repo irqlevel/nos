@@ -332,8 +332,8 @@ fn stop_engines(regs: &io::MmioRegion) {
     let tctl = regs.read32(TCTL);
     regs.write32(TCTL, tctl & !TCTL_EN);
 
-    regs.write32(RXDCTL0, 0);
-    regs.write32(TXDCTL0, 0);
+    regs.write32(RXDCTL0, regs.read32(RXDCTL0) & !XDCTL_QUEUE_ENABLE);
+    regs.write32(TXDCTL0, regs.read32(TXDCTL0) & !XDCTL_QUEUE_ENABLE);
 
     /* Wait for the queues to say they have stopped, rather than assuming the
      * write took effect the moment it was posted. The enable bit reads back
@@ -931,7 +931,22 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     /* Descriptors must be visible before the engine that will read them. */
     kcore::barrier::dma_wmb();
 
-    regs.write32(RXDCTL0, XDCTL_QUEUE_ENABLE);
+    /* Read-modify-write, and not a bare enable bit. The other fields of this
+     * register are the descriptor prefetch thresholds, and they come out of
+     * reset with values the part was designed around -- PTHRESH 12, HTHRESH
+     * 10, WTHRESH 1. Writing the enable bit alone zeroes them, and PTHRESH at
+     * zero means the on-chip descriptor count must fall below zero before a
+     * prefetch is even considered, which it never does. The ring in host
+     * memory then stays full while the chip runs out of descriptors on the
+     * die and drops what arrives: measured at 443,000 packets a second
+     * discarded with all 255 descriptors sitting available.
+     *
+     * Written rather than preserved, because preserving is only as good as
+     * what was there: QEMU's model resets them to zero where the silicon
+     * resets them to 12/10/1, and a fix that depends on which is which is
+     * not a fix. */
+    let rxdctl = (regs.read32(RXDCTL0) & !XDCTL_THRESH_MASK) | XDCTL_THRESH_DEFAULT;
+    regs.write32(RXDCTL0, rxdctl | XDCTL_QUEUE_ENABLE);
     if !wait_for(100, 100, || regs.read32(RXDCTL0) & XDCTL_QUEUE_ENABLE != 0) {
         trace!(0, "igb: RX queue did not enable");
         stop_engines(&regs);
@@ -956,7 +971,9 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     regs.write32(TDH0, 0);
     regs.write32(TDT0, 0);
 
-    regs.write32(TXDCTL0, XDCTL_QUEUE_ENABLE);
+    /* Same register layout, same reason. */
+    let txdctl = (regs.read32(TXDCTL0) & !XDCTL_THRESH_MASK) | XDCTL_THRESH_DEFAULT;
+    regs.write32(TXDCTL0, txdctl | XDCTL_QUEUE_ENABLE);
     if !wait_for(100, 100, || regs.read32(TXDCTL0) & XDCTL_QUEUE_ENABLE != 0) {
         trace!(0, "igb: TX queue did not enable");
         stop_engines(&regs);
