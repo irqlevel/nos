@@ -683,15 +683,17 @@ fn resolve_link(regs: &io::MmioRegion, phy_addr: u32) -> Option<(u32, bool)> {
 
 /// Put the MAC on the speed the link actually settled at.
 ///
-/// Auto-speed detection is not a standing arrangement: the datasheet says the
-/// speed "is configured only once after the LINK signal is asserted by the
-/// PHY". A PHY that asserts link early -- before negotiation finishes -- and
-/// then resolves upward leaves the MAC latched at whatever it saw first.
-/// Measured on an I210 against a gigabit switch: the MAC ran at 10 Mb/s with
-/// both sides advertising 1000BASE-T full and no master/slave fault. A MAC
-/// clocked for 10 against a PHY running at 1000 receives nothing, which is
-/// exactly what a dead receive ring with a healthy link and a healthy filter
-/// looks like from the outside.
+/// Check that the MAC runs at the speed the PHY negotiated, and force it if
+/// not.
+///
+/// With ASDE and FRCSPD clear the MAC is meant to follow the PHY's own speed
+/// indication at every link-up, so this should find nothing to do; the
+/// trace line is the evidence either way. The forcing path is kept because
+/// the failure it covers is total and silent: a MAC clocked for 10 against
+/// a PHY running at 1000 receives nothing, which from the outside is a dead
+/// receive ring with a healthy link and a healthy filter. That was the I210
+/// under auto-speed detection, which samples the speed once, at the first
+/// LINK the PHY asserts, and never revisits it.
 ///
 /// Runs in task context, not from the interrupt: reading the PHY means
 /// polling MDIC, which is milliseconds.
@@ -714,7 +716,8 @@ fn sync_mac_speed(regs: &io::MmioRegion, phy_addr: u32) {
 
     let mut ctrl = regs.read32(CTRL);
     /* Forcing is only honoured with detection out of the way: CTRL.SPEED is
-     * documented as ignored while ASDE is set. */
+     * documented as ignored while ASDE is set. Once forced, the MAC stops
+     * following the PHY, so every later link change comes back through here. */
     ctrl = ctrl & !(CTRL_ASDE | CTRL_SPEED_MASK | CTRL_FD);
     ctrl = ctrl | CTRL_FRCSPD | CTRL_FRCDPLX;
     ctrl = ctrl | (speed << CTRL_SPEED_SHIFT);
@@ -725,7 +728,7 @@ fn sync_mac_speed(regs: &io::MmioRegion, phy_addr: u32) {
 
     trace!(
         0,
-        "igb: MAC was latched at speed {} duplex {}, link resolved to {} duplex {}; forced",
+        "igb: MAC did not follow the PHY: at speed {} duplex {}, PHY resolved {} duplex {}; forced",
         latched,
         if latched_full { 1 } else { 0 },
         speed,
@@ -890,6 +893,14 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
 
     /* --- Link. Ask the PHY to bring it up and auto-negotiate.
      *
+     * The MAC takes its speed and duplex from the internal PHY directly:
+     * the datasheet (3.7.4.4.2.2) wants ASDE and FRCSPD both clear for
+     * that, and then re-configures the MAC itself at every link-up the PHY
+     * reports. Auto-speed detection is the other mode, and the one this
+     * driver first used: it samples once, at the first LINK it sees, which
+     * on the I210 was 10 Mb/s from a PHY that went on to negotiate 1000.
+     * Linux clears the same three bits and never forces a copper link.
+     *
      * The master-disable bit set during reset is cleared here explicitly.
      * A device reset is supposed to clear it, but leaving that to the reset
      * means trusting it: the bit stops the chip mastering the bus at all, so
@@ -898,7 +909,8 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let ctrl = regs.read32(CTRL);
     regs.write32(
         CTRL,
-        (ctrl & !CTRL_GIO_MASTER_DISABLE) | CTRL_SLU | CTRL_ASDE,
+        (ctrl & !(CTRL_GIO_MASTER_DISABLE | CTRL_ASDE | CTRL_FRCSPD | CTRL_FRCDPLX))
+            | CTRL_SLU,
     );
 
     let phy_addr = phy_address(&regs, generation);
@@ -1014,7 +1026,10 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
         msix: false,
         generation,
         phy_addr,
-        link_event: AtomicU32::new(0),
+        /* Set, so the first poll compares the MAC against the PHY once even
+         * if no link change ever comes: the LINK that came up during init was
+         * acknowledged and cleared before the interrupt was armed. */
+        link_event: AtomicU32::new(1),
         tx_ring,
         rx_ring,
         net_handle: net::NetDeviceHandle::placeholder(),

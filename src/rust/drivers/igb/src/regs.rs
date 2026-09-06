@@ -125,13 +125,16 @@ pub const CTRL_ASDE: u32 = 1 << 5; /* auto-speed detection */
 pub const CTRL_SLU: u32 = 1 << 6; /* set link up */
 pub const CTRL_RST: u32 = 1 << 26;
 
-/* Speed the MAC runs at. Ignored while ASDE is on, which is the trap this
-   driver fell into: auto-speed detection latches the speed once, at the first
-   LINK the PHY asserts, and never revisits it. A PHY that asserts link early
-   and then negotiates up leaves the MAC behind at whatever it saw first. */
+/* Speed the MAC runs at. There are three ways to set it, and the datasheet
+   (3.7.4.4.2.2) is clear about which one an internal PHY wants: with ASDE
+   and FRCSPD both clear, the MAC takes speed and duplex straight from the
+   PHY at every link-up. ASDE is the trap this driver fell into -- it samples
+   once, at the first LINK the PHY asserts, and never revisits, so a PHY
+   that asserts link early and negotiates up leaves the MAC behind. FRCSPD
+   and FRCDPLX override both with the CTRL fields; kept as the fallback. */
 pub const CTRL_SPEED_SHIFT: u32 = 8;
 pub const CTRL_SPEED_MASK: u32 = 3 << CTRL_SPEED_SHIFT;
-pub const CTRL_FRCSPD: u32 = 1 << 11; /* take the speed from CTRL, not ASD */
+pub const CTRL_FRCSPD: u32 = 1 << 11; /* take the speed from CTRL, not the PHY */
 pub const CTRL_FRCDPLX: u32 = 1 << 12; /* take the duplex from CTRL.FD */
 
 /* ---- STATUS bits ---- */
