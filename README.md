@@ -371,7 +371,7 @@ it on a network you trust.
 |---------|-------------|
 | `cls` | Clear screen |
 | `cpu` | Dump CPU state |
-| `lscpu` | Identify the CPU and report the features the kernel depends on (1 GiB pages, NX, PAT, invariant TSC, ARAT, architectural perfmon) |
+| `lscpu` | Identify the CPU and report the features the kernel depends on (1 GiB pages, NX, PAT, invariant TSC, ARAT), the performance counters it has (Intel architectural perfmon, or AMD core counters and PerfMonV2), and which of them `profile` will actually sample with |
 | `dmesg [lines] [filter]` | Dump kernel log: newest `lines` messages (all of it if omitted), optional substring filter |
 | `loglevel [N]` | Show or set the trace level (0-5) on a running kernel |
 | `uptime` | Show uptime |
@@ -381,7 +381,7 @@ it on a network you trust.
 | `stacks` | Stack high-water marks: every stack is filled with a pattern when it is created, and what is still intact is what it never reached. Catches a spike that lasted microseconds during boot, and costs nothing while the machine runs |
 | `ps` | Show tasks |
 | `top [ms]` | Per-task CPU use over a sampling window, percent per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%), plus the number of tasks moved between CPU queues since boot |
-| `profile [ms] [pid\|all] [chains]` | Sampling profiler: where the kernel spends its time, as whole call chains -- samples are folded by their entire stack, not by the leaf symbol, and the hottest chains are printed in full. `chains` caps how many, for a console with no scrollback -- `profile 2000 all 3` fits a screen where the default does not. Every frame carries its offset: the leaf as the instruction the sample landed on (a span when they spread across the body, so a hot spinlock says whether it sat on the exchange or in the pause loop), each caller as the return address that names which call site led there. Samples on a performance counter overflowing into an NMI (~1 kHz, and catches code running with interrupts off) where the CPU has architectural perfmon; falls back to the 100 Hz per-CPU tick where it does not. The report names which |
+| `profile [ms] [pid\|all] [chains]` | Sampling profiler: where the kernel spends its time, as whole call chains -- samples are folded by their entire stack, not by the leaf symbol, and the hottest chains are printed in full. `chains` caps how many, for a console with no scrollback -- `profile 2000 all 3` fits a screen where the default does not. Every frame carries its offset: the leaf as the instruction the sample landed on (a span when they spread across the body, so a hot spinlock says whether it sat on the exchange or in the pause loop), each caller as the return address that names which call site led there. Samples on a performance counter overflowing into an NMI (~1 kHz, and catches code running with interrupts off) where the CPU has one -- Intel's architectural fixed counter 1, or AMD's PMCx076 on family 15h and later, both counting unhalted core cycles; falls back to the 100 Hz per-CPU tick where it does not, which includes any machine whose hypervisor answers CPUID for a PMU it declines to virtualise (the counter is asked to prove it counts before the profiler trusts it). The report names which |
 | `bt <pid>` | Dump stack trace of a task (uses IPI for remote CPUs) |
 | `watchdog` | Watchdog stats: locks watched, table walks, and the slice of the bucket table each CPU walks (the table is divided among the CPUs, so a bucket is visited once per tick rather than once per tick per CPU) |
 | `memusage` | Show memory usage |

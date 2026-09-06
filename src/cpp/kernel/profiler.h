@@ -19,13 +19,18 @@ namespace Kernel
    because the whole kernel is built with -fno-omit-frame-pointer. What is
    left is to take a sample on each tick and count them up.
  
-   Samples come from one of two places. Where the hardware has architectural
-   performance counters, a cycle counter is set to overflow into an NMI about
+   Samples come from one of two places. Where the hardware has a usable
+   performance counter -- Intel's fixed counter 1 or AMD's PMCx076, both
+   counting unhalted core cycles -- it is set to overflow into an NMI about
    every millisecond: ten times the tick rate, and -- because it arrives as
    an NMI -- it also samples code running with interrupts disabled, which a
    tick by construction never catches. Everywhere else the tick itself takes
    the sample, at 100 Hz per CPU: enough to find a hot function, not enough
-   to show its shape. Report() says which of the two produced the numbers.
+   to show its shape. Report() names the counter the numbers came off.
+
+   The two differ in one way worth knowing before reading a report: the
+   counter counts unhalted cycles, so an idle CPU contributes nothing at all,
+   where the tick would have filled the profile with `Hlt`.
  
    Each CPU writes only its own buffer, from its own interrupt, with
    interrupts already off -- so there is no lock here and nothing to contend
@@ -107,6 +112,7 @@ private:
 
     /* Set at Start from CPUID; read by every tick. */
     volatile bool UsePmu;
+
     bool Allocated;
 
     PerCpu Cpu_[MaxCpus];
