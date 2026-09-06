@@ -63,6 +63,15 @@ static RX_POLLS: AtomicU64 = AtomicU64::new(0);
 static RX_BUDGET_HITS: AtomicU64 = AtomicU64::new(0);
 static RX_ERR_EVENTS: AtomicU64 = AtomicU64::new(0);
 
+/* The chip's own statistics, accumulated because the registers are
+   read-clear. Sampled whenever the state is dumped, which is often enough:
+   they are 32-bit and would need hours at line rate to wrap. */
+static STAT_TPR: AtomicU64 = AtomicU64::new(0);
+static STAT_GPRC: AtomicU64 = AtomicU64::new(0);
+static STAT_MPC: AtomicU64 = AtomicU64::new(0);
+static STAT_RNBC: AtomicU64 = AtomicU64::new(0);
+static STAT_RXERRC: AtomicU64 = AtomicU64::new(0);
+
 /* The register window. 128 KiB, which reaches the NVM block at 0x12010 as
  * well as the queue and interrupt blocks far below it. The card's BAR is
  * larger still -- 512 KiB on the I210 -- but nothing above here is touched. */
@@ -1412,6 +1421,11 @@ pub struct IgbState {
     pub tctl: u32,
     pub ims: u32,
     pub eitr: u32,
+    pub stat_tpr: u64,
+    pub stat_gprc: u64,
+    pub stat_mpc: u64,
+    pub stat_rnbc: u64,
+    pub stat_rxerrc: u64,
     pub rxdctl: u32,
     pub srrctl: u32,
     pub rdh: u32,
@@ -1428,6 +1442,11 @@ pub struct IgbState {
     pub rx_packets: u64,
     pub rx_dropped: u64,
     pub tx_packets: u64,
+}
+
+/// Add a read-clear register's delta to its running total and return it.
+fn accumulate(total: &AtomicU64, delta: u32) -> u64 {
+    total.fetch_add(delta as u64, Ordering::Relaxed) + delta as u64
 }
 
 #[no_mangle]
@@ -1478,6 +1497,13 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
         (*out).tctl = regs.read32(TCTL);
         (*out).ims = regs.read32(IMS);
         (*out).eitr = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
+
+        /* Read-clear, so each read is a delta and has to be added on. */
+        (*out).stat_tpr = accumulate(&STAT_TPR, regs.read32(TPR));
+        (*out).stat_gprc = accumulate(&STAT_GPRC, regs.read32(GPRC));
+        (*out).stat_mpc = accumulate(&STAT_MPC, regs.read32(MPC));
+        (*out).stat_rnbc = accumulate(&STAT_RNBC, regs.read32(RNBC));
+        (*out).stat_rxerrc = accumulate(&STAT_RXERRC, regs.read32(RXERRC));
         (*out).rxdctl = regs.read32(RXDCTL0);
         (*out).srrctl = regs.read32(SRRCTL0);
         (*out).rdh = regs.read32(RDH0);

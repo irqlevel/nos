@@ -85,6 +85,19 @@ pub const TDH0: usize = 0x0E010;
 pub const TDT0: usize = 0x0E018;
 pub const TXDCTL0: usize = 0x0E028;
 
+/* ---- Statistics ----
+ *
+ * All read-clear: reading one zeroes it, so they have to be accumulated in
+ * software rather than sampled. They are the only way to tell a NIC that is
+ * not being offered packets from one that is throwing them away -- the
+ * descriptor ring's own counters cannot see a frame the MAC dropped before it
+ * ever reached for a descriptor. */
+pub const RXERRC: usize = 0x0400C; /* receive errors */
+pub const MPC: usize = 0x04010; /* missed: no room in the receive FIFO */
+pub const GPRC: usize = 0x04074; /* good packets received */
+pub const RNBC: usize = 0x040A0; /* no descriptor was available */
+pub const TPR: usize = 0x040D0; /* everything the MAC took off the wire */
+
 /* ---- Receive address filter ---- */
 pub const RAL0: usize = 0x05400;
 pub const RAH0: usize = 0x05404;
