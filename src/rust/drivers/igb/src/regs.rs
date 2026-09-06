@@ -187,6 +187,8 @@ pub const EEC_AUTO_RD: u32 = 1 << 9;
  * the wrong address gets a bus with nothing on it rather than an error. */
 pub const MDICNFG: usize = 0x00E04;
 pub const MDICNFG_PHY_MASK: u32 = 0x1F << 21;
+/* Clear means every MDIC access goes to the integrated PHY. */
+pub const MDICNFG_DESTINATION: u32 = 1 << 30;
 pub const MDICNFG_PHY_SHIFT: u32 = 21;
 
 /* ---- Software/firmware semaphore (I210) ----
@@ -227,12 +229,37 @@ pub const MDIC_OP_READ: u32 = 2 << 26;
 pub const MDIC_READY: u32 = 1 << 28;
 pub const MDIC_ERROR: u32 = 1 << 30;
 
-/* The integrated copper PHY sits at MDI address 1 on every part here. */
+/* The address written into MDIC. It does not actually select anything on a
+   copper part: with MDICNFG.destination clear every access goes to the
+   integrated PHY and, in the datasheet's words, "the PHY address is ignored".
+   MDICNFG.PHYADD is the address of an *external* PHY on an SGMII or SerDes
+   board. One is what the older parts hard-wire, so it is what goes in the
+   field. (333016 rev 3.7, section 3.7.2.2.) */
 pub const PHY_ADDR_INTERNAL: u32 = 1;
 
 /* Standard MII registers, which is all this driver needs: no vendor pages. */
 pub const PHY_BMCR: u32 = 0; /* basic mode control */
 pub const PHY_BMSR: u32 = 1; /* basic mode status */
+pub const PHY_ANAR: u32 = 4; /* auto-negotiation advertisement */
+pub const PHY_GCTL: u32 = 9; /* 1000BASE-T control */
+
+/* What to offer the link partner. Without these the PHY negotiates on
+   whatever its advertisement registers happen to hold, which on this part
+   settled at 10 Mbit -- a gigabit port and a gigabit PHY agreeing on 10BASE-T
+   because nobody said otherwise. */
+pub const ANAR_SELECTOR_802_3: u16 = 0x0001;
+pub const ANAR_10_HALF: u16 = 1 << 5;
+pub const ANAR_10_FULL: u16 = 1 << 6;
+pub const ANAR_100_HALF: u16 = 1 << 7;
+pub const ANAR_100_FULL: u16 = 1 << 8;
+pub const ANAR_ADVERTISE_ALL: u16 = ANAR_SELECTOR_802_3
+    | ANAR_10_HALF
+    | ANAR_10_FULL
+    | ANAR_100_HALF
+    | ANAR_100_FULL;
+
+pub const GCTL_1000_HALF: u16 = 1 << 8;
+pub const GCTL_1000_FULL: u16 = 1 << 9;
 
 pub const BMCR_RESET: u16 = 1 << 15;
 pub const BMCR_ANENABLE: u16 = 1 << 12;
