@@ -14,6 +14,7 @@
 #include <hal/console.h>
 
 #include <net/netconsole.h>
+#include "disklog.h"
 
 namespace Kernel
 {
@@ -208,6 +209,7 @@ void Panicker::DoPanic(const char *fmt, ...)
            already has the whole report, so a TX path that turns out to be
            wedged costs nothing that was still needed. */
         Netconsole::GetInstance().PanicFlush();
+        DiskLog::GetInstance().PanicFlush();
     }
 
     for (;;)
@@ -255,6 +257,7 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
            already has the whole report, so a TX path that turns out to be
            wedged costs nothing that was still needed. */
         Netconsole::GetInstance().PanicFlush();
+        DiskLog::GetInstance().PanicFlush();
     }
 
     for (;;)

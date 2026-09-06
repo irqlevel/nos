@@ -4,6 +4,7 @@
 
 #include <hal/console.h>
 #include <net/netconsole.h>
+#include "disklog.h"
 
 namespace Kernel
 {
@@ -55,6 +56,11 @@ void Tracer::Output(const char *fmt, ...)
     /* Capture is a memcpy into a ring buffer -- the send happens later, on the
        netconsole task, so this stays safe in IRQ context. */
     Netconsole::GetInstance().Log(msg);
+
+    /* And to the disk area, if one was prepared. Unlike the netconsole this
+       writes now, synchronously: it exists for the boot that stops before
+       there is a task to drain anything. */
+    DiskLog::GetInstance().Log(msg);
 
     if (!ConsoleSuppressed)
     {

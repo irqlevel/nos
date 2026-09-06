@@ -119,6 +119,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/tsc.cpp \
     src/cpp/kernel/spin_lock.cpp \
     src/cpp/kernel/watchdog.cpp \
+    src/cpp/kernel/disklog.cpp \
     src/cpp/kernel/object_table.cpp \
     src/cpp/kernel/parameters.cpp \
     src/cpp/kernel/raw_spin_lock.cpp \
@@ -183,6 +184,7 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/preempt.cpp \
     src/cpp/kernel/parameters.cpp \
     src/cpp/kernel/watchdog.cpp \
+    src/cpp/kernel/disklog.cpp \
     src/cpp/kernel/task.cpp \
     src/cpp/kernel/sched.cpp \
     src/cpp/kernel/cpu.cpp \

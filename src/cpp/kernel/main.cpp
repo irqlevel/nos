@@ -16,6 +16,7 @@
 #include "preempt.h"
 #include "dmesg.h"
 #include "watchdog.h"
+#include "disklog.h"
 #include "parameters.h"
 #include "console.h"
 #include "input.h"
@@ -656,6 +657,16 @@ void BpStartup(void* ctx)
             Panic("Can't init softirq");
             return;
         }
+
+        /* Here, and not earlier: a block request is completed through the
+           BLK_IO soft IRQ, so until the line above a read returns without
+           having read anything. Everything traced since the first line of the
+           boot has been held in memory and goes down as soon as the area is
+           found, so the log on disk is whole from the beginning -- but a
+           machine that stops before this point leaves nothing, because
+           nothing can be written yet. Closing that gap means a polled
+           completion path in the NVMe driver. */
+        DiskLog::GetInstance().Setup();
 
         Tcp::GetInstance().Init();
 
