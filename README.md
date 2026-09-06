@@ -2,7 +2,7 @@
 
 A hobby operating system kernel for x86-64 and arm64 (aarch64), written in C++20, Rust, and assembly.
 Code is partially written by AI models (Claude, GPT) with human control over architecture decisions, testing, and code review.
-Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices), and on QEMU `virt` with HVF acceleration on Apple Silicon for the arm64 build. On x86-64 it boots under both legacy BIOS and UEFI. It also runs on real hardware — a laptop and a dedicated server, see [Real hardware](docs/real-hardware.md) — though only those two machines have been tried, so anything beyond them is untested.
+Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices), and on QEMU `virt` with HVF acceleration on Apple Silicon for the arm64 build. On x86-64 it boots under both legacy BIOS and UEFI. It also runs on real hardware — a laptop and two dedicated servers, one Intel and one AMD, see [Real hardware](docs/real-hardware.md) — though only those three machines have been tried, so anything beyond them is untested.
 
 #### Highlights
 
@@ -40,7 +40,7 @@ deployment in [Run](docs/run.md).
 - [Features](docs/features.md) — everything the kernel does today, by subsystem
 - [Build](docs/build.md) — native and Docker builds, arm64, the disk image, BIOS vs. UEFI
 - [Run](docs/run.md) — QEMU on x86-64 and arm64, Google Cloud
-- [Real hardware](docs/real-hardware.md) — Dell Latitude 5480 (UEFI, no serial, USB keyboard) and Hetzner EX44 (20 CPUs, RTL8125 on the real internet)
+- [Real hardware](docs/real-hardware.md) — Dell Latitude 5480 (UEFI, no serial, USB keyboard), Hetzner EX44 (20 CPUs, RTL8125 on the real internet) and Hetzner AX41 (AMD Ryzen, Intel I210, profiler on the PMU)
 - [Debug](docs/debug.md) — GDB, boot and smoke tests, getting a log off a box with no serial port
 - [Kernel parameters](docs/kernel-parameters.md) — boot-time options via GRUB or QEMU `-append`
 - [UDP remote shell](docs/udp-shell.md) — `udpshell=PORT` + `scripts/udpsh.py`

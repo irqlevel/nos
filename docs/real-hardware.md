@@ -1,8 +1,8 @@
 # Real hardware
 
-`nos` boots on bare metal. Two machines so far, and they pull in opposite
-directions: a laptop whose only console is its own screen, and a dedicated
-server whose only console is the network.
+`nos` boots on bare metal. Three machines so far, and they pull in opposite
+directions: a laptop whose only console is its own screen, and two dedicated
+servers — one Intel, one AMD — whose only console is the network.
 
 ## Dell Latitude 5480
 
@@ -62,5 +62,74 @@ boot log — self-tests, AP bring-up, xHCI enumeration, DHCP — went out over U
 to `scripts/netconsole.py` as it was produced. xHCI also came up on that board:
 26 root ports, three hubs, and a USB keyboard enumerated behind one of them.
 
+## Hetzner AX41-1-LTD dedicated server
+
+A **Hetzner AX41-1-LTD** (AMD Ryzen 5 3600 — Zen 2, family 17h, 6 cores /
+12 threads) booted from its NVMe under GRUB, dual-booting with Ubuntu. It is
+the first AMD machine the kernel has run on; the only vendor check in the
+tree is the Intel TCO watchdog, which declines politely, and nothing else
+noticed the change. Like the EX44 it has no serial port and no IPMI, and
+unlike the EX44 its only NIC is an **Intel I210** (`8086:1533`), so the
+driver being brought up was also the only channel there was to report
+through.
+
+**Network.** The Rust **igb** driver (`drivers/igb`, developed against QEMU's
+82576 model) brings up the I210: DHCP takes an address, ARP and TCP flow, and
+the [UDP shell](udp-shell.md) and [netconsole](netconsole.md) are reachable
+across the internet. The I210 wanted four things the 82576 never did, and
+only the last of them was the actual fault:
+
+- Its PHY is shared with the manageability firmware, so every MDIO access
+  claims it through `SW_FW_SYNC` behind the `SWSM` hardware mutex — two
+  masters on one MDIO bus produce reads that look like data.
+- In MSI-X mode `EICR` is not cleared on read; the cause has to be written
+  back, or the interrupt re-asserts forever (434 million interrupts and zero
+  frames, measured).
+- The PHY is reset and its advertisements written before negotiation is
+  restarted; firmware leaves it in an arbitrary state, possibly on a
+  non-zero register page.
+- Auto-speed detection is a latch: the MAC takes its speed once, when the
+  PHY first asserts link, and this PHY asserted link early at 10 Mb/s before
+  resolving to 1000. A MAC clocked for 10 against a PHY at 1000 receives
+  nothing while link, receiver, queue, descriptors and filter all read
+  healthy, which is why it took four rounds to find. Per the datasheet the
+  MAC now follows the PHY (`ASDE` and `FRCSPD` clear), and `igbdump` prints
+  the PHY's own view — what each side advertised and what negotiation
+  resolved to.
+
+Under a 613 k pps flood the I210 delivers about 205 k; the rest is dropped by
+the chip's on-chip descriptor fetch/writeback pipeline (a 16-descriptor
+cache per queue), not by the ring or the driver. `SRRCTL.Drop_En` stays set
+even with a single queue: clearing it moved the drops into the 34 KiB packet
+FIFO and halved delivery.
+
+**Profiler.** `profile` samples on the AMD core performance counters here:
+general counter 0 programmed with PMCx076 ("CPU clocks not halted") through
+the six-counter core extension MSRs, overflowing into an NMI at ~1 kHz. Zen 2
+has no PerfMonV2, so there is no global status register and an overflow is
+recognised by the counter's sign bit going clear; the extra NMI AMD delivers
+after each overflow is absorbed, one per sample, and `lscpu` reports how
+many. TCG refuses to expose `perfctr-core` at all, so this box is the only
+place the arming path has ever run — everything before it was the CPUID
+gate declining.
+
+**Diagnostics.** With no serial port and the NIC itself under bring-up, the
+boot log had nowhere to go, which is what `disklog` is for: every traced
+line is written synchronously to a raw partition set aside for it, from the
+first line of boot, straight from the tracer with no task in between (a
+drain task would not exist yet where a bring-up hang happens). Under Ubuntu
+`scripts/disklog.py format` lays a header on that partition and the kernel
+writes only where it finds the header intact; after the next Ubuntu boot
+`scripts/disklog.py read` prints the log back. Finding the area is what
+brought GPT support and a second partition probe after the Rust NVMe driver
+registers its disks. `scripts/nosboot` builds, installs the kernel, arms one
+boot of `nos` and reboots. It does not use `grub-reboot`: `/boot` is ext3 on
+an mdadm mirror, which GRUB can read but not write, so `next_entry` never
+clears and `nos` boots every time — on a box with no console that is one you
+do not get back, and how this machine spent an afternoon. The one-shot flag
+lives on a plain partition GRUB can write, read and cleared by a
+`/etc/grub.d` snippet before the menu, so a hang plus a hardware reset comes
+back to Ubuntu.
+
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
-as "works on the two machines it was debugged on".
+as "works on the three machines it was debugged on".
