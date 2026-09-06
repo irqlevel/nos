@@ -24,13 +24,12 @@ use crate::regs::*;
 
 /// Descriptors per ring.
 ///
-/// 1024 * 16 bytes is four pages, which the allocator hands out contiguously
-/// because it rounds to a power of two. Raised from 256 to find out whether
-/// ring depth has anything to do with the chip dropping packets while it owns
-/// every descriptor in the ring -- at 256 it dropped 408,000 a second with
-/// all 255 available, which is not the shape of a ring that is too short, but
-/// measuring beats arguing about it.
-pub const RING_SIZE: usize = 1024;
+/// 256, which is what Linux's igb uses for both directions on every part in
+/// the family (IGB_DEFAULT_RXD, against a maximum of 4096). It drives an I210
+/// at line rate on that, so ring depth is not what stands between this driver
+/// and the same -- raising it to 1024 was tried and told us only that the
+/// shadow arrays did not belong on the stack.
+pub const RING_SIZE: usize = 256;
 pub const DESC_BYTES: usize = 16;
 pub const RING_PAGES: usize = (RING_SIZE * DESC_BYTES + 4095) / 4096;
 
