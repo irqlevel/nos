@@ -170,6 +170,29 @@ pub const TXD_DCMD_DEXT: u32 = 1 << 29; /* descriptor extension: advanced */
 pub const TXD_PAYLEN_SHIFT: u32 = 14;
 pub const TXD_STAT_DD: u32 = 1 << 0;
 
+/* ---- Software/firmware semaphore (I210) ----
+ *
+ * The 82576 hands the PHY to whoever asks. On the I210 the manageability
+ * firmware shares the same MDIO bus, and both sides are expected to take a
+ * semaphore before touching it. Two levels: a hardware mutex in SWSM that
+ * arbitrates access to SW_FW_SYNC, and a bit in SW_FW_SYNC itself claiming
+ * the resource -- software in the low half of the word, firmware in the
+ * high. */
+pub const SWSM: usize = 0x05B50;
+pub const SW_FW_SYNC: usize = 0x05B5C;
+
+pub const SWSM_SMBI: u32 = 1 << 0; /* the hardware mutex itself */
+pub const SWSM_SWESMBI: u32 = 1 << 1; /* software's claim on it */
+
+pub const SWFW_PHY0_SM: u32 = 1 << 1;
+pub const SWFW_FW_SHIFT: u32 = 16;
+
+/* ---- CTRL_EXT bits ---- */
+/* Which interface the MAC talks to. Zero is the integrated copper PHY, which
+ * is what both parts here have; the others select SGMII and SERDES. */
+pub const CTRL_EXT_LINK_MODE_MASK: u32 = 3 << 22;
+pub const CTRL_EXT_LINK_MODE_INTERNAL: u32 = 0 << 22;
+
 /* ---- PHY access through the MDI control register ----
  *
  * The link does not come up on its own. Both the silicon and the QEMU model
@@ -207,9 +230,20 @@ pub const PCI_VENDOR_INTEL: u16 = 0x8086;
 pub const PCI_COMMAND: u16 = 0x04;
 pub const PCI_COMMAND_INTX_DISABLE: u16 = 1 << 10;
 
-/* The parts this driver claims. 82576 is what QEMU emulates and is where
- * this was developed; I210 is the one on real hardware. They share the
- * register map this file describes. */
+/* The parts this driver claims.
+ *
+ * 82576 is what QEMU emulates and where this was developed. The I210 family
+ * is what is on real hardware -- 0x1533 is the copper part on the AMD box.
+ * They share the register map this file describes; where they diverge, the
+ * driver splits on Generation rather than on the individual id. */
 pub const PCI_DEVICE_82576: u16 = 0x10C9;
-pub const PCI_DEVICE_I210: u16 = 0x1533;
-pub const SUPPORTED_DEVICES: [u16; 2] = [PCI_DEVICE_82576, PCI_DEVICE_I210];
+pub const PCI_DEVICE_82576_QUAD: u16 = 0x10E8;
+pub const PCI_DEVICE_82576_NS: u16 = 0x150A;
+
+pub const PCI_DEVICE_I210_COPPER: u16 = 0x1533;
+pub const PCI_DEVICE_I210_FIBER: u16 = 0x1536;
+pub const PCI_DEVICE_I210_SERDES: u16 = 0x1537;
+pub const PCI_DEVICE_I210_SGMII: u16 = 0x1538;
+pub const PCI_DEVICE_I210_COPPER_FLASHLESS: u16 = 0x157B;
+pub const PCI_DEVICE_I210_SERDES_FLASHLESS: u16 = 0x157C;
+pub const PCI_DEVICE_I211_COPPER: u16 = 0x1539;
