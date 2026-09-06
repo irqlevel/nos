@@ -1,7 +1,9 @@
 # Project layout
 
-Where things live in the tree. The architecture notes in `CLAUDE.md` describe
-the boot flow and the conventions; the roadmap is in `plans/README.md`.
+Where things live in the tree. How the pieces work is in [Boot](boot.md),
+[Paging and memory](paging.md), [Scheduler](scheduler.md),
+[Interrupts](interrupts.md) and [Profiler](profiler.md); the conventions are
+in `CLAUDE.md` and the roadmap in `plans/README.md`.
 
 ```
 src/cpp/

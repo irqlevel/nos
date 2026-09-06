@@ -43,6 +43,17 @@ deployment in [Run](docs/run.md).
 - [Real hardware](docs/real-hardware.md) — Dell Latitude 5480 (UEFI, no serial, USB keyboard), Hetzner EX44 (20 CPUs, RTL8125 on the real internet) and Hetzner AX41 (AMD Ryzen, Intel I210, profiler on the PMU)
 - [Debug](docs/debug.md) — GDB, boot and smoke tests, getting a log off a box with no serial port
 - [Kernel parameters](docs/kernel-parameters.md) — boot-time options via GRUB or QEMU `-append`
+
+How it works, by subsystem:
+
+- [Boot](docs/boot.md) — GRUB/Multiboot2 and the Linux `Image` protocol to `boot: complete`, on both architectures, and how the APs come up
+- [Paging and memory](docs/paging.md) — the bootstrap linear map, the real page table, the free list, the allocators, MMIO and W^X, TLB shootdown
+- [Scheduler](docs/scheduler.md) — per-CPU run queues, the context switch, preemption, blocking and load balancing
+- [Interrupts](docs/interrupts.md) — the IDT and IOAPIC, MSI-X, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
+- [Profiler](docs/profiler.md) — sampling on a performance counter or the tick, and how to read a `profile` report
+
+Tools:
+
 - [UDP remote shell](docs/udp-shell.md) — `udpshell=PORT` + `scripts/udpsh.py`
 - [Netconsole](docs/netconsole.md) — `netconsole=ip:port` + `scripts/netconsole.py`
 - [Shell commands](docs/shell-commands.md) — the full command reference

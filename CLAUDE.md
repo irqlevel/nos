@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on three real machines — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels, and two Hetzner dedicated servers, an Intel EX44 (RTL8125) and an AMD Ryzen AX41 (Intel I210), whose only console is the network (see `docs/real-hardware.md`). See `docs/features.md` for the full feature list, `docs/shell-commands.md` for the shell command reference (index in `docs/README.md`), and `plans/README.md` for the roadmap (the long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor — stages 0–5, currently at the end of stage 2).
+`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on three real machines — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels, and two Hetzner dedicated servers, an Intel EX44 (RTL8125) and an AMD Ryzen AX41 (Intel I210), whose only console is the network (see `docs/real-hardware.md`). See `docs/features.md` for the full feature list, `docs/shell-commands.md` for the shell command reference (index in `docs/README.md`), `docs/boot.md` / `docs/paging.md` / `docs/scheduler.md` / `docs/interrupts.md` / `docs/profiler.md` for how those subsystems work, and `plans/README.md` for the roadmap (the long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor — stages 0–5, currently at the end of stage 2).
 
 ## Build, run, test
 
@@ -107,7 +107,7 @@ Stack traces resolve symbols from a table baked into the kernel. The build links
 
 ## Architecture
 
-Boot flow (x86-64): `arch/x86_64/boot64.asm` (Multiboot2 entry, 32→64-bit transition, AP trampoline) → `kernel/main.cpp` `Main2` (BSP: paging, dmesg, page allocator, runs `Test()`) → `BpStartup` (interrupts, IOAPIC, timers, brings up APs via INIT/SIPI, starts SoftIrq/TCP/shell, prints `boot: complete`). APs enter via `ApMain` → `ApStartup`. On arm64 the equivalent path is `arch/arm64/boot.S` → `arch/arm64/main_arm64.cpp`, with PSCI `CPU_ON` for APs.
+Boot flow (x86-64), in full in `docs/boot.md`: `arch/x86_64/boot64.asm` (Multiboot2 entry, 32→64-bit transition, AP trampoline) → `kernel/main.cpp` `Main2` (BSP: paging, dmesg, page allocator, runs `Test()`) → `BpStartup` (interrupts, IOAPIC, timers, brings up APs via INIT/SIPI, starts SoftIrq/TCP/shell, prints `boot: complete`). APs enter via `ApMain` → `ApStartup`. On arm64 the equivalent path is `arch/arm64/boot.S` → `arch/arm64/main_arm64.cpp`, with PSCI `CPU_ON` for APs.
 
 Source layout (detailed in `docs/project-layout.md`):
 
