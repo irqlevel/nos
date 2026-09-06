@@ -198,15 +198,51 @@ void PrintCpuInfo(Stdlib::Printer& con)
     PrintFeature(con, "hyperv  ", (r1.Ecx & (1u << 31)) != 0,
         "running under a hypervisor");
 
-    /* CPUID.0AH: architectural performance monitoring. Version 0 means the
-       counters are not there to program -- which is the case under TCG, and
-       is what decides whether this machine can sample faster than its tick. */
-    CpuidResult r10 = (r0.Eax >= 0xA) ? Cpuid(0xA) : CpuidResult{0, 0, 0, 0};
-    ulong perfVersion = r10.Eax & 0xFF;
-    con.Printf("arch perfmon: version %u, %u general counters %u bits, "
-        "%u fixed counters %u bits\n",
-        perfVersion, (r10.Eax >> 8) & 0xFF, (r10.Eax >> 16) & 0xFF,
-        (ulong)(r10.Edx & 0x1F), (ulong)((r10.Edx >> 5) & 0xFF));
+    /* What the profiler can sample with. The two vendors enumerate entirely
+       different things here, and CPUID.0AH on an AMD part reads back as
+       zeroes -- printing it there would say "no counters" about a machine
+       that has six. */
+    static const u32 AmdVendorEbx = 0x68747541;   /* "Auth" */
+    if (r0.Ebx == AmdVendorEbx)
+    {
+        /* Fn8000_0022 is PerfMonV2: global control and status, Zen 4 and
+           later, and the only place AMD states a counter count. Without it
+           the count follows Fn8000_0001_ECX[PerfCtrExtCore]: six with, the
+           four legacy ones without. Width is 48 bits on every AMD part and
+           is enumerated nowhere. */
+        CpuidResult r22 = (maxExtended >= ExtendedLeafBase + 0x22)
+            ? Cpuid(ExtendedLeafBase + 0x22) : CpuidResult{0, 0, 0, 0};
+        bool perfMonV2 = (r22.Eax & 1u) != 0;
+        bool extCore = (ext1.Ecx & (1u << 23)) != 0;
+
+        con.Printf("amd perfmon: %u core counters 48 bits, perfctr-core %s, "
+            "perfmon v2 %s\n",
+            perfMonV2 ? (ulong)(r22.Ebx & 0xF) : (extCore ? 6UL : 4UL),
+            extCore ? "yes" : "NO", perfMonV2 ? "yes" : "no");
+    }
+    else
+    {
+        /* CPUID.0AH: architectural performance monitoring. Version 0 means
+           the counters are not there to program -- which is the case under
+           TCG, and is what decides whether this machine can sample faster
+           than its tick. */
+        CpuidResult r10 = (r0.Eax >= 0xA) ? Cpuid(0xA) : CpuidResult{0, 0, 0, 0};
+        ulong perfVersion = r10.Eax & 0xFF;
+        con.Printf("arch perfmon: version %u, %u general counters %u bits, "
+            "%u fixed counters %u bits\n",
+            perfVersion, (r10.Eax >> 8) & 0xFF, (r10.Eax >> 16) & 0xFF,
+            (ulong)(r10.Edx & 0x1F), (ulong)((r10.Edx >> 5) & 0xFF));
+    }
+
+    con.Printf("profile sampling: %s\n",
+        PmuAvailable() ? PmuName() : "tick only");
+
+    /* Only ever non-zero on AMD, and only after a profiling run. Printed
+       here because the NMI that produced it could not safely say so
+       itself. */
+    ulong spurious = Kernel::Pmu::SpuriousNmiCount();
+    if (spurious != 0)
+        con.Printf("  %u late performance-counter nmis absorbed\n", spurious);
 }
 
 bool PmuAvailable()
@@ -222,6 +258,11 @@ bool PmuStart()
 void PmuStop()
 {
     Kernel::Pmu::Stop();
+}
+
+const char* PmuName()
+{
+    return Kernel::Pmu::Name();
 }
 
 void PrintCpuState(Stdlib::Printer& con)
