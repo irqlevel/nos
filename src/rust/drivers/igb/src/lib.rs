@@ -256,6 +256,30 @@ fn reset(regs: &io::MmioRegion) -> bool {
     true
 }
 
+/// Stop both DMA engines and silence the device.
+///
+/// Needed on every failure path taken after the receive queue is enabled.
+/// The rings are local variables until the device is boxed, so returning
+/// frees the pages they live in -- and a chip still holding those addresses
+/// goes on writing received frames into memory the page allocator has handed
+/// to somebody else. Nothing reports that; it corrupts whatever comes next.
+fn stop_engines(regs: &io::MmioRegion) {
+    regs.write32(IMC, u32::MAX);
+    regs.write32(EIMC, u32::MAX);
+
+    let rctl = regs.read32(RCTL);
+    regs.write32(RCTL, rctl & !RCTL_EN);
+    let tctl = regs.read32(TCTL);
+    regs.write32(TCTL, tctl & !TCTL_EN);
+
+    regs.write32(RXDCTL0, 0);
+    regs.write32(TXDCTL0, 0);
+
+    /* Read one register back so none of those writes is still in flight when
+     * the rings are freed. */
+    let _ = regs.read32(STATUS);
+}
+
 /// The station address, which hardware has already loaded into the first
 /// receive-address register from the NVM.
 fn read_mac(regs: &io::MmioRegion) -> Option<[u8; 6]> {
@@ -561,12 +585,14 @@ fn init_device(pci_dev: &pci::PciDevice) {
     regs.write32(RXDCTL0, XDCTL_QUEUE_ENABLE);
     if !wait_for(100, 100, || regs.read32(RXDCTL0) & XDCTL_QUEUE_ENABLE != 0) {
         trace!(0, "igb: RX queue did not enable");
+        stop_engines(&regs);
         return;
     }
 
     /* Only now hand the buffers over: the tail must not point past
      * descriptors the engine was not yet allowed to fetch. */
     regs.write32(RDT0, rx_ring.tail());
+    rx_ring.mark_tail_written();
 
     regs.write32(
         RCTL,
@@ -584,6 +610,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     regs.write32(TXDCTL0, XDCTL_QUEUE_ENABLE);
     if !wait_for(100, 100, || regs.read32(TXDCTL0) & XDCTL_QUEUE_ENABLE != 0) {
         trace!(0, "igb: TX queue did not enable");
+        stop_engines(&regs);
         return;
     }
 
@@ -797,16 +824,13 @@ extern "C" fn igb_isr(ctx: *mut u8) {
 
 /// Put buffers back into every slot the chip has given up, and publish them.
 /// Returns whether the tail moved.
-unsafe fn refill_rx(dev: *mut IgbDevice) -> bool {
-    let mut posted = false;
-
+unsafe fn refill_rx(dev: *mut IgbDevice) {
     while (*dev).rx_ring.desc_unused() > 0 {
         match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
             Some(frame) => {
                 if (*dev).rx_ring.post_next(frame).is_none() {
                     break;
                 }
-                posted = true;
             }
             None => {
                 /* Out of frames: leave the slots empty and try again next
@@ -817,13 +841,17 @@ unsafe fn refill_rx(dev: *mut IgbDevice) -> bool {
         }
     }
 
-    if posted {
+    /* Publish on the tail having moved, not on this function having posted
+     * something: an error frame reposted in the harvest loop moves it too,
+     * and if it took the last free slot the loop above adds nothing. Keying
+     * off `posted` there would leave that descriptor sitting in the ring
+     * with the chip never told it was available. */
+    if (*dev).rx_ring.needs_tail_write() {
         /* Descriptors visible before the tail that points past them. */
         kcore::barrier::dma_wmb();
         (*dev).regs.write32(RDT0, (*dev).rx_ring.tail());
+        (*dev).rx_ring.mark_tail_written();
     }
-
-    posted
 }
 
 extern "C" fn igb_process_rx(ctx: *mut u8) {
@@ -866,7 +894,13 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
                 if status & RXD_ERR_MASK != 0 || status & RXD_STAT_EOP == 0 || len == 0 {
                     (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
                     frame.set_len(0);
-                    drop(frame);
+
+                    /* Straight back into the ring rather than out through the
+                     * pool and in again: the buffer is still perfectly good,
+                     * and the receive path has no business allocating. The
+                     * slot is there because the harvest above just freed one,
+                     * so this cannot fail. */
+                    let _ = (*dev).rx_ring.post_next(frame);
                     continue;
                 }
 
