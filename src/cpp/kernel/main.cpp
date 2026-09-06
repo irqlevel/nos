@@ -658,6 +658,14 @@ void BpStartup(void* ctx)
             return;
         }
 
+        /* The disks that came up in rust_init -- NVMe, above all -- were
+           registered after the boot-time probe ran, so their partitions have
+           never been looked at. Done here rather than next to that probe for
+           the same reason the log area is: until the soft IRQ layer exists a
+           block read returns without having read anything, so a probe there
+           would find no partitions and cache that as the answer. */
+        PartitionDevice::ProbeNew();
+
         /* Here, and not earlier: a block request is completed through the
            BLK_IO soft IRQ, so until the line above a read returns without
            having read anything. Everything traced since the first line of the
