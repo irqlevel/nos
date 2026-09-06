@@ -13,27 +13,37 @@ namespace Kernel
 namespace
 {
 
-/* A counter that is really counting moves within one round of PAUSEs -- tens
-   of thousands of cycles, tens of microseconds. The extra rounds are for a
-   counter that is slow to be believed rather than dead, and only a dead one
-   ever pays for all of them. */
-const ulong SelfTestSpins = 256;
-const ulong SelfTestRounds = 4;
+/* How long the probe below may spend before giving up on a counter, in core
+   cycles -- about ten microseconds on a 3 GHz part.
 
-/* Does this MSR count? Interrupts are already off, so the reads bracket a
-   spin on one CPU rather than two. */
+   Bounded by the cycle counter rather than by a count of PAUSEs on purpose:
+   PAUSE is ten cycles on one part and a hundred and forty on the next, so a
+   fixed number of them is a duration nobody can state -- and this is time
+   spent with interrupts off. Ten microseconds is one interrupt handler, paid
+   once per boot.
+
+   It is also far more than the answer needs. A counter that is running
+   advances every unhalted cycle, and one RDMSR alone is a hundred cycles on
+   bare metal and a VM exit under a hypervisor, so a live counter has already
+   moved by the first check and the loop returns there. Only a counter that
+   is not really there spends the whole budget. */
+const ulong SelfTestCycles = 30000;
+
+/* Does this MSR count? Interrupts are already off, so both reads come off
+   one CPU's counter rather than two. */
 bool MsrMoves(u32 msr, u64 mask)
 {
     u64 before = ReadMsr(msr) & mask;
+    u64 deadline = Hal::ReadCycleCounter() + SelfTestCycles;
 
-    for (ulong round = 0; round < SelfTestRounds; round++)
+    do
     {
-        for (ulong i = 0; i < SelfTestSpins; i++)
-            Pause();
-
         if ((ReadMsr(msr) & mask) != before)
             return true;
+
+        Pause();
     }
+    while (Hal::ReadCycleCounter() < deadline);
 
     return false;
 }
@@ -145,8 +155,9 @@ void Stop()
 
 bool CountsForReal()
 {
-    /* Enabled without the PMI bit: a probe this short cannot overflow, and an
-       interrupt out of one would arrive with no profiler behind it. */
+    /* Enabled without the PMI bit: a probe this short cannot overflow the
+       counter, and an interrupt out of one would arrive with no profiler
+       behind it. */
     WriteMsr(GlobalCtrlMsr, ReadMsr(GlobalCtrlMsr) & ~FixedCtr1GlobalBit);
     WriteMsr(FixedCtrCtrlMsr,
         (ReadMsr(FixedCtrCtrlMsr) & ~FixedCtr1CtrlMask) | (1ULL << 4));
@@ -414,11 +425,16 @@ bool Pmu::Available()
         return Kind != FlavorNone;
     }
 
-    /* Interrupts off for the whole probe. It runs in task context, where
-       this task can otherwise be preempted and resumed on another CPU
-       between arming the counter and reading it back -- and then the two
-       reads bracketing the spin come off two different CPUs' counters, which
-       answers a question nobody asked. */
+    /* Interrupts off for the whole probe, which is bounded at SelfTestCycles
+       -- about ten microseconds, once per boot.
+
+       Something has to pin this to one CPU: it runs in task context, and
+       SelectNextTaskQueue() will move even a running task to a lighter
+       queue, so without pinning the two reads bracketing the spin can come
+       off two different CPUs' counters. Task::SetCpuAffinity() would pin it
+       too, but it would not stop a tick on this CPU from arming the counter
+       underneath the probe -- and for ten microseconds the cheap answer is
+       also the complete one. */
     ulong flags = Hal::IrqSave();
 
     Flavor kind = FlavorNone;
@@ -443,7 +459,7 @@ bool Pmu::Available()
        hypervisor that does not virtualise the PMU the writes are accepted
        and the counter never moves, and a profiler that trusted CPUID would
        arm it on every CPU and report an empty profile with no hint as to
-       why. At most four short spins, once. */
+       why. Bounded at SelfTestCycles, once. */
     if (kind == FlavorIntel && !Intel::CountsForReal())
         kind = FlavorNone;
     else if (kind == FlavorAmd && !Amd::CountsForReal())
