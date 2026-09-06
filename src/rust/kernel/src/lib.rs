@@ -24,6 +24,7 @@ pub extern "C" fn rust_init() {
     nvme::init();
     r8168::init();
     r8125::init();
+    igb::init();
     #[cfg(target_arch = "x86_64")]
     {
         tco_init();
@@ -113,4 +114,5 @@ pub extern "C" fn rust_fini() {
     nvme::shutdown();
     r8168::shutdown();
     r8125::shutdown();
+    igb::shutdown();
 }

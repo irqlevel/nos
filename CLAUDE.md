@@ -122,7 +122,7 @@ Source layout (detailed in `README.md` "Project layout"):
 - `src/cpp/fs/` — VFS with mount points, ramfs, nanofs (on-disk), ext2 (ro), procfs
 - `src/cpp/lib/` — freestanding stdlib equivalents (`Stdlib::`), containers (list/vector/btree/ringbuffer/bitmap), CRC32, formatting; some routines (`MemSet`/`MemCpy`/`StrLen`…) are in `arch/x86_64/stdlib_asm.asm` (portable C in `arch/arm64/stdlib_c.cpp`)
 
-Rust (`src/rust/`, a cargo workspace) compiles to a `#![no_std]` `staticlib` (`libkernel.a`) linked into the kernel. The **NVMe driver is written entirely in Rust**. Layers: `ffi/` (raw `extern "C"` declarations only), `kcore/` (safe RAII wrappers around kernel services), `drivers/` (nvme, r8168), `kernel/` (entry points + global allocator), `hello/` (self-test). Adding a kernel service to Rust is a three-step process across `rust_ffi.cpp`, `ffi/`, and `kcore/` — see `.cursor/rules/rust-kernel-conventions.mdc`.
+Rust (`src/rust/`, a cargo workspace) compiles to a `#![no_std]` `staticlib` (`libkernel.a`) linked into the kernel. The **NVMe driver is written entirely in Rust**. Layers: `ffi/` (raw `extern "C"` declarations only), `kcore/` (safe RAII wrappers around kernel services), `drivers/` (nvme, r8168, r8125, igb), `kernel/` (entry points + global allocator), `hello/` (self-test). Adding a kernel service to Rust is a three-step process across `rust_ffi.cpp`, `ffi/`, and `kcore/` — see `.cursor/rules/rust-kernel-conventions.mdc`.
 
 ## Conventions (critical — full rules in `.cursor/rules/`)
 

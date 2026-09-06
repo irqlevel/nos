@@ -1,5 +1,5 @@
 [workspace]
-members = ["ffi", "kernel", "hello", "kcore", "drivers/nvme", "drivers/r8168", "drivers/r8125"]
+members = ["ffi", "kernel", "hello", "kcore", "drivers/nvme", "drivers/r8168", "drivers/r8125", "drivers/igb"]
 resolver = "2"
 
 [profile.release]

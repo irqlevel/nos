@@ -492,6 +492,73 @@ struct R8125State
 
 extern "C" int r8125_get_state(R8125State* out);
 
+/* Mirrors IgbState in src/rust/drivers/igb/src/lib.rs. */
+struct IgbState
+{
+    u32 Present;
+    u32 Ctrl;
+    u32 Status;
+    u32 Rctl;
+    u32 Tctl;
+    u32 Ims;
+    u32 Rxdctl;
+    u32 Srrctl;
+    u32 Rdh;
+    u32 Rdt;
+    u32 Tdh;
+    u32 Tdt;
+    u32 NextToClean;
+    u32 NextToUse;
+    u32 HeadStatus;
+    u32 HeadPosted;
+    u64 RxPolls;
+    u64 RxBudgetHits;
+    u64 RxErrEvents;
+    u64 RxPackets;
+    u64 RxDropped;
+    u64 TxPackets;
+};
+
+extern "C" int igb_get_state(IgbState* out);
+
+static void CmdIgbdump(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+
+    IgbState st;
+    Stdlib::MemSet(&st, 0, sizeof(st));
+
+    if (igb_get_state(&st) != 0 || st.Present == 0)
+    {
+        con.Printf("igbdump: no igb\n");
+        return;
+    }
+
+    static const u32 StatusLu = 1u << 1;
+    static const u32 RctlEn = 1u << 1;
+    static const u32 TctlEn = 1u << 1;
+    static const u32 XdctlEnable = 1u << 25;
+    static const u32 RxdStatDd = 1u << 0;
+
+    con.Printf("ctrl 0x%p status 0x%p link %u\n", (ulong)st.Ctrl, (ulong)st.Status,
+        (ulong)((st.Status & StatusLu) ? 1 : 0));
+    con.Printf("rctl 0x%p rx-en %u  tctl 0x%p tx-en %u  ims 0x%p\n",
+        (ulong)st.Rctl, (ulong)((st.Rctl & RctlEn) ? 1 : 0),
+        (ulong)st.Tctl, (ulong)((st.Tctl & TctlEn) ? 1 : 0), (ulong)st.Ims);
+    con.Printf("rxdctl 0x%p queue-en %u srrctl 0x%p\n", (ulong)st.Rxdctl,
+        (ulong)((st.Rxdctl & XdctlEnable) ? 1 : 0), (ulong)st.Srrctl);
+    con.Printf("rx ring: rdh %u rdt %u  clean %u use %u\n",
+        (ulong)st.Rdh, (ulong)st.Rdt, (ulong)st.NextToClean, (ulong)st.NextToUse);
+    con.Printf("rx head: status 0x%p dd %u posted %u\n", (ulong)st.HeadStatus,
+        (ulong)((st.HeadStatus & RxdStatDd) ? 1 : 0), (ulong)st.HeadPosted);
+    con.Printf("tx ring: tdh %u tdt %u packets %u\n",
+        (ulong)st.Tdh, (ulong)st.Tdt, (ulong)st.TxPackets);
+    con.Printf("rx packets %u dropped %u err events %u\n",
+        (ulong)st.RxPackets, (ulong)st.RxDropped, (ulong)st.RxErrEvents);
+    con.Printf("rx polls %u, of them budget-limited %u\n",
+        (ulong)st.RxPolls, (ulong)st.RxBudgetHits);
+}
+
 static void CmdNicdump(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -1797,6 +1864,7 @@ static const CmdEntry Commands[] = {
     { "stacks",    CmdStacks,    "stacks - stack high-water marks" },
     { "netload",   CmdNetload,   "netload [start [port] [sink]|stop|reset] - udp load target" },
     { "nicdump",   CmdNicdump,   "nicdump - r8125 chip and ring state" },
+    { "igbdump",   CmdIgbdump,   "igbdump - igb chip and ring state" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
     { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },

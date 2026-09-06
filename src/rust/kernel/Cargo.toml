@@ -13,3 +13,4 @@ hello = { path = "../hello" }
 nvme = { path = "../drivers/nvme" }
 r8168 = { path = "../drivers/r8168" }
 r8125 = { path = "../drivers/r8125" }
+igb = { path = "../drivers/igb" }
