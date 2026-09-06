@@ -63,9 +63,10 @@ static RX_POLLS: AtomicU64 = AtomicU64::new(0);
 static RX_BUDGET_HITS: AtomicU64 = AtomicU64::new(0);
 static RX_ERR_EVENTS: AtomicU64 = AtomicU64::new(0);
 
-/* The register window. Everything this driver touches is below 0x0E100;
- * 64 KiB covers it with room for the blocks a later version might want. */
-const BAR_MAP_PAGES: usize = 16;
+/* The register window. 128 KiB, which reaches the NVM block at 0x12010 as
+ * well as the queue and interrupt blocks far below it. The card's BAR is
+ * larger still -- 512 KiB on the I210 -- but nothing above here is touched. */
+const BAR_MAP_PAGES: usize = 32;
 const PAGE_SIZE: usize = 4096;
 const _: () = assert!(BAR_MAP_PAGES * PAGE_SIZE >= REG_SPACE_USED);
 
@@ -115,6 +116,7 @@ struct IgbDevice {
     /// It decides which pair of registers masks and arms the receive side.
     msix: bool,
     generation: Generation,
+    phy_addr: u32,
     tx_ring: TxRing,
     rx_ring: RxRing,
     net_handle: net::NetDeviceHandle,
@@ -287,6 +289,17 @@ fn reset(regs: &io::MmioRegion) -> bool {
     /* The reset re-enables some sources; silence them again. */
     regs.write32(IMC, u32::MAX);
     let _ = regs.read32(ICR);
+
+    /* The station address and a handful of other registers are reloaded from
+     * the NVM as part of coming out of reset, and that takes longer than the
+     * reset itself. Reading RAL0 before it finishes gets whatever was there
+     * before -- which on a cold boot is zero, and a zero station address is
+     * rejected further down as "no valid address", so the card would simply
+     * not appear. Not fatal if it times out: the read below decides. */
+    if !wait_for(1000, 100, || regs.read32(EEC) & EEC_AUTO_RD != 0) {
+        trace!(0, "igb: NVM auto-read did not complete; the MAC may not be loaded");
+    }
+
     true
 }
 
@@ -453,20 +466,40 @@ fn mdic_wait(regs: &io::MmioRegion) -> Option<u32> {
     Some(val)
 }
 
-fn phy_read(regs: &io::MmioRegion, reg: u32) -> Option<u16> {
+/// Where the PHY answers on the MDIO bus.
+///
+/// The 82576 has it at address 1 and no register to say so. From the I210 on
+/// it is a field in MDICNFG, loaded from the NVM, and a card that puts it
+/// somewhere else would leave every PHY read returning the bus idle pattern
+/// -- which looks like a PHY that is present and says nothing, not like an
+/// error. Falls back to 1, which is both the older parts' fixed address and
+/// what the field almost always holds.
+fn phy_address(regs: &io::MmioRegion, generation: Generation) -> u32 {
+    if generation != Generation::I210 {
+        return PHY_ADDR_INTERNAL;
+    }
+
+    let addr = (regs.read32(MDICNFG) & MDICNFG_PHY_MASK) >> MDICNFG_PHY_SHIFT;
+    if addr == 0 {
+        return PHY_ADDR_INTERNAL;
+    }
+    addr
+}
+
+fn phy_read(regs: &io::MmioRegion, phy_addr: u32, reg: u32) -> Option<u16> {
     regs.write32(
         MDIC,
-        (reg << MDIC_REG_SHIFT) | (PHY_ADDR_INTERNAL << MDIC_PHY_SHIFT) | MDIC_OP_READ,
+        (reg << MDIC_REG_SHIFT) | (phy_addr << MDIC_PHY_SHIFT) | MDIC_OP_READ,
     );
     mdic_wait(regs).map(|v| (v & MDIC_DATA_MASK) as u16)
 }
 
-fn phy_write(regs: &io::MmioRegion, reg: u32, data: u16) -> bool {
+fn phy_write(regs: &io::MmioRegion, phy_addr: u32, reg: u32, data: u16) -> bool {
     regs.write32(
         MDIC,
         (data as u32)
             | (reg << MDIC_REG_SHIFT)
-            | (PHY_ADDR_INTERNAL << MDIC_PHY_SHIFT)
+            | (phy_addr << MDIC_PHY_SHIFT)
             | MDIC_OP_WRITE,
     );
     mdic_wait(regs).is_some()
@@ -481,7 +514,7 @@ fn phy_write(regs: &io::MmioRegion, reg: u32, data: u16) -> bool {
 /// untouched, the head pointer never moves, and nothing in the receive path
 /// gives any hint why. Transmit, meanwhile, works: frames go out and replies
 /// come back to a card that will not take them.
-fn phy_start_link(regs: &io::MmioRegion, generation: Generation) -> bool {
+fn phy_start_link(regs: &io::MmioRegion, generation: Generation, phy_addr: u32) -> bool {
     /* On the I210 the PHY is shared with the manageability firmware. Talking
      * to it without the claim is not a race that shows up as a clean failure:
      * two masters on one MDIO bus produce reads that look like data. */
@@ -490,7 +523,7 @@ fn phy_start_link(regs: &io::MmioRegion, generation: Generation) -> bool {
         return false;
     }
 
-    let up = phy_start_link_locked(regs);
+    let up = phy_start_link_locked(regs, phy_addr);
 
     if generation == Generation::I210 {
         swfw_release(regs, SWFW_PHY0_SM);
@@ -499,8 +532,8 @@ fn phy_start_link(regs: &io::MmioRegion, generation: Generation) -> bool {
     up
 }
 
-fn phy_start_link_locked(regs: &io::MmioRegion) -> bool {
-    let bmcr = match phy_read(regs, PHY_BMCR) {
+fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
+    let bmcr = match phy_read(regs, phy_addr, PHY_BMCR) {
         Some(v) => v,
         None => {
             trace!(0, "igb: PHY did not answer on MDIC");
@@ -512,7 +545,7 @@ fn phy_start_link_locked(regs: &io::MmioRegion) -> bool {
         | BMCR_FULLDPLX
         | BMCR_SPEED1000;
 
-    if !phy_write(regs, PHY_BMCR, want) {
+    if !phy_write(regs, phy_addr, PHY_BMCR, want) {
         trace!(0, "igb: PHY control write failed");
         return false;
     }
@@ -521,7 +554,7 @@ fn phy_start_link_locked(regs: &io::MmioRegion) -> bool {
      * be able to say in the log whether it finished, and boots either way.
      * A link that comes up later announces itself through LSC. */
     let up = wait_for(10_000, 100, || {
-        match phy_read(regs, PHY_BMSR) {
+        match phy_read(regs, phy_addr, PHY_BMSR) {
             /* Read twice in effect: the link bit is latching-low, so the
              * first read after a change reports the old state. */
             Some(v) => v & (BMSR_LSTATUS | BMSR_ANEGCOMPLETE) == (BMSR_LSTATUS | BMSR_ANEGCOMPLETE),
@@ -703,7 +736,9 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
         (ctrl & !CTRL_GIO_MASTER_DISABLE) | CTRL_SLU | CTRL_ASDE,
     );
 
-    phy_start_link(&regs, generation);
+    let phy_addr = phy_address(&regs, generation);
+    trace!(0, "igb: PHY at MDIO address {}", phy_addr);
+    phy_start_link(&regs, generation, phy_addr);
 
     /* --- Multicast table: nothing accepted by hash, broadcast handled by
      * RCTL.BAM below. --- */
@@ -785,6 +820,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
         _intx: interrupt::LegacyInterrupt::empty(),
         msix: false,
         generation,
+        phy_addr,
         tx_ring,
         rx_ring,
         net_handle: net::NetDeviceHandle::placeholder(),
@@ -1206,8 +1242,9 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
         let phy_locked = (*raw).generation != Generation::I210
             || swfw_acquire(regs, SWFW_PHY0_SM);
         if phy_locked {
-            (*out).phy_bmcr = phy_read(regs, PHY_BMCR).unwrap_or(0) as u32;
-            (*out).phy_bmsr = phy_read(regs, PHY_BMSR).unwrap_or(0) as u32;
+            let addr = (*raw).phy_addr;
+            (*out).phy_bmcr = phy_read(regs, addr, PHY_BMCR).unwrap_or(0) as u32;
+            (*out).phy_bmsr = phy_read(regs, addr, PHY_BMSR).unwrap_or(0) as u32;
             if (*raw).generation == Generation::I210 {
                 swfw_release(regs, SWFW_PHY0_SM);
             }

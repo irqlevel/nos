@@ -78,8 +78,10 @@ pub const MTA_ENTRIES: usize = 128;
 
 /* The highest offset this driver touches, which sets how much of the BAR
  * has to be mapped. */
-/* TXDCTL0 is the highest of them all; the interrupt block sits far below it. */
-pub const REG_SPACE_USED: usize = TXDCTL0 + 4;
+/* EEC is the highest of them all -- the queue and interrupt blocks sit well
+ * below it. The card's BAR is far larger again (512 KiB on the I210), but
+ * nothing this driver touches lives above here. */
+pub const REG_SPACE_USED: usize = EEC + 4;
 
 /* ---- CTRL bits ---- */
 pub const CTRL_FD: u32 = 1 << 0; /* full duplex */
@@ -169,6 +171,23 @@ pub const TXD_DCMD_RS: u32 = 1 << 27; /* report status */
 pub const TXD_DCMD_DEXT: u32 = 1 << 29; /* descriptor extension: advanced */
 pub const TXD_PAYLEN_SHIFT: u32 = 14;
 pub const TXD_STAT_DD: u32 = 1 << 0;
+
+/* ---- NVM auto-read ----
+ *
+ * After a reset the chip reloads a block of registers from the NVM, the
+ * station address among them. Reading RAL0 before this bit is set can hand
+ * back whatever was there before the load. */
+pub const EEC: usize = 0x12010;
+pub const EEC_AUTO_RD: u32 = 1 << 9;
+
+/* ---- MDI configuration ----
+ *
+ * Where the PHY sits on the MDIO bus. The 82576 has it hard-wired at address
+ * 1; from the I210 on it is a field here, written from the NVM, and reading
+ * the wrong address gets a bus with nothing on it rather than an error. */
+pub const MDICNFG: usize = 0x00E04;
+pub const MDICNFG_PHY_MASK: u32 = 0x1F << 21;
+pub const MDICNFG_PHY_SHIFT: u32 = 21;
 
 /* ---- Software/firmware semaphore (I210) ----
  *
