@@ -945,7 +945,12 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
      * what was there: QEMU's model resets them to zero where the silicon
      * resets them to 12/10/1, and a fix that depends on which is which is
      * not a fix. */
-    let rxdctl = (regs.read32(RXDCTL0) & !XDCTL_THRESH_MASK) | XDCTL_THRESH_DEFAULT;
+    let wthresh = if generation == Generation::I82576 {
+        XDCTL_WTHRESH_82576
+    } else {
+        XDCTL_WTHRESH_I210
+    };
+    let rxdctl = (regs.read32(RXDCTL0) & !XDCTL_THRESH_MASK) | xdctl_thresh(wthresh);
     regs.write32(RXDCTL0, rxdctl | XDCTL_QUEUE_ENABLE);
     if !wait_for(100, 100, || regs.read32(RXDCTL0) & XDCTL_QUEUE_ENABLE != 0) {
         trace!(0, "igb: RX queue did not enable");
@@ -972,7 +977,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     regs.write32(TDT0, 0);
 
     /* Same register layout, same reason. */
-    let txdctl = (regs.read32(TXDCTL0) & !XDCTL_THRESH_MASK) | XDCTL_THRESH_DEFAULT;
+    let txdctl = (regs.read32(TXDCTL0) & !XDCTL_THRESH_MASK) | xdctl_thresh(wthresh);
     regs.write32(TXDCTL0, txdctl | XDCTL_QUEUE_ENABLE);
     if !wait_for(100, 100, || regs.read32(TXDCTL0) & XDCTL_QUEUE_ENABLE != 0) {
         trace!(0, "igb: TX queue did not enable");

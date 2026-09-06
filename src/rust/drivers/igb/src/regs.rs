@@ -215,13 +215,22 @@ pub const XDCTL_WTHRESH_SHIFT: u32 = 16;
 pub const XDCTL_THRESH_MASK: u32 =
     (0x1F << XDCTL_PTHRESH_SHIFT) | (0x1F << XDCTL_HTHRESH_SHIFT) | (0x1F << XDCTL_WTHRESH_SHIFT);
 
-pub const XDCTL_PTHRESH: u32 = 12;
-pub const XDCTL_HTHRESH: u32 = 10;
-pub const XDCTL_WTHRESH: u32 = 1;
+/* The values Linux's igb programs, which is a stronger recommendation than
+   the reset defaults: it drives these parts at line rate and this does not.
+   WTHRESH is the one that differs -- it is how many finished descriptors the
+   chip gathers before writing them back, and at 1 every received packet costs
+   its own PCIe write. Linux uses 1 only for the 82576 with MSI-X, where it is
+   a documented workaround, and 4 everywhere else. */
+pub const XDCTL_PTHRESH: u32 = 8;
+pub const XDCTL_HTHRESH: u32 = 8;
+pub const XDCTL_WTHRESH_82576: u32 = 1;
+pub const XDCTL_WTHRESH_I210: u32 = 4;
 
-pub const XDCTL_THRESH_DEFAULT: u32 = (XDCTL_PTHRESH << XDCTL_PTHRESH_SHIFT)
-    | (XDCTL_HTHRESH << XDCTL_HTHRESH_SHIFT)
-    | (XDCTL_WTHRESH << XDCTL_WTHRESH_SHIFT);
+pub const fn xdctl_thresh(wthresh: u32) -> u32 {
+    (XDCTL_PTHRESH << XDCTL_PTHRESH_SHIFT)
+        | (XDCTL_HTHRESH << XDCTL_HTHRESH_SHIFT)
+        | (wthresh << XDCTL_WTHRESH_SHIFT)
+}
 
 /* ---- Receive address high ---- */
 pub const RAH_AV: u32 = 1 << 31; /* address valid */
