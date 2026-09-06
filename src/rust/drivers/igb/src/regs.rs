@@ -90,14 +90,34 @@ pub const CTRL_ASDE: u32 = 1 << 5; /* auto-speed detection */
 pub const CTRL_SLU: u32 = 1 << 6; /* set link up */
 pub const CTRL_RST: u32 = 1 << 26;
 
+/* Speed the MAC runs at. Ignored while ASDE is on, which is the trap this
+   driver fell into: auto-speed detection latches the speed once, at the first
+   LINK the PHY asserts, and never revisits it. A PHY that asserts link early
+   and then negotiates up leaves the MAC behind at whatever it saw first. */
+pub const CTRL_SPEED_SHIFT: u32 = 8;
+pub const CTRL_SPEED_MASK: u32 = 3 << CTRL_SPEED_SHIFT;
+pub const CTRL_FRCSPD: u32 = 1 << 11; /* take the speed from CTRL, not ASD */
+pub const CTRL_FRCDPLX: u32 = 1 << 12; /* take the duplex from CTRL.FD */
+
 /* ---- STATUS bits ---- */
 pub const STATUS_FD: u32 = 1 << 0;
 pub const STATUS_LU: u32 = 1 << 1; /* link up */
-pub const STATUS_SPEED_MASK: u32 = 3 << 6;
+pub const STATUS_SPEED_SHIFT: u32 = 6;
+pub const STATUS_SPEED_MASK: u32 = 3 << STATUS_SPEED_SHIFT;
 pub const STATUS_SPEED_10: u32 = 0 << 6;
 pub const STATUS_SPEED_100: u32 = 1 << 6;
 pub const STATUS_SPEED_1000: u32 = 2 << 6;
 pub const STATUS_GIO_MASTER_ENABLE: u32 = 1 << 19;
+
+/* What the MAC's own auto-detection last sensed off the PHY receive clock.
+   The datasheet calls it diagnostic, but it is the one place that says what
+   the link really settled on when the latched SPEED above disagrees. Same
+   encoding as CTRL.SPEED. */
+pub const STATUS_ASDV_SHIFT: u32 = 8;
+pub const STATUS_ASDV_MASK: u32 = 3 << STATUS_ASDV_SHIFT;
+
+/* Initiates a fresh detection; self-clearing, result lands in STATUS.ASDV. */
+pub const CTRL_EXT_ASDCHK: u32 = 1 << 12;
 
 /* ---- Interrupt cause / mask bits ---- */
 pub const ICR_TXDW: u32 = 1 << 0; /* transmit descriptor written back */
@@ -262,6 +282,15 @@ pub const ANAR_ADVERTISE_ALL: u16 = ANAR_SELECTOR_802_3
 
 pub const GCTL_1000_HALF: u16 = 1 << 8;
 pub const GCTL_1000_FULL: u16 = 1 << 9;
+
+/* 1000BASE-T status: what the partner claims it can do. */
+pub const GSTAT_PARTNER_1000_HALF: u16 = 1 << 10;
+pub const GSTAT_PARTNER_1000_FULL: u16 = 1 << 11;
+
+/* The CTRL.SPEED encoding, which STATUS.SPEED and STATUS.ASDV share. */
+pub const CTRL_SPEED_10: u32 = 0;
+pub const CTRL_SPEED_100: u32 = 1;
+pub const CTRL_SPEED_1000: u32 = 2;
 
 pub const BMCR_RESET: u16 = 1 << 15;
 pub const BMCR_ANENABLE: u16 = 1 << 12;
