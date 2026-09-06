@@ -1426,6 +1426,8 @@ pub struct IgbState {
     pub stat_mpc: u64,
     pub stat_rnbc: u64,
     pub stat_rxerrc: u64,
+    pub stat_rqdpc: u32,
+    pub stat_pqgprc: u32,
     pub rxdctl: u32,
     pub srrctl: u32,
     pub rdh: u32,
@@ -1504,6 +1506,10 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
         (*out).stat_mpc = accumulate(&STAT_MPC, regs.read32(MPC));
         (*out).stat_rnbc = accumulate(&STAT_RNBC, regs.read32(RNBC));
         (*out).stat_rxerrc = accumulate(&STAT_RXERRC, regs.read32(RXERRC));
+
+        /* Not read-clear: taken as they stand. */
+        (*out).stat_rqdpc = regs.read32(RQDPC0);
+        (*out).stat_pqgprc = regs.read32(PQGPRC0);
         (*out).rxdctl = regs.read32(RXDCTL0);
         (*out).srrctl = regs.read32(SRRCTL0);
         (*out).rdh = regs.read32(RDH0);
