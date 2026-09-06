@@ -496,6 +496,9 @@ extern "C" int r8125_get_state(R8125State* out);
 struct IgbState
 {
     u32 Present;
+    u32 Generation;
+    u32 PhyBmcr;
+    u32 PhyBmsr;
     u32 Ctrl;
     u32 Status;
     u32 Rctl;
@@ -540,8 +543,18 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
     static const u32 XdctlEnable = 1u << 25;
     static const u32 RxdStatDd = 1u << 0;
 
+    static const u32 BmsrLstatus = 1u << 2;
+    static const u32 BmsrAnegDone = 1u << 5;
+
+    con.Printf("part %s\n", st.Generation ? "I210" : "82576");
     con.Printf("ctrl 0x%p status 0x%p link %u\n", (ulong)st.Ctrl, (ulong)st.Status,
         (ulong)((st.Status & StatusLu) ? 1 : 0));
+    /* The PHY's own view, which is what tells a link the driver never brought
+       up apart from a cable that is not plugged in. */
+    con.Printf("phy bmcr 0x%p bmsr 0x%p link %u autoneg-done %u\n",
+        (ulong)st.PhyBmcr, (ulong)st.PhyBmsr,
+        (ulong)((st.PhyBmsr & BmsrLstatus) ? 1 : 0),
+        (ulong)((st.PhyBmsr & BmsrAnegDone) ? 1 : 0));
     con.Printf("rctl 0x%p rx-en %u  tctl 0x%p tx-en %u  ims 0x%p\n",
         (ulong)st.Rctl, (ulong)((st.Rctl & RctlEn) ? 1 : 0),
         (ulong)st.Tctl, (ulong)((st.Tctl & TctlEn) ? 1 : 0), (ulong)st.Ims);

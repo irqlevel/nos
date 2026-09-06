@@ -69,6 +69,38 @@ const BAR_MAP_PAGES: usize = 16;
 const PAGE_SIZE: usize = 4096;
 const _: () = assert!(BAR_MAP_PAGES * PAGE_SIZE >= REG_SPACE_USED);
 
+/* Which part this is. The two share a register map; they differ in who else
+ * is allowed to touch the PHY, which is enough to need naming. */
+#[derive(Clone, Copy, PartialEq)]
+enum Generation {
+    /// 82576 and relatives. What QEMU emulates.
+    I82576,
+    /// I210/I211. Has manageability firmware sharing the MDIO bus.
+    I210,
+}
+
+impl Generation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Generation::I82576 => "82576",
+            Generation::I210 => "I210",
+        }
+    }
+}
+
+const SUPPORTED: [(u16, Generation); 10] = [
+    (PCI_DEVICE_82576, Generation::I82576),
+    (PCI_DEVICE_82576_QUAD, Generation::I82576),
+    (PCI_DEVICE_82576_NS, Generation::I82576),
+    (PCI_DEVICE_I210_COPPER, Generation::I210),
+    (PCI_DEVICE_I210_FIBER, Generation::I210),
+    (PCI_DEVICE_I210_SERDES, Generation::I210),
+    (PCI_DEVICE_I210_SGMII, Generation::I210),
+    (PCI_DEVICE_I210_COPPER_FLASHLESS, Generation::I210),
+    (PCI_DEVICE_I210_SERDES_FLASHLESS, Generation::I210),
+    (PCI_DEVICE_I211_COPPER, Generation::I210),
+];
+
 /* Descriptors taken in one pass before the poll yields, and passes before it
  * gives the CPU back through a softirq. The product bounds how long one
  * entry into process_rx can hold the CPU. */
@@ -82,6 +114,7 @@ struct IgbDevice {
     /// Whether causes arrive through the extended block rather than ICR/IMS.
     /// It decides which pair of registers masks and arms the receive side.
     msix: bool,
+    generation: Generation,
     tx_ring: TxRing,
     rx_ring: RxRing,
     net_handle: net::NetDeviceHandle,
@@ -177,7 +210,7 @@ fn wait_for<F: FnMut() -> bool>(us: u64, tries: u32, mut cond: F) -> bool {
 /* Public entry points called from kernel/src/lib.rs */
 
 pub fn init() {
-    for device_id in SUPPORTED_DEVICES {
+    for (device_id, generation) in SUPPORTED {
         let mut start: usize = 0;
         loop {
             match pci::find_device_from(PCI_VENDOR_INTEL, device_id, start) {
@@ -185,7 +218,8 @@ pub fn init() {
                 Some((idx, dev)) => {
                     trace!(
                         0,
-                        "igb: found {:04x}:{:04x} at {:02x}:{:02x}.{} rev {:02x} irq={}",
+                        "igb: found {} {:04x}:{:04x} at {:02x}:{:02x}.{} rev {:02x} irq={}",
+                        generation.as_str(),
                         PCI_VENDOR_INTEL,
                         device_id,
                         dev.bus,
@@ -194,7 +228,7 @@ pub fn init() {
                         dev.revision,
                         dev.irq_line
                     );
-                    init_device(&dev);
+                    init_device(&dev, generation);
                     start = idx + 1;
                 }
             }
@@ -275,9 +309,16 @@ fn stop_engines(regs: &io::MmioRegion) {
     regs.write32(RXDCTL0, 0);
     regs.write32(TXDCTL0, 0);
 
-    /* Read one register back so none of those writes is still in flight when
-     * the rings are freed. */
-    let _ = regs.read32(STATUS);
+    /* Wait for the queues to say they have stopped, rather than assuming the
+     * write took effect the moment it was posted. The enable bit reads back
+     * clear only once the engine is idle, and the whole point of this
+     * function is that the rings are about to be freed. */
+    if !wait_for(100, 100, || {
+        regs.read32(RXDCTL0) & XDCTL_QUEUE_ENABLE == 0
+            && regs.read32(TXDCTL0) & XDCTL_QUEUE_ENABLE == 0
+    }) {
+        trace!(0, "igb: queues did not report idle after being disabled");
+    }
 }
 
 /// The station address, which hardware has already loaded into the first
@@ -315,6 +356,81 @@ fn write_mac(regs: &io::MmioRegion, mac: &[u8; 6]) {
     /* Low half first: the address becomes valid on the write that sets AV. */
     regs.write32(RAL0, ral);
     regs.write32(RAH0, rah);
+}
+
+/* ================================================================== */
+/* Software/firmware semaphore, I210 only.
+ *
+ * On this part the manageability firmware drives the same MDIO bus, so the
+ * PHY is a shared resource and both sides claim it through SW_FW_SYNC. That
+ * register is itself guarded by a hardware mutex in SWSM, so every claim is
+ * two acquisitions deep: take the mutex, set the bit, drop the mutex.
+ *
+ * Everything here is bounded. A firmware that never releases its claim must
+ * cost a failed bring-up and a line in the log, not a boot that stops. */
+
+/// Take the hardware mutex guarding SW_FW_SYNC.
+fn hw_semaphore_get(regs: &io::MmioRegion) -> bool {
+    /* SMBI is the mutex itself: clear means nobody holds it. */
+    if !wait_for(50, 200, || regs.read32(SWSM) & SWSM_SMBI == 0) {
+        return false;
+    }
+
+    /* Then software's own bit, which only latches if the claim took. */
+    let ok = wait_for(50, 200, || {
+        let swsm = regs.read32(SWSM);
+        regs.write32(SWSM, swsm | SWSM_SWESMBI);
+        regs.read32(SWSM) & SWSM_SWESMBI != 0
+    });
+
+    if !ok {
+        hw_semaphore_put(regs);
+        return false;
+    }
+    true
+}
+
+fn hw_semaphore_put(regs: &io::MmioRegion) {
+    let swsm = regs.read32(SWSM);
+    regs.write32(SWSM, swsm & !(SWSM_SMBI | SWSM_SWESMBI));
+}
+
+/// Claim a resource in SW_FW_SYNC, waiting for firmware to let go of it.
+fn swfw_acquire(regs: &io::MmioRegion, mask: u32) -> bool {
+    let fwmask = mask << SWFW_FW_SHIFT;
+
+    for _ in 0..200 {
+        if !hw_semaphore_get(regs) {
+            return false;
+        }
+
+        let sync = regs.read32(SW_FW_SYNC);
+        if sync & (fwmask | mask) == 0 {
+            regs.write32(SW_FW_SYNC, sync | mask);
+            hw_semaphore_put(regs);
+            return true;
+        }
+
+        /* Held by the other side: drop the mutex so it can make progress. */
+        hw_semaphore_put(regs);
+        udelay(5000);
+    }
+
+    false
+}
+
+fn swfw_release(regs: &io::MmioRegion, mask: u32) {
+    if !hw_semaphore_get(regs) {
+        /* Nothing better to do than let the claim go anyway: leaving it set
+         * would lock the PHY out for good. */
+        let sync = regs.read32(SW_FW_SYNC);
+        regs.write32(SW_FW_SYNC, sync & !mask);
+        return;
+    }
+
+    let sync = regs.read32(SW_FW_SYNC);
+    regs.write32(SW_FW_SYNC, sync & !mask);
+    hw_semaphore_put(regs);
 }
 
 /* ================================================================== */
@@ -365,7 +481,25 @@ fn phy_write(regs: &io::MmioRegion, reg: u32, data: u16) -> bool {
 /// untouched, the head pointer never moves, and nothing in the receive path
 /// gives any hint why. Transmit, meanwhile, works: frames go out and replies
 /// come back to a card that will not take them.
-fn phy_start_link(regs: &io::MmioRegion) -> bool {
+fn phy_start_link(regs: &io::MmioRegion, generation: Generation) -> bool {
+    /* On the I210 the PHY is shared with the manageability firmware. Talking
+     * to it without the claim is not a race that shows up as a clean failure:
+     * two masters on one MDIO bus produce reads that look like data. */
+    if generation == Generation::I210 && !swfw_acquire(regs, SWFW_PHY0_SM) {
+        trace!(0, "igb: could not take the PHY semaphore from firmware");
+        return false;
+    }
+
+    let up = phy_start_link_locked(regs);
+
+    if generation == Generation::I210 {
+        swfw_release(regs, SWFW_PHY0_SM);
+    }
+
+    up
+}
+
+fn phy_start_link_locked(regs: &io::MmioRegion) -> bool {
     let bmcr = match phy_read(regs, PHY_BMCR) {
         Some(v) => v,
         None => {
@@ -451,7 +585,7 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
 /* ================================================================== */
 /* Device initialisation */
 
-fn init_device(pci_dev: &pci::PciDevice) {
+fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     /* Claim a slot before touching the hardware, as the r8125 driver does:
      * every failure below either happens before the DMA engines start or
      * unwinds through Drop, which stops them first. */
@@ -482,6 +616,21 @@ fn init_device(pci_dev: &pci::PciDevice) {
     if !reset(&regs) {
         trace!(0, "igb: chip reset timed out");
         return;
+    }
+
+    /* Which interface the MAC is wired to, from the NVM. Reported rather than
+     * forced: the copper, SGMII and SERDES variants of this family differ
+     * only here, and writing "internal PHY" onto a SERDES part would break a
+     * card that was working. If this ever reads as anything but internal, the
+     * PHY bring-up below is talking to the wrong thing and the log will say
+     * so instead of leaving a silent link-down. */
+    let link_mode = regs.read32(CTRL_EXT) & CTRL_EXT_LINK_MODE_MASK;
+    if link_mode != CTRL_EXT_LINK_MODE_INTERNAL {
+        trace!(
+            0,
+            "igb: link mode {:#x} is not the internal PHY; this driver drives copper only",
+            link_mode >> 22
+        );
     }
 
     let mac = match read_mac(&regs) {
@@ -554,7 +703,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
         (ctrl & !CTRL_GIO_MASTER_DISABLE) | CTRL_SLU | CTRL_ASDE,
     );
 
-    phy_start_link(&regs);
+    phy_start_link(&regs, generation);
 
     /* --- Multicast table: nothing accepted by hash, broadcast handled by
      * RCTL.BAM below. --- */
@@ -635,6 +784,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
         _msix_table: None,
         _intx: interrupt::LegacyInterrupt::empty(),
         msix: false,
+        generation,
         tx_ring,
         rx_ring,
         net_handle: net::NetDeviceHandle::placeholder(),
@@ -684,7 +834,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     DEVICES[idx as usize].store(raw, Ordering::Release);
     DEVICE_COUNT.store(idx + 1, Ordering::Release);
 
-    trace!(0, "igb: device {} ready", idx);
+    trace!(0, "igb: device {} ready ({})", idx, generation.as_str());
 }
 
 fn attach_interrupt(
@@ -1004,6 +1154,10 @@ extern "C" fn igb_flush_tx(ctx: *mut u8) {
 #[repr(C)]
 pub struct IgbState {
     pub present: u32,
+    /// 0 = 82576, 1 = I210.
+    pub generation: u32,
+    pub phy_bmcr: u32,
+    pub phy_bmsr: u32,
     pub ctrl: u32,
     pub status: u32,
     pub rctl: u32,
@@ -1042,6 +1196,23 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
     unsafe {
         let regs = &(*raw).regs;
         (*out).present = 1;
+        (*out).generation = if (*raw).generation == Generation::I210 { 1 } else { 0 };
+
+        /* What the PHY itself says, which on a machine with no console but
+         * this NIC is the difference between "the cable is out" and "the
+         * driver never brought the link up". Read under the same claim the
+         * bring-up takes; if firmware will not give it up, report zeroes
+         * rather than whatever a contended MDIO bus hands back. */
+        let phy_locked = (*raw).generation != Generation::I210
+            || swfw_acquire(regs, SWFW_PHY0_SM);
+        if phy_locked {
+            (*out).phy_bmcr = phy_read(regs, PHY_BMCR).unwrap_or(0) as u32;
+            (*out).phy_bmsr = phy_read(regs, PHY_BMSR).unwrap_or(0) as u32;
+            if (*raw).generation == Generation::I210 {
+                swfw_release(regs, SWFW_PHY0_SM);
+            }
+        }
+
         (*out).ctrl = regs.read32(CTRL);
         (*out).status = regs.read32(STATUS);
         (*out).rctl = regs.read32(RCTL);
