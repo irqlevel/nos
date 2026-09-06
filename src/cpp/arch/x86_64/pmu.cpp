@@ -3,6 +3,7 @@
 #include "cpuid.h"
 #include "lapic.h"
 
+#include <hal/barrier.h>
 #include <hal/cpu.h>
 #include <kernel/cpu.h>
 
@@ -12,15 +13,29 @@ namespace Kernel
 namespace
 {
 
-/* Long enough that any counter which is really counting has moved, short
-   enough to disappear into the cost of the `profile` command that asks. A
-   PAUSE is tens of cycles even where it is cheapest. */
-const ulong SelfTestSpins = 4096;
+/* A counter that is really counting moves within one round of PAUSEs -- tens
+   of thousands of cycles, tens of microseconds. The extra rounds are for a
+   counter that is slow to be believed rather than dead, and only a dead one
+   ever pays for all of them. */
+const ulong SelfTestSpins = 256;
+const ulong SelfTestRounds = 4;
 
-void SpinAWhile()
+/* Does this MSR count? Interrupts are already off, so the reads bracket a
+   spin on one CPU rather than two. */
+bool MsrMoves(u32 msr, u64 mask)
 {
-    for (ulong i = 0; i < SelfTestSpins; i++)
-        Pause();
+    u64 before = ReadMsr(msr) & mask;
+
+    for (ulong round = 0; round < SelfTestRounds; round++)
+    {
+        for (ulong i = 0; i < SelfTestSpins; i++)
+            Pause();
+
+        if ((ReadMsr(msr) & mask) != before)
+            return true;
+    }
+
+    return false;
 }
 
 /* Which performance-counter interface this part speaks. Decided once, by
@@ -32,8 +47,11 @@ enum Flavor
     FlavorAmd,
 };
 
-Flavor Kind = FlavorNone;
-bool Probed;
+/* Read by every CPU that arms a counter, written once by the CPU that
+   probes. Volatile so the two stores below cannot be reordered against each
+   other, which is what makes Probed a safe flag to publish Kind behind. */
+volatile Flavor Kind = FlavorNone;
+volatile bool Probed;
 
 /* Written by every CPU that arms its counter, always with the same value:
    the profiler asks for one period and hands it to all of them. */
@@ -127,21 +145,18 @@ void Stop()
 
 bool CountsForReal()
 {
-    /* Enabled without the PMI bit: this is not going to overflow in four
-       thousand PAUSEs, and an interrupt out of a probe would arrive with no
-       profiler behind it. */
+    /* Enabled without the PMI bit: a probe this short cannot overflow, and an
+       interrupt out of one would arrive with no profiler behind it. */
     WriteMsr(GlobalCtrlMsr, ReadMsr(GlobalCtrlMsr) & ~FixedCtr1GlobalBit);
     WriteMsr(FixedCtrCtrlMsr,
         (ReadMsr(FixedCtrCtrlMsr) & ~FixedCtr1CtrlMask) | (1ULL << 4));
     WriteMsr(FixedCtr1Msr, 0);
     WriteMsr(GlobalCtrlMsr, ReadMsr(GlobalCtrlMsr) | FixedCtr1GlobalBit);
 
-    u64 before = ReadMsr(FixedCtr1Msr);
-    SpinAWhile();
-    u64 after = ReadMsr(FixedCtr1Msr);
+    bool counts = MsrMoves(FixedCtr1Msr, CounterMask());
 
     Stop();
-    return after != before;
+    return counts;
 }
 
 bool AckOverflow()
@@ -322,12 +337,10 @@ bool CountsForReal()
     if (V2)
         WriteMsr(GlobalCtlMsr, ReadMsr(GlobalCtlMsr) | GlobalCtr0Bit);
 
-    u64 before = ReadMsr(Ctr0Msr) & CounterMask;
-    SpinAWhile();
-    u64 after = ReadMsr(Ctr0Msr) & CounterMask;
+    bool counts = MsrMoves(Ctr0Msr, CounterMask);
 
     Stop();
-    return after != before;
+    return counts;
 }
 
 bool AckOverflow()
@@ -373,11 +386,13 @@ bool AckOverflow()
 
    Indexed by hardware CPU id, like the profiler's own per-CPU buffers, and
    written only by its own CPU from its own NMI. */
-u8 SpuriousCredit[MaxCpus];
+volatile u8 SpuriousCredit[MaxCpus];
 
 /* Counted rather than silent: a credit spent after the profiler has stopped
-   is an NMI this kernel swallowed, and `lscpu` says how many. */
-ulong SpuriousNmis;
+   is an NMI this kernel swallowed, and `lscpu` says how many. Per CPU, like
+   everything else an NMI writes here, so counting one costs no atomic and
+   loses nothing to a simultaneous NMI on another core. */
+ulong SpuriousNmis[MaxCpus];
 
 /* Whether this CPU currently has its counter armed. Load-bearing on AMD
    without PerfMonV2, where an overflow is recognised by the sign bit of a
@@ -385,14 +400,26 @@ ulong SpuriousNmis;
    run, that bit is as likely clear as not, and without this flag the next
    genuine NMI -- arriving minutes later, from something else entirely --
    would be read as a sample and swallowed instead of panicking. */
-u8 Armed[MaxCpus];
+volatile u8 Armed[MaxCpus];
 
 }
 
 bool Pmu::Available()
 {
     if (Probed)
+    {
+        /* Pairs with the publish below: Kind and everything Detect() left
+           behind it must be visible to a CPU that has seen Probed. */
+        Hal::SmpRmb();
         return Kind != FlavorNone;
+    }
+
+    /* Interrupts off for the whole probe. It runs in task context, where
+       this task can otherwise be preempted and resumed on another CPU
+       between arming the counter and reading it back -- and then the two
+       reads bracketing the spin come off two different CPUs' counters, which
+       answers a question nobody asked. */
+    ulong flags = Hal::IrqSave();
 
     Flavor kind = FlavorNone;
 
@@ -416,30 +443,37 @@ bool Pmu::Available()
        hypervisor that does not virtualise the PMU the writes are accepted
        and the counter never moves, and a profiler that trusted CPUID would
        arm it on every CPU and report an empty profile with no hint as to
-       why. This costs a few thousand PAUSEs, once. */
+       why. At most four short spins, once. */
     if (kind == FlavorIntel && !Intel::CountsForReal())
         kind = FlavorNone;
     else if (kind == FlavorAmd && !Amd::CountsForReal())
         kind = FlavorNone;
 
-    /* Published after the answer is complete: the CPU running the shell gets
-       here first and the CPUs that arm their own counters read it. */
+    /* Published after the answer is complete, and after a barrier: the CPU
+       running the shell gets here first, and the CPUs that go on to arm their
+       own counters read Kind, CounterWidth and V2 on the strength of having
+       seen Probed. */
     Kind = kind;
+    Hal::SmpWmb();
     Probed = true;
-    return Kind != FlavorNone;
+
+    Hal::IrqRestore(flags);
+    return kind != FlavorNone;
 }
 
 bool Pmu::Start(ulong period)
 {
-    if (!Available())
+    /* Available(), not Probed, is what decides whether there is a counter --
+       but this runs from the tick, in an interrupt, and Available() spins for
+       tens of microseconds the first time it is asked. The profiler calls it
+       from the shell before it sets a single CPU sampling, so by the time any
+       tick gets here the answer is already in. If it is not, this tick stays
+       on the tick. */
+    if (!Probed)
         return false;
 
-    if (period < MinPeriod)
-        period = MinPeriod;
-
-    SavedPeriod = period;
-
-    if (!((Kind == FlavorIntel) ? Intel::Start(period) : Amd::Start(period)))
+    Hal::SmpRmb();
+    if (Kind == FlavorNone)
         return false;
 
     /* A CPU with no slot in the armed table would take overflows that
@@ -447,12 +481,23 @@ bool Pmu::Start(ulong period)
        the panic. Leave that CPU on the tick instead. */
     ulong index = Hal::GetCurrentCpuHwId();
     if (index >= MaxCpus)
+        return false;
+
+    if (period < MinPeriod)
+        period = MinPeriod;
+
+    SavedPeriod = period;
+
+    /* Armed before the counter is, not after: an overflow landing between the
+       two is this profiler's, and the flag is what says so. */
+    Armed[index] = 1;
+
+    if (!((Kind == FlavorIntel) ? Intel::Start(period) : Amd::Start(period)))
     {
-        Stop();
+        Armed[index] = 0;
         return false;
     }
 
-    Armed[index] = 1;
     return true;
 }
 
@@ -509,13 +554,17 @@ bool Pmu::AbsorbSpuriousNmi()
     /* Counted, not traced: Trace takes the dmesg lock, and this runs in an
        NMI that may have landed on a CPU already holding it. `lscpu` reads
        the count where printing it is safe. */
-    SpuriousNmis++;
+    SpuriousNmis[index]++;
     return true;
 }
 
 ulong Pmu::SpuriousNmiCount()
 {
-    return SpuriousNmis;
+    ulong total = 0;
+    for (ulong i = 0; i < MaxCpus; i++)
+        total += SpuriousNmis[i];
+
+    return total;
 }
 
 const char* Pmu::Name()
