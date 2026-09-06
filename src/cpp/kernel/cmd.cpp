@@ -1,4 +1,5 @@
 #include "cmd.h"
+#include "version_gen.h"
 #include "trace.h"
 #include <hal/cpu.h>
 #include <hal/console.h>
@@ -1698,7 +1699,7 @@ static void CmdFormat(const char* args, Stdlib::Printer& con)
 static void CmdVersion(const char* args, Stdlib::Printer& con)
 {
     (void)args;
-    con.Printf("nos %s\n", KERNEL_VERSION);
+    con.Printf("nos %s (%s)\n", KERNEL_VERSION, KERNEL_GIT_REV);
 }
 
 static void CmdRandom(const char* args, Stdlib::Printer& con)
