@@ -543,6 +543,29 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
         }
     };
 
+    /* Reset the PHY first. Firmware has been driving it, and it hands the
+     * part over in whatever state it left -- possibly on a register page
+     * other than zero, where the advertisement writes below would land on
+     * something else entirely. A reset puts the standard MII registers back
+     * where they belong. */
+    if !phy_write(regs, phy_addr, PHY_BMCR, BMCR_RESET) {
+        trace!(0, "igb: PHY reset write failed");
+        return false;
+    }
+
+    /* The bit clears itself when the reset finishes. */
+    if !wait_for(1000, 100, || {
+        match phy_read(regs, phy_addr, PHY_BMCR) {
+            Some(v) => v & BMCR_RESET == 0,
+            None => false,
+        }
+    }) {
+        trace!(0, "igb: PHY reset did not complete");
+        return false;
+    }
+
+    let bmcr = phy_read(regs, phy_addr, PHY_BMCR).unwrap_or(0);
+
     /* Say what to offer before asking for a round of negotiation. With
      * auto-negotiation enabled the speed and duplex bits in BMCR are ignored
      * -- what the partner sees comes from these two registers -- and leaving
@@ -586,6 +609,19 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
     if !up {
         trace!(0, "igb: auto-negotiation has not completed yet");
     }
+
+    /* What was offered and what came back. A link that resolves lower than it
+     * should is either an advertisement that did not take or a partner that
+     * offered nothing better, and these two registers are the difference. */
+    trace!(
+        0,
+        "igb: PHY advertised {:#06x}, partner offered {:#06x}, 1000 ctrl {:#06x} status {:#06x}",
+        phy_read(regs, phy_addr, PHY_ANAR).unwrap_or(0),
+        phy_read(regs, phy_addr, PHY_ANLPAR).unwrap_or(0),
+        phy_read(regs, phy_addr, PHY_GCTL).unwrap_or(0),
+        phy_read(regs, phy_addr, PHY_GSTAT).unwrap_or(0)
+    );
+
     up
 }
 
@@ -1224,6 +1260,10 @@ pub struct IgbState {
     pub generation: u32,
     pub phy_bmcr: u32,
     pub phy_bmsr: u32,
+    pub phy_anar: u32,
+    pub phy_anlpar: u32,
+    pub phy_gctl: u32,
+    pub phy_gstat: u32,
     pub ctrl: u32,
     pub status: u32,
     pub rctl: u32,
@@ -1274,7 +1314,16 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
         if phy_locked {
             let addr = (*raw).phy_addr;
             (*out).phy_bmcr = phy_read(regs, addr, PHY_BMCR).unwrap_or(0) as u32;
+
+            /* Twice: the link bit in BMSR latches low, so the first read after
+             * any drop reports the old state rather than the current one. */
+            let _ = phy_read(regs, addr, PHY_BMSR);
             (*out).phy_bmsr = phy_read(regs, addr, PHY_BMSR).unwrap_or(0) as u32;
+
+            (*out).phy_anar = phy_read(regs, addr, PHY_ANAR).unwrap_or(0) as u32;
+            (*out).phy_anlpar = phy_read(regs, addr, PHY_ANLPAR).unwrap_or(0) as u32;
+            (*out).phy_gctl = phy_read(regs, addr, PHY_GCTL).unwrap_or(0) as u32;
+            (*out).phy_gstat = phy_read(regs, addr, PHY_GSTAT).unwrap_or(0) as u32;
             if (*raw).generation == Generation::I210 {
                 swfw_release(regs, SWFW_PHY0_SM);
             }
