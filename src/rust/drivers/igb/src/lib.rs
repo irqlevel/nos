@@ -921,11 +921,17 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
 
     /* 2 KiB buffers, advanced one-buffer descriptors -- the layout desc.rs
      * decodes -- and drop rather than back up when the ring runs dry. */
+    /* No Drop_En. The chip keeps a cache of sixteen descriptors per queue
+     * and fetches the rest from the ring in bursts; with Drop_En set, a
+     * frame that arrives while that cache is empty is discarded on the spot
+     * (RQDPC counts it) even though the ring in host memory is full of
+     * descriptors it has not fetched yet. Without it the frame waits in the
+     * 34 KiB packet buffer until the next fetch lands. The datasheet's own
+     * default is clear for queue 0, and Linux sets the bit only when it has
+     * several queues to keep from starving each other. */
     regs.write32(
         SRRCTL0,
-        ((RX_BUF_SIZE as u32) >> SRRCTL_BSIZEPKT_SHIFT)
-            | SRRCTL_DESCTYPE_ADV_ONEBUF
-            | SRRCTL_DROP_EN,
+        ((RX_BUF_SIZE as u32) >> SRRCTL_BSIZEPKT_SHIFT) | SRRCTL_DESCTYPE_ADV_ONEBUF,
     );
 
     /* Descriptors must be visible before the engine that will read them. */
