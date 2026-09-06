@@ -55,16 +55,22 @@ pub const IVAR_MISC: usize = 0x01740; /* non-queue causes */
 /* ---- GPIE bits ---- */
 pub const GPIE_NSICR: u32 = 1 << 0; /* clear the cause on read */
 pub const GPIE_MSIX_MODE: u32 = 1 << 4;
-pub const GPIE_EIAME: u32 = 1 << 30; /* auto-mask a vector when it fires */
+pub const GPIE_EIAME: u32 = 1 << 30; /* honour EIAM: a vector masks itself when it fires */
 pub const GPIE_PBA: u32 = 1 << 31;
 
 /* An IVAR byte: the low bits pick the vector, the top bit says the entry
  * means anything at all. */
 pub const IVAR_VALID: u32 = 0x80;
 
-/* This driver puts every cause on one vector, so one bit of EICR is the whole
- * interrupt. */
-pub const EICR_VECTOR0: u32 = 1 << 0;
+/* Two vectors: the ring on entry 0, everything that is not a queue -- the
+ * link, in practice -- on entry 1. EICR has a bit per entry. The split is
+ * what lets the ring's handler run without a register access: link changes
+ * are the one cause that must be read out of ICR, and they get a vector of
+ * their own to be read from. */
+pub const MSIX_ENTRY_RING: u16 = 0;
+pub const MSIX_ENTRY_OTHER: u16 = 1;
+pub const EICR_RING: u32 = 1 << MSIX_ENTRY_RING;
+pub const EICR_OTHER: u32 = 1 << MSIX_ENTRY_OTHER;
 
 /* ---- Receive ---- */
 pub const RCTL: usize = 0x00100;
