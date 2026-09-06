@@ -1,32 +1,31 @@
 #!/bin/sh
-# Build the nos kernel, install it, and reboot into it once.
+# Build the nos kernel, install it, and boot into it exactly once.
 #
-# Install as /usr/local/sbin/nosboot on a machine that dual-boots Ubuntu and
-# nos. Ubuntu stays the default boot entry; this arms the next boot only.
+# Install as /usr/local/sbin/nosboot.
 #
-#   nosboot          build, install, reboot -- pick nos at the GRUB menu
+#   nosboot          build, install, arm one boot of nos, reboot
 #   nosboot -n       build and install, do not reboot
-#   nosboot -a       also arm the next boot, for a machine with no console
-#   nosboot -c       clear an arming left behind by -a
+#   nosboot -c       cancel an arming
 #   nosboot -s       show what is installed and what is armed
+#   nosboot --install-service   belt-and-braces disarm on every Ubuntu boot
 #
-# WHY THE DEFAULT DOES NOT ARM ANYTHING.
+# THE ONE-SHOT, AND WHY IT IS NOT grub-reboot.
 #
-# grub-reboot works by writing next_entry into grubenv and letting GRUB clear
-# it as it boots, so the choice lasts exactly one boot. GRUB cannot write to a
-# filesystem on mdadm RAID, and on these machines /boot is exactly that -- so
-# the clear fails silently and the choice sticks. nos then boots every time,
-# including when nos itself reboots, and the machine never comes back on its
-# own.
+# grub-reboot writes next_entry into $prefix/grubenv and relies on GRUB to
+# clear it on the way past. $prefix is /boot; /boot here is ext3 on an mdadm
+# mirror; and GRUB can read a diskfilter device but cannot write one. The
+# clear fails silently, the selection sticks, and nos boots every time --
+# including when nos itself reboots. On a machine with no console that is one
+# that does not come back.
 #
-# So the default here is what the other host already does: leave Ubuntu as the
-# default entry, show the menu, and choose nos by hand. Do nothing and the
-# machine boots Ubuntu; that property is worth more than saving a keystroke.
+# So the flag lives on a plain partition GRUB can write, under its own name
+# (nos_next), read and cleared by /etc/grub.d/01_nosenv before the menu is
+# shown. GRUB clears it itself, which is what makes it one-shot: a hang plus a
+# hardware reset comes back to Ubuntu with nothing left to do.
 #
-# -a is for when there is no console at all. It arms the one-shot knowing it
-# will stick, and getting back then needs either the menu or, once Ubuntu is
-# reached, nos-grub-reset.service (see --install-service), which clears the
-# arming on every Ubuntu boot so that reaching it once is enough.
+# Everything is guarded. If the partition is missing, or the file is, or the
+# entry is not in grub.cfg, the arming does not happen and the machine boots
+# its default. Failing to boot nos is not worth risking a boot over.
 
 set -e
 
@@ -34,11 +33,10 @@ REPO=${NOSBOOT_REPO:-/root/nos}
 KERNEL_SRC=$REPO/kernel64.elf
 KERNEL_DST=${NOSBOOT_KERNEL:-/boot/nos-kernel64.elf}
 ENTRY=${NOSBOOT_ENTRY:-nos-multiboot2}
-GRUBENV=/boot/grub/grubenv
+NOSENV=${NOSBOOT_ENV:-/nosenv/grubenv}
 
 die() { echo "nosboot: $*" >&2; exit 1; }
-
-armed() { grub-editenv "$GRUBENV" list 2>/dev/null | sed -n 's/^next_entry=//p'; }
+armed() { grub-editenv "$NOSENV" list 2>/dev/null | sed -n 's/^nos_next=//p'; }
 
 status() {
     if [ -f "$KERNEL_DST" ]; then
@@ -46,37 +44,34 @@ status() {
     else
         echo "installed: nothing at $KERNEL_DST"
     fi
-    if [ -d "$REPO/.git" ]; then
-        echo "repo:      $(git -C "$REPO" log --oneline -1 2>/dev/null)"
+    [ -d "$REPO/.git" ] && echo "repo:      $(git -C "$REPO" log --oneline -1 2>/dev/null)"
+    if [ ! -f "$NOSENV" ]; then
+        echo "one-shot:  unavailable, no environment at $NOSENV"
+        return
     fi
     a=$(armed)
     if [ -n "$a" ]; then
-        echo "armed:     next boot is '$a'"
+        echo "armed:     the next boot only is '$a'"
     else
-        echo "armed:     no, next boot is the default (Ubuntu)"
+        echo "armed:     no, the next boot is the default (Ubuntu)"
     fi
-}
-
-clear_arming() {
-    grub-editenv "$GRUBENV" unset next_entry 2>/dev/null || true
-    echo "nosboot: cleared; the next boot is Ubuntu"
 }
 
 install_service() {
     cat > /etc/systemd/system/nos-grub-reset.service <<'UNIT'
 [Unit]
-Description=Clear a stale nos one-shot boot selection
-Documentation=man:grub-reboot(8)
-# GRUB cannot write to grubenv on mdadm RAID, so it never clears the one-shot
-# selection it was given. Ubuntu clears it instead: reaching Ubuntu once is
-# then enough to keep reaching it.
+Description=Cancel any nos one-shot boot selection left standing
+# GRUB clears the flag itself, so this should never find anything to do. It is
+# here for the case where it did not: reaching Ubuntu once then guarantees
+# staying there, whatever went wrong on the way.
 DefaultDependencies=no
 After=local-fs.target
 Before=sysinit.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/grub-editenv /boot/grub/grubenv unset next_entry
+ExecStart=-/usr/bin/grub-editenv /nosenv/grubenv unset nos_next
+ExecStart=-/usr/bin/grub-editenv /boot/grub/grubenv unset next_entry
 RemainAfterExit=yes
 
 [Install]
@@ -88,19 +83,19 @@ UNIT
 }
 
 REBOOT=yes
-ARM=no
 case "$1" in
-    -s|--status)  status; exit 0 ;;
-    -c|--clear)   clear_arming; exit 0 ;;
+    -s|--status) status; exit 0 ;;
+    -c|--clear)
+        grub-editenv "$NOSENV" unset nos_next 2>/dev/null || true
+        echo "nosboot: cancelled; the next boot is Ubuntu"
+        exit 0 ;;
     -n|--no-reboot) REBOOT=no ;;
-    -a|--arm)     ARM=yes ;;
     --install-service) install_service; exit 0 ;;
     "") ;;
-    *) die "usage: nosboot [-n|-a|-c|-s|--install-service]" ;;
+    *) die "usage: nosboot [-n|-c|-s|--install-service]" ;;
 esac
 
 [ -d "$REPO" ] || die "no repository at $REPO"
-command -v grub-editenv >/dev/null || die "grub-editenv not found"
 
 echo "nosboot: building in $REPO"
 make -C "$REPO" nocheck >/dev/null || die "build failed"
@@ -110,26 +105,19 @@ cp "$KERNEL_SRC" "$KERNEL_DST"
 sync
 echo "nosboot: installed $(git -C "$REPO" log --oneline -1 2>/dev/null)"
 
-# Arm only an entry that exists: arming a name GRUB does not know boots the
-# default instead, which looks like the script silently doing nothing.
+# Refuse to arm what GRUB cannot act on. Arming a name it does not know boots
+# the default instead, which presents as the script silently doing nothing.
 grep -q "$ENTRY" /boot/grub/grub.cfg || die "no menu entry '$ENTRY' in grub.cfg"
+[ -f "$NOSENV" ] || die "no environment at $NOSENV; see /etc/grub.d/01_nosenv"
 
-if [ "$ARM" = yes ]; then
-    grub-reboot "$ENTRY"
-    echo "nosboot: armed '$ENTRY' -- and it will NOT clear itself here."
-    echo "         Rebooting from nos comes back to nos. To get out: pick"
-    echo "         Ubuntu at the menu, or run 'nosboot -c' once you are in it."
-fi
+grub-editenv "$NOSENV" set nos_next="$ENTRY"
+sync
+echo "nosboot: armed '$ENTRY' for the next boot only"
 
 if [ "$REBOOT" = no ]; then
     echo "nosboot: not rebooting (-n)"
     exit 0
 fi
 
-if [ "$ARM" = no ]; then
-    echo "nosboot: rebooting -- pick 'nos' at the GRUB menu within the timeout."
-    echo "         Doing nothing boots Ubuntu, and so does rebooting from nos."
-fi
-
-sync
+echo "nosboot: rebooting; the boot after this one is Ubuntu again"
 exec reboot
