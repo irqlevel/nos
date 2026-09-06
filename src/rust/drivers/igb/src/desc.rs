@@ -62,8 +62,13 @@ pub struct RxRing {
     frames: [usize; RING_SIZE],
     /// The slot the chip will complete next, from software's point of view.
     next_to_clean: usize,
-    /// The slot to hand over next. Mirrors what was last written to RDT.
+    /// The slot to hand over next.
     next_to_use: usize,
+    /// What was last written to RDT. Kept because the tail can move without
+    /// a refill: an error frame goes straight back into the ring, and if it
+    /// takes the last free slot the refill that follows posts nothing and
+    /// would leave the chip never told about it.
+    rdt_written: u32,
 }
 
 impl RxRing {
@@ -74,11 +79,20 @@ impl RxRing {
             frames: [0usize; RING_SIZE],
             next_to_clean: 0,
             next_to_use: 0,
+            rdt_written: 0,
         }
     }
 
     fn desc_ptr(&mut self, idx: usize) -> *mut Desc {
         unsafe { (self.dma.as_mut_ptr() as *mut Desc).add(idx) }
+    }
+
+    /// The same address without borrowing the ring mutably, for the state
+    /// dump: that runs from the shell task while the poll owns this ring on
+    /// another CPU, and handing out a second `&mut` to it would be a lie to
+    /// the compiler whether or not the reads are harmless.
+    fn desc_ptr_shared(&self, idx: usize) -> *const Desc {
+        unsafe { (self.dma.as_ptr() as *const Desc).add(idx) }
     }
 
     /// Slots that could still be handed to the chip, keeping the one-descriptor
@@ -128,11 +142,21 @@ impl RxRing {
         self.next_to_use as u32
     }
 
+    /// Whether the tail has moved since it was last published to the chip.
+    pub fn needs_tail_write(&self) -> bool {
+        self.next_to_use as u32 != self.rdt_written
+    }
+
+    /// Record that `tail()` has just been written to RDT.
+    pub fn mark_tail_written(&mut self) {
+        self.rdt_written = self.next_to_use as u32;
+    }
+
     /// Software's two pointers and the status word of the descriptor it is
-    /// waiting on, for the state dump.
-    pub fn debug_state(&mut self) -> (u32, u32, u32, u32) {
+    /// waiting on, for the state dump. Takes `&self`: see `desc_ptr_shared`.
+    pub fn debug_state(&self) -> (u32, u32, u32, u32) {
         let idx = self.next_to_clean;
-        let status = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).d2)) };
+        let status = unsafe { read_volatile(addr_of!((*self.desc_ptr_shared(idx)).d2)) };
         let posted = if self.frames[idx] != 0 { 1 } else { 0 };
         (
             self.next_to_clean as u32,
