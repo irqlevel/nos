@@ -1,8 +1,20 @@
 [build]
 target = "x86_64-unknown-none"
 
+# Frame pointers on both targets, to match the C++ side's
+# -fno-omit-frame-pointer. Release builds drop them by default, and the
+# kernel's stack walker -- used by the panic backtrace, the `stacks` command
+# and the PMU profiler -- has nothing else to follow. Without them a sample
+# landing in Rust either produced no chain at all or jumped straight from the
+# Rust leaf to the nearest C++ ancestor, silently skipping every Rust frame in
+# between: a profile of a kernel whose NVMe and NIC drivers are entirely Rust
+# could not see inside either of them. The cost is a register and a push/pop
+# per call, which the C++ half has always paid.
 [target.x86_64-unknown-none]
-rustflags = ["-Ccode-model=large"]
+rustflags = ["-Ccode-model=large", "-Cforce-frame-pointers=yes"]
+
+[target.aarch64-unknown-none-softfloat]
+rustflags = ["-Cforce-frame-pointers=yes"]
 
 [unstable]
 build-std = ["core", "alloc"]
