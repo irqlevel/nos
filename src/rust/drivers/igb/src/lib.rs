@@ -468,21 +468,23 @@ fn mdic_wait(regs: &io::MmioRegion) -> Option<u32> {
 
 /// Where the PHY answers on the MDIO bus.
 ///
-/// The 82576 has it at address 1 and no register to say so. From the I210 on
-/// it is a field in MDICNFG, loaded from the NVM, and a card that puts it
-/// somewhere else would leave every PHY read returning the bus idle pattern
-/// -- which looks like a PHY that is present and says nothing, not like an
-/// error. Falls back to 1, which is both the older parts' fixed address and
-/// what the field almost always holds.
+/// On a copper part this selects nothing: MDICNFG.destination is clear, every
+/// MDIC access goes to the integrated PHY, and the address field is ignored.
+/// MDICNFG.PHYADD is for an *external* PHY on an SGMII or SerDes board, which
+/// this driver does not handle. The value is reported rather than derived, so
+/// a log from a board that turns out to be wired differently says so.
 fn phy_address(regs: &io::MmioRegion, generation: Generation) -> u32 {
     if generation != Generation::I210 {
         return PHY_ADDR_INTERNAL;
     }
 
-    let addr = (regs.read32(MDICNFG) & MDICNFG_PHY_MASK) >> MDICNFG_PHY_SHIFT;
-    if addr == 0 {
+    let external = (regs.read32(MDICNFG) & MDICNFG_DESTINATION) != 0;
+    if !external {
         return PHY_ADDR_INTERNAL;
     }
+
+    let addr = (regs.read32(MDICNFG) & MDICNFG_PHY_MASK) >> MDICNFG_PHY_SHIFT;
+    trace!(0, "igb: MDICNFG selects an external PHY at address {}", addr);
     addr
 }
 
@@ -541,6 +543,25 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
         }
     };
 
+    /* Say what to offer before asking for a round of negotiation. With
+     * auto-negotiation enabled the speed and duplex bits in BMCR are ignored
+     * -- what the partner sees comes from these two registers -- and leaving
+     * them at whatever the PHY powered up with is how a gigabit port and a
+     * gigabit PHY settled on 10BASE-T full duplex on the first machine this
+     * ran on. */
+    if !phy_write(regs, phy_addr, PHY_ANAR, ANAR_ADVERTISE_ALL) {
+        trace!(0, "igb: PHY advertisement write failed");
+        return false;
+    }
+
+    if !phy_write(regs, phy_addr, PHY_GCTL, GCTL_1000_FULL | GCTL_1000_HALF) {
+        trace!(0, "igb: PHY gigabit advertisement write failed");
+        return false;
+    }
+
+    /* Speed and duplex here are what the link falls back to if the partner
+     * cannot negotiate at all; the restart is what makes the advertisement
+     * above take effect. */
     let want = (bmcr & !BMCR_PDOWN) | BMCR_ANENABLE | BMCR_ANRESTART
         | BMCR_FULLDPLX
         | BMCR_SPEED1000;
@@ -962,6 +983,15 @@ extern "C" fn igb_isr(ctx: *mut u8) {
             if eicr & EICR_VECTOR0 == 0 {
                 return;
             }
+
+            /* Clear it by writing the bits back. EICR is documented as
+             * cleared on read only when GPIE.Multiple_MSIX is zero, and this
+             * driver sets that bit -- so a read alone leaves the cause
+             * standing and the interrupt re-asserts the moment it is armed
+             * again. Measured on an I210 before this line existed: 434
+             * million interrupts and 144 million poll rounds, with not one
+             * frame received. (333016 rev 3.7, section 8.8.3.) */
+            regs.write32(EICR, eicr);
         }
 
         /* Reading the cause register clears it, so this is the only chance to
