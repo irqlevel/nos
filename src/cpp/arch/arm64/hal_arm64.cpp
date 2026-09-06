@@ -55,6 +55,11 @@ void PmuStop()
 {
 }
 
+const char* PmuName()
+{
+    return "none";
+}
+
 void PrintCpuInfo(Stdlib::Printer& con)
 {
     ulong midr, ctr, mmfr0;

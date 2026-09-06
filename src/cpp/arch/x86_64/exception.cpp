@@ -163,6 +163,12 @@ void ExceptionTable::ExcNMI(Context* ctx)
         return;
     }
 
+    /* An AMD part delivering the tail of an overflow this CPU has already
+       handled. Not a sample -- there is nothing new to record -- but not a
+       fault to bring the machine down over either. */
+    if (Pmu::AbsorbSpuriousNmi())
+        return;
+
     PanicCtx(ctx, false, "EXC: NMI rip 0x%p rsp 0x%p",
         ctx->GetRetRip(), ctx->GetOrigRsp());
 }
