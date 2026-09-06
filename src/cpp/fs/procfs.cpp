@@ -1,4 +1,5 @@
 #include "procfs.h"
+#include "version_gen.h"
 
 #include <lib/stdlib.h>
 #include <kernel/parameters.h>
@@ -29,7 +30,8 @@ bool ProcFs::Mount()
     /* /proc/version */
     {
         char buf[128];
-        Stdlib::SnPrintf(buf, sizeof(buf), "nos %s", KERNEL_VERSION);
+        Stdlib::SnPrintf(buf, sizeof(buf), "nos %s (%s)", KERNEL_VERSION,
+            KERNEL_GIT_REV);
         VNode* node = CreateFile(root, "version");
         if (node != nullptr)
             Write(node, buf, Stdlib::StrLen(buf));
