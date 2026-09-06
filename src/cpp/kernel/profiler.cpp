@@ -75,8 +75,8 @@ bool Profiler::Start()
     }
 
     /* Asked once, on the CPU running the shell: the answer is a property of
-       the part, and the fixed counters are the one thing the two core types
-       of a hybrid CPU do agree about. */
+       the part, and the cycle counter is the one thing the two core types of
+       a hybrid CPU do agree about. */
     UsePmu = Hal::PmuAvailable();
 
     Active = true;
@@ -301,7 +301,7 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
        function has to be very hot to appear at all, and nothing that runs
        with interrupts off appears ever. */
     printer.Printf("%u samples on %u cpus, %u dropped, source %s\n",
-        total, cpus, dropped, UsePmu ? "pmu/nmi" : "tick");
+        total, cpus, dropped, UsePmu ? Hal::PmuName() : "tick");
 
     if (total == 0)
     {
@@ -309,6 +309,12 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
             printer.Printf("(no sample landed in pid %u -- it may have been "
                 "asleep the whole window, which is what a task that is not "
                 "running looks like)\n", pidFilter);
+        else if (UsePmu)
+            /* The counter counts unhalted cycles, so a machine that spent the
+               window in `hlt` produces nothing at all -- where the tick would
+               have shown a stack full of idle. */
+            printer.Printf("(nothing sampled -- every cpu was halted for the "
+                "whole window, or the window was too short)\n");
         else
             printer.Printf("(nothing sampled -- was the window too short?)\n");
 
