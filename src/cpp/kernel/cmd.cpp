@@ -510,6 +510,11 @@ struct IgbState
     u32 Tctl;
     u32 Ims;
     u32 Eitr;
+    u64 StatTpr;
+    u64 StatGprc;
+    u64 StatMpc;
+    u64 StatRnbc;
+    u64 StatRxerrc;
     u32 Rxdctl;
     u32 Srrctl;
     u32 Rdh;
@@ -591,6 +596,13 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
         (ulong)st.RxPackets, (ulong)st.RxDropped, (ulong)st.RxErrEvents);
     con.Printf("rx polls %u, of them budget-limited %u\n",
         (ulong)st.RxPolls, (ulong)st.RxBudgetHits);
+    /* The chip's own view, which the ring counters cannot see: a frame the MAC
+       dropped before it reached for a descriptor never appears above. TPR is
+       everything taken off the wire, MPC what the receive FIFO had no room
+       for, RNBC what found no descriptor waiting. */
+    con.Printf("mac: total %u good %u missed %u no-buffer %u errors %u\n",
+        (ulong)st.StatTpr, (ulong)st.StatGprc, (ulong)st.StatMpc,
+        (ulong)st.StatRnbc, (ulong)st.StatRxerrc);
 }
 
 static void CmdNicdump(const char* args, Stdlib::Printer& con)
