@@ -34,6 +34,21 @@ pub const EIMC: usize = 0x01528; /* Extended Mask Clear */
 pub const EIAC: usize = 0x0152C; /* Extended Auto Clear */
 pub const EIAM: usize = 0x01530; /* Extended Auto Mask */
 pub const EICR: usize = 0x01580; /* Extended Cause */
+/* Interrupt throttling, one per MSI-X vector. A guaranteed minimum delay
+   between interrupts, in microseconds, and -- the part that matters -- it is
+   documented as *not* reset by a device reset. Whatever firmware left in it
+   stands until the driver says otherwise, and left alone it caps the receive
+   rate no matter how idle the CPU is. */
+pub const EITR0: usize = 0x01680;
+pub const EITR_INTERVAL_SHIFT: u32 = 2;
+pub const EITR_INTERVAL_MASK: u32 = 0x1FFF << EITR_INTERVAL_SHIFT;
+
+/* Microseconds between interrupts. Two is the low end of the range the
+   datasheet suggests, and with the receive sources masked for the duration of
+   a poll the real rate is set by how fast the ring drains, not by this. Zero
+   is not a legal setting. */
+pub const EITR_INTERVAL_US: u32 = 2;
+
 pub const IVAR0: usize = 0x01700; /* queue-to-vector map, 2 queues per reg */
 pub const IVAR_MISC: usize = 0x01740; /* non-queue causes */
 

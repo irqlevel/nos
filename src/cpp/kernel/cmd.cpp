@@ -509,6 +509,7 @@ struct IgbState
     u32 Rctl;
     u32 Tctl;
     u32 Ims;
+    u32 Eitr;
     u32 Rxdctl;
     u32 Srrctl;
     u32 Rdh;
@@ -574,6 +575,10 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
     con.Printf("rctl 0x%p rx-en %u  tctl 0x%p tx-en %u  ims 0x%p\n",
         (ulong)st.Rctl, (ulong)((st.Rctl & RctlEn) ? 1 : 0),
         (ulong)st.Tctl, (ulong)((st.Tctl & TctlEn) ? 1 : 0), (ulong)st.Ims);
+    /* Microseconds the chip holds interrupts apart. Firmware leaves a value
+       here that a device reset does not clear, and it caps the receive rate
+       on its own. */
+    con.Printf("interrupt throttle %u us\n", (ulong)st.Eitr);
     con.Printf("rxdctl 0x%p queue-en %u srrctl 0x%p\n", (ulong)st.Rxdctl,
         (ulong)((st.Rxdctl & XdctlEnable) ? 1 : 0), (ulong)st.Srrctl);
     con.Printf("rx ring: rdh %u rdt %u  clean %u use %u\n",

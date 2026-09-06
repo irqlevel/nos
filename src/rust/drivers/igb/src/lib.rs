@@ -1087,6 +1087,20 @@ fn arm_msix(regs: &io::MmioRegion) {
         GPIE_MSIX_MODE | GPIE_PBA | GPIE_EIAME | GPIE_NSICR,
     );
 
+    /* Take the throttle off before anything is armed. Firmware leaves a value
+     * here and a device reset does not clear it: measured on the I210, the
+     * receive rate sat at 169k packets a second with the CPU 93% idle,
+     * because the chip was holding interrupts apart and nothing else was
+     * wrong. */
+    let inherited = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
+    regs.write32(EITR0, EITR_INTERVAL_US << EITR_INTERVAL_SHIFT);
+    trace!(
+        0,
+        "igb: interrupt throttle was {} us, set to {}",
+        inherited,
+        EITR_INTERVAL_US
+    );
+
     regs.write32(IVAR0, IVAR_VALID | (IVAR_VALID << 8));
     regs.write32(IVAR_MISC, IVAR_VALID << 8);
 
@@ -1397,6 +1411,7 @@ pub struct IgbState {
     pub rctl: u32,
     pub tctl: u32,
     pub ims: u32,
+    pub eitr: u32,
     pub rxdctl: u32,
     pub srrctl: u32,
     pub rdh: u32,
@@ -1462,6 +1477,7 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
         (*out).rctl = regs.read32(RCTL);
         (*out).tctl = regs.read32(TCTL);
         (*out).ims = regs.read32(IMS);
+        (*out).eitr = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
         (*out).rxdctl = regs.read32(RXDCTL0);
         (*out).srrctl = regs.read32(SRRCTL0);
         (*out).rdh = regs.read32(RDH0);
