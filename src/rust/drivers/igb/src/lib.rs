@@ -117,6 +117,10 @@ struct IgbDevice {
     msix: bool,
     generation: Generation,
     phy_addr: u32,
+    /* Set by the interrupt when the link changes, acted on by the poll: the
+       work it asks for is a PHY read, which means polling MDIC for
+       milliseconds, and that has no business in an interrupt handler. */
+    link_event: AtomicU32,
     tx_ring: TxRing,
     rx_ring: RxRing,
     net_handle: net::NetDeviceHandle,
@@ -625,6 +629,101 @@ fn phy_start_link_locked(regs: &io::MmioRegion, phy_addr: u32) -> bool {
     up
 }
 
+/// What auto-negotiation resolved to, worked out from the advertisement both
+/// sides made. Returns the CTRL.SPEED encoding and whether it is full duplex.
+///
+/// Read from the PHY rather than taken from STATUS.ASDV: that field is
+/// documented as diagnostic, and on a device that does not implement it -- a
+/// QEMU model, say -- it reads zero, which taken at face value forces a
+/// gigabit link down to 10 Mb/s. The advertisements cannot lie in that
+/// direction; the highest ability both sides claim is what the link is.
+fn resolve_link(regs: &io::MmioRegion, phy_addr: u32) -> Option<(u32, bool)> {
+    let bmsr = phy_read(regs, phy_addr, PHY_BMSR)?;
+    if bmsr & BMSR_ANEGCOMPLETE == 0 {
+        return None;
+    }
+
+    let ours = phy_read(regs, phy_addr, PHY_ANAR)?;
+    let theirs = phy_read(regs, phy_addr, PHY_ANLPAR)?;
+    let gctl = phy_read(regs, phy_addr, PHY_GCTL)?;
+    let gstat = phy_read(regs, phy_addr, PHY_GSTAT)?;
+
+    /* In the order 802.3 resolves them: fastest common ability wins, full
+     * duplex ahead of half at the same speed. */
+    if gctl & GCTL_1000_FULL != 0 && gstat & GSTAT_PARTNER_1000_FULL != 0 {
+        return Some((CTRL_SPEED_1000, true));
+    }
+    if gctl & GCTL_1000_HALF != 0 && gstat & GSTAT_PARTNER_1000_HALF != 0 {
+        return Some((CTRL_SPEED_1000, false));
+    }
+    if ours & theirs & ANAR_100_FULL != 0 {
+        return Some((CTRL_SPEED_100, true));
+    }
+    if ours & theirs & ANAR_100_HALF != 0 {
+        return Some((CTRL_SPEED_100, false));
+    }
+    if ours & theirs & ANAR_10_FULL != 0 {
+        return Some((CTRL_SPEED_10, true));
+    }
+    if ours & theirs & ANAR_10_HALF != 0 {
+        return Some((CTRL_SPEED_10, false));
+    }
+
+    None
+}
+
+/// Put the MAC on the speed the link actually settled at.
+///
+/// Auto-speed detection is not a standing arrangement: the datasheet says the
+/// speed "is configured only once after the LINK signal is asserted by the
+/// PHY". A PHY that asserts link early -- before negotiation finishes -- and
+/// then resolves upward leaves the MAC latched at whatever it saw first.
+/// Measured on an I210 against a gigabit switch: the MAC ran at 10 Mb/s with
+/// both sides advertising 1000BASE-T full and no master/slave fault. A MAC
+/// clocked for 10 against a PHY running at 1000 receives nothing, which is
+/// exactly what a dead receive ring with a healthy link and a healthy filter
+/// looks like from the outside.
+///
+/// Runs in task context, not from the interrupt: reading the PHY means
+/// polling MDIC, which is milliseconds.
+fn sync_mac_speed(regs: &io::MmioRegion, phy_addr: u32) {
+    let status = regs.read32(STATUS);
+    if status & STATUS_LU == 0 {
+        return;
+    }
+
+    let (speed, full) = match resolve_link(regs, phy_addr) {
+        Some(pair) => pair,
+        None => return,
+    };
+
+    let latched = (status & STATUS_SPEED_MASK) >> STATUS_SPEED_SHIFT;
+    let latched_full = status & STATUS_FD != 0;
+    if latched == speed && latched_full == full {
+        return;
+    }
+
+    let mut ctrl = regs.read32(CTRL);
+    /* Forcing is only honoured with detection out of the way: CTRL.SPEED is
+     * documented as ignored while ASDE is set. */
+    ctrl = ctrl & !(CTRL_ASDE | CTRL_SPEED_MASK | CTRL_FD);
+    ctrl = ctrl | CTRL_FRCSPD | CTRL_FRCDPLX;
+    ctrl = ctrl | (speed << CTRL_SPEED_SHIFT);
+    if full {
+        ctrl = ctrl | CTRL_FD;
+    }
+    regs.write32(CTRL, ctrl);
+
+    trace!(
+        0,
+        "igb: MAC was latched at speed {} duplex {}, link resolved to {} duplex {}; forced",
+        latched,
+        if latched_full { 1 } else { 0 },
+        speed,
+        if full { 1 } else { 0 }
+    );
+}
+
 fn trace_link(regs: &io::MmioRegion) {
     let status = regs.read32(STATUS);
     if status & STATUS_LU == 0 {
@@ -878,6 +977,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
         msix: false,
         generation,
         phy_addr,
+        link_event: AtomicU32::new(0),
         tx_ring,
         rx_ring,
         net_handle: net::NetDeviceHandle::placeholder(),
@@ -1040,7 +1140,7 @@ extern "C" fn igb_isr(ctx: *mut u8) {
         }
 
         if icr & ICR_LSC != 0 {
-            trace_link(regs);
+            (*dev).link_event.store(1, Ordering::Release);
         }
 
         if icr & ICR_RXO != 0 {
@@ -1073,6 +1173,32 @@ extern "C" fn igb_isr(ctx: *mut u8) {
 
 /* ================================================================== */
 /* Receive */
+
+/// Bring the MAC into step with a link that has just changed, and say so.
+///
+/// Task context, from the poll: takes the PHY semaphore where the part shares
+/// its MDIO bus with firmware, which is not something to do from an interrupt.
+unsafe fn handle_link_event(dev: *mut IgbDevice) {
+    if (*dev).link_event.swap(0, Ordering::AcqRel) == 0 {
+        return;
+    }
+
+    let regs = &(*dev).regs;
+    let generation = (*dev).generation;
+
+    if generation == Generation::I210 && !swfw_acquire(regs, SWFW_PHY0_SM) {
+        trace!(0, "igb: link changed, but the PHY semaphore is held elsewhere");
+        return;
+    }
+
+    sync_mac_speed(regs, (*dev).phy_addr);
+
+    if generation == Generation::I210 {
+        swfw_release(regs, SWFW_PHY0_SM);
+    }
+
+    trace_link(regs);
+}
 
 /// Put buffers back into every slot the chip has given up, and publish them.
 /// Returns whether the tail moved.
@@ -1115,6 +1241,8 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
     let mut polls: u32 = 0;
 
     unsafe {
+        handle_link_event(dev);
+
         /* Harvested frames wait here until the batch is complete, so the
          * receive queue's lock is taken once rather than once per frame. */
         let mut batch: [usize; RX_BUDGET as usize] = [0; RX_BUDGET as usize];
