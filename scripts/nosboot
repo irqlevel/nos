@@ -4,24 +4,29 @@
 # Install as /usr/local/sbin/nosboot on a machine that dual-boots Ubuntu and
 # nos. Ubuntu stays the default boot entry; this arms the next boot only.
 #
-#   nosboot          build, install, arm the next boot, reboot
+#   nosboot          build, install, reboot -- pick nos at the GRUB menu
 #   nosboot -n       build and install, do not reboot
-#   nosboot -c       clear the arming, so the next boot is Ubuntu again
+#   nosboot -a       also arm the next boot, for a machine with no console
+#   nosboot -c       clear an arming left behind by -a
 #   nosboot -s       show what is installed and what is armed
 #
-# WHY THE ARMING HAS TO BE CLEARED BY UBUNTU, NOT BY GRUB.
+# WHY THE DEFAULT DOES NOT ARM ANYTHING.
 #
-# grub-reboot works by writing next_entry into grubenv; GRUB is supposed to
-# clear it as it boots, so the choice lasts exactly one boot. GRUB cannot
-# write to a filesystem on mdadm RAID, and on these machines /boot is exactly
-# that -- so the write fails silently and the arming sticks. nos then boots
-# every time, and with no serial port and no menu that is a machine you cannot
-# get back.
+# grub-reboot works by writing next_entry into grubenv and letting GRUB clear
+# it as it boots, so the choice lasts exactly one boot. GRUB cannot write to a
+# filesystem on mdadm RAID, and on these machines /boot is exactly that -- so
+# the clear fails silently and the choice sticks. nos then boots every time,
+# including when nos itself reboots, and the machine never comes back on its
+# own.
 #
-# Two things stop that. The GRUB menu is visible with a timeout, so Ubuntu can
-# always be chosen by hand from a console; and nos-grub-reset.service (see
-# --install-service) clears the arming every time Ubuntu boots, so getting
-# back once is enough to stay back.
+# So the default here is what the other host already does: leave Ubuntu as the
+# default entry, show the menu, and choose nos by hand. Do nothing and the
+# machine boots Ubuntu; that property is worth more than saving a keystroke.
+#
+# -a is for when there is no console at all. It arms the one-shot knowing it
+# will stick, and getting back then needs either the menu or, once Ubuntu is
+# reached, nos-grub-reset.service (see --install-service), which clears the
+# arming on every Ubuntu boot so that reaching it once is enough.
 
 set -e
 
@@ -83,13 +88,15 @@ UNIT
 }
 
 REBOOT=yes
+ARM=no
 case "$1" in
     -s|--status)  status; exit 0 ;;
     -c|--clear)   clear_arming; exit 0 ;;
     -n|--no-reboot) REBOOT=no ;;
+    -a|--arm)     ARM=yes ;;
     --install-service) install_service; exit 0 ;;
     "") ;;
-    *) die "usage: nosboot [-n|-c|-s|--install-service]" ;;
+    *) die "usage: nosboot [-n|-a|-c|-s|--install-service]" ;;
 esac
 
 [ -d "$REPO" ] || die "no repository at $REPO"
@@ -107,14 +114,22 @@ echo "nosboot: installed $(git -C "$REPO" log --oneline -1 2>/dev/null)"
 # default instead, which looks like the script silently doing nothing.
 grep -q "$ENTRY" /boot/grub/grub.cfg || die "no menu entry '$ENTRY' in grub.cfg"
 
+if [ "$ARM" = yes ]; then
+    grub-reboot "$ENTRY"
+    echo "nosboot: armed '$ENTRY' -- and it will NOT clear itself here."
+    echo "         Rebooting from nos comes back to nos. To get out: pick"
+    echo "         Ubuntu at the menu, or run 'nosboot -c' once you are in it."
+fi
+
 if [ "$REBOOT" = no ]; then
-    echo "nosboot: not rebooting (-n); run 'nosboot' again or reboot by hand"
+    echo "nosboot: not rebooting (-n)"
     exit 0
 fi
 
-grub-reboot "$ENTRY"
-echo "nosboot: next boot is '$ENTRY'; rebooting"
-echo "nosboot: to come back, pick Ubuntu at the GRUB menu -- the arming does"
-echo "         not clear itself here, but Ubuntu clears it on the way up"
+if [ "$ARM" = no ]; then
+    echo "nosboot: rebooting -- pick 'nos' at the GRUB menu within the timeout."
+    echo "         Doing nothing boots Ubuntu, and so does rebooting from nos."
+fi
+
 sync
 exec reboot
