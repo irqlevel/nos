@@ -33,6 +33,10 @@ over the network instead:
 - `loglevel=N` at boot or `loglevel N` in the shell raises the trace level
   without a rebuild; see [Kernel parameters](kernel-parameters.md).
 
+The boot sequence itself, and what each marker means, is in
+[Boot](boot.md); `profile` and its two sample sources are in
+[Profiler](profiler.md).
+
 ## Boot tests
 
 There is no separate test binary: self-tests live in `src/cpp/kernel/test.cpp`
