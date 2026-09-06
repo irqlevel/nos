@@ -1,0 +1,120 @@
+#!/bin/sh
+# Build the nos kernel, install it, and reboot into it once.
+#
+# Install as /usr/local/sbin/nosboot on a machine that dual-boots Ubuntu and
+# nos. Ubuntu stays the default boot entry; this arms the next boot only.
+#
+#   nosboot          build, install, arm the next boot, reboot
+#   nosboot -n       build and install, do not reboot
+#   nosboot -c       clear the arming, so the next boot is Ubuntu again
+#   nosboot -s       show what is installed and what is armed
+#
+# WHY THE ARMING HAS TO BE CLEARED BY UBUNTU, NOT BY GRUB.
+#
+# grub-reboot works by writing next_entry into grubenv; GRUB is supposed to
+# clear it as it boots, so the choice lasts exactly one boot. GRUB cannot
+# write to a filesystem on mdadm RAID, and on these machines /boot is exactly
+# that -- so the write fails silently and the arming sticks. nos then boots
+# every time, and with no serial port and no menu that is a machine you cannot
+# get back.
+#
+# Two things stop that. The GRUB menu is visible with a timeout, so Ubuntu can
+# always be chosen by hand from a console; and nos-grub-reset.service (see
+# --install-service) clears the arming every time Ubuntu boots, so getting
+# back once is enough to stay back.
+
+set -e
+
+REPO=${NOSBOOT_REPO:-/root/nos}
+KERNEL_SRC=$REPO/kernel64.elf
+KERNEL_DST=${NOSBOOT_KERNEL:-/boot/nos-kernel64.elf}
+ENTRY=${NOSBOOT_ENTRY:-nos-multiboot2}
+GRUBENV=/boot/grub/grubenv
+
+die() { echo "nosboot: $*" >&2; exit 1; }
+
+armed() { grub-editenv "$GRUBENV" list 2>/dev/null | sed -n 's/^next_entry=//p'; }
+
+status() {
+    if [ -f "$KERNEL_DST" ]; then
+        echo "installed: $KERNEL_DST ($(stat -c %y "$KERNEL_DST" | cut -d. -f1))"
+    else
+        echo "installed: nothing at $KERNEL_DST"
+    fi
+    if [ -d "$REPO/.git" ]; then
+        echo "repo:      $(git -C "$REPO" log --oneline -1 2>/dev/null)"
+    fi
+    a=$(armed)
+    if [ -n "$a" ]; then
+        echo "armed:     next boot is '$a'"
+    else
+        echo "armed:     no, next boot is the default (Ubuntu)"
+    fi
+}
+
+clear_arming() {
+    grub-editenv "$GRUBENV" unset next_entry 2>/dev/null || true
+    echo "nosboot: cleared; the next boot is Ubuntu"
+}
+
+install_service() {
+    cat > /etc/systemd/system/nos-grub-reset.service <<'UNIT'
+[Unit]
+Description=Clear a stale nos one-shot boot selection
+Documentation=man:grub-reboot(8)
+# GRUB cannot write to grubenv on mdadm RAID, so it never clears the one-shot
+# selection it was given. Ubuntu clears it instead: reaching Ubuntu once is
+# then enough to keep reaching it.
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/grub-editenv /boot/grub/grubenv unset next_entry
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable nos-grub-reset.service
+    echo "nosboot: installed and enabled nos-grub-reset.service"
+}
+
+REBOOT=yes
+case "$1" in
+    -s|--status)  status; exit 0 ;;
+    -c|--clear)   clear_arming; exit 0 ;;
+    -n|--no-reboot) REBOOT=no ;;
+    --install-service) install_service; exit 0 ;;
+    "") ;;
+    *) die "usage: nosboot [-n|-c|-s|--install-service]" ;;
+esac
+
+[ -d "$REPO" ] || die "no repository at $REPO"
+command -v grub-editenv >/dev/null || die "grub-editenv not found"
+
+echo "nosboot: building in $REPO"
+make -C "$REPO" nocheck >/dev/null || die "build failed"
+[ -f "$KERNEL_SRC" ] || die "no kernel at $KERNEL_SRC after the build"
+
+cp "$KERNEL_SRC" "$KERNEL_DST"
+sync
+echo "nosboot: installed $(git -C "$REPO" log --oneline -1 2>/dev/null)"
+
+# Arm only an entry that exists: arming a name GRUB does not know boots the
+# default instead, which looks like the script silently doing nothing.
+grep -q "$ENTRY" /boot/grub/grub.cfg || die "no menu entry '$ENTRY' in grub.cfg"
+
+if [ "$REBOOT" = no ]; then
+    echo "nosboot: not rebooting (-n); run 'nosboot' again or reboot by hand"
+    exit 0
+fi
+
+grub-reboot "$ENTRY"
+echo "nosboot: next boot is '$ENTRY'; rebooting"
+echo "nosboot: to come back, pick Ubuntu at the GRUB menu -- the arming does"
+echo "         not clear itself here, but Ubuntu clears it on the way up"
+sync
+exec reboot
