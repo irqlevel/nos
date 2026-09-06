@@ -241,7 +241,9 @@ pub const PHY_ADDR_INTERNAL: u32 = 1;
 pub const PHY_BMCR: u32 = 0; /* basic mode control */
 pub const PHY_BMSR: u32 = 1; /* basic mode status */
 pub const PHY_ANAR: u32 = 4; /* auto-negotiation advertisement */
+pub const PHY_ANLPAR: u32 = 5; /* what the link partner offered */
 pub const PHY_GCTL: u32 = 9; /* 1000BASE-T control */
+pub const PHY_GSTAT: u32 = 10; /* 1000BASE-T status */
 
 /* What to offer the link partner. Without these the PHY negotiates on
    whatever its advertisement registers happen to hold, which on this part

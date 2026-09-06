@@ -500,6 +500,10 @@ struct IgbState
     u32 Generation;
     u32 PhyBmcr;
     u32 PhyBmsr;
+    u32 PhyAnar;
+    u32 PhyAnlpar;
+    u32 PhyGctl;
+    u32 PhyGstat;
     u32 Ctrl;
     u32 Status;
     u32 Rctl;
@@ -562,6 +566,11 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
         (ulong)st.PhyBmcr, (ulong)st.PhyBmsr,
         (ulong)((st.PhyBmsr & BmsrLstatus) ? 1 : 0),
         (ulong)((st.PhyBmsr & BmsrAnegDone) ? 1 : 0));
+    /* What we offered against what came back: a link that resolves lower than
+       it should is one or the other, and nothing else distinguishes them. */
+    con.Printf("phy adv 0x%p partner 0x%p  1000: ctrl 0x%p status 0x%p\n",
+        (ulong)st.PhyAnar, (ulong)st.PhyAnlpar,
+        (ulong)st.PhyGctl, (ulong)st.PhyGstat);
     con.Printf("rctl 0x%p rx-en %u  tctl 0x%p tx-en %u  ims 0x%p\n",
         (ulong)st.Rctl, (ulong)((st.Rctl & RctlEn) ? 1 : 0),
         (ulong)st.Tctl, (ulong)((st.Tctl & TctlEn) ? 1 : 0), (ulong)st.Ims);
