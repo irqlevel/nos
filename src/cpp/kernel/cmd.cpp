@@ -515,6 +515,8 @@ struct IgbState
     u64 StatMpc;
     u64 StatRnbc;
     u64 StatRxerrc;
+    u32 StatRqdpc;
+    u32 StatPqgprc;
     u32 Rxdctl;
     u32 Srrctl;
     u32 Rdh;
@@ -603,6 +605,10 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
     con.Printf("mac: total %u good %u missed %u no-buffer %u errors %u\n",
         (ulong)st.StatTpr, (ulong)st.StatGprc, (ulong)st.StatMpc,
         (ulong)st.StatRnbc, (ulong)st.StatRxerrc);
+    /* Per queue. RQDPC counts packets the queue was offered and had no
+       descriptor for -- the one drop nothing else in this dump can see. */
+    con.Printf("queue0: good %u dropped-no-descriptor %u\n",
+        (ulong)st.StatPqgprc, (ulong)st.StatRqdpc);
 }
 
 static void CmdNicdump(const char* args, Stdlib::Printer& con)

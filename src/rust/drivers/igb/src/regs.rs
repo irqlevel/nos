@@ -98,6 +98,13 @@ pub const GPRC: usize = 0x04074; /* good packets received */
 pub const RNBC: usize = 0x040A0; /* no descriptor was available */
 pub const TPR: usize = 0x040D0; /* everything the MAC took off the wire */
 
+/* Per-queue, and not read-clear like the five above: these are read as they
+   stand. RQDPC is the one that says a queue was offered a packet and had no
+   descriptor to put it in -- the gap between what the MAC accepted and what
+   the driver ever saw, which nothing else counts. */
+pub const RQDPC0: usize = 0x0C030;
+pub const PQGPRC0: usize = 0x10010;
+
 /* ---- Receive address filter ---- */
 pub const RAL0: usize = 0x05400;
 pub const RAH0: usize = 0x05404;
