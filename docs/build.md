@@ -16,6 +16,23 @@ make
 finding; `make nocheck` skips it. `make smoke` builds in Docker and runs the
 headless boot smoke test (`scripts/smoke-test.sh`).
 
+## No network during a build
+
+The Rust dependencies (rustls and what it brings, see [HTTPS](tls.md)) are
+vendored in `src/rust/vendor` and cargo is run with `--offline`, so a build
+never reaches crates.io — a machine with no internet, or a CI runner with none,
+builds the same as any other.
+
+After adding, removing or bumping a dependency in `src/rust`, refresh that
+directory and commit it together with `Cargo.lock`:
+
+```sh
+scripts/vendor.sh      # this step, and only this step, needs the network
+```
+
+A build that suddenly wants the network is a dependency that was never
+vendored; `--offline` makes it say so instead of quietly fetching.
+
 ## Docker
 
 Works on macOS / Apple Silicon, and packages the whole toolchain:

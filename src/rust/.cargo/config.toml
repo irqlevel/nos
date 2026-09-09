@@ -25,3 +25,11 @@ rustflags = ["-Cforce-frame-pointers=yes", "--cfg", "aes_force_soft", "--cfg", "
 [unstable]
 build-std = ["core", "alloc"]
 build-std-features = []
+
+# The dependency sources live in the tree, so a build never reaches out to
+# crates.io -- see scripts/vendor.sh for how the directory is (re)made.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

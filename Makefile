@@ -355,11 +355,14 @@ $(OUT)/%.o: src/cpp/%.cpp | $(OUT)/version_gen.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -c $< -o $@
 
+# --offline: every dependency source is vendored in src/rust/vendor, so a
+# build that wants the network is a build with a dependency that was never
+# vendored -- fail saying so rather than quietly fetching it (scripts/vendor.sh).
 rust:
-	cd src/rust && cargo build --release --target $(RUST_TARGET)
+	cd src/rust && cargo build --offline --release --target $(RUST_TARGET)
 
 $(RUST_LIB): $(RUST_SRC)
-	cd src/rust && cargo build --release --target $(RUST_TARGET)
+	cd src/rust && cargo build --offline --release --target $(RUST_TARGET)
 
 nos-arm64.img: $(KERNEL)
 	$(OBJCOPY) -O binary $< $@

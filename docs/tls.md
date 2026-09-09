@@ -87,8 +87,17 @@ tls: InvalidCertificate(ExpiredContext { time: UnixTime(1788984857),
 
 **External crates.** These are the first dependencies in the tree that are not
 local paths: `rustls`, `rustls-rustcrypto`, `webpki-roots`, `getrandom` and
-what they pull in. A clean build fetches them from crates.io, so the build
-host (or the Docker container) needs network access the first time.
+what they pull in. Their sources are vendored in `src/rust/vendor` and the
+build runs `cargo --offline`, so nothing is ever fetched during a build. After
+changing a dependency, run `scripts/vendor.sh` (which does need the network,
+once) and commit the result with `Cargo.lock`.
+
+The vendor directory is 31 MB rather than the 143 MB `cargo vendor` produces
+on its own: the lock file holds packages no target compiles — `ring`, an
+optional rustls backend we do not use, and through it the Windows import
+libraries, `wasi` and `libc` — and cargo needs their manifests to resolve but
+never their code, so the script empties them. Emptied, not deleted: cargo
+still looks for the source files the manifest names.
 
 **Software crypto only.** The RustCrypto crates dispatch to SSE2/AVX2 at
 runtime and compile those paths unconditionally, which LLVM cannot legalize
