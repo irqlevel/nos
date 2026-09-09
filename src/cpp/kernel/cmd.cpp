@@ -25,6 +25,8 @@
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
 #include <fs/nanofs.h>
+#include <fs/ext2.h>
+#include <fs/fstest.h>
 #include "entropy.h"
 #include "console.h"
 #include "mutex.h"
@@ -45,6 +47,7 @@
 #include <mm/memory_map.h>
 #include <mm/new.h>
 #include <lib/unique_ptr.h>
+#include <lib/checksum.h>
 
 namespace Kernel
 {
@@ -1074,11 +1077,21 @@ static void CmdTcpstat(const char* args, Stdlib::Printer& con)
 
 static void CmdWget(const char* args, Stdlib::Printer& con)
 {
-    if (!args || args[0] == '\0')
+    const char* end;
+    const char* urlStart = Stdlib::NextToken(args, end);
+    if (urlStart == nullptr)
     {
-        con.Printf("usage: wget <url>\n");
+        con.Printf("usage: wget <url> [path]\n");
         return;
     }
+    char url[HttpMaxUrlHostLen + HttpMaxUrlPathLen];
+    Stdlib::TokenCopy(urlStart, end, url, sizeof(url));
+
+    char path[Vfs::MaxPath];
+    path[0] = '\0';
+    const char* pathStart = Stdlib::NextToken(end, end);
+    if (pathStart != nullptr)
+        Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
     NetDevice* dev = NetDeviceTable::GetInstance().Find("eth0");
     if (!dev)
@@ -1088,7 +1101,7 @@ static void CmdWget(const char* args, Stdlib::Printer& con)
     }
 
     HttpClient client(dev);
-    HttpResponse resp = client.Get(args);
+    HttpResponse resp = client.Get(url);
 
     if (!resp.Ok)
     {
@@ -1101,7 +1114,15 @@ static void CmdWget(const char* args, Stdlib::Printer& con)
     if (resp.Location[0] != '\0')
         con.Printf("Location: %s\n", resp.Location);
 
-    if (resp.Body && resp.BodyLen > 0)
+    if (path[0] != '\0')
+    {
+        /* The body goes to a file, whole or not at all */
+        if (Vfs::GetInstance().WriteFile(path, resp.Body, resp.BodyLen))
+            con.Printf("saved %u bytes to %s\n", resp.BodyLen, path);
+        else
+            con.Printf("write to %s failed\n", path);
+    }
+    else if (resp.Body && resp.BodyLen > 0)
     {
         /* Print body as text, truncate to 4 KB for display */
         static const ulong MaxDisplay = 4096;
@@ -1422,6 +1443,7 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
     {
         con.Printf("usage: mount ramfs <path>\n");
         con.Printf("       mount nanofs <disk> <path>\n");
+        con.Printf("       mount ext2 <disk> <path> [ro]\n");
         return;
     }
     char fsName[16];
@@ -1497,6 +1519,64 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
             con.Printf("mounted nanofs on %s\n", path);
         }
     }
+    else if (Stdlib::StrCmp(fsName, "ext2") == 0)
+    {
+        const char* diskStart = Stdlib::NextToken(end, end);
+        if (diskStart == nullptr)
+        {
+            con.Printf("usage: mount ext2 <disk> <path> [ro]\n");
+            return;
+        }
+        char diskName[16];
+        Stdlib::TokenCopy(diskStart, end, diskName, sizeof(diskName));
+
+        const char* pathStart = Stdlib::NextToken(end, end);
+        if (pathStart == nullptr)
+        {
+            con.Printf("usage: mount ext2 <disk> <path> [ro]\n");
+            return;
+        }
+        char path[Vfs::MaxPath];
+        Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+        bool readOnly = false;
+        const char* optStart = Stdlib::NextToken(end, end);
+        if (optStart != nullptr)
+        {
+            char opt[8];
+            Stdlib::TokenCopy(optStart, end, opt, sizeof(opt));
+            if (Stdlib::StrCmp(opt, "ro") != 0)
+            {
+                con.Printf("usage: mount ext2 <disk> <path> [ro]\n");
+                return;
+            }
+            readOnly = true;
+        }
+
+        BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
+        if (dev == nullptr)
+        {
+            con.Printf("disk '%s' not found\n", diskName);
+            return;
+        }
+
+        Ext2Fs* fs = new (Mm::NoThrow) Ext2Fs(dev);
+        if (fs == nullptr)
+        {
+            con.Printf("failed to allocate ext2\n");
+            return;
+        }
+
+        if (!Vfs::GetInstance().Mount(path, fs, readOnly))
+        {
+            delete fs;
+            con.Printf("mount failed\n");
+        }
+        else
+        {
+            con.Printf("mounted ext2 on %s (%s)\n", path, fs->ReadOnly ? "ro" : "rw");
+        }
+    }
     else
     {
         con.Printf("unknown filesystem '%s'\n", fsName);
@@ -1534,15 +1614,13 @@ static void CmdMounts(const char* args, Stdlib::Printer& con)
 
 static void CmdLs(const char* args, Stdlib::Printer& con)
 {
+    char path[Vfs::MaxPath];
     const char* end;
     const char* pathStart = Stdlib::NextToken(args, end);
     if (pathStart == nullptr)
-    {
-        con.Printf("usage: ls <path>\n");
-        return;
-    }
-    char path[Vfs::MaxPath];
-    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+        Stdlib::StrnCpy(path, "/", sizeof(path));
+    else
+        Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
     Vfs::GetInstance().ListDir(path, con);
 }
 
@@ -1630,6 +1708,241 @@ static void CmdTouch(const char* args, Stdlib::Printer& con)
     }
 }
 
+/* The name after the last slash: what a copy into a directory is called */
+static const char* BaseName(const char* path)
+{
+    const char* base = path;
+    for (const char* p = path; *p != '\0'; p++)
+    {
+        if (*p == '/' && p[1] != '\0')
+            base = p + 1;
+    }
+    return base;
+}
+
+/* dst, or dst/<basename of src> when dst is an existing directory */
+static bool ResolveCopyTarget(const char* src, const char* dst, char* out, ulong outSize)
+{
+    FileStat st;
+    if (Vfs::GetInstance().Stat(dst, st) && st.Type == VNode::TypeDir)
+    {
+        ulong dstLen = Stdlib::StrLen(dst);
+        bool slash = (dstLen > 0 && dst[dstLen - 1] == '/');
+        int n = Stdlib::SnPrintf(out, outSize, slash ? "%s%s" : "%s/%s", dst, BaseName(src));
+        return n > 0 && (ulong)n < outSize;
+    }
+
+    Stdlib::StrnCpy(out, dst, outSize);
+    return Stdlib::StrLen(dst) < outSize;
+}
+
+static const ulong CopyChunk = 64 * 1024;
+
+/* One file, through the file API in 64 KiB pieces: neither side has to
+   fit in memory. Fails with the target left as it was written so far. */
+static bool CopyFile(const char* src, const char* dst, Stdlib::Printer& con, ulong& copied)
+{
+    auto& vfs = Vfs::GetInstance();
+    copied = 0;
+
+    File* in = vfs.Open(src, Vfs::OpenRead);
+    if (in == nullptr)
+    {
+        con.Printf("cp: cannot open %s\n", src);
+        return false;
+    }
+
+    File* out = vfs.Open(dst, Vfs::OpenWrite | Vfs::OpenCreate | Vfs::OpenTruncate);
+    if (out == nullptr)
+    {
+        con.Printf("cp: cannot create %s\n", dst);
+        vfs.Close(in);
+        return false;
+    }
+
+    u8* buf = (u8*)Mm::Alloc(CopyChunk, 0);
+    if (buf == nullptr)
+    {
+        con.Printf("cp: alloc failed\n");
+        vfs.Close(out);
+        vfs.Close(in);
+        return false;
+    }
+
+    bool ok = true;
+    for (;;)
+    {
+        ulong got = 0;
+        if (!vfs.Read(in, buf, CopyChunk, got))
+        {
+            con.Printf("cp: read from %s failed\n", src);
+            ok = false;
+            break;
+        }
+        if (got == 0)
+            break;
+        if (!vfs.Write(out, buf, got))
+        {
+            con.Printf("cp: write to %s failed\n", dst);
+            ok = false;
+            break;
+        }
+        copied += got;
+    }
+
+    Mm::Free(buf);
+    vfs.Close(out);
+    vfs.Close(in);
+    return ok;
+}
+
+/* Deep enough for anything a rootfs holds; the paths cap it anyway */
+static const ulong CopyMaxDepth = 32;
+
+static bool CopyTree(const char* src, const char* dst, ulong depth, Stdlib::Printer& con,
+                     ulong& files, ulong& bytes)
+{
+    auto& vfs = Vfs::GetInstance();
+
+    if (depth >= CopyMaxDepth)
+    {
+        con.Printf("cp: %s: too deep\n", src);
+        return false;
+    }
+
+    FileStat st;
+    if (!vfs.Stat(dst, st))
+    {
+        if (!vfs.CreateDir(dst))
+        {
+            con.Printf("cp: cannot create directory %s\n", dst);
+            return false;
+        }
+    }
+    else if (st.Type != VNode::TypeDir)
+    {
+        con.Printf("cp: %s exists and is not a directory\n", dst);
+        return false;
+    }
+
+    DirEntry entry;
+    for (ulong i = 0; vfs.ReadDir(src, i, entry); i++)
+    {
+        char from[Vfs::MaxPath];
+        char to[Vfs::MaxPath];
+        ulong srcLen = Stdlib::StrLen(src);
+        ulong dstLen = Stdlib::StrLen(dst);
+        bool srcSlash = (srcLen > 0 && src[srcLen - 1] == '/');
+        bool dstSlash = (dstLen > 0 && dst[dstLen - 1] == '/');
+        int n1 = Stdlib::SnPrintf(from, sizeof(from), srcSlash ? "%s%s" : "%s/%s", src, entry.Name);
+        int n2 = Stdlib::SnPrintf(to, sizeof(to), dstSlash ? "%s%s" : "%s/%s", dst, entry.Name);
+        if (n1 <= 0 || (ulong)n1 >= sizeof(from) || n2 <= 0 || (ulong)n2 >= sizeof(to))
+        {
+            con.Printf("cp: path too long under %s\n", src);
+            return false;
+        }
+
+        if (entry.Type == VNode::TypeDir)
+        {
+            if (!CopyTree(from, to, depth + 1, con, files, bytes))
+                return false;
+        }
+        else
+        {
+            ulong copied = 0;
+            if (!CopyFile(from, to, con, copied))
+                return false;
+            files++;
+            bytes += copied;
+        }
+    }
+
+    return true;
+}
+
+/* True when path is inside dir (or is dir itself) */
+static bool IsUnder(const char* dir, const char* path)
+{
+    ulong dirLen = Stdlib::StrLen(dir);
+    while (dirLen > 1 && dir[dirLen - 1] == '/')
+        dirLen--;
+    if (Stdlib::StrnCmp(path, dir, dirLen) != 0)
+        return false;
+    return dirLen == 1 || path[dirLen] == '\0' || path[dirLen] == '/';
+}
+
+static void CmdCp(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* tok = Stdlib::NextToken(args, end);
+    bool recursive = false;
+    if (tok != nullptr && Stdlib::StrnCmp(tok, "-r", 2) == 0 && (end - tok) == 2)
+    {
+        recursive = true;
+        tok = Stdlib::NextToken(end, end);
+    }
+    if (tok == nullptr)
+    {
+        con.Printf("usage: cp [-r] <src> <dst>\n");
+        return;
+    }
+    char src[Vfs::MaxPath];
+    Stdlib::TokenCopy(tok, end, src, sizeof(src));
+
+    tok = Stdlib::NextToken(end, end);
+    if (tok == nullptr)
+    {
+        con.Printf("usage: cp [-r] <src> <dst>\n");
+        return;
+    }
+    char dstArg[Vfs::MaxPath];
+    Stdlib::TokenCopy(tok, end, dstArg, sizeof(dstArg));
+
+    auto& vfs = Vfs::GetInstance();
+    FileStat st;
+    if (!vfs.Stat(src, st))
+    {
+        con.Printf("cp: %s not found\n", src);
+        return;
+    }
+
+    char dst[Vfs::MaxPath];
+    if (!ResolveCopyTarget(src, dstArg, dst, sizeof(dst)))
+    {
+        con.Printf("cp: path too long\n");
+        return;
+    }
+
+    if (Stdlib::StrCmp(src, dst) == 0)
+    {
+        con.Printf("cp: %s and %s are the same file\n", src, dst);
+        return;
+    }
+
+    if (st.Type == VNode::TypeDir)
+    {
+        if (!recursive)
+        {
+            con.Printf("cp: %s is a directory (use -r)\n", src);
+            return;
+        }
+        if (IsUnder(src, dst))
+        {
+            con.Printf("cp: cannot copy %s into itself\n", src);
+            return;
+        }
+        ulong files = 0;
+        ulong bytes = 0;
+        if (CopyTree(src, dst, 0, con, files, bytes))
+            con.Printf("copied %u files, %u bytes to %s\n", files, bytes, dst);
+        return;
+    }
+
+    ulong copied = 0;
+    if (CopyFile(src, dst, con, copied))
+        con.Printf("copied %u bytes to %s\n", copied, dst);
+}
+
 static void CmdDel(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -1649,6 +1962,206 @@ static void CmdDel(const char* args, Stdlib::Printer& con)
     {
         con.Printf("del failed\n");
     }
+}
+
+static void CmdAppend(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: append <path> <text>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+    // Rest of the line after path is the content
+    const char* content = end;
+    while (*content == ' ')
+        content++;
+
+    ulong len = Stdlib::StrLen(content);
+    auto& vfs = Vfs::GetInstance();
+    File* file = vfs.Open(path, Vfs::OpenAppend | Vfs::OpenCreate);
+    if (file == nullptr)
+    {
+        con.Printf("open failed\n");
+        return;
+    }
+
+    if (vfs.Write(file, content, len))
+        con.Printf("appended %u bytes\n", len);
+    else
+        con.Printf("write failed\n");
+    vfs.Close(file);
+}
+
+static void CmdMv(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* oldStart = Stdlib::NextToken(args, end);
+    if (oldStart == nullptr)
+    {
+        con.Printf("usage: mv <old> <new>\n");
+        return;
+    }
+    char oldPath[Vfs::MaxPath];
+    Stdlib::TokenCopy(oldStart, end, oldPath, sizeof(oldPath));
+
+    const char* newStart = Stdlib::NextToken(end, end);
+    if (newStart == nullptr)
+    {
+        con.Printf("usage: mv <old> <new>\n");
+        return;
+    }
+    char newPath[Vfs::MaxPath];
+    Stdlib::TokenCopy(newStart, end, newPath, sizeof(newPath));
+
+    if (Vfs::GetInstance().Rename(oldPath, newPath))
+        con.Printf("moved %s to %s\n", oldPath, newPath);
+    else
+        con.Printf("mv failed\n");
+}
+
+static void CmdStat(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: stat <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+    FileStat st;
+    if (!Vfs::GetInstance().Stat(path, st))
+    {
+        con.Printf("not found\n");
+        return;
+    }
+
+    if (st.Type == VNode::TypeDir)
+        con.Printf("%s: directory, inode %u\n", path, st.Ino);
+    else
+        con.Printf("%s: file, %u bytes, inode %u\n", path, st.Size, st.Ino);
+}
+
+static void CmdSync(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    if (Vfs::GetInstance().Sync())
+        con.Printf("synced\n");
+    else
+        con.Printf("sync failed\n");
+}
+
+/* fstest [dir] [size]: the filesystem self-test in dir (default /) with a
+   big file of size bytes (default 300 KiB; a K or M suffix is taken) */
+static void CmdFstest(const char* args, Stdlib::Printer& con)
+{
+    static const ulong DefaultBigSize = 300 * 1024;
+    static const ulong MaxBigSize = 1024UL * 1024 * 1024;
+
+    char dir[Vfs::MaxPath];
+    Stdlib::StrnCpy(dir, "/", sizeof(dir));
+    ulong bigSize = DefaultBigSize;
+
+    const char* end;
+    const char* dirStart = Stdlib::NextToken(args, end);
+    if (dirStart != nullptr)
+    {
+        Stdlib::TokenCopy(dirStart, end, dir, sizeof(dir));
+
+        const char* sizeStart = Stdlib::NextToken(end, end);
+        if (sizeStart != nullptr)
+        {
+            char sizeText[24];
+            ulong len = Stdlib::TokenCopy(sizeStart, end, sizeText, sizeof(sizeText));
+            ulong mult = 1;
+            if (len > 0 && (sizeText[len - 1] == 'K' || sizeText[len - 1] == 'k'))
+            {
+                mult = 1024;
+                sizeText[len - 1] = '\0';
+            }
+            else if (len > 0 && (sizeText[len - 1] == 'M' || sizeText[len - 1] == 'm'))
+            {
+                mult = 1024 * 1024;
+                sizeText[len - 1] = '\0';
+            }
+            if (!Stdlib::ParseUlong(sizeText, bigSize) || bigSize * mult > MaxBigSize)
+            {
+                con.Printf("usage: fstest [dir] [size[K|M]]\n");
+                return;
+            }
+            bigSize *= mult;
+        }
+    }
+
+    if (FsSelfTest(dir, bigSize, &con))
+        con.Printf("fstest: passed (%s, %u byte file)\n", dir, bigSize);
+    else
+        con.Printf("fstest: FAILED\n");
+}
+
+/* crc32 <path>: the CRC-32 of a file, to check a copy against the host
+   (python3 -c "import zlib,sys; print(hex(zlib.crc32(open(sys.argv[1],'rb').read())))" file) */
+static void CmdCrc32(const char* args, Stdlib::Printer& con)
+{
+    static const ulong ChunkSize = 64 * 1024;
+
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: crc32 <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+    auto& vfs = Vfs::GetInstance();
+    File* file = vfs.Open(path, Vfs::OpenRead);
+    if (file == nullptr)
+    {
+        con.Printf("open failed\n");
+        return;
+    }
+
+    u8* buf = (u8*)Mm::Alloc(ChunkSize, 0);
+    if (buf == nullptr)
+    {
+        con.Printf("alloc failed\n");
+        vfs.Close(file);
+        return;
+    }
+
+    u32 crc = 0;
+    ulong total = 0;
+    bool ok = true;
+    for (;;)
+    {
+        ulong got = 0;
+        if (!vfs.Read(file, buf, ChunkSize, got))
+        {
+            ok = false;
+            break;
+        }
+        if (got == 0)
+            break;
+        crc = Stdlib::Crc32Update(crc, buf, got);
+        total += got;
+    }
+
+    Mm::Free(buf);
+    vfs.Close(file);
+
+    if (ok)
+        con.Printf("%s: crc32 0x%p, %u bytes\n", path, (ulong)crc, total);
+    else
+        con.Printf("read failed\n");
 }
 
 static void CmdFormat(const char* args, Stdlib::Printer& con)
@@ -1943,22 +2456,30 @@ static const CmdEntry Commands[] = {
     { "netconsole", CmdNetconsole, "netconsole - show netconsole state" },
     { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
     { "tcpstat",   CmdTcpstat,   "tcpstat - show TCP connections and statistics" },
-    { "wget",      CmdWget,      "wget <url> - HTTP GET request" },
+    { "wget",      CmdWget,      "wget <url> [path] - HTTP GET request, optionally saved to a file" },
     { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
     { "ping",      CmdPing,      "ping <ip|hostname> - send ICMP echo" },
     { "nslookup",  CmdNslookup,  "nslookup <hostname> - resolve hostname" },
     { "dnsflush",  CmdDnsflush,  "dnsflush - flush DNS cache" },
     { "dhcp",      CmdDhcp,      "dhcp [dev] - obtain IP via DHCP" },
     { "format",    CmdFormat,    "format nanofs <disk> - format disk" },
-    { "mount",     CmdMount,     "mount <ramfs|nanofs> ... - mount filesystem" },
+    { "mount",     CmdMount,     "mount <ramfs|nanofs|ext2> ... - mount filesystem" },
     { "umount",    CmdUmount,    "umount <path> - unmount filesystem" },
     { "mounts",    CmdMounts,    "mounts - list mount points" },
-    { "ls",        CmdLs,        "ls <path> - list directory" },
+    { "ls",        CmdLs,        "ls [path] - list directory (default /)" },
     { "cat",       CmdCat,       "cat <path> - show file content" },
     { "write",     CmdWrite,     "write <path> <text> - write to file" },
     { "mkdir",     CmdMkdir,     "mkdir <path> - create directory" },
     { "touch",     CmdTouch,     "touch <path> - create empty file" },
-    { "del",       CmdDel,       "del <path> - remove file or directory" },
+    { "cp",        CmdCp,        "cp [-r] <src> <dst> - copy a file, or a directory tree with -r" },
+    { "rm",        CmdDel,       "rm <path> - remove file or directory (recursively)" },
+    { "del",       CmdDel,       nullptr },
+    { "append",    CmdAppend,    "append <path> <text> - append text to file" },
+    { "mv",        CmdMv,        "mv <old> <new> - rename or move a file or directory" },
+    { "stat",      CmdStat,      "stat <path> - show type, size and inode" },
+    { "sync",      CmdSync,      "sync - flush filesystems to disk" },
+    { "fstest",    CmdFstest,    "fstest [dir] [size] - filesystem self-test" },
+    { "crc32",     CmdCrc32,     "crc32 <path> - CRC-32 of a file" },
     { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
     { "version",   CmdVersion,   "version - show kernel version" },
     { "bt",        CmdBt,        "bt <pid> - show task backtrace" },
@@ -2029,14 +2550,30 @@ void Cmd::ProcessCmd(const char *cmd)
     con.Printf("$");
 }
 
+/* The flags below are polled by the BSP's idle task, between halts. The
+   scheduler runs an idle task only when nothing else on its queue can run
+   -- and a task that sleeps yields rather than blocks, so on a CPU carrying
+   the shell, DHCP and USB poll tasks that is never: the request would sit
+   unseen for good. Let that task take its turn as an ordinary one from
+   here on; it has nothing left to do but notice. */
+static void WakeShutdownWatch()
+{
+    auto& cpus = CpuTable::GetInstance();
+    Task* idle = cpus.GetCpu(cpus.GetBspIndex()).GetIdleTask();
+    if (idle != nullptr)
+        idle->ClearIdle();
+}
+
 void Cmd::RequestShutdown()
 {
     Shutdown = true;
+    WakeShutdownWatch();
 }
 
 void Cmd::RequestReboot()
 {
     Reboot = true;
+    WakeShutdownWatch();
 }
 
 bool Cmd::ShouldShutdown()

@@ -102,8 +102,7 @@ and take mutexes.
   replacement mode if there is one, otherwise the PIT. Both land on the GSI
   that ACPI maps ISA IRQ 0 to. The 8042 keyboard takes vector 0x21, the
   serial port 0x24.
-- virtio-blk and virtio-scsi come up, partitions are probed, and `root=auto`
-  mounts a ramfs on `/` and the first ext2 it finds on `/boot`.
+- virtio-blk and virtio-scsi come up and their partitions are probed.
 - `rust_init()` brings up the Rust drivers — NVMe, r8168, r8125, igb.
 - `NetFramePool::Setup()` (sized by `netframes=`), then virtio-net and
   virtio-rng. The pool is built before any driver can want a frame.
@@ -124,8 +123,10 @@ and take mutexes.
 - `SoftIrq::Init()` creates one softirq task per running CPU. Block I/O
   completions and the receive path run there, so several things below this
   line would silently do nothing above it: `PartitionDevice::ProbeNew()`
-  (the disks that appeared during `rust_init`) and `DiskLog::Setup()` are
-  here for exactly that reason.
+  (the disks that appeared during `rust_init`), `MountRootFs()` (the root
+  filesystem `root=` names, which may well be on one of those disks — see
+  [Filesystems](filesystems.md)) and `DiskLog::Setup()` are here for exactly
+  that reason.
 - `Tcp::Init()`, then xHCI (unless `usb=off`) — on a laptop with no PS/2
   controller the USB keyboard is the only way in, so enumeration happens
   here, synchronously, while trace output still reaches the console.

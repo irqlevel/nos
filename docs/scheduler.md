@@ -179,7 +179,14 @@ from the shell.
 
 Because the idle task is now the scheduler's last resort rather than an
 equal, a CPU with something always runnable may not reach `ReapExited` for a
-while — which is why the softirq task calls it too.
+while — which is why the softirq task calls it too. The same starvation
+used to swallow `poweroff` and `reboot` outright: `Sleep()` yields rather
+than blocks, so a CPU carrying the shell, DHCP and USB poll tasks never ran
+its idle task again, and the request sat unseen (on a two-CPU QEMU, every
+time). `Cmd::RequestShutdown()`/`RequestReboot()` now clear the BSP idle
+task's `FlagIdleBit`, making it an ordinary task for what remains of its
+life: it takes its turn, sees the flag, unmounts the filesystems while the
+soft IRQs still run, and halts.
 
 ## Looking at it from the shell
 

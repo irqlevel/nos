@@ -124,6 +124,8 @@ CXX_SRC_x86_64 =   \
     src/cpp/fs/nanofs.cpp \
     src/cpp/fs/ext2.cpp \
     src/cpp/fs/procfs.cpp \
+    src/cpp/fs/rootfs.cpp \
+    src/cpp/fs/fstest.cpp \
     src/cpp/kernel/mutex.cpp \
     src/cpp/kernel/wait_group.cpp \
     src/cpp/kernel/softirq.cpp \
@@ -237,6 +239,8 @@ CXX_SRC_aarch64 = \
     src/cpp/fs/nanofs.cpp \
     src/cpp/fs/ext2.cpp \
     src/cpp/fs/procfs.cpp \
+    src/cpp/fs/rootfs.cpp \
+    src/cpp/fs/fstest.cpp \
     src/cpp/drivers/virtqueue.cpp \
     src/cpp/drivers/virtio_mmio.cpp \
     src/cpp/drivers/virtio_blk.cpp \

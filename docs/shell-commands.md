@@ -39,7 +39,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `netconsole` | Show netconsole target, buffered bytes, drop/send counters |
 | `icmpstat` | Show ICMP statistics |
 | `tcpstat` | Show TCP connections and statistics |
-| `wget <url>` | Fetch a URL via HTTP GET (follows redirects) |
+| `wget <url> [path]` | Fetch a URL via HTTP GET (follows redirects); with a path, save the body to that file instead of printing it (bodies are capped at 32 KiB by the HTTP client) |
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
 | `ping <ip\|hostname>` | Send 5 ICMP echo requests with RTT (resolves hostnames via DNS) |
 | `nslookup <hostname>` | Resolve hostname to IP via DNS |
@@ -49,14 +49,22 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `format nanofs <disk>` | Format disk with nanofs |
 | `mount ramfs <path>` | Mount a ramfs at path |
 | `mount nanofs <disk> <path>` | Mount nanofs from disk at path |
+| `mount ext2 <disk> <path> [ro]` | Mount ext2 from disk at path, read-write unless `ro` (or unless the image carries features the driver does not write; see [Filesystems](filesystems.md)) |
 | `umount <path>` | Unmount filesystem |
 | `mounts` | List mount points |
-| `ls <path>` | List directory contents |
+| `ls [path]` | List directory contents (default `/`) |
+| `cp [-r] <src> <dst>` | Copy a file, or a whole directory tree with `-r`; a `dst` that is an existing directory takes the copy under its own name |
 | `cat <path>` | Show file contents |
 | `write <path> <text>` | Write text to file (creates if needed) |
 | `mkdir <path>` | Create directory |
 | `touch <path>` | Create empty file |
-| `del <path>` | Remove file or directory |
+| `rm <path>` | Remove file or directory (recursively); `del` is the same command |
+| `append <path> <text>` | Append text to a file (created if missing) |
+| `mv <old> <new>` | Rename or move a file or directory within one filesystem |
+| `stat <path>` | Type, size and inode number |
+| `sync` | Flush every mounted filesystem to disk |
+| `fstest [dir] [size]` | Filesystem self-test in `dir` (default `/`) with a big file of `size` bytes (`K`/`M` suffix; default 300 KiB); `fstest / 5M` reaches the doubly-indirect blocks at 4 KiB blocks |
+| `crc32 <path>` | CRC-32 of a file, to check a copy against the host |
 | `usb` | Show xHCI controllers, connected root ports and keyboard report counters |
 | `panic [type]` | Trigger kernel panic (direct, pagefault, divzero, ud) |
 | `version` | Show kernel version |

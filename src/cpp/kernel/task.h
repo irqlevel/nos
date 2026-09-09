@@ -99,6 +99,9 @@ public:
     /* The queue this task should be on: the lightest one its affinity
        allows, or nullptr to say it is already on the right one. */
     void SetIdle();
+    /* Back to an ordinary task: scheduled in its turn, not only when
+       nothing else on its queue can run (see TaskQueue::SelectNext) */
+    void ClearIdle();
     bool IsIdle();
 
     /* A task that has asked not to be scheduled until someone wakes it.

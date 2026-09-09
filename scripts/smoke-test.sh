@@ -47,8 +47,12 @@ fi
 [ -f nos.iso ] || fail "nos.iso not found"
 
 # Scratch disks: exercise virtio-blk (modern), virtio-scsi (legacy) and the
-# Rust NVMe/MSI-X path on every smoke boot.
-qemu-img create -q -f qcow2 "$TMPDIR_SMOKE/blk0.qcow2" 256M
+# Rust NVMe/MSI-X path on every smoke boot. The virtio-blk one carries an
+# ext2 root filesystem (label nos, 1 KiB blocks so the boot-time fstest
+# reaches the double-indirect blocks), which root=auto mounts on / and
+# fstest=on exercises.
+scripts/mkrootfs.sh "$TMPDIR_SMOKE/root.img" 64 "" 1024 > /dev/null \
+    || fail "cannot make the root filesystem image"
 qemu-img create -q -f qcow2 "$TMPDIR_SMOKE/scsi0.qcow2" 256M
 qemu-img create -q -f qcow2 "$TMPDIR_SMOKE/nvme0.qcow2" 256M
 
@@ -59,7 +63,7 @@ echo "smoke: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
     -smp 4 \
     -cdrom nos.iso \
     -serial "file:$SMOKE_LOG" \
-    -drive "file=$TMPDIR_SMOKE/blk0.qcow2,format=qcow2,id=drive0,if=none" \
+    -drive "file=$TMPDIR_SMOKE/root.img,format=raw,id=drive0,if=none" \
     -device virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off \
     -drive "file=$TMPDIR_SMOKE/scsi0.qcow2,format=qcow2,id=scsi0,if=none" \
     -device virtio-scsi-pci,id=scsi,disable-legacy=off,disable-modern=on \
@@ -74,10 +78,12 @@ echo "smoke: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
 QEMU_PID=$!
 
 # Success requires all of these, which the kernel prints in this order:
-#   "After test"        - Test::Test() self-tests passed (early boot, BSP)
-#   "Preempt is now on" - SMP bringup + scheduler alive
-#   "boot: complete"    - shells started, kernel reached the idle loop
-MARKERS=("After test" "Preempt is now on" "boot: complete")
+#   "After test"                    - Test::Test() self-tests passed (early boot, BSP)
+#   "Preempt is now on"             - SMP bringup + scheduler alive
+#   "MountRootFs: mounted ext2 on /" - the root image was found and mounted rw
+#   "fstest: passed"                - the filesystem self-test ran on it
+#   "boot: complete"                - shells started, kernel reached the idle loop
+MARKERS=("After test" "Preempt is now on" "MountRootFs: mounted ext2 on /" "fstest: passed" "boot: complete")
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do
@@ -89,6 +95,9 @@ while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do
 
     if grep -q "PANIC:" "$SMOKE_LOG"; then
         fail "kernel panic"
+    fi
+    if grep -q "fstest: FAILED" "$SMOKE_LOG"; then
+        fail "filesystem self-test failed"
     fi
 
     DONE=1

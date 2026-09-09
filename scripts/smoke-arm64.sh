@@ -47,7 +47,10 @@ fi
 
 [ -f nos-arm64.img ] || fail "nos-arm64.img not found"
 
-qemu-img create -q -f qcow2 "$TMPDIR_SMOKE/blk0.qcow2" 256M
+# The virtio-blk disk carries an ext2 root filesystem (label nos, 1 KiB
+# blocks) that root=auto mounts on / and fstest=on exercises.
+scripts/mkrootfs.sh "$TMPDIR_SMOKE/root.img" 64 "" 1024 > /dev/null \
+    || fail "cannot make the root filesystem image"
 
 echo "smoke-arm64: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
 qemu-system-aarch64 \
@@ -56,8 +59,9 @@ qemu-system-aarch64 \
     -m 1024 \
     $ACCEL_OPTS \
     -kernel nos-arm64.img \
+    -append "root=auto fstest=on" \
     -global virtio-mmio.force-legacy=false \
-    -drive "file=$TMPDIR_SMOKE/blk0.qcow2,format=qcow2,id=hd,if=none" \
+    -drive "file=$TMPDIR_SMOKE/root.img,format=raw,id=hd,if=none" \
     -device virtio-blk-device,drive=hd \
     -device virtio-net-device,netdev=net0 -netdev user,id=net0 \
     -device virtio-rng-device \
@@ -67,11 +71,13 @@ qemu-system-aarch64 \
 QEMU_PID=$!
 
 # Printed in this order on a healthy boot:
-#   "Self test passed"   - Test::Test() green (mm/lib self-tests)
-#   "Cpus started"       - every DTB CPU came up via PSCI CPU_ON
-#   "After test"         - multitasking test green with SMP on
-#   "boot: complete"     - shell started, BSP reached the idle loop
-MARKERS=("Self test passed" "Cpus started" "After test" "boot: complete")
+#   "Self test passed"                - Test::Test() green (mm/lib self-tests)
+#   "Cpus started"                    - every DTB CPU came up via PSCI CPU_ON
+#   "After test"                      - multitasking test green with SMP on
+#   "MountRootFs: mounted ext2 on /"  - the root image was found and mounted rw
+#   "fstest: passed"                  - the filesystem self-test ran on it
+#   "boot: complete"                  - shell started, BSP reached the idle loop
+MARKERS=("Self test passed" "Cpus started" "After test" "MountRootFs: mounted ext2 on /" "fstest: passed" "boot: complete")
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do
@@ -83,6 +89,9 @@ while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do
 
     if grep -q "PANIC:" "$SMOKE_LOG"; then
         fail "kernel panic"
+    fi
+    if grep -q "fstest: FAILED" "$SMOKE_LOG"; then
+        fail "filesystem self-test failed"
     fi
 
     DONE=1

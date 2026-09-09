@@ -6,6 +6,9 @@
 #include "stack_trace.h"
 #include <hal/cpu.h>
 #include <block/block_device.h>
+#include <fs/vfs.h>
+#include <fs/ramfs.h>
+#include <fs/fstest.h>
 
 #include <lib/btree.h>
 #include <lib/error.h>
@@ -1885,6 +1888,44 @@ Stdlib::Error TestSnPrintf()
     return MakeSuccess();
 }
 
+/* The Vfs and ramfs through the file API: everything FsSelfTest does, on
+   a ramfs mounted on / for the duration and taken down after */
+Stdlib::Error TestVfs()
+{
+    static const ulong BigSize = 100 * 1024;
+
+    auto& vfs = Vfs::GetInstance();
+    RamFs* fs = new (Mm::NoThrow) RamFs();
+    if (fs == nullptr)
+        return MakeError(Stdlib::Error::NoMemory);
+
+    if (!vfs.Mount("/", fs))
+    {
+        delete fs;
+        Trace(0, "TestVfs: mount failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    bool ok = FsSelfTest("/", BigSize, nullptr);
+
+    FileSystem* unmounted = vfs.Unmount("/");
+    if (unmounted == nullptr)
+    {
+        Trace(0, "TestVfs: unmount failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+    delete unmounted;
+
+    if (!ok)
+    {
+        Trace(0, "TestVfs: self-test failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    Trace(0, "TestVfs: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
@@ -1964,6 +2005,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestSnPrintf();
+    if (!err.Ok())
+        return err;
+
+    err = TestVfs();
     if (!err.Ok())
         return err;
 

@@ -66,6 +66,10 @@ public:
 
     bool Run(Task::Func func, void *ctx);
 
+    /* The task Run() made for this CPU: the BSP's runs BpStartup and then
+       the shutdown watch, an AP's its idle loop */
+    Task* GetIdleTask() { return IdleTaskPtr; }
+
     void SendIPISelf();
 
     void QueueIPITask(IPITask& task);

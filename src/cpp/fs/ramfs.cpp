@@ -18,6 +18,9 @@ RamFs::RamFs()
     Root.Data = nullptr;
     Root.Size = 0;
     Root.Capacity = 0;
+    Root.Ino = 0;
+    Root.Flags = VNode::FlagDirLoaded;
+    Root.OpenCount = 0;
 }
 
 RamFs::~RamFs()
@@ -58,7 +61,45 @@ VNode* RamFs::AllocNode(const char* name, VNode::Type type)
     node->Data = nullptr;
     node->Size = 0;
     node->Capacity = 0;
+    node->Ino = 0;
+    node->Flags = (type == VNode::TypeDir) ? VNode::FlagDirLoaded : 0;
+    node->OpenCount = 0;
     return node;
+}
+
+/* Make room for size bytes, keeping the current content */
+bool RamFs::Reserve(VNode* file, ulong size)
+{
+    if (size <= file->Capacity)
+        return true;
+
+    ulong newCap = (file->Capacity != 0) ? file->Capacity : MinCapacity;
+    while (newCap < size)
+    {
+        if (newCap * 2 < newCap)
+        {
+            Trace(0, "RamFs::Reserve: size %u overflows", (ulong)size);
+            return false;
+        }
+        newCap *= 2;
+    }
+
+    u8* newBuf = (u8*)Mm::Alloc(newCap, 0);
+    if (newBuf == nullptr)
+    {
+        Trace(0, "RamFs::Reserve: alloc %u bytes failed", (ulong)newCap);
+        return false;
+    }
+
+    if (file->Data != nullptr)
+    {
+        Stdlib::MemCpy(newBuf, file->Data, file->Size);
+        Mm::Free(file->Data);
+    }
+
+    file->Data = newBuf;
+    file->Capacity = newCap;
+    return true;
 }
 
 void RamFs::FreeNode(VNode* node)
@@ -181,7 +222,7 @@ VNode* RamFs::CreateDir(VNode* dir, const char* name)
     return node;
 }
 
-bool RamFs::Write(VNode* file, const void* data, ulong len)
+bool RamFs::Write(VNode* file, const void* data, ulong len, ulong offset)
 {
     if (file == nullptr || file->NodeType != VNode::TypeFile)
     {
@@ -190,34 +231,83 @@ bool RamFs::Write(VNode* file, const void* data, ulong len)
     }
 
     if (len == 0)
-    {
-        file->Size = 0;
         return true;
-    }
 
-    if (len > file->Capacity)
+    ulong end = offset + len;
+    if (end < offset)
     {
-        // Round up to next power-of-two-ish block
-        ulong newCap = 64;
-        while (newCap < len)
-            newCap *= 2;
-
-        u8* newBuf = (u8*)Mm::Alloc(newCap, 0);
-        if (newBuf == nullptr)
-        {
-            Trace(0, "RamFs::Write: alloc %u bytes failed", (ulong)newCap);
-            return false;
-        }
-
-        if (file->Data != nullptr)
-            Mm::Free(file->Data);
-
-        file->Data = newBuf;
-        file->Capacity = newCap;
+        Trace(0, "RamFs::Write: offset %u + len %u overflows", (ulong)offset, (ulong)len);
+        return false;
     }
 
-    Stdlib::MemCpy(file->Data, data, len);
-    file->Size = len;
+    if (!Reserve(file, end))
+        return false;
+
+    /* Writing past the end leaves a hole that reads as zeros */
+    if (offset > file->Size)
+        Stdlib::MemSet(file->Data + file->Size, 0, offset - file->Size);
+
+    Stdlib::MemCpy(file->Data + offset, data, len);
+    if (end > file->Size)
+        file->Size = end;
+    return true;
+}
+
+bool RamFs::Truncate(VNode* file, ulong size)
+{
+    if (file == nullptr || file->NodeType != VNode::TypeFile)
+    {
+        Trace(0, "RamFs::Truncate: null file or not a file");
+        return false;
+    }
+
+    if (size > file->Size)
+    {
+        if (!Reserve(file, size))
+            return false;
+        Stdlib::MemSet(file->Data + file->Size, 0, size - file->Size);
+    }
+
+    file->Size = size;
+    return true;
+}
+
+bool RamFs::Rename(VNode* node, VNode* newDir, const char* newName)
+{
+    if (node == nullptr || newDir == nullptr || newName == nullptr)
+    {
+        Trace(0, "RamFs::Rename: null node, dir or name");
+        return false;
+    }
+
+    if (node->Parent == nullptr)
+    {
+        Trace(0, "RamFs::Rename: cannot rename root");
+        return false;
+    }
+
+    if (newDir->NodeType != VNode::TypeDir)
+    {
+        Trace(0, "RamFs::Rename: target parent is not a dir");
+        return false;
+    }
+
+    if (Stdlib::StrLen(newName) >= sizeof(node->Name))
+    {
+        Trace(0, "RamFs::Rename: name '%s' too long", newName);
+        return false;
+    }
+
+    if (Lookup(newDir, newName) != nullptr)
+    {
+        Trace(0, "RamFs::Rename: '%s' already exists", newName);
+        return false;
+    }
+
+    node->SiblingLink.RemoveInit();
+    Stdlib::StrnCpy(node->Name, newName, sizeof(node->Name));
+    node->Parent = newDir;
+    newDir->Children.InsertTail(&node->SiblingLink);
     return true;
 }
 
