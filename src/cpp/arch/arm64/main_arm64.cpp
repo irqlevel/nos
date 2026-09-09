@@ -24,6 +24,8 @@
 #include <kernel/softirq.h>
 #include <kernel/stack_probe.h>
 #include <fs/vfs.h>
+#include <fs/rootfs.h>
+#include <block/partition.h>
 #include <hal/power.h>
 
 #include <drivers/virtio_mmio.h>
@@ -104,8 +106,6 @@ static void __attribute__((noreturn)) PrepareHaltArm(HaltAction action)
        stack (released in FinalizeOnBootStack after the stack switch) */
     auto task = Task::GetCurrentTask();
     task->Get();
-
-    Vfs::GetInstance().UnmountAll();
 
     PreemptDisable();
 
@@ -254,6 +254,12 @@ static void BpStartupArm(void* ctx)
         return;
     }
 
+    /* Partitions and the root filesystem: here, not next to the virtio
+       bring-up, because a block request completes through the BLK_IO soft
+       IRQ, and the NVMe disks came up in rust_init (see kernel/main.cpp) */
+    PartitionDevice::ProbeAll();
+    MountRootFs();
+
     Tcp::GetInstance().Init();
 
     auto& cmd = Cmd::GetInstance();
@@ -312,6 +318,10 @@ static void BpStartupArm(void* ctx)
             netconsole.Stop();
             cmd.Stop();
             cmd.StopDhcp();
+
+            /* While the soft IRQs still run: unmounting writes the
+               superblock, and a block request completes through BLK_IO */
+            Vfs::GetInstance().UnmountAll();
 
             PrepareHaltArm(reboot ? Hal::Reset : Hal::PowerOff);
         }

@@ -38,13 +38,16 @@ This produces `kernel-arm64.elf` and `nos-arm64.img` (Linux `Image` format, boot
 
 ## Disk image
 
-Build a bootable qcow2 disk image (MBR, 2 partitions):
+Build a bootable qcow2 disk image (MBR, one ext2 partition labelled `nos`
+that is both where GRUB finds `/boot/kernel64.elf` and the root filesystem
+the kernel mounts read-write):
 
 ```sh
-./scripts/build-disk.sh
+./scripts/build-disk.sh                      # nos.qcow2, 1 GB
+SIZE_MB=4096 ROOTFS=my-root ./scripts/build-disk.sh   # bigger, with my-root/ copied in (e.g. lib/modules)
 ```
 
-This produces `nos.qcow2` (1 GB, MBR, virtio-blk compatible, suitable for KVM-based public clouds including Google Cloud Compute Engine). See [Run](run.md#google-cloud) for deploying it.
+This produces `nos.qcow2` (MBR, virtio-blk compatible, suitable for KVM-based public clouds including Google Cloud Compute Engine). It runs entirely inside Docker and needs no `--privileged`: the filesystem is populated by `mke2fs -d` and GRUB's boot code is written with `dd`. See [Run](run.md#google-cloud) for deploying it and [Filesystems](filesystems.md) for the root filesystem itself.
 
 ## Firmware: BIOS and UEFI
 

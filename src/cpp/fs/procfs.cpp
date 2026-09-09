@@ -34,7 +34,7 @@ bool ProcFs::Mount()
             KERNEL_GIT_REV);
         VNode* node = CreateFile(root, "version");
         if (node != nullptr)
-            Write(node, buf, Stdlib::StrLen(buf));
+            Write(node, buf, Stdlib::StrLen(buf), 0);
     }
 
     /* /proc/cmdline */
@@ -42,10 +42,10 @@ bool ProcFs::Mount()
         const char* cmdline = Parameters::GetInstance().GetCmdline();
         VNode* node = CreateFile(root, "cmdline");
         if (node != nullptr)
-            Write(node, cmdline, Stdlib::StrLen(cmdline));
+            Write(node, cmdline, Stdlib::StrLen(cmdline), 0);
     }
 
-    /* /proc/interrupts — dynamic, refreshed on each read */
+    /* /proc/interrupts -- dynamic, refreshed on each lookup */
     InterruptsNode = CreateFile(root, "interrupts");
     if (InterruptsNode != nullptr)
         RefreshInterrupts();
@@ -70,18 +70,18 @@ void ProcFs::RefreshInterrupts()
             pos = pos + (ulong)n;
     }
 
-    RamFs::Write(InterruptsNode, buf, pos);
+    RamFs::Truncate(InterruptsNode, 0);
+    RamFs::Write(InterruptsNode, buf, pos, 0);
 }
 
-bool ProcFs::Read(VNode* file, void* buf, ulong len, ulong offset)
+/* The Vfs looks a file up before it reads it or reports its size, so
+   refreshing here keeps both consistent with each other. */
+VNode* ProcFs::Lookup(VNode* dir, const char* name)
 {
-    if (file == InterruptsNode)
-    {
+    VNode* node = RamFs::Lookup(dir, name);
+    if (node != nullptr && node == InterruptsNode)
         RefreshInterrupts();
-        Stdlib::MemSet(buf, 0, len);
-    }
-
-    return RamFs::Read(file, buf, len, offset);
+    return node;
 }
 
 }

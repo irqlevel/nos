@@ -13,7 +13,7 @@ public:
 
     virtual const char* GetName() override;
     virtual bool Mount() override;
-    virtual bool Read(VNode* file, void* buf, ulong len, ulong offset) override;
+    virtual VNode* Lookup(VNode* dir, const char* name) override;
 
 private:
     ProcFs(const ProcFs& other) = delete;

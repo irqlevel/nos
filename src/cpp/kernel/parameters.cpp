@@ -34,8 +34,11 @@ Parameters::Parameters()
     , RxPoll(false)
     , LogLevel(DefaultLogLevel)
     , DnsEnabled(false)
-    , RootAuto(false)
+    , RootReadOnly(false)
+    , FsTest(false)
 {
+    Stdlib::MemSet(&Root, 0, sizeof(Root));
+    Root.Mode = RootNone;
 }
 
 Parameters::~Parameters()
@@ -147,9 +150,43 @@ bool Parameters::IsDnsEnabled()
     return DnsEnabled;
 }
 
-bool Parameters::IsRootAuto()
+const Parameters::RootSpec& Parameters::GetRoot()
 {
-    return RootAuto;
+    return Root;
+}
+
+bool Parameters::IsRootReadOnly()
+{
+    return RootReadOnly;
+}
+
+bool Parameters::IsFsTest()
+{
+    return FsTest;
+}
+
+/* xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, as blkid prints it */
+bool Parameters::ParseUuid(const char* text, u8* out)
+{
+    if (Stdlib::StrLen(text) != UuidTextLen)
+        return false;
+
+    char hex[UuidBytes * 2 + 1];
+    ulong n = 0;
+    for (ulong i = 0; i < UuidTextLen; i++)
+    {
+        if (i == 8 || i == 13 || i == 18 || i == 23)
+        {
+            if (text[i] != '-')
+                return false;
+            continue;
+        }
+        hex[n++] = text[i];
+    }
+    hex[n] = '\0';
+
+    ulong bytes = 0;
+    return Stdlib::HexDecode(hex, n, out, UuidBytes, bytes) && bytes == UuidBytes;
 }
 
 const char* Parameters::GetCmdline()
@@ -176,7 +213,16 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     
     const char* sep = Stdlib::StrChrOnce(param, '=');
     if (sep == nullptr)
+    {
+        /* The one bare word taken, as on Linux: ro */
+        if (Stdlib::StrCmp(param, "ro") == 0)
+        {
+            Trace(0, "Key %s", param);
+            RootReadOnly = true;
+            return true;
+        }
         return false;
+    }
 
     if ((sep == param) || (sep == &param[len - 1]))
         return false;
@@ -379,9 +425,49 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     }
     else if (Stdlib::StrCmp(key, "root") == 0)
     {
+        const char* labelPrefix = "LABEL=";
+        const char* uuidPrefix = "UUID=";
+        ulong labelPrefixLen = Stdlib::StrLen(labelPrefix);
+        ulong uuidPrefixLen = Stdlib::StrLen(uuidPrefix);
+
+        Stdlib::MemSet(&Root, 0, sizeof(Root));
         if (Stdlib::StrCmp(value, "auto") == 0)
         {
-            RootAuto = true;
+            Root.Mode = RootAuto;
+        }
+        else if (Stdlib::StrnCmp(value, labelPrefix, labelPrefixLen) == 0 &&
+                 value[labelPrefixLen] != '\0')
+        {
+            Root.Mode = RootLabel;
+            Stdlib::StrnCpy(Root.Value, value + labelPrefixLen, sizeof(Root.Value));
+        }
+        else if (Stdlib::StrnCmp(value, uuidPrefix, uuidPrefixLen) == 0)
+        {
+            if (ParseUuid(value + uuidPrefixLen, Root.Uuid))
+            {
+                Root.Mode = RootUuid;
+                Stdlib::StrnCpy(Root.Value, value + uuidPrefixLen, sizeof(Root.Value));
+            }
+            else
+            {
+                Trace(0, "Invalid UUID %s, key %s", value, key);
+            }
+        }
+        else
+        {
+            Root.Mode = RootDevice;
+            Stdlib::StrnCpy(Root.Value, value, sizeof(Root.Value));
+        }
+    }
+    else if (Stdlib::StrCmp(key, "fstest") == 0)
+    {
+        if (Stdlib::StrCmp(value, "on") == 0)
+        {
+            FsTest = true;
+        }
+        else if (Stdlib::StrCmp(value, "off") == 0)
+        {
+            FsTest = false;
         }
         else
         {

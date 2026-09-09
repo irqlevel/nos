@@ -68,7 +68,34 @@ public:
 
     bool IsDnsEnabled();
 
-    bool IsRootAuto();
+    /* root=auto | <device> | LABEL=<label> | UUID=<uuid>: what to mount on /
+       (see fs/rootfs.cpp). Value holds the device name or label; Uuid the
+       parsed UUID. */
+    enum RootMode {
+        RootNone = 0,
+        RootAuto,
+        RootDevice,
+        RootLabel,
+        RootUuid,
+    };
+
+    static const ulong RootValueLen = 40;
+    static const ulong UuidBytes = 16;
+    static const ulong UuidTextLen = 36;
+
+    struct RootSpec {
+        RootMode Mode;
+        char Value[RootValueLen];
+        u8 Uuid[UuidBytes];
+    };
+
+    const RootSpec& GetRoot();
+
+    /* ro: mount the root filesystem read-only */
+    bool IsRootReadOnly();
+
+    /* fstest=on: run the filesystem self-test on / once it is mounted */
+    bool IsFsTest();
 
     const char* GetCmdline();
 
@@ -107,6 +134,10 @@ private:
     bool RxPoll;
     int LogLevel;
     bool DnsEnabled;
-    bool RootAuto;
+    RootSpec Root;
+    bool RootReadOnly;
+    bool FsTest;
+
+    static bool ParseUuid(const char* text, u8* out);
 };
 }

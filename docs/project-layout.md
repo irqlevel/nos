@@ -16,7 +16,7 @@ src/cpp/
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
   block/      Block I/O: device abstraction, async request queue, MBR partition discovery
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell, netconsole
-  fs/         Filesystem: VFS, ramfs, nanofs, block I/O helpers
+  fs/         Filesystems: VFS and the file API, ramfs, nanofs, ext2 (rw), procfs, the root mount (rootfs.cpp), the self-test (fstest.cpp)
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
   lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, stdlib
   include/    Shared headers

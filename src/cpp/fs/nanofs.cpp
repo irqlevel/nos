@@ -550,7 +550,9 @@ VNode* NanoFs::LoadVNode(u32 inodeIdx, u32 depth)
     vnode->SiblingLink.Init();
     vnode->Data = nullptr;
     vnode->Size = (inode->Type == NanoInodeTypeFile) ? inode->Size : 0;
-    vnode->Capacity = inodeIdx; // Repurpose Capacity to store inode index
+    vnode->Ino = inodeIdx;
+    if (vnode->NodeType == VNode::TypeDir)
+        vnode->Flags = VNode::FlagDirLoaded;
 
     VNodes[inodeIdx] = vnode;
     LoadInProgress[inodeIdx] = 1;
@@ -625,7 +627,7 @@ u32 NanoFs::VNodeToInode(VNode* vnode)
 {
     if (vnode == nullptr)
         return (u32)-1;
-    return (u32)vnode->Capacity; // Capacity stores inode index
+    return (u32)vnode->Ino;
 }
 
 // --- Directory helpers ---
@@ -924,7 +926,7 @@ VNode* NanoFs::CreateFile(VNode* dir, const char* name)
     vnode->SiblingLink.Init();
     vnode->Data = nullptr;
     vnode->Size = 0;
-    vnode->Capacity = (ulong)inodeIdx;
+    vnode->Ino = (ulong)inodeIdx;
 
     VNodes[(u32)inodeIdx] = vnode;
     dir->Children.InsertTail(&vnode->SiblingLink);
@@ -1048,7 +1050,8 @@ VNode* NanoFs::CreateDir(VNode* dir, const char* name)
     vnode->SiblingLink.Init();
     vnode->Data = nullptr;
     vnode->Size = 0;
-    vnode->Capacity = (ulong)inodeIdx;
+    vnode->Ino = (ulong)inodeIdx;
+    vnode->Flags = VNode::FlagDirLoaded;
 
     VNodes[(u32)inodeIdx] = vnode;
     dir->Children.InsertTail(&vnode->SiblingLink);
@@ -1056,7 +1059,7 @@ VNode* NanoFs::CreateDir(VNode* dir, const char* name)
     return vnode;
 }
 
-bool NanoFs::Write(VNode* file, const void* data, ulong len)
+bool NanoFs::Write(VNode* file, const void* data, ulong len, ulong offset)
 {
     if (file == nullptr || file->NodeType != VNode::TypeFile)
     {
@@ -1064,9 +1067,45 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         return false;
     }
 
-    if (len > NanoMaxFileSize)
+    if (len == 0)
+        return true;
+
+    ulong end = offset + len;
+    if (end < offset)
     {
-        Trace(0, "NanoFs::Write: len %u exceeds max %u", (ulong)len, (ulong)NanoMaxFileSize);
+        Trace(0, "NanoFs::Write: offset %u + len %u overflows", (ulong)offset, (ulong)len);
+        return false;
+    }
+
+    ulong newSize = (end > file->Size) ? end : file->Size;
+    return Rewrite(file, newSize, data, len, offset);
+}
+
+bool NanoFs::Truncate(VNode* file, ulong size)
+{
+    if (file == nullptr || file->NodeType != VNode::TypeFile)
+    {
+        Trace(0, "NanoFs::Truncate: null file or not a file");
+        return false;
+    }
+
+    if (size == file->Size)
+        return true;
+
+    return Rewrite(file, size, nullptr, 0, 0);
+}
+
+/* Replace the file's content with the old content resized to newSize (cut
+   short, or padded with zeros), then len bytes of data at offset, which the
+   callers keep within newSize. Every block of the new content goes to a
+   freshly allocated block, the inode is committed with FUA, and only then
+   are the old blocks released -- so a crash at any point leaves either the
+   old file or the new one, never a mix. */
+bool NanoFs::Rewrite(VNode* file, ulong newSize, const void* data, ulong len, ulong offset)
+{
+    if (newSize > NanoMaxFileSize)
+    {
+        Trace(0, "NanoFs::Rewrite: size %u exceeds max %u", (ulong)newSize, (ulong)NanoMaxFileSize);
         return false;
     }
 
@@ -1074,13 +1113,13 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     NanoInode* inode = new (Mm::NoThrow) NanoInode();
     if (inode == nullptr)
     {
-        Trace(0, "NanoFs::Write: alloc inode failed");
+        Trace(0, "NanoFs::Rewrite: alloc inode failed");
         return false;
     }
 
     if (!ReadInode(inodeIdx, inode))
     {
-        Trace(0, "NanoFs::Write: read inode %u failed", (ulong)inodeIdx);
+        Trace(0, "NanoFs::Rewrite: read inode %u failed", (ulong)inodeIdx);
         delete inode;
         return false;
     }
@@ -1089,15 +1128,15 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     // in-range garbage block index would free a block another file owns.
     if (!VerifyInodeChecksum(inode))
     {
-        Trace(0, "NanoFs::Write: inode %u checksum mismatch", (ulong)inodeIdx);
+        Trace(0, "NanoFs::Rewrite: inode %u checksum mismatch", (ulong)inodeIdx);
         delete inode;
         return false;
     }
 
-    u32 oldBlockCount = (inode->Size > 0)
-        ? (inode->Size + NanoBlockSize - 1) / NanoBlockSize : 0;
-    if (oldBlockCount > NanoMaxBlocks)
-        oldBlockCount = NanoMaxBlocks;
+    u32 oldSize = inode->Size;
+    if (oldSize > NanoMaxFileSize)
+        oldSize = NanoMaxFileSize;
+    u32 oldBlockCount = (oldSize + NanoBlockSize - 1) / NanoBlockSize;
 
     // Old blocks must be freed only after the new inode is committed: the
     // bitmap is FUA-flushed by FreeDataBlock, so freeing first leaves a crash
@@ -1105,7 +1144,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     u32 oldBlocks[NanoMaxBlocks];
     Stdlib::MemCpy(oldBlocks, inode->Blocks, sizeof(oldBlocks));
 
-    if (len == 0)
+    if (newSize == 0)
     {
         Stdlib::MemSet(inode->Blocks, 0, sizeof(inode->Blocks));
         inode->Size = 0;
@@ -1115,7 +1154,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         delete inode;
         if (!ok)
         {
-            Trace(0, "NanoFs::Write: truncate inode %u failed", (ulong)inodeIdx);
+            Trace(0, "NanoFs::Rewrite: truncate inode %u failed", (ulong)inodeIdx);
             return false;
         }
         for (u32 i = 0; i < oldBlockCount; i++)
@@ -1125,7 +1164,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     }
 
     // Allocate new data blocks into a temporary array first
-    u32 newBlockCount = ((u32)len + NanoBlockSize - 1) / NanoBlockSize;
+    u32 newBlockCount = ((u32)newSize + NanoBlockSize - 1) / NanoBlockSize;
     u32 newBlocks[NanoMaxBlocks];
     Stdlib::MemSet(newBlocks, 0, sizeof(newBlocks));
 
@@ -1134,7 +1173,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         long blk = AllocDataBlock();
         if (blk < 0)
         {
-            Trace(0, "NanoFs::Write: alloc block %u/%u failed for inode %u",
+            Trace(0, "NanoFs::Rewrite: alloc block %u/%u failed for inode %u",
                   (ulong)i, (ulong)newBlockCount, (ulong)inodeIdx);
             // Roll back already allocated new blocks
             for (u32 j = 0; j < i; j++)
@@ -1145,43 +1184,68 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
         newBlocks[i] = (u32)blk;
     }
 
-    // Write data to new blocks
+    // Build and write each block of the new content
     u8* wbuf = (u8*)Mm::Alloc(NanoBlockSize, 0);
     if (wbuf == nullptr)
     {
-        Trace(0, "NanoFs::Write: alloc write buf failed");
+        Trace(0, "NanoFs::Rewrite: alloc write buf failed");
         for (u32 j = 0; j < newBlockCount; j++)
             FreeDataBlock(newBlocks[j]);
         delete inode;
         return false;
     }
 
+    /* Bytes of the old content that survive */
+    ulong keep = (oldSize < newSize) ? oldSize : newSize;
     const u8* src = static_cast<const u8*>(data);
-    u32 remaining = (u32)len;
     bool writeOk = true;
     for (u32 i = 0; i < newBlockCount; i++)
     {
-        u32 chunkSize = (remaining < NanoBlockSize) ? remaining : NanoBlockSize;
-        Stdlib::MemSet(wbuf, 0, NanoBlockSize);
-        Stdlib::MemCpy(wbuf, src, chunkSize);
+        ulong blockStart = (ulong)i * NanoBlockSize;
+
+        if (blockStart < keep && i < oldBlockCount)
+        {
+            if (oldBlocks[i] >= NanoDataBlockCount ||
+                !Io.ReadBlock(Super->DataStartBlock + oldBlocks[i], wbuf))
+            {
+                Trace(0, "NanoFs::Rewrite: read old block %u failed for inode %u",
+                      (ulong)oldBlocks[i], (ulong)inodeIdx);
+                writeOk = false;
+                break;
+            }
+            ulong valid = keep - blockStart;
+            if (valid < NanoBlockSize)
+                Stdlib::MemSet(wbuf + valid, 0, NanoBlockSize - valid);
+        }
+        else
+        {
+            Stdlib::MemSet(wbuf, 0, NanoBlockSize);
+        }
+
+        /* The part of [offset, offset + len) that falls in this block */
+        if (len > 0 && offset < blockStart + NanoBlockSize && offset + len > blockStart)
+        {
+            ulong from = (offset > blockStart) ? offset : blockStart;
+            ulong to = offset + len;
+            if (to > blockStart + NanoBlockSize)
+                to = blockStart + NanoBlockSize;
+            Stdlib::MemCpy(wbuf + (from - blockStart), src + (from - offset), to - from);
+        }
 
         if (!Io.WriteBlock(Super->DataStartBlock + newBlocks[i], wbuf))
         {
-            Trace(0, "NanoFs::Write: write data block %u failed for inode %u",
+            Trace(0, "NanoFs::Rewrite: write data block %u failed for inode %u",
                   (ulong)newBlocks[i], (ulong)inodeIdx);
             writeOk = false;
             break;
         }
-
-        src += chunkSize;
-        remaining -= chunkSize;
     }
 
     Mm::Free(wbuf);
 
     if (!writeOk)
     {
-        Trace(0, "NanoFs::Write: data write failed, rolling back inode %u", (ulong)inodeIdx);
+        Trace(0, "NanoFs::Rewrite: data write failed, rolling back inode %u", (ulong)inodeIdx);
         // Roll back all new blocks
         for (u32 j = 0; j < newBlockCount; j++)
             FreeDataBlock(newBlocks[j]);
@@ -1196,7 +1260,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     // loses data the bitmap already accounts for.
     if (!Io.Flush())
     {
-        Trace(0, "NanoFs::Write: data flush failed for inode %u", (ulong)inodeIdx);
+        Trace(0, "NanoFs::Rewrite: data flush failed for inode %u", (ulong)inodeIdx);
         for (u32 j = 0; j < newBlockCount; j++)
             FreeDataBlock(newBlocks[j]);
         delete inode;
@@ -1207,7 +1271,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
        references them; AllocDataBlock only set the bits in memory */
     if (!FlushSuper())
     {
-        Trace(0, "NanoFs::Write: bitmap commit failed for inode %u", (ulong)inodeIdx);
+        Trace(0, "NanoFs::Rewrite: bitmap commit failed for inode %u", (ulong)inodeIdx);
         for (u32 j = 0; j < newBlockCount; j++)
             FreeDataBlock(newBlocks[j]);
         delete inode;
@@ -1218,7 +1282,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     for (u32 i = 0; i < newBlockCount; i++)
         inode->Blocks[i] = newBlocks[i];
 
-    inode->Size = (u32)len;
+    inode->Size = (u32)newSize;
     inode->DataChecksum = ComputeDataChecksum(inode);
     ComputeInodeChecksum(inode);
 
@@ -1226,7 +1290,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     delete inode;
     if (!ok)
     {
-        Trace(0, "NanoFs::Write: commit inode %u failed", (ulong)inodeIdx);
+        Trace(0, "NanoFs::Rewrite: commit inode %u failed", (ulong)inodeIdx);
         // The old on-disk inode still references the old blocks; release the
         // new blocks instead.
         for (u32 j = 0; j < newBlockCount; j++)
@@ -1237,7 +1301,7 @@ bool NanoFs::Write(VNode* file, const void* data, ulong len)
     for (u32 i = 0; i < oldBlockCount; i++)
         FreeDataBlock(oldBlocks[i]);
 
-    file->Size = len;
+    file->Size = newSize;
     return true;
 }
 
@@ -1453,6 +1517,99 @@ bool NanoFs::Remove(VNode* node)
     if (!RemoveRecursive(node))
         return false;
 
+    return Io.Flush();
+}
+
+bool NanoFs::Rename(VNode* node, VNode* newDir, const char* newName)
+{
+    if (node == nullptr || newDir == nullptr || newName == nullptr)
+    {
+        Trace(0, "NanoFs::Rename: null node, dir or name");
+        return false;
+    }
+
+    if (node->Parent == nullptr)
+    {
+        Trace(0, "NanoFs::Rename: cannot rename root");
+        return false;
+    }
+
+    if (newDir->NodeType != VNode::TypeDir)
+    {
+        Trace(0, "NanoFs::Rename: target parent is not a dir");
+        return false;
+    }
+
+    if (Stdlib::StrLen(newName) >= sizeof(node->Name))
+    {
+        Trace(0, "NanoFs::Rename: name '%s' too long", newName);
+        return false;
+    }
+
+    if (Lookup(newDir, newName) != nullptr)
+    {
+        Trace(0, "NanoFs::Rename: '%s' already exists", newName);
+        return false;
+    }
+
+    u32 inodeIdx = VNodeToInode(node);
+    u32 oldParentIdx = VNodeToInode(node->Parent);
+    u32 newParentIdx = VNodeToInode(newDir);
+
+    NanoInode* inode = new (Mm::NoThrow) NanoInode();
+    if (inode == nullptr)
+    {
+        Trace(0, "NanoFs::Rename: alloc inode failed");
+        return false;
+    }
+
+    if (!ReadInode(inodeIdx, inode) || !VerifyInodeChecksum(inode))
+    {
+        Trace(0, "NanoFs::Rename: read inode %u failed", (ulong)inodeIdx);
+        delete inode;
+        return false;
+    }
+
+    /* The name lives in the inode and a directory holds only inode
+       indices: a rename within one directory is an inode rewrite, a move
+       adds the index to the new directory first, so that a crash leaves
+       the file reachable (twice, which LoadVNode tolerates), never lost. */
+    bool moved = (newParentIdx != oldParentIdx);
+    if (moved && !AddDirEntry(newParentIdx, inodeIdx))
+    {
+        Trace(0, "NanoFs::Rename: add dir entry failed for inode %u", (ulong)inodeIdx);
+        delete inode;
+        return false;
+    }
+
+    Stdlib::StrnCpy(inode->Name, newName, sizeof(inode->Name));
+    inode->ParentInode = newParentIdx;
+    ComputeInodeChecksum(inode);
+    bool ok = WriteInode(inodeIdx, inode, true);
+    delete inode;
+    if (!ok)
+    {
+        Trace(0, "NanoFs::Rename: write inode %u failed", (ulong)inodeIdx);
+        if (moved)
+            RemoveDirEntry(newParentIdx, inodeIdx);
+        return false;
+    }
+
+    if (moved && !RemoveDirEntry(oldParentIdx, inodeIdx))
+        Trace(0, "NanoFs::Rename: inode %u left in dir %u as well", (ulong)inodeIdx, (ulong)oldParentIdx);
+
+    node->SiblingLink.RemoveInit();
+    Stdlib::StrnCpy(node->Name, newName, sizeof(node->Name));
+    node->Parent = newDir;
+    newDir->Children.InsertTail(&node->SiblingLink);
+
+    return Io.Flush();
+}
+
+bool NanoFs::Sync()
+{
+    if (!Mounted)
+        return true;
     return Io.Flush();
 }
 

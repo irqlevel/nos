@@ -18,7 +18,7 @@ exec qemu-system-aarch64 \
     -m 1024 \
     $ACCEL_OPTS \
     -kernel nos-arm64.img \
-    -append "dhcp=auto dns=on udpshell=9000" \
+    -append "dhcp=auto dns=on udpshell=9000 root=auto" \
     -global virtio-mmio.force-legacy=false \
     -drive file=nos-arm64.qcow2,format=qcow2,id=hd,if=none \
     -device virtio-blk-device,drive=hd \

@@ -7,8 +7,9 @@ characters and a single parameter at 48; an unknown key, or a known key with
 a value it does not recognise, is logged and skipped rather than refused.
 Parsing lives in `src/cpp/kernel/parameters.cpp`.
 
-The defaults the shipped configs use are `dhcp=auto dns=on root=auto` on
-x86-64 and `dhcp=auto dns=on udpshell=9000` on arm64.
+The defaults the shipped configs use are `dhcp=auto dns=on root=auto
+fstest=on` on the x86-64 ISO, `dhcp=auto dns=on udpshell=9000 root=auto` on
+the disk image, and `dhcp=auto dns=on udpshell=9000 root=auto` on arm64.
 
 ## CPUs
 
@@ -40,7 +41,10 @@ x86-64 and `dhcp=auto dns=on udpshell=9000` on arm64.
 
 - `usb=off` — x86-64 only: skip xHCI bring-up (no USB keyboard; the 8042 keyboard is unaffected)
 - `its=off` — arm64 only: disable the GICv3 ITS and degrade PCIe MSI gracefully (default `its=on`; virtio-mmio devices don't need it)
-- `root=auto` — mount a ramfs on `/` at boot and the first ext2 filesystem found on a block device read-only on `/boot`. Without it the VFS starts empty and filesystems are mounted from the shell
+- `root=auto` — mount the ext2 filesystem labelled `nos` read-write on `/`; without one, a ramfs on `/`, the first ext2 found read-only on `/boot` and the first nanofs found read-write on `/data`. Without `root=` the VFS starts empty and filesystems are mounted from the shell
+- `root=<device>` / `root=LABEL=<label>` / `root=UUID=<uuid>` — the root by block device name (`vda1`, `nvme01`), ext2 volume label or UUID. A root that is not found falls back to the `auto` layout, so the shell is always there. See [Filesystems](filesystems.md)
+- `ro` — mount the root read-only
+- `fstest=on` — run the filesystem self-test on `/` once it is mounted (prints `fstest: passed` or `fstest: FAILED`); the smoke tests boot with it
 
 ## Diagnostics
 

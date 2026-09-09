@@ -14,6 +14,7 @@ How it works, by subsystem:
 - [Scheduler](scheduler.md) — per-CPU run queues, the context switch, preemption, blocking and load balancing
 - [Interrupts](interrupts.md) — the IDT and IOAPIC, MSI-X, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
 - [Profiler](profiler.md) — sampling on a performance counter or the tick, and how to read a `profile` report
+- [Filesystems](filesystems.md) — the root filesystem and `root=`, the file API, what the ext2 driver writes and how, making and checking a root image
 
 Tools:
 

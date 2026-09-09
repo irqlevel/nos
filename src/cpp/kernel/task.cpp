@@ -91,6 +91,11 @@ void Task::SetIdle()
     Flags.SetBit(FlagIdleBit);
 }
 
+void Task::ClearIdle()
+{
+    Flags.ClearBit(FlagIdleBit);
+}
+
 bool Task::IsIdle()
 {
     return Flags.TestBit(FlagIdleBit);

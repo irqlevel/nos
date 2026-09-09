@@ -23,13 +23,13 @@ static void InitCrc32Table()
     Crc32TableReady = true;
 }
 
-u32 Crc32(const void* data, ulong size)
+u32 Crc32Update(u32 crc, const void* data, ulong size)
 {
     if (!Crc32TableReady)
         InitCrc32Table();
 
     const u8* p = static_cast<const u8*>(data);
-    u32 crc = 0xFFFFFFFF;
+    crc = crc ^ 0xFFFFFFFF;
 
     for (ulong i = 0; i < size; i++)
     {
@@ -37,6 +37,11 @@ u32 Crc32(const void* data, ulong size)
     }
 
     return crc ^ 0xFFFFFFFF;
+}
+
+u32 Crc32(const void* data, ulong size)
+{
+    return Crc32Update(0, data, size);
 }
 
 }

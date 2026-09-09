@@ -75,9 +75,12 @@ public:
     virtual VNode* Lookup(VNode* dir, const char* name) override;
     virtual VNode* CreateFile(VNode* dir, const char* name) override;
     virtual VNode* CreateDir(VNode* dir, const char* name) override;
-    virtual bool Write(VNode* file, const void* data, ulong len) override;
+    virtual bool Write(VNode* file, const void* data, ulong len, ulong offset) override;
     virtual bool Read(VNode* file, void* buf, ulong len, ulong offset) override;
+    virtual bool Truncate(VNode* file, ulong size) override;
+    virtual bool Rename(VNode* node, VNode* newDir, const char* newName) override;
     virtual bool Remove(VNode* node) override;
+    virtual bool Sync() override;
     virtual BlockDevice* GetDevice() override;
 
 private:
@@ -106,6 +109,8 @@ private:
     VNode* FindVNode(u32 inodeIdx);
     void   FreeVNode(VNode* vnode);
     u32    VNodeToInode(VNode* vnode);
+
+    bool Rewrite(VNode* file, ulong newSize, const void* data, ulong len, ulong offset);
 
     bool AddDirEntry(u32 dirInodeIdx, u32 childInodeIdx);
     bool RemoveDirEntry(u32 dirInodeIdx, u32 childInodeIdx);
