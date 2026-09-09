@@ -1146,12 +1146,17 @@ long Tcp::Send(TcpConn* conn, const void* data, ulong len)
     return (long)sent;
 }
 
-long Tcp::Recv(TcpConn* conn, void* buf, ulong len)
+long Tcp::Recv(TcpConn* conn, void* buf, ulong len, ulong timeoutMs)
 {
     if (!conn)
-        return -1;
+        return TcpRecvError;
 
     u8* dst = (u8*)buf;
+
+    /* An idle deadline, not a whole-transfer one: every byte that arrives
+       pushes it out again, so a long but progressing download never trips
+       it while a peer that goes silent does. */
+    ulong deadline = (timeoutMs != 0) ? GetBootTimeMs() + timeoutMs : 0;
 
     for (;;)
     {
@@ -1197,6 +1202,10 @@ long Tcp::Recv(TcpConn* conn, void* buf, ulong len)
         }
 
         conn->Lock.Unlock();
+
+        if (deadline != 0 && GetBootTimeMs() > deadline)
+            return TcpRecvTimeout;
+
         Sleep(1 * Const::NanoSecsInMs);
     }
 }

@@ -171,21 +171,50 @@ static bool HasChunkedEncoding(const u8* buf, ulong headerLen)
     return false;
 }
 
-/* Decode chunk-size/CRLF framing (RFC 9112 7.1) from src into dst and return
-   the decoded length. dst must hold srcLen bytes (the decoded body is never
-   longer than the wire form). Trailers after the 0-size chunk are ignored;
-   a truncated final chunk keeps the bytes that did arrive. */
-static ulong DechunkBody(const u8* src, ulong srcLen, u8* dst)
+/* Incremental chunk-size/CRLF framing (RFC 9112 7.1). The body never
+   exists in one piece, so decoding is a state machine over the wire bytes
+   as they arrive: Feed() hands the decoded payload to a sink. Trailers
+   after the 0-size chunk are ignored; a truncated final chunk keeps the
+   bytes that did arrive. */
+class HttpChunkDecoder
+{
+public:
+    HttpChunkDecoder()
+        : St(StateSize)
+        , Remaining(0)
+        , SawDigit(false)
+    {
+    }
+
+    /* False means the sink took less than it was offered -- stop reading. */
+    bool Feed(const u8* src, ulong len, HttpSink& out);
+
+    bool IsDone() const { return St == StateDone; }
+
+private:
+    enum State
+    {
+        StateSize,      /* hex chunk size */
+        StateExt,       /* ";extension" and the CRLF that ends the size line */
+        StateData,      /* Remaining payload bytes */
+        StateDataEnd,   /* the CRLF that follows the payload */
+        StateDone,      /* the 0-size chunk arrived */
+    };
+
+    State St;
+    ulong Remaining;
+    bool SawDigit;
+};
+
+bool HttpChunkDecoder::Feed(const u8* src, ulong len, HttpSink& out)
 {
     ulong pos = 0;
-    ulong out = 0;
 
-    for (;;)
+    while (pos < len && St != StateDone)
     {
-        /* Hex chunk size, optionally followed by ";extension", then CRLF */
-        ulong size = 0;
-        bool sawDigit = false;
-        while (pos < srcLen)
+        switch (St)
+        {
+        case StateSize:
         {
             char c = (char)src[pos];
             ulong digit;
@@ -196,74 +225,255 @@ static ulong DechunkBody(const u8* src, ulong srcLen, u8* dst)
             else if (c >= 'A' && c <= 'F')
                 digit = (ulong)(c - 'A') + 10;
             else
+            {
+                /* A size line with no digits at all is framing garbage:
+                   stop rather than resynchronize on noise. */
+                St = SawDigit ? StateExt : StateDone;
                 break;
-            size = size * 16 + digit;
-            sawDigit = true;
+            }
+            Remaining = Remaining * 16 + digit;
+            SawDigit = true;
             pos++;
+            break;
         }
-        if (!sawDigit)
+        case StateExt:
+        {
+            if (src[pos++] != '\n')
+                break;
+            SawDigit = false;
+            St = (Remaining == 0) ? StateDone : StateData;
             break;
-
-        while (pos < srcLen && src[pos] != '\n')
-            pos++;
-        if (pos >= srcLen)
+        }
+        case StateData:
+        {
+            ulong chunk = len - pos;
+            if (chunk > Remaining)
+                chunk = Remaining;
+            ulong taken = out.Write(src + pos, chunk);
+            pos += taken;
+            Remaining -= taken;
+            if (taken < chunk)
+                return false;
+            if (Remaining == 0)
+                St = StateDataEnd;
             break;
-        pos++; /* skip \n */
-
-        if (size == 0)
-            break; /* last chunk */
-
-        if (size > srcLen - pos)
-            size = srcLen - pos;
-
-        Stdlib::MemCpy(dst + out, src + pos, size);
-        out += size;
-        pos += size;
-
-        /* Skip the CRLF that terminates the chunk data */
-        if (pos + 1 < srcLen && src[pos] == '\r' && src[pos + 1] == '\n')
-            pos += 2;
-        else if (pos < srcLen && src[pos] == '\n')
-            pos += 1;
+        }
+        case StateDataEnd:
+        {
+            if (src[pos++] == '\n')
+                St = StateSize;
+            break;
+        }
+        case StateDone:
+            break;
+        }
     }
 
-    return out;
+    return true;
 }
 
-bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp)
+/* Everything the framing says about the body, applied on the way to the
+   caller's sink: chunked decoding, the Content-Length cut-off and the hard
+   size cap. It is itself the sink the decoder writes through, so the cap
+   covers decoded output too. */
+class HttpBodyWriter : public HttpSink
 {
-    /* Receive into a temp buffer */
-    u8* buf = (u8*)Mm::Alloc(HttpMaxResponseSize, 'Http');
+public:
+    HttpBodyWriter(HttpSink& sink, bool chunked, ulong contentLength, ulong limit)
+        : Sink(sink)
+        , Chunked(chunked)
+        , ContentLength(contentLength)
+        , Limit(limit)
+        , Written(0)
+        , Overflow(false)
+        , Failed(false)
+    {
+    }
+
+    /* Raw bytes off the wire; false means there is nothing more to read. */
+    bool Feed(const u8* data, ulong len);
+
+    /* HttpSink: decoded bytes out, the cap applied. */
+    virtual ulong Write(const u8* data, ulong len) override;
+
+    /* True when the body ended where the framing said it would. */
+    bool IsComplete() const;
+
+    ulong GetWritten() const { return Written; }
+    bool IsOverflow() const { return Overflow; }
+
+private:
+    HttpSink& Sink;
+    HttpChunkDecoder Dec;
+    bool Chunked;
+    ulong ContentLength;
+    ulong Limit;
+    ulong Written;
+    bool Overflow;
+    bool Failed;
+};
+
+ulong HttpBodyWriter::Write(const u8* data, ulong len)
+{
+    if (len > Limit - Written)
+    {
+        /* Hand over what still fits under the cap, then stop. */
+        Overflow = true;
+        len = Limit - Written;
+    }
+
+    if (len == 0)
+        return 0;
+
+    ulong taken = Sink.Write(data, len);
+    Written += taken;
+    if (taken < len)
+        Failed = true;
+
+    return taken;
+}
+
+bool HttpBodyWriter::Feed(const u8* data, ulong len)
+{
+    if (Chunked)
+    {
+        if (!Dec.Feed(data, len, *this))
+            return false;
+        return !Dec.IsDone();
+    }
+
+    if (ContentLength != 0)
+    {
+        /* Content-Length is the authority when it is there: stop on the
+           last byte instead of waiting out the peer's FIN. */
+        ulong remaining = ContentLength - Written;
+        if (len > remaining)
+            len = remaining;
+        if (Write(data, len) < len)
+            return false;
+        return Written < ContentLength;
+    }
+
+    /* No framing but the close: read until EOF. */
+    return Write(data, len) == len;
+}
+
+bool HttpBodyWriter::IsComplete() const
+{
+    if (Overflow || Failed)
+        return false;
+    if (Chunked)
+        return Dec.IsDone();
+    if (ContentLength != 0)
+        return Written >= ContentLength;
+    return true;
+}
+
+HttpMemorySink::HttpMemorySink(ulong cap)
+    : Buf(nullptr)
+    , Cap(cap)
+    , Used(0)
+{
+}
+
+HttpMemorySink::~HttpMemorySink()
+{
+    if (Buf != nullptr)
+        Mm::Free(Buf);
+}
+
+ulong HttpMemorySink::Write(const u8* data, ulong len)
+{
+    if (len == 0)
+        return 0;
+
+    /* Allocated on the first byte, so an empty body costs nothing. */
+    if (Buf == nullptr)
+    {
+        Buf = (u8*)Mm::Alloc(Cap, 'Http');
+        if (Buf == nullptr)
+            return 0;
+    }
+
+    /* A body that does not fit keeps its first Cap bytes; the short count
+       stops the transfer and marks the response truncated. */
+    if (len > Cap - Used)
+        len = Cap - Used;
+
+    Stdlib::MemCpy(Buf + Used, data, len);
+    Used += len;
+    return len;
+}
+
+u8* HttpMemorySink::Take()
+{
+    u8* buf = Buf;
+    Buf = nullptr;
+    return buf;
+}
+
+/* Offset of the "\r\n\r\n" boundary's first byte past it, searching buf
+   from `from`; 0 when the headers have not ended yet. */
+static ulong FindHeaderEnd(const u8* buf, ulong from, ulong total)
+{
+    for (ulong j = from; j + 3 < total; j++)
+    {
+        if (buf[j] == '\r' && buf[j + 1] == '\n' &&
+            buf[j + 2] == '\r' && buf[j + 3] == '\n')
+            return j + 4;
+    }
+    return 0;
+}
+
+bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp, HttpSink& sink)
+{
+    /* One buffer for the whole exchange: it holds the headers first, then
+       carries the body a receive at a time. A 20 MB download costs no more
+       memory than a 200 byte one. */
+    u8* buf = (u8*)Mm::Alloc(HttpMaxHeaderSize, 'Http');
     if (!buf)
         return false;
 
     ulong total = 0;
-    Stdlib::Time bt = GetBootTime();
-    ulong deadline = bt.GetSecs() * 1000 + bt.GetUsecs() / 1000 + HttpRecvTimeoutMs;
+    ulong searched = 0;
+    ulong headerEnd = 0;
+    bool eof = false;
 
-    while (total < HttpMaxResponseSize)
+    for (;;)
     {
-        long got = Tcp::GetInstance().Recv(conn, buf + total,
-                                           HttpMaxResponseSize - total);
-        if (got > 0)
+        headerEnd = FindHeaderEnd(buf, searched, total);
+        if (headerEnd != 0 || eof)
+            break;
+
+        if (total >= HttpMaxHeaderSize)
         {
-            total += (ulong)got;
-            bt = GetBootTime();
-            deadline = bt.GetSecs() * 1000 + bt.GetUsecs() / 1000 + HttpRecvTimeoutMs;
-        }
-        else if (got == 0)
-        {
-            break; /* EOF */
-        }
-        else
-        {
+            Trace(0, "HttpClient: headers larger than %u bytes",
+                  (ulong)HttpMaxHeaderSize);
             Mm::Free(buf);
             return false;
         }
 
-        bt = GetBootTime();
-        if (bt.GetSecs() * 1000 + bt.GetUsecs() / 1000 > deadline)
-            break;
+        /* A boundary can straddle two receives, so rescan the last 3 bytes. */
+        searched = (total >= 3) ? total - 3 : 0;
+
+        long got = Tcp::GetInstance().Recv(conn, buf + total,
+                                           HttpMaxHeaderSize - total,
+                                           HttpRecvTimeoutMs);
+        if (got > 0)
+        {
+            total += (ulong)got;
+        }
+        else if (got == 0)
+        {
+            eof = true;
+        }
+        else
+        {
+            Trace(0, "HttpClient: %s waiting for headers",
+                  (got == TcpRecvTimeout) ? "timeout" : "receive error");
+            Mm::Free(buf);
+            return false;
+        }
     }
 
     if (total == 0)
@@ -289,26 +499,16 @@ bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp)
         i++;
     }
 
-    /* Find header/body boundary: \r\n\r\n */
-    ulong headerEnd = 0;
-    for (ulong j = 0; j + 3 < total; j++)
-    {
-        if (buf[j] == '\r' && buf[j + 1] == '\n' &&
-            buf[j + 2] == '\r' && buf[j + 3] == '\n')
-        {
-            headerEnd = j + 4;
-            break;
-        }
-    }
-
     if (headerEnd == 0)
     {
-        /* No header boundary found -- treat entire response as body */
-        resp.Body = buf;
-        resp.BodyLen = total;
-        resp.ContentLength = total;
+        /* No header boundary before the peer hung up -- treat everything
+           that arrived as the body. */
+        resp.BodyLen = sink.Write(buf, total);
+        resp.ContentLength = resp.BodyLen;
+        resp.Truncated = true;
         resp.Ok = true;
-        resp.Err = MakeSuccess();
+        resp.Err = MakeError(Stdlib::Error::UnexpectedEOF);
+        Mm::Free(buf);
         return true;
     }
 
@@ -343,33 +543,75 @@ bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp)
         }
     }
 
-    /* Body starts after header boundary */
     bool chunked = HasChunkedEncoding(buf, headerEnd);
-    ulong bodyLen = total - headerEnd;
-    if (bodyLen > 0)
-    {
-        resp.Body = (u8*)Mm::Alloc(bodyLen, 'Http');
-        if (resp.Body)
-        {
-            if (chunked)
-            {
-                resp.BodyLen = DechunkBody(buf + headerEnd, bodyLen, resp.Body);
-            }
-            else
-            {
-                Stdlib::MemCpy(resp.Body, buf + headerEnd, bodyLen);
-                resp.BodyLen = bodyLen;
-            }
-        }
-    }
-    if (resp.ContentLength == 0 || chunked)
-        resp.ContentLength = resp.BodyLen;
 
     /* Extract Location header for redirects */
     ExtractLocation(buf, headerEnd, resp.Location, sizeof(resp.Location));
 
+    if (resp.IsRedirect())
+    {
+        /* The body of a redirect is of no interest to anyone, and the
+           connection is closed right after -- do not read it at all. */
+        resp.BodyLen = 0;
+        resp.Ok = true;
+        resp.Err = MakeSuccess();
+        Mm::Free(buf);
+        return true;
+    }
+
+    if (!chunked && resp.ContentLength > HttpMaxBodySize)
+    {
+        /* Refuse before the transfer rather than after 20 MB of it. */
+        Trace(0, "HttpClient: body of %u bytes over the %u byte limit",
+              resp.ContentLength, (ulong)HttpMaxBodySize);
+        resp.BodyLen = 0;
+        resp.Truncated = true;
+        resp.Ok = true;
+        resp.Err = MakeError(Stdlib::Error::BufTooBig);
+        Mm::Free(buf);
+        return true;
+    }
+
+    HttpBodyWriter writer(sink, chunked, resp.ContentLength, HttpMaxBodySize);
+
+    bool keepReading = writer.Feed(buf + headerEnd, total - headerEnd);
+    bool recvFailed = false;
+
+    while (keepReading && !eof)
+    {
+        long got = Tcp::GetInstance().Recv(conn, buf, HttpMaxHeaderSize,
+                                           HttpRecvTimeoutMs);
+        if (got > 0)
+        {
+            keepReading = writer.Feed(buf, (ulong)got);
+        }
+        else if (got == 0)
+        {
+            eof = true;
+        }
+        else
+        {
+            Trace(0, "HttpClient: %s after %u body bytes",
+                  (got == TcpRecvTimeout) ? "timeout" : "receive error",
+                  writer.GetWritten());
+            recvFailed = true;
+            break;
+        }
+    }
+
+    resp.BodyLen = writer.GetWritten();
+    if (resp.ContentLength == 0 || chunked)
+        resp.ContentLength = resp.BodyLen;
+
+    resp.Truncated = recvFailed || !writer.IsComplete();
+    if (writer.IsOverflow())
+        resp.Err = MakeError(Stdlib::Error::BufTooBig);
+    else if (resp.Truncated)
+        resp.Err = MakeError(Stdlib::Error::UnexpectedEOF);
+    else
+        resp.Err = MakeSuccess();
+
     resp.Ok = true;
-    resp.Err = MakeSuccess();
     Mm::Free(buf);
     return true;
 }
@@ -414,7 +656,7 @@ void HttpClient::ExtractLocation(const u8* headers, ulong headerLen,
     loc[0] = '\0';
 }
 
-HttpResponse HttpClient::DoGet(const char* url)
+HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
 {
     HttpResponse resp;
 
@@ -453,7 +695,7 @@ HttpResponse HttpClient::DoGet(const char* url)
     }
 
     /* Receive response */
-    if (!RecvResponse(conn, resp))
+    if (!RecvResponse(conn, resp, sink))
     {
         Trace(0, "HttpClient: failed to receive response");
         Tcp::GetInstance().Close(conn);
@@ -466,6 +708,14 @@ HttpResponse HttpClient::DoGet(const char* url)
 
 HttpResponse HttpClient::Get(const char* url)
 {
+    HttpMemorySink sink(HttpMaxResponseSize);
+    HttpResponse resp = Get(url, sink);
+    resp.Body = sink.Take();
+    return resp;
+}
+
+HttpResponse HttpClient::Get(const char* url, HttpSink& sink)
+{
     char currentUrl[HttpMaxUrlHostLen + HttpMaxUrlPathLen];
     ulong urlLen = Stdlib::StrLen(url);
     if (urlLen >= sizeof(currentUrl))
@@ -475,7 +725,7 @@ HttpResponse HttpClient::Get(const char* url)
 
     for (ulong attempt = 0; attempt <= HttpMaxRedirects; attempt++)
     {
-        HttpResponse resp = DoGet(currentUrl);
+        HttpResponse resp = DoGet(currentUrl, sink);
 
         if (!resp.Ok || !resp.IsRedirect())
             return resp;
@@ -492,13 +742,8 @@ HttpResponse HttpClient::Get(const char* url)
 
         Trace(0, "HttpClient: %u redirect -> %s", (ulong)resp.StatusCode, resp.Location);
 
-        /* Free body from redirect response */
-        if (resp.Body)
-        {
-            Mm::Free(resp.Body);
-            resp.Body = nullptr;
-            resp.BodyLen = 0;
-        }
+        /* The body of a redirect never reached the sink (RecvResponse drops
+           it), so there is nothing to release here. */
 
         urlLen = Stdlib::StrLen(resp.Location);
         if (urlLen >= sizeof(currentUrl))
