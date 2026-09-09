@@ -28,6 +28,11 @@ public:
     bool IsWxProbe();
     bool IsUsbOff();
 
+    /* hwrng=off -- ignore the cpu's random instruction (RDRAND/RDSEED,
+       RNDR). For seeing what a machine without one does, on a machine that
+       has one; the pool then falls back on virtio-rng and timing jitter. */
+    bool IsHwRngOff();
+
     bool IsConsoleSerial();
     bool IsConsoleVga();
     bool IsConsoleBoth();
@@ -122,6 +127,7 @@ private:
     bool SmpOff;
     ulong MaxCpusLimit;
     bool ItsEnabled;
+    bool HwRngOff;
     bool WxProbe;
     bool UsbOff;
     ConsoleMode ConMode;

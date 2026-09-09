@@ -4,6 +4,7 @@
 #include "sched.h"
 #include "cpu.h"
 #include "stack_trace.h"
+#include "random.h"
 #include <hal/cpu.h>
 #include <block/block_device.h>
 #include <fs/vfs.h>
@@ -1926,6 +1927,133 @@ Stdlib::Error TestVfs()
     return MakeSuccess();
 }
 
+Stdlib::Error TestChaCha20()
+{
+    Trace(0, "TestChaCha20: started");
+
+    /* RFC 8439, 2.3.2: the block function's own test vector. Key 00..1f,
+       nonce 00:00:00:09:00:00:00:4a:00:00:00:00, block counter 1. The pool
+       (kernel/random.cpp) is only as good as this is right, and there is no
+       other way to find out that a barrel shift or a round order is wrong --
+       wrong output here still looks random. */
+    u8 key[Stdlib::ChaCha20KeySize];
+    for (ulong i = 0; i < sizeof(key); i++)
+        key[i] = (u8)i;
+
+    const u8 nonce[Stdlib::ChaCha20NonceSize] = {
+        0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x4a, 0x00, 0x00, 0x00, 0x00
+    };
+
+    const u8 expected[Stdlib::ChaCha20BlockSize] = {
+        0x10, 0xf1, 0xe7, 0xe4, 0xd1, 0x3b, 0x59, 0x15,
+        0x50, 0x0f, 0xdd, 0x1f, 0xa3, 0x20, 0x71, 0xc4,
+        0xc7, 0xd1, 0xf4, 0xc7, 0x33, 0xc0, 0x68, 0x03,
+        0x04, 0x22, 0xaa, 0x9a, 0xc3, 0xd4, 0x6c, 0x4e,
+        0xd2, 0x82, 0x64, 0x46, 0x07, 0x9f, 0xaa, 0x09,
+        0x14, 0xc2, 0xd7, 0x05, 0xd9, 0x8b, 0x02, 0xa2,
+        0xb5, 0x12, 0x9c, 0xd1, 0xde, 0x16, 0x4e, 0xb9,
+        0xcb, 0xd0, 0x83, 0xe8, 0xa2, 0x50, 0x3c, 0x4e
+    };
+
+    u8 block[Stdlib::ChaCha20BlockSize];
+    Stdlib::ChaCha20Block(key, 1, nonce, block);
+
+    if (Stdlib::MemCmp(block, expected, sizeof(expected)) != 0)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* A different counter has to give a different block, or the counter is
+       not reaching the state at all. */
+    u8 other[Stdlib::ChaCha20BlockSize];
+    Stdlib::ChaCha20Block(key, 2, nonce, other);
+    if (Stdlib::MemCmp(block, other, sizeof(other)) == 0)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Trace(0, "TestChaCha20: complete");
+    return MakeSuccess();
+}
+
+Stdlib::Error TestRandom()
+{
+    Trace(0, "TestRandom: started");
+
+    auto& random = Random::GetInstance();
+
+    /* A pool that no source could seed is a property of the machine, not a
+       bug in this code -- boot says so already, and the checks below still
+       mean something, since they are about the generator and not the seed. */
+    if (!random.IsSeeded())
+        Trace(0, "TestRandom: pool is unseeded on this machine");
+
+    /* 33 bytes spans two ChaCha20 blocks and ends mid-block, which is where a
+       length or offset slip would show. Eight draws, and at least two of them
+       have to differ in the byte past the first block: a generator stuck on
+       one block, or one that never writes the tail, fails this, and a working
+       one fails it with probability 256^-7. */
+    const ulong Draws = 8;
+    const ulong Len = 33;
+
+    u8 buf[Len];
+    u8 first[Len];
+    bool differs = false;
+    bool nonZero = false;
+
+    for (ulong i = 0; i < Draws; i++)
+    {
+        Stdlib::MemSet(buf, 0, sizeof(buf));
+        random.GetBytes(buf, sizeof(buf));
+
+        for (ulong j = 0; j < sizeof(buf); j++)
+        {
+            if (buf[j] != 0)
+                nonZero = true;
+        }
+
+        if (i == 0)
+            Stdlib::MemCpy(first, buf, sizeof(buf));
+        else if (buf[Stdlib::ChaCha20KeySize] != first[Stdlib::ChaCha20KeySize])
+            differs = true;
+    }
+
+    if (!nonZero || !differs)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Same argument for the u64 shorthand. */
+    u64 prev = random.GetU64();
+    differs = false;
+    for (ulong i = 0; i < Draws; i++)
+    {
+        u64 value = random.GetU64();
+        if (value != prev)
+            differs = true;
+        prev = value;
+    }
+
+    if (!differs)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Absorbing must not wedge the pool or empty it: an unpaired lock or a
+       zeroed key would show as the next draw failing the checks above. */
+    const char material[] = "TestRandom";
+    random.AddEntropy(material, sizeof(material));
+    random.AddEntropy(nullptr, 0);
+
+    prev = random.GetU64();
+    differs = false;
+    for (ulong i = 0; i < Draws; i++)
+    {
+        u64 value = random.GetU64();
+        if (value != prev)
+            differs = true;
+        prev = value;
+    }
+
+    if (!differs)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Trace(0, "TestRandom: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
@@ -2005,6 +2133,14 @@ Stdlib::Error Test()
         return err;
 
     err = TestSnPrintf();
+    if (!err.Ok())
+        return err;
+
+    err = TestChaCha20();
+    if (!err.Ok())
+        return err;
+
+    err = TestRandom();
     if (!err.Ok())
         return err;
 

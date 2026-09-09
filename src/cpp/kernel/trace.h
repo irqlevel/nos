@@ -22,6 +22,10 @@ const int IoApicLL = 0;
 const int MmIoLL = 4;
 const int TestLL = 3;
 
+/* One line per entropy source per reseed, and a reseed is a rare event -- but
+   a source that quietly stops answering is worth being able to see. */
+const int RandomLL = 3;
+
 /* Three lines per ping, on the normal path. A machine someone is checking
    with `ping -f`, or just a host that gets scanned, buries everything else
    in the dmesg ring and in the netconsole stream. The counters behind

@@ -18,7 +18,7 @@ What the kernel supplies, and already had:
 | TLS needs | comes from |
 |---|---|
 | a byte transport | `Tcp::Send` / `Tcp::Recv` (`net/tcp.cpp`) |
-| randomness | `EntropySourceTable` — virtio-rng, RDRAND |
+| randomness | `Kernel::Random` — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
 | a wall clock, for certificate validity | `GetWallTimeSecs()` |
 | a heap | the Rust global allocator over `Mm::Alloc` |
 
@@ -113,7 +113,10 @@ the crates' own switches to the portable backends:
 ```
 
 `getrandom` has no backend for a bare-metal target either; the `tls` crate
-registers the kernel's entropy pool as its custom one.
+registers the kernel's entropy pool as its custom one. That pool is what makes
+a handshake work on a machine with no virtio-rng: `FailedToGetRandomBytes` from
+rustls means `kernel_get_random` returned zero, i.e. nothing had seeded the
+pool -- `entropy` in the shell says which sources exist.
 
 ## What it costs
 

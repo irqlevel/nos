@@ -41,6 +41,7 @@ the disk image, and `dhcp=auto dns=on udpshell=9000 root=auto` on arm64.
 
 - `usb=off` — x86-64 only: skip xHCI bring-up (no USB keyboard; the 8042 keyboard is unaffected)
 - `its=off` — arm64 only: disable the GICv3 ITS and degrade PCIe MSI gracefully (default `its=on`; virtio-mmio devices don't need it)
+- `hwrng=off` — ignore the CPU's random instruction (RDRAND/RDSEED, RNDR), leaving the entropy pool with virtio-rng and timing jitter. How the fallback path gets exercised on a machine that has one; `entropy` then reports whether anything else reached the pool. See [Randomness](random.md)
 - `root=auto` — mount the ext2 filesystem labelled `nos` read-write on `/`; without one, a ramfs on `/`, the first ext2 found read-only on `/boot` and the first nanofs found read-write on `/data`. Without `root=` the VFS starts empty and filesystems are mounted from the shell
 - `root=<device>` / `root=LABEL=<label>` / `root=UUID=<uuid>` — the root by block device name (`vda1`, `nvme01`), ext2 volume label or UUID. A root that is not found falls back to the `auto` layout, so the shell is always there. See [Filesystems](filesystems.md)
 - `ro` — mount the root read-only

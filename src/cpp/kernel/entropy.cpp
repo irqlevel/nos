@@ -39,11 +39,11 @@ EntropySource* EntropySourceTable::Find(const char* name)
     return nullptr;
 }
 
-EntropySource* EntropySourceTable::GetDefault()
+EntropySource* EntropySourceTable::Get(ulong index)
 {
-    if (Count == 0)
+    if (index >= Count)
         return nullptr;
-    return Sources[0];
+    return Sources[index];
 }
 
 ulong EntropySourceTable::GetCount()

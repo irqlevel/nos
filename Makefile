@@ -59,6 +59,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/arch/x86_64/cpu_start.cpp \
     src/cpp/arch/x86_64/pci_x86.cpp \
     src/cpp/arch/x86_64/hal_x86.cpp \
+    src/cpp/arch/x86_64/hal_random.cpp \
     src/cpp/arch/x86_64/builtin_pt.cpp \
     src/cpp/drivers/serial.cpp  \
     src/cpp/arch/x86_64/pic.cpp \
@@ -151,11 +152,13 @@ CXX_SRC_x86_64 =   \
     src/cpp/kernel/stack_probe.cpp \
     src/cpp/kernel/symtab.cpp \
     src/cpp/kernel/entropy.cpp \
+    src/cpp/kernel/random.cpp \
     src/cpp/kernel/rust_ffi.cpp \
     src/cpp/lib/stdlib.cpp  \
     src/cpp/lib/format.cpp \
     src/cpp/lib/bitmap.cpp \
     src/cpp/lib/checksum.cpp \
+    src/cpp/lib/chacha20.cpp \
     src/cpp/lib/list_entry.cpp  \
     src/cpp/lib/error.cpp   \
     src/cpp/mm/memory_map.cpp   \
@@ -176,6 +179,7 @@ CXX_SRC_aarch64 = \
     src/cpp/arch/arm64/cpu_arm64.cpp \
     src/cpp/arch/arm64/cpu_start_arm64.cpp \
     src/cpp/arch/arm64/hal_arm64.cpp \
+    src/cpp/arch/arm64/hal_random.cpp \
     src/cpp/arch/arm64/time_arm64.cpp \
     src/cpp/arch/arm64/builtin_pt.cpp \
     src/cpp/arch/arm64/gicv3.cpp \
@@ -222,6 +226,7 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/cmd.cpp \
     src/cpp/kernel/input.cpp \
     src/cpp/kernel/entropy.cpp \
+    src/cpp/kernel/random.cpp \
     src/cpp/net/net_device.cpp \
     src/cpp/net/net_frame.cpp \
     src/cpp/net/net_frame_pool.cpp \
@@ -254,6 +259,7 @@ CXX_SRC_aarch64 = \
     src/cpp/lib/error.cpp \
     src/cpp/lib/bitmap.cpp \
     src/cpp/lib/checksum.cpp \
+    src/cpp/lib/chacha20.cpp \
     src/cpp/lib/list_entry.cpp \
     src/cpp/mm/memory_map.cpp \
     src/cpp/mm/new.cpp \

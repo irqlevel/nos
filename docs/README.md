@@ -15,6 +15,7 @@ How it works, by subsystem:
 - [Interrupts](interrupts.md) — the IDT and IOAPIC, MSI-X, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
 - [Profiler](profiler.md) — sampling on a performance counter or the tick, and how to read a `profile` report
 - [HTTPS](tls.md) — how `wget https://` works: the transport seam, rustls in `no_std`, certificates, and what it costs
+- [Randomness](random.md) — the ChaCha20 pool, the entropy sources each machine turns out to have, and what timing jitter is worth
 - [Filesystems](filesystems.md) — the root filesystem and `root=`, the file API, what the ext2 driver writes and how, making and checking a root image
 
 Tools:
