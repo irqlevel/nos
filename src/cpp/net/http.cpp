@@ -1,5 +1,6 @@
 #include "http.h"
 #include "tcp.h"
+#include "tls.h"
 #include "dns.h"
 #include <kernel/trace.h>
 #include <kernel/time.h>
@@ -19,21 +20,32 @@ HttpClient::~HttpClient()
 }
 
 bool HttpClient::ParseUrl(const char* url, char* host, ulong hostSize,
-                          u16& port, char* path, ulong pathSize)
+                          u16& port, char* path, ulong pathSize, bool& tls)
 {
-    /* Expected: http://host[:port][/path] */
+    /* Expected: http[s]://host[:port][/path] */
     const char* p = url;
 
     /* Skip scheme */
     static const char httpPrefix[] = "http://";
     static const ulong httpPrefixLen = 7;
-    if (Stdlib::StrnCmp(p, httpPrefix, httpPrefixLen) == 0)
+    static const char httpsPrefix[] = "https://";
+    static const ulong httpsPrefixLen = 8;
+
+    tls = false;
+    if (Stdlib::StrnCmp(p, httpsPrefix, httpsPrefixLen) == 0)
+    {
+        tls = true;
+        p += httpsPrefixLen;
+    }
+    else if (Stdlib::StrnCmp(p, httpPrefix, httpPrefixLen) == 0)
+    {
         p += httpPrefixLen;
+    }
 
     /* Extract host (and optional port) */
     const char* hostStart = p;
     const char* hostEnd = nullptr;
-    port = HttpDefaultPort;
+    port = tls ? HttpsDefaultPort : HttpDefaultPort;
 
     /* Find end of host: '/', ':', or end of string */
     while (*p && *p != '/' && *p != ':')
@@ -93,7 +105,56 @@ bool HttpClient::ResolveHost(const char* host, Net::IpAddress& ip)
     return DnsResolver::GetInstance().Resolve(host, ip);
 }
 
-bool HttpClient::SendRequest(TcpConn* conn, const char* method,
+/* Plain TCP: the transport the client has always used. */
+class TcpTransport : public HttpTransport
+{
+public:
+    TcpTransport(TcpConn* conn)
+        : Conn(conn)
+    {
+    }
+
+    virtual bool Send(const void* data, ulong len) override
+    {
+        return Tcp::GetInstance().Send(Conn, data, len) > 0;
+    }
+
+    virtual long Recv(void* buf, ulong len, ulong timeoutMs) override
+    {
+        return Tcp::GetInstance().Recv(Conn, buf, len, timeoutMs);
+    }
+
+private:
+    TcpConn* Conn;
+};
+
+/* TLS over that same connection. The session is handed in already
+   handshaken, and closed by whoever opened it. */
+class TlsTransport : public HttpTransport
+{
+public:
+    TlsTransport(TlsConn& tls)
+        : Tls(tls)
+    {
+    }
+
+    virtual bool Send(const void* data, ulong len) override
+    {
+        return Tls.Send(data, len);
+    }
+
+    virtual long Recv(void* buf, ulong len, ulong timeoutMs) override
+    {
+        /* The TLS side runs its own idle timeout on the socket below. */
+        (void)timeoutMs;
+        return Tls.Recv(buf, len);
+    }
+
+private:
+    TlsConn& Tls;
+};
+
+bool HttpClient::SendRequest(HttpTransport& transport, const char* method,
                              const char* host, const char* path)
 {
     /* Build request:
@@ -121,8 +182,7 @@ bool HttpClient::SendRequest(TcpConn* conn, const char* method,
         off += slen;
     }
 
-    long sent = Tcp::GetInstance().Send(conn, req, off);
-    return (sent > 0);
+    return transport.Send(req, off);
 }
 
 /* True when the headers contain "Transfer-Encoding: ... chunked" */
@@ -425,7 +485,8 @@ static ulong FindHeaderEnd(const u8* buf, ulong from, ulong total)
     return 0;
 }
 
-bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp, HttpSink& sink)
+bool HttpClient::RecvResponse(HttpTransport& transport, HttpResponse& resp,
+                              HttpSink& sink)
 {
     /* One buffer for the whole exchange: it holds the headers first, then
        carries the body a receive at a time. A 20 MB download costs no more
@@ -456,9 +517,8 @@ bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp, HttpSink& sink)
         /* A boundary can straddle two receives, so rescan the last 3 bytes. */
         searched = (total >= 3) ? total - 3 : 0;
 
-        long got = Tcp::GetInstance().Recv(conn, buf + total,
-                                           HttpMaxHeaderSize - total,
-                                           HttpRecvTimeoutMs);
+        long got = transport.Recv(buf + total, HttpMaxHeaderSize - total,
+                                  HttpRecvTimeoutMs);
         if (got > 0)
         {
             total += (ulong)got;
@@ -579,8 +639,7 @@ bool HttpClient::RecvResponse(TcpConn* conn, HttpResponse& resp, HttpSink& sink)
 
     while (keepReading && !eof)
     {
-        long got = Tcp::GetInstance().Recv(conn, buf, HttpMaxHeaderSize,
-                                           HttpRecvTimeoutMs);
+        long got = transport.Recv(buf, HttpMaxHeaderSize, HttpRecvTimeoutMs);
         if (got > 0)
         {
             keepReading = writer.Feed(buf, (ulong)got);
@@ -663,8 +722,9 @@ HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
     char host[HttpMaxUrlHostLen];
     char path[HttpMaxUrlPathLen];
     u16 port = HttpDefaultPort;
+    bool useTls = false;
 
-    if (!ParseUrl(url, host, sizeof(host), port, path, sizeof(path)))
+    if (!ParseUrl(url, host, sizeof(host), port, path, sizeof(path), useTls))
     {
         Trace(0, "HttpClient: failed to parse URL");
         return resp;
@@ -686,22 +746,40 @@ HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
         return resp;
     }
 
+    /* TLS goes on top of that connection; its destructor sends the
+       close_notify, and the connection below is closed here either way. */
+    TlsConn tls;
+    if (useTls && !tls.Connect(conn, host))
+    {
+        resp.TlsFailed = true;
+        Tcp::GetInstance().Close(conn);
+        return resp;
+    }
+
+    TcpTransport tcpTransport(conn);
+    TlsTransport tlsTransport(tls);
+    HttpTransport& transport = useTls ? (HttpTransport&)tlsTransport
+                                      : (HttpTransport&)tcpTransport;
+
     /* Send GET request */
-    if (!SendRequest(conn, "GET", host, path))
+    if (!SendRequest(transport, "GET", host, path))
     {
         Trace(0, "HttpClient: failed to send request");
+        tls.Close();
         Tcp::GetInstance().Close(conn);
         return resp;
     }
 
     /* Receive response */
-    if (!RecvResponse(conn, resp, sink))
+    if (!RecvResponse(transport, resp, sink))
     {
         Trace(0, "HttpClient: failed to receive response");
+        tls.Close();
         Tcp::GetInstance().Close(conn);
         return resp;
     }
 
+    tls.Close();
     Tcp::GetInstance().Close(conn);
     return resp;
 }
@@ -730,10 +808,13 @@ HttpResponse HttpClient::Get(const char* url, HttpSink& sink)
         if (!resp.Ok || !resp.IsRedirect())
             return resp;
 
-        /* Only follow http:// redirects */
+        /* Only follow absolute http:// and https:// redirects */
         static const char httpPrefix[] = "http://";
         static const ulong httpPrefixLen = 7;
-        if (Stdlib::StrnCmp(resp.Location, httpPrefix, httpPrefixLen) != 0)
+        static const char httpsPrefix[] = "https://";
+        static const ulong httpsPrefixLen = 8;
+        if (Stdlib::StrnCmp(resp.Location, httpPrefix, httpPrefixLen) != 0 &&
+            Stdlib::StrnCmp(resp.Location, httpsPrefix, httpsPrefixLen) != 0)
         {
             Trace(0, "HttpClient: %u redirect to non-HTTP: %s",
                   (ulong)resp.StatusCode, resp.Location);

@@ -18,4 +18,5 @@ pub mod softirq;
 pub mod timer;
 pub mod block;
 pub mod net;
+pub mod tcp;
 pub mod acpi;

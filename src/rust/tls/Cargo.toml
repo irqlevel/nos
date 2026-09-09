@@ -1,0 +1,14 @@
+[package]
+name = "tls"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kcore = { path = "../kcore" }
+ffi = { path = "../ffi" }
+rustls = { version = "0.23", default-features = false, features = ["custom-provider", "tls12", "hashbrown"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc", "tls12"] }
+webpki-roots = "1.0"
+# getrandom has no backend for a bare-metal target: register the kernel's
+# entropy source as its custom one (see lib.rs).
+getrandom = { version = "0.2", features = ["custom"] }

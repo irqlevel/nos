@@ -1174,6 +1174,17 @@ private:
     ulong Reported;
 };
 
+/* Why the request produced nothing. TLS gets its own line: "failed" for a
+   rejected certificate would send the reader looking in the wrong place. */
+static void WgetPrintFailure(const HttpResponse& resp, Stdlib::Printer& con)
+{
+    if (resp.TlsFailed)
+        con.Printf("wget: TLS handshake refused -- bad certificate, or no "
+                   "protocol in common (dmesg has the reason)\n");
+    else
+        con.Printf("wget: failed\n");
+}
+
 /* Downloads to a file, streaming. Returns false with the reason printed. */
 static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
                        Stdlib::Printer& con)
@@ -1207,7 +1218,7 @@ static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
 
     if (!resp.Ok)
     {
-        con.Printf("wget: failed\n");
+        WgetPrintFailure(resp, con);
         return false;
     }
 
@@ -1236,21 +1247,45 @@ static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
 
 static void CmdWget(const char* args, Stdlib::Printer& con)
 {
-    const char* end;
-    const char* urlStart = Stdlib::NextToken(args, end);
-    if (urlStart == nullptr)
+    char url[HttpMaxUrlHostLen + HttpMaxUrlPathLen];
+    char path[Vfs::MaxPath];
+    url[0] = '\0';
+    path[0] = '\0';
+
+    /* wget [-o <path>] <url> [path] -- the flag and the trailing argument
+       mean the same thing, whichever reads better. */
+    const char* end = args;
+    for (const char* tok = Stdlib::NextToken(args, end); tok != nullptr;
+         tok = Stdlib::NextToken(end, end))
     {
-        con.Printf("usage: wget <url> [path]\n");
+        char arg[Vfs::MaxPath];
+        Stdlib::TokenCopy(tok, end, arg, sizeof(arg));
+
+        if (Stdlib::StrCmp(arg, "-o") == 0)
+        {
+            const char* out = Stdlib::NextToken(end, end);
+            if (out == nullptr)
+            {
+                con.Printf("wget: -o needs a path\n");
+                return;
+            }
+            Stdlib::TokenCopy(out, end, path, sizeof(path));
+        }
+        else if (url[0] == '\0')
+        {
+            Stdlib::TokenCopy(tok, end, url, sizeof(url));
+        }
+        else if (path[0] == '\0')
+        {
+            Stdlib::TokenCopy(tok, end, path, sizeof(path));
+        }
+    }
+
+    if (url[0] == '\0')
+    {
+        con.Printf("usage: wget [-o <path>] <url> [path]\n");
         return;
     }
-    char url[HttpMaxUrlHostLen + HttpMaxUrlPathLen];
-    Stdlib::TokenCopy(urlStart, end, url, sizeof(url));
-
-    char path[Vfs::MaxPath];
-    path[0] = '\0';
-    const char* pathStart = Stdlib::NextToken(end, end);
-    if (pathStart != nullptr)
-        Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
     NetDevice* dev = NetDeviceTable::GetInstance().Find("eth0");
     if (!dev)
@@ -1271,7 +1306,7 @@ static void CmdWget(const char* args, Stdlib::Printer& con)
 
     if (!resp.Ok)
     {
-        con.Printf("wget: failed\n");
+        WgetPrintFailure(resp, con);
         return;
     }
 
@@ -2617,7 +2652,7 @@ static const CmdEntry Commands[] = {
     { "netconsole", CmdNetconsole, "netconsole - show netconsole state" },
     { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
     { "tcpstat",   CmdTcpstat,   "tcpstat - show TCP connections and statistics" },
-    { "wget",      CmdWget,      "wget <url> [path] - HTTP GET request, streamed to a file (up to 20 MB)" },
+    { "wget",      CmdWget,      "wget [-o <path>] <url> [path] - HTTP(S) GET, streamed to a file (up to 20 MB)" },
     { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
     { "ping",      CmdPing,      "ping <ip|hostname> - send ICMP echo" },
     { "nslookup",  CmdNslookup,  "nslookup <hostname> - resolve hostname" },

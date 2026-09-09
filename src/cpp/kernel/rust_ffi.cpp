@@ -27,6 +27,7 @@
 #include <block/block_device.h>
 #include <net/net_device.h>
 #include <net/net_frame.h>
+#include <net/tcp.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
 
@@ -421,6 +422,26 @@ int kernel_get_random(unsigned char* buf, unsigned long len)
     if (!src || !buf || len == 0)
         return 0;
     return src->GetRandom(buf, (ulong)len) ? 1 : 0;
+}
+
+/* ---- TCP, for the Rust TLS client ---- */
+
+/* The TLS session runs on the connection its C++ owner opened; these two
+   are the whole of what rustls needs from the socket. */
+long kernel_tcp_send(void* conn, const unsigned char* buf, unsigned long len)
+{
+    if (!conn || !buf)
+        return -1;
+    return Kernel::Tcp::GetInstance().Send((Kernel::TcpConn*)conn, buf, (ulong)len);
+}
+
+long kernel_tcp_recv(void* conn, unsigned char* buf, unsigned long len,
+                     unsigned long timeoutMs)
+{
+    if (!conn || !buf)
+        return -1;
+    return Kernel::Tcp::GetInstance().Recv((Kernel::TcpConn*)conn, buf, (ulong)len,
+                                           (ulong)timeoutMs);
 }
 
 /* ---- Soft IRQ ---- */

@@ -21,6 +21,9 @@ fn alloc_error(_layout: core::alloc::Layout) -> ! {
 #[no_mangle]
 pub extern "C" fn rust_init() {
     hello::hello();
+    /* Nothing to set up -- the TLS client is called from C++ through its
+       own symbols, and this is what keeps them in the archive. */
+    tls::init();
     nvme::init();
     r8168::init();
     r8125::init();

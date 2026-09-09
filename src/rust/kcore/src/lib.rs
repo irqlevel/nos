@@ -9,6 +9,7 @@ pub mod trace;
 pub mod time;
 pub mod sync;
 pub mod task;
+pub mod tcp;
 pub mod io;
 pub mod dma;
 pub mod random;
