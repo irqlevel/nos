@@ -6,25 +6,117 @@ on:
       - 'v*'
 
 jobs:
-  build-and-release:
+  # x86-64: the disk image build already compiles the kernel inside the
+  # builder container (make clean && make nocheck), so the ISO, the qcow2
+  # and bin/kernel64.elf all fall out of this one step.
+  build-x86_64:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build ISO and disk image
+      - name: Build ISO, disk image and kernel
         env:
           VERSION: ${{ github.ref_name }}
         run: ./scripts/build-disk.sh
+
+      - name: Stage the release files
+        run: |
+          mkdir -p dist
+          cp bin/kernel64.elf dist/kernel-x86_64.elf
+          cp nos.iso          dist/nos.iso
+          cp nos.qcow2        dist/nos.qcow2
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  # arm64: no ISO and no disk image -- the artifacts are the ELF (symbols,
+  # for GDB) and the flat Linux-protocol Image that QEMU/U-Boot boot.
+  build-aarch64:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --default-toolchain nightly --component rust-src
+
+      - name: Build aarch64
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          make nocheck ARCH=aarch64
+
+      - name: Stage the release files
+        run: |
+          mkdir -p dist
+          cp bin/kernel-arm64.elf dist/kernel-arm64.elf
+          cp nos-arm64.img        dist/nos-arm64.img
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aarch64
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [build-x86_64, build-aarch64]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          ls -l
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           name: nos ${{ github.ref_name }}
           generate_release_notes: true
+          append_body: true
+          body: |
+            ### Download
+
+            ```sh
+            # x86-64 kernel (Multiboot2 ELF, GRUB `multiboot2` / QEMU `-kernel`)
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kernel-x86_64.elf
+            # arm64 kernel (flat Linux `Image`, QEMU virt `-kernel`)
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nos-arm64.img
+            # arm64 ELF with symbols, for GDB
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/kernel-arm64.elf
+            # bootable media
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nos.iso
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nos.qcow2
+            ```
+
+            `latest` works too, without naming the tag:
+            `https://github.com/${{ github.repository }}/releases/latest/download/kernel-x86_64.elf`
+
+            `SHA256SUMS` covers every file above.
           files: |
-            nos.iso
-            nos.qcow2
+            dist/kernel-x86_64.elf
+            dist/kernel-arm64.elf
+            dist/nos-arm64.img
+            dist/nos.iso
+            dist/nos.qcow2
+            dist/SHA256SUMS
