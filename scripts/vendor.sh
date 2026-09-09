@@ -6,6 +6,12 @@
 # commit the result together with Cargo.toml/Cargo.lock. It needs network
 # access itself, once.
 #
+# It belongs to one nightly. -Z build-std resolves the compiler's own library
+# workspace alongside ours (--sync below), so what lands here depends on the
+# toolchain that ran the script -- and std's dependencies move between
+# nightlies. src/rust/rust-toolchain.toml therefore pins a dated channel, and
+# bumping that pin and re-running this script are one commit, not two.
+#
 #   scripts/vendor.sh
 #
 # Why it is not just `cargo vendor`: that copies every package in Cargo.lock,
@@ -31,6 +37,7 @@ cd "$(dirname "$0")/../src/rust"
 STD_MANIFEST="$(rustc --print sysroot)/lib/rustlib/src/rust/library/Cargo.toml"
 [ -f "$STD_MANIFEST" ] || { echo "vendor: no rust-src component ($STD_MANIFEST)" >&2; exit 1; }
 
+echo "vendor: for $(rustc --version)"
 echo "vendor: copying dependency sources from crates.io..."
 cargo vendor --versioned-dirs --sync "$STD_MANIFEST" vendor > /dev/null
 
