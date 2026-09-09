@@ -1075,6 +1075,165 @@ static void CmdTcpstat(const char* args, Stdlib::Printer& con)
     Tcp::GetInstance().Dump(con);
 }
 
+/* The body is gathered into blocks this size before each write: ext2 then
+   commits its metadata once per block rather than once per TCP segment. */
+static const ulong WgetWriteBufSize = 64 * 1024;
+/* Progress line every this many bytes; a big download over a slow link
+   otherwise looks like a hang. */
+static const ulong WgetReportStep = 1024 * 1024;
+
+/* Streams a download straight to a file. The body never exists in memory:
+   it arrives in TCP-sized pieces and leaves in WgetWriteBufSize blocks, so
+   a 20 MB file costs one 64 KB buffer. */
+class WgetFileSink : public HttpSink
+{
+public:
+    WgetFileSink(File* file, Stdlib::Printer& con)
+        : Out(file)
+        , Con(con)
+        , Buf(nullptr)
+        , Used(0)
+        , Written(0)
+        , Reported(0)
+    {
+    }
+
+    virtual ~WgetFileSink()
+    {
+        if (Buf != nullptr)
+            Mm::Free(Buf);
+    }
+
+    bool Setup()
+    {
+        Buf = (u8*)Mm::Alloc(WgetWriteBufSize, 'Wget');
+        return Buf != nullptr;
+    }
+
+    virtual ulong Write(const u8* data, ulong len) override
+    {
+        ulong before = Written;
+        ulong taken = 0;
+
+        while (taken < len)
+        {
+            ulong room = WgetWriteBufSize - Used;
+            ulong take = (len - taken < room) ? (len - taken) : room;
+
+            Stdlib::MemCpy(Buf + Used, data + taken, take);
+            Used += take;
+            taken += take;
+
+            /* A failed block never reached the disk, and neither did
+               anything still buffered: only what Flush committed counts. */
+            if (Used == WgetWriteBufSize && !Flush())
+                return Written - before;
+        }
+
+        ulong total = Written + Used;
+        if (total - Reported >= WgetReportStep)
+        {
+            Reported = total - (total % WgetReportStep);
+            Con.Printf("wget: %u KB\n", total / Const::KB);
+        }
+
+        return taken;
+    }
+
+    /* Pushes what the buffer still holds; call once the body is over. */
+    bool Flush()
+    {
+        if (Used == 0)
+            return true;
+
+        ulong len = Used;
+        Used = 0;
+
+        if (!Vfs::GetInstance().Write(Out, Buf, len))
+        {
+            Con.Printf("wget: write failed after %u bytes\n", Written);
+            return false;
+        }
+
+        Written += len;
+        return true;
+    }
+
+    /* Bytes committed to the file. */
+    ulong GetTotal() const { return Written; }
+
+private:
+    WgetFileSink(const WgetFileSink& other) = delete;
+    WgetFileSink& operator=(const WgetFileSink& other) = delete;
+
+    File* Out;
+    Stdlib::Printer& Con;
+    u8* Buf;
+    ulong Used;      /* bytes buffered, not yet written */
+    ulong Written;   /* bytes committed to the file */
+    ulong Reported;
+};
+
+/* Downloads to a file, streaming. Returns false with the reason printed. */
+static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
+                       Stdlib::Printer& con)
+{
+    File* file = Vfs::GetInstance().Open(path,
+        Vfs::OpenWrite | Vfs::OpenCreate | Vfs::OpenTruncate);
+    if (file == nullptr)
+    {
+        con.Printf("wget: cannot open %s for writing\n", path);
+        return false;
+    }
+
+    WgetFileSink sink(file, con);
+    if (!sink.Setup())
+    {
+        con.Printf("wget: out of memory\n");
+        Vfs::GetInstance().Close(file);
+        return false;
+    }
+
+    HttpClient client(dev);
+    HttpResponse resp = client.Get(url, sink);
+
+    bool flushed = sink.Flush();
+    Vfs::GetInstance().Close(file);
+
+    /* Nothing landed -- a failed request, or a body refused before the
+       first byte: do not leave an empty file behind. */
+    if (sink.GetTotal() == 0)
+        Vfs::GetInstance().Remove(path);
+
+    if (!resp.Ok)
+    {
+        con.Printf("wget: failed\n");
+        return false;
+    }
+
+    con.Printf("HTTP %u, %u bytes\n", (ulong)resp.StatusCode, resp.BodyLen);
+
+    if (resp.Location[0] != '\0')
+        con.Printf("Location: %s\n", resp.Location);
+
+    if (!flushed)
+        return false;
+
+    if (resp.Truncated)
+    {
+        if (resp.Err.GetCode() == Stdlib::Error::BufTooBig)
+            con.Printf("wget: body over the %u MB limit\n",
+                       (ulong)(HttpMaxBodySize / Const::MB));
+        else
+            con.Printf("wget: incomplete, %u bytes saved to %s\n",
+                       sink.GetTotal(), path);
+        return false;
+    }
+
+    con.Printf("saved %u bytes to %s\n", sink.GetTotal(), path);
+    return true;
+}
+
 static void CmdWget(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -1100,6 +1259,13 @@ static void CmdWget(const char* args, Stdlib::Printer& con)
         return;
     }
 
+    if (path[0] != '\0')
+    {
+        WgetToFile(dev, url, path, con);
+        return;
+    }
+
+    /* No file: the body is kept in memory, capped at HttpMaxResponseSize. */
     HttpClient client(dev);
     HttpResponse resp = client.Get(url);
 
@@ -1114,15 +1280,7 @@ static void CmdWget(const char* args, Stdlib::Printer& con)
     if (resp.Location[0] != '\0')
         con.Printf("Location: %s\n", resp.Location);
 
-    if (path[0] != '\0')
-    {
-        /* The body goes to a file, whole or not at all */
-        if (Vfs::GetInstance().WriteFile(path, resp.Body, resp.BodyLen))
-            con.Printf("saved %u bytes to %s\n", resp.BodyLen, path);
-        else
-            con.Printf("write to %s failed\n", path);
-    }
-    else if (resp.Body && resp.BodyLen > 0)
+    if (resp.Body && resp.BodyLen > 0)
     {
         /* Print body as text, truncate to 4 KB for display */
         static const ulong MaxDisplay = 4096;
@@ -1135,6 +1293,9 @@ static void CmdWget(const char* args, Stdlib::Printer& con)
         if (resp.BodyLen > MaxDisplay)
             con.Printf("... (%u bytes truncated)\n", resp.BodyLen - MaxDisplay);
     }
+
+    if (resp.Truncated)
+        con.Printf("wget: body truncated, pass a path to save it to a file\n");
 
     if (resp.Body)
         Mm::Free(resp.Body);
@@ -2456,7 +2617,7 @@ static const CmdEntry Commands[] = {
     { "netconsole", CmdNetconsole, "netconsole - show netconsole state" },
     { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
     { "tcpstat",   CmdTcpstat,   "tcpstat - show TCP connections and statistics" },
-    { "wget",      CmdWget,      "wget <url> [path] - HTTP GET request, optionally saved to a file" },
+    { "wget",      CmdWget,      "wget <url> [path] - HTTP GET request, streamed to a file (up to 20 MB)" },
     { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
     { "ping",      CmdPing,      "ping <ip|hostname> - send ICMP echo" },
     { "nslookup",  CmdNslookup,  "nslookup <hostname> - resolve hostname" },

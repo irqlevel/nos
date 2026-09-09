@@ -47,6 +47,10 @@ static const ulong TcpConnHashSize     = 32;
 static const u16   TcpEphemeralPortBase = 49152;
 static const u16   TcpEphemeralPortMax  = 65535;
 
+/* Tcp::Recv results below zero */
+static const long TcpRecvError   = -1;
+static const long TcpRecvTimeout = -2;
+
 /* DataOff value for a 20-byte header (5 * 4 = 20) */
 static const u8 TcpDataOff5 = (5 << 4);
 /* DataOff value for a 24-byte header (6 * 4 = 24, with MSS option) */
@@ -218,9 +222,12 @@ public:
     /* Accept -- blocks until a new connection arrives on a listening socket */
     TcpConn* Accept(TcpConn* listener);
 
-    /* Data transfer -- blocks until data sent/received or timeout */
+    /* Data transfer -- blocks until data sent/received or timeout.
+       Recv returns the byte count, 0 at EOF, TcpRecvError on a bad
+       argument, or TcpRecvTimeout when timeoutMs (0 = wait forever)
+       elapses with the receive buffer still empty. */
     long Send(TcpConn* conn, const void* data, ulong len);
-    long Recv(TcpConn* conn, void* buf, ulong len);
+    long Recv(TcpConn* conn, void* buf, ulong len, ulong timeoutMs = 0);
 
     /* Close connection (graceful FIN exchange) */
     void Close(TcpConn* conn);
