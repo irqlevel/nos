@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on three real machines — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels, and two Hetzner dedicated servers, an Intel EX44 (RTL8125) and an AMD Ryzen AX41 (Intel I210), whose only console is the network (see `docs/real-hardware.md`). See `docs/features.md` for the full feature list, `docs/shell-commands.md` for the shell command reference (index in `docs/README.md`), `docs/boot.md` / `docs/paging.md` / `docs/scheduler.md` / `docs/interrupts.md` / `docs/profiler.md` for how those subsystems work, and `plans/README.md` for the roadmap (the long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor — stages 0–5, currently at the end of stage 2).
+`nos` is a hobby x86-64 / arm64 OS kernel written in C++20, Rust, and assembly. It is freestanding (no libc, no STL, no C++ exceptions/RTTI) and boots via Multiboot2/GRUB on x86-64 and the Linux `Image` protocol on arm64. It targets QEMU/KVM, KVM-based clouds (Google Cloud, Yandex Cloud), and QEMU `virt` + HVF on Apple Silicon, and boots on three real machines — a Dell Latitude 5480 (Skylake-U, UEFI, no serial port, no PS/2), where the framebuffer console and the xHCI USB keyboard are the only console channels, and two Hetzner dedicated servers, an Intel EX44 (RTL8125) and an AMD Ryzen AX41 (Intel I210), whose only console is the network (see `docs/real-hardware.md`). See `docs/features.md` for the full feature list, `docs/shell-commands.md` for the shell command reference (index in `docs/README.md`), `docs/boot.md` / `docs/paging.md` / `docs/scheduler.md` / `docs/interrupts.md` / `docs/profiler.md` / `docs/random.md` for how those subsystems work, and `plans/README.md` for the roadmap (the long-term goal is a bare-metal cloud node running Linux guests under a Rust hypervisor — stages 0–5, currently at the end of stage 2).
 
 ## Build, run, test
 
@@ -85,7 +85,9 @@ Set via GRUB (`build/grub.cfg`) on x86-64, or QEMU `-append` on arm64. Useful
 when bisecting a boot failure: `smp=off` (BSP only), `maxcpus=N` (start at most
 N CPUs, the BSP included), `console=serial` / `console=vga`,
 `dhcp=auto|on|off`, `dns=on`, `udpshell=PORT`, `usb=off`
-(x86-64: skip xHCI bring-up), `its=off` (arm64). Parsing lives in
+(x86-64: skip xHCI bring-up), `its=off` (arm64), `hwrng=off` (ignore
+RDRAND/RDSEED/RNDR, so the entropy pool falls back on virtio-rng and timing
+jitter -- see `docs/random.md`). Parsing lives in
 `kernel/parameters.cpp`. `netconsole=ip:port` streams the whole kernel log to
 that UDP collector as each line is produced (buffered until the network is up,
 panic report included) -- receive it with `scripts/netconsole.py`; on a machine
@@ -111,16 +113,16 @@ Boot flow (x86-64), in full in `docs/boot.md`: `arch/x86_64/boot64.asm` (Multibo
 
 Source layout (detailed in `docs/project-layout.md`):
 
-- `src/cpp/hal/` — portable HAL contracts (cpu/atomics, semantic barriers, mmu+pte, irqchip, console, pci, power, Context, IRQ stub symbols); each header selects the arch backend at compile time
+- `src/cpp/hal/` — portable HAL contracts (cpu/atomics, semantic barriers, mmu+pte, irqchip, console, pci, power, Context, IRQ stub symbols, the cpu's random instruction); each header selects the arch backend at compile time
 - `src/cpp/arch/x86_64/` — everything x86-specific: Multiboot2 entry + AP trampoline (`boot64.asm`), CPU primitives (`asm.asm`, `asm.h`), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding (`pte.h`), GRUB parsing, HAL inline/impl backends. Only arch code, the documented exemptions (`kernel/main.cpp`, `kernel/cmd.cpp`, `kernel/irq_balance.cpp`) and x86-only drivers may include these headers
 - `src/cpp/arch/arm64/` — Linux-Image boot + PSCI SMP (`boot.S`), EL1 vectors, GICv3 + ITS, generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, HAL backends
-- `src/cpp/kernel/` — scheduling, tasks, interrupt dispatch, SoftIrq, timers, timekeeping seam (`time.h`), locks (spinlock/mutex/seqlock/rwlock), panic/backtrace, dmesg ring buffer, the interactive shell (`cmd.cpp`), input layer (`input.cpp`), the Rust FFI bridge (`rust_ffi.cpp`), symbol table
+- `src/cpp/kernel/` — scheduling, tasks, interrupt dispatch, SoftIrq, timers, timekeeping seam (`time.h`), locks (spinlock/mutex/seqlock/rwlock), panic/backtrace, dmesg ring buffer, the interactive shell (`cmd.cpp`), input layer (`input.cpp`), the ChaCha20 random pool every source feeds and everything reads from (`random.cpp`, `entropy.h`; see `docs/random.md`), the Rust FFI bridge (`rust_ffi.cpp`), symbol table
 - `src/cpp/mm/` — 4-level page tables (`VirtToPhys` walk, `ProtectRange`), page allocator (fixed-size block allocator), pool allocator, VA allocator, `new`/`delete`
 - `src/cpp/drivers/` — serial, console (`screen.cpp` picks EGA text on BIOS vs. the 8x16-font pixel framebuffer under UEFI), PIT/HPET/RTC, 8042 keyboard, `usb/` (xHCI host controller + HID boot keyboard, for UEFI laptops with no PS/2), PCI, MSI-X, ACPI, virtio (blk/net/scsi/rng) behind the `VirtioTransport` interface (legacy+modern virtio-pci on x86, virtio-mmio on arm64)
 - `src/cpp/block/` — async interrupt-driven block request queue, MBR partitions
 - `src/cpp/net/` — device abstraction, ARP/ICMP/DHCP/DNS/TCP/UDP, HTTP client (`http.cpp`, with a transport seam so the same client speaks plain TCP or TLS), the TLS session wrapper over the Rust client (`tls.cpp`), UDP shell, netconsole (kernel log over UDP)
 - `src/cpp/fs/` — VFS with mount points and a file API (`Open/Read/Write/Seek`, `Stat`, `ReadDir`, `Rename`, `Truncate`), ramfs, nanofs (on-disk, small), **ext2 read-write** (the root filesystem: `root=auto` mounts the ext2 labelled `nos`; `fs/rootfs.cpp`), procfs, the `fstest` self-test (`fs/fstest.cpp`); see `docs/filesystems.md`
-- `src/cpp/lib/` — freestanding stdlib equivalents (`Stdlib::`), containers (list/vector/btree/ringbuffer/bitmap), CRC32, formatting; some routines (`MemSet`/`MemCpy`/`StrLen`…) are in `arch/x86_64/stdlib_asm.asm` (portable C in `arch/arm64/stdlib_c.cpp`)
+- `src/cpp/lib/` — freestanding stdlib equivalents (`Stdlib::`), containers (list/vector/btree/ringbuffer/bitmap), CRC32, ChaCha20, formatting; some routines (`MemSet`/`MemCpy`/`StrLen`…) are in `arch/x86_64/stdlib_asm.asm` (portable C in `arch/arm64/stdlib_c.cpp`)
 
 Rust (`src/rust/`, a cargo workspace) compiles to a `#![no_std]` `staticlib` (`libkernel.a`) linked into the kernel. The **NVMe driver is written entirely in Rust**, as is the **TLS client** (`tls/`: rustls + RustCrypto + webpki-roots, driven through rustls' unbuffered API — see `docs/tls.md`). Layers: `ffi/` (raw `extern "C"` declarations only), `kcore/` (safe RAII wrappers around kernel services), `drivers/` (nvme, r8168, r8125, igb), `tls/`, `kernel/` (entry points + global allocator), `hello/` (self-test).
 

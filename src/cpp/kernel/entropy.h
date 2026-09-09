@@ -6,6 +6,11 @@
 namespace Kernel
 {
 
+/* A source of raw entropy: a device (virtio-rng), a cpu instruction (RDRAND,
+   RNDR) or a measurement (timing jitter). Sources register with the table
+   below and Kernel::Random (kernel/random.h) mixes all of them into its pool;
+   nothing else reads a source directly. GetRandom may be slow -- virtio-rng
+   polls its device -- and may fail, which is why there is a pool in front. */
 class EntropySource
 {
 public:
@@ -25,11 +30,15 @@ public:
 
     bool Register(EntropySource* src);
     EntropySource* Find(const char* name);
-    EntropySource* GetDefault();
+    /* Sources are enumerated, not picked: a reseed takes from all of them.
+       Returns nullptr past the end. */
+    EntropySource* Get(ulong index);
     ulong GetCount();
     void Dump(Stdlib::Printer& printer);
 
-    static const ulong MaxSources = 4;
+    /* Four virtio-rng devices, the cpu instruction and the jitter collector,
+       with room to spare. */
+    static const ulong MaxSources = 8;
 
 private:
     EntropySourceTable();

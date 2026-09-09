@@ -23,6 +23,7 @@ Parameters::Parameters()
     , SmpOff(false)
     , MaxCpusLimit(0)
     , ItsEnabled(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
+    , HwRngOff(false)
     , WxProbe(false)
     , UsbOff(false)
     , ConMode(ConsoleBoth)
@@ -63,6 +64,11 @@ bool Parameters::IsSmpOff()
 ulong Parameters::GetMaxCpus()
 {
     return MaxCpusLimit;
+}
+
+bool Parameters::IsHwRngOff()
+{
+    return HwRngOff;
 }
 
 bool Parameters::IsItsEnabled()
@@ -263,6 +269,10 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     else if (Stdlib::StrCmp(key, "usb") == 0)
     {
         UsbOff = (Stdlib::StrCmp(value, "off") == 0);
+    }
+    else if (Stdlib::StrCmp(key, "hwrng") == 0)
+    {
+        HwRngOff = (Stdlib::StrCmp(value, "off") == 0);
     }
     else if (Stdlib::StrCmp(key, "wxprobe") == 0)
     {

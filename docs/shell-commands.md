@@ -45,7 +45,8 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `nslookup <hostname>` | Resolve hostname to IP via DNS |
 | `dnsflush` | Flush DNS cache |
 | `dhcp [dev]` | Obtain IP address via DHCP |
-| `random [len]` | Get random bytes as hex string |
+| `random [len]` | Get random bytes as hex string, 1..1024, default 16 — from the kernel's ChaCha20 pool, not from a device |
+| `entropy [reseed]` | Show the random pool (seeded, whether hardware entropy reached it, reseeds, bytes generated) and the registered entropy sources; `reseed` draws from every source again first. See [Randomness](random.md) |
 | `format nanofs <disk>` | Format disk with nanofs |
 | `mount ramfs <path>` | Mount a ramfs at path |
 | `mount nanofs <disk> <path>` | Mount nanofs from disk at path |

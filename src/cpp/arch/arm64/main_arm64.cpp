@@ -18,6 +18,7 @@
 #include <kernel/parameters.h>
 #include <kernel/time.h>
 #include <kernel/test.h>
+#include <kernel/random.h>
 #include <kernel/cpu.h>
 #include <kernel/preempt.h>
 #include <kernel/cmd.h>
@@ -217,6 +218,10 @@ static void BpStartupArm(void* ctx)
 
         VirtioNet::InitAllMmio(Slots, count);
         VirtioRng::InitAllMmio(Slots, count);
+
+        /* The virtio-rng carries the pool on this arch: no cpu here that the
+           kernel runs on implements FEAT_RNG, Apple's included. */
+        Random::GetInstance().Reseed();
     }
 
     auto& cpus = CpuTable::GetInstance();
@@ -501,6 +506,12 @@ extern "C" void MainArm64(void* dtb)
     Mm::AllocatorImpl::GetInstance(&Mm::PageAllocatorImpl::GetInstance());
 
     TimeInit();
+
+    /* Before the self-tests, which ask the pool for bytes: seeding needs no
+       heap and no device. The virtio-rng is folded in later, once the mmio
+       slots have been probed. */
+    if (!Random::GetInstance().Setup())
+        Trace(0, "Random: unseeded at boot, https will fail until a source turns up");
 
     Trace(0, "Before test");
 

@@ -10,7 +10,7 @@
 #include "task.h"
 #include "sched.h"
 #include "cpu.h"
-#include "entropy.h"
+#include "random.h"
 #include "interrupt.h"
 #include <hal/cpu.h>
 #include <hal/context.h>
@@ -417,11 +417,20 @@ unsigned long kernel_virt_to_phys(const void* virt_addr)
 
 int kernel_get_random(unsigned char* buf, unsigned long len)
 {
-    Kernel::EntropySource* src =
-        Kernel::EntropySourceTable::GetInstance().GetDefault();
-    if (!src || !buf || len == 0)
+    if (!buf || len == 0)
         return 0;
-    return src->GetRandom(buf, (ulong)len) ? 1 : 0;
+
+    /* The pool, not a source: on a bare-metal machine with no virtio-rng
+       there is no source to read, and this returning 0 is what a TLS
+       handshake fails with (rustls: FailedToGetRandomBytes). An unseeded pool
+       still has to fail here -- a handshake keyed from a zero pool would be
+       worse than no handshake. */
+    auto& random = Kernel::Random::GetInstance();
+    if (!random.IsSeeded())
+        return 0;
+
+    random.GetBytes(buf, (ulong)len);
+    return 1;
 }
 
 /* ---- TCP, for the Rust TLS client ---- */

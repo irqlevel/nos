@@ -7,18 +7,18 @@ in `CLAUDE.md` and the roadmap in `plans/README.md`.
 
 ```
 src/cpp/
-  hal/        Portable HAL contracts: cpu, barriers, mmu/pte, irqchip, console, power, context, irq stubs
+  hal/        Portable HAL contracts: cpu, barriers, mmu/pte, irqchip, console, power, context, irq stubs, random instruction
   arch/
     x86_64/   Multiboot2 entry + AP trampoline (NASM), CPU primitives (asm.asm), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding, GRUB info parsing, HAL backends
     arm64/    Linux-Image boot + PSCI SMP (boot.S), EL1 vectors, GICv3 + ITS (LPIs for PCIe MSI), generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, HAL backends
-  kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, Rust FFI bridge, symbol table
+  kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, the random pool, Rust FFI bridge, symbol table
   drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi/rng (virtio-pci on x86-64, virtio-mmio on arm64)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
   block/      Block I/O: device abstraction, async request queue, MBR partition discovery
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell, netconsole
   fs/         Filesystems: VFS and the file API, ramfs, nanofs, ext2 (rw), procfs, the root mount (rootfs.cpp), the self-test (fstest.cpp)
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
-  lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, stdlib
+  lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, ChaCha20, stdlib
   include/    Shared headers
 src/rust/
   ffi/        Raw extern "C" FFI declarations for kernel services

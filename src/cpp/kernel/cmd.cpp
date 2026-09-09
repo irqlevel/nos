@@ -28,6 +28,7 @@
 #include <fs/ext2.h>
 #include <fs/fstest.h>
 #include "entropy.h"
+#include "random.h"
 #include "console.h"
 #include "mutex.h"
 #include "task.h"
@@ -2423,19 +2424,15 @@ static void CmdRandom(const char* args, Stdlib::Printer& con)
         }
     }
 
-    EntropySource* src = EntropySourceTable::GetInstance().GetDefault();
-    if (!src)
+    auto& random = Random::GetInstance();
+    if (!random.IsSeeded())
     {
-        con.Printf("no entropy source\n");
+        con.Printf("entropy pool is not seeded\n");
         return;
     }
 
     u8 buf[1024];
-    if (!src->GetRandom(buf, len))
-    {
-        con.Printf("failed to get random bytes\n");
-        return;
-    }
+    random.GetBytes(buf, len);
 
     static const char hex[] = "0123456789abcdef";
     for (ulong i = 0; i < len; i++)
@@ -2447,6 +2444,27 @@ static void CmdRandom(const char* args, Stdlib::Printer& con)
         con.PrintString(s);
     }
     con.Printf("\n");
+}
+
+static void CmdEntropy(const char* args, Stdlib::Printer& con)
+{
+    auto& random = Random::GetInstance();
+
+    if (Stdlib::StrCmp(args, "reseed") == 0)
+    {
+        /* Worth having by hand: a source can appear after the pool was seeded
+           (a virtio-rng behind a bus that was scanned late), and on a machine
+           whose only console is a UDP socket this is how one finds out
+           whether it answers. */
+        random.Reseed();
+    }
+    else if (args[0] != '\0')
+    {
+        con.Printf("usage: entropy [reseed]\n");
+        return;
+    }
+
+    random.Dump(con);
 }
 
 static void DumpStackTrace(ulong* frames, size_t count, Stdlib::Printer& con)
@@ -2677,6 +2695,7 @@ static const CmdEntry Commands[] = {
     { "fstest",    CmdFstest,    "fstest [dir] [size] - filesystem self-test" },
     { "crc32",     CmdCrc32,     "crc32 <path> - CRC-32 of a file" },
     { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
+    { "entropy",   CmdEntropy,   "entropy [reseed] - show the random pool and its sources" },
     { "version",   CmdVersion,   "version - show kernel version" },
     { "bt",        CmdBt,        "bt <pid> - show task backtrace" },
     { "panic",     CmdPanic,     "panic [pf|div0|ud] - trigger kernel panic" },

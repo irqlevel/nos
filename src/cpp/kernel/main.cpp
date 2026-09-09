@@ -23,6 +23,7 @@
 #include "softirq.h"
 #include "irq_balance.h"
 #include "time.h"
+#include "random.h"
 #include <arch/x86_64/tsc.h>
 
 #include <arch/x86_64/grub.h>
@@ -480,6 +481,11 @@ void BpStartup(void* ctx)
         VirtioNet::InitAll();
         VirtioRng::InitAll();
 
+        /* Now that the devices are here, fold what they can give into the
+           pool: on a machine with a virtio-rng this is where it stops resting
+           on what the boot itself could be measured for. */
+        Random::GetInstance().Reseed();
+
         Trace(0, "Interrupts registered");
 
         idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
@@ -878,6 +884,13 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     Hpet::GetInstance().Setup();
 
     HaltTcoWatchdog();
+
+    /* Before the self-tests, which ask the pool for bytes, and before
+       anything else can: seeding needs no heap and no device, only the cycle
+       counter and whatever instruction the cpu has. The devices that can do
+       better are folded in by the Reseed() in BpStartup. */
+    if (!Random::GetInstance().Setup())
+        Trace(0, "Random: unseeded at boot, https will fail until a source turns up");
 
     Screen::Printf("Self test begin, please wait...\n");
 
