@@ -20,3 +20,9 @@ src/cpp/kernel/symtab_data.cpp
 src/rust/target/
 out/
 .claude/
+
+# Vendored crate sources (src/rust/vendor) are checked in verbatim: cargo
+# verifies every file against the checksums shipped with each package, so
+# none of the patterns above may filter one out -- test fixtures named
+# *.bin, *.out and so on are part of the package.
+!src/rust/vendor/**
