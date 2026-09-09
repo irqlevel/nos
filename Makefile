@@ -117,6 +117,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/net/netconsole.cpp \
     src/cpp/net/dns.cpp \
     src/cpp/net/tcp.cpp \
+    src/cpp/net/tls.cpp \
     src/cpp/net/http.cpp \
     src/cpp/fs/vfs.cpp \
     src/cpp/fs/ramfs.cpp \
@@ -232,6 +233,7 @@ CXX_SRC_aarch64 = \
     src/cpp/net/netconsole.cpp \
     src/cpp/net/dns.cpp \
     src/cpp/net/tcp.cpp \
+    src/cpp/net/tls.cpp \
     src/cpp/net/http.cpp \
     src/cpp/fs/vfs.cpp \
     src/cpp/fs/ramfs.cpp \

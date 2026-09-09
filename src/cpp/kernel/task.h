@@ -20,7 +20,11 @@ class Task final : public Object
 {
 public:
 
-    static const ulong StackSize = 8 * Const::PageSize;
+    /* 64 KB. Eight pages were enough until the kernel grew a TLS client:
+       verifying a certificate chain walks candidate issuers recursively and
+       goes several times deeper than anything else a task does, and a task
+       stack that overflows takes the machine down with it. */
+    static const ulong StackSize = 16 * Const::PageSize;
     static const ulong StackMagic1 = 0xBCDEBCDE;
     static const ulong StackMagic2 = 0xCBDECBDE;
 

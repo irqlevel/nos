@@ -39,7 +39,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `netconsole` | Show netconsole target, buffered bytes, drop/send counters |
 | `icmpstat` | Show ICMP statistics |
 | `tcpstat` | Show TCP connections and statistics |
-| `wget <url> [path]` | Fetch a URL via HTTP GET (follows redirects); with a path, the body is streamed to that file as it arrives, up to 20 MiB, with a progress line every megabyte. Without a path it is printed, and kept in memory, so it is capped at 32 KiB |
+| `wget [-o <path>] <url> [path]` | Fetch a URL via HTTP or HTTPS GET (follows redirects, including http→https). With a path — `-o` and the trailing argument are the same thing — the body is streamed to that file as it arrives, up to 20 MiB, with a progress line every megabyte. Without one it is printed, and kept in memory, so it is capped at 32 KiB. HTTPS verifies the certificate chain against the built-in roots and the wall clock; see [HTTPS](tls.md) |
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
 | `ping <ip\|hostname>` | Send 5 ICMP echo requests with RTT (resolves hostnames via DNS) |
 | `nslookup <hostname>` | Resolve hostname to IP via DNS |

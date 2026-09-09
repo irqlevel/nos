@@ -10,11 +10,17 @@ target = "x86_64-unknown-none"
 # between: a profile of a kernel whose NVMe and NIC drivers are entirely Rust
 # could not see inside either of them. The cost is a register and a push/pop
 # per call, which the C++ half has always paid.
+# The RustCrypto crates dispatch to SSE2/AVX2 intrinsics at runtime, and
+# compile those paths unconditionally -- which LLVM cannot legalize for a
+# target with SSE turned off ("Do not know how to split the result of this
+# operator"). The kernel keeps SSE off on purpose: it saves no XMM state on a
+# context switch. These cfgs are the crates' own documented switch to the
+# portable, constant-time software backends.
 [target.x86_64-unknown-none]
-rustflags = ["-Ccode-model=large", "-Cforce-frame-pointers=yes"]
+rustflags = ["-Ccode-model=large", "-Cforce-frame-pointers=yes", "--cfg", "aes_force_soft", "--cfg", "polyval_force_soft", "--cfg", "poly1305_force_soft", "--cfg", "chacha20_force_soft", "--cfg", "curve25519_dalek_backend=\"serial\""]
 
 [target.aarch64-unknown-none-softfloat]
-rustflags = ["-Cforce-frame-pointers=yes"]
+rustflags = ["-Cforce-frame-pointers=yes", "--cfg", "aes_force_soft", "--cfg", "polyval_force_soft", "--cfg", "poly1305_force_soft", "--cfg", "chacha20_force_soft", "--cfg", "curve25519_dalek_backend=\"serial\""]
 
 [unstable]
 build-std = ["core", "alloc"]

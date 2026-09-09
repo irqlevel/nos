@@ -21,11 +21,25 @@ static const ulong HttpMaxBodySize = 20 * 1024 * 1024;
    body in receive-sized pieces. */
 static const ulong HttpMaxHeaderSize = 16384;
 static const u16   HttpDefaultPort = 80;
+static const u16   HttpsDefaultPort = 443;
 static const ulong HttpMaxUrlHostLen = 128;
 static const ulong HttpMaxUrlPathLen = 256;
 static const ulong HttpMaxLocationLen = 256;
 static const ulong HttpRecvTimeoutMs = 10000;
 static const ulong HttpMaxRedirects = 5;
+
+/* The byte pipe the exchange runs over: plain TCP, or TLS on top of it.
+   Everything above it -- the request, the header parsing, chunked decoding,
+   redirects and the body sink -- is the same either way. */
+class HttpTransport
+{
+public:
+    virtual ~HttpTransport() {}
+    virtual bool Send(const void* data, ulong len) = 0;
+    /* Bytes read, 0 at end of stream, negative on error or timeout. The
+       timeout is advisory: the TLS transport uses its own. */
+    virtual long Recv(void* buf, ulong len, ulong timeoutMs) = 0;
+};
 
 /* Where a response body goes as it arrives. The client never holds a whole
    body: a 20 MB download passes through Write() in receive-buffer sized
@@ -78,6 +92,8 @@ struct HttpResponse
     bool Ok;
     bool Truncated;     /* body cut short: size cap, sink refusal, an idle
                            timeout or a peer that closed early */
+    bool TlsFailed;     /* the TLS handshake was refused -- a certificate
+                           that did not verify, or no common protocol */
     Stdlib::Error Err;
 
     HttpResponse()
@@ -87,6 +103,7 @@ struct HttpResponse
         , BodyLen(0)
         , Ok(false)
         , Truncated(false)
+        , TlsFailed(false)
         , Err(MakeError(Stdlib::Error::InvalidState))
     {
         Location[0] = '\0';
@@ -118,11 +135,11 @@ private:
 
     HttpResponse DoGet(const char* url, HttpSink& sink);
     bool ParseUrl(const char* url, char* host, ulong hostSize,
-                  u16& port, char* path, ulong pathSize);
+                  u16& port, char* path, ulong pathSize, bool& tls);
     bool ResolveHost(const char* host, Net::IpAddress& ip);
-    bool SendRequest(TcpConn* conn, const char* method,
+    bool SendRequest(HttpTransport& transport, const char* method,
                      const char* host, const char* path);
-    bool RecvResponse(TcpConn* conn, HttpResponse& resp, HttpSink& sink);
+    bool RecvResponse(HttpTransport& transport, HttpResponse& resp, HttpSink& sink);
     void ExtractLocation(const u8* headers, ulong headerLen, char* loc, ulong locSize);
 };
 
