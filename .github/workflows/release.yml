@@ -46,8 +46,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang lld llvm
+          # The pinned nightly, not whatever nightly is today: src/rust/vendor
+          # only resolves against the one src/rust/rust-toolchain.toml names.
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-            sh -s -- -y --default-toolchain nightly --component rust-src
+            sh -s -- -y --component rust-src --default-toolchain \
+              "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' src/rust/rust-toolchain.toml)"
 
       - name: Build aarch64
         env:

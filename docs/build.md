@@ -6,7 +6,8 @@ The build is parameterized by `ARCH` (default `x86_64`, or `aarch64`); objects g
 
 Requires clang, nasm, ld, grub-mkrescue with `xorriso` + `mtools`, and a **nightly**
 rustup toolchain with the `rust-src` component — the Rust staticlib uses `-Z build-std`
-to rebuild `core`/`alloc` with `-Ccode-model=large`; `src/rust/rust-toolchain.toml` pins it:
+to rebuild `core`/`alloc` with `-Ccode-model=large`; `src/rust/rust-toolchain.toml` pins
+the exact nightly:
 
 ```sh
 make
@@ -32,6 +33,16 @@ scripts/vendor.sh      # this step, and only this step, needs the network
 
 A build that suddenly wants the network is a dependency that was never
 vendored; `--offline` makes it say so instead of quietly fetching.
+
+The dated toolchain pin is what holds this together. `-Z build-std` resolves
+the compiler's own `library/` workspace alongside ours, so the vendored set
+covers *std's* dependencies as well — and those move from one nightly to the
+next. On a floating `nightly` the offline build eventually fails in resolution,
+naming a crate the kernel does not compile and never will: `hermit-abi`, which
+only std wants and only on `cfg(target_os = "hermit")`, going 0.5.2 → 0.5.3 is
+enough to stop the build. `src/rust/rust-toolchain.toml` is where the version
+lives; the Dockerfile and both CI workflows install whatever it names. Bumping
+it and re-running `scripts/vendor.sh` is one commit, not two.
 
 ## Docker
 

@@ -1,9 +1,20 @@
 # The kernel staticlib needs nightly: `#![feature(alloc_error_handler)]` in
 # kernel/src/lib.rs and `-Z build-std` (see .cargo/config.toml), which rebuilds
 # core/alloc with -Ccode-model=large so they can be linked at 0xFFFF800001000000.
-# Pinned here so the build does not depend on the machine's default toolchain
-# (matches the Dockerfile: rustup ... --default-toolchain nightly --component rust-src).
+#
+# The date is part of the pin, not decoration. -Z build-std resolves the
+# compiler's own library workspace alongside ours, and vendor/ is a snapshot of
+# what that resolution picked -- which is why scripts/vendor.sh has to --sync
+# the std manifest. std's own dependencies move with the compiler, so a
+# floating `nightly` quietly outgrows the vendored sources and the --offline
+# build dies in resolution naming a crate the kernel never compiles:
+# hermit-abi, wanted only by std on cfg(target_os = "hermit"), went 0.5.2 ->
+# 0.5.3 and took the build with it.
+#
+# So bump the channel and re-run scripts/vendor.sh in the same commit, never
+# one without the other. The Dockerfile and both CI workflows install whatever
+# this file names, so this is the only place the version lives.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-30"
 components = ["rust-src"]
 profile = "minimal"

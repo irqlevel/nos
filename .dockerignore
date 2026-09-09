@@ -1,3 +1,6 @@
-# The Dockerfile never COPYs sources (the repo is bind-mounted at run time),
-# so exclude everything from the build context to keep `docker build` fast.
+# The Dockerfile COPYs one file and no sources (the repo is bind-mounted at run
+# time), so exclude everything from the build context to keep `docker build`
+# fast. The exception is the Rust toolchain pin: the image installs the nightly
+# that file names, which is how the version stays in one place instead of three.
 *
+!src/rust/rust-toolchain.toml
