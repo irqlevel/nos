@@ -205,11 +205,9 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     if (BugOn(start >= end))
         return false;
 
-    /* Long enough for the widest value we take: netconsole=255.255.255.255:65535 */
-    const size_t maxLen = 48;
-    char param[maxLen + 1];
+    char param[MaxParamLen + 1];
     size_t len = end - start;
-    if (len > maxLen)
+    if (len > MaxParamLen)
         return false;
 
     /* The shortest token taken is the bare word ro */
@@ -506,32 +504,62 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     return true;
 }
 
-bool Parameters::Parse(const char *cmdline)
+void Parameters::Parse(const char *cmdline)
 {
-    if (Stdlib::SnPrintf(Cmdline, Stdlib::ArraySize(Cmdline), "%s", cmdline) < 0)
-        return false;
+    if (cmdline == nullptr)
+        return;
 
-    size_t start = 0, i = 0;
-    for (; i < Stdlib::StrLen(Cmdline); i++)
+    /* StrnCpy, not SnPrintf: past the end of the buffer SnPrintf keeps
+       nothing, and what is wanted there is as much as fits */
+    Stdlib::StrnCpy(Cmdline, cmdline, sizeof(Cmdline));
+    ulong kept = Stdlib::StrLen(Cmdline);
+    if (cmdline[kept] != '\0')
     {
-        if (Cmdline[i] == ' ')
+        /* Longer than the buffer. The parameter the end cuts through goes
+           as well: half of one is a different one, and root=LABEL=nosenv
+           cut short is root=LABEL=nos. */
+        if (cmdline[kept] != ' ')
         {
-            if (start < i)
-            {
-                if (!ParseParameter(Cmdline, start, i))
-                    return false;
-            }
-            start = i + 1;
+            while (kept > 0 && Cmdline[kept - 1] != ' ')
+                kept--;
+            Cmdline[kept] = '\0';
         }
+
+        const char* rest = &cmdline[kept];
+        while (*rest == ' ')
+            rest++;
+
+        char shown[MaxParamLen + 1];
+        Stdlib::StrnCpy(shown, rest, sizeof(shown));
+        Trace(0, "Cmdline: longer than %u characters, ignoring from '%s'",
+            (ulong)(CmdlineLen - 1), shown);
     }
 
-    if (start < i)
+    ulong len = Stdlib::StrLen(Cmdline);
+    ulong start = 0;
+    for (ulong i = 0; i <= len; i++)
     {
-        if (!ParseParameter(Cmdline, start, i))
-            return false;
-    }
+        if (i < len && Cmdline[i] != ' ')
+            continue;
 
-    return true;
+        if (start < i && !ParseParameter(Cmdline, start, i))
+        {
+            /* Named, so that a typo, or a Linux habit such as quiet, is a
+               line in the log rather than a boot that stops */
+            ulong shownLen = i - start;
+            if (shownLen > MaxParamLen)
+                shownLen = MaxParamLen;
+
+            char shown[MaxParamLen + 1];
+            Stdlib::StrnCpy(shown, &Cmdline[start], shownLen + 1);
+            if (i - start > MaxParamLen)
+                Trace(0, "Cmdline: ignoring '%s...', longer than the %u characters "
+                    "a parameter can have", shown, (ulong)MaxParamLen);
+            else
+                Trace(0, "Cmdline: ignoring '%s'", shown);
+        }
+        start = i + 1;
+    }
 }
 
 }

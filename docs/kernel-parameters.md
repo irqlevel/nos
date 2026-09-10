@@ -2,10 +2,17 @@
 
 Space-separated `key=value` pairs. Set them on the GRUB command line on
 x86-64 (`build/grub.cfg`, the `multiboot2` line) or with QEMU `-append` on
-arm64 (`scripts/qemu-arm64.sh`). The whole command line is capped at 255
-characters and a single parameter at 48; an unknown key, or a known key with
-a value it does not recognise, is logged and skipped rather than refused.
-Parsing lives in `src/cpp/kernel/parameters.cpp`.
+arm64 (`scripts/qemu-arm64.sh`). Parsing lives in
+`src/cpp/kernel/parameters.cpp`.
+
+Nothing on the command line stops the boot. An unknown key, a known key with
+a value it does not recognise, and a parameter that cannot be parsed at all
+— no `=`, nothing before or after it, a bare word other than `ro`, longer
+than 48 characters — are each logged and skipped, and the rest of the line
+is still read, as Linux does. The whole line is capped at 255 characters; a
+longer one is read up to its last whole parameter, since half of one is a
+different one. The warnings land in `dmesg`, which the
+[netconsole](netconsole.md) replays from the start of the boot.
 
 The defaults the shipped configs use are `dhcp=auto dns=on root=auto
 fstest=on` on the x86-64 ISO, `dhcp=auto dns=on udpshell=9000 root=auto` on
