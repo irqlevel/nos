@@ -6,6 +6,7 @@
 #include "stack_trace.h"
 #include "random.h"
 #include "sha256.h"
+#include "parameters.h"
 #include <hal/cpu.h>
 #include <block/block_device.h>
 #include <fs/vfs.h>
@@ -406,6 +407,47 @@ Stdlib::Error TestParseUlong()
         return MakeError(Stdlib::Error::Unsuccessful);
 
     Trace(0, "TestParseUlong: complete");
+    return MakeSuccess();
+}
+
+/* A value may carry an '=' of its own. Taking a second '=' for a malformed
+   parameter failed the whole command line, and on x86 that is a panic --
+   before the netconsole, the disk log or the NIC exist to report it. Each
+   case parses into its own instance, never the one the kernel booted with. */
+Stdlib::Error TestParameters()
+{
+    Trace(0, "TestParameters: started");
+
+    Parameters label;
+    if (!label.Parse("dhcp=auto root=LABEL=nosenv") ||
+        label.GetRoot().Mode != Parameters::RootLabel ||
+        Stdlib::StrCmp(label.GetRoot().Value, "nosenv") != 0 ||
+        !label.IsDhcpAuto())
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Parameters uuid;
+    if (!uuid.Parse("root=UUID=f8740651-e0b5-4ae3-84f1-a55d1ab00139 ro") ||
+        uuid.GetRoot().Mode != Parameters::RootUuid ||
+        uuid.GetRoot().Uuid[0] != 0xf8 || uuid.GetRoot().Uuid[15] != 0x39 ||
+        !uuid.IsRootReadOnly())
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Parameters device;
+    if (!device.Parse("root=nvme11") ||
+        device.GetRoot().Mode != Parameters::RootDevice ||
+        Stdlib::StrCmp(device.GetRoot().Value, "nvme11") != 0)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Still refused: no key, and no value */
+    Parameters noKey;
+    if (noKey.Parse("=nosenv"))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Parameters noValue;
+    if (noValue.Parse("root="))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Trace(0, "TestParameters: complete");
     return MakeSuccess();
 }
 
@@ -2255,6 +2297,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestParseUlong();
+    if (!err.Ok())
+        return err;
+
+    err = TestParameters();
     if (!err.Ok())
         return err;
 
