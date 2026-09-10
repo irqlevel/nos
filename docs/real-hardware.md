@@ -131,5 +131,50 @@ lives on a plain partition GRUB can write, read and cleared by a
 `/etc/grub.d` snippet before the menu, so a hang plus a hardware reset comes
 back to Ubuntu.
 
+### Updating the kernel from inside nos
+
+The kernel GRUB boots and the one-shot flag live together on `nosenv`, a
+plain ext2 partition (`nvme1n1p1`) that GRUB can read and write and that
+nos mounts read-write as its root (`root=LABEL=nosenv`). `/boot` itself is
+left alone on purpose: it is ext3 on an md mirror, which nos could read
+through one member but never write safely, and nothing about updating nos
+needs it. So a new kernel goes in from the [UDP shell](udp-shell.md):
+
+    wget https://github.com/irqlevel/nos/releases/latest/download/kernel-x86_64.elf /nos-kernel64.elf.next
+    sha256 /nos-kernel64.elf.next        # against the release's SHA256SUMS
+    grubenv /grubenv nos_next=nos-next   # one boot of the candidate
+    reboot
+
+`grubenv` edits GRUB's environment block in place, at the same size, the
+way `grub-editenv` and GRUB's own `save_env` do — `save_env` writes the
+file's disk blocks directly, so the file has to keep them — and GRUB clears
+the flag before it loads anything. GRUB carries two entries with the same
+command line, `nos` (id `nos-multiboot2`) for `/nos-kernel64.elf` and
+`nos-next` for `/nos-kernel64.elf.next`, and the `01_nosenv` snippet sets
+`fallback=0` (Ubuntu) whenever it arms one, so a file GRUB cannot load
+falls through to Ubuntu without a reset:
+
+    search --no-floppy --fs-uuid --set=nosenv_dev <uuid of nosenv>
+    load_env -f (${nosenv_dev})/grubenv
+    if [ -n "${nos_next}" ]; then
+      set default="${nos_next}"
+      set fallback=0
+      set nos_next=
+      save_env -f (${nosenv_dev})/grubenv nos_next
+      set timeout=3
+    fi
+
+If the candidate comes up — `version` over udpsh names its commit — it is
+promoted from inside itself: `mv /nos-kernel64.elf /nos-kernel64.elf.prev`,
+then `mv /nos-kernel64.elf.next /nos-kernel64.elf` (`rm` an older `.prev`
+first; `mv` refuses to overwrite). If it does not, a hardware reset brings
+Ubuntu back, the `nos` entry still names the kernel that worked, and the
+`.next` file just sits there. Promoting only from inside the new kernel is
+what keeps a kernel that never reached a shell from replacing one that did,
+on a machine where nobody can watch it fail. Under Ubuntu the same
+partition is `/nosenv`: `nosboot` builds and installs a kernel there as
+`/nosenv/nos-kernel64.elf`, and `grub-editenv /nosenv/grubenv set
+nos_next=nos-next` arms a candidate from that side.
+
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
 as "works on the three machines it was debugged on".

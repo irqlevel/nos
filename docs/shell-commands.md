@@ -66,6 +66,8 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `sync` | Flush every mounted filesystem to disk |
 | `fstest [dir] [size]` | Filesystem self-test in `dir` (default `/`) with a big file of `size` bytes (`K`/`M` suffix; default 300 KiB); `fstest / 5M` reaches the doubly-indirect blocks at 4 KiB blocks |
 | `crc32 <path>` | CRC-32 of a file, to check a copy against the host |
+| `sha256 <path>` | SHA-256 of a file, printed the way `sha256sum` prints it, to check a downloaded kernel against the `SHA256SUMS` of its release |
+| `grubenv <path> [name=value ...]` | Show, or set, the variables of a GRUB environment block — the `grubenv` file `grub-editenv` makes and GRUB's `load_env`/`save_env` read and write; `name=` with nothing after it removes one. Edited in place at the same size, the way GRUB's own writer edits it, so GRUB can still read and clear what was set. What arms a one-shot boot of a downloaded kernel from inside nos: see [Real hardware](real-hardware.md#updating-the-kernel-from-inside-nos) |
 | `usb` | Show xHCI controllers, connected root ports and keyboard report counters |
 | `panic [type]` | Trigger kernel panic (direct, pagefault, divzero, ud) |
 | `version` | Show kernel version |

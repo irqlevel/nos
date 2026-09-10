@@ -15,3 +15,11 @@ nvme = { path = "../drivers/nvme" }
 r8168 = { path = "../drivers/r8168" }
 r8125 = { path = "../drivers/r8125" }
 igb = { path = "../drivers/igb" }
+# For the sha256 shell command; the same crate the TLS client hashes with.
+# force-soft for the same reason .cargo/config.toml forces the other
+# RustCrypto crates onto their software backends: sha2 would otherwise pick
+# SHA-NI by CPUID at runtime, and those are SSE instructions -- an
+# application processor here runs with CR4.OSFXSR clear, so the first
+# block hashed on one is an invalid opcode. Applies to the TLS client too,
+# since a crate is built once for the whole graph.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }

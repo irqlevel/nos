@@ -9,6 +9,14 @@
 #   nosboot -s       show what is installed and what is armed
 #   nosboot --install-service   belt-and-braces disarm on every Ubuntu boot
 #
+# The kernel goes to the nosenv partition, next to the flag, not under /boot:
+# GRUB reads both from there, and nos mounts that partition as its root, so a
+# running nos can fetch a release and replace the kernel itself (the grubenv
+# and sha256 shell commands; docs/real-hardware.md). A candidate it left as
+# nos-kernel64.elf.next boots once from here with
+#
+#   grub-editenv /nosenv/grubenv set nos_next=nos-next
+#
 # THE ONE-SHOT, AND WHY IT IS NOT grub-reboot.
 #
 # grub-reboot writes next_entry into $prefix/grubenv and relies on GRUB to
@@ -31,7 +39,7 @@ set -e
 
 REPO=${NOSBOOT_REPO:-/root/nos}
 KERNEL_SRC=$REPO/kernel64.elf
-KERNEL_DST=${NOSBOOT_KERNEL:-/boot/nos-kernel64.elf}
+KERNEL_DST=${NOSBOOT_KERNEL:-/nosenv/nos-kernel64.elf}
 ENTRY=${NOSBOOT_ENTRY:-nos-multiboot2}
 NOSENV=${NOSBOOT_ENV:-/nosenv/grubenv}
 
@@ -96,6 +104,11 @@ case "$1" in
 esac
 
 [ -d "$REPO" ] || die "no repository at $REPO"
+
+# A kernel copied under an unmounted mount point lands on the root filesystem,
+# where GRUB never looks, and the arming below would boot the previous one.
+NOSENV_DIR=$(dirname "$NOSENV")
+mountpoint -q "$NOSENV_DIR" || die "$NOSENV_DIR is not mounted; the kernel and the flag both live there"
 
 echo "nosboot: building in $REPO"
 make -C "$REPO" nocheck >/dev/null || die "build failed"
