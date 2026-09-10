@@ -410,41 +410,80 @@ Stdlib::Error TestParseUlong()
     return MakeSuccess();
 }
 
-/* A value may carry an '=' of its own. Taking a second '=' for a malformed
-   parameter failed the whole command line, and on x86 that is a panic --
-   before the netconsole, the disk log or the NIC exist to report it. Each
-   case parses into its own instance, never the one the kernel booted with. */
+/* Nothing on the command line stops the boot: it is read before the
+   netconsole, the disk log or the NIC exist, and on x86 a line that failed
+   to parse used to be a panic. A value may carry an '=' of its own, what
+   cannot be parsed is skipped and the rest still read, and a line too long
+   for the buffer is read up to its last whole parameter. Each case parses
+   into its own instance, never the one the kernel booted with. */
 Stdlib::Error TestParameters()
 {
     Trace(0, "TestParameters: started");
 
     Parameters label;
-    if (!label.Parse("dhcp=auto root=LABEL=nosenv") ||
-        label.GetRoot().Mode != Parameters::RootLabel ||
+    label.Parse("dhcp=auto root=LABEL=nosenv");
+    if (label.GetRoot().Mode != Parameters::RootLabel ||
         Stdlib::StrCmp(label.GetRoot().Value, "nosenv") != 0 ||
         !label.IsDhcpAuto())
         return MakeError(Stdlib::Error::Unsuccessful);
 
     Parameters uuid;
-    if (!uuid.Parse("root=UUID=f8740651-e0b5-4ae3-84f1-a55d1ab00139 ro") ||
-        uuid.GetRoot().Mode != Parameters::RootUuid ||
+    uuid.Parse("root=UUID=f8740651-e0b5-4ae3-84f1-a55d1ab00139 ro");
+    if (uuid.GetRoot().Mode != Parameters::RootUuid ||
         uuid.GetRoot().Uuid[0] != 0xf8 || uuid.GetRoot().Uuid[15] != 0x39 ||
         !uuid.IsRootReadOnly())
         return MakeError(Stdlib::Error::Unsuccessful);
 
     Parameters device;
-    if (!device.Parse("root=nvme11") ||
-        device.GetRoot().Mode != Parameters::RootDevice ||
+    device.Parse("root=nvme11");
+    if (device.GetRoot().Mode != Parameters::RootDevice ||
         Stdlib::StrCmp(device.GetRoot().Value, "nvme11") != 0)
         return MakeError(Stdlib::Error::Unsuccessful);
 
-    /* Still refused: no key, and no value */
-    Parameters noKey;
-    if (noKey.Parse("=nosenv"))
+    /* Skipped: no key, no value, a bare word other than ro, one character,
+       and a parameter longer than any taken */
+    const char* const skipped[] = {
+        "=nosenv",
+        "root=",
+        "quiet",
+        "x",
+        "root=LABEL=a-label-longer-than-any-parameter-taken",
+    };
+    for (ulong i = 0; i < Stdlib::ArraySize(skipped); i++)
+    {
+        Parameters one;
+        one.Parse(skipped[i]);
+        if (one.GetRoot().Mode != Parameters::RootNone || one.IsRootReadOnly())
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* ... and the rest of the line still read around them */
+    Parameters rest;
+    rest.Parse("quiet root=nvme11 =nosenv dhcp=auto x");
+    if (rest.GetRoot().Mode != Parameters::RootDevice ||
+        Stdlib::StrCmp(rest.GetRoot().Value, "nvme11") != 0 ||
+        !rest.IsDhcpAuto())
         return MakeError(Stdlib::Error::Unsuccessful);
 
-    Parameters noValue;
-    if (noValue.Parse("root="))
+    /* Too long for the buffer, padded so the root parameter starts inside it
+       and ends past it: that one is dropped rather than read as a shorter
+       one (a root=LABEL=nos), and everything before it is taken */
+    const char* filler = " dns=on";
+    const char* straddler = " root=LABEL=nosenv";
+    char line[Parameters::CmdlineLen * 2];
+    Stdlib::StrnCpy(line, "dhcp=auto", sizeof(line));
+    ulong lineLen = Stdlib::StrLen(line);
+    while (lineLen < Parameters::CmdlineLen - Stdlib::StrLen(straddler))
+    {
+        Stdlib::StrnCpy(line + lineLen, filler, sizeof(line) - lineLen);
+        lineLen += Stdlib::StrLen(filler);
+    }
+    Stdlib::StrnCpy(line + lineLen, straddler, sizeof(line) - lineLen);
+
+    Parameters longLine;
+    longLine.Parse(line);
+    if (longLine.GetRoot().Mode != Parameters::RootNone ||
+        !longLine.IsDhcpAuto() || !longLine.IsDnsEnabled())
         return MakeError(Stdlib::Error::Unsuccessful);
 
     Trace(0, "TestParameters: complete");

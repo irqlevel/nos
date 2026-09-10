@@ -143,10 +143,7 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
             }
 
             Trace(0, "Cmdline %s", cmdLine->String);
-            if (!Kernel::Parameters::GetInstance().Parse(cmdLine->String)) {
-                Trace(0, "Can't parse command line");
-                Panic("Can't parse command line");
-            }
+            Kernel::Parameters::GetInstance().Parse(cmdLine->String);
 
             break;
         }

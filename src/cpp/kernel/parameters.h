@@ -15,7 +15,19 @@ public:
         return Instance;
     }
 
-    bool Parse(const char *cmdline);
+    /* Take what can be taken and name what cannot. A parameter that cannot be
+       parsed is logged and skipped and the rest of the line still read, as
+       Linux does, and a line longer than CmdlineLen - 1 characters is read
+       up to its last whole parameter. Nothing here stops the boot: this runs
+       before the netconsole, the disk log or the NIC exist, so on a machine
+       whose only console is the network a boot that stopped here would stop
+       without a word. */
+    void Parse(const char *cmdline);
+
+    /* The line, its terminator included, and the longest single parameter
+       taken -- room for root=UUID=<uuid>, which is 46 */
+    static const ulong CmdlineLen = 256;
+    static const ulong MaxParamLen = 48;
 
     bool IsTraceVga();
     bool IsPanicVga();
@@ -121,7 +133,7 @@ private:
         DhcpOff,       /* disabled entirely */
     };
 
-    char Cmdline[256];
+    char Cmdline[CmdlineLen];
     bool TraceVga;
     bool PanicVga;
     bool SmpOff;
