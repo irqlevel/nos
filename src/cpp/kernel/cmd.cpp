@@ -1082,6 +1082,11 @@ static const ulong WgetWriteBufSize = 64 * 1024;
 /* Progress line every this many bytes; a big download over a slow link
    otherwise looks like a hang. */
 static const ulong WgetReportStep = 1024 * 1024;
+/* The longest URL a command line can carry (the UDP shell takes 255-byte
+   commands, the console 80). Redirect targets run far longer -- a GitHub
+   release link becomes ~900 characters -- but those never pass through
+   here: the client keeps them in its own HttpMaxUrlLen buffers. */
+static const ulong WgetMaxUrlLen = 256;
 
 /* Streams a download straight to a file. The body never exists in memory:
    it arrives in TCP-sized pieces and leaves in WgetWriteBufSize blocks, so
@@ -1182,6 +1187,9 @@ static void WgetPrintFailure(const HttpResponse& resp, Stdlib::Printer& con)
     if (resp.TlsFailed)
         con.Printf("wget: TLS handshake refused -- bad certificate, or no "
                    "protocol in common (dmesg has the reason)\n");
+    else if (resp.Err.GetCode() == Stdlib::Error::BufTooBig)
+        con.Printf("wget: URL, or a redirect's target, longer than %u "
+                   "characters\n", HttpMaxUrlLen - 1);
     else
         con.Printf("wget: failed\n");
 }
@@ -1248,7 +1256,7 @@ static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
 
 static void CmdWget(const char* args, Stdlib::Printer& con)
 {
-    char url[HttpMaxUrlHostLen + HttpMaxUrlPathLen];
+    char url[WgetMaxUrlLen];
     char path[Vfs::MaxPath];
     url[0] = '\0';
     path[0] = '\0';
@@ -1274,7 +1282,14 @@ static void CmdWget(const char* args, Stdlib::Printer& con)
         }
         else if (url[0] == '\0')
         {
-            Stdlib::TokenCopy(tok, end, url, sizeof(url));
+            /* A cut-down URL would fetch some other resource. */
+            if (Stdlib::TokenCopy(tok, end, url, sizeof(url)) <
+                (ulong)(end - tok))
+            {
+                con.Printf("wget: URL longer than %u characters\n",
+                           WgetMaxUrlLen - 1);
+                return;
+            }
         }
         else if (path[0] == '\0')
         {

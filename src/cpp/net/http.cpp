@@ -10,6 +10,20 @@
 namespace Kernel
 {
 
+/* The buffers one Get works in: the URL being fetched (rewritten as
+   redirects are followed), the host and path it parses into, and the
+   request built from them. Together they are several KiB -- too much for a
+   task stack that also carries the TLS handshake and its recursive
+   certificate walk (an https wget already peaks near 29 KiB of the shell's
+   64; see Task::StackSize) -- so they are one heap block per Get. */
+struct HttpClient::Exchange
+{
+    char Url[HttpMaxUrlLen];
+    char Host[HttpMaxUrlHostLen];
+    char Path[HttpMaxUrlLen];
+    char Req[HttpMaxRequestLen];
+};
+
 HttpClient::HttpClient(NetDevice* dev)
     : Dev(dev)
 {
@@ -74,12 +88,12 @@ bool HttpClient::ParseUrl(const char* url, char* host, ulong hostSize,
         port = (u16)portVal;
     }
 
-    /* Path */
+    /* Path, query included. Never cut short: see HttpMaxUrlLen. */
     if (*p == '/')
     {
         ulong pLen = Stdlib::StrLen(p);
         if (pLen >= pathSize)
-            pLen = pathSize - 1;
+            return false;
         Stdlib::MemCpy(path, p, pLen);
         path[pLen] = '\0';
     }
@@ -155,20 +169,20 @@ private:
 };
 
 bool HttpClient::SendRequest(HttpTransport& transport, const char* method,
-                             const char* host, const char* path)
+                             Exchange& ex)
 {
     /* Build request:
        METHOD /path HTTP/1.1\r\n
        Host: hostname\r\n
        Connection: close\r\n
        \r\n */
-    static const ulong MaxReqLen = 512;
-    char req[MaxReqLen];
+    static const ulong MaxReqLen = sizeof(ex.Req);
+    char* req = ex.Req;
     ulong off = 0;
 
     const char* parts[] = {
-        method, " ", path, " HTTP/1.1\r\nHost: ",
-        host, "\r\nConnection: close\r\n\r\n"
+        method, " ", ex.Path, " HTTP/1.1\r\nHost: ",
+        ex.Host, "\r\nConnection: close\r\n\r\n"
     };
     for (ulong i = 0; i < sizeof(parts) / sizeof(parts[0]); i++)
     {
@@ -606,7 +620,16 @@ bool HttpClient::RecvResponse(HttpTransport& transport, HttpResponse& resp,
     bool chunked = HasChunkedEncoding(buf, headerEnd);
 
     /* Extract Location header for redirects */
-    ExtractLocation(buf, headerEnd, resp.Location, sizeof(resp.Location));
+    if (!ExtractLocation(buf, headerEnd, resp.Location, sizeof(resp.Location)) &&
+        HttpResponse::IsRedirectStatus(resp.StatusCode))
+    {
+        /* Following a cut-down target would fetch some other URL. */
+        Trace(0, "HttpClient: %u redirect target longer than %u characters",
+              (ulong)resp.StatusCode, HttpMaxUrlLen - 1);
+        resp.Err = MakeError(Stdlib::Error::BufTooBig);
+        Mm::Free(buf);
+        return true;
+    }
 
     if (resp.IsRedirect())
     {
@@ -675,7 +698,9 @@ bool HttpClient::RecvResponse(HttpTransport& transport, HttpResponse& resp,
     return true;
 }
 
-void HttpClient::ExtractLocation(const u8* headers, ulong headerLen,
+/* False when the header is there but its value does not fit in loc; loc
+   is left empty then, as it is when there is no Location at all. */
+bool HttpClient::ExtractLocation(const u8* headers, ulong headerLen,
                                  char* loc, ulong locSize)
 {
     static const char locHeader[] = "Location:";
@@ -706,28 +731,33 @@ void HttpClient::ExtractLocation(const u8* headers, ulong headerLen,
                 v++;
             ulong len = v - start;
             if (len >= locSize)
-                len = locSize - 1;
+            {
+                loc[0] = '\0';
+                return false;
+            }
             Stdlib::MemCpy(loc, headers + start, len);
             loc[len] = '\0';
-            return;
+            return true;
         }
     }
     loc[0] = '\0';
+    return true;
 }
 
-HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
+/* One request/response exchange for ex.Url, into resp -- which is filled
+   in place rather than returned: at over 2 KiB it is not something to hold
+   two copies of on a stack this deep. */
+void HttpClient::DoGet(Exchange& ex, HttpSink& sink, HttpResponse& resp)
 {
-    HttpResponse resp;
-
-    char host[HttpMaxUrlHostLen];
-    char path[HttpMaxUrlPathLen];
+    const char* host = ex.Host;
     u16 port = HttpDefaultPort;
     bool useTls = false;
 
-    if (!ParseUrl(url, host, sizeof(host), port, path, sizeof(path), useTls))
+    if (!ParseUrl(ex.Url, ex.Host, sizeof(ex.Host), port,
+                  ex.Path, sizeof(ex.Path), useTls))
     {
         Trace(0, "HttpClient: failed to parse URL");
-        return resp;
+        return;
     }
 
     /* Resolve host */
@@ -735,7 +765,7 @@ HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
     if (!ResolveHost(host, ip))
     {
         Trace(0, "HttpClient: failed to resolve host");
-        return resp;
+        return;
     }
 
     /* TCP connect */
@@ -743,7 +773,7 @@ HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
     if (!conn)
     {
         Trace(0, "HttpClient: TCP connect failed");
-        return resp;
+        return;
     }
 
     /* TLS goes on top of that connection; its destructor sends the
@@ -753,7 +783,7 @@ HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
     {
         resp.TlsFailed = true;
         Tcp::GetInstance().Close(conn);
-        return resp;
+        return;
     }
 
     TcpTransport tcpTransport(conn);
@@ -762,12 +792,12 @@ HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
                                       : (HttpTransport&)tcpTransport;
 
     /* Send GET request */
-    if (!SendRequest(transport, "GET", host, path))
+    if (!SendRequest(transport, "GET", ex))
     {
         Trace(0, "HttpClient: failed to send request");
         tls.Close();
         Tcp::GetInstance().Close(conn);
-        return resp;
+        return;
     }
 
     /* Receive response */
@@ -776,12 +806,11 @@ HttpResponse HttpClient::DoGet(const char* url, HttpSink& sink)
         Trace(0, "HttpClient: failed to receive response");
         tls.Close();
         Tcp::GetInstance().Close(conn);
-        return resp;
+        return;
     }
 
     tls.Close();
     Tcp::GetInstance().Close(conn);
-    return resp;
 }
 
 HttpResponse HttpClient::Get(const char* url)
@@ -794,19 +823,38 @@ HttpResponse HttpClient::Get(const char* url)
 
 HttpResponse HttpClient::Get(const char* url, HttpSink& sink)
 {
-    char currentUrl[HttpMaxUrlHostLen + HttpMaxUrlPathLen];
-    ulong urlLen = Stdlib::StrLen(url);
-    if (urlLen >= sizeof(currentUrl))
-        urlLen = sizeof(currentUrl) - 1;
-    Stdlib::MemCpy(currentUrl, url, urlLen);
-    currentUrl[urlLen] = '\0';
+    HttpResponse resp;
 
-    for (ulong attempt = 0; attempt <= HttpMaxRedirects; attempt++)
+    ulong urlLen = Stdlib::StrLen(url);
+    if (urlLen >= HttpMaxUrlLen)
     {
-        HttpResponse resp = DoGet(currentUrl, sink);
+        Trace(0, "HttpClient: URL longer than %u characters", HttpMaxUrlLen - 1);
+        resp.Err = MakeError(Stdlib::Error::BufTooBig);
+        return resp;
+    }
+
+    Exchange* ex = (Exchange*)Mm::Alloc(sizeof(Exchange), 'Http');
+    if (ex == nullptr)
+    {
+        resp.Err = MakeError(Stdlib::Error::NoMemory);
+        return resp;
+    }
+    Stdlib::MemCpy(ex->Url, url, urlLen + 1);
+
+    for (ulong attempt = 0; ; attempt++)
+    {
+        resp.Reset();
+        DoGet(*ex, sink, resp);
 
         if (!resp.Ok || !resp.IsRedirect())
-            return resp;
+            break;
+
+        if (attempt == HttpMaxRedirects)
+        {
+            Trace(0, "HttpClient: too many redirects");
+            resp.Reset();
+            break;
+        }
 
         /* Only follow absolute http:// and https:// redirects */
         static const char httpPrefix[] = "http://";
@@ -818,24 +866,19 @@ HttpResponse HttpClient::Get(const char* url, HttpSink& sink)
         {
             Trace(0, "HttpClient: %u redirect to non-HTTP: %s",
                   (ulong)resp.StatusCode, resp.Location);
-            return resp;
+            break;
         }
 
         Trace(0, "HttpClient: %u redirect -> %s", (ulong)resp.StatusCode, resp.Location);
 
         /* The body of a redirect never reached the sink (RecvResponse drops
-           it), so there is nothing to release here. */
-
-        urlLen = Stdlib::StrLen(resp.Location);
-        if (urlLen >= sizeof(currentUrl))
-            urlLen = sizeof(currentUrl) - 1;
-        Stdlib::MemCpy(currentUrl, resp.Location, urlLen);
-        currentUrl[urlLen] = '\0';
+           it), so there is nothing to release here. The target fits: it is
+           held in a buffer the size of ex->Url. */
+        Stdlib::MemCpy(ex->Url, resp.Location, Stdlib::StrLen(resp.Location) + 1);
     }
 
-    Trace(0, "HttpClient: too many redirects");
-    HttpResponse fail;
-    return fail;
+    Mm::Free(ex);
+    return resp;
 }
 
 } /* namespace Kernel */

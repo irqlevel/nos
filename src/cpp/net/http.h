@@ -23,8 +23,16 @@ static const ulong HttpMaxHeaderSize = 16384;
 static const u16   HttpDefaultPort = 80;
 static const u16   HttpsDefaultPort = 443;
 static const ulong HttpMaxUrlHostLen = 128;
-static const ulong HttpMaxUrlPathLen = 256;
-static const ulong HttpMaxLocationLen = 256;
+/* A whole URL, path and query included. URLs run long: a GitHub release
+   download redirects to a signed link whose query carries a signature and a
+   JWT, ~900 characters of it. 2 KiB is the long-standing practical limit
+   servers and browsers accept. A URL that does not fit fails the request
+   instead of being cut short: a truncated URL is a different URL -- a
+   signed link minus its signature -- and whether the server still answers
+   it depends on what its cache happens to hold. */
+static const ulong HttpMaxUrlLen = 2048;
+/* The request: method, path, the Host header and the framing around them. */
+static const ulong HttpMaxRequestLen = HttpMaxUrlLen + HttpMaxUrlHostLen + 64;
 static const ulong HttpRecvTimeoutMs = 10000;
 static const ulong HttpMaxRedirects = 5;
 
@@ -88,32 +96,42 @@ struct HttpResponse
                            caller must Mm::Free. Null when a sink took the
                            body. */
     ulong BodyLen;      /* bytes delivered, to memory or to the sink */
-    char Location[HttpMaxLocationLen]; /* redirect target from Location header */
+    char Location[HttpMaxUrlLen]; /* redirect target from Location header */
     bool Ok;
     bool Truncated;     /* body cut short: size cap, sink refusal, an idle
                            timeout or a peer that closed early */
     bool TlsFailed;     /* the TLS handshake was refused -- a certificate
                            that did not verify, or no common protocol */
-    Stdlib::Error Err;
+    Stdlib::Error Err;  /* BufTooBig with Ok false: the URL, or a redirect's
+                           target, is longer than HttpMaxUrlLen */
 
     HttpResponse()
-        : StatusCode(0)
-        , ContentLength(0)
-        , Body(nullptr)
-        , BodyLen(0)
-        , Ok(false)
-        , Truncated(false)
-        , TlsFailed(false)
-        , Err(MakeError(Stdlib::Error::InvalidState))
     {
-        Location[0] = '\0';
+        Reset();
+    }
+
+    static bool IsRedirectStatus(int code)
+    {
+        return code == 301 || code == 302 || code == 303 ||
+               code == 307 || code == 308;
     }
 
     bool IsRedirect() const
     {
-        return (StatusCode == 301 || StatusCode == 302 ||
-                StatusCode == 303 || StatusCode == 307 ||
-                StatusCode == 308) && Location[0] != '\0';
+        return IsRedirectStatus(StatusCode) && Location[0] != '\0';
+    }
+
+    void Reset()
+    {
+        StatusCode = 0;
+        ContentLength = 0;
+        Body = nullptr;
+        BodyLen = 0;
+        Ok = false;
+        Truncated = false;
+        TlsFailed = false;
+        Err = MakeError(Stdlib::Error::InvalidState);
+        Location[0] = '\0';
     }
 };
 
@@ -131,16 +149,17 @@ public:
     HttpResponse Get(const char* url, HttpSink& sink);
 
 private:
+    struct Exchange;
+
     NetDevice* Dev;
 
-    HttpResponse DoGet(const char* url, HttpSink& sink);
+    void DoGet(Exchange& ex, HttpSink& sink, HttpResponse& resp);
     bool ParseUrl(const char* url, char* host, ulong hostSize,
                   u16& port, char* path, ulong pathSize, bool& tls);
     bool ResolveHost(const char* host, Net::IpAddress& ip);
-    bool SendRequest(HttpTransport& transport, const char* method,
-                     const char* host, const char* path);
+    bool SendRequest(HttpTransport& transport, const char* method, Exchange& ex);
     bool RecvResponse(HttpTransport& transport, HttpResponse& resp, HttpSink& sink);
-    void ExtractLocation(const u8* headers, ulong headerLen, char* loc, ulong locSize);
+    bool ExtractLocation(const u8* headers, ulong headerLen, char* loc, ulong locSize);
 };
 
 } /* namespace Kernel */
