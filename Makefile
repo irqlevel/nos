@@ -159,6 +159,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/lib/bitmap.cpp \
     src/cpp/lib/checksum.cpp \
     src/cpp/lib/chacha20.cpp \
+    src/cpp/lib/grub_env.cpp \
     src/cpp/lib/list_entry.cpp  \
     src/cpp/lib/error.cpp   \
     src/cpp/mm/memory_map.cpp   \
@@ -260,6 +261,7 @@ CXX_SRC_aarch64 = \
     src/cpp/lib/bitmap.cpp \
     src/cpp/lib/checksum.cpp \
     src/cpp/lib/chacha20.cpp \
+    src/cpp/lib/grub_env.cpp \
     src/cpp/lib/list_entry.cpp \
     src/cpp/mm/memory_map.cpp \
     src/cpp/mm/new.cpp \

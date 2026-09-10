@@ -49,6 +49,8 @@
 #include <mm/new.h>
 #include <lib/unique_ptr.h>
 #include <lib/checksum.h>
+#include <lib/grub_env.h>
+#include "sha256.h"
 
 namespace Kernel
 {
@@ -2376,6 +2378,253 @@ static void CmdCrc32(const char* args, Stdlib::Printer& con)
         con.Printf("read failed\n");
 }
 
+static void PrintHex(Stdlib::Printer& con, const u8* buf, ulong len)
+{
+    static const char hex[] = "0123456789abcdef";
+    for (ulong i = 0; i < len; i++)
+    {
+        char s[3];
+        s[0] = hex[(buf[i] >> 4) & 0xF];
+        s[1] = hex[buf[i] & 0xF];
+        s[2] = '\0';
+        con.PrintString(s);
+    }
+}
+
+static void CmdSha256(const char* args, Stdlib::Printer& con)
+{
+    static const ulong ChunkSize = 64 * 1024;
+
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: sha256 <path>\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+    auto& vfs = Vfs::GetInstance();
+    File* file = vfs.Open(path, Vfs::OpenRead);
+    if (file == nullptr)
+    {
+        con.Printf("open failed\n");
+        return;
+    }
+
+    u8* buf = (u8*)Mm::Alloc(ChunkSize, 0);
+    if (buf == nullptr)
+    {
+        con.Printf("alloc failed\n");
+        vfs.Close(file);
+        return;
+    }
+
+    Sha256Hash hash;
+    bool ok = true;
+    for (;;)
+    {
+        ulong got = 0;
+        if (!vfs.Read(file, buf, ChunkSize, got))
+        {
+            ok = false;
+            break;
+        }
+        if (got == 0)
+            break;
+        hash.Update(buf, got);
+    }
+
+    Mm::Free(buf);
+    vfs.Close(file);
+
+    if (!ok)
+    {
+        con.Printf("read failed\n");
+        return;
+    }
+
+    /* As sha256sum prints it, so a line of a release's SHA256SUMS compares
+       by eye */
+    u8 digest[Sha256Hash::DigestSize];
+    if (!hash.Finish(digest))
+    {
+        con.Printf("hash failed\n");
+        return;
+    }
+    PrintHex(con, digest, sizeof(digest));
+    con.Printf("  %s\n", path);
+}
+
+/* A GRUB environment block bigger than this is not one grub-editenv made */
+static const ulong GrubenvMaxSize = 64 * 1024;
+
+/* name=value with its terminator */
+static const ulong GrubenvAssignmentSize =
+    Stdlib::GrubEnvBlock::MaxNameLen + 1 + Stdlib::GrubEnvBlock::MaxValueLen + 1;
+
+static bool GrubenvPrintVar(const char* name, const char* value, void* ctx)
+{
+    auto* con = static_cast<Stdlib::Printer*>(ctx);
+    con->Printf("%s=%s\n", name, value);
+    return true;
+}
+
+/* The whole file, or nullptr with the reason printed; size comes with it */
+static char* GrubenvReadFile(const char* path, ulong& size, Stdlib::Printer& con)
+{
+    auto& vfs = Vfs::GetInstance();
+    File* file = vfs.Open(path, Vfs::OpenRead);
+    if (file == nullptr)
+    {
+        con.Printf("open failed\n");
+        return nullptr;
+    }
+
+    size = vfs.GetSize(file);
+    if (size < Stdlib::GrubEnvBlock::MinSize || size > GrubenvMaxSize)
+    {
+        con.Printf("%s: %u bytes is not a GRUB environment block\n", path, size);
+        vfs.Close(file);
+        return nullptr;
+    }
+
+    char* block = (char*)Mm::Alloc(size, 0);
+    if (block == nullptr)
+    {
+        con.Printf("alloc failed\n");
+        vfs.Close(file);
+        return nullptr;
+    }
+
+    ulong total = 0;
+    while (total < size)
+    {
+        ulong got = 0;
+        if (!vfs.Read(file, block + total, size - total, got) || got == 0)
+            break;
+        total += got;
+    }
+    vfs.Close(file);
+
+    if (total != size)
+    {
+        con.Printf("read failed\n");
+        Mm::Free(block);
+        return nullptr;
+    }
+    return block;
+}
+
+/* grubenv <path>: the variables in a GRUB environment block, as
+   grub-editenv list prints them. grubenv <path> name=value ...: set them
+   (name= with nothing after it removes one) and write the block back where
+   it was. This is how a running kernel arms a one-shot boot for the next
+   GRUB -- see docs/real-hardware.md. */
+static void CmdGrubenv(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* pathStart = Stdlib::NextToken(args, end);
+    if (pathStart == nullptr)
+    {
+        con.Printf("usage: grubenv <path> [name=value ...]  (name= removes it)\n");
+        return;
+    }
+    char path[Vfs::MaxPath];
+    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
+
+    ulong size = 0;
+    char* block = GrubenvReadFile(path, size, con);
+    if (block == nullptr)
+        return;
+
+    Stdlib::GrubEnvBlock env(block, size);
+    if (!env.IsValid())
+    {
+        con.Printf("%s: not a GRUB environment block\n", path);
+        Mm::Free(block);
+        return;
+    }
+
+    const char* tokStart = Stdlib::NextToken(end, end);
+    if (tokStart == nullptr)
+    {
+        if (!env.ForEach(GrubenvPrintVar, &con))
+            con.Printf("%s: malformed from here on\n", path);
+        Mm::Free(block);
+        return;
+    }
+
+    ulong changes = 0;
+    while (tokStart != nullptr)
+    {
+        char assignment[GrubenvAssignmentSize];
+        Stdlib::TokenCopy(tokStart, end, assignment, sizeof(assignment));
+
+        const char* sep = Stdlib::StrChrOnce(assignment, '=');
+        if (sep == nullptr || sep == assignment)
+        {
+            con.Printf("%s: expected name=value\n", assignment);
+            Mm::Free(block);
+            return;
+        }
+        assignment[sep - assignment] = '\0';
+        const char* name = assignment;
+        const char* value = sep + 1;
+
+        if (*value == '\0')
+        {
+            if (env.Unset(name))
+            {
+                con.Printf("%s unset\n", name);
+                changes++;
+            }
+            else
+            {
+                con.Printf("%s was not set\n", name);
+            }
+        }
+        else if (env.Set(name, value))
+        {
+            con.Printf("%s=%s\n", name, value);
+            changes++;
+        }
+        else
+        {
+            con.Printf("cannot set %s: not a name GRUB takes, or no room in %u bytes\n",
+                name, size);
+            Mm::Free(block);
+            return;
+        }
+
+        tokStart = Stdlib::NextToken(end, end);
+    }
+
+    if (changes == 0)
+    {
+        Mm::Free(block);
+        return;
+    }
+
+    /* Back in place, at the same size: GRUB's save_env writes the file's own
+       disk blocks, so the file has to keep them */
+    auto& vfs = Vfs::GetInstance();
+    File* file = vfs.Open(path, Vfs::OpenWrite);
+    bool ok = (file != nullptr) && vfs.Write(file, block, size);
+    if (file != nullptr)
+        vfs.Close(file);
+    Mm::Free(block);
+
+    if (!ok)
+    {
+        con.Printf("%s: write failed\n", path);
+        return;
+    }
+    if (!vfs.Sync())
+        con.Printf("sync failed\n");
+}
+
 static void CmdFormat(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -2709,6 +2958,8 @@ static const CmdEntry Commands[] = {
     { "sync",      CmdSync,      "sync - flush filesystems to disk" },
     { "fstest",    CmdFstest,    "fstest [dir] [size] - filesystem self-test" },
     { "crc32",     CmdCrc32,     "crc32 <path> - CRC-32 of a file" },
+    { "sha256",    CmdSha256,    "sha256 <path> - SHA-256 of a file, as sha256sum prints it" },
+    { "grubenv",   CmdGrubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
     { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
     { "entropy",   CmdEntropy,   "entropy [reseed] - show the random pool and its sources" },
     { "version",   CmdVersion,   "version - show kernel version" },

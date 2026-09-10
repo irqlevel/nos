@@ -3,6 +3,8 @@
 
 extern crate alloc;
 
+mod sha256;
+
 use ffi::alloc::KernelAllocator;
 
 #[global_allocator]

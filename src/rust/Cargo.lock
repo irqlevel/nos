@@ -413,6 +413,7 @@ dependencies = [
  "nvme",
  "r8125",
  "r8168",
+ "sha2",
  "tls",
 ]
 

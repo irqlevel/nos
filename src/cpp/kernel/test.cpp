@@ -5,6 +5,7 @@
 #include "cpu.h"
 #include "stack_trace.h"
 #include "random.h"
+#include "sha256.h"
 #include <hal/cpu.h>
 #include <block/block_device.h>
 #include <fs/vfs.h>
@@ -13,6 +14,7 @@
 
 #include <lib/btree.h>
 #include <lib/error.h>
+#include <lib/grub_env.h>
 #include <lib/stdlib.h>
 #include <lib/ring_buffer.h>
 #include <lib/vector.h>
@@ -2054,6 +2056,182 @@ Stdlib::Error TestRandom()
     return MakeSuccess();
 }
 
+Stdlib::Error TestSha256()
+{
+    Trace(0, "TestSha256: started");
+
+    /* FIPS 180-2's "abc" and the empty message. The sha256 command is what
+       says a downloaded kernel is the one its release lists, so this is
+       checked against the standard, not against itself. */
+    static const u8 abc[] = { 'a', 'b', 'c' };
+    static const u8 abcDigest[Sha256Hash::DigestSize] = {
+        0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+        0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+        0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+    };
+    static const u8 emptyDigest[Sha256Hash::DigestSize] = {
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55
+    };
+
+    u8 digest[Sha256Hash::DigestSize];
+    {
+        Sha256Hash hash;
+        hash.Update(abc, sizeof(abc));
+        if (!hash.Finish(digest) || Stdlib::MemCmp(digest, abcDigest, sizeof(digest)) != 0)
+            return MakeError(Stdlib::Error::Unsuccessful);
+
+        /* The digest is taken once */
+        if (hash.Finish(digest))
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    {
+        Sha256Hash hash;
+        if (!hash.Finish(digest) || Stdlib::MemCmp(digest, emptyDigest, sizeof(digest)) != 0)
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Fed in pieces, as the command feeds a file, the same digest */
+    {
+        Sha256Hash hash;
+        hash.Update(abc, 2);
+        hash.Update(abc + 2, 1);
+        if (!hash.Finish(digest) || Stdlib::MemCmp(digest, abcDigest, sizeof(digest)) != 0)
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* A hash abandoned before its digest is released, not leaked */
+    {
+        Sha256Hash hash;
+        hash.Update(abc, 1);
+    }
+
+    Trace(0, "TestSha256: complete");
+    return MakeSuccess();
+}
+
+static bool CountGrubEnvVar(const char* name, const char* value, void* ctx)
+{
+    (void)name;
+    (void)value;
+    auto* count = static_cast<ulong*>(ctx);
+    (*count)++;
+    return true;
+}
+
+/* Does the block hold exactly this value for name? */
+static bool GrubEnvHas(Stdlib::GrubEnvBlock& env, const char* name, const char* expected)
+{
+    char value[Stdlib::GrubEnvBlock::MaxValueLen + 1];
+    return env.Get(name, value, sizeof(value)) && Stdlib::StrCmp(value, expected) == 0;
+}
+
+Stdlib::Error TestGrubEnv()
+{
+    Trace(0, "TestGrubEnv: started");
+
+    using Stdlib::GrubEnvBlock;
+
+    char block[GrubEnvBlock::DefaultSize];
+    GrubEnvBlock::Format(block, sizeof(block));
+    GrubEnvBlock env(block, sizeof(block));
+    char value[GrubEnvBlock::MaxValueLen + 1];
+
+    if (!env.IsValid() || env.Get("nos_next", value, sizeof(value)))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Set, read back, and a second variable behind the first */
+    if (!env.Set("nos_next", "nos-next") || !env.Set("other", "x") ||
+        !GrubEnvHas(env, "nos_next", "nos-next") || !GrubEnvHas(env, "other", "x"))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* A longer value shifts the line behind it, intact; so does a shorter one */
+    if (!env.Set("nos_next", "nos-multiboot2") ||
+        !GrubEnvHas(env, "nos_next", "nos-multiboot2") || !GrubEnvHas(env, "other", "x"))
+        return MakeError(Stdlib::Error::Unsuccessful);
+    if (!env.Set("nos_next", "n") ||
+        !GrubEnvHas(env, "nos_next", "n") || !GrubEnvHas(env, "other", "x"))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* What GRUB leaves behind when it clears a flag: the name, nothing after '=' */
+    if (!env.Set("nos_next", "") || !GrubEnvHas(env, "nos_next", ""))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Escapes go on and come off */
+    if (!env.Set("esc", "a\\b") || !GrubEnvHas(env, "esc", "a\\b"))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    ulong count = 0;
+    if (!env.ForEach(CountGrubEnvVar, &count) || count != 3)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* Unset closes the gap; a second unset finds nothing */
+    if (!env.Unset("nos_next") || env.Get("nos_next", value, sizeof(value)) ||
+        env.Unset("nos_next") || !GrubEnvHas(env, "other", "x") || !GrubEnvHas(env, "esc", "a\\b"))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* The layout GRUB's own writer insists on: lines, a newline, '#' to the end */
+    {
+        ulong pos = sizeof(block);
+        while (pos > 0 && block[pos - 1] == '#')
+            pos--;
+        if (pos == sizeof(block) || block[pos - 1] != '\n')
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* A name GRUB would not take, and a value there is no room for, leave
+       the block as it was */
+    char copy[sizeof(block)];
+    Stdlib::MemCpy(copy, block, sizeof(block));
+    if (env.Set("bad name", "x") || env.Set("", "x") || env.Set("a=b", "x") ||
+        Stdlib::MemCmp(copy, block, sizeof(block)) != 0)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    char big[GrubEnvBlock::MaxValueLen + 1];
+    Stdlib::MemSet(big, 'v', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    bool full = false;
+    for (ulong i = 0; i < 8 && !full; i++)
+    {
+        char name[8];
+        Stdlib::SnPrintf(name, sizeof(name), "big%u", i);
+        Stdlib::MemCpy(copy, block, sizeof(block));
+        if (!env.Set(name, big))
+        {
+            if (Stdlib::MemCmp(copy, block, sizeof(block)) != 0)
+                return MakeError(Stdlib::Error::Unsuccessful);
+            full = true;
+        }
+    }
+    if (!full || !GrubEnvHas(env, "other", "x"))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    /* A comment line, as grub-editenv writes one, is passed over */
+    {
+        static const char comment[] = "# WARNING: Do not edit this file by hand\n";
+        static const char line[] = "a=1\n";
+        GrubEnvBlock::Format(block, sizeof(block));
+        Stdlib::MemCpy(block + GrubEnvBlock::SignatureLen, comment, sizeof(comment) - 1);
+        Stdlib::MemCpy(block + GrubEnvBlock::SignatureLen + sizeof(comment) - 1, line, sizeof(line) - 1);
+        if (!GrubEnvHas(env, "a", "1") || !env.Set("b", "2") ||
+            !GrubEnvHas(env, "a", "1") || !GrubEnvHas(env, "b", "2") ||
+            Stdlib::MemCmp(block + GrubEnvBlock::SignatureLen, comment, sizeof(comment) - 1) != 0)
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Not a block at all */
+    block[0] = 'x';
+    if (env.IsValid() || env.Set("nos_next", "nos-next") || env.Get("a", value, sizeof(value)))
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Trace(0, "TestGrubEnv: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
@@ -2141,6 +2319,14 @@ Stdlib::Error Test()
         return err;
 
     err = TestRandom();
+    if (!err.Ok())
+        return err;
+
+    err = TestSha256();
+    if (!err.Ok())
+        return err;
+
+    err = TestGrubEnv();
     if (!err.Ok())
         return err;
 
