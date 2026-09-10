@@ -305,6 +305,9 @@ int StrnCmp(const char *s1, const char *s2, size_t size);
 /* Copies at most size-1 chars; dst is always null-terminated (if size > 0). */
 void StrnCpy(char *dst, const char *s, size_t size);
 
+/* The first occurrence of c in s, or nullptr */
+const char* StrChr(const char* s, char c);
+
 const char* StrChrOnce(const char* s, char sep);
 
 size_t Log2(size_t size);

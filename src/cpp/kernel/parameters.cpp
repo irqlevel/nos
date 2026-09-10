@@ -212,12 +212,15 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     if (len > maxLen)
         return false;
 
-    if (len < 3)
+    /* The shortest token taken is the bare word ro */
+    if (len < 2)
         return false;
 
     Stdlib::StrnCpy(param, &cmdline[start], len + 1);
-    
-    const char* sep = Stdlib::StrChrOnce(param, '=');
+
+    /* The key ends at the first '=': the value may hold one of its own, as
+       root=LABEL=<label> and root=UUID=<uuid> do */
+    const char* sep = Stdlib::StrChr(param, '=');
     if (sep == nullptr)
     {
         /* The one bare word taken, as on Linux: ro */
