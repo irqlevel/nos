@@ -40,6 +40,16 @@ void UnmapPages(void* ptr, size_t numPages)
 	PageAllocatorImpl::GetInstance().UnmapPages(ptr, numPages);
 }
 
+void* MapLargePages(size_t numPages, ulong* physAddrs)
+{
+	return PageAllocatorImpl::GetInstance().MapLargePages(numPages, physAddrs);
+}
+
+void UnmapLargePages(void* ptr, size_t numPages)
+{
+	PageAllocatorImpl::GetInstance().UnmapLargePages(ptr, numPages);
+}
+
 }
 }
 

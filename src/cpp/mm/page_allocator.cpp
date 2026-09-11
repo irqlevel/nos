@@ -167,6 +167,15 @@ bool PageAllocatorImpl::Setup()
         }
     }
 
+    /* The large runs get a window of their own, past the blocks' */
+    const ulong largeBlock = PageTable::MaxLargeMapPages * Const::PageSize;
+    const ulong largeStart = Stdlib::RoundUp(endAddress, largeBlock);
+    if (!LargePgAlloc.Setup(largeStart, largeStart + LargeBlockCount * largeBlock,
+            PageTable::MaxLargeMapPages))
+    {
+        return false;
+    }
+
     return true;
 }
 
@@ -253,6 +262,24 @@ void PageAllocatorImpl::UnmapPages(void* ptr, size_t numPages)
 
     if (!FixedPgAlloc[log].Unmap(ptr, numPages))
         Panic("Can't unmap addr 0x%p numPages %u", ptr, numPages);
+}
+
+void* PageAllocatorImpl::MapLargePages(size_t numPages, ulong* physAddrs)
+{
+    BugOn(numPages == 0);
+
+    if (numPages > PageTable::MaxLargeMapPages)
+        return nullptr;
+
+    return LargePgAlloc.MapPhys(physAddrs, numPages);
+}
+
+void PageAllocatorImpl::UnmapLargePages(void* ptr, size_t numPages)
+{
+    BugOn(numPages == 0 || numPages > PageTable::MaxLargeMapPages);
+
+    if (!LargePgAlloc.Unmap(ptr, numPages))
+        Panic("Can't unmap large run 0x%p numPages %u", ptr, numPages);
 }
 
 }

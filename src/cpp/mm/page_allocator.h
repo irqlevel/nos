@@ -71,6 +71,11 @@ public:
     virtual void* MapPages(size_t numPages, ulong* physAddrs) override;
     virtual void UnmapPages(void* ptr, size_t numPages) override;
 
+    /* MapPages for runs past the largest block: up to
+       PageTable::MaxLargeMapPages pages, from a window of blocks that big */
+    void* MapLargePages(size_t numPages, ulong* physAddrs);
+    void UnmapLargePages(void* ptr, size_t numPages);
+
 private:
     PageAllocatorImpl();
     virtual ~PageAllocatorImpl();
@@ -83,6 +88,12 @@ private:
     static const size_t PageLogLimit = Stdlib::CLog2(PageTable::MaxContiguousPages) + 1;
 
     FixedPageAllocator FixedPgAlloc[PageLogLimit];
+
+    /* How many large runs can be mapped at once -- one less, the first
+       block holding the window's own bitmap. 1 GiB of VA, which costs page
+       tables only where a run is mapped. */
+    static const size_t LargeBlockCount = 64;
+    FixedPageAllocator LargePgAlloc;
 };
 
 }
