@@ -31,8 +31,8 @@ void PreemptEnableTask(Task* task);
 
 /* May the caller block -- wait for a completion, or Schedule() away? Not
    with interrupts off; and once preemption is on, not off a task stack, and
-   not with preemption disabled -- which a RawSpinLock, and so every
-   SpinLock, keeps it for as long as it is held. */
+   not with preemption disabled -- which every spinlock (RawSpinLock,
+   SpinLock, RawRwSpinLock) keeps it for as long as it is held. */
 bool PreemptCanBlock();
 
 /*

@@ -93,8 +93,10 @@ Two independent gates:
   across `SwitchContext`, and `SwitchComplete` checks that `Schedule()`'s is
   the only count the switched-out task still has. `PreemptCanBlock()` asks
   the whole question — interrupts on and preemption enabled — for code that
-  has to know whether it may wait. `RawRwSpinLock`'s plain
-  `ReadLock`/`WriteLock` are the exception: they still leave preemption on.
+  has to know whether it may wait. `RawRwSpinLock` does the same on both
+  sides; a read lock has many holders at once, so `ReadLock()` hands back
+  whose count it raised and `ReadUnlock()` takes it, the way
+  `WriteLockIrqSave()` hands back its flags.
 
 Involuntary preemption comes from the per-CPU timer tick — the local APIC
 timer on x86-64, the generic timer on arm64, both at 100 Hz — whose handler

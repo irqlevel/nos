@@ -6,6 +6,8 @@
 namespace Kernel
 {
 
+class Task;
+
 /*
  * Lightweight reader-writer spinlock with writer priority.
  *
@@ -16,6 +18,11 @@ namespace Kernel
  *
  * WriterWaiting: when non-zero, new readers back off and let existing
  * readers drain so the writer can acquire without starvation.
+ *
+ * Holding either side disables preemption, as RawSpinLock::Lock() does. The
+ * writer is one, and the lock keeps whose count it raised. Readers are many
+ * at once, so that cannot live in the lock: ReadLock() hands it back and
+ * ReadUnlock() takes it, the way WriteLockIrqSave() hands back its flags.
  */
 class RawRwSpinLock final
 {
@@ -23,13 +30,18 @@ public:
     RawRwSpinLock();
     ~RawRwSpinLock();
 
-    void ReadLock();
-    void ReadUnlock();
+    /* The returned task goes back to ReadUnlock(). It is nullptr when there
+       was nothing to disable -- preemption not on yet, or no task on this
+       stack -- and ReadUnlock(nullptr) then leaves the count alone, whatever
+       the global gate did in between. */
+    Task* ReadLock();
+    void ReadUnlock(Task* preemptTask);
 
     void WriteLock();
     void WriteUnlock();
 
-    /* IRQ-save variants for writers running in task/preemptible context. */
+    /* IRQ-save variants for writers running in task/preemptible context.
+       Preemption goes off with interrupts, and the flags carry it. */
     ulong WriteLockIrqSave();
     void WriteUnlockIrqRestore(ulong flags);
 
@@ -39,8 +51,18 @@ private:
     RawRwSpinLock& operator=(const RawRwSpinLock& other) = delete;
     RawRwSpinLock& operator=(RawRwSpinLock&& other) = delete;
 
+    void AcquireWrite();
+    void ReleaseWrite();
+
     Atomic Value;
     Atomic WriterWaiting;
+
+    /* Whose preemption WriteLock() disabled, for WriteUnlock() to enable
+       again. nullptr when it had nothing to disable, and whenever the lock is
+       not held through WriteLock() -- WriteLockIrqSave's flags carry that
+       instead. Zero is also what a static instance starts as, constructor or
+       not. */
+    Task* WriterPreemptTask;
 };
 
 }

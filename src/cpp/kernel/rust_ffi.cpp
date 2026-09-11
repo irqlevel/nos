@@ -169,14 +169,18 @@ void kernel_rw_spinlock_destroy(unsigned long handle)
     Kernel::Mm::Free(rw);
 }
 
-void kernel_rw_spinlock_read_lock(unsigned long handle)
+/* The read side hands back whose preemption it disabled, and the caller
+   carries it to the unlock -- the same round trip as the write side's
+   flags. */
+unsigned long long kernel_rw_spinlock_read_lock(unsigned long handle)
 {
-    reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->ReadLock();
+    return (unsigned long long)reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->ReadLock();
 }
 
-void kernel_rw_spinlock_read_unlock(unsigned long handle)
+void kernel_rw_spinlock_read_unlock(unsigned long handle, unsigned long long token)
 {
-    reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->ReadUnlock();
+    reinterpret_cast<Kernel::RawRwSpinLock*>(handle)->ReadUnlock(
+        reinterpret_cast<Kernel::Task*>(token));
 }
 
 unsigned long long kernel_rw_spinlock_write_lock(unsigned long handle)
@@ -748,12 +752,12 @@ public:
     void OnInterrupt(Kernel::Context* ctx) override
     {
         (void)ctx;
-        RustIrqLock.ReadLock();
+        Kernel::Task* preempt = RustIrqLock.ReadLock();
         auto handler = RustIrqSlots[SlotIndex].Handler;
         auto uctx = RustIrqSlots[SlotIndex].Ctx;
         if (handler)
             RustIrqSlots[SlotIndex].InFlight.Inc();
-        RustIrqLock.ReadUnlock();
+        RustIrqLock.ReadUnlock(preempt);
         if (handler)
         {
             handler(uctx);
@@ -794,12 +798,12 @@ void RustInterruptDispatch(Kernel::Context* ctx, int slot)
     /* InFlight is raised inside the read-locked section so unregister (which
        nulls Handler under the write lock) can wait out a mid-call ISR before
        its caller frees ctx. */
-    RustIrqLock.ReadLock();
+    Kernel::Task* preempt = RustIrqLock.ReadLock();
     auto handler = RustIrqSlots[slot].Handler;
     auto uctx = RustIrqSlots[slot].Ctx;
     if (handler)
         RustIrqSlots[slot].InFlight.Inc();
-    RustIrqLock.ReadUnlock();
+    RustIrqLock.ReadUnlock(preempt);
     if (handler)
     {
         handler(uctx);
@@ -903,10 +907,10 @@ public:
     void OnTick(Kernel::TimerCallback& callback) override
     {
         (void)callback;
-        RustTimerLock.ReadLock();
+        Kernel::Task* preempt = RustTimerLock.ReadLock();
         auto handler = RustTimerSlots[SlotIndex].Handler;
         auto ctx = RustTimerSlots[SlotIndex].Ctx;
-        RustTimerLock.ReadUnlock();
+        RustTimerLock.ReadUnlock(preempt);
         if (handler)
             handler(ctx);
     }
@@ -1096,12 +1100,12 @@ void RustMsixDispatch(Kernel::Context* ctx, int slot)
         return;
     }
     /* Same in-flight discipline as RustInterruptDispatch */
-    RustMsixLock.ReadLock();
+    Kernel::Task* preempt = RustMsixLock.ReadLock();
     auto handler = RustMsixSlots[slot].Handler;
     auto uctx = RustMsixSlots[slot].Ctx;
     if (handler)
         RustMsixSlots[slot].InFlight.Inc();
-    RustMsixLock.ReadUnlock();
+    RustMsixLock.ReadUnlock(preempt);
     if (handler)
     {
         handler(uctx);
