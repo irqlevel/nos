@@ -24,6 +24,11 @@ public:
        without a word. */
     void Parse(const char *cmdline);
 
+    /* Whether Parse() has run. Before it every getter reports its default,
+       and a caller that must not act on a default -- the disk log, keeping
+       the first lines of the boot until it knows -- can tell. */
+    bool IsParsed();
+
     /* The line, its terminator included, and the longest single parameter
        taken -- room for root=UUID=<uuid>, which is 46 */
     static const ulong CmdlineLen = 256;
@@ -114,6 +119,11 @@ public:
     /* fstest=on: run the filesystem self-test on / once it is mounted */
     bool IsFsTest();
 
+    /* disklog=on: write the kernel log to a disk area prepared with
+       scripts/disklog.py (see kernel/disklog.h). Off by default: it costs
+       a forced disk write per burst of lines. */
+    bool IsDiskLogOn();
+
     const char* GetCmdline();
 
     Parameters();
@@ -155,6 +165,8 @@ private:
     RootSpec Root;
     bool RootReadOnly;
     bool FsTest;
+    bool DiskLogOn;
+    bool Parsed;
 
     static bool ParseUuid(const char* text, u8* out);
 };

@@ -6,7 +6,8 @@ block device -- for the machine that has no serial port, no working NIC and so
 no netconsole, and stops somewhere in boot without saying anything. See
 src/cpp/kernel/disklog.h.
 
-The area is never guessed by the kernel. It writes only where it finds the
+The area is never guessed by the kernel, and nothing is read or written
+unless it was booted with disklog=on. It writes only where it finds the
 header this tool lays down, magic and checksum intact, in the first sector of
 a block device. A disk that has not been through `format` here is not written
 to at all.

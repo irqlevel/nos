@@ -30,7 +30,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `diskread <disk> <sector>` | Read and hex-dump a sector |
 | `diskwrite <disk> <sector> <hex>` | Write hex data to a sector |
 | `partitions <disk>` | Show the partition table (MBR or GPT) |
-| `disklog` | Kernel-log-to-disk state: the prepared area it found (if any), boot number, sectors written, lines dropped. The area is laid down under the host OS with `scripts/disklog.py format` and read back with `scripts/disklog.py read` |
+| `disklog` | Kernel-log-to-disk state: off unless the kernel was booted with `disklog=on`; otherwise the prepared area it found (if any), boot number, sectors written, lines queued and dropped. The area is laid down under the host OS with `scripts/disklog.py format` and read back with `scripts/disklog.py read` |
 | `irqstat` | Show per-device interrupt counters |
 | `help` | List commands |
 | `net` | List network devices and per-protocol stats |
