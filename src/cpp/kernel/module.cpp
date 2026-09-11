@@ -2,6 +2,10 @@
 #include "elf.h"
 #include "trace.h"
 #include "cpu.h"
+#include "atomic.h"
+#include "task.h"
+#include "sched.h"
+#include "preempt.h"
 
 #include <hal/mmu.h>
 #include <hal/module.h>
@@ -37,30 +41,62 @@ __attribute__((weak)) const ulong nos_module_export_count = 0;
 namespace Kernel
 {
 
+/* Pages of its own at one run of VA -- up to PageTable::MaxLargeMapPages of
+   them, physically scattered, mapped writable: a module's image, or the .ko
+   file it is read from */
+struct ModulePageRun
+{
+    ulong Base;
+    ulong Count;
+    Mm::Page** Pages;
+};
+
+enum class ModulePhase
+{
+    Loading,    /* mapped and listed, its init running */
+    Live,
+    Unloading,  /* its exit running */
+};
+
+/* One of a module's functions, from the table the build puts in its .ko */
+struct ModuleSymbol
+{
+    ulong Offset;       /* from the image's base */
+    const char* Name;   /* in the image's pages, past the segments */
+};
+
 struct LoadedModule
 {
     LoadedModule()
-        : Base(0)
-        , PageCount(0)
-        , Pages(nullptr)
+        : Phase(ModulePhase::Loading)
+        , ImageSize(0)
+        , TextEnd(0)
+        , Symbols(nullptr)
+        , SymbolCount(0)
         , Imports(0)
         , PermanentBy(nullptr)
-        , State(nullptr)
+        , Instance(nullptr)
         , Exit(nullptr)
     {
         ListEntry.Init();
         Name[0] = '\0';
+        Image.Base = 0;
+        Image.Count = 0;
+        Image.Pages = nullptr;
     }
 
     Stdlib::ListEntry ListEntry;
     char Name[ModuleTable::NameMax + 1];
-    ulong Base;        /* where the image is mapped */
-    ulong PageCount;   /* and how many pages it takes */
-    Mm::Page** Pages;  /* the frames behind them */
-    ulong Imports;     /* kernel functions it binds to */
-    const char* PermanentBy; /* what keeps it from being unloaded, if anything */
-    void* State;       /* what its init returned, which its exit takes back */
-    void (*Exit)(void* state);
+    ModulePhase Phase;            /* changed only under ModuleTable::Lock */
+    ModulePageRun Image;          /* the segments, then the symbol table */
+    ulong ImageSize;              /* the segments' extent */
+    ulong TextEnd;                /* where the last executable segment ends */
+    const ModuleSymbol* Symbols;  /* sorted by offset */
+    ulong SymbolCount;
+    ulong Imports;                /* kernel functions it binds to */
+    const char* PermanentBy;      /* what keeps it from being unloaded, if anything */
+    void* Instance;               /* what its init returned; its exit takes it back */
+    void (*Exit)(void* instance);
 };
 
 namespace
@@ -83,7 +119,7 @@ struct ModuleInfo
     char Abi[InfoAbiLen];
     char Name[InfoNameLen];
     void* (*Init)();
-    void (*Exit)(void* state);
+    void (*Exit)(void* instance);
 };
 
 static_assert(sizeof(ModuleInfo) == 120, "kmod::ModuleInfo layout");
@@ -95,9 +131,9 @@ static_assert(sizeof(KernelAbi) - 1 <= InfoAbiLen, "NOS_MODULE_ABI is too long")
 /* How much of each digest a refusal for a mismatch quotes */
 const ulong AbiShown = 12;
 
-/* A module's image, and the .ko file it comes from, are at most the largest
-   block the page allocator maps in one piece */
-const ulong MaxImageSize = Mm::PageTable::MaxContiguousPages * Const::PageSize;
+/* A module's image -- its segments and its symbol table -- and the .ko file
+   it comes from are at most the longest run MapLargePages maps: 16 MiB */
+const ulong MaxImageSize = Mm::PageTable::MaxLargeMapPages * Const::PageSize;
 
 /* A linked .ko has half a dozen program headers; the segment checks compare
    every pair, so a corrupt count must not make that billions */
@@ -112,6 +148,19 @@ const char* const PermanentImports[] = {
     "kernel_netdev_register",
     "kernel_softirq_register",
 };
+
+/* The section the Makefile adds to every .ko: its functions, a line each,
+   "<hex offset> <name>", in address order -- llvm-nm -n -C's, so the Rust
+   names come demangled and the kernel needs no demangler */
+const char SymbolSection[] = ".nos_syms";
+const ulong MaxHexDigits = 16;
+
+/* insmod and rmmod in a task of their own */
+const ulong JobOutputSize = 2048;
+const ulong JobPollMs = 10;
+const long JobRunning = 0;
+const long JobDone = 1;
+const long JobAbandoned = 2;
 
 bool InFile(ulong fileSize, ulong offset, ulong len)
 {
@@ -132,6 +181,87 @@ void Quote(char* dst, const char* src, ulong len)
     dst[i] = '\0';
 }
 
+const char* PhaseText(ModulePhase phase)
+{
+    switch (phase)
+    {
+    case ModulePhase::Loading:
+        return "being loaded";
+    case ModulePhase::Unloading:
+        return "being unloaded";
+    default:
+        return "loaded";
+    }
+}
+
+/* Undo AllocPageRun, whatever part of it happened. Unmapping takes the page
+   permissions with the PTEs and shoots down every CPU's TLB. */
+void FreePageRun(ModulePageRun& run)
+{
+    auto& pt = Mm::PageTable::GetInstance();
+
+    if (run.Base != 0)
+        Mm::UnmapLargePages(reinterpret_cast<void*>(run.Base), run.Count);
+
+    for (ulong i = 0; i < run.Count; i++)
+        pt.FreePage(run.Pages[i]);
+
+    if (run.Pages != nullptr)
+        Mm::Free(run.Pages);
+
+    run.Base = 0;
+    run.Count = 0;
+    run.Pages = nullptr;
+}
+
+bool AllocPageRun(ModulePageRun& run, ulong bytes)
+{
+    auto& pt = Mm::PageTable::GetInstance();
+    const ulong count = Stdlib::RoundUp(bytes, Const::PageSize) / Const::PageSize;
+
+    run.Base = 0;
+    run.Count = 0;
+    run.Pages = nullptr;
+    if (count == 0 || count > Mm::PageTable::MaxLargeMapPages)
+        return false;
+
+    run.Pages = static_cast<Mm::Page**>(Mm::Alloc(count * sizeof(Mm::Page*), Tag));
+    ulong* phys = static_cast<ulong*>(Mm::Alloc(count * sizeof(ulong), Tag));
+    if (run.Pages != nullptr && phys != nullptr)
+    {
+        for (ulong i = 0; i < count; i++)
+        {
+            Mm::Page* page = pt.AllocPage();
+            if (page == nullptr)
+                break;
+
+            run.Pages[i] = page;
+            run.Count++;
+            phys[i] = page->GetPhyAddress();
+        }
+
+        if (run.Count == count)
+            run.Base = reinterpret_cast<ulong>(Mm::MapLargePages(count, phys));
+    }
+
+    if (phys != nullptr)
+        Mm::Free(phys);
+
+    if (run.Base == 0)
+    {
+        FreePageRun(run);
+        return false;
+    }
+
+    return true;
+}
+
+void ReleaseModule(LoadedModule* module)
+{
+    FreePageRun(module->Image);
+    Mm::Free(module);
+}
+
 /* What Load works out about one image, step by step */
 struct LoadCtx
 {
@@ -147,8 +277,13 @@ struct LoadCtx
         , StrSize(0)
         , Base(0)
         , ImageSize(0)
+        , RunSize(0)
+        , TextEnd(0)
         , Imports(0)
         , PermanentBy(nullptr)
+        , FuncText(nullptr)
+        , FuncTextSize(0)
+        , FuncLines(0)
     {
     }
 
@@ -157,14 +292,19 @@ struct LoadCtx
     const Elf::Ehdr* Header;
     const Elf::Phdr* Phdrs;
     const Elf::Shdr* Shdrs;
-    const Elf::Sym* Syms;   /* .dynsym */
+    const Elf::Sym* Syms;    /* .dynsym */
     ulong SymCount;
-    const char* Strs;       /* .dynstr */
+    const char* Strs;        /* .dynstr */
     ulong StrSize;
-    ulong Base;             /* where the image is mapped */
-    ulong ImageSize;        /* bytes, a whole number of pages */
+    ulong Base;              /* where the image is mapped */
+    ulong ImageSize;         /* the segments' extent, a whole number of pages */
+    ulong RunSize;           /* all the image's pages, symbol table included */
+    ulong TextEnd;
     ulong Imports;
     const char* PermanentBy; /* the first of PermanentImports it imports */
+    const char* FuncText;    /* .nos_syms, if it has one */
+    ulong FuncTextSize;
+    ulong FuncLines;
 };
 
 Stdlib::Error CheckHeader(LoadCtx& ctx, Stdlib::Printer& out)
@@ -279,6 +419,8 @@ Stdlib::Error CheckSegments(LoadCtx& ctx, Stdlib::Printer& out)
 
         if (segEnd > end)
             end = segEnd;
+        if ((ph.Flags & Elf::PfX) != 0 && ph.Vaddr + ph.Memsz > ctx.TextEnd)
+            ctx.TextEnd = ph.Vaddr + ph.Memsz;
     }
 
     if (end == 0)
@@ -335,6 +477,52 @@ Stdlib::Error FindSymbols(LoadCtx& ctx, Stdlib::Printer& out)
     ctx.Strs = reinterpret_cast<const char*>(ctx.File + strtab.Offset);
     ctx.StrSize = strtab.Size;
     return MakeSuccess();
+}
+
+/* The .nos_syms section, measured: BuildFunctions copies and indexes it once
+   the image is mapped. A .ko without one -- linked outside the Makefile --
+   loads all the same, and its frames go unnamed. */
+void FindFunctions(LoadCtx& ctx)
+{
+    const Elf::Ehdr* eh = ctx.Header;
+    if (eh->Shstrndx == 0 || eh->Shstrndx >= eh->Shnum)
+        return;
+
+    const Elf::Shdr& names = ctx.Shdrs[eh->Shstrndx];
+    if (names.Type != Elf::ShtStrtab || names.Size == 0 ||
+        !InFile(ctx.Size, names.Offset, names.Size) ||
+        ctx.File[names.Offset + names.Size - 1] != '\0')
+        return;
+
+    const char* sectionNames = reinterpret_cast<const char*>(ctx.File + names.Offset);
+    for (ulong i = 0; i < eh->Shnum; i++)
+    {
+        const Elf::Shdr& sh = ctx.Shdrs[i];
+        if (sh.Name >= names.Size || Stdlib::StrCmp(sectionNames + sh.Name, SymbolSection) != 0)
+            continue;
+
+        if (sh.Size == 0 || !InFile(ctx.Size, sh.Offset, sh.Size))
+            return;
+
+        ulong lines = 0;
+        for (ulong j = 0; j < sh.Size; j++)
+        {
+            if (ctx.File[sh.Offset + j] == '\n')
+                lines++;
+        }
+
+        const ulong bytes = lines * sizeof(ModuleSymbol) + sh.Size + 1;
+        if (lines == 0 || bytes > MaxImageSize - ctx.ImageSize)
+        {
+            Trace(ModuleLL, "module: %u function names left out, %u bytes of them", lines, sh.Size);
+            return;
+        }
+
+        ctx.FuncText = reinterpret_cast<const char*>(ctx.File + sh.Offset);
+        ctx.FuncTextSize = sh.Size;
+        ctx.FuncLines = lines;
+        return;
+    }
 }
 
 /* NUL-terminated within the table: FindSymbols checked its last byte */
@@ -499,6 +687,94 @@ Stdlib::Error Relocate(const LoadCtx& ctx, Stdlib::Printer& out)
     return MakeSuccess();
 }
 
+/* One line of .nos_syms, "<hex offset> <name>", its newline already a NUL */
+bool ParseFunctionLine(char* line, ulong& offset, const char*& name)
+{
+    offset = 0;
+    ulong digits = 0;
+    char* p = line;
+    for (; *p != ' ' && *p != '\0'; p++, digits++)
+    {
+        const u8 nibble = Stdlib::HexCharToNibble(*p);
+        if (nibble > 0xF || digits == MaxHexDigits)
+            return false;
+        offset = (offset << 4) | nibble;
+    }
+
+    if (digits == 0 || *p != ' ' || p[1] == '\0')
+        return false;
+
+    name = p + 1;
+    return true;
+}
+
+/* The function names, into the image's own pages past the segments: an
+   index of offsets there, then the names it points at. Protect leaves them
+   read-only. A table that does not parse -- out of order, or naming offsets
+   outside the image -- is dropped whole, and the module loads nameless. */
+void BuildFunctions(const LoadCtx& ctx, LoadedModule& module)
+{
+    if (ctx.FuncText == nullptr)
+        return;
+
+    ModuleSymbol* index = reinterpret_cast<ModuleSymbol*>(ctx.Base + ctx.ImageSize);
+    char* text = reinterpret_cast<char*>(index + ctx.FuncLines);
+    Stdlib::MemCpy(text, ctx.FuncText, ctx.FuncTextSize);
+    text[ctx.FuncTextSize] = '\0';
+
+    ulong count = 0;
+    char* line = text;
+    char* const end = text + ctx.FuncTextSize;
+    while (line < end)
+    {
+        char* newline = line;
+        while (newline < end && *newline != '\n')
+            newline++;
+        if (newline == end)
+            break;
+        *newline = '\0';
+
+        ulong offset;
+        const char* name;
+        if (!ParseFunctionLine(line, offset, name) || offset >= ctx.ImageSize ||
+            (count != 0 && offset < index[count - 1].Offset))
+        {
+            Trace(0, "module: %s: function table bad at line %u, left out", module.Name, count + 1);
+            return;
+        }
+
+        index[count].Offset = offset;
+        index[count].Name = name;
+        count++;
+        line = newline + 1;
+    }
+
+    module.Symbols = index;
+    module.SymbolCount = count;
+}
+
+/* The function offset lies in: the last one starting at or before it, if
+   offset is in code at all */
+const ModuleSymbol* FindFunction(const LoadedModule& module, ulong offset)
+{
+    if (module.SymbolCount == 0 || offset >= module.TextEnd ||
+        offset < module.Symbols[0].Offset)
+        return nullptr;
+
+    ulong lo = 0;
+    ulong hi = module.SymbolCount;
+    while (hi - lo > 1)
+    {
+        const ulong mid = lo + (hi - lo) / 2;
+        if (module.Symbols[mid].Offset <= offset)
+            lo = mid;
+        else
+            hi = mid;
+    }
+
+    return &module.Symbols[lo];
+}
+
 const ModuleInfo* FindInfo(const LoadCtx& ctx, Stdlib::Printer& out)
 {
     for (ulong i = 1; i < ctx.SymCount; i++)
@@ -595,70 +871,27 @@ Stdlib::Error CheckInfo(const LoadCtx& ctx, const ModuleInfo& info, LoadedModule
     return MakeSuccess();
 }
 
-/* Pages of its own for the image, mapped writable into one run of kernel VA
-   -- Protect gives each segment its own permissions once it is filled in.
-   They need not be physically contiguous. */
+/* The image's pages -- the segments, and after them the function names, if
+   the .ko has any -- mapped writable into one run of kernel VA. Protect gives
+   each segment its own permissions once it is filled in. */
 Stdlib::Error MapImage(LoadCtx& ctx, LoadedModule& module, Stdlib::Printer& out)
 {
-    auto& pt = Mm::PageTable::GetInstance();
-    const ulong count = ctx.ImageSize / Const::PageSize;
+    ulong bytes = ctx.ImageSize;
+    if (ctx.FuncText != nullptr)
+        bytes += ctx.FuncLines * sizeof(ModuleSymbol) + ctx.FuncTextSize + 1;
 
-    module.Pages = static_cast<Mm::Page**>(Mm::Alloc(count * sizeof(Mm::Page*), Tag));
-    ulong* phys = static_cast<ulong*>(Mm::Alloc(count * sizeof(ulong), Tag));
-    if (module.Pages == nullptr || phys == nullptr)
+    if (!AllocPageRun(module.Image, bytes))
     {
-        if (phys != nullptr)
-            Mm::Free(phys);
-        out.Printf("module: out of memory\n");
+        out.Printf("module: no memory for a %u KiB image\n", bytes / Const::KB);
         return MakeError(Stdlib::Error::NoMemory);
     }
 
-    for (ulong i = 0; i < count; i++)
-    {
-        Mm::Page* page = pt.AllocPage();
-        if (page == nullptr)
-            break;
-
-        module.Pages[i] = page;
-        module.PageCount++;
-        phys[i] = page->GetPhyAddress();
-    }
-
-    void* va = nullptr;
-    if (module.PageCount == count)
-        va = Mm::MapPages(count, phys);
-    Mm::Free(phys);
-
-    if (va == nullptr)
-    {
-        out.Printf("module: no memory for a %u KiB image\n", ctx.ImageSize / Const::KB);
-        return MakeError(Stdlib::Error::NoMemory);
-    }
-
-    module.Base = reinterpret_cast<ulong>(va);
-    ctx.Base = module.Base;
-    Stdlib::MemSet(va, 0, ctx.ImageSize);
+    ctx.Base = module.Image.Base;
+    ctx.RunSize = module.Image.Count * Const::PageSize;
+    module.ImageSize = ctx.ImageSize;
+    module.TextEnd = ctx.TextEnd;
+    Stdlib::MemSet(reinterpret_cast<void*>(ctx.Base), 0, ctx.RunSize);
     return MakeSuccess();
-}
-
-/* Undo MapImage, whatever part of it happened. Unmapping takes the page
-   permissions with the PTEs and shoots down every CPU's TLB. */
-void ReleaseImage(LoadedModule& module)
-{
-    auto& pt = Mm::PageTable::GetInstance();
-
-    if (module.Base != 0)
-        Mm::UnmapPages(reinterpret_cast<void*>(module.Base), module.PageCount);
-
-    for (ulong i = 0; i < module.PageCount; i++)
-        pt.FreePage(module.Pages[i]);
-
-    if (module.Pages != nullptr)
-        Mm::Free(module.Pages);
-
-    module.Base = 0;
-    module.PageCount = 0;
-    module.Pages = nullptr;
 }
 
 /* Each segment's permissions from its program header. Only then is the code
@@ -667,9 +900,8 @@ Stdlib::Error Protect(const LoadCtx& ctx, Stdlib::Printer& out)
 {
     auto& pt = Mm::PageTable::GetInstance();
 
-    /* A page no segment claims (there are none, the way the Makefile links)
-       is left read-only */
-    bool ok = pt.SetRangeProtection(ctx.Base, ctx.ImageSize, false, false);
+    /* What no segment claims -- the function names -- is left read-only */
+    bool ok = pt.SetRangeProtection(ctx.Base, ctx.RunSize, false, false);
     for (ulong i = 0; ok && i < ctx.Header->Phnum; i++)
     {
         const Elf::Phdr& ph = ctx.Phdrs[i];
@@ -685,7 +917,7 @@ Stdlib::Error Protect(const LoadCtx& ctx, Stdlib::Printer& out)
     }
 
     /* SetRangeProtection flushes only this CPU's TLB */
-    CpuTable::GetInstance().InvalidateTlbRange(ctx.Base, ctx.ImageSize / Const::PageSize);
+    CpuTable::GetInstance().InvalidateTlbRange(ctx.Base, ctx.RunSize / Const::PageSize);
 
     if (!ok)
     {
@@ -704,8 +936,8 @@ Stdlib::Error Protect(const LoadCtx& ctx, Stdlib::Printer& out)
 }
 
 /* Everything between the checks on the file and the module's init: the
-   image mapped, filled and relocated, its header checked, its permissions
-   set. On failure the caller releases the image. */
+   image mapped, filled and relocated, its function names indexed, its header
+   checked, its permissions set. On failure the caller releases the image. */
 Stdlib::Error Prepare(LoadCtx& ctx, LoadedModule& module, const ModuleInfo*& info,
     Stdlib::Printer& out)
 {
@@ -713,7 +945,7 @@ Stdlib::Error Prepare(LoadCtx& ctx, LoadedModule& module, const ModuleInfo*& inf
     if (!err.Ok())
         return err;
 
-    /* The pages came zeroed, which is what a segment's tail past its file
+    /* The pages are zeroed, which is what a segment's tail past its file
        contents -- .bss -- has to be */
     for (ulong i = 0; i < ctx.Header->Phnum; i++)
     {
@@ -735,12 +967,64 @@ Stdlib::Error Prepare(LoadCtx& ctx, LoadedModule& module, const ModuleInfo*& inf
     if (!err.Ok())
         return err;
 
+    BuildFunctions(ctx, module);
     return Protect(ctx, out);
+}
+
+/* An insmod or rmmod handed to a task of its own, and what the task has to
+   say about it. Two references: the task's, and the one of whoever started
+   it, who may stop waiting before the task is done. */
+struct ModuleJob
+{
+    ModuleJob(bool unload, const char* arg)
+        : Refs(2)
+        , State(JobRunning)
+        , Unload(unload)
+        , Result(Stdlib::Error::Success)
+    {
+        /* StartJob has seen to it that arg fits */
+        Stdlib::MemCpy(Arg, arg, Stdlib::StrLen(arg) + 1);
+        Output[0] = '\0';
+    }
+
+    Atomic Refs;
+    Atomic State;   /* JobRunning, then JobDone or JobAbandoned */
+    bool Unload;
+    int Result;
+    char Arg[ModuleTable::PathMax + 1];
+    char Output[JobOutputSize];
+};
+
+void PutJob(ModuleJob* job)
+{
+    if (job->Refs.DecAndTest())
+        Mm::Free(job);
+}
+
+void RunJob(void* ctx)
+{
+    ModuleJob* job = static_cast<ModuleJob*>(ctx);
+    auto& modules = ModuleTable::GetInstance();
+
+    Stdlib::BufferPrinter out(job->Output, sizeof(job->Output));
+    Stdlib::Error err = job->Unload ? modules.Unload(job->Arg, out) : modules.LoadFile(job->Arg, out);
+    job->Result = err.GetCode();
+
+    /* Handed over -- unless whoever started this has stopped waiting, and then
+       the kernel log is where it can still be read */
+    if (job->State.Cmpxchg(JobDone, JobRunning) != JobRunning)
+    {
+        Trace(0, "module: %s %s, done in the background, error %u: %s",
+            job->Unload ? "rmmod" : "insmod", job->Arg, (ulong)job->Result, job->Output);
+    }
+
+    PutJob(job);
 }
 
 }
 
 ModuleTable::ModuleTable()
+    : Lock(false)
 {
     List.Init();
 }
@@ -761,6 +1045,13 @@ LoadedModule* ModuleTable::FindLocked(const char* name)
     return nullptr;
 }
 
+void ModuleTable::Remove(LoadedModule* module)
+{
+    const ulong flags = Lock.LockIrqSave();
+    module->ListEntry.RemoveInit();
+    Lock.UnlockIrqRestore(flags);
+}
+
 Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& out)
 {
     LoadCtx ctx(image, size);
@@ -775,6 +1066,8 @@ Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& 
     if (!err.Ok())
         return err;
 
+    FindFunctions(ctx);
+
     LoadedModule* module = Mm::TAlloc<LoadedModule, Tag>();
     if (module == nullptr)
     {
@@ -784,39 +1077,69 @@ Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& 
     module->Imports = ctx.Imports;
     module->PermanentBy = ctx.PermanentBy;
 
-    Stdlib::AutoLock lock(Lock);
-
     const ModuleInfo* info = nullptr;
     err = Prepare(ctx, *module, info, out);
-    if (err.Ok() && FindLocked(module->Name) != nullptr)
-    {
-        out.Printf("module: %s is already loaded\n", module->Name);
-        err = MakeError(Stdlib::Error::AlreadyExists);
-    }
-
-    if (err.Ok())
-    {
-        module->State = info->Init();
-        if (module->State == nullptr)
-        {
-            out.Printf("module: %s: init failed\n", module->Name);
-            err = MakeError(Stdlib::Error::Unsuccessful);
-        }
-    }
-
     if (!err.Ok())
     {
-        ReleaseImage(*module);
-        Mm::Free(module);
+        ReleaseModule(module);
         return err;
     }
 
-    module->Exit = info->Exit;
-    List.InsertTail(&module->ListEntry);
+    /* On the list while its init runs -- a backtrace from inside it can name
+       it -- unless the name is taken, whatever that module is doing */
+    bool taken;
+    ModulePhase phase = ModulePhase::Live;
+    {
+        const ulong flags = Lock.LockIrqSave();
+        LoadedModule* other = FindLocked(module->Name);
+        taken = (other != nullptr);
+        if (taken)
+            phase = other->Phase;
+        else
+            List.InsertTail(&module->ListEntry);
+        Lock.UnlockIrqRestore(flags);
+    }
 
-    Trace(0, "module: %s loaded at 0x%p, %u KiB, %u kernel imports", module->Name,
-        module->Base, (module->PageCount * Const::PageSize) / Const::KB, module->Imports);
-    out.Printf("module: %s loaded at 0x%p\n", module->Name, module->Base);
+    if (taken)
+    {
+        out.Printf("module: %s is %s\n", module->Name,
+            (phase == ModulePhase::Live) ? "already loaded" : PhaseText(phase));
+        ReleaseModule(module);
+        return MakeError(Stdlib::Error::AlreadyExists);
+    }
+
+    /* Once it is Live another task may unload it at any moment: what is
+       said about it here is said from copies */
+    char name[NameMax + 1];
+    Stdlib::MemCpy(name, module->Name, sizeof(name));
+    const ulong base = module->Image.Base;
+    const ulong kib = module->ImageSize / Const::KB;
+    const ulong imports = module->Imports;
+    const ulong functions = module->SymbolCount;
+
+    module->Exit = info->Exit;
+    module->Instance = info->Init();
+    const bool live = (module->Instance != nullptr);
+
+    {
+        const ulong flags = Lock.LockIrqSave();
+        if (live)
+            module->Phase = ModulePhase::Live;
+        else
+            module->ListEntry.RemoveInit();
+        Lock.UnlockIrqRestore(flags);
+    }
+
+    if (!live)
+    {
+        out.Printf("module: %s: init failed\n", name);
+        ReleaseModule(module);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    Trace(0, "module: %s loaded at 0x%p, %u KiB, %u kernel imports, %u functions named",
+        name, base, kib, imports, functions);
+    out.Printf("module: %s loaded at 0x%p\n", name, base);
     return MakeSuccess();
 }
 
@@ -839,21 +1162,22 @@ Stdlib::Error ModuleTable::LoadFile(const char* path, Stdlib::Printer& out)
         return MakeError(Stdlib::Error::BadSize);
     }
 
-    /* Mm::Alloc hands out a block this size page-aligned, and anything
-       smaller 8-byte aligned: either suits Load */
-    u8* buf = static_cast<u8*>(Mm::Alloc(size, Tag));
-    if (buf == nullptr)
+    /* A run of pages, page-aligned: what Load wants, and as big as a module
+       may be, where the heap stops at 512 KiB */
+    ModulePageRun buf;
+    if (!AllocPageRun(buf, size))
     {
         vfs.Close(file);
         out.Printf("module: no memory to read %s\n", path);
         return MakeError(Stdlib::Error::NoMemory);
     }
 
+    u8* data = reinterpret_cast<u8*>(buf.Base);
     ulong done = 0;
     while (done < size)
     {
         ulong got = 0;
-        if (!vfs.Read(file, buf + done, size - done, got) || got == 0)
+        if (!vfs.Read(file, data + done, size - done, got) || got == 0)
             break;
         done += got;
     }
@@ -862,7 +1186,7 @@ Stdlib::Error ModuleTable::LoadFile(const char* path, Stdlib::Printer& out)
     Stdlib::Error err;
     if (done == size)
     {
-        err = Load(buf, size, out);
+        err = Load(data, size, out);
     }
     else
     {
@@ -870,90 +1194,276 @@ Stdlib::Error ModuleTable::LoadFile(const char* path, Stdlib::Printer& out)
         err = MakeError(Stdlib::Error::IO);
     }
 
-    Mm::Free(buf);
+    FreePageRun(buf);
     return err;
-}
-
-void ModuleTable::UnloadLocked(LoadedModule* module)
-{
-    /* The module's state goes, and everything the module holds with it: exit
-       returns once the commands it registered are gone and no call into it is
-       still running (kernel_cmd_unregister waits those out). Only then may its
-       code go. */
-    module->ListEntry.RemoveInit();
-    module->Exit(module->State);
-
-    Trace(0, "module: %s unloaded", module->Name);
-
-    ReleaseImage(*module);
-    Mm::Free(module);
 }
 
 Stdlib::Error ModuleTable::Unload(const char* name, Stdlib::Printer& out)
 {
-    Stdlib::AutoLock lock(Lock);
+    LoadedModule* module;
+    ModulePhase phase = ModulePhase::Live;
+    const char* permanentBy = nullptr;
+    {
+        const ulong flags = Lock.LockIrqSave();
+        module = FindLocked(name);
+        if (module != nullptr)
+        {
+            phase = module->Phase;
+            permanentBy = module->PermanentBy;
+            if (phase == ModulePhase::Live && permanentBy == nullptr)
+                module->Phase = ModulePhase::Unloading;
+        }
+        Lock.UnlockIrqRestore(flags);
+    }
 
-    LoadedModule* module = FindLocked(name);
     if (module == nullptr)
     {
         out.Printf("module: %s is not loaded\n", name);
         return MakeError(Stdlib::Error::NotFound);
     }
 
-    if (module->PermanentBy != nullptr)
+    if (phase != ModulePhase::Live)
     {
-        out.Printf("module: %s is permanent: it imports %s, which nothing undoes\n",
-            module->Name, module->PermanentBy);
+        out.Printf("module: %s is %s already\n", name, PhaseText(phase));
         return MakeError(Stdlib::Error::InvalidState);
     }
 
-    UnloadLocked(module);
+    if (permanentBy != nullptr)
+    {
+        out.Printf("module: %s is permanent: it imports %s, which nothing undoes\n",
+            name, permanentBy);
+        return MakeError(Stdlib::Error::InvalidState);
+    }
+
+    /* The module's state goes, and everything the module holds with it: exit
+       returns once the commands it registered are gone and no call into it is
+       still running (kernel_cmd_unregister waits those out). Only then may its
+       code go. Nothing is held meanwhile: this may take a while. */
+    module->Exit(module->Instance);
+    Remove(module);
+    ReleaseModule(module);
+
+    Trace(0, "module: %s unloaded", name);
     out.Printf("module: %s unloaded\n", name);
     return MakeSuccess();
 }
 
 void ModuleTable::UnloadAll()
 {
-    Stdlib::AutoLock lock(Lock);
-
-    /* Newest first: the reverse of the order they came in */
-    Stdlib::ListEntry* entry = List.Blink;
-    while (entry != &List)
+    for (;;)
     {
-        LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, ListEntry);
-        entry = entry->Blink;
+        /* Newest first: the reverse of the order they came in */
+        LoadedModule* module = nullptr;
+        {
+            const ulong flags = Lock.LockIrqSave();
+            for (Stdlib::ListEntry* entry = List.Blink; entry != &List; entry = entry->Blink)
+            {
+                LoadedModule* candidate = CONTAINING_RECORD(entry, LoadedModule, ListEntry);
+                if (candidate->Phase == ModulePhase::Live && candidate->PermanentBy == nullptr)
+                {
+                    candidate->Phase = ModulePhase::Unloading;
+                    module = candidate;
+                    break;
+                }
+            }
+            Lock.UnlockIrqRestore(flags);
+        }
 
-        if (module->PermanentBy != nullptr)
-            Trace(0, "module: %s is permanent, left loaded", module->Name);
-        else
-            UnloadLocked(module);
+        if (module == nullptr)
+            break;
+
+        char name[NameMax + 1];
+        Stdlib::MemCpy(name, module->Name, sizeof(name));
+        module->Exit(module->Instance);
+        Remove(module);
+        ReleaseModule(module);
+        Trace(0, "module: %s unloaded", name);
     }
+
+    ulong left = 0;
+    {
+        const ulong flags = Lock.LockIrqSave();
+        for (Stdlib::ListEntry* entry = List.Flink; entry != &List; entry = entry->Flink)
+            left++;
+        Lock.UnlockIrqRestore(flags);
+    }
+
+    if (left != 0)
+        Trace(0, "module: %u left loaded: permanent, or in another task's hands", left);
+}
+
+void ModuleTable::StartLoad(const char* path, Stdlib::Printer& out)
+{
+    StartJob(false, path, out);
+}
+
+void ModuleTable::StartUnload(const char* name, Stdlib::Printer& out)
+{
+    StartJob(true, name, out);
+}
+
+void ModuleTable::StartJob(bool unload, const char* arg, Stdlib::Printer& out)
+{
+    const char* what = unload ? "rmmod" : "insmod";
+    if (Stdlib::StrLen(arg) > PathMax)
+    {
+        out.Printf("%s: %s is too long\n", what, arg);
+        return;
+    }
+
+    ModuleJob* job = Mm::TAlloc<ModuleJob, Tag>(unload, arg);
+    Task* task = (job != nullptr) ? Mm::TAlloc<Task, Tag>("%s", what) : nullptr;
+    if (task == nullptr || !task->Start(RunJob, job))
+    {
+        /* Never ran: no one else holds the job */
+        if (task != nullptr)
+            task->Put();
+        if (job != nullptr)
+            Mm::Free(job);
+        out.Printf("%s: cannot start a task for it\n", what);
+        return;
+    }
+
+    /* The run queue keeps a reference of its own until the task has exited */
+    task->Put();
+
+    for (ulong waited = 0; waited < ShellWaitMs && job->State.Get() == JobRunning;
+         waited += JobPollMs)
+        Sleep(JobPollMs * Const::NanoSecsInMs);
+
+    if (job->State.Cmpxchg(JobAbandoned, JobRunning) == JobRunning)
+    {
+        out.Printf("%s: %s is taking its time and goes on in the background --"
+            " lsmod shows where it is, the kernel log will say how it ended\n", what, arg);
+    }
+    else
+    {
+        out.PrintString(job->Output);
+        if (job->Result != Stdlib::Error::Success)
+            out.Printf("%s: %s failed, error %u\n", what, arg, (ulong)job->Result);
+    }
+
+    PutJob(job);
 }
 
 bool ModuleTable::IsLoaded(const char* name)
 {
-    Stdlib::AutoLock lock(Lock);
-
-    return FindLocked(name) != nullptr;
+    const ulong flags = Lock.LockIrqSave();
+    const bool loaded = (FindLocked(name) != nullptr);
+    Lock.UnlockIrqRestore(flags);
+    return loaded;
 }
 
 void ModuleTable::Dump(Stdlib::Printer& out)
 {
-    Stdlib::AutoLock lock(Lock);
-
-    if (List.IsEmpty())
+    /* A module at a time, copied under the lock and printed without it: a
+       console line can take a while */
+    ulong shown = 0;
+    for (;; shown++)
     {
-        out.Printf("no modules loaded\n");
-        return;
+        char name[NameMax + 1];
+        ulong base = 0;
+        ulong kib = 0;
+        ulong imports = 0;
+        ModulePhase phase = ModulePhase::Live;
+        bool permanent = false;
+        bool found = false;
+
+        {
+            const ulong flags = Lock.LockIrqSave();
+            ulong i = 0;
+            for (Stdlib::ListEntry* entry = List.Flink; entry != &List; entry = entry->Flink, i++)
+            {
+                if (i != shown)
+                    continue;
+
+                const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, ListEntry);
+                Stdlib::MemCpy(name, module->Name, sizeof(name));
+                base = module->Image.Base;
+                kib = (module->Image.Count * Const::PageSize) / Const::KB;
+                imports = module->Imports;
+                phase = module->Phase;
+                permanent = (module->PermanentBy != nullptr);
+                found = true;
+                break;
+            }
+            Lock.UnlockIrqRestore(flags);
+        }
+
+        if (!found)
+            break;
+
+        out.Printf("%s  %u KiB at 0x%p, %u kernel imports%s%s\n", name, kib, base, imports,
+            permanent ? ", permanent" : "",
+            (phase == ModulePhase::Loading) ? ", loading" :
+            (phase == ModulePhase::Unloading) ? ", unloading" : "");
     }
 
+    if (shown == 0)
+        out.Printf("no modules loaded\n");
+}
+
+bool ModuleTable::Describe(ulong addr, char* buf, ulong size)
+{
+    bool acquired = false;
+    const ulong flags = Lock.TryLockIrqSave(acquired);
+    if (!acquired)
+    {
+        PreemptIrqRestore(flags);
+        return false;
+    }
+
+    bool found = false;
     for (Stdlib::ListEntry* entry = List.Flink; entry != &List; entry = entry->Flink)
     {
-        LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, ListEntry);
-        out.Printf("%s  %u KiB at 0x%p, %u kernel imports%s\n", module->Name,
-            (module->PageCount * Const::PageSize) / Const::KB, module->Base, module->Imports,
-            (module->PermanentBy != nullptr) ? ", permanent" : "");
+        const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, ListEntry);
+        if (addr < module->Image.Base || addr >= module->Image.Base + module->ImageSize)
+            continue;
+
+        const ulong offset = addr - module->Image.Base;
+        const ModuleSymbol* function = FindFunction(*module, offset);
+        if (function != nullptr)
+            Stdlib::SnPrintf(buf, size, "%s+0x%p [%s]", function->Name,
+                offset - function->Offset, module->Name);
+        else
+            Stdlib::SnPrintf(buf, size, "[%s]+0x%p", module->Name, offset);
+        found = true;
+        break;
     }
+
+    Lock.UnlockIrqRestore(flags);
+    return found;
+}
+
+bool ModuleTable::DescribeAll(char* buf, ulong size)
+{
+    if (size == 0)
+        return false;
+
+    bool acquired = false;
+    const ulong flags = Lock.TryLockIrqSave(acquired);
+    if (!acquired)
+    {
+        PreemptIrqRestore(flags);
+        return false;
+    }
+
+    buf[0] = '\0';
+    ulong pos = 0;
+    bool any = false;
+    for (Stdlib::ListEntry* entry = List.Flink; entry != &List && pos + 1 < size;
+         entry = entry->Flink)
+    {
+        const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, ListEntry);
+        Stdlib::SnPrintf(buf + pos, size - pos, "%s%s 0x%p+0x%p", any ? ", " : "",
+            module->Name, module->Image.Base, module->ImageSize);
+        buf[size - 1] = '\0';
+        pos += Stdlib::StrLen(buf + pos);
+        any = true;
+    }
+
+    Lock.UnlockIrqRestore(flags);
+    return any;
 }
 
 }

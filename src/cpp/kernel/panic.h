@@ -54,6 +54,7 @@ private:
     void PrintOutput(const char* str);
     void DumpContext();
     void DumpBacktrace(ulong* frames, size_t count);
+    void DumpModules();
 
     char Message[256];
     Atomic Active;

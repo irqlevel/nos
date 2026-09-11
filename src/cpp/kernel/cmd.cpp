@@ -2737,10 +2737,9 @@ static void DumpStackTrace(ulong* frames, size_t count, Stdlib::Printer& con)
     auto& symtab = SymbolTable::GetInstance();
     for (size_t i = 0; i < count; i++)
     {
-        const char* name;
-        ulong offset;
-        if (symtab.Resolve(frames[i], name, offset))
-            con.Printf("  [%u] 0x%p %s+0x%p\n", (ulong)i, frames[i], name, offset);
+        char where[SymbolTable::DescribeMax];
+        if (symtab.Describe(frames[i], where, sizeof(where)))
+            con.Printf("  [%u] 0x%p %s\n", (ulong)i, frames[i], where);
         else
             con.Printf("  [%u] 0x%p\n", (ulong)i, frames[i]);
     }
@@ -2899,7 +2898,8 @@ static void CmdPanic(const char* args, Stdlib::Printer& con)
     }
 }
 
-/* The loader prints why a module was refused; these add how it ended */
+/* Each in a task of its own, which the shell waits for only so long: an
+   unload waits out a module command still running, however long it runs */
 static void CmdInsmod(const char* args, Stdlib::Printer& con)
 {
     if (args[0] == '\0')
@@ -2908,9 +2908,7 @@ static void CmdInsmod(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    auto err = ModuleTable::GetInstance().LoadFile(args, con);
-    if (!err.Ok())
-        con.Printf("insmod: %s not loaded, error %u\n", args, (ulong)err.GetCode());
+    ModuleTable::GetInstance().StartLoad(args, con);
 }
 
 static void CmdRmmod(const char* args, Stdlib::Printer& con)
@@ -2921,9 +2919,7 @@ static void CmdRmmod(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    auto err = ModuleTable::GetInstance().Unload(args, con);
-    if (!err.Ok())
-        con.Printf("rmmod: %s not unloaded, error %u\n", args, (ulong)err.GetCode());
+    ModuleTable::GetInstance().StartUnload(args, con);
 }
 
 static void CmdLsmod(const char* args, Stdlib::Printer& con)

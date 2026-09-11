@@ -463,6 +463,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-slowexit"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+]
+
+[[package]]
 name = "num-bigint-dig"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

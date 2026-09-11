@@ -120,6 +120,11 @@ The staticlib is then linked into an ELF shared object:
 - `-z now`, `-z norelro`: every import is bound at load time, and there is no
   lazy binding and no dynamic linker to protect anything from.
 
+Last, `llvm-nm -n -C` lists the module's functions, demangled, and
+`llvm-objcopy` adds the list to the `.ko` as a `.nos_syms` section -- what
+backtraces name a module's frames with (below). Rust's v0 names would need a
+demangler in the kernel otherwise.
+
 `hello.ko` comes out around 25 KiB.
 
 ## Loading
@@ -138,9 +143,12 @@ a fresh root image with `scripts/mkrootfs.sh <image> <MiB> <dir>`. The loader
    kernel cannot satisfy is refused with the list of everything it lacks. A
    weak import may go unresolved and binds to 0.
 3. **maps the image**: pages of its own, which need not be physically
-   contiguous, mapped read-write and non-executable into one run of kernel
-   virtual addresses. The segments are copied in; the zeroed tail of the last
-   is `.bss`.
+   contiguous, mapped writable into one run of kernel virtual addresses --
+   from a window of 16 MiB blocks set aside for runs the page allocator's own
+   blocks, 512 KiB at most, cannot hold (`Mm::MapLargePages`). The segments
+   are copied in; the zeroed tail of the last is `.bss`. The function names
+   from `.nos_syms` go into the same pages, past the segments, indexed by
+   offset.
 4. **relocates it**: every `RELA` section the loader is meant to see (`.rela.dyn`,
    `.rela.plt`). Three kinds of relocation reach it, and the architecture
    says which is which (`Hal::ClassifyModuleReloc`):
@@ -173,8 +181,29 @@ before it returns, so the code under a running command is never freed.
 `rmmod` must not be run from the module's own command, which would wait for
 itself.
 
-Loads and unloads run in task context, one at a time: a module's init and exit
-may sleep.
+Loads and unloads run in task context: a module's init and exit may sleep,
+and an exit that waits out a command still running may take as long as that
+command does. So nothing is held across an init or an exit. The table's lock
+covers looking a module up and moving it from one phase to the next --
+loading, live, unloading -- and nothing else: a load or unload that takes its
+time holds up no other, and `lsmod` never waits. A module is on the list
+while its init runs, so a second `insmod` of it is refused, as is an `rmmod`
+of one still loading or already unloading.
+
+`insmod` and `rmmod` each hand the work to a task of their own and wait for it
+at most five seconds (`ModuleTable::ShellWaitMs`). What the loader says is
+printed when it is done by then. When it is not -- an unload waiting on a
+command, say -- the shell says so and gets its prompt back; `lsmod` shows the
+module as unloading meanwhile, and the kernel log says how it ended:
+
+```
+$ rmmod slowexit
+rmmod: slowexit is taking its time and goes on in the background -- lsmod shows where it is, the kernel log will say how it ended
+$ lsmod
+slowexit  12 KiB at 0xFFFF8000..., 5 kernel imports, unloading
+$ dmesg 5 module:
+... module: rmmod slowexit, done in the background, error 0: module: slowexit unloaded
+```
 
 `poweroff` and `reboot` unload every module that can be unloaded, newest
 first, once the shells have stopped and before the filesystems are unmounted
@@ -205,31 +234,59 @@ module: built against another kernel interface (ffi 3fa81c..., this kernel 9b02e
 A module built outside the Makefile carries `unset` and is refused by a kernel
 that was not.
 
+## Backtraces
+
+A frame in a module's code is named like the kernel's own, with the module
+after it -- in the panic report, in `bt` and in the profiler's call chains:
+
+```
+Backtrace:
+  [0] 0xFFFF800012DA1C40 mod_hello::init::{closure#0}+0x3c [hello]
+  [1] 0xFFFF80000104A2F1 Kernel::Cmd::DispatchDynamic+0xd1
+...
+Modules: hello 0xFFFF800012DA0000+0x5000
+```
+
+`SymbolTable::Describe` asks the kernel's table first -- which now answers
+only for an address in the kernel's text, rather than naming whatever lies
+past its last function after that function -- and then the module table,
+whose names come from each module's `.nos_syms`. The name is copied out under
+the table's lock, since the module may be unloaded right after; the lock is
+only tried, never waited on, so a panic can ask too. The panic report ends
+with where each module sits (`Modules:`), which places any frame the list
+could not name.
+
 ## Testing
 
 The boot self-test loads a module on both architectures. `modtest`
 (`src/rust/modules/modtest`) is built with the kernel and embedded in its
 image (`out/<arch>/modtest_blob.S`); `TestModules` in `kernel/test.cpp` loads
 it, and its init checks what a loader can get wrong -- initialised data,
-`.bss`, a table of function pointers, a trait object's vtable, allocations
-from the kernel heap, a kernel object created and destroyed through the export
-table -- and fails the load if anything comes out wrong. The test then runs
-the command the module registered through the shell's dispatcher, checks a
-second copy is refused, unloads it and checks the command went with it, twice;
-and last feeds the loader damaged copies -- truncated, another machine's, an
-import the kernel lacks, no header, a bad magic, another kernel interface --
-each of which it must refuse.
+`.bss` (a megabyte of it, past the 512 KiB images were once held to), a
+table of function pointers, a trait object's vtable, allocations from the
+kernel heap, a kernel object created and destroyed through the export table
+-- and fails the load if anything comes out wrong. The test then runs the
+command the module registered through the shell's dispatcher, has the
+symbolizer name the function whose address the command prints, checks a
+second copy is refused, unloads it and checks the command went with it,
+twice; and last feeds the loader damaged copies -- truncated, another
+machine's, an import the kernel lacks, no header, a bad magic, another kernel
+interface -- each of which it must refuse.
+
+`slowexit` (`src/rust/modules/slowexit`) is never loaded by the kernel itself:
+its exit takes eight seconds, for testing an `rmmod` that outlasts the
+shell's wait by hand or from a script.
 
 ## Limits
 
-- A module's image is at most 512 KiB (`PageTable::MaxContiguousPages`
-  pages): the largest block the page allocator maps in one piece. So is the
-  `.ko` file.
+- A module's image, function names included, is at most 16 MiB
+  (`PageTable::MaxLargeMapPages` pages), and so is the `.ko` file. The window
+  they are mapped from holds 63 such runs at a time.
 - A module that registers a block device, a net device or a softirq handler
   cannot be unloaded (above).
-- `rmmod` waits for a running call of the module's commands; one that never
-  returns keeps `rmmod` -- and every `insmod`, `rmmod` and `lsmod` after it,
-  which queue on the same lock -- waiting with it.
+- An unload waits for a running call of the module's commands for as long as
+  it runs -- in a task of its own, so it holds up nothing else, but a command
+  that never returns leaves its module unloading for good.
 - Modules cannot call each other; each carries its own `kcore`, so they share
   no statics either.
 - Only the functions `ffi` declares are exported -- not C++ classes, not

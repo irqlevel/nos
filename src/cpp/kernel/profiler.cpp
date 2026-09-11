@@ -259,6 +259,11 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
                 if (chains[c].LeafName != leafName)
                     continue;
 
+                /* No name to fold by -- a loadable module's code, or nobody's
+                   -- and the address is all there is */
+                if (leafName == nullptr && chains[c].Frame[0] != record.Frame[0])
+                    continue;
+
                 ulong f = 1;
                 for (; f < depth; f++)
                 {
@@ -280,7 +285,7 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
 
                 chains[c].Depth = depth;
                 chains[c].LeafName = leafName;
-                for (ulong f = 1; f < depth; f++)
+                for (ulong f = 0; f < depth; f++)
                     chains[c].Frame[f] = record.Frame[f];
                 chains[c].Count = 0;
                 chains[c].LeafLow = leafOffset;
@@ -344,7 +349,16 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
 
         ulong permille = (chains[i].Count * 1000) / total;
 
-        if (chains[i].LeafLow == chains[i].LeafHigh)
+        if (chains[i].LeafName == nullptr)
+        {
+            /* Not the kernel's: named now, if a module still has it */
+            char where[SymbolTable::DescribeMax];
+            if (!symtab.Describe(chains[i].Frame[0], where, sizeof(where)))
+                Stdlib::SnPrintf(where, sizeof(where), "0x%p", chains[i].Frame[0]);
+            printer.Printf("%u.%u%% %u %s\n", permille / 10, permille % 10,
+                chains[i].Count, where);
+        }
+        else if (chains[i].LeafLow == chains[i].LeafHigh)
             printer.Printf("%u.%u%% %u %s+0x%p\n", permille / 10, permille % 10,
                 chains[i].Count, SymbolName(chains[i].LeafName),
                 chains[i].LeafLow);
@@ -359,10 +373,9 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
            backtrace prints, so the two read alike. */
         for (ulong f = 1; f < chains[i].Depth; f++)
         {
-            const char* name;
-            ulong offset;
-            if (symtab.Resolve(chains[i].Frame[f], name, offset))
-                printer.Printf("        <- %s+0x%p\n", name, offset);
+            char where[SymbolTable::DescribeMax];
+            if (symtab.Describe(chains[i].Frame[f], where, sizeof(where)))
+                printer.Printf("        <- %s\n", where);
             else
                 printer.Printf("        <- 0x%p\n", chains[i].Frame[f]);
         }
