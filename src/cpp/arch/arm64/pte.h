@@ -18,8 +18,9 @@ namespace Mm
      are ignored on table descriptors, required on leaves.
    - SetHuge() converts the entry to a BLOCK descriptor (bit1 cleared),
      used for 2MiB mappings at the L2 level — same geometry as x86.
-   - SetWritable() is a no-op: AP[7]=0 (the default) is EL1-RW, and this
-     kernel maps everything writable today (x86 also always sets W).
+   - SetWritable() clears AP[2]: 0 (the default) is EL1-RW, so it matters
+     only to undo SetReadOnly(), which PageTable::SetRangeProtection does
+     (x86 always sets W too).
    - SetCacheDisabled() selects MAIR AttrIndx 1 = Device-nGnRE, clears SH
      (ignored for device memory) and sets PXN|UXN. Default AttrIndx 0 =
      Normal WB.
@@ -94,7 +95,9 @@ struct Pte final
 
     void SetWritable()
     {
-        /* AP[7]=0 (default) is already EL1 read-write */
+        /* AP[2]=0 is EL1 read-write: what a fresh entry already is, and what
+           undoes SetReadOnly() */
+        Value &= ~ApReadOnly;
     }
 
     void SetReadOnly()
@@ -105,6 +108,13 @@ struct Pte final
     void SetNoExecute()
     {
         Value |= PxnBit | UxnBit; /* never executable */
+    }
+
+    void ClearNoExecute()
+    {
+        /* Executable at EL1 only: UXN stays, there is no EL0 to run it */
+        Value &= ~PxnBit;
+        Value |= UxnBit;
     }
 
     void ClearPresent()

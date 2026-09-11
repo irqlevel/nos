@@ -17,6 +17,7 @@
 #include <hal/irq_stubs.h>
 #include "softirq.h"
 #include "timer.h"
+#include "cmd.h"
 #include <mm/new.h>
 #include <mm/page_allocator.h>
 #include <mm/page_table.h>
@@ -32,6 +33,9 @@
 #include <drivers/acpi.h>
 
 static const ulong RustAllocTag = 'rust';
+
+/* kernel_printer_write hands a Printer at most this much at a time */
+static const unsigned long PrinterChunkSize = 128;
 
 extern "C" {
 
@@ -1494,6 +1498,41 @@ bool kernel_hpet_is_available()
 bool kernel_acpi_has_firmware_watchdog()
 {
     return Kernel::Acpi::GetInstance().HasFirmwareWatchdog();
+}
+
+/* Shell commands from Rust, a loadable module's in particular (kcore::cmd).
+   Rust's handler takes the arguments as *const u8, which is the same thing
+   to the ABI as the const char* DynamicHandler is declared with. */
+unsigned long kernel_cmd_register(const unsigned char* name, unsigned long nameLen,
+    const unsigned char* help, unsigned long helpLen,
+    Kernel::Cmd::DynamicHandler handler, void* ctx)
+{
+    return Kernel::Cmd::GetInstance().RegisterDynamic(reinterpret_cast<const char*>(name),
+        nameLen, reinterpret_cast<const char*>(help), helpLen, handler, ctx);
+}
+
+void kernel_cmd_unregister(unsigned long handle)
+{
+    Kernel::Cmd::GetInstance().UnregisterDynamic(handle);
+}
+
+/* out is the Stdlib::Printer a command handler was given */
+void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len)
+{
+    if (out == nullptr || buf == nullptr)
+        return;
+
+    auto* printer = static_cast<Stdlib::Printer*>(out);
+    char chunk[PrinterChunkSize];
+    while (len != 0)
+    {
+        unsigned long n = (len < sizeof(chunk) - 1) ? len : sizeof(chunk) - 1;
+        Stdlib::MemCpy(chunk, buf, n);
+        chunk[n] = '\0';
+        printer->PrintString(chunk);
+        buf += n;
+        len -= n;
+    }
 }
 
 } /* extern "C" */

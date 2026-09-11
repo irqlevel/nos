@@ -30,6 +30,8 @@ src/rust/
     igb/      Intel I210 (igb) gigabit network device driver
   hello/      Rust self-test module
   kernel/     Rust entry points (rust_main, rust_fini), global allocator
+  kmod/       Runtime of a loadable module: allocator, panic handler, the module! header
+  modules/    Loadable modules, each built into a .ko (hello; modtest, which the boot test loads)
 build/        Linker script, GRUB configs
 scripts/      Build, run, debug, and GDB helpers
 ```

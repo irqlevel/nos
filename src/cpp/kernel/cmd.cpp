@@ -37,6 +37,7 @@
 #include "stack_trace.h"
 #include "symtab.h"
 #include "profiler.h"
+#include "module.h"
 
 #include <drivers/vga.h>
 #include <drivers/pci.h>
@@ -2898,6 +2899,39 @@ static void CmdPanic(const char* args, Stdlib::Printer& con)
     }
 }
 
+/* The loader prints why a module was refused; these add how it ended */
+static void CmdInsmod(const char* args, Stdlib::Printer& con)
+{
+    if (args[0] == '\0')
+    {
+        con.Printf("usage: insmod <path>\n");
+        return;
+    }
+
+    auto err = ModuleTable::GetInstance().LoadFile(args, con);
+    if (!err.Ok())
+        con.Printf("insmod: %s not loaded, error %u\n", args, (ulong)err.GetCode());
+}
+
+static void CmdRmmod(const char* args, Stdlib::Printer& con)
+{
+    if (args[0] == '\0')
+    {
+        con.Printf("usage: rmmod <name>\n");
+        return;
+    }
+
+    auto err = ModuleTable::GetInstance().Unload(args, con);
+    if (!err.Ok())
+        con.Printf("rmmod: %s not unloaded, error %u\n", args, (ulong)err.GetCode());
+}
+
+static void CmdLsmod(const char* args, Stdlib::Printer& con)
+{
+    (void)args;
+    ModuleTable::GetInstance().Dump(con);
+}
+
 // Forward declaration - CmdHelp needs the Commands array defined below
 static void CmdHelp(const char* args, Stdlib::Printer& con);
 
@@ -2960,6 +2994,9 @@ static const CmdEntry Commands[] = {
     { "crc32",     CmdCrc32,     "crc32 <path> - CRC-32 of a file" },
     { "sha256",    CmdSha256,    "sha256 <path> - SHA-256 of a file, as sha256sum prints it" },
     { "grubenv",   CmdGrubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
+    { "insmod",    CmdInsmod,    "insmod <path> - load a kernel module (.ko)" },
+    { "rmmod",     CmdRmmod,     "rmmod <name> - unload a kernel module" },
+    { "lsmod",     CmdLsmod,     "lsmod - list the loaded kernel modules" },
     { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
     { "entropy",   CmdEntropy,   "entropy [reseed] - show the random pool and its sources" },
     { "version",   CmdVersion,   "version - show kernel version" },
@@ -2980,6 +3017,8 @@ static void CmdHelp(const char* args, Stdlib::Printer& con)
         if (Commands[i].Help != nullptr)
             con.Printf("%s\n", Commands[i].Help);
     }
+
+    Cmd::GetInstance().DynamicHelp(con);
 }
 
 Cmd::Cmd()
@@ -2987,8 +3026,10 @@ Cmd::Cmd()
     , Shutdown(false)
     , Reboot(false)
     , Active(false)
+    , DynamicGeneration(0)
 {
     CmdLine[0] = '\0';
+    Stdlib::MemSet(Dynamic, 0, sizeof(Dynamic));
 }
 
 Cmd::~Cmd()
@@ -3021,7 +3062,177 @@ void Cmd::Dispatch(const char *cmd, Stdlib::Printer& out)
     }
 
     if (!found)
+        found = GetInstance().DispatchDynamic(cmd, out);
+
+    if (!found)
         out.Printf("command '%s' not found\n", cmd);
+}
+
+bool Cmd::DispatchDynamic(const char* cmd, Stdlib::Printer& out)
+{
+    DynamicHandler handler = nullptr;
+    void* ctx = nullptr;
+    const char* args = "";
+    ulong slot = 0;
+
+    {
+        Stdlib::AutoLock lock(DynamicLock);
+        for (ulong i = 0; i < DynamicMax; i++)
+        {
+            DynamicCmd& entry = Dynamic[i];
+            if (entry.Handle == 0 || entry.Removing)
+                continue;
+
+            ulong nameLen = Stdlib::StrLen(entry.Name);
+            if (Stdlib::StrCmp(cmd, entry.Name) == 0)
+                args = "";
+            else if (Stdlib::MemCmp(cmd, entry.Name, nameLen) == 0 && cmd[nameLen] == ' ')
+                args = cmd + nameLen + 1;
+            else
+                continue;
+
+            entry.Running++;
+            handler = entry.Handler;
+            ctx = entry.Ctx;
+            slot = i;
+            break;
+        }
+    }
+
+    if (handler == nullptr)
+        return false;
+
+    /* Without the lock: the handler is the module's code and may take as
+       long as it likes. Running keeps UnregisterDynamic -- and with it the
+       module's unload -- waiting until it returns. */
+    handler(ctx, args, Stdlib::StrLen(args), &out);
+
+    Stdlib::AutoLock lock(DynamicLock);
+    Dynamic[slot].Running--;
+    return true;
+}
+
+ulong Cmd::RegisterDynamic(const char* name, ulong nameLen, const char* help, ulong helpLen,
+    DynamicHandler handler, void* ctx)
+{
+    if (name == nullptr || handler == nullptr || nameLen == 0 || nameLen > DynamicNameMax)
+        return 0;
+
+    char key[DynamicNameMax + 1];
+    for (ulong i = 0; i < nameLen; i++)
+    {
+        if (name[i] <= ' ' || name[i] > '~')
+            return 0;
+        key[i] = name[i];
+    }
+    key[nameLen] = '\0';
+
+    for (ulong i = 0; Commands[i].Name != nullptr; i++)
+    {
+        if (Stdlib::StrCmp(Commands[i].Name, key) == 0)
+            return 0;
+    }
+
+    Stdlib::AutoLock lock(DynamicLock);
+
+    DynamicCmd* entry = nullptr;
+    ulong slot = 0;
+    for (ulong i = 0; i < DynamicMax; i++)
+    {
+        if (Dynamic[i].Handle == 0)
+        {
+            if (entry == nullptr)
+            {
+                entry = &Dynamic[i];
+                slot = i;
+            }
+        }
+        else if (Stdlib::StrCmp(Dynamic[i].Name, key) == 0)
+        {
+            return 0;
+        }
+    }
+
+    if (entry == nullptr)
+        return 0;
+
+    ulong helpCopy = (help != nullptr) ? helpLen : 0;
+    if (helpCopy > DynamicHelpMax)
+        helpCopy = DynamicHelpMax;
+    for (ulong i = 0; i < helpCopy; i++)
+        entry->Help[i] = (help[i] >= ' ' && help[i] <= '~') ? help[i] : '?';
+    entry->Help[helpCopy] = '\0';
+
+    Stdlib::MemCpy(entry->Name, key, nameLen + 1);
+    entry->Handler = handler;
+    entry->Ctx = ctx;
+    entry->Running = 0;
+    entry->Removing = false;
+    DynamicGeneration++;
+    entry->Handle = (DynamicGeneration << DynamicSlotBits) | (slot + 1);
+    return entry->Handle;
+}
+
+void Cmd::UnregisterDynamic(ulong handle)
+{
+    const ulong index = handle & ((1UL << DynamicSlotBits) - 1);
+    if (index == 0 || index > DynamicMax)
+        return;
+
+    DynamicCmd& entry = Dynamic[index - 1];
+    {
+        Stdlib::AutoLock lock(DynamicLock);
+        if (entry.Handle != handle)
+            return;
+        entry.Removing = true;
+    }
+
+    /* Wait out the calls already made: the module may free the handler's ctx,
+       and unload its code, the moment this returns */
+    for (;;)
+    {
+        {
+            Stdlib::AutoLock lock(DynamicLock);
+
+            /* A second unregister of the same handle may have finished first
+               and the slot found a new user since: not ours to clear */
+            if (entry.Handle != handle)
+                return;
+
+            if (entry.Running == 0)
+            {
+                entry.Handle = 0;
+                return;
+            }
+        }
+        Sleep(DynamicPollNs);
+    }
+}
+
+void Cmd::DynamicHelp(Stdlib::Printer& out)
+{
+    for (ulong i = 0; i < DynamicMax; i++)
+    {
+        char help[DynamicHelpMax + 1];
+        help[0] = '\0';
+        {
+            Stdlib::AutoLock lock(DynamicLock);
+            const DynamicCmd& entry = Dynamic[i];
+            if (entry.Handle != 0 && !entry.Removing)
+            {
+                const char* text = (entry.Help[0] != '\0') ? entry.Help : entry.Name;
+                ulong len = Stdlib::StrLen(text);
+                if (len > DynamicHelpMax)
+                    len = DynamicHelpMax;
+                Stdlib::MemCpy(help, text, len);
+                help[len] = '\0';
+            }
+        }
+
+        /* Printed without the lock: a console line can take a while */
+        if (help[0] != '\0')
+            out.Printf("%s\n", help);
+    }
 }
 
 void Cmd::ProcessCmd(const char *cmd)

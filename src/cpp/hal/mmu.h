@@ -29,6 +29,13 @@ bool IsWriteCombiningAvailable();
    MapMmioRegion returns it directly instead of building 4K mappings.
    x86 returns 0. Defined per arch. */
 ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes);
+
+/* Make code just stored to [va, va+size) safe to execute: the stores reach
+   the point of unification, and no stale instruction stays cached for the
+   range. arm64 does both by hand (DC CVAU, IC IVAU); x86 keeps instruction
+   fetch coherent with stores and needs nothing. The module loader calls it
+   before a module's first instruction runs. Defined per arch. */
+void SyncInstructionCache(ulong va, ulong size);
 }
 
 // MMU control: TLB invalidation and the translation-root register.

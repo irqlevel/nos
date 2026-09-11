@@ -1,5 +1,10 @@
 [workspace]
-members = ["ffi", "kernel", "hello", "kcore", "tls", "drivers/nvme", "drivers/r8168", "drivers/r8125", "drivers/igb"]
+members = ["ffi", "kernel", "hello", "kcore", "tls", "drivers/nvme", "drivers/r8168", "drivers/r8125", "drivers/igb", "kmod", "modules/hello", "modules/modtest"]
+# What a plain `cargo build` builds: the crates the kernel links. A loadable
+# module is built on its own, one package at a time and with the
+# position-independent code the kernel's crates do not use (the Makefile's
+# module rules), then linked into a shared object the kernel loads.
+default-members = ["ffi", "kernel", "hello", "kcore", "tls", "drivers/nvme", "drivers/r8168", "drivers/r8125", "drivers/igb"]
 resolver = "2"
 
 [profile.release]

@@ -3,7 +3,10 @@
 #include <hal/power.h>
 #include <hal/cpu.h>
 #include <hal/irqchip.h>
+#include <hal/mmu.h>
+#include <hal/module.h>
 
+#include <kernel/elf.h>
 #include <lib/printer.h>
 
 #include "pl011.h"
@@ -120,6 +123,63 @@ void PrintCpuState(Stdlib::Printer& con)
 void EnableWxSupport()
 {
     /* PXN/UXN are always active on arm64 — nothing to enable. */
+}
+
+void SyncInstructionCache(ulong va, ulong size)
+{
+    if (size == 0)
+        return;
+
+    /* CTR_EL0 DminLine [19:16] and IminLine [3:0]: log2 of the smallest
+       data and instruction cache line, in 4-byte words */
+    ulong ctr;
+    asm volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    const ulong dline = 4UL << ((ctr >> 16) & 0xF);
+    const ulong iline = 4UL << (ctr & 0xF);
+    const ulong end = va + size;
+
+    /* Instruction fetch does not snoop the data cache: push the freshly
+       written code out to the point of unification, where fetch sees it... */
+    for (ulong p = va & ~(dline - 1); p < end; p += dline)
+        asm volatile("dc cvau, %0" :: "r"(p) : "memory");
+    asm volatile("dsb ish" ::: "memory");
+
+    /* ...then drop whatever any CPU's instruction cache still holds for these
+       lines -- IC IVAU is broadcast to the inner-shareable domain -- and make
+       this CPU refetch */
+    for (ulong p = va & ~(iline - 1); p < end; p += iline)
+        asm volatile("ic ivau, %0" :: "r"(p) : "memory");
+    asm volatile("dsb ish" ::: "memory");
+    asm volatile("isb" ::: "memory");
+}
+
+u16 ModuleElfMachine()
+{
+    return Kernel::Elf::MachineAarch64;
+}
+
+ModuleReloc ClassifyModuleReloc(u32 type)
+{
+    /* AArch64 ELF ABI numbering */
+    static const u32 RelNone = 0;
+    static const u32 RelAbs64 = 257;     /* R_AARCH64_ABS64: a pointer in data */
+    static const u32 RelGlobDat = 1025;  /* R_AARCH64_GLOB_DAT: a GOT slot */
+    static const u32 RelJumpSlot = 1026; /* R_AARCH64_JUMP_SLOT: a PLT's slot */
+    static const u32 RelRelative = 1027; /* R_AARCH64_RELATIVE */
+
+    switch (type)
+    {
+    case RelNone:
+        return ModuleReloc::None;
+    case RelRelative:
+        return ModuleReloc::Relative;
+    case RelAbs64:
+    case RelGlobDat:
+    case RelJumpSlot:
+        return ModuleReloc::Symbol;
+    default:
+        return ModuleReloc::Unsupported;
+    }
 }
 
 void SetupMemoryTypes()

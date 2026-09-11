@@ -154,6 +154,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/kernel/entropy.cpp \
     src/cpp/kernel/random.cpp \
     src/cpp/kernel/rust_ffi.cpp \
+    src/cpp/kernel/module.cpp \
     src/cpp/lib/stdlib.cpp  \
     src/cpp/lib/format.cpp \
     src/cpp/lib/bitmap.cpp \
@@ -221,6 +222,7 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/softirq.cpp \
     src/cpp/kernel/interrupt_stats.cpp \
     src/cpp/kernel/rust_ffi.cpp \
+    src/cpp/kernel/module.cpp \
     src/cpp/block/block_device.cpp \
     src/cpp/block/partition.cpp \
     src/cpp/kernel/test.cpp \
@@ -303,10 +305,11 @@ RUST_LIB = $(RUST_LIB_$(ARCH))
 # stale staticlib.  Hence `make rust && make nocheck` in scripts/smoke-test.sh.
 RUST_SRC = $(shell find src/rust -name '*.rs' -not -path 'src/rust/target/*') \
     $(wildcard src/rust/Cargo.toml src/rust/Cargo.lock src/rust/*/Cargo.toml \
-        src/rust/drivers/*/Cargo.toml src/rust/.cargo/config.toml \
+        src/rust/drivers/*/Cargo.toml src/rust/modules/*/Cargo.toml \
+        src/rust/.cargo/config.toml \
         src/rust/rust-toolchain.toml)
 
-.PHONY: all check nocheck clean rust smoke
+.PHONY: all check nocheck clean rust smoke modules
 
 # The generated .d files are ordinary makefiles, so the first target of the
 # first one make reads becomes the default goal -- on an incremental build a
@@ -318,11 +321,11 @@ RUST_SRC = $(shell find src/rust -name '*.rs' -not -path 'src/rust/target/*') \
 -include $(DEPS)
 
 ifeq ($(ARCH),x86_64)
-all: check nos.iso
-nocheck: nos.iso
+all: check nos.iso modules
+nocheck: nos.iso modules
 else
-all: check nos-arm64.img
-nocheck: nos-arm64.img
+all: check nos-arm64.img modules
+nocheck: nos-arm64.img modules
 endif
 
 check: $(CXX_SRC)
@@ -372,6 +375,69 @@ rust:
 $(RUST_LIB): $(RUST_SRC)
 	cd src/rust && cargo build --offline --release --target $(RUST_TARGET)
 
+# Loadable kernel modules (docs/modules.md): the crates under src/rust/modules,
+# each built on its own into a position-independent staticlib -- the module,
+# kmod, kcore, core and alloc, everything but the kernel functions it calls --
+# and linked into an ELF shared object, a .ko, for kernel/module.cpp to load.
+# They get a target directory of their own, being compiled with flags the
+# kernel's Rust is not: PIC; the small code model on x86, where the kernel's
+# large one has no position-independent form worth having; and
+# compiler-builtins' own memcpy and friends, so that a module imports nothing
+# but the kernel's API.
+MODULES = hello modtest
+MODULE_KO = $(patsubst %,$(OUT)/modules/%.ko,$(MODULES))
+MODULE_RUSTFLAGS_x86_64 = ["-Ccode-model=small","-Crelocation-model=pic"]
+MODULE_RUSTFLAGS_aarch64 = ["-Crelocation-model=pic"]
+MODULE_LDEMU_x86_64 = elf_x86_64
+MODULE_LDEMU_aarch64 = aarch64elf
+# -Bsymbolic binds a module's references to itself at link time, which leaves
+# the loader RELATIVE relocations and the kernel's functions to resolve;
+# separate-loadable-segments on 4 KiB pages gives every segment pages of its
+# own, which the loader needs to give each its own permissions.
+MODULE_LDFLAGS = -m $(MODULE_LDEMU_$(ARCH)) -shared -Bsymbolic --gc-sections \
+    -z separate-loadable-segments -z max-page-size=4096 -z norelro \
+    -z noexecstack -z now --build-id=none --hash-style=sysv \
+    --version-script=src/rust/kmod/module.ver -u nos_module_info
+# The kernel interface a module is built against, and which the loader holds
+# it to: a digest of the ffi crate's sources.
+MODULE_FFI_SRC = $(sort $(wildcard src/rust/ffi/src/*.rs))
+MODULE_ABI := $(shell cat $(MODULE_FFI_SRC) | sha256sum | cut -c1-64)
+
+modules: $(MODULE_KO)
+
+$(OUT)/modules/%.ko: $(RUST_SRC) src/rust/kmod/module.ver
+	@mkdir -p $(dir $@)
+	cd src/rust && NOS_MODULE_ABI=$(MODULE_ABI) cargo build --offline --release \
+	    --target $(RUST_TARGET) -p mod-$* --target-dir target/modules \
+	    --config 'target.$(RUST_TARGET).rustflags=$(MODULE_RUSTFLAGS_$(ARCH))' \
+	    --config 'unstable.build-std-features=["compiler-builtins-mem"]'
+	ld.lld $(MODULE_LDFLAGS) -o $@ src/rust/target/modules/$(RUST_TARGET)/release/libmod_$*.a
+
+$(OUT)/kernel/module.o: CXXFLAGS += -DNOS_MODULE_ABI=\"$(MODULE_ABI)\"
+$(OUT)/kernel/module.o: $(MODULE_FFI_SRC)
+
+# The functions a module may bind to: those the ffi crate declares in its
+# extern blocks that the kernel defines. Generated from pass1.elf like the
+# symbol table, and linked into the final kernel only -- kernel/module.cpp has
+# the empty weak table pass 1 gets instead.
+$(OUT)/module_exports.S: $(OUT)/pass1.elf $(MODULE_FFI_SRC) build/module-exports.awk
+	@echo "Generating module export table..."
+	@awk '/^extern "C" \{/ { inblock = 1; next } inblock && /^\}/ { inblock = 0; next } inblock && match($$0, /fn [A-Za-z_][A-Za-z0-9_]*/) { print substr($$0, RSTART + 3, RLENGTH - 3) }' $(MODULE_FFI_SRC) | LC_ALL=C sort -u > $@.ffi
+	@$(NM) -g --defined-only $< | awk 'NF == 3 && ($$2 == "T" || $$2 == "W") { print $$3 }' | LC_ALL=C sort -u > $@.defined
+	@LC_ALL=C comm -12 $@.ffi $@.defined | awk -f build/module-exports.awk > $@
+	@rm -f $@.ffi $@.defined
+
+$(OUT)/module_exports.o: $(OUT)/module_exports.S
+	$(CC) --target=$(TARGET) -c $< -o $@
+
+# The boot self-test (TestModules in kernel/test.cpp) loads modtest.ko out of
+# the kernel's own image, which this puts it in.
+$(OUT)/modtest_blob.S: $(OUT)/modules/modtest.ko
+	@printf '/* generated by the Makefile; do not edit */\n    .section .rodata.nos_modtest_ko, "a"\n    .balign 16\n    .globl nos_modtest_ko\nnos_modtest_ko:\n    .incbin "%s"\nnos_modtest_ko_end:\n    .balign 8\n    .globl nos_modtest_ko_size\nnos_modtest_ko_size:\n    .quad nos_modtest_ko_end - nos_modtest_ko\n' '$(CURDIR)/$<' > $@
+
+$(OUT)/modtest_blob.o: $(OUT)/modtest_blob.S $(OUT)/modules/modtest.ko
+	$(CC) --target=$(TARGET) -c $< -o $@
+
 nos-arm64.img: $(KERNEL)
 	$(OBJCOPY) -O binary $< $@
 	@mkdir -p bin
@@ -380,8 +446,8 @@ nos-arm64.img: $(KERNEL)
 smoke:
 	./scripts/smoke-test.sh
 
-$(OUT)/pass1.elf: $(LDSCRIPT) $(OBJS) $(RUST_LIB)
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(RUST_LIB)
+$(OUT)/pass1.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(RUST_LIB)
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(RUST_LIB)
 
 $(OUT)/symtab_data.cpp: $(OUT)/pass1.elf
 	@echo "Generating symbol table..."
@@ -392,8 +458,8 @@ $(OUT)/symtab_data.cpp: $(OUT)/pass1.elf
 $(OUT)/symtab_data.o: $(OUT)/symtab_data.cpp src/cpp/kernel/symtab.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-$(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/symtab_data.o $(RUST_LIB)
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/symtab_data.o $(RUST_LIB)
+$(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)/module_exports.o $(RUST_LIB)
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)/module_exports.o $(RUST_LIB)
 
 clean:
 	rm -rf out kernel64.elf kernel-arm64.elf nos-arm64.img *.bin *.iso iso

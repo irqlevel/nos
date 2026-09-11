@@ -47,6 +47,7 @@ extern "C" char BootStackTop[];
 #include <net/netconsole.h>
 #include <net/net_frame_pool.h>
 #include <net/net_device.h>
+#include <kernel/module.h>
 
 /* arm64 boot orchestrator, the Main2 twin (kernel/main.cpp). Milestone M2:
    full memory management + boot self-tests on one CPU; the interrupt/
@@ -323,6 +324,11 @@ static void BpStartupArm(void* ctx)
             netconsole.Stop();
             cmd.Stop();
             cmd.StopDhcp();
+
+            /* With the shells gone nothing calls into a module any more:
+               its exit runs now, while the files and block I/O it may still
+               need are there (as in kernel/main.cpp) */
+            ModuleTable::GetInstance().UnloadAll();
 
             /* While the soft IRQs still run: unmounting writes the
                superblock, and a block request completes through BLK_IO */
