@@ -85,6 +85,16 @@ Two independent gates:
   `PreemptIrqSave()`/`PreemptIrqRestore()` pair the two with interrupt
   disabling, stashing "preemption was on" in bit 63 of the saved flags so
   the restore balances correctly even if the global gate moves in between.
+- **Spinlocks.** `RawSpinLock::Lock()` — and so every `SpinLock` — disables
+  preemption until `Unlock()`, as Linux's `spin_lock` does: a holder is
+  never switched away with the lock taken, so no taker spins out a time
+  slice waiting for it. The lock remembers *whose* count it raised: the
+  scheduler takes its own locks in one task and releases them in the next,
+  across `SwitchContext`, and `SwitchComplete` checks that `Schedule()`'s is
+  the only count the switched-out task still has. `PreemptCanBlock()` asks
+  the whole question — interrupts on and preemption enabled — for code that
+  has to know whether it may wait. `RawRwSpinLock`'s plain
+  `ReadLock`/`WriteLock` are the exception: they still leave preemption on.
 
 Involuntary preemption comes from the per-CPU timer tick — the local APIC
 timer on x86-64, the generic timer on arm64, both at 100 Hz — whose handler

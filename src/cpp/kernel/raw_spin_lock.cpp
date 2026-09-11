@@ -8,6 +8,7 @@ namespace Kernel
 
 RawSpinLock::RawSpinLock(bool watched)
     : Watched(watched)
+    , PreemptTask(nullptr)
     , WatchdogReported(0)
     , WatchdogLockTime(0)
 {
@@ -33,7 +34,7 @@ void RawSpinLock::Stamp()
     WatchdogLockTime.Set((now != 0) ? now : 1);
 }
 
-void RawSpinLock::Lock()
+void RawSpinLock::Acquire()
 {
     for (;;)
     {
@@ -46,7 +47,7 @@ void RawSpinLock::Lock()
     Stamp();
 }
 
-bool RawSpinLock::TryLock()
+bool RawSpinLock::TryAcquire()
 {
     if (Value.Cmpxchg(1, 0) != 0)
         return false;
@@ -55,7 +56,7 @@ bool RawSpinLock::TryLock()
     return true;
 }
 
-void RawSpinLock::Unlock()
+void RawSpinLock::Release()
 {
     if (Watched)
     {
@@ -65,23 +66,57 @@ void RawSpinLock::Unlock()
     Value.Set(0);
 }
 
+void RawSpinLock::Lock()
+{
+    /* Before the acquire, not after: a tick landing between the two would
+       switch the new holder away with the lock taken. */
+    Task* task = PreemptDisableTask();
+    Acquire();
+    PreemptTask = task;
+}
+
+void RawSpinLock::Unlock()
+{
+    /* Read and cleared while the lock is still ours: once Release() runs,
+       the next holder writes its own. */
+    Task* task = PreemptTask;
+    PreemptTask = nullptr;
+    Release();
+    PreemptEnableTask(task);
+}
+
+bool RawSpinLock::TryLock()
+{
+    Task* task = PreemptDisableTask();
+    if (!TryAcquire())
+    {
+        PreemptEnableTask(task);
+        return false;
+    }
+
+    PreemptTask = task;
+    return true;
+}
+
+/* The IRQ-saving forms leave PreemptTask alone: PreemptIrqSave disables
+   preemption along with interrupts, and the flags carry it to the restore. */
 ulong RawSpinLock::LockIrqSave()
 {
     ulong flags = PreemptIrqSave();
-    Lock();
+    Acquire();
     return flags;
 }
 
 ulong RawSpinLock::TryLockIrqSave(bool& acquired)
 {
     ulong flags = PreemptIrqSave();
-    acquired = TryLock();
+    acquired = TryAcquire();
     return flags;
 }
 
 void RawSpinLock::UnlockIrqRestore(ulong flags)
 {
-    Unlock();
+    Release();
     PreemptIrqRestore(flags);
 }
 

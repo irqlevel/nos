@@ -33,16 +33,19 @@ void SpinLock::Unlock()
     RawLock.Unlock();
 }
 
+/* Through the raw lock's IRQ-saving form: preemption goes off with
+   interrupts and the flags carry it, instead of Lock() counting it a second
+   time. */
 void SpinLock::Lock(ulong& flags)
 {
-    flags = PreemptIrqSave();
-    Lock();
+    flags = RawLock.LockIrqSave();
+    Owner = (PreemptIsOn()) ? Task::GetCurrentTask() : nullptr;
 }
 
 void SpinLock::Unlock(ulong flags)
 {
-    Unlock();
-    PreemptIrqRestore(flags);
+    Owner = nullptr;
+    RawLock.UnlockIrqRestore(flags);
 }
 
 void SpinLock::SharedLock(ulong& flags)

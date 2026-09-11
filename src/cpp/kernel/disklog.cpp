@@ -1,6 +1,7 @@
 #include "disklog.h"
 #include "trace.h"
 #include "panic.h"
+#include "preempt.h"
 #include <hal/cpu.h>
 #include <block/block_device.h>
 #include <lib/checksum.h>
@@ -284,11 +285,17 @@ void DiskLog::Log(const char* s)
     if (!Enabled)
         return;
 
-    /* A write waits for a completion interrupt, so a caller that already has
-       them off cannot wait for one. The line is staged either way and the
+    /* A write waits for its completion, so it is only for a caller that
+       could block: not one with interrupts off, which the completion
+       interrupt could never reach, and not one under a spinlock, which would
+       hold the lock for as long as the device takes. Interrupts alone used
+       to be the test, and a raw spinlock leaves them on -- a TCP trace line
+       under conn->Lock kept that lock for 25-33 ms of forced writes on real
+       hardware. RawSpinLock::Lock() now disables preemption, so
+       PreemptCanBlock() catches both. The line is staged either way and the
        next caller that can write pushes it out -- which is why the partial
        sector is rewritten rather than held back. */
-    if (!Hal::IsInterruptEnabled())
+    if (!PreemptCanBlock())
         return;
 
     if (Panicker::GetInstance().IsActive())
