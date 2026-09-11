@@ -189,6 +189,15 @@ public:
        virtAddr+sizeBytes) and invalidates the local TLB. */
     bool ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable, bool executable);
 
+    /* Set exactly these permissions on [virtAddr, virtAddr+sizeBytes),
+       loosening as well as tightening, which ProtectRange never does. For
+       memory the kernel owns outright and hands out as code: a loadable
+       module's pages, made executable once written and writable again
+       before they are freed. Same walk and same 4KiB-leaf requirement, and
+       likewise only the local TLB is invalidated -- the caller shoots down
+       the rest (CpuTable::InvalidateTlbRange). */
+    bool SetRangeProtection(ulong virtAddr, ulong sizeBytes, bool writable, bool executable);
+
     /* Walk every page descriptor and report any page that is on the free
        list but must not be: inside a reserved region, inside the kernel
        image, or outside usable RAM. That is the invariant the whole
@@ -250,6 +259,9 @@ private:
 
     PtePage* WalkToL1Locked(ulong virtAddr, bool create);
     bool MapRangeLocked(ulong virtAddr, size_t count, const MapSource& src);
+
+    bool ChangeRangeProtection(ulong virtAddr, ulong sizeBytes, bool writable,
+        bool executable, bool exact);
     void UnmapRangeLocked(ulong virtAddr, size_t count, bool freePages);
 
     ulong TmpMapStart;

@@ -68,6 +68,9 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `crc32 <path>` | CRC-32 of a file, to check a copy against the host |
 | `sha256 <path>` | SHA-256 of a file, printed the way `sha256sum` prints it, to check a downloaded kernel against the `SHA256SUMS` of its release |
 | `grubenv <path> [name=value ...]` | Show, or set, the variables of a GRUB environment block — the `grubenv` file `grub-editenv` makes and GRUB's `load_env`/`save_env` read and write; `name=` with nothing after it removes one. Edited in place at the same size, the way GRUB's own writer edits it, so GRUB can still read and clear what was set. What arms a one-shot boot of a downloaded kernel from inside nos: see [Real hardware](real-hardware.md#updating-the-kernel-from-inside-nos) |
+| `insmod <path>` | Load a kernel module — a Rust crate built into a `.ko` by `make modules` — from a file, and run its init. Says why when it refuses one: not a module, another machine's, built against another kernel interface, an import the kernel does not export, a name already loaded. See [Loadable modules](modules.md) |
+| `rmmod <name>` | Unload a module: run its exit, which releases everything it holds, then free its code. Waits for a call of one of its commands that is still running |
+| `lsmod` | List the loaded modules: name, size, load address and how many kernel functions each binds to |
 | `usb` | Show xHCI controllers, connected root ports and keyboard report counters |
 | `panic [type]` | Trigger kernel panic (direct, pagefault, divzero, ud) |
 | `version` | Show kernel version |

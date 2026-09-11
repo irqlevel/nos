@@ -9,6 +9,9 @@
 #include "random.h"
 #include "sha256.h"
 #include "parameters.h"
+#include "module.h"
+#include "cmd.h"
+#include "elf.h"
 #include <hal/cpu.h>
 #include <block/block_device.h>
 #include <fs/vfs.h>
@@ -2315,6 +2318,220 @@ Stdlib::Error TestGrubEnv()
     return MakeSuccess();
 }
 
+/* modtest.ko -- src/rust/modules/modtest as the Makefile builds it --
+   embedded in the kernel image (modtest_blob.S) for TestModules to load */
+extern "C" const u8 nos_modtest_ko[];
+extern "C" const ulong nos_modtest_ko_size;
+
+/* A Printer that keeps what it is given, for a test to read back */
+class CapturePrinter final : public Stdlib::Printer
+{
+public:
+    CapturePrinter()
+        : Pos(0)
+    {
+        Buf[0] = '\0';
+    }
+
+    virtual void Printf(const char *fmt, ...) override
+    {
+        va_list args;
+        va_start(args, fmt);
+        VPrintf(fmt, args);
+        va_end(args);
+    }
+
+    virtual void VPrintf(const char *fmt, va_list args) override
+    {
+        char line[LineSize];
+        if (Stdlib::VsnPrintf(line, sizeof(line), fmt, args) > 0)
+            PrintString(line);
+    }
+
+    virtual void PrintString(const char *s) override
+    {
+        ulong len = Stdlib::StrLen(s);
+        if (len > sizeof(Buf) - 1 - Pos)
+            len = sizeof(Buf) - 1 - Pos;
+        Stdlib::MemCpy(Buf + Pos, s, len);
+        Pos += len;
+        Buf[Pos] = '\0';
+    }
+
+    virtual void Backspace() override
+    {
+    }
+
+    const char* Get() const
+    {
+        return Buf;
+    }
+
+    void Reset()
+    {
+        Pos = 0;
+        Buf[0] = '\0';
+    }
+
+private:
+    static const ulong LineSize = 256;
+    char Buf[1024];
+    ulong Pos;
+};
+
+/* Overwrite every occurrence of from with to, a string as long */
+static void PatchAll(u8* buf, ulong size, const char* from, const char* to)
+{
+    const ulong len = Stdlib::StrLen(from);
+    if (Stdlib::StrLen(to) != len)
+        return;
+
+    for (ulong i = 0; i + len <= size; i++)
+    {
+        if (Stdlib::MemCmp(buf + i, from, len) == 0)
+            Stdlib::MemCpy(buf + i, to, len);
+    }
+}
+
+/* Flip a bit of the byte offset bytes past the first occurrence of marker */
+static void FlipAfter(u8* buf, ulong size, const char* marker, ulong offset)
+{
+    const ulong len = Stdlib::StrLen(marker);
+    for (ulong i = 0; i + len <= size; i++)
+    {
+        if (Stdlib::MemCmp(buf + i, marker, len) == 0)
+        {
+            if (i + offset < size)
+                buf[i + offset] ^= 1;
+            return;
+        }
+    }
+}
+
+/* The loader end to end, on modtest.ko. Loaded, the module runs its own
+   checks in its init and adds a shell command, which answers through the
+   dispatcher; a second copy is refused; unloaded, the command goes with it.
+   All of it twice, the second time into memory the first gave back. Then
+   damaged copies, which the loader must turn away -- the last three only
+   after mapping and relocating them, so the cleanup of a load that fails
+   halfway runs too. */
+Stdlib::Error TestModules()
+{
+    /* kmod::ModuleInfo: the magic "NOSM", the version, then the digest of the
+       kernel interface the module was built against */
+    static const ulong HeaderAbiOffset = 8;
+    static const ulong DamageCount = 6;
+
+    auto& modules = ModuleTable::GetInstance();
+    CapturePrinter out;
+
+    for (ulong round = 0; round < 2; round++)
+    {
+        out.Reset();
+        Stdlib::Error err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, out);
+        if (!err.Ok())
+        {
+            Trace(0, "TestModules: load failed: %s", out.Get());
+            return err;
+        }
+
+        out.Reset();
+        Cmd::Dispatch("modtest 1 2", out);
+        if (Stdlib::StrStr(out.Get(), "modtest: answer 52 args '1 2'") == nullptr)
+        {
+            Trace(0, "TestModules: the module's command answered: %s", out.Get());
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+
+        out.Reset();
+        err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, out);
+        if (err.GetCode() != Stdlib::Error::AlreadyExists || !modules.IsLoaded("modtest"))
+        {
+            Trace(0, "TestModules: a second copy was not refused: %s", out.Get());
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+
+        out.Reset();
+        err = modules.Unload("modtest", out);
+        if (!err.Ok() || modules.IsLoaded("modtest"))
+        {
+            Trace(0, "TestModules: unload failed: %s", out.Get());
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+
+        out.Reset();
+        Cmd::Dispatch("modtest", out);
+        if (Stdlib::StrStr(out.Get(), "not found") == nullptr)
+        {
+            Trace(0, "TestModules: the command outlived its module: %s", out.Get());
+            return MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    u8* copy = static_cast<u8*>(Mm::Alloc(nos_modtest_ko_size, Tag));
+    if (copy == nullptr)
+        return MakeError(Stdlib::Error::NoMemory);
+
+    Stdlib::Error result = MakeSuccess();
+    for (ulong i = 0; i < DamageCount && result.Ok(); i++)
+    {
+        Stdlib::MemCpy(copy, nos_modtest_ko, nos_modtest_ko_size);
+        ulong size = nos_modtest_ko_size;
+        const char* what;
+        int expected;
+
+        switch (i)
+        {
+        case 0:
+            what = "a truncated header";
+            size = sizeof(Elf::Ehdr) - 1;
+            expected = Stdlib::Error::BadMagic;
+            break;
+        case 1:
+            what = "another machine's";
+            reinterpret_cast<Elf::Ehdr*>(copy)->Machine = 0;
+            expected = Stdlib::Error::InvalidValue;
+            break;
+        case 2:
+            what = "an import the kernel lacks";
+            PatchAll(copy, size, "kernel_trace", "kernel_trac3");
+            expected = Stdlib::Error::NotFound;
+            break;
+        case 3:
+            what = "no module header";
+            PatchAll(copy, size, "nos_module_info", "nos_module_inf0");
+            expected = Stdlib::Error::NotFound;
+            break;
+        case 4:
+            what = "a bad header magic";
+            PatchAll(copy, size, "NOSM", "NOSX");
+            expected = Stdlib::Error::BadMagic;
+            break;
+        default:
+            what = "another kernel interface";
+            FlipAfter(copy, size, "NOSM", HeaderAbiOffset);
+            expected = Stdlib::Error::InvalidValue;
+            break;
+        }
+
+        out.Reset();
+        Stdlib::Error err = modules.Load(copy, size, out);
+        if (err.GetCode() != expected || modules.IsLoaded("modtest"))
+        {
+            Trace(0, "TestModules: %s: error %u, expected %u: %s", what,
+                (ulong)err.GetCode(), (ulong)expected, out.Get());
+            result = MakeError(Stdlib::Error::Unsuccessful);
+        }
+    }
+
+    Mm::Free(copy);
+    if (!result.Ok())
+        return result;
+
+    Trace(0, "TestModules: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error Test()
 {
     Stdlib::Error err;
@@ -2418,6 +2635,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestVfs();
+    if (!err.Ok())
+        return err;
+
+    err = TestModules();
     if (!err.Ok())
         return err;
 

@@ -86,6 +86,11 @@ struct Pte final
         Value |= NxBit; /* requires EFER.NXE; unused until x86 W^X lands */
     }
 
+    void ClearNoExecute()
+    {
+        Value &= ~NxBit;
+    }
+
     void ClearPresent()
     {
         Value &= ~(1UL << PresentBit);

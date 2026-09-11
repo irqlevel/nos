@@ -62,6 +62,7 @@
 #include <fs/vfs.h>
 #include <fs/rootfs.h>
 #include <kernel/stack_probe.h>
+#include <kernel/module.h>
 #include <arch/x86_64/percpu.h>
 
 using namespace Kernel;
@@ -687,6 +688,11 @@ void BpStartup(void* ctx)
                 break;
             }
         }
+
+        /* With the shells gone nothing calls into a module any more: its
+           exit runs now, while the files, block I/O and soft IRQs it may
+           still need are all there */
+        ModuleTable::GetInstance().UnloadAll();
 
         /* Before the soft IRQs stop: unmounting writes the superblock, and
            a block request completes through the BLK_IO soft IRQ */

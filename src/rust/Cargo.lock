@@ -418,6 +418,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmod"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "kcore",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -437,6 +445,22 @@ name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
+name = "mod-hello"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+]
+
+[[package]]
+name = "mod-modtest"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+]
 
 [[package]]
 name = "num-bigint-dig"

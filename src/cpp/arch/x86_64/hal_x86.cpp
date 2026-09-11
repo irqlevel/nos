@@ -2,6 +2,7 @@
 #include <hal/power.h>
 #include <hal/cpu.h>
 #include <hal/mmu.h>
+#include <hal/module.h>
 #include <hal/pmu.h>
 #include <arch/x86_64/pmu.h>
 
@@ -14,6 +15,7 @@
 
 #include <kernel/trace.h>
 #include <kernel/parameters.h>
+#include <kernel/elf.h>
 #include <drivers/serial.h>
 #include <drivers/screen.h>
 #include <drivers/acpi.h>
@@ -100,6 +102,44 @@ ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes)
     (void)physAddr;
     (void)sizeBytes;
     return 0;
+}
+
+void SyncInstructionCache(ulong va, ulong size)
+{
+    /* Instruction fetch snoops stores on x86, this CPU's and every other's:
+       code written through a data mapping can be fetched as soon as its
+       pages are mapped executable. Nothing to clean, nothing to invalidate. */
+    (void)va;
+    (void)size;
+}
+
+u16 ModuleElfMachine()
+{
+    return Kernel::Elf::MachineX86_64;
+}
+
+ModuleReloc ClassifyModuleReloc(u32 type)
+{
+    /* x86-64 psABI numbering */
+    static const u32 RelNone = 0;
+    static const u32 Rel64 = 1;       /* R_X86_64_64: a pointer in data */
+    static const u32 RelGlobDat = 6;  /* R_X86_64_GLOB_DAT: a GOT slot */
+    static const u32 RelJumpSlot = 7; /* R_X86_64_JUMP_SLOT: a PLT's slot */
+    static const u32 RelRelative = 8; /* R_X86_64_RELATIVE */
+
+    switch (type)
+    {
+    case RelNone:
+        return ModuleReloc::None;
+    case RelRelative:
+        return ModuleReloc::Relative;
+    case Rel64:
+    case RelGlobDat:
+    case RelJumpSlot:
+        return ModuleReloc::Symbol;
+    default:
+        return ModuleReloc::Unsupported;
+    }
 }
 
 ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)

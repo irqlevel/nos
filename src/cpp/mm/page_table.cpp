@@ -547,8 +547,8 @@ ulong PageTable::ReservePageArray(ulong bytes, ulong lowerBound)
     return 0;
 }
 
-bool PageTable::ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable,
-    bool executable)
+bool PageTable::ChangeRangeProtection(ulong virtAddr, ulong sizeBytes,
+    bool writable, bool executable, bool exact)
 {
     Stdlib::AutoLock lock(Lock);
 
@@ -596,14 +596,30 @@ bool PageTable::ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable,
 
         if (!writable)
             l1e->SetReadOnly();
+        else if (exact)
+            l1e->SetWritable();
         if (!executable)
             l1e->SetNoExecute();
+        else if (exact)
+            l1e->ClearNoExecute();
         TmpUnmapPage((ulong)l1);
 
         InvalidateLocalTlbAddress(va);
     }
 
     return true;
+}
+
+bool PageTable::ProtectRange(ulong virtAddr, ulong sizeBytes, bool writable,
+    bool executable)
+{
+    return ChangeRangeProtection(virtAddr, sizeBytes, writable, executable, false);
+}
+
+bool PageTable::SetRangeProtection(ulong virtAddr, ulong sizeBytes, bool writable,
+    bool executable)
+{
+    return ChangeRangeProtection(virtAddr, sizeBytes, writable, executable, true);
 }
 
 Page* PageTable::GetPage(ulong phyAddr)

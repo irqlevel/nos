@@ -40,6 +40,11 @@ const int IcmpLL = 3;
    `loglevel 3` brings it back on a running kernel. */
 const int TaskLL = 3;
 
+/* Loadable modules: what each import bound to and the permissions each
+   segment got, a few lines per insmod. The load and unload themselves are
+   always traced. */
+const int ModuleLL = 3;
+
 /* The highest level any call site above uses, and the bound the shell's
    loglevel command accepts. Raise it together with a noisier call site. */
 const int MaxTraceLevel = 5;

@@ -1,0 +1,8 @@
+/* The one symbol a module exports: the descriptor the loader looks for.
+   Everything else is local -- which is what lets --gc-sections drop the
+   parts of core and alloc the module never calls, and what binds the
+   module's references to its own definitions. */
+{
+    global: nos_module_info;
+    local: *;
+};

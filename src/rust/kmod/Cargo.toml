@@ -1,0 +1,8 @@
+[package]
+name = "kmod"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ffi = { path = "../ffi" }
+kcore = { path = "../kcore" }
