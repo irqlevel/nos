@@ -3,6 +3,7 @@
 #include "task.h"
 #include "sched.h"
 #include "preempt.h"
+#include "raw_rw_spin_lock.h"
 #include "cpu.h"
 #include "stack_trace.h"
 #include "random.h"
@@ -2423,12 +2424,12 @@ Stdlib::Error Test()
     return err;
 }
 
-/* A RawSpinLock disables preemption for as long as it is held, and
+/* A spinlock disables preemption for as long as it is held, and
    PreemptCanBlock() -- asked by code that has to know whether it may wait --
    follows it: through nesting, through a TryLock that fails and one that
-   succeeds, and through the IRQ-saving SpinLock. Run first thing in
-   TestMultiTasking, which every CPU calls in task context with interrupts
-   and preemption on. */
+   succeeds, through the IRQ-saving SpinLock, and through both sides of a
+   RawRwSpinLock. Run first thing in TestMultiTasking, which every CPU calls
+   in task context with interrupts and preemption on. */
 static bool TestSpinLockPreempt()
 {
     if (!PreemptCanBlock())
@@ -2458,14 +2459,33 @@ static bool TestSpinLockPreempt()
     }
     bool releasedSpin = PreemptCanBlock();
 
+    /* The reader-writer lock, both sides: two readers nested on it, their
+       counts coming back through ReadUnlock(), then a writer alone. */
+    RawRwSpinLock rw;
+    Task* reader = rw.ReadLock();
+    Task* nested = rw.ReadLock();
+    bool underReads = !PreemptCanBlock();
+    rw.ReadUnlock(nested);
+    bool underRead = !PreemptCanBlock();
+    rw.ReadUnlock(reader);
+    bool releasedRead = PreemptCanBlock();
+    rw.WriteLock();
+    bool underWrite = !PreemptCanBlock();
+    rw.WriteUnlock();
+    bool releasedWrite = PreemptCanBlock();
+
     if (!underOuter || !innerTaken || outerTakenTwice || !underInner ||
-        !released || !underSpin || !releasedSpin)
+        !released || !underSpin || !releasedSpin || !underReads ||
+        !underRead || !releasedRead || !underWrite || !releasedWrite)
     {
         Trace(0, "TestSpinLockPreempt: outer %u inner %u twice %u "
             "under inner %u released %u spin %u released spin %u",
             (ulong)underOuter, (ulong)innerTaken, (ulong)outerTakenTwice,
             (ulong)underInner, (ulong)released, (ulong)underSpin,
             (ulong)releasedSpin);
+        Trace(0, "TestSpinLockPreempt: rw reads %u read %u released %u "
+            "write %u released %u", (ulong)underReads, (ulong)underRead,
+            (ulong)releasedRead, (ulong)underWrite, (ulong)releasedWrite);
         return false;
     }
 

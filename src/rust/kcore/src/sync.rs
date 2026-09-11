@@ -131,6 +131,8 @@ impl Drop for WaitGroup {
 ///
 /// Use read locks in task context for shared lookups; use write locks for
 /// mutations.  ISR context may hold a read lock only if it does not sleep.
+/// Either side keeps preemption off while it is held, as every kernel
+/// spinlock does.
 pub struct RwSpinLock {
     handle: usize,
 }
@@ -142,8 +144,8 @@ impl RwSpinLock {
     }
 
     pub fn read(&self) -> RwReadGuard<'_> {
-        unsafe { sync::kernel_rw_spinlock_read_lock(self.handle) }
-        RwReadGuard { lock: self, _not_send: PhantomData }
+        let token = unsafe { sync::kernel_rw_spinlock_read_lock(self.handle) };
+        RwReadGuard { lock: self, token, _not_send: PhantomData }
     }
 
     pub fn write(&self) -> RwWriteGuard<'_> {
@@ -160,12 +162,15 @@ impl Drop for RwSpinLock {
 
 pub struct RwReadGuard<'a> {
     lock: &'a RwSpinLock,
+    /* Whose preemption the read lock disabled, handed back on release: a
+       read lock has many holders at once, so it cannot live in the lock. */
+    token: u64,
     _not_send: PhantomData<*const ()>,
 }
 
 impl<'a> Drop for RwReadGuard<'a> {
     fn drop(&mut self) {
-        unsafe { sync::kernel_rw_spinlock_read_unlock(self.lock.handle) }
+        unsafe { sync::kernel_rw_spinlock_read_unlock(self.lock.handle, self.token) }
     }
 }
 
