@@ -73,6 +73,17 @@ enum TcpState : u8
     TcpStateClosed,
 };
 
+/* What HandleState did that deserves a trace line. HandleState runs under
+   conn->Lock, so it only reports; Process writes the line once the lock is
+   released (see Tcp::TraceEvent). */
+enum TcpEvent : u8
+{
+    TcpEventNone = 0,
+    TcpEventRst,
+    TcpEventConnected,
+    TcpEventAccepted,
+};
+
 /* Simple byte ring buffer */
 struct TcpRingBuf
 {
@@ -288,9 +299,13 @@ private:
                  Net::IpAddress srcIp, Net::IpAddress dstIp,
                  u16 srcPort, u16 dstPort, u32 seq, u32 ack);
 
-    void HandleState(TcpConn* conn, const Net::IpHdr* ip,
-                     const Net::TcpHdr* tcp, const u8* payload,
-                     ulong payloadLen);
+    TcpEvent HandleState(TcpConn* conn, const Net::IpHdr* ip,
+                         const Net::TcpHdr* tcp, const u8* payload,
+                         ulong payloadLen);
+
+    /* Writes the line for a TcpEvent; called with no lock held. */
+    void TraceEvent(TcpEvent event, u16 localPort, u16 remotePort,
+                    u16 peerMss);
 
     /* In-order payload delivery to RecvBuf + the ACK it requires. Shared by
        Established and the FIN-WAIT states (RFC 793 half-close). */
