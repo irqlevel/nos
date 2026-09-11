@@ -441,9 +441,9 @@ void Tcp::ProcessPayload(TcpConn* conn, u32 seq, const u8* payload,
 
 /* --- State machine --- */
 
-void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
-                      const TcpHdr* tcp, const u8* payload,
-                      ulong payloadLen)
+TcpEvent Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
+                          const TcpHdr* tcp, const u8* payload,
+                          ulong payloadLen)
 {
     (void)ip;
     u32 seq = Ntohl(tcp->SeqNum);
@@ -468,15 +468,12 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
                 ((u32)(seq - conn->RcvNxt) < conn->RcvWnd);
 
         if (!acceptable)
-            return;
+            return TcpEventNone;
 
-        Trace(0, "Tcp: RST received, conn %u:%u -> %u:%u",
-              (ulong)conn->LocalPort, (ulong)conn->RemotePort,
-              (ulong)Ntohs(tcp->SrcPort), (ulong)Ntohs(tcp->DstPort));
         conn->State = TcpStateClosed;
         conn->ConnReady.Set(1);
         conn->DataReady.Set(1);
-        return;
+        return TcpEventRst;
     }
 
     switch (conn->State)
@@ -493,7 +490,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
                         conn->LocalIp, conn->RemoteIp,
                         conn->LocalPort, conn->RemotePort,
                         ack, 0);
-                return;
+                return TcpEventNone;
             }
             conn->Irs = seq;
             conn->RcvNxt = seq + 1;
@@ -512,9 +509,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
             conn->SndNxt = savedNxt; /* ACK doesn't consume seq */
 
             conn->ConnReady.Set(1);
-            Trace(0, "Tcp: connected %u -> %u, mss %u",
-                  (ulong)conn->LocalPort, (ulong)conn->RemotePort,
-                  (ulong)conn->PeerMss);
+            return TcpEventConnected;
         }
         break;
     }
@@ -531,8 +526,7 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
             conn->RtoMs = TcpInitialRtoMs;
             conn->RetransmitDeadlineMs = 0;
             conn->ConnReady.Set(1);
-            Trace(0, "Tcp: accepted %u <- %u",
-                  (ulong)conn->LocalPort, (ulong)conn->RemotePort);
+            return TcpEventAccepted;
         }
         break;
     }
@@ -705,6 +699,37 @@ void Tcp::HandleState(TcpConn* conn, const IpHdr* ip,
     default:
         break;
     }
+
+    return TcpEventNone;
+}
+
+/* The trace line for what HandleState reported, written by Process after
+   conn->Lock is released -- never under it. A trace is synchronous output:
+   the serial port and the screen are written there and then, while the task
+   in Connect() spins on conn->Lock -- ConnReady goes up just before the
+   line. Written under the lock, the "connected" line once kept it for
+   25-33 ms on real hardware, forced disk log writes included. */
+void Tcp::TraceEvent(TcpEvent event, u16 localPort, u16 remotePort,
+                     u16 peerMss)
+{
+    switch (event)
+    {
+    case TcpEventRst:
+        Trace(0, "Tcp: RST received, conn %u:%u -> %u:%u",
+              (ulong)localPort, (ulong)remotePort,
+              (ulong)remotePort, (ulong)localPort);
+        break;
+    case TcpEventConnected:
+        Trace(0, "Tcp: connected %u -> %u, mss %u",
+              (ulong)localPort, (ulong)remotePort, (ulong)peerMss);
+        break;
+    case TcpEventAccepted:
+        Trace(0, "Tcp: accepted %u <- %u",
+              (ulong)localPort, (ulong)remotePort);
+        break;
+    default:
+        break;
+    }
 }
 
 /* --- Process incoming TCP segment --- */
@@ -777,8 +802,12 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
     if (conn)
     {
         PoolLock.Unlock();
-        HandleState(conn, ip, tcp, payload, payloadLen);
+        TcpEvent event = HandleState(conn, ip, tcp, payload, payloadLen);
+        u16 peerMss = conn->PeerMss;
         conn->Lock.Unlock();
+
+        /* The exact match makes the segment's ports the connection's. */
+        TraceEvent(event, localPort, remotePort, peerMss);
         return;
     }
 
@@ -876,14 +905,16 @@ void Tcp::OnIcmpUnreachable(u32 localIp, u16 localPort,
         return;
     }
 
-    Trace(0, "Tcp: ICMP unreachable, conn %u -> %u aborted",
-          (ulong)localPort, (ulong)remotePort);
     conn->State = TcpStateClosed;
     conn->RetransmitDeadlineMs = 0;
     conn->NeedCleanup = true;
     conn->ConnReady.Set(1);
     conn->DataReady.Set(1);
     conn->Lock.Unlock();
+
+    /* Not under conn->Lock: see TraceEvent. */
+    Trace(0, "Tcp: ICMP unreachable, conn %u -> %u aborted",
+          (ulong)localPort, (ulong)remotePort);
 }
 
 /* --- User-facing API --- */
@@ -1384,9 +1415,11 @@ void Tcp::ProcessRetransmits()
                        so the slot is reclaimed. Otherwise a dead peer pins the
                        connection forever (half-open SYNs, unacked FINs and
                        unacked data all retransmit with no retry limit). */
-                    Trace(0, "Tcp: conn %u:%u -> %u aborted after %u retransmits",
-                          (ulong)conn->LocalPort, (ulong)conn->RemotePort,
-                          (ulong)conn->State, (ulong)conn->RetransmitCount);
+                    ulong localPort = conn->LocalPort;
+                    ulong remotePort = conn->RemotePort;
+                    ulong state = conn->State;
+                    ulong count = conn->RetransmitCount;
+
                     conn->State = TcpStateClosed;
                     conn->RetransmitDeadlineMs = 0;
                     conn->NeedCleanup = true;
@@ -1394,6 +1427,10 @@ void Tcp::ProcessRetransmits()
                     conn->DataReady.Set(1);
                     anyCleanup = true;
                     conn->Lock.Unlock();
+
+                    /* Not under conn->Lock: see TraceEvent. */
+                    Trace(0, "Tcp: conn %u:%u -> %u aborted after %u retransmits",
+                          localPort, remotePort, state, count);
                     continue;
                 }
                 conn->RtoMs *= 2;
@@ -1500,21 +1537,31 @@ void Tcp::Dump(Stdlib::Printer& printer)
     for (ulong i = 0; i < TcpMaxConnections; i++)
     {
         TcpConn* conn = &Pool[i];
+
+        /* A snapshot under the lock, printed after it: the printer is the
+           console or a shell socket, and neither belongs under conn->Lock
+           (see TraceEvent). */
         conn->Lock.Lock();
-        if (conn->State != TcpStateFree)
-        {
-            printer.Printf("  [%u] ", i);
-            conn->LocalIp.Print(printer);
-            printer.Printf(":%u -> ", (ulong)conn->LocalPort);
-            conn->RemoteIp.Print(printer);
-            printer.Printf(":%u  %s  snd=%u/%u rcv=%u\n",
-                           (ulong)conn->RemotePort,
-                           StateToString(conn->State),
-                           (ulong)conn->SendBuf.Used(),
-                           (ulong)(conn->SndNxt - conn->SndUna),
-                           (ulong)conn->RecvBuf.Used());
-        }
+        TcpState state = conn->State;
+        IpAddress localIp = conn->LocalIp;
+        u16 localPort = conn->LocalPort;
+        IpAddress remoteIp = conn->RemoteIp;
+        u16 remotePort = conn->RemotePort;
+        ulong sndUsed = conn->SendBuf.Used();
+        ulong inFlight = (ulong)(conn->SndNxt - conn->SndUna);
+        ulong rcvUsed = conn->RecvBuf.Used();
         conn->Lock.Unlock();
+
+        if (state == TcpStateFree)
+            continue;
+
+        printer.Printf("  [%u] ", i);
+        localIp.Print(printer);
+        printer.Printf(":%u -> ", (ulong)localPort);
+        remoteIp.Print(printer);
+        printer.Printf(":%u  %s  snd=%u/%u rcv=%u\n",
+                       (ulong)remotePort, StateToString(state),
+                       sndUsed, inFlight, rcvUsed);
     }
 }
 
