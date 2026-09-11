@@ -210,6 +210,11 @@ public:
 
     Page* AllocPage();
     static const ulong MaxContiguousPages = 128;
+
+    /* The most pages Mm::MapLargePages maps at one run of VA: 16 MiB, for
+       what outgrows the largest block MapPages serves -- a loadable
+       module's image, the .ko file it is read from */
+    static const ulong MaxLargeMapPages = 4096;
     Page* AllocContiguousPages(ulong count);
     void FreePage(Page* page);
 

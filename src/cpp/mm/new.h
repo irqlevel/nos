@@ -21,6 +21,13 @@ void* MapPages(size_t numPages, ulong* physAddrs);
 
 void UnmapPages(void* ptr, size_t numPages);
 
+/* MapPages for more pages than its largest block holds, up to
+   PageTable::MaxLargeMapPages: a loadable module's image, the .ko it is
+   read from. The pages stay the caller's, as with MapPages. */
+void* MapLargePages(size_t numPages, ulong* physAddrs);
+
+void UnmapLargePages(void* ptr, size_t numPages);
+
 template<typename T, ulong tag, class... Args>
 T* TAlloc(Args&&... args)
 {
