@@ -179,5 +179,12 @@ partition is `/nosenv`: `nosboot` builds and installs a kernel there as
 `/nosenv/nos-kernel64.elf`, and `grub-editenv /nosenv/grubenv set
 nos_next=nos-next` arms a candidate from that side.
 
+Loadable modules come from the same place, and from the same release as the
+kernel that is running -- a kernel refuses a module built against another
+kernel interface ([Modules](modules.md#releases)):
+
+    wget https://github.com/irqlevel/nos/releases/download/<tag>/blkload-x86_64.ko /blkload.ko
+    insmod /blkload.ko
+
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
 as "works on the three machines it was debugged on".

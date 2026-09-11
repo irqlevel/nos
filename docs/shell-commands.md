@@ -28,7 +28,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `pci` | Show PCI devices |
 | `disks` | List block devices |
 | `diskread <disk> <sector>` | Read and hex-dump a sector |
-| `diskwrite <disk> <sector> <hex>` | Write hex data to a sector |
+| `diskwrite <disk> <sector> <hex>` | Write hex data to a sector. Refused on a device a mounted filesystem, the disk log or a `blkload` write test holds, or on a disk or partition overlapping one (see [Filesystems](filesystems.md)) |
 | `partitions <disk>` | Show the partition table (MBR or GPT) |
 | `disklog` | Kernel-log-to-disk state: off unless the kernel was booted with `disklog=on`; otherwise the prepared area it found (if any), boot number, sectors written, lines queued and dropped. The area is laid down under the host OS with `scripts/disklog.py format` and read back with `scripts/disklog.py read` |
 | `irqstat` | Show per-device interrupt counters |
@@ -47,7 +47,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `dhcp [dev]` | Obtain IP address via DHCP |
 | `random [len]` | Get random bytes as hex string, 1..1024, default 16 — from the kernel's ChaCha20 pool, not from a device |
 | `entropy [reseed]` | Show the random pool (seeded, whether hardware entropy reached it, reseeds, bytes generated) and the registered entropy sources; `reseed` draws from every source again first. See [Randomness](random.md) |
-| `format nanofs <disk>` | Format disk with nanofs |
+| `format nanofs <disk>` | Format disk with nanofs. Refused, like `diskwrite`, on a device in use |
 | `mount ramfs <path>` | Mount a ramfs at path |
 | `mount nanofs <disk> <path>` | Mount nanofs from disk at path |
 | `mount ext2 <disk> <path> [ro]` | Mount ext2 from disk at path, read-write unless `ro` (or unless the image carries features the driver does not write; see [Filesystems](filesystems.md)) |

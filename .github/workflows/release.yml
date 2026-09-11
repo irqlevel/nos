@@ -26,6 +26,12 @@ jobs:
           cp bin/kernel64.elf dist/kernel-x86_64.elf
           cp nos.iso          dist/nos.iso
           cp nos.qcow2        dist/nos.qcow2
+          # Every module the Makefile builds, named for the kernel it loads
+          # into: blkload.ko goes up as blkload-x86_64.ko. No match leaves
+          # the pattern itself, and cp fails the step on it.
+          for ko in out/x86_64/modules/*.ko; do
+            cp "$ko" "dist/$(basename "$ko" .ko)-x86_64.ko"
+          done
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -64,6 +70,9 @@ jobs:
           mkdir -p dist
           cp bin/kernel-arm64.elf dist/kernel-arm64.elf
           cp nos-arm64.img        dist/nos-arm64.img
+          for ko in out/aarch64/modules/*.ko; do
+            cp "$ko" "dist/$(basename "$ko" .ko)-arm64.ko"
+          done
 
       - name: Upload
         uses: actions/upload-artifact@v4
@@ -115,11 +124,27 @@ jobs:
             `latest` works too, without naming the tag:
             `https://github.com/${{ github.repository }}/releases/latest/download/kernel-x86_64.elf`
 
-            `SHA256SUMS` covers every file above.
+            ### Kernel modules
+
+            Every loadable module in the tree, built with the kernels above:
+            `<name>-x86_64.ko` and `<name>-arm64.ko`. From a running nos:
+
+            ```sh
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/blkload-x86_64.ko /blkload.ko
+            insmod /blkload.ko
+            ```
+
+            A kernel loads only modules built against its own kernel interface
+            (a digest of the `ffi` crate's sources), so take them from the
+            release the running kernel came from -- `version` names it.
+
+            `SHA256SUMS` covers every file in the release.
+          fail_on_unmatched_files: true
           files: |
             dist/kernel-x86_64.elf
             dist/kernel-arm64.elf
             dist/nos-arm64.img
             dist/nos.iso
             dist/nos.qcow2
+            dist/*.ko
             dist/SHA256SUMS

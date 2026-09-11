@@ -19,11 +19,11 @@
 //! Reads are always allowed. A write test destroys
 //! what is on the device, so it has to be asked for by name, and it claims
 //! the device first: refused while a mounted filesystem, the disk log or
-//! another write test holds it -- or the disk it is a partition of, or a
+//! another writer holds it -- or the disk it is a partition of, or a
 //! partition of it -- whatever else is said, and holding all of those off
 //! until it is done. Unless `force`, it is refused too on a disk with
-//! partitions and on anything that starts with an ext2 filesystem, a
-//! partition table, a boot sector or a prepared disk log area.
+//! partitions and on anything that starts with an ext2 or nanofs
+//! filesystem, a partition table, a boot sector or a prepared disk log area.
 
 extern crate alloc;
 
@@ -39,7 +39,8 @@ use kcore::cmd::{Command, Output};
 use kcore::dma::DmaBuffer;
 use kcore::time::boot_time_ns;
 
-const HELP: &str = "blkload <dev> [randread|randwrite|read|write] [bs=4k] [qd=1] [secs=5] [force] - block I/O load test: IOPS, bandwidth, latency";
+const HELP: &str = "blkload <dev> [randread|randwrite|read|write] [bs=4k] [qd=1] [secs=5] [force] - disk load test";
+const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
 
 const PAGE_SIZE: u64 = 4096;
 const KIB: u64 = 1024;
@@ -66,7 +67,10 @@ const MBR_SIGNATURE_AT: usize = 510;
 const MBR_SIGNATURE: u16 = 0xAA55;
 /* A disk log area prepared for kernel/disklog.cpp begins with "NOSLOG1" */
 const DISKLOG_MAGIC: u64 = 0x0031_474F_4C53_4F4E;
-/* Enough of a device's start to hold all three */
+/* nanofs, `format nanofs`'s, begins its superblock -- the device's first
+   block -- with this (fs/nanofs.h) */
+const NANOFS_MAGIC: u32 = 0x4E41_4E4F;
+/* Enough of a device's start to hold every one of them */
 const PEEK_BYTES: u64 = 4 * KIB;
 
 /* Latency histogram: 2^SUB_BITS buckets to each power of two, so a
@@ -348,13 +352,16 @@ extern "C" fn worker_main(ctx: *mut u8) {
     }
 }
 
-/* The largest transfer the device takes in one I/O, below bs: halved until a
-   read at the start goes through. For when the very first I/O failed, which
-   is what asking a driver for more than it takes at once looks like. */
+/* The largest transfer the device takes in one I/O, below bs: the powers of
+   two under it, largest first, until a read at the start goes through. A
+   driver's limit is a whole number of pages, so bs=12k finds 8k where halving
+   would have stopped at 6k. For when the very first I/O failed, which is
+   what asking a driver for more than it takes at once looks like. */
 fn largest_transfer(disk: &Disk, bs: u64) -> Option<u64> {
     let sector_size = disk.sector_size();
     let mut buf = dma_buffer(bs).ok()?;
-    let mut size = bs / 2;
+    /* bs is a whole number of sectors, so at least 512 */
+    let mut size = 1u64 << (63 - (bs - 1).leading_zeros());
     while size >= sector_size {
         if size % sector_size == 0 && disk.read(0, &mut buf.as_mut_slice()[..size as usize]).is_ok() {
             return Some(size);
@@ -405,6 +412,9 @@ fn check_writable(disk: &Disk, opts: &Options) -> Result<(), String> {
     }
     if word(EXT2_MAGIC_AT) == EXT2_MAGIC {
         return Err(format!("{} holds an ext2 filesystem -- add force to write over it", opts.device));
+    }
+    if u32::from_le_bytes([head[0], head[1], head[2], head[3]]) == NANOFS_MAGIC {
+        return Err(format!("{} holds a nanofs filesystem -- add force to write over it", opts.device));
     }
     if word(MBR_SIGNATURE_AT) == MBR_SIGNATURE {
         return Err(format!(
