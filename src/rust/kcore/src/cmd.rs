@@ -22,6 +22,10 @@ impl core::fmt::Write for Output {
 
 type Handler = dyn Fn(&str, &mut Output) + Send + Sync;
 
+/// How much of a command's help `help` shows: the kernel keeps this many
+/// characters of it (Cmd::DynamicHelpMax) and drops the rest.
+pub const HELP_MAX: usize = 95;
+
 /// A registered command. Dropping it takes the command away, after any call
 /// of it still running has returned -- so its handler, and a module holding
 /// one, can go right after.

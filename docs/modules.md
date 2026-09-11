@@ -127,6 +127,23 @@ demangler in the kernel otherwise.
 
 `hello.ko` comes out around 25 KiB.
 
+### Releases
+
+A tagged release (`.github/workflows/release.yml`) carries every module the
+Makefile builds, next to the kernels it was built with, as `<name>-x86_64.ko`
+and `<name>-arm64.ko` -- so a running nos can fetch one over HTTPS and load
+it:
+
+```
+$ wget https://github.com/irqlevel/nos/releases/download/<tag>/blkload-x86_64.ko /blkload.ko
+$ insmod /blkload.ko
+```
+
+Take it from the release the running kernel came from (`version` names it):
+the kernel from another release may have another kernel interface, and then
+refuses the module ([What a module may call](#what-a-module-may-call)). The
+release's `SHA256SUMS` covers the modules too, for `sha256` to check.
+
 ## Loading
 
 `insmod <path>` reads a `.ko` off any mounted filesystem -- put it on the root
@@ -263,7 +280,10 @@ blkload nvme0: randread, bs 4 KiB, qd 8, 2 s over 64 MiB
   descriptor per request) and two for NVMe (two PRP entries, no PRP lists).
   Past that the first I/O fails, and blkload says the largest size that does
   go through.
-- `secs`, 1 to 60: the command holds its shell that long.
+- `secs`, 1 to 60: the command holds its shell that long. Over the [UDP
+  shell](udp-shell.md) the reply comes whole once the command is done, and
+  `udpsh.py` gives up on one after 30 s unless its third argument says
+  otherwise -- so give a longer run a longer wait: `udpsh.py <host> 9000 90`.
 - Latency is timed per I/O on the kernel's clock, to the nanosecond; the
   percentiles come off a histogram with sixteen buckets to each power of two,
   so they are within 1/16. It runs from submission to the task running
@@ -272,28 +292,32 @@ blkload nvme0: randread, bs 4 KiB, qd 8, 2 s over 64 MiB
 
 Reads are always allowed. A write test destroys what is on the device, so it
 has to be asked for by name, and it claims the device first
-(`BlockDeviceTable::Claim`, which mounts and the disk log take too). The
-claim is refused while a mounted filesystem, the disk log or another write
-test holds the device -- or the disk it is a partition of, or one of its
-partitions -- whatever else is said; once taken, it holds all of those off
-until the test is done, so nothing can be mounted under it midway. Unless
-`force` is given the test is also refused on a disk with partitions, and on
-a device that starts with an ext2 superblock, a partition table, a boot
-sector or a prepared disk log area. A write test ends with a flush, timed.
+(`BlockDeviceTable::Claim`, which mounts and the disk log take too, and the
+shell's `format` and `diskwrite` while they write). The claim is refused
+while a mounted filesystem, the disk log or another writer holds the device
+-- or the disk it is a partition of, or one of its partitions -- whatever
+else is said; once taken, it holds all of those off until the test is done,
+so nothing can be mounted under it midway. Unless `force` is given the test
+is also refused on a disk with partitions, and on a device that starts with
+an ext2 or nanofs superblock, a partition table, a boot sector or a prepared
+disk log area. A write test ends with a flush, timed.
 
 To try a spare partition on a machine's NVMe disk, find it with `disks` --
 a partition is named after its disk and numbered: `nvme01`, `nvme02` -- fetch
-the module with `wget`, and start with reads:
+the module from the release the machine's kernel came from
+([Releases](#releases)), and start with reads:
 
 ```
+wget https://github.com/irqlevel/nos/releases/download/<tag>/blkload-x86_64.ko /blkload.ko
 insmod /blkload.ko
 blkload nvme02 randread qd=32 secs=10
 blkload nvme02 randwrite qd=32 secs=10
 blkload nvme02 write bs=8k qd=16
 ```
 
-The machine's kernel has to come from the same tree as the module -- see
-[What a module may call](#what-a-module-may-call) -- so update it first.
+The module and the machine's kernel have to share a kernel interface -- see
+[What a module may call](#what-a-module-may-call) -- so take both from one
+release, or build both from one tree.
 
 ## Backtraces
 

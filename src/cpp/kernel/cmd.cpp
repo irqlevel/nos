@@ -975,6 +975,9 @@ static void CmdDiskread(const char* args, Stdlib::Printer& con)
     }
 }
 
+/* What diskwrite's claim on its device says to whoever is refused it */
+static const char DiskwriteHolder[] = "diskwrite";
+
 static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -1032,10 +1035,22 @@ static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
 
     if (byteCount > 0)
     {
+        /* Not around a mounted filesystem, the disk log or a write test */
+        auto& table = BlockDeviceTable::GetInstance();
+        const char* heldBy = nullptr;
+        const ulong claim = table.Claim(dev, DiskwriteHolder, heldBy);
+        if (claim == 0)
+        {
+            con.Printf("disk '%s' is in use by %s\n", diskName, heldBy);
+            return;
+        }
+
         if (!dev->WriteSectors(sector, buf, 1))
             con.Printf("write error\n");
         else
             con.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
+
+        table.Release(claim);
     }
 }
 
@@ -2626,6 +2641,9 @@ static void CmdGrubenv(const char* args, Stdlib::Printer& con)
         con.Printf("sync failed\n");
 }
 
+/* What format's claim on its device says to whoever is refused it */
+static const char FormatHolder[] = "format";
+
 static void CmdFormat(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -2660,8 +2678,25 @@ static void CmdFormat(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    NanoFs fs(dev);
-    if (fs.Format(dev))
+    /* Not under a mounted filesystem, the disk log or a write test, nor over
+       a disk one of those holds a partition of */
+    auto& table = BlockDeviceTable::GetInstance();
+    const char* heldBy = nullptr;
+    const ulong claim = table.Claim(dev, FormatHolder, heldBy);
+    if (claim == 0)
+    {
+        con.Printf("disk '%s' is in use by %s\n", diskName, heldBy);
+        return;
+    }
+
+    bool formatted = false;
+    {
+        NanoFs fs(dev);
+        formatted = fs.Format(dev);
+    }
+    table.Release(claim);
+
+    if (formatted)
     {
         con.Printf("formatted %s as nanofs\n", diskName);
     }
