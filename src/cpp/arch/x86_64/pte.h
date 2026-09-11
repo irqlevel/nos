@@ -24,9 +24,10 @@ struct Pte final
 
     ulong Address()
     {
-        ulong address =  Value & (~BitMask);
-        BugOn(address & BitMask);
-        return address;
+        /* Bits 12-51 only: NX is bit 63, so an entry that maps a page
+           non-executable would otherwise hand back an address with the top
+           bit set -- and GetPage() a BUG -- the moment it is unmapped */
+        return Value & AddrMask;
     }
 
     bool Present()
@@ -137,6 +138,11 @@ struct Pte final
     static const ulong BitMask = (1UL << MaxBit) - 1;
 
     static const ulong NxBit = 1UL << 63;
+
+    /* The frame address: bits 12 up to 51, the architectural limit on
+       MAXPHYADDR. Above it sit bits the CPU ignores, the protection keys and
+       NX, none of them part of the address. */
+    static const ulong AddrMask = 0x000FFFFFFFFFF000UL;
 
     static const ulong HugePageShift = 21;
     static const ulong HugePageSize = 1UL << HugePageShift;
