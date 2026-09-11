@@ -98,6 +98,7 @@ private:
         char Path[MaxPath];
         FileSystem* Fs;
         bool ReadOnly;
+        ulong Claim;    /* on the filesystem's device, for as long as it is mounted */
     };
 
     bool ResolvePath(const char* path, FileSystem*& fs, VNode*& node, VNode*& parent, char* lastName, ulong lastNameSize);

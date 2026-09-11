@@ -234,6 +234,67 @@ module: built against another kernel interface (ffi 3fa81c..., this kernel 9b02e
 A module built outside the Makefile carries `unset` and is refused by a kernel
 that was not.
 
+## blkload
+
+`blkload` (`src/rust/modules/blkload`) runs a short load test against a block
+device -- a disk, or one of its partitions, by the name `disks` gives it --
+and reports IOPS, bandwidth and latency. Under QEMU, against its emulated
+NVMe disk:
+
+```
+$ insmod /blkload.ko
+$ blkload nvme0 randread qd=8 secs=2
+blkload nvme0: randread, bs 4 KiB, qd 8, 2 s over 64 MiB
+  51965 ios in 2.06 s: 25223 IOPS, 98.5 MiB/s
+  latency us: min 56.0, avg 297.6, p50 270.3, p90 434.1, p99 770.0, p99.9 1146.8, max 9557.0
+```
+
+    blkload <dev> [randread|randwrite|read|write] [bs=4k] [qd=1] [secs=5] [force]
+
+- `randread`, the default, and `randwrite` pick blocks at random over the
+  whole device; `read` and `write` go through it in order, the tasks taking
+  consecutive blocks.
+- `qd` tasks, up to 64, each keep one I/O in flight: the queue depth asked
+  of the driver, which passes on as many as it has room for -- 8 at a time
+  for virtio-blk, 63 for NVMe. A burst past that waits for a command to
+  complete rather than failing.
+- `bs` is a whole number of sectors, up to 512 KiB -- and no more than the
+  driver takes in one I/O, which today is a page for virtio-blk (one
+  descriptor per request) and two for NVMe (two PRP entries, no PRP lists).
+  Past that the first I/O fails, and blkload says the largest size that does
+  go through.
+- `secs`, 1 to 60: the command holds its shell that long.
+- Latency is timed per I/O on the kernel's clock, to the nanosecond; the
+  percentiles come off a histogram with sixteen buckets to each power of two,
+  so they are within 1/16. It runs from submission to the task running
+  again: the kernel's waits yield rather than sleep, so with more tasks than
+  CPUs it includes waiting for one, and the test keeps the CPUs busy.
+
+Reads are always allowed. A write test destroys what is on the device, so it
+has to be asked for by name, and it claims the device first
+(`BlockDeviceTable::Claim`, which mounts and the disk log take too). The
+claim is refused while a mounted filesystem, the disk log or another write
+test holds the device -- or the disk it is a partition of, or one of its
+partitions -- whatever else is said; once taken, it holds all of those off
+until the test is done, so nothing can be mounted under it midway. Unless
+`force` is given the test is also refused on a disk with partitions, and on
+a device that starts with an ext2 superblock, a partition table, a boot
+sector or a prepared disk log area. A write test ends with a flush, timed.
+
+To try a spare partition on a machine's NVMe disk, find it with `disks` --
+a partition is named after its disk and numbered: `nvme01`, `nvme02` -- fetch
+the module with `wget`, and start with reads:
+
+```
+insmod /blkload.ko
+blkload nvme02 randread qd=32 secs=10
+blkload nvme02 randwrite qd=32 secs=10
+blkload nvme02 write bs=8k qd=16
+```
+
+The machine's kernel has to come from the same tree as the module -- see
+[What a module may call](#what-a-module-may-call) -- so update it first.
+
 ## Backtraces
 
 A frame in a module's code is named like the kernel's own, with the module

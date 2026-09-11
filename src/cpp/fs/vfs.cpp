@@ -22,6 +22,9 @@ Vfs::~Vfs()
 {
 }
 
+/* What a mount's claim on its device says to whoever is refused it */
+static const char MountHolder[] = "a mounted filesystem";
+
 bool Vfs::Mount(const char* path, FileSystem* fs, bool readOnly)
 {
     if (path == nullptr || fs == nullptr)
@@ -75,10 +78,26 @@ bool Vfs::Mount(const char* path, FileSystem* fs, bool readOnly)
         return false;
     }
 
+    /* The device is the filesystem's while it is mounted: nothing may write
+       to it around the filesystem -- the disk log, a module going direct --
+       nor another mount take it, or a disk or partition overlapping it */
+    ulong claim = 0;
+    if (dev != nullptr)
+    {
+        const char* heldBy = nullptr;
+        claim = BlockDeviceTable::GetInstance().Claim(dev, MountHolder, heldBy);
+        if (claim == 0)
+        {
+            Trace(0, "Vfs::Mount: %s is in use by %s", dev->GetName(), heldBy);
+            return false;
+        }
+    }
+
     fs->ReadOnly = readOnly;
     if (!fs->Mount())
     {
         Trace(0, "Vfs::Mount: fs->Mount() failed for %s", path);
+        BlockDeviceTable::GetInstance().Release(claim);
         return false;
     }
 
@@ -92,6 +111,7 @@ bool Vfs::Mount(const char* path, FileSystem* fs, bool readOnly)
     Stdlib::StrnCpy(Mounts[MountCount].Path, path, MaxPath);
     Mounts[MountCount].Fs = fs;
     Mounts[MountCount].ReadOnly = readOnly;
+    Mounts[MountCount].Claim = claim;
     MountCount++;
     return true;
 }
@@ -119,6 +139,7 @@ FileSystem* Vfs::Unmount(const char* path)
             }
 
             fs->Unmount();
+            BlockDeviceTable::GetInstance().Release(Mounts[i].Claim);
 
             // Shift remaining entries
             for (ulong j = i; j + 1 < MountCount; j++)
@@ -981,6 +1002,7 @@ void Vfs::UnmountAll()
             Trace(0, "Vfs::UnmountAll: %s has %u open files", Mounts[longestIdx].Path, fs->OpenFiles);
 
         fs->Unmount();
+        BlockDeviceTable::GetInstance().Release(Mounts[longestIdx].Claim);
         delete fs;
 
         for (ulong j = longestIdx; j + 1 < MountCount; j++)

@@ -14,6 +14,8 @@ public:
     virtual u64 GetCapacity() = 0;         /* Total sectors */
     virtual u64 GetSectorSize() = 0;       /* Bytes per sector */
     virtual bool Flush() { return true; }
+    /* The disk a partition is on; nullptr for a whole disk */
+    virtual BlockDevice* GetParent() { return nullptr; }
     virtual bool ReadSectors(u64 sector, void* buf, u32 count) = 0;
     virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) = 0;
 
@@ -44,6 +46,19 @@ public:
     ulong GetCount();
 
     BlockDevice* GetDevice(ulong index);
+
+    /* Exclusive users of a device: a mounted filesystem, the disk log, code
+       writing to it around both (a module's, through kcore::block). A claim
+       is refused while another overlaps it -- the same device, the disk a
+       partition is on, or a partition of that disk -- and heldBy then names
+       the holder. holder has to outlive the claim. Reads need no claim.
+       Returns a handle for Release, 0 when refused. */
+    ulong Claim(BlockDevice* dev, const char* holder, const char*& heldBy);
+    void Release(ulong claim);
+
+    /* Whether writing to one can touch the other: the same device, or a disk
+       and a partition of it */
+    static bool Overlap(BlockDevice* a, BlockDevice* b);
 
     static const ulong MaxDevices = 48;
 

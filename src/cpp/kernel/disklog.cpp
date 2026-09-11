@@ -96,6 +96,9 @@ void DiskLog::SwitchOff()
     Off = true;
 }
 
+/* What the disk log's claim on its device says to whoever is refused it */
+static const char DiskLogHolder[] = "the disk log";
+
 bool DiskLog::Setup()
 {
     /* Asked for, or nothing at all -- not a disk read, not a buffer. An area
@@ -133,9 +136,20 @@ bool DiskLog::Setup()
         if (!ReadHeader(dev, hdr))
             continue;
 
+        /* The area is the disk log's from here on: a mount of the device, or
+           of the disk it is on, or a module writing to it direct is refused */
+        const char* heldBy = nullptr;
+        const ulong claim = table.Claim(dev, DiskLogHolder, heldBy);
+        if (claim == 0)
+        {
+            Trace(0, "DiskLog: %s is in use by %s, not writing to it", dev->GetName(), heldBy);
+            continue;
+        }
+
         {
             Stdlib::AutoLock lock(Lock);
             Dev = dev;
+            DevClaim = claim;
             AreaStartSector = 0;
             AreaSectors = hdr.AreaSectors;
             SectorSize = hdr.SectorSize;
@@ -150,10 +164,14 @@ bool DiskLog::Setup()
            previous boot's text under a stale length. */
         if (!WriteHeader())
         {
-            Stdlib::AutoLock lock(Lock);
-            Enabled = false;
-            Off = true;
-            Dev = nullptr;
+            {
+                Stdlib::AutoLock lock(Lock);
+                Enabled = false;
+                Off = true;
+                Dev = nullptr;
+                DevClaim = 0;
+            }
+            table.Release(claim);
             return false;
         }
 
@@ -171,6 +189,8 @@ bool DiskLog::Setup()
             Trace(0, "DiskLog: no writer task, the log on disk stops here");
             Flush();
             SwitchOff();
+            table.Release(DevClaim);
+            DevClaim = 0;
             return false;
         }
 
@@ -468,6 +488,10 @@ void DiskLog::Stop()
     StopTask();
     Flush();
     SwitchOff();
+
+    /* Nothing writes the area again: it goes back to whoever wants it */
+    BlockDeviceTable::GetInstance().Release(DevClaim);
+    DevClaim = 0;
 }
 
 void DiskLog::PanicFlush()

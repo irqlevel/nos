@@ -78,6 +78,7 @@ public:
     bool Init(BlockDevice* parent, u64 startSector, u64 sectorCount, const char* name);
 
     virtual const char* GetName() override;
+    virtual BlockDevice* GetParent() override;
     virtual u64 GetCapacity() override;
     virtual u64 GetSectorSize() override;
     virtual bool Flush() override;
