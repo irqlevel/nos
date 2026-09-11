@@ -7,6 +7,7 @@
 #include "trace.h"
 #include "stack_trace.h"
 #include "symtab.h"
+#include "module.h"
 #include "task.h"
 
 #include <hal/irqchip.h>
@@ -70,22 +71,36 @@ void Panicker::DumpContext()
 
 void Panicker::DumpBacktrace(ulong* frames, size_t count)
 {
-    char buf[128];
+    char where[SymbolTable::DescribeMax];
+    char buf[SymbolTable::DescribeMax + 32];
     auto& symtab = SymbolTable::GetInstance();
 
     PrintOutput("Backtrace:\n");
     for (size_t i = 0; i < count; i++)
     {
-        const char* name;
-        ulong offset;
-        if (symtab.Resolve(frames[i], name, offset))
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%u] 0x%p %s+0x%p\n",
-                (ulong)i, frames[i], name, offset);
+        if (symtab.Describe(frames[i], where, sizeof(where)))
+            Stdlib::SnPrintf(buf, sizeof(buf), "  [%u] 0x%p %s\n",
+                (ulong)i, frames[i], where);
         else
             Stdlib::SnPrintf(buf, sizeof(buf), "  [%u] 0x%p\n",
                 (ulong)i, frames[i]);
         PrintOutput(buf);
     }
+}
+
+/* Where each loaded module sits, so a frame nothing could name -- or one read
+   off a log later -- can still be placed */
+void Panicker::DumpModules()
+{
+    static const ulong LineMax = 256;
+    char list[LineMax];
+    char buf[LineMax + 16];
+
+    if (!ModuleTable::GetInstance().DescribeAll(list, sizeof(list)))
+        return;
+
+    Stdlib::SnPrintf(buf, sizeof(buf), "Modules: %s\n", list);
+    PrintOutput(buf);
 }
 
 bool Panicker::CollectRemoteStack()
@@ -199,6 +214,7 @@ void Panicker::DoPanic(const char *fmt, ...)
         ulong frames[16];
         size_t count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
         DumpBacktrace(frames, count);
+        DumpModules();
 
         /* Before the halting IPI: the CPU worth asking has interrupts off and
            would never take that one. */
@@ -249,6 +265,7 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
         size_t count = StackTrace::CaptureFromSp(ctx->GetFramePointer(),
             ctx->GetOrigRsp(hasErrorCode), frames, Stdlib::ArraySize(frames));
         DumpBacktrace(frames, count);
+        DumpModules();
 
         CollectRemoteStacks();
 

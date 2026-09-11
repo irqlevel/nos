@@ -1,0 +1,12 @@
+[package]
+name = "mod-slowexit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_slowexit"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../kmod" }
+kcore = { path = "../../kcore" }

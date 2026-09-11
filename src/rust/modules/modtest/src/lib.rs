@@ -11,7 +11,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use kcore::cmd::Command;
 use kcore::error::{Error, Result};
 
@@ -21,6 +21,13 @@ use kcore::error::{Error, Result};
 static DATA: [AtomicU32; 4] = [AtomicU32::new(1), AtomicU32::new(2), AtomicU32::new(3), AtomicU32::new(4)];
 static ZEROED: AtomicU32 = AtomicU32::new(0);
 static TABLE: [fn(u32) -> u32; 3] = [double, square, negate];
+
+/* A megabyte of .bss: twice what a module's image could once be, which it
+   can be now that images are mapped from a window of their own. It has to
+   come out mapped, writable and zeroed from its first page to its last. */
+const BIG_LEN: usize = 1 << 20;
+const PAGE: usize = 4096;
+static BIG: [AtomicU8; BIG_LEN] = [const { AtomicU8::new(0) }; BIG_LEN];
 
 fn double(x: u32) -> u32 {
     x * 2
@@ -74,6 +81,11 @@ fn init() -> Result<Box<dyn kmod::Module>> {
     ZEROED.fetch_add(5, Ordering::Relaxed);
     check(ZEROED.load(Ordering::Relaxed) == 5, ".bss")?;
 
+    let zeroed = (0..BIG_LEN).step_by(PAGE).all(|i| BIG[i].load(Ordering::Relaxed) == 0);
+    check(zeroed && BIG[BIG_LEN - 1].load(Ordering::Relaxed) == 0, "a megabyte of .bss")?;
+    BIG[BIG_LEN - 1].store(0x5a, Ordering::Relaxed);
+    check(BIG[BIG_LEN - 1].load(Ordering::Relaxed) == 0x5a, "the last page of .bss")?;
+
     let table = TABLE.iter().fold(0u32, |acc, f| acc.wrapping_add(f(3)));
     check(table == 12, "a table of function pointers")?;
 
@@ -89,9 +101,12 @@ fn init() -> Result<Box<dyn kmod::Module>> {
         let _guard = lock.lock();
     }
 
+    /* Where one of its functions landed, for the test to name through the
+       kernel's symbolizer -- the way a backtrace through this module would */
     let answer = shape.area() + data;
+    let probe = double as fn(u32) -> u32 as usize;
     let cmd = Command::register("modtest", "modtest - the loader self-test module's command", move |args, out| {
-        let _ = writeln!(out, "modtest: answer {} args '{}'", answer, args);
+        let _ = writeln!(out, "modtest: answer {} args '{}' double at {}", answer, args, probe);
     })?;
 
     kcore::trace!(0, "modtest: loaded, every check passed");

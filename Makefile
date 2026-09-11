@@ -384,7 +384,7 @@ $(RUST_LIB): $(RUST_SRC)
 # large one has no position-independent form worth having; and
 # compiler-builtins' own memcpy and friends, so that a module imports nothing
 # but the kernel's API.
-MODULES = hello modtest
+MODULES = hello modtest slowexit
 MODULE_KO = $(patsubst %,$(OUT)/modules/%.ko,$(MODULES))
 MODULE_RUSTFLAGS_x86_64 = ["-Ccode-model=small","-Crelocation-model=pic"]
 MODULE_RUSTFLAGS_aarch64 = ["-Crelocation-model=pic"]
@@ -393,7 +393,11 @@ MODULE_LDEMU_aarch64 = aarch64elf
 # -Bsymbolic binds a module's references to itself at link time, which leaves
 # the loader RELATIVE relocations and the kernel's functions to resolve;
 # separate-loadable-segments on 4 KiB pages gives every segment pages of its
-# own, which the loader needs to give each its own permissions.
+# own, which the loader needs to give each its own permissions. The linked
+# object then gets a .nos_syms section: its functions, "<offset> <name>" a
+# line, in address order and demangled by llvm-nm -C -- Rust's v0 names
+# would need a demangler in the kernel otherwise -- which the loader keeps so
+# a backtrace through a module can name its frames.
 MODULE_LDFLAGS = -m $(MODULE_LDEMU_$(ARCH)) -shared -Bsymbolic --gc-sections \
     -z separate-loadable-segments -z max-page-size=4096 -z norelro \
     -z noexecstack -z now --build-id=none --hash-style=sysv \
@@ -411,7 +415,10 @@ $(OUT)/modules/%.ko: $(RUST_SRC) src/rust/kmod/module.ver
 	    --target $(RUST_TARGET) -p mod-$* --target-dir target/modules \
 	    --config 'target.$(RUST_TARGET).rustflags=$(MODULE_RUSTFLAGS_$(ARCH))' \
 	    --config 'unstable.build-std-features=["compiler-builtins-mem"]'
-	ld.lld $(MODULE_LDFLAGS) -o $@ src/rust/target/modules/$(RUST_TARGET)/release/libmod_$*.a
+	ld.lld $(MODULE_LDFLAGS) -o $@.elf src/rust/target/modules/$(RUST_TARGET)/release/libmod_$*.a
+	llvm-nm -n -C --defined-only $@.elf | awk '$$2 ~ /^[tTwW]$$/ { a = $$1; sub(/^[0-9a-fA-F]+ [tTwW] /, ""); print a " " $$0 }' > $@.syms
+	$(OBJCOPY) --add-section .nos_syms=$@.syms $@.elf $@
+	@rm -f $@.elf $@.syms
 
 $(OUT)/kernel/module.o: CXXFLAGS += -DNOS_MODULE_ABI=\"$(MODULE_ABI)\"
 $(OUT)/kernel/module.o: $(MODULE_FFI_SRC)

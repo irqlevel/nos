@@ -12,6 +12,7 @@
 #include "module.h"
 #include "cmd.h"
 #include "elf.h"
+#include "symtab.h"
 #include <hal/cpu.h>
 #include <block/block_device.h>
 #include <fs/vfs.h>
@@ -2323,61 +2324,53 @@ Stdlib::Error TestGrubEnv()
 extern "C" const u8 nos_modtest_ko[];
 extern "C" const ulong nos_modtest_ko_size;
 
-/* A Printer that keeps what it is given, for a test to read back */
-class CapturePrinter final : public Stdlib::Printer
+/* The command's output says where modtest's double() landed. The symbolizer
+   has to name it back, out of the function table the build put in the .ko --
+   and the kernel's own functions still by the kernel's table, with an
+   address in neither left unnamed. */
+static Stdlib::Error CheckSymbolizer(const char* output)
 {
-public:
-    CapturePrinter()
-        : Pos(0)
+    static const char Marker[] = "double at ";
+    static const ulong DigitsMax = 24;
+
+    const char* at = Stdlib::StrStr(output, Marker);
+    if (at == nullptr)
     {
-        Buf[0] = '\0';
+        Trace(0, "TestModules: no address in: %s", output);
+        return MakeError(Stdlib::Error::NotFound);
     }
 
-    virtual void Printf(const char *fmt, ...) override
+    char digits[DigitsMax];
+    ulong n = 0;
+    at += sizeof(Marker) - 1;
+    for (; n < sizeof(digits) - 1 && at[n] >= '0' && at[n] <= '9'; n++)
+        digits[n] = at[n];
+    digits[n] = '\0';
+
+    auto& symtab = SymbolTable::GetInstance();
+    char where[SymbolTable::DescribeMax];
+    where[0] = '\0';
+    ulong addr = 0;
+    if (!Stdlib::ParseUlong(digits, addr) ||
+        !symtab.Describe(addr, where, sizeof(where)) ||
+        Stdlib::StrStr(where, "mod_modtest::double+0x") == nullptr ||
+        Stdlib::StrStr(where, "[modtest]") == nullptr)
     {
-        va_list args;
-        va_start(args, fmt);
-        VPrintf(fmt, args);
-        va_end(args);
+        Trace(0, "TestModules: modtest's double() at 0x%p named '%s'", addr, where);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    virtual void VPrintf(const char *fmt, va_list args) override
+    where[0] = '\0';
+    if (!symtab.Describe(reinterpret_cast<ulong>(&CheckSymbolizer), where, sizeof(where)) ||
+        Stdlib::StrStr(where, "CheckSymbolizer") == nullptr ||
+        symtab.Describe(0, where, sizeof(where)))
     {
-        char line[LineSize];
-        if (Stdlib::VsnPrintf(line, sizeof(line), fmt, args) > 0)
-            PrintString(line);
+        Trace(0, "TestModules: the kernel's own named '%s'", where);
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    virtual void PrintString(const char *s) override
-    {
-        ulong len = Stdlib::StrLen(s);
-        if (len > sizeof(Buf) - 1 - Pos)
-            len = sizeof(Buf) - 1 - Pos;
-        Stdlib::MemCpy(Buf + Pos, s, len);
-        Pos += len;
-        Buf[Pos] = '\0';
-    }
-
-    virtual void Backspace() override
-    {
-    }
-
-    const char* Get() const
-    {
-        return Buf;
-    }
-
-    void Reset()
-    {
-        Pos = 0;
-        Buf[0] = '\0';
-    }
-
-private:
-    static const ulong LineSize = 256;
-    char Buf[1024];
-    ulong Pos;
-};
+    return MakeSuccess();
+}
 
 /* Overwrite every occurrence of from with to, a string as long */
 static void PatchAll(u8* buf, ulong size, const char* from, const char* to)
@@ -2421,9 +2414,11 @@ Stdlib::Error TestModules()
        kernel interface the module was built against */
     static const ulong HeaderAbiOffset = 8;
     static const ulong DamageCount = 6;
+    static const ulong OutputSize = 1024;
 
     auto& modules = ModuleTable::GetInstance();
-    CapturePrinter out;
+    char output[OutputSize];
+    Stdlib::BufferPrinter out(output, sizeof(output));
 
     for (ulong round = 0; round < 2; round++)
     {
@@ -2442,6 +2437,10 @@ Stdlib::Error TestModules()
             Trace(0, "TestModules: the module's command answered: %s", out.Get());
             return MakeError(Stdlib::Error::Unsuccessful);
         }
+
+        err = CheckSymbolizer(out.Get());
+        if (!err.Ok())
+            return err;
 
         out.Reset();
         err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, out);
