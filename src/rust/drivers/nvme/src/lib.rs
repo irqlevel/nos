@@ -588,9 +588,8 @@ extern "C" fn nvme_flush(ctx: *mut u8) -> i32 {
     };
 
     let cid = {
-        let _guard = unsafe { (*dev).io_lock.lock() };
-        let cid = match alloc_cid(dev) {
-            Some(c) => c,
+        let (_guard, cid) = match lock_with_cid(dev) {
+            Some(held) => held,
             None => {
                 trace!(0, "NVMe: flush: all CID slots busy");
                 /* Disarm the completion (never submitted) before it drops. */
@@ -666,9 +665,8 @@ fn submit_io(
     let opcode = if is_write { OPC_WRITE } else { OPC_READ };
 
     let cid = {
-        let _guard = unsafe { (*dev).io_lock.lock() };
-        let cid = match alloc_cid(dev) {
-            Some(c) => c,
+        let (_guard, cid) = match lock_with_cid(dev) {
+            Some(held) => held,
             None => {
                 trace!(0, "NVMe: submit_io: all CID slots busy");
                 /* Disarm the completion (never submitted) before it drops. */
@@ -706,6 +704,28 @@ fn submit_io(
         return -1;
     }
     0
+}
+
+/* When every command ID is in flight: how long to wait for one, a little at
+ * a time. A second is far past any completion; past it the I/O fails as it
+ * always did -- which the panic path, where nothing completes, needs. */
+const CID_WAIT_NS: u64 = 50_000;
+const CID_WAIT_TRIES: u32 = 20_000;
+
+/* io_lock, held, and a free command ID under it. Every ID in flight at once
+ * -- several tasks' I/O together, a load test's -- is no reason to fail a
+ * synchronous read or write: one comes back with the next completion, so
+ * wait for it. None only once CID_WAIT_TRIES have gone by. */
+fn lock_with_cid<'a>(dev: *mut NvmeDevice) -> Option<(sync::SpinLockGuard<'a>, u16)> {
+    for _ in 0..CID_WAIT_TRIES {
+        let guard = unsafe { (*dev).io_lock.lock() };
+        if let Some(cid) = alloc_cid(dev) {
+            return Some((guard, cid));
+        }
+        drop(guard);
+        kcore::task::sleep(kcore::time::Duration::from_nanos(CID_WAIT_NS));
+    }
+    None
 }
 
 /* Allocate a free command ID slot.  Returns None when all IO_QUEUE_DEPTH

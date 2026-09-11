@@ -37,6 +37,9 @@ static const ulong RustAllocTag = 'rust';
 /* kernel_printer_write hands a Printer at most this much at a time */
 static const unsigned long PrinterChunkSize = 128;
 
+/* Longer than any block device's name: a partition's is at most 15 */
+static const unsigned long BlockDevNameMax = 32;
+
 extern "C" {
 
 void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long len)
@@ -99,6 +102,11 @@ void kernel_get_boot_time(unsigned long* secs, unsigned long* usecs)
     auto t = Kernel::GetBootTime();
     *secs = t.GetSecs();
     *usecs = t.GetUsecs();
+}
+
+unsigned long long kernel_get_boot_time_ns()
+{
+    return Kernel::GetBootTime().GetValue();
 }
 
 unsigned long kernel_get_wall_time_secs()
@@ -1533,6 +1541,83 @@ void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len
         buf += n;
         len -= n;
     }
+}
+
+/* Block devices from Rust, the consuming side (kcore::block::Disk). A device
+   lives as long as the kernel does, so its handle is its pointer and needs
+   no release. */
+unsigned long kernel_blockdev_find(const unsigned char* name, unsigned long nameLen)
+{
+    char key[BlockDevNameMax];
+    if (name == nullptr || nameLen == 0 || nameLen >= sizeof(key))
+        return 0;
+
+    Stdlib::MemCpy(key, name, nameLen);
+    key[nameLen] = '\0';
+    return reinterpret_cast<unsigned long>(Kernel::BlockDeviceTable::GetInstance().Find(key));
+}
+
+unsigned long long kernel_blockdev_capacity(unsigned long handle)
+{
+    return reinterpret_cast<Kernel::BlockDevice*>(handle)->GetCapacity();
+}
+
+unsigned long long kernel_blockdev_sector_size(unsigned long handle)
+{
+    return reinterpret_cast<Kernel::BlockDevice*>(handle)->GetSectorSize();
+}
+
+int kernel_blockdev_read(unsigned long handle, unsigned long long sector,
+    unsigned char* buf, unsigned int count)
+{
+    auto* dev = reinterpret_cast<Kernel::BlockDevice*>(handle);
+    return dev->ReadSectors(sector, buf, count) ? 0 : -1;
+}
+
+int kernel_blockdev_write(unsigned long handle, unsigned long long sector,
+    const unsigned char* buf, unsigned int count, int fua)
+{
+    auto* dev = reinterpret_cast<Kernel::BlockDevice*>(handle);
+    return dev->WriteSectors(sector, buf, count, fua != 0) ? 0 : -1;
+}
+
+int kernel_blockdev_flush(unsigned long handle)
+{
+    return reinterpret_cast<Kernel::BlockDevice*>(handle)->Flush() ? 0 : -1;
+}
+
+/* A claim from Rust holds the device against mounts, the disk log and other
+   writers (BlockDeviceTable::Claim) */
+unsigned long kernel_blockdev_claim(unsigned long handle, const char** heldBy)
+{
+    static const char Holder[] = "a module writing to it";
+
+    auto* dev = reinterpret_cast<Kernel::BlockDevice*>(handle);
+    const char* held = nullptr;
+    ulong claim = Kernel::BlockDeviceTable::GetInstance().Claim(dev, Holder, held);
+    if (claim == 0 && heldBy != nullptr)
+        *heldBy = held;
+    return claim;
+}
+
+void kernel_blockdev_release(unsigned long claim)
+{
+    Kernel::BlockDeviceTable::GetInstance().Release(claim);
+}
+
+unsigned int kernel_blockdev_partitions(unsigned long handle)
+{
+    auto* dev = reinterpret_cast<Kernel::BlockDevice*>(handle);
+    auto& table = Kernel::BlockDeviceTable::GetInstance();
+
+    unsigned int count = 0;
+    for (ulong i = 0; i < table.GetCount(); i++)
+    {
+        Kernel::BlockDevice* other = table.GetDevice(i);
+        if (other != nullptr && other->GetParent() == dev)
+            count++;
+    }
+    return count;
 }
 
 } /* extern "C" */

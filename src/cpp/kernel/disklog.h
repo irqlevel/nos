@@ -161,6 +161,7 @@ private:
     SpinLock Lock;
 
     BlockDevice* Dev;
+    ulong DevClaim = 0;    /* BlockDeviceTable::Claim's, on Dev */
     u64 AreaStartSector;   /* the header sector */
     u64 AreaSectors;
     u32 SectorSize;

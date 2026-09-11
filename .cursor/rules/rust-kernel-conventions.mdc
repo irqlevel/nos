@@ -37,7 +37,7 @@ Add a new kernel service in three steps:
 |---|---|
 | `consts` | `PAGE_SIZE`, `SECTOR_SIZE`, `KB`/`MB`/`GB`, `NS_PER_SEC`/`MS`/`US` |
 | `trace` | `trace!(level, "fmt {}", arg)` macro — level 0 always visible |
-| `time` | `Duration`, `boot_time()`, `wall_clock_secs()` |
+| `time` | `Duration`, `boot_time()`, `boot_time_ns()` (full resolution), `wall_clock_secs()` |
 | `random` | `fill_random(&mut [u8])`, `random_u64()` |
 | `pci` | Device scan, config r/w, BAR access (`get_bar`, `get_bar64`) |
 | `dma` | `DmaBuffer` (contiguous DMA alloc), `PhysMapping`, `virt_to_phys` |
@@ -49,7 +49,8 @@ Add a new kernel service in three steps:
 | `softirq` | `raise`, `register` (types: `TYPE_NET_RX`, `TYPE_BLK_IO`, etc.) |
 | `timer` | `Timer` (periodic, 8 slots, fires on CPU 0 via IPI) |
 | `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI) |
-| `block` | `register` → `BlockDeviceRegistration` |
+| `block` | `register` → `BlockDeviceRegistration`; `Disk` — an existing disk or partition by name: synchronous `read`/`write`/`flush`, `partitions`; `claim` → `DiskClaim` before writing (refused while a mount, the disk log or another writer holds it or an overlapping disk/partition) |
+| `cmd` | `Command::register` — a shell command whose handler writes to an `Output`; unregistered on drop, after any running call returns |
 | `net` | `register` → `NetDeviceHandle`, `NetFrame` |
 
 ## Interrupt handlers

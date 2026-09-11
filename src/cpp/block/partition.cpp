@@ -45,6 +45,11 @@ bool PartitionDevice::Init(BlockDevice* parent, u64 startSector, u64 sectorCount
     return true;
 }
 
+BlockDevice* PartitionDevice::GetParent()
+{
+    return Parent;
+}
+
 const char* PartitionDevice::GetName()
 {
     return Name;
