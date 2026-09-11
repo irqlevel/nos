@@ -61,6 +61,43 @@ void PreemptEnable()
     }
 }
 
+Task* PreemptDisableTask()
+{
+    if (!PreemptIsOn())
+        return nullptr;
+
+    /* Not GetCurrentTask(), whose BugOn is for callers that know they run on
+       a task: a lock is taken from stacks that are not one. */
+    Task* task = Task::TryGetCurrentTask();
+    if (task != nullptr)
+        task->PreemptDisableCounter.Inc();
+
+    return task;
+}
+
+void PreemptEnableTask(Task* task)
+{
+    if (task == nullptr)
+        return;
+
+    BugOn(task->PreemptDisableCounter.Get() == 0);
+    task->PreemptDisableCounter.Dec();
+}
+
+bool PreemptCanBlock()
+{
+    if (!Hal::IsInterruptEnabled())
+        return false;
+
+    /* Before the scheduler runs nothing is ever switched away, so a wait
+       spins through to its end: interrupts are the whole question. */
+    if (!PreemptIsOn())
+        return true;
+
+    Task* task = Task::TryGetCurrentTask();
+    return task != nullptr && task->PreemptDisableCounter.Get() == 0;
+}
+
 static constexpr ulong PreemptWasOnBit = (1UL << 63);
 
 ulong PreemptIrqSave()

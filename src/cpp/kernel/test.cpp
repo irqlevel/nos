@@ -2,6 +2,7 @@
 #include "debug.h"
 #include "task.h"
 #include "sched.h"
+#include "preempt.h"
 #include "cpu.h"
 #include "stack_trace.h"
 #include "random.h"
@@ -2422,6 +2423,55 @@ Stdlib::Error Test()
     return err;
 }
 
+/* A RawSpinLock disables preemption for as long as it is held, and
+   PreemptCanBlock() -- asked by code that has to know whether it may wait --
+   follows it: through nesting, through a TryLock that fails and one that
+   succeeds, and through the IRQ-saving SpinLock. Run first thing in
+   TestMultiTasking, which every CPU calls in task context with interrupts
+   and preemption on. */
+static bool TestSpinLockPreempt()
+{
+    if (!PreemptCanBlock())
+    {
+        Trace(0, "TestSpinLockPreempt: cannot block before any lock is taken");
+        return false;
+    }
+
+    RawSpinLock outer;
+    RawSpinLock inner;
+
+    outer.Lock();
+    bool underOuter = !PreemptCanBlock();
+    bool innerTaken = inner.TryLock();
+    bool outerTakenTwice = outer.TryLock();
+    outer.Unlock();
+    bool underInner = !PreemptCanBlock();
+    if (innerTaken)
+        inner.Unlock();
+    bool released = PreemptCanBlock();
+
+    SpinLock spin;
+    bool underSpin;
+    {
+        Stdlib::AutoLock lock(spin);
+        underSpin = !PreemptCanBlock();
+    }
+    bool releasedSpin = PreemptCanBlock();
+
+    if (!underOuter || !innerTaken || outerTakenTwice || !underInner ||
+        !released || !underSpin || !releasedSpin)
+    {
+        Trace(0, "TestSpinLockPreempt: outer %u inner %u twice %u "
+            "under inner %u released %u spin %u released spin %u",
+            (ulong)underOuter, (ulong)innerTaken, (ulong)outerTakenTwice,
+            (ulong)underInner, (ulong)released, (ulong)underSpin,
+            (ulong)releasedSpin);
+        return false;
+    }
+
+    return true;
+}
+
 void TestMultiTaskingTaskFunc(void *ctx)
 {
     (void)ctx;
@@ -2437,6 +2487,9 @@ void TestMultiTaskingTaskFunc(void *ctx)
 
 bool TestMultiTasking()
 {
+    if (!TestSpinLockPreempt())
+        return false;
+
     Task *task[2] = {0};
     for (size_t i = 0; i < Stdlib::ArraySize(task); i++)
     {

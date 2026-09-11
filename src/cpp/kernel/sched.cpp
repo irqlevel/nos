@@ -71,6 +71,17 @@ void TaskQueue::SwitchComplete(Task* curr)
             prev->Put();
         }
 
+        /* Schedule()'s count should be the only one left: the locks
+           TaskQueue::Schedule took in prev were released above, in this
+           task, and handed their counts back to prev -- a RawSpinLock
+           remembers whose preemption it disabled. Anything more would be a
+           lock prev still holds, which Schedule() never switches away from,
+           or a count gone astray; either way SelectNext would pass prev over
+           for good, a task that silently never runs again. Checked before
+           the Dec, while that last count still keeps prev off every CPU:
+           after it, prev may already be running elsewhere -- it may just
+           have been moved -- and taking locks of its own. */
+        BugOn(prev->PreemptDisableCounter.Get() != 1);
         prev->PreemptDisableCounter.Dec();
     } else {
 

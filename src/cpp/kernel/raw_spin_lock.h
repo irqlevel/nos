@@ -7,6 +7,8 @@
 namespace Kernel
 {
 
+class Task;
+
 class RawSpinLock final
 {
 public:
@@ -19,11 +21,18 @@ public:
     explicit RawSpinLock(bool watched = true);
     ~RawSpinLock();
 
+    /* Lock() disables preemption until Unlock(), as Linux's spin_lock does.
+       The holder cannot be switched away with the lock taken -- a timer tick
+       would otherwise leave every other taker spinning for a whole time
+       slice -- and a caller that asks whether it may block
+       (PreemptCanBlock) is told no. Interrupts stay on: LockIrqSave is for a
+       lock an interrupt handler takes too. */
     void Lock();
     void Unlock();
 
     /* One attempt, no spin. For paths that must not block on a lock whose
-       holder may never release it -- the panic path, above all. */
+       holder may never release it -- the panic path, above all. Preemption
+       stays disabled only if the lock was taken. */
     bool TryLock();
 
 	ulong LockIrqSave();
@@ -39,10 +48,20 @@ private:
     RawSpinLock& operator=(const RawSpinLock& other) = delete;
     RawSpinLock& operator=(RawSpinLock&& other) = delete;
 
+    void Acquire();
+    bool TryAcquire();
+    void Release();
     void Stamp();
 
     Atomic Value;
     bool Watched;
+
+    /* Whose preemption Lock() disabled, for Unlock() to enable again -- not
+       necessarily the task calling Unlock(): the scheduler takes its locks
+       in one task and releases them in the next, across the context switch.
+       nullptr when Lock() had nothing to disable, and whenever the lock is
+       free or held through LockIrqSave, whose flags carry that instead. */
+    Task* PreemptTask;
 
 public:
     /* Set once the watchdog has complained about this lock, cleared on
