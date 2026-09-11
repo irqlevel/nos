@@ -692,6 +692,11 @@ void BpStartup(void* ctx)
            a block request completes through the BLK_IO soft IRQ */
         Vfs::GetInstance().UnmountAll();
 
+        /* The disk log last of all: its writer finishes what is queued and
+           the log switches off -- after SoftIrq::Stop() a write through a
+           virtio disk would wait for ever. */
+        DiskLog::GetInstance().Stop();
+
         SoftIrq::GetInstance().Stop();
     } /* all locals destroyed before stack is abandoned */
 

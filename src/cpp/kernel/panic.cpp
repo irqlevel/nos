@@ -39,6 +39,11 @@ void Panicker::PrintOutput(const char* str)
     /* Also into the netconsole ring; PanicFlush() below pushes it out while
        the machine still can. */
     Netconsole::GetInstance().Log(str);
+
+    /* And into the disk log's, for its PanicFlush(): on a machine with no
+       serial port and no network yet the disk is the only place the report
+       can go. Log() takes no lock, which is what makes it safe here. */
+    DiskLog::GetInstance().Log(str);
 }
 
 void Panicker::DumpContext()

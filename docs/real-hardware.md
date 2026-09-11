@@ -115,12 +115,15 @@ gate declining.
 
 **Diagnostics.** With no serial port and the NIC itself under bring-up, the
 boot log had nowhere to go, which is what `disklog` is for: every traced
-line is written synchronously to a raw partition set aside for it, from the
-first line of boot, straight from the tracer with no task in between (a
-drain task would not exist yet where a bring-up hang happens). Under Ubuntu
-`scripts/disklog.py format` lays a header on that partition and the kernel
-writes only where it finds the header intact; after the next Ubuntu boot
-`scripts/disklog.py read` prints the log back. Finding the area is what
+line from the first one of the boot is queued, without a lock, until the raw
+partition set aside for it is found; the boot so far is written there in
+one go, and every line after by a writer task of its own, so nothing that
+traces ever waits on the disk. Under Ubuntu
+`scripts/disklog.py format` lays a header on that partition, and a kernel
+booted with `disklog=on` writes only where it finds the header intact —
+without the parameter it leaves every disk alone, prepared or not, since a
+forced write per line is no price for a boot that works; after the next
+Ubuntu boot `scripts/disklog.py read` prints the log back. Finding the area is what
 brought GPT support and a second partition probe after the Rust NVMe driver
 registers its disks. `scripts/nosboot` builds, installs the kernel, arms one
 boot of `nos` and reboots. It does not use `grub-reboot`: `/boot` is ext3 on

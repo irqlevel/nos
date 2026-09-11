@@ -37,6 +37,8 @@ Parameters::Parameters()
     , DnsEnabled(false)
     , RootReadOnly(false)
     , FsTest(false)
+    , DiskLogOn(false)
+    , Parsed(false)
 {
     Stdlib::MemSet(&Root, 0, sizeof(Root));
     Root.Mode = RootNone;
@@ -169,6 +171,16 @@ bool Parameters::IsRootReadOnly()
 bool Parameters::IsFsTest()
 {
     return FsTest;
+}
+
+bool Parameters::IsDiskLogOn()
+{
+    return DiskLogOn;
+}
+
+bool Parameters::IsParsed()
+{
+    return Parsed;
 }
 
 /* xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx, as blkid prints it */
@@ -485,6 +497,21 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
             Trace(0, "Unknown value %s, key %s", value, key);
         }
     }
+    else if (Stdlib::StrCmp(key, "disklog") == 0)
+    {
+        if (Stdlib::StrCmp(value, "on") == 0)
+        {
+            DiskLogOn = true;
+        }
+        else if (Stdlib::StrCmp(value, "off") == 0)
+        {
+            DiskLogOn = false;
+        }
+        else
+        {
+            Trace(0, "Unknown value %s, key %s", value, key);
+        }
+    }
     else if (Stdlib::StrCmp(key, "dns") == 0)
     {
         if (Stdlib::StrCmp(value, "on") == 0)
@@ -506,6 +533,9 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
 
 void Parameters::Parse(const char *cmdline)
 {
+    /* No line at all is an answer too: nothing on it was asked for. */
+    Parsed = true;
+
     if (cmdline == nullptr)
         return;
 

@@ -5,11 +5,13 @@
 #include <lib/printer.h>
 #include "atomic.h"
 #include "spin_lock.h"
+#include "lockless_ring.h"
 
 namespace Kernel
 {
 
 class BlockDevice;
+class Task;
 
 /* The kernel log, written to a raw disk area as each line is produced.
  *
@@ -19,23 +21,33 @@ class BlockDevice;
  * works and a link that is up, and by the time either exists the interesting
  * part is over.
  *
- * The writes are synchronous, one per line, straight from the tracer. That is
- * deliberate and it is the whole point: a drain task cannot help either,
- * because the scheduler does not exist until late in boot -- Rust driver
- * bring-up, where a hang is most likely, runs long before preemption is on.
- * Anything buffered for a task to write later is exactly what a hang loses.
+ * HOW A LINE GETS THERE. The tracer hands every line to Log() from whatever
+ * context it runs in -- an interrupt handler, code under a spinlock, the
+ * panic path -- so Log() takes no lock and never waits: the line goes into a
+ * free slot, the slot onto a ready ring (kernel/lockless_ring.h), and that is
+ * all. Until the area is known that ring is the boot log so far, and Setup()
+ * writes all of it before it returns. From then on a task of its own does the
+ * writing, woken by each line: a write waits for the device -- one line has
+ * cost 25-33 ms on real hardware -- and whoever traced, the receive path or
+ * a lock holder, is no place to wait that long. With no scheduler to hand a
+ * line to, a caller that can wait writes it itself.
  *
- * The cost is a sector write per traced line, which is why it is off unless
- * `disklog=on` is given. On NVMe a few thousand of them is a few tens of
- * milliseconds over a whole boot.
+ * The price of the task is the last moments before a hang: a line traced
+ * just before a machine stops dead may still be in the ring. A panic pushes
+ * out whatever is queued, the report with it.
+ *
+ * Every burst of lines is still a forced write, which is why the whole thing
+ * is off unless `disklog=on` is given: a machine that merely has an area
+ * prepared is not made to pay for it on every boot.
  *
  * WHERE IT WRITES, and why it will not eat a disk. The area is never guessed
  * and never searched for by "free space". A tool run under the host OS
  * (scripts/disklog.py) writes a header carrying a magic and a checksum to the
- * first sector of a partition set aside for this. At boot the kernel reads
- * the first sector of every block device it has and writes only where that
- * header is found intact. A disk that has not been prepared is not written
- * to, and a partition holding anything else does not carry the magic. */
+ * first sector of a partition set aside for this. At boot, given disklog=on,
+ * the kernel reads the first sector of every block device it has and writes
+ * only where that header is found intact. A disk that has not been prepared
+ * is not written to, a partition holding anything else does not carry the
+ * magic, and without disklog=on no disk is so much as read. */
 class DiskLog final
 {
 public:
@@ -45,16 +57,26 @@ public:
         return instance;
     }
 
-    /* Look for a prepared area on every registered block device. Called once
-       the block drivers are up. Returns false when nothing is prepared, which
-       is the normal case and not an error. */
+    /* Given disklog=on, look for a prepared area on every registered block
+       device. Called once the block drivers are up. When one is found the
+       boot so far is written before this returns, and the writer task takes
+       over. Returns false -- and the log is off for the rest of the boot,
+       nothing more queued -- when the parameter is not given or nothing is
+       prepared, which is the normal case and not an error. */
     bool Setup();
 
-    /* Append one line. Safe from any context: what cannot be written now is
-       held until a call that can write flushes it. */
+    /* Append one line. Safe from any context, and never waits: the line is
+       queued for the writer. Nothing is queued once the command line has
+       been read without disklog=on, or once the log has been switched off. */
     void Log(const char* s);
 
-    /* Push everything held, from the panic path. Best effort by
+    /* On the way down, before the soft IRQs stop: the writer finishes what is
+       queued and exits, and the log switches off -- after SoftIrq::Stop() a
+       write through a virtio disk, which completes by soft IRQ, would wait
+       for ever. */
+    void Stop();
+
+    /* Push everything queued, from the panic path. Best effort by
        construction -- the machine is going down either way. */
     void PanicFlush();
 
@@ -100,21 +122,42 @@ private:
 
     bool ReadHeader(BlockDevice* dev, Header& hdr);
     bool WriteHeader();
-    void Stage(const char* s, ulong len);
+    bool Enqueue(const char* s);
+    bool Drain();
+    void WriteOut();
     void Flush();
+    bool StartTask();
+    void StopTask();
+    void Run();
+    static void TaskFunc(void* ctx);
+    void SwitchOff();
     static u32 HeaderCrc(const Header& hdr);
 
-    /* Everything not yet on disk. Before the area is found that is the whole
-       boot log, which is the part that matters and the part no other channel
-       can carry; after, it is the handful of bytes since the last write.
-       Sized like the netconsole backlog and for the same reason -- a real
-       machine prints far more of a boot than QEMU does. */
-    static const ulong PendingSize = 256 * 1024;
+    /* A line as the tracer makes it: Tracer::Output formats into 256 bytes,
+       and anything longer is cut to fit. */
+    static const ulong MsgSize = 256;
+
+    /* Lines the writer has not taken yet. Before the area is found that is
+       the whole boot log, which is the part that matters and the part no
+       other channel can carry -- and a real machine prints far more of a
+       boot than QEMU does. A slot per line, since the ring carries
+       pointers. */
+    static const ulong MsgCount = 2048;
+    static_assert((MsgCount & (MsgCount - 1)) == 0,
+        "LocklessRing wants a power of two");
+
+    /* The writer's own staging: lines off the ring, and the tail of a sector
+       written only in part. Room for a transfer and a line over. */
+    static const ulong PendingSize = 2 * IoBufSize;
 
     static const ulong Tag = 'DLog';
 
+    struct Msg
+    {
+        char Text[MsgSize];
+    };
 
-
+    /* Setup's and Dump's; neither the tracer nor the writer takes it. */
     SpinLock Lock;
 
     BlockDevice* Dev;
@@ -125,13 +168,28 @@ private:
 
     volatile bool Enabled;
 
-    /* Guards against a write path that traces: without it the first error
-       inside WriteSectors would recurse until the stack ran out. */
+    /* Set once the log will not be written this boot: disklog=on not given,
+       no prepared area, no writer task, or Stop(). Log() queues nothing
+       after that. */
+    volatile bool Off;
+
+    /* One writer at a time: the task, Setup() catching up, Stop() finishing,
+       or a caller with no scheduler to hand its line to. */
     Atomic InFlush;
+
+    /* Published before the task first runs. Log() wakes it through this, and
+       leaves out the lines the task itself produces: an error on the write
+       path traces, and writing that line would fail and trace again. */
+    Task* TaskPtr;
+
+    Msg Msgs[MsgCount];
+    LocklessRing::Cell FreeCells[MsgCount];
+    LocklessRing::Cell ReadyCells[MsgCount];
+    LocklessRing FreeRing;    /* empty slots */
+    LocklessRing ReadyRing;   /* filled ones, in the order they were queued */
 
     u8 Pending[PendingSize];
     ulong PendingUsed;
-    bool PendingOverflowed;
 
     /* DMA targets, from the page allocator and not static arrays. A driver
        hands the buffer's physical address to the device, and only memory the
@@ -149,7 +207,8 @@ private:
     /* Stats for the shell command. */
     u64 SectorWrites;
     u64 WriteFailures;
-    u64 DroppedBytes;
+    u64 DroppedBytes;      /* the writer's: past the end of the area */
+    Atomic DroppedLines;   /* the tracer's: no free slot */
 };
 
 }
