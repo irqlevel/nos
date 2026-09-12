@@ -1,6 +1,7 @@
 #pragma once
 
 #include "spin_lock.h"
+#include "mutex.h"
 #include "task.h"
 
 #include "input.h"
@@ -39,6 +40,20 @@ public:
 
     static void Dispatch(const char *cmd, Stdlib::Printer& out);
 
+    typedef void (*ScriptStep)(void* ctx);
+
+    /* Runs the shell commands in the file at path a line at a time -- blank
+       lines and #comments skipped -- with what they print on out, and step,
+       if there is one, called after each (the boot script's logging). /etc/rc
+       is run so at boot (RunBootScript). False if the file cannot be read,
+       or a script is running already: a script that ran itself would never
+       end. */
+    bool RunScript(const char* path, Stdlib::Printer& out, ScriptStep step = nullptr,
+        void* stepCtx = nullptr);
+
+    /* Held while /etc/rc is rewritten, one edit at a time */
+    Mutex& GetRcLock() { return RcLock; }
+
     /* Shell commands added at run time, by a loadable module through
        kernel_cmd_register. A call hands the handler its ctx, the rest of the
        command line after the name, and the Stdlib::Printer to answer on --
@@ -74,6 +89,11 @@ private:
     Cmd& operator=(Cmd&& other) = delete;
 
     void ShowBanner(Stdlib::Printer& out);
+
+    /* /etc/rc, run once the network is set up, what it prints going to the
+       kernel log; rc=off skips it */
+    void RunBootScript();
+
     void Run();
     static void RunFunc(void *ctx);
 
@@ -91,6 +111,8 @@ private:
     bool Shutdown;
     bool Reboot;
     bool Active;
+    bool ScriptRunning;     /* under Lock */
+    Mutex RcLock;
 
     static const ulong DynamicMax = 32;
     static const ulong DynamicNameMax = 31;

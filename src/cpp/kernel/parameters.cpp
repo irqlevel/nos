@@ -26,6 +26,7 @@ Parameters::Parameters()
     , HwRngOff(false)
     , WxProbe(false)
     , UsbOff(false)
+    , RcOff(false)
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
@@ -86,6 +87,11 @@ bool Parameters::IsWxProbe()
 bool Parameters::IsUsbOff()
 {
     return UsbOff;
+}
+
+bool Parameters::IsRcOff()
+{
+    return RcOff;
 }
 
 bool Parameters::IsConsoleSerial()
@@ -282,6 +288,10 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     else if (Stdlib::StrCmp(key, "usb") == 0)
     {
         UsbOff = (Stdlib::StrCmp(value, "off") == 0);
+    }
+    else if (Stdlib::StrCmp(key, "rc") == 0)
+    {
+        RcOff = (Stdlib::StrCmp(value, "off") == 0);
     }
     else if (Stdlib::StrCmp(key, "hwrng") == 0)
     {

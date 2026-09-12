@@ -1,7 +1,10 @@
 # UDP remote shell
 
 When `udpshell=PORT` is set (see [Kernel parameters](kernel-parameters.md)),
-the kernel listens for commands on that UDP port.
+the kernel listens for commands on that UDP port. It runs whatever any
+datagram carrying its magic asks, unencrypted and with no authentication:
+fine on a VM's private network, not on a port the internet can reach. For
+that, [sshd](sshd.md) serves the same shell over SSH, to the keys it is given.
 A lightweight protocol header (16 bytes: magic, sequence number, chunk index, flags, payload length) frames every packet, enabling the client to validate replies, reassemble multi-chunk responses in order, and detect the end of a response without relying on timeouts.
 
 Connect with the included Python client:

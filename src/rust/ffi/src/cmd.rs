@@ -25,3 +25,14 @@ extern "C" {
     /// Writes to the printer a handler was given.
     pub fn kernel_printer_write(out: *mut c_void, buf: *const u8, len: usize);
 }
+
+/// Where kernel_cmd_dispatch hands what a command prints: the ctx it was
+/// given, and a piece of the output.
+pub type CmdSink = unsafe extern "C" fn(ctx: *mut c_void, buf: *const u8, len: usize);
+
+extern "C" {
+    /// Runs a shell command line as the console would, handing what it
+    /// prints to the sink, a piece at a time. Sleeps as long as the command
+    /// runs.
+    pub fn kernel_cmd_dispatch(line: *const u8, len: usize, sink: CmdSink, ctx: *mut c_void);
+}
