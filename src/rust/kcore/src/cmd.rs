@@ -71,6 +71,21 @@ impl Drop for Command {
     }
 }
 
+/// Runs a shell command line as the console would, and hands what it
+/// prints to `sink` a piece at a time as it prints it -- how an SSH session
+/// puts the shell's output on its channel. Returns when the command does,
+/// so task context only.
+pub fn dispatch(line: &str, sink: &mut dyn FnMut(&[u8])) {
+    let mut sink = sink;
+    let ctx = &mut sink as *mut &mut dyn FnMut(&[u8]) as *mut c_void;
+    unsafe { cmd::kernel_cmd_dispatch(line.as_ptr(), line.len(), dispatch_sink, ctx) };
+}
+
+unsafe extern "C" fn dispatch_sink(ctx: *mut c_void, buf: *const u8, len: usize) {
+    let sink = unsafe { &mut *(ctx as *mut &mut dyn FnMut(&[u8])) };
+    sink(unsafe { core::slice::from_raw_parts(buf, len) });
+}
+
 unsafe extern "C" fn trampoline(ctx: *mut c_void, args: *const u8, args_len: usize, out: *mut c_void) {
     let handler = unsafe { &*(ctx as *const Box<Handler>) };
     let bytes = unsafe { core::slice::from_raw_parts(args, args_len) };

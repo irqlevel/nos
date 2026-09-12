@@ -11,6 +11,7 @@
 #include "rw_mutex.h"
 #include "task.h"
 #include "sched.h"
+#include "preempt.h"
 #include "cpu.h"
 #include "random.h"
 #include "interrupt.h"
@@ -31,6 +32,7 @@
 #include <net/net_device.h>
 #include <net/net_frame.h>
 #include <net/tcp.h>
+#include <fs/vfs.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
 
@@ -47,6 +49,144 @@ static const unsigned long NetDevNameMax = 16;
 
 /* kernel_ring_create's ceiling: a ring's cells are one allocation */
 static const unsigned long RingMaxCapacity = 1UL << 20;
+
+/* kernel_cmd_dispatch: the longest command line it runs -- the UDP shell's */
+static const unsigned long DispatchLineMax = 255;
+
+/* kernel_cmd_dispatch: how much of a command's output waits in memory for a
+   moment it may be sent */
+static const unsigned long SinkBufferSize = 64 * 1024;
+
+/* What a command prints, for Rust -- an SSH session's channel -- instead of
+   a console. A command may print holding a spinlock with interrupts off
+   (ps, stacks, arp) or a mutex (ls holds the Vfs's), and passing text on
+   means the network: allocating, and waiting for room as long as the client
+   takes. So the text goes into Buf, and on to Fn only where the caller may
+   block (PreemptCanBlock): when Buf is full; at a line end once its oldest
+   byte has waited FlushDelayNs, so a command printing a line a second is
+   seen as it prints while one printing everything at once goes out after it
+   returns, its locks let go; and whatever is left when it has. What does
+   not fit while nothing may be sent is dropped, and said so at the end. */
+class SinkPrinter final : public Stdlib::Printer
+{
+public:
+    typedef void (*SinkFn)(void* ctx, const unsigned char* buf, unsigned long len);
+
+    SinkPrinter(SinkFn fn, void* ctx, unsigned char* buf, unsigned long size)
+        : Fn(fn)
+        , Ctx(ctx)
+        , Buf(buf)
+        , Size(size)
+        , Len(0)
+        , Oldest(0)
+        , Dropped(0)
+    {
+    }
+
+    virtual void Printf(const char *fmt, ...) override
+    {
+        va_list args;
+        va_start(args, fmt);
+        VPrintf(fmt, args);
+        va_end(args);
+    }
+
+    virtual void VPrintf(const char *fmt, va_list args) override
+    {
+        char text[FormatMax];
+        if (Stdlib::VsnPrintf(text, sizeof(text), fmt, args) < 0)
+            return;
+        Put(text);
+    }
+
+    virtual void PrintString(const char *s) override
+    {
+        if (s != nullptr)
+            Put(s);
+    }
+
+    virtual void Backspace() override
+    {
+    }
+
+    /* The command has returned: what is left goes, and what was lost is
+       said */
+    void Finish()
+    {
+        Flush();
+        if (Dropped == 0)
+            return;
+
+        char note[128];
+        Stdlib::BufferPrinter bp(note, sizeof(note));
+        bp.Printf("\n[%u bytes of output dropped: printed with a lock held, past the %u that can wait]\n",
+            Dropped, Size);
+        Fn(Ctx, reinterpret_cast<const unsigned char*>(note), Stdlib::StrLen(note));
+        Dropped = 0;
+    }
+
+private:
+    SinkPrinter(const SinkPrinter& other) = delete;
+    SinkPrinter& operator=(const SinkPrinter& other) = delete;
+
+    void Put(const char* s)
+    {
+        bool lineEnd = false;
+        for (; *s != '\0'; s++)
+        {
+            if (Len == Size)
+            {
+                if (!Kernel::PreemptCanBlock())
+                {
+                    Dropped++;
+                    continue;
+                }
+                Flush();
+            }
+            if (Len == 0)
+                Oldest = Kernel::GetBootTime().GetValue();
+            Buf[Len++] = (unsigned char)*s;
+            if (*s == '\n' || *s == '\r')
+                lineEnd = true;
+        }
+
+        if (lineEnd && Len != 0 &&
+            Kernel::GetBootTime().GetValue() - Oldest >= FlushDelayNs &&
+            Kernel::PreemptCanBlock())
+            Flush();
+    }
+
+    void Flush()
+    {
+        if (Len != 0)
+        {
+            Fn(Ctx, Buf, Len);
+            Len = 0;
+        }
+    }
+
+    static const unsigned long FormatMax = 512;
+    static const unsigned long long FlushDelayNs = 50ULL * 1000 * 1000;
+
+    SinkFn Fn;
+    void* Ctx;
+    unsigned char* Buf;
+    unsigned long Size;
+    unsigned long Len;
+    unsigned long long Oldest;
+    unsigned long Dropped;
+};
+
+/* A path from Rust -- bytes and a length -- as the NUL-terminated string the
+   Vfs takes; false if it does not fit */
+static bool FfiPath(const unsigned char* path, unsigned long len, char (&out)[Kernel::Vfs::MaxPath])
+{
+    if (path == nullptr || len == 0 || len >= sizeof(out))
+        return false;
+    Stdlib::MemCpy(out, path, len);
+    out[len] = '\0';
+    return true;
+}
 
 extern "C" {
 
@@ -378,6 +518,13 @@ void kernel_task_yield_to_runnable()
     Kernel::YieldToRunnable();
 }
 
+/* The calling task -- a handle to compare with a TaskHandle's, never to
+   wait on or put */
+unsigned long kernel_task_current()
+{
+    return (unsigned long)Kernel::Task::GetCurrentTask();
+}
+
 unsigned int kernel_get_cpu_id()
 {
     return (unsigned int)Kernel::GetCpu().GetIndex();
@@ -526,6 +673,62 @@ long kernel_tcp_recv(void* conn, unsigned char* buf, unsigned long len,
         return -1;
     return Kernel::Tcp::GetInstance().Recv((Kernel::TcpConn*)conn, buf, (ulong)len,
                                            (ulong)timeoutMs);
+}
+
+/* A server of Rust's -- sshd's -- owns its connections rather than
+   borrowing one: it listens on a device's port, accepts, and closes both
+   what it accepted and the listener. dev is a kernel_net_find handle. */
+void* kernel_tcp_listen(unsigned long dev, unsigned short port)
+{
+    if (dev == 0 || port == 0)
+        return nullptr;
+    return Kernel::Tcp::GetInstance().Listen(reinterpret_cast<Kernel::NetDevice*>(dev), port);
+}
+
+/* The next connection on the listener's port: nullptr once timeoutMs passes
+   with none, or once the listener is closed */
+void* kernel_tcp_accept(void* listener, unsigned long timeoutMs)
+{
+    if (!listener)
+        return nullptr;
+    return Kernel::Tcp::GetInstance().Accept((Kernel::TcpConn*)listener, (ulong)timeoutMs);
+}
+
+void kernel_tcp_close(void* conn)
+{
+    if (conn)
+        Kernel::Tcp::GetInstance().Close((Kernel::TcpConn*)conn);
+}
+
+/* A connection a server refuses or drops: reset, so that its slot does not
+   sit out TIME-WAIT */
+void kernel_tcp_abort(void* conn)
+{
+    if (conn)
+        Kernel::Tcp::GetInstance().Abort((Kernel::TcpConn*)conn);
+}
+
+/* kernel_tcp_send with a bound on the wait for room: the bytes queued, 0
+   when timeoutMs found room for none, -1 once the connection is gone */
+long kernel_tcp_send_timeout(void* conn, const unsigned char* buf, unsigned long len,
+                             unsigned long timeoutMs)
+{
+    if (!conn || !buf)
+        return -1;
+    return Kernel::Tcp::GetInstance().Send((Kernel::TcpConn*)conn, buf, (ulong)len,
+                                           (ulong)timeoutMs);
+}
+
+/* Who is at the other end: the address in host byte order, and the port */
+void kernel_tcp_peer(void* conn, unsigned int* ip, unsigned short* port)
+{
+    if (!conn)
+        return;
+    auto* c = (Kernel::TcpConn*)conn;
+    if (ip)
+        *ip = c->RemoteIp.Addr4;
+    if (port)
+        *port = c->RemotePort;
 }
 
 /* ---- Soft IRQ ---- */
@@ -1615,6 +1818,145 @@ void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len
         buf += n;
         len -= n;
     }
+}
+
+/* A shell command line run for Rust -- an SSH session's -- as the console
+   would run it, what it prints handed to sink(ctx, ...) as SinkPrinter
+   passes it on. Sleeps as long as the command runs: task context only, with
+   no lock held. */
+void kernel_cmd_dispatch(const unsigned char* line, unsigned long len,
+    SinkPrinter::SinkFn sink, void* ctx)
+{
+    if (line == nullptr || sink == nullptr)
+        return;
+
+    if (len > DispatchLineMax)
+    {
+        char note[96];
+        Stdlib::BufferPrinter bp(note, sizeof(note));
+        bp.Printf("command too long: %u characters, the most is %u\n", len, DispatchLineMax);
+        sink(ctx, reinterpret_cast<const unsigned char*>(note), Stdlib::StrLen(note));
+        return;
+    }
+
+    /* Before the command runs: the one moment sure to be allowed to */
+    auto* buf = static_cast<unsigned char*>(Kernel::Mm::Alloc(SinkBufferSize, RustAllocTag));
+    if (buf == nullptr)
+    {
+        static const char NoMemory[] = "no memory for the command's output\n";
+        sink(ctx, reinterpret_cast<const unsigned char*>(NoMemory), sizeof(NoMemory) - 1);
+        return;
+    }
+
+    char cmd[DispatchLineMax + 1];
+    Stdlib::MemCpy(cmd, line, len);
+    cmd[len] = '\0';
+
+    SinkPrinter out(sink, ctx, buf, SinkBufferSize);
+    Kernel::Cmd::Dispatch(cmd, out);
+    out.Finish();
+    Kernel::Mm::Free(buf);
+}
+
+/* Files, for a module to keep its configuration in (kcore::fs). Paths are
+   absolute, and nothing is held open between calls. -1: no such file, or
+   the filesystem refused. */
+long kernel_file_size(const unsigned char* path, unsigned long pathLen)
+{
+    char p[Kernel::Vfs::MaxPath];
+    char at[Kernel::Vfs::MaxPath];
+    if (!FfiPath(path, pathLen, p))
+        return -1;
+
+    auto& vfs = Kernel::Vfs::GetInstance();
+    Kernel::FileStat st;
+    if (!vfs.Locate(p, at, sizeof(at)) || !vfs.Stat(at, st) || st.Type != Kernel::VNode::TypeFile)
+        return -1;
+    return (long)st.Size;
+}
+
+/* Up to cap bytes from the start of the file: the count read */
+long kernel_file_read(const unsigned char* path, unsigned long pathLen,
+    unsigned char* buf, unsigned long cap)
+{
+    char p[Kernel::Vfs::MaxPath];
+    char at[Kernel::Vfs::MaxPath];
+    if (!FfiPath(path, pathLen, p) || (buf == nullptr && cap != 0))
+        return -1;
+
+    auto& vfs = Kernel::Vfs::GetInstance();
+    if (!vfs.Locate(p, at, sizeof(at)))
+        return -1;
+    Kernel::File* file = vfs.Open(at, Kernel::Vfs::OpenRead);
+    if (file == nullptr)
+        return -1;
+
+    unsigned long total = 0;
+    while (total < cap)
+    {
+        ulong got = 0;
+        if (!vfs.Read(file, buf + total, cap - total, got))
+        {
+            vfs.Close(file);
+            return -1;
+        }
+        if (got == 0)
+            break;
+        total += got;
+    }
+    vfs.Close(file);
+    return (long)total;
+}
+
+/* Replaces the file's content, making the file if it is missing, through
+   Vfs::ReplaceFile: what a module writes is its configuration -- the keys
+   allowed to log in -- which a full disk or a crash midway must not leave
+   empty */
+int kernel_file_write(const unsigned char* path, unsigned long pathLen,
+    const unsigned char* data, unsigned long len)
+{
+    char p[Kernel::Vfs::MaxPath];
+    if (!FfiPath(path, pathLen, p) || (data == nullptr && len != 0))
+        return -1;
+
+    return Kernel::Vfs::GetInstance().ReplaceFile(p, data, len) ? 0 : -1;
+}
+
+/* A new file with this content: 1, and nothing written, when there is one
+   at the path already -- or the remains of a ReplaceFile of it. For a file
+   that must never be written over by mistake, a host key: a Stat that
+   failed on a bad block must not read as "there is none" and lose it. */
+int kernel_file_create(const unsigned char* path, unsigned long pathLen,
+    const unsigned char* data, unsigned long len)
+{
+    char p[Kernel::Vfs::MaxPath];
+    char at[Kernel::Vfs::MaxPath];
+    if (!FfiPath(path, pathLen, p) || (data == nullptr && len != 0))
+        return -1;
+
+    auto& vfs = Kernel::Vfs::GetInstance();
+    if (vfs.Locate(p, at, sizeof(at)))
+        return 1;
+    /* Refused by the filesystem itself when the file is there after all */
+    if (!vfs.CreateFile(p))
+        return 1;
+    if (!vfs.WriteFile(p, data, len) || !vfs.Sync())
+        return -1;
+    return 0;
+}
+
+/* A directory, made if there is none by that name: 0 once there is one */
+int kernel_dir_create(const unsigned char* path, unsigned long pathLen)
+{
+    char p[Kernel::Vfs::MaxPath];
+    if (!FfiPath(path, pathLen, p))
+        return -1;
+
+    auto& vfs = Kernel::Vfs::GetInstance();
+    Kernel::FileStat st;
+    if (vfs.Stat(p, st))
+        return (st.Type == Kernel::VNode::TypeDir) ? 0 : -1;
+    return vfs.CreateDir(p) ? 0 : -1;
 }
 
 /* Block devices from Rust, the consuming side (kcore::block::Disk). A device

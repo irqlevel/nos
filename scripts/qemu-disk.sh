@@ -19,6 +19,6 @@ qemu-system-x86_64 \
     -drive file=nvme-disk0.qcow2,format=qcow2,id=nvme0,if=none \
     -device nvme,serial=deadbeef00,drive=nvme0 \
     -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
-    -netdev user,id=net0,hostfwd=udp::9000-:9000 \
+    -netdev user,id=net0,hostfwd=udp::9000-:9000,hostfwd=tcp::2222-:22 \
     -device virtio-rng-pci \
     -s -nographic
