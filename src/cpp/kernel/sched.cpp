@@ -174,7 +174,8 @@ Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle)
     }
 
     /* Only the idle task to hand the CPU to: a task polling with
-       YieldToRunnable keeps it instead -- unless it cannot run itself */
+       YieldToRunnable, or one an interrupt landed on (Preempt), keeps it
+       instead -- unless it cannot run itself */
     if (next == nullptr && keepOverIdle &&
         curr->State.Get() != Task::StateExited && !curr->IsBlocked())
         return nullptr;
@@ -353,6 +354,11 @@ static void ScheduleCurrent(bool keepOverIdle)
 void Schedule()
 {
     ScheduleCurrent(false);
+}
+
+void Preempt()
+{
+    ScheduleCurrent(true);
 }
 
 void YieldToRunnable()

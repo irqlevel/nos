@@ -462,7 +462,9 @@ void Cpu::IPI(Context* ctx)
 
     Hal::IrqEoi(CpuTable::IPIVector);
 
-    Schedule();
+    /* Not Schedule(): a task this lands on while it can still run keeps the
+       CPU -- see Preempt */
+    Preempt();
 }
 
 /* This CPU's own periodic tick. One interrupt per CPU delivered by its own
@@ -502,7 +504,9 @@ void Cpu::TimerTick(Context* ctx)
 
     Hal::IrqEoi(CpuTable::TimerVector);
 
-    Schedule();
+    /* Round-robin among the runnable, and never the idle task over a task
+       that can still run -- see Preempt */
+    Preempt();
 }
 
 void Cpu::QueueIPITaskAsync(IPITask& task)

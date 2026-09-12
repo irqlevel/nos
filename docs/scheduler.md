@@ -29,7 +29,9 @@ idle task:
 - If the walk reaches the current task before finding a candidate, nothing
   ahead of it was runnable: it is rotated to the tail and the walk stops.
   The CPU keeps it — unless the idle task was passed on the way, in which
-  case that is what runs.
+  case that is what runs, for a voluntary `Schedule()`. The reschedule an
+  interrupt asks for, `Preempt()`, keeps a task that can still run over the
+  idle task (below).
 
 The chosen task and the current one are both moved to the tail, which is
 what makes the rotation round-robin.
@@ -100,8 +102,21 @@ Two independent gates:
 
 Involuntary preemption comes from the per-CPU timer tick — the local APIC
 timer on x86-64, the generic timer on arm64, both at 100 Hz — whose handler
-ends in `Schedule()`. So does the IPI handler, which is what makes an IPI a
+ends in `Preempt()`. So does the IPI handler, which is what makes an IPI a
 reschedule request. Voluntary preemption is a direct `Schedule()` call.
+
+The two differ in one case: when nothing but the idle task could take the
+CPU. `Schedule()` hands it over — its caller asked to let others run, and the
+idle task halting the CPU until the next interrupt is what makes `Sleep()`
+cheap. `Preempt()` leaves the CPU with the task the interrupt landed on, if
+that task can still run. The tick and the IPI handler used to end in
+`Schedule()`, and that made stalls: the idle task only halts, and a task
+displaced while runnable — not blocked — gets no IPI from whoever has work
+for it, so it waited for the next tick. On the AX41 the netblk worker,
+polling for requests with `poll=` and never blocking, was switched out that
+way by the tick some 25 times a second, a tick each: the idle task took a
+quarter of its CPU while it had work, and the server's p99 was 10 ms. An IPI
+landing on a running task could do the same to it.
 
 `Sleep(ns)` is worth knowing about: it *spins* on `GetBootTime()` calling
 `Schedule()`, it does not block. It yields the CPU but keeps the task
@@ -128,7 +143,7 @@ ordering would hold on x86 and fail on arm64 only.
 
 The sleeper's side runs with **interrupts off**, from the flag going up
 until it is down again, its own `Schedule()` included. The tick and every
-IPI end in a `Schedule()` of their own, and one landing while the flag is up
+IPI end in a reschedule of their own, and one landing while the flag is up
 switches the task out as a blocked one -- asleep on work it never saw, or had
 just seen and not yet cleared the flag for, while a waker that found the
 work already published may not clear it again. `Schedule()` saves and

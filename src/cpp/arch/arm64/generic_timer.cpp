@@ -115,12 +115,13 @@ void GenericTimer::LocalTick(Context* ctx)
         NetDeviceTable::GetInstance().PollRx();
     }
 
-    /* EOI before Schedule(): it may context-switch away and only return
+    /* EOI before Preempt(): it may context-switch away and only return
        when this task is rescheduled, so the PPI must be deactivated first
-       (the IPI path does the same for the SGI). */
+       (the IPI path does the same for the SGI). Preempt, not Schedule: a
+       task that can still run is never handed over to the idle task. */
     Hal::IrqEoi((u8)TimerIntId);
 
-    Schedule();
+    Preempt();
 }
 
 void GenericTimer::OnInterruptRegister(u8 irq, u8 vector)

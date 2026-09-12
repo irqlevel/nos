@@ -139,11 +139,12 @@ void SoftIrq::Raise(ulong type)
        Otherwise it really is running; its loop looks at Pending again the
        moment the handler returns.
 
-       The IPI would be worse than useless there. It is delivered as a
-       reschedule -- Cpu::IPI ends in Schedule() -- so it takes the CPU away
-       from the one task that has work to do, and that task does not run
-       again until the next tick. A handler that asks for another pass, which
-       is how the receive poll yields on its budget, was therefore getting
+       The IPI would be useless there: an interrupt, for a reschedule the task
+       does not need. It used to be worse than useless. Before Cpu::IPI ended
+       in Preempt() rather than Schedule(), it took the CPU away from the one
+       task that had work to do and gave it to the idle task, and that task
+       did not run again until the next tick. A handler that asks for another
+       pass, which is how the receive poll yields on its budget, was getting
        exactly one pass per tick: 64 frames at 100 Hz, a ceiling of 6600
        packets a second no matter how many arrived. */
     if (!wasBlocked && Task::TryGetCurrentTask() == target)
