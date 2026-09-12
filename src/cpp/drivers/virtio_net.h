@@ -4,6 +4,7 @@
 #include <kernel/interrupt.h>
 #include <net/net_device.h>
 #include <net/net_frame.h>
+#include <net/net_frame_pool.h>
 #include <net/net.h>
 #include <kernel/atomic.h>
 #include <hal/context.h>
@@ -88,14 +89,30 @@ private:
 
     static_assert(sizeof(VirtioNetHdrLegacy) == 10, "Invalid size");
 
-    /* RX buffer management */
-    static const ulong RxBufCount = 16;
-    static const ulong RxBufSize = 2048;
-    void PostRxBuf(ulong index);
-    void PostAllRxBufs();
+    /* RX: frames from the NetFramePool, each posted as a two-descriptor chain
+       -- the virtio-net header into the slot's piece of RxHdrPage, the packet
+       into the frame -- and handed up as they are once the device fills
+       them, the slot refilled with a fresh frame on the spot. A frame handed
+       up is then the stack's for as long as it likes, to release from
+       anywhere: nothing about the ring waits for it. The zero-copy block
+       server keeps one until the disk has written its payload, and sends it
+       back afterwards as the reply. The sixteen static buffers this replaced
+       were reposted by the frame's release, into a queue only the receive
+       softirq may touch, so no frame could ever leave the receive path. */
+    static const ulong MaxRxSlots = 128;
+    static const ulong RxFrameSize = NetFramePool::FrameCapacity;
+    static const ulong NoRxSlot = ~0UL;
 
-    /* TX DMA slot pool */
-    static const ulong MaxTxSlots = 8;
+    /* A fresh frame into an empty slot; false leaves it empty for RefillRx. */
+    bool PostRxSlot(ulong slot);
+    /* frame into slot; false if the queue had no room -- the frame is then
+       still the caller's */
+    bool PostRxFrame(ulong slot, NetFrame* frame);
+    void RefillRx();
+
+    /* TX DMA slot pool. Eight capped a burst at eight frames per round trip
+       to the device -- a reply batch from the block server is dozens. */
+    static const ulong MaxTxSlots = 32;
 
     struct TxSlot
     {
@@ -110,8 +127,6 @@ private:
     /* Hands every frame the device is done with to NetDevice::TxDone rather
        than releasing it: the caller holds TxQueueLock. See the note there. */
     void CompleteTx();
-
-    static void RxFrameRelease(NetFrame* frame, void* ctx);
 
     VirtioPci PciTransport;
     VirtioMmio MmioTransport;
@@ -138,18 +153,17 @@ private:
     u8* TxHdrPage;        /* one DMA page for all slot headers */
     ulong TxHdrPagePhys;
 
-    /* RX DMA buffers */
-    u8* RxBufs;       /* RxBufCount * RxBufSize bytes */
-    ulong RxBufsPhys;
-
-    /* Pre-allocated RX frame descriptors */
-    NetFrame RxFrames[RxBufCount];
+    /* RX slots: the frame each holds, nullptr while it is empty */
+    ulong RxSlotCount;
+    ulong RxEmptySlots;
+    NetFrame* RxSlotFrame[MaxRxSlots];
+    u8* RxHdrPage;        /* the device writes each slot's virtio-net header here */
+    ulong RxHdrPagePhys;
     bool RxNeedNotify;
 
-    /* Descriptor head -> RX buffer index. The virtqueue recycles freed
-       descriptors in LIFO order, so usedId == buffer index only holds for
-       the initial linear posting. */
-    ulong RxBufByDesc[VirtQueue::MaxDescriptors];
+    /* Descriptor head -> RX slot. The virtqueue recycles freed descriptors
+       in LIFO order, so heads and slots part company after the first lap. */
+    ulong RxSlotByHead[VirtQueue::MaxDescriptors];
 
     static const ulong MaxInstances = 4;
 

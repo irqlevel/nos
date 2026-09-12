@@ -6,6 +6,30 @@
 namespace Kernel
 {
 
+/* One asynchronous I/O, straight to or from physical memory: what a caller
+   that must not block hands a device. The zero-copy block server (the netblk
+   module) has the disk DMA a read into the frame it is about to transmit,
+   and a write out of the frame it received. */
+struct AsyncBlockIo
+{
+    enum : u8 { Read = 0, Write = 1, Flush = 2 };
+
+    u8 Op;
+    u8 Fua;             /* a write: through the device's cache before Done */
+    u16 Reserved;
+    u32 Count;          /* sectors; 0 for a flush */
+    u64 Sector;
+    u64 Phys;           /* the data: physically contiguous, dword aligned */
+
+    /* Called exactly once for an I/O Submit took, from interrupt context --
+       no sleeping, no allocating, no freeing: status 0 once the device has
+       done it, the device's error otherwise. */
+    void (*Done)(void* ctx, int status);
+    void* Ctx;
+};
+
+static_assert(sizeof(AsyncBlockIo) == 40, "kcore::block::BlockIo mirrors this layout");
+
 class BlockDevice
 {
 public:
@@ -18,6 +42,23 @@ public:
     virtual BlockDevice* GetParent() { return nullptr; }
     virtual bool ReadSectors(u64 sector, void* buf, u32 count) = 0;
     virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) = 0;
+
+    /* Asynchronous I/O (AsyncBlockIo), for a device that has it -- NVMe, and
+       a partition of an NVMe disk. Never blocks, so task or softirq context
+       alike. The io is read before SubmitAsync returns and only its Done and
+       Ctx are kept: it may live on the caller's stack, and be submitted again
+       as it is after a Busy. With kick false the device may leave its
+       doorbell for KickAsync() to ring -- once for a whole batch rather than
+       once per I/O, and a doorbell is a write across the bus (under a
+       hypervisor, an exit). */
+    static const int SubmitOk = 0;
+    static const int SubmitBusy = 1;        /* no room now; there will be after a completion */
+    static const int SubmitInvalid = 2;     /* out of range, misaligned, or more than it takes at once */
+    static const int SubmitUnsupported = 3; /* the synchronous path only */
+
+    virtual bool CanSubmitAsync() { return false; }
+    virtual int SubmitAsync(const AsyncBlockIo& io, bool kick) { (void)io; (void)kick; return SubmitUnsupported; }
+    virtual void KickAsync() {}
 
     /* Set once interrupts and the scheduler are running.
        Before this, synchronous I/O must poll for completion. */

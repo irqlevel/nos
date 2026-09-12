@@ -43,6 +43,13 @@ public:
     /* TX: enqueue frame to TxQueue, call FlushTx() */
     bool SubmitTx(NetFrame* frame);
 
+    /* TX, a run of frames: one TxQueueLock acquisition and one FlushTx --
+       one doorbell -- for the lot. Takes every frame; returns how many were
+       queued, the rest dropped for want of room. From any context: with
+       interrupts off, what the driver has finished with is left to the TX
+       softirq to release. */
+    ulong SubmitTxBatch(NetFrame** frames, ulong count);
+
     /* TX: convenience wrapper -- alloc frame, copy data, SubmitTx */
     bool SendRaw(const void* buf, ulong len);
 
@@ -72,8 +79,30 @@ public:
 
     typedef void (*RxCallback)(const u8* frame, ulong len, void* ctx);
 
+    /* A listener handed the frame itself rather than a look at its bytes. It
+       may keep it -- a Get() before returning -- and later hand it to a
+       disk, transmit it as a reply, or Put() it, from any context: the
+       receive path of the zero-copy block server (the netblk module). */
+    typedef void (*RxFrameCallback)(void* ctx, NetFrame* frame);
+
     bool RegisterUdpListener(u16 port, RxCallback cb, void* ctx);
+
+    /* Unlike RegisterUdpListener, never takes a port over from whoever has
+       it: a server started on the shell's port is refused, not handed the
+       shell's datagrams. */
+    static const int UdpListenOk = 0;
+    static const int UdpListenPortTaken = 1;
+    static const int UdpListenTableFull = 2;
+    static const int UdpListenInvalid = 3;
+    int ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx);
+
+    /* Each takes away only its own kind of listener -- and a frame listener
+       only the one registered with this ctx: DHCP takes port 68 for an
+       attempt and gives it back after, and must never give back someone
+       else's. Both return once no callback of the device's listeners is
+       running. */
     void UnregisterUdpListener(u16 port);
+    void UnlistenUdpFrames(u16 port, void* ctx);
 
     /* Higher-level UDP send: builds the Ethernet/IP/UDP headers, resolves the
        destination MAC through ARP and hands the frame to SendRaw. Generic
@@ -83,12 +112,15 @@ public:
     virtual bool SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
                          const void* data, ulong len);
 
-    static const ulong MaxUdpListeners = 4;
+    /* DHCP, DNS and the UDP shell take three at boot; every block server
+       takes one more. */
+    static const ulong MaxUdpListeners = 16;
 
     struct UdpListener
     {
         u16 Port;
         RxCallback Cb;
+        RxFrameCallback FrameCb;    /* instead of Cb: ListenUdpFrames */
         void* Ctx;
     };
 
@@ -206,6 +238,8 @@ protected:
     /* Summed across CPUs; for GetStats, never for the datapath. */
     void GetRxProtoTotals(NetStats& stats);
     void GetTxProtoTotals(NetStats& stats);
+
+    void RemoveUdpListener(u16 port, void* ctx, bool frames);
 
     UdpListener UdpListeners[MaxUdpListeners];
     ulong UdpListenerCount;

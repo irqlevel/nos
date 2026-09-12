@@ -44,14 +44,15 @@ Add a new kernel service in three steps:
 | `io` | `MmioRegion` (8/16/32/64-bit), `Port<T>`, `read_msr`/`write_msr` |
 | `msix` | `MsixTable`, `MsixInterrupt` (Rust callback, 16 slots) |
 | `interrupt` | `LegacyInterrupt` (INTx, 8 slots) |
-| `sync` | `Mutex`, `SpinLock` (RAII guards), `WaitGroup` |
-| `task` | `spawn`, `spawn_on`, `spawn_with_ctx`, `TaskHandle`, `sleep` |
+| `sync` | `Mutex`, `SpinLock` (RAII guards), `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |
+| `task` | `spawn`, `spawn_on`, `spawn_with_ctx`, `TaskHandle`, `sleep`, `yield_to_runnable` |
 | `softirq` | `raise`, `register` (types: `TYPE_NET_RX`, `TYPE_BLK_IO`, etc.) |
 | `timer` | `Timer` (periodic, 8 slots, fires on CPU 0 via IPI) |
-| `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI) |
-| `block` | `register` → `BlockDeviceRegistration`; `Disk` — an existing disk or partition by name: synchronous `read`/`write`/`flush`, `partitions`; `claim` → `DiskClaim` before writing (refused while a mount, the disk log or another writer holds it or an overlapping disk/partition) |
+| `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI), `synchronize` (returns once every interrupt handler running at the call has returned) |
+| `ring` | `LocklessRing` — the kernel's bounded MPMC queue of words, one CAS an operation, safe from any context |
+| `block` | `register` → `BlockDeviceRegistration` (optional `submit`/`kick`: the asynchronous path); `Disk` — an existing disk or partition by name: synchronous `read`/`write`/`flush`, `partitions`; asynchronous `submit(&BlockIo, kick)`/`kick` straight to physical memory, completion callback from interrupt context (`can_submit`: NVMe and its partitions); `claim` → `DiskClaim` before writing (refused while a mount, the disk log or another writer holds it or an overlapping disk/partition) |
 | `cmd` | `Command::register` — a shell command whose handler writes to an `Output`; unregistered on drop, after any running call returns |
-| `net` | `register` → `NetDeviceHandle`, `NetFrame` |
+| `net` | `register` → `NetDeviceHandle`, `NetFrame` (`alloc_tx`, `retain` a lent frame); `Nic` — an existing device by name: `ip`, `mac`, `listen_udp` → `UdpListener` (handed the frame itself), `transmit`/`transmit_raw` (a batch, one lock and one doorbell) |
 
 ## Interrupt handlers
 
@@ -72,6 +73,8 @@ let reg = kcore::block::register(&kcore::block::BlockDeviceOps {
     read_sectors: my_read,
     write_sectors: my_write,
     flush: None,
+    submit: None,   // the asynchronous path: both, or neither
+    kick: None,
     ctx: driver_ptr,
 }).unwrap();
 // reg lives forever (boot-lifetime); no unregister

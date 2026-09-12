@@ -13,6 +13,7 @@
 #include "cmd.h"
 #include "elf.h"
 #include "symtab.h"
+#include "event.h"
 #include <hal/cpu.h>
 #include <block/block_device.h>
 #include <fs/vfs.h>
@@ -2725,9 +2726,117 @@ void TestMultiTaskingTaskFunc(void *ctx)
     }
 }
 
+/* Two tasks taking turns through a pair of events, the way the block
+   server's worker and whoever feeds it do: every signal has to reach a waiter
+   that is blocked, or on its way to blocking, on whichever CPU it is. Both
+   are tasks of their own. This runs on each CPU's boot task, which is its
+   idle task -- the scheduler's last resort, which must never block: a task
+   exiting on a CPU whose idle task is blocked has nowhere to switch to, and
+   spins, interrupts off, until the TLB shootdown watchdog panics. */
+struct EventPingPong
+{
+    Event Ping;
+    Event Pong;
+    Atomic Rounds;
+    Atomic Failed;
+    Atomic Abort;   /* the pinger never started: the ponger goes home */
+};
+
+static const ulong EventTestRounds = 64;
+
+static void EventTestPinger(void* ctx)
+{
+    auto* pp = static_cast<EventPingPong*>(ctx);
+    for (ulong i = 0; i < EventTestRounds; i++)
+    {
+        pp->Ping.Signal();
+        pp->Pong.Wait();
+        if (pp->Rounds.Get() != (long)(i + 1))
+            pp->Failed.Set(1);
+    }
+}
+
+static void EventTestPonger(void* ctx)
+{
+    auto* pp = static_cast<EventPingPong*>(ctx);
+    for (ulong i = 0; i < EventTestRounds; i++)
+    {
+        pp->Ping.Wait();
+        if (pp->Abort.Get() != 0)
+            return;
+        pp->Rounds.Inc();
+        pp->Pong.Signal();
+    }
+}
+
+static bool TestEvent()
+{
+    /* A signal before the wait is kept, and the wait takes it without
+       blocking -- so this much is safe on the idle task; two are one. */
+    {
+        Event early;
+        early.Signal();
+        early.Signal();
+        early.Wait();
+    }
+
+    auto* pp = Mm::TAlloc<EventPingPong, Tag>();
+    if (pp == nullptr)
+        return false;
+
+    Task* ponger = Mm::TAlloc<Task, Tag>("evpong");
+    Task* pinger = Mm::TAlloc<Task, Tag>("evping");
+    bool ok = ponger != nullptr && pinger != nullptr;
+
+    /* Both on this CPU: a waiter moved elsewhere as it blocks is woken at its
+       new CPU's next tick, not by the IPI -- 64 rounds of that would be most
+       of a second of boot */
+    if (ok)
+    {
+        ulong self = 1UL << CpuTable::GetInstance().GetCurrentCpuId();
+        ponger->SetCpuAffinity(self);
+        pinger->SetCpuAffinity(self);
+    }
+
+    if (ok && ponger->Start(EventTestPonger, pp))
+    {
+        if (!pinger->Start(EventTestPinger, pp))
+        {
+            ok = false;
+            pp->Abort.Set(1);
+            pp->Ping.Signal();
+        }
+        else
+        {
+            pinger->Wait();
+        }
+        ponger->Wait();
+    }
+    else
+    {
+        ok = false;
+    }
+
+    ok = ok && pp->Failed.Get() == 0 && pp->Rounds.Get() == (long)EventTestRounds;
+
+    if (pinger != nullptr)
+        pinger->Put();
+    if (ponger != nullptr)
+        ponger->Put();
+    pp->~EventPingPong();
+    Mm::Free(pp);
+
+    if (!ok)
+        Trace(0, "TestEvent: the ping-pong lost count");
+    return ok;
+}
+
 bool TestMultiTasking()
 {
     if (!TestSpinLockPreempt())
+        return false;
+
+    if (!TestEvent())
         return false;
 
     Task *task[2] = {0};

@@ -122,6 +122,104 @@ impl NetDeviceHandle {
     }
 }
 
+/// A network device already in the kernel's table -- `eth0` -- for a service
+/// that sends and receives over it rather than drives it. Devices live as
+/// long as the kernel does, so a Nic holds nothing and copies freely.
+#[derive(Clone, Copy)]
+pub struct Nic {
+    handle: usize,
+}
+
+/// Why a UDP listener was refused
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenError {
+    /// Someone has the port already -- the UDP shell, DHCP, another server.
+    PortTaken,
+    /// The device's listener table is full.
+    TableFull,
+    /// Port 0.
+    Invalid,
+}
+
+impl Nic {
+    pub fn find(name: &str) -> Option<Self> {
+        let handle = unsafe { net::kernel_net_find(name.as_ptr(), name.len()) };
+        if handle == 0 { None } else { Some(Self { handle }) }
+    }
+
+    /// Its address, host byte order; 0 until it has one.
+    pub fn ip(&self) -> u32 {
+        unsafe { net::kernel_net_ip(self.handle) }
+    }
+
+    pub fn mac(&self) -> [u8; 6] {
+        let mut mac = [0u8; 6];
+        unsafe { net::kernel_net_mac(self.handle, mac.as_mut_ptr()) };
+        mac
+    }
+
+    /// Every UDP datagram to `port`, handed to `cb(ctx, frame)` from the
+    /// receive softirq: the frame itself, lent for the call -- `NetFrame::
+    /// retain` keeps it. Refused for a port someone else has. The listener
+    /// goes with the returned handle, once any call still running returns.
+    ///
+    /// cb runs on the receive path of every packet the machine gets: nothing
+    /// that sleeps, and nothing long. `ctx` has to stay valid until the
+    /// UdpListener is dropped.
+    pub fn listen_udp(
+        &self,
+        port: u16,
+        cb: extern "C" fn(ctx: *mut u8, frame: usize),
+        ctx: *mut u8,
+    ) -> core::result::Result<UdpListener, ListenError> {
+        match unsafe { net::kernel_net_udp_listen(self.handle, port, cb, ctx) } {
+            0 => Ok(UdpListener { nic: *self, port, ctx: ctx as usize }),
+            1 => Err(ListenError::PortTaken),
+            2 => Err(ListenError::TableFull),
+            _ => Err(ListenError::Invalid),
+        }
+    }
+
+    /// Queues a frame to transmit; false when the queue had no room and it
+    /// was dropped.
+    pub fn transmit(&self, frame: NetFrame) -> bool {
+        let handle = frame.into_raw();
+        unsafe { net::kernel_net_submit_tx(self.handle, &handle, 1) == 1 }
+    }
+
+    /// Queues a run of frames -- one lock and one doorbell for the lot --
+    /// from any context. Takes every one; returns how many were queued, the
+    /// rest dropped.
+    ///
+    /// # Safety
+    /// Each is a frame handle the caller owns (`NetFrame::into_raw`) and
+    /// gives up here.
+    #[inline]
+    pub unsafe fn transmit_raw(&self, frames: &[usize]) -> usize {
+        if frames.is_empty() {
+            return 0;
+        }
+        unsafe { net::kernel_net_submit_tx(self.handle, frames.as_ptr(), frames.len()) }
+    }
+}
+
+/// A UDP port listened on, from `Nic::listen_udp`; given back on drop, once
+/// no call of its callback is still running -- so what the callback reaches
+/// may go right after. Task context: the drop may wait.
+pub struct UdpListener {
+    nic: Nic,
+    port: u16,
+    /* what it was registered with, which is what takes away this listener
+       and nobody else's on the port */
+    ctx: usize,
+}
+
+impl Drop for UdpListener {
+    fn drop(&mut self) {
+        unsafe { net::kernel_net_udp_unlisten(self.nic.handle, self.port, self.ctx as *mut u8) }
+    }
+}
+
 /// Reference-counted network frame buffer.
 /// `Drop` calls `kernel_netframe_put`, which frees the frame when the
 /// refcount reaches zero.
@@ -137,6 +235,39 @@ impl NetFrame {
     pub fn alloc_rx(data_len: usize) -> Option<Self> {
         let h = unsafe { net::kernel_netframe_alloc_rx(data_len) };
         if h == 0 { None } else { Some(Self { handle: h }) }
+    }
+
+    /// A frame to transmit, room for `data_len` bytes: from the frame pool --
+    /// a per-CPU cache, no allocator -- whenever it fits one. `len()` is 0
+    /// until `set_len`.
+    #[inline]
+    pub fn alloc_tx(data_len: usize) -> Option<Self> {
+        let h = unsafe { net::kernel_netframe_alloc_tx(data_len) };
+        if h == 0 { None } else { Some(Self { handle: h }) }
+    }
+
+    /// A reference of the caller's own to a frame the kernel lent: how a UDP
+    /// frame listener keeps the frame it was handed past its return.
+    ///
+    /// # Safety
+    /// `handle` must be a frame alive for the call -- the one a listener was
+    /// handed, say.
+    #[inline]
+    pub unsafe fn retain(handle: usize) -> Self {
+        unsafe { net::kernel_netframe_get(handle) };
+        Self { handle }
+    }
+
+    /// The bytes of a frame the kernel lent, without taking it.
+    ///
+    /// # Safety
+    /// `handle` must be a frame that outlives the slice and that nobody
+    /// writes meanwhile.
+    #[inline]
+    pub unsafe fn lent<'a>(handle: usize) -> &'a [u8] {
+        let ptr = unsafe { net::kernel_netframe_data(handle) };
+        let len = unsafe { net::kernel_netframe_len(handle) };
+        unsafe { core::slice::from_raw_parts(ptr, len) }
     }
 
     /// Slice of the received/transmitted data (length = `self.len()`).
@@ -163,21 +294,25 @@ impl NetFrame {
     /// Use this when you need to write into a freshly allocated RX frame
     /// before calling `set_len`. `capacity` must not exceed the value passed
     /// to `alloc_rx`; the caller is responsible for not exceeding it.
+    #[inline]
     pub fn data_raw_mut(&mut self, capacity: usize) -> &mut [u8] {
         let ptr = unsafe { net::kernel_netframe_data(self.handle) };
         unsafe { core::slice::from_raw_parts_mut(ptr, capacity) }
     }
 
     /// Physical address of the data buffer (for DMA descriptor programming).
+    #[inline]
     pub fn data_phys(&self) -> u64 {
         unsafe { net::kernel_netframe_data_phys(self.handle) }
     }
 
     /// Current valid data length (0 for a freshly allocated RX frame).
+    #[inline]
     pub fn len(&self) -> usize {
         unsafe { net::kernel_netframe_len(self.handle) }
     }
 
+    #[inline]
     pub fn set_len(&mut self, len: usize) {
         unsafe { net::kernel_netframe_set_len(self.handle, len) }
     }
@@ -185,6 +320,7 @@ impl NetFrame {
     /// Consume the frame, returning the raw handle without decrementing
     /// the refcount.  The caller must eventually call `from_raw()` or
     /// invoke `kernel_netframe_put(handle)` directly (e.g. from an ISR).
+    #[inline]
     pub fn into_raw(self) -> usize {
         let h = self.handle;
         core::mem::forget(self);
@@ -197,6 +333,7 @@ impl NetFrame {
     /// `handle` must be a valid non-zero handle previously obtained from
     /// `into_raw()`.  The caller must not use the original raw handle after
     /// this call.
+    #[inline]
     pub unsafe fn from_raw(handle: usize) -> Self {
         Self { handle }
     }

@@ -18,7 +18,9 @@ public:
     void Insert(Task* task);
     void Remove(Task* task);
 
-    void Schedule(Task* curr);
+    /* keepOverIdle: curr keeps the CPU rather than hand it to the idle
+       task, when the idle task is all there is (YieldToRunnable) */
+    void Schedule(Task* curr, bool keepOverIdle = false);
 
     void Clear();
 
@@ -40,7 +42,7 @@ private:
     TaskQueue& operator=(const TaskQueue& other) = delete;
     TaskQueue& operator=(TaskQueue&& other) = delete;
 
-    Task* SelectNext(Task* curr);
+    Task* SelectNext(Task* curr, bool keepOverIdle);
 
     /* Spins allowed in Schedule while an exited task waits for a
        runnable candidate before declaring the queue broken */
@@ -68,6 +70,15 @@ private:
 
 
 void Schedule();
+
+/* Gives the CPU to another task runnable on it, if there is one, and returns
+   at once if there is not: never to the idle task, as Schedule() would, which
+   halts the CPU until the next interrupt that CPU takes. The way to poll for
+   work another CPU's interrupt will bring, without keeping whatever else is
+   runnable here -- a softirq task the tick preempted mid-handler among them
+   -- off the CPU the way a plain spin does. */
+void YieldToRunnable();
+
 void Sleep(ulong nanoSecs);
 
 /* Tasks moved between CPU queues since boot. */

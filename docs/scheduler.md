@@ -126,12 +126,43 @@ clears the flag before `Schedule()` can act on it. Both stores are
 sequentially consistent (`lock bts` on x86, `stlr` on arm64); relaxed
 ordering would hold on x86 and fail on arm64 only.
 
+The sleeper's side runs with **interrupts off**, from the flag going up
+until it is down again, its own `Schedule()` included. The tick and every
+IPI end in a `Schedule()` of their own, and one landing while the flag is up
+switches the task out as a blocked one -- asleep on work it never saw, or had
+just seen and not yet cleared the flag for, while a waker that found the
+work already published may not clear it again. `Schedule()` saves and
+restores interrupts per task, so a task that blocks with them off comes back
+with them off, and turns them back on itself.
+
+The idle task only halts (`Cpu::Idle`), so a task that *yields* on a CPU with
+nothing else to run gives that CPU to it: the CPU sleeps until the next
+interrupt it takes itself -- the tick, when the device's interrupt is routed
+elsewhere -- and a waker that finds the task merely runnable sends no IPI.
+`Schedule()` is a way to let others run, not a way to wait: wait by blocking,
+or poll with `YieldToRunnable()`, which gives the CPU to another runnable task
+and never to the idle task, returning at once when there is none. A plain spin
+is no better than the yield: it keeps whatever else is runnable on the CPU off
+it until the tick -- a softirq task the tick preempted mid-handler included,
+with its type's work held up on every CPU meanwhile. `WaitGroup::Wait` and
+`Sleep()` still wait by yielding, which is why a synchronous NVMe read on
+arm64 under TCG takes a tick (`blkload nvme0 randread qd=1`, 10 ms).
+
 `SoftIrq::Run` is the worked example, and it also shows the one case where
 "the task is already running" is true and useless: between `Block()` and the
 `Schedule()` that follows it, a task is out of the scheduler's walk while
 still being the current task, so a raise landing there must kick anyway. Its
 `TickKick` is the belt and braces — one atomic read per tick turns a lost
-wakeup from a wedged CPU into at most a tick of latency.
+wakeup from a wedged CPU into at most a tick of latency. (Before its window
+had interrupts off, that tick was paid a few times in every thousand network
+round trips.)
+
+`Event` (`kernel/event.h`) packages the pattern for any task with something
+to wait for: one waiter, `Signal()` from anywhere, a hard IRQ handler
+included, and an IPI to the waiter's CPU when it finds the waiter blocked.
+The netblk module's worker sleeps on one. A CPU's idle task must never block,
+on an event or otherwise: it is the scheduler's last resort, and a task
+exiting on a CPU whose idle task is blocked has nothing to switch to.
 
 ## Load balancing
 

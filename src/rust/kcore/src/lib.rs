@@ -23,6 +23,7 @@ pub mod block;
 pub mod net;
 pub mod bitmap;
 pub mod ring_buffer;
+pub mod ring;
 pub mod hpet;
 pub mod acpi;
 pub mod cmd;

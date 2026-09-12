@@ -24,4 +24,8 @@ extern "C" {
     pub fn kernel_waitgroup_add(handle: usize, delta: isize);
     pub fn kernel_waitgroup_done(handle: usize);
     pub fn kernel_waitgroup_wait(handle: usize);
+    pub fn kernel_event_create() -> usize;
+    pub fn kernel_event_destroy(handle: usize);
+    pub fn kernel_event_wait(handle: usize);
+    pub fn kernel_event_signal(handle: usize);
 }

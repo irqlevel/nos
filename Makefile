@@ -130,6 +130,7 @@ CXX_SRC_x86_64 =   \
     src/cpp/fs/fstest.cpp \
     src/cpp/kernel/mutex.cpp \
     src/cpp/kernel/wait_group.cpp \
+    src/cpp/kernel/event.cpp \
     src/cpp/kernel/softirq.cpp \
     src/cpp/kernel/irq_balance.cpp \
     src/cpp/arch/x86_64/exception.cpp    \
@@ -217,6 +218,7 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/timer.cpp \
     src/cpp/kernel/mutex.cpp \
     src/cpp/kernel/wait_group.cpp \
+    src/cpp/kernel/event.cpp \
     src/cpp/kernel/rw_mutex.cpp \
     src/cpp/kernel/object_table.cpp \
     src/cpp/kernel/softirq.cpp \
@@ -384,7 +386,7 @@ $(RUST_LIB): $(RUST_SRC)
 # large one has no position-independent form worth having; and
 # compiler-builtins' own memcpy and friends, so that a module imports nothing
 # but the kernel's API.
-MODULES = hello modtest slowexit blkload
+MODULES = hello modtest slowexit blkload netblk
 MODULE_KO = $(patsubst %,$(OUT)/modules/%.ko,$(MODULES))
 MODULE_RUSTFLAGS_x86_64 = ["-Ccode-model=small","-Crelocation-model=pic"]
 MODULE_RUSTFLAGS_aarch64 = ["-Crelocation-model=pic"]

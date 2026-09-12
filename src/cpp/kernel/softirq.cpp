@@ -4,6 +4,7 @@
 #include "sched.h"
 #include "cpu.h"
 
+#include <hal/cpu.h>
 #include <hal/irqchip.h>
 #include <mm/new.h>
 #include <lib/stdlib.h>
@@ -282,6 +283,16 @@ void SoftIrq::Run(CpuState& state)
                empty: a type held by another CPU leaves the bit set here, and
                testing Pending alone would refuse to sleep and spin for the
                length of that handler. */
+            /* And interrupts off across it, as Event::Wait has them: the tick
+               and every IPI end in a Schedule() of their own, and one landing
+               between the flag going up and the re-check switches this task
+               out blocked before it has looked -- while a raise that finds
+               the bit already pending returns without a wakeup. Only
+               TickKick came back for it then, a tick later: ten milliseconds
+               of a receive path going nowhere, a few times in a thousand
+               round trips. Schedule() keeps interrupts per task, so the task
+               comes back with them still off. */
+            ulong flags = Hal::IrqSave();
             task->Block();
 
             if (!HasRunnableWork(state))
@@ -290,8 +301,11 @@ void SoftIrq::Run(CpuState& state)
             /* Running again, so the flag has no business still being up. The
                waker normally cleared it; this covers the re-check above
                finding work, and the case where Schedule() had no one else to
-               run and returned to us still blocked. */
+               run and returned to us still blocked. Cleared before interrupts
+               come back on: a tick held off until then would find it up. */
             task->Unblock();
+
+            Hal::IrqRestore(flags);
         }
     }
 }

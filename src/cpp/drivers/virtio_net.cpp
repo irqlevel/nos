@@ -41,13 +41,18 @@ VirtioNet::VirtioNet()
     , FreeTxSlotMask(0)
     , TxHdrPage(nullptr)
     , TxHdrPagePhys(0)
-    , RxBufs(nullptr)
-    , RxBufsPhys(0)
+    , RxSlotCount(0)
+    , RxEmptySlots(0)
+    , RxHdrPage(nullptr)
+    , RxHdrPagePhys(0)
     , RxNeedNotify(false)
 {
     DevName[0] = '\0';
     Stdlib::MemSet(TxSlots, 0, sizeof(TxSlots));
     Stdlib::MemSet(TxSlotByHead, 0, sizeof(TxSlotByHead));
+    Stdlib::MemSet(RxSlotFrame, 0, sizeof(RxSlotFrame));
+    for (ulong i = 0; i < VirtQueue::MaxDescriptors; i++)
+        RxSlotByHead[i] = NoRxSlot;
 }
 
 VirtioNet::~VirtioNet()
@@ -247,34 +252,42 @@ bool VirtioNet::InitCommon(const char* name, u8 irq, u8 vector)
     }
     FreeTxSlotMask = (1UL << MaxTxSlots) - 1; /* all slots free */
 
-    /* Allocate DMA pages for RX buffers (RxBufCount * RxBufSize = 32KB = 8 pages) */
-    ulong rxPages = (RxBufCount * RxBufSize + Const::PageSize - 1) / Const::PageSize;
-    RxBufs = (u8*)Mm::AllocMapPages(rxPages, &RxBufsPhys);
-    if (!RxBufs)
+    /* One DMA page for every RX slot's virtio-net header */
+    static_assert(MaxRxSlots * sizeof(VirtioNetHdr) <= Const::PageSize, "RX headers fit their page");
+    static_assert(MaxTxSlots * sizeof(VirtioNetHdr) <= Const::PageSize, "TX headers fit their page");
+    static_assert(MaxTxSlots < sizeof(FreeTxSlotMask) * 8, "TX slots are a bit mask");
+
+    RxHdrPage = (u8*)Mm::AllocMapPages(1, &RxHdrPagePhys);
+    if (!RxHdrPage)
     {
-        Trace(0, "VirtioNet %s: failed to alloc RX DMA pages", name);
+        Trace(0, "VirtioNet %s: failed to alloc RX header page", name);
         Mm::UnmapFreePages(TxHdrPage);
         TxHdrPage = nullptr;
         Transport->SetStatus(VirtioTransport::StatusFailed);
         return false;
     }
+    Stdlib::MemSet(RxHdrPage, 0, Const::PageSize);
 
-    /* Init pre-allocated RX frame descriptors */
-    for (ulong r = 0; r < RxBufCount; r++)
-    {
-        RxFrames[r].Init();
-        RxFrames[r].Direction = NetFrame::Rx;
-        RxFrames[r].Release = RxFrameRelease;
-        RxFrames[r].ReleaseCtx = this;
-    }
+    /* Two descriptors to a slot */
+    RxSlotCount = rxQueueSize / 2;
+    if (RxSlotCount > MaxRxSlots)
+        RxSlotCount = MaxRxSlots;
 
     /* Default IP for QEMU user-mode networking */
     Ip = Net::IpAddress(10, 0, 2, 15);
 
     Initialized = true;
 
-    /* Pre-post RX buffers */
-    PostAllRxBufs();
+    /* Pre-post RX frames */
+    for (ulong s = 0; s < RxSlotCount; s++)
+    {
+        if (!PostRxSlot(s))
+            RxEmptySlots++;
+    }
+    Transport->NotifyQueue(0);
+
+    Trace(0, "VirtioNet %s: %u of %u RX slots posted, %u TX slots", name,
+        RxSlotCount - RxEmptySlots, RxSlotCount, (ulong)MaxTxSlots);
 
     if (!Transport->UsingMsix())
     {
@@ -288,32 +301,58 @@ bool VirtioNet::InitCommon(const char* name, u8 irq, u8 vector)
     return true;
 }
 
-void VirtioNet::PostRxBuf(ulong index)
+bool VirtioNet::PostRxFrame(ulong slot, NetFrame* frame)
 {
-    VirtQueue::BufDesc buf;
-    buf.Addr = RxBufsPhys + index * RxBufSize;
-    buf.Len = RxBufSize;
-    buf.Writable = true;
+    /* The header in a descriptor of its own, which is also the layout a
+       legacy device without ANY_LAYOUT asks for; the packet then starts at
+       the frame's first byte, where the rest of the stack expects it. */
+    VirtQueue::BufDesc bufs[2];
+    bufs[0].Addr = RxHdrPagePhys + slot * NetHdrSize;
+    bufs[0].Len = (u32)NetHdrSize;
+    bufs[0].Writable = true;
+    bufs[1].Addr = frame->DataPhys;
+    bufs[1].Len = (u32)RxFrameSize;
+    bufs[1].Writable = true;
 
-    int head = HwRxQueue.AddBufs(&buf, 1);
+    int head = HwRxQueue.AddBufs(bufs, 2);
     if (head < 0)
-    {
-        Trace(0, "VirtioNet %s: RX post failed for buf %u", DevName, index);
-        return;
-    }
-    if ((ulong)head < VirtQueue::MaxDescriptors)
-        RxBufByDesc[head] = index;
+        return false;
+
+    /* A head is an index into a queue VirtQueue::Setup held to MaxDescriptors */
+    RxSlotByHead[head] = slot;
+    RxSlotFrame[slot] = frame;
+    return true;
 }
 
-void VirtioNet::PostAllRxBufs()
+bool VirtioNet::PostRxSlot(ulong slot)
 {
-    Stdlib::MemSet(RxBufByDesc, 0, sizeof(RxBufByDesc));
+    NetFrame* frame = NetFrame::AllocTx(RxFrameSize);
+    if (frame == nullptr)
+        return false;
 
-    for (ulong i = 0; i < RxBufCount; i++)
-        PostRxBuf(i);
+    frame->Direction = NetFrame::Rx;
+    if (!PostRxFrame(slot, frame))
+    {
+        frame->Put();
+        return false;
+    }
+    return true;
+}
 
-    /* Notify device about available RX buffers */
-    Transport->NotifyQueue(0);
+void VirtioNet::RefillRx()
+{
+    for (ulong s = 0; s < RxSlotCount && RxEmptySlots != 0; s++)
+    {
+        if (RxSlotFrame[s] != nullptr)
+            continue;
+
+        /* Still nothing to post it with: the next pass tries again. */
+        if (!PostRxSlot(s))
+            break;
+
+        RxEmptySlots--;
+        RxNeedNotify = true;
+    }
 }
 
 /* --- TX slot management (caller holds TxQueueLock) --- */
@@ -323,15 +362,9 @@ int VirtioNet::AllocTxSlot()
     if (FreeTxSlotMask == 0)
         return -1;
 
-    for (ulong i = 0; i < MaxTxSlots; i++)
-    {
-        if (FreeTxSlotMask & (1UL << i))
-        {
-            FreeTxSlotMask &= ~(1UL << i);
-            return (int)i;
-        }
-    }
-    return -1;
+    ulong i = (ulong)__builtin_ctzl(FreeTxSlotMask);
+    FreeTxSlotMask &= ~(1UL << i);
+    return (int)i;
 }
 
 void VirtioNet::FreeTxSlot(int idx)
@@ -445,50 +478,71 @@ void VirtioNet::ReapRx()
 
         RxPktCount.Inc();
 
-        if (usedId >= VirtQueue::MaxDescriptors)
+        /* Map the completed chain back to its slot (heads and slots part
+           company once descriptors are recycled). */
+        ulong slot = (usedId < VirtQueue::MaxDescriptors) ? RxSlotByHead[usedId] : NoRxSlot;
+        if (slot >= RxSlotCount || RxSlotFrame[slot] == nullptr)
         {
             RxDropCount.Inc();
             continue;
         }
 
-        /* Map the completed descriptor back to its buffer (the ids diverge
-           from buffer indexes once descriptors are recycled). */
-        ulong bufIdx = RxBufByDesc[usedId];
-        if (bufIdx >= RxBufCount)
-        {
-            RxDropCount.Inc();
-            continue;
-        }
+        RxSlotByHead[usedId] = NoRxSlot;
+        NetFrame* frame = RxSlotFrame[slot];
+        RxSlotFrame[slot] = nullptr;
+        RxNeedNotify = true;
 
         if (usedLen <= NetHdrSize)
         {
             RxDropCount.Inc();
-            PostRxBuf(bufIdx);
-            RxNeedNotify = true;
+            if (!PostRxFrame(slot, frame))
+            {
+                frame->Put();
+                RxEmptySlots++;
+            }
             continue;
         }
 
-        /* usedLen is device-controlled; clamp to the RX buffer so a bogus
-           length cannot make frame->Length exceed the allocation and let
-           protocol parsers read past RxBufs. */
-        if (usedLen > RxBufSize)
-            usedLen = RxBufSize;
+        /* usedLen is device-controlled; clamp to the frame so a bogus length
+           cannot make frame->Length exceed it and let protocol parsers read
+           past its end. */
+        ulong len = usedLen - NetHdrSize;
+        if (len > RxFrameSize)
+            len = RxFrameSize;
 
-        NetFrame* frame = &RxFrames[bufIdx];
-        frame->Data = RxBufs + bufIdx * RxBufSize + NetHdrSize;
-        frame->DataPhys = RxBufsPhys + bufIdx * RxBufSize + NetHdrSize;
-        frame->Length = usedLen - NetHdrSize;
-        frame->Refcount.Set(1);
+        frame->Length = len;
         frame->Direction = NetFrame::Rx;
-        frame->Release = RxFrameRelease;
-        frame->ReleaseCtx = this;
 
-        if (!EnqueueRx(frame))
+        /* The slot's next frame first. With none to be had -- or no room in
+           the queue -- the packet is dropped and its frame goes straight
+           back: a slot left empty is one the device can never fill, and a
+           ring gone empty raises no interrupt to come back for it, deaf
+           until something happens to transmit. */
+        NetFrame* fresh = NetFrame::AllocTx(RxFrameSize);
+        if (fresh == nullptr || !EnqueueRx(frame))
         {
             RxDropCount.Inc();
-            frame->Put(); /* reposts DMA buffer via RxFrameRelease */
+            if (fresh != nullptr)
+                fresh->Put();
+            if (!PostRxFrame(slot, frame))
+            {
+                frame->Put();
+                RxEmptySlots++;
+            }
+            continue;
+        }
+
+        /* Handed up, the stack's now; the fresh frame takes its place. */
+        fresh->Direction = NetFrame::Rx;
+        if (!PostRxFrame(slot, fresh))
+        {
+            fresh->Put();
+            RxEmptySlots++;
         }
     }
+
+    if (RxEmptySlots != 0)
+        RefillRx();
 }
 
 /* --- RX: process frames from SW RxQueue (protocol dispatch) --- */
@@ -512,16 +566,6 @@ void VirtioNet::ProcessRx()
         Transport->NotifyQueue(0);
         RxNeedNotify = false;
     }
-}
-
-/* --- RX frame release callback --- */
-
-void VirtioNet::RxFrameRelease(NetFrame* frame, void* ctx)
-{
-    VirtioNet* dev = (VirtioNet*)ctx;
-    ulong idx = (ulong)(frame - dev->RxFrames);
-    dev->PostRxBuf(idx);
-    dev->RxNeedNotify = true;
 }
 
 /* --- Interface methods --- */

@@ -84,6 +84,9 @@ public:
     virtual bool Flush() override;
     virtual bool ReadSectors(u64 sector, void* buf, u32 count) override;
     virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) override;
+    virtual bool CanSubmitAsync() override;
+    virtual int SubmitAsync(const AsyncBlockIo& io, bool kick) override;
+    virtual void KickAsync() override;
 
     static void ProbeAll();
 
