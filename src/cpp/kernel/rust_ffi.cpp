@@ -52,6 +52,13 @@ extern "C" {
 
 void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long len)
 {
+    /* The level, as Trace() has it. A trace!(3, ...) used to be printed at
+       every level: the NVMe interrupt handler's "IRQ spurious (no CQEs)",
+       forty thousand times in a few seconds of netblk load, each one
+       formatted and logged from the handler. */
+    if (level > (unsigned int)Kernel::Tracer::GetInstance().GetLevel())
+        return;
+
     char buf[512];
     unsigned long n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
     Stdlib::MemCpy(buf, msg, n);

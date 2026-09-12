@@ -348,14 +348,29 @@ worker yielded instead of polling, the tail was the server's own: its CPU
 halted while the disk worked, and a window of 1 ran at 1 700 IOPS, p99
 9.4 ms.)
 
-On arm64 the test runs under TCG: 14 000 IOPS at a window of 8, 19 000 with
-`poll=1000`, the server's p50 72 to 117 µs. There about one wakeup of a
-sleeping worker in a hundred takes a tick -- the server's p99 is 9.7 ms, and
-0.4 ms with `poll=1000`, where it hardly sleeps -- which x86 under KVM does not
-show, and whose cause is not known yet. The synchronous path pays the tick on
-every command: `blkload nvme0 randread qd=1` measures 10 ms, because
-`WaitGroup` waits by yielding, its CPU halts in the idle task, and on that
-board nothing but the tick wakes it.
+On arm64 the test runs under TCG, and there the worker used to lose a whole
+tick now and then -- the server's p99 was 10.7 ms -- which x86 under KVM does
+not show. The cause was the scheduler's. The tick and the IPI handler ended in
+`Schedule()`, which hands the CPU to the idle task when nothing else is
+runnable, even while the task the interrupt landed on can still run; the idle
+task only halts, and a worker that is runnable rather than blocked gets no IPI
+from the requests and completions meant for it, so it waited for the next
+tick. They end in `Preempt()` now, which keeps a task that can still run (see
+[Scheduler](scheduler.md) -- the AX41 lost a quarter of a polling worker's CPU
+the same way). One run of each, 5 seconds, before and after:
+
+| arm64 under TCG, random 1 KiB reads | before | after |
+|---|---|---|
+| window 1 | 675 IOPS | 3 000 IOPS |
+| window 16 | 10 500 IOPS | 29 900 IOPS |
+| window 64 | 41 500 IOPS | 57 300 IOPS |
+| the server's p99 over those three | 10.7 ms | 0.8 ms |
+| window 16, `poll=100000` | 34 500 IOPS, p99.9 10.2 ms | 49 000 IOPS, p99.9 0.3 ms |
+| the idle task's share of that worker's CPU | 24% | 0 |
+
+The synchronous path still pays the tick on every command: `blkload nvme0
+randread qd=1` measures 10 ms, because `WaitGroup` waits by yielding, its CPU
+halts in the idle task, and on that board nothing but the tick wakes it.
 
 ## Limits
 

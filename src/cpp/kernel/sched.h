@@ -19,7 +19,7 @@ public:
     void Remove(Task* task);
 
     /* keepOverIdle: curr keeps the CPU rather than hand it to the idle
-       task, when the idle task is all there is (YieldToRunnable) */
+       task, when the idle task is all there is (YieldToRunnable, Preempt) */
     void Schedule(Task* curr, bool keepOverIdle = false);
 
     void Clear();
@@ -70,6 +70,16 @@ private:
 
 
 void Schedule();
+
+/* The reschedule an interrupt asks for -- the tick's and every IPI's: the CPU
+   goes to another task runnable on it, if there is one, and otherwise stays
+   with the task the interrupt landed on. Never to the idle task while that
+   task can still run, as Schedule() would: the idle task only halts, and the
+   task it displaced, runnable rather than blocked, gets no IPI from whoever
+   has work for it -- it waited for the next tick. On the AX41 that took
+   netblk's polling worker off its CPU some 25 times a second, a tick each:
+   a quarter of the CPU, and a p99 of 10 ms. */
+void Preempt();
 
 /* Gives the CPU to another task runnable on it, if there is one, and returns
    at once if there is not: never to the idle task, as Schedule() would, which
