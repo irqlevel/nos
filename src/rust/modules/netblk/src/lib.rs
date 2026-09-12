@@ -296,7 +296,7 @@ fn start<'a>(reg: &Registry, mut words: impl Iterator<Item = &'a str>, out: &mut
         .ok_or_else(|| "no memory for its rings and slots".to_string())?;
     let ctx = &*shared as *const Shared as *mut u8;
 
-    let worker = kcore::task::spawn_on_with_ctx(1u64 << cpu, worker_main, ctx)
+    let worker = kcore::task::spawn_on_with_ctx(&format!("netblk/{}", port), 1u64 << cpu, worker_main, ctx)
         .ok_or_else(|| "could not start its task".to_string())?;
 
     /* An instance from here on, so that a failure below is torn down by its

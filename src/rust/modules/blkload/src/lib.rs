@@ -513,9 +513,9 @@ fn run(args: &str, out: &mut Output) -> Result<(), String> {
        with `shared` and its buffer before this block ends */
     let started = {
         let mut tasks = Vec::new();
-        for worker in workers.iter_mut() {
+        for (i, worker) in workers.iter_mut().enumerate() {
             let ctx = &mut **worker as *mut Worker as *mut u8;
-            match kcore::task::spawn_with_ctx(worker_main, ctx) {
+            match kcore::task::spawn_with_ctx(&format!("blkload/{}", i), worker_main, ctx) {
                 Some(task) => tasks.push(task),
                 None => {
                     shared.stop.store(true, Ordering::Relaxed);

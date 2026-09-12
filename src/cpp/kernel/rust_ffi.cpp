@@ -310,9 +310,23 @@ void kernel_event_signal(unsigned long handle)
     reinterpret_cast<Kernel::Event*>(handle)->Signal();
 }
 
-unsigned long kernel_task_spawn(void (*func)(void*), void* ctx)
+/* The name ps and top show for a task Rust starts: the caller's, a Rust
+   string with no terminator, cut to the room a task has for one */
+static Kernel::Task* NewRustTask(const unsigned char* name, unsigned long nameLen)
 {
-    Kernel::Task* t = Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>("rust");
+    char buf[Kernel::TaskNameLen];
+    const unsigned long len = Stdlib::Min(nameLen, (unsigned long)sizeof(buf) - 1);
+
+    Stdlib::MemCpy(buf, name, len);
+    buf[len] = '\0';
+    /* Never the format itself: a '%' in the name is the caller's */
+    return Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>("%s", buf);
+}
+
+unsigned long kernel_task_spawn(const unsigned char* name, unsigned long nameLen,
+    void (*func)(void*), void* ctx)
+{
+    Kernel::Task* t = NewRustTask(name, nameLen);
     if (!t)
         return 0;
     if (!t->Start(func, ctx))
@@ -323,11 +337,11 @@ unsigned long kernel_task_spawn(void (*func)(void*), void* ctx)
     return (unsigned long)t;
 }
 
-unsigned long kernel_task_spawn_on(
+unsigned long kernel_task_spawn_on(const unsigned char* name, unsigned long nameLen,
     void (*func)(void*), void* ctx,
     unsigned long affinity_mask)
 {
-    Kernel::Task* t = Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>("rust");
+    Kernel::Task* t = NewRustTask(name, nameLen);
     if (!t)
         return 0;
     t->SetCpuAffinity(affinity_mask);
@@ -745,19 +759,6 @@ int kernel_msix_is_ready(unsigned long handle)
     if (handle == 0)
         return 0;
     return reinterpret_cast<Kernel::MsixTable*>(handle)->IsReady() ? 1 : 0;
-}
-
-unsigned long kernel_task_spawn_ctx(
-    void (*func)(void*), void* ctx)
-{
-    return kernel_task_spawn(func, ctx);
-}
-
-unsigned long kernel_task_spawn_on_ctx(
-    void (*func)(void*), void* ctx,
-    unsigned long affinity_mask)
-{
-    return kernel_task_spawn_on(func, ctx, affinity_mask);
 }
 
 } /* extern "C" */

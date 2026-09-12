@@ -32,7 +32,7 @@ fn test_worker() {
 }
 
 fn test_task() {
-    if let Some(h) = kcore::task::spawn(test_worker) {
+    if let Some(h) = kcore::task::spawn("rust_test", test_worker) {
         kcore::task::sleep_ms(10);
         drop(h);
     }
