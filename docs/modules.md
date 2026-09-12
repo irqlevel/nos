@@ -330,6 +330,24 @@ another, a worker task, frames the NIC still holds -- and its `Drop` is the
 order that takes: the listener, the worker, then `kcore::cpu::synchronize` for
 an interrupt handler still on its way out of the module's code.
 
+## sshd
+
+`sshd` (`src/rust/modules/sshd`) is an SSH server: `sshd allow <key>`, `sshd
+start`, and an OpenSSH client logs in to the kernel's shell. The protocol is a
+crate of its own, `src/rust/ssh`, which knows nothing of the kernel; the
+module is the kernel's side -- a listener task, a task for each connection,
+the files it keeps under `/etc/ssh`. Its page is [sshd](sshd.md). Nothing loads
+a module at boot by itself, so a machine that is to be reached only through
+it gets two lines in `/etc/rc`, which the shell runs once the network is up:
+`insmod /sshd.ko` and `sshd start`.
+
+It needed the kernel to export more than the drivers ever had: TCP's passive
+side (`kcore::tcp::TcpListener`, `TcpStream`), running a shell command with
+its output handed back (`kcore::cmd::dispatch`), files (`kcore::fs`) and the
+calling task's identity (`kcore::task::current_id`). And it carries its own
+copy of the cryptography the TLS client uses: modules share nothing with the
+kernel but the exported functions.
+
 ## Backtraces
 
 A frame in a module's code is named like the kernel's own, with the module

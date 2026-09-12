@@ -158,6 +158,12 @@ impl Nic {
         mac
     }
 
+    /// The device, for the wrappers of other kernel calls that take one
+    /// (`tcp::TcpListener::bind`).
+    pub(crate) fn handle(&self) -> usize {
+        self.handle
+    }
+
     /// Every UDP datagram to `port`, handed to `cb(ctx, frame)` from the
     /// receive softirq: the frame itself, lent for the call -- `NetFrame::
     /// retain` keeps it. Refused for a port someone else has. The listener

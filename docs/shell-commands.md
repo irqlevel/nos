@@ -74,6 +74,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `netblk start <disk> <port> [ro] [nic=eth0] [mtu=1500] [cpu=N] [poll=us]` | From the `netblk` module, once it is loaded: serve an NVMe disk, or a partition of one, over UDP on `port` (1024 and up, one instance to a port), zero-copy. Read-write claims the device the way a `blkload` write test does; `ro` takes no claim. A port someone else has is refused. `poll` keeps the worker spinning that long for the next request before it sleeps. See [netblk](netblk.md) |
 | `netblk list` / `netblk stop <port>\|all` | The instances served and their counters; stop one, or all -- waiting for what the disk still has in flight |
 | `lsmod` | List the modules: name, size, load address, how many kernel functions each binds to, and which are permanent, still loading or still unloading. Never waits on a load or unload in progress |
+| `rc [add <line>\|del <n>\|clear\|run]` | Show or edit `/etc/rc`: shell commands, a line each (blank lines and `#` comments skipped), that the shell's task runs once at boot after DHCP -- how a module such as [sshd](sshd.md) gets loaded and started on a machine nobody can reach until it is. `rc` numbers the lines, `add` appends one, `del` takes one out, `clear` removes the file, `run` runs it now. What it prints at boot goes to the kernel log and the screen; `rc=off` skips it |
 | `usb` | Show xHCI controllers, connected root ports and keyboard report counters |
 | `panic [type]` | Trigger kernel panic (direct, pagefault, divzero, ud) |
 | `version` | Show kernel version |

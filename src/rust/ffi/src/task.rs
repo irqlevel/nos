@@ -17,4 +17,6 @@ extern "C" {
     pub fn kernel_task_put(handle: usize);
     pub fn kernel_sleep_ns(ns: u64);
     pub fn kernel_task_yield_to_runnable();
+    /// The calling task, as a handle from the spawn calls names it.
+    pub fn kernel_task_current() -> usize;
 }

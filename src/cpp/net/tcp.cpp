@@ -815,6 +815,14 @@ void Tcp::Process(NetDevice* dev, const u8* frame, ulong frameLen)
     if (tcp->Flags & TcpFlagSyn)
     {
         TcpConn* listener = FindListenerLocked(localIp, localPort);
+        if (listener && BacklogFullLocked(localPort))
+        {
+            /* Dropped, as a full accept queue drops it: the peer tries
+               again, and the pool keeps its slots */
+            listener->Lock.Unlock();
+            PoolLock.Unlock();
+            return;
+        }
         if (listener)
         {
             /* Allocate a new connection for this SYN */
@@ -1051,7 +1059,10 @@ TcpConn* Tcp::Listen(NetDevice* dev, u16 port)
     }
 
     conn->Dev = dev;
-    conn->LocalIp = dev->GetIp();
+    /* The wildcard, which FindListenerLocked matches with any destination:
+       bound to the device's address of the moment, the port would answer
+       nobody once a DHCP renewal moved it */
+    conn->LocalIp = IpAddress((u32)0);
     conn->LocalPort = port;
     conn->State = TcpStateListen;
     conn->OwnedByApp = true; /* caller holds this pointer until Close() */
@@ -1060,28 +1071,55 @@ TcpConn* Tcp::Listen(NetDevice* dev, u16 port)
     return conn;
 }
 
-TcpConn* Tcp::Accept(TcpConn* listener)
+TcpConn* Tcp::Accept(TcpConn* listener, ulong timeoutMs)
 {
-    if (!listener || listener->State != TcpStateListen)
+    if (!listener)
         return nullptr;
+
+    /* The port, taken once: a Close from another task frees the listener's
+       slot, and a Listen after that may take the slot for another port */
+    listener->Lock.Lock();
+    bool listening = (listener->State == TcpStateListen);
+    u16 port = listener->LocalPort;
+    listener->Lock.Unlock();
+    if (!listening)
+        return nullptr;
+
+    ulong deadline = (timeoutMs != 0) ? GetBootTimeMs() + timeoutMs : 0;
 
     for (;;)
     {
         PoolLock.Lock();
+
+        listener->Lock.Lock();
+        listening = (listener->State == TcpStateListen && listener->LocalPort == port);
+        listener->Lock.Unlock();
+        if (!listening)
+        {
+            PoolLock.Unlock();
+            return nullptr;
+        }
+
         for (ulong i = 0; i < TcpMaxConnections; i++)
         {
             TcpConn* c = &Pool[i];
             if (c == listener)
                 continue;
-            if (c->LocalPort == listener->LocalPort && !c->Accepted &&
+            if (c->LocalPort == port && !c->Accepted && !c->OwnedByApp &&
                 (c->State == TcpStateEstablished ||
+                 c->State == TcpStateCloseWait ||
                  c->State == TcpStateSynReceived))
             {
                 c->Lock.Lock();
                 /* Re-check under the lock: only hand out each established
                    connection once, and take ownership so the cleanup timer
-                   won't recycle the slot from under the accepting task. */
-                if (c->State == TcpStateEstablished && !c->Accepted)
+                   won't recycle the slot from under the accepting task. One
+                   whose peer has closed already goes too: its reader sees the
+                   end of the stream and closes it, and nothing else would --
+                   a CLOSE-WAIT nobody owns keeps its slot for good. Never one
+                   of our own connections that happens to use the port. */
+                if ((c->State == TcpStateEstablished || c->State == TcpStateCloseWait) &&
+                    !c->Accepted && !c->OwnedByApp)
                 {
                     c->Accepted = true;
                     c->OwnedByApp = true;
@@ -1093,17 +1131,25 @@ TcpConn* Tcp::Accept(TcpConn* listener)
             }
         }
         PoolLock.Unlock();
+
+        if (deadline != 0 && GetBootTimeMs() >= deadline)
+            return nullptr;
+
         Sleep(1 * Const::NanoSecsInMs);
     }
 }
 
-long Tcp::Send(TcpConn* conn, const void* data, ulong len)
+long Tcp::Send(TcpConn* conn, const void* data, ulong len, ulong timeoutMs)
 {
     if (!conn)
         return -1;
 
     const u8* src = (const u8*)data;
     ulong sent = 0;
+
+    /* A whole-call deadline: a caller that has to notice something else
+       meanwhile -- its server stopping -- calls again with the rest */
+    ulong deadline = (timeoutMs != 0) ? GetBootTimeMs() + timeoutMs : 0;
 
     while (sent < len)
     {
@@ -1120,6 +1166,8 @@ long Tcp::Send(TcpConn* conn, const void* data, ulong len)
         if (avail == 0)
         {
             conn->Lock.Unlock();
+            if (deadline != 0 && GetBootTimeMs() >= deadline)
+                return (long)sent;
             Sleep(1 * Const::NanoSecsInMs);
             continue;
         }
@@ -1132,15 +1180,17 @@ long Tcp::Send(TcpConn* conn, const void* data, ulong len)
         {
             wndAvail = conn->SndWnd - inFlight;
         }
-        else if (conn->SndWnd == 0 && inFlight == 0)
-        {
-            /* Zero-window probe: send a single byte so the peer is forced to
-               re-advertise its window, even if an earlier update was lost. */
-            wndAvail = 1;
-        }
         else
         {
+            /* The peer's window is full, or shut -- and then the persist
+               timer (ProcessRetransmits) probes it until it opens. Not a byte
+               of data into a shut window: the peer's duplicate ACKs would
+               never advance SndUna, and the retransmit count would give up
+               on a peer that is only slow to read -- a suspended ssh client
+               -- as a dead one, in under a minute. */
             conn->Lock.Unlock();
+            if (deadline != 0 && GetBootTimeMs() >= deadline)
+                return (long)sent;
             Sleep(1 * Const::NanoSecsInMs);
             continue;
         }
@@ -1241,9 +1291,151 @@ long Tcp::Recv(TcpConn* conn, void* buf, ulong len, ulong timeoutMs)
     }
 }
 
+/* A listener goes back to the pool, and so does every connection that
+   arrived on its port and was never accepted: nobody is left to accept it,
+   and a peer that finished its handshake would otherwise sit waiting on it
+   -- holding a slot -- until it gave up by itself. */
+bool Tcp::CloseListener(TcpConn* listener)
+{
+    PoolLock.Lock();
+    listener->Lock.Lock();
+    if (listener->State != TcpStateListen)
+    {
+        listener->Lock.Unlock();
+        PoolLock.Unlock();
+        return false;
+    }
+    u16 port = listener->LocalPort;
+    listener->State = TcpStateFree;
+    listener->OwnedByApp = false;
+    listener->Lock.Unlock();
+
+    ResetUnacceptedAndUnlock(port);
+    return true;
+}
+
+void Tcp::ResetUnacceptedAndUnlock(u16 port)
+{
+    /* What each reset goes out with: the RSTs are sent once the pool lock
+       is let go, from these rather than from slots the cleanup timer may
+       have handed on by then */
+    struct Reset
+    {
+        NetDevice* Dev;
+        MacAddress Mac;
+        IpAddress Local;
+        IpAddress Remote;
+        u16 LocalPort;
+        u16 RemotePort;
+        u32 Seq;
+        u32 Ack;
+    };
+    Reset resets[TcpMaxConnections];
+    ulong count = 0;
+
+    /* Under the pool lock throughout, as Accept scans: a Listen that takes
+       the port the moment its old listener's slot is free gets nothing in
+       before the walk is over, so what the walk marks is the old one's */
+    for (ulong i = 0; i < TcpMaxConnections; i++)
+    {
+        TcpConn* c = &Pool[i];
+        c->Lock.Lock();
+        if (c->LocalPort == port && !c->Accepted && !c->OwnedByApp &&
+            (c->State == TcpStateSynReceived || c->State == TcpStateEstablished ||
+             c->State == TcpStateCloseWait))
+        {
+            Reset& r = resets[count++];
+            r.Dev = c->Dev;
+            r.Mac = c->ResolvedMac;
+            r.Local = c->LocalIp;
+            r.Remote = c->RemoteIp;
+            r.LocalPort = c->LocalPort;
+            r.RemotePort = c->RemotePort;
+            r.Seq = c->SndNxt;
+            r.Ack = c->RcvNxt;
+
+            c->State = TcpStateClosed;
+            c->RetransmitDeadlineMs = 0;
+            c->NeedCleanup = true;
+            c->ConnReady.Set(1);
+            c->DataReady.Set(1);
+        }
+        c->Lock.Unlock();
+    }
+    PoolLock.Unlock();
+
+    for (ulong i = 0; i < count; i++)
+    {
+        const Reset& r = resets[i];
+        SendRst(r.Dev, r.Mac, r.Local, r.Remote, r.LocalPort, r.RemotePort, r.Seq, r.Ack);
+    }
+
+    if (count != 0)
+        Trace(0, "Tcp: listener on port %u closed, %u connections it never accepted reset",
+              (ulong)port, count);
+}
+
+void Tcp::Abort(TcpConn* conn)
+{
+    if (!conn)
+        return;
+
+    /* A listener's abort is its close: it has nothing else to reset */
+    if (CloseListener(conn))
+        return;
+
+    conn->Lock.Lock();
+    switch (conn->State)
+    {
+    case TcpStateSynReceived:
+    case TcpStateEstablished:
+    case TcpStateCloseWait:
+    case TcpStateFinWait1:
+    case TcpStateFinWait2:
+    case TcpStateClosing:
+    case TcpStateLastAck:
+        SendSegment(conn, TcpFlagRst | TcpFlagAck, nullptr, 0);
+        conn->State = TcpStateClosed;
+        break;
+    case TcpStateSynSent:
+    case TcpStateTimeWait:
+        conn->State = TcpStateClosed;
+        break;
+    default:
+        break;
+    }
+    conn->RetransmitDeadlineMs = 0;
+    conn->NeedCleanup = true;
+    conn->ConnReady.Set(1);
+    conn->DataReady.Set(1);
+
+    /* As Close: from here the slot is the cleanup timer's */
+    conn->OwnedByApp = false;
+    conn->Lock.Unlock();
+}
+
+bool Tcp::BacklogFullLocked(u16 port)
+{
+    /* A racy read of each state, as Accept's first look is: enough for a
+       limit */
+    ulong pending = 0;
+    for (ulong i = 0; i < TcpMaxConnections; i++)
+    {
+        const TcpConn* c = &Pool[i];
+        if (c->LocalPort == port && !c->Accepted && !c->OwnedByApp &&
+            (c->State == TcpStateSynReceived || c->State == TcpStateEstablished ||
+             c->State == TcpStateCloseWait))
+            pending++;
+    }
+    return pending >= TcpListenBacklog;
+}
+
 void Tcp::Close(TcpConn* conn)
 {
     if (!conn)
+        return;
+
+    if (CloseListener(conn))
         return;
 
     conn->Lock.Lock();
