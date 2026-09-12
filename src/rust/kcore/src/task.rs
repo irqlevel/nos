@@ -40,11 +40,16 @@ impl Drop for TaskHandle {
     }
 }
 
-pub fn spawn_on(affinity_mask: u64, f: fn()) -> Option<TaskHandle> {
+/// Spawn a task running `f` on the CPUs of `affinity_mask`. `name`, which
+/// every spawn here takes, is what `ps` and `top` show for the task -- cut
+/// to the 31 bytes a task has room for.
+pub fn spawn_on(name: &str, affinity_mask: u64, f: fn()) -> Option<TaskHandle> {
     let boxed = Box::new(RustSpawnCtx { f });
     let ptr = Box::into_raw(boxed).cast::<u8>();
     let h = unsafe {
-        task::kernel_task_spawn_on(rust_spawn_trampoline, ptr, affinity_mask as usize)
+        task::kernel_task_spawn_on(
+            name.as_ptr(), name.len(), rust_spawn_trampoline, ptr, affinity_mask as usize,
+        )
     };
     if h == 0 {
         unsafe { drop(Box::from_raw(ptr.cast::<RustSpawnCtx>())); }
@@ -53,10 +58,10 @@ pub fn spawn_on(affinity_mask: u64, f: fn()) -> Option<TaskHandle> {
     Some(TaskHandle { handle: h })
 }
 
-pub fn spawn(f: fn()) -> Option<TaskHandle> {
+pub fn spawn(name: &str, f: fn()) -> Option<TaskHandle> {
     let boxed = Box::new(RustSpawnCtx { f });
     let ptr = Box::into_raw(boxed).cast::<u8>();
-    let h = unsafe { task::kernel_task_spawn(rust_spawn_trampoline, ptr) };
+    let h = unsafe { task::kernel_task_spawn(name.as_ptr(), name.len(), rust_spawn_trampoline, ptr) };
     if h == 0 {
         unsafe {
             drop(Box::from_raw(ptr.cast::<RustSpawnCtx>()));
@@ -91,19 +96,19 @@ pub fn yield_to_runnable() {
 /// Spawn a task that receives a raw context pointer.
 /// The caller is responsible for the lifetime and safety of `ctx`.
 pub fn spawn_with_ctx(
-    func: extern "C" fn(*mut u8), ctx: *mut u8,
+    name: &str, func: extern "C" fn(*mut u8), ctx: *mut u8,
 ) -> Option<TaskHandle> {
-    let h = unsafe { task::kernel_task_spawn_ctx(func, ctx) };
+    let h = unsafe { task::kernel_task_spawn(name.as_ptr(), name.len(), func, ctx) };
     if h == 0 { None } else { Some(TaskHandle { handle: h }) }
 }
 
 /// Spawn a task with a raw context pointer, bound to `affinity_mask` CPUs.
 pub fn spawn_on_with_ctx(
-    affinity_mask: u64,
+    name: &str, affinity_mask: u64,
     func: extern "C" fn(*mut u8), ctx: *mut u8,
 ) -> Option<TaskHandle> {
     let h = unsafe {
-        task::kernel_task_spawn_on_ctx(func, ctx, affinity_mask as usize)
+        task::kernel_task_spawn_on(name.as_ptr(), name.len(), func, ctx, affinity_mask as usize)
     };
     if h == 0 { None } else { Some(TaskHandle { handle: h }) }
 }

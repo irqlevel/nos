@@ -201,7 +201,8 @@ is the Ethernet CRC of each hop.
   CPUs working on neighbours never share one. A request is a slot from the
   moment the receive path takes it to the moment its reply is queued; a read
   takes a slot for each datagram of its answer.
-- **The worker**, a task pinned to one CPU, submits what is queued with no
+- **The worker**, a task pinned to one CPU (`netblk/<port>` in `ps` and
+  `top`), submits what is queued with no
   doorbell and rings it once for the batch (`BlockDevice::KickAsync`), then
   hands every finished reply to the NIC in one `SubmitTxBatch`: one lock, one
   doorbell. A doorbell is a write across the bus -- and under a hypervisor, an
