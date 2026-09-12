@@ -74,6 +74,18 @@ public:
     bool ReadFile(const char* path, Stdlib::Printer& printer);
     /* Replace the file's content (created if missing). */
     bool WriteFile(const char* path, const void* data, ulong len);
+
+    /* WriteFile that never leaves the file empty or half written -- the disk
+       filling, or the machine stopping, midway: the new content goes to
+       <path>.new and is synced, and only then takes the old file's place.
+       Cut short between those two steps, the content is whole in
+       <path>.new, where Locate finds it. Callers writing the same file at
+       once serialize themselves. */
+    bool ReplaceFile(const char* path, const void* data, ulong len);
+
+    /* Where a file's content is, into out: at path, or at <path>.new when a
+       ReplaceFile was cut short. False if at neither. */
+    bool Locate(const char* path, char* out, ulong outSize);
     bool CreateDir(const char* path);
     bool CreateFile(const char* path);
     bool Remove(const char* path);

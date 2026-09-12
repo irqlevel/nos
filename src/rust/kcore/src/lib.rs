@@ -27,6 +27,7 @@ pub mod ring;
 pub mod hpet;
 pub mod acpi;
 pub mod cmd;
+pub mod fs;
 #[cfg(target_arch = "x86_64")]
 pub mod tco_wdt;
 

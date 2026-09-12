@@ -1,7 +1,8 @@
 #!/bin/bash
 # Boot the arm64 kernel on QEMU virt with virtio-mmio disk/net/rng.
 # Uses HVF acceleration on Apple Silicon (set NOS_TCG=1 to force TCG);
-# serial console goes to nos-arm64.log, UDP shell forwarded on :9000.
+# serial console goes to nos-arm64.log, UDP shell forwarded on :9000, and
+# host port 2222 to the guest's 22 for the sshd module (docs/sshd.md).
 cd "$(dirname "$0")/.."
 
 ACCEL_OPTS="-accel tcg -cpu cortex-a72"
@@ -23,7 +24,7 @@ exec qemu-system-aarch64 \
     -drive file=nos-arm64.qcow2,format=qcow2,id=hd,if=none \
     -device virtio-blk-device,drive=hd \
     -device virtio-net-device,netdev=net0 \
-    -netdev user,id=net0,hostfwd=udp::9000-:9000 \
+    -netdev user,id=net0,hostfwd=udp::9000-:9000,hostfwd=tcp::2222-:22 \
     -device virtio-rng-device \
     -serial file:nos-arm64.log \
     -display none \

@@ -45,6 +45,10 @@ public:
     bool IsWxProbe();
     bool IsUsbOff();
 
+    /* rc=off -- do not run /etc/rc at boot: the way past a command in it
+       that keeps the machine from coming up (see Cmd::RunBootScript) */
+    bool IsRcOff();
+
     /* hwrng=off -- ignore the cpu's random instruction (RDRAND/RDSEED,
        RNDR). For seeing what a machine without one does, on a machine that
        has one; the pool then falls back on virtio-rng and timing jitter. */
@@ -152,6 +156,7 @@ private:
     bool HwRngOff;
     bool WxProbe;
     bool UsbOff;
+    bool RcOff;
     ConsoleMode ConMode;
     DhcpMode DhcpMd;
     u16 UdpShellPort;

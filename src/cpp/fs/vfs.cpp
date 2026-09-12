@@ -957,6 +957,58 @@ bool Vfs::Sync()
     return ok;
 }
 
+/* <path>.new: where ReplaceFile puts a file's next content */
+static bool ReplacementPath(const char* path, char* out, ulong size)
+{
+    static const char Suffix[] = ".new";
+    ulong len = Stdlib::StrLen(path);
+    if (len + sizeof(Suffix) > size)
+        return false;
+    Stdlib::MemCpy(out, path, len);
+    Stdlib::MemCpy(out + len, Suffix, sizeof(Suffix));
+    return true;
+}
+
+bool Vfs::ReplaceFile(const char* path, const void* data, ulong len)
+{
+    char next[MaxPath];
+    if (!ReplacementPath(path, next, sizeof(next)))
+        return false;
+
+    FileStat st;
+    if (Stat(path, st) && st.Type != VNode::TypeFile)
+    {
+        Trace(0, "Vfs::ReplaceFile: %s is not a file", path);
+        return false;
+    }
+
+    /* The old content stays where it is until all of the new is on disk */
+    if (!WriteFile(next, data, len) || !Sync())
+    {
+        Remove(next);
+        return false;
+    }
+    if (Stat(path, st) && !Remove(path))
+        return false;
+    if (!Rename(next, path))
+        return false;
+    return Sync();
+}
+
+bool Vfs::Locate(const char* path, char* out, ulong outSize)
+{
+    FileStat st;
+    if (Stat(path, st))
+    {
+        ulong len = Stdlib::StrLen(path);
+        if (len >= outSize)
+            return false;
+        Stdlib::MemCpy(out, path, len + 1);
+        return true;
+    }
+    return ReplacementPath(path, out, outSize) && Stat(out, st);
+}
+
 void Vfs::DumpMounts(Stdlib::Printer& printer)
 {
     Stdlib::AutoLock lock(Lock);

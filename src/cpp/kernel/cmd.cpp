@@ -2963,6 +2963,429 @@ static void CmdLsmod(const char* args, Stdlib::Printer& con)
     ModuleTable::GetInstance().Dump(con);
 }
 
+/* /etc/rc: shell commands run once at boot, after the network is set up --
+   what loads and starts a module like sshd on a machine nobody can reach
+   until it has. `rc` shows and edits it; rc=off on the kernel command line
+   skips it at boot. */
+static const char RcPath[] = "/etc/rc";
+static const char RcDir[] = "/etc";
+/* The most of a script read, and the longest line run */
+static const ulong ScriptSizeMax = 16 * Const::KB;
+static const ulong ScriptLineMax = 255;
+static const ulong ScriptTag = 'Rc  ';
+
+/* A script, NUL-terminated, in a buffer from Mm::Alloc the caller frees --
+   or nullptr, said on out, when it cannot be read. Found where Vfs::Locate
+   finds it. Past ScriptSizeMax only its whole lines are taken, whole comes
+   back false, and it is said: a command cut at the limit would run as some
+   other command. */
+static char* ReadScript(const char* path, ulong& size, bool& whole, Stdlib::Printer& out)
+{
+    auto& vfs = Vfs::GetInstance();
+    char at[Vfs::MaxPath];
+    File* file = vfs.Locate(path, at, sizeof(at)) ? vfs.Open(at, Vfs::OpenRead) : nullptr;
+    if (file == nullptr)
+    {
+        out.Printf("rc: cannot open %s\n", path);
+        return nullptr;
+    }
+
+    char* text = static_cast<char*>(Mm::Alloc(ScriptSizeMax + 1, ScriptTag));
+    if (text == nullptr)
+    {
+        vfs.Close(file);
+        out.Printf("rc: no memory to read %s\n", path);
+        return nullptr;
+    }
+
+    size = 0;
+    bool ok = true;
+    while (size < ScriptSizeMax)
+    {
+        ulong got = 0;
+        if (!vfs.Read(file, text + size, ScriptSizeMax - size, got))
+        {
+            ok = false;
+            break;
+        }
+        if (got == 0)
+            break;
+        size += got;
+    }
+    ulong total = vfs.GetSize(file);
+    vfs.Close(file);
+
+    if (!ok)
+    {
+        Mm::Free(text);
+        out.Printf("rc: cannot read %s\n", path);
+        return nullptr;
+    }
+    whole = (total <= size);
+    if (!whole)
+    {
+        ulong keep = size;
+        while (keep > 0 && text[keep - 1] != '\n')
+            keep--;
+        out.Printf("rc: %s is %u bytes; only its whole lines in the first %u are read\n",
+            path, total, size);
+        size = keep;
+    }
+
+    text[size] = '\0';
+    return text;
+}
+
+/* The line of text at p, blanks and a CR trimmed off either end, with p
+   moved past it; false at the end of the text */
+static bool NextScriptLine(const char*& p, const char*& line, ulong& len)
+{
+    if (*p == '\0')
+        return false;
+
+    const char* start = p;
+    while (*p != '\0' && *p != '\n')
+        p++;
+    const char* end = p;
+    if (*p == '\n')
+        p++;
+
+    while (start < end && (*start == ' ' || *start == '\t'))
+        start++;
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
+        end--;
+
+    line = start;
+    len = static_cast<ulong>(end - start);
+    return true;
+}
+
+/* A Printer into the kernel log, for what /etc/rc prints at boot: on a
+   machine whose console is the network nobody sits at a console, and the
+   netconsole and dmesg are where it can be read. What a command prints
+   waits in Buf and goes to the log a line at a time once the command has
+   returned (Commit), not as it is printed: a command that reads the log --
+   dmesg -- would read its own output back as it went. The shell has taken
+   the console from the log by then, so it goes to echo as well, as it is
+   printed -- the screen of a machine that has one. */
+class LogPrinter final : public Stdlib::Printer
+{
+public:
+    LogPrinter(const char* prefix, Stdlib::Printer* echo, char* buf, ulong size)
+        : Prefix(prefix)
+        , Echo(echo)
+        , Buf(buf)
+        , Size(size)
+        , Len(0)
+        , Dropped(0)
+    {
+    }
+
+    virtual void Printf(const char *fmt, ...) override
+    {
+        va_list args;
+        va_start(args, fmt);
+        VPrintf(fmt, args);
+        va_end(args);
+    }
+
+    virtual void VPrintf(const char *fmt, va_list args) override
+    {
+        char text[FormatMax];
+        if (Stdlib::VsnPrintf(text, sizeof(text), fmt, args) < 0)
+            return;
+        Add(text);
+    }
+
+    virtual void PrintString(const char *s) override
+    {
+        if (s != nullptr)
+            Add(s);
+    }
+
+    virtual void Backspace() override
+    {
+    }
+
+    /* A command is done: what it printed goes to the log, a line at a time,
+       a line longer than the log takes in pieces */
+    void Commit()
+    {
+        ulong start = 0;
+        while (start < Len)
+        {
+            ulong end = start;
+            while (end < Len && Buf[end] != '\n' && end - start < LineMax)
+                end++;
+
+            char line[LineMax + 1];
+            ulong n = 0;
+            for (ulong i = start; i < end; i++)
+            {
+                if (Buf[i] != '\r')
+                    line[n++] = Buf[i];
+            }
+            line[n] = '\0';
+            if (n != 0)
+                Trace(0, "%s%s", Prefix, line);
+
+            start = (end < Len && Buf[end] == '\n') ? end + 1 : end;
+        }
+        if (Dropped != 0)
+            Trace(0, "%s[%u more bytes it printed not logged]", Prefix, Dropped);
+
+        Len = 0;
+        Dropped = 0;
+    }
+
+private:
+    LogPrinter(const LogPrinter& other) = delete;
+    LogPrinter& operator=(const LogPrinter& other) = delete;
+
+    void Add(const char* s)
+    {
+        if (Echo != nullptr)
+            Echo->PrintString(s);
+
+        for (; *s != '\0'; s++)
+        {
+            if (Len == Size)
+                Dropped++;
+            else
+                Buf[Len++] = *s;
+        }
+    }
+
+    /* Room, in the trace line's 256 bytes, for its own prefix */
+    static const ulong LineMax = 160;
+    static const ulong FormatMax = 512;
+
+    const char* Prefix;
+    Stdlib::Printer* Echo;
+    char* Buf;
+    ulong Size;
+    ulong Len;
+    ulong Dropped;
+};
+
+/* What a boot script command printed, into the log: RunScript's step */
+static void CommitLog(void* ctx)
+{
+    static_cast<LogPrinter*>(ctx)->Commit();
+}
+
+/* What of a boot script command's output the log takes */
+static const ulong RcLogSize = 8 * Const::KB;
+
+static void RcShow(Stdlib::Printer& con)
+{
+    char at[Vfs::MaxPath];
+    if (!Vfs::GetInstance().Locate(RcPath, at, sizeof(at)))
+    {
+        con.Printf("rc: no %s -- rc add <command line> makes one\n", RcPath);
+        return;
+    }
+
+    ulong size = 0;
+    bool whole = true;
+    char* text = ReadScript(RcPath, size, whole, con);
+    if (text == nullptr)
+        return;
+
+    const char* p = text;
+    const char* line = nullptr;
+    ulong len = 0;
+    ulong number = 0;
+    char shown[ScriptLineMax + 1];
+    while (NextScriptLine(p, line, len))
+    {
+        number++;
+        ulong n = (len < ScriptLineMax) ? len : ScriptLineMax;
+        Stdlib::MemCpy(shown, line, n);
+        shown[n] = '\0';
+        con.Printf("%u  %s\n", number, shown);
+    }
+    if (number == 0)
+        con.Printf("rc: %s is empty\n", RcPath);
+
+    Mm::Free(text);
+}
+
+/* Writes a new /etc/rc: the lines of the old one but the one numbered skip
+   (0: none), then add if there is one -- through Vfs::ReplaceFile, since
+   what it is for is the next boot, and a full disk must not leave it empty.
+   One edit at a time (RcLock): two at once would each write over the other
+   one's line. */
+static bool RcRewrite(ulong skip, const char* add, Stdlib::Printer& con)
+{
+    Stdlib::AutoLock lock(Cmd::GetInstance().GetRcLock());
+
+    auto& vfs = Vfs::GetInstance();
+    FileStat st;
+    char at[Vfs::MaxPath];
+
+    ulong size = 0;
+    char* old = nullptr;
+    if (vfs.Locate(RcPath, at, sizeof(at)))
+    {
+        bool whole = true;
+        old = ReadScript(RcPath, size, whole, con);
+        if (old == nullptr)
+            return false;
+        if (!whole)
+        {
+            Mm::Free(old);
+            con.Printf("rc: %s is too large to edit with rc\n", RcPath);
+            return false;
+        }
+    }
+    else if (skip != 0)
+    {
+        con.Printf("rc: no %s\n", RcPath);
+        return false;
+    }
+    else if (!vfs.Stat(RcDir, st) && !vfs.CreateDir(RcDir))
+    {
+        con.Printf("rc: cannot make %s\n", RcDir);
+        return false;
+    }
+
+    if (skip != 0)
+    {
+        const char* p = old;
+        const char* line = nullptr;
+        ulong len = 0;
+        ulong lines = 0;
+        while (NextScriptLine(p, line, len))
+            lines++;
+        if (skip > lines)
+        {
+            Mm::Free(old);
+            con.Printf("rc: %s has no line %u\n", RcPath, skip);
+            return false;
+        }
+    }
+
+    ulong addLen = (add != nullptr) ? Stdlib::StrLen(add) : 0;
+    if (size + addLen + 1 > ScriptSizeMax)
+    {
+        if (old != nullptr)
+            Mm::Free(old);
+        con.Printf("rc: %s would pass %u bytes\n", RcPath, ScriptSizeMax);
+        return false;
+    }
+
+    char* text = static_cast<char*>(Mm::Alloc(ScriptSizeMax + 1, ScriptTag));
+    if (text == nullptr)
+    {
+        if (old != nullptr)
+            Mm::Free(old);
+        con.Printf("rc: no memory\n");
+        return false;
+    }
+
+    /* Trimmed as the lines are, every one ends up with its newline */
+    ulong pos = 0;
+    ulong number = 0;
+    if (old != nullptr)
+    {
+        const char* p = old;
+        const char* line = nullptr;
+        ulong len = 0;
+        while (NextScriptLine(p, line, len))
+        {
+            number++;
+            if (number == skip)
+                continue;
+            Stdlib::MemCpy(text + pos, line, len);
+            pos += len;
+            text[pos++] = '\n';
+        }
+        Mm::Free(old);
+    }
+    if (addLen != 0)
+    {
+        Stdlib::MemCpy(text + pos, add, addLen);
+        pos += addLen;
+        text[pos++] = '\n';
+    }
+
+    bool ok = vfs.ReplaceFile(RcPath, text, pos);
+    Mm::Free(text);
+    if (!ok)
+    {
+        con.Printf("rc: cannot write %s\n", RcPath);
+        return false;
+    }
+    return true;
+}
+
+static void CmdRc(const char* args, Stdlib::Printer& con)
+{
+    const char* end;
+    const char* word = Stdlib::NextToken(args, end);
+    if (word == nullptr)
+    {
+        RcShow(con);
+        return;
+    }
+
+    char verb[8];
+    Stdlib::TokenCopy(word, end, verb, sizeof(verb));
+
+    const char* rest = end;
+    while (*rest == ' ')
+        rest++;
+
+    if (Stdlib::StrCmp(verb, "add") == 0)
+    {
+        ulong len = Stdlib::StrLen(rest);
+        if (len == 0)
+            con.Printf("usage: rc add <command line>\n");
+        else if (len > ScriptLineMax)
+            con.Printf("rc: at most %u characters a line\n", ScriptLineMax);
+        else if (RcRewrite(0, rest, con))
+            con.Printf("rc: added to %s: %s\n", RcPath, rest);
+    }
+    else if (Stdlib::StrCmp(verb, "del") == 0)
+    {
+        ulong number = 0;
+        if (!Stdlib::ParseUlong(rest, number) || number == 0)
+            con.Printf("usage: rc del <n> -- n as rc numbers the lines\n");
+        else if (RcRewrite(number, nullptr, con))
+            RcShow(con);
+    }
+    else if (Stdlib::StrCmp(verb, "clear") == 0)
+    {
+        Stdlib::AutoLock lock(Cmd::GetInstance().GetRcLock());
+        auto& vfs = Vfs::GetInstance();
+        char at[Vfs::MaxPath];
+        if (!vfs.Locate(RcPath, at, sizeof(at)))
+        {
+            con.Printf("rc: no %s\n", RcPath);
+        }
+        else if (vfs.Remove(at))
+        {
+            /* And the other of the pair, should a cut-short edit have left both */
+            if (vfs.Locate(RcPath, at, sizeof(at)))
+                vfs.Remove(at);
+            con.Printf("rc: removed %s\n", RcPath);
+        }
+        else
+        {
+            con.Printf("rc: cannot remove %s\n", RcPath);
+        }
+    }
+    else if (Stdlib::StrCmp(verb, "run") == 0)
+    {
+        Cmd::GetInstance().RunScript(RcPath, con);
+    }
+    else
+    {
+        con.Printf("usage: rc [add <command line> | del <n> | clear | run]\n");
+    }
+}
+
 // Forward declaration - CmdHelp needs the Commands array defined below
 static void CmdHelp(const char* args, Stdlib::Printer& con);
 
@@ -3028,6 +3451,7 @@ static const CmdEntry Commands[] = {
     { "insmod",    CmdInsmod,    "insmod <path> - load a kernel module (.ko)" },
     { "rmmod",     CmdRmmod,     "rmmod <name> - unload a kernel module" },
     { "lsmod",     CmdLsmod,     "lsmod - list the loaded kernel modules" },
+    { "rc",        CmdRc,        "rc [add <command line>|del <n>|clear|run] - show or edit /etc/rc, run at boot" },
     { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
     { "entropy",   CmdEntropy,   "entropy [reseed] - show the random pool and its sources" },
     { "version",   CmdVersion,   "version - show kernel version" },
@@ -3057,6 +3481,7 @@ Cmd::Cmd()
     , Shutdown(false)
     , Reboot(false)
     , Active(false)
+    , ScriptRunning(false)
     , DynamicGeneration(0)
 {
     CmdLine[0] = '\0';
@@ -3273,6 +3698,86 @@ void Cmd::ProcessCmd(const char *cmd)
     con.Printf("$");
 }
 
+bool Cmd::RunScript(const char* path, Stdlib::Printer& out, ScriptStep step, void* stepCtx)
+{
+    bool running;
+    {
+        Stdlib::AutoLock lock(Lock);
+        running = ScriptRunning;
+        ScriptRunning = true;
+    }
+    /* Said out of the lock, which keeps interrupts off: out may be an SSH
+       session's, and what is printed there may wait for the network */
+    if (running)
+    {
+        out.Printf("rc: a script is running already -- one that ran itself would never end\n");
+        return false;
+    }
+
+    ulong size = 0;
+    bool whole = true;
+    char* text = ReadScript(path, size, whole, out);
+    bool ok = (text != nullptr);
+    if (ok)
+    {
+        const char* p = text;
+        const char* line = nullptr;
+        ulong len = 0;
+        ulong number = 0;
+        char cmd[ScriptLineMax + 1];
+        while (NextScriptLine(p, line, len))
+        {
+            number++;
+            if (len == 0 || line[0] == '#')
+                continue;
+            if (len > ScriptLineMax)
+            {
+                out.Printf("rc: line %u is longer than %u characters, skipped\n", number, ScriptLineMax);
+                continue;
+            }
+            Stdlib::MemCpy(cmd, line, len);
+            cmd[len] = '\0';
+            out.Printf("> %s\n", cmd);
+            Dispatch(cmd, out);
+            if (step != nullptr)
+                step(stepCtx);
+        }
+        Mm::Free(text);
+    }
+
+    {
+        Stdlib::AutoLock lock(Lock);
+        ScriptRunning = false;
+    }
+    return ok;
+}
+
+void Cmd::RunBootScript()
+{
+    char at[Vfs::MaxPath];
+    if (!Vfs::GetInstance().Locate(RcPath, at, sizeof(at)))
+        return;
+
+    if (Parameters::GetInstance().IsRcOff())
+    {
+        Trace(0, "rc: %s skipped, rc=off", RcPath);
+        return;
+    }
+
+    /* With no room to keep it, what the commands print is on the screen
+       alone, and the log says how much */
+    char* buf = static_cast<char*>(Mm::Alloc(RcLogSize, ScriptTag));
+
+    Trace(0, "rc: running %s", RcPath);
+    LogPrinter log("rc: ", &Console::GetInstance(), buf, (buf != nullptr) ? RcLogSize : 0);
+    RunScript(RcPath, log, CommitLog, &log);
+    log.Commit();
+    Trace(0, "rc: %s done", RcPath);
+
+    if (buf != nullptr)
+        Mm::Free(buf);
+}
+
 /* The flags below are polled by the BSP's idle task, between halts. The
    scheduler runs an idle task only when nothing else on its queue can run
    -- and a task that sleeps yields rather than blocks, so on a CPU carrying
@@ -3430,6 +3935,8 @@ void Cmd::Run()
             }
         }
     }
+
+    RunBootScript();
 
     con.Printf("$");
 

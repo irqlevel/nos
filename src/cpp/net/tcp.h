@@ -46,6 +46,11 @@ static const ulong TcpTimerPeriodMs    = 200;
 static const ulong TcpConnHashSize     = 32;
 static const u16   TcpEphemeralPortBase = 49152;
 static const u16   TcpEphemeralPortMax  = 65535;
+/* Connections a listener holds that nobody has accepted yet -- handshakes
+   under way, and ones done and waiting. Past this a SYN to its port is
+   dropped, as a full accept queue drops it: a flood of SYNs to a listening
+   port then costs the pool this many slots, not all of them. */
+static const ulong TcpListenBacklog    = 16;
 
 /* Tcp::Recv results below zero */
 static const long TcpRecvError   = -1;
@@ -227,21 +232,35 @@ public:
        srcPort=0 means auto-allocate an ephemeral port. */
     TcpConn* Connect(NetDevice* dev, Net::IpAddress dstIp, u16 dstPort, u16 srcPort = 0);
 
-    /* Passive open -- marks a port as listening */
+    /* Passive open -- listens on the port, at every address the machine has
+       (a connection is the device's that it arrives on) */
     TcpConn* Listen(NetDevice* dev, u16 port);
 
-    /* Accept -- blocks until a new connection arrives on a listening socket */
-    TcpConn* Accept(TcpConn* listener);
+    /* Accept -- blocks until a new connection arrives on a listening socket.
+       nullptr once timeoutMs (0 = wait forever) passes with none, or once
+       the listener has been closed: a server's task waiting here is how it
+       sees a Close from another task. */
+    TcpConn* Accept(TcpConn* listener, ulong timeoutMs = 0);
 
     /* Data transfer -- blocks until data sent/received or timeout.
-       Recv returns the byte count, 0 at EOF, TcpRecvError on a bad
+       Send returns the bytes queued: all of them, fewer once timeoutMs
+       (0 = wait forever) passes with no room for the rest -- 0 when it
+       found room for none -- or -1 when the connection is gone before any
+       were. Recv returns the byte count, 0 at EOF, TcpRecvError on a bad
        argument, or TcpRecvTimeout when timeoutMs (0 = wait forever)
        elapses with the receive buffer still empty. */
-    long Send(TcpConn* conn, const void* data, ulong len);
+    long Send(TcpConn* conn, const void* data, ulong len, ulong timeoutMs = 0);
     long Recv(TcpConn* conn, void* buf, ulong len, ulong timeoutMs = 0);
 
-    /* Close connection (graceful FIN exchange) */
+    /* Close connection (graceful FIN exchange). Closing a listener resets
+       the connections that arrived on its port and were never accepted:
+       nobody is left to accept them. */
     void Close(TcpConn* conn);
+
+    /* Abortive close: a RST instead of the FIN exchange, and the slot back
+       to the pool at the cleanup timer's next tick rather than after a
+       minute of TIME-WAIT. For a connection a server refuses or drops. */
+    void Abort(TcpConn* conn);
 
     /* Called from VirtioNet::ProcessRx for IpProtoTcp */
     void Process(NetDevice* dev, const u8* frame, ulong frameLen);
@@ -293,6 +312,17 @@ private:
     void RemoveHash(TcpConn* conn);
     ulong HashIndex(u32 localIp, u16 localPort,
                     u32 remoteIp, u16 remotePort);
+
+    /* Close for a listener: false if conn is not one */
+    bool CloseListener(TcpConn* listener);
+
+    /* Caller holds PoolLock, which this lets go of: resets every connection
+       on port that nobody accepted, the RSTs sent after the unlock */
+    void ResetUnacceptedAndUnlock(u16 port);
+
+    /* Caller must hold PoolLock. Whether port's listener holds all the
+       connections it may that nobody has accepted (TcpListenBacklog). */
+    bool BacklogFullLocked(u16 port);
 
     void SendSegment(TcpConn* conn, u8 flags, const u8* data, ulong len);
     void SendRst(NetDevice* dev, const Net::MacAddress& dstMac,

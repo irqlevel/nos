@@ -27,6 +27,18 @@ impl TaskHandle {
             task::kernel_task_set_stopping(self.handle);
         }
     }
+
+    /// The task, as `current_id` names it from inside.
+    pub fn id(&self) -> usize {
+        self.handle
+    }
+}
+
+/// The calling task: what `TaskHandle::id` says for it. For telling
+/// whether a call comes from one of a server's own tasks -- which must not
+/// wait for itself.
+pub fn current_id() -> usize {
+    unsafe { task::kernel_task_current() }
 }
 
 impl Drop for TaskHandle {

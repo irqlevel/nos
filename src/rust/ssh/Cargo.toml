@@ -1,0 +1,23 @@
+[package]
+name = "ssh"
+version = "0.1.0"
+edition = "2021"
+
+# The protocol alone: nothing here calls ffi or kcore. The sshd module
+# (modules/sshd) supplies the connection, the clock, the random pool and the
+# shell through the Link and Shell traits.
+
+[dependencies]
+x25519-dalek = { version = "2", default-features = false }
+# zeroize: keys wiped when they are dropped -- the host key, a session's
+# cipher and its random stream
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+chacha20 = { version = "0.9", default-features = false, features = ["zeroize"] }
+poly1305 = { version = "0.8", default-features = false, features = ["zeroize"] }
+subtle = { version = "2", default-features = false }
+zeroize = { version = "1", default-features = false }
+# force-soft for the reason the kernel crate gives: sha2 would otherwise pick
+# the CPU's SHA instructions at run time, SIMD the kernel keeps off. A module
+# is a build of its own -- the kernel's features do not reach it -- so the
+# choice has to be made here as well.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
