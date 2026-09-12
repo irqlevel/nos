@@ -471,6 +471,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-netblk"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+]
+
+[[package]]
 name = "mod-slowexit"
 version = "0.1.0"
 dependencies = [

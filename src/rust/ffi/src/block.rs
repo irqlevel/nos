@@ -1,3 +1,21 @@
+/// One asynchronous I/O straight to or from physical memory (AsyncBlockIo in
+/// block/block_device.h, whose layout this is).
+#[repr(C)]
+pub struct BlockIo {
+    /// 0 read, 1 write, 2 flush
+    pub op: u8,
+    pub fua: u8,
+    pub reserved: u16,
+    /// Sectors; 0 for a flush.
+    pub count: u32,
+    pub sector: u64,
+    /// Physically contiguous, dword aligned.
+    pub phys: u64,
+    /// Called exactly once, from interrupt context: 0, or the device's error.
+    pub done: extern "C" fn(ctx: *mut u8, status: i32),
+    pub ctx: *mut u8,
+}
+
 #[repr(C)]
 pub struct BlockDeviceOps {
     pub name: *const u8,
@@ -10,6 +28,9 @@ pub struct BlockDeviceOps {
         ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
     ) -> i32,
     pub flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
+    /// The asynchronous path; None for a device without one.
+    pub submit: Option<extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32>,
+    pub kick: Option<extern "C" fn(ctx: *mut u8)>,
     pub ctx: *mut u8,
 }
 
@@ -50,4 +71,16 @@ extern "C" {
 
     /// How many partitions of the device the kernel found.
     pub fn kernel_blockdev_partitions(handle: usize) -> u32;
+
+    /// 1 if the device has the asynchronous path: NVMe and its partitions.
+    pub fn kernel_blockdev_can_submit(handle: usize) -> i32;
+
+    /// Never blocks. 0 once submitted -- io.done is then called exactly
+    /// once, from interrupt context -- 1 when the device has no room right
+    /// now, 2 for an io it cannot take, 3 when it has no asynchronous path.
+    /// io is read before this returns. kick 0 leaves the doorbell for
+    /// kernel_blockdev_kick.
+    pub fn kernel_blockdev_submit(handle: usize, io: *const BlockIo, kick: i32) -> i32;
+
+    pub fn kernel_blockdev_kick(handle: usize);
 }

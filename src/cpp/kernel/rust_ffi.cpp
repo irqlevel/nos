@@ -3,6 +3,8 @@
 #include "time.h"
 #include "mutex.h"
 #include "wait_group.h"
+#include "event.h"
+#include "lockless_ring.h"
 #include "spin_lock.h"
 #include "raw_spin_lock.h"
 #include "raw_rw_spin_lock.h"
@@ -39,6 +41,12 @@ static const unsigned long PrinterChunkSize = 128;
 
 /* Longer than any block device's name: a partition's is at most 15 */
 static const unsigned long BlockDevNameMax = 32;
+
+/* Longer than any net device's name: VirtioNet's are at most 7 */
+static const unsigned long NetDevNameMax = 16;
+
+/* kernel_ring_create's ceiling: a ring's cells are one allocation */
+static const unsigned long RingMaxCapacity = 1UL << 20;
 
 extern "C" {
 
@@ -270,6 +278,31 @@ void kernel_waitgroup_wait(unsigned long handle)
     reinterpret_cast<Kernel::WaitGroup*>(handle)->Wait();
 }
 
+unsigned long kernel_event_create()
+{
+    Kernel::Event* e = Kernel::Mm::TAlloc<Kernel::Event, RustAllocTag>();
+    return (unsigned long)e;
+}
+
+void kernel_event_destroy(unsigned long handle)
+{
+    if (handle == 0)
+        return;
+    Kernel::Event* e = reinterpret_cast<Kernel::Event*>(handle);
+    e->~Event();
+    Kernel::Mm::Free(e);
+}
+
+void kernel_event_wait(unsigned long handle)
+{
+    reinterpret_cast<Kernel::Event*>(handle)->Wait();
+}
+
+void kernel_event_signal(unsigned long handle)
+{
+    reinterpret_cast<Kernel::Event*>(handle)->Signal();
+}
+
 unsigned long kernel_task_spawn(void (*func)(void*), void* ctx)
 {
     Kernel::Task* t = Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>("rust");
@@ -317,6 +350,11 @@ void kernel_task_put(unsigned long handle)
 void kernel_sleep_ns(unsigned long long ns)
 {
     Kernel::Sleep((ulong)ns);
+}
+
+void kernel_task_yield_to_runnable()
+{
+    Kernel::YieldToRunnable();
 }
 
 unsigned int kernel_get_cpu_id()
@@ -1196,6 +1234,10 @@ struct RustBlockDeviceOps
     int (*WriteSectors)(void* ctx, unsigned long long sector,
                         const void* buf, unsigned int count, int fua);
     int (*Flush)(void* ctx);    /* may be nullptr */
+    /* The asynchronous path (BlockDevice::SubmitAsync); both nullptr for a
+       device without one */
+    int (*Submit)(void* ctx, const Kernel::AsyncBlockIo* io, int kick);
+    void (*Kick)(void* ctx);
     void* Ctx;
 };
 
@@ -1227,6 +1269,24 @@ public:
             return true;
         return Ops.Flush(Ops.Ctx) == 0;
     }
+
+    bool CanSubmitAsync() override
+    {
+        return Ops.Submit != nullptr;
+    }
+
+    int SubmitAsync(const Kernel::AsyncBlockIo& io, bool kick) override
+    {
+        if (!Ops.Submit)
+            return SubmitUnsupported;
+        return Ops.Submit(Ops.Ctx, &io, kick ? 1 : 0);
+    }
+
+    void KickAsync() override
+    {
+        if (Ops.Kick)
+            Ops.Kick(Ops.Ctx);
+    }
 };
 
 extern "C" {
@@ -1234,6 +1294,12 @@ extern "C" {
 unsigned long kernel_blockdev_register(const RustBlockDeviceOps* ops)
 {
     if (!ops || !ops->Name || !ops->ReadSectors || !ops->WriteSectors)
+        return 0;
+
+    /* The asynchronous path is both or neither: a submit that may leave its
+       doorbell owed with no kick to ring it would queue commands that never
+       reach the device */
+    if ((ops->Submit == nullptr) != (ops->Kick == nullptr))
         return 0;
 
     RustBlockDevice* dev = Kernel::Mm::TAlloc<RustBlockDevice, RustAllocTag>();
@@ -1618,6 +1684,156 @@ unsigned int kernel_blockdev_partitions(unsigned long handle)
             count++;
     }
     return count;
+}
+
+int kernel_blockdev_can_submit(unsigned long handle)
+{
+    return reinterpret_cast<Kernel::BlockDevice*>(handle)->CanSubmitAsync() ? 1 : 0;
+}
+
+/* The asynchronous path (BlockDevice::SubmitAsync): never blocks, and io is
+   read before it returns -- only its Done and Ctx are kept */
+int kernel_blockdev_submit(unsigned long handle, const Kernel::AsyncBlockIo* io, int kick)
+{
+    if (io == nullptr || io->Done == nullptr)
+        return Kernel::BlockDevice::SubmitInvalid;
+    return reinterpret_cast<Kernel::BlockDevice*>(handle)->SubmitAsync(*io, kick != 0);
+}
+
+void kernel_blockdev_kick(unsigned long handle)
+{
+    reinterpret_cast<Kernel::BlockDevice*>(handle)->KickAsync();
+}
+
+/* The kernel's lockless ring for Rust (kcore::ring): a bounded MPMC queue of
+   words, safe from any context. The ring and its cells are allocated apart,
+   as NetFramePool does it. */
+struct RustRing
+{
+    Kernel::LocklessRing Ring;
+    Kernel::LocklessRing::Cell* Cells;
+};
+
+unsigned long kernel_ring_create(unsigned long capacity)
+{
+    if (capacity == 0 || capacity > RingMaxCapacity || (capacity & (capacity - 1)) != 0)
+        return 0;
+
+    auto* cells = static_cast<Kernel::LocklessRing::Cell*>(
+        Kernel::Mm::Alloc(capacity * sizeof(Kernel::LocklessRing::Cell), RustAllocTag));
+    if (cells == nullptr)
+        return 0;
+
+    RustRing* ring = Kernel::Mm::TAlloc<RustRing, RustAllocTag>();
+    if (ring == nullptr)
+    {
+        Kernel::Mm::Free(cells);
+        return 0;
+    }
+
+    ring->Cells = cells;
+    if (!ring->Ring.Setup(cells, capacity))
+    {
+        ring->~RustRing();
+        Kernel::Mm::Free(ring);
+        Kernel::Mm::Free(cells);
+        return 0;
+    }
+
+    return (unsigned long)ring;
+}
+
+void kernel_ring_destroy(unsigned long handle)
+{
+    if (handle == 0)
+        return;
+
+    RustRing* ring = reinterpret_cast<RustRing*>(handle);
+    Kernel::LocklessRing::Cell* cells = ring->Cells;
+    ring->~RustRing();
+    Kernel::Mm::Free(ring);
+    Kernel::Mm::Free(cells);
+}
+
+int kernel_ring_push(unsigned long handle, unsigned long value)
+{
+    return reinterpret_cast<RustRing*>(handle)->Ring.Enqueue((void*)value) ? 1 : 0;
+}
+
+int kernel_ring_pop(unsigned long handle, unsigned long* value)
+{
+    void* data;
+    if (!reinterpret_cast<RustRing*>(handle)->Ring.Dequeue(data))
+        return 0;
+
+    *value = (unsigned long)data;
+    return 1;
+}
+
+unsigned long kernel_ring_count(unsigned long handle)
+{
+    return reinterpret_cast<RustRing*>(handle)->Ring.Count();
+}
+
+/* Net devices from Rust, the consuming side (kcore::net::Nic): a device
+   already in the kernel's table, found by name. Devices live as long as the
+   kernel does, so a handle is the device's pointer and needs no release --
+   a NetDevice, where the driver-side functions above take a RustNetDevice. */
+unsigned long kernel_net_find(const unsigned char* name, unsigned long nameLen)
+{
+    char key[NetDevNameMax];
+    if (name == nullptr || nameLen == 0 || nameLen >= sizeof(key))
+        return 0;
+
+    Stdlib::MemCpy(key, name, nameLen);
+    key[nameLen] = '\0';
+    return reinterpret_cast<unsigned long>(Kernel::NetDeviceTable::GetInstance().Find(key));
+}
+
+unsigned int kernel_net_ip(unsigned long dev)
+{
+    return reinterpret_cast<Kernel::NetDevice*>(dev)->GetIp().Addr4;
+}
+
+void kernel_net_mac(unsigned long dev, unsigned char* out)
+{
+    if (out == nullptr)
+        return;
+    reinterpret_cast<Kernel::NetDevice*>(dev)->GetMac().CopyTo(out);
+}
+
+int kernel_net_udp_listen(unsigned long dev, unsigned short port,
+    Kernel::NetDevice::RxFrameCallback cb, void* ctx)
+{
+    return reinterpret_cast<Kernel::NetDevice*>(dev)->ListenUdpFrames(port, cb, ctx);
+}
+
+void kernel_net_udp_unlisten(unsigned long dev, unsigned short port, void* ctx)
+{
+    reinterpret_cast<Kernel::NetDevice*>(dev)->UnlistenUdpFrames(port, ctx);
+}
+
+/* Takes every frame; returns how many were queued */
+unsigned long kernel_net_submit_tx(unsigned long dev, const unsigned long* frames,
+    unsigned long count)
+{
+    if (frames == nullptr || count == 0)
+        return 0;
+
+    auto** batch = reinterpret_cast<Kernel::NetFrame**>(const_cast<unsigned long*>(frames));
+    return reinterpret_cast<Kernel::NetDevice*>(dev)->SubmitTxBatch(batch, count);
+}
+
+unsigned long kernel_netframe_alloc_tx(unsigned long data_len)
+{
+    return (unsigned long)Kernel::NetFrame::AllocTx((ulong)data_len);
+}
+
+void kernel_netframe_get(unsigned long handle)
+{
+    if (!handle)
+        return;
+    reinterpret_cast<Kernel::NetFrame*>(handle)->Get();
 }
 
 } /* extern "C" */

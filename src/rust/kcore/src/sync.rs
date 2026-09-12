@@ -281,3 +281,41 @@ impl Completion {
         self.wg.raw_handle()
     }
 }
+
+/// One task waiting for others to have something for it (kernel/event.h):
+/// `signal` from anywhere -- a hard IRQ handler included -- and the one task
+/// that calls `wait` comes back once for every run of signals since it last
+/// did. The waiter is out of the scheduler's walk until then rather than
+/// spinning, and a signal that finds it blocked sends its CPU an IPI. Pin a
+/// waiter whose wakeups have to be prompt: one moved to another CPU as it
+/// blocks is woken at that CPU's next scheduling point instead.
+pub struct Event {
+    handle: usize,
+}
+
+/* The kernel's event is built to be signalled from every CPU */
+unsafe impl Send for Event {}
+unsafe impl Sync for Event {}
+
+impl Event {
+    pub fn new() -> Option<Self> {
+        let h = unsafe { sync::kernel_event_create() };
+        if h == 0 { None } else { Some(Self { handle: h }) }
+    }
+
+    /// Task context, one waiter at a time.
+    pub fn wait(&self) {
+        unsafe { sync::kernel_event_wait(self.handle) }
+    }
+
+    #[inline]
+    pub fn signal(&self) {
+        unsafe { sync::kernel_event_signal(self.handle) }
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        unsafe { sync::kernel_event_destroy(self.handle) }
+    }
+}

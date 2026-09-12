@@ -9,6 +9,7 @@
 #include <kernel/softirq.h>
 #include <kernel/panic.h>
 #include <kernel/preempt.h>
+#include <hal/cpu.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>
 
@@ -51,6 +52,19 @@ void NetDevice::ReleaseTxDone()
 
 bool NetDevice::SubmitTx(NetFrame* frame)
 {
+    return SubmitTxBatch(&frame, 1) == 1;
+}
+
+ulong NetDevice::SubmitTxBatch(NetFrame** frames, ulong count)
+{
+    if (count == 0)
+        return 0;
+
+    /* Before the lock: this is bookkeeping, and the section below is the
+       narrowest one on the transmit path. */
+    for (ulong i = 0; i < count; i++)
+        CountTxFrame(frames[i]);
+
     /* A panic report has to leave through this function, and the lock it
        needs may be held by a CPU that is never going to release it -- that
        is precisely the failure a panic is most often reporting. Blocking
@@ -61,10 +75,6 @@ bool NetDevice::SubmitTx(NetFrame* frame)
        without it if it is not. Going on without it can race the holder into
        the driver's ring; on a machine that is already dying, a corrupted
        TX ring costs nothing and the report is worth everything. */
-    /* Before the lock: this is bookkeeping, and the section below is the
-       narrowest one on the transmit path. */
-    CountTxFrame(frame);
-
     bool acquired = true;
     ulong flags;
 
@@ -73,26 +83,46 @@ bool NetDevice::SubmitTx(NetFrame* frame)
     else
         flags = TxQueueLock.LockIrqSave();
 
-    if (TxCount >= TxQueueCapacity)
+    ulong queued = 0;
+    while (queued < count && TxCount < TxQueueCapacity)
     {
-        if (acquired)
-            TxQueueLock.UnlockIrqRestore(flags);
-        else
-            PreemptIrqRestore(flags);
-        frame->Put();
-        return false;
+        TxQueue.InsertTail(&frames[queued]->Link);
+        TxCount++;
+        queued++;
     }
-    TxQueue.InsertTail(&frame->Link);
-    TxCount++;
-    FlushTx();
+
+    /* No room for the rest: released along with what the driver finishes. */
+    if (acquired)
+    {
+        for (ulong i = queued; i < count; i++)
+            TxDone(frames[i]);
+    }
+
+    if (queued != 0)
+        FlushTx();
 
     if (acquired)
         TxQueueLock.UnlockIrqRestore(flags);
     else
         PreemptIrqRestore(flags);
 
-    ReleaseTxDone();
-    return true;
+    if (!acquired)
+    {
+        for (ulong i = queued; i < count; i++)
+            frames[i]->Put();
+    }
+
+    /* Off the lock, always -- and only with interrupts on. A frame from the
+       allocator goes back through Mm::Free, whose TLB shootdown waits for
+       every other CPU to answer, and a caller with interrupts off cannot
+       answer one itself: two such CPUs would wait on each other for good.
+       That caller leaves the release to the transmit softirq. */
+    if (Hal::IsInterruptEnabled())
+        ReleaseTxDone();
+    else
+        SoftIrq::GetInstance().Raise(SoftIrq::TypeNetTx);
+
+    return queued;
 }
 
 bool NetDevice::SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
@@ -306,6 +336,11 @@ bool NetDevice::RegisterUdpListener(u16 port, RxCallback cb, void* ctx)
     {
         if (UdpListeners[i].Port == port)
         {
+            /* Its own port again -- DHCP re-registering -- but never a frame
+               listener's, which would go on believing it was served. */
+            if (UdpListeners[i].FrameCb != nullptr)
+                return false;
+
             UdpListeners[i].Cb = cb;
             UdpListeners[i].Ctx = ctx;
             return true;
@@ -317,26 +352,65 @@ bool NetDevice::RegisterUdpListener(u16 port, RxCallback cb, void* ctx)
 
     UdpListeners[UdpListenerCount].Port = port;
     UdpListeners[UdpListenerCount].Cb = cb;
+    UdpListeners[UdpListenerCount].FrameCb = nullptr;
     UdpListeners[UdpListenerCount].Ctx = ctx;
     UdpListenerCount++;
     return true;
 }
 
+int NetDevice::ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx)
+{
+    if (port == 0 || cb == nullptr)
+        return UdpListenInvalid;
+
+    Stdlib::AutoLock lock(UdpListenerLock);
+
+    for (ulong i = 0; i < UdpListenerCount; i++)
+    {
+        if (UdpListeners[i].Port == port)
+            return UdpListenPortTaken;
+    }
+
+    if (UdpListenerCount >= MaxUdpListeners)
+        return UdpListenTableFull;
+
+    UdpListener& listener = UdpListeners[UdpListenerCount];
+    listener.Port = port;
+    listener.Cb = nullptr;
+    listener.FrameCb = cb;
+    listener.Ctx = ctx;
+    UdpListenerCount++;
+    return UdpListenOk;
+}
+
 void NetDevice::UnregisterUdpListener(u16 port)
+{
+    RemoveUdpListener(port, nullptr, false);
+}
+
+void NetDevice::UnlistenUdpFrames(u16 port, void* ctx)
+{
+    RemoveUdpListener(port, ctx, true);
+}
+
+void NetDevice::RemoveUdpListener(u16 port, void* ctx, bool frames)
 {
     {
         Stdlib::AutoLock lock(UdpListenerLock);
 
         for (ulong i = 0; i < UdpListenerCount; i++)
         {
-            if (UdpListeners[i].Port == port)
-            {
-                for (ulong j = i; j + 1 < UdpListenerCount; j++)
-                    UdpListeners[j] = UdpListeners[j + 1];
-                UdpListenerCount--;
-                Stdlib::MemSet(&UdpListeners[UdpListenerCount], 0, sizeof(UdpListener));
-                break;
-            }
+            UdpListener& listener = UdpListeners[i];
+            if (listener.Port != port || (listener.FrameCb != nullptr) != frames)
+                continue;
+            if (frames && listener.Ctx != ctx)
+                continue;
+
+            for (ulong j = i; j + 1 < UdpListenerCount; j++)
+                UdpListeners[j] = UdpListeners[j + 1];
+            UdpListenerCount--;
+            Stdlib::MemSet(&UdpListeners[UdpListenerCount], 0, sizeof(UdpListener));
+            break;
         }
     }
 
@@ -571,11 +645,17 @@ void NetDevice::DrainRxQueueAndDispatch()
                    returns. */
                 for (ulong li = 0; li < listenerCount; li++)
                 {
-                    if (listeners[li].Port == dstPort && listeners[li].Cb)
-                    {
+                    if (listeners[li].Port != dstPort)
+                        continue;
+
+                    /* A frame listener gets the frame itself, and keeps it
+                       by taking a reference before it returns: the Put below
+                       is then not the last one. */
+                    if (listeners[li].FrameCb)
+                        listeners[li].FrameCb(listeners[li].Ctx, frame);
+                    else if (listeners[li].Cb)
                         listeners[li].Cb(data, dataLen, listeners[li].Ctx);
-                        break;
-                    }
+                    break;
                 }
                 break;
             }

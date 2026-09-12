@@ -84,6 +84,37 @@ bool PartitionDevice::WriteSectors(u64 sector, const void* buf, u32 count, bool 
     return Parent->WriteSectors(StartSector + sector, buf, count, fua);
 }
 
+bool PartitionDevice::CanSubmitAsync()
+{
+    return Parent->CanSubmitAsync();
+}
+
+int PartitionDevice::SubmitAsync(const AsyncBlockIo& io, bool kick)
+{
+    if (io.Op == AsyncBlockIo::Flush)
+        return Parent->SubmitAsync(io, kick);
+
+    if (io.Sector > SectorCount || io.Count > SectorCount - io.Sector)
+    {
+        /* Refused, but a kick is still a kick: what was queued before it
+           without a doorbell is owed one */
+        if (kick)
+            Parent->KickAsync();
+        return SubmitInvalid;
+    }
+
+    /* Moved onto the disk in a copy: the caller's io is only read, so it can
+       be submitted again as it is after a Busy. */
+    AsyncBlockIo onDisk = io;
+    onDisk.Sector = StartSector + io.Sector;
+    return Parent->SubmitAsync(onDisk, kick);
+}
+
+void PartitionDevice::KickAsync()
+{
+    Parent->KickAsync();
+}
+
 bool PartitionDevice::ProbeDevice(BlockDevice* dev)
 {
     Stdlib::UniquePtr<u8, Mm::FreeDeleter> buf(static_cast<u8*>(Mm::Alloc(Const::PageSize, 0)));

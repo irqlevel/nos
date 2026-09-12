@@ -124,7 +124,7 @@ void TaskQueue::Switch(Task* next, Task* curr)
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
 
-Task* TaskQueue::SelectNext(Task *curr)
+Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle)
 {
     Task* next = nullptr;
     Task* idle = nullptr;
@@ -173,10 +173,16 @@ Task* TaskQueue::SelectNext(Task *curr)
         break;
     }
 
+    /* Only the idle task to hand the CPU to: a task polling with
+       YieldToRunnable keeps it instead -- unless it cannot run itself */
+    if (next == nullptr && keepOverIdle &&
+        curr->State.Get() != Task::StateExited && !curr->IsBlocked())
+        return nullptr;
+
     return (next != nullptr) ? next : idle;
 }
 
-void TaskQueue::Schedule(Task* curr)
+void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
 {
     ScheduleCounter.Inc();
 
@@ -199,7 +205,7 @@ void TaskQueue::Schedule(Task* curr)
             BugOn(TaskCount.Get() < 0);
         }
 
-        next = SelectNext(curr);
+        next = SelectNext(curr, keepOverIdle);
         if (next != nullptr)
         {
             next->Lock.Lock();
@@ -316,7 +322,7 @@ long TaskQueue::GetSwitchContextCounter()
     return SwitchContextCounter.Get();
 }
 
-void Schedule()
+static void ScheduleCurrent(bool keepOverIdle)
 {
     if (unlikely(!PreemptIsOn()))
     {
@@ -341,7 +347,17 @@ void Schedule()
         return;
     }
 
-    curr->TaskQueue->Schedule(curr);
+    curr->TaskQueue->Schedule(curr, keepOverIdle);
+}
+
+void Schedule()
+{
+    ScheduleCurrent(false);
+}
+
+void YieldToRunnable()
+{
+    ScheduleCurrent(true);
 }
 
 void Sleep(ulong nanoSecs)

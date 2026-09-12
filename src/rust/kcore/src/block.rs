@@ -2,6 +2,30 @@ use ffi::block;
 
 use crate::error::{Error, Result};
 
+pub use ffi::block::BlockIo;
+
+/// What a BlockIo asks for (AsyncBlockIo::Read, Write, Flush in block_device.h)
+pub const IO_READ: u8 = 0;
+pub const IO_WRITE: u8 = 1;
+pub const IO_FLUSH: u8 = 2;
+
+/// What a driver's submit answers (BlockDevice::Submit* in block_device.h)
+pub const SUBMIT_OK: i32 = 0;
+pub const SUBMIT_BUSY: i32 = 1;
+pub const SUBMIT_INVALID: i32 = 2;
+pub const SUBMIT_UNSUPPORTED: i32 = 3;
+
+/// Why an asynchronous I/O was not taken
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubmitError {
+    /// No room right now; there will be after a completion.
+    Busy,
+    /// Out of range, misaligned, or more than the device takes at once.
+    Invalid,
+    /// The device has only the synchronous path.
+    Unsupported,
+}
+
 /// Registration handle for a Rust-implemented block device.
 /// Registration is permanent (boot-lifetime); there is no unregister.
 pub struct BlockDeviceRegistration {
@@ -29,6 +53,10 @@ pub struct BlockDeviceOps {
     ) -> i32,
     /// Optional. Pass `None` if the device has no write cache to flush.
     pub flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
+    /// Optional: the asynchronous path (BlockIo) -- never blocking, answering
+    /// with a SUBMIT_* -- and the doorbell for submissions made without one.
+    pub submit: Option<extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32>,
+    pub kick: Option<extern "C" fn(ctx: *mut u8)>,
     pub ctx: *mut u8,
 }
 
@@ -42,6 +70,8 @@ pub fn register(ops: &BlockDeviceOps) -> Option<BlockDeviceRegistration> {
         read_sectors: ops.read_sectors,
         write_sectors: ops.write_sectors,
         flush: ops.flush,
+        submit: ops.submit,
+        kick: ops.kick,
         ctx: ops.ctx,
     };
     let h = unsafe { block::kernel_blockdev_register(&ffi_ops) };
@@ -122,6 +152,40 @@ impl Disk {
     /// How many partitions of it the kernel found
     pub fn partitions(&self) -> u32 {
         unsafe { block::kernel_blockdev_partitions(self.handle) }
+    }
+
+    /// Whether it takes asynchronous I/O -- `submit`: NVMe does, and so does
+    /// a partition of an NVMe disk.
+    pub fn can_submit(&self) -> bool {
+        unsafe { block::kernel_blockdev_can_submit(self.handle) != 0 }
+    }
+
+    /// Hands the device an I/O straight to or from physical memory and
+    /// returns at once; io.done is called when the device is done, exactly
+    /// once, from interrupt context. Task or softirq context. With kick false
+    /// the device may leave its doorbell for `kick` -- one doorbell for a
+    /// batch. The io is read before this returns, and may be submitted again
+    /// as it is after Busy.
+    ///
+    /// # Safety
+    /// io.phys names io.count sectors of physically contiguous memory, dword
+    /// aligned, that stay valid -- and, for a read, untouched -- until io.done
+    /// has run; io.ctx stays valid as long. io.done runs in interrupt context:
+    /// no sleeping, allocating or freeing in it.
+    #[inline]
+    pub unsafe fn submit(&self, io: &BlockIo, kick: bool) -> core::result::Result<(), SubmitError> {
+        match unsafe { block::kernel_blockdev_submit(self.handle, io, kick as i32) } {
+            SUBMIT_OK => Ok(()),
+            SUBMIT_BUSY => Err(SubmitError::Busy),
+            SUBMIT_UNSUPPORTED => Err(SubmitError::Unsupported),
+            _ => Err(SubmitError::Invalid),
+        }
+    }
+
+    /// Rings the doorbell for what `submit(.., false)` queued.
+    #[inline]
+    pub fn kick(&self) {
+        unsafe { block::kernel_blockdev_kick(self.handle) }
     }
 
     fn sector_count(&self, len: usize) -> Result<u32> {

@@ -76,6 +76,18 @@ pub fn sleep_ms(ms: u64) {
     sleep(Duration::from_millis(ms));
 }
 
+/// Gives the CPU to another task runnable on it, if there is one, and
+/// returns at once if there is not -- never to the idle task, which would
+/// halt the CPU until the next interrupt the CPU itself takes, often the
+/// tick, 10 ms on. The way to poll for work another CPU's interrupt will
+/// bring, without keeping whatever else is runnable here -- a softirq task
+/// the tick preempted mid-handler among them -- off the CPU the way a plain
+/// spin does.
+#[inline]
+pub fn yield_to_runnable() {
+    unsafe { task::kernel_task_yield_to_runnable() }
+}
+
 /// Spawn a task that receives a raw context pointer.
 /// The caller is responsible for the lifetime and safety of `ctx`.
 pub fn spawn_with_ctx(

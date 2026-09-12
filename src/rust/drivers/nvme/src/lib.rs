@@ -85,6 +85,22 @@ struct NvmeDevice {
      * Accessed from both the I/O submission path and the ISR. */
     inflight_status: [AtomicU16; IO_QUEUE_DEPTH],
 
+    /* The asynchronous path's completion target per CID: the function to
+     * call and its argument; 0 for a synchronous command.  The submitter
+     * stores the argument, then the function (Release); the ISR loads the
+     * function (Acquire) and clears it. */
+    inflight_done: [AtomicUsize; IO_QUEUE_DEPTH],
+    inflight_ctx:  [AtomicUsize; IO_QUEUE_DEPTH],
+
+    /* Commands in the SQ whose doorbell a kick still owes the controller:
+     * an asynchronous batch rings it once, at the end.  Under io_lock. */
+    doorbell_owed: bool,
+
+    /* Asynchronous commands in flight, and how many there may be: the
+     * synchronous path keeps SYNC_RESERVED_CIDS of the IDs.  Under io_lock. */
+    async_in_flight: usize,
+    async_limit: usize,
+
     /* device name for block registration */
     name_buf: [u8; 16],
 }
@@ -388,6 +404,17 @@ fn init_device(dev: pci::PciDevice) {
             const ZERO: AtomicU16 = AtomicU16::new(0);
             [ZERO; IO_QUEUE_DEPTH]
         },
+        inflight_done: {
+            const ZERO: AtomicUsize = AtomicUsize::new(0);
+            [ZERO; IO_QUEUE_DEPTH]
+        },
+        inflight_ctx: {
+            const ZERO: AtomicUsize = AtomicUsize::new(0);
+            [ZERO; IO_QUEUE_DEPTH]
+        },
+        doorbell_owed: false,
+        async_in_flight: 0,
+        async_limit: (io_depth - 1).saturating_sub(SYNC_RESERVED_CIDS).max(1),
         name_buf: [0u8; 16],
     });
 
@@ -428,6 +455,8 @@ fn init_device(dev: pci::PciDevice) {
         read_sectors:  nvme_read_sectors,
         write_sectors: nvme_write_sectors,
         flush:         Some(nvme_flush),
+        submit:        Some(nvme_submit),
+        kick:          Some(nvme_kick),
         ctx:           raw as *mut u8,
     };
 
@@ -536,30 +565,190 @@ fn disable_controller_on_error(regs: &io::MmioRegion, to_ms: u64) {
 /* MSI-X interrupt handler                                             */
 /* ------------------------------------------------------------------ */
 
+/* Completions one pass of the handler takes before it acknowledges them; a
+ * pass that fills it goes round again. */
+const CQE_BATCH: usize = 32;
+
+/* A pass frees the asynchronous CIDs it completed as one bit mask */
+const _: () = assert!(IO_QUEUE_DEPTH <= u64::BITS as usize);
+
 extern "C" fn nvme_msix_handler(ctx: *mut u8) {
     let dev = ctx as *mut NvmeDevice;
 
     let mut completed = 0u32;
     loop {
-        let cqe = match unsafe { (*dev).io_cq.poll_completion() } {
-            Some(c) => c,
-            None => break,
-        };
+        /* Take what the controller has posted, then acknowledge the lot with
+         * one CQ head doorbell. A doorbell is a write across the bus -- under
+         * a hypervisor, an exit -- and this paid one per completion. It still
+         * has to come before any of these command IDs can go back out: a CID
+         * reused while its old entry is unacknowledged is one more entry the
+         * controller may need room for, and the queue has room for one per
+         * CID and no more. */
+        let mut cqes = [(0u16, 0u16); CQE_BATCH];
+        let mut n = 0usize;
+        while n < CQE_BATCH {
+            match unsafe { (*dev).io_cq.poll_completion() } {
+                Some(cqe) => {
+                    cqes[n] = (cqe.cid, cqe.status_code());
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        completed += n as u32;
         unsafe { (*dev).io_cq.ring_cq_doorbell(&(*dev).regs) };
 
-        let cid = cqe.cid as usize % IO_QUEUE_DEPTH;
-        /* Acquire pairs with the submitter's Release store of the handle */
-        let wg_handle = unsafe { (*dev).inflight[cid].load(Ordering::Acquire) };
-        completed = completed + 1;
-        if wg_handle != 0 {
-            unsafe { (*dev).inflight_status[cid].store(cqe.status_code(), Ordering::Relaxed) };
-            unsafe { (*dev).inflight[cid].store(0, Ordering::Release) };
-            sync::waitgroup_done_raw(wg_handle);
+        /* Asynchronous completions are collected and their CIDs freed under
+         * one lock before their callbacks run -- a callback's owner may want
+         * to submit again the moment it hears -- and the callbacks after. */
+        let mut done = [(0usize, 0usize, 0u16); CQE_BATCH];
+        let mut ndone = 0usize;
+        let mut freed = 0u64;
+
+        for &(cid, status) in &cqes[..n] {
+            let cid = cid as usize % IO_QUEUE_DEPTH;
+
+            /* Acquire pairs with the submitter's Release store */
+            let func = unsafe { (*dev).inflight_done[cid].load(Ordering::Acquire) };
+            if func != 0 {
+                let arg = unsafe { (*dev).inflight_ctx[cid].load(Ordering::Relaxed) };
+                unsafe { (*dev).inflight_done[cid].store(0, Ordering::Relaxed) };
+                done[ndone] = (func, arg, status);
+                ndone += 1;
+                freed |= 1u64 << cid;
+                continue;
+            }
+
+            /* Acquire pairs with the submitter's Release store of the handle */
+            let wg_handle = unsafe { (*dev).inflight[cid].load(Ordering::Acquire) };
+            if wg_handle != 0 {
+                unsafe { (*dev).inflight_status[cid].store(status, Ordering::Relaxed) };
+                unsafe { (*dev).inflight[cid].store(0, Ordering::Release) };
+                sync::waitgroup_done_raw(wg_handle);
+            }
+        }
+
+        if freed != 0 {
+            let _guard = unsafe { (*dev).io_lock.lock() };
+            unsafe { (*dev).async_in_flight -= freed.count_ones() as usize };
+            let mut bits = freed;
+            while bits != 0 {
+                free_cid(dev, bits.trailing_zeros() as u16);
+                bits &= bits - 1;
+            }
+        }
+
+        for &(func, arg, status) in &done[..ndone] {
+            let callback: extern "C" fn(*mut u8, i32) = unsafe { core::mem::transmute(func) };
+            callback(arg as *mut u8, status as i32);
         }
     }
     if completed == 0 {
         /* Not level 0: a shared/stray vector would otherwise spam the log */
         trace!(3, "NVMe: IRQ spurious (no CQEs)");
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Asynchronous path: submit, kick                                     */
+/* ------------------------------------------------------------------ */
+
+/* Never blocks and never waits for a command ID: a full queue is Busy, for
+ * the caller to try again after a completion. The completion calls io.done
+ * from the ISR above. A kick rings the doorbell whatever became of this
+ * command -- the ones queued before it without one are owed it. */
+extern "C" fn nvme_submit(ctx: *mut u8, io: *const block::BlockIo, kick: i32) -> i32 {
+    let rc = queue_async(ctx as *mut NvmeDevice, io);
+    if kick != 0 {
+        nvme_kick(ctx);
+    }
+    rc
+}
+
+/* The command into the SQ, its doorbell left owed */
+fn queue_async(dev: *mut NvmeDevice, io: *const block::BlockIo) -> i32 {
+    if io.is_null() {
+        return block::SUBMIT_INVALID;
+    }
+    let io = unsafe { &*io };
+
+    let (opcode, prp1, prp2, cdw12) = match io.op {
+        block::IO_READ | block::IO_WRITE => {
+            let count = io.count;
+            let capacity = unsafe { (*dev).capacity };
+            if count == 0
+                || count > unsafe { (*dev).max_transfer }
+                || io.sector >= capacity
+                || count as u64 > capacity - io.sector
+            {
+                return block::SUBMIT_INVALID;
+            }
+
+            /* Two PRP entries, no lists: the first may start anywhere dword
+             * aligned, the second is the page after it -- the range is
+             * physically contiguous, the caller's promise. */
+            let bytes = count as usize * unsafe { (*dev).sector_size } as usize;
+            let offset = io.phys as usize & (PAGE_SIZE - 1);
+            if io.phys & 3 != 0 || offset + bytes > 2 * PAGE_SIZE {
+                return block::SUBMIT_INVALID;
+            }
+            let prp2 = if offset + bytes > PAGE_SIZE {
+                (io.phys & !(PAGE_SIZE as u64 - 1)) + PAGE_SIZE as u64
+            } else {
+                0
+            };
+
+            let write = io.op == block::IO_WRITE;
+            let fua: u32 = if write && io.fua != 0 { 1 << 30 } else { 0 };
+            (if write { OPC_WRITE } else { OPC_READ }, io.phys, prp2, fua | (count - 1))
+        }
+        block::IO_FLUSH => (OPC_FLUSH, 0, 0, 0),
+        _ => return block::SUBMIT_INVALID,
+    };
+
+    let _guard = unsafe { (*dev).io_lock.lock() };
+    if unsafe { (*dev).async_in_flight >= (*dev).async_limit } {
+        return block::SUBMIT_BUSY;
+    }
+    let cid = match alloc_cid(dev) {
+        Some(c) => c as usize,
+        None => return block::SUBMIT_BUSY,
+    };
+    unsafe { (*dev).async_in_flight += 1 };
+
+    unsafe {
+        (*dev).inflight_ctx[cid].store(io.ctx as usize, Ordering::Relaxed);
+        /* Release: the ISR has to see the argument with the function */
+        (*dev).inflight_done[cid].store(io.done as usize, Ordering::Release);
+    }
+
+    let mut cmd = SubmissionEntry::new(opcode, cid as u16);
+    cmd.nsid = 1;
+    cmd.prp1 = prp1;
+    cmd.prp2 = prp2;
+    if opcode != OPC_FLUSH {
+        cmd.cdw10 = io.sector as u32;
+        cmd.cdw11 = (io.sector >> 32) as u32;
+        cmd.cdw12 = cdw12;
+    }
+
+    unsafe { (*dev).io_sq.submit(&cmd) };
+    unsafe { (*dev).doorbell_owed = true };
+    block::SUBMIT_OK
+}
+
+/* The doorbell for what nvme_submit queued without ringing it: the tail as it
+ * stands, which covers every one of them. Under io_lock, as every doorbell
+ * write is -- the tail must never be written going backwards. */
+extern "C" fn nvme_kick(ctx: *mut u8) {
+    let dev = ctx as *mut NvmeDevice;
+    let _guard = unsafe { (*dev).io_lock.lock() };
+    if unsafe { (*dev).doorbell_owed } {
+        unsafe { (*dev).io_sq.ring_sq_doorbell(&(*dev).regs) };
+        unsafe { (*dev).doorbell_owed = false };
     }
 }
 
@@ -605,7 +794,9 @@ extern "C" fn nvme_flush(ctx: *mut u8) -> i32 {
         let mut cmd = SubmissionEntry::new(OPC_FLUSH, cid);
         cmd.nsid = 1;
         unsafe { (*dev).io_sq.submit(&cmd) };
+        /* The tail covers any asynchronous command still owed a doorbell */
         unsafe { (*dev).io_sq.ring_sq_doorbell(&(*dev).regs) };
+        unsafe { (*dev).doorbell_owed = false };
         cid
     };
 
@@ -690,7 +881,9 @@ fn submit_io(
         cmd.cdw12 = fua_bit | (count as u32 - 1);
 
         unsafe { (*dev).io_sq.submit(&cmd) };
+        /* The tail covers any asynchronous command still owed a doorbell */
         unsafe { (*dev).io_sq.ring_sq_doorbell(&(*dev).regs) };
+        unsafe { (*dev).doorbell_owed = false };
         cid
     };
 
@@ -710,6 +903,12 @@ fn submit_io(
  * a time. A second is far past any completion; past it the I/O fails as it
  * always did -- which the panic path, where nothing completes, needs. */
 const CID_WAIT_NS: u64 = 50_000;
+
+/* Command IDs the asynchronous path leaves to the synchronous one. A server
+ * keeping the queue full -- netblk at a high window -- would otherwise have
+ * every ID back the moment it came free, and a filesystem's synchronous I/O
+ * on the same disk would wait out lock_with_cid's retries and fail. */
+const SYNC_RESERVED_CIDS: usize = 8;
 const CID_WAIT_TRIES: u32 = 20_000;
 
 /* io_lock, held, and a free command ID under it. Every ID in flight at once
