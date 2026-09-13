@@ -21,9 +21,10 @@ namespace Kernel
  
    Echo mode answers every datagram, which exercises receive and transmit
    together; sink mode drops them, which isolates the receive half. The reply
-   is built and sent from the receive callback itself, in softirq context,
-   the same way Icmp answers a ping: a load generator that woke a task per
-   packet would be measuring the wakeup. */
+   is the frame that arrived, its addresses swapped, built in the receive
+   callback itself, in softirq context, the way Icmp answers a ping -- a load
+   generator that woke a task per packet would be measuring the wakeup -- and
+   the replies of one receive batch go to the NIC together when it ends. */
 class NetLoad final
 {
 public:
@@ -43,18 +44,23 @@ public:
 
     static const u16 DefaultPort = 9999;
 
-    /* Ethernet MTU plus headers: the reply is the request with its addresses
-       swapped, so it is never larger than what arrived. */
-    static const ulong MaxFrameLen = 1514;
-
 private:
     NetLoad();
     ~NetLoad();
     NetLoad(const NetLoad& other) = delete;
     NetLoad& operator=(const NetLoad& other) = delete;
 
-    static void RxCallbackFn(const u8* frame, ulong len, void* ctx);
-    void OnFrame(const u8* frame, ulong len);
+    static void FrameCallbackFn(void* ctx, NetFrame* frame);
+    static void BatchEndFn(void* ctx);
+    void OnFrame(NetFrame* frame);
+    void FlushReplies();
+
+    /* Replies built during the receive batch being dispatched, not yet handed
+       to the NIC. Only the receive softirq touches them, and a softirq type
+       runs on one CPU at a time, so there is no lock. */
+    static const ulong MaxPending = 64;
+    NetFrame* Pending[MaxPending];
+    ulong PendingCount;
 
     static void TaskFunc(void* ctx);
     void Run();
