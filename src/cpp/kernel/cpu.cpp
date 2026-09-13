@@ -67,6 +67,11 @@ ulong Cpu::GetState()
     return State;
 }
 
+bool Cpu::IsParked()
+{
+    return (Parked.Get() != 0) ? true : false;
+}
+
 void Cpu::SetRunning()
 {
     {
@@ -258,13 +263,19 @@ void Cpu::OnPanic()
    there is nothing left for it to do. One halt is not enough to stay put:
    arm64's WFI may complete at any moment -- a pending interrupt ends it even
    while masked, and under HVF every AP was out of it within milliseconds --
-   and x86's HLT ends at the first NMI, which a panic sends every CPU. A CPU
-   that fell out of it used to return from the IPI into a task whose stack
-   was being freed under it: the data abort every arm64 poweroff printed from
-   an AP, in the middle of the boot CPU's static destructors. */
+   and x86's HLT ends at the first NMI. A CPU that fell out of it used to
+   return from the IPI into a task whose stack was being freed under it: the
+   data abort every arm64 poweroff printed from an AP, in the middle of the
+   boot CPU's static destructors. */
 void Cpu::Park()
 {
     InterruptDisable();
+
+    /* Before StateExited: from then on the stack under this CPU may be freed
+       at any moment, and a panic must already know not to send it an NMI,
+       whose delivery pushes a frame onto that stack (see
+       Panicker::CollectRemoteStacks). */
+    Parked.Set(1);
 
     {
         Stdlib::AutoLock lock(Lock);

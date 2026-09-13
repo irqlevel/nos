@@ -56,6 +56,10 @@ public:
 
     ulong GetState();
 
+    /* True once Park() has stopped this CPU for good. Written once by the
+       parking CPU and read by whichever one panics, without the lock. */
+    bool IsParked();
+
     void IPI(Context* ctx);
     void TimerTick(Context* ctx);
 
@@ -100,6 +104,9 @@ private:
     RawSpinLock IPITaskLock;
     Stdlib::ListEntry IPITaskList;
     bool IPITasksClosed; /* set on exit: queuers self-complete instead of waiting */
+
+    /* Set by Park() before StateExited; see IsParked */
+    Atomic Parked;
 
     static const ulong Tag = 'Cpu ';
 };
