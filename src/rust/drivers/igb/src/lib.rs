@@ -22,10 +22,14 @@
  * is no OWN bit, ownership is a pair of ring pointers, and the tail is a
  * register write.
  *
- * Interrupts are legacy INTx. This part offers MSI-X, but using it means
- * routing queues to vectors through the IVAR registers and driving the
- * extended EICR block, and none of that buys anything until there is more
- * than one queue to spread.
+ * Interrupts are MSI-X where the part offers it (INTx otherwise): the one
+ * receive and one transmit queue on vector 0, the rare non-queue causes on
+ * vector 1 where the table has room. Splitting them lets the queue interrupt
+ * read no register at all -- the hardware clears and masks its cause -- where
+ * a shared vector must read ICR on every interrupt to tell a packet from a
+ * link change. The receive poll also spins briefly for the next frame when
+ * the ring empties under load, and the throttle widens with the rate, so a
+ * flood costs far fewer interrupts than one apiece. See arm_msix.
  *
  * Locking:
  *  - tx_ring is touched only by flush_tx, which the C++ TxQueueLock
@@ -39,6 +43,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use kcore::time::boot_time_ns;
 use kcore::{dma, interrupt, io, msix, net, pci, softirq, trace};
 
 mod desc;
@@ -117,13 +122,33 @@ const SUPPORTED: [(u16, Generation); 10] = [
 const RX_BUDGET: u32 = 64;
 const MAX_POLLS: u32 = 8;
 
+/* When the ring empties but the receive side is running at least this fast,
+ * spin for the next frame this long before handing the ring back to the
+ * interrupt. At a high rate the next frame is a couple of microseconds away
+ * and an arm-interrupt-mask round trip -- and, on the shared vector, its
+ * register reads -- costs more than the spin; below the rate it is not worth
+ * a microsecond of a CPU, so the ring is handed straight back. */
+const LINGER_MIN_PPS: u32 = 200_000;
+const LINGER_NS: u64 = 20_000;
+
+/* The receive rate is resampled no more often than this. */
+const RATE_SAMPLE_NS: u64 = 1_000_000;
+
 struct IgbDevice {
     _msix_irq: msix::MsixInterrupt,
+    /// The second MSI-X vector, for the non-queue causes, when there is one.
+    _msix_irq_other: msix::MsixInterrupt,
     _msix_table: Option<msix::MsixTable>,
     _intx: interrupt::LegacyInterrupt,
     /// Whether causes arrive through the extended block rather than ICR/IMS.
     /// It decides which pair of registers masks and arms the receive side.
     msix: bool,
+    /// Whether the queues and the non-queue causes have a vector each. When
+    /// they do, the queue interrupt reads no register at all: the hardware
+    /// auto-clears its cause (EIAC) and auto-masks it (EIAME), and only the
+    /// rare other vector reads ICR. When they share one vector, that one
+    /// handler reads EICR and ICR as before.
+    two_vector: bool,
     generation: Generation,
     phy_addr: u32,
     /* Set by the interrupt when the link changes, acted on by the poll: the
@@ -138,6 +163,22 @@ struct IgbDevice {
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
     rx_dropped: AtomicU64,
+    /// Receive rate, packets a second, resampled once a millisecond in
+    /// process_rx. It drives two things: how wide to set the interrupt
+    /// throttle (apply_eitr), and whether to spin briefly for the next frame
+    /// when the ring empties rather than hand it back to the interrupt
+    /// (the linger below). Written by the receive poll, one CPU at a time.
+    rx_rate_pps: AtomicU32,
+    rate_last_ns: AtomicU64,
+    rate_last_pkts: AtomicU64,
+    /// The EITR interval currently programmed, microseconds, so apply_eitr
+    /// writes the register only when it changes.
+    eitr_us: AtomicU32,
+    /// Interrupts taken on each vector, and lingers that found a frame and so
+    /// spared the ring an arm-and-interrupt round trip -- for igbdump.
+    isr_queue: AtomicU64,
+    isr_other: AtomicU64,
+    rx_linger_hits: AtomicU64,
     _bar_mapping: dma::PhysMapping,
     regs: io::MmioRegion,
 }
@@ -998,9 +1039,11 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
 
     let mut dev_box = Box::new(IgbDevice {
         _msix_irq: msix::MsixInterrupt::empty(),
+        _msix_irq_other: msix::MsixInterrupt::empty(),
         _msix_table: None,
         _intx: interrupt::LegacyInterrupt::empty(),
         msix: false,
+        two_vector: false,
         generation,
         phy_addr,
         link_event: AtomicU32::new(0),
@@ -1012,6 +1055,13 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
+        rx_rate_pps: AtomicU32::new(0),
+        rate_last_ns: AtomicU64::new(0),
+        rate_last_pkts: AtomicU64::new(0),
+        eitr_us: AtomicU32::new(EITR_INTERVAL_US),
+        isr_queue: AtomicU64::new(0),
+        isr_other: AtomicU64::new(0),
+        rx_linger_hits: AtomicU64::new(0),
         _bar_mapping: bar_mapping,
         regs,
     });
@@ -1024,7 +1074,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     }
 
     if dev_box.msix {
-        arm_msix(&dev_box.regs);
+        arm_msix(&dev_box.regs, dev_box.two_vector);
     } else {
         dev_box.regs.write32(IMS, INTR_MASK_BITS);
     }
@@ -1061,20 +1111,37 @@ fn attach_interrupt(
     dev_box: &mut Box<IgbDevice>,
     ctx_ptr: *mut u8,
 ) -> bool {
-    /* One vector for everything. The point of this part's 25 vectors is to
-     * give each queue its own, and there is one queue. */
+    /* Two vectors where the table has room for them: entry 0 for the one
+     * receive and the one transmit queue, entry 1 for the rare non-queue
+     * causes. There is one queue, so this is not about spreading queues --
+     * it is that a queue interrupt separated from the others needs to read no
+     * register to know what it is for, where a single shared vector must read
+     * ICR on every interrupt to tell a received packet from a link change. On
+     * the AX41 under a small-packet flood those reads were a tenth of the
+     * receive CPU. Entry 1's handler still reads ICR; it fires seldom. */
     if let Some(table) = msix::MsixTable::new(pci_dev) {
-        match msix::MsixInterrupt::register(&table, 0, igb_isr, ctx_ptr) {
+        match msix::MsixInterrupt::register(&table, 0, igb_isr_queue, ctx_ptr) {
             Some(irq) => {
+                dev_box._msix_irq = irq;
+                dev_box.msix = true;
+
+                if table.table_size() >= 2 {
+                    if let Some(other) =
+                        msix::MsixInterrupt::register(&table, 1, igb_isr_other, ctx_ptr)
+                    {
+                        dev_box._msix_irq_other = other;
+                        dev_box.two_vector = true;
+                    }
+                }
+
                 trace!(
                     0,
-                    "igb: MSI-X vector={} ({} entries available)",
-                    irq.vector(),
-                    table.table_size()
+                    "igb: MSI-X vector={} ({} entries), {}",
+                    dev_box._msix_irq.vector(),
+                    table.table_size(),
+                    if dev_box.two_vector { "queue + other" } else { "one vector" }
                 );
-                dev_box._msix_irq = irq;
                 dev_box._msix_table = Some(table);
-                dev_box.msix = true;
                 return true;
             }
             None => {
@@ -1101,13 +1168,15 @@ fn attach_interrupt(
     }
 }
 
-/// Route every cause to MSI-X vector 0 and arm it.
+/// Route the causes to their vectors and arm them.
 ///
 /// IVAR maps queues to vectors a byte apiece -- receive queue 0 in the low
 /// byte of IVAR0, transmit queue 0 in the next, everything that is not a
 /// queue in the second byte of IVAR_MISC -- and the top bit of each byte is
-/// what makes the entry mean anything.
-fn arm_msix(regs: &io::MmioRegion) {
+/// what makes the entry mean anything. With `two_vector`, the queues stay on
+/// vector 0 and the non-queue causes move to vector 1; otherwise all of them
+/// share vector 0, the way this driver used to run.
+fn arm_msix(regs: &io::MmioRegion, two_vector: bool) {
     regs.write32(
         GPIE,
         GPIE_MSIX_MODE | GPIE_PBA | GPIE_EIAME | GPIE_NSICR,
@@ -1117,7 +1186,7 @@ fn arm_msix(regs: &io::MmioRegion) {
      * here and a device reset does not clear it: measured on the I210, the
      * receive rate sat at 169k packets a second with the CPU 93% idle,
      * because the chip was holding interrupts apart and nothing else was
-     * wrong. */
+     * wrong. apply_eitr widens it again under load. */
     let inherited = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
     regs.write32(EITR0, EITR_INTERVAL_US << EITR_INTERVAL_SHIFT);
     trace!(
@@ -1127,22 +1196,83 @@ fn arm_msix(regs: &io::MmioRegion) {
         EITR_INTERVAL_US
     );
 
+    let other_vec = if two_vector { 1 } else { 0 };
     regs.write32(IVAR0, IVAR_VALID | (IVAR_VALID << 8));
-    regs.write32(IVAR_MISC, IVAR_VALID << 8);
+    regs.write32(IVAR_MISC, (IVAR_VALID | other_vec) << 8);
 
-    /* No auto-clear: the handler reads EICR, and having the hardware clear
-     * causes behind its back is how a driver loses an event it never saw. */
-    regs.write32(EIAC, 0);
+    if two_vector {
+        /* The queue vector's cause is cleared by the hardware when the
+         * interrupt is delivered (EIAC), so its handler reads no register --
+         * matching what Linux's igb does with its ring vectors. The other
+         * vector is left out of EIAC: its handler reads ICR, and having the
+         * hardware clear causes behind that read is how a driver loses an
+         * event it never saw. GPIE.EIAME auto-masks whichever vector fired,
+         * and the handler (the receive poll, for the queue vector) re-arms
+         * it. */
+        regs.write32(EIAC, EICR_VECTOR0);
+    } else {
+        regs.write32(EIAC, 0);
+    }
     regs.write32(EIAM, 0);
 
-    /* Link changes still arrive through the legacy mask even in this mode. */
-    regs.write32(IMS, ICR_LSC);
-    regs.write32(EIMS, EICR_VECTOR0);
+    /* The non-queue causes, enabled in the legacy mask so they reach ICR for
+     * the other vector's handler (or the shared handler) to read. */
+    regs.write32(IMS, ICR_LSC | ICR_RXO);
+
+    let eims = if two_vector { EICR_VECTOR0 | EICR_VECTOR1 } else { EICR_VECTOR0 };
+    regs.write32(EIMS, eims);
 }
 
 /* ================================================================== */
 /* Interrupt */
 
+/* The queue vector, when the causes are split in two. It reads no register:
+ * the hardware cleared the cause (EIAC) and masked the vector (EIAME) before
+ * this ran, and the receive poll re-arms it. Transmit shares the vector, so
+ * the transmit softirq is raised too -- cheap when nothing is queued, and the
+ * datapath reaps transmits from flush_tx on the send side anyway. */
+extern "C" fn igb_isr_queue(ctx: *mut u8) {
+    let dev = ctx as *mut IgbDevice;
+    if dev.is_null() {
+        return;
+    }
+    unsafe {
+        (*dev).isr_queue.fetch_add(1, Ordering::Relaxed);
+        softirq::raise(softirq::TYPE_NET_TX);
+        softirq::raise(softirq::TYPE_NET_RX);
+    }
+}
+
+/* The other vector: link change and receiver overrun, seldom. It reads ICR
+ * for the cause, clears its own EICR bit and re-arms it (EIAME masked it). */
+extern "C" fn igb_isr_other(ctx: *mut u8) {
+    let dev = ctx as *mut IgbDevice;
+    if dev.is_null() {
+        return;
+    }
+    unsafe {
+        let regs = &(*dev).regs;
+        (*dev).isr_other.fetch_add(1, Ordering::Relaxed);
+
+        let icr = regs.read32(ICR);
+        if icr & ICR_LSC != 0 {
+            (*dev).link_event.store(1, Ordering::Release);
+            softirq::raise(softirq::TYPE_NET_RX); /* the poll acts on it */
+        }
+        if icr & ICR_RXO != 0 {
+            let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                trace!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
+            }
+        }
+
+        regs.write32(EICR, EICR_VECTOR1);
+        regs.write32(EIMS, EICR_VECTOR1);
+    }
+}
+
+/* The shared vector: MSI-X with one vector, or INTx. Reads EICR and ICR to
+ * tell the causes apart. */
 extern "C" fn igb_isr(ctx: *mut u8) {
     let dev = ctx as *mut IgbDevice;
     if dev.is_null() {
@@ -1151,6 +1281,7 @@ extern "C" fn igb_isr(ctx: *mut u8) {
 
     unsafe {
         let regs = &(*dev).regs;
+        (*dev).isr_queue.fetch_add(1, Ordering::Relaxed);
 
         /* In MSI-X mode the vector's own cause register says whether this
          * interrupt is ours; the per-event detail still arrives in ICR. */
@@ -1272,6 +1403,57 @@ unsafe fn refill_rx(dev: *mut IgbDevice) {
     }
 }
 
+/// Resample the receive rate if a sample window has passed, and adapt the
+/// interrupt throttle to it. Called at the head of the poll, one CPU at a
+/// time. Returns the current rate estimate.
+unsafe fn sample_rate(dev: *mut IgbDevice) -> u32 {
+    let now = boot_time_ns();
+    let last = (*dev).rate_last_ns.load(Ordering::Relaxed);
+    let dt = now.wrapping_sub(last);
+    if last != 0 && dt >= RATE_SAMPLE_NS {
+        let pkts = (*dev).rx_packets.load(Ordering::Relaxed);
+        let dpkts = pkts.wrapping_sub((*dev).rate_last_pkts.load(Ordering::Relaxed));
+        let pps = (dpkts.saturating_mul(1_000_000_000) / dt) as u32;
+        (*dev).rx_rate_pps.store(pps, Ordering::Relaxed);
+        (*dev).rate_last_ns.store(now, Ordering::Relaxed);
+        (*dev).rate_last_pkts.store(pkts, Ordering::Relaxed);
+        apply_eitr(dev, pps);
+    } else if last == 0 {
+        (*dev).rate_last_ns.store(now, Ordering::Relaxed);
+        (*dev).rate_last_pkts
+            .store((*dev).rx_packets.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+    (*dev).rx_rate_pps.load(Ordering::Relaxed)
+}
+
+/// Widen the interrupt throttle with the rate: 2 us idle, 20 us at 400k a
+/// second and up. Written only when it changes.
+unsafe fn apply_eitr(dev: *mut IgbDevice, pps: u32) {
+    let want = (pps / 20_000).clamp(EITR_MIN_US, EITR_MAX_US);
+    if want != (*dev).eitr_us.load(Ordering::Relaxed) {
+        (*dev)
+            .regs
+            .write32(EITR0, (want << EITR_INTERVAL_SHIFT) | EITR_CNT_IGNR);
+        (*dev).eitr_us.store(want, Ordering::Relaxed);
+    }
+}
+
+/// Spin until the ring has a frame or `ns` have passed. Softirq context, the
+/// vector masked: a bounded spin, entered only when the rate says the wait is
+/// short. Returns whether a frame arrived.
+unsafe fn linger_until_work(dev: *mut IgbDevice, ns: u64) -> bool {
+    let deadline = boot_time_ns() + ns;
+    loop {
+        if (*dev).rx_ring.has_work() {
+            return true;
+        }
+        if boot_time_ns() >= deadline {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 extern "C" fn igb_process_rx(ctx: *mut u8) {
     let dev = ctx as *mut IgbDevice;
     if dev.is_null() {
@@ -1282,6 +1464,8 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
 
     unsafe {
         handle_link_event(dev);
+
+        let hot = sample_rate(dev) >= LINGER_MIN_PPS;
 
         /* Harvested frames wait here until the batch is complete, so the
          * receive queue's lock is taken once rather than once per frame. */
@@ -1350,7 +1534,19 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
             /* Round again while the ring still has frames, receive sources
              * left masked: the repeating path touches no device register at
              * all, since has_work reads the descriptor out of DMA memory. */
-            if !(*dev).rx_ring.has_work() {
+            let mut empty = !(*dev).rx_ring.has_work();
+
+            /* Running hot: rather than arm the interrupt for a frame that is
+             * a couple of microseconds away, spin for it. Under a sustained
+             * flood the ring never stays empty long enough to reach the
+             * deadline, so the interrupt -- and its register reads -- is
+             * spared for as long as the flood lasts. */
+            if empty && hot && linger_until_work(dev, LINGER_NS) {
+                (*dev).rx_linger_hits.fetch_add(1, Ordering::Relaxed);
+                empty = false;
+            }
+
+            if empty {
                 /* Empty: hand the ring back to the interrupt. */
                 (*dev).arm_rx();
 
@@ -1472,6 +1668,11 @@ pub struct IgbState {
     pub rx_packets: u64,
     pub rx_dropped: u64,
     pub tx_packets: u64,
+    pub two_vector: u32,
+    pub rx_rate_pps: u32,
+    pub isr_queue: u64,
+    pub isr_other: u64,
+    pub rx_linger_hits: u64,
 }
 
 /// Add a read-clear register's delta to its running total and return it.
@@ -1557,6 +1758,11 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
         (*out).rx_packets = (*raw).rx_packets.load(Ordering::Relaxed);
         (*out).rx_dropped = (*raw).rx_dropped.load(Ordering::Relaxed);
         (*out).tx_packets = (*raw).tx_packets.load(Ordering::Relaxed);
+        (*out).two_vector = if (*raw).two_vector { 1 } else { 0 };
+        (*out).rx_rate_pps = (*raw).rx_rate_pps.load(Ordering::Relaxed);
+        (*out).isr_queue = (*raw).isr_queue.load(Ordering::Relaxed);
+        (*out).isr_other = (*raw).isr_other.load(Ordering::Relaxed);
+        (*out).rx_linger_hits = (*raw).rx_linger_hits.load(Ordering::Relaxed);
     }
 
     0

@@ -43,11 +43,21 @@ pub const EITR0: usize = 0x01680;
 pub const EITR_INTERVAL_SHIFT: u32 = 2;
 pub const EITR_INTERVAL_MASK: u32 = 0x1FFF << EITR_INTERVAL_SHIFT;
 
+/* Write bit 31 to load the interval now rather than after the current one
+   the counter is already timing runs out -- so a rate change takes effect on
+   the next interrupt, not the one after. */
+pub const EITR_CNT_IGNR: u32 = 1 << 31;
+
 /* Microseconds between interrupts. Two is the low end of the range the
    datasheet suggests, and with the receive sources masked for the duration of
    a poll the real rate is set by how fast the ring drains, not by this. Zero
-   is not a legal setting. */
+   is not a legal setting. It is the floor of an adaptive range now (see
+   apply_eitr): the busier the receive side, the wider the guaranteed gap, so
+   a flood costs fewer interrupts and each fewer is one less pass over the
+   interrupt registers. */
 pub const EITR_INTERVAL_US: u32 = 2;
+pub const EITR_MIN_US: u32 = 2;
+pub const EITR_MAX_US: u32 = 20;
 
 pub const IVAR0: usize = 0x01700; /* queue-to-vector map, 2 queues per reg */
 pub const IVAR_MISC: usize = 0x01740; /* non-queue causes */
@@ -62,9 +72,11 @@ pub const GPIE_PBA: u32 = 1 << 31;
  * means anything at all. */
 pub const IVAR_VALID: u32 = 0x80;
 
-/* This driver puts every cause on one vector, so one bit of EICR is the whole
- * interrupt. */
+/* Vector 0 carries the receive and transmit queues; vector 1, when there are
+ * two, the rare non-queue causes (link change, receiver overrun). Each is one
+ * bit of EICR, numbered by the MSI-X table entry the IVAR byte points at. */
 pub const EICR_VECTOR0: u32 = 1 << 0;
+pub const EICR_VECTOR1: u32 = 1 << 1;
 
 /* ---- Receive ---- */
 pub const RCTL: usize = 0x00100;

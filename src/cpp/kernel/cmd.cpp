@@ -543,6 +543,11 @@ struct IgbState
     u64 RxPackets;
     u64 RxDropped;
     u64 TxPackets;
+    u32 TwoVector;
+    u32 RxRatePps;
+    u64 IsrQueue;
+    u64 IsrOther;
+    u64 RxLingerHits;
 };
 
 extern "C" int igb_get_state(IgbState* out);
@@ -595,7 +600,11 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
     /* Microseconds the chip holds interrupts apart. Firmware leaves a value
        here that a device reset does not clear, and it caps the receive rate
        on its own. */
-    con.Printf("interrupt throttle %u us\n", (ulong)st.Eitr);
+    con.Printf("interrupt throttle %u us, rx rate %u pps\n",
+        (ulong)st.Eitr, (ulong)st.RxRatePps);
+    con.Printf("interrupts: %s, queue %u, other %u; rx lingers that spared one %u\n",
+        st.TwoVector ? "queue + other vector" : "one vector",
+        (ulong)st.IsrQueue, (ulong)st.IsrOther, (ulong)st.RxLingerHits);
     /* The prefetch thresholds live in the low fields of RXDCTL. Zero there
        means the chip never prefetches descriptors and drops packets with a
        full ring, so they are worth reading back rather than assuming. */
