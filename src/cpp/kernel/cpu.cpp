@@ -251,6 +251,32 @@ void Cpu::OnPanic()
     }
 }
 
+/* Where an exiting CPU ends, for good. Once StateExited is visible the CPU
+   that asked goes on to free the tasks, their stacks and at last the heap --
+   the stack this one is standing on among them -- so this CPU must never go
+   back to the task it interrupted, and StateExited is published only when
+   there is nothing left for it to do. One halt is not enough to stay put:
+   arm64's WFI may complete at any moment -- a pending interrupt ends it even
+   while masked, and under HVF every AP was out of it within milliseconds --
+   and x86's HLT ends at the first NMI, which a panic sends every CPU. A CPU
+   that fell out of it used to return from the IPI into a task whose stack
+   was being freed under it: the data abort every arm64 poweroff printed from
+   an AP, in the middle of the boot CPU's static destructors. */
+void Cpu::Park()
+{
+    InterruptDisable();
+
+    {
+        Stdlib::AutoLock lock(Lock);
+        State |= StateExited;
+    }
+
+    for (;;)
+    {
+        Hlt();
+    }
+}
+
 static void TlbFlushFunc(void* ctx, Context* ipiCtx)
 {
     (void)ctx;
@@ -429,8 +455,6 @@ void Cpu::IPI(Context* ctx)
     {
         Stdlib::AutoLock lock(Lock);
         exit = (State & StateExiting) ? true : false;
-        if (exit)
-            State |= StateExited;
     }
 
     if (exit)
@@ -442,9 +466,7 @@ void Cpu::IPI(Context* ctx)
            future ones, so a CPU that queued work to us never waits forever. */
         DrainAndCloseIPITasks(ctx);
 
-        InterruptDisable();
-        Hlt();
-        return;
+        Park();
     }
 
     /* The periodic work moved to this CPU's own timer (Cpu::TimerTick).

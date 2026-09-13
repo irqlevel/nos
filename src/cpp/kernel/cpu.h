@@ -86,6 +86,7 @@ private:
     Cpu& operator=(Cpu&& other) = delete;
 
     void OnPanic();
+    void __attribute__((noreturn)) Park();
     void ProcessIPITasks(Context* ctx);
     void DrainAndCloseIPITasks(Context* ctx);
 
