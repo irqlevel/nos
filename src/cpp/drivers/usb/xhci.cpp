@@ -2641,8 +2641,17 @@ void Stop()
 
     if (UsbTask != nullptr)
     {
-        UsbTask->SetStopping();
-        UsbTask->Wait();
+        Task* task = UsbTask;
+
+        task->SetStopping();
+        task->Wait();
+
+        /* Start() kept the reference the task was made with. Dropped here,
+           now that the task has exited -- until now it never was, and the
+           task outlived every poweroff. The pointer goes first, so it never
+           names a freed task, and a later Start() can make a new one. */
+        UsbTask = nullptr;
+        task->Put();
     }
 }
 
