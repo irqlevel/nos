@@ -83,7 +83,10 @@ Two independent gates:
 - **Per task.** `Task::PreemptDisableCounter`. `Schedule()` increments it and
   bails out if it was already non-zero, so a task inside `PreemptDisable()`
   keeps the CPU; `SelectNext` also passes over any *other* task with a
-  non-zero count, since it cannot be switched to safely either.
+  non-zero count, since it cannot be switched to safely either. A
+  reschedule that bails out is not forgotten: it leaves `Task::PreemptPending`
+  set, and the `PreemptEnable()` that brings the count back to zero makes it
+  (see [below](#a-reschedule-that-finds-preemption-off)).
   `PreemptIrqSave()`/`PreemptIrqRestore()` pair the two with interrupt
   disabling, stashing "preemption was on" in bit 63 of the saved flags so
   the restore balances correctly even if the global gate moves in between.
@@ -117,6 +120,52 @@ polling for requests with `poll=` and never blocking, was switched out that
 way by the tick some 25 times a second, a tick each: the idle task took a
 quarter of its CPU while it had work, and the server's p99 was 10 ms. An IPI
 landing on a running task could do the same to it.
+
+### A reschedule that finds preemption off
+
+The tick or an IPI can land on a task with preemption off -- inside a
+spinlock, most often -- where the reschedule cannot be made. It used to be
+dropped: the task went on, and whatever the reschedule was for waited for the
+next tick or IPI. For the tick's own round-robin that costs nothing; for the
+IPI a wakeup sends, the wakeup is lost. `SoftIrq::Raise` in an interrupt
+handler unblocks its CPU's softirq task and sends the CPU an IPI to switch to
+it. Landing on the idle task inside the lock `ReapExited()` takes -- a few
+instructions, with interrupts on -- that IPI's reschedule was dropped, and the
+idle task went on to halt with the softirq task runnable. Nothing else woke
+it: a raise that finds its bit already up sends no IPI, a device interrupt
+never reschedules on its own, and the igb driver keeps its vector masked
+until the receive poll re-arms it. The CPU slept on its receive queue until
+its next tick. On the AX41 under netblk's load that was the receive path going
+quiet for up to 10 ms some 80 times a second -- 13% of round trips over 2 ms,
+nearly every silence ending on the same 10 ms grid, one CPU's tick -- while
+netblk's own service time stayed under half a millisecond (see
+[netblk](netblk.md#the-receive-path-lost-ticks-too)).
+
+A refused reschedule now sets `Task::PreemptPending`, and `PreemptEnable()`
+or `PreemptEnableTask()` -- every unlock goes through one of them -- makes it
+the moment the count is back to zero with interrupts on: on that idle task,
+right after the unlock and before the `hlt`. With interrupts off it waits,
+since that is an interrupt handler, whose own `Preempt()` or the next tick
+will do, or a section its caller keeps closed, until its next
+`PreemptEnable()`. Only the running task's reschedule is made that way
+(`SwitchComplete` releases locks for the task it switched away from), and
+none once a panic has begun. `Schedule()`, when it keeps the CPU, also drops
+its own count before it turns interrupts back on, so an IPI waiting on the
+way out finds the task preemptible.
+
+One consequence for code that sends and then waits for an answer: the answer
+can be in before the send returns. The receive softirq may run on the way out
+of the transmit path, at the transmit lock's unlock -- rare while it took a
+tick landing just there, likely now that the reschedule an interrupt asked for
+meanwhile is made there. The DHCP client cleared its answer flag after
+sending, and over QEMU's igb, which transmits within the doorbell's write,
+lost every answer that way; it clears it before the send now
+(`DhcpClient::ArmResponse`). Arm first, then send.
+
+`top` prints how many reschedules were deferred since boot and how many of
+those landed on an idle task. Under netblk's load in QEMU (virtio-net, 12
+vCPUs), 20 seconds of it put more than a thousand on idle tasks -- before,
+each one a CPU asleep on work until its next tick or IPI.
 
 `Sleep(ns)` is worth knowing about: it *spins* on `GetBootTime()` calling
 `Schedule()`, it does not block. It yields the CPU but keeps the task
@@ -251,7 +300,7 @@ soft IRQs still run, and halts.
 | Command | Shows |
 |---|---|
 | `ps` | Every task: pid, state, flags, accumulated runtime, context switches, name |
-| `top [ms]` | Per-task CPU use over a window, as a percentage per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%), plus the migration count |
+| `top [ms]` | Per-task CPU use over a window, as a percentage per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%), plus the migration count and the deferred reschedules |
 | `stacks` | High-water mark of every task stack and every static boot stack |
 | `bt <pid>` | Stack trace of a task, using an IPI to capture it if it is running on another CPU |
 | `profile` | Where the time actually goes — see [Profiler](profiler.md) |

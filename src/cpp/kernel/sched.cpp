@@ -15,9 +15,24 @@ namespace Kernel
    number is the only way to know whether it is. */
 static Atomic TaskMigrations;
 
+/* Reschedules that found the task they landed on with preemption off, and
+   of those, how many landed on an idle task. */
+static Atomic PreemptsDeferred;
+static Atomic PreemptsDeferredIdle;
+
 long GetTaskMigrationCount()
 {
     return TaskMigrations.Get();
+}
+
+long GetPreemptDeferredCount()
+{
+    return PreemptsDeferred.Get();
+}
+
+long GetPreemptDeferredIdleCount()
+{
+    return PreemptsDeferredIdle.Get();
 }
 
 TaskQueue::TaskQueue()
@@ -188,6 +203,9 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
     ScheduleCounter.Inc();
 
     ulong flags = Hal::IrqSave();
+
+    /* Whatever reschedule was put off until now, this is it */
+    curr->PreemptPending.Set(0);
     Lock.Lock();
 
     Task* next = nullptr;
@@ -241,8 +259,13 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
         curr->UpdateRuntime();
         curr->Lock.Unlock();
         Lock.Unlock();
-        Hal::IrqRestore(flags);
+
+        /* The count down before interrupts come back on, not after: one
+           waiting to be taken -- the IPI for a task woken meanwhile -- would
+           find it still up, and its reschedule would wait for a PreemptEnable
+           that a task which has just kept the CPU may be a long way from. */
         curr->PreemptDisableCounter.Dec();
+        Hal::IrqRestore(flags);
         BugOn(curr->State.Get() == Task::StateExited);
         return;
     }
@@ -342,6 +365,19 @@ static void ScheduleCurrent(bool keepOverIdle)
     curr->PreemptDisableCounter.Inc();
     if (curr->PreemptDisableCounter.Get() > 1)
     {
+        /* Preemption is off -- a spinlock, most likely -- so not now; but
+           remembered, and made the moment the count is back to zero (see
+           PreemptEnable). It used to be dropped, and with it whatever the
+           reschedule was for: the IPI SoftIrq::Raise sends to run a softirq
+           task it has just woken, landing on an idle task inside the lock
+           ReapExited takes, left that idle task to halt with the softirq task
+           runnable -- and every raise after it found the bit already up and
+           sent nothing. The CPU slept on its work until its next tick. */
+        curr->PreemptPending.Set(1);
+        PreemptsDeferred.Inc();
+        if (curr->IsIdle())
+            PreemptsDeferredIdle.Inc();
+
         Stdlib::AutoLock lock(curr->Lock);
         curr->UpdateRuntime();
         curr->PreemptDisableCounter.Dec();

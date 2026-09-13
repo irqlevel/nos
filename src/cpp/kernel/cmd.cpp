@@ -374,6 +374,8 @@ static void CmdTop(const char* args, Stdlib::Printer& con)
     Mm::Free(before);
 
     con.Printf("task migrations since boot: %u\n", (ulong)GetTaskMigrationCount());
+    con.Printf("preemptions deferred since boot: %u, %u of them on an idle task\n",
+        (ulong)GetPreemptDeferredCount(), (ulong)GetPreemptDeferredIdleCount());
 }
 
 /* Sampled on the per-CPU tick, so the resolution is the tick rate: enough
