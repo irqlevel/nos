@@ -353,12 +353,14 @@ bool NetDevice::RegisterUdpListener(u16 port, RxCallback cb, void* ctx)
     UdpListeners[UdpListenerCount].Port = port;
     UdpListeners[UdpListenerCount].Cb = cb;
     UdpListeners[UdpListenerCount].FrameCb = nullptr;
+    UdpListeners[UdpListenerCount].BatchEndCb = nullptr;
     UdpListeners[UdpListenerCount].Ctx = ctx;
     UdpListenerCount++;
     return true;
 }
 
-int NetDevice::ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx)
+int NetDevice::ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx,
+                               RxBatchEndCallback batchEnd)
 {
     if (port == 0 || cb == nullptr)
         return UdpListenInvalid;
@@ -378,6 +380,7 @@ int NetDevice::ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx)
     listener.Port = port;
     listener.Cb = nullptr;
     listener.FrameCb = cb;
+    listener.BatchEndCb = batchEnd;
     listener.Ctx = ctx;
     UdpListenerCount++;
     return UdpListenOk;
@@ -667,6 +670,15 @@ void NetDevice::DrainRxQueueAndDispatch()
         }
 done:
         frame->Put();
+    }
+
+    /* The batch is dispatched: a listener that answers from here hands over
+       its replies now, together. Still inside the in-flight count, so an
+       unlisten waiting on it knows they have gone. */
+    for (ulong li = 0; li < listenerCount; li++)
+    {
+        if (listeners[li].BatchEndCb)
+            listeners[li].BatchEndCb(listeners[li].Ctx);
     }
 
     if (listenerCount != 0)

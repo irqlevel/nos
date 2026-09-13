@@ -85,6 +85,12 @@ public:
        receive path of the zero-copy block server (the netblk module). */
     typedef void (*RxFrameCallback)(void* ctx, NetFrame* frame);
 
+    /* Called once a receive batch has been dispatched, for every frame
+       listener that registered one: where a listener that answers from the
+       receive path hands the batch's replies to the NIC together -- one
+       SubmitTxBatch, one lock, one doorbell -- rather than one each. */
+    typedef void (*RxBatchEndCallback)(void* ctx);
+
     bool RegisterUdpListener(u16 port, RxCallback cb, void* ctx);
 
     /* Unlike RegisterUdpListener, never takes a port over from whoever has
@@ -94,7 +100,8 @@ public:
     static const int UdpListenPortTaken = 1;
     static const int UdpListenTableFull = 2;
     static const int UdpListenInvalid = 3;
-    int ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx);
+    int ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx,
+                        RxBatchEndCallback batchEnd = nullptr);
 
     /* Each takes away only its own kind of listener -- and a frame listener
        only the one registered with this ctx: DHCP takes port 68 for an
@@ -121,6 +128,7 @@ public:
         u16 Port;
         RxCallback Cb;
         RxFrameCallback FrameCb;    /* instead of Cb: ListenUdpFrames */
+        RxBatchEndCallback BatchEndCb;  /* ListenUdpFrames' optional one */
         void* Ctx;
     };
 

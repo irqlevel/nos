@@ -59,28 +59,24 @@ void NetLoad::Totals(ulong& rxPackets, ulong& rxBytes, ulong& txPackets, ulong& 
     }
 }
 
-void NetLoad::OnFrame(const u8* frame, ulong len)
+void NetLoad::OnFrame(NetFrame* frame)
 {
     using namespace Net;
+
+    u8* data = frame->Data;
+    ulong len = frame->Length;
 
     if (len < sizeof(EthHdr) + sizeof(IpHdr) + sizeof(UdpHdr))
         return;
 
-    const IpHdr* ip = (const IpHdr*)(frame + sizeof(EthHdr));
+    IpHdr* ip = (IpHdr*)(data + sizeof(EthHdr));
 
     /* Honor IHL, so IP options shift the UDP offset. */
     ulong ipHdrLen = IpHeaderLen(ip);
-    if (ipHdrLen == 0)
+    if (ipHdrLen == 0 || len < sizeof(EthHdr) + ipHdrLen + sizeof(UdpHdr))
         return;
 
-    ulong hdrLen = sizeof(EthHdr) + ipHdrLen + sizeof(UdpHdr);
-    if (len < hdrLen)
-        return;
-
-    const UdpHdr* udp = (const UdpHdr*)(frame + sizeof(EthHdr) + ipHdrLen);
-
-    const u8* payload = frame + hdrLen;
-    ulong payloadLen = len - hdrLen;
+    UdpHdr* udp = (UdpHdr*)(data + sizeof(EthHdr) + ipHdrLen);
 
     ulong index = Hal::GetCurrentCpuHwId();
     if (index >= MaxCpus)
@@ -93,17 +89,8 @@ void NetLoad::OnFrame(const u8* frame, ulong len)
     if (!Echo)
         return;
 
-    (void)payload;
-    (void)payloadLen;
-
-    if (len > MaxFrameLen)
-    {
-        cpu.TxFailed++;
-        return;
-    }
-
-    /* The reply is the frame that arrived, with its addresses swapped -- the
-       way Icmp answers a ping, and for the same reason.
+    /* The reply is the frame that arrived, its addresses swapped where they
+       lie -- no copy and no allocation, the way netblk answers a write.
 
        NetDevice::SendUdp must never be called from here. It resolves the
        destination through ArpTable::Resolve, which on a cache miss sends a
@@ -112,46 +99,69 @@ void NetLoad::OnFrame(const u8* frame, ulong len)
        the machine would otherwise process, including the ICMP it needs to
        answer a ping and the datagrams carrying the shell. ARP entries expire
        after five minutes, so that miss is not a rare case -- it is one every
-       load test long enough to be interesting.
+       load test long enough to be interesting. */
+    EthHdr* eth = (EthHdr*)data;
+    Stdlib::MemCpy(eth->DstMac, eth->SrcMac, 6);
+    Dev->GetMac().CopyTo(eth->SrcMac);
 
-       Swapping also costs less: SendUdp clears and rebuilds a 1514-byte
-       frame per packet, where everything needed is already here. */
-    u8 reply[MaxFrameLen];
-    Stdlib::MemCpy(reply, frame, len);
+    auto srcAddr = ip->SrcAddr;
+    ip->SrcAddr = ip->DstAddr;
+    ip->DstAddr = srcAddr;
+    ip->Ttl = 64;
+    ip->Checksum = 0;
+    ip->Checksum = Htons(IpChecksum(ip, ipHdrLen));
 
-    EthHdr* rEth = (EthHdr*)reply;
-    Stdlib::MemCpy(rEth->DstMac, ((const EthHdr*)frame)->SrcMac, 6);
-    Dev->GetMac().CopyTo(rEth->SrcMac);
-
-    IpHdr* rIp = (IpHdr*)(reply + sizeof(EthHdr));
-    rIp->SrcAddr = ip->DstAddr;
-    rIp->DstAddr = ip->SrcAddr;
-    rIp->Ttl = 64;
-    rIp->Checksum = 0;
-    rIp->Checksum = Htons(IpChecksum(rIp, ipHdrLen));
-
-    UdpHdr* rUdp = (UdpHdr*)(reply + sizeof(EthHdr) + ipHdrLen);
-    rUdp->SrcPort = udp->DstPort;
-    rUdp->DstPort = udp->SrcPort;
+    auto srcPort = udp->SrcPort;
+    udp->SrcPort = udp->DstPort;
+    udp->DstPort = srcPort;
 
     /* Zero means "not computed", which IPv4 allows and which is what this
        saves a pass over the payload for. */
-    rUdp->Checksum = 0;
+    udp->Checksum = 0;
 
-    if (Dev->SendRaw(reply, len))
-        cpu.TxPackets++;
-    else
-        cpu.TxFailed++;
+    /* Kept past this callback -- the dispatcher's Put is then not the last
+       one -- and sent with the rest of the batch when it ends (BatchEndFn),
+       or now, if the batch has filled what is kept. */
+    frame->Get();
+    Pending[PendingCount++] = frame;
+    if (PendingCount == MaxPending)
+        FlushReplies();
 }
 
-void NetLoad::RxCallbackFn(const u8* frame, ulong len, void* ctx)
+/* The batch's replies to the NIC in one SubmitTxBatch: one TxQueueLock and
+   one doorbell for the lot. Each echo used to take both on its own, and
+   under a flood the lock's release, just after the doorbell, was where a
+   profile found the receive CPU spending most. */
+void NetLoad::FlushReplies()
+{
+    if (PendingCount == 0)
+        return;
+
+    ulong queued = Dev->SubmitTxBatch(Pending, PendingCount);
+
+    ulong index = Hal::GetCurrentCpuHwId();
+    if (index >= MaxCpus)
+        index = 0;
+
+    /* SubmitTxBatch takes every frame: what found no room it releases */
+    Cpu_[index].TxPackets += queued;
+    Cpu_[index].TxFailed += PendingCount - queued;
+    PendingCount = 0;
+}
+
+void NetLoad::FrameCallbackFn(void* ctx, NetFrame* frame)
 {
     NetLoad* self = static_cast<NetLoad*>(ctx);
 
     if (!self->Running)
         return;
 
-    self->OnFrame(frame, len);
+    self->OnFrame(frame);
+}
+
+void NetLoad::BatchEndFn(void* ctx)
+{
+    static_cast<NetLoad*>(ctx)->FlushReplies();
 }
 
 void NetLoad::Run()
@@ -231,12 +241,17 @@ bool NetLoad::Start(NetDevice* dev, u16 port, bool echo)
         return false;
     }
 
+    PendingCount = 0;
+
     /* Listener slots are few, and DHCP, DNS and the shell have taken theirs
        already: a full table is a real outcome and has to be reported, not
-       left as a server that is running and never dispatched to. */
-    if (!Dev->RegisterUdpListener(Port, RxCallbackFn, this))
+       left as a server that is running and never dispatched to -- and so is
+       a port someone else has, which a frame listener is refused. */
+    int err = Dev->ListenUdpFrames(Port, FrameCallbackFn, this, BatchEndFn);
+    if (err != NetDevice::UdpListenOk)
     {
-        Trace(0, "NetLoad: no free UDP listener slot for port %u", (ulong)Port);
+        Trace(0, "NetLoad: cannot listen on UDP port %u: %s", (ulong)Port,
+            (err == NetDevice::UdpListenPortTaken) ? "taken" : "no free listener slot");
         TaskPtr->SetStopping();
         TaskPtr->Wait();
         TaskPtr->Put();
@@ -260,7 +275,12 @@ void NetLoad::Stop()
        and the flag keeps a later one from starting. */
     Running = false;
 
-    Dev->UnregisterUdpListener(Port);
+    /* Returns once no callback of the device's listeners is running -- a
+       batch's end included, which hands over what that batch built -- so
+       nothing should be left kept here; were anything, it goes out rather
+       than leaking. */
+    Dev->UnlistenUdpFrames(Port, this);
+    FlushReplies();
 
     TaskPtr->SetStopping();
     TaskPtr->Wait();
