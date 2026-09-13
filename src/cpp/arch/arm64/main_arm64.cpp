@@ -334,6 +334,12 @@ static void BpStartupArm(void* ctx)
                superblock, and a block request completes through BLK_IO */
             Vfs::GetInstance().UnmountAll();
 
+            /* Then the soft IRQ tasks themselves, as on x86. Left running
+               into the halt they were never released -- SoftIrq's own
+               reference outlived it -- and one per CPU leaked on every
+               poweroff. */
+            SoftIrq::GetInstance().Stop();
+
             PrepareHaltArm(reboot ? Hal::Reset : Hal::PowerOff);
         }
     }
