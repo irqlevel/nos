@@ -165,6 +165,7 @@ bool UdpShell::Start(NetDevice* dev, u16 port)
     {
         Trace(0, "UdpShell: no free UDP listener slot for port %u", (ulong)Port);
         TaskPtr->SetStopping();
+        RxEvent.Signal();
         TaskPtr->Wait();
         TaskPtr->Put();
         TaskPtr = nullptr;
@@ -188,6 +189,7 @@ void UdpShell::Stop()
     if (TaskPtr)
     {
         TaskPtr->SetStopping();
+        RxEvent.Signal();
         TaskPtr->Wait();
         TaskPtr->Put();
         TaskPtr = nullptr;
@@ -222,7 +224,7 @@ void UdpShell::Run()
 
         if (!ready)
         {
-            Sleep(10 * Const::NanoSecsInMs);
+            RxEvent.Wait();
             continue;
         }
 
@@ -377,6 +379,10 @@ void UdpShell::RxCallbackFn(const u8* frame, ulong len, void* ctx)
     shell->SenderIp = Net::IpAddress::FromNetwork(ip->SrcAddr);
     shell->SenderPort = Ntohs(udp->SrcPort);
     shell->RxBufReady = true;
+
+    /* The task is waiting for this -- or, busy with the last command, finds
+       the signal when it next waits and goes round again */
+    shell->RxEvent.Signal();
 }
 
 }
