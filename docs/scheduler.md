@@ -164,8 +164,11 @@ lost every answer that way; it clears it before the send now
 
 `top` prints how many reschedules were deferred since boot and how many of
 those landed on an idle task. Under netblk's load in QEMU (virtio-net, 12
-vCPUs), 20 seconds of it put more than a thousand on idle tasks -- before,
-each one a CPU asleep on work until its next tick or IPI.
+vCPUs), 20 seconds of it put more than a thousand on idle tasks, and on the
+AX41 some 200 a second land there -- before, each one a CPU asleep on work
+until its next tick or IPI. Made instead of dropped, they took the AX41's
+receive path from 397 silences in 5 seconds to none (see
+[netblk](netblk.md#the-receive-path-lost-ticks-too) for the rest).
 
 `Sleep(ns)` is worth knowing about: it *spins* on `GetBootTime()` calling
 `Schedule()`, it does not block. It yields the CPU but keeps the task
