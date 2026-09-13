@@ -238,6 +238,9 @@ impl Drop for RxRing {
 pub struct TxRing {
     pub dma: DmaBuffer,
     frames: Vec<usize>,
+    /// The slots that asked the chip for a write-back (RS). Not every one
+    /// does: see `submit` and `report_last`.
+    rs: Vec<bool>,
     next_to_use: usize,
     next_to_clean: usize,
 }
@@ -248,6 +251,7 @@ impl TxRing {
         Self {
             dma,
             frames: vec![0usize; RING_SIZE],
+            rs: vec![false; RING_SIZE],
             next_to_use: 0,
             next_to_clean: 0,
         }
@@ -262,9 +266,10 @@ impl TxRing {
         (self.next_to_use + 1) % RING_SIZE != self.next_to_clean
     }
 
-    /// Place a frame in the next slot. Does not ring the doorbell; the caller
-    /// submits a run and writes TDT once.
-    pub fn submit(&mut self, frame: NetFrame) -> bool {
+    /// Place a frame in the next slot, asking the chip to report it done when
+    /// `rs`. Does not ring the doorbell: the caller submits a run, marks its
+    /// last descriptor with `report_last` and writes TDT once.
+    pub fn submit(&mut self, frame: NetFrame, rs: bool) -> bool {
         if !self.can_submit() {
             return false;
         }
@@ -274,22 +279,28 @@ impl TxRing {
         let len = frame.len();
         let handle = frame.into_raw();
 
+        /* RS asks for the write-back this driver reaps on -- not on every
+         * descriptor: each is a descriptor write the chip makes and, with
+         * TXDW enabled, an interrupt, and under a flood of echoes, one a
+         * packet was a tenth of the receive CPU in the interrupt handler's
+         * register reads alone. */
+        let rs_bit = if rs { TXD_DCMD_RS } else { 0 };
+
         let d = self.desc_ptr(idx);
         unsafe {
             write_volatile(addr_of_mut!((*d).d0), phys as u32);
             write_volatile(addr_of_mut!((*d).d1), (phys >> 32) as u32);
 
             /* Every frame is a whole packet in one buffer, so every descriptor
-             * is EOP. RS asks for the write-back this driver reaps on, IFCS
-             * has the chip append the CRC, DEXT selects the advanced layout
-             * these offsets describe. */
+             * is EOP. IFCS has the chip append the CRC, DEXT selects the
+             * advanced layout these offsets describe. */
             write_volatile(
                 addr_of_mut!((*d).d2),
                 (len as u32 & 0xFFFF)
                     | TXD_DTYP_DATA
                     | TXD_DCMD_EOP
                     | TXD_DCMD_IFCS
-                    | TXD_DCMD_RS
+                    | rs_bit
                     | TXD_DCMD_DEXT,
             );
 
@@ -300,8 +311,30 @@ impl TxRing {
         }
 
         self.frames[idx] = handle;
+        self.rs[idx] = rs;
         self.next_to_use = (idx + 1) % RING_SIZE;
         true
+    }
+
+    /// Ask for a write-back on the descriptor submitted last, if it did not
+    /// already. Before the doorbell that hands it over, while the chip cannot
+    /// be reading it.
+    pub fn report_last(&mut self) {
+        if self.next_to_use == self.next_to_clean {
+            return;
+        }
+
+        let idx = (self.next_to_use + RING_SIZE - 1) % RING_SIZE;
+        if self.rs[idx] {
+            return;
+        }
+
+        let d = self.desc_ptr(idx);
+        unsafe {
+            let d2 = read_volatile(addr_of!((*d).d2));
+            write_volatile(addr_of_mut!((*d).d2), d2 | TXD_DCMD_RS);
+        }
+        self.rs[idx] = true;
     }
 
     pub fn tail(&self) -> u32 {
@@ -309,34 +342,49 @@ impl TxRing {
     }
 
     /// Give back every frame the chip has finished with. Called at the head of
-    /// flush_tx, never from the ISR.
+    /// flush_tx, never from the ISR. Only a descriptor that asked for a
+    /// write-back gets one, and the chip works through the ring in order: the
+    /// next such descriptor done means everything up to it is.
     pub fn reap_completed(&mut self, net: NetDeviceHandle) -> usize {
         let mut reaped = 0;
 
         while self.next_to_clean != self.next_to_use {
-            let idx = self.next_to_clean;
-            let h = self.frames[idx];
-            if h == 0 {
-                /* Nothing here to give back, but the slot is still behind the
-                 * use pointer: step over it rather than stalling the reap. */
-                self.next_to_clean = (idx + 1) % RING_SIZE;
-                continue;
+            let mut watch = self.next_to_clean;
+            while watch != self.next_to_use && !self.rs[watch] {
+                watch = (watch + 1) % RING_SIZE;
             }
 
-            let status = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).d3)) };
+            /* Every run ends with a descriptor that reports (report_last), so
+             * one is always ahead of whatever is unreaped. */
+            if watch == self.next_to_use {
+                break;
+            }
+
+            let status = unsafe { read_volatile(addr_of!((*self.desc_ptr(watch)).d3)) };
             if status & TXD_STAT_DD == 0 {
                 break;
             }
 
             kcore::barrier::dma_rmb();
 
-            self.frames[idx] = 0;
-            self.next_to_clean = (idx + 1) % RING_SIZE;
+            loop {
+                let idx = self.next_to_clean;
+                let h = self.frames[idx];
+                self.frames[idx] = 0;
+                self.rs[idx] = false;
+                self.next_to_clean = (idx + 1) % RING_SIZE;
 
-            /* Back to the pool through the net layer, which is what keeps the
-             * frame off any allocator on this path. */
-            net.tx_done(unsafe { NetFrame::from_raw(h) });
-            reaped += 1;
+                /* Back to the pool through the net layer, which is what keeps
+                 * the frame off any allocator on this path. */
+                if h != 0 {
+                    net.tx_done(unsafe { NetFrame::from_raw(h) });
+                    reaped += 1;
+                }
+
+                if idx == watch {
+                    break;
+                }
+            }
         }
 
         reaped

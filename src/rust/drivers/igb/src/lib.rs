@@ -1378,6 +1378,12 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
 /* ================================================================== */
 /* Transmit: called by the C++ net stack under TxQueueLock */
 
+/* A write-back asked for every this many descriptors of a run, besides the
+ * run's last one: often enough that a long run gives its frames back while
+ * it is still going out, rarely enough that a run of echoes costs the chip
+ * one descriptor write and the CPU one TXDW interrupt, not one a packet. */
+const TX_RS_EVERY: u32 = 32;
+
 extern "C" fn igb_flush_tx(ctx: *mut u8) {
     let dev = ctx as *mut IgbDevice;
     if dev.is_null() {
@@ -1397,13 +1403,18 @@ extern "C" fn igb_flush_tx(ctx: *mut u8) {
                 Some(f) => f,
             };
 
-            if !(*dev).tx_ring.submit(frame) {
+            let rs = (submitted + 1) % TX_RS_EVERY == 0;
+            if !(*dev).tx_ring.submit(frame, rs) {
                 break;
             }
             submitted += 1;
         }
 
         if submitted != 0 {
+            /* Only a descriptor that reports lets the ones before it be
+             * reaped, so every run ends with one. */
+            (*dev).tx_ring.report_last();
+
             (*dev).tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
 
             /* Descriptors visible before the doorbell that points past them. */
