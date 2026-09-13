@@ -2831,9 +2831,44 @@ static bool TestEvent()
     return ok;
 }
 
+/* A reschedule that finds preemption off is deferred, not dropped: made by
+   the unlock that brings the count back to zero. Preempt() under a spinlock
+   stands in for the IPI that used to be lost that way -- refused, it leaves
+   PreemptPending up and is counted; the unlock makes it, which clears the
+   flag whether or not another task was there to take the CPU. After
+   TestSpinLockPreempt, in the same task context with interrupts and
+   preemption on. */
+static bool TestPreemptDeferred()
+{
+    Task* task = Task::GetCurrentTask();
+    long deferred = GetPreemptDeferredCount();
+
+    SpinLock lock;
+    bool pendingUnder;
+    {
+        Stdlib::AutoLock guard(lock);
+        Preempt();
+        pendingUnder = (task->PreemptPending.Get() != 0);
+    }
+    bool pendingAfter = (task->PreemptPending.Get() != 0);
+    bool counted = (GetPreemptDeferredCount() > deferred);
+
+    if (!pendingUnder || pendingAfter || !counted)
+    {
+        Trace(0, "TestPreemptDeferred: pending under the lock %u, after the unlock %u, counted %u",
+            (ulong)pendingUnder, (ulong)pendingAfter, (ulong)counted);
+        return false;
+    }
+
+    return true;
+}
+
 bool TestMultiTasking()
 {
     if (!TestSpinLockPreempt())
+        return false;
+
+    if (!TestPreemptDeferred())
         return false;
 
     if (!TestEvent())

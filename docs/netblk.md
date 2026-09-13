@@ -340,12 +340,12 @@ The server's own service time over all of those, 1.2 million requests: p50
 At a window of 1 the worker is asleep by the time each request arrives, and
 waking it -- an IPI to a CPU that has halted, which under a hypervisor means a
 vCPU to wake -- is most of what the request costs: its service time is p50
-56 µs, and 24 µs with `poll=1000`. The client's p99 there changes from one run
-to the next, anywhere from 0.2 to 9 ms, while the server's stays under 400 µs:
-the tail lies outside the server -- the kernel's own UDP echo (`netload`,
-answered from the receive softirq, netblk not involved) shows it too, p99.9
-9.9 ms -- and goes away when polling keeps the CPUs from halting. (When the
-worker yielded instead of polling, the tail was the server's own: its CPU
+56 µs, and 24 µs with `poll=1000`. The client's p99 there used to change
+from one run to the next, anywhere from 0.2 to 9 ms, while the server's
+stayed under 400 µs: the tail lay outside netblk -- the kernel's own UDP echo
+(`netload`, answered from the receive softirq, netblk not involved) showed it
+too, p99.9 9.9 ms. It was the scheduler's, in the receive path
+([below](#the-receive-path-lost-ticks-too)). (When the worker yielded instead of polling, the tail was the server's own: its CPU
 halted while the disk worked, and a window of 1 ran at 1 700 IOPS, p99
 9.4 ms.)
 
@@ -372,6 +372,32 @@ the same way). One run of each, 5 seconds, before and after:
 The synchronous path still pays the tick on every command: `blkload nvme0
 randread qd=1` measures 10 ms, because `WaitGroup` waits by yielding, its CPU
 halts in the idle task, and on that board nothing but the tick wakes it.
+
+### The receive path lost ticks too
+
+That left a tail the server's service time cannot see. On the AX41, with the
+fix above, a window of 16 or 64 still had a client p99 of 10 ms while the
+server answered every request within half a millisecond. A capture on the
+client's NIC showed the replies stopping for 2 to 10 ms some 80 times a
+second with 63 requests outstanding, nearly every silence ending on the same
+10 ms grid -- one CPU's tick -- and pings stalling with them, answered from the
+receive softirq with netblk not involved. At the end of a silence the pong
+for a ping sent in the middle of it left first, and netblk's replies a disk
+round trip later: the requests had been sitting in the NIC's receive ring.
+The reschedule that was to run the receive softirq had been dropped, because
+it landed on the idle task inside a spinlock, and the idle task halted (see
+[Scheduler](scheduler.md#a-reschedule-that-finds-preemption-off)). It is
+deferred now rather than dropped. Under QEMU/KVM with virtio-net and 12
+vCPUs, where it showed as plainly -- 5 seconds each, the last row from a
+capture of a fourth run at window 64:
+
+| QEMU/KVM, virtio-net, 12 vCPUs, random 1 KiB reads | before | after |
+|---|---|---|
+| window 1 | 10 700 IOPS, p99 0.36 ms, max 10.6 ms | 19 800 IOPS, p99 0.07 ms, max 1.4 ms |
+| window 16 | 33 000 IOPS, p99 8.4 ms | 96 000 IOPS, p99 0.3 ms |
+| window 64 | 89 700 IOPS, p99 6.3 ms, p99.9 10.2 ms | 105 600 IOPS, p99 1.2 ms, p99.9 1.5 ms |
+| requests over 5 ms, all four runs | 14 864 of 1.1 million | 0 of 1.6 million |
+| reply gaps over 2 ms with requests outstanding | 110, 103 of them on one 10 ms grid | 1 |
 
 ## Limits
 

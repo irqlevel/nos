@@ -78,7 +78,9 @@ void Schedule();
    task it displaced, runnable rather than blocked, gets no IPI from whoever
    has work for it -- it waited for the next tick. On the AX41 that took
    netblk's polling worker off its CPU some 25 times a second, a tick each:
-   a quarter of the CPU, and a p99 of 10 ms. */
+   a quarter of the CPU, and a p99 of 10 ms. A task with preemption off keeps
+   the CPU, and the reschedule is made when its PreemptEnable() brings the
+   count back to zero -- deferred, not dropped (see ScheduleCurrent). */
 void Preempt();
 
 /* Gives the CPU to another task runnable on it, if there is one, and returns
@@ -93,5 +95,10 @@ void Sleep(ulong nanoSecs);
 
 /* Tasks moved between CPU queues since boot. */
 long GetTaskMigrationCount();
+
+/* Reschedules since boot that found preemption off on the task they landed
+   on, and how many of those landed on an idle task (see ScheduleCurrent). */
+long GetPreemptDeferredCount();
+long GetPreemptDeferredIdleCount();
 
 }

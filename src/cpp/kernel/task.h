@@ -140,6 +140,11 @@ public:
     TaskQueue* TaskQueue;
     SpinLock Lock;
     Atomic PreemptDisableCounter;
+    /* A reschedule that came while PreemptDisableCounter was up: the tick's,
+       or the one an IPI asks for on behalf of a task just woken. The task
+       keeps the CPU, as it must, and the reschedule is made the moment the
+       count is back to zero (PreemptEnable), where it used to be dropped. */
+    Atomic PreemptPending;
     Atomic ContextSwitches;
     ulong Rsp;
 

@@ -1,5 +1,6 @@
 #include "preempt.h"
 #include "task.h"
+#include "sched.h"
 #include "panic.h"
 #include <hal/cpu.h>
 #include "debug.h"
@@ -50,6 +51,25 @@ void PreemptDisable()
     }
 }
 
+/* The count has just dropped to zero: a reschedule that came while it was up
+   is made now. Only with interrupts on -- off, this is an interrupt handler
+   or a section its caller keeps closed, and the reschedule waits for the next
+   PreemptEnable, the handler's own Preempt() or the tick. Only for the task
+   that is running: a lock can be released on another's behalf, as
+   SwitchComplete releases the ones Schedule() took in the task it switched
+   away from. And not once a panic has begun, which no tick preempts either. */
+static void PreemptRunPending(Task* task)
+{
+    if (likely(task->PreemptPending.Get() == 0))
+        return;
+
+    if (!Hal::IsInterruptEnabled() || task != Task::TryGetCurrentTask() ||
+        Panicker::GetInstance().IsActive())
+        return;
+
+    Preempt();
+}
+
 void PreemptEnable()
 {
     if (likely(PreemptIsOn()))
@@ -57,7 +77,8 @@ void PreemptEnable()
         auto task = Task::GetCurrentTask();
         BugOn(!task);
         BugOn(!task->PreemptDisableCounter.Get());
-        task->PreemptDisableCounter.Dec();
+        if (task->PreemptDisableCounter.DecAndTest())
+            PreemptRunPending(task);
     }
 }
 
@@ -81,7 +102,8 @@ void PreemptEnableTask(Task* task)
         return;
 
     BugOn(task->PreemptDisableCounter.Get() == 0);
-    task->PreemptDisableCounter.Dec();
+    if (task->PreemptDisableCounter.DecAndTest())
+        PreemptRunPending(task);
 }
 
 bool PreemptCanBlock()
