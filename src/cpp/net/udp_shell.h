@@ -7,6 +7,7 @@
 #include <net/net.h>
 #include <kernel/spin_lock.h>
 #include <kernel/task.h>
+#include <kernel/event.h>
 
 namespace Kernel
 {
@@ -86,6 +87,14 @@ private:
     ulong RxBufLen;
     bool RxBufReady;
     SpinLock RxLock;
+
+    /* Signalled by the receive callback once a command is in, and by Stop:
+       the task sleeps on it between commands. It used to look every 10 ms
+       with Sleep(), which yields rather than blocks, so the task was always
+       runnable -- under a flood it took a fifth of the CPU the NIC's receive
+       softirq runs on, and each time that softirq went to sleep the CPU went
+       through the shell on its way to the idle task. */
+    Event RxEvent;
 
     /* Sender info for reply */
     Net::MacAddress SenderMac;
