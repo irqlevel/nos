@@ -138,7 +138,8 @@ What differs on the hardware drivers:
   raises the transmit softirq on a transmit completion.
 - The link is a ceiling: at 1 KiB a datagram, 1 GbE (I210, r8168) carries some
   110 000 replies a second, about 108 MiB/s of reads; 2.5 GbE (r8125) some
-  270 000.
+  270 000. The AX41's I210 reaches it: 111 000 random 1 KiB reads a second,
+  108.5 MiB/s, and as many writes ([numbers](#the-receive-path-lost-ticks-too)).
 
 On a machine on the internet -- the Hetzner ones -- the port is open to
 whoever can reach it, with no authentication, as with the UDP shell. Serve a
@@ -345,9 +346,9 @@ from one run to the next, anywhere from 0.2 to 9 ms, while the server's
 stayed under 400 µs: the tail lay outside netblk -- the kernel's own UDP echo
 (`netload`, answered from the receive softirq, netblk not involved) showed it
 too, p99.9 9.9 ms. It was the scheduler's, in the receive path
-([below](#the-receive-path-lost-ticks-too)). (When the worker yielded instead of polling, the tail was the server's own: its CPU
-halted while the disk worked, and a window of 1 ran at 1 700 IOPS, p99
-9.4 ms.)
+([below](#the-receive-path-lost-ticks-too)). (When the worker yielded
+instead of polling, the tail was the server's own: its CPU halted while the
+disk worked, and a window of 1 ran at 1 700 IOPS, p99 9.4 ms.)
 
 On arm64 the test runs under TCG, and there the worker used to lose a whole
 tick now and then -- the server's p99 was 10.7 ms -- which x86 under KVM does
@@ -398,6 +399,31 @@ capture of a fourth run at window 64:
 | window 64 | 89 700 IOPS, p99 6.3 ms, p99.9 10.2 ms | 105 600 IOPS, p99 1.2 ms, p99.9 1.5 ms |
 | requests over 5 ms, all four runs | 14 864 of 1.1 million | 0 of 1.6 million |
 | reply gaps over 2 ms with requests outstanding | 110, 103 of them on one 10 ms grid | 1 |
+
+And on the AX41 itself, the same tests before and after the fix, a few hours
+apart: a `scripts/netblk.py` client on another machine in the same data
+centre (0.3 ms away), a partition of one of the NVMe disks served on the
+I210, the benchmarks against a read-only instance with no `poll`, the
+capture against one with `poll=100000`, 5 seconds each:
+
+| AX41, I210, random 1 KiB unless said | before | after |
+|---|---|---|
+| reads, window 1 | 2 900 IOPS, p99 0.51 ms | 3 000 IOPS, p99 0.43 ms |
+| reads, window 16 | 33 400 IOPS, p99 7.4 ms | 52 200 IOPS, p99 0.39 ms |
+| reads, window 64 | 39 100 IOPS, p99 9.8 ms | 111 100 IOPS, 108.5 MiB/s, p99 0.65 ms |
+| 16 KiB reads, window 16 | 100.7 MiB/s, p99 9.2 ms | 109.0 MiB/s, p99 2.6 ms |
+| writes, window 64 | 25 400 IOPS, p99 9.9 ms | 110 500 IOPS, 107.9 MiB/s, p99 0.95 ms |
+| the server's service time, p99 / p99.9 | 0.37 / 7.2 ms | 0.12 / 0.47 ms |
+| window 64 at the client's NIC: round trips over 2 ms | 12.7% | none |
+| reply gaps over 2 ms with requests outstanding | 397 | none |
+| pings during that load, p99 | 8.0 ms | 0.58 ms |
+
+The window-64 rate that had looked like the Python client's limit, and the
+write rate that had looked like the disk's, were this stall: without it both
+run at the link's 110 000 a second. A write with FUA (4.3 ms) and a flush
+(1.4 ms) are the disk's own, and did not move. Four clients at once for 30
+seconds -- two reading, two writing and verifying what they wrote -- got 1.8
+million requests through, where before they got 0.9 million.
 
 ## Limits
 
