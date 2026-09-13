@@ -83,6 +83,7 @@ private:
 
     bool DoDiscover();
     bool DoRequest(bool renewing = false);
+    void ArmResponse();
     bool WaitForResponse(u8 expectedType, ulong timeoutMs);
 
     ulong BuildDiscover(u8* frame, ulong maxLen);

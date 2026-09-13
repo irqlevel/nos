@@ -185,6 +185,23 @@ void DhcpClient::Run()
     }
 }
 
+/* Forget any earlier answer before a request goes out -- never after it: the
+   answer can be back before SendRaw returns. The receive softirq may run on
+   this CPU on the way out of the transmit path, when a reschedule asked for
+   while the transmit lock was held is made at its unlock; QEMU's igb
+   transmits within the doorbell's write and slirp answers at once, so there
+   the answer is always in by then, and a flag cleared after the send threw
+   every one of them away. */
+void DhcpClient::ArmResponse()
+{
+    {
+        Stdlib::AutoLock lock(RxLock);
+        RxBufReady = false;
+    }
+
+    NakReceived = false;
+}
+
 bool DhcpClient::DoDiscover()
 {
     u8 frame[600];
@@ -192,6 +209,7 @@ bool DhcpClient::DoDiscover()
     if (len == 0)
         return false;
 
+    ArmResponse();
     Dev->SendRaw(frame, len);
 
     /* Wait for OFFER */
@@ -208,6 +226,7 @@ bool DhcpClient::DoRequest(bool renewing)
     if (len == 0)
         return false;
 
+    ArmResponse();
     Dev->SendRaw(frame, len);
 
     /* Wait for ACK */
@@ -217,15 +236,9 @@ bool DhcpClient::DoRequest(bool renewing)
     return true;
 }
 
+/* Waits for the answer ArmResponse() cleared the way for */
 bool DhcpClient::WaitForResponse(u8 expectedType, ulong timeoutMs)
 {
-    {
-        Stdlib::AutoLock lock(RxLock);
-        RxBufReady = false;
-    }
-
-    NakReceived = false;
-
     ulong deadline = timeoutMs;
     while (deadline > 0)
     {
