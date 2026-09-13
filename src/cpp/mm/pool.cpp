@@ -35,15 +35,18 @@ Pool::~Pool()
         Trace(0, "0x%p block 0x%p tag 0x%p", this, block, block->Tag);
     }
 
-    while (!FreePageList.IsEmpty())
-    {
-        PgAlloc->Free(FreePageList.RemoveHead());
-    }
-
-    while (!PageList.IsEmpty())
-    {
-        PgAlloc->Free(PageList.RemoveHead());
-    }
+    /* The pages stay mapped. Free() hands a page back the moment its last
+       block goes, so every page still on either list holds a block nobody
+       freed: an object that is still there and still linked into whatever
+       it was linked into. Releasing them here unmapped live objects under
+       everything destroyed after the allocator -- which on x86 is every
+       static constructed before the heap: CpuTable, Serial, Dmesg, the
+       watchdog. The watchdog's buckets are where that bit: a leaked
+       object's lock shares a bucket with a static's lock, and unregistering
+       the static one writes into the leaked one's links -- a page fault in
+       Watchdog::UnregisterSpinLock under Cpu::~Cpu, Serial::~Serial or
+       whichever static drew the neighbouring slot. The leaks are reported
+       above; their memory is not worth anything at halt. */
 }
 
 void Pool::Init(size_t blockSize, class PageAllocator* pgAlloc)
