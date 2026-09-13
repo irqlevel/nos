@@ -691,6 +691,16 @@ ulong CpuTable::GetRunningCpus()
 
 void CpuTable::Reset()
 {
+    /* An exited task's last reference is dropped by its CPU's idle loop
+       (TaskQueue::ReapExited), and once the halt has begun no CPU idles
+       again: the others are parked and this one is on its way out. Dropped
+       here instead, or everything that exited since each CPU last idled
+       leaks -- the soft IRQ tasks among them, stopped moments before the
+       halt. Before the table lock: freeing a task frees its stack, and the
+       TLB shootdown for that reads the running CPUs under this lock. */
+    for (ulong i = 0; i < Stdlib::ArraySize(CpuArray); i++)
+        CpuArray[i].GetTaskQueue().ReapExited();
+
     Stdlib::AutoLock lock(Lock);
 
     for (ulong i = 0; i < Stdlib::ArraySize(CpuArray); i++)
