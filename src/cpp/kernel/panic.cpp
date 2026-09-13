@@ -144,13 +144,24 @@ void Panicker::CollectRemoteStacks()
     Collecting.Set(1);
 
     ulong asked = 0;
+    ulong parked = 0;
     for (ulong i = 0; i < MaxCpus; i++)
     {
-        if ((mask & (1UL << i)) && i != self)
+        if (!(mask & (1UL << i)) || i == self)
+            continue;
+
+        /* Stopped for good in the halt path (Cpu::Park): it has nothing to
+           tell, and the stack it stopped on may be freed by now. Delivering
+           an NMI pushes a frame onto that stack, and the fault that follows
+           would bury this report under one of its own. */
+        if (table.GetCpu(i).IsParked())
         {
-            asked |= (1UL << i);
-            Hal::SendNmiIpi(i);
+            parked |= (1UL << i);
+            continue;
         }
+
+        asked |= (1UL << i);
+        Hal::SendNmiIpi(i);
     }
 
     /* Bounded by iterations, not by the clock: a panic must not depend on a
@@ -176,6 +187,13 @@ void Panicker::CollectRemoteStacks()
     char buf[64];
     for (ulong i = 0; i < MaxCpus; i++)
     {
+        if (parked & (1UL << i))
+        {
+            Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %u parked\n", i);
+            PrintOutput(buf);
+            continue;
+        }
+
         if (!(asked & (1UL << i)))
             continue;
 
