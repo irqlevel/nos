@@ -145,9 +145,9 @@ struct IgbDevice {
     msix: bool,
     /// Whether the queues and the non-queue causes have a vector each. When
     /// they do, the queue interrupt reads no register at all: the hardware
-    /// auto-clears its cause (EIAC) and auto-masks it (EIAME), and only the
-    /// rare other vector reads ICR. When they share one vector, that one
-    /// handler reads EICR and ICR as before.
+    /// auto-clears its cause (EIAC) and auto-masks it (EIAME, with EIAM
+    /// naming it), and only the rare other vector reads ICR. When they share
+    /// one vector, that one handler reads EICR and ICR as before.
     two_vector: bool,
     generation: Generation,
     phy_addr: u32,
@@ -1206,14 +1206,24 @@ fn arm_msix(regs: &io::MmioRegion, two_vector: bool) {
          * matching what Linux's igb does with its ring vectors. The other
          * vector is left out of EIAC: its handler reads ICR, and having the
          * hardware clear causes behind that read is how a driver loses an
-         * event it never saw. GPIE.EIAME auto-masks whichever vector fired,
-         * and the handler (the receive poll, for the queue vector) re-arms
-         * it. */
+         * event it never saw.
+         *
+         * Both vectors are masked as their message goes out, and each handler
+         * (the receive poll, for the queue vector) re-arms its own. That takes
+         * EIAM as well as GPIE.EIAME: EIAME says to mask on delivery, EIAM
+         * says which vectors, and at zero it names none -- the queue vector
+         * then stays armed through the whole poll and fires every throttle
+         * interval for frames the poll is already taking. Nothing is lost
+         * that way, so nothing would ever say so. Linux's igb_irq_enable
+         * writes the two together. */
         regs.write32(EIAC, EICR_VECTOR0);
+        regs.write32(EIAM, EICR_VECTOR0 | EICR_VECTOR1);
     } else {
+        /* One vector: the shared handler reads EICR and masks the receive
+         * side itself, and nothing is cleared or masked behind it. */
         regs.write32(EIAC, 0);
+        regs.write32(EIAM, 0);
     }
-    regs.write32(EIAM, 0);
 
     /* The non-queue causes, enabled in the legacy mask so they reach ICR for
      * the other vector's handler (or the shared handler) to read. */
@@ -1226,17 +1236,30 @@ fn arm_msix(regs: &io::MmioRegion, two_vector: bool) {
 /* ================================================================== */
 /* Interrupt */
 
-/* The queue vector, when the causes are split in two. It reads no register:
- * the hardware cleared the cause (EIAC) and masked the vector (EIAME) before
- * this ran, and the receive poll re-arms it. Transmit shares the vector, so
- * the transmit softirq is raised too -- cheap when nothing is queued, and the
- * datapath reaps transmits from flush_tx on the send side anyway. */
+/* MSI-X entry 0. With the causes split in two it is the queue vector, and it
+ * reads no register: the hardware cleared the cause (EIAC) and masked the
+ * vector (EIAME, on the vectors EIAM names) before this ran, and the receive
+ * poll re-arms it. Transmit shares the vector, so the transmit softirq is
+ * raised too -- cheap when nothing is queued, and the datapath reaps
+ * transmits from flush_tx on the send side anyway.
+ *
+ * With one vector it is the shared handler's job. Entry 0 is registered
+ * before it is known whether entry 1 will be, so this is the handler it gets
+ * either way -- and with one vector nothing clears the cause behind it (EIAC
+ * is 0 there). Returning without igb_isr's read and write-back of EICR would
+ * leave the cause standing and the vector firing for good: the storm
+ * igb_isr's own comment measured on an I210. */
 extern "C" fn igb_isr_queue(ctx: *mut u8) {
     let dev = ctx as *mut IgbDevice;
     if dev.is_null() {
         return;
     }
     unsafe {
+        if !(*dev).two_vector {
+            igb_isr(ctx);
+            return;
+        }
+
         (*dev).isr_queue.fetch_add(1, Ordering::Relaxed);
         softirq::raise(softirq::TYPE_NET_TX);
         softirq::raise(softirq::TYPE_NET_RX);
@@ -1427,9 +1450,16 @@ unsafe fn sample_rate(dev: *mut IgbDevice) -> u32 {
 }
 
 /// Widen the interrupt throttle with the rate: 2 us idle, 20 us at 400k a
-/// second and up. Written only when it changes.
+/// second and up. Written only when it changes -- and only on MSI-X. EITR
+/// throttles MSI-X vectors; on INTx the part holds interrupts apart through
+/// ITR, which this driver leaves alone, and writing EITR there would change
+/// nothing while igbdump reported it as the throttle in force.
 unsafe fn apply_eitr(dev: *mut IgbDevice, pps: u32) {
-    let want = (pps / 20_000).clamp(EITR_MIN_US, EITR_MAX_US);
+    if !(*dev).msix {
+        return;
+    }
+
+    let want = (pps / EITR_PPS_PER_US).clamp(EITR_MIN_US, EITR_MAX_US);
     if want != (*dev).eitr_us.load(Ordering::Relaxed) {
         (*dev)
             .regs
@@ -1673,6 +1703,8 @@ pub struct IgbState {
     pub isr_queue: u64,
     pub isr_other: u64,
     pub rx_linger_hits: u64,
+    /// 1 on MSI-X, 0 on INTx -- where EITR is not the throttle.
+    pub msix: u32,
 }
 
 /// Add a read-clear register's delta to its running total and return it.
@@ -1763,6 +1795,7 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
         (*out).isr_queue = (*raw).isr_queue.load(Ordering::Relaxed);
         (*out).isr_other = (*raw).isr_other.load(Ordering::Relaxed);
         (*out).rx_linger_hits = (*raw).rx_linger_hits.load(Ordering::Relaxed);
+        (*out).msix = if (*raw).msix { 1 } else { 0 };
     }
 
     0

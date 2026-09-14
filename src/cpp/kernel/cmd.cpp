@@ -548,6 +548,7 @@ struct IgbState
     u64 IsrQueue;
     u64 IsrOther;
     u64 RxLingerHits;
+    u32 Msix;
 };
 
 extern "C" int igb_get_state(IgbState* out);
@@ -599,11 +600,12 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
         (ulong)st.Tctl, (ulong)((st.Tctl & TctlEn) ? 1 : 0), (ulong)st.Ims);
     /* Microseconds the chip holds interrupts apart. Firmware leaves a value
        here that a device reset does not clear, and it caps the receive rate
-       on its own. */
-    con.Printf("interrupt throttle %u us, rx rate %u pps\n",
-        (ulong)st.Eitr, (ulong)st.RxRatePps);
+       on its own -- on MSI-X. On INTx the part throttles through ITR, and
+       this register, which the driver then leaves alone, is not in force. */
+    con.Printf("interrupt throttle %u us%s, rx rate %u pps\n",
+        (ulong)st.Eitr, st.Msix ? "" : " (not in force: INTx)", (ulong)st.RxRatePps);
     con.Printf("interrupts: %s, queue %u, other %u; rx lingers that spared one %u\n",
-        st.TwoVector ? "queue + other vector" : "one vector",
+        !st.Msix ? "INTx" : (st.TwoVector ? "queue + other vector" : "one vector"),
         (ulong)st.IsrQueue, (ulong)st.IsrOther, (ulong)st.RxLingerHits);
     /* The prefetch thresholds live in the low fields of RXDCTL. Zero there
        means the chip never prefetches descriptors and drops packets with a
