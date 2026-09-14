@@ -468,16 +468,22 @@ void BpStartup(void* ctx)
         VirtioScsi::InitAll();
         PartitionDevice::ProbeAll();
 
-        rust_init();
-
         /* Before any driver can want a frame: the pool is what keeps the
            datapath clear of the allocator, and of the TLB shootdown that
-           freeing a frame would otherwise cost. */
+           freeing a frame would otherwise cost. That means before rust_init,
+           whose NIC drivers fill their receive rings as they come up. Set up
+           after it, as it was, a ring started out as a thousand frames from
+           Mm::Alloc, and the first burst after boot paid a shootdown for each
+           in the receive softirq until the ring had turned over: on the AX41
+           two seconds at 256 frames a second, the NIC dropping the rest.
+           arm64 has always had this order. */
         ulong netFrames = Parameters::GetInstance().GetNetFrameCount();
         if (netFrames == 0)
             netFrames = NetFramePool::DefaultFrameCount;
 
         NetFramePool::GetInstance().Setup(netFrames);
+
+        rust_init();
 
         VirtioNet::InitAll();
         VirtioRng::InitAll();

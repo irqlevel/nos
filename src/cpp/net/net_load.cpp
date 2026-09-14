@@ -164,6 +164,14 @@ void NetLoad::BatchEndFn(void* ctx)
     static_cast<NetLoad*>(ctx)->FlushReplies();
 }
 
+/* A rate from two samples of a counter. `netload reset` zeroes the counters
+   under the sampler, so one found below its last sample has started again:
+   what it holds is the count since, not a difference to wrap around. */
+static ulong CounterDelta(ulong now, ulong last)
+{
+    return (now >= last) ? (now - last) : now;
+}
+
 void NetLoad::Run()
 {
     ulong lastRxPackets = 0;
@@ -181,9 +189,9 @@ void NetLoad::Run()
         Totals(rxPackets, rxBytes, txPackets, txFailed);
 
         /* One second per sample, so the delta is the rate. */
-        RxPps = rxPackets - lastRxPackets;
-        TxPps = txPackets - lastTxPackets;
-        RxBps = rxBytes - lastRxBytes;
+        RxPps = CounterDelta(rxPackets, lastRxPackets);
+        TxPps = CounterDelta(txPackets, lastTxPackets);
+        RxBps = CounterDelta(rxBytes, lastRxBytes);
 
         /* One line a second, over the netconsole, for as long as the load
            runs. The point is not the numbers: it is that the line keeps
