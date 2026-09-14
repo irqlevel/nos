@@ -59,6 +59,10 @@ pub const EITR_INTERVAL_US: u32 = 2;
 pub const EITR_MIN_US: u32 = 2;
 pub const EITR_MAX_US: u32 = 20;
 
+/* Receive packets a second per microsecond of throttle, so EITR_MAX_US is
+   reached at 20 * 20,000 = 400k packets a second. */
+pub const EITR_PPS_PER_US: u32 = 20_000;
+
 pub const IVAR0: usize = 0x01700; /* queue-to-vector map, 2 queues per reg */
 pub const IVAR_MISC: usize = 0x01740; /* non-queue causes */
 
