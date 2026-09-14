@@ -425,6 +425,16 @@ run at the link's 110 000 a second. A write with FUA (4.3 ms) and a flush
 seconds -- two reading, two writing and verifying what they wrote -- got 1.8
 million requests through, where before they got 0.9 million.
 
+Re-run after the igb interrupt rework -- a queue vector that reads no
+register, a poll that goes round again under load, the frame pool up before
+the NIC ([real hardware](real-hardware.md#hetzner-ax41-1-ltd-dedicated-server))
+-- every number held within a few percent: reads at window 64 110 400 IOPS,
+p99 0.79 ms; writes 110 500, p99 0.92 ms; round trips at the NIC p99 0.69
+ms, none over 2 ms, no reply gaps; pings under the load p99 0.57 ms; four
+clients, 1.8 million requests again. At 110 000 requests a second netblk
+stays below the rate where the poll repolls, and the link is still its
+ceiling.
+
 ## Limits
 
 - One datagram, one I/O: 1 KiB at an MTU of 1500 with 512-byte sectors. No

@@ -97,11 +97,43 @@ only the last of them was the actual fault:
   the PHY's own view — what each side advertised and what negotiation
   resolved to.
 
-Under a 613 k pps flood the I210 delivers about 205 k; the rest is dropped by
-the chip's on-chip descriptor fetch/writeback pipeline (a 16-descriptor
-cache per queue), not by the ring or the driver. `SRRCTL.Drop_En` stays set
-even with a single queue: clearing it moved the drops into the 34 KiB packet
-FIFO and halved delivery.
+**Load.** Hammered with small UDP datagrams (64-byte frames, `netload`, from
+a machine in the same data centre) the I210 now takes everything that
+arrives: an echo at 578–581 k datagrams a second answers every one, a sink
+at 615 k receives every one, and the queue's `dropped-no-descriptor` stays
+at zero. The ceiling is the sender, whose single-queue NIC holds one of its
+CPUs at 60–100% softirq — well short of the 1.49 M a second 1 GbE carries
+at that size. On the nos side it is all one CPU's work, the queue vector's:
+about three quarters of it for the echo, 60% for the sink. (`top` shows the
+receive softirq at 100% under load, since the poll keeps looking at an empty
+ring rather than re-arm the interrupt; `igbdump` says how long it looked,
+and the rest is the work.) Three things stood between the first
+measurements and that, none of them the 82576 model could show:
+
+- The first ceiling — 205 k delivered of 613 k offered, put down at the
+  time to the chip's descriptor pipeline — was the driver. `RXDCTL` holds
+  the descriptor prefetch thresholds besides the enable bit, and writing
+  the bit on its own zeroed them: with `PTHRESH` at zero the chip never
+  fetched, and dropped 443 k packets a second with 255 descriptors free in
+  host memory. The throttle had one of its own: firmware leaves an `EITR`
+  interval that a reset does not clear, which held delivery at 169 k with
+  the CPU 93% idle.
+- Then interrupts cost more than packets. On one MSI-X vector every
+  interrupt read `EICR` and `ICR` to tell a packet from a link change, and
+  under the echo those two reads were a third of the profile. The queue
+  now has a vector of its own whose handler reads nothing — the chip
+  clears and masks its cause (`EIAC`, and `EIAM` under `GPIE.EIAME`) —
+  with link changes and overruns on a second; while the rate is high the
+  poll goes round again through the softirq instead of re-arming, and the
+  throttle widens with the rate. A flood costs one interrupt per thousand
+  to five thousand packets, and the echo a quarter less CPU per packet.
+- The first burst after every boot lost frames — 755 k in two seconds —
+  until the receive ring had turned over once: the rings were filled from
+  `Mm::Alloc` before the frame pool existed, and each of those frames cost
+  a TLB shootdown to free. The pool now comes up first.
+
+`SRRCTL.Drop_En` stays set: a queue out of descriptors drops at the queue,
+where `igbdump` counts it, rather than backing up the packet FIFO.
 
 **Profiler.** `profile` samples on the AMD core performance counters here:
 general counter 0 programmed with PMCx076 ("CPU clocks not halted") through

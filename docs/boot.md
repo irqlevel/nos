@@ -103,9 +103,12 @@ and take mutexes.
   that ACPI maps ISA IRQ 0 to. The 8042 keyboard takes vector 0x21, the
   serial port 0x24.
 - virtio-blk and virtio-scsi come up and their partitions are probed.
+- `NetFramePool::Setup()` (sized by `netframes=`). The pool is built before
+  any driver can want a frame — the Rust NIC drivers too, which fill their
+  receive rings as they come up; built after them, those rings started out
+  as heap frames that each cost a TLB shootdown to free.
 - `rust_init()` brings up the Rust drivers — NVMe, r8168, r8125, igb.
-- `NetFramePool::Setup()` (sized by `netframes=`), then virtio-net and
-  virtio-rng. The pool is built before any driver can want a frame.
+- virtio-net and virtio-rng.
 - The IPI vector (0xFE), the LAPIC timer vector (0xFD) and the LAPIC
   spurious vector (0xFF) get their IDT entries, and interrupts are enabled.
 - `TimeInit()` calibrates the TSC against PIT channel 2 and picks a clock
