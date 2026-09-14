@@ -162,8 +162,10 @@ sending, and over QEMU's igb, which transmits within the doorbell's write,
 lost every answer that way; it clears it before the send now
 (`DhcpClient::ArmResponse`). Arm first, then send.
 
-`top` prints how many reschedules were deferred since boot and how many of
-those landed on an idle task. Under netblk's load in QEMU (virtio-net, 12
+`top` prints how many reschedules were deferred in its window and since
+boot, and how many of those landed on an idle task; the count since boot
+starts at one per CPU, made on purpose on each idle task by the boot
+self-test (`TestPreemptDeferred`). Under netblk's load in QEMU (virtio-net, 12
 vCPUs), 20 seconds of it put more than a thousand on idle tasks, and on the
 AX41 some 200 a second land there -- before, each one a CPU asleep on work
 until its next tick or IPI. Made instead of dropped, they took the AX41's

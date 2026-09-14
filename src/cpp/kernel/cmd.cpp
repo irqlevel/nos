@@ -295,10 +295,14 @@ static void CmdTop(const char* args, Stdlib::Printer& con)
        shade under its true share rather than a shade over 100%. */
     ulong t0 = GetBootTime().GetValue();
     size_t n0 = table.SampleCpu(before, MaxSamples);
+    long deferred0 = GetPreemptDeferredCount();
+    long deferredIdle0 = GetPreemptDeferredIdleCount();
 
     Sleep(intervalMs * Const::NanoSecsInMs);
 
     size_t n1 = table.SampleCpu(after, MaxSamples);
+    long deferred1 = GetPreemptDeferredCount();
+    long deferredIdle1 = GetPreemptDeferredIdleCount();
     ulong elapsed = GetBootTime().GetValue() - t0;
 
     if (elapsed == 0)
@@ -374,8 +378,13 @@ static void CmdTop(const char* args, Stdlib::Printer& con)
     Mm::Free(before);
 
     con.Printf("task migrations since boot: %u\n", (ulong)GetTaskMigrationCount());
-    con.Printf("preemptions deferred since boot: %u, %u of them on an idle task\n",
-        (ulong)GetPreemptDeferredCount(), (ulong)GetPreemptDeferredIdleCount());
+    /* The window's count first: it is what the load being looked at did. The
+       one since boot starts at one per CPU, on its idle task, that the boot
+       self-test makes on purpose (TestPreemptDeferred). */
+    con.Printf("preemptions deferred: %u in the window, %u of them on an idle task; "
+        "%u since boot, %u on an idle task\n",
+        (ulong)(deferred1 - deferred0), (ulong)(deferredIdle1 - deferredIdle0),
+        (ulong)deferred1, (ulong)deferredIdle1);
 }
 
 /* Sampled on the per-CPU tick, so the resolution is the tick rate: enough
@@ -547,7 +556,9 @@ struct IgbState
     u32 RxRatePps;
     u64 IsrQueue;
     u64 IsrOther;
-    u64 RxLingerHits;
+    u64 RxRepollHits;
+    u64 RxRepolls;
+    u64 RxRepollNs;
     u32 Msix;
 };
 
@@ -604,9 +615,17 @@ static void CmdIgbdump(const char* args, Stdlib::Printer& con)
        this register, which the driver then leaves alone, is not in force. */
     con.Printf("interrupt throttle %u us%s, rx rate %u pps\n",
         (ulong)st.Eitr, st.Msix ? "" : " (not in force: INTx)", (ulong)st.RxRatePps);
-    con.Printf("interrupts: %s, queue %u, other %u; rx lingers that spared one %u\n",
+    con.Printf("interrupts: %s, queue %u, other %u\n",
         !st.Msix ? "INTx" : (st.TwoVector ? "queue + other vector" : "one vector"),
-        (ulong)st.IsrQueue, (ulong)st.IsrOther, (ulong)st.RxLingerHits);
+        (ulong)st.IsrQueue, (ulong)st.IsrOther);
+    /* Under load the poll looks at an empty ring again rather than arm the
+       interrupt: how many such passes, how many runs of them a frame ended --
+       an interrupt spared each time -- and how long the ring sat empty
+       through them, which is what they cost. The receive softirq's CPU in
+       `top`, less that, is the work. */
+    con.Printf("rx repolls %u, %u runs ended by a frame, %u us on an empty ring\n",
+        (ulong)st.RxRepolls, (ulong)st.RxRepollHits,
+        (ulong)(st.RxRepollNs / Const::NanoSecsInUsec));
     /* The prefetch thresholds live in the low fields of RXDCTL. Zero there
        means the chip never prefetches descriptors and drops packets with a
        full ring, so they are worth reading back rather than assuming. */

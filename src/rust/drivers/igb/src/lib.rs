@@ -27,9 +27,10 @@
  * vector 1 where the table has room. Splitting them lets the queue interrupt
  * read no register at all -- the hardware clears and masks its cause -- where
  * a shared vector must read ICR on every interrupt to tell a packet from a
- * link change. The receive poll also spins briefly for the next frame when
- * the ring empties under load, and the throttle widens with the rate, so a
- * flood costs far fewer interrupts than one apiece. See arm_msix.
+ * link change. Under load the receive poll also goes round again through
+ * the softirq when the ring runs dry, rather than arm the interrupt, and the
+ * throttle widens with the rate, so a flood costs far fewer interrupts than
+ * one apiece. See arm_msix and REPOLL_NS.
  *
  * Locking:
  *  - tx_ring is touched only by flush_tx, which the C++ TxQueueLock
@@ -123,13 +124,20 @@ const RX_BUDGET: u32 = 64;
 const MAX_POLLS: u32 = 8;
 
 /* When the ring empties but the receive side is running at least this fast,
- * spin for the next frame this long before handing the ring back to the
- * interrupt. At a high rate the next frame is a couple of microseconds away
- * and an arm-interrupt-mask round trip -- and, on the shared vector, its
- * register reads -- costs more than the spin; below the rate it is not worth
- * a microsecond of a CPU, so the ring is handed straight back. */
-const LINGER_MIN_PPS: u32 = 200_000;
-const LINGER_NS: u64 = 20_000;
+ * the poll does not hand it back to the interrupt: it returns with the
+ * receive sources still masked and asks the softirq for another pass, and
+ * goes on doing so until the ring has sat empty this long. At a high rate the
+ * next frame is a couple of microseconds away, and an arm-interrupt-mask
+ * round trip costs more than looking again; below the rate it is not worth a
+ * microsecond of a CPU, and the ring is handed straight back.
+ *
+ * Another pass, not a spin in place -- which is what this first was. The
+ * frames already taken are dispatched only once this function returns, so a
+ * spin here held them back for as long as it lasted; and the receive softirq
+ * runs on one CPU at a time, so nothing else could be delivered meanwhile,
+ * from any device, on any CPU. Between passes both happen. */
+const REPOLL_MIN_PPS: u32 = 200_000;
+const REPOLL_NS: u64 = 20_000;
 
 /* The receive rate is resampled no more often than this. */
 const RATE_SAMPLE_NS: u64 = 1_000_000;
@@ -165,20 +173,29 @@ struct IgbDevice {
     rx_dropped: AtomicU64,
     /// Receive rate, packets a second, resampled once a millisecond in
     /// process_rx. It drives two things: how wide to set the interrupt
-    /// throttle (apply_eitr), and whether to spin briefly for the next frame
-    /// when the ring empties rather than hand it back to the interrupt
-    /// (the linger below). Written by the receive poll, one CPU at a time.
+    /// throttle (apply_eitr), and whether to look at the ring again when it
+    /// empties rather than hand it back to the interrupt (REPOLL_NS).
+    /// Written by the receive poll, one CPU at a time.
     rx_rate_pps: AtomicU32,
     rate_last_ns: AtomicU64,
     rate_last_pkts: AtomicU64,
     /// The EITR interval currently programmed, microseconds, so apply_eitr
     /// writes the register only when it changes.
     eitr_us: AtomicU32,
-    /// Interrupts taken on each vector, and lingers that found a frame and so
-    /// spared the ring an arm-and-interrupt round trip -- for igbdump.
+    /// Interrupts taken on each vector, for igbdump.
     isr_queue: AtomicU64,
     isr_other: AtomicU64,
-    rx_linger_hits: AtomicU64,
+    /// Boot time the ring was first found empty in a run of repolls (see
+    /// REPOLL_NS), 0 outside one. The receive poll's, one CPU at a time.
+    empty_since: AtomicU64,
+    /// For igbdump: passes that found nothing and went round again rather
+    /// than arm; runs of those that ended in a frame -- an interrupt
+    /// spared each time; and how long the ring sat empty through them, which
+    /// is the CPU repolling cost. The receive softirq's share in `top`, less
+    /// that, is the work.
+    rx_repolls: AtomicU64,
+    rx_repoll_hits: AtomicU64,
+    rx_repoll_ns: AtomicU64,
     _bar_mapping: dma::PhysMapping,
     regs: io::MmioRegion,
 }
@@ -1061,7 +1078,10 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
         eitr_us: AtomicU32::new(EITR_INTERVAL_US),
         isr_queue: AtomicU64::new(0),
         isr_other: AtomicU64::new(0),
-        rx_linger_hits: AtomicU64::new(0),
+        empty_since: AtomicU64::new(0),
+        rx_repolls: AtomicU64::new(0),
+        rx_repoll_hits: AtomicU64::new(0),
+        rx_repoll_ns: AtomicU64::new(0),
         _bar_mapping: bar_mapping,
         regs,
     });
@@ -1280,7 +1300,18 @@ extern "C" fn igb_isr_other(ctx: *mut u8) {
         let icr = regs.read32(ICR);
         if icr & ICR_LSC != 0 {
             (*dev).link_event.store(1, Ordering::Release);
-            softirq::raise(softirq::TYPE_NET_RX); /* the poll acts on it */
+
+            /* The poll acts on it, and should on the queue vector's CPU, not
+             * this one: IrqBalance places each MSI-X entry on a CPU of its
+             * own, and raising the receive softirq here would run the whole
+             * poll here -- the PHY reads, which take milliseconds, included --
+             * while the CPU the frames land on waited for it. Setting the
+             * queue vector's cause has the chip interrupt that CPU instead:
+             * now if the vector is armed, the moment the poll re-arms it if
+             * not. Linux's igb watchdog kicks its ring vectors the same way.
+             * The flag is out before the kick that sends a CPU to read it. */
+            kcore::barrier::dma_wmb();
+            regs.write32(EICS, EICR_VECTOR0);
         }
         if icr & ICR_RXO != 0 {
             let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
@@ -1428,9 +1459,8 @@ unsafe fn refill_rx(dev: *mut IgbDevice) {
 
 /// Resample the receive rate if a sample window has passed, and adapt the
 /// interrupt throttle to it. Called at the head of the poll, one CPU at a
-/// time. Returns the current rate estimate.
-unsafe fn sample_rate(dev: *mut IgbDevice) -> u32 {
-    let now = boot_time_ns();
+/// time, with the time the pass began. Returns the current rate estimate.
+unsafe fn sample_rate(dev: *mut IgbDevice, now: u64) -> u32 {
     let last = (*dev).rate_last_ns.load(Ordering::Relaxed);
     let dt = now.wrapping_sub(last);
     if last != 0 && dt >= RATE_SAMPLE_NS {
@@ -1468,20 +1498,35 @@ unsafe fn apply_eitr(dev: *mut IgbDevice, pps: u32) {
     }
 }
 
-/// Spin until the ring has a frame or `ns` have passed. Softirq context, the
-/// vector masked: a bounded spin, entered only when the rate says the wait is
-/// short. Returns whether a frame arrived.
-unsafe fn linger_until_work(dev: *mut IgbDevice, ns: u64) -> bool {
-    let deadline = boot_time_ns() + ns;
-    loop {
-        if (*dev).rx_ring.has_work() {
-            return true;
-        }
-        if boot_time_ns() >= deadline {
-            return false;
-        }
-        core::hint::spin_loop();
+/// The ring gave up a frame, or is being handed back to the interrupt: a run
+/// of repolls over an empty ring, if one was going, is over. Its length is
+/// what it cost; ending in a frame, it spared an interrupt.
+unsafe fn end_repolls(dev: *mut IgbDevice, now: u64, found: bool) {
+    let since = (*dev).empty_since.swap(0, Ordering::Relaxed);
+    if since == 0 {
+        return;
     }
+
+    (*dev).rx_repoll_ns.fetch_add(now.saturating_sub(since), Ordering::Relaxed);
+    if found {
+        (*dev).rx_repoll_hits.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The ring is empty and the rate high: whether to look again on another
+/// softirq pass rather than arm -- yes until it has sat empty for REPOLL_NS.
+unsafe fn repoll(dev: *mut IgbDevice, now: u64) -> bool {
+    let since = (*dev).empty_since.load(Ordering::Relaxed);
+    if since == 0 {
+        /* Never 0 itself, which means "not in a run". */
+        (*dev).empty_since.store(now.max(1), Ordering::Relaxed);
+    } else if now.saturating_sub(since) >= REPOLL_NS {
+        end_repolls(dev, now, false);
+        return false;
+    }
+
+    (*dev).rx_repolls.fetch_add(1, Ordering::Relaxed);
+    true
 }
 
 extern "C" fn igb_process_rx(ctx: *mut u8) {
@@ -1495,11 +1540,15 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
     unsafe {
         handle_link_event(dev);
 
-        let hot = sample_rate(dev) >= LINGER_MIN_PPS;
+        let now = boot_time_ns();
+        let hot = sample_rate(dev, now) >= REPOLL_MIN_PPS;
 
         /* Harvested frames wait here until the batch is complete, so the
          * receive queue's lock is taken once rather than once per frame. */
         let mut batch: [usize; RX_BUDGET as usize] = [0; RX_BUDGET as usize];
+
+        /* Whether this pass took anything, in any of its rounds. */
+        let mut took = false;
 
         loop {
             RX_POLLS.fetch_add(1, Ordering::Relaxed);
@@ -1545,6 +1594,11 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
                 batched += 1;
             }
 
+            if taken != 0 {
+                took = true;
+                end_repolls(dev, now, true);
+            }
+
             /* Hand the harvest over in one piece, then give the chip its
              * buffers back. Refilling after the batch keeps the ring supplied
              * from the pool the dispatch below will replenish. */
@@ -1564,20 +1618,26 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
             /* Round again while the ring still has frames, receive sources
              * left masked: the repeating path touches no device register at
              * all, since has_work reads the descriptor out of DMA memory. */
-            let mut empty = !(*dev).rx_ring.has_work();
+            if !(*dev).rx_ring.has_work() {
+                /* Running hot: rather than arm the interrupt for a frame a
+                 * couple of microseconds away, look again on the softirq's
+                 * next pass, receive sources still masked. After a pass that
+                 * took frames that is simply the next pass -- they are
+                 * dispatched in between, which is where a flood's time goes.
+                 * After one that took nothing it is a repoll proper, and
+                 * REPOLL_NS of those in a row hands the ring back; under a
+                 * sustained flood the ring never sits empty that long, so the
+                 * interrupt is spared for as long as the flood lasts. Only a
+                 * pass that took nothing starts that clock: one started by a
+                 * pass with frames would count their dispatch, which comes
+                 * after this function returns, as time the ring sat empty. */
+                if hot && (took || repoll(dev, now)) {
+                    softirq::raise(softirq::TYPE_NET_RX);
+                    return;
+                }
 
-            /* Running hot: rather than arm the interrupt for a frame that is
-             * a couple of microseconds away, spin for it. Under a sustained
-             * flood the ring never stays empty long enough to reach the
-             * deadline, so the interrupt -- and its register reads -- is
-             * spared for as long as the flood lasts. */
-            if empty && hot && linger_until_work(dev, LINGER_NS) {
-                (*dev).rx_linger_hits.fetch_add(1, Ordering::Relaxed);
-                empty = false;
-            }
-
-            if empty {
                 /* Empty: hand the ring back to the interrupt. */
+                end_repolls(dev, now, false);
                 (*dev).arm_rx();
 
                 /* Re-checked after arming, for a frame that landed between
@@ -1702,7 +1762,9 @@ pub struct IgbState {
     pub rx_rate_pps: u32,
     pub isr_queue: u64,
     pub isr_other: u64,
-    pub rx_linger_hits: u64,
+    pub rx_repoll_hits: u64,
+    pub rx_repolls: u64,
+    pub rx_repoll_ns: u64,
     /// 1 on MSI-X, 0 on INTx -- where EITR is not the throttle.
     pub msix: u32,
 }
@@ -1794,7 +1856,9 @@ pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
         (*out).rx_rate_pps = (*raw).rx_rate_pps.load(Ordering::Relaxed);
         (*out).isr_queue = (*raw).isr_queue.load(Ordering::Relaxed);
         (*out).isr_other = (*raw).isr_other.load(Ordering::Relaxed);
-        (*out).rx_linger_hits = (*raw).rx_linger_hits.load(Ordering::Relaxed);
+        (*out).rx_repoll_hits = (*raw).rx_repoll_hits.load(Ordering::Relaxed);
+        (*out).rx_repolls = (*raw).rx_repolls.load(Ordering::Relaxed);
+        (*out).rx_repoll_ns = (*raw).rx_repoll_ns.load(Ordering::Relaxed);
         (*out).msix = if (*raw).msix { 1 } else { 0 };
     }
 
