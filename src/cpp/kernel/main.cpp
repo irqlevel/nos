@@ -718,6 +718,30 @@ void BpStartup(void* ctx)
         Shutdown();
 }
 
+/* wxprobe=heap: call into a page the allocator just handed out. Every
+   runtime mapping is NX, so the call must die on the instruction fetch; the
+   line after it printing means W^X covers the kernel image and nothing else.
+   Deliberately fatal, like the text probe -- it is asked for by name on the
+   command line. */
+static void WxProbeHeap()
+{
+    static const u8 RetOpcode = 0xC3;
+
+    ulong phys = 0;
+    void* va = Mm::AllocMapPages(1, &phys);
+    if (va == nullptr)
+    {
+        Trace(0, "W^X probe: no page for the heap probe");
+        return;
+    }
+
+    *reinterpret_cast<volatile u8*>(va) = RetOpcode;
+    Hal::SyncInstructionCache((ulong)va, sizeof(RetOpcode));
+    Trace(0, "W^X probe: calling into a heap page 0x%p (expect page fault)", (ulong)va);
+    reinterpret_cast<void (*)()>(va)();
+    Trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
+}
+
 void Main2(Grub::MultiBootInfoHeader *MbInfo)
 {
     do {
@@ -757,6 +781,12 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
             StackProbe::Poison((void*)base, size);
         }
     }
+
+    /* Before any page table is built: every mapping the kernel makes at
+       runtime carries NX, and with EFER.NXE off bit 63 is a reserved bit --
+       the first touch of such a page would fault instead of reading. The APs
+       do the same before they load this table (ApMain2). */
+    Hal::EnableWxSupport();
 
     auto& bpt = Mm::BuiltinPageTable::GetInstance();
     if (!bpt.Setup())
@@ -828,12 +858,13 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
-    /* W^X: enable NXE, then make .text RX, .rodata RO+NX, .data/.bss RW+NX */
+    /* W^X: the image mapping is the one executable thing the page table
+       was built with (everything else is already NX), so split it here into
+       .text RX, .rodata RO+NX, .data/.bss RW+NX */
     {
         extern char KernelStart[], KernelText[], KernelRodata[], KernelEnd[];
-        Hal::EnableWxSupport();
-        /* Before the first MapMmioRegion: NX in a PTE needs EFER.NXE, and a
-           write-combining one needs the PAT entry to exist. */
+        /* Before the first MapMmioRegion: a write-combining mapping needs
+           the PAT entry to exist. */
         Hal::SetupMemoryTypes();
         ulong t0 = (ulong)KernelStart, t1 = (ulong)KernelText;
         ulong r1 = (ulong)KernelRodata, e = (ulong)KernelEnd;
@@ -842,7 +873,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         pt.ProtectRange(r1, e - r1, true, false);    /* RW+NX */
         Trace(0, "W^X: text [0x%p,0x%p) rodata [0x%p,0x%p) data [0x%p,0x%p)",
             t0, t1, t1, r1, r1, e);
-        if (Parameters::GetInstance().IsWxProbe())
+        if (Parameters::GetInstance().IsWxProbeText())
         {
             Trace(0, "W^X probe: writing to text 0x%p (expect page fault)", t0);
             *reinterpret_cast<volatile u32*>(t0) = 0;
@@ -895,6 +926,9 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     }
 
     Mm::AllocatorImpl::GetInstance(&Mm::PageAllocatorImpl::GetInstance());
+
+    if (Parameters::GetInstance().IsWxProbeHeap())
+        WxProbeHeap();
 
     /* Setup HPET after page allocator is ready (MMIO mapping requires it).
        HPET may not be available on all hardware; Setup() returns false silently. */
