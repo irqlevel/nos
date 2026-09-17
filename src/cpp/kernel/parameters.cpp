@@ -24,7 +24,7 @@ Parameters::Parameters()
     , MaxCpusLimit(0)
     , ItsEnabled(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
     , HwRngOff(false)
-    , WxProbe(false)
+    , WxProbeMd(WxProbeOff)
     , UsbOff(false)
     , RcOff(false)
     , ConMode(ConsoleBoth)
@@ -79,9 +79,14 @@ bool Parameters::IsItsEnabled()
     return ItsEnabled;
 }
 
-bool Parameters::IsWxProbe()
+bool Parameters::IsWxProbeText()
 {
-    return WxProbe;
+    return WxProbeMd == WxProbeText;
+}
+
+bool Parameters::IsWxProbeHeap()
+{
+    return WxProbeMd == WxProbeHeap;
 }
 
 bool Parameters::IsUsbOff()
@@ -299,7 +304,12 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     }
     else if (Stdlib::StrCmp(key, "wxprobe") == 0)
     {
-        WxProbe = (Stdlib::StrCmp(value, "on") == 0);
+        if (Stdlib::StrCmp(value, "on") == 0 || Stdlib::StrCmp(value, "text") == 0)
+            WxProbeMd = WxProbeText;
+        else if (Stdlib::StrCmp(value, "heap") == 0)
+            WxProbeMd = WxProbeHeap;
+        else
+            Trace(0, "Unknown value %s, key %s", value, key);
     }
     else if (Stdlib::StrCmp(key, "smp") == 0)
     {

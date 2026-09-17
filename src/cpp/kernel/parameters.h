@@ -42,7 +42,14 @@ public:
     ulong GetMaxCpus();
 
     bool IsItsEnabled();
-    bool IsWxProbe();
+
+    /* wxprobe=text (or the older =on): write to .text once the image has
+       been split, wxprobe=heap: call into a page the allocator just handed
+       out. Both are meant to be fatal -- they are how W^X is shown to be
+       doing its job (docs/paging.md). */
+    bool IsWxProbeText();
+    bool IsWxProbeHeap();
+
     bool IsUsbOff();
 
     /* rc=off -- do not run /etc/rc at boot: the way past a command in it
@@ -141,6 +148,12 @@ private:
         ConsoleVgaOnly,
     };
 
+    enum WxProbeMode {
+        WxProbeOff = 0,
+        WxProbeText,   /* write to .text */
+        WxProbeHeap,   /* execute from a page the heap handed out */
+    };
+
     enum DhcpMode {
         DhcpOn = 0,    /* start only by cmd (default) */
         DhcpAuto,      /* start automatically at boot */
@@ -154,7 +167,7 @@ private:
     ulong MaxCpusLimit;
     bool ItsEnabled;
     bool HwRngOff;
-    bool WxProbe;
+    WxProbeMode WxProbeMd;
     bool UsbOff;
     bool RcOff;
     ConsoleMode ConMode;

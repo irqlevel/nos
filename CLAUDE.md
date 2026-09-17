@@ -45,7 +45,10 @@ code that references x86-only entry points gets an unreachable link stub in
 `scripts/smoke-arm64.sh` is the arm64 equivalent). Gate on its exit code,
 never on grepping its output. The x86 smoke boot attaches virtio-blk (modern),
 virtio-scsi (legacy), NVMe, virtio-net and virtio-rng, so it covers the
-Rust/MSI-X path too.
+Rust/MSI-X path too. `./scripts/wx-test.sh [--arch x86_64|aarch64]` is the
+W^X test: it boots once per probe (`wxprobe=text`, `wxprobe=heap`) and fails
+if the kernel survives one — run it after touching a mapping path, since no
+smoke boot notices a mapping that stops being NX.
 
 Run in QEMU (serial console is logged to `nos.log`):
 

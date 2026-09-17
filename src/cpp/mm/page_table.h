@@ -231,7 +231,11 @@ private:
     /* Move every page on the early physical free list onto FreePagesList. */
     void DrainEarlyFreeList();
 
-    bool SetupPage(ulong virtAddr, ulong phyAddr);
+    /* One 4KiB leaf in the table Setup() is building, before it is live.
+       executable is for the kernel image alone -- the kernel runs out of
+       that mapping from the root switch until ProtectRange refines it;
+       every other page Setup() maps is data and gets NX. */
+    bool SetupPage(ulong virtAddr, ulong phyAddr, bool executable);
 
     /* SetupPage stopping one level short: a 2MiB leaf at L2 instead of a
        4KiB one at L1. Only PageArray uses it, and only because it is the one

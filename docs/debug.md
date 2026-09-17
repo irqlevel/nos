@@ -48,3 +48,9 @@ failing test returns a non-success `Stdlib::Error`. To run a single test, edit
 boot the kernel headless and assert the serial markers `After test` →
 `Preempt is now on` → `boot: complete`, failing fast on `PANIC:`. Gate on the
 exit code, never on grepping the output.
+
+`./scripts/wx-test.sh [--arch x86_64|aarch64]` is the W^X test: one boot per
+probe (`wxprobe=text`, `wxprobe=heap`), each of which has to die on the fault
+it asked for, at the address it printed. A kernel that survives a probe
+prints `SUCCEEDED (W^X broken!)` and the script fails — which is how a
+mapping path that stops setting NX gets caught. See [Paging](paging.md).

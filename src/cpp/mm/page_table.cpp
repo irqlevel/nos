@@ -240,6 +240,7 @@ void PageTable::DrainEarlyFreeList()
         l1Entry->Value = 0;
         l1Entry->SetAddress(phyAddr);
         l1Entry->SetWritable();
+        l1Entry->SetNoExecute(); /* a free page is data, like every TmpMap slot */
         l1Entry->SetPresent();
         Hal::TlbFlushPage(virtAddr);
 
@@ -371,7 +372,7 @@ ulong PageTable::VirtToPhysLocked(ulong virtAddr)
     return l1Entry.Address() + offset;
 }
 
-bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
+bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr, bool executable)
 {
     BugOn(virtAddr & (Const::PageSize - 1));
     BugOn(phyAddr & (Const::PageSize - 1));
@@ -438,6 +439,8 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr)
     {
         l1Entry->SetAddress(phyAddr);
         l1Entry->SetWritable();
+        if (!executable)
+            l1Entry->SetNoExecute();
         l1Entry->SetPresent();
     } else {
         l1Entry->Clear();
@@ -490,9 +493,11 @@ bool PageTable::SetupHugePage(ulong virtAddr, ulong phyAddr)
     if (l2Entry->Present())
         return false;
 
-    /* The permissions SetupPage's 4KiB leaf gets, no more and no less. */
+    /* The permissions SetupPage's 4KiB leaf gets for data, no more and no
+       less: PageArray is written and read, never executed. */
     l2Entry->SetAddress(phyAddr);
     l2Entry->SetWritable();
+    l2Entry->SetNoExecute();
     l2Entry->SetHuge();
     l2Entry->SetPresent();
     Hal::TlbFlushPage(virtAddr);
@@ -686,7 +691,10 @@ bool PageTable::Setup()
 
     for (ulong address = mmap.GetKernelStart(); address < mmap.GetKernelEnd(); address+= Const::PageSize)
     {
-        if (!SetupPage(address, BuiltinPageTable::GetInstance().VirtToPhys(address)))
+        /* The one executable mapping the table is built with: the kernel
+           runs out of it from the root switch until ProtectRange splits
+           it into text RX / rodata RO+NX / data RW+NX. */
+        if (!SetupPage(address, BuiltinPageTable::GetInstance().VirtToPhys(address), true))
         {
             Trace(0, "can't setup page");
             return false;
@@ -696,7 +704,7 @@ bool PageTable::Setup()
     Trace(0, "TmpMapStart 0x%p", TmpMapStart);
     for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
     {
-        if (!SetupPage(TmpMapStart + i * Const::PageSize, 0))
+        if (!SetupPage(TmpMapStart + i * Const::PageSize, 0, false))
             return false;
 
         TmpMapPageArray[i] = nullptr;
@@ -706,10 +714,10 @@ bool PageTable::Setup()
     for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
         BugOn(tmpMapL1PagePhyAddr != GetL1Page(TmpMapStart + i * Const::PageSize));
 
-    if (!SetupPage((ulong)TmpMapL1Page, tmpMapL1PagePhyAddr))
+    if (!SetupPage((ulong)TmpMapL1Page, tmpMapL1PagePhyAddr, false))
         return false;
 
-    if (!SetupPage(0, 0))
+    if (!SetupPage(0, 0, false))
         return false;
 
     Trace(0, "PageArray setup, highestPhyAddr 0x%p", HighestPhyAddr);
@@ -991,6 +999,9 @@ ulong PageTable::TmpMapPage(ulong phyAddr)
             if (!MemoryMap::GetInstance().IsUsableRam(phyAddr))
                 l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
+            /* The window exists to read and write page tables, page contents
+               and device registers; nothing is ever fetched from it. */
+            l1Entry->SetNoExecute();
             l1Entry->SetPresent();
             Hal::TlbFlushPage(virtAddr);
 
@@ -1115,6 +1126,7 @@ ulong PageTable::TmpMapRange(ulong phyAddr, size_t len)
             if (!MemoryMap::GetInstance().IsUsableRam(thisPhyPage))
                 l1Entry->SetCacheDisabled();
             l1Entry->SetWritable();
+            l1Entry->SetNoExecute(); /* data, as in TmpMapPage */
             l1Entry->SetPresent();
             Hal::TlbFlushPage(virtAddr);
 
@@ -1189,6 +1201,10 @@ PtePage* PageTable::WalkToL1Locked(ulong virtAddr, bool create)
 
             entry->SetAddress(page->GetPhyAddress());
             entry->SetWritable();
+            /* No NX on the way down: on both arches the bit on an L4/L3/L2
+               entry takes away execute permission from the whole subtree,
+               which no leaf can give back -- a module's text lives under
+               these tables. Execute permission is a leaf decision. */
             entry->SetPresent();
         }
 
@@ -1238,6 +1254,13 @@ bool PageTable::MapRangeLocked(ulong virtAddr, size_t count, const MapSource& sr
             page->Get();
             l1Entry->SetAddress(page->GetPhyAddress());
             l1Entry->SetWritable();
+            /* RW+NX is what every runtime mapping gets: the heap, stacks,
+               DMA buffers and a module image before it is laid out. The one
+               thing that runs from such a page is a module's text, and the
+               loader asks for it by name (SetRangeProtection) once the
+               segment is written -- so nothing is ever writable and
+               executable at the same time. */
+            l1Entry->SetNoExecute();
             l1Entry->SetPresent();
             if (src.PhyAddrs != nullptr)
                 page->Put(); /* balance SourcePage's GetPage */

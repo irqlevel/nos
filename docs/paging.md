@@ -199,12 +199,32 @@ answered from the premapped window instead (`Hal::MmioPremappedVa`).
 Never map DMA or device memory at `phys + KernelSpaceBase` by hand: go
 through `Mm::MapPages` / `Mm::AllocMapPages` so the VA is tracked.
 
-**W^X** is `ProtectRange` walking 4 KiB leaves and clearing the writable or
-setting the no-execute bit. Late in boot the kernel image is split into text
-RX, rodata RO+NX, data RW+NX on both architectures. Self-modifying code,
-executing from a heap buffer, or writing through a pointer into `.rodata`
-faults instead of silently working — `wxprobe=on` deliberately does the last
-of those to prove the protection is on.
+**W^X** has two halves. Every mapping the kernel makes at runtime is
+non-executable from birth: `MapRangeLocked` sets NX on each leaf it writes,
+so the heap, task stacks, DMA buffers, the temp-map window and `PageArray`
+are RW+NX, and so is MMIO (`MapMmioRegion`). Nothing walks that back except
+the module loader, which asks for each segment's permissions by name once
+the segment is written (`SetRangeProtection`), so a module's text is RX and
+nothing is ever writable and executable at once. The tables above the leaves
+stay permissive: on both architectures an NX bit on an L4/L3/L2 entry takes
+execute permission away from the whole subtree and no leaf can give it back.
+
+The other half is the kernel image, which is the one executable mapping the
+page table is built with — the kernel runs out of it from the root switch
+onwards. Late in boot `ProtectRange` walks its 4 KiB leaves and splits it
+into text RX, rodata RO+NX, data RW+NX on both architectures.
+
+So self-modifying code, executing from a heap buffer, or writing through a
+pointer into `.rodata` faults instead of silently working. `wxprobe=text`
+deliberately writes to `.text` and `wxprobe=heap` deliberately calls into a
+page the allocator just handed out, to prove both halves are on;
+`scripts/wx-test.sh` runs both boots and fails if either survives.
+
+On x86-64 the NX bit means nothing until `EFER.NXE` is set, and bit 63 is a
+*reserved* bit until it is — a PTE carrying it faults on the first touch. So
+`Hal::EnableWxSupport()` runs before any page table is built on the BSP, and
+on each AP before it loads the kernel's (`ApMain2`). arm64 needs no enable:
+PXN/UXN are always honored.
 
 ## TLB shootdown, and the deadlock it can cause
 

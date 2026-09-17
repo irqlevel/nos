@@ -10,6 +10,7 @@
 #include <mm/memory_map.h>
 #include <mm/page_table.h>
 #include <mm/page_allocator.h>
+#include <mm/new.h>
 #include <mm/allocator.h>
 #include <hal/mmu.h>
 #include <kernel/trace.h>
@@ -346,6 +347,32 @@ static void BpStartupArm(void* ctx)
 }
 }
 
+/* wxprobe=heap: call into a page the allocator just handed out. Every
+   runtime mapping is PXN, so the call must die on the instruction fetch; the
+   line after it printing means W^X covers the kernel image and nothing else.
+   Deliberately fatal, like the text probe -- it is asked for by name on the
+   command line. The x86 twin is in kernel/main.cpp. */
+static void WxProbeHeap()
+{
+    using namespace Kernel;
+
+    static const u32 RetInsn = 0xD65F03C0; /* ret */
+
+    ulong phys = 0;
+    void* va = Mm::AllocMapPages(1, &phys);
+    if (va == nullptr)
+    {
+        Trace(0, "W^X probe: no page for the heap probe");
+        return;
+    }
+
+    *reinterpret_cast<volatile u32*>(va) = RetInsn;
+    Hal::SyncInstructionCache((ulong)va, sizeof(RetInsn));
+    Trace(0, "W^X probe: calling into a heap page 0x%p (expect instr abort)", (ulong)va);
+    reinterpret_cast<void (*)()>(va)();
+    Trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
+}
+
 /* PSCI CPU_ON lands here (via boot.S SecondaryEntry) on the AP boot stack */
 extern "C" void ApMainArm64(ulong index)
 {
@@ -478,7 +505,8 @@ extern "C" void MainArm64(void* dtb)
 
     /* W^X: kernel text is RX, everything else in the image is RW+NX.
        Runs after the free-pages list so the walk sees the final image
-       mapping. (x86 keeps its historical RWX for now.) */
+       mapping. The image is the only executable mapping the page table was
+       built with -- every other one is NX from birth (MapRangeLocked). */
     {
         ulong textStart = (ulong)KernelStart;
         ulong textEnd = (ulong)KernelText;
@@ -491,7 +519,7 @@ extern "C" void MainArm64(void* dtb)
         Trace(0, "W^X: text [0x%p,0x%p) rodata [0x%p,0x%p) data [0x%p,0x%p)",
             textStart, textEnd, textEnd, rodataEnd, rodataEnd, imgEnd);
 
-        if (Parameters::GetInstance().IsWxProbe())
+        if (Parameters::GetInstance().IsWxProbeText())
         {
             Trace(0, "W^X probe: writing to text 0x%p (expect data abort)", textStart);
             *reinterpret_cast<volatile u32*>(textStart) = 0;
@@ -516,6 +544,9 @@ extern "C" void MainArm64(void* dtb)
         Panic("Can't setup page allocator");
 
     Mm::AllocatorImpl::GetInstance(&Mm::PageAllocatorImpl::GetInstance());
+
+    if (Parameters::GetInstance().IsWxProbeHeap())
+        WxProbeHeap();
 
     TimeInit();
 
