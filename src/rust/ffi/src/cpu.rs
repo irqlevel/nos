@@ -8,3 +8,10 @@ extern "C" {
         ctx: *mut u8,
     );
 }
+
+/* Interrupts and preemption off, and back on, for code that holds a lock of
+   its own because it cannot allocate one. */
+extern "C" {
+    pub fn kernel_irq_save() -> usize;
+    pub fn kernel_irq_restore(flags: usize);
+}

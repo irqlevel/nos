@@ -39,6 +39,7 @@
 #include <drivers/acpi.h>
 #include "parameters.h"
 #include "version_gen.h"
+#include "dmesg.h"
 
 static const ulong RustAllocTag = 'rust';
 
@@ -1860,6 +1861,74 @@ long kernel_interrupt_source(unsigned long index, char* name, unsigned long name
     if (name != nullptr && nameLen != 0)
         Stdlib::SnPrintf(name, nameLen, "%s", Kernel::InterruptStats::GetName(src));
     return Kernel::InterruptStats::Get(src);
+}
+
+/* What netconsole= asked for: the collector's address into ip, its port into
+   port, and the nctail= cap in KiB into tailKb. 1 when it was asked for at
+   all, 0 when it was not. */
+int kernel_netconsole_params(unsigned int* ip, unsigned short* port,
+    unsigned long* tailKb)
+{
+    auto& params = Kernel::Parameters::GetInstance();
+    if (!params.IsNetconsoleEnabled())
+        return 0;
+
+    if (ip != nullptr)
+        *ip = params.GetNetconsoleIp().Addr4;
+    if (port != nullptr)
+        *port = params.GetNetconsolePort();
+    if (tailKb != nullptr)
+        *tailKb = params.GetNetconsoleTailKb();
+    return 1;
+}
+
+/* Every message the log already holds, oldest first, handed to `line`. What
+   primes the netconsole ring with the boot that happened before it was set
+   up, so a collector still sees the whole of it. */
+void kernel_dmesg_replay(void (*line)(void* ctx, const unsigned char* s,
+    unsigned long len), void* ctx)
+{
+    if (line == nullptr)
+        return;
+
+    Kernel::DmesgMsg* msg = Kernel::Dmesg::GetInstance().Next(nullptr);
+    for (ulong replayed = 0; msg != nullptr; replayed++)
+    {
+        ulong len = Stdlib::StrLen(msg->Str);
+        if (len != 0)
+            line(ctx, reinterpret_cast<const unsigned char*>(msg->Str), len);
+
+        /* Never outlast the log itself: a walk past its capacity is chasing
+           a tail someone else is still extending. */
+        if (replayed + 1 == Kernel::Dmesg::MaxMsgs)
+        {
+            Kernel::Dmesg::GetInstance().Release(msg);
+            break;
+        }
+
+        msg = Kernel::Dmesg::GetInstance().Next(msg);
+    }
+}
+
+/* Interrupts and preemption off, and back on: what code holding a lock of
+   its own uses when it cannot allocate one -- netconsole arms its capture
+   ring before the page allocator exists. The order matters: reading the CPU
+   first and disabling after leaves a window to be preempted onto another. */
+unsigned long kernel_irq_save()
+{
+    return Kernel::PreemptIrqSave();
+}
+
+void kernel_irq_restore(unsigned long flags)
+{
+    Kernel::PreemptIrqRestore(flags);
+}
+
+/* Whether a panic has started: what tells code to write without taking a
+   lock, because another CPU may hold it and is on its way to a halt. */
+int kernel_panic_active()
+{
+    return Kernel::Panicker::GetInstance().IsActive() ? 1 : 0;
 }
 
 /* What the root filesystem is to be, off the kernel command line: the mode

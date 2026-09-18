@@ -73,3 +73,20 @@ extern "C" {
         src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, seq: u32,
     );
 }
+
+/* What netconsole needs of the kernel: what it was asked for, the log that
+   happened before it was set up, and whether a panic has started. */
+extern "C" {
+    /// The collector's address, port and the nctail= cap in KiB; 1 when
+    /// netconsole= was given at all.
+    pub fn kernel_netconsole_params(
+        ip: *mut u32, port: *mut u16, tail_kb: *mut usize,
+    ) -> i32;
+    /// Every message the kernel log already holds, oldest first.
+    pub fn kernel_dmesg_replay(
+        line: extern "C" fn(ctx: *mut u8, s: *const u8, len: usize), ctx: *mut u8,
+    );
+    /// Whether a panic has started -- so code writes without taking a lock
+    /// another CPU may hold on its way to a halt.
+    pub fn kernel_panic_active() -> i32;
+}
