@@ -32,6 +32,7 @@
 #include <block/block_device.h>
 #include <net/net_device.h>
 #include <net/net_frame.h>
+#include <net/net_frame_pool.h>
 #include <net/tcp.h>
 #include <fs/vfs.h>
 #include <fs/fstest.h>
@@ -2218,6 +2219,43 @@ int kernel_net_udp_listen(unsigned long dev, unsigned short port,
     Kernel::NetDevice::RxFrameCallback cb, void* ctx)
 {
     return reinterpret_cast<Kernel::NetDevice*>(dev)->ListenUdpFrames(port, cb, ctx);
+}
+
+/* The same, with a call at the end of each receive batch: where a listener
+   that answers from the receive path hands the batch's replies to the NIC
+   together -- one lock, one doorbell -- rather than one each. */
+int kernel_net_udp_listen_batch(unsigned long dev, unsigned short port,
+    Kernel::NetDevice::RxFrameCallback cb, void* ctx,
+    Kernel::NetDevice::RxBatchEndCallback batchEnd)
+{
+    return reinterpret_cast<Kernel::NetDevice*>(dev)->ListenUdpFrames(
+        port, cb, ctx, batchEnd);
+}
+
+/* What the recycled frame pool has been doing: allocations it could not
+   serve, and frames a driver is holding. For a load target's periodic line. */
+void kernel_netframe_pool_stats(unsigned long* misses, unsigned long* inFlight)
+{
+    auto& pool = Kernel::NetFramePool::GetInstance();
+    if (misses != nullptr)
+        *misses = pool.GetAllocMisses();
+    if (inFlight != nullptr)
+        *inFlight = pool.GetInFlight();
+}
+
+/* Polls of the receive path, polls that found work, and polls that found
+   work with no interrupt-driven pass since the last one -- the third being
+   the evidence of a lost wakeup. */
+void kernel_net_rx_poll_stats(unsigned long* polls, unsigned long* work,
+    unsigned long* stalls)
+{
+    auto& table = Kernel::NetDeviceTable::GetInstance();
+    if (polls != nullptr)
+        *polls = table.GetRxPolls();
+    if (work != nullptr)
+        *work = table.GetRxPollWork();
+    if (stalls != nullptr)
+        *stalls = table.GetRxStalls();
 }
 
 void kernel_net_udp_unlisten(unsigned long dev, unsigned short port, void* ctx)

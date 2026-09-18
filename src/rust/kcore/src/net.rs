@@ -224,6 +224,28 @@ impl Nic {
         }
     }
 
+    /// Every UDP datagram to `port`, as `listen_udp`, and a call at the end
+    /// of each receive batch. A listener that answers from the receive path
+    /// builds its replies as the frames arrive and hands them to the NIC in
+    /// `batch_end` -- one lock and one doorbell for the batch, rather than
+    /// one of each per packet.
+    pub fn listen_udp_batched(
+        &self,
+        port: u16,
+        cb: extern "C" fn(ctx: *mut u8, frame: usize),
+        batch_end: extern "C" fn(ctx: *mut u8),
+        ctx: *mut u8,
+    ) -> core::result::Result<UdpListener, ListenError> {
+        match unsafe {
+            net::kernel_net_udp_listen_batch(self.handle, port, cb, ctx, batch_end)
+        } {
+            0 => Ok(UdpListener { nic: *self, port, ctx: ctx as usize }),
+            1 => Err(ListenError::PortTaken),
+            2 => Err(ListenError::TableFull),
+            _ => Err(ListenError::Invalid),
+        }
+    }
+
     /// Queues a frame to transmit; false when the queue had no room and it
     /// was dropped.
     pub fn transmit(&self, frame: NetFrame) -> bool {
@@ -387,4 +409,21 @@ impl Drop for NetFrame {
     fn drop(&mut self) {
         unsafe { net::kernel_netframe_put(self.handle) }
     }
+}
+
+/// What the recycled frame pool has been doing: allocations it could not
+/// serve, and frames a driver is holding.
+pub fn frame_pool_stats() -> (usize, usize) {
+    let (mut misses, mut in_flight) = (0, 0);
+    unsafe { net::kernel_netframe_pool_stats(&mut misses, &mut in_flight) };
+    (misses, in_flight)
+}
+
+/// Receive polls, polls that found work, and polls that found work with no
+/// interrupt-driven pass since the last one -- the third being the evidence
+/// of a lost wakeup.
+pub fn rx_poll_stats() -> (usize, usize, usize) {
+    let (mut polls, mut work, mut stalls) = (0, 0, 0);
+    unsafe { net::kernel_net_rx_poll_stats(&mut polls, &mut work, &mut stalls) };
+    (polls, work, stalls)
 }
