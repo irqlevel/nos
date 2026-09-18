@@ -713,21 +713,3 @@ pub unsafe extern "C" fn kernel_netframe_get(frame: usize) {
 pub unsafe extern "C" fn kernel_netframe_put(frame: usize) {
     drop(unsafe { Frame::from_handle(frame) });
 }
-
-/// Allocations the pool could not serve, and frames a driver is holding.
-///
-/// # Safety
-/// Both are writable, or null.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_netframe_pool_stats(
-    misses: *mut usize, in_flight: *mut usize,
-) {
-    unsafe {
-        if let Some(misses) = misses.as_mut() {
-            *misses = POOL.alloc_misses();
-        }
-        if let Some(in_flight) = in_flight.as_mut() {
-            *in_flight = POOL.in_flight();
-        }
-    }
-}

@@ -6,8 +6,8 @@
 //! here costs what a plain field costs, and says in its type why that is
 //! sound.
 
-use core::cell::{Cell, UnsafeCell};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub use crate::const_init::ConstInit;
 use crate::consts::MAX_CPUS;
@@ -103,7 +103,10 @@ pub struct CpuLocal<T> {
 /// mid-line.
 #[repr(align(64))]
 struct Slot<T> {
-    busy: Cell<bool>,
+    /// Somebody is inside `value`. Plain loads and stores -- it is only ever
+    /// contended by code that is already wrong -- but atomic ones, so that
+    /// even then what goes wrong is a `None` and not a data race.
+    busy: AtomicBool,
     value: UnsafeCell<T>,
 }
 
@@ -115,7 +118,7 @@ impl<T: ConstInit> CpuLocal<T> {
     pub const fn new() -> Self {
         Self {
             slots: [const {
-                Slot { busy: Cell::new(false), value: UnsafeCell::new(T::INIT) }
+                Slot { busy: AtomicBool::new(false), value: UnsafeCell::new(T::INIT) }
             }; MAX_CPUS],
         }
     }
@@ -131,12 +134,13 @@ impl<T> CpuLocal<T> {
 
         let cpu = crate::cpu::id() as usize;
         let result = match self.slots.get(cpu) {
-            Some(slot) if !slot.busy.replace(true) => {
+            Some(slot) if !slot.busy.load(Ordering::Relaxed) => {
+                slot.busy.store(true, Ordering::Relaxed);
                 /* Interrupts are off and this is the CPU the slot belongs
                  * to: nothing else can be in it, and the flag just taken
                  * says this call is not inside another. */
                 let result = work(unsafe { &mut *slot.value.get() }, cpu);
-                slot.busy.set(false);
+                slot.busy.store(false, Ordering::Relaxed);
                 Some(result)
             }
             _ => None,

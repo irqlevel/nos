@@ -1187,20 +1187,3 @@ pub unsafe extern "C" fn kernel_net_submit_tx(
 pub extern "C" fn rust_net_poll_rx() {
     DEVICES.poll_rx();
 }
-
-/// Polls issued, polls that found work, and polls that found work with no
-/// interrupt-driven pass since the last one.
-///
-/// # Safety
-/// All three are writable, or null.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_net_rx_poll_stats(
-    polls: *mut usize, work: *mut usize, stalls: *mut usize,
-) {
-    let (a, b, c) = DEVICES.poll_counts();
-    unsafe {
-        if let Some(polls) = polls.as_mut() { *polls = a; }
-        if let Some(work) = work.as_mut() { *work = b; }
-        if let Some(stalls) = stalls.as_mut() { *stalls = c; }
-    }
-}

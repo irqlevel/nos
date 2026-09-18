@@ -69,13 +69,6 @@ extern "C" {
         batch_end: extern "C" fn(ctx: *mut u8),
     ) -> i32;
     pub fn kernel_net_udp_unlisten(dev: usize, port: u16, ctx: *mut u8);
-    /// Allocations the frame pool could not serve, and frames in flight.
-    pub fn kernel_netframe_pool_stats(misses: *mut usize, in_flight: *mut usize);
-    /// Receive polls, polls that found work, and polls that found work with
-    /// no interrupt-driven pass since the last one.
-    pub fn kernel_net_rx_poll_stats(
-        polls: *mut usize, work: *mut usize, stalls: *mut usize,
-    );
     /// Queues frames to transmit, one lock and one doorbell for the lot, from
     /// any context. Takes every frame; returns how many were queued.
     pub fn kernel_net_submit_tx(dev: usize, frames: *const usize, count: usize) -> usize;
