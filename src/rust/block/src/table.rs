@@ -27,14 +27,16 @@ use kcore::trace;
 /// What the table holds.
 pub const MAX_DEVICES: usize = 48;
 
-/// What a driver's submit answers (kcore::block)
+/// What a driver's submit answers, and the one op that is not about a range
+/// (kcore::block)
 const SUBMIT_INVALID: i32 = 2;
 const SUBMIT_UNSUPPORTED: i32 = 3;
+const IO_FLUSH: u8 = 2;
 
-/// A registered device: what its ops table said, kept for the life of the
-/// kernel because nothing takes a device back.
+/// A registered device, kept for the life of the kernel because nothing
+/// takes a device back.
 ///
-/// The name is a copy, and the driver's context is kept as the word it is to
+/// The name is a copy, and a driver's context is kept as the word it is to
 /// this layer -- handed back on every call and never looked into. So a
 /// device is plain data and a few functions, and may be shared between CPUs
 /// without anyone having to promise anything.
@@ -43,18 +45,30 @@ struct Device {
     name: Box<CStr>,
     capacity: u64,
     sector_size: u64,
-    read_sectors: extern "C" fn(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32) -> i32,
-    write_sectors: extern "C" fn(
-        ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
-    ) -> i32,
-    flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
-    /// The asynchronous path, both halves or neither
-    submit: Option<(
-        extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32,
-        extern "C" fn(ctx: *mut u8),
-    )>,
-    ctx: usize,
+    /// The disk a partition is on, as its handle; 0 for a whole disk
     parent: usize,
+    backend: Backend,
+}
+
+/// What does a device's I/O.
+enum Backend {
+    /// A driver: what its ops table said
+    Driver {
+        read_sectors: extern "C" fn(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32) -> i32,
+        write_sectors: extern "C" fn(
+            ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
+        ) -> i32,
+        flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
+        /// The asynchronous path, both halves or neither
+        submit: Option<(
+            extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32,
+            extern "C" fn(ctx: *mut u8),
+        )>,
+        ctx: usize,
+    },
+    /// A stretch of `parent`, from this sector of it: everything asked of a
+    /// partition is rebased onto its disk, and refused past its own end.
+    Partition { start: u64 },
 }
 
 impl Device {
@@ -62,9 +76,166 @@ impl Device {
         self.name.to_bytes()
     }
 
-    fn ctx(&self) -> *mut u8 {
-        self.ctx as *mut u8
+    /// Whether [sector, sector + count) is inside the device. By subtraction
+    /// from the size rather than by adding to the offset, so nothing can
+    /// wrap.
+    fn within(&self, sector: u64, count: u64) -> bool {
+        sector <= self.capacity && count <= self.capacity - sector
     }
+}
+
+/// A slot for `dev`, and its handle; 0 when the table is full.
+fn add(dev: Device) -> usize {
+    let slot = match reserve() {
+        Some(slot) => slot,
+        None => {
+            trace!(0, "block: the device table is full at {}", MAX_DEVICES);
+            return 0;
+        }
+    };
+
+    if let Some(dev) = DEVICES[slot].get_or_try_init(|| Some(Box::new(dev))) {
+        trace!(0, "block: {} registered, {} sectors of {} bytes",
+            core::str::from_utf8(dev.name()).unwrap_or("?"), dev.capacity, dev.sector_size);
+    }
+    slot + 1
+}
+
+/// One partition of the device `parent` names, as a device of its own. The
+/// asynchronous path is there exactly when the disk has one -- a caller
+/// picks its path by `can_submit`, and a partition that claimed one its disk
+/// cannot serve would have every submission refused.
+pub fn register_partition(parent: usize, start: u64, count: u64, name: &CStr) -> bool {
+    let sector_size = match device(parent) {
+        Some(disk) if disk.within(start, count) && count != 0 => disk.sector_size,
+        _ => return false,
+    };
+
+    add(Device {
+        name: name.into(),
+        capacity: count,
+        sector_size,
+        parent,
+        backend: Backend::Partition { start },
+    }) != 0
+}
+
+/* ---- I/O, by handle ----
+ *
+ * A buffer is a pointer here, passed on and never looked into: a driver
+ * DMAs to it, and what it points at is the contract of whoever called in.
+ * A partition is its disk a few sectors on, and a disk was registered before
+ * any partition of it, so the walk up ends. */
+
+fn read(handle: usize, sector: u64, buf: *mut u8, count: u32) -> i32 {
+    let dev = match device(handle) {
+        Some(dev) => dev,
+        None => return -1,
+    };
+    match dev.backend {
+        Backend::Driver { read_sectors, ctx, .. } => {
+            read_sectors(ctx as *mut u8, sector, buf, count)
+        }
+        Backend::Partition { start } if dev.within(sector, count as u64) => {
+            read(dev.parent, start + sector, buf, count)
+        }
+        Backend::Partition { .. } => -1,
+    }
+}
+
+fn write(handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32) -> i32 {
+    let dev = match device(handle) {
+        Some(dev) => dev,
+        None => return -1,
+    };
+    match dev.backend {
+        Backend::Driver { write_sectors, ctx, .. } => {
+            write_sectors(ctx as *mut u8, sector, buf, count, fua)
+        }
+        Backend::Partition { start } if dev.within(sector, count as u64) => {
+            write(dev.parent, start + sector, buf, count, fua)
+        }
+        Backend::Partition { .. } => -1,
+    }
+}
+
+fn flush(handle: usize) -> i32 {
+    match device(handle) {
+        Some(dev) => match dev.backend {
+            /* A device with no write cache to push has nothing to do here. */
+            Backend::Driver { flush: driver_flush, ctx, .. } => {
+                driver_flush.map_or(0, |driver_flush| driver_flush(ctx as *mut u8))
+            }
+            Backend::Partition { .. } => flush(dev.parent),
+        },
+        None => -1,
+    }
+}
+
+fn can_submit(handle: usize) -> bool {
+    match device(handle) {
+        Some(dev) => match dev.backend {
+            Backend::Driver { submit: async_path, .. } => async_path.is_some(),
+            Backend::Partition { .. } => can_submit(dev.parent),
+        },
+        None => false,
+    }
+}
+
+fn kick(handle: usize) {
+    if let Some(dev) = device(handle) {
+        match dev.backend {
+            Backend::Driver { submit: Some((_, driver_kick)), ctx, .. } => {
+                driver_kick(ctx as *mut u8)
+            }
+            Backend::Driver { .. } => {}
+            Backend::Partition { .. } => kick(dev.parent),
+        }
+    }
+}
+
+fn submit(handle: usize, io: &BlockIo, kick_now: i32) -> i32 {
+    let dev = match device(handle) {
+        Some(dev) => dev,
+        None => return SUBMIT_INVALID,
+    };
+
+    let start = match dev.backend {
+        Backend::Driver { submit: Some((driver_submit, _)), ctx, .. } => {
+            return driver_submit(ctx as *mut u8, io, kick_now);
+        }
+        Backend::Driver { .. } => return SUBMIT_UNSUPPORTED,
+        Backend::Partition { start } => start,
+    };
+
+    /* A flush is about the device, not about a range of it: passed on as it
+     * is. */
+    if io.op == IO_FLUSH {
+        return submit(dev.parent, io, kick_now);
+    }
+
+    if !dev.within(io.sector, io.count as u64) {
+        /* Refused, but a kick is still a kick: what was queued before it
+         * without a doorbell is owed one. */
+        if kick_now != 0 {
+            kick(dev.parent);
+        }
+        return SUBMIT_INVALID;
+    }
+
+    /* Moved onto the disk in a copy: the caller's io is only read, so it can
+     * be submitted again as it is after a Busy. */
+    let on_disk = BlockIo {
+        op: io.op,
+        fua: io.fua,
+        reserved: io.reserved,
+        count: io.count,
+        sector: start + io.sector,
+        phys: io.phys,
+        done: io.done,
+        ctx: io.ctx,
+    };
+    submit(dev.parent, &on_disk, kick_now)
 }
 
 static DEVICES: [OnceBox<Device>; MAX_DEVICES] = [const { OnceBox::new() }; MAX_DEVICES];
@@ -118,34 +289,19 @@ pub unsafe extern "C" fn kernel_blockdev_register(ops: *const BlockDeviceOps) ->
         _ => return 0,
     };
 
-    let name: Box<CStr> = unsafe { CStr::from_ptr(ops.name.cast()) }.into();
-
-    let slot = match reserve() {
-        Some(slot) => slot,
-        None => {
-            trace!(0, "block: the device table is full at {}", MAX_DEVICES);
-            return 0;
-        }
-    };
-
-    let made = DEVICES[slot].get_or_try_init(|| Some(Box::new(Device {
-        name,
+    add(Device {
+        name: unsafe { CStr::from_ptr(ops.name.cast()) }.into(),
         capacity: ops.capacity,
         sector_size: ops.sector_size,
-        read_sectors,
-        write_sectors,
-        flush: ops.flush,
-        submit,
-        ctx: ops.ctx as usize,
         parent: ops.parent,
-    })));
-
-    if let Some(dev) = made {
-        trace!(0, "block: {} registered, {} sectors of {} bytes",
-            core::str::from_utf8(dev.name()).unwrap_or("?"), dev.capacity, dev.sector_size);
-    }
-
-    slot + 1
+        backend: Backend::Driver {
+            read_sectors,
+            write_sectors,
+            flush: ops.flush,
+            submit,
+            ctx: ops.ctx as usize,
+        },
+    })
 }
 
 /// How many devices the table holds. It only grows, so an index once valid
@@ -232,10 +388,7 @@ pub extern "C" fn kernel_blockdev_sector_size(handle: usize) -> u64 {
 pub unsafe extern "C" fn kernel_blockdev_read(
     handle: usize, sector: u64, buf: *mut u8, count: u32,
 ) -> i32 {
-    match device(handle) {
-        Some(dev) => (dev.read_sectors)(dev.ctx(), sector, buf, count),
-        None => -1,
-    }
+    read(handle, sector, buf, count)
 }
 
 /// Synchronous write, count in sectors: 0 once the device has the data.
@@ -246,28 +399,18 @@ pub unsafe extern "C" fn kernel_blockdev_read(
 pub unsafe extern "C" fn kernel_blockdev_write(
     handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
 ) -> i32 {
-    match device(handle) {
-        Some(dev) => (dev.write_sectors)(dev.ctx(), sector, buf, count, fua),
-        None => -1,
-    }
+    write(handle, sector, buf, count, fua)
 }
 
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_flush(handle: usize) -> i32 {
-    match device(handle) {
-        /* A device with no write cache to push has nothing to do here. */
-        Some(dev) => dev.flush.map_or(0, |flush| flush(dev.ctx())),
-        None => -1,
-    }
+    flush(handle)
 }
 
 /// 1 if the device has the asynchronous path.
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_can_submit(handle: usize) -> i32 {
-    match device(handle) {
-        Some(dev) => dev.submit.is_some() as i32,
-        None => 0,
-    }
+    can_submit(handle) as i32
 }
 
 /// Hand the device an I/O straight to or from physical memory. Never blocks;
@@ -280,15 +423,8 @@ pub extern "C" fn kernel_blockdev_can_submit(handle: usize) -> i32 {
 pub unsafe extern "C" fn kernel_blockdev_submit(
     handle: usize, io: *const BlockIo, kick: i32,
 ) -> i32 {
-    if io.is_null() {
-        return SUBMIT_INVALID;
-    }
-
-    match device(handle) {
-        Some(dev) => match dev.submit {
-            Some((submit, _)) => submit(dev.ctx(), io, kick),
-            None => SUBMIT_UNSUPPORTED,
-        },
+    match unsafe { io.as_ref() } {
+        Some(io) => submit(handle, io, kick),
         None => SUBMIT_INVALID,
     }
 }
@@ -296,11 +432,7 @@ pub unsafe extern "C" fn kernel_blockdev_submit(
 /// Ring the doorbell for what a submit without a kick left queued.
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_kick(handle: usize) {
-    if let Some(dev) = device(handle) {
-        if let Some((_, kick)) = dev.submit {
-            kick(dev.ctx());
-        }
-    }
+    kick(handle);
 }
 
 /// How many partitions of the device the kernel found.
