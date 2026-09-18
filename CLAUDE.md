@@ -80,6 +80,14 @@ and the frame pool back where it began. Nothing else reaches the code that
 answers from inside the receive path -- or notices a frame pool that was
 never built, which is how a boot that passed every other gate spent two
 hours taking each frame from the allocator.
+Both of them take `--nic igb`, which swaps virtio-net for QEMU's 82576 (QEMU
+8.0 or later; CI's does not have it, so this one is run by hand). It is the
+only way any of the three hardware NIC drivers runs anywhere but on a Hetzner
+box -- MSI-X with two vectors, the descriptor rings, the receive poll and its
+interrupt throttle -- so run both after touching `drivers/igb` or the
+driver side of `kcore/src/net.rs`. `r8168` and `r8125` have no emulation
+at all: a change to either is checked by the compiler and then on the EX44,
+whose only console is that NIC, so keep their register sequences as they are.
 `./scripts/disklog-test.py` (arm64) boots with `disklog=on` over an area it
 prepares itself and then reads that area back with `scripts/disklog.py` —
 the boot's first fifty traced lines compared with the serial console's, line
