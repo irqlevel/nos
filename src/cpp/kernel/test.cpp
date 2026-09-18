@@ -15,7 +15,6 @@
 #include "symtab.h"
 #include "event.h"
 #include <hal/cpu.h>
-#include <block/block.h>
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
 #include <fs/fstest.h>
@@ -664,43 +663,21 @@ Stdlib::Error TestNextToken()
     return MakeSuccess();
 }
 
-static ulong FindBlockDevice(const char* name)
-{
-    return kernel_blockdev_find(
-        reinterpret_cast<const u8*>(name), Stdlib::StrLen(name));
-}
+/* The block layer's table (src/rust/block/src/selftest.rs). The devices are
+   whatever booted, so what is checked is that the table agrees with itself:
+   a name nothing carries finds nothing, and every device it counts answers
+   to its own name with the handle the walk gave. */
+extern "C" int rust_block_selftest();
 
-/* A lookup by name, against the table in Rust: the devices themselves are
-   whatever booted, so what is checked is that a name nothing carries finds
-   nothing and that walking the table agrees with its own count. */
 static Stdlib::Error TestBlockDeviceTable()
 {
     Trace(0, "TestBlockDeviceTable: started");
 
-    if (FindBlockDevice("nonexistent") != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
-
-    if (FindBlockDevice("") != 0)
-        return MakeError(Stdlib::Error::Unsuccessful);
-
-    /* Every device the table counts answers to the name it is registered
-       under, and answers with the same handle the walk gave. */
-    const u32 count = kernel_blockdev_count();
-    for (u32 i = 0; i < count; i++)
+    if (rust_block_selftest() != 0)
     {
-        const ulong dev = kernel_blockdev_at(i);
-        if (dev == 0)
-            continue;
-
-        const char* name = kernel_blockdev_name_ptr(dev);
-        if (name == nullptr)
-            return MakeError(Stdlib::Error::Unsuccessful);
-
-        if (FindBlockDevice(name) != dev)
-            return MakeError(Stdlib::Error::Unsuccessful);
+        Trace(0, "TestBlockDeviceTable: failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
-
-    Trace(0, "TestBlockDeviceTable: count = %u", (ulong)count);
 
     Trace(0, "TestBlockDeviceTable: complete");
     return MakeSuccess();
