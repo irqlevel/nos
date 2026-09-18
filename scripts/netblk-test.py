@@ -48,6 +48,11 @@ BLK_PORT = 7000
 DISK_MIB = 256
 SECTOR = 512
 
+# The second disk's one partition, and the port it is served on.
+PART_START = 2048
+PART_SECTORS = (64 << 20) // SECTOR
+PART_PORT = 7002
+
 # The UDP shell's framing (scripts/udpsh.py)
 SHELL_MAGIC = 0x4E4F5348
 SHELL_HDR = struct.Struct("!IIHHHH")
@@ -125,14 +130,30 @@ def build_images(tmp, arch):
     with open(os.path.join(tmp, "nvme.img"), "wb") as f:
         f.truncate(DISK_MIB << 20)
 
+    # A second disk with one partition on it: what is served there goes
+    # through the device table's rebasing, which a whole disk never touches.
+    with open(os.path.join(tmp, "nvme-part.img"), "wb") as f:
+        f.truncate(DISK_MIB << 20)
+        mbr = bytearray(SECTOR)
+        entry = struct.pack("<B3sB3sII", 0, b"\xfe\xff\xff", 0x83, b"\xfe\xff\xff",
+                            PART_START, PART_SECTORS)
+        mbr[446:446 + len(entry)] = entry
+        mbr[510:512] = b"\x55\xaa"
+        f.seek(0)
+        f.write(mbr)
+
 
 def boot(tmp, arch, tcg, nic="virtio"):
     log = os.path.join(tmp, "serial.log")
-    fwd = f"hostfwd=udp:127.0.0.1:{SHELL_PORT}-:{SHELL_PORT},hostfwd=udp:127.0.0.1:{BLK_PORT}-:{BLK_PORT}"
+    fwd = (f"hostfwd=udp:127.0.0.1:{SHELL_PORT}-:{SHELL_PORT},"
+           f"hostfwd=udp:127.0.0.1:{BLK_PORT}-:{BLK_PORT},"
+           f"hostfwd=udp:127.0.0.1:{PART_PORT}-:{PART_PORT}")
     disks = [
         "-drive", f"file={os.path.join(tmp, 'root.img')},format=raw,id=root,if=none",
         "-drive", f"file={os.path.join(tmp, 'nvme.img')},format=raw,id=nvme0,if=none",
         "-device", "nvme,serial=netblk0,drive=nvme0",
+        "-drive", f"file={os.path.join(tmp, 'nvme-part.img')},format=raw,id=nvme1,if=none",
+        "-device", "nvme,serial=netblk1,drive=nvme1",
         "-netdev", f"user,id=net0,{fwd}",
         "-serial", f"file:{log}", "-display", "none", "-m", "1G", "-smp", "4",
     ]
@@ -183,6 +204,26 @@ def expect_refused(client, req, status_text):
     raise TestFailure(f"expected '{status_text}', the request went through")
 
 
+def dump_sector(shell, disk, sector):
+    """The kernel's own read of one sector, no netblk in the way."""
+    dumped = bytearray()
+    for line in shell.run(f"diskread {disk} {sector}").splitlines():
+        _, colon, rest = line.partition(":")
+        if colon:
+            dumped.extend(int(token, 16) for token in rest.split())
+    return bytes(dumped)
+
+
+def find_partition(shell):
+    """The device the kernel made of the second disk's one partition: the
+    disk served first is nvme0 or nvme1 by probe order, so ask."""
+    for line in shell.run("disks").splitlines():
+        name = line.split()[0] if line.split() else ""
+        if name.startswith("nvme") and len(name) > len("nvme0"):
+            return name
+    return None
+
+
 def exercise(shell, tcg):
     print("module")
     check("loaded" in shell.run("insmod /netblk.ko"), "netblk.ko loaded")
@@ -220,15 +261,39 @@ def exercise(shell, tcg):
     # What was written through the network is on the disk: the kernel's own
     # read of the first sector, no netblk in the way
     start = client.read(0, SECTOR, 1)
-    dumped = bytearray()
-    for line in shell.run("diskread nvme0 0").splitlines():
-        _, colon, rest = line.partition(":")
-        if colon:
-            dumped.extend(int(token, 16) for token in rest.split())
-    check(bytes(dumped) == start, "the kernel reads what netblk wrote")
+    check(dump_sector(shell, "nvme0", 0) == start, "the kernel reads what netblk wrote")
 
     listing = shell.run("netblk list")
     check("port 7000" in listing and "reads " in listing, "listed")
+
+    # A partition: the same path, a disk away. What is written at the start
+    # of the partition has to land at the partition's start on the disk --
+    # not at the disk's -- and the end of the partition is the end.
+    print("a partition")
+    part = find_partition(shell)
+    check(part is not None, "the second disk's partition is a device")
+    check(f"serving {part}" in shell.run(f"netblk start {part} {PART_PORT}"), f"{part} served")
+
+    pclient = netblk.Client("127.0.0.1", PART_PORT)
+    check(pclient.size == PART_SECTORS * SECTOR, f"the partition's size, {pclient.size}")
+
+    head = random.Random(4).randbytes(64 * SECTOR)
+    pclient.write(0, head, 16)
+    last = random.Random(5).randbytes(SECTOR)
+    pclient.write(pclient.size - SECTOR, last, 1, netblk.FLAG_FUA)
+    pclient.flush()
+    check(pclient.read(0, len(head), 16) == head, "written and read back through the partition")
+    check(pclient.read(pclient.size - SECTOR, SECTOR, 1) == last, "and its last sector")
+    expect_refused(pclient, netblk.Request(netblk.OP_READ, pclient.size, SECTOR), "out of range")
+
+    disk = part[:-1]
+    check(dump_sector(shell, disk, PART_START) == head[:SECTOR],
+          "the partition's first sector is where the table says it is")
+    check(dump_sector(shell, disk, PART_START + PART_SECTORS - 1) == last,
+          "and its last one")
+    check(dump_sector(shell, disk, 0)[510:512] == b"\x55\xaa",
+          "the partition table in front of it is untouched")
+    check("stopped" in shell.run(f"netblk stop {PART_PORT}"), "the partition's server stopped")
 
     print("teardown")
     check("stopped" in shell.run(f"netblk stop {BLK_PORT}"), "stopped")
