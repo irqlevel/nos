@@ -1,5 +1,7 @@
-/// One asynchronous I/O straight to or from physical memory (AsyncBlockIo in
-/// block/block_device.h, whose layout this is).
+/// One asynchronous I/O straight to or from physical memory: what a caller
+/// that must not block hands a device. The zero-copy block server (the netblk
+/// module) has the disk DMA a read into the frame it is about to transmit,
+/// and a write out of the frame it received.
 #[repr(C)]
 pub struct BlockIo {
     /// 0 read, 1 write, 2 flush

@@ -3,9 +3,11 @@
 //! sectors.
 //!
 //! This is the C ABI half of the block layer -- the `kernel_blockdev_*`
-//! functions both the C++ side (block/block_device.h) and the Rust side
+//! functions both the C++ side (block/block.h) and the Rust side
 //! (`kcore::block`, and through it every module) call. A device is a handle,
 //! and a handle is a slot in the table plus one, so zero is never a device.
+//! There is no C++ view of a device: the shell, the disk log and a mount
+//! hold that handle and nothing else.
 //!
 //! The table only grows: nothing unregisters, which is what makes a lookup
 //! lock-free -- a slot is written once, with a release, and read with an
@@ -22,11 +24,10 @@ use kcore::cmd::Output;
 use kcore::sync::SpinLock;
 use kcore::trace;
 
-/// What the table holds. The C++ side mirrors it as
-/// BlockDeviceTable::MaxDevices.
+/// What the table holds.
 pub const MAX_DEVICES: usize = 48;
 
-/// What a driver's submit answers (kcore::block, block/block_device.h)
+/// What a driver's submit answers (kcore::block)
 const SUBMIT_INVALID: i32 = 2;
 const SUBMIT_UNSUPPORTED: i32 = 3;
 

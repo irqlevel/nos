@@ -2591,24 +2591,6 @@ fn ops_for(fs: *mut Ext2) -> FsOps {
 
 /* ---- what the kernel calls ---- */
 
-/// Does the device carry an ext2 this driver would mount? Fills `out` when
-/// it does, so the caller can pick a root filesystem by label or UUID.
-///
-/// # Safety
-/// `out` points at an Identity.
-#[no_mangle]
-pub unsafe extern "C" fn rust_ext2_probe(device: usize, out: *mut Identity) -> i32 {
-    let dev = match Disk::from_handle(device) {
-        Some(dev) => dev,
-        None => return -1,
-    };
-    if out.is_null() {
-        return -1;
-    }
-
-    if probe(&dev, unsafe { &mut *out }) { 0 } else { -1 }
-}
-
 /// Mount the device's ext2 at `path`: 0 mounted for writing, 1 mounted
 /// read-only -- asked for, or all the image allows -- and -1 not mounted.
 ///

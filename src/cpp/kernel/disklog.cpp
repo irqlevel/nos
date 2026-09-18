@@ -6,7 +6,7 @@
 #include "task.h"
 #include "sched.h"
 #include <hal/cpu.h>
-#include <block/block_device.h>
+#include <block/block.h>
 #include <lib/checksum.h>
 #include <mm/new.h>
 
@@ -22,7 +22,7 @@ namespace Kernel
  * completion interrupt from the device. */
 
 DiskLog::DiskLog()
-    : Dev(nullptr)
+    : Dev(0)
     , AreaStartSector(0)
     , AreaSectors(0)
     , SectorSize(0)
@@ -65,13 +65,13 @@ u32 DiskLog::HeaderCrc(const Header& hdr)
     return Stdlib::Crc32(&hdr, CrcOffset);
 }
 
-bool DiskLog::ReadHeader(BlockDevice* dev, Header& hdr)
+bool DiskLog::ReadHeader(ulong dev, Header& hdr)
 {
-    u32 sectorSize = (u32)dev->GetSectorSize();
+    u32 sectorSize = (u32)kernel_blockdev_sector_size(dev);
     if (sectorSize < sizeof(Header) || sectorSize > MaxSectorSize)
         return false;
 
-    if (!dev->ReadSectors(0, IoBuffer, 1))
+    if (kernel_blockdev_read(dev, 0, IoBuffer, 1) != 0)
         return false;
 
     Stdlib::MemCpy(&hdr, IoBuffer, sizeof(hdr));
@@ -83,7 +83,7 @@ bool DiskLog::ReadHeader(BlockDevice* dev, Header& hdr)
         return false;
 
     /* The area must fit the device and hold more than its own header. */
-    if (hdr.AreaSectors < 2 || hdr.AreaSectors > dev->GetCapacity())
+    if (hdr.AreaSectors < 2 || hdr.AreaSectors > kernel_blockdev_capacity(dev))
         return false;
 
     return hdr.Crc == HeaderCrc(hdr);
@@ -122,12 +122,10 @@ bool DiskLog::Setup()
         }
     }
 
-    auto& table = BlockDeviceTable::GetInstance();
-
-    for (ulong i = 0; i < table.GetCount(); i++)
+    for (u32 i = 0; i < kernel_blockdev_count(); i++)
     {
-        BlockDevice* dev = table.GetDevice(i);
-        if (dev == nullptr)
+        const ulong dev = kernel_blockdev_at(i);
+        if (dev == 0)
             continue;
 
         /* Reading here is safe and not under the lock: this runs once, in
@@ -139,10 +137,11 @@ bool DiskLog::Setup()
         /* The area is the disk log's from here on: a mount of the device, or
            of the disk it is on, or a module writing to it direct is refused */
         const char* heldBy = nullptr;
-        const ulong claim = table.Claim(dev, DiskLogHolder, heldBy);
+        const ulong claim = kernel_blockdev_claim_as(dev, DiskLogHolder, &heldBy);
         if (claim == 0)
         {
-            Trace(0, "DiskLog: %s is in use by %s, not writing to it", dev->GetName(), heldBy);
+            Trace(0, "DiskLog: %s is in use by %s, not writing to it",
+                kernel_blockdev_name_ptr(dev), heldBy);
             continue;
         }
 
@@ -168,15 +167,15 @@ bool DiskLog::Setup()
                 Stdlib::AutoLock lock(Lock);
                 Enabled = false;
                 Off = true;
-                Dev = nullptr;
+                Dev = 0;
                 DevClaim = 0;
             }
-            table.Release(claim);
+            kernel_blockdev_release(claim);
             return false;
         }
 
         Trace(0, "DiskLog: %s, boot %u, %u sectors of %u bytes",
-            dev->GetName(), (ulong)BootSeq, (ulong)AreaSectors,
+            kernel_blockdev_name_ptr(dev), (ulong)BootSeq, (ulong)AreaSectors,
             (ulong)SectorSize);
 
         /* The boot so far -- the whole ring, the line above with it -- goes
@@ -189,7 +188,7 @@ bool DiskLog::Setup()
             Trace(0, "DiskLog: no writer task, the log on disk stops here");
             Flush();
             SwitchOff();
-            table.Release(DevClaim);
+            kernel_blockdev_release(DevClaim);
             DevClaim = 0;
             return false;
         }
@@ -206,7 +205,7 @@ bool DiskLog::Setup()
 
 bool DiskLog::WriteHeader()
 {
-    if (Dev == nullptr || SectorSize == 0)
+    if (Dev == 0 || SectorSize == 0)
         return false;
 
     Header hdr;
@@ -222,7 +221,7 @@ bool DiskLog::WriteHeader()
     Stdlib::MemSet(HdrBuffer, 0, SectorSize);
     Stdlib::MemCpy(HdrBuffer, &hdr, sizeof(hdr));
 
-    if (!Dev->WriteSectors(AreaStartSector, HdrBuffer, 1, true))
+    if (kernel_blockdev_write(Dev, AreaStartSector, HdrBuffer, 1, 1) != 0)
     {
         WriteFailures++;
         return false;
@@ -324,7 +323,7 @@ void DiskLog::WriteOut()
         /* Forced to media: the point of this is to survive a machine that
            stops immediately afterwards, and a write sitting in a cache does
            not. */
-        if (!Dev->WriteSectors(firstSector, IoBuffer, (u32)sectors, true))
+        if (kernel_blockdev_write(Dev, firstSector, IoBuffer, (u32)sectors, 1) != 0)
         {
             WriteFailures++;
             break;
@@ -356,7 +355,7 @@ void DiskLog::WriteOut()
 /* Push what is queued to the device, from the writer's side. */
 void DiskLog::Flush()
 {
-    if (!Enabled || Dev == nullptr)
+    if (!Enabled || Dev == 0)
         return;
 
     /* One writer at a time. Losing the race costs nothing: the winner drains
@@ -490,13 +489,13 @@ void DiskLog::Stop()
     SwitchOff();
 
     /* Nothing writes the area again: it goes back to whoever wants it */
-    BlockDeviceTable::GetInstance().Release(DevClaim);
+    kernel_blockdev_release(DevClaim);
     DevClaim = 0;
 }
 
 void DiskLog::PanicFlush()
 {
-    if (!Enabled || Dev == nullptr || Off)
+    if (!Enabled || Dev == 0 || Off)
         return;
 
     /* No InFlush: every other CPU has been sent the halting IPI by now, and a
@@ -536,7 +535,8 @@ void DiskLog::Dump(Stdlib::Printer& printer)
     /* The writer's counters are read as they stand, without its InFlush:
        for a report, a value a moment old is as good as any. */
     printer.Printf("disklog: %s, boot %u, %u sectors of %u bytes\n",
-        Dev->GetName(), (ulong)BootSeq, (ulong)AreaSectors, (ulong)SectorSize);
+        kernel_blockdev_name_ptr(Dev), (ulong)BootSeq, (ulong)AreaSectors,
+        (ulong)SectorSize);
     printer.Printf("  on disk %u bytes, staged %u, queued %u, sector writes %u\n",
         (ulong)Cursor, (ulong)PendingUsed, ReadyRing.Count(),
         (ulong)SectorWrites);

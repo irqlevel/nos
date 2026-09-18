@@ -4,12 +4,12 @@ use crate::error::{Error, Result};
 
 pub use ffi::block::BlockIo;
 
-/// What a BlockIo asks for (AsyncBlockIo::Read, Write, Flush in block_device.h)
+/// What a BlockIo asks for
 pub const IO_READ: u8 = 0;
 pub const IO_WRITE: u8 = 1;
 pub const IO_FLUSH: u8 = 2;
 
-/// What a driver's submit answers (BlockDevice::Submit* in block_device.h)
+/// What a driver's submit answers
 pub const SUBMIT_OK: i32 = 0;
 pub const SUBMIT_BUSY: i32 = 1;
 pub const SUBMIT_INVALID: i32 = 2;

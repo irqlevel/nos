@@ -49,7 +49,7 @@
 #include <drivers/pci.h>
 #include <drivers/usb/xhci.h>
 
-#include <block/block_device.h>
+#include <block/block.h>
 #include <net/udp_shell.h>
 #include <net/net_frame_pool.h>
 #include <net/netconsole.h>
@@ -522,7 +522,7 @@ void BpStartup(void* ctx)
 
         InterruptEnable();
 
-        BlockDevice::SetInterruptsStarted();
+        kernel_blockdev_set_interrupts_started();
 
         Trace(0, "Interrupts enabled %u", (ulong)Hal::IsInterruptEnabled());
 

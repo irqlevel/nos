@@ -292,7 +292,7 @@ blkload nvme0: randread, bs 4 KiB, qd 8, 2 s over 64 MiB
 
 Reads are always allowed. A write test destroys what is on the device, so it
 has to be asked for by name, and it claims the device first
-(`BlockDeviceTable::Claim`, which mounts and the disk log take too, and the
+(`kernel_blockdev_claim_as`, which mounts and the disk log take too, and the
 shell's `format` and `diskwrite` while they write). The claim is refused
 while a mounted filesystem, the disk log or another writer holds the device
 -- or the disk it is a partition of, or one of its partitions -- whatever
