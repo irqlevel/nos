@@ -14,6 +14,7 @@ use crate::arp::ArpTable;
 use crate::dhcp::{Dhcp, Lease};
 use crate::dns::{Dns, MAX_DOMAIN_LEN};
 use crate::icmp::{Icmp, Stats};
+use crate::net_load::{NetLoad, Stats as NetLoadStats};
 use crate::netconsole::{Stats as NetconsoleStats, NETCONSOLE};
 use crate::udp_shell::UdpShell;
 use crate::wire::Mac;
@@ -23,6 +24,11 @@ static ICMP: AtomicPtr<Icmp> = AtomicPtr::new(core::ptr::null_mut());
 static DNS: AtomicPtr<Dns> = AtomicPtr::new(core::ptr::null_mut());
 static DHCP: AtomicPtr<Dhcp> = AtomicPtr::new(core::ptr::null_mut());
 static UDP_SHELL: AtomicPtr<UdpShell> = AtomicPtr::new(core::ptr::null_mut());
+
+/// The one load target: a static, because its per-CPU counters are its bulk
+/// and it is reached from the receive path, where a pointer chase is the
+/// kind of thing it exists to measure.
+static NET_LOAD: NetLoad = NetLoad::new_const();
 
 /// The one of something, made on first use. Two callers racing here both get
 /// the same one, and the loser's is dropped.
@@ -496,4 +502,50 @@ pub unsafe extern "C" fn rust_netconsole_stats(out: *mut NetconsoleStats) {
     }
 
     unsafe { *out = NETCONSOLE.stats() };
+}
+
+/* ---- the load target ---- */
+
+/// Start it on the device's `port`, echoing or sinking: 0 started, -1 not.
+#[no_mangle]
+pub extern "C" fn rust_netload_start(dev: usize, port: u16, echo: i32) -> i32 {
+    let nic = match unsafe { Nic::from_handle(dev) } {
+        Some(nic) => nic,
+        None => return -1,
+    };
+
+    if NET_LOAD.start(nic, port, echo != 0) { 0 } else { -1 }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_netload_stop() {
+    NET_LOAD.stop();
+}
+
+#[no_mangle]
+pub extern "C" fn rust_netload_running() -> i32 {
+    if NET_LOAD.is_running() { 1 } else { 0 }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_netload_reset() {
+    NET_LOAD.reset_counters();
+}
+
+/// What `netload` reports.
+///
+/// # Safety
+/// `out` points at a Stats.
+#[no_mangle]
+pub unsafe extern "C" fn rust_netload_stats(out: *mut NetLoadStats) {
+    if out.is_null() {
+        return;
+    }
+    unsafe { *out = NET_LOAD.stats() };
+}
+
+/// What the index'th CPU received, for the per-CPU line.
+#[no_mangle]
+pub extern "C" fn rust_netload_cpu_rx(index: usize) -> usize {
+    NET_LOAD.cpu_rx(index)
 }

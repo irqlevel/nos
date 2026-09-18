@@ -58,7 +58,24 @@ extern "C" {
     ) -> i32;
     /// Takes away the listener kernel_net_udp_listen put on the port with this
     /// ctx, and nobody else's; returns once no call of it is running.
+    /// The same, with a call at the end of each receive batch: where a
+    /// listener that answers from the receive path hands the batch's replies
+    /// to the NIC together rather than one at a time.
+    pub fn kernel_net_udp_listen_batch(
+        dev: usize,
+        port: u16,
+        cb: extern "C" fn(ctx: *mut u8, frame: usize),
+        ctx: *mut u8,
+        batch_end: extern "C" fn(ctx: *mut u8),
+    ) -> i32;
     pub fn kernel_net_udp_unlisten(dev: usize, port: u16, ctx: *mut u8);
+    /// Allocations the frame pool could not serve, and frames in flight.
+    pub fn kernel_netframe_pool_stats(misses: *mut usize, in_flight: *mut usize);
+    /// Receive polls, polls that found work, and polls that found work with
+    /// no interrupt-driven pass since the last one.
+    pub fn kernel_net_rx_poll_stats(
+        polls: *mut usize, work: *mut usize, stalls: *mut usize,
+    );
     /// Queues frames to transmit, one lock and one doorbell for the lot, from
     /// any context. Takes every frame; returns how many were queued.
     pub fn kernel_net_submit_tx(dev: usize, frames: *const usize, count: usize) -> usize;
