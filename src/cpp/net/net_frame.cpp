@@ -1,9 +1,11 @@
 #include "net_frame.h"
-#include "net_frame_pool.h"
 
 #include <lib/stdlib.h>
 #include <mm/new.h>
 #include <mm/page_table.h>
+
+/* The recycled pool (src/rust/net/src/frame.rs) */
+extern "C" Kernel::NetFrame* rust_netframe_pool_alloc(unsigned long len);
 
 namespace Kernel
 {
@@ -41,7 +43,7 @@ NetFrame* NetFrame::AllocTx(ulong dataLen)
        Mm::Free and so no cross-CPU TLB shootdown. Anything it cannot serve
        -- too large, or the pool exhausted -- falls through to the slow path
        below, which is what this used to be. */
-    NetFrame* pooled = NetFramePool::GetInstance().Alloc(dataLen);
+    NetFrame* pooled = rust_netframe_pool_alloc(dataLen);
     if (pooled != nullptr)
         return pooled;
 

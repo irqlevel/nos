@@ -1,4 +1,6 @@
-pub const MAX_CPUS: usize = 8;
+/* The most CPUs the kernel tracks is `consts::MAX_CPUS`, which is what a
+ * per-CPU array is sized by. There used to be a second one here, at 8,
+ * which no longer matched the kernel and which nothing used. */
 
 /// Returns the logical index of the current CPU.
 pub fn id() -> u32 {
@@ -37,4 +39,23 @@ pub fn synchronize() {
             run_on(cpu, nothing, core::ptr::null_mut());
         }
     }
+}
+
+/// Interrupts and preemption off until `irq_restore`, and the flags to give
+/// it back with.
+///
+/// For code that owns a per-CPU structure and needs nothing else: there is
+/// no lock to take, because nothing else touches that CPU's slot. The order
+/// matters -- reading the CPU id first and disabling after leaves a window
+/// in which this task is preempted onto another CPU, and then two CPUs are
+/// inside one per-CPU structure, which is not a per-CPU structure at all.
+pub fn irq_save() -> usize {
+    unsafe { ffi::cpu::kernel_irq_save() }
+}
+
+/// # Safety
+/// `flags` came from `irq_save` on this CPU, and nothing since has restored
+/// them.
+pub unsafe fn irq_restore(flags: usize) {
+    unsafe { ffi::cpu::kernel_irq_restore(flags) }
 }
