@@ -10,22 +10,13 @@
 #include "watchdog.h"
 #include "parameters.h"
 #include <net/net_device.h>
-#include <net/net_frame_pool.h>
 #include <net/net.h>
-#include <net/arp.h>
-#include <net/dhcp.h>
-#include <net/icmp.h>
-#include <net/dns.h>
-#include <net/tcp.h>
-#include <net/http.h>
-#include <net/netconsole.h>
 #include "entropy.h"
 #include "random.h"
 #include "console.h"
 #include "mutex.h"
 #include "task.h"
 #include "stack_probe.h"
-#include <net/net_load.h>
 #include "stack_trace.h"
 #include "symtab.h"
 #include "profiler.h"
@@ -45,6 +36,13 @@
 #include <lib/grub_env.h>
 #include "sha256.h"
 
+/* The network layer is Rust (src/rust/net); its commands register
+   themselves. These two are boot's, run by the shell's own task. */
+extern "C" {
+void rust_net_dhcp_auto(void* printer);
+void rust_net_dhcp_stop();
+}
+
 /* The filesystem layer is Rust (src/rust/fs). These are the calls the shell
    makes on it -- a script to read and rewrite, a file to checksum, a download
    to write -- taking paths as bytes and a length rather than a C string.
@@ -60,8 +58,6 @@ struct RustFile;
 /* Open flags (crate::vfs) */
 static const ulong FileRead = 1;
 static const ulong FileWrite = 2;
-static const ulong FileCreate = 4;
-static const ulong FileTruncate = 8;
 
 RustFile* kernel_vfs_open(const char* path, ulong len, ulong flags);
 void kernel_vfs_close(RustFile* file);
@@ -91,12 +87,6 @@ static RustFile* FileOpen(const char* path, ulong flags)
     return kernel_vfs_open(path, Stdlib::StrLen(path), flags);
 }
 
-
-static DhcpClient& GetDhcpClient()
-{
-    static DhcpClient instance;
-    return instance;
-}
 
 struct CmdEntry
 {
@@ -723,100 +713,6 @@ static void CmdNicdump(const char* args, Stdlib::Printer& con)
         (ulong)st.RxPolls, (ulong)st.RxBudgetHits);
 }
 
-static void CmdNetload(const char* args, Stdlib::Printer& con)
-{
-    auto& load = NetLoad::GetInstance();
-
-    const char* end;
-    const char* tok = Stdlib::NextToken(args, end);
-
-    if (tok == nullptr)
-    {
-        load.Dump(con);
-        return;
-    }
-
-    char buf[16];
-    Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
-
-    if (Stdlib::StrCmp(buf, "stop") == 0)
-    {
-        if (!load.IsRunning())
-        {
-            con.Printf("netload: not running\n");
-            return;
-        }
-
-        load.Stop();
-        con.Printf("netload: stopped\n");
-        return;
-    }
-
-    if (Stdlib::StrCmp(buf, "reset") == 0)
-    {
-        load.ResetCounters();
-        con.Printf("netload: counters cleared\n");
-        return;
-    }
-
-    if (Stdlib::StrCmp(buf, "start") != 0)
-    {
-        con.Printf("usage: netload [start [port] [sink] | stop | reset]\n");
-        return;
-    }
-
-    if (load.IsRunning())
-    {
-        con.Printf("netload: already running\n");
-        return;
-    }
-
-    ulong port = NetLoad::DefaultPort;
-    bool echo = true;
-
-    tok = Stdlib::NextToken(end, end);
-    if (tok != nullptr)
-    {
-        Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
-
-        if (Stdlib::StrCmp(buf, "sink") == 0)
-        {
-            echo = false;
-        }
-        else
-        {
-            if (!Stdlib::ParseUlong(buf, port) || port == 0 || port > 65535)
-            {
-                con.Printf("usage: netload [start [port] [sink] | stop | reset]\n");
-                return;
-            }
-
-            tok = Stdlib::NextToken(end, end);
-            if (tok != nullptr)
-            {
-                Stdlib::TokenCopy(tok, end, buf, sizeof(buf));
-                if (Stdlib::StrCmp(buf, "sink") == 0)
-                    echo = false;
-            }
-        }
-    }
-
-    NetDevice* dev = NetDeviceTable::GetInstance().Find("eth0");
-    if (dev == nullptr)
-    {
-        con.Printf("netload: no eth0\n");
-        return;
-    }
-
-    if (!load.Start(dev, (u16)port, echo))
-    {
-        con.Printf("netload: could not start on port %u\n", port);
-        return;
-    }
-
-    con.Printf("netload: listening on udp %u, %s\n", port, echo ? "echo" : "sink");
-}
-
 static void CmdPs(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -908,575 +804,6 @@ static void CmdUsb(const char* args, Stdlib::Printer& con)
     con.Printf("usb: not supported on this architecture\n");
 #endif
 }
-
-static void CmdNet(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    NetDeviceTable::GetInstance().Dump(con);
-    con.Printf("rx polls %u, poll work %u, stalls %u\n",
-        NetDeviceTable::GetInstance().GetRxPolls(),
-        NetDeviceTable::GetInstance().GetRxPollWork(),
-        NetDeviceTable::GetInstance().GetRxStalls());
-}
-
-static void CmdNetpool(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    NetFramePool::GetInstance().Dump(con);
-}
-
-static void CmdArp(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    ArpTable::GetInstance().Dump(con);
-}
-
-static void CmdNetconsole(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    Netconsole::GetInstance().Dump(con);
-}
-
-static void CmdIcmpstat(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    Icmp::GetInstance().Dump(con);
-}
-
-static void CmdTcpstat(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    Tcp::GetInstance().Dump(con);
-}
-
-/* The body is gathered into blocks this size before each write: ext2 then
-   commits its metadata once per block rather than once per TCP segment. */
-static const ulong WgetWriteBufSize = 64 * 1024;
-/* Progress line every this many bytes; a big download over a slow link
-   otherwise looks like a hang. */
-static const ulong WgetReportStep = 1024 * 1024;
-/* The longest URL a command line can carry (the UDP shell takes 255-byte
-   commands, the console 80). Redirect targets run far longer -- a GitHub
-   release link becomes ~900 characters -- but those never pass through
-   here: the client keeps them in its own HttpMaxUrlLen buffers. */
-static const ulong WgetMaxUrlLen = 256;
-
-/* Streams a download straight to a file. The body never exists in memory:
-   it arrives in TCP-sized pieces and leaves in WgetWriteBufSize blocks, so
-   a 20 MB file costs one 64 KB buffer. */
-class WgetFileSink : public HttpSink
-{
-public:
-    WgetFileSink(RustFile* file, Stdlib::Printer& con)
-        : Out(file)
-        , Con(con)
-        , Buf(nullptr)
-        , Used(0)
-        , Written(0)
-        , Reported(0)
-    {
-    }
-
-    virtual ~WgetFileSink()
-    {
-        if (Buf != nullptr)
-            Mm::Free(Buf);
-    }
-
-    bool Setup()
-    {
-        Buf = (u8*)Mm::Alloc(WgetWriteBufSize, 'Wget');
-        return Buf != nullptr;
-    }
-
-    virtual ulong Write(const u8* data, ulong len) override
-    {
-        ulong before = Written;
-        ulong taken = 0;
-
-        while (taken < len)
-        {
-            ulong room = WgetWriteBufSize - Used;
-            ulong take = (len - taken < room) ? (len - taken) : room;
-
-            Stdlib::MemCpy(Buf + Used, data + taken, take);
-            Used += take;
-            taken += take;
-
-            /* A failed block never reached the disk, and neither did
-               anything still buffered: only what Flush committed counts. */
-            if (Used == WgetWriteBufSize && !Flush())
-                return Written - before;
-        }
-
-        ulong total = Written + Used;
-        if (total - Reported >= WgetReportStep)
-        {
-            Reported = total - (total % WgetReportStep);
-            Con.Printf("wget: %u KB\n", total / Const::KB);
-        }
-
-        return taken;
-    }
-
-    /* Pushes what the buffer still holds; call once the body is over. */
-    bool Flush()
-    {
-        if (Used == 0)
-            return true;
-
-        ulong len = Used;
-        Used = 0;
-
-        if (kernel_vfs_write(Out, Buf, len) != 0)
-        {
-            Con.Printf("wget: write failed after %u bytes\n", Written);
-            return false;
-        }
-
-        Written += len;
-        return true;
-    }
-
-    /* Bytes committed to the file. */
-    ulong GetTotal() const { return Written; }
-
-private:
-    WgetFileSink(const WgetFileSink& other) = delete;
-    WgetFileSink& operator=(const WgetFileSink& other) = delete;
-
-    RustFile* Out;
-    Stdlib::Printer& Con;
-    u8* Buf;
-    ulong Used;      /* bytes buffered, not yet written */
-    ulong Written;   /* bytes committed to the file */
-    ulong Reported;
-};
-
-/* Why the request produced nothing. TLS gets its own line: "failed" for a
-   rejected certificate would send the reader looking in the wrong place. */
-static void WgetPrintFailure(const HttpResponse& resp, Stdlib::Printer& con)
-{
-    if (resp.TlsFailed)
-        con.Printf("wget: TLS handshake refused -- bad certificate, or no "
-                   "protocol in common (dmesg has the reason)\n");
-    else if (resp.Err.GetCode() == Stdlib::Error::BufTooBig)
-        con.Printf("wget: URL, or a redirect's target, longer than %u "
-                   "characters\n", HttpMaxUrlLen - 1);
-    else
-        con.Printf("wget: failed\n");
-}
-
-/* Downloads to a file, streaming. Returns false with the reason printed. */
-static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
-                       Stdlib::Printer& con)
-{
-    RustFile* file = FileOpen(path, FileWrite | FileCreate | FileTruncate);
-    if (file == nullptr)
-    {
-        con.Printf("wget: cannot open %s for writing\n", path);
-        return false;
-    }
-
-    WgetFileSink sink(file, con);
-    if (!sink.Setup())
-    {
-        con.Printf("wget: out of memory\n");
-        kernel_vfs_close(file);
-        return false;
-    }
-
-    HttpClient client(dev);
-    HttpResponse resp = client.Get(url, sink);
-
-    bool flushed = sink.Flush();
-    kernel_vfs_close(file);
-
-    /* Nothing landed -- a failed request, or a body refused before the
-       first byte: do not leave an empty file behind. */
-    if (sink.GetTotal() == 0)
-        kernel_vfs_remove(path, Stdlib::StrLen(path));
-
-    if (!resp.Ok)
-    {
-        WgetPrintFailure(resp, con);
-        return false;
-    }
-
-    con.Printf("HTTP %u, %u bytes\n", (ulong)resp.StatusCode, resp.BodyLen);
-
-    if (resp.Location[0] != '\0')
-        con.Printf("Location: %s\n", resp.Location);
-
-    if (!flushed)
-        return false;
-
-    if (resp.Truncated)
-    {
-        if (resp.Err.GetCode() == Stdlib::Error::BufTooBig)
-            con.Printf("wget: body over the %u MB limit\n",
-                       (ulong)(HttpMaxBodySize / Const::MB));
-        else
-            con.Printf("wget: incomplete, %u bytes saved to %s\n",
-                       sink.GetTotal(), path);
-        return false;
-    }
-
-    con.Printf("saved %u bytes to %s\n", sink.GetTotal(), path);
-    return true;
-}
-
-static void CmdWget(const char* args, Stdlib::Printer& con)
-{
-    char url[WgetMaxUrlLen];
-    char path[MaxPath];
-    url[0] = '\0';
-    path[0] = '\0';
-
-    /* wget [-o <path>] <url> [path] -- the flag and the trailing argument
-       mean the same thing, whichever reads better. */
-    const char* end = args;
-    for (const char* tok = Stdlib::NextToken(args, end); tok != nullptr;
-         tok = Stdlib::NextToken(end, end))
-    {
-        char arg[MaxPath];
-        Stdlib::TokenCopy(tok, end, arg, sizeof(arg));
-
-        if (Stdlib::StrCmp(arg, "-o") == 0)
-        {
-            const char* out = Stdlib::NextToken(end, end);
-            if (out == nullptr)
-            {
-                con.Printf("wget: -o needs a path\n");
-                return;
-            }
-            Stdlib::TokenCopy(out, end, path, sizeof(path));
-        }
-        else if (url[0] == '\0')
-        {
-            /* A cut-down URL would fetch some other resource. */
-            if (Stdlib::TokenCopy(tok, end, url, sizeof(url)) <
-                (ulong)(end - tok))
-            {
-                con.Printf("wget: URL longer than %u characters\n",
-                           WgetMaxUrlLen - 1);
-                return;
-            }
-        }
-        else if (path[0] == '\0')
-        {
-            Stdlib::TokenCopy(tok, end, path, sizeof(path));
-        }
-    }
-
-    if (url[0] == '\0')
-    {
-        con.Printf("usage: wget [-o <path>] <url> [path]\n");
-        return;
-    }
-
-    NetDevice* dev = NetDeviceTable::GetInstance().Find("eth0");
-    if (!dev)
-    {
-        con.Printf("eth0 not found\n");
-        return;
-    }
-
-    if (path[0] != '\0')
-    {
-        WgetToFile(dev, url, path, con);
-        return;
-    }
-
-    /* No file: the body is kept in memory, capped at HttpMaxResponseSize. */
-    HttpClient client(dev);
-    HttpResponse resp = client.Get(url);
-
-    if (!resp.Ok)
-    {
-        WgetPrintFailure(resp, con);
-        return;
-    }
-
-    con.Printf("HTTP %u, %u bytes\n", (ulong)resp.StatusCode, resp.BodyLen);
-
-    if (resp.Location[0] != '\0')
-        con.Printf("Location: %s\n", resp.Location);
-
-    if (resp.Body && resp.BodyLen > 0)
-    {
-        /* Print body as text, truncate to 4 KB for display */
-        static const ulong MaxDisplay = 4096;
-        ulong displayLen = resp.BodyLen;
-        if (displayLen > MaxDisplay)
-            displayLen = MaxDisplay;
-        for (ulong i = 0; i < displayLen; i++)
-            con.Printf("%c", (ulong)resp.Body[i]);
-        con.Printf("\n");
-        if (resp.BodyLen > MaxDisplay)
-            con.Printf("... (%u bytes truncated)\n", resp.BodyLen - MaxDisplay);
-    }
-
-    if (resp.Truncated)
-        con.Printf("wget: body truncated, pass a path to save it to a file\n");
-
-    if (resp.Body)
-        Mm::Free(resp.Body);
-}
-
-static void CmdUdpsend(const char* args, Stdlib::Printer& con)
-{
-    const char* end;
-    const char* ipStart = Stdlib::NextToken(args, end);
-    if (!ipStart)
-    {
-        con.Printf("usage: udpsend <ip> <port> <message>\n");
-        return;
-    }
-
-    char ipBuf[16];
-    Stdlib::TokenCopy(ipStart, end, ipBuf, sizeof(ipBuf));
-
-    const char* portStart = Stdlib::NextToken(end, end);
-    if (!portStart)
-    {
-        con.Printf("usage: udpsend <ip> <port> <message>\n");
-        return;
-    }
-
-    char portBuf[8];
-    Stdlib::TokenCopy(portStart, end, portBuf, sizeof(portBuf));
-
-    ulong port = 0;
-    if (!Stdlib::ParseUlong(portBuf, port) || port > 65535)
-    {
-        con.Printf("invalid port\n");
-        return;
-    }
-
-    /* Skip whitespace to get message */
-    const char* msg = end;
-    while (*msg == ' ')
-        msg++;
-
-    if (*msg == '\0')
-    {
-        con.Printf("usage: udpsend <ip> <port> <message>\n");
-        return;
-    }
-
-    Net::IpAddress dstIp;
-    if (!Net::IpAddress::Parse(ipBuf, dstIp))
-    {
-        con.Printf("invalid IP '%s'\n", ipBuf);
-        return;
-    }
-
-    /* Find first net device */
-    NetDevice* dev = nullptr;
-    if (NetDeviceTable::GetInstance().GetCount() > 0)
-        dev = NetDeviceTable::GetInstance().Find("eth0");
-
-    if (!dev)
-    {
-        con.Printf("no network device\n");
-        return;
-    }
-
-    /* The headers, the ARP resolution and the send are the net layer's --
-       this used to build the frame by hand, which is one more copy of the
-       same thing to keep right. */
-    static const u16 UdpSendSourcePort = 12345;
-    ulong msgLen = Stdlib::StrLen(msg);
-
-    if (NetDeviceSendUdp(dev, dstIp, (u16)port, NetDeviceIp(dev),
-            UdpSendSourcePort, msg, msgLen))
-    {
-        con.Printf("sent %u bytes to %s:%u\n", msgLen, ipBuf, port);
-    }
-    else
-    {
-        con.Printf("send failed\n");
-    }
-}
-
-static void CmdPing(const char* args, Stdlib::Printer& con)
-{
-    const char* end;
-    const char* ipStart = Stdlib::NextToken(args, end);
-    if (!ipStart)
-    {
-        con.Printf("usage: ping <ip|hostname>\n");
-        return;
-    }
-
-    char hostBuf[DnsResolver::MaxDomainLen + 1];
-    Stdlib::TokenCopy(ipStart, end, hostBuf, sizeof(hostBuf));
-
-    Net::IpAddress dstIp;
-    if (!Net::IpAddress::Parse(hostBuf, dstIp))
-    {
-        if (!DnsResolver::GetInstance().IsInitialized() ||
-            !DnsResolver::GetInstance().Resolve(hostBuf, dstIp))
-        {
-            con.Printf("cannot resolve '%s'\n", hostBuf);
-            return;
-        }
-    }
-
-    NetDevice* dev = nullptr;
-    if (NetDeviceTable::GetInstance().GetCount() > 0)
-        dev = NetDeviceTable::GetInstance().Find("eth0");
-
-    if (!dev)
-    {
-        con.Printf("no network device\n");
-        return;
-    }
-
-    u16 pingId = (u16)(Hal::ReadCycleCounter() & 0xFFFF);
-
-    con.Printf("PING %s\n", hostBuf);
-    ulong received = 0;
-
-    for (u16 seq = 0; seq < 5; seq++)
-    {
-        if (!Icmp::GetInstance().SendEchoRequest(dev, dstIp, pingId, seq))
-        {
-            con.Printf("send failed seq=%u\n", (ulong)seq);
-        }
-        else
-        {
-            ulong rttNs = 0;
-            if (Icmp::GetInstance().WaitReply(pingId, seq, 3000, rttNs))
-            {
-                ulong rttMs = rttNs / Const::NanoSecsInMs;
-                con.Printf("reply from %s: seq=%u time=%u ms\n",
-                    hostBuf, (ulong)seq, rttMs);
-                received++;
-            }
-            else
-            {
-                con.Printf("request timeout seq=%u\n", (ulong)seq);
-            }
-        }
-
-        if (seq < 4)
-            Sleep(1000 * Const::NanoSecsInMs);
-    }
-
-    con.Printf("%u/5 received\n", received);
-}
-
-static void CmdNslookup(const char* args, Stdlib::Printer& con)
-{
-    const char* end;
-    const char* nameStart = Stdlib::NextToken(args, end);
-    if (!nameStart)
-    {
-        con.Printf("usage: nslookup <hostname>\n");
-        return;
-    }
-
-    char hostBuf[DnsResolver::MaxDomainLen + 1];
-    Stdlib::TokenCopy(nameStart, end, hostBuf, sizeof(hostBuf));
-
-    if (!DnsResolver::GetInstance().IsInitialized())
-    {
-        con.Printf("DNS resolver not initialized\n");
-        return;
-    }
-
-    Net::IpAddress ip;
-    if (DnsResolver::GetInstance().Resolve(hostBuf, ip))
-    {
-        con.Printf("%s -> %u.%u.%u.%u\n", hostBuf,
-            (ulong)((ip.Addr4 >> 24) & 0xFF),
-            (ulong)((ip.Addr4 >> 16) & 0xFF),
-            (ulong)((ip.Addr4 >> 8) & 0xFF),
-            (ulong)(ip.Addr4 & 0xFF));
-    }
-    else
-    {
-        con.Printf("failed to resolve '%s'\n", hostBuf);
-    }
-}
-
-static void CmdDnsflush(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    DnsResolver::GetInstance().Flush();
-    con.Printf("dns cache flushed\n");
-}
-
-static void CmdDhcp(const char* args, Stdlib::Printer& con)
-{
-    if (Parameters::GetInstance().IsDhcpOff())
-    {
-        con.Printf("DHCP disabled (dhcp=off)\n");
-        return;
-    }
-
-    static Mutex dhcpLock;
-    Stdlib::AutoLock lock(dhcpLock);
-
-    const char* devName = "eth0";
-    if (args[0] != '\0')
-        devName = args;
-
-    NetDevice* dev = NetDeviceTable::GetInstance().Find(devName);
-    if (!dev)
-    {
-        con.Printf("device '%s' not found\n", devName);
-        return;
-    }
-
-    if (GetDhcpClient().IsReady())
-    {
-        DhcpResult r = GetDhcpClient().GetResult();
-        con.Printf("already bound: ");
-        r.Ip.Print(con);
-        con.Printf("\n");
-        return;
-    }
-
-    con.Printf("DHCP discovering on %s...\n", devName);
-    if (!GetDhcpClient().Start(dev))
-    {
-        con.Printf("failed to start DHCP\n");
-        return;
-    }
-
-    /* Wait up to 10 seconds for a lease */
-    for (ulong i = 0; i < 100 && !GetDhcpClient().IsReady(); i++)
-        Sleep(100 * Const::NanoSecsInMs);
-
-    if (GetDhcpClient().IsReady())
-    {
-        DhcpResult r = GetDhcpClient().GetResult();
-        con.Printf("ip:     "); r.Ip.Print(con); con.Printf("\n");
-        con.Printf("mask:   "); r.Mask.Print(con); con.Printf("\n");
-        con.Printf("router: "); r.Router.Print(con); con.Printf("\n");
-        con.Printf("dns:    "); r.Dns.Print(con); con.Printf("\n");
-        con.Printf("lease:  %u seconds\n", r.LeaseTime);
-
-        if (Parameters::GetInstance().IsDnsEnabled() && !r.Dns.IsZero() &&
-            !DnsResolver::GetInstance().IsInitialized())
-        {
-            if (DnsResolver::GetInstance().Init(dev, r.Dns))
-            {
-                con.Printf("DNS resolver started, server: ");
-                r.Dns.Print(con);
-                con.Printf("\n");
-            }
-        }
-    }
-    else
-    {
-        con.Printf("DHCP timeout\n");
-    }
-}
-
 
 
 /* crc32 <path>: the CRC-32 of a file, to check a copy against the host
@@ -2449,7 +1776,6 @@ static const CmdEntry Commands[] = {
     { "date",      CmdDate,      "date - show wall clock time" },
     { "ps",        CmdPs,        "ps - show tasks" },
     { "stacks",    CmdStacks,    "stacks - stack high-water marks" },
-    { "netload",   CmdNetload,   "netload [start [port] [sink]|stop|reset] - udp load target" },
     { "nicdump",   CmdNicdump,   "nicdump - r8125 chip and ring state" },
     { "igbdump",   CmdIgbdump,   "igbdump - igb chip and ring state" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
@@ -2461,18 +1787,6 @@ static const CmdEntry Commands[] = {
     { "irqstat",   CmdIrqstat,   "irqstat - show interrupt statistics" },
     { "pci",       CmdPci,       "pci - show pci devices" },
     { "usb",       CmdUsb,       "usb - show usb controllers and ports" },
-    { "net",       CmdNet,       "net - list network devices" },
-    { "arp",       CmdArp,       "arp - show ARP table" },
-    { "netpool",   CmdNetpool,   "netpool - show the recycled net frame pool" },
-    { "netconsole", CmdNetconsole, "netconsole - show netconsole state" },
-    { "icmpstat",  CmdIcmpstat,  "icmpstat - show ICMP statistics" },
-    { "tcpstat",   CmdTcpstat,   "tcpstat - show TCP connections and statistics" },
-    { "wget",      CmdWget,      "wget [-o <path>] <url> [path] - HTTP(S) GET, streamed to a file (up to 20 MB)" },
-    { "udpsend",   CmdUdpsend,   "udpsend <ip> <port> <msg> - send UDP packet" },
-    { "ping",      CmdPing,      "ping <ip|hostname> - send ICMP echo" },
-    { "nslookup",  CmdNslookup,  "nslookup <hostname> - resolve hostname" },
-    { "dnsflush",  CmdDnsflush,  "dnsflush - flush DNS cache" },
-    { "dhcp",      CmdDhcp,      "dhcp [dev] - obtain IP via DHCP" },
     { "crc32",     CmdCrc32,     "crc32 <path> - CRC-32 of a file" },
     { "sha256",    CmdSha256,    "sha256 <path> - SHA-256 of a file, as sha256sum prints it" },
     { "grubenv",   CmdGrubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
@@ -2854,7 +2168,7 @@ void Cmd::Stop()
 
 void Cmd::StopDhcp()
 {
-    GetDhcpClient().Stop();
+    rust_net_dhcp_stop();
 }
 
 bool Cmd::Start()
@@ -2924,44 +2238,7 @@ void Cmd::Run()
     ShowBanner(con);
 
     if (Parameters::GetInstance().IsDhcpAuto())
-    {
-        NetDevice* dev = NetDeviceTable::GetInstance().Find("eth0");
-        if (dev)
-        {
-            con.Printf("DHCP auto on eth0...\n");
-            if (GetDhcpClient().Start(dev))
-            {
-                for (ulong i = 0; i < 100 && !GetDhcpClient().IsReady(); i++)
-                    Sleep(100 * Const::NanoSecsInMs);
-
-                if (GetDhcpClient().IsReady())
-                {
-                    DhcpResult r = GetDhcpClient().GetResult();
-                    con.Printf("DHCP ip: ");
-                    r.Ip.Print(con);
-                    con.Printf("\n");
-
-                    if (Parameters::GetInstance().IsDnsEnabled() && !r.Dns.IsZero())
-                    {
-                        if (DnsResolver::GetInstance().Init(dev, r.Dns))
-                        {
-                            con.Printf("DNS resolver started, server: ");
-                            r.Dns.Print(con);
-                            con.Printf("\n");
-                        }
-                    }
-                }
-                else
-                {
-                    con.Printf("DHCP auto timeout\n");
-                }
-            }
-            else
-            {
-                con.Printf("DHCP auto failed\n");
-            }
-        }
-    }
+        rust_net_dhcp_auto(&con);
 
     RunBootScript();
 

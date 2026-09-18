@@ -97,3 +97,11 @@ extern "C" {
         line: extern "C" fn(ctx: *mut u8, s: *const u8, len: usize), ctx: *mut u8,
     );
 }
+
+/* What the kernel command line said about the network. */
+extern "C" {
+    /// `dhcp=off`: do not run a DHCP client.
+    pub fn kernel_param_dhcp_off() -> i32;
+    /// `dns=on`: start a resolver on a lease's DNS server.
+    pub fn kernel_param_dns_on() -> i32;
+}

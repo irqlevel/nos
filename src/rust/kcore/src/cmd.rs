@@ -21,6 +21,16 @@ impl core::fmt::Write for Output {
 }
 
 impl Output {
+    /// A printer the kernel passed in, for code that is not a command
+    /// handler but prints where one would -- the boot's DHCP, on the shell's
+    /// console.
+    ///
+    /// # Safety
+    /// `printer` is a `Stdlib::Printer*` that outlives the Output.
+    pub unsafe fn from_raw(printer: *mut c_void) -> Self {
+        Self { printer }
+    }
+
     /// Bytes as they are, for output that is not text -- a file `cat` prints,
     /// which is whatever was written to it.
     pub fn write_bytes(&mut self, bytes: &[u8]) {

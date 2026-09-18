@@ -22,11 +22,15 @@ pub mod icmp;
 pub mod net_load;
 pub mod netconsole;
 pub mod selftest;
+pub mod shell;
 pub mod tcp;
 pub mod udp;
 pub mod udp_shell;
+pub mod wget;
 pub mod wire;
 
-/// Nothing to set up: the layer is called from C++ by the names below, and
-/// this is what keeps them in the archive.
-pub fn init() {}
+/// Put the layer's commands in front of whoever runs one. Called from
+/// `rust_init`, before the shell starts.
+pub fn init() {
+    shell::register_all();
+}

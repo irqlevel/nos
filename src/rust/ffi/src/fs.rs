@@ -20,6 +20,23 @@ extern "C" {
     pub fn kernel_dir_create(path: *const u8, path_len: usize) -> i32;
 }
 
+/* The streaming half, for what must not exist in memory all at once -- a
+   download written to a file as it arrives. An open handle holds its
+   filesystem in place: nothing may unmount it, and nothing may remove or
+   rename the file, until the handle is closed. */
+extern "C" {
+    /// Flags: 1 read, 2 write, 4 create, 8 truncate, 16 append.
+    pub fn kernel_vfs_open(path: *const u8, path_len: usize, flags: usize) -> *mut core::ffi::c_void;
+    pub fn kernel_vfs_close(file: *mut core::ffi::c_void);
+    /// 0 with `*out` set to what was read -- 0 at end of file -- or -1.
+    pub fn kernel_vfs_read(
+        file: *mut core::ffi::c_void, buf: *mut u8, len: usize, out: *mut usize,
+    ) -> i32;
+    pub fn kernel_vfs_write(file: *mut core::ffi::c_void, data: *const u8, len: usize) -> i32;
+    pub fn kernel_vfs_size(file: *mut core::ffi::c_void) -> usize;
+    pub fn kernel_vfs_remove(path: *const u8, path_len: usize) -> i32;
+}
+
 /* What procfs puts in its files. Each writes into the buffer given and
    answers how many bytes it wrote. */
 extern "C" {
