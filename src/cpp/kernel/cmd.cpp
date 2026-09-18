@@ -878,12 +878,6 @@ static void CmdUsb(const char* args, Stdlib::Printer& con)
 #endif
 }
 
-static void CmdDisks(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    BlockDeviceTable::GetInstance().Dump(con);
-}
-
 static void CmdDiskread(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -3383,7 +3377,6 @@ static const CmdEntry Commands[] = {
     { "irqstat",   CmdIrqstat,   "irqstat - show interrupt statistics" },
     { "pci",       CmdPci,       "pci - show pci devices" },
     { "usb",       CmdUsb,       "usb - show usb controllers and ports" },
-    { "disks",     CmdDisks,     "disks - list block devices" },
     { "diskread",  CmdDiskread,  "diskread <disk> <sector> - read sector" },
     { "diskwrite", CmdDiskwrite, "diskwrite <disk> <sector> <hex> - write sector" },
     { "net",       CmdNet,       "net - list network devices" },

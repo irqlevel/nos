@@ -1,52 +1,35 @@
 #include "block_device.h"
 
-#include <kernel/trace.h>
-#include <kernel/spin_lock.h>
 #include <lib/stdlib.h>
+
+/* The table itself: src/rust/block/src/table.rs. A device is a handle there,
+   and everything below is that handle plus a call. */
+extern "C" {
+
+unsigned long kernel_blockdev_register(const Kernel::BlockDeviceOps* ops);
+unsigned int kernel_blockdev_count();
+unsigned long kernel_blockdev_at(unsigned int index);
+unsigned long kernel_blockdev_find(const unsigned char* name, unsigned long nameLen);
+const char* kernel_blockdev_name_ptr(unsigned long handle);
+unsigned long kernel_blockdev_parent(unsigned long handle);
+unsigned long long kernel_blockdev_capacity(unsigned long handle);
+unsigned long long kernel_blockdev_sector_size(unsigned long handle);
+int kernel_blockdev_read(unsigned long handle, unsigned long long sector,
+    void* buf, unsigned int count);
+int kernel_blockdev_write(unsigned long handle, unsigned long long sector,
+    const void* buf, unsigned int count, int fua);
+int kernel_blockdev_flush(unsigned long handle);
+int kernel_blockdev_can_submit(unsigned long handle);
+int kernel_blockdev_submit(unsigned long handle, const Kernel::AsyncBlockIo* io, int kick);
+void kernel_blockdev_kick(unsigned long handle);
+unsigned long kernel_blockdev_claim_as(unsigned long handle, const char* holder,
+    const char** heldBy);
+void kernel_blockdev_release(unsigned long claim);
+
+}
 
 namespace Kernel
 {
-
-namespace
-{
-
-/* BlockDeviceTable's claims, kept here so the header, which half the kernel
-   includes, stays free of the lock */
-struct ClaimEntry
-{
-    BlockDevice* Dev;
-    const char* Holder;
-    ulong Handle;       /* 0: the slot is free */
-};
-
-struct ClaimTable
-{
-    static ClaimTable& GetInstance()
-    {
-        static ClaimTable Instance;
-        return Instance;
-    }
-
-    ClaimTable()
-        : Generation(0)
-    {
-        Stdlib::MemSet(Entries, 0, sizeof(Entries));
-    }
-
-    static const ulong MaxClaims = BlockDeviceTable::MaxDevices;
-    /* A handle is the slot + 1 in its low bits and a count of claims above
-       them, so a stale handle never releases the slot's next claim */
-    static const ulong SlotBits = 8;
-    static_assert(MaxClaims < (1UL << SlotBits), "a slot must fit a handle");
-
-    SpinLock Lock;
-    ClaimEntry Entries[MaxClaims];
-    ulong Generation;
-};
-
-const char TooManyClaims[] = "too many claims already";
-
-}
 
 bool BlockDevice::InterruptsStarted = false;
 
@@ -60,146 +43,123 @@ bool BlockDevice::GetInterruptsStarted()
     return InterruptsStarted;
 }
 
-BlockDeviceTable::BlockDeviceTable()
-    : Count(0)
+const char* BlockDevice::GetName()
 {
+    const char* name = kernel_blockdev_name_ptr(Handle);
+    return name != nullptr ? name : "";
+}
+
+u64 BlockDevice::GetCapacity()
+{
+    return kernel_blockdev_capacity(Handle);
+}
+
+u64 BlockDevice::GetSectorSize()
+{
+    return kernel_blockdev_sector_size(Handle);
+}
+
+bool BlockDevice::Flush()
+{
+    return kernel_blockdev_flush(Handle) == 0;
+}
+
+BlockDevice* BlockDevice::GetParent()
+{
+    return BlockDeviceTable::GetInstance().FromHandle(kernel_blockdev_parent(Handle));
+}
+
+bool BlockDevice::ReadSectors(u64 sector, void* buf, u32 count)
+{
+    return kernel_blockdev_read(Handle, sector, buf, count) == 0;
+}
+
+bool BlockDevice::WriteSectors(u64 sector, const void* buf, u32 count, bool fua)
+{
+    return kernel_blockdev_write(Handle, sector, buf, count, fua ? 1 : 0) == 0;
+}
+
+bool BlockDevice::CanSubmitAsync()
+{
+    return kernel_blockdev_can_submit(Handle) != 0;
+}
+
+int BlockDevice::SubmitAsync(const AsyncBlockIo& io, bool kick)
+{
+    if (io.Done == nullptr)
+        return SubmitInvalid;
+
+    return kernel_blockdev_submit(Handle, &io, kick ? 1 : 0);
+}
+
+void BlockDevice::KickAsync()
+{
+    kernel_blockdev_kick(Handle);
+}
+
+BlockDeviceTable::BlockDeviceTable()
+{
+    /* A view per slot, so the handle a lookup answers with is the index into
+       this array plus one and the pointer never moves. */
     for (ulong i = 0; i < MaxDevices; i++)
-        Devices[i] = nullptr;
+        Views[i].Handle = i + 1;
 }
 
 BlockDeviceTable::~BlockDeviceTable()
 {
 }
 
-bool BlockDeviceTable::Overlap(BlockDevice* a, BlockDevice* b)
+bool BlockDeviceTable::Register(const BlockDeviceOps& ops)
 {
-    for (BlockDevice* dev = a; dev != nullptr; dev = dev->GetParent())
-    {
-        if (dev == b)
-            return true;
-    }
-
-    for (BlockDevice* dev = b; dev != nullptr; dev = dev->GetParent())
-    {
-        if (dev == a)
-            return true;
-    }
-
-    return false;
+    return kernel_blockdev_register(&ops) != 0;
 }
 
-ulong BlockDeviceTable::Claim(BlockDevice* dev, const char* holder, const char*& heldBy)
+BlockDevice* BlockDeviceTable::FromHandle(ulong handle)
 {
-    auto& claims = ClaimTable::GetInstance();
-    Stdlib::AutoLock lock(claims.Lock);
+    if (handle == 0 || handle > MaxDevices)
+        return nullptr;
 
-    ClaimEntry* slotEntry = nullptr;
-    ulong slot = 0;
-    for (ulong i = 0; i < ClaimTable::MaxClaims; i++)
-    {
-        ClaimEntry& entry = claims.Entries[i];
-        if (entry.Handle == 0)
-        {
-            if (slotEntry == nullptr)
-            {
-                slotEntry = &entry;
-                slot = i;
-            }
-        }
-        else if (Overlap(entry.Dev, dev))
-        {
-            heldBy = entry.Holder;
-            return 0;
-        }
-    }
-
-    if (slotEntry == nullptr)
-    {
-        heldBy = TooManyClaims;
-        return 0;
-    }
-
-    claims.Generation++;
-    slotEntry->Dev = dev;
-    slotEntry->Holder = holder;
-    slotEntry->Handle = (claims.Generation << ClaimTable::SlotBits) | (slot + 1);
-    return slotEntry->Handle;
-}
-
-void BlockDeviceTable::Release(ulong claim)
-{
-    const ulong index = claim & ((1UL << ClaimTable::SlotBits) - 1);
-    if (index == 0 || index > ClaimTable::MaxClaims)
-        return;
-
-    auto& claims = ClaimTable::GetInstance();
-    Stdlib::AutoLock lock(claims.Lock);
-
-    ClaimEntry& entry = claims.Entries[index - 1];
-    if (entry.Handle == claim)
-    {
-        entry.Handle = 0;
-        entry.Dev = nullptr;
-        entry.Holder = nullptr;
-    }
-}
-
-bool BlockDeviceTable::Register(BlockDevice* dev)
-{
-    if (Count >= MaxDevices || dev == nullptr)
-        return false;
-
-    Devices[Count] = dev;
-    Count++;
-
-    Trace(0, "BlockDevice registered: %s capacity %u sectors",
-        dev->GetName(), dev->GetCapacity());
-
-    return true;
+    return &Views[handle - 1];
 }
 
 BlockDevice* BlockDeviceTable::Find(const char* name)
 {
-    for (ulong i = 0; i < Count; i++)
-    {
-        if (Devices[i] && Stdlib::StrCmp(Devices[i]->GetName(), name) == 0)
-            return Devices[i];
-    }
-    return nullptr;
-}
+    if (name == nullptr)
+        return nullptr;
 
-void BlockDeviceTable::Dump(Stdlib::Printer& printer)
-{
-    if (Count == 0)
-    {
-        printer.Printf("no block devices\n");
-        return;
-    }
-
-    for (ulong i = 0; i < Count; i++)
-    {
-        if (!Devices[i])
-            continue;
-
-        u64 cap = Devices[i]->GetCapacity();
-        u64 secSize = Devices[i]->GetSectorSize();
-        u64 mb = (cap * secSize) / (1024 * 1024);
-
-        printer.Printf("%s  %u sectors (%u MB)  %u bytes/sector\n",
-            Devices[i]->GetName(), cap, mb, secSize);
-    }
+    return FromHandle(kernel_blockdev_find(
+        reinterpret_cast<const unsigned char*>(name), Stdlib::StrLen(name)));
 }
 
 ulong BlockDeviceTable::GetCount()
 {
-    return Count;
+    return kernel_blockdev_count();
 }
 
 BlockDevice* BlockDeviceTable::GetDevice(ulong index)
 {
-    if (index >= Count)
+    if (index >= MaxDevices)
         return nullptr;
-    return Devices[index];
+
+    return FromHandle(kernel_blockdev_at((unsigned int)index));
+}
+
+ulong BlockDeviceTable::Claim(BlockDevice* dev, const char* holder, const char*& heldBy)
+{
+    if (dev == nullptr || holder == nullptr)
+        return 0;
+
+    const char* held = nullptr;
+    ulong claim = kernel_blockdev_claim_as(dev->GetHandle(), holder, &held);
+    if (claim == 0)
+        heldBy = held;
+
+    return claim;
+}
+
+void BlockDeviceTable::Release(ulong claim)
+{
+    kernel_blockdev_release(claim);
 }
 
 }

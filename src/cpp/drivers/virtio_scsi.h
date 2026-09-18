@@ -43,7 +43,7 @@ struct VirtioScsiCmdResp
 
 static_assert(sizeof(VirtioScsiCmdResp) == 108, "Invalid size");
 
-class VirtioScsi : public BlockDevice, public InterruptHandler
+class VirtioScsi : public InterruptHandler
 {
 public:
     VirtioScsi();
@@ -53,13 +53,14 @@ public:
               u8 target, u16 lun, u64 capacity, u64 sectorSize, const char* name,
               u32 reqHdrSize, u32 respHdrSize);
 
-    /* BlockDevice interface */
-    virtual const char* GetName() override;
-    virtual u64 GetCapacity() override;
-    virtual u64 GetSectorSize() override;
-    virtual bool Flush() override;
-    virtual bool ReadSectors(u64 sector, void* buf, u32 count) override;
-    virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) override;
+    /* What the device table calls through the ops this registers
+       (BlockDeviceOps in block/block_device.h) */
+    const char* GetName();
+    u64 GetCapacity();
+    u64 GetSectorSize();
+    bool Flush();
+    bool ReadSectors(u64 sector, void* buf, u32 count);
+    bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false);
 
     /* InterruptHandler interface */
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;

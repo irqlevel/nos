@@ -21,12 +21,12 @@ pub struct BlockDeviceOps {
     pub name: *const u8,
     pub capacity: u64,
     pub sector_size: u64,
-    pub read_sectors: extern "C" fn(
+    pub read_sectors: Option<extern "C" fn(
         ctx: *mut u8, sector: u64, buf: *mut u8, count: u32,
-    ) -> i32,
-    pub write_sectors: extern "C" fn(
+    ) -> i32>,
+    pub write_sectors: Option<extern "C" fn(
         ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
-    ) -> i32,
+    ) -> i32>,
     pub flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
     /// The asynchronous path; None for a device without one.
     pub submit: Option<extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32>,
@@ -60,6 +60,11 @@ extern "C" {
     /// if it does not fit.
     pub fn kernel_blockdev_name(handle: usize, buf: *mut u8, len: usize) -> usize;
 
+    /// The name as the table holds it: NUL-terminated, kept for as long as
+    /// the device is registered, which is for good. Null for a handle that
+    /// names nothing.
+    pub fn kernel_blockdev_name_ptr(handle: usize) -> *const u8;
+
     /// The disk a partition is on, or 0 for a whole disk.
     pub fn kernel_blockdev_parent(handle: usize) -> usize;
 
@@ -84,6 +89,12 @@ extern "C" {
     /// those is on it, on the disk it is a partition of, or on a partition
     /// of it.
     pub fn kernel_blockdev_claim(handle: usize, held_by: *mut *const u8) -> usize;
+
+    /// The same, naming the holder a refusal reports -- what the kernel's own
+    /// claimants (a mount, the disk log, the shell) use.
+    pub fn kernel_blockdev_claim_as(
+        handle: usize, holder: *const u8, held_by: *mut *const u8,
+    ) -> usize;
 
     pub fn kernel_blockdev_release(claim: usize);
 

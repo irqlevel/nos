@@ -635,7 +635,7 @@ void VirtioScsi::HbaState::CompleteIO()
 
 void VirtioScsi::WaitForCompletion(BlockRequest& req)
 {
-    if (GetInterruptsStarted())
+    if (BlockDevice::GetInterruptsStarted())
     {
         req.Completion.Wait();
         return;
@@ -970,6 +970,28 @@ bool VirtioScsi::InitHbaCommon(HbaState* hba)
 
 /* Probe a target/LUN using INQUIRY and READ CAPACITY.
    On success, registers a VirtioScsi instance as a BlockDevice. */
+/* The device table's calls, which land on the instance behind ctx. The
+   virtio path is synchronous: no Submit, and so no Kick either. */
+namespace
+{
+
+int ScsiRead(void* ctx, u64 sector, void* buf, u32 count)
+{
+    return static_cast<VirtioScsi*>(ctx)->ReadSectors(sector, buf, count) ? 0 : -1;
+}
+
+int ScsiWrite(void* ctx, u64 sector, const void* buf, u32 count, int fua)
+{
+    return static_cast<VirtioScsi*>(ctx)->WriteSectors(sector, buf, count, fua != 0) ? 0 : -1;
+}
+
+int ScsiFlush(void* ctx)
+{
+    return static_cast<VirtioScsi*>(ctx)->Flush() ? 0 : -1;
+}
+
+}
+
 bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
 {
     if (InstanceCount >= MaxInstances)
@@ -1056,8 +1078,17 @@ bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
     inst.CapacitySectors = capacity;
     inst.SectorSz = blockSize;
 
-    /* Register as block device */
-    BlockDeviceTable::GetInstance().Register(&inst);
+    /* Into the kernel's device table, the same way a Rust driver goes:
+       an ops table whose context is this device. */
+    BlockDeviceOps ops = {};
+    ops.Name = inst.DevName;
+    ops.Capacity = inst.CapacitySectors;
+    ops.SectorSize = inst.SectorSz;
+    ops.ReadSectors = ScsiRead;
+    ops.WriteSectors = ScsiWrite;
+    ops.Flush = ScsiFlush;
+    ops.Ctx = &inst;
+    BlockDeviceTable::GetInstance().Register(ops);
 
     InstanceCount++;
     return true;
