@@ -73,6 +73,11 @@ connection table back where it started — a slot leaked per connection is
 invisible until the sixty-fourth. `scripts/sshd-test.py` covers the
 listening side (40 checks pass; the `poweroff unloads sshd before the
 unmount` one fails for reasons of its own, unrelated to TCP).
+`./scripts/disklog-test.py` (arm64) boots with `disklog=on` over an area it
+prepares itself and then reads that area back with `scripts/disklog.py` —
+the boot's first fifty traced lines compared with the serial console's, line
+for line. Nothing else in the suite gives `disklog=on`, and without it no
+disk is so much as read.
 
 Run in QEMU (serial console is logged to `nos.log`):
 

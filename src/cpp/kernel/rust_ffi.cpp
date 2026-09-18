@@ -532,6 +532,14 @@ unsigned long kernel_task_current()
     return (unsigned long)Kernel::Task::GetCurrentTask();
 }
 
+/* The same, but 0 rather than a complaint when the stack is not a task's.
+   For code that runs wherever it is called from -- the tracer's side of the
+   disk log above all, where the complaint would itself trace and recurse. */
+unsigned long kernel_task_current_or_none()
+{
+    return (unsigned long)Kernel::Task::TryGetCurrentTask();
+}
+
 unsigned int kernel_get_cpu_id()
 {
     return (unsigned int)Kernel::GetCpu().GetIndex();
@@ -1718,6 +1726,36 @@ void kernel_preempt_enable()
     Kernel::PreemptEnable();
 }
 
+/* The same, for code that runs on stacks that are not a task's -- the
+   tracer's, an interrupt handler's, an AP on its way up. Answers with the
+   task whose count went up, or 0 when there was none to raise, and that goes
+   back to kernel_preempt_enable_task: the count belongs to the task that
+   took it. */
+unsigned long kernel_preempt_disable_task()
+{
+    return (unsigned long)Kernel::PreemptDisableTask();
+}
+
+void kernel_preempt_enable_task(unsigned long task)
+{
+    Kernel::PreemptEnableTask(reinterpret_cast<Kernel::Task*>(task));
+}
+
+/* Whether preemption is on at all yet: before it is, no task will ever be
+   scheduled and a caller with work to hand off has to do it itself. */
+int kernel_preempt_is_on()
+{
+    return Kernel::PreemptIsOn() ? 1 : 0;
+}
+
+/* May the caller wait -- for a completion, or to be scheduled away? Not with
+   interrupts off, not off a task stack, and not with preemption disabled,
+   which every spinlock holds for as long as it is held. */
+int kernel_preempt_can_block()
+{
+    return Kernel::PreemptCanBlock() ? 1 : 0;
+}
+
 /* Whether interrupts are on for this CPU. What tells a caller it may
    release something whose free waits for every other CPU to answer -- with
    interrupts off it could not answer one itself. */
@@ -1731,6 +1769,18 @@ int kernel_interrupts_enabled()
 int kernel_panic_active()
 {
     return Kernel::Panicker::GetInstance().IsActive() ? 1 : 0;
+}
+
+/* Whether the kernel log is to be written to a prepared disk area: 1 for
+   disklog=on, 0 without it, and -1 before the command line has been read at
+   all -- when nobody knows yet, and every line is kept because the first
+   lines are part of the boot the area is meant to hold. */
+int kernel_disklog_wanted()
+{
+    auto& params = Kernel::Parameters::GetInstance();
+    if (!params.IsParsed())
+        return -1;
+    return params.IsDiskLogOn() ? 1 : 0;
 }
 
 /* What the root filesystem is to be, off the kernel command line: the mode

@@ -4,7 +4,7 @@
 The kernel writes its log, line by line and synchronously, to a raw area on a
 block device -- for the machine that has no serial port, no working NIC and so
 no netconsole, and stops somewhere in boot without saying anything. See
-src/cpp/kernel/disklog.h.
+src/rust/block/src/disklog.rs.
 
 The area is never guessed by the kernel, and nothing is read or written
 unless it was booted with disklog=on. It writes only where it finds the

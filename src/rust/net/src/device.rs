@@ -334,7 +334,7 @@ impl Device {
          * without it if it is not. Going on without it can race the holder
          * into the driver's ring; on a machine that is already dying, a
          * corrupted ring costs nothing and the report is worth everything. */
-        let panicking = unsafe { ffi::net::kernel_panic_active() } != 0;
+        let panicking = unsafe { ffi::panic::kernel_panic_active() } != 0;
         let (flags, acquired) = if panicking {
             self.tx_lock.try_lock_flags()
         } else {

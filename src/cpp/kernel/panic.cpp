@@ -15,7 +15,12 @@
 #include <hal/console.h>
 
 #include <net/netconsole.h>
-#include "disklog.h"
+
+/* The disk log is Rust (src/rust/block/src/disklog.rs). */
+extern "C" {
+void rust_disklog_log(const char* line);
+void rust_disklog_panic_flush();
+}
 
 namespace Kernel
 {
@@ -44,7 +49,7 @@ void Panicker::PrintOutput(const char* str)
     /* And into the disk log's, for its PanicFlush(): on a machine with no
        serial port and no network yet the disk is the only place the report
        can go. Log() takes no lock, which is what makes it safe here. */
-    DiskLog::GetInstance().Log(str);
+    rust_disklog_log(str);
 }
 
 void Panicker::DumpContext()
@@ -248,7 +253,7 @@ void Panicker::DoPanic(const char *fmt, ...)
            already has the whole report, so a TX path that turns out to be
            wedged costs nothing that was still needed. */
         Netconsole::GetInstance().PanicFlush();
-        DiskLog::GetInstance().PanicFlush();
+        rust_disklog_panic_flush();
     }
 
     for (;;)
@@ -297,7 +302,7 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
            already has the whole report, so a TX path that turns out to be
            wedged costs nothing that was still needed. */
         Netconsole::GetInstance().PanicFlush();
-        DiskLog::GetInstance().PanicFlush();
+        rust_disklog_panic_flush();
     }
 
     for (;;)

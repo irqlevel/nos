@@ -16,7 +16,6 @@
 #include "preempt.h"
 #include "dmesg.h"
 #include "watchdog.h"
-#include "disklog.h"
 #include "parameters.h"
 #include "console.h"
 #include "input.h"
@@ -410,6 +409,10 @@ void SomeTaskRoutine(void *ctx)
    All C++ objects with non-trivial destructors must go out of
    scope before those calls, so the body is wrapped in a block. */
 extern "C" void rust_init();
+
+/* The disk log is Rust (src/rust/block/src/disklog.rs). */
+extern "C" int rust_disklog_setup();
+extern "C" void rust_disklog_stop();
 extern "C" void rust_test();
 /* The partition table reader (src/rust/block): registers a block device for
    every partition of every disk the kernel has not looked at yet. */
@@ -629,7 +632,7 @@ void BpStartup(void* ctx)
            machine that stops before this point leaves nothing, because
            nothing can be written yet. Closing that gap means a polled
            completion path in the NVMe driver. */
-        DiskLog::GetInstance().Setup();
+        rust_disklog_setup();
 
         Tcp::GetInstance().Init();
 
@@ -712,7 +715,7 @@ void BpStartup(void* ctx)
         /* The disk log last of all: its writer finishes what is queued and
            the log switches off -- after SoftIrq::Stop() a write through a
            virtio disk would wait for ever. */
-        DiskLog::GetInstance().Stop();
+        rust_disklog_stop();
 
         SoftIrq::GetInstance().Stop();
     } /* all locals destroyed before stack is abandoned */

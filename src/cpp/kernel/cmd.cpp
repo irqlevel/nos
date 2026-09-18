@@ -8,7 +8,6 @@
 #include "interrupt.h"
 #include "time.h"
 #include "watchdog.h"
-#include "disklog.h"
 #include <block/block.h>
 #include "parameters.h"
 #include <net/net_device.h>
@@ -562,12 +561,6 @@ struct IgbState
 };
 
 extern "C" int igb_get_state(IgbState* out);
-
-static void CmdDisklog(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-    DiskLog::GetInstance().Dump(con);
-}
 
 static void CmdIgbdump(const char* args, Stdlib::Printer& con)
 {
@@ -3154,7 +3147,6 @@ static const CmdEntry Commands[] = {
     { "netload",   CmdNetload,   "netload [start [port] [sink]|stop|reset] - udp load target" },
     { "nicdump",   CmdNicdump,   "nicdump - r8125 chip and ring state" },
     { "igbdump",   CmdIgbdump,   "igbdump - igb chip and ring state" },
-    { "disklog",   CmdDisklog,   "disklog - kernel log to disk area state" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
     { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
