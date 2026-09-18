@@ -47,8 +47,6 @@
 #include <arch/x86_64/lapic.h>
 #include <arch/x86_64/ioapic.h>
 #include <drivers/pci.h>
-#include <drivers/virtio_scsi.h>
-#include <drivers/virtio_net.h>
 #include <drivers/usb/xhci.h>
 
 #include <block/block_device.h>
@@ -418,6 +416,10 @@ extern "C" void rust_partitions_probe();
 /* The virtio-blk driver (src/rust/drivers/virtio_blk): the disks come up
    here, before the partitions on them are looked at. */
 extern "C" void rust_virtio_blk_init();
+/* The virtio-net driver (src/rust/drivers/virtio_net) */
+extern "C" void rust_virtio_net_init();
+/* The virtio-scsi driver (src/rust/drivers/virtio_scsi) */
+extern "C" void rust_virtio_scsi_init();
 
 void BpStartup(void* ctx)
 {
@@ -468,7 +470,7 @@ void BpStartup(void* ctx)
         Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
 
         rust_virtio_blk_init();
-        VirtioScsi::InitAll();
+        rust_virtio_scsi_init();
         rust_partitions_probe();
 
         /* Before any driver can want a frame: the pool is what keeps the
@@ -488,7 +490,7 @@ void BpStartup(void* ctx)
 
         rust_init();
 
-        VirtioNet::InitAll();
+        rust_virtio_net_init();
 
         /* Now that the devices are here, fold what they can give into the
            pool: on a machine with a virtio-rng this is where it stops resting

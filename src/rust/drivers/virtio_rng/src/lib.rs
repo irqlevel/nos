@@ -256,7 +256,7 @@ pub unsafe extern "C" fn rust_virtio_rng_init_mmio(slots: *const Slot, count: us
         if unsafe { DEVICES } >= MAX_DEVICES {
             break;
         }
-        if slot.device_id != virtio::device::RNG {
+        if MmioTransport::device_id(slot) != virtio::device::RNG {
             continue;
         }
 

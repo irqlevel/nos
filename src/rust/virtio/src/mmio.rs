@@ -38,9 +38,11 @@ const REG_QUEUE_DEVICE_LOW: usize = 0x0A0;
 const REG_QUEUE_DEVICE_HIGH: usize = 0x0A4;
 const REG_CONFIG: usize = 0x100;
 
-/// A virtio-mmio device the device tree pointed at. The C++ boot code hands
-/// these over (`VirtioMmioSlot` in drivers/virtio_mmio.h), already mapped:
-/// the window is inside the device GiB the arm64 boot premaps.
+/// A virtio-mmio window the device tree pointed at, as the arm64 boot path
+/// hands it over: already mapped, because it is inside the device GiB that
+/// boot premaps. What kind of device is in it is this side's to read --
+/// [`MmioTransport::device_id`] -- so the boot path needs to know nothing
+/// about virtio at all.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Slot {
@@ -48,8 +50,7 @@ pub struct Slot {
     pub base: usize,
     pub size: usize,
     pub int_id: u32,
-    /// 1 net, 2 blk, 4 rng, 8 scsi
-    pub device_id: u32,
+    pub reserved: u32,
 }
 
 pub struct MmioTransport {

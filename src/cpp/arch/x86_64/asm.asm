@@ -10,8 +10,6 @@ extern PitInterrupt
 extern HpetInterrupt
 extern IPInterrupt
 extern LapicTimerInterrupt
-extern VirtioNetInterrupt
-extern VirtioScsiInterrupt
 extern SharedInterrupt
 extern RustInterruptDispatch
 extern RustMsixDispatch
@@ -103,8 +101,6 @@ global PitInterruptStub
 global HpetInterruptStub
 global IPInterruptStub
 global LapicTimerInterruptStub
-global VirtioNetInterruptStub
-global VirtioScsiInterruptStub
 global SharedInterruptStub
 global RustInterruptStub0
 global RustInterruptStub1
@@ -573,8 +569,6 @@ InterruptStub Pit
 InterruptStub Hpet
 InterruptStub IP
 InterruptStub LapicTimer
-InterruptStub VirtioNet
-InterruptStub VirtioScsi
 InterruptStub Shared
 
 ; One entry point per IDT vector. Every slot starts out pointing here
