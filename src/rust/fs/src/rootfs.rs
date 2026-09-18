@@ -99,7 +99,7 @@ fn mount_fallback_layout() {
         None => return,
     };
 
-    if unsafe { ramfs::rust_ramfs_mount(b"/".as_ptr(), 1, 0) } != 0 {
+    if !ramfs::mount_at("/", false) {
         trace!(0, "MountRootFs: failed to mount ramfs on /");
         return;
     }
@@ -149,8 +149,7 @@ fn mount_procfs() {
         None => return,
     };
 
-    let mut stat = crate::vfs::FileStat { node_type: 0, size: 0, ino: 0 };
-    if !vfs.stat(b"/proc", &mut stat) && !vfs.create(b"/proc", true) {
+    if vfs.stat(b"/proc").is_none() && !vfs.create(b"/proc", true) {
         trace!(0, "MountRootFs: no /proc directory and cannot make one");
         return;
     }

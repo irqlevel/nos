@@ -11,11 +11,11 @@ use core::fmt::Write;
 use kcore::block::{self, Disk};
 use kcore::cmd::Output;
 
-use crate::files::{self, Buffer};
+use crate::files::{self, buffer};
 use crate::paths::{base_name, is_under, Path};
-use crate::vfs::{FileStat, DirEntry, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
+use crate::vfs::{FileStat, Open, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
                  OPEN_WRITE};
-use crate::vnode::{NAME_MAX, TYPE_DIR};
+use crate::vnode::Kind;
 use crate::{ext2, nanofs, ramfs, vfs_instance};
 
 /// What `format`'s claim on its device says to whoever is refused it.
@@ -33,14 +33,7 @@ fn args_of(args: &str) -> core::str::SplitWhitespace<'_> {
 }
 
 fn stat_of(path: &str) -> Option<FileStat> {
-    let vfs = vfs_instance()?;
-    let mut st = FileStat { node_type: 0, size: 0, ino: 0 };
-    if vfs.stat(path.as_bytes(), &mut st) { Some(st) } else { None }
-}
-
-fn entry_name(entry: &DirEntry) -> &str {
-    let len = entry.name.iter().position(|b| *b == 0).unwrap_or(NAME_MAX);
-    core::str::from_utf8(&entry.name[..len]).unwrap_or("?")
+    vfs_instance()?.stat(path.as_bytes())
 }
 
 fn find_disk(name: &str, out: &mut Output) -> Option<Disk> {
@@ -205,7 +198,7 @@ pub fn write(args: &str, out: &mut Output) {
     let content = rest_after_first(args);
 
     let vfs = match vfs_instance() { Some(vfs) => vfs, None => return };
-    if vfs.write_file(path.as_bytes(), content.as_ptr(), content.len()) {
+    if vfs.write_file(path.as_bytes(), content.as_bytes()) {
         let _ = writeln!(out, "wrote {} bytes", content.len());
     } else {
         let _ = writeln!(out, "write failed");
@@ -220,18 +213,19 @@ pub fn append(args: &str, out: &mut Output) {
     let content = rest_after_first(args);
 
     let vfs = match vfs_instance() { Some(vfs) => vfs, None => return };
-    let file = vfs.open(path.as_bytes(), OPEN_APPEND | OPEN_CREATE);
-    if file.is_null() {
-        let _ = writeln!(out, "open failed");
-        return;
-    }
+    let file = match Open::new(vfs, path.as_bytes(), OPEN_APPEND | OPEN_CREATE) {
+        Some(file) => file,
+        None => {
+            let _ = writeln!(out, "open failed");
+            return;
+        }
+    };
 
-    if vfs.write(file, content.as_ptr(), content.len()) {
+    if file.write(content.as_bytes()) {
         let _ = writeln!(out, "appended {} bytes", content.len());
     } else {
         let _ = writeln!(out, "write failed");
     }
-    vfs.close(file);
 }
 
 pub fn mkdir(args: &str, out: &mut Output) {
@@ -296,7 +290,7 @@ pub fn stat(args: &str, out: &mut Output) {
 
     match stat_of(path) {
         None => { let _ = writeln!(out, "not found"); }
-        Some(st) if st.node_type == TYPE_DIR => {
+        Some(st) if st.kind == Kind::Dir => {
             let _ = writeln!(out, "{}: directory, inode {}", path, st.ino);
         }
         Some(st) => {
@@ -317,7 +311,7 @@ pub fn sync(_args: &str, out: &mut Output) {
 /// `dst`, or `dst/<basename of src>` when `dst` is an existing directory.
 fn copy_target(src: &str, dst: &str) -> Option<Path> {
     match stat_of(dst) {
-        Some(st) if st.node_type == TYPE_DIR => Path::join(dst, base_name(src)),
+        Some(st) if st.kind == Kind::Dir => Path::join(dst, base_name(src)),
         _ => Path::from(dst),
     }
 }
@@ -327,52 +321,47 @@ fn copy_target(src: &str, dst: &str) -> Option<Path> {
 fn copy_file(src: &str, dst: &str, out: &mut Output) -> Option<usize> {
     let vfs = vfs_instance()?;
 
-    let input = vfs.open(src.as_bytes(), OPEN_READ);
-    if input.is_null() {
-        let _ = writeln!(out, "cp: cannot open {}", src);
-        return None;
-    }
+    let input = match Open::new(vfs, src.as_bytes(), OPEN_READ) {
+        Some(input) => input,
+        None => {
+            let _ = writeln!(out, "cp: cannot open {}", src);
+            return None;
+        }
+    };
 
-    let output = vfs.open(dst.as_bytes(), OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE);
-    if output.is_null() {
-        let _ = writeln!(out, "cp: cannot create {}", dst);
-        vfs.close(input);
-        return None;
-    }
+    let flags = OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE;
+    let output = match Open::new(vfs, dst.as_bytes(), flags) {
+        Some(output) => output,
+        None => {
+            let _ = writeln!(out, "cp: cannot create {}", dst);
+            return None;
+        }
+    };
 
-    let mut buf = match Buffer::new(COPY_CHUNK) {
+    let mut buf = match buffer(COPY_CHUNK) {
         Some(buf) => buf,
         None => {
             let _ = writeln!(out, "cp: alloc failed");
-            vfs.close(output);
-            vfs.close(input);
             return None;
         }
     };
 
     let mut copied = 0;
-    let mut ok = true;
     loop {
-        let got = match vfs.read(input, buf.as_mut_ptr(), COPY_CHUNK) {
-            Some(0) => break,
+        let got = match input.read(&mut buf) {
+            Some(0) => return Some(copied),
             Some(got) => got,
             None => {
                 let _ = writeln!(out, "cp: read from {} failed", src);
-                ok = false;
-                break;
+                return None;
             }
         };
-        if !vfs.write(output, buf.as_slice().as_ptr(), got) {
+        if !output.write(&buf[..got]) {
             let _ = writeln!(out, "cp: write to {} failed", dst);
-            ok = false;
-            break;
+            return None;
         }
         copied += got;
     }
-
-    vfs.close(output);
-    vfs.close(input);
-    if ok { Some(copied) } else { None }
 }
 
 fn copy_tree(src: &str, dst: &str, depth: usize, out: &mut Output,
@@ -391,7 +380,7 @@ fn copy_tree(src: &str, dst: &str, depth: usize, out: &mut Output,
                 return false;
             }
         }
-        Some(st) if st.node_type != TYPE_DIR => {
+        Some(st) if st.kind != Kind::Dir => {
             let _ = writeln!(out, "cp: {} exists and is not a directory", dst);
             return false;
         }
@@ -399,14 +388,10 @@ fn copy_tree(src: &str, dst: &str, depth: usize, out: &mut Output,
     }
 
     let mut index = 0;
-    loop {
-        let mut entry = DirEntry { name: [0; NAME_MAX], node_type: 0, size: 0 };
-        if !vfs.read_dir(src.as_bytes(), index, &mut entry) {
-            break;
-        }
+    while let Some(entry) = vfs.read_dir(src.as_bytes(), index) {
         index += 1;
 
-        let name = entry_name(&entry);
+        let name = core::str::from_utf8(entry.name()).unwrap_or("?");
         let (from, to) = match (Path::join(src, name), Path::join(dst, name)) {
             (Some(from), Some(to)) => (from, to),
             _ => {
@@ -415,7 +400,7 @@ fn copy_tree(src: &str, dst: &str, depth: usize, out: &mut Output,
             }
         };
 
-        if entry.node_type == TYPE_DIR {
+        if entry.kind == Kind::Dir {
             if !copy_tree(from.as_str(), to.as_str(), depth + 1, out, files_done, bytes) {
                 return false;
             }
@@ -458,7 +443,7 @@ pub fn cp(args: &str, out: &mut Output) {
         return;
     }
 
-    if st.node_type == TYPE_DIR {
+    if st.kind == Kind::Dir {
         if !recursive {
             let _ = writeln!(out, "cp: {} is a directory (use -r)", src);
             return;

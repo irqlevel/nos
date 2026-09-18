@@ -7,61 +7,35 @@
 //! them here rather than in C++, where it used to go out to the VFS view and
 //! straight back into this crate.
 
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use kcore::cmd::Output;
 use kcore::trace;
 
 use crate::paths::Path;
-use crate::vfs::{FileStat, MAX_PATH, OPEN_READ};
-use crate::vfs::Vfs;
-use crate::vnode::{TYPE_DIR, TYPE_FILE};
+use crate::vfs::{FileStat, Open, Vfs, OPEN_READ};
+use crate::vnode::Kind;
 use crate::vfs_instance;
 
 /// A file is streamed to a printer through a buffer of this size, so the
 /// file itself never has to fit in one allocation.
 const READ_CHUNK: usize = 4096;
 
-/// A heap buffer taken fallibly and given back on the way out. `Vec` would
+/// `len` zeroed bytes from the heap, taken fallibly: a `vec![0; len]` would
 /// panic the kernel on a failed allocation rather than let the caller say so.
-pub struct Buffer {
-    ptr: *mut u8,
-    len: usize,
-}
-
-impl Buffer {
-    pub fn new(len: usize) -> Option<Self> {
-        let layout = core::alloc::Layout::from_size_align(len, 8).ok()?;
-        let ptr = unsafe { alloc::alloc::alloc(layout) };
-        if ptr.is_null() { None } else { Some(Self { ptr, len }) }
-    }
-
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-}
-
-impl Drop for Buffer {
-    fn drop(&mut self) {
-        let layout = core::alloc::Layout::from_size_align(self.len, 8).unwrap();
-        unsafe { alloc::alloc::dealloc(self.ptr, layout) };
-    }
+pub fn buffer(len: usize) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).ok()?;
+    buf.resize(len, 0);
+    Some(buf)
 }
 
 /// Where `replace_file` puts a file's next content.
 const SUFFIX: &str = ".new";
 
 fn stat(vfs: &Vfs, path: &[u8]) -> Option<FileStat> {
-    let mut st = FileStat { node_type: 0, size: 0, ino: 0 };
-    if vfs.stat(path, &mut st) { Some(st) } else { None }
+    vfs.stat(path)
 }
 
 /* ---- what the shell shows ---- */
@@ -80,24 +54,17 @@ pub fn list_dir(path: &str, out: &mut Output) -> bool {
         }
     };
 
-    if st.node_type != TYPE_DIR {
+    if st.kind != Kind::Dir {
         let _ = writeln!(out, "not a directory");
         return false;
     }
 
     let mut index = 0;
-    loop {
-        let mut entry = crate::vfs::DirEntry {
-            name: [0; crate::vnode::NAME_MAX], node_type: 0, size: 0,
-        };
-        if !vfs.read_dir(path.as_bytes(), index, &mut entry) {
-            break;
-        }
+    while let Some(entry) = vfs.read_dir(path.as_bytes(), index) {
         index += 1;
 
-        let len = entry.name.iter().position(|b| *b == 0).unwrap_or(entry.name.len());
-        let name = core::str::from_utf8(&entry.name[..len]).unwrap_or("?");
-        if entry.node_type == TYPE_FILE {
+        let name = core::str::from_utf8(entry.name()).unwrap_or("?");
+        if entry.kind == Kind::File {
             let _ = writeln!(out, "f {} {}", entry.size, name);
         } else {
             let _ = writeln!(out, "d   {}", name);
@@ -113,43 +80,39 @@ pub fn read_file(path: &str, out: &mut Output) -> bool {
         None => return false,
     };
 
-    let file = vfs.open(path.as_bytes(), OPEN_READ);
-    if file.is_null() {
-        let _ = writeln!(out, "file not found");
-        return false;
-    }
-
-    /* From the allocator and not the stack, and fallibly: a task's stack has
-     * no room for this, and `Vec` would panic the kernel rather than report
-     * that there was no memory. */
-    let mut buf = match Buffer::new(READ_CHUNK) {
-        Some(buf) => buf,
+    let file = match Open::new(vfs, path.as_bytes(), OPEN_READ) {
+        Some(file) => file,
         None => {
-            trace!(0, "fs: read_file: no memory for a {} byte buffer", READ_CHUNK);
-            let _ = writeln!(out, "read failed");
-            vfs.close(file);
+            let _ = writeln!(out, "file not found");
             return false;
         }
     };
 
-    let mut ok = true;
+    /* From the allocator and not the stack, and fallibly: a task's stack has
+     * no room for this, and a failed allocation is to be reported rather
+     * than panicked on. */
+    let mut buf = match buffer(READ_CHUNK) {
+        Some(buf) => buf,
+        None => {
+            trace!(0, "fs: read_file: no memory for a {} byte buffer", READ_CHUNK);
+            let _ = writeln!(out, "read failed");
+            return false;
+        }
+    };
+
     loop {
-        match vfs.read(file, buf.as_mut_ptr(), READ_CHUNK) {
+        match file.read(&mut buf) {
             Some(0) => break,
-            Some(got) => out.write_bytes(&buf.as_slice()[..got]),
+            Some(got) => out.write_bytes(&buf[..got]),
             None => {
                 let _ = writeln!(out, "read failed");
-                ok = false;
-                break;
+                return false;
             }
         }
     }
 
-    vfs.close(file);
-    if ok {
-        let _ = writeln!(out);
-    }
-    ok
+    let _ = writeln!(out);
+    true
 }
 
 pub fn dump_mounts(out: &mut Output) {
@@ -159,39 +122,20 @@ pub fn dump_mounts(out: &mut Output) {
     };
 
     for index in 0..vfs.mount_count() {
-        let mut path = [0u8; MAX_PATH];
-        let mut info = [0u8; 64];
-        let mut name: *const u8 = core::ptr::null();
+        let mount = match vfs.mount_info(index) {
+            Some(mount) => mount,
+            None => continue,
+        };
 
-        let read_only = vfs.mount_at(index, &mut path, &mut name, &mut info);
-        if read_only < 0 {
-            continue;
-        }
-
-        let rw = if read_only != 0 { "ro" } else { "rw" };
-        let path = cstr(&path);
-        let info = cstr(&info);
-        let name = name_of(name);
+        let rw = if mount.read_only { "ro" } else { "rw" };
+        let path = core::str::from_utf8(mount.path()).unwrap_or("?");
+        let info = core::str::from_utf8(mount.info()).unwrap_or("?");
         if info.is_empty() {
-            let _ = writeln!(out, "{} on {}  {}", name, path, rw);
+            let _ = writeln!(out, "{} on {}  {}", mount.fs_name, path, rw);
         } else {
-            let _ = writeln!(out, "{} on {}  {}  {}", name, path, info, rw);
+            let _ = writeln!(out, "{} on {}  {}  {}", mount.fs_name, path, info, rw);
         }
     }
-}
-
-fn cstr(buf: &[u8]) -> &str {
-    let len = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    core::str::from_utf8(&buf[..len]).unwrap_or("?")
-}
-
-/// The filesystem's name, which it keeps for good.
-fn name_of(name: *const u8) -> &'static str {
-    if name.is_null() {
-        return "?";
-    }
-    let text = unsafe { core::ffi::CStr::from_ptr(name as *const core::ffi::c_char) };
-    text.to_str().unwrap_or("?")
 }
 
 /* ---- the two-step replace ---- */
@@ -215,14 +159,14 @@ pub fn replace_file(path: &str, data: &[u8]) -> bool {
     };
 
     if let Some(st) = stat(vfs, path.as_bytes()) {
-        if st.node_type != TYPE_FILE {
+        if st.kind != Kind::File {
             trace!(0, "fs: replace_file: {} is not a file", path);
             return false;
         }
     }
 
     /* The old content stays where it is until all of the new is on disk. */
-    if !vfs.write_file(next.as_bytes(), data.as_ptr(), data.len()) || !vfs.sync() {
+    if !vfs.write_file(next.as_bytes(), data) || !vfs.sync() {
         vfs.remove(next.as_bytes());
         return false;
     }
@@ -269,7 +213,7 @@ pub unsafe extern "C" fn kernel_file_size(path: *const u8, path_len: usize) -> i
         None => return -1,
     };
     match stat(vfs, at.as_bytes()) {
-        Some(st) if st.node_type == TYPE_FILE => st.size as isize,
+        Some(st) if st.kind == Kind::File => st.size as isize,
         _ => -1,
     }
 }
@@ -294,23 +238,23 @@ pub unsafe extern "C" fn kernel_file_read(
         Some(at) => at,
         None => return -1,
     };
-    let file = vfs.open(at.as_bytes(), OPEN_READ);
-    if file.is_null() {
-        return -1;
+    let file = match Open::new(vfs, at.as_bytes(), OPEN_READ) {
+        Some(file) => file,
+        None => return -1,
+    };
+    if cap == 0 {
+        return 0;
     }
 
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf, cap) };
     let mut total = 0;
     while total < cap {
-        match vfs.read(file, unsafe { buf.add(total) }, cap - total) {
+        match file.read(&mut buf[total..]) {
             Some(0) => break,
             Some(got) => total += got,
-            None => {
-                vfs.close(file);
-                return -1;
-            }
+            None => return -1,
         }
     }
-    vfs.close(file);
     total as isize
 }
 
@@ -333,7 +277,7 @@ pub unsafe extern "C" fn kernel_file_write(
         return -1;
     }
 
-    let data = unsafe { core::slice::from_raw_parts(data, len) };
+    let data = unsafe { bytes(data, len) };
     if replace_file(path, data) { 0 } else { -1 }
 }
 
@@ -363,7 +307,7 @@ pub unsafe extern "C" fn kernel_file_create(
     if !vfs.create(path.as_bytes(), false) {
         return 1;
     }
-    if !vfs.write_file(path.as_bytes(), data, len) || !vfs.sync() {
+    if !vfs.write_file(path.as_bytes(), unsafe { bytes(data, len) }) || !vfs.sync() {
         return -1;
     }
     0
@@ -405,9 +349,22 @@ pub unsafe extern "C" fn kernel_dir_create(path: *const u8, path_len: usize) -> 
     };
 
     match stat(vfs, path.as_bytes()) {
-        Some(st) if st.node_type == TYPE_DIR => 0,
+        Some(st) if st.kind == Kind::Dir => 0,
         Some(_) => -1,
         None => if vfs.create(path.as_bytes(), true) { 0 } else { -1 },
+    }
+}
+
+/// What a caller outside Rust wants written: nothing, for a length of 0,
+/// whatever the pointer.
+///
+/// # Safety
+/// `data` points at `len` readable bytes, unless `len` is 0.
+unsafe fn bytes<'a>(data: *const u8, len: usize) -> &'a [u8] {
+    if len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(data, len) }
     }
 }
 

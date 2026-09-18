@@ -11,11 +11,11 @@ use core::fmt::Write;
 use kcore::cmd::Output;
 use kcore::trace;
 
-use crate::files::Buffer;
+use crate::files::buffer;
 use crate::paths::Path;
-use crate::vfs::{FileStat, DirEntry, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
-                 OPEN_WRITE, File, Vfs};
-use crate::vnode::{NAME_MAX, TYPE_DIR, TYPE_FILE};
+use crate::vfs::{FileStat, Open, Vfs, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
+                 OPEN_WRITE};
+use crate::vnode::Kind;
 use crate::vfs_instance;
 
 /// The big file is written in chunks of one size and read back in chunks of
@@ -44,49 +44,21 @@ fn pattern(offset: usize, salt: u8) -> u8 {
 }
 
 fn stat_of(vfs: &Vfs, path: &str) -> Option<FileStat> {
-    let mut st = FileStat { node_type: 0, size: 0, ino: 0 };
-    if vfs.stat(path.as_bytes(), &mut st) { Some(st) } else { None }
+    vfs.stat(path.as_bytes())
 }
 
 /// An open file that closes itself, so no path out of the test leaks one.
-struct Handle<'a> {
-    vfs: &'a Vfs,
-    file: *mut File,
-}
-
-impl<'a> Handle<'a> {
-    fn open(vfs: &'a Vfs, path: &str, flags: usize) -> Option<Self> {
-        let file = vfs.open(path.as_bytes(), flags);
-        if file.is_null() { None } else { Some(Self { vfs, file }) }
-    }
-
-    fn write(&self, data: &[u8]) -> bool {
-        self.vfs.write(self.file, data.as_ptr(), data.len())
-    }
-
-    fn read(&self, buf: &mut Buffer, len: usize) -> Option<usize> {
-        self.vfs.read(self.file, buf.as_mut_ptr(), len)
-    }
-
-    fn seek(&self, pos: usize) -> bool {
-        self.vfs.seek(self.file, pos)
-    }
-}
-
-impl Drop for Handle<'_> {
-    fn drop(&mut self) {
-        self.vfs.close(self.file);
-    }
+fn open<'a>(vfs: &'a Vfs, path: &str, flags: usize) -> Option<Open<'a>> {
+    Open::new(vfs, path.as_bytes(), flags)
 }
 
 fn read_whole(vfs: &Vfs, path: &str, buf: &mut [u8]) -> Option<usize> {
-    let file = Handle::open(vfs, path, OPEN_READ)?;
+    let file = open(vfs, path, OPEN_READ)?;
     let mut got = 0;
     while got < buf.len() {
-        match vfs.read(file.file, unsafe { buf.as_mut_ptr().add(got) }, buf.len() - got) {
-            Some(0) => break,
-            Some(n) => got += n,
-            None => return None,
+        match file.read(&mut buf[got..])? {
+            0 => break,
+            n => got += n,
         }
     }
     Some(got)
@@ -99,7 +71,7 @@ fn check_content(vfs: &Vfs, path: &str, expect: &[u8], report: &mut Reporter) ->
     }
 
     match stat_of(vfs, path) {
-        Some(st) if st.node_type == TYPE_FILE && st.size == expect.len() => {}
+        Some(st) if st.kind == Kind::File && st.size == expect.len() => {}
         _ => {
             report.say(path, "size is wrong");
             return false;
@@ -121,7 +93,7 @@ const SALT: u8 = 0x5A;
 const SALT2: u8 = 0xC3;
 
 fn big_file(vfs: &Vfs, path: &str, size: usize, report: &mut Reporter) -> bool {
-    let (mut wbuf, mut rbuf) = match (Buffer::new(WRITE_CHUNK), Buffer::new(READ_CHUNK)) {
+    let (mut wbuf, mut rbuf) = match (buffer(WRITE_CHUNK), buffer(READ_CHUNK)) {
         (Some(w), Some(r)) => (w, r),
         _ => {
             report.say(path, "alloc failed");
@@ -131,7 +103,7 @@ fn big_file(vfs: &Vfs, path: &str, size: usize, report: &mut Reporter) -> bool {
 
     /* Sequential write in big chunks */
     {
-        let file = match Handle::open(vfs, path, OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE) {
+        let file = match open(vfs, path, OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE) {
             Some(file) => file,
             None => { report.say(path, "create failed"); return false; }
         };
@@ -139,7 +111,7 @@ fn big_file(vfs: &Vfs, path: &str, size: usize, report: &mut Reporter) -> bool {
         while pos < size {
             let chunk = (size - pos).min(WRITE_CHUNK);
             fill(&mut wbuf, chunk, pos, SALT);
-            if !file.write(&wbuf.as_slice()[..chunk]) {
+            if !file.write(&wbuf[..chunk]) {
                 report.say(path, "write failed");
                 return false;
             }
@@ -161,12 +133,12 @@ fn big_file(vfs: &Vfs, path: &str, size: usize, report: &mut Reporter) -> bool {
     let patch_off = size / 2 - 100;
     let patch_len = (4096 + 300).min(size - patch_off);
     {
-        let file = match Handle::open(vfs, path, OPEN_WRITE) {
+        let file = match open(vfs, path, OPEN_WRITE) {
             Some(file) if file.seek(patch_off) => file,
             _ => { report.say(path, "open for patch failed"); return false; }
         };
         fill(&mut wbuf, patch_len, patch_off, SALT2);
-        if !file.write(&wbuf.as_slice()[..patch_len]) {
+        if !file.write(&wbuf[..patch_len]) {
             report.say(path, "patch write failed");
             return false;
         }
@@ -198,7 +170,7 @@ fn big_file(vfs: &Vfs, path: &str, size: usize, report: &mut Reporter) -> bool {
 
     /* Grow it back past the cut: the gap must read as zeros */
     {
-        let file = match Handle::open(vfs, path, OPEN_WRITE | OPEN_APPEND) {
+        let file = match open(vfs, path, OPEN_WRITE | OPEN_APPEND) {
             Some(file) => file,
             None => { report.say(path, "append after truncate failed"); return false; }
         };
@@ -213,20 +185,20 @@ fn big_file(vfs: &Vfs, path: &str, size: usize, report: &mut Reporter) -> bool {
         return false;
     }
     {
-        let file = match Handle::open(vfs, path, OPEN_READ) {
+        let file = match open(vfs, path, OPEN_READ) {
             Some(file) if file.seek(cut) => file,
             _ => { report.say(path, "read of the grown tail failed"); return false; }
         };
-        match file.read(&mut rbuf, tail) {
+        match file.read(&mut rbuf[..tail]) {
             Some(got) if got == tail => {}
             _ => { report.say(path, "read of the grown tail failed"); return false; }
         }
     }
-    if &rbuf.as_slice()[..3] != b"END" {
+    if &rbuf[..3] != b"END" {
         report.say(path, "appended bytes are wrong");
         return false;
     }
-    if rbuf.as_slice()[3..tail].iter().any(|b| *b != 0) {
+    if rbuf[3..tail].iter().any(|b| *b != 0) {
         report.say(path, "grown gap is not zero");
         return false;
     }
@@ -234,18 +206,17 @@ fn big_file(vfs: &Vfs, path: &str, size: usize, report: &mut Reporter) -> bool {
     true
 }
 
-fn fill(buf: &mut Buffer, len: usize, base: usize, salt: u8) {
-    let slice = buf.as_mut_slice();
-    for (i, byte) in slice[..len].iter_mut().enumerate() {
+fn fill(buf: &mut [u8], len: usize, base: usize, salt: u8) {
+    for (i, byte) in buf[..len].iter_mut().enumerate() {
         *byte = pattern(base + i, salt);
     }
 }
 
 /// Read the whole file back in odd-sized chunks and check every byte against
 /// the pattern -- the second salt over the patched stretch, when there is one.
-fn verify(vfs: &Vfs, path: &str, rbuf: &mut Buffer, expect_len: usize,
+fn verify(vfs: &Vfs, path: &str, rbuf: &mut [u8], expect_len: usize,
           patched: Option<(usize, usize)>, report: &mut Reporter, when: &str) -> bool {
-    let file = match Handle::open(vfs, path, OPEN_READ) {
+    let file = match open(vfs, path, OPEN_READ) {
         Some(file) => file,
         None => {
             report.say(path, "open for read failed");
@@ -255,7 +226,7 @@ fn verify(vfs: &Vfs, path: &str, rbuf: &mut Buffer, expect_len: usize,
 
     let mut pos = 0;
     loop {
-        let got = match file.read(rbuf, READ_CHUNK) {
+        let got = match file.read(&mut rbuf[..READ_CHUNK]) {
             Some(0) => break,
             Some(got) => got,
             None => {
@@ -264,7 +235,7 @@ fn verify(vfs: &Vfs, path: &str, rbuf: &mut Buffer, expect_len: usize,
             }
         };
 
-        for (i, byte) in rbuf.as_slice()[..got].iter().enumerate() {
+        for (i, byte) in rbuf[..got].iter().enumerate() {
             let off = pos + i;
             let want = match patched {
                 Some((at, len)) if off >= at && off < at + len => pattern(off, SALT2),
@@ -297,7 +268,7 @@ pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
     };
 
     match stat_of(vfs, dir) {
-        Some(st) if st.node_type == TYPE_DIR => {}
+        Some(st) if st.kind == Kind::Dir => {}
         _ => { report.say(dir, "not a directory"); return false; }
     }
 
@@ -337,7 +308,7 @@ pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &Path,
         big_size: usize, report: &mut Reporter) -> bool {
-    if !vfs.write_file(a.as_bytes(), b"hello world".as_ptr(), 11)
+    if !vfs.write_file(a.as_bytes(), b"hello world")
         || !check_content(vfs, a.as_str(), b"hello world", report)
     {
         report.say(a.as_str(), "write and read back failed");
@@ -346,7 +317,7 @@ fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &
 
     /* Append */
     {
-        let file = match Handle::open(vfs, a.as_str(), OPEN_APPEND) {
+        let file = match open(vfs, a.as_str(), OPEN_APPEND) {
             Some(file) if file.write(b" again") => file,
             _ => { report.say(a.as_str(), "append failed"); return false; }
         };
@@ -358,7 +329,7 @@ fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &
 
     /* Write at an offset */
     {
-        let file = match Handle::open(vfs, a.as_str(), OPEN_WRITE) {
+        let file = match open(vfs, a.as_str(), OPEN_WRITE) {
             Some(file) if file.seek(6) && file.write(b"WORLD") => file,
             _ => { report.say(a.as_str(), "write at offset failed"); return false; }
         };
@@ -397,17 +368,16 @@ fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &
         return false;
     }
 
-    let mut entry = DirEntry { name: [0; NAME_MAX], node_type: 0, size: 0 };
-    let named_c = vfs.read_dir(sub.as_bytes(), 0, &mut entry)
-        && entry_is(&entry, "c.txt") && entry.size == 8;
-    if !named_c || vfs.read_dir(sub.as_bytes(), 1, &mut entry) {
+    let named_c = vfs.read_dir(sub.as_bytes(), 0)
+        .is_some_and(|entry| entry.name() == b"c.txt" && entry.size == 8);
+    if !named_c || vfs.read_dir(sub.as_bytes(), 1).is_some() {
         report.say(sub.as_str(), "readdir is wrong");
         return false;
     }
 
     /* Refusals: a missing file, a directory as a file, a duplicate name */
-    let refused = vfs.open(b.as_bytes(), OPEN_READ).is_null()
-        && vfs.open(sub.as_bytes(), OPEN_READ).is_null()
+    let refused = open(vfs, b.as_str(), OPEN_READ).is_none()
+        && open(vfs, sub.as_str(), OPEN_READ).is_none()
         && !vfs.create(sub.as_bytes(), true)
         && !vfs.create(c.as_bytes(), false);
     if !refused {
@@ -434,11 +404,6 @@ fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &
     }
 
     true
-}
-
-fn entry_is(entry: &DirEntry, name: &str) -> bool {
-    let len = entry.name.iter().position(|b| *b == 0).unwrap_or(NAME_MAX);
-    &entry.name[..len] == name.as_bytes()
 }
 
 /* ---- what the kernel calls ---- */

@@ -44,16 +44,22 @@ mount prefix wins; `.` and `..` resolve in the tree, and `..` stops at a
 mount root.
 
 ```rust
-let file = vfs.open(b"/lib/modules/foo.ko", OPEN_READ);
-let got = vfs.read(file, buf.as_mut_ptr(), buf.len());   // Some(0) at end of file
-vfs.close(file);
+let file = Open::new(vfs, b"/lib/modules/foo.ko", OPEN_READ)?;   // closed when it goes
+let got = file.read(&mut buf)?;                                  // 0 at end of file
 ```
+
+An open file is a `Handle`: a slot in the VFS's table of open files and the
+generation of what is in it. That is what crosses the C ABI as well -- the
+`RustFile*` the C++ shell holds is that word and not an address -- so a
+handle from anywhere is looked up rather than followed, and one that was
+closed, or never opened, or whose filesystem has been unmounted at shutdown,
+reads as no file instead of as whatever memory is there now.
 
 - `open(path, flags)` with `OPEN_READ`, `OPEN_WRITE`, `OPEN_CREATE`,
   `OPEN_TRUNCATE`, `OPEN_APPEND` (which puts every write at the end and
   implies `OPEN_WRITE`); `close`, `read`, `write`, `seek`, `tell`, `size`. A
   write past the end extends the file; the gap reads as zeros.
-- `stat` (type, size, inode), `read_dir(path, index, entry)` to walk a
+- `stat` (type, size, inode), `read_dir(path, index)` to walk a
   directory by index, `rename` (a move within one filesystem; a directory
   cannot move under itself), `truncate` (either way), `sync`, `remove` (a
   directory goes with everything under it), `create(path, directory)`.
@@ -63,9 +69,10 @@ vfs.close(file);
   ABI over them that a module -- and the shell's `/etc/rc` -- reads and
   writes by.
 
-An open file pins its vnode: `Remove` and `Rename` refuse a file (or a
-directory containing one) that is open, and `Unmount` refuses a filesystem
-with open files. `UnmountAll` at shutdown does not refuse — it is shutdown.
+An open file pins its vnode: `remove` and `rename` refuse a file (or a
+directory containing one) that is open, and `unmount` refuses a filesystem
+with open files. `unmount_all` at shutdown does not refuse — it is shutdown —
+and the handles it abandons stop naming anything.
 
 A mounted filesystem claims its block device (`kernel_blockdev_claim_as`) until
 it is unmounted, and so do the disk log and a module writing to a device
@@ -78,8 +85,34 @@ on a device a write test is running on; and those, in turn, keep off a
 mounted one. Reads need no claim.
 
 One mutex serialises every VFS call, so a multi-megabyte read holds up an
-`ls` from the UDP shell for its duration. Filesystems see one call at a time
-and do no locking of their own; that is the contract in `fs/filesystem.h`.
+`ls` from the UDP shell for its duration. Everything it guards is inside it:
+the mounts, each owning its filesystem, and the open files.
+
+## What a filesystem is
+
+A filesystem is a type that implements `vfs::FileSystem`, mounted as a
+`Box<dyn FileSystem>` the mount owns; unmounting drops it. The trait is the
+whole seam: `mount`/`unmount`, `root`, `lookup`, `load_dir`, `create_file`,
+`create_dir`, `read`, `write`, `truncate`, `rename`, `remove`, `sync`, and
+`name`/`info`/`device` for what `mounts` prints and the device it claims.
+Every call arrives with the VFS lock held, so a filesystem sees one call at
+a time and does no locking of its own.
+
+What a filesystem holds is a `vnode::Tree`: an arena of nodes -- a name, a
+kind, a size, an inode number, the children of a directory in order -- named
+by `NodeId`s, a slot and the generation of what is in it. Parents, children
+and open files all refer to a node by that number, never by an address, so
+the tree is ordinary owned data: a filesystem hands the VFS an id and the
+VFS asks the filesystem's tree what it is. An id of a node that has been
+freed finds nothing. The slots are taken from the allocator in chunks and
+fallibly: an image says how many nodes there will be, and an image is not
+to be trusted with that.
+
+There is no `unsafe` in the VFS, the tree or any of the four filesystems.
+ext2's on-disk structures are read and written whole through `kcore::pod`,
+which is where the two pointer casts that takes are; what is left in the
+crate is the C ABI at its edge, where a path or a buffer arrives as a
+pointer and a length.
 
 ## ext2
 
