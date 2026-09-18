@@ -61,6 +61,11 @@ boot touches at all: format, the `fstest` self-test, files written and read
 back from a second mount, and then the image parsed by the script itself —
 a driver reading back its own writes never notices a field at the wrong
 offset, and that last check is what does.
+`./scripts/netconsole-test.py` (arm64) boots with the log streaming to a
+collector it runs itself and checks what arrives: the pre-link backlog, no
+gaps in the sequence numbers, lines after link-up, and a panic's report with
+its backtrace — on the Hetzner boxes netconsole is the only console there
+is, so run it after touching the trace path, the net device or netconsole.
 
 Run in QEMU (serial console is logged to `nos.log`):
 

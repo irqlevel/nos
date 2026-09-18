@@ -62,3 +62,9 @@ jobs:
       - name: nanofs test (TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/nanofs-test.py --tcg
+
+      # On the machines with no serial port the kernel log over UDP is the
+      # only console there is, and a panic is when it matters most.
+      - name: netconsole test (TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/netconsole-test.py --tcg
