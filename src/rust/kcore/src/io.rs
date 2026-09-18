@@ -81,9 +81,28 @@ pub struct MmioRegion {
     size: usize,
 }
 
+/* A window of device registers. Every access is a volatile read or write
+ * through `&self`, which is as much as the hardware itself promises of two
+ * CPUs at once: what has to be one at a time -- an index register and its
+ * data -- is the driver's to keep so, with a lock, as it would be anyway. */
+unsafe impl Send for MmioRegion {}
+unsafe impl Sync for MmioRegion {}
+
 impl MmioRegion {
     pub fn new(base: *mut u8, size: usize) -> Self {
         Self { base, size }
+    }
+
+    /// The part of this window from `offset` on, as a window of its own: a
+    /// block of registers that starts where a capability register says it
+    /// does. It ends where this one ends, so an access past the mapping is
+    /// still an assert rather than a wild read. None when `offset` is not in
+    /// the window at all.
+    pub fn window(&self, offset: usize) -> Option<MmioRegion> {
+        if offset >= self.size {
+            return None;
+        }
+        Some(MmioRegion { base: self.base.wrapping_add(offset), size: self.size - offset })
     }
 
     pub fn read8(&self, offset: usize) -> u8 {

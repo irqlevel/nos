@@ -47,3 +47,9 @@ pub fn write<T: Pod>(buf: &mut [u8], off: usize, value: &T) -> bool {
         None => false,
     }
 }
+
+/* The integers themselves: what a descriptor's fields are. */
+unsafe impl Pod for u8 {}
+unsafe impl Pod for u16 {}
+unsafe impl Pod for u32 {}
+unsafe impl Pod for u64 {}

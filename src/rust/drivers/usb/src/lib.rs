@@ -27,25 +27,27 @@ pub mod regs;
 pub mod ring;
 pub mod shared;
 
+use alloc::boxed::Box;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kcore::cmd::{Command, Output};
+use kcore::sync::TryLock;
 use kcore::task::TaskHandle;
 use kcore::trace;
 
 use controller::{Controller, MAX_CONTROLLERS, MAX_PORTS, POLL_PERIOD_MS};
 use descriptors::speed_name;
 
-/// The controllers, in the order they were found. Written once each, during
-/// `init`, and read by the USB task alone -- which is why `poll_all` may take
-/// a `&mut` to one.
-static CONTROLLERS: [AtomicPtr<Controller>; MAX_CONTROLLERS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_CONTROLLERS];
+/// The controllers, in the order they were found. Put here once each, during
+/// `init`, and polled by the USB task alone: nobody ever waits for this lock,
+/// and it is one that may be held across the sleeps a port reset takes.
+static CONTROLLERS: TryLock<[Option<Box<Controller>>; MAX_CONTROLLERS]> =
+    TryLock::new([const { None }; MAX_CONTROLLERS]);
 static COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// The polling task, while it runs.
-static TASK: AtomicPtr<TaskHandle> = AtomicPtr::new(core::ptr::null_mut());
+static TASK: TryLock<Option<TaskHandle>> = TryLock::new(None);
 
 /// Put the layer's command in front of whoever runs one. Called from
 /// `rust_init`.
@@ -91,7 +93,14 @@ fn init_all() {
             continue;
         }
 
-        CONTROLLERS[found].store(alloc::boxed::Box::into_raw(ctrl), Ordering::Release);
+        match CONTROLLERS.try_lock() {
+            Some(mut controllers) => controllers[found] = Some(ctrl),
+            None => {
+                /* Only a second `init` running beside this one could hold it. */
+                trace!(0, "Xhci: controller table busy, controller {} dropped", found);
+                continue;
+            }
+        }
         found += 1;
         COUNT.store(found, Ordering::Release);
     }
@@ -100,17 +109,18 @@ fn init_all() {
 }
 
 fn poll_all() {
-    for index in 0..COUNT.load(Ordering::Acquire) {
-        let ptr = CONTROLLERS[index].load(Ordering::Acquire);
-        if !ptr.is_null() {
-            /* The USB task is the only caller, and each controller is
-             * reachable from exactly one slot. */
-            unsafe { (*ptr).poll() };
-        }
+    /* The USB task is the only caller, so the lock is there for the taking. */
+    let mut controllers = match CONTROLLERS.try_lock() {
+        Some(controllers) => controllers,
+        None => return,
+    };
+
+    for ctrl in controllers.iter_mut().flatten() {
+        ctrl.poll();
     }
 }
 
-extern "C" fn run(_ctx: *mut u8) {
+fn run() {
     while !kcore::task::stopping() {
         poll_all();
         kcore::task::sleep_ms(POLL_PERIOD_MS);
@@ -169,28 +179,33 @@ pub extern "C" fn rust_usb_init() {
 /// hot-plug. Called after `rust_usb_init`.
 #[no_mangle]
 pub extern "C" fn rust_usb_start() -> i32 {
-    if !TASK.load(Ordering::Acquire).is_null() {
+    let mut task = match TASK.try_lock() {
+        Some(task) => task,
+        None => return -1,
+    };
+    if task.is_some() {
         return -1;
     }
 
-    let handle = match kcore::task::spawn_with_ctx("usb", run, core::ptr::null_mut()) {
-        Some(handle) => handle,
-        None => return -1,
-    };
-
-    TASK.store(alloc::boxed::Box::into_raw(alloc::boxed::Box::new(handle)), Ordering::Release);
-    0
+    match kcore::task::spawn("usb", run) {
+        Some(handle) => {
+            *task = Some(handle);
+            0
+        }
+        None => -1,
+    }
 }
 
 /// On the way down: the task finishes its pass and exits.
 #[no_mangle]
 pub extern "C" fn rust_usb_stop() {
-    let ptr = TASK.swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if ptr.is_null() {
-        return;
-    }
+    let handle = match TASK.try_lock() {
+        Some(mut task) => task.take(),
+        None => None,
+    };
 
-    let handle = unsafe { alloc::boxed::Box::from_raw(ptr) };
-    handle.request_stop();
-    handle.wait();
+    if let Some(handle) = handle {
+        handle.request_stop();
+        handle.wait();
+    }
 }
