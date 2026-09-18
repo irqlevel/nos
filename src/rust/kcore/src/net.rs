@@ -1,49 +1,23 @@
+use alloc::boxed::Box;
+use core::cell::UnsafeCell;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use ffi::net;
 
-/// Handle to a registered net device.
-/// Registration is permanent (boot-lifetime); there is no unregister, so the
-/// handle is a plain value a driver may copy where it needs one.
+/* ---- the driver's side ---- */
+
+/// What a device's name fits in, its terminator included.
+const NAME_MAX: usize = 32;
+
+/// A registered net device, as its driver knows it. Registration is for the
+/// life of the kernel, so this is a plain value.
 #[derive(Clone, Copy)]
 pub struct NetDeviceHandle {
     handle: usize,
 }
 
-/// Ops table passed to `register`. All function pointers must remain valid
-/// for the lifetime of the kernel.
-pub struct NetDeviceOps {
-    /// Null-terminated ASCII device name (e.g. b"eth0\0").
-    pub name: *const u8,
-    pub mac: [u8; 6],
-    /// Called by the C++ net stack while TxQueueLock is held.
-    /// Use `NetDeviceHandle::tx_dequeue` to drain frames one by one.
-    pub flush_tx: extern "C" fn(ctx: *mut u8),
-    /// Called from the soft IRQ task to process received frames.
-    pub process_rx: extern "C" fn(ctx: *mut u8),
-    pub ctx: *mut u8,
-}
-
-/// Register a net device with the kernel net device table.
-/// Returns `None` if the slot pool is full.
-pub fn register(ops: &NetDeviceOps) -> Option<NetDeviceHandle> {
-    let ffi_ops = net::NetDeviceOps {
-        name: ops.name,
-        mac: ops.mac,
-        flush_tx: ops.flush_tx,
-        process_rx: ops.process_rx,
-        ctx: ops.ctx,
-    };
-    let h = unsafe { net::kernel_netdev_register(&ffi_ops) };
-    if h == 0 { None } else { Some(NetDeviceHandle { handle: h }) }
-}
-
 impl NetDeviceHandle {
-    /// Construct a null placeholder (handle == 0).
-    /// Used as a field initialiser before the real handle is assigned.
-    /// Calling any method on a placeholder is a no-op or returns None.
-    pub fn placeholder() -> Self {
-        Self { handle: 0 }
-    }
-
     pub fn set_ip(&self, ip: u32) {
         unsafe { net::kernel_netdev_set_ip(self.handle, ip) }
     }
@@ -55,72 +29,180 @@ impl NetDeviceHandle {
     pub fn set_gw(&self, gw: u32) {
         unsafe { net::kernel_netdev_set_gw(self.handle, gw) }
     }
+}
 
-    /// Dequeue one pending TX frame. Call this from inside `flush_tx` callback.
-    /// Returns `None` when the TX queue is empty.
-    ///
-    /// # Lifetime contract
-    ///
-    /// The returned `NetFrame` wraps a reference-counted DMA buffer. You must
-    /// keep the `NetFrame` alive (i.e. stored in a TX slot) until the hardware
-    /// signals completion of the DMA transfer. Dropping the frame early (while
-    /// the hardware is still reading from `data_phys()`) is a use-after-free.
-    /// Only drop (or explicitly `put`) the frame after the hardware completion
-    /// interrupt fires and you have confirmed the descriptor is done.
-    pub fn tx_dequeue(&self) -> Option<NetFrame> {
-        let h = unsafe { net::kernel_netdev_tx_dequeue(self.handle) };
-        if h == 0 { None } else { Some(NetFrame { handle: h }) }
+/// A network card, as the driver behind it. The net layer asks a driver two
+/// things, and each comes with the state that only that call touches:
+///
+/// - `flush_tx`, with the device's transmit lock held around it, so one at a
+///   time per device: it is handed the transmit side as `&mut Self::Tx`;
+/// - `process_rx`, from the receive soft IRQ, which the kernel runs on one
+///   CPU at a time: it is handed the receive side as `&mut Self::Rx`.
+///
+/// Everything else of the driver -- what an interrupt handler or a shell
+/// command looks at -- is `&self`, shared between whatever runs: registers,
+/// atomics, locks. So a driver has no `UnsafeCell` with a comment saying who
+/// may touch it; who may touch it is who is handed it.
+pub trait NetDriver: Sync + 'static {
+    /// What only `flush_tx` touches: the transmit ring and what is on it.
+    type Tx: Send + 'static;
+    /// What only `process_rx` touches: the receive ring and what is posted.
+    type Rx: Send + 'static;
+
+    /// Give back what the hardware has finished sending and send what the
+    /// stack has queued. Called under the device's transmit lock, interrupts
+    /// off: no sleeping, no allocating -- and no *freeing*: a frame finished
+    /// with goes to `queue.done`, never out of scope.
+    fn flush_tx(&'static self, tx: &mut Self::Tx, queue: &mut TxQueue<'_>);
+
+    /// Take what the hardware has received and hand it up.
+    fn process_rx(&'static self, rx: &mut Self::Rx, queue: &mut RxQueue<'_>);
+}
+
+/// A driver and the two halves only its calls touch, together for good.
+/// Made first, so that the driver is somewhere an interrupt handler can be
+/// pointed at; registered last, once the hardware is ready to be asked.
+pub struct NetBinding<D: NetDriver> {
+    driver: D,
+    tx: UnsafeCell<D::Tx>,
+    rx: UnsafeCell<D::Rx>,
+    registered: AtomicBool,
+}
+
+/* `tx` and `rx` are reached only by the two functions at the bottom of this
+ * block, each under the exclusion the net layer promises a driver. */
+unsafe impl<D: NetDriver> Sync for NetBinding<D> {}
+
+impl<D: NetDriver> NetBinding<D> {
+    /// For the life of the kernel: a net device is never given back.
+    pub fn new(driver: D, tx: D::Tx, rx: D::Rx) -> &'static NetBinding<D> {
+        Box::leak(Box::new(NetBinding {
+            driver,
+            tx: UnsafeCell::new(tx),
+            rx: UnsafeCell::new(rx),
+            registered: AtomicBool::new(false),
+        }))
     }
 
-    /// Notify the device that TX descriptors have been submitted to hardware.
-    pub fn tx_notify(&self) {
-        unsafe { net::kernel_netdev_tx_notify(self.handle) }
+    pub fn driver(&'static self) -> &'static D {
+        &self.driver
     }
 
-    /// Pass a received frame to the kernel net stack.
-    /// Takes ownership of the frame (calls `Put` on drop or on queue-full).
-    pub fn enqueue_rx(&self, frame: NetFrame) {
-        let h = frame.handle;
-        core::mem::forget(frame);
-        unsafe { net::kernel_netdev_enqueue_rx(self.handle, h) }
-    }
-
-    /// Hand a whole harvest over at once.
-    ///
-    /// The receive queue's lock is taken once for the batch rather than once
-    /// per frame, which at tens of thousands of packets a second is the
-    /// difference between a lock acquisition being noise and being the top of
-    /// the receive path in a profile.
-    ///
-    /// The handles are consumed: whatever the queue had no room for is
-    /// released on the other side, so the caller must not touch them again.
-    pub fn enqueue_rx_batch(&self, handles: &[usize]) {
-        if handles.is_empty() {
-            return;
+    /// Put the device in the net layer's table; from here on it is called.
+    /// None when the table is full, the name will not do, or this binding is
+    /// registered already -- one device to a binding, because one transmit
+    /// lock is what stands behind its `&mut Tx`.
+    pub fn register(&'static self, name: &str, mac: [u8; 6]) -> Option<NetDeviceHandle> {
+        if name.is_empty() || name.len() >= NAME_MAX || name.as_bytes().contains(&0) {
+            return None;
         }
-        unsafe {
-            net::kernel_netdev_enqueue_rx_batch(
-                self.handle,
-                handles.as_ptr(),
-                handles.len(),
-            )
-        };
-    }
+        if self.registered.swap(true, Ordering::AcqRel) {
+            return None;
+        }
 
-    /// Hand a transmitted frame back for release, instead of dropping it.
-    ///
-    /// A driver reaps its TX ring from `flush_tx`, which the C++ net stack
-    /// calls under TxQueueLock with interrupts off. Dropping a `NetFrame`
-    /// there calls `kernel_netframe_put` -> `Mm::Free`, which shoots down the
-    /// TLB on every other CPU and waits for each to acknowledge -- and a CPU
-    /// spinning on TxQueueLock has interrupts off and never will. The two
-    /// then wait for each other forever. This queues the frame instead; the
-    /// C++ side releases it once the lock is down.
-    pub fn tx_done(&self, frame: NetFrame) {
-        let h = frame.into_raw();
-        unsafe { net::kernel_netdev_tx_done(self.handle, h) }
+        /* The table copies the name: a C string for the length of the call. */
+        let mut c_name = [0u8; NAME_MAX];
+        c_name[..name.len()].copy_from_slice(name.as_bytes());
+
+        let ops = net::NetDeviceOps {
+            name: c_name.as_ptr(),
+            mac,
+            flush_tx: flush_tx::<D>,
+            process_rx: process_rx::<D>,
+            ctx: self as *const Self as *mut u8,
+        };
+        let h = unsafe { net::kernel_netdev_register(&ops) };
+        if h == 0 {
+            self.registered.store(false, Ordering::Release);
+            None
+        } else {
+            Some(NetDeviceHandle { handle: h })
+        }
     }
 }
+
+extern "C" fn flush_tx<D: NetDriver>(ctx: *mut u8, dev: usize) {
+    /* `ctx` is the binding `register` passed, which lives for good. */
+    let binding = unsafe { &*(ctx as *const NetBinding<D>) };
+    /* The device's transmit lock is held around this call -- the net layer's
+     * contract with a driver -- so nothing else is in `tx`. The one exception
+     * is a panic's report, which comes through with the lock stolen if its
+     * holder is never going to let go: see `Device::submit_tx`. */
+    let tx = unsafe { &mut *binding.tx.get() };
+    binding.driver.flush_tx(tx, &mut TxQueue { dev, _held: PhantomData });
+}
+
+extern "C" fn process_rx<D: NetDriver>(ctx: *mut u8, dev: usize) {
+    let binding = unsafe { &*(ctx as *const NetBinding<D>) };
+    /* Called from the receive soft IRQ and nowhere else, and the kernel runs
+     * a soft IRQ type on one CPU at a time. */
+    let rx = unsafe { &mut *binding.rx.get() };
+    binding.driver.process_rx(rx, &mut RxQueue { dev, _life: PhantomData });
+}
+
+/// The stack's transmit queue, for the length of one `flush_tx`. It exists
+/// only there, which is what its two calls need: the queue is guarded by the
+/// lock that is held around `flush_tx`.
+pub struct TxQueue<'a> {
+    dev: usize,
+    _held: PhantomData<&'a mut ()>,
+}
+
+impl TxQueue<'_> {
+    /// The next frame to send, or None when the queue is empty.
+    ///
+    /// The frame wraps a DMA buffer the hardware is about to read: keep it --
+    /// in the ring's shadow of what is posted -- until the hardware says it
+    /// is done, and then hand it to `done`. Dropped earlier, the buffer goes
+    /// back to the pool and out again while the card is still reading it.
+    pub fn dequeue(&mut self) -> Option<NetFrame> {
+        /* Inside `flush_tx`, which is what the call requires. */
+        let h = unsafe { net::kernel_netdev_tx_dequeue(self.dev) };
+        core::num::NonZeroUsize::new(h).map(|handle| NetFrame { handle })
+    }
+
+    /// A transmitted frame, for release once the lock is down. Never dropped
+    /// here instead: dropping frees, a free can reach the page allocator,
+    /// which shoots down the TLB on every other CPU and waits for each -- and
+    /// a CPU spinning on this lock has interrupts off and never answers.
+    pub fn done(&mut self, frame: NetFrame) {
+        let h = frame.into_raw();
+        unsafe { net::kernel_netdev_tx_done(self.dev, h) }
+    }
+}
+
+/// The stack's receive queue, for the length of one `process_rx`.
+pub struct RxQueue<'a> {
+    dev: usize,
+    _life: PhantomData<&'a mut ()>,
+}
+
+impl RxQueue<'_> {
+    /// One received frame, to the stack. What the queue has no room for is
+    /// released on the far side.
+    pub fn enqueue(&mut self, frame: NetFrame) {
+        let h = frame.into_raw();
+        unsafe { net::kernel_netdev_enqueue_rx(self.dev, h) }
+    }
+
+    /// A whole harvest at once: the receive queue's lock is taken once for
+    /// the batch rather than once per frame, which at tens of thousands of
+    /// packets a second is the difference between a lock acquisition being
+    /// noise and being the top of the receive path in a profile. The batch
+    /// is empty after.
+    pub fn deliver<const N: usize>(&mut self, batch: &mut FrameBatch<N>) {
+        let count = core::mem::replace(&mut batch.count, 0);
+        if count == 0 {
+            return;
+        }
+        /* Each is a frame `push` took ownership of and gives up here. */
+        unsafe {
+            net::kernel_netdev_enqueue_rx_batch(self.dev, batch.frames.as_ptr(), count);
+        }
+    }
+}
+
+/* ---- the consuming side ---- */
 
 /// A network device already in the kernel's table -- `eth0` -- for a service
 /// that sends and receives over it rather than drives it. Devices live as
@@ -312,14 +394,18 @@ impl AtomicNic {
     }
 }
 
-/// Frames gathered to go out together: one transmit lock and one doorbell
-/// for the lot, rather than one of each per frame.
-pub struct TxBatch<const N: usize> {
+/// Frames gathered to be handed over together -- to a device to transmit,
+/// one lock and one doorbell for the lot, or by a driver to the stack, one
+/// lock for the harvest -- rather than one of each per frame.
+pub struct FrameBatch<const N: usize> {
     frames: [usize; N],
     count: usize,
 }
 
-impl<const N: usize> TxBatch<N> {
+/// What a listener that answers from the receive path gathers its replies in.
+pub type TxBatch<const N: usize> = FrameBatch<N>;
+
+impl<const N: usize> FrameBatch<N> {
     pub const fn new() -> Self {
         Self { frames: [0; N], count: 0 }
     }
@@ -364,7 +450,7 @@ impl<const N: usize> TxBatch<N> {
     }
 }
 
-impl<const N: usize> Drop for TxBatch<N> {
+impl<const N: usize> Drop for FrameBatch<N> {
     fn drop(&mut self) {
         self.clear();
     }
@@ -477,17 +563,23 @@ impl Drop for UdpListener {
 /// `Drop` calls `kernel_netframe_put`, which frees the frame when the
 /// refcount reaches zero.
 pub struct NetFrame {
-    handle: usize,
+    /// Never zero, so that a slot that may hold a frame -- a ring's shadow of
+    /// what is posted -- is no bigger than the frame's own word
+    handle: core::num::NonZeroUsize,
 }
 
 impl NetFrame {
+    fn raw(&self) -> usize {
+        self.handle.get()
+    }
+
     /// Allocate a new RX frame with `data_len` bytes of DMA-backed buffer.
     /// Direction is set to Rx. `Length` is initialised to 0; call `set_len`
     /// after the hardware fills the buffer.
     /// Returns `None` on allocation failure.
     pub fn alloc_rx(data_len: usize) -> Option<Self> {
         let h = unsafe { net::kernel_netframe_alloc_rx(data_len) };
-        if h == 0 { None } else { Some(Self { handle: h }) }
+        core::num::NonZeroUsize::new(h).map(|handle| Self { handle })
     }
 
     /// A frame to transmit, room for `data_len` bytes: from the frame pool --
@@ -496,7 +588,7 @@ impl NetFrame {
     #[inline]
     pub fn alloc_tx(data_len: usize) -> Option<Self> {
         let h = unsafe { net::kernel_netframe_alloc_tx(data_len) };
-        if h == 0 { None } else { Some(Self { handle: h }) }
+        core::num::NonZeroUsize::new(h).map(|handle| Self { handle })
     }
 
     /// A reference of the caller's own to a frame the kernel lent: how a UDP
@@ -508,7 +600,8 @@ impl NetFrame {
     #[inline]
     pub unsafe fn retain(handle: usize) -> Self {
         unsafe { net::kernel_netframe_get(handle) };
-        Self { handle }
+        /* A frame alive for the call is not the null one. */
+        Self { handle: unsafe { core::num::NonZeroUsize::new_unchecked(handle) } }
     }
 
     /// The bytes of a frame the kernel lent, without taking it.
@@ -529,45 +622,46 @@ impl NetFrame {
     /// called. Use `data_raw_mut(capacity)` to access the full buffer before
     /// the length is known (e.g. for memcpy-based drivers).
     pub fn data(&self) -> &[u8] {
-        let ptr = unsafe { net::kernel_netframe_data(self.handle) };
-        let len = unsafe { net::kernel_netframe_len(self.handle) };
+        let ptr = unsafe { net::kernel_netframe_data(self.raw()) };
+        let len = unsafe { net::kernel_netframe_len(self.raw()) };
         unsafe { core::slice::from_raw_parts(ptr, len) }
     }
 
     /// Mutable slice of the received/transmitted data (length = `self.len()`).
     /// See `data()` for the note on freshly allocated RX frames.
     pub fn data_mut(&mut self) -> &mut [u8] {
-        let ptr = unsafe { net::kernel_netframe_data(self.handle) };
-        let len = unsafe { net::kernel_netframe_len(self.handle) };
+        let ptr = unsafe { net::kernel_netframe_data(self.raw()) };
+        let len = unsafe { net::kernel_netframe_len(self.raw()) };
         unsafe { core::slice::from_raw_parts_mut(ptr, len) }
     }
 
-    /// Mutable slice of the full allocated buffer up to `capacity` bytes.
+    /// Mutable slice of the allocated buffer, up to `capacity` bytes of it --
+    /// fewer if the frame has room for fewer.
     ///
-    /// Use this when you need to write into a freshly allocated RX frame
-    /// before calling `set_len`. `capacity` must not exceed the value passed
-    /// to `alloc_rx`; the caller is responsible for not exceeding it.
+    /// Use this when you need to write into a freshly allocated frame before
+    /// calling `set_len`.
     #[inline]
     pub fn data_raw_mut(&mut self, capacity: usize) -> &mut [u8] {
-        let ptr = unsafe { net::kernel_netframe_data(self.handle) };
-        unsafe { core::slice::from_raw_parts_mut(ptr, capacity) }
+        let ptr = unsafe { net::kernel_netframe_data(self.raw()) };
+        let room = unsafe { net::kernel_netframe_capacity(self.raw()) };
+        unsafe { core::slice::from_raw_parts_mut(ptr, capacity.min(room)) }
     }
 
     /// Physical address of the data buffer (for DMA descriptor programming).
     #[inline]
     pub fn data_phys(&self) -> u64 {
-        unsafe { net::kernel_netframe_data_phys(self.handle) }
+        unsafe { net::kernel_netframe_data_phys(self.raw()) }
     }
 
     /// Current valid data length (0 for a freshly allocated RX frame).
     #[inline]
     pub fn len(&self) -> usize {
-        unsafe { net::kernel_netframe_len(self.handle) }
+        unsafe { net::kernel_netframe_len(self.raw()) }
     }
 
     #[inline]
     pub fn set_len(&mut self, len: usize) {
-        unsafe { net::kernel_netframe_set_len(self.handle, len) }
+        unsafe { net::kernel_netframe_set_len(self.raw(), len) }
     }
 
     /// Consume the frame, returning the raw handle without decrementing
@@ -575,7 +669,7 @@ impl NetFrame {
     /// invoke `kernel_netframe_put(handle)` directly (e.g. from an ISR).
     #[inline]
     pub fn into_raw(self) -> usize {
-        let h = self.handle;
+        let h = self.raw();
         core::mem::forget(self);
         h
     }
@@ -588,13 +682,13 @@ impl NetFrame {
     /// this call.
     #[inline]
     pub unsafe fn from_raw(handle: usize) -> Self {
-        Self { handle }
+        Self { handle: unsafe { core::num::NonZeroUsize::new_unchecked(handle) } }
     }
 }
 
 impl Drop for NetFrame {
     fn drop(&mut self) {
-        unsafe { net::kernel_netframe_put(self.handle) }
+        unsafe { net::kernel_netframe_put(self.raw()) }
     }
 }
 

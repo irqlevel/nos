@@ -9,9 +9,9 @@
  * Architecture, matching the r8168 driver:
  *  - PCI probe scans for 10EC:8125; each match calls init_device().
  *  - The 64 KiB MMIO BAR (BAR 2) is mapped for register access.
- *  - TX: the C++ net stack calls flush_tx() under TxQueueLock.  It drains
- *    the software queue into TX descriptors and rings the doorbell.  TX
- *    reaping happens at the head of flush_tx, never in the ISR.
+ *  - TX: the net stack calls flush_tx() under the device's transmit lock.
+ *    It drains the software queue into TX descriptors and rings the doorbell.
+ *    TX reaping happens at the head of flush_tx, never in the ISR.
  *  - RX: the ISR raises softirq TYPE_NET_RX; the net layer then calls
  *    process_rx() from the softirq task, which harvests descriptors, hands
  *    frames up and reposts fresh buffers.
@@ -20,25 +20,32 @@
  *    event, as it does in the vendor driver.
  *
  * Locking:
- *  - tx_ring is touched only by flush_tx, which the C++ TxQueueLock
- *    serialises.  The ISR never touches it.
- *  - rx_ring is touched only by process_rx, which runs in one softirq task.
+ *  - The TX ring is the driver's `NetDriver::Tx`: flush_tx is handed it, under
+ *    the device's transmit lock, and nothing else can reach it.  The ISR
+ *    never touches it.
+ *  - The RX ring is its `NetDriver::Rx`: process_rx is handed it, in the one
+ *    softirq task, and nothing else can reach it.  The state dump reads the
+ *    descriptors -- which are the chip's as much as ours, so shared cells --
+ *    and where the poll last said it was.
+ *  - What is left in the device itself -- registers, counters -- is what the
+ *    ISR shares with both, and is `&self`.
  */
 
 #![no_std]
 extern crate alloc;
 
-use alloc::boxed::Box;
 use core::fmt::Write;
-use core::ptr::{addr_of, read_volatile};
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use kcore::net::{FrameBatch, NetBinding, NetDriver, RxQueue, TxQueue};
+use kcore::once::Once;
+use kcore::sync::IrqSpinLock;
 use kcore::{dma, interrupt, io, msix, net, pci, softirq, trace};
 
 mod desc;
 mod hw;
 mod regs;
 
-use desc::{RxRing, TxRing, RING_PAGES, RING_SIZE};
+use desc::{RxRing, RxView, TxRing, RING_PAGES, RING_SIZE};
 use hw::Chip;
 use regs::*;
 
@@ -46,9 +53,9 @@ use regs::*;
 /* Module-level device registry (same pattern as the nvme and r8168 drivers) */
 
 const MAX_DEVICES: usize = 4;
-static DEVICES: [AtomicPtr<R8125Device>; MAX_DEVICES] = {
-    const NULL: AtomicPtr<R8125Device> = AtomicPtr::new(core::ptr::null_mut());
-    [NULL; MAX_DEVICES]
+static DEVICES: [Once<&'static R8125Device>; MAX_DEVICES] = {
+    const NONE: Once<&'static R8125Device> = Once::new();
+    [NONE; MAX_DEVICES]
 };
 static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -65,42 +72,73 @@ const PCI_COMMAND_INTX_DISABLE: u16 = 1 << 10;
 /* ================================================================== */
 /* Device structure */
 
-/* Field order is the drop order, and it matters: stop interrupt delivery
- * before freeing the DMA rings, and free the rings before unmapping the
- * registers.  Drop additionally stops the DMA engines and masks interrupts
- * in hardware before any field is dropped, so an interrupt already on its
- * way to the CPU cannot reach memory that is about to be freed. */
-struct R8125Device {
+/* The interrupts a device has.  Field order is the drop order, and it
+ * matters: the handler goes before the table its vector is an entry of. */
+struct Irqs {
     /* 1st: unregister the ISR (no further callbacks after this) */
-    _msix_irq: msix::MsixInterrupt,
+    _msix_irq: Option<msix::MsixInterrupt>,
     /* 2nd: tear down the MSI-X table, masking its entries */
     _msix_table: Option<msix::MsixTable>,
     /* 3rd: the legacy INTx slot, if that is the path in use */
-    _intx: interrupt::LegacyInterrupt,
-    /* then the DMA rings -- safe now that no ISR can run */
-    tx_ring: TxRing,
-    rx_ring: RxRing,
-    net_handle: net::NetDeviceHandle, /* no Drop; just a usize */
-    mac: [u8; 6],
-    name_buf: [u8; 16],
+    _intx: Option<interrupt::LegacyInterrupt>,
+}
+
+/* What the interrupt handler, the transmit path, the receive poll and the
+ * state dump share: registers, counters, and the poll's word on where it is.
+ * The rings are not here -- each belongs to the one path that is handed it
+ * (see `NetDriver` below).
+ *
+ * A device lives for good: the net layer never gives one back, and the chip
+ * has been told where its rings are.  Shutting down is `quiesce`. */
+struct R8125Device {
+    regs: io::MmioRegion,
+    _bar_mapping: dma::PhysMapping,
+    /* The interrupts, until shutdown takes them out to unregister them. */
+    irqs: IrqSpinLock<Option<Irqs>>,
+    /* The receive descriptors, for the state dump. */
+    rx_view: RxView,
+    /* Where the poll last left the receive ring, for the same. */
+    rx_head: AtomicU32,
+    rx_head_posted: AtomicBool,
     /* Statistics, atomic so any context can update them */
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
     rx_dropped: AtomicU64,
-    /* last: unmap MMIO, once nothing can reference the registers */
-    _bar_mapping: dma::PhysMapping,
-    regs: io::MmioRegion, /* raw pointer; no Drop -- must come last */
 }
 
-impl Drop for R8125Device {
-    fn drop(&mut self) {
+impl R8125Device {
+    fn quiesce(&self) {
         /* Stop the TX/RX DMA engines and mask every interrupt source before
-         * any field is dropped.  The chip must not DMA into rings we are
-         * about to free, and a last in-flight interrupt must not find a
-         * half-torn-down device. */
+         * the handler goes.  The chip must not DMA into rings nothing is
+         * looking after any more, and a last in-flight interrupt must not
+         * find a half-torn-down device. */
         self.regs.write8(CMD_REG, 0);
         self.regs.write32(INTR_MASK, 0);
         self.regs.write32(INTR_STATUS, u32::MAX);
+
+        /* Unregistered outside the lock: that is a call into the kernel's
+         * interrupt tables, which is nothing to make under a spinlock. */
+        let irqs = self.irqs.lock().take();
+        drop(irqs);
+    }
+
+    /// Arm exactly `bits` in the mask register.
+    ///
+    /// The register is the only record of what is armed. An in-memory copy
+    /// alongside it would be a second source of truth that the ISR and the
+    /// poll update without a common lock, and the two disagreeing is a lost
+    /// interrupt: the ISR decides whether a status bit is a signal it will be
+    /// given by looking at the mask, and a stale "masked" there makes it
+    /// return without acknowledging anything.
+    fn arm(&self, bits: u32) {
+        self.regs.write32(INTR_MASK, bits)
+    }
+
+    /// Where the poll leaves the ring, for the state dump.
+    fn publish_rx(&self, ring: &RxRing) {
+        let head = ring.head();
+        self.rx_head.store(head as u32, Ordering::Relaxed);
+        self.rx_head_posted.store(!ring.is_empty_slot(head), Ordering::Relaxed);
     }
 }
 
@@ -131,10 +169,9 @@ pub fn init() {
 
 pub fn shutdown() {
     let count = (DEVICE_COUNT.load(Ordering::Relaxed) as usize).min(MAX_DEVICES);
-    for i in 0..count {
-        let raw = DEVICES[i].swap(core::ptr::null_mut(), Ordering::AcqRel);
-        if !raw.is_null() {
-            unsafe { drop(Box::from_raw(raw)) };
+    for slot in &DEVICES[..count] {
+        if let Some(dev) = slot.get() {
+            dev.quiesce();
         }
     }
     trace!(0, "r8125: shutdown complete, count={}", count);
@@ -145,9 +182,8 @@ pub fn shutdown() {
 
 fn init_device(pci_dev: &pci::PciDevice) {
     /* Claim a slot before touching the hardware.  Every later failure path
-     * either happens before the DMA engines are started or unwinds through
-     * the device's Drop, which stops them first; bailing out after the
-     * engines are running would free rings the chip is still writing to.
+     * either happens before the DMA engines are started or goes through the
+     * device's `quiesce`, which stops them first.
      * Init is single-threaded, so this index is stable, and DEVICE_COUNT is
      * only advanced once registration has succeeded. */
     let idx = DEVICE_COUNT.load(Ordering::Relaxed);
@@ -233,8 +269,13 @@ fn init_device(pci_dev: &pci::PciDevice) {
         }
     };
 
-    let tx_ring = TxRing::new(tx_dma);
-    let mut rx_ring = RxRing::new(rx_dma);
+    let (tx_ring, mut rx_ring) = match (TxRing::new(tx_dma), RxRing::new(rx_dma)) {
+        (Some(tx), Some(rx)) => (tx, rx),
+        _ => {
+            trace!(0, "r8125: no memory for the rings' bookkeeping");
+            return;
+        }
+    };
 
     for i in 0..RING_SIZE {
         match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
@@ -268,11 +309,11 @@ fn init_device(pci_dev: &pci::PciDevice) {
 
     /* Ring base addresses: high half first.  The chip latches the pair on
      * the write to the low half. */
-    let tx_phys = tx_ring.dma.phys();
+    let tx_phys = tx_ring.phys;
     regs.write32(TNPDS_HI, (tx_phys >> 32) as u32);
     regs.write32(TNPDS_LO, tx_phys as u32);
 
-    let rx_phys = rx_ring.dma.phys();
+    let rx_phys = rx_ring.phys;
     regs.write32(RDSAR_HI, (rx_phys >> 32) as u32);
     regs.write32(RDSAR_LO, rx_phys as u32);
 
@@ -309,68 +350,52 @@ fn init_device(pci_dev: &pci::PciDevice) {
     regs.write32(INTR_MASK, 0);
     regs.write32(INTR_STATUS, u32::MAX);
 
-    /* Name the device with the slot claimed at entry: the C++ side traces
+    /* Name the device with the slot claimed at entry: the net layer traces
      * the name at registration time. */
     let mut name_buf = [0u8; 16];
-    write_device_name(&mut name_buf, idx);
+    let name = write_device_name(&mut name_buf, idx);
 
-    /* Box the device so ISR callbacks have a stable address.  The interrupt
-     * and net handles are placeholders until the real ones are installed. */
-    let mut dev_box = Box::new(R8125Device {
-        _msix_irq: msix::MsixInterrupt::empty(),
-        _msix_table: None,
-        _intx: interrupt::LegacyInterrupt::empty(),
-        tx_ring,
-        rx_ring,
-        net_handle: net::NetDeviceHandle::placeholder(),
-        mac,
-        name_buf,
+    /* The device goes where it will stay, so that the interrupt handler has
+     * somewhere to be pointed at; the rings go with it, each to the one path
+     * that will be handed it.  Nothing calls into any of it until the
+     * interrupt is attached and, last of all, the net layer is told. */
+    let rx_view = rx_ring.view();
+    let head_posted = !rx_ring.is_empty_slot(rx_ring.head());
+    let binding = NetBinding::new(R8125Device {
+        regs,
+        _bar_mapping: bar_mapping,
+        irqs: IrqSpinLock::new(None),
+        rx_view,
+        rx_head: AtomicU32::new(0),
+        rx_head_posted: AtomicBool::new(head_posted),
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
-        _bar_mapping: bar_mapping,
-        regs,
-    });
+    }, tx_ring, rx_ring);
+    let dev = binding.driver();
 
-    let ctx_ptr = dev_box.as_mut() as *mut R8125Device as *mut u8;
-
-    if !attach_interrupt(pci_dev, &mut dev_box, ctx_ptr) {
+    if !attach_interrupt(pci_dev, dev) {
         trace!(0, "r8125: no interrupt could be registered");
+        dev.quiesce();
         return;
     }
 
     /* Arm the sources we handle. */
-    dev_box.regs.write32(INTR_MASK, INTR_MASK_BITS);
+    dev.regs.write32(INTR_MASK, INTR_MASK_BITS);
 
-    trace_link(&dev_box.regs);
+    trace_link(&dev.regs);
 
-    let raw = Box::into_raw(dev_box);
-
-    let ops = net::NetDeviceOps {
-        name: unsafe { (*raw).name_buf.as_ptr() },
-        mac: unsafe { (*raw).mac },
-        flush_tx: r8125_flush_tx,
-        process_rx: r8125_process_rx,
-        ctx: raw as *mut u8,
-    };
-    let handle = match net::register(&ops) {
-        Some(h) => h,
-        None => {
-            trace!(0, "r8125: NetDevice registration failed");
-            unsafe { drop(Box::from_raw(raw)) };
-            return;
-        }
-    };
-    unsafe { (*raw).net_handle = handle };
+    if binding.register(name, mac).is_none() {
+        trace!(0, "r8125: NetDevice registration failed");
+        dev.quiesce();
+        return;
+    }
 
     /* Commit the slot only once everything has succeeded. */
     DEVICE_COUNT.store(idx + 1, Ordering::Relaxed);
-    DEVICES[idx as usize].store(raw, Ordering::Release);
-    trace!(
-        0,
-        "r8125: registered as {}",
-        core::str::from_utf8(unsafe { &(*raw).name_buf }).unwrap_or("?")
-    );
+    /* The slot is this device's own: init is single-threaded. */
+    let _ = DEVICES[idx as usize].set(dev);
+    trace!(0, "r8125: registered as {}", name);
 }
 
 /* ================================================================== */
@@ -378,16 +403,12 @@ fn init_device(pci_dev: &pci::PciDevice) {
 
 /// Attach an interrupt to the device: MSI-X vector 0 if the chip offers a
 /// table, otherwise legacy INTx.  Returns false if neither worked.
-fn attach_interrupt(
-    pci_dev: &pci::PciDevice,
-    dev_box: &mut Box<R8125Device>,
-    ctx_ptr: *mut u8,
-) -> bool {
+fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static R8125Device) -> bool {
     /* One vector carries every event on this chip, exactly as in the vendor
      * driver: the 32 MSI-X entries only become useful with RSS and multiple
      * queues, which this driver does not use. */
     if let Some(table) = msix::MsixTable::new(pci_dev) {
-        match msix::MsixInterrupt::register(&table, 0, r8125_isr, ctx_ptr) {
+        match msix::MsixInterrupt::register_for(&table, 0, dev, isr) {
             Some(irq) => {
                 trace!(
                     0,
@@ -395,8 +416,11 @@ fn attach_interrupt(
                     irq.vector(),
                     table.table_size()
                 );
-                dev_box._msix_irq = irq;
-                dev_box._msix_table = Some(table);
+                *dev.irqs.lock() = Some(Irqs {
+                    _msix_irq: Some(irq),
+                    _msix_table: Some(table),
+                    _intx: None,
+                });
                 return true;
             }
             None => {
@@ -415,10 +439,14 @@ fn attach_interrupt(
         pci_dev.write_config16(PCI_COMMAND, cmd & !PCI_COMMAND_INTX_DISABLE);
     }
 
-    match interrupt::LegacyInterrupt::register_level(pci_dev, r8125_isr, ctx_ptr) {
+    match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
         Some(irq) => {
             trace!(0, "r8125: INTx vector={} (irq {})", irq.vector(), pci_dev.irq_line);
-            dev_box._intx = irq;
+            *dev.irqs.lock() = Some(Irqs {
+                _msix_irq: None,
+                _msix_table: None,
+                _intx: Some(irq),
+            });
             true
         }
         None => false,
@@ -522,8 +550,8 @@ fn trace_link(regs: &io::MmioRegion) {
     );
 }
 
-/* Write "eth0\0".."eth3\0" into `buf` */
-fn write_device_name(buf: &mut [u8; 16], idx: u32) {
+/* Write "eth0".."eth3" into `buf` */
+fn write_device_name(buf: &mut [u8; 16], idx: u32) -> &str {
     struct BufWriter<'a> {
         buf: &'a mut [u8; 16],
         pos: usize,
@@ -542,7 +570,8 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
     }
     let mut w = BufWriter { buf, pos: 0 };
     let _ = write!(w, "eth{}", idx);
-    w.buf[w.pos] = 0;
+    let BufWriter { buf, pos } = w;
+    core::str::from_utf8(&buf[..pos]).unwrap_or("eth?")
 }
 
 /* ================================================================== */
@@ -572,29 +601,16 @@ const RX_INTR_BITS: u32 = ISR_ROK | ISR_RER | ISR_RDU | ISR_RX_FIFO_OVER;
 /// without ever returning would overflow it and drop the excess.
 const RX_BUDGET: u32 = 64;
 
-/// Arm exactly `bits` in the mask register.
-///
-/// The register is the only record of what is armed. An in-memory copy
-/// alongside it would be a second source of truth that the ISR and the poll
-/// update without a common lock, and the two disagreeing is a lost interrupt:
-/// the ISR decides whether a status bit is a signal it will be given by
-/// looking at the mask, and a stale "masked" there makes it return without
-/// acknowledging anything.
-fn arm(dev: *mut R8125Device, bits: u32) {
-    unsafe { (*dev).regs.write32(INTR_MASK, bits) }
-}
-
 pub fn rx_err_events() -> u64 {
     RX_ERR_EVENTS.load(Ordering::Relaxed)
 }
 
-extern "C" fn r8125_isr(ctx: *mut u8) {
-    /* Raw dereference, not `&mut`: flush_tx or process_rx may hold their own
-     * reference to this device on another CPU right now (a per-CPU interrupt
-     * disable does not exclude them), and two live `&mut` to one object are
-     * UB. The ISR only touches MMIO registers and atomics. */
-    let dev = ctx as *mut R8125Device;
-    let regs = unsafe { &(*dev).regs };
+fn isr(dev: &'static R8125Device) {
+    /* flush_tx or process_rx may be running on another CPU right now (a
+     * per-CPU interrupt disable does not exclude them): what is shared with
+     * them is the device, not the rings. The ISR only touches MMIO registers
+     * and atomics. */
+    let regs = &dev.regs;
 
     /* Receive interrupts are silenced here and armed again by the poll, once
      * it has drained the ring. Without that, this card interrupts once per
@@ -652,7 +668,7 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
 
         /* TX reaping stays in flush_tx -- doing it here would race a
          * flush_tx running on another CPU. Raising the softirq drains frames
-         * that piled up in the C++ TxQueue while the ring was full. */
+         * that piled up in the stack's transmit queue while the ring was full. */
         if status & (ISR_TOK | ISR_TDU | ISR_TER) != 0 {
             softirq::raise(softirq::TYPE_NET_TX);
         }
@@ -661,7 +677,7 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
          * whenever anything at all arrived, not only on the receive bits: a
          * harvest that finds nothing is cheap, and it is one less thing this
          * register can lose. */
-        arm(dev, mask & !RX_INTR_BITS);
+        dev.arm(mask & !RX_INTR_BITS);
         softirq::raise(softirq::TYPE_NET_RX);
 
         round += 1;
@@ -673,46 +689,7 @@ extern "C" fn r8125_isr(ctx: *mut u8) {
 }
 
 /* ================================================================== */
-/* TX path: called by the C++ net stack under TxQueueLock */
-
-extern "C" fn r8125_flush_tx(ctx: *mut u8) {
-    /* Raw pointer, not `&mut`: process_rx may hold its own reference on
-     * another CPU (softirq exclusivity is per-type, and TxQueueLock does not
-     * cover process_rx).  Only fields disjoint from process_rx's are touched
-     * here; tx_ring is safe without a lock because flush_tx is its only
-     * mutator and the C++ TxQueueLock serialises flush_tx callers. */
-    let dev = ctx as *mut R8125Device;
-
-    unsafe {
-        let net = (*dev).net_handle;
-        (*dev).tx_ring.reap_completed(net);
-
-        let mut submitted: u32 = 0;
-        loop {
-            if !(*dev).tx_ring.has_space() {
-                break;
-            }
-            match (*dev).net_handle.tx_dequeue() {
-                None => break,
-                Some(frame) => {
-                    (*dev).tx_ring.submit(frame);
-                    submitted = submitted + 1;
-                }
-            }
-        }
-
-        if submitted > 0 {
-            (*dev).tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
-            /* Doorbell.  On the 8125 this is a 16-bit write of bit 0 to
-             * 0x90 -- the 8168's 8-bit NPQ at 0x38 does nothing here.
-             * Ordered after the descriptor stores by submit()'s dma_wmb. */
-            (*dev).regs.write16(TX_POLL, TX_POLL_KICK);
-        }
-    }
-}
-
-/* ================================================================== */
-/* RX path: called from the softirq task by the C++ net layer */
+/* State dump */
 
 /* A window into the chip, for a machine that has stopped receiving and can
  * still be typed at. Six explanations for that stall were built by reasoning
@@ -739,93 +716,91 @@ pub struct R8125State {
     pub rx_dropped: u64,
 }
 
+/// What `r8125dump` prints, into `out`.
+///
+/// # Safety
+/// `out` is writable, or null.
 #[no_mangle]
-pub extern "C" fn r8125_get_state(out: *mut R8125State) -> i32 {
-    if out.is_null() {
-        return -1;
-    }
+pub unsafe extern "C" fn r8125_get_state(out: *mut R8125State) -> i32 {
+    let out = match unsafe { out.as_mut() } {
+        Some(out) => out,
+        None => return -1,
+    };
 
-    let dev = DEVICES[0].load(Ordering::Acquire);
-    if dev.is_null() {
-        unsafe { (*out).present = 0 };
-        return -1;
-    }
+    let dev = match DEVICES[0].get() {
+        Some(dev) => *dev,
+        None => {
+            out.present = 0;
+            return -1;
+        }
+    };
 
-    unsafe {
-        let regs = &(*dev).regs;
-        let head = (*dev).rx_ring.head;
-        let posted = (*dev).rx_ring.frames[head] != 0;
+    let regs = &dev.regs;
+    let head = dev.rx_head.load(Ordering::Relaxed);
 
-        /* Read straight out of the descriptor the chip would fill next. */
-        let opts1 = {
-            let d = ((*dev).rx_ring.dma.as_ptr() as *const desc::RxDesc).add(head);
-            read_volatile(addr_of!((*d).opts1))
-        };
-
-        (*out).present = 1;
-        (*out).cmd = regs.read8(CMD_REG) as u32;
-        (*out).intr_status = regs.read32(INTR_STATUS);
-        (*out).intr_mask = regs.read32(INTR_MASK);
-        (*out).rx_config = regs.read32(RX_CONFIG);
-        (*out).rx_head = head as u32;
-        (*out).head_posted = if posted { 1 } else { 0 };
-        (*out).head_opts1 = opts1;
-        (*out).rx_err_events = RX_ERR_EVENTS.load(Ordering::Relaxed);
-        (*out).rx_polls = RX_POLLS.load(Ordering::Relaxed);
-        (*out).rx_budget_hits = RX_BUDGET_HITS.load(Ordering::Relaxed);
-        (*out).rx_packets = (*dev).rx_packets.load(Ordering::Relaxed);
-        (*out).rx_dropped = (*dev).rx_dropped.load(Ordering::Relaxed);
-    }
+    out.present = 1;
+    out.cmd = regs.read8(CMD_REG) as u32;
+    out.intr_status = regs.read32(INTR_STATUS);
+    out.intr_mask = regs.read32(INTR_MASK);
+    out.rx_config = regs.read32(RX_CONFIG);
+    out.rx_head = head;
+    out.head_posted = dev.rx_head_posted.load(Ordering::Relaxed) as u32;
+    /* Read straight out of the descriptor the chip would fill next, as it is
+     * this instant -- not out of anything the poll remembers. */
+    out.head_opts1 = dev.rx_view.opts1(head as usize);
+    out.rx_err_events = RX_ERR_EVENTS.load(Ordering::Relaxed);
+    out.rx_polls = RX_POLLS.load(Ordering::Relaxed);
+    out.rx_budget_hits = RX_BUDGET_HITS.load(Ordering::Relaxed);
+    out.rx_packets = dev.rx_packets.load(Ordering::Relaxed);
+    out.rx_dropped = dev.rx_dropped.load(Ordering::Relaxed);
 
     0
 }
 
-extern "C" fn r8125_process_rx(ctx: *mut u8) {
-    /* Raw pointer for the same reason as flush_tx; process_rx touches only
-     * rx_ring / rx_* / net_handle, all disjoint from flush_tx's tx_ring. */
-    let dev = ctx as *mut R8125Device;
+/* ================================================================== */
+/* RX path: called from the softirq task by the net layer */
 
-    /* The second half of what the ISR started when it silenced the receive
-     * sources: drain, then arm them again.
-     *
-     * Three things this has to get right, each of which is a stall if it is
-     * got wrong.
-     *
-     * A budget. The harvest feeds a queue of 256 that is drained and
-     * dispatched only after this function returns, so a poll that ran until
-     * the ring was empty would overflow that queue under load and drop
-     * everything past it -- while holding the CPU that has to do the
-     * dispatching. On the budget the poll yields with the sources still
-     * silent and raises its own softirq, which is how it stays scheduled
-     * without needing an interrupt. Every descriptor taken counts against it,
-     * including the ones thrown away as errors: a chip producing those
-     * steadily would otherwise keep this loop forever.
-     *
-     * Acknowledging before arming. The chip signals on the 0->1 transition of
-     * `(status & mask)`. Arming while the status still carries the receive
-     * bits leaves that product already non-zero, and no later packet can then
-     * make it transition -- exactly the lost-interrupt shape that made this
-     * machine deaf for a day. Clearing them first means the next packet is a
-     * genuine 0->1 whatever the chip does about unmasking.
-     *
-     * Re-checking after arming. A packet landing between the last empty
-     * harvest and the write to the mask register was already counted in the
-     * status just cleared, so nothing would come for it. */
-    const MAX_POLLS: u32 = 8;
-    let mut polls = 0;
+impl R8125Device {
+    fn poll_rx(&self, ring: &mut RxRing, up: &mut RxQueue<'_>) {
+        /* The second half of what the ISR started when it silenced the receive
+         * sources: drain, then arm them again.
+         *
+         * Three things this has to get right, each of which is a stall if it is
+         * got wrong.
+         *
+         * A budget. The harvest feeds a queue of 256 that is drained and
+         * dispatched only after this function returns, so a poll that ran until
+         * the ring was empty would overflow that queue under load and drop
+         * everything past it -- while holding the CPU that has to do the
+         * dispatching. On the budget the poll yields with the sources still
+         * silent and raises its own softirq, which is how it stays scheduled
+         * without needing an interrupt. Every descriptor taken counts against it,
+         * including the ones thrown away as errors: a chip producing those
+         * steadily would otherwise keep this loop forever.
+         *
+         * Acknowledging before arming. The chip signals on the 0->1 transition of
+         * `(status & mask)`. Arming while the status still carries the receive
+         * bits leaves that product already non-zero, and no later packet can then
+         * make it transition -- exactly the lost-interrupt shape that made this
+         * machine deaf for a day. Clearing them first means the next packet is a
+         * genuine 0->1 whatever the chip does about unmasking.
+         *
+         * Re-checking after arming. A packet landing between the last empty
+         * harvest and the write to the mask register was already counted in the
+         * status just cleared, so nothing would come for it. */
+        const MAX_POLLS: u32 = 8;
+        let mut polls = 0;
 
-    unsafe {
         /* Harvested frames wait here until the drain ends, so the receive
          * queue's lock is taken once for the batch instead of once per
          * frame. Sized by the budget, which is what bounds the drain. */
-        let mut batch: [usize; RX_BUDGET as usize] = [0; RX_BUDGET as usize];
+        let mut batch: FrameBatch<{ RX_BUDGET as usize }> = FrameBatch::new();
 
         loop {
             RX_POLLS.fetch_add(1, Ordering::Relaxed);
 
             let mut taken = 0u32;
             let mut budget_hit = false;
-            let mut batched = 0usize;
 
             loop {
                 if taken >= RX_BUDGET {
@@ -833,19 +808,19 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
                     break;
                 }
 
-                let idx = (*dev).rx_ring.head;
+                let idx = ring.head();
 
                 /* Refill a slot an earlier allocation failure left empty: the
                  * chip stalls on a descriptor it does not own, so RX makes no
                  * progress until the slot is posted again. */
-                if (*dev).rx_ring.frames[idx] == 0 {
+                if ring.is_empty_slot(idx) {
                     match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-                        Some(frame) => (*dev).rx_ring.post(idx, frame),
+                        Some(frame) => ring.post(idx, frame),
                         None => break, /* still no memory; try again later */
                     }
                 }
 
-                let (mut frame, opts1) = match (*dev).rx_ring.harvest() {
+                let (mut frame, opts1) = match ring.harvest() {
                     None => break,
                     Some(pair) => pair,
                 };
@@ -858,27 +833,27 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
                     /* Error frame, a fragment of a multi-descriptor frame (the
                      * RX_MAX_SIZE filter should prevent those), or a runt:
                      * drop it and give the buffer straight back to the chip. */
-                    (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.rx_dropped.fetch_add(1, Ordering::Relaxed);
                     frame.set_len(0);
-                    (*dev).rx_ring.post(idx, frame);
+                    ring.post(idx, frame);
                     continue;
                 }
 
                 /* The reported length includes the 4-byte CRC. */
                 let data_len = (rx_len - 4) as usize;
                 frame.set_len(data_len);
-                (*dev).rx_packets.fetch_add(1, Ordering::Relaxed);
+                self.rx_packets.fetch_add(1, Ordering::Relaxed);
 
-                batch[batched] = frame.into_raw();
-                batched += 1;
+                /* Room for it: the batch is as long as the budget. */
+                batch.push(frame);
 
                 match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-                    Some(new_frame) => (*dev).rx_ring.post(idx, new_frame),
+                    Some(new_frame) => ring.post(idx, new_frame),
                     None => {
                         /* Under memory pressure leave the slot empty; the
                          * refill at the top of this loop posts it once
                          * allocation works again. */
-                        (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
+                        self.rx_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -886,11 +861,11 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
             /* Hand the harvest over in one piece. Done before the status is
              * touched so that nothing sits in a local array while the chip is
              * being told it may signal again. */
-            (*dev).net_handle.enqueue_rx_batch(&batch[..batched]);
+            up.deliver(&mut batch);
 
             /* Clear what the chip has reported, so the next packet is a
              * transition rather than an addition to a status already set. */
-            (*dev).regs.write32(INTR_STATUS, RX_INTR_BITS);
+            self.regs.write32(INTR_STATUS, RX_INTR_BITS);
 
             if budget_hit {
                 RX_BUDGET_HITS.fetch_add(1, Ordering::Relaxed);
@@ -911,20 +886,20 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
              * chip answered with 7.5M interrupts for 38.7M frames -- one per
              * five, each costing an interrupt entry and two register reads on
              * the CPU already busy draining the ring. */
-            if !(*dev).rx_ring.has_work() {
+            if !ring.has_work() {
                 /* Empty: hand the ring back to the interrupt. */
-                arm(dev, INTR_MASK_BITS);
+                self.arm(INTR_MASK_BITS);
 
                 /* Re-checked after arming. A packet landing between the
                  * harvest above and the write to the mask register was
                  * already counted in the status cleared at the top of this
                  * round, so nothing would come for it. */
-                if !(*dev).rx_ring.has_work() {
+                if !ring.has_work() {
                     return;
                 }
 
                 /* Raced: it is ours to take, so go silent again. */
-                arm(dev, INTR_MASK_BITS & !RX_INTR_BITS);
+                self.arm(INTR_MASK_BITS & !RX_INTR_BITS);
             }
 
             polls += 1;
@@ -940,5 +915,45 @@ extern "C" fn r8125_process_rx(ctx: *mut u8) {
                 return;
             }
         }
+    }
+}
+
+/* ================================================================== */
+/* TX path: called by the net stack under the device's transmit lock;
+ * RX path: the poll above, and then its word on where it stopped */
+
+impl NetDriver for R8125Device {
+    type Tx = TxRing;
+    type Rx = RxRing;
+
+    fn flush_tx(&'static self, ring: &mut TxRing, stack: &mut TxQueue<'_>) {
+        ring.reap_completed(stack);
+
+        let mut submitted: u32 = 0;
+        loop {
+            if !ring.has_space() {
+                break;
+            }
+            match stack.dequeue() {
+                None => break,
+                Some(frame) => {
+                    ring.submit(frame);
+                    submitted = submitted + 1;
+                }
+            }
+        }
+
+        if submitted > 0 {
+            self.tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
+            /* Doorbell.  On the 8125 this is a 16-bit write of bit 0 to
+             * 0x90 -- the 8168's 8-bit NPQ at 0x38 does nothing here.
+             * Ordered after the descriptor stores by submit()'s dma_wmb. */
+            self.regs.write16(TX_POLL, TX_POLL_KICK);
+        }
+    }
+
+    fn process_rx(&'static self, ring: &mut RxRing, up: &mut RxQueue<'_>) {
+        self.poll_rx(ring, up);
+        self.publish_rx(ring);
     }
 }

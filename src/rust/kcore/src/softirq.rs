@@ -9,10 +9,21 @@ pub fn raise(typ: usize) {
     unsafe { ffi::softirq::kernel_softirq_raise(typ) }
 }
 
-/// Register a handler for a soft IRQ type.
-/// Called once during driver init, before the softirq task starts processing.
-pub fn register(typ: usize, handler: extern "C" fn(*mut u8), ctx: *mut u8) {
-    unsafe { ffi::softirq::kernel_softirq_register(typ, handler, ctx) }
+/// Have `handler(target)` run for a soft IRQ type: in task context, on one
+/// CPU at a time for a given type. Called once, before anything raises it.
+/// See `MsixInterrupt::register_for` for what a target and a handler are.
+pub fn register_for<T, F>(typ: usize, target: &'static T, handler: F)
+where
+    T: Sync + 'static,
+    F: Fn(&'static T) + Copy + 'static,
+{
+    const { crate::callback::assert_stateless::<F>() };
+    let _shown = handler;
+
+    unsafe {
+        ffi::softirq::kernel_softirq_register(
+            typ, crate::callback::trampoline::<T, F>, crate::callback::ctx_of(target))
+    }
 }
 
 /// Whether that soft IRQ is already asked for. What lets a poll tell a pass

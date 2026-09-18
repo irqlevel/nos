@@ -1,3 +1,4 @@
+use crate::callback;
 use crate::time::Duration;
 
 pub struct Timer {
@@ -5,15 +6,21 @@ pub struct Timer {
 }
 
 impl Timer {
-    /// Start a periodic timer. `handler(ctx)` is called every `period` from IPI context on CPU 0.
-    /// Returns None if no timer slots are available or period is zero.
-    pub fn start(
-        period: Duration,
-        handler: extern "C" fn(*mut u8),
-        ctx: *mut u8,
-    ) -> Option<Self> {
+    /// Start a periodic timer: `handler(target)` is called every `period`,
+    /// from IPI context on CPU 0. See `MsixInterrupt::register_for` for what
+    /// a target and a handler are. None if no timer slots are available or
+    /// the period is zero.
+    pub fn start_for<T, F>(period: Duration, target: &'static T, handler: F) -> Option<Self>
+    where
+        T: Sync + 'static,
+        F: Fn(&'static T) + Copy + 'static,
+    {
+        const { callback::assert_stateless::<F>() };
+        let _shown = handler;
+
         let h = unsafe {
-            ffi::timer::kernel_timer_start(handler, ctx, period.as_nanos())
+            ffi::timer::kernel_timer_start(
+                callback::trampoline::<T, F>, callback::ctx_of(target), period.as_nanos())
         };
         if h == 0 { None } else { Some(Self { handle: h }) }
     }

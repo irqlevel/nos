@@ -29,7 +29,10 @@ pub struct QueueLayout {
     pub msix: Option<u16>,
 }
 
-pub trait Transport {
+/// A transport is shared by everything that drives its device -- the task
+/// that submits, the interrupt that completes, on whichever CPUs -- so it is
+/// `Sync`: registers, and what it remembers in atomics.
+pub trait Transport: Send + Sync {
     fn reset(&self);
     fn status(&self) -> u8;
     fn set_status(&self, status: u8);

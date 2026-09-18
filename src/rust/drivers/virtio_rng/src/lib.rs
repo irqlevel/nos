@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
@@ -35,12 +36,10 @@ const REQUEST_QUEUE: u16 = 0;
 
 struct Rng {
     transport: Box<dyn Transport>,
-    /// Everything below is touched only with the lock held: the queue's
-    /// bookkeeping and the one buffer the device writes into.
-    lock: SpinLock<()>,
-    inner: core::cell::UnsafeCell<Inner>,
-    /// NUL-terminated, handed to the entropy table, which keeps it
-    name: [u8; 8],
+    /// The queue's bookkeeping and the one buffer the device writes into:
+    /// one request at a time.
+    inner: SpinLock<Inner>,
+    name: [u8; 4],
 }
 
 struct Inner {
@@ -53,16 +52,11 @@ struct Inner {
     stuck: bool,
 }
 
-/* The lock is what makes concurrent use of Inner safe, and the entropy table
- * only ever calls through the one registration. */
-unsafe impl Sync for Rng {}
-unsafe impl Send for Rng {}
-
-static mut DEVICES: usize = 0;
+static DEVICES: AtomicUsize = AtomicUsize::new(0);
 
 impl Rng {
     /// Bring a device up on whatever bus found it, and take its queue.
-    fn start(transport: Box<dyn Transport>, index: usize) -> Option<Box<Rng>> {
+    fn start(transport: Box<dyn Transport>, index: usize) -> Option<Rng> {
         /* virtio-rng has no features of its own to ask for. */
         virtio::negotiate(transport.as_ref(), 0)?;
 
@@ -82,33 +76,28 @@ impl Rng {
             }
         };
 
-        let lock = match SpinLock::new(()) {
-            Some(lock) => lock,
+        let inner = match SpinLock::new(Inner { queue, dma, stuck: false }) {
+            Some(inner) => inner,
             None => {
                 virtio::failed(transport.as_ref());
                 return None;
             }
         };
 
-        let mut name = [0u8; 8];
+        let mut name = [0u8; 4];
         name[..3].copy_from_slice(b"rng");
         name[3] = b'0' + index as u8;
 
-        Some(Box::new(Rng {
-            transport,
-            lock,
-            inner: core::cell::UnsafeCell::new(Inner { queue, dma, stuck: false }),
-            name,
-        }))
+        Some(Rng { transport, inner, name })
     }
 
     /// Fill buf from the device, a page at a time. False if the device
     /// stopped answering, which leaves the pool to its other sources.
     fn fill(&self, buf: &mut [u8]) -> bool {
-        let _guard = self.lock.lock();
         /* The lock is held for the whole of this, so nothing else is looking
          * at the queue or the buffer. */
-        let inner = unsafe { &mut *self.inner.get() };
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
 
         if inner.stuck {
             if inner.queue.take_used().is_none() {
@@ -162,41 +151,24 @@ impl Rng {
 
 /// What the kernel's entropy pool calls (kernel/entropy.h). Runs in task
 /// context, from a reseed.
-extern "C" fn get_random(ctx: *mut u8, buf: *mut u8, len: usize) -> i32 {
-    if ctx.is_null() || buf.is_null() || len == 0 {
-        return -1;
-    }
-
-    let rng = unsafe { &*(ctx as *const Rng) };
-    let out = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    if rng.fill(out) {
-        0
-    } else {
-        -1
+impl entropy::Source for Rng {
+    fn fill(&'static self, buf: &mut [u8]) -> bool {
+        Rng::fill(self, buf)
     }
 }
 
-fn register(rng: Box<Rng>) {
-    /* Taken before the box becomes a raw pointer: forming a reference to a
-       field through that pointer is exactly what must not be done to memory
-       the kernel is about to share. */
-    let label = rng.name;
-    let raw = Box::into_raw(rng);
-    let name = unsafe { core::ptr::addr_of!((*raw).name) as *const u8 };
-
+fn register(rng: Rng) {
     /* The device is the kernel's for good: an entropy source cannot be
-     * taken back, so neither the box nor the registration is ever dropped. */
-    match entropy::register(name, get_random, raw as *mut u8) {
-        Some(source) => {
-            core::mem::forget(source);
-            unsafe { DEVICES += 1 };
-            trace!(0, "virtio-rng: {} is an entropy source",
-                core::str::from_utf8(&label[..4]).unwrap_or("?"));
+     * taken back, so neither it nor the registration is ever dropped. */
+    let rng: &'static Rng = Box::leak(Box::new(rng));
+    let name = core::str::from_utf8(&rng.name).unwrap_or("rng?");
+
+    match entropy::register_source(name, rng) {
+        Some(_source) => {
+            DEVICES.fetch_add(1, Ordering::AcqRel);
+            trace!(0, "virtio-rng: {} is an entropy source", name);
         }
-        None => {
-            trace!(0, "virtio-rng: the entropy table would not take another source");
-            unsafe { drop(Box::from_raw(raw)) };
-        }
+        None => trace!(0, "virtio-rng: the entropy table would not take another source"),
     }
 }
 
@@ -208,7 +180,7 @@ pub fn init() {
 
     for device in [pci::device::VIRTIO_RNG, pci::device::VIRTIO_RNG_MODERN] {
         let mut start = 0;
-        while unsafe { DEVICES } < MAX_DEVICES {
+        while DEVICES.load(Ordering::Acquire) < MAX_DEVICES {
             let (index, dev) = match pci::find_device_from(pci::vendor::VIRTIO, device, start) {
                 Some(found) => found,
                 None => break,
@@ -229,7 +201,7 @@ pub fn init() {
                 if transport.is_legacy() { "legacy" } else { "modern" },
                 dev.bus, dev.slot, dev.func);
 
-            if let Some(rng) = Rng::start(Box::new(transport), unsafe { DEVICES }) {
+            if let Some(rng) = Rng::start(Box::new(transport), DEVICES.load(Ordering::Acquire)) {
                 register(rng);
             }
         }
@@ -253,7 +225,7 @@ pub unsafe extern "C" fn rust_virtio_rng_init_mmio(slots: *const Slot, count: us
 
     let slots = unsafe { core::slice::from_raw_parts(slots, count) };
     for slot in slots {
-        if unsafe { DEVICES } >= MAX_DEVICES {
+        if DEVICES.load(Ordering::Acquire) >= MAX_DEVICES {
             break;
         }
         if MmioTransport::device_id(slot) != virtio::device::RNG {
@@ -267,7 +239,7 @@ pub unsafe extern "C" fn rust_virtio_rng_init_mmio(slots: *const Slot, count: us
 
         trace!(0, "virtio-rng: virtio-mmio at {:#x}", slot.base);
 
-        if let Some(rng) = Rng::start(Box::new(transport), unsafe { DEVICES }) {
+        if let Some(rng) = Rng::start(Box::new(transport), DEVICES.load(Ordering::Acquire)) {
             register(rng);
         }
     }

@@ -20,14 +20,14 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use kcore::block;
+use kcore::block::{self, BlockDriver};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::{self, DmaBuffer};
 use kcore::interrupt::LegacyInterrupt;
 use kcore::msix::MsixInterrupt;
+use kcore::once::Once;
 use kcore::pci;
 use kcore::sync::{SpinLock, WaitGroup};
 use kcore::trace;
@@ -106,50 +106,45 @@ struct Hba {
     resp_size: usize,
     cdb_size: usize,
     max_target: u16,
-    msix: bool,
+    /// Whether completions arrive as MSI-X, where the ISR byte means nothing.
+    /// Known once the interrupt is in place, which is after the adapter is.
+    msix: AtomicBool,
 
-    /// One page of request headers and responses, a slot's worth apiece
-    dma: DmaBuffer,
     free: AtomicU32,
     done: Vec<WaitGroup>,
     complete: Vec<AtomicBool>,
 
     /// The queue and what is on it. Taken with interrupts off: completions
     /// arrive in interrupt context.
-    lock: SpinLock<()>,
-    inner: UnsafeCell<Inner>,
+    inner: SpinLock<Inner>,
 
-    _irq: Irq,
+    /// Kept: dropped, it would take the handler away
+    irq: Once<Irq>,
 }
 
 struct Inner {
     queue: Queue,
     slot_of_head: [u8; virtio::MAX_DESCRIPTORS as usize],
+    /// One page of request headers and responses, a slot's worth apiece. A
+    /// slot's are its holder's, but the page is one allocation, so it is
+    /// written and read where the queue is: under the lock.
+    dma: DmaBuffer,
 }
 
 enum Irq {
     Msix(MsixInterrupt),
     Legacy(LegacyInterrupt),
-    None,
 }
 
-/* Everything inside is atomic or taken under the lock, and an adapter is
- * registered for the life of the kernel. */
-unsafe impl Sync for Hba {}
-unsafe impl Send for Hba {}
-
-/// One logical unit: a disk the block layer knows by name.
+/// One logical unit: a disk the block layer knows by name. The adapter it is
+/// behind is for good, as it is itself.
 struct Disk {
-    hba: *const Hba,
+    hba: &'static Hba,
     target: u8,
     lun: u16,
     capacity: u64,
     sector_size: u64,
-    name: [u8; 8],
 }
-
-unsafe impl Sync for Disk {}
-unsafe impl Send for Disk {}
 
 impl Hba {
     fn slot_stride(&self) -> usize {
@@ -203,35 +198,33 @@ impl Hba {
         &self, target: u8, lun: u16, cdb: &[u8], data: Option<(u64, u32)>, dir: Data,
     ) -> bool {
         let slot = self.wait_for_slot();
-        let base = self.dma.as_ptr() as *mut u8;
         let req = self.req_offset(slot);
         let resp = self.resp_offset(slot);
-
-        unsafe {
-            core::ptr::write_bytes(base.add(req), 0, self.req_size + self.resp_size);
-
-            /* The SAM single-level LUN the spec asks for */
-            let lun_at = base.add(req + REQ_LUN_AT);
-            lun_at.write_volatile(0x01);
-            lun_at.add(1).write_volatile(target);
-            lun_at.add(2).write_volatile(((lun >> 8) as u8) | 0x40);
-            lun_at.add(3).write_volatile(lun as u8);
-
-            let cdb_at = base.add(req + REQ_CDB_AT);
-            for (i, byte) in cdb.iter().take(self.cdb_size).enumerate() {
-                cdb_at.add(i).write_volatile(*byte);
-            }
-        }
 
         self.complete[slot].store(false, Ordering::Release);
         self.done[slot].add(1);
 
-        let req_buf = Buf::read(self.dma.phys() + req as u64, self.req_size as u32);
-        let resp_buf = Buf::write(self.dma.phys() + resp as u64, self.resp_size as u32);
-
         let queued = {
-            let _guard = self.lock.lock();
-            let inner = unsafe { &mut *self.inner.get() };
+            let mut guard = self.inner.lock();
+            let inner = &mut *guard;
+
+            /* The request the device will read, and a response it has not
+             * written yet: before the chain goes on the ring. */
+            if let Some(bytes) = inner.dma.bytes_mut(req, self.req_size + self.resp_size) {
+                bytes.fill(0);
+
+                /* The SAM single-level LUN the spec asks for */
+                bytes[REQ_LUN_AT] = 0x01;
+                bytes[REQ_LUN_AT + 1] = target;
+                bytes[REQ_LUN_AT + 2] = ((lun >> 8) as u8) | 0x40;
+                bytes[REQ_LUN_AT + 3] = lun as u8;
+
+                let len = cdb.len().min(self.cdb_size);
+                bytes[REQ_CDB_AT..REQ_CDB_AT + len].copy_from_slice(&cdb[..len]);
+            }
+
+            let req_buf = Buf::read(inner.dma.phys() + req as u64, self.req_size as u32);
+            let resp_buf = Buf::write(inner.dma.phys() + resp as u64, self.resp_size as u32);
 
             let head = match (dir, data) {
                 /* Data the device reads goes with the request, before the
@@ -266,11 +259,10 @@ impl Hba {
         self.transport.notify(REQUEST_QUEUE);
         self.wait_done(slot);
 
-        let (response, status) = unsafe {
-            (
-                base.add(resp + RESP_RESPONSE_AT).read_volatile(),
-                base.add(resp + RESP_STATUS_AT).read_volatile(),
-            )
+        /* What the adapter wrote, read once it has said it is done. */
+        let (response, status) = match self.inner.lock().dma.bytes(resp, self.resp_size) {
+            Some(bytes) => (bytes[RESP_RESPONSE_AT], bytes[RESP_STATUS_AT]),
+            None => (!RESPONSE_OK, !STATUS_GOOD),
         };
         self.give_slot(slot);
 
@@ -298,8 +290,7 @@ impl Hba {
     fn collect(&self) {
         loop {
             let slot = {
-                let _guard = self.lock.lock();
-                let inner = unsafe { &mut *self.inner.get() };
+                let mut inner = self.inner.lock();
 
                 match inner.queue.take_used() {
                     None => break,
@@ -327,81 +318,68 @@ impl Hba {
 
 /* ---- what the block table calls ---- */
 
-extern "C" fn read_sectors(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32) -> i32 {
-    transfer(ctx, sector, buf, count, false, false)
-}
+impl Disk {
+    fn transfer(&self, sector: u64, buf: *const u8, len: usize, write: bool, fua: bool) -> bool {
+        /* One physically contiguous run, which is what the block API asks its
+         * callers for: a page, page-aligned. */
+        if len > PAGE_SIZE || (buf as usize) & (PAGE_SIZE - 1) != 0 {
+            trace!(0, "virtio-scsi: {} bytes at {:p} is not one page-aligned run", len, buf);
+            return false;
+        }
 
-extern "C" fn write_sectors(ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32) -> i32 {
-    transfer(ctx, sector, buf as *mut u8, count, true, fua != 0)
-}
+        let phys = dma::virt_to_phys(buf);
+        if phys == 0 {
+            return false;
+        }
 
-fn transfer(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32, write: bool, fua: bool) -> i32 {
-    if ctx.is_null() || buf.is_null() {
-        return -1;
-    }
-    if count == 0 {
-        return 0;
-    }
+        /* READ(10) / WRITE(10): the block address and the count, big-endian,
+         * and the force-unit-access bit for a write that must reach the
+         * medium. */
+        let count = (len as u64 / self.sector_size) as u16;
+        let mut cdb = [0u8; 32];
+        cdb[0] = if write { OP_WRITE10 } else { OP_READ10 };
+        if write && fua {
+            cdb[1] = 0x08;
+        }
+        let lba = sector as u32;
+        cdb[2..6].copy_from_slice(&lba.to_be_bytes());
+        cdb[7..9].copy_from_slice(&count.to_be_bytes());
 
-    let disk = unsafe { &*(ctx as *const Disk) };
-    let hba = unsafe { &*disk.hba };
-    let len = count as u64 * disk.sector_size;
-
-    /* One physically contiguous run, which is what the block API asks its
-     * callers for: a page, page-aligned. */
-    if len > PAGE_SIZE as u64 || (buf as usize) & (PAGE_SIZE - 1) != 0 {
-        trace!(0, "virtio-scsi: {} sectors at {:p} is not one page-aligned run", count, buf);
-        return -1;
-    }
-
-    let phys = dma::virt_to_phys(buf);
-    if phys == 0 {
-        return -1;
-    }
-
-    /* READ(10) / WRITE(10): the block address and the count, big-endian, and
-     * the force-unit-access bit for a write that must reach the medium. */
-    let mut cdb = [0u8; 32];
-    cdb[0] = if write { OP_WRITE10 } else { OP_READ10 };
-    if write && fua {
-        cdb[1] = 0x08;
-    }
-    let lba = sector as u32;
-    cdb[2..6].copy_from_slice(&lba.to_be_bytes());
-    cdb[7..9].copy_from_slice(&(count as u16).to_be_bytes());
-
-    let dir = if write { Data::Out } else { Data::In };
-    if hba.command(disk.target, disk.lun, &cdb, Some((phys, len as u32)), dir) {
-        0
-    } else {
-        -1
+        let dir = if write { Data::Out } else { Data::In };
+        self.hba.command(self.target, self.lun, &cdb, Some((phys, len as u32)), dir)
     }
 }
 
-extern "C" fn flush(ctx: *mut u8) -> i32 {
-    if ctx.is_null() {
-        return -1;
+impl BlockDriver for Disk {
+    /* The asynchronous path is NVMe's. */
+
+    fn capacity(&self) -> u64 {
+        self.capacity
     }
 
-    let disk = unsafe { &*(ctx as *const Disk) };
-    let hba = unsafe { &*disk.hba };
+    fn sector_size(&self) -> u64 {
+        self.sector_size
+    }
 
-    let mut cdb = [0u8; 32];
-    cdb[0] = OP_SYNC_CACHE;
+    fn read(&'static self, sector: u64, buf: &mut [u8]) -> bool {
+        self.transfer(sector, buf.as_ptr(), buf.len(), false, false)
+    }
 
-    if hba.command(disk.target, disk.lun, &cdb, None, Data::None) {
-        0
-    } else {
-        -1
+    fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
+        self.transfer(sector, data.as_ptr(), data.len(), true, fua)
+    }
+
+    fn flush(&'static self) -> bool {
+        let mut cdb = [0u8; 32];
+        cdb[0] = OP_SYNC_CACHE;
+        self.hba.command(self.target, self.lun, &cdb, None, Data::None)
     }
 }
 
-extern "C" fn interrupt(ctx: *mut u8) {
-    let hba = unsafe { &*(ctx as *const Hba) };
-
+fn interrupt(hba: &'static Hba) {
     /* The ISR byte says whether this device raised the line, and reading it
      * acknowledges; under MSI-X it means nothing (virtio 1.x 4.1.4.5). */
-    if !hba.msix && hba.transport.read_isr() == 0 {
+    if !hba.msix.load(Ordering::Relaxed) && hba.transport.read_isr() == 0 {
         return;
     }
 
@@ -473,14 +451,6 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         }
     };
 
-    let lock = match SpinLock::new(()) {
-        Some(lock) => lock,
-        None => {
-            virtio::failed(transport.as_ref());
-            return false;
-        }
-    };
-
     let mut done = Vec::with_capacity(MAX_SLOTS);
     let mut complete = Vec::with_capacity(MAX_SLOTS);
     for _ in 0..MAX_SLOTS {
@@ -494,50 +464,51 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         complete.push(AtomicBool::new(false));
     }
 
-    let hba = Box::new(Hba {
+    let layout = virtio::QueueLayout {
+        size: queue.size(),
+        desc: queue.desc_phys(),
+        driver: queue.avail_phys(),
+        device: queue.used_phys(),
+        msix: None,
+    };
+
+    let inner = match SpinLock::new(Inner {
+        queue,
+        slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
+        dma,
+    }) {
+        Some(inner) => inner,
+        None => {
+            virtio::failed(transport.as_ref());
+            return false;
+        }
+    };
+
+    /* For good: the interrupt handler is pointed at it, and so is every disk
+     * behind it. */
+    let hba: &'static Hba = Box::leak(Box::new(Hba {
         transport,
         req_size,
         resp_size,
         cdb_size,
         max_target: core::cmp::min(max_target, 255),
-        msix: false,
-        dma,
+        msix: AtomicBool::new(false),
         free: AtomicU32::new(if MAX_SLOTS >= 32 { u32::MAX } else { (1 << MAX_SLOTS) - 1 }),
         done,
         complete,
-        lock,
-        inner: UnsafeCell::new(Inner {
-            queue,
-            slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
-        }),
-        _irq: Irq::None,
-    });
+        inner,
+        irq: Once::new(),
+    }));
+    let transport = hba.transport.as_ref();
 
-    let raw = Box::into_raw(hba);
-    let transport = unsafe { (*raw).transport.as_ref() };
+    let msix_entry = arm_interrupt(hba, source);
+    hba.msix.store(msix_entry.is_some(), Ordering::Release);
 
-    let (irq, msix_entry) = arm_interrupt(transport, source, raw);
-    unsafe {
-        (*raw)._irq = irq;
-        (*raw).msix = msix_entry.is_some();
-    }
-
-    let layout = {
-        let inner = unsafe { &*(*raw).inner.get() };
-        virtio::QueueLayout {
-            size: inner.queue.size(),
-            desc: inner.queue.desc_phys(),
-            driver: inner.queue.avail_phys(),
-            device: inner.queue.used_phys(),
-            msix: msix_entry,
-        }
-    };
-    transport.setup_queue(REQUEST_QUEUE, &layout);
+    transport.setup_queue(REQUEST_QUEUE, &virtio::QueueLayout { msix: msix_entry, ..layout });
     virtio::driver_ok(transport);
 
     ADAPTERS.fetch_add(1, Ordering::AcqRel);
 
-    let hba = unsafe { &*raw };
     trace!(0, "virtio-scsi: an adapter with cdb {} sense {}, targets up to {}",
         cdb_size, sense_size, hba.max_target);
 
@@ -610,74 +581,49 @@ fn probe_lun(hba: &'static Hba, target: u8, lun: u16) -> bool {
     };
 
     let index = DISKS.load(Ordering::Relaxed);
-    let mut name = [0u8; 8];
+    let mut name = [0u8; 3];
     name[..2].copy_from_slice(b"sd");
     name[2] = b'a' + index as u8;
+    let name = core::str::from_utf8(&name).unwrap_or("sd?");
 
-    let disk = Box::into_raw(Box::new(Disk {
-        hba: hba as *const Hba,
-        target,
-        lun,
-        capacity,
-        sector_size,
-        name,
-    }));
+    /* For good, as every block device is. */
+    let disk: &'static Disk = Box::leak(Box::new(Disk { hba, target, lun, capacity, sector_size }));
 
-    let ops = block::BlockDeviceOps {
-        name: unsafe { core::ptr::addr_of!((*disk).name) as *const u8 },
-        capacity,
-        sector_size,
-        read_sectors,
-        write_sectors,
-        flush: Some(flush),
-        /* The asynchronous path is NVMe's. */
-        submit: None,
-        kick: None,
-        ctx: disk as *mut u8,
-        parent: 0,
-    };
-
-    match block::register(&ops) {
-        Some(registration) => {
-            core::mem::forget(registration);
+    match block::register_driver(name, 0, disk) {
+        Some(_registration) => {
             DISKS.store(index + 1, Ordering::Release);
             trace!(0, "virtio-scsi: {} is target {} lun {}, {} sectors of {} bytes",
-                core::str::from_utf8(&name[..3]).unwrap_or("?"), target, lun,
-                capacity, sector_size);
+                name, target, lun, capacity, sector_size);
             true
         }
-        None => {
-            unsafe { drop(Box::from_raw(disk)) };
-            false
-        }
+        None => false,
     }
 }
 
-fn arm_interrupt(
-    transport: &dyn Transport, source: IrqSource, hba: *mut Hba,
-) -> (Irq, Option<u16>) {
+fn arm_interrupt(hba: &'static Hba, source: IrqSource) -> Option<u16> {
+    let transport = hba.transport.as_ref();
+
     if let Some(table) = transport.msix_table() {
-        match MsixInterrupt::register(table, 0, interrupt, hba as *mut u8) {
+        match MsixInterrupt::register_for(table, 0, hba, interrupt) {
             Some(irq) => {
                 transport.use_msix(0);
-                return (Irq::Msix(irq), Some(0));
+                let _ = hba.irq.set(Irq::Msix(irq));
+                return Some(0);
             }
             None => trace!(0, "virtio-scsi: no MSI-X slot left, falling back on the line"),
         }
     }
 
     let registered = match source {
-        IrqSource::Pci(dev) => LegacyInterrupt::register_level(&dev, interrupt, hba as *mut u8),
-        IrqSource::Line(line) => LegacyInterrupt::register_irq(line, interrupt, hba as *mut u8),
+        IrqSource::Pci(dev) => LegacyInterrupt::register_level_for(&dev, hba, interrupt),
+        IrqSource::Line(line) => LegacyInterrupt::register_irq_for(line, hba, interrupt),
     };
 
     match registered {
-        Some(irq) => (Irq::Legacy(irq), None),
-        None => {
-            trace!(0, "virtio-scsi: the adapter has no interrupt -- I/O will be polled");
-            (Irq::None, None)
-        }
+        Some(irq) => { let _ = hba.irq.set(Irq::Legacy(irq)); }
+        None => trace!(0, "virtio-scsi: the adapter has no interrupt -- I/O will be polled"),
     }
+    None
 }
 
 /// The virtio-scsi adapters on the PCI bus. Called from the boot path.

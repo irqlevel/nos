@@ -29,7 +29,7 @@ Add a new kernel service in three steps:
 
 - Every kernel object that needs cleanup implements `Drop` calling the matching `kernel_*_destroy` / `kernel_*_stop` / `kernel_*_put` FFI.
 - RAII handles that must not be `Send` / `Sync` carry `PhantomData<*const ()>`.
-- Use `core::mem::forget(x)` when transferring ownership to C++ (e.g. `enqueue_rx`).
+- Ownership crosses to C++ by value, inside the wrapper: `RxQueue::enqueue(frame)` takes the frame and does the `into_raw`, so no call site has a `forget` to remember.
 
 ## Available modules (kcore)
 
@@ -40,23 +40,24 @@ Add a new kernel service in three steps:
 | `time` | `Duration`, `boot_time()`, `boot_time_ns()` (full resolution), `wall_clock_secs()` |
 | `random` | `fill_random(&mut [u8])`, `random_u64()` |
 | `pci` | Device scan, config r/w, BAR access (`get_bar`, `get_bar64`) |
-| `dma` | `DmaBuffer` (contiguous DMA alloc), `PhysMapping`, `virt_to_phys` |
+| `dma` | `DmaBuffer` (contiguous DMA alloc; `bytes`/`bytes_mut`, and `load`/`store` of a `Pod` at an offset — volatile, aligned and bounds-checked), `PhysMapping`, `virt_to_phys`; for a descriptor ring, `Volatile<T>` cells, `unsafe trait Descriptor` and `DmaBuffer::leak_ring::<D>() -> (&'static [D], phys)` — the ring as a shared slice of cells, which is what it is: the device, the poll and the state dump all look at it |
 | `io` | `MmioRegion` (8/16/32/64-bit), `Port<T>`, `read_msr`/`write_msr` |
-| `msix` | `MsixTable`, `MsixInterrupt` (Rust callback, 16 slots) |
-| `interrupt` | `LegacyInterrupt` (INTx, 8 slots) |
+| `msix` | `MsixTable`, `MsixInterrupt::register_for(table, index, &'static T, handler)` (16 slots) |
+| `interrupt` | `LegacyInterrupt::register_level_for(dev, &'static T, handler)` / `register_irq_for(irq, …)` (INTx, 8 slots) |
 | `sync` | **Locks own what they guard**: `Mutex<T>` (sleeps), `SpinLock<T>` (the kernel's), `IrqSpinLock<T>` and `PreemptSpinLock<T>` (const-constructible, for statics; the first also `try_lock`), `TryLock<T>` (never waited for; the holder may sleep). `lock()` gives a guard that derefs to the data. `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |
 | `once` | `Once<T>` (set once by boot or a `setup`, read from anywhere) and `OnceBox<T>` (the one of something, made on first use; racing makers get the same one) |
 | `percpu` | `PerCpu<T>` + `LocalCounter` (statistics any CPU may read, added to with no bus lock), `CpuLocal<T>` (state only its own CPU touches, reached with interrupts off through `with`) |
 | `static_ring` | `StaticRing<N>` (MPMC queue of words in static storage) and `Mailbox<T, N>` (fixed-shape messages written and read in place, from any context, no allocation) |
 | `task` | `spawn`, `spawn_on`, `spawn_for(name, &'static T, fn(&'static T))` (a service's task over its one instance — no raw context), `spawn_with_ctx` (each takes the name `ps` and `top` show), `TaskHandle` (`id`), `sleep`, `yield_to_runnable`, `current_id` (is this call from one of my own tasks?) |
-| `softirq` | `raise`, `register` (types: `TYPE_NET_RX`, `TYPE_BLK_IO`, etc.) |
-| `timer` | `Timer` (periodic, 8 slots, fires on CPU 0 via IPI) |
+| `softirq` | `raise`, `register_for(type, &'static T, handler)` (types: `TYPE_NET_RX`, `TYPE_BLK_IO`, etc.) |
+| `timer` | `Timer::start_for(period, &'static T, handler)` (periodic, 8 slots, fires on CPU 0 via IPI) |
 | `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI), `synchronize` (returns once every interrupt handler running at the call has returned) |
 | `ring` | `LocklessRing` — the kernel's bounded MPMC queue of words, one CAS an operation, safe from any context |
-| `block` | `register` → `BlockDeviceRegistration` (optional `submit`/`kick`: the asynchronous path; `parent` for a partition, so claims on it and on its disk refuse each other); `count`/`at` walk the kernel's table, `Disk::name`/`parent`/`handle` say what a device is; `Disk` — an existing disk or partition by name: synchronous `read`/`write`/`flush`, `partitions`; asynchronous `submit(&BlockIo, kick)`/`kick` straight to physical memory, completion callback from interrupt context (`can_submit`: NVMe and its partitions); `claim` → `DiskClaim` before writing (refused while a mount, the disk log or another writer holds it or an overlapping disk/partition) |
+| `block` | `trait BlockDriver` + `register_driver(name, parent, &'static D)` → `BlockDeviceRegistration` (`const ASYNC` with `submit`/`kick`: the asynchronous path); `count`/`at` walk the kernel's table, `Disk::name`/`parent`/`handle` say what a device is; `Disk` — an existing disk or partition by name: synchronous `read`/`write`/`flush`, `partitions`; asynchronous `submit(&BlockIo, kick)`/`kick` straight to physical memory, completion callback from interrupt context (`can_submit`: NVMe and its partitions); `claim` → `DiskClaim` before writing (refused while a mount, the disk log or another writer holds it or an overlapping disk/partition) |
 | `cmd` | `Command::register` — a shell command whose handler writes to an `Output`; unregistered on drop, after any running call returns. `dispatch` — run a command line as the console would, its output handed to a closure as it is printed |
-| `net` | `register` → `NetDeviceHandle`, `NetFrame` (`alloc_tx`); `Nic` — an existing device by name: `ip`, `mac`, `listen(port, &'static impl UdpHandler)` → `UdpListener` (the handler is lent each frame as a `Lent`: `bytes()`, or `retain()` to keep it and answer in it; `listen_batched` adds `on_batch_end`), `RxOwned<T>` (state only the receive path touches, reached with the `&mut RxContext` a handler is lent), `TxBatch<N>` (replies gathered and sent with one lock and one doorbell), `AtomicNic`, `transmit`; the raw `listen_udp`/`transmit_raw` remain for a module whose context is not `'static` |
+| `net` | `trait NetDriver` (`type Tx`, `type Rx`) + `NetBinding::new(driver, tx, rx).register(name, mac)` → `NetDeviceHandle`; `TxQueue` (`dequeue`, `done`) and `RxQueue` (`enqueue`, `deliver(&mut FrameBatch<N>)`) exist only inside `flush_tx` / `process_rx`; `NetFrame` (`alloc_tx`, `alloc_rx`); `Nic` — an existing device by name: `ip`, `mac`, `listen(port, &'static impl UdpHandler)` → `UdpListener` (the handler is lent each frame as a `Lent`: `bytes()`, or `retain()` to keep it and answer in it; `listen_batched` adds `on_batch_end`), `RxOwned<T>` (state only the receive path touches, reached with the `&mut RxContext` a handler is lent), `TxBatch<N>` (replies gathered and sent with one lock and one doorbell), `AtomicNic`, `transmit`; the raw `listen_udp`/`transmit_raw` remain for a module whose context is not `'static` |
 | `tcp` | `TcpSocket` — a connection somebody else opened and closes (the TLS client's); `TcpListener::bind(&Nic, port)` → `accept(timeout)` → `TcpStream` (`send_all`, `send` with a timeout, `recv`, `peer`), each closed on drop — a listener's drop resets what it never accepted |
+| `entropy` | `trait Source` + `register_source(name, &'static S)` — a hardware generator the pool reseeds from |
 | `fs` | `read(path, max)`, `write(path, data)` (replaces, then syncs), `create_dir` — a module's configuration files |
 | `pod` | `unsafe trait Pod` — said once of a `#[repr(C)]` structure of integers with no padding — and then `pod::read`/`write`/`zeroed`: bounds-checked, unaligned, safe to call. How an on-disk or on-wire structure is read out of a buffer |
 
@@ -89,6 +90,33 @@ The layers (`block/`, `fs/`, `net/`) are ordinary Rust; `unsafe` belongs in
   `UdpHandler`; a partition is an entry of the block table, not a driver
   registered with it). The C ABI is for what C++ or a separately linked
   module is on the other side of.
+- **A driver is a trait impl over a device that lives for good.** The
+  kernel's callback tables are C, but no driver sees them: `kcore` has the
+  `extern "C"` trampolines, generic over the driver, and the driver
+  implements `BlockDriver`, `NetDriver` or `entropy::Source`. A device is
+  `Box::leak`ed -- the tables never give one back -- so it is `&'static`,
+  there is no `*mut Device` to cast from `ctx`, and shutting down is a
+  `quiesce(&self)` that stops the hardware and takes the interrupt handles
+  out of their lock, not a `Box::from_raw` and a `Drop`.
+- **A callback is a function item over its target**:
+  `register_for(.., target: &'static T, handler)`, where `handler` is
+  `fn(&'static T)` named directly (`Nic::interrupt`, not a closure that
+  captures). `kcore` checks at compile time that it is zero-sized and
+  monomorphizes the trampoline, so the context word *is* the target.
+- **Who may touch what is who is handed it.** An interrupt handler gets
+  `&'static Device` and nothing else: registers, atomics, IRQ-safe locks --
+  it can run beside itself when its vector moves. A NIC's rings are not in
+  the device at all: they are `NetDriver::Tx` / `Rx`, owned by the
+  `NetBinding`, lent as `&mut` to `flush_tx` (the transmit lock is held)
+  and to `process_rx` (the receive soft IRQ runs on one CPU at a time).
+  What a state dump needs of a ring the poll publishes in atomics, and the
+  descriptors themselves are shared cells it can read live.
+- **Device memory is cells, not `read_volatile` on a cast pointer**: a
+  descriptor is a `#[repr(C)]` struct of `Volatile<u32>` (`unsafe impl
+  Descriptor` says so once), a ring is `leak_ring`'s `&'static [D]`, and
+  anything else in a `DmaBuffer` crosses through `load`/`store`/`bytes`.
+  The barriers stay where they were: `dma_wmb` before the store that hands
+  ownership over, `dma_rmb` after the check that takes it back.
 - **A graph is an arena and ids**, not raw pointers: `fs::vnode::Tree` hands
   out `NodeId`s -- a slot and a generation -- so a stale one finds nothing.
   Open files are the same shape (`vfs::Handle`).
@@ -99,56 +127,65 @@ The layers (`block/`, `fs/`, `net/`) are ordinary Rust; `unsafe` belongs in
 
 ## Interrupt handlers
 
-- **MSI-X with Rust callback**: use `MsixInterrupt::register(table, index, handler, ctx)` — no assembly needed, 16 slots shared across all Rust drivers.
-- **Legacy INTx**: use `LegacyInterrupt::register_level(dev, handler, ctx)`, 8 slots.
-- Handler signature: `extern "C" fn handler(ctx: *mut u8)` — called from IRQ context, no sleeping, no allocation.
+- **MSI-X**: `MsixInterrupt::register_for(&table, index, dev, Dev::interrupt)` — no assembly needed, 16 slots shared across all Rust drivers.
+- **Legacy INTx**: `LegacyInterrupt::register_level_for(pci_dev, dev, Dev::interrupt)`, 8 slots. The line may be shared: the handler says by its own status register whether the interrupt was its.
+- `dev` is `&'static Dev`, the handler `fn(&'static Dev)` — called from IRQ context: no sleeping, no allocation, and nothing of the device but registers, atomics and IRQ-safe locks (it may run on two CPUs at once).
+- The returned handle unregisters on drop. Keep it in a lock inside the device (`IrqSpinLock<Option<Irqs>>`); `quiesce` takes it out and drops it after the lock.
 
 ## Block driver registration
 
 ```rust
-extern "C" fn my_read(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32) -> i32 { ... }
-extern "C" fn my_write(ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32) -> i32 { ... }
+impl kcore::block::BlockDriver for MyDisk {
+    const ASYNC: bool = false;            // true: also `submit` and `kick`
+    fn capacity(&self) -> u64 { self.sectors }
+    fn sector_size(&self) -> u64 { 512 }
+    fn read(&'static self, sector: u64, buf: &mut [u8]) -> bool { ... }
+    fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool { ... }
+    fn flush(&'static self) -> bool { ... }   // default: nothing to push
+}
 
-let reg = kcore::block::register(&kcore::block::BlockDeviceOps {
-    name: b"nvme0\0".as_ptr(),
-    capacity: total_sectors,
-    sector_size: 512,
-    read_sectors: my_read,
-    write_sectors: my_write,
-    flush: None,
-    submit: None,   // the asynchronous path: both, or neither
-    kick: None,
-    ctx: driver_ptr,
-}).unwrap();
+let disk: &'static MyDisk = Box::leak(Box::new(MyDisk { ... }));
+let reg = kcore::block::register_driver("nvme0", 0, disk)?;
 // reg lives forever (boot-lifetime); no unregister
 ```
+
+Calls arrive from any task on any CPU, several at once: what one needs
+exclusively sits behind a lock in the device (`SpinLock<Submission>`). A
+buffer is whole sectors and never empty; the device may DMA straight into it.
 
 ## Net driver registration
 
 ```rust
-extern "C" fn flush_tx(ctx: *mut u8) {
-    let dev = unsafe { &*(ctx as *const MyNic) };
-    while let Some(frame) = dev.net_handle.tx_dequeue() {
-        // submit frame.data_phys() to HW ring
-        // store `frame` in a TX slot -- MUST keep alive until HW completion
-        dev.tx_slots[slot] = Some(frame);
+impl kcore::net::NetDriver for MyNic {
+    type Tx = TxRing;   // only flush_tx touches it
+    type Rx = RxRing;   // only process_rx touches it
+
+    fn flush_tx(&'static self, ring: &mut TxRing, stack: &mut TxQueue<'_>) {
+        ring.reap_completed(stack);              // finished frames -> stack.done(frame)
+        while ring.has_space() {
+            let Some(frame) = stack.dequeue() else { break };
+            ring.submit(frame);                  // the ring keeps the frame until HW is done
+        }
+        // doorbell
+    }
+
+    fn process_rx(&'static self, ring: &mut RxRing, up: &mut RxQueue<'_>) {
+        let mut batch: FrameBatch<64> = FrameBatch::new();
+        while let Some(frame) = ring.harvest() { batch.push(frame); /* repost a fresh one */ }
+        up.deliver(&mut batch);                  // one lock for the lot
     }
 }
-extern "C" fn process_rx(ctx: *mut u8) { /* dequeue from RxQueue, process */ }
 
-let handle = kcore::net::register(&kcore::net::NetDeviceOps {
-    name: b"eth0\0".as_ptr(),
-    mac: [0x52,0x54,0x00,0x01,0x02,0x03],
-    flush_tx,
-    process_rx,
-    ctx: driver_ptr,
-}).unwrap();
+let binding = NetBinding::new(MyNic { regs, .. }, tx_ring, rx_ring);   // leaked, for good
+let nic = binding.driver();                     // &'static MyNic: point the interrupt at it
+// ... register the interrupt, enable the hardware ...
+let handle = binding.register("eth0", mac)?;    // last: from here on it is called
 handle.set_ip(0xC0A80001); // 192.168.0.1 host order
 ```
 
-**TX frame lifetime**: a `NetFrame` from `tx_dequeue()` wraps the DMA buffer. Keep it alive until the HW completion interrupt fires. Dropping it early is a use-after-free.
+**TX frame lifetime**: a `NetFrame` from `dequeue()` wraps the DMA buffer. Keep it (in the ring's `Vec<Option<NetFrame>>` shadow) until the hardware says it is done, then hand it to `stack.done(frame)` — never drop it under the transmit lock: a free can reach the page allocator's TLB shootdown, which a CPU spinning on that lock never answers.
 
-**RX frame**: `NetFrame::alloc_rx(max_size)` gives a frame with `len() == 0`. Use `data_phys()` for the HW ring entry. After HW fills the buffer, call `set_len(received)` then `handle.enqueue_rx(frame)`.
+**RX frame**: `NetFrame::alloc_rx(max_size)` gives a frame with `len() == 0`. Use `data_phys()` for the HW ring entry. After HW fills the buffer, call `set_len(received)` then `up.enqueue(frame)` or gather a `FrameBatch` for `up.deliver`.
 
 ## C++ FFI conventions (`kernel/rust_ffi.cpp`)
 

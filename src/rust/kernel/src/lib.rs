@@ -72,14 +72,12 @@ fn tco_init() {
         wdt.base(), wdt.source().as_str(),
         if wdt.source().no_reboot_cleared() { "" } else { ", NO_REBOOT left as firmware set it" });
 
-    /* The timer callback holds a raw pointer to the TcoWatchdog; the watchdog
-       is deliberately leaked so it lives for the kernel's lifetime. */
-    let wdt_ptr = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(wdt));
+    /* The kick timer looks at the watchdog for as long as the kernel runs,
+       so that is how long the watchdog lives. */
+    let wdt: &'static TcoWatchdog = alloc::boxed::Box::leak(alloc::boxed::Box::new(wdt));
 
-    extern "C" fn kick_wdt(ctx: *mut u8) {
+    fn kick_wdt(wdt: &'static TcoWatchdog) {
         use core::sync::atomic::{AtomicBool, Ordering};
-
-        let wdt = unsafe { &*(ctx as *const TcoWatchdog) };
 
         /* ~16 ticks (0.6s each) have elapsed since the last kick, so a
            count still at the armed value means the timer never ran
@@ -99,13 +97,13 @@ fn tco_init() {
        machines where NO_REBOOT was cleared. Kick every 10 seconds against
        a 30-second timeout. */
     let period = Duration::from_secs(10);
-    match Timer::start(period, kick_wdt, wdt_ptr as *mut u8) {
+    match Timer::start_for(period, wdt, kick_wdt) {
         /* Dropping the handle would stop the timer (and the unkicked
            watchdog would then reset the machine); leak it so the kick
            runs for the kernel's lifetime. */
         Some(t) => {
             t.leak();
-            unsafe { (&mut *wdt_ptr).start(30) };
+            wdt.start(30);
             kcore::trace!(0, "TCO watchdog: started, timeout=30s");
         }
         None => {

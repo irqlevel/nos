@@ -66,8 +66,9 @@ Dropping a handle is enough because every unregister the kernel offers waits
 out a callback still running on another CPU before it returns: a command
 (`kernel_cmd_unregister`), a timer, a legacy or MSI-X interrupt, a task
 (`TaskHandle` joins it). A few registrations have no unregister at all: a block
-device (`kcore::block::register`), a net device (`kcore::net::register`) and a
-softirq handler (`kcore::softirq::register`) are the kernel's to call for as
+device (`kcore::block::register_driver`), a net device
+(`kcore::net::NetBinding::register`) and a softirq handler
+(`kcore::softirq::register_for`) are the kernel's to call for as
 long as it runs. A module that imports any of those is **permanent**: the
 loader sees the import, `lsmod` says so, and `rmmod` refuses it -- the way
 Linux keeps a module that has no exit function.

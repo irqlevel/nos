@@ -5,14 +5,15 @@
  * the EOR (End Of Ring) bit in the last descriptor's opts1 field.
  *
  * The descriptor memory is written by the NIC concurrently with the CPU,
- * so it is never accessed through references: all loads and stores go
- * through volatile operations on raw pointers (see desc_ptr()).
+ * so every word of it is a `Volatile` cell: shared, and each load and store
+ * is one the compiler leaves where it was written.
  *
  * TX ring ownership protocol:
  *   - Software fills descriptor, sets TX_OWN to hand off to hardware.
  *   - Hardware clears TX_OWN after transmission.
- *   - Shadow array stores raw NetFrame handles (0 = empty) to keep the
- *     DMA buffer alive until hardware signals completion.
+ *   - The shadow array holds the NetFrame of every descriptor the hardware
+ *     owns, which is what keeps its DMA buffer alive until the hardware
+ *     signals completion.
  *
  * RX ring ownership protocol:
  *   - Software allocates a NetFrame, writes its physical address into the
@@ -22,10 +23,9 @@
  *     new one via post().
  */
 
-use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-use kcore::dma::DmaBuffer;
-use kcore::net;
-use kcore::net::NetFrame;
+use alloc::vec::Vec;
+use kcore::dma::{Descriptor, DmaBuffer, Volatile};
+use kcore::net::{NetFrame, TxQueue};
 use crate::regs::*;
 
 /* Number of descriptors in each ring.
@@ -62,62 +62,77 @@ const _: () = assert!(RING_SIZE * core::mem::size_of::<RxDesc>() <= RING_PAGES *
 
 #[repr(C)]
 pub struct TxDesc {
-    pub opts1:   u32, /* OWN | EOR | FS | LS | frame_len */
-    pub opts2:   u32, /* checksum offload / VLAN (0 for basic driver) */
-    pub addr_lo: u32, /* low 32 bits of buffer physical address */
-    pub addr_hi: u32, /* high 32 bits of buffer physical address */
+    opts1:   Volatile<u32>, /* OWN | EOR | FS | LS | frame_len */
+    opts2:   Volatile<u32>, /* checksum offload / VLAN (0 for basic driver) */
+    addr_lo: Volatile<u32>, /* low 32 bits of buffer physical address */
+    addr_hi: Volatile<u32>, /* high 32 bits of buffer physical address */
 }
 const _: () = assert!(core::mem::size_of::<TxDesc>() == 16);
 
 #[repr(C)]
 pub struct RxDesc {
-    pub opts1:   u32, /* OWN | EOR | buffer_len (written with buf capacity; hardware fills rx_len) */
-    pub opts2:   u32, /* checksum / VLAN status (read-only for basic driver) */
-    pub addr_lo: u32,
-    pub addr_hi: u32,
+    opts1:   Volatile<u32>, /* OWN | EOR | buffer_len (written with buf capacity; hardware fills rx_len) */
+    opts2:   Volatile<u32>, /* checksum / VLAN status (read-only for basic driver) */
+    addr_lo: Volatile<u32>,
+    addr_hi: Volatile<u32>,
 }
 const _: () = assert!(core::mem::size_of::<RxDesc>() == 16);
+
+/* Four volatile words each. */
+unsafe impl Descriptor for TxDesc {}
+unsafe impl Descriptor for RxDesc {}
+
+/// A ring's descriptors, where the chip is about to be told they are: shared
+/// with it, zeroed, and for good. None when the memory is too small for them.
+fn ring<D: Descriptor>(dma: DmaBuffer) -> Option<(&'static [D], u64)> {
+    let (descs, phys) = dma.leak_ring::<D>();
+    if descs.len() < RING_SIZE {
+        return None;
+    }
+    Some((&descs[..RING_SIZE], phys))
+}
+
+/// A ring's shadow of what is posted in it: the frame in each slot, none
+/// where there is none.
+fn shadow() -> Option<Vec<Option<NetFrame>>> {
+    let mut frames = Vec::new();
+    frames.try_reserve_exact(RING_SIZE).ok()?;
+    frames.resize_with(RING_SIZE, || None);
+    Some(frames)
+}
 
 /* ================================================================== */
 /* TX ring */
 
 pub struct TxRing {
-    /* DMA memory holding RING_SIZE TxDesc structs */
-    pub dma: DmaBuffer,
-    /* Shadow raw frame handles: non-zero while descriptor is owned by hardware.
-     * Using raw usize instead of Option<NetFrame> avoids the non-Copy array
-     * initialisation restriction. */
-    pub frames: [usize; RING_SIZE],
+    /* RING_SIZE TxDesc structs in DMA memory */
+    descs: &'static [TxDesc],
+    /* Where the chip is told the ring is */
+    pub phys: u64,
+    /* The frame of each descriptor the hardware owns */
+    frames: Vec<Option<NetFrame>>,
     /* Next free descriptor slot (written by flush_tx) */
-    pub tail: usize,
+    tail: usize,
     /* Next descriptor to check for completion (advanced by reap_completed) */
-    pub head: usize,
+    head: usize,
 }
 
 impl TxRing {
-    pub fn new(mut dma: DmaBuffer) -> Self {
-        /* Zero the entire DMA page so no leftover TX_OWN bits can cause
+    pub fn new(dma: DmaBuffer) -> Option<Self> {
+        /* The whole ring comes zeroed, so no leftover TX_OWN bits can cause
          * the hardware to DMA from garbage addresses at TX_POLL time. */
-        unsafe { core::ptr::write_bytes(dma.as_mut_ptr(), 0, dma.len()) };
+        let (descs, phys) = ring::<TxDesc>(dma)?;
 
-        let mut ring = Self {
-            dma,
-            frames: [0usize; RING_SIZE],
+        /* Mark the last descriptor as EOR so the hardware wraps to index 0 */
+        descs[RING_SIZE - 1].opts1.write(TX_EOR);
+
+        Some(Self {
+            descs,
+            phys,
+            frames: shadow()?,
             tail: 0,
             head: 0,
-        };
-        /* Mark the last descriptor as EOR so the hardware wraps to index 0 */
-        unsafe {
-            write_volatile(addr_of_mut!((*ring.desc_ptr(RING_SIZE - 1)).opts1), TX_EOR);
-        }
-        ring
-    }
-
-    /* Raw pointer to descriptor `idx` in DMA memory.  All descriptor
-     * access must be volatile through this pointer; the NIC reads and
-     * writes the ring concurrently. */
-    fn desc_ptr(&mut self, idx: usize) -> *mut TxDesc {
-        unsafe { (self.dma.as_mut_ptr() as *mut TxDesc).add(idx) }
+        })
     }
 
     /* True if there is at least one free descriptor slot */
@@ -126,9 +141,9 @@ impl TxRing {
     }
 
     /* Submit a frame into the next TX descriptor slot.
-     * Caller must check has_space() first.  The frame is consumed and its
-     * raw handle is stored in the shadow array to keep the DMA buffer alive
-     * until reap_completed() sees that hardware cleared TX_OWN. */
+     * Caller must check has_space() first.  The frame is consumed and kept
+     * in the shadow array, its DMA buffer alive, until reap_completed() sees
+     * that hardware cleared TX_OWN. */
     pub fn submit(&mut self, frame: NetFrame) {
         let idx  = self.tail;
         let phys = frame.data_phys();
@@ -137,50 +152,42 @@ impl TxRing {
         let is_last = idx == RING_SIZE - 1;
         let eor: u32 = if is_last { TX_EOR } else { 0 };
 
-        /* Transfer ownership into shadow array without calling Drop */
-        let handle = frame.into_raw();
+        let d = &self.descs[idx];
+        d.addr_lo.write(phys as u32);
+        d.addr_hi.write((phys >> 32) as u32);
+        d.opts2.write(0);
+        /* Write opts1 (with TX_OWN) last; dma_wmb orders the descriptor
+         * stores against the OWN store as seen by the NIC (dmb oshst on
+         * arm64 — an atomic fence is only dmb ish, whose domain excludes
+         * a PCIe master; free on x86). Hardware must see a valid address
+         * before it sees OWN=1. */
+        kcore::barrier::dma_wmb();
+        d.opts1.write(TX_OWN | TX_FS | TX_LS | eor | (len & TX_LEN_MASK));
 
-        let d = self.desc_ptr(idx);
-        unsafe {
-            write_volatile(addr_of_mut!((*d).addr_lo), phys as u32);
-            write_volatile(addr_of_mut!((*d).addr_hi), (phys >> 32) as u32);
-            write_volatile(addr_of_mut!((*d).opts2), 0);
-            /* Write opts1 (with TX_OWN) last; dma_wmb orders the descriptor
-             * stores against the OWN store as seen by the NIC (dmb oshst on
-             * arm64 — an atomic fence is only dmb ish, whose domain excludes
-             * a PCIe master; free on x86). Hardware must see a valid address
-             * before it sees OWN=1. */
-            kcore::barrier::dma_wmb();
-            write_volatile(addr_of_mut!((*d).opts1),
-                TX_OWN | TX_FS | TX_LS | eor | (len & TX_LEN_MASK));
-        }
-
-        self.frames[idx] = handle;
+        self.frames[idx] = Some(frame);
         self.tail = (idx + 1) % RING_SIZE;
     }
 
     /* Walk the ring from head and free all descriptors that hardware has
      * finished with (TX_OWN cleared).  Called only from flush_tx under
      * tx_lock; never from the ISR. */
-    pub fn reap_completed(&mut self, net: net::NetDeviceHandle) {
+    pub fn reap_completed(&mut self, stack: &mut TxQueue<'_>) {
         loop {
             if self.head == self.tail {
                 break; /* ring empty */
             }
             let idx = self.head;
             /* Volatile read: hardware clears TX_OWN asynchronously via DMA. */
-            let opts1 = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).opts1)) };
+            let opts1 = self.descs[idx].opts1.read();
             if opts1 & TX_OWN != 0 {
                 break; /* hardware still owns */
             }
-            let h = self.frames[idx];
-            self.frames[idx] = 0;
-            if h != 0 {
-                /* Handed back, not dropped: this runs under the C++
-                 * TxQueueLock with interrupts off, and dropping reaches
+            if let Some(frame) = self.frames[idx].take() {
+                /* Handed back, not dropped: this runs under the device's
+                 * transmit lock with interrupts off, and dropping reaches
                  * Mm::Free -> a TLB shootdown that waits for every other CPU.
                  * A CPU spinning on that lock cannot answer it. */
-                net.tx_done(unsafe { NetFrame::from_raw(h) });
+                stack.done(frame);
             }
             self.head = (idx + 1) % RING_SIZE;
         }
@@ -191,49 +198,52 @@ impl TxRing {
 /* RX ring */
 
 pub struct RxRing {
-    pub dma: DmaBuffer,
-    /* Per-slot shadow handle; non-zero while descriptor is owned by hardware */
-    pub frames: [usize; RING_SIZE],
+    descs: &'static [RxDesc],
+    pub phys: u64,
+    /* Per-slot shadow frame; there while the descriptor is owned by hardware */
+    frames: Vec<Option<NetFrame>>,
     /* Next descriptor to check for received data */
-    pub head: usize,
+    head: usize,
 }
 
 impl RxRing {
-    pub fn new(dma: DmaBuffer) -> Self {
-        Self {
-            dma,
-            frames: [0usize; RING_SIZE],
+    pub fn new(dma: DmaBuffer) -> Option<Self> {
+        let (descs, phys) = ring::<RxDesc>(dma)?;
+        Some(Self {
+            descs,
+            phys,
+            frames: shadow()?,
             head: 0,
-        }
+        })
     }
 
-    /* Raw pointer to descriptor `idx`; see TxRing::desc_ptr. */
-    fn desc_ptr(&mut self, idx: usize) -> *mut RxDesc {
-        unsafe { (self.dma.as_mut_ptr() as *mut RxDesc).add(idx) }
+    /* The slot the next received frame will be found in. */
+    pub fn head(&self) -> usize {
+        self.head
+    }
+
+    /* Whether slot `idx` has no buffer posted: a refill that failed. */
+    pub fn is_empty_slot(&self, idx: usize) -> bool {
+        self.frames[idx].is_none()
     }
 
     /* Post a NetFrame at descriptor slot `idx`, giving ownership to hardware.
-     * The frame handle is retained in `frames[idx]` for later harvest. */
+     * The frame is retained in `frames[idx]` for later harvest. */
     pub fn post(&mut self, idx: usize, frame: NetFrame) {
         let phys = frame.data_phys();
         let is_last = idx == RING_SIZE - 1;
         let eor: u32 = if is_last { RX_EOR } else { 0 };
 
-        let handle = frame.into_raw();
+        let d = &self.descs[idx];
+        d.addr_lo.write(phys as u32);
+        d.addr_hi.write((phys >> 32) as u32);
+        d.opts2.write(0);
+        kcore::barrier::dma_wmb(); /* see TxRing::submit */
+        /* Program buffer capacity into len field; hardware replaces it with
+         * the actual received frame length when it clears RX_OWN. */
+        d.opts1.write(RX_OWN | eor | (RX_BUF_SIZE as u32 & RX_LEN_MASK));
 
-        let d = self.desc_ptr(idx);
-        unsafe {
-            write_volatile(addr_of_mut!((*d).addr_lo), phys as u32);
-            write_volatile(addr_of_mut!((*d).addr_hi), (phys >> 32) as u32);
-            write_volatile(addr_of_mut!((*d).opts2), 0);
-            kcore::barrier::dma_wmb(); /* see TxRing::submit */
-            /* Program buffer capacity into len field; hardware replaces it with
-             * the actual received frame length when it clears RX_OWN. */
-            write_volatile(addr_of_mut!((*d).opts1),
-                RX_OWN | eor | (RX_BUF_SIZE as u32 & RX_LEN_MASK));
-        }
-
-        self.frames[idx] = handle;
+        self.frames[idx] = Some(frame);
     }
 
     /* Attempt to harvest a received frame from the current head slot.
@@ -245,13 +255,12 @@ impl RxRing {
      * bits (RX_ERR_MASK, RX_FF/RX_LF) before passing the frame on. */
     pub fn harvest(&mut self) -> Option<(NetFrame, u32)> {
         let idx = self.head;
-        let h = self.frames[idx];
-        if h == 0 {
+        if self.frames[idx].is_none() {
             return None;
         }
         /* Volatile read: hardware clears RX_OWN and writes the received
          * length via DMA. */
-        let opts1 = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).opts1)) };
+        let opts1 = self.descs[idx].opts1.read();
         if opts1 & RX_OWN != 0 {
             return None; /* hardware still owns */
         }
@@ -260,8 +269,8 @@ impl RxRing {
          * packet bytes must be fenced after the OWN-bit load (dma_rmb; a
          * control dependency does not order load->load on arm64). */
         kcore::barrier::dma_rmb();
-        self.frames[idx] = 0;
+        let frame = self.frames[idx].take()?;
         self.head = (idx + 1) % RING_SIZE;
-        Some((unsafe { NetFrame::from_raw(h) }, opts1))
+        Some((frame, opts1))
     }
 }

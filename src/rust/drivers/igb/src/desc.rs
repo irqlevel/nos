@@ -14,11 +14,9 @@
  * `desc_unused` is what enforces it, and it is why the ring holds
  * RING_SIZE - 1 buffers rather than RING_SIZE. */
 
-use alloc::vec;
 use alloc::vec::Vec;
-use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
-use kcore::dma::DmaBuffer;
-use kcore::net::{NetDeviceHandle, NetFrame};
+use kcore::dma::{Descriptor, DmaBuffer, Volatile};
+use kcore::net::{NetFrame, TxQueue};
 
 use crate::regs::*;
 
@@ -46,12 +44,17 @@ const _: () = assert!(RING_SIZE * DESC_BYTES <= RING_PAGES * 4096);
  * rather than declaring two structs and transmuting between them keeps every
  * access plainly volatile. */
 #[repr(C)]
-struct Desc {
-    d0: u32,
-    d1: u32,
-    d2: u32,
-    d3: u32,
+pub struct Desc {
+    d0: Volatile<u32>,
+    d1: Volatile<u32>,
+    d2: Volatile<u32>,
+    d3: Volatile<u32>,
 }
+
+const _: () = assert!(core::mem::size_of::<Desc>() == DESC_BYTES);
+
+/* Four volatile words. */
+unsafe impl Descriptor for Desc {}
 
 /* Receive, software format:  d0/d1 = packet buffer address (lo/hi)
  *                            d2/d3 = header buffer address, unused here
@@ -65,15 +68,49 @@ struct Desc {
  *                            d3    = offload info and payload length
  * Transmit, write-back:      d3    = status, of which only DD matters here */
 
+/// A ring's descriptors, where the chip has been told they are: shared with
+/// it, and for good. None when there is no memory for them, or not enough.
+fn ring(dma: DmaBuffer) -> Option<(&'static [Desc], u64)> {
+    let (descs, phys) = dma.leak_ring::<Desc>();
+    if descs.len() < RING_SIZE {
+        return None;
+    }
+    Some((&descs[..RING_SIZE], phys))
+}
+
+/// A ring's shadow of what is posted in it: the frame in each slot, none
+/// where there is none. On the heap, not inline -- see `RxRing::frames`.
+fn shadow() -> Option<Vec<Option<NetFrame>>> {
+    let mut frames = Vec::new();
+    frames.try_reserve_exact(RING_SIZE).ok()?;
+    frames.resize_with(RING_SIZE, || None);
+    Some(frames)
+}
+
+/// The receive ring as anything but the poll may see it: the descriptors
+/// themselves, which are the chip's as much as the driver's, and where the
+/// poll last said it was. What the state dump reads.
+pub struct RxView {
+    descs: &'static [Desc],
+}
+
+impl RxView {
+    /// The status word of descriptor `idx`, as it is in memory this instant.
+    pub fn status(&self, idx: usize) -> u32 {
+        self.descs.get(idx).map_or(0, |d| d.d2.read())
+    }
+}
+
 pub struct RxRing {
-    pub dma: DmaBuffer,
-    /// Raw NetFrame handles, one per slot; 0 where a refill has not happened.
+    descs: &'static [Desc],
+    pub phys: u64,
+    /// The frame in each slot; None where a refill has not happened.
     ///
     /// Heap, not an inline array. Two of these inline is 16 KiB inside a
     /// struct that Box::new builds on the stack before moving, and a kernel
     /// stack is 32 KiB in total -- at RING_SIZE 1024 that is a double fault
     /// during device init, which is how this was found.
-    frames: Vec<usize>,
+    frames: Vec<Option<NetFrame>>,
     /// The slot the chip will complete next, from software's point of view.
     next_to_clean: usize,
     /// The slot to hand over next.
@@ -86,27 +123,22 @@ pub struct RxRing {
 }
 
 impl RxRing {
-    pub fn new(mut dma: DmaBuffer) -> Self {
-        unsafe { core::ptr::write_bytes(dma.as_mut_ptr(), 0, dma.len()) };
-        Self {
-            dma,
-            frames: vec![0usize; RING_SIZE],
+    pub fn new(dma: DmaBuffer) -> Option<Self> {
+        let (descs, phys) = ring(dma)?;
+        Some(Self {
+            descs,
+            phys,
+            frames: shadow()?,
             next_to_clean: 0,
             next_to_use: 0,
             rdt_written: 0,
-        }
+        })
     }
 
-    fn desc_ptr(&mut self, idx: usize) -> *mut Desc {
-        unsafe { (self.dma.as_mut_ptr() as *mut Desc).add(idx) }
-    }
-
-    /// The same address without borrowing the ring mutably, for the state
-    /// dump: that runs from the shell task while the poll owns this ring on
-    /// another CPU, and handing out a second `&mut` to it would be a lie to
-    /// the compiler whether or not the reads are harmless.
-    fn desc_ptr_shared(&self, idx: usize) -> *const Desc {
-        unsafe { (self.dma.as_ptr() as *const Desc).add(idx) }
+    /// The same descriptors, for whoever dumps the chip's state while the
+    /// poll owns this ring on another CPU.
+    pub fn view(&self) -> RxView {
+        RxView { descs: self.descs }
     }
 
     /// Slots that could still be handed to the chip, keeping the one-descriptor
@@ -132,20 +164,17 @@ impl RxRing {
 
         let idx = self.next_to_use;
         let phys = frame.data_phys();
-        let handle = frame.into_raw();
 
-        let d = self.desc_ptr(idx);
-        unsafe {
-            /* Writing the software format also clears the status word, so the
-             * stale Descriptor Done from the previous round cannot be read as
-             * a fresh completion. */
-            write_volatile(addr_of_mut!((*d).d0), phys as u32);
-            write_volatile(addr_of_mut!((*d).d1), (phys >> 32) as u32);
-            write_volatile(addr_of_mut!((*d).d2), 0);
-            write_volatile(addr_of_mut!((*d).d3), 0);
-        }
+        /* Writing the software format also clears the status word, so the
+         * stale Descriptor Done from the previous round cannot be read as a
+         * fresh completion. */
+        let d = &self.descs[idx];
+        d.d0.write(phys as u32);
+        d.d1.write((phys >> 32) as u32);
+        d.d2.write(0);
+        d.d3.write(0);
 
-        self.frames[idx] = handle;
+        self.frames[idx] = Some(frame);
         self.next_to_use = (idx + 1) % RING_SIZE;
         Some(idx)
     }
@@ -166,17 +195,13 @@ impl RxRing {
         self.rdt_written = self.next_to_use as u32;
     }
 
-    /// Software's two pointers and the status word of the descriptor it is
-    /// waiting on, for the state dump. Takes `&self`: see `desc_ptr_shared`.
-    pub fn debug_state(&self) -> (u32, u32, u32, u32) {
-        let idx = self.next_to_clean;
-        let status = unsafe { read_volatile(addr_of!((*self.desc_ptr_shared(idx)).d2)) };
-        let posted = if self.frames[idx] != 0 { 1 } else { 0 };
+    /// Software's two pointers, and whether the slot it is waiting on has a
+    /// buffer in it: what the poll leaves out for the state dump.
+    pub fn pointers(&self) -> (u32, u32, bool) {
         (
             self.next_to_clean as u32,
             self.next_to_use as u32,
-            status,
-            posted,
+            self.frames[self.next_to_clean].is_some(),
         )
     }
 
@@ -185,26 +210,25 @@ impl RxRing {
     /// go round again without touching the device.
     pub fn has_work(&mut self) -> bool {
         let idx = self.next_to_clean;
-        if self.frames[idx] == 0 {
+        if self.frames[idx].is_none() {
             /* An earlier refill failed and left this slot empty; the chip
              * cannot pass it, so there is nothing to wait for. Reported as
              * work so the caller reposts it. */
             return true;
         }
-        let status = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).d2)) };
-        status & RXD_STAT_DD != 0
+        self.descs[idx].d2.read() & RXD_STAT_DD != 0
     }
 
     /// Take the completed frame at the clean pointer.
     /// Returns the frame, the status/error word and the length in bytes.
     pub fn harvest(&mut self) -> Option<(NetFrame, u32, usize)> {
         let idx = self.next_to_clean;
-        let h = self.frames[idx];
-        if h == 0 {
+        if self.frames[idx].is_none() {
             return None;
         }
 
-        let status = unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).d2)) };
+        let d = &self.descs[idx];
+        let status = d.d2.read();
         if status & RXD_STAT_DD == 0 {
             return None;
         }
@@ -215,29 +239,18 @@ impl RxRing {
          * arm64; fence explicitly. */
         kcore::barrier::dma_rmb();
 
-        let len = (unsafe { read_volatile(addr_of!((*self.desc_ptr(idx)).d3)) } & 0xFFFF) as usize;
+        let len = (d.d3.read() & 0xFFFF) as usize;
 
-        self.frames[idx] = 0;
+        let frame = self.frames[idx].take()?;
         self.next_to_clean = (idx + 1) % RING_SIZE;
-        Some((unsafe { NetFrame::from_raw(h) }, status, len))
-    }
-}
-
-impl Drop for RxRing {
-    fn drop(&mut self) {
-        for i in 0..RING_SIZE {
-            let h = self.frames[i];
-            if h != 0 {
-                self.frames[i] = 0;
-                drop(unsafe { NetFrame::from_raw(h) });
-            }
-        }
+        Some((frame, status, len))
     }
 }
 
 pub struct TxRing {
-    pub dma: DmaBuffer,
-    frames: Vec<usize>,
+    descs: &'static [Desc],
+    pub phys: u64,
+    frames: Vec<Option<NetFrame>>,
     /// The slots that asked the chip for a write-back (RS). Not every one
     /// does: see `submit` and `report_last`.
     rs: Vec<bool>,
@@ -246,19 +259,14 @@ pub struct TxRing {
 }
 
 impl TxRing {
-    pub fn new(mut dma: DmaBuffer) -> Self {
-        unsafe { core::ptr::write_bytes(dma.as_mut_ptr(), 0, dma.len()) };
-        Self {
-            dma,
-            frames: vec![0usize; RING_SIZE],
-            rs: vec![false; RING_SIZE],
-            next_to_use: 0,
-            next_to_clean: 0,
-        }
-    }
+    pub fn new(dma: DmaBuffer) -> Option<Self> {
+        let (descs, phys) = ring(dma)?;
 
-    fn desc_ptr(&mut self, idx: usize) -> *mut Desc {
-        unsafe { (self.dma.as_mut_ptr() as *mut Desc).add(idx) }
+        let mut rs = Vec::new();
+        rs.try_reserve_exact(RING_SIZE).ok()?;
+        rs.resize(RING_SIZE, false);
+
+        Some(Self { descs, phys, frames: shadow()?, rs, next_to_use: 0, next_to_clean: 0 })
     }
 
     /// Room for one more, under the same gap rule the receive ring follows.
@@ -268,16 +276,16 @@ impl TxRing {
 
     /// Place a frame in the next slot, asking the chip to report it done when
     /// `rs`. Does not ring the doorbell: the caller submits a run, marks its
-    /// last descriptor with `report_last` and writes TDT once.
-    pub fn submit(&mut self, frame: NetFrame, rs: bool) -> bool {
+    /// last descriptor with `report_last` and writes TDT once. A frame there
+    /// is no room for comes back.
+    pub fn submit(&mut self, frame: NetFrame, rs: bool) -> Result<(), NetFrame> {
         if !self.can_submit() {
-            return false;
+            return Err(frame);
         }
 
         let idx = self.next_to_use;
         let phys = frame.data_phys();
         let len = frame.len();
-        let handle = frame.into_raw();
 
         /* RS asks for the write-back this driver reaps on -- not on every
          * descriptor: each is a descriptor write the chip makes and, with
@@ -286,34 +294,30 @@ impl TxRing {
          * register reads alone. */
         let rs_bit = if rs { TXD_DCMD_RS } else { 0 };
 
-        let d = self.desc_ptr(idx);
-        unsafe {
-            write_volatile(addr_of_mut!((*d).d0), phys as u32);
-            write_volatile(addr_of_mut!((*d).d1), (phys >> 32) as u32);
+        let d = &self.descs[idx];
+        d.d0.write(phys as u32);
+        d.d1.write((phys >> 32) as u32);
 
-            /* Every frame is a whole packet in one buffer, so every descriptor
-             * is EOP. IFCS has the chip append the CRC, DEXT selects the
-             * advanced layout these offsets describe. */
-            write_volatile(
-                addr_of_mut!((*d).d2),
-                (len as u32 & 0xFFFF)
-                    | TXD_DTYP_DATA
-                    | TXD_DCMD_EOP
-                    | TXD_DCMD_IFCS
-                    | rs_bit
-                    | TXD_DCMD_DEXT,
-            );
+        /* Every frame is a whole packet in one buffer, so every descriptor is
+         * EOP. IFCS has the chip append the CRC, DEXT selects the advanced
+         * layout these offsets describe. */
+        d.d2.write(
+            (len as u32 & 0xFFFF)
+                | TXD_DTYP_DATA
+                | TXD_DCMD_EOP
+                | TXD_DCMD_IFCS
+                | rs_bit
+                | TXD_DCMD_DEXT,
+        );
 
-            /* Payload length for a packet with no offloads is just the frame,
-             * and the status half starts clear so the DD we reap on is the
-             * chip's. */
-            write_volatile(addr_of_mut!((*d).d3), (len as u32) << TXD_PAYLEN_SHIFT);
-        }
+        /* Payload length for a packet with no offloads is just the frame, and
+         * the status half starts clear so the DD we reap on is the chip's. */
+        d.d3.write((len as u32) << TXD_PAYLEN_SHIFT);
 
-        self.frames[idx] = handle;
+        self.frames[idx] = Some(frame);
         self.rs[idx] = rs;
         self.next_to_use = (idx + 1) % RING_SIZE;
-        true
+        Ok(())
     }
 
     /// Ask for a write-back on the descriptor submitted last, if it did not
@@ -329,11 +333,8 @@ impl TxRing {
             return;
         }
 
-        let d = self.desc_ptr(idx);
-        unsafe {
-            let d2 = read_volatile(addr_of!((*d).d2));
-            write_volatile(addr_of_mut!((*d).d2), d2 | TXD_DCMD_RS);
-        }
+        let d = &self.descs[idx];
+        d.d2.write(d.d2.read() | TXD_DCMD_RS);
         self.rs[idx] = true;
     }
 
@@ -345,7 +346,7 @@ impl TxRing {
     /// flush_tx, never from the ISR. Only a descriptor that asked for a
     /// write-back gets one, and the chip works through the ring in order: the
     /// next such descriptor done means everything up to it is.
-    pub fn reap_completed(&mut self, net: NetDeviceHandle) -> usize {
+    pub fn reap_completed(&mut self, stack: &mut TxQueue<'_>) -> usize {
         let mut reaped = 0;
 
         while self.next_to_clean != self.next_to_use {
@@ -360,8 +361,7 @@ impl TxRing {
                 break;
             }
 
-            let status = unsafe { read_volatile(addr_of!((*self.desc_ptr(watch)).d3)) };
-            if status & TXD_STAT_DD == 0 {
+            if self.descs[watch].d3.read() & TXD_STAT_DD == 0 {
                 break;
             }
 
@@ -369,15 +369,14 @@ impl TxRing {
 
             loop {
                 let idx = self.next_to_clean;
-                let h = self.frames[idx];
-                self.frames[idx] = 0;
+                let frame = self.frames[idx].take();
                 self.rs[idx] = false;
                 self.next_to_clean = (idx + 1) % RING_SIZE;
 
                 /* Back to the pool through the net layer, which is what keeps
                  * the frame off any allocator on this path. */
-                if h != 0 {
-                    net.tx_done(unsafe { NetFrame::from_raw(h) });
+                if let Some(frame) = frame {
+                    stack.done(frame);
                     reaped += 1;
                 }
 
@@ -388,17 +387,5 @@ impl TxRing {
         }
 
         reaped
-    }
-}
-
-impl Drop for TxRing {
-    fn drop(&mut self) {
-        for i in 0..RING_SIZE {
-            let h = self.frames[i];
-            if h != 0 {
-                self.frames[i] = 0;
-                drop(unsafe { NetFrame::from_raw(h) });
-            }
-        }
     }
 }

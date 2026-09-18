@@ -510,12 +510,11 @@ impl Tcp {
             return true;
         }
 
-        kcore::softirq::register(kcore::softirq::TYPE_TCP_TIMER, on_softirq,
-            core::ptr::null_mut());
+        kcore::softirq::register_for(kcore::softirq::TYPE_TCP_TIMER, self, Tcp::on_softirq);
 
         let period = kcore::time::Duration::from_nanos(
             TIMER_PERIOD_MS * kcore::consts::NS_PER_MS);
-        match kcore::timer::Timer::start(period, on_tick, core::ptr::null_mut()) {
+        match kcore::timer::Timer::start_for(period, self, Tcp::on_tick) {
             Some(timer) => timer.leak(),
             None => {
                 trace!(0, "tcp: the retransmit timer could not be started");
@@ -1865,12 +1864,14 @@ pub struct ConnInfo {
     pub recv_used: usize,
 }
 
-/// The periodic tick, from IPI context: it only raises the soft IRQ.
-extern "C" fn on_tick(_ctx: *mut u8) {
-    kcore::softirq::raise(kcore::softirq::TYPE_TCP_TIMER);
-}
+impl Tcp {
+    /// The periodic tick, from IPI context: it only raises the soft IRQ.
+    fn on_tick(&'static self) {
+        kcore::softirq::raise(kcore::softirq::TYPE_TCP_TIMER);
+    }
 
-/// The soft IRQ the tick raised.
-extern "C" fn on_softirq(_ctx: *mut u8) {
-    TCP.process_retransmits();
+    /// The soft IRQ the tick raised.
+    fn on_softirq(&'static self) {
+        self.process_retransmits();
+    }
 }

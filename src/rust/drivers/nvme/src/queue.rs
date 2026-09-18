@@ -1,75 +1,84 @@
-#![allow(dead_code)]
-
-/* NVMe submission/completion queue pair backed by DMA buffers.
- *
- * A `Queue` holds one Submission Queue (SQ) and one Completion Queue (CQ).
- * Both buffers are physically contiguous DMA allocations. */
+/* NVMe queues, backed by DMA buffers: a submission queue the driver writes
+ * commands into and the controller reads, and a completion queue the
+ * controller writes and the driver reads. Both buffers are physically
+ * contiguous DMA allocations, and every entry crosses through
+ * `DmaBuffer::store` / `load` -- volatile, and checked to lie in the buffer. */
 
 use kcore::dma::DmaBuffer;
 use kcore::io::MmioRegion;
 use kcore::consts::PAGE_SIZE;
-use crate::spec::{SubmissionEntry, CompletionEntry, SQE_SIZE, CQE_SIZE, DB_BASE};
+use crate::spec::{SubmissionEntry, CompletionEntry, SQE_SIZE, CQE_SIZE, CQE_STATUS_AT, DB_BASE};
 
-pub struct Queue {
-    sq_dma: DmaBuffer,
-    cq_dma: DmaBuffer,
-    sq_tail: usize,
-    cq_head: usize,
-    cq_phase: bool,   /* expected phase bit for next valid CQE */
-    depth:    usize,
-    qid:      u16,    /* 0 = admin, 1+ = I/O */
-    db_stride: usize, /* CAP.DSTRD in bytes (4 << DSTRD) */
+fn pages_for(bytes: usize) -> usize {
+    (bytes + PAGE_SIZE - 1) / PAGE_SIZE
 }
 
-impl Queue {
+pub struct SubmissionQueue {
+    dma: DmaBuffer,
+    tail: usize,
+    depth: usize,
+    qid: u16,          /* 0 = admin, 1+ = I/O */
+    db_stride: usize,  /* CAP.DSTRD in bytes (4 << DSTRD) */
+}
+
+impl SubmissionQueue {
     /* Allocate a new queue with `depth` entries.
      * Returns None if DMA allocation fails. */
     pub fn new(depth: usize, qid: u16, db_stride: usize) -> Option<Self> {
-        let sq_bytes = depth * SQE_SIZE;
-        let cq_bytes = depth * CQE_SIZE;
-        let sq_pages = (sq_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-        let cq_pages = (cq_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        if depth == 0 {
+            return None;
+        }
+        Some(Self { dma: DmaBuffer::new(pages_for(depth * SQE_SIZE))?, tail: 0, depth, qid, db_stride })
+    }
 
-        let sq_dma = DmaBuffer::new(sq_pages)?;
-        let cq_dma = DmaBuffer::new(cq_pages)?;
+    pub fn phys(&self) -> u64 {
+        self.dma.phys()
+    }
 
+    /* Write `cmd` into the next tail slot and advance the tail.
+     * Does NOT ring the doorbell -- the caller does, with `ring_doorbell`. */
+    pub fn submit(&mut self, cmd: &SubmissionEntry) {
+        let slot = self.tail % self.depth;
+        self.dma.store(slot * SQE_SIZE, *cmd);
+        self.tail = (self.tail + 1) % self.depth;
+    }
+
+    /* Ring the tail doorbell to notify the controller. */
+    pub fn ring_doorbell(&self, regs: &MmioRegion) {
+        /* The SQE stores must be visible to the DEVICE before the doorbell
+           write: dma_wmb (dmb oshst on arm64 — an atomic Release fence is
+           only dmb ish, whose domain excludes a PCIe master; free on x86). */
+        kcore::barrier::dma_wmb();
+        regs.write32(DB_BASE + (2 * self.qid as usize) * self.db_stride, self.tail as u32);
+    }
+}
+
+pub struct CompletionQueue {
+    dma: DmaBuffer,
+    head: usize,
+    phase: bool,       /* expected phase bit for next valid CQE */
+    depth: usize,
+    qid: u16,
+    db_stride: usize,
+}
+
+impl CompletionQueue {
+    pub fn new(depth: usize, qid: u16, db_stride: usize) -> Option<Self> {
+        if depth == 0 {
+            return None;
+        }
         Some(Self {
-            sq_dma,
-            cq_dma,
-            sq_tail: 0,
-            cq_head: 0,
-            cq_phase: true,
+            dma: DmaBuffer::new(pages_for(depth * CQE_SIZE))?,
+            head: 0,
+            phase: true,
             depth,
             qid,
             db_stride,
         })
     }
 
-    pub fn sq_phys(&self) -> u64 {
-        self.sq_dma.phys()
-    }
-
-    pub fn cq_phys(&self) -> u64 {
-        self.cq_dma.phys()
-    }
-
-    pub fn depth(&self) -> usize {
-        self.depth
-    }
-
-    pub fn sq_tail(&self) -> usize {
-        self.sq_tail
-    }
-
-    /* Write `cmd` into the next SQ tail slot and advance tail.
-     * Does NOT ring the doorbell -- caller must call `ring_sq_doorbell`. */
-    pub fn submit(&mut self, cmd: &SubmissionEntry) {
-        let slot = self.sq_tail % self.depth;
-        let dst = unsafe {
-            (self.sq_dma.as_mut_ptr() as *mut SubmissionEntry).add(slot)
-        };
-        unsafe { core::ptr::write_volatile(dst, *cmd) };
-        self.sq_tail = (self.sq_tail + 1) % self.depth;
+    pub fn phys(&self) -> u64 {
+        self.dma.phys()
     }
 
     /* Read the CQE at `slot` if the controller has posted it.
@@ -83,59 +92,30 @@ impl Queue {
      * full-entry read (and any later read of DMA'd data buffers) could be
      * satisfied before the phase-bit load. */
     fn read_cqe(&self, slot: usize) -> Option<CompletionEntry> {
-        let src = unsafe {
-            (self.cq_dma.as_ptr() as *const CompletionEntry).add(slot)
-        };
-        let status = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*src).status)) };
-        if (status & 1 != 0) != self.cq_phase {
+        let at = slot * CQE_SIZE;
+        let status: u16 = self.dma.load(at + CQE_STATUS_AT)?;
+        if (status & 1 != 0) != self.phase {
             return None;
         }
         kcore::barrier::dma_rmb();
-        Some(unsafe { core::ptr::read_volatile(src) })
+        self.dma.load(at)
     }
 
     /* Poll for one completed entry.
      * Returns Some(cqe) if a completion is available, None if CQ is empty. */
-    pub fn poll_completion(&mut self) -> Option<CompletionEntry> {
-        let cqe = self.read_cqe(self.cq_head)?;
+    pub fn poll(&mut self) -> Option<CompletionEntry> {
+        let cqe = self.read_cqe(self.head)?;
         /* Consume the entry: advance head and flip phase on wrap-around. */
-        self.cq_head = self.cq_head + 1;
-        if self.cq_head >= self.depth {
-            self.cq_head = 0;
-            self.cq_phase = !self.cq_phase;
+        self.head += 1;
+        if self.head >= self.depth {
+            self.head = 0;
+            self.phase = !self.phase;
         }
         Some(cqe)
     }
 
-    /* Ring the SQ tail doorbell to notify the controller. */
-    pub fn ring_sq_doorbell(&self, regs: &MmioRegion) {
-        /* The SQE stores must be visible to the DEVICE before the doorbell
-           write: dma_wmb (dmb oshst on arm64 — an atomic Release fence is
-           only dmb ish, whose domain excludes a PCIe master; free on x86). */
-        kcore::barrier::dma_wmb();
-        let off = sq_doorbell_offset(self.qid, self.db_stride);
-        regs.write32(off, self.sq_tail as u32);
+    /* Ring the head doorbell to return consumed entries to the controller. */
+    pub fn ring_doorbell(&self, regs: &MmioRegion) {
+        regs.write32(DB_BASE + (2 * self.qid as usize + 1) * self.db_stride, self.head as u32);
     }
-
-    /* Ring the CQ head doorbell to return consumed entries to the controller. */
-    pub fn ring_cq_doorbell(&self, regs: &MmioRegion) {
-        let off = cq_doorbell_offset(self.qid, self.db_stride);
-        regs.write32(off, self.cq_head as u32);
-    }
-
-    /* Peek at the next CQ entry without consuming it (diagnostic). */
-    pub fn peek_cq(&self) -> Option<CompletionEntry> {
-        self.read_cqe(self.cq_head)
-    }
-}
-
-/* NVMe doorbell offsets:
- *   SQ tail doorbell: DB_BASE + (2*qid)   * (4 << DSTRD)
- *   CQ head doorbell: DB_BASE + (2*qid+1) * (4 << DSTRD) */
-fn sq_doorbell_offset(qid: u16, stride: usize) -> usize {
-    DB_BASE + (2 * qid as usize) * stride
-}
-
-fn cq_doorbell_offset(qid: u16, stride: usize) -> usize {
-    DB_BASE + (2 * qid as usize + 1) * stride
 }

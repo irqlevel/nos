@@ -19,14 +19,14 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use kcore::block;
+use kcore::block::{self, BlockDriver};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::{self, DmaBuffer};
 use kcore::interrupt::LegacyInterrupt;
 use kcore::msix::MsixInterrupt;
+use kcore::once::Once;
 use kcore::pci;
 use kcore::sync::{SpinLock, WaitGroup};
 use kcore::trace;
@@ -67,15 +67,12 @@ pub fn init() {}
 
 struct Blk {
     transport: Box<dyn Transport>,
-    /// NUL-terminated, handed to the block table, which keeps it
-    name: [u8; 8],
     capacity: u64,
     has_flush: bool,
-    /// Whether completions arrive as MSI-X, where the ISR byte means nothing
-    msix: bool,
+    /// Whether completions arrive as MSI-X, where the ISR byte means nothing.
+    /// Known once the interrupt is in place, which is after the device is.
+    msix: AtomicBool,
 
-    /// One page holding every slot's request header and status byte
-    dma: DmaBuffer,
     /// Free slots, one bit each
     free: AtomicU64,
     /// Admission, in the order callers arrive: a caller takes the next
@@ -93,29 +90,26 @@ struct Blk {
 
     /// The queue and what is on it. Taken with interrupts off: the
     /// completion path runs in interrupt context.
-    lock: SpinLock<()>,
-    inner: UnsafeCell<Inner>,
+    inner: SpinLock<Inner>,
 
-    /// Kept so the registration outlives the device
-    _irq: Irq,
+    /// Kept: dropped, it would take the handler away
+    irq: Once<Irq>,
 }
 
 struct Inner {
     queue: Queue,
     /// Which slot a descriptor head belongs to, NO_SLOT for none
     slot_of_head: [u8; virtio::MAX_DESCRIPTORS as usize],
+    /// One page holding every slot's request header and status byte. A
+    /// slot's are its holder's, but the page is one allocation, so it is
+    /// written and read where the queue is: under the lock.
+    dma: DmaBuffer,
 }
 
 enum Irq {
     Msix(MsixInterrupt),
     Legacy(LegacyInterrupt),
-    None,
 }
-
-/* Everything inside is either atomic or taken under the lock, and the device
- * is registered for the life of the kernel. */
-unsafe impl Sync for Blk {}
-unsafe impl Send for Blk {}
 
 impl Blk {
     fn header_offset(slot: usize) -> usize {
@@ -182,27 +176,31 @@ impl Blk {
 
         let header = Self::header_offset(slot);
         let status = Self::status_offset(slot);
-        let base = self.dma.as_ptr() as *mut u8;
-
-        unsafe {
-            (base.add(header) as *mut u32).write_volatile(kind);
-            (base.add(header + 4) as *mut u32).write_volatile(0);
-            (base.add(header + 8) as *mut u64).write_volatile(sector);
-            base.add(status).write_volatile(STATUS_UNSET);
-        }
 
         self.complete[slot].store(false, Ordering::Release);
         self.done[slot].add(1);
 
-        let header_buf = Buf::read(self.dma.phys() + header as u64, HEADER_SIZE as u32);
-        let status_buf = Buf::write(self.dma.phys() + status as u64, 1);
-
         let queued = {
-            let _guard = self.lock.lock();
             /* The lock is held for the whole of this: a completion on
              * another CPU may claim the head the moment it drops, so the
              * mapping from head to slot is published here and not after. */
-            let inner = unsafe { &mut *self.inner.get() };
+            let mut guard = self.inner.lock();
+            let inner = &mut *guard;
+
+            /* The header the device will read, and the status it has not
+             * written yet. Before the chain goes on the ring, and the ring's
+             * own barrier is what orders both ahead of the doorbell. */
+            if let Some(bytes) = inner.dma.bytes_mut(header, HEADER_SIZE) {
+                bytes[0..4].copy_from_slice(&kind.to_le_bytes());
+                bytes[4..8].copy_from_slice(&0u32.to_le_bytes());
+                bytes[8..16].copy_from_slice(&sector.to_le_bytes());
+            }
+            if let Some(byte) = inner.dma.bytes_mut(status, 1) {
+                byte[0] = STATUS_UNSET;
+            }
+
+            let header_buf = Buf::read(inner.dma.phys() + header as u64, HEADER_SIZE as u32);
+            let status_buf = Buf::write(inner.dma.phys() + status as u64, 1);
 
             let head = match data {
                 Some((phys, len, writable)) => {
@@ -236,7 +234,8 @@ impl Blk {
         self.transport.notify(REQUEST_QUEUE);
         self.wait_done(slot);
 
-        let answer = unsafe { base.add(status).read_volatile() };
+        /* What the device wrote, read once it has said it is done. */
+        let answer = self.inner.lock().dma.bytes(status, 1).map_or(STATUS_UNSET, |byte| byte[0]);
         self.give_slot(slot);
         answer == 0
     }
@@ -264,8 +263,7 @@ impl Blk {
     fn collect(&self) {
         loop {
             let slot = {
-                let _guard = self.lock.lock();
-                let inner = unsafe { &mut *self.inner.get() };
+                let mut inner = self.inner.lock();
 
                 match inner.queue.take_used() {
                     None => break,
@@ -297,76 +295,60 @@ impl Blk {
 
 /* ---- what the block table calls ---- */
 
-extern "C" fn read_sectors(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32) -> i32 {
-    transfer(ctx, sector, buf, count, TYPE_IN)
-}
+impl Blk {
+    /// One run of sectors to or from `buf`, which the device is pointed
+    /// straight at.
+    fn transfer(&self, sector: u64, buf: *const u8, len: usize, kind: u32) -> bool {
+        /* The driver hands the device one physically contiguous run, so the
+         * buffer is a page at most and page-aligned -- what the block API asks
+         * of its callers. */
+        if len > PAGE_SIZE || (buf as usize) & (PAGE_SIZE - 1) != 0 {
+            trace!(0, "virtio-blk: {} bytes at {:p} is not one page-aligned run", len, buf);
+            return false;
+        }
 
-extern "C" fn write_sectors(ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32) -> i32 {
-    let rc = transfer(ctx, sector, buf as *mut u8, count, TYPE_OUT);
-    if rc != 0 || fua == 0 {
-        return rc;
-    }
-    flush(ctx)
-}
+        let phys = dma::virt_to_phys(buf);
+        if phys == 0 {
+            trace!(0, "virtio-blk: no physical address for {:p}", buf);
+            return false;
+        }
 
-fn transfer(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32, kind: u32) -> i32 {
-    if ctx.is_null() || buf.is_null() {
-        return -1;
-    }
-    if count == 0 {
-        return 0;
-    }
-
-    let blk = unsafe { &*(ctx as *const Blk) };
-    let len = count as usize * SECTOR_SIZE;
-
-    /* The driver hands the device one physically contiguous run, so the
-     * buffer is a page at most and page-aligned -- what the block API asks
-     * of its callers. */
-    if len > PAGE_SIZE || (buf as usize) & (PAGE_SIZE - 1) != 0 {
-        trace!(0, "virtio-blk: {} sectors at {:p} is not one page-aligned run", count, buf);
-        return -1;
-    }
-
-    let phys = dma::virt_to_phys(buf);
-    if phys == 0 {
-        trace!(0, "virtio-blk: no physical address for {:p}", buf);
-        return -1;
-    }
-
-    if blk.request(kind, sector, Some((phys, len as u32, kind == TYPE_IN))) {
-        0
-    } else {
-        -1
+        self.request(kind, sector, Some((phys, len as u32, kind == TYPE_IN)))
     }
 }
 
-extern "C" fn flush(ctx: *mut u8) -> i32 {
-    if ctx.is_null() {
-        return -1;
+impl BlockDriver for Blk {
+    /* The asynchronous path is NVMe's; this driver is a queue and a caller
+     * that waits on it. */
+
+    fn capacity(&self) -> u64 {
+        self.capacity
     }
 
-    let blk = unsafe { &*(ctx as *const Blk) };
-    if !blk.has_flush {
+    fn sector_size(&self) -> u64 {
+        SECTOR_SIZE as u64
+    }
+
+    fn read(&'static self, sector: u64, buf: &mut [u8]) -> bool {
+        self.transfer(sector, buf.as_ptr(), buf.len(), TYPE_IN)
+    }
+
+    fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
+        self.transfer(sector, data.as_ptr(), data.len(), TYPE_OUT) && (!fua || self.flush())
+    }
+
+    fn flush(&'static self) -> bool {
         /* No write cache: there is nothing to push. */
-        return 0;
-    }
-
-    if blk.request(TYPE_FLUSH, 0, None) {
-        0
-    } else {
-        -1
+        !self.has_flush || self.request(TYPE_FLUSH, 0, None)
     }
 }
 
-extern "C" fn interrupt(ctx: *mut u8) {
-    let blk = unsafe { &*(ctx as *const Blk) };
-
+fn interrupt(blk: &'static Blk) {
     /* On the line-interrupt path the ISR byte says whether this device
      * raised it, and reading it acknowledges. Under MSI-X it means nothing
      * (virtio 1.x 4.1.4.5): a device that keeps the spec leaves it zero, and
      * gating on it there would drop every completion. */
-    if !blk.msix && blk.transport.read_isr() == 0 {
+    if !blk.msix.load(Ordering::Relaxed) && blk.transport.read_isr() == 0 {
         return;
     }
 
@@ -420,14 +402,6 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         }
     };
 
-    let lock = match SpinLock::new(()) {
-        Some(lock) => lock,
-        None => {
-            virtio::failed(transport.as_ref());
-            return false;
-        }
-    };
-
     let mut done = Vec::with_capacity(MAX_SLOTS);
     let mut complete = Vec::with_capacity(MAX_SLOTS);
     for _ in 0..MAX_SLOTS {
@@ -441,86 +415,71 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         complete.push(AtomicBool::new(false));
     }
 
+    let layout = virtio::QueueLayout {
+        size: queue.size(),
+        desc: queue.desc_phys(),
+        driver: queue.avail_phys(),
+        device: queue.used_phys(),
+        msix: None,
+    };
+
+    let inner = match SpinLock::new(Inner {
+        queue,
+        slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
+        dma,
+    }) {
+        Some(inner) => inner,
+        None => {
+            virtio::failed(transport.as_ref());
+            return false;
+        }
+    };
+
     let capacity = transport.config_read64(0);
-    let mut name = [0u8; 8];
+    let mut name = [0u8; 3];
     name[..2].copy_from_slice(b"vd");
     name[2] = b'a' + index as u8;
+    let name = core::str::from_utf8(&name).unwrap_or("vd?");
 
-    let blk = Box::new(Blk {
+    /* For good: the interrupt handler is pointed at it, and so is the block
+     * table, which never gives a device back. */
+    let blk: &'static Blk = Box::leak(Box::new(Blk {
         transport,
-        name,
         capacity,
         has_flush,
-        msix: false,
-        dma,
+        msix: AtomicBool::new(false),
         free: AtomicU64::new(if MAX_SLOTS >= 64 { u64::MAX } else { (1 << MAX_SLOTS) - 1 }),
         next_ticket: AtomicU64::new(0),
         /* The first MAX_SLOTS tickets are admitted straight away. */
         served: AtomicU64::new(0),
         done,
         complete,
-        lock,
-        inner: UnsafeCell::new(Inner {
-            queue,
-            slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
-        }),
-        _irq: Irq::None,
-    });
+        inner,
+        irq: Once::new(),
+    }));
+    let transport = blk.transport.as_ref();
 
-    /* From here the device is a pointer: the interrupt handler takes it as
-     * its context, and it is never freed once registered. */
-    let raw = Box::into_raw(blk);
-    let transport = unsafe { (*raw).transport.as_ref() };
-
-    let (irq, msix_entry) = arm_interrupt(transport, source, raw);
-    unsafe {
-        (*raw)._irq = irq;
-        (*raw).msix = msix_entry.is_some();
-    }
+    let msix_entry = arm_interrupt(blk, source);
+    blk.msix.store(msix_entry.is_some(), Ordering::Release);
 
     /* Now the device can be pointed at the rings -- and told, if it has
      * MSI-X, which vector the queue raises. */
-    let layout = {
-        let inner = unsafe { &*(*raw).inner.get() };
-        virtio::QueueLayout {
-            size: inner.queue.size(),
-            desc: inner.queue.desc_phys(),
-            driver: inner.queue.avail_phys(),
-            device: inner.queue.used_phys(),
-            msix: msix_entry,
-        }
-    };
-    transport.setup_queue(REQUEST_QUEUE, &layout);
+    transport.setup_queue(REQUEST_QUEUE, &virtio::QueueLayout { msix: msix_entry, ..layout });
     virtio::driver_ok(transport);
 
-    let ops = block::BlockDeviceOps {
-        name: unsafe { core::ptr::addr_of!((*raw).name) as *const u8 },
-        capacity,
-        sector_size: SECTOR_SIZE as u64,
-        read_sectors,
-        write_sectors,
-        flush: Some(flush),
-        /* The asynchronous path is NVMe's; this driver is a queue and a
-         * caller that waits on it. */
-        submit: None,
-        kick: None,
-        ctx: raw as *mut u8,
-        parent: 0,
-    };
-
-    match block::register(&ops) {
-        Some(registration) => {
-            core::mem::forget(registration);
+    match block::register_driver(name, 0, blk) {
+        Some(_registration) => {
             DEVICES.store(index + 1, Ordering::Release);
             trace!(0, "virtio-blk: {} is a disk of {} sectors{}, {} slots",
-                core::str::from_utf8(&name[..3]).unwrap_or("?"), capacity,
+                name, capacity,
                 if has_flush { " with a write cache" } else { "" }, MAX_SLOTS);
             true
         }
         None => {
             trace!(0, "virtio-blk: the device table would not take another disk");
+            /* Told to stop, and left where it is: its interrupt may still
+             * be on its way. */
             virtio::failed(transport);
-            unsafe { drop(Box::from_raw(raw)) };
             false
         }
     }
@@ -535,31 +494,30 @@ enum IrqSource {
 
 /// Put the completion interrupt in place: MSI-X where the bus has it, the
 /// device's line otherwise. Returns the entry the queue should raise.
-fn arm_interrupt(
-    transport: &dyn Transport, source: IrqSource, blk: *mut Blk,
-) -> (Irq, Option<u16>) {
+fn arm_interrupt(blk: &'static Blk, source: IrqSource) -> Option<u16> {
+    let transport = blk.transport.as_ref();
+
     if let Some(table) = transport.msix_table() {
-        match MsixInterrupt::register(table, 0, interrupt, blk as *mut u8) {
+        match MsixInterrupt::register_for(table, 0, blk, interrupt) {
             Some(irq) => {
                 transport.use_msix(0);
-                return (Irq::Msix(irq), Some(0));
+                let _ = blk.irq.set(Irq::Msix(irq));
+                return Some(0);
             }
             None => trace!(0, "virtio-blk: no MSI-X slot left, falling back on the line"),
         }
     }
 
     let registered = match source {
-        IrqSource::Pci(dev) => LegacyInterrupt::register_level(&dev, interrupt, blk as *mut u8),
-        IrqSource::Line(line) => LegacyInterrupt::register_irq(line, interrupt, blk as *mut u8),
+        IrqSource::Pci(dev) => LegacyInterrupt::register_level_for(&dev, blk, interrupt),
+        IrqSource::Line(line) => LegacyInterrupt::register_irq_for(line, blk, interrupt),
     };
 
     match registered {
-        Some(irq) => (Irq::Legacy(irq), None),
-        None => {
-            trace!(0, "virtio-blk: the device has no interrupt -- I/O will be polled");
-            (Irq::None, None)
-        }
+        Some(irq) => { let _ = blk.irq.set(Irq::Legacy(irq)); }
+        None => trace!(0, "virtio-blk: the device has no interrupt -- I/O will be polled"),
     }
+    None
 }
 
 /// The virtio-blk disks on the PCI bus. Called from the boot path, before

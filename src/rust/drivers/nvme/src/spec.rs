@@ -37,6 +37,8 @@ pub const DB_BASE: usize = 0x1000;
 /* Queue entry sizes */
 pub const SQE_SIZE: usize = 64;
 pub const CQE_SIZE: usize = 16;
+/* Where in a completion entry the status word -- phase bit and all -- is */
+pub const CQE_STATUS_AT: usize = 14;
 
 /* Queue depths */
 pub const ADMIN_QUEUE_DEPTH: usize = 16;
@@ -90,6 +92,13 @@ pub struct SubmissionEntry {
     pub cdw15: u32,
 }
 
+const _: () = assert!(core::mem::size_of::<SubmissionEntry>() == SQE_SIZE);
+const _: () = assert!(core::mem::size_of::<CompletionEntry>() == CQE_SIZE);
+
+/* Integers, and sizes that leave no room for padding. */
+unsafe impl kcore::pod::Pod for SubmissionEntry {}
+unsafe impl kcore::pod::Pod for CompletionEntry {}
+
 impl SubmissionEntry {
     pub fn new(opcode: u8, cid: u16) -> Self {
         let mut e = Self::default();
@@ -126,47 +135,19 @@ impl CompletionEntry {
     }
 }
 
-/* --- Identify Controller response (only fields we use, 4096 bytes total) ---
- * Layout per NVMe 1.4 spec §5.15.2.1:
- *   offset  0: VID (2), SSVID (2)
- *   offset  4: SN[20]
- *   offset 24: MN[40]
- *   offset 64: FR[8]
- *   offset 72: RAB (1), IEEE[3], CMIC (1)
- *   offset 77: MDTS (1)   <- last field we read
- *   offset 78..4095: remainder (4018 bytes)
- * Total: 78 + 4018 = 4096 bytes. */
-#[repr(C)]
-pub struct IdentifyController {
-    pub vid:       u16,
-    pub ssvid:     u16,
-    pub sn:        [u8; 20],
-    pub mn:        [u8; 40],
-    pub fr:        [u8; 8],
-    pub rab:       u8,
-    pub ieee:      [u8; 3],
-    pub cmic:      u8,
-    pub mdts:      u8,   /* Max Data Transfer Size (2^n pages, 0=unlimited) */
-    _pad:          [u8; 4018],
-}
+/* --- Identify responses: a page each, of which a few fields are read, where
+ * they lie (NVMe 1.4 §5.15.2.1 and §5.15.2.2). --- */
 
-/* --- Identify Namespace response (only fields we use, 4096 bytes total) --- */
-#[repr(C)]
-pub struct IdentifyNamespace {
-    pub nsze:  u64,  /* Namespace Size (total blocks) */
-    pub ncap:  u64,  /* Namespace Capacity */
-    pub nuse:  u64,  /* Namespace Utilization */
-    pub nsfeat: u8,
-    pub nlbaf:  u8,  /* Number of LBA Formats (0-based) */
-    pub flbas:  u8,  /* Formatted LBA Size: bits[3:0] = lbaf index */
-    _pad:       [u8; 4069],
-}
+/* Identify Controller */
+pub const ID_CTRL_SN_AT:   usize = 4;   /* serial number, 20 bytes of ASCII */
+pub const ID_CTRL_SN_LEN:  usize = 20;
+pub const ID_CTRL_MN_AT:   usize = 24;  /* model number, 40 bytes of ASCII */
+pub const ID_CTRL_MN_LEN:  usize = 40;
+pub const ID_CTRL_MDTS_AT: usize = 77;  /* Max Data Transfer Size (2^n pages, 0 = unlimited) */
 
-/* LBA Format entry (embedded in IdentifyNamespace at offset 128) */
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct LbaFormat {
-    pub ms:   u16,  /* Metadata Size */
-    pub lbads: u8,  /* LBA Data Size: sector size = 2^lbads */
-    pub rp:   u8,   /* Relative Performance */
-}
+/* Identify Namespace */
+pub const ID_NS_NSZE_AT:  usize = 0;    /* Namespace Size (total blocks), u64 */
+pub const ID_NS_FLBAS_AT: usize = 26;   /* Formatted LBA Size: bits[3:0] = lbaf index */
+pub const ID_NS_LBAF_AT:  usize = 128;  /* the LBA formats, four bytes apiece */
+pub const ID_NS_LBAF_SIZE: usize = 4;
+pub const LBAF_LBADS_AT:  usize = 2;    /* LBA Data Size: sector size = 2^lbads */
