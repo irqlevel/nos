@@ -33,6 +33,10 @@
 #include <net/tcp.h>
 
 extern "C" void rust_init();
+
+/* The disk log is Rust (src/rust/block/src/disklog.rs). */
+extern "C" int rust_disklog_setup();
+extern "C" void rust_disklog_stop();
 extern "C" void rust_test();
 extern "C" void rust_fini();
 /* The partition table reader (src/rust/block), the x86 twin's counterpart */
@@ -283,6 +287,12 @@ static void BpStartupArm(void* ctx)
     rust_partitions_probe();
     MountRootFs();
 
+    /* Here, and not earlier: a block request is completed through the BLK_IO
+       soft IRQ, so until the line above a write returns without having
+       written anything. Everything traced since the first line of the boot
+       has been held in memory and goes down as soon as the area is found. */
+    rust_disklog_setup();
+
     Tcp::GetInstance().Init();
 
     auto& cmd = Cmd::GetInstance();
@@ -350,6 +360,11 @@ static void BpStartupArm(void* ctx)
             /* While the soft IRQs still run: unmounting writes the
                superblock, and a block request completes through BLK_IO */
             Vfs::GetInstance().UnmountAll();
+
+            /* The disk log last of all: its writer finishes what is queued
+               and the log switches off -- after SoftIrq::Stop() a write
+               through a virtio disk would wait for ever. */
+            rust_disklog_stop();
 
             /* Then the soft IRQ tasks themselves, as on x86. Left running
                into the halt they were never released -- SoftIrq's own

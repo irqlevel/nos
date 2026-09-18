@@ -553,11 +553,20 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
 
 void Parameters::Parse(const char *cmdline)
 {
-    /* No line at all is an answer too: nothing on it was asked for. */
-    Parsed = true;
+    /* Not set until the whole line has been read, at the end. Parsing traces
+       a line per parameter, and the disk log keeps a line only while nothing
+       is known yet or disklog=on has been seen: set here, the parameters
+       before disklog on the line would be traced into the gap between the
+       two and lost from the one channel a machine with no serial port has.
+
+       No line at all is an answer too: nothing on it was asked for, and the
+       flag goes up on that path as well. */
 
     if (cmdline == nullptr)
+    {
+        Parsed = true;
         return;
+    }
 
     /* StrnCpy, not SnPrintf: past the end of the buffer SnPrintf keeps
        nothing, and what is wanted there is as much as fits */
@@ -610,6 +619,8 @@ void Parameters::Parse(const char *cmdline)
         }
         start = i + 1;
     }
+
+    Parsed = true;
 }
 
 }

@@ -96,7 +96,4 @@ extern "C" {
     pub fn kernel_dmesg_replay(
         line: extern "C" fn(ctx: *mut u8, s: *const u8, len: usize), ctx: *mut u8,
     );
-    /// Whether a panic has started -- so code writes without taking a lock
-    /// another CPU may hold on its way to a halt.
-    pub fn kernel_panic_active() -> i32;
 }

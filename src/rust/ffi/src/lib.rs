@@ -18,6 +18,7 @@ pub mod interrupt;
 pub mod softirq;
 pub mod timer;
 pub mod block;
+pub mod disklog;
 pub mod net;
 pub mod tcp;
 pub mod acpi;

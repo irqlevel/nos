@@ -20,6 +20,17 @@ extern "C" {
 extern "C" {
     pub fn kernel_preempt_disable();
     pub fn kernel_preempt_enable();
+    /// The same, for code that may run on a stack that is not a task's. The
+    /// answer -- the task whose count went up, or 0 -- goes back to
+    /// `kernel_preempt_enable_task`.
+    pub fn kernel_preempt_disable_task() -> usize;
+    pub fn kernel_preempt_enable_task(task: usize);
+    /// Whether preemption is on at all yet: before it is, no task will ever
+    /// be scheduled and work cannot be handed to one.
+    pub fn kernel_preempt_is_on() -> i32;
+    /// Whether the caller may wait: not with interrupts off, not off a task
+    /// stack, and not with preemption disabled.
+    pub fn kernel_preempt_can_block() -> i32;
     /// Whether interrupts are on for this CPU.
     pub fn kernel_interrupts_enabled() -> i32;
 }

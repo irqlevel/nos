@@ -48,6 +48,14 @@ pub fn current_id() -> usize {
     unsafe { task::kernel_task_current() }
 }
 
+/// The calling task, or 0 when the stack is not a task's. For code that runs
+/// wherever it is called from -- an interrupt handler, the tracer, the panic
+/// path -- where asking the other way would itself complain, and a complaint
+/// traces.
+pub fn current_id_or_none() -> usize {
+    unsafe { task::kernel_task_current_or_none() }
+}
+
 impl Drop for TaskHandle {
     fn drop(&mut self) {
         if self.handle != 0 {

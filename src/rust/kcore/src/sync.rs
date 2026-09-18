@@ -312,6 +312,13 @@ impl Event {
     pub fn signal(&self) {
         unsafe { sync::kernel_event_signal(self.handle) }
     }
+
+    /// The raw handle, for an owner that keeps the event for the life of the
+    /// kernel and signals it from a `static` -- which is what `wait` and
+    /// `signal` need, and what `Drop` must therefore never get.
+    pub fn handle(&self) -> usize {
+        self.handle
+    }
 }
 
 impl Drop for Event {

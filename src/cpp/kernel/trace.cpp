@@ -4,7 +4,11 @@
 
 #include <hal/console.h>
 #include <net/netconsole.h>
-#include "disklog.h"
+
+/* The disk log is Rust (src/rust/block/src/disklog.rs). */
+extern "C" {
+void rust_disklog_log(const char* line);
+}
 
 namespace Kernel
 {
@@ -60,7 +64,7 @@ void Tracer::Output(const char *fmt, ...)
     /* And to the disk area, if one was prepared. Unlike the netconsole this
        writes now, synchronously: it exists for the boot that stops before
        there is a task to drain anything. */
-    DiskLog::GetInstance().Log(msg);
+    rust_disklog_log(msg);
 
     if (!ConsoleSuppressed)
     {

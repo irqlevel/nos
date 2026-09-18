@@ -14,6 +14,7 @@
 
 extern crate alloc;
 
+mod disklog;
 mod part;
 mod shell;
 mod table;
@@ -116,6 +117,7 @@ pub fn init() {
     register("partitions", "partitions <disk> - show the partition table (MBR or GPT)", dump);
     register("diskread", "diskread <disk> <sector> - read sector", shell::diskread);
     register("diskwrite", "diskwrite <disk> <sector> <hex> - write sector", shell::diskwrite);
+    register("disklog", "disklog - kernel log to disk area state", disklog::dump);
 }
 
 fn register(name: &'static str, help: &'static str, handler: fn(&str, &mut Output)) {

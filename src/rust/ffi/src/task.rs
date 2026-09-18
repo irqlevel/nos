@@ -21,4 +21,7 @@ extern "C" {
     pub fn kernel_task_yield_to_runnable();
     /// The calling task, as a handle from the spawn calls names it.
     pub fn kernel_task_current() -> usize;
+    /// The same, but 0 rather than a complaint when the stack is not a
+    /// task's -- for code that runs wherever it is called from.
+    pub fn kernel_task_current_or_none() -> usize;
 }

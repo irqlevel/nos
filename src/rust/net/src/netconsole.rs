@@ -382,7 +382,7 @@ impl Netconsole {
         /* A panic runs with interrupts off and the other CPUs on their way
          * to a halt -- one of them may hold the lock and never release it,
          * so the panic path writes unlocked rather than deadlocking. */
-        if unsafe { ffi::net::kernel_panic_active() } != 0 {
+        if unsafe { ffi::panic::kernel_panic_active() } != 0 {
             unsafe { (*self.ring.get()).append(text) };
             return;
         }

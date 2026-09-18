@@ -68,3 +68,32 @@ pub unsafe fn irq_restore(flags: usize) {
 pub fn interrupts_enabled() -> bool {
     unsafe { ffi::cpu::kernel_interrupts_enabled() != 0 }
 }
+
+/// Preemption off for the calling task, and the task it was taken on -- or
+/// 0, when the stack is not a task's and there was nothing to raise. The
+/// answer goes back to `preempt_enable_task`, because the count belongs to
+/// the task that took it. Unlike the plain pair this is safe from the
+/// tracer's side and from an AP on its way up.
+#[inline]
+pub fn preempt_disable_task() -> usize {
+    unsafe { ffi::cpu::kernel_preempt_disable_task() }
+}
+
+#[inline]
+pub fn preempt_enable_task(task: usize) {
+    unsafe { ffi::cpu::kernel_preempt_enable_task(task) }
+}
+
+/// Whether preemption is on at all yet. Before it is, no task will ever be
+/// scheduled: work cannot be handed to one, and whoever has it does it.
+#[inline]
+pub fn preempt_is_on() -> bool {
+    unsafe { ffi::cpu::kernel_preempt_is_on() != 0 }
+}
+
+/// Whether the caller may wait -- for a completion, or to be scheduled away.
+/// Not with interrupts off, not off a task stack, and not under a spinlock.
+#[inline]
+pub fn preempt_can_block() -> bool {
+    unsafe { ffi::cpu::kernel_preempt_can_block() != 0 }
+}
