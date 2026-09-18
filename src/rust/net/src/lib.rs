@@ -15,6 +15,7 @@ pub mod abi;
 pub mod arp;
 pub mod dhcp;
 pub mod dns;
+pub mod http;
 pub mod icmp;
 pub mod net_load;
 pub mod netconsole;
