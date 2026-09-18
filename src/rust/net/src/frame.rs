@@ -53,22 +53,26 @@ pub struct ListEntry {
     pub blink: *mut ListEntry,
 }
 
-/// A frame, as both languages lay it out. The C++ side asserts the same
-/// size (net/net_frame.h): a disagreement would be no compile error anywhere
-/// -- it would be a driver reading a length at the wrong offset.
+/// A frame: a buffer with its physical address, a length, and a reference
+/// count that says when it goes back where it came from.
+///
+/// Nothing outside this crate sees one any more -- a driver holds a handle
+/// and reaches the bytes through `kcore::net` -- so the layout is this
+/// crate's own.
 #[repr(C)]
 pub struct NetFrame {
     pub link: ListEntry,
     pub data: *mut u8,
     pub data_phys: usize,
+    /// Bytes in the frame now
     pub len: usize,
+    /// Bytes it has room for, which is what its release frees
+    pub capacity: usize,
     pub refcount: AtomicIsize,
     pub direction: u8,
     pub release: Option<extern "C" fn(*mut NetFrame, *mut u8)>,
     pub release_ctx: *mut u8,
 }
-
-const _: () = assert!(core::mem::size_of::<NetFrame>() == 72);
 
 impl NetFrame {
     /// # Safety
@@ -398,6 +402,7 @@ fn build_frame() -> Option<*mut NetFrame> {
         let data = raw.add(core::mem::size_of::<NetFrame>());
         (*frame).data = data;
         (*frame).len = 0;
+        (*frame).capacity = FRAME_CAPACITY;
         (*frame).refcount.store(0, Ordering::Release);
         (*frame).direction = DIRECTION_TX;
         (*frame).release = Some(release_to_pool);
@@ -457,4 +462,105 @@ pub extern "C" fn rust_netframe_pool_misses() -> usize {
 #[no_mangle]
 pub extern "C" fn rust_netframe_pool_in_flight() -> usize {
     POOL.in_flight()
+}
+
+/* ---- a frame's references ---- */
+
+/// One more reference: what a listener takes to keep a frame past its call.
+///
+/// # Safety
+/// `frame` is a live frame.
+pub unsafe fn get(frame: *mut NetFrame) {
+    unsafe { (*frame).refcount.fetch_add(1, Ordering::AcqRel) };
+}
+
+/// One fewer. The last one releases the frame -- to the pool it came from,
+/// or to the allocator for one the pool could not serve.
+///
+/// # Safety
+/// `frame` is a live frame and this caller's reference is not used again.
+pub unsafe fn put(frame: *mut NetFrame) {
+    if unsafe { (*frame).refcount.fetch_sub(1, Ordering::AcqRel) } != 1 {
+        return;
+    }
+
+    let release = unsafe { (*frame).release };
+    if let Some(release) = release {
+        release(frame, unsafe { (*frame).release_ctx });
+    }
+}
+
+/// What a frame from outside the pool is released by: straight back to the
+/// allocator, TLB shootdown and all. Which is why the pool exists.
+extern "C" fn release_to_allocator(frame: *mut NetFrame, _ctx: *mut u8) {
+    let size = core::mem::size_of::<NetFrame>() + unsafe { (*frame).capacity };
+    let layout = unsafe { core::alloc::Layout::from_size_align_unchecked(size, 8) };
+    unsafe { alloc::alloc::dealloc(frame as *mut u8, layout) };
+}
+
+/// A frame to transmit, with room for `len` bytes.
+///
+/// From the pool whenever it fits one -- a per-CPU cache, no allocator at
+/// all. What the pool cannot serve falls through to the allocator, which is
+/// what this used to be for every frame.
+pub fn alloc_tx(len: usize) -> *mut NetFrame {
+    let pooled = POOL.alloc(len);
+    if !pooled.is_null() {
+        return pooled;
+    }
+
+    let size = core::mem::size_of::<NetFrame>() + len;
+    let layout = unsafe { core::alloc::Layout::from_size_align_unchecked(size, 8) };
+    let raw = unsafe { alloc::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return core::ptr::null_mut();
+    }
+
+    let frame = raw as *mut NetFrame;
+    unsafe {
+        NetFrame::link_init(frame);
+        let data = raw.add(core::mem::size_of::<NetFrame>());
+        (*frame).data = data;
+        (*frame).len = 0;
+        (*frame).capacity = len;
+        (*frame).refcount.store(1, Ordering::Release);
+        (*frame).direction = DIRECTION_TX;
+        (*frame).release = Some(release_to_allocator);
+        (*frame).release_ctx = core::ptr::null_mut();
+
+        let phys = kcore::dma::virt_to_phys(data) as usize;
+        if phys == 0 {
+            alloc::alloc::dealloc(raw, layout);
+            return core::ptr::null_mut();
+        }
+        (*frame).data_phys = phys;
+    }
+    frame
+}
+
+/// A frame to receive into, with room for `len` bytes.
+pub fn alloc_rx(len: usize) -> *mut NetFrame {
+    let frame = alloc_tx(len);
+    if !frame.is_null() {
+        unsafe { (*frame).direction = DIRECTION_RX };
+    }
+    frame
+}
+
+/// Allocations the pool could not serve, and frames a driver is holding.
+///
+/// # Safety
+/// Both are writable, or null.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_netframe_pool_stats(
+    misses: *mut usize, in_flight: *mut usize,
+) {
+    unsafe {
+        if !misses.is_null() {
+            *misses = POOL.alloc_misses();
+        }
+        if !in_flight.is_null() {
+            *in_flight = POOL.in_flight();
+        }
+    }
 }

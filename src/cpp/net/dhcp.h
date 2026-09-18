@@ -6,7 +6,7 @@
 namespace Kernel
 {
 
-class NetDevice;
+struct NetDevice;
 
 /* The client itself is Rust (src/rust/net/src/dhcp.rs): the discover, the
    request, the parsing, and the task that renews the lease at half its life.

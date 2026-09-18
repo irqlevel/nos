@@ -7,7 +7,7 @@
 namespace Kernel
 {
 
-class NetDevice;
+struct NetDevice;
 
 /* ARP itself is Rust (src/rust/net/src/arp.rs): the cache, its expiry, the
    requests and the replies. What is left here is the way in. */

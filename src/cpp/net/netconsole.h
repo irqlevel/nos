@@ -6,7 +6,7 @@
 namespace Kernel
 {
 
-class NetDevice;
+struct NetDevice;
 
 /* The kernel log over UDP ("netconsole=ip:port") is Rust
    (src/rust/net/src/netconsole.rs): the capture ring, the paced drain, the

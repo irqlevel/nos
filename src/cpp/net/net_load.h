@@ -6,7 +6,7 @@
 namespace Kernel
 {
 
-class NetDevice;
+struct NetDevice;
 
 /* The UDP load target is Rust (src/rust/net/src/net_load.rs): the echo built
    in the receive callback itself, the batch's replies handed over together,

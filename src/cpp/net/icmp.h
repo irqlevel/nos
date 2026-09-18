@@ -7,7 +7,7 @@
 namespace Kernel
 {
 
-class NetDevice;
+struct NetDevice;
 
 namespace Net
 {

@@ -1,266 +1,21 @@
 #pragma once
 
 #include <include/types.h>
-#include <lib/printer.h>
-#include <lib/list_entry.h>
-#include <kernel/spin_lock.h>
-#include <kernel/raw_spin_lock.h>
 #include <net/net.h>
-#include <net/net_frame.h>
-#include <kernel/cpu.h>
+#include <lib/printer.h>
 
 namespace Kernel
 {
 
-struct NetStats
-{
-    u64 TxTotal;
-    u64 RxTotal;
-    u64 RxDrop;
-    u64 RxIcmp;
-    u64 RxUdp;
-    u64 RxTcp;
-    u64 RxArp;
-    u64 RxOther;
-    u64 TxIcmp;
-    u64 TxUdp;
-    u64 TxTcp;
-    u64 TxArp;
-    u64 TxOther;
-};
+/* The network devices are Rust (src/rust/net/src/device.rs): the queues
+   between a driver and the stack, the UDP listeners, the receive dispatch
+   and the per-CPU counters. What is left here is the way in.
 
-class NetDevice
-{
-public:
-    NetDevice();
-    virtual ~NetDevice() {}
-    virtual const char* GetName() = 0;
-    virtual u64 GetTxPackets() = 0;
-    virtual u64 GetRxPackets() = 0;
-    virtual u64 GetRxDropped() = 0;
-    virtual void GetStats(NetStats& stats) { (void)stats; }
+   A device is opaque on this side: the table lives in Rust and a NetDevice*
+   is a handle into it, stable for the life of the kernel -- nothing takes a
+   device back. */
+struct NetDevice;
 
-    /* TX: enqueue frame to TxQueue, call FlushTx() */
-    bool SubmitTx(NetFrame* frame);
-
-    /* TX, a run of frames: one TxQueueLock acquisition and one FlushTx --
-       one doorbell -- for the lot. Takes every frame; returns how many were
-       queued, the rest dropped for want of room. From any context: with
-       interrupts off, what the driver has finished with is left to the TX
-       softirq to release. */
-    ulong SubmitTxBatch(NetFrame** frames, ulong count);
-
-    /* TX: convenience wrapper -- alloc frame, copy data, SubmitTx */
-    bool SendRaw(const void* buf, ulong len);
-
-    /* Frames reaped from the hardware and waiting to be dispatched. Read
-       without the lock: it is a hint for the receive poll, not an invariant. */
-    ulong GetRxPending() { return RxCount; }
-
-    /* RX: enqueue frame to RxQueue; returns false if full (caller must Put) */
-    bool EnqueueRx(NetFrame* frame);
-
-    /* Enqueue a run of frames under one lock acquisition. Returns how many
-       were taken -- the queue may fill part way -- and the caller releases
-       the remainder. */
-    ulong EnqueueRxBatch(NetFrame** frames, ulong count);
-
-    Net::MacAddress GetMac();
-    void SetMac(const Net::MacAddress& mac);
-    Net::IpAddress GetIp();
-    void SetIp(Net::IpAddress ip);
-    Net::IpAddress GetSubnetMask();
-    void SetSubnetMask(Net::IpAddress mask);
-    Net::IpAddress GetGateway();
-    void SetGateway(Net::IpAddress gw);
-
-    /* Return the IP to ARP for: gateway if dstIp is off-subnet, else dstIp */
-    Net::IpAddress RouteIp(Net::IpAddress dstIp);
-
-    typedef void (*RxCallback)(const u8* frame, ulong len, void* ctx);
-
-    /* A listener handed the frame itself rather than a look at its bytes. It
-       may keep it -- a Get() before returning -- and later hand it to a
-       disk, transmit it as a reply, or Put() it, from any context: the
-       receive path of the zero-copy block server (the netblk module). */
-    typedef void (*RxFrameCallback)(void* ctx, NetFrame* frame);
-
-    /* Called once a receive batch has been dispatched, for every frame
-       listener that registered one: where a listener that answers from the
-       receive path hands the batch's replies to the NIC together -- one
-       SubmitTxBatch, one lock, one doorbell -- rather than one each. */
-    typedef void (*RxBatchEndCallback)(void* ctx);
-
-    bool RegisterUdpListener(u16 port, RxCallback cb, void* ctx);
-
-    /* Unlike RegisterUdpListener, never takes a port over from whoever has
-       it: a server started on the shell's port is refused, not handed the
-       shell's datagrams. */
-    static const int UdpListenOk = 0;
-    static const int UdpListenPortTaken = 1;
-    static const int UdpListenTableFull = 2;
-    static const int UdpListenInvalid = 3;
-    int ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx,
-                        RxBatchEndCallback batchEnd = nullptr);
-
-    /* Each takes away only its own kind of listener -- and a frame listener
-       only the one registered with this ctx: DHCP takes port 68 for an
-       attempt and gives it back after, and must never give back someone
-       else's. Both return once no callback of the device's listeners is
-       running. */
-    void UnregisterUdpListener(u16 port);
-    void UnlistenUdpFrames(u16 port, void* ctx);
-
-    /* Higher-level UDP send: builds the Ethernet/IP/UDP headers, resolves the
-       destination MAC through ARP and hands the frame to SendRaw. Generic
-       protocol code, so it lives here rather than in any one driver -- a
-       driver that returned false from this is a driver whose UDP replies
-       (the UDP shell, DNS) silently never leave the box. */
-    virtual bool SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
-                         const void* data, ulong len);
-
-    /* DHCP, DNS and the UDP shell take three at boot; every block server
-       takes one more. */
-    static const ulong MaxUdpListeners = 16;
-
-    struct UdpListener
-    {
-        u16 Port;
-        RxCallback Cb;
-        RxFrameCallback FrameCb;    /* instead of Cb: ListenUdpFrames */
-        RxBatchEndCallback BatchEndCb;  /* ListenUdpFrames' optional one */
-        void* Ctx;
-    };
-
-    /* Listener callbacks running right now. The dispatcher takes a listener
-       out of the table under UdpListenerLock and then calls it with the lock
-       released -- so a callback runs with interrupts on, may take locks of
-       its own, and no longer stalls the NIC's interrupt for its duration.
-       UnregisterUdpListener waits for this to drain before returning, which
-       is what makes freeing the callback's context after it safe. */
-    Atomic UdpListenerInFlight;
-
-    /* Driver must implement: drain TxQueue to hardware (called under TxQueueLock) */
-    virtual void FlushTx() = 0;
-
-    /* Driver must implement: process frames from RxQueue (called from softirq) */
-    virtual void ProcessRx() = 0;
-
-    /* Driver hook: reap completed RX buffers from hardware into RxQueue
-       (called from the net RX softirq before ProcessRx) */
-    virtual void ReapRx() {}
-
-    /* Driver hook: retry pending TX (called from the net TX softirq).
-       Default: flush TxQueue under TxQueueLock. */
-    virtual void DrainTx();
-
-    /* Drain the SW RxQueue and dispatch frames to the protocol stack. Drivers
-       whose reap runs as ReapRx() can use this as their ProcessRx(). */
-    void DrainRxQueueAndDispatch();
-
-    /* A driver must never release a transmitted frame from inside FlushTx.
-       FlushTx runs under TxQueueLock with interrupts off, and NetFrame::Put
-       reaches Mm::Free, which shoots down the TLB on every other CPU and
-       waits for each one to acknowledge -- and a CPU spinning on TxQueueLock
-       has interrupts off, so it never can. The two then wait for each other
-       forever and the machine stops dead, with no fault to panic on and the
-       netconsole drain blocked on the same lock, so it cannot even say so.
-
-       Hand the frame here instead. SubmitTx and DrainTx empty the queue once
-       the lock is down. */
-    void TxDone(NetFrame* frame);
-    void ReleaseTxDone();
-
-protected:
-    static const ulong TxQueueCapacity = 256;
-    static const ulong RxQueueCapacity = 256;
-
-    Stdlib::ListEntry TxQueue;
-    ulong TxCount;
-    RawSpinLock TxQueueLock;
-
-    /* Transmitted frames waiting to be released outside the lock. */
-    Stdlib::ListEntry TxDoneQueue;
-
-    Stdlib::ListEntry RxQueue;
-    ulong RxCount;
-    RawSpinLock RxQueueLock;
-
-    /* Counted by DrainRxQueueAndDispatch, which is the one place every
-       driver's frames pass through -- they used to be per-driver, so the
-       `net` command reported zeros for any device whose driver had not
-       written its own copy of the dispatch loop, which is how the Rust NIC
-       bridge came to show tx:0 rx:0 on a machine forwarding thousands of
-       packets a second.
-
-       Per CPU and plain, not shared and atomic. This is a datapath, and a
-       counter every arriving packet increments on one cache line is the
-       thing this kernel has spent a day removing from other datapaths --
-       the frame pool and the load target both count this way for the same
-       reason. The CPU is read once per batch, not once per frame. */
-    struct RxProtoCounters
-    {
-        ulong Icmp;
-        ulong Udp;
-        ulong Tcp;
-        ulong Arp;
-        ulong Other;
-        ulong Drop;
-
-        /* Padded to a cache line rather than aligned to one: alignas here
-           would over-align NetDevice itself, and deleting an over-aligned
-           object calls operator delete(void*, align_val_t), which this
-           freestanding runtime does not provide. Sizing to 64 keeps two CPUs
-           off the same line everywhere except the array's own ends. */
-        ulong Pad[2];
-    };
-
-    static_assert(sizeof(RxProtoCounters) == 64, "one counter set per line");
-
-    RxProtoCounters RxProto[MaxCpus];
-
-    /* The same on the way out. These were six shared atomics per frame
-       taken inside FlushTx, which runs under TxQueueLock with interrupts
-       off -- the narrowest section on the transmit path. */
-    struct TxProtoCounters
-    {
-        ulong Icmp;
-        ulong Udp;
-        ulong Tcp;
-        ulong Arp;
-        ulong Other;
-        ulong Total;
-        ulong Pad[2];
-    };
-
-    static_assert(sizeof(TxProtoCounters) == 64, "one counter set per line");
-
-    TxProtoCounters TxProto[MaxCpus];
-
-    /* Classify one outgoing frame. Called from SubmitTx, which is where
-       every driver's frames leave, so the Rust NIC bridge is counted too --
-       it reported zeros for the transmit breakdown, having no classifier of
-       its own. */
-    void CountTxFrame(NetFrame* frame);
-
-    /* Summed across CPUs; for GetStats, never for the datapath. */
-    void GetRxProtoTotals(NetStats& stats);
-    void GetTxProtoTotals(NetStats& stats);
-
-    void RemoveUdpListener(u16 port, void* ctx, bool frames);
-
-    UdpListener UdpListeners[MaxUdpListeners];
-    ulong UdpListenerCount;
-    SpinLock UdpListenerLock;
-    Net::MacAddress Mac;
-    Net::IpAddress Ip;
-    Net::IpAddress Mask;
-    Net::IpAddress Gw;
-};
-
-/* Not internally synchronized: Register() is expected to run only at boot
-   (driver probe) before any concurrent Find()/Dump() readers exist. Devices are
-   never unregistered, so steady-state reads need no lock. */
 class NetDeviceTable
 {
 public:
@@ -270,68 +25,37 @@ public:
         return instance;
     }
 
-    bool Register(NetDevice* dev);
-
     NetDevice* Find(const char* name);
-
-    void Dump(Stdlib::Printer& printer);
-
     ulong GetCount();
 
-    /* Softirq-driven RX/TX processing across all registered devices */
-    void ProcessAllRx();
-    void ProcessAllTx();
-
-    /* Look at the receive path without waiting to be asked.
-
-       A driver whose only source of liveness is its own interrupt has no
-       recovery from a lost one: r8125 reaps only from the receive softirq,
-       which is raised only from its ISR, so a wakeup lost while the ring is
-       full means nothing ever looks at that ring again -- which is exactly
-       how the bare metal machine goes permanently deaf while the rest of the
-       kernel runs on. This is the fallback: a lost wakeup then costs a tick
-       instead of the rest of the uptime.
-
-       Raised only when the softirq is not already pending, so that a pass it
-       causes can be told from one an interrupt caused -- which is what makes
-       RxStalls evidence rather than a guess. */
+    /* Look at the receive path without waiting to be asked: a driver whose
+       only source of liveness is its own interrupt has no recovery from a
+       lost one, and this makes that cost a tick rather than the uptime. */
     void PollRx();
 
     /* Polls issued; polls that found frames waiting; and polls that found
        frames waiting with no interrupt-driven pass since the previous poll.
-
-       Only the third is evidence of a lost wakeup. The second is mostly a
-       race that means nothing is wrong: under load the poll often gets there
-       before an interrupt that is already on its way, which is why it counts
-       in the hundreds on QEMU, where nothing is lost at all. A wakeup that
-       is genuinely gone shows as poll after poll finding work with no
-       interrupt in between. */
+       Only the third is evidence of a lost wakeup. */
     ulong GetRxPolls();
     ulong GetRxPollWork();
     ulong GetRxStalls();
 
-    static const ulong MaxDevices = 16;
+    void Dump(Stdlib::Printer& printer);
 
 private:
-    Atomic PollPending;
-    Atomic RxPolls;
-    Atomic RxPollWork;
-    Atomic RxStalls;
-
-    /* Whether the previous receive pass was one this poll caused. */
-    bool LastPassWasPoll;
-public:
-
-private:
-    NetDeviceTable();
-    ~NetDeviceTable();
+    NetDeviceTable() {}
+    ~NetDeviceTable() {}
     NetDeviceTable(const NetDeviceTable& other) = delete;
-    NetDeviceTable(NetDeviceTable&& other) = delete;
     NetDeviceTable& operator=(const NetDeviceTable& other) = delete;
-    NetDeviceTable& operator=(NetDeviceTable&& other) = delete;
-
-    NetDevice* Devices[MaxDevices];
-    ulong Count;
 };
+
+/* What the shell asks of one device */
+const char* NetDeviceName(NetDevice* dev, char* buf, ulong bufSize);
+Net::IpAddress NetDeviceIp(NetDevice* dev);
+
+/* A UDP datagram out of the device: the headers built, the destination
+   resolved through ARP. Task context -- the resolution may wait. */
+bool NetDeviceSendUdp(NetDevice* dev, Net::IpAddress dstIp, u16 dstPort,
+                      Net::IpAddress srcIp, u16 srcPort, const void* data, ulong len);
 
 }

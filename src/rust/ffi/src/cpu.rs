@@ -20,4 +20,6 @@ extern "C" {
 extern "C" {
     pub fn kernel_preempt_disable();
     pub fn kernel_preempt_enable();
+    /// Whether interrupts are on for this CPU.
+    pub fn kernel_interrupts_enabled() -> i32;
 }

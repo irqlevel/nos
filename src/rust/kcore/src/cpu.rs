@@ -59,3 +59,12 @@ pub fn irq_save() -> usize {
 pub unsafe fn irq_restore(flags: usize) {
     unsafe { ffi::cpu::kernel_irq_restore(flags) }
 }
+
+/// Whether interrupts are on for this CPU.
+///
+/// What tells a caller it may release something whose free waits for every
+/// other CPU to answer: with interrupts off it could not answer one itself,
+/// and two such CPUs would wait on each other for good.
+pub fn interrupts_enabled() -> bool {
+    unsafe { ffi::cpu::kernel_interrupts_enabled() != 0 }
+}

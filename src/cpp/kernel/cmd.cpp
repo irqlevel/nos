@@ -1394,58 +1394,16 @@ static void CmdUdpsend(const char* args, Stdlib::Printer& con)
         return;
     }
 
+    /* The headers, the ARP resolution and the send are the net layer's --
+       this used to build the frame by hand, which is one more copy of the
+       same thing to keep right. */
+    static const u16 UdpSendSourcePort = 12345;
     ulong msgLen = Stdlib::StrLen(msg);
-    Net::IpAddress srcIp = dev->GetIp();
 
-    /* Resolve destination MAC via ARP */
-    Net::MacAddress dstMac;
-    if (!ArpTable::GetInstance().Resolve(dev, dstIp, dstMac))
-        dstMac = Net::MacAddress::Broadcast();
-
-    /* Build UDP frame */
-    ulong udpPayLen = sizeof(Net::UdpHdr) + msgLen;
-    ulong ipPayLen = sizeof(Net::IpHdr) + udpPayLen;
-    ulong frameLen = sizeof(Net::EthHdr) + ipPayLen;
-
-    if (frameLen > 1514)
+    if (NetDeviceSendUdp(dev, dstIp, (u16)port, NetDeviceIp(dev),
+            UdpSendSourcePort, msg, msgLen))
     {
-        con.Printf("message too large\n");
-        return;
-    }
-
-    u8 frame[1514];
-    Stdlib::MemSet(frame, 0, sizeof(frame));
-    ulong off = 0;
-
-    Net::EthHdr* eth = (Net::EthHdr*)(frame + off);
-    dstMac.CopyTo(eth->DstMac);
-    dev->GetMac().CopyTo(eth->SrcMac);
-    eth->EtherType = Net::Htons(Net::EtherTypeIp);
-    off += sizeof(Net::EthHdr);
-
-    Net::IpHdr* ip = (Net::IpHdr*)(frame + off);
-    ip->VersionIhl = 0x45;
-    ip->TotalLen = Net::Htons((u16)ipPayLen);
-    ip->Ttl = 64;
-    ip->Protocol = Net::IpProtoUdp;
-    ip->SrcAddr = srcIp.ToNetwork();
-    ip->DstAddr = dstIp.ToNetwork();
-    ip->Checksum = Net::Htons(Net::IpChecksum(ip, sizeof(Net::IpHdr)));
-    off += sizeof(Net::IpHdr);
-
-    Net::UdpHdr* udp = (Net::UdpHdr*)(frame + off);
-    udp->SrcPort = Net::Htons(12345);
-    udp->DstPort = Net::Htons((u16)port);
-    udp->Length = Net::Htons((u16)udpPayLen);
-    off += sizeof(Net::UdpHdr);
-
-    Stdlib::MemCpy(frame + off, msg, msgLen);
-    off += msgLen;
-
-    if (dev->SendRaw(frame, off))
-    {
-        con.Printf("sent %u bytes to %s:%u\n",
-            msgLen, ipBuf, port);
+        con.Printf("sent %u bytes to %s:%u\n", msgLen, ipBuf, port);
     }
     else
     {

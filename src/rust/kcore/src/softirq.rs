@@ -14,3 +14,9 @@ pub fn raise(typ: usize) {
 pub fn register(typ: usize, handler: extern "C" fn(*mut u8), ctx: *mut u8) {
     unsafe { ffi::softirq::kernel_softirq_register(typ, handler, ctx) }
 }
+
+/// Whether that soft IRQ is already asked for. What lets a poll tell a pass
+/// it caused from one an interrupt caused.
+pub fn is_pending(typ: usize) -> bool {
+    unsafe { ffi::softirq::kernel_softirq_pending(typ) != 0 }
+}

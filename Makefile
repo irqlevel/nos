@@ -100,7 +100,6 @@ CXX_SRC_x86_64 =   \
     src/cpp/kernel/input.cpp \
     src/cpp/block/block_device.cpp \
     src/cpp/net/net_device.cpp \
-    src/cpp/net/net_frame.cpp \
     src/cpp/net/net_frame_pool.cpp \
     src/cpp/net/net_load.cpp \
     src/cpp/net/arp.cpp \
@@ -222,7 +221,6 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/entropy.cpp \
     src/cpp/kernel/random.cpp \
     src/cpp/net/net_device.cpp \
-    src/cpp/net/net_frame.cpp \
     src/cpp/net/net_frame_pool.cpp \
     src/cpp/net/net_load.cpp \
     src/cpp/net/arp.cpp \

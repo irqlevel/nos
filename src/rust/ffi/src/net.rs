@@ -84,13 +84,6 @@ extern "C" {
     pub fn kernel_netframe_get(handle: usize);
 }
 
-/* A quoted TCP segment came back unreachable. Goes when TCP moves over. */
-extern "C" {
-    pub fn kernel_tcp_icmp_unreachable(
-        src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, seq: u32,
-    );
-}
-
 /* What netconsole needs of the kernel: what it was asked for, the log that
    happened before it was set up, and whether a panic has started. */
 extern "C" {
