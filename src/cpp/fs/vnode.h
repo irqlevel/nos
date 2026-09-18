@@ -31,4 +31,10 @@ struct VNode
     ulong OpenCount; // File handles open on this node, kept by the Vfs
 };
 
+/* The VFS is Rust (src/rust/fs), and a vnode is what the two sides pass each
+   other: the same struct, laid out the same way. crate::vnode::VNode asserts
+   the same number, because a disagreement would be no compile error anywhere
+   -- it would be a filesystem reading fields at the wrong offsets. */
+static_assert(sizeof(VNode) == 160, "src/rust/fs/src/vnode.rs mirrors this");
+
 }

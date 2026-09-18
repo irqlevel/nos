@@ -5,6 +5,62 @@
 #include <mm/new.h>
 #include <kernel/trace.h>
 
+/* The VFS itself is Rust (src/rust/fs): the mount table, path resolution and
+   the file API. What is left here is the C++ way in -- the same class the
+   rest of the kernel has always called -- and the shim that wraps a
+   filesystem still written in C++ into the ops table the VFS drives it by.
+   Both go when the last filesystem moves. */
+extern "C" {
+
+struct RustFsOps
+{
+    const char* Name;
+    void (*Info)(void* ctx, char* buf, unsigned long len);
+    Kernel::VNode* (*Root)(void* ctx);
+    int (*LoadDir)(void* ctx, Kernel::VNode* dir);
+    Kernel::VNode* (*Lookup)(void* ctx, Kernel::VNode* dir, const char* name);
+    Kernel::VNode* (*CreateFile)(void* ctx, Kernel::VNode* dir, const char* name);
+    Kernel::VNode* (*CreateDir)(void* ctx, Kernel::VNode* dir, const char* name);
+    int (*Read)(void* ctx, Kernel::VNode* file, void* buf, unsigned long len, unsigned long off);
+    int (*Write)(void* ctx, Kernel::VNode* file, const void* data, unsigned long len, unsigned long off);
+    int (*Truncate)(void* ctx, Kernel::VNode* file, unsigned long size);
+    int (*Rename)(void* ctx, Kernel::VNode* node, Kernel::VNode* dir, const char* name);
+    int (*Remove)(void* ctx, Kernel::VNode* node);
+    int (*Sync)(void* ctx);
+    unsigned long (*Device)(void* ctx);
+    int (*Mount)(void* ctx, int readOnly);
+    void (*Unmount)(void* ctx);
+    void (*Destroy)(void* ctx);
+    void* Ctx;
+};
+
+int kernel_vfs_mount(const char* path, unsigned long len, const RustFsOps* ops, int readOnly);
+void* kernel_vfs_unmount(const char* path, unsigned long len);
+void kernel_vfs_unmount_all();
+unsigned long kernel_vfs_mount_count();
+int kernel_vfs_mount_at(unsigned long index, char* path, unsigned long pathLen,
+    const char** name, char* info, unsigned long infoLen);
+
+Kernel::File* kernel_vfs_open(const char* path, unsigned long len, unsigned long flags);
+void kernel_vfs_close(Kernel::File* file);
+int kernel_vfs_read(Kernel::File* file, void* buf, unsigned long len, unsigned long* out);
+int kernel_vfs_write(Kernel::File* file, const void* data, unsigned long len);
+int kernel_vfs_seek(Kernel::File* file, unsigned long pos);
+unsigned long kernel_vfs_tell(Kernel::File* file);
+unsigned long kernel_vfs_size(Kernel::File* file);
+
+int kernel_vfs_stat(const char* path, unsigned long len, Kernel::FileStat* out);
+int kernel_vfs_readdir(const char* path, unsigned long len, unsigned long index,
+    Kernel::DirEntry* out);
+int kernel_vfs_create(const char* path, unsigned long len, int directory);
+int kernel_vfs_remove(const char* path, unsigned long len);
+int kernel_vfs_truncate(const char* path, unsigned long len, unsigned long size);
+int kernel_vfs_rename(const char* from, unsigned long fromLen, const char* to, unsigned long toLen);
+int kernel_vfs_sync();
+int kernel_vfs_write_file(const char* path, unsigned long len, const void* data, unsigned long dataLen);
+
+}
+
 namespace Kernel
 {
 
@@ -12,430 +68,155 @@ namespace Kernel
    the file itself never has to fit in one allocation. */
 static const ulong ReadFileChunk = 4096;
 
-Vfs::Vfs()
-    : MountCount(0)
+namespace
 {
-    Stdlib::MemSet(Mounts, 0, sizeof(Mounts));
+
+/* The shim: a C++ FileSystem seen as the ops table the VFS drives. Every
+   call arrives with the VFS lock held, which is the contract FileSystem is
+   written to. */
+
+FileSystem* Fs(void* ctx)
+{
+    return static_cast<FileSystem*>(ctx);
+}
+
+void ShimInfo(void* ctx, char* buf, unsigned long len)
+{
+    Fs(ctx)->GetInfo(buf, len);
+}
+
+VNode* ShimRoot(void* ctx)
+{
+    return Fs(ctx)->GetRoot();
+}
+
+int ShimLoadDir(void* ctx, VNode* dir)
+{
+    return Fs(ctx)->LoadDir(dir) ? 0 : -1;
+}
+
+VNode* ShimLookup(void* ctx, VNode* dir, const char* name)
+{
+    return Fs(ctx)->Lookup(dir, name);
+}
+
+VNode* ShimCreateFile(void* ctx, VNode* dir, const char* name)
+{
+    return Fs(ctx)->CreateFile(dir, name);
+}
+
+VNode* ShimCreateDir(void* ctx, VNode* dir, const char* name)
+{
+    return Fs(ctx)->CreateDir(dir, name);
+}
+
+int ShimRead(void* ctx, VNode* file, void* buf, unsigned long len, unsigned long off)
+{
+    return Fs(ctx)->Read(file, buf, len, off) ? 0 : -1;
+}
+
+int ShimWrite(void* ctx, VNode* file, const void* data, unsigned long len, unsigned long off)
+{
+    return Fs(ctx)->Write(file, data, len, off) ? 0 : -1;
+}
+
+int ShimTruncate(void* ctx, VNode* file, unsigned long size)
+{
+    return Fs(ctx)->Truncate(file, size) ? 0 : -1;
+}
+
+int ShimRename(void* ctx, VNode* node, VNode* dir, const char* name)
+{
+    return Fs(ctx)->Rename(node, dir, name) ? 0 : -1;
+}
+
+int ShimRemove(void* ctx, VNode* node)
+{
+    return Fs(ctx)->Remove(node) ? 0 : -1;
+}
+
+int ShimSync(void* ctx)
+{
+    return Fs(ctx)->Sync() ? 0 : -1;
+}
+
+unsigned long ShimDevice(void* ctx)
+{
+    BlockDevice* dev = Fs(ctx)->GetDevice();
+    return dev != nullptr ? dev->GetHandle() : 0;
+}
+
+int ShimMount(void* ctx, int readOnly)
+{
+    FileSystem* fs = Fs(ctx);
+    fs->ReadOnly = readOnly != 0;
+    if (!fs->Mount())
+        return -1;
+
+    /* The filesystem may have found an image it can read but must not
+       write; the VFS takes that answer as the mount's. */
+    return fs->ReadOnly ? 1 : 0;
+}
+
+void ShimUnmount(void* ctx)
+{
+    Fs(ctx)->Unmount();
+}
+
+void ShimDestroy(void* ctx)
+{
+    delete Fs(ctx);
+}
+
+RustFsOps ShimOps(FileSystem* fs)
+{
+    RustFsOps ops = {};
+    ops.Name = fs->GetName();
+    ops.Info = ShimInfo;
+    ops.Root = ShimRoot;
+    ops.LoadDir = ShimLoadDir;
+    ops.Lookup = ShimLookup;
+    ops.CreateFile = ShimCreateFile;
+    ops.CreateDir = ShimCreateDir;
+    ops.Read = ShimRead;
+    ops.Write = ShimWrite;
+    ops.Truncate = ShimTruncate;
+    ops.Rename = ShimRename;
+    ops.Remove = ShimRemove;
+    ops.Sync = ShimSync;
+    ops.Device = ShimDevice;
+    ops.Mount = ShimMount;
+    ops.Unmount = ShimUnmount;
+    ops.Destroy = ShimDestroy;
+    ops.Ctx = fs;
+    return ops;
+}
+
+}
+
+Vfs::Vfs()
+{
 }
 
 Vfs::~Vfs()
 {
 }
 
-/* What a mount's claim on its device says to whoever is refused it */
-static const char MountHolder[] = "a mounted filesystem";
-
 bool Vfs::Mount(const char* path, FileSystem* fs, bool readOnly)
 {
     if (path == nullptr || fs == nullptr)
-    {
-        Trace(0, "Vfs::Mount: null path or fs");
         return false;
-    }
 
-    if (path[0] != '/')
-    {
-        Trace(0, "Vfs::Mount: path must start with /");
-        return false;
-    }
-
-    if (Stdlib::StrLen(path) >= MaxPath)
-    {
-        Trace(0, "Vfs::Mount: path too long");
-        return false;
-    }
-
-    Stdlib::AutoLock lock(Lock);
-
-    // Check for duplicate mount path
-    for (ulong i = 0; i < MountCount; i++)
-    {
-        if (Stdlib::StrCmp(Mounts[i].Path, path) == 0)
-        {
-            Trace(0, "Vfs::Mount: already mounted on %s", path);
-            return false;
-        }
-    }
-
-    // Check for duplicate block device
-    BlockDevice* dev = fs->GetDevice();
-    if (dev != nullptr)
-    {
-        for (ulong i = 0; i < MountCount; i++)
-        {
-            if (Mounts[i].Fs->GetDevice() == dev)
-            {
-                Trace(0, "Vfs::Mount: device %s already mounted on %s",
-                      dev->GetName(), Mounts[i].Path);
-                return false;
-            }
-        }
-    }
-
-    if (MountCount >= MaxMounts)
-    {
-        Trace(0, "Vfs::Mount: max mounts reached");
-        return false;
-    }
-
-    /* The device is the filesystem's while it is mounted: nothing may write
-       to it around the filesystem -- the disk log, a module going direct --
-       nor another mount take it, or a disk or partition overlapping it */
-    ulong claim = 0;
-    if (dev != nullptr)
-    {
-        const char* heldBy = nullptr;
-        claim = BlockDeviceTable::GetInstance().Claim(dev, MountHolder, heldBy);
-        if (claim == 0)
-        {
-            Trace(0, "Vfs::Mount: %s is in use by %s", dev->GetName(), heldBy);
-            return false;
-        }
-    }
-
-    fs->ReadOnly = readOnly;
-    if (!fs->Mount())
-    {
-        Trace(0, "Vfs::Mount: fs->Mount() failed for %s", path);
-        BlockDeviceTable::GetInstance().Release(claim);
-        return false;
-    }
-
-    /* The filesystem may have found an image it can only read */
-    if (fs->ReadOnly && !readOnly)
-    {
-        Trace(0, "Vfs::Mount: %s mounted read-only on %s", fs->GetName(), path);
-        readOnly = true;
-    }
-
-    Stdlib::StrnCpy(Mounts[MountCount].Path, path, MaxPath);
-    Mounts[MountCount].Fs = fs;
-    Mounts[MountCount].ReadOnly = readOnly;
-    Mounts[MountCount].Claim = claim;
-    MountCount++;
-    return true;
+    RustFsOps ops = ShimOps(fs);
+    return kernel_vfs_mount(path, Stdlib::StrLen(path), &ops, readOnly ? 1 : 0) == 0;
 }
 
 FileSystem* Vfs::Unmount(const char* path)
 {
     if (path == nullptr)
-    {
-        Trace(0, "Vfs::Unmount: null path");
         return nullptr;
-    }
 
-    Stdlib::AutoLock lock(Lock);
-
-    for (ulong i = 0; i < MountCount; i++)
-    {
-        if (Stdlib::StrCmp(Mounts[i].Path, path) == 0)
-        {
-            FileSystem* fs = Mounts[i].Fs;
-
-            if (fs->OpenFiles != 0)
-            {
-                Trace(0, "Vfs::Unmount: %s is busy (%u open files)", path, fs->OpenFiles);
-                return nullptr;
-            }
-
-            fs->Unmount();
-            BlockDeviceTable::GetInstance().Release(Mounts[i].Claim);
-
-            // Shift remaining entries
-            for (ulong j = i; j + 1 < MountCount; j++)
-            {
-                Mounts[j] = Mounts[j + 1];
-            }
-            MountCount--;
-            Stdlib::MemSet(&Mounts[MountCount], 0, sizeof(MountEntry));
-            return fs;
-        }
-    }
-    Trace(0, "Vfs::Unmount: %s not found", path);
-    return nullptr;
-}
-
-bool Vfs::FindMount(const char* path, ulong& mountIdx, const char*& remainder)
-{
-    ulong bestLen = 0;
-    ulong bestIdx = 0;
-    bool found = false;
-
-    for (ulong i = 0; i < MountCount; i++)
-    {
-        ulong mlen = Stdlib::StrLen(Mounts[i].Path);
-        if (mlen == 0)
-            continue;
-
-        // Check if path starts with mount path
-        if (Stdlib::StrnCmp(path, Mounts[i].Path, mlen) != 0)
-            continue;
-
-        // Must match exactly or be followed by '/'
-        // Root mount "/" matches any absolute path
-        if (path[mlen] != '\0' && path[mlen] != '/' &&
-            !(mlen == 1 && Mounts[i].Path[0] == '/'))
-            continue;
-
-        if (mlen > bestLen)
-        {
-            bestLen = mlen;
-            bestIdx = i;
-            found = true;
-        }
-    }
-
-    if (!found)
-    {
-        Trace(0, "Vfs::FindMount: no mount for %s", path);
-        return false;
-    }
-
-    mountIdx = bestIdx;
-    remainder = path + bestLen;
-    if (*remainder == '/')
-        remainder++;
-
-    return true;
-}
-
-bool Vfs::IsMountReadOnly(const char* path)
-{
-    ulong mountIdx;
-    const char* remainder;
-    if (!FindMount(path, mountIdx, remainder))
-        return false;
-    return Mounts[mountIdx].ReadOnly;
-}
-
-bool Vfs::ResolvePath(const char* path, FileSystem*& fs, VNode*& node,
-                      VNode*& parent, char* lastName, ulong lastNameSize)
-{
-    fs = nullptr;
-    node = nullptr;
-    parent = nullptr;
-    if (lastName)
-        lastName[0] = '\0';
-
-    ulong mountIdx;
-    const char* remainder;
-
-    if (!FindMount(path, mountIdx, remainder))
-    {
-        Trace(0, "Vfs::ResolvePath: no mount for %s", path);
-        return false;
-    }
-
-    fs = Mounts[mountIdx].Fs;
-    VNode* cur = fs->GetRoot();
-
-    if (*remainder == '\0')
-    {
-        node = cur;
-        return true;
-    }
-
-    // Walk path components
-    const char* p = remainder;
-    while (*p != '\0')
-    {
-        // Extract next component
-        char component[MaxName];
-        ulong i = 0;
-        while (*p != '\0' && *p != '/' && i < sizeof(component) - 1)
-        {
-            component[i++] = *p++;
-        }
-        component[i] = '\0';
-
-        // A component that doesn't fit is an error, not two components
-        if (*p != '\0' && *p != '/')
-        {
-            Trace(0, "Vfs::ResolvePath: component too long in %s", path);
-            return false;
-        }
-
-        if (*p == '/')
-            p++;
-
-        if (i == 0)
-            continue;
-
-        // "." and ".." are not stored as children; resolve them here
-        if (component[0] == '.' && component[1] == '\0')
-        {
-            if (*p == '\0')
-            {
-                node = cur;
-                return true;
-            }
-            continue;
-        }
-        if (component[0] == '.' && component[1] == '.' && component[2] == '\0')
-        {
-            if (cur->Parent != nullptr)
-                cur = cur->Parent; // the mount root stays put
-            if (*p == '\0')
-            {
-                node = cur;
-                return true;
-            }
-            continue;
-        }
-
-        // If there are more components, this must be a directory
-        if (*p != '\0')
-        {
-            VNode* child = fs->Lookup(cur, component);
-            if (child == nullptr || child->NodeType != VNode::TypeDir)
-            {
-                Trace(0, "Vfs::ResolvePath: component '%s' not found or not dir", component);
-                return false;
-            }
-            cur = child;
-        }
-        else
-        {
-            // Last component
-            VNode* child = fs->Lookup(cur, component);
-            parent = cur;
-            if (lastName)
-                Stdlib::StrnCpy(lastName, component, lastNameSize);
-            if (child != nullptr)
-            {
-                node = child;
-            }
-            return true;
-        }
-    }
-
-    node = cur;
-    return true;
-}
-
-bool Vfs::HasOpenFiles(VNode* node)
-{
-    if (node->OpenCount != 0)
-        return true;
-
-    Stdlib::ListEntry* head = &node->Children;
-    for (Stdlib::ListEntry* entry = head->Flink; entry != head; entry = entry->Flink)
-    {
-        VNode* child = CONTAINING_RECORD(entry, VNode, SiblingLink);
-        if (HasOpenFiles(child))
-            return true;
-    }
-    return false;
-}
-
-/* True when node is other itself or one of its ancestors */
-bool Vfs::IsAncestor(VNode* node, VNode* other)
-{
-    for (VNode* cur = other; cur != nullptr; cur = cur->Parent)
-    {
-        if (cur == node)
-            return true;
-    }
-    return false;
-}
-
-bool Vfs::ListDir(const char* path, Stdlib::Printer& printer)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-
-    if (!ResolvePath(path, fs, node, parent, nullptr, 0))
-    {
-        printer.Printf("path not found\n");
-        return false;
-    }
-
-    if (node == nullptr)
-    {
-        printer.Printf("path not found\n");
-        return false;
-    }
-
-    if (node->NodeType != VNode::TypeDir)
-    {
-        printer.Printf("not a directory\n");
-        return false;
-    }
-
-    if (!fs->LoadDir(node))
-    {
-        printer.Printf("read failed\n");
-        return false;
-    }
-
-    Stdlib::ListEntry* head = &node->Children;
-    Stdlib::ListEntry* entry = head->Flink;
-    while (entry != head)
-    {
-        VNode* child = CONTAINING_RECORD(entry, VNode, SiblingLink);
-        const char* typeStr = (child->NodeType == VNode::TypeDir) ? "d" : "f";
-        if (child->NodeType == VNode::TypeFile)
-            printer.Printf("%s %u %s\n", typeStr, child->Size, child->Name);
-        else
-            printer.Printf("%s   %s\n", typeStr, child->Name);
-        entry = entry->Flink;
-    }
-
-    return true;
-}
-
-bool Vfs::ReadDir(const char* path, ulong index, DirEntry& entry)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-
-    if (!ResolvePath(path, fs, node, parent, nullptr, 0) || node == nullptr)
-        return false;
-
-    if (node->NodeType != VNode::TypeDir)
-        return false;
-
-    if (!fs->LoadDir(node))
-        return false;
-
-    ulong i = 0;
-    Stdlib::ListEntry* head = &node->Children;
-    for (Stdlib::ListEntry* e = head->Flink; e != head; e = e->Flink, i++)
-    {
-        if (i != index)
-            continue;
-
-        VNode* child = CONTAINING_RECORD(e, VNode, SiblingLink);
-        Stdlib::StrnCpy(entry.Name, child->Name, sizeof(entry.Name));
-        entry.Type = child->NodeType;
-        entry.Size = (child->NodeType == VNode::TypeFile) ? child->Size : 0;
-        return true;
-    }
-
-    return false;
-}
-
-bool Vfs::Stat(const char* path, FileStat& st)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-
-    if (!ResolvePath(path, fs, node, parent, nullptr, 0) || node == nullptr)
-        return false;
-
-    st.Type = node->NodeType;
-    st.Size = (node->NodeType == VNode::TypeFile) ? node->Size : 0;
-    st.Ino = node->Ino;
-    return true;
+    return static_cast<FileSystem*>(kernel_vfs_unmount(path, Stdlib::StrLen(path)));
 }
 
 File* Vfs::Open(const char* path, ulong flags)
@@ -443,188 +224,146 @@ File* Vfs::Open(const char* path, ulong flags)
     if (path == nullptr)
         return nullptr;
 
-    if (flags & OpenAppend)
-        flags |= OpenWrite;
-    if ((flags & (OpenRead | OpenWrite)) == 0)
-    {
-        Trace(0, "Vfs::Open: %s: neither read nor write", path);
-        return nullptr;
-    }
-
-    Stdlib::AutoLock lock(Lock);
-
-    bool writes = (flags & (OpenWrite | OpenCreate | OpenTruncate)) != 0;
-    if (writes && IsMountReadOnly(path))
-    {
-        Trace(0, "Vfs::Open: %s is on a readonly mount", path);
-        return nullptr;
-    }
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-    char lastName[MaxName];
-
-    if (!ResolvePath(path, fs, node, parent, lastName, sizeof(lastName)))
-    {
-        Trace(0, "Vfs::Open: resolve failed for %s", path);
-        return nullptr;
-    }
-
-    if (node == nullptr)
-    {
-        if ((flags & OpenCreate) == 0)
-        {
-            Trace(0, "Vfs::Open: %s not found", path);
-            return nullptr;
-        }
-
-        if (parent == nullptr || lastName[0] == '\0')
-        {
-            Trace(0, "Vfs::Open: no parent dir for %s", path);
-            return nullptr;
-        }
-
-        node = fs->CreateFile(parent, lastName);
-        if (node == nullptr)
-        {
-            Trace(0, "Vfs::Open: create failed for %s", path);
-            return nullptr;
-        }
-    }
-
-    if (node->NodeType != VNode::TypeFile)
-    {
-        Trace(0, "Vfs::Open: %s is not a file", path);
-        return nullptr;
-    }
-
-    if ((flags & OpenTruncate) && node->Size != 0)
-    {
-        if (!fs->Truncate(node, 0))
-        {
-            Trace(0, "Vfs::Open: truncate failed for %s", path);
-            return nullptr;
-        }
-    }
-
-    File* file = new (Mm::NoThrow) File();
-    if (file == nullptr)
-    {
-        Trace(0, "Vfs::Open: alloc failed for %s", path);
-        return nullptr;
-    }
-
-    file->Fs = fs;
-    file->Node = node;
-    file->Pos = (flags & OpenAppend) ? node->Size : 0;
-    file->Flags = flags;
-
-    node->OpenCount++;
-    fs->OpenFiles++;
-    return file;
+    return kernel_vfs_open(path, Stdlib::StrLen(path), flags);
 }
 
 void Vfs::Close(File* file)
 {
-    if (file == nullptr)
-        return;
-
-    Stdlib::AutoLock lock(Lock);
-
-    file->Node->OpenCount--;
-    file->Fs->OpenFiles--;
-    delete file;
+    kernel_vfs_close(file);
 }
 
 bool Vfs::Read(File* file, void* buf, ulong len, ulong& bytesRead)
 {
     bytesRead = 0;
-    if (file == nullptr || buf == nullptr)
-        return false;
-
-    if ((file->Flags & OpenRead) == 0)
-    {
-        Trace(0, "Vfs::Read: not open for reading");
-        return false;
-    }
-
-    Stdlib::AutoLock lock(Lock);
-
-    VNode* node = file->Node;
-    if (file->Pos >= node->Size || len == 0)
-        return true;
-
-    ulong avail = node->Size - file->Pos;
-    ulong toRead = (len < avail) ? len : avail;
-
-    if (!file->Fs->Read(node, buf, toRead, file->Pos))
-        return false;
-
-    file->Pos += toRead;
-    bytesRead = toRead;
-    return true;
+    return kernel_vfs_read(file, buf, len, &bytesRead) == 0;
 }
 
 bool Vfs::Write(File* file, const void* data, ulong len)
 {
-    if (file == nullptr || (data == nullptr && len != 0))
-        return false;
-
-    if ((file->Flags & OpenWrite) == 0)
-    {
-        Trace(0, "Vfs::Write: not open for writing");
-        return false;
-    }
-
-    if (len == 0)
-        return true;
-
-    Stdlib::AutoLock lock(Lock);
-
-    VNode* node = file->Node;
-    if (file->Flags & OpenAppend)
-        file->Pos = node->Size;
-
-    if (file->Pos + len < file->Pos)
-    {
-        Trace(0, "Vfs::Write: offset overflow");
-        return false;
-    }
-
-    if (!file->Fs->Write(node, data, len, file->Pos))
-        return false;
-
-    file->Pos += len;
-    return true;
+    return kernel_vfs_write(file, data, len) == 0;
 }
 
 bool Vfs::Seek(File* file, ulong pos)
 {
-    if (file == nullptr)
-        return false;
-
-    Stdlib::AutoLock lock(Lock);
-    file->Pos = pos;
-    return true;
+    return kernel_vfs_seek(file, pos) == 0;
 }
 
 ulong Vfs::Tell(File* file)
 {
-    if (file == nullptr)
-        return 0;
-
-    Stdlib::AutoLock lock(Lock);
-    return file->Pos;
+    return kernel_vfs_tell(file);
 }
 
 ulong Vfs::GetSize(File* file)
 {
-    if (file == nullptr)
-        return 0;
+    return kernel_vfs_size(file);
+}
 
-    Stdlib::AutoLock lock(Lock);
-    return file->Node->Size;
+bool Vfs::Stat(const char* path, FileStat& st)
+{
+    if (path == nullptr)
+        return false;
+
+    return kernel_vfs_stat(path, Stdlib::StrLen(path), &st) == 0;
+}
+
+bool Vfs::ReadDir(const char* path, ulong index, DirEntry& entry)
+{
+    if (path == nullptr)
+        return false;
+
+    return kernel_vfs_readdir(path, Stdlib::StrLen(path), index, &entry) == 0;
+}
+
+bool Vfs::CreateDir(const char* path)
+{
+    if (path == nullptr)
+        return false;
+
+    return kernel_vfs_create(path, Stdlib::StrLen(path), 1) == 0;
+}
+
+bool Vfs::CreateFile(const char* path)
+{
+    if (path == nullptr)
+        return false;
+
+    return kernel_vfs_create(path, Stdlib::StrLen(path), 0) == 0;
+}
+
+bool Vfs::Remove(const char* path)
+{
+    if (path == nullptr)
+        return false;
+
+    return kernel_vfs_remove(path, Stdlib::StrLen(path)) == 0;
+}
+
+bool Vfs::Truncate(const char* path, ulong size)
+{
+    if (path == nullptr)
+        return false;
+
+    return kernel_vfs_truncate(path, Stdlib::StrLen(path), size) == 0;
+}
+
+bool Vfs::Rename(const char* oldPath, const char* newPath)
+{
+    if (oldPath == nullptr || newPath == nullptr)
+        return false;
+
+    return kernel_vfs_rename(oldPath, Stdlib::StrLen(oldPath),
+        newPath, Stdlib::StrLen(newPath)) == 0;
+}
+
+bool Vfs::Sync()
+{
+    return kernel_vfs_sync() == 0;
+}
+
+bool Vfs::WriteFile(const char* path, const void* data, ulong len)
+{
+    if (path == nullptr)
+        return false;
+
+    return kernel_vfs_write_file(path, Stdlib::StrLen(path), data, len) == 0;
+}
+
+void Vfs::UnmountAll()
+{
+    kernel_vfs_unmount_all();
+}
+
+/* What follows is made of the calls above and nothing else: presentation,
+   and the two-step replace. */
+
+bool Vfs::ListDir(const char* path, Stdlib::Printer& printer)
+{
+    FileStat st;
+    if (!Stat(path, st))
+    {
+        printer.Printf("path not found\n");
+        return false;
+    }
+
+    if (st.Type != VNode::TypeDir)
+    {
+        printer.Printf("not a directory\n");
+        return false;
+    }
+
+    for (ulong i = 0; ; i++)
+    {
+        DirEntry entry;
+        if (!ReadDir(path, i, entry))
+            break;
+
+        if (entry.Type == VNode::TypeFile)
+            printer.Printf("f %u %s\n", entry.Size, entry.Name);
+        else
+            printer.Printf("d   %s\n", entry.Name);
+    }
+
+    return true;
 }
 
 bool Vfs::ReadFile(const char* path, Stdlib::Printer& printer)
@@ -658,7 +397,7 @@ bool Vfs::ReadFile(const char* path, Stdlib::Printer& printer)
         if (got == 0)
             break;
 
-        // Print character by character to handle non-null-terminated data
+        /* Character by character: the data is not NUL-terminated. */
         for (ulong i = 0; i < got; i++)
         {
             char tmp[2] = { (char)buf[i], '\0' };
@@ -670,290 +409,6 @@ bool Vfs::ReadFile(const char* path, Stdlib::Printer& printer)
     Close(file);
     if (ok)
         printer.Printf("\n");
-    return ok;
-}
-
-bool Vfs::WriteFile(const char* path, const void* data, ulong len)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    if (IsMountReadOnly(path))
-    {
-        Trace(0, "Vfs::WriteFile: %s is on a readonly mount", path);
-        return false;
-    }
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-    char lastName[MaxName];
-
-    if (!ResolvePath(path, fs, node, parent, lastName, sizeof(lastName)))
-    {
-        Trace(0, "Vfs::WriteFile: resolve failed for %s", path);
-        return false;
-    }
-
-    if (node == nullptr)
-    {
-        // Create file
-        if (parent == nullptr || lastName[0] == '\0')
-        {
-            Trace(0, "Vfs::WriteFile: no parent dir for %s", path);
-            return false;
-        }
-        node = fs->CreateFile(parent, lastName);
-        if (node == nullptr)
-        {
-            Trace(0, "Vfs::WriteFile: create failed for %s", path);
-            return false;
-        }
-    }
-
-    if (node->NodeType != VNode::TypeFile)
-    {
-        Trace(0, "Vfs::WriteFile: %s is not a file", path);
-        return false;
-    }
-
-    if (node->Size != 0 && !fs->Truncate(node, 0))
-        return false;
-
-    if (len == 0)
-        return true;
-
-    return fs->Write(node, data, len, 0);
-}
-
-bool Vfs::Truncate(const char* path, ulong size)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    if (IsMountReadOnly(path))
-    {
-        Trace(0, "Vfs::Truncate: %s is on a readonly mount", path);
-        return false;
-    }
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-
-    if (!ResolvePath(path, fs, node, parent, nullptr, 0) || node == nullptr)
-    {
-        Trace(0, "Vfs::Truncate: %s not found", path);
-        return false;
-    }
-
-    if (node->NodeType != VNode::TypeFile)
-    {
-        Trace(0, "Vfs::Truncate: %s is not a file", path);
-        return false;
-    }
-
-    return fs->Truncate(node, size);
-}
-
-bool Vfs::CreateDir(const char* path)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    if (IsMountReadOnly(path))
-    {
-        Trace(0, "Vfs::CreateDir: %s is on a readonly mount", path);
-        return false;
-    }
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-    char lastName[MaxName];
-
-    if (!ResolvePath(path, fs, node, parent, lastName, sizeof(lastName)))
-    {
-        Trace(0, "Vfs::CreateDir: resolve failed for %s", path);
-        return false;
-    }
-
-    if (node != nullptr)
-    {
-        Trace(0, "Vfs::CreateDir: %s already exists", path);
-        return false; // already exists
-    }
-
-    if (parent == nullptr || lastName[0] == '\0')
-    {
-        Trace(0, "Vfs::CreateDir: no parent dir for %s", path);
-        return false;
-    }
-
-    return (fs->CreateDir(parent, lastName) != nullptr);
-}
-
-bool Vfs::CreateFile(const char* path)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    if (IsMountReadOnly(path))
-    {
-        Trace(0, "Vfs::CreateFile: %s is on a readonly mount", path);
-        return false;
-    }
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-    char lastName[MaxName];
-
-    if (!ResolvePath(path, fs, node, parent, lastName, sizeof(lastName)))
-    {
-        Trace(0, "Vfs::CreateFile: resolve failed for %s", path);
-        return false;
-    }
-
-    if (node != nullptr)
-    {
-        Trace(0, "Vfs::CreateFile: %s already exists", path);
-        return false; // already exists
-    }
-
-    if (parent == nullptr || lastName[0] == '\0')
-    {
-        Trace(0, "Vfs::CreateFile: no parent dir for %s", path);
-        return false;
-    }
-
-    return (fs->CreateFile(parent, lastName) != nullptr);
-}
-
-bool Vfs::Remove(const char* path)
-{
-    Stdlib::AutoLock lock(Lock);
-
-    if (IsMountReadOnly(path))
-    {
-        Trace(0, "Vfs::Remove: %s is on a readonly mount", path);
-        return false;
-    }
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-
-    if (!ResolvePath(path, fs, node, parent, nullptr, 0))
-    {
-        Trace(0, "Vfs::Remove: resolve failed for %s", path);
-        return false;
-    }
-
-    if (node == nullptr)
-    {
-        Trace(0, "Vfs::Remove: %s not found", path);
-        return false;
-    }
-
-    if (node->NodeType == VNode::TypeDir && !fs->LoadDir(node))
-        return false;
-
-    if (HasOpenFiles(node))
-    {
-        Trace(0, "Vfs::Remove: %s is open", path);
-        return false;
-    }
-
-    return fs->Remove(node);
-}
-
-bool Vfs::Rename(const char* oldPath, const char* newPath)
-{
-    if (oldPath == nullptr || newPath == nullptr)
-        return false;
-
-    Stdlib::AutoLock lock(Lock);
-
-    ulong oldMount, newMount;
-    const char* rem;
-    if (!FindMount(oldPath, oldMount, rem) || !FindMount(newPath, newMount, rem))
-        return false;
-
-    if (oldMount != newMount)
-    {
-        Trace(0, "Vfs::Rename: %s and %s are on different mounts", oldPath, newPath);
-        return false;
-    }
-
-    if (Mounts[oldMount].ReadOnly)
-    {
-        Trace(0, "Vfs::Rename: %s is on a readonly mount", oldPath);
-        return false;
-    }
-
-    FileSystem* fs;
-    VNode* node;
-    VNode* parent;
-    if (!ResolvePath(oldPath, fs, node, parent, nullptr, 0) || node == nullptr)
-    {
-        Trace(0, "Vfs::Rename: %s not found", oldPath);
-        return false;
-    }
-
-    if (node->Parent == nullptr)
-    {
-        Trace(0, "Vfs::Rename: cannot rename the root");
-        return false;
-    }
-
-    if (node->NodeType == VNode::TypeDir && !fs->LoadDir(node))
-        return false;
-
-    if (HasOpenFiles(node))
-    {
-        Trace(0, "Vfs::Rename: %s is open", oldPath);
-        return false;
-    }
-
-    FileSystem* newFs;
-    VNode* target;
-    VNode* newParent;
-    char newName[MaxName];
-    if (!ResolvePath(newPath, newFs, target, newParent, newName, sizeof(newName)))
-    {
-        Trace(0, "Vfs::Rename: resolve failed for %s", newPath);
-        return false;
-    }
-
-    if (target != nullptr)
-    {
-        Trace(0, "Vfs::Rename: %s already exists", newPath);
-        return false;
-    }
-
-    if (newParent == nullptr || newName[0] == '\0')
-    {
-        Trace(0, "Vfs::Rename: no parent dir for %s", newPath);
-        return false;
-    }
-
-    /* A directory cannot move under itself */
-    if (IsAncestor(node, newParent))
-    {
-        Trace(0, "Vfs::Rename: %s is inside %s", newPath, oldPath);
-        return false;
-    }
-
-    return fs->Rename(node, newParent, newName);
-}
-
-bool Vfs::Sync()
-{
-    Stdlib::AutoLock lock(Lock);
-
-    bool ok = true;
-    for (ulong i = 0; i < MountCount; i++)
-    {
-        if (!Mounts[i].Fs->Sync())
-            ok = false;
-    }
     return ok;
 }
 
@@ -1011,56 +466,22 @@ bool Vfs::Locate(const char* path, char* out, ulong outSize)
 
 void Vfs::DumpMounts(Stdlib::Printer& printer)
 {
-    Stdlib::AutoLock lock(Lock);
-
-    for (ulong i = 0; i < MountCount; i++)
+    ulong count = kernel_vfs_mount_count();
+    for (ulong i = 0; i < count; i++)
     {
-        const char* rwStr = Mounts[i].ReadOnly ? "ro" : "rw";
+        char path[MaxPath];
         char info[64];
-        Mounts[i].Fs->GetInfo(info, sizeof(info));
+        const char* name = nullptr;
+
+        int readOnly = kernel_vfs_mount_at(i, path, sizeof(path), &name, info, sizeof(info));
+        if (readOnly < 0)
+            continue;
+
+        const char* rwStr = (readOnly != 0) ? "ro" : "rw";
         if (info[0] != '\0')
-            printer.Printf("%s on %s  %s  %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path, info, rwStr);
+            printer.Printf("%s on %s  %s  %s\n", name != nullptr ? name : "?", path, info, rwStr);
         else
-            printer.Printf("%s on %s  %s\n", Mounts[i].Fs->GetName(), Mounts[i].Path, rwStr);
-    }
-}
-
-void Vfs::UnmountAll()
-{
-    Stdlib::AutoLock lock(Lock);
-
-    /* Unmount in reverse path-length order (deepest first)
-       so child mounts are torn down before parents. */
-    while (MountCount > 0)
-    {
-        ulong longest = 0;
-        ulong longestIdx = 0;
-        for (ulong i = 0; i < MountCount; i++)
-        {
-            ulong len = Stdlib::StrLen(Mounts[i].Path);
-            if (len >= longest)
-            {
-                longest = len;
-                longestIdx = i;
-            }
-        }
-
-        FileSystem* fs = Mounts[longestIdx].Fs;
-        Trace(0, "Vfs::UnmountAll: unmounting %s (%s)",
-              Mounts[longestIdx].Path, fs->GetName());
-
-        /* This is shutdown: a handle left open is abandoned, not honoured */
-        if (fs->OpenFiles != 0)
-            Trace(0, "Vfs::UnmountAll: %s has %u open files", Mounts[longestIdx].Path, fs->OpenFiles);
-
-        fs->Unmount();
-        BlockDeviceTable::GetInstance().Release(Mounts[longestIdx].Claim);
-        delete fs;
-
-        for (ulong j = longestIdx; j + 1 < MountCount; j++)
-            Mounts[j] = Mounts[j + 1];
-        MountCount--;
-        Stdlib::MemSet(&Mounts[MountCount], 0, sizeof(MountEntry));
+            printer.Printf("%s on %s  %s\n", name != nullptr ? name : "?", path, rwStr);
     }
 }
 

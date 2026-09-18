@@ -99,6 +99,22 @@ pub struct Disk {
     handle: usize,
 }
 
+/// Claim a device by handle, naming the holder a refusal reports: what the
+/// VFS does for as long as a filesystem is mounted on it. 0 if something
+/// overlapping holds it.
+///
+/// `holder` must be NUL-terminated and outlive the claim.
+pub fn claim_as(device: usize, holder: *const u8) -> usize {
+    unsafe { block::kernel_blockdev_claim_as(device, holder, core::ptr::null_mut()) }
+}
+
+/// Give back a claim from `claim_as`. A claim of 0 is nothing to give back.
+pub fn release(claim: usize) {
+    if claim != 0 {
+        unsafe { block::kernel_blockdev_release(claim) }
+    }
+}
+
 /// Whether a driver may block waiting for a completion: false early in
 /// boot, before interrupts and the scheduler are running, when a
 /// synchronous I/O has to poll its device instead.

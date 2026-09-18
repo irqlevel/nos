@@ -2,21 +2,16 @@
 
 #include <fs/filesystem.h>
 #include <lib/printer.h>
-#include <kernel/mutex.h>
 
 namespace Kernel
 {
 
 /* An open file: a position over a vnode. Made by Vfs::Open, released by
    Vfs::Close; every access goes through the Vfs, which holds the vnode in
-   place (no remove, rename or unmount under an open handle). */
-struct File
-{
-    FileSystem* Fs;
-    VNode* Node;
-    ulong Pos;
-    ulong Flags;
-};
+   place (no remove, rename or unmount under an open handle).
+
+   The VFS is Rust (src/rust/fs) and the handle is its own: opaque here. */
+struct File;
 
 struct FileStat
 {
@@ -105,23 +100,8 @@ private:
     Vfs& operator=(const Vfs& other) = delete;
     Vfs& operator=(Vfs&& other) = delete;
 
-    struct MountEntry
-    {
-        char Path[MaxPath];
-        FileSystem* Fs;
-        bool ReadOnly;
-        ulong Claim;    /* on the filesystem's device, for as long as it is mounted */
-    };
-
-    bool ResolvePath(const char* path, FileSystem*& fs, VNode*& node, VNode*& parent, char* lastName, ulong lastNameSize);
-    bool FindMount(const char* path, ulong& mountIdx, const char*& remainder);
-    bool IsMountReadOnly(const char* path);
-    static bool HasOpenFiles(VNode* node);
-    static bool IsAncestor(VNode* node, VNode* other);
-
-    MountEntry Mounts[MaxMounts];
-    ulong MountCount;
-    Mutex Lock;
+    /* Nothing is kept here: the mount table, the path walk and the open
+       handles are all in src/rust/fs, and this is the way in. */
 };
 
 }
