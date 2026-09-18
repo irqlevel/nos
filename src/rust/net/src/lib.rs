@@ -18,6 +18,7 @@ pub mod dns;
 pub mod icmp;
 pub mod selftest;
 pub mod udp;
+pub mod udp_shell;
 pub mod wire;
 
 /// Nothing to set up: the layer is called from C++ by the names below, and

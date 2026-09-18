@@ -14,12 +14,14 @@ use crate::arp::ArpTable;
 use crate::dhcp::{Dhcp, Lease};
 use crate::dns::{Dns, MAX_DOMAIN_LEN};
 use crate::icmp::{Icmp, Stats};
+use crate::udp_shell::UdpShell;
 use crate::wire::Mac;
 
 static ARP: AtomicPtr<ArpTable> = AtomicPtr::new(core::ptr::null_mut());
 static ICMP: AtomicPtr<Icmp> = AtomicPtr::new(core::ptr::null_mut());
 static DNS: AtomicPtr<Dns> = AtomicPtr::new(core::ptr::null_mut());
 static DHCP: AtomicPtr<Dhcp> = AtomicPtr::new(core::ptr::null_mut());
+static UDP_SHELL: AtomicPtr<UdpShell> = AtomicPtr::new(core::ptr::null_mut());
 
 /// The one of something, made on first use. Two callers racing here both get
 /// the same one, and the loser's is dropped.
@@ -396,4 +398,35 @@ pub unsafe extern "C" fn rust_dhcp_lease(out: *mut Lease) {
     }
 
     unsafe { *out = dhcp.lease() };
+}
+
+/* ---- the shell over UDP ---- */
+
+fn udp_shell() -> Option<&'static UdpShell> {
+    match once(&UDP_SHELL, || UdpShell::new().map(Box::new)) {
+        Some(shell) => Some(shell),
+        None => {
+            trace!(0, "udpshell: no memory");
+            None
+        }
+    }
+}
+
+/// Start the shell on the device's `port`: 0 started, -1 not.
+#[no_mangle]
+pub extern "C" fn rust_udp_shell_start(dev: usize, port: u16) -> i32 {
+    let (shell, nic) = match (udp_shell(), unsafe { Nic::from_handle(dev) }) {
+        (Some(shell), Some(nic)) => (shell, nic),
+        _ => return -1,
+    };
+
+    if shell.start(nic, port) { 0 } else { -1 }
+}
+
+/// Stop it and give up the port. Returns once its task has left.
+#[no_mangle]
+pub extern "C" fn rust_udp_shell_stop() {
+    if let Some(shell) = udp_shell() {
+        shell.stop();
+    }
 }
