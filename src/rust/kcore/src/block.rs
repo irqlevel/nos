@@ -104,8 +104,23 @@ pub struct Disk {
 /// overlapping holds it.
 ///
 /// `holder` must be NUL-terminated and outlive the claim.
-pub fn claim_as(device: usize, holder: *const u8) -> usize {
-    unsafe { block::kernel_blockdev_claim_as(device, holder, core::ptr::null_mut()) }
+pub fn claim_as(device: usize, holder: *const u8) -> core::result::Result<usize, &'static str> {
+    let mut held: *const u8 = core::ptr::null();
+    let claim = unsafe { block::kernel_blockdev_claim_as(device, holder, &mut held) };
+    if claim != 0 {
+        return Ok(claim);
+    }
+    Err(holder_name(held))
+}
+
+/// The holder a refused claim named. The kernel keeps the string for as long
+/// as the claim, and a static holder's for good.
+fn holder_name(held: *const u8) -> &'static str {
+    if held.is_null() {
+        return "something";
+    }
+    let name = unsafe { core::ffi::CStr::from_ptr(held as *const core::ffi::c_char) };
+    name.to_str().unwrap_or("something")
 }
 
 /// Give back a claim from `claim_as`. A claim of 0 is nothing to give back.
@@ -203,12 +218,7 @@ impl Disk {
         if claim != 0 {
             return Ok(DiskClaim { claim });
         }
-        if held.is_null() {
-            return Err("something");
-        }
-        /* The kernel keeps the name for good */
-        let name = unsafe { core::ffi::CStr::from_ptr(held as *const core::ffi::c_char) };
-        Err(name.to_str().unwrap_or("something"))
+        Err(holder_name(held))
     }
 
     /// How many partitions of it the kernel found

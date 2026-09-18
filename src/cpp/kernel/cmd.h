@@ -114,7 +114,10 @@ private:
     bool ScriptRunning;     /* under Lock */
     Mutex RcLock;
 
-    static const ulong DynamicMax = 32;
+    /* Room for every command the kernel's own layers register -- the block,
+       filesystem and network layers are Rust and put their own commands in
+       front of whoever runs one -- and for a module's on top of those. */
+    static const ulong DynamicMax = 128;
     static const ulong DynamicNameMax = 31;
     static const ulong DynamicHelpMax = 95;
     /* A handle is the slot index + 1 in its low bits, and a registration

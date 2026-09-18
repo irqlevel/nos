@@ -15,6 +15,7 @@
 extern crate alloc;
 
 mod part;
+mod shell;
 mod table;
 
 use core::fmt::Write;
@@ -113,6 +114,8 @@ pub fn init() {
 
     register("disks", "disks - list block devices", table::dump);
     register("partitions", "partitions <disk> - show the partition table (MBR or GPT)", dump);
+    register("diskread", "diskread <disk> <sector> - read sector", shell::diskread);
+    register("diskwrite", "diskwrite <disk> <sector> <hex> - write sector", shell::diskwrite);
 }
 
 fn register(name: &'static str, help: &'static str, handler: fn(&str, &mut Output)) {
