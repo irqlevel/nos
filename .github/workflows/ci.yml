@@ -68,3 +68,8 @@ jobs:
       - name: netconsole test (TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/netconsole-test.py --tcg
+
+      # The connecting side of TCP, which the sshd test does not reach.
+      - name: TCP test (TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/tcp-test.py --tcg
