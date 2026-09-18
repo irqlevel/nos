@@ -262,7 +262,7 @@ public:
        minute of TIME-WAIT. For a connection a server refuses or drops. */
     void Abort(TcpConn* conn);
 
-    /* Called from VirtioNet::ProcessRx for IpProtoTcp */
+    /* Called from a net device's receive dispatch for IpProtoTcp */
     void Process(NetDevice* dev, const u8* frame, ulong frameLen);
 
     /* Called by Icmp for a hard Destination Unreachable (protocol/port)

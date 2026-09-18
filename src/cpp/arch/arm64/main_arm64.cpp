@@ -29,9 +29,6 @@
 #include <fs/rootfs.h>
 #include <hal/power.h>
 
-#include <drivers/virtio_mmio.h>
-#include <drivers/virtio_net.h>
-#include <drivers/virtio_scsi.h>
 
 #include <net/tcp.h>
 
@@ -40,12 +37,29 @@ extern "C" void rust_test();
 extern "C" void rust_fini();
 /* The partition table reader (src/rust/block), the x86 twin's counterpart */
 extern "C" void rust_partitions_probe();
+
+namespace Kernel
+{
+/* Where a virtio-mmio window is, as the Rust drivers take it
+   (virtio::mmio::Slot in src/rust/virtio/src/mmio.rs) */
+struct VirtioMmioSlot
+{
+    ulong Base;    /* kernel VA of the register window */
+    ulong Size;
+    u32 IntId;
+    u32 Reserved;
+};
+}
 /* The virtio-rng driver (src/rust/drivers/virtio_rng), which takes the
    virtio-mmio windows the device tree described -- the arm64 bus. */
 extern "C" void rust_virtio_rng_init_mmio(const Kernel::VirtioMmioSlot* slots, unsigned long count);
 /* The virtio-blk driver (src/rust/drivers/virtio_blk), likewise over the
    windows the device tree described */
 extern "C" void rust_virtio_blk_init_mmio(const Kernel::VirtioMmioSlot* slots, unsigned long count);
+/* The virtio-net driver (src/rust/drivers/virtio_net), likewise */
+extern "C" void rust_virtio_net_init_mmio(const Kernel::VirtioMmioSlot* slots, unsigned long count);
+/* The virtio-scsi driver (src/rust/drivers/virtio_scsi), likewise */
+extern "C" void rust_virtio_scsi_init_mmio(const Kernel::VirtioMmioSlot* slots, unsigned long count);
 namespace Kernel { bool PciEcamSetup(); }
 extern "C" void __cxa_finalize(void*);
 extern "C" char BootStackTop[];
@@ -195,35 +209,32 @@ static void BpStartupArm(void* ctx)
 
     InterruptEnable();
 
-    /* Discover virtio-mmio devices from the DTB slots (all inside the
-       premapped device GiB). Must run on the BSP before the APs start
-       (MapMmioRegion boot-ordering constraint). */
+    /* Hand the virtio-mmio windows the device tree described to the drivers
+       (all inside the premapped device GiB). What is in each one is theirs
+       to read; this only says where they are. Must run on the BSP before the
+       APs start (MapMmioRegion boot-ordering constraint). */
     {
         static VirtioMmioSlot Slots[Board::MaxVirtioMmio];
         ulong count = 0;
         for (ulong i = 0; i < board.VirtioMmioCount; i++)
         {
-            ulong va = Mm::MemoryMap::KernelSpaceBase + board.VirtioMmio[i].Base;
-            u32 devId = VirtioMmio::ReadDeviceId(va);
-            if (devId == 0)
-                continue;
-            Slots[count].Base = va;
+            Slots[count].Base = Mm::MemoryMap::KernelSpaceBase + board.VirtioMmio[i].Base;
             Slots[count].Size = board.VirtioMmio[i].Size;
             Slots[count].IntId = board.VirtioMmio[i].IntId;
-            Slots[count].DeviceId = devId;
+            Slots[count].Reserved = 0;
             count++;
         }
-        Trace(0, "virtio-mmio: %u devices", count);
+        Trace(0, "virtio-mmio: %u windows from the device tree", count);
 
         rust_virtio_blk_init_mmio(Slots, count);
-        VirtioScsi::InitAllMmio(Slots, count);
+        rust_virtio_scsi_init_mmio(Slots, count);
         ulong netFrames = Parameters::GetInstance().GetNetFrameCount();
         if (netFrames == 0)
             netFrames = NetFramePool::DefaultFrameCount;
 
         NetFramePool::GetInstance().Setup(netFrames);
 
-        VirtioNet::InitAllMmio(Slots, count);
+        rust_virtio_net_init_mmio(Slots, count);
         rust_virtio_rng_init_mmio(Slots, count);
 
         /* The virtio-rng carries the pool on this arch: no cpu here that the

@@ -425,7 +425,9 @@ dependencies = [
  "sha2",
  "tls",
  "virtio-blk",
+ "virtio-net",
  "virtio-rng",
+ "virtio-scsi",
 ]
 
 [[package]]
@@ -1074,7 +1076,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "virtio-net"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "virtio",
+]
+
+[[package]]
 name = "virtio-rng"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "virtio",
+]
+
+[[package]]
+name = "virtio-scsi"
 version = "0.1.0"
 dependencies = [
  "kcore",

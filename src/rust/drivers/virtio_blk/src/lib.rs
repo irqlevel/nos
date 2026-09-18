@@ -613,7 +613,7 @@ pub unsafe extern "C" fn rust_virtio_blk_init_mmio(slots: *const Slot, count: us
         if DEVICES.load(Ordering::Relaxed) >= MAX_DEVICES {
             break;
         }
-        if slot.device_id != virtio::device::BLK {
+        if MmioTransport::device_id(slot) != virtio::device::BLK {
             continue;
         }
 
