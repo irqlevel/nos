@@ -147,6 +147,15 @@ impl Nic {
         if handle == 0 { None } else { Some(Self { handle }) }
     }
 
+    /// The device a handle names: what a call arriving from the C++ side
+    /// carries, `kernel_net_find`'s answer passed on.
+    ///
+    /// # Safety
+    /// `handle` is one the kernel's device table gave out, or 0.
+    pub unsafe fn from_handle(handle: usize) -> Option<Self> {
+        if handle == 0 { None } else { Some(Self { handle }) }
+    }
+
     /// Its address, host byte order; 0 until it has one.
     pub fn ip(&self) -> u32 {
         unsafe { net::kernel_net_ip(self.handle) }
@@ -156,6 +165,22 @@ impl Nic {
         let mut mac = [0u8; 6];
         unsafe { net::kernel_net_mac(self.handle, mac.as_mut_ptr()) };
         mac
+    }
+
+    /// What to ask ARP for to reach `dst`: the gateway when `dst` is off the
+    /// subnet, `dst` itself when it is on it. Host byte order both ways.
+    pub fn route_ip(&self, dst: u32) -> u32 {
+        unsafe { net::kernel_net_route_ip(self.handle, dst) }
+    }
+
+    /// A frame the caller built whole -- Ethernet header and all -- copied
+    /// into a frame of the device's and queued. False when it was dropped.
+    ///
+    /// `transmit` is the way to send something built in a frame already;
+    /// this is for a packet assembled on the stack.
+    pub fn send_raw(&self, data: &[u8]) -> bool {
+        !data.is_empty()
+            && unsafe { net::kernel_net_send_raw(self.handle, data.as_ptr(), data.len()) } == 0
     }
 
     /// The device, for the wrappers of other kernel calls that take one

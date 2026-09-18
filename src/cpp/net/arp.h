@@ -1,13 +1,16 @@
 #pragma once
 
 #include <include/types.h>
-#include <net/net_device.h>
-#include <kernel/spin_lock.h>
+#include <net/net.h>
 #include <lib/printer.h>
 
 namespace Kernel
 {
 
+class NetDevice;
+
+/* ARP itself is Rust (src/rust/net/src/arp.rs): the cache, its expiry, the
+   requests and the replies. What is left here is the way in. */
 class ArpTable
 {
 public:
@@ -17,43 +20,27 @@ public:
         return instance;
     }
 
+    /* The cache alone, without asking: false when there is no unexpired
+       entry. Any context. */
     bool Lookup(Net::IpAddress ip, Net::MacAddress& mac);
-    void Insert(Net::IpAddress ip, const Net::MacAddress& mac);
 
-    /* Resolve IP to MAC. Sends ARP request and polls for reply. */
+    /* The cache, or an ARP request and a wait for the answer. Task context:
+       it sleeps a second at a time, up to three times. */
     bool Resolve(NetDevice* dev, Net::IpAddress ip, Net::MacAddress& mac);
 
-    /* Process incoming ARP frame (request or reply). */
+    /* An ARP frame off the wire: a request for us is answered, and either
+       kind teaches the cache. */
     void Process(NetDevice* dev, const u8* frame, ulong len);
 
-    /* Dump ARP cache contents. */
     void Dump(Stdlib::Printer& printer);
 
 private:
-    ArpTable();
-    ~ArpTable();
+    ArpTable() {}
+    ~ArpTable() {}
     ArpTable(const ArpTable& other) = delete;
     ArpTable(ArpTable&& other) = delete;
     ArpTable& operator=(const ArpTable& other) = delete;
     ArpTable& operator=(ArpTable&& other) = delete;
-
-    void SendRequest(NetDevice* dev, Net::IpAddress ip);
-    void SendReply(NetDevice* dev, const u8* reqFrame);
-
-    struct ArpEntry
-    {
-        Net::IpAddress Ip;
-        Net::MacAddress Mac;
-        ulong CreatedMs;
-        bool Valid;
-    };
-
-    /* Entries expire so a host changing its MAC is re-resolved */
-    static const ulong ArpTtlMs = 300000;
-
-    static const ulong CacheSize = 16;
-    ArpEntry Cache[CacheSize];
-    SpinLock Lock;
 };
 
 }

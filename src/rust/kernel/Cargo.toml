@@ -11,6 +11,7 @@ ffi = { path = "../ffi" }
 kcore = { path = "../kcore" }
 block = { path = "../block" }
 fs = { path = "../fs" }
+net = { path = "../net" }
 hello = { path = "../hello" }
 tls = { path = "../tls" }
 nvme = { path = "../drivers/nvme" }

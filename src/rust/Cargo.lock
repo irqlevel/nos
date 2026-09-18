@@ -427,6 +427,7 @@ dependencies = [
  "hello",
  "igb",
  "kcore",
+ "net",
  "nvme",
  "r8125",
  "r8168",
@@ -514,6 +515,14 @@ dependencies = [
  "kcore",
  "kmod",
  "ssh",
+]
+
+[[package]]
+name = "net"
+version = "0.1.0"
+dependencies = [
+ "ffi",
+ "kcore",
 ]
 
 [[package]]
