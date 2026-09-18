@@ -78,7 +78,7 @@ and do no locking of their own; that is the contract in `fs/filesystem.h`.
 
 ## ext2
 
-`fs/ext2.cpp` reads and writes ext2 rev 1 with 1, 2 or 4 KiB blocks:
+`src/rust/fs/src/ext2.rs` reads and writes ext2 rev 1 with 1, 2 or 4 KiB blocks:
 direct, indirect and doubly-indirect blocks (a file can reach 4 GiB at 4 KiB
 blocks; the triple-indirect block is not implemented and a file needing it is
 refused), sparse files, directories of any size. Directories are read from

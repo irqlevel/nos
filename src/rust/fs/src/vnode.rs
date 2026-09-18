@@ -140,3 +140,132 @@ pub unsafe fn is_ancestor(node: *mut VNode, other: *mut VNode) -> bool {
     }
     false
 }
+
+/* ---- making and unmaking vnodes ----
+ *
+ * A filesystem owns the vnodes it makes; the VFS only walks them. They are
+ * taken from the kernel heap without going through `Box`, so that a tree
+ * bigger than the memory for it is a failure to report rather than a panic:
+ * a mounted image says how many there will be, and an image is not to be
+ * trusted with that. */
+
+use core::alloc::Layout;
+
+fn layout() -> Layout {
+    Layout::new::<VNode>()
+}
+
+/// A zeroed vnode with both list links initialised, or null when there is no
+/// memory for one. Everything else is the caller's to fill.
+pub fn alloc() -> *mut VNode {
+    let node = unsafe { alloc::alloc::alloc_zeroed(layout()) } as *mut VNode;
+    if !node.is_null() {
+        unsafe {
+            list_init(core::ptr::addr_of_mut!((*node).children));
+            list_init(core::ptr::addr_of_mut!((*node).sibling));
+        }
+    }
+    node
+}
+
+/// # Safety
+/// `node` came from `alloc`, is off every list, and is not used again.
+pub unsafe fn free(node: *mut VNode) {
+    if !node.is_null() {
+        unsafe { alloc::alloc::dealloc(node as *mut u8, layout()) };
+    }
+}
+
+/// Free a node and everything under it.
+///
+/// # Safety
+/// As for `free`, and nothing below it is held anywhere else.
+pub unsafe fn free_tree(node: *mut VNode) {
+    loop {
+        let child = unsafe { first_child(node) };
+        if child.is_null() {
+            break;
+        }
+        unsafe {
+            unlink(child);
+            free_tree(child);
+        }
+    }
+    unsafe { free(node) };
+}
+
+/// # Safety
+/// `entry` is a list link of a live vnode.
+pub unsafe fn list_init(entry: *mut ListEntry) {
+    unsafe {
+        (*entry).flink = entry;
+        (*entry).blink = entry;
+    }
+}
+
+/// Put `child` at the end of `dir`'s children.
+///
+/// # Safety
+/// Both are live vnodes, `child` is on no list, and nothing else is walking
+/// the list -- which is what holding the VFS lock guarantees.
+pub unsafe fn insert_child(dir: *mut VNode, child: *mut VNode) {
+    unsafe {
+        let head = core::ptr::addr_of_mut!((*dir).children);
+        let entry = core::ptr::addr_of_mut!((*child).sibling);
+        let tail = (*head).blink;
+
+        (*entry).flink = head;
+        (*entry).blink = tail;
+        (*tail).flink = entry;
+        (*head).blink = entry;
+    }
+}
+
+/// Take a node off its parent's children. It keeps its `parent` pointer,
+/// which the caller replaces or drops.
+///
+/// # Safety
+/// As for `insert_child`.
+pub unsafe fn unlink(node: *mut VNode) {
+    unsafe {
+        let entry = core::ptr::addr_of_mut!((*node).sibling);
+        let flink = (*entry).flink;
+        let blink = (*entry).blink;
+        if !flink.is_null() && !blink.is_null() {
+            (*blink).flink = flink;
+            (*flink).blink = blink;
+        }
+        list_init(entry);
+    }
+}
+
+/// The first of a directory's children, or null if it has none.
+///
+/// # Safety
+/// As for `children`.
+pub unsafe fn first_child(dir: *mut VNode) -> *mut VNode {
+    unsafe {
+        let head = core::ptr::addr_of_mut!((*dir).children);
+        let first = (*head).flink;
+        if first.is_null() || first == head {
+            return core::ptr::null_mut();
+        }
+        (first as usize - core::mem::offset_of!(VNode, sibling)) as *mut VNode
+    }
+}
+
+/// Give a node a new name and a new parent -- what a rename leaves behind in
+/// memory once the directories on disk say so.
+///
+/// # Safety
+/// As for `insert_child`.
+pub unsafe fn rename(node: *mut VNode, new_parent: *mut VNode, new_name: &[u8]) {
+    unsafe {
+        unlink(node);
+        (*node).name = [0; NAME_MAX];
+        let len = new_name.len().min(NAME_MAX - 1);
+        (&mut (*node).name)[..len].copy_from_slice(&new_name[..len]);
+        (*node).parent = new_parent;
+        insert_child(new_parent, node);
+    }
+}

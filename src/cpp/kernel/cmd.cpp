@@ -1755,21 +1755,15 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
             return;
         }
 
-        Ext2Fs* fs = new (Mm::NoThrow) Ext2Fs(dev);
-        if (fs == nullptr)
+        int mounted = Ext2Mount(path, dev, readOnly);
+        if (mounted == Ext2NotMounted)
         {
-            con.Printf("failed to allocate ext2\n");
-            return;
-        }
-
-        if (!Vfs::GetInstance().Mount(path, fs, readOnly))
-        {
-            delete fs;
             con.Printf("mount failed\n");
         }
         else
         {
-            con.Printf("mounted ext2 on %s (%s)\n", path, fs->ReadOnly ? "ro" : "rw");
+            con.Printf("mounted ext2 on %s (%s)\n", path,
+                mounted == Ext2MountedRo ? "ro" : "rw");
         }
     }
     else
@@ -1789,16 +1783,10 @@ static void CmdUmount(const char* args, Stdlib::Printer& con)
     }
     char path[Vfs::MaxPath];
     Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
-    FileSystem* fs = Vfs::GetInstance().Unmount(path);
-    if (fs == nullptr)
-    {
-        con.Printf("not mounted\n");
-    }
-    else
-    {
-        delete fs;
+    if (Vfs::GetInstance().Unmount(path))
         con.Printf("unmounted %s\n", path);
-    }
+    else
+        con.Printf("not mounted\n");
 }
 
 static void CmdMounts(const char* args, Stdlib::Printer& con)

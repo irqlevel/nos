@@ -35,7 +35,7 @@ struct RustFsOps
 };
 
 int kernel_vfs_mount(const char* path, unsigned long len, const RustFsOps* ops, int readOnly);
-void* kernel_vfs_unmount(const char* path, unsigned long len);
+int kernel_vfs_unmount(const char* path, unsigned long len);
 void kernel_vfs_unmount_all();
 unsigned long kernel_vfs_mount_count();
 int kernel_vfs_mount_at(unsigned long index, char* path, unsigned long pathLen,
@@ -211,12 +211,12 @@ bool Vfs::Mount(const char* path, FileSystem* fs, bool readOnly)
     return kernel_vfs_mount(path, Stdlib::StrLen(path), &ops, readOnly ? 1 : 0) == 0;
 }
 
-FileSystem* Vfs::Unmount(const char* path)
+bool Vfs::Unmount(const char* path)
 {
     if (path == nullptr)
-        return nullptr;
+        return false;
 
-    return static_cast<FileSystem*>(kernel_vfs_unmount(path, Stdlib::StrLen(path)));
+    return kernel_vfs_unmount(path, Stdlib::StrLen(path)) == 0;
 }
 
 File* Vfs::Open(const char* path, ulong flags)
