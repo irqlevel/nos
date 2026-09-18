@@ -1,4 +1,5 @@
 #include "trace.h"
+#include "input.h"
 #include "panic.h"
 #include "time.h"
 #include "mutex.h"
@@ -1675,6 +1676,14 @@ int kernel_interrupts_enabled()
 int kernel_panic_active()
 {
     return Kernel::Panicker::GetInstance().IsActive() ? 1 : 0;
+}
+
+/* One decoded keystroke from a driver in Rust -- the USB keyboard -- to
+   every observer: the shell, and whatever else is listening. `code` is the
+   PS/2 set-1 make code, which is what consumers key off. */
+void kernel_input_key(char c, unsigned char code)
+{
+    Kernel::KeyboardInput::GetInstance().Emit(c, code);
 }
 
 /* dhcp=off: the shell's `dhcp` says so rather than running one. */

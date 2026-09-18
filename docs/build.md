@@ -88,7 +88,7 @@ adapts to whichever firmware it woke up under.
 |---|---|---|
 | GRUB platform | `i386-pc` El Torito image + MBR boot code | ESP with `bootx64.efi` |
 | Console | EGA text at `0xB8000` (`drivers/vga.cpp`) | GOP pixel framebuffer, 8x16 font (`drivers/fb_console.cpp`) |
-| Keyboard | 8042 PS/2 | USB HID over xHCI (`drivers/usb/`); real UEFI laptops often have no 8042 at all |
+| Keyboard | 8042 PS/2 | USB HID over xHCI (`src/rust/drivers/usb`); real UEFI laptops often have no 8042 at all |
 
 The multiboot2 header asks GRUB for a framebuffer but marks both the console and
 framebuffer tags optional, so BIOS boots keep legacy text mode while UEFI boots

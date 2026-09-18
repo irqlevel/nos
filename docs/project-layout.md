@@ -13,7 +13,6 @@ src/cpp/
     arm64/    Linux-Image boot + PSCI SMP (boot.S), EL1 vectors, GICv3 + ITS (LPIs for PCIe MSI), generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, HAL backends
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, the random pool, Rust FFI bridge, symbol table
   drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI (every virtio device and the bus itself are Rust now, src/rust/virtio)
-    usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
 
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
   lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, ChaCha20, stdlib
@@ -23,6 +22,7 @@ src/rust/
   kcore/      Safe Rust wrappers: sync, DMA, MMIO, MSI-X, interrupts, timers, tasks, PCI, block/net device
   drivers/
     nvme/     NVMe block device driver (PCI, MSI-X, admin/IO queues)
+    usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + the HID boot-protocol keyboard on it
     r8168/    Realtek r8168 network device driver
     r8125/    Realtek RTL8125 2.5GbE network device driver
     igb/      Intel I210 (igb) gigabit network device driver
