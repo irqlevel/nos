@@ -38,6 +38,10 @@ extern "C" {
     /// Host byte order; 0 until the device has an address.
     pub fn kernel_net_ip(dev: usize) -> u32;
     pub fn kernel_net_mac(dev: usize, mac: *mut u8);
+    /// The addresses a lease gives the device; host byte order.
+    pub fn kernel_net_set_ip(dev: usize, ip: u32);
+    pub fn kernel_net_set_mask(dev: usize, mask: u32);
+    pub fn kernel_net_set_gw(dev: usize, gw: u32);
     /// What to ARP for to reach `dst`: the gateway off-subnet, `dst` on it.
     /// Host byte order both ways.
     pub fn kernel_net_route_ip(dev: usize, dst: u32) -> u32;

@@ -15,6 +15,8 @@ extern "C" {
     pub fn kernel_task_wait(handle: usize);
     pub fn kernel_task_set_stopping(handle: usize);
     pub fn kernel_task_put(handle: usize);
+    /// Whether the calling task has been asked to stop.
+    pub fn kernel_task_stopping() -> i32;
     pub fn kernel_sleep_ns(ns: u64);
     pub fn kernel_task_yield_to_runnable();
     /// The calling task, as a handle from the spawn calls names it.
