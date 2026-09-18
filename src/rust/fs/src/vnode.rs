@@ -1,15 +1,14 @@
-//! The vnode: a name, a type and a place in a tree, and the one piece of the
-//! filesystem layer both languages still share.
+//! The vnode: a name, a type and a place in a tree.
 //!
 //! A filesystem makes vnodes and owns them; the VFS walks them and never
-//! allocates one. While a filesystem is still written in C++ its `VNode`
-//! (fs/vnode.h) is the same struct as this one, laid out the same way -- the
-//! static assertions on both sides are what keeps that true -- so the two
-//! can pass nodes to each other with nothing in between.
+//! allocates one. Nothing outside this crate sees one any more -- C++ knows
+//! only what `Stat` and `ReadDir` answer with -- so the layout below is the
+//! only one there is.
 
 use core::ffi::c_int;
 
-/// What a name fits in, NUL included (VNode::Name).
+/// What a name fits in, NUL included. The C++ side states the same number
+/// as `VNode::NameMax`, for the length `Vfs::MaxName` promises.
 pub const NAME_MAX: usize = 64;
 
 pub const TYPE_DIR: c_int = 0;
@@ -48,9 +47,9 @@ pub struct VNode {
     pub open_count: usize,
 }
 
-/* The C++ side asserts the same number (fs/vnode.h). A vnode crosses between
- * them by pointer, so a disagreement here would not be a compile error
- * anywhere -- it would be a filesystem reading fields at the wrong offsets. */
+/* The size is not a contract with anything any more; it is here because a
+ * vnode is allocated and freed by its layout (see `alloc`), and a field
+ * added by accident is worth noticing. */
 const _: () = assert!(core::mem::size_of::<VNode>() == 160);
 
 impl VNode {
@@ -267,5 +266,17 @@ pub unsafe fn rename(node: *mut VNode, new_parent: *mut VNode, new_name: &[u8]) 
         (&mut (*node).name)[..len].copy_from_slice(&new_name[..len]);
         (*node).parent = new_parent;
         insert_child(new_parent, node);
+    }
+}
+
+/// Whether a node is on no parent's list: its link points at itself, which
+/// is what `alloc` leaves it as and `unlink` puts it back to.
+///
+/// # Safety
+/// `node` is a live vnode.
+pub unsafe fn is_unlinked(node: *mut VNode) -> bool {
+    unsafe {
+        let entry = core::ptr::addr_of_mut!((*node).sibling);
+        (*entry).flink == entry
     }
 }

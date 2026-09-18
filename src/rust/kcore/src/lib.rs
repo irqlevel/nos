@@ -4,6 +4,7 @@ extern crate alloc;
 
 pub mod barrier;
 pub mod consts;
+pub mod crc32;
 pub mod error;
 pub mod trace;
 pub mod time;

@@ -1,17 +1,21 @@
 //! The filesystem layer: the VFS every read and write in the kernel goes
-//! through, and the C ABI the rest of the kernel calls it by.
+//! through, the filesystems under it, and the C ABI the rest of the kernel
+//! calls them by.
 //!
-//! The filesystems below it are moving over one at a time; while one is
-//! still written in C++ it is wrapped in an [`FsOps`] by the shim in
-//! fs/vfs.cpp, and the vnodes the two pass each other are the same struct on
-//! both sides (see `vnode`).
+//! [`vfs`] is the mount table, path resolution and the open handles; under
+//! it [`ext2`] (the root filesystem), [`nanofs`], [`ramfs`] and [`procfs`],
+//! each giving the VFS an [`FsOps`] and seeing one call at a time under its
+//! lock. [`rootfs`] is what the kernel command line asks to be mounted at
+//! boot. C++ calls in through fs/vfs.cpp and never sees a vnode.
 
 #![no_std]
 
 extern crate alloc;
 
 pub mod ext2;
+pub mod nanofs;
 pub mod procfs;
+pub mod rootfs;
 pub mod ramfs;
 pub mod vfs;
 pub mod vnode;

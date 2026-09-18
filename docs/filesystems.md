@@ -133,7 +133,7 @@ kept in memory so a sequential pass does not re-read them per data block.
 
 ## nanofs, ramfs, procfs
 
-nanofs (`fs/nanofs.cpp`) is the kernel's own small checksummed filesystem:
+nanofs (`src/rust/fs/src/nanofs.rs`) is the kernel's own small checksummed filesystem:
 1024 inodes, 64 MiB of data, files up to 1 MiB, every write copy-on-write
 with the inode committed last. It predates ext2 write support and remains
 for what it is good at — a small, self-verifying store (`format nanofs`,

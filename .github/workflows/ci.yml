@@ -56,3 +56,9 @@ jobs:
       - name: ext2 write test (e2fsck, TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/ext2-test.py --tcg
+
+      # nanofs is the one filesystem no smoke boot mounts, so without this
+      # nothing here would notice it breaking.
+      - name: nanofs test (TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/nanofs-test.py --tcg

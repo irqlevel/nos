@@ -29,3 +29,20 @@ extern "C" {
     /// counted; -1 past the end.
     pub fn kernel_interrupt_source(index: usize, name: *mut u8, name_len: usize) -> isize;
 }
+
+/* What the root filesystem is to be, off the kernel command line, and the
+   self-test that runs on it. */
+extern "C" {
+    /// The root mode (0 none, 1 auto, 2 device, 3 label, 4 uuid), with the
+    /// device name or label into `value` and the parsed UUID into `uuid`.
+    pub fn kernel_root_spec(
+        value: *mut u8, value_len: usize, uuid: *mut u8, uuid_len: usize,
+    ) -> i32;
+    /// `ro`: the root is to be mounted read-only.
+    pub fn kernel_root_read_only() -> i32;
+    /// `fstest=on`: run the self-test on / once it is mounted.
+    pub fn kernel_root_fstest() -> i32;
+    /// The filesystem self-test in `dir`, with a file of `size` bytes:
+    /// 0 passed, -1 failed. `dir` is NUL-terminated.
+    pub fn kernel_fs_selftest(dir: *const u8, size: usize) -> i32;
+}
