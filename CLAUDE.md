@@ -78,6 +78,15 @@ prepares itself and then reads that area back with `scripts/disklog.py` —
 the boot's first fifty traced lines compared with the serial console's, line
 for line. Nothing else in the suite gives `disklog=on`, and without it no
 disk is so much as read.
+`./scripts/usb-test.py` (x86-64) boots with an emulated xHCI controller, two
+keyboards — one on a root port, one behind a hub — and a device that is
+neither, then **types at the kernel through QEMU's monitor** and reads the
+shell's answer off the serial console. No smoke boot attaches a USB
+controller at all, and on the Dell laptop the xHCI keyboard is the only way
+in, so run it after touching `drivers/usb/`. It is built to catch the one
+failure that looks like success: a driver that enumerates perfectly and
+delivers no report leaves every boot-log check passing and fails on "a
+command typed on the usb keyboard reaches the shell".
 
 Run in QEMU (serial console is logged to `nos.log`):
 
