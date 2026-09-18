@@ -598,23 +598,6 @@ impl Drop for NetFrame {
     }
 }
 
-/// What the recycled frame pool has been doing: allocations it could not
-/// serve, and frames a driver is holding.
-pub fn frame_pool_stats() -> (usize, usize) {
-    let (mut misses, mut in_flight) = (0, 0);
-    unsafe { net::kernel_netframe_pool_stats(&mut misses, &mut in_flight) };
-    (misses, in_flight)
-}
-
-/// Receive polls, polls that found work, and polls that found work with no
-/// interrupt-driven pass since the last one -- the third being the evidence
-/// of a lost wakeup.
-pub fn rx_poll_stats() -> (usize, usize, usize) {
-    let (mut polls, mut work, mut stalls) = (0, 0, 0);
-    unsafe { net::kernel_net_rx_poll_stats(&mut polls, &mut work, &mut stalls) };
-    (polls, work, stalls)
-}
-
 /// `dhcp=off`: the kernel was told not to run a DHCP client.
 pub fn dhcp_off() -> bool {
     unsafe { net::kernel_param_dhcp_off() != 0 }

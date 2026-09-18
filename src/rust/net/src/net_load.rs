@@ -335,8 +335,9 @@ impl NetLoad {
              * the machine is alive and the receive path is what died; if they
              * stop with it, the kernel itself is wedged. Nothing else here
              * can tell those apart. */
-            let (misses, in_flight) = kcore::net::frame_pool_stats();
-            let (polls, work, stalls) = kcore::net::rx_poll_stats();
+            let (misses, in_flight) =
+                (crate::frame::POOL.alloc_misses(), crate::frame::POOL.in_flight());
+            let (polls, work, stalls) = crate::device::DEVICES.poll_counts();
             trace!(0, "netload: rx {} (+{}), tx {}, failed {}, pool misses {}, in flight {}, rx polls {}, poll work {}, stalls {}",
                 rx, self.rx_pps.load(Ordering::Relaxed), tx, failed,
                 misses, in_flight, polls, work, stalls);
