@@ -115,7 +115,6 @@ CXX_SRC_x86_64 =   \
     src/cpp/fs/ext2.cpp \
     src/cpp/fs/procfs.cpp \
     src/cpp/fs/rootfs.cpp \
-    src/cpp/fs/fstest.cpp \
     src/cpp/kernel/mutex.cpp \
     src/cpp/kernel/wait_group.cpp \
     src/cpp/kernel/event.cpp \
@@ -233,7 +232,6 @@ CXX_SRC_aarch64 = \
     src/cpp/fs/ext2.cpp \
     src/cpp/fs/procfs.cpp \
     src/cpp/fs/rootfs.cpp \
-    src/cpp/fs/fstest.cpp \
     src/cpp/lib/stdlib.cpp \
     src/cpp/lib/format.cpp \
     src/cpp/lib/error.cpp \

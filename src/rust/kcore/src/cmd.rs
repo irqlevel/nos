@@ -15,8 +15,16 @@ pub struct Output {
 
 impl core::fmt::Write for Output {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        unsafe { cmd::kernel_printer_write(self.printer, s.as_ptr(), s.len()) };
+        self.write_bytes(s.as_bytes());
         Ok(())
+    }
+}
+
+impl Output {
+    /// Bytes as they are, for output that is not text -- a file `cat` prints,
+    /// which is whatever was written to it.
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        unsafe { cmd::kernel_printer_write(self.printer, bytes.as_ptr(), bytes.len()) };
     }
 }
 

@@ -13,10 +13,14 @@
 extern crate alloc;
 
 pub mod ext2;
+pub mod files;
 pub mod nanofs;
+pub mod paths;
 pub mod procfs;
 pub mod rootfs;
 pub mod ramfs;
+pub mod selftest;
+pub mod shell;
 pub mod vfs;
 pub mod vnode;
 
@@ -27,9 +31,11 @@ use vfs::{DirEntry, File, FileStat, FsOps, Vfs};
 
 static VFS: AtomicPtr<Vfs> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Nothing to set up: the layer is called from C++ by the names below, and
-/// this is what keeps them in the archive.
-pub fn init() {}
+/// Put the layer's commands in front of whoever runs one. Called from
+/// `rust_init`, before the shell starts.
+pub fn init() {
+    shell::register_all();
+}
 
 /// The one VFS, made on first use. That is early in boot, in task context,
 /// where its mutex can be allocated; two callers racing here both get the

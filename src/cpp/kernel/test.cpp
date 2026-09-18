@@ -17,7 +17,6 @@
 #include <hal/cpu.h>
 #include <fs/vfs.h>
 #include <fs/ramfs.h>
-#include <fs/fstest.h>
 
 #include <lib/btree.h>
 #include <lib/error.h>
@@ -1974,8 +1973,11 @@ Stdlib::Error TestSnPrintf()
     return MakeSuccess();
 }
 
-/* The Vfs and ramfs through the file API: everything FsSelfTest does, on
-   a ramfs mounted on / for the duration and taken down after */
+/* The filesystem self-test (src/rust/fs/src/selftest.rs) on a ramfs mounted
+   on / for the duration and taken down after: the whole file API, over a
+   filesystem that needs no disk. */
+extern "C" int kernel_fs_selftest(const char* dir, unsigned long dirLen, unsigned long size);
+
 Stdlib::Error TestVfs()
 {
     static const ulong BigSize = 100 * 1024;
@@ -1987,7 +1989,7 @@ Stdlib::Error TestVfs()
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    bool ok = FsSelfTest("/", BigSize, nullptr);
+    bool ok = kernel_fs_selftest("/", 1, BigSize) == 0;
 
     if (!vfs.Unmount("/"))
     {

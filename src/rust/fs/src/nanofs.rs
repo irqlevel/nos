@@ -1489,13 +1489,26 @@ fn ops_for(fs: *mut NanoFs) -> FsOps {
 pub unsafe extern "C" fn rust_nanofs_mount(
     path: *const u8, path_len: usize, device: usize, read_only: i32,
 ) -> i32 {
+    match unsafe { crate::path(path, path_len) } {
+        Some(at) => mount_bytes(at, device, read_only != 0),
+        None => -1,
+    }
+}
+
+/// Mount the device's nanofs at `path`: 0 mounted for writing, 1 read-only,
+/// -1 not mounted.
+pub fn mount_at(path: &str, device: usize, read_only: bool) -> i32 {
+    mount_bytes(path.as_bytes(), device, read_only)
+}
+
+fn mount_bytes(at: &[u8], device: usize, read_only: bool) -> i32 {
     let dev = match Disk::from_handle(device) {
         Some(dev) => dev,
         None => return -1,
     };
-    let (vfs, at) = match (crate::vfs_instance(), unsafe { crate::path(path, path_len) }) {
-        (Some(vfs), Some(at)) => (vfs, at),
-        _ => return -1,
+    let vfs = match crate::vfs_instance() {
+        Some(vfs) => vfs,
+        None => return -1,
     };
 
     let fs = match NanoFs::new(dev) {
@@ -1507,18 +1520,23 @@ pub unsafe extern "C" fn rust_nanofs_mount(
     };
 
     let ops = ops_for(fs);
-    if !vfs.mount(at, &ops, read_only != 0) {
+    if !vfs.mount(at, &ops, read_only) {
         drop(unsafe { Box::from_raw(fs) });
         return -1;
     }
-    if read_only != 0 { 1 } else { 0 }
+    if read_only { 1 } else { 0 }
 }
 
 /// Write a fresh nanofs onto the device: 0 done, -1 not.
 #[no_mangle]
 pub extern "C" fn rust_nanofs_format(device: usize) -> i32 {
+    if format_device(device) { 0 } else { -1 }
+}
+
+/// The same, as the shell's `format` calls it.
+pub fn format_device(device: usize) -> bool {
     match Disk::from_handle(device) {
-        Some(dev) if format(&dev) => 0,
-        _ => -1,
+        Some(dev) => format(&dev),
+        None => false,
     }
 }

@@ -194,7 +194,7 @@ pub extern "C" fn rust_mount_root_fs() {
     mount_procfs();
 
     if procinfo::root_fstest() {
-        if procinfo::fs_selftest(b"/\0", FSTEST_SIZE) {
+        if crate::selftest::run("/", FSTEST_SIZE, None) {
             trace!(0, "fstest: passed");
         } else {
             trace!(0, "fstest: FAILED");
