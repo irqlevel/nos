@@ -100,7 +100,7 @@ pub fn net(_args: &str, out: &mut Output) {
 
 pub fn netpool(_args: &str, out: &mut Output) {
     let st = POOL.stats();
-    if st.ready == 0 {
+    if !st.ready {
         let _ = writeln!(out, "netpool: not set up");
         return;
     }

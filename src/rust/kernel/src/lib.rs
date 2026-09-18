@@ -23,9 +23,6 @@ fn alloc_error(_layout: core::alloc::Layout) -> ! {
 #[no_mangle]
 pub extern "C" fn rust_init() {
     hello::hello();
-    /* Nothing to set up -- the TLS client is called from C++ through its
-       own symbols, and this is what keeps them in the archive. */
-    tls::init();
     /* The partition table reader: its own entry point is called from the
        boot path, and this puts its shell command in front of whoever runs
        one. */

@@ -257,28 +257,22 @@ fn ops_for(fs: *mut ProcFs) -> FsOps {
     }
 }
 
-/* ---- what the kernel calls ---- */
-
-/// Mount procfs at `path`: 0 mounted, -1 not.
-///
-/// # Safety
-/// `path` points at `path_len` readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn rust_procfs_mount(path: *const u8, path_len: usize) -> i32 {
-    let (vfs, at) = match (crate::vfs_instance(), unsafe { crate::path(path, path_len) }) {
-        (Some(vfs), Some(at)) => (vfs, at),
-        _ => return -1,
+/// Mount procfs at `path`. Read-only: there is nothing in it to write.
+pub fn mount_at(path: &str) -> bool {
+    let vfs = match crate::vfs_instance() {
+        Some(vfs) => vfs,
+        None => return false,
     };
 
     let fs = match ProcFs::new() {
         Some(fs) => Box::into_raw(fs),
-        None => return -1,
+        None => return false,
     };
 
     let ops = ops_for(fs);
-    if !vfs.mount(at, &ops, true) {
+    if !vfs.mount(path.as_bytes(), &ops, true) {
         drop(unsafe { Box::from_raw(fs) });
-        return -1;
+        return false;
     }
-    0
+    true
 }

@@ -432,7 +432,6 @@ dependencies = [
  "r8125",
  "r8168",
  "sha2",
- "tls",
  "usb",
  "virtio-blk",
  "virtio-net",
@@ -524,6 +523,7 @@ version = "0.1.0"
 dependencies = [
  "ffi",
  "kcore",
+ "tls",
 ]
 
 [[package]]

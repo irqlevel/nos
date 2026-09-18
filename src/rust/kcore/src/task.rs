@@ -120,6 +120,34 @@ pub fn yield_to_runnable() {
     unsafe { task::kernel_task_yield_to_runnable() }
 }
 
+/// Spawn a task that runs `entry` over something that lives for good -- a
+/// service's one instance, a `static`. This is what almost every task in the
+/// kernel is, and it needs no raw pointer at the call site: that `target`
+/// outlives the task is what `'static` says, and that the task may share it
+/// is what `Sync` says.
+pub fn spawn_for<T: Sync + 'static>(
+    name: &str, target: &'static T, entry: fn(&'static T),
+) -> Option<TaskHandle> {
+    struct Start<T: 'static> {
+        target: &'static T,
+        entry: fn(&'static T),
+    }
+
+    extern "C" fn trampoline<T: Sync + 'static>(ctx: *mut u8) {
+        /* Made below, by this function's own caller, and handed over once. */
+        let start = unsafe { Box::from_raw(ctx.cast::<Start<T>>()) };
+        (start.entry)(start.target);
+    }
+
+    let ctx = Box::into_raw(Box::new(Start { target, entry })).cast::<u8>();
+    let h = unsafe { task::kernel_task_spawn(name.as_ptr(), name.len(), trampoline::<T>, ctx) };
+    if h == 0 {
+        unsafe { drop(Box::from_raw(ctx.cast::<Start<T>>())) };
+        return None;
+    }
+    Some(TaskHandle { handle: h })
+}
+
 /// Spawn a task that receives a raw context pointer.
 /// The caller is responsible for the lifetime and safety of `ctx`.
 pub fn spawn_with_ctx(

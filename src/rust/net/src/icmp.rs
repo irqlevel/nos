@@ -31,12 +31,13 @@ struct Reply {
     id: u16,
     seq: u16,
     at_ns: u64,
+    /// When the request this would answer went out
+    sent_ns: u64,
 }
 
 pub struct Icmp {
-    lock: SpinLock,
-    reply: core::cell::UnsafeCell<Reply>,
-    sent_ns: core::cell::UnsafeCell<u64>,
+    /// The one echo exchange in flight: what was sent, and what came back
+    reply: SpinLock<Reply>,
 
     echo_req_rx: AtomicU64,
     echo_reply_tx: AtomicU64,
@@ -48,12 +49,7 @@ pub struct Icmp {
     rx_bad_csum: AtomicU64,
 }
 
-/* The reply slot is touched with the lock held */
-unsafe impl Sync for Icmp {}
-unsafe impl Send for Icmp {}
-
-/// What `icmp` reports, in the order the shell prints it.
-#[repr(C)]
+/// What `icmpstat` reports, in the order the shell prints it.
 pub struct Stats {
     pub echo_req_rx: u64,
     pub echo_req_tx: u64,
@@ -68,10 +64,8 @@ pub struct Stats {
 impl Icmp {
     pub fn new() -> Option<Icmp> {
         Some(Icmp {
-            lock: SpinLock::new()?,
-            reply: core::cell::UnsafeCell::new(
-                Reply { valid: false, id: 0, seq: 0, at_ns: 0 }),
-            sent_ns: core::cell::UnsafeCell::new(0),
+            reply: SpinLock::new(
+                Reply { valid: false, id: 0, seq: 0, at_ns: 0, sent_ns: 0 })?,
             echo_req_rx: AtomicU64::new(0),
             echo_reply_tx: AtomicU64::new(0),
             echo_reply_tx_fail: AtomicU64::new(0),
@@ -118,14 +112,11 @@ impl Icmp {
             (icmp::ECHO_REQUEST, 0) => self.answer_echo(nic, frame, packet, msg),
             (icmp::ECHO_REPLY, 0) => {
                 self.echo_reply_rx.fetch_add(1, Ordering::Relaxed);
-                let _guard = self.lock.lock();
-                let reply = unsafe { &mut *self.reply.get() };
-                *reply = Reply {
-                    valid: true,
-                    id: icmp::id(msg),
-                    seq: icmp::seq(msg),
-                    at_ns: time::boot_time_ns(),
-                };
+                let mut reply = self.reply.lock();
+                reply.valid = true;
+                reply.id = icmp::id(msg);
+                reply.seq = icmp::seq(msg);
+                reply.at_ns = time::boot_time_ns();
             }
             (icmp::DEST_UNREACH, code) => {
                 self.rx_other.fetch_add(1, Ordering::Relaxed);
@@ -228,11 +219,9 @@ impl Icmp {
         icmp::write(&mut frame[at..], icmp::ECHO_REQUEST, 0, id, seq, msg_len);
 
         {
-            let _guard = self.lock.lock();
-            unsafe {
-                (*self.reply.get()).valid = false;
-                *self.sent_ns.get() = time::boot_time_ns();
-            }
+            let mut reply = self.reply.lock();
+            reply.valid = false;
+            reply.sent_ns = time::boot_time_ns();
         }
 
         let ok = nic.send_raw(&frame[..frame_len]);
@@ -249,12 +238,10 @@ impl Icmp {
 
         while time::boot_time_ns() < deadline {
             {
-                let _guard = self.lock.lock();
-                let reply = unsafe { &mut *self.reply.get() };
+                let mut reply = self.reply.lock();
                 if reply.valid && reply.id == id && reply.seq == seq {
-                    let sent = unsafe { *self.sent_ns.get() };
                     reply.valid = false;
-                    return Some(reply.at_ns.saturating_sub(sent));
+                    return Some(reply.at_ns.saturating_sub(reply.sent_ns));
                 }
             }
             kcore::task::sleep_ms(10);

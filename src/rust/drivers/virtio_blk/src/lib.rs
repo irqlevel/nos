@@ -62,8 +62,7 @@ const NO_SLOT: u8 = 0xFF;
 static DEVICES: AtomicUsize = AtomicUsize::new(0);
 
 /// Nothing to set up: the driver is called from the boot path by the names
-/// below, and this is what keeps them in the archive (as `tls::init` does
-/// for the TLS client).
+/// below, and this is what keeps them in the archive.
 pub fn init() {}
 
 struct Blk {
@@ -94,7 +93,7 @@ struct Blk {
 
     /// The queue and what is on it. Taken with interrupts off: the
     /// completion path runs in interrupt context.
-    lock: SpinLock,
+    lock: SpinLock<()>,
     inner: UnsafeCell<Inner>,
 
     /// Kept so the registration outlives the device
@@ -421,7 +420,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         }
     };
 
-    let lock = match SpinLock::new() {
+    let lock = match SpinLock::new(()) {
         Some(lock) => lock,
         None => {
             virtio::failed(transport.as_ref());

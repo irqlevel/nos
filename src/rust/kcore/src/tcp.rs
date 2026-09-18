@@ -26,16 +26,20 @@ fn recv(conn: *mut c_void, buf: &mut [u8], timeout_ms: u64) -> isize {
     unsafe { tcp::kernel_tcp_recv(conn, buf.as_mut_ptr(), buf.len(), timeout_ms) }
 }
 
-/* A TCP connection opened and owned by the C++ side. The handle is passed
-   in, used, and never closed here: whoever opened it closes it. */
+/* A TCP connection somebody else opened and owns. The handle is passed in,
+   used, and never closed here: whoever opened it closes it. */
 pub struct TcpSocket {
     conn: *mut c_void,
 }
 
+/* One task uses it at a time; the kernel's calls take their own locks */
+unsafe impl Send for TcpSocket {}
+
 impl TcpSocket {
-    /// # Safety
-    /// `conn` must be a live `Kernel::TcpConn*` that outlives this socket.
-    pub unsafe fn from_raw(conn: *mut c_void) -> Self {
+    /// The connection a handle names. Any word will do: the network layer
+    /// looks up every handle it is given, and one that names no connection
+    /// of its pool sends nothing and receives an error.
+    pub fn from_raw(conn: *mut c_void) -> Self {
         Self { conn }
     }
 

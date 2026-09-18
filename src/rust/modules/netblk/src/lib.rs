@@ -156,7 +156,7 @@ impl kmod::Module for NetBlk {}
 
 fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
     let registry = Arc::new(Registry {
-        lock: Mutex::new().ok_or(Error::NoMemory)?,
+        lock: Mutex::new(()).ok_or(Error::NoMemory)?,
         instances: UnsafeCell::new(Vec::new()),
     });
 
@@ -177,7 +177,7 @@ kmod::module!(name: "netblk", init: init);
 /* The running instances, for the command's calls -- which may come from the
    console and the UDP shell at once -- to share */
 struct Registry {
-    lock: Mutex,
+    lock: Mutex<()>,
     instances: UnsafeCell<Vec<Instance>>,
 }
 

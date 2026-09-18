@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod barrier;
+pub mod const_init;
 pub mod consts;
 pub mod crc32;
 pub mod error;
@@ -16,7 +17,9 @@ pub mod dma;
 pub mod entropy;
 pub mod procinfo;
 pub mod random;
+pub mod once;
 pub mod pci;
+pub mod percpu;
 pub mod msix;
 pub mod input;
 pub mod interrupt;

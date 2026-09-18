@@ -66,9 +66,7 @@ fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
     let mut id = ext2::Identity { uuid: [0; 16], label: [0; 17] };
 
     if ext2::probe(dev, &mut id) {
-        let mounted = unsafe {
-            ext2::rust_ext2_mount(b"/".as_ptr(), 1, dev.handle(), read_only as i32)
-        };
+        let mounted = ext2::mount_at("/", dev.handle(), read_only);
         if mounted >= 0 {
             trace!(0, "MountRootFs: mounted ext2 on / from {} ({})",
                 dev.name(&mut name).unwrap_or("?"),
@@ -80,9 +78,7 @@ fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
         return false;
     }
 
-    let mounted = unsafe {
-        nanofs::rust_nanofs_mount(b"/".as_ptr(), 1, dev.handle(), read_only as i32)
-    };
+    let mounted = nanofs::mount_at("/", dev.handle(), read_only);
     if mounted >= 0 {
         trace!(0, "MountRootFs: mounted nanofs on / from {} ({})",
             dev.name(&mut name).unwrap_or("?"),
@@ -121,7 +117,7 @@ fn mount_fallback_layout() {
         if !ext2::probe(&dev, &mut id) {
             continue;
         }
-        if unsafe { ext2::rust_ext2_mount(b"/boot".as_ptr(), 5, dev.handle(), 1) } >= 0 {
+        if ext2::mount_at("/boot", dev.handle(), true) >= 0 {
             trace!(0, "MountRootFs: mounted ext2 on /boot from {} (ro)",
                 dev.name(&mut name).unwrap_or("?"));
             break;
@@ -139,7 +135,7 @@ fn mount_fallback_layout() {
         if ext2::probe(&dev, &mut id) {
             continue;
         }
-        if unsafe { nanofs::rust_nanofs_mount(b"/data".as_ptr(), 5, dev.handle(), 0) } >= 0 {
+        if nanofs::mount_at("/data", dev.handle(), false) >= 0 {
             trace!(0, "MountRootFs: mounted nanofs on /data from {} (rw)",
                 dev.name(&mut name).unwrap_or("?"));
             break;
@@ -159,7 +155,7 @@ fn mount_procfs() {
         return;
     }
 
-    if unsafe { procfs::rust_procfs_mount(b"/proc".as_ptr(), 5) } == 0 {
+    if procfs::mount_at("/proc") {
         trace!(0, "MountRootFs: mounted procfs on /proc (ro)");
     }
 }

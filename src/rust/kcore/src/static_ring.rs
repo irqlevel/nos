@@ -18,7 +18,10 @@
 //! whole `pos & mask`, so what is left is `pos & !mask` -- the round -- and
 //! the two comparisons below are against that instead.
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::const_init::ConstInit;
 
 pub struct Cell {
     /// The cell's sequence number less its index; zero when never used.
@@ -39,9 +42,8 @@ pub struct StaticRing<const N: usize> {
     dequeue_pos: AtomicUsize,
 }
 
-/* Built to be used from every CPU at once, which is the whole point. */
-unsafe impl<const N: usize> Send for StaticRing<N> {}
-unsafe impl<const N: usize> Sync for StaticRing<N> {}
+/* Atomics and nothing else: shared between CPUs by construction, which is
+ * the whole point. */
 
 impl<const N: usize> StaticRing<N> {
     pub const fn new() -> Self {
@@ -126,5 +128,103 @@ impl<const N: usize> StaticRing<N> {
         let enqueued = self.enqueue_pos.load(Ordering::Relaxed);
         let dequeued = self.dequeue_pos.load(Ordering::Relaxed);
         enqueued.wrapping_sub(dequeued).min(N)
+    }
+}
+
+/// Messages of a fixed shape, passed from whoever has something to say to
+/// whoever writes it down, through `N` slots that are never allocated: a
+/// `static`, usable from the first line of the boot and from any context --
+/// an interrupt handler, code under a spinlock, the panic path.
+///
+/// A message is written in place and read in place. Between the two its slot
+/// is a number on a ring, and a ring gives a number to one taker: that is
+/// the whole of why nobody else is ever looking at a slot being written or
+/// read, and why there is no lock.
+pub struct Mailbox<T, const N: usize> {
+    slots: [UnsafeCell<T>; N],
+    /// Slots never yet handed out. A slot is taken from here the first time
+    /// and from `free` after, which is what saves the free ring an
+    /// initialiser to run.
+    fresh: AtomicUsize,
+    /// Slots the reader is done with
+    free: StaticRing<N>,
+    /// Slots holding a message, in the order they were sent
+    ready: StaticRing<N>,
+}
+
+/* A slot is reached only by whoever holds its number, and the rings hand a
+ * number to one holder at a time -- so a `T` moves between CPUs, and is never
+ * on two. */
+unsafe impl<T: Send, const N: usize> Sync for Mailbox<T, N> {}
+
+impl<T: ConstInit, const N: usize> Mailbox<T, N> {
+    pub const fn new() -> Self {
+        Self {
+            slots: [const { UnsafeCell::new(T::INIT) }; N],
+            fresh: AtomicUsize::new(0),
+            free: StaticRing::new(),
+            ready: StaticRing::new(),
+        }
+    }
+}
+
+impl<T, const N: usize> Mailbox<T, N> {
+    fn take_slot(&self) -> Option<usize> {
+        loop {
+            let fresh = self.fresh.load(Ordering::Relaxed);
+            if fresh >= N {
+                return self.free.pop();
+            }
+            if self
+                .fresh
+                .compare_exchange_weak(fresh, fresh + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(fresh);
+            }
+        }
+    }
+
+    /// One message, written by `fill` into the slot it will be read from.
+    /// False -- and `fill` not called -- when every slot is taken. Never
+    /// waits.
+    ///
+    /// A sender that can be switched away should hold preemption off across
+    /// this: the reader takes messages in order, and would wait behind one
+    /// whose sender was descheduled half way through handing it over.
+    pub fn send(&self, fill: impl FnOnce(&mut T)) -> bool {
+        let slot = match self.take_slot() {
+            Some(slot) => slot,
+            None => return false,
+        };
+
+        /* The number came off `fresh` or `free`, to this call alone. */
+        fill(unsafe { &mut *self.slots[slot].get() });
+
+        /* Cannot fail: the ready ring holds every slot there is. */
+        if self.ready.push(slot) {
+            true
+        } else {
+            self.free.push(slot);
+            false
+        }
+    }
+
+    /// The oldest message, looked at by `read` where it lies; its slot is
+    /// free again after. None when there is no message.
+    pub fn receive<R>(&self, read: impl FnOnce(&T) -> R) -> Option<R> {
+        let slot = self.ready.pop()?;
+
+        /* The number came off `ready`, to this call alone. */
+        let result = read(unsafe { &*self.slots[slot].get() });
+
+        /* Cannot fail either: the free ring holds every slot there is. */
+        self.free.push(slot);
+        Some(result)
+    }
+
+    /// Messages sent and not yet received. A snapshot: for reporting.
+    pub fn waiting(&self) -> usize {
+        self.ready.count()
     }
 }

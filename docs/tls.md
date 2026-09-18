@@ -17,7 +17,7 @@ What the kernel supplies, and already had:
 
 | TLS needs | comes from |
 |---|---|
-| a byte transport | `Tcp::Send` / `Tcp::Recv` (`net/tcp.cpp`) |
+| a byte transport | the TCP of `src/rust/net` (`tcp.rs`) |
 | randomness | `Kernel::Random` — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
 | a wall clock, for certificate validity | `GetWallTimeSecs()` |
 | a heap | the Rust global allocator over `Mm::Alloc` |
@@ -25,29 +25,30 @@ What the kernel supplies, and already had:
 ## The pieces
 
 ```
-  cmd.cpp  wget
+  wget                           src/rust/net/src/wget.rs
       |
-  HttpClient                     net/http.cpp
-      |   HttpTransport: Send / Recv
+  http::get_with_location        src/rust/net/src/http.rs
+      |   Transport: send / recv
       |         |
-  TcpTransport  TlsTransport     net/http.cpp
-                    |
-                TlsConn          net/tls.h, net/tls.cpp
-                    |  tls_connect / tls_send / tls_recv / tls_close
-                TlsStream        src/rust/tls
-                    |  rustls, rustls-rustcrypto, webpki-roots
-                TcpSocket -> kernel_tcp_send / kernel_tcp_recv
-                    |
-                  Tcp            net/tcp.cpp
+    Plain      Tls
+      |         |
+      |     TlsStream            src/rust/tls
+      |         |  rustls, rustls-rustcrypto, webpki-roots
+      |     TcpSocket -> kernel_tcp_send / kernel_tcp_recv
+      |         |
+      +------  TCP               src/rust/net/src/tcp.rs
 ```
 
-`HttpTransport` is the seam: request framing, header parsing, chunked
-decoding, redirects and the body sink all sit above it and neither know nor
-care whether the bytes are encrypted. Adding TLS did not change any of them.
+`Transport` is the seam: request framing, header parsing, chunked decoding,
+redirects and the body sink all sit above it and neither know nor care
+whether the bytes are encrypted. Adding TLS did not change any of them.
 
-The connection belongs to C++ — `HttpClient::DoGet` opens it and closes it.
-Rust borrows it for the session and calls back down through
-`kernel_tcp_send` / `kernel_tcp_recv` (`kernel/rust_ffi.cpp`).
+The connection belongs to the HTTP client -- `exchange` opens it and closes
+it. The session borrows it as a `kcore::tcp::TcpSocket` and calls back down
+through `kernel_tcp_send` / `kernel_tcp_recv`, the same names a loadable
+module reaches TCP by: `tls` is a crate of its own with no view of the
+network layer's insides, and `net` depends on it like on any other crate --
+`TlsStream::connect`, `send`, `recv`, and a drop that says close_notify.
 
 ## The unbuffered API
 

@@ -23,7 +23,7 @@
 //! hold it and is on its way to a halt, so waiting for it would spend the
 //! panic rather than report it.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 use kcore::net::Nic;
 use kcore::sync::IrqSpinLock;
@@ -213,36 +213,38 @@ impl Ring {
     }
 }
 
-pub struct Netconsole {
-    lock: IrqSpinLock,
-    ring: core::cell::UnsafeCell<Ring>,
-    packet: core::cell::UnsafeCell<[u8; DGRAM_MAX]>,
+/// What the log's lock guards: the ring, the number the next datagram gets,
+/// and the device they go out on.
+struct Log {
+    ring: Ring,
+    seq: u32,
+    /// Bytes of backlog in front of a panic's report
+    panic_backlog: usize,
+    nic: Option<Nic>,
+}
 
-    dst_ip: core::cell::UnsafeCell<u32>,
-    dst_port: core::cell::UnsafeCell<u16>,
-    src_port: core::cell::UnsafeCell<u16>,
+pub struct Netconsole {
+    log: IrqSpinLock<Log>,
+
+    /* Written once by `setup`, before `enabled` says there is anything to
+     * read. */
+    dst_ip: AtomicU32,
+    dst_port: AtomicU16,
+    src_port: AtomicU16,
     /// nctail=N: bytes of backlog to keep when the link first comes up,
     /// 0 to keep all of it.
-    tail_keep: core::cell::UnsafeCell<usize>,
+    tail_keep: AtomicUsize,
     backlog_trimmed: AtomicBool,
 
-    nic: core::cell::UnsafeCell<Option<Nic>>,
-    task: core::cell::UnsafeCell<Option<TaskHandle>>,
+    /// Never dropped under the lock: giving a task back waits for it.
+    task: IrqSpinLock<Option<TaskHandle>>,
     /// The drain task's id, so its own messages are not captured
     drain_id: AtomicUsize,
     enabled: AtomicBool,
 
     sent: AtomicUsize,
     tx_failed: AtomicUsize,
-    seq: core::cell::UnsafeCell<u32>,
-    /// Bytes of backlog in front of a panic's report
-    panic_backlog: core::cell::UnsafeCell<usize>,
 }
-
-/* Everything inside is touched with the lock held, or by the panic path,
- * which runs with every other CPU on its way to a halt */
-unsafe impl Sync for Netconsole {}
-unsafe impl Send for Netconsole {}
 
 /// The one netconsole. A static, ring and all, rather than something made
 /// on the heap: capture is armed from the kernel command line, which is long
@@ -250,28 +252,40 @@ unsafe impl Send for Netconsole {}
 /// before then is the whole point. Its lock allocates nothing for the same
 /// reason.
 pub static NETCONSOLE: Netconsole = Netconsole {
-    lock: IrqSpinLock::new(),
-    ring: core::cell::UnsafeCell::new(
-        Ring { buf: [0; RING_SIZE], head: 0, used: 0, dropped: 0 }),
-    packet: core::cell::UnsafeCell::new([0; DGRAM_MAX]),
-    dst_ip: core::cell::UnsafeCell::new(0),
-    dst_port: core::cell::UnsafeCell::new(0),
-    src_port: core::cell::UnsafeCell::new(0),
-    tail_keep: core::cell::UnsafeCell::new(0),
+    log: IrqSpinLock::new(Log {
+        ring: Ring { buf: [0; RING_SIZE], head: 0, used: 0, dropped: 0 },
+        seq: 0,
+        panic_backlog: 0,
+        nic: None,
+    }),
+    dst_ip: AtomicU32::new(0),
+    dst_port: AtomicU16::new(0),
+    src_port: AtomicU16::new(0),
+    tail_keep: AtomicUsize::new(0),
     backlog_trimmed: AtomicBool::new(false),
-    nic: core::cell::UnsafeCell::new(None),
-    task: core::cell::UnsafeCell::new(None),
+    task: IrqSpinLock::new(None),
     drain_id: AtomicUsize::new(0),
     enabled: AtomicBool::new(false),
     sent: AtomicUsize::new(0),
     tx_failed: AtomicUsize::new(0),
-    seq: core::cell::UnsafeCell::new(0),
-    panic_backlog: core::cell::UnsafeCell::new(0),
 };
 
 impl Netconsole {
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::Acquire)
+    }
+
+    /// The log, from the panic path: properly if the lock can be had, around
+    /// it if not. A panic runs with interrupts off and the other CPUs on
+    /// their way to a halt -- one of them may hold the lock and never release
+    /// it, and the report must not wait for a lock that is never coming back.
+    fn in_panic<R>(&self, work: impl FnOnce(&mut Log) -> R) -> R {
+        match self.log.try_lock() {
+            Some(mut log) => work(&mut log),
+            /* The rest of the machine has been sent the halting IPI: nothing
+             * else is running that could touch the log. */
+            None => work(unsafe { self.log.steal() }),
+        }
     }
 
     /// Arm capture from the kernel command line. Safe long before the network
@@ -282,67 +296,59 @@ impl Netconsole {
             return false;
         }
 
-        let mut ip = 0u32;
-        let mut port = 0u16;
-        let mut tail_kb = 0usize;
-        if unsafe { ffi::net::kernel_netconsole_params(&mut ip, &mut port, &mut tail_kb) } == 0 {
-            return false;
-        }
+        let (ip, port, tail_kb) = match kcore::net::netconsole_params() {
+            Some(params) => params,
+            None => return false,
+        };
 
-        unsafe {
-            *self.dst_ip.get() = ip;
-            *self.dst_port.get() = port;
-            *self.src_port.get() = port;
-            /* A cap at or above the ring is the same as no cap at all */
-            *self.tail_keep.get() = if tail_kb != 0 {
-                let bytes = tail_kb * 1024;
-                if bytes < RING_SIZE { bytes } else { 0 }
-            } else {
-                0
-            };
-        }
+        /* A cap at or above the ring is the same as no cap at all */
+        let tail_keep = match tail_kb * 1024 {
+            bytes if bytes != 0 && bytes < RING_SIZE => bytes,
+            _ => 0,
+        };
+        self.dst_ip.store(ip, Ordering::Relaxed);
+        self.dst_port.store(port, Ordering::Relaxed);
+        self.src_port.store(port, Ordering::Relaxed);
+        self.tail_keep.store(tail_keep, Ordering::Relaxed);
 
         /* Everything traced before this point is still in the kernel log --
          * replay it into the ring so the collector sees the whole boot, not
          * just the tail. */
-        unsafe { ffi::net::kernel_dmesg_replay(replay_line, self as *const _ as *mut u8) };
+        kcore::net::replay_kernel_log(&mut |line: &[u8]| {
+            self.log.lock().ring.append(&line[..line.len().min(MAX_RECORD)]);
+        });
 
         self.enabled.store(true, Ordering::Release);
         trace!(0, "netconsole: capturing for {}.{}.{}.{}:{}, backlog cap {} bytes",
             (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
-            port, unsafe { *self.tail_keep.get() });
+            port, tail_keep);
         true
     }
 
     /// Attach a device and start the drain task.
     pub fn start(&'static self, nic: Nic) -> bool {
-        if !self.is_enabled() || unsafe { (*self.task.get()).is_some() } {
+        if !self.is_enabled() || self.task.lock().is_some() {
             return false;
         }
 
-        unsafe { *self.nic.get() = Some(nic) };
+        self.log.lock().nic = Some(nic);
 
-        let task = match kcore::task::spawn_with_ctx(
-            "netcon", run, self as *const _ as *mut u8)
-        {
+        let task = match kcore::task::spawn_for("netcon", self, Netconsole::run) {
             Some(task) => task,
             None => {
-                unsafe { *self.nic.get() = None };
+                self.log.lock().nic = None;
                 return false;
             }
         };
         /* The id before it runs: `log` uses it to recognise, and skip, the
          * messages the transmit path itself produces. */
         self.drain_id.store(task.id(), Ordering::Release);
-        unsafe { *self.task.get() = Some(task) };
+        *self.task.lock() = Some(task);
 
         /* Say it in the stream, not just in the counters: a backlog that
          * overflowed before the link came up makes a log that starts in the
          * middle, and nothing about it says so. */
-        let dropped = {
-            let _guard = self.lock.lock();
-            unsafe { (*self.ring.get()).dropped }
-        };
+        let dropped = self.log.lock().ring.dropped;
         if dropped != 0 {
             trace!(0, "netconsole: {} lines were dropped before the link came up", dropped);
         }
@@ -352,13 +358,13 @@ impl Netconsole {
     }
 
     pub fn stop(&self) {
-        let task = unsafe { (*self.task.get()).take() };
+        let task = self.task.lock().take();
         if let Some(task) = task {
             task.request_stop();
             drop(task);
         }
         self.drain_id.store(0, Ordering::Release);
-        unsafe { *self.nic.get() = None };
+        self.log.lock().nic = None;
     }
 
     /// The capture hook, called for every message the tracer produces and
@@ -379,74 +385,60 @@ impl Netconsole {
 
         let text = &text[..text.len().min(MAX_RECORD)];
 
-        /* A panic runs with interrupts off and the other CPUs on their way
-         * to a halt -- one of them may hold the lock and never release it,
-         * so the panic path writes unlocked rather than deadlocking. */
-        if unsafe { ffi::panic::kernel_panic_active() } != 0 {
-            unsafe { (*self.ring.get()).append(text) };
+        if kcore::trace::panic_active() {
+            self.in_panic(|log| log.ring.append(text));
             return;
         }
 
-        let _guard = self.lock.lock();
-        unsafe { (*self.ring.get()).append(text) };
+        self.log.lock().ring.append(text);
     }
 
-    /// One datagram: the header, then the text already placed after it.
-    /// Only a datagram the device took gets a number, so a gap in the
-    /// sequence at the collector means the network lost it.
-    fn send_batch(&self, text_len: usize) -> bool {
-        let nic = match unsafe { *self.nic.get() } {
-            Some(nic) => nic,
-            None => return false,
-        };
+    /// One datagram: the header, then the text already placed after it in
+    /// `packet`. Only a datagram the device took gets a number -- the caller
+    /// moves `seq` on when this says it went -- so a gap in the sequence at
+    /// the collector means the network lost it.
+    fn send_batch(&self, nic: &Nic, packet: &mut [u8; DGRAM_MAX], text_len: usize, seq: u32)
+        -> bool
+    {
         if text_len == 0 {
             return false;
         }
-
-        let (dst_ip, dst_port, src_port) = unsafe {
-            (*self.dst_ip.get(), *self.dst_port.get(), *self.src_port.get())
-        };
         let arp = match abi::arp_table() {
             Some(arp) => arp,
             None => return false,
         };
 
-        let packet = unsafe { &mut *self.packet.get() };
         packet[..4].copy_from_slice(&MAGIC);
-        let seq = unsafe { *self.seq.get() };
         packet[4..8].copy_from_slice(&seq.to_le_bytes());
 
-        if !udp::send(&nic, arp, dst_ip, dst_port, nic.ip(), src_port,
+        udp::send(nic, arp,
+            self.dst_ip.load(Ordering::Relaxed), self.dst_port.load(Ordering::Relaxed),
+            nic.ip(), self.src_port.load(Ordering::Relaxed),
             &packet[..DGRAM_HDR + text_len])
-        {
-            return false;
-        }
-
-        unsafe { *self.seq.get() = seq.wrapping_add(1) };
-        true
     }
 
-    fn run(&self) {
+    fn run(&'static self) {
+        /* The datagram being built is this task's own: filled under the lock
+         * and sent with it down, since a send may wait on ARP. */
+        let mut packet = [0u8; DGRAM_MAX];
+
         while !kcore::task::stopping() {
             /* No address yet -- DHCP still running, or no static one set:
              * keep buffering, the backlog goes out as soon as there is one. */
-            let has_link = match unsafe { *self.nic.get() } {
-                Some(nic) => nic.ip() != 0,
-                None => false,
+            let nic = match self.log.lock().nic {
+                Some(nic) if nic.ip() != 0 => nic,
+                _ => {
+                    kcore::task::sleep_ms(NO_LINK_POLL_MS);
+                    continue;
+                }
             };
-            if !has_link {
-                kcore::task::sleep_ms(NO_LINK_POLL_MS);
-                continue;
-            }
 
             self.trim_backlog_once();
 
-            let (len, consumed, dropped) = {
-                let _guard = self.lock.lock();
-                let ring = unsafe { &*self.ring.get() };
-                let packet = unsafe { &mut *self.packet.get() };
-                let (len, consumed) = ring.peek_batch(&mut packet[DGRAM_HDR..]);
-                (len, consumed, ring.dropped)
+            let (len, consumed, dropped, seq) = {
+                let log = self.log.lock();
+                let (len, consumed) = log.ring.peek_batch(&mut packet[DGRAM_HDR..]);
+                (len, consumed, log.ring.dropped, log.seq)
             };
 
             if len == 0 {
@@ -454,7 +446,7 @@ impl Netconsole {
                 continue;
             }
 
-            if !self.send_batch(len) {
+            if !self.send_batch(&nic, &mut packet, len, seq) {
                 /* The records are still in the ring. On a machine whose only
                  * console is this one, consuming them first turned any
                  * transmit hiccup into a silent blackout: the loop has no
@@ -468,14 +460,14 @@ impl Netconsole {
             self.sent.fetch_add(1, Ordering::Relaxed);
 
             {
-                let _guard = self.lock.lock();
-                let ring = unsafe { &mut *self.ring.get() };
+                let mut log = self.log.lock();
+                log.seq = seq.wrapping_add(1);
                 /* An append may have evicted from the head while the lock
                  * was down, in which case what was just sent is already gone
                  * and popping again would eat live records. The drop count
                  * is the only other thing that moves the head. */
-                if ring.dropped == dropped {
-                    ring.pop(consumed, None);
+                if log.ring.dropped == dropped {
+                    log.ring.pop(consumed, None);
                 }
             }
 
@@ -493,16 +485,15 @@ impl Netconsole {
             return;
         }
 
-        let keep = unsafe { *self.tail_keep.get() };
+        let keep = self.tail_keep.load(Ordering::Relaxed);
         let trimmed = {
-            let _guard = self.lock.lock();
-            let ring = unsafe { &mut *self.ring.get() };
-            let before = ring.dropped;
+            let mut log = self.log.lock();
+            let before = log.ring.dropped;
             if keep != 0 {
-                let used = ring.used;
-                ring.trim_head(used, keep);
+                let used = log.ring.used;
+                log.ring.trim_head(used, keep);
             }
-            ring.dropped - before
+            log.ring.dropped - before
         };
         self.backlog_trimmed.store(true, Ordering::Release);
 
@@ -518,10 +509,7 @@ impl Netconsole {
          * and a log that says why. */
         let mut msg = [0u8; MAX_RECORD];
         let len = format_trimmed(&mut msg, trimmed, keep);
-        {
-            let _guard = self.lock.lock();
-            unsafe { (*self.ring.get()).append(&msg[..len]) };
-        }
+        self.log.lock().ring.append(&msg[..len]);
 
         trace!(0, "netconsole: link up, dropped {} backlog msgs over the {} byte cap",
             trimmed, keep);
@@ -533,19 +521,17 @@ impl Netconsole {
         if !self.is_enabled() {
             return;
         }
-        /* Unlocked on purpose -- see `log` */
-        unsafe { *self.panic_backlog.get() = (*self.ring.get()).used };
+        self.in_panic(|log| log.panic_backlog = log.ring.used);
     }
 
-    /// A best-effort drain from panic context: no locks, and only when the
-    /// collector is already in the ARP cache -- with the other CPUs halted
-    /// nothing would ever deliver a reply, so resolving would just burn the
-    /// panic.
+    /// A best-effort drain from panic context, and only when the collector is
+    /// already in the ARP cache -- with the other CPUs halted nothing would
+    /// ever deliver a reply, so resolving would just burn the panic.
     pub fn panic_flush(&self) {
         if !self.is_enabled() {
             return;
         }
-        let nic = match unsafe { *self.nic.get() } {
+        let nic = match self.in_panic(|log| log.nic) {
             Some(nic) if nic.ip() != 0 => nic,
             _ => return,
         };
@@ -554,8 +540,7 @@ impl Netconsole {
             Some(arp) => arp,
             None => return,
         };
-        let dst_ip = unsafe { *self.dst_ip.get() };
-        if arp.lookup(nic.route_ip(dst_ip)).is_none() {
+        if arp.lookup(nic.route_ip(self.dst_ip.load(Ordering::Relaxed))).is_none() {
             return;
         }
 
@@ -563,27 +548,28 @@ impl Netconsole {
          * shipped. A machine that dies just after DHCP has the entire boot
          * log in front of it -- far more than this will carry -- so the old
          * end of that backlog goes, keeping a little for context. */
-        unsafe {
-            let ring = &mut *self.ring.get();
-            let backlog = (*self.panic_backlog.get()).min(ring.used);
-            ring.trim_head(backlog, PANIC_BACKLOG_KEEP);
-        }
+        self.in_panic(|log| {
+            let backlog = log.panic_backlog.min(log.ring.used);
+            log.ring.trim_head(backlog, PANIC_BACKLOG_KEEP);
+        });
 
+        let mut packet = [0u8; DGRAM_MAX];
         let mut failures = 0;
         for _ in 0..PANIC_MAX_PACKETS {
-            /* Unlocked on purpose -- see `log` */
-            let (len, consumed) = unsafe {
-                let ring = &*self.ring.get();
-                let packet = &mut *self.packet.get();
-                ring.peek_batch(&mut packet[DGRAM_HDR..])
-            };
+            let (len, consumed, seq) = self.in_panic(|log| {
+                let (len, consumed) = log.ring.peek_batch(&mut packet[DGRAM_HDR..]);
+                (len, consumed, log.seq)
+            });
             if len == 0 {
                 break;
             }
 
-            if self.send_batch(len) {
+            if self.send_batch(&nic, &mut packet, len, seq) {
                 self.sent.fetch_add(1, Ordering::Relaxed);
-                unsafe { (*self.ring.get()).pop(consumed, None) };
+                self.in_panic(|log| {
+                    log.seq = seq.wrapping_add(1);
+                    log.ring.pop(consumed, None);
+                });
                 failures = 0;
                 continue;
             }
@@ -601,31 +587,26 @@ impl Netconsole {
 
     /// What the `netconsole` command reports.
     pub fn stats(&self) -> Stats {
-        let _guard = self.lock.lock();
-        let ring = unsafe { &*self.ring.get() };
-        unsafe {
-            Stats {
-                enabled: self.is_enabled() as u32,
-                dst_ip: *self.dst_ip.get(),
-                dst_port: *self.dst_port.get(),
-                src_port: *self.src_port.get(),
-                attached: (*self.nic.get()).is_some() as u32,
-                used: ring.used,
-                capacity: RING_SIZE,
-                dropped: ring.dropped,
-                sent: self.sent.load(Ordering::Relaxed),
-                tx_failed: self.tx_failed.load(Ordering::Relaxed),
-                seq: *self.seq.get(),
-                tail_keep: *self.tail_keep.get(),
-                trimmed: self.backlog_trimmed.load(Ordering::Acquire) as u32,
-            }
+        let log = self.log.lock();
+        Stats {
+            enabled: self.is_enabled() as u32,
+            dst_ip: self.dst_ip.load(Ordering::Relaxed),
+            dst_port: self.dst_port.load(Ordering::Relaxed),
+            src_port: self.src_port.load(Ordering::Relaxed),
+            attached: log.nic.is_some() as u32,
+            used: log.ring.used,
+            capacity: RING_SIZE,
+            dropped: log.ring.dropped,
+            sent: self.sent.load(Ordering::Relaxed),
+            tx_failed: self.tx_failed.load(Ordering::Relaxed),
+            seq: log.seq,
+            tail_keep: self.tail_keep.load(Ordering::Relaxed),
+            trimmed: self.backlog_trimmed.load(Ordering::Acquire) as u32,
         }
     }
 }
 
-/// What the `netconsole` command prints. The C++ side declares the same
-/// struct.
-#[repr(C)]
+/// What the `netconsole` command prints.
 pub struct Stats {
     pub enabled: u32,
     pub dst_ip: u32,
@@ -672,25 +653,4 @@ fn put_num(out: &mut [u8], at: usize, mut value: u64) -> usize {
         }
     }
     put(out, at, &digits[n..])
-}
-
-/// Each message the kernel log already held, as `setup` replays them.
-extern "C" fn replay_line(ctx: *mut u8, s: *const u8, len: usize) {
-    if ctx.is_null() || s.is_null() || len == 0 {
-        return;
-    }
-    let netconsole = unsafe { &*(ctx as *const Netconsole) };
-    let text = unsafe { core::slice::from_raw_parts(s, len.min(MAX_RECORD)) };
-
-    let _guard = netconsole.lock.lock();
-    unsafe { (*netconsole.ring.get()).append(text) };
-}
-
-/// The task the drain runs in.
-extern "C" fn run(ctx: *mut u8) {
-    if ctx.is_null() {
-        return;
-    }
-    let netconsole = unsafe { &*(ctx as *const Netconsole) };
-    netconsole.run();
 }

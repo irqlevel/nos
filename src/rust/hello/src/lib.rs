@@ -19,7 +19,7 @@ fn test_time() {
 }
 
 fn test_sync() {
-    if let Some(m) = kcore::sync::Mutex::new() {
+    if let Some(m) = kcore::sync::Mutex::new(()) {
         let _g = m.lock();
         kcore::trace!(0, "rust_test: mutex acquired");
     }

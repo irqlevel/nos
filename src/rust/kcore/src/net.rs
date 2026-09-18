@@ -147,12 +147,11 @@ impl Nic {
         if handle == 0 { None } else { Some(Self { handle }) }
     }
 
-    /// The device a handle names: what a call arriving from the C++ side
-    /// carries, `kernel_net_find`'s answer passed on.
-    ///
-    /// # Safety
-    /// `handle` is one the kernel's device table gave out, or 0.
-    pub unsafe fn from_handle(handle: usize) -> Option<Self> {
+    /// The device a handle names: what a call arriving from outside
+    /// carries, `kernel_net_find`'s answer passed on. Any word will do: the
+    /// device table looks up every handle it is given, and one it never gave
+    /// out names no device -- whatever is asked of it answers nothing.
+    pub fn from_handle(handle: usize) -> Option<Self> {
         if handle == 0 { None } else { Some(Self { handle }) }
     }
 
@@ -224,6 +223,28 @@ impl Nic {
         }
     }
 
+    /// Every UDP datagram to `port`, handed to `handler` -- something that
+    /// lives for good, a service's one instance. No raw context at the call
+    /// site: `'static` is what says the handler outlives the listener, and
+    /// `Sync` what says the receive path may call it from any CPU.
+    ///
+    /// The handler runs on the receive path of every packet the machine gets:
+    /// nothing that sleeps, and nothing long.
+    pub fn listen<H: UdpHandler>(
+        &self, port: u16, handler: &'static H,
+    ) -> core::result::Result<UdpListener, ListenError> {
+        self.listen_udp(port, on_frame::<H>, handler as *const H as *mut u8)
+    }
+
+    /// As `listen`, with `UdpHandler::on_batch_end` called at the end of each
+    /// receive batch -- see `listen_udp_batched`.
+    pub fn listen_batched<H: UdpHandler>(
+        &self, port: u16, handler: &'static H,
+    ) -> core::result::Result<UdpListener, ListenError> {
+        self.listen_udp_batched(port, on_frame::<H>, on_batch_end::<H>,
+            handler as *const H as *mut u8)
+    }
+
     /// Every UDP datagram to `port`, as `listen_udp`, and a call at the end
     /// of each receive batch. A listener that answers from the receive path
     /// builds its replies as the frames arrive and hands them to the NIC in
@@ -269,6 +290,168 @@ impl Nic {
     }
 }
 
+/// A device that can be set and cleared without a lock: what a receive path
+/// reads once a packet. Only a `Nic` ever goes in, so only a `Nic` comes out.
+pub struct AtomicNic(core::sync::atomic::AtomicUsize);
+
+impl AtomicNic {
+    pub const fn none() -> Self {
+        Self(core::sync::atomic::AtomicUsize::new(0))
+    }
+
+    pub fn set(&self, nic: Option<Nic>) {
+        self.0.store(nic.map_or(0, |nic| nic.handle), core::sync::atomic::Ordering::Release);
+    }
+
+    #[inline]
+    pub fn get(&self) -> Option<Nic> {
+        match self.0.load(core::sync::atomic::Ordering::Acquire) {
+            0 => None,
+            handle => Some(Nic { handle }),
+        }
+    }
+}
+
+/// Frames gathered to go out together: one transmit lock and one doorbell
+/// for the lot, rather than one of each per frame.
+pub struct TxBatch<const N: usize> {
+    frames: [usize; N],
+    count: usize,
+}
+
+impl<const N: usize> TxBatch<N> {
+    pub const fn new() -> Self {
+        Self { frames: [0; N], count: 0 }
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.count == N
+    }
+
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Takes the frame. False, and the frame released, when there is no room.
+    pub fn push(&mut self, frame: NetFrame) -> bool {
+        if self.count == N {
+            return false;
+        }
+        self.frames[self.count] = frame.into_raw();
+        self.count += 1;
+        true
+    }
+
+    /// Everything gathered, released unsent.
+    pub fn clear(&mut self) {
+        let count = core::mem::replace(&mut self.count, 0);
+        for handle in &self.frames[..count] {
+            /* A frame `push` took ownership of, given up here. */
+            drop(unsafe { NetFrame::from_raw(*handle) });
+        }
+    }
+
+    /// Everything gathered, to the device: how many it queued. The rest it
+    /// releases, and the batch is empty either way.
+    pub fn send(&mut self, nic: &Nic) -> usize {
+        let count = core::mem::replace(&mut self.count, 0);
+        /* Each is a frame `push` took ownership of and gives up here. */
+        unsafe { nic.transmit_raw(&self.frames[..count]) }
+    }
+}
+
+impl<const N: usize> Drop for TxBatch<N> {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// Being inside the receive dispatch, as a value.
+///
+/// The kernel runs the receive soft IRQ on one CPU at a time, and the
+/// dispatch in it is what calls every listener. So there is one of these at
+/// a time, a handler is lent it for the length of a call, and holding it is
+/// what it means to be the only code on the receive path right now -- which
+/// is what lets `RxOwned` hand out its contents without a lock.
+pub struct RxContext {
+    _only_the_dispatch_makes_one: (),
+}
+
+/// What only the receive path touches: the replies a listener gathers during
+/// a batch, say. No lock, because the `RxContext` borrowed to reach in is
+/// the proof nobody else is there.
+pub struct RxOwned<T>(core::cell::UnsafeCell<T>);
+
+/* Reached on whichever CPU the receive soft IRQ runs on, one at a time. */
+unsafe impl<T: Send> Sync for RxOwned<T> {}
+
+impl<T> RxOwned<T> {
+    pub const fn new(value: T) -> Self {
+        Self(core::cell::UnsafeCell::new(value))
+    }
+
+    #[inline]
+    pub fn get<'a>(&'a self, _rx: &'a mut RxContext) -> &'a mut T {
+        /* There is one `RxContext` at a time and it is borrowed for as long
+         * as what is returned here lives. */
+        unsafe { &mut *self.0.get() }
+    }
+}
+
+/// What `Nic::listen` hands datagrams to.
+pub trait UdpHandler: Sync + 'static {
+    /// One datagram's frame, lent for the length of the call.
+    fn on_frame(&'static self, frame: Lent<'_>, rx: &mut RxContext);
+
+    /// The end of a receive batch, for a listener registered with
+    /// `listen_batched`: the moment to hand the NIC what was built.
+    fn on_batch_end(&'static self, _rx: &mut RxContext) {}
+}
+
+/// A frame the receive path lends a listener for the length of one call.
+pub struct Lent<'a> {
+    handle: usize,
+    _life: core::marker::PhantomData<&'a ()>,
+}
+
+impl Lent<'_> {
+    /// The frame's bytes, Ethernet header first.
+    pub fn bytes(&self) -> &[u8] {
+        /* Alive and unwritten for as long as the borrow: that is what being
+         * lent it for the call means, and `retain` -- the way to a frame
+         * that can be written -- ends the loan. */
+        unsafe { NetFrame::lent(self.handle) }
+    }
+
+    /// The frame, to keep past the call -- to answer in, where it lies. The
+    /// receive path's own reference is then not the last, and it never looks
+    /// at the bytes again.
+    pub fn retain(self) -> NetFrame {
+        unsafe { NetFrame::retain(self.handle) }
+    }
+}
+
+extern "C" fn on_frame<H: UdpHandler>(ctx: *mut u8, frame: usize) {
+    /* `ctx` is the `&'static H` that `Nic::listen` registered. */
+    let handler = unsafe { &*(ctx as *const H) };
+    /* This is the one place an `RxContext` comes from, and what makes it
+     * true: nothing but the receive dispatch is ever given this function,
+     * and the kernel runs that dispatch on one CPU at a time. */
+    let mut rx = RxContext { _only_the_dispatch_makes_one: () };
+    handler.on_frame(Lent { handle: frame, _life: core::marker::PhantomData }, &mut rx);
+}
+
+extern "C" fn on_batch_end<H: UdpHandler>(ctx: *mut u8) {
+    let handler = unsafe { &*(ctx as *const H) };
+    /* As in `on_frame`. */
+    let mut rx = RxContext { _only_the_dispatch_makes_one: () };
+    handler.on_batch_end(&mut rx);
+}
+
 /// A UDP port listened on, from `Nic::listen_udp`; given back on drop, once
 /// no call of its callback is still running -- so what the callback reaches
 /// may go right after. Task context: the drop may wait.
@@ -279,6 +462,10 @@ pub struct UdpListener {
        and nobody else's on the port */
     ctx: usize,
 }
+
+/* A handle -- a device, a port and the word it was registered with -- and
+ * the kernel's listener table is what it names. */
+unsafe impl Send for UdpListener {}
 
 impl Drop for UdpListener {
     fn drop(&mut self) {
@@ -436,4 +623,34 @@ pub fn dhcp_off() -> bool {
 /// `dns=on`: a lease's DNS server is worth starting a resolver on.
 pub fn dns_on() -> bool {
     unsafe { net::kernel_param_dns_on() != 0 }
+}
+
+/// `netconsole=ip:port` and `nctail=N`, off the kernel command line: the
+/// collector's address (host byte order), its port, and the backlog cap in
+/// KiB. None when no netconsole was asked for.
+pub fn netconsole_params() -> Option<(u32, u16, usize)> {
+    let (mut ip, mut port, mut tail_kb) = (0u32, 0u16, 0usize);
+    if unsafe { net::kernel_netconsole_params(&mut ip, &mut port, &mut tail_kb) } == 0 {
+        None
+    } else {
+        Some((ip, port, tail_kb))
+    }
+}
+
+/// Every message the kernel log already holds, oldest first, handed to
+/// `line` one at a time.
+pub fn replay_kernel_log(line: &mut dyn FnMut(&[u8])) {
+    extern "C" fn each(ctx: *mut u8, s: *const u8, len: usize) {
+        if s.is_null() || len == 0 {
+            return;
+        }
+        /* `ctx` is the `&mut dyn FnMut` below, alive for the whole replay,
+         * and the kernel calls back on this same stack. */
+        let line = unsafe { &mut *(ctx as *mut &mut dyn FnMut(&[u8])) };
+        line(unsafe { core::slice::from_raw_parts(s, len) });
+    }
+
+    let mut line = line;
+    let ctx = &mut line as *mut &mut dyn FnMut(&[u8]) as *mut u8;
+    unsafe { net::kernel_dmesg_replay(each, ctx) };
 }

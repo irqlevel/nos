@@ -7,6 +7,12 @@ pub struct DmaBuffer {
     pages: usize,
 }
 
+/* Pages the buffer owns outright, as a `Box` owns its allocation: it may go
+ * to another CPU, and what a shared reference gives -- `as_slice` -- is
+ * reading. */
+unsafe impl Send for DmaBuffer {}
+unsafe impl Sync for DmaBuffer {}
+
 impl DmaBuffer {
     pub fn new(requested_pages: usize) -> Option<Self> {
         if requested_pages == 0 {

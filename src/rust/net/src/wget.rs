@@ -33,9 +33,7 @@ const MAX_LOCATION: usize = 256;
 
 /* ---- a body that goes to a file ---- */
 
-/// The sink's state between calls. Only the one task running the command
-/// touches it, and the raw pointer the client carries is a borrow of it that
-/// lasts exactly as long as the call.
+/// The sink's state between calls.
 struct FileSink<'a> {
     file: &'a fs::File,
     out: &'a mut Output,
@@ -45,16 +43,7 @@ struct FileSink<'a> {
     reported: usize,
 }
 
-extern "C" fn sink_write(ctx: *mut u8, data: *const u8, len: usize) -> usize {
-    if ctx.is_null() || (data.is_null() && len != 0) {
-        return 0;
-    }
-    let sink = unsafe { &mut *(ctx as *mut FileSink) };
-    let data = unsafe { core::slice::from_raw_parts(data, len) };
-    sink.take(data)
-}
-
-impl FileSink<'_> {
+impl http::Sink for FileSink<'_> {
     fn take(&mut self, data: &[u8]) -> usize {
         let before = self.written;
         let mut taken = 0;
@@ -81,7 +70,9 @@ impl FileSink<'_> {
 
         taken
     }
+}
 
+impl FileSink<'_> {
     /// Pushes what the buffer still holds; called once the body is over.
     fn flush(&mut self) -> bool {
         if self.used == 0 {
@@ -106,24 +97,21 @@ struct MemSink<'a> {
     body: &'a mut alloc::vec::Vec<u8>,
 }
 
-extern "C" fn mem_write(ctx: *mut u8, data: *const u8, len: usize) -> usize {
-    if ctx.is_null() || (data.is_null() && len != 0) {
-        return 0;
+impl http::Sink for MemSink<'_> {
+    fn take(&mut self, data: &[u8]) -> usize {
+        /* Capped: without a path to save it to, a body is only ever looked
+         * at. */
+        let room = http::MAX_RESPONSE.saturating_sub(self.body.len());
+        let take = data.len().min(room);
+        if take == 0 {
+            return 0;
+        }
+        if self.body.try_reserve(take).is_err() {
+            return 0;
+        }
+        self.body.extend_from_slice(&data[..take]);
+        take
     }
-    let sink = unsafe { &mut *(ctx as *mut MemSink) };
-    let data = unsafe { core::slice::from_raw_parts(data, len) };
-
-    /* Capped: without a path to save it to, a body is only ever looked at. */
-    let room = http::MAX_RESPONSE.saturating_sub(sink.body.len());
-    let take = data.len().min(room);
-    if take == 0 {
-        return 0;
-    }
-    if sink.body.try_reserve(take).is_err() {
-        return 0;
-    }
-    sink.body.extend_from_slice(&data[..take]);
-    take
 }
 
 /* ---- why a request produced nothing ---- */
@@ -200,8 +188,7 @@ pub fn wget(args: &str, out: &mut Output) {
     let mut location = [0u8; MAX_LOCATION];
     let resp = {
         let mut sink = MemSink { body: &mut body };
-        let ctx = &mut sink as *mut MemSink as *mut u8;
-        http::get_with_location(&nic, url.as_bytes(), mem_write, ctx, &mut location)
+        http::get_with_location(&nic, url.as_bytes(), &mut sink, &mut location)
     };
 
     if resp.ok == 0 {
@@ -245,8 +232,7 @@ fn to_file(nic: &kcore::net::Nic, url: &str, path: &str, out: &mut Output) {
             file: &file, out, buf: buf.into_boxed_slice(),
             used: 0, written: 0, reported: 0,
         };
-        let ctx = &mut sink as *mut FileSink as *mut u8;
-        let resp = http::get_with_location(nic, url.as_bytes(), sink_write, ctx, &mut location);
+        let resp = http::get_with_location(nic, url.as_bytes(), &mut sink, &mut location);
         let flushed = sink.flush();
         (resp, sink.written, flushed)
     };

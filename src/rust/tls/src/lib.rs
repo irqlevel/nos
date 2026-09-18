@@ -12,7 +12,6 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::ffi::c_void;
 use core::time::Duration;
 
 use kcore::tcp::TcpSocket;
@@ -93,6 +92,14 @@ pub struct TlsStream {
 }
 
 impl TlsStream {
+    /// A session over a connection somebody else opened, and closes: `host`
+    /// is who the certificate has to be for. None when the handshake is
+    /// refused -- the certificate, the name, or no protocol in common.
+    pub fn connect(sock: TcpSocket, host: &str) -> Option<Self> {
+        let mut stream = Self::new(sock, host)?;
+        if stream.handshake() { Some(stream) } else { None }
+    }
+
     fn new(sock: TcpSocket, host: &str) -> Option<Self> {
         let server_name = match ServerName::try_from(host) {
             Ok(name) => name.to_owned(),
@@ -284,7 +291,8 @@ impl TlsStream {
         false
     }
 
-    fn write(&mut self, data: &[u8]) -> isize {
+    /// Encrypts and sends the whole buffer: its length, or -1.
+    pub fn send(&mut self, data: &[u8]) -> isize {
         if self.failed {
             return -1;
         }
@@ -315,7 +323,9 @@ impl TlsStream {
         -1
     }
 
-    fn read(&mut self, buf: &mut [u8]) -> isize {
+    /// Decrypted data: the byte count, 0 at the end of the stream, -1 on
+    /// error.
+    pub fn recv(&mut self, buf: &mut [u8]) -> isize {
         loop {
             /* Hand back what was already decrypted first. */
             if self.plaintext_pos < self.plaintext.len() {
@@ -389,79 +399,10 @@ impl TlsStream {
     }
 }
 
-/* ---- C API, called from net/tls.cpp ---- */
-
-/// Opens a TLS session over an established TCP connection.
-///
-/// # Safety
-/// `conn` must be a live `Kernel::TcpConn*`, and `host`/`host_len` a UTF-8
-/// host name. The returned handle must be released with `tls_close`.
-#[no_mangle]
-pub unsafe extern "C" fn tls_connect(
-    conn: *mut c_void,
-    host: *const u8,
-    host_len: usize,
-) -> *mut TlsStream {
-    if conn.is_null() || host.is_null() || host_len == 0 {
-        return core::ptr::null_mut();
+/// Sends close_notify. The TCP connection itself stays open, and is closed
+/// by whoever opened it.
+impl Drop for TlsStream {
+    fn drop(&mut self) {
+        self.close();
     }
-
-    let name = core::slice::from_raw_parts(host, host_len);
-    let name = match core::str::from_utf8(name) {
-        Ok(name) => name,
-        Err(_) => return core::ptr::null_mut(),
-    };
-
-    let sock = TcpSocket::from_raw(conn);
-    let mut stream = match TlsStream::new(sock, name) {
-        Some(stream) => alloc::boxed::Box::new(stream),
-        None => return core::ptr::null_mut(),
-    };
-
-    if !stream.handshake() {
-        return core::ptr::null_mut();
-    }
-
-    alloc::boxed::Box::into_raw(stream)
 }
-
-/// Encrypts and sends the whole buffer. Returns `len`, or -1.
-///
-/// # Safety
-/// `stream` must come from `tls_connect`, `buf`/`len` must be readable.
-#[no_mangle]
-pub unsafe extern "C" fn tls_send(stream: *mut TlsStream, buf: *const u8, len: usize) -> isize {
-    if stream.is_null() || buf.is_null() {
-        return -1;
-    }
-    (*stream).write(core::slice::from_raw_parts(buf, len))
-}
-
-/// Receives decrypted data: the byte count, 0 at end of stream, -1 on error.
-///
-/// # Safety
-/// `stream` must come from `tls_connect`, `buf`/`len` must be writable.
-#[no_mangle]
-pub unsafe extern "C" fn tls_recv(stream: *mut TlsStream, buf: *mut u8, len: usize) -> isize {
-    if stream.is_null() || buf.is_null() {
-        return -1;
-    }
-    (*stream).read(core::slice::from_raw_parts_mut(buf, len))
-}
-
-/// Sends close_notify and releases the session. The TCP connection itself
-/// stays open and is closed by its owner.
-///
-/// # Safety
-/// `stream` must come from `tls_connect` and is invalid afterwards.
-#[no_mangle]
-pub unsafe extern "C" fn tls_close(stream: *mut TlsStream) {
-    if stream.is_null() {
-        return;
-    }
-    let mut stream = alloc::boxed::Box::from_raw(stream);
-    stream.close();
-}
-
-/// Linked in for its C API alone; this is what keeps it in the archive.
-pub fn init() {}

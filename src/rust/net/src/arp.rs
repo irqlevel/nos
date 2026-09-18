@@ -34,13 +34,8 @@ struct Entry {
 }
 
 pub struct ArpTable {
-    lock: SpinLock,
-    cache: core::cell::UnsafeCell<[Entry; CACHE_SIZE]>,
+    cache: SpinLock<[Entry; CACHE_SIZE]>,
 }
-
-/* Everything inside is touched with the lock held */
-unsafe impl Sync for ArpTable {}
-unsafe impl Send for ArpTable {}
 
 fn now_ms() -> u64 {
     time::boot_time().as_nanos() / kcore::consts::NS_PER_MS
@@ -49,16 +44,14 @@ fn now_ms() -> u64 {
 impl ArpTable {
     pub fn new() -> Option<ArpTable> {
         Some(ArpTable {
-            lock: SpinLock::new()?,
-            cache: core::cell::UnsafeCell::new(
-                [Entry { ip: 0, mac: [0; 6], made_ms: 0, valid: false }; CACHE_SIZE]),
+            cache: SpinLock::new(
+                [Entry { ip: 0, mac: [0; 6], made_ms: 0, valid: false }; CACHE_SIZE])?,
         })
     }
 
     /// The address of `ip`, if it is cached and has not expired.
     pub fn lookup(&self, ip: u32) -> Option<Mac> {
-        let _guard = self.lock.lock();
-        let cache = unsafe { &mut *self.cache.get() };
+        let mut cache = self.cache.lock();
         let now = now_ms();
 
         for entry in cache.iter_mut() {
@@ -76,8 +69,7 @@ impl ArpTable {
     }
 
     pub fn insert(&self, ip: u32, mac: &Mac) {
-        let _guard = self.lock.lock();
-        let cache = unsafe { &mut *self.cache.get() };
+        let mut cache = self.cache.lock();
         let now = now_ms();
 
         for entry in cache.iter_mut() {
@@ -156,8 +148,7 @@ impl ArpTable {
     /// The cache, into `out`, one entry per (ip, mac) pair: how many there
     /// are, and what each one is.
     pub fn snapshot(&self, out: &mut [(u32, Mac)]) -> usize {
-        let _guard = self.lock.lock();
-        let cache = unsafe { &*self.cache.get() };
+        let cache = self.cache.lock();
 
         let mut at = 0;
         for entry in cache.iter() {
