@@ -12,6 +12,10 @@ extern "C" {
     /// A new file with this content: 1, and nothing written, when there is
     /// one at the path already.
     pub fn kernel_file_create(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;
+    /// The file wherever it is -- at the path, and at `<path>.new` should a
+    /// write of it have been cut short leaving both: 0 once neither is
+    /// there.
+    pub fn kernel_file_remove(path: *const u8, path_len: usize) -> i32;
     /// Makes a directory; 0 also when there is one by that name already.
     pub fn kernel_dir_create(path: *const u8, path_len: usize) -> i32;
 }

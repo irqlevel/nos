@@ -19,7 +19,6 @@
 #include <net/tcp.h>
 #include <net/http.h>
 #include <net/netconsole.h>
-#include <fs/vfs.h>
 #include "entropy.h"
 #include "random.h"
 #include "console.h"
@@ -46,8 +45,52 @@
 #include <lib/grub_env.h>
 #include "sha256.h"
 
+/* The filesystem layer is Rust (src/rust/fs). These are the calls the shell
+   makes on it -- a script to read and rewrite, a file to checksum, a download
+   to write -- taking paths as bytes and a length rather than a C string.
+
+   kernel_file_* are the whole-file calls, and they know about the pair a
+   write leaves behind: a content written through kernel_file_write goes to
+   <path>.new first and takes the old file's place only once it is whole on
+   disk, and the reads below look in both places. */
+extern "C" {
+
+struct RustFile;
+
+/* Open flags (crate::vfs) */
+static const ulong FileRead = 1;
+static const ulong FileWrite = 2;
+static const ulong FileCreate = 4;
+static const ulong FileTruncate = 8;
+
+RustFile* kernel_vfs_open(const char* path, ulong len, ulong flags);
+void kernel_vfs_close(RustFile* file);
+int kernel_vfs_read(RustFile* file, void* buf, ulong len, ulong* out);
+int kernel_vfs_write(RustFile* file, const void* data, ulong len);
+ulong kernel_vfs_size(RustFile* file);
+int kernel_vfs_remove(const char* path, ulong len);
+int kernel_vfs_sync();
+
+long kernel_file_size(const char* path, ulong len);
+long kernel_file_read(const char* path, ulong len, void* buf, ulong cap);
+int kernel_file_write(const char* path, ulong len, const void* data, ulong dataLen);
+int kernel_file_remove(const char* path, ulong len);
+int kernel_dir_create(const char* path, ulong len);
+
+}
+
 namespace Kernel
 {
+
+/* What a path fits in, NUL included (crate::vfs::MAX_PATH) */
+static const ulong MaxPath = 256;
+
+/* The shell holds paths as C strings; the layer takes bytes and a length. */
+static RustFile* FileOpen(const char* path, ulong flags)
+{
+    return kernel_vfs_open(path, Stdlib::StrLen(path), flags);
+}
+
 
 static DhcpClient& GetDhcpClient()
 {
@@ -924,7 +967,7 @@ static const ulong WgetMaxUrlLen = 256;
 class WgetFileSink : public HttpSink
 {
 public:
-    WgetFileSink(File* file, Stdlib::Printer& con)
+    WgetFileSink(RustFile* file, Stdlib::Printer& con)
         : Out(file)
         , Con(con)
         , Buf(nullptr)
@@ -985,7 +1028,7 @@ public:
         ulong len = Used;
         Used = 0;
 
-        if (!Vfs::GetInstance().Write(Out, Buf, len))
+        if (kernel_vfs_write(Out, Buf, len) != 0)
         {
             Con.Printf("wget: write failed after %u bytes\n", Written);
             return false;
@@ -1002,7 +1045,7 @@ private:
     WgetFileSink(const WgetFileSink& other) = delete;
     WgetFileSink& operator=(const WgetFileSink& other) = delete;
 
-    File* Out;
+    RustFile* Out;
     Stdlib::Printer& Con;
     u8* Buf;
     ulong Used;      /* bytes buffered, not yet written */
@@ -1028,8 +1071,7 @@ static void WgetPrintFailure(const HttpResponse& resp, Stdlib::Printer& con)
 static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
                        Stdlib::Printer& con)
 {
-    File* file = Vfs::GetInstance().Open(path,
-        Vfs::OpenWrite | Vfs::OpenCreate | Vfs::OpenTruncate);
+    RustFile* file = FileOpen(path, FileWrite | FileCreate | FileTruncate);
     if (file == nullptr)
     {
         con.Printf("wget: cannot open %s for writing\n", path);
@@ -1040,7 +1082,7 @@ static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
     if (!sink.Setup())
     {
         con.Printf("wget: out of memory\n");
-        Vfs::GetInstance().Close(file);
+        kernel_vfs_close(file);
         return false;
     }
 
@@ -1048,12 +1090,12 @@ static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
     HttpResponse resp = client.Get(url, sink);
 
     bool flushed = sink.Flush();
-    Vfs::GetInstance().Close(file);
+    kernel_vfs_close(file);
 
     /* Nothing landed -- a failed request, or a body refused before the
        first byte: do not leave an empty file behind. */
     if (sink.GetTotal() == 0)
-        Vfs::GetInstance().Remove(path);
+        kernel_vfs_remove(path, Stdlib::StrLen(path));
 
     if (!resp.Ok)
     {
@@ -1087,7 +1129,7 @@ static bool WgetToFile(NetDevice* dev, const char* url, const char* path,
 static void CmdWget(const char* args, Stdlib::Printer& con)
 {
     char url[WgetMaxUrlLen];
-    char path[Vfs::MaxPath];
+    char path[MaxPath];
     url[0] = '\0';
     path[0] = '\0';
 
@@ -1097,7 +1139,7 @@ static void CmdWget(const char* args, Stdlib::Printer& con)
     for (const char* tok = Stdlib::NextToken(args, end); tok != nullptr;
          tok = Stdlib::NextToken(end, end))
     {
-        char arg[Vfs::MaxPath];
+        char arg[MaxPath];
         Stdlib::TokenCopy(tok, end, arg, sizeof(arg));
 
         if (Stdlib::StrCmp(arg, "-o") == 0)
@@ -1450,11 +1492,10 @@ static void CmdCrc32(const char* args, Stdlib::Printer& con)
         con.Printf("usage: crc32 <path>\n");
         return;
     }
-    char path[Vfs::MaxPath];
+    char path[MaxPath];
     Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
-    auto& vfs = Vfs::GetInstance();
-    File* file = vfs.Open(path, Vfs::OpenRead);
+    RustFile* file = FileOpen(path, FileRead);
     if (file == nullptr)
     {
         con.Printf("open failed\n");
@@ -1465,7 +1506,7 @@ static void CmdCrc32(const char* args, Stdlib::Printer& con)
     if (buf == nullptr)
     {
         con.Printf("alloc failed\n");
-        vfs.Close(file);
+        kernel_vfs_close(file);
         return;
     }
 
@@ -1475,7 +1516,7 @@ static void CmdCrc32(const char* args, Stdlib::Printer& con)
     for (;;)
     {
         ulong got = 0;
-        if (!vfs.Read(file, buf, ChunkSize, got))
+        if (kernel_vfs_read(file, buf, ChunkSize, &got) != 0)
         {
             ok = false;
             break;
@@ -1487,7 +1528,7 @@ static void CmdCrc32(const char* args, Stdlib::Printer& con)
     }
 
     Mm::Free(buf);
-    vfs.Close(file);
+    kernel_vfs_close(file);
 
     if (ok)
         con.Printf("%s: crc32 0x%p, %u bytes\n", path, (ulong)crc, total);
@@ -1519,11 +1560,10 @@ static void CmdSha256(const char* args, Stdlib::Printer& con)
         con.Printf("usage: sha256 <path>\n");
         return;
     }
-    char path[Vfs::MaxPath];
+    char path[MaxPath];
     Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
-    auto& vfs = Vfs::GetInstance();
-    File* file = vfs.Open(path, Vfs::OpenRead);
+    RustFile* file = FileOpen(path, FileRead);
     if (file == nullptr)
     {
         con.Printf("open failed\n");
@@ -1534,7 +1574,7 @@ static void CmdSha256(const char* args, Stdlib::Printer& con)
     if (buf == nullptr)
     {
         con.Printf("alloc failed\n");
-        vfs.Close(file);
+        kernel_vfs_close(file);
         return;
     }
 
@@ -1543,7 +1583,7 @@ static void CmdSha256(const char* args, Stdlib::Printer& con)
     for (;;)
     {
         ulong got = 0;
-        if (!vfs.Read(file, buf, ChunkSize, got))
+        if (kernel_vfs_read(file, buf, ChunkSize, &got) != 0)
         {
             ok = false;
             break;
@@ -1554,7 +1594,7 @@ static void CmdSha256(const char* args, Stdlib::Printer& con)
     }
 
     Mm::Free(buf);
-    vfs.Close(file);
+    kernel_vfs_close(file);
 
     if (!ok)
     {
@@ -1591,19 +1631,18 @@ static bool GrubenvPrintVar(const char* name, const char* value, void* ctx)
 /* The whole file, or nullptr with the reason printed; size comes with it */
 static char* GrubenvReadFile(const char* path, ulong& size, Stdlib::Printer& con)
 {
-    auto& vfs = Vfs::GetInstance();
-    File* file = vfs.Open(path, Vfs::OpenRead);
+    RustFile* file = FileOpen(path, FileRead);
     if (file == nullptr)
     {
         con.Printf("open failed\n");
         return nullptr;
     }
 
-    size = vfs.GetSize(file);
+    size = kernel_vfs_size(file);
     if (size < Stdlib::GrubEnvBlock::MinSize || size > GrubenvMaxSize)
     {
         con.Printf("%s: %u bytes is not a GRUB environment block\n", path, size);
-        vfs.Close(file);
+        kernel_vfs_close(file);
         return nullptr;
     }
 
@@ -1611,7 +1650,7 @@ static char* GrubenvReadFile(const char* path, ulong& size, Stdlib::Printer& con
     if (block == nullptr)
     {
         con.Printf("alloc failed\n");
-        vfs.Close(file);
+        kernel_vfs_close(file);
         return nullptr;
     }
 
@@ -1619,11 +1658,11 @@ static char* GrubenvReadFile(const char* path, ulong& size, Stdlib::Printer& con
     while (total < size)
     {
         ulong got = 0;
-        if (!vfs.Read(file, block + total, size - total, got) || got == 0)
+        if (kernel_vfs_read(file, block + total, size - total, &got) != 0 || got == 0)
             break;
         total += got;
     }
-    vfs.Close(file);
+    kernel_vfs_close(file);
 
     if (total != size)
     {
@@ -1648,7 +1687,7 @@ static void CmdGrubenv(const char* args, Stdlib::Printer& con)
         con.Printf("usage: grubenv <path> [name=value ...]  (name= removes it)\n");
         return;
     }
-    char path[Vfs::MaxPath];
+    char path[MaxPath];
     Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
     ulong size = 0;
@@ -1726,11 +1765,10 @@ static void CmdGrubenv(const char* args, Stdlib::Printer& con)
 
     /* Back in place, at the same size: GRUB's save_env writes the file's own
        disk blocks, so the file has to keep them */
-    auto& vfs = Vfs::GetInstance();
-    File* file = vfs.Open(path, Vfs::OpenWrite);
-    bool ok = (file != nullptr) && vfs.Write(file, block, size);
+    RustFile* file = FileOpen(path, FileWrite);
+    bool ok = (file != nullptr) && kernel_vfs_write(file, block, size) == 0;
     if (file != nullptr)
-        vfs.Close(file);
+        kernel_vfs_close(file);
     Mm::Free(block);
 
     if (!ok)
@@ -1738,7 +1776,7 @@ static void CmdGrubenv(const char* args, Stdlib::Printer& con)
         con.Printf("%s: write failed\n", path);
         return;
     }
-    if (!vfs.Sync())
+    if (kernel_vfs_sync() != 0)
         con.Printf("sync failed\n");
 }
 
@@ -2011,16 +2049,16 @@ static const ulong ScriptLineMax = 255;
 static const ulong ScriptTag = 'Rc  ';
 
 /* A script, NUL-terminated, in a buffer from Mm::Alloc the caller frees --
-   or nullptr, said on out, when it cannot be read. Found where Vfs::Locate
-   finds it. Past ScriptSizeMax only its whole lines are taken, whole comes
-   back false, and it is said: a command cut at the limit would run as some
-   other command. */
+   or nullptr, said on out, when it cannot be read. Read through the
+   whole-file calls, which look for it where a cut-short write may have left
+   it as well as where it belongs. Past ScriptSizeMax only its whole lines
+   are taken, whole comes back false, and it is said: a command cut at the
+   limit would run as some other command. */
 static char* ReadScript(const char* path, ulong& size, bool& whole, Stdlib::Printer& out)
 {
-    auto& vfs = Vfs::GetInstance();
-    char at[Vfs::MaxPath];
-    File* file = vfs.Locate(path, at, sizeof(at)) ? vfs.Open(at, Vfs::OpenRead) : nullptr;
-    if (file == nullptr)
+    const ulong pathLen = Stdlib::StrLen(path);
+    const long total = kernel_file_size(path, pathLen);
+    if (total < 0)
     {
         out.Printf("rc: cannot open %s\n", path);
         return nullptr;
@@ -2029,35 +2067,19 @@ static char* ReadScript(const char* path, ulong& size, bool& whole, Stdlib::Prin
     char* text = static_cast<char*>(Mm::Alloc(ScriptSizeMax + 1, ScriptTag));
     if (text == nullptr)
     {
-        vfs.Close(file);
         out.Printf("rc: no memory to read %s\n", path);
         return nullptr;
     }
 
-    size = 0;
-    bool ok = true;
-    while (size < ScriptSizeMax)
-    {
-        ulong got = 0;
-        if (!vfs.Read(file, text + size, ScriptSizeMax - size, got))
-        {
-            ok = false;
-            break;
-        }
-        if (got == 0)
-            break;
-        size += got;
-    }
-    ulong total = vfs.GetSize(file);
-    vfs.Close(file);
-
-    if (!ok)
+    const long got = kernel_file_read(path, pathLen, text, ScriptSizeMax);
+    if (got < 0)
     {
         Mm::Free(text);
         out.Printf("rc: cannot read %s\n", path);
         return nullptr;
     }
-    whole = (total <= size);
+    size = (ulong)got;
+    whole = ((ulong)total <= size);
     if (!whole)
     {
         ulong keep = size;
@@ -2215,8 +2237,7 @@ static const ulong RcLogSize = 8 * Const::KB;
 
 static void RcShow(Stdlib::Printer& con)
 {
-    char at[Vfs::MaxPath];
-    if (!Vfs::GetInstance().Locate(RcPath, at, sizeof(at)))
+    if (kernel_file_size(RcPath, Stdlib::StrLen(RcPath)) < 0)
     {
         con.Printf("rc: no %s -- rc add <command line> makes one\n", RcPath);
         return;
@@ -2248,7 +2269,7 @@ static void RcShow(Stdlib::Printer& con)
 }
 
 /* Writes a new /etc/rc: the lines of the old one but the one numbered skip
-   (0: none), then add if there is one -- through Vfs::ReplaceFile, since
+   (0: none), then add if there is one -- through kernel_file_write, since
    what it is for is the next boot, and a full disk must not leave it empty.
    One edit at a time (RcLock): two at once would each write over the other
    one's line. */
@@ -2256,13 +2277,9 @@ static bool RcRewrite(ulong skip, const char* add, Stdlib::Printer& con)
 {
     Stdlib::AutoLock lock(Cmd::GetInstance().GetRcLock());
 
-    auto& vfs = Vfs::GetInstance();
-    FileStat st;
-    char at[Vfs::MaxPath];
-
     ulong size = 0;
     char* old = nullptr;
-    if (vfs.Locate(RcPath, at, sizeof(at)))
+    if (kernel_file_size(RcPath, Stdlib::StrLen(RcPath)) >= 0)
     {
         bool whole = true;
         old = ReadScript(RcPath, size, whole, con);
@@ -2280,7 +2297,7 @@ static bool RcRewrite(ulong skip, const char* add, Stdlib::Printer& con)
         con.Printf("rc: no %s\n", RcPath);
         return false;
     }
-    else if (!vfs.Stat(RcDir, st) && !vfs.CreateDir(RcDir))
+    else if (kernel_dir_create(RcDir, Stdlib::StrLen(RcDir)) != 0)
     {
         con.Printf("rc: cannot make %s\n", RcDir);
         return false;
@@ -2346,7 +2363,7 @@ static bool RcRewrite(ulong skip, const char* add, Stdlib::Printer& con)
         text[pos++] = '\n';
     }
 
-    bool ok = vfs.ReplaceFile(RcPath, text, pos);
+    bool ok = kernel_file_write(RcPath, Stdlib::StrLen(RcPath), text, pos) == 0;
     Mm::Free(text);
     if (!ok)
     {
@@ -2394,17 +2411,14 @@ static void CmdRc(const char* args, Stdlib::Printer& con)
     else if (Stdlib::StrCmp(verb, "clear") == 0)
     {
         Stdlib::AutoLock lock(Cmd::GetInstance().GetRcLock());
-        auto& vfs = Vfs::GetInstance();
-        char at[Vfs::MaxPath];
-        if (!vfs.Locate(RcPath, at, sizeof(at)))
+        const ulong pathLen = Stdlib::StrLen(RcPath);
+        if (kernel_file_size(RcPath, pathLen) < 0)
         {
             con.Printf("rc: no %s\n", RcPath);
         }
-        else if (vfs.Remove(at))
+        else if (kernel_file_remove(RcPath, pathLen) == 0)
         {
-            /* And the other of the pair, should a cut-short edit have left both */
-            if (vfs.Locate(RcPath, at, sizeof(at)))
-                vfs.Remove(at);
+            /* Both of the pair go, should a cut-short edit have left both */
             con.Printf("rc: removed %s\n", RcPath);
         }
         else
@@ -2768,8 +2782,7 @@ bool Cmd::RunScript(const char* path, Stdlib::Printer& out, ScriptStep step, voi
 
 void Cmd::RunBootScript()
 {
-    char at[Vfs::MaxPath];
-    if (!Vfs::GetInstance().Locate(RcPath, at, sizeof(at)))
+    if (kernel_file_size(RcPath, Stdlib::StrLen(RcPath)) < 0)
         return;
 
     if (Parameters::GetInstance().IsRcOff())

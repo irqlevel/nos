@@ -369,6 +369,30 @@ pub unsafe extern "C" fn kernel_file_create(
     0
 }
 
+/// The file wherever it is -- at the path, and at `<path>.new` should a
+/// `replace_file` of it have been cut short leaving both. 0 once neither is
+/// there, -1 when one could not be removed. The pair is this layer's idea,
+/// so taking a file away whole is its job and not the caller's.
+///
+/// # Safety
+/// `path` points at `path_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_remove(path: *const u8, path_len: usize) -> i32 {
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return -1,
+    };
+
+    let mut removed_any = false;
+    while let Some(at) = locate(path) {
+        if !vfs.remove(at.as_bytes()) {
+            return -1;
+        }
+        removed_any = true;
+    }
+    if removed_any { 0 } else { -1 }
+}
+
 /// A directory, made if there is none by that name: 0 once there is one.
 ///
 /// # Safety
