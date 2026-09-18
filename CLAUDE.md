@@ -66,6 +66,13 @@ collector it runs itself and checks what arrives: the pre-link backlog, no
 gaps in the sequence numbers, lines after link-up, and a panic's report with
 its backtrace — on the Hetzner boxes netconsole is the only console there
 is, so run it after touching the trace path, the net device or netconsole.
+`./scripts/tcp-test.py` (arm64) fetches from an HTTP server it runs itself:
+a 400 KB body checked by SHA-256, a refused connection, one that has to time
+out, twelve in a row to reuse ephemeral ports through TIME-WAIT, and the
+connection table back where it started — a slot leaked per connection is
+invisible until the sixty-fourth. `scripts/sshd-test.py` covers the
+listening side (40 checks pass; the `poweroff unloads sshd before the
+unmount` one fails for reasons of its own, unrelated to TCP).
 
 Run in QEMU (serial console is logged to `nos.log`):
 
