@@ -19,6 +19,7 @@ pub mod icmp;
 pub mod net_load;
 pub mod netconsole;
 pub mod selftest;
+pub mod tcp;
 pub mod udp;
 pub mod udp_shell;
 pub mod wire;

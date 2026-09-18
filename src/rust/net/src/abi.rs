@@ -549,3 +549,268 @@ pub unsafe extern "C" fn rust_netload_stats(out: *mut NetLoadStats) {
 pub extern "C" fn rust_netload_cpu_rx(index: usize) -> usize {
     NET_LOAD.cpu_rx(index)
 }
+
+/* ---- TCP ---- */
+
+use crate::tcp::{self, Conn, ConnInfo, Stats as TcpStats, TCP};
+
+/// What the C++ side sees a connection as.
+type ConnPtr = *mut u8;
+
+/// # Safety
+/// `conn` came from connect, listen or accept and has not been closed.
+unsafe fn conn_of<'a>(conn: ConnPtr) -> Option<&'a Conn> {
+    if conn.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(conn as *const Conn) })
+    }
+}
+
+/// Start the connection pool's timer: 0 started, -1 not.
+#[no_mangle]
+pub extern "C" fn rust_tcp_init() -> i32 {
+    if TCP.init() { 0 } else { -1 }
+}
+
+/// A frame the receive path says carries TCP.
+///
+/// # Safety
+/// `data` points at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_process(dev: usize, data: *const u8, len: usize) {
+    let (nic, bytes) = match (unsafe { Nic::from_handle(dev) }, unsafe { frame(data, len) }) {
+        (Some(nic), Some(bytes)) => (nic, bytes),
+        _ => return,
+    };
+
+    TCP.process(&nic, bytes);
+}
+
+/// An active open, blocking until it is up or the timeout passes. A source
+/// port of 0 takes an ephemeral one. Null when it did not connect.
+#[no_mangle]
+pub extern "C" fn rust_tcp_connect(dev: usize, dst_ip: u32, dst_port: u16, src_port: u16)
+    -> ConnPtr
+{
+    let nic = match unsafe { Nic::from_handle(dev) } {
+        Some(nic) => nic,
+        None => return core::ptr::null_mut(),
+    };
+
+    match TCP.connect(&nic, dst_ip, dst_port, src_port) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// A passive open on the port, at every address this machine has.
+#[no_mangle]
+pub extern "C" fn rust_tcp_listen(dev: usize, port: u16) -> ConnPtr {
+    let nic = match unsafe { Nic::from_handle(dev) } {
+        Some(nic) => nic,
+        None => return core::ptr::null_mut(),
+    };
+
+    match TCP.listen(&nic, port) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// The next connection on a listener's port; null once the timeout passes
+/// with none, or once the listener is closed.
+///
+/// # Safety
+/// `listener` came from `rust_tcp_listen`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_accept(listener: ConnPtr, timeout_ms: u64) -> ConnPtr {
+    let listener = match unsafe { conn_of(listener) } {
+        Some(listener) => listener,
+        None => return core::ptr::null_mut(),
+    };
+
+    /* The pool is a static, so a connection lives as long as the kernel */
+    let listener: &'static Conn = unsafe { core::mem::transmute(listener) };
+    match TCP.accept(listener, timeout_ms) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// Queue and send: the bytes taken, or -1 when the connection went before
+/// any were.
+///
+/// # Safety
+/// `data` points at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_send(
+    conn: ConnPtr, data: *const u8, len: usize, timeout_ms: u64,
+) -> isize {
+    let conn = match unsafe { conn_of(conn) } {
+        Some(conn) => conn,
+        None => return -1,
+    };
+    if data.is_null() {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let conn: &'static Conn = unsafe { core::mem::transmute(conn) };
+    TCP.send(conn, unsafe { core::slice::from_raw_parts(data, len) }, timeout_ms)
+}
+
+/// What has arrived: the byte count, 0 at the end of the stream, or one of
+/// the negative answers.
+///
+/// # Safety
+/// `buf` takes `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_recv(
+    conn: ConnPtr, buf: *mut u8, len: usize, timeout_ms: u64,
+) -> isize {
+    let conn = match unsafe { conn_of(conn) } {
+        Some(conn) => conn,
+        None => return tcp::RECV_ERROR,
+    };
+    if buf.is_null() {
+        return tcp::RECV_ERROR;
+    }
+    if len == 0 {
+        return 0;
+    }
+
+    let conn: &'static Conn = unsafe { core::mem::transmute(conn) };
+    TCP.recv(conn, unsafe { core::slice::from_raw_parts_mut(buf, len) }, timeout_ms)
+}
+
+/// # Safety
+/// `conn` came from connect, listen or accept, and is not used again.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_close(conn: ConnPtr) {
+    if let Some(conn) = unsafe { conn_of(conn) } {
+        let conn: &'static Conn = unsafe { core::mem::transmute(conn) };
+        TCP.close(conn);
+    }
+}
+
+/// # Safety
+/// As for `rust_tcp_close`.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_abort(conn: ConnPtr) {
+    if let Some(conn) = unsafe { conn_of(conn) } {
+        let conn: &'static Conn = unsafe { core::mem::transmute(conn) };
+        TCP.abort(conn);
+    }
+}
+
+/// Who the connection is with; host byte order.
+///
+/// # Safety
+/// `ip` and `port` are writable, and `conn` is live.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_peer(conn: ConnPtr, ip: *mut u32, port: *mut u16) {
+    let conn = match unsafe { conn_of(conn) } {
+        Some(conn) => conn,
+        None => return,
+    };
+
+    let conn: &'static Conn = unsafe { core::mem::transmute(conn) };
+    let (peer_ip, peer_port) = TCP.peer(conn);
+    unsafe {
+        if !ip.is_null() {
+            *ip = peer_ip;
+        }
+        if !port.is_null() {
+            *port = peer_port;
+        }
+    }
+}
+
+/// A quoted segment came back unreachable.
+#[no_mangle]
+pub extern "C" fn rust_tcp_on_icmp_unreachable(
+    local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16, quoted_seq: u32,
+) {
+    TCP.on_icmp_unreachable(local_ip, local_port, remote_ip, remote_port, quoted_seq);
+}
+
+/// What `tcpstat` reports.
+///
+/// # Safety
+/// `out` points at a Stats.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_stats(out: *mut TcpStats) {
+    if out.is_null() {
+        return;
+    }
+    unsafe { *out = TCP.stats() };
+}
+
+/// What `tcpstat` prints per connection. The C++ side declares the same
+/// struct.
+#[repr(C)]
+pub struct TcpConnLine {
+    pub state: *const u8,
+    pub local_ip: u32,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub remote_ip: u32,
+    pub send_used: usize,
+    pub in_flight: usize,
+    pub recv_used: usize,
+}
+
+/// The index'th connection, or -1 when that slot is free.
+///
+/// # Safety
+/// `out` points at a TcpConnLine.
+#[no_mangle]
+pub unsafe extern "C" fn rust_tcp_conn_at(index: usize, out: *mut TcpConnLine) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+
+    let info: ConnInfo = match TCP.snapshot(index) {
+        Some(info) => info,
+        None => return -1,
+    };
+
+    /* The names are static strings with a NUL the C side reads to */
+    let name: &'static [u8] = match info.state {
+        tcp::State::Listen => b"LISTEN\0",
+        tcp::State::SynSent => b"SYN_SENT\0",
+        tcp::State::SynReceived => b"SYN_RCVD\0",
+        tcp::State::Established => b"ESTABLISHED\0",
+        tcp::State::FinWait1 => b"FIN_WAIT_1\0",
+        tcp::State::FinWait2 => b"FIN_WAIT_2\0",
+        tcp::State::CloseWait => b"CLOSE_WAIT\0",
+        tcp::State::LastAck => b"LAST_ACK\0",
+        tcp::State::Closing => b"CLOSING\0",
+        tcp::State::TimeWait => b"TIME_WAIT\0",
+        tcp::State::Closed => b"CLOSED\0",
+        tcp::State::Free => b"FREE\0",
+    };
+
+    unsafe {
+        *out = TcpConnLine {
+            state: name.as_ptr(),
+            local_ip: info.local_ip,
+            local_port: info.local_port,
+            remote_port: info.remote_port,
+            remote_ip: info.remote_ip,
+            send_used: info.send_used,
+            in_flight: info.in_flight,
+            recv_used: info.recv_used,
+        };
+    }
+    0
+}
+
+/// How many slots `rust_tcp_conn_at` will answer for.
+#[no_mangle]
+pub extern "C" fn rust_tcp_max_connections() -> usize {
+    tcp::MAX_CONNECTIONS
+}

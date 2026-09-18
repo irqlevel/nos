@@ -370,3 +370,45 @@ impl Drop for IrqSpinGuard<'_> {
         unsafe { ffi::cpu::kernel_irq_restore(self.flags) };
     }
 }
+
+/// A spin lock that owns nothing and takes and releases by hand, holding
+/// preemption off while it is taken -- the kernel's own `RawSpinLock`, in
+/// the shape Rust can put in a `static`.
+///
+/// Interrupts stay **on**. That is what makes it the wrong lock for anything
+/// a hard interrupt handler touches (use [`IrqSpinLock`] there) and the right
+/// one for a pool with a lock per entry: two of these can be held at once and
+/// released in either order, which a guard's scope cannot express. The holder
+/// cannot be switched away, so no other taker spins out a whole time slice.
+///
+/// Nothing that sleeps may run while it is held.
+pub struct PreemptSpinLock {
+    held: core::sync::atomic::AtomicBool,
+}
+
+unsafe impl Send for PreemptSpinLock {}
+unsafe impl Sync for PreemptSpinLock {}
+
+impl PreemptSpinLock {
+    pub const fn new() -> Self {
+        Self { held: core::sync::atomic::AtomicBool::new(false) }
+    }
+
+    pub fn lock(&self) {
+        use core::sync::atomic::Ordering;
+
+        unsafe { ffi::cpu::kernel_preempt_disable() };
+        while self.held.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+    }
+
+    /// # Safety
+    /// This caller holds it.
+    pub unsafe fn unlock(&self) {
+        use core::sync::atomic::Ordering;
+
+        self.held.store(false, Ordering::Release);
+        unsafe { ffi::cpu::kernel_preempt_enable() };
+    }
+}

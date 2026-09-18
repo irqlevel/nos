@@ -15,3 +15,9 @@ extern "C" {
     pub fn kernel_irq_save() -> usize;
     pub fn kernel_irq_restore(flags: usize);
 }
+
+/* Preemption off and back on, for a spin lock of the kernel's own kind. */
+extern "C" {
+    pub fn kernel_preempt_disable();
+    pub fn kernel_preempt_enable();
+}
