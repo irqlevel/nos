@@ -50,7 +50,6 @@
 #include <drivers/virtio_blk.h>
 #include <drivers/virtio_scsi.h>
 #include <drivers/virtio_net.h>
-#include <drivers/virtio_rng.h>
 #include <drivers/usb/xhci.h>
 
 #include <block/block_device.h>
@@ -488,7 +487,6 @@ void BpStartup(void* ctx)
         rust_init();
 
         VirtioNet::InitAll();
-        VirtioRng::InitAll();
 
         /* Now that the devices are here, fold what they can give into the
            pool: on a machine with a virtio-rng this is where it stops resting

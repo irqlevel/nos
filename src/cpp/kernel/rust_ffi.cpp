@@ -14,6 +14,7 @@
 #include "preempt.h"
 #include "cpu.h"
 #include "random.h"
+#include "entropy.h"
 #include "interrupt.h"
 #include <hal/cpu.h>
 #include <hal/context.h>
@@ -1426,6 +1427,59 @@ void kernel_msix_unregister_handler(unsigned long handle)
     /* Wait out an ISR mid-call on another CPU (see kernel_interrupt_unregister) */
     while (RustMsixSlots[i].InFlight.Get() != 0)
         Pause();
+}
+
+} /* extern "C" */
+
+/* ---- Entropy source bridge ---- */
+
+/* A source of raw entropy implemented in Rust -- the virtio-rng driver --
+   put in front of the kernel's pool (kernel/entropy.h). Registration is for
+   good, as it is for a C++ source, so nothing here is ever freed. */
+struct RustEntropyOps
+{
+    const char* Name;
+    int (*GetRandom)(void* ctx, void* buf, unsigned long len);
+    void* Ctx;
+};
+
+class RustEntropySource : public Kernel::EntropySource
+{
+public:
+    RustEntropyOps Ops;
+
+    const char* GetName() override { return Ops.Name; }
+
+    bool GetRandom(u8* buf, ulong len) override
+    {
+        return Ops.GetRandom(Ops.Ctx, buf, (unsigned long)len) == 0;
+    }
+};
+
+extern "C" {
+
+unsigned long kernel_entropy_source_register(const char* name,
+    int (*getRandom)(void* ctx, void* buf, unsigned long len), void* ctx)
+{
+    if (!name || !getRandom)
+        return 0;
+
+    RustEntropySource* src = Kernel::Mm::TAlloc<RustEntropySource, RustAllocTag>();
+    if (!src)
+        return 0;
+
+    src->Ops.Name = name;
+    src->Ops.GetRandom = getRandom;
+    src->Ops.Ctx = ctx;
+
+    if (!Kernel::EntropySourceTable::GetInstance().Register(src))
+    {
+        src->~RustEntropySource();
+        Kernel::Mm::Free(src);
+        return 0;
+    }
+
+    return (unsigned long)src;
 }
 
 } /* extern "C" */

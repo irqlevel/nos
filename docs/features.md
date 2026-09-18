@@ -4,6 +4,7 @@ Everything the kernel does today, by subsystem. For where the code lives see
 [Project layout](project-layout.md); for the interactive shell see
 [Shell commands](shell-commands.md).
 
+- **virtio in Rust** — the split virtqueue, the transport contract and both buses (virtio-pci modern *and* legacy, virtio-mmio v2) are `src/rust/virtio`; **virtio-rng** is the first device driver on it (`src/rust/drivers/virtio_rng`), feeding the entropy pool on both architectures. The remaining virtio devices (blk, scsi, net) still stand on the C++ foundation and move over one at a time
 - **Two architectures** — x86-64 (Multiboot2/GRUB, ISO or MBR disk boot, **legacy BIOS and UEFI firmware**) and arm64 (QEMU `virt` board, Linux `Image` boot protocol); portable code goes through a HAL layer (`src/cpp/hal/`), arch backends live in `src/cpp/arch/`
 - **SMP** — up to 64 CPUs (20 exercised on real hardware); AP bootstrap via INIT/SIPI on x86-64, PSCI `CPU_ON` on arm64, APs started one at a time, `maxcpus=N` to cap them
 - **Preemptive multitasking** — per-CPU task queues, round-robin scheduling, load-balanced task placement

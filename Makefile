@@ -85,7 +85,6 @@ CXX_SRC_x86_64 =   \
     src/cpp/drivers/virtio_blk.cpp \
     src/cpp/drivers/virtio_scsi.cpp \
     src/cpp/drivers/virtio_net.cpp \
-    src/cpp/drivers/virtio_rng.cpp \
     src/cpp/drivers/rtc.cpp \
     src/cpp/kernel/icxxabi.cpp    \
     src/cpp/kernel/interrupt.cpp   \
@@ -256,7 +255,6 @@ CXX_SRC_aarch64 = \
     src/cpp/drivers/virtio_blk.cpp \
     src/cpp/drivers/virtio_scsi.cpp \
     src/cpp/drivers/virtio_net.cpp \
-    src/cpp/drivers/virtio_rng.cpp \
     src/cpp/lib/stdlib.cpp \
     src/cpp/lib/format.cpp \
     src/cpp/lib/error.cpp \

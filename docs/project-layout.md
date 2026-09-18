@@ -12,7 +12,7 @@ src/cpp/
     x86_64/   Multiboot2 entry + AP trampoline (NASM), CPU primitives (asm.asm), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding, GRUB info parsing, HAL backends
     arm64/    Linux-Image boot + PSCI SMP (boot.S), EL1 vectors, GICv3 + ITS (LPIs for PCIe MSI), generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, HAL backends
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, the random pool, Rust FFI bridge, symbol table
-  drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi/rng (virtio-pci on x86-64, virtio-mmio on arm64)
+  drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi (virtio-pci on x86-64, virtio-mmio on arm64; the queue and both buses also exist in Rust, src/rust/virtio)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
   block/      The C++ view of a block device: a handle and the calls on it, plus the async request queue the virtio drivers use (the table itself is in Rust, src/rust/block)
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell, netconsole
@@ -28,7 +28,9 @@ src/rust/
     r8168/    Realtek r8168 network device driver
     r8125/    Realtek RTL8125 2.5GbE network device driver
     igb/      Intel I210 (igb) gigabit network device driver
+    virtio_rng/ virtio-rng, the host's entropy, on the Rust virtio foundation
   block/      The block layer: the device table, its claims, the `disks` and `partitions` commands, and the partition tables (MBR and GPT) a disk is cut up by
+  virtio/     The virtio foundation: the split virtqueue, the transport contract, virtio-pci (modern and legacy) and virtio-mmio v2
   hello/      Rust self-test module
   kernel/     Rust entry points (rust_main, rust_fini), global allocator
   kmod/       Runtime of a loadable module: allocator, panic handler, the module! header

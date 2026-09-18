@@ -33,7 +33,6 @@
 #include <drivers/virtio_blk.h>
 #include <drivers/virtio_net.h>
 #include <drivers/virtio_scsi.h>
-#include <drivers/virtio_rng.h>
 
 #include <net/tcp.h>
 
@@ -42,6 +41,9 @@ extern "C" void rust_test();
 extern "C" void rust_fini();
 /* The partition table reader (src/rust/block), the x86 twin's counterpart */
 extern "C" void rust_partitions_probe();
+/* The virtio-rng driver (src/rust/drivers/virtio_rng), which takes the
+   virtio-mmio windows the device tree described -- the arm64 bus. */
+extern "C" void rust_virtio_rng_init_mmio(const Kernel::VirtioMmioSlot* slots, unsigned long count);
 namespace Kernel { bool PciEcamSetup(); }
 extern "C" void __cxa_finalize(void*);
 extern "C" char BootStackTop[];
@@ -220,7 +222,7 @@ static void BpStartupArm(void* ctx)
         NetFramePool::GetInstance().Setup(netFrames);
 
         VirtioNet::InitAllMmio(Slots, count);
-        VirtioRng::InitAllMmio(Slots, count);
+        rust_virtio_rng_init_mmio(Slots, count);
 
         /* The virtio-rng carries the pool on this arch: no cpu here that the
            kernel runs on implements FEAT_RNG, Apple's included. */
