@@ -202,9 +202,9 @@ impl Vfs {
         true
     }
 
-    /// Take a filesystem off its mount point and answer with its context,
-    /// which is the caller's to release. 0 if it is not mounted or is busy.
-    pub fn unmount(&self, path: &[u8]) -> *mut u8 {
+    /// Take a filesystem off its mount point and release it. False if it is
+    /// not mounted there, or is busy.
+    pub fn unmount(&self, path: &[u8]) -> bool {
         let _guard = self.lock.lock();
         let inner = unsafe { &mut *self.inner.get() };
 
@@ -220,20 +220,23 @@ impl Vfs {
             let mount = inner.mounts[index].as_ref().unwrap();
             if mount.open_files != 0 {
                 trace!(0, "vfs: the mount is busy, {} files open", mount.open_files);
-                return core::ptr::null_mut();
+                return false;
             }
 
             let ops = mount.ops;
             let claim = mount.claim;
             (ops.unmount)(ops.ctx);
             kcore::block::release(claim);
+            if let Some(destroy) = ops.destroy {
+                destroy(ops.ctx);
+            }
 
             remove_mount(inner, index);
-            return ops.ctx;
+            return true;
         }
 
         trace!(0, "vfs: nothing is mounted there");
-        core::ptr::null_mut()
+        false
     }
 
     /// Take everything down, deepest mount first, releasing each filesystem.

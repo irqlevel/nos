@@ -46,7 +46,8 @@ public:
     static const ulong OpenAppend = 16;
 
     bool Mount(const char* path, FileSystem* fs, bool readOnly = false);
-    FileSystem* Unmount(const char* path);
+    /* Takes the filesystem off the path and releases it. */
+    bool Unmount(const char* path);
 
     File* Open(const char* path, ulong flags);
     void Close(File* file);

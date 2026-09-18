@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+pub mod ext2;
 pub mod vfs;
 pub mod vnode;
 
@@ -27,7 +28,7 @@ pub fn init() {}
 /// The one VFS, made on first use. That is early in boot, in task context,
 /// where its mutex can be allocated; two callers racing here both get the
 /// same one.
-fn vfs() -> Option<&'static Vfs> {
+pub(crate) fn vfs_instance() -> Option<&'static Vfs> {
     let existing = VFS.load(Ordering::Acquire);
     if !existing.is_null() {
         return Some(unsafe { &*existing });
@@ -55,7 +56,7 @@ fn vfs() -> Option<&'static Vfs> {
 
 /// # Safety
 /// `path` points at `len` readable bytes.
-unsafe fn path<'a>(path: *const u8, len: usize) -> Option<&'a [u8]> {
+pub(crate) unsafe fn path<'a>(path: *const u8, len: usize) -> Option<&'a [u8]> {
     if path.is_null() || len == 0 || len >= vfs::MAX_PATH {
         return None;
     }
@@ -71,7 +72,7 @@ unsafe fn path<'a>(path: *const u8, len: usize) -> Option<&'a [u8]> {
 pub unsafe extern "C" fn kernel_vfs_mount(
     path_ptr: *const u8, len: usize, ops: *const FsOps, read_only: i32,
 ) -> i32 {
-    let (vfs, at) = match (vfs(), unsafe { path(path_ptr, len) }) {
+    let (vfs, at) = match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) => (vfs, at),
         _ => return -1,
     };
@@ -87,28 +88,28 @@ pub unsafe extern "C" fn kernel_vfs_mount(
     }
 }
 
-/// The filesystem's context, for the caller to release, or null.
+/// Unmount what is at the path, releasing the filesystem: 0 done, -1 not.
 ///
 /// # Safety
 /// `path` points at `len` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_vfs_unmount(path_ptr: *const u8, len: usize) -> *mut u8 {
-    match (vfs(), unsafe { path(path_ptr, len) }) {
-        (Some(vfs), Some(at)) => vfs.unmount(at),
-        _ => core::ptr::null_mut(),
+pub unsafe extern "C" fn kernel_vfs_unmount(path_ptr: *const u8, len: usize) -> i32 {
+    match (vfs_instance(), unsafe { path(path_ptr, len) }) {
+        (Some(vfs), Some(at)) if vfs.unmount(at) => 0,
+        _ => -1,
     }
 }
 
 #[no_mangle]
 pub extern "C" fn kernel_vfs_unmount_all() {
-    if let Some(vfs) = vfs() {
+    if let Some(vfs) = vfs_instance() {
         vfs.unmount_all();
     }
 }
 
 #[no_mangle]
 pub extern "C" fn kernel_vfs_mount_count() -> usize {
-    vfs().map_or(0, |vfs| vfs.mount_count())
+    vfs_instance().map_or(0, |vfs| vfs.mount_count())
 }
 
 /// What the index'th mount is: 1 read-only, 0 writable, -1 past the end.
@@ -121,7 +122,7 @@ pub unsafe extern "C" fn kernel_vfs_mount_at(
     index: usize, path_out: *mut u8, path_len: usize,
     name_out: *mut *const u8, info_out: *mut u8, info_len: usize,
 ) -> i32 {
-    let vfs = match vfs() {
+    let vfs = match vfs_instance() {
         Some(vfs) => vfs,
         None => return -1,
     };
@@ -145,7 +146,7 @@ pub unsafe extern "C" fn kernel_vfs_mount_at(
 pub unsafe extern "C" fn kernel_vfs_open(
     path_ptr: *const u8, len: usize, flags: usize,
 ) -> *mut File {
-    match (vfs(), unsafe { path(path_ptr, len) }) {
+    match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) => vfs.open(at, flags),
         _ => core::ptr::null_mut(),
     }
@@ -155,7 +156,7 @@ pub unsafe extern "C" fn kernel_vfs_open(
 /// `file` came from `kernel_vfs_open` and is not used again.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_vfs_close(file: *mut File) {
-    if let Some(vfs) = vfs() {
+    if let Some(vfs) = vfs_instance() {
         vfs.close(file);
     }
 }
@@ -168,7 +169,7 @@ pub unsafe extern "C" fn kernel_vfs_close(file: *mut File) {
 pub unsafe extern "C" fn kernel_vfs_read(
     file: *mut File, buf: *mut u8, len: usize, out: *mut usize,
 ) -> i32 {
-    let vfs = match vfs() {
+    let vfs = match vfs_instance() {
         Some(vfs) => vfs,
         None => return -1,
     };
@@ -188,7 +189,7 @@ pub unsafe extern "C" fn kernel_vfs_read(
 /// `data` holds `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_vfs_write(file: *mut File, data: *const u8, len: usize) -> i32 {
-    match vfs() {
+    match vfs_instance() {
         Some(vfs) if vfs.write(file, data, len) => 0,
         _ => -1,
     }
@@ -198,7 +199,7 @@ pub unsafe extern "C" fn kernel_vfs_write(file: *mut File, data: *const u8, len:
 /// `file` came from `kernel_vfs_open`.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_vfs_seek(file: *mut File, pos: usize) -> i32 {
-    match vfs() {
+    match vfs_instance() {
         Some(vfs) if vfs.seek(file, pos) => 0,
         _ => -1,
     }
@@ -208,14 +209,14 @@ pub unsafe extern "C" fn kernel_vfs_seek(file: *mut File, pos: usize) -> i32 {
 /// `file` came from `kernel_vfs_open`.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_vfs_tell(file: *mut File) -> usize {
-    vfs().map_or(0, |vfs| vfs.tell(file))
+    vfs_instance().map_or(0, |vfs| vfs.tell(file))
 }
 
 /// # Safety
 /// `file` came from `kernel_vfs_open`.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_vfs_size(file: *mut File) -> usize {
-    vfs().map_or(0, |vfs| vfs.size(file))
+    vfs_instance().map_or(0, |vfs| vfs.size(file))
 }
 
 /* ---- paths ---- */
@@ -226,7 +227,7 @@ pub unsafe extern "C" fn kernel_vfs_size(file: *mut File) -> usize {
 pub unsafe extern "C" fn kernel_vfs_stat(
     path_ptr: *const u8, len: usize, out: *mut FileStat,
 ) -> i32 {
-    let (vfs, at) = match (vfs(), unsafe { path(path_ptr, len) }) {
+    let (vfs, at) = match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) => (vfs, at),
         _ => return -1,
     };
@@ -247,7 +248,7 @@ pub unsafe extern "C" fn kernel_vfs_stat(
 pub unsafe extern "C" fn kernel_vfs_readdir(
     path_ptr: *const u8, len: usize, index: usize, out: *mut DirEntry,
 ) -> i32 {
-    let (vfs, at) = match (vfs(), unsafe { path(path_ptr, len) }) {
+    let (vfs, at) = match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) => (vfs, at),
         _ => return -1,
     };
@@ -268,7 +269,7 @@ pub unsafe extern "C" fn kernel_vfs_readdir(
 pub unsafe extern "C" fn kernel_vfs_create(
     path_ptr: *const u8, len: usize, directory: i32,
 ) -> i32 {
-    match (vfs(), unsafe { path(path_ptr, len) }) {
+    match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) if vfs.create(at, directory != 0) => 0,
         _ => -1,
     }
@@ -278,7 +279,7 @@ pub unsafe extern "C" fn kernel_vfs_create(
 /// `path` points at `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_vfs_remove(path_ptr: *const u8, len: usize) -> i32 {
-    match (vfs(), unsafe { path(path_ptr, len) }) {
+    match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) if vfs.remove(at) => 0,
         _ => -1,
     }
@@ -290,7 +291,7 @@ pub unsafe extern "C" fn kernel_vfs_remove(path_ptr: *const u8, len: usize) -> i
 pub unsafe extern "C" fn kernel_vfs_truncate(
     path_ptr: *const u8, len: usize, size: usize,
 ) -> i32 {
-    match (vfs(), unsafe { path(path_ptr, len) }) {
+    match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) if vfs.truncate(at, size) => 0,
         _ => -1,
     }
@@ -302,7 +303,7 @@ pub unsafe extern "C" fn kernel_vfs_truncate(
 pub unsafe extern "C" fn kernel_vfs_rename(
     from_ptr: *const u8, from_len: usize, to_ptr: *const u8, to_len: usize,
 ) -> i32 {
-    let vfs = match vfs() {
+    let vfs = match vfs_instance() {
         Some(vfs) => vfs,
         None => return -1,
     };
@@ -315,7 +316,7 @@ pub unsafe extern "C" fn kernel_vfs_rename(
 
 #[no_mangle]
 pub extern "C" fn kernel_vfs_sync() -> i32 {
-    match vfs() {
+    match vfs_instance() {
         Some(vfs) if vfs.sync() => 0,
         _ => -1,
     }
@@ -329,7 +330,7 @@ pub extern "C" fn kernel_vfs_sync() -> i32 {
 pub unsafe extern "C" fn kernel_vfs_write_file(
     path_ptr: *const u8, len: usize, data: *const u8, data_len: usize,
 ) -> i32 {
-    match (vfs(), unsafe { path(path_ptr, len) }) {
+    match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) if vfs.write_file(at, data, data_len) => 0,
         _ => -1,
     }

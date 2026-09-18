@@ -1999,13 +1999,11 @@ Stdlib::Error TestVfs()
 
     bool ok = FsSelfTest("/", BigSize, nullptr);
 
-    FileSystem* unmounted = vfs.Unmount("/");
-    if (unmounted == nullptr)
+    if (!vfs.Unmount("/"))
     {
         Trace(0, "TestVfs: unmount failed");
         return MakeError(Stdlib::Error::Unsuccessful);
     }
-    delete unmounted;
 
     if (!ok)
     {

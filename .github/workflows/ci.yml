@@ -48,3 +48,11 @@ jobs:
       # notice the partition reader breaking.
       - name: Partition table test (${{ matrix.arch }}, TCG)
         run: python3 scripts/parttest.py --arch ${{ matrix.arch }} --tcg
+
+      # The smoke boot's fstest checks that ext2 reads back what it wrote;
+      # this checks that what it leaves on the disk is a filesystem e2fsck
+      # still calls clean. It drives the shell over UDP, which is the arm64
+      # boot's command line.
+      - name: ext2 write test (e2fsck, TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/ext2-test.py --tcg

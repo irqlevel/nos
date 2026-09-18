@@ -16,7 +16,7 @@ src/cpp/
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
   block/      The C++ view of a block device: a handle and the calls on it (the layer itself is in Rust, src/rust/block)
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell, netconsole
-  fs/         Filesystems: ramfs, nanofs, ext2 (rw), procfs, the root mount (rootfs.cpp), the self-test (fstest.cpp), and the C++ way into the VFS (vfs.cpp, which is in Rust: src/rust/fs)
+  fs/         Filesystems: ramfs, nanofs, procfs, the root mount (rootfs.cpp), the self-test (fstest.cpp), and the C++ way into the VFS and into ext2, both of which are in Rust (vfs.cpp, ext2.cpp -> src/rust/fs)
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
   lib/        Utilities: list, vector, btree, ring buffer, bitmap, CRC32 checksum, ChaCha20, stdlib
   include/    Shared headers
@@ -33,7 +33,7 @@ src/rust/
     virtio_net/ virtio-net, the card the network comes in on
     virtio_scsi/ virtio-scsi, a SCSI adapter and the disks behind it
   block/      The block layer: the device table, its claims, the `disks` and `partitions` commands, and the partition tables (MBR and GPT) a disk is cut up by
-  fs/         The VFS: the mount table, path resolution, open handles and the file API, over filesystems that give it an ops table
+  fs/         The VFS: the mount table, path resolution, open handles and the file API, over filesystems that give it an ops table -- and ext2 (ext2.rs), the first of them to live here
   virtio/     The virtio foundation: the split virtqueue, the transport contract, virtio-pci (modern and legacy) and virtio-mmio v2
   hello/      Rust self-test module
   kernel/     Rust entry points (rust_main, rust_fini), global allocator

@@ -36,7 +36,7 @@ static BlockDevice* FindRootDevice(const Parameters::RootSpec& spec)
     {
         BlockDevice* dev = table.GetDevice(i);
         Ext2Identity id;
-        if (dev == nullptr || !Ext2Fs::Probe(dev, id))
+        if (dev == nullptr || !Ext2Probe(dev, id))
             continue;
 
         switch (spec.Mode)
@@ -67,16 +67,15 @@ static bool MountRootOn(BlockDevice* dev, bool readOnly)
     auto& vfs = Vfs::GetInstance();
     Ext2Identity id;
 
-    if (Ext2Fs::Probe(dev, id))
+    if (Ext2Probe(dev, id))
     {
-        Ext2Fs* fs = new (Mm::NoThrow) Ext2Fs(dev);
-        if (fs != nullptr && vfs.Mount("/", fs, readOnly))
+        int mounted = Ext2Mount("/", dev, readOnly);
+        if (mounted != Ext2NotMounted)
         {
             Trace(0, "MountRootFs: mounted ext2 on / from %s (%s)", dev->GetName(),
-                  fs->ReadOnly ? "ro" : "rw");
+                  mounted == Ext2MountedRo ? "ro" : "rw");
             return true;
         }
-        delete fs;
         Trace(0, "MountRootFs: mounting ext2 from %s failed", dev->GetName());
         return false;
     }
@@ -115,16 +114,14 @@ static void MountFallbackLayout()
     {
         BlockDevice* dev = table.GetDevice(i);
         Ext2Identity id;
-        if (!Ext2Fs::Probe(dev, id))
+        if (!Ext2Probe(dev, id))
             continue;
-        Ext2Fs* ext2 = new (Mm::NoThrow) Ext2Fs(dev);
-        if (ext2 != nullptr && vfs.Mount("/boot", ext2, true))
+        if (Ext2Mount("/boot", dev, true) != Ext2NotMounted)
         {
             Trace(0, "MountRootFs: mounted ext2 on /boot from %s (ro)",
                 dev->GetName());
             break;
         }
-        delete ext2;
     }
 
     vfs.CreateDir("/data");
@@ -133,7 +130,7 @@ static void MountFallbackLayout()
     {
         BlockDevice* dev = table.GetDevice(i);
         Ext2Identity id;
-        if (Ext2Fs::Probe(dev, id))
+        if (Ext2Probe(dev, id))
             continue;
         NanoFs* nanofs = new (Mm::NoThrow) NanoFs(dev);
         if (nanofs != nullptr && vfs.Mount("/data", nanofs))

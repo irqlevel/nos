@@ -14,8 +14,9 @@ arm64 only, because it drives the shell over UDP and that is the boot whose
 command line carries one; the ext2 driver itself is the same code on either
 architecture, and x86 exercises it through the smoke test's `fstest=on`.
 
-e2fsck runs in the nos-builder image, as mkrootfs does when the host has no
-e2fsprogs. Exit code 0 = every check passed and the image is clean.
+e2fsck is the host's, or the one in the nos-builder image when the host has
+none, as mkrootfs does. Exit code 0 = every check passed and the image is
+clean.
 
 What this does not judge: the shutdown path after the filesystems are
 unmounted. arm64 has a known fault in the static destructors there
@@ -25,6 +26,7 @@ unmounted. arm64 has a known fault in the static destructors there
 import argparse
 import importlib.util
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -101,14 +103,17 @@ def wait_for(log, marker, timeout):
 
 
 def fsck(image):
-    """What e2fsck makes of the image, through Docker as mkrootfs does."""
-    at = os.path.dirname(image)
-    name = os.path.basename(image)
-    run = subprocess.run(
-        ["docker", "run", "--platform", "linux/amd64", "--rm",
-         "-v", "%s:/img" % at, "-w", "/img", "nos-builder",
-         "e2fsck", "-fn", "/img/" + name],
-        capture_output=True, text=True)
+    """What e2fsck makes of the image: the host's, or the one in the builder
+    image when the host has none -- the way mkrootfs.sh picks its mke2fs."""
+    if shutil.which("e2fsck"):
+        argv = ["e2fsck", "-fn", image]
+    else:
+        at = os.path.dirname(image)
+        name = os.path.basename(image)
+        argv = ["docker", "run", "--platform", "linux/amd64", "--rm",
+                "-v", "%s:/img" % at, "-w", "/img", "nos-builder",
+                "e2fsck", "-fn", "/img/" + name]
+    run = subprocess.run(argv, capture_output=True, text=True)
     return run.returncode, (run.stdout + run.stderr).strip()
 
 
