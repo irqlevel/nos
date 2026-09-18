@@ -16,6 +16,7 @@ extern crate alloc;
 
 mod disklog;
 mod part;
+mod selftest;
 mod shell;
 mod table;
 
