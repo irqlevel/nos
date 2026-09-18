@@ -56,6 +56,13 @@ sizes, both tables as `partitions` prints them, that a partition's sector 0
 is its first sector on the disk and that a read past its end is refused, and
 that a filesystem mounted on a partition keeps writers off the disk it is on.
 
+`./scripts/ext2-test.py` works the ext2 root filesystem from the shell --
+files made, grown past their direct blocks, copied, renamed, removed, a
+directory removed whole -- and then lets `e2fsck -fn` judge the image. The
+boot-time `fstest=on` checks that the driver reads back what it wrote; this
+checks the other half, that what is left on the disk is still a filesystem a
+checker calls clean. arm64 only, because it drives the UDP shell.
+
 `./scripts/wx-test.sh [--arch x86_64|aarch64]` is the W^X test: one boot per
 probe (`wxprobe=text`, `wxprobe=heap`), each of which has to die on the fault
 it asked for, at the address it printed. A kernel that survives a probe

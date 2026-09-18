@@ -258,6 +258,8 @@ impl Vfs {
             let mount = inner.mounts[deepest].as_ref().unwrap();
             let ops = mount.ops;
             let claim = mount.claim;
+            trace!(0, "vfs: unmounting {}",
+                core::str::from_utf8(mount.path()).unwrap_or("?"));
             if mount.open_files != 0 {
                 trace!(0, "vfs: unmounting with {} files still open", mount.open_files);
             }
