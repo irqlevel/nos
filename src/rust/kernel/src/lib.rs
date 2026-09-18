@@ -30,6 +30,7 @@ pub extern "C" fn rust_init() {
        boot path, and this puts its shell command in front of whoever runs
        one. */
     block::init();
+    fs::init();
     nvme::init();
     virtio_rng::init();
     virtio_blk::init();
