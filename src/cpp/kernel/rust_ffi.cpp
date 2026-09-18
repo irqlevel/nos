@@ -2087,6 +2087,33 @@ void kernel_net_mac(unsigned long dev, unsigned char* out)
     reinterpret_cast<Kernel::NetDevice*>(dev)->GetMac().CopyTo(out);
 }
 
+/* What to ARP for to reach dst: the gateway when dst is off-subnet, dst
+   itself when it is on it. Host byte order both ways. */
+unsigned int kernel_net_route_ip(unsigned long dev, unsigned int dst)
+{
+    Kernel::Net::IpAddress addr;
+    addr.Addr4 = dst;
+    return reinterpret_cast<Kernel::NetDevice*>(dev)->RouteIp(addr).Addr4;
+}
+
+/* A frame built whole by the caller -- headers and all -- out of the device.
+   0 queued, -1 dropped. */
+int kernel_net_send_raw(unsigned long dev, const unsigned char* data, unsigned long len)
+{
+    if (data == nullptr || len == 0)
+        return -1;
+    return reinterpret_cast<Kernel::NetDevice*>(dev)->SendRaw(data, len) ? 0 : -1;
+}
+
+/* A quoted TCP segment came back as unreachable: the connection it belongs
+   to is told, rather than left retransmitting into a void. Goes when TCP
+   moves over. */
+void kernel_tcp_icmp_unreachable(unsigned int srcIp, unsigned short srcPort,
+    unsigned int dstIp, unsigned short dstPort, unsigned int seq)
+{
+    Kernel::Tcp::GetInstance().OnIcmpUnreachable(srcIp, srcPort, dstIp, dstPort, seq);
+}
+
 int kernel_net_udp_listen(unsigned long dev, unsigned short port,
     Kernel::NetDevice::RxFrameCallback cb, void* ctx)
 {

@@ -38,6 +38,11 @@ extern "C" {
     /// Host byte order; 0 until the device has an address.
     pub fn kernel_net_ip(dev: usize) -> u32;
     pub fn kernel_net_mac(dev: usize, mac: *mut u8);
+    /// What to ARP for to reach `dst`: the gateway off-subnet, `dst` on it.
+    /// Host byte order both ways.
+    pub fn kernel_net_route_ip(dev: usize, dst: u32) -> u32;
+    /// A frame built whole by the caller, out of the device: 0 queued, -1 not.
+    pub fn kernel_net_send_raw(dev: usize, data: *const u8, len: usize) -> i32;
     /// Hands every UDP datagram to `port` to cb, the frame itself, from the
     /// receive softirq: 0 once listening, 1 when the port is taken, 2 when
     /// the device's listener table is full, 3 for port 0.
@@ -56,4 +61,11 @@ extern "C" {
     pub fn kernel_netframe_alloc_tx(data_len: usize) -> usize;
     /// Another reference to the frame.
     pub fn kernel_netframe_get(handle: usize);
+}
+
+/* A quoted TCP segment came back unreachable. Goes when TCP moves over. */
+extern "C" {
+    pub fn kernel_tcp_icmp_unreachable(
+        src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, seq: u32,
+    );
 }

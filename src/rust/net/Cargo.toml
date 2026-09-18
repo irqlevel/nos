@@ -1,0 +1,11 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+kcore = { path = "../kcore" }
+# ICMP tells the C++ TCP about an unreachable; that declaration lives here.
+ffi = { path = "../ffi" }

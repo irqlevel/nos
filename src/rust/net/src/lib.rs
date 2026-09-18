@@ -1,0 +1,22 @@
+//! The network layer: what is on the wire, and the protocols over it.
+//!
+//! [`wire`] is the frame formats -- Ethernet, ARP, IP, UDP, ICMP -- read and
+//! written through byte slices, with the internet checksum. The protocol
+//! modules sit on it, and reach the devices through `kcore::net`.
+//!
+//! The C++ side calls in by the names at the bottom of each module; the
+//! device layer and the protocols above TCP are still there and move next.
+
+#![no_std]
+
+extern crate alloc;
+
+pub mod abi;
+pub mod arp;
+pub mod icmp;
+pub mod selftest;
+pub mod wire;
+
+/// Nothing to set up: the layer is called from C++ by the names below, and
+/// this is what keeps them in the archive.
+pub fn init() {}

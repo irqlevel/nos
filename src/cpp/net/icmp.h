@@ -1,14 +1,13 @@
 #pragma once
 
 #include <include/types.h>
-#include <net/net_device.h>
-#include <kernel/spin_lock.h>
-#include <kernel/atomic.h>
-#include <lib/stdlib.h>
+#include <net/net.h>
 #include <lib/printer.h>
 
 namespace Kernel
 {
+
+class NetDevice;
 
 namespace Net
 {
@@ -26,6 +25,9 @@ static_assert(sizeof(IcmpHdr) == 8, "Invalid size");
 
 } /* namespace Net */
 
+/* ICMP itself is Rust (src/rust/net/src/icmp.rs): the echo requests and
+   replies, and the unreachables that abort a TCP connection. What is left
+   here is the way in. */
 class Icmp
 {
 public:
@@ -35,16 +37,15 @@ public:
         return instance;
     }
 
-    /* Process incoming ICMP packet (called from DrainRx). */
+    /* An ICMP packet off the wire, from the receive path. */
     void Process(NetDevice* dev, const u8* frame, ulong len);
 
-    /* Send an ICMP echo request to dstIp with given id and seq. */
     bool SendEchoRequest(NetDevice* dev, Net::IpAddress dstIp, u16 id, u16 seq);
 
-    /* Wait for a matching echo reply. Returns true and sets rttNs on success. */
+    /* The round trip of the reply to (id, seq) into rttNs; false once the
+       timeout passes with none. */
     bool WaitReply(u16 id, u16 seq, ulong timeoutMs, ulong& rttNs);
 
-    /* Dump ICMP statistics. */
     void Dump(Stdlib::Printer& printer);
 
     static const u8 TypeEchoReply   = 0;
@@ -57,33 +58,12 @@ public:
     static const u8 CodePortUnreach  = 3;
 
 private:
-    Icmp();
-    ~Icmp();
+    Icmp() {}
+    ~Icmp() {}
     Icmp(const Icmp& other) = delete;
     Icmp(Icmp&& other) = delete;
     Icmp& operator=(const Icmp& other) = delete;
     Icmp& operator=(Icmp&& other) = delete;
-
-    struct ReplySlot
-    {
-        bool Valid;
-        u16 Id;
-        u16 Seq;
-        Stdlib::Time Timestamp;
-    };
-
-    ReplySlot Reply;
-    Stdlib::Time SendTime;
-    SpinLock Lock;
-
-    Atomic EchoReqRx;      /* echo requests received */
-    Atomic EchoReplyTx;    /* echo replies sent */
-    Atomic EchoReplyTxFail;/* echo replies failed to send */
-    Atomic EchoReqTx;      /* echo requests sent */
-    Atomic EchoReplyRx;    /* echo replies received */
-    Atomic RxTooShort;     /* packets too short */
-    Atomic RxOther;        /* other ICMP types received */
-    Atomic RxBadCsum;      /* packets dropped for bad ICMP checksum */
 };
 
 }

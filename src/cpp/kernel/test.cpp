@@ -2010,6 +2010,27 @@ Stdlib::Error TestVfs()
     return MakeSuccess();
 }
 
+/* The network layer's packet formats (src/rust/net/src/selftest.rs). A ping
+   that comes back checks the sending half; what it cannot reach is the
+   receiving one -- under QEMU user networking nothing ever pings this
+   machine or asks for its address -- so the formats behind those answers are
+   checked here instead, against packets written out by hand. */
+extern "C" int rust_net_selftest();
+
+Stdlib::Error TestNetWire()
+{
+    Trace(0, "TestNetWire: started");
+
+    if (rust_net_selftest() != 0)
+    {
+        Trace(0, "TestNetWire: failed");
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    Trace(0, "TestNetWire: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error TestChaCha20()
 {
     Trace(0, "TestChaCha20: started");
@@ -2612,6 +2633,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestChaCha20();
+    if (!err.Ok())
+        return err;
+
+    err = TestNetWire();
     if (!err.Ok())
         return err;
 
