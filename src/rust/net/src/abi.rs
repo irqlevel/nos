@@ -429,12 +429,24 @@ fn udp_shell() -> Option<&'static UdpShell> {
 /// Start the shell on the device's `port`: 0 started, -1 not.
 #[no_mangle]
 pub extern "C" fn rust_udp_shell_start(dev: usize, port: u16) -> i32 {
-    let (shell, nic) = match (udp_shell(), unsafe { Nic::from_handle(dev) }) {
-        (Some(shell), Some(nic)) => (shell, nic),
-        _ => return -1,
-    };
+    match unsafe { Nic::from_handle(dev) } {
+        Some(nic) if udp_shell_start(nic, port) => 0,
+        _ => -1,
+    }
+}
 
-    if shell.start(nic, port) { 0 } else { -1 }
+/// The same, for the boot path in this crate.
+pub(crate) fn udp_shell_start(nic: Nic, port: u16) -> bool {
+    match udp_shell() {
+        Some(shell) => shell.start(nic, port),
+        None => false,
+    }
+}
+
+pub(crate) fn udp_shell_stop() {
+    if let Some(shell) = udp_shell() {
+        shell.stop();
+    }
 }
 
 /// Stop it and give up the port. Returns once its task has left.
@@ -820,4 +832,129 @@ pub unsafe extern "C" fn rust_tcp_conn_at(index: usize, out: *mut TcpConnLine) -
 #[no_mangle]
 pub extern "C" fn rust_tcp_max_connections() -> usize {
     tcp::MAX_CONNECTIONS
+}
+
+/* ---- TCP, as a module and the TLS client call it ---- */
+
+/* These were defined in `rust_ffi.cpp`, over the C++ `Tcp` view, which called
+ * straight back into this crate: Rust to C++ to Rust for every byte the SSH
+ * server sent. They are the same names and the same contract, one hop now. */
+
+/// The bytes queued, or -1 when the connection is gone before any were.
+///
+/// # Safety
+/// `conn` came from a listen, accept or connect, and `buf` holds `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_send(
+    conn: ConnPtr, buf: *const u8, len: usize,
+) -> isize {
+    unsafe { kernel_tcp_send_timeout(conn, buf, len, 0) }
+}
+
+/// `kernel_tcp_send` with a bound on the wait for room: the bytes queued, 0
+/// when `timeout_ms` found room for none, -1 once the connection is gone.
+///
+/// # Safety
+/// `conn` came from a listen, accept or connect, and `buf` holds `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_send_timeout(
+    conn: ConnPtr, buf: *const u8, len: usize, timeout_ms: u64,
+) -> isize {
+    let conn = match unsafe { conn_of(conn) } { Some(conn) => conn, None => return -1 };
+    if buf.is_null() {
+        return -1;
+    }
+    TCP.send(conn, unsafe { core::slice::from_raw_parts(buf, len) }, timeout_ms)
+}
+
+/// The byte count, 0 at end of stream, -1 on a bad argument, -2 on a timeout.
+///
+/// # Safety
+/// `conn` came from a listen, accept or connect, and `buf` takes `len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_recv(
+    conn: ConnPtr, buf: *mut u8, len: usize, timeout_ms: u64,
+) -> isize {
+    let conn = match unsafe { conn_of(conn) } { Some(conn) => conn, None => return -1 };
+    if buf.is_null() {
+        return -1;
+    }
+    TCP.recv(conn, unsafe { core::slice::from_raw_parts_mut(buf, len) }, timeout_ms)
+}
+
+/// A server of Rust's -- sshd's -- owns its connections rather than borrowing
+/// one: it listens on a device's port, accepts, and closes both what it
+/// accepted and the listener. `dev` is a `kernel_net_find` handle.
+#[no_mangle]
+pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16) -> ConnPtr {
+    if dev == 0 || port == 0 {
+        return core::ptr::null_mut();
+    }
+    let nic = match unsafe { Nic::from_handle(dev) } {
+        Some(nic) => nic,
+        None => return core::ptr::null_mut(),
+    };
+    match TCP.listen(&nic, port) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// The next connection on the listener's port: null once `timeout_ms` passes
+/// with none, or once the listener is closed.
+///
+/// # Safety
+/// `listener` came from `kernel_tcp_listen`.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_accept(
+    listener: ConnPtr, timeout_ms: u64,
+) -> ConnPtr {
+    let listener = match unsafe { conn_of(listener) } {
+        Some(listener) => listener,
+        None => return core::ptr::null_mut(),
+    };
+    match TCP.accept(listener, timeout_ms) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
+/// # Safety
+/// `conn` came from a listen, accept or connect and is not used again.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_close(conn: ConnPtr) {
+    if let Some(conn) = unsafe { conn_of(conn) } {
+        TCP.close(conn);
+    }
+}
+
+/// A connection a server refuses or drops: reset, so that its slot does not
+/// sit out TIME-WAIT.
+///
+/// # Safety
+/// `conn` came from a listen, accept or connect and is not used again.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_abort(conn: ConnPtr) {
+    if let Some(conn) = unsafe { conn_of(conn) } {
+        TCP.abort(conn);
+    }
+}
+
+/// Who is at the other end: the address in host byte order, and the port.
+///
+/// # Safety
+/// `conn` came from a listen, accept or connect; `ip` and `port` are
+/// writable or null.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_tcp_peer(
+    conn: ConnPtr, ip: *mut u32, port: *mut u16,
+) {
+    let conn = match unsafe { conn_of(conn) } { Some(conn) => conn, None => return };
+    let (addr, remote) = TCP.peer(conn);
+    if !ip.is_null() {
+        unsafe { *ip = addr };
+    }
+    if !port.is_null() {
+        unsafe { *port = remote };
+    }
 }

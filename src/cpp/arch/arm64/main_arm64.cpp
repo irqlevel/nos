@@ -28,9 +28,16 @@
 #include <hal/power.h>
 
 
-#include <net/tcp.h>
 
 extern "C" void rust_init();
+/* The network layer is Rust (src/rust/net): the recycled frame pool, the
+   log over UDP armed as soon as the command line is known, TCP, and the
+   services boot starts once there is a device and a shell. */
+extern "C" int rust_netframe_pool_setup(unsigned long count);
+extern "C" int rust_netconsole_setup();
+extern "C" int rust_tcp_init();
+extern "C" void rust_net_start_services(unsigned short udpShellPort);
+extern "C" void rust_net_stop_services();
 /* The filesystem layer is Rust (src/rust/fs): what boot mounts where, and
    taking it all down again on the way out. */
 extern "C" void rust_mount_root_fs();
@@ -69,10 +76,6 @@ extern "C" void rust_virtio_scsi_init_mmio(const Kernel::VirtioMmioSlot* slots, 
 namespace Kernel { bool PciEcamSetup(); }
 extern "C" void __cxa_finalize(void*);
 extern "C" char BootStackTop[];
-#include <net/udp_shell.h>
-#include <net/netconsole.h>
-#include <net/net_frame_pool.h>
-#include <net/net_device.h>
 #include <kernel/module.h>
 
 /* arm64 boot orchestrator, the Main2 twin (kernel/main.cpp). Milestone M2:
@@ -234,11 +237,8 @@ static void BpStartupArm(void* ctx)
 
         rust_virtio_blk_init_mmio(Slots, count);
         rust_virtio_scsi_init_mmio(Slots, count);
-        ulong netFrames = Parameters::GetInstance().GetNetFrameCount();
-        if (netFrames == 0)
-            netFrames = NetFramePool::DefaultFrameCount;
-
-        NetFramePool::GetInstance().Setup(netFrames);
+        /* 0 means the layer's own default. */
+        rust_netframe_pool_setup(Parameters::GetInstance().GetNetFrameCount());
 
         rust_virtio_net_init_mmio(Slots, count);
         rust_virtio_rng_init_mmio(Slots, count);
@@ -295,7 +295,7 @@ static void BpStartupArm(void* ctx)
        has been held in memory and goes down as soon as the area is found. */
     rust_disklog_setup();
 
-    Tcp::GetInstance().Init();
+    rust_tcp_init();
 
     auto& cmd = Cmd::GetInstance();
     if (!Pl011::GetInstance().RegisterObserver(cmd))
@@ -310,31 +310,9 @@ static void BpStartupArm(void* ctx)
         return;
     }
 
-    auto& netconsole = Netconsole::GetInstance();
-    if (netconsole.IsEnabled())
-    {
-        NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
-        if (netDev == nullptr)
-            Trace(0, "Netconsole: eth0 not found");
-        else if (!netconsole.Start(netDev))
-            Trace(0, "Netconsole: failed to start");
-    }
-
-    UdpShell udpShell;
-    u16 udpShellPort = Parameters::GetInstance().GetUdpShellPort();
-    if (udpShellPort != 0)
-    {
-        NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
-        if (netDev)
-        {
-            if (!udpShell.Start(netDev, udpShellPort))
-                Trace(0, "UdpShell: failed to start on port %u", (ulong)udpShellPort);
-        }
-        else
-        {
-            Trace(0, "UdpShell: eth0 not found");
-        }
-    }
+    /* The netconsole, if the command line asked for one, and the shell over
+       UDP: both on eth0, both the layer's to start. */
+    rust_net_start_services(Parameters::GetInstance().GetUdpShellPort());
 
     Trace(0, "boot: complete");
 
@@ -349,8 +327,7 @@ static void BpStartupArm(void* ctx)
             else
                 Trace(0, "Shutdown requested");
 
-            udpShell.Stop();
-            netconsole.Stop();
+            rust_net_stop_services();
             cmd.Stop();
             cmd.StopDhcp();
 
@@ -503,7 +480,7 @@ extern "C" void MainArm64(void* dtb)
 
     /* Arm log capture as soon as the command line is known: the ring buffers
        everything until the network can carry it away. */
-    Netconsole::GetInstance().Setup();
+    rust_netconsole_setup();
 
     Trace(0, "Enter kernel: start 0x%p end 0x%p",
         mmap.GetKernelStart(), mmap.GetKernelEnd());

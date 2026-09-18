@@ -1,5 +1,4 @@
 #include "generic_timer.h"
-#include <net/net_device.h>
 #include "board.h"
 #include "gicv3.h"
 
@@ -18,6 +17,9 @@
    (drivers/pit.cpp); here the timer PPI is banked per-CPU, so each CPU
    ticks itself — no per-tick IPI broadcast, and each CPU schedules
    independently. Timekeeping reads CNTVCT directly (time_arm64.cpp). */
+
+/* The network layer is Rust (src/rust/net). */
+extern "C" void rust_net_poll_rx();
 
 namespace Kernel
 {
@@ -111,8 +113,8 @@ void GenericTimer::LocalTick(Context* ctx)
         TimerTable::GetInstance().ProcessTimers();
 
         /* And look at the receive path, whether or not a NIC asked. See
-           NetDeviceTable::PollRx. */
-        NetDeviceTable::GetInstance().PollRx();
+           the network layer's poll. */
+        rust_net_poll_rx();
     }
 
     /* EOI before Preempt(): it may context-switch away and only return

@@ -98,17 +98,6 @@ CXX_SRC_x86_64 =   \
     src/cpp/kernel/cpu.cpp  \
     src/cpp/kernel/cmd.cpp  \
     src/cpp/kernel/input.cpp \
-    src/cpp/net/net_device.cpp \
-    src/cpp/net/net_frame_pool.cpp \
-    src/cpp/net/net_load.cpp \
-    src/cpp/net/arp.cpp \
-    src/cpp/net/dhcp.cpp \
-    src/cpp/net/icmp.cpp \
-    src/cpp/net/udp_shell.cpp \
-    src/cpp/net/netconsole.cpp \
-    src/cpp/net/dns.cpp \
-    src/cpp/net/tcp.cpp \
-    src/cpp/net/http.cpp \
     src/cpp/kernel/mutex.cpp \
     src/cpp/kernel/wait_group.cpp \
     src/cpp/kernel/event.cpp \
@@ -209,17 +198,6 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/input.cpp \
     src/cpp/kernel/entropy.cpp \
     src/cpp/kernel/random.cpp \
-    src/cpp/net/net_device.cpp \
-    src/cpp/net/net_frame_pool.cpp \
-    src/cpp/net/net_load.cpp \
-    src/cpp/net/arp.cpp \
-    src/cpp/net/dhcp.cpp \
-    src/cpp/net/icmp.cpp \
-    src/cpp/net/udp_shell.cpp \
-    src/cpp/net/netconsole.cpp \
-    src/cpp/net/dns.cpp \
-    src/cpp/net/tcp.cpp \
-    src/cpp/net/http.cpp \
     src/cpp/lib/stdlib.cpp \
     src/cpp/lib/format.cpp \
     src/cpp/lib/error.cpp \

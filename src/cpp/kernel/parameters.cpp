@@ -134,7 +134,7 @@ bool Parameters::IsNetconsoleEnabled()
     return NetconsolePort != 0;
 }
 
-Net::IpAddress Parameters::GetNetconsoleIp()
+u32 Parameters::GetNetconsoleIp()
 {
     return NetconsoleIp;
 }
@@ -221,6 +221,42 @@ bool Parameters::ParseUuid(const char* text, u8* out)
 const char* Parameters::GetCmdline()
 {
     return Cmdline;
+}
+
+/* A dotted quad into host byte order. The only thing the command line has
+   ever needed of an address, and the reason this file used to include the
+   whole network layer's header. */
+static bool ParseIpV4(const char* text, u32& out)
+{
+    u32 addr = 0;
+    for (ulong octet = 0; octet < 4; octet++)
+    {
+        if (*text < '0' || *text > '9')
+            return false;
+
+        u32 value = 0;
+        while (*text >= '0' && *text <= '9')
+        {
+            value = value * 10 + (u32)(*text - '0');
+            if (value > 255)
+                return false;
+            text++;
+        }
+        addr = (addr << 8) | value;
+
+        if (octet < 3)
+        {
+            if (*text != '.')
+                return false;
+            text++;
+        }
+    }
+
+    if (*text != '\0')
+        return false;
+
+    out = addr;
+    return true;
 }
 
 bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
@@ -398,7 +434,7 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
             size_t ipLen = colon - value;
             ulong port = 0;
 
-            Net::IpAddress ip;
+            u32 ip = 0;
             if (ipLen >= sizeof(ipBuf))
             {
                 Trace(0, "Invalid netconsole ip in %s", value);
@@ -406,7 +442,7 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
             else
             {
                 Stdlib::StrnCpy(ipBuf, value, ipLen + 1);
-                if (!Net::IpAddress::Parse(ipBuf, ip))
+                if (!ParseIpV4(ipBuf, ip))
                 {
                     Trace(0, "Invalid netconsole ip %s", ipBuf);
                 }

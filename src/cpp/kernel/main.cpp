@@ -48,11 +48,6 @@
 #include <drivers/pci.h>
 #include <drivers/usb/xhci.h>
 
-#include <net/udp_shell.h>
-#include <net/net_frame_pool.h>
-#include <net/netconsole.h>
-#include <net/net_device.h>
-#include <net/tcp.h>
 #include <kernel/stack_probe.h>
 #include <kernel/module.h>
 #include <arch/x86_64/percpu.h>
@@ -406,6 +401,14 @@ void SomeTaskRoutine(void *ctx)
    All C++ objects with non-trivial destructors must go out of
    scope before those calls, so the body is wrapped in a block. */
 extern "C" void rust_init();
+/* The network layer is Rust (src/rust/net): the recycled frame pool, the
+   log over UDP armed as soon as the command line is known, TCP, and the
+   services boot starts once there is a device and a shell. */
+extern "C" int rust_netframe_pool_setup(unsigned long count);
+extern "C" int rust_netconsole_setup();
+extern "C" int rust_tcp_init();
+extern "C" void rust_net_start_services(unsigned short udpShellPort);
+extern "C" void rust_net_stop_services();
 /* The block layer is Rust (src/rust/block): before this, a synchronous I/O
    has to poll its device, because there is nothing yet to wake a waiter. */
 extern "C" void kernel_blockdev_set_interrupts_started();
@@ -491,11 +494,8 @@ void BpStartup(void* ctx)
            in the receive softirq until the ring had turned over: on the AX41
            two seconds at 256 frames a second, the NIC dropping the rest.
            arm64 has always had this order. */
-        ulong netFrames = Parameters::GetInstance().GetNetFrameCount();
-        if (netFrames == 0)
-            netFrames = NetFramePool::DefaultFrameCount;
-
-        NetFramePool::GetInstance().Setup(netFrames);
+        /* 0 means the layer's own default. */
+        rust_netframe_pool_setup(Parameters::GetInstance().GetNetFrameCount());
 
         rust_init();
 
@@ -639,7 +639,7 @@ void BpStartup(void* ctx)
            completion path in the NVMe driver. */
         rust_disklog_setup();
 
-        Tcp::GetInstance().Init();
+        rust_tcp_init();
 
         /* On a machine with no PS/2 controller the xHCI HID keyboard is the
            only way in, so bring it up before the shell starts: enumeration
@@ -661,31 +661,9 @@ void BpStartup(void* ctx)
             return;
         }
 
-        auto& netconsole = Netconsole::GetInstance();
-        if (netconsole.IsEnabled())
-        {
-            NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
-            if (netDev == nullptr)
-                Trace(0, "Netconsole: eth0 not found");
-            else if (!netconsole.Start(netDev))
-                Trace(0, "Netconsole: failed to start");
-        }
-
-        UdpShell udpShell;
-        u16 udpShellPort = Parameters::GetInstance().GetUdpShellPort();
-        if (udpShellPort != 0)
-        {
-            NetDevice* netDev = NetDeviceTable::GetInstance().Find("eth0");
-            if (netDev)
-            {
-                if (!udpShell.Start(netDev, udpShellPort))
-                    Trace(0, "UdpShell: failed to start on port %u", (ulong)udpShellPort);
-            }
-            else
-            {
-                Trace(0, "UdpShell: eth0 not found");
-            }
-        }
+        /* The netconsole, if the command line asked for one, and the shell over
+           UDP: both on eth0, both the layer's to start. */
+        rust_net_start_services(Parameters::GetInstance().GetUdpShellPort());
 
         Trace(0, "boot: complete");
 
@@ -699,8 +677,7 @@ void BpStartup(void* ctx)
                     Trace(0, "Reboot requested");
                 else
                     Trace(0, "Shutdown requested");
-                udpShell.Stop();
-                netconsole.Stop();
+                rust_net_stop_services();
                 Usb::Stop();
                 cmd.Stop();
                 cmd.StopDhcp();
@@ -838,7 +815,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     /* Arm log capture as soon as the command line is known: the ring buffers
        everything until the network can carry it away. */
-    Netconsole::GetInstance().Setup();
+    rust_netconsole_setup();
 
     auto& mmap = Mm::MemoryMap::GetInstance();
     Trace(0, "Enter kernel: start 0x%p end 0x%p",

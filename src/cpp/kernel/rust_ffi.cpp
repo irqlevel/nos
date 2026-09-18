@@ -29,8 +29,6 @@
 #include <drivers/pci.h>
 #include <drivers/msix.h>
 #include <hal/irqchip.h>
-#include <net/net_device.h>
-#include <net/tcp.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
 #include "parameters.h"
@@ -655,85 +653,6 @@ int kernel_get_random(unsigned char* buf, unsigned long len)
 
     random.GetBytes(buf, (ulong)len);
     return 1;
-}
-
-/* ---- TCP, for the Rust TLS client ---- */
-
-/* The TLS session runs on the connection its C++ owner opened; these two
-   are the whole of what rustls needs from the socket. */
-long kernel_tcp_send(void* conn, const unsigned char* buf, unsigned long len)
-{
-    if (!conn || !buf)
-        return -1;
-    return Kernel::Tcp::GetInstance().Send((Kernel::TcpConn*)conn, buf, (ulong)len);
-}
-
-long kernel_tcp_recv(void* conn, unsigned char* buf, unsigned long len,
-                     unsigned long timeoutMs)
-{
-    if (!conn || !buf)
-        return -1;
-    return Kernel::Tcp::GetInstance().Recv((Kernel::TcpConn*)conn, buf, (ulong)len,
-                                           (ulong)timeoutMs);
-}
-
-/* A server of Rust's -- sshd's -- owns its connections rather than
-   borrowing one: it listens on a device's port, accepts, and closes both
-   what it accepted and the listener. dev is a kernel_net_find handle. */
-void* kernel_tcp_listen(unsigned long dev, unsigned short port)
-{
-    if (dev == 0 || port == 0)
-        return nullptr;
-    return Kernel::Tcp::GetInstance().Listen(reinterpret_cast<Kernel::NetDevice*>(dev), port);
-}
-
-/* The next connection on the listener's port: nullptr once timeoutMs passes
-   with none, or once the listener is closed */
-void* kernel_tcp_accept(void* listener, unsigned long timeoutMs)
-{
-    if (!listener)
-        return nullptr;
-    return Kernel::Tcp::GetInstance().Accept((Kernel::TcpConn*)listener, (ulong)timeoutMs);
-}
-
-void kernel_tcp_close(void* conn)
-{
-    if (conn)
-        Kernel::Tcp::GetInstance().Close((Kernel::TcpConn*)conn);
-}
-
-/* A connection a server refuses or drops: reset, so that its slot does not
-   sit out TIME-WAIT */
-void kernel_tcp_abort(void* conn)
-{
-    if (conn)
-        Kernel::Tcp::GetInstance().Abort((Kernel::TcpConn*)conn);
-}
-
-/* kernel_tcp_send with a bound on the wait for room: the bytes queued, 0
-   when timeoutMs found room for none, -1 once the connection is gone */
-long kernel_tcp_send_timeout(void* conn, const unsigned char* buf, unsigned long len,
-                             unsigned long timeoutMs)
-{
-    if (!conn || !buf)
-        return -1;
-    return Kernel::Tcp::GetInstance().Send((Kernel::TcpConn*)conn, buf, (ulong)len,
-                                           (ulong)timeoutMs);
-}
-
-/* Who is at the other end: the address in host byte order, and the port */
-void kernel_tcp_peer(void* conn, unsigned int* ip, unsigned short* port)
-{
-    if (!conn)
-        return;
-
-    unsigned int addr = 0;
-    unsigned short remote = 0;
-    Kernel::Tcp::GetInstance().Peer((Kernel::TcpConn*)conn, addr, remote);
-    if (ip)
-        *ip = addr;
-    if (port)
-        *port = remote;
 }
 
 /* ---- Soft IRQ ---- */
@@ -1648,7 +1567,7 @@ int kernel_netconsole_params(unsigned int* ip, unsigned short* port,
         return 0;
 
     if (ip != nullptr)
-        *ip = params.GetNetconsoleIp().Addr4;
+        *ip = params.GetNetconsoleIp();
     if (port != nullptr)
         *port = params.GetNetconsolePort();
     if (tailKb != nullptr)

@@ -95,7 +95,7 @@ lines in `/etc/rc`, and boot without it.
 | `/etc/ssh/authorized_keys` | One key a line, as OpenSSH writes them. `ssh-ed25519` keys only; a line with options in front of its key is skipped with a warning rather than taken without them, since the server would not honour `from=` or `command=` |
 
 A file is never written over in place: the new content goes to `<path>.new`,
-is synced, and only then takes the old one's place (`Vfs::ReplaceFile`), so a
+is synced, and only then takes the old one's place (`kernel_file_write`), so a
 full disk or a machine stopping midway leaves the old content rather than an
 empty file -- a machine whose only way in is SSH is not locked out by an
 `allow` at the wrong moment. Cut short between the two steps, the content is

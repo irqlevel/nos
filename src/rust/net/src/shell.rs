@@ -547,3 +547,38 @@ pub extern "C" fn rust_net_dhcp_stop() {
         client.stop();
     }
 }
+
+/// The services boot starts once the devices are up and the shell exists:
+/// the netconsole, if the command line asked for one, and the shell over
+/// UDP. Both go on eth0, which is what the C++ looked for.
+#[no_mangle]
+pub extern "C" fn rust_net_start_services(udp_shell_port: u16) {
+    if NETCONSOLE.is_enabled() {
+        match DEVICES.find(DEFAULT_DEVICE.as_bytes()) {
+            None => kcore::trace!(0, "Netconsole: eth0 not found"),
+            Some(dev) => {
+                if !NETCONSOLE.start(dev.as_nic()) {
+                    kcore::trace!(0, "Netconsole: failed to start");
+                }
+            }
+        }
+    }
+
+    if udp_shell_port != 0 {
+        match DEVICES.find(DEFAULT_DEVICE.as_bytes()) {
+            None => kcore::trace!(0, "UdpShell: eth0 not found"),
+            Some(dev) => {
+                if !abi::udp_shell_start(dev.as_nic(), udp_shell_port) {
+                    kcore::trace!(0, "UdpShell: failed to start on port {}", udp_shell_port);
+                }
+            }
+        }
+    }
+}
+
+/// And what stops them, on the way down and before the soft IRQs go.
+#[no_mangle]
+pub extern "C" fn rust_net_stop_services() {
+    abi::udp_shell_stop();
+    NETCONSOLE.stop();
+}
