@@ -17,7 +17,7 @@
 namespace Kernel
 {
 
-class VirtioBlk : public BlockDevice, public InterruptHandler
+class VirtioBlk : public InterruptHandler
 {
 public:
     VirtioBlk();
@@ -26,13 +26,14 @@ public:
     bool Init(Pci::DeviceInfo* pciDev, const char* name);
     bool InitMmio(ulong base, ulong size, u32 intId, const char* name);
 
-    /* BlockDevice interface */
-    virtual const char* GetName() override;
-    virtual u64 GetCapacity() override;
-    virtual u64 GetSectorSize() override;
-    virtual bool Flush() override;
-    virtual bool ReadSectors(u64 sector, void* buf, u32 count) override;
-    virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) override;
+    /* What the device table calls through the ops this registers
+       (BlockDeviceOps in block/block_device.h) */
+    const char* GetName();
+    u64 GetCapacity();
+    u64 GetSectorSize();
+    bool Flush();
+    bool ReadSectors(u64 sector, void* buf, u32 count);
+    bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false);
 
     /* InterruptHandler interface */
     virtual void OnInterruptRegister(u8 irq, u8 vector) override;

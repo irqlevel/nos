@@ -1,7 +1,6 @@
 #pragma once
 
 #include <include/types.h>
-#include <lib/printer.h>
 
 namespace Kernel
 {
@@ -30,18 +29,66 @@ struct AsyncBlockIo
 
 static_assert(sizeof(AsyncBlockIo) == 40, "kcore::block::BlockIo mirrors this layout");
 
-class BlockDevice
+/* What a driver registers: the calls the table makes on it, and what it is.
+   A driver written in Rust fills the same table through kcore::block, so
+   there is one way into the kernel's device table and not two.
+
+   Everything the ops point at -- the name, the context -- stays the
+   driver's, and has to outlive the registration, which is to say the kernel:
+   nothing takes a device back. */
+struct BlockDeviceOps
+{
+    /* NUL-terminated, what `disks` shows the device as */
+    const char* Name;
+    u64 Capacity;                       /* sectors */
+    u64 SectorSize;                     /* bytes */
+
+    /* 0 on success, anything else on failure */
+    int (*ReadSectors)(void* ctx, u64 sector, void* buf, u32 count);
+    int (*WriteSectors)(void* ctx, u64 sector, const void* buf, u32 count, int fua);
+
+    /* nullptr for a device with no write cache to push */
+    int (*Flush)(void* ctx);
+
+    /* The asynchronous path: both nullptr for a device without one. Submit
+       never blocks and answers with a BlockDevice::Submit* code; Kick is the
+       doorbell a submit made without one leaves owed. */
+    int (*Submit)(void* ctx, const AsyncBlockIo* io, int kick);
+    void (*Kick)(void* ctx);
+
+    void* Ctx;
+
+    /* The disk this is a partition of, as its handle, or 0 for a whole disk.
+       Claims are refused through it: one on a disk keeps its partitions out,
+       and one on a partition keeps the disk out. */
+    ulong Parent;
+};
+
+/* A block device the kernel has: a disk, or a partition of one.
+ *
+ * The device itself lives in the table (src/rust/block), and this is the
+ * view of it C++ holds -- a handle and the calls on it. Devices are
+ * registered for the life of the kernel, and the table hands out one of
+ * these per device, so the pointer is stable and two lookups of the same
+ * device compare equal. */
+class BlockDevice final
 {
 public:
-    virtual ~BlockDevice() {}
-    virtual const char* GetName() = 0;
-    virtual u64 GetCapacity() = 0;         /* Total sectors */
-    virtual u64 GetSectorSize() = 0;       /* Bytes per sector */
-    virtual bool Flush() { return true; }
+    BlockDevice()
+        : Handle(0)
+    {
+    }
+
+    const char* GetName();
+    u64 GetCapacity();                  /* sectors */
+    u64 GetSectorSize();                /* bytes */
+    bool Flush();
+
     /* The disk a partition is on; nullptr for a whole disk */
-    virtual BlockDevice* GetParent() { return nullptr; }
-    virtual bool ReadSectors(u64 sector, void* buf, u32 count) = 0;
-    virtual bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false) = 0;
+    BlockDevice* GetParent();
+
+    bool ReadSectors(u64 sector, void* buf, u32 count);
+    bool WriteSectors(u64 sector, const void* buf, u32 count, bool fua = false);
 
     /* Asynchronous I/O (AsyncBlockIo), for a device that has it -- NVMe, and
        a partition of an NVMe disk. Never blocks, so task or softirq context
@@ -56,9 +103,13 @@ public:
     static const int SubmitInvalid = 2;     /* out of range, misaligned, or more than it takes at once */
     static const int SubmitUnsupported = 3; /* the synchronous path only */
 
-    virtual bool CanSubmitAsync() { return false; }
-    virtual int SubmitAsync(const AsyncBlockIo& io, bool kick) { (void)io; (void)kick; return SubmitUnsupported; }
-    virtual void KickAsync() {}
+    bool CanSubmitAsync();
+    int SubmitAsync(const AsyncBlockIo& io, bool kick);
+    void KickAsync();
+
+    /* What the table knows this device by, and what the Rust side of the
+       layer takes: 0 for a view of nothing. */
+    ulong GetHandle() { return Handle; }
 
     /* Set once interrupts and the scheduler are running.
        Before this, synchronous I/O must poll for completion. */
@@ -66,10 +117,15 @@ public:
     static bool GetInterruptsStarted();
 
 private:
+    friend class BlockDeviceTable;
+
+    ulong Handle;
     static bool InterruptsStarted;
 };
 
-class BlockDeviceTable
+/* The kernel's block devices. The table itself is in Rust (src/rust/block):
+   this is the C++ way in, and holds nothing but a view per device. */
+class BlockDeviceTable final
 {
 public:
     static BlockDeviceTable& GetInstance()
@@ -78,11 +134,15 @@ public:
         return instance;
     }
 
-    bool Register(BlockDevice* dev);
+    /* Register a device written in C++. False if the table is full or the
+       ops are not a device: no name, no read or write, or a submit without
+       the kick its doorbell needs. */
+    bool Register(const BlockDeviceOps& ops);
 
     BlockDevice* Find(const char* name);
 
-    void Dump(Stdlib::Printer& printer);
+    /* The view of the device a handle names, or nullptr */
+    BlockDevice* FromHandle(ulong handle);
 
     ulong GetCount();
 
@@ -97,10 +157,8 @@ public:
     ulong Claim(BlockDevice* dev, const char* holder, const char*& heldBy);
     void Release(ulong claim);
 
-    /* Whether writing to one can touch the other: the same device, or a disk
-       and a partition of it */
-    static bool Overlap(BlockDevice* a, BlockDevice* b);
-
+    /* What the table in Rust holds, mirrored here so the views can be an
+       array rather than an allocation */
     static const ulong MaxDevices = 48;
 
 private:
@@ -111,8 +169,8 @@ private:
     BlockDeviceTable& operator=(const BlockDeviceTable& other) = delete;
     BlockDeviceTable& operator=(BlockDeviceTable&& other) = delete;
 
-    BlockDevice* Devices[MaxDevices];
-    ulong Count;
+    /* One view per slot of the table, handed out by Find and GetDevice */
+    BlockDevice Views[MaxDevices];
 };
 
 }

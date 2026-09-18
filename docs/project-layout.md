@@ -14,7 +14,7 @@ src/cpp/
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, the random pool, Rust FFI bridge, symbol table
   drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI, virtio blk/net/scsi/rng (virtio-pci on x86-64, virtio-mmio on arm64)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
-  block/      Block I/O: device abstraction, async request queue (the partition tables are read in Rust, src/rust/block)
+  block/      The C++ view of a block device: a handle and the calls on it, plus the async request queue the virtio drivers use (the table itself is in Rust, src/rust/block)
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell, netconsole
   fs/         Filesystems: VFS and the file API, ramfs, nanofs, ext2 (rw), procfs, the root mount (rootfs.cpp), the self-test (fstest.cpp)
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator
@@ -28,7 +28,7 @@ src/rust/
     r8168/    Realtek r8168 network device driver
     r8125/    Realtek RTL8125 2.5GbE network device driver
     igb/      Intel I210 (igb) gigabit network device driver
-  block/      Partition tables (MBR and GPT) read, and a block device registered for each partition
+  block/      The block layer: the device table, its claims, the `disks` and `partitions` commands, and the partition tables (MBR and GPT) a disk is cut up by
   hello/      Rust self-test module
   kernel/     Rust entry points (rust_main, rust_fini), global allocator
   kmod/       Runtime of a loadable module: allocator, panic handler, the module! header

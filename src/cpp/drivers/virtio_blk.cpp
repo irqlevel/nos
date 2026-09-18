@@ -76,6 +76,28 @@ bool VirtioBlk::InitMmio(ulong base, ulong size, u32 intId, const char* name)
     return InitCommon(name, (u8)intId, (u8)intId);
 }
 
+/* The device table's calls, which land on the instance behind ctx. The
+   virtio path is synchronous: no Submit, and so no Kick either. */
+namespace
+{
+
+int BlkRead(void* ctx, u64 sector, void* buf, u32 count)
+{
+    return static_cast<VirtioBlk*>(ctx)->ReadSectors(sector, buf, count) ? 0 : -1;
+}
+
+int BlkWrite(void* ctx, u64 sector, const void* buf, u32 count, int fua)
+{
+    return static_cast<VirtioBlk*>(ctx)->WriteSectors(sector, buf, count, fua != 0) ? 0 : -1;
+}
+
+int BlkFlush(void* ctx)
+{
+    return static_cast<VirtioBlk*>(ctx)->Flush() ? 0 : -1;
+}
+
+}
+
 bool VirtioBlk::InitCommon(const char* name, u8 irq, u8 vector)
 {
     ulong nameLen = Stdlib::StrLen(name);
@@ -211,8 +233,17 @@ bool VirtioBlk::InitCommon(const char* name, u8 irq, u8 vector)
         Interrupt::RegisterLevel(*this, irq, vector);
     }
 
-    /* Register as block device */
-    BlockDeviceTable::GetInstance().Register(this);
+    /* Into the kernel's device table, the same way a Rust driver goes:
+       an ops table whose context is this device. */
+    BlockDeviceOps ops = {};
+    ops.Name = DevName;
+    ops.Capacity = CapacitySectors;
+    ops.SectorSize = GetSectorSize();
+    ops.ReadSectors = BlkRead;
+    ops.WriteSectors = BlkWrite;
+    ops.Flush = BlkFlush;
+    ops.Ctx = this;
+    BlockDeviceTable::GetInstance().Register(ops);
 
     Trace(0, "VirtioBlk %s: initialized", name);
     return true;
@@ -476,7 +507,7 @@ void VirtioBlk::CompleteIO()
 
 void VirtioBlk::WaitForCompletion(BlockRequest& req)
 {
-    if (GetInterruptsStarted())
+    if (BlockDevice::GetInterruptsStarted())
     {
         req.Completion.Wait();
         return;

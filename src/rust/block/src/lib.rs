@@ -16,6 +16,7 @@ extern crate alloc;
 
 mod crc32;
 mod part;
+mod table;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -104,16 +105,22 @@ pub extern "C" fn rust_partitions_probe() {
         PROBED_COUNT.load(Ordering::Relaxed));
 }
 
-/// Register the `partitions` command. Called from `rust_init`.
+/// Set the layer up and put its commands in front of whoever runs one.
+/// Called from `rust_init`, before anything can claim a device.
 pub fn init() {
-    match Command::register(
-        "partitions",
-        "partitions <disk> - show the partition table (MBR or GPT)",
-        |args, out| dump(args, out),
-    ) {
+    if !table::claims_setup() {
+        trace!(0, "block: no memory for the claim table -- writes will be refused");
+    }
+
+    register("disks", "disks - list block devices", table::dump);
+    register("partitions", "partitions <disk> - show the partition table (MBR or GPT)", dump);
+}
+
+fn register(name: &'static str, help: &'static str, handler: fn(&str, &mut Output)) {
+    match Command::register(name, help, move |args, out| handler(args, out)) {
         /* The command is the kernel's own and stays for good. */
         Ok(cmd) => core::mem::forget(cmd),
-        Err(_) => trace!(0, "part: cannot register the partitions command"),
+        Err(_) => trace!(0, "block: cannot register the {} command", name),
     }
 }
 
