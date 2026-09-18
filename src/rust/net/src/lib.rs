@@ -13,6 +13,7 @@ extern crate alloc;
 
 pub mod abi;
 pub mod arp;
+pub mod device;
 pub mod dhcp;
 pub mod dns;
 pub mod frame;

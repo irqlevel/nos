@@ -5,7 +5,7 @@
 namespace Kernel
 {
 
-class NetDevice;
+struct NetDevice;
 
 /* The shell over UDP is Rust (src/rust/net/src/udp_shell.rs): the protocol
    header, the command dispatch, the chunked and paced reply. What is left

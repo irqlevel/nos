@@ -200,12 +200,10 @@ impl Icmp {
 
         /* The quoted segment is one this machine sent: its source is our end */
         let seg = &quoted[quoted_len..];
-        unsafe {
-            ffi_tcp_unreachable(
-                ip::src(quoted), wire::be16(seg, 0),
-                ip::dst(quoted), wire::be16(seg, 2),
-                wire::be32(seg, 4));
-        }
+        crate::tcp::TCP.on_icmp_unreachable(
+            ip::src(quoted), wire::be16(seg, 0),
+            ip::dst(quoted), wire::be16(seg, 2),
+            wire::be32(seg, 4));
     }
 
     /// An echo request to `dst`, with the payload `ping` expects back.
@@ -279,13 +277,3 @@ impl Icmp {
     }
 }
 
-/// The C++ TCP, told that a segment it sent came back unreachable. Goes when
-/// TCP moves over.
-///
-/// # Safety
-/// Calls into the kernel's TCP, which is alive for as long as the kernel is.
-unsafe fn ffi_tcp_unreachable(src_ip: u32, src_port: u16, dst_ip: u32, dst_port: u16, seq: u32) {
-    unsafe {
-        ffi::net::kernel_tcp_icmp_unreachable(src_ip, src_port, dst_ip, dst_port, seq)
-    }
-}

@@ -1,805 +1,153 @@
 #include "net_device.h"
-#include "arp.h"
-#include "icmp.h"
-#include "tcp.h"
 
-#include <kernel/trace.h>
-#include <kernel/sched.h>
-#include <kernel/parameters.h>
-#include <kernel/softirq.h>
-#include <kernel/panic.h>
-#include <kernel/preempt.h>
-#include <hal/cpu.h>
 #include <lib/stdlib.h>
-#include <mm/new.h>
+
+extern "C" {
+
+/* What `net` prints per device; crate::device::Stats is the same struct. */
+struct RustNetStats
+{
+    unsigned long TxTotal;
+    unsigned long RxTotal;
+    unsigned long RxDrop;
+    unsigned long RxIcmp;
+    unsigned long RxUdp;
+    unsigned long RxTcp;
+    unsigned long RxArp;
+    unsigned long RxOther;
+    unsigned long TxIcmp;
+    unsigned long TxUdp;
+    unsigned long TxTcp;
+    unsigned long TxArp;
+    unsigned long TxOther;
+};
+
+unsigned long kernel_net_find(const unsigned char* name, unsigned long nameLen);
+unsigned int kernel_net_ip(unsigned long dev);
+void kernel_net_mac(unsigned long dev, unsigned char* out);
+void rust_net_poll_rx();
+void kernel_net_rx_poll_stats(unsigned long* polls, unsigned long* work,
+    unsigned long* stalls);
+unsigned long rust_net_device_count();
+unsigned long rust_net_device_at(unsigned long index);
+unsigned long rust_net_device_name(unsigned long dev, char* out, unsigned long cap);
+void rust_net_device_stats(unsigned long dev, RustNetStats* out);
+int rust_net_send_udp(unsigned long dev, unsigned int dstIp, unsigned short dstPort,
+    unsigned int srcIp, unsigned short srcPort, const unsigned char* data,
+    unsigned long len);
+
+}
 
 namespace Kernel
 {
 
-NetDevice::NetDevice()
-    : TxCount(0)
-    , RxCount(0)
-    , UdpListenerCount(0)
+NetDevice* NetDeviceTable::Find(const char* name)
 {
-    Stdlib::MemSet(RxProto, 0, sizeof(RxProto));
-    Stdlib::MemSet(TxProto, 0, sizeof(TxProto));
-    Stdlib::MemSet(UdpListeners, 0, sizeof(UdpListeners));
+    if (name == nullptr)
+        return nullptr;
+
+    return (NetDevice*)kernel_net_find((const unsigned char*)name,
+        Stdlib::StrLen(name));
 }
 
-void NetDevice::TxDone(NetFrame* frame)
+ulong NetDeviceTable::GetCount()
 {
-    TxDoneQueue.InsertTail(&frame->Link);
-}
-
-void NetDevice::ReleaseTxDone()
-{
-    for (;;)
-    {
-        ulong flags = TxQueueLock.LockIrqSave();
-        if (TxDoneQueue.IsEmpty())
-        {
-            TxQueueLock.UnlockIrqRestore(flags);
-            return;
-        }
-
-        NetFrame* frame = CONTAINING_RECORD(TxDoneQueue.RemoveHead(), NetFrame, Link);
-        TxQueueLock.UnlockIrqRestore(flags);
-
-        /* Outside the lock, always: see the note on TxDone. */
-        frame->Put();
-    }
-}
-
-bool NetDevice::SubmitTx(NetFrame* frame)
-{
-    return SubmitTxBatch(&frame, 1) == 1;
-}
-
-ulong NetDevice::SubmitTxBatch(NetFrame** frames, ulong count)
-{
-    if (count == 0)
-        return 0;
-
-    /* Before the lock: this is bookkeeping, and the section below is the
-       narrowest one on the transmit path. */
-    for (ulong i = 0; i < count; i++)
-        CountTxFrame(frames[i]);
-
-    /* A panic report has to leave through this function, and the lock it
-       needs may be held by a CPU that is never going to release it -- that
-       is precisely the failure a panic is most often reporting. Blocking
-       here means the report is never written, which is how a deadlocked TX
-       path produces a machine that dies in complete silence.
-
-       So once a panic has begun, take the lock if it is free and go on
-       without it if it is not. Going on without it can race the holder into
-       the driver's ring; on a machine that is already dying, a corrupted
-       TX ring costs nothing and the report is worth everything. */
-    bool acquired = true;
-    ulong flags;
-
-    if (Panicker::GetInstance().IsActive())
-        flags = TxQueueLock.TryLockIrqSave(acquired);
-    else
-        flags = TxQueueLock.LockIrqSave();
-
-    ulong queued = 0;
-    while (queued < count && TxCount < TxQueueCapacity)
-    {
-        TxQueue.InsertTail(&frames[queued]->Link);
-        TxCount++;
-        queued++;
-    }
-
-    /* No room for the rest: released along with what the driver finishes. */
-    if (acquired)
-    {
-        for (ulong i = queued; i < count; i++)
-            TxDone(frames[i]);
-    }
-
-    if (queued != 0)
-        FlushTx();
-
-    if (acquired)
-        TxQueueLock.UnlockIrqRestore(flags);
-    else
-        PreemptIrqRestore(flags);
-
-    if (!acquired)
-    {
-        for (ulong i = queued; i < count; i++)
-            frames[i]->Put();
-    }
-
-    /* Off the lock, always -- and only with interrupts on. A frame from the
-       allocator goes back through Mm::Free, whose TLB shootdown waits for
-       every other CPU to answer, and a caller with interrupts off cannot
-       answer one itself: two such CPUs would wait on each other for good.
-       That caller leaves the release to the transmit softirq. */
-    if (Hal::IsInterruptEnabled())
-        ReleaseTxDone();
-    else
-        SoftIrq::GetInstance().Raise(SoftIrq::TypeNetTx);
-
-    return queued;
-}
-
-bool NetDevice::SendUdp(Net::IpAddress dstIp, u16 dstPort, Net::IpAddress srcIp, u16 srcPort,
-                        const void* data, ulong len)
-{
-    /* Resolve the destination MAC via ARP. For an off-subnet destination
-       RouteIp() hands back the gateway, so that is what gets resolved. */
-    Net::IpAddress arpTarget = RouteIp(dstIp);
-    Net::MacAddress dstMac;
-    if (!ArpTable::GetInstance().Resolve(this, arpTarget, dstMac))
-    {
-        Trace(0, "NetDevice %s: ARP failed for 0x%p", GetName(), (ulong)dstIp.Addr4);
-        /* Fall back to broadcast */
-        dstMac = Net::MacAddress::Broadcast();
-    }
-
-    ulong udpLen = sizeof(Net::UdpHdr) + len;
-    ulong ipLen = sizeof(Net::IpHdr) + udpLen;
-    ulong frameLen = sizeof(Net::EthHdr) + ipLen;
-
-    if (frameLen > 1514) /* Ethernet MTU */
-        return false;
-
-    u8 frame[1514];
-    Stdlib::MemSet(frame, 0, sizeof(frame));
-
-    ulong off = 0;
-
-    /* Ethernet header */
-    Net::EthHdr* eth = (Net::EthHdr*)(frame + off);
-    dstMac.CopyTo(eth->DstMac);
-    GetMac().CopyTo(eth->SrcMac);
-    eth->EtherType = Net::Htons(0x0800);
-    off += sizeof(Net::EthHdr);
-
-    /* IP header */
-    Net::IpHdr* ip = (Net::IpHdr*)(frame + off);
-    ip->VersionIhl = 0x45; /* IPv4, IHL=5 */
-    ip->Tos = 0;
-    ip->TotalLen = Net::Htons((u16)ipLen);
-    ip->Id = 0;
-    ip->FragOff = 0;
-    ip->Ttl = 64;
-    ip->Protocol = Net::IpProtoUdp;
-    ip->Checksum = 0;
-    ip->SrcAddr = srcIp.ToNetwork();
-    ip->DstAddr = dstIp.ToNetwork();
-    ip->Checksum = Net::Htons(Net::IpChecksum(ip, sizeof(Net::IpHdr)));
-    off += sizeof(Net::IpHdr);
-
-    /* UDP header */
-    Net::UdpHdr* udp = (Net::UdpHdr*)(frame + off);
-    udp->SrcPort = Net::Htons(srcPort);
-    udp->DstPort = Net::Htons(dstPort);
-    udp->Length = Net::Htons((u16)udpLen);
-    udp->Checksum = 0; /* Valid per RFC 768 */
-    off += sizeof(Net::UdpHdr);
-
-    /* Payload */
-    if (len > 0)
-    {
-        Stdlib::MemCpy(frame + off, data, len);
-        off += len;
-    }
-
-    return SendRaw(frame, off);
-}
-
-bool NetDevice::SendRaw(const void* buf, ulong len)
-{
-    if (len == 0)
-        return false;
-
-    NetFrame* frame = NetFrame::AllocTx(len);
-    if (!frame)
-        return false;
-
-    Stdlib::MemCpy(frame->Data, buf, len);
-    frame->Length = len;
-    return SubmitTx(frame);
-}
-
-void NetDevice::DrainTx()
-{
-    ulong flags = TxQueueLock.LockIrqSave();
-    if (TxCount > 0)
-        FlushTx();
-    TxQueueLock.UnlockIrqRestore(flags);
-
-    ReleaseTxDone();
-}
-
-void NetDevice::CountTxFrame(NetFrame* frame)
-{
-    ulong cpuIndex = Hal::GetCurrentCpuHwId();
-    if (cpuIndex >= MaxCpus)
-        cpuIndex = 0;
-
-    TxProtoCounters& proto = TxProto[cpuIndex];
-    proto.Total++;
-
-    if (frame->Length < sizeof(Net::EthHdr))
-    {
-        proto.Other++;
-        return;
-    }
-
-    const Net::EthHdr* eth = (const Net::EthHdr*)frame->Data;
-    u16 etherType = Net::Ntohs(eth->EtherType);
-
-    if (etherType == Net::EtherTypeArp)
-    {
-        proto.Arp++;
-        return;
-    }
-
-    if (etherType != Net::EtherTypeIp ||
-        frame->Length < sizeof(Net::EthHdr) + sizeof(Net::IpHdr))
-    {
-        proto.Other++;
-        return;
-    }
-
-    const Net::IpHdr* ip = (const Net::IpHdr*)(frame->Data + sizeof(Net::EthHdr));
-    switch (ip->Protocol)
-    {
-    case Net::IpProtoIcmp: proto.Icmp++; break;
-    case Net::IpProtoTcp:  proto.Tcp++;  break;
-    case Net::IpProtoUdp:  proto.Udp++;  break;
-    default:               proto.Other++; break;
-    }
-}
-
-void NetDevice::GetTxProtoTotals(NetStats& stats)
-{
-    stats.TxTotal = 0;
-    stats.TxIcmp = 0;
-    stats.TxUdp = 0;
-    stats.TxTcp = 0;
-    stats.TxArp = 0;
-    stats.TxOther = 0;
-
-    for (ulong i = 0; i < MaxCpus; i++)
-    {
-        stats.TxTotal += TxProto[i].Total;
-        stats.TxIcmp += TxProto[i].Icmp;
-        stats.TxUdp += TxProto[i].Udp;
-        stats.TxTcp += TxProto[i].Tcp;
-        stats.TxArp += TxProto[i].Arp;
-        stats.TxOther += TxProto[i].Other;
-    }
-}
-
-void NetDevice::GetRxProtoTotals(NetStats& stats)
-{
-    stats.RxIcmp = 0;
-    stats.RxUdp = 0;
-    stats.RxTcp = 0;
-    stats.RxArp = 0;
-    stats.RxOther = 0;
-    stats.RxDrop = 0;
-
-    for (ulong i = 0; i < MaxCpus; i++)
-    {
-        stats.RxIcmp += RxProto[i].Icmp;
-        stats.RxUdp += RxProto[i].Udp;
-        stats.RxTcp += RxProto[i].Tcp;
-        stats.RxArp += RxProto[i].Arp;
-        stats.RxOther += RxProto[i].Other;
-        stats.RxDrop += RxProto[i].Drop;
-    }
-}
-
-ulong NetDevice::EnqueueRxBatch(NetFrame** frames, ulong count)
-{
-    /* One acquisition for the whole harvest, rather than one per frame.
-       Returns how many were taken; the caller releases the rest. */
-    ulong taken = 0;
-
-    ulong flags = RxQueueLock.LockIrqSave();
-    while (taken < count && RxCount < RxQueueCapacity)
-    {
-        RxQueue.InsertTail(&frames[taken]->Link);
-        RxCount++;
-        taken++;
-    }
-    RxQueueLock.UnlockIrqRestore(flags);
-
-    return taken;
-}
-
-bool NetDevice::EnqueueRx(NetFrame* frame)
-{
-    ulong flags = RxQueueLock.LockIrqSave();
-    if (RxCount >= RxQueueCapacity)
-    {
-        RxQueueLock.UnlockIrqRestore(flags);
-        return false;
-    }
-    RxQueue.InsertTail(&frame->Link);
-    RxCount++;
-    RxQueueLock.UnlockIrqRestore(flags);
-    return true;
-}
-
-bool NetDevice::RegisterUdpListener(u16 port, RxCallback cb, void* ctx)
-{
-    Stdlib::AutoLock lock(UdpListenerLock);
-
-    for (ulong i = 0; i < UdpListenerCount; i++)
-    {
-        if (UdpListeners[i].Port == port)
-        {
-            /* Its own port again -- DHCP re-registering -- but never a frame
-               listener's, which would go on believing it was served. */
-            if (UdpListeners[i].FrameCb != nullptr)
-                return false;
-
-            UdpListeners[i].Cb = cb;
-            UdpListeners[i].Ctx = ctx;
-            return true;
-        }
-    }
-
-    if (UdpListenerCount >= MaxUdpListeners)
-        return false;
-
-    UdpListeners[UdpListenerCount].Port = port;
-    UdpListeners[UdpListenerCount].Cb = cb;
-    UdpListeners[UdpListenerCount].FrameCb = nullptr;
-    UdpListeners[UdpListenerCount].BatchEndCb = nullptr;
-    UdpListeners[UdpListenerCount].Ctx = ctx;
-    UdpListenerCount++;
-    return true;
-}
-
-int NetDevice::ListenUdpFrames(u16 port, RxFrameCallback cb, void* ctx,
-                               RxBatchEndCallback batchEnd)
-{
-    if (port == 0 || cb == nullptr)
-        return UdpListenInvalid;
-
-    Stdlib::AutoLock lock(UdpListenerLock);
-
-    for (ulong i = 0; i < UdpListenerCount; i++)
-    {
-        if (UdpListeners[i].Port == port)
-            return UdpListenPortTaken;
-    }
-
-    if (UdpListenerCount >= MaxUdpListeners)
-        return UdpListenTableFull;
-
-    UdpListener& listener = UdpListeners[UdpListenerCount];
-    listener.Port = port;
-    listener.Cb = nullptr;
-    listener.FrameCb = cb;
-    listener.BatchEndCb = batchEnd;
-    listener.Ctx = ctx;
-    UdpListenerCount++;
-    return UdpListenOk;
-}
-
-void NetDevice::UnregisterUdpListener(u16 port)
-{
-    RemoveUdpListener(port, nullptr, false);
-}
-
-void NetDevice::UnlistenUdpFrames(u16 port, void* ctx)
-{
-    RemoveUdpListener(port, ctx, true);
-}
-
-void NetDevice::RemoveUdpListener(u16 port, void* ctx, bool frames)
-{
-    {
-        Stdlib::AutoLock lock(UdpListenerLock);
-
-        for (ulong i = 0; i < UdpListenerCount; i++)
-        {
-            UdpListener& listener = UdpListeners[i];
-            if (listener.Port != port || (listener.FrameCb != nullptr) != frames)
-                continue;
-            if (frames && listener.Ctx != ctx)
-                continue;
-
-            for (ulong j = i; j + 1 < UdpListenerCount; j++)
-                UdpListeners[j] = UdpListeners[j + 1];
-            UdpListenerCount--;
-            Stdlib::MemSet(&UdpListeners[UdpListenerCount], 0, sizeof(UdpListener));
-            break;
-        }
-    }
-
-    /* No new dispatch can find the listener now; wait out any that took it
-       before the lock, so the caller may free its context on return. The
-       count covers every listener on the device, not just this port -- the
-       table is compacted on removal, so a per-slot count would not stay
-       with its slot -- and a callback is microseconds, so waiting for a
-       neighbour's costs nothing worth a second data structure. Task context
-       only: a listener that unregistered itself from inside its own
-       callback would wait here for itself. */
-    while (UdpListenerInFlight.Get() != 0)
-        Sleep(1 * Const::NanoSecsInMs);
-}
-
-Net::MacAddress NetDevice::GetMac()
-{
-    return Mac;
-}
-
-void NetDevice::SetMac(const Net::MacAddress& mac)
-{
-    Mac = mac;
-}
-
-Net::IpAddress NetDevice::GetIp()
-{
-    return Ip;
-}
-
-void NetDevice::SetIp(Net::IpAddress ip)
-{
-    Ip = ip;
-}
-
-Net::IpAddress NetDevice::GetSubnetMask()
-{
-    return Mask;
-}
-
-void NetDevice::SetSubnetMask(Net::IpAddress mask)
-{
-    Mask = mask;
-}
-
-Net::IpAddress NetDevice::GetGateway()
-{
-    return Gw;
-}
-
-void NetDevice::SetGateway(Net::IpAddress gw)
-{
-    Gw = gw;
-}
-
-Net::IpAddress NetDevice::RouteIp(Net::IpAddress dstIp)
-{
-    if (Mask.Addr4 != 0 && Gw.Addr4 != 0)
-    {
-        if ((dstIp.Addr4 & Mask.Addr4) != (Ip.Addr4 & Mask.Addr4))
-            return Gw;
-    }
-    return dstIp;
-}
-
-NetDeviceTable::NetDeviceTable()
-    : Count(0)
-{
-    LastPassWasPoll = false;
-
-    for (ulong i = 0; i < MaxDevices; i++)
-        Devices[i] = nullptr;
-}
-
-NetDeviceTable::~NetDeviceTable()
-{
-}
-
-static void NetRxSoftIrqHandler(void* ctx)
-{
-    (void)ctx;
-    NetDeviceTable::GetInstance().ProcessAllRx();
-}
-
-static void NetTxSoftIrqHandler(void* ctx)
-{
-    (void)ctx;
-    NetDeviceTable::GetInstance().ProcessAllTx();
-}
-
-bool NetDeviceTable::Register(NetDevice* dev)
-{
-    if (Count >= MaxDevices || dev == nullptr)
-        return false;
-
-    Devices[Count] = dev;
-    Count++;
-
-    if (Count == 1)
-    {
-        /* One handler per softirq type (SoftIrq allows a single handler),
-           dispatching RX/TX to every registered device -- virtio-net and
-           Rust drivers alike raise TypeNetRx/TypeNetTx from their ISRs. */
-        SoftIrq::GetInstance().Register(SoftIrq::TypeNetRx, NetRxSoftIrqHandler, nullptr);
-        SoftIrq::GetInstance().Register(SoftIrq::TypeNetTx, NetTxSoftIrqHandler, nullptr);
-    }
-
-    Net::MacAddress mac = dev->GetMac();
-
-    Trace(0, "NetDevice registered: %s mac %p:%p:%p:%p:%p:%p",
-        dev->GetName(),
-        (ulong)mac.Bytes[0], (ulong)mac.Bytes[1], (ulong)mac.Bytes[2],
-        (ulong)mac.Bytes[3], (ulong)mac.Bytes[4], (ulong)mac.Bytes[5]);
-
-    return true;
-}
-
-void NetDevice::DrainRxQueueAndDispatch()
-{
-    /* Take the whole queue in one go, then dispatch with the lock down.
-       Frames arrive one at a time but they are dispatched in a run, and the
-       queue lock was being taken and released -- with interrupts disabled --
-       once per packet on each side of it. At 37000 packets a second that
-       showed up in a profile as the top of the receive path: two acquisitions
-       here and one in EnqueueRx, per frame, on the one CPU doing all of it.
-       Splicing the list costs one acquisition per batch instead. */
-    Stdlib::ListEntry batch;
-    batch.Init();
-
-    {
-        ulong flags = RxQueueLock.LockIrqSave();
-        batch.MoveTailList(&RxQueue);
-        RxCount = 0;
-        RxQueueLock.UnlockIrqRestore(flags);
-    }
-
-    /* Nothing arrived: no table to copy, no hold to take, no lock. The drain
-       runs on every softirq pass, most of which have no frames. */
-    if (batch.IsEmpty())
-        return;
-
-    /* One look at the listener table for the whole batch. It was a spinlock
-       acquire and release per UDP datagram -- with interrupts off, plus the
-       pair of atomics on the in-flight count -- which a profile put among the
-       top entries of the receive path at 37000 packets a second. The table
-       has four slots and changes when a server starts or stops, so copying it
-       per batch costs nothing and the copy is good for the length of one.
-
-       The in-flight count is raised once for the batch and dropped at the
-       end, which is what lets UnregisterUdpListener keep waiting for
-       callbacks to finish before its caller frees their context. */
-    /* Read once for the batch: the counters below are per CPU, and the poll
-       that produced this batch does not migrate part way through it. */
-    ulong cpuIndex = Hal::GetCurrentCpuHwId();
-    if (cpuIndex >= MaxCpus)
-        cpuIndex = 0;
-    RxProtoCounters& proto = RxProto[cpuIndex];
-
-    UdpListener listeners[MaxUdpListeners];
-    ulong listenerCount = 0;
-
-    {
-        Stdlib::AutoLock lock(UdpListenerLock);
-        listenerCount = UdpListenerCount;
-        for (ulong i = 0; i < listenerCount; i++)
-            listeners[i] = UdpListeners[i];
-        if (listenerCount != 0)
-            UdpListenerInFlight.Inc();
-    }
-
-    while (!batch.IsEmpty())
-    {
-        Stdlib::ListEntry* entry = batch.RemoveHead();
-
-        NetFrame* frame = CONTAINING_RECORD(entry, NetFrame, Link);
-        u8* data = frame->Data;
-        ulong dataLen = frame->Length;
-
-        if (dataLen < sizeof(Net::EthHdr))
-        {
-            proto.Drop++;
-            goto done;
-        }
-
-        {
-            Net::EthHdr* eth = (Net::EthHdr*)data;
-            u16 etherType = Net::Ntohs(eth->EtherType);
-
-            if (etherType == Net::EtherTypeArp)
-            {
-                proto.Arp++;
-                ArpTable::GetInstance().Process(this, data, dataLen);
-                goto done;
-            }
-
-            if (etherType != Net::EtherTypeIp ||
-                dataLen < sizeof(Net::EthHdr) + sizeof(Net::IpHdr))
-            {
-                proto.Other++;
-                proto.Drop++;
-                goto done;
-            }
-
-            Net::IpHdr* ip = (Net::IpHdr*)(data + sizeof(Net::EthHdr));
-            switch (ip->Protocol)
-            {
-            case Net::IpProtoIcmp:
-                proto.Icmp++;
-                Icmp::GetInstance().Process(this, data, dataLen);
-                break;
-            case Net::IpProtoTcp:
-                proto.Tcp++;
-                Tcp::GetInstance().Process(this, data, dataLen);
-                break;
-            case Net::IpProtoUdp:
-            {
-                proto.Udp++;
-                ulong ipHdrLen = Net::IpHeaderLen(ip);
-                if (ipHdrLen == 0 ||
-                    dataLen < sizeof(Net::EthHdr) + ipHdrLen + sizeof(Net::UdpHdr))
-                    break;
-                Net::UdpHdr* udp = (Net::UdpHdr*)(data + sizeof(Net::EthHdr) + ipHdrLen);
-                u16 dstPort = Net::Ntohs(udp->DstPort);
-
-                /* The callback ran under UdpListenerLock -- a spinlock, so
-                   with interrupts off -- on every datagram. On the CPU the
-                   NIC's MSI-X targets that held the card's own interrupt
-                   back for the length of every callback, and forbade the
-                   callback anything that might block. Take the listener out
-                   under the lock, then call it with the lock down; the
-                   in-flight count is what keeps the context alive until it
-                   returns. */
-                for (ulong li = 0; li < listenerCount; li++)
-                {
-                    if (listeners[li].Port != dstPort)
-                        continue;
-
-                    /* A frame listener gets the frame itself, and keeps it
-                       by taking a reference before it returns: the Put below
-                       is then not the last one. */
-                    if (listeners[li].FrameCb)
-                        listeners[li].FrameCb(listeners[li].Ctx, frame);
-                    else if (listeners[li].Cb)
-                        listeners[li].Cb(data, dataLen, listeners[li].Ctx);
-                    break;
-                }
-                break;
-            }
-            default:
-                proto.Other++;
-                proto.Drop++;
-                break;
-            }
-        }
-done:
-        frame->Put();
-    }
-
-    /* The batch is dispatched: a listener that answers from here hands over
-       its replies now, together. Still inside the in-flight count, so an
-       unlisten waiting on it knows they have gone. */
-    for (ulong li = 0; li < listenerCount; li++)
-    {
-        if (listeners[li].BatchEndCb)
-            listeners[li].BatchEndCb(listeners[li].Ctx);
-    }
-
-    if (listenerCount != 0)
-        UdpListenerInFlight.Dec();
-}
-
-void NetDeviceTable::ProcessAllRx()
-{
-    /* Test and clear: whoever gets the 1 owns the attribution for this pass. */
-    bool polled = (PollPending.Cmpxchg(0, 1) == 1);
-    ulong pending = 0;
-
-    for (ulong i = 0; i < Count; i++)
-    {
-        Devices[i]->ReapRx();
-
-        /* After the reap, before the dispatch: what the hardware had waiting. */
-        pending += Devices[i]->GetRxPending();
-
-        Devices[i]->ProcessRx();
-    }
-
-    if (polled && pending != 0)
-    {
-        RxPollWork.Inc();
-
-        /* Two polls in a row finding work, with no interrupt-driven pass
-           between them, is the shape of a wakeup that is not coming. One on
-           its own is just the poll winning a race against an interrupt
-           already in flight. */
-        if (LastPassWasPoll)
-            RxStalls.Inc();
-    }
-
-    LastPassWasPoll = polled;
+    return rust_net_device_count();
 }
 
 void NetDeviceTable::PollRx()
 {
-    if (Count == 0)
-        return;
-
-    if (!Parameters::GetInstance().IsRxPollEnabled())
-        return;
-
-    /* An interrupt has already asked; leave it to say so. */
-    if (SoftIrq::GetInstance().IsPending(SoftIrq::TypeNetRx))
-        return;
-
-    RxPolls.Inc();
-    PollPending.Set(1);
-    SoftIrq::GetInstance().Raise(SoftIrq::TypeNetRx);
+    rust_net_poll_rx();
 }
 
 ulong NetDeviceTable::GetRxPolls()
 {
-    return RxPolls.Get();
+    ulong polls = 0;
+    kernel_net_rx_poll_stats(&polls, nullptr, nullptr);
+    return polls;
 }
 
 ulong NetDeviceTable::GetRxPollWork()
 {
-    return RxPollWork.Get();
+    ulong work = 0;
+    kernel_net_rx_poll_stats(nullptr, &work, nullptr);
+    return work;
 }
 
 ulong NetDeviceTable::GetRxStalls()
 {
-    return RxStalls.Get();
+    ulong stalls = 0;
+    kernel_net_rx_poll_stats(nullptr, nullptr, &stalls);
+    return stalls;
 }
 
-void NetDeviceTable::ProcessAllTx()
+const char* NetDeviceName(NetDevice* dev, char* buf, ulong bufSize)
 {
-    for (ulong i = 0; i < Count; i++)
-        Devices[i]->DrainTx();
+    if (dev == nullptr || buf == nullptr || bufSize == 0)
+        return "";
+
+    buf[0] = '\0';
+    rust_net_device_name(reinterpret_cast<unsigned long>(dev), buf, bufSize);
+    return buf;
 }
 
-NetDevice* NetDeviceTable::Find(const char* name)
+Net::IpAddress NetDeviceIp(NetDevice* dev)
 {
-    for (ulong i = 0; i < Count; i++)
-    {
-        if (Devices[i] && Stdlib::StrCmp(Devices[i]->GetName(), name) == 0)
-            return Devices[i];
-    }
-    return nullptr;
+    Net::IpAddress ip;
+    ip.Addr4 = (dev != nullptr)
+        ? kernel_net_ip(reinterpret_cast<unsigned long>(dev)) : 0;
+    return ip;
+}
+
+bool NetDeviceSendUdp(NetDevice* dev, Net::IpAddress dstIp, u16 dstPort,
+                      Net::IpAddress srcIp, u16 srcPort, const void* data, ulong len)
+{
+    if (dev == nullptr)
+        return false;
+
+    return rust_net_send_udp(reinterpret_cast<unsigned long>(dev), dstIp.Addr4,
+        dstPort, srcIp.Addr4, srcPort, (const unsigned char*)data, len) == 0;
 }
 
 void NetDeviceTable::Dump(Stdlib::Printer& printer)
 {
-    if (Count == 0)
+    ulong count = rust_net_device_count();
+    if (count == 0)
     {
         printer.Printf("no network devices\n");
         return;
     }
 
-    for (ulong i = 0; i < Count; i++)
+    for (ulong i = 0; i < count; i++)
     {
-        if (!Devices[i])
+        ulong dev = rust_net_device_at(i);
+        if (dev == 0)
             continue;
 
-        Net::MacAddress mac = Devices[i]->GetMac();
-        Net::IpAddress ip = Devices[i]->GetIp();
+        char name[32];
+        name[0] = '\0';
+        rust_net_device_name(dev, name, sizeof(name));
 
-        NetStats st;
-        Stdlib::MemSet(&st, 0, sizeof(st));
-        Devices[i]->GetStats(st);
+        unsigned char macBytes[6] = {};
+        kernel_net_mac(dev, macBytes);
+        Net::MacAddress mac(macBytes);
 
-        printer.Printf("%s  ", Devices[i]->GetName());
+        Net::IpAddress ip;
+        ip.Addr4 = kernel_net_ip(dev);
+
+        RustNetStats st = {};
+        rust_net_device_stats(dev, &st);
+
+        printer.Printf("%s  ", name);
         mac.Print(printer);
         printer.Printf("  ip:");
         ip.Print(printer);
-        printer.Printf("  tx:%u rx:%u drop:%u\n",
-            st.TxTotal, st.RxTotal, st.RxDrop);
+        printer.Printf("  tx:%u rx:%u drop:%u\n", st.TxTotal, st.RxTotal, st.RxDrop);
         printer.Printf("  rx  icmp:%u udp:%u tcp:%u arp:%u other:%u\n",
             st.RxIcmp, st.RxUdp, st.RxTcp, st.RxArp, st.RxOther);
         printer.Printf("  tx  icmp:%u udp:%u tcp:%u arp:%u other:%u\n",
             st.TxIcmp, st.TxUdp, st.TxTcp, st.TxArp, st.TxOther);
     }
-}
-
-ulong NetDeviceTable::GetCount()
-{
-    return Count;
 }
 
 }

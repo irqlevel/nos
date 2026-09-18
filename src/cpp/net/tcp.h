@@ -7,7 +7,7 @@
 namespace Kernel
 {
 
-class NetDevice;
+struct NetDevice;
 
 /* TCP itself is Rust (src/rust/net/src/tcp.rs): the connection pool, the
    state machine, the retransmit and persist timers, and the blocking calls

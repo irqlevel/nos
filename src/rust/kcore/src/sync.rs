@@ -345,6 +345,14 @@ impl IrqSpinLock {
     }
 
     pub fn lock(&self) -> IrqSpinGuard<'_> {
+        let flags = self.lock_flags();
+        IrqSpinGuard { lock: self, flags }
+    }
+
+    /// Taken by hand, giving back the flags to release it with. For code
+    /// that holds two of these at once, or releases them in an order a
+    /// guard's scope cannot express -- a queue with a lock per device, say.
+    pub fn lock_flags(&self) -> usize {
         use core::sync::atomic::Ordering;
 
         /* Interrupts off first: a CPU that takes an interrupt while holding
@@ -353,7 +361,28 @@ impl IrqSpinLock {
         while self.held.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
-        IrqSpinGuard { lock: self, flags }
+        flags
+    }
+
+    /// One attempt, no spin. Interrupts go off either way; the flag says
+    /// whether the lock was taken, and the caller decides what to do if it
+    /// was not. For the panic path, whose lock may be held by a CPU that is
+    /// never going to release it.
+    pub fn try_lock_flags(&self) -> (usize, bool) {
+        use core::sync::atomic::Ordering;
+
+        let flags = unsafe { ffi::cpu::kernel_irq_save() };
+        let taken = !self.held.swap(true, Ordering::Acquire);
+        (flags, taken)
+    }
+
+    /// # Safety
+    /// This caller holds it, with `flags` from the call that took it.
+    pub unsafe fn unlock_flags(&self, flags: usize) {
+        use core::sync::atomic::Ordering;
+
+        self.held.store(false, Ordering::Release);
+        unsafe { ffi::cpu::kernel_irq_restore(flags) };
     }
 }
 

@@ -7,7 +7,7 @@
 namespace Kernel
 {
 
-class NetDevice;
+struct NetDevice;
 
 /* The resolver itself is Rust (src/rust/net/src/dns.rs): the queries, the
    cache and its TTLs, and the checks that keep an off-path answer out. What

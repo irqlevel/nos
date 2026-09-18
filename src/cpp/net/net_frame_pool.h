@@ -1,6 +1,6 @@
 #pragma once
 
-#include <net/net_frame.h>
+#include <include/types.h>
 #include <lib/printer.h>
 
 namespace Kernel

@@ -31,8 +31,6 @@
 #include <hal/irqchip.h>
 #include <block/block_device.h>
 #include <net/net_device.h>
-#include <net/net_frame.h>
-#include <net/net_frame_pool.h>
 #include <net/tcp.h>
 #include <fs/vfs.h>
 #include <fs/fstest.h>
@@ -48,7 +46,6 @@ static const ulong RustAllocTag = 'rust';
 static const unsigned long PrinterChunkSize = 128;
 
 /* Longer than any net device's name: VirtioNet's are at most 7 */
-static const unsigned long NetDevNameMax = 16;
 
 /* kernel_ring_create's ceiling: a ring's cells are one allocation */
 static const unsigned long RingMaxCapacity = 1UL << 20;
@@ -750,6 +747,13 @@ void kernel_tcp_peer(void* conn, unsigned int* ip, unsigned short* port)
 void kernel_softirq_raise(unsigned long type)
 {
     Kernel::SoftIrq::GetInstance().Raise(type);
+}
+
+/* Whether that soft IRQ is already asked for. What lets a poll tell a pass
+   it caused from one an interrupt caused. */
+int kernel_softirq_pending(unsigned long type)
+{
+    return Kernel::SoftIrq::GetInstance().IsPending(type) ? 1 : 0;
 }
 
 void kernel_softirq_register(unsigned long type,
@@ -1502,240 +1506,12 @@ unsigned long kernel_entropy_source_register(const char* name,
 
 /* ---- Net device bridge ---- */
 
-struct RustNetDeviceOps
-{
-    const char* Name;
-    unsigned char Mac[6];
-    void (*FlushTx)(void* ctx);
-    void (*ProcessRx)(void* ctx);
-    void* Ctx;
-};
-
-class RustNetDevice : public Kernel::NetDevice
-{
-public:
-    RustNetDeviceOps Ops;
-    u64 TxPackets;
-    u64 RxPackets;
-    u64 RxDropped;
-
-    const char* GetName() override { return Ops.Name; }
-    u64 GetTxPackets() override { return TxPackets; }
-    u64 GetRxPackets() override { return RxPackets; }
-    u64 GetRxDropped() override { return RxDropped; }
-
-    /* Was never implemented, so `net` reported zeros for this device on a
-       machine that had just forwarded thousands of packets. The receive
-       breakdown comes from the shared drain now; the totals are the bridge's
-       own. */
-    void GetStats(Kernel::NetStats& stats) override
-    {
-        GetRxProtoTotals(stats);
-        GetTxProtoTotals(stats);
-        stats.RxTotal = RxPackets;
-        stats.RxDrop += RxDropped;
-    }
-
-    /* Called while TxQueueLock is held by base SubmitTx. */
-    void FlushTx() override
-    {
-        Ops.FlushTx(Ops.Ctx);
-    }
-
-    /* Ops.ProcessRx (e.g. r8168_process_rx) harvests hardware into the base
-       RxQueue -- that is the reap phase, so run it as ReapRx(). ProcessRx()
-       then drains and dispatches the RxQueue like every other device; without
-       this split, reaped frames would sit in RxQueue and never reach the
-       protocol stack. */
-    void ReapRx() override
-    {
-        Ops.ProcessRx(Ops.Ctx);
-    }
-
-    void ProcessRx() override
-    {
-        DrainRxQueueAndDispatch();
-    }
-
-    /* Dequeue one TX frame without acquiring TxQueueLock (lock already held). */
-    Kernel::NetFrame* TxDequeue()
-    {
-        if (TxQueue.IsEmpty())
-            return nullptr;
-        Stdlib::ListEntry* entry = TxQueue.RemoveHead();
-        TxCount--;
-        TxPackets++;
-        return CONTAINING_RECORD(entry, Kernel::NetFrame, Link);
-    }
-};
+/* The net devices, the frames and the queues between them are Rust
+   (src/rust/net/src/device.rs and frame.rs), and so is the C ABI a driver
+   registers through: the kernel_netdev_* and kernel_netframe_* names are
+   defined there now. Nothing of them is left here. */
 
 extern "C" {
-
-unsigned long kernel_netdev_register(const RustNetDeviceOps* ops)
-{
-    if (!ops || !ops->Name || !ops->FlushTx || !ops->ProcessRx)
-        return 0;
-
-    /* Heap-allocate so that NetDevice's constructor (which calls
-       ListEntry::Init on TxQueue/RxQueue) runs reliably -- static arrays
-       of non-trivial objects are forbidden in this freestanding kernel. */
-    RustNetDevice* dev = Kernel::Mm::TAlloc<RustNetDevice, RustAllocTag>();
-    if (!dev)
-        return 0;
-
-    dev->Ops = *ops;
-    dev->TxPackets = 0;
-    dev->RxPackets = 0;
-    dev->RxDropped = 0;
-
-    Kernel::Net::MacAddress mac;
-    Stdlib::MemCpy(mac.Bytes, ops->Mac, 6);
-    dev->SetMac(mac);
-
-    if (!Kernel::NetDeviceTable::GetInstance().Register(dev))
-    {
-        dev->~RustNetDevice();
-        Kernel::Mm::Free(dev);
-        return 0;
-    }
-
-    return (unsigned long)dev;
-}
-
-static RustNetDevice* NetDevFromHandle(unsigned long handle)
-{
-    return reinterpret_cast<RustNetDevice*>(handle);
-}
-
-void kernel_netdev_set_ip(unsigned long handle, unsigned int ip)
-{
-    if (!handle) return;
-    NetDevFromHandle(handle)->SetIp(Kernel::Net::IpAddress(ip));
-}
-
-void kernel_netdev_set_mask(unsigned long handle, unsigned int mask)
-{
-    if (!handle) return;
-    NetDevFromHandle(handle)->SetSubnetMask(Kernel::Net::IpAddress(mask));
-}
-
-void kernel_netdev_set_gw(unsigned long handle, unsigned int gw)
-{
-    if (!handle) return;
-    NetDevFromHandle(handle)->SetGateway(Kernel::Net::IpAddress(gw));
-}
-
-/* Called from inside Rust FlushTx callback. TxQueueLock is already held. */
-unsigned long kernel_netdev_tx_dequeue(unsigned long handle)
-{
-    if (!handle)
-        return 0;
-    Kernel::NetFrame* frame = NetDevFromHandle(handle)->TxDequeue();
-    return (unsigned long)frame;
-}
-
-void kernel_netdev_tx_notify(unsigned long handle)
-{
-    (void)handle;
-    /* Placeholder for hardware doorbell. FlushTx returns to SubmitTx
-       which raises SoftIrq for any retry if frames remain. */
-}
-
-unsigned long kernel_netframe_alloc_rx(unsigned long data_len)
-{
-    Kernel::NetFrame* frame = Kernel::NetFrame::AllocTx((ulong)data_len);
-    if (!frame)
-        return 0;
-    frame->Direction = Kernel::NetFrame::Rx;
-    return (unsigned long)frame;
-}
-
-/* Hand a finished TX frame back for release once TxQueueLock is down. The
-   driver calls this from flush_tx, which runs under that lock with
-   interrupts off; releasing there reaches Mm::Free and a TLB shootdown that
-   waits for every other CPU, one of which may be spinning on the very lock
-   the caller holds. See NetDevice::TxDone. */
-void kernel_netdev_tx_done(unsigned long dev_handle, unsigned long frame_handle)
-{
-    if (!dev_handle || !frame_handle)
-        return;
-    RustNetDevice* dev = NetDevFromHandle(dev_handle);
-    auto* frame = reinterpret_cast<Kernel::NetFrame*>(frame_handle);
-    dev->TxDone(frame);
-}
-
-/* Hand a whole harvest over under one lock acquisition. `count` is bounded
-   by the driver's receive budget, so the array is a small stack one there.
-   Frames the queue had no room for are released here, which is what the
-   single-frame path does too. */
-unsigned long kernel_netdev_enqueue_rx_batch(unsigned long dev_handle,
-    const unsigned long* frame_handles, unsigned long count)
-{
-    if (!dev_handle || !frame_handles || count == 0)
-        return 0;
-
-    RustNetDevice* dev = NetDevFromHandle(dev_handle);
-    auto** frames = reinterpret_cast<Kernel::NetFrame**>(
-        const_cast<unsigned long*>(frame_handles));
-
-    unsigned long taken = dev->EnqueueRxBatch(frames, count);
-
-    dev->RxPackets += taken;
-    for (unsigned long i = taken; i < count; i++)
-    {
-        dev->RxDropped++;
-        frames[i]->Put();
-    }
-
-    return taken;
-}
-
-void kernel_netdev_enqueue_rx(unsigned long dev_handle, unsigned long frame_handle)
-{
-    if (!dev_handle || !frame_handle)
-        return;
-    RustNetDevice* dev = NetDevFromHandle(dev_handle);
-    auto* frame = reinterpret_cast<Kernel::NetFrame*>(frame_handle);
-    if (!dev->EnqueueRx(frame))
-    {
-        dev->RxDropped++;
-        frame->Put();
-    }
-    else
-    {
-        dev->RxPackets++;
-    }
-}
-
-unsigned char* kernel_netframe_data(unsigned long handle)
-{
-    if (!handle) return nullptr;
-    return reinterpret_cast<Kernel::NetFrame*>(handle)->Data;
-}
-
-unsigned long kernel_netframe_data_phys(unsigned long handle)
-{
-    if (!handle) return 0;
-    return reinterpret_cast<Kernel::NetFrame*>(handle)->DataPhys;
-}
-
-unsigned long kernel_netframe_len(unsigned long handle)
-{
-    if (!handle) return 0;
-    return reinterpret_cast<Kernel::NetFrame*>(handle)->Length;
-}
-
-void kernel_netframe_set_len(unsigned long handle, unsigned long len)
-{
-    if (!handle) return;
-    reinterpret_cast<Kernel::NetFrame*>(handle)->Length = len;
-}
-
-void kernel_netframe_put(unsigned long handle)
-{
-    if (!handle) return;
-    reinterpret_cast<Kernel::NetFrame*>(handle)->Put();
-}
 
 unsigned long long kernel_hpet_read_ns()
 {
@@ -1941,6 +1717,14 @@ void kernel_preempt_disable()
 void kernel_preempt_enable()
 {
     Kernel::PreemptEnable();
+}
+
+/* Whether interrupts are on for this CPU. What tells a caller it may
+   release something whose free waits for every other CPU to answer -- with
+   interrupts off it could not answer one itself. */
+int kernel_interrupts_enabled()
+{
+    return Hal::IsInterruptEnabled() ? 1 : 0;
 }
 
 /* Whether a panic has started: what tells code to write without taking a
@@ -2156,152 +1940,8 @@ unsigned long kernel_ring_count(unsigned long handle)
     return reinterpret_cast<RustRing*>(handle)->Ring.Count();
 }
 
-/* Net devices from Rust, the consuming side (kcore::net::Nic): a device
-   already in the kernel's table, found by name. Devices live as long as the
-   kernel does, so a handle is the device's pointer and needs no release --
-   a NetDevice, where the driver-side functions above take a RustNetDevice. */
-unsigned long kernel_net_find(const unsigned char* name, unsigned long nameLen)
-{
-    char key[NetDevNameMax];
-    if (name == nullptr || nameLen == 0 || nameLen >= sizeof(key))
-        return 0;
-
-    Stdlib::MemCpy(key, name, nameLen);
-    key[nameLen] = '\0';
-    return reinterpret_cast<unsigned long>(Kernel::NetDeviceTable::GetInstance().Find(key));
-}
-
-unsigned int kernel_net_ip(unsigned long dev)
-{
-    return reinterpret_cast<Kernel::NetDevice*>(dev)->GetIp().Addr4;
-}
-
-void kernel_net_mac(unsigned long dev, unsigned char* out)
-{
-    if (out == nullptr)
-        return;
-    reinterpret_cast<Kernel::NetDevice*>(dev)->GetMac().CopyTo(out);
-}
-
-/* The addresses a lease gives the device (kcore::net::Nic). Host byte
-   order, as everything on this side of the FFI keeps them. */
-void kernel_net_set_ip(unsigned long dev, unsigned int ip)
-{
-    Kernel::Net::IpAddress addr;
-    addr.Addr4 = ip;
-    reinterpret_cast<Kernel::NetDevice*>(dev)->SetIp(addr);
-}
-
-void kernel_net_set_mask(unsigned long dev, unsigned int mask)
-{
-    Kernel::Net::IpAddress addr;
-    addr.Addr4 = mask;
-    reinterpret_cast<Kernel::NetDevice*>(dev)->SetSubnetMask(addr);
-}
-
-void kernel_net_set_gw(unsigned long dev, unsigned int gw)
-{
-    Kernel::Net::IpAddress addr;
-    addr.Addr4 = gw;
-    reinterpret_cast<Kernel::NetDevice*>(dev)->SetGateway(addr);
-}
-
-/* What to ARP for to reach dst: the gateway when dst is off-subnet, dst
-   itself when it is on it. Host byte order both ways. */
-unsigned int kernel_net_route_ip(unsigned long dev, unsigned int dst)
-{
-    Kernel::Net::IpAddress addr;
-    addr.Addr4 = dst;
-    return reinterpret_cast<Kernel::NetDevice*>(dev)->RouteIp(addr).Addr4;
-}
-
-/* A frame built whole by the caller -- headers and all -- out of the device.
-   0 queued, -1 dropped. */
-int kernel_net_send_raw(unsigned long dev, const unsigned char* data, unsigned long len)
-{
-    if (data == nullptr || len == 0)
-        return -1;
-    return reinterpret_cast<Kernel::NetDevice*>(dev)->SendRaw(data, len) ? 0 : -1;
-}
-
-/* A quoted TCP segment came back as unreachable: the connection it belongs
-   to is told, rather than left retransmitting into a void. Goes when TCP
-   moves over. */
-void kernel_tcp_icmp_unreachable(unsigned int srcIp, unsigned short srcPort,
-    unsigned int dstIp, unsigned short dstPort, unsigned int seq)
-{
-    Kernel::Tcp::GetInstance().OnIcmpUnreachable(srcIp, srcPort, dstIp, dstPort, seq);
-}
-
-int kernel_net_udp_listen(unsigned long dev, unsigned short port,
-    Kernel::NetDevice::RxFrameCallback cb, void* ctx)
-{
-    return reinterpret_cast<Kernel::NetDevice*>(dev)->ListenUdpFrames(port, cb, ctx);
-}
-
-/* The same, with a call at the end of each receive batch: where a listener
-   that answers from the receive path hands the batch's replies to the NIC
-   together -- one lock, one doorbell -- rather than one each. */
-int kernel_net_udp_listen_batch(unsigned long dev, unsigned short port,
-    Kernel::NetDevice::RxFrameCallback cb, void* ctx,
-    Kernel::NetDevice::RxBatchEndCallback batchEnd)
-{
-    return reinterpret_cast<Kernel::NetDevice*>(dev)->ListenUdpFrames(
-        port, cb, ctx, batchEnd);
-}
-
-/* What the recycled frame pool has been doing: allocations it could not
-   serve, and frames a driver is holding. For a load target's periodic line. */
-void kernel_netframe_pool_stats(unsigned long* misses, unsigned long* inFlight)
-{
-    auto& pool = Kernel::NetFramePool::GetInstance();
-    if (misses != nullptr)
-        *misses = pool.GetAllocMisses();
-    if (inFlight != nullptr)
-        *inFlight = pool.GetInFlight();
-}
-
-/* Polls of the receive path, polls that found work, and polls that found
-   work with no interrupt-driven pass since the last one -- the third being
-   the evidence of a lost wakeup. */
-void kernel_net_rx_poll_stats(unsigned long* polls, unsigned long* work,
-    unsigned long* stalls)
-{
-    auto& table = Kernel::NetDeviceTable::GetInstance();
-    if (polls != nullptr)
-        *polls = table.GetRxPolls();
-    if (work != nullptr)
-        *work = table.GetRxPollWork();
-    if (stalls != nullptr)
-        *stalls = table.GetRxStalls();
-}
-
-void kernel_net_udp_unlisten(unsigned long dev, unsigned short port, void* ctx)
-{
-    reinterpret_cast<Kernel::NetDevice*>(dev)->UnlistenUdpFrames(port, ctx);
-}
-
-/* Takes every frame; returns how many were queued */
-unsigned long kernel_net_submit_tx(unsigned long dev, const unsigned long* frames,
-    unsigned long count)
-{
-    if (frames == nullptr || count == 0)
-        return 0;
-
-    auto** batch = reinterpret_cast<Kernel::NetFrame**>(const_cast<unsigned long*>(frames));
-    return reinterpret_cast<Kernel::NetDevice*>(dev)->SubmitTxBatch(batch, count);
-}
-
-unsigned long kernel_netframe_alloc_tx(unsigned long data_len)
-{
-    return (unsigned long)Kernel::NetFrame::AllocTx((ulong)data_len);
-}
-
-void kernel_netframe_get(unsigned long handle)
-{
-    if (!handle)
-        return;
-    reinterpret_cast<Kernel::NetFrame*>(handle)->Get();
-}
+/* Net devices from Rust, both sides of them -- the driver's and the
+   consumer's -- are defined in src/rust/net/src/device.rs, alongside the
+   devices themselves. Nothing of them is left here. */
 
 } /* extern "C" */
