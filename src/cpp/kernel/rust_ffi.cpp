@@ -29,7 +29,6 @@
 #include <drivers/pci.h>
 #include <drivers/msix.h>
 #include <hal/irqchip.h>
-#include <block/block_device.h>
 #include <net/net_device.h>
 #include <net/tcp.h>
 #include <fs/vfs.h>

@@ -1,11 +1,9 @@
 #include "ext2.h"
 
-#include <block/block_device.h>
 #include <lib/stdlib.h>
 
 extern "C" {
 
-int rust_ext2_probe(unsigned long device, Kernel::Ext2Identity* id);
 int rust_ext2_mount(const char* path, unsigned long pathLen, unsigned long device, int readOnly);
 
 }
@@ -13,20 +11,12 @@ int rust_ext2_mount(const char* path, unsigned long pathLen, unsigned long devic
 namespace Kernel
 {
 
-bool Ext2Probe(BlockDevice* dev, Ext2Identity& id)
+int Ext2Mount(const char* path, ulong device, bool readOnly)
 {
-    if (dev == nullptr)
-        return false;
-
-    return rust_ext2_probe(dev->GetHandle(), &id) == 0;
-}
-
-int Ext2Mount(const char* path, BlockDevice* dev, bool readOnly)
-{
-    if (path == nullptr || dev == nullptr)
+    if (path == nullptr || device == 0)
         return Ext2NotMounted;
 
-    return rust_ext2_mount(path, Stdlib::StrLen(path), dev->GetHandle(), readOnly ? 1 : 0);
+    return rust_ext2_mount(path, Stdlib::StrLen(path), device, readOnly ? 1 : 0);
 }
 
 }

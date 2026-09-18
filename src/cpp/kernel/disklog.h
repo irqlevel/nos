@@ -10,7 +10,6 @@
 namespace Kernel
 {
 
-class BlockDevice;
 class Task;
 
 /* The kernel log, written to a raw disk area as each line is produced.
@@ -120,7 +119,7 @@ private:
     DiskLog& operator=(const DiskLog& other) = delete;
     DiskLog& operator=(DiskLog&& other) = delete;
 
-    bool ReadHeader(BlockDevice* dev, Header& hdr);
+    bool ReadHeader(ulong dev, Header& hdr);
     bool WriteHeader();
     bool Enqueue(const char* s);
     bool Drain();
@@ -160,8 +159,10 @@ private:
     /* Setup's and Dump's; neither the tracer nor the writer takes it. */
     SpinLock Lock;
 
-    BlockDevice* Dev;
-    ulong DevClaim = 0;    /* BlockDeviceTable::Claim's, on Dev */
+    /* The block layer's handle for the device the area is on, 0 for none
+       (block/block.h), and the claim held on it. */
+    ulong Dev;
+    ulong DevClaim = 0;
     u64 AreaStartSector;   /* the header sector */
     u64 AreaSectors;
     u32 SectorSize;

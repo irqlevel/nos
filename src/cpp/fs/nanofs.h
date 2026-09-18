@@ -1,9 +1,9 @@
 #pragma once
 
+#include <include/types.h>
+
 namespace Kernel
 {
-
-class BlockDevice;
 
 /* nanofs itself is Rust (src/rust/fs/src/nanofs.rs): 1024 inodes, 16384
    data blocks of 4 KiB, a CRC32 on every block and on every file's data,
@@ -18,11 +18,12 @@ enum NanoFsMounted
     NanoFsNotMounted = -1,
 };
 
-/* Mount dev's nanofs at path. The filesystem belongs to the VFS from here
-   on: an unmount releases it. */
-int NanoFsMount(const char* path, BlockDevice* dev, bool readOnly = false);
+/* Mount the device's nanofs at path. The filesystem belongs to the VFS from
+   here on: an unmount releases it. `device` is a block layer handle
+   (block/block.h). */
+int NanoFsMount(const char* path, ulong device, bool readOnly = false);
 
-/* Write a fresh nanofs onto dev, with an empty root directory. */
-bool NanoFsFormat(BlockDevice* dev);
+/* Write a fresh nanofs onto the device, with an empty root directory. */
+bool NanoFsFormat(ulong device);
 
 }

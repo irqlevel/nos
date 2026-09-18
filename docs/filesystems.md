@@ -62,7 +62,7 @@ An open file pins its vnode: `Remove` and `Rename` refuse a file (or a
 directory containing one) that is open, and `Unmount` refuses a filesystem
 with open files. `UnmountAll` at shutdown does not refuse — it is shutdown.
 
-A mounted filesystem claims its block device (`BlockDeviceTable::Claim`) until
+A mounted filesystem claims its block device (`kernel_blockdev_claim_as`) until
 it is unmounted, and so do the disk log and a module writing to a device
 direct (`blkload`'s write tests) -- and the shell's `format` and `diskwrite`,
 for as long as they write. A claim is refused while another overlaps

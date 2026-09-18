@@ -46,7 +46,7 @@ python3 scripts/netblk.py 10.0.2.15 7000 bench --mode randread --window 64
   is refused rather than taken over, and so is one another instance serves,
   on whatever NIC -- `stop` names an instance by its port.
 - Served read-write, the device is claimed as a `blkload` write test claims it
-  (`BlockDeviceTable::Claim`): refused while a mounted filesystem, the disk log
+  (`kcore::block::Disk::claim`): refused while a mounted filesystem, the disk log
   or another writer holds it -- or the disk it is a partition of, or one of its
   partitions -- and holding all of those off until `stop`. `ro` takes no claim
   and refuses writes and flushes.
@@ -204,7 +204,7 @@ is the Ethernet CRC of each hop.
   takes a slot for each datagram of its answer.
 - **The worker**, a task pinned to one CPU (`netblk/<port>` in `ps` and
   `top`), submits what is queued with no
-  doorbell and rings it once for the batch (`BlockDevice::KickAsync`), then
+  doorbell and rings it once for the batch (`kcore::block::Disk::kick`), then
   hands every finished reply to the NIC in one `SubmitTxBatch`: one lock, one
   doorbell. A doorbell is a write across the bus -- and under a hypervisor, an
   exit.
@@ -253,7 +253,7 @@ the kernel did not have:
   has finished with is then left for the transmit softirq to release, since a
   frame from the allocator is freed through a TLB shootdown that a CPU with
   interrupts off cannot take part in.
-- **Asynchronous block I/O.** `BlockDevice::SubmitAsync` takes an
+- **Asynchronous block I/O.** `kcore::block::Disk::submit` takes an
   `AsyncBlockIo` -- sectors, a physical address, a completion callback -- and
   never blocks: a full queue is `SubmitBusy`, to be tried again after a
   completion. A partition forwards it, moved onto its disk. The NVMe driver

@@ -14,7 +14,7 @@ src/cpp/
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, shell, timers, timekeeping, locks, panic, the random pool, Rust FFI bridge, symbol table
   drivers/    Hardware: serial, VGA text + framebuffer console (screen.cpp picks one), PIT, HPET, RTC, 8042, PCI, MSI-X, ACPI (every virtio device and the bus itself are Rust now, src/rust/virtio)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + HID boot-protocol keyboard
-  block/      The C++ view of a block device: a handle and the calls on it (the layer itself is in Rust, src/rust/block)
+  block/      block.h alone: the kernel_blockdev_* ABI C++ calls (the layer itself is in Rust, src/rust/block)
   net/        Networking: device abstraction, protocol headers, ARP, ICMP, DHCP, DNS, TCP, HTTP client, UDP shell, netconsole
   fs/         The C++ way into the filesystem layer, which is all in Rust now (vfs.cpp, ext2.cpp, nanofs.cpp, ramfs.cpp, procfs.cpp, rootfs.cpp -> src/rust/fs), and the self-test (fstest.cpp), which uses nothing but the file API
   mm/         Memory: page tables (4-level walk, VirtToPhys), page allocator, pool allocator

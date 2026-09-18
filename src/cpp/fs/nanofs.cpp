@@ -1,6 +1,5 @@
 #include "nanofs.h"
 
-#include <block/block_device.h>
 #include <lib/stdlib.h>
 
 extern "C" {
@@ -13,20 +12,20 @@ int rust_nanofs_format(unsigned long device);
 namespace Kernel
 {
 
-int NanoFsMount(const char* path, BlockDevice* dev, bool readOnly)
+int NanoFsMount(const char* path, ulong device, bool readOnly)
 {
-    if (path == nullptr || dev == nullptr)
+    if (path == nullptr || device == 0)
         return NanoFsNotMounted;
 
-    return rust_nanofs_mount(path, Stdlib::StrLen(path), dev->GetHandle(), readOnly ? 1 : 0);
+    return rust_nanofs_mount(path, Stdlib::StrLen(path), device, readOnly ? 1 : 0);
 }
 
-bool NanoFsFormat(BlockDevice* dev)
+bool NanoFsFormat(ulong device)
 {
-    if (dev == nullptr)
+    if (device == 0)
         return false;
 
-    return rust_nanofs_format(dev->GetHandle()) == 0;
+    return rust_nanofs_format(device) == 0;
 }
 
 }

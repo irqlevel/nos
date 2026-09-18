@@ -9,7 +9,7 @@
 #include "time.h"
 #include "watchdog.h"
 #include "disklog.h"
-#include <block/block_device.h>
+#include <block/block.h>
 #include "parameters.h"
 #include <net/net_device.h>
 #include <net/net_frame_pool.h>
@@ -878,6 +878,15 @@ static void CmdUsb(const char* args, Stdlib::Printer& con)
 #endif
 }
 
+/* The block layer's handle for the disk the shell was given by name, 0 when
+   there is no such device. A device is nothing more than this handle here:
+   the table, and everything in it, is Rust (src/rust/block). */
+static ulong FindDisk(const char* name)
+{
+    return kernel_blockdev_find(
+        reinterpret_cast<const u8*>(name), Stdlib::StrLen(name));
+}
+
 static void CmdDiskread(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -908,8 +917,8 @@ static void CmdDiskread(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
-    if (!dev)
+    const ulong dev = FindDisk(diskName);
+    if (dev == 0)
     {
         con.Printf("disk '%s' not found\n", diskName);
         return;
@@ -923,7 +932,7 @@ static void CmdDiskread(const char* args, Stdlib::Printer& con)
     }
     u8* buf = bufPtr.Get();
 
-    if (!dev->ReadSectors(sector, buf, 1))
+    if (kernel_blockdev_read(dev, sector, buf, 1) != 0)
     {
         con.Printf("read error\n");
         return;
@@ -974,8 +983,8 @@ static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
-    if (!dev)
+    const ulong dev = FindDisk(diskName);
+    if (dev == 0)
     {
         con.Printf("disk '%s' not found\n", diskName);
         return;
@@ -1001,21 +1010,20 @@ static void CmdDiskwrite(const char* args, Stdlib::Printer& con)
     if (byteCount > 0)
     {
         /* Not around a mounted filesystem, the disk log or a write test */
-        auto& table = BlockDeviceTable::GetInstance();
         const char* heldBy = nullptr;
-        const ulong claim = table.Claim(dev, DiskwriteHolder, heldBy);
+        const ulong claim = kernel_blockdev_claim_as(dev, DiskwriteHolder, &heldBy);
         if (claim == 0)
         {
             con.Printf("disk '%s' is in use by %s\n", diskName, heldBy);
             return;
         }
 
-        if (!dev->WriteSectors(sector, buf, 1))
+        if (kernel_blockdev_write(dev, sector, buf, 1, 0) != 0)
             con.Printf("write error\n");
         else
             con.Printf("wrote %u bytes to sector %u\n", byteCount, sector);
 
-        table.Release(claim);
+        kernel_blockdev_release(claim);
     }
 }
 
@@ -1638,8 +1646,8 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
         char path[Vfs::MaxPath];
         Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
-        BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
-        if (dev == nullptr)
+        const ulong dev = FindDisk(diskName);
+        if (dev == 0)
         {
             con.Printf("disk '%s' not found\n", diskName);
             return;
@@ -1684,8 +1692,8 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
             readOnly = true;
         }
 
-        BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
-        if (dev == nullptr)
+        const ulong dev = FindDisk(diskName);
+        if (dev == 0)
         {
             con.Printf("disk '%s' not found\n", diskName);
             return;
@@ -2560,8 +2568,8 @@ static void CmdFormat(const char* args, Stdlib::Printer& con)
     char diskName[16];
     Stdlib::TokenCopy(diskStart, end, diskName, sizeof(diskName));
 
-    BlockDevice* dev = BlockDeviceTable::GetInstance().Find(diskName);
-    if (dev == nullptr)
+    const ulong dev = FindDisk(diskName);
+    if (dev == 0)
     {
         con.Printf("disk '%s' not found\n", diskName);
         return;
@@ -2569,9 +2577,8 @@ static void CmdFormat(const char* args, Stdlib::Printer& con)
 
     /* Not under a mounted filesystem, the disk log or a write test, nor over
        a disk one of those holds a partition of */
-    auto& table = BlockDeviceTable::GetInstance();
     const char* heldBy = nullptr;
-    const ulong claim = table.Claim(dev, FormatHolder, heldBy);
+    const ulong claim = kernel_blockdev_claim_as(dev, FormatHolder, &heldBy);
     if (claim == 0)
     {
         con.Printf("disk '%s' is in use by %s\n", diskName, heldBy);
@@ -2579,7 +2586,7 @@ static void CmdFormat(const char* args, Stdlib::Printer& con)
     }
 
     bool formatted = NanoFsFormat(dev);
-    table.Release(claim);
+    kernel_blockdev_release(claim);
 
     if (formatted)
     {
