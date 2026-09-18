@@ -34,6 +34,13 @@ impl TaskHandle {
     }
 }
 
+/// Whether the calling task has been asked to stop -- what a loop that runs
+/// for the life of the kernel checks each time round, so that a shutdown or
+/// a `stop` gets it out rather than leaving it sleeping.
+pub fn stopping() -> bool {
+    unsafe { task::kernel_task_stopping() != 0 }
+}
+
 /// The calling task: what `TaskHandle::id` says for it. For telling
 /// whether a call comes from one of a server's own tasks -- which must not
 /// wait for itself.

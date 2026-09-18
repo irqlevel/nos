@@ -504,6 +504,14 @@ void kernel_task_set_stopping(unsigned long handle)
     reinterpret_cast<Kernel::Task*>(handle)->SetStopping();
 }
 
+/* Whether the calling task has been asked to stop: what a loop that runs
+   for the life of the kernel checks each time round. */
+int kernel_task_stopping()
+{
+    Kernel::Task* task = Kernel::Task::GetCurrentTask();
+    return (task != nullptr && task->IsStopping()) ? 1 : 0;
+}
+
 void kernel_task_put(unsigned long handle)
 {
     reinterpret_cast<Kernel::Task*>(handle)->Put();
@@ -2085,6 +2093,29 @@ void kernel_net_mac(unsigned long dev, unsigned char* out)
     if (out == nullptr)
         return;
     reinterpret_cast<Kernel::NetDevice*>(dev)->GetMac().CopyTo(out);
+}
+
+/* The addresses a lease gives the device (kcore::net::Nic). Host byte
+   order, as everything on this side of the FFI keeps them. */
+void kernel_net_set_ip(unsigned long dev, unsigned int ip)
+{
+    Kernel::Net::IpAddress addr;
+    addr.Addr4 = ip;
+    reinterpret_cast<Kernel::NetDevice*>(dev)->SetIp(addr);
+}
+
+void kernel_net_set_mask(unsigned long dev, unsigned int mask)
+{
+    Kernel::Net::IpAddress addr;
+    addr.Addr4 = mask;
+    reinterpret_cast<Kernel::NetDevice*>(dev)->SetSubnetMask(addr);
+}
+
+void kernel_net_set_gw(unsigned long dev, unsigned int gw)
+{
+    Kernel::Net::IpAddress addr;
+    addr.Addr4 = gw;
+    reinterpret_cast<Kernel::NetDevice*>(dev)->SetGateway(addr);
 }
 
 /* What to ARP for to reach dst: the gateway when dst is off-subnet, dst

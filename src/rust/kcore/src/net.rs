@@ -167,6 +167,19 @@ impl Nic {
         mac
     }
 
+    /// Give the device the addresses a lease granted it. Host byte order.
+    pub fn set_ip(&self, ip: u32) {
+        unsafe { net::kernel_net_set_ip(self.handle, ip) }
+    }
+
+    pub fn set_mask(&self, mask: u32) {
+        unsafe { net::kernel_net_set_mask(self.handle, mask) }
+    }
+
+    pub fn set_gw(&self, gw: u32) {
+        unsafe { net::kernel_net_set_gw(self.handle, gw) }
+    }
+
     /// What to ask ARP for to reach `dst`: the gateway when `dst` is off the
     /// subnet, `dst` itself when it is on it. Host byte order both ways.
     pub fn route_ip(&self, dst: u32) -> u32 {
