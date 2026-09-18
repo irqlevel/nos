@@ -14,25 +14,27 @@ use kcore::procinfo;
 use kcore::trace;
 
 use crate::ramfs::RamFs;
-use crate::vfs::FsOps;
-use crate::vnode::{VNode, NAME_MAX};
+use crate::vfs::FileSystem;
+use crate::vnode::{NodeId, Tree};
 
 /// What one rendering of /proc/interrupts fits in.
 const INTERRUPTS_MAX: usize = 512;
 
 pub struct ProcFs {
     ram: RamFs,
-    interrupts: *mut VNode,
+    interrupts: Option<NodeId>,
 }
 
 impl ProcFs {
-    pub fn new() -> Option<Box<ProcFs>> {
-        let ram = *RamFs::new()?;
-        Some(Box::new(ProcFs { ram, interrupts: core::ptr::null_mut() }))
+    pub fn new() -> Option<ProcFs> {
+        Some(ProcFs { ram: RamFs::new()?, interrupts: None })
     }
 
-    pub fn mount(&mut self) -> bool {
-        let root = self.ram.root();
+    fn fill(&mut self) -> bool {
+        let root = match self.ram.root() {
+            Some(root) => root,
+            None => return false,
+        };
 
         let mut buf = [0u8; 128];
         let len = procinfo::version(&mut buf);
@@ -43,7 +45,7 @@ impl ProcFs {
         self.put(root, b"cmdline", &buf[..len]);
 
         self.interrupts = self.ram.create_file(root, b"interrupts");
-        if self.interrupts.is_null() {
+        if self.interrupts.is_none() {
             trace!(0, "procfs: no memory for /proc/interrupts");
         } else {
             self.refresh_interrupts();
@@ -53,18 +55,21 @@ impl ProcFs {
     }
 
     /// A file with this content, made once at mount.
-    fn put(&self, root: *mut VNode, name: &[u8], content: &[u8]) {
-        let node = self.ram.create_file(root, name);
-        if node.is_null() {
-            trace!(0, "procfs: no memory for a file");
-            return;
+    fn put(&mut self, root: NodeId, name: &[u8], content: &[u8]) {
+        match self.ram.create_file(root, name) {
+            Some(node) => { self.ram.write(node, content, 0); }
+            None => trace!(0, "procfs: no memory for a file"),
         }
-        self.ram.write(node, content, 0);
     }
 
     /// The interrupt counters as they are now. What does not fit is left
     /// out, as it was when this rendered into a fixed buffer in C++.
-    fn refresh_interrupts(&self) {
+    fn refresh_interrupts(&mut self) {
+        let file = match self.interrupts {
+            Some(file) => file,
+            None => return,
+        };
+
         let mut out = [0u8; INTERRUPTS_MAX];
         let mut at = 0;
 
@@ -82,16 +87,8 @@ impl ProcFs {
             at += written;
         }
 
-        self.ram.truncate(self.interrupts, 0);
-        self.ram.write(self.interrupts, &out[..at], 0);
-    }
-
-    pub fn lookup(&self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        let node = self.ram.lookup(dir, name);
-        if !node.is_null() && node == self.interrupts {
-            self.refresh_interrupts();
-        }
-        node
+        self.ram.truncate(file, 0);
+        self.ram.write(file, &out[..at], 0);
     }
 }
 
@@ -137,142 +134,76 @@ fn line(out: &mut [u8], name: &[u8], count: i64) -> usize {
     total
 }
 
-/* ---- the ops table the VFS drives it by ---- */
-
-/// # Safety
-/// `ctx` is the pointer a mount was made with, and the filesystem is alive.
-unsafe fn fs<'a>(ctx: *mut u8) -> &'a mut ProcFs {
-    unsafe { &mut *(ctx as *mut ProcFs) }
-}
-
-/// # Safety
-/// `name` points at a NUL-terminated string.
-unsafe fn cstr<'a>(name: *const u8) -> &'a [u8] {
-    if name.is_null() {
-        return &[];
-    }
-    let mut len = 0;
-    while len < NAME_MAX && unsafe { *name.add(len) } != 0 {
-        len += 1;
-    }
-    unsafe { core::slice::from_raw_parts(name, len) }
-}
-
-extern "C" fn op_root(ctx: *mut u8) -> *mut VNode {
-    unsafe { fs(ctx) }.ram.root()
-}
-
-extern "C" fn op_load_dir(_ctx: *mut u8, _dir: *mut VNode) -> i32 {
-    0
-}
-
-extern "C" fn op_lookup(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.lookup(dir, unsafe { cstr(name) })
-}
-
 /* Nothing is made, written, moved or removed in procfs from outside. */
-
-extern "C" fn op_no_node(_ctx: *mut u8, _dir: *mut VNode, _name: *const u8) -> *mut VNode {
-    core::ptr::null_mut()
-}
-
-extern "C" fn op_read(
-    ctx: *mut u8, file: *mut VNode, buf: *mut u8, len: usize, off: usize,
-) -> i32 {
-    if len == 0 {
-        return 0;
+impl FileSystem for ProcFs {
+    fn name(&self) -> &'static str {
+        "procfs"
     }
-    if buf.is_null() {
-        return -1;
+
+    /// Read-only whatever the mount asked for: these files are the kernel's.
+    fn mount(&mut self, _read_only: bool) -> Option<bool> {
+        if self.fill() { Some(true) } else { None }
     }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    if unsafe { fs(ctx) }.ram.read(file, buf, off) { 0 } else { -1 }
-}
 
-extern "C" fn op_write(
-    _ctx: *mut u8, _file: *mut VNode, _data: *const u8, _len: usize, _off: usize,
-) -> i32 {
-    -1
-}
-
-extern "C" fn op_truncate(_ctx: *mut u8, _file: *mut VNode, _size: usize) -> i32 {
-    -1
-}
-
-extern "C" fn op_rename(
-    _ctx: *mut u8, _node: *mut VNode, _dir: *mut VNode, _name: *const u8,
-) -> i32 {
-    -1
-}
-
-extern "C" fn op_remove(_ctx: *mut u8, _node: *mut VNode) -> i32 {
-    -1
-}
-
-extern "C" fn op_sync(_ctx: *mut u8) -> i32 {
-    0
-}
-
-extern "C" fn op_device(_ctx: *mut u8) -> usize {
-    0
-}
-
-extern "C" fn op_mount(ctx: *mut u8, _read_only: i32) -> i32 {
-    let fs = unsafe { fs(ctx) };
-    if !fs.mount() {
-        return -1;
+    fn unmount(&mut self) {
+        self.ram.unmount();
+        self.interrupts = None;
     }
-    /* Read-only whatever the mount asked for: these files are the kernel's */
-    1
-}
 
-extern "C" fn op_unmount(ctx: *mut u8) {
-    unsafe { fs(ctx) }.ram.unmount();
-}
+    fn tree(&self) -> &Tree {
+        self.ram.tree()
+    }
 
-extern "C" fn op_destroy(ctx: *mut u8) {
-    drop(unsafe { Box::from_raw(ctx as *mut ProcFs) });
-}
+    fn tree_mut(&mut self) -> &mut Tree {
+        FileSystem::tree_mut(&mut self.ram)
+    }
 
-fn ops_for(fs: *mut ProcFs) -> FsOps {
-    FsOps {
-        name: b"procfs\0".as_ptr(),
-        info: None,
-        root: op_root,
-        load_dir: op_load_dir,
-        lookup: op_lookup,
-        create_file: op_no_node,
-        create_dir: op_no_node,
-        read: op_read,
-        write: op_write,
-        truncate: op_truncate,
-        rename: op_rename,
-        remove: op_remove,
-        sync: op_sync,
-        device: op_device,
-        mount: op_mount,
-        unmount: op_unmount,
-        destroy: Some(op_destroy),
-        ctx: fs as *mut u8,
+    fn root(&self) -> Option<NodeId> {
+        self.ram.root()
+    }
+
+    fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        let node = self.ram.lookup(dir, name)?;
+        if Some(node) == self.interrupts {
+            self.refresh_interrupts();
+        }
+        Some(node)
+    }
+
+    fn create_file(&mut self, _dir: NodeId, _name: &[u8]) -> Option<NodeId> {
+        None
+    }
+
+    fn create_dir(&mut self, _dir: NodeId, _name: &[u8]) -> Option<NodeId> {
+        None
+    }
+
+    fn read(&mut self, file: NodeId, buf: &mut [u8], offset: usize) -> bool {
+        self.ram.read(file, buf, offset)
+    }
+
+    fn write(&mut self, _file: NodeId, _data: &[u8], _offset: usize) -> bool {
+        false
+    }
+
+    fn truncate(&mut self, _file: NodeId, _size: usize) -> bool {
+        false
+    }
+
+    fn rename(&mut self, _node: NodeId, _dir: NodeId, _name: &[u8]) -> bool {
+        false
+    }
+
+    fn remove(&mut self, _node: NodeId) -> bool {
+        false
     }
 }
 
 /// Mount procfs at `path`. Read-only: there is nothing in it to write.
 pub fn mount_at(path: &str) -> bool {
-    let vfs = match crate::vfs_instance() {
-        Some(vfs) => vfs,
-        None => return false,
+    let (vfs, fs) = match (crate::vfs_instance(), ProcFs::new()) {
+        (Some(vfs), Some(fs)) => (vfs, fs),
+        _ => return false,
     };
-
-    let fs = match ProcFs::new() {
-        Some(fs) => Box::into_raw(fs),
-        None => return false,
-    };
-
-    let ops = ops_for(fs);
-    if !vfs.mount(path.as_bytes(), &ops, true) {
-        drop(unsafe { Box::from_raw(fs) });
-        return false;
-    }
-    true
+    vfs.mount(path.as_bytes(), Box::new(fs), true).is_some()
 }

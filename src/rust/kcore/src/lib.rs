@@ -20,6 +20,7 @@ pub mod random;
 pub mod once;
 pub mod pci;
 pub mod percpu;
+pub mod pod;
 pub mod msix;
 pub mod input;
 pub mod interrupt;

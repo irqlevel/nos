@@ -1,12 +1,15 @@
 //! The filesystem layer: the VFS every read and write in the kernel goes
-//! through, the filesystems under it, and the C ABI the rest of the kernel
-//! calls them by.
+//! through, the filesystems under it, and the few names the rest of the
+//! kernel calls them by.
 //!
-//! [`vfs`] is the mount table, path resolution and the open handles; under
-//! it [`ext2`] (the root filesystem), [`nanofs`], [`ramfs`] and [`procfs`],
-//! each giving the VFS an [`FsOps`] and seeing one call at a time under its
-//! lock. [`rootfs`] is what the kernel command line asks to be mounted at
-//! boot. C++ calls in through fs/vfs.cpp and never sees a vnode.
+//! [`vfs`] is the mount table, path resolution and the open files; under it
+//! [`ext2`] (the root filesystem), [`nanofs`], [`ramfs`] and [`procfs`], each
+//! a [`vfs::FileSystem`] seeing one call at a time under the VFS lock, and
+//! each keeping what it holds in a [`vnode::Tree`]. [`rootfs`] is what the
+//! kernel command line asks to be mounted at boot. C++ and the modules come
+//! in through the C ABI at the bottom of this file and of [`files`], and
+//! never see a vnode: an open file is a handle to them, and a handle is
+//! looked up, not followed.
 
 #![no_std]
 
@@ -24,12 +27,13 @@ pub mod shell;
 pub mod vfs;
 pub mod vnode;
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::ffi::c_void;
 
+use kcore::once::OnceBox;
 use kcore::trace;
-use vfs::{File, Vfs};
+use vfs::{Handle, Vfs};
 
-static VFS: AtomicPtr<Vfs> = AtomicPtr::new(core::ptr::null_mut());
+static VFS: OnceBox<Vfs> = OnceBox::new();
 
 /// Put the layer's commands in front of whoever runs one. Called from
 /// `rust_init`, before the shell starts.
@@ -41,29 +45,11 @@ pub fn init() {
 /// where its mutex can be allocated; two callers racing here both get the
 /// same one.
 pub(crate) fn vfs_instance() -> Option<&'static Vfs> {
-    let existing = VFS.load(Ordering::Acquire);
-    if !existing.is_null() {
-        return Some(unsafe { &*existing });
+    let vfs = VFS.get_or_try_init(Vfs::new);
+    if vfs.is_none() {
+        trace!(0, "vfs: no memory for the mount table");
     }
-
-    let made = match Vfs::new() {
-        Some(vfs) => alloc::boxed::Box::into_raw(vfs),
-        None => {
-            trace!(0, "vfs: no memory for the mount table");
-            return None;
-        }
-    };
-
-    match VFS.compare_exchange(
-        core::ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire)
-    {
-        Ok(_) => Some(unsafe { &*made }),
-        Err(winner) => {
-            /* Someone else got there first; theirs is the one. */
-            unsafe { drop(alloc::boxed::Box::from_raw(made)) };
-            Some(unsafe { &*winner })
-        }
-    }
+    vfs
 }
 
 /// # Safety
@@ -96,46 +82,55 @@ pub extern "C" fn kernel_vfs_unmount_all() {
     }
 }
 
-/* ---- files ---- */
+/* ---- files ----
+ *
+ * An open file crosses as a word -- a slot of the VFS's table and the
+ * generation of what is in it -- and comes back as one. Whatever comes back
+ * is looked up: a word that is no open file's reads as no file, so the calls
+ * that take nothing else are not `unsafe`. */
+
+fn handle_of(file: *mut c_void) -> Option<Handle> {
+    Handle::from_raw(file as usize)
+}
 
 /// # Safety
 /// `path` points at `len` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_vfs_open(
     path_ptr: *const u8, len: usize, flags: usize,
-) -> *mut File {
-    match (vfs_instance(), unsafe { path(path_ptr, len) }) {
+) -> *mut c_void {
+    let handle = match (vfs_instance(), unsafe { path(path_ptr, len) }) {
         (Some(vfs), Some(at)) => vfs.open(at, flags),
-        _ => core::ptr::null_mut(),
-    }
+        _ => None,
+    };
+    Handle::into_raw(handle) as *mut c_void
 }
 
-/// # Safety
-/// `file` came from `kernel_vfs_open` and is not used again.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_vfs_close(file: *mut File) {
-    if let Some(vfs) = vfs_instance() {
-        vfs.close(file);
+pub extern "C" fn kernel_vfs_close(file: *mut c_void) {
+    if let (Some(vfs), Some(handle)) = (vfs_instance(), handle_of(file)) {
+        vfs.close(handle);
     }
 }
 
 /// 0 with `*out` set to what was read -- 0 at end of file -- or -1.
 ///
 /// # Safety
-/// `buf` takes `len` bytes; `out` is writable.
+/// `buf` takes `len` bytes; `out` is writable, or null.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_vfs_read(
-    file: *mut File, buf: *mut u8, len: usize, out: *mut usize,
+    file: *mut c_void, buf: *mut u8, len: usize, out: *mut usize,
 ) -> i32 {
-    let vfs = match vfs_instance() {
-        Some(vfs) => vfs,
-        None => return -1,
+    let (vfs, handle) = match (vfs_instance(), handle_of(file)) {
+        (Some(vfs), Some(handle)) if !buf.is_null() => (vfs, handle),
+        _ => return -1,
     };
 
-    match vfs.read(file, buf, len) {
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    match vfs.read(handle, buf) {
         Some(got) => {
-            if !out.is_null() {
-                unsafe { *out = got };
+            if let Some(out) = unsafe { out.as_mut() } {
+                *out = got;
             }
             0
         }
@@ -146,18 +141,22 @@ pub unsafe extern "C" fn kernel_vfs_read(
 /// # Safety
 /// `data` holds `len` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_vfs_write(file: *mut File, data: *const u8, len: usize) -> i32 {
-    match vfs_instance() {
-        Some(vfs) if vfs.write(file, data, len) => 0,
-        _ => -1,
-    }
+pub unsafe extern "C" fn kernel_vfs_write(file: *mut c_void, data: *const u8, len: usize) -> i32 {
+    let (vfs, handle) = match (vfs_instance(), handle_of(file)) {
+        (Some(vfs), Some(handle)) if !data.is_null() || len == 0 => (vfs, handle),
+        _ => return -1,
+    };
+
+    let data = if len == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(data, len) } };
+    if vfs.write(handle, data) { 0 } else { -1 }
 }
 
-/// # Safety
-/// `file` came from `kernel_vfs_open`.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_vfs_size(file: *mut File) -> usize {
-    vfs_instance().map_or(0, |vfs| vfs.size(file))
+pub extern "C" fn kernel_vfs_size(file: *mut c_void) -> usize {
+    match (vfs_instance(), handle_of(file)) {
+        (Some(vfs), Some(handle)) => vfs.size(handle),
+        _ => 0,
+    }
 }
 
 /* ---- paths ---- */
@@ -179,4 +178,3 @@ pub extern "C" fn kernel_vfs_sync() -> i32 {
         _ => -1,
     }
 }
-

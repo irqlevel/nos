@@ -4,183 +4,136 @@
 //! the boot self-test use. A file is one growing buffer, a directory is a
 //! list of children, and nothing survives a reboot.
 //!
-//! Every call arrives with the VFS lock held (see `FsOps`), so there is no
-//! locking here.
+//! Every call arrives with the VFS lock held (see `FileSystem`), so there is
+//! no locking here.
 
 use alloc::boxed::Box;
-use core::alloc::Layout;
 
 use kcore::trace;
 
-use crate::vfs::FsOps;
-use crate::vnode::{self, VNode, FLAG_DIR_LOADED, NAME_MAX, TYPE_DIR, TYPE_FILE};
-
-/// The smallest buffer a file gets; it doubles from there.
-const MIN_CAPACITY: usize = 64;
+use crate::vfs::FileSystem;
+use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 pub struct RamFs {
-    root: *mut VNode,
-}
-
-/// A file's buffer, as the layout it was taken with. A zero capacity is no
-/// buffer at all.
-fn buffer_layout(capacity: usize) -> Layout {
-    /* Bytes, so any size is a valid layout and `dealloc` needs nothing but
-     * the capacity the vnode already carries. */
-    unsafe { Layout::from_size_align_unchecked(capacity, 1) }
+    tree: Tree,
+    root: Option<NodeId>,
 }
 
 impl RamFs {
-    pub fn new() -> Option<Box<RamFs>> {
-        let root = vnode::alloc();
-        if root.is_null() {
-            trace!(0, "ramfs: no memory for the root");
-            return None;
-        }
-
-        unsafe {
-            (*root).name[0] = b'/';
-            (*root).node_type = TYPE_DIR;
-            /* In-memory directories are born complete */
-            (*root).flags = FLAG_DIR_LOADED;
-        }
-        Some(Box::new(RamFs { root }))
+    pub fn new() -> Option<RamFs> {
+        let mut tree = Tree::new();
+        let root = match tree.alloc(b"/", Kind::Dir) {
+            Some(root) => root,
+            None => {
+                trace!(0, "ramfs: no memory for the root");
+                return None;
+            }
+        };
+        /* In-memory directories are born complete */
+        tree[root].dir_loaded = true;
+        Some(RamFs { tree, root: Some(root) })
     }
 
-    pub fn root(&self) -> *mut VNode {
+    pub fn tree(&self) -> &Tree {
+        &self.tree
+    }
+
+    pub fn root(&self) -> Option<NodeId> {
         self.root
     }
 
     pub fn unmount(&mut self) {
-        if !self.root.is_null() {
-            unsafe { free_tree(self.root) };
-            self.root = core::ptr::null_mut();
-        }
+        self.tree.clear();
+        self.root = None;
     }
 
-    fn new_node(name: &[u8], node_type: i32) -> *mut VNode {
-        let node = vnode::alloc();
-        if node.is_null() {
-            trace!(0, "ramfs: no memory for a node");
-            return node;
+    pub fn lookup(&self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        if !self.tree.get(dir)?.is_dir() {
+            return None;
         }
-
-        unsafe {
-            let len = name.len().min(NAME_MAX - 1);
-            (&mut (*node).name)[..len].copy_from_slice(&name[..len]);
-            (*node).node_type = node_type;
-            if node_type == TYPE_DIR {
-                (*node).flags = FLAG_DIR_LOADED;
-            }
-        }
-        node
+        self.tree.find_child(dir, name)
     }
 
-    pub fn lookup(&self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        if dir.is_null() || !unsafe { (*dir).is_dir() } {
-            return core::ptr::null_mut();
-        }
-
-        for child in unsafe { vnode::children(dir) } {
-            if unsafe { (*child).name_is(name) } {
-                return child;
-            }
-        }
-        core::ptr::null_mut()
-    }
-
-    fn create(&self, dir: *mut VNode, name: &[u8], node_type: i32) -> *mut VNode {
-        let null = core::ptr::null_mut();
-        if dir.is_null() || name.is_empty() {
+    fn create(&mut self, dir: NodeId, name: &[u8], kind: Kind) -> Option<NodeId> {
+        if name.is_empty() {
             trace!(0, "ramfs: something made with no name");
-            return null;
+            return None;
         }
-        if !unsafe { (*dir).is_dir() } {
+        if !self.tree.get(dir)?.is_dir() {
             trace!(0, "ramfs: something made somewhere that is not a directory");
-            return null;
+            return None;
         }
-        if !self.lookup(dir, name).is_null() {
+        if self.lookup(dir, name).is_some() {
             trace!(0, "ramfs: there is something by that name already");
-            return null;
+            return None;
         }
 
-        let node = RamFs::new_node(name, node_type);
-        if !node.is_null() {
-            unsafe {
-                (*node).parent = dir;
-                vnode::insert_child(dir, node);
+        let node = match self.tree.alloc(name, kind) {
+            Some(node) => node,
+            None => {
+                trace!(0, "ramfs: no memory for a node");
+                return None;
             }
+        };
+        if kind == Kind::Dir {
+            self.tree[node].dir_loaded = true;
         }
-        node
+        self.tree.insert_child(dir, node);
+        Some(node)
     }
 
-    pub fn create_file(&self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        self.create(dir, name, TYPE_FILE)
+    pub fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        self.create(dir, name, Kind::File)
     }
 
-    pub fn create_dir(&self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        self.create(dir, name, TYPE_DIR)
+    pub fn create_dir(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        self.create(dir, name, Kind::Dir)
     }
 
-    /// Room for `size` bytes, keeping what the file holds. The buffer starts
-    /// at MIN_CAPACITY and doubles, so a file written a line at a time costs
-    /// a logarithmic number of copies rather than one per write.
-    fn reserve(file: *mut VNode, size: usize) -> bool {
-        let (data, used, capacity) = unsafe { ((*file).data, (*file).size, (*file).capacity) };
-        if size <= capacity {
-            return true;
-        }
-
-        let mut want = if capacity != 0 { capacity } else { MIN_CAPACITY };
-        while want < size {
-            match want.checked_mul(2) {
-                Some(doubled) => want = doubled,
-                None => {
-                    trace!(0, "ramfs: a file of {} bytes is more than memory holds", size);
-                    return false;
-                }
-            }
-        }
-
-        let fresh = unsafe { alloc::alloc::alloc(buffer_layout(want)) };
-        if fresh.is_null() {
-            trace!(0, "ramfs: no memory for {} bytes", want);
+    /// The file's buffer made `size` bytes long, keeping what it holds and
+    /// reading as zeros where it grew. The growth is amortized, so a file
+    /// written a line at a time costs a logarithmic number of copies rather
+    /// than one per write.
+    fn resize(&mut self, file: NodeId, size: usize) -> bool {
+        let node = &mut self.tree[file];
+        let len = node.data.len();
+        if size > len && node.data.try_reserve(size - len).is_err() {
+            trace!(0, "ramfs: no memory for {} bytes", size);
             return false;
         }
-
-        unsafe {
-            if !data.is_null() {
-                core::ptr::copy_nonoverlapping(data, fresh, used);
-                alloc::alloc::dealloc(data, buffer_layout(capacity));
-            }
-            (*file).data = fresh;
-            (*file).capacity = want;
-        }
+        node.data.resize(size, 0);
+        node.size = size;
         true
     }
 
-    pub fn read(&self, file: *mut VNode, buf: &mut [u8], offset: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "ramfs: a read of something that is not a file");
+    pub fn read(&self, file: NodeId, buf: &mut [u8], offset: usize) -> bool {
+        let node = match self.tree.get(file) {
+            Some(node) if node.is_file() => node,
+            _ => {
+                trace!(0, "ramfs: a read of something that is not a file");
+                return false;
+            }
+        };
+
+        if offset >= node.data.len() {
+            trace!(0, "ramfs: a read at {} is past the {} bytes there are",
+                offset, node.data.len());
             return false;
         }
 
-        let (data, size) = unsafe { ((*file).data, (*file).size) };
-        if offset >= size {
-            trace!(0, "ramfs: a read at {} is past the {} bytes there are", offset, size);
-            return false;
-        }
-
-        let take = buf.len().min(size - offset);
-        unsafe { core::ptr::copy_nonoverlapping(data.add(offset), buf.as_mut_ptr(), take) };
+        let take = buf.len().min(node.data.len() - offset);
+        buf[..take].copy_from_slice(&node.data[offset..offset + take]);
         true
     }
 
-    pub fn write(&self, file: *mut VNode, data: &[u8], offset: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "ramfs: a write to something that is not a file");
-            return false;
-        }
+    pub fn write(&mut self, file: NodeId, data: &[u8], offset: usize) -> bool {
+        let size = match self.tree.get(file) {
+            Some(node) if node.is_file() => node.data.len(),
+            _ => {
+                trace!(0, "ramfs: a write to something that is not a file");
+                return false;
+            }
+        };
         if data.is_empty() {
             return true;
         }
@@ -194,53 +147,36 @@ impl RamFs {
             }
         };
 
-        if !RamFs::reserve(file, end) {
+        /* Writing past the end leaves a hole that reads as zeros */
+        if end > size && !self.resize(file, end) {
             return false;
         }
 
-        unsafe {
-            let buf = (*file).data;
-            let size = (*file).size;
-            /* Writing past the end leaves a hole that reads as zeros */
-            if offset > size {
-                core::ptr::write_bytes(buf.add(size), 0, offset - size);
-            }
-            core::ptr::copy_nonoverlapping(data.as_ptr(), buf.add(offset), data.len());
-            if end > size {
-                (*file).size = end;
-            }
-        }
+        self.tree[file].data[offset..end].copy_from_slice(data);
         true
     }
 
-    pub fn truncate(&self, file: *mut VNode, size: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "ramfs: a truncate of something that is not a file");
-            return false;
-        }
-
-        let was = unsafe { (*file).size };
-        if size > was {
-            if !RamFs::reserve(file, size) {
+    pub fn truncate(&mut self, file: NodeId, size: usize) -> bool {
+        match self.tree.get(file) {
+            Some(node) if node.is_file() => {}
+            _ => {
+                trace!(0, "ramfs: a truncate of something that is not a file");
                 return false;
             }
-            unsafe { core::ptr::write_bytes((*file).data.add(was), 0, size - was) };
         }
-
-        unsafe { (*file).size = size };
-        true
+        self.resize(file, size)
     }
 
-    pub fn rename(&self, node: *mut VNode, new_dir: *mut VNode, new_name: &[u8]) -> bool {
-        if node.is_null() || new_dir.is_null() || new_name.is_empty() {
+    pub fn rename(&mut self, node: NodeId, new_dir: NodeId, new_name: &[u8]) -> bool {
+        if new_name.is_empty() || self.tree.get(node).is_none() {
             trace!(0, "ramfs: a rename of nothing");
             return false;
         }
-        if unsafe { (*node).parent }.is_null() {
+        if self.tree.parent(node).is_none() {
             trace!(0, "ramfs: the root cannot be renamed");
             return false;
         }
-        if !unsafe { (*new_dir).is_dir() } {
+        if !self.tree.get(new_dir).is_some_and(|dir| dir.is_dir()) {
             trace!(0, "ramfs: the target of a rename is not a directory");
             return false;
         }
@@ -248,179 +184,89 @@ impl RamFs {
             trace!(0, "ramfs: a name of {} bytes is too long", new_name.len());
             return false;
         }
-        if !self.lookup(new_dir, new_name).is_null() {
+        if self.lookup(new_dir, new_name).is_some() {
             trace!(0, "ramfs: there is something by that name already");
             return false;
         }
 
-        unsafe { vnode::rename(node, new_dir, new_name) };
+        self.tree.rename(node, new_dir, new_name);
         true
     }
 
-    pub fn remove(&self, node: *mut VNode) -> bool {
-        if node.is_null() {
+    pub fn remove(&mut self, node: NodeId) -> bool {
+        if self.tree.get(node).is_none() {
             trace!(0, "ramfs: a remove of nothing");
             return false;
         }
-        if unsafe { (*node).parent }.is_null() {
+        if self.tree.parent(node).is_none() {
             trace!(0, "ramfs: the root cannot be removed");
             return false;
         }
 
-        unsafe {
-            vnode::unlink(node);
-            free_tree(node);
-        }
+        /* Its buffer, and those of everything under it, go with the nodes */
+        self.tree.free_tree(node);
         true
     }
 }
 
-/// Free a node, its buffer, and everything under it.
-///
-/// # Safety
-/// `node` is a ramfs node, off its parent's list already.
-unsafe fn free_tree(node: *mut VNode) {
-    loop {
-        let child = unsafe { vnode::first_child(node) };
-        if child.is_null() {
-            break;
-        }
-        unsafe {
-            vnode::unlink(child);
-            free_tree(child);
-        }
+impl FileSystem for RamFs {
+    fn name(&self) -> &'static str {
+        "ramfs"
     }
 
-    unsafe {
-        let (data, capacity) = ((*node).data, (*node).capacity);
-        if !data.is_null() {
-            alloc::alloc::dealloc(data, buffer_layout(capacity));
-        }
-        vnode::free(node);
+    fn mount(&mut self, read_only: bool) -> Option<bool> {
+        Some(read_only)
     }
-}
 
-/* ---- the ops table the VFS drives it by ---- */
-
-/// # Safety
-/// `ctx` is the pointer a mount was made with, and the filesystem is alive.
-unsafe fn fs<'a>(ctx: *mut u8) -> &'a mut RamFs {
-    unsafe { &mut *(ctx as *mut RamFs) }
-}
-
-/// # Safety
-/// `name` points at a NUL-terminated string.
-unsafe fn cstr<'a>(name: *const u8) -> &'a [u8] {
-    if name.is_null() {
-        return &[];
+    fn unmount(&mut self) {
+        RamFs::unmount(self);
     }
-    let mut len = 0;
-    while len < NAME_MAX && unsafe { *name.add(len) } != 0 {
-        len += 1;
+
+    fn tree(&self) -> &Tree {
+        &self.tree
     }
-    unsafe { core::slice::from_raw_parts(name, len) }
-}
 
-extern "C" fn op_root(ctx: *mut u8) -> *mut VNode {
-    unsafe { fs(ctx) }.root()
-}
-
-extern "C" fn op_load_dir(_ctx: *mut u8, _dir: *mut VNode) -> i32 {
-    /* Born complete: there is nowhere else the entries could be */
-    0
-}
-
-extern "C" fn op_lookup(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.lookup(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_create_file(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.create_file(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_create_dir(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.create_dir(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_read(
-    ctx: *mut u8, file: *mut VNode, buf: *mut u8, len: usize, off: usize,
-) -> i32 {
-    if len == 0 {
-        return 0;
+    fn tree_mut(&mut self) -> &mut Tree {
+        &mut self.tree
     }
-    if buf.is_null() {
-        return -1;
+
+    fn root(&self) -> Option<NodeId> {
+        self.root
     }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    if unsafe { fs(ctx) }.read(file, buf, off) { 0 } else { -1 }
-}
 
-extern "C" fn op_write(
-    ctx: *mut u8, file: *mut VNode, data: *const u8, len: usize, off: usize,
-) -> i32 {
-    if len == 0 {
-        return 0;
+    /* `load_dir` is the default: born complete, there is nowhere else the
+     * entries could be. And `sync`: nowhere to push it to. */
+
+    fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        RamFs::lookup(self, dir, name)
     }
-    if data.is_null() {
-        return -1;
+
+    fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        RamFs::create_file(self, dir, name)
     }
-    let data = unsafe { core::slice::from_raw_parts(data, len) };
-    if unsafe { fs(ctx) }.write(file, data, off) { 0 } else { -1 }
-}
 
-extern "C" fn op_truncate(ctx: *mut u8, file: *mut VNode, size: usize) -> i32 {
-    if unsafe { fs(ctx) }.truncate(file, size) { 0 } else { -1 }
-}
+    fn create_dir(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        RamFs::create_dir(self, dir, name)
+    }
 
-extern "C" fn op_rename(ctx: *mut u8, node: *mut VNode, dir: *mut VNode, name: *const u8) -> i32 {
-    if unsafe { fs(ctx) }.rename(node, dir, unsafe { cstr(name) }) { 0 } else { -1 }
-}
+    fn read(&mut self, file: NodeId, buf: &mut [u8], offset: usize) -> bool {
+        RamFs::read(self, file, buf, offset)
+    }
 
-extern "C" fn op_remove(ctx: *mut u8, node: *mut VNode) -> i32 {
-    if unsafe { fs(ctx) }.remove(node) { 0 } else { -1 }
-}
+    fn write(&mut self, file: NodeId, data: &[u8], offset: usize) -> bool {
+        RamFs::write(self, file, data, offset)
+    }
 
-extern "C" fn op_sync(_ctx: *mut u8) -> i32 {
-    /* Nowhere to push it to */
-    0
-}
+    fn truncate(&mut self, file: NodeId, size: usize) -> bool {
+        RamFs::truncate(self, file, size)
+    }
 
-extern "C" fn op_device(_ctx: *mut u8) -> usize {
-    0
-}
+    fn rename(&mut self, node: NodeId, dir: NodeId, name: &[u8]) -> bool {
+        RamFs::rename(self, node, dir, name)
+    }
 
-extern "C" fn op_mount(_ctx: *mut u8, read_only: i32) -> i32 {
-    if read_only != 0 { 1 } else { 0 }
-}
-
-extern "C" fn op_unmount(ctx: *mut u8) {
-    unsafe { fs(ctx) }.unmount();
-}
-
-extern "C" fn op_destroy(ctx: *mut u8) {
-    drop(unsafe { Box::from_raw(ctx as *mut RamFs) });
-}
-
-fn ops_for(fs: *mut RamFs) -> FsOps {
-    FsOps {
-        name: b"ramfs\0".as_ptr(),
-        info: None,
-        root: op_root,
-        load_dir: op_load_dir,
-        lookup: op_lookup,
-        create_file: op_create_file,
-        create_dir: op_create_dir,
-        read: op_read,
-        write: op_write,
-        truncate: op_truncate,
-        rename: op_rename,
-        remove: op_remove,
-        sync: op_sync,
-        device: op_device,
-        mount: op_mount,
-        unmount: op_unmount,
-        destroy: Some(op_destroy),
-        ctx: fs as *mut u8,
+    fn remove(&mut self, node: NodeId) -> bool {
+        RamFs::remove(self, node)
     }
 }
 
@@ -446,20 +292,9 @@ pub fn mount_at(path: &str, read_only: bool) -> bool {
 }
 
 fn mount_bytes(at: &[u8], read_only: bool) -> bool {
-    let vfs = match crate::vfs_instance() {
-        Some(vfs) => vfs,
-        None => return false,
+    let (vfs, fs) = match (crate::vfs_instance(), RamFs::new()) {
+        (Some(vfs), Some(fs)) => (vfs, fs),
+        _ => return false,
     };
-
-    let fs = match RamFs::new() {
-        Some(fs) => Box::into_raw(fs),
-        None => return false,
-    };
-
-    let ops = ops_for(fs);
-    if !vfs.mount(at, &ops, read_only) {
-        drop(unsafe { Box::from_raw(fs) });
-        return false;
-    }
-    true
+    vfs.mount(at, Box::new(fs), read_only).is_some()
 }

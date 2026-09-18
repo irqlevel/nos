@@ -18,16 +18,16 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::ffi::c_int;
 
 use kcore::block::Disk;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
+use kcore::pod::{self, Pod};
 use kcore::time::wall_clock_secs;
 use kcore::trace;
 
-use crate::vfs::FsOps;
-use crate::vnode::{self, VNode, FLAG_DIR_LOADED, NAME_MAX, TYPE_DIR, TYPE_FILE};
+use crate::vfs::FileSystem;
+use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 pub const MAGIC: u16 = 0xEF53;
 
@@ -139,6 +139,10 @@ struct SuperBlock {
 
 const _: () = assert!(core::mem::size_of::<SuperBlock>() == SUPER_BLOCK_SIZE);
 
+/* Integers and arrays of bytes, and the size above leaves no room for
+ * padding: the fields add up to it. */
+unsafe impl Pod for SuperBlock {}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Inode {
@@ -164,9 +168,11 @@ struct Inode {
 
 const _: () = assert!(core::mem::size_of::<Inode>() == INODE_SIZE);
 
+/* As the superblock: integers, and a size with no room for padding. */
+unsafe impl Pod for Inode {}
+
 /// What `probe` reads off an unmounted superblock: enough to pick a root
-/// filesystem by label or UUID. The C++ side declares the same struct.
-#[repr(C)]
+/// filesystem by label or UUID.
 pub struct Identity {
     pub uuid: [u8; 16],
     pub label: [u8; 17],
@@ -190,21 +196,9 @@ fn wr_u32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
 }
 
-/// A POD out of a buffer at an offset. The kernel is little-endian on both
-/// architectures, which is the byte order ext2 is written in.
-///
-/// # Safety
-/// `off + size_of::<T>()` is within `buf`, and `T` is a plain structure of
-/// scalars with no padding that means anything.
-unsafe fn read_pod<T: Copy>(buf: &[u8], off: usize) -> T {
-    unsafe { core::ptr::read_unaligned(buf.as_ptr().add(off) as *const T) }
-}
-
-/// # Safety
-/// As for `read_pod`.
-unsafe fn write_pod<T: Copy>(buf: &mut [u8], off: usize, v: &T) {
-    unsafe { core::ptr::write_unaligned(buf.as_mut_ptr().add(off) as *mut T, *v) }
-}
+/* The superblock and an inode are read and written whole, as `kcore::pod`
+ * does it. The kernel is little-endian on both architectures, which is the
+ * byte order ext2 is written in. */
 
 /* ---- bitmaps ---- */
 
@@ -327,7 +321,9 @@ pub struct Ext2 {
     group_count: u32,
     inode_size: usize,
     ptrs_per_block: u32,
-    root: *mut VNode,
+    /// What has been looked at of the tree on disk, so far
+    tree: Tree,
+    root: Option<NodeId>,
     /// Free counts in the descriptors and the superblock changed in memory
     meta_dirty: bool,
 
@@ -367,8 +363,7 @@ fn read_super_block(dev: &Disk, scratch: &mut [u8]) -> Option<SuperBlock> {
         return None;
     }
 
-    /* off + 1024 is within a page for every sector size up to one */
-    Some(unsafe { read_pod::<SuperBlock>(scratch, off) })
+    pod::read::<SuperBlock>(scratch, off)
 }
 
 /// Does the device carry an ext2 superblock this driver would mount?
@@ -394,13 +389,13 @@ pub fn probe(dev: &Disk, id: &mut Identity) -> bool {
 
 impl Ext2 {
     /// A filesystem over a device, not yet mounted.
-    pub fn new(dev: Disk) -> Option<Box<Ext2>> {
+    pub fn new(dev: Disk) -> Option<Ext2> {
         let sector_size = dev.sector_size() as usize;
         if sector_size == 0 || sector_size > PAGE_SIZE {
             return None;
         }
 
-        Some(Box::new(Ext2 {
+        Some(Ext2 {
             io: Io {
                 dev,
                 block_size: 0,
@@ -410,14 +405,15 @@ impl Ext2 {
             },
             read_only: false,
             mounted: false,
-            sb: unsafe { core::mem::zeroed() },
+            sb: pod::zeroed(),
             gdt: Vec::new(),
             gdt_blocks: 0,
             gdt_block: 0,
             group_count: 0,
             inode_size: INODE_SIZE,
             ptrs_per_block: 0,
-            root: core::ptr::null_mut(),
+            tree: Tree::new(),
+            root: None,
             meta_dirty: false,
             tmp: DmaBuffer::new(1)?,
             data: DmaBuffer::new(1)?,
@@ -428,7 +424,7 @@ impl Ext2 {
             bitmap: DmaBuffer::new(1)?,
             bitmap_block: 0,
             bitmap_dirty: false,
-        }))
+        })
     }
 
     fn block_size(&self) -> usize {
@@ -492,7 +488,9 @@ impl Ext2 {
         }
 
         let sb = self.sb;
-        unsafe { write_pod(self.tmp.as_mut_slice(), off, &sb) };
+        if !pod::write(self.tmp.as_mut_slice(), off, &sb) {
+            return false;
+        }
         if !self.io.write_block(block, self.tmp.as_slice(), true) {
             trace!(0, "ext2: write of the superblock failed");
             return false;
@@ -668,8 +666,8 @@ impl Ext2 {
             }
         }
 
-        self.root = new_vnode(core::ptr::null_mut(), b"/", TYPE_DIR, ROOT_INODE, 0);
-        if self.root.is_null() {
+        self.root = self.new_vnode(None, b"/", Kind::Dir, ROOT_INODE, 0);
+        if self.root.is_none() {
             trace!(0, "ext2: no memory for the root vnode");
             return self.mount_failed();
         }
@@ -706,10 +704,8 @@ impl Ext2 {
 
     /// Give back what a failed mount took, and say so.
     fn mount_failed(&mut self) -> bool {
-        if !self.root.is_null() {
-            free_vnode(self.root);
-            self.root = core::ptr::null_mut();
-        }
+        self.tree.clear();
+        self.root = None;
         self.gdt = Vec::new();
         false
     }
@@ -728,12 +724,8 @@ impl Ext2 {
             self.io.flush();
         }
 
-        /* Every vnode sits in exactly one child list, so the tree walk frees
-         * them all; depth is bounded by the paths that loaded them. */
-        if !self.root.is_null() {
-            unsafe { free_tree(self.root) };
-            self.root = core::ptr::null_mut();
-        }
+        self.tree.clear();
+        self.root = None;
 
         self.gdt = Vec::new();
         self.ind_block = 0;
@@ -784,7 +776,7 @@ impl Ext2 {
             trace!(0, "ext2: read of the block holding inode {} failed", ino);
             return None;
         }
-        Some(unsafe { read_pod::<Inode>(self.tmp.as_slice(), off) })
+        pod::read::<Inode>(self.tmp.as_slice(), off)
     }
 
     /// Read-modify-write of the inode table block, with FUA: an inode commit
@@ -800,7 +792,9 @@ impl Ext2 {
             return false;
         }
 
-        unsafe { write_pod(self.tmp.as_mut_slice(), off, inode) };
+        if !pod::write(self.tmp.as_mut_slice(), off, inode) {
+            return false;
+        }
         if !self.io.write_block(block, self.tmp.as_slice(), true) {
             trace!(0, "ext2: write of the block holding inode {} failed", ino);
             return false;
@@ -810,7 +804,7 @@ impl Ext2 {
 
     fn new_inode(mode: u16) -> Inode {
         let now = wall_clock_secs() as u32;
-        let mut inode: Inode = unsafe { core::mem::zeroed() };
+        let mut inode: Inode = pod::zeroed();
         inode.mode = mode;
         inode.links_count = 1;
         inode.access_time = now;
@@ -1546,43 +1540,39 @@ impl Ext2 {
 
 /* ---- vnodes ---- */
 
-/// A vnode of this filesystem, linked into its parent's children. Null when
-/// there is no memory for it: a directory with more entries than the kernel
-/// has room for is a failure to report, not one to panic on.
-fn new_vnode(
-    parent: *mut VNode, name: &[u8], node_type: c_int, ino: u32, size: usize,
-) -> *mut VNode {
-    let node = vnode::alloc();
-    if node.is_null() {
-        trace!(0, "ext2: no memory for a vnode");
-        return node;
+impl Ext2 {
+    /// A vnode of this filesystem, linked into its parent's children. None
+    /// when there is no memory for it: a directory with more entries than the
+    /// kernel has room for is a failure to report, not one to panic on.
+    fn new_vnode(
+        &mut self, parent: Option<NodeId>, name: &[u8], kind: Kind, ino: u32, size: usize,
+    ) -> Option<NodeId> {
+        let node = match self.tree.alloc(name, kind) {
+            Some(node) => node,
+            None => {
+                trace!(0, "ext2: no memory for a vnode");
+                return None;
+            }
+        };
+
+        {
+            let made = &mut self.tree[node];
+            made.size = if kind == Kind::File { size } else { 0 };
+            made.ino = ino as usize;
+        }
+        if let Some(parent) = parent {
+            self.tree.insert_child(parent, node);
+        }
+        Some(node)
     }
 
-    unsafe {
-        let n = &mut *node;
-        let len = name.len().min(NAME_MAX - 1);
-        n.name[..len].copy_from_slice(&name[..len]);
-        n.node_type = node_type;
-        n.parent = parent;
-        n.size = if node_type == TYPE_FILE { size } else { 0 };
-        n.ino = ino as usize;
-
-        if !parent.is_null() {
-            vnode::insert_child(parent, node);
+    /// The inode a directory's vnode is of, or None for what is not one.
+    fn dir_ino(&self, dir: NodeId) -> Option<u32> {
+        match self.tree.get(dir) {
+            Some(node) if node.is_dir() => Some(node.ino as u32),
+            _ => None,
         }
     }
-    node
-}
-
-fn free_vnode(node: *mut VNode) {
-    unsafe { vnode::free(node) };
-}
-
-/// # Safety
-/// `node` is a vnode of this filesystem, off its parent's list already or
-/// being freed with the tree it heads.
-unsafe fn free_tree(node: *mut VNode) {
-    unsafe { vnode::free_tree(node) };
 }
 
 /* ---- directories ---- */
@@ -1591,15 +1581,17 @@ impl Ext2 {
     /// Read a directory's entries into its vnode the first time it is needed.
     /// Only what a path walk touches is ever loaded, so a big tree costs
     /// memory in proportion to what is used, not to what is on disk.
-    pub fn load_dir(&mut self, dir: *mut VNode) -> bool {
-        if dir.is_null() || !unsafe { (*dir).is_dir() } {
-            return false;
-        }
-        if unsafe { (*dir).flags } & FLAG_DIR_LOADED != 0 {
-            return true;
-        }
+    pub fn load_dir(&mut self, dir: NodeId) -> bool {
+        let dir_ino = match self.tree.get(dir) {
+            Some(node) if node.is_dir() => {
+                if node.dir_loaded {
+                    return true;
+                }
+                node.ino as u32
+            }
+            _ => return false,
+        };
 
-        let dir_ino = unsafe { (*dir).ino } as u32;
         let inode = match self.read_inode(dir_ino) {
             Some(inode) => inode,
             None => {
@@ -1675,13 +1667,13 @@ impl Ext2 {
             }
         }
 
-        unsafe { (*dir).flags |= FLAG_DIR_LOADED };
+        self.tree[dir].dir_loaded = true;
         true
     }
 
     /// Make a vnode for one directory entry, if it names something this
     /// driver puts in the tree. False only when there is no memory for it.
-    fn adopt(&mut self, dir: *mut VNode, name: &[u8], ino: u32, file_type: u8) -> bool {
+    fn adopt(&mut self, dir: NodeId, name: &[u8], ino: u32, file_type: u8) -> bool {
         /* Everything but files and directories -- symlinks, devices -- is
          * left out of the tree */
         let mut is_dir = file_type == DIR_TYPE_DIR;
@@ -1710,15 +1702,16 @@ impl Ext2 {
         /* A directory entry that leads back up the tree is a cycle in the
          * image; following it would never end */
         if is_dir {
-            let mut up = dir;
-            while !up.is_null() {
-                if unsafe { (*up).ino } == ino as usize {
+            let mut up = Some(dir);
+            while let Some(at) = up {
+                let node = &self.tree[at];
+                if node.ino == ino as usize {
                     trace!(0, "ext2: an entry of inode {} is an ancestor, skipped",
-                        unsafe { (*dir).ino });
+                        self.tree[dir].ino);
                     is_dir = false;
                     break;
                 }
-                up = unsafe { (*up).parent };
+                up = node.parent();
             }
         }
 
@@ -1726,16 +1719,15 @@ impl Ext2 {
             return true;
         }
 
-        let node = new_vnode(
-            dir, name, if is_dir { TYPE_DIR } else { TYPE_FILE }, ino, size);
-        !node.is_null()
+        let kind = if is_dir { Kind::Dir } else { Kind::File };
+        self.new_vnode(Some(dir), name, kind, ino, size).is_some()
     }
 
     /// Put (ino, name) into `dir`: in the first slack big enough in a block
     /// it has, else in a new block appended to it. `dir_inode` is updated in
     /// memory (size, mtime, the htree flag dropped); the caller commits it.
     fn add_dir_entry(
-        &mut self, dir: *mut VNode, dir_inode: &mut Inode, ino: u32, name: &[u8], file_type: u8,
+        &mut self, dir_ino: u32, dir_inode: &mut Inode, ino: u32, name: &[u8], file_type: u8,
     ) -> bool {
         if name.is_empty() || name.len() > MAX_NAME_LEN {
             return false;
@@ -1746,7 +1738,6 @@ impl Ext2 {
         dir_inode.flags &= !INODE_FLAG_INDEX;
         dir_inode.modify_time = wall_clock_secs() as u32;
 
-        let dir_ino = unsafe { (*dir).ino } as u32;
         let goal_group = self.inode_group(dir_ino);
         let dir_blocks = ((dir_inode.size as usize + bs - 1) / bs) as u32;
 
@@ -1822,10 +1813,9 @@ impl Ext2 {
     /// Take (ino, name) out of `dir`: the entry is folded into its
     /// predecessor's record, or emptied if it leads its block.
     fn remove_dir_entry(
-        &mut self, dir: *mut VNode, dir_inode: &mut Inode, ino: u32, name: &[u8],
+        &mut self, dir_ino: u32, dir_inode: &mut Inode, ino: u32, name: &[u8],
     ) -> bool {
         let bs = self.block_size();
-        let dir_ino = unsafe { (*dir).ino } as u32;
         let dir_blocks = ((dir_inode.size as usize + bs - 1) / bs) as u32;
 
         dir_inode.flags &= !INODE_FLAG_INDEX;
@@ -1931,33 +1921,37 @@ impl Ext2 {
 /* ---- what the VFS calls ---- */
 
 impl Ext2 {
-    pub fn root(&self) -> *mut VNode {
+    pub fn root(&self) -> Option<NodeId> {
         self.root
     }
 
-    pub fn lookup(&mut self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        if dir.is_null() || !unsafe { (*dir).is_dir() } || !self.load_dir(dir) {
-            return core::ptr::null_mut();
+    pub fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        if !self.tree.get(dir)?.is_dir() || !self.load_dir(dir) {
+            return None;
         }
-
-        for child in unsafe { vnode::children(dir) } {
-            if unsafe { (*child).name_is(name) } {
-                return child;
-            }
-        }
-        core::ptr::null_mut()
+        self.tree.find_child(dir, name)
     }
 
-    pub fn read(&mut self, file: *mut VNode, buf: &mut [u8], offset: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "ext2: a read of something that is not a file");
-            return false;
+    /// The inode a file's vnode is of, or None for what is not a file.
+    fn file_ino(&self, file: NodeId) -> Option<u32> {
+        match self.tree.get(file) {
+            Some(node) if node.is_file() => Some(node.ino as u32),
+            _ => None,
         }
+    }
+
+    pub fn read(&mut self, file: NodeId, buf: &mut [u8], offset: usize) -> bool {
+        let ino = match self.file_ino(file) {
+            Some(ino) => ino,
+            None => {
+                trace!(0, "ext2: a read of something that is not a file");
+                return false;
+            }
+        };
         if buf.is_empty() {
             return true;
         }
 
-        let ino = unsafe { (*file).ino } as u32;
         let inode = match self.read_inode(ino) {
             Some(inode) => inode,
             None => {
@@ -1969,11 +1963,14 @@ impl Ext2 {
         self.read_inode_data(&inode, buf, offset)
     }
 
-    pub fn write(&mut self, file: *mut VNode, data: &[u8], offset: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "ext2: a write to something that is not a file");
-            return false;
-        }
+    pub fn write(&mut self, file: NodeId, data: &[u8], offset: usize) -> bool {
+        let ino = match self.file_ino(file) {
+            Some(ino) => ino,
+            None => {
+                trace!(0, "ext2: a write to something that is not a file");
+                return false;
+            }
+        };
         if self.read_only {
             trace!(0, "ext2: read-only");
             return false;
@@ -1989,7 +1986,6 @@ impl Ext2 {
             return false;
         }
 
-        let ino = unsafe { (*file).ino } as u32;
         let mut inode = match self.read_inode(ino) {
             Some(inode) => inode,
             None => {
@@ -2017,21 +2013,23 @@ impl Ext2 {
             return false;
         }
 
-        unsafe { (*file).size = inode.size as usize };
+        self.tree[file].size = inode.size as usize;
         ok
     }
 
-    pub fn truncate(&mut self, file: *mut VNode, size: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "ext2: a truncate of something that is not a file");
-            return false;
-        }
+    pub fn truncate(&mut self, file: NodeId, size: usize) -> bool {
+        let ino = match self.file_ino(file) {
+            Some(ino) => ino,
+            None => {
+                trace!(0, "ext2: a truncate of something that is not a file");
+                return false;
+            }
+        };
         if self.read_only {
             trace!(0, "ext2: read-only");
             return false;
         }
 
-        let ino = unsafe { (*file).ino } as u32;
         let mut inode = match self.read_inode(ino) {
             Some(inode) => inode,
             None => {
@@ -2054,7 +2052,7 @@ impl Ext2 {
             return false;
         }
 
-        unsafe { (*file).size = inode.size as usize };
+        self.tree[file].size = inode.size as usize;
         ok
     }
 
@@ -2064,36 +2062,37 @@ impl Ext2 {
         !name.is_empty() && name.len() < NAME_MAX
     }
 
-    pub fn create_file(&mut self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        let null = core::ptr::null_mut();
-        if dir.is_null() || !unsafe { (*dir).is_dir() } {
-            trace!(0, "ext2: a file made somewhere that is not a directory");
-            return null;
-        }
+    /// The checks every create shares. The inode of the directory, or None
+    /// when nothing may be made there.
+    fn create_into(&mut self, dir: NodeId, name: &[u8]) -> Option<u32> {
+        let dir_ino = match self.dir_ino(dir) {
+            Some(dir_ino) => dir_ino,
+            None => {
+                trace!(0, "ext2: something made somewhere that is not a directory");
+                return None;
+            }
+        };
         if self.read_only {
             trace!(0, "ext2: read-only");
-            return null;
+            return None;
         }
         if !self.usable_name(name) {
             trace!(0, "ext2: a name of {} bytes cannot be made", name.len());
-            return null;
+            return None;
         }
-        if !self.lookup(dir, name).is_null() {
+        if self.lookup(dir, name).is_some() {
             trace!(0, "ext2: there is something by that name already");
-            return null;
+            return None;
         }
+        Some(dir_ino)
+    }
 
-        let dir_ino = unsafe { (*dir).ino } as u32;
-        let mut dir_inode = match self.read_inode(dir_ino) {
-            Some(inode) => inode,
-            None => return null,
-        };
+    pub fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        let dir_ino = self.create_into(dir, name)?;
+        let mut dir_inode = self.read_inode(dir_ino)?;
 
         let group = self.inode_group(dir_ino);
-        let ino = match self.alloc_inode(group, false) {
-            Some(ino) => ino,
-            None => return null,
-        };
+        let ino = self.alloc_inode(group, false)?;
 
         /* The inode and its allocation bit are on disk before anything names
          * it: a crash in between leaves an unreferenced inode for e2fsck, not
@@ -2102,23 +2101,23 @@ impl Ext2 {
         if !self.write_inode(ino, &inode) || !self.flush_bitmap() || !self.commit_meta() {
             trace!(0, "ext2: commit of inode {} failed", ino);
             self.give_back_inode(ino, false);
-            return null;
+            return None;
         }
 
-        if !self.add_dir_entry(dir, &mut dir_inode, ino, name, DIR_TYPE_FILE) {
+        if !self.add_dir_entry(dir_ino, &mut dir_inode, ino, name, DIR_TYPE_FILE) {
             trace!(0, "ext2: the directory entry could not be added");
             self.give_back_inode(ino, false);
-            return null;
+            return None;
         }
 
         if !self.flush_bitmap() || !self.io.flush()
             || !self.write_inode(dir_ino, &dir_inode) || !self.commit_meta()
         {
             trace!(0, "ext2: commit of directory inode {} failed", dir_ino);
-            return null;
+            return None;
         }
 
-        new_vnode(dir, name, TYPE_FILE, ino, 0)
+        self.new_vnode(Some(dir), name, Kind::File, ino, 0)
     }
 
     /// Undo an allocation a create could not finish, and put what that
@@ -2136,43 +2135,19 @@ impl Ext2 {
         self.commit_meta();
     }
 
-    pub fn create_dir(&mut self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        let null = core::ptr::null_mut();
-        if dir.is_null() || !unsafe { (*dir).is_dir() } {
-            trace!(0, "ext2: a directory made somewhere that is not a directory");
-            return null;
-        }
-        if self.read_only {
-            trace!(0, "ext2: read-only");
-            return null;
-        }
-        if !self.usable_name(name) {
-            trace!(0, "ext2: a name of {} bytes cannot be made", name.len());
-            return null;
-        }
-        if !self.lookup(dir, name).is_null() {
-            trace!(0, "ext2: there is something by that name already");
-            return null;
-        }
-
-        let dir_ino = unsafe { (*dir).ino } as u32;
-        let mut dir_inode = match self.read_inode(dir_ino) {
-            Some(inode) => inode,
-            None => return null,
-        };
+    pub fn create_dir(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        let dir_ino = self.create_into(dir, name)?;
+        let mut dir_inode = self.read_inode(dir_ino)?;
 
         let group = self.inode_group(dir_ino);
-        let ino = match self.alloc_inode(group, true) {
-            Some(ino) => ino,
-            None => return null,
-        };
+        let ino = self.alloc_inode(group, true)?;
 
         let goal = self.inode_group(ino);
         let block = match self.alloc_block(goal) {
             Some(block) => block,
             None => {
                 self.free_inode(ino, true);
-                return null;
+                return None;
             }
         };
 
@@ -2201,13 +2176,13 @@ impl Ext2 {
         {
             trace!(0, "ext2: commit of inode {} failed", ino);
             self.give_back(ino, block, true);
-            return null;
+            return None;
         }
 
-        if !self.add_dir_entry(dir, &mut dir_inode, ino, name, DIR_TYPE_DIR) {
+        if !self.add_dir_entry(dir_ino, &mut dir_inode, ino, name, DIR_TYPE_DIR) {
             trace!(0, "ext2: the directory entry could not be added");
             self.give_back(ino, block, true);
-            return null;
+            return None;
         }
 
         /* The new directory's ".." is a link to the parent */
@@ -2216,52 +2191,56 @@ impl Ext2 {
             || !self.write_inode(dir_ino, &dir_inode) || !self.commit_meta()
         {
             trace!(0, "ext2: commit of directory inode {} failed", dir_ino);
-            return null;
+            return None;
         }
 
-        let node = new_vnode(dir, name, TYPE_DIR, ino, 0);
-        if !node.is_null() {
-            unsafe { (*node).flags |= FLAG_DIR_LOADED };
-        }
-        node
+        let node = self.new_vnode(Some(dir), name, Kind::Dir, ino, 0)?;
+        /* Made here, with nothing in it: there is nothing to load */
+        self.tree[node].dir_loaded = true;
+        Some(node)
     }
 
-    pub fn rename(&mut self, node: *mut VNode, new_dir: *mut VNode, new_name: &[u8]) -> bool {
-        if node.is_null() || new_dir.is_null() {
-            trace!(0, "ext2: a rename of nothing");
-            return false;
-        }
+    pub fn rename(&mut self, node: NodeId, new_dir: NodeId, new_name: &[u8]) -> bool {
+        let (ino, is_dir) = match self.tree.get(node) {
+            Some(found) => (found.ino as u32, found.is_dir()),
+            None => {
+                trace!(0, "ext2: a rename of nothing");
+                return false;
+            }
+        };
         if self.read_only {
             trace!(0, "ext2: read-only");
             return false;
         }
-        if unsafe { (*node).parent }.is_null() {
-            trace!(0, "ext2: the root cannot be renamed");
-            return false;
-        }
-        if !unsafe { (*new_dir).is_dir() } {
-            trace!(0, "ext2: the target of a rename is not a directory");
-            return false;
-        }
+        let old_dir = match self.tree.parent(node) {
+            Some(old_dir) => old_dir,
+            None => {
+                trace!(0, "ext2: the root cannot be renamed");
+                return false;
+            }
+        };
+        let new_dir_ino = match self.dir_ino(new_dir) {
+            Some(new_dir_ino) => new_dir_ino,
+            None => {
+                trace!(0, "ext2: the target of a rename is not a directory");
+                return false;
+            }
+        };
         if !self.usable_name(new_name) {
             trace!(0, "ext2: a name of {} bytes cannot be made", new_name.len());
             return false;
         }
-        if !self.lookup(new_dir, new_name).is_null() {
+        if self.lookup(new_dir, new_name).is_some() {
             trace!(0, "ext2: there is something by that name already");
             return false;
         }
 
-        let old_dir = unsafe { (*node).parent };
-        let is_dir = unsafe { (*node).is_dir() };
         let moved = old_dir != new_dir;
-        let ino = unsafe { (*node).ino } as u32;
-        let new_dir_ino = unsafe { (*new_dir).ino } as u32;
-        let old_dir_ino = unsafe { (*old_dir).ino } as u32;
+        let old_dir_ino = self.tree[old_dir].ino as u32;
 
         let mut old_name = [0u8; NAME_MAX];
         let old_len = {
-            let name = unsafe { (*node).name() };
+            let name = self.tree[node].name();
             old_name[..name.len()].copy_from_slice(name);
             name.len()
         };
@@ -2275,7 +2254,7 @@ impl Ext2 {
          * leaves the file reachable under both, which e2fsck reduces to one,
          * rather than under neither */
         let file_type = if is_dir { DIR_TYPE_DIR } else { DIR_TYPE_FILE };
-        if !self.add_dir_entry(new_dir, &mut new_dir_inode, ino, new_name, file_type) {
+        if !self.add_dir_entry(new_dir_ino, &mut new_dir_inode, ino, new_name, file_type) {
             trace!(0, "ext2: the directory entry could not be added");
             return false;
         }
@@ -2291,7 +2270,7 @@ impl Ext2 {
                 Some(inode) => inode,
                 None => return false,
             };
-            if !self.remove_dir_entry(old_dir, &mut old_dir_inode, ino, &old_name[..old_len]) {
+            if !self.remove_dir_entry(old_dir_ino, &mut old_dir_inode, ino, &old_name[..old_len]) {
                 return false;
             }
 
@@ -2314,7 +2293,7 @@ impl Ext2 {
                 return false;
             }
         } else {
-            if !self.remove_dir_entry(old_dir, &mut new_dir_inode, ino, &old_name[..old_len]) {
+            if !self.remove_dir_entry(old_dir_ino, &mut new_dir_inode, ino, &old_name[..old_len]) {
                 return false;
             }
             if !self.flush_bitmap() || !self.io.flush()
@@ -2324,42 +2303,42 @@ impl Ext2 {
             }
         }
 
-        unsafe { vnode::rename(node, new_dir, new_name) };
+        self.tree.rename(node, new_dir, new_name);
         true
     }
 
     /// Take `node` out of its parent, release its blocks and inode, and free
     /// the vnode; a directory goes with everything under it. The name goes
     /// first, so a crash leaves at worst an orphan for e2fsck.
-    fn remove_node(&mut self, node: *mut VNode, depth: u32) -> bool {
+    fn remove_node(&mut self, node: NodeId, depth: u32) -> bool {
         if depth >= MAX_DIR_DEPTH {
             trace!(0, "ext2: the directory depth limit of {} was reached", MAX_DIR_DEPTH);
             return false;
         }
 
-        let is_dir = unsafe { (*node).is_dir() };
+        let (ino, is_dir) = match self.tree.get(node) {
+            Some(found) => (found.ino as u32, found.is_dir()),
+            None => return false,
+        };
         if is_dir {
             if !self.load_dir(node) {
                 return false;
             }
-            loop {
-                let child = unsafe { vnode::first_child(node) };
-                if child.is_null() {
-                    break;
-                }
+            while let Some(child) = self.tree.first_child(node) {
                 if !self.remove_node(child, depth + 1) {
                     return false;
                 }
             }
         }
 
-        let parent = unsafe { (*node).parent };
-        let parent_ino = unsafe { (*parent).ino } as u32;
-        let ino = unsafe { (*node).ino } as u32;
+        let parent_ino = match self.tree.parent(node) {
+            Some(parent) => self.tree[parent].ino as u32,
+            None => return false,
+        };
 
         let mut name = [0u8; NAME_MAX];
         let len = {
-            let from = unsafe { (*node).name() };
+            let from = self.tree[node].name();
             name[..from.len()].copy_from_slice(from);
             from.len()
         };
@@ -2368,7 +2347,7 @@ impl Ext2 {
             Some(inode) => inode,
             None => return false,
         };
-        if !self.remove_dir_entry(parent, &mut parent_inode, ino, &name[..len]) {
+        if !self.remove_dir_entry(parent_ino, &mut parent_inode, ino, &name[..len]) {
             return false;
         }
         if is_dir {
@@ -2392,13 +2371,13 @@ impl Ext2 {
         }
         self.free_inode(ino, is_dir);
 
-        unsafe { vnode::unlink(node) };
-        free_vnode(node);
+        /* Nothing is under it any more: this takes the one node away */
+        self.tree.free_tree(node);
         true
     }
 
-    pub fn remove(&mut self, node: *mut VNode) -> bool {
-        if node.is_null() {
+    pub fn remove(&mut self, node: NodeId) -> bool {
+        if self.tree.get(node).is_none() {
             trace!(0, "ext2: a remove of nothing");
             return false;
         }
@@ -2406,7 +2385,7 @@ impl Ext2 {
             trace!(0, "ext2: read-only");
             return false;
         }
-        if unsafe { (*node).parent }.is_null() {
+        if self.tree.parent(node).is_none() {
             trace!(0, "ext2: the root cannot be removed");
             return false;
         }
@@ -2417,175 +2396,90 @@ impl Ext2 {
         }
         ok
     }
+}
+
+impl FileSystem for Ext2 {
+    fn name(&self) -> &'static str {
+        "ext2"
+    }
 
     /// The device and the label, for `mounts`.
-    fn info(&self, buf: &mut [u8]) {
-        if buf.is_empty() {
-            return;
-        }
-        buf[0] = 0;
-
+    fn info(&self, out: &mut dyn core::fmt::Write) {
         let mut name = [0u8; 32];
-        let len = match self.io.dev.name(&mut name) {
-            Some(name) => name.len(),
-            None => 0,
-        };
-        let mut at = put(buf, 0, &name[..len]);
+        let _ = out.write_str(self.io.dev.name(&mut name).unwrap_or(""));
 
         let label = &self.sb.volume_name;
         let end = label.iter().position(|b| *b == 0).unwrap_or(label.len());
-        if end > 0 {
-            at = put(buf, at, b" label=");
-            put(buf, at, &label[..end]);
+        if let Ok(label) = core::str::from_utf8(&label[..end]) {
+            if !label.is_empty() {
+                let _ = write!(out, " label={}", label);
+            }
         }
     }
-}
 
-/// Bytes into a C string buffer at `at`, NUL-terminated, as far as they fit.
-fn put(buf: &mut [u8], at: usize, bytes: &[u8]) -> usize {
-    let room = buf.len().saturating_sub(at + 1);
-    let take = bytes.len().min(room);
-    buf[at..at + take].copy_from_slice(&bytes[..take]);
-    buf[at + take] = 0;
-    at + take
-}
-
-/* ---- the ops table the VFS drives it by ---- */
-
-/// # Safety
-/// `ctx` is the pointer a mount was made with, and the filesystem is alive.
-unsafe fn fs<'a>(ctx: *mut u8) -> &'a mut Ext2 {
-    unsafe { &mut *(ctx as *mut Ext2) }
-}
-
-/// A NUL-terminated name the caller passed, as bytes.
-///
-/// # Safety
-/// `name` points at a NUL-terminated string of at most NAME_MAX bytes.
-unsafe fn cstr<'a>(name: *const u8) -> &'a [u8] {
-    if name.is_null() {
-        return &[];
+    fn device(&self) -> usize {
+        self.io.dev.handle()
     }
-    let mut len = 0;
-    while len < NAME_MAX && unsafe { *name.add(len) } != 0 {
-        len += 1;
+
+    /// The image may be one this driver can read but must not write.
+    fn mount(&mut self, read_only: bool) -> Option<bool> {
+        if Ext2::mount(self, read_only) { Some(self.read_only) } else { None }
     }
-    unsafe { core::slice::from_raw_parts(name, len) }
-}
 
-extern "C" fn op_info(ctx: *mut u8, buf: *mut u8, len: usize) {
-    if buf.is_null() || len == 0 {
-        return;
+    fn unmount(&mut self) {
+        Ext2::unmount(self);
     }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    unsafe { fs(ctx) }.info(buf);
-}
 
-extern "C" fn op_root(ctx: *mut u8) -> *mut VNode {
-    unsafe { fs(ctx) }.root()
-}
-
-extern "C" fn op_load_dir(ctx: *mut u8, dir: *mut VNode) -> i32 {
-    if unsafe { fs(ctx) }.load_dir(dir) { 0 } else { -1 }
-}
-
-extern "C" fn op_lookup(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.lookup(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_create_file(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.create_file(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_create_dir(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.create_dir(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_read(
-    ctx: *mut u8, file: *mut VNode, buf: *mut u8, len: usize, off: usize,
-) -> i32 {
-    if len == 0 {
-        return 0;
+    fn tree(&self) -> &Tree {
+        &self.tree
     }
-    if buf.is_null() {
-        return -1;
+
+    fn tree_mut(&mut self) -> &mut Tree {
+        &mut self.tree
     }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    if unsafe { fs(ctx) }.read(file, buf, off) { 0 } else { -1 }
-}
 
-extern "C" fn op_write(
-    ctx: *mut u8, file: *mut VNode, data: *const u8, len: usize, off: usize,
-) -> i32 {
-    if len == 0 {
-        return 0;
+    fn root(&self) -> Option<NodeId> {
+        self.root
     }
-    if data.is_null() {
-        return -1;
+
+    fn load_dir(&mut self, dir: NodeId) -> bool {
+        Ext2::load_dir(self, dir)
     }
-    let data = unsafe { core::slice::from_raw_parts(data, len) };
-    if unsafe { fs(ctx) }.write(file, data, off) { 0 } else { -1 }
-}
 
-extern "C" fn op_truncate(ctx: *mut u8, file: *mut VNode, size: usize) -> i32 {
-    if unsafe { fs(ctx) }.truncate(file, size) { 0 } else { -1 }
-}
-
-extern "C" fn op_rename(
-    ctx: *mut u8, node: *mut VNode, dir: *mut VNode, name: *const u8,
-) -> i32 {
-    if unsafe { fs(ctx) }.rename(node, dir, unsafe { cstr(name) }) { 0 } else { -1 }
-}
-
-extern "C" fn op_remove(ctx: *mut u8, node: *mut VNode) -> i32 {
-    if unsafe { fs(ctx) }.remove(node) { 0 } else { -1 }
-}
-
-extern "C" fn op_sync(ctx: *mut u8) -> i32 {
-    if unsafe { fs(ctx) }.sync() { 0 } else { -1 }
-}
-
-extern "C" fn op_device(ctx: *mut u8) -> usize {
-    unsafe { fs(ctx) }.io.dev.handle()
-}
-
-extern "C" fn op_mount(ctx: *mut u8, read_only: i32) -> i32 {
-    let fs = unsafe { fs(ctx) };
-    if !fs.mount(read_only != 0) {
-        return -1;
+    fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        Ext2::lookup(self, dir, name)
     }
-    /* The image may be one this driver can read but must not write */
-    if fs.read_only { 1 } else { 0 }
-}
 
-extern "C" fn op_unmount(ctx: *mut u8) {
-    unsafe { fs(ctx) }.unmount();
-}
+    fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        Ext2::create_file(self, dir, name)
+    }
 
-extern "C" fn op_destroy(ctx: *mut u8) {
-    drop(unsafe { Box::from_raw(ctx as *mut Ext2) });
-}
+    fn create_dir(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        Ext2::create_dir(self, dir, name)
+    }
 
-fn ops_for(fs: *mut Ext2) -> FsOps {
-    FsOps {
-        name: b"ext2\0".as_ptr(),
-        info: Some(op_info),
-        root: op_root,
-        load_dir: op_load_dir,
-        lookup: op_lookup,
-        create_file: op_create_file,
-        create_dir: op_create_dir,
-        read: op_read,
-        write: op_write,
-        truncate: op_truncate,
-        rename: op_rename,
-        remove: op_remove,
-        sync: op_sync,
-        device: op_device,
-        mount: op_mount,
-        unmount: op_unmount,
-        destroy: Some(op_destroy),
-        ctx: fs as *mut u8,
+    fn read(&mut self, file: NodeId, buf: &mut [u8], offset: usize) -> bool {
+        Ext2::read(self, file, buf, offset)
+    }
+
+    fn write(&mut self, file: NodeId, data: &[u8], offset: usize) -> bool {
+        Ext2::write(self, file, data, offset)
+    }
+
+    fn truncate(&mut self, file: NodeId, size: usize) -> bool {
+        Ext2::truncate(self, file, size)
+    }
+
+    fn rename(&mut self, node: NodeId, dir: NodeId, name: &[u8]) -> bool {
+        Ext2::rename(self, node, dir, name)
+    }
+
+    fn remove(&mut self, node: NodeId) -> bool {
+        Ext2::remove(self, node)
+    }
+
+    fn sync(&mut self) -> bool {
+        Ext2::sync(self)
     }
 }
 
@@ -2608,20 +2502,17 @@ fn mount_bytes(at: &[u8], device: usize, read_only: bool) -> i32 {
     };
 
     let fs = match Ext2::new(dev) {
-        Some(fs) => Box::into_raw(fs),
+        Some(fs) => fs,
         None => {
             trace!(0, "ext2: no memory for the filesystem");
             return -1;
         }
     };
 
-    let ops = ops_for(fs);
-    if !vfs.mount(at, &ops, read_only) {
-        /* Not mounted: nothing took it, and it is ours to release */
-        drop(unsafe { Box::from_raw(fs) });
-        return -1;
+    /* Not mounted, it is released by whoever refused it */
+    match vfs.mount(at, Box::new(fs), read_only) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
     }
-
-    /* The VFS holds it now; this is the last look at it from here. */
-    if unsafe { (*fs).read_only } { 1 } else { 0 }
 }

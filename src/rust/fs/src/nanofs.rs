@@ -11,8 +11,8 @@
 //! buys: there is no directory to load later, and a lookup is a walk of a
 //! list that is already in memory.
 //!
-//! Every call arrives with the VFS lock held (see `FsOps`), so there is no
-//! locking here.
+//! Every call arrives with the VFS lock held (see `FileSystem`), so there is
+//! no locking here.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -22,8 +22,8 @@ use kcore::crc32::{crc32_update, crc32_with_hole};
 use kcore::dma::DmaBuffer;
 use kcore::trace;
 
-use crate::vfs::FsOps;
-use crate::vnode::{self, VNode, FLAG_DIR_LOADED, NAME_MAX, TYPE_DIR, TYPE_FILE};
+use crate::vfs::FileSystem;
+use crate::vnode::{Kind, NodeId, Tree, NAME_MAX};
 
 pub const MAGIC: u32 = 0x4E41_4E4F; // "NANO"
 pub const VERSION: u32 = 1;
@@ -162,8 +162,10 @@ pub struct NanoFs {
     /// The inode of a directory being added to or taken from, which is never
     /// the inode a caller is holding in `inode`
     dir_inode: DmaBuffer,
-    /// The vnode of each inode, by index; the whole tree, made at mount
-    vnodes: Vec<*mut VNode>,
+    /// The whole tree, made at mount
+    tree: Tree,
+    /// The vnode of each inode, by index
+    vnodes: Vec<Option<NodeId>>,
     /// Inodes whose walk is still on the recursion stack. A directory entry
     /// naming one of those is a cycle in the image; linking it would put a
     /// cycle in the VFS tree.
@@ -172,7 +174,7 @@ pub struct NanoFs {
 }
 
 impl NanoFs {
-    pub fn new(dev: Disk) -> Option<Box<NanoFs>> {
+    pub fn new(dev: Disk) -> Option<NanoFs> {
         let sector_size = dev.sector_size();
         if sector_size == 0 || BLOCK_SIZE as u64 % sector_size != 0 {
             trace!(0, "nanofs: a sector size of {} does not divide a block", sector_size);
@@ -187,19 +189,20 @@ impl NanoFs {
             trace!(0, "nanofs: no memory for the vnode table");
             return None;
         }
-        vnodes.resize(INODE_COUNT as usize, core::ptr::null_mut());
+        vnodes.resize(INODE_COUNT as usize, None);
         walking.resize(INODE_COUNT as usize, false);
 
-        Some(Box::new(NanoFs {
+        Some(NanoFs {
             io: Io { dev, sectors_per_block: (BLOCK_SIZE as u64 / sector_size) as u32 },
             sb: DmaBuffer::new(1)?,
             inode: DmaBuffer::new(1)?,
             data: DmaBuffer::new(1)?,
             dir_inode: DmaBuffer::new(1)?,
+            tree: Tree::new(),
             vnodes,
             walking,
             mounted: false,
-        }))
+        })
     }
 
     /* ---- the superblock ---- */
@@ -354,7 +357,7 @@ impl NanoFs {
             return false;
         }
 
-        if self.walk(0, 0).is_null() {
+        if self.walk(0, 0).is_none() {
             trace!(0, "nanofs: the root inode could not be read");
             self.free_all();
             return false;
@@ -379,15 +382,9 @@ impl NanoFs {
     }
 
     fn free_all(&mut self) {
-        for i in 0..self.vnodes.len() {
-            let node = self.vnodes[i];
-            if !node.is_null() {
-                /* Each vnode is freed on its own: they are all in the table,
-                 * so a tree walk would free them twice. */
-                unsafe { vnode::free(node) };
-                self.vnodes[i] = core::ptr::null_mut();
-            }
-        }
+        /* Every node there is, linked into the tree or not */
+        self.tree.clear();
+        self.vnodes.fill(None);
     }
 
     pub fn sync(&mut self) -> bool {
@@ -409,7 +406,7 @@ impl NanoFs {
         let mut repaired = false;
 
         for i in 0..INODE_COUNT {
-            if self.vnodes[i as usize].is_null() {
+            if self.vnodes[i as usize].is_none() {
                 continue;
             }
 
@@ -449,83 +446,83 @@ impl NanoFs {
     }
 
     /// Read the inode's vnode and, for a directory, everything under it.
-    /// Null when the inode is free, damaged or out of range.
-    fn walk(&mut self, idx: u32, depth: u32) -> *mut VNode {
-        let null = core::ptr::null_mut();
+    /// None when the inode is free, damaged or out of range.
+    fn walk(&mut self, idx: u32, depth: u32) -> Option<NodeId> {
         if idx >= INODE_COUNT {
             trace!(0, "nanofs: inode {} is out of range", idx);
-            return null;
+            return None;
         }
         if depth >= MAX_DIR_DEPTH {
             trace!(0, "nanofs: the directory depth limit of {} was reached at inode {}",
                 MAX_DIR_DEPTH, idx);
-            return null;
+            return None;
         }
-        if !self.vnodes[idx as usize].is_null() {
-            return self.vnodes[idx as usize];
+        if let Some(node) = self.vnodes[idx as usize] {
+            return Some(node);
         }
 
         if !self.read_inode(idx) {
-            return null;
+            return None;
         }
         let node_type = self.in_u32(IN_TYPE);
         if node_type == TYPE_FREE {
             trace!(0, "nanofs: inode {} is free", idx);
-            return null;
+            return None;
         }
         if !self.inode_ok() {
             trace!(0, "nanofs: inode {}'s checksum does not match", idx);
-            return null;
+            return None;
         }
 
         let is_dir = node_type == INODE_TYPE_DIR;
         let size = self.in_u32(IN_SIZE);
         let first_block = self.in_block(0);
 
-        let node = vnode::alloc();
-        if node.is_null() {
-            trace!(0, "nanofs: no memory for the vnode of inode {}", idx);
-            return null;
-        }
-        unsafe {
+        let node = {
             let name = &self.inode.as_slice()[IN_NAME..IN_NAME + IN_NAME_LEN];
-            let len = name.iter().position(|b| *b == 0).unwrap_or(IN_NAME_LEN).min(NAME_MAX - 1);
-            (&mut (*node).name)[..len].copy_from_slice(&name[..len]);
-            (*node).node_type = if is_dir { TYPE_DIR } else { TYPE_FILE };
-            (*node).size = if is_dir { 0 } else { size as usize };
-            (*node).ino = idx as usize;
-            if is_dir {
-                /* The whole tree is read here, so a directory is complete */
-                (*node).flags = FLAG_DIR_LOADED;
+            let len = name.iter().position(|b| *b == 0).unwrap_or(IN_NAME_LEN);
+            let kind = if is_dir { Kind::Dir } else { Kind::File };
+            match self.tree.alloc(&name[..len], kind) {
+                Some(node) => node,
+                None => {
+                    trace!(0, "nanofs: no memory for the vnode of inode {}", idx);
+                    return None;
+                }
             }
+        };
+        {
+            let made = &mut self.tree[node];
+            made.size = if is_dir { 0 } else { size as usize };
+            made.ino = idx as usize;
+            /* The whole tree is read here, so a directory is complete */
+            made.dir_loaded = is_dir;
         }
 
-        self.vnodes[idx as usize] = node;
+        self.vnodes[idx as usize] = Some(node);
         self.walking[idx as usize] = true;
 
         if is_dir && size > 0 {
             for child in self.dir_entries(idx, first_block, size) {
-                let loaded = self.walk(child, depth + 1);
+                let loaded = match self.walk(child, depth + 1) {
+                    Some(loaded) => loaded,
+                    None => continue,
+                };
                 /* A corrupted image may name this directory itself, an
                  * ancestor still being walked -- a cycle, the root
                  * included -- or an inode already linked somewhere else.
                  * Any of the three would make a tree that is not one. */
-                if loaded.is_null()
-                    || loaded == node
+                if loaded == node
                     || self.walking[child as usize]
-                    || !unsafe { vnode::is_unlinked(loaded) }
+                    || self.tree.is_linked(loaded)
                 {
                     continue;
                 }
-                unsafe {
-                    (*loaded).parent = node;
-                    vnode::insert_child(node, loaded);
-                }
+                self.tree.insert_child(node, loaded);
             }
         }
 
         self.walking[idx as usize] = false;
-        node
+        Some(node)
     }
 
     /// The inode indices a directory's entries name. They are copied out of
@@ -676,31 +673,30 @@ impl NanoFs {
 
     /* ---- what the VFS calls ---- */
 
-    pub fn root(&self) -> *mut VNode {
+    pub fn root(&self) -> Option<NodeId> {
         self.vnodes[0]
     }
 
-    pub fn lookup(&self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        if dir.is_null() || !unsafe { (*dir).is_dir() } {
-            return core::ptr::null_mut();
+    pub fn lookup(&self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        if !self.tree.get(dir)?.is_dir() {
+            return None;
         }
+        self.tree.find_child(dir, name)
+    }
 
-        for child in unsafe { vnode::children(dir) } {
-            if unsafe { (*child).name_is(name) } {
-                return child;
-            }
-        }
-        core::ptr::null_mut()
+    /// The inode a vnode is of.
+    fn ino_of(&self, node: NodeId) -> Option<u32> {
+        self.tree.get(node).map(|node| node.ino as u32)
     }
 
     /// The checks every create shares. The inode index of the parent, or
     /// None when nothing may be made there.
-    fn create_into(&mut self, dir: *mut VNode, name: &[u8]) -> Option<u32> {
-        if dir.is_null() || name.is_empty() {
+    fn create_into(&mut self, dir: NodeId, name: &[u8]) -> Option<u32> {
+        if name.is_empty() {
             trace!(0, "nanofs: something made with no name");
             return None;
         }
-        if !unsafe { (*dir).is_dir() } {
+        if !self.tree.get(dir)?.is_dir() {
             trace!(0, "nanofs: something made somewhere that is not a directory");
             return None;
         }
@@ -708,11 +704,11 @@ impl NanoFs {
             trace!(0, "nanofs: a name of {} bytes is too long", name.len());
             return None;
         }
-        if !self.lookup(dir, name).is_null() {
+        if self.lookup(dir, name).is_some() {
             trace!(0, "nanofs: there is something by that name already");
             return None;
         }
-        Some(unsafe { (*dir).ino } as u32)
+        self.ino_of(dir)
     }
 
     /// Fill the inode buffer for something newly made.
@@ -727,78 +723,60 @@ impl NanoFs {
     }
 
     /// The vnode for something just made on disk, linked under its parent.
-    fn link_new(&mut self, dir: *mut VNode, name: &[u8], idx: u32, is_dir: bool) -> *mut VNode {
-        let node = vnode::alloc();
-        if node.is_null() {
-            trace!(0, "nanofs: no memory for a vnode");
-            return node;
-        }
-
-        unsafe {
-            let len = name.len().min(NAME_MAX - 1);
-            (&mut (*node).name)[..len].copy_from_slice(&name[..len]);
-            (*node).node_type = if is_dir { TYPE_DIR } else { TYPE_FILE };
-            (*node).parent = dir;
-            (*node).ino = idx as usize;
-            if is_dir {
-                (*node).flags = FLAG_DIR_LOADED;
+    fn link_new(&mut self, dir: NodeId, name: &[u8], idx: u32, is_dir: bool) -> Option<NodeId> {
+        let kind = if is_dir { Kind::Dir } else { Kind::File };
+        let node = match self.tree.alloc(name, kind) {
+            Some(node) => node,
+            None => {
+                trace!(0, "nanofs: no memory for a vnode");
+                return None;
             }
-            vnode::insert_child(dir, node);
-        }
+        };
 
-        self.vnodes[idx as usize] = node;
-        node
+        {
+            let made = &mut self.tree[node];
+            made.ino = idx as usize;
+            made.dir_loaded = is_dir;
+        }
+        self.tree.insert_child(dir, node);
+
+        self.vnodes[idx as usize] = Some(node);
+        Some(node)
     }
 
-    pub fn create_file(&mut self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        let null = core::ptr::null_mut();
-        let dir_idx = match self.create_into(dir, name) {
-            Some(idx) => idx,
-            None => return null,
-        };
-
-        let idx = match self.take_inode() {
-            Some(idx) => idx,
-            None => return null,
-        };
+    pub fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        let dir_idx = self.create_into(dir, name)?;
+        let idx = self.take_inode()?;
 
         self.init_inode(INODE_TYPE_FILE, name, dir_idx);
         if !self.write_inode(idx, false) {
             self.give_back_inode(idx);
-            return null;
+            return None;
         }
 
         /* Commit the inode bitmap now the inode's contents are on disk */
         if !self.flush_super() || !self.add_dir_entry(dir_idx, idx) {
             trace!(0, "nanofs: a file could not be added to directory {}", dir_idx);
             self.give_back_inode(idx);
-            return null;
+            return None;
         }
 
         let node = self.link_new(dir, name, idx, false);
-        if node.is_null() {
+        if node.is_none() {
             self.remove_dir_entry(dir_idx, idx);
             self.give_back_inode(idx);
         }
         node
     }
 
-    pub fn create_dir(&mut self, dir: *mut VNode, name: &[u8]) -> *mut VNode {
-        let null = core::ptr::null_mut();
-        let dir_idx = match self.create_into(dir, name) {
-            Some(idx) => idx,
-            None => return null,
-        };
-
-        let idx = match self.take_inode() {
-            Some(idx) => idx,
-            None => return null,
-        };
+    pub fn create_dir(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        let dir_idx = self.create_into(dir, name)?;
+        let idx = self.take_inode()?;
         let block = match self.take_data_block() {
             Some(block) => block,
             None => {
                 self.give_back_inode(idx);
-                return null;
+                return None;
             }
         };
 
@@ -807,7 +785,7 @@ impl NanoFs {
         if !self.io.write_block(DATA_START + block, self.data.as_slice(), false) {
             self.give_back_data_block(block);
             self.give_back_inode(idx);
-            return null;
+            return None;
         }
 
         self.init_inode(INODE_TYPE_DIR, name, dir_idx);
@@ -815,7 +793,7 @@ impl NanoFs {
         if !self.write_inode(idx, false) {
             self.give_back_data_block(block);
             self.give_back_inode(idx);
-            return null;
+            return None;
         }
 
         /* Commit both bitmaps now the inode and its block are on disk */
@@ -823,11 +801,11 @@ impl NanoFs {
             trace!(0, "nanofs: a directory could not be added to directory {}", dir_idx);
             self.give_back_data_block(block);
             self.give_back_inode(idx);
-            return null;
+            return None;
         }
 
         let node = self.link_new(dir, name, idx, true);
-        if node.is_null() {
+        if node.is_none() {
             self.remove_dir_entry(dir_idx, idx);
             self.give_back_data_block(block);
             self.give_back_inode(idx);
@@ -835,11 +813,22 @@ impl NanoFs {
         node
     }
 
-    pub fn write(&mut self, file: *mut VNode, data: &[u8], offset: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "nanofs: a write to something that is not a file");
-            return false;
+    /// A file's size as its vnode has it, or None for what is not a file.
+    fn file_size(&self, file: NodeId) -> Option<usize> {
+        match self.tree.get(file) {
+            Some(node) if node.is_file() => Some(node.size),
+            _ => None,
         }
+    }
+
+    pub fn write(&mut self, file: NodeId, data: &[u8], offset: usize) -> bool {
+        let current = match self.file_size(file) {
+            Some(size) => size,
+            None => {
+                trace!(0, "nanofs: a write to something that is not a file");
+                return false;
+            }
+        };
         if data.is_empty() {
             return true;
         }
@@ -853,20 +842,18 @@ impl NanoFs {
             }
         };
 
-        let size = unsafe { (*file).size }.max(end);
-        self.rewrite(file, size, data, offset)
+        self.rewrite(file, current.max(end), data, offset)
     }
 
-    pub fn truncate(&mut self, file: *mut VNode, size: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "nanofs: a truncate of something that is not a file");
-            return false;
+    pub fn truncate(&mut self, file: NodeId, size: usize) -> bool {
+        match self.file_size(file) {
+            Some(current) if current == size => true,
+            Some(_) => self.rewrite(file, size, &[], 0),
+            None => {
+                trace!(0, "nanofs: a truncate of something that is not a file");
+                false
+            }
         }
-        if size == unsafe { (*file).size } {
-            return true;
-        }
-
-        self.rewrite(file, size, &[], 0)
     }
 
     /// Replace the file's content with the old content resized to `new_size`
@@ -875,14 +862,17 @@ impl NanoFs {
     /// to a freshly taken block, the inode is committed with FUA, and only
     /// then are the old blocks given back: a crash at any point leaves
     /// either the old file or the new one, never a mix.
-    fn rewrite(&mut self, file: *mut VNode, new_size: usize, data: &[u8], offset: usize) -> bool {
+    fn rewrite(&mut self, file: NodeId, new_size: usize, data: &[u8], offset: usize) -> bool {
         if new_size > MAX_FILE_SIZE {
             trace!(0, "nanofs: a size of {} is more than the {} a file holds",
                 new_size, MAX_FILE_SIZE);
             return false;
         }
 
-        let idx = unsafe { (*file).ino } as u32;
+        let idx = match self.ino_of(file) {
+            Some(idx) => idx,
+            None => return false,
+        };
         if !self.read_inode(idx) {
             return false;
         }
@@ -919,7 +909,7 @@ impl NanoFs {
             for i in 0..old_count {
                 self.give_back_data_block(old_blocks[i]);
             }
-            unsafe { (*file).size = 0 };
+            self.tree[file].size = 0;
             return true;
         }
 
@@ -1011,7 +1001,7 @@ impl NanoFs {
             self.give_back_data_block(old_blocks[i]);
         }
 
-        unsafe { (*file).size = new_size };
+        self.tree[file].size = new_size;
         true
     }
 
@@ -1043,13 +1033,14 @@ impl NanoFs {
         sum
     }
 
-    pub fn read(&mut self, file: *mut VNode, buf: &mut [u8], offset: usize) -> bool {
-        if file.is_null() || !unsafe { (*file).is_file() } {
-            trace!(0, "nanofs: a read of something that is not a file");
-            return false;
-        }
-
-        let idx = unsafe { (*file).ino } as u32;
+    pub fn read(&mut self, file: NodeId, buf: &mut [u8], offset: usize) -> bool {
+        let idx = match self.tree.get(file) {
+            Some(node) if node.is_file() => node.ino as u32,
+            _ => {
+                trace!(0, "nanofs: a read of something that is not a file");
+                return false;
+            }
+        };
         if !self.read_inode(idx) {
             return false;
         }
@@ -1115,15 +1106,14 @@ impl NanoFs {
 
     /// Take a node out of its directory, give back its blocks and inode, and
     /// free the vnode; a directory goes with everything under it.
-    fn remove_tree(&mut self, node: *mut VNode) -> bool {
-        let idx = unsafe { (*node).ino } as u32;
+    fn remove_tree(&mut self, node: NodeId) -> bool {
+        let (idx, is_dir) = match self.tree.get(node) {
+            Some(found) => (found.ino as u32, found.is_dir()),
+            None => return false,
+        };
 
-        if unsafe { (*node).is_dir() } {
-            loop {
-                let child = unsafe { vnode::first_child(node) };
-                if child.is_null() {
-                    break;
-                }
+        if is_dir {
+            while let Some(child) = self.tree.first_child(node) {
                 if !self.remove_tree(child) {
                     return false;
                 }
@@ -1151,27 +1141,27 @@ impl NanoFs {
         self.write_inode(idx, false);
         self.give_back_inode(idx);
 
-        self.vnodes[idx as usize] = core::ptr::null_mut();
-        unsafe {
-            vnode::unlink(node);
-            vnode::free(node);
-        }
+        self.vnodes[idx as usize] = None;
+        /* Nothing is under it any more: this takes the one node away */
+        self.tree.free_tree(node);
         true
     }
 
-    pub fn remove(&mut self, node: *mut VNode) -> bool {
-        if node.is_null() {
-            trace!(0, "nanofs: a remove of nothing");
-            return false;
-        }
-        let parent = unsafe { (*node).parent };
-        if parent.is_null() {
-            trace!(0, "nanofs: the root cannot be removed");
-            return false;
-        }
-
-        let idx = unsafe { (*node).ino } as u32;
-        let parent_idx = unsafe { (*parent).ino } as u32;
+    pub fn remove(&mut self, node: NodeId) -> bool {
+        let idx = match self.ino_of(node) {
+            Some(idx) => idx,
+            None => {
+                trace!(0, "nanofs: a remove of nothing");
+                return false;
+            }
+        };
+        let parent_idx = match self.tree.parent(node).and_then(|parent| self.ino_of(parent)) {
+            Some(parent_idx) => parent_idx,
+            None => {
+                trace!(0, "nanofs: the root cannot be removed");
+                return false;
+            }
+        };
 
         if !self.remove_dir_entry(parent_idx, idx) {
             trace!(0, "nanofs: inode {} could not be taken out of directory {}", idx, parent_idx);
@@ -1184,32 +1174,36 @@ impl NanoFs {
         self.io.flush()
     }
 
-    pub fn rename(&mut self, node: *mut VNode, new_dir: *mut VNode, new_name: &[u8]) -> bool {
-        if node.is_null() || new_dir.is_null() || new_name.is_empty() {
-            trace!(0, "nanofs: a rename of nothing");
-            return false;
-        }
-        let old_dir = unsafe { (*node).parent };
-        if old_dir.is_null() {
-            trace!(0, "nanofs: the root cannot be renamed");
-            return false;
-        }
-        if !unsafe { (*new_dir).is_dir() } {
-            trace!(0, "nanofs: the target of a rename is not a directory");
-            return false;
-        }
+    pub fn rename(&mut self, node: NodeId, new_dir: NodeId, new_name: &[u8]) -> bool {
+        let idx = match self.ino_of(node) {
+            Some(idx) if !new_name.is_empty() => idx,
+            _ => {
+                trace!(0, "nanofs: a rename of nothing");
+                return false;
+            }
+        };
+        let old_idx = match self.tree.parent(node).and_then(|parent| self.ino_of(parent)) {
+            Some(old_idx) => old_idx,
+            None => {
+                trace!(0, "nanofs: the root cannot be renamed");
+                return false;
+            }
+        };
+        let new_idx = match self.tree.get(new_dir) {
+            Some(dir) if dir.is_dir() => dir.ino as u32,
+            _ => {
+                trace!(0, "nanofs: the target of a rename is not a directory");
+                return false;
+            }
+        };
         if new_name.len() >= NAME_MAX || new_name.len() >= IN_NAME_LEN {
             trace!(0, "nanofs: a name of {} bytes is too long", new_name.len());
             return false;
         }
-        if !self.lookup(new_dir, new_name).is_null() {
+        if self.lookup(new_dir, new_name).is_some() {
             trace!(0, "nanofs: there is something by that name already");
             return false;
         }
-
-        let idx = unsafe { (*node).ino } as u32;
-        let old_idx = unsafe { (*old_dir).ino } as u32;
-        let new_idx = unsafe { (*new_dir).ino } as u32;
 
         if !self.read_inode(idx) || !self.inode_ok() {
             trace!(0, "nanofs: inode {} could not be read", idx);
@@ -1251,30 +1245,8 @@ impl NanoFs {
             trace!(0, "nanofs: inode {} is in directory {} as well", idx, old_idx);
         }
 
-        unsafe { vnode::rename(node, new_dir, new_name) };
+        self.tree.rename(node, new_dir, new_name);
         self.io.flush()
-    }
-
-    /// The UUID as hex, for `mounts`.
-    fn info(&self, buf: &mut [u8]) {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        const NEED: usize = 5 + 32 + 1;
-
-        if buf.is_empty() {
-            return;
-        }
-        buf[0] = 0;
-        if buf.len() < NEED {
-            return;
-        }
-
-        buf[..5].copy_from_slice(b"uuid=");
-        for i in 0..16 {
-            let byte = self.sb.as_slice()[SB_UUID + i];
-            buf[5 + i * 2] = HEX[(byte >> 4) as usize];
-            buf[5 + i * 2 + 1] = HEX[(byte & 0xF) as usize];
-        }
-        buf[NEED - 1] = 0;
     }
 }
 
@@ -1343,138 +1315,80 @@ pub fn format(dev: &Disk) -> bool {
     true
 }
 
-/* ---- the ops table the VFS drives it by ---- */
-
-/// # Safety
-/// `ctx` is the pointer a mount was made with, and the filesystem is alive.
-unsafe fn fs<'a>(ctx: *mut u8) -> &'a mut NanoFs {
-    unsafe { &mut *(ctx as *mut NanoFs) }
-}
-
-/// # Safety
-/// `name` points at a NUL-terminated string.
-unsafe fn cstr<'a>(name: *const u8) -> &'a [u8] {
-    if name.is_null() {
-        return &[];
+impl FileSystem for NanoFs {
+    fn name(&self) -> &'static str {
+        "nanofs"
     }
-    let mut len = 0;
-    while len < NAME_MAX && unsafe { *name.add(len) } != 0 {
-        len += 1;
+
+    /// The UUID as hex, for `mounts`.
+    fn info(&self, out: &mut dyn core::fmt::Write) {
+        let _ = out.write_str("uuid=");
+        for byte in &self.sb.as_slice()[SB_UUID..SB_UUID + 16] {
+            let _ = write!(out, "{:02x}", byte);
+        }
     }
-    unsafe { core::slice::from_raw_parts(name, len) }
-}
 
-extern "C" fn op_info(ctx: *mut u8, buf: *mut u8, len: usize) {
-    if buf.is_null() || len == 0 {
-        return;
+    fn device(&self) -> usize {
+        self.io.dev.handle()
     }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    unsafe { fs(ctx) }.info(buf);
-}
 
-extern "C" fn op_root(ctx: *mut u8) -> *mut VNode {
-    unsafe { fs(ctx) }.root()
-}
-
-extern "C" fn op_load_dir(_ctx: *mut u8, _dir: *mut VNode) -> i32 {
-    /* The whole tree is read at mount: there is nothing left to load */
-    0
-}
-
-extern "C" fn op_lookup(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.lookup(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_create_file(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.create_file(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_create_dir(ctx: *mut u8, dir: *mut VNode, name: *const u8) -> *mut VNode {
-    unsafe { fs(ctx) }.create_dir(dir, unsafe { cstr(name) })
-}
-
-extern "C" fn op_read(
-    ctx: *mut u8, file: *mut VNode, buf: *mut u8, len: usize, off: usize,
-) -> i32 {
-    if len == 0 {
-        return 0;
+    fn mount(&mut self, read_only: bool) -> Option<bool> {
+        if NanoFs::mount(self) { Some(read_only) } else { None }
     }
-    if buf.is_null() {
-        return -1;
+
+    fn unmount(&mut self) {
+        NanoFs::unmount(self);
     }
-    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
-    if unsafe { fs(ctx) }.read(file, buf, off) { 0 } else { -1 }
-}
 
-extern "C" fn op_write(
-    ctx: *mut u8, file: *mut VNode, data: *const u8, len: usize, off: usize,
-) -> i32 {
-    if len == 0 {
-        return 0;
+    fn tree(&self) -> &Tree {
+        &self.tree
     }
-    if data.is_null() {
-        return -1;
+
+    fn tree_mut(&mut self) -> &mut Tree {
+        &mut self.tree
     }
-    let data = unsafe { core::slice::from_raw_parts(data, len) };
-    if unsafe { fs(ctx) }.write(file, data, off) { 0 } else { -1 }
-}
 
-extern "C" fn op_truncate(ctx: *mut u8, file: *mut VNode, size: usize) -> i32 {
-    if unsafe { fs(ctx) }.truncate(file, size) { 0 } else { -1 }
-}
-
-extern "C" fn op_rename(ctx: *mut u8, node: *mut VNode, dir: *mut VNode, name: *const u8) -> i32 {
-    if unsafe { fs(ctx) }.rename(node, dir, unsafe { cstr(name) }) { 0 } else { -1 }
-}
-
-extern "C" fn op_remove(ctx: *mut u8, node: *mut VNode) -> i32 {
-    if unsafe { fs(ctx) }.remove(node) { 0 } else { -1 }
-}
-
-extern "C" fn op_sync(ctx: *mut u8) -> i32 {
-    if unsafe { fs(ctx) }.sync() { 0 } else { -1 }
-}
-
-extern "C" fn op_device(ctx: *mut u8) -> usize {
-    unsafe { fs(ctx) }.io.dev.handle()
-}
-
-extern "C" fn op_mount(ctx: *mut u8, read_only: i32) -> i32 {
-    let fs = unsafe { fs(ctx) };
-    if !fs.mount() {
-        return -1;
+    fn root(&self) -> Option<NodeId> {
+        NanoFs::root(self)
     }
-    if read_only != 0 { 1 } else { 0 }
-}
 
-extern "C" fn op_unmount(ctx: *mut u8) {
-    unsafe { fs(ctx) }.unmount();
-}
+    /* `load_dir` is the default: the whole tree is read at mount, and there
+     * is nothing left to load. */
 
-extern "C" fn op_destroy(ctx: *mut u8) {
-    drop(unsafe { Box::from_raw(ctx as *mut NanoFs) });
-}
+    fn lookup(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        NanoFs::lookup(self, dir, name)
+    }
 
-fn ops_for(fs: *mut NanoFs) -> FsOps {
-    FsOps {
-        name: b"nanofs\0".as_ptr(),
-        info: Some(op_info),
-        root: op_root,
-        load_dir: op_load_dir,
-        lookup: op_lookup,
-        create_file: op_create_file,
-        create_dir: op_create_dir,
-        read: op_read,
-        write: op_write,
-        truncate: op_truncate,
-        rename: op_rename,
-        remove: op_remove,
-        sync: op_sync,
-        device: op_device,
-        mount: op_mount,
-        unmount: op_unmount,
-        destroy: Some(op_destroy),
-        ctx: fs as *mut u8,
+    fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        NanoFs::create_file(self, dir, name)
+    }
+
+    fn create_dir(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        NanoFs::create_dir(self, dir, name)
+    }
+
+    fn read(&mut self, file: NodeId, buf: &mut [u8], offset: usize) -> bool {
+        NanoFs::read(self, file, buf, offset)
+    }
+
+    fn write(&mut self, file: NodeId, data: &[u8], offset: usize) -> bool {
+        NanoFs::write(self, file, data, offset)
+    }
+
+    fn truncate(&mut self, file: NodeId, size: usize) -> bool {
+        NanoFs::truncate(self, file, size)
+    }
+
+    fn rename(&mut self, node: NodeId, dir: NodeId, name: &[u8]) -> bool {
+        NanoFs::rename(self, node, dir, name)
+    }
+
+    fn remove(&mut self, node: NodeId) -> bool {
+        NanoFs::remove(self, node)
+    }
+
+    fn sync(&mut self) -> bool {
+        NanoFs::sync(self)
     }
 }
 
@@ -1497,19 +1411,18 @@ fn mount_bytes(at: &[u8], device: usize, read_only: bool) -> i32 {
     };
 
     let fs = match NanoFs::new(dev) {
-        Some(fs) => Box::into_raw(fs),
+        Some(fs) => fs,
         None => {
             trace!(0, "nanofs: no memory for the filesystem");
             return -1;
         }
     };
 
-    let ops = ops_for(fs);
-    if !vfs.mount(at, &ops, read_only) {
-        drop(unsafe { Box::from_raw(fs) });
-        return -1;
+    match vfs.mount(at, Box::new(fs), read_only) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
     }
-    if read_only { 1 } else { 0 }
 }
 
 /// The same, as the shell's `format` calls it.
