@@ -276,6 +276,149 @@ pub mod icmp {
     }
 }
 
+/* ---- TCP ---- */
+
+pub mod tcp {
+    use super::*;
+
+    pub const HDR_LEN: usize = 20;
+
+    pub const SRC_PORT: usize = 0;
+    pub const DST_PORT: usize = 2;
+    pub const SEQ: usize = 4;
+    pub const ACK: usize = 8;
+    pub const DATA_OFF: usize = 12;
+    pub const FLAGS: usize = 13;
+    pub const WINDOW: usize = 14;
+    pub const CHECKSUM: usize = 16;
+    pub const URGENT: usize = 18;
+
+    pub const FIN: u8 = 0x01;
+    pub const SYN: u8 = 0x02;
+    pub const RST: u8 = 0x04;
+    pub const PSH: u8 = 0x08;
+    pub const ACK_FLAG: u8 = 0x10;
+
+    pub const OPT_END: u8 = 0;
+    pub const OPT_NOP: u8 = 1;
+    pub const OPT_MSS: u8 = 2;
+    pub const OPT_MSS_LEN: u8 = 4;
+
+    pub fn src_port(seg: &[u8]) -> u16 {
+        be16(seg, SRC_PORT)
+    }
+
+    pub fn dst_port(seg: &[u8]) -> u16 {
+        be16(seg, DST_PORT)
+    }
+
+    pub fn seq(seg: &[u8]) -> u32 {
+        be32(seg, SEQ)
+    }
+
+    pub fn ack(seg: &[u8]) -> u32 {
+        be32(seg, ACK)
+    }
+
+    pub fn flags(seg: &[u8]) -> u8 {
+        seg[FLAGS]
+    }
+
+    pub fn window(seg: &[u8]) -> u16 {
+        be16(seg, WINDOW)
+    }
+
+    /// The header's own length in bytes, options included. 0 when the field
+    /// says something shorter than a header.
+    pub fn header_len(seg: &[u8]) -> usize {
+        let words = (seg[DATA_OFF] >> 4) as usize;
+        if words < 5 { 0 } else { words * 4 }
+    }
+
+    /// The header, with no checksum yet: the caller takes it once the payload
+    /// is in place, over the pseudo-header too.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write(
+        seg: &mut [u8], src_port: u16, dst_port: u16, seq: u32, ack: u32,
+        header_len: usize, flags: u8, window: u16,
+    ) {
+        set_be16(seg, SRC_PORT, src_port);
+        set_be16(seg, DST_PORT, dst_port);
+        set_be32(seg, SEQ, seq);
+        set_be32(seg, ACK, ack);
+        seg[DATA_OFF] = ((header_len / 4) as u8) << 4;
+        seg[FLAGS] = flags;
+        set_be16(seg, WINDOW, window);
+        set_be16(seg, CHECKSUM, 0);
+        set_be16(seg, URGENT, 0);
+    }
+
+    /// The peer's maximum segment size from a SYN's options, capped at ours.
+    /// `default` when it named none.
+    pub fn parse_mss(seg: &[u8], ours: u16, default: u16) -> u16 {
+        let len = header_len(seg);
+        if len <= HDR_LEN || len > seg.len() {
+            return default;
+        }
+
+        let options = &seg[HDR_LEN..len];
+        let mut at = 0;
+        while at < options.len() {
+            let kind = options[at];
+            if kind == OPT_END {
+                break;
+            }
+            if kind == OPT_NOP {
+                at += 1;
+                continue;
+            }
+            if at + 1 >= options.len() {
+                break;
+            }
+            let opt_len = options[at + 1] as usize;
+            if opt_len < 2 || at + opt_len > options.len() {
+                break;
+            }
+            if kind == OPT_MSS && opt_len == OPT_MSS_LEN as usize {
+                let mss = be16(options, at + 2);
+                return if mss == 0 { default } else { mss.min(ours) };
+            }
+            at += opt_len;
+        }
+        default
+    }
+
+    /// The checksum a TCP segment carries: over the pseudo-header of
+    /// addresses, protocol and length, then the segment itself. Answers 0
+    /// over a segment whose own checksum is right.
+    pub fn checksum(src_ip: u32, dst_ip: u32, segment: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+
+        /* The pseudo-header, as 16-bit words */
+        sum += (src_ip >> 16) & 0xFFFF;
+        sum += src_ip & 0xFFFF;
+        sum += (dst_ip >> 16) & 0xFFFF;
+        sum += dst_ip & 0xFFFF;
+        sum += IP_PROTO_TCP as u32;
+        sum += segment.len() as u32;
+
+        let mut at = 0;
+        while at + 1 < segment.len() {
+            sum += ((segment[at] as u32) << 8) | segment[at + 1] as u32;
+            at += 2;
+        }
+        if at < segment.len() {
+            sum += (segment[at] as u32) << 8;
+        }
+
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+
+        !(sum as u16)
+    }
+}
+
 /// The internet checksum (RFC 1071): the one's complement of the one's
 /// complement sum of the 16-bit words, with an odd last byte padded.
 pub fn checksum(data: &[u8]) -> u16 {

@@ -1,223 +1,27 @@
 #pragma once
 
 #include <include/types.h>
-#include <include/const.h>
 #include <net/net.h>
-#include <net/net_device.h>
-#include <kernel/raw_spin_lock.h>
-#include <kernel/mutex.h>
-#include <kernel/atomic.h>
-#include <kernel/timer.h>
-#include <lib/list_entry.h>
 #include <lib/printer.h>
 
 namespace Kernel
 {
 
-/* TCP flag constants */
-static const u8 TcpFlagFin = 0x01;
-static const u8 TcpFlagSyn = 0x02;
-static const u8 TcpFlagRst = 0x04;
-static const u8 TcpFlagPsh = 0x08;
-static const u8 TcpFlagAck = 0x10;
+class NetDevice;
 
-/* TCP option constants */
-static const u8 TcpOptEnd      = 0;
-static const u8 TcpOptNop      = 1;
-static const u8 TcpOptMss      = 2;
-static const u8 TcpOptMssLen   = 4;
+/* TCP itself is Rust (src/rust/net/src/tcp.rs): the connection pool, the
+   state machine, the retransmit and persist timers, and the blocking calls
+   over them. What is left here is the way in.
 
-/* TCP constants */
-static const ulong TcpMaxConnections   = 64;
-static const ulong TcpSendBufSize      = 8192;
-static const ulong TcpRecvBufSize      = 8192;
-static const u16   TcpDefaultMss       = 536;
-static const u16   TcpOurMss           = 1460;
-static const ulong TcpInitialRtoMs     = 1000;
-static const ulong TcpMaxRtoMs         = 8000;
-static const ulong TcpMaxRetransmits   = 8;
-/* Linux-style 60 s stand-in for 2*MSL: an old-incarnation segment must
-   not be matched by a new connection reusing the 4-tuple */
-static const ulong TcpTimeWaitMs       = 60000;
-static const ulong TcpFinWait2TimeoutMs = 60000;
-static const ulong TcpConnectTimeoutMs = 5000;
-static const u8    TcpDefaultTtl       = 64;
-static const ulong TcpTimerPeriodMs    = 200;
-static const ulong TcpConnHashSize     = 32;
-static const u16   TcpEphemeralPortBase = 49152;
-static const u16   TcpEphemeralPortMax  = 65535;
-/* Connections a listener holds that nobody has accepted yet -- handshakes
-   under way, and ones done and waiting. Past this a SYN to its port is
-   dropped, as a full accept queue drops it: a flood of SYNs to a listening
-   port then costs the pool this many slots, not all of them. */
-static const ulong TcpListenBacklog    = 16;
+   A connection is opaque on this side: the pool lives in Rust and a
+   TcpConn* is a pointer into it, stable for the connection's life. */
+struct TcpConn;
 
-/* Tcp::Recv results below zero */
+/* What Tcp::Recv answers below zero */
 static const long TcpRecvError   = -1;
 static const long TcpRecvTimeout = -2;
 
-/* DataOff value for a 20-byte header (5 * 4 = 20) */
-static const u8 TcpDataOff5 = (5 << 4);
-/* DataOff value for a 24-byte header (6 * 4 = 24, with MSS option) */
-static const u8 TcpDataOff6 = (6 << 4);
-
-/* TCP connection states */
-enum TcpState : u8
-{
-    TcpStateFree = 0,
-    TcpStateListen,
-    TcpStateSynSent,
-    TcpStateSynReceived,
-    TcpStateEstablished,
-    TcpStateFinWait1,
-    TcpStateFinWait2,
-    TcpStateCloseWait,
-    TcpStateLastAck,
-    TcpStateClosing,
-    TcpStateTimeWait,
-    TcpStateClosed,
-};
-
-/* What HandleState did that deserves a trace line. HandleState runs under
-   conn->Lock, so it only reports; Process writes the line once the lock is
-   released (see Tcp::TraceEvent). */
-enum TcpEvent : u8
-{
-    TcpEventNone = 0,
-    TcpEventRst,
-    TcpEventConnected,
-    TcpEventAccepted,
-};
-
-/* Simple byte ring buffer */
-struct TcpRingBuf
-{
-    u8 Data[TcpSendBufSize]; /* reuse max of Send/Recv size */
-    ulong Head;
-    ulong Tail;
-    ulong Size; /* capacity */
-
-    void Init(ulong capacity)
-    {
-        Head = 0;
-        Tail = 0;
-        Size = capacity;
-    }
-
-    ulong Used() const
-    {
-        return (Tail - Head);
-    }
-
-    ulong Free() const
-    {
-        return Size - Used();
-    }
-
-    ulong Write(const u8* src, ulong len)
-    {
-        ulong avail = Free();
-        if (len > avail)
-            len = avail;
-        for (ulong i = 0; i < len; i++)
-            Data[(Tail + i) % Size] = src[i];
-        Tail += len;
-        return len;
-    }
-
-    ulong Read(u8* dst, ulong len)
-    {
-        ulong avail = Used();
-        if (len > avail)
-            len = avail;
-        for (ulong i = 0; i < len; i++)
-            dst[i] = Data[(Head + i) % Size];
-        Head += len;
-        return len;
-    }
-
-    /* Peek at data without advancing Head */
-    ulong Peek(u8* dst, ulong offset, ulong len) const
-    {
-        ulong avail = Used();
-        if (offset >= avail)
-            return 0;
-        if (len > avail - offset)
-            len = avail - offset;
-        for (ulong i = 0; i < len; i++)
-            dst[i] = Data[(Head + offset + i) % Size];
-        return len;
-    }
-
-    /* Discard len bytes from the front */
-    void Consume(ulong len)
-    {
-        ulong avail = Used();
-        if (len > avail)
-            len = avail;
-        Head += len;
-    }
-};
-
-/* Per-connection state */
-struct TcpConn
-{
-    /* Identity */
-    Net::IpAddress LocalIp;
-    u16 LocalPort;
-    Net::IpAddress RemoteIp;
-    u16 RemotePort;
-    NetDevice* Dev;
-    Net::MacAddress ResolvedMac;
-
-    /* State */
-    TcpState State;
-
-    /* Sequence tracking */
-    u32 SndUna;   /* oldest unacked */
-    u32 SndNxt;   /* next to send */
-    u32 SndWnd;   /* peer window */
-    u32 SndWl1;   /* SEG.SEQ of the segment that last updated SndWnd (RFC 793) */
-    u32 SndWl2;   /* SEG.ACK of the segment that last updated SndWnd (RFC 793) */
-    u32 RcvNxt;   /* next expected */
-    u32 RcvWnd;   /* our window */
-    u32 AdvertisedWnd; /* window advertised in our last outgoing segment */
-    u32 Iss;      /* initial send sequence */
-    u32 Irs;      /* initial receive sequence */
-    u16 PeerMss;
-
-    /* Buffers */
-    TcpRingBuf SendBuf;
-    TcpRingBuf RecvBuf;
-
-    /* Retransmit state */
-    ulong RtoMs;
-    ulong RetransmitDeadlineMs; /* boot-time ms when retransmit fires */
-    ulong RetransmitCount;      /* consecutive retransmits with no ACK progress */
-    ulong TimeWaitDeadlineMs;   /* also the FIN-WAIT-2 timeout deadline */
-    ulong PersistDeadlineMs;    /* zero-window probe deadline (persist timer) */
-
-    /* Flags */
-    Atomic DataReady;   /* set when data arrives in RecvBuf */
-    Atomic ConnReady;   /* set when state changes from SynSent/SynReceived */
-    bool NeedCleanup;
-    bool FinAcked;      /* our FIN has been ACKed */
-    bool OwnedByApp;    /* an application still holds this pointer; the cleanup
-                          timer must not recycle the slot until Close() clears it */
-    bool Accepted;      /* a passive connection already handed out by Accept() */
-
-    /* Per-connection lock */
-    RawSpinLock Lock;
-
-    /* Hash table linkage */
-    Stdlib::ListEntry HashLink;
-
-    void Init();
-    void Reset();
-};
-
-/* TCP singleton */
-class Tcp : public TimerCallback
+class Tcp
 {
 public:
     static Tcp& GetInstance()
@@ -228,129 +32,52 @@ public:
 
     bool Init();
 
-    /* Active open -- blocks until connected or timeout.
-       srcPort=0 means auto-allocate an ephemeral port. */
+    /* Active open -- blocks until connected or the timeout passes.
+       srcPort = 0 takes an ephemeral port. */
     TcpConn* Connect(NetDevice* dev, Net::IpAddress dstIp, u16 dstPort, u16 srcPort = 0);
 
-    /* Passive open -- listens on the port, at every address the machine has
-       (a connection is the device's that it arrives on) */
+    /* Passive open, at every address the machine has */
     TcpConn* Listen(NetDevice* dev, u16 port);
 
-    /* Accept -- blocks until a new connection arrives on a listening socket.
-       nullptr once timeoutMs (0 = wait forever) passes with none, or once
-       the listener has been closed: a server's task waiting here is how it
-       sees a Close from another task. */
+    /* The next connection on a listening socket; nullptr once timeoutMs
+       (0 = wait forever) passes with none, or once the listener is closed. */
     TcpConn* Accept(TcpConn* listener, ulong timeoutMs = 0);
 
-    /* Data transfer -- blocks until data sent/received or timeout.
-       Send returns the bytes queued: all of them, fewer once timeoutMs
-       (0 = wait forever) passes with no room for the rest -- 0 when it
-       found room for none -- or -1 when the connection is gone before any
-       were. Recv returns the byte count, 0 at EOF, TcpRecvError on a bad
-       argument, or TcpRecvTimeout when timeoutMs (0 = wait forever)
-       elapses with the receive buffer still empty. */
+    /* Send returns the bytes queued, or -1 when the connection is gone
+       before any were. Recv returns the byte count, 0 at end of stream,
+       TcpRecvError on a bad argument, or TcpRecvTimeout when timeoutMs
+       elapses with nothing received. */
     long Send(TcpConn* conn, const void* data, ulong len, ulong timeoutMs = 0);
     long Recv(TcpConn* conn, void* buf, ulong len, ulong timeoutMs = 0);
 
-    /* Close connection (graceful FIN exchange). Closing a listener resets
-       the connections that arrived on its port and were never accepted:
-       nobody is left to accept them. */
+    /* The graceful close; closing a listener resets the connections that
+       arrived on its port and were never accepted. */
     void Close(TcpConn* conn);
 
-    /* Abortive close: a RST instead of the FIN exchange, and the slot back
-       to the pool at the cleanup timer's next tick rather than after a
-       minute of TIME-WAIT. For a connection a server refuses or drops. */
+    /* A reset instead of the FIN exchange, and the slot back at the next
+       tick rather than after a minute of TIME-WAIT. */
     void Abort(TcpConn* conn);
+
+    /* Who the connection is with; host byte order. */
+    void Peer(TcpConn* conn, u32& ip, u16& port);
 
     /* Called from a net device's receive dispatch for IpProtoTcp */
     void Process(NetDevice* dev, const u8* frame, ulong frameLen);
 
-    /* Called by Icmp for a hard Destination Unreachable (protocol/port)
-       quoting a TCP segment we sent -- aborts the matching connection.
-       `quotedSeq` is the SEG.SEQ from the quoted segment; it is validated
-       against the send window (RFC 5927) to reject off-path forgeries. */
+    /* Called by Icmp for a hard Destination Unreachable quoting a segment
+       we sent. */
     void OnIcmpUnreachable(u32 localIp, u16 localPort,
                            u32 remoteIp, u16 remotePort, u32 quotedSeq);
-
-    /* Called from TypeTcpTimer SoftIrq handler -- retransmits + cleanup */
-    void ProcessRetransmits();
-
-    /* TimerCallback -- runs in IPI context, just raises SoftIrq */
-    void OnTick(TimerCallback& callback) override;
 
     void Dump(Stdlib::Printer& printer);
 
 private:
-    Tcp();
-    ~Tcp();
+    Tcp() {}
+    ~Tcp() {}
     Tcp(const Tcp& other) = delete;
     Tcp(Tcp&& other) = delete;
     Tcp& operator=(const Tcp& other) = delete;
     Tcp& operator=(Tcp&& other) = delete;
-
-    Mutex PortMutex;
-    RawSpinLock PoolLock;
-    TcpConn Pool[TcpMaxConnections];
-    Stdlib::ListEntry HashTable[TcpConnHashSize];
-    u16 NextEphemeralPort;
-    bool Initialized;
-
-    /* Statistics */
-    Atomic TxSegments;
-    Atomic RxSegments;
-    Atomic RxChecksumErr;
-    Atomic RxTooShort;
-    Atomic Retransmits;
-    Atomic ConnCount;
-
-    u16 AllocEphemeralPort();
-    TcpConn* AllocConn();
-    TcpConn* LookupLocked(u32 localIp, u16 localPort,
-                          u32 remoteIp, u16 remotePort);
-    TcpConn* FindListenerLocked(u32 localIp, u16 localPort);
-    void InsertHash(TcpConn* conn);
-    void RemoveHash(TcpConn* conn);
-    ulong HashIndex(u32 localIp, u16 localPort,
-                    u32 remoteIp, u16 remotePort);
-
-    /* Close for a listener: false if conn is not one */
-    bool CloseListener(TcpConn* listener);
-
-    /* Caller holds PoolLock, which this lets go of: resets every connection
-       on port that nobody accepted, the RSTs sent after the unlock */
-    void ResetUnacceptedAndUnlock(u16 port);
-
-    /* Caller must hold PoolLock. Whether port's listener holds all the
-       connections it may that nobody has accepted (TcpListenBacklog). */
-    bool BacklogFullLocked(u16 port);
-
-    void SendSegment(TcpConn* conn, u8 flags, const u8* data, ulong len);
-    void SendRst(NetDevice* dev, const Net::MacAddress& dstMac,
-                 Net::IpAddress srcIp, Net::IpAddress dstIp,
-                 u16 srcPort, u16 dstPort, u32 seq, u32 ack);
-
-    TcpEvent HandleState(TcpConn* conn, const Net::IpHdr* ip,
-                         const Net::TcpHdr* tcp, const u8* payload,
-                         ulong payloadLen);
-
-    /* Writes the line for a TcpEvent; called with no lock held. */
-    void TraceEvent(TcpEvent event, u16 localPort, u16 remotePort,
-                    u16 peerMss);
-
-    /* In-order payload delivery to RecvBuf + the ACK it requires. Shared by
-       Established and the FIN-WAIT states (RFC 793 half-close). */
-    void ProcessPayload(TcpConn* conn, u32 seq, const u8* payload,
-                        ulong payloadLen);
-
-    /* Advance SndUna / drain SendBuf for an incoming ACK (wrap-safe).
-       Shared by every state that may have unacked data outstanding. */
-    void ProcessAck(TcpConn* conn, u32 segSeq, u32 ack, u16 wnd, ulong now);
-
-    ulong GetBootTimeMs();
-
-    static void TcpTimerSoftIrqHandler(void* ctx);
-
-    static const char* StateToString(TcpState state);
 };
 
 } /* namespace Kernel */

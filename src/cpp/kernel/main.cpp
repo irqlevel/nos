@@ -53,6 +53,7 @@
 #include <net/udp_shell.h>
 #include <net/net_frame_pool.h>
 #include <net/netconsole.h>
+#include <net/net_device.h>
 #include <net/tcp.h>
 #include <fs/vfs.h>
 #include <fs/rootfs.h>

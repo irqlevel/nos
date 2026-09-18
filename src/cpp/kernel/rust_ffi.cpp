@@ -735,11 +735,14 @@ void kernel_tcp_peer(void* conn, unsigned int* ip, unsigned short* port)
 {
     if (!conn)
         return;
-    auto* c = (Kernel::TcpConn*)conn;
+
+    unsigned int addr = 0;
+    unsigned short remote = 0;
+    Kernel::Tcp::GetInstance().Peer((Kernel::TcpConn*)conn, addr, remote);
     if (ip)
-        *ip = c->RemoteIp.Addr4;
+        *ip = addr;
     if (port)
-        *port = c->RemotePort;
+        *port = remote;
 }
 
 /* ---- Soft IRQ ---- */
@@ -1923,6 +1926,21 @@ unsigned long kernel_irq_save()
 void kernel_irq_restore(unsigned long flags)
 {
     Kernel::PreemptIrqRestore(flags);
+}
+
+/* Preemption off, and back on: what a spin lock of the kernel's own kind
+   holds while it is taken. Interrupts stay on -- a lock an interrupt handler
+   also takes needs kernel_irq_save instead. The holder cannot be switched
+   away, which is what keeps every other taker from spinning out a whole time
+   slice. */
+void kernel_preempt_disable()
+{
+    Kernel::PreemptDisable();
+}
+
+void kernel_preempt_enable()
+{
+    Kernel::PreemptEnable();
 }
 
 /* Whether a panic has started: what tells code to write without taking a

@@ -33,7 +33,7 @@ src/rust/
     virtio_net/ virtio-net, the card the network comes in on
     virtio_scsi/ virtio-scsi, a SCSI adapter and the disks behind it
   block/      The block layer: the device table, its claims, the `disks` and `partitions` commands, and the partition tables (MBR and GPT) a disk is cut up by
-  net/        The network layer: the wire formats and the internet checksum (wire.rs), ARP (arp.rs), ICMP (icmp.rs), UDP (udp.rs), the DHCP client (dhcp.rs), the DNS resolver (dns.rs), the shell over UDP (udp_shell.rs), the kernel log over UDP (netconsole.rs), the load target (net_load.rs), the boot self-test over the formats (selftest.rs) and the C ABI C++ calls them by (abi.rs)
+  net/        The network layer: the wire formats and the internet checksum (wire.rs), ARP (arp.rs), ICMP (icmp.rs), UDP (udp.rs), the DHCP client (dhcp.rs), the DNS resolver (dns.rs), TCP (tcp.rs), the shell over UDP (udp_shell.rs), the kernel log over UDP (netconsole.rs), the load target (net_load.rs), the boot self-test over the formats (selftest.rs) and the C ABI C++ calls them by (abi.rs)
   fs/         The filesystem layer: the VFS (vfs.rs -- the mount table, path resolution, open handles and the file API), the filesystems under it (ext2.rs, nanofs.rs, ramfs.rs, procfs.rs), the vnode they are made of (vnode.rs) and what boot mounts where (rootfs.rs)
   virtio/     The virtio foundation: the split virtqueue, the transport contract, virtio-pci (modern and legacy) and virtio-mmio v2
   hello/      Rust self-test module
