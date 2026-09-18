@@ -72,7 +72,7 @@ it is unmounted, and so do the disk log and a module writing to a device
 direct (`blkload`'s write tests) -- and the shell's `format` and `diskwrite`,
 for as long as they write. A claim is refused while another overlaps
 it — the same device, the disk a partition is on, or a partition of that
-disk — so a mount fails (`Vfs::Mount: vdb is in use by a mounted filesystem`
+disk — so a mount fails (`vfs: the device is in use by a mounted filesystem`
 in dmesg) on the disk under a mounted partition, on the disk log's area, or
 on a device a write test is running on; and those, in turn, keep off a
 mounted one. Reads need no claim.

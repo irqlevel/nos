@@ -14,11 +14,13 @@
 #include <hal/barrier.h>
 #include <hal/console.h>
 
-#include <net/netconsole.h>
 
 /* The disk log is Rust (src/rust/block/src/disklog.rs). */
 extern "C" {
 void rust_disklog_log(const char* line);
+void rust_netconsole_log(const char* line, unsigned long len);
+void rust_netconsole_panic_mark();
+void rust_netconsole_panic_flush();
 void rust_disklog_panic_flush();
 }
 
@@ -44,7 +46,7 @@ void Panicker::PrintOutput(const char* str)
 
     /* Also into the netconsole ring; PanicFlush() below pushes it out while
        the machine still can. */
-    Netconsole::GetInstance().Log(str);
+    rust_netconsole_log(str, Stdlib::StrLen(str));
 
     /* And into the disk log's, for its PanicFlush(): on a machine with no
        serial port and no network yet the disk is the only place the report
@@ -223,7 +225,7 @@ void Panicker::DoPanic(const char *fmt, ...)
         /* Before the first PrintOutput: the report is appended behind whatever
            backlog the drain task still owes the collector, and PanicFlush()
            needs to know how much of it to skip. */
-        Netconsole::GetInstance().PanicMark();
+        rust_netconsole_panic_mark();
 
         va_list args;
 
@@ -252,7 +254,7 @@ void Panicker::DoPanic(const char *fmt, ...)
         /* Last thing done, and best-effort by construction: the console
            already has the whole report, so a TX path that turns out to be
            wedged costs nothing that was still needed. */
-        Netconsole::GetInstance().PanicFlush();
+        rust_netconsole_panic_flush();
         rust_disklog_panic_flush();
     }
 
@@ -270,7 +272,7 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
         /* Before the first PrintOutput: the report is appended behind whatever
            backlog the drain task still owes the collector, and PanicFlush()
            needs to know how much of it to skip. */
-        Netconsole::GetInstance().PanicMark();
+        rust_netconsole_panic_mark();
 
         va_list args;
 
@@ -301,7 +303,7 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
         /* Last thing done, and best-effort by construction: the console
            already has the whole report, so a TX path that turns out to be
            wedged costs nothing that was still needed. */
-        Netconsole::GetInstance().PanicFlush();
+        rust_netconsole_panic_flush();
         rust_disklog_panic_flush();
     }
 

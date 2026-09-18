@@ -9,8 +9,6 @@
 #include "time.h"
 #include "watchdog.h"
 #include "parameters.h"
-#include <net/net_device.h>
-#include <net/net.h>
 #include "entropy.h"
 #include "random.h"
 #include "console.h"

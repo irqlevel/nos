@@ -3,10 +3,10 @@
 #include "parameters.h"
 
 #include <hal/console.h>
-#include <net/netconsole.h>
 
 /* The disk log is Rust (src/rust/block/src/disklog.rs). */
 extern "C" {
+void rust_netconsole_log(const char* line, unsigned long len);
 void rust_disklog_log(const char* line);
 }
 
@@ -59,7 +59,7 @@ void Tracer::Output(const char *fmt, ...)
 
     /* Capture is a memcpy into a ring buffer -- the send happens later, on the
        netconsole task, so this stays safe in IRQ context. */
-    Netconsole::GetInstance().Log(msg);
+    rust_netconsole_log(msg, Stdlib::StrLen(msg));
 
     /* And to the disk area, if one was prepared. Unlike the netconsole this
        writes now, synchronously: it exists for the boot that stops before

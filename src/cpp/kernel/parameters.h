@@ -1,7 +1,6 @@
 #pragma once
 
 #include <lib/stdlib.h>
-#include <net/net.h>
 
 namespace Kernel
 {
@@ -72,7 +71,8 @@ public:
 
     /* netconsole=ip:port -- stream the kernel log to that collector */
     bool IsNetconsoleEnabled();
-    Net::IpAddress GetNetconsoleIp();
+    /* Host byte order; 0 when no netconsole was asked for. */
+    u32 GetNetconsoleIp();
     u16 GetNetconsolePort();
 
     /* nctail=N -- when the link comes up, ship only the newest N KiB of the
@@ -80,7 +80,7 @@ public:
     ulong GetNetconsoleTailKb();
 
     /* netframes=N -- how many frames the network pool is built with. 0 (the
-       default) means NetFramePool::DefaultFrameCount. Worth having as a knob
+       default) means the network layer's own default. Worth having as a knob
        rather than a rebuild: how many frames a driver keeps in flight is a
        property of that driver and that load, and the only way to find out is
        to raise it on the machine in question and watch `netpool` for misses. */
@@ -173,7 +173,7 @@ private:
     ConsoleMode ConMode;
     DhcpMode DhcpMd;
     u16 UdpShellPort;
-    Net::IpAddress NetconsoleIp;
+    u32 NetconsoleIp;
     u16 NetconsolePort;
     ulong NetconsoleTailKb;
     ulong NetFrameCount;

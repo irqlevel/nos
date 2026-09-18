@@ -1,5 +1,4 @@
 #include "cpu.h"
-#include <net/net_device.h>
 #include "interrupt.h"
 #include "panic.h"
 #include "trace.h"
@@ -14,6 +13,10 @@
 #include <kernel/time.h>
 #include <mm/new.h>
 #include <mm/page_table.h>
+
+/* The network layer is Rust (src/rust/net): a receive pass asked for from
+   here, when the idle path has nothing else to do. */
+extern "C" void rust_net_poll_rx();
 
 namespace Kernel
 {
@@ -526,8 +529,8 @@ void Cpu::TimerTick(Context* ctx)
         TimerTable::GetInstance().ProcessTimers();
 
         /* And look at the receive path, whether or not a NIC asked. See
-           NetDeviceTable::PollRx. */
-        NetDeviceTable::GetInstance().PollRx();
+           the network layer's poll. */
+        rust_net_poll_rx();
     }
 
     /* Repairs a wakeup that went missing, and nothing else -- see
