@@ -44,6 +44,25 @@ impl LegacyInterrupt {
         }
     }
 
+    /// Register a level-triggered interrupt by its number, for a device
+    /// found somewhere other than the PCI bus -- a virtio-mmio window, whose
+    /// interrupt the device tree names.
+    pub fn register_irq(
+        irq: u8,
+        handler: extern "C" fn(*mut u8),
+        ctx: *mut u8,
+    ) -> Option<Self> {
+        let mut vector: u8 = 0;
+        let handle = unsafe {
+            interrupt::kernel_interrupt_register_level(irq, handler, ctx, &mut vector)
+        };
+        if handle == 0 {
+            None
+        } else {
+            Some(Self { handle, vector })
+        }
+    }
+
     /// The CPU interrupt vector assigned to this slot.
     pub fn vector(&self) -> u8 {
         self.vector

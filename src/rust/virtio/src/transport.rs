@@ -65,6 +65,20 @@ pub trait Transport {
     fn is_legacy(&self) -> bool {
         false
     }
+
+    /// The MSI-X table this bus has, for a driver that wants its completions
+    /// as messages rather than on a line. None where there is no MSI-X --
+    /// virtio-mmio, and a legacy virtio-pci device.
+    fn msix_table(&self) -> Option<&kcore::msix::MsixTable> {
+        None
+    }
+
+    /// Say that MSI-X entry `entry` serves this device, which is what makes
+    /// the queues be told their vectors as they are enabled. A driver calls
+    /// it once its handler is registered and before the queue is set up.
+    fn use_msix(&self, entry: u16) {
+        let _ = entry;
+    }
 }
 
 /// The bring-up every virtio driver does before it touches a queue: reset,

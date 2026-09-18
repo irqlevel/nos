@@ -10,7 +10,6 @@ extern PitInterrupt
 extern HpetInterrupt
 extern IPInterrupt
 extern LapicTimerInterrupt
-extern VirtioBlkInterrupt
 extern VirtioNetInterrupt
 extern VirtioScsiInterrupt
 extern SharedInterrupt
@@ -104,7 +103,6 @@ global PitInterruptStub
 global HpetInterruptStub
 global IPInterruptStub
 global LapicTimerInterruptStub
-global VirtioBlkInterruptStub
 global VirtioNetInterruptStub
 global VirtioScsiInterruptStub
 global SharedInterruptStub
@@ -575,7 +573,6 @@ InterruptStub Pit
 InterruptStub Hpet
 InterruptStub IP
 InterruptStub LapicTimer
-InterruptStub VirtioBlk
 InterruptStub VirtioNet
 InterruptStub VirtioScsi
 InterruptStub Shared

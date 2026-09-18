@@ -1094,6 +1094,15 @@ bool VirtioScsi::ProbeLun(HbaState* hba, u8 target, u16 lun)
     return true;
 }
 
+/* The block I/O soft IRQ: what a completion raises so the requests that
+   were waiting for a slot go out. virtio-blk used to share this handler;
+   its Rust replacement waits on its own slots and needs none. */
+static void BlkIoSoftIrqHandler(void* ctx)
+{
+    (void)ctx;
+    VirtioScsi::DrainAllQueues();
+}
+
 void VirtioScsi::InitAll()
 {
     auto& pci = Pci::GetInstance();
@@ -1125,6 +1134,8 @@ void VirtioScsi::InitAll()
         HbaCount++;
     }
 
+    SoftIrq::GetInstance().Register(SoftIrq::TypeBlkIo, BlkIoSoftIrqHandler, nullptr);
+
     Trace(0, "VirtioScsi: initialized %u devices on %u HBAs", InstanceCount, HbaCount);
 }
 
@@ -1151,6 +1162,8 @@ void VirtioScsi::InitAllMmio(const VirtioMmioSlot* slots, ulong count)
         SetupHbaDevices(hba, (u8)slots[i].IntId, (u8)slots[i].IntId);
         HbaCount++;
     }
+
+    SoftIrq::GetInstance().Register(SoftIrq::TypeBlkIo, BlkIoSoftIrqHandler, nullptr);
 
     Trace(0, "VirtioScsi: initialized %u devices on %u HBAs", InstanceCount, HbaCount);
 }

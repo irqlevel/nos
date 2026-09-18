@@ -1,0 +1,11 @@
+[package]
+name = "virtio-blk"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "virtio_blk"
+
+[dependencies]
+kcore = { path = "../../kcore" }
+virtio = { path = "../../virtio" }

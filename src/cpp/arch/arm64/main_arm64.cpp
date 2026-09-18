@@ -30,7 +30,6 @@
 #include <hal/power.h>
 
 #include <drivers/virtio_mmio.h>
-#include <drivers/virtio_blk.h>
 #include <drivers/virtio_net.h>
 #include <drivers/virtio_scsi.h>
 
@@ -44,6 +43,9 @@ extern "C" void rust_partitions_probe();
 /* The virtio-rng driver (src/rust/drivers/virtio_rng), which takes the
    virtio-mmio windows the device tree described -- the arm64 bus. */
 extern "C" void rust_virtio_rng_init_mmio(const Kernel::VirtioMmioSlot* slots, unsigned long count);
+/* The virtio-blk driver (src/rust/drivers/virtio_blk), likewise over the
+   windows the device tree described */
+extern "C" void rust_virtio_blk_init_mmio(const Kernel::VirtioMmioSlot* slots, unsigned long count);
 namespace Kernel { bool PciEcamSetup(); }
 extern "C" void __cxa_finalize(void*);
 extern "C" char BootStackTop[];
@@ -213,7 +215,7 @@ static void BpStartupArm(void* ctx)
         }
         Trace(0, "virtio-mmio: %u devices", count);
 
-        VirtioBlk::InitAllMmio(Slots, count);
+        rust_virtio_blk_init_mmio(Slots, count);
         VirtioScsi::InitAllMmio(Slots, count);
         ulong netFrames = Parameters::GetInstance().GetNetFrameCount();
         if (netFrames == 0)

@@ -111,22 +111,6 @@ impl PciTransport {
         }
     }
 
-    /// The MSI-X table, for a driver that takes its interrupts that way.
-    /// None on a legacy device, or where the table could not be set up.
-    pub fn msix(&self) -> Option<&MsixTable> {
-        self.msix.as_ref()
-    }
-
-    /// Say that MSI-X entry `index` serves configuration changes, and start
-    /// telling queues to use their vectors. A driver calls this once it has
-    /// registered its handler.
-    pub fn use_msix(&self, index: u16) {
-        if let Regs::Modern { common, .. } = &self.regs {
-            common.write16(CFG_MSIX_CONFIG, index);
-            self.msix_active.set(true);
-        }
-    }
-
     fn probe_modern(dev: &PciDevice) -> Option<Self> {
         let mut bars = [0u64; MAX_BARS];
         let mut mappings: [Option<PhysMapping>; MAX_BARS] = [None, None, None, None, None, None];
@@ -511,6 +495,19 @@ impl Transport for PciTransport {
 
     fn is_legacy(&self) -> bool {
         matches!(self.regs, Regs::Legacy { .. })
+    }
+
+    fn msix_table(&self) -> Option<&MsixTable> {
+        self.msix.as_ref()
+    }
+
+    fn use_msix(&self, entry: u16) {
+        if let Regs::Modern { common, .. } = &self.regs {
+            /* The vector for configuration changes, and from here on the
+             * queues are told theirs as they are enabled. */
+            common.write16(CFG_MSIX_CONFIG, entry);
+            self.msix_active.set(true);
+        }
     }
 }
 

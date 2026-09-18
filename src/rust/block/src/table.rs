@@ -324,6 +324,22 @@ pub extern "C" fn kernel_blockdev_partitions(handle: usize) -> u32 {
     found
 }
 
+/// Set once interrupts and the scheduler are running (the boot path calls
+/// it). Before that a synchronous I/O has to poll its device: there is
+/// nothing yet to wake a waiter.
+static INTERRUPTS_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_set_interrupts_started() {
+    INTERRUPTS_STARTED.store(true, Ordering::Release);
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_interrupts_started() -> i32 {
+    INTERRUPTS_STARTED.load(Ordering::Acquire) as i32
+}
+
 /* ---- claims ---- */
 
 /// A claim is the slot plus one in its low bits and a count of claims above

@@ -18,7 +18,6 @@ void PitInterruptStub();
 void HpetInterruptStub();
 void IPInterruptStub();
 void LapicTimerInterruptStub();
-void VirtioBlkInterruptStub();
 void VirtioNetInterruptStub();
 void VirtioScsiInterruptStub();
 void SharedInterruptStub();

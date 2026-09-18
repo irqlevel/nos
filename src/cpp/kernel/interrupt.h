@@ -28,7 +28,6 @@ enum InterruptSource : u8
     IrqHpet,
     IrqIO8042,
     IrqSerial,
-    IrqVirtioBlk,
     IrqVirtioNet,
     IrqVirtioScsi,
     IrqIPI,
