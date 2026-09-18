@@ -9,6 +9,7 @@ crate-type = ["staticlib"]
 [dependencies]
 ffi = { path = "../ffi" }
 kcore = { path = "../kcore" }
+block = { path = "../block" }
 hello = { path = "../hello" }
 tls = { path = "../tls" }
 nvme = { path = "../drivers/nvme" }

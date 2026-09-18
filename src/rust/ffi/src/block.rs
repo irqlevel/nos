@@ -32,6 +32,10 @@ pub struct BlockDeviceOps {
     pub submit: Option<extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32>,
     pub kick: Option<extern "C" fn(ctx: *mut u8)>,
     pub ctx: *mut u8,
+    /// The disk this is a partition of, as its handle, or 0 for a whole
+    /// disk. What claims are refused through: one on a disk keeps its
+    /// partitions out, and one on a partition keeps the disk out.
+    pub parent: usize,
 }
 
 extern "C" {
@@ -44,6 +48,20 @@ extern "C" {
     /// The device `disks` lists under this name, or 0. Devices live as long
     /// as the kernel does: there is nothing to release.
     pub fn kernel_blockdev_find(name: *const u8, name_len: usize) -> usize;
+
+    /// How many devices the table holds. It only grows, so an index once
+    /// valid stays valid and names the same device.
+    pub fn kernel_blockdev_count() -> u32;
+
+    /// The index'th device of the table, or 0.
+    pub fn kernel_blockdev_at(index: u32) -> usize;
+
+    /// The device's name into buf, NUL-terminated: the length written, or 0
+    /// if it does not fit.
+    pub fn kernel_blockdev_name(handle: usize, buf: *mut u8, len: usize) -> usize;
+
+    /// The disk a partition is on, or 0 for a whole disk.
+    pub fn kernel_blockdev_parent(handle: usize) -> usize;
 
     /// Its size, in sectors
     pub fn kernel_blockdev_capacity(handle: usize) -> u64;

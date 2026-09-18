@@ -458,6 +458,7 @@ fn init_device(dev: pci::PciDevice) {
         submit:        Some(nvme_submit),
         kick:          Some(nvme_kick),
         ctx:           raw as *mut u8,
+        parent:        0,      /* a whole disk */
     };
 
     match block::register(&ops) {

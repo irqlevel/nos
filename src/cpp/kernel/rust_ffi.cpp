@@ -1450,6 +1450,10 @@ struct RustBlockDeviceOps
     int (*Submit)(void* ctx, const Kernel::AsyncBlockIo* io, int kick);
     void (*Kick)(void* ctx);
     void* Ctx;
+    /* The disk this is a partition of, as a handle (a BlockDevice*), or 0
+       for a whole disk. What BlockDeviceTable::Overlap walks, so a claim on
+       a disk keeps its partitions out and the other way round. */
+    unsigned long Parent;
 };
 
 class RustBlockDevice : public Kernel::BlockDevice
@@ -1460,6 +1464,11 @@ public:
     const char* GetName() override { return Ops.Name; }
     u64 GetCapacity() override { return (u64)Ops.Capacity; }
     u64 GetSectorSize() override { return (u64)Ops.SectorSize; }
+
+    Kernel::BlockDevice* GetParent() override
+    {
+        return reinterpret_cast<Kernel::BlockDevice*>(Ops.Parent);
+    }
 
     bool ReadSectors(u64 sector, void* buf, u32 count) override
     {
@@ -1971,6 +1980,50 @@ unsigned long kernel_blockdev_find(const unsigned char* name, unsigned long name
     Stdlib::MemCpy(key, name, nameLen);
     key[nameLen] = '\0';
     return reinterpret_cast<unsigned long>(Kernel::BlockDeviceTable::GetInstance().Find(key));
+}
+
+unsigned int kernel_blockdev_count()
+{
+    return (unsigned int)Kernel::BlockDeviceTable::GetInstance().GetCount();
+}
+
+/* The index'th device of the table, or 0. The table only grows, so an index
+   once valid stays valid and names the same device. */
+unsigned long kernel_blockdev_at(unsigned int index)
+{
+    return reinterpret_cast<unsigned long>(
+        Kernel::BlockDeviceTable::GetInstance().GetDevice(index));
+}
+
+/* The device's name into buf, NUL-terminated; the length written, or 0 if it
+   does not fit. */
+unsigned long kernel_blockdev_name(unsigned long handle, unsigned char* buf,
+    unsigned long len)
+{
+    if (handle == 0 || buf == nullptr || len == 0)
+        return 0;
+
+    const char* name = reinterpret_cast<Kernel::BlockDevice*>(handle)->GetName();
+    if (name == nullptr)
+        return 0;
+
+    unsigned long n = Stdlib::StrLen(name);
+    if (n >= len)
+        return 0;
+
+    Stdlib::MemCpy(buf, name, n);
+    buf[n] = '\0';
+    return n;
+}
+
+/* The disk a partition is on, or 0 for a whole disk */
+unsigned long kernel_blockdev_parent(unsigned long handle)
+{
+    if (handle == 0)
+        return 0;
+
+    return reinterpret_cast<unsigned long>(
+        reinterpret_cast<Kernel::BlockDevice*>(handle)->GetParent());
 }
 
 unsigned long long kernel_blockdev_capacity(unsigned long handle)

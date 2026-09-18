@@ -49,6 +49,13 @@ boot the kernel headless and assert the serial markers `After test` →
 `Preempt is now on` → `boot: complete`, failing fast on `PANIC:`. Gate on the
 exit code, never on grepping the output.
 
+`./scripts/parttest.py [--arch aarch64|x86_64]` boots with an MBR disk and
+a GPT disk it writes itself -- no partitioning tool, no privileges -- and
+checks what the kernel made of them: the partitions registered and their
+sizes, both tables as `partitions` prints them, that a partition's sector 0
+is its first sector on the disk and that a read past its end is refused, and
+that a filesystem mounted on a partition keeps writers off the disk it is on.
+
 `./scripts/wx-test.sh [--arch x86_64|aarch64]` is the W^X test: one boot per
 probe (`wxprobe=text`, `wxprobe=heap`), each of which has to die on the fault
 it asked for, at the address it printed. A kernel that survives a probe

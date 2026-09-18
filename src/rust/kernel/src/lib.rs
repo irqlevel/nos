@@ -26,6 +26,10 @@ pub extern "C" fn rust_init() {
     /* Nothing to set up -- the TLS client is called from C++ through its
        own symbols, and this is what keeps them in the archive. */
     tls::init();
+    /* The partition table reader: its own entry point is called from the
+       boot path, and this puts its shell command in front of whoever runs
+       one. */
+    block::init();
     nvme::init();
     r8168::init();
     r8125::init();

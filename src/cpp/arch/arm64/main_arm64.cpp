@@ -27,7 +27,6 @@
 #include <kernel/stack_probe.h>
 #include <fs/vfs.h>
 #include <fs/rootfs.h>
-#include <block/partition.h>
 #include <hal/power.h>
 
 #include <drivers/virtio_mmio.h>
@@ -41,6 +40,8 @@
 extern "C" void rust_init();
 extern "C" void rust_test();
 extern "C" void rust_fini();
+/* The partition table reader (src/rust/block), the x86 twin's counterpart */
+extern "C" void rust_partitions_probe();
 namespace Kernel { bool PciEcamSetup(); }
 extern "C" void __cxa_finalize(void*);
 extern "C" char BootStackTop[];
@@ -264,7 +265,7 @@ static void BpStartupArm(void* ctx)
     /* Partitions and the root filesystem: here, not next to the virtio
        bring-up, because a block request completes through the BLK_IO soft
        IRQ, and the NVMe disks came up in rust_init (see kernel/main.cpp) */
-    PartitionDevice::ProbeAll();
+    rust_partitions_probe();
     MountRootFs();
 
     Tcp::GetInstance().Init();

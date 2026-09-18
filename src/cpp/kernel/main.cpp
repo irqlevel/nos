@@ -54,7 +54,6 @@
 #include <drivers/usb/xhci.h>
 
 #include <block/block_device.h>
-#include <block/partition.h>
 #include <net/udp_shell.h>
 #include <net/net_frame_pool.h>
 #include <net/netconsole.h>
@@ -415,6 +414,9 @@ void SomeTaskRoutine(void *ctx)
    scope before those calls, so the body is wrapped in a block. */
 extern "C" void rust_init();
 extern "C" void rust_test();
+/* The partition table reader (src/rust/block): registers a block device for
+   every partition of every disk the kernel has not looked at yet. */
+extern "C" void rust_partitions_probe();
 
 void BpStartup(void* ctx)
 {
@@ -466,7 +468,7 @@ void BpStartup(void* ctx)
 
         VirtioBlk::InitAll();
         VirtioScsi::InitAll();
-        PartitionDevice::ProbeAll();
+        rust_partitions_probe();
 
         /* Before any driver can want a frame: the pool is what keeps the
            datapath clear of the allocator, and of the TLB shootdown that
@@ -611,7 +613,7 @@ void BpStartup(void* ctx)
            the same reason the log area is: until the soft IRQ layer exists a
            block read returns without having read anything, so a probe there
            would find no partitions and cache that as the answer. */
-        PartitionDevice::ProbeNew();
+        rust_partitions_probe();
 
         /* The root filesystem may well be on one of those disks */
         MountRootFs();
