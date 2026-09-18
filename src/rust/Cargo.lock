@@ -424,6 +424,7 @@ dependencies = [
  "r8168",
  "sha2",
  "tls",
+ "virtio-blk",
  "virtio-rng",
 ]
 
@@ -1062,6 +1063,14 @@ name = "virtio"
 version = "0.1.0"
 dependencies = [
  "kcore",
+]
+
+[[package]]
+name = "virtio-blk"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "virtio",
 ]
 
 [[package]]

@@ -32,6 +32,7 @@ pub extern "C" fn rust_init() {
     block::init();
     nvme::init();
     virtio_rng::init();
+    virtio_blk::init();
     r8168::init();
     r8125::init();
     igb::init();

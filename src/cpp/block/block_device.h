@@ -120,7 +120,6 @@ private:
     friend class BlockDeviceTable;
 
     ulong Handle;
-    static bool InterruptsStarted;
 };
 
 /* The kernel's block devices. The table itself is in Rust (src/rust/block):

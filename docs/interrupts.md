@@ -45,7 +45,7 @@ are (`hal/irqchip.h`: `IrqEoi`, `SendIpi`, `GetCurrentCpuHwId`,
 |---|---|
 | `0x00`–`0x15` | CPU exceptions, registered by `ExceptionTable`. All of them panic with a register dump and a backtrace, except NMI |
 | `0x20`, `0x21`, `0x24` | Tick (PIT or HPET), 8042 keyboard, serial |
-| `0x25+`, `0x30+`, `0x35+` | virtio-blk, virtio-net, virtio-scsi INTx lines, one per instance — used only when the device has no MSI-X |
+| `0x30+`, `0x35+` | virtio-net, virtio-scsi INTx lines, one per instance — used only when the device has no MSI-X. virtio-blk, being a Rust driver now, takes one of the shared Rust slots below |
 | `0x38`–`0x3F` | Legacy INTx lines requested by Rust drivers (8 slots) |
 | `0x40`–`0xEF` | MSI-X vectors, handed out in order by `MsixTable::AllocVector` |
 | `0xFD` | Local APIC timer — this CPU's tick |
@@ -225,7 +225,7 @@ disk-log setup happen after it rather than next to the driver init.
 ## Counters
 
 `irqstat` prints one counter per source: `pit`, `hpet`, `8042`, `serial`,
-`virtio-blk`, `virtio-net`, `virtio-scsi`, `ipi`, `lapic-timer`, `shared`,
+`virtio-net`, `virtio-scsi`, `ipi`, `lapic-timer`, `shared`,
 `msix`, `dummy`, `spurious`. The `msix` and `shared` rows are what answer
 "has this card stopped interrupting, or has it stopped receiving?" — a
 question that was unanswerable on a running machine until they were counted,

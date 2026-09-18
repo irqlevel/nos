@@ -99,6 +99,13 @@ pub struct Disk {
     handle: usize,
 }
 
+/// Whether a driver may block waiting for a completion: false early in
+/// boot, before interrupts and the scheduler are running, when a
+/// synchronous I/O has to poll its device instead.
+pub fn interrupts_started() -> bool {
+    unsafe { block::kernel_blockdev_interrupts_started() != 0 }
+}
+
 /// How many block devices the kernel's table holds. The table only grows,
 /// so an index once valid stays valid and names the same device.
 pub fn count() -> u32 {

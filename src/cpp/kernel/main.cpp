@@ -47,7 +47,6 @@
 #include <arch/x86_64/lapic.h>
 #include <arch/x86_64/ioapic.h>
 #include <drivers/pci.h>
-#include <drivers/virtio_blk.h>
 #include <drivers/virtio_scsi.h>
 #include <drivers/virtio_net.h>
 #include <drivers/usb/xhci.h>
@@ -416,6 +415,9 @@ extern "C" void rust_test();
 /* The partition table reader (src/rust/block): registers a block device for
    every partition of every disk the kernel has not looked at yet. */
 extern "C" void rust_partitions_probe();
+/* The virtio-blk driver (src/rust/drivers/virtio_blk): the disks come up
+   here, before the partitions on them are looked at. */
+extern "C" void rust_virtio_blk_init();
 
 void BpStartup(void* ctx)
 {
@@ -465,7 +467,7 @@ void BpStartup(void* ctx)
         Interrupt::Register(kbd, acpi.GetGsiByIrq(0x1), 0x21);
         Interrupt::Register(serial, acpi.GetGsiByIrq(0x4), 0x24);
 
-        VirtioBlk::InitAll();
+        rust_virtio_blk_init();
         VirtioScsi::InitAll();
         rust_partitions_probe();
 

@@ -25,22 +25,25 @@ void kernel_blockdev_kick(unsigned long handle);
 unsigned long kernel_blockdev_claim_as(unsigned long handle, const char* holder,
     const char** heldBy);
 void kernel_blockdev_release(unsigned long claim);
+int kernel_blockdev_interrupts_started();
+void kernel_blockdev_set_interrupts_started();
 
 }
 
 namespace Kernel
 {
 
-bool BlockDevice::InterruptsStarted = false;
-
+/* The flag itself lives with the rest of the layer, in Rust: the drivers
+   that read it are moving there, and the two that have not yet ask through
+   these. */
 void BlockDevice::SetInterruptsStarted()
 {
-    InterruptsStarted = true;
+    kernel_blockdev_set_interrupts_started();
 }
 
 bool BlockDevice::GetInterruptsStarted()
 {
-    return InterruptsStarted;
+    return kernel_blockdev_interrupts_started() != 0;
 }
 
 const char* BlockDevice::GetName()

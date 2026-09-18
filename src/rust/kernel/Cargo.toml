@@ -14,6 +14,7 @@ hello = { path = "../hello" }
 tls = { path = "../tls" }
 nvme = { path = "../drivers/nvme" }
 virtio-rng = { path = "../drivers/virtio_rng" }
+virtio-blk = { path = "../drivers/virtio_blk" }
 r8168 = { path = "../drivers/r8168" }
 r8125 = { path = "../drivers/r8125" }
 igb = { path = "../drivers/igb" }

@@ -68,6 +68,11 @@ extern "C" {
     /// The disk a partition is on, or 0 for a whole disk.
     pub fn kernel_blockdev_parent(handle: usize) -> usize;
 
+    /// 1 once interrupts and the scheduler are running, which is when a
+    /// driver may wait for a completion instead of polling for it.
+    pub fn kernel_blockdev_interrupts_started() -> i32;
+    pub fn kernel_blockdev_set_interrupts_started();
+
     /// Its size, in sectors
     pub fn kernel_blockdev_capacity(handle: usize) -> u64;
 
