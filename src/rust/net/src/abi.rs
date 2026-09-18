@@ -50,6 +50,13 @@ fn once<T>(slot: &AtomicPtr<T>, make: impl FnOnce() -> Option<Box<T>>) -> Option
     }
 }
 
+/// The one load target. A static rather than something made on first use:
+/// its per-CPU counters are its bulk, and it is reached from the receive
+/// path, where a pointer chase is the kind of thing it exists to measure.
+pub(crate) fn net_load() -> &'static NetLoad {
+    &NET_LOAD
+}
+
 pub(crate) fn arp_table() -> Option<&'static ArpTable> {
     match once(&ARP, || ArpTable::new().map(Box::new)) {
         Some(arp) => Some(arp),

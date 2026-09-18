@@ -427,3 +427,13 @@ pub fn rx_poll_stats() -> (usize, usize, usize) {
     unsafe { net::kernel_net_rx_poll_stats(&mut polls, &mut work, &mut stalls) };
     (polls, work, stalls)
 }
+
+/// `dhcp=off`: the kernel was told not to run a DHCP client.
+pub fn dhcp_off() -> bool {
+    unsafe { net::kernel_param_dhcp_off() != 0 }
+}
+
+/// `dns=on`: a lease's DNS server is worth starting a resolver on.
+pub fn dns_on() -> bool {
+    unsafe { net::kernel_param_dns_on() != 0 }
+}

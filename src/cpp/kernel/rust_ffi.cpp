@@ -1758,6 +1758,18 @@ int kernel_panic_active()
     return Kernel::Panicker::GetInstance().IsActive() ? 1 : 0;
 }
 
+/* dhcp=off: the shell's `dhcp` says so rather than running one. */
+int kernel_param_dhcp_off()
+{
+    return Kernel::Parameters::GetInstance().IsDhcpOff() ? 1 : 0;
+}
+
+/* dns=on: a lease's DNS server is worth starting a resolver on. */
+int kernel_param_dns_on()
+{
+    return Kernel::Parameters::GetInstance().IsDnsEnabled() ? 1 : 0;
+}
+
 /* Whether the kernel log is to be written to a prepared disk area: 1 for
    disklog=on, 0 without it, and -1 before the command line has been read at
    all -- when nobody knows yet, and every line is kept because the first

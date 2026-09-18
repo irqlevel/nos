@@ -650,7 +650,7 @@ impl Device {
 
 impl Device {
     /// This device as the handle every consumer-side call takes.
-    fn as_nic(&'static self) -> kcore::net::Nic {
+    pub(crate) fn as_nic(&'static self) -> kcore::net::Nic {
         unsafe { kcore::net::Nic::from_handle(self as *const Device as usize) }
             .unwrap_or_else(|| unreachable!())
     }
