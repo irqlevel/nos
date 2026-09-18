@@ -15,3 +15,17 @@ extern "C" {
     /// Makes a directory; 0 also when there is one by that name already.
     pub fn kernel_dir_create(path: *const u8, path_len: usize) -> i32;
 }
+
+/* What procfs puts in its files. Each writes into the buffer given and
+   answers how many bytes it wrote. */
+extern "C" {
+    /// "nos <version> (<git rev>)".
+    pub fn kernel_version_string(buf: *mut u8, len: usize) -> usize;
+    /// The command line the kernel was booted with.
+    pub fn kernel_cmdline_string(buf: *mut u8, len: usize) -> usize;
+    /// How many interrupt sources there are to ask about.
+    pub fn kernel_interrupt_source_count() -> usize;
+    /// What the index'th source is called, into `name`, and what it has
+    /// counted; -1 past the end.
+    pub fn kernel_interrupt_source(index: usize, name: *mut u8, name_len: usize) -> isize;
+}

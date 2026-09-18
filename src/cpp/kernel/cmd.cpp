@@ -1655,20 +1655,10 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
         char path[Vfs::MaxPath];
         Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
 
-        RamFs* fs = new (Mm::NoThrow) RamFs();
-        if (fs == nullptr)
-        {
-            con.Printf("failed to allocate ramfs\n");
-        }
-        else if (!Vfs::GetInstance().Mount(path, fs))
-        {
-            delete fs;
-            con.Printf("mount failed\n");
-        }
-        else
-        {
+        if (RamFsMount(path))
             con.Printf("mounted ramfs on %s\n", path);
-        }
+        else
+            con.Printf("mount failed\n");
     }
     else if (Stdlib::StrCmp(fsName, "nanofs") == 0)
     {

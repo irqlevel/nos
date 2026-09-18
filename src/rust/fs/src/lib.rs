@@ -11,6 +11,8 @@
 extern crate alloc;
 
 pub mod ext2;
+pub mod procfs;
+pub mod ramfs;
 pub mod vfs;
 pub mod vnode;
 
