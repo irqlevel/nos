@@ -73,3 +73,9 @@ jobs:
       - name: TCP test (TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/tcp-test.py --tcg
+
+      # The load target answers from inside the receive path, and is the one
+      # thing here that would notice a frame pool that was never built.
+      - name: netload test (TCG)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/netload-test.py --tcg
