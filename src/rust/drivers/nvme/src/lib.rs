@@ -51,7 +51,7 @@ struct NvmeDevice {
     io_sq:     Queue,
     io_cq:     Queue,
 
-    io_lock: sync::SpinLock,
+    io_lock: sync::SpinLock<()>,
 
     _msix_table: msix::MsixTable,
     _msix_irq:   msix::MsixInterrupt,
@@ -324,7 +324,7 @@ fn init_device(dev: pci::PciDevice) {
         None => { trace!(0, "NVMe: I/O CQ alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
 
-    let io_lock = match sync::SpinLock::new() {
+    let io_lock = match sync::SpinLock::new(()) {
         Some(l) => l,
         None => { trace!(0, "NVMe: spinlock alloc failed"); disable_controller_on_error(&regs, to_ms); return; }
     };
@@ -916,7 +916,7 @@ const CID_WAIT_TRIES: u32 = 20_000;
  * -- several tasks' I/O together, a load test's -- is no reason to fail a
  * synchronous read or write: one comes back with the next completion, so
  * wait for it. None only once CID_WAIT_TRIES have gone by. */
-fn lock_with_cid<'a>(dev: *mut NvmeDevice) -> Option<(sync::SpinLockGuard<'a>, u16)> {
+fn lock_with_cid<'a>(dev: *mut NvmeDevice) -> Option<(sync::SpinLockGuard<'a, ()>, u16)> {
     for _ in 0..CID_WAIT_TRIES {
         let guard = unsafe { (*dev).io_lock.lock() };
         if let Some(cid) = alloc_cid(dev) {

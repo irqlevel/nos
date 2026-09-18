@@ -2591,21 +2591,6 @@ fn ops_for(fs: *mut Ext2) -> FsOps {
 
 /* ---- what the kernel calls ---- */
 
-/// Mount the device's ext2 at `path`: 0 mounted for writing, 1 mounted
-/// read-only -- asked for, or all the image allows -- and -1 not mounted.
-///
-/// # Safety
-/// `path` points at `path_len` readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn rust_ext2_mount(
-    path: *const u8, path_len: usize, device: usize, read_only: i32,
-) -> i32 {
-    match unsafe { crate::path(path, path_len) } {
-        Some(at) => mount_bytes(at, device, read_only != 0),
-        None => -1,
-    }
-}
-
 /// Mount the device's ext2 at `path`: 0 mounted for writing, 1 read-only --
 /// asked for, or all the image allows -- and -1 not mounted.
 pub fn mount_at(path: &str, device: usize, read_only: bool) -> i32 {

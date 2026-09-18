@@ -5,8 +5,6 @@
 //! than let it reach into state the task is mutating, the task publishes what
 //! the command needs here, under a lock of its own. Nothing else is shared.
 
-use core::cell::UnsafeCell;
-
 use kcore::sync::IrqSpinLock;
 
 use crate::controller::{MAX_CONTROLLERS, MAX_DEVICES, MAX_PORTS};
@@ -69,36 +67,20 @@ impl Shared {
     }
 }
 
-struct Cell {
-    lock: IrqSpinLock,
-    inner: UnsafeCell<Shared>,
-}
-
 /* One task writes, one reads, and the lock is what stands between them. */
-unsafe impl Sync for Cell {}
-
-static SHARED: [Cell; MAX_CONTROLLERS] =
-    [const { Cell { lock: IrqSpinLock::new(), inner: UnsafeCell::new(Shared::new()) } };
-        MAX_CONTROLLERS];
+static SHARED: [IrqSpinLock<Shared>; MAX_CONTROLLERS] =
+    [const { IrqSpinLock::new(Shared::new()) }; MAX_CONTROLLERS];
 
 /// Change what the shell will see of controller `index`.
 pub fn update(index: usize, edit: impl FnOnce(&mut Shared)) {
-    if index >= MAX_CONTROLLERS {
-        return;
+    if let Some(shared) = SHARED.get(index) {
+        edit(&mut shared.lock());
     }
-    let cell = &SHARED[index];
-    let _guard = cell.lock.lock();
-    edit(unsafe { &mut *cell.inner.get() });
 }
 
 /// A copy of it, for printing without holding the lock while the console
 /// takes its time.
 pub fn snapshot(index: usize) -> Option<Shared> {
-    if index >= MAX_CONTROLLERS {
-        return None;
-    }
-    let cell = &SHARED[index];
-    let _guard = cell.lock.lock();
-    let shared = unsafe { *cell.inner.get() };
+    let shared = *SHARED.get(index)?.lock();
     if shared.live { Some(shared) } else { None }
 }

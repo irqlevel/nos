@@ -10,17 +10,17 @@
 //! hold that handle and nothing else.
 //!
 //! The table only grows: nothing unregisters, which is what makes a lookup
-//! lock-free -- a slot is written once, with a release, and read with an
-//! acquire. The claims are the one part that needs a lock, and take the
-//! kernel's spinlock through `kcore`.
+//! lock-free -- a slot is filled once and only read after. The claims are the
+//! one part that needs a lock, and sit inside the kernel's spinlock.
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
+use core::ffi::CStr;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ffi::block::{BlockDeviceOps, BlockIo};
 use kcore::cmd::Output;
+use kcore::once::{Once, OnceBox};
 use kcore::sync::SpinLock;
 use kcore::trace;
 
@@ -31,47 +31,47 @@ pub const MAX_DEVICES: usize = 48;
 const SUBMIT_INVALID: i32 = 2;
 const SUBMIT_UNSUPPORTED: i32 = 3;
 
-/// A registered device: the ops table it gave, kept for the life of the
+/// A registered device: what its ops table said, kept for the life of the
 /// kernel because nothing takes a device back.
+///
+/// The name is a copy, and the driver's context is kept as the word it is to
+/// this layer -- handed back on every call and never looked into. So a
+/// device is plain data and a few functions, and may be shared between CPUs
+/// without anyone having to promise anything.
 struct Device {
-    ops: BlockDeviceOps,
+    /// With its NUL, which is how `kernel_blockdev_name` hands it out
+    name: Box<CStr>,
+    capacity: u64,
+    sector_size: u64,
+    read_sectors: extern "C" fn(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32) -> i32,
+    write_sectors: extern "C" fn(
+        ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
+    ) -> i32,
+    flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
+    /// The asynchronous path, both halves or neither
+    submit: Option<(
+        extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32,
+        extern "C" fn(ctx: *mut u8),
+    )>,
+    ctx: usize,
+    parent: usize,
 }
 
-/* The ops are only read after registration, and every pointer in them is the
- * registrant's to keep valid -- which is the contract of registering. */
-unsafe impl Sync for Device {}
-unsafe impl Send for Device {}
+impl Device {
+    fn name(&self) -> &[u8] {
+        self.name.to_bytes()
+    }
 
-static DEVICES: [AtomicPtr<Device>; MAX_DEVICES] = {
-    const NULL: AtomicPtr<Device> = AtomicPtr::new(core::ptr::null_mut());
-    [NULL; MAX_DEVICES]
-};
+    fn ctx(&self) -> *mut u8 {
+        self.ctx as *mut u8
+    }
+}
+
+static DEVICES: [OnceBox<Device>; MAX_DEVICES] = [const { OnceBox::new() }; MAX_DEVICES];
 static COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn device(handle: usize) -> Option<&'static Device> {
-    if handle == 0 || handle > MAX_DEVICES {
-        return None;
-    }
-
-    let ptr = DEVICES[handle - 1].load(Ordering::Acquire);
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { &*ptr })
-    }
-}
-
-fn name_of(dev: &Device) -> &'static [u8] {
-    if dev.ops.name.is_null() {
-        return b"";
-    }
-
-    /* The name is the registrant's, NUL-terminated and kept for good. */
-    let mut len = 0;
-    while unsafe { *dev.ops.name.add(len) } != 0 {
-        len += 1;
-    }
-    unsafe { core::slice::from_raw_parts(dev.ops.name, len) }
+    DEVICES.get(handle.checked_sub(1)?)?.get()
 }
 
 /// Take the next free slot, or None when the table is full.
@@ -90,29 +90,35 @@ fn reserve() -> Option<usize> {
     }
 }
 
-/// Register a device. The ops are copied; everything they point at -- the
-/// name, the context -- stays the registrant's, and has to outlive the
-/// kernel's use of it, which is to say the kernel.
+/// Register a device. The ops are copied, and so is the name; the context
+/// stays the registrant's, and has to outlive the kernel's use of it, which
+/// is to say the kernel.
 ///
 /// # Safety
-/// `ops` points at a valid BlockDeviceOps for the duration of the call.
+/// `ops` points at a valid BlockDeviceOps for the duration of the call, and
+/// its name is NUL-terminated.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_blockdev_register(ops: *const BlockDeviceOps) -> usize {
-    if ops.is_null() {
-        return 0;
-    }
+    let ops = match unsafe { ops.as_ref() } {
+        Some(ops) => ops,
+        None => return 0,
+    };
 
-    let ops = unsafe { core::ptr::read(ops) };
-    if ops.name.is_null() || ops.read_sectors.is_none() || ops.write_sectors.is_none() {
-        return 0;
-    }
+    let (read_sectors, write_sectors) = match (ops.read_sectors, ops.write_sectors) {
+        (Some(read), Some(write)) if !ops.name.is_null() => (read, write),
+        _ => return 0,
+    };
 
     /* The asynchronous path is both or neither: a submit that may leave its
      * doorbell owed, with no kick to ring it, would queue commands that never
      * reach the device. */
-    if ops.submit.is_none() != ops.kick.is_none() {
-        return 0;
-    }
+    let submit = match (ops.submit, ops.kick) {
+        (Some(submit), Some(kick)) => Some((submit, kick)),
+        (None, None) => None,
+        _ => return 0,
+    };
+
+    let name: Box<CStr> = unsafe { CStr::from_ptr(ops.name.cast()) }.into();
 
     let slot = match reserve() {
         Some(slot) => slot,
@@ -122,13 +128,22 @@ pub unsafe extern "C" fn kernel_blockdev_register(ops: *const BlockDeviceOps) ->
         }
     };
 
-    let dev = Box::into_raw(Box::new(Device { ops }));
-    DEVICES[slot].store(dev, Ordering::Release);
+    let made = DEVICES[slot].get_or_try_init(|| Some(Box::new(Device {
+        name,
+        capacity: ops.capacity,
+        sector_size: ops.sector_size,
+        read_sectors,
+        write_sectors,
+        flush: ops.flush,
+        submit,
+        ctx: ops.ctx as usize,
+        parent: ops.parent,
+    })));
 
-    let dev = unsafe { &*dev };
-    trace!(0, "block: {} registered, {} sectors of {} bytes",
-        core::str::from_utf8(name_of(dev)).unwrap_or("?"),
-        dev.ops.capacity, dev.ops.sector_size);
+    if let Some(dev) = made {
+        trace!(0, "block: {} registered, {} sectors of {} bytes",
+            core::str::from_utf8(dev.name()).unwrap_or("?"), dev.capacity, dev.sector_size);
+    }
 
     slot + 1
 }
@@ -145,10 +160,9 @@ pub extern "C" fn kernel_blockdev_count() -> u32 {
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_at(index: u32) -> usize {
     let index = index as usize;
-    if index >= MAX_DEVICES || DEVICES[index].load(Ordering::Acquire).is_null() {
-        0
-    } else {
-        index + 1
+    match DEVICES.get(index) {
+        Some(slot) if slot.get().is_some() => index + 1,
+        _ => 0,
     }
 }
 
@@ -164,23 +178,13 @@ pub unsafe extern "C" fn kernel_blockdev_find(name: *const u8, name_len: usize) 
 
     let wanted = unsafe { core::slice::from_raw_parts(name, name_len) };
     for index in 0..kernel_blockdev_count() {
-        let handle = kernel_blockdev_at(index) ;
+        let handle = kernel_blockdev_at(index);
         match device(handle) {
-            Some(dev) if name_of(dev) == wanted => return handle,
+            Some(dev) if dev.name() == wanted => return handle,
             _ => continue,
         }
     }
     0
-}
-
-/// The device's name, NUL-terminated and the registrant's to keep. Null for
-/// a handle that names nothing.
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_name_ptr(handle: usize) -> *const u8 {
-    match device(handle) {
-        Some(dev) => dev.ops.name,
-        None => core::ptr::null(),
-    }
 }
 
 /// The device's name into buf, NUL-terminated: the length written, or 0 if
@@ -195,32 +199,29 @@ pub unsafe extern "C" fn kernel_blockdev_name(handle: usize, buf: *mut u8, len: 
         None => return 0,
     };
 
-    let name = name_of(dev);
-    if buf.is_null() || name.len() + 1 > len {
+    let name = dev.name.to_bytes_with_nul();
+    if buf.is_null() || name.len() > len {
         return 0;
     }
 
-    unsafe {
-        core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len());
-        *buf.add(name.len()) = 0;
-    }
-    name.len()
+    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len()) };
+    name.len() - 1
 }
 
 /// The disk a partition is on, or 0 for a whole disk.
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_parent(handle: usize) -> usize {
-    device(handle).map_or(0, |dev| dev.ops.parent)
+    device(handle).map_or(0, |dev| dev.parent)
 }
 
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_capacity(handle: usize) -> u64 {
-    device(handle).map_or(0, |dev| dev.ops.capacity)
+    device(handle).map_or(0, |dev| dev.capacity)
 }
 
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_sector_size(handle: usize) -> u64 {
-    device(handle).map_or(0, |dev| dev.ops.sector_size)
+    device(handle).map_or(0, |dev| dev.sector_size)
 }
 
 /// Synchronous read, count in sectors: 0 once the data is in buf.
@@ -232,10 +233,7 @@ pub unsafe extern "C" fn kernel_blockdev_read(
     handle: usize, sector: u64, buf: *mut u8, count: u32,
 ) -> i32 {
     match device(handle) {
-        Some(dev) => match dev.ops.read_sectors {
-            Some(read) => read(dev.ops.ctx, sector, buf, count),
-            None => -1,
-        },
+        Some(dev) => (dev.read_sectors)(dev.ctx(), sector, buf, count),
         None => -1,
     }
 }
@@ -249,10 +247,7 @@ pub unsafe extern "C" fn kernel_blockdev_write(
     handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
 ) -> i32 {
     match device(handle) {
-        Some(dev) => match dev.ops.write_sectors {
-            Some(write) => write(dev.ops.ctx, sector, buf, count, fua),
-            None => -1,
-        },
+        Some(dev) => (dev.write_sectors)(dev.ctx(), sector, buf, count, fua),
         None => -1,
     }
 }
@@ -261,7 +256,7 @@ pub unsafe extern "C" fn kernel_blockdev_write(
 pub extern "C" fn kernel_blockdev_flush(handle: usize) -> i32 {
     match device(handle) {
         /* A device with no write cache to push has nothing to do here. */
-        Some(dev) => dev.ops.flush.map_or(0, |flush| flush(dev.ops.ctx)),
+        Some(dev) => dev.flush.map_or(0, |flush| flush(dev.ctx())),
         None => -1,
     }
 }
@@ -270,7 +265,7 @@ pub extern "C" fn kernel_blockdev_flush(handle: usize) -> i32 {
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_can_submit(handle: usize) -> i32 {
     match device(handle) {
-        Some(dev) => dev.ops.submit.is_some() as i32,
+        Some(dev) => dev.submit.is_some() as i32,
         None => 0,
     }
 }
@@ -290,8 +285,8 @@ pub unsafe extern "C" fn kernel_blockdev_submit(
     }
 
     match device(handle) {
-        Some(dev) => match dev.ops.submit {
-            Some(submit) => submit(dev.ops.ctx, io, kick),
+        Some(dev) => match dev.submit {
+            Some((submit, _)) => submit(dev.ctx(), io, kick),
             None => SUBMIT_UNSUPPORTED,
         },
         None => SUBMIT_INVALID,
@@ -302,8 +297,8 @@ pub unsafe extern "C" fn kernel_blockdev_submit(
 #[no_mangle]
 pub extern "C" fn kernel_blockdev_kick(handle: usize) {
     if let Some(dev) = device(handle) {
-        if let Some(kick) = dev.ops.kick {
-            kick(dev.ops.ctx);
+        if let Some((_, kick)) = dev.submit {
+            kick(dev.ctx());
         }
     }
 }
@@ -352,50 +347,40 @@ const _: () = assert!(MAX_DEVICES < (1 << SLOT_BITS), "a slot must fit a claim")
 #[derive(Clone, Copy)]
 struct ClaimEntry {
     device: usize,
-    /// NUL-terminated, the claimant's to keep, and only read while the claim
-    /// stands
-    holder: *const u8,
+    /// Where the claimant's name is: NUL-terminated, the claimant's to keep,
+    /// and only ever handed back -- to whoever is refused because of this
+    /// claim -- never read here.
+    holder: usize,
     /// 0: the slot is free
     claim: usize,
 }
 
-struct ClaimTable {
-    lock: SpinLock,
-    entries: UnsafeCell<[ClaimEntry; MAX_DEVICES]>,
-    generation: UnsafeCell<usize>,
+const NO_CLAIM: ClaimEntry = ClaimEntry { device: 0, holder: 0, claim: 0 };
+
+struct Claims {
+    entries: [ClaimEntry; MAX_DEVICES],
+    generation: usize,
 }
 
-/* Everything inside is touched with the lock held. */
-unsafe impl Sync for ClaimTable {}
-unsafe impl Send for ClaimTable {}
+static CLAIMS: Once<SpinLock<Claims>> = Once::new();
 
-static CLAIMS: AtomicPtr<ClaimTable> = AtomicPtr::new(core::ptr::null_mut());
-
-const TOO_MANY: &[u8] = b"too many claims already\0";
-const NOT_READY: &[u8] = b"the block layer, still starting up\0";
-const NO_DEVICE: &[u8] = b"nothing -- there is no such device\0";
-const MODULE_HOLDER: &[u8] = b"a module writing to it\0";
+const TOO_MANY: &CStr = c"too many claims already";
+const NOT_READY: &CStr = c"the block layer, still starting up";
+const NO_DEVICE: &CStr = c"nothing -- there is no such device";
+const MODULE_HOLDER: &CStr = c"a module writing to it";
 
 /// Called once, from `block::init`, before anything can claim: the table
 /// needs the kernel's spinlock, which is a handle and cannot be a static.
 pub fn claims_setup() -> bool {
-    if !CLAIMS.load(Ordering::Acquire).is_null() {
+    if CLAIMS.get().is_some() {
         return true;
     }
 
-    let lock = match SpinLock::new() {
-        Some(lock) => lock,
-        None => return false,
-    };
-
-    let table = Box::into_raw(Box::new(ClaimTable {
-        lock,
-        entries: UnsafeCell::new([ClaimEntry { device: 0, holder: core::ptr::null(), claim: 0 };
-            MAX_DEVICES]),
-        generation: UnsafeCell::new(0),
-    }));
-    CLAIMS.store(table, Ordering::Release);
-    true
+    match SpinLock::new(Claims { entries: [NO_CLAIM; MAX_DEVICES], generation: 0 }) {
+        /* Lost to another setup: there is a table, which is what was asked. */
+        Some(claims) => { let _ = CLAIMS.set(claims); true }
+        None => false,
+    }
 }
 
 /// Whether writing to one device can touch the other: the same device, or a
@@ -420,6 +405,36 @@ fn overlap(a: usize, b: usize) -> bool {
     false
 }
 
+/// The claim, or where the name of whoever stands in its way is.
+fn claim(handle: usize, holder: usize) -> Result<usize, usize> {
+    if handle == 0 || holder == 0 {
+        return Err(NO_DEVICE.as_ptr() as usize);
+    }
+
+    let mut claims = match CLAIMS.get() {
+        Some(claims) => claims.lock(),
+        None => return Err(NOT_READY.as_ptr() as usize),
+    };
+
+    let mut free = None;
+    for (slot, entry) in claims.entries.iter().enumerate() {
+        if entry.claim == 0 {
+            if free.is_none() {
+                free = Some(slot);
+            }
+        } else if overlap(entry.device, handle) {
+            return Err(entry.holder);
+        }
+    }
+
+    let slot = free.ok_or(TOO_MANY.as_ptr() as usize)?;
+
+    claims.generation += 1;
+    let claim = (claims.generation << SLOT_BITS) | (slot + 1);
+    claims.entries[slot] = ClaimEntry { device: handle, holder, claim };
+    Ok(claim)
+}
+
 /// Claim a device against mounts, the disk log and other writers. Returns the
 /// claim for `kernel_blockdev_release`, or 0 with `held_by` set to who holds
 /// an overlapping one -- a NUL-terminated name the kernel keeps.
@@ -431,52 +446,15 @@ fn overlap(a: usize, b: usize) -> bool {
 pub unsafe extern "C" fn kernel_blockdev_claim_as(
     handle: usize, holder: *const u8, held_by: *mut *const u8,
 ) -> usize {
-    let refuse = |why: &'static [u8]| -> usize {
-        if !held_by.is_null() {
-            unsafe { *held_by = why.as_ptr() };
-        }
-        0
-    };
-
-    if handle == 0 || holder.is_null() {
-        return refuse(NO_DEVICE);
-    }
-
-    let table = CLAIMS.load(Ordering::Acquire);
-    if table.is_null() {
-        return refuse(NOT_READY);
-    }
-    let table = unsafe { &*table };
-
-    let _guard = table.lock.lock();
-    let entries = unsafe { &mut *table.entries.get() };
-
-    let mut free = None;
-    for (slot, entry) in entries.iter().enumerate() {
-        if entry.claim == 0 {
-            if free.is_none() {
-                free = Some(slot);
+    match claim(handle, holder as usize) {
+        Ok(claim) => claim,
+        Err(in_the_way) => {
+            if let Some(held_by) = unsafe { held_by.as_mut() } {
+                *held_by = in_the_way as *const u8;
             }
-        } else if overlap(entry.device, handle) {
-            let held = entry.holder;
-            if !held_by.is_null() {
-                unsafe { *held_by = held };
-            }
-            return 0;
+            0
         }
     }
-
-    let slot = match free {
-        Some(slot) => slot,
-        None => return refuse(TOO_MANY),
-    };
-
-    let generation = unsafe { &mut *table.generation.get() };
-    *generation += 1;
-
-    let claim = (*generation << SLOT_BITS) | (slot + 1);
-    entries[slot] = ClaimEntry { device: handle, holder, claim };
-    claim
 }
 
 /// The claim a module takes when it writes to a device of its own accord.
@@ -485,7 +463,7 @@ pub unsafe extern "C" fn kernel_blockdev_claim_as(
 /// `held_by`, if given, is writable.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_blockdev_claim(handle: usize, held_by: *mut *const u8) -> usize {
-    unsafe { kernel_blockdev_claim_as(handle, MODULE_HOLDER.as_ptr(), held_by) }
+    unsafe { kernel_blockdev_claim_as(handle, MODULE_HOLDER.as_ptr().cast(), held_by) }
 }
 
 /// Give a claim back. A claim that is not the one the slot holds -- a stale
@@ -497,16 +475,11 @@ pub extern "C" fn kernel_blockdev_release(claim: usize) {
         return;
     }
 
-    let table = CLAIMS.load(Ordering::Acquire);
-    if table.is_null() {
-        return;
-    }
-    let table = unsafe { &*table };
-
-    let _guard = table.lock.lock();
-    let entries = unsafe { &mut *table.entries.get() };
-    if entries[slot - 1].claim == claim {
-        entries[slot - 1] = ClaimEntry { device: 0, holder: core::ptr::null(), claim: 0 };
+    if let Some(claims) = CLAIMS.get() {
+        let mut claims = claims.lock();
+        if claims.entries[slot - 1].claim == claim {
+            claims.entries[slot - 1] = NO_CLAIM;
+        }
     }
 }
 
@@ -526,9 +499,9 @@ pub fn dump(_args: &str, out: &mut Output) {
             None => continue,
         };
 
-        let bytes = dev.ops.capacity.saturating_mul(dev.ops.sector_size);
+        let bytes = dev.capacity.saturating_mul(dev.sector_size);
         let _ = writeln!(out, "{}  {} sectors ({} MB)  {} bytes/sector",
-            core::str::from_utf8(name_of(dev)).unwrap_or("?"),
-            dev.ops.capacity, bytes / (1024 * 1024), dev.ops.sector_size);
+            core::str::from_utf8(dev.name()).unwrap_or("?"),
+            dev.capacity, bytes / (1024 * 1024), dev.sector_size);
     }
 }

@@ -15,7 +15,7 @@ use crate::files::{self, Buffer};
 use crate::paths::{base_name, is_under, Path};
 use crate::vfs::{FileStat, DirEntry, OPEN_APPEND, OPEN_CREATE, OPEN_READ, OPEN_TRUNCATE,
                  OPEN_WRITE};
-use crate::vnode::{NAME_MAX, TYPE_DIR, TYPE_FILE};
+use crate::vnode::{NAME_MAX, TYPE_DIR};
 use crate::{ext2, nanofs, ramfs, vfs_instance};
 
 /// What `format`'s claim on its device says to whoever is refused it.

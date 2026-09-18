@@ -1480,21 +1480,6 @@ fn ops_for(fs: *mut NanoFs) -> FsOps {
 
 /* ---- what the kernel calls ---- */
 
-/// Mount the device's nanofs at `path`: 0 mounted for writing, 1 mounted
-/// read-only, -1 not mounted.
-///
-/// # Safety
-/// `path` points at `path_len` readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn rust_nanofs_mount(
-    path: *const u8, path_len: usize, device: usize, read_only: i32,
-) -> i32 {
-    match unsafe { crate::path(path, path_len) } {
-        Some(at) => mount_bytes(at, device, read_only != 0),
-        None => -1,
-    }
-}
-
 /// Mount the device's nanofs at `path`: 0 mounted for writing, 1 read-only,
 /// -1 not mounted.
 pub fn mount_at(path: &str, device: usize, read_only: bool) -> i32 {
@@ -1525,12 +1510,6 @@ fn mount_bytes(at: &[u8], device: usize, read_only: bool) -> i32 {
         return -1;
     }
     if read_only { 1 } else { 0 }
-}
-
-/// Write a fresh nanofs onto the device: 0 done, -1 not.
-#[no_mangle]
-pub extern "C" fn rust_nanofs_format(device: usize) -> i32 {
-    if format_device(device) { 0 } else { -1 }
 }
 
 /// The same, as the shell's `format` calls it.

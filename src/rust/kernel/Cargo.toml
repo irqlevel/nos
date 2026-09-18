@@ -13,7 +13,6 @@ block = { path = "../block" }
 fs = { path = "../fs" }
 net = { path = "../net" }
 hello = { path = "../hello" }
-tls = { path = "../tls" }
 nvme = { path = "../drivers/nvme" }
 usb = { path = "../drivers/usb" }
 virtio-rng = { path = "../drivers/virtio_rng" }

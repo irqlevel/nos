@@ -7,7 +7,6 @@
 //! `locate`) take no lock themselves: they are made of the calls that do.
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
 use core::ffi::c_int;
 
 use kcore::sync::Mutex;
@@ -110,27 +109,20 @@ struct Inner {
 }
 
 pub struct Vfs {
-    lock: Mutex,
-    inner: UnsafeCell<Inner>,
+    inner: Mutex<Inner>,
 }
-
-/* Everything inside is touched with the lock held. */
-unsafe impl Sync for Vfs {}
-unsafe impl Send for Vfs {}
 
 /// What a mount's claim on its device says to whoever is refused it.
 const MOUNT_HOLDER: &[u8] = b"a mounted filesystem\0";
 
 impl Vfs {
     pub fn new() -> Option<Box<Vfs>> {
-        let lock = Mutex::new()?;
         Some(Box::new(Vfs {
-            lock,
-            inner: UnsafeCell::new(Inner {
+            inner: Mutex::new(Inner {
                 mounts: [const { None }; MAX_MOUNTS],
                 count: 0,
                 next_id: 1,
-            }),
+            })?,
         }))
     }
 
@@ -142,8 +134,8 @@ impl Vfs {
             return false;
         }
 
-        let _guard = self.lock.lock();
-        let inner = unsafe { &mut *self.inner.get() };
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
 
         let device = (ops.device)(ops.ctx);
 
@@ -207,8 +199,8 @@ impl Vfs {
     /// Take a filesystem off its mount point and release it. False if it is
     /// not mounted there, or is busy.
     pub fn unmount(&self, path: &[u8]) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &mut *self.inner.get() };
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
 
         for index in 0..inner.count {
             let matches = match &inner.mounts[index] {
@@ -244,8 +236,8 @@ impl Vfs {
     /// Take everything down, deepest mount first, releasing each filesystem.
     /// This is shutdown: a handle left open is abandoned, not honoured.
     pub fn unmount_all(&self) {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &mut *self.inner.get() };
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
 
         while inner.count > 0 {
             /* Deepest first, so a mount inside another goes before it. */
@@ -280,8 +272,7 @@ impl Vfs {
     }
 
     pub fn mount_count(&self) -> usize {
-        let _guard = self.lock.lock();
-        unsafe { &*self.inner.get() }.count
+        self.inner.lock().count
     }
 
     /// What the index'th mount is, for `mounts` to print: its path, the
@@ -290,8 +281,8 @@ impl Vfs {
     pub fn mount_at(
         &self, index: usize, path: &mut [u8], name: &mut *const u8, info: &mut [u8],
     ) -> i32 {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let mount = match inner.mounts.get(index).and_then(|m| m.as_ref()) {
             Some(mount) => mount,
@@ -465,8 +456,8 @@ fn remove_mount(inner: &mut Inner, index: usize) {
 
 impl Vfs {
     pub fn stat(&self, path: &[u8], out: &mut FileStat) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let resolved = match self.resolve(inner, path) {
             Some(resolved) if !resolved.node.is_null() => resolved,
@@ -481,8 +472,8 @@ impl Vfs {
     }
 
     pub fn read_dir(&self, path: &[u8], index: usize, out: &mut DirEntry) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let resolved = match self.resolve(inner, path) {
             Some(resolved) if !resolved.node.is_null() => resolved,
@@ -523,8 +514,8 @@ impl Vfs {
             return core::ptr::null_mut();
         }
 
-        let _guard = self.lock.lock();
-        let inner = unsafe { &mut *self.inner.get() };
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
 
         let writes = flags & (OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE) != 0;
 
@@ -586,8 +577,8 @@ impl Vfs {
             return;
         }
 
-        let _guard = self.lock.lock();
-        let inner = unsafe { &mut *self.inner.get() };
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
 
         let file = unsafe { Box::from_raw(file) };
         unsafe { (*file.node).open_count -= 1 };
@@ -611,7 +602,7 @@ impl Vfs {
             return None;
         }
 
-        let _guard = self.lock.lock();
+        let _guard = self.inner.lock();
 
         let size = unsafe { (*file.node).size };
         if file.pos >= size || len == 0 {
@@ -641,7 +632,7 @@ impl Vfs {
             return true;
         }
 
-        let _guard = self.lock.lock();
+        let _guard = self.inner.lock();
 
         if file.flags & OPEN_APPEND != 0 {
             file.pos = unsafe { (*file.node).size };
@@ -662,7 +653,7 @@ impl Vfs {
         if file.is_null() {
             return false;
         }
-        let _guard = self.lock.lock();
+        let _guard = self.inner.lock();
         unsafe { (*file).pos = pos };
         true
     }
@@ -671,7 +662,7 @@ impl Vfs {
         if file.is_null() {
             return 0;
         }
-        let _guard = self.lock.lock();
+        let _guard = self.inner.lock();
         unsafe { (*file).pos }
     }
 
@@ -679,13 +670,13 @@ impl Vfs {
         if file.is_null() {
             return 0;
         }
-        let _guard = self.lock.lock();
+        let _guard = self.inner.lock();
         unsafe { (*(*file).node).size }
     }
 
     pub fn create(&self, path: &[u8], directory: bool) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let resolved = match self.resolve(inner, path) {
             Some(resolved) => resolved,
@@ -714,8 +705,8 @@ impl Vfs {
     }
 
     pub fn remove(&self, path: &[u8]) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let resolved = match self.resolve(inner, path) {
             Some(resolved) if !resolved.node.is_null() => resolved,
@@ -742,8 +733,8 @@ impl Vfs {
     }
 
     pub fn truncate(&self, path: &[u8], size: usize) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let resolved = match self.resolve(inner, path) {
             Some(resolved) if !resolved.node.is_null() => resolved,
@@ -762,8 +753,8 @@ impl Vfs {
     }
 
     pub fn rename(&self, from: &[u8], to: &[u8]) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let (from_mount, _) = match self.find_mount(inner, from) {
             Some(found) => found,
@@ -827,8 +818,8 @@ impl Vfs {
     }
 
     pub fn sync(&self) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let mut ok = true;
         for mount in inner.mounts.iter().flatten() {
@@ -841,8 +832,8 @@ impl Vfs {
 
     /// Replace a file's contents, creating it if it is missing.
     pub fn write_file(&self, path: &[u8], data: *const u8, len: usize) -> bool {
-        let _guard = self.lock.lock();
-        let inner = unsafe { &*self.inner.get() };
+        let guard = self.inner.lock();
+        let inner = &*guard;
 
         let resolved = match self.resolve(inner, path) {
             Some(resolved) => resolved,

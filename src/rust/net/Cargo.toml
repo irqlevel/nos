@@ -9,3 +9,5 @@ edition = "2021"
 kcore = { path = "../kcore" }
 # ICMP tells the C++ TCP about an unreachable; that declaration lives here.
 ffi = { path = "../ffi" }
+# The HTTP client speaks plain TCP or TLS over it.
+tls = { path = "../tls" }

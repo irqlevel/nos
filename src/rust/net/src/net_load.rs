@@ -14,10 +14,11 @@
 //! measuring the wakeup -- and the replies of one batch go to the NIC
 //! together when it ends.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
-use kcore::consts::MAX_CPUS;
-use kcore::net::{NetFrame, Nic, UdpListener};
+use kcore::net::{AtomicNic, Lent, Nic, RxContext, RxOwned, TxBatch, UdpHandler, UdpListener};
+use kcore::percpu::{ConstInit, LocalCounter, PerCpu};
+use kcore::sync::PreemptSpinLock;
 use kcore::task::TaskHandle;
 use kcore::trace;
 
@@ -30,36 +31,45 @@ const MAX_PENDING: usize = 64;
 
 const SAMPLE_MS: u64 = 1000;
 
-/// Counters are per CPU and plain, not atomic. This is the datapath the
-/// profile is about: one shared cache line incremented by twenty cores would
-/// be the loudest line in the report, and the report would be about the
-/// instrument. A count lost to a migration between reading the CPU id and
-/// adding to its slot costs a statistic nothing worth an atomic.
+/// Counters are per CPU, and added to with no bus lock. This is the datapath
+/// the profile is about: one shared cache line incremented by twenty cores
+/// would be the loudest line in the report, and the report would be about
+/// the instrument. A count lost to a migration between reading the CPU id
+/// and adding to its slot costs a statistic nothing worth a locked
+/// instruction.
 #[repr(align(64))]
-#[derive(Clone, Copy)]
-struct PerCpu {
-    rx_packets: usize,
-    rx_bytes: usize,
-    tx_packets: usize,
-    tx_failed: usize,
+struct Counts {
+    rx_packets: LocalCounter,
+    rx_bytes: LocalCounter,
+    tx_packets: LocalCounter,
+    tx_failed: LocalCounter,
 }
 
-const NO_COUNTS: PerCpu = PerCpu { rx_packets: 0, rx_bytes: 0, tx_packets: 0, tx_failed: 0 };
+impl ConstInit for Counts {
+    const INIT: Self = Counts {
+        rx_packets: LocalCounter::new(),
+        rx_bytes: LocalCounter::new(),
+        tx_packets: LocalCounter::new(),
+        tx_failed: LocalCounter::new(),
+    };
+}
 
 pub struct NetLoad {
-    cpu: core::cell::UnsafeCell<[PerCpu; MAX_CPUS]>,
+    counts: PerCpu<Counts>,
 
-    /// Replies of the batch being dispatched, not yet handed over. Only the
-    /// receive softirq touches them, and a softirq type runs on one CPU at a
-    /// time, so there is no lock.
-    pending: core::cell::UnsafeCell<[usize; MAX_PENDING]>,
-    pending_count: core::cell::UnsafeCell<usize>,
+    /// Replies of the batch being dispatched, not yet handed over. The
+    /// receive path's own -- it is reached with the `RxContext` a callback is
+    /// lent -- so there is no lock on the way to it.
+    pending: RxOwned<TxBatch<MAX_PENDING>>,
 
-    nic: core::cell::UnsafeCell<Option<Nic>>,
-    port: core::cell::UnsafeCell<u16>,
+    /// Read once a packet
+    nic: AtomicNic,
+    port: AtomicU16,
     echo: AtomicBool,
-    listener: core::cell::UnsafeCell<Option<UdpListener>>,
-    task: core::cell::UnsafeCell<Option<TaskHandle>>,
+    /* Never dropped under a lock: giving a port back waits for the receive
+     * path, and giving a task back waits for the task. */
+    listener: PreemptSpinLock<Option<UdpListener>>,
+    task: PreemptSpinLock<Option<TaskHandle>>,
     running: AtomicBool,
     started: AtomicBool,
 
@@ -70,12 +80,7 @@ pub struct NetLoad {
     rx_bps: AtomicUsize,
 }
 
-/* The counters are per CPU and the pending list is the softirq's alone */
-unsafe impl Sync for NetLoad {}
-unsafe impl Send for NetLoad {}
-
-/// What `netload` reports. The C++ side declares the same struct.
-#[repr(C)]
+/// What `netload` reports.
 pub struct Stats {
     pub running: u32,
     pub port: u16,
@@ -94,14 +99,13 @@ impl NetLoad {
     /// on the heap and reached through a pointer from the receive path.
     pub const fn new_const() -> NetLoad {
         NetLoad {
-            cpu: core::cell::UnsafeCell::new([NO_COUNTS; MAX_CPUS]),
-            pending: core::cell::UnsafeCell::new([0; MAX_PENDING]),
-            pending_count: core::cell::UnsafeCell::new(0),
-            nic: core::cell::UnsafeCell::new(None),
-            port: core::cell::UnsafeCell::new(0),
+            counts: PerCpu::new(),
+            pending: RxOwned::new(TxBatch::new()),
+            nic: AtomicNic::none(),
+            port: AtomicU16::new(0),
             echo: AtomicBool::new(true),
-            listener: core::cell::UnsafeCell::new(None),
-            task: core::cell::UnsafeCell::new(None),
+            listener: PreemptSpinLock::new(None),
+            task: PreemptSpinLock::new(None),
             running: AtomicBool::new(false),
             started: AtomicBool::new(false),
             rx_pps: AtomicUsize::new(0),
@@ -115,9 +119,11 @@ impl NetLoad {
     }
 
     pub fn reset_counters(&self) {
-        let cpu = unsafe { &mut *self.cpu.get() };
-        for slot in cpu.iter_mut() {
-            *slot = NO_COUNTS;
+        for counts in self.counts.iter() {
+            counts.rx_packets.set(0);
+            counts.rx_bytes.set(0);
+            counts.tx_packets.set(0);
+            counts.tx_failed.set(0);
         }
         self.rx_pps.store(0, Ordering::Relaxed);
         self.tx_pps.store(0, Ordering::Relaxed);
@@ -125,54 +131,50 @@ impl NetLoad {
     }
 
     fn totals(&self) -> (usize, usize, usize, usize) {
-        let cpu = unsafe { &*self.cpu.get() };
         let mut totals = (0, 0, 0, 0);
-        for slot in cpu.iter() {
-            totals.0 += slot.rx_packets;
-            totals.1 += slot.rx_bytes;
-            totals.2 += slot.tx_packets;
-            totals.3 += slot.tx_failed;
+        for counts in self.counts.iter() {
+            totals.0 += counts.rx_packets.get();
+            totals.1 += counts.rx_bytes.get();
+            totals.2 += counts.tx_packets.get();
+            totals.3 += counts.tx_failed.get();
         }
         totals
     }
 
-    fn slot(&self) -> &mut PerCpu {
-        let index = (kcore::cpu::id() as usize).min(MAX_CPUS - 1);
-        unsafe { &mut (*self.cpu.get())[index] }
-    }
-
     /// One arrived datagram, from the receive softirq.
-    fn on_frame(&self, handle: usize) {
-        let frame = unsafe { NetFrame::lent(handle) };
-        let len = frame.len();
-        if len < ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN {
-            return;
-        }
+    fn receive(&self, frame: Lent<'_>, rx: &mut RxContext) {
+        let ip_len = {
+            let bytes = frame.bytes();
+            let len = bytes.len();
+            if len < ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN {
+                return;
+            }
 
-        let packet = &frame[ETH_HDR_LEN..];
-        let ip_len = ip::header_len(packet);
-        if ip_len == 0 || len < ETH_HDR_LEN + ip_len + UDP_HDR_LEN
-            || ip::protocol(packet) != IP_PROTO_UDP
-        {
-            return;
-        }
+            let packet = &bytes[ETH_HDR_LEN..];
+            let ip_len = ip::header_len(packet);
+            if ip_len == 0 || len < ETH_HDR_LEN + ip_len + UDP_HDR_LEN
+                || ip::protocol(packet) != IP_PROTO_UDP
+            {
+                return;
+            }
 
-        {
-            let slot = self.slot();
-            slot.rx_packets += 1;
-            slot.rx_bytes += len;
-        }
+            let counts = self.counts.here();
+            counts.rx_packets.add(1);
+            counts.rx_bytes.add(len);
+            ip_len
+        };
 
         if !self.echo.load(Ordering::Relaxed) {
             return;
         }
-        let nic = match unsafe { *self.nic.get() } {
+        let nic = match self.nic.get() {
             Some(nic) => nic,
             None => return,
         };
 
         /* The reply is the frame that arrived, its addresses swapped where
-         * they lie -- no copy and no allocation.
+         * they lie -- no copy and no allocation. Kept past this callback --
+         * the dispatcher's release is then not the last one.
          *
          * `udp::send` must never be called from here. It resolves through
          * ARP, which on a cache miss sends a request and then sleeps up to
@@ -182,10 +184,8 @@ impl NetLoad {
          * included. ARP entries expire after five minutes, so that miss is
          * not a rare case -- it is one every load test long enough to be
          * interesting. */
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(
-                ffi::net::kernel_netframe_data(handle), len)
-        };
+        let mut kept = frame.retain();
+        let bytes = kept.data_mut();
 
         let requester = eth::src(bytes);
         eth::write(bytes, &requester, &nic.mac(), crate::wire::ETH_TYPE_IP);
@@ -207,17 +207,14 @@ impl NetLoad {
          * this saves a pass over the payload for. */
         crate::wire::set_be16(datagram, udp::CHECKSUM, 0);
 
-        /* Kept past this callback -- the dispatcher's release is then not the
-         * last one -- and sent with the rest of the batch when it ends, or
-         * now, if the batch has filled what is kept. */
-        let kept = unsafe { NetFrame::retain(handle) };
-        unsafe {
-            let count = &mut *self.pending_count.get();
-            (*self.pending.get())[*count] = kept.into_raw();
-            *count += 1;
-            if *count == MAX_PENDING {
-                self.flush_replies();
-            }
+        /* Sent with the rest of the batch when it ends, or now, if the batch
+         * has filled what is kept. */
+        let pending = self.pending.get(rx);
+        if !pending.push(kept) {
+            self.counts.here().tx_failed.add(1);
+        }
+        if pending.is_full() {
+            self.flush_replies(rx);
         }
     }
 
@@ -225,26 +222,26 @@ impl NetLoad {
     /// and one doorbell for the lot. Each echo used to take both on its own,
     /// and under a flood the lock's release, just after the doorbell, was
     /// where a profile found the receive CPU spending most.
-    fn flush_replies(&self) {
-        let count = unsafe { *self.pending_count.get() };
+    fn flush_replies(&self, rx: &mut RxContext) {
+        let pending = self.pending.get(rx);
+        let count = pending.len();
         if count == 0 {
             return;
         }
-        unsafe { *self.pending_count.get() = 0 };
 
-        let nic = match unsafe { *self.nic.get() } {
-            Some(nic) => nic,
-            None => return,
+        let queued = match self.nic.get() {
+            /* Every frame is taken: what found no room is released on the
+             * far side. */
+            Some(nic) => pending.send(&nic),
+            None => {
+                pending.clear();
+                0
+            }
         };
 
-        let pending = unsafe { &(&*self.pending.get())[..count] };
-        /* Every frame is taken: what found no room is released on the far
-         * side. */
-        let queued = unsafe { nic.transmit_raw(pending) };
-
-        let slot = self.slot();
-        slot.tx_packets += queued;
-        slot.tx_failed += count - queued;
+        let counts = self.counts.here();
+        counts.tx_packets.add(queued);
+        counts.tx_failed.add(count - queued);
     }
 
     pub fn start(&'static self, nic: Nic, port: u16, echo: bool) -> bool {
@@ -252,17 +249,12 @@ impl NetLoad {
             return false;
         }
 
-        unsafe {
-            *self.nic.get() = Some(nic);
-            *self.port.get() = port;
-            *self.pending_count.get() = 0;
-        }
+        self.nic.set(Some(nic));
+        self.port.store(port, Ordering::Release);
         self.echo.store(echo, Ordering::Release);
         self.reset_counters();
 
-        let task = match kcore::task::spawn_with_ctx(
-            "netload", run, self as *const _ as *mut u8)
-        {
+        let task = match kcore::task::spawn_for("netload", self, NetLoad::run) {
             Some(task) => task,
             None => {
                 self.started.store(false, Ordering::Release);
@@ -274,13 +266,11 @@ impl NetLoad {
          * theirs already: a full table is a real outcome and has to be
          * reported, not left as a server that is running and never
          * dispatched to -- and so is a port someone else has. */
-        match nic.listen_udp_batched(port, on_frame, on_batch_end,
-            self as *const _ as *mut u8)
-        {
-            Ok(listener) => unsafe {
-                *self.listener.get() = Some(listener);
-                *self.task.get() = Some(task);
-            },
+        match nic.listen_batched(port, self) {
+            Ok(listener) => {
+                *self.listener.lock() = Some(listener);
+                *self.task.lock() = Some(task);
+            }
             Err(err) => {
                 trace!(0, "netload: port {} could not be listened on ({:?})", port, err);
                 task.request_stop();
@@ -300,34 +290,31 @@ impl NetLoad {
             return;
         }
 
-        /* Before the listener goes: a callback already inside `on_frame`
+        /* Before the listener goes: a callback already inside `receive`
          * finishes, and the flag keeps a later one from starting. */
         self.running.store(false, Ordering::Release);
 
         /* Dropping the listener returns once no callback is still running --
          * a batch's end included, which hands over what that batch built --
-         * so nothing should be left kept here; were anything, it goes out
-         * rather than leaking. */
-        unsafe { *self.listener.get() = None };
-        self.flush_replies();
+         * so nothing is left gathered after it. Taken out under the lock and
+         * dropped after: the drop waits. */
+        let listener = self.listener.lock().take();
+        drop(listener);
 
-        let task = unsafe { (*self.task.get()).take() };
+        let task = self.task.lock().take();
         if let Some(task) = task {
             task.request_stop();
             drop(task);
         }
 
-        let port = unsafe { *self.port.get() };
-        trace!(0, "netload: stopped on port {}", port);
+        trace!(0, "netload: stopped on port {}", self.port.load(Ordering::Acquire));
 
-        unsafe {
-            *self.nic.get() = None;
-            *self.port.get() = 0;
-        }
+        self.nic.set(None);
+        self.port.store(0, Ordering::Release);
         self.started.store(false, Ordering::Release);
     }
 
-    fn run(&self) {
+    fn run(&'static self) {
         let (mut last_rx, mut last_bytes, mut last_tx, _) = self.totals();
 
         while !kcore::task::stopping() {
@@ -364,7 +351,7 @@ impl NetLoad {
         let (rx_packets, rx_bytes, tx_packets, tx_failed) = self.totals();
         Stats {
             running: self.is_running() as u32,
-            port: unsafe { *self.port.get() },
+            port: self.port.load(Ordering::Acquire),
             echo: self.echo.load(Ordering::Relaxed) as u16,
             rx_packets,
             rx_bytes,
@@ -379,10 +366,7 @@ impl NetLoad {
     /// What the index'th CPU received, for the per-CPU line: a load test that
     /// runs entirely on one core is measuring one core.
     pub fn cpu_rx(&self, index: usize) -> usize {
-        if index >= MAX_CPUS {
-            return 0;
-        }
-        unsafe { (*self.cpu.get())[index].rx_packets }
+        self.counts.get(index).map_or(0, |counts| counts.rx_packets.get())
     }
 }
 
@@ -393,27 +377,16 @@ fn delta(now: usize, last: usize) -> usize {
     if now >= last { now - last } else { now }
 }
 
-extern "C" fn run(ctx: *mut u8) {
-    if ctx.is_null() {
-        return;
+/// What the receive path hands every datagram on the load port to, and tells
+/// when a batch of them has ended.
+impl UdpHandler for NetLoad {
+    fn on_frame(&'static self, frame: Lent<'_>, rx: &mut RxContext) {
+        if self.running.load(Ordering::Acquire) {
+            self.receive(frame, rx);
+        }
     }
-    unsafe { &*(ctx as *const NetLoad) }.run();
-}
 
-extern "C" fn on_frame(ctx: *mut u8, frame: usize) {
-    if ctx.is_null() {
-        return;
+    fn on_batch_end(&'static self, rx: &mut RxContext) {
+        self.flush_replies(rx);
     }
-    let load = unsafe { &*(ctx as *const NetLoad) };
-    if !load.running.load(Ordering::Acquire) {
-        return;
-    }
-    load.on_frame(frame);
-}
-
-extern "C" fn on_batch_end(ctx: *mut u8) {
-    if ctx.is_null() {
-        return;
-    }
-    unsafe { &*(ctx as *const NetLoad) }.flush_replies();
 }

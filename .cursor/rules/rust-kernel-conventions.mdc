@@ -44,17 +44,52 @@ Add a new kernel service in three steps:
 | `io` | `MmioRegion` (8/16/32/64-bit), `Port<T>`, `read_msr`/`write_msr` |
 | `msix` | `MsixTable`, `MsixInterrupt` (Rust callback, 16 slots) |
 | `interrupt` | `LegacyInterrupt` (INTx, 8 slots) |
-| `sync` | `Mutex`, `SpinLock` (RAII guards), `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |
-| `task` | `spawn`, `spawn_on`, `spawn_with_ctx` (each takes the name `ps` and `top` show), `TaskHandle` (`id`), `sleep`, `yield_to_runnable`, `current_id` (is this call from one of my own tasks?) |
+| `sync` | **Locks own what they guard**: `Mutex<T>` (sleeps), `SpinLock<T>` (the kernel's), `IrqSpinLock<T>` and `PreemptSpinLock<T>` (const-constructible, for statics; the first also `try_lock`), `TryLock<T>` (never waited for; the holder may sleep). `lock()` gives a guard that derefs to the data. `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |
+| `once` | `Once<T>` (set once by boot or a `setup`, read from anywhere) and `OnceBox<T>` (the one of something, made on first use; racing makers get the same one) |
+| `percpu` | `PerCpu<T>` + `LocalCounter` (statistics any CPU may read, added to with no bus lock), `CpuLocal<T>` (state only its own CPU touches, reached with interrupts off through `with`) |
+| `static_ring` | `StaticRing<N>` (MPMC queue of words in static storage) and `Mailbox<T, N>` (fixed-shape messages written and read in place, from any context, no allocation) |
+| `task` | `spawn`, `spawn_on`, `spawn_for(name, &'static T, fn(&'static T))` (a service's task over its one instance — no raw context), `spawn_with_ctx` (each takes the name `ps` and `top` show), `TaskHandle` (`id`), `sleep`, `yield_to_runnable`, `current_id` (is this call from one of my own tasks?) |
 | `softirq` | `raise`, `register` (types: `TYPE_NET_RX`, `TYPE_BLK_IO`, etc.) |
 | `timer` | `Timer` (periodic, 8 slots, fires on CPU 0 via IPI) |
 | `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI), `synchronize` (returns once every interrupt handler running at the call has returned) |
 | `ring` | `LocklessRing` — the kernel's bounded MPMC queue of words, one CAS an operation, safe from any context |
 | `block` | `register` → `BlockDeviceRegistration` (optional `submit`/`kick`: the asynchronous path; `parent` for a partition, so claims on it and on its disk refuse each other); `count`/`at` walk the kernel's table, `Disk::name`/`parent`/`handle` say what a device is; `Disk` — an existing disk or partition by name: synchronous `read`/`write`/`flush`, `partitions`; asynchronous `submit(&BlockIo, kick)`/`kick` straight to physical memory, completion callback from interrupt context (`can_submit`: NVMe and its partitions); `claim` → `DiskClaim` before writing (refused while a mount, the disk log or another writer holds it or an overlapping disk/partition) |
 | `cmd` | `Command::register` — a shell command whose handler writes to an `Output`; unregistered on drop, after any running call returns. `dispatch` — run a command line as the console would, its output handed to a closure as it is printed |
-| `net` | `register` → `NetDeviceHandle`, `NetFrame` (`alloc_tx`, `retain` a lent frame); `Nic` — an existing device by name: `ip`, `mac`, `listen_udp` → `UdpListener` (handed the frame itself), `transmit`/`transmit_raw` (a batch, one lock and one doorbell) |
-| `tcp` | `TcpSocket` — a connection C++ opened and closes (the TLS client's); `TcpListener::bind(&Nic, port)` → `accept(timeout)` → `TcpStream` (`send_all`, `send` with a timeout, `recv`, `peer`), each closed on drop — a listener's drop resets what it never accepted |
+| `net` | `register` → `NetDeviceHandle`, `NetFrame` (`alloc_tx`); `Nic` — an existing device by name: `ip`, `mac`, `listen(port, &'static impl UdpHandler)` → `UdpListener` (the handler is lent each frame as a `Lent`: `bytes()`, or `retain()` to keep it and answer in it; `listen_batched` adds `on_batch_end`), `RxOwned<T>` (state only the receive path touches, reached with the `&mut RxContext` a handler is lent), `TxBatch<N>` (replies gathered and sent with one lock and one doorbell), `AtomicNic`, `transmit`; the raw `listen_udp`/`transmit_raw` remain for a module whose context is not `'static` |
+| `tcp` | `TcpSocket` — a connection somebody else opened and closes (the TLS client's); `TcpListener::bind(&Nic, port)` → `accept(timeout)` → `TcpStream` (`send_all`, `send` with a timeout, `recv`, `peer`), each closed on drop — a listener's drop resets what it never accepted |
 | `fs` | `read(path, max)`, `write(path, data)` (replaces, then syncs), `create_dir` — a module's configuration files |
+
+## Where `unsafe` goes, and where it does not
+
+The layers (`block/`, `fs/`, `net/`) are ordinary Rust; `unsafe` belongs in
+`kcore`, under a type that says why it is sound, and at the C ABI.
+
+- **A lock owns its data.** Never a bare lock beside an `UnsafeCell` with
+  `unsafe { &mut *cell.get() }` at every use. A lock that guards nothing is
+  `Lock<()>`. Guards are values: hold two, drop them in either order, return
+  one from a function (`Tcp::take_fresh`).
+- **What waits when dropped** — a `UdpListener` (for the receive path), a
+  `TaskHandle` (for the task) — sits in its own `Lock<Option<..>>`: `take()`
+  it under the lock, drop it after. Dropped under the lock its wait needs,
+  it is a deadlock.
+- **The one of something** is a `Once`/`OnceBox` static, not an `AtomicPtr`
+  and a `&*ptr`.
+- **Per-CPU state** is `PerCpu<LocalCounter…>` for numbers and `CpuLocal<T>`
+  for anything exclusive — not an `UnsafeCell<[T; MAX_CPUS]>` indexed by
+  `cpu::id()`, which is a data race the moment a task migrates between the
+  two.
+- **A handle from outside is looked up, not dereferenced**: a device, a TCP
+  connection and a block device are each a slot of a table that lives as
+  long as the kernel (`DEVICES.by_handle`, `TCP.by_handle`, block
+  `device()`), so a word that is not one is `None` rather than undefined
+  behaviour — and the functions taking them need not be `unsafe`.
+- **Seams inside Rust are Rust**: a trait or a `&mut dyn`, not an
+  `extern "C" fn(ctx: *mut u8, …)` table. The C ABI is for what C++ or a
+  separately linked module is on the other side of.
+- **An export that trusts a pointer is `unsafe extern "C" fn`** with a
+  `# Safety` section; one that takes only validated handles and plain values
+  is a safe `extern "C" fn`.
+- **An export nobody calls is deleted**, not kept for symmetry.
 
 ## Interrupt handlers
 

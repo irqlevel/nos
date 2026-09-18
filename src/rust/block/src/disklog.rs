@@ -34,18 +34,19 @@
 //! been prepared is not written to, a partition holding anything else does
 //! not carry the magic, and without `disklog=on` no disk is so much as read.
 
-use core::cell::UnsafeCell;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use kcore::block::{self, Disk};
 use kcore::cmd::Output;
+use kcore::const_init::ConstInit;
 use kcore::cpu;
 use kcore::crc32::crc32_update;
 use kcore::dma::DmaBuffer;
-use kcore::static_ring::StaticRing;
-use kcore::sync::Event;
-use kcore::task;
+use kcore::once::Once;
+use kcore::static_ring::Mailbox;
+use kcore::sync::{Event, TryLock};
+use kcore::task::{self, TaskHandle};
 use kcore::trace;
 
 /* ---- the on-disk header, first sector of the area ---- */
@@ -132,51 +133,26 @@ const AREA_START_SECTOR: u64 = 0;
 /// What the disk log's claim on its device says to whoever is refused it.
 const HOLDER: &[u8] = b"the disk log\0";
 
+/// How long `disklog` waits for a writer that is writing, before reporting
+/// without its numbers.
+const REPORT_TRIES: usize = 50;
+const REPORT_WAIT_MS: u64 = 2;
+
 /* ---- the lines waiting to be written ---- */
 
-struct Slot {
-    text: UnsafeCell<[u8; MSG_SIZE]>,
-    len: UnsafeCell<usize>,
+struct Line {
+    text: [u8; MSG_SIZE],
+    len: usize,
 }
 
-/* A slot is only ever touched by whoever holds it out of a ring, and a ring
- * hands it to one holder at a time. */
-unsafe impl Sync for Slot {}
-
-impl Slot {
-    const fn new() -> Self {
-        Self { text: UnsafeCell::new([0; MSG_SIZE]), len: UnsafeCell::new(0) }
-    }
+impl ConstInit for Line {
+    const INIT: Self = Line { text: [0; MSG_SIZE], len: 0 };
 }
 
-static SLOTS: [Slot; MSG_COUNT] = [const { Slot::new() }; MSG_COUNT];
-
-/// Slots handed out and not yet recycled. A slot is taken from here the
-/// first time and from `FREE` after, which is what saves the free ring an
-/// initialiser to run -- and this whole channel has to work from the first
-/// line of the boot, long before anything could run one.
-static FRESH: AtomicUsize = AtomicUsize::new(0);
-
-/// Slots the writer is done with.
-static FREE: StaticRing<MSG_COUNT> = StaticRing::new();
-
-/// Slots holding a line, in the order they were queued.
-static READY: StaticRing<MSG_COUNT> = StaticRing::new();
-
-fn take_slot() -> Option<usize> {
-    loop {
-        let fresh = FRESH.load(Ordering::Relaxed);
-        if fresh >= MSG_COUNT {
-            return FREE.pop();
-        }
-        if FRESH
-            .compare_exchange_weak(fresh, fresh + 1, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-        {
-            return Some(fresh);
-        }
-    }
-}
+/// From the tracer to the writer. A static with nothing to set up: this
+/// whole channel has to work from the first line of the boot, long before
+/// anything could run an initialiser.
+static LINES: Mailbox<Line, MSG_COUNT> = Mailbox::new();
 
 /* ---- where it writes, and how it is going ---- */
 
@@ -194,23 +170,22 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// no prepared area, no writer task, or `stop`. Nothing is queued after.
 static OFF: AtomicBool = AtomicBool::new(false);
 
-/// One writer at a time: the task, `setup` catching up, `stop` finishing, or
-/// a caller with no scheduler to hand its line to.
-static IN_FLUSH: AtomicBool = AtomicBool::new(false);
-
 /// The tracer's drops: no free slot.
 static DROPPED_LINES: AtomicU64 = AtomicU64::new(0);
 
-/// The writer task's wake-up, and the task itself -- published before it
+/// The writer task's wake-up, and which task it is -- published before it
 /// first runs. `log` wakes it through the event, and leaves out the lines
 /// the task itself produces: an error on the write path traces, and writing
 /// that line would fail and trace again.
-static WAKE: AtomicUsize = AtomicUsize::new(0);
-static WRITER: AtomicUsize = AtomicUsize::new(0);
+static WAKE: Once<Event> = Once::new();
+static WRITER_ID: AtomicUsize = AtomicUsize::new(0);
+static WRITER_TASK: TryLock<Option<TaskHandle>> = TryLock::new(None);
 
-/// What only the writer touches: everything below is read and written by
-/// whoever holds `IN_FLUSH`, or by the panic path with the rest of the
-/// machine already stopped.
+/// What only the writer touches. One writer at a time -- the task, `setup`
+/// catching up, `stop` finishing, or a caller with no scheduler to hand its
+/// line to -- and nobody waits to be it: whoever finds the lock taken leaves
+/// the work to whoever has it. The panic path goes round the lock, with the
+/// rest of the machine already stopped.
 struct Writer {
     /// Lines off the ring, and the tail of a sector written only in part.
     pending: [u8; PENDING_SIZE],
@@ -232,10 +207,7 @@ struct Writer {
     hdr: Option<DmaBuffer>,
 }
 
-struct WriterCell(UnsafeCell<Writer>);
-unsafe impl Sync for WriterCell {}
-
-static WRITER_STATE: WriterCell = WriterCell(UnsafeCell::new(Writer {
+static WRITER: TryLock<Writer> = TryLock::new(Writer {
     pending: [0; PENDING_SIZE],
     pending_used: 0,
     cursor: 0,
@@ -245,12 +217,16 @@ static WRITER_STATE: WriterCell = WriterCell(UnsafeCell::new(Writer {
     dropped_bytes: 0,
     io: None,
     hdr: None,
-}));
+});
 
-/// # Safety
-/// The caller holds `IN_FLUSH`, or the rest of the machine has been stopped.
-unsafe fn writer() -> &'static mut Writer {
-    unsafe { &mut *WRITER_STATE.0.get() }
+/// What the command line said: `Some(true)` for `disklog=on`, `Some(false)`
+/// without it, and `None` while it has not been read yet.
+fn wanted() -> Option<bool> {
+    match unsafe { ffi::disklog::kernel_disklog_wanted() } {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
 }
 
 /* ---- the tracer's side ---- */
@@ -258,7 +234,7 @@ unsafe fn writer() -> &'static mut Writer {
 /// Append one line. Safe from any context, and never waits: the line is
 /// queued for the writer. Nothing is queued once the command line has been
 /// read without `disklog=on`, or once the log has been switched off.
-pub fn log(line: &str) {
+pub fn log(line: &[u8]) {
     /* Switched off, or nothing to say. Read without a lock -- each flag is
      * set once, and a line that slips past the flip is only queued for a
      * writer that drops it. */
@@ -269,11 +245,11 @@ pub fn log(line: &str) {
     /* Once the command line has been read, only for disklog=on. Before it
      * every line is kept: nobody knows yet whether it is wanted, and the
      * first lines are part of the boot the area is meant to hold. */
-    if unsafe { ffi::disklog::kernel_disklog_wanted() } == 0 {
+    if wanted() == Some(false) {
         return;
     }
 
-    let writer_task = WRITER.load(Ordering::Relaxed);
+    let writer_task = WRITER_ID.load(Ordering::Relaxed);
     if writer_task != 0 && task::current_id_or_none() == writer_task {
         return;
     }
@@ -282,7 +258,7 @@ pub fn log(line: &str) {
         return;
     }
 
-    if !ENABLED.load(Ordering::Relaxed) || unsafe { ffi::panic::kernel_panic_active() } != 0 {
+    if !ENABLED.load(Ordering::Relaxed) || trace::panic_active() {
         return;
     }
 
@@ -291,9 +267,8 @@ pub fn log(line: &str) {
      * runs at its CPU's next scheduling point. Before there is a task,
      * `setup` is about to write the ring itself. */
     if cpu::preempt_is_on() {
-        let wake = WAKE.load(Ordering::Acquire);
-        if wake != 0 {
-            unsafe { ffi::sync::kernel_event_signal(wake) };
+        if let Some(wake) = WAKE.get() {
+            wake.signal();
         }
         return;
     }
@@ -312,29 +287,14 @@ pub fn log(line: &str) {
 /// across it so that a task is never switched away between claiming a ready
 /// cell and publishing it: the writer takes cells in order, and would wait
 /// behind that one for as long as the task stayed away.
-fn enqueue(line: &str) -> bool {
+fn enqueue(line: &[u8]) -> bool {
     let held = cpu::preempt_disable_task();
 
-    let queued = match take_slot() {
-        Some(slot) => {
-            let bytes = line.as_bytes();
-            let len = bytes.len().min(MSG_SIZE);
-            unsafe {
-                let text: &mut [u8; MSG_SIZE] = &mut *SLOTS[slot].text.get();
-                text[..len].copy_from_slice(&bytes[..len]);
-                *SLOTS[slot].len.get() = len;
-            }
-            /* Cannot fail: the ready ring holds every slot there is. */
-            if READY.push(slot) {
-                true
-            } else {
-                FREE.push(slot);
-                false
-            }
-        }
-        None => false,
-    };
-
+    let queued = LINES.send(|slot| {
+        let len = line.len().min(MSG_SIZE);
+        slot.text[..len].copy_from_slice(&line[..len]);
+        slot.len = len;
+    });
     if !queued {
         DROPPED_LINES.fetch_add(1, Ordering::Relaxed);
     }
@@ -347,37 +307,26 @@ fn enqueue(line: &str) -> bool {
 
 /// Lines off the ready ring into `pending`, as many as there is room for;
 /// true if any came.
-///
-/// # Safety
-/// The caller holds `IN_FLUSH`, or the machine is on its way down.
-unsafe fn drain(w: &mut Writer) -> bool {
+fn drain(w: &mut Writer) -> bool {
     let mut drained = false;
 
     while PENDING_SIZE - w.pending_used >= MSG_SIZE {
-        let slot = match READY.pop() {
-            Some(slot) => slot,
-            None => break,
-        };
-
-        let len = unsafe { *SLOTS[slot].len.get() };
-        let text: &[u8; MSG_SIZE] = unsafe { &*SLOTS[slot].text.get() };
-        w.pending[w.pending_used..w.pending_used + len].copy_from_slice(&text[..len]);
-        w.pending_used += len;
+        let took = LINES.receive(|line| {
+            let at = w.pending_used;
+            w.pending[at..at + line.len].copy_from_slice(&line.text[..line.len]);
+            w.pending_used += line.len;
+        });
+        if took.is_none() {
+            break;
+        }
         drained = true;
-
-        /* Cannot fail either: the free ring holds every slot there is. */
-        FREE.push(slot);
     }
 
     drained
 }
 
 /// Everything queued, onto the disk.
-///
-/// # Safety
-/// The caller holds `IN_FLUSH`, or the machine is on its way down.
-unsafe fn write_out() {
-    let w = unsafe { writer() };
+fn write_out(w: &mut Writer) {
     let dev = match Disk::from_handle(DEV.load(Ordering::Relaxed)) {
         Some(dev) => dev,
         None => return,
@@ -389,7 +338,7 @@ unsafe fn write_out() {
     }
 
     loop {
-        let drained = unsafe { drain(w) };
+        let drained = drain(w);
 
         if w.full {
             /* The area is used up. What is queued still has to leave the
@@ -454,13 +403,11 @@ unsafe fn write_out() {
          * find the end without it -- the area is zeroed and the text is not --
          * but a header that agrees is the difference between a tool that has
          * to guess and one that knows. */
-        unsafe { write_header(w, &dev) };
+        write_header(w, &dev);
     }
 }
 
-/// # Safety
-/// The caller holds `IN_FLUSH`, or the machine is on its way down.
-unsafe fn write_header(w: &mut Writer, dev: &Disk) -> bool {
+fn write_header(w: &mut Writer, dev: &Disk) -> bool {
     let sector_size = SECTOR_SIZE.load(Ordering::Relaxed) as usize;
     if sector_size == 0 {
         return false;
@@ -497,16 +444,9 @@ fn flush() {
 
     /* One writer at a time. Losing the race costs nothing: the winner drains
      * the ring, and a line queued behind its last look is the next wake's. */
-    if IN_FLUSH
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        return;
+    if let Some(mut writer) = WRITER.try_lock() {
+        write_out(&mut writer);
     }
-
-    unsafe { write_out() };
-
-    IN_FLUSH.store(false, Ordering::Release);
 }
 
 /// Push everything queued, from the panic path. Best effort by construction
@@ -519,19 +459,22 @@ pub fn panic_flush() {
         return;
     }
 
-    /* No IN_FLUSH: every other CPU has been sent the halting IPI by now, and
-     * a flag one of them died holding -- the task stopped mid-write, say --
-     * must not keep the report off the disk. Interrupts are off here, so the
-     * device write may not complete -- best effort, and the console already
-     * has the report. A line whose producer was stopped between claiming its
-     * cell and publishing it holds up the ring behind it; what came before
-     * still goes. */
-    unsafe { write_out() };
+    /* With the lock or without it: every other CPU has been sent the halting
+     * IPI by now, and a lock one of them died holding -- the task stopped
+     * mid-write, say -- must not keep the report off the disk. Interrupts are
+     * off here, so the device write may not complete -- best effort, and the
+     * console already has the report. A line whose producer was stopped
+     * between claiming its cell and publishing it holds up the ring behind
+     * it; what came before still goes. */
+    match WRITER.try_lock() {
+        Some(mut writer) => write_out(&mut writer),
+        None => write_out(unsafe { WRITER.steal() }),
+    }
 }
 
 /* ---- the writer task ---- */
 
-extern "C" fn run(_ctx: *mut u8) {
+fn run() {
     while !task::stopping() {
         flush();
 
@@ -539,11 +482,9 @@ extern "C" fn run(_ctx: *mut u8) {
          * The event counts its signals, so one that lands between the flush
          * above and the wait below is not lost -- the wait returns at once
          * and the next round takes the line. */
-        let wake = WAKE.load(Ordering::Acquire);
-        if wake != 0 {
-            unsafe { ffi::sync::kernel_event_wait(wake) };
-        } else {
-            task::yield_to_runnable();
+        match WAKE.get() {
+            Some(wake) => wake.wait(),
+            None => task::yield_to_runnable(),
         }
     }
 
@@ -552,21 +493,28 @@ extern "C" fn run(_ctx: *mut u8) {
 }
 
 fn start_task() -> bool {
-    let event = match Event::new() {
-        Some(event) => event,
+    /* The event outlives the kernel: the task waits on it and `log` signals
+     * it from anywhere. A second start finds the first one's. */
+    if WAKE.get().is_none() {
+        match Event::new() {
+            Some(event) => { let _ = WAKE.set(event); }
+            None => return false,
+        }
+    }
+
+    let mut slot = match WRITER_TASK.try_lock() {
+        Some(slot) => slot,
         None => return false,
     };
-    /* The event outlives the kernel: the task waits on it and `log` signals
-     * it from anywhere, so nothing may drop it. */
-    let handle = event.handle();
-    core::mem::forget(event);
-    WAKE.store(handle, Ordering::Release);
 
-    /* Published before it runs (see WRITER). */
-    match task::spawn_with_ctx("disklog", run, core::ptr::null_mut()) {
+    /* Published the moment there is one (see WRITER_ID). A line the task
+     * logs before that is queued like anyone's and written once, which is
+     * harmless: what the id is for is a write that keeps failing, whose
+     * every trace would otherwise be another write. */
+    match task::spawn("disklog", run) {
         Some(handle) => {
-            WRITER.store(handle.id(), Ordering::Release);
-            core::mem::forget(handle);
+            WRITER_ID.store(handle.id(), Ordering::Release);
+            *slot = Some(handle);
             true
         }
         None => false,
@@ -574,19 +522,21 @@ fn start_task() -> bool {
 }
 
 fn stop_task() {
-    let writer = WRITER.swap(0, Ordering::AcqRel);
-    if writer == 0 {
-        return;
-    }
-
     /* Unpublished first, so no new line reaches for a task on its way out. */
-    unsafe { ffi::task::kernel_task_set_stopping(writer) };
-    let wake = WAKE.load(Ordering::Acquire);
-    if wake != 0 {
-        unsafe { ffi::sync::kernel_event_signal(wake) };
+    WRITER_ID.store(0, Ordering::Release);
+
+    let task = match WRITER_TASK.try_lock() {
+        Some(mut slot) => slot.take(),
+        None => None,
+    };
+    if let Some(task) = task {
+        task.request_stop();
+        if let Some(wake) = WAKE.get() {
+            wake.signal();
+        }
+        /* Waits for it to have written what it had. */
+        drop(task);
     }
-    unsafe { ffi::task::kernel_task_wait(writer) };
-    unsafe { ffi::task::kernel_task_put(writer) };
 }
 
 /* ---- bring-up and tear-down ---- */
@@ -605,14 +555,21 @@ pub fn setup() -> bool {
     /* Asked for, or nothing at all -- not a disk read, not a buffer. An area
      * outlives the debugging session it was prepared for, and finding one is
      * no reason for every later boot to pay a forced write per line. */
-    if unsafe { ffi::disklog::kernel_disklog_wanted() } != 1 {
+    if wanted() != Some(true) {
         switch_off();
         return false;
     }
 
     /* Nothing else is writing yet, and nothing will until this returns: the
      * area is not found, so `flush` does nothing and `log` only queues. */
-    let w = unsafe { writer() };
+    let mut writer = match WRITER.try_lock() {
+        Some(writer) => writer,
+        None => {
+            switch_off();
+            return false;
+        }
+    };
+    let w = &mut *writer;
     if w.io.is_none() {
         w.io = DmaBuffer::new(IO_BUF_SIZE / 4096);
         w.hdr = DmaBuffer::new(MAX_SECTOR_SIZE / 4096);
@@ -660,7 +617,7 @@ pub fn setup() -> bool {
         /* The header goes down before any text, so a machine that stops on
          * the very next line still leaves a readable area rather than the
          * previous boot's text under a stale length. */
-        if !unsafe { write_header(w, &dev) } {
+        if !write_header(w, &dev) {
             ENABLED.store(false, Ordering::Relaxed);
             switch_off();
             DEV.store(0, Ordering::Relaxed);
@@ -677,7 +634,8 @@ pub fn setup() -> bool {
         /* The boot so far -- the whole ring, the line above with it -- goes
          * down here, in this context and before setup returns: a machine that
          * stops right after still leaves all of it. */
-        flush();
+        write_out(w);
+        drop(writer);
 
         if !start_task() {
             trace!(0, "DiskLog: no writer task, the log on disk stops here");
@@ -760,7 +718,7 @@ pub fn stop() {
 
 pub fn dump(_args: &str, out: &mut Output) {
     if !ENABLED.load(Ordering::Relaxed) {
-        if unsafe { ffi::disklog::kernel_disklog_wanted() } != 1 {
+        if wanted() != Some(true) {
             let _ = writeln!(out, "disklog: off -- boot with disklog=on to write the \
 log to a prepared area");
             return;
@@ -768,13 +726,10 @@ log to a prepared area");
 
         let _ = writeln!(out, "disklog: no prepared area found");
         let _ = writeln!(out, "  {} lines queued, {} dropped",
-            READY.count(), DROPPED_LINES.load(Ordering::Relaxed));
+            LINES.waiting(), DROPPED_LINES.load(Ordering::Relaxed));
         return;
     }
 
-    /* The writer's counters are read as they stand, without its IN_FLUSH:
-     * for a report, a value a moment old is as good as any. */
-    let w = unsafe { &*WRITER_STATE.0.get() };
     let mut name = [0u8; 32];
     let dev = Disk::from_handle(DEV.load(Ordering::Relaxed));
     let dev_name = match dev.as_ref() {
@@ -785,11 +740,33 @@ log to a prepared area");
     let _ = writeln!(out, "disklog: {}, boot {}, {} sectors of {} bytes",
         dev_name, BOOT_SEQ.load(Ordering::Relaxed),
         AREA_SECTORS.load(Ordering::Relaxed), SECTOR_SIZE.load(Ordering::Relaxed));
-    let _ = writeln!(out, "  on disk {} bytes, staged {}, queued {}, sector writes {}",
-        w.cursor, w.pending_used, READY.count(), w.sector_writes);
-    let _ = writeln!(out, "  failures {}, dropped {} lines and {} bytes, full {}, off {}",
-        w.write_failures, DROPPED_LINES.load(Ordering::Relaxed), w.dropped_bytes,
-        w.full as u32, OFF.load(Ordering::Relaxed) as u32);
+
+    /* The writer's own numbers are the writer's while it writes. A write is
+     * milliseconds, so it is waited for a little -- and no longer: a report
+     * that says the writer is busy is still a report. */
+    let mut writer = WRITER.try_lock();
+    for _ in 0..REPORT_TRIES {
+        if writer.is_some() {
+            break;
+        }
+        task::sleep_ms(REPORT_WAIT_MS);
+        writer = WRITER.try_lock();
+    }
+
+    match writer {
+        Some(w) => {
+            let _ = writeln!(out, "  on disk {} bytes, staged {}, queued {}, sector writes {}",
+                w.cursor, w.pending_used, LINES.waiting(), w.sector_writes);
+            let _ = writeln!(out, "  failures {}, dropped {} lines and {} bytes, full {}, off {}",
+                w.write_failures, DROPPED_LINES.load(Ordering::Relaxed), w.dropped_bytes,
+                w.full as u32, OFF.load(Ordering::Relaxed) as u32);
+        }
+        None => {
+            let _ = writeln!(out, "  the writer is busy; queued {}, dropped {} lines, off {}",
+                LINES.waiting(), DROPPED_LINES.load(Ordering::Relaxed),
+                OFF.load(Ordering::Relaxed) as u32);
+        }
+    }
 }
 
 /* ---- what the kernel calls ---- */
@@ -803,12 +780,9 @@ pub unsafe extern "C" fn rust_disklog_log(line: *const u8) {
     if line.is_null() {
         return;
     }
-    let text = unsafe { core::ffi::CStr::from_ptr(line as *const core::ffi::c_char) };
-    match text.to_str() {
-        Ok(text) => log(text),
-        /* Not UTF-8: the bytes still belong in the log. */
-        Err(_) => log(unsafe { core::str::from_utf8_unchecked(text.to_bytes()) }),
-    }
+    /* Bytes, whatever they spell: a line that is not UTF-8 still belongs in
+     * the log. */
+    log(unsafe { core::ffi::CStr::from_ptr(line.cast()) }.to_bytes());
 }
 
 #[no_mangle]

@@ -21,7 +21,6 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::fmt;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -143,23 +142,15 @@ kmod::module!(name: "sshd", init: init);
 
 /// A value behind a kernel mutex, which sleeps: never held while waiting
 /// for a task, nor taken by anything such a task could be waiting in.
-struct Locked<T> {
-    lock: Mutex,
-    value: UnsafeCell<T>,
-}
-
-/* value is only reached under lock */
-unsafe impl<T: Send> Send for Locked<T> {}
-unsafe impl<T: Send> Sync for Locked<T> {}
+struct Locked<T>(Mutex<T>);
 
 impl<T> Locked<T> {
     fn new(value: T) -> Option<Self> {
-        Some(Self { lock: Mutex::new()?, value: UnsafeCell::new(value) })
+        Some(Self(Mutex::new(value)?))
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        let _guard = self.lock.lock();
-        f(unsafe { &mut *self.value.get() })
+        f(&mut self.0.lock())
     }
 }
 

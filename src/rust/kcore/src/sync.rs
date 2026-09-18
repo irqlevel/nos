@@ -1,92 +1,132 @@
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, Ordering};
 use ffi::sync;
 
-pub struct Mutex {
+/* Every lock here owns what it guards. `lock()` hands back a guard that
+ * derefs to the data and releases on drop, so neither the access nor the
+ * unlock is `unsafe` at a call site -- the one place that needs it is the
+ * guard's own `Deref`, below, once per lock type.
+ *
+ * Guards are values: two may be held at once and dropped in either order
+ * (`drop(a)` before `b` goes out of scope), and a function that takes a lock
+ * on its caller's behalf returns the guard. A lock that guards nothing --
+ * one that only serialises a stretch of code -- is a lock over `()`. */
+
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+
+/// The kernel's mutex: a taker that finds it held sleeps. Task context only.
+pub struct Mutex<T> {
     handle: usize,
+    data: UnsafeCell<T>,
 }
 
-impl Mutex {
-    pub fn new() -> Option<Self> {
+/* The mutex is what makes handing `&mut T` to one thread at a time sound. */
+unsafe impl<T: Send> Send for Mutex<T> {}
+unsafe impl<T: Send> Sync for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    /// None when the kernel has no memory for one.
+    pub fn new(data: T) -> Option<Self> {
         let h = unsafe { sync::kernel_mutex_create() };
         if h == 0 {
             None
         } else {
-            Some(Self { handle: h })
+            Some(Self { handle: h, data: UnsafeCell::new(data) })
         }
     }
 
-    pub fn lock(&self) -> MutexGuard<'_> {
-        unsafe {
-            sync::kernel_mutex_lock(self.handle);
-        }
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        unsafe { sync::kernel_mutex_lock(self.handle) };
         MutexGuard { mutex: self, _not_send: PhantomData }
     }
 }
 
-impl Drop for Mutex {
+impl<T> Drop for Mutex<T> {
     fn drop(&mut self) {
-        unsafe {
-            sync::kernel_mutex_destroy(self.handle);
-        }
+        unsafe { sync::kernel_mutex_destroy(self.handle) };
     }
 }
 
-pub struct MutexGuard<'a> {
-    mutex: &'a Mutex,
+pub struct MutexGuard<'a, T> {
+    mutex: &'a Mutex<T>,
     _not_send: PhantomData<*const ()>,
 }
 
-impl<'a> Drop for MutexGuard<'a> {
-    fn drop(&mut self) {
-        unsafe {
-            sync::kernel_mutex_unlock(self.mutex.handle);
-        }
+impl<T> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.data.get() }
     }
 }
 
-pub struct SpinLock {
-    handle: usize,
+impl<T> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.data.get() }
+    }
 }
 
-impl SpinLock {
-    pub fn new() -> Option<Self> {
+impl<T> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        unsafe { sync::kernel_mutex_unlock(self.mutex.handle) };
+    }
+}
+
+/// The kernel's spin lock: interrupts and preemption off while it is held.
+/// The one to use unless it cannot be had -- see [`IrqSpinLock`].
+pub struct SpinLock<T> {
+    handle: usize,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for SpinLock<T> {}
+unsafe impl<T: Send> Sync for SpinLock<T> {}
+
+impl<T> SpinLock<T> {
+    /// None when the kernel has no memory for one.
+    pub fn new(data: T) -> Option<Self> {
         let h = unsafe { sync::kernel_spinlock_create() };
         if h == 0 {
             None
         } else {
-            Some(Self { handle: h })
+            Some(Self { handle: h, data: UnsafeCell::new(data) })
         }
     }
 
-    pub fn lock(&self) -> SpinLockGuard<'_> {
+    pub fn lock(&self) -> SpinLockGuard<'_, T> {
         let flags = unsafe { sync::kernel_spinlock_lock(self.handle) };
-        SpinLockGuard {
-            lock: self,
-            flags,
-            _not_send: PhantomData,
-        }
+        SpinLockGuard { lock: self, flags, _not_send: PhantomData }
     }
 }
 
-impl Drop for SpinLock {
+impl<T> Drop for SpinLock<T> {
     fn drop(&mut self) {
-        unsafe {
-            sync::kernel_spinlock_destroy(self.handle);
-        }
+        unsafe { sync::kernel_spinlock_destroy(self.handle) };
     }
 }
 
-pub struct SpinLockGuard<'a> {
-    lock: &'a SpinLock,
+pub struct SpinLockGuard<'a, T> {
+    lock: &'a SpinLock<T>,
     flags: u64,
     _not_send: PhantomData<*const ()>,
 }
 
-impl<'a> Drop for SpinLockGuard<'a> {
+impl<T> Deref for SpinLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for SpinLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        unsafe {
-            sync::kernel_spinlock_unlock(self.lock.handle, self.flags);
-        }
+        unsafe { sync::kernel_spinlock_unlock(self.lock.handle, self.flags) };
     }
 }
 
@@ -327,8 +367,8 @@ impl Drop for Event {
     }
 }
 
-/// A spin lock that owns nothing: an atomic flag, with interrupts and
-/// preemption off while it is held.
+/// A spin lock made of an atomic flag, with interrupts and preemption off
+/// while it is held.
 ///
 /// [`SpinLock`] is the one to use -- it is the kernel's own, and it can be
 /// held across the things kernel locks may be held across. This one exists
@@ -339,112 +379,208 @@ impl Drop for Event {
 ///
 /// Nothing that sleeps may run while it is held, and nothing that takes
 /// longer than a few hundred instructions: interrupts are off on this CPU.
-pub struct IrqSpinLock {
-    held: core::sync::atomic::AtomicBool,
+pub struct IrqSpinLock<T> {
+    held: AtomicBool,
+    data: UnsafeCell<T>,
 }
 
-unsafe impl Send for IrqSpinLock {}
-unsafe impl Sync for IrqSpinLock {}
+unsafe impl<T: Send> Send for IrqSpinLock<T> {}
+unsafe impl<T: Send> Sync for IrqSpinLock<T> {}
 
-impl IrqSpinLock {
-    pub const fn new() -> Self {
-        Self { held: core::sync::atomic::AtomicBool::new(false) }
+impl<T> IrqSpinLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self { held: AtomicBool::new(false), data: UnsafeCell::new(data) }
     }
 
-    pub fn lock(&self) -> IrqSpinGuard<'_> {
-        let flags = self.lock_flags();
-        IrqSpinGuard { lock: self, flags }
-    }
-
-    /// Taken by hand, giving back the flags to release it with. For code
-    /// that holds two of these at once, or releases them in an order a
-    /// guard's scope cannot express -- a queue with a lock per device, say.
-    pub fn lock_flags(&self) -> usize {
-        use core::sync::atomic::Ordering;
-
+    pub fn lock(&self) -> IrqSpinGuard<'_, T> {
         /* Interrupts off first: a CPU that takes an interrupt while holding
          * this, and whose handler takes it again, deadlocks against itself. */
         let flags = unsafe { ffi::cpu::kernel_irq_save() };
         while self.held.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
-        flags
+        IrqSpinGuard { lock: self, flags }
     }
 
-    /// One attempt, no spin. Interrupts go off either way; the flag says
-    /// whether the lock was taken, and the caller decides what to do if it
-    /// was not. For the panic path, whose lock may be held by a CPU that is
-    /// never going to release it.
-    pub fn try_lock_flags(&self) -> (usize, bool) {
-        use core::sync::atomic::Ordering;
-
+    /// One attempt, no spin: None when someone else has it. For the panic
+    /// path, whose lock may be held by a CPU that is never going to release
+    /// it.
+    pub fn try_lock(&self) -> Option<IrqSpinGuard<'_, T>> {
         let flags = unsafe { ffi::cpu::kernel_irq_save() };
-        let taken = !self.held.swap(true, Ordering::Acquire);
-        (flags, taken)
+        if self.held.swap(true, Ordering::Acquire) {
+            unsafe { ffi::cpu::kernel_irq_restore(flags) };
+            None
+        } else {
+            Some(IrqSpinGuard { lock: self, flags })
+        }
     }
 
+    /// The data, around the lock. For the panic path once `try_lock` has
+    /// failed: every other CPU has been sent the halting IPI, and a lock one
+    /// of them died holding must not keep the report from going out.
+    ///
     /// # Safety
-    /// This caller holds it, with `flags` from the call that took it.
-    pub unsafe fn unlock_flags(&self, flags: usize) {
-        use core::sync::atomic::Ordering;
+    /// Nothing else is running that could touch the data: the rest of the
+    /// machine is stopped.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn steal(&self) -> &mut T {
+        unsafe { &mut *self.data.get() }
+    }
 
-        self.held.store(false, Ordering::Release);
-        unsafe { ffi::cpu::kernel_irq_restore(flags) };
+    /// The data, for code the holder itself called. A driver's `flush_tx`
+    /// runs under its device's transmit lock and calls back into the device
+    /// for the queue that very lock guards: taking it again would wait for
+    /// itself, and the guard is a frame up the stack, on the far side of a
+    /// C ABI.
+    ///
+    /// # Safety
+    /// The lock is held by the call chain this is made from, and the holder
+    /// does not reach through its guard until the borrow returned here ends.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn reenter(&self) -> &mut T {
+        unsafe { &mut *self.data.get() }
     }
 }
 
-pub struct IrqSpinGuard<'a> {
-    lock: &'a IrqSpinLock,
+pub struct IrqSpinGuard<'a, T> {
+    lock: &'a IrqSpinLock<T>,
     flags: usize,
 }
 
-impl Drop for IrqSpinGuard<'_> {
-    fn drop(&mut self) {
-        use core::sync::atomic::Ordering;
+impl<T> Deref for IrqSpinGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
 
+impl<T> DerefMut for IrqSpinGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for IrqSpinGuard<'_, T> {
+    fn drop(&mut self) {
         self.lock.held.store(false, Ordering::Release);
         unsafe { ffi::cpu::kernel_irq_restore(self.flags) };
     }
 }
 
-/// A spin lock that owns nothing and takes and releases by hand, holding
-/// preemption off while it is taken -- the kernel's own `RawSpinLock`, in
-/// the shape Rust can put in a `static`.
+/// A spin lock made of an atomic flag that holds preemption off while it is
+/// taken -- the kernel's own `RawSpinLock`, in the shape Rust can put in a
+/// `static`.
 ///
 /// Interrupts stay **on**. That is what makes it the wrong lock for anything
 /// a hard interrupt handler touches (use [`IrqSpinLock`] there) and the right
-/// one for a pool with a lock per entry: two of these can be held at once and
-/// released in either order, which a guard's scope cannot express. The holder
-/// cannot be switched away, so no other taker spins out a whole time slice.
+/// one for a pool with a lock per entry, where a holder may go on to do work
+/// that must not run with interrupts off. The holder cannot be switched away,
+/// so no other taker spins out a whole time slice.
 ///
 /// Nothing that sleeps may run while it is held.
-pub struct PreemptSpinLock {
-    held: core::sync::atomic::AtomicBool,
+pub struct PreemptSpinLock<T> {
+    held: AtomicBool,
+    data: UnsafeCell<T>,
 }
 
-unsafe impl Send for PreemptSpinLock {}
-unsafe impl Sync for PreemptSpinLock {}
+unsafe impl<T: Send> Send for PreemptSpinLock<T> {}
+unsafe impl<T: Send> Sync for PreemptSpinLock<T> {}
 
-impl PreemptSpinLock {
-    pub const fn new() -> Self {
-        Self { held: core::sync::atomic::AtomicBool::new(false) }
+impl<T> PreemptSpinLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self { held: AtomicBool::new(false), data: UnsafeCell::new(data) }
     }
 
-    pub fn lock(&self) {
-        use core::sync::atomic::Ordering;
-
+    pub fn lock(&self) -> PreemptSpinGuard<'_, T> {
         unsafe { ffi::cpu::kernel_preempt_disable() };
         while self.held.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
+        PreemptSpinGuard { lock: self }
+    }
+}
+
+pub struct PreemptSpinGuard<'a, T> {
+    lock: &'a PreemptSpinLock<T>,
+}
+
+impl<T> Deref for PreemptSpinGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for PreemptSpinGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for PreemptSpinGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.held.store(false, Ordering::Release);
+        unsafe { ffi::cpu::kernel_preempt_enable() };
+    }
+}
+
+/// A lock nobody ever waits for: `try_lock` takes it or says it is taken,
+/// and that is all. For work that one caller at a time must do and that
+/// anyone may start -- a log's writer, say, where losing the race costs
+/// nothing because the winner does the loser's work too. The holder may
+/// sleep: nothing spins on this, and neither interrupts nor preemption are
+/// touched.
+pub struct TryLock<T> {
+    held: AtomicBool,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: Send> Send for TryLock<T> {}
+unsafe impl<T: Send> Sync for TryLock<T> {}
+
+impl<T> TryLock<T> {
+    pub const fn new(data: T) -> Self {
+        Self { held: AtomicBool::new(false), data: UnsafeCell::new(data) }
     }
 
-    /// # Safety
-    /// This caller holds it.
-    pub unsafe fn unlock(&self) {
-        use core::sync::atomic::Ordering;
+    pub fn try_lock(&self) -> Option<TryLockGuard<'_, T>> {
+        if self.held.swap(true, Ordering::Acquire) {
+            None
+        } else {
+            Some(TryLockGuard { lock: self })
+        }
+    }
 
-        self.held.store(false, Ordering::Release);
-        unsafe { ffi::cpu::kernel_preempt_enable() };
+    /// The data, around the lock: the panic path's, as `IrqSpinLock::steal`.
+    ///
+    /// # Safety
+    /// Nothing else is running that could touch the data: the rest of the
+    /// machine is stopped.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn steal(&self) -> &mut T {
+        unsafe { &mut *self.data.get() }
+    }
+}
+
+pub struct TryLockGuard<'a, T> {
+    lock: &'a TryLock<T>,
+}
+
+impl<T> Deref for TryLockGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T> DerefMut for TryLockGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T> Drop for TryLockGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.held.store(false, Ordering::Release);
     }
 }

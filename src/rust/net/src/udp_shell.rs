@@ -61,25 +61,61 @@ struct Request {
     ready: bool,
 }
 
-pub struct UdpShell {
-    lock: SpinLock,
-    request: core::cell::UnsafeCell<Request>,
-    /// Signalled when a command is in, and by `stop`
-    arrived: Event,
-
-    reply: core::cell::UnsafeCell<Vec<u8>>,
-    truncated: core::cell::UnsafeCell<bool>,
-
-    nic: core::cell::UnsafeCell<Option<Nic>>,
-    port: core::cell::UnsafeCell<u16>,
-    listener: core::cell::UnsafeCell<Option<UdpListener>>,
-    task: core::cell::UnsafeCell<Option<TaskHandle>>,
-    running: AtomicBool,
+/// What the receive path and the task share.
+struct State {
+    request: Request,
+    nic: Option<Nic>,
+    port: u16,
 }
 
-/* Everything inside is touched with the lock held, or by the one task */
-unsafe impl Sync for UdpShell {}
-unsafe impl Send for UdpShell {}
+/// What a command printed, gathered for the reply. The task's own: it takes
+/// this out of the shell when it starts and works on it as a local, so the
+/// output of a command -- which may sleep, and run for seconds -- is never
+/// written under a lock.
+struct Reply {
+    buf: Vec<u8>,
+    truncated: bool,
+}
+
+impl Reply {
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.truncated = false;
+    }
+
+    fn collect(&mut self, piece: &[u8]) {
+        let room = REPLY_CAP - self.buf.len();
+        let take = piece.len().min(room);
+        if take < piece.len() {
+            self.truncated = true;
+        }
+        self.buf.extend_from_slice(&piece[..take]);
+    }
+
+    /// Stamp the marker if anything was dropped. There is by definition no
+    /// room left to append it, so it goes over the tail of what did fit.
+    fn finish(&mut self) {
+        if !self.truncated || self.buf.len() < TRUNCATED.len() {
+            return;
+        }
+        let at = self.buf.len() - TRUNCATED.len();
+        self.buf[at..].copy_from_slice(TRUNCATED);
+    }
+}
+
+pub struct UdpShell {
+    state: SpinLock<State>,
+    /// Signalled when a command is in, and by `stop`
+    arrived: Event,
+    /// The reply buffer, while no task has it: made once, so that a shell
+    /// that cannot have one fails to start rather than to answer.
+    reply: SpinLock<Option<Reply>>,
+    /* Never dropped under a lock: giving a port back waits for the receive
+     * path, and giving a task back waits for the task. */
+    listener: SpinLock<Option<UdpListener>>,
+    task: SpinLock<Option<TaskHandle>>,
+    running: AtomicBool,
+}
 
 impl UdpShell {
     pub fn new() -> Option<UdpShell> {
@@ -90,18 +126,18 @@ impl UdpShell {
         }
 
         Some(UdpShell {
-            lock: SpinLock::new()?,
-            request: core::cell::UnsafeCell::new(Request {
-                cmd: [0; CMD_MAX], len: 0, from_ip: 0, from_port: 0,
-                seq: [0; 4], ready: false,
-            }),
+            state: SpinLock::new(State {
+                request: Request {
+                    cmd: [0; CMD_MAX], len: 0, from_ip: 0, from_port: 0,
+                    seq: [0; 4], ready: false,
+                },
+                nic: None,
+                port: 0,
+            })?,
             arrived: Event::new()?,
-            reply: core::cell::UnsafeCell::new(reply),
-            truncated: core::cell::UnsafeCell::new(false),
-            nic: core::cell::UnsafeCell::new(None),
-            port: core::cell::UnsafeCell::new(0),
-            listener: core::cell::UnsafeCell::new(None),
-            task: core::cell::UnsafeCell::new(None),
+            reply: SpinLock::new(Some(Reply { buf: reply, truncated: false }))?,
+            listener: SpinLock::new(None)?,
+            task: SpinLock::new(None)?,
             running: AtomicBool::new(false),
         })
     }
@@ -115,14 +151,13 @@ impl UdpShell {
             return false;
         }
 
-        unsafe {
-            *self.nic.get() = Some(nic);
-            *self.port.get() = port;
+        {
+            let mut state = self.state.lock();
+            state.nic = Some(nic);
+            state.port = port;
         }
 
-        let task = match kcore::task::spawn_with_ctx(
-            "udpsh", run, self as *const _ as *mut u8)
-        {
+        let task = match kcore::task::spawn_for("udpsh", self, UdpShell::run) {
             Some(task) => task,
             None => {
                 self.running.store(false, Ordering::Release);
@@ -130,11 +165,11 @@ impl UdpShell {
             }
         };
 
-        match nic.listen_udp(port, on_datagram, self as *const _ as *mut u8) {
-            Ok(listener) => unsafe {
-                *self.listener.get() = Some(listener);
-                *self.task.get() = Some(task);
-            },
+        match nic.listen(port, self) {
+            Ok(listener) => {
+                *self.listener.lock() = Some(listener);
+                *self.task.lock() = Some(task);
+            }
             Err(err) => {
                 trace!(0, "udpshell: port {} could not be listened on ({:?})", port, err);
                 task.request_stop();
@@ -152,18 +187,20 @@ impl UdpShell {
     pub fn stop(&self) {
         /* Off the port first, so nothing new arrives for a task that is
          * leaving */
-        unsafe { *self.listener.get() = None };
+        let listener = self.listener.lock().take();
+        drop(listener);
 
-        let task = unsafe { (*self.task.get()).take() };
+        let task = self.task.lock().take();
         if let Some(task) = task {
             task.request_stop();
             self.arrived.signal();
             drop(task);
         }
 
-        unsafe {
-            *self.nic.get() = None;
-            *self.port.get() = 0;
+        {
+            let mut state = self.state.lock();
+            state.nic = None;
+            state.port = 0;
         }
         self.running.store(false, Ordering::Release);
     }
@@ -190,8 +227,8 @@ impl UdpShell {
             return;
         }
 
-        let _guard = self.lock.lock();
-        let request = unsafe { &mut *self.request.get() };
+        let mut state = self.state.lock();
+        let request = &mut state.request;
         if request.ready {
             /* The one before it has not been run yet */
             return;
@@ -212,37 +249,6 @@ impl UdpShell {
 
     /* ---- replying ---- */
 
-    /// What a command printed, gathered into the reply buffer.
-    fn collect(&self, piece: &[u8]) {
-        let reply = unsafe { &mut *self.reply.get() };
-        let room = REPLY_CAP - reply.len();
-        if room == 0 {
-            unsafe { *self.truncated.get() = true };
-            return;
-        }
-
-        let take = piece.len().min(room);
-        if take < piece.len() {
-            unsafe { *self.truncated.get() = true };
-        }
-        reply.extend_from_slice(&piece[..take]);
-    }
-
-    /// Stamp the marker if anything was dropped. There is by definition no
-    /// room left to append it, so it goes over the tail of what did fit.
-    fn finish(&self) {
-        if !unsafe { *self.truncated.get() } {
-            return;
-        }
-
-        let reply = unsafe { &mut *self.reply.get() };
-        if reply.len() < TRUNCATED.len() {
-            return;
-        }
-        let at = reply.len() - TRUNCATED.len();
-        reply[at..].copy_from_slice(TRUNCATED);
-    }
-
     /// One reply datagram: the header, then this much of the output.
     fn send_chunk(
         &self, nic: &Nic, to_ip: u32, to_port: u16, seq: &[u8; 4], chunk: u16, last: bool,
@@ -260,16 +266,28 @@ impl UdpShell {
             Some(arp) => arp,
             None => return,
         };
-        let port = unsafe { *self.port.get() };
+        let port = self.state.lock().port;
         udp::send(nic, arp, to_ip, to_port, nic.ip(), port,
             &buf[..HDR_LEN + payload.len()]);
     }
 
-    fn run(&self) {
+    fn run(&'static self) {
+        /* The reply buffer is this task's for as long as it runs. */
+        let mut reply = match self.reply.lock().take() {
+            Some(reply) => reply,
+            None => return,
+        };
+
+        self.serve(&mut reply);
+
+        *self.reply.lock() = Some(reply);
+    }
+
+    fn serve(&self, reply: &mut Reply) {
         while !kcore::task::stopping() {
             let (cmd, len, to_ip, to_port, seq) = {
-                let _guard = self.lock.lock();
-                let request = unsafe { &mut *self.request.get() };
+                let mut state = self.state.lock();
+                let request = &mut state.request;
                 if !request.ready {
                     (None, 0, 0, 0, [0u8; 4])
                 } else {
@@ -309,21 +327,15 @@ impl UdpShell {
                 (to_ip >> 24) & 0xFF, (to_ip >> 16) & 0xFF,
                 (to_ip >> 8) & 0xFF, to_ip & 0xFF, to_port);
 
-            unsafe {
-                (*self.reply.get()).clear();
-                *self.truncated.get() = false;
-            }
-            kcore::cmd::dispatch(line, &mut |piece: &[u8]| self.collect(piece));
-            self.finish();
+            reply.clear();
+            kcore::cmd::dispatch(line, &mut |piece: &[u8]| reply.collect(piece));
+            reply.finish();
 
-            let nic = match unsafe { *self.nic.get() } {
+            let nic = match self.state.lock().nic {
                 Some(nic) => nic,
                 None => continue,
             };
-
-            /* The reply is read here and nothing else writes it until the
-             * next command, which this same task takes. */
-            let reply = unsafe { &*self.reply.get() };
+            let reply = &reply.buf;
 
             if reply.is_empty() {
                 /* Nothing printed: a header alone, flagged last, so the
@@ -354,22 +366,9 @@ impl UdpShell {
     }
 }
 
-/// The task the shell runs in.
-extern "C" fn run(ctx: *mut u8) {
-    if ctx.is_null() {
-        return;
+/// What the receive path hands every datagram on the shell's port to.
+impl kcore::net::UdpHandler for UdpShell {
+    fn on_frame(&'static self, frame: kcore::net::Lent<'_>, _rx: &mut kcore::net::RxContext) {
+        self.receive(frame.bytes());
     }
-    let shell = unsafe { &*(ctx as *const UdpShell) };
-    shell.run();
-}
-
-/// The frame listener: what the receive softirq hands every datagram on the
-/// shell's port.
-extern "C" fn on_datagram(ctx: *mut u8, frame: usize) {
-    if ctx.is_null() {
-        return;
-    }
-    let shell = unsafe { &*(ctx as *const UdpShell) };
-    let bytes = unsafe { kcore::net::NetFrame::lent(frame) };
-    shell.receive(bytes);
 }

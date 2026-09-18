@@ -64,8 +64,7 @@ const EXCHANGE_TIMEOUT_MS: u64 = 3000;
 const POLL_INTERVAL_MS: u64 = 10;
 const TRIES: u32 = 3;
 
-/// What the lease turned out to be. The C++ side declares the same struct.
-#[repr(C)]
+/// What the lease turned out to be.
 #[derive(Clone, Copy, Default)]
 pub struct Lease {
     pub ip: u32,
@@ -82,42 +81,45 @@ struct Received {
     ready: bool,
 }
 
-pub struct Dhcp {
-    /// Guards the received slot and everything the task and the listener
-    /// both touch.
-    lock: SpinLock,
-    rx: core::cell::UnsafeCell<Received>,
-    lease: core::cell::UnsafeCell<Lease>,
-    offered_ip: core::cell::UnsafeCell<u32>,
-    server_id: core::cell::UnsafeCell<u32>,
-    xid: core::cell::UnsafeCell<u32>,
-    naked: AtomicBool,
+/// What the task, the listener and the shell all reach: one lock over all
+/// of it. None of it is on a path where the lock could matter.
+struct State {
+    rx: Received,
+    lease: Lease,
+    offered_ip: u32,
+    server_id: u32,
+    xid: u32,
+    nic: Option<Nic>,
+}
 
-    nic: core::cell::UnsafeCell<Option<Nic>>,
-    listener: core::cell::UnsafeCell<Option<UdpListener>>,
-    task: core::cell::UnsafeCell<Option<TaskHandle>>,
+pub struct Dhcp {
+    state: SpinLock<State>,
+    /* The two things that must never be dropped under a lock: giving a port
+     * back waits for the receive path to leave the callback -- which takes
+     * `state` -- and giving a task back waits for the task. Each is taken out
+     * under its lock and let go of after. */
+    listener: SpinLock<Option<UdpListener>>,
+    task: SpinLock<Option<TaskHandle>>,
+
+    naked: AtomicBool,
     ready: AtomicBool,
     running: AtomicBool,
 }
 
-/* Everything inside is touched with the lock held, or by the one task */
-unsafe impl Sync for Dhcp {}
-unsafe impl Send for Dhcp {}
-
 impl Dhcp {
     pub fn new() -> Option<Dhcp> {
         Some(Dhcp {
-            lock: SpinLock::new()?,
-            rx: core::cell::UnsafeCell::new(
-                Received { buf: [0; RX_MAX], len: 0, ready: false }),
-            lease: core::cell::UnsafeCell::new(Lease::default()),
-            offered_ip: core::cell::UnsafeCell::new(0),
-            server_id: core::cell::UnsafeCell::new(0),
-            xid: core::cell::UnsafeCell::new(0),
+            state: SpinLock::new(State {
+                rx: Received { buf: [0; RX_MAX], len: 0, ready: false },
+                lease: Lease::default(),
+                offered_ip: 0,
+                server_id: 0,
+                xid: 0,
+                nic: None,
+            })?,
+            listener: SpinLock::new(None)?,
+            task: SpinLock::new(None)?,
             naked: AtomicBool::new(false),
-            nic: core::cell::UnsafeCell::new(None),
-            listener: core::cell::UnsafeCell::new(None),
-            task: core::cell::UnsafeCell::new(None),
             ready: AtomicBool::new(false),
             running: AtomicBool::new(false),
         })
@@ -128,8 +130,7 @@ impl Dhcp {
     }
 
     pub fn lease(&self) -> Lease {
-        let _guard = self.lock.lock();
-        unsafe { *self.lease.get() }
+        self.state.lock().lease
     }
 
     /// Start the client on `nic`. False when one is running already.
@@ -138,18 +139,19 @@ impl Dhcp {
             return false;
         }
 
-        unsafe {
-            *self.nic.get() = Some(nic);
+        {
+            let mut state = self.state.lock();
+            state.nic = Some(nic);
             /* The transaction id is the client's own; the entropy pool is a
              * better source than the boot time the C++ used, and by this
              * point it has been fed. */
-            *self.xid.get() = kcore::random::random_u64().unwrap_or(0x1234_5678) as u32;
+            state.xid = kcore::random::random_u64().unwrap_or(0x1234_5678) as u32;
         }
         self.ready.store(false, Ordering::Release);
 
-        match kcore::task::spawn_with_ctx("dhcp", run, self as *const _ as *mut u8) {
+        match kcore::task::spawn_for("dhcp", self, Dhcp::run) {
             Some(task) => {
-                unsafe { *self.task.get() = Some(task) };
+                *self.task.lock() = Some(task);
                 true
             }
             None => {
@@ -162,7 +164,7 @@ impl Dhcp {
 
     /// Stop the client and give up the port. Waits for the task to leave.
     pub fn stop(&self) {
-        let task = unsafe { (*self.task.get()).take() };
+        let task = self.task.lock().take();
         if let Some(task) = task {
             task.request_stop();
             /* Dropping the handle waits for the task and releases it */
@@ -170,16 +172,16 @@ impl Dhcp {
         }
 
         self.unlisten();
-        unsafe { *self.nic.get() = None };
+        self.state.lock().nic = None;
         self.running.store(false, Ordering::Release);
     }
 
     fn nic(&self) -> Option<Nic> {
-        unsafe { *self.nic.get() }
+        self.state.lock().nic
     }
 
     fn listen(&'static self) {
-        if unsafe { (*self.listener.get()).is_some() } {
+        if self.listener.lock().is_some() {
             return;
         }
         let nic = match self.nic() {
@@ -187,8 +189,8 @@ impl Dhcp {
             None => return,
         };
 
-        match nic.listen_udp(CLIENT_PORT, on_datagram, self as *const _ as *mut u8) {
-            Ok(listener) => unsafe { *self.listener.get() = Some(listener) },
+        match nic.listen(CLIENT_PORT, self) {
+            Ok(listener) => *self.listener.lock() = Some(listener),
             Err(err) => trace!(0, "dhcp: port {} could not be listened on ({:?})",
                 CLIENT_PORT, err),
         }
@@ -196,8 +198,10 @@ impl Dhcp {
 
     fn unlisten(&self) {
         /* Dropping the listener takes it off the port and returns once no
-         * call of the callback is still running. */
-        unsafe { *self.listener.get() = None };
+         * call of the callback is still running -- so it is dropped with the
+         * lock down, which the statement's end sees to. */
+        let listener = self.listener.lock().take();
+        drop(listener);
     }
 
     /* ---- the exchange ---- */
@@ -208,15 +212,14 @@ impl Dhcp {
     /// devices answer within the doorbell's write -- a flag cleared after
     /// the send threw every one of those answers away.
     fn arm(&self) {
-        let _guard = self.lock.lock();
-        unsafe { (*self.rx.get()).ready = false };
+        self.state.lock().rx.ready = false;
         self.naked.store(false, Ordering::Release);
     }
 
     /// A received datagram on the client port, from the receive softirq.
     fn receive(&self, frame: &[u8]) {
-        let _guard = self.lock.lock();
-        let rx = unsafe { &mut *self.rx.get() };
+        let mut state = self.state.lock();
+        let rx = &mut state.rx;
 
         if rx.ready {
             /* The one before it has not been looked at yet */
@@ -238,8 +241,8 @@ impl Dhcp {
             let mut frame = [0u8; RX_MAX];
             let mut len = 0;
             {
-                let _guard = self.lock.lock();
-                let rx = unsafe { &mut *self.rx.get() };
+                let mut state = self.state.lock();
+                let rx = &mut state.rx;
                 if rx.ready {
                     len = rx.len;
                     frame[..len].copy_from_slice(&rx.buf[..len]);
@@ -319,7 +322,7 @@ impl Dhcp {
         frame[msg + OP] = BOOTREQUEST;
         frame[msg + HTYPE] = 1; /* Ethernet */
         frame[msg + HLEN] = 6;
-        let xid = unsafe { *self.xid.get() };
+        let xid = self.state.lock().xid;
         frame[msg + XID..msg + XID + 4].copy_from_slice(&xid.to_be_bytes());
         frame[msg + FLAGS..msg + FLAGS + 2].copy_from_slice(&flags.to_be_bytes());
         frame[msg + CIADDR..msg + CIADDR + 4].copy_from_slice(&ciaddr.to_be_bytes());
@@ -345,8 +348,9 @@ impl Dhcp {
     }
 
     fn build_request(&self, nic: &Nic, frame: &mut [u8], renewing: bool) -> usize {
-        let (lease, offered, server) = unsafe {
-            (*self.lease.get(), *self.offered_ip.get(), *self.server_id.get())
+        let (lease, offered, server) = {
+            let state = self.state.lock();
+            (state.lease, state.offered_ip, state.server_id)
         };
 
         /* Selecting (after an offer): the address asked for and the server
@@ -408,7 +412,7 @@ impl Dhcp {
         }
 
         let xid = u32::from_be_bytes([msg[XID], msg[XID + 1], msg[XID + 2], msg[XID + 3]]);
-        if xid != unsafe { *self.xid.get() } {
+        if xid != self.state.lock().xid {
             return false;
         }
         if msg[CHADDR..CHADDR + 6] != nic.mac() {
@@ -476,13 +480,16 @@ impl Dhcp {
             return false;
         }
 
-        let _guard = self.lock.lock();
-        unsafe {
-            *self.offered_ip.get() = yiaddr;
-            *self.server_id.get() = found.server_ip;
-            *self.lease.get() = found;
-        }
+        let mut state = self.state.lock();
+        state.offered_ip = yiaddr;
+        state.server_id = found.server_ip;
+        state.lease = found;
         true
+    }
+
+    fn next_transaction(&self) {
+        let mut state = self.state.lock();
+        state.xid = state.xid.wrapping_add(1);
     }
 
     /* ---- the lease's life ---- */
@@ -496,7 +503,7 @@ impl Dhcp {
                 if kcore::task::stopping() {
                     break;
                 }
-                unsafe { *self.xid.get() = (*self.xid.get()).wrapping_add(1) };
+                self.next_transaction();
 
                 if self.discover() && self.request(false) {
                     bound = true;
@@ -541,7 +548,7 @@ impl Dhcp {
 
             trace!(0, "dhcp: renewing");
             self.listen();
-            unsafe { *self.xid.get() = (*self.xid.get()).wrapping_add(1) };
+            self.next_transaction();
             let renewed = self.request(true);
             self.unlisten();
 
@@ -581,22 +588,9 @@ fn recompute_ip_checksum(packet: &mut [u8]) {
     packet[ip::CHECKSUM..ip::CHECKSUM + 2].copy_from_slice(&sum.to_be_bytes());
 }
 
-/// The task the client runs in.
-extern "C" fn run(ctx: *mut u8) {
-    if ctx.is_null() {
-        return;
+/// What the receive path hands every datagram on the client port to.
+impl kcore::net::UdpHandler for Dhcp {
+    fn on_frame(&'static self, frame: kcore::net::Lent<'_>, _rx: &mut kcore::net::RxContext) {
+        self.receive(frame.bytes());
     }
-    let dhcp = unsafe { &*(ctx as *const Dhcp) };
-    dhcp.run();
-}
-
-/// The frame listener: what the receive softirq hands every datagram on the
-/// client port.
-extern "C" fn on_datagram(ctx: *mut u8, frame: usize) {
-    if ctx.is_null() {
-        return;
-    }
-    let dhcp = unsafe { &*(ctx as *const Dhcp) };
-    let bytes = unsafe { kcore::net::NetFrame::lent(frame) };
-    dhcp.receive(bytes);
 }

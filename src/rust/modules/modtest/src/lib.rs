@@ -96,7 +96,7 @@ fn init() -> Result<Box<dyn kmod::Module>> {
     check(v.iter().sum::<u32>() == 5050, "a Vec from the kernel's allocator")?;
 
     /* A kernel object through the export table, created and destroyed. */
-    let lock = kcore::sync::SpinLock::new().ok_or(Error::NoMemory)?;
+    let lock = kcore::sync::SpinLock::new(()).ok_or(Error::NoMemory)?;
     {
         let _guard = lock.lock();
     }

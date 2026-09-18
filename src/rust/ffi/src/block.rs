@@ -62,11 +62,6 @@ extern "C" {
     /// if it does not fit.
     pub fn kernel_blockdev_name(handle: usize, buf: *mut u8, len: usize) -> usize;
 
-    /// The name as the table holds it: NUL-terminated, kept for as long as
-    /// the device is registered, which is for good. Null for a handle that
-    /// names nothing.
-    pub fn kernel_blockdev_name_ptr(handle: usize) -> *const u8;
-
     /// The disk a partition is on, or 0 for a whole disk.
     pub fn kernel_blockdev_parent(handle: usize) -> usize;
 

@@ -25,7 +25,7 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kcore::net::Nic;
-use kcore::sync::PreemptSpinLock;
+use kcore::sync::{PreemptSpinGuard, PreemptSpinLock};
 use kcore::trace;
 
 use crate::abi;
@@ -243,11 +243,6 @@ struct Inner {
     owned_by_app: bool,
     /// A passive connection already handed out by `accept`
     accepted: bool,
-
-    /// The next slot in this connection's hash bucket, or -1
-    hash_next: i8,
-    /// Whether it is in a bucket at all
-    hashed: bool,
 }
 
 impl Inner {
@@ -265,15 +260,11 @@ impl Inner {
             retransmit_at: 0, retransmit_count: 0, time_wait_at: 0, persist_at: 0,
             need_cleanup: false, fin_acked: false, owned_by_app: false,
             accepted: false,
-            hash_next: -1, hashed: false,
         }
     }
 
-    /// Everything but the buffers' bytes and the hash link, which the pool
-    /// keeps.
+    /// Everything but the buffers' bytes.
     fn init(&mut self) {
-        let hash_next = self.hash_next;
-        let hashed = self.hashed;
         self.local_ip = 0;
         self.local_port = 0;
         self.remote_ip = 0;
@@ -303,57 +294,180 @@ impl Inner {
         self.fin_acked = false;
         self.owned_by_app = false;
         self.accepted = false;
-        self.hash_next = hash_next;
-        self.hashed = hashed;
-    }
-
-    fn matches(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16)
-        -> bool
-    {
-        self.state != State::Free
-            && self.local_ip == local_ip && self.local_port == local_port
-            && self.remote_ip == remote_ip && self.remote_port == remote_port
     }
 }
 
+/// One connection: what its own lock guards, and the two flags a waiting
+/// task reads without it.
 pub struct Conn {
-    lock: PreemptSpinLock,
-    inner: core::cell::UnsafeCell<Inner>,
+    inner: PreemptSpinLock<Inner>,
     /// Data has arrived; read without the lock by a waiting task
     data_ready: AtomicBool,
     /// The state left SYN-SENT or SYN-RECEIVED
     conn_ready: AtomicBool,
 }
 
-unsafe impl Sync for Conn {}
-unsafe impl Send for Conn {}
-
 impl Conn {
     const fn new() -> Conn {
         Conn {
-            lock: PreemptSpinLock::new(),
-            inner: core::cell::UnsafeCell::new(Inner::new()),
+            inner: PreemptSpinLock::new(Inner::new()),
             data_ready: AtomicBool::new(false),
             conn_ready: AtomicBool::new(false),
         }
     }
+}
 
-    /// # Safety
-    /// The caller holds this connection's lock.
-    unsafe fn get(&self) -> &mut Inner {
-        unsafe { &mut *self.inner.get() }
+/* ---- the pool: which slot is whose ---- */
+
+/// No slot: the end of a hash chain, an empty bucket.
+const NONE: i8 = -1;
+
+/// What a slot is, as far as *finding* it goes -- and nothing more. A walk of
+/// the pool reads these and never a connection's own state, so it takes no
+/// connection's lock: the identity of a slot is the pool's to keep, written
+/// when the slot is handed out and when it comes back, both under the pool
+/// lock.
+#[derive(Clone, Copy)]
+struct Slot {
+    used: bool,
+    listening: bool,
+    local_ip: u32,
+    local_port: u16,
+    remote_ip: u32,
+    remote_port: u16,
+}
+
+impl Slot {
+    const FREE: Slot = Slot {
+        used: false, listening: false,
+        local_ip: 0, local_port: 0, remote_ip: 0, remote_port: 0,
+    };
+
+    fn is(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16) -> bool {
+        self.used && !self.listening
+            && self.local_ip == local_ip && self.local_port == local_port
+            && self.remote_ip == remote_ip && self.remote_port == remote_port
+    }
+}
+
+/// What the pool lock guards: the identity of every slot, the hash over the
+/// connected ones, and where the next ephemeral port comes from.
+struct Pool {
+    slots: [Slot; MAX_CONNECTIONS],
+    /// Head slot of each bucket
+    buckets: [i8; HASH_SIZE],
+    /// The chain through a bucket, per slot
+    next: [i8; MAX_CONNECTIONS],
+    hashed: [bool; MAX_CONNECTIONS],
+    next_ephemeral: u16,
+}
+
+impl Pool {
+    const fn new() -> Pool {
+        Pool {
+            slots: [Slot::FREE; MAX_CONNECTIONS],
+            buckets: [NONE; HASH_SIZE],
+            next: [NONE; MAX_CONNECTIONS],
+            hashed: [false; MAX_CONNECTIONS],
+            next_ephemeral: EPHEMERAL_BASE,
+        }
+    }
+
+    /// The slot those four addresses name.
+    fn lookup(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16)
+        -> Option<usize>
+    {
+        let mut at = self.buckets[hash_index(local_ip, local_port, remote_ip, remote_port)];
+        while at >= 0 {
+            let index = at as usize;
+            if self.slots[index].is(local_ip, local_port, remote_ip, remote_port) {
+                return Some(index);
+            }
+            at = self.next[index];
+        }
+        None
+    }
+
+    /// The listener for that address and port. One bound to an address must
+    /// not take a segment aimed at another, while a wildcard one takes any.
+    fn find_listener(&self, local_ip: u32, local_port: u16) -> Option<usize> {
+        (0..MAX_CONNECTIONS).find(|&i| {
+            let slot = &self.slots[i];
+            slot.used && slot.listening && slot.local_port == local_port
+                && (slot.local_ip == local_ip || slot.local_ip == 0)
+        })
+    }
+
+    /// A free slot, taken as `slot`. The caller makes the connection itself
+    /// ready, under the connection's own lock.
+    fn alloc(&mut self, slot: Slot) -> Option<usize> {
+        let index = (0..MAX_CONNECTIONS).find(|&i| !self.slots[i].used)?;
+        self.slots[index] = slot;
+        if !slot.listening {
+            /* A listener is not in the hash: a SYN scans for it */
+            let bucket = hash_index(slot.local_ip, slot.local_port,
+                slot.remote_ip, slot.remote_port);
+            self.next[index] = self.buckets[bucket];
+            self.buckets[bucket] = index as i8;
+            self.hashed[index] = true;
+        }
+        Some(index)
+    }
+
+    /// The slot back: out of the hash, and free for the next taker.
+    fn free(&mut self, index: usize) {
+        if self.hashed[index] {
+            let slot = self.slots[index];
+            let bucket = hash_index(slot.local_ip, slot.local_port,
+                slot.remote_ip, slot.remote_port);
+
+            if self.buckets[bucket] == index as i8 {
+                self.buckets[bucket] = self.next[index];
+            } else {
+                let mut at = self.buckets[bucket];
+                while at >= 0 {
+                    if self.next[at as usize] == index as i8 {
+                        self.next[at as usize] = self.next[index];
+                        break;
+                    }
+                    at = self.next[at as usize];
+                }
+            }
+            self.next[index] = NONE;
+            self.hashed[index] = false;
+        }
+        self.slots[index] = Slot::FREE;
+    }
+
+    /// A local port nothing is using, or 0 once all the way round without
+    /// one.
+    fn alloc_ephemeral_port(&mut self) -> u16 {
+        let start = self.next_ephemeral;
+        loop {
+            let port = self.next_ephemeral;
+            self.next_ephemeral =
+                if port >= EPHEMERAL_MAX { EPHEMERAL_BASE } else { port + 1 };
+
+            if !self.slots.iter().any(|slot| slot.used && slot.local_port == port) {
+                return port;
+            }
+            if self.next_ephemeral == start {
+                return 0;
+            }
+        }
     }
 }
 
 /* ---- the one TCP ---- */
 
+/// Two locks, and the types say which guards what: `pool` the identity of
+/// the slots, each connection's own lock everything about that connection.
+/// The order is pool first, then a connection; a connection found by a walk
+/// of the pool is locked before the pool is let go of, which is what keeps
+/// the slot from changing hands in between.
 pub struct Tcp {
-    /// Guards the pool: the hash buckets, allocation, and every walk of it.
-    pool_lock: PreemptSpinLock,
-    pool: [Conn; MAX_CONNECTIONS],
-    /// Head slot of each bucket, or -1
-    hash: core::cell::UnsafeCell<[i8; HASH_SIZE]>,
-    next_ephemeral: core::cell::UnsafeCell<u16>,
+    pool: PreemptSpinLock<Pool>,
+    conns: [Conn; MAX_CONNECTIONS],
     initialized: AtomicBool,
 
     tx_segments: AtomicUsize,
@@ -364,17 +478,12 @@ pub struct Tcp {
     conn_count: AtomicUsize,
 }
 
-unsafe impl Sync for Tcp {}
-unsafe impl Send for Tcp {}
-
 /// The one of these. A static, pool and all -- 64 connections with two 8 KiB
 /// buffers each is about a megabyte, which is what the C++ had in .bss too,
 /// and what nothing would hand out from the heap.
 pub static TCP: Tcp = Tcp {
-    pool_lock: PreemptSpinLock::new(),
-    pool: [const { Conn::new() }; MAX_CONNECTIONS],
-    hash: core::cell::UnsafeCell::new([-1; HASH_SIZE]),
-    next_ephemeral: core::cell::UnsafeCell::new(EPHEMERAL_BASE),
+    pool: PreemptSpinLock::new(Pool::new()),
+    conns: [const { Conn::new() }; MAX_CONNECTIONS],
     initialized: AtomicBool::new(false),
     tx_segments: AtomicUsize::new(0),
     rx_segments: AtomicUsize::new(0),
@@ -419,164 +528,41 @@ impl Tcp {
         true
     }
 
-    fn slot(&'static self, index: usize) -> &'static Conn {
-        &self.pool[index]
+    /// Which slot a connection is: where it sits in the array, worked out
+    /// from its address. None for a reference to something that is not one
+    /// of the pool's.
+    fn index_of(&'static self, conn: &Conn) -> Option<usize> {
+        self.slot_at(conn as *const Conn as usize)
     }
 
-    /// Which slot a connection pointer names, for the calls that arrive with
-    /// one from an application.
-    fn index_of(&'static self, conn: *const Conn) -> Option<usize> {
-        for i in 0..MAX_CONNECTIONS {
-            if core::ptr::eq(&self.pool[i], conn) {
-                return Some(i);
-            }
+    /// Which slot starts at `address`, if one does.
+    fn slot_at(&'static self, address: usize) -> Option<usize> {
+        let base = self.conns.as_ptr() as usize;
+        let offset = address.checked_sub(base)?;
+        let size = core::mem::size_of::<Conn>();
+        if offset % size != 0 || offset / size >= MAX_CONNECTIONS {
+            return None;
         }
-        None
+        Some(offset / size)
     }
 
-    /* ---- the hash of four addresses ---- */
-
-    /// The connection those four addresses name, with its lock held. The
-    /// caller holds the pool lock.
-    fn lookup_locked(&'static self, local_ip: u32, local_port: u16,
-        remote_ip: u32, remote_port: u16) -> Option<&'static Conn>
-    {
-        let buckets = unsafe { &*self.hash.get() };
-        let mut at = buckets[hash_index(local_ip, local_port, remote_ip, remote_port)];
-
-        while at >= 0 {
-            let conn = self.slot(at as usize);
-            conn.lock.lock();
-            let inner = unsafe { conn.get() };
-            if inner.matches(local_ip, local_port, remote_ip, remote_port) {
-                /* Handed to the caller still locked, as the C++ does: the
-                 * pool lock is what stops it changing in between, and the
-                 * caller lets go of that one first. */
-                return Some(conn);
-            }
-            let next = inner.hash_next;
-            unsafe { conn.lock.unlock() };
-            at = next;
-        }
-        None
+    /// The connection a caller outside Rust names by its address: one of the
+    /// pool's, or none.
+    pub fn by_handle(&'static self, handle: usize) -> Option<&'static Conn> {
+        self.slot_at(handle).map(|index| &self.conns[index])
     }
 
-    /// The listener for that address and port, with its lock held. A listener
-    /// bound to one address must not take a segment aimed at another, while a
-    /// wildcard one takes any.
-    fn find_listener_locked(&'static self, local_ip: u32, local_port: u16)
-        -> Option<&'static Conn>
-    {
-        for i in 0..MAX_CONNECTIONS {
-            let conn = self.slot(i);
-            conn.lock.lock();
-            let inner = unsafe { conn.get() };
-            if inner.state == State::Listen && inner.local_port == local_port
-                && (inner.local_ip == local_ip || inner.local_ip == 0)
-            {
-                return Some(conn);
-            }
-            unsafe { conn.lock.unlock() };
-        }
-        None
-    }
-
-    /// The caller holds the pool lock and the connection's.
-    fn insert_hash(&'static self, index: usize) {
-        let conn = self.slot(index);
-        let inner = unsafe { conn.get() };
-        let bucket = hash_index(inner.local_ip, inner.local_port,
-            inner.remote_ip, inner.remote_port);
-
-        let buckets = unsafe { &mut *self.hash.get() };
-        inner.hash_next = buckets[bucket];
-        inner.hashed = true;
-        buckets[bucket] = index as i8;
-    }
-
-    /// The caller holds the pool lock and the connection's.
-    fn remove_hash(&'static self, index: usize) {
-        let conn = self.slot(index);
-        let inner = unsafe { conn.get() };
-        if !inner.hashed {
-            return;
-        }
-        let bucket = hash_index(inner.local_ip, inner.local_port,
-            inner.remote_ip, inner.remote_port);
-
-        let buckets = unsafe { &mut *self.hash.get() };
-        if buckets[bucket] == index as i8 {
-            buckets[bucket] = inner.hash_next;
-        } else {
-            let mut at = buckets[bucket];
-            while at >= 0 {
-                let prev = self.slot(at as usize);
-                /* Every other connection in the bucket is untouched by this
-                 * caller, so its link is read without its lock -- the pool
-                 * lock is what keeps the chain still. */
-                let prev_inner = unsafe { &mut *prev.inner.get() };
-                if prev_inner.hash_next == index as i8 {
-                    prev_inner.hash_next = inner.hash_next;
-                    break;
-                }
-                at = prev_inner.hash_next;
-            }
-        }
-
-        inner.hash_next = -1;
-        inner.hashed = false;
-    }
-
-    /// A free slot, made ready. The caller holds the pool lock, and that is
-    /// the only lock taken here -- deliberately.
-    ///
-    /// A free slot has no other user by definition, so its own lock guards
-    /// nothing; taking it anyway would deadlock the one caller that matters.
-    /// The SYN path holds the listener's lock while it allocates, and the
-    /// listener is a slot in this very pool: a walk that locked each slot
-    /// would spin on the one it already holds, with preemption off, for
-    /// good.
-    fn alloc_conn(&'static self) -> Option<usize> {
-        for i in 0..MAX_CONNECTIONS {
-            let conn = self.slot(i);
-            let inner = unsafe { &mut *conn.inner.get() };
-            if inner.state == State::Free {
-                inner.init();
-                conn.data_ready.store(false, Ordering::Release);
-                conn.conn_ready.store(false, Ordering::Release);
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    /// A local port nothing is using. The caller holds the pool lock.
-    fn alloc_ephemeral_port(&'static self) -> u16 {
-        let next = unsafe { &mut *self.next_ephemeral.get() };
-        let start = *next;
-
-        loop {
-            let port = *next;
-            *next = if *next >= EPHEMERAL_MAX { EPHEMERAL_BASE } else { *next + 1 };
-
-            let mut taken = false;
-            for i in 0..MAX_CONNECTIONS {
-                let conn = self.slot(i);
-                let inner = unsafe { &*conn.inner.get() };
-                if inner.state != State::Free && inner.local_port == port {
-                    taken = true;
-                    break;
-                }
-            }
-            if !taken {
-                return port;
-            }
-
-            /* All the way round without one */
-            if *next == start {
-                return 0;
-            }
-        }
+    /// A fresh connection in a slot the pool has just handed out: locked,
+    /// cleared, and the caller's to fill. The caller holds the pool lock, and
+    /// holds no other connection's -- a free slot has no user, so this lock
+    /// is only ever contended by a walk passing through.
+    fn take_fresh(&'static self, index: usize) -> PreemptSpinGuard<'static, Inner> {
+        let conn = &self.conns[index];
+        let mut inner = conn.inner.lock();
+        inner.init();
+        conn.data_ready.store(false, Ordering::Release);
+        conn.conn_ready.store(false, Ordering::Release);
+        inner
     }
 }
 
@@ -1008,82 +994,73 @@ impl Tcp {
         let flags = seg::flags(segment);
         let peer_mac = eth::src(frame);
 
-        self.pool_lock.lock();
+        let pool = self.pool.lock();
 
         /* The four addresses, exactly */
-        if let Some(conn) = self.lookup_locked(local_ip, local_port, remote_ip, remote_port) {
-            unsafe { self.pool_lock.unlock() };
+        if let Some(index) = pool.lookup(local_ip, local_port, remote_ip, remote_port) {
+            let conn = &self.conns[index];
+            /* Locked before the pool is let go of: that is what stops the
+             * slot changing hands in between. */
+            let mut inner = conn.inner.lock();
+            drop(pool);
 
-            let inner = unsafe { conn.get() };
-            let event = self.handle(conn, inner, segment, payload);
+            let event = self.handle(conn, &mut inner, segment, payload);
             let peer_mss = inner.peer_mss;
-            unsafe { conn.lock.unlock() };
+            drop(inner);
 
             self.trace_event(event, local_port, remote_port, peer_mss);
             return;
         }
 
         /* A SYN for something listening */
-        if flags & seg::SYN != 0 {
-            if let Some(listener) = self.find_listener_locked(local_ip, local_port) {
-                if self.backlog_full_locked(local_port) {
-                    /* Dropped, as a full accept queue drops it: the peer
-                     * tries again and the pool keeps its slots. */
-                    unsafe { listener.lock.unlock() };
-                    unsafe { self.pool_lock.unlock() };
-                    return;
-                }
+        if flags & seg::SYN != 0 && pool.find_listener(local_ip, local_port).is_some() {
+            let mut pool = pool;
 
-                let index = match self.alloc_conn() {
-                    Some(index) => index,
-                    None => {
-                        unsafe { listener.lock.unlock() };
-                        unsafe { self.pool_lock.unlock() };
-                        return;
-                    }
-                };
-
-                let conn = self.slot(index);
-                conn.lock.lock();
-                {
-                    let inner = unsafe { conn.get() };
-                    inner.nic = Some(*nic);
-                    inner.local_ip = local_ip;
-                    inner.local_port = local_port;
-                    inner.remote_ip = remote_ip;
-                    inner.remote_port = remote_port;
-                    inner.state = State::SynReceived;
-                    inner.irs = seg::seq(segment);
-                    inner.rcv_nxt = inner.irs.wrapping_add(1);
-                    inner.iss = initial_sequence();
-                    inner.snd_nxt = inner.iss;
-                    inner.snd_una = inner.iss;
-                    inner.snd_wnd = seg::window(segment) as u32;
-                    inner.snd_wl1 = inner.irs;
-                    inner.snd_wl2 = 0;
-                    inner.peer_mss = seg::parse_mss(segment, OUR_MSS, DEFAULT_MSS);
-                    /* Where the frame came from: no resolution needed */
-                    inner.peer_mac = peer_mac;
-                }
-                self.insert_hash(index);
-
-                unsafe { listener.lock.unlock() };
-                unsafe { self.pool_lock.unlock() };
-
-                {
-                    let inner = unsafe { conn.get() };
-                    self.send_segment(inner, seg::SYN | seg::ACK_FLAG, &[]);
-                    /* A SYN takes a sequence number */
-                    inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
-                    inner.retransmit_at = now_ms() + inner.rto_ms;
-                }
-                self.conn_count.fetch_add(1, Ordering::Relaxed);
-                unsafe { conn.lock.unlock() };
+            /* Dropped, as a full accept queue drops it: the peer tries again
+             * and the pool keeps its slots. */
+            if self.backlog_full(&pool, local_port) {
                 return;
             }
+
+            let index = match pool.alloc(Slot {
+                used: true, listening: false,
+                local_ip, local_port, remote_ip, remote_port,
+            }) {
+                Some(index) => index,
+                None => return,
+            };
+
+            let mut inner = self.take_fresh(index);
+            drop(pool);
+
+            inner.nic = Some(*nic);
+            inner.local_ip = local_ip;
+            inner.local_port = local_port;
+            inner.remote_ip = remote_ip;
+            inner.remote_port = remote_port;
+            inner.state = State::SynReceived;
+            inner.irs = seg::seq(segment);
+            inner.rcv_nxt = inner.irs.wrapping_add(1);
+            inner.iss = initial_sequence();
+            inner.snd_nxt = inner.iss;
+            inner.snd_una = inner.iss;
+            inner.snd_wnd = seg::window(segment) as u32;
+            inner.snd_wl1 = inner.irs;
+            inner.snd_wl2 = 0;
+            inner.peer_mss = seg::parse_mss(segment, OUR_MSS, DEFAULT_MSS);
+            /* Where the frame came from: no resolution needed */
+            inner.peer_mac = peer_mac;
+
+            self.send_segment(&mut inner, seg::SYN | seg::ACK_FLAG, &[]);
+            /* A SYN takes a sequence number */
+            inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
+            inner.retransmit_at = now_ms() + inner.rto_ms;
+
+            self.conn_count.fetch_add(1, Ordering::Relaxed);
+            return;
         }
 
-        unsafe { self.pool_lock.unlock() };
+        drop(pool);
 
         /* Nothing here for it: reset, unless it is one itself */
         if flags & seg::RST == 0 {
@@ -1106,14 +1083,20 @@ impl Tcp {
     }
 
     /// Whether the port's listener holds all the connections it may that
-    /// nobody has accepted. The caller holds the pool lock.
-    fn backlog_full_locked(&'static self, port: u16) -> bool {
+    /// nobody has accepted. The caller holds the pool lock and no
+    /// connection's: whether one is waiting to be accepted is its own state,
+    /// read under its own lock, and the pool says which slots are worth
+    /// asking.
+    fn backlog_full(&'static self, pool: &Pool, port: u16) -> bool {
         let mut pending = 0;
         for i in 0..MAX_CONNECTIONS {
-            /* A racy read of each state, as accept's first look is: enough
-             * for a limit. */
-            let inner = unsafe { &*self.pool[i].inner.get() };
-            if inner.local_port == port && !inner.accepted && !inner.owned_by_app
+            let slot = &pool.slots[i];
+            if !slot.used || slot.listening || slot.local_port != port {
+                continue;
+            }
+
+            let inner = self.conns[i].inner.lock();
+            if !inner.accepted && !inner.owned_by_app
                 && matches!(inner.state,
                     State::SynReceived | State::Established | State::CloseWait)
             {
@@ -1131,21 +1114,19 @@ impl Tcp {
             return;
         }
 
-        self.pool_lock.lock();
-        let conn = self.lookup_locked(local_ip, local_port, remote_ip, remote_port);
-        unsafe { self.pool_lock.unlock() };
-
-        let conn = match conn {
-            Some(conn) => conn,
+        let pool = self.pool.lock();
+        let index = match pool.lookup(local_ip, local_port, remote_ip, remote_port) {
+            Some(index) => index,
             None => return,
         };
-        let inner = unsafe { conn.get() };
+        let conn = &self.conns[index];
+        let mut inner = conn.inner.lock();
+        drop(pool);
 
         /* RFC 5927: honour the hard error only when the quoted sequence
          * number is one this machine sent and has not seen acknowledged --
          * which is what an off-path forgery cannot know. */
         if before(quoted_seq, inner.snd_una) || before(inner.snd_nxt, quoted_seq) {
-            unsafe { conn.lock.unlock() };
             return;
         }
 
@@ -1154,7 +1135,7 @@ impl Tcp {
         inner.need_cleanup = true;
         conn.conn_ready.store(true, Ordering::Release);
         conn.data_ready.store(true, Ordering::Release);
-        unsafe { conn.lock.unlock() };
+        drop(inner);
 
         trace!(0, "tcp: icmp unreachable, {} -> {} aborted", local_port, remote_port);
     }
@@ -1189,12 +1170,12 @@ impl Tcp {
             }
         };
 
-        self.pool_lock.lock();
+        let mut pool = self.pool.lock();
 
         let src_port = if src_port == 0 {
-            let port = self.alloc_ephemeral_port();
+            let port = pool.alloc_ephemeral_port();
             if port == 0 {
-                unsafe { self.pool_lock.unlock() };
+                drop(pool);
                 trace!(0, "tcp: no ephemeral port is free");
                 return None;
             }
@@ -1202,59 +1183,54 @@ impl Tcp {
         } else {
             /* Two connections with the same four addresses would take each
              * other's segments. */
-            if let Some(dup) = self.lookup_locked(nic.ip(), src_port, dst_ip, dst_port) {
-                unsafe { dup.lock.unlock() };
-                unsafe { self.pool_lock.unlock() };
+            if pool.lookup(nic.ip(), src_port, dst_ip, dst_port).is_some() {
+                drop(pool);
                 trace!(0, "tcp: port {} is already connected to that address", src_port);
                 return None;
             }
             src_port
         };
 
-        let index = match self.alloc_conn() {
+        let local_ip = nic.ip();
+        let index = match pool.alloc(Slot {
+            used: true, listening: false,
+            local_ip, local_port: src_port, remote_ip: dst_ip, remote_port: dst_port,
+        }) {
             Some(index) => index,
             None => {
-                unsafe { self.pool_lock.unlock() };
+                drop(pool);
                 trace!(0, "tcp: no free connection");
                 return None;
             }
         };
 
-        let conn = self.slot(index);
-        conn.lock.lock();
-        {
-            let inner = unsafe { conn.get() };
-            inner.nic = Some(*nic);
-            inner.local_ip = nic.ip();
-            inner.local_port = src_port;
-            inner.remote_ip = dst_ip;
-            inner.remote_port = dst_port;
-            inner.peer_mac = peer_mac;
-            inner.iss = initial_sequence();
-            inner.snd_nxt = inner.iss;
-            inner.snd_una = inner.iss;
-            inner.state = State::SynSent;
-            /* The caller holds this until it closes it */
-            inner.owned_by_app = true;
-        }
-        self.insert_hash(index);
-        unsafe { self.pool_lock.unlock() };
+        let conn = &self.conns[index];
+        let mut inner = self.take_fresh(index);
+        drop(pool);
 
-        {
-            let inner = unsafe { conn.get() };
-            self.send_segment(inner, seg::SYN, &[]);
-            inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
-            inner.retransmit_at = now_ms() + inner.rto_ms;
-        }
-        unsafe { conn.lock.unlock() };
+        inner.nic = Some(*nic);
+        inner.local_ip = local_ip;
+        inner.local_port = src_port;
+        inner.remote_ip = dst_ip;
+        inner.remote_port = dst_port;
+        inner.peer_mac = peer_mac;
+        inner.iss = initial_sequence();
+        inner.snd_nxt = inner.iss;
+        inner.snd_una = inner.iss;
+        inner.state = State::SynSent;
+        /* The caller holds this until it closes it */
+        inner.owned_by_app = true;
+
+        self.send_segment(&mut inner, seg::SYN, &[]);
+        inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
+        inner.retransmit_at = now_ms() + inner.rto_ms;
+        drop(inner);
         self.conn_count.fetch_add(1, Ordering::Relaxed);
 
         let deadline = now_ms() + CONNECT_TIMEOUT_MS;
         while now_ms() < deadline {
             if conn.conn_ready.load(Ordering::Acquire) {
-                conn.lock.lock();
-                let state = unsafe { conn.get() }.state;
-                unsafe { conn.lock.unlock() };
+                let state = conn.inner.lock().state;
 
                 if state == State::Established {
                     return Some(conn);
@@ -1278,43 +1254,30 @@ impl Tcp {
             return None;
         }
 
-        self.pool_lock.lock();
+        let mut pool = self.pool.lock();
 
         /* A second listener on the same port would never be given anything */
-        for i in 0..MAX_CONNECTIONS {
-            let inner = unsafe { &*self.pool[i].inner.get() };
-            if inner.state == State::Listen && inner.local_port == port {
-                unsafe { self.pool_lock.unlock() };
-                trace!(0, "tcp: port {} is listened on already", port);
-                return None;
-            }
+        if pool.slots.iter().any(|slot| slot.used && slot.listening && slot.local_port == port) {
+            drop(pool);
+            trace!(0, "tcp: port {} is listened on already", port);
+            return None;
         }
 
-        let index = match self.alloc_conn() {
-            Some(index) => index,
-            None => {
-                unsafe { self.pool_lock.unlock() };
-                return None;
-            }
-        };
+        /* The wildcard address, which a segment for any address matches:
+         * bound to the device's address of the moment, the port would answer
+         * nobody once a lease renewal moved it. */
+        let index = pool.alloc(Slot {
+            used: true, listening: true,
+            local_ip: 0, local_port: port, remote_ip: 0, remote_port: 0,
+        })?;
 
-        let conn = self.slot(index);
-        conn.lock.lock();
-        {
-            let inner = unsafe { conn.get() };
-            inner.nic = Some(*nic);
-            /* The wildcard, which a segment for any address matches: bound
-             * to the device's address of the moment, the port would answer
-             * nobody once a lease renewal moved it. */
-            inner.local_ip = 0;
-            inner.local_port = port;
-            inner.state = State::Listen;
-            inner.owned_by_app = true;
-        }
-        unsafe { conn.lock.unlock() };
-        /* A listener is not in the hash: the SYN path scans for it */
-        unsafe { self.pool_lock.unlock() };
-        Some(conn)
+        let mut inner = self.take_fresh(index);
+        inner.nic = Some(*nic);
+        inner.local_ip = 0;
+        inner.local_port = port;
+        inner.state = State::Listen;
+        inner.owned_by_app = true;
+        Some(&self.conns[index])
     }
 
     /// The next connection on a listener's port. None once the timeout
@@ -1325,57 +1288,49 @@ impl Tcp {
     {
         /* The port, taken once: a close from another task frees the slot,
          * and a later listen may take it for another port. */
-        listener.lock.lock();
-        let inner = unsafe { listener.get() };
-        let listening = inner.state == State::Listen;
-        let port = inner.local_port;
-        unsafe { listener.lock.unlock() };
-        if !listening {
-            return None;
-        }
+        let listener_index = self.index_of(listener)?;
+        let port = {
+            let pool = self.pool.lock();
+            let slot = &pool.slots[listener_index];
+            if !slot.used || !slot.listening {
+                return None;
+            }
+            slot.local_port
+        };
 
         let deadline = if timeout_ms != 0 { now_ms() + timeout_ms } else { 0 };
 
         loop {
-            self.pool_lock.lock();
+            let pool = self.pool.lock();
 
-            listener.lock.lock();
-            let inner = unsafe { listener.get() };
-            let still = inner.state == State::Listen && inner.local_port == port;
-            unsafe { listener.lock.unlock() };
-            if !still {
-                unsafe { self.pool_lock.unlock() };
+            let slot = &pool.slots[listener_index];
+            if !slot.used || !slot.listening || slot.local_port != port {
                 return None;
             }
 
             for i in 0..MAX_CONNECTIONS {
-                let conn = self.slot(i);
-                if core::ptr::eq(conn, listener) {
+                /* The pool says which slots arrived on this port; whether one
+                 * is waiting to be accepted is its own to say. Never one of
+                 * this machine's own connections that happens to use the
+                 * port: those are owned from the start. */
+                let slot = &pool.slots[i];
+                if !slot.used || slot.listening || slot.local_port != port {
                     continue;
                 }
 
-                conn.lock.lock();
-                let inner = unsafe { conn.get() };
+                let mut inner = self.conns[i].inner.lock();
                 /* One whose peer has closed already goes too: its reader
                  * sees the end of the stream and closes it, and nothing else
-                 * would -- a CLOSE-WAIT nobody owns keeps its slot for good.
-                 * Never one of this machine's own connections that happens
-                 * to use the port. */
-                let take = inner.local_port == port && !inner.accepted
-                    && !inner.owned_by_app
-                    && matches!(inner.state, State::Established | State::CloseWait);
-                if take {
+                 * would -- a CLOSE-WAIT nobody owns keeps its slot for good. */
+                if !inner.accepted && !inner.owned_by_app
+                    && matches!(inner.state, State::Established | State::CloseWait)
+                {
                     inner.accepted = true;
                     inner.owned_by_app = true;
-                }
-                unsafe { conn.lock.unlock() };
-
-                if take {
-                    unsafe { self.pool_lock.unlock() };
-                    return Some(conn);
+                    return Some(&self.conns[i]);
                 }
             }
-            unsafe { self.pool_lock.unlock() };
+            drop(pool);
 
             if deadline != 0 && now_ms() >= deadline {
                 return None;
@@ -1395,17 +1350,15 @@ impl Tcp {
         let deadline = if timeout_ms != 0 { now_ms() + timeout_ms } else { 0 };
 
         while sent < data.len() {
-            conn.lock.lock();
-            let inner = unsafe { conn.get() };
+            let mut inner = conn.inner.lock();
 
             if !matches!(inner.state, State::Established | State::CloseWait) {
-                unsafe { conn.lock.unlock() };
                 return if sent > 0 { sent as isize } else { -1 };
             }
 
             let room = inner.send_buf.free();
             if room == 0 {
-                unsafe { conn.lock.unlock() };
+                drop(inner);
                 if deadline != 0 && now_ms() >= deadline {
                     return sent as isize;
                 }
@@ -1422,7 +1375,7 @@ impl Tcp {
                  * and the retransmit count would give up on a peer that is
                  * only slow to read -- a suspended ssh client -- as a dead
                  * one, in under a minute. The persist timer probes instead. */
-                unsafe { conn.lock.unlock() };
+                drop(inner);
                 if deadline != 0 && now_ms() >= deadline {
                     return sent as isize;
                 }
@@ -1442,13 +1395,13 @@ impl Tcp {
             let at = inner.send_buf.used() - chunk;
             let len = inner.send_buf.peek(&mut segment[..chunk], at);
 
-            self.send_segment(inner, seg::ACK_FLAG | seg::PSH, &segment[..len]);
+            self.send_segment(&mut inner, seg::ACK_FLAG | seg::PSH, &segment[..len]);
             inner.snd_nxt = inner.snd_nxt.wrapping_add(len as u32);
 
             if inner.retransmit_at == 0 {
                 inner.retransmit_at = now_ms() + inner.rto_ms;
             }
-            unsafe { conn.lock.unlock() };
+            drop(inner);
             sent += chunk;
         }
 
@@ -1466,8 +1419,7 @@ impl Tcp {
         let deadline = if timeout_ms != 0 { now_ms() + timeout_ms } else { 0 };
 
         loop {
-            conn.lock.lock();
-            let inner = unsafe { conn.get() };
+            let mut inner = conn.inner.lock();
 
             if inner.recv_buf.used() > 0 {
                 let got = inner.recv_buf.read(buf);
@@ -1486,16 +1438,15 @@ impl Tcp {
                     && matches!(inner.state,
                         State::Established | State::FinWait1 | State::FinWait2)
                 {
-                    self.send_ack(inner);
+                    self.send_ack(&mut inner);
                 }
 
-                unsafe { conn.lock.unlock() };
                 return got as isize;
             }
 
             let closing = matches!(inner.state, State::CloseWait | State::Closed
                 | State::TimeWait | State::LastAck | State::Closing);
-            unsafe { conn.lock.unlock() };
+            drop(inner);
 
             if closing {
                 return 0;
@@ -1516,28 +1467,32 @@ impl Tcp {
     /// and a peer that finished its handshake would otherwise sit holding a
     /// slot until it gave up by itself. False when it is not a listener.
     fn close_listener(&'static self, conn: &'static Conn) -> bool {
-        self.pool_lock.lock();
-        conn.lock.lock();
-        let inner = unsafe { conn.get() };
-        if inner.state != State::Listen {
-            unsafe { conn.lock.unlock() };
-            unsafe { self.pool_lock.unlock() };
+        let index = match self.index_of(conn) {
+            Some(index) => index,
+            None => return false,
+        };
+
+        let mut pool = self.pool.lock();
+        if !pool.slots[index].used || !pool.slots[index].listening {
             return false;
         }
+        let port = pool.slots[index].local_port;
 
-        let port = inner.local_port;
-        inner.state = State::Free;
-        inner.owned_by_app = false;
-        unsafe { conn.lock.unlock() };
+        {
+            let mut inner = conn.inner.lock();
+            inner.state = State::Free;
+            inner.owned_by_app = false;
+        }
+        pool.free(index);
 
-        self.reset_unaccepted_and_unlock(port);
+        self.reset_unaccepted(pool, port);
         true
     }
 
-    /// The caller holds the pool lock, which this lets go of: every
-    /// connection on the port that nobody accepted is reset, and the resets
-    /// go out once the lock is down.
-    fn reset_unaccepted_and_unlock(&'static self, port: u16) {
+    /// Every connection on the port that nobody accepted is reset. Takes the
+    /// pool's guard and lets go of it: the resets go out once the lock is
+    /// down.
+    fn reset_unaccepted(&'static self, pool: PreemptSpinGuard<'static, Pool>, port: u16) {
         /* What each reset goes out with, taken from the slots rather than
          * sent from them: by the time the lock is down the cleanup timer may
          * have handed those slots on. */
@@ -1563,10 +1518,14 @@ impl Tcp {
          * nothing in before this walk is over, so what it marks is the old
          * one's. */
         for i in 0..MAX_CONNECTIONS {
-            let conn = self.slot(i);
-            conn.lock.lock();
-            let inner = unsafe { conn.get() };
-            if inner.local_port == port && !inner.accepted && !inner.owned_by_app
+            let slot = &pool.slots[i];
+            if !slot.used || slot.listening || slot.local_port != port {
+                continue;
+            }
+
+            let conn = &self.conns[i];
+            let mut inner = conn.inner.lock();
+            if !inner.accepted && !inner.owned_by_app
                 && matches!(inner.state,
                     State::SynReceived | State::Established | State::CloseWait)
             {
@@ -1588,9 +1547,8 @@ impl Tcp {
                 conn.conn_ready.store(true, Ordering::Release);
                 conn.data_ready.store(true, Ordering::Release);
             }
-            unsafe { conn.lock.unlock() };
         }
-        unsafe { self.pool_lock.unlock() };
+        drop(pool);
 
         for reset in resets.iter().take(count) {
             if let Some(nic) = reset.nic {
@@ -1611,25 +1569,25 @@ impl Tcp {
             return;
         }
 
-        conn.lock.lock();
-        let inner = unsafe { conn.get() };
+        let mut inner = conn.inner.lock();
 
         match inner.state {
             State::Established | State::SynReceived => {
                 inner.state = State::FinWait1;
                 inner.fin_acked = false;
-                self.send_segment(inner, seg::FIN | seg::ACK_FLAG, &[]);
+                self.send_segment(&mut inner, seg::FIN | seg::ACK_FLAG, &[]);
                 inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
                 inner.retransmit_at = now_ms() + inner.rto_ms;
             }
             State::CloseWait => {
                 inner.state = State::LastAck;
-                self.send_segment(inner, seg::FIN | seg::ACK_FLAG, &[]);
+                self.send_segment(&mut inner, seg::FIN | seg::ACK_FLAG, &[]);
                 inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
                 inner.retransmit_at = now_ms() + inner.rto_ms;
             }
             State::SynSent => inner.state = State::Closed,
-            State::Listen => inner.state = State::Free,
+            /* A listener was dealt with above, under the pool lock -- which
+             * is the only place a slot may be given back. */
             _ => {}
         }
 
@@ -1637,7 +1595,6 @@ impl Tcp {
          * timer owns the slot and may recycle it once the connection is
          * closed. */
         inner.owned_by_app = false;
-        unsafe { conn.lock.unlock() };
     }
 
     /// The abrupt close: a reset instead of the exchange, and the slot back
@@ -1649,13 +1606,12 @@ impl Tcp {
             return;
         }
 
-        conn.lock.lock();
-        let inner = unsafe { conn.get() };
+        let mut inner = conn.inner.lock();
 
         match inner.state {
             State::SynReceived | State::Established | State::CloseWait
             | State::FinWait1 | State::FinWait2 | State::Closing | State::LastAck => {
-                self.send_segment(inner, seg::RST | seg::ACK_FLAG, &[]);
+                self.send_segment(&mut inner, seg::RST | seg::ACK_FLAG, &[]);
                 inner.state = State::Closed;
             }
             State::SynSent | State::TimeWait => inner.state = State::Closed,
@@ -1668,7 +1624,6 @@ impl Tcp {
         conn.data_ready.store(true, Ordering::Release);
         /* As close: from here the slot is the cleanup timer's */
         inner.owned_by_app = false;
-        unsafe { conn.lock.unlock() };
     }
 }
 
@@ -1682,12 +1637,10 @@ impl Tcp {
 
         /* What each connection owes, with only its own lock */
         for i in 0..MAX_CONNECTIONS {
-            let conn = self.slot(i);
-            conn.lock.lock();
-            let inner = unsafe { conn.get() };
+            let conn = &self.conns[i];
+            let mut inner = conn.inner.lock();
 
             if inner.state == State::Free {
-                unsafe { conn.lock.unlock() };
                 continue;
             }
 
@@ -1701,14 +1654,12 @@ impl Tcp {
                 conn.conn_ready.store(true, Ordering::Release);
                 conn.data_ready.store(true, Ordering::Release);
                 any_cleanup = true;
-                unsafe { conn.lock.unlock() };
                 continue;
             }
 
             if inner.state == State::Closed {
                 inner.need_cleanup = true;
                 any_cleanup = true;
-                unsafe { conn.lock.unlock() };
                 continue;
             }
 
@@ -1720,13 +1671,13 @@ impl Tcp {
                      * buffered data */
                     State::SynSent => {
                         inner.snd_nxt = inner.snd_una;
-                        self.send_segment(inner, seg::SYN, &[]);
+                        self.send_segment(&mut inner, seg::SYN, &[]);
                         inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
                         retransmitted = true;
                     }
                     State::SynReceived => {
                         inner.snd_nxt = inner.snd_una;
-                        self.send_segment(inner, seg::SYN | seg::ACK_FLAG, &[]);
+                        self.send_segment(&mut inner, seg::SYN | seg::ACK_FLAG, &[]);
                         inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
                         retransmitted = true;
                     }
@@ -1740,13 +1691,13 @@ impl Tcp {
                             if got > 0 {
                                 let saved = inner.snd_nxt;
                                 inner.snd_nxt = inner.snd_una;
-                                self.send_segment(inner, seg::ACK_FLAG | seg::PSH,
+                                self.send_segment(&mut inner, seg::ACK_FLAG | seg::PSH,
                                     &segment[..got]);
                                 inner.snd_nxt = saved;
                             }
                         } else {
                             inner.snd_nxt = inner.snd_una;
-                            self.send_segment(inner, seg::FIN | seg::ACK_FLAG, &[]);
+                            self.send_segment(&mut inner, seg::FIN | seg::ACK_FLAG, &[]);
                             inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
                         }
                         retransmitted = true;
@@ -1759,7 +1710,7 @@ impl Tcp {
                             if got > 0 {
                                 let saved = inner.snd_nxt;
                                 inner.snd_nxt = inner.snd_una;
-                                self.send_segment(inner, seg::ACK_FLAG | seg::PSH,
+                                self.send_segment(&mut inner, seg::ACK_FLAG | seg::PSH,
                                     &segment[..got]);
                                 inner.snd_nxt = saved;
                             }
@@ -1786,7 +1737,9 @@ impl Tcp {
                         conn.conn_ready.store(true, Ordering::Release);
                         conn.data_ready.store(true, Ordering::Release);
                         any_cleanup = true;
-                        unsafe { conn.lock.unlock() };
+                        /* The line goes out with the lock down: a trace is
+                         * synchronous output. */
+                        drop(inner);
 
                         trace!(0, "tcp: {} -> {} in {} aborted after {} retransmits",
                             local, remote, state.name(), count);
@@ -1813,7 +1766,7 @@ impl Tcp {
                 } else if now >= inner.persist_at {
                     let saved = inner.snd_nxt;
                     inner.snd_nxt = inner.snd_una.wrapping_sub(1);
-                    self.send_segment(inner, seg::ACK_FLAG, &[]);
+                    self.send_segment(&mut inner, seg::ACK_FLAG, &[]);
                     inner.snd_nxt = saved;
 
                     inner.rto_ms = (inner.rto_ms * 2).min(MAX_RTO_MS);
@@ -1822,33 +1775,28 @@ impl Tcp {
             } else {
                 inner.persist_at = 0;
             }
-
-            unsafe { conn.lock.unlock() };
         }
 
-        /* And the slots that are done with, under the pool lock */
+        /* And the slots that are done with, under the pool lock: giving a
+         * slot back changes whose it is, and that is the pool's to say. */
         if any_cleanup {
-            self.pool_lock.lock();
+            let mut pool = self.pool.lock();
             for i in 0..MAX_CONNECTIONS {
-                let conn = self.slot(i);
-                conn.lock.lock();
-                let inner = unsafe { conn.get() };
+                let mut inner = self.conns[i].inner.lock();
 
                 if inner.need_cleanup && inner.state == State::Closed
                     && !inner.owned_by_app
                 {
-                    self.remove_hash(i);
                     inner.state = State::Free;
                     inner.need_cleanup = false;
+                    pool.free(i);
                     self.conn_count.fetch_sub(1, Ordering::Relaxed);
                 } else if inner.state != State::Closed {
                     inner.need_cleanup = false;
                 }
                 /* One still held by an application keeps the flag, so the
                  * next tick tries again once it has closed it. */
-                unsafe { conn.lock.unlock() };
             }
-            unsafe { self.pool_lock.unlock() };
         }
     }
 
@@ -1873,10 +1821,8 @@ impl Tcp {
             return None;
         }
 
-        let conn = self.slot(index);
-        conn.lock.lock();
-        let inner = unsafe { conn.get() };
-        let info = if inner.state == State::Free {
+        let inner = self.conns[index].inner.lock();
+        if inner.state == State::Free {
             None
         } else {
             Some(ConnInfo {
@@ -1889,18 +1835,13 @@ impl Tcp {
                 in_flight: inner.snd_nxt.wrapping_sub(inner.snd_una) as usize,
                 recv_used: inner.recv_buf.used(),
             })
-        };
-        unsafe { conn.lock.unlock() };
-        info
+        }
     }
 
     /// Who a connection is with, for a server that logs it.
     pub fn peer(&'static self, conn: &'static Conn) -> (u32, u16) {
-        conn.lock.lock();
-        let inner = unsafe { conn.get() };
-        let peer = (inner.remote_ip, inner.remote_port);
-        unsafe { conn.lock.unlock() };
-        peer
+        let inner = conn.inner.lock();
+        (inner.remote_ip, inner.remote_port)
     }
 }
 

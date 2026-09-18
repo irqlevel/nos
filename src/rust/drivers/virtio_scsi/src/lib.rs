@@ -116,7 +116,7 @@ struct Hba {
 
     /// The queue and what is on it. Taken with interrupts off: completions
     /// arrive in interrupt context.
-    lock: SpinLock,
+    lock: SpinLock<()>,
     inner: UnsafeCell<Inner>,
 
     _irq: Irq,
@@ -473,7 +473,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         }
     };
 
-    let lock = match SpinLock::new() {
+    let lock = match SpinLock::new(()) {
         Some(lock) => lock,
         None => {
             virtio::failed(transport.as_ref());

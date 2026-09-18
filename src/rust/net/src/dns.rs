@@ -54,26 +54,24 @@ struct Pending {
     ttl_sec: u64,
 }
 
-pub struct Dns {
-    /// Guards the cache and the query in flight; taken from the receive
-    /// softirq as well as from a resolving task.
-    lock: SpinLock,
-    /// One resolution at a time: there is one pending slot.
-    resolving: Mutex,
-    cache: core::cell::UnsafeCell<[Entry; CACHE_SIZE]>,
-    pending: core::cell::UnsafeCell<Pending>,
-    next_id: core::cell::UnsafeCell<u16>,
-
-    nic: core::cell::UnsafeCell<Option<Nic>>,
-    server_ip: core::cell::UnsafeCell<u32>,
-    listener: core::cell::UnsafeCell<Option<UdpListener>>,
-    ready: core::sync::atomic::AtomicBool,
+/// The cache, the query in flight, and who is being asked: taken from the
+/// receive softirq as well as from a resolving task.
+struct State {
+    cache: [Entry; CACHE_SIZE],
+    pending: Pending,
+    next_id: u16,
+    nic: Option<Nic>,
+    server_ip: u32,
 }
 
-/* Everything inside is touched with the lock held, or before the resolver is
- * started and reachable */
-unsafe impl Sync for Dns {}
-unsafe impl Send for Dns {}
+pub struct Dns {
+    state: SpinLock<State>,
+    /// One resolution at a time: there is one pending slot.
+    resolving: Mutex<()>,
+    /// Kept for as long as the resolver runs, which is for good.
+    listener: SpinLock<Option<UdpListener>>,
+    ready: core::sync::atomic::AtomicBool,
+}
 
 fn now_ms() -> u64 {
     time::boot_time().as_nanos() / kcore::consts::NS_PER_MS
@@ -90,15 +88,15 @@ impl Dns {
         };
 
         Some(Dns {
-            lock: SpinLock::new()?,
-            resolving: Mutex::new()?,
-            cache: core::cell::UnsafeCell::new([NOTHING; CACHE_SIZE]),
-            pending: core::cell::UnsafeCell::new(
-                Pending { id: 0, answered: false, result: 0, ttl_sec: 0 }),
-            next_id: core::cell::UnsafeCell::new(1),
-            nic: core::cell::UnsafeCell::new(None),
-            server_ip: core::cell::UnsafeCell::new(0),
-            listener: core::cell::UnsafeCell::new(None),
+            state: SpinLock::new(State {
+                cache: [NOTHING; CACHE_SIZE],
+                pending: Pending { id: 0, answered: false, result: 0, ttl_sec: 0 },
+                next_id: 1,
+                nic: None,
+                server_ip: 0,
+            })?,
+            resolving: Mutex::new(())?,
+            listener: SpinLock::new(None)?,
             ready: core::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -119,21 +117,21 @@ impl Dns {
          * is what an off-path forgery would have to get past. The C++ side
          * seeded this from the cycle counter; the pool is the better source
          * and by this point in boot it has been fed. */
-        unsafe {
-            *self.next_id.get() =
-                (kcore::random::random_u64().unwrap_or(1) as u16) | 1;
-            *self.nic.get() = Some(nic);
-            *self.server_ip.get() = server_ip;
+        {
+            let mut state = self.state.lock();
+            state.next_id = (kcore::random::random_u64().unwrap_or(1) as u16) | 1;
+            state.nic = Some(nic);
+            state.server_ip = server_ip;
         }
 
-        let listener = match nic.listen_udp(CLIENT_PORT, on_datagram, self as *const _ as *mut u8) {
+        let listener = match nic.listen(CLIENT_PORT, self) {
             Ok(listener) => listener,
             Err(err) => {
                 trace!(0, "dns: port {} could not be listened on ({:?})", CLIENT_PORT, err);
                 return false;
             }
         };
-        unsafe { *self.listener.get() = Some(listener) };
+        *self.listener.lock() = Some(listener);
 
         self.ready.store(true, core::sync::atomic::Ordering::Release);
         trace!(0, "dns: resolver started, server {}.{}.{}.{}",
@@ -145,11 +143,10 @@ impl Dns {
     /* ---- the cache ---- */
 
     fn lookup(&self, name: &[u8]) -> Option<u32> {
-        let _guard = self.lock.lock();
-        let cache = unsafe { &mut *self.cache.get() };
+        let mut state = self.state.lock();
         let now = now_ms();
 
-        for entry in cache.iter_mut() {
+        for entry in state.cache.iter_mut() {
             if !entry.valid || &entry.name[..entry.len] != name {
                 continue;
             }
@@ -169,8 +166,8 @@ impl Dns {
         }
         let ttl_sec = ttl_sec.min(MAX_TTL_SEC);
 
-        let _guard = self.lock.lock();
-        let cache = unsafe { &mut *self.cache.get() };
+        let mut state = self.state.lock();
+        let cache = &mut state.cache;
         let expires_ms = now_ms() + ttl_sec * 1000;
 
         let mut at = None;
@@ -194,20 +191,17 @@ impl Dns {
     }
 
     pub fn flush(&self) {
-        let _guard = self.lock.lock();
-        let cache = unsafe { &mut *self.cache.get() };
-        for entry in cache.iter_mut() {
+        for entry in self.state.lock().cache.iter_mut() {
             entry.valid = false;
         }
     }
 
     /// The cache into `out`, as (name length, name, ip); how many there are.
     pub fn snapshot(&self, out: &mut [([u8; MAX_DOMAIN_LEN + 1], usize, u32)]) -> usize {
-        let _guard = self.lock.lock();
-        let cache = unsafe { &*self.cache.get() };
+        let state = self.state.lock();
 
         let mut at = 0;
-        for entry in cache.iter() {
+        for entry in state.cache.iter() {
             if entry.valid && at < out.len() {
                 out[at] = (entry.name, entry.len, entry.ip);
                 at += 1;
@@ -220,7 +214,10 @@ impl Dns {
 
     /// A query for `name`, out to the server.
     fn send_query(&self, name: &[u8], id: u16) -> bool {
-        let (nic, server) = unsafe { (*self.nic.get(), *self.server_ip.get()) };
+        let (nic, server) = {
+            let state = self.state.lock();
+            (state.nic, state.server_ip)
+        };
         let nic = match nic {
             Some(nic) => nic,
             None => return false,
@@ -262,7 +259,7 @@ impl Dns {
         /* Only what came from the resolver we asked, on the port we asked it
          * on. Without this an off-path host could inject an answer, and the
          * transaction ID alone is not much of a gate. */
-        let server = unsafe { *self.server_ip.get() };
+        let server = self.state.lock().server_ip;
         if datagram.src_ip != server || datagram.src_port != SERVER_PORT {
             return;
         }
@@ -290,11 +287,8 @@ impl Dns {
 
         /* The pending id is read under the lock that guards the writes below:
          * this runs in the softirq while a task is in `resolve`. */
-        {
-            let _guard = self.lock.lock();
-            if id != unsafe { (*self.pending.get()).id } {
-                return;
-            }
+        if id != self.state.lock().pending.id {
+            return;
         }
         if answers == 0 {
             return;
@@ -338,8 +332,8 @@ impl Dns {
                 let ip = u32::from_be_bytes([
                     packet[at], packet[at + 1], packet[at + 2], packet[at + 3]]);
 
-                let _guard = self.lock.lock();
-                let pending = unsafe { &mut *self.pending.get() };
+                let mut state = self.state.lock();
+                let pending = &mut state.pending;
                 /* The id again under the lock: the resolver may have moved on
                  * to another query since the check above. */
                 if id == pending.id && !pending.answered {
@@ -373,14 +367,11 @@ impl Dns {
         }
 
         let id = {
-            let _guard = self.lock.lock();
-            let next = unsafe { &mut *self.next_id.get() };
-            let id = *next;
-            *next = next.wrapping_add(1);
-
-            let pending = unsafe { &mut *self.pending.get() };
-            pending.id = id;
-            pending.answered = false;
+            let mut state = self.state.lock();
+            let id = state.next_id;
+            state.next_id = id.wrapping_add(1);
+            state.pending.id = id;
+            state.pending.answered = false;
             id
         };
 
@@ -395,9 +386,8 @@ impl Dns {
             waited += POLL_INTERVAL_MS;
 
             let (answered, ip, ttl_sec) = {
-                let _guard = self.lock.lock();
-                let pending = unsafe { &*self.pending.get() };
-                (pending.answered, pending.result, pending.ttl_sec)
+                let state = self.state.lock();
+                (state.pending.answered, state.pending.result, state.pending.ttl_sec)
             };
 
             if answered {
@@ -416,15 +406,11 @@ impl Dns {
     }
 }
 
-/// The frame listener: what the receive softirq hands every datagram on the
-/// client port.
-extern "C" fn on_datagram(ctx: *mut u8, frame: usize) {
-    if ctx.is_null() {
-        return;
+/// What the receive path hands every datagram on the client port to.
+impl kcore::net::UdpHandler for Dns {
+    fn on_frame(&'static self, frame: kcore::net::Lent<'_>, _rx: &mut kcore::net::RxContext) {
+        self.receive(frame.bytes());
     }
-    let dns = unsafe { &*(ctx as *const Dns) };
-    let bytes = unsafe { kcore::net::NetFrame::lent(frame) };
-    dns.receive(bytes);
 }
 
 /// A name in the form the wire takes it: `\3www\7example\3com\0`. None when

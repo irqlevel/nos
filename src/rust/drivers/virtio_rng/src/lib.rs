@@ -37,7 +37,7 @@ struct Rng {
     transport: Box<dyn Transport>,
     /// Everything below is touched only with the lock held: the queue's
     /// bookkeeping and the one buffer the device writes into.
-    lock: SpinLock,
+    lock: SpinLock<()>,
     inner: core::cell::UnsafeCell<Inner>,
     /// NUL-terminated, handed to the entropy table, which keeps it
     name: [u8; 8],
@@ -82,7 +82,7 @@ impl Rng {
             }
         };
 
-        let lock = match SpinLock::new() {
+        let lock = match SpinLock::new(()) {
             Some(lock) => lock,
             None => {
                 virtio::failed(transport.as_ref());

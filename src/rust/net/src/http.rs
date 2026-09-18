@@ -10,7 +10,9 @@
 use alloc::vec::Vec;
 
 use kcore::net::Nic;
+use kcore::tcp::TcpSocket;
 use kcore::trace;
+use tls::TlsStream;
 
 use crate::abi;
 use crate::tcp::{Conn, TCP};
@@ -40,19 +42,14 @@ pub const MAX_URL_LEN: usize = 2048;
 const RECV_TIMEOUT_MS: u64 = 10_000;
 const MAX_REDIRECTS: u32 = 5;
 
-/* src/rust/tls: the session over a connection this client opened */
-extern "C" {
-    fn tls_connect(conn: *mut u8, host: *const u8, host_len: usize) -> *mut u8;
-    fn tls_send(stream: *mut u8, buf: *const u8, len: usize) -> isize;
-    fn tls_recv(stream: *mut u8, buf: *mut u8, len: usize) -> isize;
-    fn tls_close(stream: *mut u8);
-}
 
-/// Where a body goes as it arrives: the context it was given, the bytes, and
-/// how many of them it took. A short count ends the transfer and marks the
-/// response cut short -- and, being a count rather than a flag, it says
-/// exactly how much the sink holds.
-pub type SinkFn = extern "C" fn(ctx: *mut u8, data: *const u8, len: usize) -> usize;
+/// Where a body goes as it arrives: handed the bytes, it says how many of
+/// them it took. A short count ends the transfer and marks the response cut
+/// short -- and, being a count rather than a flag, it says exactly how much
+/// the sink holds.
+pub trait Sink {
+    fn take(&mut self, data: &[u8]) -> usize;
+}
 
 /// What a GET turned out to be. The C++ side declares the same struct.
 #[repr(C)]
@@ -91,27 +88,23 @@ impl Response {
 /// the same either way.
 enum Transport {
     Plain(&'static Conn),
-    Tls(*mut u8),
+    /// The session, over a connection that stays this client's to close
+    Tls(TlsStream),
 }
 
 impl Transport {
-    fn send(&self, data: &[u8]) -> bool {
-        match *self {
+    fn send(&mut self, data: &[u8]) -> bool {
+        match self {
             Transport::Plain(conn) => TCP.send(conn, data, 0) > 0,
-            Transport::Tls(stream) => {
-                let sent = unsafe { tls_send(stream, data.as_ptr(), data.len()) };
-                sent == data.len() as isize
-            }
+            Transport::Tls(stream) => stream.send(data) == data.len() as isize,
         }
     }
 
-    fn recv(&self, buf: &mut [u8], timeout_ms: u64) -> isize {
-        match *self {
+    fn recv(&mut self, buf: &mut [u8], timeout_ms: u64) -> isize {
+        match self {
             Transport::Plain(conn) => TCP.recv(conn, buf, timeout_ms),
             /* The TLS side runs its own idle timeout on the socket below */
-            Transport::Tls(stream) => {
-                unsafe { tls_recv(stream, buf.as_mut_ptr(), buf.len()) }
-            }
+            Transport::Tls(stream) => stream.recv(buf),
         }
     }
 }
@@ -310,18 +303,17 @@ impl ChunkDecoder {
 /// caller's sink: the chunk decoding, the content length's cut-off and the
 /// hard cap. It is itself what the decoder writes through, so the cap covers
 /// decoded output too.
-struct BodyWriter {
-    sink: SinkFn,
-    ctx: *mut u8,
+struct BodyWriter<'a> {
+    sink: &'a mut dyn Sink,
     limit: usize,
     written: usize,
     overflow: bool,
     failed: bool,
 }
 
-impl BodyWriter {
-    fn new(sink: SinkFn, ctx: *mut u8, limit: usize) -> BodyWriter {
-        BodyWriter { sink, ctx, limit, written: 0, overflow: false, failed: false }
+impl<'a> BodyWriter<'a> {
+    fn new(sink: &'a mut dyn Sink, limit: usize) -> BodyWriter<'a> {
+        BodyWriter { sink, limit, written: 0, overflow: false, failed: false }
     }
 
     fn write(&mut self, data: &[u8]) -> usize {
@@ -335,7 +327,7 @@ impl BodyWriter {
             return 0;
         }
 
-        let taken = (self.sink)(self.ctx, data.as_ptr(), len);
+        let taken = self.sink.take(&data[..len]);
         self.written += taken;
         if taken < len {
             self.failed = true;
@@ -345,16 +337,16 @@ impl BodyWriter {
 }
 
 /// The framing around the writer: what to do with raw bytes off the wire.
-struct Body {
-    writer: BodyWriter,
+struct Body<'a> {
+    writer: BodyWriter<'a>,
     decoder: Option<ChunkDecoder>,
     content_length: usize,
 }
 
-impl Body {
-    fn new(sink: SinkFn, ctx: *mut u8, chunked: bool, content_length: usize) -> Body {
+impl<'a> Body<'a> {
+    fn new(sink: &'a mut dyn Sink, chunked: bool, content_length: usize) -> Body<'a> {
         Body {
-            writer: BodyWriter::new(sink, ctx, MAX_BODY),
+            writer: BodyWriter::new(sink, MAX_BODY),
             decoder: if chunked { Some(ChunkDecoder::new()) } else { None },
             content_length,
         }
@@ -524,7 +516,7 @@ fn resolve(host: &[u8]) -> Option<u32> {
 /* ---- one exchange ---- */
 
 /// The request line, the host header and the framing around them.
-fn send_request(transport: &Transport, url: &Url) -> bool {
+fn send_request(transport: &mut Transport, url: &Url) -> bool {
     let mut request = Vec::new();
     if request.try_reserve_exact(MAX_URL_LEN + MAX_HOST_LEN + 64).is_err() {
         return false;
@@ -560,7 +552,7 @@ fn parse_status(buf: &[u8]) -> i32 {
 /// The response, with the body handed to the sink as it arrives. `location`
 /// takes a redirect's target, and its length comes back in the result.
 fn recv_response(
-    transport: &Transport, sink: SinkFn, ctx: *mut u8, resp: &mut Response,
+    transport: &mut Transport, sink: &mut dyn Sink, resp: &mut Response,
     location: &mut [u8; MAX_URL_LEN],
 ) -> Option<usize> {
     /* One buffer for the whole exchange: it holds the headers first, then
@@ -574,7 +566,7 @@ fn recv_response(
 
     let mut total = 0;
     let mut searched = 0;
-    let mut header_end = None;
+    let mut header_end;
     let mut eof = false;
 
     loop {
@@ -614,7 +606,7 @@ fn recv_response(
         None => {
             /* The peer hung up before the headers ended: what arrived is
              * all there is, and it is the body. */
-            resp.body_len = sink(ctx, buf.as_ptr(), total);
+            resp.body_len = sink.take(&buf[..total]);
             resp.content_length = resp.body_len;
             resp.truncated = 1;
             resp.ok = 1;
@@ -662,7 +654,7 @@ fn recv_response(
         return Some(0);
     }
 
-    let mut body = Body::new(sink, ctx, chunked, resp.content_length);
+    let mut body = Body::new(sink, chunked, resp.content_length);
 
     let mut keep_reading = body.feed(&buf[header_end..total]);
     let mut recv_failed = false;
@@ -692,7 +684,7 @@ fn recv_response(
 
 /// One request and its answer, over a connection this opens and closes.
 fn exchange(
-    nic: &Nic, url: &[u8], sink: SinkFn, ctx: *mut u8, resp: &mut Response,
+    nic: &Nic, url: &[u8], sink: &mut dyn Sink, resp: &mut Response,
     location: &mut [u8; MAX_URL_LEN],
 ) -> usize {
     let parsed = match parse_url(url) {
@@ -721,25 +713,27 @@ fn exchange(
 
     /* TLS goes on top of that connection; the connection below is closed
      * here either way. */
-    let mut stream = core::ptr::null_mut();
-    if parsed.tls {
-        stream = unsafe {
-            tls_connect(conn as *const Conn as *mut u8,
-                parsed.host().as_ptr(), parsed.host_len)
-        };
-        if stream.is_null() {
-            trace!(0, "http: the tls handshake was refused");
-            resp.tls_failed = 1;
-            TCP.close(conn);
-            return 0;
+    let mut transport = if parsed.tls {
+        let socket = TcpSocket::from_raw(conn as *const Conn as *mut core::ffi::c_void);
+        let session = core::str::from_utf8(parsed.host())
+            .ok()
+            .and_then(|host| TlsStream::connect(socket, host));
+        match session {
+            Some(stream) => Transport::Tls(stream),
+            None => {
+                trace!(0, "http: the tls handshake was refused");
+                resp.tls_failed = 1;
+                TCP.close(conn);
+                return 0;
+            }
         }
-    }
-
-    let transport = if parsed.tls { Transport::Tls(stream) } else { Transport::Plain(conn) };
+    } else {
+        Transport::Plain(conn)
+    };
 
     let mut redirect_len = 0;
-    if send_request(&transport, &parsed) {
-        match recv_response(&transport, sink, ctx, resp, location) {
+    if send_request(&mut transport, &parsed) {
+        match recv_response(&mut transport, sink, resp, location) {
             Some(len) => redirect_len = len,
             None => trace!(0, "http: no answer to the request"),
         }
@@ -747,9 +741,8 @@ fn exchange(
         trace!(0, "http: the request could not be sent");
     }
 
-    if !stream.is_null() {
-        unsafe { tls_close(stream) };
-    }
+    /* The session says goodbye before the connection under it goes. */
+    drop(transport);
     TCP.close(conn);
     redirect_len
 }
@@ -758,7 +751,7 @@ fn exchange(
 /// comes back in `last_location` is the target of a redirect that was not
 /// followed -- one that does not lead to http, or one too many.
 pub fn get_with_location(
-    nic: &Nic, url: &[u8], sink: SinkFn, ctx: *mut u8, last_location: &mut [u8],
+    nic: &Nic, url: &[u8], sink: &mut dyn Sink, last_location: &mut [u8],
 ) -> Response {
     let mut resp = Response::new();
 
@@ -776,7 +769,7 @@ pub fn get_with_location(
 
     for attempt in 0..=MAX_REDIRECTS {
         resp = Response::new();
-        let redirect_len = exchange(nic, &current[..current_len], sink, ctx,
+        let redirect_len = exchange(nic, &current[..current_len], &mut *sink,
             &mut resp, &mut location);
 
         if resp.ok == 0 || !resp.is_redirect(redirect_len) {
@@ -817,32 +810,3 @@ pub fn get_with_location(
 
 /* ---- what the kernel calls ---- */
 
-/// A GET of the url, with the body going to `sink`. Fills `out`, and
-/// `location` with a redirect target that was not followed (NUL-terminated,
-/// empty when there was none).
-///
-/// # Safety
-/// `url` points at `url_len` readable bytes, `out` at a Response, and
-/// `location` takes `location_cap` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn rust_http_get(
-    dev: usize, url: *const u8, url_len: usize, sink: SinkFn, ctx: *mut u8,
-    out: *mut Response, location: *mut u8, location_cap: usize,
-) -> i32 {
-    let nic = match unsafe { Nic::from_handle(dev) } {
-        Some(nic) => nic,
-        None => return -1,
-    };
-    if url.is_null() || url_len == 0 || out.is_null()
-        || location.is_null() || location_cap == 0
-    {
-        return -1;
-    }
-
-    let url = unsafe { core::slice::from_raw_parts(url, url_len) };
-    let location = unsafe { core::slice::from_raw_parts_mut(location, location_cap) };
-    location[0] = 0;
-
-    unsafe { *out = get_with_location(&nic, url, sink, ctx, location) };
-    0
-}
