@@ -687,6 +687,13 @@ pub unsafe extern "C" fn kernel_netframe_len(frame: usize) -> usize {
 /// # Safety
 /// `frame` is 0 or a reference the caller holds.
 #[no_mangle]
+pub unsafe extern "C" fn kernel_netframe_capacity(frame: usize) -> usize {
+    unsafe { peek(frame) }.map_or(0, |frame| frame.capacity)
+}
+
+/// # Safety
+/// `frame` is 0 or a reference the caller holds.
+#[no_mangle]
 pub unsafe extern "C" fn kernel_netframe_set_len(frame: usize, len: usize) {
     if let Some(frame) = unsafe { peek(frame) } {
         frame.set_len(len);

@@ -57,10 +57,11 @@ pub struct DeviceOps {
     pub name: *const u8,
     pub mac: [u8; 6],
     /// Empty the transmit queue into the hardware. Called with the transmit
-    /// lock held, so it must not sleep, allocate or free.
-    pub flush_tx: extern "C" fn(ctx: *mut u8),
+    /// lock held, so it must not sleep, allocate or free. `dev` is the
+    /// device's own handle, as in every call.
+    pub flush_tx: extern "C" fn(ctx: *mut u8, dev: usize),
     /// Harvest the hardware into the receive queue.
-    pub process_rx: extern "C" fn(ctx: *mut u8),
+    pub process_rx: extern "C" fn(ctx: *mut u8, dev: usize),
     pub ctx: *mut u8,
 }
 
@@ -69,18 +70,18 @@ pub struct DeviceOps {
 /// is to this layer -- which is also what lets a device be shared between
 /// CPUs without anybody having to promise anything.
 struct Driver {
-    flush_tx: extern "C" fn(ctx: *mut u8),
-    process_rx: extern "C" fn(ctx: *mut u8),
+    flush_tx: extern "C" fn(ctx: *mut u8, dev: usize),
+    process_rx: extern "C" fn(ctx: *mut u8, dev: usize),
     ctx: usize,
 }
 
 impl Driver {
-    fn flush_tx(&self) {
-        (self.flush_tx)(self.ctx as *mut u8);
+    fn flush_tx(&self, dev: &Device) {
+        (self.flush_tx)(self.ctx as *mut u8, dev.handle());
     }
 
-    fn process_rx(&self) {
-        (self.process_rx)(self.ctx as *mut u8);
+    fn process_rx(&self, dev: &Device) {
+        (self.process_rx)(self.ctx as *mut u8, dev.handle());
     }
 }
 
@@ -252,6 +253,12 @@ impl Device {
     fn driver(&self) -> Option<&Driver> {
         self.identity.get().map(|identity| &identity.driver)
     }
+
+    /// What the device is known by outside this crate: where it is in the
+    /// table, which `DeviceTable::by_handle` turns back into the device.
+    fn handle(&self) -> usize {
+        self as *const Device as usize
+    }
 }
 
 /* ---- transmitting ---- */
@@ -346,7 +353,7 @@ impl Device {
 
         if queued != 0 {
             if let Some(driver) = self.driver() {
-                driver.flush_tx();
+                driver.flush_tx(self);
             }
         }
 
@@ -384,7 +391,7 @@ impl Device {
                 if let Some(driver) = self.driver() {
                     /* Under the lock, and the guard untouched until it
                      * returns: what `tx_dequeue` needs of its caller. */
-                    driver.flush_tx();
+                    driver.flush_tx(self);
                 }
             }
         }
@@ -617,7 +624,7 @@ impl Device {
 impl Device {
     /// This device as the handle every consumer-side call takes.
     pub(crate) fn as_nic(&'static self) -> kcore::net::Nic {
-        kcore::net::Nic::from_handle(self as *const Device as usize)
+        kcore::net::Nic::from_handle(self.handle())
             .unwrap_or_else(|| unreachable!())
     }
 
@@ -827,10 +834,10 @@ impl DeviceTable {
 
         /* One handler per softirq type, dispatching to every device */
         if !self.handlers_registered.swap(true, Ordering::AcqRel) {
-            kcore::softirq::register(kcore::softirq::TYPE_NET_RX, on_rx_softirq,
-                core::ptr::null_mut());
-            kcore::softirq::register(kcore::softirq::TYPE_NET_TX, on_tx_softirq,
-                core::ptr::null_mut());
+            kcore::softirq::register_for(
+                kcore::softirq::TYPE_NET_RX, self, DeviceTable::process_all_rx);
+            kcore::softirq::register_for(
+                kcore::softirq::TYPE_NET_TX, self, DeviceTable::process_all_tx);
         }
 
         let mac = ops.mac;
@@ -850,7 +857,7 @@ impl DeviceTable {
 
         for dev in self.devices[..self.count()].iter() {
             if let Some(driver) = dev.driver() {
-                driver.process_rx();
+                driver.process_rx(dev);
             }
             /* After the harvest, before the dispatch: what the hardware had
              * waiting. */
@@ -911,14 +918,6 @@ impl DeviceTable {
     }
 }
 
-extern "C" fn on_rx_softirq(_ctx: *mut u8) {
-    DEVICES.process_all_rx();
-}
-
-extern "C" fn on_tx_softirq(_ctx: *mut u8) {
-    DEVICES.process_all_tx();
-}
-
 /* ---- what a driver calls ----
  *
  * A device crosses as a word -- its address -- and `by_handle` is what makes
@@ -953,7 +952,7 @@ pub unsafe extern "C" fn kernel_netdev_register(ops: *const DeviceOps) -> usize 
     };
 
     match unsafe { DEVICES.register(ops) } {
-        Some(dev) => dev as *const Device as usize,
+        Some(dev) => dev.handle(),
         None => 0,
     }
 }
@@ -991,11 +990,6 @@ pub unsafe extern "C" fn kernel_netdev_tx_dequeue(dev: usize) -> usize {
         .and_then(|dev| unsafe { dev.tx_dequeue() })
         .map_or(0, Frame::into_handle)
 }
-
-/// Nothing to do: the doorbell is the driver's, and the queue is drained
-/// under the lock it already holds. Kept because a driver calls it.
-#[no_mangle]
-pub extern "C" fn kernel_netdev_tx_notify(_dev: usize) {}
 
 /// A received frame into the stack. Takes it either way: what the queue had
 /// no room for is released here.
@@ -1062,7 +1056,7 @@ pub unsafe extern "C" fn kernel_net_find(name: *const u8, name_len: usize) -> us
     let name = unsafe { core::slice::from_raw_parts(name, name_len) };
 
     match DEVICES.find(name) {
-        Some(dev) => dev as *const Device as usize,
+        Some(dev) => dev.handle(),
         None => 0,
     }
 }

@@ -1,3 +1,4 @@
+use crate::callback;
 use crate::pci::PciDevice;
 use ffi::msix;
 
@@ -21,20 +22,6 @@ impl MsixTable {
         if h == 0 { None } else { Some(Self { handle: h }) }
     }
 
-    /// Program MSI-X table entry `index` and install `isr_fn` into the IDT.
-    /// Returns the allocated CPU vector, or `None` on failure.
-    ///
-    /// # Safety
-    ///
-    /// `isr_fn` must be a valid ISR entry point that saves/restores
-    /// registers, sends LAPIC EOI, and returns via `iretq`.
-    pub unsafe fn enable_vector(
-        &self, index: u16, isr_fn: unsafe extern "C" fn(),
-    ) -> Option<u8> {
-        let v = msix::kernel_msix_enable_vector(self.handle, index, isr_fn);
-        if v == 0 { None } else { Some(v) }
-    }
-
     pub fn mask(&self, index: u16) {
         unsafe { msix::kernel_msix_mask(self.handle, index) }
     }
@@ -49,13 +36,6 @@ impl MsixTable {
 
     pub fn is_ready(&self) -> bool {
         unsafe { msix::kernel_msix_is_ready(self.handle) != 0 }
-    }
-
-    pub fn disarm(&mut self) {
-        if self.handle != 0 {
-            unsafe { msix::kernel_msix_destroy(self.handle) }
-            self.handle = 0;
-        }
     }
 }
 
@@ -77,20 +57,32 @@ pub struct MsixInterrupt {
 }
 
 impl MsixInterrupt {
-    /// An empty handle that owns no interrupt slot.
-    /// Drop is a safe no-op (slot_handle == 0).
-    pub fn empty() -> Self {
-        Self { slot_handle: 0, vector: 0 }
-    }
-
-    /// Register a Rust callback for MSI-X table entry `msix_index`.
+    /// Have `handler(target)` called for MSI-X table entry `msix_index`: from
+    /// the assembly stub's ISR context, registers saved and the EOI sent
+    /// after it returns. The target is something that lives for good -- a
+    /// device, registered for the life of the kernel -- and the handler a
+    /// function item, so there is no context pointer to cast either way.
     ///
-    /// `handler(ctx)` will be called from the assembly stub's ISR context
-    /// (registers saved, LAPIC EOI sent automatically after return).
+    /// An interrupt runs on whichever CPU it is routed to, and that can move:
+    /// what the handler touches of the target it must be able to touch with
+    /// anything else running, itself included -- registers, atomics, and
+    /// locks that take interrupts off.
     ///
     /// Returns `None` if all 16 MSI-X callback slots are in use or
     /// if `MsixTable::EnableVector` fails (no free CPU vectors).
-    pub fn register(
+    pub fn register_for<T, F>(
+        table: &MsixTable, msix_index: u16, target: &'static T, handler: F,
+    ) -> Option<Self>
+    where
+        T: Sync + 'static,
+        F: Fn(&'static T) + Copy + 'static,
+    {
+        const { callback::assert_stateless::<F>() };
+        let _shown = handler;
+        Self::register(table, msix_index, callback::trampoline::<T, F>, callback::ctx_of(target))
+    }
+
+    fn register(
         table: &MsixTable,
         msix_index: u16,
         handler: extern "C" fn(*mut u8),
@@ -107,14 +99,6 @@ impl MsixInterrupt {
 
     pub fn vector(&self) -> u8 {
         self.vector
-    }
-
-    /// Unregister the interrupt and disarm the implicit Drop.
-    pub fn disarm(&mut self) {
-        if self.slot_handle != 0 {
-            unsafe { msix::kernel_msix_unregister_handler(self.slot_handle) }
-            self.slot_handle = 0;
-        }
     }
 }
 

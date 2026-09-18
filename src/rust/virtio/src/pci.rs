@@ -9,7 +9,7 @@
 //! feature bits above 31. QEMU serves both: the smoke boot attaches a modern
 //! virtio-blk and a legacy virtio-scsi, so both paths are walked every time.
 
-use core::cell::Cell;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use kcore::barrier::dma_wmb;
 use kcore::consts::PAGE_SIZE;
@@ -94,8 +94,11 @@ pub struct PciTransport {
     msix: Option<MsixTable>,
     /// Whether a vector has been handed to the device for configuration
     /// changes, which is what says MSI-X is in use at all
-    msix_active: Cell<bool>,
-    notify: [Cell<usize>; MAX_CACHED_QUEUES],
+    msix_active: AtomicBool,
+    /// Where each queue's doorbell is, worked out when the queue is set up.
+    /// Atomics, so that a transport can be shared between the CPUs that ring
+    /// it; written once a queue, and read with a plain load.
+    notify: [AtomicUsize; MAX_CACHED_QUEUES],
     /// Kept so the windows outlive the transport's use of them. The MSI-X
     /// table took the addresses it needed at probe.
     _mappings: [Option<PhysMapping>; MAX_BARS],
@@ -192,8 +195,8 @@ impl PciTransport {
         Some(Self {
             regs: Regs::Modern { common, notify_base, notify_multiplier, isr, device },
             msix,
-            msix_active: Cell::new(false),
-            notify: [const { Cell::new(0) }; MAX_CACHED_QUEUES],
+            msix_active: AtomicBool::new(false),
+            notify: [const { AtomicUsize::new(0) }; MAX_CACHED_QUEUES],
             _mappings: mappings,
         })
     }
@@ -214,8 +217,8 @@ impl PciTransport {
         Some(Self {
             regs: Regs::Legacy { io },
             msix: None,
-            msix_active: Cell::new(false),
-            notify: [const { Cell::new(0) }; MAX_CACHED_QUEUES],
+            msix_active: AtomicBool::new(false),
+            notify: [const { AtomicUsize::new(0) }; MAX_CACHED_QUEUES],
             _mappings: [None, None, None, None, None, None],
         })
     }
@@ -420,7 +423,7 @@ impl Transport for PciTransport {
                 common.write64(CFG_QUEUE_DEVICE, layout.device);
 
                 match layout.msix {
-                    Some(entry) if self.msix_active.get() => {
+                    Some(entry) if self.msix_active.load(Ordering::Acquire) => {
                         common.write16(CFG_QUEUE_MSIX_VECTOR, entry)
                     }
                     _ => common.write16(CFG_QUEUE_MSIX_VECTOR, MSIX_NO_VECTOR),
@@ -431,7 +434,7 @@ impl Transport for PciTransport {
                 common.write16(CFG_QUEUE_ENABLE, 1);
 
                 if (index as usize) < MAX_CACHED_QUEUES {
-                    self.notify[index as usize].set(self.notify_addr(index));
+                    self.notify[index as usize].store(self.notify_addr(index), Ordering::Release);
                 }
             }
             Regs::Legacy { .. } => {
@@ -453,7 +456,7 @@ impl Transport for PciTransport {
             Regs::Legacy { .. } => self.port16(LEG_QUEUE_NOTIFY).write(index),
             Regs::Modern { .. } => {
                 let cached = if (index as usize) < MAX_CACHED_QUEUES {
-                    self.notify[index as usize].get()
+                    self.notify[index as usize].load(Ordering::Relaxed)
                 } else {
                     0
                 };
@@ -506,7 +509,7 @@ impl Transport for PciTransport {
             /* The vector for configuration changes, and from here on the
              * queues are told theirs as they are enabled. */
             common.write16(CFG_MSIX_CONFIG, entry);
-            self.msix_active.set(true);
+            self.msix_active.store(true, Ordering::Release);
         }
     }
 }

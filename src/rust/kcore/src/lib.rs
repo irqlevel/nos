@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod barrier;
+mod callback;
 pub mod const_init;
 pub mod consts;
 pub mod crc32;

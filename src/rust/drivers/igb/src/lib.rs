@@ -9,8 +9,8 @@
  * Architecture, matching the r8125 driver:
  *  - PCI probe walks an ID table; each match calls init_device().
  *  - The register BAR (BAR 0) is mapped for MMIO access.
- *  - TX: the C++ net stack calls flush_tx() under TxQueueLock. It reaps
- *    finished descriptors, drains the software queue into the ring and
+ *  - TX: the net stack calls flush_tx() under the device's transmit lock. It
+ *    reaps finished descriptors, drains the software queue into the ring and
  *    writes the tail once. Reaping never happens in the ISR.
  *  - RX: the ISR masks the receive sources and raises softirq TYPE_NET_RX;
  *    process_rx() then polls to a budget, hands frames up in one batch,
@@ -32,35 +32,36 @@
  * throttle widens with the rate, so a flood costs far fewer interrupts than
  * one apiece. See arm_msix and REPOLL_NS.
  *
- * Locking:
- *  - tx_ring is touched only by flush_tx, which the C++ TxQueueLock
- *    serialises. The ISR never touches it.
- *  - rx_ring is touched only by process_rx, which the softirq layer runs on
- *    one CPU at a time.
+ * Locking, which is to say who is handed what (kcore::net::NetDriver):
+ *  - the transmit ring is flush_tx's, which the net stack calls under the
+ *    device's transmit lock. The ISR never touches it.
+ *  - the receive ring is process_rx's, which the softirq layer runs on one
+ *    CPU at a time.
+ *  - everything else -- IgbDevice -- is shared by those two, the interrupt
+ *    handlers and the state dump: registers and atomics.
  */
 
 #![no_std]
 extern crate alloc;
 
-use alloc::boxed::Box;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use kcore::net::{FrameBatch, NetBinding, NetDriver, RxQueue, TxQueue};
+use kcore::once::Once;
+use kcore::sync::IrqSpinLock;
 use kcore::time::boot_time_ns;
 use kcore::{dma, interrupt, io, msix, net, pci, softirq, trace};
 
 mod desc;
 mod regs;
 
-use desc::{RxRing, TxRing, RING_PAGES, RING_SIZE, RX_BUF_SIZE};
+use desc::{RxRing, RxView, TxRing, RING_PAGES, RING_SIZE, RX_BUF_SIZE};
 use regs::*;
 
 /* ================================================================== */
 /* Module-level device registry (same pattern as the other drivers) */
 
 const MAX_DEVICES: usize = 4;
-static DEVICES: [AtomicPtr<IgbDevice>; MAX_DEVICES] = {
-    const NULL: AtomicPtr<IgbDevice> = AtomicPtr::new(core::ptr::null_mut());
-    [NULL; MAX_DEVICES]
-};
+static DEVICES: [Once<&'static IgbDevice>; MAX_DEVICES] = [const { Once::new() }; MAX_DEVICES];
 static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /* Counters worth having when something is wrong on a machine whose only
@@ -142,32 +143,45 @@ const REPOLL_NS: u64 = 20_000;
 /* The receive rate is resampled no more often than this. */
 const RATE_SAMPLE_NS: u64 = 1_000_000;
 
-struct IgbDevice {
-    _msix_irq: msix::MsixInterrupt,
+/// The interrupts a device has, in the order they are to go: the handlers
+/// before the table their vectors are entries of.
+struct Irqs {
+    _msix_irq: Option<msix::MsixInterrupt>,
     /// The second MSI-X vector, for the non-queue causes, when there is one.
-    _msix_irq_other: msix::MsixInterrupt,
+    _msix_irq_other: Option<msix::MsixInterrupt>,
     _msix_table: Option<msix::MsixTable>,
-    _intx: interrupt::LegacyInterrupt,
+    _intx: Option<interrupt::LegacyInterrupt>,
+}
+
+struct IgbDevice {
+    /// Kept: dropped, they would take the handlers away -- which is what
+    /// shutdown does with them.
+    irqs: IrqSpinLock<Option<Irqs>>,
     /// Whether causes arrive through the extended block rather than ICR/IMS.
     /// It decides which pair of registers masks and arms the receive side.
-    msix: bool,
+    /// Settled when the interrupt is attached, before anything is armed.
+    msix: AtomicBool,
     /// Whether the queues and the non-queue causes have a vector each. When
     /// they do, the queue interrupt reads no register at all: the hardware
     /// auto-clears its cause (EIAC) and auto-masks it (EIAME, with EIAM
     /// naming it), and only the rare other vector reads ICR. When they share
     /// one vector, that one handler reads EICR and ICR as before.
-    two_vector: bool,
+    two_vector: AtomicBool,
     generation: Generation,
     phy_addr: u32,
     /* Set by the interrupt when the link changes, acted on by the poll: the
        work it asks for is a PHY read, which means polling MDIC for
        milliseconds, and that has no business in an interrupt handler. */
     link_event: AtomicU32,
-    tx_ring: TxRing,
-    rx_ring: RxRing,
-    net_handle: net::NetDeviceHandle,
-    mac: [u8; 6],
-    name_buf: [u8; 16],
+    /// The receive ring's descriptors, for the state dump: the poll owns the
+    /// ring, but what the chip has written into it is there for anyone to
+    /// read -- and reading the chip rather than the driver's idea of it is
+    /// what the dump is for.
+    rx_view: RxView,
+    /// Where the poll last left the ring, for the same dump.
+    rx_next_to_clean: AtomicU32,
+    rx_next_to_use: AtomicU32,
+    rx_head_posted: AtomicBool,
     tx_packets: AtomicU64,
     rx_packets: AtomicU64,
     rx_dropped: AtomicU64,
@@ -201,9 +215,13 @@ struct IgbDevice {
 }
 
 impl IgbDevice {
+    fn is_msix(&self) -> bool {
+        self.msix.load(Ordering::Relaxed)
+    }
+
     /// Go quiet on receive for the duration of a poll.
     fn mask_rx(&self) {
-        if self.msix {
+        if self.is_msix() {
             self.regs.write32(EIMC, EICR_VECTOR0);
         } else {
             self.regs.write32(IMC, RX_INTR_BITS);
@@ -212,7 +230,7 @@ impl IgbDevice {
 
     /// Hand the ring back to the interrupt.
     fn arm_rx(&self) {
-        if self.msix {
+        if self.is_msix() {
             self.regs.write32(EIMS, EICR_VECTOR0);
         } else {
             self.regs.write32(IMS, RX_INTR_BITS);
@@ -220,10 +238,11 @@ impl IgbDevice {
     }
 }
 
-impl Drop for IgbDevice {
-    fn drop(&mut self) {
-        /* Stop both engines before the rings go: the chip must not be left
-         * writing into freed pages. */
+impl IgbDevice {
+    /// Every interrupt masked and both engines stopped: what a shutdown
+    /// leaves, and a bring-up that could not finish. The rings stay where
+    /// they are -- the device is for good -- with nothing reading them.
+    fn quiesce(&self) {
         self.regs.write32(IMC, u32::MAX);
         self.regs.write32(EIMC, u32::MAX);
         let rctl = self.regs.read32(RCTL);
@@ -233,6 +252,11 @@ impl Drop for IgbDevice {
         self.regs.write32(RXDCTL0, 0);
         self.regs.write32(TXDCTL0, 0);
         let _ = self.regs.read32(STATUS); /* flush the posted writes */
+
+        /* And the handlers: taken out under the lock, dropped after it --
+         * the drop waits for one that may be running. */
+        let irqs = self.irqs.lock().take();
+        drop(irqs);
     }
 }
 
@@ -311,10 +335,9 @@ pub fn init() {
 
 pub fn shutdown() {
     let count = (DEVICE_COUNT.load(Ordering::Relaxed) as usize).min(MAX_DEVICES);
-    for i in 0..count {
-        let raw = DEVICES[i].swap(core::ptr::null_mut(), Ordering::AcqRel);
-        if !raw.is_null() {
-            unsafe { drop(Box::from_raw(raw)) };
+    for slot in DEVICES[..count].iter() {
+        if let Some(dev) = slot.get() {
+            dev.quiesce();
         }
     }
     trace!(0, "igb: shutdown complete, count={}", count);
@@ -826,7 +849,7 @@ fn find_mmio_bar(pci_dev: &pci::PciDevice) -> u64 {
 
 /* "ethN", which is the name every NIC driver here uses and the one the
  * shell's DHCP autostart looks for by name. */
-fn write_device_name(buf: &mut [u8; 16], idx: u32) {
+fn write_device_name(buf: &mut [u8; 16], idx: u32) -> &str {
     let name = b"eth";
     let mut i = 0;
     while i < name.len() {
@@ -835,7 +858,7 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
     }
     /* Single digit is enough: MAX_DEVICES is 4. */
     buf[i] = b'0' + (idx as u8 % 10);
-    buf[i + 1] = 0;
+    core::str::from_utf8(&buf[..i + 1]).unwrap_or("eth?")
 }
 
 /* ================================================================== */
@@ -844,7 +867,7 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
 fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     /* Claim a slot before touching the hardware, as the r8125 driver does:
      * every failure below either happens before the DMA engines start or
-     * unwinds through Drop, which stops them first. */
+     * goes through `stop_engines` or `quiesce`, which stop them first. */
     let idx = DEVICE_COUNT.load(Ordering::Relaxed);
     if idx as usize >= MAX_DEVICES {
         trace!(0, "igb: too many devices (max {})", MAX_DEVICES);
@@ -923,8 +946,13 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
         }
     };
 
-    let tx_ring = TxRing::new(tx_dma);
-    let mut rx_ring = RxRing::new(rx_dma);
+    let (tx_ring, mut rx_ring) = match (TxRing::new(tx_dma), RxRing::new(rx_dma)) {
+        (Some(tx), Some(rx)) => (tx, rx),
+        _ => {
+            trace!(0, "igb: no memory for the rings' bookkeeping");
+            return;
+        }
+    };
 
     /* Fill the ring before the engine is switched on. desc_unused enforces
      * the one-descriptor gap, so this posts RING_SIZE - 1 buffers. */
@@ -970,7 +998,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     }
 
     /* --- Receive queue 0 --- */
-    let rx_phys = rx_ring.dma.phys();
+    let rx_phys = rx_ring.phys;
     regs.write32(RDBAL0, rx_phys as u32);
     regs.write32(RDBAH0, (rx_phys >> 32) as u32);
     regs.write32(RDLEN0, (RING_SIZE * desc::DESC_BYTES) as u32);
@@ -1022,7 +1050,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     );
 
     /* --- Transmit queue 0 --- */
-    let tx_phys = tx_ring.dma.phys();
+    let tx_phys = tx_ring.phys;
     regs.write32(TDBAL0, tx_phys as u32);
     regs.write32(TDBAH0, (tx_phys >> 32) as u32);
     regs.write32(TDLEN0, (RING_SIZE * desc::DESC_BYTES) as u32);
@@ -1052,85 +1080,72 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let _ = regs.read32(ICR);
 
     let mut name_buf = [0u8; 16];
-    write_device_name(&mut name_buf, idx);
+    let name = write_device_name(&mut name_buf, idx);
 
-    let mut dev_box = Box::new(IgbDevice {
-        _msix_irq: msix::MsixInterrupt::empty(),
-        _msix_irq_other: msix::MsixInterrupt::empty(),
-        _msix_table: None,
-        _intx: interrupt::LegacyInterrupt::empty(),
-        msix: false,
-        two_vector: false,
-        generation,
-        phy_addr,
-        link_event: AtomicU32::new(0),
+    /* For good from here: the interrupt handlers are pointed at the device,
+     * and then the net stack is -- with each ring handed to the one call
+     * that touches it. */
+    let (next_to_clean, next_to_use, head_posted) = rx_ring.pointers();
+    let binding = NetBinding::new(
+        IgbDevice {
+            irqs: IrqSpinLock::new(None),
+            msix: AtomicBool::new(false),
+            two_vector: AtomicBool::new(false),
+            generation,
+            phy_addr,
+            link_event: AtomicU32::new(0),
+            rx_view: rx_ring.view(),
+            rx_next_to_clean: AtomicU32::new(next_to_clean),
+            rx_next_to_use: AtomicU32::new(next_to_use),
+            rx_head_posted: AtomicBool::new(head_posted),
+            tx_packets: AtomicU64::new(0),
+            rx_packets: AtomicU64::new(0),
+            rx_dropped: AtomicU64::new(0),
+            rx_rate_pps: AtomicU32::new(0),
+            rate_last_ns: AtomicU64::new(0),
+            rate_last_pkts: AtomicU64::new(0),
+            eitr_us: AtomicU32::new(EITR_INTERVAL_US),
+            isr_queue: AtomicU64::new(0),
+            isr_other: AtomicU64::new(0),
+            empty_since: AtomicU64::new(0),
+            rx_repolls: AtomicU64::new(0),
+            rx_repoll_hits: AtomicU64::new(0),
+            rx_repoll_ns: AtomicU64::new(0),
+            _bar_mapping: bar_mapping,
+            regs,
+        },
         tx_ring,
         rx_ring,
-        net_handle: net::NetDeviceHandle::placeholder(),
-        mac,
-        name_buf,
-        tx_packets: AtomicU64::new(0),
-        rx_packets: AtomicU64::new(0),
-        rx_dropped: AtomicU64::new(0),
-        rx_rate_pps: AtomicU32::new(0),
-        rate_last_ns: AtomicU64::new(0),
-        rate_last_pkts: AtomicU64::new(0),
-        eitr_us: AtomicU32::new(EITR_INTERVAL_US),
-        isr_queue: AtomicU64::new(0),
-        isr_other: AtomicU64::new(0),
-        empty_since: AtomicU64::new(0),
-        rx_repolls: AtomicU64::new(0),
-        rx_repoll_hits: AtomicU64::new(0),
-        rx_repoll_ns: AtomicU64::new(0),
-        _bar_mapping: bar_mapping,
-        regs,
-    });
+    );
+    let dev = binding.driver();
 
-    let ctx_ptr = dev_box.as_mut() as *mut IgbDevice as *mut u8;
-
-    if !attach_interrupt(pci_dev, &mut dev_box, ctx_ptr) {
+    if !attach_interrupt(pci_dev, dev) {
         trace!(0, "igb: no interrupt could be registered");
+        dev.quiesce();
         return;
     }
 
-    if dev_box.msix {
-        arm_msix(&dev_box.regs, dev_box.two_vector);
+    if dev.is_msix() {
+        arm_msix(&dev.regs, dev.two_vector.load(Ordering::Relaxed));
     } else {
-        dev_box.regs.write32(IMS, INTR_MASK_BITS);
+        dev.regs.write32(IMS, INTR_MASK_BITS);
     }
 
-    trace_link(&dev_box.regs);
+    trace_link(&dev.regs);
 
-    let raw = Box::into_raw(dev_box);
+    if binding.register(name, mac).is_none() {
+        trace!(0, "igb: NetDevice registration failed");
+        dev.quiesce();
+        return;
+    }
 
-    let ops = net::NetDeviceOps {
-        name: unsafe { (*raw).name_buf.as_ptr() },
-        mac: unsafe { (*raw).mac },
-        flush_tx: igb_flush_tx,
-        process_rx: igb_process_rx,
-        ctx: raw as *mut u8,
-    };
-    let handle = match net::register(&ops) {
-        Some(h) => h,
-        None => {
-            trace!(0, "igb: NetDevice registration failed");
-            unsafe { drop(Box::from_raw(raw)) };
-            return;
-        }
-    };
-    unsafe { (*raw).net_handle = handle };
-
-    DEVICES[idx as usize].store(raw, Ordering::Release);
+    let _ = DEVICES[idx as usize].set(dev);
     DEVICE_COUNT.store(idx + 1, Ordering::Release);
 
     trace!(0, "igb: device {} ready ({})", idx, generation.as_str());
 }
 
-fn attach_interrupt(
-    pci_dev: &pci::PciDevice,
-    dev_box: &mut Box<IgbDevice>,
-    ctx_ptr: *mut u8,
-) -> bool {
+fn attach_interrupt(pci_dev: &pci::PciDevice, dev: &'static IgbDevice) -> bool {
     /* Two vectors where the table has room for them: entry 0 for the one
      * receive and the one transmit queue, entry 1 for the rare non-queue
      * causes. There is one queue, so this is not about spreading queues --
@@ -1140,28 +1155,30 @@ fn attach_interrupt(
      * the AX41 under a small-packet flood those reads were a tenth of the
      * receive CPU. Entry 1's handler still reads ICR; it fires seldom. */
     if let Some(table) = msix::MsixTable::new(pci_dev) {
-        match msix::MsixInterrupt::register(&table, 0, igb_isr_queue, ctx_ptr) {
+        match msix::MsixInterrupt::register_for(&table, 0, dev, isr_queue) {
             Some(irq) => {
-                dev_box._msix_irq = irq;
-                dev_box.msix = true;
+                dev.msix.store(true, Ordering::Release);
 
-                if table.table_size() >= 2 {
-                    if let Some(other) =
-                        msix::MsixInterrupt::register(&table, 1, igb_isr_other, ctx_ptr)
-                    {
-                        dev_box._msix_irq_other = other;
-                        dev_box.two_vector = true;
-                    }
-                }
+                let other = if table.table_size() >= 2 {
+                    msix::MsixInterrupt::register_for(&table, 1, dev, isr_other)
+                } else {
+                    None
+                };
+                dev.two_vector.store(other.is_some(), Ordering::Release);
 
                 trace!(
                     0,
                     "igb: MSI-X vector={} ({} entries), {}",
-                    dev_box._msix_irq.vector(),
+                    irq.vector(),
                     table.table_size(),
-                    if dev_box.two_vector { "queue + other" } else { "one vector" }
+                    if other.is_some() { "queue + other" } else { "one vector" }
                 );
-                dev_box._msix_table = Some(table);
+                *dev.irqs.lock() = Some(Irqs {
+                    _msix_irq: Some(irq),
+                    _msix_irq_other: other,
+                    _msix_table: Some(table),
+                    _intx: None,
+                });
                 return true;
             }
             None => {
@@ -1178,10 +1195,15 @@ fn attach_interrupt(
         pci_dev.write_config16(PCI_COMMAND, cmd & !PCI_COMMAND_INTX_DISABLE);
     }
 
-    match interrupt::LegacyInterrupt::register_level(pci_dev, igb_isr, ctx_ptr) {
+    match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
         Some(irq) => {
             trace!(0, "igb: INTx vector={} (irq {})", irq.vector(), pci_dev.irq_line);
-            dev_box._intx = irq;
+            *dev.irqs.lock() = Some(Irqs {
+                _msix_irq: None,
+                _msix_irq_other: None,
+                _msix_table: None,
+                _intx: Some(irq),
+            });
             true
         }
         None => false,
@@ -1266,286 +1288,269 @@ fn arm_msix(regs: &io::MmioRegion, two_vector: bool) {
  * With one vector it is the shared handler's job. Entry 0 is registered
  * before it is known whether entry 1 will be, so this is the handler it gets
  * either way -- and with one vector nothing clears the cause behind it (EIAC
- * is 0 there). Returning without igb_isr's read and write-back of EICR would
+ * is 0 there). Returning without `isr`'s read and write-back of EICR would
  * leave the cause standing and the vector firing for good: the storm
- * igb_isr's own comment measured on an I210. */
-extern "C" fn igb_isr_queue(ctx: *mut u8) {
-    let dev = ctx as *mut IgbDevice;
-    if dev.is_null() {
+ * `isr`'s own comment measured on an I210. */
+fn isr_queue(dev: &'static IgbDevice) {
+    if !dev.two_vector.load(Ordering::Relaxed) {
+        isr(dev);
         return;
     }
-    unsafe {
-        if !(*dev).two_vector {
-            igb_isr(ctx);
-            return;
-        }
 
-        (*dev).isr_queue.fetch_add(1, Ordering::Relaxed);
-        softirq::raise(softirq::TYPE_NET_TX);
-        softirq::raise(softirq::TYPE_NET_RX);
-    }
+    dev.isr_queue.fetch_add(1, Ordering::Relaxed);
+    softirq::raise(softirq::TYPE_NET_TX);
+    softirq::raise(softirq::TYPE_NET_RX);
 }
 
 /* The other vector: link change and receiver overrun, seldom. It reads ICR
  * for the cause, clears its own EICR bit and re-arms it (EIAME masked it). */
-extern "C" fn igb_isr_other(ctx: *mut u8) {
-    let dev = ctx as *mut IgbDevice;
-    if dev.is_null() {
-        return;
+fn isr_other(dev: &'static IgbDevice) {
+    let regs = &dev.regs;
+    dev.isr_other.fetch_add(1, Ordering::Relaxed);
+
+    let icr = regs.read32(ICR);
+    if icr & ICR_LSC != 0 {
+        dev.link_event.store(1, Ordering::Release);
+
+        /* The poll acts on it, and should on the queue vector's CPU, not
+         * this one: IrqBalance places each MSI-X entry on a CPU of its own,
+         * and raising the receive softirq here would run the whole poll here
+         * -- the PHY reads, which take milliseconds, included -- while the
+         * CPU the frames land on waited for it. Setting the queue vector's
+         * cause has the chip interrupt that CPU instead: now if the vector
+         * is armed, the moment the poll re-arms it if not. Linux's igb
+         * watchdog kicks its ring vectors the same way. The flag is out
+         * before the kick that sends a CPU to read it. */
+        kcore::barrier::dma_wmb();
+        regs.write32(EICS, EICR_VECTOR0);
     }
-    unsafe {
-        let regs = &(*dev).regs;
-        (*dev).isr_other.fetch_add(1, Ordering::Relaxed);
-
-        let icr = regs.read32(ICR);
-        if icr & ICR_LSC != 0 {
-            (*dev).link_event.store(1, Ordering::Release);
-
-            /* The poll acts on it, and should on the queue vector's CPU, not
-             * this one: IrqBalance places each MSI-X entry on a CPU of its
-             * own, and raising the receive softirq here would run the whole
-             * poll here -- the PHY reads, which take milliseconds, included --
-             * while the CPU the frames land on waited for it. Setting the
-             * queue vector's cause has the chip interrupt that CPU instead:
-             * now if the vector is armed, the moment the poll re-arms it if
-             * not. Linux's igb watchdog kicks its ring vectors the same way.
-             * The flag is out before the kick that sends a CPU to read it. */
-            kcore::barrier::dma_wmb();
-            regs.write32(EICS, EICR_VECTOR0);
+    if icr & ICR_RXO != 0 {
+        let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if n < 10 {
+            trace!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
         }
-        if icr & ICR_RXO != 0 {
-            let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
-            if n < 10 {
-                trace!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
-            }
-        }
-
-        regs.write32(EICR, EICR_VECTOR1);
-        regs.write32(EIMS, EICR_VECTOR1);
     }
+
+    regs.write32(EICR, EICR_VECTOR1);
+    regs.write32(EIMS, EICR_VECTOR1);
 }
 
 /* The shared vector: MSI-X with one vector, or INTx. Reads EICR and ICR to
  * tell the causes apart. */
-extern "C" fn igb_isr(ctx: *mut u8) {
-    let dev = ctx as *mut IgbDevice;
-    if dev.is_null() {
-        return;
-    }
+fn isr(dev: &'static IgbDevice) {
+    let regs = &dev.regs;
+    let msix = dev.is_msix();
+    dev.isr_queue.fetch_add(1, Ordering::Relaxed);
 
-    unsafe {
-        let regs = &(*dev).regs;
-        (*dev).isr_queue.fetch_add(1, Ordering::Relaxed);
-
-        /* In MSI-X mode the vector's own cause register says whether this
-         * interrupt is ours; the per-event detail still arrives in ICR. */
-        if (*dev).msix {
-            let eicr = regs.read32(EICR);
-            if eicr & EICR_VECTOR0 == 0 {
-                return;
-            }
-
-            /* Clear it by writing the bits back. EICR is documented as
-             * cleared on read only when GPIE.Multiple_MSIX is zero, and this
-             * driver sets that bit -- so a read alone leaves the cause
-             * standing and the interrupt re-asserts the moment it is armed
-             * again. Measured on an I210 before this line existed: 434
-             * million interrupts and 144 million poll rounds, with not one
-             * frame received. (333016 rev 3.7, section 8.8.3.) */
-            regs.write32(EICR, eicr);
-        }
-
-        /* Reading the cause register clears it, so this is the only chance to
-         * see these bits: everything they ask for has to be started here.
-         * A zero read means the line belongs to somebody else -- INTx is
-         * shared. */
-        let icr = regs.read32(ICR);
-        if icr == 0 && !(*dev).msix {
+    /* In MSI-X mode the vector's own cause register says whether this
+     * interrupt is ours; the per-event detail still arrives in ICR. */
+    if msix {
+        let eicr = regs.read32(EICR);
+        if eicr & EICR_VECTOR0 == 0 {
             return;
         }
 
-        if icr & ICR_LSC != 0 {
-            (*dev).link_event.store(1, Ordering::Release);
-        }
+        /* Clear it by writing the bits back. EICR is documented as cleared
+         * on read only when GPIE.Multiple_MSIX is zero, and this driver sets
+         * that bit -- so a read alone leaves the cause standing and the
+         * interrupt re-asserts the moment it is armed again. Measured on an
+         * I210 before this line existed: 434 million interrupts and 144
+         * million poll rounds, with not one frame received. (333016 rev 3.7,
+         * section 8.8.3.) */
+        regs.write32(EICR, eicr);
+    }
 
-        if icr & ICR_RXO != 0 {
-            let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
-            if n < 10 {
-                trace!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
-            }
-        }
+    /* Reading the cause register clears it, so this is the only chance to
+     * see these bits: everything they ask for has to be started here. A zero
+     * read means the line belongs to somebody else -- INTx is shared. */
+    let icr = regs.read32(ICR);
+    if icr == 0 && !msix {
+        return;
+    }
 
-        /* TX reaping stays in flush_tx -- doing it here would race a
-         * flush_tx on another CPU. The softirq drains frames that piled up
-         * in the C++ TxQueue while the ring was full. */
-        if icr & ICR_TXDW != 0 {
-            softirq::raise(softirq::TYPE_NET_TX);
-        }
+    if icr & ICR_LSC != 0 {
+        dev.link_event.store(1, Ordering::Release);
+    }
 
-        /* Go quiet on receive and hand the ring to the poll. Unlike the
-         * Realtek parts there is no edge to lose here: the causes are cleared
-         * by the reads above, so re-arming later cannot land on a stale one.
-         *
-         * On the single MSI-X vector every cause shares the interrupt, so the
-         * poll is entered whenever it fires; a harvest that finds nothing is
-         * cheap, and it is one fewer thing this register can lose. */
-        if (*dev).msix || icr & RX_INTR_BITS != 0 {
-            (*dev).mask_rx();
-            softirq::raise(softirq::TYPE_NET_RX);
+    if icr & ICR_RXO != 0 {
+        let n = RX_ERR_EVENTS.fetch_add(1, Ordering::Relaxed);
+        if n < 10 {
+            trace!(0, "igb: receiver overrun, icr {:#x} (event {})", icr, n + 1);
         }
+    }
+
+    /* TX reaping stays in flush_tx -- doing it here would race a flush_tx on
+     * another CPU. The softirq drains frames that piled up in the stack's
+     * transmit queue while the ring was full. */
+    if icr & ICR_TXDW != 0 {
+        softirq::raise(softirq::TYPE_NET_TX);
+    }
+
+    /* Go quiet on receive and hand the ring to the poll. Unlike the Realtek
+     * parts there is no edge to lose here: the causes are cleared by the
+     * reads above, so re-arming later cannot land on a stale one.
+     *
+     * On the single MSI-X vector every cause shares the interrupt, so the
+     * poll is entered whenever it fires; a harvest that finds nothing is
+     * cheap, and it is one fewer thing this register can lose. */
+    if msix || icr & RX_INTR_BITS != 0 {
+        dev.mask_rx();
+        softirq::raise(softirq::TYPE_NET_RX);
     }
 }
 
 /* ================================================================== */
 /* Receive */
 
-/// Bring the MAC into step with a link that has just changed, and say so.
-///
-/// Task context, from the poll: takes the PHY semaphore where the part shares
-/// its MDIO bus with firmware, which is not something to do from an interrupt.
-unsafe fn handle_link_event(dev: *mut IgbDevice) {
-    if (*dev).link_event.swap(0, Ordering::AcqRel) == 0 {
-        return;
+impl IgbDevice {
+    /// Bring the MAC into step with a link that has just changed, and say so.
+    ///
+    /// Task context, from the poll: takes the PHY semaphore where the part
+    /// shares its MDIO bus with firmware, which is not something to do from
+    /// an interrupt.
+    fn handle_link_event(&self) {
+        if self.link_event.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
+
+        let regs = &self.regs;
+
+        if self.generation == Generation::I210 && !swfw_acquire(regs, SWFW_PHY0_SM) {
+            trace!(0, "igb: link changed, but the PHY semaphore is held elsewhere");
+            return;
+        }
+
+        sync_mac_speed(regs, self.phy_addr);
+
+        if self.generation == Generation::I210 {
+            swfw_release(regs, SWFW_PHY0_SM);
+        }
+
+        trace_link(regs);
     }
 
-    let regs = &(*dev).regs;
-    let generation = (*dev).generation;
-
-    if generation == Generation::I210 && !swfw_acquire(regs, SWFW_PHY0_SM) {
-        trace!(0, "igb: link changed, but the PHY semaphore is held elsewhere");
-        return;
-    }
-
-    sync_mac_speed(regs, (*dev).phy_addr);
-
-    if generation == Generation::I210 {
-        swfw_release(regs, SWFW_PHY0_SM);
-    }
-
-    trace_link(regs);
-}
-
-/// Put buffers back into every slot the chip has given up, and publish them.
-/// Returns whether the tail moved.
-unsafe fn refill_rx(dev: *mut IgbDevice) {
-    while (*dev).rx_ring.desc_unused() > 0 {
-        match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-            Some(frame) => {
-                if (*dev).rx_ring.post_next(frame).is_none() {
+    /// Put buffers back into every slot the chip has given up, and publish
+    /// them.
+    fn refill_rx(&self, ring: &mut RxRing) {
+        while ring.desc_unused() > 0 {
+            match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+                Some(frame) => {
+                    if ring.post_next(frame).is_none() {
+                        break;
+                    }
+                }
+                None => {
+                    /* Out of frames: leave the slots empty and try again next
+                     * pass. The ring keeps running on what it still holds. */
+                    self.rx_dropped.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
             }
-            None => {
-                /* Out of frames: leave the slots empty and try again next
-                 * pass. The ring keeps running on what it still holds. */
-                (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
-                break;
-            }
+        }
+
+        /* Publish on the tail having moved, not on this function having
+         * posted something: an error frame reposted in the harvest loop moves
+         * it too, and if it took the last free slot the loop above adds
+         * nothing. Keying off `posted` there would leave that descriptor
+         * sitting in the ring with the chip never told it was available. */
+        if ring.needs_tail_write() {
+            /* Descriptors visible before the tail that points past them. */
+            kcore::barrier::dma_wmb();
+            self.regs.write32(RDT0, ring.tail());
+            ring.mark_tail_written();
         }
     }
 
-    /* Publish on the tail having moved, not on this function having posted
-     * something: an error frame reposted in the harvest loop moves it too,
-     * and if it took the last free slot the loop above adds nothing. Keying
-     * off `posted` there would leave that descriptor sitting in the ring
-     * with the chip never told it was available. */
-    if (*dev).rx_ring.needs_tail_write() {
-        /* Descriptors visible before the tail that points past them. */
-        kcore::barrier::dma_wmb();
-        (*dev).regs.write32(RDT0, (*dev).rx_ring.tail());
-        (*dev).rx_ring.mark_tail_written();
-    }
-}
-
-/// Resample the receive rate if a sample window has passed, and adapt the
-/// interrupt throttle to it. Called at the head of the poll, one CPU at a
-/// time, with the time the pass began. Returns the current rate estimate.
-unsafe fn sample_rate(dev: *mut IgbDevice, now: u64) -> u32 {
-    let last = (*dev).rate_last_ns.load(Ordering::Relaxed);
-    let dt = now.wrapping_sub(last);
-    if last != 0 && dt >= RATE_SAMPLE_NS {
-        let pkts = (*dev).rx_packets.load(Ordering::Relaxed);
-        let dpkts = pkts.wrapping_sub((*dev).rate_last_pkts.load(Ordering::Relaxed));
-        let pps = (dpkts.saturating_mul(1_000_000_000) / dt) as u32;
-        (*dev).rx_rate_pps.store(pps, Ordering::Relaxed);
-        (*dev).rate_last_ns.store(now, Ordering::Relaxed);
-        (*dev).rate_last_pkts.store(pkts, Ordering::Relaxed);
-        apply_eitr(dev, pps);
-    } else if last == 0 {
-        (*dev).rate_last_ns.store(now, Ordering::Relaxed);
-        (*dev).rate_last_pkts
-            .store((*dev).rx_packets.load(Ordering::Relaxed), Ordering::Relaxed);
-    }
-    (*dev).rx_rate_pps.load(Ordering::Relaxed)
-}
-
-/// Widen the interrupt throttle with the rate: 2 us idle, 20 us at 400k a
-/// second and up. Written only when it changes -- and only on MSI-X. EITR
-/// throttles MSI-X vectors; on INTx the part holds interrupts apart through
-/// ITR, which this driver leaves alone, and writing EITR there would change
-/// nothing while igbdump reported it as the throttle in force.
-unsafe fn apply_eitr(dev: *mut IgbDevice, pps: u32) {
-    if !(*dev).msix {
-        return;
+    /// Resample the receive rate if a sample window has passed, and adapt the
+    /// interrupt throttle to it. Called at the head of the poll, one CPU at a
+    /// time, with the time the pass began. Returns the current rate estimate.
+    fn sample_rate(&self, now: u64) -> u32 {
+        let last = self.rate_last_ns.load(Ordering::Relaxed);
+        let dt = now.wrapping_sub(last);
+        if last != 0 && dt >= RATE_SAMPLE_NS {
+            let pkts = self.rx_packets.load(Ordering::Relaxed);
+            let dpkts = pkts.wrapping_sub(self.rate_last_pkts.load(Ordering::Relaxed));
+            let pps = (dpkts.saturating_mul(1_000_000_000) / dt) as u32;
+            self.rx_rate_pps.store(pps, Ordering::Relaxed);
+            self.rate_last_ns.store(now, Ordering::Relaxed);
+            self.rate_last_pkts.store(pkts, Ordering::Relaxed);
+            self.apply_eitr(pps);
+        } else if last == 0 {
+            self.rate_last_ns.store(now, Ordering::Relaxed);
+            self.rate_last_pkts.store(self.rx_packets.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        self.rx_rate_pps.load(Ordering::Relaxed)
     }
 
-    let want = (pps / EITR_PPS_PER_US).clamp(EITR_MIN_US, EITR_MAX_US);
-    if want != (*dev).eitr_us.load(Ordering::Relaxed) {
-        (*dev)
-            .regs
-            .write32(EITR0, (want << EITR_INTERVAL_SHIFT) | EITR_CNT_IGNR);
-        (*dev).eitr_us.store(want, Ordering::Relaxed);
-    }
-}
+    /// Widen the interrupt throttle with the rate: 2 us idle, 20 us at 400k a
+    /// second and up. Written only when it changes -- and only on MSI-X. EITR
+    /// throttles MSI-X vectors; on INTx the part holds interrupts apart
+    /// through ITR, which this driver leaves alone, and writing EITR there
+    /// would change nothing while igbdump reported it as the throttle in
+    /// force.
+    fn apply_eitr(&self, pps: u32) {
+        if !self.is_msix() {
+            return;
+        }
 
-/// The ring gave up a frame, or is being handed back to the interrupt: a run
-/// of repolls over an empty ring, if one was going, is over. Its length is
-/// what it cost; ending in a frame, it spared an interrupt.
-unsafe fn end_repolls(dev: *mut IgbDevice, now: u64, found: bool) {
-    let since = (*dev).empty_since.swap(0, Ordering::Relaxed);
-    if since == 0 {
-        return;
-    }
-
-    (*dev).rx_repoll_ns.fetch_add(now.saturating_sub(since), Ordering::Relaxed);
-    if found {
-        (*dev).rx_repoll_hits.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// The ring is empty and the rate high: whether to look again on another
-/// softirq pass rather than arm -- yes until it has sat empty for REPOLL_NS.
-unsafe fn repoll(dev: *mut IgbDevice, now: u64) -> bool {
-    let since = (*dev).empty_since.load(Ordering::Relaxed);
-    if since == 0 {
-        /* Never 0 itself, which means "not in a run". */
-        (*dev).empty_since.store(now.max(1), Ordering::Relaxed);
-    } else if now.saturating_sub(since) >= REPOLL_NS {
-        end_repolls(dev, now, false);
-        return false;
+        let want = (pps / EITR_PPS_PER_US).clamp(EITR_MIN_US, EITR_MAX_US);
+        if want != self.eitr_us.load(Ordering::Relaxed) {
+            self.regs.write32(EITR0, (want << EITR_INTERVAL_SHIFT) | EITR_CNT_IGNR);
+            self.eitr_us.store(want, Ordering::Relaxed);
+        }
     }
 
-    (*dev).rx_repolls.fetch_add(1, Ordering::Relaxed);
-    true
-}
+    /// The ring gave up a frame, or is being handed back to the interrupt: a
+    /// run of repolls over an empty ring, if one was going, is over. Its
+    /// length is what it cost; ending in a frame, it spared an interrupt.
+    fn end_repolls(&self, now: u64, found: bool) {
+        let since = self.empty_since.swap(0, Ordering::Relaxed);
+        if since == 0 {
+            return;
+        }
 
-extern "C" fn igb_process_rx(ctx: *mut u8) {
-    let dev = ctx as *mut IgbDevice;
-    if dev.is_null() {
-        return;
+        self.rx_repoll_ns.fetch_add(now.saturating_sub(since), Ordering::Relaxed);
+        if found {
+            self.rx_repoll_hits.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    let mut polls: u32 = 0;
+    /// The ring is empty and the rate high: whether to look again on another
+    /// softirq pass rather than arm -- yes until it has sat empty for
+    /// REPOLL_NS.
+    fn repoll(&self, now: u64) -> bool {
+        let since = self.empty_since.load(Ordering::Relaxed);
+        if since == 0 {
+            /* Never 0 itself, which means "not in a run". */
+            self.empty_since.store(now.max(1), Ordering::Relaxed);
+        } else if now.saturating_sub(since) >= REPOLL_NS {
+            self.end_repolls(now, false);
+            return false;
+        }
 
-    unsafe {
-        handle_link_event(dev);
+        self.rx_repolls.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Where the poll leaves the ring, for the state dump.
+    fn publish_rx(&self, ring: &RxRing) {
+        let (next_to_clean, next_to_use, posted) = ring.pointers();
+        self.rx_next_to_clean.store(next_to_clean, Ordering::Relaxed);
+        self.rx_next_to_use.store(next_to_use, Ordering::Relaxed);
+        self.rx_head_posted.store(posted, Ordering::Relaxed);
+    }
+
+    fn poll_rx(&self, ring: &mut RxRing, up: &mut RxQueue<'_>) {
+        let mut polls: u32 = 0;
+
+        self.handle_link_event();
 
         let now = boot_time_ns();
-        let hot = sample_rate(dev, now) >= REPOLL_MIN_PPS;
+        let hot = self.sample_rate(now) >= REPOLL_MIN_PPS;
 
         /* Harvested frames wait here until the batch is complete, so the
          * receive queue's lock is taken once rather than once per frame. */
-        let mut batch: [usize; RX_BUDGET as usize] = [0; RX_BUDGET as usize];
+        let mut batch: FrameBatch<{ RX_BUDGET as usize }> = FrameBatch::new();
 
         /* Whether this pass took anything, in any of its rounds. */
         let mut took = false;
@@ -1555,7 +1560,6 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
 
             let mut taken = 0u32;
             let mut budget_hit = false;
-            let mut batched = 0usize;
 
             loop {
                 if taken >= RX_BUDGET {
@@ -1563,7 +1567,7 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
                     break;
                 }
 
-                let (mut frame, status, len) = match (*dev).rx_ring.harvest() {
+                let (mut frame, status, len) = match ring.harvest() {
                     None => break,
                     Some(triple) => triple,
                 };
@@ -1575,7 +1579,7 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
                  * 2 KiB, so the chip has no way to make one -- but a frame
                  * that claims to be a fragment is not one to pass up. */
                 if status & RXD_ERR_MASK != 0 || status & RXD_STAT_EOP == 0 || len == 0 {
-                    (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
+                    self.rx_dropped.fetch_add(1, Ordering::Relaxed);
                     frame.set_len(0);
 
                     /* Straight back into the ring rather than out through the
@@ -1583,27 +1587,26 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
                      * and the receive path has no business allocating. The
                      * slot is there because the harvest above just freed one,
                      * so this cannot fail. */
-                    let _ = (*dev).rx_ring.post_next(frame);
+                    let _ = ring.post_next(frame);
                     continue;
                 }
 
                 frame.set_len(len);
-                (*dev).rx_packets.fetch_add(1, Ordering::Relaxed);
+                self.rx_packets.fetch_add(1, Ordering::Relaxed);
 
-                batch[batched] = frame.into_raw();
-                batched += 1;
+                batch.push(frame);
             }
 
             if taken != 0 {
                 took = true;
-                end_repolls(dev, now, true);
+                self.end_repolls(now, true);
             }
 
             /* Hand the harvest over in one piece, then give the chip its
              * buffers back. Refilling after the batch keeps the ring supplied
              * from the pool the dispatch below will replenish. */
-            (*dev).net_handle.enqueue_rx_batch(&batch[..batched]);
-            refill_rx(dev);
+            up.deliver(&mut batch);
+            self.refill_rx(ring);
 
             if budget_hit {
                 RX_BUDGET_HITS.fetch_add(1, Ordering::Relaxed);
@@ -1618,7 +1621,7 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
             /* Round again while the ring still has frames, receive sources
              * left masked: the repeating path touches no device register at
              * all, since has_work reads the descriptor out of DMA memory. */
-            if !(*dev).rx_ring.has_work() {
+            if !ring.has_work() {
                 /* Running hot: rather than arm the interrupt for a frame a
                  * couple of microseconds away, look again on the softirq's
                  * next pass, receive sources still masked. After a pass that
@@ -1631,22 +1634,22 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
                  * pass that took nothing starts that clock: one started by a
                  * pass with frames would count their dispatch, which comes
                  * after this function returns, as time the ring sat empty. */
-                if hot && (took || repoll(dev, now)) {
+                if hot && (took || self.repoll(now)) {
                     softirq::raise(softirq::TYPE_NET_RX);
                     return;
                 }
 
                 /* Empty: hand the ring back to the interrupt. */
-                end_repolls(dev, now, false);
-                (*dev).arm_rx();
+                self.end_repolls(now, false);
+                self.arm_rx();
 
                 /* Re-checked after arming, for a frame that landed between
                  * the last harvest and the write above. */
-                if !(*dev).rx_ring.has_work() {
+                if !ring.has_work() {
                     return;
                 }
 
-                (*dev).mask_rx();
+                self.mask_rx();
             }
 
             polls += 1;
@@ -1662,7 +1665,7 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
 }
 
 /* ================================================================== */
-/* Transmit: called by the C++ net stack under TxQueueLock */
+/* Transmit: called by the net stack under the device's transmit lock */
 
 /* A write-back asked for every this many descriptors of a run, besides the
  * run's last one: often enough that a long run gives its frames back while
@@ -1670,27 +1673,26 @@ extern "C" fn igb_process_rx(ctx: *mut u8) {
  * one descriptor write and the CPU one TXDW interrupt, not one a packet. */
 const TX_RS_EVERY: u32 = 32;
 
-extern "C" fn igb_flush_tx(ctx: *mut u8) {
-    let dev = ctx as *mut IgbDevice;
-    if dev.is_null() {
-        return;
-    }
+impl NetDriver for IgbDevice {
+    type Tx = TxRing;
+    type Rx = RxRing;
 
-    unsafe {
-        let net = (*dev).net_handle;
-
+    fn flush_tx(&'static self, ring: &mut TxRing, stack: &mut TxQueue<'_>) {
         /* Give back what the chip has finished before asking for room. */
-        (*dev).tx_ring.reap_completed(net);
+        ring.reap_completed(stack);
 
         let mut submitted: u32 = 0;
-        while (*dev).tx_ring.can_submit() {
-            let frame = match net.tx_dequeue() {
+        while ring.can_submit() {
+            let frame = match stack.dequeue() {
                 None => break,
                 Some(f) => f,
             };
 
             let rs = (submitted + 1) % TX_RS_EVERY == 0;
-            if !(*dev).tx_ring.submit(frame, rs) {
+            if let Err(frame) = ring.submit(frame, rs) {
+                /* There was room a moment ago; handed back rather than
+                 * dropped, as everything is under this lock. */
+                stack.done(frame);
                 break;
             }
             submitted += 1;
@@ -1699,14 +1701,19 @@ extern "C" fn igb_flush_tx(ctx: *mut u8) {
         if submitted != 0 {
             /* Only a descriptor that reports lets the ones before it be
              * reaped, so every run ends with one. */
-            (*dev).tx_ring.report_last();
+            ring.report_last();
 
-            (*dev).tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
+            self.tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
 
             /* Descriptors visible before the doorbell that points past them. */
             kcore::barrier::dma_wmb();
-            (*dev).regs.write32(TDT0, (*dev).tx_ring.tail());
+            self.regs.write32(TDT0, ring.tail());
         }
+    }
+
+    fn process_rx(&'static self, ring: &mut RxRing, up: &mut RxQueue<'_>) {
+        self.poll_rx(ring, up);
+        self.publish_rx(ring);
     }
 }
 
@@ -1774,93 +1781,100 @@ fn accumulate(total: &AtomicU64, delta: u32) -> u64 {
     total.fetch_add(delta as u64, Ordering::Relaxed) + delta as u64
 }
 
+/// What `igbdump` prints, into `out`.
+///
+/// # Safety
+/// `out` is writable, or null.
 #[no_mangle]
-pub extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
-    if out.is_null() {
-        return -1;
-    }
+pub unsafe extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
+    let out = match unsafe { out.as_mut() } {
+        Some(out) => out,
+        None => return -1,
+    };
 
-    let raw = DEVICES[0].load(Ordering::Acquire);
-    if raw.is_null() {
-        unsafe { (*out).present = 0 };
-        return 0;
-    }
-
-    unsafe {
-        let regs = &(*raw).regs;
-        (*out).present = 1;
-        (*out).generation = if (*raw).generation == Generation::I210 { 1 } else { 0 };
-
-        /* What the PHY itself says, which on a machine with no console but
-         * this NIC is the difference between "the cable is out" and "the
-         * driver never brought the link up". Read under the same claim the
-         * bring-up takes; if firmware will not give it up, report zeroes
-         * rather than whatever a contended MDIO bus hands back. */
-        let phy_locked = (*raw).generation != Generation::I210
-            || swfw_acquire(regs, SWFW_PHY0_SM);
-        if phy_locked {
-            let addr = (*raw).phy_addr;
-            (*out).phy_bmcr = phy_read(regs, addr, PHY_BMCR).unwrap_or(0) as u32;
-
-            /* Twice: the link bit in BMSR latches low, so the first read after
-             * any drop reports the old state rather than the current one. */
-            let _ = phy_read(regs, addr, PHY_BMSR);
-            (*out).phy_bmsr = phy_read(regs, addr, PHY_BMSR).unwrap_or(0) as u32;
-
-            (*out).phy_anar = phy_read(regs, addr, PHY_ANAR).unwrap_or(0) as u32;
-            (*out).phy_anlpar = phy_read(regs, addr, PHY_ANLPAR).unwrap_or(0) as u32;
-            (*out).phy_gctl = phy_read(regs, addr, PHY_GCTL).unwrap_or(0) as u32;
-            (*out).phy_gstat = phy_read(regs, addr, PHY_GSTAT).unwrap_or(0) as u32;
-            if (*raw).generation == Generation::I210 {
-                swfw_release(regs, SWFW_PHY0_SM);
-            }
+    let dev = match DEVICES[0].get() {
+        Some(dev) => *dev,
+        None => {
+            out.present = 0;
+            return 0;
         }
+    };
 
-        (*out).ctrl = regs.read32(CTRL);
-        (*out).status = regs.read32(STATUS);
-        (*out).rctl = regs.read32(RCTL);
-        (*out).tctl = regs.read32(TCTL);
-        (*out).ims = regs.read32(IMS);
-        (*out).eitr = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
+    let regs = &dev.regs;
+    out.present = 1;
+    out.generation = if dev.generation == Generation::I210 { 1 } else { 0 };
 
-        /* Read-clear, so each read is a delta and has to be added on. */
-        (*out).stat_tpr = accumulate(&STAT_TPR, regs.read32(TPR));
-        (*out).stat_gprc = accumulate(&STAT_GPRC, regs.read32(GPRC));
-        (*out).stat_mpc = accumulate(&STAT_MPC, regs.read32(MPC));
-        (*out).stat_rnbc = accumulate(&STAT_RNBC, regs.read32(RNBC));
-        (*out).stat_rxerrc = accumulate(&STAT_RXERRC, regs.read32(RXERRC));
+    /* What the PHY itself says, which on a machine with no console but this
+     * NIC is the difference between "the cable is out" and "the driver never
+     * brought the link up". Read under the same claim the bring-up takes; if
+     * firmware will not give it up, report zeroes rather than whatever a
+     * contended MDIO bus hands back. */
+    let phy_locked = dev.generation != Generation::I210 || swfw_acquire(regs, SWFW_PHY0_SM);
+    if phy_locked {
+        let addr = dev.phy_addr;
+        out.phy_bmcr = phy_read(regs, addr, PHY_BMCR).unwrap_or(0) as u32;
 
-        /* Not read-clear: taken as they stand. */
-        (*out).stat_rqdpc = regs.read32(RQDPC0);
-        (*out).stat_pqgprc = regs.read32(PQGPRC0);
-        (*out).rxdctl = regs.read32(RXDCTL0);
-        (*out).srrctl = regs.read32(SRRCTL0);
-        (*out).rdh = regs.read32(RDH0);
-        (*out).rdt = regs.read32(RDT0);
-        (*out).tdh = regs.read32(TDH0);
-        (*out).tdt = regs.read32(TDT0);
+        /* Twice: the link bit in BMSR latches low, so the first read after
+         * any drop reports the old state rather than the current one. */
+        let _ = phy_read(regs, addr, PHY_BMSR);
+        out.phy_bmsr = phy_read(regs, addr, PHY_BMSR).unwrap_or(0) as u32;
 
-        let (ntc, ntu, status, posted) = (*raw).rx_ring.debug_state();
-        (*out).next_to_clean = ntc;
-        (*out).next_to_use = ntu;
-        (*out).head_status = status;
-        (*out).head_posted = posted;
-
-        (*out).rx_polls = RX_POLLS.load(Ordering::Relaxed);
-        (*out).rx_budget_hits = RX_BUDGET_HITS.load(Ordering::Relaxed);
-        (*out).rx_err_events = RX_ERR_EVENTS.load(Ordering::Relaxed);
-        (*out).rx_packets = (*raw).rx_packets.load(Ordering::Relaxed);
-        (*out).rx_dropped = (*raw).rx_dropped.load(Ordering::Relaxed);
-        (*out).tx_packets = (*raw).tx_packets.load(Ordering::Relaxed);
-        (*out).two_vector = if (*raw).two_vector { 1 } else { 0 };
-        (*out).rx_rate_pps = (*raw).rx_rate_pps.load(Ordering::Relaxed);
-        (*out).isr_queue = (*raw).isr_queue.load(Ordering::Relaxed);
-        (*out).isr_other = (*raw).isr_other.load(Ordering::Relaxed);
-        (*out).rx_repoll_hits = (*raw).rx_repoll_hits.load(Ordering::Relaxed);
-        (*out).rx_repolls = (*raw).rx_repolls.load(Ordering::Relaxed);
-        (*out).rx_repoll_ns = (*raw).rx_repoll_ns.load(Ordering::Relaxed);
-        (*out).msix = if (*raw).msix { 1 } else { 0 };
+        out.phy_anar = phy_read(regs, addr, PHY_ANAR).unwrap_or(0) as u32;
+        out.phy_anlpar = phy_read(regs, addr, PHY_ANLPAR).unwrap_or(0) as u32;
+        out.phy_gctl = phy_read(regs, addr, PHY_GCTL).unwrap_or(0) as u32;
+        out.phy_gstat = phy_read(regs, addr, PHY_GSTAT).unwrap_or(0) as u32;
+        if dev.generation == Generation::I210 {
+            swfw_release(regs, SWFW_PHY0_SM);
+        }
     }
+
+    out.ctrl = regs.read32(CTRL);
+    out.status = regs.read32(STATUS);
+    out.rctl = regs.read32(RCTL);
+    out.tctl = regs.read32(TCTL);
+    out.ims = regs.read32(IMS);
+    out.eitr = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
+
+    /* Read-clear, so each read is a delta and has to be added on. */
+    out.stat_tpr = accumulate(&STAT_TPR, regs.read32(TPR));
+    out.stat_gprc = accumulate(&STAT_GPRC, regs.read32(GPRC));
+    out.stat_mpc = accumulate(&STAT_MPC, regs.read32(MPC));
+    out.stat_rnbc = accumulate(&STAT_RNBC, regs.read32(RNBC));
+    out.stat_rxerrc = accumulate(&STAT_RXERRC, regs.read32(RXERRC));
+
+    /* Not read-clear: taken as they stand. */
+    out.stat_rqdpc = regs.read32(RQDPC0);
+    out.stat_pqgprc = regs.read32(PQGPRC0);
+    out.rxdctl = regs.read32(RXDCTL0);
+    out.srrctl = regs.read32(SRRCTL0);
+    out.rdh = regs.read32(RDH0);
+    out.rdt = regs.read32(RDT0);
+    out.tdh = regs.read32(TDH0);
+    out.tdt = regs.read32(TDT0);
+
+    /* Where the poll last left the ring -- and what the chip has written,
+     * by now, into the descriptor the poll would look at next: read out of
+     * the ring itself, this instant, not out of what the poll remembers. */
+    let next_to_clean = dev.rx_next_to_clean.load(Ordering::Relaxed);
+    out.next_to_clean = next_to_clean;
+    out.next_to_use = dev.rx_next_to_use.load(Ordering::Relaxed);
+    out.head_status = dev.rx_view.status(next_to_clean as usize);
+    out.head_posted = dev.rx_head_posted.load(Ordering::Relaxed) as u32;
+
+    out.rx_polls = RX_POLLS.load(Ordering::Relaxed);
+    out.rx_budget_hits = RX_BUDGET_HITS.load(Ordering::Relaxed);
+    out.rx_err_events = RX_ERR_EVENTS.load(Ordering::Relaxed);
+    out.rx_packets = dev.rx_packets.load(Ordering::Relaxed);
+    out.rx_dropped = dev.rx_dropped.load(Ordering::Relaxed);
+    out.tx_packets = dev.tx_packets.load(Ordering::Relaxed);
+    out.two_vector = dev.two_vector.load(Ordering::Relaxed) as u32;
+    out.rx_rate_pps = dev.rx_rate_pps.load(Ordering::Relaxed);
+    out.isr_queue = dev.isr_queue.load(Ordering::Relaxed);
+    out.isr_other = dev.isr_other.load(Ordering::Relaxed);
+    out.rx_repoll_hits = dev.rx_repoll_hits.load(Ordering::Relaxed);
+    out.rx_repolls = dev.rx_repolls.load(Ordering::Relaxed);
+    out.rx_repoll_ns = dev.rx_repoll_ns.load(Ordering::Relaxed);
+    out.msix = dev.is_msix() as u32;
 
     0
 }

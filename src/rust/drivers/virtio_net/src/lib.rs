@@ -10,23 +10,26 @@
 //! raises the soft IRQs and does nothing else; the receive harvest runs in
 //! the receive soft IRQ, which is one CPU at a time, so the receive side
 //! needs no lock of its own; and the transmit side is only ever touched from
-//! `flush_tx`, which the net stack calls with its own lock held. A frame
-//! finished with there is handed back with `tx_done` and not dropped --
-//! dropping it would free under that lock, and freeing shoots down every
-//! other CPU's TLB and waits for it.
+//! `flush_tx`, which the net stack calls with its own lock held. That is
+//! what `kcore::net::NetDriver` hands each call its half by: `RxState` and
+//! `TxState` are not fields of the device with a comment about who may touch
+//! them, they are what `process_rx` and `flush_tx` are given. A frame
+//! finished with in `flush_tx` is handed back with `queue.done` and not
+//! dropped -- dropping it would free under that lock, and freeing shoots
+//! down every other CPU's TLB and waits for it.
 
 #![no_std]
 
 extern crate alloc;
 
 use alloc::boxed::Box;
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use kcore::dma::DmaBuffer;
 use kcore::interrupt::LegacyInterrupt;
 use kcore::msix::MsixInterrupt;
-use kcore::net::{self, NetDeviceHandle, NetFrame};
+use kcore::net::{FrameBatch, NetBinding, NetDriver, NetFrame, RxQueue, TxQueue};
+use kcore::once::Once;
 use kcore::pci;
 use kcore::softirq;
 use kcore::trace;
@@ -72,25 +75,15 @@ static DEVICES: AtomicUsize = AtomicUsize::new(0);
 /// at the bottom, and this is what keeps them in the archive.
 pub fn init() {}
 
+/// What every path shares: the interrupt, the two soft IRQs, anyone asking
+/// for the counters.
 struct Net {
     transport: Box<dyn Transport>,
-    name: [u8; 8],
-    mac: [u8; 6],
     /// 12, or 10 on a legacy device
     hdr_size: usize,
-    handle: NetDeviceHandle,
-    /// Whether completions arrive as MSI-X, where the ISR byte means nothing
-    msix: bool,
-
-    /// One page each for the receive and transmit headers, a slot's worth
-    /// apiece
-    rx_hdr: DmaBuffer,
-    tx_hdr: DmaBuffer,
-
-    /// Touched only by the receive soft IRQ, which runs on one CPU at a time
-    rx: UnsafeCell<RxState>,
-    /// Touched only from flush_tx, which the net stack calls under its lock
-    tx: UnsafeCell<TxState>,
+    /// Whether completions arrive as MSI-X, where the ISR byte means nothing.
+    /// Known once the interrupt is in place, which is after the device is.
+    msix: AtomicBool,
 
     rx_packets: AtomicU64,
     tx_packets: AtomicU64,
@@ -98,18 +91,26 @@ struct Net {
     /// Receive slots with no frame in them, waiting on memory
     rx_empty: AtomicU32,
 
-    _irq: Irq,
+    /// Kept so the registration outlives nothing: the device is for good
+    irq: Once<Irq>,
 }
 
+/// The receive side: `process_rx`'s, which the receive soft IRQ runs on one
+/// CPU at a time.
 struct RxState {
     queue: Queue,
+    /// A page of receive headers, a slot's worth apiece
+    hdr: DmaBuffer,
     slots: usize,
     frames: [Option<NetFrame>; MAX_RX_SLOTS],
     slot_of_head: [u8; virtio::MAX_DESCRIPTORS as usize],
 }
 
+/// The transmit side: `flush_tx`'s, which the net stack calls under its lock.
 struct TxState {
     queue: Queue,
+    /// A page of transmit headers, a slot's worth apiece
+    hdr: DmaBuffer,
     frames: [Option<NetFrame>; MAX_TX_SLOTS],
     slot_of_head: [u8; virtio::MAX_DESCRIPTORS as usize],
     /// Free slots, one bit each
@@ -119,28 +120,15 @@ struct TxState {
 enum Irq {
     Msix(MsixInterrupt),
     Legacy(LegacyInterrupt),
-    None,
 }
 
-/* The state inside is reached only from the paths named on each field, and
- * the device is registered for the life of the kernel. */
-unsafe impl Sync for Net {}
-unsafe impl Send for Net {}
-
 impl Net {
-    fn rx_hdr_phys(&self, slot: usize) -> u64 {
-        self.rx_hdr.phys() + (slot * self.hdr_size) as u64
-    }
-
-    fn tx_hdr_phys(&self, slot: usize) -> u64 {
-        self.tx_hdr.phys() + (slot * self.hdr_size) as u64
-    }
-
     /// Put a frame in a receive slot and hand the pair of descriptors -- the
     /// header, then the frame -- to the device.
     fn post_rx(&self, rx: &mut RxState, slot: usize, frame: NetFrame) -> bool {
+        let hdr_phys = rx.hdr.phys() + (slot * self.hdr_size) as u64;
         let bufs = [
-            Buf::write(self.rx_hdr_phys(slot), self.hdr_size as u32),
+            Buf::write(hdr_phys, self.hdr_size as u32),
             Buf::write(frame.data_phys(), FRAME_CAPACITY as u32),
         ];
 
@@ -186,13 +174,8 @@ impl Net {
 
     /// Take what the device has received and hand it up. Runs in the receive
     /// soft IRQ.
-    fn harvest(&self) {
-        /* The receive soft IRQ is one CPU at a time, and nothing else
-         * touches this state. */
-        let rx = unsafe { &mut *self.rx.get() };
-
-        let mut batch = [0usize; RX_BUDGET];
-        let mut batched = 0;
+    fn harvest(&self, rx: &mut RxState, up: &mut RxQueue<'_>) {
+        let mut batch: FrameBatch<RX_BUDGET> = FrameBatch::new();
         let mut taken = 0;
         let mut budget_hit = false;
 
@@ -237,8 +220,7 @@ impl Net {
 
             frame.set_len(data_len);
             self.rx_packets.fetch_add(1, Ordering::Relaxed);
-            batch[batched] = frame.into_raw();
-            batched += 1;
+            batch.push(frame);
             taken += 1;
 
             /* The slot goes back to the device with a fresh frame: the one
@@ -257,9 +239,8 @@ impl Net {
                 }
             }
 
-            if batched == batch.len() {
-                self.handle.enqueue_rx_batch(&batch[..batched]);
-                batched = 0;
+            if batch.is_full() {
+                up.deliver(&mut batch);
             }
 
             if taken >= RX_BUDGET {
@@ -268,9 +249,7 @@ impl Net {
             }
         }
 
-        if batched != 0 {
-            self.handle.enqueue_rx_batch(&batch[..batched]);
-        }
+        up.deliver(&mut batch);
 
         if refilled {
             self.transport.notify(RX_QUEUE);
@@ -285,9 +264,7 @@ impl Net {
 
     /// Give back every transmit the device has finished with, and send what
     /// the stack has queued. Called under the net stack's transmit lock.
-    fn flush(&self) {
-        let tx = unsafe { &mut *self.tx.get() };
-
+    fn flush(&self, tx: &mut TxState, stack: &mut TxQueue<'_>) {
         /* Completions first: they are what frees the slots the sends below
          * need. */
         loop {
@@ -316,13 +293,13 @@ impl Net {
                  * drop would free -- which shoots down every other CPU's TLB
                  * and waits for CPUs that cannot answer while they spin on
                  * that same lock. */
-                self.handle.tx_done(frame);
+                stack.done(frame);
             }
         }
 
         let mut submitted = 0;
         while tx.free != 0 {
-            let frame = match self.handle.tx_dequeue() {
+            let frame = match stack.dequeue() {
                 Some(frame) => frame,
                 None => break,
             };
@@ -331,16 +308,11 @@ impl Net {
 
             /* A zeroed header in front of the packet: no checksum offload,
              * no segmentation, nothing to say. */
-            unsafe {
-                core::ptr::write_bytes(
-                    (self.tx_hdr.as_ptr() as *mut u8).add(slot * self.hdr_size),
-                    0,
-                    self.hdr_size,
-                );
-            }
+            let hdr_at = slot * self.hdr_size;
+            tx.hdr.as_mut_slice()[hdr_at..hdr_at + self.hdr_size].fill(0);
 
             let bufs = [
-                Buf::read(self.tx_hdr_phys(slot), self.hdr_size as u32),
+                Buf::read(tx.hdr.phys() + hdr_at as u64, self.hdr_size as u32),
                 Buf::read(frame.data_phys(), frame.len() as u32),
             ];
 
@@ -356,7 +328,7 @@ impl Net {
                      * release rather than being dropped here, for the same
                      * reason a completed one does. */
                     trace!(0, "virtio-net: the transmit ring is full");
-                    self.handle.tx_done(frame);
+                    stack.done(frame);
                     break;
                 }
             }
@@ -371,23 +343,24 @@ impl Net {
 
 /* ---- what the net stack calls ---- */
 
-extern "C" fn flush_tx(ctx: *mut u8) {
-    let net = unsafe { &*(ctx as *const Net) };
-    net.flush();
+impl NetDriver for Net {
+    type Tx = TxState;
+    type Rx = RxState;
+
+    fn flush_tx(&'static self, tx: &mut TxState, queue: &mut TxQueue<'_>) {
+        self.flush(tx, queue);
+    }
+
+    fn process_rx(&'static self, rx: &mut RxState, queue: &mut RxQueue<'_>) {
+        self.harvest(rx, queue);
+    }
 }
 
-extern "C" fn process_rx(ctx: *mut u8) {
-    let net = unsafe { &*(ctx as *const Net) };
-    net.harvest();
-}
-
-extern "C" fn interrupt(ctx: *mut u8) {
-    let net = unsafe { &*(ctx as *const Net) };
-
+fn interrupt(net: &'static Net) {
     /* On the line-interrupt path the ISR byte says whether this device
      * raised it, and reading it acknowledges. Under MSI-X it means nothing
      * (virtio 1.x 4.1.4.5). */
-    if !net.msix && net.transport.read_isr() == 0 {
+    if !net.msix.load(Ordering::Relaxed) && net.transport.read_isr() == 0 {
         return;
     }
 
@@ -465,91 +438,75 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
      * has descriptors. */
     let slots = core::cmp::min(rx_size as usize / 2, MAX_RX_SLOTS);
 
-    let mut name = [0u8; 8];
+    let mut name = [0u8; 4];
     name[..3].copy_from_slice(b"eth");
     name[3] = b'0' + index as u8;
+    let name = core::str::from_utf8(&name).unwrap_or("eth?");
 
-    let net = Box::new(Net {
+    let net = Net {
         transport,
-        name,
-        mac,
         hdr_size,
-        handle: NetDeviceHandle::placeholder(),
-        msix: false,
-        rx_hdr,
-        tx_hdr,
-        rx: UnsafeCell::new(RxState {
-            queue: rx_queue,
-            slots,
-            frames: [const { None }; MAX_RX_SLOTS],
-            slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
-        }),
-        tx: UnsafeCell::new(TxState {
-            queue: tx_queue,
-            frames: [const { None }; MAX_TX_SLOTS],
-            slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
-            free: if MAX_TX_SLOTS >= 32 { u32::MAX } else { (1 << MAX_TX_SLOTS) - 1 },
-        }),
+        msix: AtomicBool::new(false),
         rx_packets: AtomicU64::new(0),
         tx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
         rx_empty: AtomicU32::new(slots as u32),
-        _irq: Irq::None,
-    });
+        irq: Once::new(),
+    };
 
-    let raw = Box::into_raw(net);
-    let transport = unsafe { (*raw).transport.as_ref() };
+    let mut rx = RxState {
+        queue: rx_queue,
+        hdr: rx_hdr,
+        slots,
+        frames: [const { None }; MAX_RX_SLOTS],
+        slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
+    };
+    let tx = TxState {
+        queue: tx_queue,
+        hdr: tx_hdr,
+        frames: [const { None }; MAX_TX_SLOTS],
+        slot_of_head: [NO_SLOT; virtio::MAX_DESCRIPTORS as usize],
+        free: if MAX_TX_SLOTS >= 32 { u32::MAX } else { (1 << MAX_TX_SLOTS) - 1 },
+    };
+
+    /* Frames for the device to receive into go on the ring now, while the
+     * ring is still this function's alone: once the device is bound, the
+     * receive side is the receive soft IRQ's and nobody else's. The device
+     * is not told yet -- it does not know where the ring is. */
+    let posted = net.refill_rx(&mut rx);
+
+    let layout = |queue: &Queue, msix: Option<u16>| virtio::QueueLayout {
+        size: queue.size(),
+        desc: queue.desc_phys(),
+        driver: queue.avail_phys(),
+        device: queue.used_phys(),
+        msix,
+    };
+    let (rx_layout, tx_layout) = (layout(&rx.queue, None), layout(&tx.queue, None));
+
+    /* From here the device is somewhere for good: what an interrupt handler
+     * is pointed at, and what the net stack will be. */
+    let binding = NetBinding::new(net, tx, rx);
+    let net = binding.driver();
+    let transport = net.transport.as_ref();
 
     /* The interrupt before the queues are enabled: a modern virtio-pci
      * device is told which vector serves a queue as the queue starts. */
-    let (irq, msix_entry) = arm_interrupt(transport, source, raw);
-    unsafe {
-        (*raw)._irq = irq;
-        (*raw).msix = msix_entry.is_some();
-    }
+    let msix_entry = arm_interrupt(net, source);
+    net.msix.store(msix_entry.is_some(), Ordering::Release);
 
-    {
-        let rx = unsafe { &*(*raw).rx.get() };
-        let tx = unsafe { &*(*raw).tx.get() };
-        transport.setup_queue(RX_QUEUE, &virtio::QueueLayout {
-            size: rx.queue.size(),
-            desc: rx.queue.desc_phys(),
-            driver: rx.queue.avail_phys(),
-            device: rx.queue.used_phys(),
-            msix: msix_entry,
-        });
-        transport.setup_queue(TX_QUEUE, &virtio::QueueLayout {
-            size: tx.queue.size(),
-            desc: tx.queue.desc_phys(),
-            driver: tx.queue.avail_phys(),
-            device: tx.queue.used_phys(),
-            msix: msix_entry,
-        });
-    }
+    transport.setup_queue(RX_QUEUE, &virtio::QueueLayout { msix: msix_entry, ..rx_layout });
+    transport.setup_queue(TX_QUEUE, &virtio::QueueLayout { msix: msix_entry, ..tx_layout });
 
     virtio::driver_ok(transport);
 
-    /* Frames for the device to receive into, before it is told anything has
-     * arrived to be received. */
-    {
-        let device = unsafe { &*raw };
-        let rx = unsafe { &mut *(*raw).rx.get() };
-        if device.refill_rx(rx) {
-            transport.notify(RX_QUEUE);
-        }
+    /* Now it may be told what was posted above. */
+    if posted {
+        transport.notify(RX_QUEUE);
     }
 
-    let ops = net::NetDeviceOps {
-        name: unsafe { core::ptr::addr_of!((*raw).name) as *const u8 },
-        mac,
-        flush_tx,
-        process_rx,
-        ctx: raw as *mut u8,
-    };
-
-    match net::register(&ops) {
+    match binding.register(name, mac) {
         Some(handle) => {
-            unsafe { (*raw).handle = handle };
             /* What QEMU's user-mode networking hands out: without it a boot
              * that runs no DHCP has no address at all, and the UDP shell is
              * how such a boot is reached. */
@@ -557,44 +514,45 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
 
             DEVICES.store(index + 1, Ordering::Release);
             trace!(0, "virtio-net: {} is up, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, {} receive slots",
-                core::str::from_utf8(&name[..4]).unwrap_or("?"),
-                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], slots);
+                name, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], slots);
             true
         }
         None => {
             trace!(0, "virtio-net: the device table would not take another card");
+            /* The device is told to stop, and what was made for it stays
+             * where it is: its interrupt may still be on its way. */
             virtio::failed(transport);
-            unsafe { drop(Box::from_raw(raw)) };
             false
         }
     }
 }
 
-fn arm_interrupt(
-    transport: &dyn Transport, source: IrqSource, net: *mut Net,
-) -> (Irq, Option<u16>) {
+/// Put the device's interrupt in place: MSI-X where the bus has it, the
+/// line otherwise. Answers the MSI-X entry the queues are to be told.
+fn arm_interrupt(net: &'static Net, source: IrqSource) -> Option<u16> {
+    let transport = net.transport.as_ref();
+
     if let Some(table) = transport.msix_table() {
-        match MsixInterrupt::register(table, 0, interrupt, net as *mut u8) {
+        match MsixInterrupt::register_for(table, 0, net, interrupt) {
             Some(irq) => {
                 transport.use_msix(0);
-                return (Irq::Msix(irq), Some(0));
+                let _ = net.irq.set(Irq::Msix(irq));
+                return Some(0);
             }
             None => trace!(0, "virtio-net: no MSI-X slot left, falling back on the line"),
         }
     }
 
     let registered = match source {
-        IrqSource::Pci(dev) => LegacyInterrupt::register_level(&dev, interrupt, net as *mut u8),
-        IrqSource::Line(line) => LegacyInterrupt::register_irq(line, interrupt, net as *mut u8),
+        IrqSource::Pci(dev) => LegacyInterrupt::register_level_for(&dev, net, interrupt),
+        IrqSource::Line(line) => LegacyInterrupt::register_irq_for(line, net, interrupt),
     };
 
     match registered {
-        Some(irq) => (Irq::Legacy(irq), None),
-        None => {
-            trace!(0, "virtio-net: the device has no interrupt");
-            (Irq::None, None)
-        }
+        Some(irq) => { let _ = net.irq.set(Irq::Legacy(irq)); }
+        None => trace!(0, "virtio-net: the device has no interrupt"),
     }
+    None
 }
 
 /// The virtio-net cards on the PCI bus. Called from the boot path.

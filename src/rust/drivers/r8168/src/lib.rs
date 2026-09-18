@@ -5,27 +5,33 @@
  * Architecture:
  *  - PCI probe scans for 10EC:8168 devices; each match calls init_device().
  *  - MMIO BAR 2 (32-bit memory) is mapped for register access.
- *  - TX: flush_tx() is called by the C++ net stack under TxQueueLock.
- *    It drains the TX queue, fills TX descriptors, and kicks the hardware.
- *    The ISR reaps completed TX descriptors and releases shadow frames.
+ *  - TX: flush_tx() is called by the net stack under the device's transmit
+ *    lock. It reaps completed TX descriptors, drains the TX queue, fills TX
+ *    descriptors, and kicks the hardware.
  *  - RX: the ISR raises softirq TYPE_NET_RX on every interrupt.
- *    The C++ net layer calls process_rx() on every registered RustNetDevice
- *    from the softirq task.  process_rx() harvests received descriptors,
- *    calls enqueue_rx(), and reposts fresh RX frames.
+ *    The net layer calls process_rx() on every registered device from the
+ *    softirq task.  process_rx() harvests received descriptors, hands the
+ *    frames up, and reposts fresh RX frames.
  *  - Interrupts: legacy INTx (RTL8168 rarely exposes MSI-X; use LegacyInterrupt).
  *
  * Locking:
- *  - tx_ring: accessed only from flush_tx (under C++ TxQueueLock).  The ISR
- *    does NOT touch tx_ring; TX reaping is done at the start of flush_tx.
- *  - rx_ring: accessed only from process_rx (single softirq task), no lock needed.
+ *  - The TX ring is the driver's `NetDriver::Tx`: flush_tx is handed it, under
+ *    the device's transmit lock, and nothing else can reach it.  The ISR does
+ *    NOT touch it; TX reaping is done at the start of flush_tx.
+ *  - The RX ring is its `NetDriver::Rx`: process_rx is handed it, from the one
+ *    softirq task, and nothing else can reach it.  No lock needed.
+ *  - What is left in the device itself -- registers and counters -- is what
+ *    the ISR shares with both, and is `&self`.
  */
 
 #![no_std]
 extern crate alloc;
 
-use alloc::boxed::Box;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use kcore::net::{NetBinding, NetDriver, RxQueue, TxQueue};
+use kcore::once::Once;
+use kcore::sync::IrqSpinLock;
 use kcore::{trace, dma, io, interrupt, net, pci, softirq};
 
 mod desc;
@@ -38,9 +44,9 @@ use regs::*;
 /* Module-level device registry (same pattern as nvme driver) */
 
 const MAX_DEVICES: usize = 4;
-static DEVICES: [AtomicPtr<R8168Device>; MAX_DEVICES] = {
-    const NULL: AtomicPtr<R8168Device> = AtomicPtr::new(core::ptr::null_mut());
-    [NULL; MAX_DEVICES]
+static DEVICES: [Once<&'static R8168Device>; MAX_DEVICES] = {
+    const NONE: Once<&'static R8168Device> = Once::new();
+    [NONE; MAX_DEVICES]
 };
 static DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -51,42 +57,37 @@ const BAR_MAP_PAGES: usize = 1;
 /* ================================================================== */
 /* Device structure */
 
-/* Field declaration order matters for Drop: Rust drops fields in order.
- * We must unregister the interrupt (_irq) before freeing the DMA rings,
- * and free the DMA rings before unmapping MMIO (_bar_mapping).
- * The Drop impl additionally masks hardware interrupts via INTR_MASK=0
- * BEFORE any fields are dropped, preventing any last in-flight ISR from
- * accessing freed memory. */
+/* What the interrupt handler, the transmit path and the receive poll share:
+ * registers and counters.  The rings are not here -- each belongs to the one
+ * path that is handed it (see `NetDriver` below).
+ *
+ * A device lives for good: the net layer never gives one back, and the chip
+ * has been told where its rings are.  Shutting down is `quiesce`. */
 struct R8168Device {
-    /* 1st dropped: unregister ISR (no new ISR callbacks after this) */
-    _irq:         interrupt::LegacyInterrupt,
-    /* 2nd/3rd dropped: free DMA descriptor rings (safe; no ISR running) */
-    tx_ring:      TxRing,
-    rx_ring:      RxRing,
-    net_handle:   net::NetDeviceHandle, /* no Drop; just a usize */
-    mac:          [u8; 6],
-    name_buf:     [u8; 16],
-    /* Statistics (atomic so ISR can update without the tx_lock) */
+    regs:         io::MmioRegion,
+    _bar_mapping: dma::PhysMapping,
+    /* The interrupt, until shutdown takes it out to unregister it. */
+    irq:          IrqSpinLock<Option<interrupt::LegacyInterrupt>>,
+    /* Statistics (atomic so every path can update them without a lock) */
     tx_packets:   AtomicU64,
     rx_packets:   AtomicU64,
     rx_dropped:   AtomicU64,
-    /* Last dropped: unmap MMIO (safe; no rings or ISR left) */
-    _bar_mapping: dma::PhysMapping,
-    regs:         io::MmioRegion, /* raw ptr; no Drop -- must be last */
 }
 
-impl Drop for R8168Device {
-    fn drop(&mut self) {
+impl R8168Device {
+    fn quiesce(&self) {
         /* Stop the TX/RX DMA engines, then mask all interrupts at the
-         * hardware level, before any fields are dropped.  This prevents
-         * the NIC from DMAing into rings we are about to free and a last
-         * in-flight interrupt (already delivered to the CPU but not yet
-         * handled) from calling the ISR after we start freeing resources.
-         * The interrupt gate ensures interrupts are disabled in the ISR,
-         * so there is no race with an ISR that is currently executing when
-         * Drop is called from kernel shutdown context (interrupts enabled). */
+         * hardware level, before the handler goes.  This stops the NIC
+         * DMAing into memory the kernel is about to stop looking after and
+         * keeps a last in-flight interrupt (already delivered to the CPU but
+         * not yet handled) from finding nothing behind its vector. */
         self.regs.write8(CMD_REG, 0);
         self.regs.write16(INTR_MASK, 0);
+
+        /* Unregistered outside the lock: that is a call into the kernel's
+         * interrupt table, which is nothing to make under a spinlock. */
+        let irq = self.irq.lock().take();
+        drop(irq);
     }
 }
 
@@ -110,10 +111,9 @@ pub fn init() {
 
 pub fn shutdown() {
     let count = (DEVICE_COUNT.load(Ordering::Relaxed) as usize).min(MAX_DEVICES);
-    for i in 0..count {
-        let raw = DEVICES[i].swap(core::ptr::null_mut(), Ordering::AcqRel);
-        if !raw.is_null() {
-            unsafe { drop(Box::from_raw(raw)) };
+    for slot in &DEVICES[..count] {
+        if let Some(dev) = slot.get() {
+            dev.quiesce();
         }
     }
     trace!(0, "r8168: shutdown complete, count={}", count);
@@ -173,8 +173,13 @@ fn init_device(pci_dev: &pci::PciDevice) {
         }
     };
 
-    let tx_ring = TxRing::new(tx_dma);
-    let mut rx_ring = RxRing::new(rx_dma);
+    let (tx_ring, mut rx_ring) = match (TxRing::new(tx_dma), RxRing::new(rx_dma)) {
+        (Some(tx), Some(rx)) => (tx, rx),
+        _ => {
+            trace!(0, "r8168: no memory for the rings' bookkeeping");
+            return;
+        }
+    };
 
     /* --- Fill RX ring with pre-allocated NetFrame buffers --- */
     for i in 0..RING_SIZE {
@@ -193,12 +198,12 @@ fn init_device(pci_dev: &pci::PciDevice) {
     regs.write8(CFG9346, CFG9346_UNLOCK);
 
     /* --- Program TX descriptor ring base address --- */
-    let tx_phys = tx_ring.dma.phys();
+    let tx_phys = tx_ring.phys;
     regs.write32(TNPDS_LO, tx_phys as u32);
     regs.write32(TNPDS_HI, (tx_phys >> 32) as u32);
 
     /* --- Program RX descriptor ring base address --- */
-    let rx_phys = rx_ring.dma.phys();
+    let rx_phys = rx_ring.phys;
     regs.write32(RDSAR_LO, rx_phys as u32);
     regs.write32(RDSAR_HI, (rx_phys >> 32) as u32);
 
@@ -224,7 +229,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     }
 
     /* Name the device with the next free index before registering (the
-     * C++ side traces the name at registration time).  Init runs
+     * net layer traces the name at registration time).  Init runs
      * single-threaded, so the provisional index is stable; DEVICE_COUNT
      * itself is only incremented after registration succeeds, so it is
      * never inflated by failed initialisations. */
@@ -234,71 +239,52 @@ fn init_device(pci_dev: &pci::PciDevice) {
         return;
     }
     let mut name_buf = [0u8; 16];
-    write_device_name(&mut name_buf, idx);
+    let name = write_device_name(&mut name_buf, idx);
 
-    /* Box the device so it has a stable address for ISR callbacks.
-     * _irq and net_handle are placeholders (handle=0, no-op Drop); they are
-     * replaced with real handles before the device is visible to the kernel. */
-    let mut dev_box = Box::new(R8168Device {
-        _irq:       interrupt::LegacyInterrupt::empty(),
-        tx_ring,
-        rx_ring,
-        net_handle: net::NetDeviceHandle::placeholder(),
-        mac,
-        name_buf,
+    /* The device goes where it will stay, so that the interrupt handler has
+     * somewhere to be pointed at; the rings go with it, each to the one path
+     * that will be handed it.  Nothing calls into any of it until the
+     * interrupt is registered and, last of all, the net layer is told. */
+    let binding = NetBinding::new(R8168Device {
+        regs,
+        _bar_mapping: bar_mapping,
+        irq:        IrqSpinLock::new(None),
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
-        _bar_mapping: bar_mapping,
-        regs,
-    });
-
-    let ctx_ptr = dev_box.as_mut() as *mut R8168Device as *mut u8;
+    }, tx_ring, rx_ring);
+    let dev = binding.driver();
 
     /* --- Register legacy interrupt --- */
-    let irq = match interrupt::LegacyInterrupt::register_level(pci_dev, r8168_isr, ctx_ptr) {
+    let irq = match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
         Some(i) => i,
         None => {
             trace!(0, "r8168: failed to register interrupt");
+            dev.quiesce();
             return;
         }
     };
     trace!(0, "r8168: IRQ vector={}", irq.vector());
-    dev_box._irq = irq;
+    *dev.irq.lock() = Some(irq);
 
     /* --- Enable TX + RX --- */
-    dev_box.regs.write8(CMD_REG, CMD_TX_EN | CMD_RX_EN);
+    dev.regs.write8(CMD_REG, CMD_TX_EN | CMD_RX_EN);
 
     /* --- Set interrupt mask --- */
-    dev_box.regs.write16(INTR_MASK, INTR_MASK_BITS);
-
-    /* --- Build device name as null-terminated C string --- */
-    let raw = Box::into_raw(dev_box);
+    dev.regs.write16(INTR_MASK, INTR_MASK_BITS);
 
     /* --- Register as NetDevice --- */
-    let ops = net::NetDeviceOps {
-        name:       unsafe { (*raw).name_buf.as_ptr() },
-        mac:        unsafe { (*raw).mac },
-        flush_tx:   r8168_flush_tx,
-        process_rx: r8168_process_rx,
-        ctx:        raw as *mut u8,
-    };
-    let handle = match net::register(&ops) {
-        Some(h) => h,
-        None => {
-            trace!(0, "r8168: NetDevice registration failed");
-            unsafe { drop(Box::from_raw(raw)) };
-            return;
-        }
-    };
-    unsafe { (*raw).net_handle = handle };
+    if binding.register(name, mac).is_none() {
+        trace!(0, "r8168: NetDevice registration failed");
+        dev.quiesce();
+        return;
+    }
 
     /* Commit the device slot only after everything has succeeded. */
     DEVICE_COUNT.store(idx + 1, Ordering::Relaxed);
-    DEVICES[idx as usize].store(raw, Ordering::Release);
-    trace!(0, "r8168: registered as {} (irq={})",
-        core::str::from_utf8(unsafe { &(*raw).name_buf }).unwrap_or("?"),
-        pci_dev.irq_line);
+    /* The slot is this device's own: init is single-threaded. */
+    let _ = DEVICES[idx as usize].set(dev);
+    trace!(0, "r8168: registered as {} (irq={})", name, pci_dev.irq_line);
 }
 
 /* ================================================================== */
@@ -351,8 +337,8 @@ fn read_mac(regs: &io::MmioRegion) -> [u8; 6] {
     ]
 }
 
-/* Write device name "eth0\0" .. "eth3\0" into `buf` */
-fn write_device_name(buf: &mut [u8; 16], idx: u32) {
+/* Write device name "eth0" .. "eth3" into `buf` */
+fn write_device_name(buf: &mut [u8; 16], idx: u32) -> &str {
     struct BufWriter<'a> { buf: &'a mut [u8; 16], pos: usize }
     impl<'a> Write for BufWriter<'a> {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -366,20 +352,18 @@ fn write_device_name(buf: &mut [u8; 16], idx: u32) {
     }
     let mut w = BufWriter { buf, pos: 0 };
     let _ = write!(w, "eth{}", idx);
-    /* null-terminate */
-    w.buf[w.pos] = 0;
+    let BufWriter { buf, pos } = w;
+    core::str::from_utf8(&buf[..pos]).unwrap_or("eth?")
 }
 
 /* ================================================================== */
 /* Interrupt service routine */
 
-extern "C" fn r8168_isr(ctx: *mut u8) {
-    /* Raw derefs, not `&mut`: flush_tx/process_rx may hold their own
-     * `&mut R8168Device` on another CPU at this moment (per-CPU IRQ
-     * disable does not exclude them), and two live `&mut` to the same
-     * object are UB. The ISR only touches MMIO registers. */
-    let dev = ctx as *mut R8168Device;
-    let regs = unsafe { &(*dev).regs };
+fn isr(dev: &'static R8168Device) {
+    /* flush_tx and process_rx may be running on other CPUs at this moment
+     * (per-CPU IRQ disable does not exclude them): what is shared with them
+     * is the device, not the rings. The ISR only touches MMIO registers. */
+    let regs = &dev.regs;
 
     /* Loop until the status reads back as zero. The register is
      * write-1-to-clear and the chip signals MSI on the 0->1 transition of
@@ -408,17 +392,16 @@ extern "C" fn r8168_isr(ctx: *mut u8) {
         }
 
         /* TX completion: reaping stays in flush_tx (reaping here would race
-         * it on another CPU), but schedule a DrainTx so frames left in the
-         * C++ TxQueue while the ring was full are flushed now that slots
-         * have freed -- without this they stall until an unrelated future
-         * SubmitTx. */
+         * it on another CPU), but schedule a drain so frames left in the
+         * stack's transmit queue while the ring was full are flushed now
+         * that slots have freed -- without this they stall until an
+         * unrelated future transmit. */
         if status & (ISR_TOK | ISR_TDU | ISR_TER) != 0 {
             softirq::raise(softirq::TYPE_NET_TX);
         }
 
-        /* On every pass. Deferred, not done here: the C++ net layer calls
-         * process_rx() on every registered RustNetDevice from the softirq
-         * task. */
+        /* On every pass. Deferred, not done here: the net layer calls
+         * process_rx() on every registered device from the softirq task. */
         softirq::raise(softirq::TYPE_NET_RX);
 
         status = regs.read16(INTR_STATUS);
@@ -435,104 +418,88 @@ extern "C" fn r8168_isr(ctx: *mut u8) {
 }
 
 /* ================================================================== */
-/* TX path: called by C++ net stack under TxQueueLock */
+/* TX path: called by the net stack under the device's transmit lock;
+ * RX path: called from the softirq task by the net layer */
 
-extern "C" fn r8168_flush_tx(ctx: *mut u8) {
-    /* Raw pointer, not `&mut`: process_rx may hold its own reference to this
-     * device on another CPU (softirq exclusivity is per-type and TxQueueLock
-     * does not cover process_rx), and two live `&mut` to the same object are
-     * UB. Access only the disjoint fields we need, through the raw pointer.
-     * Safe without a lock: flush_tx is the only path that mutates tx_ring, and
-     * the C++ TxQueueLock serialises flush_tx callers. */
-    let dev = ctx as *mut R8168Device;
+impl NetDriver for R8168Device {
+    type Tx = TxRing;
+    type Rx = RxRing;
 
-    unsafe {
+    fn flush_tx(&'static self, ring: &mut TxRing, stack: &mut TxQueue<'_>) {
         /* Reap any already-completed TX slots to make room. */
-        let net = (*dev).net_handle;
-        (*dev).tx_ring.reap_completed(net);
+        ring.reap_completed(stack);
 
         let mut submitted: u32 = 0;
         loop {
-            if !(*dev).tx_ring.has_space() {
+            if !ring.has_space() {
                 break;
             }
-            match (*dev).net_handle.tx_dequeue() {
+            match stack.dequeue() {
                 None => break,
                 Some(frame) => {
-                    (*dev).tx_ring.submit(frame);
+                    ring.submit(frame);
                     submitted = submitted + 1;
                 }
             }
         }
 
         if submitted > 0 {
-            (*dev).tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
+            self.tx_packets.fetch_add(submitted as u64, Ordering::Relaxed);
             /* Kick the TX DMA engine.  Must be written after the descriptor
-             * stores (already guaranteed by tx_ring.submit's Release fence). */
-            (*dev).regs.write8(TX_POLL, TX_POLL_NPQ);
+             * stores (already guaranteed by TxRing::submit's barrier). */
+            self.regs.write8(TX_POLL, TX_POLL_NPQ);
         }
     }
-}
 
-/* ================================================================== */
-/* RX path: called from softirq task by the C++ net layer */
+    fn process_rx(&'static self, ring: &mut RxRing, up: &mut RxQueue<'_>) {
+        /* Walk the RX ring until we hit a hardware-owned descriptor */
+        loop {
+            let idx = ring.head();
 
-extern "C" fn r8168_process_rx(ctx: *mut u8) {
-    /* Raw pointer, not `&mut`: flush_tx may hold its own reference to this
-     * device on another CPU, and two live `&mut` to the same object are UB.
-     * process_rx touches only rx_ring / rx_* / net_handle, disjoint from
-     * flush_tx's tx_ring. */
-    let dev = ctx as *mut R8168Device;
+            /* Refill a slot left empty by an earlier NetFrame allocation
+             * failure.  The hardware stalls on a descriptor it does not own,
+             * so RX cannot make progress until the slot is reposted. */
+            if ring.is_empty_slot(idx) {
+                match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+                    Some(frame) => ring.post(idx, frame),
+                    None => break, /* still no memory; retry on next softirq */
+                }
+            }
 
-    unsafe {
-    /* Walk the RX ring until we hit a hardware-owned descriptor */
-    loop {
-        let idx = (*dev).rx_ring.head;
+            let (mut frame, opts1) = match ring.harvest() {
+                None => break,
+                Some(pair) => pair,
+            };
 
-        /* Refill a slot left empty by an earlier NetFrame allocation
-         * failure.  The hardware stalls on a descriptor it does not own,
-         * so RX cannot make progress until the slot is reposted. */
-        if (*dev).rx_ring.frames[idx] == 0 {
+            let rx_len = opts1 & RX_LEN_MASK;
+            let whole_frame = opts1 & RX_FF != 0 && opts1 & RX_LF != 0;
+            if opts1 & RX_ERR_MASK != 0 || !whole_frame || rx_len < 4 {
+                /* Error frame, multi-descriptor fragment (cannot happen while
+                 * RX_MAX_SIZE < RX_BUF_SIZE, but check anyway), or runt:
+                 * drop it and give the buffer straight back to hardware. */
+                self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                frame.set_len(0);
+                ring.post(idx, frame);
+                continue;
+            }
+
+            /* The length field includes the 4-byte CRC; strip it */
+            let data_len = (rx_len - 4) as usize;
+            frame.set_len(data_len);
+            self.rx_packets.fetch_add(1, Ordering::Relaxed);
+
+            /* Enqueue to kernel net stack (transfers ownership) */
+            up.enqueue(frame);
+
+            /* Refill the slot we just harvested */
             match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-                Some(frame) => (*dev).rx_ring.post(idx, frame),
-                None => break, /* still no memory; retry on next softirq */
+                Some(new_frame) => ring.post(idx, new_frame),
+                None => {
+                    /* Memory pressure: leave the slot empty; the refill at the
+                     * top of this loop reposts it once allocation succeeds. */
+                    self.rx_dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
-
-        let (mut frame, opts1) = match (*dev).rx_ring.harvest() {
-            None => break,
-            Some(pair) => pair,
-        };
-
-        let rx_len = opts1 & RX_LEN_MASK;
-        let whole_frame = opts1 & RX_FF != 0 && opts1 & RX_LF != 0;
-        if opts1 & RX_ERR_MASK != 0 || !whole_frame || rx_len < 4 {
-            /* Error frame, multi-descriptor fragment (cannot happen while
-             * RX_MAX_SIZE < RX_BUF_SIZE, but check anyway), or runt:
-             * drop it and give the buffer straight back to hardware. */
-            (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
-            frame.set_len(0);
-            (*dev).rx_ring.post(idx, frame);
-            continue;
-        }
-
-        /* The length field includes the 4-byte CRC; strip it */
-        let data_len = (rx_len - 4) as usize;
-        frame.set_len(data_len);
-        (*dev).rx_packets.fetch_add(1, Ordering::Relaxed);
-
-        /* Enqueue to kernel net stack (transfers ownership) */
-        (*dev).net_handle.enqueue_rx(frame);
-
-        /* Refill the slot we just harvested */
-        match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
-            Some(new_frame) => (*dev).rx_ring.post(idx, new_frame),
-            None => {
-                /* Memory pressure: leave the slot empty; the refill at the
-                 * top of this loop reposts it once allocation succeeds. */
-                (*dev).rx_dropped.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
     }
 }

@@ -38,49 +38,152 @@ impl BlockDeviceRegistration {
     }
 }
 
-/// Ops table passed to `register`. All function pointers must remain valid
-/// for the lifetime of the kernel (static or leaked allocations).
-pub struct BlockDeviceOps {
-    /// Null-terminated ASCII device name (e.g. b"nvme0\0").
-    pub name: *const u8,
-    pub capacity: u64,
-    pub sector_size: u64,
-    pub read_sectors: extern "C" fn(
-        ctx: *mut u8, sector: u64, buf: *mut u8, count: u32,
-    ) -> i32,
-    pub write_sectors: extern "C" fn(
-        ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
-    ) -> i32,
-    /// Optional. Pass `None` if the device has no write cache to flush.
-    pub flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
-    /// Optional: the asynchronous path (BlockIo) -- never blocking, answering
-    /// with a SUBMIT_* -- and the doorbell for submissions made without one.
-    pub submit: Option<extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32>,
-    pub kick: Option<extern "C" fn(ctx: *mut u8)>,
-    pub ctx: *mut u8,
-    /// The disk this device is a partition of, or 0 for a whole disk. A
-    /// claim on either end refuses one on the other, and `Disk::partitions`
-    /// counts through it.
-    pub parent: usize,
+/// What a name for the device table fits in, its terminator included.
+const NAME_MAX: usize = 32;
+
+/// A block device, as the driver behind it: what the kernel's device table
+/// calls when somebody reads, writes or flushes the disk.
+///
+/// The driver is something that lives for good -- a device is registered for
+/// the life of the kernel, and the table has no way to give one back -- and
+/// every call can arrive from any task on any CPU, several at once: hence
+/// `Sync`, and `&'static self`. What a call needs exclusively the driver
+/// keeps behind a lock of its own.
+pub trait BlockDriver: Sync + 'static {
+    /// Whether the device has the asynchronous path -- `submit` and `kick`.
+    /// Without it the table answers Unsupported for the driver.
+    const ASYNC: bool = false;
+
+    /// Its size, in sectors.
+    fn capacity(&self) -> u64;
+
+    /// Bytes to a sector.
+    fn sector_size(&self) -> u64;
+
+    /// Fill `buf` -- whole sectors, never empty: a request for none is
+    /// answered before it gets here -- from `sector` on, and return once the
+    /// data is in it. The device may be pointed straight at
+    /// the buffer: the caller has given one it can DMA into.
+    fn read(&'static self, sector: u64, buf: &mut [u8]) -> bool;
+
+    /// Write `data` -- whole sectors, never empty -- at `sector`, and return
+    /// once the device has it; with `fua`, once it is on the medium.
+    fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool;
+
+    /// Push the device's write cache out. A device without one has nothing
+    /// to do, which is the default.
+    fn flush(&'static self) -> bool {
+        true
+    }
+
+    /// One asynchronous I/O straight to or from physical memory: never
+    /// blocks, never waits. `io.done` is called exactly once when the device
+    /// is done, from interrupt context. With `kick` false the doorbell may
+    /// be left for `kick`. That `io.phys` is memory the device may use is
+    /// what whoever called `Disk::submit` promised; the driver passes it on.
+    fn submit(&'static self, _io: &BlockIo, _kick: bool) -> core::result::Result<(), SubmitError> {
+        Err(SubmitError::Unsupported)
+    }
+
+    /// Ring the doorbell for what `submit` queued without one.
+    fn kick(&'static self) {}
 }
 
-/// Register a block device with the kernel block device table.
-/// Returns `None` if the slot pool is full or the name is null.
-pub fn register(ops: &BlockDeviceOps) -> Option<BlockDeviceRegistration> {
-    let ffi_ops = block::BlockDeviceOps {
-        name: ops.name,
-        capacity: ops.capacity,
-        sector_size: ops.sector_size,
-        read_sectors: Some(ops.read_sectors),
-        write_sectors: Some(ops.write_sectors),
-        flush: ops.flush,
-        submit: ops.submit,
-        kick: ops.kick,
-        ctx: ops.ctx,
-        parent: ops.parent,
+/// Register `driver` as the block device `name`. None when the table is
+/// full, or the name is empty or too long for it.
+pub fn register_driver<D: BlockDriver>(
+    name: &str, parent: usize, driver: &'static D,
+) -> Option<BlockDeviceRegistration> {
+    if name.is_empty() || name.len() >= NAME_MAX || name.as_bytes().contains(&0) {
+        return None;
+    }
+
+    /* The table copies the name: it has to be a C string for the length of
+     * the call and no longer. */
+    let mut c_name = [0u8; NAME_MAX];
+    c_name[..name.len()].copy_from_slice(name.as_bytes());
+
+    let ops = block::BlockDeviceOps {
+        name: c_name.as_ptr(),
+        capacity: driver.capacity(),
+        sector_size: driver.sector_size(),
+        read_sectors: Some(read_sectors::<D>),
+        write_sectors: Some(write_sectors::<D>),
+        flush: Some(flush::<D>),
+        submit: if D::ASYNC { Some(submit::<D>) } else { None },
+        kick: if D::ASYNC { Some(kick::<D>) } else { None },
+        ctx: crate::callback::ctx_of(driver),
+        parent,
     };
-    let h = unsafe { block::kernel_blockdev_register(&ffi_ops) };
+
+    let h = unsafe { block::kernel_blockdev_register(&ops) };
     if h == 0 { None } else { Some(BlockDeviceRegistration { handle: h }) }
+}
+
+/* What the device table is given to call. `ctx` is the driver, as
+ * `register_driver` passed it; a buffer is the caller's, `count` sectors of
+ * it, for the length of the call -- which is the block ABI's contract with
+ * whoever called in, and what makes it a slice here. */
+
+fn byte_len<D: BlockDriver>(driver: &D, count: u32) -> Option<usize> {
+    usize::try_from((count as u64).checked_mul(driver.sector_size())?).ok()
+}
+
+extern "C" fn read_sectors<D: BlockDriver>(
+    ctx: *mut u8, sector: u64, buf: *mut u8, count: u32,
+) -> i32 {
+    let driver = unsafe { crate::callback::target_of::<D>(ctx) };
+    if count == 0 {
+        return 0;
+    }
+    let len = match byte_len(driver, count) {
+        Some(len) if !buf.is_null() => len,
+        _ => return -1,
+    };
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    if driver.read(sector, buf) { 0 } else { -1 }
+}
+
+extern "C" fn write_sectors<D: BlockDriver>(
+    ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
+) -> i32 {
+    let driver = unsafe { crate::callback::target_of::<D>(ctx) };
+    if count == 0 {
+        return 0;
+    }
+    let len = match byte_len(driver, count) {
+        Some(len) if !buf.is_null() => len,
+        _ => return -1,
+    };
+
+    let data = unsafe { core::slice::from_raw_parts(buf, len) };
+    if driver.write(sector, data, fua != 0) { 0 } else { -1 }
+}
+
+extern "C" fn flush<D: BlockDriver>(ctx: *mut u8) -> i32 {
+    let driver = unsafe { crate::callback::target_of::<D>(ctx) };
+    if driver.flush() { 0 } else { -1 }
+}
+
+extern "C" fn submit<D: BlockDriver>(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32 {
+    let driver = unsafe { crate::callback::target_of::<D>(ctx) };
+    /* The table hands over the `&BlockIo` it was given, or nothing. */
+    let io = match unsafe { io.as_ref() } {
+        Some(io) => io,
+        None => return SUBMIT_INVALID,
+    };
+
+    match driver.submit(io, kick != 0) {
+        Ok(()) => SUBMIT_OK,
+        Err(SubmitError::Busy) => SUBMIT_BUSY,
+        Err(SubmitError::Invalid) => SUBMIT_INVALID,
+        Err(SubmitError::Unsupported) => SUBMIT_UNSUPPORTED,
+    }
+}
+
+extern "C" fn kick<D: BlockDriver>(ctx: *mut u8) {
+    unsafe { crate::callback::target_of::<D>(ctx) }.kick();
 }
 
 /// A block device to read and write -- a disk, or a partition of one -- by

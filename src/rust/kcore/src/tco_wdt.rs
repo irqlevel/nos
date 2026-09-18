@@ -37,6 +37,8 @@
  *   }
  */
 
+use core::sync::atomic::{AtomicU16, Ordering};
+
 use crate::io::Port;
 
 /* TCO register offsets relative to TCOBASE */
@@ -110,8 +112,10 @@ impl TcoBaseSource {
 pub struct TcoWatchdog {
     tco_base: u16,
     /* Tick value programmed into TCO_TMR by start(); used by is_counting()
-       to detect a timer that never runs (e.g. NO_REBOOT still set). */
-    armed_ticks: u16,
+       to detect a timer that never runs (e.g. NO_REBOOT still set). Atomic
+       because the kick timer is already running, and looking, when start()
+       writes it. */
+    armed_ticks: AtomicU16,
     source: TcoBaseSource,
 }
 
@@ -210,7 +214,7 @@ impl TcoWatchdog {
 
     /// Common register init once TCOBASE is known.
     fn from_base(tco_base: u16, source: TcoBaseSource) -> Self {
-        let wdt = Self { tco_base, armed_ticks: 0, source };
+        let wdt = Self { tco_base, armed_ticks: AtomicU16::new(0), source };
 
         /* Clear TMR_HLT so the watchdog can be started */
         let cnt = Port::<u16>::new(tco_base + TCO1_CNT).read();
@@ -225,7 +229,7 @@ impl TcoWatchdog {
 
     /// Start the watchdog with the given timeout in seconds.
     /// The actual timeout is rounded to the nearest 0.6-second boundary.
-    pub fn start(&mut self, timeout_secs: u32) {
+    pub fn start(&self, timeout_secs: u32) {
         /* Convert seconds to TCO ticks (round up, minimum 2 ticks) */
         let ticks = {
             let t = ((timeout_secs as u64) * 1_000_000_000 + TCO_TICK_NS - 1) / TCO_TICK_NS;
@@ -236,7 +240,7 @@ impl TcoWatchdog {
         let tmr = Port::<u16>::new(self.tco_base + TCO_TMR);
         let cur = tmr.read() & !0x1FF;
         tmr.write(cur | ticks);
-        self.armed_ticks = ticks;
+        self.armed_ticks.store(ticks, Ordering::Relaxed);
 
         /* Reload (kick) to arm with the new value */
         self.kick();
@@ -268,6 +272,6 @@ impl TcoWatchdog {
     /// NO_REBOOT could not be cleared on this chipset) and a hang will NOT
     /// trigger a reset.
     pub fn is_counting(&self) -> bool {
-        self.current_count() != self.armed_ticks
+        self.current_count() != self.armed_ticks.load(Ordering::Relaxed)
     }
 }

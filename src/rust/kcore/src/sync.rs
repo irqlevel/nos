@@ -151,10 +151,6 @@ impl WaitGroup {
     pub fn wait(&self) {
         unsafe { sync::kernel_waitgroup_wait(self.handle) }
     }
-
-    pub fn raw_handle(&self) -> usize {
-        self.handle
-    }
 }
 
 impl Drop for WaitGroup {
@@ -277,48 +273,6 @@ pub struct RwMutexWriteGuard<'a> {
 impl<'a> Drop for RwMutexWriteGuard<'a> {
     fn drop(&mut self) {
         unsafe { sync::kernel_rw_mutex_write_unlock(self.lock.handle) }
-    }
-}
-
-/// Signal a WaitGroup by raw handle from ISR context, where no `&WaitGroup`
-/// borrow is possible (e.g. the handle was stashed in an inflight slot).
-///
-/// `handle` must come from `WaitGroup::raw_handle()` (or
-/// `Completion::raw_handle()`) on a WaitGroup that is still alive.
-pub fn waitgroup_done_raw(handle: usize) {
-    unsafe { sync::kernel_waitgroup_done(handle) }
-}
-
-/// One-shot completion event.
-///
-/// Wraps a `WaitGroup` pre-armed with `add(1)`.  Call `complete()` exactly
-/// once (typically from an ISR or another task) to unblock anyone calling
-/// `wait()`.
-pub struct Completion {
-    wg: WaitGroup,
-}
-
-impl Completion {
-    pub fn new() -> Option<Self> {
-        let wg = WaitGroup::new()?;
-        wg.add(1);
-        Some(Self { wg })
-    }
-
-    /// Signal the completion (call once, typically from ISR context).
-    pub fn complete(&self) {
-        self.wg.done();
-    }
-
-    /// Block until `complete()` has been called.
-    pub fn wait(&self) {
-        self.wg.wait();
-    }
-
-    /// Raw WaitGroup handle for signaling via direct FFI from ISR context
-    /// where borrowing `self` is not possible (e.g. stored in an inflight array).
-    pub fn raw_handle(&self) -> usize {
-        self.wg.raw_handle()
     }
 }
 
