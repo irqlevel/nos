@@ -36,19 +36,6 @@ static const ulong HttpMaxRequestLen = HttpMaxUrlLen + HttpMaxUrlHostLen + 64;
 static const ulong HttpRecvTimeoutMs = 10000;
 static const ulong HttpMaxRedirects = 5;
 
-/* The byte pipe the exchange runs over: plain TCP, or TLS on top of it.
-   Everything above it -- the request, the header parsing, chunked decoding,
-   redirects and the body sink -- is the same either way. */
-class HttpTransport
-{
-public:
-    virtual ~HttpTransport() {}
-    virtual bool Send(const void* data, ulong len) = 0;
-    /* Bytes read, 0 at end of stream, negative on error or timeout. The
-       timeout is advisory: the TLS transport uses its own. */
-    virtual long Recv(void* buf, ulong len, ulong timeoutMs) = 0;
-};
-
 /* Where a response body goes as it arrives. The client never holds a whole
    body: a 20 MB download passes through Write() in receive-buffer sized
    pieces, so the peak cost of any transfer is one HttpMaxHeaderSize buffer
@@ -135,13 +122,21 @@ struct HttpResponse
     }
 };
 
+/* The client itself is Rust (src/rust/net/src/http.rs): the URL, the
+   request, the header parsing, the chunked decoding, the redirects, and the
+   transport seam that makes TLS look like TCP. What is left here is the way
+   in, and the two sinks a caller picks between. */
 class HttpClient
 {
 public:
-    HttpClient(NetDevice* dev);
-    ~HttpClient();
+    HttpClient(NetDevice* dev)
+        : Dev(dev)
+    {
+    }
 
-    /* HTTP GET -- connects, sends request, receives response, closes.
+    ~HttpClient() {}
+
+    /* HTTP GET -- connects, sends the request, reads the response, closes.
        The body of the final response (redirects are followed and their
        bodies dropped) goes to the sink; the no-sink form keeps it in
        resp.Body, capped at HttpMaxResponseSize. */
@@ -149,17 +144,10 @@ public:
     HttpResponse Get(const char* url, HttpSink& sink);
 
 private:
-    struct Exchange;
+    HttpClient(const HttpClient& other) = delete;
+    HttpClient& operator=(const HttpClient& other) = delete;
 
     NetDevice* Dev;
-
-    void DoGet(Exchange& ex, HttpSink& sink, HttpResponse& resp);
-    bool ParseUrl(const char* url, char* host, ulong hostSize,
-                  u16& port, char* path, ulong pathSize, bool& tls);
-    bool ResolveHost(const char* host, Net::IpAddress& ip);
-    bool SendRequest(HttpTransport& transport, const char* method, Exchange& ex);
-    bool RecvResponse(HttpTransport& transport, HttpResponse& resp, HttpSink& sink);
-    bool ExtractLocation(const u8* headers, ulong headerLen, char* loc, ulong locSize);
 };
 
 } /* namespace Kernel */
