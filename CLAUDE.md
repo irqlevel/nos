@@ -73,6 +73,13 @@ connection table back where it started — a slot leaked per connection is
 invisible until the sixty-fourth. `scripts/sshd-test.py` covers the
 listening side (40 checks pass; the `poweroff unloads sshd before the
 unmount` one fails for reasons of its own, unrelated to TCP).
+`./scripts/netload-test.py` (arm64) hammers the `netload` UDP target from
+the host and checks every echo byte for byte, a burst longer than the reply
+batch, sink mode, more start/stop rounds than a device has listener slots,
+and the frame pool back where it began. Nothing else reaches the code that
+answers from inside the receive path -- or notices a frame pool that was
+never built, which is how a boot that passed every other gate spent two
+hours taking each frame from the allocator.
 `./scripts/disklog-test.py` (arm64) boots with `disklog=on` over an area it
 prepares itself and then reads that area back with `scripts/disklog.py` —
 the boot's first fifty traced lines compared with the serial console's, line
