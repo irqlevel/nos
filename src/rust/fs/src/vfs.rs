@@ -169,11 +169,13 @@ impl Vfs {
          * overlapping it. */
         let mut claim = 0;
         if device != 0 {
-            claim = kcore::block::claim_as(device, MOUNT_HOLDER.as_ptr());
-            if claim == 0 {
-                trace!(0, "vfs: the device is in use by someone else");
-                return false;
-            }
+            claim = match kcore::block::claim_as(device, MOUNT_HOLDER.as_ptr()) {
+                Ok(claim) => claim,
+                Err(held_by) => {
+                    trace!(0, "vfs: the device is in use by {}", held_by);
+                    return false;
+                }
+            };
         }
 
         /* The filesystem may find an image it can read but must not write. */
