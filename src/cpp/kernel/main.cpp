@@ -48,7 +48,6 @@
 #include <drivers/pci.h>
 #include <drivers/usb/xhci.h>
 
-#include <block/block.h>
 #include <net/udp_shell.h>
 #include <net/net_frame_pool.h>
 #include <net/netconsole.h>
@@ -407,6 +406,10 @@ void SomeTaskRoutine(void *ctx)
    All C++ objects with non-trivial destructors must go out of
    scope before those calls, so the body is wrapped in a block. */
 extern "C" void rust_init();
+/* The block layer is Rust (src/rust/block): before this, a synchronous I/O
+   has to poll its device, because there is nothing yet to wake a waiter. */
+extern "C" void kernel_blockdev_set_interrupts_started();
+
 /* The filesystem layer is Rust (src/rust/fs): what boot mounts where, and
    taking it all down again on the way out. */
 extern "C" void rust_mount_root_fs();
