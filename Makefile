@@ -66,8 +66,6 @@ CXX_SRC_x86_64 =   \
     src/cpp/drivers/pit.cpp \
     src/cpp/drivers/hpet.cpp \
     src/cpp/drivers/8042.cpp    \
-    src/cpp/drivers/usb/xhci.cpp \
-    src/cpp/drivers/usb/hid_kbd.cpp \
     src/cpp/drivers/acpi.cpp    \
     src/cpp/arch/x86_64/lapic.cpp   \
 	src/cpp/arch/x86_64/pmu.cpp	\

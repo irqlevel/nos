@@ -15,6 +15,7 @@ net = { path = "../net" }
 hello = { path = "../hello" }
 tls = { path = "../tls" }
 nvme = { path = "../drivers/nvme" }
+usb = { path = "../drivers/usb" }
 virtio-rng = { path = "../drivers/virtio_rng" }
 virtio-blk = { path = "../drivers/virtio_blk" }
 virtio-net = { path = "../drivers/virtio_net" }

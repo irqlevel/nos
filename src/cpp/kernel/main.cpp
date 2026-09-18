@@ -46,7 +46,6 @@
 #include <arch/x86_64/lapic.h>
 #include <arch/x86_64/ioapic.h>
 #include <drivers/pci.h>
-#include <drivers/usb/xhci.h>
 
 #include <kernel/stack_probe.h>
 #include <kernel/module.h>
@@ -409,6 +408,12 @@ extern "C" int rust_netconsole_setup();
 extern "C" int rust_tcp_init();
 extern "C" void rust_net_start_services(unsigned short udpShellPort);
 extern "C" void rust_net_stop_services();
+/* USB is Rust (src/rust/drivers/usb): the xHCI controllers and the HID boot
+   keyboard on them, which on a machine with no PS/2 is the only way in. */
+extern "C" void rust_usb_init();
+extern "C" int rust_usb_start();
+extern "C" void rust_usb_stop();
+
 /* The block layer is Rust (src/rust/block): before this, a synchronous I/O
    has to poll its device, because there is nothing yet to wake a waiter. */
 extern "C" void kernel_blockdev_set_interrupts_started();
@@ -647,9 +652,9 @@ void BpStartup(void* ctx)
            console, and the polling task takes over afterwards. */
         if (!Parameters::GetInstance().IsUsbOff())
         {
-            Usb::Init();
+            rust_usb_init();
 
-            if (!Usb::Start())
+            if (rust_usb_start() != 0)
                 Trace(0, "Usb: failed to start the poll task");
         }
 
@@ -678,7 +683,7 @@ void BpStartup(void* ctx)
                 else
                     Trace(0, "Shutdown requested");
                 rust_net_stop_services();
-                Usb::Stop();
+                rust_usb_stop();
                 cmd.Stop();
                 cmd.StopDhcp();
                 break;

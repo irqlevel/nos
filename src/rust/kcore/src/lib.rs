@@ -18,6 +18,7 @@ pub mod procinfo;
 pub mod random;
 pub mod pci;
 pub mod msix;
+pub mod input;
 pub mod interrupt;
 pub mod softirq;
 pub mod timer;

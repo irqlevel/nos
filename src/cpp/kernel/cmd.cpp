@@ -23,7 +23,6 @@
 #include <drivers/vga.h>
 #include <drivers/pci.h>
 #ifdef __x86_64__
-#include <drivers/usb/xhci.h>
 #endif
 #include <include/const.h>
 #include <mm/page_table.h>
@@ -791,16 +790,6 @@ static void CmdPci(const char* args, Stdlib::Printer& con)
 {
     (void)args;
     Pci::GetInstance().Dump(con);
-}
-
-static void CmdUsb(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-#ifdef __x86_64__
-    Usb::Controller::Dump(con);
-#else
-    con.Printf("usb: not supported on this architecture\n");
-#endif
 }
 
 
@@ -1784,7 +1773,6 @@ static const CmdEntry Commands[] = {
     { "memcheck",  CmdMemcheck,  "memcheck - verify no reserved page reached the free list" },
     { "irqstat",   CmdIrqstat,   "irqstat - show interrupt statistics" },
     { "pci",       CmdPci,       "pci - show pci devices" },
-    { "usb",       CmdUsb,       "usb - show usb controllers and ports" },
     { "crc32",     CmdCrc32,     "crc32 <path> - CRC-32 of a file" },
     { "sha256",    CmdSha256,    "sha256 <path> - SHA-256 of a file, as sha256sum prints it" },
     { "grubenv",   CmdGrubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
