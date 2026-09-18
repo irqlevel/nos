@@ -36,6 +36,8 @@
 #include <fs/vfs.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
+#include "parameters.h"
+#include "version_gen.h"
 
 static const ulong RustAllocTag = 'rust';
 
@@ -1809,6 +1811,46 @@ void kernel_cmd_dispatch(const unsigned char* line, unsigned long len,
     Kernel::Cmd::Dispatch(cmd, out);
     out.Finish();
     Kernel::Mm::Free(buf);
+}
+
+/* What procfs puts in its files: the kernel's version, the command line it
+   was booted with, and the interrupt counters. Each answers how many bytes
+   it wrote, which is never more than the buffer holds. */
+unsigned long kernel_version_string(char* buf, unsigned long len)
+{
+    if (buf == nullptr || len == 0)
+        return 0;
+
+    int n = Stdlib::SnPrintf(buf, len, "nos %s (%s)", KERNEL_VERSION, KERNEL_GIT_REV);
+    return (n > 0) ? (unsigned long)n : 0;
+}
+
+unsigned long kernel_cmdline_string(char* buf, unsigned long len)
+{
+    if (buf == nullptr || len == 0)
+        return 0;
+
+    const char* cmdline = Kernel::Parameters::GetInstance().GetCmdline();
+    int n = Stdlib::SnPrintf(buf, len, "%s", cmdline);
+    return (n > 0) ? (unsigned long)n : 0;
+}
+
+/* How many interrupt sources there are, and what the index'th one is
+   called and has counted. -1 past the end. */
+unsigned long kernel_interrupt_source_count()
+{
+    return Kernel::InterruptStats::Count;
+}
+
+long kernel_interrupt_source(unsigned long index, char* name, unsigned long nameLen)
+{
+    if (index >= Kernel::InterruptStats::Count)
+        return -1;
+
+    Kernel::InterruptSource src = static_cast<Kernel::InterruptSource>(index);
+    if (name != nullptr && nameLen != 0)
+        Stdlib::SnPrintf(name, nameLen, "%s", Kernel::InterruptStats::GetName(src));
+    return Kernel::InterruptStats::Get(src);
 }
 
 /* Files, for a module to keep its configuration in (kcore::fs). Paths are

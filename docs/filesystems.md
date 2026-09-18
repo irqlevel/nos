@@ -140,10 +140,12 @@ for what it is good at — a small, self-verifying store (`format nanofs`,
 `mount nanofs`, `scripts/mkfs_nanofs.py`) — and takes the whole file API,
 including writes at an offset and truncates, by rewriting the file.
 
-ramfs is the in-memory filesystem the fallback layout puts on `/`, and what
-`TestVfs` exercises at every boot. procfs is a ramfs whose
-`/proc/interrupts` is regenerated on each lookup; `/proc/version` and
-`/proc/cmdline` are there too.
+ramfs (`src/rust/fs/src/ramfs.rs`) is the in-memory filesystem the fallback
+layout puts on `/`, and what `TestVfs` exercises at every boot: a file is
+one buffer that doubles as it grows. procfs (`procfs.rs`) is a ramfs whose
+`/proc/interrupts` is regenerated on each lookup -- the VFS looks a file up
+before it reads it or reports its size, so refreshing there keeps the two
+consistent; `/proc/version` and `/proc/cmdline` are written once at mount.
 
 ## Making a root filesystem
 

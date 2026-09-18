@@ -1986,13 +1986,8 @@ Stdlib::Error TestVfs()
     static const ulong BigSize = 100 * 1024;
 
     auto& vfs = Vfs::GetInstance();
-    RamFs* fs = new (Mm::NoThrow) RamFs();
-    if (fs == nullptr)
-        return MakeError(Stdlib::Error::NoMemory);
-
-    if (!vfs.Mount("/", fs))
+    if (!RamFsMount("/"))
     {
-        delete fs;
         Trace(0, "TestVfs: mount failed");
         return MakeError(Stdlib::Error::Unsuccessful);
     }

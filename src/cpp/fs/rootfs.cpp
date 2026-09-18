@@ -98,11 +98,9 @@ static void MountFallbackLayout()
 {
     auto& vfs = Vfs::GetInstance();
 
-    RamFs* ramfs = new (Mm::NoThrow) RamFs();
-    if (ramfs == nullptr || !vfs.Mount("/", ramfs))
+    if (!RamFsMount("/"))
     {
         Trace(0, "MountRootFs: failed to mount ramfs on /");
-        delete ramfs;
         return;
     }
     Trace(0, "MountRootFs: mounted ramfs on / (rw)");
@@ -154,15 +152,8 @@ static void MountProcFs()
         return;
     }
 
-    ProcFs* procfs = new (Mm::NoThrow) ProcFs();
-    if (procfs != nullptr && vfs.Mount("/proc", procfs, true))
-    {
+    if (ProcFsMount("/proc"))
         Trace(0, "MountRootFs: mounted procfs on /proc (ro)");
-    }
-    else
-    {
-        delete procfs;
-    }
 }
 
 void MountRootFs()

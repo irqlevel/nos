@@ -1,29 +1,14 @@
 #pragma once
 
-#include <fs/ramfs.h>
-
 namespace Kernel
 {
 
-class ProcFs : public RamFs
-{
-public:
-    ProcFs();
-    virtual ~ProcFs();
+/* procfs itself is Rust (src/rust/fs/src/procfs.rs): /proc/version,
+   /proc/cmdline and /proc/interrupts, the last written again on every
+   lookup. What is left here is the way in. */
 
-    virtual const char* GetName() override;
-    virtual bool Mount() override;
-    virtual VNode* Lookup(VNode* dir, const char* name) override;
-
-private:
-    ProcFs(const ProcFs& other) = delete;
-    ProcFs(ProcFs&& other) = delete;
-    ProcFs& operator=(const ProcFs& other) = delete;
-    ProcFs& operator=(ProcFs&& other) = delete;
-
-    void RefreshInterrupts();
-
-    VNode* InterruptsNode;
-};
+/* Mount procfs at path, read-only. The filesystem belongs to the VFS from
+   here on: an unmount releases it. */
+bool ProcFsMount(const char* path);
 
 }
