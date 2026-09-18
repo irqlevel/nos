@@ -43,3 +43,8 @@ jobs:
           else
             ./scripts/smoke-arm64.sh --skip-build
           fi
+
+      # The smoke disks carry no partition table, so nothing else here would
+      # notice the partition reader breaking.
+      - name: Partition table test (${{ matrix.arch }}, TCG)
+        run: python3 scripts/parttest.py --arch ${{ matrix.arch }} --tcg

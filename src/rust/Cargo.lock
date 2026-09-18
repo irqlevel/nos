@@ -56,6 +56,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "block"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -406,6 +413,7 @@ dependencies = [
 name = "kernel"
 version = "0.1.0"
 dependencies = [
+ "block",
  "ffi",
  "hello",
  "igb",

@@ -106,7 +106,6 @@ CXX_SRC_x86_64 =   \
     src/cpp/kernel/cmd.cpp  \
     src/cpp/kernel/input.cpp \
     src/cpp/block/block_device.cpp \
-    src/cpp/block/partition.cpp \
     src/cpp/net/net_device.cpp \
     src/cpp/net/net_frame.cpp \
     src/cpp/net/net_frame_pool.cpp \
@@ -226,7 +225,6 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/rust_ffi.cpp \
     src/cpp/kernel/module.cpp \
     src/cpp/block/block_device.cpp \
-    src/cpp/block/partition.cpp \
     src/cpp/kernel/test.cpp \
     src/cpp/kernel/cmd.cpp \
     src/cpp/kernel/input.cpp \

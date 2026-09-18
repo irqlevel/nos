@@ -58,6 +58,10 @@ pub struct BlockDeviceOps {
     pub submit: Option<extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32>,
     pub kick: Option<extern "C" fn(ctx: *mut u8)>,
     pub ctx: *mut u8,
+    /// The disk this device is a partition of, or 0 for a whole disk. A
+    /// claim on either end refuses one on the other, and `Disk::partitions`
+    /// counts through it.
+    pub parent: usize,
 }
 
 /// Register a block device with the kernel block device table.
@@ -73,6 +77,7 @@ pub fn register(ops: &BlockDeviceOps) -> Option<BlockDeviceRegistration> {
         submit: ops.submit,
         kick: ops.kick,
         ctx: ops.ctx,
+        parent: ops.parent,
     };
     let h = unsafe { block::kernel_blockdev_register(&ffi_ops) };
     if h == 0 { None } else { Some(BlockDeviceRegistration { handle: h }) }
@@ -94,10 +99,44 @@ pub struct Disk {
     handle: usize,
 }
 
+/// How many block devices the kernel's table holds. The table only grows,
+/// so an index once valid stays valid and names the same device.
+pub fn count() -> u32 {
+    unsafe { block::kernel_blockdev_count() }
+}
+
+/// The index'th device of the table, or None past its end.
+pub fn at(index: u32) -> Option<Disk> {
+    Disk::from_handle(unsafe { block::kernel_blockdev_at(index) })
+}
+
 impl Disk {
     pub fn open(name: &str) -> Option<Self> {
         let handle = unsafe { block::kernel_blockdev_find(name.as_ptr(), name.len()) };
         if handle == 0 { None } else { Some(Self { handle }) }
+    }
+
+    /// A device by the handle its registration or the table gave back.
+    pub fn from_handle(handle: usize) -> Option<Self> {
+        if handle == 0 { None } else { Some(Self { handle }) }
+    }
+
+    pub fn handle(&self) -> usize {
+        self.handle
+    }
+
+    /// Its name into buf, as `disks` shows it; None if it does not fit.
+    pub fn name<'a>(&self, buf: &'a mut [u8]) -> Option<&'a str> {
+        let n = unsafe { block::kernel_blockdev_name(self.handle, buf.as_mut_ptr(), buf.len()) };
+        if n == 0 {
+            return None;
+        }
+        core::str::from_utf8(&buf[..n]).ok()
+    }
+
+    /// The disk this is a partition of, or None for a whole disk.
+    pub fn parent(&self) -> Option<Disk> {
+        Disk::from_handle(unsafe { block::kernel_blockdev_parent(self.handle) })
     }
 
     /// Its size, in sectors
