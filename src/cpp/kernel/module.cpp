@@ -11,7 +11,6 @@
 #include <hal/module.h>
 #include <mm/new.h>
 #include <mm/page_table.h>
-#include <fs/vfs.h>
 #include <include/const.h>
 
 /* The digest of the ffi crate's sources. The Makefile passes it to this file
@@ -37,6 +36,13 @@ extern "C" const ModuleExport nos_module_exports[];
 extern "C" const ulong nos_module_export_count;
 __attribute__((weak)) const ModuleExport nos_module_exports[] = {};
 __attribute__((weak)) const ulong nos_module_export_count = 0;
+
+/* The filesystem layer is Rust (src/rust/fs): a module's file is read whole,
+   through the same calls a module itself reads a file by. */
+extern "C" {
+long kernel_file_size(const char* path, ulong len);
+long kernel_file_read(const char* path, ulong len, void* buf, ulong cap);
+}
 
 namespace Kernel
 {
@@ -1145,19 +1151,17 @@ Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& 
 
 Stdlib::Error ModuleTable::LoadFile(const char* path, Stdlib::Printer& out)
 {
-    auto& vfs = Vfs::GetInstance();
-
-    File* file = vfs.Open(path, Vfs::OpenRead);
-    if (file == nullptr)
+    const ulong pathLen = Stdlib::StrLen(path);
+    const long got = kernel_file_size(path, pathLen);
+    if (got < 0)
     {
         out.Printf("module: cannot open %s\n", path);
         return MakeError(Stdlib::Error::NotFound);
     }
 
-    const ulong size = vfs.GetSize(file);
+    const ulong size = (ulong)got;
     if (size == 0 || size > MaxImageSize)
     {
-        vfs.Close(file);
         out.Printf("module: %s is %u bytes; a module file is 1 to %u\n", path, size, MaxImageSize);
         return MakeError(Stdlib::Error::BadSize);
     }
@@ -1167,24 +1171,15 @@ Stdlib::Error ModuleTable::LoadFile(const char* path, Stdlib::Printer& out)
     ModulePageRun buf;
     if (!AllocPageRun(buf, size))
     {
-        vfs.Close(file);
         out.Printf("module: no memory to read %s\n", path);
         return MakeError(Stdlib::Error::NoMemory);
     }
 
     u8* data = reinterpret_cast<u8*>(buf.Base);
-    ulong done = 0;
-    while (done < size)
-    {
-        ulong got = 0;
-        if (!vfs.Read(file, data + done, size - done, got) || got == 0)
-            break;
-        done += got;
-    }
-    vfs.Close(file);
+    const long done = kernel_file_read(path, pathLen, data, size);
 
     Stdlib::Error err;
-    if (done == size)
+    if (done == (long)size)
     {
         err = Load(data, size, out);
     }

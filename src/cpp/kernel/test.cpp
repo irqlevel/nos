@@ -15,8 +15,6 @@
 #include "symtab.h"
 #include "event.h"
 #include <hal/cpu.h>
-#include <fs/vfs.h>
-#include <fs/ramfs.h>
 
 #include <lib/btree.h>
 #include <lib/error.h>
@@ -1977,13 +1975,14 @@ Stdlib::Error TestSnPrintf()
    on / for the duration and taken down after: the whole file API, over a
    filesystem that needs no disk. */
 extern "C" int kernel_fs_selftest(const char* dir, unsigned long dirLen, unsigned long size);
+extern "C" int rust_ramfs_mount(const char* path, unsigned long pathLen, int readOnly);
+extern "C" int kernel_vfs_unmount(const char* path, unsigned long pathLen);
 
 Stdlib::Error TestVfs()
 {
     static const ulong BigSize = 100 * 1024;
 
-    auto& vfs = Vfs::GetInstance();
-    if (!RamFsMount("/"))
+    if (rust_ramfs_mount("/", 1, 0) != 0)
     {
         Trace(0, "TestVfs: mount failed");
         return MakeError(Stdlib::Error::Unsuccessful);
@@ -1991,7 +1990,7 @@ Stdlib::Error TestVfs()
 
     bool ok = kernel_fs_selftest("/", 1, BigSize) == 0;
 
-    if (!vfs.Unmount("/"))
+    if (kernel_vfs_unmount("/", 1) != 0)
     {
         Trace(0, "TestVfs: unmount failed");
         return MakeError(Stdlib::Error::Unsuccessful);

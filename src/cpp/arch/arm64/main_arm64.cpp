@@ -25,14 +25,16 @@
 #include <kernel/cmd.h>
 #include <kernel/softirq.h>
 #include <kernel/stack_probe.h>
-#include <fs/vfs.h>
-#include <fs/rootfs.h>
 #include <hal/power.h>
 
 
 #include <net/tcp.h>
 
 extern "C" void rust_init();
+/* The filesystem layer is Rust (src/rust/fs): what boot mounts where, and
+   taking it all down again on the way out. */
+extern "C" void rust_mount_root_fs();
+extern "C" void kernel_vfs_unmount_all();
 
 /* The disk log is Rust (src/rust/block/src/disklog.rs). */
 extern "C" int rust_disklog_setup();
@@ -285,7 +287,7 @@ static void BpStartupArm(void* ctx)
        bring-up, because a block request completes through the BLK_IO soft
        IRQ, and the NVMe disks came up in rust_init (see kernel/main.cpp) */
     rust_partitions_probe();
-    MountRootFs();
+    rust_mount_root_fs();
 
     /* Here, and not earlier: a block request is completed through the BLK_IO
        soft IRQ, so until the line above a write returns without having
@@ -359,7 +361,7 @@ static void BpStartupArm(void* ctx)
 
             /* While the soft IRQs still run: unmounting writes the
                superblock, and a block request completes through BLK_IO */
-            Vfs::GetInstance().UnmountAll();
+            kernel_vfs_unmount_all();
 
             /* The disk log last of all: its writer finishes what is queued
                and the log switches off -- after SoftIrq::Stop() a write

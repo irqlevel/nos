@@ -54,8 +54,6 @@
 #include <net/netconsole.h>
 #include <net/net_device.h>
 #include <net/tcp.h>
-#include <fs/vfs.h>
-#include <fs/rootfs.h>
 #include <kernel/stack_probe.h>
 #include <kernel/module.h>
 #include <arch/x86_64/percpu.h>
@@ -409,6 +407,10 @@ void SomeTaskRoutine(void *ctx)
    All C++ objects with non-trivial destructors must go out of
    scope before those calls, so the body is wrapped in a block. */
 extern "C" void rust_init();
+/* The filesystem layer is Rust (src/rust/fs): what boot mounts where, and
+   taking it all down again on the way out. */
+extern "C" void rust_mount_root_fs();
+extern "C" void kernel_vfs_unmount_all();
 
 /* The disk log is Rust (src/rust/block/src/disklog.rs). */
 extern "C" int rust_disklog_setup();
@@ -622,7 +624,7 @@ void BpStartup(void* ctx)
         rust_partitions_probe();
 
         /* The root filesystem may well be on one of those disks */
-        MountRootFs();
+        rust_mount_root_fs();
 
         /* Here, and not earlier: a block request is completed through the
            BLK_IO soft IRQ, so until the line above a read returns without
@@ -710,7 +712,7 @@ void BpStartup(void* ctx)
 
         /* Before the soft IRQs stop: unmounting writes the superblock, and
            a block request completes through the BLK_IO soft IRQ */
-        Vfs::GetInstance().UnmountAll();
+        kernel_vfs_unmount_all();
 
         /* The disk log last of all: its writer finishes what is queued and
            the log switches off -- after SoftIrq::Stop() a write through a

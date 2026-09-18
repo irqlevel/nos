@@ -7,7 +7,7 @@ is in [Shell commands](shell-commands.md#filesystem).
 
 ## What is mounted at boot
 
-`MountRootFs()` (`fs/rootfs.cpp`) runs late in the boot, after the disks
+`rust_mount_root_fs()` (`src/rust/fs/src/rootfs.rs`) runs late in the boot, after the disks
 that appear during `rust_init` (NVMe) have been probed for partitions, and
 does what `root=` on the command line asks:
 
@@ -35,28 +35,33 @@ mount; the smoke tests boot with it and assert `fstest: passed`.
 
 ## The file API
 
-Kernel code reaches files through `Vfs::GetInstance()` (`fs/vfs.h`). Paths
-are absolute; the longest mount prefix wins; `.` and `..` resolve in the
-tree, and `..` stops at a mount root.
+Rust reaches files through `crate::vfs_instance()` (`src/rust/fs/src/vfs.rs`),
+and C++ through the `kernel_vfs_*` calls it exports -- there is no C++ view
+of the layer, so a file that needs one declares the calls it makes where it
+makes them (`kernel/module.cpp` reading a `.ko`, `kernel/cmd.cpp` for
+`crc32`, `sha256`, `wget` and `/etc/rc`). Paths are absolute; the longest
+mount prefix wins; `.` and `..` resolve in the tree, and `..` stops at a
+mount root.
 
-```cpp
-File* f = vfs.Open("/lib/modules/foo.ko", Vfs::OpenRead);
-ulong size = vfs.GetSize(f);
-ulong got;
-vfs.Read(f, buf, size, got);    // got == 0 at end of file
-vfs.Close(f);
+```rust
+let file = vfs.open(b"/lib/modules/foo.ko", OPEN_READ);
+let got = vfs.read(file, buf.as_mut_ptr(), buf.len());   // Some(0) at end of file
+vfs.close(file);
 ```
 
-- `Open(path, flags)` with `OpenRead`, `OpenWrite`, `OpenCreate`,
-  `OpenTruncate`, `OpenAppend` (which puts every write at the end and implies
-  `OpenWrite`); `Close`, `Read`, `Write`, `Seek`, `Tell`, `GetSize`. A write
-  past the end extends the file; the gap reads as zeros.
-- `Stat` (type, size, inode), `ReadDir(path, index, entry)` to walk a
-  directory by index, `Rename` (a move within one filesystem; a directory
-  cannot move under itself), `Truncate` (either way), `Sync`, `Remove` (a
-  directory goes with everything under it), `CreateDir`, `CreateFile`.
-- `ReadFile(path, printer)` and `WriteFile(path, data, len)` for the
-  whole-file cases the shell has.
+- `open(path, flags)` with `OPEN_READ`, `OPEN_WRITE`, `OPEN_CREATE`,
+  `OPEN_TRUNCATE`, `OPEN_APPEND` (which puts every write at the end and
+  implies `OPEN_WRITE`); `close`, `read`, `write`, `seek`, `tell`, `size`. A
+  write past the end extends the file; the gap reads as zeros.
+- `stat` (type, size, inode), `read_dir(path, index, entry)` to walk a
+  directory by index, `rename` (a move within one filesystem; a directory
+  cannot move under itself), `truncate` (either way), `sync`, `remove` (a
+  directory goes with everything under it), `create(path, directory)`.
+- `files.rs` for the whole-file cases: `list_dir` and `read_file` for what
+  the shell prints, `replace_file`/`locate` for a configuration file that a
+  full disk or a crash midway must not leave empty, and the `kernel_file_*`
+  ABI over them that a module -- and the shell's `/etc/rc` -- reads and
+  writes by.
 
 An open file pins its vnode: `Remove` and `Rename` refuse a file (or a
 directory containing one) that is open, and `Unmount` refuses a filesystem
@@ -180,7 +185,7 @@ driver left it as it should.
 ## Checking it
 
 `fstest [dir] [size]` from the shell, or `fstest=on` at boot, runs
-`FsSelfTest` (`fs/fstest.cpp`) in a directory it makes and removes: write
+The self-test (`src/rust/fs/src/selftest.rs`) runs in a directory it makes and removes: write
 and read back, append, write at an offset, truncate both ways with the gap
 checked for zeros, rename, move into a subdirectory, `readdir`, the
 operations that must fail, a file of `size` bytes (300 KiB by default)
