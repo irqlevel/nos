@@ -243,9 +243,19 @@ impl Controller {
             return None;
         }
 
-        let op = MmioRegion::new(unsafe { base.add(cap_length as usize) }, size);
-        let rt = MmioRegion::new(unsafe { base.add(rts_off) }, size);
-        let db = MmioRegion::new(unsafe { base.add(db_off) }, size);
+        /* Each block starts where the capability registers say, and the
+         * controller is the one saying it: one that points outside its own
+         * BAR is refused here rather than believed. */
+        let (op, rt, db) = match (
+            cap.window(cap_length as usize), cap.window(rts_off), cap.window(db_off),
+        ) {
+            (Some(op), Some(rt), Some(db)) => (op, rt, db),
+            _ => {
+                trace!(0, "Xhci: register blocks outside BAR0 (op {} rt 0x{:X} db 0x{:X}, size 0x{:X})",
+                    cap_length, rts_off, db_off, size);
+                return None;
+            }
+        };
 
         Some(Box::new(Self {
             index,
