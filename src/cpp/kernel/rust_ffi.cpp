@@ -31,8 +31,6 @@
 #include <hal/irqchip.h>
 #include <net/net_device.h>
 #include <net/tcp.h>
-#include <fs/vfs.h>
-#include <fs/fstest.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
 #include "parameters.h"
@@ -175,17 +173,6 @@ private:
     unsigned long long Oldest;
     unsigned long Dropped;
 };
-
-/* A path from Rust -- bytes and a length -- as the NUL-terminated string the
-   Vfs takes; false if it does not fit */
-static bool FfiPath(const unsigned char* path, unsigned long len, char (&out)[Kernel::Vfs::MaxPath])
-{
-    if (path == nullptr || len == 0 || len >= sizeof(out))
-        return false;
-    Stdlib::MemCpy(out, path, len);
-    out[len] = '\0';
-    return true;
-}
 
 extern "C" {
 
@@ -1809,114 +1796,6 @@ int kernel_root_read_only()
 int kernel_root_fstest()
 {
     return Kernel::Parameters::GetInstance().IsFsTest() ? 1 : 0;
-}
-
-/* The filesystem self-test (fs/fstest.cpp), which uses nothing but the file
-   API and so stays where it is: 0 passed, -1 failed. */
-int kernel_fs_selftest(const char* dir, unsigned long size)
-{
-    return Kernel::FsSelfTest(dir, size, nullptr) ? 0 : -1;
-}
-
-/* Files, for a module to keep its configuration in (kcore::fs). Paths are
-   absolute, and nothing is held open between calls. -1: no such file, or
-   the filesystem refused. */
-long kernel_file_size(const unsigned char* path, unsigned long pathLen)
-{
-    char p[Kernel::Vfs::MaxPath];
-    char at[Kernel::Vfs::MaxPath];
-    if (!FfiPath(path, pathLen, p))
-        return -1;
-
-    auto& vfs = Kernel::Vfs::GetInstance();
-    Kernel::FileStat st;
-    if (!vfs.Locate(p, at, sizeof(at)) || !vfs.Stat(at, st) || st.Type != Kernel::VNode::TypeFile)
-        return -1;
-    return (long)st.Size;
-}
-
-/* Up to cap bytes from the start of the file: the count read */
-long kernel_file_read(const unsigned char* path, unsigned long pathLen,
-    unsigned char* buf, unsigned long cap)
-{
-    char p[Kernel::Vfs::MaxPath];
-    char at[Kernel::Vfs::MaxPath];
-    if (!FfiPath(path, pathLen, p) || (buf == nullptr && cap != 0))
-        return -1;
-
-    auto& vfs = Kernel::Vfs::GetInstance();
-    if (!vfs.Locate(p, at, sizeof(at)))
-        return -1;
-    Kernel::File* file = vfs.Open(at, Kernel::Vfs::OpenRead);
-    if (file == nullptr)
-        return -1;
-
-    unsigned long total = 0;
-    while (total < cap)
-    {
-        ulong got = 0;
-        if (!vfs.Read(file, buf + total, cap - total, got))
-        {
-            vfs.Close(file);
-            return -1;
-        }
-        if (got == 0)
-            break;
-        total += got;
-    }
-    vfs.Close(file);
-    return (long)total;
-}
-
-/* Replaces the file's content, making the file if it is missing, through
-   Vfs::ReplaceFile: what a module writes is its configuration -- the keys
-   allowed to log in -- which a full disk or a crash midway must not leave
-   empty */
-int kernel_file_write(const unsigned char* path, unsigned long pathLen,
-    const unsigned char* data, unsigned long len)
-{
-    char p[Kernel::Vfs::MaxPath];
-    if (!FfiPath(path, pathLen, p) || (data == nullptr && len != 0))
-        return -1;
-
-    return Kernel::Vfs::GetInstance().ReplaceFile(p, data, len) ? 0 : -1;
-}
-
-/* A new file with this content: 1, and nothing written, when there is one
-   at the path already -- or the remains of a ReplaceFile of it. For a file
-   that must never be written over by mistake, a host key: a Stat that
-   failed on a bad block must not read as "there is none" and lose it. */
-int kernel_file_create(const unsigned char* path, unsigned long pathLen,
-    const unsigned char* data, unsigned long len)
-{
-    char p[Kernel::Vfs::MaxPath];
-    char at[Kernel::Vfs::MaxPath];
-    if (!FfiPath(path, pathLen, p) || (data == nullptr && len != 0))
-        return -1;
-
-    auto& vfs = Kernel::Vfs::GetInstance();
-    if (vfs.Locate(p, at, sizeof(at)))
-        return 1;
-    /* Refused by the filesystem itself when the file is there after all */
-    if (!vfs.CreateFile(p))
-        return 1;
-    if (!vfs.WriteFile(p, data, len) || !vfs.Sync())
-        return -1;
-    return 0;
-}
-
-/* A directory, made if there is none by that name: 0 once there is one */
-int kernel_dir_create(const unsigned char* path, unsigned long pathLen)
-{
-    char p[Kernel::Vfs::MaxPath];
-    if (!FfiPath(path, pathLen, p))
-        return -1;
-
-    auto& vfs = Kernel::Vfs::GetInstance();
-    Kernel::FileStat st;
-    if (vfs.Stat(p, st))
-        return (st.Type == Kernel::VNode::TypeDir) ? 0 : -1;
-    return vfs.CreateDir(p) ? 0 : -1;
 }
 
 /* The kernel's lockless ring for Rust (kcore::ring): a bounded MPMC queue of

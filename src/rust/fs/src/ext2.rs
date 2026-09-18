@@ -2600,13 +2600,26 @@ fn ops_for(fs: *mut Ext2) -> FsOps {
 pub unsafe extern "C" fn rust_ext2_mount(
     path: *const u8, path_len: usize, device: usize, read_only: i32,
 ) -> i32 {
+    match unsafe { crate::path(path, path_len) } {
+        Some(at) => mount_bytes(at, device, read_only != 0),
+        None => -1,
+    }
+}
+
+/// Mount the device's ext2 at `path`: 0 mounted for writing, 1 read-only --
+/// asked for, or all the image allows -- and -1 not mounted.
+pub fn mount_at(path: &str, device: usize, read_only: bool) -> i32 {
+    mount_bytes(path.as_bytes(), device, read_only)
+}
+
+fn mount_bytes(at: &[u8], device: usize, read_only: bool) -> i32 {
     let dev = match Disk::from_handle(device) {
         Some(dev) => dev,
         None => return -1,
     };
-    let (vfs, at) = match (crate::vfs_instance(), unsafe { crate::path(path, path_len) }) {
-        (Some(vfs), Some(at)) => (vfs, at),
-        _ => return -1,
+    let vfs = match crate::vfs_instance() {
+        Some(vfs) => vfs,
+        None => return -1,
     };
 
     let fs = match Ext2::new(dev) {
@@ -2618,7 +2631,7 @@ pub unsafe extern "C" fn rust_ext2_mount(
     };
 
     let ops = ops_for(fs);
-    if !vfs.mount(at, &ops, read_only != 0) {
+    if !vfs.mount(at, &ops, read_only) {
         /* Not mounted: nothing took it, and it is ours to release */
         drop(unsafe { Box::from_raw(fs) });
         return -1;

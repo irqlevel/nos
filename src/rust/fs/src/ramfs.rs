@@ -434,20 +434,32 @@ fn ops_for(fs: *mut RamFs) -> FsOps {
 pub unsafe extern "C" fn rust_ramfs_mount(
     path: *const u8, path_len: usize, read_only: i32,
 ) -> i32 {
-    let (vfs, at) = match (crate::vfs_instance(), unsafe { crate::path(path, path_len) }) {
-        (Some(vfs), Some(at)) => (vfs, at),
-        _ => return -1,
+    match unsafe { crate::path(path, path_len) } {
+        Some(at) if mount_bytes(at, read_only != 0) => 0,
+        _ => -1,
+    }
+}
+
+/// A fresh ramfs at `path`.
+pub fn mount_at(path: &str, read_only: bool) -> bool {
+    mount_bytes(path.as_bytes(), read_only)
+}
+
+fn mount_bytes(at: &[u8], read_only: bool) -> bool {
+    let vfs = match crate::vfs_instance() {
+        Some(vfs) => vfs,
+        None => return false,
     };
 
     let fs = match RamFs::new() {
         Some(fs) => Box::into_raw(fs),
-        None => return -1,
+        None => return false,
     };
 
     let ops = ops_for(fs);
-    if !vfs.mount(at, &ops, read_only != 0) {
+    if !vfs.mount(at, &ops, read_only) {
         drop(unsafe { Box::from_raw(fs) });
-        return -1;
+        return false;
     }
-    0
+    true
 }

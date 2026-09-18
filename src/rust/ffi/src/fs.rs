@@ -42,7 +42,7 @@ extern "C" {
     pub fn kernel_root_read_only() -> i32;
     /// `fstest=on`: run the self-test on / once it is mounted.
     pub fn kernel_root_fstest() -> i32;
-    /// The filesystem self-test in `dir`, with a file of `size` bytes:
-    /// 0 passed, -1 failed. `dir` is NUL-terminated.
-    pub fn kernel_fs_selftest(dir: *const u8, size: usize) -> i32;
+    /// The filesystem self-test in `dir` (`dir_len` bytes), with a file of
+    /// `size` bytes: 0 passed, -1 failed.
+    pub fn kernel_fs_selftest(dir: *const u8, dir_len: usize, size: usize) -> i32;
 }
