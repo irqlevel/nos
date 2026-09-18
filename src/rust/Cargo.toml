@@ -1,10 +1,10 @@
 [workspace]
-members = ["ffi", "kernel", "hello", "kcore", "tls", "ssh", "block", "drivers/nvme", "drivers/r8168", "drivers/r8125", "drivers/igb", "kmod", "modules/hello", "modules/modtest", "modules/slowexit", "modules/blkload", "modules/netblk", "modules/sshd"]
+members = ["ffi", "kernel", "hello", "kcore", "tls", "ssh", "block", "virtio", "drivers/nvme", "drivers/virtio_rng", "drivers/r8168", "drivers/r8125", "drivers/igb", "kmod", "modules/hello", "modules/modtest", "modules/slowexit", "modules/blkload", "modules/netblk", "modules/sshd"]
 # What a plain `cargo build` builds: the crates the kernel links. A loadable
 # module is built on its own, one package at a time and with the
 # position-independent code the kernel's crates do not use (the Makefile's
 # module rules), then linked into a shared object the kernel loads.
-default-members = ["ffi", "kernel", "hello", "kcore", "tls", "block", "drivers/nvme", "drivers/r8168", "drivers/r8125", "drivers/igb"]
+default-members = ["ffi", "kernel", "hello", "kcore", "tls", "block", "virtio", "drivers/nvme", "drivers/virtio_rng", "drivers/r8168", "drivers/r8125", "drivers/igb"]
 resolver = "2"
 
 [profile.release]

@@ -73,6 +73,7 @@ echo "smoke: booting (log: $SMOKE_LOG, timeout: ${SMOKE_TIMEOUT}s)..."
     -device virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off \
     -netdev user,id=net0 \
     -device virtio-rng-pci \
+    -device virtio-rng-pci,disable-modern=on,disable-legacy=off \
     -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
     &
 QEMU_PID=$!
@@ -83,7 +84,8 @@ QEMU_PID=$!
 #   "MountRootFs: mounted ext2 on /" - the root image was found and mounted rw
 #   "fstest: passed"                - the filesystem self-test ran on it
 #   "boot: complete"                - shells started, kernel reached the idle loop
-MARKERS=("After test" "Preempt is now on" "MountRootFs: mounted ext2 on /" "fstest: passed" "boot: complete")
+MARKERS=("After test" "Preempt is now on" "MountRootFs: mounted ext2 on /" "fstest: passed"
+         "EntropySource registered: rng0" "EntropySource registered: rng1" "boot: complete")
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do
@@ -98,6 +100,11 @@ while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do
     fi
     if grep -q "fstest: FAILED" "$SMOKE_LOG"; then
         fail "filesystem self-test failed"
+    fi
+    # A source that registered and then gave nothing: the virtio-rng driver
+    # probed its device but its queue is not working
+    if grep -q "reseeded from 0 of" "$SMOKE_LOG"; then
+        fail "an entropy source registered but gave nothing"
     fi
 
     DONE=1

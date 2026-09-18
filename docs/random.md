@@ -34,7 +34,7 @@ what a generator is for — sources contribute, the generator answers.
 |---|---|---|
 | `rdseed` / `rdrand` | x86-64, `arch/x86_64/hal_random.cpp` | the CPU's own DRBG. RDSEED taps the conditioned output of the physical noise source and is what another generator wants to be keyed from; RDRAND is the AES-CTR DRBG downstream of it — faster, never dry, one more deterministic step from the noise |
 | `rndr` | arm64, `arch/arm64/hal_random.cpp` | FEAT_RNG, the same idea (RNDRRS reseeds before answering, RNDR does not). Optional from Armv8.5 and **not implemented by Apple's M-series**, so no arm64 machine nos runs on today has it |
-| `rng0`… | `drivers/virtio_rng.cpp` | virtio-rng, i.e. the host's entropy. Present under QEMU, absent on bare metal — exactly the wrong way round from the CPU instruction, which is why both exist |
+| `rng0`… | `src/rust/drivers/virtio_rng` | virtio-rng, i.e. the host's entropy. Present under QEMU, absent on bare metal — exactly the wrong way round from the CPU instruction, which is why both exist |
 | `jitter` | `kernel/random.cpp` | timing jitter, the fallback (below) |
 
 `hal/random.h` is the seam for the CPU instruction, so common code never asks
