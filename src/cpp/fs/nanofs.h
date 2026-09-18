@@ -1,129 +1,28 @@
 #pragma once
 
-#include <fs/filesystem.h>
-#include <fs/block_io.h>
-
 namespace Kernel
 {
 
-static const u32 NanoMagic         = 0x4E414E4F; // "NANO"
-static const u32 NanoVersion       = 1;
-static const u32 NanoBlockSize     = 4096;
-static const u32 NanoInodeCount    = 1024;
-static const u32 NanoDataBlockCount = 16384;
-static const u32 NanoInodeStart    = 1;
-static const u32 NanoDataStart     = 1 + NanoInodeCount; // 1025
-static const u32 NanoMaxBlocks     = 256;
-static const u32 NanoMaxDirEntries = 256;
-static const u32 NanoMaxFileSize   = NanoMaxBlocks * NanoBlockSize; // 1 MB
-static const u32 NanoMaxDirDepth   = 32; // recursion cap for LoadVNode (32 KB kernel stack)
+class BlockDevice;
 
-struct NanoSuperBlock
+/* nanofs itself is Rust (src/rust/fs/src/nanofs.rs): 1024 inodes, 16384
+   data blocks of 4 KiB, a CRC32 on every block and on every file's data,
+   and copy-on-write writes with the inode committed last. What is left here
+   is the way in. */
+
+/* What NanoFsMount answers */
+enum NanoFsMounted
 {
-    u32 Magic;
-    u32 Version;
-    u8  Uuid[16];
-    u32 Checksum;
-    u32 BlockSize;
-    u32 InodeCount;
-    u32 DataBlockCount;
-    u32 InodeStartBlock;
-    u32 DataStartBlock;
-    u8  InodeBitmap[128];
-    u8  DataBitmap[2048];
-    u8  Padding[NanoBlockSize - 48 - 128 - 2048];
+    NanoFsMountedRw = 0,
+    NanoFsMountedRo = 1,
+    NanoFsNotMounted = -1,
 };
 
-static_assert(sizeof(NanoSuperBlock) == NanoBlockSize, "NanoSuperBlock must be 4 KB");
+/* Mount dev's nanofs at path. The filesystem belongs to the VFS from here
+   on: an unmount releases it. */
+int NanoFsMount(const char* path, BlockDevice* dev, bool readOnly = false);
 
-struct NanoInode
-{
-    u32 Type;           // 0 = free, 1 = file, 2 = dir
-    u32 Size;           // file: byte count, dir: entry count
-    char Name[64];
-    u32 ParentInode;
-    u32 Checksum;       // CRC32 of this block (zeroed during computation)
-    u32 DataChecksum;   // CRC32 of file data (0 for dirs/empty)
-    u32 Blocks[NanoMaxBlocks];
-    u8  Padding[NanoBlockSize - 4 - 4 - 64 - 4 - 4 - 4 - NanoMaxBlocks * 4];
-};
-
-static_assert(sizeof(NanoInode) == NanoBlockSize, "NanoInode must be 4 KB");
-
-struct NanoDirEntry
-{
-    u32 InodeIndex;
-    u32 Reserved;
-};
-
-static const u32 NanoInodeTypeFree = 0;
-static const u32 NanoInodeTypeFile = 1;
-static const u32 NanoInodeTypeDir  = 2;
-
-class NanoFs : public FileSystem
-{
-public:
-    NanoFs(BlockDevice* dev);
-    virtual ~NanoFs();
-
-    virtual const char* GetName() override;
-    virtual bool Format(BlockDevice* dev) override;
-    virtual void GetInfo(char* buf, ulong bufSize) override;
-    virtual bool Mount() override;
-    virtual void Unmount() override;
-    virtual VNode* GetRoot() override;
-    virtual VNode* Lookup(VNode* dir, const char* name) override;
-    virtual VNode* CreateFile(VNode* dir, const char* name) override;
-    virtual VNode* CreateDir(VNode* dir, const char* name) override;
-    virtual bool Write(VNode* file, const void* data, ulong len, ulong offset) override;
-    virtual bool Read(VNode* file, void* buf, ulong len, ulong offset) override;
-    virtual bool Truncate(VNode* file, ulong size) override;
-    virtual bool Rename(VNode* node, VNode* newDir, const char* newName) override;
-    virtual bool Remove(VNode* node) override;
-    virtual bool Sync() override;
-    virtual BlockDevice* GetDevice() override;
-
-private:
-    NanoFs(const NanoFs& other) = delete;
-    NanoFs(NanoFs&& other) = delete;
-    NanoFs& operator=(const NanoFs& other) = delete;
-    NanoFs& operator=(NanoFs&& other) = delete;
-
-    bool ReadInode(u32 idx, NanoInode* out);
-    bool WriteInode(u32 idx, const NanoInode* in, bool fua = false);
-    bool FlushSuper();
-
-    long AllocInode();
-    void FreeInode(u32 idx);
-    long AllocDataBlock();
-    void FreeDataBlock(u32 idx);
-    void MarkReachableAllocated();
-
-    void ComputeSuperChecksum();
-    bool VerifySuperChecksum();
-    void ComputeInodeChecksum(NanoInode* inode);
-    bool VerifyInodeChecksum(NanoInode* inode);
-    u32  ComputeDataChecksum(NanoInode* inode);
-
-    VNode* LoadVNode(u32 inodeIdx, u32 depth = 0);
-    VNode* FindVNode(u32 inodeIdx);
-    void   FreeVNode(VNode* vnode);
-    u32    VNodeToInode(VNode* vnode);
-
-    bool Rewrite(VNode* file, ulong newSize, const void* data, ulong len, ulong offset);
-
-    bool AddDirEntry(u32 dirInodeIdx, u32 childInodeIdx);
-    bool RemoveDirEntry(u32 dirInodeIdx, u32 childInodeIdx);
-    bool RemoveRecursive(VNode* node);
-
-    BlockIo Io;
-    NanoSuperBlock* Super;
-    VNode* VNodes[NanoInodeCount]; // in-memory VNode cache by inode index
-    // Inodes whose LoadVNode is still on the recursion stack. A dir entry
-    // referencing such an inode is a directory cycle in the on-disk image;
-    // linking it would put a cycle in the VFS tree (infinite recursion later).
-    u8 LoadInProgress[NanoInodeCount];
-    bool Mounted;
-};
+/* Write a fresh nanofs onto dev, with an empty root directory. */
+bool NanoFsFormat(BlockDevice* dev);
 
 }

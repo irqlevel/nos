@@ -114,7 +114,6 @@ CXX_SRC_x86_64 =   \
     src/cpp/net/http.cpp \
     src/cpp/fs/vfs.cpp \
     src/cpp/fs/ramfs.cpp \
-    src/cpp/fs/block_io.cpp \
     src/cpp/fs/nanofs.cpp \
     src/cpp/fs/ext2.cpp \
     src/cpp/fs/procfs.cpp \
@@ -238,7 +237,6 @@ CXX_SRC_aarch64 = \
     src/cpp/net/http.cpp \
     src/cpp/fs/vfs.cpp \
     src/cpp/fs/ramfs.cpp \
-    src/cpp/fs/block_io.cpp \
     src/cpp/fs/nanofs.cpp \
     src/cpp/fs/ext2.cpp \
     src/cpp/fs/procfs.cpp \

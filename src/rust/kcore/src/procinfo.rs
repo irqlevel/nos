@@ -39,3 +39,53 @@ pub fn interrupt_source(index: usize, name: &mut [u8]) -> Option<(usize, i64)> {
     let len = name.iter().position(|b| *b == 0).unwrap_or(name.len());
     Some((len, count as i64))
 }
+
+/* ---- what the root filesystem is to be ---- */
+
+/// What `root=` asked for.
+pub enum Root {
+    /// `root=` was not given, or said nothing: mount nothing.
+    None,
+    /// `root=auto`: the ext2 labelled `nos`.
+    Auto,
+    /// `root=<device>`: that block device, by the name `disks` shows.
+    Device,
+    /// `root=LABEL=<label>`: the ext2 with that volume label.
+    Label,
+    /// `root=UUID=<uuid>`: the ext2 with that UUID.
+    Uuid,
+}
+
+/// The root spec: what to look for, the name or label it was given, and the
+/// UUID it was given. The name's length comes back with it.
+pub fn root_spec(value: &mut [u8], uuid: &mut [u8; 16]) -> (Root, usize) {
+    let mode = unsafe {
+        fs::kernel_root_spec(value.as_mut_ptr(), value.len(), uuid.as_mut_ptr(), uuid.len())
+    };
+    let len = value.iter().position(|b| *b == 0).unwrap_or(value.len());
+
+    let mode = match mode {
+        1 => Root::Auto,
+        2 => Root::Device,
+        3 => Root::Label,
+        4 => Root::Uuid,
+        _ => Root::None,
+    };
+    (mode, len)
+}
+
+/// `ro`: the root is to be mounted read-only.
+pub fn root_read_only() -> bool {
+    unsafe { fs::kernel_root_read_only() != 0 }
+}
+
+/// `fstest=on`: run the filesystem self-test on / once it is mounted.
+pub fn root_fstest() -> bool {
+    unsafe { fs::kernel_root_fstest() != 0 }
+}
+
+/// The filesystem self-test in `dir`, with a file of `size` bytes. `dir` is
+/// NUL-terminated.
+pub fn fs_selftest(dir: &[u8], size: usize) -> bool {
+    unsafe { fs::kernel_fs_selftest(dir.as_ptr(), size) == 0 }
+}

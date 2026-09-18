@@ -1,6 +1,6 @@
 #pragma once
 
-#include <fs/filesystem.h>
+#include <fs/vnode.h>
 #include <lib/printer.h>
 
 namespace Kernel
@@ -45,7 +45,6 @@ public:
     static const ulong OpenTruncate = 8;
     static const ulong OpenAppend = 16;
 
-    bool Mount(const char* path, FileSystem* fs, bool readOnly = false);
     /* Takes the filesystem off the path and releases it. */
     bool Unmount(const char* path);
 
@@ -91,7 +90,7 @@ public:
 
     static const ulong MaxMounts = 16;
     static const ulong MaxPath = 256;
-    static const ulong MaxName = sizeof(VNode::Name);
+    static const ulong MaxName = VNode::NameMax;
 
 private:
     Vfs();

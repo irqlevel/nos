@@ -1687,22 +1687,10 @@ static void CmdMount(const char* args, Stdlib::Printer& con)
             return;
         }
 
-        NanoFs* fs = new (Mm::NoThrow) NanoFs(dev);
-        if (fs == nullptr)
-        {
-            con.Printf("failed to allocate nanofs\n");
-            return;
-        }
-
-        if (!Vfs::GetInstance().Mount(path, fs))
-        {
-            delete fs;
-            con.Printf("mount failed\n");
-        }
-        else
-        {
+        if (NanoFsMount(path, dev) != NanoFsNotMounted)
             con.Printf("mounted nanofs on %s\n", path);
-        }
+        else
+            con.Printf("mount failed\n");
     }
     else if (Stdlib::StrCmp(fsName, "ext2") == 0)
     {
@@ -2632,11 +2620,7 @@ static void CmdFormat(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    bool formatted = false;
-    {
-        NanoFs fs(dev);
-        formatted = fs.Format(dev);
-    }
+    bool formatted = NanoFsFormat(dev);
     table.Release(claim);
 
     if (formatted)

@@ -1,40 +1,16 @@
 #include "vfs.h"
 
-#include <block/block_device.h>
 #include <lib/stdlib.h>
 #include <mm/new.h>
 #include <kernel/trace.h>
 
-/* The VFS itself is Rust (src/rust/fs): the mount table, path resolution and
-   the file API. What is left here is the C++ way in -- the same class the
-   rest of the kernel has always called -- and the shim that wraps a
-   filesystem still written in C++ into the ops table the VFS drives it by.
-   Both go when the last filesystem moves. */
+/* The VFS is Rust (src/rust/fs), and so is every filesystem under it: the
+   mount table, path resolution, the open handles, the file API. What is left
+   here is the C++ way in -- the same class the rest of the kernel has always
+   called -- and the few calls made of the others (ListDir, ReadFile,
+   ReplaceFile, Locate), which hold no state of their own. */
 extern "C" {
 
-struct RustFsOps
-{
-    const char* Name;
-    void (*Info)(void* ctx, char* buf, unsigned long len);
-    Kernel::VNode* (*Root)(void* ctx);
-    int (*LoadDir)(void* ctx, Kernel::VNode* dir);
-    Kernel::VNode* (*Lookup)(void* ctx, Kernel::VNode* dir, const char* name);
-    Kernel::VNode* (*CreateFile)(void* ctx, Kernel::VNode* dir, const char* name);
-    Kernel::VNode* (*CreateDir)(void* ctx, Kernel::VNode* dir, const char* name);
-    int (*Read)(void* ctx, Kernel::VNode* file, void* buf, unsigned long len, unsigned long off);
-    int (*Write)(void* ctx, Kernel::VNode* file, const void* data, unsigned long len, unsigned long off);
-    int (*Truncate)(void* ctx, Kernel::VNode* file, unsigned long size);
-    int (*Rename)(void* ctx, Kernel::VNode* node, Kernel::VNode* dir, const char* name);
-    int (*Remove)(void* ctx, Kernel::VNode* node);
-    int (*Sync)(void* ctx);
-    unsigned long (*Device)(void* ctx);
-    int (*Mount)(void* ctx, int readOnly);
-    void (*Unmount)(void* ctx);
-    void (*Destroy)(void* ctx);
-    void* Ctx;
-};
-
-int kernel_vfs_mount(const char* path, unsigned long len, const RustFsOps* ops, int readOnly);
 int kernel_vfs_unmount(const char* path, unsigned long len);
 void kernel_vfs_unmount_all();
 unsigned long kernel_vfs_mount_count();
@@ -68,147 +44,12 @@ namespace Kernel
    the file itself never has to fit in one allocation. */
 static const ulong ReadFileChunk = 4096;
 
-namespace
-{
-
-/* The shim: a C++ FileSystem seen as the ops table the VFS drives. Every
-   call arrives with the VFS lock held, which is the contract FileSystem is
-   written to. */
-
-FileSystem* Fs(void* ctx)
-{
-    return static_cast<FileSystem*>(ctx);
-}
-
-void ShimInfo(void* ctx, char* buf, unsigned long len)
-{
-    Fs(ctx)->GetInfo(buf, len);
-}
-
-VNode* ShimRoot(void* ctx)
-{
-    return Fs(ctx)->GetRoot();
-}
-
-int ShimLoadDir(void* ctx, VNode* dir)
-{
-    return Fs(ctx)->LoadDir(dir) ? 0 : -1;
-}
-
-VNode* ShimLookup(void* ctx, VNode* dir, const char* name)
-{
-    return Fs(ctx)->Lookup(dir, name);
-}
-
-VNode* ShimCreateFile(void* ctx, VNode* dir, const char* name)
-{
-    return Fs(ctx)->CreateFile(dir, name);
-}
-
-VNode* ShimCreateDir(void* ctx, VNode* dir, const char* name)
-{
-    return Fs(ctx)->CreateDir(dir, name);
-}
-
-int ShimRead(void* ctx, VNode* file, void* buf, unsigned long len, unsigned long off)
-{
-    return Fs(ctx)->Read(file, buf, len, off) ? 0 : -1;
-}
-
-int ShimWrite(void* ctx, VNode* file, const void* data, unsigned long len, unsigned long off)
-{
-    return Fs(ctx)->Write(file, data, len, off) ? 0 : -1;
-}
-
-int ShimTruncate(void* ctx, VNode* file, unsigned long size)
-{
-    return Fs(ctx)->Truncate(file, size) ? 0 : -1;
-}
-
-int ShimRename(void* ctx, VNode* node, VNode* dir, const char* name)
-{
-    return Fs(ctx)->Rename(node, dir, name) ? 0 : -1;
-}
-
-int ShimRemove(void* ctx, VNode* node)
-{
-    return Fs(ctx)->Remove(node) ? 0 : -1;
-}
-
-int ShimSync(void* ctx)
-{
-    return Fs(ctx)->Sync() ? 0 : -1;
-}
-
-unsigned long ShimDevice(void* ctx)
-{
-    BlockDevice* dev = Fs(ctx)->GetDevice();
-    return dev != nullptr ? dev->GetHandle() : 0;
-}
-
-int ShimMount(void* ctx, int readOnly)
-{
-    FileSystem* fs = Fs(ctx);
-    fs->ReadOnly = readOnly != 0;
-    if (!fs->Mount())
-        return -1;
-
-    /* The filesystem may have found an image it can read but must not
-       write; the VFS takes that answer as the mount's. */
-    return fs->ReadOnly ? 1 : 0;
-}
-
-void ShimUnmount(void* ctx)
-{
-    Fs(ctx)->Unmount();
-}
-
-void ShimDestroy(void* ctx)
-{
-    delete Fs(ctx);
-}
-
-RustFsOps ShimOps(FileSystem* fs)
-{
-    RustFsOps ops = {};
-    ops.Name = fs->GetName();
-    ops.Info = ShimInfo;
-    ops.Root = ShimRoot;
-    ops.LoadDir = ShimLoadDir;
-    ops.Lookup = ShimLookup;
-    ops.CreateFile = ShimCreateFile;
-    ops.CreateDir = ShimCreateDir;
-    ops.Read = ShimRead;
-    ops.Write = ShimWrite;
-    ops.Truncate = ShimTruncate;
-    ops.Rename = ShimRename;
-    ops.Remove = ShimRemove;
-    ops.Sync = ShimSync;
-    ops.Device = ShimDevice;
-    ops.Mount = ShimMount;
-    ops.Unmount = ShimUnmount;
-    ops.Destroy = ShimDestroy;
-    ops.Ctx = fs;
-    return ops;
-}
-
-}
-
 Vfs::Vfs()
 {
 }
 
 Vfs::~Vfs()
 {
-}
-
-bool Vfs::Mount(const char* path, FileSystem* fs, bool readOnly)
-{
-    if (path == nullptr || fs == nullptr)
-        return false;
-
-    RustFsOps ops = ShimOps(fs);
-    return kernel_vfs_mount(path, Stdlib::StrLen(path), &ops, readOnly ? 1 : 0) == 0;
 }
 
 bool Vfs::Unmount(const char* path)

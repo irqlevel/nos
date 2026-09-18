@@ -34,6 +34,7 @@
 #include <net/net_frame.h>
 #include <net/tcp.h>
 #include <fs/vfs.h>
+#include <fs/fstest.h>
 #include <drivers/hpet.h>
 #include <drivers/acpi.h>
 #include "parameters.h"
@@ -1851,6 +1852,41 @@ long kernel_interrupt_source(unsigned long index, char* name, unsigned long name
     if (name != nullptr && nameLen != 0)
         Stdlib::SnPrintf(name, nameLen, "%s", Kernel::InterruptStats::GetName(src));
     return Kernel::InterruptStats::Get(src);
+}
+
+/* What the root filesystem is to be, off the kernel command line: the mode
+   (Parameters::RootMode), the device name or label into `value`, and the
+   parsed UUID into `uuid`. See rust_mount_root_fs. */
+int kernel_root_spec(char* value, unsigned long valueLen, unsigned char* uuid,
+    unsigned long uuidLen)
+{
+    const Kernel::Parameters::RootSpec& spec = Kernel::Parameters::GetInstance().GetRoot();
+
+    if (value != nullptr && valueLen != 0)
+        Stdlib::SnPrintf(value, valueLen, "%s", spec.Value);
+    if (uuid != nullptr && uuidLen >= sizeof(spec.Uuid))
+        Stdlib::MemCpy(uuid, spec.Uuid, sizeof(spec.Uuid));
+
+    return (int)spec.Mode;
+}
+
+/* ro: the root is to be mounted read-only */
+int kernel_root_read_only()
+{
+    return Kernel::Parameters::GetInstance().IsRootReadOnly() ? 1 : 0;
+}
+
+/* fstest=on: run the filesystem self-test on / once it is mounted */
+int kernel_root_fstest()
+{
+    return Kernel::Parameters::GetInstance().IsFsTest() ? 1 : 0;
+}
+
+/* The filesystem self-test (fs/fstest.cpp), which uses nothing but the file
+   API and so stays where it is: 0 passed, -1 failed. */
+int kernel_fs_selftest(const char* dir, unsigned long size)
+{
+    return Kernel::FsSelfTest(dir, size, nullptr) ? 0 : -1;
 }
 
 /* Files, for a module to keep its configuration in (kcore::fs). Paths are
