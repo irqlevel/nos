@@ -147,11 +147,13 @@ impl FramePool {
         unsafe { (*self.ring.get()).as_ref() }
     }
 
-    /// Build `count` frames, once, at boot.
+    /// Build `count` frames, once, at boot; 0 asks for the default, which is
+    /// what boot passes unless `netframes=N` was given.
     pub fn setup(&'static self, count: usize) -> bool {
-        if self.is_ready() || count == 0 {
+        if self.is_ready() {
             return false;
         }
+        let count = if count == 0 { DEFAULT_FRAME_COUNT } else { count };
 
         /* The ring has to hold every frame at once -- a flush from a full
          * cache must never fail, or a frame would have to go back to the
