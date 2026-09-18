@@ -319,3 +319,54 @@ impl Drop for Event {
         unsafe { sync::kernel_event_destroy(self.handle) }
     }
 }
+
+/// A spin lock that owns nothing: an atomic flag, with interrupts and
+/// preemption off while it is held.
+///
+/// [`SpinLock`] is the one to use -- it is the kernel's own, and it can be
+/// held across the things kernel locks may be held across. This one exists
+/// for the code that cannot have it: netconsole arms its capture ring from
+/// the kernel command line, long before the page allocator can make anything,
+/// and a lock that allocates is a lock it cannot have. Being `const`, it can
+/// also live in a `static` rather than behind a pointer.
+///
+/// Nothing that sleeps may run while it is held, and nothing that takes
+/// longer than a few hundred instructions: interrupts are off on this CPU.
+pub struct IrqSpinLock {
+    held: core::sync::atomic::AtomicBool,
+}
+
+unsafe impl Send for IrqSpinLock {}
+unsafe impl Sync for IrqSpinLock {}
+
+impl IrqSpinLock {
+    pub const fn new() -> Self {
+        Self { held: core::sync::atomic::AtomicBool::new(false) }
+    }
+
+    pub fn lock(&self) -> IrqSpinGuard<'_> {
+        use core::sync::atomic::Ordering;
+
+        /* Interrupts off first: a CPU that takes an interrupt while holding
+         * this, and whose handler takes it again, deadlocks against itself. */
+        let flags = unsafe { ffi::cpu::kernel_irq_save() };
+        while self.held.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        IrqSpinGuard { lock: self, flags }
+    }
+}
+
+pub struct IrqSpinGuard<'a> {
+    lock: &'a IrqSpinLock,
+    flags: usize,
+}
+
+impl Drop for IrqSpinGuard<'_> {
+    fn drop(&mut self) {
+        use core::sync::atomic::Ordering;
+
+        self.lock.held.store(false, Ordering::Release);
+        unsafe { ffi::cpu::kernel_irq_restore(self.flags) };
+    }
+}

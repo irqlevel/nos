@@ -14,6 +14,7 @@ use crate::arp::ArpTable;
 use crate::dhcp::{Dhcp, Lease};
 use crate::dns::{Dns, MAX_DOMAIN_LEN};
 use crate::icmp::{Icmp, Stats};
+use crate::netconsole::{Stats as NetconsoleStats, NETCONSOLE};
 use crate::udp_shell::UdpShell;
 use crate::wire::Mac;
 
@@ -429,4 +430,70 @@ pub extern "C" fn rust_udp_shell_stop() {
     if let Some(shell) = udp_shell() {
         shell.stop();
     }
+}
+
+/* ---- the kernel log over UDP ---- */
+
+/// Arm capture from the kernel command line: 1 armed, 0 not asked for.
+#[no_mangle]
+pub extern "C" fn rust_netconsole_setup() -> i32 {
+    if NETCONSOLE.setup() { 1 } else { 0 }
+}
+
+/// Attach the device and start the drain task: 0 started, -1 not.
+#[no_mangle]
+pub extern "C" fn rust_netconsole_start(dev: usize) -> i32 {
+    let nic = match unsafe { Nic::from_handle(dev) } {
+        Some(nic) => nic,
+        None => return -1,
+    };
+
+    if NETCONSOLE.start(nic) { 0 } else { -1 }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_netconsole_stop() {
+    NETCONSOLE.stop();
+}
+
+#[no_mangle]
+pub extern "C" fn rust_netconsole_enabled() -> i32 {
+    if NETCONSOLE.is_enabled() { 1 } else { 0 }
+}
+
+/// One message into the ring. Called for every line the tracer produces and
+/// from the panic printer, so from any context.
+///
+/// # Safety
+/// `s` points at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn rust_netconsole_log(s: *const u8, len: usize) {
+    if s.is_null() || len == 0 {
+        return;
+    }
+
+    NETCONSOLE.log(unsafe { core::slice::from_raw_parts(s, len) });
+}
+
+#[no_mangle]
+pub extern "C" fn rust_netconsole_panic_mark() {
+    NETCONSOLE.panic_mark();
+}
+
+#[no_mangle]
+pub extern "C" fn rust_netconsole_panic_flush() {
+    NETCONSOLE.panic_flush();
+}
+
+/// What the `netconsole` command reports.
+///
+/// # Safety
+/// `out` points at a Stats.
+#[no_mangle]
+pub unsafe extern "C" fn rust_netconsole_stats(out: *mut NetconsoleStats) {
+    if out.is_null() {
+        return;
+    }
+
+    unsafe { *out = NETCONSOLE.stats() };
 }
