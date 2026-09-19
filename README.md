@@ -41,7 +41,8 @@ deployment in [Run](docs/run.md).
 - [Build](docs/build.md) — native and Docker builds, arm64, the disk image, BIOS vs. UEFI
 - [Run](docs/run.md) — QEMU on x86-64 and arm64, Google Cloud
 - [Real hardware](docs/real-hardware.md) — Dell Latitude 5480 (UEFI, no serial, USB keyboard), Hetzner EX44 (20 CPUs, RTL8125 on the real internet) and Hetzner AX41 (AMD Ryzen, Intel I210, profiler on the PMU)
-- [Debug](docs/debug.md) — GDB, boot and smoke tests, getting a log off a box with no serial port
+- [Debug](docs/debug.md) — GDB, getting a log off a box with no serial port
+- [Tests and gates](docs/testing.md) — boot self-tests, smoke boots, and a gate per subsystem for what a smoke boot cannot notice
 - [Kernel parameters](docs/kernel-parameters.md) — boot-time options via GRUB or QEMU `-append`
 
 How it works, by subsystem:
@@ -51,6 +52,7 @@ How it works, by subsystem:
 - [Scheduler](docs/scheduler.md) — per-CPU run queues, the context switch, preemption, blocking and load balancing
 - [Interrupts](docs/interrupts.md) — the IDT and IOAPIC, MSI-X, GICv3 and the ITS, IPIs, NMI, IRQ balancing, deferred work
 - [Profiler](docs/profiler.md) — sampling on a performance counter or the tick, and how to read a `profile` report
+- [Rust in the kernel](docs/rust.md) — the crates and how they are layered, the types that stand in for `unsafe`, a map of `kcore`, writing a driver
 
 Tools:
 

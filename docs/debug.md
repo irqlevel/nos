@@ -37,34 +37,10 @@ The boot sequence itself, and what each marker means, is in
 [Boot](boot.md); `profile` and its two sample sources are in
 [Profiler](profiler.md).
 
-## Boot tests
+## Tests
 
-There is no separate test binary: self-tests live in `src/cpp/kernel/test.cpp`
-and run early in boot, from `Test::Test()` and `Test::TestMultiTasking()`. A
-failing test returns a non-success `Stdlib::Error`. To run a single test, edit
-`Test()` to call only that function, rebuild, boot, and watch `nos.log`.
-
-`./scripts/smoke-test.sh` (x86-64) and `./scripts/smoke-arm64.sh` (arm64)
-boot the kernel headless and assert the serial markers `After test` →
-`Preempt is now on` → `boot: complete`, failing fast on `PANIC:`. Gate on the
-exit code, never on grepping the output.
-
-`./scripts/parttest.py [--arch aarch64|x86_64]` boots with an MBR disk and
-a GPT disk it writes itself -- no partitioning tool, no privileges -- and
-checks what the kernel made of them: the partitions registered and their
-sizes, both tables as `partitions` prints them, that a partition's sector 0
-is its first sector on the disk and that a read past its end is refused, and
-that a filesystem mounted on a partition keeps writers off the disk it is on.
-
-`./scripts/ext2-test.py` works the ext2 root filesystem from the shell --
-files made, grown past their direct blocks, copied, renamed, removed, a
-directory removed whole -- and then lets `e2fsck -fn` judge the image. The
-boot-time `fstest=on` checks that the driver reads back what it wrote; this
-checks the other half, that what is left on the disk is still a filesystem a
-checker calls clean. arm64 only, because it drives the UDP shell.
-
-`./scripts/wx-test.sh [--arch x86_64|aarch64]` is the W^X test: one boot per
-probe (`wxprobe=text`, `wxprobe=heap`), each of which has to die on the fault
-it asked for, at the address it printed. A kernel that survives a probe
-prints `SUCCEEDED (W^X broken!)` and the script fails — which is how a
-mapping path that stops setting NX gets caught. See [Paging](paging.md).
+The self-tests every boot runs, the smoke boots, and the gate each subsystem
+has for what a smoke boot cannot notice are in [Tests and gates](testing.md).
+The two lines worth knowing by heart: to run a single self-test, edit
+`Test()` in `src/cpp/kernel/test.cpp` to call only that function; and gate
+on a script's exit code, never on grepping its output.

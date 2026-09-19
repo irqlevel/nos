@@ -116,6 +116,14 @@ the crates' own switches to the portable backends:
 --cfg chacha20_force_soft --cfg curve25519_dalek_backend="serial"
 ```
 
+`sha2` has no such `--cfg`: left alone it picks SHA-NI by CPUID at run time,
+and on an application processor, which runs with `CR4.OSFXSR` clear, the
+first block hashed is an invalid opcode. It takes a feature instead, so
+`kernel/Cargo.toml` asks for `force-soft` -- which reaches the TLS client
+too, since a crate is built once for the whole graph -- and so does
+`ssh/Cargo.toml`, because a module is a build of its own that the kernel's
+features do not reach.
+
 `getrandom` has no backend for a bare-metal target either; the `tls` crate
 registers the kernel's entropy pool as its custom one. That pool is what makes
 a handshake work on a machine with no virtio-rng: `FailedToGetRandomBytes` from

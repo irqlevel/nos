@@ -3,7 +3,7 @@
 How files work in `nos`: what gets mounted at boot and how the root is
 chosen, the file API kernel code uses, what the ext2 driver does and does
 not do, and how a root filesystem image is made and checked. The shell side
-is in [Shell commands](shell-commands.md#filesystem).
+is in [Shell commands](shell-commands.md).
 
 ## What is mounted at boot
 
