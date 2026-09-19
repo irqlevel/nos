@@ -492,40 +492,9 @@ fn parse_url(url: &[u8]) -> Option<Url> {
     Some(out)
 }
 
-/// A dotted-quad, or None.
-fn parse_ipv4(text: &[u8]) -> Option<u32> {
-    let mut parts = [0u32; 4];
-    let mut part = 0;
-    let mut digits = 0;
-
-    for &b in text {
-        if b == b'.' {
-            if digits == 0 || part == 3 {
-                return None;
-            }
-            part += 1;
-            digits = 0;
-            continue;
-        }
-        if !b.is_ascii_digit() {
-            return None;
-        }
-        parts[part] = parts[part] * 10 + (b - b'0') as u32;
-        if parts[part] > 255 {
-            return None;
-        }
-        digits += 1;
-    }
-
-    if part != 3 || digits == 0 {
-        return None;
-    }
-    Some((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
-}
-
 /// The address of a host: a literal, or what the resolver says.
 fn resolve(host: &[u8]) -> Option<u32> {
-    if let Some(ip) = parse_ipv4(host) {
+    if let Some(ip) = crate::wire::parse_ipv4(host) {
         return Some(ip);
     }
 

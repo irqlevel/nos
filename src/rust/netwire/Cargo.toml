@@ -1,0 +1,12 @@
+[package]
+name = "netwire"
+version = "0.1.0"
+edition = "2021"
+
+# What is on the wire, and nothing else: no kernel in it, no allocation, no
+# dependency. The network layer is built on it, and so is a loadable module
+# that takes frames apart or puts them together itself -- a module is linked
+# on its own and cannot share the `net` crate, but it can share this.
+[lib]
+
+[dependencies]

@@ -18,45 +18,15 @@ use crate::dns::MAX_DOMAIN_LEN;
 use crate::frame::POOL;
 use crate::netconsole::NETCONSOLE;
 use crate::tcp::TCP;
-use crate::wire::Mac;
+use crate::wire::{Ipv4 as Ip, MacHex};
 
 /// What every command that needs "the" network device looks for, as the C++
 /// did: the first one, which the drivers name eth0.
 const DEFAULT_DEVICE: &str = "eth0";
 
-/// A dotted quad, host byte order, as `Net::IpAddress::Print` wrote it.
-struct Ip(u32);
-
-impl core::fmt::Display for Ip {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}.{}.{}.{}", (self.0 >> 24) & 0xFF, (self.0 >> 16) & 0xFF,
-            (self.0 >> 8) & 0xFF, self.0 & 0xFF)
-    }
-}
-
-/// Six hex pairs, lower case, as `Net::MacAddress::Print` wrote it.
-struct MacHex(Mac);
-
-impl core::fmt::Display for MacHex {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let b = self.0;
-        write!(f, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            b[0], b[1], b[2], b[3], b[4], b[5])
-    }
-}
-
 /// A dotted quad the shell was given, into host byte order.
 fn parse_ip(text: &str) -> Option<u32> {
-    let mut parts = text.split('.');
-    let mut addr = 0u32;
-    for _ in 0..4 {
-        let octet: u32 = parts.next()?.parse().ok()?;
-        if octet > 255 {
-            return None;
-        }
-        addr = (addr << 8) | octet;
-    }
-    if parts.next().is_some() { None } else { Some(addr) }
+    crate::wire::parse_ipv4(text.as_bytes())
 }
 
 /// The device a command works on, or None with the reason said.

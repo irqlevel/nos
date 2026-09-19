@@ -7,6 +7,9 @@ edition = "2021"
 
 [dependencies]
 kcore = { path = "../kcore" }
+# The frame formats, shared with the modules that build their own frames:
+# `net::wire` is this crate.
+netwire = { path = "../netwire" }
 # ICMP tells the C++ TCP about an unreachable; that declaration lives here.
 ffi = { path = "../ffi" }
 # The HTTP client speaks plain TCP or TLS over it.

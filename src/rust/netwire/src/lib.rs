@@ -6,6 +6,14 @@
 //! a read past the end. The kernel is little-endian on both architectures
 //! and the wire is big-endian, so every multi-byte field goes through
 //! `from_be_bytes`/`to_be_bytes` -- there is no host-order path to forget.
+//!
+//! A crate of its own, with no kernel in it, because two things that cannot
+//! share a crate with a kernel in it both need it: the network layer
+//! (`net`, which re-exports it as `net::wire`), and a loadable module that
+//! answers from the receive path or builds its own frames -- linked on its
+//! own, so the layer's statics are not something it can link against.
+
+#![no_std]
 
 /// An Ethernet address.
 pub type Mac = [u8; 6];
@@ -28,6 +36,67 @@ pub const IP_PROTO_UDP: u8 = 17;
 
 pub const UDP_HDR_LEN: usize = 8;
 pub const ICMP_HDR_LEN: usize = 8;
+
+/// An Ethernet frame, headers included, as this stack sends them: no jumbo
+/// frames and no VLAN tag.
+pub const MAX_FRAME: usize = 1514;
+
+/* ---- addresses, as people write them ---- */
+
+/// An IPv4 address in host byte order, which is how the kernel keeps one,
+/// printed as a dotted quad.
+pub struct Ipv4(pub u32);
+
+impl core::fmt::Display for Ipv4 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let b = self.0.to_be_bytes();
+        write!(f, "{}.{}.{}.{}", b[0], b[1], b[2], b[3])
+    }
+}
+
+/// An Ethernet address printed as six hex pairs, lower case.
+pub struct MacHex(pub Mac);
+
+impl core::fmt::Display for MacHex {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let b = self.0;
+        write!(f, "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            b[0], b[1], b[2], b[3], b[4], b[5])
+    }
+}
+
+/// A dotted quad into host byte order, or None: four decimal numbers of at
+/// most 255, three dots, and nothing else -- no sign, no space, no empty
+/// part. Strict, because it is also what tells an address from a host name.
+pub fn parse_ipv4(text: &[u8]) -> Option<u32> {
+    let mut parts = [0u32; 4];
+    let mut part = 0;
+    let mut digits = 0;
+
+    for &b in text {
+        if b == b'.' {
+            if digits == 0 || part == 3 {
+                return None;
+            }
+            part += 1;
+            digits = 0;
+            continue;
+        }
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        parts[part] = parts[part] * 10 + (b - b'0') as u32;
+        if parts[part] > 255 {
+            return None;
+        }
+        digits += 1;
+    }
+
+    if part != 3 || digits == 0 {
+        return None;
+    }
+    Some((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
+}
 
 /* ---- scalars ---- */
 
@@ -223,6 +292,86 @@ pub mod udp {
         set_be16(udp, DST_PORT, dst_port);
         set_be16(udp, LENGTH, (UDP_HDR_LEN + payload_len) as u16);
         set_be16(udp, CHECKSUM, 0);
+    }
+
+    /// What fits in one datagram out of this stack.
+    pub const MAX_PAYLOAD: usize = MAX_FRAME - ETH_HDR_LEN - IP_HDR_LEN - UDP_HDR_LEN;
+
+    /// Where a datagram's payload starts in a frame whose IP header carries
+    /// no options -- which is every frame [`write_frame`] makes.
+    pub const PAYLOAD_AT: usize = ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN;
+
+    /// A received datagram: who it is from, and what it carries.
+    pub struct Datagram<'a> {
+        pub src_ip: u32,
+        pub dst_ip: u32,
+        pub src_port: u16,
+        pub dst_port: u16,
+        pub payload: &'a [u8],
+    }
+
+    /// What a frame off the wire holds, if it holds a whole UDP datagram at
+    /// all.
+    ///
+    /// The IP header's own length is honoured, so a packet carrying options
+    /// puts its UDP header where this looks for it; a length that disagrees
+    /// with the frame is a None rather than a read past the end.
+    pub fn parse(frame: &[u8]) -> Option<Datagram<'_>> {
+        if frame.len() < ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN {
+            return None;
+        }
+
+        let packet = &frame[ETH_HDR_LEN..];
+        let ip_len = ip::header_len(packet);
+        if ip_len == 0 || frame.len() < ETH_HDR_LEN + ip_len + UDP_HDR_LEN {
+            return None;
+        }
+        if ip::protocol(packet) != IP_PROTO_UDP {
+            return None;
+        }
+
+        let datagram = &frame[ETH_HDR_LEN + ip_len..];
+        let length = self::length(datagram) as usize;
+        if length < UDP_HDR_LEN || length > datagram.len() {
+            return None;
+        }
+
+        Some(Datagram {
+            src_ip: ip::src(packet),
+            dst_ip: ip::dst(packet),
+            src_port: src_port(datagram),
+            dst_port: dst_port(datagram),
+            payload: &datagram[UDP_HDR_LEN..length],
+        })
+    }
+
+    /// Who a datagram is from and who it is for, Ethernet addresses included:
+    /// everything [`write_frame`] puts in front of a payload.
+    pub struct Route {
+        pub src_mac: Mac,
+        pub dst_mac: Mac,
+        /// Host byte order, as the rest of the kernel keeps an address.
+        pub src_ip: u32,
+        pub dst_ip: u32,
+        pub src_port: u16,
+        pub dst_port: u16,
+    }
+
+    /// The Ethernet, IP and UDP headers of a datagram of `payload_len` bytes,
+    /// at the start of `frame`; the payload goes at [`PAYLOAD_AT`]. The
+    /// frame's whole length, or None when `frame` has no room for it or the
+    /// payload is more than one datagram holds.
+    pub fn write_frame(frame: &mut [u8], route: &Route, payload_len: usize) -> Option<usize> {
+        let frame_len = PAYLOAD_AT + payload_len;
+        if payload_len > MAX_PAYLOAD || frame.len() < frame_len {
+            return None;
+        }
+
+        eth::write(frame, &route.dst_mac, &route.src_mac, ETH_TYPE_IP);
+        ip::write(&mut frame[ETH_HDR_LEN..], IP_PROTO_UDP, route.src_ip, route.dst_ip,
+                  UDP_HDR_LEN + payload_len, 0);
+        write(&mut frame[ETH_HDR_LEN + IP_HDR_LEN..], route.src_port, route.dst_port, payload_len);
+        Some(frame_len)
     }
 }
 

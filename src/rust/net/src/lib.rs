@@ -1,8 +1,10 @@
 //! The network layer: what is on the wire, and the protocols over it.
 //!
 //! [`wire`] is the frame formats -- Ethernet, ARP, IP, UDP, ICMP -- read and
-//! written through byte slices, with the internet checksum. The protocol
-//! modules sit on it, and reach the devices through [`nic`].
+//! written through byte slices, with the internet checksum: the `netwire`
+//! crate, which has no kernel in it so that a loadable module can use it
+//! too. The protocol modules sit on it, and reach the devices through
+//! [`nic`].
 //!
 //! A NIC's driver depends on this crate and registers with [`register`]; the
 //! C++ side calls in by the `rust_net_*` names, and a loadable module by the
@@ -30,7 +32,9 @@ pub mod tcp;
 pub mod udp;
 pub mod udp_shell;
 pub mod wget;
-pub mod wire;
+
+/// The frame formats: a crate of their own, shared with the modules.
+pub use netwire as wire;
 
 pub use device::{NetDriver, RxQueue, TxQueue};
 pub use frame::{Frame, FrameQueue};
