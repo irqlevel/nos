@@ -236,8 +236,8 @@ takes every function named in an `extern "C"` block of the `ffi` crate that the
 kernel defines, and writes their names and addresses into
 `out/<arch>/module_exports.S`, which the final link takes in. So what a module
 can call is what an in-kernel Rust driver can call; adding a kernel service
-for modules is the same three steps as adding one for the drivers (see
-`.cursor/rules/rust-kernel-conventions.mdc`), and the table picks it up.
+for modules is the same three steps as adding one for the drivers (see the
+Rust section of `CLAUDE.md`), and the table picks it up.
 
 A module compiled against one version of those declarations and loaded into
 a kernel built from another would call functions with arguments they no
