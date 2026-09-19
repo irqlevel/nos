@@ -10,7 +10,6 @@
 use alloc::vec::Vec;
 
 use kcore::net::Nic;
-use kcore::tcp::TcpSocket;
 use kcore::trace;
 use tls::TlsStream;
 
@@ -89,7 +88,31 @@ impl Response {
 enum Transport {
     Plain(&'static Conn),
     /// The session, over a connection that stays this client's to close
-    Tls(TlsStream),
+    Tls(TlsStream<TcpPipe>),
+}
+
+/// A connection of this layer, as the TLS crate below it takes one: that
+/// crate cannot name `Conn`, so it takes anything that sends and receives.
+struct TcpPipe(&'static Conn);
+
+impl tls::Transport for TcpPipe {
+    fn send_all(&mut self, mut buf: &[u8]) -> bool {
+        while !buf.is_empty() {
+            let sent = TCP.send(self.0, buf, 0);
+            if sent <= 0 {
+                return false;
+            }
+            buf = &buf[sent as usize..];
+        }
+        true
+    }
+
+    fn recv(&mut self, buf: &mut [u8], timeout_ms: u64) -> isize {
+        if buf.is_empty() {
+            return 0;
+        }
+        TCP.recv(self.0, buf, timeout_ms)
+    }
 }
 
 impl Transport {
@@ -714,10 +737,9 @@ fn exchange(
     /* TLS goes on top of that connection; the connection below is closed
      * here either way. */
     let mut transport = if parsed.tls {
-        let socket = TcpSocket::from_raw(conn as *const Conn as *mut core::ffi::c_void);
         let session = core::str::from_utf8(parsed.host())
             .ok()
-            .and_then(|host| TlsStream::connect(socket, host));
+            .and_then(|host| TlsStream::connect(TcpPipe(conn), host));
         match session {
             Some(stream) => Transport::Tls(stream),
             None => {

@@ -32,9 +32,9 @@ What the kernel supplies, and already had:
       |         |
     Plain      Tls
       |         |
-      |     TlsStream            src/rust/tls
+      |     TlsStream<T>         src/rust/tls
       |         |  rustls, rustls-rustcrypto, webpki-roots
-      |     TcpSocket -> kernel_tcp_send / kernel_tcp_recv
+      |     T: tls::Transport    implemented by http.rs for its connection
       |         |
       +------  TCP               src/rust/net/src/tcp.rs
 ```
@@ -44,11 +44,14 @@ redirects and the body sink all sit above it and neither know nor care
 whether the bytes are encrypted. Adding TLS did not change any of them.
 
 The connection belongs to the HTTP client -- `exchange` opens it and closes
-it. The session borrows it as a `kcore::tcp::TcpSocket` and calls back down
-through `kernel_tcp_send` / `kernel_tcp_recv`, the same names a loadable
-module reaches TCP by: `tls` is a crate of its own with no view of the
-network layer's insides, and `net` depends on it like on any other crate --
-`TlsStream::connect`, `send`, `recv`, and a drop that says close_notify.
+it. `tls` is a crate of its own, *below* the network layer -- `net` depends
+on it like on any other crate: `TlsStream::connect`, `send`, `recv`, and a
+drop that says close_notify -- so it cannot name a connection of that layer.
+It takes anything that implements its `Transport` trait (`send_all`, `recv`
+with a timeout) instead, and `http.rs` hands it its connection as one. No C
+ABI is involved: the session used to call back down through
+`kernel_tcp_send` / `kernel_tcp_recv`, the names a loadable module reaches
+TCP by, and those are now the modules' alone.
 
 ## The unbuffered API
 

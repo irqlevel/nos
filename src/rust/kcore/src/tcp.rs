@@ -8,9 +8,14 @@ use crate::net::Nic;
 /// (Tcp::Recv's TcpRecvTimeout).
 pub const RECV_TIMEOUT: isize = -2;
 
+/// No bound on the wait for room: what `send_all` sends with.
+const WAIT_FOREVER_MS: u64 = 0;
+
 fn send_all(conn: *mut c_void, mut buf: &[u8]) -> bool {
     while !buf.is_empty() {
-        let sent = unsafe { tcp::kernel_tcp_send(conn, buf.as_ptr(), buf.len()) };
+        let sent = unsafe {
+            tcp::kernel_tcp_send_timeout(conn, buf.as_ptr(), buf.len(), WAIT_FOREVER_MS)
+        };
         if sent <= 0 {
             return false;
         }
@@ -24,34 +29,6 @@ fn recv(conn: *mut c_void, buf: &mut [u8], timeout_ms: u64) -> isize {
         return 0;
     }
     unsafe { tcp::kernel_tcp_recv(conn, buf.as_mut_ptr(), buf.len(), timeout_ms) }
-}
-
-/* A TCP connection somebody else opened and owns. The handle is passed in,
-   used, and never closed here: whoever opened it closes it. */
-pub struct TcpSocket {
-    conn: *mut c_void,
-}
-
-/* One task uses it at a time; the kernel's calls take their own locks */
-unsafe impl Send for TcpSocket {}
-
-impl TcpSocket {
-    /// The connection a handle names. Any word will do: the network layer
-    /// looks up every handle it is given, and one that names no connection
-    /// of its pool sends nothing and receives an error.
-    pub fn from_raw(conn: *mut c_void) -> Self {
-        Self { conn }
-    }
-
-    /// Sends the whole buffer; false if the connection failed part way.
-    pub fn send_all(&mut self, buf: &[u8]) -> bool {
-        send_all(self.conn, buf)
-    }
-
-    /// Bytes read, 0 at EOF, negative on error or timeout.
-    pub fn recv(&mut self, buf: &mut [u8], timeout_ms: u64) -> isize {
-        recv(self.conn, buf, timeout_ms)
-    }
 }
 
 /// A TCP port listened on, on one device. Dropped, it closes the port: a

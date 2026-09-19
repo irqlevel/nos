@@ -14,7 +14,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use kcore::tcp::TcpSocket;
 use kcore::trace;
 use rustls::client::UnbufferedClientConnection;
 use rustls::pki_types::{ServerName, UnixTime};
@@ -74,9 +73,24 @@ enum Step {
     Closed,
 }
 
-pub struct TlsStream {
+/// What a session runs over: a byte stream somebody else opened, and closes.
+///
+/// A trait rather than a TCP type, because this crate sits *under* the
+/// network layer -- the HTTP client there speaks TLS through it -- and so
+/// cannot name a connection of that layer. The layer hands its connection in
+/// as one of these.
+pub trait Transport {
+    /// Sends the whole buffer; false if the connection failed part way.
+    fn send_all(&mut self, buf: &[u8]) -> bool;
+
+    /// Bytes read, 0 at the end of the stream, negative on an error or when
+    /// `timeout_ms` went by with nothing received.
+    fn recv(&mut self, buf: &mut [u8], timeout_ms: u64) -> isize;
+}
+
+pub struct TlsStream<T: Transport> {
     conn: UnbufferedClientConnection,
-    sock: TcpSocket,
+    sock: T,
     /* TLS bytes read from the socket and not yet processed */
     incoming: Vec<u8>,
     incoming_used: usize,
@@ -91,16 +105,16 @@ pub struct TlsStream {
     failed: bool,
 }
 
-impl TlsStream {
+impl<T: Transport> TlsStream<T> {
     /// A session over a connection somebody else opened, and closes: `host`
     /// is who the certificate has to be for. None when the handshake is
     /// refused -- the certificate, the name, or no protocol in common.
-    pub fn connect(sock: TcpSocket, host: &str) -> Option<Self> {
+    pub fn connect(sock: T, host: &str) -> Option<Self> {
         let mut stream = Self::new(sock, host)?;
         if stream.handshake() { Some(stream) } else { None }
     }
 
-    fn new(sock: TcpSocket, host: &str) -> Option<Self> {
+    fn new(sock: T, host: &str) -> Option<Self> {
         let server_name = match ServerName::try_from(host) {
             Ok(name) => name.to_owned(),
             Err(e) => {
@@ -401,7 +415,7 @@ impl TlsStream {
 
 /// Sends close_notify. The TCP connection itself stays open, and is closed
 /// by whoever opened it.
-impl Drop for TlsStream {
+impl<T: Transport> Drop for TlsStream<T> {
     fn drop(&mut self) {
         self.close();
     }
