@@ -100,26 +100,32 @@ pub fn parse_ipv4(text: &[u8]) -> Option<u32> {
 
 /* ---- scalars ---- */
 
+#[inline]
 pub fn be16(buf: &[u8], off: usize) -> u16 {
     u16::from_be_bytes([buf[off], buf[off + 1]])
 }
 
+#[inline]
 pub fn be32(buf: &[u8], off: usize) -> u32 {
     u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
+#[inline]
 pub fn set_be16(buf: &mut [u8], off: usize, v: u16) {
     buf[off..off + 2].copy_from_slice(&v.to_be_bytes());
 }
 
+#[inline]
 pub fn set_be32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 
+#[inline]
 pub fn be64(buf: &[u8], off: usize) -> u64 {
     ((be32(buf, off) as u64) << 32) | be32(buf, off + 4) as u64
 }
 
+#[inline]
 pub fn set_be64(buf: &mut [u8], off: usize, v: u64) {
     buf[off..off + 8].copy_from_slice(&v.to_be_bytes());
 }
@@ -133,23 +139,27 @@ pub mod eth {
     pub const SRC: usize = 6;
     pub const TYPE: usize = 12;
 
+    #[inline]
     pub fn dst(frame: &[u8]) -> Mac {
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&frame[DST..DST + 6]);
         mac
     }
 
+    #[inline]
     pub fn src(frame: &[u8]) -> Mac {
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&frame[SRC..SRC + 6]);
         mac
     }
 
+    #[inline]
     pub fn ether_type(frame: &[u8]) -> u16 {
         be16(frame, TYPE)
     }
 
     /// Fill the header at the start of `frame`.
+    #[inline]
     pub fn write(frame: &mut [u8], dst: &Mac, src: &Mac, ether_type: u16) {
         frame[DST..DST + 6].copy_from_slice(dst);
         frame[SRC..SRC + 6].copy_from_slice(src);
@@ -173,10 +183,12 @@ pub mod arp {
     pub const TARGET_MAC: usize = 18;
     pub const TARGET_IP: usize = 24;
 
+    #[inline]
     pub fn opcode(arp: &[u8]) -> u16 {
         be16(arp, OPCODE)
     }
 
+    #[inline]
     pub fn sender_mac(arp: &[u8]) -> Mac {
         let mut mac = [0u8; 6];
         mac.copy_from_slice(&arp[SENDER_MAC..SENDER_MAC + 6]);
@@ -184,15 +196,18 @@ pub mod arp {
     }
 
     /// Host byte order, as the rest of the kernel keeps an address.
+    #[inline]
     pub fn sender_ip(arp: &[u8]) -> u32 {
         be32(arp, SENDER_IP)
     }
 
+    #[inline]
     pub fn target_ip(arp: &[u8]) -> u32 {
         be32(arp, TARGET_IP)
     }
 
     /// A request or a reply, filled into `arp`.
+    #[inline]
     pub fn write(
         arp: &mut [u8], opcode: u16, sender_mac: &Mac, sender_ip: u32,
         target_mac: &Mac, target_ip: u32,
@@ -234,27 +249,33 @@ pub mod ip {
 
     /// The header's own length in bytes, which a packet with options makes
     /// longer than 20. 0 when the field says something impossible.
+    #[inline]
     pub fn header_len(ip: &[u8]) -> usize {
         let words = (ip[VERSION_IHL] & 0x0F) as usize;
         if words < 5 { 0 } else { words * 4 }
     }
 
+    #[inline]
     pub fn version(ip: &[u8]) -> u8 {
         ip[VERSION_IHL] >> 4
     }
 
+    #[inline]
     pub fn total_len(ip: &[u8]) -> u16 {
         be16(ip, TOTAL_LEN)
     }
 
+    #[inline]
     pub fn protocol(ip: &[u8]) -> u8 {
         ip[PROTOCOL]
     }
 
+    #[inline]
     pub fn src(ip: &[u8]) -> u32 {
         be32(ip, SRC)
     }
 
+    #[inline]
     pub fn dst(ip: &[u8]) -> u32 {
         be32(ip, DST)
     }
@@ -263,16 +284,19 @@ pub mod ip {
     /// or it is not the first. There is no reassembly in this kernel, so a
     /// fragment is never anybody's -- and what follows the IP header of one
     /// that is not the first is not a transport header at all.
+    #[inline]
     pub fn is_fragment(ip: &[u8]) -> bool {
         be16(ip, FRAG_OFF) & (MORE_FRAGMENTS | FRAG_OFFSET_MASK) != 0
     }
 
     /// A 20-byte header with no options, checksum included.
+    #[inline]
     pub fn write(ip: &mut [u8], protocol: u8, src: u32, dst: u32, payload_len: usize, id: u16) {
         write_flags(ip, protocol, src, dst, payload_len, id, 0)
     }
 
     /// As `write`, with the flags word given: `DONT_FRAGMENT`, or 0.
+    #[inline]
     pub fn write_flags(
         ip: &mut [u8], protocol: u8, src: u32, dst: u32, payload_len: usize, id: u16, flags: u16,
     ) {
@@ -302,14 +326,17 @@ pub mod udp {
     pub const LENGTH: usize = 4;
     pub const CHECKSUM: usize = 6;
 
+    #[inline]
     pub fn src_port(udp: &[u8]) -> u16 {
         be16(udp, SRC_PORT)
     }
 
+    #[inline]
     pub fn dst_port(udp: &[u8]) -> u16 {
         be16(udp, DST_PORT)
     }
 
+    #[inline]
     pub fn length(udp: &[u8]) -> u16 {
         be16(udp, LENGTH)
     }
@@ -317,6 +344,7 @@ pub mod udp {
     /// The header only; the payload is the caller's to put after it. The
     /// checksum is left at 0, which IPv4 allows and this stack has always
     /// sent.
+    #[inline]
     pub fn write(udp: &mut [u8], src_port: u16, dst_port: u16, payload_len: usize) {
         set_be16(udp, SRC_PORT, src_port);
         set_be16(udp, DST_PORT, dst_port);
@@ -349,6 +377,7 @@ pub mod udp {
     /// The IP header's own length is honoured, so a packet carrying options
     /// puts its UDP header where this looks for it; a length that disagrees
     /// with the frame is a None rather than a read past the end.
+    #[inline]
     pub fn parse(frame: &[u8]) -> Option<Datagram<'_>> {
         if frame.len() < ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN {
             return None;
@@ -399,6 +428,7 @@ pub mod udp {
     /// at the start of `frame`; the payload goes at [`PAYLOAD_AT`]. The
     /// frame's whole length, or None when `frame` has no room for it or the
     /// payload is more than one datagram out of this stack holds.
+    #[inline]
     pub fn write_frame(frame: &mut [u8], route: &Route, payload_len: usize) -> Option<usize> {
         let frame_len = PAYLOAD_AT + payload_len;
         if payload_len > MAX_PAYLOAD || frame.len() < frame_len {
@@ -415,6 +445,7 @@ pub mod udp {
     /// that knows its path takes a larger frame than this stack's own sends.
     /// None when `headers` is short or the lengths would not fit their
     /// fields.
+    #[inline]
     pub fn write_headers(headers: &mut [u8], route: &Route, payload_len: usize) -> Option<()> {
         if headers.len() < PAYLOAD_AT
             || payload_len > u16::MAX as usize - IP_HDR_LEN - UDP_HDR_LEN
@@ -451,24 +482,29 @@ pub mod icmp {
     pub const PROTO_UNREACH: u8 = 2;
     pub const PORT_UNREACH: u8 = 3;
 
+    #[inline]
     pub fn kind(icmp: &[u8]) -> u8 {
         icmp[TYPE]
     }
 
+    #[inline]
     pub fn code(icmp: &[u8]) -> u8 {
         icmp[CODE]
     }
 
+    #[inline]
     pub fn id(icmp: &[u8]) -> u16 {
         be16(icmp, ID)
     }
 
+    #[inline]
     pub fn seq(icmp: &[u8]) -> u16 {
         be16(icmp, SEQ)
     }
 
     /// The header, with the checksum taken over it and everything after it
     /// within `len` -- which is what an ICMP checksum covers.
+    #[inline]
     pub fn write(icmp: &mut [u8], kind: u8, code: u8, id: u16, seq: u16, len: usize) {
         icmp[TYPE] = kind;
         icmp[CODE] = code;
@@ -509,32 +545,39 @@ pub mod tcp {
     pub const OPT_MSS: u8 = 2;
     pub const OPT_MSS_LEN: u8 = 4;
 
+    #[inline]
     pub fn src_port(seg: &[u8]) -> u16 {
         be16(seg, SRC_PORT)
     }
 
+    #[inline]
     pub fn dst_port(seg: &[u8]) -> u16 {
         be16(seg, DST_PORT)
     }
 
+    #[inline]
     pub fn seq(seg: &[u8]) -> u32 {
         be32(seg, SEQ)
     }
 
+    #[inline]
     pub fn ack(seg: &[u8]) -> u32 {
         be32(seg, ACK)
     }
 
+    #[inline]
     pub fn flags(seg: &[u8]) -> u8 {
         seg[FLAGS]
     }
 
+    #[inline]
     pub fn window(seg: &[u8]) -> u16 {
         be16(seg, WINDOW)
     }
 
     /// The header's own length in bytes, options included. 0 when the field
     /// says something shorter than a header.
+    #[inline]
     pub fn header_len(seg: &[u8]) -> usize {
         let words = (seg[DATA_OFF] >> 4) as usize;
         if words < 5 { 0 } else { words * 4 }
@@ -543,6 +586,7 @@ pub mod tcp {
     /// The header, with no checksum yet: the caller takes it once the payload
     /// is in place, over the pseudo-header too.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub fn write(
         seg: &mut [u8], src_port: u16, dst_port: u16, seq: u32, ack: u32,
         header_len: usize, flags: u8, window: u16,
@@ -596,6 +640,7 @@ pub mod tcp {
     /// The checksum a TCP segment carries: over the pseudo-header of
     /// addresses, protocol and length, then the segment itself. Answers 0
     /// over a segment whose own checksum is right.
+    #[inline]
     pub fn checksum(src_ip: u32, dst_ip: u32, segment: &[u8]) -> u16 {
         let mut sum: u32 = 0;
 
@@ -626,6 +671,7 @@ pub mod tcp {
 
 /// The internet checksum (RFC 1071): the one's complement of the one's
 /// complement sum of the 16-bit words, with an odd last byte padded.
+#[inline]
 pub fn checksum(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 

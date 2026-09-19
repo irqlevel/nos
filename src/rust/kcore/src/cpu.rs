@@ -3,6 +3,7 @@
  * which no longer matched the kernel and which nothing used. */
 
 /// Returns the logical index of the current CPU.
+#[inline]
 pub fn id() -> u32 {
     ffi::cpu::kernel_get_cpu_id()
 }

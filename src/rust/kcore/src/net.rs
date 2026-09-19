@@ -73,6 +73,7 @@ pub struct Lent<'a> {
 
 impl Lent<'_> {
     /// The frame's bytes, Ethernet header first.
+    #[inline]
     pub fn bytes(&self) -> &[u8] {
         /* The receive path holds the frame for the whole call, which
          * outlives this borrow, and does not write it meanwhile. */
@@ -82,6 +83,7 @@ impl Lent<'_> {
     /// The frame, to keep past the call -- to answer in, where it lies. The
     /// receive path's own reference is then not the last, and it never looks
     /// at the bytes again.
+    #[inline]
     pub fn retain(self) -> NetFrame {
         unsafe { NetFrame::retain(self.handle) }
     }
@@ -155,6 +157,7 @@ impl Nic {
     }
 
     /// Its address, host byte order; 0 until it has one.
+    #[inline]
     pub fn ip(&self) -> u32 {
         net::kernel_net_ip(self.handle)
     }
@@ -202,6 +205,7 @@ impl Nic {
     /// `transmit` and `TxBatch::send` release what finds no room; a sender
     /// that asks first, and builds no more than the answer, loses nothing
     /// that way while it is the only one sending.
+    #[inline]
     pub fn tx_room(&self) -> usize {
         net::kernel_net_tx_room(self.handle)
     }
@@ -218,6 +222,7 @@ impl Nic {
 
     /// Queues a frame to transmit; false when the queue had no room and it
     /// was dropped.
+    #[inline]
     pub fn transmit(&self, frame: NetFrame) -> bool {
         let handle = frame.into_raw();
         unsafe { net::kernel_net_submit_tx(self.handle, &handle, 1) == 1 }
@@ -279,19 +284,23 @@ impl<const N: usize> TxBatch<N> {
         Self { frames: [0; N], len: 0 }
     }
 
+    #[inline]
     pub fn is_full(&self) -> bool {
         self.len >= N
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Takes the frame. False, and the frame released, when there is no room.
+    #[inline]
     pub fn push(&mut self, frame: NetFrame) -> bool {
         if self.is_full() {
             return false;
@@ -311,6 +320,7 @@ impl<const N: usize> TxBatch<N> {
 
     /// Everything gathered, to the device: how many it queued. The rest it
     /// releases, and the batch is empty either way.
+    #[inline]
     pub fn send(&mut self, nic: &Nic) -> usize {
         /* Each is a reference `push` took over, given up here. */
         let queued = unsafe { nic.transmit_raw(&self.frames[..self.len]) };
@@ -335,6 +345,7 @@ pub struct NetFrame {
 }
 
 impl NetFrame {
+    #[inline]
     fn raw(&self) -> usize {
         self.handle.get()
     }
@@ -378,6 +389,7 @@ impl NetFrame {
     /// Note: for a freshly allocated RX frame `len()` is 0 until `set_len` is
     /// called. Use `data_raw_mut(capacity)` to access the full buffer before
     /// the length is known (e.g. for memcpy-based drivers).
+    #[inline]
     pub fn data(&self) -> &[u8] {
         let ptr = unsafe { net::kernel_netframe_data(self.raw()) };
         let len = unsafe { net::kernel_netframe_len(self.raw()) };
@@ -386,6 +398,7 @@ impl NetFrame {
 
     /// Mutable slice of the received/transmitted data (length = `self.len()`).
     /// See `data()` for the note on freshly allocated RX frames.
+    #[inline]
     pub fn data_mut(&mut self) -> &mut [u8] {
         let ptr = unsafe { net::kernel_netframe_data(self.raw()) };
         let len = unsafe { net::kernel_netframe_len(self.raw()) };
@@ -444,6 +457,7 @@ impl NetFrame {
     /// A frame's word. Zero is the kernel's "no frame" and never a frame:
     /// a caller that passes it has broken what `retain` and `from_raw` ask,
     /// and is told so rather than left holding a frame that is not one.
+    #[inline]
     fn word(handle: usize) -> core::num::NonZeroUsize {
         core::num::NonZeroUsize::new(handle).expect("a frame handle is never 0")
     }

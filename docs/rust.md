@@ -58,6 +58,26 @@ into netconsole and the disk log, the idle path into the receive poll, boot
 into the frame pool, TCP, the services and the mounts, the C++ part of the
 shell into files.
 
+**Small functions that cross a crate boundary are `#[inline]`.** The build
+has no LTO, so a function in another crate can only be inlined if its body
+travels with the crate's metadata, and for anything that is not generic that
+takes the attribute. Without it a two-instruction accessor is a call, with
+its own bounds checks that the caller's cannot cancel -- and a module pays it
+twice over, being another crate to everything. That is what `netwire`'s
+accessors and header writers carry it for, and `kcore`'s per-frame wrappers
+(`Lent`, `NetFrame`, `TxBatch`, `cpu::id`, `time::boot_time_ns`; the ring,
+the event and the block calls had it already). It was measured, not
+guessed. Moving the frame formats out of `net`, and the load target out of
+the image, took its echo handler from 8 calls a packet to 18; with the
+attributes it is 10, seven of them the calls into the kernel that a module
+cannot avoid. In the image the same move took TCP's `send_segment` from 1
+call into the formats to 4 and ICMP's echo answer from 5 to 8; with the
+attributes both have none, and there are 2 such call sites left outside the
+self-test where there were 57. Count them the same way after adding to
+either crate:
+`llvm-objdump -d -C` on the `.ko` or the kernel, and the `bl` instructions in
+the handler.
+
 One consequence: a disk's or a NIC's driver cannot be a loadable module
 today. It registers with its layer as a trait object from inside the image,
 and there is no C name for a module to bind. A module *uses* disks and NICs
