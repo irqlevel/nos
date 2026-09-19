@@ -128,7 +128,7 @@ the previous control word: the address must not change while the entry is
 unmasked. `EntryLock` serialises all of that against a concurrent `Mask`.
 
 Rust drivers reach the same table through the FFI
-(`kernel_msix_create` / `kernel_msix_enable_vector` / …); their vectors land
+(`kernel_msix_create` / `kernel_msix_register_handler` / …); their vectors land
 in 32 pre-generated stub slots that dispatch to the registered Rust closure
 under a read-write lock, with an in-flight counter so unregistering can wait
 out an ISR that is mid-call.
