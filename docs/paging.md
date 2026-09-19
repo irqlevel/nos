@@ -147,7 +147,8 @@ entries, because it runs with the page-table lock held.
 **`PageAllocatorImpl`** — eight `FixedPageAllocator` buckets, for 1, 2, 4 …
 128 pages. The VA arena starts where `PageArray` ends and spans 70% of the
 free page count; each bucket gets an eighth of it and tracks it with a
-`VaAllocator` bitmap, whose blocks are aligned to their own size. The
+`VaAllocator` bitmap (`mm/va_allocator.h`), whose blocks are aligned to their
+own size. The
 `Mm::` surface on top of it (`mm/new.h`):
 
 | API | Allocates frames? | Tracked VA? | Frees frames on release? |
@@ -172,8 +173,12 @@ replaceable plain form is implicitly potentially-throwing, so the compiler
 runs the constructor on the result unchecked and may delete a caller's null
 test — a null check after plain `new` is dead code. An allocation that wants
 to observe OOM must use `new (Mm::NoThrow) T(...)` or
-`Mm::TAlloc<T, Tag>()`, both of which are checked. The reasoning is in
-`mm/new.h`.
+`Mm::TAlloc<T, Tag>()`, both of which are checked; from `Stdlib::` code the
+tag is spelled in full, `new (Kernel::Mm::NoThrow) T[...]`, as in
+`lib/vector.h`. The reasoning is in `mm/new.h`. There is no way to make the
+plain form nullable instead: a `noexcept` redeclaration of it does not
+compile, and the toolchain's clang parses `-fcheck-new` without implementing
+it.
 
 ## MMIO, cacheability and W^X
 

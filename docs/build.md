@@ -6,8 +6,8 @@ The build is parameterized by `ARCH` (default `x86_64`, or `aarch64`); objects g
 
 Requires clang, nasm, ld, grub-mkrescue with `xorriso` + `mtools`, and a **nightly**
 rustup toolchain with the `rust-src` component — the Rust staticlib uses `-Z build-std`
-to rebuild `core`/`alloc` with `-Ccode-model=large`; `src/rust/rust-toolchain.toml` pins
-the exact nightly:
+to rebuild `core`/`alloc` with `-Ccode-model=large`, and `#![feature(alloc_error_handler)]`
+for its out-of-memory hook; `src/rust/rust-toolchain.toml` pins the exact nightly:
 
 ```sh
 make
@@ -16,6 +16,29 @@ make
 `make` runs `cppcheck` static analysis first (`make check`) and fails on any
 finding; `make nocheck` skips it. `make smoke` builds in Docker and runs the
 headless boot smoke test (`scripts/smoke-test.sh`).
+
+## Three things the Makefile will not tell you
+
+**Source lists are explicit, not globbed.** The Makefile has two
+hand-written lists, `CXX_SRC_x86_64` and `CXX_SRC_aarch64` (plus `ASM_SRC_*`
+for NASM and `ASM_S_SRC_*` for GNU-as). A new `.cpp` that is in neither is
+silently not compiled, and portable code has to be added to **both**. Common
+driver code that names an x86-only entry point gets an unreachable link stub
+in `src/cpp/arch/arm64/x86_driver_stubs.cpp` rather than an `#ifdef`.
+
+**Dependency files go stale.** After moving, renaming or deleting a header,
+run a clean build, or delete the `.d` files in `out/` that still name the
+old path. Make reports one as `No rule to make target`, not as an error in
+any source file -- which is one more reason to gate on the exit code of a
+build and not on what it printed.
+
+**The link is two-pass.** Stack traces resolve symbols from a table baked
+into the kernel: the build links `out/$(ARCH)/pass1.elf`, runs `nm` over it
+to generate `out/$(ARCH)/symtab_data.cpp`, and then links the final ELF (the
+`symtab_data` rules in the `Makefile`). The table of functions a loadable
+module may call is made from the same first pass
+([Loadable modules](modules.md#what-a-module-may-call)). Anything that
+touches the link or symbol resolution has to keep both passes working.
 
 ## No network during a build
 
