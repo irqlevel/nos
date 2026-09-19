@@ -204,9 +204,25 @@ class Test:
             m = re.search(r"refused (\d+)", out)
             return (int(m.group(1)) if m else -1), out.count("logging in")
 
+        def connections():
+            m = re.search(r"connections (\d+)", sh.run("sshd"))
+            return int(m.group(1)) if m else -1
+
+        # Drained means the server has seen the last of the burst, not that
+        # it has seen none of it yet: "nobody logging in" is just as true
+        # before the first probe arrives, and the shell answers faster than
+        # the user network delivers -- the stragglers then land in the count
+        # below and are taken for the refusals it is looking for. So: nobody
+        # logging in, and a connection count that has stopped moving.
         start = time.time()
-        while server_view()[1] != 0 and time.time() - start < 30:
+        seen, quiet_since = connections(), time.time()
+        while time.time() - start < 60:
             time.sleep(1)
+            now = connections()
+            if now != seen or server_view()[1] != 0:
+                seen, quiet_since = now, time.time()
+            elif time.time() - quiet_since >= 3:
+                break
         refused_before = server_view()[0]
         idle = [socket.create_connection(("127.0.0.1", SSH_PORT), timeout=10) for _ in range(6)]
         start = time.time()
