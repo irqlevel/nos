@@ -78,7 +78,7 @@ carries `udpshell=`; the code they test is the same on either architecture.
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
-| `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener |
+| `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 
 ### `wx-test.sh` -- W^X
@@ -221,8 +221,20 @@ the receive path, so this is what tests the typed listener a module is
 given -- a handler the listener owns, frames lent, the end of a batch told
 (`kcore::net`) -- and the C ABI under it.
 
-It takes about six minutes: 88 round trips with a three-second collection
-window each, by design.
+And the tick's receive poll, which nothing but `rxpoll=on` turns on. When
+that stopped being true nothing showed: the switch lived in the C++ function
+the tick called, went with `src/cpp/net`, and from then on every tick
+polled. Under a flood the receive softirq ran on two CPUs in turn -- the
+BSP, whose tick it is, and the one the NIC interrupts -- with an IPI at
+each handover, and on the AX41 took 70% of each of two CPUs where it had
+taken one, while every rate held. So at the end of all the above, booted
+without the switch, `net` has to say the tick never polled; and a second,
+short boot with `rxpoll=on` has to show it polling, since a switch that no
+longer turns the poll on fails as quietly. The switch is in common code,
+`DeviceTable::poll_rx`, so the arm64 boots cover both architectures.
+
+It takes about seven minutes: 88 round trips with a three-second collection
+window each, by design, and the second boot.
 
 `--arch x86_64` is the short form, a minute of it: `nos.iso`, a root that
 carries the module and an `/etc/rc` that loads it, starts the target and

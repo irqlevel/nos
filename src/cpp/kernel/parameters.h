@@ -91,7 +91,8 @@ public:
        stall, not a proven fix, and on the machine it was meant to help the
        stall arrived sooner with it on than with it off. Left behind a switch
        so the two can be compared without a rebuild, which is the only way to
-       tell on a box whose console is a UDP socket. */
+       tell on a box whose console is a UDP socket. The network layer's
+       poll asks (kernel_param_rxpoll_on); the tick only offers. */
     bool IsRxPollEnabled();
 
     /* loglevel=N: the trace level to boot with. Defaults to what main sets

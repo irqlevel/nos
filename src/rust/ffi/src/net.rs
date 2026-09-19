@@ -112,4 +112,6 @@ unsafe extern "C" {
     pub safe fn kernel_param_dhcp_off() -> i32;
     /// `dns=on`: start a resolver on a lease's DNS server.
     pub safe fn kernel_param_dns_on() -> i32;
+    /// `rxpoll=on`: the tick looks at the receive path as well as the NIC.
+    pub safe fn kernel_param_rxpoll_on() -> i32;
 }

@@ -18,7 +18,8 @@
    ticks itself — no per-tick IPI broadcast, and each CPU schedules
    independently. Timekeeping reads CNTVCT directly (time_arm64.cpp). */
 
-/* The network layer is Rust (src/rust/net). */
+/* The network layer is Rust (src/rust/net): a receive pass offered from the
+   tick, which it takes only with rxpoll=on. */
 extern "C" void rust_net_poll_rx();
 
 namespace Kernel
@@ -112,8 +113,9 @@ void GenericTimer::LocalTick(Context* ctx)
     {
         TimerTable::GetInstance().ProcessTimers();
 
-        /* And look at the receive path, whether or not a NIC asked. See
-           the network layer's poll. */
+        /* And offer the receive path a look, whether or not a NIC asked.
+           The network layer takes it only with rxpoll=on -- the switch is
+           in its poll, DeviceTable::poll_rx, not here. */
         rust_net_poll_rx();
     }
 
