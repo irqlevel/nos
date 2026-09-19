@@ -46,6 +46,11 @@ and of the module:
   - loaded again, it starts again on the same port
   - the frame pool ends where it began: no frame is left kept
 
+and of the tick's receive poll, which nothing but `rxpoll=on` turns on:
+
+  - booted without it, the tick has not polled once by the end of all that
+  - booted again with it, the tick polls
+
     scripts/netload-test.py [--arch aarch64|x86_64] [--tcg] [--keep] [--nic igb]
 
 All of that is arm64, because it drives the shell over UDP and the arm64
@@ -219,6 +224,78 @@ def in_flight(sh):
     return (int(found.group(1)) if found else None), out
 
 
+def udp_socket():
+    """A non-blocking socket with room for a whole burst of echoes. Under KVM
+    the guest answers faster than the burst is sent, and Linux's default
+    receive buffer -- about 208 KiB, charged per datagram with its overhead --
+    holds some 220 of them: the rest were dropped by this host, and the test
+    failed on its own socket. SO_RCVBUFFORCE (as root) passes rmem_max."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    for opt in (getattr(socket, "SO_RCVBUFFORCE", 33), socket.SO_RCVBUF):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, 8 << 20)
+            break
+        except OSError:
+            pass
+    sock.setblocking(False)
+    return sock
+
+
+def host_drops():
+    """UDP datagrams this host has dropped for a full socket buffer, when it
+    says (Linux); None elsewhere."""
+    try:
+        with open("/proc/net/snmp") as f:
+            rows = [line.split() for line in f if line.startswith("Udp:")]
+        return int(rows[1][rows[0].index("RcvbufErrors")])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def burst_detail(answered, drops_before):
+    after = host_drops()
+    lost_here = "" if after is None or drops_before is None else \
+        ", %d of them dropped by this host's socket buffer" % (after - drops_before)
+    return "%d of %d%s" % (answered, BURST, lost_here)
+
+
+def rx_polls(sh):
+    """The receive passes the tick has asked for since boot, from `net`."""
+    out = sh.run("net")
+    found = re.search(r"rx polls (\d+)", out)
+    return (int(found.group(1)) if found else None), out
+
+
+def qemu_argv(args, image, log, extra=""):
+    import platform
+    hvf = platform.system() == "Darwin" and platform.machine() == "arm64" and not args.tcg
+    accel = ["-accel", "hvf", "-cpu", "host"] if hvf else ["-accel", "tcg", "-cpu", "cortex-a72"]
+    return ["qemu-system-aarch64", "-M", "virt,gic-version=3", "-smp", "4", "-m", "1024"] + accel + [
+        "-kernel", os.path.join(ROOT, "nos-arm64.img"),
+        "-append", ("root=auto dhcp=auto udpshell=%d %s" % (SHELL_PORT, extra)).strip(),
+        "-global", "virtio-mmio.force-legacy=false",
+        "-drive", "file=%s,format=raw,id=hd0,if=none" % image,
+        "-device", "virtio-blk-device,drive=hd0",
+        "-device", "igb,netdev=n0" if args.nic == "igb" else "virtio-net-device,netdev=n0",
+        "-netdev", "user,id=n0,hostfwd=udp::%d-:%d,hostfwd=udp::%d-:%d" % (
+            SHELL_PORT, SHELL_PORT, LOAD_PORT, LOAD_PORT),
+        "-serial", "file:" + log, "-display", "none"]
+
+
+def stop(p):
+    if p.poll() is None:
+        p.send_signal(signal.SIGTERM)
+        try:
+            p.wait(10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
+def panicked(log):
+    up = open(log, errors="replace").read().split("Stopping cpu")[0]
+    return "\n".join(l for l in up.splitlines() if "PANIC" in l)
+
+
 def x86(args):
     """nos.iso, with everything asked of the module from /etc/rc."""
     module = os.path.join(ROOT, "out", "x86_64", "modules", "netload.ko")
@@ -273,8 +350,7 @@ def x86(args):
         pt.check("and all of them arrived", len(seen) == PACED_COUNT,
                  "%d of %d" % (len(seen), PACED_COUNT))
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
+        sock = udp_socket()
         target = ("127.0.0.1", LOAD_PORT)
         seq, wrong = 0, []
         for size in SIZES:
@@ -287,6 +363,7 @@ def x86(args):
         pt.check("every datagram sent alone comes back as it went, once", not wrong,
                  "\n".join(wrong))
 
+        drops = host_drops()
         burst = {}
         for _ in range(BURST):
             seq += 1
@@ -299,7 +376,7 @@ def x86(args):
                 burst[d] += 1
         answered = sum(1 for n in burst.values() if n == 1)
         pt.check("a burst of %d comes back" % BURST, answered >= BURST_MIN,
-                 "%d of %d" % (answered, BURST))
+                 burst_detail(answered, drops))
         pt.check("with nothing in it that was not sent, and nothing twice",
                  all(d in burst for d in back) and all(n <= 1 for n in burst.values()))
     finally:
@@ -349,21 +426,8 @@ def main():
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "64", rootdir, "1024"],
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
 
-    import platform
-    hvf = platform.system() == "Darwin" and platform.machine() == "arm64" and not args.tcg
-    accel = ["-accel", "hvf", "-cpu", "host"] if hvf else ["-accel", "tcg", "-cpu", "cortex-a72"]
-    argv = ["qemu-system-aarch64", "-M", "virt,gic-version=3", "-smp", "4", "-m", "1024"] + accel + [
-        "-kernel", os.path.join(ROOT, "nos-arm64.img"),
-        "-append", "root=auto dhcp=auto udpshell=%d" % SHELL_PORT,
-        "-global", "virtio-mmio.force-legacy=false",
-        "-drive", "file=%s,format=raw,id=hd0,if=none" % image,
-        "-device", "virtio-blk-device,drive=hd0",
-        "-device", "igb,netdev=n0" if args.nic == "igb" else "virtio-net-device,netdev=n0",
-        "-netdev", "user,id=n0,hostfwd=udp::%d-:%d,hostfwd=udp::%d-:%d" % (
-            SHELL_PORT, SHELL_PORT, LOAD_PORT, LOAD_PORT),
-        "-serial", "file:" + log, "-display", "none"]
-
-    p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(qemu_argv(args, image, log), cwd=ROOT,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         if not pt.check("reaches the shell", pt.wait_log(log, "boot: complete", 300)):
             return 1
@@ -385,8 +449,7 @@ def main():
         out = sh.run("netload start %d" % LOAD_PORT)
         pt.check("netload starts in echo mode", "echo" in out and "listening" in out, out)
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
+        sock = udp_socket()
         target = ("127.0.0.1", LOAD_PORT)
 
         # One at a time: a reply of every size, each byte of it checked.
@@ -408,6 +471,7 @@ def main():
                  not wrong, "\n".join(wrong[:10]))
 
         # A burst: longer than the batch the target gathers.
+        drops = host_drops()
         burst = {}
         for _ in range(BURST):
             seq += 1
@@ -423,7 +487,7 @@ def main():
         twice = [d for d, n in burst.items() if n > 1]
         answered = sum(1 for n in burst.values() if n == 1)
         pt.check("a burst of %d comes back" % BURST, answered >= BURST_MIN,
-                 "%d of %d" % (answered, BURST))
+                 burst_detail(answered, drops))
         pt.check("with nothing in it that was not sent", not strangers,
                  "%d unknown datagrams" % len(strangers))
         pt.check("and nothing twice", not twice, "%d duplicated" % len(twice))
@@ -611,21 +675,43 @@ def main():
                  "%s in flight before, %s after\n%s" % (held_before, held_after, out))
 
         pt.check("the shell still answers after all of it", "eth0" in sh.run("net"))
-    finally:
-        if p.poll() is None:
-            p.send_signal(signal.SIGTERM)
-            try:
-                p.wait(10)
-            except subprocess.TimeoutExpired:
-                p.kill()
 
-    text = open(log, errors="replace").read()
-    up = text.split("Stopping cpu")[0]
-    pt.check("nothing panicked", "PANIC" not in up,
-             "\n".join(l for l in up.splitlines() if "PANIC" in l))
+        # The tick looks at the receive path only when rxpoll=on asks. The
+        # switch once lived in the C++ function the tick called; that went
+        # with src/cpp/net, and from then on every tick polled. Nothing
+        # failed: under a flood the receive softirq just moved back and forth
+        # between the BSP and the queue vector's CPU, an IPI each time, and
+        # took two CPUs where it had taken one.
+        polls, out = rx_polls(sh)
+        pt.check("booted without rxpoll=on, the tick never polled the receive path",
+                 polls == 0, out)
+    finally:
+        stop(p)
+
+    bad = panicked(log)
+    pt.check("nothing panicked", not bad, bad)
+
+    # And the switch still turns it on: a poll nothing can enable is as
+    # silent a failure as one nothing can disable.
+    poll_log = os.path.join(tmp, "serial-rxpoll.log")
+    p = subprocess.Popen(qemu_argv(args, image, poll_log, "rxpoll=on"), cwd=ROOT,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if pt.check("boots again, with rxpoll=on", pt.wait_log(poll_log, "boot: complete", 300)):
+            time.sleep(12)   # the boot-time DHCP, as above; the tick goes on meanwhile
+            sh = pt.Shell()
+            sh.sock.settimeout(60)
+            polls, out = rx_polls(sh)
+            pt.check("and with it the tick polls the receive path",
+                     polls is not None and polls > 0, out)
+    finally:
+        stop(p)
+
+    bad = panicked(poll_log)
+    pt.check("nothing panicked with the poll on", not bad, bad)
 
     if args.keep:
-        print("log at " + log)
+        print("logs at %s and %s" % (log, poll_log))
     else:
         subprocess.run(["rm", "-rf", tmp])
 

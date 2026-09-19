@@ -1096,11 +1096,21 @@ impl DeviceTable {
     /// This is the fallback: a lost wakeup then costs a tick instead of the
     /// rest of the uptime.
     ///
+    /// Only with `rxpoll=on`. It was a hypothesis about a driver stall, and
+    /// on the machine it was meant for the stall came sooner with it on than
+    /// off; and it has a cost. The tick that calls this is the BSP's, so
+    /// under load the receive softirq runs on two CPUs in turn -- the BSP and
+    /// the one the NIC's interrupt goes to -- with an IPI at every handover:
+    /// on the AX41 a flood took 70% of each of two CPUs where it had taken
+    /// one. The switch is here, not at the callers, because that is where it
+    /// was once lost: it lived in the C++ function the tick called, and went
+    /// with it. netload-test.py checks both ways.
+    ///
     /// Raised only when the softirq is not already pending, so a pass this
     /// causes can be told from one an interrupt caused -- which is what makes
     /// the stall count evidence rather than a guess.
     pub fn poll_rx(&'static self) {
-        if self.count() == 0 {
+        if !kcore::net::rx_poll_on() || self.count() == 0 {
             return;
         }
         if kcore::softirq::is_pending(kcore::softirq::TYPE_NET_RX) {

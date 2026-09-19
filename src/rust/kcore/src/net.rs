@@ -486,6 +486,12 @@ pub fn dns_on() -> bool {
     net::kernel_param_dns_on() != 0
 }
 
+/// `rxpoll=on`: the tick is to look at the receive path as well as the
+/// NIC's own interrupt. Off unless asked for.
+pub fn rx_poll_on() -> bool {
+    net::kernel_param_rxpoll_on() != 0
+}
+
 /// `netconsole=ip:port` and `nctail=N`, off the kernel command line: the
 /// collector's address (host byte order), its port, and the backlog cap in
 /// KiB. None when no netconsole was asked for.
