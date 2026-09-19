@@ -9,7 +9,7 @@
 
 use alloc::vec::Vec;
 
-use kcore::net::Nic;
+use crate::nic::Nic;
 use kcore::trace;
 use tls::TlsStream;
 

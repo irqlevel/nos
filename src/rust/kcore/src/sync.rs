@@ -380,20 +380,6 @@ impl<T> IrqSpinLock<T> {
     pub unsafe fn steal(&self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }
-
-    /// The data, for code the holder itself called. A driver's `flush_tx`
-    /// runs under its device's transmit lock and calls back into the device
-    /// for the queue that very lock guards: taking it again would wait for
-    /// itself, and the guard is a frame up the stack, on the far side of a
-    /// C ABI.
-    ///
-    /// # Safety
-    /// The lock is held by the call chain this is made from, and the holder
-    /// does not reach through its guard until the borrow returned here ends.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn reenter(&self) -> &mut T {
-        unsafe { &mut *self.data.get() }
-    }
 }
 
 pub struct IrqSpinGuard<'a, T> {

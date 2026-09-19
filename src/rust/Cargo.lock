@@ -400,6 +400,7 @@ name = "igb"
 version = "0.1.0"
 dependencies = [
  "kcore",
+ "net",
 ]
 
 [[package]]
@@ -523,6 +524,7 @@ name = "net"
 version = "0.1.0"
 dependencies = [
  "ffi",
+ "fs",
  "kcore",
  "tls",
 ]
@@ -728,6 +730,7 @@ name = "r8125"
 version = "0.1.0"
 dependencies = [
  "kcore",
+ "net",
 ]
 
 [[package]]
@@ -735,6 +738,7 @@ name = "r8168"
 version = "0.1.0"
 dependencies = [
  "kcore",
+ "net",
 ]
 
 [[package]]
@@ -1108,6 +1112,7 @@ name = "virtio-net"
 version = "0.1.0"
 dependencies = [
  "kcore",
+ "net",
  "virtio",
 ]
 

@@ -204,8 +204,53 @@ impl Frame {
         self.header().len()
     }
 
+    /// How many bytes are in it, from now on: a driver's, once the hardware
+    /// has said how much it received, or a sender's, before it fills them in.
+    /// Never past the buffer.
+    pub fn set_len(&mut self, len: usize) {
+        self.header().set_len(len);
+    }
+
+    /// Bytes it has room for.
+    pub fn capacity(&self) -> usize {
+        self.header().capacity
+    }
+
+    /// Where a device is pointed to read or write the buffer.
+    pub fn data_phys(&self) -> u64 {
+        self.header().data_phys as u64
+    }
+
     pub fn bytes(&self) -> &[u8] {
         self.header().bytes()
+    }
+
+    /// The frame's contents -- `len()` bytes -- to write in place.
+    ///
+    /// For whoever is the only one looking at the bytes: a sender filling in
+    /// a frame it has just allocated, or a listener answering in the frame it
+    /// kept, which the receive path holds a reference to and never reads
+    /// again.
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        let header = self.header();
+        /* The buffer is `capacity` bytes for as long as the frame is, and
+         * `len` is never more. */
+        unsafe { core::slice::from_raw_parts_mut(header.data.as_ptr(), header.len()) }
+    }
+
+    /// The buffer itself, up to `capacity` bytes of it -- fewer if it has
+    /// room for fewer: for writing into a fresh frame before `set_len`.
+    pub fn data_raw_mut(&mut self, capacity: usize) -> &mut [u8] {
+        let header = self.header();
+        let len = capacity.min(header.capacity);
+        unsafe { core::slice::from_raw_parts_mut(header.data.as_ptr(), len) }
+    }
+
+    /// One more reference to the same frame: how a listener keeps what it
+    /// was lent.
+    pub fn retain(&self) -> Frame {
+        self.header().refcount.fetch_add(1, Ordering::AcqRel);
+        Frame(self.0)
     }
 
     /// The whole of `data` as the frame's contents. False when it has no
@@ -639,11 +684,12 @@ pub extern "C" fn rust_netframe_pool_setup(count: usize) -> i32 {
     if POOL.setup(count) { 0 } else { -1 }
 }
 
-/* ---- what a driver, or a listener, calls ----
+/* ---- what a module calls ----
  *
- * A frame crosses to them as a word, and they work on it through these. A
- * handle is a reference: whoever was given one either hands it on or gives
- * it up with `kernel_netframe_put`. */
+ * A frame crosses to a module as a word, and it works on it through these
+ * (`kcore::net::NetFrame`); a driver, and everything else inside the kernel
+ * image, holds a `Frame`. A handle is a reference: whoever was given one
+ * either hands it on or gives it up with `kernel_netframe_put`. */
 
 /// A frame somebody outside holds, looked at without taking it.
 ///
@@ -656,11 +702,6 @@ unsafe fn peek<'a>(handle: usize) -> Option<&'a RawFrame> {
 #[no_mangle]
 pub extern "C" fn kernel_netframe_alloc_tx(len: usize) -> usize {
     Frame::alloc_tx(len).map_or(0, Frame::into_handle)
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_netframe_alloc_rx(len: usize) -> usize {
-    Frame::alloc_rx(len).map_or(0, Frame::into_handle)
 }
 
 /// # Safety

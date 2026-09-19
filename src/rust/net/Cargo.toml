@@ -11,3 +11,6 @@ kcore = { path = "../kcore" }
 ffi = { path = "../ffi" }
 # The HTTP client speaks plain TCP or TLS over it.
 tls = { path = "../tls" }
+# `wget` saves to a file: the filesystem layer itself, not the C ABI a module
+# reaches it by.
+fs = { path = "../fs" }

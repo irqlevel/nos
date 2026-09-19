@@ -19,7 +19,7 @@ src/cpp/
   include/    Shared headers
 src/rust/
   ffi/        Raw extern "C" FFI declarations for kernel services
-  kcore/      Safe Rust wrappers: sync, DMA, MMIO, MSI-X, interrupts, timers, tasks, PCI, block/net device
+  kcore/      Safe Rust wrappers around kernel services: sync, DMA, MMIO, MSI-X, interrupts, timers, tasks, PCI -- and the block, net, TCP and file layers *as a loadable module reaches them*, across the C ABI (inside the image the crates below call each other as crates)
   drivers/
     nvme/     NVMe block device driver (PCI, MSI-X, admin/IO queues)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + the HID boot-protocol keyboard on it
@@ -30,12 +30,12 @@ src/rust/
     virtio_blk/ virtio-blk, the disk the root filesystem lives on, likewise
     virtio_net/ virtio-net, the card the network comes in on
     virtio_scsi/ virtio-scsi, a SCSI adapter and the disks behind it
-  block/      The block layer: the device table, its claims, the partition tables (MBR and GPT) a disk is cut up by, the shell's disk commands (shell.rs) and the kernel log written to a raw disk area (disklog.rs)
-  net/        The network layer: the wire formats and the internet checksum (wire.rs), ARP (arp.rs), ICMP (icmp.rs), UDP (udp.rs), the DHCP client (dhcp.rs), the DNS resolver (dns.rs), TCP (tcp.rs), the HTTP client over either TCP or TLS (http.rs), the shell over UDP (udp_shell.rs), the kernel log over UDP (netconsole.rs), the load target (net_load.rs), the recycled frame pool (frame.rs), the devices and the queues between them and their drivers (device.rs), the boot self-test over the formats (selftest.rs), the shell's network commands (shell.rs), wget (wget.rs) and the C ABI C++ calls them by (abi.rs)
+  block/      The block layer: the device table a driver registers a `BlockDriver` in (table.rs), the `Disk` the rest of the image reads and writes through (disk.rs), its claims, the partition tables (MBR and GPT) a disk is cut up by, the shell's disk commands (shell.rs) and the kernel log written to a raw disk area (disklog.rs)
+  net/        The network layer: the wire formats and the internet checksum (wire.rs), ARP (arp.rs), ICMP (icmp.rs), UDP (udp.rs), the DHCP client (dhcp.rs), the DNS resolver (dns.rs), TCP (tcp.rs), the HTTP client over either TCP or TLS (http.rs), the shell over UDP (udp_shell.rs), the kernel log over UDP (netconsole.rs), the load target (net_load.rs), the recycled frame pool (frame.rs), the devices, the `NetDriver` a NIC registers as and the queues between it and the stack (device.rs), a device as the layer's own services hold one (nic.rs), the boot self-test over the formats (selftest.rs), the shell's network commands (shell.rs), wget (wget.rs) and the C ABI C++ and the modules call them by (abi.rs)
   fs/         The filesystem layer: the VFS (vfs.rs -- the mount table, path resolution, open handles and the file API), the `FileSystem` trait and the filesystems that implement it (ext2.rs, nanofs.rs, ramfs.rs, procfs.rs), the arena of nodes each keeps its tree in (vnode.rs), what boot mounts where (rootfs.rs), the shell's filesystem commands (shell.rs) and the self-test (selftest.rs)
   virtio/     The virtio foundation: the split virtqueue, the transport contract, virtio-pci (modern and legacy) and virtio-mmio v2
   hello/      Rust self-test module
-  kernel/     Rust entry points (rust_main, rust_fini), global allocator
+  kernel/     Rust entry points (rust_init, rust_fini), global allocator, the `sha256` command
   kmod/       Runtime of a loadable module: allocator, panic handler, the module! header
   modules/    Loadable modules, each built into a .ko (hello; blkload, a block I/O load test; netblk, a disk served over UDP, zero-copy; modtest, which the boot test loads; slowexit, an exit that takes its time)
 build/        Linker script, GRUB configs

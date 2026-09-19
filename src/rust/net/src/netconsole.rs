@@ -25,7 +25,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
-use kcore::net::Nic;
+use crate::nic::Nic;
 use kcore::sync::IrqSpinLock;
 use kcore::task::TaskHandle;
 use kcore::trace;

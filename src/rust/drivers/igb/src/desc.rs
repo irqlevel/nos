@@ -16,7 +16,7 @@
 
 use alloc::vec::Vec;
 use kcore::dma::{Descriptor, DmaBuffer, Volatile};
-use kcore::net::{NetFrame, TxQueue};
+use net::{Frame, TxQueue};
 
 use crate::regs::*;
 
@@ -80,7 +80,7 @@ fn ring(dma: DmaBuffer) -> Option<(&'static [Desc], u64)> {
 
 /// A ring's shadow of what is posted in it: the frame in each slot, none
 /// where there is none. On the heap, not inline -- see `RxRing::frames`.
-fn shadow() -> Option<Vec<Option<NetFrame>>> {
+fn shadow() -> Option<Vec<Option<Frame>>> {
     let mut frames = Vec::new();
     frames.try_reserve_exact(RING_SIZE).ok()?;
     frames.resize_with(RING_SIZE, || None);
@@ -110,7 +110,7 @@ pub struct RxRing {
     /// struct that Box::new builds on the stack before moving, and a kernel
     /// stack is 32 KiB in total -- at RING_SIZE 1024 that is a double fault
     /// during device init, which is how this was found.
-    frames: Vec<Option<NetFrame>>,
+    frames: Vec<Option<Frame>>,
     /// The slot the chip will complete next, from software's point of view.
     next_to_clean: usize,
     /// The slot to hand over next.
@@ -157,7 +157,7 @@ impl RxRing {
     /// visible before the tail that points past them.
     ///
     /// Returns the slot used, or None when the gap rule says there is no room.
-    pub fn post_next(&mut self, frame: NetFrame) -> Option<usize> {
+    pub fn post_next(&mut self, frame: Frame) -> Option<usize> {
         if self.desc_unused() == 0 {
             return None;
         }
@@ -221,7 +221,7 @@ impl RxRing {
 
     /// Take the completed frame at the clean pointer.
     /// Returns the frame, the status/error word and the length in bytes.
-    pub fn harvest(&mut self) -> Option<(NetFrame, u32, usize)> {
+    pub fn harvest(&mut self) -> Option<(Frame, u32, usize)> {
         let idx = self.next_to_clean;
         if self.frames[idx].is_none() {
             return None;
@@ -250,7 +250,7 @@ impl RxRing {
 pub struct TxRing {
     descs: &'static [Desc],
     pub phys: u64,
-    frames: Vec<Option<NetFrame>>,
+    frames: Vec<Option<Frame>>,
     /// The slots that asked the chip for a write-back (RS). Not every one
     /// does: see `submit` and `report_last`.
     rs: Vec<bool>,
@@ -278,7 +278,7 @@ impl TxRing {
     /// `rs`. Does not ring the doorbell: the caller submits a run, marks its
     /// last descriptor with `report_last` and writes TDT once. A frame there
     /// is no room for comes back.
-    pub fn submit(&mut self, frame: NetFrame, rs: bool) -> Result<(), NetFrame> {
+    pub fn submit(&mut self, frame: Frame, rs: bool) -> Result<(), Frame> {
         if !self.can_submit() {
             return Err(frame);
         }

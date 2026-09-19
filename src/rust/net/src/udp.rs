@@ -4,7 +4,7 @@
 //! the load target -- builds its payload and hands it to [`send`], or is
 //! handed a received frame and takes it apart with [`parse`].
 
-use kcore::net::Nic;
+use crate::nic::Nic;
 use kcore::trace;
 
 use crate::arp::ArpTable;

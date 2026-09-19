@@ -1,10 +1,14 @@
 //! The network devices: the queues between a driver and the stack, the UDP
 //! listeners, the receive dispatch, and the table of them all.
 //!
-//! A driver registers an ops table and is then only asked two things: empty
-//! the transmit queue into the hardware, and harvest the hardware into the
-//! receive queue. Everything between -- the queueing, the batching, the
+//! A driver registers as a `NetDriver` and is then only asked two things:
+//! empty the transmit queue into the hardware, and harvest the hardware into
+//! the receive queue. Everything between -- the queueing, the batching, the
 //! protocol dispatch and the counters -- is here.
+//!
+//! Drivers and this crate's own services call in directly. What is left of a
+//! C ABI, at the bottom, is what a loadable module binds by name
+//! (`kcore::net`): a module is linked on its own.
 //!
 //! Three things are the way they are because a profile said so, and they are
 //! worth not undoing:
@@ -18,6 +22,7 @@
 //! - The per-protocol counters are **per CPU and plain**. Shared atomics on
 //!   the datapath are what all of this exists to remove.
 
+use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use kcore::once::Once;
@@ -39,55 +44,188 @@ const RX_CAPACITY: usize = 256;
 /// more.
 pub const MAX_LISTENERS: usize = 16;
 
-/// What `listen_udp` answers.
-pub const LISTEN_OK: i32 = 0;
-pub const LISTEN_PORT_TAKEN: i32 = 1;
-pub const LISTEN_TABLE_FULL: i32 = 2;
-pub const LISTEN_INVALID: i32 = 3;
+/// Why a UDP listener was refused
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenError {
+    /// Someone has the port already -- the UDP shell, DHCP, another server.
+    PortTaken,
+    /// The device's listener table is full.
+    TableFull,
+    /// Port 0.
+    Invalid,
+}
+
+/// What `kernel_net_udp_listen` answers a module (kcore::net::ListenError).
+const LISTEN_OK: i32 = 0;
+const LISTEN_PORT_TAKEN: i32 = 1;
+const LISTEN_TABLE_FULL: i32 = 2;
+const LISTEN_INVALID: i32 = 3;
 
 /// How many frames cross from a driver, or to one, in a single call.
 const HANDLE_CHUNK: usize = 64;
 
 /* ---- what a driver gives the stack ---- */
 
-/// The ops a driver registers. `ffi::net::NetDeviceOps` is the same struct.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct DeviceOps {
-    pub name: *const u8,
-    pub mac: [u8; 6],
-    /// Empty the transmit queue into the hardware. Called with the transmit
-    /// lock held, so it must not sleep, allocate or free. `dev` is the
-    /// device's own handle, as in every call.
-    pub flush_tx: extern "C" fn(ctx: *mut u8, dev: usize),
-    /// Harvest the hardware into the receive queue.
-    pub process_rx: extern "C" fn(ctx: *mut u8, dev: usize),
-    pub ctx: *mut u8,
+/// A NIC's driver. There are two things the stack asks of it, and each comes
+/// with the state only that call touches, lent for the length of the call:
+///
+/// - `flush_tx`, with the device's transmit lock held around it, so one at a
+///   time per device: it is handed the transmit side as `&mut Self::Tx`;
+/// - `process_rx`, from the receive soft IRQ, which the kernel runs on one
+///   CPU at a time: it is handed the receive side as `&mut Self::Rx`.
+///
+/// Everything else of the driver -- what an interrupt handler or a shell
+/// command looks at -- is `&self`, shared between whatever runs: registers,
+/// atomics, locks. So a driver has no `UnsafeCell` with a comment saying who
+/// may touch it; who may touch it is who is handed it. The transmit side
+/// lives *inside* the transmit lock and the receive side behind the receive
+/// path's `RxContext`, so none of that is a promise: it is how the borrow
+/// checker sees it.
+pub trait NetDriver: Sync + 'static {
+    /// What only `flush_tx` touches: the transmit ring and what is on it.
+    type Tx: Send + 'static;
+    /// What only `process_rx` touches: the receive ring and what is posted.
+    type Rx: Send + 'static;
+
+    /// Give back what the hardware has finished sending and send what the
+    /// stack has queued. Called under the device's transmit lock, interrupts
+    /// off: no sleeping, no allocating -- and no *freeing*: a frame finished
+    /// with goes to `queue.done`, never out of scope.
+    fn flush_tx(&'static self, tx: &mut Self::Tx, queue: &mut TxQueue<'_>);
+
+    /// Take what the hardware has received and hand it up.
+    fn process_rx(&'static self, rx: &mut Self::Rx, queue: &mut RxQueue<'_>);
 }
 
-/// The driver behind a device: the two things it is asked, and the word it
-/// asked to be given back. A word and not a pointer, because that is all it
-/// is to this layer -- which is also what lets a device be shared between
-/// CPUs without anybody having to promise anything.
-struct Driver {
-    flush_tx: extern "C" fn(ctx: *mut u8, dev: usize),
-    process_rx: extern "C" fn(ctx: *mut u8, dev: usize),
-    ctx: usize,
+/// A driver's transmit side with its type erased: what the device keeps
+/// under its transmit lock.
+trait TxHalf: Send {
+    fn flush(&mut self, queue: &mut TxQueue<'_>);
 }
 
-impl Driver {
-    fn flush_tx(&self, dev: &Device) {
-        (self.flush_tx)(self.ctx as *mut u8, dev.handle());
+/// A driver's receive side, the same.
+trait RxHalf: Send {
+    fn process(&mut self, queue: &mut RxQueue<'_>);
+}
+
+struct TxOf<D: NetDriver> {
+    driver: &'static D,
+    state: D::Tx,
+}
+
+impl<D: NetDriver> TxHalf for TxOf<D> {
+    fn flush(&mut self, queue: &mut TxQueue<'_>) {
+        self.driver.flush_tx(&mut self.state, queue);
+    }
+}
+
+struct RxOf<D: NetDriver> {
+    driver: &'static D,
+    state: D::Rx,
+}
+
+impl<D: NetDriver> RxHalf for RxOf<D> {
+    fn process(&mut self, queue: &mut RxQueue<'_>) {
+        self.driver.process_rx(&mut self.state, queue);
+    }
+}
+
+/// The stack's transmit queue, for the length of one `flush_tx`: a borrow of
+/// what the held transmit lock guards, which is why it cannot outlive the
+/// call or be reached from anywhere else.
+pub struct TxQueue<'a> {
+    queue: &'a mut FrameQueue,
+    done: &'a mut FrameQueue,
+    sent: &'a AtomicUsize,
+}
+
+impl TxQueue<'_> {
+    /// The next frame to send, or None when the queue is empty.
+    ///
+    /// The frame's buffer is what the hardware is about to read: keep it --
+    /// in the ring's shadow of what is posted -- until the hardware says it
+    /// is done, and then hand it to `done`. Dropped earlier, the buffer goes
+    /// back to the pool and out again while the card is still reading it.
+    pub fn dequeue(&mut self) -> Option<Frame> {
+        let frame = self.queue.pop()?;
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        Some(frame)
     }
 
-    fn process_rx(&self, dev: &Device) {
-        (self.process_rx)(self.ctx as *mut u8, dev.handle());
+    /// A transmitted frame, for release once the lock is down. Never dropped
+    /// here instead: dropping frees, a free can reach the page allocator,
+    /// which shoots down the TLB on every other CPU and waits for each -- and
+    /// a CPU spinning on this lock has interrupts off and never answers.
+    pub fn done(&mut self, frame: Frame) {
+        self.done.push(frame);
+    }
+}
+
+/// The stack's receive queue, for the length of one `process_rx`.
+pub struct RxQueue<'a> {
+    dev: &'a Device,
+}
+
+impl RxQueue<'_> {
+    /// One received frame, to the stack. What the queue has no room for is
+    /// released.
+    pub fn enqueue(&mut self, frame: Frame) {
+        let mut frames = FrameQueue::new();
+        frames.push(frame);
+        self.deliver(&mut frames);
+    }
+
+    /// A whole harvest at once: the receive queue's lock is taken once for
+    /// the batch rather than once per frame, which at tens of thousands of
+    /// packets a second is the difference between a lock acquisition being
+    /// noise and being the top of the receive path in a profile. `frames` is
+    /// empty after: what found no room is released here, with the lock down.
+    pub fn deliver(&mut self, frames: &mut FrameQueue) {
+        if frames.is_empty() {
+            return;
+        }
+        self.dev.enqueue_rx(frames);
+        drop(frames.take());
+    }
+}
+
+/* ---- the receive path, as a value ---- */
+
+/// Being inside the receive dispatch, as a value.
+///
+/// The kernel runs the receive soft IRQ on one CPU at a time, and the pass
+/// in it -- `DeviceTable::process_all_rx` -- is what harvests every driver
+/// and calls every listener. It makes one of these, and lends it down. So
+/// there is one at a time, and holding it is what it means to be the only
+/// code on the receive path right now -- which is what lets `RxOwned` hand
+/// out its contents without a lock.
+pub struct RxContext {
+    _only_the_receive_pass_makes_one: (),
+}
+
+/// What only the receive path touches: a driver's receive ring, the replies
+/// a listener gathers during a batch. No lock, because the `RxContext`
+/// borrowed to reach in is the proof nobody else is there.
+pub struct RxOwned<T>(core::cell::UnsafeCell<T>);
+
+/* Reached on whichever CPU the receive soft IRQ runs on, one at a time. */
+unsafe impl<T: Send> Sync for RxOwned<T> {}
+
+impl<T> RxOwned<T> {
+    pub const fn new(value: T) -> Self {
+        Self(core::cell::UnsafeCell::new(value))
+    }
+
+    #[inline]
+    pub fn get<'a>(&'a self, _rx: &'a mut RxContext) -> &'a mut T {
+        /* There is one `RxContext` at a time and it is borrowed for as long
+         * as what is returned here lives. */
+        unsafe { &mut *self.0.get() }
     }
 }
 
 /// What a device is from the moment it is registered, and never changes.
 struct Identity {
-    driver: Driver,
     name: [u8; NAME_MAX],
     name_len: usize,
     mac: Mac,
@@ -95,20 +233,55 @@ struct Identity {
 
 /* ---- listeners ---- */
 
+/// What `Nic::listen` hands datagrams to: a service of this crate.
+pub trait UdpHandler: Sync + 'static {
+    /// One datagram's frame, lent for the length of the call.
+    fn on_frame(&'static self, frame: Lent<'_>, rx: &mut RxContext);
+
+    /// The end of a receive batch, for a listener registered with
+    /// `listen_batched`: the moment to hand the NIC what was built.
+    fn on_batch_end(&'static self, _rx: &mut RxContext) {}
+}
+
+/// A frame the receive path lends a listener for the length of one call.
+pub struct Lent<'a>(&'a Frame);
+
+impl Lent<'_> {
+    /// The frame's bytes, Ethernet header first.
+    pub fn bytes(&self) -> &[u8] {
+        self.0.bytes()
+    }
+
+    /// The frame, to keep past the call -- to answer in, where it lies. The
+    /// receive path's own reference is then not the last, and it never looks
+    /// at the bytes again.
+    pub fn retain(self) -> Frame {
+        self.0.retain()
+    }
+}
+
+/// Who a datagram goes to.
+#[derive(Clone, Copy)]
+enum Sink {
+    /// A service of this crate. `batched`: it is also told when a receive
+    /// batch ends, for a listener that answers from the receive path and
+    /// hands its replies over together.
+    Handler { handler: &'static dyn UdpHandler, batched: bool },
+    /// A module's, across the C ABI: the frame as a word, lent for the call
+    Callback { frame_cb: extern "C" fn(ctx: *mut u8, frame: usize), ctx: usize },
+}
+
 /// What the receive path hands a datagram to.
 #[derive(Clone, Copy)]
 struct Listener {
     port: u16,
-    /// The frame itself, lent for the call
-    frame_cb: Option<extern "C" fn(ctx: *mut u8, frame: usize)>,
-    /// Called at the end of a receive batch, for a listener that answers
-    /// from the receive path and hands its replies over together
-    batch_end_cb: Option<extern "C" fn(ctx: *mut u8)>,
-    /// The listener's word, handed back with every call
-    ctx: usize,
+    /// What takes this listener away and nobody else's on the port: the
+    /// handler's address, or a callback's context
+    key: usize,
+    sink: Option<Sink>,
 }
 
-const NO_LISTENER: Listener = Listener { port: 0, frame_cb: None, batch_end_cb: None, ctx: 0 };
+const NO_LISTENER: Listener = Listener { port: 0, key: 0, sink: None };
 
 struct Listeners {
     table: [Listener; MAX_LISTENERS],
@@ -162,6 +335,20 @@ struct Tx {
     queue: FrameQueue,
     /// Transmitted frames waiting to be released off the lock
     done: FrameQueue,
+    /// The driver's transmit side, from registration on. In here because
+    /// this lock is what makes `flush_tx` one at a time: whoever holds it
+    /// has the queue and the driver's ring together, and nobody else either.
+    driver: Option<Box<dyn TxHalf>>,
+}
+
+impl Tx {
+    /// The driver's turn: what is queued, into the hardware.
+    fn flush(&mut self, sent: &AtomicUsize) {
+        let Tx { queue, done, driver } = self;
+        if let Some(driver) = driver.as_mut() {
+            driver.flush(&mut TxQueue { queue, done, sent });
+        }
+    }
 }
 
 pub struct Device {
@@ -179,6 +366,8 @@ pub struct Device {
     /// How long the receive queue is, left where the poll can see it without
     /// the lock: a hint, not an invariant
     rx_waiting: AtomicUsize,
+    /// The driver's receive side, from registration on: the receive path's
+    rx_driver: Once<RxOwned<Box<dyn RxHalf>>>,
 
     /// Never taken from a hard interrupt
     listeners: PreemptSpinLock<Listeners>,
@@ -200,9 +389,12 @@ impl Device {
             ip: AtomicU32::new(0),
             mask: AtomicU32::new(0),
             gw: AtomicU32::new(0),
-            tx: IrqSpinLock::new(Tx { queue: FrameQueue::new(), done: FrameQueue::new() }),
+            tx: IrqSpinLock::new(Tx {
+                queue: FrameQueue::new(), done: FrameQueue::new(), driver: None,
+            }),
             rx: IrqSpinLock::new(FrameQueue::new()),
             rx_waiting: AtomicUsize::new(0),
+            rx_driver: Once::new(),
             listeners: PreemptSpinLock::new(Listeners {
                 table: [NO_LISTENER; MAX_LISTENERS],
                 count: 0,
@@ -250,13 +442,9 @@ impl Device {
         }
     }
 
-    fn driver(&self) -> Option<&Driver> {
-        self.identity.get().map(|identity| &identity.driver)
-    }
-
     /// What the device is known by outside this crate: where it is in the
     /// table, which `DeviceTable::by_handle` turns back into the device.
-    fn handle(&self) -> usize {
+    pub(crate) fn handle(&self) -> usize {
         self as *const Device as usize
     }
 }
@@ -264,35 +452,6 @@ impl Device {
 /* ---- transmitting ---- */
 
 impl Device {
-    /// A frame the driver has finished with, for release once the transmit
-    /// lock is down.
-    ///
-    /// A driver must **never** release a transmitted frame from inside
-    /// `flush_tx`. That runs under the transmit lock with interrupts off, and
-    /// a release reaches the page allocator, which shoots down the TLB on
-    /// every other CPU and waits for each to answer -- and a CPU spinning on
-    /// this lock has interrupts off, so it never can. The two then wait for
-    /// each other for good.
-    ///
-    /// # Safety
-    /// Called from inside this device's `flush_tx`, which is to say under
-    /// its transmit lock.
-    pub unsafe fn tx_done(&self, frame: Frame) {
-        /* `submit_tx` and `drain_tx` hold the lock across the driver's
-         * `flush_tx` and do not reach through their guard until it returns. */
-        unsafe { self.tx.reenter() }.done.push(frame);
-    }
-
-    /// One queued frame, for a driver inside its own `flush_tx`.
-    ///
-    /// # Safety
-    /// As `tx_done`.
-    pub unsafe fn tx_dequeue(&self) -> Option<Frame> {
-        let frame = unsafe { self.tx.reenter() }.queue.pop()?;
-        self.tx_packets.fetch_add(1, Ordering::Relaxed);
-        Some(frame)
-    }
-
     /// The finished frames, released with the lock down and interrupts on.
     pub fn release_tx_done(&self) {
         loop {
@@ -347,13 +506,11 @@ impl Device {
                 }
                 queued += 1;
             }
-            /* The borrow ends here, before the driver runs: its `flush_tx`
-             * comes back in for this queue through `tx_dequeue`. */
-        }
 
-        if queued != 0 {
-            if let Some(driver) = self.driver() {
-                driver.flush_tx(self);
+            /* The driver, with the queue and its own ring both lent out of
+             * what this lock guards. */
+            if queued != 0 {
+                tx.flush(&self.tx_packets);
             }
         }
 
@@ -385,14 +542,9 @@ impl Device {
     /// The transmit softirq: what a driver with nothing else to do owes.
     pub fn drain_tx(&self) {
         {
-            let guard = self.tx.lock();
-            let pending = !guard.queue.is_empty();
-            if pending {
-                if let Some(driver) = self.driver() {
-                    /* Under the lock, and the guard untouched until it
-                     * returns: what `tx_dequeue` needs of its caller. */
-                    driver.flush_tx(self);
-                }
+            let mut guard = self.tx.lock();
+            if !guard.queue.is_empty() {
+                guard.flush(&self.tx_packets);
             }
         }
 
@@ -468,6 +620,14 @@ impl Device {
         taken
     }
 
+    /// The driver's turn: what the hardware has received, into the receive
+    /// queue. The receive pass's own, which is what `rx` says.
+    fn harvest(&self, rx: &mut RxContext) {
+        if let Some(driver) = self.rx_driver.get() {
+            driver.get(rx).process(&mut RxQueue { dev: self });
+        }
+    }
+
     /// What the hardware has waiting, as a hint for the receive poll -- read
     /// without the lock, because it is a hint and not an invariant.
     pub fn rx_pending(&self) -> usize {
@@ -480,7 +640,7 @@ impl Device {
     /// Frames arrive one at a time but leave in a run, and taking the lock
     /// per frame -- with interrupts off -- was the top of the receive path in
     /// a profile at thirty-seven thousand packets a second.
-    pub fn drain_rx_and_dispatch(&'static self) {
+    fn drain_rx_and_dispatch(&'static self, rx: &mut RxContext) {
         let mut batch = {
             let mut queue = self.rx.lock();
             self.rx_waiting.store(0, Ordering::Relaxed);
@@ -521,7 +681,7 @@ impl Device {
 
         while let Some(frame) = batch.pop() {
             self.rx_packets.fetch_add(1, Ordering::Relaxed);
-            self.dispatch_one(counters, &frame, listeners);
+            self.dispatch_one(counters, &frame, listeners, rx);
             /* The receive path's reference goes here. A listener that kept
              * the frame took one of its own. */
             drop(frame);
@@ -531,8 +691,8 @@ impl Device {
          * its replies over now, together. Still inside the in-flight count,
          * so an unlisten waiting on it knows they have gone. */
         for listener in listeners {
-            if let Some(batch_end) = listener.batch_end_cb {
-                batch_end(listener.ctx as *mut u8);
+            if let Some(Sink::Handler { handler, batched: true }) = listener.sink {
+                handler.on_batch_end(rx);
             }
         }
 
@@ -541,7 +701,10 @@ impl Device {
         }
     }
 
-    fn dispatch_one(&'static self, counters: &RxCounters, frame: &Frame, listeners: &[Listener]) {
+    fn dispatch_one(
+        &'static self, counters: &RxCounters, frame: &Frame, listeners: &[Listener],
+        rx: &mut RxContext,
+    ) {
         let data = frame.bytes();
 
         if data.len() < ETH_HDR_LEN {
@@ -605,8 +768,12 @@ impl Device {
                     /* A listener keeps the frame by taking a reference before
                      * it returns: the release after this is then not the last
                      * one. */
-                    if let Some(cb) = listener.frame_cb {
-                        cb(listener.ctx as *mut u8, frame.as_lent());
+                    match listener.sink {
+                        Some(Sink::Handler { handler, .. }) => handler.on_frame(Lent(frame), rx),
+                        Some(Sink::Callback { frame_cb, ctx }) => {
+                            frame_cb(ctx as *mut u8, frame.as_lent())
+                        }
+                        None => {}
                     }
                     break;
                 }
@@ -622,52 +789,65 @@ impl Device {
 /* ---- listeners ---- */
 
 impl Device {
-    /// This device as the handle every consumer-side call takes.
-    pub(crate) fn as_nic(&'static self) -> kcore::net::Nic {
-        kcore::net::Nic::from_handle(self.handle())
-            .unwrap_or_else(|| unreachable!())
+    /// This device as what this crate's services hold.
+    pub(crate) fn as_nic(&'static self) -> crate::nic::Nic {
+        crate::nic::Nic::of(self)
     }
 
-    /// Every UDP datagram to `port`, handed to `cb` with the frame itself.
-    /// Never takes a port from whoever has it.
-    pub fn listen_udp(&self, port: u16,
-        cb: extern "C" fn(ctx: *mut u8, frame: usize),
-        batch_end: Option<extern "C" fn(ctx: *mut u8)>,
-        ctx: usize) -> i32
-    {
+    /// Every UDP datagram to `port`, to a listener. Never takes a port from
+    /// whoever has it.
+    fn listen(&self, port: u16, key: usize, sink: Sink) -> Result<(), ListenError> {
         if port == 0 {
-            return LISTEN_INVALID;
+            return Err(ListenError::Invalid);
         }
 
         let mut listeners = self.listeners.lock();
         let count = listeners.count;
 
         if listeners.table[..count].iter().any(|listener| listener.port == port) {
-            return LISTEN_PORT_TAKEN;
+            return Err(ListenError::PortTaken);
         }
         if count >= MAX_LISTENERS {
-            return LISTEN_TABLE_FULL;
+            return Err(ListenError::TableFull);
         }
 
-        listeners.table[count] = Listener { port, frame_cb: Some(cb), batch_end_cb: batch_end, ctx };
+        listeners.table[count] = Listener { port, key, sink: Some(sink) };
         listeners.count = count + 1;
-        LISTEN_OK
+        Ok(())
     }
 
-    /// Takes away the listener registered on the port with this context, and
+    /// A service of this crate on `port`: the key to `unlisten_udp` it by.
+    pub(crate) fn listen_handler(
+        &self, port: u16, handler: &'static dyn UdpHandler, batched: bool,
+    ) -> Result<usize, ListenError> {
+        /* Where the handler is: what no other listener's key can be. */
+        let key = handler as *const dyn UdpHandler as *const () as usize;
+        self.listen(port, key, Sink::Handler { handler, batched })?;
+        Ok(key)
+    }
+
+    /// A module's callback on `port`, handed the frame as a word; `ctx` is
+    /// its key.
+    fn listen_callback(
+        &self, port: u16, frame_cb: extern "C" fn(ctx: *mut u8, frame: usize), ctx: usize,
+    ) -> Result<(), ListenError> {
+        self.listen(port, ctx, Sink::Callback { frame_cb, ctx })
+    }
+
+    /// Takes away the listener registered on the port with this key, and
     /// nobody else's. Returns once no call of it is still running, so the
     /// caller may free what it reaches.
     ///
     /// Task context only: a listener that unregistered itself from inside its
     /// own callback would wait here for itself.
-    pub fn unlisten_udp(&self, port: u16, ctx: usize) {
+    pub fn unlisten_udp(&self, port: u16, key: usize) {
         {
             let mut listeners = self.listeners.lock();
             let count = listeners.count;
 
             let found = listeners.table[..count]
                 .iter()
-                .position(|listener| listener.port == port && listener.ctx == ctx);
+                .position(|listener| listener.port == port && listener.key == key);
             if let Some(at) = found {
                 listeners.table.copy_within(at + 1..count, at);
                 listeners.table[count - 1] = NO_LISTENER;
@@ -786,13 +966,56 @@ impl DeviceTable {
         self.devices.get(offset / core::mem::size_of::<Device>())
     }
 
-    /// A driver's device. None when the table is full or the ops are not a
-    /// device.
-    ///
-    /// # Safety
-    /// `ops.name` is a NUL-terminated string.
-    pub unsafe fn register(&'static self, ops: &DeviceOps) -> Option<&'static Device> {
-        if ops.name.is_null() {
+    /// A driver's device, from here on called: `tx` and `rx` are the two
+    /// halves only `flush_tx` and `process_rx` touch, and become the
+    /// device's. None when the table is full or the name will not do -- and
+    /// then the halves are *leaked*, not dropped: the hardware has been told
+    /// where those rings are and may be running on them, so the memory stays
+    /// until the driver has quiesced it, which is after this returns.
+    pub fn register<D: NetDriver>(
+        &'static self, name: &str, mac: Mac, driver: &'static D, tx: D::Tx, rx: D::Rx,
+    ) -> Option<&'static Device> {
+        /* Made before any lock is taken: nothing allocates under one. */
+        let tx_half: Box<dyn TxHalf> = Box::new(TxOf { driver, state: tx });
+        let rx_half: Box<dyn RxHalf> = Box::new(RxOf { driver, state: rx });
+
+        let dev = match self.claim(name, mac) {
+            Some(dev) => dev,
+            None => {
+                core::mem::forget(tx_half);
+                core::mem::forget(rx_half);
+                return None;
+            }
+        };
+
+        /* Both halves in before the device can be found: the count below is
+         * what the softirq passes walk, and the transmit path starts from a
+         * device somebody was handed. */
+        dev.tx.lock().driver = Some(tx_half);
+        if dev.rx_driver.set(RxOwned::new(rx_half)).is_err() {
+            /* The slot was this registration's alone: see `claim`. */
+            return None;
+        }
+
+        self.count.store(self.count() + 1, Ordering::Release);
+
+        /* One handler per softirq type, dispatching to every device */
+        if !self.handlers_registered.swap(true, Ordering::AcqRel) {
+            kcore::softirq::register_for(
+                kcore::softirq::TYPE_NET_RX, self, DeviceTable::process_all_rx);
+            kcore::softirq::register_for(
+                kcore::softirq::TYPE_NET_TX, self, DeviceTable::process_all_tx);
+        }
+
+        trace!(0, "net: {} registered, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            core::str::from_utf8(dev.name()).unwrap_or("?"),
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        Some(dev)
+    }
+
+    /// The next slot, named. Registration is boot's, one driver at a time.
+    fn claim(&'static self, name: &str, mac: Mac) -> Option<&'static Device> {
+        if name.is_empty() || name.len() >= NAME_MAX || name.as_bytes().contains(&0) {
             return None;
         }
 
@@ -805,45 +1028,12 @@ impl DeviceTable {
             return None;
         }
 
-        let mut name = [0u8; NAME_MAX];
-        let mut name_len = 0;
-        while name_len < NAME_MAX - 1 {
-            let byte = unsafe { *ops.name.add(name_len) };
-            if byte == 0 {
-                break;
-            }
-            name[name_len] = byte;
-            name_len += 1;
-        }
-
-        let identity = Identity {
-            driver: Driver {
-                flush_tx: ops.flush_tx,
-                process_rx: ops.process_rx,
-                ctx: ops.ctx as usize,
-            },
-            name,
-            name_len,
-            mac: ops.mac,
-        };
+        let mut bytes = [0u8; NAME_MAX];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        let identity = Identity { name: bytes, name_len: name.len(), mac };
         if dev.identity.set(identity).is_err() {
             return None;
         }
-
-        self.count.store(index + 1, Ordering::Release);
-
-        /* One handler per softirq type, dispatching to every device */
-        if !self.handlers_registered.swap(true, Ordering::AcqRel) {
-            kcore::softirq::register_for(
-                kcore::softirq::TYPE_NET_RX, self, DeviceTable::process_all_rx);
-            kcore::softirq::register_for(
-                kcore::softirq::TYPE_NET_TX, self, DeviceTable::process_all_tx);
-        }
-
-        let mac = ops.mac;
-        trace!(0, "net: {} registered, mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            core::str::from_utf8(dev.name()).unwrap_or("?"),
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
         Some(dev)
     }
 
@@ -855,14 +1045,18 @@ impl DeviceTable {
         let polled = self.poll_pending.swap(0, Ordering::AcqRel) == 1;
         let mut pending = 0;
 
+        /* This is the one place an `RxContext` comes from, and what makes it
+         * true: this function is the receive soft IRQ's handler and nothing
+         * else calls it, and the kernel runs a soft IRQ type on one CPU at a
+         * time. */
+        let mut rx = RxContext { _only_the_receive_pass_makes_one: () };
+
         for dev in self.devices[..self.count()].iter() {
-            if let Some(driver) = dev.driver() {
-                driver.process_rx(dev);
-            }
+            dev.harvest(&mut rx);
             /* After the harvest, before the dispatch: what the hardware had
              * waiting. */
             pending += dev.rx_pending();
-            dev.drain_rx_and_dispatch();
+            dev.drain_rx_and_dispatch(&mut rx);
         }
 
         if polled && pending != 0 {
@@ -918,8 +1112,10 @@ impl DeviceTable {
     }
 }
 
-/* ---- what a driver calls ----
+/* ---- what a module calls ----
  *
+ * A module is linked on its own and binds these by name (`kcore::net` is
+ * their wrapper); drivers and this crate's services call the device itself.
  * A device crosses as a word -- its address -- and `by_handle` is what makes
  * a word from outside a device again: one of the table's, or nothing. So
  * these take any word at all. What they cannot check is a *frame's* word,
@@ -939,110 +1135,6 @@ unsafe fn queue_of(handles: &[usize], each: impl Fn(&Frame)) -> FrameQueue {
     }
     frames
 }
-
-/// Register a device. 0 when the table is full or the ops are not a device.
-///
-/// # Safety
-/// `ops` points at a filled table whose name and context outlive the kernel.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_netdev_register(ops: *const DeviceOps) -> usize {
-    let ops = match unsafe { ops.as_ref() } {
-        Some(ops) => ops,
-        None => return 0,
-    };
-
-    match unsafe { DEVICES.register(ops) } {
-        Some(dev) => dev.handle(),
-        None => 0,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_netdev_set_ip(dev: usize, ip: u32) {
-    if let Some(dev) = DEVICES.by_handle(dev) {
-        dev.set_ip(ip);
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_netdev_set_mask(dev: usize, mask: u32) {
-    if let Some(dev) = DEVICES.by_handle(dev) {
-        dev.set_mask(mask);
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_netdev_set_gw(dev: usize, gw: u32) {
-    if let Some(dev) = DEVICES.by_handle(dev) {
-        dev.set_gw(gw);
-    }
-}
-
-/// One queued frame, from inside the driver's own `flush_tx`. 0 when the
-/// queue is empty.
-///
-/// # Safety
-/// Called from inside `dev`'s `flush_tx`, and nowhere else: the queue is
-/// guarded by the lock that is held there.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_netdev_tx_dequeue(dev: usize) -> usize {
-    DEVICES.by_handle(dev)
-        .and_then(|dev| unsafe { dev.tx_dequeue() })
-        .map_or(0, Frame::into_handle)
-}
-
-/// A received frame into the stack. Takes it either way: what the queue had
-/// no room for is released here.
-///
-/// # Safety
-/// `frame` is a frame reference the caller gives up.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_netdev_enqueue_rx(dev: usize, frame: usize) {
-    unsafe { kernel_netdev_enqueue_rx_batch(dev, &frame, 1) };
-}
-
-/// A whole harvest, under one acquisition. Takes every frame; what the queue
-/// had no room for is released here.
-///
-/// # Safety
-/// `frames` points at `count` frame references the caller gives up.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_netdev_enqueue_rx_batch(
-    dev: usize, frames: *const usize, count: usize,
-) -> usize {
-    if frames.is_null() || count == 0 {
-        return 0;
-    }
-    let handles = unsafe { core::slice::from_raw_parts(frames, count) };
-    let dev = DEVICES.by_handle(dev);
-
-    let mut taken = 0;
-    for chunk in handles.chunks(HANDLE_CHUNK) {
-        let mut frames = unsafe { queue_of(chunk, |_| ()) };
-        if let Some(dev) = dev {
-            taken += dev.enqueue_rx(&mut frames);
-        }
-        /* What found no room -- or no device -- is released here, with the
-         * lock down. */
-        drop(frames);
-    }
-    taken
-}
-
-/// A transmitted frame handed back for release once the lock is down.
-///
-/// # Safety
-/// `frame` is a frame reference the caller gives up, and the call is made
-/// from inside `dev`'s `flush_tx`.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_netdev_tx_done(dev: usize, frame: usize) {
-    let frame = unsafe { Frame::from_handle(frame) };
-    if let (Some(dev), Some(frame)) = (DEVICES.by_handle(dev), frame) {
-        unsafe { dev.tx_done(frame) };
-    }
-}
-
-/* ---- what a consumer calls ---- */
 
 /// The device of that name, or 0.
 ///
@@ -1082,61 +1174,18 @@ pub unsafe extern "C" fn kernel_net_mac(dev: usize, out: *mut u8) {
 }
 
 #[no_mangle]
-pub extern "C" fn kernel_net_set_ip(dev: usize, ip: u32) {
-    kernel_netdev_set_ip(dev, ip);
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_net_set_mask(dev: usize, mask: u32) {
-    kernel_netdev_set_mask(dev, mask);
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_net_set_gw(dev: usize, gw: u32) {
-    kernel_netdev_set_gw(dev, gw);
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_net_route_ip(dev: usize, dst: u32) -> u32 {
-    DEVICES.by_handle(dev).map_or(dst, |dev| dev.route_ip(dst))
-}
-
-/// A frame the caller built whole, out of the device: 0 queued, -1 not.
-///
-/// # Safety
-/// `data` points at `len` readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_net_send_raw(dev: usize, data: *const u8, len: usize) -> i32 {
-    let dev = match DEVICES.by_handle(dev) {
-        Some(dev) => dev,
-        None => return -1,
-    };
-    if data.is_null() || len == 0 {
-        return -1;
-    }
-
-    let data = unsafe { core::slice::from_raw_parts(data, len) };
-    if dev.send_raw(data) { 0 } else { -1 }
-}
-
-#[no_mangle]
 pub extern "C" fn kernel_net_udp_listen(
     dev: usize, port: u16, cb: extern "C" fn(ctx: *mut u8, frame: usize), ctx: *mut u8,
 ) -> i32 {
-    match DEVICES.by_handle(dev) {
-        Some(dev) => dev.listen_udp(port, cb, None, ctx as usize),
-        None => LISTEN_INVALID,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_net_udp_listen_batch(
-    dev: usize, port: u16, cb: extern "C" fn(ctx: *mut u8, frame: usize), ctx: *mut u8,
-    batch_end: extern "C" fn(ctx: *mut u8),
-) -> i32 {
-    match DEVICES.by_handle(dev) {
-        Some(dev) => dev.listen_udp(port, cb, Some(batch_end), ctx as usize),
-        None => LISTEN_INVALID,
+    let dev = match DEVICES.by_handle(dev) {
+        Some(dev) => dev,
+        None => return LISTEN_INVALID,
+    };
+    match dev.listen_callback(port, cb, ctx as usize) {
+        Ok(()) => LISTEN_OK,
+        Err(ListenError::PortTaken) => LISTEN_PORT_TAKEN,
+        Err(ListenError::TableFull) => LISTEN_TABLE_FULL,
+        Err(ListenError::Invalid) => LISTEN_INVALID,
     }
 }
 

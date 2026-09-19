@@ -11,12 +11,12 @@
  * TX ring ownership protocol:
  *   - Software fills descriptor, sets TX_OWN to hand off to hardware.
  *   - Hardware clears TX_OWN after transmission.
- *   - The shadow array holds the NetFrame of every descriptor the hardware
+ *   - The shadow array holds the Frame of every descriptor the hardware
  *     owns, which is what keeps its DMA buffer alive until the hardware
  *     signals completion.
  *
  * RX ring ownership protocol:
- *   - Software allocates a NetFrame, writes its physical address into the
+ *   - Software allocates a Frame, writes its physical address into the
  *     descriptor, and sets RX_OWN to give the buffer to hardware.
  *   - Hardware writes received data, clears RX_OWN, updates opts1 length.
  *   - Software harvests the descriptor, reclaims the frame, and reposts a
@@ -25,7 +25,7 @@
 
 use alloc::vec::Vec;
 use kcore::dma::{Descriptor, DmaBuffer, Volatile};
-use kcore::net::{NetFrame, TxQueue};
+use net::{Frame, TxQueue};
 use crate::regs::*;
 
 /* Number of descriptors in each ring.
@@ -94,7 +94,7 @@ fn ring<D: Descriptor>(dma: DmaBuffer) -> Option<(&'static [D], u64)> {
 
 /// A ring's shadow of what is posted in it: the frame in each slot, none
 /// where there is none.
-fn shadow() -> Option<Vec<Option<NetFrame>>> {
+fn shadow() -> Option<Vec<Option<Frame>>> {
     let mut frames = Vec::new();
     frames.try_reserve_exact(RING_SIZE).ok()?;
     frames.resize_with(RING_SIZE, || None);
@@ -110,7 +110,7 @@ pub struct TxRing {
     /* Where the chip is told the ring is */
     pub phys: u64,
     /* The frame of each descriptor the hardware owns */
-    frames: Vec<Option<NetFrame>>,
+    frames: Vec<Option<Frame>>,
     /* Next free descriptor slot (written by flush_tx) */
     tail: usize,
     /* Next descriptor to check for completion (advanced by reap_completed) */
@@ -144,7 +144,7 @@ impl TxRing {
      * Caller must check has_space() first.  The frame is consumed and kept
      * in the shadow array, its DMA buffer alive, until reap_completed() sees
      * that hardware cleared TX_OWN. */
-    pub fn submit(&mut self, frame: NetFrame) {
+    pub fn submit(&mut self, frame: Frame) {
         let idx  = self.tail;
         let phys = frame.data_phys();
         let len  = frame.len() as u32;
@@ -201,7 +201,7 @@ pub struct RxRing {
     descs: &'static [RxDesc],
     pub phys: u64,
     /* Per-slot shadow frame; there while the descriptor is owned by hardware */
-    frames: Vec<Option<NetFrame>>,
+    frames: Vec<Option<Frame>>,
     /* Next descriptor to check for received data */
     head: usize,
 }
@@ -227,9 +227,9 @@ impl RxRing {
         self.frames[idx].is_none()
     }
 
-    /* Post a NetFrame at descriptor slot `idx`, giving ownership to hardware.
+    /* Post a Frame at descriptor slot `idx`, giving ownership to hardware.
      * The frame is retained in `frames[idx]` for later harvest. */
-    pub fn post(&mut self, idx: usize, frame: NetFrame) {
+    pub fn post(&mut self, idx: usize, frame: Frame) {
         let phys = frame.data_phys();
         let is_last = idx == RING_SIZE - 1;
         let eor: u32 = if is_last { RX_EOR } else { 0 };
@@ -253,7 +253,7 @@ impl RxRing {
      * responsible for reposting it before harvesting again).
      * The caller extracts the length from opts1 and must check its error
      * bits (RX_ERR_MASK, RX_FF/RX_LF) before passing the frame on. */
-    pub fn harvest(&mut self) -> Option<(NetFrame, u32)> {
+    pub fn harvest(&mut self) -> Option<(Frame, u32)> {
         let idx = self.head;
         if self.frames[idx].is_none() {
             return None;

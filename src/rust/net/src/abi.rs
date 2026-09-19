@@ -8,7 +8,7 @@
 //! name, which have to be a C ABI because a module is linked on its own.
 
 use alloc::boxed::Box;
-use kcore::net::Nic;
+use crate::nic::Nic;
 use kcore::once::OnceBox;
 use kcore::trace;
 

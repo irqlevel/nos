@@ -24,7 +24,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use kcore::net::Nic;
+use crate::nic::Nic;
 use kcore::sync::{PreemptSpinGuard, PreemptSpinLock};
 use kcore::trace;
 

@@ -7,7 +7,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use kcore::net::Nic;
+use crate::nic::Nic;
 use kcore::sync::SpinLock;
 use kcore::time;
 use kcore::trace;

@@ -32,7 +32,7 @@
  * throttle widens with the rate, so a flood costs far fewer interrupts than
  * one apiece. See arm_msix and REPOLL_NS.
  *
- * Locking, which is to say who is handed what (kcore::net::NetDriver):
+ * Locking, which is to say who is handed what (net::NetDriver):
  *  - the transmit ring is flush_tx's, which the net stack calls under the
  *    device's transmit lock. The ISR never touches it.
  *  - the receive ring is process_rx's, which the softirq layer runs on one
@@ -44,14 +44,16 @@
 #![no_std]
 extern crate alloc;
 
+use alloc::boxed::Box;
+
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kcore::cmd::{Command, Output};
-use kcore::net::{FrameBatch, NetBinding, NetDriver, RxQueue, TxQueue};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
 use kcore::time::boot_time_ns;
-use kcore::{dma, interrupt, io, msix, net, pci, softirq, trace};
+use kcore::{dma, interrupt, io, msix, pci, softirq, trace};
+use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 
 mod desc;
 mod regs;
@@ -966,7 +968,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
      * the one-descriptor gap, so this posts RING_SIZE - 1 buffers. */
     let mut posted = 0;
     while rx_ring.desc_unused() > 0 {
-        match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+        match Frame::alloc_rx(RX_BUF_SIZE) {
             Some(frame) => {
                 if rx_ring.post_next(frame).is_none() {
                     break;
@@ -1091,10 +1093,10 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
     let name = write_device_name(&mut name_buf, idx);
 
     /* For good from here: the interrupt handlers are pointed at the device,
-     * and then the net stack is -- with each ring handed to the one call
-     * that touches it. */
+     * and then the net stack is -- with each ring handed over to it, for the
+     * one call that touches it. */
     let (next_to_clean, next_to_use, head_posted) = rx_ring.pointers();
-    let binding = NetBinding::new(
+    let dev: &'static IgbDevice = Box::leak(Box::new(
         IgbDevice {
             irqs: IrqSpinLock::new(None),
             msix: AtomicBool::new(false),
@@ -1122,10 +1124,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
             _bar_mapping: bar_mapping,
             regs,
         },
-        tx_ring,
-        rx_ring,
-    );
-    let dev = binding.driver();
+    ));
 
     if !attach_interrupt(pci_dev, dev) {
         trace!(0, "igb: no interrupt could be registered");
@@ -1141,7 +1140,7 @@ fn init_device(pci_dev: &pci::PciDevice, generation: Generation) {
 
     trace_link(&dev.regs);
 
-    if binding.register(name, mac).is_none() {
+    if net::register(name, mac, dev, tx_ring, rx_ring).is_none() {
         trace!(0, "igb: NetDevice registration failed");
         dev.quiesce();
         return;
@@ -1441,7 +1440,7 @@ impl IgbDevice {
     /// them.
     fn refill_rx(&self, ring: &mut RxRing) {
         while ring.desc_unused() > 0 {
-            match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+            match Frame::alloc_rx(RX_BUF_SIZE) {
                 Some(frame) => {
                     if ring.post_next(frame).is_none() {
                         break;
@@ -1558,7 +1557,7 @@ impl IgbDevice {
 
         /* Harvested frames wait here until the batch is complete, so the
          * receive queue's lock is taken once rather than once per frame. */
-        let mut batch: FrameBatch<{ RX_BUDGET as usize }> = FrameBatch::new();
+        let mut batch = FrameQueue::new();
 
         /* Whether this pass took anything, in any of its rounds. */
         let mut took = false;

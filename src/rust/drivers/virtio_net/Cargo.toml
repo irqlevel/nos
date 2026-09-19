@@ -8,4 +8,6 @@ name = "virtio_net"
 
 [dependencies]
 kcore = { path = "../../kcore" }
+# The device table a NIC registers in, and the frames it moves.
+net = { path = "../../net" }
 virtio = { path = "../../virtio" }
