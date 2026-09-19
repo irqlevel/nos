@@ -142,10 +142,18 @@ ModuleReloc ClassifyModuleReloc(u32 type)
     }
 }
 
+/* The ABI's stack alignment: RSP on a 16-byte boundary at every call, so
+   that a function is entered 8 below one. */
+static const ulong AbiStackAlign = 16;
+
 ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
 {
-    ulong* rsp = (ulong *)stackTop;
-    *(--rsp) = entry; /* return address SwitchContext's ret pops */
+    /* The entry function is reached by SwitchContext's `ret`, as though it
+       had been called from a boundary -- so the address `ret` pops sits on
+       one. Worked out from the top rounded down, not from where Task::Stack
+       happens to put StackTop. */
+    ulong* rsp = (ulong *)((stackTop & ~(AbiStackAlign - 1)) - AbiStackAlign);
+    rsp[0] = entry; /* return address SwitchContext's ret pops */
     Kernel::Context* regs = (Kernel::Context*)((ulong)rsp - sizeof(*regs));
     Stdlib::MemSet(regs, 0, sizeof(*regs));
     regs->Rdi = arg;         /* 1st argument for the entry function */
@@ -325,10 +333,16 @@ ulong TaskSavedFramePointer(ulong savedSp)
 
 void RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx)
 {
+    /* Rounded down before the call, as Arm64RunOnStack does. Task::Stack's
+       StackTop sits 8 below a boundary, and a call from there entered every
+       function on the boot and idle stacks 8 off the ABI -- which nothing
+       noticed, the kernel using no SSE, until a UBSan build (docs/build.md)
+       found a 16-aligned local 8 off. */
+    ulong top = stackTop & ~(AbiStackAlign - 1);
     asm volatile(
         "movq %1, %%rsp\n\t"
         "callq *%0\n\t"
-        :: "a"(fn), "r"(stackTop), "D"(ctx)
+        :: "a"(fn), "r"(top), "D"(ctx)
         : "memory");
     Trace(0, "RunOnStack: fn returned");
     while (1)

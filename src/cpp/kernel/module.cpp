@@ -1,4 +1,5 @@
 #include "module.h"
+#include "module_exports.h"
 #include "elf.h"
 #include "trace.h"
 #include "cpu.h"
@@ -21,21 +22,6 @@
 #define NOS_MODULE_ABI "unset"
 #endif
 
-/* The kernel functions a module may bind to: every function the ffi crate
-   declares that this kernel defines, by name. The Makefile generates the table
-   from pass1.elf (module_exports.S) and links it into the final kernel only;
-   these empty weak ones stand in for it in pass 1, like the symbol table's in
-   symtab.cpp. */
-struct ModuleExport
-{
-    const char* Name;
-    ulong Addr;
-};
-
-extern "C" const ModuleExport nos_module_exports[];
-extern "C" const ulong nos_module_export_count;
-__attribute__((weak)) const ModuleExport nos_module_exports[] = {};
-__attribute__((weak)) const ulong nos_module_export_count = 0;
 
 /* The filesystem layer is Rust (src/rust/fs): a module's file is read whole,
    through the same calls a module itself reads a file by. */

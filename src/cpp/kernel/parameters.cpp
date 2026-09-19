@@ -2,6 +2,7 @@
 #include "cpu.h"
 #include "panic.h"
 #include "trace.h"
+#include "ubsan.h"
 
 namespace Kernel
 {
@@ -461,6 +462,11 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     else if (Stdlib::StrCmp(key, "rxpoll") == 0)
     {
         RxPoll = (Stdlib::StrCmp(value, "on") == 0);
+    }
+    else if (Stdlib::StrCmp(key, "ubsan") == 0)
+    {
+        /* Meaningful in a UBSAN=1 build only, and harmless in any other. */
+        Ubsan::SetWarnOnly(Stdlib::StrCmp(value, "warn") == 0);
     }
     else if (Stdlib::StrCmp(key, "netframes") == 0)
     {

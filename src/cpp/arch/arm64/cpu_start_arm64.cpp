@@ -1,6 +1,7 @@
 #include "board.h"
 
 #include <kernel/cpu.h>
+#include <kernel/panic.h>
 #include <kernel/stack_probe.h>
 #include <kernel/parameters.h>
 #include <kernel/trace.h>
@@ -69,6 +70,7 @@ static_assert(Board::MaxBoardCpus <= MaxCpus,
     "the FDT CPU table must not outgrow the kernel's CPU cap");
 
 /* boot.S */
+extern "C" char BootStackGuard[];
 extern "C" char BootStack[];
 extern "C" char BootStackTop[];
 
@@ -117,6 +119,15 @@ bool CpuTable::StartAll()
     ulong entryPhys = (ulong)&SecondaryEntry[0] - Mm::MemoryMap::KernelSpaceBase;
 
     Trace(0, "Starting cpus, entry 0x%p", entryPhys);
+
+    /* The boot stack runs down into this guard, and past it into the
+       identity tables every AP walks as it turns its MMU on (boot.S). A
+       guard that has been written in means the stack may have gone further:
+       an AP started now could take a translation fault with no vector to go
+       to, and the only sign of it would be "still not running". */
+    ulong guardSize = (ulong)&BootStack[0] - (ulong)&BootStackGuard[0];
+    if (StackProbe::Untouched(&BootStackGuard[0], guardSize) != guardSize)
+        Panic("the boot stack ran off its end, into the guard above the APs' identity tables");
 
     Arm64ApTtbr1 = Mm::PageTable::GetInstance().GetRoot();
     for (ulong i = 0; i < Stdlib::ArraySize(Arm64ApStackTop) && i < MaxCpus; i++)

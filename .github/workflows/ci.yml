@@ -79,3 +79,18 @@ jobs:
       - name: netload test (TCG)
         if: matrix.arch == 'aarch64'
         run: python3 scripts/netload-test.py --tcg
+
+      # The same kernel under clang's undefined-behaviour sanitizer (UBSAN=1,
+      # docs/build.md): a check in front of every operation the language
+      # leaves undefined, and the first one that fails a panic -- so this
+      # smoke boot is a UB check over the whole boot path. Last, because its
+      # images replace the ones every step above tests.
+      - name: UBSan build and smoke test (${{ matrix.arch }}, TCG)
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          make nocheck ARCH=${{ matrix.arch }} UBSAN=1
+          if [ "${{ matrix.arch }}" = "x86_64" ]; then
+            ./scripts/smoke-test.sh --skip-build
+          else
+            ./scripts/smoke-arm64.sh --skip-build
+          fi

@@ -424,6 +424,10 @@ CpuidCall:
 	push r15
 %endmacro
 
+; What PushAll pushes, in bytes: the frame stubs below build their alignment
+; on. Kept in step with it by hand; the sums below check what depends on it.
+%assign PushAllSize 17 * 8
+
 %macro PopAll 0
 	pop r15
 	pop r14
@@ -531,6 +535,23 @@ AtomicCmpxchg:
 	lock cmpxchg qword [rdi], rsi
 	ret
 
+; The ABI wants RSP on a 16-byte boundary at every call. The CPU aligns RSP
+; to 16 and pushes SS, RSP, RFLAGS, CS and RIP, and for some exceptions an
+; error code on top of those; PushAll follows. An interrupt stub then calls
+; from a boundary as the frame stands; one under an error code is 8 off it,
+; and pads. It did not: every #GP, #PF and the rest ran its C++ handler 8
+; off the ABI, found while chasing a UBSan report of the same thing on the
+; boot stacks (docs/build.md). The assembly fails if the sums stop adding up.
+%define CpuFrameSize 40
+%define ErrorCodeSize 8
+%define ErrorCodePad 8
+%if (CpuFrameSize + PushAllSize) % 16 != 0
+	%error "an interrupt stub would call C++ with RSP off a 16-byte boundary"
+%endif
+%if (CpuFrameSize + ErrorCodeSize + PushAllSize + ErrorCodePad) % 16 != 0
+	%error "an exception stub under an error code would call C++ with RSP off a 16-byte boundary"
+%endif
+
 %macro InterruptStub 1
 %1InterruptStub:
 	PushAll
@@ -556,9 +577,11 @@ AtomicCmpxchg:
 	PushAll
 	mov rdi, rsp
 	cld
+	sub rsp, ErrorCodePad
 	call %1
+	add rsp, ErrorCodePad
 	PopAll
-	add rsp, 8 ; remove error code pushed by CPU
+	add rsp, ErrorCodeSize ; remove error code pushed by CPU
 	iretq
 %endmacro
 

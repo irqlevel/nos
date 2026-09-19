@@ -9,9 +9,6 @@ extern "C" char KernelStart[], KernelText[];
 namespace Kernel
 {
 
-/* Weak defaults — overridden by generated symtab_data.o in pass 2 */
-__attribute__((weak)) const SymEntry SymbolTable::Symbols[] = {};
-__attribute__((weak)) const size_t SymbolTable::SymbolCount = 0;
 
 SymbolTable::SymbolTable()
 {

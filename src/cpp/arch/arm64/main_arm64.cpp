@@ -17,6 +17,7 @@
 #include <kernel/panic.h>
 #include <kernel/dmesg.h>
 #include <kernel/parameters.h>
+#include <kernel/ubsan.h>
 #include <kernel/time.h>
 #include <kernel/test.h>
 #include <kernel/random.h>
@@ -103,6 +104,7 @@ void SetupVectors(); /* arch/arm64/exception_arm64.cpp */
 
 /* boot.S */
 extern "C" char BootStack[];
+extern "C" char BootStackGuard[];
 extern "C" char BootStackTop[];
 
 typedef void (*HaltAction)();
@@ -273,6 +275,7 @@ static void BpStartupArm(void* ctx)
     }
 
     Trace(0, "After test");
+    Ubsan::Announce();
 
     rust_init();
     rust_test();
@@ -420,6 +423,10 @@ extern "C" void MainArm64(void* dtb)
         if (sp > base + PoisonMargin)
             StackProbe::Poison(&BootStack[0],
                 (sp - base - PoisonMargin) & ~(sizeof(ulong) - 1));
+
+        /* And the guard page below it, whole: CpuTable::StartAll wants it
+           untouched (boot.S). */
+        StackProbe::Poison(&BootStackGuard[0], base - (ulong)&BootStackGuard[0]);
     }
 
     auto& board = Board::GetInstance();
