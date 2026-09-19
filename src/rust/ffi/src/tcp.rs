@@ -1,10 +1,10 @@
 use core::ffi::c_void;
 
-/* The TLS client drives a connection the C++ side owns: these are the two
-   calls it makes back into net/tcp.cpp. Both return the byte count, 0 at
-   EOF, or a negative Tcp::Recv code. */
+/* TCP as a loadable module reaches it (src/rust/net/src/abi.rs defines
+   these): a module is linked on its own, so a C ABI is the only seam it and
+   the network layer can share. Code inside the kernel image calls the layer
+   itself. The byte count, 0 at EOF, or a negative code: -2 is a timeout. */
 extern "C" {
-    pub fn kernel_tcp_send(conn: *mut c_void, buf: *const u8, len: usize) -> isize;
     pub fn kernel_tcp_recv(
         conn: *mut c_void,
         buf: *mut u8,

@@ -156,25 +156,16 @@ pub extern "C" fn rust_tcp_init() -> i32 {
     if TCP.init() { 0 } else { -1 }
 }
 
-/* ---- TCP, as a module and the TLS client call it ---- */
+/* ---- TCP, as a module calls it ---- */
 
-/* These were defined in `rust_ffi.cpp`, over the C++ `Tcp` view, which called
- * straight back into this crate: Rust to C++ to Rust for every byte the SSH
- * server sent. They are the same names and the same contract, one hop now. */
+/* A module is linked on its own and binds these by name, which is why they
+ * are a C ABI; nothing inside the kernel image comes through here -- the
+ * HTTP client and, through the transport it is handed, the TLS client call
+ * `TCP` itself. */
 
-/// The bytes queued, or -1 when the connection is gone before any were.
-///
-/// # Safety
-/// `conn` came from a listen, accept or connect, and `buf` holds `len` bytes.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_tcp_send(
-    conn: ConnPtr, buf: *const u8, len: usize,
-) -> isize {
-    unsafe { kernel_tcp_send_timeout(conn, buf, len, 0) }
-}
-
-/// `kernel_tcp_send` with a bound on the wait for room: the bytes queued, 0
-/// when `timeout_ms` found room for none, -1 once the connection is gone.
+/// The bytes queued within `timeout_ms` (0: wait for room as long as it
+/// takes): 0 when the time found room for none, -1 once the connection is
+/// gone.
 ///
 /// # Safety
 /// `conn` came from a listen, accept or connect, and `buf` holds `len` bytes.
