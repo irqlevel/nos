@@ -31,7 +31,6 @@
 #include <lib/unique_ptr.h>
 #include <lib/checksum.h>
 #include <lib/grub_env.h>
-#include "sha256.h"
 
 /* The network layer is Rust (src/rust/net); its commands register
    themselves. These two are boot's, run by the shell's own task. */
@@ -515,201 +514,6 @@ static void CmdStacks(const char* args, Stdlib::Printer& con)
 }
 
 
-/* Mirrors R8125State in src/rust/drivers/r8125/src/lib.rs. */
-struct R8125State
-{
-    u32 Present;
-    u32 Cmd;
-    u32 IntrStatus;
-    u32 IntrMask;
-    u32 RxConfig;
-    u32 RxHead;
-    u32 HeadPosted;
-    u32 HeadOpts1;
-    u64 RxErrEvents;
-    u64 RxPolls;
-    u64 RxBudgetHits;
-    u64 RxPackets;
-    u64 RxDropped;
-};
-
-extern "C" int r8125_get_state(R8125State* out);
-
-/* Mirrors IgbState in src/rust/drivers/igb/src/lib.rs. */
-struct IgbState
-{
-    u32 Present;
-    u32 Generation;
-    u32 PhyBmcr;
-    u32 PhyBmsr;
-    u32 PhyAnar;
-    u32 PhyAnlpar;
-    u32 PhyGctl;
-    u32 PhyGstat;
-    u32 Ctrl;
-    u32 Status;
-    u32 Rctl;
-    u32 Tctl;
-    u32 Ims;
-    u32 Eitr;
-    u64 StatTpr;
-    u64 StatGprc;
-    u64 StatMpc;
-    u64 StatRnbc;
-    u64 StatRxerrc;
-    u32 StatRqdpc;
-    u32 StatPqgprc;
-    u32 Rxdctl;
-    u32 Srrctl;
-    u32 Rdh;
-    u32 Rdt;
-    u32 Tdh;
-    u32 Tdt;
-    u32 NextToClean;
-    u32 NextToUse;
-    u32 HeadStatus;
-    u32 HeadPosted;
-    u64 RxPolls;
-    u64 RxBudgetHits;
-    u64 RxErrEvents;
-    u64 RxPackets;
-    u64 RxDropped;
-    u64 TxPackets;
-    u32 TwoVector;
-    u32 RxRatePps;
-    u64 IsrQueue;
-    u64 IsrOther;
-    u64 RxRepollHits;
-    u64 RxRepolls;
-    u64 RxRepollNs;
-    u32 Msix;
-};
-
-extern "C" int igb_get_state(IgbState* out);
-
-static void CmdIgbdump(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-
-    IgbState st;
-    Stdlib::MemSet(&st, 0, sizeof(st));
-
-    if (igb_get_state(&st) != 0 || st.Present == 0)
-    {
-        con.Printf("igbdump: no igb\n");
-        return;
-    }
-
-    static const u32 StatusLu = 1u << 1;
-    static const u32 RctlEn = 1u << 1;
-    static const u32 TctlEn = 1u << 1;
-    static const u32 XdctlEnable = 1u << 25;
-    static const u32 RxdStatDd = 1u << 0;
-
-    static const u32 BmsrLstatus = 1u << 2;
-    static const u32 BmsrAnegDone = 1u << 5;
-
-    con.Printf("part %s\n", st.Generation ? "I210" : "82576");
-    con.Printf("ctrl 0x%p status 0x%p link %u\n", (ulong)st.Ctrl, (ulong)st.Status,
-        (ulong)((st.Status & StatusLu) ? 1 : 0));
-    /* The PHY's own view, which is what tells a link the driver never brought
-       up apart from a cable that is not plugged in. */
-    con.Printf("phy bmcr 0x%p bmsr 0x%p link %u autoneg-done %u\n",
-        (ulong)st.PhyBmcr, (ulong)st.PhyBmsr,
-        (ulong)((st.PhyBmsr & BmsrLstatus) ? 1 : 0),
-        (ulong)((st.PhyBmsr & BmsrAnegDone) ? 1 : 0));
-    /* What we offered against what came back: a link that resolves lower than
-       it should is one or the other, and nothing else distinguishes them. */
-    con.Printf("phy adv 0x%p partner 0x%p  1000: ctrl 0x%p status 0x%p\n",
-        (ulong)st.PhyAnar, (ulong)st.PhyAnlpar,
-        (ulong)st.PhyGctl, (ulong)st.PhyGstat);
-    con.Printf("rctl 0x%p rx-en %u  tctl 0x%p tx-en %u  ims 0x%p\n",
-        (ulong)st.Rctl, (ulong)((st.Rctl & RctlEn) ? 1 : 0),
-        (ulong)st.Tctl, (ulong)((st.Tctl & TctlEn) ? 1 : 0), (ulong)st.Ims);
-    /* Microseconds the chip holds interrupts apart. Firmware leaves a value
-       here that a device reset does not clear, and it caps the receive rate
-       on its own -- on MSI-X. On INTx the part throttles through ITR, and
-       this register, which the driver then leaves alone, is not in force. */
-    con.Printf("interrupt throttle %u us%s, rx rate %u pps\n",
-        (ulong)st.Eitr, st.Msix ? "" : " (not in force: INTx)", (ulong)st.RxRatePps);
-    con.Printf("interrupts: %s, queue %u, other %u\n",
-        !st.Msix ? "INTx" : (st.TwoVector ? "queue + other vector" : "one vector"),
-        (ulong)st.IsrQueue, (ulong)st.IsrOther);
-    /* Under load the poll looks at an empty ring again rather than arm the
-       interrupt: how many such passes, how many runs of them a frame ended --
-       an interrupt spared each time -- and how long the ring sat empty
-       through them, which is what they cost. The receive softirq's CPU in
-       `top`, less that, is the work. */
-    con.Printf("rx repolls %u, %u runs ended by a frame, %u us on an empty ring\n",
-        (ulong)st.RxRepolls, (ulong)st.RxRepollHits,
-        (ulong)(st.RxRepollNs / Const::NanoSecsInUsec));
-    /* The prefetch thresholds live in the low fields of RXDCTL. Zero there
-       means the chip never prefetches descriptors and drops packets with a
-       full ring, so they are worth reading back rather than assuming. */
-    con.Printf("rxdctl 0x%p queue-en %u (pthresh %u hthresh %u wthresh %u) srrctl 0x%p\n",
-        (ulong)st.Rxdctl, (ulong)((st.Rxdctl & XdctlEnable) ? 1 : 0),
-        (ulong)(st.Rxdctl & 0x1F), (ulong)((st.Rxdctl >> 8) & 0x1F),
-        (ulong)((st.Rxdctl >> 16) & 0x1F), (ulong)st.Srrctl);
-    con.Printf("rx ring: rdh %u rdt %u  clean %u use %u\n",
-        (ulong)st.Rdh, (ulong)st.Rdt, (ulong)st.NextToClean, (ulong)st.NextToUse);
-    con.Printf("rx head: status 0x%p dd %u posted %u\n", (ulong)st.HeadStatus,
-        (ulong)((st.HeadStatus & RxdStatDd) ? 1 : 0), (ulong)st.HeadPosted);
-    con.Printf("tx ring: tdh %u tdt %u packets %u\n",
-        (ulong)st.Tdh, (ulong)st.Tdt, (ulong)st.TxPackets);
-    con.Printf("rx packets %u dropped %u err events %u\n",
-        (ulong)st.RxPackets, (ulong)st.RxDropped, (ulong)st.RxErrEvents);
-    con.Printf("rx polls %u, of them budget-limited %u\n",
-        (ulong)st.RxPolls, (ulong)st.RxBudgetHits);
-    /* The chip's own view, which the ring counters cannot see: a frame the MAC
-       dropped before it reached for a descriptor never appears above. TPR is
-       everything taken off the wire, MPC what the receive FIFO had no room
-       for, RNBC what found no descriptor waiting. */
-    con.Printf("mac: total %u good %u missed %u no-buffer %u errors %u\n",
-        (ulong)st.StatTpr, (ulong)st.StatGprc, (ulong)st.StatMpc,
-        (ulong)st.StatRnbc, (ulong)st.StatRxerrc);
-    /* Per queue. RQDPC counts packets the queue was offered and had no
-       descriptor for -- the one drop nothing else in this dump can see. */
-    con.Printf("queue0: good %u dropped-no-descriptor %u\n",
-        (ulong)st.StatPqgprc, (ulong)st.StatRqdpc);
-}
-
-static void CmdNicdump(const char* args, Stdlib::Printer& con)
-{
-    (void)args;
-
-    R8125State st;
-    Stdlib::MemSet(&st, 0, sizeof(st));
-
-    if (r8125_get_state(&st) != 0 || st.Present == 0)
-    {
-        con.Printf("nicdump: no r8125\n");
-        return;
-    }
-
-    /* Bit 3 of the command register is the receiver. If it is clear the chip
-       has switched itself off and nothing the driver does to descriptors will
-       bring it back -- which is the one thing six guesses about this stall
-       never checked. */
-    static const u32 CmdRxEn = 0x08;
-    static const u32 CmdTxEn = 0x04;
-    static const u32 RxOwn = 0x80000000;
-
-    con.Printf("cmd 0x%p rx-en %u tx-en %u\n", (ulong)st.Cmd,
-        (ulong)((st.Cmd & CmdRxEn) ? 1 : 0), (ulong)((st.Cmd & CmdTxEn) ? 1 : 0));
-    con.Printf("isr 0x%p imr 0x%p rxcfg 0x%p\n",
-        (ulong)st.IntrStatus, (ulong)st.IntrMask, (ulong)st.RxConfig);
-    con.Printf("rx head %u posted %u opts1 0x%p own %u\n",
-        (ulong)st.RxHead, (ulong)st.HeadPosted, (ulong)st.HeadOpts1,
-        (ulong)((st.HeadOpts1 & RxOwn) ? 1 : 0));
-    con.Printf("rx packets %u dropped %u err events %u\n",
-        (ulong)st.RxPackets, (ulong)st.RxDropped, (ulong)st.RxErrEvents);
-
-    /* A ceiling that reads as polls-per-second times budget is either the
-       softirq loop's cadence or the chip's interrupt rate; these tell which. */
-    con.Printf("rx polls %u, of them budget-limited %u\n",
-        (ulong)st.RxPolls, (ulong)st.RxBudgetHits);
-}
-
 static void CmdPs(const char* args, Stdlib::Printer& con)
 {
     (void)args;
@@ -848,84 +652,6 @@ static void CmdCrc32(const char* args, Stdlib::Printer& con)
         con.Printf("%s: crc32 0x%p, %u bytes\n", path, (ulong)crc, total);
     else
         con.Printf("read failed\n");
-}
-
-static void PrintHex(Stdlib::Printer& con, const u8* buf, ulong len)
-{
-    static const char hex[] = "0123456789abcdef";
-    for (ulong i = 0; i < len; i++)
-    {
-        char s[3];
-        s[0] = hex[(buf[i] >> 4) & 0xF];
-        s[1] = hex[buf[i] & 0xF];
-        s[2] = '\0';
-        con.PrintString(s);
-    }
-}
-
-static void CmdSha256(const char* args, Stdlib::Printer& con)
-{
-    static const ulong ChunkSize = 64 * 1024;
-
-    const char* end;
-    const char* pathStart = Stdlib::NextToken(args, end);
-    if (pathStart == nullptr)
-    {
-        con.Printf("usage: sha256 <path>\n");
-        return;
-    }
-    char path[MaxPath];
-    Stdlib::TokenCopy(pathStart, end, path, sizeof(path));
-
-    RustFile* file = FileOpen(path, FileRead);
-    if (file == nullptr)
-    {
-        con.Printf("open failed\n");
-        return;
-    }
-
-    u8* buf = (u8*)Mm::Alloc(ChunkSize, 0);
-    if (buf == nullptr)
-    {
-        con.Printf("alloc failed\n");
-        kernel_vfs_close(file);
-        return;
-    }
-
-    Sha256Hash hash;
-    bool ok = true;
-    for (;;)
-    {
-        ulong got = 0;
-        if (kernel_vfs_read(file, buf, ChunkSize, &got) != 0)
-        {
-            ok = false;
-            break;
-        }
-        if (got == 0)
-            break;
-        hash.Update(buf, got);
-    }
-
-    Mm::Free(buf);
-    kernel_vfs_close(file);
-
-    if (!ok)
-    {
-        con.Printf("read failed\n");
-        return;
-    }
-
-    /* As sha256sum prints it, so a line of a release's SHA256SUMS compares
-       by eye */
-    u8 digest[Sha256Hash::DigestSize];
-    if (!hash.Finish(digest))
-    {
-        con.Printf("hash failed\n");
-        return;
-    }
-    PrintHex(con, digest, sizeof(digest));
-    con.Printf("  %s\n", path);
 }
 
 /* A GRUB environment block bigger than this is not one grub-editenv made */
@@ -1763,8 +1489,6 @@ static const CmdEntry Commands[] = {
     { "date",      CmdDate,      "date - show wall clock time" },
     { "ps",        CmdPs,        "ps - show tasks" },
     { "stacks",    CmdStacks,    "stacks - stack high-water marks" },
-    { "nicdump",   CmdNicdump,   "nicdump - r8125 chip and ring state" },
-    { "igbdump",   CmdIgbdump,   "igbdump - igb chip and ring state" },
     { "top",       CmdTop,       "top [ms] - per-task cpu use over a sampling window" },
     { "profile",   CmdProfile,   "profile [ms] [pid] - sample where the kernel spends its time" },
     { "watchdog",  CmdWatchdog,  "watchdog - show watchdog stats" },
@@ -1774,7 +1498,6 @@ static const CmdEntry Commands[] = {
     { "irqstat",   CmdIrqstat,   "irqstat - show interrupt statistics" },
     { "pci",       CmdPci,       "pci - show pci devices" },
     { "crc32",     CmdCrc32,     "crc32 <path> - CRC-32 of a file" },
-    { "sha256",    CmdSha256,    "sha256 <path> - SHA-256 of a file, as sha256sum prints it" },
     { "grubenv",   CmdGrubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
     { "insmod",    CmdInsmod,    "insmod <path> - load a kernel module (.ko)" },
     { "rmmod",     CmdRmmod,     "rmmod <name> - unload a kernel module" },
