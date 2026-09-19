@@ -10,7 +10,7 @@
 //! with tables it writes itself; a self-test cannot, because a boot has only
 //! the disks it was given.
 
-use kcore::block::{self, Disk};
+use crate::disk::{self as block, Disk};
 use kcore::trace;
 
 fn check(what: &str, ok: bool) -> bool {
@@ -35,14 +35,8 @@ fn lookups() -> bool {
             None => continue,
         };
 
-        let mut buf = [0u8; 64];
-        let name = match dev.name(&mut buf) {
-            Some(name) => name,
-            None => {
-                ok &= check("every device in the table has a name", false);
-                continue;
-            }
-        };
+        let name = dev.name();
+        ok &= check("every device in the table has a name", !name.is_empty());
 
         ok &= check("and answers to it with the handle the walk gave",
             Disk::open(name).map(|found| found.handle()) == Some(dev.handle()));

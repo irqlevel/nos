@@ -18,57 +18,16 @@ pub struct BlockIo {
     pub ctx: *mut u8,
 }
 
-#[repr(C)]
-pub struct BlockDeviceOps {
-    pub name: *const u8,
-    pub capacity: u64,
-    pub sector_size: u64,
-    pub read_sectors: Option<extern "C" fn(
-        ctx: *mut u8, sector: u64, buf: *mut u8, count: u32,
-    ) -> i32>,
-    pub write_sectors: Option<extern "C" fn(
-        ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
-    ) -> i32>,
-    pub flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
-    /// The asynchronous path; None for a device without one.
-    pub submit: Option<extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32>,
-    pub kick: Option<extern "C" fn(ctx: *mut u8)>,
-    pub ctx: *mut u8,
-    /// The disk this is a partition of, as its handle, or 0 for a whole
-    /// disk. What claims are refused through: one on a disk keeps its
-    /// partitions out, and one on a partition keeps the disk out.
-    pub parent: usize,
-}
-
-extern "C" {
-    pub fn kernel_blockdev_register(ops: *const BlockDeviceOps) -> usize;
-}
-
-/* The consuming side: a block device already in the kernel's table -- a disk,
-   or a partition of one -- read and written by name. */
+/* A block device already in the kernel's table -- a disk, or a partition of
+   one -- read and written by name: the block layer as a loadable module
+   reaches it (src/rust/block/src/table.rs defines these). A module is linked
+   on its own, so a C ABI is the only seam it and the layer can share; code
+   inside the kernel image calls the layer itself, and a driver registers
+   with it as a `block::BlockDriver`. */
 extern "C" {
     /// The device `disks` lists under this name, or 0. Devices live as long
     /// as the kernel does: there is nothing to release.
     pub fn kernel_blockdev_find(name: *const u8, name_len: usize) -> usize;
-
-    /// How many devices the table holds. It only grows, so an index once
-    /// valid stays valid and names the same device.
-    pub fn kernel_blockdev_count() -> u32;
-
-    /// The index'th device of the table, or 0.
-    pub fn kernel_blockdev_at(index: u32) -> usize;
-
-    /// The device's name into buf, NUL-terminated: the length written, or 0
-    /// if it does not fit.
-    pub fn kernel_blockdev_name(handle: usize, buf: *mut u8, len: usize) -> usize;
-
-    /// The disk a partition is on, or 0 for a whole disk.
-    pub fn kernel_blockdev_parent(handle: usize) -> usize;
-
-    /// 1 once interrupts and the scheduler are running, which is when a
-    /// driver may wait for a completion instead of polling for it.
-    pub fn kernel_blockdev_interrupts_started() -> i32;
-    pub fn kernel_blockdev_set_interrupts_started();
 
     /// Its size, in sectors
     pub fn kernel_blockdev_capacity(handle: usize) -> u64;
@@ -91,12 +50,6 @@ extern "C" {
     /// those is on it, on the disk it is a partition of, or on a partition
     /// of it.
     pub fn kernel_blockdev_claim(handle: usize, held_by: *mut *const u8) -> usize;
-
-    /// The same, naming the holder a refusal reports -- what the kernel's own
-    /// claimants (a mount, the disk log, the shell) use.
-    pub fn kernel_blockdev_claim_as(
-        handle: usize, holder: *const u8, held_by: *mut *const u8,
-    ) -> usize;
 
     pub fn kernel_blockdev_release(claim: usize);
 

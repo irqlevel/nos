@@ -14,16 +14,19 @@
 
 extern crate alloc;
 
+mod disk;
 mod disklog;
 mod part;
 mod selftest;
 mod shell;
 mod table;
 
+pub use disk::{at, claim_as, count, register_driver, release, Disk};
+pub use table::{interrupts_started, BlockDriver};
+
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use kcore::block::Disk;
 use kcore::cmd::{Command, Output};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
@@ -83,10 +86,10 @@ static PART_COUNT: AtomicU32 = AtomicU32::new(0);
 pub extern "C" fn rust_partitions_probe() {
     /* The count is read once: probing registers partitions, and probing
      * those would be probing our own output. */
-    let devices = kcore::block::count();
+    let devices = disk::count();
 
     for index in 0..devices {
-        let disk = match kcore::block::at(index) {
+        let disk = match disk::at(index) {
             Some(disk) => disk,
             None => continue,
         };
@@ -293,11 +296,7 @@ fn add_partition(disk: Disk, start: u64, count: u64, index: u32) -> bool {
         return false;
     }
 
-    let mut disk_name = [0u8; part::NAME_MAX];
-    let disk_name = match disk.name(&mut disk_name) {
-        Some(name) => name,
-        None => return true,
-    };
+    let disk_name = disk.name();
 
     let mut name = [0u8; part::NAME_MAX];
     let len = match partition_name(disk_name.as_bytes(), index + 1, &mut name) {

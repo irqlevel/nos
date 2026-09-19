@@ -21,7 +21,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use kcore::block::{self, BlockDriver};
+use block::BlockDriver;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::{self, DmaBuffer};
 use kcore::interrupt::LegacyInterrupt;
@@ -467,7 +467,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     transport.setup_queue(REQUEST_QUEUE, &virtio::QueueLayout { msix: msix_entry, ..layout });
     virtio::driver_ok(transport);
 
-    match block::register_driver(name, 0, blk) {
+    match block::register_driver(name, blk) {
         Some(_registration) => {
             DEVICES.store(index + 1, Ordering::Release);
             trace!(0, "virtio-blk: {} is a disk of {} sectors{}, {} slots",

@@ -314,6 +314,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 name = "fs"
 version = "0.1.0"
 dependencies = [
+ "block",
  "kcore",
 ]
 
@@ -575,6 +576,7 @@ dependencies = [
 name = "nvme"
 version = "0.1.0"
 dependencies = [
+ "block",
  "kcore",
 ]
 
@@ -1096,6 +1098,7 @@ dependencies = [
 name = "virtio-blk"
 version = "0.1.0"
 dependencies = [
+ "block",
  "kcore",
  "virtio",
 ]
@@ -1120,6 +1123,7 @@ dependencies = [
 name = "virtio-scsi"
 version = "0.1.0"
 dependencies = [
+ "block",
  "kcore",
  "virtio",
 ]

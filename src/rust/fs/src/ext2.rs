@@ -19,7 +19,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use kcore::block::Disk;
+use block::Disk;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::pod::{self, Pod};
@@ -2405,8 +2405,7 @@ impl FileSystem for Ext2 {
 
     /// The device and the label, for `mounts`.
     fn info(&self, out: &mut dyn core::fmt::Write) {
-        let mut name = [0u8; 32];
-        let _ = out.write_str(self.io.dev.name(&mut name).unwrap_or(""));
+        let _ = out.write_str(self.io.dev.name());
 
         let label = &self.sb.volume_name;
         let end = label.iter().position(|b| *b == 0).unwrap_or(label.len());

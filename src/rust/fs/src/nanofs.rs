@@ -17,7 +17,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use kcore::block::Disk;
+use block::Disk;
 use kcore::crc32::{crc32_update, crc32_with_hole};
 use kcore::dma::DmaBuffer;
 use kcore::trace;

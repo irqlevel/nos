@@ -8,4 +8,6 @@ name = "virtio_blk"
 
 [dependencies]
 kcore = { path = "../../kcore" }
+# The device table a disk is registered in.
+block = { path = "../../block" }
 virtio = { path = "../../virtio" }

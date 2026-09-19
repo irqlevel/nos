@@ -3,9 +3,10 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use kcore::{trace, dma, io, msix, pci, block, sync};
+use kcore::{trace, dma, io, msix, pci, sync};
 use kcore::bitmap::BitMap;
-use kcore::block::{BlockDriver, BlockIo, SubmitError};
+use block::BlockDriver;
+use kcore::block::{BlockIo, SubmitError, IO_FLUSH, IO_READ, IO_WRITE};
 use kcore::consts::PAGE_SIZE;
 use kcore::once::Once;
 use kcore::time::poll_until_busy;
@@ -457,7 +458,7 @@ fn init_device(dev: pci::PciDevice) {
     let name = core::str::from_utf8(&name).unwrap_or("nvme?");
 
     /* --- Register as block device: a whole disk --- */
-    match block::register_driver(name, 0, device) {
+    match block::register_driver(name, device) {
         Some(_reg) => {
             /* Registration is permanent; the handle has no Drop. */
             let _ = DEVICES[idx as usize].set(device);
@@ -688,7 +689,7 @@ impl NvmeDevice {
      * ISR above. */
     fn queue_async(&self, io: &BlockIo) -> Result<(), SubmitError> {
         let (opcode, prp1, prp2, cdw12) = match io.op {
-            block::IO_READ | block::IO_WRITE => {
+            IO_READ | IO_WRITE => {
                 let count = io.count;
                 if count == 0
                     || count > self.max_transfer
@@ -712,11 +713,11 @@ impl NvmeDevice {
                     0
                 };
 
-                let write = io.op == block::IO_WRITE;
+                let write = io.op == IO_WRITE;
                 let fua: u32 = if write && io.fua != 0 { 1 << 30 } else { 0 };
                 (if write { OPC_WRITE } else { OPC_READ }, io.phys, prp2, fua | (count - 1))
             }
-            block::IO_FLUSH => (OPC_FLUSH, 0, 0, 0),
+            IO_FLUSH => (OPC_FLUSH, 0, 0, 0),
             _ => return Err(SubmitError::Invalid),
         };
 
@@ -879,7 +880,9 @@ impl NvmeDevice {
 }
 
 impl BlockDriver for NvmeDevice {
-    const ASYNC: bool = true;
+    fn is_async(&self) -> bool {
+        true
+    }
 
     fn capacity(&self) -> u64 {
         self.capacity
