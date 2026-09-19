@@ -157,6 +157,7 @@ pub fn spawn_with_ctx(
     if h == 0 { None } else { Some(TaskHandle { handle: h }) }
 }
 
+#[inline]
 pub fn cpu_id() -> u32 {
     crate::cpu::id()
 }

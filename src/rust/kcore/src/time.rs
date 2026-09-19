@@ -46,6 +46,7 @@ impl Duration {
     }
 }
 
+#[inline]
 pub fn boot_time() -> Duration {
     let mut secs: u64 = 0;
     let mut usecs: u64 = 0;
@@ -63,6 +64,7 @@ pub fn wall_clock_secs() -> u64 {
 
 /// Nanoseconds since boot at the clock's full resolution -- what timing a
 /// single I/O wants; boot_time() comes rounded to microseconds.
+#[inline]
 pub fn boot_time_ns() -> u64 {
     time::kernel_get_boot_time_ns()
 }
