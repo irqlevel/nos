@@ -31,7 +31,6 @@ pub mod cpu;
 pub mod block;
 pub mod net;
 pub mod bitmap;
-pub mod ring_buffer;
 pub mod ring;
 pub mod static_ring;
 pub mod hpet;

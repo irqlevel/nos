@@ -66,16 +66,6 @@ impl<T: PortWidth> Port<T> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn read_msr(msr: u32) -> u64 {
-    io::ReadMsr(msr)
-}
-
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn write_msr(msr: u32, value: u64) {
-    io::WriteMsr(msr, value);
-}
-
 pub struct MmioRegion {
     base: *mut u8,
     size: usize,

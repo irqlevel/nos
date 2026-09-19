@@ -5,6 +5,4 @@ unsafe extern "C" {
     pub fn Inw(port: u16) -> u16;
     pub fn Out(port: u16, data: u32);
     pub fn In(port: u16) -> u32;
-    pub fn ReadMsr(msr: u32) -> u64;
-    pub fn WriteMsr(msr: u32, value: u64);
 }

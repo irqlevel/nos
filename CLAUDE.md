@@ -233,14 +233,14 @@ Look here before writing `unsafe`: the shape you need probably has a type.
 | `random` | `fill_random(&mut [u8])`, `random_u64()` |
 | `pci` | Device scan, config r/w, BAR access (`get_bar`, `get_bar64`) |
 | `dma` | `DmaBuffer` (contiguous DMA alloc; `bytes`/`bytes_mut`, and `load`/`store` of a `Pod` at an offset — volatile, aligned and bounds-checked), `PhysMapping`, `virt_to_phys`; for a descriptor ring, `Volatile<T>` cells, `unsafe trait Descriptor` and `DmaBuffer::leak_ring::<D>() -> (&'static [D], phys)` — the ring as a shared slice of cells, which is what it is: the device, the poll and the state dump all look at it |
-| `io` | `MmioRegion` (8/16/32/64-bit), `Port<T>`, `read_msr`/`write_msr` |
+| `io` | `MmioRegion` (8/16/32/64-bit, `window(offset)` for a register block inside it), `Port<T>` |
 | `msix` | `MsixTable`, `MsixInterrupt::register_for(table, index, &'static T, handler)` (16 slots) |
 | `interrupt` | `LegacyInterrupt::register_level_for(dev, &'static T, handler)` / `register_irq_for(irq, …)` (INTx, 8 slots) |
 | `sync` | **Locks own what they guard**: `Mutex<T>` (sleeps), `SpinLock<T>` (the kernel's), `IrqSpinLock<T>` and `PreemptSpinLock<T>` (const-constructible, for statics; the first also `try_lock`), `TryLock<T>` (never waited for; the holder may sleep). `lock()` gives a guard that derefs to the data. `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |
 | `once` | `Once<T>` (set once by boot or a `setup`, read from anywhere) and `OnceBox<T>` (the one of something, made on first use; racing makers get the same one) |
 | `percpu` | `PerCpu<T>` + `LocalCounter` (statistics any CPU may read, added to with no bus lock), `CpuLocal<T>` (state only its own CPU touches, reached with interrupts off through `with`) |
 | `static_ring` | `StaticRing<N>` (MPMC queue of words in static storage) and `Mailbox<T, N>` (fixed-shape messages written and read in place, from any context, no allocation) |
-| `task` | `spawn`, `spawn_on`, `spawn_for(name, &'static T, fn(&'static T))` (a service's task over its one instance — no raw context), `spawn_with_ctx` (each takes the name `ps` and `top` show), `TaskHandle` (`id`), `sleep`, `yield_to_runnable`, `current_id` (is this call from one of my own tasks?) |
+| `task` | `spawn`, `spawn_for(name, &'static T, fn(&'static T))` (a service's task over its one instance — no raw context), `spawn_with_ctx` and `spawn_on_with_ctx` for a module's owned context (each takes the name `ps` and `top` show), `TaskHandle` (`id`), `sleep`, `yield_to_runnable`, `current_id` (is this call from one of my own tasks?) |
 | `softirq` | `raise`, `register_for(type, &'static T, handler)` (types: `TYPE_NET_RX`, `TYPE_BLK_IO`, etc.) |
 | `timer` | `Timer::start_for(period, &'static T, handler)` (periodic, 8 slots, fires on CPU 0 via IPI) |
 | `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI), `synchronize` (returns once every interrupt handler running at the call has returned) |
