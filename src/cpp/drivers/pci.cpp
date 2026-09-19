@@ -288,8 +288,16 @@ namespace {
    the surface is exported to Rust drivers that run post-SMP, where two CPUs
    could otherwise interleave a read-modify-write. The RMW helpers (word/byte
    writes) hold the lock across the whole read-modify-write. The raw dword
-   accessors are the arch backend (x86: port CAM; arm64: ECAM). */
-Kernel::RawSpinLock ConfigLock;
+   accessors are the arch backend (x86: port CAM; arm64: ECAM).
+
+   A function-local static, not a global: its constructor registers it with
+   the watchdog, and a global's constructor is one this kernel never runs --
+   as a global it went unwatched from the day it was written. */
+Kernel::RawSpinLock& ConfigLock()
+{
+    static Kernel::RawSpinLock lock;
+    return lock;
+}
 
 u32 ConfigReadDwordRaw(u16 bus, u16 slot, u16 func, u16 offset)
 {
@@ -305,36 +313,36 @@ void ConfigWriteDwordRaw(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
 
 u16 Pci::ReadWord(u16 bus, u16 slot, u16 func, u16 offset)
 {
-    ulong flags = ConfigLock.LockIrqSave();
+    ulong flags = ConfigLock().LockIrqSave();
     u32 dword = ConfigReadDwordRaw(bus, slot, func, offset);
-    ConfigLock.UnlockIrqRestore(flags);
+    ConfigLock().UnlockIrqRestore(flags);
     return (u16)((dword >> ((offset & 2) * 8)) & 0xffff);
 }
 
 u32 Pci::ReadDword(u16 bus, u16 slot, u16 func, u16 offset)
 {
-    ulong flags = ConfigLock.LockIrqSave();
+    ulong flags = ConfigLock().LockIrqSave();
     u32 dword = ConfigReadDwordRaw(bus, slot, func, offset);
-    ConfigLock.UnlockIrqRestore(flags);
+    ConfigLock().UnlockIrqRestore(flags);
     return dword;
 }
 
 void Pci::WriteDword(u16 bus, u16 slot, u16 func, u16 offset, u32 value)
 {
-    ulong flags = ConfigLock.LockIrqSave();
+    ulong flags = ConfigLock().LockIrqSave();
     ConfigWriteDwordRaw(bus, slot, func, offset, value);
-    ConfigLock.UnlockIrqRestore(flags);
+    ConfigLock().UnlockIrqRestore(flags);
 }
 
 void Pci::WriteWord(u16 bus, u16 slot, u16 func, u16 offset, u16 value)
 {
-    ulong flags = ConfigLock.LockIrqSave();
+    ulong flags = ConfigLock().LockIrqSave();
     u32 dword = ConfigReadDwordRaw(bus, slot, func, offset);
     u16 shift = (offset & 2) * 8;
     dword &= ~(0xFFFF << shift);
     dword |= ((u32)value << shift);
     ConfigWriteDwordRaw(bus, slot, func, offset, dword);
-    ConfigLock.UnlockIrqRestore(flags);
+    ConfigLock().UnlockIrqRestore(flags);
 }
 
 u8 Pci::ReadByte(u16 bus, u16 slot, u16 func, u16 offset)
@@ -345,13 +353,13 @@ u8 Pci::ReadByte(u16 bus, u16 slot, u16 func, u16 offset)
 
 void Pci::WriteByte(u16 bus, u16 slot, u16 func, u16 offset, u8 value)
 {
-    ulong flags = ConfigLock.LockIrqSave();
+    ulong flags = ConfigLock().LockIrqSave();
     u32 dword = ConfigReadDwordRaw(bus, slot, func, offset);
     u16 shift = (offset & 3) * 8;
     dword &= ~(0xFF << shift);
     dword |= ((u32)value << shift);
     ConfigWriteDwordRaw(bus, slot, func, offset, dword);
-    ConfigLock.UnlockIrqRestore(flags);
+    ConfigLock().UnlockIrqRestore(flags);
 }
 
 u8 Pci::FindCapability(u16 bus, u16 slot, u16 func, u8 capId, u8 startOffset)

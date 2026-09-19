@@ -5,15 +5,6 @@
 namespace Kernel
 {
 
-RawRwSpinLock::RawRwSpinLock()
-    : WriterPreemptTask(nullptr)
-{
-}
-
-RawRwSpinLock::~RawRwSpinLock()
-{
-}
-
 Task* RawRwSpinLock::ReadLock()
 {
     /* Before the acquire, as in RawSpinLock::Lock(): a tick landing between

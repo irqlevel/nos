@@ -7,7 +7,15 @@ namespace Kernel
 {
 
 ulong Pl011::Base;
-RawSpinLock Pl011::OutLock;
+/* A function-local static, not a static member: its constructor registers it
+   with the watchdog, as the x86 serial port's lock is, and a global's
+   constructor is one this kernel never runs -- as a member it went unwatched
+   from the day it was written. Built on the first line printed. */
+static RawSpinLock& OutLock()
+{
+    static RawSpinLock lock;
+    return lock;
+}
 
 namespace
 {
@@ -58,9 +66,9 @@ void Pl011::PanicPrintString(const char* s)
 void Pl011::PrintString(const char* s)
 {
     ulong flags = Hal::IrqSave();
-    OutLock.Lock();
+    OutLock().Lock();
     PanicPrintString(s);
-    OutLock.Unlock();
+    OutLock().Unlock();
     Hal::IrqRestore(flags);
 }
 
