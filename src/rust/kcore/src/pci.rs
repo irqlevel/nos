@@ -1,5 +1,10 @@
-use core::mem::MaybeUninit;
 use ffi::pci;
+
+/// What the kernel is handed to fill in: zeroes, which no device is.
+const NO_DEVICE: pci::PciDeviceInfo = pci::PciDeviceInfo {
+    bus: 0, slot: 0, func: 0, vendor: 0, device: 0,
+    cls: 0, subclass: 0, prog_if: 0, revision: 0, irq_line: 0, irq_pin: 0,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PciDevice {
@@ -95,12 +100,12 @@ pub fn find_device(vendor: u16, device: u16) -> Option<PciDevice> {
 pub fn find_device_from(vendor: u16, device: u16, start: usize)
     -> Option<(usize, PciDevice)>
 {
-    let mut info = MaybeUninit::<pci::PciDeviceInfo>::uninit();
+    let mut info = NO_DEVICE;
     let idx = unsafe {
-        pci::kernel_pci_find_device(vendor, device, start, info.as_mut_ptr())
+        pci::kernel_pci_find_device(vendor, device, start, &mut info)
     };
     if idx >= 0 {
-        Some((idx as usize, PciDevice::from_ffi(unsafe { info.assume_init_ref() })))
+        Some((idx as usize, PciDevice::from_ffi(&info)))
     } else {
         None
     }
@@ -139,10 +144,10 @@ pub fn device_count() -> usize {
 }
 
 pub fn get_device(index: usize) -> Option<PciDevice> {
-    let mut info = MaybeUninit::<pci::PciDeviceInfo>::uninit();
-    let ok = unsafe { pci::kernel_pci_get_device(index, info.as_mut_ptr()) };
+    let mut info = NO_DEVICE;
+    let ok = unsafe { pci::kernel_pci_get_device(index, &mut info) };
     if ok != 0 {
-        Some(PciDevice::from_ffi(unsafe { info.assume_init_ref() }))
+        Some(PciDevice::from_ffi(&info))
     } else {
         None
     }

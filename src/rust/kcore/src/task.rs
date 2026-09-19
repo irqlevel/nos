@@ -2,13 +2,31 @@ use alloc::boxed::Box;
 use crate::time::Duration;
 use ffi::task;
 
-struct RustSpawnCtx {
-    f: fn(),
+/// What a spawned task starts from: boxed on its way through the kernel,
+/// which carries it as a word.
+struct Start<C> {
+    ctx: C,
+    entry: fn(C),
 }
 
-extern "C" fn rust_spawn_trampoline(ctx: *mut u8) {
-    let b = unsafe { Box::from_raw(ctx.cast::<RustSpawnCtx>()) };
-    (b.f)();
+/// A task that is handed `ctx` by value. The one place a start is boxed,
+/// and the one place it is unboxed: in the task, or here if no task was made
+/// to hand it to. It is released once `entry` has returned, not before.
+fn spawn_owned<C: Copy + Send + 'static>(name: &str, ctx: C, entry: fn(C)) -> Option<TaskHandle> {
+    extern "C" fn trampoline<C: Copy>(raw: *mut u8) {
+        /* Made below and handed over exactly once: to this task. */
+        let start = unsafe { Box::from_raw(raw.cast::<Start<C>>()) };
+        (start.entry)(start.ctx);
+    }
+
+    let raw = Box::into_raw(Box::new(Start { ctx, entry })).cast::<u8>();
+    let h = unsafe { task::kernel_task_spawn(name.as_ptr(), name.len(), trampoline::<C>, raw) };
+    if h == 0 {
+        /* No task to hand it to: still this function's. */
+        drop(unsafe { Box::from_raw(raw.cast::<Start<C>>()) });
+        return None;
+    }
+    Some(TaskHandle { handle: h })
 }
 
 pub struct TaskHandle {
@@ -71,16 +89,7 @@ impl Drop for TaskHandle {
 /// `ps` and `top` show for the task -- cut to the 31 bytes a task has room
 /// for.
 pub fn spawn(name: &str, f: fn()) -> Option<TaskHandle> {
-    let boxed = Box::new(RustSpawnCtx { f });
-    let ptr = Box::into_raw(boxed).cast::<u8>();
-    let h = unsafe { task::kernel_task_spawn(name.as_ptr(), name.len(), rust_spawn_trampoline, ptr) };
-    if h == 0 {
-        unsafe {
-            drop(Box::from_raw(ptr.cast::<RustSpawnCtx>()));
-        }
-        return None;
-    }
-    Some(TaskHandle { handle: h })
+    spawn_owned(name, f, |f| f())
 }
 
 pub fn sleep(dur: Duration) {
@@ -111,24 +120,7 @@ pub fn yield_to_runnable() {
 pub fn spawn_for<T: Sync + 'static>(
     name: &str, target: &'static T, entry: fn(&'static T),
 ) -> Option<TaskHandle> {
-    struct Start<T: 'static> {
-        target: &'static T,
-        entry: fn(&'static T),
-    }
-
-    extern "C" fn trampoline<T: Sync + 'static>(ctx: *mut u8) {
-        /* Made below, by this function's own caller, and handed over once. */
-        let start = unsafe { Box::from_raw(ctx.cast::<Start<T>>()) };
-        (start.entry)(start.target);
-    }
-
-    let ctx = Box::into_raw(Box::new(Start { target, entry })).cast::<u8>();
-    let h = unsafe { task::kernel_task_spawn(name.as_ptr(), name.len(), trampoline::<T>, ctx) };
-    if h == 0 {
-        unsafe { drop(Box::from_raw(ctx.cast::<Start<T>>())) };
-        return None;
-    }
-    Some(TaskHandle { handle: h })
+    spawn_owned(name, (target, entry), |(target, entry)| entry(target))
 }
 
 /// Spawn a task that receives a raw context pointer.
