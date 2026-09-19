@@ -1,0 +1,15 @@
+[package]
+name = "mod-netload"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_netload"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../kmod" }
+kcore = { path = "../../kcore" }
+# The frame formats: the server rewrites a frame where it lies and the client
+# builds its own, and a module cannot link the network layer to borrow them.
+netwire = { path = "../../netwire" }

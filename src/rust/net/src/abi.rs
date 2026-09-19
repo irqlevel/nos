@@ -16,7 +16,6 @@ use crate::arp::ArpTable;
 use crate::dhcp::Dhcp;
 use crate::dns::Dns;
 use crate::icmp::Icmp;
-use crate::net_load::NetLoad;
 use crate::netconsole::NETCONSOLE;
 use crate::udp_shell::UdpShell;
 
@@ -25,18 +24,6 @@ static ICMP: OnceBox<Icmp> = OnceBox::new();
 static DNS: OnceBox<Dns> = OnceBox::new();
 static DHCP: OnceBox<Dhcp> = OnceBox::new();
 static UDP_SHELL: OnceBox<UdpShell> = OnceBox::new();
-
-/// The one load target: a static, because its per-CPU counters are its bulk
-/// and it is reached from the receive path, where a pointer chase is the
-/// kind of thing it exists to measure.
-static NET_LOAD: NetLoad = NetLoad::new_const();
-
-/// The one load target. A static rather than something made on first use:
-/// its per-CPU counters are its bulk, and it is reached from the receive
-/// path, where a pointer chase is the kind of thing it exists to measure.
-pub(crate) fn net_load() -> &'static NetLoad {
-    &NET_LOAD
-}
 
 pub(crate) fn arp_table() -> Option<&'static ArpTable> {
     match ARP.get_or_try_init(|| ArpTable::new().map(Box::new)) {

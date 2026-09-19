@@ -237,10 +237,6 @@ struct Identity {
 pub trait UdpHandler: Sync + 'static {
     /// One datagram's frame, lent for the length of the call.
     fn on_frame(&'static self, frame: Lent<'_>, rx: &mut RxContext);
-
-    /// The end of a receive batch, for a listener registered with
-    /// `listen_batched`: the moment to hand the NIC what was built.
-    fn on_batch_end(&'static self, _rx: &mut RxContext) {}
 }
 
 /// A frame the receive path lends a listener for the length of one call.
@@ -263,12 +259,17 @@ impl Lent<'_> {
 /// Who a datagram goes to.
 #[derive(Clone, Copy)]
 enum Sink {
-    /// A service of this crate. `batched`: it is also told when a receive
-    /// batch ends, for a listener that answers from the receive path and
-    /// hands its replies over together.
-    Handler { handler: &'static dyn UdpHandler, batched: bool },
-    /// A module's, across the C ABI: the frame as a word, lent for the call
-    Callback { frame_cb: extern "C" fn(ctx: *mut u8, frame: usize), ctx: usize },
+    /// A service of this crate.
+    Handler { handler: &'static dyn UdpHandler },
+    /// A module's, across the C ABI: the frame as a word, lent for the call.
+    /// `batch_end`: it is also told when a receive batch ends, for a
+    /// listener that answers from the receive path and hands its replies
+    /// over together -- the load target, which is a module.
+    Callback {
+        frame_cb: extern "C" fn(ctx: *mut u8, frame: usize),
+        batch_end: Option<extern "C" fn(ctx: *mut u8)>,
+        ctx: usize,
+    },
 }
 
 /// What the receive path hands a datagram to.
@@ -539,6 +540,12 @@ impl Device {
         queued
     }
 
+    /// How many more frames the queue has room for right now: what a sender
+    /// that would rather wait than lose asks before it builds a batch.
+    pub fn tx_room(&self) -> usize {
+        TX_CAPACITY.saturating_sub(self.tx.lock().queue.len())
+    }
+
     /// The transmit softirq: what a driver with nothing else to do owes.
     pub fn drain_tx(&self) {
         {
@@ -691,8 +698,8 @@ impl Device {
          * its replies over now, together. Still inside the in-flight count,
          * so an unlisten waiting on it knows they have gone. */
         for listener in listeners {
-            if let Some(Sink::Handler { handler, batched: true }) = listener.sink {
-                handler.on_batch_end(rx);
+            if let Some(Sink::Callback { batch_end: Some(batch_end), ctx, .. }) = listener.sink {
+                batch_end(ctx as *mut u8);
             }
         }
 
@@ -769,8 +776,8 @@ impl Device {
                      * it returns: the release after this is then not the last
                      * one. */
                     match listener.sink {
-                        Some(Sink::Handler { handler, .. }) => handler.on_frame(Lent(frame), rx),
-                        Some(Sink::Callback { frame_cb, ctx }) => {
+                        Some(Sink::Handler { handler }) => handler.on_frame(Lent(frame), rx),
+                        Some(Sink::Callback { frame_cb, ctx, .. }) => {
                             frame_cb(ctx as *mut u8, frame.as_lent())
                         }
                         None => {}
@@ -818,20 +825,21 @@ impl Device {
 
     /// A service of this crate on `port`: the key to `unlisten_udp` it by.
     pub(crate) fn listen_handler(
-        &self, port: u16, handler: &'static dyn UdpHandler, batched: bool,
+        &self, port: u16, handler: &'static dyn UdpHandler,
     ) -> Result<usize, ListenError> {
         /* Where the handler is: what no other listener's key can be. */
         let key = handler as *const dyn UdpHandler as *const () as usize;
-        self.listen(port, key, Sink::Handler { handler, batched })?;
+        self.listen(port, key, Sink::Handler { handler })?;
         Ok(key)
     }
 
     /// A module's callback on `port`, handed the frame as a word; `ctx` is
     /// its key.
     fn listen_callback(
-        &self, port: u16, frame_cb: extern "C" fn(ctx: *mut u8, frame: usize), ctx: usize,
+        &self, port: u16, frame_cb: extern "C" fn(ctx: *mut u8, frame: usize),
+        batch_end: Option<extern "C" fn(ctx: *mut u8)>, ctx: usize,
     ) -> Result<(), ListenError> {
-        self.listen(port, ctx, Sink::Callback { frame_cb, ctx })
+        self.listen(port, ctx, Sink::Callback { frame_cb, batch_end, ctx })
     }
 
     /// Takes away the listener registered on the port with this key, and
@@ -1175,13 +1183,14 @@ pub unsafe extern "C" fn kernel_net_mac(dev: usize, out: *mut u8) {
 
 #[no_mangle]
 pub extern "C" fn kernel_net_udp_listen(
-    dev: usize, port: u16, cb: extern "C" fn(ctx: *mut u8, frame: usize), ctx: *mut u8,
+    dev: usize, port: u16, cb: extern "C" fn(ctx: *mut u8, frame: usize),
+    batch_end: Option<extern "C" fn(ctx: *mut u8)>, ctx: *mut u8,
 ) -> i32 {
     let dev = match DEVICES.by_handle(dev) {
         Some(dev) => dev,
         None => return LISTEN_INVALID,
     };
-    match dev.listen_callback(port, cb, ctx as usize) {
+    match dev.listen_callback(port, cb, batch_end, ctx as usize) {
         Ok(()) => LISTEN_OK,
         Err(ListenError::PortTaken) => LISTEN_PORT_TAKEN,
         Err(ListenError::TableFull) => LISTEN_TABLE_FULL,
@@ -1223,6 +1232,45 @@ pub unsafe extern "C" fn kernel_net_submit_tx(
         }
     }
     queued
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_net_tx_room(dev: usize) -> usize {
+    DEVICES.by_handle(dev).map_or(0, |dev| dev.tx_room())
+}
+
+/// Where a frame to `ip` goes on the wire: `ip` itself on the device's
+/// subnet, the gateway off it, as ARP answers for it. What a module that
+/// builds its own frames needs before the first one, and cannot work out for
+/// itself: the lease and the ARP table are the layer's. Task context -- a
+/// miss sends a request and sleeps for the answer.
+#[no_mangle]
+pub extern "C" fn kernel_net_resolve(dev: usize, ip: u32) -> ffi::net::Resolved {
+    let nobody = ffi::net::Resolved { found: 0, mac: [0; 6] };
+
+    let (dev, arp) = match (DEVICES.by_handle(dev), crate::abi::arp_table()) {
+        (Some(dev), Some(arp)) => (dev, arp),
+        _ => return nobody,
+    };
+    let nic = dev.as_nic();
+    match arp.resolve(&nic, nic.route_ip(ip)) {
+        Some(mac) => ffi::net::Resolved { found: 1, mac },
+        None => nobody,
+    }
+}
+
+/// Whether the receive path is keeping up: what the load target prints once
+/// a second, over the netconsole, for as long as a load runs.
+#[no_mangle]
+pub extern "C" fn kernel_net_rx_stats() -> ffi::net::RxStats {
+    let (polls, work, stalls) = DEVICES.poll_counts();
+    ffi::net::RxStats {
+        pool_misses: crate::frame::POOL.alloc_misses() as u64,
+        pool_in_flight: crate::frame::POOL.in_flight() as u64,
+        rx_polls: polls as u64,
+        rx_poll_work: work as u64,
+        rx_stalls: stalls as u64,
+    }
 }
 
 /// Look at the receive path without waiting to be asked. From the tick.

@@ -97,8 +97,9 @@ only the last of them was the actual fault:
   the PHY's own view — what each side advertised and what negotiation
   resolved to.
 
-**Load.** Hammered with small UDP datagrams (64-byte frames, `netload`, from
-a machine in the same data centre) the I210 now takes everything that
+**Load.** Hammered with small UDP datagrams (64-byte frames, the `netload`
+target -- a [module](modules.md#netload) now -- from a machine in the same
+data centre) the I210 now takes everything that
 arrives: an echo at 578–581 k datagrams a second answers every one, a sink
 at 615 k receives every one, and the queue's `dropped-no-descriptor` stays
 at zero. The ceiling is the sender, whose single-queue NIC holds one of its

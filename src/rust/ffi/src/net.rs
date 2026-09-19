@@ -1,3 +1,31 @@
+/// What `kernel_net_resolve` answers: the Ethernet address a frame to an IP
+/// address goes to, if anything said it has one.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Resolved {
+    /// 1 when `mac` is an answer, 0 when nothing answered.
+    pub found: u8,
+    pub mac: [u8; 6],
+}
+
+/// What `kernel_net_rx_stats` answers: the counters that say whether the
+/// receive path is keeping up, summed over every device. They only grow,
+/// but for `pool_in_flight`, which is a level.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RxStats {
+    /// Frames that had to come from the allocator because the pool had none.
+    pub pool_misses: u64,
+    /// Frames out of the pool right now.
+    pub pool_in_flight: u64,
+    /// Receive passes the tick started rather than an interrupt.
+    pub rx_polls: u64,
+    /// Those of them that found the hardware had frames waiting.
+    pub rx_poll_work: u64,
+    /// Two such in a row: the shape of an interrupt that is not coming.
+    pub rx_stalls: u64,
+}
+
 /* The network layer as a loadable module reaches it (src/rust/net defines
    these, in device.rs and frame.rs): a device by name, a UDP port to listen
    on, frames to build and transmit. A module is linked on its own, so a C
@@ -17,10 +45,20 @@ unsafe extern "C" {
     /// Hands every UDP datagram to `port` to cb, the frame itself, from the
     /// receive softirq: 0 once listening, 1 when the port is taken, 2 when
     /// the device's listener table is full, 3 for port 0.
+    ///
+    /// batch_end, when there is one, is called at the end of every receive
+    /// batch, whether or not the batch had anything for this port: the
+    /// moment for a listener that answers from the receive path to hand the
+    /// NIC what it built, one lock and one doorbell for the lot.
+    ///
+    /// Both are called from the receive pass and from nowhere else, and
+    /// there is one receive pass at a time in the whole kernel: what only
+    /// they touch needs no lock.
     pub fn kernel_net_udp_listen(
         dev: usize,
         port: u16,
         cb: extern "C" fn(ctx: *mut u8, frame: usize),
+        batch_end: Option<extern "C" fn(ctx: *mut u8)>,
         ctx: *mut u8,
     ) -> i32;
     /// Takes away the listener kernel_net_udp_listen put on the port with this
@@ -29,6 +67,18 @@ unsafe extern "C" {
     /// Queues frames to transmit, one lock and one doorbell for the lot, from
     /// any context. Takes every frame; returns how many were queued.
     pub fn kernel_net_submit_tx(dev: usize, frames: *const usize, count: usize) -> usize;
+    /// How many more frames the device's transmit queue has room for right
+    /// now. A sender that asks before it builds a batch loses nothing to a
+    /// full queue -- kernel_net_submit_tx releases what finds no room -- as
+    /// long as it is the only one sending; with others beside it the answer
+    /// is a hint, and what it counts as failed is how far off the hint was.
+    pub safe fn kernel_net_tx_room(dev: usize) -> usize;
+    /// Where a frame to `ip` (host byte order) goes on the wire: the address
+    /// itself when it is on the device's subnet, the gateway when it is not,
+    /// asked of ARP. Task context: a cache miss sends a request and sleeps,
+    /// up to three seconds, for the answer.
+    pub safe fn kernel_net_resolve(dev: usize, ip: u32) -> Resolved;
+    pub safe fn kernel_net_rx_stats() -> RxStats;
 
     pub safe fn kernel_netframe_alloc_tx(data_len: usize) -> usize;
     /// Another reference to the frame.
