@@ -67,24 +67,9 @@ impl Drop for TaskHandle {
     }
 }
 
-/// Spawn a task running `f` on the CPUs of `affinity_mask`. `name`, which
-/// every spawn here takes, is what `ps` and `top` show for the task -- cut
-/// to the 31 bytes a task has room for.
-pub fn spawn_on(name: &str, affinity_mask: u64, f: fn()) -> Option<TaskHandle> {
-    let boxed = Box::new(RustSpawnCtx { f });
-    let ptr = Box::into_raw(boxed).cast::<u8>();
-    let h = unsafe {
-        task::kernel_task_spawn_on(
-            name.as_ptr(), name.len(), rust_spawn_trampoline, ptr, affinity_mask as usize,
-        )
-    };
-    if h == 0 {
-        unsafe { drop(Box::from_raw(ptr.cast::<RustSpawnCtx>())); }
-        return None;
-    }
-    Some(TaskHandle { handle: h })
-}
-
+/// Spawn a task running `f`. `name`, which every spawn here takes, is what
+/// `ps` and `top` show for the task -- cut to the 31 bytes a task has room
+/// for.
 pub fn spawn(name: &str, f: fn()) -> Option<TaskHandle> {
     let boxed = Box::new(RustSpawnCtx { f });
     let ptr = Box::into_raw(boxed).cast::<u8>();
