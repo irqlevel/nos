@@ -159,8 +159,7 @@ impl NetFrame {
     #[inline]
     pub unsafe fn retain(handle: usize) -> Self {
         unsafe { net::kernel_netframe_get(handle) };
-        /* A frame alive for the call is not the null one. */
-        Self { handle: unsafe { core::num::NonZeroUsize::new_unchecked(handle) } }
+        Self { handle: Self::word(handle) }
     }
 
     /// The bytes of a frame the kernel lent, without taking it.
@@ -241,7 +240,14 @@ impl NetFrame {
     /// this call.
     #[inline]
     pub unsafe fn from_raw(handle: usize) -> Self {
-        Self { handle: unsafe { core::num::NonZeroUsize::new_unchecked(handle) } }
+        Self { handle: Self::word(handle) }
+    }
+
+    /// A frame's word. Zero is the kernel's "no frame" and never a frame:
+    /// a caller that passes it has broken what `retain` and `from_raw` ask,
+    /// and is told so rather than left holding a frame that is not one.
+    fn word(handle: usize) -> core::num::NonZeroUsize {
+        core::num::NonZeroUsize::new(handle).expect("a frame handle is never 0")
     }
 }
 
