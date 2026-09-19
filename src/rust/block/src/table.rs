@@ -2,23 +2,27 @@
 //! what `disks` lists, and the claims that keep two writers off the same
 //! sectors.
 //!
-//! This is the C ABI half of the block layer -- the `kernel_blockdev_*`
-//! functions both the C++ side (block/block.h) and the Rust side
-//! (`kcore::block`, and through it every module) call. A device is a handle,
-//! and a handle is a slot in the table plus one, so zero is never a device.
-//! There is no C++ view of a device: the shell, the disk log and a mount
-//! hold that handle and nothing else.
+//! A driver registers a `BlockDriver` with it; a partition is an entry of the
+//! table itself. The rest of the kernel image reaches a device through
+//! `Disk` (disk.rs), which calls the functions here directly. What is left of
+//! a C ABI -- the `kernel_blockdev_*` names at the bottom -- is what a
+//! loadable module binds by name (`kcore::block::Disk`), because a module is
+//! linked on its own, and one call the C++ boot path makes.
 //!
-//! The table only grows: nothing unregisters, which is what makes a lookup
-//! lock-free -- a slot is filled once and only read after. The claims are the
-//! one part that needs a lock, and sit inside the kernel's spinlock.
+//! A device is a handle, and a handle is a slot in the table plus one, so
+//! zero is never a device. The table only grows: nothing unregisters, which
+//! is what makes a lookup lock-free -- a slot is filled once and only read
+//! after. The claims are the one part that needs a lock, and sit inside the
+//! kernel's spinlock.
 
 use alloc::boxed::Box;
+use alloc::ffi::CString;
 use core::ffi::CStr;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use ffi::block::{BlockDeviceOps, BlockIo};
+use ffi::block::BlockIo;
+use kcore::block::{SubmitError, IO_FLUSH, SUBMIT_BUSY, SUBMIT_INVALID, SUBMIT_OK, SUBMIT_UNSUPPORTED};
 use kcore::cmd::Output;
 use kcore::once::{Once, OnceBox};
 use kcore::sync::SpinLock;
@@ -27,21 +31,60 @@ use kcore::trace;
 /// What the table holds.
 pub const MAX_DEVICES: usize = 48;
 
-/// What a driver's submit answers, and the one op that is not about a range
-/// (kcore::block)
-const SUBMIT_INVALID: i32 = 2;
-const SUBMIT_UNSUPPORTED: i32 = 3;
-const IO_FLUSH: u8 = 2;
+/// A block device, as the driver behind it: what the table calls when
+/// somebody reads, writes or flushes the disk.
+///
+/// The driver is something that lives for good -- a device is registered for
+/// the life of the kernel, and the table has no way to give one back -- and
+/// every call can arrive from any task on any CPU, several at once: hence
+/// `Sync`, and `&'static self`. What a call needs exclusively the driver
+/// keeps behind a lock of its own.
+pub trait BlockDriver: Sync + 'static {
+    /// Its size, in sectors.
+    fn capacity(&self) -> u64;
+
+    /// Bytes to a sector.
+    fn sector_size(&self) -> u64;
+
+    /// Fill `buf` -- whole sectors, never empty: a request for none is
+    /// answered before it gets here -- from `sector` on, and return once the
+    /// data is in it. The device may be pointed straight at the buffer: the
+    /// caller has given one it can DMA into.
+    fn read(&'static self, sector: u64, buf: &mut [u8]) -> bool;
+
+    /// Write `data` -- whole sectors, never empty -- at `sector`, and return
+    /// once the device has it; with `fua`, once it is on the medium.
+    fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool;
+
+    /// Push the device's write cache out. A device without one has nothing
+    /// to do, which is the default.
+    fn flush(&'static self) -> bool {
+        true
+    }
+
+    /// Whether the device has the asynchronous path -- `submit` and `kick`.
+    /// Without it the table answers Unsupported for the driver.
+    fn is_async(&self) -> bool {
+        false
+    }
+
+    /// One asynchronous I/O straight to or from physical memory: never
+    /// blocks, never waits. `io.done` is called exactly once when the device
+    /// is done, from interrupt context. With `kick` false the doorbell may
+    /// be left for `kick`. That `io.phys` is memory the device may use is
+    /// what whoever called `Disk::submit` promised; the driver passes it on.
+    fn submit(&'static self, _io: &BlockIo, _kick: bool) -> Result<(), SubmitError> {
+        Err(SubmitError::Unsupported)
+    }
+
+    /// Ring the doorbell for what `submit` queued without one.
+    fn kick(&'static self) {}
+}
 
 /// A registered device, kept for the life of the kernel because nothing
 /// takes a device back.
-///
-/// The name is a copy, and a driver's context is kept as the word it is to
-/// this layer -- handed back on every call and never looked into. So a
-/// device is plain data and a few functions, and may be shared between CPUs
-/// without anyone having to promise anything.
 struct Device {
-    /// With its NUL, which is how `kernel_blockdev_name` hands it out
+    /// With its NUL, which is how `kernel_blockdev_*` hands a name out
     name: Box<CStr>,
     capacity: u64,
     sector_size: u64,
@@ -52,20 +95,8 @@ struct Device {
 
 /// What does a device's I/O.
 enum Backend {
-    /// A driver: what its ops table said
-    Driver {
-        read_sectors: extern "C" fn(ctx: *mut u8, sector: u64, buf: *mut u8, count: u32) -> i32,
-        write_sectors: extern "C" fn(
-            ctx: *mut u8, sector: u64, buf: *const u8, count: u32, fua: i32,
-        ) -> i32,
-        flush: Option<extern "C" fn(ctx: *mut u8) -> i32>,
-        /// The asynchronous path, both halves or neither
-        submit: Option<(
-            extern "C" fn(ctx: *mut u8, io: *const BlockIo, kick: i32) -> i32,
-            extern "C" fn(ctx: *mut u8),
-        )>,
-        ctx: usize,
-    },
+    /// A driver
+    Driver(&'static dyn BlockDriver),
     /// A stretch of `parent`, from this sector of it: everything asked of a
     /// partition is rebased onto its disk, and refused past its own end.
     Partition { start: u64 },
@@ -81,6 +112,15 @@ impl Device {
     /// wrap.
     fn within(&self, sector: u64, count: u64) -> bool {
         sector <= self.capacity && count <= self.capacity - sector
+    }
+
+    /// How many sectors `bytes` is: None unless it is a whole number of them.
+    fn sectors_in(&self, bytes: usize) -> Option<u64> {
+        let size = usize::try_from(self.sector_size).ok()?;
+        if size == 0 || bytes % size != 0 {
+            return None;
+        }
+        Some((bytes / size) as u64)
     }
 }
 
@@ -99,6 +139,23 @@ fn add(dev: Device) -> usize {
             core::str::from_utf8(dev.name()).unwrap_or("?"), dev.capacity, dev.sector_size);
     }
     slot + 1
+}
+
+/// Register `driver` as the block device `name`: its handle, or 0 when the
+/// table is full or the name will not do. For good -- nothing unregisters.
+pub fn register_driver(name: &str, parent: usize, driver: &'static dyn BlockDriver) -> usize {
+    let name = match CString::new(name) {
+        Ok(name) if !name.as_bytes().is_empty() => name.into_boxed_c_str(),
+        _ => return 0,
+    };
+
+    add(Device {
+        name,
+        capacity: driver.capacity(),
+        sector_size: driver.sector_size(),
+        parent,
+        backend: Backend::Driver(driver),
+    })
 }
 
 /// One partition of the device `parent` names, as a device of its own. The
@@ -122,89 +179,87 @@ pub fn register_partition(parent: usize, start: u64, count: u64, name: &CStr) ->
 
 /* ---- I/O, by handle ----
  *
- * A buffer is a pointer here, passed on and never looked into: a driver
- * DMAs to it, and what it points at is the contract of whoever called in.
- * A partition is its disk a few sectors on, and a disk was registered before
- * any partition of it, so the walk up ends. */
+ * A buffer is whole sectors and handed on as it is: a driver DMAs to it, and
+ * that it can is the contract of whoever called in. A partition is its disk
+ * a few sectors on, and a disk was registered before any partition of it, so
+ * the walk up ends. */
 
-fn read(handle: usize, sector: u64, buf: *mut u8, count: u32) -> i32 {
+pub(crate) fn read(handle: usize, sector: u64, buf: &mut [u8]) -> bool {
     let dev = match device(handle) {
         Some(dev) => dev,
-        None => return -1,
+        None => return false,
     };
+    let count = match dev.sectors_in(buf.len()) {
+        Some(0) => return true,
+        Some(count) => count,
+        None => return false,
+    };
+
     match dev.backend {
-        Backend::Driver { read_sectors, ctx, .. } => {
-            read_sectors(ctx as *mut u8, sector, buf, count)
+        Backend::Driver(driver) => driver.read(sector, buf),
+        Backend::Partition { start } if dev.within(sector, count) => {
+            read(dev.parent, start + sector, buf)
         }
-        Backend::Partition { start } if dev.within(sector, count as u64) => {
-            read(dev.parent, start + sector, buf, count)
-        }
-        Backend::Partition { .. } => -1,
+        Backend::Partition { .. } => false,
     }
 }
 
-fn write(handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32) -> i32 {
+pub(crate) fn write(handle: usize, sector: u64, data: &[u8], fua: bool) -> bool {
     let dev = match device(handle) {
         Some(dev) => dev,
-        None => return -1,
+        None => return false,
     };
+    let count = match dev.sectors_in(data.len()) {
+        Some(0) => return true,
+        Some(count) => count,
+        None => return false,
+    };
+
     match dev.backend {
-        Backend::Driver { write_sectors, ctx, .. } => {
-            write_sectors(ctx as *mut u8, sector, buf, count, fua)
+        Backend::Driver(driver) => driver.write(sector, data, fua),
+        Backend::Partition { start } if dev.within(sector, count) => {
+            write(dev.parent, start + sector, data, fua)
         }
-        Backend::Partition { start } if dev.within(sector, count as u64) => {
-            write(dev.parent, start + sector, buf, count, fua)
-        }
-        Backend::Partition { .. } => -1,
+        Backend::Partition { .. } => false,
     }
 }
 
-fn flush(handle: usize) -> i32 {
+pub(crate) fn flush(handle: usize) -> bool {
     match device(handle) {
         Some(dev) => match dev.backend {
-            /* A device with no write cache to push has nothing to do here. */
-            Backend::Driver { flush: driver_flush, ctx, .. } => {
-                driver_flush.map_or(0, |driver_flush| driver_flush(ctx as *mut u8))
-            }
+            Backend::Driver(driver) => driver.flush(),
             Backend::Partition { .. } => flush(dev.parent),
         },
-        None => -1,
+        None => false,
     }
 }
 
-fn can_submit(handle: usize) -> bool {
+pub(crate) fn can_submit(handle: usize) -> bool {
     match device(handle) {
         Some(dev) => match dev.backend {
-            Backend::Driver { submit: async_path, .. } => async_path.is_some(),
+            Backend::Driver(driver) => driver.is_async(),
             Backend::Partition { .. } => can_submit(dev.parent),
         },
         None => false,
     }
 }
 
-fn kick(handle: usize) {
+pub(crate) fn kick(handle: usize) {
     if let Some(dev) = device(handle) {
         match dev.backend {
-            Backend::Driver { submit: Some((_, driver_kick)), ctx, .. } => {
-                driver_kick(ctx as *mut u8)
-            }
-            Backend::Driver { .. } => {}
+            Backend::Driver(driver) if driver.is_async() => driver.kick(),
+            Backend::Driver(_) => {}
             Backend::Partition { .. } => kick(dev.parent),
         }
     }
 }
 
-fn submit(handle: usize, io: &BlockIo, kick_now: i32) -> i32 {
-    let dev = match device(handle) {
-        Some(dev) => dev,
-        None => return SUBMIT_INVALID,
-    };
+pub(crate) fn submit(handle: usize, io: &BlockIo, kick_now: bool) -> Result<(), SubmitError> {
+    let dev = device(handle).ok_or(SubmitError::Invalid)?;
 
     let start = match dev.backend {
-        Backend::Driver { submit: Some((driver_submit, _)), ctx, .. } => {
-            return driver_submit(ctx as *mut u8, io, kick_now);
-        }
-        Backend::Driver { .. } => return SUBMIT_UNSUPPORTED,
+        Backend::Driver(driver) if driver.is_async() => return driver.submit(io, kick_now),
+        Backend::Driver(_) => return Err(SubmitError::Unsupported),
         Backend::Partition { start } => start,
     };
 
@@ -217,10 +272,10 @@ fn submit(handle: usize, io: &BlockIo, kick_now: i32) -> i32 {
     if !dev.within(io.sector, io.count as u64) {
         /* Refused, but a kick is still a kick: what was queued before it
          * without a doorbell is owed one. */
-        if kick_now != 0 {
+        if kick_now {
             kick(dev.parent);
         }
-        return SUBMIT_INVALID;
+        return Err(SubmitError::Invalid);
     }
 
     /* Moved onto the disk in a copy: the caller's io is only read, so it can
@@ -261,60 +316,17 @@ fn reserve() -> Option<usize> {
     }
 }
 
-/// Register a device. The ops are copied, and so is the name; the context
-/// stays the registrant's, and has to outlive the kernel's use of it, which
-/// is to say the kernel.
-///
-/// # Safety
-/// `ops` points at a valid BlockDeviceOps for the duration of the call, and
-/// its name is NUL-terminated.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_register(ops: *const BlockDeviceOps) -> usize {
-    let ops = match unsafe { ops.as_ref() } {
-        Some(ops) => ops,
-        None => return 0,
-    };
-
-    let (read_sectors, write_sectors) = match (ops.read_sectors, ops.write_sectors) {
-        (Some(read), Some(write)) if !ops.name.is_null() => (read, write),
-        _ => return 0,
-    };
-
-    /* The asynchronous path is both or neither: a submit that may leave its
-     * doorbell owed, with no kick to ring it, would queue commands that never
-     * reach the device. */
-    let submit = match (ops.submit, ops.kick) {
-        (Some(submit), Some(kick)) => Some((submit, kick)),
-        (None, None) => None,
-        _ => return 0,
-    };
-
-    add(Device {
-        name: unsafe { CStr::from_ptr(ops.name.cast()) }.into(),
-        capacity: ops.capacity,
-        sector_size: ops.sector_size,
-        parent: ops.parent,
-        backend: Backend::Driver {
-            read_sectors,
-            write_sectors,
-            flush: ops.flush,
-            submit,
-            ctx: ops.ctx as usize,
-        },
-    })
-}
+/* ---- the table, by handle ---- */
 
 /// How many devices the table holds. It only grows, so an index once valid
 /// stays valid and names the same device.
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_count() -> u32 {
+pub(crate) fn count() -> u32 {
     COUNT.load(Ordering::Acquire)
 }
 
 /// The index'th device, or 0. A slot being reserved by a registration that
 /// has not finished reads as 0, and the caller skips it.
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_at(index: u32) -> usize {
+pub(crate) fn at(index: u32) -> usize {
     let index = index as usize;
     match DEVICES.get(index) {
         Some(slot) if slot.get().is_some() => index + 1,
@@ -323,18 +335,13 @@ pub extern "C" fn kernel_blockdev_at(index: u32) -> usize {
 }
 
 /// The device of that name, or 0.
-///
-/// # Safety
-/// `name` points at `name_len` readable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_find(name: *const u8, name_len: usize) -> usize {
-    if name.is_null() || name_len == 0 {
+pub(crate) fn find(wanted: &[u8]) -> usize {
+    if wanted.is_empty() {
         return 0;
     }
 
-    let wanted = unsafe { core::slice::from_raw_parts(name, name_len) };
-    for index in 0..kernel_blockdev_count() {
-        let handle = kernel_blockdev_at(index);
+    for index in 0..count() {
+        let handle = at(index);
         match device(handle) {
             Some(dev) if dev.name() == wanted => return handle,
             _ => continue,
@@ -343,109 +350,40 @@ pub unsafe extern "C" fn kernel_blockdev_find(name: *const u8, name_len: usize) 
     0
 }
 
-/// The device's name into buf, NUL-terminated: the length written, or 0 if
-/// it does not fit.
-///
-/// # Safety
-/// `buf` points at `len` writable bytes.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_name(handle: usize, buf: *mut u8, len: usize) -> usize {
-    let dev = match device(handle) {
-        Some(dev) => dev,
-        None => return 0,
-    };
+/// Whether the handle names a device at all.
+pub(crate) fn exists(handle: usize) -> bool {
+    device(handle).is_some()
+}
 
-    let name = dev.name.to_bytes_with_nul();
-    if buf.is_null() || name.len() > len {
-        return 0;
-    }
-
-    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf, name.len()) };
-    name.len() - 1
+/// The device's name: its own copy, kept as long as the device, which is
+/// for good.
+pub(crate) fn name(handle: usize) -> Option<&'static str> {
+    core::str::from_utf8(device(handle)?.name()).ok()
 }
 
 /// The disk a partition is on, or 0 for a whole disk.
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_parent(handle: usize) -> usize {
+pub(crate) fn parent(handle: usize) -> usize {
     device(handle).map_or(0, |dev| dev.parent)
 }
 
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_capacity(handle: usize) -> u64 {
+pub(crate) fn capacity(handle: usize) -> u64 {
     device(handle).map_or(0, |dev| dev.capacity)
 }
 
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_sector_size(handle: usize) -> u64 {
+pub(crate) fn sector_size(handle: usize) -> u64 {
     device(handle).map_or(0, |dev| dev.sector_size)
 }
 
-/// Synchronous read, count in sectors: 0 once the data is in buf.
-///
-/// # Safety
-/// `buf` takes `count` sectors, and the device's driver may DMA into it.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_read(
-    handle: usize, sector: u64, buf: *mut u8, count: u32,
-) -> i32 {
-    read(handle, sector, buf, count)
-}
-
-/// Synchronous write, count in sectors: 0 once the device has the data.
-///
-/// # Safety
-/// `buf` holds `count` sectors, and the device's driver may DMA out of it.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_write(
-    handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
-) -> i32 {
-    write(handle, sector, buf, count, fua)
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_flush(handle: usize) -> i32 {
-    flush(handle)
-}
-
-/// 1 if the device has the asynchronous path.
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_can_submit(handle: usize) -> i32 {
-    can_submit(handle) as i32
-}
-
-/// Hand the device an I/O straight to or from physical memory. Never blocks;
-/// `io` is read before this returns.
-///
-/// # Safety
-/// `io` points at a valid BlockIo whose memory stays valid until its `done`
-/// has run.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_submit(
-    handle: usize, io: *const BlockIo, kick: i32,
-) -> i32 {
-    match unsafe { io.as_ref() } {
-        Some(io) => submit(handle, io, kick),
-        None => SUBMIT_INVALID,
-    }
-}
-
-/// Ring the doorbell for what a submit without a kick left queued.
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_kick(handle: usize) {
-    kick(handle);
-}
-
 /// How many partitions of the device the kernel found.
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_partitions(handle: usize) -> u32 {
+pub(crate) fn partitions(handle: usize) -> u32 {
     if handle == 0 {
         return 0;
     }
 
     let mut found = 0;
-    for index in 0..kernel_blockdev_count() {
-        let other = kernel_blockdev_at(index);
-        if other != 0 && kernel_blockdev_parent(other) == handle {
+    for index in 0..count() {
+        let other = at(index);
+        if other != 0 && parent(other) == handle {
             found += 1;
         }
     }
@@ -455,17 +393,13 @@ pub extern "C" fn kernel_blockdev_partitions(handle: usize) -> u32 {
 /// Set once interrupts and the scheduler are running (the boot path calls
 /// it). Before that a synchronous I/O has to poll its device: there is
 /// nothing yet to wake a waiter.
-static INTERRUPTS_STARTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static INTERRUPTS_STARTED: AtomicBool = AtomicBool::new(false);
 
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_set_interrupts_started() {
-    INTERRUPTS_STARTED.store(true, Ordering::Release);
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_interrupts_started() -> i32 {
-    INTERRUPTS_STARTED.load(Ordering::Acquire) as i32
+/// Whether a driver may block waiting for a completion: false early in
+/// boot, before interrupts and the scheduler are running, when a
+/// synchronous I/O has to poll its device instead.
+pub fn interrupts_started() -> bool {
+    INTERRUPTS_STARTED.load(Ordering::Acquire)
 }
 
 /* ---- claims ---- */
@@ -479,15 +413,14 @@ const _: () = assert!(MAX_DEVICES < (1 << SLOT_BITS), "a slot must fit a claim")
 #[derive(Clone, Copy)]
 struct ClaimEntry {
     device: usize,
-    /// Where the claimant's name is: NUL-terminated, the claimant's to keep,
-    /// and only ever handed back -- to whoever is refused because of this
-    /// claim -- never read here.
-    holder: usize,
+    /// Who holds it: handed back to whoever is refused because of this
+    /// claim.
+    holder: &'static CStr,
     /// 0: the slot is free
     claim: usize,
 }
 
-const NO_CLAIM: ClaimEntry = ClaimEntry { device: 0, holder: 0, claim: 0 };
+const NO_CLAIM: ClaimEntry = ClaimEntry { device: 0, holder: c"", claim: 0 };
 
 struct Claims {
     entries: [ClaimEntry; MAX_DEVICES],
@@ -523,7 +456,7 @@ fn overlap(a: usize, b: usize) -> bool {
         if walk == b {
             return true;
         }
-        walk = kernel_blockdev_parent(walk);
+        walk = parent(walk);
     }
 
     let mut walk = b;
@@ -531,21 +464,23 @@ fn overlap(a: usize, b: usize) -> bool {
         if walk == a {
             return true;
         }
-        walk = kernel_blockdev_parent(walk);
+        walk = parent(walk);
     }
 
     false
 }
 
-/// The claim, or where the name of whoever stands in its way is.
-fn claim(handle: usize, holder: usize) -> Result<usize, usize> {
-    if handle == 0 || holder == 0 {
-        return Err(NO_DEVICE.as_ptr() as usize);
+/// Claim a device against mounts, the disk log and other writers, naming
+/// the holder a refusal reports: the claim, for `release` -- or who stands
+/// in its way.
+pub(crate) fn claim(handle: usize, holder: &'static CStr) -> Result<usize, &'static CStr> {
+    if handle == 0 {
+        return Err(NO_DEVICE);
     }
 
     let mut claims = match CLAIMS.get() {
         Some(claims) => claims.lock(),
-        None => return Err(NOT_READY.as_ptr() as usize),
+        None => return Err(NOT_READY),
     };
 
     let mut free = None;
@@ -559,7 +494,7 @@ fn claim(handle: usize, holder: usize) -> Result<usize, usize> {
         }
     }
 
-    let slot = free.ok_or(TOO_MANY.as_ptr() as usize)?;
+    let slot = free.ok_or(TOO_MANY)?;
 
     claims.generation += 1;
     let claim = (claims.generation << SLOT_BITS) | (slot + 1);
@@ -567,41 +502,9 @@ fn claim(handle: usize, holder: usize) -> Result<usize, usize> {
     Ok(claim)
 }
 
-/// Claim a device against mounts, the disk log and other writers. Returns the
-/// claim for `kernel_blockdev_release`, or 0 with `held_by` set to who holds
-/// an overlapping one -- a NUL-terminated name the kernel keeps.
-///
-/// # Safety
-/// `holder` is NUL-terminated and outlives the claim; `held_by`, if given, is
-/// writable.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_claim_as(
-    handle: usize, holder: *const u8, held_by: *mut *const u8,
-) -> usize {
-    match claim(handle, holder as usize) {
-        Ok(claim) => claim,
-        Err(in_the_way) => {
-            if let Some(held_by) = unsafe { held_by.as_mut() } {
-                *held_by = in_the_way as *const u8;
-            }
-            0
-        }
-    }
-}
-
-/// The claim a module takes when it writes to a device of its own accord.
-///
-/// # Safety
-/// `held_by`, if given, is writable.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_blockdev_claim(handle: usize, held_by: *mut *const u8) -> usize {
-    unsafe { kernel_blockdev_claim_as(handle, MODULE_HOLDER.as_ptr().cast(), held_by) }
-}
-
 /// Give a claim back. A claim that is not the one the slot holds -- a stale
 /// one, or one already released -- does nothing.
-#[no_mangle]
-pub extern "C" fn kernel_blockdev_release(claim: usize) {
+pub(crate) fn release(claim: usize) {
     let slot = claim & SLOT_MASK;
     if slot == 0 || slot > MAX_DEVICES {
         return;
@@ -615,17 +518,158 @@ pub extern "C" fn kernel_blockdev_release(claim: usize) {
     }
 }
 
+/* ---- what a module, and the boot path, call ----
+ *
+ * A module is linked on its own and binds these by name (`kcore::block::
+ * Disk` is their wrapper); the kernel image itself comes in through `Disk`
+ * in disk.rs and never through here. A device crosses as its handle, which
+ * `device()` looks up, so any word will do; a buffer crosses as a pointer
+ * and a count of sectors, which nothing here can check. */
+
+/// The boot path, once interrupts and the scheduler run.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_set_interrupts_started() {
+    INTERRUPTS_STARTED.store(true, Ordering::Release);
+}
+
+/// The device of that name, or 0.
+///
+/// # Safety
+/// `name` points at `name_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_find(name: *const u8, name_len: usize) -> usize {
+    if name.is_null() {
+        return 0;
+    }
+    find(unsafe { core::slice::from_raw_parts(name, name_len) })
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_capacity(handle: usize) -> u64 {
+    capacity(handle)
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_sector_size(handle: usize) -> u64 {
+    sector_size(handle)
+}
+
+/// How many bytes `count` sectors of the device are.
+fn byte_len(handle: usize, count: u32) -> Option<usize> {
+    usize::try_from((count as u64).checked_mul(sector_size(handle))?).ok()
+}
+
+/// Synchronous read, count in sectors: 0 once the data is in buf.
+///
+/// # Safety
+/// `buf` takes `count` sectors, and the device's driver may DMA into it.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_read(
+    handle: usize, sector: u64, buf: *mut u8, count: u32,
+) -> i32 {
+    let len = match byte_len(handle, count) {
+        Some(len) if !buf.is_null() => len,
+        _ => return -1,
+    };
+    if read(handle, sector, unsafe { core::slice::from_raw_parts_mut(buf, len) }) { 0 } else { -1 }
+}
+
+/// Synchronous write, count in sectors: 0 once the device has the data.
+///
+/// # Safety
+/// `buf` holds `count` sectors, and the device's driver may DMA out of it.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_write(
+    handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
+) -> i32 {
+    let len = match byte_len(handle, count) {
+        Some(len) if !buf.is_null() => len,
+        _ => return -1,
+    };
+    if write(handle, sector, unsafe { core::slice::from_raw_parts(buf, len) }, fua != 0) { 0 } else { -1 }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_flush(handle: usize) -> i32 {
+    if flush(handle) { 0 } else { -1 }
+}
+
+/// 1 if the device has the asynchronous path.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_can_submit(handle: usize) -> i32 {
+    can_submit(handle) as i32
+}
+
+/// Hand the device an I/O straight to or from physical memory. Never blocks;
+/// `io` is read before this returns.
+///
+/// # Safety
+/// `io` points at a valid BlockIo whose memory stays valid until its `done`
+/// has run.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_submit(
+    handle: usize, io: *const BlockIo, kick_now: i32,
+) -> i32 {
+    let io = match unsafe { io.as_ref() } {
+        Some(io) => io,
+        None => return SUBMIT_INVALID,
+    };
+
+    match submit(handle, io, kick_now != 0) {
+        Ok(()) => SUBMIT_OK,
+        Err(SubmitError::Busy) => SUBMIT_BUSY,
+        Err(SubmitError::Invalid) => SUBMIT_INVALID,
+        Err(SubmitError::Unsupported) => SUBMIT_UNSUPPORTED,
+    }
+}
+
+/// Ring the doorbell for what a submit without a kick left queued.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_kick(handle: usize) {
+    kick(handle);
+}
+
+/// How many partitions of the device the kernel found.
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_partitions(handle: usize) -> u32 {
+    partitions(handle)
+}
+
+/// The claim a module takes when it writes to a device of its own accord:
+/// the claim for `kernel_blockdev_release`, or 0 with `held_by` set to who
+/// holds an overlapping one -- a NUL-terminated name the kernel keeps.
+///
+/// # Safety
+/// `held_by`, if given, is writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_blockdev_claim(handle: usize, held_by: *mut *const u8) -> usize {
+    match claim(handle, MODULE_HOLDER) {
+        Ok(claim) => claim,
+        Err(in_the_way) => {
+            if let Some(held_by) = unsafe { held_by.as_mut() } {
+                *held_by = in_the_way.as_ptr().cast();
+            }
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn kernel_blockdev_release(claim: usize) {
+    release(claim);
+}
+
 /* ---- the `disks` command ---- */
 
 pub fn dump(_args: &str, out: &mut Output) {
-    let devices = kernel_blockdev_count();
+    let devices = count();
     if devices == 0 {
         let _ = writeln!(out, "no block devices");
         return;
     }
 
     for index in 0..devices {
-        let handle = kernel_blockdev_at(index);
+        let handle = at(index);
         let dev = match device(handle) {
             Some(dev) => dev,
             None => continue,

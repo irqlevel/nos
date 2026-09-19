@@ -10,7 +10,7 @@
 //! found read-only on `/boot`, and the first nanofs found read-write on
 //! `/data`. A procfs goes on `/proc` either way.
 
-use kcore::block::{self, Disk};
+use block::Disk;
 use kcore::procinfo::{self, Root};
 use kcore::trace;
 
@@ -62,32 +62,31 @@ fn find_root(mode: &Root, value: &[u8], uuid: &[u8; 16]) -> Option<Disk> {
 
 /// ext2 if the device carries one, else nanofs; false when neither mounts.
 fn mount_root_on(dev: &Disk, read_only: bool) -> bool {
-    let mut name = [0u8; 32];
     let mut id = ext2::Identity { uuid: [0; 16], label: [0; 17] };
 
     if ext2::probe(dev, &mut id) {
         let mounted = ext2::mount_at("/", dev.handle(), read_only);
         if mounted >= 0 {
             trace!(0, "MountRootFs: mounted ext2 on / from {} ({})",
-                dev.name(&mut name).unwrap_or("?"),
+                dev.name(),
                 if mounted == 1 { "ro" } else { "rw" });
             return true;
         }
         trace!(0, "MountRootFs: mounting ext2 from {} failed",
-            dev.name(&mut name).unwrap_or("?"));
+            dev.name());
         return false;
     }
 
     let mounted = nanofs::mount_at("/", dev.handle(), read_only);
     if mounted >= 0 {
         trace!(0, "MountRootFs: mounted nanofs on / from {} ({})",
-            dev.name(&mut name).unwrap_or("?"),
+            dev.name(),
             if read_only { "ro" } else { "rw" });
         return true;
     }
 
     trace!(0, "MountRootFs: {} carries no filesystem this kernel mounts",
-        dev.name(&mut name).unwrap_or("?"));
+        dev.name());
     false
 }
 
@@ -107,7 +106,6 @@ fn mount_fallback_layout() {
 
     vfs.create(b"/boot", true);
 
-    let mut name = [0u8; 32];
     for index in 0..block::count() {
         let dev = match block::at(index) {
             Some(dev) => dev,
@@ -119,7 +117,7 @@ fn mount_fallback_layout() {
         }
         if ext2::mount_at("/boot", dev.handle(), true) >= 0 {
             trace!(0, "MountRootFs: mounted ext2 on /boot from {} (ro)",
-                dev.name(&mut name).unwrap_or("?"));
+                dev.name());
             break;
         }
     }
@@ -137,7 +135,7 @@ fn mount_fallback_layout() {
         }
         if nanofs::mount_at("/data", dev.handle(), false) >= 0 {
             trace!(0, "MountRootFs: mounted nanofs on /data from {} (rw)",
-                dev.name(&mut name).unwrap_or("?"));
+                dev.name());
             break;
         }
     }

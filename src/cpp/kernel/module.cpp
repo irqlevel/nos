@@ -145,12 +145,13 @@ const ulong MaxImageSize = Mm::PageTable::MaxLargeMapPages * Const::PageSize;
    every pair, so a corrupt count must not make that billions */
 const ulong MaxProgramHeaders = 64;
 
-/* Kernel functions that take a callback for good: nothing hands a block
-   device, a net device or a softirq handler back once it is registered. A
-   module that imports one is permanent -- rmmod would free code the kernel
-   may still call into -- the way a Linux module without an exit is. */
+/* Kernel functions that take a callback for good: nothing hands a net
+   device or a softirq handler back once it is registered. A module that
+   imports one is permanent -- rmmod would free code the kernel may still
+   call into -- the way a Linux module without an exit is. (A disk's driver
+   registers with the block layer as a Rust trait object, from inside the
+   kernel image: there is no name for a module to import.) */
 const char* const PermanentImports[] = {
-    "kernel_blockdev_register",
     "kernel_netdev_register",
     "kernel_softirq_register",
 };

@@ -8,7 +8,7 @@
 
 use core::ffi::CStr;
 
-use kcore::block::Disk;
+use crate::disk::Disk;
 
 use crate::table;
 

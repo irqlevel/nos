@@ -37,7 +37,7 @@
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use kcore::block::{self, Disk};
+use crate::disk::{self as block, Disk};
 use kcore::cmd::Output;
 use kcore::const_init::ConstInit;
 use kcore::cpu;
@@ -131,7 +131,7 @@ const PENDING_SIZE: usize = 2 * IO_BUF_SIZE;
 const AREA_START_SECTOR: u64 = 0;
 
 /// What the disk log's claim on its device says to whoever is refused it.
-const HOLDER: &[u8] = b"the disk log\0";
+const HOLDER: &core::ffi::CStr = c"the disk log";
 
 /// How long `disklog` waits for a writer that is writing, before reporting
 /// without its numbers.
@@ -595,12 +595,11 @@ pub fn setup() -> bool {
 
         /* The area is the disk log's from here on: a mount of the device, or
          * of the disk it is on, or a module writing to it direct is refused */
-        let claim = match block::claim_as(dev.handle(), HOLDER.as_ptr()) {
+        let claim = match block::claim_as(dev.handle(), HOLDER) {
             Ok(claim) => claim,
             Err(held_by) => {
-                let mut name = [0u8; 32];
                 trace!(0, "DiskLog: {} is in use by {}, not writing to it",
-                    dev.name(&mut name).unwrap_or("?"), held_by);
+                    dev.name(), held_by);
                 continue;
             }
         };
@@ -626,9 +625,8 @@ pub fn setup() -> bool {
             return false;
         }
 
-        let mut name = [0u8; 32];
         trace!(0, "DiskLog: {}, boot {}, {} sectors of {} bytes",
-            dev.name(&mut name).unwrap_or("?"), header.boot_seq + 1,
+            dev.name(), header.boot_seq + 1,
             header.area_sectors, header.sector_size);
 
         /* The boot so far -- the whole ring, the line above with it -- goes
@@ -730,12 +728,7 @@ log to a prepared area");
         return;
     }
 
-    let mut name = [0u8; 32];
-    let dev = Disk::from_handle(DEV.load(Ordering::Relaxed));
-    let dev_name = match dev.as_ref() {
-        Some(dev) => dev.name(&mut name).unwrap_or("?"),
-        None => "?",
-    };
+    let dev_name = Disk::from_handle(DEV.load(Ordering::Relaxed)).map_or("?", |dev| dev.name());
 
     let _ = writeln!(out, "disklog: {}, boot {}, {} sectors of {} bytes",
         dev_name, BOOT_SEQ.load(Ordering::Relaxed),

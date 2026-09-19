@@ -22,7 +22,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use kcore::block::{self, BlockDriver};
+use block::BlockDriver;
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::{self, DmaBuffer};
 use kcore::interrupt::LegacyInterrupt;
@@ -589,7 +589,7 @@ fn probe_lun(hba: &'static Hba, target: u8, lun: u16) -> bool {
     /* For good, as every block device is. */
     let disk: &'static Disk = Box::leak(Box::new(Disk { hba, target, lun, capacity, sector_size }));
 
-    match block::register_driver(name, 0, disk) {
+    match block::register_driver(name, disk) {
         Some(_registration) => {
             DISKS.store(index + 1, Ordering::Release);
             trace!(0, "virtio-scsi: {} is target {} lun {}, {} sectors of {} bytes",

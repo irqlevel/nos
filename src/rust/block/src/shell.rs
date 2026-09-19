@@ -6,7 +6,7 @@
 
 use core::fmt::Write;
 
-use kcore::block::{self, Disk};
+use crate::disk::{self as block, Disk};
 use kcore::cmd::Output;
 use kcore::dma::DmaBuffer;
 
@@ -17,7 +17,7 @@ const DUMP_BYTES: usize = 512;
 /// What diskwrite's claim on its device says to whoever is refused it. NUL
 /// terminated because the claim keeps the pointer, and whoever is refused
 /// prints it.
-const DISKWRITE_HOLDER: &[u8] = b"diskwrite\0";
+const DISKWRITE_HOLDER: &core::ffi::CStr = c"diskwrite";
 
 pub fn diskread(args: &str, out: &mut Output) {
     let mut tokens = args.split_whitespace();
@@ -118,7 +118,7 @@ pub fn diskwrite(args: &str, out: &mut Output) {
     }
 
     /* Not around a mounted filesystem, the disk log or a write test */
-    let claim = match block::claim_as(disk.handle(), DISKWRITE_HOLDER.as_ptr()) {
+    let claim = match block::claim_as(disk.handle(), DISKWRITE_HOLDER) {
         Ok(claim) => claim,
         Err(held_by) => {
             let _ = writeln!(out, "disk '{}' is in use by {}", name, held_by);

@@ -165,7 +165,7 @@ impl Mount {
     /// Off its device and gone. The filesystem is released with it.
     fn take_down(mut self) {
         self.fs.unmount();
-        kcore::block::release(self.claim);
+        block::release(self.claim);
     }
 }
 
@@ -302,7 +302,7 @@ pub struct Vfs {
 }
 
 /// What a mount's claim on its device says to whoever is refused it.
-const MOUNT_HOLDER: &[u8] = b"a mounted filesystem\0";
+const MOUNT_HOLDER: &core::ffi::CStr = c"a mounted filesystem";
 
 /// What a path came to.
 struct Resolved {
@@ -377,7 +377,7 @@ impl Vfs {
          * overlapping it. */
         let mut claim = 0;
         if device != 0 {
-            claim = match kcore::block::claim_as(device, MOUNT_HOLDER.as_ptr()) {
+            claim = match block::claim_as(device, MOUNT_HOLDER) {
                 Ok(claim) => claim,
                 Err(held_by) => {
                     trace!(0, "vfs: the device is in use by {}", held_by);
@@ -390,7 +390,7 @@ impl Vfs {
         let read_only = match fs.mount(read_only) {
             Some(found_read_only) => read_only || found_read_only,
             None => {
-                kcore::block::release(claim);
+                block::release(claim);
                 return None;
             }
         };

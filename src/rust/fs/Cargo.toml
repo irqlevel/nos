@@ -7,3 +7,6 @@ edition = "2021"
 
 [dependencies]
 kcore = { path = "../kcore" }
+# The disks a filesystem is mounted on: the block layer itself, not the C ABI
+# a module reaches it by.
+block = { path = "../block" }

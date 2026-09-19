@@ -8,7 +8,7 @@
 
 use core::fmt::Write;
 
-use kcore::block::{self, Disk};
+use block::Disk;
 use kcore::cmd::Output;
 
 use crate::files::{self, buffer};
@@ -19,7 +19,7 @@ use crate::vnode::Kind;
 use crate::{ext2, nanofs, ramfs, vfs_instance};
 
 /// What `format`'s claim on its device says to whoever is refused it.
-const FORMAT_HOLDER: &[u8] = b"format\0";
+const FORMAT_HOLDER: &core::ffi::CStr = c"format";
 
 /// One file at a time through 64 KiB pieces: neither side has to fit in
 /// memory.
@@ -148,7 +148,7 @@ pub fn format(args: &str, out: &mut Output) {
 
     /* Not under a mounted filesystem, the disk log or a write test, nor over
        a disk one of those holds a partition of */
-    let claim = match block::claim_as(dev.handle(), FORMAT_HOLDER.as_ptr()) {
+    let claim = match block::claim_as(dev.handle(), FORMAT_HOLDER) {
         Ok(claim) => claim,
         Err(held_by) => {
             let _ = writeln!(out, "disk '{}' is in use by {}", name, held_by);
