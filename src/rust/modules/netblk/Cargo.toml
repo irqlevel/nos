@@ -10,3 +10,6 @@ crate-type = ["staticlib"]
 [dependencies]
 kmod = { path = "../../kmod" }
 kcore = { path = "../../kcore" }
+# The frame formats: a request is taken apart and a reply's headers put
+# together here, in the frame itself, and the network layer cannot be linked.
+netwire = { path = "../../netwire" }

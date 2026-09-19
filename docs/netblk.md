@@ -239,27 +239,28 @@ netblk is an ordinary module, and everything it does goes through the kernel
 interface any module has ([Loadable modules](modules.md)). What it needed that
 the kernel did not have:
 
-- **Frames a listener can keep.** `NetDevice::ListenUdpFrames` hands a UDP
-  listener the `NetFrame`; the listener may take a reference and keep it past
-  its return, hand it to a disk, transmit it, or release it from any context.
+- **Frames a listener can keep.** A UDP listener is lent the frame itself
+  (`kcore::net::Lent`), not a copy of what is in it; it may take a reference
+  (`retain`, a `NetFrame`) and keep it past its return, hand it to a disk,
+  transmit it, or release it from any context.
   virtio-net's receive ring used to be sixteen static buffers, each reposted by
   its frame's release -- into a queue only the receive softirq may touch, so a
   frame could never leave the receive path. Its ring now holds frames from the
   pool (up to 128, each posted as a header descriptor and a frame descriptor),
   refilled from the pool as they are handed up, as the Rust NIC drivers
   already did; and it keeps 32 transmits in flight instead of 8.
-- **Batched transmit.** `NetDevice::SubmitTxBatch`: a run of frames under one
-  lock and one `FlushTx`. It may be called with interrupts off; what the driver
+- **Batched transmit.** `kernel_net_submit_tx` (`kcore::net::TxBatch`): a run
+  of frames under one lock and one `flush_tx`. It may be called with interrupts off; what the driver
   has finished with is then left for the transmit softirq to release, since a
   frame from the allocator is freed through a TLB shootdown that a CPU with
   interrupts off cannot take part in.
-- **Asynchronous block I/O.** `kcore::block::Disk::submit` takes an
-  `AsyncBlockIo` -- sectors, a physical address, a completion callback -- and
-  never blocks: a full queue is `SubmitBusy`, to be tried again after a
-  completion. A partition forwards it, moved onto its disk. The NVMe driver
+- **Asynchronous block I/O.** `kcore::block::Disk::submit` takes a
+  `BlockIo` -- sectors, a physical address, a completion callback -- and
+  never blocks: a full queue is `SubmitError::Busy`, to be tried again after
+  a completion. A partition forwards it, moved onto its disk. The NVMe driver
   implements it with the command IDs its synchronous path uses, calling the
   callback from its interrupt handler, and rings its doorbell only on
-  `KickAsync` when asked to. Its interrupt handler now acknowledges a batch of
+  `kick` when asked to. Its interrupt handler now acknowledges a batch of
   completions with one CQ doorbell instead of one per completion -- before any
   of their command IDs can be reused, which is what keeps the completion queue
   from ever needing more room than it has. Eight of the IDs are kept from the
@@ -272,9 +273,21 @@ the kernel did not have:
   the CPU to another task runnable on it and returns at once when there is
   none, where `Schedule()` would hand it to the idle task.
 - **For Rust**, in `kcore`: `ring::LocklessRing`, `sync::Event`,
-  `task::yield_to_runnable`, `cpu::synchronize`, `net::Nic` (a device to send and
-  receive on, found by name) with `UdpListener`, `NetFrame::retain` and
-  `alloc_tx`, and `block::Disk::submit` and `kick`.
+  `task::yield_to_runnable`, `task::spawn_on_with` (the worker, pinned, holding
+  the instance's state rather than a pointer to it), `cpu::synchronize`,
+  `net::Nic` (a device to send and receive on, found by name) with a listener
+  that owns its handler (`listen`, `UdpHandler`, `Lent`), `NetFrame::alloc_tx`
+  and `TxBatch`, and `block::Disk::submit` and `kick`. The frame formats --
+  a request taken apart, a reply's headers put in front of data the CPU never
+  touches -- are the `netwire` crate's, which the network layer is built on
+  too.
+
+What is left of `unsafe` in the module is what those do not cover yet: a
+slot travels the rings as a word, from the receive path to the worker, to the
+disk's interrupt and back, and whoever takes it off a ring reaches it through
+that word; and the disk's completion callback is a C function handed a
+context. The frames themselves, the listener, the worker and the batch that
+goes to the NIC are ordinary owned values.
 
 ## The protocol
 

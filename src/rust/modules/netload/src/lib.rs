@@ -824,6 +824,7 @@ fn build_source(plan: SendPlan) -> Result<SourceRun, &'static str> {
         dst_ip: plan.ip,
         src_port: plan.source_port,
         dst_port: plan.port,
+        dont_fragment: false,
     };
     let template = Source::template(&plan, &route).ok_or("not a size a datagram can have")?;
 

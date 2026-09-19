@@ -421,7 +421,8 @@ are the `netwire` crate's, which the network layer is built on too.
 `netblk` (`src/rust/modules/netblk`) serves an NVMe disk, or a partition of
 one, over UDP, zero-copy both ways: `netblk start nvme0 7000`, then
 `scripts/netblk.py <host> 7000 ...` from anywhere else. Its own page is
-[netblk](netblk.md). It is the module that stops cleanly with the most in
+[netblk](netblk.md). It takes its requests through the same listener netload
+does, and takes them apart with `netwire`. It is the module that stops cleanly with the most in
 flight -- a receive callback on one CPU, the disk's interrupt handler on
 another, a worker task, frames the NIC still holds -- and its `Drop` is the
 order that takes: the listener, the worker, then `kcore::cpu::synchronize` for

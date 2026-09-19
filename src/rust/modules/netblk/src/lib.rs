@@ -15,8 +15,9 @@
 //!
 //! The path, and the kernel's lockless rings that join its pieces:
 //!
-//! - receive softirq: `on_frame` parses a request, takes a slot for it and
-//!   queues it on `requests` -- no lock, no allocation, no copy;
+//! - receive softirq: the listener's `on_frame` parses a request, takes a
+//!   slot for it and queues it on `requests` -- no lock, no allocation, no
+//!   copy;
 //! - the worker, a task of the instance's pinned to one CPU: submits what is
 //!   queued to the disk, each I/O's PRP pointing into its frame, and rings
 //!   the disk's doorbell once for the batch;
@@ -39,19 +40,19 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::fmt;
 use core::fmt::Write;
-use core::mem::ManuallyDrop;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::block::{BlockIo, Disk, DiskClaim, SubmitError, IO_FLUSH, IO_READ, IO_WRITE};
 use kcore::cmd::{Command, Output};
 use kcore::error::Error;
-use kcore::net::{ListenError, NetFrame, Nic, UdpListener};
+use kcore::net::{Lent, ListenError, NetFrame, Nic, RxContext, TxBatch, UdpHandler, UdpListener};
 use kcore::ring::LocklessRing;
 use kcore::sync::{Event, Mutex};
 use kcore::task::TaskHandle;
 use kcore::time::boot_time_ns;
+use netwire::{be16, be32, be64, eth, ip, set_be16, set_be32, set_be64, udp, Ipv4 as Ip, ETH_HDR_LEN,
+              ETH_TYPE_IP, IP_HDR_LEN, UDP_HDR_LEN};
 
 const HELP: &str = "netblk start <disk> <port> [ro nic= mtu= cpu= poll=] | list | stop <port>|all - a disk over UDP";
 const _: () = assert!(HELP.len() <= kcore::cmd::HELP_MAX, "`help` would cut it short");
@@ -83,21 +84,20 @@ const ST_ROFS: u16 = 5;
 const INFO_LEN: usize = 32;
 const INFO_READ_ONLY: u32 = 1;
 
-const ETH_LEN: usize = 14;
-const IP_LEN: usize = 20;
-const UDP_LEN: usize = 8;
+/* netblk's own header, behind UDP's; where each of its fields lies */
 const HDR_LEN: usize = 30;
+const HDR_MAGIC: usize = 0;
+const HDR_VERSION: usize = 4;
+const HDR_OP: usize = 5;
+const HDR_FLAGS: usize = 6;
+const HDR_COOKIE: usize = 8;
+const HDR_OFFSET: usize = 16;
+const HDR_LENGTH: usize = 24;
+const HDR_STATUS: usize = 28;
 /* A reply's headers, never with IP options: where its data starts */
-const REPLY_HDRS: usize = ETH_LEN + IP_LEN + UDP_LEN + HDR_LEN;
+const REPLY_HDRS: usize = udp::PAYLOAD_AT + HDR_LEN;
 
-const ETHERTYPE_IP: u16 = 0x0800;
-const IP_VERSION_IHL: u8 = 0x45;
-const IPPROTO_UDP: u8 = 17;
-/* More-fragments and the fragment offset: a fragment is never ours, there
-   being no reassembly here */
-const IP_FRAG_MASK: u16 = 0x3FFF;
-const IP_DF: u16 = 0x4000;
-const IP_TTL: u8 = 64;
+const IP_VERSION: u8 = 4;
 
 const DEFAULT_NIC: &str = "eth0";
 /* Ports below are the well-known ones -- DHCP's 68 among them, which the
@@ -106,7 +106,7 @@ const FIRST_PORT: u16 = 1024;
 const DEFAULT_MTU: usize = 1500;
 const MIN_MTU: usize = 576;
 /* A frame from the kernel's pool holds 2 KiB, Ethernet header included */
-const MAX_MTU: usize = 2048 - ETH_LEN;
+const MAX_MTU: usize = 2048 - ETH_HDR_LEN;
 
 /* A read asks for up to this many datagrams' worth */
 const READ_PIECES: usize = 16;
@@ -155,10 +155,7 @@ struct NetBlk {
 impl kmod::Module for NetBlk {}
 
 fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
-    let registry = Arc::new(Registry {
-        lock: Mutex::new(()).ok_or(Error::NoMemory)?,
-        instances: UnsafeCell::new(Vec::new()),
-    });
+    let registry = Arc::new(Registry { instances: Mutex::new(Vec::new()).ok_or(Error::NoMemory)? });
 
     let reg = registry.clone();
     let cmd = Command::register("netblk", HELP, move |args, out| {
@@ -177,18 +174,12 @@ kmod::module!(name: "netblk", init: init);
 /* The running instances, for the command's calls -- which may come from the
    console and the UDP shell at once -- to share */
 struct Registry {
-    lock: Mutex<()>,
-    instances: UnsafeCell<Vec<Instance>>,
+    instances: Mutex<Vec<Instance>>,
 }
-
-/* instances is only reached under lock */
-unsafe impl Send for Registry {}
-unsafe impl Sync for Registry {}
 
 impl Registry {
     fn with<R>(&self, f: impl FnOnce(&mut Vec<Instance>) -> R) -> R {
-        let _guard = self.lock.lock();
-        f(unsafe { &mut *self.instances.get() })
+        f(&mut self.instances.lock())
     }
 }
 
@@ -262,7 +253,7 @@ fn start<'a>(reg: &Registry, mut words: impl Iterator<Item = &'a str>, out: &mut
     if sector_size == 0 || !sector_size.is_power_of_two() {
         return Err(format!("{} has {}-byte sectors?", disk_name, sector_size));
     }
-    let max_io = ((mtu - IP_LEN - UDP_LEN - HDR_LEN) as u64 / sector_size) * sector_size;
+    let max_io = ((mtu - IP_HDR_LEN - UDP_HDR_LEN - HDR_LEN) as u64 / sector_size) * sector_size;
     if max_io == 0 {
         return Err(format!(
             "a {}-byte sector of {} does not fit a {}-byte datagram -- no room to carry one without a copy",
@@ -294,9 +285,11 @@ fn start<'a>(reg: &Registry, mut words: impl Iterator<Item = &'a str>, out: &mut
 
     let shared = Shared::new(disk, nic, port, read_only, sector_size, size, max_io, poll_us * NS_PER_US)
         .ok_or_else(|| "no memory for its rings and slots".to_string())?;
-    let ctx = &*shared as *const Shared as *mut u8;
 
-    let worker = kcore::task::spawn_on_with_ctx(&format!("netblk/{}", port), 1u64 << cpu, worker_main, ctx)
+    /* The worker holds the shared state for as long as it runs, and the
+       listener for as long as it listens: neither is handed a pointer to
+       outlive. */
+    let worker = kcore::task::spawn_on_with(&format!("netblk/{}", port), 1u64 << cpu, shared.clone(), worker_main)
         .ok_or_else(|| "could not start its task".to_string())?;
 
     /* An instance from here on, so that a failure below is torn down by its
@@ -308,14 +301,14 @@ fn start<'a>(reg: &Registry, mut words: impl Iterator<Item = &'a str>, out: &mut
         cpu,
         mtu,
         started: boot_time_ns(),
-        shared,
+        shared: shared.clone(),
         listener: None,
         worker: Some(worker),
         _claim: claim,
     };
 
     /* Last: requests may arrive from this moment */
-    instance.listener = Some(nic.listen_udp(port, on_frame, ctx).map_err(|e| match e {
+    instance.listener = Some(nic.listen(port, shared).map_err(|e| match e {
         ListenError::PortTaken => format!("UDP port {} on {} is taken", port, nic_name),
         ListenError::TableFull => format!("{} listens on as many ports as it can already", nic_name),
         ListenError::Invalid => format!("{}: not a UDP port", port),
@@ -512,16 +505,6 @@ impl fmt::Display for Micros {
     }
 }
 
-/* An IPv4 address in host byte order, dotted */
-struct Ip(u32);
-
-impl fmt::Display for Ip {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let b = self.0.to_be_bytes();
-        write!(f, "{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-    }
-}
-
 /* ------------------------------------------------------------------ */
 /* An instance                                                         */
 /* ------------------------------------------------------------------ */
@@ -533,16 +516,12 @@ struct Instance {
     cpu: u32,
     mtu: usize,
     started: u64,
-    shared: Box<Shared>,
+    shared: Arc<Shared>,
     listener: Option<UdpListener>,
     worker: Option<TaskHandle>,
     /* Last to go */
     _claim: Option<DiskClaim>,
 }
-
-/* Everything behind `shared` is reached from other contexts only through the
-   rings, the event and its atomics */
-unsafe impl Send for Instance {}
 
 impl Drop for Instance {
     fn drop(&mut self) {
@@ -569,7 +548,10 @@ impl Drop for Instance {
 }
 
 /* What the receive softirq, the worker and the disk's interrupt handler all
-   reach, through a pointer: the configuration, the rings, the slots */
+   reach: the configuration, the rings, the slots. The listener and the
+   worker each hold it for as long as they run; the disk's interrupt handler
+   finds it through the slot it is handed, which is why an instance waits out
+   every handler before it lets go of its own hold. */
 struct Shared {
     disk: Disk,
     nic: Nic,
@@ -591,13 +573,22 @@ struct Shared {
     done: LocklessRing,
     /* the worker's wakeup, from either producer */
     event: Event,
-    /* SLOTS of them, reached only through the pointers the rings carry */
+    /* SLOTS of them, reached only through the pointers the rings carry:
+       whoever takes one off a ring has it to itself until it puts it on the
+       next */
     slots: *mut Slot,
     stopping: AtomicBool,
 
     rx: RxStats,
     worker: WorkerStats,
 }
+
+/* `slots` is what keeps these from being derived. A slot is one context's at
+   a time -- the rings hand it from the receive path to the worker, to the
+   disk's interrupt and back -- and everything else is atomics, rings and an
+   event. */
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
 
 impl Shared {
     fn new(
@@ -609,7 +600,7 @@ impl Shared {
         size: u64,
         max_io: u64,
         idle_poll_ns: u64,
-    ) -> Option<Box<Self>> {
+    ) -> Option<Arc<Self>> {
         let free = LocklessRing::new(SLOTS)?;
         let requests = LocklessRing::new(SLOTS)?;
         let done = LocklessRing::new(SLOTS)?;
@@ -621,7 +612,7 @@ impl Shared {
         }
         let slots = Box::into_raw(slots.into_boxed_slice()) as *mut Slot;
 
-        let shared = Box::new(Self {
+        let shared = Arc::new(Self {
             disk,
             nic,
             mac: nic.mac(),
@@ -643,7 +634,7 @@ impl Shared {
             worker: WorkerStats::new(),
         });
 
-        let base = &*shared as *const Shared;
+        let base = Arc::as_ptr(&shared);
         for i in 0..SLOTS {
             let slot = unsafe { shared.slots.add(i) };
             unsafe { (*slot).shared = base };
@@ -677,7 +668,7 @@ struct Slot {
     shared: *const Shared,
     /* A read's frame to transmit, allocated when it is submitted; a write's
        or a flush's frame as received, kept to become the reply */
-    frame: usize,
+    frame: Option<NetFrame>,
     cookie: u64,
     offset: u64,
     length: u32,
@@ -695,7 +686,7 @@ impl Slot {
     const fn empty() -> Self {
         Self {
             shared: core::ptr::null(),
-            frame: 0,
+            frame: None,
             cookie: 0,
             offset: 0,
             length: 0,
@@ -867,95 +858,79 @@ struct Request {
     data_len: usize,
 }
 
-#[inline]
-fn be16(b: &[u8], at: usize) -> u16 {
-    u16::from_be_bytes([b[at], b[at + 1]])
-}
-
-#[inline]
-fn be32(b: &[u8], at: usize) -> u32 {
-    u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
-}
-
-#[inline]
-fn be64(b: &[u8], at: usize) -> u64 {
-    ((be32(b, at) as u64) << 32) | be32(b, at + 4) as u64
-}
-
 /* An Ethernet frame holding a netblk request, or None. The dispatcher
    matched the UDP port and nothing else. */
 fn parse(b: &[u8]) -> Option<Request> {
-    if b.len() < ETH_LEN + IP_LEN + UDP_LEN + HDR_LEN || be16(b, 12) != ETHERTYPE_IP {
+    if b.len() < REPLY_HDRS || eth::ether_type(b) != ETH_TYPE_IP {
+        return None;
+    }
+    /* A fragment is never ours, there being no reassembly here */
+    let packet = &b[ETH_HDR_LEN..];
+    if ip::version(packet) != IP_VERSION || ip::is_fragment(packet) {
         return None;
     }
 
-    let ip = ETH_LEN;
-    let ihl = (b[ip] & 0x0F) as usize * 4;
-    if b[ip] >> 4 != 4 || ihl < IP_LEN || be16(b, ip + 6) & IP_FRAG_MASK != 0 {
-        return None;
-    }
-
-    let udp = ip + ihl;
-    if b.len() < udp + UDP_LEN + HDR_LEN {
-        return None;
-    }
-    /* The UDP length, not the frame's: a short frame carries Ethernet padding */
-    let udp_len = be16(b, udp + 4) as usize;
-    if udp_len < UDP_LEN + HDR_LEN || udp + udp_len > b.len() {
+    /* The IP header's own length honoured, and the UDP length rather than
+       the frame's: a short frame carries Ethernet padding */
+    let datagram = udp::parse(b)?;
+    let hdr = datagram.payload;
+    if hdr.len() < HDR_LEN {
         return None;
     }
 
     /* A reply is never answered, whatever it carries: two servers would
        otherwise bounce one datagram between them for good, each refusal an
        answer to the last */
-    let hdr = udp + UDP_LEN;
-    if be32(b, hdr) != MAGIC || b[hdr + 4] != VERSION || b[hdr + 5] & OP_REPLY != 0 {
+    if be32(hdr, HDR_MAGIC) != MAGIC || hdr[HDR_VERSION] != VERSION || hdr[HDR_OP] & OP_REPLY != 0 {
         return None;
     }
-    let local_ip = be32(b, ip + 16);
 
     Some(Request {
         peer: Peer {
-            mac: [b[6], b[7], b[8], b[9], b[10], b[11]],
-            ip: be32(b, ip + 12),
-            port: be16(b, udp),
-            local_ip,
+            mac: eth::src(b),
+            ip: datagram.src_ip,
+            port: datagram.src_port,
+            local_ip: datagram.dst_ip,
         },
-        op: b[hdr + 5],
-        flags: be16(b, hdr + 6),
-        cookie: be64(b, hdr + 8),
-        offset: be64(b, hdr + 16),
-        length: be32(b, hdr + 24),
-        data_off: hdr + HDR_LEN,
-        data_len: udp_len - UDP_LEN - HDR_LEN,
+        op: hdr[HDR_OP],
+        flags: be16(hdr, HDR_FLAGS),
+        cookie: be64(hdr, HDR_COOKIE),
+        offset: be64(hdr, HDR_OFFSET),
+        length: be32(hdr, HDR_LENGTH),
+        data_off: datagram.payload_at + HDR_LEN,
+        data_len: hdr.len() - HDR_LEN,
     })
 }
 
 /* The listener: every datagram to the port, lent for the call. */
-extern "C" fn on_frame(ctx: *mut u8, frame: usize) {
-    let sh = unsafe { &*(ctx as *const Shared) };
+impl UdpHandler for Shared {
+    fn on_frame(&self, frame: Lent<'_>, _rx: &mut RxContext) {
+        let sh = self;
 
-    /* To the NIC's own address and no other -- not a subnet broadcast, not an
-       address it was never given: the reply comes from it */
-    let Some(req) = parse(unsafe { NetFrame::lent(frame) }).filter(|r| r.peer.local_ip == sh.nic.ip()) else {
-        sh.rx.bad.add(1);
-        return;
-    };
-    sh.rx.requests.add(1);
+        /* To the NIC's own address and no other -- not a subnet broadcast,
+           not an address it was never given: the reply comes from it */
+        let Some(req) = parse(frame.bytes()).filter(|r| r.peer.local_ip == sh.nic.ip()) else {
+            sh.rx.bad.add(1);
+            return;
+        };
+        sh.rx.requests.add(1);
 
-    match req.op {
-        OP_INFO => answer_info(sh, &req),
-        OP_READ => queue_read(sh, frame, &req, now_units()),
-        OP_WRITE => queue_write(sh, frame, &req, now_units()),
-        OP_FLUSH => queue_flush(sh, frame, &req, now_units()),
-        _ => refuse(sh, unsafe { NetFrame::retain(frame) }, &req, ST_BADREQ),
+        match req.op {
+            OP_INFO => answer_info(sh, &req),
+            OP_READ => queue_read(sh, frame, &req, now_units()),
+            OP_WRITE => queue_write(sh, frame, &req, now_units()),
+            OP_FLUSH => queue_flush(sh, frame, &req, now_units()),
+            _ => refuse(sh, frame.retain(), &req, ST_BADREQ),
+        }
     }
 }
 
 /* Answered on the spot, in the frame the request came in */
 fn refuse(sh: &Shared, mut frame: NetFrame, req: &Request, status: u16) {
     sh.rx.refused.add(1);
-    let len = write_reply(frame.data_raw_mut(REPLY_HDRS), sh, &req.peer, req.op, req.cookie, req.offset, req.length, status, 0);
+    let Some(len) = write_reply(frame.data_raw_mut(REPLY_HDRS), sh, &req.peer, req.op, req.cookie, req.offset, req.length, status, 0) else {
+        return;
+    };
     frame.set_len(len);
     sh.nic.transmit(frame);
 }
@@ -966,7 +941,12 @@ fn answer_info(sh: &Shared, req: &Request) {
     };
 
     let buf = reply.data_raw_mut(REPLY_HDRS + INFO_LEN);
-    let len = write_reply(buf, sh, &req.peer, OP_INFO, req.cookie, 0, INFO_LEN as u32, ST_OK, INFO_LEN);
+    if buf.len() < REPLY_HDRS + INFO_LEN {
+        return;
+    }
+    let Some(len) = write_reply(buf, sh, &req.peer, OP_INFO, req.cookie, 0, INFO_LEN as u32, ST_OK, INFO_LEN) else {
+        return;
+    };
 
     let info = &mut buf[REPLY_HDRS..];
     info[0..8].copy_from_slice(&sh.size.to_be_bytes());
@@ -983,13 +963,13 @@ fn answer_info(sh: &Shared, req: &Request) {
 
 /* A read takes a slot for every datagram of its answer; the frame it came in
    is not kept */
-fn queue_read(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
+fn queue_read(sh: &Shared, frame: Lent<'_>, req: &Request, arrived: u32) {
     let length = req.length as u64;
     if length == 0 || length > sh.max_read || !sh.aligned(req.offset, length) {
-        return refuse(sh, unsafe { NetFrame::retain(frame) }, req, ST_BADREQ);
+        return refuse(sh, frame.retain(), req, ST_BADREQ);
     }
     if !sh.in_range(req.offset, length) {
-        return refuse(sh, unsafe { NetFrame::retain(frame) }, req, ST_RANGE);
+        return refuse(sh, frame.retain(), req, ST_RANGE);
     }
 
     let pieces = ((length + sh.max_io - 1) / sh.max_io) as usize;
@@ -1002,7 +982,7 @@ fn queue_read(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
                     sh.free.push(slot);
                 }
                 sh.rx.busy.add(1);
-                return refuse(sh, unsafe { NetFrame::retain(frame) }, req, ST_BUSY);
+                return refuse(sh, frame.retain(), req, ST_BUSY);
             }
         }
     }
@@ -1010,7 +990,7 @@ fn queue_read(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
     for (i, &slot) in slots[..pieces].iter().enumerate() {
         let at = i as u64 * sh.max_io;
         let s = unsafe { &mut *(slot as *mut Slot) };
-        s.frame = 0;
+        s.frame = None;
         s.op = OP_READ;
         s.fua = false;
         s.cookie = req.cookie;
@@ -1027,8 +1007,8 @@ fn queue_read(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
 
 /* A write keeps its frame: the disk takes the data out of it where it lies,
    and it goes back out as the reply */
-fn queue_write(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
-    let frame = unsafe { NetFrame::retain(frame) };
+fn queue_write(sh: &Shared, frame: Lent<'_>, req: &Request, arrived: u32) {
+    let frame = frame.retain();
     if sh.read_only {
         return refuse(sh, frame, req, ST_ROFS);
     }
@@ -1054,7 +1034,7 @@ fn queue_write(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
     };
 
     let s = unsafe { &mut *(slot as *mut Slot) };
-    s.frame = frame.into_raw();
+    s.frame = Some(frame);
     s.op = OP_WRITE;
     s.fua = req.flags & FLAG_FUA != 0;
     s.cookie = req.cookie;
@@ -1068,8 +1048,8 @@ fn queue_write(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
     sh.event.signal();
 }
 
-fn queue_flush(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
-    let frame = unsafe { NetFrame::retain(frame) };
+fn queue_flush(sh: &Shared, frame: Lent<'_>, req: &Request, arrived: u32) {
+    let frame = frame.retain();
     if sh.read_only {
         return refuse(sh, frame, req, ST_ROFS);
     }
@@ -1080,7 +1060,7 @@ fn queue_flush(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
     };
 
     let s = unsafe { &mut *(slot as *mut Slot) };
-    s.frame = frame.into_raw();
+    s.frame = Some(frame);
     s.op = OP_FLUSH;
     s.fua = false;
     s.cookie = req.cookie;
@@ -1099,10 +1079,11 @@ fn queue_flush(sh: &Shared, frame: usize, req: &Request, arrived: u32) {
 /* ------------------------------------------------------------------ */
 
 /* The headers in front of a reply's data -- Ethernet, IPv4 without options,
-   UDP and netblk's own -- into buf, which holds at least REPLY_HDRS; the
-   frame's length back. The UDP checksum is left 0, "not computed", which
-   IPv4 allows: computing it would read every byte of the data the disk just
-   wrote, the one thing this path never does. */
+   UDP and netblk's own -- into buf; the frame's length back, or None for a
+   buf with no room for them, which no frame off the pool is. The UDP
+   checksum is left 0, "not computed", which IPv4 allows: computing it would
+   read every byte of the data the disk just wrote, the one thing this path
+   never does. */
 fn write_reply(
     buf: &mut [u8],
     sh: &Shared,
@@ -1113,56 +1094,35 @@ fn write_reply(
     length: u32,
     status: u16,
     payload: usize,
-) -> usize {
-    let h = &mut buf[..REPLY_HDRS];
+) -> Option<usize> {
+    let h = buf.get_mut(..REPLY_HDRS)?;
 
-    h[0..6].copy_from_slice(&peer.mac);
-    h[6..12].copy_from_slice(&sh.mac);
-    h[12..14].copy_from_slice(&ETHERTYPE_IP.to_be_bytes());
+    /* From the address the request came to, back to where it came from.
+       "Do not fragment": a reply is sized to the path on purpose, and one
+       a router cut up would be no use to a client that reads a datagram at
+       a time. */
+    let route = udp::Route {
+        src_mac: sh.mac,
+        dst_mac: peer.mac,
+        src_ip: peer.local_ip,
+        dst_ip: peer.ip,
+        src_port: sh.port,
+        dst_port: peer.port,
+        dont_fragment: true,
+    };
+    udp::write_headers(h, &route, HDR_LEN + payload)?;
 
-    let ip = &mut h[ETH_LEN..ETH_LEN + IP_LEN];
-    ip[0] = IP_VERSION_IHL;
-    ip[1] = 0;
-    ip[2..4].copy_from_slice(&((IP_LEN + UDP_LEN + HDR_LEN + payload) as u16).to_be_bytes());
-    ip[4..6].copy_from_slice(&0u16.to_be_bytes());
-    ip[6..8].copy_from_slice(&IP_DF.to_be_bytes());
-    ip[8] = IP_TTL;
-    ip[9] = IPPROTO_UDP;
-    ip[10..12].copy_from_slice(&0u16.to_be_bytes());
-    ip[12..16].copy_from_slice(&peer.local_ip.to_be_bytes());
-    ip[16..20].copy_from_slice(&peer.ip.to_be_bytes());
-    let checksum = ip_checksum(ip);
-    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    let nb = &mut h[udp::PAYLOAD_AT..];
+    set_be32(nb, HDR_MAGIC, MAGIC);
+    nb[HDR_VERSION] = VERSION;
+    nb[HDR_OP] = op | OP_REPLY;
+    set_be16(nb, HDR_FLAGS, 0);
+    set_be64(nb, HDR_COOKIE, cookie);
+    set_be64(nb, HDR_OFFSET, offset);
+    set_be32(nb, HDR_LENGTH, length);
+    set_be16(nb, HDR_STATUS, status);
 
-    let udp = &mut h[ETH_LEN + IP_LEN..ETH_LEN + IP_LEN + UDP_LEN];
-    udp[0..2].copy_from_slice(&sh.port.to_be_bytes());
-    udp[2..4].copy_from_slice(&peer.port.to_be_bytes());
-    udp[4..6].copy_from_slice(&((UDP_LEN + HDR_LEN + payload) as u16).to_be_bytes());
-    udp[6..8].copy_from_slice(&0u16.to_be_bytes());
-
-    let nb = &mut h[ETH_LEN + IP_LEN + UDP_LEN..];
-    nb[0..4].copy_from_slice(&MAGIC.to_be_bytes());
-    nb[4] = VERSION;
-    nb[5] = op | OP_REPLY;
-    nb[6..8].copy_from_slice(&0u16.to_be_bytes());
-    nb[8..16].copy_from_slice(&cookie.to_be_bytes());
-    nb[16..24].copy_from_slice(&offset.to_be_bytes());
-    nb[24..28].copy_from_slice(&length.to_be_bytes());
-    nb[28..30].copy_from_slice(&status.to_be_bytes());
-
-    REPLY_HDRS + payload
-}
-
-#[inline]
-fn ip_checksum(header: &[u8]) -> u16 {
-    let mut sum = 0u32;
-    for pair in header.chunks_exact(2) {
-        sum += u16::from_be_bytes([pair[0], pair[1]]) as u32;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
+    Some(REPLY_HDRS + payload)
 }
 
 /* ------------------------------------------------------------------ */
@@ -1188,9 +1148,8 @@ extern "C" fn on_disk_done(ctx: *mut u8, status: i32) {
 /* The worker                                                          */
 /* ------------------------------------------------------------------ */
 
-extern "C" fn worker_main(ctx: *mut u8) {
-    let sh = unsafe { &*(ctx as *const Shared) };
-    let mut worker = Worker { sh, in_flight: 0, stalled: 0, tx: [0; BATCH], ntx: 0, now: 0 };
+fn worker_main(sh: Arc<Shared>) {
+    let mut worker = Worker { sh: &sh, in_flight: 0, stalled: 0, tx: TxBatch::new(), now: 0 };
     worker.run();
 }
 
@@ -1211,16 +1170,9 @@ struct Worker<'a> {
     /* a request the disk had no room for, first in line; 0 for none */
     stalled: usize,
     /* replies to transmit as one batch */
-    tx: [usize; BATCH],
-    ntx: usize,
+    tx: TxBatch<BATCH>,
     /* the clock, once a pass, for the service times of what it finishes */
     now: u32,
-}
-
-/* The physical address of a frame the slot holds, the frame kept */
-#[inline]
-fn frame_phys(frame: usize) -> u64 {
-    ManuallyDrop::new(unsafe { NetFrame::from_raw(frame) }).data_phys()
 }
 
 impl Worker<'_> {
@@ -1354,17 +1306,23 @@ impl Worker<'_> {
 
         let (op, phys, count) = match s.op {
             OP_READ => {
-                if s.frame == 0 {
-                    match NetFrame::alloc_tx(REPLY_HDRS + s.length as usize) {
-                        Some(frame) => s.frame = frame.into_raw(),
-                        None => return Issued::Dropped,
-                    }
+                if s.frame.is_none() {
+                    s.frame = NetFrame::alloc_tx(REPLY_HDRS + s.length as usize);
                 }
+                let Some(frame) = s.frame.as_ref() else {
+                    return Issued::Dropped;
+                };
                 /* Straight into the frame, behind the room for the headers */
-                (IO_READ, frame_phys(s.frame) + REPLY_HDRS as u64, s.length >> sh.sector_shift)
+                (IO_READ, frame.data_phys() + REPLY_HDRS as u64, s.length >> sh.sector_shift)
             }
-            /* Straight out of the frame, where the NIC put the data */
-            OP_WRITE => (IO_WRITE, frame_phys(s.frame) + s.data_off as u64, s.length >> sh.sector_shift),
+            OP_WRITE => {
+                /* A write always has the frame it came in: see queue_write */
+                let Some(frame) = s.frame.as_ref() else {
+                    return Issued::Dropped;
+                };
+                /* Straight out of the frame, where the NIC put the data */
+                (IO_WRITE, frame.data_phys() + s.data_off as u64, s.length >> sh.sector_shift)
+            }
             _ => (IO_FLUSH, 0, 0),
         };
 
@@ -1414,23 +1372,30 @@ impl Worker<'_> {
         let took = self.now.wrapping_sub(s.arrived);
         sh.worker.record_service(if took > u32::MAX / 2 { 0 } else { took });
 
-        let mut frame = unsafe { NetFrame::from_raw(s.frame) };
-        s.frame = 0;
-        let len = write_reply(frame.data_raw_mut(REPLY_HDRS), sh, &s.peer, s.op, s.cookie, s.offset, s.length, s.status, payload);
-        frame.set_len(len);
+        /* A read that never got a frame was dropped before it came here, and
+           everything else has the one it arrived in: no frame is no reply. */
+        let Some(mut frame) = s.frame.take() else {
+            sh.free.push(slot as usize);
+            return;
+        };
+        let reply = write_reply(frame.data_raw_mut(REPLY_HDRS), sh, &s.peer, s.op, s.cookie, s.offset, s.length, s.status, payload);
 
         /* Nothing of the slot is read after this */
         sh.free.push(slot as usize);
-        self.queue_tx(frame.into_raw());
+        match reply {
+            Some(len) => {
+                frame.set_len(len);
+                self.queue_tx(frame);
+            }
+            /* A reply that could not be written is one that was not sent */
+            None => sh.worker.tx_dropped.add(1),
+        }
     }
 
     /* The slot back to the free, its frame released unanswered */
     fn release(&mut self, slot: *mut Slot) {
         let s = unsafe { &mut *slot };
-        if s.frame != 0 {
-            drop(unsafe { NetFrame::from_raw(s.frame) });
-            s.frame = 0;
-        }
+        drop(s.frame.take());
         self.sh.free.push(slot as usize);
     }
 
@@ -1446,23 +1411,23 @@ impl Worker<'_> {
     }
 
     #[inline]
-    fn queue_tx(&mut self, frame: usize) {
-        self.tx[self.ntx] = frame;
-        self.ntx += 1;
-        if self.ntx == BATCH {
+    fn queue_tx(&mut self, frame: NetFrame) {
+        /* Never full here: a full batch is handed over on the spot */
+        self.tx.push(frame);
+        if self.tx.is_full() {
             self.flush_tx();
         }
     }
 
     /* The replies so far, to the NIC as one batch: one lock, one doorbell */
     fn flush_tx(&mut self) {
-        if self.ntx == 0 {
+        let count = self.tx.len();
+        if count == 0 {
             return;
         }
-        let queued = unsafe { self.sh.nic.transmit_raw(&self.tx[..self.ntx]) };
-        if queued < self.ntx {
-            self.sh.worker.tx_dropped.add((self.ntx - queued) as u64);
+        let queued = self.tx.send(&self.sh.nic);
+        if queued < count {
+            self.sh.worker.tx_dropped.add((count - queued) as u64);
         }
-        self.ntx = 0;
     }
 }
