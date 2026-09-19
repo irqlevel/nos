@@ -9,18 +9,28 @@ struct Start<C> {
     entry: fn(C),
 }
 
-/// A task that is handed `ctx` by value. The one place a start is boxed,
-/// and the one place it is unboxed: in the task, or here if no task was made
-/// to hand it to. It is released once `entry` has returned, not before.
-fn spawn_owned<C: Copy + Send + 'static>(name: &str, ctx: C, entry: fn(C)) -> Option<TaskHandle> {
-    extern "C" fn trampoline<C: Copy>(raw: *mut u8) {
+/// A task that is handed `ctx` by value, on every CPU `affinity` names (any,
+/// when it names none). The one place a start is boxed, and the one place it
+/// is unboxed: in the task, or here if no task was made to hand it to. `ctx`
+/// is the task's from then on, and dropped when `entry` returns.
+fn spawn_owned<C: Send + 'static>(
+    name: &str, affinity: Option<u64>, ctx: C, entry: fn(C),
+) -> Option<TaskHandle> {
+    extern "C" fn trampoline<C>(raw: *mut u8) {
         /* Made below and handed over exactly once: to this task. */
         let start = unsafe { Box::from_raw(raw.cast::<Start<C>>()) };
-        (start.entry)(start.ctx);
+        let Start { ctx, entry } = *start;
+        entry(ctx);
     }
 
     let raw = Box::into_raw(Box::new(Start { ctx, entry })).cast::<u8>();
-    let h = unsafe { task::kernel_task_spawn(name.as_ptr(), name.len(), trampoline::<C>, raw) };
+    let h = unsafe {
+        match affinity {
+            None => task::kernel_task_spawn(name.as_ptr(), name.len(), trampoline::<C>, raw),
+            Some(mask) => task::kernel_task_spawn_on(
+                name.as_ptr(), name.len(), trampoline::<C>, raw, mask as usize),
+        }
+    };
     if h == 0 {
         /* No task to hand it to: still this function's. */
         drop(unsafe { Box::from_raw(raw.cast::<Start<C>>()) });
@@ -89,7 +99,7 @@ impl Drop for TaskHandle {
 /// `ps` and `top` show for the task -- cut to the 31 bytes a task has room
 /// for.
 pub fn spawn(name: &str, f: fn()) -> Option<TaskHandle> {
-    spawn_owned(name, f, |f| f())
+    spawn_owned(name, None, f, |f| f())
 }
 
 pub fn sleep(dur: Duration) {
@@ -120,7 +130,22 @@ pub fn yield_to_runnable() {
 pub fn spawn_for<T: Sync + 'static>(
     name: &str, target: &'static T, entry: fn(&'static T),
 ) -> Option<TaskHandle> {
-    spawn_owned(name, (target, entry), |(target, entry)| entry(target))
+    spawn_owned(name, None, (target, entry), |(target, entry)| entry(target))
+}
+
+/// Spawn a task that owns what it starts from: `ctx` is moved into the task
+/// and dropped when `entry` returns. What a loadable module's tasks are --
+/// nothing of a module lives for good, so its task holds an `Arc` of the
+/// state it works on, and the state outlives the task however the two end.
+pub fn spawn_with<C: Send + 'static>(name: &str, ctx: C, entry: fn(C)) -> Option<TaskHandle> {
+    spawn_owned(name, None, ctx, entry)
+}
+
+/// As `spawn_with`, bound to the CPUs `affinity_mask` names.
+pub fn spawn_on_with<C: Send + 'static>(
+    name: &str, affinity_mask: u64, ctx: C, entry: fn(C),
+) -> Option<TaskHandle> {
+    spawn_owned(name, Some(affinity_mask), ctx, entry)
 }
 
 /// Spawn a task that receives a raw context pointer.

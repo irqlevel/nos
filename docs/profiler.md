@@ -169,8 +169,9 @@ Two empty-report cases are worth knowing:
   asleep the whole window, which is what a task that is not running looks
   like.
 
-`netload` exists partly for this: it gives `profile` something to look at
-other than an idle machine.
+The [`netload` module](modules.md#netload) exists partly for this: a UDP
+load test, from either end of the wire, that gives `profile` something to
+look at other than an idle machine.
 
 ## Cost
 

@@ -1,6 +1,5 @@
 //! A device, as this crate's services see one: DHCP, DNS, the shell over
-//! UDP, netconsole, the load target, the HTTP client and the protocols under
-//! them.
+//! UDP, netconsole, the HTTP client and the protocols under them.
 //!
 //! These are the names `kcore::net` has -- `Nic`, `UdpHandler`, `Lent`,
 //! `UdpListener` -- because the services were written against those. But
@@ -10,7 +9,6 @@
 //! far end. These call the device.
 
 use core::ops::Deref;
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::device::{Device, DEVICES};
 use crate::frame::{Frame, FrameQueue};
@@ -61,19 +59,7 @@ impl Nic {
     pub fn listen<H: UdpHandler>(
         &self, port: u16, handler: &'static H,
     ) -> Result<UdpListener, ListenError> {
-        let key = self.0.listen_handler(port, handler, false)?;
-        Ok(UdpListener { dev: self.0, port, key })
-    }
-
-    /// As `listen`, with `UdpHandler::on_batch_end` called at the end of each
-    /// receive batch. A listener that answers from the receive path builds
-    /// its replies as the frames arrive and hands them to the NIC there --
-    /// one lock and one doorbell for the batch, rather than one of each per
-    /// packet.
-    pub fn listen_batched<H: UdpHandler>(
-        &self, port: u16, handler: &'static H,
-    ) -> Result<UdpListener, ListenError> {
-        let key = self.0.listen_handler(port, handler, true)?;
+        let key = self.0.listen_handler(port, handler)?;
         Ok(UdpListener { dev: self.0, port, key })
     }
 
@@ -99,79 +85,5 @@ pub struct UdpListener {
 impl Drop for UdpListener {
     fn drop(&mut self) {
         self.dev.unlisten_udp(self.port, self.key);
-    }
-}
-
-/// A device that can be set and cleared without a lock: what a receive path
-/// reads once a packet. Only a `Nic` ever goes in, so only a `Nic` comes out
-/// -- looked up in the table on the way, like any word.
-pub struct AtomicNic(AtomicUsize);
-
-impl AtomicNic {
-    pub const fn none() -> Self {
-        Self(AtomicUsize::new(0))
-    }
-
-    pub fn set(&self, nic: Option<Nic>) {
-        self.0.store(nic.map_or(0, |nic| nic.0.handle()), Ordering::Release);
-    }
-
-    #[inline]
-    pub fn get(&self) -> Option<Nic> {
-        match self.0.load(Ordering::Acquire) {
-            0 => None,
-            handle => Nic::from_handle(handle),
-        }
-    }
-}
-
-/// What a listener that answers from the receive path gathers its replies
-/// in: at most `N`, sent with one lock and one doorbell.
-pub struct TxBatch<const N: usize> {
-    frames: FrameQueue,
-}
-
-impl<const N: usize> TxBatch<N> {
-    pub const fn new() -> Self {
-        Self { frames: FrameQueue::new() }
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.frames.len() >= N
-    }
-
-    pub fn len(&self) -> usize {
-        self.frames.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.frames.is_empty()
-    }
-
-    /// Takes the frame. False, and the frame released, when there is no room.
-    pub fn push(&mut self, frame: Frame) -> bool {
-        if self.is_full() {
-            return false;
-        }
-        self.frames.push(frame);
-        true
-    }
-
-    /// Everything gathered, released unsent.
-    pub fn clear(&mut self) {
-        drop(self.frames.take());
-    }
-
-    /// Everything gathered, to the device: how many it queued. The rest it
-    /// releases, and the batch is empty either way.
-    pub fn send(&mut self, nic: &Nic) -> usize {
-        /* Counted by what they carry on the way, as every sender's are. */
-        let mut gathered = self.frames.take();
-        let mut counted = FrameQueue::new();
-        while let Some(frame) = gathered.pop() {
-            nic.count_tx(&frame);
-            counted.push(frame);
-        }
-        nic.submit_tx(counted)
     }
 }

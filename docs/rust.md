@@ -20,6 +20,7 @@ has now, a map of `kcore`, and how a driver is written.
 ```
 ffi/                              raw extern "C" declarations, and nothing else
 kcore/                            safe RAII wrappers around kernel services
+netwire/                          the frame formats, with no kernel in them
 block/  net/  fs/  tls/  virtio/  the layers
 drivers/*                         over block, net, virtio and kcore
 kernel/                           entry points, the global allocator: what C++ calls
@@ -31,6 +32,13 @@ driver depends on `block` and a NIC's on `net`, `fs` depends on `block`,
 `net` on `fs` (for `wget`) and on `tls`. `tls` sits *below* `net`, so it
 takes the connection it speaks over as a trait, `tls::Transport`, which
 `net`'s HTTP client implements over a TCP connection.
+
+Two crates have no kernel in them at all, and that is what they are for:
+`netwire` (the frame formats and the internet checksum) and `ssh` (the
+protocol). A loadable module is linked on its own and cannot link a layer --
+the layer's statics would be a second copy -- but it can link these, so what
+the network layer and the `netload` module both need of a frame is written
+once.
 
 The C ABI is for what is on the other side of a link: C++, and a module,
 which is linked on its own and can share no other seam with the kernel.
@@ -139,9 +147,11 @@ able to say why.
   `cpu::id()`, which is a data race the moment a task migrates between the
   index and the access.
 - **What only the receive path touches** is an `RxOwned<T>`, reached with
-  the `&mut RxContext` the receive pass makes once and lends down
-  (`net::nic`, where a service's `UdpHandler` is lent each frame as a `Lent`
-  and gathers its replies in a `TxBatch`).
+  the `&mut RxContext` the receive pass makes once and lends down: a
+  driver's receive ring, and the replies a listener gathers during a batch.
+  A service's `UdpHandler` is lent each frame as a `Lent` (`net::nic`); a
+  module's is the same shape across the C ABI (`kcore::net`), told when a
+  receive batch ends too, and gathers its replies in a `TxBatch`.
 - **An on-disk or on-wire structure** goes through `kcore::pod`:
   `unsafe impl Pod` said once, of a `#[repr(C)]` structure of integers with
   no padding, and then `read`/`write`/`zeroed` are safe -- bounds-checked
@@ -192,7 +202,7 @@ able to say why.
 | `percpu` | `PerCpu<T>` + `LocalCounter` (statistics any CPU may read, added to with no bus lock), `CpuLocal<T>` (state only its own CPU touches, reached with interrupts off through `with`) |
 | `ring` | `LocklessRing` — the kernel's bounded MPMC queue of words, one CAS an operation, safe from any context |
 | `static_ring` | `StaticRing<N>` (the same, in static storage) and `Mailbox<T, N>` (fixed-shape messages written and read in place, from any context, no allocation) |
-| `task` | `spawn`, `spawn_for(name, &'static T, fn(&'static T))` (a service's task over its one instance — no raw context), `spawn_with_ctx` and `spawn_on_with_ctx` for a module's owned context (each takes the name `ps` and `top` show), `TaskHandle` (`id`), `sleep`, `yield_to_runnable`, `current_id` (is this call from one of my own tasks?) |
+| `task` | `spawn`, `spawn_for(name, &'static T, fn(&'static T))` (a service's task over its one instance — no raw context), `spawn_with(name, ctx, fn(C))` and `spawn_on_with(name, cpus, ..)` for a task that owns what it starts from — a module's, holding an `Arc` of its state, since nothing of a module lives for good — and the raw `spawn_with_ctx` / `spawn_on_with_ctx` (each takes the name `ps` and `top` show), `TaskHandle` (`id`), `sleep`, `yield_to_runnable`, `current_id` (is this call from one of my own tasks?) |
 | `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI), `synchronize` (returns once every interrupt handler running at the call has returned) |
 | `msix` | `MsixTable`, `MsixInterrupt::register_for(table, index, &'static T, handler)` (16 slots, shared by every Rust driver) |
 | `interrupt` | `LegacyInterrupt::register_level_for(dev, &'static T, handler)` / `register_irq_for(irq, …)` (INTx, 8 slots) |
@@ -206,7 +216,7 @@ able to say why.
 | `cmd` | `Command::register` — a shell command whose handler writes to an `Output`; unregistered on drop, after any running call returns. `dispatch` — run a command line as the console would, its output handed to a closure as it is printed |
 | `entropy` | `trait Source` + `register_source(name, &'static S)` — a hardware generator the pool reseeds from |
 | `block` | **for a module.** `Disk` — an existing disk or partition by name: synchronous `read`/`write`/`flush`, `partitions`; asynchronous `submit(&BlockIo, kick)`/`kick` straight to physical memory, the completion callback from interrupt context (`can_submit`: NVMe and its partitions); `claim` → `DiskClaim` before writing, refused while a mount, the disk log or another writer holds the device or one overlapping it. The image uses the `block` crate itself: `block::Disk`, the same shape with no ABI in between, plus `count`/`at`, `name`/`parent`/`handle` and `claim_as` |
-| `net` | **for a module.** `Nic` — an existing device by name: `ip`, `mac`, `listen_udp(port, cb, ctx)` → `UdpListener` (the callback is lent each frame as a word: `NetFrame::lent` reads it, `NetFrame::retain` keeps it to answer in), `transmit`, `transmit_raw`; `NetFrame` (`alloc_tx`, `data_mut`, `data_raw_mut`, `data_phys`, `set_len`). And for the net layer, what the kernel command line said (`dhcp_off`, `dns_on`, `netconsole_params`) and `replay_kernel_log`. The image uses the `net` crate itself: `net::Nic`, `net::Frame`, typed `UdpHandler` listeners |
+| `net` | **for a module.** `Nic` — an existing device by name: `ip`, `mac`; `listen(port, Arc<H>)` → `UdpListener`, which owns its `UdpHandler` until it is dropped — `on_frame(Lent, &mut RxContext)` for each datagram, `on_batch_end(&mut RxContext)` when a receive batch ends, `RxOwned<T>` for what only those two touch, `TxBatch<N>` for the frames that go to the NIC together; `resolve(ip)` (the Ethernet address a frame to `ip` goes to: route, then ARP; sleeps), `tx_room` (how much the transmit queue will take), `transmit`, `transmit_raw`; `NetFrame` (`alloc_tx`, `data_mut`, `data_raw_mut`, `data_phys`, `set_len`); `rx_stats` (whether the receive path is keeping up). The raw `listen_udp(port, cb, ctx)`, which lends each frame as a word (`NetFrame::lent` reads it, `NetFrame::retain` keeps it), is what netblk still uses. And for the net layer, what the kernel command line said (`dhcp_off`, `dns_on`, `netconsole_params`) and `replay_kernel_log`. The image uses the `net` crate itself: `net::Nic`, `net::Frame`, typed `UdpHandler` listeners |
 | `tcp` | **for a module.** `TcpListener::bind(&Nic, port)` → `accept(timeout)` → `TcpStream` (`send_all`, `send` with a timeout, `recv`, `peer`), each closed on drop; a listener's drop resets what it never accepted |
 | `fs` | **for a module.** `read(path, max)`, `write(path, data)` (replaces, then syncs), `create`, `create_dir` — its configuration files. The image opens files through the `fs` crate itself: `fs::vfs::Open::new(fs::vfs_instance()?, path, flags)` |
 

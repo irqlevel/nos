@@ -323,6 +323,99 @@ The module and the machine's kernel have to share a kernel interface -- see
 [What a module may call](#what-a-module-may-call) -- so take both from one
 release, or build both from one tree.
 
+## netload
+
+`netload` (`src/rust/modules/netload`) is a UDP load test from either end of
+the wire, so that [`profile`](profiler.md) has something to look at other
+than an idle machine: an idle twenty-CPU box spends about 0.06% of a core on
+anything at all, and the paths worth seeing -- the frame pool, the driver
+rings, soft IRQ dispatch -- only appear when packets are moving. Two
+machines running it, one each way, move them with nothing else in the
+picture. Under QEMU, the source against a host that sends back what it gets:
+
+```
+$ insmod /netload.ko
+$ netload send 10.0.2.2 7777 size=200 pps=500 count=300 tasks=2
+netload: sending to 10.0.2.2:7777 from port 9998, 200 byte datagrams, 2 task(s), 500 a second, 300 of them
+$ netload
+netload: sending to 10.0.2.2:7777 from port 9998, 200 byte datagrams, 2 task(s), 500 a second, 300 of them -- done in 0.613 s
+sent 300 packets, 72600 bytes, 0 failed
+echoes 300 packets, 72600 bytes, 0 from elsewhere
+rate 0 tx-pps, 0 rx-pps, 0 tx-bytes/s
+per cpu tx: 0:150 1:150
+```
+
+and the target, on another machine, is `netload start` -- then
+`netload send <its address> 9999` from the first.
+
+    netload start [port] [sink]
+    netload send <ip> <port> [size=64] [pps=0] [secs=0] [count=0] [tasks=1] [sport=9998]
+    netload            what either has counted
+    netload stop       both
+    netload reset      the counters
+
+**The target** (`start`, port 9999 unless told) answers every datagram, which
+exercises receive and transmit together; `sink` drops them, which isolates
+the receive half. The reply is the frame that arrived with its addresses
+swapped where they lie -- no copy, no allocation -- built in the receive
+callback itself, because a load target that woke a task per packet would be
+measuring the wakeup; and the replies of one receive batch go to the NIC
+together when the batch ends, one transmit lock and one doorbell for the
+lot. It can be driven from any host as well: `scripts/netload.py` (`--pps`
+to hold a rate, `--threads` to raise the ceiling).
+
+**The source** (`send`) has `tasks` sender tasks, up to 16, each building its
+datagrams straight into frames off the pool -- one copy of a template made
+once, and a sequence number -- and handing them to the NIC a batch at a
+time.
+
+- `size` is the payload, 16 to 1472 bytes. `pps` is a rate over all the
+  senders, and 0 is as fast as the NIC takes them. The run ends when `count`
+  datagrams are sent, when `secs` have passed, or at `netload stop`; a
+  finished run stays to be asked about until the next `send`.
+- The destination's Ethernet address is asked of ARP once, before the first
+  frame -- the gateway's, for an address off the subnet. If nothing answers,
+  nothing is sent: a load test does not fall back to broadcast.
+- A sender asks the NIC's transmit queue how much room it has before it
+  builds a batch, so that it loses nothing of its own to a full queue, and
+  leaves a quarter of the queue alone. A source that took every slot the
+  moment one opened would keep the queue full for as long as it ran, and
+  everybody else's frames would find no room: the shell's answers, the
+  netconsole's lines. On a machine whose only console is the network, the
+  load test would silence the one channel that says how it is going.
+  `failed` counts what found no room anyway -- with several senders the
+  room one was told of may be another's by the time it has built its batch.
+- What comes back to `sport` is counted as `echoes` when it is from where the
+  run is sending, and as `from elsewhere` when it is not -- and never
+  answered, so two sources pointed at each other do not bounce one datagram
+  for good. Pointed at a target of this same module, a source therefore sees
+  how much of what it sent made the round trip.
+- A datagram says which one it is: `NLD1`, the sender's number (four bytes,
+  big-endian), a sequence number (eight), then filler whose every byte is
+  its own offset. Whatever receives them can tell what was lost, what came
+  twice and what was damaged; a sequence number is spent whether or not its
+  frame found room, so what the far end misses is what this end counted
+  failed, plus what the wire lost.
+
+Both write a line a second to the kernel log while they run -- packets,
+failures, the frame pool's misses and what is out of it, how often the tick
+had to find the frames an interrupt should have announced. The point is not
+the numbers: it is that the line keeps arriving. A machine goes deaf under
+load -- the shell stops answering and so does ping -- and every channel that
+could say why is a network channel. The [netconsole](netconsole.md) only
+sends, so if these lines continue after the machine has stopped receiving,
+the machine is alive and the receive path is what died; if they stop with
+it, the kernel itself is wedged.
+
+It is the one module that lives on the receive path, and the reason a
+module's UDP listener is what it is: `kcore::net::Nic::listen` takes a
+handler the listener owns, lends it each frame as a `Lent`, tells it when a
+receive batch ends, and lends both calls the `RxContext` that reaches what
+only the receive path touches (`RxOwned`) with no lock -- here, the `TxBatch`
+the replies gather in. The module has no `unsafe` in it; the frame formats
+are the `netwire` crate's, which the network layer is built on too.
+`scripts/netload-test.py` is its test ([Tests and gates](testing.md)).
+
 ## netblk
 
 `netblk` (`src/rust/modules/netblk`) serves an NVMe disk, or a partition of

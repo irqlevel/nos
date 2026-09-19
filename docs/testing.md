@@ -78,7 +78,7 @@ carries `udpshell=`; the code they test is the same on either architecture.
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
 | `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
-| `netload-test.py` | arm64 | the receive path, the frame pool |
+| `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 
 ### `wx-test.sh` -- W^X
@@ -183,10 +183,10 @@ for the disk to DMA into, and of `kcore`'s module-facing `block` and `net`.
 x86-64 runs under KVM unless `--tcg`; `--arch aarch64` is the one that runs
 on a Mac. See [netblk](netblk.md#using-it).
 
-### `netload-test.py` -- the receive path and the frame pool
+### `netload-test.py` -- the receive path, the frame pool, a module on both
 
-Hammers the `netload` UDP target from the host. `netload` answers from
-inside the receive path: the reply is the frame that arrived, kept past the
+Loads the [`netload` module](modules.md#netload) and hammers its UDP target
+from the host. The target answers from inside the receive path: the reply is the frame that arrived, kept past the
 callback, its addresses swapped where they lie, and the replies of a batch
 go to the NIC together when the batch ends. No other test touches any of
 that, and all of it fails quietly -- a frame kept and never released is a
@@ -198,8 +198,40 @@ sent; sink mode answers nothing and counts everything; more start/stop
 rounds than a device has listener slots; and the frame pool ends where it
 began. That last one is also what notices a frame pool that was never built
 -- which is how a boot that passed every other gate once spent two hours
-taking each frame from the allocator. It takes about five minutes: 88 round
-trips with a three-second collection window each, by design.
+taking each frame from the allocator.
+
+Then it turns the module round and checks its source, against a socket of
+the script's own. A paced run has to arrive whole: every datagram the size
+asked for, marked with its sender and a sequence number, none twice, the
+filler intact, the kernel's count of what it sent the same as what came; and
+what the script sends back has to be counted as echoes and not answered. A
+run with no pace has to finish and account for every datagram as sent or
+failed. An address nothing answers ARP for has to be refused with nothing
+sent, and so do bad arguments. And while a run with no pace floods, the
+shell is asked ten things and has to answer ten: a source that did not leave
+room in the transmit queue keeps it full, every answer of the shell's is
+released for want of room, and on a machine whose only console is the
+network the load test has silenced the console -- which the first version of
+the source did, and this check is there because of it.
+
+Last, the module's life: `rmmod` with a target running has to take it down
+and give the port back, a second `insmod` has to start on that same port,
+and the frame pool has to end where it began. netload is the one module on
+the receive path, so this is what tests the typed listener a module is
+given -- a handler the listener owns, frames lent, the end of a batch told
+(`kcore::net`) -- and the C ABI under it.
+
+It takes about six minutes: 88 round trips with a three-second collection
+window each, by design.
+
+`--arch x86_64` is the short form, a minute of it: `nos.iso`, a root that
+carries the module and an `/etc/rc` that loads it, starts the target and
+runs the source once -- no shell at all, the x86-64 boot having none over
+UDP. It checks what differs between the architectures rather than what does
+not: that the module loads and binds there, that its calls across the C ABI
+come back right where the ABI is the other one -- two of them return a
+structure by value -- and that the target echoes and the source's run
+arrives whole. Both forms take `--nic igb`.
 
 ### `usb-test.py` -- typing at the kernel
 

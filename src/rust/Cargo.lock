@@ -503,6 +503,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-netload"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+ "netwire",
+]
+
+[[package]]
 name = "mod-slowexit"
 version = "0.1.0"
 dependencies = [

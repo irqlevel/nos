@@ -150,99 +150,6 @@ pub fn tcpstat(_args: &str, out: &mut Output) {
     }
 }
 
-/* ---- the load target ---- */
-
-pub fn netload(args: &str, out: &mut Output) {
-    const USAGE: &str = "usage: netload [start [port] [sink] | stop | reset]";
-
-    let load = abi::net_load();
-    let mut tokens = args.split_whitespace();
-    let verb = match tokens.next() {
-        Some(verb) => verb,
-        None => { dump_netload(out); return; }
-    };
-
-    match verb {
-        "stop" => {
-            if !load.is_running() {
-                let _ = writeln!(out, "netload: not running");
-                return;
-            }
-            load.stop();
-            let _ = writeln!(out, "netload: stopped");
-            return;
-        }
-        "reset" => {
-            load.reset_counters();
-            let _ = writeln!(out, "netload: counters cleared");
-            return;
-        }
-        "start" => {}
-        _ => { let _ = writeln!(out, "{}", USAGE); return; }
-    }
-
-    if load.is_running() {
-        let _ = writeln!(out, "netload: already running");
-        return;
-    }
-
-    /* start [port] [sink], and `sink` alone means the default port. */
-    let mut port = crate::net_load::DEFAULT_PORT;
-    let mut echo = true;
-    match tokens.next() {
-        None => {}
-        Some("sink") => echo = false,
-        Some(text) => match text.parse::<u16>() {
-            Ok(parsed) if parsed != 0 => {
-                port = parsed;
-                if tokens.next() == Some("sink") {
-                    echo = false;
-                }
-            }
-            _ => { let _ = writeln!(out, "{}", USAGE); return; }
-        },
-    }
-
-    let dev = match DEVICES.find(DEFAULT_DEVICE.as_bytes()) {
-        Some(dev) => dev,
-        None => { let _ = writeln!(out, "netload: no eth0"); return; }
-    };
-
-    if !load.start(dev.as_nic(), port, echo) {
-        let _ = writeln!(out, "netload: could not start on port {}", port);
-        return;
-    }
-
-    let _ = writeln!(out, "netload: listening on udp {}, {}", port,
-        if echo { "echo" } else { "sink" });
-}
-
-fn dump_netload(out: &mut Output) {
-    let st = abi::net_load().stats();
-    if st.running == 0 {
-        let _ = writeln!(out, "netload: not running");
-        return;
-    }
-
-    let _ = writeln!(out, "netload: port {}, {}", st.port,
-        if st.echo != 0 { "echo" } else { "sink" });
-    let _ = writeln!(out, "rx {} packets, {} bytes", st.rx_packets, st.rx_bytes);
-    let _ = writeln!(out, "tx {} packets, {} failed", st.tx_packets, st.tx_failed);
-    let _ = writeln!(out, "rate {} rx-pps, {} tx-pps, {} rx-bytes/s",
-        st.rx_pps, st.tx_pps, st.rx_bps);
-
-    /* Which CPUs the driver's interrupts actually landed on: a load test that
-       runs entirely on one core is measuring one core. */
-    let _ = write!(out, "per cpu rx:");
-    for cpu in 0..kcore::consts::MAX_CPUS {
-        let rx = abi::net_load().cpu_rx(cpu);
-        if rx != 0 {
-            let _ = write!(out, " {}:{}", cpu, rx);
-        }
-    }
-    let _ = writeln!(out);
-}
-
 /* ---- asking the network things ---- */
 
 pub fn udpsend(args: &str, out: &mut Output) {
@@ -443,7 +350,6 @@ pub fn register_all() {
         ("netconsole", "netconsole - kernel log over UDP state", netconsole),
         ("icmpstat", "icmpstat - ICMP counters", icmpstat),
         ("tcpstat", "tcpstat - TCP connections and counters", tcpstat),
-        ("netload", "netload [start [port] [sink]|stop|reset] - udp load target", netload),
         ("udpsend", "udpsend <ip> <port> <msg> - send UDP packet", udpsend),
         ("ping", "ping <ip|hostname> - ICMP echo", ping),
         ("nslookup", "nslookup <hostname> - resolve a name", nslookup),

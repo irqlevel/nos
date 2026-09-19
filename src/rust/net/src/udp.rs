@@ -1,8 +1,9 @@
 //! UDP: one datagram out of a device, and what a received one is made of.
 //!
-//! Everything above UDP in this kernel -- DHCP, DNS, the shell, netconsole,
-//! the load target -- builds its payload and hands it to [`send`], or is
-//! handed a received frame and takes it apart with [`parse`].
+//! Everything above UDP in this kernel -- DHCP, DNS, the shell, netconsole
+//! -- builds its payload and hands it to [`send`], or is handed a received
+//! frame and takes it apart with [`parse`]. (The load target, a module,
+//! builds its own frames: the formats are `netwire`'s, which both share.)
 
 use crate::nic::Nic;
 use kcore::trace;
