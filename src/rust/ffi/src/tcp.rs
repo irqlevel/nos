@@ -4,7 +4,7 @@ use core::ffi::c_void;
    these): a module is linked on its own, so a C ABI is the only seam it and
    the network layer can share. Code inside the kernel image calls the layer
    itself. The byte count, 0 at EOF, or a negative code: -2 is a timeout. */
-extern "C" {
+unsafe extern "C" {
     pub fn kernel_tcp_recv(
         conn: *mut c_void,
         buf: *mut u8,
@@ -18,13 +18,13 @@ extern "C" {
    both what it accepted and the listener. Accepting returns null once
    timeout_ms (0: forever) passes with nobody, or once the listener is
    closed. */
-extern "C" {
-    pub fn kernel_tcp_listen(dev: usize, port: u16) -> *mut c_void;
-    pub fn kernel_tcp_accept(listener: *mut c_void, timeout_ms: u64) -> *mut c_void;
-    pub fn kernel_tcp_close(conn: *mut c_void);
+unsafe extern "C" {
+    pub safe fn kernel_tcp_listen(dev: usize, port: u16) -> *mut c_void;
+    pub safe fn kernel_tcp_accept(listener: *mut c_void, timeout_ms: u64) -> *mut c_void;
+    pub safe fn kernel_tcp_close(conn: *mut c_void);
     /// A RST instead of the FIN exchange: the slot comes back at once, not
     /// after a minute of TIME-WAIT.
-    pub fn kernel_tcp_abort(conn: *mut c_void);
+    pub safe fn kernel_tcp_abort(conn: *mut c_void);
     /// The bytes queued: 0 when timeout_ms found room for none, -1 once the
     /// connection is gone.
     pub fn kernel_tcp_send_timeout(

@@ -1,6 +1,6 @@
 use core::alloc::{GlobalAlloc, Layout};
 
-extern "C" {
+unsafe extern "C" {
     fn kernel_alloc(size: usize, align: usize) -> *mut u8;
     fn kernel_free(ptr: *mut u8, size: usize, align: usize);
 }

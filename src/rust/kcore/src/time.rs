@@ -58,13 +58,13 @@ pub fn boot_time() -> Duration {
 }
 
 pub fn wall_clock_secs() -> u64 {
-    unsafe { time::kernel_get_wall_time_secs() }
+    time::kernel_get_wall_time_secs()
 }
 
 /// Nanoseconds since boot at the clock's full resolution -- what timing a
 /// single I/O wants; boot_time() comes rounded to microseconds.
 pub fn boot_time_ns() -> u64 {
-    unsafe { time::kernel_get_boot_time_ns() }
+    time::kernel_get_boot_time_ns()
 }
 
 /// Busy-poll `condition` for up to `iterations` iterations without sleeping.

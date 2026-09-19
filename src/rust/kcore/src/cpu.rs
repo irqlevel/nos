@@ -4,17 +4,17 @@
 
 /// Returns the logical index of the current CPU.
 pub fn id() -> u32 {
-    unsafe { ffi::cpu::kernel_get_cpu_id() }
+    ffi::cpu::kernel_get_cpu_id()
 }
 
 /// Returns the number of CPUs currently in the running state.
 pub fn count() -> u32 {
-    unsafe { ffi::cpu::kernel_cpu_count() }
+    ffi::cpu::kernel_cpu_count()
 }
 
 /// Returns a bitmask of running CPUs (bit i = CPU i is running).
 pub fn online_mask() -> u64 {
-    unsafe { ffi::cpu::kernel_cpu_online_mask() as u64 }
+    ffi::cpu::kernel_cpu_online_mask() as u64
 }
 
 /// Run `handler(ctx)` synchronously on the given CPU via IPI.
@@ -50,7 +50,7 @@ pub fn synchronize() {
 /// in which this task is preempted onto another CPU, and then two CPUs are
 /// inside one per-CPU structure, which is not a per-CPU structure at all.
 pub fn irq_save() -> usize {
-    unsafe { ffi::cpu::kernel_irq_save() }
+    ffi::cpu::kernel_irq_save()
 }
 
 /// # Safety
@@ -66,7 +66,7 @@ pub unsafe fn irq_restore(flags: usize) {
 /// other CPU to answer: with interrupts off it could not answer one itself,
 /// and two such CPUs would wait on each other for good.
 pub fn interrupts_enabled() -> bool {
-    unsafe { ffi::cpu::kernel_interrupts_enabled() != 0 }
+    ffi::cpu::kernel_interrupts_enabled() != 0
 }
 
 /// Preemption off for the calling task, and the task it was taken on -- or
@@ -76,7 +76,7 @@ pub fn interrupts_enabled() -> bool {
 /// tracer's side and from an AP on its way up.
 #[inline]
 pub fn preempt_disable_task() -> usize {
-    unsafe { ffi::cpu::kernel_preempt_disable_task() }
+    ffi::cpu::kernel_preempt_disable_task()
 }
 
 #[inline]
@@ -88,12 +88,12 @@ pub fn preempt_enable_task(task: usize) {
 /// scheduled: work cannot be handed to one, and whoever has it does it.
 #[inline]
 pub fn preempt_is_on() -> bool {
-    unsafe { ffi::cpu::kernel_preempt_is_on() != 0 }
+    ffi::cpu::kernel_preempt_is_on() != 0
 }
 
 /// Whether the caller may wait -- for a completion, or to be scheduled away.
 /// Not with interrupts off, not off a task stack, and not under a spinlock.
 #[inline]
 pub fn preempt_can_block() -> bool {
-    unsafe { ffi::cpu::kernel_preempt_can_block() != 0 }
+    ffi::cpu::kernel_preempt_can_block() != 0
 }

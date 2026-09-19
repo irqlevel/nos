@@ -24,15 +24,15 @@ pub struct BlockIo {
    on its own, so a C ABI is the only seam it and the layer can share; code
    inside the kernel image calls the layer itself, and a driver registers
    with it as a `block::BlockDriver`. */
-extern "C" {
+unsafe extern "C" {
     /// The device `disks` lists under this name, or 0. Devices live as long
     /// as the kernel does: there is nothing to release.
     pub fn kernel_blockdev_find(name: *const u8, name_len: usize) -> usize;
 
     /// Its size, in sectors
-    pub fn kernel_blockdev_capacity(handle: usize) -> u64;
+    pub safe fn kernel_blockdev_capacity(handle: usize) -> u64;
 
-    pub fn kernel_blockdev_sector_size(handle: usize) -> u64;
+    pub safe fn kernel_blockdev_sector_size(handle: usize) -> u64;
 
     /// Synchronous, count in sectors: 0 once the data is in buf.
     pub fn kernel_blockdev_read(handle: usize, sector: u64, buf: *mut u8, count: u32) -> i32;
@@ -42,7 +42,7 @@ extern "C" {
         handle: usize, sector: u64, buf: *const u8, count: u32, fua: i32,
     ) -> i32;
 
-    pub fn kernel_blockdev_flush(handle: usize) -> i32;
+    pub safe fn kernel_blockdev_flush(handle: usize) -> i32;
 
     /// Claims the device against mounts, the disk log and other writers: a
     /// claim for kernel_blockdev_release, or 0 -- with *held_by set to who
@@ -51,13 +51,13 @@ extern "C" {
     /// of it.
     pub fn kernel_blockdev_claim(handle: usize, held_by: *mut *const u8) -> usize;
 
-    pub fn kernel_blockdev_release(claim: usize);
+    pub safe fn kernel_blockdev_release(claim: usize);
 
     /// How many partitions of the device the kernel found.
-    pub fn kernel_blockdev_partitions(handle: usize) -> u32;
+    pub safe fn kernel_blockdev_partitions(handle: usize) -> u32;
 
     /// 1 if the device has the asynchronous path: NVMe and its partitions.
-    pub fn kernel_blockdev_can_submit(handle: usize) -> i32;
+    pub safe fn kernel_blockdev_can_submit(handle: usize) -> i32;
 
     /// Never blocks. 0 once submitted -- io.done is then called exactly
     /// once, from interrupt context -- 1 when the device has no room right
@@ -66,5 +66,5 @@ extern "C" {
     /// kernel_blockdev_kick.
     pub fn kernel_blockdev_submit(handle: usize, io: *const BlockIo, kick: i32) -> i32;
 
-    pub fn kernel_blockdev_kick(handle: usize);
+    pub safe fn kernel_blockdev_kick(handle: usize);
 }

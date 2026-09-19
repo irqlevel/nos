@@ -13,12 +13,12 @@ pub struct PciDeviceInfo {
     pub irq_pin: u8,
 }
 
-extern "C" {
+unsafe extern "C" {
     pub fn kernel_pci_find_device(
         vendor: u16, device: u16, start_index: usize,
         out: *mut PciDeviceInfo,
     ) -> isize;
-    pub fn kernel_pci_device_count() -> usize;
+    pub safe fn kernel_pci_device_count() -> usize;
     pub fn kernel_pci_get_device(index: usize, out: *mut PciDeviceInfo) -> i32;
     pub fn kernel_pci_get_bar(bus: u16, slot: u16, func: u16, bar: u8) -> u32;
     pub fn kernel_pci_enable_bus_mastering(bus: u16, slot: u16, func: u16);

@@ -1,4 +1,4 @@
-extern "C" {
+unsafe extern "C" {
     fn kernel_trace(level: u32, msg: *const u8, len: usize);
 }
 

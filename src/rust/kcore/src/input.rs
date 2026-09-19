@@ -5,5 +5,5 @@
 /// code, which is what consumers key off (0x0E is backspace), so a USB
 /// keyboard is indistinguishable from the 8042 one.
 pub fn key(c: u8, code: u8) {
-    unsafe { ffi::input::kernel_input_key(c, code) }
+    ffi::input::kernel_input_key(c, code)
 }

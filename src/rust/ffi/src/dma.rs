@@ -1,4 +1,4 @@
-extern "C" {
+unsafe extern "C" {
     pub fn kernel_alloc_dma_pages(
         count: usize,
         phys_out: *mut u64,

@@ -64,11 +64,11 @@ impl Disk {
 
     /// Its size, in sectors
     pub fn sectors(&self) -> u64 {
-        unsafe { block::kernel_blockdev_capacity(self.handle) }
+        block::kernel_blockdev_capacity(self.handle)
     }
 
     pub fn sector_size(&self) -> u64 {
-        unsafe { block::kernel_blockdev_sector_size(self.handle) }
+        block::kernel_blockdev_sector_size(self.handle)
     }
 
     /// Fills buf -- a whole number of sectors -- from `sector` on.
@@ -89,7 +89,7 @@ impl Disk {
     }
 
     pub fn flush(&self) -> Result<()> {
-        let rc = unsafe { block::kernel_blockdev_flush(self.handle) };
+        let rc = block::kernel_blockdev_flush(self.handle);
         if rc == 0 { Ok(()) } else { Err(Error::IoError) }
     }
 
@@ -108,13 +108,13 @@ impl Disk {
 
     /// How many partitions of it the kernel found
     pub fn partitions(&self) -> u32 {
-        unsafe { block::kernel_blockdev_partitions(self.handle) }
+        block::kernel_blockdev_partitions(self.handle)
     }
 
     /// Whether it takes asynchronous I/O -- `submit`: NVMe does, and so does
     /// a partition of an NVMe disk.
     pub fn can_submit(&self) -> bool {
-        unsafe { block::kernel_blockdev_can_submit(self.handle) != 0 }
+        block::kernel_blockdev_can_submit(self.handle) != 0
     }
 
     /// Hands the device an I/O straight to or from physical memory and
@@ -142,7 +142,7 @@ impl Disk {
     /// Rings the doorbell for what `submit(.., false)` queued.
     #[inline]
     pub fn kick(&self) {
-        unsafe { block::kernel_blockdev_kick(self.handle) }
+        block::kernel_blockdev_kick(self.handle)
     }
 
     fn sector_count(&self, len: usize) -> Result<u32> {
@@ -161,6 +161,6 @@ pub struct DiskClaim {
 
 impl Drop for DiskClaim {
     fn drop(&mut self) {
-        unsafe { block::kernel_blockdev_release(self.claim) };
+        block::kernel_blockdev_release(self.claim);
     }
 }

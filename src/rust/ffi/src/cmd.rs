@@ -5,7 +5,7 @@ use core::ffi::c_void;
 pub type CmdHandler =
     unsafe extern "C" fn(ctx: *mut c_void, args: *const u8, args_len: usize, out: *mut c_void);
 
-extern "C" {
+unsafe extern "C" {
     /// Adds a shell command. Returns a handle for `kernel_cmd_unregister`,
     /// or 0 when the name is taken or the table is full.
     pub fn kernel_cmd_register(
@@ -30,7 +30,7 @@ extern "C" {
 /// given, and a piece of the output.
 pub type CmdSink = unsafe extern "C" fn(ctx: *mut c_void, buf: *const u8, len: usize);
 
-extern "C" {
+unsafe extern "C" {
     /// Runs a shell command line as the console would, handing what it
     /// prints to the sink, a piece at a time. Sleeps as long as the command
     /// runs.

@@ -28,7 +28,7 @@ unsafe impl<T: Send> Sync for Mutex<T> {}
 impl<T> Mutex<T> {
     /// None when the kernel has no memory for one.
     pub fn new(data: T) -> Option<Self> {
-        let h = unsafe { sync::kernel_mutex_create() };
+        let h = sync::kernel_mutex_create();
         if h == 0 {
             None
         } else {
@@ -85,7 +85,7 @@ unsafe impl<T: Send> Sync for SpinLock<T> {}
 impl<T> SpinLock<T> {
     /// None when the kernel has no memory for one.
     pub fn new(data: T) -> Option<Self> {
-        let h = unsafe { sync::kernel_spinlock_create() };
+        let h = sync::kernel_spinlock_create();
         if h == 0 {
             None
         } else {
@@ -136,7 +136,7 @@ pub struct WaitGroup {
 
 impl WaitGroup {
     pub fn new() -> Option<Self> {
-        let h = unsafe { sync::kernel_waitgroup_create() };
+        let h = sync::kernel_waitgroup_create();
         if h == 0 { None } else { Some(Self { handle: h }) }
     }
 
@@ -175,7 +175,7 @@ pub struct RwSpinLock {
 
 impl RwSpinLock {
     pub fn new() -> Option<Self> {
-        let h = unsafe { sync::kernel_rw_spinlock_create() };
+        let h = sync::kernel_rw_spinlock_create();
         if h == 0 { None } else { Some(Self { handle: h }) }
     }
 
@@ -233,7 +233,7 @@ pub struct RwMutex {
 
 impl RwMutex {
     pub fn new() -> Option<Self> {
-        let h = unsafe { sync::kernel_rw_mutex_create() };
+        let h = sync::kernel_rw_mutex_create();
         if h == 0 { None } else { Some(Self { handle: h }) }
     }
 
@@ -293,7 +293,7 @@ unsafe impl Sync for Event {}
 
 impl Event {
     pub fn new() -> Option<Self> {
-        let h = unsafe { sync::kernel_event_create() };
+        let h = sync::kernel_event_create();
         if h == 0 { None } else { Some(Self { handle: h }) }
     }
 
@@ -349,7 +349,7 @@ impl<T> IrqSpinLock<T> {
     pub fn lock(&self) -> IrqSpinGuard<'_, T> {
         /* Interrupts off first: a CPU that takes an interrupt while holding
          * this, and whose handler takes it again, deadlocks against itself. */
-        let flags = unsafe { ffi::cpu::kernel_irq_save() };
+        let flags = ffi::cpu::kernel_irq_save();
         while self.held.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }
@@ -360,7 +360,7 @@ impl<T> IrqSpinLock<T> {
     /// path, whose lock may be held by a CPU that is never going to release
     /// it.
     pub fn try_lock(&self) -> Option<IrqSpinGuard<'_, T>> {
-        let flags = unsafe { ffi::cpu::kernel_irq_save() };
+        let flags = ffi::cpu::kernel_irq_save();
         if self.held.swap(true, Ordering::Acquire) {
             unsafe { ffi::cpu::kernel_irq_restore(flags) };
             None
@@ -432,7 +432,7 @@ impl<T> PreemptSpinLock<T> {
     }
 
     pub fn lock(&self) -> PreemptSpinGuard<'_, T> {
-        unsafe { ffi::cpu::kernel_preempt_disable() };
+        ffi::cpu::kernel_preempt_disable();
         while self.held.swap(true, Ordering::Acquire) {
             core::hint::spin_loop();
         }

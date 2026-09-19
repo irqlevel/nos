@@ -368,7 +368,7 @@ $(OUT)/kernel/module.o: $(MODULE_FFI_SRC)
 # the empty weak table pass 1 gets instead.
 $(OUT)/module_exports.S: $(OUT)/pass1.elf $(MODULE_FFI_SRC) build/module-exports.awk
 	@echo "Generating module export table..."
-	@awk '/^extern "C" \{/ { inblock = 1; next } inblock && /^\}/ { inblock = 0; next } inblock && match($$0, /fn [A-Za-z_][A-Za-z0-9_]*/) { print substr($$0, RSTART + 3, RLENGTH - 3) }' $(MODULE_FFI_SRC) | LC_ALL=C sort -u > $@.ffi
+	@awk '/^(unsafe )?extern "C" \{/ { inblock = 1; next } inblock && /^\}/ { inblock = 0; next } inblock && match($$0, /fn [A-Za-z_][A-Za-z0-9_]*/) { print substr($$0, RSTART + 3, RLENGTH - 3) }' $(MODULE_FFI_SRC) | LC_ALL=C sort -u > $@.ffi
 	@$(NM) -g --defined-only $< | awk 'NF == 3 && ($$2 == "T" || $$2 == "W") { print $$3 }' | LC_ALL=C sort -u > $@.defined
 	@LC_ALL=C comm -12 $@.ffi $@.defined | awk -f build/module-exports.awk > $@
 	@rm -f $@.ffi $@.defined

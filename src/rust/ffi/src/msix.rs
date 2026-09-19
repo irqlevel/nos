@@ -1,4 +1,4 @@
-extern "C" {
+unsafe extern "C" {
     pub fn kernel_msix_create(
         bus: u16, slot: u16, func: u16,
         mapped_bars: *const u64,

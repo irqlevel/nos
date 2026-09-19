@@ -1,4 +1,4 @@
-extern "C" {
+unsafe extern "C" {
     pub fn kernel_interrupt_register_level(
         irq_line: u8,
         handler: extern "C" fn(*mut u8),

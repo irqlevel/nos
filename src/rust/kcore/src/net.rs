@@ -46,7 +46,7 @@ impl Nic {
 
     /// Its address, host byte order; 0 until it has one.
     pub fn ip(&self) -> u32 {
-        unsafe { net::kernel_net_ip(self.handle) }
+        net::kernel_net_ip(self.handle)
     }
 
     pub fn mac(&self) -> [u8; 6] {
@@ -123,7 +123,7 @@ unsafe impl Send for UdpListener {}
 
 impl Drop for UdpListener {
     fn drop(&mut self) {
-        unsafe { net::kernel_net_udp_unlisten(self.nic.handle, self.port, self.ctx as *mut u8) }
+        net::kernel_net_udp_unlisten(self.nic.handle, self.port, self.ctx as *mut u8)
     }
 }
 
@@ -146,7 +146,7 @@ impl NetFrame {
     /// until `set_len`.
     #[inline]
     pub fn alloc_tx(data_len: usize) -> Option<Self> {
-        let h = unsafe { net::kernel_netframe_alloc_tx(data_len) };
+        let h = net::kernel_netframe_alloc_tx(data_len);
         core::num::NonZeroUsize::new(h).map(|handle| Self { handle })
     }
 
@@ -253,12 +253,12 @@ impl Drop for NetFrame {
 
 /// `dhcp=off`: the kernel was told not to run a DHCP client.
 pub fn dhcp_off() -> bool {
-    unsafe { net::kernel_param_dhcp_off() != 0 }
+    net::kernel_param_dhcp_off() != 0
 }
 
 /// `dns=on`: a lease's DNS server is worth starting a resolver on.
 pub fn dns_on() -> bool {
-    unsafe { net::kernel_param_dns_on() != 0 }
+    net::kernel_param_dns_on() != 0
 }
 
 /// `netconsole=ip:port` and `nctail=N`, off the kernel command line: the

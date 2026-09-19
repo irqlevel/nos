@@ -22,7 +22,7 @@ pub fn cmdline(buf: &mut [u8]) -> usize {
 
 /// How many interrupt sources `interrupt_source` will answer for.
 pub fn interrupt_source_count() -> usize {
-    unsafe { fs::kernel_interrupt_source_count() }
+    fs::kernel_interrupt_source_count()
 }
 
 /// What the index'th interrupt source is called and has counted, or None
@@ -76,10 +76,10 @@ pub fn root_spec(value: &mut [u8], uuid: &mut [u8; 16]) -> (Root, usize) {
 
 /// `ro`: the root is to be mounted read-only.
 pub fn root_read_only() -> bool {
-    unsafe { fs::kernel_root_read_only() != 0 }
+    fs::kernel_root_read_only() != 0
 }
 
 /// `fstest=on`: run the filesystem self-test on / once it is mounted.
 pub fn root_fstest() -> bool {
-    unsafe { fs::kernel_root_fstest() != 0 }
+    fs::kernel_root_fstest() != 0
 }

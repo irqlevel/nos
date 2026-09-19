@@ -222,7 +222,7 @@ static WRITER: TryLock<Writer> = TryLock::new(Writer {
 /// What the command line said: `Some(true)` for `disklog=on`, `Some(false)`
 /// without it, and `None` while it has not been read yet.
 fn wanted() -> Option<bool> {
-    match unsafe { ffi::disklog::kernel_disklog_wanted() } {
+    match ffi::disklog::kernel_disklog_wanted() {
         0 => Some(false),
         1 => Some(true),
         _ => None,

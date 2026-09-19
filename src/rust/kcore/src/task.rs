@@ -38,14 +38,14 @@ impl TaskHandle {
 /// for the life of the kernel checks each time round, so that a shutdown or
 /// a `stop` gets it out rather than leaving it sleeping.
 pub fn stopping() -> bool {
-    unsafe { task::kernel_task_stopping() != 0 }
+    task::kernel_task_stopping() != 0
 }
 
 /// The calling task: what `TaskHandle::id` says for it. For telling
 /// whether a call comes from one of a server's own tasks -- which must not
 /// wait for itself.
 pub fn current_id() -> usize {
-    unsafe { task::kernel_task_current() }
+    task::kernel_task_current()
 }
 
 /// The calling task, or 0 when the stack is not a task's. For code that runs
@@ -53,7 +53,7 @@ pub fn current_id() -> usize {
 /// path -- where asking the other way would itself complain, and a complaint
 /// traces.
 pub fn current_id_or_none() -> usize {
-    unsafe { task::kernel_task_current_or_none() }
+    task::kernel_task_current_or_none()
 }
 
 impl Drop for TaskHandle {
@@ -99,9 +99,7 @@ pub fn spawn(name: &str, f: fn()) -> Option<TaskHandle> {
 }
 
 pub fn sleep(dur: Duration) {
-    unsafe {
-        task::kernel_sleep_ns(dur.as_nanos());
-    }
+    task::kernel_sleep_ns(dur.as_nanos());
 }
 
 pub fn sleep_ms(ms: u64) {
@@ -117,7 +115,7 @@ pub fn sleep_ms(ms: u64) {
 /// spin does.
 #[inline]
 pub fn yield_to_runnable() {
-    unsafe { task::kernel_task_yield_to_runnable() }
+    task::kernel_task_yield_to_runnable()
 }
 
 /// Spawn a task that runs `entry` over something that lives for good -- a
