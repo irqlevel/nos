@@ -20,7 +20,7 @@ impl LocklessRing {
         if capacity == 0 || !capacity.is_power_of_two() {
             return None;
         }
-        let handle = unsafe { ring::kernel_ring_create(capacity) };
+        let handle = ring::kernel_ring_create(capacity);
         if handle == 0 { None } else { Some(Self { handle }) }
     }
 

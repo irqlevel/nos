@@ -1,4 +1,4 @@
-extern "C" {
+unsafe extern "C" {
     pub fn kernel_timer_start(
         handler: extern "C" fn(*mut u8),
         ctx: *mut u8,

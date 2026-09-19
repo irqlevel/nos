@@ -135,7 +135,7 @@ pub fn get_device_by_bdf(bus: u16, slot: u16, func: u16) -> Option<PciDevice> {
 }
 
 pub fn device_count() -> usize {
-    unsafe { pci::kernel_pci_device_count() }
+    pci::kernel_pci_device_count()
 }
 
 pub fn get_device(index: usize) -> Option<PciDevice> {

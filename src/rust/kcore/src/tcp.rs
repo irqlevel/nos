@@ -51,7 +51,7 @@ impl TcpListener {
         if port == 0 {
             return Err(Error::InvalidValue);
         }
-        let conn = unsafe { tcp::kernel_tcp_listen(nic.handle(), port) };
+        let conn = tcp::kernel_tcp_listen(nic.handle(), port);
         if conn.is_null() {
             Err(Error::Busy)
         } else {
@@ -66,7 +66,7 @@ impl TcpListener {
     /// The next connection, or None once `timeout_ms` (0: forever) passes
     /// with nobody -- or the listener has been closed.
     pub fn accept(&self, timeout_ms: u64) -> Option<TcpStream> {
-        let conn = unsafe { tcp::kernel_tcp_accept(self.conn, timeout_ms) };
+        let conn = tcp::kernel_tcp_accept(self.conn, timeout_ms);
         if conn.is_null() {
             None
         } else {
@@ -77,7 +77,7 @@ impl TcpListener {
 
 impl Drop for TcpListener {
     fn drop(&mut self) {
-        unsafe { tcp::kernel_tcp_close(self.conn) }
+        tcp::kernel_tcp_close(self.conn)
     }
 }
 
@@ -129,12 +129,12 @@ impl TcpStream {
     pub fn abort(self) {
         let conn = self.conn;
         core::mem::forget(self);
-        unsafe { tcp::kernel_tcp_abort(conn) }
+        tcp::kernel_tcp_abort(conn)
     }
 }
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        unsafe { tcp::kernel_tcp_close(self.conn) }
+        tcp::kernel_tcp_close(self.conn)
     }
 }

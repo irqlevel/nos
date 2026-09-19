@@ -2,9 +2,9 @@
    multi-producer multi-consumer queue of words, one compare-and-swap an
    operation and no lock anywhere -- so safe with interrupts off, in a hard
    IRQ handler too. */
-extern "C" {
+unsafe extern "C" {
     /// A ring of `capacity` words, a power of two; 0 when there is no memory.
-    pub fn kernel_ring_create(capacity: usize) -> usize;
+    pub safe fn kernel_ring_create(capacity: usize) -> usize;
     pub fn kernel_ring_destroy(ring: usize);
     /// 1 once queued, 0 when the ring is full.
     pub fn kernel_ring_push(ring: usize, value: usize) -> i32;

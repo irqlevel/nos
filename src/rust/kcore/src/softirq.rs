@@ -6,7 +6,7 @@ pub const MAX_TYPES: usize = 8;
 
 /// Raise a soft IRQ type. Safe to call from a hard IRQ handler.
 pub fn raise(typ: usize) {
-    unsafe { ffi::softirq::kernel_softirq_raise(typ) }
+    ffi::softirq::kernel_softirq_raise(typ)
 }
 
 /// Have `handler(target)` run for a soft IRQ type: in task context, on one
@@ -29,5 +29,5 @@ where
 /// Whether that soft IRQ is already asked for. What lets a poll tell a pass
 /// it caused from one an interrupt caused.
 pub fn is_pending(typ: usize) -> bool {
-    unsafe { ffi::softirq::kernel_softirq_pending(typ) != 0 }
+    ffi::softirq::kernel_softirq_pending(typ) != 0
 }
