@@ -116,6 +116,14 @@ pub fn set_be32(buf: &mut [u8], off: usize, v: u32) {
     buf[off..off + 4].copy_from_slice(&v.to_be_bytes());
 }
 
+pub fn be64(buf: &[u8], off: usize) -> u64 {
+    ((be32(buf, off) as u64) << 32) | be32(buf, off + 4) as u64
+}
+
+pub fn set_be64(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_be_bytes());
+}
+
 /* ---- Ethernet ---- */
 
 pub mod eth {
@@ -217,6 +225,13 @@ pub mod ip {
     pub const SRC: usize = 12;
     pub const DST: usize = 16;
 
+    /* The flags and the fragment offset share the word at FRAG_OFF */
+    /// "Do not fragment": a router with too small a link drops the packet
+    /// and says so, rather than cutting it up.
+    pub const DONT_FRAGMENT: u16 = 0x4000;
+    pub const MORE_FRAGMENTS: u16 = 0x2000;
+    pub const FRAG_OFFSET_MASK: u16 = 0x1FFF;
+
     /// The header's own length in bytes, which a packet with options makes
     /// longer than 20. 0 when the field says something impossible.
     pub fn header_len(ip: &[u8]) -> usize {
@@ -244,13 +259,28 @@ pub mod ip {
         be32(ip, DST)
     }
 
+    /// A piece of a packet rather than a whole one: more pieces follow it,
+    /// or it is not the first. There is no reassembly in this kernel, so a
+    /// fragment is never anybody's -- and what follows the IP header of one
+    /// that is not the first is not a transport header at all.
+    pub fn is_fragment(ip: &[u8]) -> bool {
+        be16(ip, FRAG_OFF) & (MORE_FRAGMENTS | FRAG_OFFSET_MASK) != 0
+    }
+
     /// A 20-byte header with no options, checksum included.
     pub fn write(ip: &mut [u8], protocol: u8, src: u32, dst: u32, payload_len: usize, id: u16) {
+        write_flags(ip, protocol, src, dst, payload_len, id, 0)
+    }
+
+    /// As `write`, with the flags word given: `DONT_FRAGMENT`, or 0.
+    pub fn write_flags(
+        ip: &mut [u8], protocol: u8, src: u32, dst: u32, payload_len: usize, id: u16, flags: u16,
+    ) {
         ip[VERSION_IHL] = 0x45;
         ip[TOS] = 0;
         set_be16(ip, TOTAL_LEN, (IP_HDR_LEN + payload_len) as u16);
         set_be16(ip, ID, id);
-        set_be16(ip, FRAG_OFF, 0);
+        set_be16(ip, FRAG_OFF, flags);
         ip[TTL] = 64;
         ip[PROTOCOL] = protocol;
         set_be16(ip, CHECKSUM, 0);
@@ -308,6 +338,9 @@ pub mod udp {
         pub src_port: u16,
         pub dst_port: u16,
         pub payload: &'a [u8],
+        /// Where `payload` starts in the frame: for whoever hands the frame's
+        /// own bytes on rather than a copy of them -- a disk's DMA, say.
+        pub payload_at: usize,
     }
 
     /// What a frame off the wire holds, if it holds a whole UDP datagram at
@@ -342,6 +375,7 @@ pub mod udp {
             src_port: src_port(datagram),
             dst_port: dst_port(datagram),
             payload: &datagram[UDP_HDR_LEN..length],
+            payload_at: ETH_HDR_LEN + ip_len + UDP_HDR_LEN,
         })
     }
 
@@ -355,23 +389,45 @@ pub mod udp {
         pub dst_ip: u32,
         pub src_port: u16,
         pub dst_port: u16,
+        /// Whether a router may cut the datagram up to fit a smaller link.
+        /// One sized to the path on purpose, and answered whole or not at
+        /// all, says it may not.
+        pub dont_fragment: bool,
     }
 
     /// The Ethernet, IP and UDP headers of a datagram of `payload_len` bytes,
     /// at the start of `frame`; the payload goes at [`PAYLOAD_AT`]. The
     /// frame's whole length, or None when `frame` has no room for it or the
-    /// payload is more than one datagram holds.
+    /// payload is more than one datagram out of this stack holds.
     pub fn write_frame(frame: &mut [u8], route: &Route, payload_len: usize) -> Option<usize> {
         let frame_len = PAYLOAD_AT + payload_len;
         if payload_len > MAX_PAYLOAD || frame.len() < frame_len {
             return None;
         }
-
-        eth::write(frame, &route.dst_mac, &route.src_mac, ETH_TYPE_IP);
-        ip::write(&mut frame[ETH_HDR_LEN..], IP_PROTO_UDP, route.src_ip, route.dst_ip,
-                  UDP_HDR_LEN + payload_len, 0);
-        write(&mut frame[ETH_HDR_LEN + IP_HDR_LEN..], route.src_port, route.dst_port, payload_len);
+        write_headers(frame, route, payload_len)?;
         Some(frame_len)
+    }
+
+    /// Only the headers, into `headers` -- which need hold no more than
+    /// them, [`PAYLOAD_AT`] bytes: the payload may be put behind them by
+    /// something that is not the CPU, a disk's DMA straight into the frame.
+    /// No limit on the payload but the one the length fields have: a sender
+    /// that knows its path takes a larger frame than this stack's own sends.
+    /// None when `headers` is short or the lengths would not fit their
+    /// fields.
+    pub fn write_headers(headers: &mut [u8], route: &Route, payload_len: usize) -> Option<()> {
+        if headers.len() < PAYLOAD_AT
+            || payload_len > u16::MAX as usize - IP_HDR_LEN - UDP_HDR_LEN
+        {
+            return None;
+        }
+
+        let flags = if route.dont_fragment { ip::DONT_FRAGMENT } else { 0 };
+        eth::write(headers, &route.dst_mac, &route.src_mac, ETH_TYPE_IP);
+        ip::write_flags(&mut headers[ETH_HDR_LEN..], IP_PROTO_UDP, route.src_ip, route.dst_ip,
+                        UDP_HDR_LEN + payload_len, 0, flags);
+        write(&mut headers[ETH_HDR_LEN + IP_HDR_LEN..], route.src_port, route.dst_port, payload_len);
+        Some(())
     }
 }
 

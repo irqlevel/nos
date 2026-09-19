@@ -500,6 +500,7 @@ version = "0.1.0"
 dependencies = [
  "kcore",
  "kmod",
+ "netwire",
 ]
 
 [[package]]

@@ -171,26 +171,6 @@ impl Nic {
         self.handle
     }
 
-    /// Every UDP datagram to `port`, handed to `cb(ctx, frame)` from the
-    /// receive softirq: the frame itself, lent for the call -- `NetFrame::
-    /// retain` keeps it, `NetFrame::lent` reads it. Refused for a port someone else has. The listener
-    /// goes with the returned handle, once any call still running returns.
-    ///
-    /// cb runs on the receive path of every packet the machine gets: nothing
-    /// that sleeps, and nothing long. `ctx` has to stay valid until the
-    /// UdpListener is dropped.
-    pub fn listen_udp(
-        &self,
-        port: u16,
-        cb: extern "C" fn(ctx: *mut u8, frame: usize),
-        ctx: *mut u8,
-    ) -> core::result::Result<UdpListener, ListenError> {
-        match unsafe { net::kernel_net_udp_listen(self.handle, port, cb, None, ctx) } {
-            0 => Ok(UdpListener { nic: *self, port, ctx: ctx as usize, release: None }),
-            code => Err(ListenError::of(code)),
-        }
-    }
-
     /// Every UDP datagram to `port`, handed to `handler` from the receive
     /// softirq, and the end of every receive batch with it. Refused for a
     /// port someone else has. The listener holds the handler for as long as
@@ -215,7 +195,7 @@ impl Nic {
             unsafe { release::<H>(ctx as usize) };
             return Err(ListenError::of(code));
         }
-        Ok(UdpListener { nic: *self, port, ctx: ctx as usize, release: Some(release::<H>) })
+        Ok(UdpListener { nic: *self, port, ctx: ctx as usize, release: release::<H> })
     }
 
     /// How many more frames the transmit queue has room for right now.
@@ -245,13 +225,14 @@ impl Nic {
 
     /// Queues a run of frames -- one lock and one doorbell for the lot --
     /// from any context. Takes every one; returns how many were queued, the
-    /// rest dropped.
+    /// rest dropped. `TxBatch::send` is how anything outside this file
+    /// reaches it.
     ///
     /// # Safety
     /// Each is a frame handle the caller owns (`NetFrame::into_raw`) and
     /// gives up here.
     #[inline]
-    pub unsafe fn transmit_raw(&self, frames: &[usize]) -> usize {
+    unsafe fn transmit_raw(&self, frames: &[usize]) -> usize {
         if frames.is_empty() {
             return 0;
         }
@@ -259,7 +240,7 @@ impl Nic {
     }
 }
 
-/// A UDP port listened on, from `Nic::listen_udp`; given back on drop, once
+/// A UDP port listened on, from `Nic::listen`; given back on drop, once
 /// no call of its callback is still running -- so what the callback reaches
 /// may go right after. Task context: the drop may wait.
 pub struct UdpListener {
@@ -268,8 +249,8 @@ pub struct UdpListener {
     /* what it was registered with, which is what takes away this listener
        and nobody else's on the port */
     ctx: usize,
-    /* a typed listener's hold on its handler, given up last */
-    release: Option<unsafe fn(usize)>,
+    /* what gives up the listener's hold on its handler: last of all */
+    release: unsafe fn(usize),
 }
 
 /* A handle -- a device, a port and the word it was registered with -- and
@@ -280,9 +261,7 @@ impl Drop for UdpListener {
     fn drop(&mut self) {
         net::kernel_net_udp_unlisten(self.nic.handle, self.port, self.ctx as *mut u8);
         /* No call is running and none will start: the handler may go. */
-        if let Some(release) = self.release {
-            unsafe { release(self.ctx) };
-        }
+        unsafe { (self.release)(self.ctx) };
     }
 }
 
@@ -369,25 +348,26 @@ impl NetFrame {
         core::num::NonZeroUsize::new(h).map(|handle| Self { handle })
     }
 
-    /// A reference of the caller's own to a frame the kernel lent: how a UDP
-    /// frame listener keeps the frame it was handed past its return.
+    /// A reference of the caller's own to a frame the kernel lent: what
+    /// `Lent::retain` is made of.
     ///
     /// # Safety
     /// `handle` must be a frame alive for the call -- the one a listener was
-    /// handed, say.
+    /// handed.
     #[inline]
-    pub unsafe fn retain(handle: usize) -> Self {
+    unsafe fn retain(handle: usize) -> Self {
         unsafe { net::kernel_netframe_get(handle) };
         Self { handle: Self::word(handle) }
     }
 
-    /// The bytes of a frame the kernel lent, without taking it.
+    /// The bytes of a frame the kernel lent, without taking it: what
+    /// `Lent::bytes` is made of.
     ///
     /// # Safety
     /// `handle` must be a frame that outlives the slice and that nobody
     /// writes meanwhile.
     #[inline]
-    pub unsafe fn lent<'a>(handle: usize) -> &'a [u8] {
+    unsafe fn lent<'a>(handle: usize) -> &'a [u8] {
         let ptr = unsafe { net::kernel_netframe_data(handle) };
         let len = unsafe { net::kernel_netframe_len(handle) };
         unsafe { core::slice::from_raw_parts(ptr, len) }
@@ -441,24 +421,23 @@ impl NetFrame {
         unsafe { net::kernel_netframe_set_len(self.raw(), len) }
     }
 
-    /// Consume the frame, returning the raw handle without decrementing
-    /// the refcount.  The caller must eventually call `from_raw()` or
-    /// invoke `kernel_netframe_put(handle)` directly (e.g. from an ISR).
+    /// The frame as the word the kernel takes one by, its reference with it:
+    /// given to `kernel_net_submit_tx`, or taken back by `from_raw`. Nothing
+    /// outside this file needs the word -- a frame goes out through
+    /// `Nic::transmit` or a `TxBatch`.
     #[inline]
-    pub fn into_raw(self) -> usize {
+    fn into_raw(self) -> usize {
         let h = self.raw();
         core::mem::forget(self);
         h
     }
 
-    /// Reconstruct a `NetFrame` from a raw handle returned by `into_raw()`.
+    /// The frame `into_raw` made a word of.
     ///
     /// # Safety
-    /// `handle` must be a valid non-zero handle previously obtained from
-    /// `into_raw()`.  The caller must not use the original raw handle after
-    /// this call.
+    /// `handle` came from `into_raw` and is not used again.
     #[inline]
-    pub unsafe fn from_raw(handle: usize) -> Self {
+    unsafe fn from_raw(handle: usize) -> Self {
         Self { handle: Self::word(handle) }
     }
 

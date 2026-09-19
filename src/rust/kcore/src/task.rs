@@ -157,17 +157,6 @@ pub fn spawn_with_ctx(
     if h == 0 { None } else { Some(TaskHandle { handle: h }) }
 }
 
-/// Spawn a task with a raw context pointer, bound to `affinity_mask` CPUs.
-pub fn spawn_on_with_ctx(
-    name: &str, affinity_mask: u64,
-    func: extern "C" fn(*mut u8), ctx: *mut u8,
-) -> Option<TaskHandle> {
-    let h = unsafe {
-        task::kernel_task_spawn_on(name.as_ptr(), name.len(), func, ctx, affinity_mask as usize)
-    };
-    if h == 0 { None } else { Some(TaskHandle { handle: h }) }
-}
-
 pub fn cpu_id() -> u32 {
     crate::cpu::id()
 }

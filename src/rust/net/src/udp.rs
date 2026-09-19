@@ -23,6 +23,7 @@ pub fn send_to(
 ) -> bool {
     let route = udp::Route {
         src_mac: nic.mac(), dst_mac: *dst_mac, src_ip, dst_ip, src_port, dst_port,
+        dont_fragment: false,
     };
 
     let mut frame = [0u8; MAX_FRAME];
