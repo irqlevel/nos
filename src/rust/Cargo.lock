@@ -526,8 +526,13 @@ dependencies = [
  "ffi",
  "fs",
  "kcore",
+ "netwire",
  "tls",
 ]
+
+[[package]]
+name = "netwire"
+version = "0.1.0"
 
 [[package]]
 name = "num-bigint-dig"

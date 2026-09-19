@@ -8,57 +8,10 @@ use crate::nic::Nic;
 use kcore::trace;
 
 use crate::arp::ArpTable;
-use crate::wire::{self, eth, ip, udp, Mac, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN,
-                  IP_PROTO_UDP, MAC_BROADCAST, UDP_HDR_LEN};
+use crate::wire::{self, udp, Mac, MAC_BROADCAST};
 
-/// An Ethernet frame, headers included.
-pub const MAX_FRAME: usize = 1514;
-
-/// What fits in one datagram out of this stack.
-pub const MAX_PAYLOAD: usize = MAX_FRAME - ETH_HDR_LEN - IP_HDR_LEN - UDP_HDR_LEN;
-
-/// A received datagram: who it is from, and what it carries.
-pub struct Datagram<'a> {
-    pub src_ip: u32,
-    pub dst_ip: u32,
-    pub src_port: u16,
-    pub dst_port: u16,
-    pub payload: &'a [u8],
-}
-
-/// What a frame off the wire holds, if it holds a whole UDP datagram at all.
-///
-/// The IP header's own length is honoured, so a packet carrying options puts
-/// its UDP header where this looks for it; a length that disagrees with the
-/// frame is a None rather than a read past the end.
-pub fn parse(frame: &[u8]) -> Option<Datagram<'_>> {
-    if frame.len() < ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN {
-        return None;
-    }
-
-    let packet = &frame[ETH_HDR_LEN..];
-    let ip_len = ip::header_len(packet);
-    if ip_len == 0 || frame.len() < ETH_HDR_LEN + ip_len + UDP_HDR_LEN {
-        return None;
-    }
-    if ip::protocol(packet) != IP_PROTO_UDP {
-        return None;
-    }
-
-    let datagram = &frame[ETH_HDR_LEN + ip_len..];
-    let length = udp::length(datagram) as usize;
-    if length < UDP_HDR_LEN || length > datagram.len() {
-        return None;
-    }
-
-    Some(Datagram {
-        src_ip: ip::src(packet),
-        dst_ip: ip::dst(packet),
-        src_port: udp::src_port(datagram),
-        dst_port: udp::dst_port(datagram),
-        payload: &datagram[UDP_HDR_LEN..length],
-    })
-}
+pub use crate::wire::udp::{parse, Datagram, MAX_PAYLOAD};
+pub use crate::wire::MAX_FRAME;
 
 /// A datagram to a host whose Ethernet address is already known -- from the
 /// frame it arrived in, or from the ARP cache. Any context: nothing here
@@ -67,20 +20,16 @@ pub fn send_to(
     nic: &Nic, dst_mac: &Mac, dst_ip: u32, dst_port: u16, src_ip: u32, src_port: u16,
     payload: &[u8],
 ) -> bool {
-    if payload.len() > MAX_PAYLOAD {
-        return false;
-    }
-
-    let datagram_len = UDP_HDR_LEN + payload.len();
-    let frame_len = ETH_HDR_LEN + IP_HDR_LEN + datagram_len;
+    let route = udp::Route {
+        src_mac: nic.mac(), dst_mac: *dst_mac, src_ip, dst_ip, src_port, dst_port,
+    };
 
     let mut frame = [0u8; MAX_FRAME];
-    eth::write(&mut frame, dst_mac, &nic.mac(), ETH_TYPE_IP);
-    ip::write(&mut frame[ETH_HDR_LEN..], IP_PROTO_UDP, src_ip, dst_ip, datagram_len, 0);
-
-    let at = ETH_HDR_LEN + IP_HDR_LEN;
-    udp::write(&mut frame[at..], src_port, dst_port, payload.len());
-    frame[at + UDP_HDR_LEN..at + datagram_len].copy_from_slice(payload);
+    let frame_len = match udp::write_frame(&mut frame, &route, payload.len()) {
+        Some(len) => len,
+        None => return false,
+    };
+    frame[udp::PAYLOAD_AT..frame_len].copy_from_slice(payload);
 
     nic.send_raw(&frame[..frame_len])
 }
