@@ -27,8 +27,14 @@ class Task;
 class RawRwSpinLock final
 {
 public:
-    RawRwSpinLock();
-    ~RawRwSpinLock();
+    /* constexpr with a trivial destructor, for the same reason as Atomic's:
+       the static instances (rust_ffi.cpp's) are initialised by the compiler. */
+    constexpr RawRwSpinLock()
+        : WriterPreemptTask(nullptr)
+    {
+    }
+
+    ~RawRwSpinLock() = default;
 
     /* The returned task goes back to ReadUnlock(). It is nullptr when there
        was nothing to disable -- preemption not on yet, or no task on this
@@ -60,8 +66,7 @@ private:
     /* Whose preemption WriteLock() disabled, for WriteUnlock() to enable
        again. nullptr when it had nothing to disable, and whenever the lock is
        not held through WriteLock() -- WriteLockIrqSave's flags carry that
-       instead. Zero is also what a static instance starts as, constructor or
-       not. */
+       instead. */
     Task* WriterPreemptTask;
 };
 

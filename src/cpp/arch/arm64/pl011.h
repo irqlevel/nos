@@ -48,7 +48,6 @@ private:
     Pl011& operator=(Pl011&& other) = delete;
 
     static ulong Base;
-    static RawSpinLock OutLock;
 
     static const ulong MaxObservers = 4;
     SerialObserver* Observers[MaxObservers] = {};

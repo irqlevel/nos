@@ -801,12 +801,15 @@ int kernel_msix_is_ready(unsigned long handle)
 static const ulong RustIrqSlotCount = 8;
 static const u8 RustIrqVectorBase = 0x38;
 
+/* Every member initialised, so that the static table is too: a default
+   constructor that left one indeterminate is not a constant expression, and
+   the compiler then made a runtime constructor this kernel never runs. */
 struct RustIrqSlot
 {
-    void (*Handler)(void*);
-    void* Ctx;
-    u8 Vector;
-    bool Used;
+    void (*Handler)(void*) = nullptr;
+    void* Ctx = nullptr;
+    u8 Vector = 0;
+    bool Used = false;
     Kernel::Atomic InFlight; /* ISRs currently executing Handler */
 };
 
@@ -1085,11 +1088,12 @@ void kernel_timer_stop(unsigned long handle)
 
 static const ulong RustMsixSlotCount = 32;
 
+/* Every member initialised, as RustIrqSlot's are. */
 struct RustMsixSlot
 {
-    void (*Handler)(void*);
-    void* Ctx;
-    bool Used;
+    void (*Handler)(void*) = nullptr;
+    void* Ctx = nullptr;
+    bool Used = false;
     Kernel::Atomic InFlight; /* ISRs currently executing Handler */
 };
 

@@ -17,7 +17,7 @@ make
 finding; `make nocheck` skips it. `make smoke` builds in Docker and runs the
 headless boot smoke test (`scripts/smoke-test.sh`).
 
-## Three things the Makefile will not tell you
+## Four things the Makefile will not tell you
 
 **Source lists are explicit, not globbed.** The Makefile has two
 hand-written lists, `CXX_SRC_x86_64` and `CXX_SRC_aarch64` (plus `ASM_SRC_*`
@@ -41,6 +41,17 @@ module may call is made from the same first pass
 against empty weak stand-ins for both tables, in `kernel/pass1_tables.cpp`,
 a file that indexes neither. Anything that touches the link or symbol
 resolution has to keep both passes working.
+
+**The link refuses a static constructor.** This kernel runs no
+`.init_array`: a global whose type has a non-`constexpr` constructor or a
+non-trivial destructor would be left as zeroes, and was -- `Pci`'s config lock
+and the arm64 console's were never registered with the watchdog their
+constructors would have registered them with. Both linker scripts gather
+`.init_array`, `.ctors` and their destructor counterparts into a section
+nothing loads and fail the build if it is not empty, with `a static
+constructor or destructor: this kernel runs none`. The way out is a
+`constexpr` constructor and a trivial destructor, every member initialised,
+or a function-local static, constructed on first use.
 
 ## No network during a build
 

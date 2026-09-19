@@ -6,16 +6,6 @@
 namespace Kernel
 {
 
-Atomic::Atomic()
-{
-    Set(0);
-}
-
-Atomic::Atomic(long value)
-{
-    Set(value);
-}
-
 void Atomic::Inc()
 {
     AtomicInc(&Value);
@@ -71,10 +61,6 @@ bool Atomic::TestBit(ulong bit)
 long Atomic::Cmpxchg(long exchange, long comparand)
 {
     return AtomicCmpxchg(&Value, exchange, comparand);
-}
-
-Atomic::~Atomic()
-{
 }
 
 Atomic::Atomic(Atomic&& other)

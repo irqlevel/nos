@@ -19,11 +19,10 @@ void PreemptOn()
 
 void PreemptOnWait()
 {
-    /* Block until the BSP has globally enabled preemption. PreemptActive is
-       zero-initialized (BSS) and set to 1 by PreemptOn(); gating on it rather
-       than on a separately-constructed flag avoids depending on a global
-       constructor -- this kernel runs no .init_array, so a dynamically
-       initialized `Atomic x(1)` would in fact be left at 0. */
+    /* Block until the BSP has globally enabled preemption: PreemptActive
+       starts at zero and PreemptOn() sets it to 1. (Atomic's constructors
+       are constexpr, so a static one is initialised by the compiler; the
+       kernel runs no .init_array, and the link refuses one.) */
     while (PreemptActive.Get() == 0)
     {
         Pause();

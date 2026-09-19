@@ -66,4 +66,21 @@ SECTIONS
 	}
 
         KernelEnd = .;
+
+	/* Static constructors and destructors, which this kernel never runs: a
+	   global whose initialisation needs code at startup is left as zeroes,
+	   right by coincidence at best -- Pci's config lock and the arm64
+	   console's went unregistered with the watchdog that way. Collected
+	   where nothing loads them, to be counted: one is a failed link. Such
+	   a global wants a constexpr constructor and a trivial destructor, or
+	   to be a function-local static (CLAUDE.md, "Static constructors are
+	   unreliable"). */
+	.static_init (INFO) : {
+		*(.preinit_array)
+		*(.init_array) *(.init_array.*)
+		*(.ctors) *(.ctors.*)
+		*(.fini_array) *(.fini_array.*)
+		*(.dtors) *(.dtors.*)
+	}
+	ASSERT(SIZEOF(.static_init) == 0, "a static constructor or destructor: this kernel runs none (CLAUDE.md)")
 }
