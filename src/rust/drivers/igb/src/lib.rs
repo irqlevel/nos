@@ -44,7 +44,9 @@
 #![no_std]
 extern crate alloc;
 
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use kcore::cmd::{Command, Output};
 use kcore::net::{FrameBatch, NetBinding, NetDriver, RxQueue, TxQueue};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
@@ -307,6 +309,12 @@ fn wait_for<F: FnMut() -> bool>(us: u64, tries: u32, mut cond: F) -> bool {
 /* Public entry points called from kernel/src/lib.rs */
 
 pub fn init() {
+    match Command::register("igbdump", "igbdump - igb chip and ring state", dump) {
+        /* The command is the kernel's own and stays for good. */
+        Ok(cmd) => core::mem::forget(cmd),
+        Err(_) => trace!(0, "igb: cannot register the igbdump command"),
+    }
+
     for (device_id, generation) in SUPPORTED {
         let mut start: usize = 0;
         loop {
@@ -1725,55 +1733,52 @@ impl NetDriver for IgbDevice {
  * reading driver code. ICR is deliberately absent -- it is read-to-clear, so
  * a dump that showed it would also consume it. */
 
-#[repr(C)]
-pub struct IgbState {
-    pub present: u32,
-    /// 0 = 82576, 1 = I210.
-    pub generation: u32,
-    pub phy_bmcr: u32,
-    pub phy_bmsr: u32,
-    pub phy_anar: u32,
-    pub phy_anlpar: u32,
-    pub phy_gctl: u32,
-    pub phy_gstat: u32,
-    pub ctrl: u32,
-    pub status: u32,
-    pub rctl: u32,
-    pub tctl: u32,
-    pub ims: u32,
-    pub eitr: u32,
-    pub stat_tpr: u64,
-    pub stat_gprc: u64,
-    pub stat_mpc: u64,
-    pub stat_rnbc: u64,
-    pub stat_rxerrc: u64,
-    pub stat_rqdpc: u32,
-    pub stat_pqgprc: u32,
-    pub rxdctl: u32,
-    pub srrctl: u32,
-    pub rdh: u32,
-    pub rdt: u32,
-    pub tdh: u32,
-    pub tdt: u32,
-    pub next_to_clean: u32,
-    pub next_to_use: u32,
-    pub head_status: u32,
-    pub head_posted: u32,
-    pub rx_polls: u64,
-    pub rx_budget_hits: u64,
-    pub rx_err_events: u64,
-    pub rx_packets: u64,
-    pub rx_dropped: u64,
-    pub tx_packets: u64,
-    pub two_vector: u32,
-    pub rx_rate_pps: u32,
-    pub isr_queue: u64,
-    pub isr_other: u64,
-    pub rx_repoll_hits: u64,
-    pub rx_repolls: u64,
-    pub rx_repoll_ns: u64,
-    /// 1 on MSI-X, 0 on INTx -- where EITR is not the throttle.
-    pub msix: u32,
+struct State {
+    generation: Generation,
+    phy_bmcr: u32,
+    phy_bmsr: u32,
+    phy_anar: u32,
+    phy_anlpar: u32,
+    phy_gctl: u32,
+    phy_gstat: u32,
+    ctrl: u32,
+    status: u32,
+    rctl: u32,
+    tctl: u32,
+    ims: u32,
+    eitr: u32,
+    stat_tpr: u64,
+    stat_gprc: u64,
+    stat_mpc: u64,
+    stat_rnbc: u64,
+    stat_rxerrc: u64,
+    stat_rqdpc: u32,
+    stat_pqgprc: u32,
+    rxdctl: u32,
+    srrctl: u32,
+    rdh: u32,
+    rdt: u32,
+    tdh: u32,
+    tdt: u32,
+    next_to_clean: u32,
+    next_to_use: u32,
+    head_status: u32,
+    head_posted: bool,
+    rx_polls: u64,
+    rx_budget_hits: u64,
+    rx_err_events: u64,
+    rx_packets: u64,
+    rx_dropped: u64,
+    tx_packets: u64,
+    two_vector: bool,
+    rx_rate_pps: u32,
+    isr_queue: u64,
+    isr_other: u64,
+    rx_repoll_hits: u64,
+    rx_repolls: u64,
+    rx_repoll_ns: u64,
+    /// On MSI-X, not INTx -- where EITR is not the throttle.
+    msix: bool,
 }
 
 /// Add a read-clear register's delta to its running total and return it.
@@ -1781,100 +1786,185 @@ fn accumulate(total: &AtomicU64, delta: u32) -> u64 {
     total.fetch_add(delta as u64, Ordering::Relaxed) + delta as u64
 }
 
-/// What `igbdump` prints, into `out`.
-///
-/// # Safety
-/// `out` is writable, or null.
-#[no_mangle]
-pub unsafe extern "C" fn igb_get_state(out: *mut IgbState) -> i32 {
-    let out = match unsafe { out.as_mut() } {
-        Some(out) => out,
-        None => return -1,
-    };
-
-    let dev = match DEVICES[0].get() {
-        Some(dev) => *dev,
-        None => {
-            out.present = 0;
-            return 0;
-        }
-    };
-
+/// The chip and the rings as they are this instant: what `igbdump` prints.
+fn snapshot(dev: &'static IgbDevice) -> State {
     let regs = &dev.regs;
-    out.present = 1;
-    out.generation = if dev.generation == Generation::I210 { 1 } else { 0 };
 
     /* What the PHY itself says, which on a machine with no console but this
      * NIC is the difference between "the cable is out" and "the driver never
      * brought the link up". Read under the same claim the bring-up takes; if
      * firmware will not give it up, report zeroes rather than whatever a
      * contended MDIO bus hands back. */
+    let mut phy = [0u32; 6];
     let phy_locked = dev.generation != Generation::I210 || swfw_acquire(regs, SWFW_PHY0_SM);
     if phy_locked {
         let addr = dev.phy_addr;
-        out.phy_bmcr = phy_read(regs, addr, PHY_BMCR).unwrap_or(0) as u32;
+        phy[0] = phy_read(regs, addr, PHY_BMCR).unwrap_or(0) as u32;
 
         /* Twice: the link bit in BMSR latches low, so the first read after
          * any drop reports the old state rather than the current one. */
         let _ = phy_read(regs, addr, PHY_BMSR);
-        out.phy_bmsr = phy_read(regs, addr, PHY_BMSR).unwrap_or(0) as u32;
+        phy[1] = phy_read(regs, addr, PHY_BMSR).unwrap_or(0) as u32;
 
-        out.phy_anar = phy_read(regs, addr, PHY_ANAR).unwrap_or(0) as u32;
-        out.phy_anlpar = phy_read(regs, addr, PHY_ANLPAR).unwrap_or(0) as u32;
-        out.phy_gctl = phy_read(regs, addr, PHY_GCTL).unwrap_or(0) as u32;
-        out.phy_gstat = phy_read(regs, addr, PHY_GSTAT).unwrap_or(0) as u32;
+        phy[2] = phy_read(regs, addr, PHY_ANAR).unwrap_or(0) as u32;
+        phy[3] = phy_read(regs, addr, PHY_ANLPAR).unwrap_or(0) as u32;
+        phy[4] = phy_read(regs, addr, PHY_GCTL).unwrap_or(0) as u32;
+        phy[5] = phy_read(regs, addr, PHY_GSTAT).unwrap_or(0) as u32;
         if dev.generation == Generation::I210 {
             swfw_release(regs, SWFW_PHY0_SM);
         }
     }
 
-    out.ctrl = regs.read32(CTRL);
-    out.status = regs.read32(STATUS);
-    out.rctl = regs.read32(RCTL);
-    out.tctl = regs.read32(TCTL);
-    out.ims = regs.read32(IMS);
-    out.eitr = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
+    let ctrl = regs.read32(CTRL);
+    let status = regs.read32(STATUS);
+    let rctl = regs.read32(RCTL);
+    let tctl = regs.read32(TCTL);
+    let ims = regs.read32(IMS);
+    let eitr = (regs.read32(EITR0) & EITR_INTERVAL_MASK) >> EITR_INTERVAL_SHIFT;
 
     /* Read-clear, so each read is a delta and has to be added on. */
-    out.stat_tpr = accumulate(&STAT_TPR, regs.read32(TPR));
-    out.stat_gprc = accumulate(&STAT_GPRC, regs.read32(GPRC));
-    out.stat_mpc = accumulate(&STAT_MPC, regs.read32(MPC));
-    out.stat_rnbc = accumulate(&STAT_RNBC, regs.read32(RNBC));
-    out.stat_rxerrc = accumulate(&STAT_RXERRC, regs.read32(RXERRC));
+    let stat_tpr = accumulate(&STAT_TPR, regs.read32(TPR));
+    let stat_gprc = accumulate(&STAT_GPRC, regs.read32(GPRC));
+    let stat_mpc = accumulate(&STAT_MPC, regs.read32(MPC));
+    let stat_rnbc = accumulate(&STAT_RNBC, regs.read32(RNBC));
+    let stat_rxerrc = accumulate(&STAT_RXERRC, regs.read32(RXERRC));
 
     /* Not read-clear: taken as they stand. */
-    out.stat_rqdpc = regs.read32(RQDPC0);
-    out.stat_pqgprc = regs.read32(PQGPRC0);
-    out.rxdctl = regs.read32(RXDCTL0);
-    out.srrctl = regs.read32(SRRCTL0);
-    out.rdh = regs.read32(RDH0);
-    out.rdt = regs.read32(RDT0);
-    out.tdh = regs.read32(TDH0);
-    out.tdt = regs.read32(TDT0);
+    let stat_rqdpc = regs.read32(RQDPC0);
+    let stat_pqgprc = regs.read32(PQGPRC0);
+    let rxdctl = regs.read32(RXDCTL0);
+    let srrctl = regs.read32(SRRCTL0);
+    let rdh = regs.read32(RDH0);
+    let rdt = regs.read32(RDT0);
+    let tdh = regs.read32(TDH0);
+    let tdt = regs.read32(TDT0);
 
     /* Where the poll last left the ring -- and what the chip has written,
      * by now, into the descriptor the poll would look at next: read out of
      * the ring itself, this instant, not out of what the poll remembers. */
     let next_to_clean = dev.rx_next_to_clean.load(Ordering::Relaxed);
-    out.next_to_clean = next_to_clean;
-    out.next_to_use = dev.rx_next_to_use.load(Ordering::Relaxed);
-    out.head_status = dev.rx_view.status(next_to_clean as usize);
-    out.head_posted = dev.rx_head_posted.load(Ordering::Relaxed) as u32;
 
-    out.rx_polls = RX_POLLS.load(Ordering::Relaxed);
-    out.rx_budget_hits = RX_BUDGET_HITS.load(Ordering::Relaxed);
-    out.rx_err_events = RX_ERR_EVENTS.load(Ordering::Relaxed);
-    out.rx_packets = dev.rx_packets.load(Ordering::Relaxed);
-    out.rx_dropped = dev.rx_dropped.load(Ordering::Relaxed);
-    out.tx_packets = dev.tx_packets.load(Ordering::Relaxed);
-    out.two_vector = dev.two_vector.load(Ordering::Relaxed) as u32;
-    out.rx_rate_pps = dev.rx_rate_pps.load(Ordering::Relaxed);
-    out.isr_queue = dev.isr_queue.load(Ordering::Relaxed);
-    out.isr_other = dev.isr_other.load(Ordering::Relaxed);
-    out.rx_repoll_hits = dev.rx_repoll_hits.load(Ordering::Relaxed);
-    out.rx_repolls = dev.rx_repolls.load(Ordering::Relaxed);
-    out.rx_repoll_ns = dev.rx_repoll_ns.load(Ordering::Relaxed);
-    out.msix = dev.is_msix() as u32;
+    State {
+        generation: dev.generation,
+        phy_bmcr: phy[0],
+        phy_bmsr: phy[1],
+        phy_anar: phy[2],
+        phy_anlpar: phy[3],
+        phy_gctl: phy[4],
+        phy_gstat: phy[5],
+        ctrl,
+        status,
+        rctl,
+        tctl,
+        ims,
+        eitr,
+        stat_tpr,
+        stat_gprc,
+        stat_mpc,
+        stat_rnbc,
+        stat_rxerrc,
+        stat_rqdpc,
+        stat_pqgprc,
+        rxdctl,
+        srrctl,
+        rdh,
+        rdt,
+        tdh,
+        tdt,
+        next_to_clean,
+        next_to_use: dev.rx_next_to_use.load(Ordering::Relaxed),
+        head_status: dev.rx_view.status(next_to_clean as usize),
+        head_posted: dev.rx_head_posted.load(Ordering::Relaxed),
+        rx_polls: RX_POLLS.load(Ordering::Relaxed),
+        rx_budget_hits: RX_BUDGET_HITS.load(Ordering::Relaxed),
+        rx_err_events: RX_ERR_EVENTS.load(Ordering::Relaxed),
+        rx_packets: dev.rx_packets.load(Ordering::Relaxed),
+        rx_dropped: dev.rx_dropped.load(Ordering::Relaxed),
+        tx_packets: dev.tx_packets.load(Ordering::Relaxed),
+        two_vector: dev.two_vector.load(Ordering::Relaxed),
+        rx_rate_pps: dev.rx_rate_pps.load(Ordering::Relaxed),
+        isr_queue: dev.isr_queue.load(Ordering::Relaxed),
+        isr_other: dev.isr_other.load(Ordering::Relaxed),
+        rx_repoll_hits: dev.rx_repoll_hits.load(Ordering::Relaxed),
+        rx_repolls: dev.rx_repolls.load(Ordering::Relaxed),
+        rx_repoll_ns: dev.rx_repoll_ns.load(Ordering::Relaxed),
+        msix: dev.is_msix(),
+    }
+}
 
-    0
+/// `igbdump`: the first igb's state, a line to a question somebody has had
+/// to ask of a machine whose only console is this NIC.
+fn dump(_args: &str, out: &mut Output) {
+    let dev = match DEVICES[0].get() {
+        Some(dev) => *dev,
+        None => {
+            let _ = writeln!(out, "igbdump: no igb");
+            return;
+        }
+    };
+    let st = snapshot(dev);
+
+    /* The prefetch, host and write-back thresholds: five bits each. */
+    const XDCTL_THRESH_FIELD: u32 = 0x1F;
+    const XDCTL_HTHRESH_SHIFT: u32 = 8;
+    const XDCTL_WTHRESH_SHIFT: u32 = 16;
+    const NS_PER_US: u64 = 1000;
+
+    let bit = |word: u32, mask: u32| (word & mask != 0) as u32;
+
+    let _ = writeln!(out, "part {}", if st.generation == Generation::I210 { "I210" } else { "82576" });
+    let _ = writeln!(out, "ctrl 0x{:X} status 0x{:X} link {}", st.ctrl, st.status, bit(st.status, STATUS_LU));
+    /* The PHY's own view, which is what tells a link the driver never brought
+     * up apart from a cable that is not plugged in. */
+    let _ = writeln!(out, "phy bmcr 0x{:X} bmsr 0x{:X} link {} autoneg-done {}",
+        st.phy_bmcr, st.phy_bmsr,
+        bit(st.phy_bmsr, BMSR_LSTATUS as u32), bit(st.phy_bmsr, BMSR_ANEGCOMPLETE as u32));
+    /* What we offered against what came back: a link that resolves lower than
+     * it should is one or the other, and nothing else distinguishes them. */
+    let _ = writeln!(out, "phy adv 0x{:X} partner 0x{:X}  1000: ctrl 0x{:X} status 0x{:X}",
+        st.phy_anar, st.phy_anlpar, st.phy_gctl, st.phy_gstat);
+    let _ = writeln!(out, "rctl 0x{:X} rx-en {}  tctl 0x{:X} tx-en {}  ims 0x{:X}",
+        st.rctl, bit(st.rctl, RCTL_EN), st.tctl, bit(st.tctl, TCTL_EN), st.ims);
+    /* Microseconds the chip holds interrupts apart. Firmware leaves a value
+     * here that a device reset does not clear, and it caps the receive rate
+     * on its own -- on MSI-X. On INTx the part throttles through ITR, and
+     * this register, which the driver then leaves alone, is not in force. */
+    let _ = writeln!(out, "interrupt throttle {} us{}, rx rate {} pps",
+        st.eitr, if st.msix { "" } else { " (not in force: INTx)" }, st.rx_rate_pps);
+    let _ = writeln!(out, "interrupts: {}, queue {}, other {}",
+        if !st.msix { "INTx" } else if st.two_vector { "queue + other vector" } else { "one vector" },
+        st.isr_queue, st.isr_other);
+    /* Under load the poll looks at an empty ring again rather than arm the
+     * interrupt: how many such passes, how many runs of them a frame ended --
+     * an interrupt spared each time -- and how long the ring sat empty
+     * through them, which is what they cost. The receive softirq's CPU in
+     * `top`, less that, is the work. */
+    let _ = writeln!(out, "rx repolls {}, {} runs ended by a frame, {} us on an empty ring",
+        st.rx_repolls, st.rx_repoll_hits, st.rx_repoll_ns / NS_PER_US);
+    /* The prefetch thresholds live in the low fields of RXDCTL. Zero there
+     * means the chip never prefetches descriptors and drops packets with a
+     * full ring, so they are worth reading back rather than assuming. */
+    let _ = writeln!(out, "rxdctl 0x{:X} queue-en {} (pthresh {} hthresh {} wthresh {}) srrctl 0x{:X}",
+        st.rxdctl, bit(st.rxdctl, XDCTL_QUEUE_ENABLE),
+        st.rxdctl & XDCTL_THRESH_FIELD,
+        (st.rxdctl >> XDCTL_HTHRESH_SHIFT) & XDCTL_THRESH_FIELD,
+        (st.rxdctl >> XDCTL_WTHRESH_SHIFT) & XDCTL_THRESH_FIELD,
+        st.srrctl);
+    let _ = writeln!(out, "rx ring: rdh {} rdt {}  clean {} use {}",
+        st.rdh, st.rdt, st.next_to_clean, st.next_to_use);
+    let _ = writeln!(out, "rx head: status 0x{:X} dd {} posted {}",
+        st.head_status, bit(st.head_status, RXD_STAT_DD), st.head_posted as u32);
+    let _ = writeln!(out, "tx ring: tdh {} tdt {} packets {}", st.tdh, st.tdt, st.tx_packets);
+    let _ = writeln!(out, "rx packets {} dropped {} err events {}",
+        st.rx_packets, st.rx_dropped, st.rx_err_events);
+    let _ = writeln!(out, "rx polls {}, of them budget-limited {}", st.rx_polls, st.rx_budget_hits);
+    /* The chip's own view, which the ring counters cannot see: a frame the MAC
+     * dropped before it reached for a descriptor never appears above. TPR is
+     * everything taken off the wire, MPC what the receive FIFO had no room
+     * for, RNBC what found no descriptor waiting. */
+    let _ = writeln!(out, "mac: total {} good {} missed {} no-buffer {} errors {}",
+        st.stat_tpr, st.stat_gprc, st.stat_mpc, st.stat_rnbc, st.stat_rxerrc);
+    /* Per queue. RQDPC counts packets the queue was offered and had no
+     * descriptor for -- the one drop nothing else in this dump can see. */
+    let _ = writeln!(out, "queue0: good {} dropped-no-descriptor {}", st.stat_pqgprc, st.stat_rqdpc);
 }

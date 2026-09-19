@@ -43,8 +43,11 @@ pub fn init() {
 
 /// The one VFS, made on first use. That is early in boot, in task context,
 /// where its mutex can be allocated; two callers racing here both get the
-/// same one.
-pub(crate) fn vfs_instance() -> Option<&'static Vfs> {
+/// same one. Public for the rest of the kernel image: another crate's
+/// command opens a file with `vfs::Open::new(fs::vfs_instance()?, ..)`, the
+/// way this crate's own commands do -- the `kernel_file_*` names are for
+/// C++ and for modules.
+pub fn vfs_instance() -> Option<&'static Vfs> {
     let vfs = VFS.get_or_try_init(Vfs::new);
     if vfs.is_none() {
         trace!(0, "vfs: no memory for the mount table");

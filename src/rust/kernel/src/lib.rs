@@ -29,6 +29,7 @@ pub extern "C" fn rust_init() {
     block::init();
     fs::init();
     net::init();
+    sha256::init();
     nvme::init();
     usb::init();
     virtio_rng::init();
@@ -115,6 +116,7 @@ fn tco_init() {
 #[no_mangle]
 pub extern "C" fn rust_test() {
     hello::test();
+    sha256::selftest();
 }
 
 /* Contract: rust_fini must be the last thing before halt.  Block/net

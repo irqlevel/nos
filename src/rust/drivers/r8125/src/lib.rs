@@ -36,6 +36,7 @@ extern crate alloc;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use kcore::cmd::{Command, Output};
 use kcore::net::{FrameBatch, NetBinding, NetDriver, RxQueue, TxQueue};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
@@ -146,6 +147,12 @@ impl R8125Device {
 /* Public entry points called from kernel/src/lib.rs */
 
 pub fn init() {
+    match Command::register("nicdump", "nicdump - r8125 chip and ring state", dump) {
+        /* The command is the kernel's own and stays for good. */
+        Ok(cmd) => core::mem::forget(cmd),
+        Err(_) => trace!(0, "r8125: cannot register the nicdump command"),
+    }
+
     let mut start: usize = 0;
     loop {
         match pci::find_device_from(PCI_VENDOR_REALTEK, PCI_DEVICE_RTL8125, start) {
@@ -601,10 +608,6 @@ const RX_INTR_BITS: u32 = ISR_ROK | ISR_RER | ISR_RDU | ISR_RX_FIFO_OVER;
 /// without ever returning would overflow it and drop the excess.
 const RX_BUDGET: u32 = 64;
 
-pub fn rx_err_events() -> u64 {
-    RX_ERR_EVENTS.load(Ordering::Relaxed)
-}
-
 fn isr(dev: &'static R8125Device) {
     /* flush_tx or process_rx may be running on another CPU right now (a
      * per-CPU interrupt disable does not exclude them): what is shared with
@@ -696,65 +699,47 @@ fn isr(dev: &'static R8125Device) {
  * about what the hardware must be doing; every one was wrong. This reads it.
  *
  * CMD_RX_EN is the first thing to look at: if the chip has cleared it, the
- * receiver is off and no amount of draining or reposting will bring it back.
- * head_posted and head_opts1 say whose the head descriptor is -- ours and
- * unposted, or the chip's and never written. */
-#[repr(C)]
-pub struct R8125State {
-    pub present: u32,
-    pub cmd: u32,
-    pub intr_status: u32,
-    pub intr_mask: u32,
-    pub rx_config: u32,
-    pub rx_head: u32,
-    pub head_posted: u32,
-    pub head_opts1: u32,
-    pub rx_err_events: u64,
-    pub rx_polls: u64,
-    pub rx_budget_hits: u64,
-    pub rx_packets: u64,
-    pub rx_dropped: u64,
-}
-
-/// What `r8125dump` prints, into `out`.
-///
-/// # Safety
-/// `out` is writable, or null.
-#[no_mangle]
-pub unsafe extern "C" fn r8125_get_state(out: *mut R8125State) -> i32 {
-    let out = match unsafe { out.as_mut() } {
-        Some(out) => out,
-        None => return -1,
-    };
-
+ * receiver is off and no amount of draining or reposting will bring it back
+ * -- which is the one thing six guesses about this stall never checked.
+ * "posted" and "opts1" say whose the head descriptor is -- ours and unposted,
+ * or the chip's and never written. */
+fn dump(_args: &str, out: &mut Output) {
     let dev = match DEVICES[0].get() {
         Some(dev) => *dev,
         None => {
-            out.present = 0;
-            return -1;
+            let _ = writeln!(out, "nicdump: no r8125");
+            return;
         }
     };
 
     let regs = &dev.regs;
+    let bit = |word: u32, mask: u32| (word & mask != 0) as u32;
+
+    let cmd = regs.read8(CMD_REG) as u32;
+    let intr_status = regs.read32(INTR_STATUS);
+    let intr_mask = regs.read32(INTR_MASK);
+    let rx_config = regs.read32(RX_CONFIG);
+
+    /* Where the poll last said it was, and the descriptor the chip would
+     * fill next read straight out of the ring, as it is this instant -- not
+     * out of anything the poll remembers. */
     let head = dev.rx_head.load(Ordering::Relaxed);
+    let posted = dev.rx_head_posted.load(Ordering::Relaxed);
+    let opts1 = dev.rx_view.opts1(head as usize);
 
-    out.present = 1;
-    out.cmd = regs.read8(CMD_REG) as u32;
-    out.intr_status = regs.read32(INTR_STATUS);
-    out.intr_mask = regs.read32(INTR_MASK);
-    out.rx_config = regs.read32(RX_CONFIG);
-    out.rx_head = head;
-    out.head_posted = dev.rx_head_posted.load(Ordering::Relaxed) as u32;
-    /* Read straight out of the descriptor the chip would fill next, as it is
-     * this instant -- not out of anything the poll remembers. */
-    out.head_opts1 = dev.rx_view.opts1(head as usize);
-    out.rx_err_events = RX_ERR_EVENTS.load(Ordering::Relaxed);
-    out.rx_polls = RX_POLLS.load(Ordering::Relaxed);
-    out.rx_budget_hits = RX_BUDGET_HITS.load(Ordering::Relaxed);
-    out.rx_packets = dev.rx_packets.load(Ordering::Relaxed);
-    out.rx_dropped = dev.rx_dropped.load(Ordering::Relaxed);
+    let _ = writeln!(out, "cmd 0x{:X} rx-en {} tx-en {}",
+        cmd, bit(cmd, CMD_RX_EN as u32), bit(cmd, CMD_TX_EN as u32));
+    let _ = writeln!(out, "isr 0x{:X} imr 0x{:X} rxcfg 0x{:X}", intr_status, intr_mask, rx_config);
+    let _ = writeln!(out, "rx head {} posted {} opts1 0x{:X} own {}",
+        head, posted as u32, opts1, bit(opts1, RX_OWN));
+    let _ = writeln!(out, "rx packets {} dropped {} err events {}",
+        dev.rx_packets.load(Ordering::Relaxed), dev.rx_dropped.load(Ordering::Relaxed),
+        RX_ERR_EVENTS.load(Ordering::Relaxed));
 
-    0
+    /* A ceiling that reads as polls-per-second times budget is either the
+     * softirq loop's cadence or the chip's interrupt rate; these tell which. */
+    let _ = writeln!(out, "rx polls {}, of them budget-limited {}",
+        RX_POLLS.load(Ordering::Relaxed), RX_BUDGET_HITS.load(Ordering::Relaxed));
 }
 
 /* ================================================================== */
