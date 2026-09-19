@@ -13,18 +13,18 @@
  * TX ownership protocol:
  *   - software fills the descriptor and sets TX_OWN to hand it over
  *   - hardware clears TX_OWN once the frame is on the wire
- *   - the shadow array holds the NetFrame itself, so the buffer stays alive
+ *   - the shadow array holds the Frame itself, so the buffer stays alive
  *     until that happens
  *
  * RX ownership protocol:
- *   - software posts a NetFrame's physical address and sets RX_OWN
+ *   - software posts a Frame's physical address and sets RX_OWN
  *   - hardware writes the frame, clears RX_OWN and puts the length in opts1
  *   - software harvests it, hands the frame up, and posts a fresh one
  */
 
 use alloc::vec::Vec;
 use kcore::dma::{Descriptor, DmaBuffer, Volatile};
-use kcore::net::{NetFrame, TxQueue};
+use net::{Frame, TxQueue};
 
 use crate::regs::*;
 
@@ -96,7 +96,7 @@ fn ring<D: Descriptor>(dma: DmaBuffer) -> Option<(&'static [D], u64)> {
 
 /// A ring's shadow of what is posted in it: the frame in each slot, none
 /// where there is none.
-fn shadow() -> Option<Vec<Option<NetFrame>>> {
+fn shadow() -> Option<Vec<Option<Frame>>> {
     let mut frames = Vec::new();
     frames.try_reserve_exact(RING_SIZE).ok()?;
     frames.resize_with(RING_SIZE, || None);
@@ -111,7 +111,7 @@ pub struct TxRing {
     /* Where the chip is told the ring is */
     pub phys: u64,
     /* The frame of each descriptor the hardware owns. */
-    frames: Vec<Option<NetFrame>>,
+    frames: Vec<Option<Frame>>,
     /* Next free slot (written by flush_tx) */
     tail: usize,
     /* Next slot to check for completion (advanced by reap_completed) */
@@ -140,7 +140,7 @@ impl TxRing {
     /// Hand one frame to the hardware.  Caller must have checked has_space().
     /// The frame is consumed; it lives in the shadow array until
     /// reap_completed() sees the chip clear TX_OWN.
-    pub fn submit(&mut self, frame: NetFrame) {
+    pub fn submit(&mut self, frame: Frame) {
         let idx = self.tail;
         let phys = frame.data_phys();
         let len = frame.len() as u32;
@@ -207,7 +207,7 @@ impl RxView {
 pub struct RxRing {
     descs: &'static [RxDesc],
     pub phys: u64,
-    frames: Vec<Option<NetFrame>>,
+    frames: Vec<Option<Frame>>,
     /* Next slot to check for received data */
     head: usize,
 }
@@ -240,7 +240,7 @@ impl RxRing {
     }
 
     /// Give slot `idx` a buffer and hand it to the hardware.
-    pub fn post(&mut self, idx: usize, frame: NetFrame) {
+    pub fn post(&mut self, idx: usize, frame: Frame) {
         let phys = frame.data_phys();
         let eor: u32 = if idx == RING_SIZE - 1 { RX_EOR } else { 0 };
 
@@ -273,7 +273,7 @@ impl RxRing {
     /// Returns None when hardware still owns the descriptor, or when the slot
     /// is empty because an earlier refill failed -- the caller reposts it.
     /// The caller reads the length and the error bits out of opts1.
-    pub fn harvest(&mut self) -> Option<(NetFrame, u32)> {
+    pub fn harvest(&mut self) -> Option<(Frame, u32)> {
         let idx = self.head;
         if self.frames[idx].is_none() {
             return None;

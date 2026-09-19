@@ -34,13 +34,15 @@
 #![no_std]
 extern crate alloc;
 
+use alloc::boxed::Box;
+
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use kcore::cmd::{Command, Output};
-use kcore::net::{FrameBatch, NetBinding, NetDriver, RxQueue, TxQueue};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
-use kcore::{dma, interrupt, io, msix, net, pci, softirq, trace};
+use kcore::{dma, interrupt, io, msix, pci, softirq, trace};
+use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 
 mod desc;
 mod hw;
@@ -285,7 +287,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     };
 
     for i in 0..RING_SIZE {
-        match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+        match Frame::alloc_rx(RX_BUF_SIZE) {
             Some(frame) => rx_ring.post(i, frame),
             None => {
                 trace!(0, "r8125: RX frame alloc failed at slot {}", i);
@@ -363,12 +365,12 @@ fn init_device(pci_dev: &pci::PciDevice) {
     let name = write_device_name(&mut name_buf, idx);
 
     /* The device goes where it will stay, so that the interrupt handler has
-     * somewhere to be pointed at; the rings go with it, each to the one path
-     * that will be handed it.  Nothing calls into any of it until the
-     * interrupt is attached and, last of all, the net layer is told. */
+     * somewhere to be pointed at; the rings stay here until the net layer is
+     * told, last of all, and become its to lend -- each to the one path that
+     * touches it.  Nothing calls into any of it until then. */
     let rx_view = rx_ring.view();
     let head_posted = !rx_ring.is_empty_slot(rx_ring.head());
-    let binding = NetBinding::new(R8125Device {
+    let dev: &'static R8125Device = Box::leak(Box::new(R8125Device {
         regs,
         _bar_mapping: bar_mapping,
         irqs: IrqSpinLock::new(None),
@@ -378,8 +380,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
-    }, tx_ring, rx_ring);
-    let dev = binding.driver();
+    }));
 
     if !attach_interrupt(pci_dev, dev) {
         trace!(0, "r8125: no interrupt could be registered");
@@ -392,7 +393,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
 
     trace_link(&dev.regs);
 
-    if binding.register(name, mac).is_none() {
+    if net::register(name, mac, dev, tx_ring, rx_ring).is_none() {
         trace!(0, "r8125: NetDevice registration failed");
         dev.quiesce();
         return;
@@ -779,7 +780,7 @@ impl R8125Device {
         /* Harvested frames wait here until the drain ends, so the receive
          * queue's lock is taken once for the batch instead of once per
          * frame. Sized by the budget, which is what bounds the drain. */
-        let mut batch: FrameBatch<{ RX_BUDGET as usize }> = FrameBatch::new();
+        let mut batch = FrameQueue::new();
 
         loop {
             RX_POLLS.fetch_add(1, Ordering::Relaxed);
@@ -799,7 +800,7 @@ impl R8125Device {
                  * chip stalls on a descriptor it does not own, so RX makes no
                  * progress until the slot is posted again. */
                 if ring.is_empty_slot(idx) {
-                    match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+                    match Frame::alloc_rx(RX_BUF_SIZE) {
                         Some(frame) => ring.post(idx, frame),
                         None => break, /* still no memory; try again later */
                     }
@@ -829,10 +830,9 @@ impl R8125Device {
                 frame.set_len(data_len);
                 self.rx_packets.fetch_add(1, Ordering::Relaxed);
 
-                /* Room for it: the batch is as long as the budget. */
                 batch.push(frame);
 
-                match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+                match Frame::alloc_rx(RX_BUF_SIZE) {
                     Some(new_frame) => ring.post(idx, new_frame),
                     None => {
                         /* Under memory pressure leave the slot empty; the

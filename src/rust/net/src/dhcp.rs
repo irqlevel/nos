@@ -7,7 +7,7 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use kcore::net::{Nic, UdpListener};
+use crate::nic::{Lent, Nic, RxContext, UdpHandler, UdpListener};
 use kcore::sync::SpinLock;
 use kcore::task::TaskHandle;
 use kcore::trace;
@@ -589,8 +589,8 @@ fn recompute_ip_checksum(packet: &mut [u8]) {
 }
 
 /// What the receive path hands every datagram on the client port to.
-impl kcore::net::UdpHandler for Dhcp {
-    fn on_frame(&'static self, frame: kcore::net::Lent<'_>, _rx: &mut kcore::net::RxContext) {
+impl UdpHandler for Dhcp {
+    fn on_frame(&'static self, frame: Lent<'_>, _rx: &mut RxContext) {
         self.receive(frame.bytes());
     }
 }

@@ -7,7 +7,8 @@
 //! retransmitting once a second so that one dropped broadcast does not cost
 //! the whole timeout.
 
-use kcore::net::{NetFrame, Nic};
+use crate::frame::Frame;
+use crate::nic::Nic;
 use kcore::sync::SpinLock;
 use kcore::time;
 use kcore::trace;
@@ -165,7 +166,7 @@ impl ArpTable {
 /// host that asked.
 fn send(nic: &Nic, opcode: u16, eth_dst: &Mac, target_mac: &Mac, target_ip: u32) {
     let len = ETH_HDR_LEN + ARP_LEN;
-    let mut frame = match NetFrame::alloc_tx(len) {
+    let mut frame = match Frame::alloc_tx(len) {
         Some(frame) => frame,
         None => {
             trace!(0, "arp: no frame to send with");

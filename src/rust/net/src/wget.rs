@@ -7,7 +7,7 @@
 use core::fmt::Write;
 
 use kcore::cmd::Output;
-use kcore::fs;
+use fs::vfs::{Open, MAX_PATH, OPEN_CREATE, OPEN_TRUNCATE, OPEN_WRITE};
 
 use crate::device::DEVICES;
 use crate::http::{self, Response, MAX_BODY, MAX_URL_LEN};
@@ -35,7 +35,7 @@ const MAX_LOCATION: usize = 256;
 
 /// The sink's state between calls.
 struct FileSink<'a> {
-    file: &'a fs::File,
+    file: &'a Open<'static>,
     out: &'a mut Output,
     buf: alloc::boxed::Box<[u8]>,
     used: usize,
@@ -213,8 +213,15 @@ pub fn wget(args: &str, out: &mut Output) {
 }
 
 /// Downloads to a file, streaming. Says why on the way out when it fails.
-fn to_file(nic: &kcore::net::Nic, url: &str, path: &str, out: &mut Output) {
-    let file = match fs::File::create(path) {
+fn to_file(nic: &crate::nic::Nic, url: &str, path: &str, out: &mut Output) {
+    /* A file to write from the beginning, made if it is missing and emptied
+     * if it is not -- through the filesystem layer itself: this crate is in
+     * the kernel image with it. */
+    let vfs = match fs::vfs_instance() {
+        Some(vfs) if !path.is_empty() && path.len() < MAX_PATH => vfs,
+        _ => { let _ = writeln!(out, "wget: cannot open {} for writing", path); return; }
+    };
+    let file = match Open::new(vfs, path.as_bytes(), OPEN_WRITE | OPEN_CREATE | OPEN_TRUNCATE) {
         Some(file) => file,
         None => { let _ = writeln!(out, "wget: cannot open {} for writing", path); return; }
     };
@@ -244,7 +251,7 @@ fn to_file(nic: &kcore::net::Nic, url: &str, path: &str, out: &mut Output) {
     /* Nothing landed -- a failed request, or a body refused before the first
      * byte: do not leave an empty file behind. */
     if written == 0 {
-        fs::remove(path);
+        vfs.remove(path.as_bytes());
     }
 
     if resp.ok == 0 {

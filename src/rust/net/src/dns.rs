@@ -6,7 +6,7 @@
 //! weak protection against an off-path forgery, so it is not the only check,
 //! and it is seeded from the cycle counter rather than counting 1, 2, 3.
 
-use kcore::net::{Nic, UdpListener};
+use crate::nic::{Lent, Nic, RxContext, UdpHandler, UdpListener};
 use kcore::sync::{Mutex, SpinLock};
 use kcore::time;
 use kcore::trace;
@@ -407,8 +407,8 @@ impl Dns {
 }
 
 /// What the receive path hands every datagram on the client port to.
-impl kcore::net::UdpHandler for Dns {
-    fn on_frame(&'static self, frame: kcore::net::Lent<'_>, _rx: &mut kcore::net::RxContext) {
+impl UdpHandler for Dns {
+    fn on_frame(&'static self, frame: Lent<'_>, _rx: &mut RxContext) {
         self.receive(frame.bytes());
     }
 }

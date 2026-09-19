@@ -13,7 +13,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use kcore::net::{Nic, UdpListener};
+use crate::nic::{Lent, Nic, RxContext, UdpHandler, UdpListener};
 use kcore::sync::{Event, SpinLock};
 use kcore::task::TaskHandle;
 use kcore::trace;
@@ -367,8 +367,8 @@ impl UdpShell {
 }
 
 /// What the receive path hands every datagram on the shell's port to.
-impl kcore::net::UdpHandler for UdpShell {
-    fn on_frame(&'static self, frame: kcore::net::Lent<'_>, _rx: &mut kcore::net::RxContext) {
+impl UdpHandler for UdpShell {
+    fn on_frame(&'static self, frame: Lent<'_>, _rx: &mut RxContext) {
         self.receive(frame.bytes());
     }
 }

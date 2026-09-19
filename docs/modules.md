@@ -65,13 +65,15 @@ the task that runs `rmmod` drops what the task that ran `insmod` built.
 Dropping a handle is enough because every unregister the kernel offers waits
 out a callback still running on another CPU before it returns: a command
 (`kernel_cmd_unregister`), a timer, a legacy or MSI-X interrupt, a task
-(`TaskHandle` joins it). A few registrations have no unregister at all: a block
-device (`kcore::block::register_driver`), a net device
-(`kcore::net::NetBinding::register`) and a softirq handler
-(`kcore::softirq::register_for`) are the kernel's to call for as
-long as it runs. A module that imports any of those is **permanent**: the
-loader sees the import, `lsmod` says so, and `rmmod` refuses it -- the way
-Linux keeps a module that has no exit function.
+(`TaskHandle` joins it). One registration has no unregister at all: a softirq
+handler (`kcore::softirq::register_for`) is the kernel's to call for as long
+as it runs. A module that imports it is **permanent**: the loader sees the
+import, `lsmod` says so, and `rmmod` refuses it -- the way Linux keeps a
+module that has no exit function. (A disk's or a NIC's *driver* cannot be a
+module at all: it registers with the block or the net layer as a Rust trait
+object, from inside the kernel image, and there is no C name for that. A
+module uses disks and NICs -- `kcore::block::Disk`, `kcore::net::Nic` -- it
+does not provide them.)
 
 The `kmod` crate supplies the rest of what every module needs once: the
 global allocator (the kernel heap, through `kernel_alloc`), the panic handler

@@ -11,7 +11,7 @@
 //! the receive soft IRQ, which is one CPU at a time, so the receive side
 //! needs no lock of its own; and the transmit side is only ever touched from
 //! `flush_tx`, which the net stack calls with its own lock held. That is
-//! what `kcore::net::NetDriver` hands each call its half by: `RxState` and
+//! what `net::NetDriver` hands each call its half by: `RxState` and
 //! `TxState` are not fields of the device with a comment about who may touch
 //! them, they are what `process_rx` and `flush_tx` are given. A frame
 //! finished with in `flush_tx` is handed back with `queue.done` and not
@@ -28,11 +28,11 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use kcore::dma::DmaBuffer;
 use kcore::interrupt::LegacyInterrupt;
 use kcore::msix::MsixInterrupt;
-use kcore::net::{FrameBatch, NetBinding, NetDriver, NetFrame, RxQueue, TxQueue};
 use kcore::once::Once;
 use kcore::pci;
 use kcore::softirq;
 use kcore::trace;
+use net::{Frame, FrameQueue, NetDriver, RxQueue, TxQueue};
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport};
 
@@ -102,7 +102,7 @@ struct RxState {
     /// A page of receive headers, a slot's worth apiece
     hdr: DmaBuffer,
     slots: usize,
-    frames: [Option<NetFrame>; MAX_RX_SLOTS],
+    frames: [Option<Frame>; MAX_RX_SLOTS],
     slot_of_head: [u8; virtio::MAX_DESCRIPTORS as usize],
 }
 
@@ -111,7 +111,7 @@ struct TxState {
     queue: Queue,
     /// A page of transmit headers, a slot's worth apiece
     hdr: DmaBuffer,
-    frames: [Option<NetFrame>; MAX_TX_SLOTS],
+    frames: [Option<Frame>; MAX_TX_SLOTS],
     slot_of_head: [u8; virtio::MAX_DESCRIPTORS as usize],
     /// Free slots, one bit each
     free: u32,
@@ -125,7 +125,7 @@ enum Irq {
 impl Net {
     /// Put a frame in a receive slot and hand the pair of descriptors -- the
     /// header, then the frame -- to the device.
-    fn post_rx(&self, rx: &mut RxState, slot: usize, frame: NetFrame) -> bool {
+    fn post_rx(&self, rx: &mut RxState, slot: usize, frame: Frame) -> bool {
         let hdr_phys = rx.hdr.phys() + (slot * self.hdr_size) as u64;
         let bufs = [
             Buf::write(hdr_phys, self.hdr_size as u32),
@@ -155,7 +155,7 @@ impl Net {
                 continue;
             }
 
-            let frame = match NetFrame::alloc_rx(FRAME_CAPACITY) {
+            let frame = match Frame::alloc_rx(FRAME_CAPACITY) {
                 Some(frame) => frame,
                 /* Still nothing to post with: the next pass tries again. */
                 None => break,
@@ -175,7 +175,7 @@ impl Net {
     /// Take what the device has received and hand it up. Runs in the receive
     /// soft IRQ.
     fn harvest(&self, rx: &mut RxState, up: &mut RxQueue<'_>) {
-        let mut batch: FrameBatch<RX_BUDGET> = FrameBatch::new();
+        let mut batch = FrameQueue::new();
         let mut taken = 0;
         let mut budget_hit = false;
 
@@ -225,7 +225,7 @@ impl Net {
 
             /* The slot goes back to the device with a fresh frame: the one
              * just harvested is the stack's now, for as long as it likes. */
-            match NetFrame::alloc_rx(FRAME_CAPACITY) {
+            match Frame::alloc_rx(FRAME_CAPACITY) {
                 Some(fresh) => {
                     if self.post_rx(rx, slot, fresh) {
                         refilled = true;
@@ -239,7 +239,7 @@ impl Net {
                 }
             }
 
-            if batch.is_full() {
+            if batch.len() >= RX_BUDGET {
                 up.deliver(&mut batch);
             }
 
@@ -485,9 +485,9 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
     let (rx_layout, tx_layout) = (layout(&rx.queue, None), layout(&tx.queue, None));
 
     /* From here the device is somewhere for good: what an interrupt handler
-     * is pointed at, and what the net stack will be. */
-    let binding = NetBinding::new(net, tx, rx);
-    let net = binding.driver();
+     * is pointed at, and what the net stack will be. The two queues stay
+     * this function's until the stack is told, last of all. */
+    let net: &'static Net = Box::leak(Box::new(net));
     let transport = net.transport.as_ref();
 
     /* The interrupt before the queues are enabled: a modern virtio-pci
@@ -505,7 +505,7 @@ fn start(transport: Box<dyn Transport>, source: IrqSource) -> bool {
         transport.notify(RX_QUEUE);
     }
 
-    match binding.register(name, mac) {
+    match ::net::register(name, mac, net, tx, rx) {
         Some(handle) => {
             /* What QEMU's user-mode networking hands out: without it a boot
              * that runs no DHCP has no address at all, and the UDP shell is

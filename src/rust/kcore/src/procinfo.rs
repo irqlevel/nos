@@ -83,8 +83,3 @@ pub fn root_read_only() -> bool {
 pub fn root_fstest() -> bool {
     unsafe { fs::kernel_root_fstest() != 0 }
 }
-
-/// The filesystem self-test in `dir`, with a file of `size` bytes.
-pub fn fs_selftest(dir: &str, size: usize) -> bool {
-    unsafe { fs::kernel_fs_selftest(dir.as_ptr(), dir.len(), size) == 0 }
-}

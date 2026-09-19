@@ -1,208 +1,15 @@
-use alloc::boxed::Box;
-use core::cell::UnsafeCell;
-use core::marker::PhantomData;
-use core::sync::atomic::{AtomicBool, Ordering};
+//! The network layer, **as a loadable module reaches it**: a device by name,
+//! a UDP port to listen on, frames to build and transmit.
+//!
+//! A module is linked on its own, so the C ABI is the only seam it shares
+//! with the layer, and these are its wrappers. Nothing inside the kernel
+//! image comes through here: a NIC's driver registers with the `net` crate
+//! as a `net::NetDriver` and moves `net::Frame`s, and the layer's own
+//! services hold a `net::Nic`. What is at the bottom -- the kernel's
+//! command-line parameters and its log -- is C++'s, and the layer asks for
+//! it here like any other kernel service.
 
 use ffi::net;
-
-/* ---- the driver's side ---- */
-
-/// What a device's name fits in, its terminator included.
-const NAME_MAX: usize = 32;
-
-/// A registered net device, as its driver knows it. Registration is for the
-/// life of the kernel, so this is a plain value.
-#[derive(Clone, Copy)]
-pub struct NetDeviceHandle {
-    handle: usize,
-}
-
-impl NetDeviceHandle {
-    pub fn set_ip(&self, ip: u32) {
-        unsafe { net::kernel_netdev_set_ip(self.handle, ip) }
-    }
-
-    pub fn set_mask(&self, mask: u32) {
-        unsafe { net::kernel_netdev_set_mask(self.handle, mask) }
-    }
-
-    pub fn set_gw(&self, gw: u32) {
-        unsafe { net::kernel_netdev_set_gw(self.handle, gw) }
-    }
-}
-
-/// A network card, as the driver behind it. The net layer asks a driver two
-/// things, and each comes with the state that only that call touches:
-///
-/// - `flush_tx`, with the device's transmit lock held around it, so one at a
-///   time per device: it is handed the transmit side as `&mut Self::Tx`;
-/// - `process_rx`, from the receive soft IRQ, which the kernel runs on one
-///   CPU at a time: it is handed the receive side as `&mut Self::Rx`.
-///
-/// Everything else of the driver -- what an interrupt handler or a shell
-/// command looks at -- is `&self`, shared between whatever runs: registers,
-/// atomics, locks. So a driver has no `UnsafeCell` with a comment saying who
-/// may touch it; who may touch it is who is handed it.
-pub trait NetDriver: Sync + 'static {
-    /// What only `flush_tx` touches: the transmit ring and what is on it.
-    type Tx: Send + 'static;
-    /// What only `process_rx` touches: the receive ring and what is posted.
-    type Rx: Send + 'static;
-
-    /// Give back what the hardware has finished sending and send what the
-    /// stack has queued. Called under the device's transmit lock, interrupts
-    /// off: no sleeping, no allocating -- and no *freeing*: a frame finished
-    /// with goes to `queue.done`, never out of scope.
-    fn flush_tx(&'static self, tx: &mut Self::Tx, queue: &mut TxQueue<'_>);
-
-    /// Take what the hardware has received and hand it up.
-    fn process_rx(&'static self, rx: &mut Self::Rx, queue: &mut RxQueue<'_>);
-}
-
-/// A driver and the two halves only its calls touch, together for good.
-/// Made first, so that the driver is somewhere an interrupt handler can be
-/// pointed at; registered last, once the hardware is ready to be asked.
-pub struct NetBinding<D: NetDriver> {
-    driver: D,
-    tx: UnsafeCell<D::Tx>,
-    rx: UnsafeCell<D::Rx>,
-    registered: AtomicBool,
-}
-
-/* `tx` and `rx` are reached only by the two functions at the bottom of this
- * block, each under the exclusion the net layer promises a driver. */
-unsafe impl<D: NetDriver> Sync for NetBinding<D> {}
-
-impl<D: NetDriver> NetBinding<D> {
-    /// For the life of the kernel: a net device is never given back.
-    pub fn new(driver: D, tx: D::Tx, rx: D::Rx) -> &'static NetBinding<D> {
-        Box::leak(Box::new(NetBinding {
-            driver,
-            tx: UnsafeCell::new(tx),
-            rx: UnsafeCell::new(rx),
-            registered: AtomicBool::new(false),
-        }))
-    }
-
-    pub fn driver(&'static self) -> &'static D {
-        &self.driver
-    }
-
-    /// Put the device in the net layer's table; from here on it is called.
-    /// None when the table is full, the name will not do, or this binding is
-    /// registered already -- one device to a binding, because one transmit
-    /// lock is what stands behind its `&mut Tx`.
-    pub fn register(&'static self, name: &str, mac: [u8; 6]) -> Option<NetDeviceHandle> {
-        if name.is_empty() || name.len() >= NAME_MAX || name.as_bytes().contains(&0) {
-            return None;
-        }
-        if self.registered.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-
-        /* The table copies the name: a C string for the length of the call. */
-        let mut c_name = [0u8; NAME_MAX];
-        c_name[..name.len()].copy_from_slice(name.as_bytes());
-
-        let ops = net::NetDeviceOps {
-            name: c_name.as_ptr(),
-            mac,
-            flush_tx: flush_tx::<D>,
-            process_rx: process_rx::<D>,
-            ctx: self as *const Self as *mut u8,
-        };
-        let h = unsafe { net::kernel_netdev_register(&ops) };
-        if h == 0 {
-            self.registered.store(false, Ordering::Release);
-            None
-        } else {
-            Some(NetDeviceHandle { handle: h })
-        }
-    }
-}
-
-extern "C" fn flush_tx<D: NetDriver>(ctx: *mut u8, dev: usize) {
-    /* `ctx` is the binding `register` passed, which lives for good. */
-    let binding = unsafe { &*(ctx as *const NetBinding<D>) };
-    /* The device's transmit lock is held around this call -- the net layer's
-     * contract with a driver -- so nothing else is in `tx`. The one exception
-     * is a panic's report, which comes through with the lock stolen if its
-     * holder is never going to let go: see `Device::submit_tx`. */
-    let tx = unsafe { &mut *binding.tx.get() };
-    binding.driver.flush_tx(tx, &mut TxQueue { dev, _held: PhantomData });
-}
-
-extern "C" fn process_rx<D: NetDriver>(ctx: *mut u8, dev: usize) {
-    let binding = unsafe { &*(ctx as *const NetBinding<D>) };
-    /* Called from the receive soft IRQ and nowhere else, and the kernel runs
-     * a soft IRQ type on one CPU at a time. */
-    let rx = unsafe { &mut *binding.rx.get() };
-    binding.driver.process_rx(rx, &mut RxQueue { dev, _life: PhantomData });
-}
-
-/// The stack's transmit queue, for the length of one `flush_tx`. It exists
-/// only there, which is what its two calls need: the queue is guarded by the
-/// lock that is held around `flush_tx`.
-pub struct TxQueue<'a> {
-    dev: usize,
-    _held: PhantomData<&'a mut ()>,
-}
-
-impl TxQueue<'_> {
-    /// The next frame to send, or None when the queue is empty.
-    ///
-    /// The frame wraps a DMA buffer the hardware is about to read: keep it --
-    /// in the ring's shadow of what is posted -- until the hardware says it
-    /// is done, and then hand it to `done`. Dropped earlier, the buffer goes
-    /// back to the pool and out again while the card is still reading it.
-    pub fn dequeue(&mut self) -> Option<NetFrame> {
-        /* Inside `flush_tx`, which is what the call requires. */
-        let h = unsafe { net::kernel_netdev_tx_dequeue(self.dev) };
-        core::num::NonZeroUsize::new(h).map(|handle| NetFrame { handle })
-    }
-
-    /// A transmitted frame, for release once the lock is down. Never dropped
-    /// here instead: dropping frees, a free can reach the page allocator,
-    /// which shoots down the TLB on every other CPU and waits for each -- and
-    /// a CPU spinning on this lock has interrupts off and never answers.
-    pub fn done(&mut self, frame: NetFrame) {
-        let h = frame.into_raw();
-        unsafe { net::kernel_netdev_tx_done(self.dev, h) }
-    }
-}
-
-/// The stack's receive queue, for the length of one `process_rx`.
-pub struct RxQueue<'a> {
-    dev: usize,
-    _life: PhantomData<&'a mut ()>,
-}
-
-impl RxQueue<'_> {
-    /// One received frame, to the stack. What the queue has no room for is
-    /// released on the far side.
-    pub fn enqueue(&mut self, frame: NetFrame) {
-        let h = frame.into_raw();
-        unsafe { net::kernel_netdev_enqueue_rx(self.dev, h) }
-    }
-
-    /// A whole harvest at once: the receive queue's lock is taken once for
-    /// the batch rather than once per frame, which at tens of thousands of
-    /// packets a second is the difference between a lock acquisition being
-    /// noise and being the top of the receive path in a profile. The batch
-    /// is empty after.
-    pub fn deliver<const N: usize>(&mut self, batch: &mut FrameBatch<N>) {
-        let count = core::mem::replace(&mut batch.count, 0);
-        if count == 0 {
-            return;
-        }
-        /* Each is a frame `push` took ownership of and gives up here. */
-        unsafe {
-            net::kernel_netdev_enqueue_rx_batch(self.dev, batch.frames.as_ptr(), count);
-        }
-    }
-}
-
-/* ---- the consuming side ---- */
 
 /// A network device already in the kernel's table -- `eth0` -- for a service
 /// that sends and receives over it rather than drives it. Devices live as
@@ -248,35 +55,6 @@ impl Nic {
         mac
     }
 
-    /// Give the device the addresses a lease granted it. Host byte order.
-    pub fn set_ip(&self, ip: u32) {
-        unsafe { net::kernel_net_set_ip(self.handle, ip) }
-    }
-
-    pub fn set_mask(&self, mask: u32) {
-        unsafe { net::kernel_net_set_mask(self.handle, mask) }
-    }
-
-    pub fn set_gw(&self, gw: u32) {
-        unsafe { net::kernel_net_set_gw(self.handle, gw) }
-    }
-
-    /// What to ask ARP for to reach `dst`: the gateway when `dst` is off the
-    /// subnet, `dst` itself when it is on it. Host byte order both ways.
-    pub fn route_ip(&self, dst: u32) -> u32 {
-        unsafe { net::kernel_net_route_ip(self.handle, dst) }
-    }
-
-    /// A frame the caller built whole -- Ethernet header and all -- copied
-    /// into a frame of the device's and queued. False when it was dropped.
-    ///
-    /// `transmit` is the way to send something built in a frame already;
-    /// this is for a packet assembled on the stack.
-    pub fn send_raw(&self, data: &[u8]) -> bool {
-        !data.is_empty()
-            && unsafe { net::kernel_net_send_raw(self.handle, data.as_ptr(), data.len()) } == 0
-    }
-
     /// The device, for the wrappers of other kernel calls that take one
     /// (`tcp::TcpListener::bind`).
     pub(crate) fn handle(&self) -> usize {
@@ -285,7 +63,7 @@ impl Nic {
 
     /// Every UDP datagram to `port`, handed to `cb(ctx, frame)` from the
     /// receive softirq: the frame itself, lent for the call -- `NetFrame::
-    /// retain` keeps it. Refused for a port someone else has. The listener
+    /// retain` keeps it, `NetFrame::lent` reads it. Refused for a port someone else has. The listener
     /// goes with the returned handle, once any call still running returns.
     ///
     /// cb runs on the receive path of every packet the machine gets: nothing
@@ -298,50 +76,6 @@ impl Nic {
         ctx: *mut u8,
     ) -> core::result::Result<UdpListener, ListenError> {
         match unsafe { net::kernel_net_udp_listen(self.handle, port, cb, ctx) } {
-            0 => Ok(UdpListener { nic: *self, port, ctx: ctx as usize }),
-            1 => Err(ListenError::PortTaken),
-            2 => Err(ListenError::TableFull),
-            _ => Err(ListenError::Invalid),
-        }
-    }
-
-    /// Every UDP datagram to `port`, handed to `handler` -- something that
-    /// lives for good, a service's one instance. No raw context at the call
-    /// site: `'static` is what says the handler outlives the listener, and
-    /// `Sync` what says the receive path may call it from any CPU.
-    ///
-    /// The handler runs on the receive path of every packet the machine gets:
-    /// nothing that sleeps, and nothing long.
-    pub fn listen<H: UdpHandler>(
-        &self, port: u16, handler: &'static H,
-    ) -> core::result::Result<UdpListener, ListenError> {
-        self.listen_udp(port, on_frame::<H>, handler as *const H as *mut u8)
-    }
-
-    /// As `listen`, with `UdpHandler::on_batch_end` called at the end of each
-    /// receive batch -- see `listen_udp_batched`.
-    pub fn listen_batched<H: UdpHandler>(
-        &self, port: u16, handler: &'static H,
-    ) -> core::result::Result<UdpListener, ListenError> {
-        self.listen_udp_batched(port, on_frame::<H>, on_batch_end::<H>,
-            handler as *const H as *mut u8)
-    }
-
-    /// Every UDP datagram to `port`, as `listen_udp`, and a call at the end
-    /// of each receive batch. A listener that answers from the receive path
-    /// builds its replies as the frames arrive and hands them to the NIC in
-    /// `batch_end` -- one lock and one doorbell for the batch, rather than
-    /// one of each per packet.
-    pub fn listen_udp_batched(
-        &self,
-        port: u16,
-        cb: extern "C" fn(ctx: *mut u8, frame: usize),
-        batch_end: extern "C" fn(ctx: *mut u8),
-        ctx: *mut u8,
-    ) -> core::result::Result<UdpListener, ListenError> {
-        match unsafe {
-            net::kernel_net_udp_listen_batch(self.handle, port, cb, ctx, batch_end)
-        } {
             0 => Ok(UdpListener { nic: *self, port, ctx: ctx as usize }),
             1 => Err(ListenError::PortTaken),
             2 => Err(ListenError::TableFull),
@@ -370,172 +104,6 @@ impl Nic {
         }
         unsafe { net::kernel_net_submit_tx(self.handle, frames.as_ptr(), frames.len()) }
     }
-}
-
-/// A device that can be set and cleared without a lock: what a receive path
-/// reads once a packet. Only a `Nic` ever goes in, so only a `Nic` comes out.
-pub struct AtomicNic(core::sync::atomic::AtomicUsize);
-
-impl AtomicNic {
-    pub const fn none() -> Self {
-        Self(core::sync::atomic::AtomicUsize::new(0))
-    }
-
-    pub fn set(&self, nic: Option<Nic>) {
-        self.0.store(nic.map_or(0, |nic| nic.handle), core::sync::atomic::Ordering::Release);
-    }
-
-    #[inline]
-    pub fn get(&self) -> Option<Nic> {
-        match self.0.load(core::sync::atomic::Ordering::Acquire) {
-            0 => None,
-            handle => Some(Nic { handle }),
-        }
-    }
-}
-
-/// Frames gathered to be handed over together -- to a device to transmit,
-/// one lock and one doorbell for the lot, or by a driver to the stack, one
-/// lock for the harvest -- rather than one of each per frame.
-pub struct FrameBatch<const N: usize> {
-    frames: [usize; N],
-    count: usize,
-}
-
-/// What a listener that answers from the receive path gathers its replies in.
-pub type TxBatch<const N: usize> = FrameBatch<N>;
-
-impl<const N: usize> FrameBatch<N> {
-    pub const fn new() -> Self {
-        Self { frames: [0; N], count: 0 }
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.count == N
-    }
-
-    pub fn len(&self) -> usize {
-        self.count
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.count == 0
-    }
-
-    /// Takes the frame. False, and the frame released, when there is no room.
-    pub fn push(&mut self, frame: NetFrame) -> bool {
-        if self.count == N {
-            return false;
-        }
-        self.frames[self.count] = frame.into_raw();
-        self.count += 1;
-        true
-    }
-
-    /// Everything gathered, released unsent.
-    pub fn clear(&mut self) {
-        let count = core::mem::replace(&mut self.count, 0);
-        for handle in &self.frames[..count] {
-            /* A frame `push` took ownership of, given up here. */
-            drop(unsafe { NetFrame::from_raw(*handle) });
-        }
-    }
-
-    /// Everything gathered, to the device: how many it queued. The rest it
-    /// releases, and the batch is empty either way.
-    pub fn send(&mut self, nic: &Nic) -> usize {
-        let count = core::mem::replace(&mut self.count, 0);
-        /* Each is a frame `push` took ownership of and gives up here. */
-        unsafe { nic.transmit_raw(&self.frames[..count]) }
-    }
-}
-
-impl<const N: usize> Drop for FrameBatch<N> {
-    fn drop(&mut self) {
-        self.clear();
-    }
-}
-
-/// Being inside the receive dispatch, as a value.
-///
-/// The kernel runs the receive soft IRQ on one CPU at a time, and the
-/// dispatch in it is what calls every listener. So there is one of these at
-/// a time, a handler is lent it for the length of a call, and holding it is
-/// what it means to be the only code on the receive path right now -- which
-/// is what lets `RxOwned` hand out its contents without a lock.
-pub struct RxContext {
-    _only_the_dispatch_makes_one: (),
-}
-
-/// What only the receive path touches: the replies a listener gathers during
-/// a batch, say. No lock, because the `RxContext` borrowed to reach in is
-/// the proof nobody else is there.
-pub struct RxOwned<T>(core::cell::UnsafeCell<T>);
-
-/* Reached on whichever CPU the receive soft IRQ runs on, one at a time. */
-unsafe impl<T: Send> Sync for RxOwned<T> {}
-
-impl<T> RxOwned<T> {
-    pub const fn new(value: T) -> Self {
-        Self(core::cell::UnsafeCell::new(value))
-    }
-
-    #[inline]
-    pub fn get<'a>(&'a self, _rx: &'a mut RxContext) -> &'a mut T {
-        /* There is one `RxContext` at a time and it is borrowed for as long
-         * as what is returned here lives. */
-        unsafe { &mut *self.0.get() }
-    }
-}
-
-/// What `Nic::listen` hands datagrams to.
-pub trait UdpHandler: Sync + 'static {
-    /// One datagram's frame, lent for the length of the call.
-    fn on_frame(&'static self, frame: Lent<'_>, rx: &mut RxContext);
-
-    /// The end of a receive batch, for a listener registered with
-    /// `listen_batched`: the moment to hand the NIC what was built.
-    fn on_batch_end(&'static self, _rx: &mut RxContext) {}
-}
-
-/// A frame the receive path lends a listener for the length of one call.
-pub struct Lent<'a> {
-    handle: usize,
-    _life: core::marker::PhantomData<&'a ()>,
-}
-
-impl Lent<'_> {
-    /// The frame's bytes, Ethernet header first.
-    pub fn bytes(&self) -> &[u8] {
-        /* Alive and unwritten for as long as the borrow: that is what being
-         * lent it for the call means, and `retain` -- the way to a frame
-         * that can be written -- ends the loan. */
-        unsafe { NetFrame::lent(self.handle) }
-    }
-
-    /// The frame, to keep past the call -- to answer in, where it lies. The
-    /// receive path's own reference is then not the last, and it never looks
-    /// at the bytes again.
-    pub fn retain(self) -> NetFrame {
-        unsafe { NetFrame::retain(self.handle) }
-    }
-}
-
-extern "C" fn on_frame<H: UdpHandler>(ctx: *mut u8, frame: usize) {
-    /* `ctx` is the `&'static H` that `Nic::listen` registered. */
-    let handler = unsafe { &*(ctx as *const H) };
-    /* This is the one place an `RxContext` comes from, and what makes it
-     * true: nothing but the receive dispatch is ever given this function,
-     * and the kernel runs that dispatch on one CPU at a time. */
-    let mut rx = RxContext { _only_the_dispatch_makes_one: () };
-    handler.on_frame(Lent { handle: frame, _life: core::marker::PhantomData }, &mut rx);
-}
-
-extern "C" fn on_batch_end<H: UdpHandler>(ctx: *mut u8) {
-    let handler = unsafe { &*(ctx as *const H) };
-    /* As in `on_frame`. */
-    let mut rx = RxContext { _only_the_dispatch_makes_one: () };
-    handler.on_batch_end(&mut rx);
 }
 
 /// A UDP port listened on, from `Nic::listen_udp`; given back on drop, once
@@ -571,15 +139,6 @@ pub struct NetFrame {
 impl NetFrame {
     fn raw(&self) -> usize {
         self.handle.get()
-    }
-
-    /// Allocate a new RX frame with `data_len` bytes of DMA-backed buffer.
-    /// Direction is set to Rx. `Length` is initialised to 0; call `set_len`
-    /// after the hardware fills the buffer.
-    /// Returns `None` on allocation failure.
-    pub fn alloc_rx(data_len: usize) -> Option<Self> {
-        let h = unsafe { net::kernel_netframe_alloc_rx(data_len) };
-        core::num::NonZeroUsize::new(h).map(|handle| Self { handle })
     }
 
     /// A frame to transmit, room for `data_len` bytes: from the frame pool --

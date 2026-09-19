@@ -16,7 +16,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
-use kcore::net::{AtomicNic, Lent, Nic, RxContext, RxOwned, TxBatch, UdpHandler, UdpListener};
+use crate::nic::{AtomicNic, Lent, Nic, RxContext, RxOwned, TxBatch, UdpHandler, UdpListener};
 use kcore::percpu::{ConstInit, LocalCounter, PerCpu};
 use kcore::sync::PreemptSpinLock;
 use kcore::task::TaskHandle;

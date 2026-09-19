@@ -27,12 +27,14 @@
 #![no_std]
 extern crate alloc;
 
+use alloc::boxed::Box;
+
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use kcore::net::{NetBinding, NetDriver, RxQueue, TxQueue};
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
-use kcore::{trace, dma, io, interrupt, net, pci, softirq};
+use kcore::{trace, dma, io, interrupt, pci, softirq};
+use net::{Frame, NetDriver, RxQueue, TxQueue};
 
 mod desc;
 mod regs;
@@ -181,9 +183,9 @@ fn init_device(pci_dev: &pci::PciDevice) {
         }
     };
 
-    /* --- Fill RX ring with pre-allocated NetFrame buffers --- */
+    /* --- Fill RX ring with pre-allocated frame buffers --- */
     for i in 0..RING_SIZE {
-        match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+        match Frame::alloc_rx(RX_BUF_SIZE) {
             Some(frame) => rx_ring.post(i, frame),
             None => {
                 trace!(0, "r8168: RX frame alloc failed at slot {}", i);
@@ -242,18 +244,17 @@ fn init_device(pci_dev: &pci::PciDevice) {
     let name = write_device_name(&mut name_buf, idx);
 
     /* The device goes where it will stay, so that the interrupt handler has
-     * somewhere to be pointed at; the rings go with it, each to the one path
-     * that will be handed it.  Nothing calls into any of it until the
-     * interrupt is registered and, last of all, the net layer is told. */
-    let binding = NetBinding::new(R8168Device {
+     * somewhere to be pointed at; the rings stay here until the net layer is
+     * told, last of all, and become its to lend -- each to the one path that
+     * touches it.  Nothing calls into any of it until then. */
+    let dev: &'static R8168Device = Box::leak(Box::new(R8168Device {
         regs,
         _bar_mapping: bar_mapping,
         irq:        IrqSpinLock::new(None),
         tx_packets: AtomicU64::new(0),
         rx_packets: AtomicU64::new(0),
         rx_dropped: AtomicU64::new(0),
-    }, tx_ring, rx_ring);
-    let dev = binding.driver();
+    }));
 
     /* --- Register legacy interrupt --- */
     let irq = match interrupt::LegacyInterrupt::register_level_for(pci_dev, dev, isr) {
@@ -274,7 +275,7 @@ fn init_device(pci_dev: &pci::PciDevice) {
     dev.regs.write16(INTR_MASK, INTR_MASK_BITS);
 
     /* --- Register as NetDevice --- */
-    if binding.register(name, mac).is_none() {
+    if net::register(name, mac, dev, tx_ring, rx_ring).is_none() {
         trace!(0, "r8168: NetDevice registration failed");
         dev.quiesce();
         return;
@@ -456,11 +457,11 @@ impl NetDriver for R8168Device {
         loop {
             let idx = ring.head();
 
-            /* Refill a slot left empty by an earlier NetFrame allocation
+            /* Refill a slot left empty by an earlier frame allocation
              * failure.  The hardware stalls on a descriptor it does not own,
              * so RX cannot make progress until the slot is reposted. */
             if ring.is_empty_slot(idx) {
-                match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+                match Frame::alloc_rx(RX_BUF_SIZE) {
                     Some(frame) => ring.post(idx, frame),
                     None => break, /* still no memory; retry on next softirq */
                 }
@@ -492,7 +493,7 @@ impl NetDriver for R8168Device {
             up.enqueue(frame);
 
             /* Refill the slot we just harvested */
-            match net::NetFrame::alloc_rx(RX_BUF_SIZE) {
+            match Frame::alloc_rx(RX_BUF_SIZE) {
                 Some(new_frame) => ring.post(idx, new_frame),
                 None => {
                     /* Memory pressure: leave the slot empty; the refill at the
