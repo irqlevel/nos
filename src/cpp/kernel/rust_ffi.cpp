@@ -798,23 +798,6 @@ void kernel_pci_write_config32(unsigned short bus, unsigned short slot,
 
 /* ---- MSI-X ---- */
 
-class RustMsixHandler : public Kernel::InterruptHandler
-{
-public:
-    Kernel::InterruptHandlerFn Stub;
-
-    void OnInterruptRegister(u8 irq, u8 vector) override
-    {
-        (void)irq;
-        (void)vector;
-    }
-
-    Kernel::InterruptHandlerFn GetHandlerFn() override
-    {
-        return Stub;
-    }
-};
-
 static Pci::DeviceInfo* FindPciDevByBdf(unsigned short bus, unsigned short slot,
     unsigned short func)
 {
@@ -855,17 +838,6 @@ void kernel_msix_destroy(unsigned long handle)
     auto* t = reinterpret_cast<Kernel::MsixTable*>(handle);
     t->~MsixTable();
     Kernel::Mm::Free(t);
-}
-
-unsigned char kernel_msix_enable_vector(unsigned long handle, unsigned short index,
-    void (*isr_fn)())
-{
-    if (handle == 0 || !isr_fn)
-        return 0;
-    auto* t = reinterpret_cast<Kernel::MsixTable*>(handle);
-    RustMsixHandler adapter;
-    adapter.Stub = isr_fn;
-    return t->EnableVector(index, adapter);
 }
 
 void kernel_msix_mask(unsigned long handle, unsigned short index)
