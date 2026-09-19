@@ -37,8 +37,10 @@ into the kernel: the build links `out/$(ARCH)/pass1.elf`, runs `nm` over it
 to generate `out/$(ARCH)/symtab_data.cpp`, and then links the final ELF (the
 `symtab_data` rules in the `Makefile`). The table of functions a loadable
 module may call is made from the same first pass
-([Loadable modules](modules.md#what-a-module-may-call)). Anything that
-touches the link or symbol resolution has to keep both passes working.
+([Loadable modules](modules.md#what-a-module-may-call)). Pass 1 links
+against empty weak stand-ins for both tables, in `kernel/pass1_tables.cpp`,
+a file that indexes neither. Anything that touches the link or symbol
+resolution has to keep both passes working.
 
 ## No network during a build
 
@@ -86,6 +88,51 @@ make nocheck ARCH=aarch64
 ```
 
 This produces `kernel-arm64.elf` and `nos-arm64.img` (Linux `Image` format, bootable with QEMU `-kernel`).
+
+## UBSan
+
+`make nocheck UBSAN=1` (either `ARCH`) builds the kernel's C++ with clang's
+undefined-behaviour sanitizer: a check in front of every operation the
+language leaves undefined -- a shift past the width, signed overflow, an index
+past a bound the compiler knows, a null or misaligned access, a `bool` or an
+`enum` holding no valid value, falling off the end of a function -- which calls
+the handlers in `kernel/ubsan.cpp` when it fails. The Rust and the assembly
+are not instrumented. The images keep their names, and the build is a flavour
+of its own: its objects are in `out/$(ARCH)-ubsan/`, and a switch of flavour
+relinks the final images (a stamp in `out/` records which they are), so a
+plain build never leaves an instrumented kernel behind, or the other way
+round. `version` says `+ubsan`.
+
+The first report is a panic, with the site:
+
+    PANIC:Report():ubsan.cpp,267: UBSAN: shift exponent 64 is too large for 64-bit type 'unsigned long' at src/cpp/...
+
+which makes every gate a UB check over the code it drives: build with
+`UBSAN=1`, and run the gate on the images as they are (`--skip-build` where it
+builds). CI boots it on both architectures, after everything else. To collect
+every report of a boot instead, boot with `ubsan=warn`: each site reports
+once, with a backtrace, and the kernel goes on. A report goes out through the
+writers the panic path uses -- the serial port, polled, and the disk log --
+and not through the kernel log or the netconsole, which take locks: a check
+can fail inside an NMI, or on a CPU that holds one of them.
+
+What its first boots found, all in code that had passed every gate:
+
+- `CONTAINING_RECORD` and `OFFSET_OF` were `&((type*)0)->field`, a member
+  access through a null pointer. They are `__builtin_offsetof` now.
+- On x86 `Hal::RunOnStack` entered the boot and idle bodies with RSP 8 off the
+  ABI's 16-byte boundary, and chasing that found the same in every exception
+  stub under an error code, `#GP` and `#PF` among them. Nothing had faulted
+  because the kernel uses no SSE. The stubs pad now, and NASM refuses to
+  assemble them if the frame sizes stop adding up.
+- The empty weak tables pass 1 links against were defined in the files that
+  index them, which made every index out of bounds of a `T[0]`.
+- On arm64 the BSP's boot stack ran off its end into the identity tables below
+  it, which every AP walks as it turns its MMU on: each AP took a translation
+  fault with no vector to go to, and was only ever "still not running". The
+  plain build had 248 bytes of its 16 KiB to spare. It has 32 KiB now, as on
+  x86, and a guard page between it and the tables, which `CpuTable::StartAll`
+  checks before it starts an AP.
 
 ## Disk image
 

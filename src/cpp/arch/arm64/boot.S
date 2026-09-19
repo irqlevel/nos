@@ -323,9 +323,22 @@ BootPgTblIdL0:
     .space 4096
 BootPgTblIdL1:
     .space 4096
+    /* A page of nothing between the boot stack and the identity tables above
+       -- which each AP walks the moment it turns its MMU on. MainArm64 fills
+       it with the stack probe's pattern and CpuTable::StartAll checks it
+       before starting any AP, so a boot stack that runs off its end is a
+       panic, not an identity table zeroed under an AP that then dies with no
+       vector to fault to. That is how it showed first: a UBSan build's
+       deeper frames overran the 16 KiB this stack had, and every AP was
+       "still not running" (docs/build.md). */
+    .globl BootStackGuard
+BootStackGuard:
+    .space 4096
+    /* 32 KiB, as x86's boot stacks: the boot path takes ~16 KiB on both, and
+       it had 248 bytes to spare here. */
     .globl BootStack
 BootStack:
-    .space 16384
+    .space 32768
     .globl BootStackTop
 BootStackTop:
     .globl Arm64ApTtbr1

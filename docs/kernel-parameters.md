@@ -60,6 +60,7 @@ the disk image, and `dhcp=auto dns=on udpshell=9000 root=auto` on arm64.
 
 - `wxprobe=text` (also `wxprobe=on`) — after the kernel image has been split into text RX / rodata RO+NX / data RW+NX, deliberately write to `.text`. The machine should die with a page fault (x86-64) or a data abort (arm64); a `W^X probe: text write SUCCEEDED` line means the protection is not doing its job. See [Paging](paging.md)
 - `wxprobe=heap` — once the page allocator is up, call into a page it just handed out. Every runtime mapping is non-executable, so the machine should die on the instruction fetch; a `W^X probe: heap execute SUCCEEDED` line means W^X covers the kernel image and nothing else
+- `ubsan=warn` — in a `UBSAN=1` build, print every undefined-behaviour report (each site once, with a backtrace, to the serial port and the disk log) and go on, instead of panicking on the first; see [Build](build.md#ubsan). Checks that fail before the command line is read still panic
 
 ## Bisecting a boot failure
 

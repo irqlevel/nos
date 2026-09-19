@@ -1,4 +1,5 @@
 #include "trace.h"
+#include "ubsan.h"
 #include "panic.h"
 #include "debug.h"
 #include "atomic.h"
@@ -951,6 +952,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     }
 
     Trace(0, "After test");
+    Ubsan::Announce();
     Screen::Printf("Self test complete, error %u\n", (ulong)err.GetCode());
 
     auto& pci = Pci::GetInstance();
