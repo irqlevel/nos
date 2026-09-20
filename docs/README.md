@@ -1,7 +1,7 @@
 # nos documentation
 
 - [Features](features.md) — everything the kernel does today, by subsystem
-- [Build](build.md) — native and Docker builds, arm64, the disk image, BIOS vs. UEFI on the ISO
+- [Build](build.md) — native and Docker builds, arm64, the undefined-behaviour flavours (`UBSAN=1` for the C++, `RUSTUB=1` for the Rust), the disk image, BIOS vs. UEFI on the ISO
 - [Run](run.md) — QEMU on x86-64 (KVM, TCG, OVMF) and arm64 (HVF), Google Cloud
 - [Real hardware](real-hardware.md) — the Dell Latitude 5480 laptop and the Hetzner EX44 (Intel) and AX41 (AMD) servers
 - [Debug](debug.md) — GDB, getting a log off a box with no serial port
