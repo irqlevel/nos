@@ -67,15 +67,20 @@ and exit 0 only if every check passed. Most are arm64 only, because they
 drive the shell over UDP and the arm64 boot is the one whose command line
 carries `udpshell=`; the code they test is the same on either architecture.
 
-Every one of them is also a check for undefined behaviour in the C++ it
-drives, when the kernel it boots is a `UBSAN=1` build
-([Build](build.md#ubsan)): the first undefined operation is a panic naming
-its site, which every gate fails on. CI boots one on both architectures after
-the rest; after touching C++, run the gate that covers it on one too. A UB
-report is nothing a plain build would show -- the first boots of it found a
-null member access in `CONTAINING_RECORD`, stacks 8 off the ABI's alignment
-and an arm64 boot stack that overran the page tables below it, all under
-gates that passed.
+Every one of them is also a check for undefined behaviour in the code it
+drives, when the kernel it boots is built with the checks on: `UBSAN=1` for
+the C++ ([Build](build.md#ubsan)) and `RUSTUB=1` for the Rust
+([Build](build.md#rust-ub-checks)), separately or together. The first
+undefined operation, and the first unsafe precondition `core` finds
+violated, is a panic naming its site, which every gate fails on. CI builds
+with both and boots it on both architectures after the rest; after touching
+C++ or Rust, run the gate that covers it on such a build too. A report is
+nothing a plain build would show -- the first UBSan boots found a null
+member access in `CONTAINING_RECORD`, stacks 8 off the ABI's alignment and
+an arm64 boot stack that overran the page tables below it, all under gates
+that passed, and the first `RUSTUB=1` run found the kernel dropping a log
+line too long for its buffer instead of truncating it, which had been
+swallowing panic messages whole.
 
 | Gate | Arch | Run it after touching |
 |---|---|---|
