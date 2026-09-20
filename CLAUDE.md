@@ -44,6 +44,7 @@ make smoke      # boot smoke test: build in Docker + headless QEMU, assert seria
 make clean
 make nocheck ARCH=aarch64   # arm64 -> kernel-arm64.elf + nos-arm64.img
 make nocheck UBSAN=1        # the C++ under clang's UB sanitizer, either ARCH: the first report is a panic
+make nocheck RUSTUB=1       # the Rust half under core's own checks of its unsafe preconditions, and overflow
 ```
 
 The build is parameterized by `ARCH` (default `x86_64`; `aarch64` selects the arm64 toolchain, linker script and Rust target), and objects live in `out/$(ARCH)/`. What the Makefile will not tell you (`docs/build.md` has each at length):
@@ -57,7 +58,7 @@ The build is parameterized by `ARCH` (default `x86_64`; `aarch64` selects the ar
 
 ### Gates
 
-**Every refactor step must keep `./scripts/smoke-test.sh` green** (markers `After test` → `Preempt is now on` → `boot: complete`, fail-fast on `PANIC:`; `scripts/smoke-arm64.sh` is the arm64 equivalent, `SMOKE_HVF=1` for HVF; both take `--skip-build`). **Gate on exit codes, never on grepping output.** The x86 smoke boot attaches virtio-blk (modern), virtio-scsi (legacy), NVMe, virtio-net and virtio-rng, so it covers the Rust/MSI-X path too. CI boots a `UBSAN=1` build on both architectures as well (docs/build.md): there, and under any gate run on one, the first undefined operation in the C++ is a panic naming its site.
+**Every refactor step must keep `./scripts/smoke-test.sh` green** (markers `After test` → `Preempt is now on` → `boot: complete`, fail-fast on `PANIC:`; `scripts/smoke-arm64.sh` is the arm64 equivalent, `SMOKE_HVF=1` for HVF; both take `--skip-build`). **Gate on exit codes, never on grepping output.** The x86 smoke boot attaches virtio-blk (modern), virtio-scsi (legacy), NVMe, virtio-net and virtio-rng, so it covers the Rust/MSI-X path too. CI boots a `UBSAN=1 RUSTUB=1` build on both architectures as well (docs/build.md): there, and under any gate run on one, the first undefined operation in the C++, and the first unsafe precondition `core` finds violated in the Rust, is a panic naming its site.
 
 What a smoke boot cannot notice has a test of its own, each there for a failure that looks like success; when you meet another such failure, write another. Run the one that covers what you touched (`docs/testing.md` says what each does and why it exists):
 
