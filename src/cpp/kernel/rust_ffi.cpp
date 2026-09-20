@@ -227,7 +227,10 @@ void kernel_free(void* ptr, unsigned long size, unsigned long align)
 
 [[noreturn]] void kernel_panic(const unsigned char* msg, unsigned long len)
 {
-    char buf[256];
+    /* Big enough for a panic from a UB check, whose message alone runs past
+       200 characters; what does not fit is truncated here and marked by
+       VsnPrintf below. */
+    char buf[512];
     unsigned long n = (len < sizeof(buf) - 1) ? len : sizeof(buf) - 1;
     Stdlib::MemCpy(buf, msg, n);
     buf[n] = '\0';
