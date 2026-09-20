@@ -145,6 +145,53 @@ What its first boots found, all in code that had passed every gate:
   x86, and a guard page between it and the tables, which `CpuTable::StartAll`
   checks before it starts an AP.
 
+## Rust UB checks
+
+`make nocheck [ARCH=aarch64] RUSTUB=1` is the other half of the same idea,
+for the half of the kernel UBSan cannot reach: rustc has no undefined-
+behaviour sanitizer (`-Zsanitizer=` has no `undefined`), but `core` checks
+the preconditions of its own unsafe operations when `-Zub-checks` is on --
+an unaligned or null pointer in `ptr::read`/`write`, an overlapping
+`copy_nonoverlapping`, a `slice::from_raw_parts` whose pointer or length is
+wrong, `get_unchecked` past the end, `NonNull::new_unchecked(null)`,
+`unreachable_unchecked` -- and `-Coverflow-checks` catches arithmetic that
+wraps where it was not meant to. The flag turns both on by building the
+`release` profile with `debug-assertions` (which `-Zub-checks` follows) and
+`overflow-checks`, through cargo's `--config`; it must go through the
+profile and not `RUSTFLAGS`, which would replace the per-target rustflags in
+`src/rust/.cargo/config.toml` and drop `-Ccode-model=large`, the frame
+pointers and the crates' software-backend cfgs. `-Z build-std` puts the
+checks inside `core` as well as this tree's crates: the staticlib grows from
+about 12 MB to about 16 MB.
+
+A failed check is a panic through the kernel's `#[panic_handler]`, naming
+the precondition and the line:
+
+    RUST PANIC: panicked at kernel/src/lib.rs:122:25:
+    unsafe precondition(s) violated: slice::get_unchecked requires that the
+    index is within the slice
+
+which makes every gate a check over the Rust it drives, exactly as `UBSAN=1`
+does over the C++; the two are independent and can be set together.
+`version` says `+rustub`. What it is not: an analysis of *your* `unsafe`.
+A raw pointer dereferenced past its object, two `&mut` to the same place,
+a read of uninitialised memory, a data race -- none of those are checked
+here. Miri is what checks them, and it cannot run a kernel: for the crates
+with no kernel in them (`netwire`, `ssh`) it can run over their host tests.
+
+The flavour is recorded like UBSan's, in `out/flavor-$(ARCH)`, and both the
+Rust staticlib and every `.ko` depend on that stamp: unlike the C++ objects
+they have one place to live, so a switch of either flag rebuilds them and
+relinks the image rather than leaving yesterday's instrumented `libkernel.a`
+in place.
+
+The first full run over the network gates (2026-09-20, both architectures)
+reported nothing: no precondition and no overflow in the block layer, the
+network layer, the drivers or the modules. What it did find was in the
+kernel's own C++: the panic it raised printed no reason, because a log line
+longer than its buffer was dropped whole rather than truncated
+([Debug](debug.md)).
+
 ## Disk image
 
 Build a bootable qcow2 disk image (MBR, one ext2 partition labelled `nos`
