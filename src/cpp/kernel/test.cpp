@@ -1966,6 +1966,40 @@ Stdlib::Error TestSnPrintf()
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
+    /* More than the buffer holds is truncated and marked, never dropped: a
+       %s that did not fit used to take the whole line with it, and Trace
+       threw away every line that reported the overflow -- which is how a
+       Rust panic reached the console as "RUST PANIC: " and nothing else. */
+    char small[8];
+    rc = Stdlib::SnPrintf(small, sizeof(small), "ab%s", "cdefghij");
+    if (rc != 7 || Stdlib::StrCmp(small, "abcd...") != 0)
+    {
+        Trace(0, "TestSnPrintf: long %%s not truncated: '%s' (%d)", small, rc);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(small, sizeof(small), "abcdefghij");
+    if (rc != 7 || Stdlib::StrCmp(small, "abcd...") != 0)
+    {
+        Trace(0, "TestSnPrintf: long text not truncated: '%s' (%d)", small, rc);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    rc = Stdlib::SnPrintf(small, sizeof(small), "%u", (ulong)123456789);
+    if (rc != 7 || Stdlib::StrCmp(small, "1234...") != 0)
+    {
+        Trace(0, "TestSnPrintf: long %%u not truncated: '%s' (%d)", small, rc);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Exactly the buffer, terminator included: no mark, nothing lost. */
+    rc = Stdlib::SnPrintf(small, sizeof(small), "abcdefg");
+    if (rc != 7 || Stdlib::StrCmp(small, "abcdefg") != 0)
+    {
+        Trace(0, "TestSnPrintf: exact fit failed: '%s' (%d)", small, rc);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
     Trace(0, "TestSnPrintf: complete");
     return MakeSuccess();
 }

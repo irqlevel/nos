@@ -56,7 +56,10 @@ private:
     void DumpBacktrace(ulong* frames, size_t count);
     void DumpModules();
 
-    char Message[256];
+    /* 512, not 256: a Rust panic's text is "panicked at <file>:<line>:" and
+       the message, and an undefined-behaviour check's message alone is over
+       200 characters (RUSTUB=1, docs/build.md). */
+    char Message[512];
     Atomic Active;
 
     Atomic Collecting;

@@ -52,7 +52,12 @@ void Tracer::Output(const char *fmt, ...)
     int size = Stdlib::VsnPrintf(msg, sizeof(msg), fmt, args);
     va_end(args);
 
-    if (size < 0)
+    /* A line longer than the buffer comes out truncated, with "..." where it
+       was cut (VsnPrintf), and is printed: dropping it lost exactly the
+       reports worth reading, a Rust panic's message among them. Only a
+       format string this code got wrong still returns -1, and even then
+       whatever was formatted before it is printed if there is any. */
+    if (size < 0 && msg[0] == '\0')
         return;
 
     Dmesg::GetInstance().PrintString(msg);

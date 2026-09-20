@@ -102,6 +102,32 @@ static void TerminateOnError(char *s, size_t size, size_t pos)
     s[pos] = '\0';
 }
 
+/* The buffer filled up before the format string ran out: keep what fits,
+   mark the cut with "..." so a reader can see the line is not all of it, and
+   report the length written. The alternative -- what this did until a Rust
+   panic came out as "RUST PANIC: " and nothing else -- was to return -1 and
+   leave the caller to decide, which cost the whole line: the %s conversion
+   dropped its entire argument rather than part of it, and Tracer::Output
+   dropped every line that reported -1. The reports that overflow a buffer
+   are the long ones, which is to say the ones worth reading. */
+static int TruncateAt(char *s, size_t size, size_t pos)
+{
+    if (size == 0)
+        return 0;
+    if (pos >= size)
+        pos = size - 1;
+
+    static const size_t MarkLen = 3;    /* "..." */
+    /* Where the mark has to start for both it and the NUL to fit. */
+    size_t mark = (size - 1 > MarkLen) ? size - 1 - MarkLen : 0;
+    if (pos > mark)
+        pos = mark;
+    while (pos < size - 1 && pos < mark + MarkLen)
+        s[pos++] = '.';
+    s[pos] = '\0';
+    return (int)pos;
+}
+
 int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
 {
     size_t i;
@@ -124,7 +150,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
             /* Literal %% */
             if (tp == '%') {
                 if (!PutChar('%', s, size, pos++))
-                    { TerminateOnError(s, size, (size_t)pos); return -1; }
+                    return TruncateAt(s, size, (size_t)pos);
                 i++;
                 continue;
             }
@@ -186,17 +212,17 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 if (!leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
-                        { TerminateOnError(s, size, (size_t)pos); return -1; }
+                        return TruncateAt(s, size, (size_t)pos);
                 }
                 if (leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 break;
@@ -214,35 +240,35 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                     if (negative && zeroPad) {
                         /* Sign before zero padding: -00042 */
                         if (!PutChar('-', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                         for (int p = 0; p < width - totalLen; p++) {
                             if (!PutChar('0', s, size, pos++))
-                                { TerminateOnError(s, size, (size_t)pos); return -1; }
+                                return TruncateAt(s, size, (size_t)pos);
                         }
                     } else {
                         for (int p = 0; p < width - totalLen; p++) {
                             if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                                { TerminateOnError(s, size, (size_t)pos); return -1; }
+                                return TruncateAt(s, size, (size_t)pos);
                         }
                         if (negative) {
                             if (!PutChar('-', s, size, pos++))
-                                { TerminateOnError(s, size, (size_t)pos); return -1; }
+                                return TruncateAt(s, size, (size_t)pos);
                         }
                     }
                 } else {
                     if (negative) {
                         if (!PutChar('-', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
-                        { TerminateOnError(s, size, (size_t)pos); return -1; }
+                        return TruncateAt(s, size, (size_t)pos);
                 }
                 if (leftAlign) {
                     for (int p = 0; p < width - totalLen; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 break;
@@ -257,17 +283,17 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 if (!leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
-                        { TerminateOnError(s, size, (size_t)pos); return -1; }
+                        return TruncateAt(s, size, (size_t)pos);
                 }
                 if (leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 break;
@@ -284,17 +310,17 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 if (!leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(zeroPad ? '0' : ' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 for (int j = 0; j < rc; j++) {
                     if (!PutChar(tmp[j], s, size, pos++))
-                        { TerminateOnError(s, size, (size_t)pos); return -1; }
+                        return TruncateAt(s, size, (size_t)pos);
                 }
                 if (leftAlign) {
                     for (int p = 0; p < width - rc; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 break;
@@ -302,7 +328,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
             case 'c': {
                 int val = va_arg(arg, int);
                 if (!PutChar(val & 0xFF, s, size, pos++))
-                    { TerminateOnError(s, size, (size_t)pos); return -1; }
+                    return TruncateAt(s, size, (size_t)pos);
                 break;
             }
             case 's': {
@@ -313,17 +339,22 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 if (!leftAlign) {
                     for (int p = 0; p < width - (int)val_len; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
-                if (val_len > (size - pos))
-                    { TerminateOnError(s, size, (size_t)pos); return -1; }
+                /* Room for the string and the NUL after it; what does not
+                   fit is truncated, never dropped (TruncateAt). */
+                size_t room = ((size_t)pos + 1 < size) ? size - (size_t)pos - 1 : 0;
+                if (val_len > room) {
+                    MemCpy(&s[pos], val, room);
+                    return TruncateAt(s, size, (size_t)pos + room);
+                }
                 MemCpy(&s[pos], val, val_len);
                 pos += val_len;
                 if (leftAlign) {
                     for (int p = 0; p < width - (int)val_len; p++) {
                         if (!PutChar(' ', s, size, pos++))
-                            { TerminateOnError(s, size, (size_t)pos); return -1; }
+                            return TruncateAt(s, size, (size_t)pos);
                     }
                 }
                 break;
@@ -333,13 +364,13 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
             }
         } else
             if (!PutChar(t, s, size, pos++))
-                { TerminateOnError(s, size, (size_t)pos); return -1; }
+                return TruncateAt(s, size, (size_t)pos);
     }
 
     /* NUL-terminate but do not count the terminator: the return value is the
        length of the formatted string (standard vsnprintf semantics). */
     if (!PutChar('\0', s, size, pos))
-        { TerminateOnError(s, size, (size_t)pos); return -1; }
+        return TruncateAt(s, size, (size_t)pos);
 
     return pos;
 }
