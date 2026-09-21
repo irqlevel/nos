@@ -18,7 +18,7 @@ void RwMutex::ReadLock()
     {
         if (WriterWaiting.Get() != 0)
         {
-            Schedule();
+            YieldToRunnable();
             continue;
         }
 
@@ -30,13 +30,13 @@ void RwMutex::ReadLock()
             if (WriterWaiting.Get() != 0)
             {
                 Value.Dec();
-                Schedule();
+                YieldToRunnable();
                 continue;
             }
             break;
         }
 
-        Schedule();
+        YieldToRunnable();
     }
 }
 
@@ -53,7 +53,7 @@ void RwMutex::WriteLock()
         if (Value.Cmpxchg(-1, 0) == 0)
             break;
 
-        Schedule();
+        YieldToRunnable();
     }
 }
 

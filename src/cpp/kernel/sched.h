@@ -69,6 +69,19 @@ private:
 };
 
 
+/* The reschedule for a task that has already taken itself out of the walk:
+   blocked (Event::Wait), exited (Task::Exit), or sleeping long enough that
+   halting the CPU cannot overshoot the deadline (Sleep). When nothing else
+   is runnable the CPU goes to the idle task, which halts it until the next
+   interrupt that CPU itself takes -- often nothing nearer than its tick.
+
+   A task that is still runnable must not poll here. Nothing wakes it: the
+   thing it waits for is a store or a counter in somebody else's interrupt
+   handler, with no waiter to unblock and no IPI to send, so it waits out the
+   tick with its work already done. Poll with YieldToRunnable(), which gives
+   the CPU to any other runnable task but never to the idle one. Every wait
+   primitive here does -- WaitGroup, Mutex, RwMutex -- and the one time each
+   of them did not, it cost a tick per wait (see WaitGroup::Wait). */
 void Schedule();
 
 /* The reschedule an interrupt asks for -- the tick's and every IPI's: the CPU

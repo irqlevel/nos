@@ -76,6 +76,7 @@ What a smoke boot cannot notice has a test of its own, each there for a failure 
 | the receive path, the frame pool, `modules/netload`, a module's UDP listener in `kcore::net`, the tick's receive poll (`rxpoll`) | `netload-test.py` (arm64; about seven minutes, by design), and `--arch x86_64`, its short form, after touching the module ABI |
 | `drivers/igb`, the driver seam in `net/src/device.rs` | `tcp-test.py --nic igb` and `netload-test.py --nic igb`: QEMU's 82576, the only way a hardware NIC driver runs anywhere but on a Hetzner box (QEMU 8.0 or later; CI's does not have it, so by hand) |
 | `drivers/usb/` | `usb-test.py` (x86-64): types at the kernel through QEMU's monitor |
+| a wait primitive (`WaitGroup`, `Mutex`, `RwMutex`), the scheduler's choice of the idle task | `idle-wait-test.py` (x86-64, needs 12+ CPUs and KVM): a qd=1 read on a machine whose other CPUs are idle. No smoke boot can see this -- it has more polling tasks than CPUs, so nothing ever reaches idle |
 | `drivers/r8168`, `drivers/r8125` | nothing emulates them: the compiler, then the EX44, whose only console is that NIC -- **keep their register sequences as they are** |
 
 ### Running and debugging

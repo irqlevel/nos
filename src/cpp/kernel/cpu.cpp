@@ -364,7 +364,13 @@ void CpuTable::SendTlbIPI(ulong cpuMask, IPITask tasks[MaxCpus])
                 break;
             }
 
-            Schedule();
+            /* YieldToRunnable, not Schedule: the ack comes from the remote
+               CPU's IPI handler, which has no reason to interrupt this one.
+               Handing this CPU to the idle task therefore halts it until its
+               own next tick, and a shootdown that the other CPUs answered in
+               microseconds took a whole one -- on the path every Mm::Free
+               with a mapping to drop goes down (see WaitGroup::Wait). */
+            YieldToRunnable();
         }
     }
 

@@ -95,6 +95,7 @@ swallowing panic messages whole.
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
+| `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
 
@@ -259,6 +260,34 @@ not: that the module loads and binds there, that its calls across the C ABI
 come back right where the ABI is the other one -- two of them return a
 structure by value -- and that the target echoes and the source's run
 arrives whole. Both forms take `--nic igb`.
+
+### `idle-wait-test.py` -- a wait that costs a tick
+
+Boots with more CPUs than the kernel has busy tasks and runs `blkload` at
+`qd=1`: one worker, one I/O in flight, every other CPU with nothing to run.
+Asserts the read comes back in well under a tick.
+
+It is here because of what the wait primitives used to do. A task waiting for
+another CPU's interrupt -- a synchronous block read, a mutex, the TLB
+shootdown's acks -- polls, and polling with `Schedule()` lets the scheduler
+hand the CPU to the idle task, which halts it. What such a task waits for is a
+counter or a store in an interrupt handler: no waiter to unblock, no IPI to
+send, so nothing brings the CPU back before its own next tick. The work was
+done microseconds in and the wait cost 10 ms, every time.
+
+Every other gate is blind to it, which is the point of having this one. The
+precondition is a CPU with *nothing else runnable*, and a smoke boot has more
+polling tasks -- shell, udpsh, dhcp, netconsole, usb -- than CPUs, so
+`Schedule()` never reaches the idle task and every latency looks right. The
+same unfixed kernel reads at 45k IOPS at `-smp 4` and at 98 IOPS at `-smp 16`.
+It was found on a 12-CPU Hetzner AX41 and nowhere else, after two earlier
+sightings of the same shape (`a171a86`, `ce3087c`) left the primitives
+themselves unconverted.
+
+There is nothing to tune: the bug puts `p50` at exactly one tick (10223 us at
+100 Hz), the fix puts it at ~22 us under KVM. Needs `/dev/kvm` and a host with
+at least 12 CPUs, and refuses to report a pass without them -- a gate that
+cannot fail is worse than no gate.
 
 ### `usb-test.py` -- typing at the kernel
 
