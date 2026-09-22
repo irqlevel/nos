@@ -324,18 +324,69 @@ pub enum NotRun {
     FiveLevelPaging { cpu: u32 },
 }
 
+/// The guest's x87, MMX and SSE registers, in FXSAVE's format: what
+/// `vmrun` does not switch, and so what [`Guest::run`] does, on every entry
+/// and exit. The host uses none of these registers -- its C++ is built
+/// without SSE and x87, its Rust is soft-float -- but other guests do, and a
+/// guest's CPU is a task that may be on another CPU each time it enters.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+pub struct FxArea(pub [u8; FX_AREA_BYTES]);
+
+pub const FX_AREA_BYTES: usize = 512;
+/// Where FXSAVE keeps the x87 control word and MXCSR.
+const FX_FCW: usize = 0;
+const FX_MXCSR: usize = 24;
+/// Their values out of reset.
+const FCW_RESET: u16 = 0x0040;
+const MXCSR_RESET: u32 = 0x1F80;
+
+impl FxArea {
+    /// The registers as a CPU comes out of reset: everything zero but the
+    /// control word and MXCSR.
+    pub fn reset() -> Self {
+        let mut a = [0u8; FX_AREA_BYTES];
+        a[FX_FCW..FX_FCW + 2].copy_from_slice(&FCW_RESET.to_le_bytes());
+        a[FX_MXCSR..FX_MXCSR + 4].copy_from_slice(&MXCSR_RESET.to_le_bytes());
+        Self(a)
+    }
+}
+
+/// XCR0 while a guest runs: x87 alone. `vmrun` does not switch XCR0, and a
+/// guest is given no XSAVE (the CPUID policy in `hv` hides it), so what it
+/// may use of the extended state is nothing -- AVX and above fault in it
+/// even should it turn CR4.OSXSAVE on itself, and no register the host
+/// does not switch holds anything of another guest's.
+const GUEST_XCR0: u64 = 1;
+
 /// A guest's CPU as SVM keeps it: the VMCB, the registers `vmrun` leaves to
-/// software, and the page the host's own FS, GS, TR, LDTR and syscall MSRs
-/// wait in while the guest runs.
+/// software, the page the host's own FS, GS, TR, LDTR and syscall MSRs
+/// wait in while the guest runs, and the x87 and SSE state.
 pub struct Guest {
     vmcb: VmcbPage,
     host: VmcbPage,
     regs: GuestRegs,
+    /// One element, on the heap: a `Vec` because it can be made fallibly.
+    fx: alloc::vec::Vec<FxArea>,
+    xsave: bool,
 }
 
 impl Guest {
     pub fn new() -> Result<Self> {
-        Ok(Self { vmcb: VmcbPage::new()?, host: VmcbPage::new()?, regs: GuestRegs::default() })
+        let mut fx = alloc::vec::Vec::new();
+        fx.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
+        fx.push(FxArea::reset());
+        Ok(Self {
+            vmcb: VmcbPage::new()?,
+            host: VmcbPage::new()?,
+            regs: GuestRegs::default(),
+            fx,
+            xsave: cpu::has_xsave(),
+        })
+    }
+
+    pub fn fx(&self) -> &FxArea {
+        &self.fx[0]
     }
 
     pub fn vmcb(&self) -> &Vmcb {
@@ -410,6 +461,8 @@ impl Guest {
         let guest = self.vmcb.phys();
         let host = self.host.phys();
         let regs: *mut GuestRegs = &mut self.regs;
+        let fx: *mut FxArea = &mut self.fx[0];
+        let xsave = self.xsave;
         let vmcb = &self.vmcb;
         kcore::cpu::with_interrupts_off(|cpu| {
             let expected = host_areas.get(cpu as usize).map_or(0, |a| a.load(Ordering::Acquire));
@@ -423,10 +476,40 @@ impl Guest {
             if cpu::read_cr4() & CR4_LA57 != 0 {
                 return Err(NotRun::FiveLevelPaging { cpu });
             }
+            /* The x87 and SSE registers are the guest's from here to the
+             * FXSAVE after the exit. CR4.OSFXSR for FXSAVE and FXRSTOR to
+             * move the XMM registers at all (AMD leaves them out without
+             * it), CR4.OSXSAVE for as long as XCR0 is the guest's; both go
+             * back as they were before interrupts come on, so outside this
+             * window the host's CPU is as it booted -- an SSE instruction
+             * where none may be still faults. `vmrun` saves this CR4 as the
+             * host's and `#vmexit` restores it. */
+            let cr4 = cpu::read_cr4();
+            let window = cr4 | cpu::CR4_OSFXSR | if xsave { cpu::CR4_OSXSAVE } else { 0 };
+            unsafe { cpu::write_cr4(window) };
+            let host_xcr0 = if xsave {
+                /* OSXSAVE is set, and x87 alone is an XCR0 every CPU with
+                 * XSAVE takes. */
+                let x = unsafe { cpu::xgetbv0() };
+                unsafe { cpu::xsetbv0(GUEST_XCR0) };
+                x
+            } else {
+                0
+            };
+            /* `fx` is this guest's own area, aligned to 16. */
+            unsafe { asm!("fxrstor64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
+
             /* The two VMCBs are pages this guest owns, `regs` is its own
              * field, and the checks above are the rest of what the stub
              * needs. */
             unsafe { vmrun_stub(guest, regs, host) };
+
+            unsafe { asm!("fxsave64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
+            if xsave {
+                /* The value read above, on this CPU. */
+                unsafe { cpu::xsetbv0(host_xcr0) };
+            }
+            unsafe { cpu::write_cr4(cr4) };
 
             /* Still on this CPU, with interrupts off: an intercepted machine
              * check is one the host's handler has not seen, and the CPU will
