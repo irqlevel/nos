@@ -10,6 +10,7 @@ pub mod cpu;
 #[cfg(target_arch = "x86_64")]
 pub mod io;
 pub mod dma;
+pub mod frame;
 pub mod entropy;
 pub mod random;
 pub mod pci;
