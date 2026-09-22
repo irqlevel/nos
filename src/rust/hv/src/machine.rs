@@ -1,7 +1,7 @@
 //! The machine's virtualization extension, and which CPUs it is on for.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use hvarch::{Caps, CpuPage, Error, Ext, Result};
 use kcore::consts::MAX_CPUS;
@@ -140,6 +140,13 @@ pub struct Machine {
     /// depended on which CPU asked would have to say so to every caller.
     ext: Result<Ext>,
     cpus: Mutex<Cpus>,
+    /// The physical address of each CPU's page, or 0: the table's pages as
+    /// entering a guest has to check them -- with interrupts off, where the
+    /// mutex cannot be taken. Set once the CPU has taken its page and before
+    /// the table holds it; cleared once the CPU has let go of it and before
+    /// the page is freed. So a CPU's entry here is never the address of a
+    /// page that has gone.
+    host_areas: [AtomicU64; MAX_CPUS],
 }
 
 impl Machine {
@@ -161,7 +168,16 @@ impl Machine {
             caps,
             ext,
             cpus: Mutex::new(Cpus { page }).ok_or(Error::NoMemory)?,
+            host_areas: [const { AtomicU64::new(0) }; MAX_CPUS],
         })
+    }
+
+    /// Each CPU's host save area, by CPU, 0 where there is none: what a
+    /// guest's entry compares with what the CPU itself says before `vmrun`.
+    /// Not for outside this crate: a cell anyone can read is a cell anyone
+    /// can store to, and a stored address is what that check trusts.
+    pub(crate) fn host_areas(&self) -> &[AtomicU64] {
+        &self.host_areas
     }
 
     pub fn caps(&self) -> &Caps {
@@ -247,6 +263,7 @@ impl Machine {
 
             /* Only now: the page is the CPU's from the moment it took it,
              * and the table is what keeps it alive. */
+            self.host_areas[i].store(page.phys(), Ordering::Release);
             cpus.page[i] = Some(page);
             done |= bit;
         }
@@ -289,6 +306,7 @@ impl Machine {
              * touch it again either. Dropping it here frees it: off the
              * machine's own lock only in the sense that matters, from task
              * context, where the page allocator's TLB shootdown can wait. */
+            self.host_areas[i].store(0, Ordering::Release);
             cpus.page[i] = None;
         }
         done

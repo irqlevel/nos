@@ -34,9 +34,11 @@ pub struct Caps {
     /// development loop, and worth saying out loud, because it is also the
     /// answer to "why is this so slow".
     pub under_hypervisor: bool,
-    /// The guest can be given an MSR-based local APIC. It is what keeps an
-    /// instruction emulator out of this hypervisor: xAPIC's APIC page is
-    /// MMIO, and every access to it would have to be decoded by hand.
+    /// The host's own local APIC can be an x2APIC. Not a condition of the
+    /// guest's: a guest is given an x2APIC whatever the host has -- its
+    /// accesses are MSR exits the hypervisor answers, which is what keeps
+    /// an instruction emulator out of it, xAPIC's page of MMIO being the
+    /// alternative -- and this says only what the hardware could help with.
     pub x2apic: bool,
     /// 1 GiB pages: a gigabyte of guest memory as one nested page-table
     /// entry rather than five hundred.
@@ -172,7 +174,7 @@ impl Caps {
             Detail::None => {}
         }
 
-        feature(out, "x2APIC", self.x2apic, "the guest's local APIC is MSRs, not a page to decode")?;
+        feature(out, "x2APIC", self.x2apic, "the host's; a guest's is MSR exits either way")?;
         feature(out, "1 GiB pages", self.gb_pages, "guest memory in one nested entry a gigabyte")?;
         Ok(())
     }

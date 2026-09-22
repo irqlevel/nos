@@ -23,6 +23,20 @@ pub fn zeroed<T: Pod>() -> T {
     unsafe { core::mem::zeroed() }
 }
 
+/// The bytes of `value`, every one of them: a `T` has no padding, so all of
+/// them are initialised.
+pub fn bytes_of<T: Pod>(value: &T) -> &[u8] {
+    /* A `T` is exactly `size_of::<T>()` initialised bytes, and a `u8` has
+     * no alignment to keep. */
+    unsafe { core::slice::from_raw_parts(value as *const T as *const u8, core::mem::size_of::<T>()) }
+}
+
+/// The bytes of `value`, to be written: whatever goes into them is still a
+/// `T`, since any bytes are one.
+pub fn bytes_of_mut<T: Pod>(value: &mut T) -> &mut [u8] {
+    unsafe { core::slice::from_raw_parts_mut(value as *mut T as *mut u8, core::mem::size_of::<T>()) }
+}
+
 /// The `T` at `off` in `buf`, wherever that falls: nothing is assumed of its
 /// alignment. None when the buffer ends before the value does.
 pub fn read<T: Pod>(buf: &[u8], off: usize) -> Option<T> {

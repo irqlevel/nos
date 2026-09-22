@@ -83,6 +83,10 @@ pub enum Error {
     NoSuchCpu,
     /// This architecture's backend is not written yet.
     NotImplemented,
+    /// No guest memory at that guest physical address.
+    Unmapped,
+    /// Guest memory there already, or an address no nested table can hold.
+    BadAddress,
 }
 
 impl core::fmt::Display for Error {
@@ -96,6 +100,8 @@ impl core::fmt::Display for Error {
             Error::HostState => "the host's CR0/CR4 are not what VMX operation requires",
             Error::NoSuchCpu => "no such CPU",
             Error::NotImplemented => "not implemented on this architecture",
+            Error::Unmapped => "no guest memory at that address",
+            Error::BadAddress => "not a guest physical address that can be given memory",
         })
     }
 }
@@ -116,6 +122,8 @@ impl Error {
             Error::NoSuchCpu => 6,
             Error::NotImplemented => 7,
             Error::HostState => 8,
+            Error::Unmapped => 9,
+            Error::BadAddress => 10,
         }
     }
 
@@ -131,6 +139,8 @@ impl Error {
             6 => Error::NoSuchCpu,
             7 => Error::NotImplemented,
             8 => Error::HostState,
+            9 => Error::Unmapped,
+            10 => Error::BadAddress,
             _ => Error::EnableFailed,
         }
     }

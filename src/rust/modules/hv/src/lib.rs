@@ -18,23 +18,27 @@
 //!     insmod /hv.ko
 //!     hv info          -- what this machine has
 //!     hv on            -- turn the extension on
+//!     hv run all       -- run the built-in guests, each in a VM of its own
 //!     hv off
 //!     rmmod hv
 //!
-//! Today it reports and turns on; the VM comes next
-//! (`plans/03-hypervisor.md`).
+//! The guests are a few bytes each (`hv::guests`); a Linux one is what
+//! comes next (`plans/03-hypervisor.md`).
 
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::fmt::Write;
 
 use hv::Machine;
 use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
+use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off] [cpu|all] - the CPU's virtualization extension";
+const HELP: &str = "hv [info|on|off [cpu|all]|run <guest|all> [cpu]] - the CPU's virtualization extension, and guests under it";
 
 struct Hv {
     /// In an `Option` so that unregistering -- which waits out a call of the
@@ -106,7 +110,7 @@ fn kernel_error(e: hv::Error) -> kcore::error::Error {
     }
 }
 
-fn command(machine: &Machine, args: &str, out: &mut Output) {
+fn command(machine: &Arc<Machine>, args: &str, out: &mut Output) {
     let mut words = args.split_ascii_whitespace();
     match words.next() {
         None => status(machine, out),
@@ -116,6 +120,7 @@ fn command(machine: &Machine, args: &str, out: &mut Output) {
         }
         Some("on") => switch(machine, words.next(), true, out),
         Some("off") => switch(machine, words.next(), false, out),
+        Some("run") => run(machine, words.next(), words.next(), out),
         Some(other) => {
             let _ = writeln!(out, "hv: no such thing as \"{}\"", other);
             let _ = writeln!(out, "{}", HELP);
@@ -156,6 +161,90 @@ fn status(machine: &Machine, out: &mut Output) {
             let _ = writeln!(out, "hv: no guest can run here -- {}", e);
         }
     }
+}
+
+/// Guests to run, and where what they did is written: what a vCPU's task
+/// shares with the command that is waiting for it.
+struct Job {
+    machine: Arc<Machine>,
+    guests: Vec<&'static str>,
+    report: Mutex<String>,
+}
+
+impl Job {
+    /// The vCPU's task: every guest of the job in turn, on whichever CPU
+    /// the task was bound to.
+    fn run(job: Arc<Job>) {
+        let mut report = String::new();
+        let mut ok = 0usize;
+        for name in &job.guests {
+            if hv::guests::run_one(&job.machine, name, &mut report) == Some(true) {
+                ok += 1;
+            }
+        }
+        if job.guests.len() > 1 {
+            let _ = writeln!(report, "hv: {} of {} guests ok", ok, job.guests.len());
+        }
+        *job.report.lock() = report;
+    }
+}
+
+/// `hv run <guest|all> [cpu]`: each guest in a VM of its own, on a task of
+/// its own -- a guest's CPU is a task, here as it will be for a Linux one --
+/// bound to `cpu` when one is named, and waited for.
+fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut Output) {
+    /* First, so that a machine with nothing to run a guest under says that,
+     * and not that it has no such guest. */
+    if let Err(e) = machine.ext() {
+        let _ = writeln!(out, "hv: no guest can run here -- {}", e);
+        return;
+    }
+    let guests: Vec<&'static str> = match which {
+        Some("all") => hv::guests::names().collect(),
+        Some(name) => hv::guests::names().filter(|g| *g == name).collect(),
+        None => Vec::new(),
+    };
+    if guests.is_empty() {
+        let _ = write!(out, "hv: run which guest? all");
+        for name in hv::guests::names() {
+            let _ = write!(out, ", {}", name);
+        }
+        let _ = writeln!(out);
+        return;
+    }
+
+    let affinity = match cpu {
+        None => None,
+        Some(word) => match word.parse::<usize>() {
+            Ok(cpu) if cpu < MAX_CPUS && kcore::cpu::online_mask() & (1u64 << cpu) != 0 => Some(1u64 << cpu),
+            _ => {
+                let _ = writeln!(out, "hv: \"{}\" is not a running CPU", word);
+                return;
+            }
+        },
+    };
+
+    let report = match Mutex::new(String::new()) {
+        Some(report) => report,
+        None => {
+            let _ = writeln!(out, "hv: out of memory");
+            return;
+        }
+    };
+    let job = Arc::new(Job { machine: machine.clone(), guests, report });
+    let task = match affinity {
+        Some(mask) => kcore::task::spawn_on_with("hv/vcpu", mask, job.clone(), Job::run),
+        None => kcore::task::spawn_with("hv/vcpu", job.clone(), Job::run),
+    };
+    match task {
+        /* Dropping the handle waits for the task. */
+        Some(task) => drop(task),
+        None => {
+            let _ = writeln!(out, "hv: no task for the guest");
+            return;
+        }
+    }
+    out.write_bytes(job.report.lock().as_bytes());
 }
 
 /// `hv on [cpu|all]` and `hv off [cpu|all]`, which differ in one word and

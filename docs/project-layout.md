@@ -40,8 +40,8 @@ src/rust/
   virtio/     The virtio foundation: the split virtqueue, the transport contract, virtio-pci (modern and legacy) and virtio-mmio v2
   tls/        The TLS client: rustls + RustCrypto + webpki-roots, driven through rustls' unbuffered API, over a transport it is handed as a trait (docs/tls.md)
   ssh/        An SSH server's protocol, with no kernel in it; the sshd module serves it (docs/sshd.md)
-  hvarch/     The CPU's virtualization extension: CPUID and the control MSRs, AMD-V (x86/svm.rs) and Intel VT-x (x86/vmx.rs), the Arm EL2 probe (arm64.rs). All of the hypervisor's unsafe, so that the rest of it has none (docs/hypervisor.md)
-  hv/         The hypervisor above the CPU, all of it safe: the machine's extension and which CPUs it is on for (machine.rs) -- and, as it grows, the VM, its nested page tables, its emulated devices and the exit dispatcher. Neither this nor hvarch is a default member of the workspace: they are compiled only into the hv module, so a kernel without it carries no hypervisor at all
+  hvarch/     The CPU's virtualization extension: CPUID and the control MSRs, AMD-V (x86/svm.rs: turning it on, entering a guest; x86/svm/vmcb.rs: the VMCB's layout) and Intel VT-x (x86/vmx.rs), the Arm EL2 probe (arm64.rs). Almost all of the hypervisor's unsafe, so that the rest of it has next to none (docs/hypervisor.md)
+  hv/         The hypervisor above the CPU, safe but for the one call that enters a guest: the machine's extension and which CPUs it is on for (machine.rs), guest memory and its nested page table (memory.rs, npt.rs), the VMCB's policy and the exits (svm.rs), the VM (vm.rs), the built-in guests (guests.rs). Neither this nor hvarch is a default member of the workspace: they are compiled only into the hv module, so a kernel without it carries no hypervisor at all
   hello/      Rust self-test module
   kernel/     Rust entry points (rust_init, rust_fini), global allocator, the `sha256` command
   kmod/       Runtime of a loadable module: allocator, panic handler, the module! header

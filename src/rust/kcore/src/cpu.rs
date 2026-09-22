@@ -88,6 +88,25 @@ pub unsafe fn irq_restore(flags: usize) {
     unsafe { ffi::cpu::kernel_irq_restore(flags) }
 }
 
+/// `work`, with interrupts and preemption off on this CPU for the whole of
+/// it, handed the CPU that is.
+///
+/// The scoped form of `irq_save` and `irq_restore`, and the reason it is safe
+/// where the pair is not: the flags never leave this function, so they
+/// cannot be given back twice, on another CPU, or out of order with another
+/// pair. For a step that has to find a CPU's state as it needs it and then
+/// act on it with nothing in between -- no IPI to change the state, no
+/// migration to change the CPU -- such as checking that a CPU's
+/// virtualization extension is on and entering a guest there.
+pub fn with_interrupts_off<R>(work: impl FnOnce(u32) -> R) -> R {
+    let flags = irq_save();
+    let result = work(id());
+    /* The flags `irq_save` returned above, on this CPU: with interrupts and
+     * preemption off, nothing moved this task elsewhere in between. */
+    unsafe { irq_restore(flags) };
+    result
+}
+
 /// Whether interrupts are on for this CPU.
 ///
 /// What tells a caller it may release something whose free waits for every
