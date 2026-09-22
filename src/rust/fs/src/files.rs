@@ -258,6 +258,56 @@ pub unsafe extern "C" fn kernel_file_read(
     total as isize
 }
 
+/// Up to `cap` bytes of the file from `offset`: the count read, 0 at or past
+/// its end, or -1. For a file too large for one buffer -- a guest's kernel --
+/// read a piece at a time; the file is opened for each call, so nothing is
+/// held open between them.
+///
+/// # Safety
+/// `path` points at `path_len` bytes; `buf` takes `cap`.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_read_at(
+    path: *const u8, path_len: usize, offset: u64, buf: *mut u8, cap: usize,
+) -> isize {
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return -1,
+    };
+    if buf.is_null() && cap != 0 {
+        return -1;
+    }
+
+    let at = match locate(path) {
+        Some(at) => at,
+        None => return -1,
+    };
+    let file = match Open::new(vfs, at.as_bytes(), OPEN_READ) {
+        Some(file) => file,
+        None => return -1,
+    };
+    let offset = match usize::try_from(offset) {
+        Ok(offset) => offset,
+        Err(_) => return 0,
+    };
+    if cap == 0 || offset >= file.size() {
+        return 0;
+    }
+    if !file.seek(offset) {
+        return -1;
+    }
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf, cap) };
+    let mut total = 0;
+    while total < cap {
+        match file.read(&mut buf[total..]) {
+            Some(0) => break,
+            Some(got) => total += got,
+            None => return -1,
+        }
+    }
+    total as isize
+}
+
 /// Replaces the file's content, making the file if it is missing, through
 /// `replace_file`: what a module writes is its configuration -- the keys
 /// allowed to log in -- which a full disk or a crash midway must not leave
