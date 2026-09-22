@@ -1,0 +1,13 @@
+[package]
+name = "hvarch"
+version = "0.1.0"
+edition = "2021"
+
+# The CPU's virtualization extension, and the only crate of the hypervisor
+# that is allowed to be unsafe: the instructions, the control MSRs and the
+# structures the hardware itself reads. Everything above it -- the VM, its
+# memory, the devices it emulates -- is safe Rust in `hv`.
+[lib]
+
+[dependencies]
+kcore = { path = "../kcore" }

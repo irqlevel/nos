@@ -396,6 +396,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hv"
+version = "0.1.0"
+dependencies = [
+ "hvarch",
+ "kcore",
+]
+
+[[package]]
+name = "hvarch"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+]
+
+[[package]]
 name = "igb"
 version = "0.1.0"
 dependencies = [
@@ -482,6 +497,15 @@ dependencies = [
 name = "mod-hello"
 version = "0.1.0"
 dependencies = [
+ "kcore",
+ "kmod",
+]
+
+[[package]]
+name = "mod-hv"
+version = "0.1.0"
+dependencies = [
+ "hv",
  "kcore",
  "kmod",
 ]

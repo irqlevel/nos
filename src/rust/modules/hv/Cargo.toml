@@ -1,0 +1,17 @@
+[package]
+name = "mod-hv"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mod_hv"
+crate-type = ["staticlib"]
+
+[dependencies]
+kmod = { path = "../../kmod" }
+kcore = { path = "../../kcore" }
+# The hypervisor itself, and through it the CPU's extension. Neither crate is
+# in the kernel's own build (they are workspace members, not default ones):
+# they exist only inside this module, so a kernel without it carries none of
+# the hypervisor at all.
+hv = { path = "../../hv" }

@@ -22,6 +22,7 @@ How it works, by subsystem:
 - [Loadable modules](modules.md) — kernel services written in Rust, built into `.ko` files and put into a running kernel with `insmod`: writing one, building it, and how the loader maps, binds, relocates and protects it
 - [netblk](netblk.md) — an NVMe disk served over UDP by a module, zero-copy both ways: the data path from NIC to disk and back, the protocol, and how Linux compares
 - [sshd](sshd.md) — an SSH server in a module: logging in with an Ed25519 key, starting it at boot from `/etc/rc`, what it speaks and what it refuses, how the protocol crate and the kernel's side divide the work
+- [The hypervisor](hypervisor.md) — a type-1 hypervisor as Rust crates and a module that can be taken back out: why a module, where the `unsafe` is confined and how it is counted, AMD-V before Intel VT-x and what QEMU's TCG gives, what the extension costs a CPU while it is on
 
 Tools:
 

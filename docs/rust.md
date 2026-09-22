@@ -223,7 +223,7 @@ able to say why.
 | `ring` | `LocklessRing` — the kernel's bounded MPMC queue of words, one CAS an operation, safe from any context |
 | `static_ring` | `StaticRing<N>` (the same, in static storage) and `Mailbox<T, N>` (fixed-shape messages written and read in place, from any context, no allocation) |
 | `task` | `spawn`, `spawn_for(name, &'static T, fn(&'static T))` (a service's task over its one instance — no raw context), `spawn_with(name, ctx, fn(C))` and `spawn_on_with(name, cpus, ..)` for a task that owns what it starts from — a module's, holding an `Arc` of its state, since nothing of a module lives for good — and the raw `spawn_with_ctx`, which sshd and blkload still use (each takes the name `ps` and `top` show), `TaskHandle` (`id`), `sleep`, `yield_to_runnable`, `current_id` (is this call from one of my own tasks?) |
-| `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI), `synchronize` (returns once every interrupt handler running at the call has returned) |
+| `cpu` | `id`, `count`, `online_mask`, `run_on` (IPI) and `run_on_with(cpu, &arg, f)` (the same, the context a borrowed value rather than a word to cast -- sound because the call waits for the handler), `synchronize` (returns once every interrupt handler running at the call has returned) |
 | `msix` | `MsixTable`, `MsixInterrupt::register_for(table, index, &'static T, handler)` (16 slots, shared by every Rust driver) |
 | `interrupt` | `LegacyInterrupt::register_level_for(dev, &'static T, handler)` / `register_irq_for(irq, …)` (INTx, 8 slots) |
 | `softirq` | `raise`, `register_for(type, &'static T, handler)` (`TYPE_NET_RX`, `TYPE_BLK_IO`, …). There is no unregister, which makes a module that registers one permanent |

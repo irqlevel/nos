@@ -446,6 +446,33 @@ calling task's identity (`kcore::task::current_id`). And it carries its own
 copy of the cryptography the TLS client uses: modules share nothing with the
 kernel but the exported functions.
 
+## hv
+
+`hv` (`src/rust/modules/hv`) is the [hypervisor](hypervisor.md), the
+beginning of [stage 3](../plans/03-hypervisor.md). It is two crates --
+`hvarch`, the CPU's virtualization extension and all of the hypervisor's
+`unsafe`, and `hv`, everything above it, which has two sites -- plus this
+module, which is their lifetime and their shell command. Neither crate is a
+default member of the workspace, so a kernel built without the module has no
+hypervisor in it at all.
+
+It is the module that makes the clearest case for the shape. The one piece
+of state it takes is not the module's: `EFER.SVME` and `MSR_VM_HSAVE_PA` on
+AMD, `CR4.VMXE` and VMX root operation on Intel belong to the CPU, and an
+`rmmod` that forgot them would leave the CPU saving host state into a page
+that has been freed and given to somebody else, with the code that would
+have turned it off unmapped. So the module turns the extension off in its
+own `Drop` -- after the command is unregistered, so nothing can ask it
+anything -- reads back what every CPU has, and says so if anything is left.
+`scripts/hv-test.py` is that round trip: load, turn on, unload without
+turning off, load again and ask the CPUs.
+
+The rest of it is what a module does with CPUs. A page per CPU (`CpuPage`)
+is allocated in task context, because the IPI handler that hands it to the
+CPU runs with interrupts off and may not allocate; `kcore::cpu::run_on_with`
+carries it over as a borrowed value rather than a word to cast back, which
+is sound because `run_on` does not return until the handler has run.
+
 ## Backtraces
 
 A frame in a module's code is named like the kernel's own, with the module
