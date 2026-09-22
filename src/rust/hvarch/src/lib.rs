@@ -16,6 +16,8 @@
 //! arm64 it will be EL2 with stage-2 translation, which today is detected
 //! and reported and not yet entered.
 
+extern crate alloc;
+
 #[cfg(target_arch = "x86_64")]
 pub mod x86;
 #[cfg(target_arch = "x86_64")]

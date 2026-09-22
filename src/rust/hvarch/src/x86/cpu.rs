@@ -95,3 +95,40 @@ pub fn read_cr4() -> u64 {
 pub unsafe fn write_cr4(value: u64) {
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nomem, nostack, preserves_flags)) };
 }
+
+/// CR4.OSFXSR: FXSAVE and FXRSTOR move the XMM registers and MXCSR too.
+pub const CR4_OSFXSR: u64 = 1 << 9;
+/// CR4.OSXSAVE: XGETBV and XSETBV may be executed.
+pub const CR4_OSXSAVE: u64 = 1 << 18;
+/// CPUID.1:ECX.XSAVE.
+pub const ECX_XSAVE: u32 = 1 << 26;
+
+/// Whether this CPU has XCR0 at all.
+pub fn has_xsave() -> bool {
+    cpuid(1).map_or(false, |r| r.ecx & ECX_XSAVE != 0)
+}
+
+/// # Safety
+/// CR4.OSXSAVE is set on this CPU.
+#[inline]
+pub unsafe fn xgetbv0() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        asm!("xgetbv", in("ecx") 0u32, out("eax") lo, out("edx") hi,
+             options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// # Safety
+/// CR4.OSXSAVE is set on this CPU, and `value` is an XCR0 it takes: bit 0
+/// set, and no component the CPU lacks. What it enables is enabled for
+/// whatever runs here next.
+#[inline]
+pub unsafe fn xsetbv0(value: u64) {
+    unsafe {
+        asm!("xsetbv", in("ecx") 0u32, in("eax") value as u32, in("edx") (value >> 32) as u32,
+             options(nomem, nostack, preserves_flags));
+    }
+}
