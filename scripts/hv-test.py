@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """hv test: the hypervisor module, loaded into a running kernel, turning the
-CPU's virtualization extension on and -- above all -- off again.
+CPU's virtualization extension on and -- above all -- off again, and running
+its built-in guests under it.
 
 The extension is the one piece of state a loadable module takes that does not
 belong to the module: `EFER.SVME` and `MSR_VM_HSAVE_PA` on AMD, `CR4.VMXE`
@@ -21,12 +22,20 @@ all -- `-cpu max` gives QEMU's TCG an AMD-V with nested paging, and under
 KVM it is whatever the host CPU has):
 
   - the module loads on a machine with an extension, and says which
-  - `hv info` reports nested paging and x2APIC, which is what a guest needs
-  - it is off for every CPU to begin with
-  - `hv on <cpu>` turns it on for that CPU and no other; `hv off` undoes it
+  - `hv info` reports nested paging, which is what a guest cannot do without
+  - it is off for every CPU to begin with, and a guest is not run on a CPU
+    it is off for
+  - `hv on <cpu>` turns it on for that CPU and no other: a guest bound to it
+    runs, a guest bound to another is not run; `hv off` undoes it
   - `hv on` turns it on for every running CPU
-  - a second `insmod`, a CPU that does not exist and a word that is not a
-    subcommand are each refused
+  - every built-in guest does what it was told on the first CPU and on the
+    last: port I/O and CPUID answered by the host, long mode with memory
+    above 4 GiB and every register across a hypercall, a write past its
+    memory stopped at the nested table, a triple fault that stops only the
+    guest, a VMCB that breaks a rule refused with the rule named, and a
+    `cli; jmp $` the host's interrupts get through and the host stops
+  - a second `insmod`, a CPU that does not exist, a word that is not a
+    subcommand and a guest that does not exist are each refused
   - `rmmod` with the extension on for every CPU turns it off for every CPU
   - loading it again finds nothing left on -- the check the rest is for
   - nothing warned, and nothing panicked
@@ -36,7 +45,7 @@ its first hundred instructions:
 
   - the module loads, says so, and refuses to run anything
   - `hv info` reports the exception level and what stage-2 would offer
-  - `hv on` is refused rather than attempted
+  - `hv on` and `hv run` are refused rather than attempted
   - it unloads
 
     scripts/hv-test.py [--arch x86_64|aarch64] [--tcg] [--keep]
@@ -69,25 +78,41 @@ ALL_MASK = "0x%x" % ((1 << CPUS) - 1)
 # One line a command, in the order /etc/rc runs them. The test indexes the
 # output by position, so the two lists are one thing.
 SCRIPT = [
-    "insmod /hv.ko",
-    "hv info",
-    "hv",
-    "hv on 1",
-    "hv",
-    "hv off",
-    "hv",
-    "hv on",
-    "hv",
-    "insmod /hv.ko",
-    "hv on 99",
-    "hv nonsense",
-    "rmmod hv",
-    "insmod /hv.ko",
-    "hv",
-    "rmmod hv",
-    "lsmod",
-    "dmesg 400 hv:",
+    "insmod /hv.ko",        # 0
+    "hv info",              # 1
+    "hv",                   # 2
+    "hv run hypercall",     # 3
+    "hv on 1",              # 4
+    "hv",                   # 5
+    "hv run hypercall 1",   # 6
+    "hv run hypercall 2",   # 7
+    "hv off",               # 8
+    "hv",                   # 9
+    "hv on",                # 10
+    "hv",                   # 11
+    "hv run all 0",         # 12
+    "hv run all %d" % (CPUS - 1),  # 13
+    "insmod /hv.ko",        # 14
+    "hv on 99",             # 15
+    "hv nonsense",          # 16
+    "hv run nonsense",      # 17
+    "rmmod hv",             # 18
+    "insmod /hv.ko",        # 19
+    "hv",                   # 20
+    "rmmod hv",             # 21
+    "lsmod",                # 22
+    "dmesg 400 hv:",        # 23
 ]
+
+# What `hv run all` has to have said about each guest, beyond its verdict.
+GUESTS = {
+    "exits": [r'said\s+"nos: ports and cpuid"', r"1 port in, 20 port out, 1 cpuid"],
+    "hypercall": [r'said\s+"nos: long mode"', r"15 registers went out at the hypercall and 15 answers came back"],
+    "fault": [r"nested page fault at gpa 0x1ff000, error 0x1[0-9a-f]{8}, rip 0x8005"],
+    "triple": [r"shutdown \(triple fault\)"],
+    "refused": [r"not entered -- the VMCB breaks a rule: CR0.NW is set without CR0.CD"],
+    "spin": [r"stopped\s+by the host", r"interrupts got through [1-9]\d* times"],
+}
 
 
 def module(arch):
@@ -126,6 +151,18 @@ def blocks(log):
     return [(cmd, "\n".join(lines)) for cmd, lines in out]
 
 
+def host_has_svm():
+    """Whether KVM would hand the guest AMD-V. `-cpu host` gives it the host
+    CPU's own extension, and the guests here run under AMD-V: on an Intel
+    host that is VT-x, whose guests are not written yet -- there, TCG's
+    AMD-V is the one that runs them."""
+    try:
+        with open("/proc/cpuinfo") as f:
+            return re.search(r"^flags\s*:.*\bsvm\b", f.read(), re.M) is not None
+    except OSError:
+        return False
+
+
 def x86(args):
     """nos.iso, with the whole script in /etc/rc: there is no remote shell
     on the ISO's command line, and a linear script needs none."""
@@ -133,7 +170,8 @@ def x86(args):
     log = os.path.join(tmp, "serial.log")
     image = rootfs(tmp, "x86_64", SCRIPT)
 
-    kvm = os.path.exists("/dev/kvm") and not args.tcg
+    kvm = os.path.exists("/dev/kvm") and not args.tcg and host_has_svm()
+    print("accelerator: %s" % ("KVM, the host's AMD-V" if kvm else "TCG, -cpu max"))
     # -cpu max, not the default: qemu64 reports SVM without nested paging,
     # and a hypervisor that will not shadow page tables has no use for that.
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "1G", "-smp", str(CPUS),
@@ -162,6 +200,25 @@ def x86(args):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def guest_report(text, name):
+    """What `hv run` said about one guest: from its first line to its verdict."""
+    m = re.search(r"^hv: guest %s -- .*?^hv: guest %s .*?$" % (name, name), text, re.M | re.S)
+    return m.group(0) if m else ""
+
+
+def check_all_guests(text, cpu):
+    """`hv run all <cpu>`: every guest ran there and did what it was told."""
+    m = re.search(r"^hv: (\d+) of (\d+) guests ok$", text, re.M)
+    pt.check("every built-in guest does what it was told on cpu %d" % cpu,
+             m is not None and m.group(1) == m.group(2) and int(m.group(2)) >= len(GUESTS), text)
+    for name, patterns in GUESTS.items():
+        report = guest_report(text, name)
+        good = ("hv: guest %s ok" % name) in report and all(re.search(p, report) for p in patterns)
+        if name != "refused":
+            good = good and re.search(r"ran on\s+cpu %d," % cpu, report) is not None
+        pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)
+
+
 def x86_checks(ran):
     if not pt.check("every line of the script ran", [c for c, _ in ran] == SCRIPT,
                     "\n".join(c for c, _ in ran)):
@@ -175,40 +232,50 @@ def x86_checks(ran):
              re.search(r"^hv: .* -- ready$", info, re.M) is not None, info)
     pt.check("with nested paging, which is what makes a guest's memory the CPU's",
              re.search(r"(nested paging|extended page tables)\s+yes", info) is not None, info)
-    pt.check("and x2APIC, which is what keeps an instruction emulator out of it",
-             re.search(r"x2APIC\s+yes", info) is not None, info)
 
     pt.check("it is off for every CPU to begin with",
              "on for cpu none of %s" % ALL_CPUS in out[2], out[2])
+    pt.check("and a guest is not run where it is off",
+             re.search(r"^hv: guest hypercall not run -- the extension is not on for cpu \d+", out[3], re.M)
+             is not None, out[3])
 
-    pt.check("hv on <cpu> turns it on for that CPU", "turned on for cpu 1" in out[3], out[3])
-    pt.check("and for no other", "on for cpu 1 of %s" % ALL_CPUS in out[4], out[4])
+    pt.check("hv on <cpu> turns it on for that CPU", "turned on for cpu 1" in out[4], out[4])
+    pt.check("and for no other", "on for cpu 1 of %s" % ALL_CPUS in out[5], out[5])
+    pt.check("a guest bound to that CPU runs there",
+             "hv: guest hypercall ok" in out[6] and re.search(r"ran on\s+cpu 1,", out[6]) is not None, out[6])
+    pt.check("and a guest bound to another is not run",
+             "hv: guest hypercall not run -- the extension is not on for cpu 2" in out[7], out[7])
 
-    pt.check("hv off turns it off again", "turned off for cpu 1" in out[5], out[5])
-    pt.check("and the CPU says so", "on for cpu none of %s" % ALL_CPUS in out[6], out[6])
+    pt.check("hv off turns it off again", "turned off for cpu 1" in out[8], out[8])
+    pt.check("and the CPU says so", "on for cpu none of %s" % ALL_CPUS in out[9], out[9])
 
     pt.check("hv on turns it on for every CPU",
-             "turned on for cpu %s" % ALL_CPUS in out[7], out[7])
+             "turned on for cpu %s" % ALL_CPUS in out[10], out[10])
     pt.check("and every CPU says so",
-             "on for cpu %s of %s" % (ALL_CPUS, ALL_CPUS) in out[8], out[8])
+             "on for cpu %s of %s" % (ALL_CPUS, ALL_CPUS) in out[11], out[11])
 
-    pt.check("a second insmod is refused", "loaded at" not in out[9], out[9])
-    pt.check("a CPU that does not exist is refused", "is not a CPU" in out[10], out[10])
-    pt.check("and a word that is not a subcommand", "no such thing" in out[11], out[11])
+    check_all_guests(out[12], 0)
+    check_all_guests(out[13], CPUS - 1)
+    pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
-    pt.check("rmmod with it on for every CPU unloads", "hv unloaded" in out[12], out[12])
+    pt.check("a second insmod is refused", "loaded at" not in out[14], out[14])
+    pt.check("a CPU that does not exist is refused", "is not a CPU" in out[15], out[15])
+    pt.check("and a word that is not a subcommand", "no such thing" in out[16], out[16])
+    pt.check("and a guest that does not exist", "run which guest?" in out[17], out[17])
+
+    pt.check("rmmod with it on for every CPU unloads", "hv unloaded" in out[18], out[18])
 
     # The one that the rest of them are for: this load asks every CPU what it
-    # has, and it has to be nothing.
-    pt.check("loading it again finds it off for every CPU", "hv loaded at" in out[13], out[13])
+    # has, and it has to be nothing -- after every guest above has run.
+    pt.check("loading it again finds it off for every CPU", "hv loaded at" in out[19], out[19])
     pt.check("and nothing was left on by the unload before it",
-             "on for cpu none of %s" % ALL_CPUS in out[14], out[14])
-    pt.check("it unloads again", "hv unloaded" in out[15], out[15])
-    pt.check("and leaves no module behind", "no modules loaded" in out[16], out[16])
+             "on for cpu none of %s" % ALL_CPUS in out[20], out[20])
+    pt.check("it unloads again", "hv unloaded" in out[21], out[21])
+    pt.check("and leaves no module behind", "no modules loaded" in out[22], out[22])
 
     # What the module traced: not on the serial console, because the shell
     # suppresses trace output there once it starts, so the script asks dmesg.
-    logged = out[17]
+    logged = out[23]
     pt.check("the kernel log says the extension went off for every CPU on the unload",
              "extension off for cpu mask %s" % ALL_MASK in logged, logged)
     pt.check("and nothing warned", "WARNING" not in logged, logged)
@@ -251,6 +318,8 @@ def arm64(args):
         pt.check("its status says the same", "no guest can run here" in status, status)
         on = sh.run("hv on")
         pt.check("hv on is refused rather than attempted", "cannot turn it on" in on, on)
+        guests = sh.run("hv run all")
+        pt.check("and so is hv run", "no guest can run here" in guests, guests)
 
         pt.check("it unloads", "hv unloaded" in sh.run("rmmod hv"))
         pt.check("and leaves no module behind", "no modules loaded" in sh.run("lsmod"))

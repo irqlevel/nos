@@ -73,8 +73,42 @@ Done so far, against **3.1**:
   and reads back what is left.
 - `scripts/hv-test.py`, on both architectures.
 
-Next, in order: the VMCB, a nested page table, and a guest of a few bytes
-that exits where it was told to (3.2, 3.3).
+And against **3.2 and 3.3**, under AMD-V -- the first two of the four demos:
+
+- `hvarch`: the VMCB, laid out from appendix B with every offset checked at
+  compile time; the run stub, a naked function that does `vmsave`/`vmload`
+  of the host's FS/GS/TR/LDTR and syscall MSRs around `vmrun` with GIF clear
+  (this kernel's per-CPU data is at the GS base: without them the first
+  per-CPU read after an exit faults, which the gate shows); and
+  `Guest::run`, which sets on every entry what keeps the host the host's --
+  the intercepts of the host's interrupts, SHUTDOWN, I/O, MSRs, INVD,
+  XSETBV and the SVM instructions, of #DB and #AC (whose delivery a guest
+  can make loop forever inside the CPU) and of #MC (raised again into the
+  host's handler, since the CPU will not), interrupt masking by the host's
+  flag, nested paging, all-ones permission maps, AVIC/SEV/virtual VMSAVE
+  off, a full TLB flush -- and refuses a CPU with five-level paging, which
+  a four-level nested table would be walked as; so the policy above it can
+  be wrong about a guest without being wrong about the host.
+- `hv`: `GuestMemory` with copying volatile accessors and the nested table
+  inside it, mapping only pages it owns; the nested page table as an arena
+  walked by index; the VMCB's policy, the exit decoder, and a software
+  consistency checker that names the rule a VMCB breaks before `vmrun` can
+  answer with a bare `VMEXIT_INVALID`; the VM.
+- Built-in guests, all in long mode: port I/O and CPUID, 4 GiB and every
+  register across a hypercall, a write past its memory stopped at the
+  nested table, a triple fault, a refused VMCB, and `cli; jmp $` stopped by
+  the host. `hv run <guest|all> [cpu]` runs them on a task of their own,
+  bound to a CPU when asked; `hv-test.py` runs them all on the first and the
+  last CPU.
+- Found on the way: QEMU's TCG before 9.2 does not translate an unpaged
+  guest's addresses through the nested table -- a real-mode guest there
+  runs out of host memory -- which is why every guest starts paged.
+
+Next, 3.4 and 3.5 towards the third demo: an 8250 on port exits and a
+`bzImage` loaded by the 64-bit boot protocol, which want guest memory that
+is not 512 KiB runs of the allocator's largest bucket, a CPUID and MSR
+policy, the guest's FPU state switched, and a vCPU task as long-lived as its
+VM. `docs/hypervisor.md` ("What comes next") has the list.
 
 Before the first VMX guest, one change outside the hypervisor: the boot path
 has to set `CR0.NE` on every CPU. VMX requires it, the APs come out of INIT

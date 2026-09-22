@@ -111,6 +111,31 @@ impl DmaBuffer {
         true
     }
 
+    /// The buffer as one `T`, from its first byte: a control block the
+    /// hardware reads and writes only inside an instruction the owner
+    /// executes -- an SVM VMCB, which `vmrun` takes and `#vmexit` hands back
+    /// before the next instruction -- and never behind the owner's back, the
+    /// way a device works a descriptor ring. What that asks of the caller is
+    /// what [`as_mut_slice`](Self::as_mut_slice) asks: that nothing else
+    /// writes the pages while the reference is held. None when a `T` does
+    /// not fit, or would not be aligned.
+    pub fn as_pod<T: crate::pod::Pod>(&self) -> Option<&T> {
+        if !self.holds::<T>(0) {
+            return None;
+        }
+        /* Inside the allocation and aligned, by the check; any bytes are a
+         * `T`; and the borrow of `self` is the borrow of the pages. */
+        Some(unsafe { &*(self.ptr as *const T) })
+    }
+
+    pub fn as_pod_mut<T: crate::pod::Pod>(&mut self) -> Option<&mut T> {
+        if !self.holds::<T>(0) {
+            return None;
+        }
+        /* As above, and `&mut self` makes it the only reference. */
+        Some(unsafe { &mut *(self.ptr as *mut T) })
+    }
+
     /// Raw pointer access for buffers that a device writes concurrently
     /// (descriptor rings, completion queues).  Forming a `&`/`&mut` slice
     /// over such memory is unsound; use these with volatile reads/writes.

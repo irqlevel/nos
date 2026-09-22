@@ -302,7 +302,7 @@ the one failure that looks like success: a driver that enumerates perfectly
 and delivers no report leaves every boot-log check passing, and fails on "a
 command typed on the usb keyboard reaches the shell".
 
-### `hv-test.py` -- the extension turned on, and off again
+### `hv-test.py` -- the extension turned on and off again, and guests under it
 
 The [hypervisor](hypervisor.md) is a module, and the one piece of state it
 takes does not belong to it: `EFER.SVME` and `MSR_VM_HSAVE_PA` on AMD,
@@ -317,20 +317,38 @@ preceded by an `hv off`, and a load again; and the module answers "which
 CPUs is it on for" by sending each CPU an IPI that reads the register,
 rather than by reading its own bookkeeping, which is what makes the second
 load able to see what the first unload left. It also checks that `hv info`
-reports the two things a guest cannot do without -- nested paging and
-x2APIC -- that one named CPU can be turned on without the others, and that a
-second `insmod`, a CPU that does not exist and a word that is not a
-subcommand are each refused.
+reports nested paging, which a guest cannot do without, that one named CPU
+can be turned on without the others, and that a second `insmod`, a CPU that
+does not exist, a word that is not a subcommand and a guest that does not
+exist are each refused.
 
-It has been shown to fail the way it is meant to: with `disable_here`
-changed to report every CPU turned off and turn none of them off -- the
-silent failure it exists for -- six checks fail, the second load's among
-them, and the module's own warnings name the CPUs left on.
+In between it runs guests. Before `hv on`, and bound to a CPU the extension
+is off for, a guest is not run, and says which CPU. With it on everywhere,
+every [built-in guest](hypervisor.md#the-built-in-guests) runs bound to the
+first CPU and then to the last, and each has to have done what it was told
+-- not only "ok": the report's own lines are checked, the nested page
+fault's address, error code and instruction, the port and CPUID counts, the
+fifteen registers each way across the hypercall, a host interrupt count
+above zero for the spin. The unload that follows, and the load after it,
+are then of a hypervisor that has run guests on those CPUs.
+
+It has been shown to fail the way it is meant to, three ways. With
+`disable_here` changed to report every CPU turned off and turn none of them
+off -- the silent failure the unload round trip exists for -- six checks
+fail, the second load's among them, and the module's own warnings name the
+CPUs left on. With the run stub storing R8 into R9's slot, the hypercall
+guest fails on both CPUs, naming R8 as 0. And with the stub's `vmload` of
+the host's state taken out, the kernel panics at the first exit -- a page
+fault at 0 in `Hal::GetCurrentCpuHwId()`, the guest's GS base -- and the
+gate says so.
 
 x86-64 boots the ISO with `-cpu max`: the default `qemu64` model reports SVM
-without nested paging. `--arch aarch64` checks the other half -- that on a
-kernel running at EL1 the module loads, says a guest cannot run here and
-names the exception level, and refuses `hv on` rather than attempting it.
+without nested paging. It uses KVM only when the host CPU has AMD-V, since
+`-cpu host` hands the guest the host's own extension and the guests run
+under AMD-V; on an Intel host it is TCG. `--arch aarch64` checks the other
+half -- that on a kernel running at EL1 the module loads, says a guest
+cannot run here and names the exception level, and refuses `hv on` and
+`hv run` rather than attempting them.
 
 ## The hardware NIC drivers
 
