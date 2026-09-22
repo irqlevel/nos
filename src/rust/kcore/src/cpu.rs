@@ -25,6 +25,33 @@ pub fn run_on(cpu: u32, handler: extern "C" fn(*mut u8), ctx: *mut u8) {
     unsafe { ffi::cpu::kernel_cpu_run_on(cpu, handler, ctx) }
 }
 
+/// Run `f(arg)` on `cpu` and return once it has: `run_on` with the context a
+/// reference the compiler checks rather than a word every call site casts
+/// back by hand.
+///
+/// `arg` may be the caller's own stack, because `run_on` does not return
+/// until the handler has run -- so the borrow outlives the call by
+/// construction, and there is nothing to keep alive afterwards. `f` runs in
+/// interrupt context on the far CPU: registers, atomics and IRQ-safe locks,
+/// no sleeping and no allocating. Whatever it has to say comes back through
+/// an atomic in `arg`.
+pub fn run_on_with<T: Sync>(cpu: u32, arg: &T, f: fn(&T)) {
+    struct Call<'a, T> {
+        arg: &'a T,
+        f: fn(&T),
+    }
+
+    extern "C" fn trampoline<T: Sync>(raw: *mut u8) {
+        /* The one made below, and reached only through the `run_on` this
+         * function makes: it is alive for as long as that call. */
+        let call = unsafe { &*(raw as *const Call<'_, T>) };
+        (call.f)(call.arg);
+    }
+
+    let call = Call { arg, f };
+    run_on(cpu, trampoline::<T>, &call as *const Call<'_, T> as *mut u8);
+}
+
 extern "C" fn nothing(_ctx: *mut u8) {}
 
 /// Returns once every running CPU has taken an interrupt since the call, so

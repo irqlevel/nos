@@ -95,6 +95,7 @@ swallowing panic messages whole.
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
+| `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -300,6 +301,36 @@ and reads the shell's answer off the serial console. It is built to catch
 the one failure that looks like success: a driver that enumerates perfectly
 and delivers no report leaves every boot-log check passing, and fails on "a
 command typed on the usb keyboard reaches the shell".
+
+### `hv-test.py` -- the extension turned on, and off again
+
+The [hypervisor](hypervisor.md) is a module, and the one piece of state it
+takes does not belong to it: `EFER.SVME` and `MSR_VM_HSAVE_PA` on AMD,
+`CR4.VMXE` and VMX root operation on Intel are the CPU's, not a task's, and
+they outlive an `rmmod` that forgets them. What is left behind then is worse
+than a leak -- the page the CPU was told to save host state into has been
+freed and handed to somebody else, and the code that would have turned it
+off has been unmapped -- and nothing in the kernel would say so.
+
+So the gate is a load, a turn-on for every CPU, an `rmmod` that is *not*
+preceded by an `hv off`, and a load again; and the module answers "which
+CPUs is it on for" by sending each CPU an IPI that reads the register,
+rather than by reading its own bookkeeping, which is what makes the second
+load able to see what the first unload left. It also checks that `hv info`
+reports the two things a guest cannot do without -- nested paging and
+x2APIC -- that one named CPU can be turned on without the others, and that a
+second `insmod`, a CPU that does not exist and a word that is not a
+subcommand are each refused.
+
+It has been shown to fail the way it is meant to: with `disable_here`
+changed to report every CPU turned off and turn none of them off -- the
+silent failure it exists for -- six checks fail, the second load's among
+them, and the module's own warnings name the CPUs left on.
+
+x86-64 boots the ISO with `-cpu max`: the default `qemu64` model reports SVM
+without nested paging. `--arch aarch64` checks the other half -- that on a
+kernel running at EL1 the module loads, says a guest cannot run here and
+names the exception level, and refuses `hv on` rather than attempting it.
 
 ## The hardware NIC drivers
 

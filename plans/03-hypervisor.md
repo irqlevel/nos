@@ -23,6 +23,69 @@ to a shell with initramfs.
 
 ---
 
+## Where it stands
+
+Started. Two decisions were taken at the first commit and are worth not
+re-litigating; [`docs/hypervisor.md`](../docs/hypervisor.md) is the page that
+explains them at length.
+
+**It is a loadable module, not part of the image.** `hvarch` (the CPU's
+extension, all of the `unsafe`) and `hv` (everything above it) are workspace
+members but not *default* members, so the kernel's own build does not compile
+them; they exist only inside `modules/hv` → `hv.ko`. A machine that runs no
+guests therefore carries none of it, and above all leaves its CPUs in the
+state they booted in. The iteration loop is `insmod`/`rmmod` rather than
+rebuild-and-boot, which matters most for exactly the part this document says
+the time goes into. And unloading is a gate: a hypervisor that can be taken
+out has to prove every time that it turned the extension off before its code
+was freed -- which is the same check stage 5 needs, years early.
+
+The cost, stated so it is not discovered later: a module cannot register a
+block device or a NIC ([modules.md](../docs/modules.md)). That constrains how
+a guest's virtual devices are *served* -- this module emulates them over the
+kernel's own disks and NICs, which is what a hypervisor wants anyway -- not
+what the hypervisor can do.
+
+**SVM before VMX**, as the section below reasons, and now with the numbers:
+QEMU 10.2's TCG reports `svm yes, npt yes, x2apic yes, vgif yes` under
+`-cpu max` and `vmx no`, so on the development machine AMD-V is the only
+extension a guest can be brought up under at all. It also lacks `nrip-save`
+and `decodeassists`, which means the hypervisor works out where an
+intercepted instruction ended from a short table of known lengths -- not an
+instruction decoder, since every instruction intercepted on purpose has a
+length that is known, and an `IOIO` intercept hands over the next
+instruction's address regardless. Use `-cpu max`: the default `qemu64`
+reports SVM *without* nested paging.
+
+Done so far, against **3.1**:
+
+- `hvarch`: CPUID and the control MSRs; AMD-V and Intel VT-x probed and
+  reported feature by feature; the extension turned on and off for a CPU
+  (`EFER.SVME` + `MSR_VM_HSAVE_PA`, or `IA32_FEATURE_CONTROL` + `CR4.VMXE` +
+  `vmxon`), with the CR0/CR4 fixed bits checked before VMXON rather than
+  found out by #GP; an arm64 backend that reports the exception level and
+  what stage-2 would offer, and says plainly that EL2 is a boot-path change
+  and not a module's.
+- `hv`: the machine, the per-CPU pages (allocated in task context, because
+  the IPI that hands one over may not allocate) and the enabled mask, both
+  under one lock, freed only after the CPU says it is done.
+- `modules/hv`: the `hv` command, and a `Drop` that turns the extension off
+  and reads back what is left.
+- `scripts/hv-test.py`, on both architectures.
+
+Next, in order: the VMCB, a nested page table, and a guest of a few bytes
+that exits where it was told to (3.2, 3.3).
+
+Before the first VMX guest, one change outside the hypervisor: the boot path
+has to set `CR0.NE` on every CPU. VMX requires it, the APs come out of INIT
+without it and nothing sets it, so on the EX44 and the Dell `hv on` refuses
+today with `HostState` -- by design, since `vmxon` would fault rather than
+fail. The kernel has no x87 code for NE to affect (none in the image, no
+floating point in the C++, soft-float Rust), so the change is one bit beside
+`EnableWxSupport`'s WP; it goes in with the VMX backend, where a guest can
+show it working. [`docs/hypervisor.md`](../docs/hypervisor.md) has the
+detail.
+
 ## Choose VMX vs SVM based on the dev environment
 
 This choice is driven by where you actually iterate:

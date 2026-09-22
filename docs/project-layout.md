@@ -40,10 +40,12 @@ src/rust/
   virtio/     The virtio foundation: the split virtqueue, the transport contract, virtio-pci (modern and legacy) and virtio-mmio v2
   tls/        The TLS client: rustls + RustCrypto + webpki-roots, driven through rustls' unbuffered API, over a transport it is handed as a trait (docs/tls.md)
   ssh/        An SSH server's protocol, with no kernel in it; the sshd module serves it (docs/sshd.md)
+  hvarch/     The CPU's virtualization extension: CPUID and the control MSRs, AMD-V (x86/svm.rs) and Intel VT-x (x86/vmx.rs), the Arm EL2 probe (arm64.rs). All of the hypervisor's unsafe, so that the rest of it has none (docs/hypervisor.md)
+  hv/         The hypervisor above the CPU, all of it safe: the machine's extension and which CPUs it is on for (machine.rs) -- and, as it grows, the VM, its nested page tables, its emulated devices and the exit dispatcher. Neither this nor hvarch is a default member of the workspace: they are compiled only into the hv module, so a kernel without it carries no hypervisor at all
   hello/      Rust self-test module
   kernel/     Rust entry points (rust_init, rust_fini), global allocator, the `sha256` command
   kmod/       Runtime of a loadable module: allocator, panic handler, the module! header
-  modules/    Loadable modules, each built into a .ko (hello; sshd, an SSH server; blkload, a block I/O load test; netload, a UDP load test from either end; netblk, a disk served over UDP, zero-copy; modtest, which the boot test loads; slowexit, an exit that takes its time)
+  modules/    Loadable modules, each built into a .ko (hello; sshd, an SSH server; blkload, a block I/O load test; netload, a UDP load test from either end; netblk, a disk served over UDP, zero-copy; hv, the hypervisor; modtest, which the boot test loads; slowexit, an exit that takes its time)
   vendor/     The sources of the external crates (what tls and ssh depend on, and what std itself resolves to), so that a build runs `cargo --offline`; scripts/vendor.sh refreshes it
   rust-toolchain.toml  The dated nightly everything is built with
 build/        Linker scripts, GRUB configs, the awk script that makes the module export table

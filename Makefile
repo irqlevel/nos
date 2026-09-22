@@ -371,7 +371,7 @@ $(RUST_LIB): $(RUST_SRC) $(FLAVOR_STAMP)
 # large one has no position-independent form worth having; and
 # compiler-builtins' own memcpy and friends, so that a module imports nothing
 # but the kernel's API.
-MODULES = hello modtest slowexit blkload netblk netload sshd
+MODULES = hello modtest slowexit blkload netblk netload sshd hv
 MODULE_KO = $(patsubst %,$(OUT)/modules/%.ko,$(MODULES))
 MODULE_RUSTFLAGS_x86_64 = ["-Ccode-model=small","-Crelocation-model=pic"]
 MODULE_RUSTFLAGS_aarch64 = ["-Crelocation-model=pic"]

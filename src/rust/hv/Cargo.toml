@@ -1,0 +1,14 @@
+[package]
+name = "hv"
+version = "0.1.0"
+edition = "2021"
+
+# The hypervisor, less the CPU: the machine's extension and which CPUs it is
+# on for, and -- as this grows -- the VM, its memory, the devices it emulates
+# and the dispatcher its exits go through. All of it safe Rust; what is not
+# is in `hvarch`, and `scripts/unsafe-count.py hv hvarch` is the check.
+[lib]
+
+[dependencies]
+kcore = { path = "../kcore" }
+hvarch = { path = "../hvarch" }
