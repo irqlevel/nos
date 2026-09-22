@@ -41,10 +41,16 @@ RUST_UB_CFG = $(if $(filter 1,$(RUSTUB)),--config profile.release.debug-assertio
 FLAVOR = $(if $(filter 1,$(UBSAN)),ubsan,plain)$(if $(filter 1,$(RUSTUB)),+rustub)
 OUT = out/$(ARCH)$(if $(filter 1,$(UBSAN)),-ubsan)
 
-# Per-arch toolchain and flags. x86_64 flags are verbatim the historical ones
-# (order preserved: -mcmodel=kernel then -mcmodel=large, large wins).
+# Per-arch toolchain and flags. x86_64 flags are the historical ones (order
+# preserved: -mcmodel=kernel then -mcmodel=large, large wins) plus -mno-80387.
+# With SSE off, floating point inside a function silently falls back to the
+# x87, whose registers the context switch saves no more than the XMM ones --
+# two tasks using it would share one register stack. Without the x87 it
+# becomes calls to the soft-float helpers the Rust staticlib's
+# compiler_builtins links anyway, which touch no FP state at all: what arm64's
+# -mgeneral-regs-only already made of it.
 TARGET_x86_64 = x86_64-none-elf
-ARCH_CXXFLAGS_x86_64 = -mno-sse -mcmodel=kernel -mcmodel=large -mno-red-zone
+ARCH_CXXFLAGS_x86_64 = -mno-sse -mno-80387 -mcmodel=kernel -mcmodel=large -mno-red-zone
 LD_x86_64 = ld
 NM_x86_64 = nm
 RUST_TARGET_x86_64 = x86_64-unknown-none

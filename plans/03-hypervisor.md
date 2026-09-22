@@ -80,8 +80,8 @@ Before the first VMX guest, one change outside the hypervisor: the boot path
 has to set `CR0.NE` on every CPU. VMX requires it, the APs come out of INIT
 without it and nothing sets it, so on the EX44 and the Dell `hv on` refuses
 today with `HostState` -- by design, since `vmxon` would fault rather than
-fail. The kernel has no x87 code for NE to affect (none in the image, no
-floating point in the C++, soft-float Rust), so the change is one bit beside
+fail. The kernel has no x87 code for NE to affect (the C++ is built with
+`-mno-80387`, the Rust is soft-float), so the change is one bit beside
 `EnableWxSupport`'s WP; it goes in with the VMX backend, where a guest can
 show it working. [`docs/hypervisor.md`](../docs/hypervisor.md) has the
 detail.
