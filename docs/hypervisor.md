@@ -159,8 +159,9 @@ registers are per CPU: a verdict that changed with the CPU `insmod` happened
 to run on would be no verdict. The fix is one bit on every CPU, beside where
 `EnableWxSupport` sets WP -- what every other x86-64 kernel does. NE chooses
 native `#MF` over the PC's FERR#/IRQ 13 for x87 errors, and this kernel has
-no x87 code to raise one: there is no x87 instruction in the linked image,
-the C++ has no floating point, and the Rust targets are soft-float. It is
+no x87 code to raise one: the C++ is built with `-mno-80387`, so there is no
+x87 instruction in the image and none can appear, and the Rust targets are
+soft-float. It is
 still a change to how every x86 machine boots, the two whose only console is
 the network among them, so it belongs to the change that brings up the VMX
 backend, where a guest can show it working -- not slipped in here.
