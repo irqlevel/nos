@@ -107,6 +107,7 @@ SCRIPT = [
 # What `hv run all` has to have said about each guest, beyond its verdict.
 GUESTS = {
     "exits": [r'said\s+"nos: ports and cpuid"', r"1 port in, 20 port out, 1 cpuid"],
+    "uart": [r"brought up the 8250 and sent 35 bytes through it"],
     "hypercall": [r'said\s+"nos: long mode"', r"15 registers went out at the hypercall and 15 answers came back"],
     "fault": [r"nested page fault at gpa 0x1ff000, error 0x1[0-9a-f]{8}, rip 0x8005"],
     "triple": [r"shutdown \(triple fault\)"],

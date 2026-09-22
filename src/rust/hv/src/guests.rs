@@ -34,9 +34,13 @@ use core::fmt::Write;
 use hvarch::Result;
 use kcore::time;
 
+use crate::devices::Uart;
 use crate::machine::Machine;
 use crate::svm::{Exit, LongMode};
 use crate::vm::{Refusal, Vm};
+
+/// COM1's port base: the serial console a guest's `console=ttyS0` writes to.
+const COM1: u16 = 0x3F8;
 
 /// The port a guest writes its text to, as Bochs and QEMU's debugcon have
 /// it. Reading it answers its own number, which is how a guest tells that it
@@ -89,6 +93,8 @@ struct Run {
     /// The guest's registers at its hypercall: RAX, RBX, RCX, RDX, RSI, RDI,
     /// RBP, R8-R15.
     at_hypercall: Option<[u64; 15]>,
+    /// The emulated serial console, and what the guest sent it.
+    uart: Uart,
     stop: Stop,
     ns: u64,
 }
@@ -120,6 +126,7 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
         hypercall: 0,
         host: 0,
         at_hypercall: None,
+        uart: Uart::new(),
         stop: Stop::Budget,
         ns: 0,
     };
@@ -141,6 +148,20 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
             /* Taken by the host on the way out, with the guest's state
              * safely in the VMCB: straight back in. */
             Exit::Host => run.host += 1,
+            Exit::Io(io) if io.size == 1 && !io.string && Uart::owns(COM1, io.port) => {
+                let v = vm.vcpu_mut();
+                let offset = io.port - COM1;
+                if io.input {
+                    let byte = run.uart.read(offset);
+                    let s = v.save_mut();
+                    s.rax = (s.rax & !0xFF) | byte as u64;
+                    run.port_in += 1;
+                } else {
+                    run.uart.write(offset, v.save().rax as u8);
+                    run.port_out += 1;
+                }
+                v.skip_io(&io);
+            }
             Exit::Io(io) if io.port == DEBUG_PORT && io.size == 1 && !io.string => {
                 let v = vm.vcpu_mut();
                 if io.input {
@@ -219,6 +240,14 @@ const GUESTS: &[Spec] = &[
         budget_ms: 2000,
         build: build_exits,
         check: check_exits,
+    },
+    Spec {
+        name: "uart",
+        about: "an 8250 brought up and written to over port I/O",
+        exceptions: ALL_EXCEPTIONS,
+        budget_ms: 2000,
+        build: build_uart,
+        check: check_uart,
     },
     Spec {
         name: "hypercall",
@@ -474,6 +503,32 @@ fn check_exits(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
         return Err(alloc::format!("the port read came back as {:#x}", port));
     }
     Ok(String::from("the port answered 0xe9 and cpuid \"nos hypervisor\", and both came back out of guest memory"))
+}
+
+
+/* An 8250 brought up the way a driver does -- disable interrupts, set the
+ * divisor behind DLAB, 8N1, the FIFO on, DTR/RTS/OUT2 -- then a line polled
+ * out of LSR.THRE a byte at a time. It writes 0xA5 to the scratch register
+ * and reads it back first, a presence test the emulated UART has to pass. */
+const UART_CODE: &[u8] = &[
+    0x66, 0xBA, 0xF9, 0x03, 0x30, 0xC0, 0xEE, 0x66, 0xBA, 0xFB, 0x03, 0xB0, 0x80, 0xEE, 0x66, 0xBA, 0xF8, 0x03, 0xB0, 0x01, 0xEE, 0x66, 0xBA, 0xF9, 0x03, 0x30, 0xC0, 0xEE, 0x66, 0xBA, 0xFB, 0x03, 0xB0, 0x03, 0xEE, 0x66, 0xBA, 0xFA, 0x03, 0xB0, 0xC7, 0xEE, 0x66, 0xBA, 0xFC, 0x03, 0xB0, 0x0B, 0xEE, 0x66, 0xBA, 0xFF, 0x03, 0xB0, 0xA5, 0xEE, 0xEC, 0x41, 0x88, 0xC0, 0x48, 0x8D, 0x35, 0x18, 0x00, 0x00, 0x00, 0xAC, 0x84, 0xC0, 0x74, 0x12, 0x66, 0xBA, 0xFD, 0x03, 0x50, 0xEC, 0xA8, 0x20, 0x58, 0x74, 0xF5, 0x66, 0xBA, 0xF8, 0x03, 0xEE, 0xEB, 0xE9, 0xF4,
+    b'n', b'o', b's', b':', b' ', b'h', b'e', b'l', b'l', b'o', b' ', b'f', b'r', b'o', b'm',
+    b' ', b'a', b' ', b'g', b'u', b'e', b's', b't', b' ', b'o', b'v', b'e', b'r', b' ',
+    b't', b't', b'y', b'S', b'0', 10, 0,
+];
+const UART_HLT: u64 = ENTRY + 0x5A;
+const UART_SAYS: &str = "nos: hello from a guest over ttyS0\n";
+
+fn build_uart(vm: &mut Vm) -> Result<()> {
+    board(vm, UART_CODE)
+}
+
+fn check_uart(_vm: &Vm, r: &Run) -> core::result::Result<String, String> {
+    halted_at(r, UART_HLT)?;
+    if r.uart.output() != UART_SAYS {
+        return Err(alloc::format!("the UART received {:?}", r.uart.output()));
+    }
+    Ok(alloc::format!("the guest brought up the 8250 and sent {} bytes through it", r.uart.written()))
 }
 
 const HYPERCALL_CODE: &[u8] = &[
