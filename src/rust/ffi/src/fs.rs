@@ -6,6 +6,10 @@ unsafe extern "C" {
     pub fn kernel_file_size(path: *const u8, path_len: usize) -> isize;
     /// Up to cap bytes from the start of the file: the count read.
     pub fn kernel_file_read(path: *const u8, path_len: usize, buf: *mut u8, cap: usize) -> isize;
+    /// Up to cap bytes from `offset`: the count read, 0 at or past the end.
+    pub fn kernel_file_read_at(
+        path: *const u8, path_len: usize, offset: u64, buf: *mut u8, cap: usize,
+    ) -> isize;
     /// Replaces the file's content -- making the file if it is missing --
     /// without ever leaving it empty or half written.
     pub fn kernel_file_write(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;

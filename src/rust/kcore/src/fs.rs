@@ -31,6 +31,28 @@ pub fn read(path: &str, max: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// The file's size in bytes: NotFound when there is no such file.
+pub fn size(path: &str) -> Result<u64> {
+    let size = unsafe { fs::kernel_file_size(path.as_ptr(), path.len()) };
+    if size < 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(size as u64)
+}
+
+/// As much of `buf` as the file has from `offset`: the count read, 0 at or
+/// past its end. For a file too large to read whole -- a guest's kernel --
+/// a piece at a time.
+pub fn read_at(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    let got = unsafe {
+        fs::kernel_file_read_at(path.as_ptr(), path.len(), offset, buf.as_mut_ptr(), buf.len())
+    };
+    if got < 0 {
+        return Err(Error::IoError);
+    }
+    Ok(got as usize)
+}
+
 /// Replaces the file's content, making the file if it is missing: the new
 /// content is written whole, and synced, before it takes the old one's place
 /// -- a full disk or a crash midway leaves the old content, never an empty
