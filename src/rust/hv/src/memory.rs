@@ -6,19 +6,16 @@ use alloc::vec::Vec;
 
 use hvarch::{Error, Result};
 use kcore::consts::PAGE_SIZE;
-use kcore::dma::DmaBuffer;
+use kcore::frame::Frame;
 use kcore::pod::{self, Pod};
 
 #[cfg(target_arch = "x86_64")]
 use crate::npt::Npt;
 
-/// The most pages the page allocator hands out in one physically contiguous
-/// run. Guest memory does not need to be contiguous -- the nested table
-/// translates it page by page -- so a region is as many of these as it
-/// takes.
-const CHUNK_PAGES: usize = 128;
-const CHUNK_BYTES: u64 = (CHUNK_PAGES * PAGE_SIZE) as u64;
 const PAGE: u64 = PAGE_SIZE as u64;
+/// Frames are kept in runs of this many, so that no one allocation of the
+/// table of them outgrows a page however large the guest is.
+const RUN_FRAMES: usize = PAGE_SIZE / core::mem::size_of::<Frame>();
 
 /// Where a guest's physical address space ends: four levels of nested table
 /// translate 48 bits, and an address above that faults whatever is mapped.
@@ -26,13 +23,15 @@ pub const MAX_GPA: u64 = 1 << 48;
 
 /// A guest's memory.
 ///
-/// The guest writes it whenever it runs, on whatever CPU it runs on, so a
-/// Rust reference into it would be a promise the guest does not keep --
-/// and a reference that changes under the compiler is undefined behaviour
-/// however it is used. So nothing here hands one out. Every access is a
-/// copy, made with volatile loads and stores, into or out of the host's own
-/// memory, and bounds-checked against the region it falls in: an address
-/// the guest gave, whatever it is, is at worst an `Unmapped`.
+/// Its pages are [`Frame`]s: RAM the kernel handed out by address and mapped
+/// nowhere, so that the guest's nested table is the only mapping of it there
+/// is, and a guest of any size costs pages and no kernel address space. The
+/// guest writes it whenever it runs, on whatever CPU it runs on, so nothing
+/// here hands out a reference into it -- a reference that changes under the
+/// compiler is undefined behaviour however it is used. Every access is a
+/// copy, bounds-checked against the region it falls in, made by the kernel
+/// through its temporary window onto the page: an address the guest gave,
+/// whatever it is, is at worst an `Unmapped`.
 ///
 /// The nested table is inside, and that is the point of it. A guest reaches
 /// exactly what its nested table maps, and the table here maps nothing but
@@ -40,19 +39,19 @@ pub const MAX_GPA: u64 = 1 << 48;
 /// only with the table -- so "the guest can reach host memory it was not
 /// given" is not a thing a caller can get wrong.
 pub struct GuestMemory {
-    regions: Vec<Region>,
+    /* Before the regions, so that it is dropped first: the table goes
+     * before the pages it maps are back on the free list. */
     #[cfg(target_arch = "x86_64")]
     npt: Npt,
+    regions: Vec<Region>,
 }
 
 /// One run of guest physical addresses with memory behind it.
 struct Region {
     base: u64,
     size: u64,
-    /// `CHUNK_BYTES` each, in order; the last may be larger than what is
-    /// left of the region, since the allocator rounds up to a power of two,
-    /// and what is past the region is neither mapped nor reachable.
-    chunks: Vec<DmaBuffer>,
+    /// One frame a page, in order, `RUN_FRAMES` to a run.
+    runs: Vec<Vec<Frame>>,
 }
 
 impl Region {
@@ -60,10 +59,15 @@ impl Region {
         gpa >= self.base && len <= self.size && gpa - self.base <= self.size - len
     }
 
-    /// The chunk `gpa` is in, and where in it: `gpa` is inside the region.
-    fn locate(&self, gpa: u64) -> (usize, usize) {
-        let off = gpa - self.base;
-        ((off / CHUNK_BYTES) as usize, (off % CHUNK_BYTES) as usize)
+    /// The frame `gpa` is in, and where in it: `gpa` is inside the region.
+    fn frame(&self, gpa: u64) -> (&Frame, usize) {
+        let page = ((gpa - self.base) / PAGE) as usize;
+        (&self.runs[page / RUN_FRAMES][page % RUN_FRAMES], (gpa % PAGE) as usize)
+    }
+
+    fn frame_mut(&mut self, gpa: u64) -> (&mut Frame, usize) {
+        let page = ((gpa - self.base) / PAGE) as usize;
+        (&mut self.runs[page / RUN_FRAMES][page % RUN_FRAMES], (gpa % PAGE) as usize)
     }
 }
 
@@ -71,9 +75,9 @@ impl GuestMemory {
     /// No memory at all, and a nested table that maps nothing.
     pub fn new() -> Result<Self> {
         Ok(Self {
-            regions: Vec::new(),
             #[cfg(target_arch = "x86_64")]
             npt: Npt::new()?,
+            regions: Vec::new(),
         })
     }
 
@@ -91,26 +95,30 @@ impl GuestMemory {
             return Err(Error::BadAddress);
         }
 
-        let mut chunks = Vec::new();
-        let mut left = size;
+        /* The kernel zeroes every frame it hands out: what the guest finds
+         * in its memory is what it was given, never what the host left
+         * there. A failure part way drops what was taken. */
+        let pages = (size / PAGE) as usize;
+        let mut runs: Vec<Vec<Frame>> = Vec::new();
+        runs.try_reserve_exact(pages.div_ceil(RUN_FRAMES)).map_err(|_| Error::NoMemory)?;
+        let mut left = pages;
         while left > 0 {
-            let bytes = left.min(CHUNK_BYTES);
-            let mut chunk = DmaBuffer::new((bytes / PAGE) as usize).ok_or(Error::NoMemory)?;
-            /* The page allocator zeroes what it hands out; this says so
-             * where it matters most. What the guest finds in its memory is
-             * what it was given, never what the host left there. */
-            chunk.as_mut_slice().fill(0);
-            chunks.try_reserve(1).map_err(|_| Error::NoMemory)?;
-            chunks.push(chunk);
-            left -= bytes;
+            let n = left.min(RUN_FRAMES);
+            let mut run = Vec::new();
+            run.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
+            for _ in 0..n {
+                run.push(Frame::new().ok_or(Error::NoMemory)?);
+            }
+            runs.push(run);
+            left -= n;
         }
-        /* The tables first, which is all that can fail for want of memory:
+        /* The tables next, which is all that can fail for want of memory:
          * a failure there leaves empty tables and no page mapped. */
         #[cfg(target_arch = "x86_64")]
         self.npt.prepare(base, size)?;
 
         self.regions.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        self.regions.push(Region { base, size, chunks });
+        self.regions.push(Region { base, size, runs });
 
         /* Owned first, mapped after, so every page the table points at is
          * this value's from before the moment it is reachable. */
@@ -118,13 +126,9 @@ impl GuestMemory {
         {
             let region = self.regions.last().expect("just pushed");
             let mut gpa = base;
-            for chunk in &region.chunks {
-                let mut off = 0u64;
-                while off < CHUNK_BYTES && gpa < base + size {
-                    self.npt.set(gpa, chunk.phys() + off)?;
-                    off += PAGE;
-                    gpa += PAGE;
-                }
+            for frame in region.runs.iter().flatten() {
+                self.npt.set(gpa, frame.phys())?;
+                gpa += PAGE;
             }
         }
         Ok(())
@@ -146,9 +150,11 @@ impl GuestMemory {
         let region = &self.regions[self.region(gpa, buf.len())?];
         let mut done = 0usize;
         while done < buf.len() {
-            let (chunk, off) = region.locate(gpa + done as u64);
-            let n = (buf.len() - done).min(CHUNK_BYTES as usize - off);
-            copy_out(&region.chunks[chunk], off, &mut buf[done..done + n])?;
+            let (frame, off) = region.frame(gpa + done as u64);
+            let n = (buf.len() - done).min(PAGE_SIZE - off);
+            if !frame.read(off, &mut buf[done..done + n]) {
+                return Err(Error::Unmapped);
+            }
             done += n;
         }
         Ok(())
@@ -160,9 +166,11 @@ impl GuestMemory {
         let region = &mut self.regions[index];
         let mut done = 0usize;
         while done < data.len() {
-            let (chunk, off) = region.locate(gpa + done as u64);
-            let n = (data.len() - done).min(CHUNK_BYTES as usize - off);
-            copy_in(&mut region.chunks[chunk], off, &data[done..done + n])?;
+            let (frame, off) = region.frame_mut(gpa + done as u64);
+            let n = (data.len() - done).min(PAGE_SIZE - off);
+            if !frame.write(off, &data[done..done + n]) {
+                return Err(Error::Unmapped);
+            }
             done += n;
         }
         Ok(())
@@ -185,41 +193,4 @@ impl GuestMemory {
     pub(crate) fn nested_root(&self) -> u64 {
         self.npt.root()
     }
-}
-
-/* The copies themselves: eight bytes at a time where the guest's side is
- * aligned for it, a byte at a time elsewhere, every access volatile and
- * bounds-checked by the buffer. `false` from a buffer is a range the checks
- * above should have refused, and is said as one. */
-
-fn copy_out(chunk: &DmaBuffer, off: usize, dst: &mut [u8]) -> Result<()> {
-    let mut i = 0usize;
-    while i < dst.len() {
-        if (off + i) % 8 == 0 && dst.len() - i >= 8 {
-            let word = chunk.load::<u64>(off + i).ok_or(Error::Unmapped)?;
-            dst[i..i + 8].copy_from_slice(&word.to_le_bytes());
-            i += 8;
-        } else {
-            dst[i] = chunk.load::<u8>(off + i).ok_or(Error::Unmapped)?;
-            i += 1;
-        }
-    }
-    Ok(())
-}
-
-fn copy_in(chunk: &mut DmaBuffer, off: usize, src: &[u8]) -> Result<()> {
-    let mut i = 0usize;
-    while i < src.len() {
-        let (n, stored) = if (off + i) % 8 == 0 && src.len() - i >= 8 {
-            let word = u64::from_le_bytes(src[i..i + 8].try_into().expect("eight bytes"));
-            (8, chunk.store::<u64>(off + i, word))
-        } else {
-            (1, chunk.store::<u8>(off + i, src[i]))
-        };
-        if !stored {
-            return Err(Error::Unmapped);
-        }
-        i += n;
-    }
-    Ok(())
 }

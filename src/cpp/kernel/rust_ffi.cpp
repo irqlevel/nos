@@ -567,6 +567,97 @@ unsigned long kernel_virt_to_phys(const void* virt_addr)
     return Kernel::Mm::PageTable::GetInstance().VirtToPhys((ulong)virt_addr);
 }
 
+/* ---- Frames: pages of RAM mapped nowhere (kcore::frame) ---- */
+
+unsigned long kernel_frame_alloc()
+{
+    /* AllocPage zeroes what it hands out, through the temp map. */
+    Kernel::Mm::Page* page = Kernel::Mm::PageTable::GetInstance().AllocPage();
+    return page ? page->GetPhyAddress() : 0;
+}
+
+void kernel_frame_free(unsigned long phys)
+{
+    Kernel::Mm::PageTable::GetInstance().FreeFrame(phys);
+}
+
+/* Copy between a frame and the caller's memory through one temp-map slot.
+   Preemption and interrupts are off from the map to the unmap: the unmap
+   invalidates only this CPU's TLB, so a task moved to another CPU mid-copy
+   would leave that slot's translation stale behind it (VirtToPhys has the
+   same window, for the same reason). The frame's side is volatile -- what it
+   holds may be a guest's memory, written while the copy runs -- and moves a
+   word at a time where it is aligned for one; the caller's side goes through
+   MemCpy, since its buffer has no alignment to promise. */
+static int FrameCopy(unsigned long phys, unsigned long offset,
+    unsigned char* buf, unsigned long len, bool toFrame)
+{
+    if (len == 0)
+        return 0;
+    if (!buf || offset >= Const::PageSize || len > Const::PageSize - offset)
+        return -1;
+
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
+    if (!pt.IsFrameAddress(phys))
+        return -1;
+
+    ulong flags = Kernel::PreemptIrqSave();
+    ulong va = pt.TmpMapPage(phys);
+    if (va == 0)
+    {
+        Kernel::PreemptIrqRestore(flags);
+        return -1;
+    }
+
+    ulong at = va + offset;
+    unsigned long i = 0;
+    while (i < len)
+    {
+        if (((at + i) % sizeof(u64)) == 0 && len - i >= sizeof(u64))
+        {
+            volatile u64* word = reinterpret_cast<volatile u64*>(at + i);
+            u64 value;
+            if (toFrame)
+            {
+                Stdlib::MemCpy(&value, buf + i, sizeof(value));
+                *word = value;
+            }
+            else
+            {
+                value = *word;
+                Stdlib::MemCpy(buf + i, &value, sizeof(value));
+            }
+            i += sizeof(u64);
+        }
+        else
+        {
+            volatile u8* byte = reinterpret_cast<volatile u8*>(at + i);
+            if (toFrame)
+                *byte = buf[i];
+            else
+                buf[i] = *byte;
+            i++;
+        }
+    }
+
+    pt.TmpUnmapPage(va);
+    Kernel::PreemptIrqRestore(flags);
+    return 0;
+}
+
+int kernel_frame_read(unsigned long phys, unsigned long offset,
+    unsigned char* buf, unsigned long len)
+{
+    return FrameCopy(phys, offset, buf, len, false);
+}
+
+int kernel_frame_write(unsigned long phys, unsigned long offset,
+    const unsigned char* data, unsigned long len)
+{
+    /* FrameCopy only reads the caller's side when toFrame is set. */
+    return FrameCopy(phys, offset, const_cast<unsigned char*>(data), len, true);
+}
+
 int kernel_get_random(unsigned char* buf, unsigned long len)
 {
     if (!buf || len == 0)

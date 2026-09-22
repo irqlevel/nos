@@ -218,6 +218,23 @@ public:
     Page* AllocContiguousPages(ulong count);
     void FreePage(Page* page);
 
+    /* Frames: pages handed out by address and mapped nowhere -- not into
+       the kernel's space, nor into any table but whatever their owner puts
+       them in (a guest's nested page table). The owner is a Rust value
+       (kcore::frame::Frame) on the far side of the C ABI, which is why a
+       frame is named by its physical address rather than its descriptor,
+       and why every address that comes back is checked.
+
+       IsFrameAddress: whether phyAddr is page-aligned and has a descriptor,
+       without the panic GetPage has for one that does not. Takes no
+       reference.
+
+       FreeFrame: back onto the free list. A page that is on the list
+       already -- a frame freed twice -- is a panic here rather than a free
+       list that loops. */
+    bool IsFrameAddress(ulong phyAddr);
+    void FreeFrame(ulong phyAddr);
+
 private:
     PageTable(const PageTable& other) = delete;
     PageTable(PageTable&& other) = delete;

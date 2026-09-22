@@ -973,6 +973,33 @@ void PageTable::FreePage(Page* page)
     FreePageNoLock(page);
 }
 
+bool PageTable::IsFrameAddress(ulong phyAddr)
+{
+    if (phyAddr & (Const::PageSize - 1))
+        return false;
+
+    /* PageArray and its count are set once in Setup() and never change. */
+    ulong index = phyAddr / Const::PageSize;
+    if (PageArray == nullptr || index >= PageArrayCount)
+        return false;
+
+    return PageArray[index].GetPhyAddress() == phyAddr;
+}
+
+void PageTable::FreeFrame(ulong phyAddr)
+{
+    BugOn(!IsFrameAddress(phyAddr));
+
+    Stdlib::AutoLock lock(Lock);
+
+    Page* page = &PageArray[phyAddr / Const::PageSize];
+    /* A page handed out has a self-pointing entry (AllocPageNoLock); one on
+       the free list points into it. Inserting the second kind again would
+       make the list a loop. */
+    BugOn(page->ListEntry.Flink != &page->ListEntry);
+    FreePageNoLock(page);
+}
+
 /* Sentinel for TmpMapPageArray when page was mapped without a Page struct (e.g. reserved ACPI region). */
 static Page* const TmpMapDirectSentinel = (Page*)1;
 
