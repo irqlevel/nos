@@ -31,6 +31,7 @@ extern crate alloc;
 
 mod machine;
 mod memory;
+mod devices;
 #[cfg(target_arch = "x86_64")]
 mod npt;
 #[cfg(target_arch = "x86_64")]
@@ -42,6 +43,7 @@ pub mod guests;
 
 pub use hvarch::{Caps, Error, Ext, Result, Vendor};
 pub use machine::{Machine, Refused};
+pub use devices::Uart;
 pub use memory::GuestMemory;
 
 /// No guest runs on this architecture yet: the extension is EL2, which this
