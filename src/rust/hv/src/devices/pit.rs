@@ -143,11 +143,14 @@ pub struct Pit {
     ch: [Channel; 3],
     /// Port 0x61 as last written, less the read-only output bit.
     port61: u8,
+    /// How many channel-0 periods had elapsed at the last `ch0_fire`, so an
+    /// edge is counted once: the running total of IRQ0s the timer owes.
+    ch0_edges_seen: u64,
 }
 
 impl Pit {
     pub fn new() -> Self {
-        Self { ch: [Channel::new(), Channel::new(), Channel::new()], port61: 0 }
+        Self { ch: [Channel::new(), Channel::new(), Channel::new()], port61: 0, ch0_edges_seen: 0 }
     }
 
     /// Whether `port` is one this device answers.
@@ -208,8 +211,34 @@ impl Pit {
             CH0..=CH2 => {
                 let index = (port - CH0) as usize;
                 self.write_counter(index, value);
+                if index == 0 {
+                    /* A fresh channel-0 program restarts its edge count. */
+                    self.ch0_edges_seen = 0;
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Whether channel 0 has completed at least one more period since this
+    /// was last asked -- an IRQ0 edge the run loop should raise. Advances the
+    /// seen count by all whole periods elapsed, so a burst behind a slow
+    /// entry collapses to one interrupt rather than a backlog (the tick a
+    /// guest missed while it was not running is not owed to it many times
+    /// over).
+    pub fn ch0_fire(&mut self) -> bool {
+        let ch = &self.ch[0];
+        /* Only the periodic modes generate a train of edges; a one-shot
+         * channel-0 (mode 0) is not how a kernel drives the tick. */
+        if !ch.running || ch.reload_ticks() == 0 || !matches!(ch.mode, 2 | 3) {
+            return false;
+        }
+        let edges = ch.elapsed() / ch.reload_ticks();
+        if edges > self.ch0_edges_seen {
+            self.ch0_edges_seen = edges;
+            true
+        } else {
+            false
         }
     }
 

@@ -57,13 +57,19 @@ const MSR_DSR: u8 = 1 << 5;
 const MSR_RI: u8 = 1 << 6;
 const MSR_DCD: u8 = 1 << 7;
 
-/* Interrupt-identification: bit 0 set means no interrupt is pending, which
- * is always so here -- this UART raises none yet. */
+/* Interrupt-enable bits (register 1). */
+const IER_RX: u8 = 1 << 0;
+const IER_THRE: u8 = 1 << 1;
+
+/* Interrupt-identification (register 2): bit 0 set means no interrupt is
+ * pending; otherwise bits 1-3 name the cause. */
 const IIR_NONE: u8 = 0x01;
+const IIR_THRE: u8 = 0x02;
+const IIR_RX: u8 = 0x04;
 
 /// The most of a guest's console output kept for a report, so a guest that
 /// prints without end is not a reason for the host to run out of memory.
-const OUTPUT_MAX: usize = 16 * 1024;
+const OUTPUT_MAX: usize = 64 * 1024;
 
 /// One 16550A.
 pub struct Uart {
@@ -82,6 +88,9 @@ pub struct Uart {
     /// A byte waiting to be read back, if the last thing written went round
     /// the loopback.
     loopback: Option<u8>,
+    /// A byte waiting for the guest to read (receive path); none yet, since
+    /// nothing types at the guest.
+    rx: Option<u8>,
 }
 
 impl Uart {
@@ -97,6 +106,7 @@ impl Uart {
             truncated: false,
             written: 0,
             loopback: None,
+            rx: None,
         }
     }
 
@@ -114,17 +124,28 @@ impl Uart {
         match offset {
             RBR_THR_DLL if self.dlab() => self.dll,
             RBR_THR_DLL => {
-                /* Data register: whatever loopback left, else nothing. */
-                self.loopback.take().unwrap_or(0)
+                /* Data register: a received byte, whatever loopback left,
+                 * else nothing. */
+                self.rx.take().or_else(|| self.loopback.take()).unwrap_or(0)
             }
             IER_DLM if self.dlab() => self.dlm,
             IER_DLM => self.ier,
-            IIR_FCR => IIR_NONE,
+            IIR_FCR => {
+                /* The pending cause, highest priority first; reading it is
+                 * one of the ways the THR-empty interrupt is cleared. */
+                if self.ier & IER_RX != 0 && self.rx.is_some() {
+                    IIR_RX
+                } else if self.ier & IER_THRE != 0 {
+                    IIR_THRE
+                } else {
+                    IIR_NONE
+                }
+            }
             LCR => self.lcr,
             MCR => self.mcr,
             LSR => {
                 let mut lsr = LSR_THRE | LSR_TEMT;
-                if self.loopback.is_some() {
+                if self.loopback.is_some() || self.rx.is_some() {
                     lsr |= LSR_DR;
                 }
                 lsr
@@ -186,6 +207,15 @@ impl Uart {
             _ => {} // LSR and MSR are read-only
         }
         None
+    }
+
+    /// Whether the UART is asserting its interrupt line (IRQ4 on COM1): the
+    /// transmitter-holding-register-empty interrupt is enabled and, since the
+    /// transmitter here is always ready, always pending; the receiver
+    /// interrupt is enabled and a byte is waiting. What the run loop turns
+    /// into a raised IRQ.
+    pub fn irq_active(&self) -> bool {
+        (self.ier & IER_THRE != 0) || (self.ier & IER_RX != 0 && self.rx.is_some())
     }
 
     pub fn output(&self) -> &str {

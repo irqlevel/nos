@@ -214,9 +214,9 @@ impl Boot {
             Stop::Unexpected { exit, rip } => writeln!(report, "an exit with no handler: {:?} at {:#x}", exit, rip),
         };
         let _ = writeln!(report,
-            "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} host",
+            "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} host",
             counts.exits, counts.port_in, counts.port_out, counts.cpuid,
-            counts.msr_read, counts.msr_write, counts.msr_gp, counts.host);
+            counts.msr_read, counts.msr_write, counts.msr_gp, counts.irq, counts.hlt, counts.host);
         let hot = guest.hot_ports(6);
         if !hot.is_empty() {
             let _ = write!(report, "  busiest in ports");
