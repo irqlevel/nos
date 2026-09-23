@@ -27,6 +27,11 @@ pub trait Backend: Send {
     fn write(&mut self, offset: u64, data: &[u8]) -> bool;
     /// Everything written, on stable storage.
     fn flush(&mut self) -> bool;
+    /// A disk the guest may only read: the device says so to the driver,
+    /// and refuses a write itself rather than hand it here.
+    fn read_only(&self) -> bool {
+        false
+    }
 }
 
 /// Virtio's type for a block device.
@@ -40,8 +45,10 @@ pub const SECTOR: u64 = 512;
 /// The queue's size.
 const QUEUE_SIZE: u16 = 128;
 
-/// Features: flush, and a limit on segments a request may have.
+/// Features: flush, a limit on segments a request may have, and a disk
+/// that is read-only.
 const F_SEG_MAX: u32 = 1 << 2;
+const F_RO: u32 = 1 << 5;
 const F_FLUSH: u32 = 1 << 9;
 /// The header, the status, and the data between.
 const SEG_MAX: u32 = QUEUE_SIZE as u32 - 2;
@@ -104,8 +111,9 @@ impl Blk {
         let mut name = [0u8; ID_BYTES];
         let n = id.len().min(ID_BYTES);
         name[..n].copy_from_slice(&id.as_bytes()[..n]);
+        let ro = if backend.read_only() { F_RO } else { 0 };
         Ok(Blk {
-            transport: Transport::new(F_SEG_MAX | F_FLUSH, queues),
+            transport: Transport::new(F_SEG_MAX | F_FLUSH | ro, queues),
             backend,
             segs,
             bounce,
@@ -259,6 +267,12 @@ impl Blk {
                 self.stats.reads += 1;
                 self.stats.read_bytes += room;
                 (S_OK, clamp32(room))
+            }
+            /* A driver that was told the disk is read-only does not write
+             * to it; one that does anyway is told no. */
+            T_OUT if self.backend.read_only() => {
+                self.stats.errors += 1;
+                (S_IOERR, 0)
             }
             T_OUT => {
                 let data = readable.saturating_sub(HEADER as u64);

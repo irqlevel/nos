@@ -38,7 +38,7 @@ use crate::guest::{self, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
 
 const START_USAGE: &str =
-    "hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [net] [cmdline=...]";
+    "hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -102,6 +102,9 @@ pub struct Shared {
     restarts: AtomicU32,
     /// How many `hv attach` sessions it has.
     attached: AtomicU32,
+    /// `hv send` has typed at this boot: its input goes in from then on,
+    /// a shell's prompt or not -- whoever typed took it to be reading.
+    typed: AtomicBool,
     console: Mutex<Ring>,
     input: Mutex<Input>,
     /// How many bytes wait in `input`: the vCPU takes the lock only when some
@@ -116,6 +119,10 @@ pub struct Shared {
     hlt: AtomicU64,
     /// When its current boot began, and when it last stopped.
     boot_ns: AtomicU64,
+    /// Where the console was when its current boot began: what `hv wait`
+    /// looks from, so that a guest booted again is not found to have printed
+    /// what the boot before it did.
+    boot_at: AtomicU64,
     ended_ns: AtomicU64,
     log: bool,
 }
@@ -135,6 +142,7 @@ impl Shared {
             running: AtomicBool::new(true),
             restarts: AtomicU32::new(0),
             attached: AtomicU32::new(0),
+            typed: AtomicBool::new(false),
             console: Mutex::new(Ring::new()?)?,
             input: Mutex::new(Input { queue, queued: queued as u64, fed: 0, fed_at: 0 })?,
             pending: AtomicUsize::new(queued),
@@ -144,6 +152,7 @@ impl Shared {
             irq: AtomicU64::new(0),
             hlt: AtomicU64::new(0),
             boot_ns: AtomicU64::new(kcore::time::boot_time_ns()),
+            boot_at: AtomicU64::new(0),
             ended_ns: AtomicU64::new(0),
             log,
         })
@@ -153,6 +162,7 @@ impl Shared {
     /// of whatever was still waiting for the one before.
     fn requeue(&self, bytes: &[u8]) {
         let mut input = self.input.lock();
+        self.typed.store(false, Ordering::Release);
         input.queue.clear();
         /* `start` refused more than fits. */
         input.queue.extend(bytes.iter().take(INPUT_MAX));
@@ -255,9 +265,11 @@ impl Host for VmHost {
         if self.shared.pending.load(Ordering::Acquire) == 0 {
             return None;
         }
-        /* A script's line waits for the prompt; with someone attached,
-         * what is typed is theirs, and goes in when they type it. */
-        if !at_prompt && self.shared.attached.load(Ordering::Acquire) == 0 {
+        /* A script's line waits for the prompt; with someone attached, or
+         * once `hv send` has typed, what is typed goes in when it is. */
+        if !at_prompt && self.shared.attached.load(Ordering::Acquire) == 0
+            && !self.shared.typed.load(Ordering::Acquire)
+        {
             return None;
         }
         let mut input = self.shared.input.lock();
@@ -422,11 +434,17 @@ fn stopped(shared: &Shared, reason: String, report: Option<String>, ended: u64) 
 fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, why: &str,
           report: Option<String>) -> Option<LinuxGuest> {
     kcore::trace!(0, "hv: vm {} restarting -- {}", shared.id, why);
+    /* The new boot's console starts here, before the build -- which is long
+     * for a big guest under TCG -- so that `hv wait` meanwhile does not find
+     * what the last boot printed. */
+    shared.boot_at.store(shared.console_total(), Ordering::Release);
     match guest::build(machine, spec) {
         Ok(g) => {
             shared.requeue(&spec.input);
-            shared.restarts.fetch_add(1, Ordering::Relaxed);
             shared.boot_ns.store(kcore::time::boot_time_ns(), Ordering::Relaxed);
+            /* Last, with release: whoever sees the count move sees the new
+             * boot's input and console start with it. */
+            shared.restarts.fetch_add(1, Ordering::Release);
             shared.running.store(true, Ordering::Release);
             Some(g)
         }
@@ -780,7 +798,11 @@ impl Vms {
         }
     }
 
-    /// `hv send <id> <text>`: type at the guest, `\n` for a newline.
+    /// `hv send <id> <text>`: type at the guest, `\n` for a newline -- now,
+    /// as at a terminal, and not at a shell's prompt: a login prompt asks
+    /// for no cursor, and a getty throws away what was typed before it
+    /// printed one, so what to type at is `hv wait`'s to find. From then on
+    /// this boot, what `exec` types goes in as it is typed too.
     pub fn send(&self, args: &str, out: &mut Output) {
         let (word, text) = after_word(args);
         let shared = match self.find(word) {
@@ -801,6 +823,7 @@ impl Vms {
                 return;
             }
         };
+        shared.typed.store(true, Ordering::Release);
         match shared.type_in(&bytes) {
             Some(_) => {
                 let _ = writeln!(out, "hv: vm {}: {} bytes queued", shared.id, bytes.len());
@@ -847,7 +870,7 @@ impl Vms {
         }
         bytes.push(b'\n');
 
-        let restarts = shared.restarts.load(Ordering::Relaxed);
+        let restarts = shared.restarts.load(Ordering::Acquire);
         let from = shared.console_total();
         let Some(seq) = shared.type_in(&bytes) else {
             let _ = writeln!(out, "hv: vm {}: its input is full -- nothing typed", shared.id);
@@ -876,7 +899,7 @@ impl Vms {
             if !shared.running() {
                 break Some("the vm stopped");
             }
-            if shared.restarts.load(Ordering::Relaxed) != restarts {
+            if shared.restarts.load(Ordering::Acquire) != restarts {
                 break Some("the vm restarted, and the line went with the boot it was typed at");
             }
             if kcore::time::boot_time_ns() >= deadline {
@@ -935,7 +958,8 @@ impl Vms {
             /* Whether it had stopped is read before the console is searched:
              * a guest that printed the text and then stopped is found. */
             let running = shared.running();
-            if shared.console.lock().contains(text.as_bytes()) {
+            let from = shared.boot_at.load(Ordering::Acquire);
+            if shared.console.lock().contains_since(from, text.as_bytes()) {
                 let _ = writeln!(out, "hv: vm {} printed \"{}\", {} ms in", shared.id, text,
                                  kcore::time::boot_time_ns().saturating_sub(start) / NS_PER_MS);
                 return;
@@ -1041,14 +1065,14 @@ impl Vms {
                 return;
             }
         };
-        let before = shared.restarts.load(Ordering::Relaxed);
+        let before = shared.restarts.load(Ordering::Acquire);
         shared.reset.store(true, Ordering::Release);
         shared.wake.signal();
 
         let deadline = kcore::time::boot_time_ns().saturating_add(RESTART_WAIT_S * NS_PER_SEC);
         loop {
             kcore::task::sleep_ms(POLL_MS);
-            if shared.restarts.load(Ordering::Relaxed) != before {
+            if shared.restarts.load(Ordering::Acquire) != before {
                 let _ = writeln!(out, "hv: vm {} restarted", shared.id);
                 return;
             }

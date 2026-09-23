@@ -8,11 +8,12 @@
 //! 1.193182 MHz off the host's clock, and channel 2's output going high when
 //! its count runs out (`pit_calibrate_tsc`'s wait on port 0x61 bit 5).
 //!
-//! No interrupt is delivered yet: channel 0's terminal count would raise
-//! IRQ0, and there is no interrupt controller for a guest to take it from.
-//! That comes with the APIC. Until then this is enough to get a guest
-//! through the time setup that would otherwise hang it, reading a counter
-//! that moves and an output that eventually fires.
+//! And channel 0 is the guest's tick, IRQ0 at the emulated 8259 (the run
+//! loop asks `ch0_fire` each time round): an edge a period in the periodic
+//! modes 2 and 3, and in the one-shot modes 0 and 4 one edge when a loaded
+//! count runs out -- what Linux's `i8253` clockevent device programs once it
+//! has a clocksource good enough for high-resolution timers, the TSC, and
+//! drives the tick and every timer from, a count at a time.
 
 use kcore::time;
 
@@ -105,10 +106,10 @@ impl Channel {
         }
         let elapsed = self.elapsed();
         match self.mode {
-            /* Mode 0: count down once to 0 and stay; the 8254 wraps to
-             * 0xFFFF and keeps going, which is what a reader sees after the
-             * terminal count. */
-            0 | 1 => {
+            /* The one-shot modes, 0 and 4 and their gate-triggered 1 and 5:
+             * count down once to 0; the 8254 wraps to 0xFFFF and keeps going,
+             * which is what a reader sees after the terminal count. */
+            0 | 1 | 4 | 5 => {
                 if elapsed >= reload {
                     (0u16).wrapping_sub((elapsed - reload) as u16)
                 } else {
@@ -130,6 +131,8 @@ impl Channel {
         let elapsed = self.elapsed();
         match self.mode {
             0 | 1 => elapsed >= reload,
+            /* Low for the one clock of the terminal count. */
+            4 | 5 => elapsed != reload,
             _ => elapsed % reload != 0,
         }
     }
@@ -150,11 +153,31 @@ pub struct Pit {
     /// How many channel-0 periods had elapsed at the last `ch0_fire`, so an
     /// edge is counted once: the running total of IRQ0s the timer owes.
     ch0_edges_seen: u64,
+    /// In a one-shot mode, whether channel 0's count has been loaded and has
+    /// not yet run out: its one edge is still to come.
+    ch0_armed: bool,
+}
+
+/// The one-shot modes: one edge when the count runs out, and none after
+/// until a count is loaded again. Mode 0's output rises at the terminal
+/// count; mode 4's strobes low there for a clock, and rises after it.
+fn one_shot(mode: u8) -> bool {
+    matches!(mode, 0 | 4)
+}
+
+fn periodic(mode: u8) -> bool {
+    /* Modes 6 and 7 are 2 and 3 again, as the 8254 decodes them. */
+    matches!(mode, 2 | 3 | 6 | 7)
 }
 
 impl Pit {
     pub fn new() -> Self {
-        Self { ch: [Channel::new(), Channel::new(), Channel::new()], port61: 0, ch0_edges_seen: 0 }
+        Self {
+            ch: [Channel::new(), Channel::new(), Channel::new()],
+            port61: 0,
+            ch0_edges_seen: 0,
+            ch0_armed: false,
+        }
     }
 
     /// Whether `port` is one this device answers.
@@ -214,10 +237,14 @@ impl Pit {
             CONTROL => self.control(value),
             CH0..=CH2 => {
                 let index = (port - CH0) as usize;
-                self.write_counter(index, value);
+                let loaded = self.write_counter(index, value);
                 if index == 0 {
-                    /* A fresh channel-0 program restarts its edge count. */
+                    /* A fresh channel-0 program restarts its edge count; a
+                     * count loaded in a one-shot mode is one edge to come. */
                     self.ch0_edges_seen = 0;
+                    if loaded {
+                        self.ch0_armed = one_shot(self.ch[0].mode);
+                    }
                 }
             }
             _ => {}
@@ -232,9 +259,17 @@ impl Pit {
     /// over).
     pub fn ch0_fire(&mut self) -> bool {
         let ch = &self.ch[0];
-        /* Only the periodic modes generate a train of edges; a one-shot
-         * channel-0 (mode 0) is not how a kernel drives the tick. */
-        if !ch.running || ch.reload_ticks() == 0 || !matches!(ch.mode, 2 | 3) {
+        if !ch.running {
+            return false;
+        }
+        if one_shot(ch.mode) {
+            if self.ch0_armed && ch.elapsed() >= ch.reload_ticks() {
+                self.ch0_armed = false;
+                return true;
+            }
+            return false;
+        }
+        if !periodic(ch.mode) {
             return false;
         }
         let edges = ch.elapsed() / ch.reload_ticks();
@@ -247,18 +282,27 @@ impl Pit {
     }
 
     /// When, in host nanoseconds since boot, channel 0 next raises IRQ0: the
-    /// edge after the last one `ch0_fire` reported. None when channel 0 makes
-    /// no train of edges -- stopped, or in a one-shot mode. What a halted
-    /// vCPU sleeps until: the only thing here that becomes pending with time.
+    /// edge after the last one `ch0_fire` reported, or a one-shot's one edge.
+    /// None when channel 0 has no edge to come -- stopped, a one-shot that has
+    /// fired, a mode that makes none. What a halted vCPU sleeps until: the
+    /// only thing here that becomes pending with time.
     pub fn next_ch0_edge_ns(&self) -> Option<u64> {
         let ch = &self.ch[0];
-        if !ch.running || !matches!(ch.mode, 2 | 3) {
+        if !ch.running {
             return None;
         }
         /* Edge k is due once `elapsed()` reaches k * reload ticks, which is
          * the first nanosecond at or past k * reload * 1e9 / PIT_HZ: rounded
-         * up, so that at that instant `ch0_fire` does see it. */
-        let ticks = (self.ch0_edges_seen as u128 + 1) * ch.reload_ticks() as u128;
+         * up, so that at that instant `ch0_fire` does see it. A one-shot's
+         * one edge is edge 1. */
+        let edge = if one_shot(ch.mode) && self.ch0_armed {
+            1
+        } else if periodic(ch.mode) {
+            self.ch0_edges_seen as u128 + 1
+        } else {
+            return None;
+        };
+        let ticks = edge * ch.reload_ticks() as u128;
         let ns = (ticks * kcore::consts::NS_PER_SEC as u128).div_ceil(PIT_HZ as u128);
         let at = (ch.loaded_ns as u128).saturating_add(ns);
         Some(u64::try_from(at).unwrap_or(u64::MAX))
@@ -288,9 +332,15 @@ impl Pit {
         ch.mode = (value >> MODE_SHIFT) & 0x7;
         ch.write_half = Half::Lo;
         ch.read_half = Half::Lo;
+        if index == 0 {
+            /* A new mode counts nothing until its count is written: a
+             * one-shot armed before it is not one now. */
+            self.ch0_armed = false;
+        }
     }
 
-    fn write_counter(&mut self, index: usize, value: u8) {
+    /// A byte of a count: true once a whole count has been loaded.
+    fn write_counter(&mut self, index: usize, value: u8) -> bool {
         let ch = &mut self.ch[index];
         let running = index != 2 || self.port61 & P61_CH2_GATE != 0;
         match ch.access {
@@ -302,6 +352,7 @@ impl Pit {
                      * counter reloads on the high byte. */
                     ch.reload = (ch.reload & 0xFF00) | value as u16;
                     ch.write_half = Half::Hi;
+                    return false;
                 }
                 Half::Hi => {
                     let reload = (ch.reload & 0x00FF) | ((value as u16) << 8);
@@ -310,5 +361,6 @@ impl Pit {
                 }
             },
         }
+        true
     }
 }
