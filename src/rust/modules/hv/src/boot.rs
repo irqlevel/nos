@@ -152,6 +152,10 @@ pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloadin
             let _ = writeln!(out, "hv: restart is hv start's -- a hv boot guest runs once");
             return;
         }
+        Ok(spec) if spec.net => {
+            let _ = writeln!(out, "hv: net is hv start's");
+            return;
+        }
         Ok(spec) if spec.secs.map_or(true, |s| (1..=MAX_SECS).contains(&s)) => spec,
         Ok(_) => {
             let _ = writeln!(out, "hv: secs= must be 1..{}", MAX_SECS);

@@ -50,6 +50,9 @@ pub mod guests;
 /// A guest's disks: what stores one (`Backend`), and what it counts.
 #[cfg(target_arch = "x86_64")]
 pub use devices::blk as disk;
+/// A guest's NICs: what carries one's frames (`Backend`), and what it counts.
+#[cfg(target_arch = "x86_64")]
+pub use devices::net as nic;
 
 pub use hvarch::{Caps, Error, Ext, Result, Vendor};
 pub use machine::{Machine, Refused};

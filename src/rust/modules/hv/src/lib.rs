@@ -36,6 +36,10 @@ mod boot;
 #[cfg(target_arch = "x86_64")]
 mod guest;
 #[cfg(target_arch = "x86_64")]
+mod forward;
+#[cfg(target_arch = "x86_64")]
+mod net;
+#[cfg(target_arch = "x86_64")]
 mod vms;
 
 use alloc::boxed::Box;
@@ -49,7 +53,7 @@ use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|boot|start|list|console|attach|send|exec|wait|restart|stop|help] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|boot|start|list|console|attach|send|exec|wait|restart|stop|forward|help] - the CPU's virtualization extension, and guests under it";
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
@@ -58,7 +62,7 @@ hv on|off [cpu|all]                turn the extension on or off
 hv run <guest|all> [cpu]           run the built-in guests
 hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path]... [input=...] [cmdline=...]
                                    a Linux guest for secs, then its console and how it ended
-hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [cmdline=...]
+hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [net] [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself
 hv list                            the started guests
@@ -69,6 +73,8 @@ hv exec <id> [secs=N] <line>       type a line and print the answer, up to the n
 hv wait <id> [secs=N] <text>       until its console shows text, or it stops
 hv restart <id>                    boot it again from its files, running or stopped
 hv stop <id|all>                   stop it, say how it ended, take it off the list
+hv forward [add <port> <vm> <guest-port> | del <port>]
+                                   a port of nos's relayed to a guest's (net guests)
 ";
 
 /// What the command works on: the machine, and the guests started on it.
@@ -76,6 +82,8 @@ struct State {
     machine: Arc<Machine>,
     #[cfg(target_arch = "x86_64")]
     vms: vms::Vms,
+    #[cfg(target_arch = "x86_64")]
+    forwards: forward::Forwards,
     /// Set as the module starts to go: an `hv boot` running then stops at
     /// once instead of at the end of its time.
     #[cfg(target_arch = "x86_64")]
@@ -100,6 +108,7 @@ impl Drop for Hv {
         #[cfg(target_arch = "x86_64")]
         {
             self.state.unloading.store(true, core::sync::atomic::Ordering::Release);
+            self.state.forwards.close();
             self.state.vms.close();
         }
 
@@ -108,6 +117,11 @@ impl Drop for Hv {
          * machine anything -- nor start a guest on it, since `close` turned
          * every later `hv start` away. */
         drop(self.cmd.take());
+
+        /* A forward added while the guests stopped, before the command went:
+         * its tasks are this module's code, and go before it does. */
+        #[cfg(target_arch = "x86_64")]
+        self.state.forwards.close();
 
         /* Then the CPUs, here rather than in the machine's own drop, so that
          * what is left can be read back afterwards and said out loud. A
@@ -133,6 +147,8 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
         machine: machine.clone(),
         #[cfg(target_arch = "x86_64")]
         vms: vms::Vms::new().ok_or(kcore::error::Error::NoMemory)?,
+        #[cfg(target_arch = "x86_64")]
+        forwards: forward::Forwards::new().ok_or(kcore::error::Error::NoMemory)?,
         #[cfg(target_arch = "x86_64")]
         unloading: Arc::new(core::sync::atomic::AtomicBool::new(false)),
     });
@@ -211,13 +227,52 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "restart" => state.vms.restart(rest, out),
         #[cfg(target_arch = "x86_64")]
         "stop" => state.vms.stop(rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "forward" => forward_command(state, rest, out),
         #[cfg(not(target_arch = "x86_64"))]
-        "boot" | "start" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart" | "stop" => {
+        "boot" | "start" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart" | "stop" | "forward" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {
             let _ = writeln!(out, "hv: no such thing as \"{}\"", other);
             let _ = write!(out, "{}", USAGE);
+        }
+    }
+}
+
+/// `hv forward [add <port> <vm> <guest-port> | del <port>]`.
+#[cfg(target_arch = "x86_64")]
+fn forward_command(state: &State, args: &str, out: &mut Output) {
+    let mut w = args.split_ascii_whitespace();
+    match (w.next(), w.next(), w.next(), w.next()) {
+        (None, ..) => state.forwards.list(out),
+        (Some("add"), Some(port), Some(vm), Some(guest_port)) => {
+            let (Ok(port), Ok(vm), Ok(guest_port)) = (port.parse::<u16>(), vm.parse::<u32>(), guest_port.parse::<u16>()) else {
+                let _ = writeln!(out, "{}", forward::usage());
+                return;
+            };
+            if port == 0 || guest_port == 0 {
+                let _ = writeln!(out, "hv: ports are 1..65535");
+                return;
+            }
+            let Some(ip) = state.vms.address_of(vm) else {
+                let _ = writeln!(out, "hv: vm {} is not a running guest with a NIC (hv start ... net)", vm);
+                return;
+            };
+            let Some(host) = state.vms.host_nic() else {
+                let _ = writeln!(out, "hv: the guests' switch is not up");
+                return;
+            };
+            state.forwards.add(port, vm, guest_port, ip, host, out);
+        }
+        (Some("del"), Some(port), None, None) => match port.parse::<u16>() {
+            Ok(port) => state.forwards.del(port, out),
+            Err(_) => {
+                let _ = writeln!(out, "{}", forward::usage());
+            }
+        },
+        _ => {
+            let _ = writeln!(out, "{}", forward::usage());
         }
     }
 }

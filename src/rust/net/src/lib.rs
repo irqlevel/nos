@@ -30,6 +30,7 @@ pub mod shell;
 pub mod tcp;
 pub mod udp;
 pub mod udp_shell;
+pub mod vnic;
 pub mod wget;
 
 /// The frame formats: a crate of their own, shared with the modules.

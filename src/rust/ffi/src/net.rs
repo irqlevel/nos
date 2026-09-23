@@ -115,3 +115,29 @@ unsafe extern "C" {
     /// `rxpoll=on`: the tick looks at the receive path as well as the NIC.
     pub safe fn kernel_param_rxpoll_on() -> i32;
 }
+
+/// What `kernel_vnic_attach` calls with each frame the stack sends out of a
+/// virtual NIC: the ctx it was given, and the frame, lent for the call --
+/// from the transmit path, interrupts off.
+pub type VnicSink = unsafe extern "C" fn(ctx: usize, frame: *const u8, len: usize);
+
+/* A virtual NIC a module drives (net/src/vnic.rs): made and registered with
+   the stack the first time it is asked for by name, found after; frames the
+   stack sends out of it go to the handler attached, frames handed in arrive
+   as if received. A handle is 0 for none. */
+unsafe extern "C" {
+    /// The virtual NIC called `name`, made with `mac` (six bytes) and given
+    /// `ip` and `mask` (host byte order) the first time: a handle, or 0.
+    pub fn kernel_vnic_open(name: *const u8, name_len: usize, mac: *const u8, ip: u32, mask: u32) -> usize;
+    /// Frames the stack sends go to handler(ctx, ...) until the detach: 0,
+    /// or -1 for a bad handle or a handler attached already.
+    pub fn kernel_vnic_attach(vnic: usize, handler: VnicSink, ctx: usize) -> i32;
+    /// No more calls of the handler; back once none is running. Task
+    /// context: it waits.
+    pub fn kernel_vnic_detach(vnic: usize);
+    /// A frame into the stack as if received: 0, or -1 when it will not fit,
+    /// the backlog is full or the pool is dry.
+    pub fn kernel_vnic_receive(vnic: usize, frame: *const u8, len: usize) -> i32;
+    /// The net device it is, a `kernel_net_find` handle; 0 for none.
+    pub safe fn kernel_vnic_device(vnic: usize) -> usize;
+}

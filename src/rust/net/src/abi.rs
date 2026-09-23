@@ -200,6 +200,25 @@ pub extern "C" fn kernel_tcp_listen(dev: usize, port: u16) -> ConnPtr {
     }
 }
 
+/// An active open, for a module: to `ip`:`port` (host byte order) through the
+/// device `dev` names -- a `kernel_net_find` handle -- from an ephemeral port.
+/// Blocks until the connection is up or the connect timeout has passed: null
+/// then, and for a handle that names no device.
+#[no_mangle]
+pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnPtr {
+    if dev == 0 || port == 0 {
+        return core::ptr::null_mut();
+    }
+    let nic = match Nic::from_handle(dev) {
+        Some(nic) => nic,
+        None => return core::ptr::null_mut(),
+    };
+    match TCP.connect(&nic, ip, port, 0) {
+        Some(conn) => conn as *const Conn as ConnPtr,
+        None => core::ptr::null_mut(),
+    }
+}
+
 /// The next connection on the listener's port: null once `timeout_ms` passes
 /// with none, or once the listener is closed -- or for a `listener` that is
 /// not a connection at all.

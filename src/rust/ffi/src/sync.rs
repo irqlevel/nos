@@ -15,5 +15,8 @@ unsafe extern "C" {
     pub safe fn kernel_event_create() -> usize;
     pub fn kernel_event_destroy(handle: usize);
     pub fn kernel_event_wait(handle: usize);
+    /// Waits at most `timeout_ns`: 1 when signalled, 0 when the time ran
+    /// out.
+    pub fn kernel_event_wait_for(handle: usize, timeout_ns: u64) -> i32;
     pub fn kernel_event_signal(handle: usize);
 }

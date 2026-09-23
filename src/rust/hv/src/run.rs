@@ -19,6 +19,7 @@ use hvarch::{Error, Result};
 use kcore::time;
 
 use crate::devices::blk::{self, Blk};
+use crate::devices::net::{self, Net};
 use crate::devices::pci::{Function, PciBus};
 use crate::devices::{Pic, Pit, Rtc, Uart};
 use crate::linux::{self, Header, Layout};
@@ -30,12 +31,22 @@ use crate::vm::{Refusal, Vm};
 /// COM1, the guest's console.
 const COM1: u16 = 0x3F8;
 
-/// Where the first virtio device's I/O BAR is put, as a BIOS would put it,
-/// and the IRQ the disks share: 11, free on a PC, on the slave PIC.
-const VIRTIO_IO_BASE: u16 = 0xC000;
+/// Where the virtio devices' I/O BARs are put, as a BIOS would put them --
+/// the disks' from 0xC000, the NICs' from 0xC100 -- and the IRQs they share:
+/// 11 and 10, free on a PC, on the slave PIC.
+const DISK_IO_BASE: u16 = 0xC000;
+const NIC_IO_BASE: u16 = 0xC100;
 const DISK_IRQ: u8 = 11;
-/// The most disks a guest has: slots on the bus, less the host bridge.
+const NIC_IRQ: u8 = 10;
+/// The most disks, and NICs, a guest has.
 pub const MAX_DISKS: usize = 4;
+pub const MAX_NICS: usize = 2;
+
+/// A device on the guest's PCI bus, by its slot.
+enum PciDev {
+    Disk(Blk),
+    Nic(Net),
+}
 
 /* The two ways a PC guest resets its machine by port I/O. The 8042's
  * command port takes 0xF0-0xFF as "pulse the output lines whose bits are
@@ -152,6 +163,13 @@ pub trait Host {
     /// Whether the guest is to be stopped: asked before every entry, and at
     /// least every host tick while the guest is halted.
     fn stop_requested(&mut self) -> bool;
+    /// The guest has halted: wait up to `ns` for something to wake it --
+    /// a timer edge is due then -- or less, when something the host keeps
+    /// for it arrives first: a frame, a key. The loop looks again either
+    /// way. Plain sleep unless the host has something to be woken by.
+    fn halt_wait(&mut self, ns: u64) {
+        kcore::task::sleep(time::Duration::from_nanos(ns));
+    }
     /// What the loop has counted so far: when the vCPU halts, every
     /// `PROGRESS_EVERY` exits, and once more at the end. For a VM that runs
     /// until it is stopped, how anyone else sees it doing.
@@ -166,8 +184,11 @@ pub struct LinuxGuest {
     rtc: Rtc,
     pic: Pic,
     pci: PciBus,
-    /// Its disks, `vda` first: disk `i` is in PCI slot `i + 1`.
-    disks: alloc::vec::Vec<Blk>,
+    /// What is on the bus, by slot: slot `i + 1` is `pci_devs[i]`. Disks and
+    /// NICs in the order they were added, `vda` and `eth0` first.
+    pci_devs: alloc::vec::Vec<PciDev>,
+    disks: usize,
+    nics: usize,
     /// A tally of reads of the low ports, to find a guest spinning on one.
     port_hist: alloc::boxed::Box<[u32; 1024]>,
     /// The first MSR accesses the policy refused with #GP: (MSR, value
@@ -190,8 +211,8 @@ impl LinuxGuest {
          * never allocates. */
         let mut msr_faults = alloc::vec::Vec::new();
         msr_faults.try_reserve_exact(MSR_FAULTS_KEPT).map_err(|_| Error::NoMemory)?;
-        let mut disks = alloc::vec::Vec::new();
-        disks.try_reserve_exact(MAX_DISKS).map_err(|_| Error::NoMemory)?;
+        let mut pci_devs = alloc::vec::Vec::new();
+        pci_devs.try_reserve_exact(MAX_DISKS + MAX_NICS).map_err(|_| Error::NoMemory)?;
         Ok(Self {
             vm,
             uart: Uart::new(),
@@ -199,7 +220,9 @@ impl LinuxGuest {
             rtc: Rtc::new(),
             pic: Pic::new(),
             pci: PciBus::new()?,
-            disks,
+            pci_devs,
+            disks: 0,
+            nics: 0,
             port_hist,
             msr_faults,
         })
@@ -212,21 +235,62 @@ impl LinuxGuest {
     /// Give it another disk, over `backend`: `vda`, `vdb`, ... in the order
     /// they are added, each a virtio block device on the PCI bus.
     pub fn add_disk(&mut self, backend: alloc::boxed::Box<dyn blk::Backend>, id: &str) -> Result<()> {
-        if self.disks.len() >= MAX_DISKS {
+        if self.disks >= MAX_DISKS {
             return Err(Error::NoMemory);
         }
         let disk = Blk::new(backend, id)?;
-        let io_base = VIRTIO_IO_BASE + (self.disks.len() as u16) * (blk::BAR_SIZE as u16);
+        let io_base = DISK_IO_BASE + (self.disks as u16) * (blk::BAR_SIZE as u16);
         self.pci.add(Function::device(&Blk::identity(), io_base, blk::BAR_SIZE, DISK_IRQ))?;
-        /* Into the room taken at `new` (`MAX_DISKS`). */
-        self.disks.push(disk);
+        /* Into the room taken at `new`. */
+        self.pci_devs.push(PciDev::Disk(disk));
+        self.disks += 1;
+        Ok(())
+    }
+
+    /// Give it a NIC with `mac`, its frames carried by `backend`: `eth0`,
+    /// `eth1`, a virtio network device on the PCI bus.
+    pub fn add_nic(&mut self, backend: alloc::boxed::Box<dyn net::Backend>, mac: [u8; 6]) -> Result<()> {
+        if self.nics >= MAX_NICS {
+            return Err(Error::NoMemory);
+        }
+        let nic = Net::new(backend, mac)?;
+        let io_base = NIC_IO_BASE + (self.nics as u16) * (net::BAR_SIZE as u16);
+        self.pci.add(Function::device(&Net::identity(), io_base, net::BAR_SIZE, NIC_IRQ))?;
+        self.pci_devs.push(PciDev::Nic(nic));
+        self.nics += 1;
         Ok(())
     }
 
     /// What each disk has done: (sectors, statistics, whether a ring of the
     /// driver's stopped it).
     pub fn disk_stats(&self) -> impl Iterator<Item = (u64, blk::Stats, bool)> + '_ {
-        self.disks.iter().map(|d| (d.sectors(), d.stats, d.broken().is_some()))
+        self.pci_devs.iter().filter_map(|d| match d {
+            PciDev::Disk(d) => Some((d.sectors(), d.stats, d.broken().is_some())),
+            PciDev::Nic(_) => None,
+        })
+    }
+
+    /// What each NIC has done: (statistics, whether a ring stopped it).
+    pub fn nic_stats(&self) -> impl Iterator<Item = (net::Stats, bool)> + '_ {
+        self.pci_devs.iter().filter_map(|d| match d {
+            PciDev::Nic(n) => Some((n.stats, n.broken().is_some())),
+            PciDev::Disk(_) => None,
+        })
+    }
+
+    /// What the NICs' backends have for the guest, into its buffers; the
+    /// NICs' line raised when that calls for an interrupt.
+    fn poll_nics(&mut self) {
+        let mem = self.vm.memory_mut();
+        let mut raise = false;
+        for d in self.pci_devs.iter_mut() {
+            if let PciDev::Nic(n) = d {
+                raise |= n.poll(mem);
+            }
+        }
+        if raise {
+            self.pic.raise(NIC_IRQ);
+        }
     }
 
     /// Write the guest's furniture -- the zero page, the command line, the
@@ -310,6 +374,9 @@ impl LinuxGuest {
             if self.uart.irq_active() {
                 self.pic.raise(4);
             }
+            /* Frames for the guest, into what its NICs have posted: before
+             * the halted check, so that one arriving wakes it. */
+            self.poll_nics();
 
             if halted {
                 if !self.wakes() {
@@ -323,7 +390,7 @@ impl LinuxGuest {
                         .min(now.saturating_add(MAX_HALT_WAIT_NS))
                         .min(deadline);
                     if until > now {
-                        kcore::task::sleep(time::Duration::from_nanos(until - now));
+                        host.halt_wait(until - now);
                         counts.sleeps += 1;
                         counts.slept_ns += time::boot_time_ns().saturating_sub(now);
                     }
@@ -554,18 +621,31 @@ impl LinuxGuest {
                 counts.port_out += 1;
             }
         } else if let Some((slot, offset)) = self.pci.io_target(io.port) {
-            /* A disk's registers: slot n is disk n - 1. */
-            let disk = usize::from(slot).checked_sub(1).and_then(|i| self.disks.get_mut(i));
+            /* A device's registers: slot n is pci_devs[n - 1]. */
+            let dev = usize::from(slot).checked_sub(1).and_then(|i| self.pci_devs.get_mut(i));
             if io.input {
-                let value = disk.map_or(u32::MAX, |d| d.io_read(offset, io.size));
+                let value = match dev {
+                    Some(PciDev::Disk(d)) => d.io_read(offset, io.size),
+                    Some(PciDev::Nic(n)) => n.io_read(offset, io.size),
+                    None => u32::MAX,
+                };
                 set_in(self.vm.vcpu_mut().save_mut(), io.size, value);
                 counts.port_in += 1;
             } else {
                 let value = self.vm.vcpu().save().rax as u32;
-                if let Some(d) = disk {
-                    if d.io_write(offset, io.size, value, self.vm.memory_mut()) {
-                        self.pic.raise(DISK_IRQ);
+                let mem = self.vm.memory_mut();
+                match dev {
+                    Some(PciDev::Disk(d)) => {
+                        if d.io_write(offset, io.size, value, mem) {
+                            self.pic.raise(DISK_IRQ);
+                        }
                     }
+                    Some(PciDev::Nic(n)) => {
+                        if n.io_write(offset, io.size, value, mem) {
+                            self.pic.raise(NIC_IRQ);
+                        }
+                    }
+                    None => {}
                 }
                 counts.port_out += 1;
             }

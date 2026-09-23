@@ -241,6 +241,10 @@ round trips.)
 `Event` (`kernel/event.h`) packages the pattern for any task with something
 to wait for: one waiter, `Signal()` from anywhere, a hard IRQ handler
 included, and an IPI to the waiter's CPU when it finds the waiter blocked.
+`WaitFor(ns)` is the same wait with `Sleep()`'s deadline beside it -- the
+task blocked, woken by a `Signal()` at once or by the scheduler when its time
+has come -- and says which: how a halted guest's vCPU waits for its timer's
+next edge or a frame, whichever comes first.
 The netblk module's worker sleeps on one. A CPU's idle task must never block,
 on an event or otherwise: it is the scheduler's last resort, and a task
 exiting on a CPU whose idle task is blocked has nothing to switch to.

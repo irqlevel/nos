@@ -185,6 +185,13 @@ impl Event {
         unsafe { sync::kernel_event_wait(self.handle) }
     }
 
+    /// `wait`, for at most `timeout`: true when signalled, false when the
+    /// time ran out first. Blocked either way -- the scheduler wakes the
+    /// task at its deadline -- so a waiter costs its CPU nothing.
+    pub fn wait_for(&self, timeout: crate::time::Duration) -> bool {
+        unsafe { sync::kernel_event_wait_for(self.handle, timeout.as_nanos()) != 0 }
+    }
+
     #[inline]
     pub fn signal(&self) {
         unsafe { sync::kernel_event_signal(self.handle) }

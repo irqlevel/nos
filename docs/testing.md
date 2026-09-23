@@ -413,6 +413,12 @@ the image, taken back out of nos's root with `debugfs`, must pass `e2fsck`
 and hold what the guest wrote. It needs a guest kernel with PCI, legacy
 virtio-pci, virtio-blk and ext4 built in.
 
+`--net` is the guests' network: two guests with `net`; each has its port's
+address and MAC; a guest pings nos at 10.0.100.1 and each pings the other;
+nos pings a guest out of `hv0`; and a page from one guest's `httpd` is
+fetched from outside QEMU through `hv forward`. It needs a guest kernel with
+networking, virtio-net and `ip=` configuration built in.
+
 ## The hardware NIC drivers
 
 `tcp-test.py` and `netload-test.py` take `--nic igb` (and so does

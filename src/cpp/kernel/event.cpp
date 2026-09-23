@@ -1,4 +1,5 @@
 #include "event.h"
+#include "time.h"
 #include "task.h"
 #include "sched.h"
 #include "cpu.h"
@@ -64,6 +65,49 @@ void Event::Wait()
     }
 
     Waiter.Set(0);
+}
+
+bool Event::WaitFor(unsigned long long timeoutNs)
+{
+    Task* self = Task::GetCurrentTask();
+
+    /* One waiter at a time, as in Wait() */
+    BugOn(Waiter.Cmpxchg((long)self, 0) != 0);
+
+    ulong start = GetBootTime().GetValue();
+    ulong until = (timeoutNs > ~0UL - start) ? ~0UL : start + (ulong)timeoutNs;
+    bool signaled = false;
+
+    for (;;)
+    {
+        if (Signaled.Cmpxchg(0, 1) == 1)
+        {
+            signaled = true;
+            break;
+        }
+        if (GetBootTime().GetValue() >= until)
+            break;
+
+        /* Wait()'s window, interrupts off from the flag going up until it is
+           down again, with the deadline beside it for the scheduler: a
+           Signal() unblocks the task, and so does its time coming. */
+        ulong flags = Hal::IrqSave();
+
+        WaiterCpu.Set((long)CpuTable::GetInstance().GetCurrentCpuId());
+        self->SleepUntil.Set((long)until);
+        self->Block();
+
+        if (Signaled.Get() == 0)
+            Schedule();
+
+        self->Unblock();
+        self->SleepUntil.Set(0);
+
+        Hal::IrqRestore(flags);
+    }
+
+    Waiter.Set(0);
+    return signaled;
 }
 
 void Event::Signal()

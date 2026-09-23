@@ -210,7 +210,7 @@ backend, where a guest can show it working -- not slipped in here.
     hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path]... [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU for
                                 secs, then print its console and how it ended
-    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -226,6 +226,8 @@ backend, where a guest can show it working -- not slipped in here.
                                 until its console shows text, or it stops
     hv restart <id>             boot it again from its files, running or stopped
     hv stop <id|all>            stop it, say how it ended, take it off the list
+    hv forward [add <port> <vm> <guest-port> | del <port>]
+                                a port of nos's relayed to a guest's
     hv help                     all of these, a line each
 
 **Turning it on** allocates one page per CPU -- AMD's host state save area,
@@ -695,6 +697,67 @@ a file of its own, syncing and reading back after a remount -- and then the
 image, taken back out of nos's root filesystem, judged by `e2fsck` and
 holding what the guest wrote. It needs a guest kernel with PCI, legacy
 virtio-pci, virtio-blk and ext4.
+
+## A network
+
+`net`, on `hv start`, gives the guest a NIC on the guests' switch, and with
+it an address: 10.0.100.2 for the first port, .3 for the next, handed to its
+kernel on the command line (`ip=`). nos is 10.0.100.1 on the same subnet, so
+the guests reach it and each other, and it reaches them -- `ping 10.0.100.2`
+from nos's shell goes out of the device whose subnet the address is on:
+
+```
+$ hv start /bzImage initrd=/initrd net cmdline=console=ttyS0 nolapic
+$ hv start /bzImage initrd=/initrd net cmdline=console=ttyS0 nolapic
+$ hv exec 0 ping -c 3 10.0.100.1        # nos
+$ hv exec 0 ping -c 3 10.0.100.3        # the other guest
+$ ping 10.0.100.2                       # from nos
+$ hv forward add 8080 1 80              # nos's 8080, to guest 1's 80
+```
+
+**The guest's NIC is virtio-net, legacy, on the same transport as its
+disks** (`hv::devices::net`): two queues, a MAC and a link status offered,
+no checksum offload and no segmentation, so a frame either way is a whole
+Ethernet frame after legacy's 10-byte header. A frame the guest sends is
+handed on before the notify returns; what waits for it is put into the
+buffers it has posted each time round the run loop, one frame held by the
+device while it has posted none.
+
+**nos's end is a virtual NIC, `hv0`, in its own stack** (`net/src/vnic.rs`).
+A module cannot register a NIC -- there is no C name for a driver to be bound
+by -- so the device is registered from inside the image, the first time a
+module asks for it by name, and stays; the module trades frames with it
+through `kcore::vnic`. What the stack sends out of `hv0` goes to the sink the
+module attached, from the transmit path with interrupts off, and what the
+module hands in arrives as if received, on the next receive pass. A detach
+waits out any call of the sink still running, so the module can go after --
+the UDP listeners' way.
+
+**The switch is the module's** (`modules/hv/src/net.rs`). A guest's NIC is a
+port, and a port's number is its address and its MAC (02:00:00:00:64:NN), so
+frames go by their destination MAC with nothing learned: to a port, to `hv0`,
+or to everyone for a broadcast or a MAC no port has. A port's inbox is filled
+from any CPU -- `hv0`'s sink among them, interrupts off -- so it is a spin
+lock with interrupts off over storage taken when the switch was made, and a
+full one drops, counted in `hv list`. A frame put in wakes the guest's vCPU:
+a halted guest waits on its VM's event, until its timer's next edge or
+something for it -- a frame, a key typed at `hv attach` or `hv send` --
+whichever comes first (`Event::WaitFor`, [the scheduler](scheduler.md#blocking-and-waking)).
+
+**`hv forward` is how a guest is reached from outside.** The guests have
+addresses only on their switch; a forward listens on a port of nos's and,
+for each connection, opens one to the guest's port through `hv0`
+(`kcore::tcp::TcpStream::connect`, new for this) and relays the two with a
+task of its own. The kernel has 64 TCP connections and a forwarded one takes
+two, so a forward carries eight at once and refuses the rest. What is not
+here yet is the way out: the guests have no route beyond nos -- no NAT --
+so a forward is how the world reaches them, and nothing yet is how they reach
+the world.
+
+`scripts/hv-linux-test.py --net` is its gate: two guests, their addresses,
+pings between each guest and nos and between the guests, nos's ping out of
+`hv0`, and a page from one guest's `httpd` fetched from outside the machine
+through `hv forward`.
 
 ## Guests that stay up
 

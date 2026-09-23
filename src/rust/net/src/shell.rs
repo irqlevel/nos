@@ -222,7 +222,12 @@ pub fn ping(args: &str, out: &mut Output) {
         },
     };
 
-    let dev = match device(DEFAULT_DEVICE, out) { Some(dev) => dev, None => return };
+    /* Out of the device whose subnet it is on -- a guest's, behind hv0 --
+     * else the default one, whose gateway reaches the rest. */
+    let dev = match DEVICES.on_subnet(dst) {
+        Some(dev) => dev,
+        None => match device(DEFAULT_DEVICE, out) { Some(dev) => dev, None => return },
+    };
     let (icmp, arp) = match (abi::icmp(), abi::arp_table()) {
         (Some(icmp), Some(arp)) => (icmp, arp),
         _ => return,

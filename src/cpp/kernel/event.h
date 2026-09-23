@@ -38,6 +38,13 @@ public:
        nothing to switch to. */
     void Wait();
 
+    /* Wait() for at most timeoutNs: true when signalled, false when the
+       time ran out first. The deadline is Sleep()'s -- the scheduler runs a
+       blocked task whose SleepUntil has passed at its CPU's next scheduling
+       point, the tick at the latest -- so a waiter costs its CPU nothing
+       either way, and a Signal() still wakes it at once. */
+    bool WaitFor(unsigned long long timeoutNs);
+
     /* Any context. A signaller is done with the event only when Signal()
        returns -- the waiter having taken the signal says nothing about that
        -- so the event, and the waiting task, must outlive every Signal()
