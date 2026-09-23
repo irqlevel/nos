@@ -171,6 +171,13 @@ impl LinuxGuest {
                 break Stop::Budget;
             }
 
+            /* Feed the console's receive register whenever it is free, on
+             * every iteration and not only at an idle HLT: while a shell's
+             * line editor reads the answer to its cursor query it spins
+             * polling the port rather than halting, so a byte offered only at
+             * HLT would never arrive and the editor would time out. */
+            self.feed_console();
+
             /* The timer: a channel-0 period elapsed is an IRQ0 edge. Then,
              * if any interrupt is pending, inject it when the guest can take
              * one and ask to be told when it can when it cannot. */
@@ -228,18 +235,6 @@ impl LinuxGuest {
                      * waiting for the very interrupt the shadow would block.
                      * Clear it, so the next timer tick can wake the guest. */
                     self.vm.vcpu_mut().clear_interrupt_shadow();
-                    /* Idle: the boot has quiesced. Feed the guest's receive
-                     * register when it is free -- first any answer it is
-                     * waiting for to a terminal query, then what was typed. */
-                    if self.uart.rx_empty() {
-                        if let Some(byte) = self.uart.take_reply() {
-                            self.uart.set_rx(byte);
-                        } else if self.uart.prompt_seen() && self.input_pos < self.input.len() {
-                            let byte = self.input[self.input_pos];
-                            self.input_pos += 1;
-                            self.uart.set_rx(byte);
-                        }
-                    }
                 }
                 Exit::NestedFault { gpa, .. } => {
                     counts.mmio += 1;
@@ -265,6 +260,24 @@ impl LinuxGuest {
         };
 
         (stop, counts)
+    }
+
+    /// Hand the guest's receive register its next byte when it is free:
+    /// first any answer it is waiting for to a terminal query (the cursor
+    /// position a shell's line editor asks for before it reads), then a byte
+    /// of what was typed -- held back until the guest has reached a prompt,
+    /// so the boot does not swallow it.
+    fn feed_console(&mut self) {
+        if !self.uart.rx_empty() {
+            return;
+        }
+        if let Some(byte) = self.uart.take_reply() {
+            self.uart.set_rx(byte);
+        } else if self.uart.prompt_seen() && self.input_pos < self.input.len() {
+            let byte = self.input[self.input_pos];
+            self.input_pos += 1;
+            self.uart.set_rx(byte);
+        }
     }
 
     /// Give the guest the highest-priority interrupt the PIC has for it, if
