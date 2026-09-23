@@ -350,6 +350,34 @@ half -- that on a kernel running at EL1 the module loads, says a guest
 cannot run here and names the exception level, and refuses `hv on` and
 `hv run` rather than attempting them.
 
+### `hv-linux-test.py` -- a real Linux bzImage printing its early console
+
+The third of the four hypervisor demos ([the hypervisor
+page](hypervisor.md#what-comes-next)): `hv boot` loads an unmodified 64-bit
+Linux `bzImage` by the boot protocol, runs it on a vCPU, and streams its
+serial console to the kernel log a line at a time (`hvguest| ...`). The gate
+boots nos with a `bzImage` on its root filesystem, turns the extension on,
+runs `hv boot`, and watches for the kernel's banner and the first lines of
+its early setup.
+
+It is a **manual** gate, not in CI: a `bzImage` is megabytes and CI cannot
+build one in the time it has, so the gate is pointed at a kernel by hand.
+Build a small 64-bit guest -- a `tinyconfig` with the 8250 serial console and
+an early console on, PCI, ACPI and SMP off is enough -- and run
+
+```sh
+scripts/hv-linux-test.py --bzimage /path/to/bzImage
+```
+
+Under AMD-V, which on a machine with no hardware SVM is QEMU's TCG, itself
+under nothing faster -- so the guest's decompressor and early boot are twice
+emulated and slow, and the whole run is a couple of minutes (`--secs` sets
+the guest's budget, `--deadline` the gate's patience). It has been shown to
+reach the kernel banner, the command line it was given, NX being turned on,
+and the early memory map, on the tinyconfig guest of Linux 6.18. What it does
+*not* yet reach is a shell: that wants a local APIC and a timer, which come
+next.
+
 ## The hardware NIC drivers
 
 `tcp-test.py` and `netload-test.py` take `--nic igb` (and so does
