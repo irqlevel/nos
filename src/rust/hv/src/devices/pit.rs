@@ -90,7 +90,11 @@ impl Channel {
     /// Ticks elapsed since the count was loaded.
     fn elapsed(&self) -> u64 {
         let ns = time::boot_time_ns().saturating_sub(self.loaded_ns);
-        ns.saturating_mul(PIT_HZ) / kcore::consts::NS_PER_SEC
+        /* In 128 bits: nanoseconds times 1.19 MHz outgrows 64 bits after some
+         * four hours of a channel counting, and saturating there would freeze
+         * the counter -- the guest's tick would stop with nothing said. The
+         * quotient fits: a u64 of nanoseconds is 2^64 * 1.19e6 / 1e9 ticks. */
+        (ns as u128 * PIT_HZ as u128 / kcore::consts::NS_PER_SEC as u128) as u64
     }
 
     /// The counter as it reads now, 16 bits.
@@ -240,6 +244,24 @@ impl Pit {
         } else {
             false
         }
+    }
+
+    /// When, in host nanoseconds since boot, channel 0 next raises IRQ0: the
+    /// edge after the last one `ch0_fire` reported. None when channel 0 makes
+    /// no train of edges -- stopped, or in a one-shot mode. What a halted
+    /// vCPU sleeps until: the only thing here that becomes pending with time.
+    pub fn next_ch0_edge_ns(&self) -> Option<u64> {
+        let ch = &self.ch[0];
+        if !ch.running || !matches!(ch.mode, 2 | 3) {
+            return None;
+        }
+        /* Edge k is due once `elapsed()` reaches k * reload ticks, which is
+         * the first nanosecond at or past k * reload * 1e9 / PIT_HZ: rounded
+         * up, so that at that instant `ch0_fire` does see it. */
+        let ticks = (self.ch0_edges_seen as u128 + 1) * ch.reload_ticks() as u128;
+        let ns = (ticks * kcore::consts::NS_PER_SEC as u128).div_ceil(PIT_HZ as u128);
+        let at = (ch.loaded_ns as u128).saturating_add(ns);
+        Some(u64::try_from(at).unwrap_or(u64::MAX))
     }
 
     /// Channel 0's mode, reload and running flag, for a diagnostic.

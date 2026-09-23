@@ -5,8 +5,9 @@
 //! the guest's physical memory a chunk at a time -- neither has to fit in one
 //! allocation, which is why they are frames and read positionally. Then the
 //! zero page, the command line, the memory map and the guest's page tables go
-//! in (`hv::linux`), and the vCPU runs until it halts, faults on memory this
-//! hypervisor does not emulate (a local APIC, next), or runs out of time.
+//! in (`hv::linux`), and the vCPU runs until the guest stops for good -- a
+//! HLT with interrupts off, a triple fault, a touch of memory this
+//! hypervisor does not emulate -- or its time runs out.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -192,6 +193,7 @@ impl Boot {
          * watched -- and not only in the report at the end. */
         let mut line = String::new();
         let budget_ns = self.req.budget_s * kcore::consts::NS_PER_SEC;
+        let run_start = kcore::time::boot_time_ns();
         let (stop, counts) = guest.run(&*self.machine, budget_ns, |byte| {
             if byte == b'\n' {
                 kcore::trace!(0, "hvguest| {}", line);
@@ -203,6 +205,7 @@ impl Boot {
         if !line.is_empty() {
             kcore::trace!(0, "hvguest| {}", line);
         }
+        let run_ns = kcore::time::boot_time_ns().saturating_sub(run_start).max(1);
 
         /* The guest's console, whatever came of it. */
         let (fed, total) = guest.input_progress();
@@ -234,6 +237,11 @@ impl Boot {
             "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} host",
             counts.exits, counts.port_in, counts.port_out, counts.cpuid,
             counts.msr_read, counts.msr_write, counts.msr_gp, counts.irq, counts.hlt, counts.host);
+        /* How much of the run the vCPU's task spent asleep with the guest
+         * halted: the host CPU an idle guest gives back. */
+        let _ = writeln!(report, "  halted     slept {} ms in {} sleeps, {}% of the {} ms run",
+            counts.slept_ns / kcore::consts::NS_PER_MS, counts.sleeps,
+            counts.slept_ns * 100 / run_ns, run_ns / kcore::consts::NS_PER_MS);
         let ((irr, isr, imr), (m0, r0, run0)) = guest.irq_debug();
         let _ = writeln!(report, "  irq        {} total ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
             counts.irq, counts.irq0, counts.irq4, counts.edges0, counts.blocked, irr, isr, imr, m0, r0, run0);

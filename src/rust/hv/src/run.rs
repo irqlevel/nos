@@ -3,9 +3,15 @@
 //!
 //! This is the safe half of running a real kernel -- it decodes
 //! guest-controlled exits and answers them, and holds no reference into
-//! guest memory. What it cannot yet answer (a local APIC, a timer) it stops
-//! on and says so, which is how far the third of the four demos in
-//! `plans/03-hypervisor.md` reaches: a `bzImage` printing its early console.
+//! guest memory. What it cannot answer (an MMIO device it does not emulate,
+//! a triple fault) it stops on and says so.
+//!
+//! A guest that halts is a vCPU with nothing to do until an interrupt it can
+//! take is pending, and the loop treats it as one: the HLT is stepped past,
+//! as a CPU an interrupt wakes resumes after it, and the vCPU is not entered
+//! again until the PIC has something for it. Meanwhile the task sleeps --
+//! to the timer's next edge, the only thing here that becomes pending with
+//! time -- and its CPU goes to whatever else can use it.
 
 use hvarch::x86::svm::vmcb::Save;
 use hvarch::x86::svm::GuestRegs;
@@ -22,11 +28,22 @@ use crate::vm::{Refusal, Vm};
 /// COM1, the guest's console.
 const COM1: u16 = 0x3F8;
 
+/// RFLAGS.IF: the guest takes maskable interrupts.
+const RFLAGS_IF: u64 = 1 << 9;
+
+/// The longest a halted vCPU's task sleeps before it looks again, when no
+/// timer edge is due sooner: a guest whose PIT is stopped, or in a one-shot
+/// mode this does not raise IRQ0 in, still has its time budget checked. One
+/// host tick -- `task::sleep` wakes at one anyway (`Kernel::Sleep` yields
+/// until the deadline, and the CPU halts until its next interrupt).
+const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
+
 /// Why a Linux guest stopped.
 #[derive(Clone, Copy, Debug)]
 pub enum Stop {
-    /// It executed HLT: idle with interrupts it will never get, or a panic
-    /// that came to rest -- either way, as far as it goes without a timer.
+    /// It executed HLT with interrupts off: nothing but an NMI -- and none
+    /// is emulated -- can wake it, so it has stopped for good (a panic that
+    /// came to rest, a `poweroff` with nowhere to go).
     Halted { rip: u64 },
     /// It touched a guest physical address with no memory behind it: either
     /// a bug, or an MMIO device this hypervisor does not emulate (a local
@@ -63,6 +80,10 @@ pub struct Counts {
     pub edges0: u64,
     pub blocked: u64,
     pub hlt: u64,
+    /// Sleeps of the task while the vCPU was halted, and the time they took:
+    /// the host CPU this guest gave back while it had nothing to do.
+    pub sleeps: u64,
+    pub slept_ns: u64,
     pub exits: u64,
 }
 
@@ -165,9 +186,14 @@ impl LinuxGuest {
     ) -> (Stop, Counts) {
         let mut counts = Counts::default();
         let start = time::boot_time_ns();
+        let deadline = start.saturating_add(budget_ns);
+        /* The guest executed HLT with interrupts on, and has not been woken
+         * since: it is not entered until an interrupt is pending for it. */
+        let mut halted = false;
 
         let stop = loop {
-            if time::boot_time_ns().saturating_sub(start) >= budget_ns {
+            let now = time::boot_time_ns();
+            if now >= deadline {
                 break Stop::Budget;
             }
 
@@ -190,6 +216,27 @@ impl LinuxGuest {
              * driver sends past the first byte, an interrupt at a time. */
             if self.uart.irq_active() {
                 self.pic.raise(4);
+            }
+
+            if halted {
+                if !self.wakes() {
+                    /* Nothing for it yet. Sleep until the timer's next edge
+                     * -- nothing else here becomes pending with time: the
+                     * console's input is waiting already or waits on the
+                     * guest -- and give the CPU to whatever else can use it,
+                     * rather than enter a guest that would only halt again. */
+                    let until = self.pit.next_ch0_edge_ns()
+                        .unwrap_or(u64::MAX)
+                        .min(now.saturating_add(MAX_HALT_WAIT_NS))
+                        .min(deadline);
+                    if until > now {
+                        kcore::task::sleep(time::Duration::from_nanos(until - now));
+                        counts.sleeps += 1;
+                        counts.slept_ns += time::boot_time_ns().saturating_sub(now);
+                    }
+                    continue;
+                }
+                halted = false;
             }
             self.deliver_interrupt(&mut counts);
 
@@ -221,20 +268,22 @@ impl LinuxGuest {
                 Exit::Hlt => {
                     /* A booted kernel idles on HLT, waking on the timer: with
                      * interrupts on it is waiting for the next one, not dead.
-                     * Re-enter -- deliver_interrupt at the top of the loop
-                     * injects the timer IRQ when its period comes, and the
-                     * guest wakes and runs on. Only a HLT with interrupts off
-                     * is a guest that has stopped for good. */
-                    const IF: u64 = 1 << 9;
-                    if self.vm.vcpu().save().rflags & IF == 0 {
+                     * Only a HLT with interrupts off has stopped for good. */
+                    if self.vm.vcpu().save().rflags & RFLAGS_IF == 0 {
                         break Stop::Halted { rip };
                     }
                     counts.hlt += 1;
-                    /* The HLT is the instruction after the idle loop's STI,
-                     * so it sits in that STI's interrupt shadow -- but it is
-                     * waiting for the very interrupt the shadow would block.
-                     * Clear it, so the next timer tick can wake the guest. */
-                    self.vm.vcpu_mut().clear_interrupt_shadow();
+                    /* Step past it: a CPU an interrupt wakes from HLT resumes
+                     * at the instruction after it -- Linux's `sti; hlt; cli`
+                     * returns to the `cli` and on to its idle loop's
+                     * need_resched check. Entered again at the HLT, the
+                     * interrupt's handler would return to the HLT, and a
+                     * kernel that does not preempt on the way out of an
+                     * interrupt would never leave its idle task. Stepping
+                     * also takes the vCPU out of the STI's interrupt shadow,
+                     * which covers the HLT and would hold the wake-up off. */
+                    self.vm.vcpu_mut().skip_hlt();
+                    halted = true;
                 }
                 Exit::NestedFault { gpa, .. } => {
                     counts.mmio += 1;
@@ -260,6 +309,14 @@ impl LinuxGuest {
         };
 
         (stop, counts)
+    }
+
+    /// Whether a halted vCPU has something to be entered for: an interrupt
+    /// the PIC would deliver now -- requested, unmasked, not behind one in
+    /// service -- or an event already queued for injection. It halted with
+    /// interrupts on and has not run since, so either is one it can take.
+    fn wakes(&self) -> bool {
+        self.pic.pending().is_some() || self.vm.vcpu().event_queued()
     }
 
     /// Hand the guest's receive register its next byte when it is free:

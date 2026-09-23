@@ -465,13 +465,27 @@ And while a guest runs:
   an allocator hands them out per CPU with generations, the way KVM does,
   and knows when one may be reused. Cheap for these guests; for a Linux
   guest it is to be measured, and then replaced.
-- **The FPU and SSE state is not switched.** The host uses none of it -- its
-  C++ is built without SSE and x87, its Rust is soft-float -- so a guest's
-  x87 and SSE registers are whatever the CPU it is entered on holds: its own
-  while it stays on one CPU and nothing else runs a guest there, another
-  guest's or stale state otherwise, since the vCPU's task may be moved
-  between exits unless it was bound. None of the built-in guests touches
-  them; the Linux guest brings `xsave`/`xrstor` with it.
+- **The x87 and SSE state is switched on every entry and exit**, with
+  FXRSTOR before `vmrun` and FXSAVE after, into an area each guest owns --
+  so it is the guest's whichever CPU the vCPU's task is on and whichever
+  guest ran there last. The host uses none of it (its C++ is built without
+  SSE and x87, its Rust is soft-float), so CR4.OSFXSR, without which AMD's
+  FXSAVE leaves the XMM registers out, and CR4.OSXSAVE are set only for the
+  interrupts-off window around `vmrun` and given back before interrupts come
+  on: outside it an SSE instruction in the host still faults. XCR0 is x87
+  alone while a guest runs, and guests are given no XSAVE, so AVX and above
+  fault in a guest even if it turns OSXSAVE on itself.
+- **A halted guest costs its CPU nothing** -- but waits at the host tick's
+  grain. A HLT with interrupts on is stepped past, as a CPU an interrupt
+  wakes resumes after it, and the vCPU is not entered again until the PIC
+  has an interrupt for it; meanwhile its task sleeps to the timer's next
+  edge. `task::sleep` yields and lets the CPU halt until its next interrupt,
+  so the edge is taken at the first host tick after it: a 100 Hz guest tick
+  arrives up to 10 ms late, still a hundred a second. Measured on the Linux
+  guest over 120 s of the same boot and a typed `id`: 5,633,131 exits, 5.56
+  million of them HLTs, became 76,334 and 11,410; the guest's timer ticks
+  went from 11,973 to 11,943; the vCPU's task slept 89% of the run; and the
+  QEMU process under it went from 106% of a host CPU to 46%.
 - **No speculative-execution mitigation yet**: no return-stack refill after
   an exit, no IBPB between guests. What KVM does there matters before this
   runs other people's guests, and is not done.
@@ -568,10 +582,13 @@ here:
 - **The exit loop** (`hv::run`) that answers all of the above, injects the
   highest-priority interrupt the PIC has when the guest can take one (and
   asks the CPU, through SVM's virtual-interrupt window, to exit the moment it
-  can when it cannot), treats an idle `HLT` as a wait for the next tick
-  rather than a stop, and clears the shadow that `HLT` sits in so the timer
-  can wake it. It streams the guest's console to the kernel log a line at a
-  time and stops with a reason and a register dump.
+  can when it cannot), and halts the vCPU when the guest does: an idle `HLT`
+  is stepped past -- a CPU an interrupt wakes resumes after it, so Linux's
+  `sti; hlt; cli` returns to its idle loop, and out of the STI's interrupt
+  shadow -- and the vCPU is not entered again until an interrupt is pending
+  for it, its task asleep until the timer's next edge. It streams the
+  guest's console to the kernel log a line at a time and stops with a reason
+  and a register dump.
 
 What this reaches today, on a tinyconfig Linux 6.18 under AMD-V (QEMU's TCG,
 where the guest is twice emulated and slow), is a full boot to an interactive
