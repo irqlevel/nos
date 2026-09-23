@@ -14,7 +14,7 @@ use kcore::cmd::Output;
 use kcore::trace;
 
 use crate::paths::Path;
-use crate::vfs::{FileStat, Open, Vfs, OPEN_READ};
+use crate::vfs::{FileStat, Open, Vfs, OPEN_READ, OPEN_WRITE};
 use crate::vnode::Kind;
 use crate::vfs_instance;
 
@@ -306,6 +306,65 @@ pub unsafe extern "C" fn kernel_file_read_at(
         }
     }
     total as isize
+}
+
+/// Writes `len` bytes into the file at `offset`, within the size it has -- a
+/// guest's disk image, whose size is its disk's: `len`, or -1 when the
+/// write would reach past the end (refused whole, the file never grown) or
+/// the filesystem refuses. Nothing is synced here: `kernel_file_sync` is the
+/// flush. The file is opened for each call, as `kernel_file_read_at` opens
+/// it.
+///
+/// # Safety
+/// `path` points at `path_len` bytes; `data` at `len`.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_write_at(
+    path: *const u8, path_len: usize, offset: u64, data: *const u8, len: usize,
+) -> isize {
+    let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
+        (Some(vfs), Some(path)) => (vfs, path),
+        _ => return -1,
+    };
+    if data.is_null() && len != 0 {
+        return -1;
+    }
+    let Ok(len_signed) = isize::try_from(len) else {
+        return -1;
+    };
+
+    let at = match locate(path) {
+        Some(at) => at,
+        None => return -1,
+    };
+    let file = match Open::new(vfs, at.as_bytes(), OPEN_WRITE) {
+        Some(file) => file,
+        None => return -1,
+    };
+    let end = match usize::try_from(offset).ok().and_then(|o| o.checked_add(len)) {
+        Some(end) => end,
+        None => return -1,
+    };
+    if end > file.size() {
+        return -1;
+    }
+    if len == 0 {
+        return 0;
+    }
+    if !file.seek(end - len) || !file.write(unsafe { bytes(data, len) }) {
+        return -1;
+    }
+    len_signed
+}
+
+/// Everything written to every filesystem so far, on its disk: what a
+/// guest's flush asks of the image under it. 0, or -1 when a filesystem
+/// could not.
+#[no_mangle]
+pub extern "C" fn kernel_file_sync() -> i32 {
+    match vfs_instance() {
+        Some(vfs) if vfs.sync() => 0,
+        _ => -1,
+    }
 }
 
 /// Replaces the file's content, making the file if it is missing, through
