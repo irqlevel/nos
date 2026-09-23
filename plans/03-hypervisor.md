@@ -123,15 +123,22 @@ console (`hv boot`, `scripts/hv-linux-test.py`):
 - the guest's FPU/SSE state and XCR0 are switched around `vmrun`
   (`hvarch::x86::svm`), and the vCPU runs on a task of its own.
 
-A tinyconfig Linux 6.18 reaches its early console in full, past
-`console [ttyS0] enabled`, and stops at `Failed to register legacy timer
-interrupt` -- the fourth demo's business, below.
+And against **3.5 and the fourth demo** -- a full boot to a shell:
 
-The fourth demo, a full boot to a shell, is the timer interrupt and the
-controller to take it from: an 8259 PIC, the PIT's channel 0 raising IRQ0,
-`event_inj` injecting it when the guest has interrupts on, and then an
-initramfs and an `init`. `docs/hypervisor.md` ("What comes next") has the
-list.
+- an 8259 PIC pair (`hv::devices::pic`) the guest takes its interrupts from,
+  since it runs with no local APIC;
+- the PIT's channel 0 raising IRQ0, the system tick, and interrupt injection
+  (`Vcpu::inject_extint` / `request_irq_window`): the run loop injects the
+  highest-priority IRQ when the guest can take one and asks the CPU (SVM's
+  VINTR) to exit the moment it can when it cannot;
+- an idle `HLT` treated as a wait for the next tick, with the interrupt
+  shadow it sits in cleared so the timer can wake it;
+- the 8250 raising IRQ4 for its transmitter, and a receive path with a
+  cursor-query answer, so the console can be typed at (`hv boot ... input=`).
+
+A tinyconfig Linux 6.18 with a BusyBox initramfs now boots to an interactive
+`ash` prompt. All four demos are done; `docs/hypervisor.md` ("What comes
+next") has what is left.
 
 Before the first VMX guest, one change outside the hypervisor: the boot path
 has to set `CR0.NE` on every CPU. VMX requires it, the APs come out of INIT

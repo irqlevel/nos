@@ -38,13 +38,14 @@ $ rmmod hv
 module: hv unloaded
 ```
 
-This is [stage 3 of the roadmap](../plans/03-hypervisor.md), and what is
-here today is the first two of its four steps: the machine's virtualization
-extension, found, reported, and turned on and off for the CPUs that will run
-guests; and a VM -- guest memory behind a nested page table, one CPU under
-AMD-V, its exits decoded -- that runs guests of a few bytes in long mode and
-checks that each did what it was told. The emulated UART and the Linux
-loader come next.
+This is [stage 3 of the roadmap](../plans/03-hypervisor.md), and all four of
+its steps are here: the machine's virtualization extension, found, reported,
+and turned on and off for the CPUs that will run guests; a VM -- guest memory
+behind a nested page table, one CPU under AMD-V, its exits decoded -- that
+runs guests of a few bytes in long mode and checks that each did what it was
+told; and, over an emulated 8250, PIT, RTC and 8259 PIC, a real Linux
+`bzImage` booted to an interactive BusyBox shell (`hv boot`, and [A Linux
+guest](#a-linux-guest) below).
 
 ## Why a module
 
@@ -555,39 +556,46 @@ here:
   own state and are served from the VMCB save area, and every other MSR reads
   zero and swallows a write, which is what a guest's `rdmsr_safe` probes are
   ready for.
-- **The devices early boot cannot do without** (`hv::devices`): the 8250
-  serial port the console writes to, an 8254 PIT whose counter counts down at
-  1.193182 MHz off the host clock and whose channel-2 output goes high at its
-  terminal count (what `pit_calibrate_tsc` waits on), and an MC146818 RTC
-  that answers a fixed date with the update-in-progress bit clear. Without
-  the last two a guest hangs: it spins on a PIT counter that never counts and
-  an RTC update bit that never clears.
-- **The exit loop** (`hv::run`) that answers all of the above, plus a nested
-  page fault (an unemulated device), a triple fault, and the host's own
-  interrupts, streaming the guest's console to the kernel log a line at a
-  time and stopping with a reason and a register dump.
+- **The devices a guest cannot boot without** (`hv::devices`): the 8250
+  serial port the console writes to (which raises IRQ4 for the transmitter,
+  so the driver sends past its first byte); an 8254 PIT whose counter counts
+  down at 1.193182 MHz off the host clock, whose channel-2 output goes high
+  at its terminal count (what `pit_calibrate_tsc` waits on), and whose
+  channel 0 raises IRQ0 -- the system tick a guest cannot schedule without;
+  an MC146818 RTC that answers a fixed date with the update bit clear; and a
+  pair of 8259 PICs the guest takes its interrupts from, since it runs with
+  no local APIC.
+- **The exit loop** (`hv::run`) that answers all of the above, injects the
+  highest-priority interrupt the PIC has when the guest can take one (and
+  asks the CPU, through SVM's virtual-interrupt window, to exit the moment it
+  can when it cannot), treats an idle `HLT` as a wait for the next tick
+  rather than a stop, and clears the shadow that `HLT` sits in so the timer
+  can wake it. It streams the guest's console to the kernel log a line at a
+  time and stops with a reason and a register dump.
 
 What this reaches today, on a tinyconfig Linux 6.18 under AMD-V (QEMU's TCG,
-where the guest is twice emulated and slow), is the early console in full:
+where the guest is twice emulated and slow), is a full boot to an interactive
+shell:
 
 ```
 $ hv on
-$ hv boot /bzImage
-hv: booting /bzImage -- 256 MiB, cmdline "earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check"
+$ hv boot /bzImage initrd=/initrd cmdline=console=ttyS0 nolapic rdinit=/init
   --- ttyS0 ---
 [    0.000000] Linux version 6.18.53 ...
-[    0.000000] Command line: earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check
 [    0.000000] NX (Execute Disable) protection: active
 ...
-[    0.000000] printk: legacy console [ttyS0] enabled
-[    0.000000] Failed to register legacy timer interrupt
+[    0.540000] Run /init as init process
+nos-guest: init is up, / on ramfs, busybox v1.36.1
+Linux (none) 6.18.53 #1 x86_64 GNU/Linux
+
+BusyBox v1.36.1 built-in shell (ash)
+~ #
   --- end ttyS0 ---
 ```
 
-It stops there because nothing yet delivers the timer interrupt -- the fourth
-demo, and what [What comes next](#what-comes-next) opens with. The gate is
-`scripts/hv-linux-test.py`, a manual one (a `bzImage` is megabytes and CI
-cannot build one in its time), pointed at a kernel by hand.
+The gate is `scripts/hv-linux-test.py`, a manual one (a `bzImage` is
+megabytes and CI cannot build one in its time), pointed at a kernel by hand;
+with `--initrd` it checks the guest reaches its `init` and a shell.
 
 ## What comes next
 
@@ -600,18 +608,17 @@ thing that can be shown in half a minute:
 3. ~~an emulated 8250 on port I/O exits, and a `bzImage` printing its early
    console~~ -- `hv boot`, and the guest of [A Linux
    guest](#a-linux-guest) below;
-4. a full boot to a shell over that UART, with an initramfs, on one vCPU.
+4. ~~a full boot to a shell over that UART, with an initramfs, on one
+   vCPU~~ -- with an initramfs, a BusyBox shell.
 
-What is left for step 4 is the timer interrupt, and the interrupt controller
-to take it from: a Linux guest today reaches `console [ttyS0] enabled` and
-its clocksource setup and then stops at `Failed to register legacy timer
-interrupt`, because nothing yet delivers IRQ0 -- an 8259 PIC (or a local
-APIC), the PIT's channel 0 raising it, and `event_inj` injecting it when the
-guest has interrupts on. Then an initramfs and an `init` that opens the
-console. Still after that, not in step order: the TLB flushed per address
-space rather than whole, the VMX backend with `CR0.NE` on every CPU, and the
-guests run on the AX41's real AMD-V, which checks the VMCB harder than
-QEMU does.
+All four demos are done. What is left, not in step order: the terminal
+handshake so the shell reads a typed command reliably (the receive path and
+the cursor-query answer are here, `hv boot ... input=`, but a busybox line
+editor's read is finicky over it); the TLB flushed per address space rather
+than whole; the VMX backend with `CR0.NE` on every CPU; and the guests run on
+the AX41's real AMD-V, which checks the VMCB harder than QEMU does. Beyond
+stage 3: a local APIC and an SMP guest, host-side virtio, and the control
+plane (stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every
