@@ -7,12 +7,21 @@
 //! The guest touches none of them directly: it stops at an intercept, and
 //! the run loop hands the exit to the device.
 
+/* The PC chipset's devices -- the 8259, the 8254, the MC146818 -- are an x86
+ * guest's; an arm64 one would have a GIC, a generic timer and a PL011. The
+ * 8250 is anybody's serial port. */
+#[cfg(target_arch = "x86_64")]
 pub mod pic;
+#[cfg(target_arch = "x86_64")]
 pub mod pit;
+#[cfg(target_arch = "x86_64")]
 pub mod rtc;
 pub mod uart;
 
+#[cfg(target_arch = "x86_64")]
 pub use pic::Pic;
+#[cfg(target_arch = "x86_64")]
 pub use pit::Pit;
+#[cfg(target_arch = "x86_64")]
 pub use rtc::Rtc;
 pub use uart::Uart;

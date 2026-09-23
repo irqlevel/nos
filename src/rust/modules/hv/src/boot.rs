@@ -237,6 +237,25 @@ impl Boot {
             "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} host",
             counts.exits, counts.port_in, counts.port_out, counts.cpuid,
             counts.msr_read, counts.msr_write, counts.msr_gp, counts.irq, counts.hlt, counts.host);
+        if counts.ud != 0 || counts.wbinvd != 0 {
+            let _ = writeln!(report, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past",
+                counts.ud, counts.wbinvd);
+        }
+        let absent = guest.absent_pages();
+        if !absent.is_empty() {
+            let _ = write!(report, "  absent     reads of no device answered with all ones at");
+            for gpa in absent {
+                let _ = write!(report, " {:#x}", gpa);
+            }
+            let _ = writeln!(report);
+        }
+        for (msr, value, write) in guest.msr_faults() {
+            let _ = if *write {
+                writeln!(report, "  #GP        wrmsr {:#x} <- {:#x}", msr, value)
+            } else {
+                writeln!(report, "  #GP        rdmsr {:#x}", msr)
+            };
+        }
         /* How much of the run the vCPU's task spent asleep with the guest
          * halted: the host CPU an idle guest gives back. */
         let _ = writeln!(report, "  halted     slept {} ms in {} sleeps, {}% of the {} ms run",

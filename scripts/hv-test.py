@@ -110,6 +110,8 @@ GUESTS = {
     "uart": [r"brought up the 8250 and sent 35 bytes through it"],
     "hypercall": [r'said\s+"nos: long mode"', r"15 registers went out at the hypercall and 15 answers came back"],
     "fault": [r"nested page fault at gpa 0x1ff000, error 0x1[0-9a-f]{8}, rip 0x8005"],
+    "absent": [r"nested page fault at gpa 0xfed803c0, error 0x1[0-9a-f]{8}, rip 0x801b",
+               r"both reads found all ones through one read-only page"],
     "triple": [r"shutdown \(triple fault\)"],
     "refused": [r"not entered -- the VMCB breaks a rule: CR0.NW is set without CR0.CD"],
     "spin": [r"stopped\s+by the host", r"interrupts got through [1-9]\d* times"],

@@ -37,6 +37,8 @@ const TABLE: u64 = PRESENT | WRITE | USER | ACCESSED;
 /// A 4 KiB page of guest memory: readable, writable and executable by the
 /// guest, write-back -- PAT, PCD and PWT clear pick the host's PAT entry 0.
 const PAGE: u64 = PRESENT | WRITE | USER | ACCESSED | DIRTY;
+/// The same page, read-only: a write to it is a nested page fault.
+const PAGE_RO: u64 = PRESENT | USER | ACCESSED;
 
 /// No table below this entry yet.
 const NONE: u32 = u32::MAX;
@@ -144,6 +146,15 @@ impl Npt {
     /// made by `prepare`; a page already mapped is refused rather than
     /// quietly moved -- the old page would still be in a TLB somewhere.
     pub fn set(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        self.set_entry(gpa, hpa, PAGE)
+    }
+
+    /// As [`set`](Self::set), but read-only for the guest.
+    pub fn set_ro(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        self.set_entry(gpa, hpa, PAGE_RO)
+    }
+
+    fn set_entry(&mut self, gpa: u64, hpa: u64, bits: u64) -> Result<()> {
         if gpa % PAGE_SIZE as u64 != 0 || hpa & !ADDRESS != 0 {
             return Err(Error::BadAddress);
         }
@@ -154,7 +165,7 @@ impl Npt {
             Some(0) => {}
             _ => return Err(Error::BadAddress),
         }
-        if !page.store::<u64>(offset, hpa | PAGE) {
+        if !page.store::<u64>(offset, hpa | bits) {
             return Err(Error::BadAddress);
         }
         Ok(())

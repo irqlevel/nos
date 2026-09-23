@@ -14,6 +14,9 @@
 //!              hypercall with every register across it both ways
 //!   fault      a write to memory its page table maps and the nested one
 //!              does not: stopped at the nested table, the address named
+//!   absent     a read of a device the platform does not have -- AMD's FCH,
+//!              which Linux on a Zen CPU reads at a fixed address -- answered
+//!              with all ones, and a write to it stopped
 //!   triple     a triple fault stops the guest, not the CPU
 //!   refused    a VMCB that breaks one of `vmrun`'s rules is never handed
 //!              to the CPU, and the refusal names the rule -- where the
@@ -90,6 +93,8 @@ struct Run {
     hypercall: u32,
     /// The host's own interrupts that took the CPU back from the guest.
     host: u32,
+    /// Reads of an absent device answered with a page of all ones.
+    absent: u32,
     /// The guest's registers at its hypercall: RAX, RBX, RCX, RDX, RSI, RDI,
     /// RBP, R8-R15.
     at_hypercall: Option<[u64; 15]>,
@@ -125,6 +130,7 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
         cpuid: 0,
         hypercall: 0,
         host: 0,
+        absent: 0,
         at_hypercall: None,
         uart: Uart::new(),
         stop: Stop::Budget,
@@ -208,7 +214,19 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
                 run.hypercall += 1;
             }
             Exit::Hlt => break Stop::Halted { rip },
-            Exit::NestedFault { gpa, error } => break Stop::Fault { gpa, error, rip },
+            Exit::NestedFault { gpa, error } => {
+                /* A read of the MMIO window with no device behind it is
+                 * answered with all ones, as the Linux guest's loop answers
+                 * one (`GuestMemory::map_absent`); anything else stops. */
+                use hvarch::x86::svm::vmcb::npf;
+                let plain_read = error & (npf::PRESENT | npf::WRITE | npf::FETCH) == 0
+                    && error & npf::FINAL != 0;
+                if plain_read && vm.memory_mut().map_absent(gpa).is_ok() {
+                    run.absent += 1;
+                    continue;
+                }
+                break Stop::Fault { gpa, error, rip };
+            }
             Exit::Shutdown => break Stop::Shutdown { rip },
             Exit::Exception { vector, error } => break Stop::Exception { vector, error, rip },
             Exit::MachineCheck => break Stop::MachineCheck { rip },
@@ -264,6 +282,14 @@ const GUESTS: &[Spec] = &[
         budget_ms: 2000,
         build: build_fault,
         check: check_fault,
+    },
+    Spec {
+        name: "absent",
+        about: "a read of a device that is not there answered with all ones, and a write to it stopped",
+        exceptions: ALL_EXCEPTIONS,
+        budget_ms: 2000,
+        build: build_absent,
+        check: check_absent,
     },
     Spec {
         name: "triple",
@@ -637,6 +663,55 @@ fn check_fault(_vm: &Vm, r: &Run) -> core::result::Result<String, String> {
             Ok(String::from("stopped at the nested table, at the address and the instruction it was told to"))
         }
         _ => Err(String::from("it did not fault where it was told to")),
+    }
+}
+
+/* AMD's FCH reset-status register, which Linux reads at this fixed address
+ * on every Zen CPU (`print_s5_reset_status_mmio`) and takes all ones from as
+ * "no such device". The guest maps the MMIO window's top 2 MiB to itself to
+ * reach it. */
+const ABSENT_CODE: &[u8] = &[
+    0xBE, 0xC0, 0x03, 0xD8, 0xFE,                   // mov esi, 0xfed803c0
+    0x8B, 0x06,                                     // mov eax, [rsi]        ; all ones
+    0x89, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,       // mov [0x7000], eax
+    0x8B, 0x86, 0x40, 0xFC, 0xFF, 0xFF,             // mov eax, [rsi - 0x3c0] ; the same page
+    0x89, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,       // mov [0x7004], eax
+    0xC6, 0x06, 0x00,                               // mov byte [rsi], 0     ; a write: stops here
+    0xF4,                                           // hlt
+];
+const ABSENT_GPA: u64 = 0xFED8_03C0;
+const ABSENT_WRITE_RIP: u64 = ENTRY + 0x1B;
+/// The page directory for the guest's fourth gigabyte, and which of its 2 MiB
+/// entries covers the register: (0xfed80000 - 3 GiB) / 2 MiB.
+const PD_MMIO: u64 = 0x6000;
+const MMIO_GIB: u64 = 3;
+const ABSENT_PD_INDEX: u64 = (ABSENT_GPA - MMIO_GIB * GIB) >> 21;
+
+fn build_absent(vm: &mut Vm) -> Result<()> {
+    board(vm, ABSENT_CODE)?;
+    let m = vm.memory_mut();
+    m.write_obj(PDPT + MMIO_GIB * 8, &(PD_MMIO | PTE_P_W))?;
+    m.write_obj(PD_MMIO + ABSENT_PD_INDEX * 8, &((ABSENT_GPA & !0x1F_FFFF) | PTE_P_W | PTE_LARGE))
+}
+
+fn check_absent(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
+    use hvarch::x86::svm::vmcb::npf;
+    let first: u32 = read(vm, RESULTS)?;
+    let second: u32 = read(vm, RESULTS + 4)?;
+    if first != u32::MAX || second != u32::MAX {
+        return Err(alloc::format!("the reads came back as {:#x} and {:#x}, not all ones", first, second));
+    }
+    if r.absent != 1 {
+        return Err(alloc::format!("{} pages of all ones mapped, not one", r.absent));
+    }
+    match r.stop {
+        Stop::Fault { gpa, error, rip } if gpa == ABSENT_GPA && rip == ABSENT_WRITE_RIP => {
+            if error & npf::WRITE == 0 || error & npf::PRESENT == 0 {
+                return Err(alloc::format!("the fault was not a write to the read-only page: error {:#x}", error));
+            }
+            Ok(String::from("both reads found all ones through one read-only page, and the write to it stopped the guest"))
+        }
+        _ => Err(String::from("the write to the absent device did not stop the guest where it was told to")),
     }
 }
 
