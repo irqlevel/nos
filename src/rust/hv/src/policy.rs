@@ -28,6 +28,7 @@ const LEAF_XSTATE: u32 = 0xD;
 const LEAF_HYPERVISOR_BASE: u32 = 0x4000_0000;
 const LEAF_HYPERVISOR_END: u32 = 0x4000_00FF;
 const LEAF_EXT_FEATURES: u32 = 0x8000_0001;
+const LEAF_EXT_ADDRESS: u32 = 0x8000_0008;
 
 /* Leaf 1, ECX: the features kept. Everything not named here is cleared --
  * among them MONITOR, VMX, x2APIC, the TSC deadline timer, XSAVE, OSXSAVE,
@@ -67,8 +68,39 @@ const LEAF1_EDX_KEEP: u32 = (1 << 0)   // FPU
     | (1 << 25)  // SSE
     | (1 << 26); // SSE2
 
-/* Extended leaf 0x80000001, ECX bit 2 is SVM: never handed to a guest. */
-const EXT_ECX_SVM: u32 = 1 << 2;
+/* Extended leaf 0x80000001, ECX: the features kept, on the same terms as
+ * leaf 1's -- anything not named is cleared. That list was once "all of it
+ * but SVM", and on a real Zen 2 the guest found MWAITX there (bit 29), used
+ * MONITORX for its udelay, and stopped at an intercept nothing answers: TCG's
+ * `-cpu max` never offered it. Among what is cleared: SVM, the extended APIC
+ * space, OSVW, IBS, XOP and FMA4 and TBM (VEX-coded, and so on state XSAVE
+ * would switch), SKINIT, the watchdog, LWP, the topology and performance
+ * counter extensions, MWAITX. */
+const EXT1_ECX_KEEP: u32 = (1 << 0)   // LAHF/SAHF in 64-bit mode
+    | (1 << 5)   // ABM: LZCNT
+    | (1 << 6)   // SSE4A
+    | (1 << 7)   // misaligned SSE
+    | (1 << 8);  // PREFETCHW
+
+/* Extended leaf 0x80000001, EDX: what leaf 1 keeps of the bits AMD mirrors
+ * there (the APIC again not), SYSCALL, NX, the MMX extensions, 1 GiB pages and
+ * long mode. RDTSCP (bit 27) is cleared because its intercept has no answer
+ * here but #UD; FFXSR and 3DNow! go too. */
+const EXT1_EDX_KEEP: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
+    | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8)   // FPU..CX8, as leaf 1
+    | (1 << 11)  // SYSCALL
+    | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15) | (1 << 16) | (1 << 17) // MTRR..PSE-36
+    | (1 << 20)  // NX
+    | (1 << 22)  // MMX extensions
+    | (1 << 23) | (1 << 24) // MMX, FXSR
+    | (1 << 26)  // 1 GiB pages
+    | (1 << 29); // long mode
+
+/* Extended leaf 0x80000008, EBX: RDPRU (bit 4) and WBNOINVD (bit 9) are
+ * cleared -- RDPRU's intercept has no answer here, and WBNOINVD is WBINVD with
+ * a prefix whose length only next-RIP save could tell. The rest -- the
+ * speculation controls a kernel wants to know of -- is the host's. */
+const EXT8_EBX_CLEAR: u32 = (1 << 4) | (1 << 9);
 
 /// The answer to a CPUID: the four registers it fills.
 pub struct Cpuid {
@@ -96,16 +128,19 @@ pub fn cpuid(leaf: u32, sub: u32) -> Cpuid {
         Some(r) => r,
         None => return Cpuid { eax: 0, ebx: 0, ecx: 0, edx: 0 },
     };
-    let (mut ecx, mut edx) = (host.ecx, host.edx);
+    let (mut ebx, mut ecx, mut edx) = (host.ebx, host.ecx, host.edx);
 
     if leaf == LEAF_FEATURES {
         ecx &= LEAF1_ECX_KEEP;
         edx &= LEAF1_EDX_KEEP;
     } else if leaf == LEAF_EXT_FEATURES {
-        ecx &= !EXT_ECX_SVM;
+        ecx &= EXT1_ECX_KEEP;
+        edx &= EXT1_EDX_KEEP;
+    } else if leaf == LEAF_EXT_ADDRESS {
+        ebx &= !EXT8_EBX_CLEAR;
     }
 
-    Cpuid { eax: host.eax, ebx: host.ebx, ecx, edx }
+    Cpuid { eax: host.eax, ebx, ecx, edx }
 }
 
 /// Apply a CPUID answer to the guest's registers: EAX and the GPRs the run

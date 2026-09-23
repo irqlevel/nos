@@ -48,6 +48,7 @@ const LEN_HLT: u64 = 1;
 const LEN_CPUID: u64 = 2;
 const LEN_MSR: u64 = 2;
 const LEN_VMMCALL: u64 = 3;
+const LEN_WBINVD: u64 = 2;
 
 /// A port access that stopped the guest.
 #[derive(Clone, Copy, Debug)]
@@ -342,6 +343,15 @@ impl Vcpu {
         self.skip(LEN_VMMCALL);
     }
 
+    /// Step past a WBINVD, which every x86 CPU has and a guest may run: the
+    /// guest's caches are the host's, coherent, and with no device of its
+    /// own doing DMA there is nothing its flush would be for. (WBNOINVD is the
+    /// same instruction with an F3 prefix, a byte longer, and only next-RIP
+    /// save tells them apart; the CPUID policy does not offer it.)
+    pub fn skip_wbinvd(&mut self) {
+        self.skip(LEN_WBINVD);
+    }
+
     /// Whether an event is queued for injection on the next entry -- one
     /// given back from `exit_int_info` by [`requeue_event`](Self::requeue_event),
     /// or one the policy injected. A vCPU with one has somewhere to go, halted
@@ -392,6 +402,16 @@ impl Vcpu {
         let c = &mut self.guest.vmcb_mut().control;
         c.intercept_misc1 &= !intercept::misc1::VINTR;
         c.int_ctl &= !int_ctl::V_IRQ;
+    }
+
+    /// Inject an invalid-opcode fault on the next entry: what a CPU raises for
+    /// an instruction it does not have, and so the answer to one the guest
+    /// was told by CPUID is not there -- MONITOR, MWAIT, RDTSCP, RDPRU,
+    /// XSETBV -- and runs anyway. The guest's RIP stays on the instruction.
+    pub fn inject_ud(&mut self) {
+        use vmcb::event;
+        const VECTOR_UD: u64 = 6;
+        self.guest.vmcb_mut().control.event_inj = event::VALID | event::TYPE_EXCEPTION | VECTOR_UD;
     }
 
     /// Inject a general-protection fault into the guest on the next entry:

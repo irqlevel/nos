@@ -13,7 +13,7 @@
 //! to the timer's next edge, the only thing here that becomes pending with
 //! time -- and its CPU goes to whatever else can use it.
 
-use hvarch::x86::svm::vmcb::Save;
+use hvarch::x86::svm::vmcb::{self, Save};
 use hvarch::x86::svm::GuestRegs;
 use hvarch::{Error, Result};
 use kcore::time;
@@ -84,8 +84,15 @@ pub struct Counts {
     /// the host CPU this guest gave back while it had nothing to do.
     pub sleeps: u64,
     pub slept_ns: u64,
+    /// Instructions the guest was told (by CPUID) it does not have, run
+    /// anyway and answered with #UD; WBINVDs stepped past.
+    pub ud: u64,
+    pub wbinvd: u64,
     pub exits: u64,
 }
+
+/// The most MSR accesses answered with #GP kept for a report.
+const MSR_FAULTS_KEPT: usize = 8;
 
 /// A Linux guest: its memory, its one vCPU, and its console.
 pub struct LinuxGuest {
@@ -99,6 +106,10 @@ pub struct LinuxGuest {
     input_pos: usize,
     /// A tally of reads of the low ports, to find a guest spinning on one.
     port_hist: alloc::boxed::Box<[u32; 1024]>,
+    /// The first MSR accesses the policy refused with #GP: (MSR, value
+    /// written, whether a write). A guest's `rdmsr_safe` takes the fault in
+    /// silence, so the report is the only place such a thing shows.
+    msr_faults: alloc::vec::Vec<(u32, u64, bool)>,
 }
 
 impl LinuxGuest {
@@ -111,6 +122,10 @@ impl LinuxGuest {
         vm.memory_mut().add(0, mem_bytes)?;
         let port_hist = alloc::vec![0u32; 1024].into_boxed_slice().try_into()
             .map_err(|_| Error::NoMemory)?;
+        /* Its whole capacity now, fallibly, so that recording a fault later
+         * never allocates. */
+        let mut msr_faults = alloc::vec::Vec::new();
+        msr_faults.try_reserve_exact(MSR_FAULTS_KEPT).map_err(|_| Error::NoMemory)?;
         Ok(Self {
             vm,
             uart: Uart::new(),
@@ -120,6 +135,7 @@ impl LinuxGuest {
             input: alloc::vec::Vec::new(),
             input_pos: 0,
             port_hist,
+            msr_faults,
         })
     }
 
@@ -157,6 +173,16 @@ impl LinuxGuest {
 
     pub fn uart_ier(&self) -> u8 {
         self.uart.ier()
+    }
+
+    /// Where the guest read an absent device and was answered with all ones.
+    pub fn absent_pages(&self) -> &[u64] {
+        self.vm.memory().absent_pages()
+    }
+
+    /// The MSR accesses answered with #GP: (MSR, value, write).
+    pub fn msr_faults(&self) -> &[(u32, u64, bool)] {
+        &self.msr_faults
     }
 
     /// The interrupt state at the end, for a diagnostic: the master PIC's
@@ -285,7 +311,18 @@ impl LinuxGuest {
                     self.vm.vcpu_mut().skip_hlt();
                     halted = true;
                 }
-                Exit::NestedFault { gpa, .. } => {
+                Exit::NestedFault { gpa, error } => {
+                    /* A read of the platform's MMIO window that nothing
+                     * answers is a probe for a device that is not there: map
+                     * all ones and let the instruction run again. Anything
+                     * else -- a write, a fetch, a walk of the guest's own
+                     * tables, an address outside the window -- stops it. */
+                    use vmcb::npf;
+                    let plain_read = error & (npf::PRESENT | npf::WRITE | npf::FETCH) == 0
+                        && error & npf::FINAL != 0;
+                    if plain_read && self.vm.memory_mut().map_absent(gpa).is_ok() {
+                        continue;
+                    }
                     counts.mmio += 1;
                     break Stop::Mmio { gpa, rip };
                 }
@@ -296,6 +333,19 @@ impl LinuxGuest {
                 Exit::IrqWindow => {
                     /* The guest can take an interrupt now; the next entry
                      * injects it. Nothing to do here. */
+                }
+                Exit::Other(code) if matches!(code,
+                    vmcb::exit::MONITOR | vmcb::exit::MWAIT | vmcb::exit::MWAIT_ARMED
+                    | vmcb::exit::RDTSCP | vmcb::exit::RDPRU | vmcb::exit::XSETBV) =>
+                {
+                    /* Intercepted, and not offered by CPUID: the guest gets
+                     * what a CPU without them gives it. */
+                    counts.ud += 1;
+                    self.vm.vcpu_mut().inject_ud();
+                }
+                Exit::Other(vmcb::exit::WBINVD) => {
+                    counts.wbinvd += 1;
+                    self.vm.vcpu_mut().skip_wbinvd();
                 }
                 Exit::Hypercall => {
                     /* No paravirtualisation is offered; a VMMCALL is a fault
@@ -431,6 +481,9 @@ impl LinuxGuest {
             } else {
                 counts.msr_gp += 1;
                 v.inject_gp();
+                if self.msr_faults.len() < MSR_FAULTS_KEPT {
+                    self.msr_faults.push((msr, value, true));
+                }
             }
         } else {
             counts.msr_read += 1;
@@ -443,6 +496,9 @@ impl LinuxGuest {
                 None => {
                     counts.msr_gp += 1;
                     v.inject_gp();
+                    if self.msr_faults.len() < MSR_FAULTS_KEPT {
+                        self.msr_faults.push((msr, 0, false));
+                    }
                 }
             }
         }

@@ -21,6 +21,16 @@ const RUN_FRAMES: usize = PAGE_SIZE / core::mem::size_of::<Frame>();
 /// translate 48 bits, and an address above that faults whatever is mapped.
 pub const MAX_GPA: u64 = 1 << 48;
 
+/// The platform's MMIO window below 4 GiB, where a PC keeps its chipset's
+/// registers (the IOAPIC, the HPET, AMD's FCH, the local APIC, the firmware
+/// flash): what [`GuestMemory::map_absent`] answers reads of.
+#[cfg(target_arch = "x86_64")]
+const MMIO_WINDOW: core::ops::Range<u64> = 0xC000_0000..0x1_0000_0000;
+/// The most pages of it a guest may have answered that way: a guest that
+/// walks the whole window is not probing for a device.
+#[cfg(target_arch = "x86_64")]
+const MAX_ABSENT_PAGES: usize = 64;
+
 /// A guest's memory.
 ///
 /// Its pages are [`Frame`]s: RAM the kernel handed out by address and mapped
@@ -39,11 +49,17 @@ pub const MAX_GPA: u64 = 1 << 48;
 /// only with the table -- so "the guest can reach host memory it was not
 /// given" is not a thing a caller can get wrong.
 pub struct GuestMemory {
-    /* Before the regions, so that it is dropped first: the table goes
-     * before the pages it maps are back on the free list. */
+    /* Before the regions and the absent page, so that it is dropped first:
+     * the table goes before the pages it maps are back on the free list. */
     #[cfg(target_arch = "x86_64")]
     npt: Npt,
     regions: Vec<Region>,
+    /// A page of all ones, the guest's reads of an absent device: made the
+    /// first time one is needed, mapped read-only wherever it is.
+    #[cfg(target_arch = "x86_64")]
+    absent: Option<Frame>,
+    /// Where it is mapped, page-aligned, in the order the guest found them.
+    absent_at: Vec<u64>,
 }
 
 /// One run of guest physical addresses with memory behind it.
@@ -78,6 +94,9 @@ impl GuestMemory {
             #[cfg(target_arch = "x86_64")]
             npt: Npt::new()?,
             regions: Vec::new(),
+            #[cfg(target_arch = "x86_64")]
+            absent: None,
+            absent_at: Vec::new(),
         })
     }
 
@@ -132,6 +151,53 @@ impl GuestMemory {
             }
         }
         Ok(())
+    }
+
+    /// Answer the guest's read of `gpa` -- in the platform's MMIO window and
+    /// backed by no memory -- as an empty bus answers one: with all ones. A
+    /// page of them is mapped there, read-only, and the guest's instruction
+    /// runs again and reads it. What makes this necessary is Linux on a Zen
+    /// CPU reading the reset-status register of AMD's FCH at a fixed address,
+    /// on hardware that has one and in a guest that does not; all ones is
+    /// what it takes for "no such device" and moves on from.
+    ///
+    /// A write is not answered this way, nor a read anywhere else: discarding
+    /// a write needs the instruction's length, which is a decoder this
+    /// hypervisor does not have, and a read of an address outside the window
+    /// is a guest's mistake, not a probe. So a write to the page is still a
+    /// nested fault, and stops the guest; so is one read past its RAM.
+    #[cfg(target_arch = "x86_64")]
+    pub fn map_absent(&mut self, gpa: u64) -> Result<()> {
+        let page = gpa & !(PAGE - 1);
+        if !MMIO_WINDOW.contains(&page) || self.region(page, PAGE_SIZE).is_ok() {
+            return Err(Error::BadAddress);
+        }
+        if self.absent_at.len() >= MAX_ABSENT_PAGES {
+            return Err(Error::NoMemory);
+        }
+        if self.absent.is_none() {
+            /* Filled a piece at a time: a page of it on the task's stack is
+             * a page the stack may not have. */
+            const PIECE: usize = 512;
+            let mut frame = Frame::new().ok_or(Error::NoMemory)?;
+            for at in (0..PAGE_SIZE).step_by(PIECE) {
+                if !frame.write(at, &[0xFF; PIECE]) {
+                    return Err(Error::NoMemory);
+                }
+            }
+            self.absent = Some(frame);
+        }
+        let hpa = self.absent.as_ref().map(|f| f.phys()).ok_or(Error::NoMemory)?;
+        self.absent_at.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        self.npt.prepare(page, PAGE)?;
+        self.npt.set_ro(page, hpa)?;
+        self.absent_at.push(page);
+        Ok(())
+    }
+
+    /// Where the guest has read an absent device, for a report.
+    pub fn absent_pages(&self) -> &[u64] {
+        &self.absent_at
     }
 
     /// How much memory the guest has, over every region.
