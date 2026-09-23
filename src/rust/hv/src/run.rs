@@ -134,9 +134,12 @@ pub trait Host {
     /// A byte the guest wrote to its serial console.
     fn output(&mut self, byte: u8);
     /// The next byte typed at the guest's console, if there is one. Asked
-    /// only once the guest is at a prompt (it has asked where its cursor is),
-    /// and only when the serial port's receive register is free.
-    fn input(&mut self) -> Option<u8>;
+    /// when the serial port's receive register is free; `at_prompt` says
+    /// whether the guest has reached a shell prompt yet -- it has asked
+    /// where its cursor is -- before which a line typed by a script is
+    /// swallowed by the boot and is better held back. A person typing at
+    /// the console knows when to, and is not.
+    fn input(&mut self, at_prompt: bool) -> Option<u8>;
     /// Whether the guest is to be stopped: asked before every entry, and at
     /// least every host tick while the guest is halted.
     fn stop_requested(&mut self) -> bool;
@@ -415,10 +418,8 @@ impl LinuxGuest {
         }
         if let Some(byte) = self.uart.take_reply() {
             self.uart.set_rx(byte);
-        } else if self.uart.prompt_seen() {
-            if let Some(byte) = host.input() {
-                self.uart.set_rx(byte);
-            }
+        } else if let Some(byte) = host.input(self.uart.prompt_seen()) {
+            self.uart.set_rx(byte);
         }
     }
 

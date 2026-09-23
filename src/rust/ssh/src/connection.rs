@@ -245,6 +245,38 @@ struct Session<'s, 'a> {
     keepalive_missed: u32,
 }
 
+/// A running command's view of its session: its output out on the channel,
+/// and what the client types -- which the line editor gets otherwise, after
+/// the command -- in. The first failure is kept for the session to end on
+/// once the command returns; nothing is written or read after it.
+struct CommandIo<'x, 's, 'a> {
+    session: &'x mut Session<'s, 'a>,
+    failed: Option<Error>,
+}
+
+impl crate::Io for CommandIo<'_, '_, '_> {
+    fn write(&mut self, data: &[u8]) {
+        if self.failed.is_none() {
+            if let Err(e) = self.session.write_output(data) {
+                self.failed = Some(e);
+            }
+        }
+    }
+
+    fn read(&mut self, buf: &mut [u8], timeout_ms: u64) -> Option<usize> {
+        if self.failed.is_some() {
+            return None;
+        }
+        match self.session.read_typed(buf, timeout_ms) {
+            Ok(n) => n,
+            Err(e) => {
+                self.failed = Some(e);
+                None
+            }
+        }
+    }
+}
+
 impl<'s, 'a> Session<'s, 'a> {
     fn new(t: &'s mut Transport<'a>, cfg: &'s Config<'s>) -> Self {
         Self {
@@ -577,19 +609,40 @@ impl<'s, 'a> Session<'s, 'a> {
         self.t.send(&m)
     }
 
-    /// Runs a command line, its output going out as it comes.
+    /// Runs a command line, its output going out as it comes and the
+    /// client's typing there for it to read.
     fn run_line(&mut self, shell: &mut dyn Shell, line: &str) -> Result<()> {
-        let mut failed = None;
-        shell.run(line, &mut |out: &[u8]| {
-            if failed.is_none() {
-                if let Err(e) = self.write_output(out) {
-                    failed = Some(e);
-                }
-            }
-        });
-        match failed {
+        let mut io = CommandIo { session: self, failed: None };
+        shell.run(line, &mut io);
+        match io.failed {
             Some(e) => Err(e),
             None => Ok(()),
+        }
+    }
+
+    /// What the client typed, for a command that reads it: from what has
+    /// come already, else from the messages that come before `timeout_ms`
+    /// is out -- which are handled as they are while output waits, a rekey
+    /// or a close among them. `Ok(None)` once no more will come.
+    fn read_typed(&mut self, buf: &mut [u8], timeout_ms: u64) -> Result<Option<usize>> {
+        let deadline = self.t.now_ms().saturating_add(timeout_ms);
+        loop {
+            if !self.input.is_empty() {
+                let n = core::cmp::min(buf.len(), self.input.len());
+                buf[..n].copy_from_slice(&self.input[..n]);
+                self.input.drain(..n);
+                self.taken(n as u32)?;
+                return Ok(Some(n));
+            }
+            match &self.channel {
+                Some(c) if !c.eof_in && !c.close_in && !c.close_out => {}
+                _ => return Ok(None),
+            }
+            if buf.is_empty() || !self.t.next(&mut self.payload, deadline)? {
+                return Ok(Some(0));
+            }
+            self.heard();
+            self.on_message(true)?;
         }
     }
 

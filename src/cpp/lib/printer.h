@@ -12,6 +12,19 @@ public:
     virtual void VPrintf(const char *fmt, va_list args) = 0;
     virtual void PrintString(const char *s) = 0;
     virtual void Backspace() = 0;
+
+    /* What the person at the other end types, for a command that reads it
+       while it runs: up to len bytes, waiting up to timeoutNs for some.
+       0 when the time passed with nothing, -1 when no one can type here --
+       the console, the UDP shell, /etc/rc -- or no more will come. Only an
+       SSH session's printer has anyone to ask (kernel_cmd_dispatch_io). */
+    virtual long ReadInput(unsigned char* buf, unsigned long len, unsigned long long timeoutNs)
+    {
+        (void)buf;
+        (void)len;
+        (void)timeoutNs;
+        return -1;
+    }
 };
 
 /* A Printer into a buffer its owner provides: what a command printed, kept

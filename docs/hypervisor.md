@@ -210,17 +210,21 @@ backend, where a guest can show it working -- not slipped in here.
     hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU for
                                 secs, then print its console and how it ended
-    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [cmdline=...]
-                                the same, left running until it is stopped
+    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [restart] [cmdline=...]
+                                the same, left running until it is stopped;
+                                restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
-                                their CPU, uptime and exits
+                                their CPU, uptime, restarts and exits
     hv console <id> [bytes=N]   the end of one's console
+    hv attach <id>              its console, live and typed at, over ssh -t;
+                                ^] detaches
     hv send <id> <text>         type at it, \n for a newline
     hv exec <id> [secs=N] <line>
                                 type a line, print what comes back up to the
                                 prompt after it
     hv wait <id> [secs=N] <text>
-                                until its console shows text
+                                until its console shows text, or it stops
+    hv restart <id>             boot it again from its files, running or stopped
     hv stop <id|all>            stop it, say how it ended, take it off the list
     hv help                     all of these, a line each
 
@@ -714,6 +718,34 @@ returns within a tick or so of asking: it takes the VM off the list first and
 joins its task after, with no lock held while it waits. A guest that stops by
 itself -- a triple fault, a HLT with interrupts off, a reset -- stays on the
 list as `stopped`, with its reason, until `hv stop` takes it off.
+
+**A VM's task lives as long as the VM.** When its guest stops, the vCPU task
+gives the guest's memory back and parks on the VM's event, for `hv restart` --
+which builds the guest again from its files and boots it, a stopped guest or
+a running one, as a reset button would -- or `hv stop`, which ends it. With
+`restart`, a guest that resets itself or triple-faults is booted again by the
+task straight away: a reboot. Five of those within a minute are taken for a
+loop -- a guest that panics at boot with `panic=1` would otherwise have its
+CPU for good -- and it is left stopped, `reset 6 times in 60 s, left
+stopped`. `hv list` counts the restarts; the console runs on across them,
+one log of every boot; a line `hv exec` typed at a boot that ended says so
+rather than waiting for a prompt that will not come.
+
+**`hv attach` is the console, live.** From an SSH session with a terminal
+(`ssh -t <host> hv attach 0`) it shows the last kilobyte of the console, then
+what the guest prints as it prints it, and types what is pressed as it is
+pressed -- the guest's line editor, ^C and all -- until ^] detaches, the guest
+stops, or the session ends. What it passes to the terminal is the guest's
+output as it is, colours and cursor movement included, but for what a
+terminal would answer or act on: a status or attributes query (`ESC [ 6 n`,
+`ESC [ c`), whose answer would be typed into the guest after the UART's own,
+and the string sequences (`ESC ]` and its kind), which set a terminal's
+title, clipboard or palette -- nothing a guest should reach on the person's
+machine. It takes a session that can type: a command reads what is typed
+through its output (`Output::read_input`), and only an SSH session's has
+anyone behind it -- from the console, the UDP shell or `/etc/rc` it says so
+and returns. Keys typed at an attached guest are not held back for a prompt
+the way a script's line is: the person decides when to type.
 
 **A guest that reboots stops, and says so.** Linux reboots -- a `reboot`, a
 panic with `panic=N` -- by pulsing the 8042's reset line (`0xFE` to port

@@ -50,7 +50,10 @@ impl Host for BootHost {
         }
     }
 
-    fn input(&mut self) -> Option<u8> {
+    fn input(&mut self, at_prompt: bool) -> Option<u8> {
+        if !at_prompt {
+            return None;
+        }
         let byte = *self.input.get(self.fed)?;
         self.fed += 1;
         Some(byte)
@@ -143,6 +146,10 @@ pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloadin
     let spec = match guest::parse(args, USAGE) {
         Ok(spec) if spec.log => {
             let _ = writeln!(out, "hv: log is hv start's -- hv boot sends the console to the kernel log always");
+            return;
+        }
+        Ok(spec) if spec.restart => {
+            let _ = writeln!(out, "hv: restart is hv start's -- a hv boot guest runs once");
             return;
         }
         Ok(spec) if spec.secs.map_or(true, |s| (1..=MAX_SECS).contains(&s)) => spec,

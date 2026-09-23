@@ -142,9 +142,16 @@ empty line to log out; line ends are made CR LF. `exit` and `logout` end the
 session. The exit status is always 0: the kernel's commands have none.
 
 A command runs on the session's own task and cannot be interrupted, as on the
-console: ^C typed during `ping` reaches the editor once `ping` is done. And
-there is one user: whatever name the client gives, a key in the list logs in,
-and what it can do is what the console can.
+console: ^C typed during `ping` reaches the editor once `ping` is done -- unless
+the command reads what is typed while it runs, which a command may: the
+session hands it the channel's data raw, as the keys are pressed, reading
+more of the connection while it waits (a rekey and a close are dealt with on
+the way), and flushes what the command has printed before each wait, a prompt
+with no line end included. `hv attach` is one such command: the console of a
+guest, typed at through `ssh -t`. What a command does not read is the line
+editor's once it returns. And there is one user: whatever name the client
+gives, a key in the list logs in, and what it can do is what the console
+can.
 
 ## Limits
 

@@ -69,9 +69,25 @@ pub trait Shell {
     fn authorized(&mut self, user: &str, key: &PublicKey) -> bool;
     /// `user` has logged in, with `key`.
     fn logged_in(&mut self, _user: &str, _key: &PublicKey) {}
-    /// Runs one command line, handing what it prints to `out` as it prints
-    /// it. `exit` and `logout` never get here: the session ends on those.
-    fn run(&mut self, line: &str, out: &mut dyn FnMut(&[u8]));
+    /// Runs one command line, what it prints going to `io` as it prints it,
+    /// and what the client types while it runs there for it to read. `exit`
+    /// and `logout` never get here: the session ends on those.
+    fn run(&mut self, line: &str, io: &mut dyn Io);
+}
+
+/// What a command a session runs has of the session, for as long as it runs.
+pub trait Io {
+    /// Output, on the channel as it comes -- line ends made CR LF for a
+    /// terminal.
+    fn write(&mut self, data: &[u8]);
+    /// What the client has typed since the command began, or since the last
+    /// read, up to `buf.len()` bytes -- waiting up to `timeout_ms` for some
+    /// when there is none yet. Raw: with a terminal, the keys as they were
+    /// pressed; and what a command does not read is the line editor's once
+    /// it returns. `Some(0)` when the time passed with nothing; `None` when
+    /// nothing more will come: the channel's EOF or close, or the session
+    /// failing -- which the session then ends on.
+    fn read(&mut self, buf: &mut [u8], timeout_ms: u64) -> Option<usize>;
 }
 
 /// How a server behaves: the same for all its sessions.

@@ -67,9 +67,12 @@ class SinkPrinter final : public Stdlib::Printer
 {
 public:
     typedef void (*SinkFn)(void* ctx, const unsigned char* buf, unsigned long len);
+    typedef long (*SourceFn)(void* ctx, unsigned char* buf, unsigned long len,
+        unsigned long long timeoutNs);
 
-    SinkPrinter(SinkFn fn, void* ctx, unsigned char* buf, unsigned long size)
+    SinkPrinter(SinkFn fn, SourceFn src, void* ctx, unsigned char* buf, unsigned long size)
         : Fn(fn)
+        , Src(src)
         , Ctx(ctx)
         , Buf(buf)
         , Size(size)
@@ -103,6 +106,20 @@ public:
 
     virtual void Backspace() override
     {
+    }
+
+    /* From the session's source, for a command that asks -- after what it
+       has printed has gone: a prompt, or the echo of what was typed, has no
+       line end to send it on its way, and a command reading its answer must
+       not leave the question waiting in Buf. Not where the caller may not
+       block: the source waits for the network. */
+    virtual long ReadInput(unsigned char* buf, unsigned long len, unsigned long long timeoutNs) override
+    {
+        if (Src == nullptr || buf == nullptr || len == 0 || !Kernel::PreemptCanBlock())
+            return -1;
+
+        Flush();
+        return Src(Ctx, buf, len, timeoutNs);
     }
 
     /* The command has returned: what is left goes, and what was lost is
@@ -165,6 +182,7 @@ private:
     static const unsigned long long FlushDelayNs = 50ULL * 1000 * 1000;
 
     SinkFn Fn;
+    SourceFn Src;
     void* Ctx;
     unsigned char* Buf;
     unsigned long Size;
@@ -1475,12 +1493,13 @@ void kernel_printer_write(void* out, const unsigned char* buf, unsigned long len
     }
 }
 
-/* A shell command line run for Rust -- an SSH session's -- as the console
-   would run it, what it prints handed to sink(ctx, ...) as SinkPrinter
-   passes it on. Sleeps as long as the command runs: task context only, with
-   no lock held. */
-void kernel_cmd_dispatch(const unsigned char* line, unsigned long len,
-    SinkPrinter::SinkFn sink, void* ctx)
+/* kernel_cmd_dispatch and kernel_cmd_dispatch_io: a command line run as the
+   console would run it, what it prints handed to sink(ctx, ...) as
+   SinkPrinter passes it on, and -- given a source -- what is typed while it
+   runs read from source(ctx, ...). Sleeps as long as the command runs: task
+   context only, with no lock held. */
+static void DispatchTo(const unsigned char* line, unsigned long len,
+    SinkPrinter::SinkFn sink, SinkPrinter::SourceFn source, void* ctx)
 {
     if (line == nullptr || sink == nullptr)
         return;
@@ -1507,10 +1526,36 @@ void kernel_cmd_dispatch(const unsigned char* line, unsigned long len,
     Stdlib::MemCpy(cmd, line, len);
     cmd[len] = '\0';
 
-    SinkPrinter out(sink, ctx, buf, SinkBufferSize);
+    SinkPrinter out(sink, source, ctx, buf, SinkBufferSize);
     Kernel::Cmd::Dispatch(cmd, out);
     out.Finish();
     Kernel::Mm::Free(buf);
+}
+
+/* A shell command line run for Rust -- an SSH session's -- with nobody to
+   type at it */
+void kernel_cmd_dispatch(const unsigned char* line, unsigned long len,
+    SinkPrinter::SinkFn sink, void* ctx)
+{
+    DispatchTo(line, len, sink, nullptr, ctx);
+}
+
+/* The same with someone to type: an SSH session's command can read what the
+   client types while it runs (kernel_printer_read) */
+void kernel_cmd_dispatch_io(const unsigned char* line, unsigned long len,
+    SinkPrinter::SinkFn sink, SinkPrinter::SourceFn source, void* ctx)
+{
+    DispatchTo(line, len, sink, source, ctx);
+}
+
+/* What is typed at a command, for one that asks: see Printer::ReadInput */
+long kernel_printer_read(void* out, unsigned char* buf, unsigned long len,
+    unsigned long long timeoutNs)
+{
+    if (out == nullptr || buf == nullptr || len == 0)
+        return -1;
+
+    return static_cast<Stdlib::Printer*>(out)->ReadInput(buf, len, timeoutNs);
 }
 
 /* What procfs puts in its files: the kernel's version, the command line it
