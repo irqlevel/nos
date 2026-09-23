@@ -853,29 +853,58 @@ void PageTable::CheckFreeList(Stdlib::Printer& printer)
         ok ? "ok" : "FAILED");
 }
 
+/* The page is zeroed off the lock. It was zeroed under it, and every CPU
+   that allocated waited for every other's zeroing -- 4 KiB of stores on
+   hardware, and seconds under TCG once the page has held a guest's code:
+   QEMU throws its translations of a page away as the page is written, and
+   rebuilding a guest that had run for half a minute held this lock for
+   more than the watchdog's ten seconds, with every other CPU idle. */
 Page* PageTable::AllocPage()
 {
-    Stdlib::AutoLock lock(Lock);
-
-    return AllocPageNoLock();
+    Page* page;
+    {
+        Stdlib::AutoLock lock(Lock);
+        page = TakeFreePageNoLock();
+    }
+    if (page)
+        ZeroPage(page);
+    return page;
 }
 
 Page* PageTable::AllocPageNoLock()
+{
+    Page* page = TakeFreePageNoLock();
+    if (page)
+        ZeroPage(page);
+    return page;
+}
+
+Page* PageTable::TakeFreePageNoLock()
 {
     if (FreePagesList.IsEmpty())
     {
         return nullptr;
     }
 
-    //DebugWait();
     Page* page = CONTAINING_RECORD(FreePagesList.RemoveHead(), Page, ListEntry);
     page->ListEntry.Init(); /* Self-pointing = not on any list */
+    FreePagesCount--;
+    return page;
+}
+
+/* Preemption is off from the map to the unmap, as a spinlock kept it when
+   this ran under Lock: the unmap invalidates only this CPU's TLB, so a task
+   moved to another CPU half way would leave the slot's translation stale
+   behind it -- and the next page mapped at that slot there would be written
+   through it. */
+void PageTable::ZeroPage(Page* page)
+{
+    Task* task = PreemptDisableTask();
     ulong va = TmpMapPage(page->GetPhyAddress());
     BugOn(!va);
     Stdlib::MemSet((void*)va, 0, Const::PageSize);
     TmpUnmapPage(va);
-    FreePagesCount--;
-    return page;
+    PreemptEnableTask(task);
 }
 
 Page* PageTable::AllocContiguousPages(ulong count)

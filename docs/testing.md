@@ -97,6 +97,7 @@ swallowing panic messages whole.
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them |
+| `hv-distro-test.py --iso <alpine-virt.iso>` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network, and its own sshd reached from outside |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -426,6 +427,36 @@ address and MAC; a guest pings nos at 10.0.100.1 and each pings the other;
 nos pings a guest out of `hv0`; and a page from one guest's `httpd` is
 fetched from outside QEMU through `hv forward`. It needs a guest kernel with
 networking, virtio-net and `ip=` configuration built in.
+
+### `hv-distro-test.py` -- a distribution, as it ships
+
+hv-linux-test's guest is a kernel built for the purpose. This one is a
+distribution's, built for every machine instead: Alpine's `virt` ISO, its
+kernel and initramfs taken out of it with `xorriso` and the ISO itself given
+to the guest as a read-only disk (`disk=...:ro`), unmodified. Also manual --
+the ISO is a download -- and run as
+
+```sh
+scripts/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso
+```
+
+It checks that Alpine's initramfs finds its ISO and OpenRC brings it to a
+login prompt; that root logs in by `hv send` (a getty asks for no cursor, so
+`exec` alone would never type at it) and it is Alpine on its `virt` kernel;
+that its clock is the host's, from the emulated RTC, to within minutes; that
+the ISO is read-only to it -- the driver says so and a write fails; that
+`reboot` resets it, `restart` boots it again, and root logs in again; that
+its initramfs configured eth0 from the VM's `ip=`, it pings nos and nos
+pings it; that `apk add openssh-server` installs from the ISO; and that the
+test, from outside QEMU, logs into the guest's own sshd through QEMU's
+forward, nos's `hv forward` and the switch. Two boots and apk under TCG:
+about five minutes. It needs `xorriso`, `ssh` and `ssh-keygen` on the host.
+
+Under TCG the guest cannot calibrate its TSC against the PIT -- an exit
+costs more than the calibration loop allows -- so it stays on jiffies and
+the PIT's periodic mode. `--cmdline-extra "tsc_early_khz=<kHz>
+tsc=reliable"` puts it on the TSC and high-resolution timers, which drive
+the PIT in one-shot mode, as a real CPU's calibration does by itself.
 
 ## The hardware NIC drivers
 

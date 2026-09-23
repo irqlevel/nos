@@ -270,6 +270,11 @@ private:
 
     Page* AllocPageNoLock();
     void FreePageNoLock(Page* page);
+    /* The halves of an allocation: a page off the free list, with Lock
+       held; and its zeroing, which needs no lock -- the page is the
+       caller's alone once it is off the list. */
+    Page* TakeFreePageNoLock();
+    void ZeroPage(Page* page);
 
     /* Where a range map takes its frames from: exactly one member is set.
        A tagged source keeps one range walk serving all three public forms

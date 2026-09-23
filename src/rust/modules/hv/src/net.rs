@@ -72,9 +72,13 @@ pub fn dotted(ip: u32) -> String {
 }
 
 /// The kernel command line's `ip=` for the guest on `port`: its address, the
-/// host's as the gateway, the mask, `eth0`, and no autoconfiguration.
+/// host's as the gateway, the mask, and no autoconfiguration -- and no
+/// device, which is the first one there is: a kernel told `eth0` waits
+/// twelve seconds for it to appear, and one whose NIC driver is a module its
+/// initramfs loads (a distribution's) finds none there before it gives up,
+/// and leaves `ip=` to the initramfs.
 pub fn ip_param(port: usize) -> String {
-    alloc::format!("ip={}::{}:{}::eth0:off", dotted(port_ip(port)), dotted(HOST_IP), dotted(MASK))
+    alloc::format!("ip={}::{}:{}:::off", dotted(port_ip(port)), dotted(HOST_IP), dotted(MASK))
 }
 
 /// What waits for one guest's NIC.

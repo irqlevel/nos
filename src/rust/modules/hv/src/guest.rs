@@ -33,8 +33,9 @@ pub struct Spec {
     pub kernel: String,
     pub initrd: Option<String>,
     /// `disk=`, as many as there are: files of nos's that are the guest's
-    /// `vda`, `vdb`, ... in that order.
-    pub disks: Vec<String>,
+    /// `vda`, `vdb`, ... in that order, and whether each is read-only
+    /// (`disk=path:ro`).
+    pub disks: Vec<(String, bool)>,
     pub mem_bytes: u64,
     pub cmdline: String,
     /// Bytes to type at its console once it is at a prompt.
@@ -115,7 +116,11 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             if spec.disks.len() >= MAX_DISKS {
                 return Err(alloc::format!("at most {} disks", MAX_DISKS));
             }
-            spec.disks.push(String::from(v));
+            let (path, ro) = match v.strip_suffix(":ro") {
+                Some(path) => (path, true),
+                None => (v, false),
+            };
+            spec.disks.push((String::from(path), ro));
         } else if let Some(v) = word.strip_prefix("secs=") {
             spec.secs = Some(v.parse().map_err(|_| String::from("secs= wants a number of seconds"))?);
         } else if let Some(v) = word.strip_prefix("cpu=") {
@@ -212,8 +217,8 @@ pub fn build(machine: &Machine, spec: &Spec) -> Result<LinuxGuest, String> {
         guest.add_nic(Box::new(nic.switch.backend(nic.port)), crate::net::port_mac(nic.port))
             .map_err(|e| alloc::format!("the NIC: {}", e))?;
     }
-    for (i, path) in spec.disks.iter().enumerate() {
-        let disk = FileDisk::open(path)?;
+    for (i, (path, ro)) in spec.disks.iter().enumerate() {
+        let disk = FileDisk::open(path, *ro)?;
         let mut id = String::new();
         let _ = write!(id, "nos-vd{}", (b'a' + i as u8) as char);
         guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;
@@ -227,16 +232,17 @@ pub fn build(machine: &Machine, spec: &Spec) -> Result<LinuxGuest, String> {
 struct FileDisk {
     path: String,
     size: u64,
+    read_only: bool,
 }
 
 impl FileDisk {
-    fn open(path: &str) -> Result<FileDisk, String> {
+    fn open(path: &str, read_only: bool) -> Result<FileDisk, String> {
         let size = kcore::fs::size(path).map_err(|e| alloc::format!("{}: {}", path, e))?;
         let size = size - size % blk::SECTOR;
         if size == 0 {
             return Err(alloc::format!("{}: not a sector long", path));
         }
-        Ok(FileDisk { path: String::from(path), size })
+        Ok(FileDisk { path: String::from(path), size, read_only })
     }
 }
 
@@ -250,7 +256,13 @@ impl blk::Backend for FileDisk {
     }
 
     fn write(&mut self, offset: u64, data: &[u8]) -> bool {
-        kcore::fs::write_at(&self.path, offset, data).is_ok()
+        /* The device refuses a write to a read-only disk before it gets
+         * here; this is the second no. */
+        !self.read_only && kcore::fs::write_at(&self.path, offset, data).is_ok()
+    }
+
+    fn read_only(&self) -> bool {
+        self.read_only
     }
 
     fn flush(&mut self) -> bool {
@@ -425,17 +437,21 @@ impl Ring {
         true
     }
 
-    /// Whether `needle` is among the kept bytes.
-    pub fn contains(&self, needle: &[u8]) -> bool {
+    /// Whether `needle` is among the kept bytes from absolute position
+    /// `from` on.
+    pub fn contains_since(&self, from: u64, needle: &[u8]) -> bool {
         if needle.is_empty() {
             return true;
         }
-        if needle.len() > self.len {
+        let oldest = self.oldest();
+        let skip = (from.max(oldest).min(self.total) - oldest) as usize;
+        let len = self.len - skip;
+        if needle.len() > len {
             return false;
         }
         let cap = self.buf.len();
-        let at = |i: usize| self.buf[(self.head + i) % cap];
-        (0..=self.len - needle.len()).any(|s| needle.iter().enumerate().all(|(k, b)| at(s + k) == *b))
+        let at = |i: usize| self.buf[(self.head + skip + i) % cap];
+        (0..=len - needle.len()).any(|s| needle.iter().enumerate().all(|(k, b)| at(s + k) == *b))
     }
 }
 

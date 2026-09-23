@@ -207,10 +207,10 @@ backend, where a guest can show it working -- not slipped in here.
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path]... [input=...] [cmdline=...]
+    hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU for
                                 secs, then print its console and how it ended
-    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -666,7 +666,10 @@ here:
   host's, masked: no local APIC, no x2APIC, no XSAVE and so no AVX -- the
   state switch around `vmrun` moves only the FXSAVE registers, so a guest is
   given nothing it could put in the part that is not switched -- and no
-  paravirtualisation. Every MSR is intercepted: the system MSRs (EFER, the
+  paravirtualisation. And one CPU of its own, whichever host CPU its vCPU runs
+  on: leaf 1 says one logical CPU with APIC ID 0, leaves 4 and 0x80000008 one
+  core, and the topology leaves (0xB, 0x1F, 0x8000001E), the SVM leaf and the
+  memory-encryption leaf are blank. Every MSR is intercepted: the system MSRs (EFER, the
   PAT, the segment bases, the SYSCALL and SYSENTER registers) are the guest's
   own state and are served from the VMCB save area, and every other MSR reads
   zero and swallows a write, which is what a guest's `rdmsr_safe` probes are
@@ -676,10 +679,12 @@ here:
   so the driver sends past its first byte); an 8254 PIT whose counter counts
   down at 1.193182 MHz off the host clock, whose channel-2 output goes high
   at its terminal count (what `pit_calibrate_tsc` waits on), and whose
-  channel 0 raises IRQ0 -- the system tick a guest cannot schedule without;
-  an MC146818 RTC that answers a fixed date with the update bit clear; and a
-  pair of 8259 PICs the guest takes its interrupts from, since it runs with
-  no local APIC.
+  channel 0 raises IRQ0 -- the system tick a guest cannot schedule without:
+  an edge a period in the periodic modes 2 and 3, and one when a loaded count
+  runs out in the one-shot modes 0 and 4, which a kernel's high-resolution
+  timers drive a count at a time; an MC146818 RTC that answers the host's
+  wall clock with the update bit clear; and a pair of 8259 PICs the guest
+  takes its interrupts from, since it runs with no local APIC.
 - **The exit loop** (`hv::run`) that answers all of the above, injects the
   highest-priority interrupt the PIC has when the guest can take one (and
   asks the CPU, through SVM's virtual-interrupt window, to exit the moment it
@@ -986,6 +991,81 @@ by side and one stopped mid-boot, a line typed at the other before its shell
 is up and another at its prompt, `send`, `wait`, `console`, the refused
 `hv off`, and an `rmmod` that stops the guest itself and leaves nothing on for
 the next load.
+
+## A distribution
+
+The guests above run a kernel built for the purpose, with a BusyBox
+initramfs. A distribution's is built for every machine instead -- SMP, ACPI,
+KASLR, high-resolution timers, virtio as modules its initramfs loads -- and
+Alpine's `virt` ISO boots under `hv start` as it ships: its kernel and
+initramfs taken out of the ISO, and the ISO itself the guest's read-only
+disk.
+
+```
+$ hv start /alpine/vmlinuz-virt mem=512 initrd=/alpine/initramfs-virt disk=/alpine/alpine.iso:ro net restart cmdline=console=ttyS0 nolapic acpi=off modules=loop,squashfs,sd-mod,usb-storage
+$ hv wait 0 secs=600 login:
+hv: vm 0 printed "login:", 36004 ms in
+$ hv send 0 root\n
+$ hv exec 0 cat /etc/alpine-release; uname -r
+3.24.2
+6.18.52-0-virt
+localhost:~#
+$ hv exec 0 date
+Wed Sep 23 21:32:50 UTC 2026
+```
+
+(Under TCG, twice emulated: 36 s to the login prompt.) Its initramfs loads
+virtio_blk, finds the ISO on `vda`, mounts it and installs the base system
+from the ISO's packages into a tmpfs, and OpenRC brings it up to a getty on
+ttyS0. `nolapic acpi=off` is the PC it is given -- no local APIC and no ACPI
+tables -- so it takes its interrupts from the 8259s, finds its PCI devices
+through configuration mechanism 1, and takes each virtio device's interrupt
+line from its configuration space. On the switch (`net`) its initramfs
+configures eth0 from the `ip=` the VM is given; `apk add openssh-server`
+installs from the ISO, and through `hv forward` its own sshd is reached from
+outside nos. `reboot` resets it through the keyboard controller, and with
+`restart` it boots again.
+
+What it took that the purpose-built kernel did not:
+
+- **The PIT's one-shot modes.** A kernel with high-resolution timers and a
+  clocksource good enough for them -- the TSC, which the guest calibrates
+  against the PIT by itself on a real CPU -- moves its tick from the PIT's
+  periodic mode 2 to one-shot mode 4, a count at a time. Channel 0 raised
+  IRQ0 only in the periodic modes, so the guest's timers would have stopped
+  at the switch. Under TCG an exit costs more than the calibration loop
+  allows and the guest stays on jiffies and a periodic tick; forced onto the
+  TSC (`tsc_early_khz=... tsc=reliable`) it runs its tick through mode 4,
+  and `sleep 2` takes 2.03 s.
+- **A clock.** The RTC answered a fixed 2026-01-01, and OpenRC took every
+  file of the ISO for one from the future, and said so at every service it
+  started. It answers the host's wall clock now, read when the guest is made
+  and counted on by the host's clock since boot; what the guest writes to
+  the time registers does not stick.
+- **One CPU of its own.** The topology CPUID gave was the host's: the guest
+  took the APIC ID of the host CPU its vCPU ran on for its own ("APIC ID
+  mismatch") and listed SVM's features for an extension it is not given.
+- **Typing at a login prompt.** `hv exec` and `input=` wait for a shell's
+  prompt -- BusyBox's line editor asking where the cursor is -- and a getty
+  asks for nothing, and throws away what was typed before it printed its
+  prompt. `hv send` types now, as at a terminal, and from then on for that
+  boot what `exec` types goes in as it is typed too; `hv wait` is what finds
+  the moment.
+- **`hv wait` in the current boot.** It searched the whole console, so after
+  a reboot it found the last boot's `login:`; it looks from where the
+  current boot began.
+- **`disk=path:ro`**: virtio's read-only feature, and a write the device
+  refuses itself before any reaches the file.
+
+And one thing in the kernel. Rebuilding the rebooted guest under TCG held
+the page allocator's lock for more than ten seconds, with every other CPU
+idle, and the watchdog panicked the machine: each page was zeroed under the
+lock, and QEMU throws away its translations of a page that held a guest's
+code as the page is written -- a guest that had run for half a minute took
+36 s to rebuild. The zeroing is done off the lock now (`PageTable::AllocPage`).
+
+The gate is `scripts/hv-distro-test.py --iso alpine-virt-*-x86_64.iso`
+([Tests and gates](testing.md)): manual, since the ISO is a download.
 
 ## On real hardware
 

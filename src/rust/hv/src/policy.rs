@@ -23,12 +23,28 @@ use hvarch::x86::svm::GuestRegs;
 
 /* CPUID leaves. */
 const LEAF_FEATURES: u32 = 1;
+const LEAF_CACHE: u32 = 4;
 const LEAF_STRUCTURED: u32 = 7;
+const LEAF_TOPOLOGY: u32 = 0xB;
 const LEAF_XSTATE: u32 = 0xD;
+const LEAF_TOPOLOGY_V2: u32 = 0x1F;
 const LEAF_HYPERVISOR_BASE: u32 = 0x4000_0000;
 const LEAF_HYPERVISOR_END: u32 = 0x4000_00FF;
 const LEAF_EXT_FEATURES: u32 = 0x8000_0001;
 const LEAF_EXT_ADDRESS: u32 = 0x8000_0008;
+const LEAF_SVM: u32 = 0x8000_000A;
+const LEAF_EXT_APIC_ID: u32 = 0x8000_001E;
+const LEAF_ENCRYPTION: u32 = 0x8000_001F;
+
+/* The guest is one CPU with APIC ID 0 in a package of its own, whatever the
+ * host CPU its vCPU runs on: leaf 1 EBX says so in its top two bytes -- the
+ * initial APIC ID, and the logical processors in the package -- leaf 4 in
+ * its core and sharing counts, and leaf 0x80000008 ECX in the core count and
+ * the APIC ID's width. The host's numbers there are another machine's: a
+ * Linux guest took CPU 3's APIC ID for its own ("APIC ID mismatch"). */
+const LEAF1_EBX_KEEP: u32 = 0x0000_FFFF;
+const LEAF1_EBX_ONE_CPU: u32 = 1 << 16;
+const LEAF4_EAX_KEEP: u32 = 0x0000_3FFF;
 
 /* Leaf 1, ECX: the features kept. Everything not named here is cleared --
  * among them MONITOR, VMX, x2APIC, the TSC deadline timer, XSAVE, OSXSAVE,
@@ -117,8 +133,17 @@ pub fn cpuid(leaf: u32, sub: u32) -> Cpuid {
      * (its SMEP/SMAP/FSGSBASE/AVX2 are either the guest's own CR4 business
      * or things XSAVE gates, which is off), the XSAVE state leaf, and the
      * hypervisor range (no paravirtualisation is offered). */
+    /* And the topology leaves, where the host's x2APIC IDs are (a guest
+     * with none of them takes its one CPU from leaf 1); the SVM leaf, for an
+     * extension it is not given; the extended APIC ID; and memory
+     * encryption, which is not the guest's to turn on. */
     if leaf == LEAF_STRUCTURED
         || leaf == LEAF_XSTATE
+        || leaf == LEAF_TOPOLOGY
+        || leaf == LEAF_TOPOLOGY_V2
+        || leaf == LEAF_SVM
+        || leaf == LEAF_EXT_APIC_ID
+        || leaf == LEAF_ENCRYPTION
         || (LEAF_HYPERVISOR_BASE..=LEAF_HYPERVISOR_END).contains(&leaf)
     {
         return Cpuid { eax: 0, ebx: 0, ecx: 0, edx: 0 };
@@ -128,19 +153,23 @@ pub fn cpuid(leaf: u32, sub: u32) -> Cpuid {
         Some(r) => r,
         None => return Cpuid { eax: 0, ebx: 0, ecx: 0, edx: 0 },
     };
-    let (mut ebx, mut ecx, mut edx) = (host.ebx, host.ecx, host.edx);
+    let (mut eax, mut ebx, mut ecx, mut edx) = (host.eax, host.ebx, host.ecx, host.edx);
 
     if leaf == LEAF_FEATURES {
+        ebx = (ebx & LEAF1_EBX_KEEP) | LEAF1_EBX_ONE_CPU;
         ecx &= LEAF1_ECX_KEEP;
         edx &= LEAF1_EDX_KEEP;
+    } else if leaf == LEAF_CACHE {
+        eax &= LEAF4_EAX_KEEP;
     } else if leaf == LEAF_EXT_FEATURES {
         ecx &= EXT1_ECX_KEEP;
         edx &= EXT1_EDX_KEEP;
     } else if leaf == LEAF_EXT_ADDRESS {
         ebx &= !EXT8_EBX_CLEAR;
+        ecx = 0;
     }
 
-    Cpuid { eax: host.eax, ebx, ecx, edx }
+    Cpuid { eax, ebx, ecx, edx }
 }
 
 /// Apply a CPUID answer to the guest's registers: EAX and the GPRs the run
