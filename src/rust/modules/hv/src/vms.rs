@@ -37,7 +37,7 @@ use kcore::task::TaskHandle;
 use crate::guest::{self, LogLine, Ring, Spec, TermFilter};
 
 const START_USAGE: &str =
-    "hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [restart] [cmdline=...]";
+    "hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take

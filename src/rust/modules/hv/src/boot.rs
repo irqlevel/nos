@@ -21,7 +21,7 @@ use kcore::sync::Mutex;
 
 use crate::guest::{self, LogLine, Ring, Spec};
 
-const USAGE: &str = "hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [input=...] [cmdline=...]";
+const USAGE: &str = "hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path]... [input=...] [cmdline=...]";
 /// How long the guest runs by default, and at most: a Linux boot under TCG,
 /// itself under this hypervisor, is very far from quick.
 const DEFAULT_SECS: u64 = 60;

@@ -56,9 +56,9 @@ const USAGE: &str = "\
 hv [info]                          what the CPU has, and which CPUs the extension is on for
 hv on|off [cpu|all]                turn the extension on or off
 hv run <guest|all> [cpu]           run the built-in guests
-hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [input=...] [cmdline=...]
+hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path]... [input=...] [cmdline=...]
                                    a Linux guest for secs, then its console and how it ended
-hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [restart] [cmdline=...]
+hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself
 hv list                            the started guests

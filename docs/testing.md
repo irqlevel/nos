@@ -405,6 +405,14 @@ said, no cursor query reach the terminal, and the guest run on; `hv attach`
 from `/etc/rc`, where nobody can type, must refuse. It needs `ssh` and
 `ssh-keygen` on the host.
 
+`--disk` is another: an ext4 image with a file in it, put on nos's root and
+given to the guest with `disk=`; the guest mounts it, reads the file, writes
+4 MiB and a file of its own, syncs, and reads both back after a remount; the
+report must count the disk's reads, writes and flushes and no error; and
+the image, taken back out of nos's root with `debugfs`, must pass `e2fsck`
+and hold what the guest wrote. It needs a guest kernel with PCI, legacy
+virtio-pci, virtio-blk and ext4 built in.
+
 ## The hardware NIC drivers
 
 `tcp-test.py` and `netload-test.py` take `--nic igb` (and so does

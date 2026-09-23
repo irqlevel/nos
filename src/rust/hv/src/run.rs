@@ -18,6 +18,8 @@ use hvarch::x86::svm::GuestRegs;
 use hvarch::{Error, Result};
 use kcore::time;
 
+use crate::devices::blk::{self, Blk};
+use crate::devices::pci::{Function, PciBus};
 use crate::devices::{Pic, Pit, Rtc, Uart};
 use crate::linux::{self, Header, Layout};
 use crate::machine::Machine;
@@ -27,6 +29,13 @@ use crate::vm::{Refusal, Vm};
 
 /// COM1, the guest's console.
 const COM1: u16 = 0x3F8;
+
+/// Where the first virtio device's I/O BAR is put, as a BIOS would put it,
+/// and the IRQ the disks share: 11, free on a PC, on the slave PIC.
+const VIRTIO_IO_BASE: u16 = 0xC000;
+const DISK_IRQ: u8 = 11;
+/// The most disks a guest has: slots on the bus, less the host bridge.
+pub const MAX_DISKS: usize = 4;
 
 /* The two ways a PC guest resets its machine by port I/O. The 8042's
  * command port takes 0xF0-0xFF as "pulse the output lines whose bits are
@@ -156,6 +165,9 @@ pub struct LinuxGuest {
     pit: Pit,
     rtc: Rtc,
     pic: Pic,
+    pci: PciBus,
+    /// Its disks, `vda` first: disk `i` is in PCI slot `i + 1`.
+    disks: alloc::vec::Vec<Blk>,
     /// A tally of reads of the low ports, to find a guest spinning on one.
     port_hist: alloc::boxed::Box<[u32; 1024]>,
     /// The first MSR accesses the policy refused with #GP: (MSR, value
@@ -178,12 +190,16 @@ impl LinuxGuest {
          * never allocates. */
         let mut msr_faults = alloc::vec::Vec::new();
         msr_faults.try_reserve_exact(MSR_FAULTS_KEPT).map_err(|_| Error::NoMemory)?;
+        let mut disks = alloc::vec::Vec::new();
+        disks.try_reserve_exact(MAX_DISKS).map_err(|_| Error::NoMemory)?;
         Ok(Self {
             vm,
             uart: Uart::new(),
             pit: Pit::new(),
             rtc: Rtc::new(),
             pic: Pic::new(),
+            pci: PciBus::new()?,
+            disks,
             port_hist,
             msr_faults,
         })
@@ -191,6 +207,26 @@ impl LinuxGuest {
 
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
         self.vm.memory_mut()
+    }
+
+    /// Give it another disk, over `backend`: `vda`, `vdb`, ... in the order
+    /// they are added, each a virtio block device on the PCI bus.
+    pub fn add_disk(&mut self, backend: alloc::boxed::Box<dyn blk::Backend>, id: &str) -> Result<()> {
+        if self.disks.len() >= MAX_DISKS {
+            return Err(Error::NoMemory);
+        }
+        let disk = Blk::new(backend, id)?;
+        let io_base = VIRTIO_IO_BASE + (self.disks.len() as u16) * (blk::BAR_SIZE as u16);
+        self.pci.add(Function::device(&Blk::identity(), io_base, blk::BAR_SIZE, DISK_IRQ))?;
+        /* Into the room taken at `new` (`MAX_DISKS`). */
+        self.disks.push(disk);
+        Ok(())
+    }
+
+    /// What each disk has done: (sectors, statistics, whether a ring of the
+    /// driver's stopped it).
+    pub fn disk_stats(&self) -> impl Iterator<Item = (u64, blk::Stats, bool)> + '_ {
+        self.disks.iter().map(|d| (d.sectors(), d.stats, d.broken().is_some()))
     }
 
     /// Write the guest's furniture -- the zero page, the command line, the
@@ -507,12 +543,36 @@ impl LinuxGuest {
                 }
                 counts.port_out += 1;
             }
+        } else if PciBus::owns(io.port) {
+            if io.input {
+                let value = self.pci.read(io.port, io.size);
+                set_in(self.vm.vcpu_mut().save_mut(), io.size, value);
+                counts.port_in += 1;
+            } else {
+                let value = self.vm.vcpu().save().rax as u32;
+                self.pci.write(io.port, io.size, value);
+                counts.port_out += 1;
+            }
+        } else if let Some((slot, offset)) = self.pci.io_target(io.port) {
+            /* A disk's registers: slot n is disk n - 1. */
+            let disk = usize::from(slot).checked_sub(1).and_then(|i| self.disks.get_mut(i));
+            if io.input {
+                let value = disk.map_or(u32::MAX, |d| d.io_read(offset, io.size));
+                set_in(self.vm.vcpu_mut().save_mut(), io.size, value);
+                counts.port_in += 1;
+            } else {
+                let value = self.vm.vcpu().save().rax as u32;
+                if let Some(d) = disk {
+                    if d.io_write(offset, io.size, value, self.vm.memory_mut()) {
+                        self.pic.raise(DISK_IRQ);
+                    }
+                }
+                counts.port_out += 1;
+            }
         } else if io.input {
             /* A port nothing here answers: the bus floats to all ones,
              * which is what a read of an absent device gives. */
-            let mask = size_mask(io.size);
-            let s = v.save_mut();
-            s.rax |= mask;
+            set_in(v.save_mut(), io.size, u32::MAX);
             counts.port_in += 1;
         } else {
             counts.port_out += 1;
@@ -567,6 +627,13 @@ fn size_mask(size: u8) -> u64 {
         2 => 0xFFFF,
         _ => 0xFFFF_FFFF,
     }
+}
+
+/// What an `in` of `size` bytes leaves in RAX: AL or AX replaced and the
+/// rest kept, or -- a write of EAX, in 64-bit mode -- RAX zero-extended.
+fn set_in(save: &mut Save, size: u8, value: u32) {
+    let value = u64::from(value) & size_mask(size);
+    save.rax = if size == 4 { value } else { (save.rax & !size_mask(size)) | value };
 }
 
 /// `rdmsr` puts the low 32 bits in EAX and the high 32 in EDX, each

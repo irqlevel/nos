@@ -195,9 +195,13 @@ impl Pic {
             self.slave.isr |= 1 << (irq - 8);
             self.slave.irr &= !(1 << (irq - 8));
             /* The master's cascade line clears once the slave has no more
-             * requests waiting. */
+             * requests waiting -- and only then: it used to clear whatever
+             * the slave still had, and with two devices on the slave the
+             * second's interrupt waited for a third to raise the line. */
             self.master.isr |= 1 << CASCADE_IRQ;
-            self.master.irr &= !(1 << CASCADE_IRQ);
+            if self.slave.irr == 0 {
+                self.master.irr &= !(1 << CASCADE_IRQ);
+            }
         }
     }
 

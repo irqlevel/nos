@@ -53,6 +53,28 @@ pub fn read_at(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
     Ok(got as usize)
 }
 
+/// Writes `data` into the file at `offset`, within the size the file has --
+/// a disk image, whose size is its disk's: a write that would reach past the
+/// end is refused whole, and the file never grows. Not synced: `sync` is.
+pub fn write_at(path: &str, offset: u64, data: &[u8]) -> Result<()> {
+    let put = unsafe {
+        fs::kernel_file_write_at(path.as_ptr(), path.len(), offset, data.as_ptr(), data.len())
+    };
+    if put < 0 || put as usize != data.len() {
+        return Err(Error::IoError);
+    }
+    Ok(())
+}
+
+/// Every filesystem's writes, on its disk: a guest's flush.
+pub fn sync() -> Result<()> {
+    if unsafe { fs::kernel_file_sync() } == 0 {
+        Ok(())
+    } else {
+        Err(Error::IoError)
+    }
+}
+
 /// Replaces the file's content, making the file if it is missing: the new
 /// content is written whole, and synced, before it takes the old one's place
 /// -- a full disk or a crash midway leaves the old content, never an empty

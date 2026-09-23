@@ -6,8 +6,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
+use alloc::boxed::Box;
+
+use hv::disk as blk;
 use hv::linux::Header;
-use hv::run::{Counts, LinuxGuest, Stop};
+use hv::run::{Counts, LinuxGuest, Stop, MAX_DISKS};
 use hv::Machine;
 use kcore::consts::{MAX_CPUS, NS_PER_MS};
 
@@ -27,6 +30,9 @@ pub const CONSOLE_BYTES: usize = 64 * 1024;
 pub struct Spec {
     pub kernel: String,
     pub initrd: Option<String>,
+    /// `disk=`, as many as there are: files of nos's that are the guest's
+    /// `vda`, `vdb`, ... in that order.
+    pub disks: Vec<String>,
     pub mem_bytes: u64,
     pub cmdline: String,
     /// Bytes to type at its console once it is at a prompt.
@@ -65,6 +71,7 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
     let mut spec = Spec {
         kernel: String::new(),
         initrd: None,
+        disks: Vec::new(),
         mem_bytes: DEFAULT_MEM_MIB * 1024 * 1024,
         cmdline: String::from(DEFAULT_CMDLINE),
         input: Vec::new(),
@@ -90,6 +97,11 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             mem_mib = v.parse().map_err(|_| String::from("mem= wants a number of MiB"))?;
         } else if let Some(v) = word.strip_prefix("initrd=") {
             spec.initrd = Some(String::from(v));
+        } else if let Some(v) = word.strip_prefix("disk=") {
+            if spec.disks.len() >= MAX_DISKS {
+                return Err(alloc::format!("at most {} disks", MAX_DISKS));
+            }
+            spec.disks.push(String::from(v));
         } else if let Some(v) = word.strip_prefix("secs=") {
             spec.secs = Some(v.parse().map_err(|_| String::from("secs= wants a number of seconds"))?);
         } else if let Some(v) = word.strip_prefix("cpu=") {
@@ -179,7 +191,51 @@ pub fn build(machine: &Machine, spec: &Spec) -> Result<LinuxGuest, String> {
     guest
         .load(&header, &first, layout, spec.cmdline.as_bytes())
         .map_err(|e| alloc::format!("laying out the guest: {}", e))?;
+
+    for (i, path) in spec.disks.iter().enumerate() {
+        let disk = FileDisk::open(path)?;
+        let mut id = String::new();
+        let _ = write!(id, "nos-vd{}", (b'a' + i as u8) as char);
+        guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;
+    }
     Ok(guest)
+}
+
+/// A guest's disk that is a file of nos's -- an image, whose size is the
+/// disk's, whole sectors of it -- read and written where the guest asks,
+/// and synced by its flush.
+struct FileDisk {
+    path: String,
+    size: u64,
+}
+
+impl FileDisk {
+    fn open(path: &str) -> Result<FileDisk, String> {
+        let size = kcore::fs::size(path).map_err(|e| alloc::format!("{}: {}", path, e))?;
+        let size = size - size % blk::SECTOR;
+        if size == 0 {
+            return Err(alloc::format!("{}: not a sector long", path));
+        }
+        Ok(FileDisk { path: String::from(path), size })
+    }
+}
+
+impl blk::Backend for FileDisk {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read(&mut self, offset: u64, buf: &mut [u8]) -> bool {
+        matches!(kcore::fs::read_at(&self.path, offset, buf), Ok(n) if n == buf.len())
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) -> bool {
+        kcore::fs::write_at(&self.path, offset, data).is_ok()
+    }
+
+    fn flush(&mut self) -> bool {
+        kcore::fs::sync().is_ok()
+    }
 }
 
 /// The CPU a vCPU is to run on: `wanted` if the extension is on there, else
@@ -263,6 +319,12 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stop: &Stop, counts: &Cou
     let ((irr, isr, imr), (m0, r0, run0)) = guest.irq_debug();
     let _ = writeln!(out, "  irq        {} total ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
         counts.irq, counts.irq0, counts.irq4, counts.edges0, counts.blocked, irr, isr, imr, m0, r0, run0);
+    for (i, (sectors, s, broken)) in guest.disk_stats().enumerate() {
+        let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}",
+            (b'a' + i as u8) as char, sectors * blk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
+            s.writes, s.written_bytes / 1024, s.flushes, s.errors,
+            if broken { "; stopped over a ring the driver broke" } else { "" });
+    }
     let hot = guest.hot_ports(6);
     if !hot.is_empty() {
         let _ = write!(out, "  busiest in ports");

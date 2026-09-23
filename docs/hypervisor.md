@@ -207,10 +207,10 @@ backend, where a guest can show it working -- not slipped in here.
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [input=...] [cmdline=...]
+    hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path]... [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU for
                                 secs, then print its console and how it ended
-    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [restart] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -638,6 +638,63 @@ carries it. The gate is `scripts/hv-linux-test.py`, a manual one (a `bzImage`
 is megabytes and CI cannot build one in its time), pointed at a kernel by
 hand; with `--initrd` it checks the guest reaches its `init` and a shell, and
 `--input 'id\n' --expect uid=0` checks it runs the command.
+
+## A disk
+
+`disk=<path>`, on `hv boot` or `hv start` and as many times as there are
+disks, gives the guest a virtio block device over a file of nos's: `vda`,
+`vdb`, ... in that order, each the size of its file. The guest mounts it,
+ext4 and all, as it would a disk of QEMU's:
+
+```
+$ hv start /bzImage initrd=/initrd disk=/disk.img cmdline=console=ttyS0 nolapic
+$ hv exec 0 mount -t devtmpfs devtmpfs /dev
+$ hv exec 0 mount /dev/vda /mnt
+$ hv exec 0 cat /mnt/hello.txt
+```
+
+**Legacy virtio over PCI, reached by port I/O** -- so still no instruction
+decoded anywhere. PCI's configuration space is the PC's mechanism #1, an
+address written to 0xCF8 and the data at 0xCFC, for bus 0: a host bridge at
+00:00.0, which is what Linux's sanity check of the mechanism looks for, then
+a function for each disk (`hv::devices::pci`). Only a dword access at 0xCF8
+reaches the address -- a byte at 0xCF9 is the chipset's reset control, which
+the run loop sees first. Each disk's registers are in an I/O BAR, placed as a
+BIOS would place it and movable as a BAR is; its interrupt is INTA, on IRQ 11
+of the emulated slave PIC, raised as an edge when the device's interrupt
+status goes from clear to set -- the PIC here is edge-triggered, and a line
+re-raised while the driver has yet to look would be interrupts it finds
+nothing for, which Linux ends up disabling a line over. (That exposed a slip
+in the PIC: acknowledging a slave interrupt dropped the cascade line even
+with another slave request waiting.)
+
+**The rings are the guest's; the host trusts none of them** (`hv::devices::
+virtio`). A queue's descriptors, its available ring and its used ring sit in
+guest memory, where the guest may write any of them at any moment. Every
+index, address and length read from them is checked before it is used: a
+descriptor past the queue, a chain longer than the queue -- a loop --, more
+chains than the queue holds, an indirect descriptor (not offered), or a
+buffer outside guest memory stop the device, which takes nothing more until
+the driver resets it. A request's header, data and status are taken as
+streams across its readable and writable buffers, whatever the layout; its
+sector range is checked against the disk's size; and the data crosses
+through a 64 KiB buffer of the device's, a chunk at a time -- nothing is
+allocated per request. A request is served before the notify that made it
+available returns: the vCPU waits for its disk.
+
+**The disk's bytes are a trait's** (`hv::disk::Backend`): the module's
+`FileDisk` reads and writes the file where the guest asks
+(`kcore::fs::read_at`, and `write_at`, which writes within the file's size
+and never grows it), and a guest's flush -- offered, and taken by ext4 --
+syncs nos's filesystems (`kcore::fs::sync`). The report counts each disk's
+reads, writes, flushes and errors.
+
+`scripts/hv-linux-test.py --disk` is its gate: an ext4 image with a file in
+it on nos's root, the guest mounting it, reading the file, writing 4 MiB and
+a file of its own, syncing and reading back after a remount -- and then the
+image, taken back out of nos's root filesystem, judged by `e2fsck` and
+holding what the guest wrote. It needs a guest kernel with PCI, legacy
+virtio-pci, virtio-blk and ext4.
 
 ## Guests that stay up
 

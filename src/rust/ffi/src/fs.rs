@@ -10,6 +10,13 @@ unsafe extern "C" {
     pub fn kernel_file_read_at(
         path: *const u8, path_len: usize, offset: u64, buf: *mut u8, cap: usize,
     ) -> isize;
+    /// Writes `len` bytes at `offset`, within the file's size -- never growing
+    /// it: `len`, or -1. Not synced.
+    pub fn kernel_file_write_at(
+        path: *const u8, path_len: usize, offset: u64, data: *const u8, len: usize,
+    ) -> isize;
+    /// Every filesystem's writes on its disk: 0, or -1. Sleeps.
+    pub fn kernel_file_sync() -> i32;
     /// Replaces the file's content -- making the file if it is missing --
     /// without ever leaving it empty or half written.
     pub fn kernel_file_write(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;

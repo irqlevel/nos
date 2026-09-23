@@ -313,6 +313,116 @@ def attach(args):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def boot_rc(args, tmp, rc, extra=None):
+    """nos with /etc/rc and the guest's files on its root, under TCG, run
+    until rc's last line has printed. The QEMU process and the serial log;
+    None for the process when rc did not get there."""
+    log = os.path.join(tmp, "serial.log")
+    rootdir = os.path.join(tmp, "rootdir")
+    os.makedirs(os.path.join(rootdir, "etc"), exist_ok=True)
+    shutil.copy(hvt.module("x86_64"), rootdir)
+    shutil.copy(args.bzimage, os.path.join(rootdir, "bzImage"))
+    if args.initrd:
+        shutil.copy(args.initrd, os.path.join(rootdir, "initrd"))
+    for name, src in (extra or {}).items():
+        shutil.copy(src, os.path.join(rootdir, name))
+    with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
+        f.write("# scripts/hv-linux-test.py\n" + "\n".join(rc) + "\n")
+    image = os.path.join(tmp, "root.img")
+    subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, str(args.root_mib), rootdir],
+                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4", "-cpu", "max",
+            "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
+            "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
+            "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
+    p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    t0 = time.time()
+    txt = ""
+    while time.time() - t0 < args.deadline and p.poll() is None:
+        txt = open(log, errors="replace").read() if os.path.exists(log) else ""
+        if "PANIC:" in txt:
+            pt.check("nos did not panic", False, txt[-3000:])
+            return p, log, image
+        if RC_DONE.search(txt):
+            return p, log, image
+        time.sleep(3)
+    pt.check("/etc/rc ran to its end", False, txt[-2000:] or "qemu exited %s" % p.poll())
+    return p, log, image
+
+
+def disk(args):
+    """A disk for the guest: an ext4 image on nos's root, `disk=` to the
+    guest, which mounts it, reads what the host put there, writes, syncs and
+    reads back -- and then the image, taken back out of nos's root, is
+    judged by e2fsck and must hold what the guest wrote."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvdisk-")
+    content = os.path.join(tmp, "content")
+    os.makedirs(content)
+    with open(os.path.join(content, "hello.txt"), "w") as f:
+        f.write("nos-disk-hello\n")
+    img = os.path.join(tmp, "disk.img")
+    subprocess.run(["mke2fs", "-q", "-F", "-t", "ext4", "-d", content, img, "%dM" % args.disk_mib],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
+    rc = ["insmod /hv.ko", "hv on",
+          "hv start /bzImage mem=%d initrd=/initrd disk=/disk.img cmdline=%s" % (args.mem, args.cmdline),
+          x("id", args.vm_secs),
+          x("mount -t devtmpfs devtmpfs /dev"),
+          x("cat /sys/block/vda/size"),
+          x("mkdir -p /mnt"),
+          x("mount /dev/vda /mnt"),
+          x("cat /mnt/hello.txt"),
+          x("dd if=/dev/zero of=/mnt/big bs=64k count=64", 120),
+          x("echo nos-wrote-this > /mnt/written.txt"),
+          x("sync", 120),
+          x("umount /mnt", 120),
+          x("mount /dev/vda /mnt"),
+          x("cat /mnt/written.txt"),
+          x("ls -l /mnt/big"),
+          x("umount /mnt", 120),
+          "hv stop 0", RC_LAST]
+    p, log, image = boot_rc(args, tmp, rc, {"disk.img": img})
+    try:
+        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+            return
+        secs = sections(open(log, errors="replace").read())
+        out = lambda i: output_of(secs, rc[i], 0) or ""
+        sectors = args.disk_mib * 1024 * 1024 // 512
+        pt.check("the guest reached its shell", "uid=0 gid=0" in out(3), out(3)[-500:])
+        pt.check("vda is the image's size: %d sectors" % sectors, re.search(r"(?m)^%d$" % sectors, out(5)) is not None, out(5))
+        pt.check("it mounts", "hv: vm 0:" not in out(7) and "mount:" not in out(7), out(7))
+        pt.check("what the host put there reads back", "nos-disk-hello" in out(8), out(8))
+        pt.check("4 MiB written", re.search(r"4194304 bytes|64\+0 records out", out(9)) is not None, out(9))
+        pt.check("sync returns", "hv: vm 0:" not in out(11), out(11))
+        pt.check("remounted, what the guest wrote reads back", "nos-wrote-this" in out(14), out(14))
+        pt.check("so does the size of the big one", "4194304" in out(15), out(15))
+        stop = output_of(secs, "hv stop 0", 0) or ""
+        m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
+        pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
+                 and int(m.group(3)) > 0 and int(m.group(4)) > 0, stop[-800:])
+    finally:
+        pt.kill(p)
+
+    # The image as nos's root filesystem has it, after the guest's writes.
+    back = os.path.join(tmp, "back.img")
+    got = subprocess.run(["debugfs", "-R", "dump /disk.img " + back, image], capture_output=True)
+    pt.check("the image comes back out of nos's root", got.returncode == 0 and os.path.exists(back),
+             got.stderr.decode(errors="replace")[-300:])
+    if os.path.exists(back):
+        fsck = subprocess.run(["e2fsck", "-fn", back], capture_output=True)
+        pt.check("e2fsck finds the guest's ext4 clean", fsck.returncode == 0,
+                 fsck.stdout.decode(errors="replace")[-800:])
+        cat = subprocess.run(["debugfs", "-R", "cat /written.txt", back], capture_output=True)
+        pt.check("and the file the guest wrote is in it", b"nos-wrote-this" in cat.stdout,
+                 repr(cat.stdout[-200:]) + cat.stderr.decode(errors="replace")[-200:])
+    if args.keep or pt.failures:
+        print("log at " + log)
+    else:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run(args):
     tmp = tempfile.mkdtemp(prefix="nos-hvlinux-")
     log = os.path.join(tmp, "serial.log")
@@ -405,6 +515,11 @@ def main():
                     help="instead: hv attach over a real ssh -tt session (needs ssh, ssh-keygen and --initrd)")
     ap.add_argument("--attach-wait", type=float, default=5.0,
                     help="seconds between what is typed through hv attach, for the guest to answer")
+    ap.add_argument("--disk", action="store_true",
+                    help="instead: a virtio disk for the guest (needs --initrd, and a guest kernel with PCI, "
+                         "legacy virtio-pci, virtio-blk and ext4)")
+    ap.add_argument("--disk-mib", type=int, default=32, help="the guest disk image's size")
+    ap.add_argument("--root-mib", type=int, default=128, help="nos's root filesystem image's size")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM even if the host has AMD-V")
     ap.add_argument("--keep", action="store_true", help="keep the serial log (it is kept on a failure anyway)")
     ap.add_argument("--verbose", action="store_true", help="print the whole serial log at the end")
@@ -415,10 +530,10 @@ def main():
     if not os.path.exists(os.path.join(ROOT, "nos.iso")):
         sys.exit("build nos.iso first (make)")
 
-    if args.attach:
+    if args.attach or args.disk:
         if not args.initrd:
-            sys.exit("--attach needs --initrd: the guest's shell is what is typed at")
-        attach(args)
+            sys.exit("--attach and --disk need --initrd: the guest's shell is what is typed at")
+        attach(args) if args.attach else disk(args)
     else:
         run(args)
 
