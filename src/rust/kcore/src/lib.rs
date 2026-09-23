@@ -38,6 +38,7 @@ pub mod hpet;
 pub mod acpi;
 pub mod cmd;
 pub mod fs;
+pub mod vnic;
 #[cfg(target_arch = "x86_64")]
 pub mod tco_wdt;
 

@@ -20,6 +20,9 @@ unsafe extern "C" {
    closed. */
 unsafe extern "C" {
     pub safe fn kernel_tcp_listen(dev: usize, port: u16) -> *mut c_void;
+    /// An active open to ip:port (host byte order) through the device, from
+    /// an ephemeral port: null when nothing answered in time. Sleeps.
+    pub safe fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> *mut c_void;
     pub safe fn kernel_tcp_accept(listener: *mut c_void, timeout_ms: u64) -> *mut c_void;
     pub safe fn kernel_tcp_close(conn: *mut c_void);
     /// A RST instead of the FIN exchange: the slot comes back at once, not

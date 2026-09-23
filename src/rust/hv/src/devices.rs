@@ -15,6 +15,8 @@
 #[cfg(target_arch = "x86_64")]
 pub mod blk;
 #[cfg(target_arch = "x86_64")]
+pub mod net;
+#[cfg(target_arch = "x86_64")]
 pub mod pci;
 #[cfg(target_arch = "x86_64")]
 pub mod pic;

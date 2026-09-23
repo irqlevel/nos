@@ -8,6 +8,8 @@ use core::fmt::Write;
 
 use alloc::boxed::Box;
 
+use alloc::sync::Arc;
+
 use hv::disk as blk;
 use hv::linux::Header;
 use hv::run::{Counts, LinuxGuest, Stop, MAX_DISKS};
@@ -45,6 +47,16 @@ pub struct Spec {
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
     pub restart: bool,
+    /// `net`, for `hv start`: a NIC on the guests' switch. Which port is
+    /// `nic`'s, once `hv start` has claimed one.
+    pub net: bool,
+    pub nic: Option<NicSpec>,
+}
+
+/// A guest's NIC: its port on the switch.
+pub struct NicSpec {
+    pub port: usize,
+    pub switch: Arc<crate::net::Switch>,
 }
 
 /// `\n` in a word for a newline, so that a line to type fits one word.
@@ -79,6 +91,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         cpu: None,
         log: false,
         restart: false,
+        net: false,
+        nic: None,
     };
     let mut mem_mib = DEFAULT_MEM_MIB;
 
@@ -112,6 +126,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.log = true;
         } else if word == "restart" {
             spec.restart = true;
+        } else if word == "net" {
+            spec.net = true;
         } else if spec.kernel.is_empty() && !word.contains('=') {
             spec.kernel = String::from(word);
         } else {
@@ -192,6 +208,10 @@ pub fn build(machine: &Machine, spec: &Spec) -> Result<LinuxGuest, String> {
         .load(&header, &first, layout, spec.cmdline.as_bytes())
         .map_err(|e| alloc::format!("laying out the guest: {}", e))?;
 
+    if let Some(nic) = &spec.nic {
+        guest.add_nic(Box::new(nic.switch.backend(nic.port)), crate::net::port_mac(nic.port))
+            .map_err(|e| alloc::format!("the NIC: {}", e))?;
+    }
     for (i, path) in spec.disks.iter().enumerate() {
         let disk = FileDisk::open(path)?;
         let mut id = String::new();
@@ -323,6 +343,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stop: &Stop, counts: &Cou
         let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}",
             (b'a' + i as u8) as char, sectors * blk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
             s.writes, s.written_bytes / 1024, s.flushes, s.errors,
+            if broken { "; stopped over a ring the driver broke" } else { "" });
+    }
+    for (i, (s, broken)) in guest.nic_stats().enumerate() {
+        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped{}",
+            i, s.sent, s.received, s.dropped,
             if broken { "; stopped over a ring the driver broke" } else { "" });
     }
     let hot = guest.hot_ports(6);

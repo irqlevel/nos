@@ -313,7 +313,7 @@ def attach(args):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-def boot_rc(args, tmp, rc, extra=None):
+def boot_rc(args, tmp, rc, extra=None, qemu=None):
     """nos with /etc/rc and the guest's files on its root, under TCG, run
     until rc's last line has printed. The QEMU process and the serial log;
     None for the process when rc did not get there."""
@@ -335,7 +335,7 @@ def boot_rc(args, tmp, rc, extra=None):
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4", "-cpu", "max",
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
-            "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
+            "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"] + (qemu or [])
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     t0 = time.time()
     txt = ""
@@ -421,6 +421,68 @@ def disk(args):
         print("log at " + log)
     else:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def network(args):
+    """The guests' network: two guests on the switch, each with its address
+    from its port; each pings nos at 10.0.100.1 and the other guest, and
+    nos pings a guest back through hv0."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvnet-")
+    x = lambda vm, line, secs=60: "hv exec %d secs=%d %s" % (vm, secs, line)
+    start = "hv start /bzImage mem=%d initrd=/initrd net cmdline=%s" % (args.mem, args.cmdline)
+    rc = ["insmod /hv.ko", "hv on", start, start,
+          x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
+          "hv list",
+          x(0, "ifconfig eth0"),
+          x(0, "ping -c 3 10.0.100.1", 60),
+          x(0, "ping -c 3 10.0.100.3", 60),
+          x(1, "ping -c 3 10.0.100.2", 60),
+          "ping 10.0.100.2",
+          x(1, "mkdir -p /www"),
+          x(1, "echo nos-http-hello > /www/index.html"),
+          x(1, "httpd -p 80 -h /www"),
+          "hv forward add 8080 1 80",
+          "hv forward",
+          RC_LAST]
+    port = free_port()
+    qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
+            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080" % port]
+    p, log, image = boot_rc(args, tmp, rc, qemu=qemu)
+    try:
+        if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
+            return
+        secs = sections(open(log, errors="replace").read())
+        out = lambda i: output_of(secs, rc[i], 0) or ""
+        ok_ping = lambda t: re.search(r"3 packets transmitted, 3 packets received", t) is not None
+        pt.check("both guests reach their shells", "uid=0 gid=0" in out(4) and "uid=0 gid=0" in out(5),
+                 out(4)[-300:] + out(5)[-300:])
+        pt.check("hv list gives each its address", "10.0.100.2" in out(6) and "10.0.100.3" in out(6), out(6))
+        pt.check("the guest's eth0 has its port's address and MAC",
+                 "10.0.100.2" in out(7) and re.search(r"(?i)02:00:00:00:64:02", out(7)) is not None, out(7))
+        pt.check("a guest pings nos, at 10.0.100.1 on hv0", ok_ping(out(8)), out(8)[-600:])
+        pt.check("a guest pings the other", ok_ping(out(9)), out(9)[-600:])
+        pt.check("and the other pings it back", ok_ping(out(10)), out(10)[-600:])
+        pt.check("nos pings a guest, out of hv0", "reply from 10.0.100.2" in out(11), out(11)[-600:])
+        pt.check("hv forward add", "port 8080 forwarded to vm 1, 10.0.100.3:80" in out(15), out(15))
+        # From outside: the host's port, QEMU's forward into nos's 8080, and
+        # nos's into the guest's httpd.
+        import urllib.request
+        body = b""
+        for attempt in range(10):
+            try:
+                body = urllib.request.urlopen("http://127.0.0.1:%d/index.html" % port, timeout=60).read()
+                break
+            except Exception as e:
+                body = repr(e).encode()
+                time.sleep(3)
+        pt.check("a page from the guest's httpd, fetched from outside through hv forward",
+                 b"nos-http-hello" in body, body[-300:])
+    finally:
+        pt.kill(p)
+        if args.keep or pt.failures:
+            print("log at " + log)
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run(args):
@@ -519,6 +581,9 @@ def main():
                     help="instead: a virtio disk for the guest (needs --initrd, and a guest kernel with PCI, "
                          "legacy virtio-pci, virtio-blk and ext4)")
     ap.add_argument("--disk-mib", type=int, default=32, help="the guest disk image's size")
+    ap.add_argument("--net", action="store_true",
+                    help="instead: the guests' network (needs --initrd, and a guest kernel with PCI, "
+                         "legacy virtio-pci, virtio-net, IP and ip= configuration)")
     ap.add_argument("--root-mib", type=int, default=128, help="nos's root filesystem image's size")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM even if the host has AMD-V")
     ap.add_argument("--keep", action="store_true", help="keep the serial log (it is kept on a failure anyway)")
@@ -530,10 +595,10 @@ def main():
     if not os.path.exists(os.path.join(ROOT, "nos.iso")):
         sys.exit("build nos.iso first (make)")
 
-    if args.attach or args.disk:
+    if args.attach or args.disk or args.net:
         if not args.initrd:
-            sys.exit("--attach and --disk need --initrd: the guest's shell is what is typed at")
-        attach(args) if args.attach else disk(args)
+            sys.exit("--attach, --disk and --net need --initrd: the guest's shell is what is typed at")
+        attach(args) if args.attach else disk(args) if args.disk else network(args)
     else:
         run(args)
 

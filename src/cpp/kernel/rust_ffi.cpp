@@ -377,6 +377,11 @@ void kernel_event_wait(unsigned long handle)
     reinterpret_cast<Kernel::Event*>(handle)->Wait();
 }
 
+int kernel_event_wait_for(unsigned long handle, unsigned long long timeoutNs)
+{
+    return reinterpret_cast<Kernel::Event*>(handle)->WaitFor(timeoutNs) ? 1 : 0;
+}
+
 void kernel_event_signal(unsigned long handle)
 {
     reinterpret_cast<Kernel::Event*>(handle)->Signal();

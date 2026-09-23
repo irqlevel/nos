@@ -2816,6 +2816,65 @@ static bool TestEvent()
     return ok;
 }
 
+/* Event::WaitFor, from a task of its own -- a CPU's idle task, which runs
+   this, must never block: a wait that nobody signals runs out, and not
+   before its time; one that is signalled comes back true. The phase is
+   what lets the signal come only after the first wait has returned. */
+struct WaitForProbe
+{
+    Event Ev;
+    Atomic Phase;       /* 1 once the first wait has returned */
+    Atomic TimedOut;    /* it returned false, having waited its time */
+    Atomic Signalled;   /* the second came back true */
+};
+
+static const ulong WaitForTestNs = 20 * Const::NanoSecsInMs;
+static const ulong WaitForLongNs = 10 * Const::NanoSecsInSec;
+
+static void WaitForTask(void* ctx)
+{
+    auto* p = static_cast<WaitForProbe*>(ctx);
+    ulong start = GetBootTime().GetValue();
+    bool got = p->Ev.WaitFor(WaitForTestNs);
+    ulong waited = GetBootTime().GetValue() - start;
+    p->TimedOut.Set((!got && waited >= WaitForTestNs) ? 1 : 0);
+    p->Phase.Set(1);
+    p->Signalled.Set(p->Ev.WaitFor(WaitForLongNs) ? 1 : 0);
+}
+
+static bool TestEventWaitFor()
+{
+    auto* p = Mm::TAlloc<WaitForProbe, Tag>();
+    Task* task = Mm::TAlloc<Task, Tag>("waitfor");
+    bool ok = (p != nullptr && task != nullptr);
+    if (ok)
+        task->SetCpuAffinity(1UL << CpuTable::GetInstance().GetCurrentCpuId());
+    if (ok && task->Start(WaitForTask, p))
+    {
+        while (p->Phase.Get() == 0)
+            Sleep(Const::NanoSecsInMs);
+        p->Ev.Signal();
+        task->Wait();
+        ok = (p->TimedOut.Get() == 1 && p->Signalled.Get() == 1);
+        if (!ok)
+            Trace(0, "TestEventWaitFor: timed out %u, signalled %u",
+                (ulong)p->TimedOut.Get(), (ulong)p->Signalled.Get());
+    }
+    else
+    {
+        ok = false;
+    }
+
+    if (task != nullptr)
+        task->Put();
+    if (p != nullptr)
+    {
+        p->~WaitForProbe();
+        Mm::Free(p);
+    }
+    return ok;
+}
+
 /* Two tasks asleep on one CPU cost it next to nothing. Sleep() used to poll
    -- a loop around Schedule() that left the task runnable -- so two sleepers
    on one CPU handed it to each other without end, each running about half
@@ -2936,6 +2995,9 @@ bool TestMultiTasking()
         return false;
 
     if (!TestSleepBlocks())
+        return false;
+
+    if (!TestEventWaitFor())
         return false;
 
     Task *task[2] = {0};

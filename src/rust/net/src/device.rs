@@ -962,6 +962,16 @@ impl DeviceTable {
         self.devices[..self.count()].iter().find(|dev| dev.name() == name)
     }
 
+    /// The device whose subnet `dst` is on -- `hv0` for a guest of the
+    /// hypervisor's -- or None when it is on none of them, and so for the
+    /// default device's gateway.
+    pub fn on_subnet(&'static self, dst: u32) -> Option<&'static Device> {
+        self.devices[..self.count()].iter().find(|dev| {
+            let mask = dev.mask.load(Ordering::Acquire);
+            mask != 0 && dev.ip() != 0 && dst & mask == dev.ip() & mask
+        })
+    }
+
     /// The device a handle names: one of the table's, or none. A handle is
     /// the device's address, so this is a range check and a division -- and
     /// what makes a word from outside something that can be trusted.

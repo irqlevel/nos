@@ -91,6 +91,13 @@ pub struct TcpStream {
 unsafe impl Send for TcpStream {}
 
 impl TcpStream {
+    /// An active open to `ip`:`port` (host byte order) through `nic`, from an
+    /// ephemeral port: None when nothing answered in time. Sleeps.
+    pub fn connect(nic: &Nic, ip: u32, port: u16) -> Option<TcpStream> {
+        let conn = tcp::kernel_tcp_connect(nic.handle(), ip, port);
+        if conn.is_null() { None } else { Some(TcpStream { conn }) }
+    }
+
     /// Sends the whole buffer, waiting for room as long as it takes; false
     /// if the connection failed part way.
     pub fn send_all(&mut self, buf: &[u8]) -> bool {

@@ -34,10 +34,11 @@ use kcore::consts::{MAX_CPUS, NS_PER_MS, NS_PER_SEC};
 use kcore::sync::{Event, Mutex};
 use kcore::task::TaskHandle;
 
-use crate::guest::{self, LogLine, Ring, Spec, TermFilter};
+use crate::guest::{self, LogLine, NicSpec, Ring, Spec, TermFilter};
+use crate::net::{self, Switch};
 
 const START_USAGE: &str =
-    "hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [cmdline=...]";
+    "hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [net] [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -166,6 +167,12 @@ impl Shared {
         self.running.load(Ordering::Acquire)
     }
 
+    /// Wake the vCPU: a halted guest has something to look at -- a frame, a
+    /// key. From any context, interrupts off included.
+    pub(crate) fn wake_up(&self) {
+        self.wake.signal();
+    }
+
     /// Queue `bytes` to be typed at the guest, all of them or -- when they do
     /// not fit -- none. The number the last of them has among all the bytes
     /// ever typed at it.
@@ -179,6 +186,8 @@ impl Shared {
         input.queue.extend(bytes.iter());
         input.queued += bytes.len() as u64;
         self.pending.fetch_add(bytes.len(), Ordering::Release);
+        /* A halted guest takes it now, not at its next timer edge. */
+        self.wake.signal();
         Some(input.queued)
     }
 
@@ -263,6 +272,12 @@ impl Host for VmHost {
         self.shared.stop.load(Ordering::Acquire) || self.shared.reset.load(Ordering::Acquire)
     }
 
+    /// On the VM's event: a frame for the guest, a key typed at it, a stop
+    /// or a restart wake it at once; else the timer edge does.
+    fn halt_wait(&mut self, ns: u64) {
+        self.shared.wake.wait_for(kcore::time::Duration::from_nanos(ns));
+    }
+
     fn progress(&mut self, counts: &Counts) {
         self.shared.exits.store(counts.exits, Ordering::Relaxed);
         self.shared.irq.store(counts.irq, Ordering::Relaxed);
@@ -317,10 +332,16 @@ fn vcpu(start: Start) {
 
     loop {
         let Some(mut g) = guest.take() else {
-            /* Parked: nothing to run until a command says what next. A
-             * signal that came while the guest ran is still there, and
-             * finds nothing to do. */
-            shared.wake.wait();
+            /* Parked: nothing to run until a command says what next. The
+             * flags are looked at before the wait, not only after: the
+             * signal a stop or a restart came with may have been taken
+             * already -- by a halted guest's wait, which the same event
+             * ends -- and a park that waited for it would wait for good,
+             * and `hv stop` and the unload with it. A signal still there
+             * from while the guest ran finds nothing to do. */
+            if !shared.stop.load(Ordering::Acquire) && !shared.reset.load(Ordering::Acquire) {
+                shared.wake.wait();
+            }
             if shared.stop.load(Ordering::Acquire) {
                 break;
             }
@@ -430,6 +451,8 @@ struct Vm {
     cpu: u32,
     kernel: String,
     mem_mib: u64,
+    /// Its port on the switch, with `net`.
+    port: Option<usize>,
 }
 
 struct Table {
@@ -442,6 +465,9 @@ struct Table {
 /// Every VM this module has started and not yet taken off the list.
 pub struct Vms {
     table: Mutex<Table>,
+    /// The guests' switch, made by the first `net` guest and kept until the
+    /// module goes.
+    switch: Mutex<Option<Arc<Switch>>>,
 }
 
 /// The first word of `args`, and the rest after it -- the text of `send`,
@@ -464,6 +490,22 @@ fn secs_option(rest: &str, default: u64) -> Result<(u64, &str), String> {
     }
 }
 
+/// A port claimed for a VM being started, given back if the start goes no
+/// further.
+struct PortHold {
+    switch: Arc<Switch>,
+    port: usize,
+    kept: bool,
+}
+
+impl Drop for PortHold {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.switch.release(self.port);
+        }
+    }
+}
+
 /// Stop a VM taken off the table and wait for its vCPU task: the flag, then
 /// the join, which returns once the guest has stopped and been freed.
 fn finish(mut vm: Vm) {
@@ -482,7 +524,10 @@ impl Vms {
     pub fn new() -> Option<Vms> {
         let mut vms = Vec::new();
         vms.try_reserve_exact(MAX_VMS).ok()?;
-        Some(Vms { table: Mutex::new(Table { next: 0, vms, closing: false })? })
+        Some(Vms {
+            table: Mutex::new(Table { next: 0, vms, closing: false })?,
+            switch: Mutex::new(None)?,
+        })
     }
 
     /// How many running VMs each CPU has: what a new vCPU is placed by.
@@ -523,7 +568,7 @@ impl Vms {
             let _ = writeln!(out, "hv: no guest can run here -- {}", e);
             return;
         }
-        let spec = match guest::parse(args, START_USAGE) {
+        let mut spec = match guest::parse(args, START_USAGE) {
             Ok(spec) if spec.secs.is_none() => spec,
             Ok(_) => {
                 let _ = writeln!(out, "hv: secs= is hv boot's -- a started vm runs until hv stop");
@@ -562,19 +607,42 @@ impl Vms {
             core::mem::replace(&mut table.next, next)
         };
 
+        let shared = match Shared::new(id, spec.log, &spec.input) {
+            Some(shared) => Arc::new(shared),
+            None => {
+                let _ = writeln!(out, "hv: vm {} not started -- out of memory for its console", id);
+                return;
+            }
+        };
+
+        /* With `net`, a port on the switch -- made by the first such guest --
+         * and the address that goes with it on the guest's command line;
+         * given back if the start goes no further. */
+        let mut hold = None;
+        if spec.net {
+            let switch = match self.switch() {
+                Ok(switch) => switch,
+                Err(why) => {
+                    let _ = writeln!(out, "hv: vm {} not started -- {}", id, why);
+                    return;
+                }
+            };
+            let Some(port) = switch.claim(&shared) else {
+                let _ = writeln!(out, "hv: vm {} not started -- every port of the switch is taken", id);
+                return;
+            };
+            spec.cmdline.push(' ');
+            spec.cmdline.push_str(&net::ip_param(port));
+            spec.nic = Some(NicSpec { port, switch: switch.clone() });
+            hold = Some(PortHold { switch, port, kept: false });
+        }
+
         /* The files are read and the guest's memory filled here, with no lock
          * held: it takes as long as the kernel and the initrd take to read. */
         let guest = match guest::build(machine, &spec) {
             Ok(guest) => guest,
             Err(why) => {
                 let _ = writeln!(out, "hv: vm {} not started -- {}", id, why);
-                return;
-            }
-        };
-        let shared = match Shared::new(id, spec.log, &spec.input) {
-            Some(shared) => Arc::new(shared),
-            None => {
-                let _ = writeln!(out, "hv: vm {} not started -- out of memory for its console", id);
                 return;
             }
         };
@@ -604,7 +672,8 @@ impl Vms {
             }
         };
 
-        let vm = Vm { shared, task: Some(task), cpu, kernel, mem_mib };
+        let port = hold.as_ref().map(|h| h.port);
+        let vm = Vm { shared, task: Some(task), cpu, kernel, mem_mib, port };
         let refused = {
             let mut table = self.table.lock();
             if table.closing || table.vms.len() >= MAX_VMS {
@@ -621,6 +690,10 @@ impl Vms {
             finish(vm);
             let _ = writeln!(out, "hv: vm {} stopped again at once -- no room for it, or the module is going", id);
             return;
+        }
+        /* On the list: its port is given back when it comes off. */
+        if let Some(h) = hold.as_mut() {
+            h.kept = true;
         }
         let _ = writeln!(out, "hv: vm {} started on cpu {} -- {}", id, cpu, said);
     }
@@ -640,6 +713,13 @@ impl Vms {
             let _ = write!(out, "vm {}  {}  cpu {}  {} MiB  {} s",
                 s.id, if running { "running" } else { "stopped" }, vm.cpu, vm.mem_mib,
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);
+            if let Some(port) = vm.port {
+                let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
+            }
+            let dropped = vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.dropped(p))).unwrap_or(0);
+            if dropped != 0 {
+                let _ = write!(out, "  {} frames dropped for it", dropped);
+            }
             let restarts = s.restarts.load(Ordering::Relaxed);
             if restarts != 0 {
                 let _ = write!(out, "  restarts {}", restarts);
@@ -651,6 +731,12 @@ impl Vms {
                 let _ = write!(out, "  -- {}", *s.reason.lock());
             }
             let _ = writeln!(out);
+        }
+        drop(table);
+        if let Some(s) = self.switch.lock().as_ref() {
+            let (to_host, refused) = s.host_counts();
+            let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take",
+                             net::dotted(net::HOST_IP), to_host, refused);
         }
     }
 
@@ -1005,7 +1091,9 @@ impl Vms {
             }
         };
         let shared = vm.shared.clone();
+        let port = vm.port;
         finish(vm);
+        self.release(port);
         let _ = writeln!(out, "hv: vm {} stopped -- {}", id, *shared.reason.lock());
         out.write_bytes(shared.report.lock().as_bytes());
     }
@@ -1029,7 +1117,9 @@ impl Vms {
                 table.vms.remove(0)
             };
             let shared = vm.shared.clone();
+            let port = vm.port;
             finish(vm);
+            self.release(port);
             stopped += 1;
             let reason = shared.reason.lock();
             match out.as_deref_mut() {
@@ -1047,9 +1137,43 @@ impl Vms {
     }
 
     /// The module is going: no VM starts from here on, and every one there is
-    /// stops.
+    /// stops -- and then the switch goes, `hv0`'s sink detached.
     pub fn close(&self) {
         self.table.lock().closing = true;
         self.stop_all(None);
+        let switch = self.switch.lock().take();
+        drop(switch);
+    }
+
+    /// The guests' switch, made the first time it is asked for.
+    fn switch(&self) -> Result<Arc<Switch>, String> {
+        let mut switch = self.switch.lock();
+        if let Some(s) = switch.as_ref() {
+            return Ok(s.clone());
+        }
+        let made = Arc::new(Switch::new()?);
+        *switch = Some(made.clone());
+        Ok(made)
+    }
+
+    /// A VM's port given back, once its vCPU task is gone.
+    fn release(&self, port: Option<usize>) {
+        let Some(port) = port else { return };
+        let switch = self.switch.lock().clone();
+        if let Some(s) = switch {
+            s.release(port);
+        }
+    }
+
+    /// The guests' switch, if there is one: for `hv forward`.
+    pub fn host_nic(&self) -> Option<kcore::net::Nic> {
+        self.switch.lock().as_ref().and_then(|s| s.host_nic())
+    }
+
+    /// The address of the running VM `id`, when it has a NIC.
+    pub fn address_of(&self, id: u32) -> Option<u32> {
+        let table = self.table.lock();
+        table.vms.iter().find(|vm| vm.shared.id == id && vm.shared.running())
+            .and_then(|vm| vm.port).map(net::port_ip)
     }
 }
