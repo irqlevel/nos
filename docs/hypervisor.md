@@ -333,11 +333,13 @@ on on every entry, whatever the VMCB says:
   VMCB gives it;
 - I/O and MSR permission maps with every bit set, and no way yet to clear
   one: a port the guest reaches directly is one of the host's devices;
-- nothing assumed clean, and **the whole TLB flushed on every entry**.
-  Guests share one address space identifier until there is an allocator
-  that knows when one may be reused, and a translation left over from
-  another guest -- or from this one, to a page since freed and handed back
-  to the host -- would be the host's memory in a guest's hands.
+- nothing assumed clean;
+- **the ASID, and what the TLB is told on the way in, given by the CPU the
+  entry is on** ([Address space identifiers](#address-space-identifiers)):
+  a translation left over from another guest -- or from a guest that has
+  gone, to a page since handed back to the host -- would be the host's
+  memory in a guest's hands, so which ASID a guest runs under is not the
+  policy's to say.
 
 ### Entering and leaving
 
@@ -347,7 +349,46 @@ one an earlier load left behind -- and only then enters, so that what was
 checked is still so: turning the extension off is an IPI, which waits. The
 machine keeps each CPU's page address in an atomic beside its table for
 exactly this check, set once the CPU has taken the page and cleared before
-the page is freed.
+the CPU is told to let it go -- so before the page is freed, and before the
+extension is off there.
+
+### Address space identifiers
+
+The TLB tags every translation a guest makes with the ASID it ran under and
+keeps it until something flushes it. Every entry flushed the whole TLB at
+first, because every guest ran under ASID 1: always right, and every exit
+cost the guest its translations and the host its own. Now each CPU hands its
+ASIDs out itself, the way KVM does -- `Asids` in `hvarch/src/x86/svm.rs`, a
+`CpuLocal` only `Guest::run` touches, on its own CPU with interrupts off:
+
+- each ASID is handed out at most once a **generation**, and a generation
+  ends when they run out -- 32767 on a Zen 2, 15 under TCG -- with a flush of
+  every entry of every ASID at that CPU's next entry into any guest. Until an
+  entry the CPU accepted has made that flush, every entry there asks for it:
+  one the CPU refuses (`VMEXIT_INVALID`) flushes nothing;
+- a guest keeps its ASID, and its translations with it, only while it keeps
+  entering on the CPU, in the generation and over the nested table it was
+  given it for; anything else -- another CPU, a generation over, another
+  table -- and it is given the next one. So no ASID is live for two guests,
+  or for a guest and one that has gone, without a flush in between;
+- every CPU starts each load of the module run out, so its first entry
+  flushes whatever an earlier load's guests left in its TLB.
+
+What lets a guest keep its translations at all is that its nested table only
+grows: an entry is written once, where there was none, and stays until the
+table goes (`hv/src/npt.rs`), so a translation the TLB still holds is one
+the table would still make. Every table has an id no other table has, and an
+entry that took a mapping away or narrowed it would give the table a new one
+-- moving its guest onto a fresh ASID, clear of the old translation. None
+does today.
+
+The `asid` built-in guest is the check: two VMs on one CPU taking turns, an
+exit each, each reading its own page at the same address, and a third made
+once they have gone, with the ASIDs a generation limited to two so that it
+is given one they had, after the flush that ended their generation. A missed
+flush, or two guests under one ASID, reads another guest's page -- for the
+third, a page back with the host. Under TCG every entry flushes whatever the
+VMCB says, so the check can fail only on a CPU that keeps translations.
 
 It also refuses a CPU with `CR4.LA57` set. A nested table is walked in the
 host's own paging mode, and the one here has four levels: walked as five,
@@ -404,7 +445,7 @@ field, no rule. `hv::svm::Vcpu::check` is the manual's list of
 consistency checks that a VMCB filled in here could fail -- EFER.SVME,
 CR0.NW without CD, CR0 above bit 31, CR3 above bit 51, reserved CR4 and EFER
 bits, DR6 and DR7 above bit 31, long mode without PAE or PE, a 64-bit code
-segment with D set, G_PAT's memory types, the ASID, the injected event's
+segment with D set, G_PAT's memory types, the injected event's
 type and vector -- and one of this hypervisor's own that the CPU does not
 make, LMA against LME and PG. Every entry asks it first: a VMCB it finds
 wrong is never handed to the CPU, and the refusal names the rule. It is the
@@ -430,6 +471,7 @@ memory behind it -- and 1 GiB to guest physical 4 GiB:
 | `triple` | `int3` with no IDT | a triple fault stops the guest, not the CPU |
 | `refused` | starts with CR0.NW set and CD clear | a VMCB that breaks a rule is refused before the CPU sees it, the rule named |
 | `spin` | `cli; jmp $` | the host's interrupts still get through -- about a hundred a second -- and the host stops it when its 300 ms are up |
+| `asid` | three VMs on one CPU read a page of their own at one address: two taking turns, and a third given an ASID one of them had | no guest reads another's page through the TLB, and a reused ASID is reused after a flush ([Address space identifiers](#address-space-identifiers)) |
 
 ```
 $ hv run all 3
@@ -447,7 +489,12 @@ hv: guest spin -- cli; jmp $ -- for as long as the host lets it
   stopped    by the host, after 300 ms
   checked    the host's interrupts got through 31 times with the guest's off, and the host stopped it
 hv: guest spin ok
-hv: 8 of 8 guests ok
+hv: guest asid -- three VMs on one CPU, and none reads another's page through the TLB
+  ran on     cpu 3, 13708 us
+  exits      24 cpuid, 0 host interrupt
+  checked    A and B each read their own page taking turns; vm C was given ASID 1, which vm A had, after 2 generation(s) ended, and read its own too
+hv: guest asid ok
+hv: 9 of 9 guests ok
 ```
 
 A guest bound to a CPU the extension is not on for is not run, and says
@@ -481,11 +528,11 @@ which CPU: `hv: guest exits not run -- the extension is not on for cpu 2`.
 
 And while a guest runs:
 
-- **Every entry flushes the whole TLB**, the host's entries included --
-  the price of every guest sharing one address space identifier, paid until
-  an allocator hands them out per CPU with generations, the way KVM does,
-  and knows when one may be reused. Cheap for these guests; for a Linux
-  guest it is to be measured, and then replaced.
+- **The TLB is flushed only when a CPU's ASIDs run out** ([Address space
+  identifiers](#address-space-identifiers)) -- once every 32767 guests, or
+  guests moved between CPUs, on a Zen 2 -- rather than on every entry, the
+  host's entries included, as it was. `hv bench ... flush` still does that,
+  for what it costs ([What an exit costs](#what-an-exit-costs)).
 - **The x87 and SSE state is switched on every entry and exit**, with
   FXRSTOR before `vmrun` and FXSAVE after, into an area each guest owns --
   so it is the guest's whichever CPU the vCPU's task is on and whichever
@@ -495,7 +542,10 @@ And while a guest runs:
   interrupts-off window around `vmrun` and given back before interrupts come
   on: outside it an SSE instruction in the host still faults. XCR0 is x87
   alone while a guest runs, and guests are given no XSAVE, so AVX and above
-  fault in a guest even if it turns OSXSAVE on itself.
+  fault in a guest even if it turns OSXSAVE on itself. XCR0 is written only
+  when the host's is something else -- nothing in this kernel changes it from
+  the x87 alone a CPU comes out of reset with, firmware that used AVX may
+  have -- since XSETBV serializes the CPU, twice an exit.
 - **A halted guest costs its CPU nothing** -- but waits at the host tick's
   grain. A HLT with interrupts on is stepped past, as a CPU an interrupt
   wakes resumes after it, and the vCPU is not entered again until the PIC
@@ -512,6 +562,36 @@ And while a guest runs:
   runs other people's guests, and is not done.
 - Each entry reads `EFER` and `VM_HSAVE_PA` on the CPU, and checks the VMCB
   against the manual's rules, before `vmrun`.
+
+### What an exit costs
+
+`hv bench` runs a guest that makes nothing but exits -- CPUIDs, each after a
+read of each of `pages` pages 4 KiB apart -- on a task bound to one CPU, and
+times it:
+
+```
+hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]
+```
+
+`flush` makes every entry flush the whole TLB, as every entry did before
+ASIDs, so the two can be set side by side on one boot; `pages` is what a
+flush costs the guest after it -- each read a translation to walk again --
+where with none it is what it costs the host. `profile` times each entry in
+its parts with the time-stamp counter: the checks and the ASID; the x87/SSE
+registers and XCR0 put in; `vmrun` to `#vmexit`, the stub's VMSAVE and
+VMLOAD and the guest's few instructions included; the registers taken back
+out; and the rest, which is the exit handled and the loop round to the next
+entry:
+
+```
+$ hv bench exits=20000 profile
+hv: 20000 exits on cpu 3, 0 pages read between, ASIDs kept: 342 ms, 17130 ns an exit, 58374 a second (12 host interrupts among them)
+hv: an exit, in ns: checks and ASID 127, x87/SSE in 605, vmrun to #vmexit 9012, x87/SSE out 731; the rest -- the exit handled, the loop -- 6655
+```
+
+Those are TCG's numbers, and say nothing about a CPU: TCG flushes its own
+TLB on every `vmrun` whatever the VMCB asks, and emulates every instruction
+of the host's side as well as the guest's.
 
 ## arm64
 
@@ -969,8 +1049,9 @@ All four demos are done, and a guest runs a command typed at its console
 real AMD-V ([On real hardware](#on-real-hardware)). Guests also run until
 they are stopped, reached from the shell ([Guests that stay
 up](#guests-that-stay-up)): the lifecycle the control plane will serve. What
-is left, not in step order: the TLB flushed per address space rather than
-whole; the VMX backend with `CR0.NE` on every CPU. Beyond stage 3: a local
+is left, not in step order: the VMX backend with `CR0.NE` on every CPU.
+The TLB is no longer flushed whole on every entry ([Address space
+identifiers](#address-space-identifiers)). Beyond stage 3: a local
 APIC and an SMP guest, host-side virtio, and the control plane's HTTP API
 (stage 4).
 

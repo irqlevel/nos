@@ -32,8 +32,12 @@ KVM it is whatever the host CPU has):
     last: port I/O and CPUID answered by the host, long mode with memory
     above 4 GiB and every register across a hypercall, a write past its
     memory stopped at the nested table, a triple fault that stops only the
-    guest, a VMCB that breaks a rule refused with the rule named, and a
-    `cli; jmp $` the host's interrupts get through and the host stops
+    guest, a VMCB that breaks a rule refused with the rule named, a
+    `cli; jmp $` the host's interrupts get through and the host stops, and
+    three VMs on one CPU that each read their own page through the TLB --
+    two taking turns, and a third given an ASID one of them had, after the
+    flush that ended their generation (meaningful on a CPU that keeps
+    translations; TCG flushes on every entry)
   - a second `insmod`, a CPU that does not exist, a word that is not a
     subcommand and a guest that does not exist are each refused
   - `rmmod` with the extension on for every CPU turns it off for every CPU
@@ -115,6 +119,7 @@ GUESTS = {
     "triple": [r"shutdown \(triple fault\)"],
     "refused": [r"not entered -- the VMCB breaks a rule: CR0.NW is set without CR0.CD"],
     "spin": [r"stopped\s+by the host", r"interrupts got through [1-9]\d* times"],
+    "asid": [r"vm C was given ASID \d+, which vm [AB] had, after \d+ generation\(s\) ended, and read its own too"],
 }
 
 

@@ -142,9 +142,8 @@ impl Vcpu {
         c.intercept_misc2 = misc2::VMMCALL | misc2::RDTSCP | misc2::ICEBP | misc2::WBINVD
             | misc2::MONITOR | misc2::MWAIT | misc2::MWAIT_ARMED | misc2::XSETBV | misc2::RDPRU;
         c.intercept_exceptions = exceptions;
-        /* Any identifier but the host's 0: every entry flushes the TLB (see
-         * `Guest::run`), so no two guests can meet in one. */
-        c.guest_asid = 1;
+        /* No ASID: each entry is given one by the CPU it is on
+         * (`Guest::run`). */
         Ok(Self { guest, nrip })
     }
 
@@ -174,6 +173,26 @@ impl Vcpu {
 
     pub(crate) fn guest_mut(&mut self) -> &mut Guest {
         &mut self.guest
+    }
+
+    /// The ASID of the last entry, for a report.
+    pub fn asid(&self) -> Option<u32> {
+        self.guest.asid()
+    }
+
+    /// Flush the whole TLB on every entry, as every entry did before there
+    /// were ASIDs: for a benchmark to compare with.
+    pub fn set_flush_always(&mut self, on: bool) {
+        self.guest.set_flush_always(on);
+    }
+
+    /// Time every entry from now on, or stop (`hvarch::x86::svm::Profile`).
+    pub fn set_profile(&mut self, on: bool) {
+        self.guest.set_profile(on);
+    }
+
+    pub fn profile(&self) -> Option<arch::Profile> {
+        self.guest.profile()
     }
 
     pub fn next_rip_saved(&self) -> bool {
@@ -475,9 +494,6 @@ impl Vcpu {
             if !matches!((s.g_pat >> (i * 8)) & 0xFF, 0 | 1 | 4 | 5 | 6 | 7) {
                 return Err("G_PAT has an entry that is not a memory type");
             }
-        }
-        if v.control.guest_asid == 0 {
-            return Err("the ASID is the host's");
         }
         if v.control.event_inj & vmcb::event::VALID != 0 {
             use vmcb::event;

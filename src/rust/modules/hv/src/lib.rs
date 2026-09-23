@@ -53,13 +53,18 @@ use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|boot|start|list|console|attach|send|exec|wait|restart|stop|forward|help] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|bench|boot|start|list|console|attach|send|exec|wait|restart|stop|forward|help] - the CPU's virtualization extension, and guests under it";
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
 hv [info]                          what the CPU has, and which CPUs the extension is on for
 hv on|off [cpu|all]                turn the extension on or off
 hv run <guest|all> [cpu]           run the built-in guests
+hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]
+                                   what a VM exit costs: CPUIDs, each after a read of
+                                   that many pages, and with the whole TLB flushed on
+                                   every entry, as before ASIDs, when told; profile
+                                   splits an entry into its parts
 hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path]... [input=...] [cmdline=...]
                                    a Linux guest for secs, then its console and how it ended
 hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path]... [input=...] [log] [restart] [net] [cmdline=...]
@@ -208,6 +213,8 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "off" => switch(state, words.next(), false, out),
         "run" => run(machine, words.next(), words.next(), out),
         #[cfg(target_arch = "x86_64")]
+        "bench" => bench(machine, words, out),
+        #[cfg(target_arch = "x86_64")]
         "boot" => boot::boot(machine, rest, &state.vms.load(), &state.unloading, out),
         #[cfg(target_arch = "x86_64")]
         "start" => state.vms.start(machine, rest, out),
@@ -230,7 +237,8 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "forward" => forward_command(state, rest, out),
         #[cfg(not(target_arch = "x86_64"))]
-        "boot" | "start" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart" | "stop" | "forward" => {
+        "boot" | "start" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart" | "stop" | "forward"
+        | "bench" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {
@@ -394,6 +402,107 @@ fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut
         }
     }
     out.write_bytes(job.report.lock().as_bytes());
+}
+
+/// The benchmark's default count of exits, and its most.
+#[cfg(target_arch = "x86_64")]
+const BENCH_DEFAULT: u32 = 100_000;
+#[cfg(target_arch = "x86_64")]
+const BENCH_MAX: u32 = 10_000_000;
+#[cfg(target_arch = "x86_64")]
+const BENCH_USAGE: &str = "hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]";
+
+/// What `hv bench` runs on its CPU.
+#[cfg(target_arch = "x86_64")]
+struct BenchJob {
+    machine: Arc<Machine>,
+    exits: u32,
+    pages: u32,
+    flush: bool,
+    profile: bool,
+    result: Mutex<Option<core::result::Result<hv::guests::Bench, String>>>,
+}
+
+/// `hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]`: a guest of
+/// CPUIDs, each after a read of each of `pages` pages, on a task bound to
+/// `cpu` (the extension's last CPU unless told), timed -- with a flush of the
+/// whole TLB on every entry when `flush` says so, for what that costs, and
+/// each entry timed in its parts when `profile` does.
+#[cfg(target_arch = "x86_64")]
+fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: &mut Output) {
+    if let Err(e) = hv::run::ensure_runnable(machine) {
+        let _ = writeln!(out, "hv: no guest can run here -- {}", e);
+        return;
+    }
+    let enabled = machine.enabled_mask();
+    if enabled == 0 {
+        let _ = writeln!(out, "hv: the extension is on for no cpu -- hv on first");
+        return;
+    }
+    let mut cpu = u64::BITS - 1 - enabled.leading_zeros();
+    let (mut exits, mut pages, mut flush, mut profile) = (BENCH_DEFAULT, 0u32, false, false);
+    for word in words {
+        let (key, value) = word.split_once('=').unwrap_or((word, ""));
+        let number = value.parse::<u32>();
+        match (key, number) {
+            ("cpu", Ok(c)) if c < u64::BITS && enabled & (1u64 << c) != 0 => cpu = c,
+            ("cpu", _) => {
+                let _ = writeln!(out, "hv: the extension is not on for cpu \"{}\"", value);
+                return;
+            }
+            ("exits", Ok(n)) if (1..=BENCH_MAX).contains(&n) => exits = n,
+            ("pages", Ok(n)) if n <= hv::guests::BENCH_MAX_PAGES => pages = n,
+            ("flush", _) if value.is_empty() => flush = true,
+            ("profile", _) if value.is_empty() => profile = true,
+            _ => {
+                let _ = writeln!(out, "hv: {} -- exits 1..{}, pages 0..{}", BENCH_USAGE, BENCH_MAX,
+                                 hv::guests::BENCH_MAX_PAGES);
+                return;
+            }
+        }
+    }
+    let Some(result) = Mutex::new(None) else {
+        let _ = writeln!(out, "hv: out of memory");
+        return;
+    };
+    let job = Arc::new(BenchJob { machine: machine.clone(), exits, pages, flush, profile, result });
+    let task = kcore::task::spawn_on_with("hv/bench", 1u64 << cpu, job.clone(), |job: Arc<BenchJob>| {
+        let r = hv::guests::bench(&job.machine, job.exits, job.pages, job.flush, job.profile);
+        *job.result.lock() = Some(r);
+    });
+    match task {
+        /* Dropping the handle waits for the task. */
+        Some(task) => drop(task),
+        None => {
+            let _ = writeln!(out, "hv: no task for the guest");
+            return;
+        }
+    }
+    let result = job.result.lock().take();
+    match result {
+        Some(Ok(b)) => {
+            let ns = b.ns.max(1);
+            let exits = b.exits.max(1);
+            let _ = writeln!(out, "hv: {} exits on cpu {}, {} pages read between, {}: {} ms, {} ns an exit, {} a second ({} host interrupts among them)",
+                b.exits, cpu, pages, if flush { "the TLB flushed on every entry" } else { "ASIDs kept" },
+                ns / 1_000_000, ns / exits, b.exits * 1_000_000_000 / ns, b.host);
+            if let Some(p) = b.profile {
+                /* Ticks to nanoseconds by the two clocks' own ratio over the
+                 * run: whatever the TSC's rate, the parts add up to the whole. */
+                let part = |ticks: u64| ticks * ns / b.ticks.max(1) / p.entries.max(1);
+                let entry = part(p.checks) + part(p.switch_in) + part(p.world) + part(p.switch_out);
+                let _ = writeln!(out, "hv: an exit, in ns: checks and ASID {}, x87/SSE in {}, vmrun to #vmexit {}, x87/SSE out {}; the rest -- the exit handled, the loop -- {}",
+                    part(p.checks), part(p.switch_in), part(p.world), part(p.switch_out),
+                    (ns / exits).saturating_sub(entry));
+            }
+        }
+        Some(Err(why)) => {
+            let _ = writeln!(out, "hv: the bench did not finish -- {}", why);
+        }
+        None => {
+            let _ = writeln!(out, "hv: the bench's task said nothing");
+        }
+    }
 }
 
 /// `hv on [cpu|all]` and `hv off [cpu|all]`, which differ in one word and

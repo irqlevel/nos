@@ -66,13 +66,13 @@ impl Vm {
     /// entry checks the CPU it finds itself on.
     pub fn enter(&mut self, machine: &Machine) -> core::result::Result<(Exit, u32), Refusal> {
         self.vcpu.check().map_err(Refusal::Vmcb)?;
-        let root = self.memory.nested_root();
+        let nested = self.memory.nested();
         /* The nested table is the memory's own and maps nothing but pages
          * the memory owns (`GuestMemory`), and both are this VM's, borrowed
-         * for the whole of the call. A CPU's entry in the machine's host
-         * areas is never the address of a page that has gone
-         * (`Machine::host_areas`). */
-        let cpu = unsafe { self.vcpu.guest_mut().run(&self.perms, root, machine.host_areas()) }
+         * for the whole of the call; it only gains entries, and its id is
+         * its own (`Npt`). A CPU's entry in the machine's host areas is never
+         * the address of a page that has gone (`Machine::host_areas`). */
+        let cpu = unsafe { self.vcpu.guest_mut().run(&self.perms, nested, machine.host_areas()) }
             .map_err(|why| match why {
                 NotRun::Off { cpu } => Refusal::NotOn(cpu),
                 NotRun::FiveLevelPaging { cpu } => Refusal::FiveLevelPaging(cpu),
