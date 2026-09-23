@@ -6,6 +6,7 @@ use core::ffi::c_void;
 use ffi::cmd;
 
 use crate::error::{Error, Result};
+use crate::time::Duration;
 
 /// Where a command's output goes: the console or the UDP shell, whichever
 /// ran it.
@@ -35,6 +36,20 @@ impl Output {
     /// which is whatever was written to it.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         unsafe { cmd::kernel_printer_write(self.printer, bytes.as_ptr(), bytes.len()) };
+    }
+
+    /// What the person at the other end types while the command runs, for
+    /// a command that asks: up to `buf.len()` bytes, waiting up to `timeout`
+    /// for some -- after whatever the command has printed has gone out.
+    /// `Some(0)` when the time passed with nothing; `None` when nobody can
+    /// type here -- the console, the UDP shell, `/etc/rc` -- or no more will
+    /// come, the session over. Only an SSH session has anyone to ask.
+    /// Sleeps: task context, no lock held.
+    pub fn read_input(&mut self, buf: &mut [u8], timeout: Duration) -> Option<usize> {
+        let n = unsafe {
+            cmd::kernel_printer_read(self.printer, buf.as_mut_ptr(), buf.len(), timeout.as_nanos())
+        };
+        usize::try_from(n).ok().map(|n| n.min(buf.len()))
     }
 }
 
@@ -86,6 +101,46 @@ impl Drop for Command {
     fn drop(&mut self) {
         unsafe { cmd::kernel_cmd_unregister(self.handle) };
         drop(unsafe { Box::from_raw(self.handler) });
+    }
+}
+
+/// What a session gives a command it runs: where its output goes, and what is
+/// typed at it while it runs, for a command that asks (`Output::read_input`).
+pub trait Session {
+    fn write(&mut self, bytes: &[u8]);
+    /// Up to `buf.len()` bytes typed, waiting up to `timeout_ns` for some:
+    /// `Some(0)` when the time passed with nothing, `None` when no more
+    /// will come.
+    fn read(&mut self, buf: &mut [u8], timeout_ns: u64) -> Option<usize>;
+}
+
+/// Runs a shell command line as the console would, its output going to
+/// `session` as it prints it and what is typed at it read from `session`
+/// when it asks -- how an SSH session runs the shell's commands. Returns when
+/// the command does, so task context only.
+pub fn dispatch_session(line: &str, session: &mut dyn Session) {
+    let mut session = session;
+    let ctx = &mut session as *mut &mut dyn Session as *mut c_void;
+    unsafe { cmd::kernel_cmd_dispatch_io(line.as_ptr(), line.len(), session_sink, session_source, ctx) };
+}
+
+/// # Safety
+/// `ctx` is the `&mut &mut dyn Session` `dispatch_session` passed, alive
+/// for as long as the command runs, and `buf` is `len` bytes to read.
+unsafe extern "C" fn session_sink(ctx: *mut c_void, buf: *const u8, len: usize) {
+    let session = unsafe { &mut *(ctx as *mut &mut dyn Session) };
+    session.write(unsafe { core::slice::from_raw_parts(buf, len) });
+}
+
+/// # Safety
+/// As `session_sink`, with `buf` `len` bytes to write. The two are never
+/// called at once: both are called by the command, on its own task.
+unsafe extern "C" fn session_source(ctx: *mut c_void, buf: *mut u8, len: usize, timeout_ns: u64) -> isize {
+    let session = unsafe { &mut *(ctx as *mut &mut dyn Session) };
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf, len) };
+    match session.read(buf, timeout_ns) {
+        Some(n) => n.min(len) as isize,
+        None => -1,
     }
 }
 

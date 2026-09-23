@@ -49,7 +49,7 @@ use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|boot|start|list|console|send|exec|wait|stop|help] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|boot|start|list|console|attach|send|exec|wait|restart|stop|help] - the CPU's virtualization extension, and guests under it";
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
@@ -58,14 +58,17 @@ hv on|off [cpu|all]                turn the extension on or off
 hv run <guest|all> [cpu]           run the built-in guests
 hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [input=...] [cmdline=...]
                                    a Linux guest for secs, then its console and how it ended
-hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [cmdline=...]
-                                   a Linux guest that runs until hv stop
+hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [restart] [cmdline=...]
+                                   a Linux guest that runs until hv stop; restart boots it
+                                   again when it resets itself
 hv list                            the started guests
 hv console <id> [bytes=N]          the end of one's console
+hv attach <id>                     its console, live, typed at -- ^] detaches (ssh -t)
 hv send <id> <text>                type at it (\\n for a newline)
 hv exec <id> [secs=N] <line>       type a line and print the answer, up to the next prompt
-hv wait <id> [secs=N] <text>       until its console shows text
-hv stop <id|all>                   stop it and say how it ended
+hv wait <id> [secs=N] <text>       until its console shows text, or it stops
+hv restart <id>                    boot it again from its files, running or stopped
+hv stop <id|all>                   stop it, say how it ended, take it off the list
 ";
 
 /// What the command works on: the machine, and the guests started on it.
@@ -203,9 +206,13 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "wait" => state.vms.wait(rest, out),
         #[cfg(target_arch = "x86_64")]
+        "attach" => state.vms.attach(rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "restart" => state.vms.restart(rest, out),
+        #[cfg(target_arch = "x86_64")]
         "stop" => state.vms.stop(rest, out),
         #[cfg(not(target_arch = "x86_64"))]
-        "boot" | "start" | "list" | "console" | "send" | "exec" | "wait" | "stop" => {
+        "boot" | "start" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart" | "stop" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {

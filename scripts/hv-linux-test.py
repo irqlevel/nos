@@ -38,6 +38,7 @@ import importlib.util
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -105,10 +106,21 @@ def vm_commands(args):
     start2 = "hv start /bzImage mem=64 cmdline=%s panic=1" % args.cmdline
     wait_reboot = "hv wait 2 secs=300 Rebooting in"
     wait_stop = "hv wait 2 secs=300 nos-never-printed"
+    # The same stopped guest booted again by hand; then one with `restart`,
+    # booted again by itself each time it resets -- until the sixth reset in
+    # a minute says it is a loop; then the running guest reset by hand, and
+    # typed at again once it is back.
+    wait_stop2 = "hv wait 2 secs=300 nos-never-printed-2"
+    start3 = "hv start /bzImage mem=64 restart cmdline=%s panic=1" % args.cmdline
+    wait_loop = "hv wait 3 secs=500 nos-never-printed-3"
+    exec_again = "hv exec 0 secs=%d id" % args.vm_secs
     lines = ["hv help", start0, start1, "hv list", "hv stop 1", exec_early, exec_prompt,
              send, wait, "hv console 0 bytes=400", "hv list",
-             start2, wait_reboot, wait_stop, "hv list", "hv stop 2", "hv off",
-             "rmmod hv", "insmod /hv.ko", "hv", "rmmod hv", RC_LOG]
+             start2, wait_reboot, wait_stop, "hv list",
+             "hv restart 2", wait_stop2, "hv list", "hv stop 2",
+             start3, wait_loop, "hv list", "hv stop 3",
+             "hv restart 0", exec_again, "hv list",
+             "hv off", "rmmod hv", "insmod /hv.ko", "hv", "rmmod hv", RC_LOG]
     checks = [
         ("hv help", 0, "hv help lists the vm commands", r"hv exec <id>", True),
         (start0, 0, "vm 0 starts", r"hv: vm 0 started on cpu \d+", True),
@@ -132,6 +144,17 @@ def vm_commands(args):
         ("hv list", 2, "hv list keeps it, stopped, with its reason",
          r"vm 2  stopped .* -- the guest asked for a reset", True),
         ("hv stop 2", 0, "hv stop takes it off the list", r"hv: vm 2 stopped -- the guest asked for a reset", True),
+        ("hv restart 2", 0, "hv restart boots a stopped guest again", r"hv: vm 2 restarted", True),
+        (wait_stop2, 0, "... which resets again, and stops again",
+         r"hv: vm 2 stopped without printing .* -- the guest asked for a reset", True),
+        ("hv list", 3, "hv list counts the restart", r"vm 2  stopped .* restarts 1 ", True),
+        (start3, 0, "a guest with restart starts", r"hv: vm 3 started on cpu \d+ .*restarted when it resets", True),
+        (wait_loop, 0, "it is booted again at each reset, until the loop is called one",
+         r"hv: vm 3 stopped without printing .* -- the guest asked for a reset.* -- reset 6 times in 60 s, left stopped", True),
+        ("hv list", 4, "five restarts before it was left stopped", r"vm 3  stopped .* restarts 5 ", True),
+        ("hv restart 0", 0, "hv restart resets the running guest", r"hv: vm 0 restarted", True),
+        (exec_again, 0, "and its new boot answers a line typed during it", r"# id\nuid=0 gid=0\n", True),
+        ("hv list", 5, "running again, one restart counted", r"vm 0  running .* restarts 1 ", True),
         ("hv off", 0, "hv off will not pull the extension from under vm 0",
          r"hv: vm 0 is running on cpu \d+ -- hv stop it first", True),
         ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),
@@ -192,6 +215,102 @@ def check_boot(args, txt):
     for m in args.expect:
         pt.check("the console shows: %s" % m, re.search(re.escape(m), block) is not None,
                  block[-1500:])
+
+
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def attach(args):
+    """`hv attach` over a real SSH session: sshd and a guest started from
+    /etc/rc, then a line typed through `ssh -tt ... hv attach 0` and its
+    answer read back, ^] to detach -- and from /etc/rc, where nobody can
+    type, a refusal."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvattach-")
+    log = os.path.join(tmp, "serial.log")
+    key = os.path.join(tmp, "id_test")
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "hv-linux-test", "-f", key], check=True)
+    port = free_port()
+
+    rootdir = os.path.join(tmp, "rootdir")
+    os.makedirs(os.path.join(rootdir, "etc", "ssh"))
+    shutil.copy(hvt.module("x86_64"), rootdir)
+    shutil.copy(os.path.join(ROOT, "out", "x86_64", "modules", "sshd.ko"), rootdir)
+    shutil.copy(args.bzimage, os.path.join(rootdir, "bzImage"))
+    shutil.copy(args.initrd, os.path.join(rootdir, "initrd"))
+    with open(os.path.join(rootdir, "etc", "ssh", "authorized_keys"), "w") as f:
+        f.write(open(key + ".pub").read())
+    rc = ["insmod /sshd.ko", "sshd start", "insmod /hv.ko", "hv on",
+          "hv start /bzImage mem=%d initrd=/initrd cmdline=%s" % (args.mem, args.cmdline),
+          "hv exec 0 secs=%d id" % args.vm_secs, "hv attach 0", RC_LAST]
+    with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
+        f.write("# scripts/hv-linux-test.py --attach\n" + "\n".join(rc) + "\n")
+    image = os.path.join(tmp, "root.img")
+    subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "128", rootdir],
+                   cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4", "-cpu", "max",
+            "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
+            "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
+            "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
+            "-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
+            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:22" % port]
+    ssh = ["ssh", "-p", str(port), "-i", key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
+           "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+           "-o", "ConnectTimeout=60", "-o", "LogLevel=ERROR"]
+    p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        done = False
+        t0 = time.time()
+        txt = ""
+        while time.time() - t0 < args.deadline and p.poll() is None:
+            txt = open(log, errors="replace").read() if os.path.exists(log) else ""
+            if "PANIC:" in txt:
+                pt.check("nos did not panic", False, txt[-3000:])
+                return
+            if RC_DONE.search(txt):
+                done = True
+                break
+            time.sleep(3)
+        if not pt.check("sshd and a guest up, from /etc/rc", done,
+                        txt[-2000:] or "qemu exited %s" % p.poll()):
+            return
+        secs = sections(open(log, errors="replace").read())
+        pt.check("the guest's shell answered", re.search(r"uid=0 gid=0", output_of(secs, rc[5], 0) or "") is not None)
+        pt.check("hv attach refuses where nobody can type",
+                 "nobody can type here" in (output_of(secs, "hv attach 0", 0) or ""))
+
+        # A person at a terminal: a line typed, its answer awaited, ^] typed.
+        a = subprocess.Popen(ssh + ["-tt", "root@127.0.0.1", "hv attach 0"], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        time.sleep(args.attach_wait)
+        a.stdin.write(b"echo nos$((6*7))attach\r")
+        a.stdin.flush()
+        time.sleep(args.attach_wait)
+        a.stdin.write(b"\x1d")
+        a.stdin.flush()
+        try:
+            out, err = a.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            a.kill()
+            out, err = a.communicate()
+        text = out.decode(errors="replace")
+        pt.check("hv attach says it is attached", "attached to vm 0" in text, repr(text[-600:]))
+        pt.check("what was typed ran in the guest, its answer came back", "nos42attach" in text, repr(text[-600:]))
+        pt.check("^] detaches", "hv: detached -- vm 0" in text, repr(text[-600:]))
+        pt.check("no terminal query reached the terminal", b"\x1b[6n" not in out, repr(text[-600:]))
+        pt.check("the session ended cleanly", a.returncode == 0, "exit %s, %r" % (a.returncode, err[-300:]))
+
+        c = subprocess.run(ssh + ["root@127.0.0.1", "hv list"], capture_output=True, timeout=120)
+        pt.check("the guest runs on after the detach", b"vm 0  running" in c.stdout, repr(c.stdout[-300:]))
+    finally:
+        pt.kill(p)
+        if args.keep or pt.failures:
+            print("log at " + log)
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run(args):
@@ -282,6 +401,10 @@ def main():
                     help="how long the first hv exec waits for the started guest's shell (at most 600)")
     ap.add_argument("--skip-boot", action="store_true", help="leave out the one-shot hv boot")
     ap.add_argument("--skip-vms", action="store_true", help="leave out the hv start phase")
+    ap.add_argument("--attach", action="store_true",
+                    help="instead: hv attach over a real ssh -tt session (needs ssh, ssh-keygen and --initrd)")
+    ap.add_argument("--attach-wait", type=float, default=5.0,
+                    help="seconds between what is typed through hv attach, for the guest to answer")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM even if the host has AMD-V")
     ap.add_argument("--keep", action="store_true", help="keep the serial log (it is kept on a failure anyway)")
     ap.add_argument("--verbose", action="store_true", help="print the whole serial log at the end")
@@ -292,7 +415,12 @@ def main():
     if not os.path.exists(os.path.join(ROOT, "nos.iso")):
         sys.exit("build nos.iso first (make)")
 
-    run(args)
+    if args.attach:
+        if not args.initrd:
+            sys.exit("--attach needs --initrd: the guest's shell is what is typed at")
+        attach(args)
+    else:
+        run(args)
 
     print()
     if pt.failures:

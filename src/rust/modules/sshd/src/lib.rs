@@ -811,8 +811,24 @@ impl ssh::Shell for KernelShell<'_> {
         kcore::trace!(0, "sshd: {} logged in from {} with {} {}", user, self.peer, key.fingerprint(), comment);
     }
 
-    fn run(&mut self, line: &str, out: &mut dyn FnMut(&[u8])) {
-        kcore::cmd::dispatch(line, out);
+    fn run(&mut self, line: &str, io: &mut dyn ssh::Io) {
+        kcore::cmd::dispatch_session(line, &mut SessionIo(io));
+    }
+}
+
+/* The session's side of a command it runs, as the kernel asks for it: the
+   output, and what the client types for a command that reads it
+   (`hv attach`). The kernel counts in nanoseconds, the protocol crate in
+   milliseconds -- rounded up, so a short wait is not turned into none. */
+struct SessionIo<'x>(&'x mut dyn ssh::Io);
+
+impl kcore::cmd::Session for SessionIo<'_> {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    fn read(&mut self, buf: &mut [u8], timeout_ns: u64) -> Option<usize> {
+        self.0.read(buf, timeout_ns.div_ceil(kcore::consts::NS_PER_MS))
     }
 }
 

@@ -393,7 +393,17 @@ extension off, which the next load confirms and `dmesg` shows in order. Once
 the shell has the console, the kernel's own lines go to the log and not to
 it -- so the gate ends on a command's output (`version`) rather than on
 `rc: /etc/rc done`, and reads what the vCPU tasks and the unload said with
-`dmesg hv:`. `--skip-boot` and `--skip-vms` run one half.
+`dmesg hv:`. `--skip-boot` and `--skip-vms` run one half. The same phase
+restarts guests: a stopped one by `hv restart`, one started with `restart`
+that resets itself until the sixth reset in a minute leaves it stopped, and
+the running one, which must answer a line typed during its new boot.
+
+`--attach` is a boot of its own for `hv attach`: sshd and a guest started
+from `/etc/rc`, then an `ssh -tt ... hv attach 0` that types a line, waits
+for its answer and types ^] -- the answer must come back, the detach be
+said, no cursor query reach the terminal, and the guest run on; `hv attach`
+from `/etc/rc`, where nobody can type, must refuse. It needs `ssh` and
+`ssh-keygen` on the host.
 
 ## The hardware NIC drivers
 

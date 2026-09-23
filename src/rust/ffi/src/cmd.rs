@@ -24,15 +24,30 @@ unsafe extern "C" {
 
     /// Writes to the printer a handler was given.
     pub fn kernel_printer_write(out: *mut c_void, buf: *const u8, len: usize);
+
+    /// Reads what is typed at the command whose printer this is, up to
+    /// `len` bytes, waiting up to `timeout_ns` for some: the count, 0 when
+    /// the time passed with nothing, -1 when nobody can type there or no
+    /// more will come. Sleeps: task context, no lock held.
+    pub fn kernel_printer_read(out: *mut c_void, buf: *mut u8, len: usize, timeout_ns: u64) -> isize;
 }
 
 /// Where kernel_cmd_dispatch hands what a command prints: the ctx it was
 /// given, and a piece of the output.
 pub type CmdSink = unsafe extern "C" fn(ctx: *mut c_void, buf: *const u8, len: usize);
 
+/// Where kernel_cmd_dispatch_io asks for what is typed while the command
+/// runs: the ctx it was given, a buffer and its length, and how long to wait
+/// for some -- answered as `kernel_printer_read` answers.
+pub type CmdSource = unsafe extern "C" fn(ctx: *mut c_void, buf: *mut u8, len: usize, timeout_ns: u64) -> isize;
+
 unsafe extern "C" {
     /// Runs a shell command line as the console would, handing what it
     /// prints to the sink, a piece at a time. Sleeps as long as the command
     /// runs.
     pub fn kernel_cmd_dispatch(line: *const u8, len: usize, sink: CmdSink, ctx: *mut c_void);
+
+    /// The same, with what is typed while it runs read from the source when
+    /// the command asks (`kernel_printer_read`).
+    pub fn kernel_cmd_dispatch_io(line: *const u8, len: usize, sink: CmdSink, source: CmdSource, ctx: *mut c_void);
 }

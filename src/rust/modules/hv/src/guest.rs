@@ -37,6 +37,8 @@ pub struct Spec {
     pub cpu: Option<u32>,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
+    /// `restart`, for `hv start`: boot it again when it resets itself.
+    pub restart: bool,
 }
 
 /// `\n` in a word for a newline, so that a line to type fits one word.
@@ -69,6 +71,7 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         secs: None,
         cpu: None,
         log: false,
+        restart: false,
     };
     let mut mem_mib = DEFAULT_MEM_MIB;
 
@@ -95,6 +98,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.input = unescape(v)?;
         } else if word == "log" {
             spec.log = true;
+        } else if word == "restart" {
+            spec.restart = true;
         } else if spec.kernel.is_empty() && !word.contains('=') {
             spec.kernel = String::from(word);
         } else {
@@ -349,6 +354,9 @@ impl Ring {
 
 /// The longest line of a guest's console the kernel log takes.
 const LOG_LINE: usize = 256;
+/// The longest control sequence `TermFilter` holds while it decides; a
+/// longer one is let through as it is.
+const CSI_MAX: usize = 32;
 
 /// Where a byte of a guest's console is in an escape sequence: what
 /// [`sanitize`] and [`LogLine`] leave out.
@@ -413,6 +421,142 @@ impl LogLine {
 
     pub fn clear(&mut self) {
         self.text.clear();
+    }
+}
+
+/// A guest's console on its way to a person's terminal, for `hv attach`: as
+/// it is -- colours, cursor movement, a line editor's redraws -- but for what
+/// a terminal would answer or act on. A query (a device status report,
+/// `ESC [ 6 n`; device attributes, `ESC [ c`; `ESC Z`) is taken out: the
+/// terminal's answer would be typed into the guest after the UART's own. The
+/// string sequences -- an operating-system command, `ESC ]`, and `ESC P`,
+/// `ESC _`, `ESC ^`, `ESC X` -- are taken out whole, to their end: they set a
+/// terminal's title, its clipboard, its palette, nothing a guest should reach
+/// on the person's machine. And NULs, which the kernel's printers end a
+/// string at. It keeps its place across calls: a sequence may be cut
+/// anywhere between two reads of the console.
+pub struct TermFilter {
+    state: Term,
+    csi: [u8; CSI_MAX],
+    csi_len: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Term {
+    Text,
+    /// ESC.
+    Esc,
+    /// ESC [ and what has come of it, held in `csi`.
+    Csi,
+    /// A CSI too long to hold, let through to its final byte.
+    CsiLong,
+    /// A string sequence, dropped to its BEL or ST.
+    Str,
+    /// An ESC inside one: `\` ends it.
+    StrEsc,
+}
+
+const BEL: u8 = 0x07;
+const ESC: u8 = 0x1B;
+const NUL: u8 = 0x00;
+
+impl TermFilter {
+    pub fn new() -> TermFilter {
+        TermFilter { state: Term::Text, csi: [0; CSI_MAX], csi_len: 0 }
+    }
+
+    /// `bytes`, filtered, onto `out`. Pushes at most `bytes.len() + CSI_MAX
+    /// + 2` bytes: room taken for that allocates nothing here.
+    pub fn filter(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
+        for &b in bytes {
+            self.state = match self.state {
+                Term::Text => match b {
+                    ESC => Term::Esc,
+                    NUL => Term::Text,
+                    _ => {
+                        out.push(b);
+                        Term::Text
+                    }
+                },
+                Term::Esc => match b {
+                    b'[' => {
+                        self.csi_len = 0;
+                        Term::Csi
+                    }
+                    b']' | b'P' | b'_' | b'^' | b'X' => Term::Str,
+                    /* DECID: identify yourself -- a query too */
+                    b'Z' => Term::Text,
+                    ESC => {
+                        out.push(ESC);
+                        Term::Esc
+                    }
+                    NUL => Term::Esc,
+                    _ => {
+                        out.push(ESC);
+                        out.push(b);
+                        Term::Text
+                    }
+                },
+                Term::Csi => match b {
+                    0x20..=0x3F => {
+                        if self.csi_len < CSI_MAX {
+                            self.csi[self.csi_len] = b;
+                            self.csi_len += 1;
+                            Term::Csi
+                        } else {
+                            self.flush_csi(out);
+                            out.push(b);
+                            Term::CsiLong
+                        }
+                    }
+                    /* The final byte: a query goes, anything else is let
+                     * through whole. */
+                    0x40..=0x7E => {
+                        if b != b'n' && b != b'c' {
+                            self.flush_csi(out);
+                            out.push(b);
+                        }
+                        Term::Text
+                    }
+                    /* A control byte inside it: what came so far as it was,
+                     * and the byte as text would have it. */
+                    ESC => {
+                        self.flush_csi(out);
+                        Term::Esc
+                    }
+                    _ => {
+                        self.flush_csi(out);
+                        if b != NUL {
+                            out.push(b);
+                        }
+                        Term::Text
+                    }
+                },
+                Term::CsiLong => {
+                    if b != NUL {
+                        out.push(b);
+                    }
+                    if (0x40..=0x7E).contains(&b) { Term::Text } else { Term::CsiLong }
+                }
+                Term::Str => match b {
+                    BEL => Term::Text,
+                    ESC => Term::StrEsc,
+                    _ => Term::Str,
+                },
+                Term::StrEsc => match b {
+                    b'\\' => Term::Text,
+                    ESC => Term::StrEsc,
+                    _ => Term::Str,
+                },
+            };
+        }
+    }
+
+    fn flush_csi(&mut self, out: &mut Vec<u8>) {
+        out.push(ESC);
+        out.push(b'[');
+        out.extend_from_slice(&self.csi[..self.csi_len]);
+        self.csi_len = 0;
     }
 }
 
