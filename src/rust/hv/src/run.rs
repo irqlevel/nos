@@ -28,6 +28,29 @@ use crate::vm::{Refusal, Vm};
 /// COM1, the guest's console.
 const COM1: u16 = 0x3F8;
 
+/* The two ways a PC guest resets its machine by port I/O. The 8042's
+ * command port takes 0xF0-0xFF as "pulse the output lines whose bits are
+ * clear", and line 0 is the CPU's reset: Linux writes 0xFE. The chipset's
+ * reset control register at 0xCF9 resets when bit 2 is written set -- Linux
+ * writes it with SYS_RST first and RST_CPU second. (The third way is a
+ * triple fault, `Stop::Shutdown`.) Nothing here emulates an 8042 or a
+ * chipset: a read of either port floats to all ones, as on a PC without
+ * one, and only the reset is recognised. */
+const I8042_COMMAND: u16 = 0x64;
+const I8042_PULSE: u8 = 0xF0;
+const I8042_RESET_LINE: u8 = 1 << 0;
+const RESET_CONTROL: u16 = 0xCF9;
+const RESET_CONTROL_RST_CPU: u8 = 1 << 2;
+
+/// What a `Stop::Reset`'s port is, for a person: which of the two ways it was.
+pub fn reset_source(port: u16) -> &'static str {
+    match port {
+        I8042_COMMAND => "the 8042's reset line",
+        RESET_CONTROL => "the chipset's reset control",
+        _ => "an unknown port",
+    }
+}
+
 /// RFLAGS.IF: the guest takes maskable interrupts.
 const RFLAGS_IF: u64 = 1 << 9;
 
@@ -52,6 +75,10 @@ pub enum Stop {
     Mmio { gpa: u64, rip: u64 },
     /// It triple-faulted.
     Shutdown { rip: u64 },
+    /// It asked the machine to reset: `value` written to `port`, the 8042's
+    /// command port or the chipset's reset control register. Its way to
+    /// reboot -- a `reboot`, a panic with `panic=N`.
+    Reset { port: u16, value: u8, rip: u64 },
     /// An exception the host intercepts (#DB, #AC, #MC) fired.
     Exception { vector: u8, rip: u64 },
     /// The CPU refused the VMCB, or the extension went off under it.
@@ -280,7 +307,9 @@ impl LinuxGuest {
             match exit {
                 Exit::Host => counts.host += 1,
                 Exit::Io(io) => {
-                    self.io(&io, &mut counts, host);
+                    if let Some((port, value)) = self.io(&io, &mut counts, host) {
+                        break Stop::Reset { port, value, rip };
+                    }
                 }
                 Exit::Cpuid => {
                     counts.cpuid += 1;
@@ -414,7 +443,9 @@ impl LinuxGuest {
         }
     }
 
-    fn io(&mut self, io: &crate::svm::Io, counts: &mut Counts, host: &mut dyn Host) {
+    /// Answer a port access and step past it -- or, for a write that resets
+    /// the machine, leave the guest where it is and say which it was.
+    fn io(&mut self, io: &crate::svm::Io, counts: &mut Counts, host: &mut dyn Host) -> Option<(u16, u8)> {
         if io.input && !Uart::owns(COM1, io.port) && (io.port as usize) < self.port_hist.len() {
             let slot = &mut self.port_hist[io.port as usize];
             *slot = slot.saturating_add(1);
@@ -424,7 +455,19 @@ impl LinuxGuest {
             /* No string I/O device is emulated; step past it. INS/OUTS to
              * the console is not how a kernel drives a UART. */
             v.skip_io(io);
-            return;
+            return None;
+        }
+        if !io.input && io.size == 1 {
+            let value = v.save().rax as u8;
+            let reset = match io.port {
+                I8042_COMMAND => value & I8042_PULSE == I8042_PULSE && value & I8042_RESET_LINE == 0,
+                RESET_CONTROL => value & RESET_CONTROL_RST_CPU != 0,
+                _ => false,
+            };
+            if reset {
+                counts.port_out += 1;
+                return Some((io.port, value));
+            }
         }
         if Uart::owns(COM1, io.port) && io.size == 1 {
             let offset = io.port - COM1;
@@ -474,6 +517,7 @@ impl LinuxGuest {
             counts.port_out += 1;
         }
         self.vm.vcpu_mut().skip_io(io);
+        None
     }
 
     fn msr(&mut self, write: bool, counts: &mut Counts) {

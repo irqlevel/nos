@@ -712,8 +712,21 @@ once, where the answer used to be appended to a queue without bound.
 entry, and a halted guest's task sleeps at most 10 ms at a time, so `hv stop`
 returns within a tick or so of asking: it takes the VM off the list first and
 joins its task after, with no lock held while it waits. A guest that stops by
-itself -- a triple fault, a HLT with interrupts off -- stays on the list as
-`stopped`, with its reason, until `hv stop` takes it off.
+itself -- a triple fault, a HLT with interrupts off, a reset -- stays on the
+list as `stopped`, with its reason, until `hv stop` takes it off.
+
+**A guest that reboots stops, and says so.** Linux reboots -- a `reboot`, a
+panic with `panic=N` -- by pulsing the 8042's reset line (`0xFE` to port
+`0x64`), then by the chipset's reset control (bit 2 of port `0xCF9`, where
+it knows of one), then by a triple fault. Nothing here emulates an 8042 or a
+chipset, and on the AX41 the first guest that rebooted spun at 100% of its
+CPU for as long as anyone let it -- 1.3 million reads of the 8042's status in
+48 seconds, waiting for a controller that is not there. Both writes now stop
+the VM (`Stop::Reset`), `the guest asked for a reset, 0xfe to port 0x64 (the
+8042's reset line)`; its ports still read as all ones, as on a PC without
+one, so Linux spends its `kb_wait` polling them first -- 65536 reads, a
+couple of seconds -- and then asks. What a reset should become -- the guest
+booted again -- is the control plane's to decide.
 
 **Idle guests cost their CPU next to nothing, sharing one or not.** A halted
 vCPU sleeps until its guest's next timer edge, and `Sleep()` blocks

@@ -385,8 +385,10 @@ side by side and one stopped mid-boot; `hv exec` typed at the other while it
 is still booting -- answered at the prompt printed after the line went in,
 not at the one before it -- and again at its prompt, where the echo must come
 back whole (the cursor-position answer once made BusyBox wrap it); `hv send`,
-`hv wait`, `hv console`; `hv off` refusing to turn the extension off under
-the running guest; and `rmmod hv` stopping that guest before it turns the
+`hv wait`, `hv console`; a third guest with no init and `panic=1`, which
+panics, reboots, and must stop with its reset as the reason rather than spin
+on an 8042 that is not there; `hv off` refusing to turn the extension off
+under the running guest; and `rmmod hv` stopping that guest before it turns the
 extension off, which the next load confirms and `dmesg` shows in order. Once
 the shell has the console, the kernel's own lines go to the log and not to
 it -- so the gate ends on a command's output (`version`) rather than on
