@@ -34,8 +34,9 @@ const RFLAGS_IF: u64 = 1 << 9;
 /// The longest a halted vCPU's task sleeps before it looks again, when no
 /// timer edge is due sooner: a guest whose PIT is stopped, or in a one-shot
 /// mode this does not raise IRQ0 in, still has its time budget checked. One
-/// host tick -- `task::sleep` wakes at one anyway (`Kernel::Sleep` yields
-/// until the deadline, and the CPU halts until its next interrupt).
+/// host tick -- `task::sleep` wakes at one anyway (`Kernel::Sleep` blocks
+/// until the deadline, and is woken at its CPU's next scheduling point, the
+/// tick at the latest).
 const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
 
 /// Why a Linux guest stopped.

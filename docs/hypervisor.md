@@ -494,9 +494,9 @@ And while a guest runs:
   grain. A HLT with interrupts on is stepped past, as a CPU an interrupt
   wakes resumes after it, and the vCPU is not entered again until the PIC
   has an interrupt for it; meanwhile its task sleeps to the timer's next
-  edge. `task::sleep` yields and lets the CPU halt until its next interrupt,
-  so the edge is taken at the first host tick after it: a 100 Hz guest tick
-  arrives up to 10 ms late, still a hundred a second. Measured on the Linux
+  edge. `task::sleep` blocks until then and is woken at its CPU's first
+  scheduling point after it -- the host tick, at the latest -- so a 100 Hz
+  guest tick arrives up to 10 ms late, still a hundred a second. Measured on the Linux
   guest over 120 s of the same boot and a typed `id`: 5,633,131 exits, 5.56
   million of them HLTs, became 76,334 and 11,410; the guest's timer ticks
   went from 11,973 to 11,943; the vCPU's task slept 89% of the run; and the
@@ -714,6 +714,13 @@ returns within a tick or so of asking: it takes the VM off the list first and
 joins its task after, with no lock held while it waits. A guest that stops by
 itself -- a triple fault, a HLT with interrupts off -- stays on the list as
 `stopped`, with its reason, until `hv stop` takes it off.
+
+**Idle guests cost their CPU next to nothing, sharing one or not.** A halted
+vCPU sleeps until its guest's next timer edge, and `Sleep()` blocks
+([the scheduler](scheduler.md#blocking-and-waking)): it used to be a loop
+around `Schedule()`, and two halted guests on one CPU of the AX41 handed it to
+each other without end -- 46% of it each, the idle task never running -- where
+one alone took 0.1%.
 
 **The extension is not pulled from under a guest.** `hv off` refuses while a
 started guest runs on one of the CPUs it names. That is a courtesy and not

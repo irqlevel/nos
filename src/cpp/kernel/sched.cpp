@@ -139,10 +139,26 @@ void TaskQueue::Switch(Task* next, Task* curr)
     SwitchContext(next->Rsp, &curr->Rsp, &TaskQueue::SwitchComplete, next);
 }
 
+/* Whether cand, a blocked task, is one asleep in Sleep() whose time has
+   come. The clock is read at most once a walk, and only by a walk that meets
+   such a task: *now is 0 until then. */
+static bool SleepIsOver(Task* cand, ulong* now)
+{
+    ulong until = (ulong)cand->SleepUntil.Get();
+    if (until == 0)
+        return false;
+
+    if (*now == 0)
+        *now = GetBootTime().GetValue();
+
+    return *now >= until;
+}
+
 Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle)
 {
     Task* next = nullptr;
     Task* idle = nullptr;
+    ulong now = 0;
 
     for (auto currEntry = TaskList.Flink;
         currEntry != &TaskList;
@@ -165,8 +181,10 @@ Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle)
         /* Asked to be left alone until woken. Skipped outright, and not
            kept as a fallback the way idle is: a blocked task has nothing to
            run. The flag is cleared by whoever has work for it, which is what
-           brings it back into this walk. */
-        if (cand->IsBlocked())
+           brings it back into this walk -- except for a task asleep in
+           Sleep(), which nobody wakes: this walk runs it once its time has
+           come, and it clears the flag itself. */
+        if (cand->IsBlocked() && !SleepIsOver(cand, &now))
         {
             continue;
         }
@@ -402,13 +420,50 @@ void YieldToRunnable()
     ScheduleCurrent(true);
 }
 
+/* Sleep blocks. The task is out of the scheduler's walk until its time has
+   come, and the walk on its CPU notices that and runs it: at every
+   scheduling point that CPU has -- the tick's, 100 times a second, at the
+   latest -- which is where a sleeper used to notice it for itself. It used to
+   poll, a loop around Schedule() that left it runnable: alone on its CPU it
+   let the CPU halt until the tick, but two on one CPU handed it to each other
+   without end and the idle task never ran. Two idle hypervisor guests, each
+   vCPU asleep until its guest's next timer edge, kept a CPU of the AX41 busy
+   that way between them, 46% each. The wakeups come where they came before;
+   only the spinning between them is gone.
+
+   Where a task cannot block -- before preemption is on, off a task's stack,
+   in a CPU's idle task (which must stay runnable, see Event::Wait), with
+   preemption disabled -- it polls as it always did. */
 void Sleep(ulong nanoSecs)
 {
-    auto expired = GetBootTime() + nanoSecs;
+    ulong start = GetBootTime().GetValue();
+    ulong until = (nanoSecs > ~0UL - start) ? ~0UL : start + nanoSecs;
 
-    while (GetBootTime() < expired)
+    Task* self = PreemptIsOn() ? Task::TryGetCurrentTask() : nullptr;
+    bool block = (self != nullptr && !self->IsIdle() &&
+                  self->PreemptDisableCounter.Get() == 0);
+
+    while (GetBootTime().GetValue() < until)
     {
+        if (!block)
+        {
+            Schedule();
+            continue;
+        }
+
+        /* Interrupts off from the moment the task is marked until it is
+           unmarked, as in Event::Wait: a tick landing in between would
+           switch it out as a sleeper -- harmless, it is one -- but then
+           return it here to go through the Schedule() below a second time.
+           The task comes back from Schedule() with interrupts still off,
+           which the switch saves and restores per task. */
+        ulong flags = Hal::IrqSave();
+        self->SleepUntil.Set((long)until);
+        self->Block();
         Schedule();
+        self->Unblock();
+        self->SleepUntil.Set(0);
+        Hal::IrqRestore(flags);
     }
 }
 
