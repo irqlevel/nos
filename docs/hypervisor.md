@@ -733,7 +733,9 @@ vCPU sleeps until its guest's next timer edge, and `Sleep()` blocks
 ([the scheduler](scheduler.md#blocking-and-waking)): it used to be a loop
 around `Schedule()`, and two halted guests on one CPU of the AX41 handed it to
 each other without end -- 46% of it each, the idle task never running -- where
-one alone took 0.1%.
+one alone took 0.1%. Blocking, the same two take 0.1% each, and sixteen idle
+guests on the AX41's twelve CPUs -- four of them carrying two -- keep the
+machine 1.6% busy, 0.1% a vCPU.
 
 **The extension is not pulled from under a guest.** `hv off` refuses while a
 started guest runs on one of the CPUs it names. That is a courtesy and not
