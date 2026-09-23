@@ -242,6 +242,11 @@ impl Pit {
         }
     }
 
+    /// Channel 0's mode, reload and running flag, for a diagnostic.
+    pub fn ch0_state(&self) -> (u8, u16, bool) {
+        (self.ch[0].mode, self.ch[0].reload, self.ch[0].running)
+    }
+
     fn control(&mut self, value: u8) {
         let index = (value >> 6) as usize;
         if index == 3 {

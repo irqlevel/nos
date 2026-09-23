@@ -88,9 +88,16 @@ pub struct Uart {
     /// A byte waiting to be read back, if the last thing written went round
     /// the loopback.
     loopback: Option<u8>,
-    /// A byte waiting for the guest to read (receive path); none yet, since
-    /// nothing types at the guest.
+    /// A byte waiting for the guest to read (receive path).
     rx: Option<u8>,
+    /// How much of an ANSI escape query the guest has written so far, and
+    /// the answer to feed back once one completes.
+    esc: u8,
+    reply: alloc::collections::VecDeque<u8>,
+    /// Set once the guest has sent its first cursor-position query, which a
+    /// shell does when it is at a prompt ready to read: until then, typed
+    /// input would be swallowed by the boot, so it is held back.
+    prompt_seen: bool,
 }
 
 impl Uart {
@@ -107,6 +114,9 @@ impl Uart {
             written: 0,
             loopback: None,
             rx: None,
+            esc: 0,
+            reply: alloc::collections::VecDeque::new(),
+            prompt_seen: false,
         }
     }
 
@@ -196,6 +206,7 @@ impl Uart {
                 } else {
                     self.truncated = true;
                 }
+                self.match_query(value);
                 return Some(value);
             }
             IER_DLM if self.dlab() => self.dlm = value,
@@ -218,12 +229,72 @@ impl Uart {
         (self.ier & IER_THRE != 0) || (self.ier & IER_RX != 0 && self.rx.is_some())
     }
 
+    /// Whether a query reply is waiting to be fed to the guest.
+    pub fn reply_pending(&self) -> bool {
+        !self.reply.is_empty()
+    }
+
+    /// Whether the guest has reached a shell prompt (asked where the cursor
+    /// is): only then is typed input handed over, so the boot does not eat it.
+    pub fn prompt_seen(&self) -> bool {
+        self.prompt_seen
+    }
+
+    /// A terminal like busybox's line editor asks where the cursor is by
+    /// writing the escape sequence ESC [ 6 n and waiting for the answer
+    /// before it will take a command. Nothing here is a terminal, so the
+    /// answer is canned -- a fixed row and column -- and queued for the guest
+    /// to read; without it the shell swallows what is typed as the reply it
+    /// was waiting for. Only this one query is answered, which is the only
+    /// one a shell sends.
+    fn match_query(&mut self, byte: u8) {
+        const ESC: u8 = 0x1B;
+        self.esc = match (self.esc, byte) {
+            (0, ESC) => 1,
+            (1, b'[') => 2,
+            (2, b'6') => 3,
+            (3, b'n') => {
+                for &b in b"\x1b[24;80R" {
+                    self.reply.push_back(b);
+                }
+                self.prompt_seen = true;
+                0
+            }
+            _ => 0,
+        };
+    }
+
+    /// The next byte of a queued reply to an ANSI query, if any: fed to the
+    /// guest ahead of anything typed, so the shell gets the answer it waits
+    /// for before the command.
+    pub fn take_reply(&mut self) -> Option<u8> {
+        self.reply.pop_front()
+    }
+
+    /// Whether the receive register is free to take another byte.
+    pub fn rx_empty(&self) -> bool {
+        self.rx.is_none()
+    }
+
+    /// Hand the guest a byte on the receive path (as if typed at the
+    /// console): it reads it from the data register, and while its receive
+    /// interrupt is enabled the UART asserts IRQ4 until it does.
+    pub fn set_rx(&mut self, byte: u8) {
+        self.rx = Some(byte);
+    }
+
     pub fn output(&self) -> &str {
         &self.output
     }
 
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// The interrupt-enable register, for a diagnostic on whether the guest
+    /// turned the receive interrupt on.
+    pub fn ier(&self) -> u8 {
+        self.ier
     }
 
     pub fn truncated(&self) -> bool {

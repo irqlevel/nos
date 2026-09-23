@@ -58,6 +58,10 @@ pub struct Counts {
     pub mmio: u64,
     pub host: u64,
     pub irq: u64,
+    pub irq0: u64,
+    pub irq4: u64,
+    pub edges0: u64,
+    pub blocked: u64,
     pub hlt: u64,
     pub exits: u64,
 }
@@ -69,6 +73,9 @@ pub struct LinuxGuest {
     pit: Pit,
     rtc: Rtc,
     pic: Pic,
+    /// Bytes to hand the guest's console once it is idle, and how far in.
+    input: alloc::vec::Vec<u8>,
+    input_pos: usize,
     /// A tally of reads of the low ports, to find a guest spinning on one.
     port_hist: alloc::boxed::Box<[u32; 1024]>,
 }
@@ -83,11 +90,28 @@ impl LinuxGuest {
         vm.memory_mut().add(0, mem_bytes)?;
         let port_hist = alloc::vec![0u32; 1024].into_boxed_slice().try_into()
             .map_err(|_| Error::NoMemory)?;
-        Ok(Self { vm, uart: Uart::new(), pit: Pit::new(), rtc: Rtc::new(), pic: Pic::new(), port_hist })
+        Ok(Self {
+            vm,
+            uart: Uart::new(),
+            pit: Pit::new(),
+            rtc: Rtc::new(),
+            pic: Pic::new(),
+            input: alloc::vec::Vec::new(),
+            input_pos: 0,
+            port_hist,
+        })
     }
 
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
         self.vm.memory_mut()
+    }
+
+    /// Type `bytes` at the guest's console once it is up: fed one at a time,
+    /// as the shell reads each, so a whole line reaches a prompt in order.
+    pub fn set_input(&mut self, bytes: &[u8]) {
+        self.input.clear();
+        self.input.extend_from_slice(bytes);
+        self.input_pos = 0;
     }
 
     /// Write the guest's furniture -- the zero page, the command line, the
@@ -102,6 +126,22 @@ impl LinuxGuest {
 
     pub fn output(&self) -> &str {
         self.uart.output()
+    }
+
+    /// How much of the typed input the guest has taken, and how much there
+    /// was: for a report on whether the shell read it.
+    pub fn input_progress(&self) -> (usize, usize) {
+        (self.input_pos, self.input.len())
+    }
+
+    pub fn uart_ier(&self) -> u8 {
+        self.uart.ier()
+    }
+
+    /// The interrupt state at the end, for a diagnostic: the master PIC's
+    /// (IRR, ISR, IMR) and the PIT channel 0's (mode, reload, running).
+    pub fn irq_debug(&self) -> ((u8, u8, u8), (u8, u16, bool)) {
+        (self.pic.master_state(), self.pit.ch0_state())
     }
 
     /// The busiest few low ports the guest read, for diagnosing a spin:
@@ -136,6 +176,7 @@ impl LinuxGuest {
              * one and ask to be told when it can when it cannot. */
             if self.pit.ch0_fire() {
                 self.pic.raise(0);
+                counts.edges0 += 1;
             }
             /* COM1's transmitter is always ready, so with its THR-empty
              * interrupt enabled it asserts IRQ4 -- which is how the serial
@@ -182,6 +223,23 @@ impl LinuxGuest {
                         break Stop::Halted { rip };
                     }
                     counts.hlt += 1;
+                    /* The HLT is the instruction after the idle loop's STI,
+                     * so it sits in that STI's interrupt shadow -- but it is
+                     * waiting for the very interrupt the shadow would block.
+                     * Clear it, so the next timer tick can wake the guest. */
+                    self.vm.vcpu_mut().clear_interrupt_shadow();
+                    /* Idle: the boot has quiesced. Feed the guest's receive
+                     * register when it is free -- first any answer it is
+                     * waiting for to a terminal query, then what was typed. */
+                    if self.uart.rx_empty() {
+                        if let Some(byte) = self.uart.take_reply() {
+                            self.uart.set_rx(byte);
+                        } else if self.uart.prompt_seen() && self.input_pos < self.input.len() {
+                            let byte = self.input[self.input_pos];
+                            self.input_pos += 1;
+                            self.uart.set_rx(byte);
+                        }
+                    }
                 }
                 Exit::NestedFault { gpa, .. } => {
                     counts.mmio += 1;
@@ -219,7 +277,10 @@ impl LinuxGuest {
                     self.pic.acknowledge(irq);
                     self.vm.vcpu_mut().clear_irq_window();
                     counts.irq += 1;
+                    if irq == 0 { counts.irq0 += 1; }
+                    if irq == 4 { counts.irq4 += 1; }
                 } else {
+                    counts.blocked += 1;
                     self.vm.vcpu_mut().request_irq_window();
                 }
             }

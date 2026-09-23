@@ -211,6 +211,12 @@ impl Pic {
         }
     }
 
+    /// The master chip's request, in-service and mask registers, for a
+    /// diagnostic on stuck interrupt delivery.
+    pub fn master_state(&self) -> (u8, u8, u8) {
+        (self.master.irr, self.master.isr, self.master.imr)
+    }
+
     pub fn write(&mut self, port: u16, value: u8) {
         match port {
             MASTER_CMD => self.master.command(value),

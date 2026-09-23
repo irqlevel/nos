@@ -342,6 +342,15 @@ impl Vcpu {
         self.skip(LEN_VMMCALL);
     }
 
+    /// Clear the interrupt shadow the guest may be under -- the one
+    /// instruction after a STI or MOV SS, during which an interrupt cannot be
+    /// taken. On a HLT that instruction is the HLT itself, and it is waiting
+    /// for the interrupt that shadow would block: clearing it is what lets
+    /// the timer wake an idle `STI; HLT` guest.
+    pub fn clear_interrupt_shadow(&mut self) {
+        self.guest.vmcb_mut().control.int_state &= !vmcb::int_state::SHADOW;
+    }
+
     /// Whether the guest can take a maskable interrupt right now: its
     /// RFLAGS.IF is set, it is not in the shadow of a STI or MOV SS, and no
     /// event is already queued for injection.
