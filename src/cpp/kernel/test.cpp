@@ -2816,6 +2816,82 @@ static bool TestEvent()
     return ok;
 }
 
+/* Two tasks asleep on one CPU cost it next to nothing. Sleep() used to poll
+   -- a loop around Schedule() that left the task runnable -- so two sleepers
+   on one CPU handed it to each other without end, each running about half
+   the time it slept, and the idle task never ran: two idle hypervisor
+   guests, their vCPUs asleep until the next timer edge, kept a CPU of the
+   AX41 busy that way. A blocked sleeper runs only to find that its time has
+   come. Both on this CPU, each asleep SleepTestRounds times; what the two
+   ran between them must be a small part of what they slept -- well under a
+   poller's half, far over a blocked one's microseconds. */
+static const ulong SleepTestRounds = 5;
+static const ulong SleepTestNs = 20 * Const::NanoSecsInMs;
+static const ulong SleepTestMaxRunPercent = 10;
+static const ulong SleepTestPercent = 100;
+
+static void SleepTestTask(void* ctx)
+{
+    (void)ctx;
+    for (ulong i = 0; i < SleepTestRounds; i++)
+        Sleep(SleepTestNs);
+}
+
+static bool TestSleepBlocks()
+{
+    Task* task[2] = { Mm::TAlloc<Task, Tag>("sleep0"), Mm::TAlloc<Task, Tag>("sleep1") };
+    bool ok = (task[0] != nullptr && task[1] != nullptr);
+
+    if (ok)
+    {
+        ulong self = 1UL << CpuTable::GetInstance().GetCurrentCpuId();
+        task[0]->SetCpuAffinity(self);
+        task[1]->SetCpuAffinity(self);
+    }
+
+    bool started[2] = { false, false };
+    for (ulong i = 0; ok && i < Stdlib::ArraySize(task); i++)
+    {
+        started[i] = task[i]->Start(SleepTestTask, nullptr);
+        ok = started[i];
+    }
+
+    ulong runNs = 0;
+    for (ulong i = 0; i < Stdlib::ArraySize(task); i++)
+    {
+        if (!started[i])
+            continue;
+
+        task[i]->Wait();
+        /* Under the task's lock, which every UpdateRuntime() is made under:
+           the exited task may still be in its last switch on its CPU. */
+        Stdlib::AutoLock lock(task[i]->Lock);
+        runNs += task[i]->Runtime.GetValue();
+    }
+
+    for (ulong i = 0; i < Stdlib::ArraySize(task); i++)
+    {
+        if (task[i] != nullptr)
+            task[i]->Put();
+    }
+
+    if (!ok)
+    {
+        Trace(0, "TestSleepBlocks: no tasks for the test");
+        return false;
+    }
+
+    ulong sleptNs = Stdlib::ArraySize(task) * SleepTestRounds * SleepTestNs;
+    if (runNs * SleepTestPercent > sleptNs * SleepTestMaxRunPercent)
+    {
+        Trace(0, "TestSleepBlocks: two sleepers on one CPU ran %u us of the %u us they slept",
+            runNs / Const::NanoSecsInUsec, sleptNs / Const::NanoSecsInUsec);
+        return false;
+    }
+
+    return true;
+}
+
 /* A reschedule that finds preemption off is deferred, not dropped: made by
    the unlock that brings the count back to zero. Preempt() under a spinlock
    stands in for the IPI that used to be lost that way -- refused, it leaves
@@ -2857,6 +2933,9 @@ bool TestMultiTasking()
         return false;
 
     if (!TestEvent())
+        return false;
+
+    if (!TestSleepBlocks())
         return false;
 
     Task *task[2] = {0};

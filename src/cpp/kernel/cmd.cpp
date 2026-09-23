@@ -1830,10 +1830,11 @@ void Cmd::RunBootScript()
 
 /* The flags below are polled by the BSP's idle task, between halts. The
    scheduler runs an idle task only when nothing else on its queue can run
-   -- and a task that sleeps yields rather than blocks, so on a CPU carrying
-   the shell, DHCP and USB poll tasks that is never: the request would sit
-   unseen for good. Let that task take its turn as an ordinary one from
-   here on; it has nothing left to do but notice. */
+   -- and on a CPU carrying the shell, DHCP and USB poll tasks that could be
+   never (a task that slept used to yield rather than block, and one that
+   polls still does): the request would sit unseen for good. Let that task
+   take its turn as an ordinary one from here on; it has nothing left to do
+   but notice. */
 static void WakeShutdownWatch()
 {
     auto& cpus = CpuTable::GetInstance();

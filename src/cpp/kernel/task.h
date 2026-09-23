@@ -150,6 +150,11 @@ public:
 
     Atomic State;
     Atomic Flags;
+    /* The boot time, in nanoseconds, at which a task blocked in Sleep() is
+       to run again: the scheduler's walk on its CPU notices that the time
+       has come (TaskQueue::SelectNext) -- the tick's walk at the latest --
+       and runs it, and the task unblocks itself. 0 while it is not asleep. */
+    Atomic SleepUntil;
 
     Stdlib::Time RunStartTime;
     Stdlib::Time Runtime;

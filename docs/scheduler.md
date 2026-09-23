@@ -172,11 +172,23 @@ until its next tick or IPI. Made instead of dropped, they took the AX41's
 receive path from 397 silences in 5 seconds to none (see
 [netblk](netblk.md#the-receive-path-lost-ticks-too) for the rest).
 
-`Sleep(ns)` is worth knowing about: it *spins* on `GetBootTime()` calling
-`Schedule()`, it does not block. It yields the CPU but keeps the task
-runnable, so a task sleeping in a loop is still on the queue and still gets
-turns. Code that wants to be out of the way until woken uses
-`Block()`/`Unblock()` instead.
+`Sleep(ns)` blocks. The task sets its deadline (`Task::SleepUntil`) and
+`Block()`s, interrupts off as below, and nobody wakes it: the scheduler's walk
+on its CPU (`SelectNext`) treats a blocked task whose deadline has passed as
+runnable, and the task clears the flag itself once it runs. The walk runs at
+every scheduling point the CPU has -- the tick, 100 times a second, at the
+latest -- so a sleep ends at the first of them after its deadline, which is
+where it ended before, when `Sleep` was a loop around `Schedule()` that
+checked the clock each time it got the CPU back. That loop kept the task
+runnable: alone on its CPU it let the idle task halt it until the tick, but
+two sleepers on one CPU handed it to each other without end and the idle task
+never ran. Two idle hypervisor guests on one CPU of the AX41, each vCPU asleep
+until its guest's next timer edge, kept that CPU busy between them, 46% each;
+a `usb` poll task and an ssh session's `top` did the same. The self-test
+`TestSleepBlocks` puts two sleepers on one CPU at every boot and fails it if
+they run more than a tenth of what they sleep -- a poller runs close to half.
+Where a task cannot block -- before preemption is on, off a task's stack, in
+a CPU's idle task, with preemption disabled -- `Sleep` still polls.
 
 ## Blocking and waking
 
@@ -213,9 +225,9 @@ or poll with `YieldToRunnable()`, which gives the CPU to another runnable task
 and never to the idle task, returning at once when there is none. A plain spin
 is no better than the yield: it keeps whatever else is runnable on the CPU off
 it until the tick -- a softirq task the tick preempted mid-handler included,
-with its type's work held up on every CPU meanwhile. `WaitGroup::Wait` and
-`Sleep()` still wait by yielding, which is why a synchronous NVMe read on
-arm64 under TCG takes a tick (`blkload nvme0 randread qd=1`, 10 ms).
+with its type's work held up on every CPU meanwhile. `Sleep()` is not for
+waiting on work either: it ends at a scheduling point after its deadline, so
+on a CPU with nothing else to do a sleep shorter than a tick costs a tick.
 
 `SoftIrq::Run` is the worked example, and it also shows the one case where
 "the task is already running" is true and useless: between `Block()` and the
@@ -292,9 +304,9 @@ from the shell.
 Because the idle task is now the scheduler's last resort rather than an
 equal, a CPU with something always runnable may not reach `ReapExited` for a
 while — which is why the softirq task calls it too. The same starvation
-used to swallow `poweroff` and `reboot` outright: `Sleep()` yields rather
-than blocks, so a CPU carrying the shell, DHCP and USB poll tasks never ran
-its idle task again, and the request sat unseen (on a two-CPU QEMU, every
+used to swallow `poweroff` and `reboot` outright: `Sleep()` yielded rather
+than blocked then, so a CPU carrying the shell, DHCP and USB poll tasks never
+ran its idle task again, and the request sat unseen (on a two-CPU QEMU, every
 time). `Cmd::RequestShutdown()`/`RequestReboot()` now clear the BSP idle
 task's `FlagIdleBit`, making it an ordinary task for what remains of its
 life: it takes its turn, sees the flag, unmounts the filesystems while the
