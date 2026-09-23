@@ -242,8 +242,12 @@ visible sub-demos above.
 
 ## Exit criteria
 
-- Trivial guest runs under VMXON/vmrun and exits as expected.
-- A long-mode guest runs under EPT/NPT.
-- `bzImage` reaches its early console.
-- Full boot to an interactive shell over the emulated UART, with initramfs, on
-  one vCPU.
+All met, under AMD-V (SVM); the VMX backend and the arm64 EL2 backend remain.
+
+- ~~Trivial guest runs under VMXON/vmrun and exits as expected~~ — `hv run`.
+- ~~A long-mode guest runs under EPT/NPT~~ — NPT, `hv run hypercall`.
+- ~~`bzImage` reaches its early console~~ — `hv boot`.
+- ~~Full boot to an interactive shell over the emulated UART, with initramfs,
+  on one vCPU~~ — a BusyBox shell that runs a command typed at it
+  (`hv boot ... input='id\n'` → `uid=0 gid=0`). Gate:
+  `scripts/hv-linux-test.py`.
