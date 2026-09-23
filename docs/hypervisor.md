@@ -405,7 +405,9 @@ memory behind it -- and 1 GiB to guest physical 4 GiB:
 |---|---|---|
 | `exits` | reads and writes the debug port 0xE9, asks CPUID a leaf only this hypervisor answers, writes what it got to its memory | port I/O both ways; CPUID answered by the host; the answers read back out of guest memory |
 | `hypercall` | writes through its own page table to guest physical 4 GiB, puts a value of its own in every register, makes a hypercall, writes every register the host answered to its memory | long mode under nested paging, above 4 GiB; the run stub's register save and restore, all 15 registers both ways |
+| `uart` | brings up an 8250 the way a driver does -- divisor behind DLAB, 8N1, FIFO, a scratch-register presence test -- and sends a line polled out of LSR.THRE | the emulated serial port, over port I/O alone |
 | `fault` | writes to 0x1FF000, which its page table maps and the nested one does not | stopped at the nested table, at that address and that instruction: a guest reaches nothing it was not given |
+| `absent` | reads AMD's FCH reset-status register at 0xFED803C0 twice, then writes to it | a read of a device the platform does not have finds all ones -- what Linux on a Zen CPU reads there -- through one read-only page; the write stops the guest |
 | `triple` | `int3` with no IDT | a triple fault stops the guest, not the CPU |
 | `refused` | starts with CR0.NW set and CD clear | a VMCB that breaks a rule is refused before the CPU sees it, the rule named |
 | `spin` | `cli; jmp $` | the host's interrupts still get through -- about a hundred a second -- and the host stops it when its 300 ms are up |
@@ -426,7 +428,7 @@ hv: guest spin -- cli; jmp $ -- for as long as the host lets it
   stopped    by the host, after 300 ms
   checked    the host's interrupts got through 31 times with the guest's off, and the host stopped it
 hv: guest spin ok
-hv: 6 of 6 guests ok
+hv: 8 of 8 guests ok
 ```
 
 A guest bound to a CPU the extension is not on for is not run, and says
@@ -620,6 +622,49 @@ is megabytes and CI cannot build one in its time), pointed at a kernel by
 hand; with `--initrd` it checks the guest reaches its `init` and a shell, and
 `--input 'id\n' --expect uid=0` checks it runs the command.
 
+## On real hardware
+
+The AX41 (a Ryzen 5 3600, Zen 2) has the whole of AMD-V -- 32768 ASIDs,
+next-RIP save, decode assists, flush by ASID, VMCB clean bits, AVIC -- and
+checks a VMCB as QEMU does not. There every built-in guest passes on the
+first CPU and the last, the extension turns on and off for all twelve, and
+the Linux guest boots to its shell and runs a typed `id`, at native speed:
+`Run /init as init process` 18 ms into the guest's clock, against half a
+second under TCG. The PIT calibrates the guest's TSC (3599.5 MHz), the guest
+takes the TSC as its clocksource, its timer delivers a hundred ticks a
+second, and idle at its prompt the vCPU's task sleeps 99% of the time.
+
+The first run there stopped twice where TCG had never gone, which is what a
+run on the real thing is for:
+
+- **CPUID leaf 0x80000001 went through whole but for SVM**, and a Zen 2 has
+  MWAITX in it. The guest's `udelay` became `monitorx`, whose intercept had
+  no answer. The leaf is an allowlist now, as leaf 1 is, and an intercepted
+  instruction CPUID did not offer is answered with the #UD a CPU without it
+  gives.
+- **Linux on a Zen CPU reads AMD's FCH at a fixed address** -- the
+  reset-status register, 0xFED803C0 -- whether or not there is one, and takes
+  all ones for "no such device". A read of the platform's MMIO window that
+  nothing answers is now answered with a read-only page of all ones; the
+  `absent` built-in guest keeps that under TCG, which is no Zen and would
+  never read it.
+
+How to repeat it -- the kernel, the modules and the guest on the machine's
+`nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
+in [Real hardware](real-hardware.md) for the machine and in the gate's own
+header for the guest; the session's recipe is short:
+
+```sh
+# on the AX41, in Ubuntu: build, and put the modules and the guest beside the kernel
+make nocheck && cp out/x86_64/modules/*.ko /nosenv/ && mkdir -p /nosenv/hvguest
+# bzImage and initrd into /nosenv/hvguest/, then one boot of nos
+nosboot -n && reboot
+# from outside, once nos is up
+ssh root@<box> 'insmod /hv.ko' ; ssh root@<box> 'hv on'
+ssh root@<box> 'hv boot /hvguest/bzImage initrd=/hvguest/initrd secs=20 input=id\n cmdline=console=ttyS0 nolapic rdinit=/init'
+ssh root@<box> reboot     # the one-shot is spent: back to Ubuntu
+```
+
 ## What comes next
 
 From [`plans/03-hypervisor.md`](../plans/03-hypervisor.md), in order, each a
@@ -635,11 +680,11 @@ thing that can be shown in half a minute:
    vCPU~~ -- with an initramfs, a BusyBox shell.
 
 All four demos are done, and a guest runs a command typed at its console
-(`hv boot ... input='id\n'` → `uid=0 gid=0`). What is left, not in step
-order: the TLB flushed per address space rather than whole; the VMX backend
-with `CR0.NE` on every CPU; and the guests run on the AX41's real AMD-V,
-which checks the VMCB harder than QEMU does. Beyond stage 3: a local APIC and
-an SMP guest, host-side virtio, and the control plane (stage 4).
+(`hv boot ... input='id\n'` → `uid=0 gid=0`) -- under TCG and on the AX41's
+real AMD-V ([On real hardware](#on-real-hardware)). What is left, not in
+step order: the TLB flushed per address space rather than whole; the VMX
+backend with `CR0.NE` on every CPU. Beyond stage 3: a local APIC and an SMP
+guest, host-side virtio, and the control plane (stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every

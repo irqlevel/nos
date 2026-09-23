@@ -96,6 +96,7 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -372,11 +373,11 @@ scripts/hv-linux-test.py --bzimage /path/to/bzImage
 Under AMD-V, which on a machine with no hardware SVM is QEMU's TCG, itself
 under nothing faster -- so the guest's decompressor and early boot are twice
 emulated and slow, and the whole run is a couple of minutes (`--secs` sets
-the guest's budget, `--deadline` the gate's patience). It has been shown to
-reach the kernel banner, the command line it was given, NX being turned on,
-and the early memory map, on the tinyconfig guest of Linux 6.18. What it does
-*not* yet reach is a shell: that wants a local APIC and a timer, which come
-next.
+the guest's budget, `--deadline` the gate's patience). With `--initrd` it
+checks the guest reaches its `init` and a BusyBox shell, and with `--input
+'id\n' --expect uid=0` that the shell runs a command typed at it. The same
+guest has been run by hand on the AX41's real AMD-V, where it found what TCG
+cannot ([the hypervisor page](hypervisor.md#on-real-hardware)).
 
 ## The hardware NIC drivers
 
