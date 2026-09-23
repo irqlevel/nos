@@ -451,8 +451,9 @@ kernel but the exported functions.
 `hv` (`src/rust/modules/hv`) is the [hypervisor](hypervisor.md), the
 beginning of [stage 3](../plans/03-hypervisor.md). It is two crates --
 `hvarch`, the CPU's virtualization extension and all of the hypervisor's
-`unsafe`, and `hv`, everything above it, which has two sites -- plus this
-module, which is their lifetime and their shell command. Neither crate is a
+`unsafe`, and `hv`, everything above it, which has three sites -- plus this
+module, which is their lifetime, their shell command and the guests it
+starts. Neither crate is a
 default member of the workspace, so a kernel built without the module has no
 hypervisor in it at all.
 
@@ -466,6 +467,17 @@ own `Drop` -- after the command is unregistered, so nothing can ask it
 anything -- reads back what every CPU has, and says so if anything is left.
 `scripts/hv-test.py` is that round trip: load, turn on, unload without
 turning off, load again and ask the CPUs.
+
+Before any of that, its guests stop. A guest `hv start`ed runs on a vCPU task
+of its own until it is stopped, and an `hv boot` may be minutes into its
+time; the `Drop` stops both first -- which is also what lets an `hv exec` or
+`hv wait` still waiting on one return, since the command's unregistration
+waits for every call still running -- then unregisters the command, and only
+then turns the extension off. An `hv start` still reading its files when the
+unload begins finds the module going when it comes to add its guest, and
+stops that guest itself before it returns. `scripts/hv-linux-test.py` unloads with a
+guest running and checks the order in the log
+([Guests that stay up](hypervisor.md#guests-that-stay-up)).
 
 The rest of it is what a module does with CPUs. A page per CPU (`CpuPage`)
 is allocated in task context, because the IPI handler that hands it to the

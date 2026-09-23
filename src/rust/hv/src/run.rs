@@ -59,6 +59,8 @@ pub enum Stop {
     Invalid,
     /// Its time ran out.
     Budget,
+    /// Whoever runs it asked it to stop (`Host::stop_requested`).
+    Requested,
     /// An exit with no handler here.
     Unexpected { exit: Exit, rip: u64 },
 }
@@ -93,6 +95,28 @@ pub struct Counts {
 
 /// The most MSR accesses answered with #GP kept for a report.
 const MSR_FAULTS_KEPT: usize = 8;
+/// How many exits go by between reports of progress while the guest does
+/// not halt: a busy VM's counters are still seen moving.
+const PROGRESS_EVERY: u64 = 4096;
+
+/// What runs a guest gives the loop: where the guest's console goes, what is
+/// typed at it, and whether to stop. The loop calls it between entries, in
+/// task context -- never with the guest running, never with interrupts off.
+pub trait Host {
+    /// A byte the guest wrote to its serial console.
+    fn output(&mut self, byte: u8);
+    /// The next byte typed at the guest's console, if there is one. Asked
+    /// only once the guest is at a prompt (it has asked where its cursor is),
+    /// and only when the serial port's receive register is free.
+    fn input(&mut self) -> Option<u8>;
+    /// Whether the guest is to be stopped: asked before every entry, and at
+    /// least every host tick while the guest is halted.
+    fn stop_requested(&mut self) -> bool;
+    /// What the loop has counted so far: when the vCPU halts, every
+    /// `PROGRESS_EVERY` exits, and once more at the end. For a VM that runs
+    /// until it is stopped, how anyone else sees it doing.
+    fn progress(&mut self, _counts: &Counts) {}
+}
 
 /// A Linux guest: its memory, its one vCPU, and its console.
 pub struct LinuxGuest {
@@ -101,9 +125,6 @@ pub struct LinuxGuest {
     pit: Pit,
     rtc: Rtc,
     pic: Pic,
-    /// Bytes to hand the guest's console once it is idle, and how far in.
-    input: alloc::vec::Vec<u8>,
-    input_pos: usize,
     /// A tally of reads of the low ports, to find a guest spinning on one.
     port_hist: alloc::boxed::Box<[u32; 1024]>,
     /// The first MSR accesses the policy refused with #GP: (MSR, value
@@ -132,8 +153,6 @@ impl LinuxGuest {
             pit: Pit::new(),
             rtc: Rtc::new(),
             pic: Pic::new(),
-            input: alloc::vec::Vec::new(),
-            input_pos: 0,
             port_hist,
             msr_faults,
         })
@@ -141,14 +160,6 @@ impl LinuxGuest {
 
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
         self.vm.memory_mut()
-    }
-
-    /// Type `bytes` at the guest's console once it is up: fed one at a time,
-    /// as the shell reads each, so a whole line reaches a prompt in order.
-    pub fn set_input(&mut self, bytes: &[u8]) {
-        self.input.clear();
-        self.input.extend_from_slice(bytes);
-        self.input_pos = 0;
     }
 
     /// Write the guest's furniture -- the zero page, the command line, the
@@ -159,16 +170,6 @@ impl LinuxGuest {
         linux::build(self.vm.memory_mut(), header, first, &layout, cmdline)?;
         linux::set_entry(self.vm.vcpu_mut(), &layout);
         Ok(())
-    }
-
-    pub fn output(&self) -> &str {
-        self.uart.output()
-    }
-
-    /// How much of the typed input the guest has taken, and how much there
-    /// was: for a report on whether the shell read it.
-    pub fn input_progress(&self) -> (usize, usize) {
-        (self.input_pos, self.input.len())
     }
 
     pub fn uart_ier(&self) -> u8 {
@@ -201,15 +202,11 @@ impl LinuxGuest {
         v
     }
 
-    /// Run the guest on the CPU this is called on until it stops, for at
-    /// most `budget_ns`, handing every console byte to `on_byte` as it is
-    /// written. Returns why it stopped and what it did.
-    pub fn run(
-        &mut self,
-        machine: &Machine,
-        budget_ns: u64,
-        mut on_byte: impl FnMut(u8),
-    ) -> (Stop, Counts) {
+    /// Run the guest on the CPU this is called on until it stops -- for good,
+    /// on `host`'s request, or at the end of `budget_ns` (`u64::MAX` for no
+    /// end) -- its console going to and coming from `host`. Returns why it
+    /// stopped and what it did.
+    pub fn run(&mut self, machine: &Machine, budget_ns: u64, host: &mut dyn Host) -> (Stop, Counts) {
         let mut counts = Counts::default();
         let start = time::boot_time_ns();
         let deadline = start.saturating_add(budget_ns);
@@ -222,13 +219,16 @@ impl LinuxGuest {
             if now >= deadline {
                 break Stop::Budget;
             }
+            if host.stop_requested() {
+                break Stop::Requested;
+            }
 
             /* Feed the console's receive register whenever it is free, on
              * every iteration and not only at an idle HLT: while a shell's
              * line editor reads the answer to its cursor query it spins
              * polling the port rather than halting, so a byte offered only at
              * HLT would never arrive and the editor would time out. */
-            self.feed_console();
+            self.feed_console(host);
 
             /* The timer: a channel-0 period elapsed is an IRQ0 edge. Then,
              * if any interrupt is pending, inject it when the guest can take
@@ -271,12 +271,15 @@ impl LinuxGuest {
                 Err(refusal) => break Stop::Refused(refusal),
             };
             counts.exits += 1;
+            if counts.exits % PROGRESS_EVERY == 0 {
+                host.progress(&counts);
+            }
             let rip = self.vm.vcpu().save().rip;
 
             match exit {
                 Exit::Host => counts.host += 1,
                 Exit::Io(io) => {
-                    self.io(&io, &mut counts, &mut on_byte);
+                    self.io(&io, &mut counts, host);
                 }
                 Exit::Cpuid => {
                     counts.cpuid += 1;
@@ -310,6 +313,7 @@ impl LinuxGuest {
                      * which covers the HLT and would hold the wake-up off. */
                     self.vm.vcpu_mut().skip_hlt();
                     halted = true;
+                    host.progress(&counts);
                 }
                 Exit::NestedFault { gpa, error } => {
                     /* A read of the platform's MMIO window that nothing
@@ -358,6 +362,7 @@ impl LinuxGuest {
             }
         };
 
+        host.progress(&counts);
         (stop, counts)
     }
 
@@ -374,16 +379,16 @@ impl LinuxGuest {
     /// position a shell's line editor asks for before it reads), then a byte
     /// of what was typed -- held back until the guest has reached a prompt,
     /// so the boot does not swallow it.
-    fn feed_console(&mut self) {
+    fn feed_console(&mut self, host: &mut dyn Host) {
         if !self.uart.rx_empty() {
             return;
         }
         if let Some(byte) = self.uart.take_reply() {
             self.uart.set_rx(byte);
-        } else if self.uart.prompt_seen() && self.input_pos < self.input.len() {
-            let byte = self.input[self.input_pos];
-            self.input_pos += 1;
-            self.uart.set_rx(byte);
+        } else if self.uart.prompt_seen() {
+            if let Some(byte) = host.input() {
+                self.uart.set_rx(byte);
+            }
         }
     }
 
@@ -408,7 +413,7 @@ impl LinuxGuest {
         }
     }
 
-    fn io(&mut self, io: &crate::svm::Io, counts: &mut Counts, on_byte: &mut impl FnMut(u8)) {
+    fn io(&mut self, io: &crate::svm::Io, counts: &mut Counts, host: &mut dyn Host) {
         if io.input && !Uart::owns(COM1, io.port) && (io.port as usize) < self.port_hist.len() {
             let slot = &mut self.port_hist[io.port as usize];
             *slot = slot.saturating_add(1);
@@ -430,7 +435,7 @@ impl LinuxGuest {
             } else {
                 let byte = v.save().rax as u8;
                 if let Some(out) = self.uart.write(offset, byte) {
-                    on_byte(out);
+                    host.output(out);
                 }
                 counts.port_out += 1;
             }

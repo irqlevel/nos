@@ -19,16 +19,24 @@
 //!     hv info          -- what this machine has
 //!     hv on            -- turn the extension on
 //!     hv run all       -- run the built-in guests, each in a VM of its own
+//!     hv boot /bzImage initrd=/initrd secs=60   -- a Linux guest, for a while
+//!     hv start /bzImage initrd=/initrd          -- one that runs until stopped
+//!     hv exec 0 uname -a                        -- a line typed at its shell
+//!     hv stop 0
 //!     hv off
-//!     rmmod hv
+//!     rmmod hv         -- stops every guest still running first
 //!
-//! The guests are a few bytes each (`hv::guests`); a Linux one is what
-//! comes next (`plans/03-hypervisor.md`).
+//! The built-in guests are a few bytes each (`hv::guests`); the Linux ones
+//! are x86-64 only, so far (`plans/03-hypervisor.md`).
 
 extern crate alloc;
 
 #[cfg(target_arch = "x86_64")]
 mod boot;
+#[cfg(target_arch = "x86_64")]
+mod guest;
+#[cfg(target_arch = "x86_64")]
+mod vms;
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -41,23 +49,61 @@ use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off [cpu|all]|run <guest|all> [cpu]|boot <bzImage> [mem=MiB] [secs=N] [initrd=path] [cmdline=...]] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|boot|start|list|console|send|exec|wait|stop|help] - the CPU's virtualization extension, and guests under it";
+
+/// What `hv help` prints: every subcommand, a line each.
+const USAGE: &str = "\
+hv [info]                          what the CPU has, and which CPUs the extension is on for
+hv on|off [cpu|all]                turn the extension on or off
+hv run <guest|all> [cpu]           run the built-in guests
+hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [input=...] [cmdline=...]
+                                   a Linux guest for secs, then its console and how it ended
+hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [cmdline=...]
+                                   a Linux guest that runs until hv stop
+hv list                            the started guests
+hv console <id> [bytes=N]          the end of one's console
+hv send <id> <text>                type at it (\\n for a newline)
+hv exec <id> [secs=N] <line>       type a line and print the answer, up to the next prompt
+hv wait <id> [secs=N] <text>       until its console shows text
+hv stop <id|all>                   stop it and say how it ended
+";
+
+/// What the command works on: the machine, and the guests started on it.
+struct State {
+    machine: Arc<Machine>,
+    #[cfg(target_arch = "x86_64")]
+    vms: vms::Vms,
+    /// Set as the module starts to go: an `hv boot` running then stops at
+    /// once instead of at the end of its time.
+    #[cfg(target_arch = "x86_64")]
+    unloading: Arc<core::sync::atomic::AtomicBool>,
+}
 
 struct Hv {
     /// In an `Option` so that unregistering -- which waits out a call of the
     /// command still running on another CPU -- happens before the machine is
     /// let go of, and not in whatever order the fields happen to be in.
     cmd: Option<Command>,
-    machine: Arc<Machine>,
+    state: Arc<State>,
 }
 
 impl kmod::Module for Hv {}
 
 impl Drop for Hv {
     fn drop(&mut self) {
-        /* The command goes first: `kernel_cmd_unregister` returns only once
-         * any call of it still running has, so from here nothing can ask the
-         * machine anything. */
+        /* The guests first: an `hv boot` running, and every `hv start`ed one
+         * -- so that an `hv wait` or `hv exec` waiting on one returns, and it
+         * is those calls the unregister below waits for. */
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.state.unloading.store(true, core::sync::atomic::Ordering::Release);
+            self.state.vms.close();
+        }
+
+        /* Then the command: `kernel_cmd_unregister` returns only once any
+         * call of it still running has, so from here nothing can ask the
+         * machine anything -- nor start a guest on it, since `close` turned
+         * every later `hv start` away. */
         drop(self.cmd.take());
 
         /* Then the CPUs, here rather than in the machine's own drop, so that
@@ -65,8 +111,9 @@ impl Drop for Hv {
          * hypervisor module that goes and leaves the extension on is the one
          * failure this shape must not have: the code that would turn it off
          * has just been freed. */
-        let was = self.machine.disable(u64::MAX);
-        let left = self.machine.hardware_mask();
+        let machine = &self.state.machine;
+        let was = machine.disable(u64::MAX);
+        let left = machine.hardware_mask();
         if left != 0 {
             kcore::trace!(0, "hv: WARNING -- unloading with the extension still on for cpu mask 0x{:x}", left);
         }
@@ -79,8 +126,15 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
      * loads: `hv info` is a diagnostic, and the machine that most needs one
      * is the machine where a guest will not start. */
     let machine = Arc::new(Machine::new().map_err(kernel_error)?);
+    let state = Arc::new(State {
+        machine: machine.clone(),
+        #[cfg(target_arch = "x86_64")]
+        vms: vms::Vms::new().ok_or(kcore::error::Error::NoMemory)?,
+        #[cfg(target_arch = "x86_64")]
+        unloading: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+    });
 
-    let for_cmd = machine.clone();
+    let for_cmd = state.clone();
     let cmd = Command::register("hv", HELP, move |args, out| command(&for_cmd, args, out))?;
 
     match machine.ext() {
@@ -98,7 +152,7 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
         Err(e) => kcore::trace!(0, "hv: loaded -- no guest can run here: {}", e),
     }
 
-    Ok(Box::new(Hv { cmd: Some(cmd), machine }))
+    Ok(Box::new(Hv { cmd: Some(cmd), state }))
 }
 
 /// An `hv::Error` as the kernel's, for the one place the two meet: what
@@ -113,26 +167,50 @@ fn kernel_error(e: hv::Error) -> kcore::error::Error {
     }
 }
 
-fn command(machine: &Arc<Machine>, args: &str, out: &mut Output) {
-    let mut words = args.split_ascii_whitespace();
-    match words.next() {
-        None => status(machine, out),
-        Some("info") => {
+fn command(state: &State, args: &str, out: &mut Output) {
+    let machine = &state.machine;
+    /* The subcommand, and what follows it spaces and all: a command line, the
+     * text to type at a guest. Split where `char` says, so that both halves
+     * start on a character. */
+    let args = args.trim_start();
+    let end = args.find(char::is_whitespace).unwrap_or(args.len());
+    let (first, rest) = (&args[..end], args[end..].trim_start());
+    let mut words = rest.split_ascii_whitespace();
+    match first {
+        "" => status(machine, out),
+        "info" => {
             let _ = machine.caps().report(out);
             status(machine, out);
         }
-        Some("on") => switch(machine, words.next(), true, out),
-        Some("off") => switch(machine, words.next(), false, out),
-        Some("run") => run(machine, words.next(), words.next(), out),
+        "help" => {
+            let _ = write!(out, "{}", USAGE);
+        }
+        "on" => switch(state, words.next(), true, out),
+        "off" => switch(state, words.next(), false, out),
+        "run" => run(machine, words.next(), words.next(), out),
         #[cfg(target_arch = "x86_64")]
-        Some("boot") => boot::boot(machine, args.strip_prefix("boot").unwrap_or("").trim_start(), out),
+        "boot" => boot::boot(machine, rest, &state.vms.load(), &state.unloading, out),
+        #[cfg(target_arch = "x86_64")]
+        "start" => state.vms.start(machine, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "list" => state.vms.list(out),
+        #[cfg(target_arch = "x86_64")]
+        "console" => state.vms.console(rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "send" => state.vms.send(rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "exec" => state.vms.exec(rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "wait" => state.vms.wait(rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "stop" => state.vms.stop(rest, out),
         #[cfg(not(target_arch = "x86_64"))]
-        Some("boot") => {
+        "boot" | "start" | "list" | "console" | "send" | "exec" | "wait" | "stop" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
-        Some(other) => {
+        other => {
             let _ = writeln!(out, "hv: no such thing as \"{}\"", other);
-            let _ = writeln!(out, "{}", HELP);
+            let _ = write!(out, "{}", USAGE);
         }
     }
 }
@@ -257,8 +335,10 @@ fn run(machine: &Arc<Machine>, which: Option<&str>, cpu: Option<&str>, out: &mut
 }
 
 /// `hv on [cpu|all]` and `hv off [cpu|all]`, which differ in one word and
-/// in nothing else worth writing twice.
-fn switch(machine: &Machine, which: Option<&str>, on: bool, out: &mut Output) {
+/// in nothing else worth writing twice -- but for a guest `hv start` left
+/// running, which `hv off` will not turn the extension off under.
+fn switch(state: &State, which: Option<&str>, on: bool, out: &mut Output) {
+    let machine = &*state.machine;
     let mask = match which {
         None | Some("all") => kcore::cpu::online_mask(),
         Some(word) => match word.parse::<usize>() {
@@ -270,6 +350,18 @@ fn switch(machine: &Machine, which: Option<&str>, on: bool, out: &mut Output) {
             }
         },
     };
+
+    /* A courtesy, not what keeps the CPU safe: a guest started between this
+     * look and the switch finds the extension off at its next entry, which
+     * checks with interrupts off, and stops there -- "not entered" in its
+     * `hv list` line. */
+    #[cfg(target_arch = "x86_64")]
+    if !on {
+        if let Some((id, cpu)) = state.vms.running_on(mask) {
+            let _ = writeln!(out, "hv: vm {} is running on cpu {} -- hv stop it first", id, cpu);
+            return;
+        }
+    }
 
     let changed = if on {
         match machine.enable(mask) {

@@ -143,6 +143,18 @@ A tinyconfig Linux 6.18 with a BusyBox initramfs now boots to an interactive
 `ash` prompt. All four demos are done; `docs/hypervisor.md` ("What comes
 next") has what is left.
 
+And a first step toward stage 4's lifecycle, as shell commands before it is
+an HTTP API: guests that run until they are stopped
+([`docs/hypervisor.md`](../docs/hypervisor.md#guests-that-stay-up)).
+`hv start` puts a guest on a vCPU task of its own and returns; `hv list`,
+`hv console`, `hv send`, `hv exec`, `hv wait` and `hv stop` reach it while it
+runs. `hv exec` types a line and returns the answer at the prompt printed
+after the line went in; `hv off` will not turn the extension off under a
+running guest, and `rmmod hv` stops every guest before it turns it off. On
+the way, the 8250's answer to the cursor query became the cursor's real
+column (it said 80, and BusyBox wrapped what was typed) from a buffer of its
+own (the old queue grew with every query a guest never read).
+
 Before the first VMX guest, one change outside the hypervisor: the boot path
 has to set `CR0.NE` on every CPU. VMX requires it, the APs come out of INIT
 without it and nothing sets it, so on the EX44 and the Dell `hv on` refuses

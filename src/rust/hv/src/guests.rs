@@ -100,6 +100,7 @@ struct Run {
     at_hypercall: Option<[u64; 15]>,
     /// The emulated serial console, and what the guest sent it.
     uart: Uart,
+    serial: String,
     stop: Stop,
     ns: u64,
 }
@@ -133,6 +134,7 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
         absent: 0,
         at_hypercall: None,
         uart: Uart::new(),
+        serial: String::new(),
         stop: Stop::Budget,
         ns: 0,
     };
@@ -163,7 +165,13 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
                     s.rax = (s.rax & !0xFF) | byte as u64;
                     run.port_in += 1;
                 } else {
-                    run.uart.write(offset, v.save().rax as u8);
+                    if let Some(byte) = run.uart.write(offset, v.save().rax as u8) {
+                        /* Kept up to the same cap as the debug port's, and
+                         * without an allocation that could fail by panicking. */
+                        if run.serial.len() < SAID_MAX && run.serial.try_reserve(1).is_ok() {
+                            run.serial.push(byte as char);
+                        }
+                    }
                     run.port_out += 1;
                 }
                 v.skip_io(&io);
@@ -551,8 +559,8 @@ fn build_uart(vm: &mut Vm) -> Result<()> {
 
 fn check_uart(_vm: &Vm, r: &Run) -> core::result::Result<String, String> {
     halted_at(r, UART_HLT)?;
-    if r.uart.output() != UART_SAYS {
-        return Err(alloc::format!("the UART received {:?}", r.uart.output()));
+    if r.serial != UART_SAYS {
+        return Err(alloc::format!("the UART received {:?}", r.serial));
     }
     Ok(alloc::format!("the guest brought up the 8250 and sent {} bytes through it", r.uart.written()))
 }

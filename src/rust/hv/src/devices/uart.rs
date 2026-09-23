@@ -8,16 +8,14 @@
 //! `console=ttyS0` and `earlyprintk=serial` write to.
 //!
 //! What it models is a UART whose transmitter is always ready and whose
-//! receiver, for now, never has anything: the guest's output is the point,
-//! and its input comes later with a console that can type back. The bits
+//! receiver takes a byte at a time from whoever runs the guest -- what is
+//! typed at its console. The bits
 //! that matter to Linux's `8250` driver on the way up are the ones that say
 //! "you may send" (LSR.THRE and LSR.TEMT), the divisor latch (so a probe
 //! that sets a baud rate reads back what it wrote), the scratch register
 //! (which the driver writes and reads to tell a UART is there at all), and
 //! the loopback path of the modem-control register (likewise a presence
 //! test).
-
-use alloc::string::String;
 
 /// The eight registers, at offsets 0..8 from the port base.
 pub const REGISTERS: u16 = 8;
@@ -67,9 +65,54 @@ const IIR_NONE: u8 = 0x01;
 const IIR_THRE: u8 = 0x02;
 const IIR_RX: u8 = 0x04;
 
-/// The most of a guest's console output kept for a report, so a guest that
-/// prints without end is not a reason for the host to run out of memory.
-const OUTPUT_MAX: usize = 64 * 1024;
+const ESC: u8 = 0x1B;
+const BACKSPACE: u8 = 0x08;
+/// The answer to a cursor-position query, `ESC [ row ; col R`, is at most
+/// this long: `ESC [ 24 ; 1000 R`.
+const REPLY_MAX: usize = 12;
+/// The row a query is told the cursor is on. Nothing here keeps rows, and a
+/// line editor uses only the column.
+const REPLY_ROW: u16 = 24;
+/// The furthest column counted: a longer line is told it is here.
+const COL_MAX: u16 = 999;
+/// Where the tab stops are.
+const TAB: u16 = 8;
+
+/// Where the guest's output is in an ANSI escape sequence: what tells the
+/// cursor-position query apart from text, and text from the bytes of a
+/// sequence, which move no cursor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Esc {
+    /// Text.
+    Text,
+    /// ESC.
+    Start,
+    /// ESC [, no parameter yet.
+    Csi,
+    /// ESC [ 6: the query, if `n` is next.
+    Csi6,
+    /// ESC [ and anything else, to its final byte.
+    CsiOther,
+}
+
+/// The answer to the last query, in room of its own: a guest that asks and
+/// never reads costs the host nothing more than one that asks once.
+struct Reply {
+    buf: [u8; REPLY_MAX],
+    len: usize,
+    /// How much of it the guest has read.
+    pos: usize,
+}
+
+impl core::fmt::Write for Reply {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.buf.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
 
 /// One 16550A.
 pub struct Uart {
@@ -79,21 +122,21 @@ pub struct Uart {
     lcr: u8,
     mcr: u8,
     scr: u8,
-    /// Everything the guest has sent, up to `OUTPUT_MAX`.
-    output: String,
-    /// Whether output was dropped for the cap.
-    truncated: bool,
-    /// How many bytes the guest has written, cap or no cap.
+    /// How many bytes the guest has sent. The bytes themselves go to whoever
+    /// runs the guest (`write` returns each), which keeps them where it wants
+    /// them -- this device keeps none.
     written: u64,
     /// A byte waiting to be read back, if the last thing written went round
     /// the loopback.
     loopback: Option<u8>,
     /// A byte waiting for the guest to read (receive path).
     rx: Option<u8>,
-    /// How much of an ANSI escape query the guest has written so far, and
-    /// the answer to feed back once one completes.
-    esc: u8,
-    reply: alloc::collections::VecDeque<u8>,
+    /// Where the guest's output is in an escape sequence, and the column it
+    /// has left the cursor at: what a cursor-position query is answered
+    /// with, and the answer.
+    esc: Esc,
+    col: u16,
+    reply: Reply,
     /// Set once the guest has sent its first cursor-position query, which a
     /// shell does when it is at a prompt ready to read: until then, typed
     /// input would be swallowed by the boot, so it is held back.
@@ -109,13 +152,12 @@ impl Uart {
             lcr: 0,
             mcr: 0,
             scr: 0,
-            output: String::new(),
-            truncated: false,
             written: 0,
             loopback: None,
             rx: None,
-            esc: 0,
-            reply: alloc::collections::VecDeque::new(),
+            esc: Esc::Text,
+            col: 0,
+            reply: Reply { buf: [0; REPLY_MAX], len: 0, pos: 0 },
             prompt_seen: false,
         }
     }
@@ -201,12 +243,7 @@ impl Uart {
                     return None;
                 }
                 self.written = self.written.saturating_add(1);
-                if self.output.len() < OUTPUT_MAX {
-                    self.output.push(value as char);
-                } else {
-                    self.truncated = true;
-                }
-                self.match_query(value);
+                self.track(value);
                 return Some(value);
             }
             IER_DLM if self.dlab() => self.dlm = value,
@@ -231,7 +268,7 @@ impl Uart {
 
     /// Whether a query reply is waiting to be fed to the guest.
     pub fn reply_pending(&self) -> bool {
-        !self.reply.is_empty()
+        self.reply.pos < self.reply.len
     }
 
     /// Whether the guest has reached a shell prompt (asked where the cursor
@@ -240,35 +277,79 @@ impl Uart {
         self.prompt_seen
     }
 
+    /// Follow what the guest writes as a terminal would: the column the
+    /// cursor ends at, and the one query a shell sends.
+    ///
     /// A terminal like busybox's line editor asks where the cursor is by
-    /// writing the escape sequence ESC [ 6 n and waiting for the answer
-    /// before it will take a command. Nothing here is a terminal, so the
-    /// answer is canned -- a fixed row and column -- and queued for the guest
-    /// to read; without it the shell swallows what is typed as the reply it
-    /// was waiting for. Only this one query is answered, which is the only
-    /// one a shell sends.
-    fn match_query(&mut self, byte: u8) {
-        const ESC: u8 = 0x1B;
+    /// writing the escape sequence ESC [ 6 n, and waits for the answer before
+    /// it takes a command. Nothing here is a terminal, so the answer is made
+    /// up from the column the guest's own output has left the cursor at --
+    /// the one number the editor uses: told any other column than the one
+    /// its prompt ended at, it takes the line for that much longer, and
+    /// wraps what is typed early (it was once told 80, and `id` came back as
+    /// `i`, a newline, `d`). Without an answer, the shell swallows what is
+    /// typed as the reply it was waiting for.
+    fn track(&mut self, byte: u8) {
+        let in_csi = matches!(self.esc, Esc::Csi | Esc::Csi6 | Esc::CsiOther);
         self.esc = match (self.esc, byte) {
-            (0, ESC) => 1,
-            (1, b'[') => 2,
-            (2, b'6') => 3,
-            (3, b'n') => {
-                for &b in b"\x1b[24;80R" {
-                    self.reply.push_back(b);
-                }
-                self.prompt_seen = true;
-                0
+            (_, ESC) => Esc::Start,
+            (Esc::Start, b'[') => Esc::Csi,
+            (Esc::Start, _) => Esc::Text,
+            (Esc::Csi, b'6') => Esc::Csi6,
+            (Esc::Csi6, b'n') => {
+                self.answer();
+                Esc::Text
             }
-            _ => 0,
+            /* Parameters and intermediates, then a final byte. */
+            (_, 0x20..=0x3F) if in_csi => Esc::CsiOther,
+            (_, _) if in_csi => Esc::Text,
+            (_, b'\r' | b'\n') => {
+                self.col = 0;
+                Esc::Text
+            }
+            (_, BACKSPACE) => {
+                self.col = self.col.saturating_sub(1);
+                Esc::Text
+            }
+            (_, b'\t') => {
+                self.col = ((self.col / TAB + 1) * TAB).min(COL_MAX);
+                Esc::Text
+            }
+            /* A printable character, or the first byte of a UTF-8 one. */
+            (_, 0x20..=0x7E | 0xC0..=0xFF) => {
+                self.col = (self.col + 1).min(COL_MAX);
+                Esc::Text
+            }
+            (_, _) => Esc::Text,
         };
     }
 
-    /// The next byte of a queued reply to an ANSI query, if any: fed to the
-    /// guest ahead of anything typed, so the shell gets the answer it waits
-    /// for before the command.
+    /// The answer to a cursor-position query, in place of one the guest has
+    /// not started to read -- one it is part way through stands, rather than
+    /// be cut into -- and from the first query on, typed input is let
+    /// through.
+    fn answer(&mut self) {
+        use core::fmt::Write;
+        self.prompt_seen = true;
+        if self.reply.pos != 0 && self.reply.pos < self.reply.len {
+            return;
+        }
+        self.reply.len = 0;
+        self.reply.pos = 0;
+        /* Fits: `REPLY_MAX` is the longest, with the column at its most. */
+        let _ = write!(self.reply, "\x1b[{};{}R", REPLY_ROW, self.col + 1);
+    }
+
+    /// The next byte of the answer to a query, if any: fed to the guest ahead
+    /// of anything typed, so the shell gets the answer it waits for before
+    /// the command.
     pub fn take_reply(&mut self) -> Option<u8> {
-        self.reply.pop_front()
+        if self.reply.pos >= self.reply.len {
+            return None;
+        }
+        let byte = *self.reply.buf.get(self.reply.pos)?;
+        self.reply.pos += 1;
+        Some(byte)
     }
 
     /// Whether the receive register is free to take another byte.
@@ -283,10 +364,6 @@ impl Uart {
         self.rx = Some(byte);
     }
 
-    pub fn output(&self) -> &str {
-        &self.output
-    }
-
     pub fn written(&self) -> u64 {
         self.written
     }
@@ -297,7 +374,4 @@ impl Uart {
         self.ier
     }
 
-    pub fn truncated(&self) -> bool {
-        self.truncated
-    }
 }
