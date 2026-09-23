@@ -54,6 +54,14 @@ REQUIRED = [
 # setup; not required, but reported when it appears.
 NICE = r"Kernel command line:"
 
+# With an initramfs, the fourth demo: the guest runs its init and reaches an
+# interactive shell over the emulated UART. These are checked only when an
+# initrd is given (the init here is a busybox that prints and execs a shell).
+SHELL_MARKERS = [
+    r"Run /init as init process",
+    r"BusyBox",
+]
+
 DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check"
 
 
@@ -88,6 +96,10 @@ def run(args):
     boot_cmd = "hv boot /bzImage mem=%d secs=%d" % (args.mem, args.secs)
     if args.initrd:
         boot_cmd += " initrd=/initrd"
+    if args.input:
+        # A single token, no spaces: \n stands for a newline. Kept before
+        # cmdline=, which takes the rest of the line.
+        boot_cmd += " input=" + args.input
     boot_cmd += " cmdline=" + args.cmdline
     image = rootfs(tmp, args.bzimage, args.initrd, boot_cmd)
 
@@ -134,6 +146,13 @@ def run(args):
                      block[-1500:])
         if re.search(NICE, block):
             print("note: the guest reached %r" % NICE)
+        if args.initrd:
+            for m in SHELL_MARKERS:
+                pt.check("the guest booted to a shell: %s" % m, re.search(m, block) is not None,
+                         block[-1500:])
+        for m in args.expect:
+            pt.check("the console shows: %s" % m, re.search(re.escape(m), block) is not None,
+                     block[-1500:])
     finally:
         pt.kill(p)
         tail = guest_lines(log)
@@ -152,6 +171,8 @@ def main():
     ap.add_argument("--cmdline", default=DEFAULT_CMDLINE, help="the guest kernel command line")
     ap.add_argument("--mem", type=int, default=256, help="guest RAM in MiB")
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
+    ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")
+    ap.add_argument("--expect", action="append", default=[], help="extra text the console must contain (repeatable)")
     ap.add_argument("--deadline", type=int, default=360, help="seconds to wait for the markers")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM even if the host has AMD-V")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")

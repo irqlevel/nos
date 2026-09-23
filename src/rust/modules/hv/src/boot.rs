@@ -42,6 +42,9 @@ struct Request {
     mem_bytes: u64,
     budget_s: u64,
     cmdline: String,
+    /// Bytes typed at the guest's console once it is up; `\n` in the word
+    /// stands for a newline.
+    input: Option<String>,
 }
 
 fn parse(args: &str) -> core::result::Result<Request, String> {
@@ -50,6 +53,7 @@ fn parse(args: &str) -> core::result::Result<Request, String> {
     let mut mem_mib = DEFAULT_MEM_MIB;
     let mut budget_s = DEFAULT_BUDGET_S;
     let mut cmdline: Option<String> = None;
+    let mut input: Option<String> = None;
 
     for word in args.split_ascii_whitespace() {
         if let Some(mib) = word.strip_prefix("mem=") {
@@ -58,6 +62,8 @@ fn parse(args: &str) -> core::result::Result<Request, String> {
             initrd = Some(String::from(path));
         } else if let Some(secs) = word.strip_prefix("secs=") {
             budget_s = secs.parse::<u64>().map_err(|_| String::from("secs= wants a number of seconds"))?;
+        } else if let Some(text) = word.strip_prefix("input=") {
+            input = Some(String::from(text));
         } else if let Some(rest) = word.strip_prefix("cmdline=") {
             /* Everything after cmdline= to the end of the line is the
              * command line, spaces and all. */
@@ -70,7 +76,7 @@ fn parse(args: &str) -> core::result::Result<Request, String> {
         }
     }
 
-    let kernel = kernel.ok_or_else(|| String::from("hv boot <bzImage> [mem=MiB] [secs=N] [initrd=path] [cmdline=...]"))?;
+    let kernel = kernel.ok_or_else(|| String::from("hv boot <bzImage> [mem=MiB] [secs=N] [initrd=path] [input=...] [cmdline=...]"))?;
     if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&mem_mib) {
         return Err(alloc::format!("mem= must be {}..{} MiB", MIN_MEM_MIB, MAX_MEM_MIB));
     }
@@ -83,6 +89,7 @@ fn parse(args: &str) -> core::result::Result<Request, String> {
         mem_bytes: mem_mib * 1024 * 1024,
         budget_s,
         cmdline: cmdline.unwrap_or_else(|| String::from(DEFAULT_CMDLINE)),
+        input,
     })
 }
 
@@ -147,6 +154,12 @@ fn build(machine: &Machine, req: &Request) -> core::result::Result<LinuxGuest, S
     guest
         .load(&header, &first, layout, req.cmdline.as_bytes())
         .map_err(|e| alloc::format!("laying out the guest: {}", e))?;
+    if let Some(text) = &req.input {
+        /* `\n` in the word for a newline, so a whole command line fits one
+         * token. */
+        let bytes: alloc::vec::Vec<u8> = text.replace("\\n", "\n").into_bytes();
+        guest.set_input(&bytes);
+    }
     Ok(guest)
 }
 
@@ -192,6 +205,10 @@ impl Boot {
         }
 
         /* The guest's console, whatever came of it. */
+        let (fed, total) = guest.input_progress();
+        if total > 0 {
+            let _ = writeln!(report, "  input      {} of {} bytes taken by the guest (uart IER {:#04x})", fed, total, guest.uart_ier());
+        }
         let console = guest.output();
         if console.is_empty() {
             let _ = writeln!(report, "  the guest printed nothing to ttyS0");
@@ -217,6 +234,9 @@ impl Boot {
             "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} host",
             counts.exits, counts.port_in, counts.port_out, counts.cpuid,
             counts.msr_read, counts.msr_write, counts.msr_gp, counts.irq, counts.hlt, counts.host);
+        let ((irr, isr, imr), (m0, r0, run0)) = guest.irq_debug();
+        let _ = writeln!(report, "  irq        {} total ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
+            counts.irq, counts.irq0, counts.irq4, counts.edges0, counts.blocked, irr, isr, imr, m0, r0, run0);
         let hot = guest.hot_ports(6);
         if !hot.is_empty() {
             let _ = write!(report, "  busiest in ports");
