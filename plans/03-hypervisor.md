@@ -131,8 +131,11 @@ And against **3.5 and the fourth demo** -- a full boot to a shell:
   (`Vcpu::inject_extint` / `request_irq_window`): the run loop injects the
   highest-priority IRQ when the guest can take one and asks the CPU (SVM's
   VINTR) to exit the moment it can when it cannot;
-- an idle `HLT` treated as a wait for the next tick, with the interrupt
-  shadow it sits in cleared so the timer can wake it;
+- an idle `HLT` halts the vCPU: stepped past, as a CPU an interrupt wakes
+  resumes after it, and not entered again until an interrupt is pending,
+  its task asleep until the timer's next edge -- a halted guest costs its
+  CPU nothing (on the Linux guest: 5.6 million HLT exits in 120 s became
+  11,410, the task asleep 89% of the run, the timer ticks unchanged);
 - the 8250 raising IRQ4 for its transmitter, and a receive path with a
   cursor-query answer, so the console can be typed at (`hv boot ... input=`).
 
