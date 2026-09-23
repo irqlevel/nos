@@ -207,9 +207,22 @@ backend, where a guest can show it working -- not slipped in here.
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [secs=N] [initrd=path] [cmdline=...]
-                                load a Linux bzImage and run it on a vCPU, its
-                                early console coming back as the command's output
+    hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [input=...] [cmdline=...]
+                                load a Linux bzImage and run it on a vCPU for
+                                secs, then print its console and how it ended
+    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [input=...] [log] [cmdline=...]
+                                the same, left running until it is stopped
+    hv list                     the started guests: running or how they ended,
+                                their CPU, uptime and exits
+    hv console <id> [bytes=N]   the end of one's console
+    hv send <id> <text>         type at it, \n for a newline
+    hv exec <id> [secs=N] <line>
+                                type a line, print what comes back up to the
+                                prompt after it
+    hv wait <id> [secs=N] <text>
+                                until its console shows text
+    hv stop <id|all>            stop it, say how it ended, take it off the list
+    hv help                     all of these, a line each
 
 **Turning it on** allocates one page per CPU -- AMD's host state save area,
 Intel's VMXON region -- and then sends that CPU an IPI that does nothing but
@@ -622,6 +635,104 @@ is megabytes and CI cannot build one in its time), pointed at a kernel by
 hand; with `--initrd` it checks the guest reaches its `init` and a shell, and
 `--input 'id\n' --expect uid=0` checks it runs the command.
 
+## Guests that stay up
+
+`hv boot` is a guest for a set time, run from start to end inside one
+command. `hv start` is the same guest left running: the command builds it,
+hands it to a vCPU task of its own and returns, and the guest is reached from
+then on by the commands above -- from the shell, over ssh or over the UDP
+shell alike. They are the lifecycle stage 4's HTTP API is to put on the
+network ([`plans/04-control-plane.md`](../plans/04-control-plane.md)); the
+commands come first because they need nothing but a shell.
+
+```
+$ hv start /bzImage initrd=/initrd cmdline=console=ttyS0 nolapic
+hv: vm 0 started on cpu 3 -- /bzImage, 256 MiB, cmdline "console=ttyS0 nolapic"
+$ hv exec 0 secs=60 id
+... the rest of its boot ...
+~ # id
+uid=0 gid=0
+~ #
+$ hv exec 0 uname -r
+uname -r
+6.18.53
+~ #
+$ hv send 0 echo nos$((6*7))nos\n
+hv: vm 0: 20 bytes queued
+$ hv wait 0 nos42nos
+hv: vm 0 printed "nos42nos", 58 ms in
+$ hv list
+vm 0  running  cpu 3  256 MiB  1 s  exits 18237  irq 284  hlt 92  /bzImage
+$ hv stop 0
+hv: vm 0 stopped -- on request
+  stopped    on request, after 1925 ms
+  exits      ...
+```
+
+(From the gate's run under TCG, where the guest is at its shell a second
+after it starts.)
+
+**A VM is a task and a shared record** (`modules/hv/src/vms.rs`). The guest
+-- its memory, its vCPU, its devices -- belongs to the vCPU task (`hv/vm<N>`)
+alone, and is freed there when the guest stops. What the task and the
+commands share is the console, its last 64 KiB in a ring; the bytes waiting to
+be typed at it, 4 KiB at most; a stop flag; and the loop's counters, which it
+publishes at every halt and every 4096 exits. The ring and the input queue
+are taken whole when the VM is made, so nothing on the guest's datapath
+allocates. Each vCPU is bound to one CPU the extension is on for: `cpu=` if
+given, else the one with fewest running VMs -- the highest of a tie, so the
+boot CPU's own work is the last to share its CPU with a guest.
+
+**`hv exec` knows where its answer starts.** It types the line and a newline
+and waits for a prompt -- but only one printed after the line's last byte was
+handed to the guest's UART: the loop notes where the console was at that
+moment, and only what comes after it can end the wait. So a line typed at a
+guest that is still booting waits for its shell and comes back with its
+answer, not with the first prompt the shell printed before it read the line;
+and a line the guest never reads says so rather than timing out in silence.
+It prints everything the guest printed since the line was typed.
+
+**What reaches a terminal is made safe for one.** `hv console`, `hv exec` and
+the report print the guest's console with escape sequences taken out whole,
+carriage returns dropped and anything above ASCII shown as `?`: a guest
+shell's `ESC [ 6 n`, printed to the terminal a person is reading nos on,
+would make that terminal type its answer into whatever reads it next.
+
+**The cursor query is answered with the cursor.** BusyBox's line editor asks
+where the cursor is after it prints its prompt, and takes the column it is
+told as the prompt's end. It was once told column 80 whatever the prompt, and
+wrapped what was typed at the edge it thought it had reached -- `id` came back
+as `i`, a newline, `d`. The UART now follows the guest's output as a terminal
+would -- the column each byte leaves the cursor at, escape sequences moving
+it nowhere -- and answers with that, from a buffer of its own: a guest that
+asks and never reads the answer costs the host no more than one that asks
+once, where the answer used to be appended to a queue without bound.
+
+**Stopping is a flag and a join.** The loop checks the flag before every
+entry, and a halted guest's task sleeps at most 10 ms at a time, so `hv stop`
+returns within a tick or so of asking: it takes the VM off the list first and
+joins its task after, with no lock held while it waits. A guest that stops by
+itself -- a triple fault, a HLT with interrupts off -- stays on the list as
+`stopped`, with its reason, until `hv stop` takes it off.
+
+**The extension is not pulled from under a guest.** `hv off` refuses while a
+started guest runs on one of the CPUs it names. That is a courtesy and not
+what keeps the CPU safe: every entry checks, with interrupts off until the
+guest is running, that the extension is on and its save area is the one this
+module gave that CPU, so a guest racing an `hv off` finds it off and stops,
+`not entered`. `rmmod hv` stops every guest before it turns the extension off
+-- the guests first, an `hv boot` under way among them, so that an `hv exec`
+or `hv wait` waiting on one returns; then the command, whose unregistration
+waits out every call still running (an `hv start` still reading its files
+finds the module going when it comes to add its guest, and stops it itself);
+and only then the extension, on every CPU.
+
+The gate is `scripts/hv-linux-test.py` with `--initrd`: two VMs started side
+by side and one stopped mid-boot, a line typed at the other before its shell
+is up and another at its prompt, `send`, `wait`, `console`, the refused
+`hv off`, and an `rmmod` that stops the guest itself and leaves nothing on for
+the next load.
+
 ## On real hardware
 
 The AX41 (a Ryzen 5 3600, Zen 2) has the whole of AMD-V -- 32768 ASIDs,
@@ -681,10 +792,13 @@ thing that can be shown in half a minute:
 
 All four demos are done, and a guest runs a command typed at its console
 (`hv boot ... input='id\n'` → `uid=0 gid=0`) -- under TCG and on the AX41's
-real AMD-V ([On real hardware](#on-real-hardware)). What is left, not in
-step order: the TLB flushed per address space rather than whole; the VMX
-backend with `CR0.NE` on every CPU. Beyond stage 3: a local APIC and an SMP
-guest, host-side virtio, and the control plane (stage 4).
+real AMD-V ([On real hardware](#on-real-hardware)). Guests also run until
+they are stopped, reached from the shell ([Guests that stay
+up](#guests-that-stay-up)): the lifecycle the control plane will serve. What
+is left, not in step order: the TLB flushed per address space rather than
+whole; the VMX backend with `CR0.NE` on every CPU. Beyond stage 3: a local
+APIC and an SMP guest, host-side virtio, and the control plane's HTTP API
+(stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every

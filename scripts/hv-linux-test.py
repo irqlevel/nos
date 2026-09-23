@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """hv Linux test: load a real Linux bzImage into a guest under the nos
-hypervisor and watch its early serial console come out.
+hypervisor and watch its serial console come out -- once for a set time
+(`hv boot`), and then as a VM that runs until it is stopped (`hv start`)
+and is typed at while it runs.
 
-This is the third of the four demos in plans/03-hypervisor.md -- a bzImage
-printing its early console -- and it is a *manual* gate, like the hardware
-NIC ones: it needs a bzImage, which is megabytes and which CI cannot build in
-the time it has, so it is not in ci.yml and is pointed at a kernel by hand.
+This is the third and fourth of the four demos in plans/03-hypervisor.md --
+a bzImage printing its early console, and booting to a shell that runs a
+command -- and it is a *manual* gate, like the hardware NIC ones: it needs a
+bzImage, which is megabytes and which CI cannot build in the time it has, so
+it is not in ci.yml and is pointed at a kernel by hand.
 
 Build a small 64-bit guest kernel (a tinyconfig with 8250 serial and an early
 console is enough; PCI, ACPI and SMP off), then:
@@ -20,12 +23,20 @@ the guest gets far enough into early boot to print the kernel banner and set
 up its memory -- under AMD-V, which on a machine with no hardware SVM is
 QEMU's TCG (slow: the whole run is a minute or two).
 
+With an initrd, then the long-lived VMs: two started side by side, one
+stopped while it boots; a line typed at the other before its shell is up,
+answered once it is (`hv exec`), and one typed at its prompt; `hv send` and
+`hv wait`; `hv console`; `hv off` refusing to pull the extension from under
+a running guest; and `rmmod` stopping that guest itself, with nothing left
+on for the next load to find.
+
 Exit code 0 = every required marker appeared.
 """
 
 import argparse
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,8 +53,8 @@ pt = hvt.pt
 
 # The lines the guest has to reach: the banner, and enough of early setup to
 # show it is a real kernel running and not just the decompressor stub. Each
-# is matched inside a "hvguest| " line, so nothing of nos's own console can
-# satisfy one.
+# is matched inside the guest's console as `hv boot` reports it, between its
+# ttyS0 markers, so nothing of nos's own console can satisfy one.
 REQUIRED = [
     r"Linux version",
     r"Command line:",
@@ -64,15 +75,81 @@ SHELL_MARKERS = [
 
 DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check"
 
+# The last line of /etc/rc, and how the console shows it has run: its echo
+# and the line it prints. Once the shell has the console, the kernel's own
+# log -- "rc: /etc/rc done", and every trace line -- goes to dmesg and not
+# to the console, so the end is marked with a command's output instead.
+RC_LAST = "version"
+RC_DONE = re.compile(r"(?m)^> version\n.+\n")
+# The module's own lines from the kernel log, printed to the console: what
+# the vCPU tasks and the unload say, which no command's output does.
+RC_LOG = "dmesg hv:"
 
-def rootfs(tmp, bzimage, initrd, boot_cmd):
+
+def vm_commands(args):
+    """The long-lived VM phase, as /etc/rc lines, and what each must print.
+
+    Each check is (command, occurrence, what, pattern, must): the output of
+    the occurrence-th run of that line must (or must not) match."""
+    start0 = "hv start /bzImage mem=%d initrd=/initrd cmdline=%s" % (args.mem, args.cmdline)
+    start1 = "hv start /bzImage mem=64 cmdline=%s" % args.cmdline
+    # Typed while vm 0 still boots: held until its shell asks for input,
+    # and answered at the prompt printed after the line went in.
+    exec_early = "hv exec 0 secs=%d id" % args.vm_secs
+    exec_prompt = "hv exec 0 uname -r"
+    send = r"hv send 0 echo nos$((6*7))nos\n"
+    wait = "hv wait 0 secs=120 nos42nos"
+    lines = ["hv help", start0, start1, "hv list", "hv stop 1", exec_early, exec_prompt,
+             send, wait, "hv console 0 bytes=400", "hv list", "hv off",
+             "rmmod hv", "insmod /hv.ko", "hv", "rmmod hv", RC_LOG]
+    checks = [
+        ("hv help", 0, "hv help lists the vm commands", r"hv exec <id>", True),
+        (start0, 0, "vm 0 starts", r"hv: vm 0 started on cpu \d+", True),
+        (start1, 0, "vm 1 starts beside it", r"hv: vm 1 started on cpu \d+", True),
+        ("hv list", 0, "hv list shows vm 0 running", r"vm 0  running", True),
+        ("hv list", 0, "hv list shows vm 1 running", r"vm 1  running", True),
+        ("hv stop 1", 0, "vm 1 stops on request, mid-boot", r"hv: vm 1 stopped -- on request", True),
+        (exec_early, 0, "a line typed during boot is answered at the prompt after it",
+         r"# id\nuid=0 gid=0\n", True),
+        (exec_early, 0, "... and nothing was left waiting", r"hv: vm 0: ", False),
+        (exec_prompt, 0, "a line typed at the prompt comes back whole", r"(?m)^uname -r\n\d+\.\d+", True),
+        (send, 0, "hv send queues", r"hv: vm 0: \d+ bytes queued", True),
+        (wait, 0, "hv wait sees what the sent line printed", r'hv: vm 0 printed "nos42nos"', True),
+        ("hv console 0 bytes=400", 0, "hv console has it too", r"nos42nos", True),
+        ("hv list", 1, "vm 0 still running", r"vm 0  running", True),
+        ("hv list", 1, "vm 1 gone from the list", r"vm 1 ", False),
+        ("hv off", 0, "hv off will not pull the extension from under vm 0",
+         r"hv: vm 0 is running on cpu \d+ -- hv stop it first", True),
+        ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),
+        (RC_LOG, 0, "vm 1's vCPU said how it ended", r"hv: vm 1 stopped after \d+ ms -- on request", True),
+        (RC_LOG, 0, "rmmod stopped vm 0 itself, and only then turned the extension off",
+         r"hv: vm 0 stopped for the unload -- on request[\s\S]*hv: unloaded, extension off for cpu mask", True),
+        (RC_LOG, 0, "no unload left the extension on", r"hv: WARNING", False),
+    ]
+    return lines, checks
+
+
+def sections(txt):
+    """What each /etc/rc line printed, in order: (line, output) pairs, the
+    output being everything on the console up to the next line rc echoes --
+    its own output as printed, then the same again in the log, and the
+    kernel's own lines in between."""
+    parts = re.split(r"(?m)^> (.*)$", txt)
+    return [(parts[i].strip(), parts[i + 1]) for i in range(1, len(parts) - 1, 2)]
+
+
+def output_of(secs, line, occurrence):
+    runs = [out for (cmd, out) in secs if cmd == line]
+    return runs[occurrence] if occurrence < len(runs) else None
+
+
+def rootfs(tmp, bzimage, initrd, rc):
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc"), exist_ok=True)
     shutil.copy(hvt.module("x86_64"), rootdir)
     shutil.copy(bzimage, os.path.join(rootdir, "bzImage"))
     if initrd:
         shutil.copy(initrd, os.path.join(rootdir, "initrd"))
-    rc = ["insmod /hv.ko", "hv on", boot_cmd]
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# scripts/hv-linux-test.py\n" + "\n".join(rc) + "\n")
 
@@ -83,13 +160,27 @@ def rootfs(tmp, bzimage, initrd, boot_cmd):
     return image
 
 
-def guest_lines(log):
-    return [l for l in open(log, errors="replace").read().splitlines() if "hvguest|" in l]
+def check_boot(args, txt):
+    """The one-shot `hv boot`: its report block, and the console in it."""
+    if not pt.check("the guest ran and its console came back",
+                    "--- end ttyS0 ---" in txt or "the guest printed nothing" in txt,
+                    txt[-1500:]):
+        return
+    block = txt[txt.find("--- ttyS0 ---"):txt.find("--- end ttyS0 ---")] if "--- ttyS0 ---" in txt else ""
+    for m in REQUIRED:
+        pt.check("the guest printed: %s" % m, re.search(m, block) is not None, block[-1500:])
+    if re.search(NICE, block):
+        print("note: the guest reached %r" % NICE)
+    if args.initrd:
+        for m in SHELL_MARKERS:
+            pt.check("the guest booted to a shell: %s" % m, re.search(m, block) is not None,
+                     block[-1500:])
+    for m in args.expect:
+        pt.check("the console shows: %s" % m, re.search(re.escape(m), block) is not None,
+                 block[-1500:])
 
 
 def run(args):
-    import re
-
     tmp = tempfile.mkdtemp(prefix="nos-hvlinux-")
     log = os.path.join(tmp, "serial.log")
 
@@ -101,7 +192,15 @@ def run(args):
         # cmdline=, which takes the rest of the line.
         boot_cmd += " input=" + args.input
     boot_cmd += " cmdline=" + args.cmdline
-    image = rootfs(tmp, args.bzimage, args.initrd, boot_cmd)
+    rc = ["insmod /hv.ko", "hv on"]
+    if not args.skip_boot:
+        rc.append(boot_cmd)
+    vm_lines, vm_checks = vm_commands(args) if args.initrd and not args.skip_vms else ([], [])
+    rc += vm_lines + [RC_LAST]
+    for line in rc:
+        if len(line) > 255:
+            sys.exit("an /etc/rc line is longer than rc takes (255): " + line)
+    image = rootfs(tmp, args.bzimage, args.initrd, rc)
 
     kvm = os.path.exists("/dev/kvm") and not args.tcg and hvt.host_has_svm()
     print("accelerator: %s" % ("KVM, the host's AMD-V" if kvm else "TCG, -cpu max"))
@@ -115,52 +214,43 @@ def run(args):
 
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        if not pt.check("nos boots and reaches the boot command",
-                        pt.wait_log(log, "> " + boot_cmd, args.deadline)):
+        if not pt.check("nos boots and runs /etc/rc",
+                        pt.wait_log(log, "> hv on", args.deadline)):
             return
-        # The guest's console comes back in the command's report block, which
-        # is printed when the vCPU stops -- so wait for the block's end (or a
-        # nos panic), then assert the guest's markers are in it. The vCPU runs
-        # for its whole budget here, since without a timer interrupt it does
-        # not reach a halt; the banner and device setup are all in the first
-        # guest millisecond regardless.
+        # Every line of /etc/rc, to its end: the one-shot boot runs its whole
+        # budget, and the VM phase waits on the guest as it goes.
         done = False
         t0 = time.time()
         while time.time() - t0 < args.deadline:
             txt = open(log, errors="replace").read()
             if "PANIC:" in txt:
-                pt.check("nos did not panic", False, txt[-2000:])
+                pt.check("nos did not panic", False, txt[-3000:])
                 return
-            if "--- end ttyS0 ---" in txt or "the guest printed nothing" in txt:
+            if RC_DONE.search(txt):
                 done = True
                 break
             time.sleep(3)
-
-        if not pt.check("the guest ran and its console came back", done,
-                        "\n".join(guest_lines(log)[-10:]) or "(no report block)"):
-            return
         txt = open(log, errors="replace").read()
-        block = txt[txt.find("--- ttyS0 ---"):txt.find("--- end ttyS0 ---")] if "--- ttyS0 ---" in txt else ""
-        for m in REQUIRED:
-            pt.check("the guest printed: %s" % m, re.search(m, block) is not None,
-                     block[-1500:])
-        if re.search(NICE, block):
-            print("note: the guest reached %r" % NICE)
-        if args.initrd:
-            for m in SHELL_MARKERS:
-                pt.check("the guest booted to a shell: %s" % m, re.search(m, block) is not None,
-                         block[-1500:])
-        for m in args.expect:
-            pt.check("the console shows: %s" % m, re.search(re.escape(m), block) is not None,
-                     block[-1500:])
+        if not pt.check("/etc/rc ran to its end", done, txt[-2000:]):
+            return
+
+        if not args.skip_boot:
+            check_boot(args, txt)
+        secs = sections(txt)
+        for (line, occurrence, what, pattern, must) in vm_checks:
+            out = output_of(secs, line, occurrence)
+            if out is None:
+                pt.check(what, False, "no output for %r" % line)
+                continue
+            found = re.search(pattern, out) is not None
+            pt.check(what, found == must, out[-1500:])
     finally:
         pt.kill(p)
-        tail = guest_lines(log)
-        if args.keep or not tail:
+        if args.verbose and os.path.exists(log):
+            print(open(log, errors="replace").read())
+        if args.keep or pt.failures:
             print("log at " + log)
-        if tail and args.verbose:
-            print("\n".join(tail))
-        if not args.keep:
+        else:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -173,10 +263,14 @@ def main():
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
     ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")
     ap.add_argument("--expect", action="append", default=[], help="extra text the console must contain (repeatable)")
-    ap.add_argument("--deadline", type=int, default=360, help="seconds to wait for the markers")
+    ap.add_argument("--deadline", type=int, default=900, help="seconds to wait for /etc/rc to finish")
+    ap.add_argument("--vm-secs", type=int, default=400,
+                    help="how long the first hv exec waits for the started guest's shell (at most 600)")
+    ap.add_argument("--skip-boot", action="store_true", help="leave out the one-shot hv boot")
+    ap.add_argument("--skip-vms", action="store_true", help="leave out the hv start phase")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM even if the host has AMD-V")
-    ap.add_argument("--keep", action="store_true", help="keep the serial log")
-    ap.add_argument("--verbose", action="store_true", help="print the guest's console at the end")
+    ap.add_argument("--keep", action="store_true", help="keep the serial log (it is kept on a failure anyway)")
+    ap.add_argument("--verbose", action="store_true", help="print the whole serial log at the end")
     args = ap.parse_args()
 
     if not os.path.exists(args.bzimage):

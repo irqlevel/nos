@@ -96,7 +96,7 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -351,15 +351,15 @@ half -- that on a kernel running at EL1 the module loads, says a guest
 cannot run here and names the exception level, and refuses `hv on` and
 `hv run` rather than attempting them.
 
-### `hv-linux-test.py` -- a real Linux bzImage printing its early console
+### `hv-linux-test.py` -- a real Linux bzImage, for a while and for good
 
-The third of the four hypervisor demos ([the hypervisor
+The third and fourth of the hypervisor demos ([the hypervisor
 page](hypervisor.md#what-comes-next)): `hv boot` loads an unmodified 64-bit
-Linux `bzImage` by the boot protocol, runs it on a vCPU, and streams its
-serial console to the kernel log a line at a time (`hvguest| ...`). The gate
-boots nos with a `bzImage` on its root filesystem, turns the extension on,
-runs `hv boot`, and watches for the kernel's banner and the first lines of
-its early setup.
+Linux `bzImage` by the boot protocol, runs it on a vCPU for a set time, and
+reports its serial console. The gate boots nos with a `bzImage` on its root
+filesystem and an `/etc/rc` that turns the extension on and runs `hv boot`,
+and looks in the report for the kernel's banner and the first lines of its
+early setup.
 
 It is a **manual** gate, not in CI: a `bzImage` is megabytes and CI cannot
 build one in the time it has, so the gate is pointed at a kernel by hand.
@@ -378,6 +378,20 @@ checks the guest reaches its `init` and a BusyBox shell, and with `--input
 'id\n' --expect uid=0` that the shell runs a command typed at it. The same
 guest has been run by hand on the AX41's real AMD-V, where it found what TCG
 cannot ([the hypervisor page](hypervisor.md#on-real-hardware)).
+
+With `--initrd` it then goes on to [guests that stay
+up](hypervisor.md#guests-that-stay-up), in the same boot: two `hv start`ed
+side by side and one stopped mid-boot; `hv exec` typed at the other while it
+is still booting -- answered at the prompt printed after the line went in,
+not at the one before it -- and again at its prompt, where the echo must come
+back whole (the cursor-position answer once made BusyBox wrap it); `hv send`,
+`hv wait`, `hv console`; `hv off` refusing to turn the extension off under
+the running guest; and `rmmod hv` stopping that guest before it turns the
+extension off, which the next load confirms and `dmesg` shows in order. Once
+the shell has the console, the kernel's own lines go to the log and not to
+it -- so the gate ends on a command's output (`version`) rather than on
+`rc: /etc/rc done`, and reads what the vCPU tasks and the unload said with
+`dmesg hv:`. `--skip-boot` and `--skip-vms` run one half.
 
 ## The hardware NIC drivers
 
