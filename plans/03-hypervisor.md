@@ -86,7 +86,9 @@ And against **3.2 and 3.3**, under AMD-V -- the first two of the four demos:
   can make loop forever inside the CPU) and of #MC (raised again into the
   host's handler, since the CPU will not), interrupt masking by the host's
   flag, nested paging, all-ones permission maps, AVIC/SEV/virtual VMSAVE
-  off, a full TLB flush -- and refuses a CPU with five-level paging, which
+  off, the ASID and the TLB control the CPU it is on hands out (per-CPU
+  generations, a full flush when a generation ends; a full flush on every
+  entry until 2026-09) -- and refuses a CPU with five-level paging, which
   a four-level nested table would be walked as; so the policy above it can
   be wrong about a guest without being wrong about the host.
 - `hv`: `GuestMemory` with copying volatile accessors and the nested table

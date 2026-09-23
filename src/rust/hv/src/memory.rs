@@ -253,10 +253,10 @@ impl GuestMemory {
         self.write(gpa, pod::bytes_of(value))
     }
 
-    /// The top of the nested table, for the VMCB: what `vmrun` translates
-    /// every guest physical address through.
+    /// The nested table, for the VMCB: what `vmrun` translates every guest
+    /// physical address through, and what the TLB may keep of it.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn nested_root(&self) -> u64 {
-        self.npt.root()
+    pub(crate) fn nested(&self) -> hvarch::x86::svm::Nested {
+        self.npt.nested()
     }
 }

@@ -12,8 +12,18 @@
 //! never read back to find the next level. The CPU sets accessed and dirty
 //! bits in entries as it walks; they are set from the start, so that it has
 //! nothing to write.
+//!
+//! And it only grows. An entry is written once, where there was none, and
+//! stays until the table goes -- which is what lets the guest keep what its
+//! entries into the TLB made of it from one entry to the next: its ASID
+//! stays its own while the table keeps its `id` (`hvarch::x86::svm::Asids`),
+//! and a translation the TLB holds is one the table would still make. An
+//! entry taken away or narrowed would change that, and whatever does it
+//! gives the table a new id -- which moves the guest onto a fresh ASID, clear
+//! of the old translation.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use hvarch::{Error, Result};
 use kcore::consts::PAGE_SIZE;
@@ -74,7 +84,13 @@ pub struct Npt {
     /// Every table, the top level first. An arena: a table is found by its
     /// index here, never by the address in an entry.
     tables: Vec<Table>,
+    /// Its identity for the TLB: no other table has it.
+    id: u64,
 }
+
+/// The next table's id. From 1, and never handed out twice in a load of the
+/// module -- which is as long as any guest's ASID lasts.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn index(gpa: u64, level: usize) -> usize {
     ((gpa >> SHIFTS[level]) as usize) & (ENTRIES - 1)
@@ -85,12 +101,12 @@ impl Npt {
         let mut tables = Vec::new();
         tables.try_reserve(1).map_err(|_| Error::NoMemory)?;
         tables.push(Table::new(false)?);
-        Ok(Self { tables })
+        Ok(Self { tables, id: NEXT_ID.fetch_add(1, Ordering::Relaxed) })
     }
 
-    /// The top level's physical address: `nCR3`.
-    pub fn root(&self) -> u64 {
-        self.tables[0].page.phys()
+    /// The top level's physical address, `nCR3`, and the table's id.
+    pub fn nested(&self) -> hvarch::x86::svm::Nested {
+        hvarch::x86::svm::Nested { root: self.tables[0].page.phys(), id: self.id }
     }
 
     /// The last-level table that maps `gpa`, making the levels above it as

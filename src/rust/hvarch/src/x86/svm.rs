@@ -10,9 +10,10 @@
 
 use core::arch::{asm, naked_asm};
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use kcore::dma::DmaBuffer;
+use kcore::percpu::{ConstInit, CpuLocal};
 
 use super::cpu;
 use crate::{Error, Result};
@@ -324,6 +325,140 @@ pub enum NotRun {
     FiveLevelPaging { cpu: u32 },
 }
 
+/// A nested page table as an entry needs it: the physical address of its
+/// top level, and an identity no other table ever has -- nor this one, once
+/// anything it translated has changed.
+#[derive(Clone, Copy, Debug)]
+pub struct Nested {
+    pub root: u64,
+    pub id: u64,
+}
+
+/// A CPU's address space identifiers.
+///
+/// The TLB tags every translation a guest makes with the ASID it ran under,
+/// and keeps it until something flushes it. So an ASID handed to a second
+/// guest while the first one's translations are still there hands the
+/// second guest the first one's memory -- and one handed out again after
+/// its guest has gone hands out pages that are back with the host. Every
+/// entry used to flush the whole TLB for that reason: always right, and
+/// every exit cost the guest its translations and the host its own.
+///
+/// What is done instead: each CPU hands its ASIDs out one at a time, each
+/// at most once a *generation*, and a generation ends -- when they run out
+/// -- with a flush of every entry of every ASID, at that CPU's next entry
+/// into any guest. A guest keeps its ASID, and its translations with it,
+/// only while it keeps entering on the CPU, in the generation and over the
+/// nested table it was given it for ([`AsidTag`]); anything else and it is
+/// given the next one. So no ASID is live for two guests, or for a guest
+/// and one that has gone, without a flush in between. And every CPU begins
+/// run out, each time the module is loaded, so that nothing an earlier
+/// load's guests left in a TLB is there for this one's.
+///
+/// Touched only by [`Guest::run`], on its own CPU with interrupts off: a
+/// [`CpuLocal`].
+struct Asids {
+    /// 0 until the CPU first hands one out: no guest's tag has it.
+    generation: u64,
+    /// The next to hand out; past `max`, the generation is over.
+    next: u32,
+    /// The most there are: one less than the count CPUID gives, since the
+    /// host's is 0. Read when the first generation begins.
+    max: u32,
+    /// The flush that ends a generation has not happened yet, and every
+    /// entry here asks for it until one has -- not only the entry that ran
+    /// out, since the CPU flushes nothing for an entry it refuses.
+    flush: bool,
+}
+
+impl ConstInit for Asids {
+    /* Run out: the first entry hands out the first ASID of a generation,
+     * with the flush that begins it. */
+    const INIT: Self = Asids { generation: 0, next: 1, max: 0, flush: false };
+}
+
+static ASIDS: CpuLocal<Asids> = CpuLocal::new();
+
+/// Where a guest's ASID came from: the CPU and the generation it was handed
+/// out in, and the nested table it translates through.
+#[derive(Clone, Copy)]
+struct AsidTag {
+    cpu: u32,
+    generation: u64,
+    table: u64,
+    asid: u32,
+}
+
+/// Fewer ASIDs than the CPU has, while any [`AsidLimit`] lives; 0 for none.
+static ASID_LIMIT: AtomicU32 = AtomicU32::new(0);
+static ASID_LIMITERS: AtomicU32 = AtomicU32::new(0);
+
+impl Asids {
+    /// The ASID a guest with `tag` enters under on `cpu`, over the table
+    /// `table`, and the TLB control of that entry -- or None when the CPU
+    /// has no ASID to give.
+    fn assign(&mut self, tag: &mut Option<AsidTag>, cpu: u32, table: u64) -> Option<(u32, u8)> {
+        let asid = match *tag {
+            Some(t) if t.cpu == cpu && t.generation == self.generation && t.table == table => t.asid,
+            _ => {
+                let limit = ASID_LIMIT.load(Ordering::Relaxed);
+                let max = if limit != 0 { self.max.min(limit) } else { self.max };
+                if self.next > max {
+                    /* Asked of this CPU itself, every generation: two CPUs
+                     * of one machine could differ, and it is cheap once
+                     * every few thousand guests. The host's ASID is 0, so a
+                     * CPU with fewer than two has nothing to give. */
+                    self.max = cpu::cpuid(CPUID_SVM)?.ebx.checked_sub(1).filter(|m| *m != 0)?;
+                    self.generation += 1;
+                    self.next = 1;
+                    self.flush = true;
+                }
+                let asid = self.next;
+                self.next += 1;
+                *tag = Some(AsidTag { cpu, generation: self.generation, table, asid });
+                asid
+            }
+        };
+        Some((asid, if self.flush { vmcb::tlb::FLUSH_ALL } else { vmcb::tlb::NOTHING }))
+    }
+
+    /// After an entry with TLB control `control`: the generation's flush is
+    /// done once the CPU has taken an entry that asked for it.
+    fn entered(&mut self, control: u8, exit_code: u64) {
+        if control == vmcb::tlb::FLUSH_ALL && exit_code != vmcb::exit::INVALID {
+            self.flush = false;
+        }
+    }
+}
+
+/// The CPU this runs on, and its ASID generation: how many times it has run
+/// out, 0 before it first handed one out. For a test.
+pub fn asid_generation() -> Option<(u32, u64)> {
+    ASIDS.with(|a, cpu| (cpu as u32, a.generation))
+}
+
+/// No more than `n` ASIDs handed out a generation, for as long as this
+/// lives: what a test takes to end a generation every few guests, the end
+/// of one being where a missing flush would show. More flushes is all it
+/// can cause -- the limit only brings the end of a generation nearer.
+pub struct AsidLimit(());
+
+impl AsidLimit {
+    pub fn new(n: u32) -> Self {
+        ASID_LIMITERS.fetch_add(1, Ordering::AcqRel);
+        ASID_LIMIT.store(n.max(1), Ordering::Relaxed);
+        AsidLimit(())
+    }
+}
+
+impl Drop for AsidLimit {
+    fn drop(&mut self) {
+        if ASID_LIMITERS.fetch_sub(1, Ordering::AcqRel) == 1 {
+            ASID_LIMIT.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The guest's x87, MMX and SSE registers, in FXSAVE's format: what
 /// `vmrun` does not switch, and so what [`Guest::run`] does, on every entry
 /// and exit. The host uses none of these registers -- its C++ is built
@@ -359,6 +494,21 @@ impl FxArea {
 /// does not switch holds anything of another guest's.
 const GUEST_XCR0: u64 = 1;
 
+/// Where an entry's time goes, in time-stamp counter ticks summed over the
+/// entries made while it was asked for: the checks and the ASID, before
+/// anything is switched; the guest's x87 and SSE registers and XCR0 put in;
+/// `vmrun` to `#vmexit`, the stub's VMSAVE and VMLOAD on either side and
+/// whatever the guest ran included; and the registers taken back out. For a
+/// benchmark, which turns it on for one guest.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Profile {
+    pub entries: u64,
+    pub checks: u64,
+    pub switch_in: u64,
+    pub world: u64,
+    pub switch_out: u64,
+}
+
 /// A guest's CPU as SVM keeps it: the VMCB, the registers `vmrun` leaves to
 /// software, the page the host's own FS, GS, TR, LDTR and syscall MSRs
 /// wait in while the guest runs, and the x87 and SSE state.
@@ -369,6 +519,13 @@ pub struct Guest {
     /// One element, on the heap: a `Vec` because it can be made fallibly.
     fx: alloc::vec::Vec<FxArea>,
     xsave: bool,
+    /// The ASID it last entered under, and where that came from; None until
+    /// its first entry.
+    asid: Option<AsidTag>,
+    /// Flush the whole TLB on every entry, as before there were ASIDs: what
+    /// a benchmark compares against.
+    flush_always: bool,
+    profile: Option<Profile>,
 }
 
 impl Guest {
@@ -382,7 +539,30 @@ impl Guest {
             regs: GuestRegs::default(),
             fx,
             xsave: cpu::has_xsave(),
+            asid: None,
+            flush_always: false,
+            profile: None,
         })
+    }
+
+    /// Time each entry from now on ([`Profile`]), or stop.
+    pub fn set_profile(&mut self, on: bool) {
+        self.profile = if on { Some(Profile::default()) } else { None };
+    }
+
+    pub fn profile(&self) -> Option<Profile> {
+        self.profile
+    }
+
+    /// The ASID of its last entry, for a report.
+    pub fn asid(&self) -> Option<u32> {
+        self.asid.map(|t| t.asid)
+    }
+
+    /// Flush the whole TLB on every entry from now on, or stop: always
+    /// sound, since a flush takes nothing from a guest but time.
+    pub fn set_flush_always(&mut self, on: bool) {
+        self.flush_always = on;
     }
 
     pub fn fx(&self) -> &FxArea {
@@ -421,19 +601,21 @@ impl Guest {
     /// Before it enters, the VMCB is made safe for the host whatever the
     /// caller put in it: the intercepts in `HOST_MISC1`, `HOST_MISC2` and
     /// `HOST_EXCEPTIONS` set, physical interrupts masked by the host's flag
-    /// and not the guest's, nested paging on over `nested_cr3` and SEV, AVIC
+    /// and not the guest's, nested paging on over `nested` and SEV, AVIC
     /// and virtual VMSAVE off, the permission maps `perms`, and nothing
-    /// assumed clean. And every entry flushes the whole
-    /// TLB: guests share an address space identifier until there is an
-    /// allocator that knows when one may be reused, and a translation left
-    /// over from another guest -- or from this one, to a page since freed
-    /// and handed back to the host -- is the host's memory in a guest's
-    /// hands.
+    /// assumed clean. The ASID and the TLB control are this CPU's to give
+    /// ([`Asids`]): the one the guest had while it keeps to this CPU, this
+    /// generation and this table, the next one otherwise, and a flush of
+    /// everything when a generation ends.
     ///
     /// # Safety
-    /// `nested_cr3` is the top of a nested page table that maps nothing but
+    /// `nested.root` is the top of a nested page table that maps nothing but
     /// memory given to this guest, and the table and that memory stay
-    /// allocated until this returns.
+    /// allocated until this returns. `nested.id` is that table's alone, and
+    /// the table keeps it only while every translation it has made is still
+    /// what it would make: it gains entries, never loses or narrows one. The
+    /// guest's translations from earlier entries stay in the TLB for exactly
+    /// as long as the id does.
     ///
     /// `host_areas[cpu]`, for the CPU this runs on, is 0 or the physical
     /// address of the host save area that CPU was given when SVM was turned
@@ -443,13 +625,10 @@ impl Guest {
     pub unsafe fn run(
         &mut self,
         perms: &Permissions,
-        nested_cr3: u64,
+        nested: Nested,
         host_areas: &[AtomicU64],
     ) -> core::result::Result<u32, NotRun> {
         {
-            /* Not the address space identifier: an ASID of 0, the host's,
-             * is refused by `vmrun` itself, and the refusal hands the guest
-             * nothing. */
             let c = &mut self.vmcb.get_mut().control;
             c.intercept_misc1 |= HOST_MISC1;
             c.intercept_misc2 |= HOST_MISC2;
@@ -457,12 +636,11 @@ impl Guest {
             c.int_ctl = (c.int_ctl | vmcb::int_ctl::V_INTR_MASKING)
                 & !(vmcb::int_ctl::AVIC_ENABLE | vmcb::int_ctl::X2AVIC_ENABLE);
             c.nested_ctl = vmcb::nested::NP_ENABLE;
-            c.nested_cr3 = nested_cr3;
+            c.nested_cr3 = nested.root;
             c.iopm_base_pa = perms.iopm.phys();
             c.msrpm_base_pa = perms.msrpm.phys();
             c.virt_ext = 0;
             c.clean = 0;
-            c.tlb_control = vmcb::tlb::FLUSH_ALL;
         }
 
         let guest = self.vmcb.phys();
@@ -470,8 +648,18 @@ impl Guest {
         let regs: *mut GuestRegs = &mut self.regs;
         let fx: *mut FxArea = &mut self.fx[0];
         let xsave = self.xsave;
-        let vmcb = &self.vmcb;
-        kcore::cpu::with_interrupts_off(|cpu| {
+        let flush_always = self.flush_always;
+        let tag = &mut self.asid;
+        let vmcb = &mut self.vmcb;
+        let profile = &mut self.profile;
+        let stamp = |on: bool| if on { cpu::rdtsc() } else { 0 };
+        /* `with` is None only on a CPU past the table, which no CPU the
+         * extension is on for is. */
+        let off = || NotRun::Off { cpu: kcore::cpu::id() };
+        ASIDS.with(|asids, cpu| {
+            let cpu = cpu as u32;
+            let timed = profile.is_some();
+            let t0 = stamp(timed);
             let expected = host_areas.get(cpu as usize).map_or(0, |a| a.load(Ordering::Acquire));
             /* SVM on, and the host save area the one this CPU was given --
              * not one some earlier load left behind -- and with interrupts
@@ -480,8 +668,21 @@ impl Guest {
             if expected == 0 || !enabled() || host_area() != expected {
                 return Err(NotRun::Off { cpu });
             }
-            if cpu::read_cr4() & CR4_LA57 != 0 {
+            let cr4 = cpu::read_cr4();
+            if cr4 & CR4_LA57 != 0 {
                 return Err(NotRun::FiveLevelPaging { cpu });
+            }
+            /* Here, with interrupts off, so that the CPU the ASID is for is
+             * the CPU `vmrun` runs on. Never 0, the host's: `vmrun` refuses
+             * that itself, and the refusal hands the guest nothing. */
+            let (asid, mut control) = asids.assign(tag, cpu, nested.id).ok_or(NotRun::Off { cpu })?;
+            if flush_always {
+                control = vmcb::tlb::FLUSH_ALL;
+            }
+            {
+                let c = &mut vmcb.get_mut().control;
+                c.guest_asid = asid;
+                c.tlb_control = control;
             }
             /* The x87 and SSE registers are the guest's from here to the
              * FXSAVE after the exit. CR4.OSFXSR for FXSAVE and FXRSTOR to
@@ -491,45 +692,61 @@ impl Guest {
              * window the host's CPU is as it booted -- an SSE instruction
              * where none may be still faults. `vmrun` saves this CR4 as the
              * host's and `#vmexit` restores it. */
-            let cr4 = cpu::read_cr4();
+            let t1 = stamp(timed);
             let window = cr4 | cpu::CR4_OSFXSR | if xsave { cpu::CR4_OSXSAVE } else { 0 };
             unsafe { cpu::write_cr4(window) };
-            let host_xcr0 = if xsave {
-                /* OSXSAVE is set, and x87 alone is an XCR0 every CPU with
-                 * XSAVE takes. */
-                let x = unsafe { cpu::xgetbv0() };
+            /* OSXSAVE is set. XCR0 is written only when it is not the
+             * guest's already: XSETBV serializes the CPU, and nothing in
+             * this kernel changes XCR0 from the x87 alone a CPU comes out of
+             * reset with -- firmware that used AVX may have, and then it is
+             * switched both ways. x87 alone is an XCR0 every CPU with XSAVE
+             * takes. */
+            let host_xcr0 = if xsave { unsafe { cpu::xgetbv0() } } else { GUEST_XCR0 };
+            let switch_xcr0 = host_xcr0 != GUEST_XCR0;
+            if switch_xcr0 {
                 unsafe { cpu::xsetbv0(GUEST_XCR0) };
-                x
-            } else {
-                0
-            };
+            }
             /* `fx` is this guest's own area, aligned to 16. */
             unsafe { asm!("fxrstor64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
 
             /* The two VMCBs are pages this guest owns, `regs` is its own
              * field, and the checks above are the rest of what the stub
              * needs. */
+            let t2 = stamp(timed);
             unsafe { vmrun_stub(guest, regs, host) };
+            let t3 = stamp(timed);
 
             unsafe { asm!("fxsave64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
-            if xsave {
+            if switch_xcr0 {
                 /* The value read above, on this CPU. */
                 unsafe { cpu::xsetbv0(host_xcr0) };
             }
             unsafe { cpu::write_cr4(cr4) };
+            if let Some(p) = profile.as_mut() {
+                let t4 = stamp(timed);
+                p.entries += 1;
+                p.checks += t1.saturating_sub(t0);
+                p.switch_in += t2.saturating_sub(t1);
+                p.world += t3.saturating_sub(t2);
+                p.switch_out += t4.saturating_sub(t3);
+            }
+
+            let exit_code = vmcb.get().control.exit_code;
+            asids.entered(control, exit_code);
 
             /* Still on this CPU, with interrupts off: an intercepted machine
              * check is one the host's handler has not seen, and the CPU will
              * not deliver it. Raising the vector hands it over as though it
              * had been -- to a handler that panics, which is what a machine
              * check in this kernel is. */
-            if vmcb.get().control.exit_code == vmcb::exit::EXCP_BASE + VECTOR_MC as u64 {
+            if exit_code == vmcb::exit::EXCP_BASE + VECTOR_MC as u64 {
                 /* Vector 18's gate, as the CPU would have used it; the
                  * handler takes no error code, and `int` pushes none. */
                 unsafe { asm!("int 0x12") };
             }
             Ok(cpu)
         })
+        .unwrap_or_else(|| Err(off()))
     }
 }
 

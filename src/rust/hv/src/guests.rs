@@ -23,6 +23,10 @@
 //!              CPU's own answer would be VMEXIT_INVALID and nothing more
 //!   spin       `cli; jmp $` does not keep the host's interrupts out, and
 //!              the host stops it when its time is up
+//!   asid       three VMs on one CPU, each reading its own page at one
+//!              address: two taking turns never read each other's, and the
+//!              third, given an ASID one of them had, reads its own too --
+//!              what a TLB entry left under a reused ASID would get wrong
 //!
 //! Every one starts in long mode with paging on, as a 64-bit Linux kernel
 //! is started. Not only because that is where a guest of this hypervisor is
@@ -325,15 +329,293 @@ const GUESTS: &[Spec] = &[
     },
 ];
 
+/* N rounds of: a read of each of K pages, 4 KiB apart from 0x10000 up,
+ * then a CPUID the host answers. With K 0 it is exits back to back and
+ * nothing else -- what a round trip through the host costs, and nothing a
+ * device model adds; with K pages, each exit is followed by K translations,
+ * which a TLB flushed on the way in has to walk again. N goes in at
+ * `BENCH_ROUNDS_AT`, K at `BENCH_PAGES_AT`. */
+const BENCH_CODE: [u8; 42] = [
+    0xBE, 0x00, 0x00, 0x00, 0x00,                   // mov esi, N
+    0xBF, 0x00, 0x00, 0x01, 0x00,                   // .round: mov edi, 0x10000
+    0xB9, 0x00, 0x00, 0x00, 0x00,                   // mov ecx, K
+    0x67, 0xE3, 0x0C,                               // jecxz .exit
+    0x8B, 0x07,                                     // .touch: mov eax, [rdi]
+    0x81, 0xC7, 0x00, 0x10, 0x00, 0x00,             // add edi, 0x1000
+    0xFF, 0xC9,                                     // dec ecx
+    0x75, 0xF4,                                     // jnz .touch
+    0xB8, 0x00, 0x53, 0x4F, 0x4E,                   // .exit: mov eax, 0x4e4f5300
+    0x0F, 0xA2,                                     // cpuid
+    0xFF, 0xCE,                                     // dec esi
+    0x75, 0xDC,                                     // jnz .round
+    0xF4,                                           // hlt
+];
+const BENCH_ROUNDS_AT: usize = 1;
+const BENCH_PAGES_AT: usize = 11;
+const BENCH_HLT: u64 = ENTRY + 0x29;
+/// Where the pages it reads start, and the most there are: up to the end
+/// of its memory.
+const BENCH_PAGES_BASE: u64 = 0x10000;
+pub const BENCH_MAX_PAGES: u32 = ((MEMORY - BENCH_PAGES_BASE) / kcore::consts::PAGE_SIZE as u64) as u32;
+/// Long enough for a million exits under TCG, twice emulated.
+const BENCH_BUDGET_MS: u64 = 120_000;
+
+/// What `bench` measured.
+pub struct Bench {
+    pub exits: u64,
+    pub ns: u64,
+    /// Time-stamp counter ticks over the same stretch as `ns`.
+    pub ticks: u64,
+    /// The host's interrupts among the exits.
+    pub host: u32,
+    pub profile: Option<hvarch::x86::svm::Profile>,
+}
+
+/// What a VM exit costs on the CPU this runs on: `exits` CPUIDs, each after
+/// a read of each of `pages` pages -- with a flush of the whole TLB on every
+/// entry when `flush` says so, for what that costs, and each entry timed in
+/// its parts when `profile` does. Timed from the first entry to the halt --
+/// or why it did not run to its halt.
+pub fn bench(machine: &Machine, exits: u32, pages: u32, flush: bool, profile: bool)
+    -> core::result::Result<Bench, String>
+{
+    if pages > BENCH_MAX_PAGES {
+        return Err(alloc::format!("{} pages is more than its {}", pages, BENCH_MAX_PAGES));
+    }
+    let mut code = BENCH_CODE;
+    code[BENCH_ROUNDS_AT..BENCH_ROUNDS_AT + 4].copy_from_slice(&exits.to_le_bytes());
+    code[BENCH_PAGES_AT..BENCH_PAGES_AT + 4].copy_from_slice(&pages.to_le_bytes());
+    let mut vm = Vm::new(machine, ALL_EXCEPTIONS).map_err(|e| alloc::format!("no VM: {}", e))?;
+    board(&mut vm, &code).map_err(|e| alloc::format!("no guest: {}", e))?;
+    vm.vcpu_mut().set_flush_always(flush);
+    vm.vcpu_mut().set_profile(profile);
+    let t0 = hvarch::x86::cpu::rdtsc();
+    let r = run(&mut vm, machine, BENCH_BUDGET_MS);
+    let ticks = hvarch::x86::cpu::rdtsc().saturating_sub(t0);
+    halted_at(&r, BENCH_HLT)?;
+    if r.cpuid != exits {
+        return Err(alloc::format!("{} CPUID exits of {}", r.cpuid, exits));
+    }
+    Ok(Bench { exits: u64::from(r.cpuid), ns: r.ns, ticks, host: r.host, profile: vm.vcpu().profile() })
+}
+
+/* ---- asid: what the TLB keeps between one guest's entries and another's --
+ *
+ * The same program in three VMs, each with a marker of its own at 0x10000:
+ * it reads the marker, then N times makes an exit and reads it again, and
+ * leaves how many reads differed from the first, and the first, for the
+ * host. A and B take turns on one CPU, an exit each; C is made once both
+ * have gone, with the ASIDs a generation limited to two, so that the one it
+ * is given is one A or B had, after the flush that ended their generation.
+ * A reused ASID whose flush was missed reads another guest's page -- a page
+ * gone back to the host, for C. Under TCG every entry flushes whatever the
+ * VMCB asks, so this can only fail on a CPU that keeps translations. */
+const ASID_CODE: [u8; 59] = [
+    0xBE, 0x00, 0x00, 0x00, 0x00,                   // mov esi, N
+    0x44, 0x8B, 0x2C, 0x25, 0x00, 0x00, 0x01, 0x00, // mov r13d, [0x10000]
+    0x45, 0x31, 0xE4,                               // xor r12d, r12d
+    0xB8, 0x00, 0x53, 0x4F, 0x4E,                   // .round: mov eax, 0x4e4f5300
+    0x0F, 0xA2,                                     // cpuid
+    0x8B, 0x04, 0x25, 0x00, 0x00, 0x01, 0x00,       // mov eax, [0x10000]
+    0x44, 0x39, 0xE8,                               // cmp eax, r13d
+    0x74, 0x03,                                     // je .same
+    0x41, 0xFF, 0xC4,                               // inc r12d
+    0xFF, 0xCE,                                     // .same: dec esi
+    0x75, 0xE6,                                     // jnz .round
+    0x44, 0x89, 0x24, 0x25, 0x00, 0x70, 0x00, 0x00, // mov [0x7000], r12d
+    0x44, 0x89, 0x2C, 0x25, 0x04, 0x70, 0x00, 0x00, // mov [0x7004], r13d
+    0xF4,                                           // hlt
+];
+const ASID_ROUNDS_AT: usize = 1;
+const ASID_ROUNDS: u32 = 8;
+const ASID_HLT: u64 = ENTRY + 0x3A;
+const ASID_MARKER_AT: u64 = 0x10000;
+const ASID_MARKERS: [u32; 3] = [0x4141_4141, 0x4242_4242, 0x4343_4343];
+const ASID_NAMES: [char; 3] = ['A', 'B', 'C'];
+/// ASIDs a generation while it runs: two, so that the third VM ends one.
+const ASID_LIMIT: u32 = 2;
+const ASID_BUDGET_MS: u64 = 5000;
+
+/// What the several VMs of a check did between them.
+#[derive(Default)]
+struct Tally {
+    cpus: u64,
+    cpuid: u32,
+    host: u32,
+    /// The CPU the extension was not on for, when nothing ran at all.
+    not_on: Option<u32>,
+}
+
+fn asid_vm(machine: &Machine, which: usize) -> core::result::Result<Vm, String> {
+    let mut code = ASID_CODE;
+    code[ASID_ROUNDS_AT..ASID_ROUNDS_AT + 4].copy_from_slice(&ASID_ROUNDS.to_le_bytes());
+    let mut vm = Vm::new(machine, ALL_EXCEPTIONS).map_err(|e| alloc::format!("no VM: {}", e))?;
+    board(&mut vm, &code).map_err(|e| alloc::format!("no guest: {}", e))?;
+    vm.memory_mut().write_obj(ASID_MARKER_AT, &ASID_MARKERS[which])
+        .map_err(|e| alloc::format!("no marker: {}", e))?;
+    Ok(vm)
+}
+
+/// Into `vm` until its next CPUID, which is answered, or its halt: true
+/// once it has halted.
+fn asid_step(vm: &mut Vm, machine: &Machine, tally: &mut Tally, deadline: u64)
+    -> core::result::Result<bool, String>
+{
+    loop {
+        if time::boot_time_ns() >= deadline {
+            return Err(String::from("it ran out of time"));
+        }
+        let (exit, cpu) = match vm.enter(machine) {
+            Ok(entered) => entered,
+            Err(Refusal::NotOn(cpu)) if tally.cpus == 0 => {
+                tally.not_on = Some(cpu);
+                return Err(String::from("not run"));
+            }
+            Err(refusal) => return Err(alloc::format!("not entered: {:?}", refusal)),
+        };
+        tally.cpus |= 1u64 << (cpu as u64 % u64::BITS as u64);
+        match exit {
+            Exit::Host => tally.host += 1,
+            Exit::Cpuid => {
+                vm.vcpu_mut().skip_cpuid();
+                tally.cpuid += 1;
+                return Ok(false);
+            }
+            Exit::Hlt if vm.vcpu().save().rip == ASID_HLT => return Ok(true),
+            other => {
+                return Err(alloc::format!("an exit with no answer here: {:?} at {:#x}", other, vm.vcpu().save().rip));
+            }
+        }
+    }
+}
+
+/// What VM `which` found at its marker, every time.
+fn asid_found(vm: &Vm, which: usize) -> core::result::Result<(), String> {
+    let differed: u32 = read(vm, RESULTS)?;
+    let first: u32 = read(vm, RESULTS + 4)?;
+    if first != ASID_MARKERS[which] {
+        return Err(alloc::format!("vm {} read {:#x} at its marker, not its own {:#x}: another guest's page, through a translation its ASID should not have had",
+                                  ASID_NAMES[which], first, ASID_MARKERS[which]));
+    }
+    if differed != 0 {
+        return Err(alloc::format!("vm {} read something else at its marker {} times of {}", ASID_NAMES[which], differed, ASID_ROUNDS));
+    }
+    Ok(())
+}
+
+fn asid_check(machine: &Machine, tally: &mut Tally) -> core::result::Result<String, String> {
+    let deadline = time::boot_time_ns() + ASID_BUDGET_MS * kcore::consts::NS_PER_MS;
+    let _limit = hvarch::x86::svm::AsidLimit::new(ASID_LIMIT);
+    let (cpu, before) = hvarch::x86::svm::asid_generation().ok_or_else(|| String::from("no ASIDs on this CPU"))?;
+
+    let mut a = asid_vm(machine, 0)?;
+    let mut b = asid_vm(machine, 1)?;
+    let (mut a_done, mut b_done) = (false, false);
+    while !(a_done && b_done) {
+        if !a_done {
+            a_done = asid_step(&mut a, machine, tally, deadline)?;
+        }
+        if !b_done {
+            b_done = asid_step(&mut b, machine, tally, deadline)?;
+        }
+    }
+    asid_found(&a, 0)?;
+    asid_found(&b, 1)?;
+    let had = [a.vcpu().asid(), b.vcpu().asid()];
+    drop(a);
+    drop(b);
+
+    let mut c = asid_vm(machine, 2)?;
+    while !asid_step(&mut c, machine, tally, deadline)? {}
+    asid_found(&c, 2)?;
+    let given = c.vcpu().asid();
+
+    let (cpu_after, after) = hvarch::x86::svm::asid_generation().ok_or_else(|| String::from("no ASIDs on this CPU"))?;
+    if tally.cpus != 1u64 << cpu || cpu_after != cpu {
+        return Ok(String::from("each read its own page; on more than one CPU, so the end of a generation was not what C was given"));
+    }
+    if after == before {
+        return Err(alloc::format!("with {} ASIDs a generation, three VMs ended none", ASID_LIMIT));
+    }
+    let whose = match given {
+        Some(n) if Some(n) == had[0] => "vm A",
+        Some(n) if Some(n) == had[1] => "vm B",
+        _ => return Err(alloc::format!("vm C was given ASID {:?}, which neither A ({:?}) nor B ({:?}) had", given, had[0], had[1])),
+    };
+    Ok(alloc::format!("A and B each read their own page taking turns; vm C was given ASID {}, which {} had, after {} generation(s) ended, and read its own too",
+                      given.unwrap_or(0), whose, after - before))
+}
+
+fn run_asid(machine: &Machine) -> Several {
+    let start = time::boot_time_ns();
+    let mut tally = Tally::default();
+    let verdict = asid_check(machine, &mut tally);
+    Several { tally, ns: time::boot_time_ns().saturating_sub(start), verdict }
+}
+
+/// A check that takes more than one VM: made, run and judged by `run`.
+struct SeveralSpec {
+    name: &'static str,
+    about: &'static str,
+    run: fn(&Machine) -> Several,
+}
+
+/// What such a check did.
+struct Several {
+    tally: Tally,
+    ns: u64,
+    verdict: core::result::Result<String, String>,
+}
+
+const SEVERAL: &[SeveralSpec] = &[
+    SeveralSpec {
+        name: "asid",
+        about: "three VMs on one CPU, and none reads another's page through the TLB",
+        run: run_asid,
+    },
+];
+
+fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
+    let s = (spec.run)(machine);
+    if let Some(cpu) = s.tally.not_on {
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first",
+                         spec.name, cpu);
+        return false;
+    }
+    let _ = write!(out, "  ran on     cpu");
+    for cpu in 0..u64::BITS {
+        if s.tally.cpus & (1u64 << cpu) != 0 {
+            let _ = write!(out, " {}", cpu);
+        }
+    }
+    let _ = writeln!(out, "{}, {} us", if s.tally.cpus == 0 { " none" } else { "" }, s.ns / kcore::consts::NS_PER_US);
+    let _ = writeln!(out, "  exits      {} cpuid, {} host interrupt", s.tally.cpuid, s.tally.host);
+    match s.verdict {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", spec.name);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
+            false
+        }
+    }
+}
+
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
-    GUESTS.iter().map(|g| g.name)
+    GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
 }
 
 /// Run the built-in guest `name` on the CPU this is called on and say what
 /// it did. `None` when there is no such guest; otherwise whether it did
 /// what it was told.
 pub fn run_one(machine: &Machine, name: &str, out: &mut dyn Write) -> Option<bool> {
+    if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
+        return Some(run_several(machine, spec, out));
+    }
     let spec = GUESTS.iter().find(|g| g.name == name)?;
     Some(run_spec(machine, spec, out))
 }

@@ -330,8 +330,16 @@ first CPU and then to the last, and each has to have done what it was told
 -- not only "ok": the report's own lines are checked, the nested page
 fault's address, error code and instruction, the port and CPUID counts, the
 fifteen registers each way across the hypercall, a host interrupt count
-above zero for the spin. The unload that follows, and the load after it,
-are then of a hypervisor that has run guests on those CPUs.
+above zero for the spin, and for `asid` that the third VM was given an ASID
+one of the first two had, after a generation ended, and each read its own
+page. The unload that follows, and the load after it, are then of a
+hypervisor that has run guests on those CPUs.
+
+What `asid` is for -- a translation a reused ASID should not have had --
+can only show on a CPU that keeps translations between entries: TCG flushes
+its own on every `vmrun`. Under TCG it checks the allocator's side, that the
+third VM's ASID is one of the first two's and that a generation ended in
+between; on the AX41 it checks the TLB's.
 
 It has been shown to fail the way it is meant to, three ways. With
 `disable_here` changed to report every CPU turned off and turn none of them

@@ -143,9 +143,10 @@ pub struct Machine {
     /// The physical address of each CPU's page, or 0: the table's pages as
     /// entering a guest has to check them -- with interrupts off, where the
     /// mutex cannot be taken. Set once the CPU has taken its page and before
-    /// the table holds it; cleared once the CPU has let go of it and before
-    /// the page is freed. So a CPU's entry here is never the address of a
-    /// page that has gone.
+    /// the table holds it; cleared before the CPU is told to let go of it,
+    /// and so before the page is freed. So a CPU's entry here is never the
+    /// address of a page that has gone, nor of one for a CPU the extension
+    /// is off for.
     host_areas: [AtomicU64; MAX_CPUS],
 }
 
@@ -288,6 +289,12 @@ impl Machine {
                 continue;
             }
 
+            /* No entry finds this CPU's page from here on, so no entry finds
+             * a page for a CPU the extension has gone off for. One that
+             * looked before this has interrupts off until its guest exits,
+             * and the IPI below waits for that. */
+            self.host_areas[i].store(0, Ordering::Release);
+
             /* Every CPU asked for, not only the ones this module has a page
              * for: a load that found the extension already on has no page
              * for that CPU and turning it off is still the right thing --
@@ -306,7 +313,6 @@ impl Machine {
              * touch it again either. Dropping it here frees it: off the
              * machine's own lock only in the sense that matters, from task
              * context, where the page allocator's TLB shootdown can wait. */
-            self.host_areas[i].store(0, Ordering::Release);
             cpus.page[i] = None;
         }
         done
