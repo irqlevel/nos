@@ -589,13 +589,19 @@ nos-guest: init is up, / on ramfs, busybox v1.36.1
 Linux (none) 6.18.53 #1 x86_64 GNU/Linux
 
 BusyBox v1.36.1 built-in shell (ash)
+~ # id
+uid=0 gid=0
 ~ #
   --- end ttyS0 ---
 ```
 
-The gate is `scripts/hv-linux-test.py`, a manual one (a `bzImage` is
-megabytes and CI cannot build one in its time), pointed at a kernel by hand;
-with `--initrd` it checks the guest reaches its `init` and a shell.
+The shell reads what is typed at it: `hv boot ... input='id\n'` hands the
+guest a line once it is at a prompt, and the 8250's receive path -- with the
+answer to the cursor-position query (`ESC[6n`) a line editor sends first --
+carries it. The gate is `scripts/hv-linux-test.py`, a manual one (a `bzImage`
+is megabytes and CI cannot build one in its time), pointed at a kernel by
+hand; with `--initrd` it checks the guest reaches its `init` and a shell, and
+`--input 'id\n' --expect uid=0` checks it runs the command.
 
 ## What comes next
 
@@ -611,14 +617,12 @@ thing that can be shown in half a minute:
 4. ~~a full boot to a shell over that UART, with an initramfs, on one
    vCPU~~ -- with an initramfs, a BusyBox shell.
 
-All four demos are done. What is left, not in step order: the terminal
-handshake so the shell reads a typed command reliably (the receive path and
-the cursor-query answer are here, `hv boot ... input=`, but a busybox line
-editor's read is finicky over it); the TLB flushed per address space rather
-than whole; the VMX backend with `CR0.NE` on every CPU; and the guests run on
-the AX41's real AMD-V, which checks the VMCB harder than QEMU does. Beyond
-stage 3: a local APIC and an SMP guest, host-side virtio, and the control
-plane (stage 4).
+All four demos are done, and a guest runs a command typed at its console
+(`hv boot ... input='id\n'` → `uid=0 gid=0`). What is left, not in step
+order: the TLB flushed per address space rather than whole; the VMX backend
+with `CR0.NE` on every CPU; and the guests run on the AX41's real AMD-V,
+which checks the VMCB harder than QEMU does. Beyond stage 3: a local APIC and
+an SMP guest, host-side virtio, and the control plane (stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every
