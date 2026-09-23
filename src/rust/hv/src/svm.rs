@@ -164,6 +164,10 @@ impl Vcpu {
         self.guest.regs_mut()
     }
 
+    pub fn save_and_regs_mut(&mut self) -> (&mut vmcb::Save, &mut GuestRegs) {
+        self.guest.save_and_regs_mut()
+    }
+
     pub(crate) fn guest_mut(&mut self) -> &mut Guest {
         &mut self.guest
     }
@@ -332,6 +336,18 @@ impl Vcpu {
 
     pub fn skip_vmmcall(&mut self) {
         self.skip(LEN_VMMCALL);
+    }
+
+    /// Inject a general-protection fault into the guest on the next entry:
+    /// what a real CPU raises for a reserved MSR or an instruction the guest
+    /// may not run. `#GP` pushes an error code, 0 here. The guest's RIP is
+    /// left where it faulted, not stepped past -- the faulting instruction
+    /// did not complete.
+    pub fn inject_gp(&mut self) {
+        use vmcb::event;
+        const VECTOR_GP: u64 = 13;
+        self.guest.vmcb_mut().control.event_inj =
+            event::VALID | event::TYPE_EXCEPTION | event::ERROR_VALID | VECTOR_GP;
     }
 
     /// What `vmrun` would refuse this VMCB for, if anything -- the checks of

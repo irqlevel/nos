@@ -1,0 +1,250 @@
+//! A Linux guest and the loop that runs it: memory, one vCPU, an emulated
+//! serial port, and the dispatch of every exit the guest comes back with.
+//!
+//! This is the safe half of running a real kernel -- it decodes
+//! guest-controlled exits and answers them, and holds no reference into
+//! guest memory. What it cannot yet answer (a local APIC, a timer) it stops
+//! on and says so, which is how far the third of the four demos in
+//! `plans/03-hypervisor.md` reaches: a `bzImage` printing its early console.
+
+use hvarch::x86::svm::vmcb::Save;
+use hvarch::x86::svm::GuestRegs;
+use hvarch::{Error, Result};
+use kcore::time;
+
+use crate::devices::Uart;
+use crate::linux::{self, Header, Layout};
+use crate::machine::Machine;
+use crate::memory::GuestMemory;
+use crate::svm::Exit;
+use crate::vm::{Refusal, Vm};
+
+/// COM1, the guest's console.
+const COM1: u16 = 0x3F8;
+
+/// Why a Linux guest stopped.
+#[derive(Clone, Copy, Debug)]
+pub enum Stop {
+    /// It executed HLT: idle with interrupts it will never get, or a panic
+    /// that came to rest -- either way, as far as it goes without a timer.
+    Halted { rip: u64 },
+    /// It touched a guest physical address with no memory behind it: either
+    /// a bug, or an MMIO device this hypervisor does not emulate (a local
+    /// APIC page, most likely).
+    Mmio { gpa: u64, rip: u64 },
+    /// It triple-faulted.
+    Shutdown { rip: u64 },
+    /// An exception the host intercepts (#DB, #AC, #MC) fired.
+    Exception { vector: u8, rip: u64 },
+    /// The CPU refused the VMCB, or the extension went off under it.
+    Refused(Refusal),
+    /// `vmrun` refused the VMCB despite the software check.
+    Invalid,
+    /// Its time ran out.
+    Budget,
+    /// An exit with no handler here.
+    Unexpected { exit: Exit, rip: u64 },
+}
+
+/// What a run counted, for a report.
+#[derive(Clone, Copy, Default)]
+pub struct Counts {
+    pub port_in: u64,
+    pub port_out: u64,
+    pub cpuid: u64,
+    pub msr_read: u64,
+    pub msr_write: u64,
+    pub msr_gp: u64,
+    pub mmio: u64,
+    pub host: u64,
+    pub exits: u64,
+}
+
+/// A Linux guest: its memory, its one vCPU, and its console.
+pub struct LinuxGuest {
+    vm: Vm,
+    uart: Uart,
+}
+
+impl LinuxGuest {
+    /// A guest with `mem_bytes` of RAM and nothing loaded yet. Its vCPU
+    /// stops at no exception of its own -- a Linux guest has an IDT and
+    /// handles its own faults -- so `exceptions` is empty; the host still
+    /// intercepts #DB, #AC and #MC whatever this says.
+    pub fn new(machine: &Machine, mem_bytes: u64) -> Result<Self> {
+        let mut vm = Vm::new(machine, 0)?;
+        vm.memory_mut().add(0, mem_bytes)?;
+        Ok(Self { vm, uart: Uart::new() })
+    }
+
+    pub fn memory_mut(&mut self) -> &mut GuestMemory {
+        self.vm.memory_mut()
+    }
+
+    /// Write the guest's furniture -- the zero page, the command line, the
+    /// memory map, the page tables and the GDT -- and put the vCPU at the
+    /// kernel's entry. The kernel and initrd bytes must already be in memory
+    /// at the addresses `layout` names; the caller streams those in.
+    pub fn load(&mut self, header: &Header, first: &[u8], layout: Layout, cmdline: &[u8]) -> Result<()> {
+        linux::build(self.vm.memory_mut(), header, first, &layout, cmdline)?;
+        linux::set_entry(self.vm.vcpu_mut(), &layout);
+        Ok(())
+    }
+
+    pub fn output(&self) -> &str {
+        self.uart.output()
+    }
+
+    /// Run the guest on the CPU this is called on until it stops, for at
+    /// most `budget_ns`, handing every console byte to `on_byte` as it is
+    /// written. Returns why it stopped and what it did.
+    pub fn run(
+        &mut self,
+        machine: &Machine,
+        budget_ns: u64,
+        mut on_byte: impl FnMut(u8),
+    ) -> (Stop, Counts) {
+        let mut counts = Counts::default();
+        let start = time::boot_time_ns();
+
+        let stop = loop {
+            if time::boot_time_ns().saturating_sub(start) >= budget_ns {
+                break Stop::Budget;
+            }
+            let (exit, _cpu) = match self.vm.enter(machine) {
+                Ok(entered) => entered,
+                Err(refusal) => break Stop::Refused(refusal),
+            };
+            counts.exits += 1;
+            let rip = self.vm.vcpu().save().rip;
+
+            match exit {
+                Exit::Host => counts.host += 1,
+                Exit::Io(io) => {
+                    self.io(&io, &mut counts, &mut on_byte);
+                }
+                Exit::Cpuid => {
+                    counts.cpuid += 1;
+                    let sub = self.vm.vcpu().regs().rcx as u32;
+                    let leaf = self.vm.vcpu().save().rax as u32;
+                    let answer = crate::policy::cpuid(leaf, sub);
+                    let v = self.vm.vcpu_mut();
+                    let (save, regs) = v.save_and_regs_mut();
+                    crate::policy::apply_cpuid(save, regs, &answer);
+                    v.skip_cpuid();
+                }
+                Exit::Msr { write } => {
+                    self.msr(write, &mut counts);
+                }
+                Exit::Hlt => break Stop::Halted { rip },
+                Exit::NestedFault { gpa, .. } => {
+                    counts.mmio += 1;
+                    break Stop::Mmio { gpa, rip };
+                }
+                Exit::Shutdown => break Stop::Shutdown { rip },
+                Exit::Exception { vector, .. } => break Stop::Exception { vector, rip },
+                Exit::MachineCheck => break Stop::Exception { vector: 18, rip },
+                Exit::Invalid => break Stop::Invalid,
+                Exit::Hypercall => {
+                    /* No paravirtualisation is offered; a VMMCALL is a fault
+                     * to the guest. Step past it so a stray one does not
+                     * spin, and inject nothing -- the guest that meant it
+                     * will notice its result did not change. */
+                    self.vm.vcpu_mut().skip_vmmcall();
+                }
+                other => break Stop::Unexpected { exit: other, rip },
+            }
+        };
+
+        (stop, counts)
+    }
+
+    fn io(&mut self, io: &crate::svm::Io, counts: &mut Counts, on_byte: &mut impl FnMut(u8)) {
+        let v = self.vm.vcpu_mut();
+        if io.string {
+            /* No string I/O device is emulated; step past it. INS/OUTS to
+             * the console is not how a kernel drives a UART. */
+            v.skip_io(io);
+            return;
+        }
+        if Uart::owns(COM1, io.port) && io.size == 1 {
+            let offset = io.port - COM1;
+            if io.input {
+                let byte = self.uart.read(offset);
+                let s = v.save_mut();
+                s.rax = (s.rax & !0xFF) | byte as u64;
+                counts.port_in += 1;
+            } else {
+                let byte = v.save().rax as u8;
+                if let Some(out) = self.uart.write(offset, byte) {
+                    on_byte(out);
+                }
+                counts.port_out += 1;
+            }
+        } else if io.input {
+            /* A port nothing here answers: the bus floats to all ones,
+             * which is what a read of an absent device gives. */
+            let mask = size_mask(io.size);
+            let s = v.save_mut();
+            s.rax |= mask;
+            counts.port_in += 1;
+        } else {
+            counts.port_out += 1;
+        }
+        self.vm.vcpu_mut().skip_io(io);
+    }
+
+    fn msr(&mut self, write: bool, counts: &mut Counts) {
+        let v = self.vm.vcpu_mut();
+        let msr = v.regs().rcx as u32;
+        if write {
+            counts.msr_write += 1;
+            let value = ((v.regs().rdx as u32 as u64) << 32) | (v.save().rax as u32 as u64);
+            if crate::policy::wrmsr(v.save_mut(), msr, value) {
+                v.skip_msr();
+            } else {
+                counts.msr_gp += 1;
+                v.inject_gp();
+            }
+        } else {
+            counts.msr_read += 1;
+            match crate::policy::rdmsr(v.save(), msr) {
+                Some(value) => {
+                    let (save, regs) = v.save_and_regs_mut();
+                    set_msr_read(save, regs, value);
+                    v.skip_msr();
+                }
+                None => {
+                    counts.msr_gp += 1;
+                    v.inject_gp();
+                }
+            }
+        }
+    }
+
+    /// The guest's state after it stopped, for a report.
+    pub fn dump(&self, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
+        self.vm.vcpu().dump(out)
+    }
+}
+
+fn size_mask(size: u8) -> u64 {
+    match size {
+        1 => 0xFF,
+        2 => 0xFFFF,
+        _ => 0xFFFF_FFFF,
+    }
+}
+
+/// `rdmsr` puts the low 32 bits in EAX and the high 32 in EDX, each
+/// zero-extended into its 64-bit register.
+fn set_msr_read(save: &mut Save, regs: &mut GuestRegs, value: u64) {
+    save.rax = value & 0xFFFF_FFFF;
+    regs.rdx = value >> 32;
+}
+
+/// A guard so the module need not repeat the check: a `LinuxGuest` cannot be
+/// made where no guest can run.
+pub fn ensure_runnable(machine: &Machine) -> Result<()> {
+    machine.ext().map(|_| ()).map_err(|_| Error::NotImplemented)
+}

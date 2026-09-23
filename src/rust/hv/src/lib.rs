@@ -39,6 +39,12 @@ pub mod svm;
 #[cfg(target_arch = "x86_64")]
 pub mod vm;
 #[cfg(target_arch = "x86_64")]
+pub mod linux;
+#[cfg(target_arch = "x86_64")]
+pub mod policy;
+#[cfg(target_arch = "x86_64")]
+pub mod run;
+#[cfg(target_arch = "x86_64")]
 pub mod guests;
 
 pub use hvarch::{Caps, Error, Ext, Result, Vendor};

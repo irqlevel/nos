@@ -405,6 +405,13 @@ impl Guest {
         &mut self.regs
     }
 
+    /// The save area and the registers together, for a caller that has to
+    /// touch both (CPUID fills RAX and RBX/RCX/RDX): two disjoint fields, so
+    /// the borrow checker is content where two calls would not be.
+    pub fn save_and_regs_mut(&mut self) -> (&mut vmcb::Save, &mut GuestRegs) {
+        (&mut self.vmcb.get_mut().save, &mut self.regs)
+    }
+
     /// Enter the guest on the CPU this runs on, and come back when it
     /// exits: the exit is in the VMCB's control area. Returns the CPU it ran
     /// on, or [`NotRun`] with the CPU it would have and why not -- checked
