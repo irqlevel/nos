@@ -104,11 +104,34 @@ And against **3.2 and 3.3**, under AMD-V -- the first two of the four demos:
   guest's addresses through the nested table -- a real-mode guest there
   runs out of host memory -- which is why every guest starts paged.
 
-Next, 3.4 and 3.5 towards the third demo: an 8250 on port exits and a
-`bzImage` loaded by the 64-bit boot protocol, which want guest memory that
-is not 512 KiB runs of the allocator's largest bucket, a CPUID and MSR
-policy, the guest's FPU state switched, and a vCPU task as long-lived as its
-VM. `docs/hypervisor.md` ("What comes next") has the list.
+And against **3.4 and 3.5** -- the third demo, a `bzImage` printing its early
+console (`hv boot`, `scripts/hv-linux-test.py`):
+
+- guest memory is now [frames](../docs/hypervisor.md#a-linux-guest) -- pages
+  of RAM mapped nowhere but the guest's nested table (`kcore::frame`), not
+  512 KiB runs of the allocator's largest bucket, so a guest is as large as
+  the machine has RAM and costs no kernel address space;
+- `hv::linux` loads a bzImage by the 64-bit boot protocol -- the setup header
+  into a zero page, the command line, an e820 map, identity page tables and a
+  GDT, all in guest memory -- and streams the kernel and initrd from a file a
+  chunk at a time (`kcore::fs::read_at`);
+- `hv::policy` is the CPUID and MSR policy: a CPU cut down to what is
+  emulated, the system MSRs served from the VMCB save area;
+- `hv::devices` is the 8250, an 8254 PIT and an MC146818 RTC -- the last two
+  because without them a guest spins on a counter that never counts and an
+  update bit that never clears;
+- the guest's FPU/SSE state and XCR0 are switched around `vmrun`
+  (`hvarch::x86::svm`), and the vCPU runs on a task of its own.
+
+A tinyconfig Linux 6.18 reaches its early console in full, past
+`console [ttyS0] enabled`, and stops at `Failed to register legacy timer
+interrupt` -- the fourth demo's business, below.
+
+The fourth demo, a full boot to a shell, is the timer interrupt and the
+controller to take it from: an 8259 PIC, the PIT's channel 0 raising IRQ0,
+`event_inj` injecting it when the guest has interrupts on, and then an
+initramfs and an `init`. `docs/hypervisor.md` ("What comes next") has the
+list.
 
 Before the first VMX guest, one change outside the hypervisor: the boot path
 has to set `CR0.NE` on every CPU. VMX requires it, the APs come out of INIT
