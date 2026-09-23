@@ -12,7 +12,7 @@ use hvarch::x86::svm::GuestRegs;
 use hvarch::{Error, Result};
 use kcore::time;
 
-use crate::devices::Uart;
+use crate::devices::{Pit, Rtc, Uart};
 use crate::linux::{self, Header, Layout};
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
@@ -64,6 +64,10 @@ pub struct Counts {
 pub struct LinuxGuest {
     vm: Vm,
     uart: Uart,
+    pit: Pit,
+    rtc: Rtc,
+    /// A tally of reads of the low ports, to find a guest spinning on one.
+    port_hist: alloc::boxed::Box<[u32; 1024]>,
 }
 
 impl LinuxGuest {
@@ -74,7 +78,9 @@ impl LinuxGuest {
     pub fn new(machine: &Machine, mem_bytes: u64) -> Result<Self> {
         let mut vm = Vm::new(machine, 0)?;
         vm.memory_mut().add(0, mem_bytes)?;
-        Ok(Self { vm, uart: Uart::new() })
+        let port_hist = alloc::vec![0u32; 1024].into_boxed_slice().try_into()
+            .map_err(|_| Error::NoMemory)?;
+        Ok(Self { vm, uart: Uart::new(), pit: Pit::new(), rtc: Rtc::new(), port_hist })
     }
 
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
@@ -93,6 +99,16 @@ impl LinuxGuest {
 
     pub fn output(&self) -> &str {
         self.uart.output()
+    }
+
+    /// The busiest few low ports the guest read, for diagnosing a spin:
+    /// (port, count), most first, at most `n`.
+    pub fn hot_ports(&self, n: usize) -> alloc::vec::Vec<(u16, u32)> {
+        let mut v: alloc::vec::Vec<(u16, u32)> = self.port_hist.iter().enumerate()
+            .filter(|(_, &c)| c > 0).map(|(p, &c)| (p as u16, c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(n);
+        v
     }
 
     /// Run the guest on the CPU this is called on until it stops, for at
@@ -160,6 +176,10 @@ impl LinuxGuest {
     }
 
     fn io(&mut self, io: &crate::svm::Io, counts: &mut Counts, on_byte: &mut impl FnMut(u8)) {
+        if io.input && !Uart::owns(COM1, io.port) && (io.port as usize) < self.port_hist.len() {
+            let slot = &mut self.port_hist[io.port as usize];
+            *slot = slot.saturating_add(1);
+        }
         let v = self.vm.vcpu_mut();
         if io.string {
             /* No string I/O device is emulated; step past it. INS/OUTS to
@@ -179,6 +199,17 @@ impl LinuxGuest {
                 if let Some(out) = self.uart.write(offset, byte) {
                     on_byte(out);
                 }
+                counts.port_out += 1;
+            }
+        } else if (Pit::owns(io.port) || Rtc::owns(io.port)) && io.size == 1 {
+            let byte = v.save().rax as u8;
+            if io.input {
+                let value = if Pit::owns(io.port) { self.pit.read(io.port) } else { self.rtc.read(io.port) };
+                let s = self.vm.vcpu_mut().save_mut();
+                s.rax = (s.rax & !0xFF) | value as u64;
+                counts.port_in += 1;
+            } else {
+                if Pit::owns(io.port) { self.pit.write(io.port, byte) } else { self.rtc.write(io.port, byte) }
                 counts.port_out += 1;
             }
         } else if io.input {
