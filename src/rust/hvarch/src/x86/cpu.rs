@@ -4,7 +4,7 @@
 //! again.
 
 use core::arch::asm;
-use core::arch::x86_64::{CpuidResult, __cpuid};
+use core::arch::x86_64::{CpuidResult, __cpuid, __cpuid_count};
 
 /// CPUID leaf `leaf`, or None when the CPU does not have that leaf.
 ///
@@ -26,6 +26,13 @@ pub fn cpuid(leaf: u32) -> Option<CpuidResult> {
         return None;
     }
     Some(__cpuid(leaf))
+}
+
+/// CPUID leaf `leaf`, subleaf `sub`, or None when the CPU does not have the
+/// leaf -- as [`cpuid`], for the leaves ECX selects a part of.
+pub fn cpuid_count(leaf: u32, sub: u32) -> Option<CpuidResult> {
+    cpuid(leaf)?;
+    Some(__cpuid_count(leaf, sub))
 }
 
 /// The vendor string as CPUID leaf 0 spells it: "GenuineIntel",
@@ -131,4 +138,12 @@ pub unsafe fn xsetbv0(value: u64) {
         asm!("xsetbv", in("ecx") 0u32, in("eax") value as u32, in("edx") (value >> 32) as u32,
              options(nomem, nostack, preserves_flags));
     }
+}
+
+/// The time-stamp counter. Every x86-64 CPU has one, and reading it has no
+/// side effect.
+#[inline]
+pub fn rdtsc() -> u64 {
+    #[allow(unused_unsafe)]
+    unsafe { core::arch::x86_64::_rdtsc() }
 }
