@@ -99,8 +99,15 @@ def vm_commands(args):
     exec_prompt = "hv exec 0 uname -r"
     send = r"hv send 0 echo nos$((6*7))nos\n"
     wait = "hv wait 0 secs=120 nos42nos"
+    # A guest that reboots itself: no init, so it panics, and panic=1 makes
+    # the panic a reboot a second later. `hv wait` for text it never prints
+    # returns when the guest stops, saying why.
+    start2 = "hv start /bzImage mem=64 cmdline=%s panic=1" % args.cmdline
+    wait_reboot = "hv wait 2 secs=300 Rebooting in"
+    wait_stop = "hv wait 2 secs=300 nos-never-printed"
     lines = ["hv help", start0, start1, "hv list", "hv stop 1", exec_early, exec_prompt,
-             send, wait, "hv console 0 bytes=400", "hv list", "hv off",
+             send, wait, "hv console 0 bytes=400", "hv list",
+             start2, wait_reboot, wait_stop, "hv list", "hv stop 2", "hv off",
              "rmmod hv", "insmod /hv.ko", "hv", "rmmod hv", RC_LOG]
     checks = [
         ("hv help", 0, "hv help lists the vm commands", r"hv exec <id>", True),
@@ -118,6 +125,13 @@ def vm_commands(args):
         ("hv console 0 bytes=400", 0, "hv console has it too", r"nos42nos", True),
         ("hv list", 1, "vm 0 still running", r"vm 0  running", True),
         ("hv list", 1, "vm 1 gone from the list", r"vm 1 ", False),
+        (start2, 0, "vm 2 starts, to panic and reboot", r"hv: vm 2 started on cpu \d+", True),
+        (wait_reboot, 0, "vm 2 panics and goes to reboot", r'hv: vm 2 printed "Rebooting in"', True),
+        (wait_stop, 0, "its reset stops it, and says so",
+         r"hv: vm 2 stopped without printing .* -- the guest asked for a reset, 0xfe to port 0x64", True),
+        ("hv list", 2, "hv list keeps it, stopped, with its reason",
+         r"vm 2  stopped .* -- the guest asked for a reset", True),
+        ("hv stop 2", 0, "hv stop takes it off the list", r"hv: vm 2 stopped -- the guest asked for a reset", True),
         ("hv off", 0, "hv off will not pull the extension from under vm 0",
          r"hv: vm 0 is running on cpu \d+ -- hv stop it first", True),
         ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),

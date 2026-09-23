@@ -211,6 +211,8 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
         Stop::Mmio { gpa, rip } => write!(out,
             "a touch of guest physical {:#x}, no memory and no device there, rip {:#x}", gpa, rip),
         Stop::Shutdown { rip } => write!(out, "triple fault at {:#x}", rip),
+        Stop::Reset { port, value, rip } => write!(out, "the guest asked for a reset, {:#04x} to port {:#x} ({}), at {:#x}",
+            value, port, hv::run::reset_source(port), rip),
         Stop::Exception { vector, rip } => write!(out, "exception {} at {:#x}", vector, rip),
         Stop::Refused(r) => write!(out, "not entered: {:?}", r),
         Stop::Invalid => write!(out, "VMEXIT_INVALID -- the CPU refused the VMCB"),
@@ -264,7 +266,7 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stop: &Stop, counts: &Cou
         }
         let _ = writeln!(out);
     }
-    if !matches!(stop, Stop::Halted { .. } | Stop::Budget | Stop::Requested) {
+    if !matches!(stop, Stop::Halted { .. } | Stop::Budget | Stop::Requested | Stop::Reset { .. }) {
         let _ = guest.dump(out);
     }
 }
