@@ -206,6 +206,9 @@ backend, where a guest can show it working -- not slipped in here.
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
+    hv boot <bzImage> [mem=MiB] [secs=N] [initrd=path] [cmdline=...]
+                                load a Linux bzImage and run it on a vCPU, its
+                                early console coming back as the command's output
 
 **Turning it on** allocates one page per CPU -- AMD's host state save area,
 Intel's VMXON region -- and then sends that CPU an IPI that does nothing but
@@ -529,6 +532,63 @@ scripts/hv-test.py                  # x86-64: the extension on and off and off a
 scripts/hv-test.py --arch aarch64   # arm64: that it reports and refuses
 ```
 
+## A Linux guest
+
+`hv boot` loads an unmodified 64-bit Linux `bzImage` by the boot protocol and
+runs it on a vCPU. The kernel and the initrd are streamed from a file
+straight into guest memory a chunk at a time, so neither has to fit in one
+allocation; then `hv::linux` lays the guest out -- the zero page from the
+setup header, the command line, an e820 map, identity page tables and a GDT,
+all written through `GuestMemory`'s copying accessors -- and puts the vCPU at
+the kernel's 64-bit entry with `RSI` at the zero page. It holds no reference
+into guest memory: everything it writes the guest could have written itself.
+
+Three things stand between that entry and a running kernel, and all three are
+here:
+
+- **A CPU cut down to what is emulated** (`hv::policy`). Every CPUID is the
+  host's, masked: no local APIC, no x2APIC, no XSAVE and so no AVX -- the
+  state switch around `vmrun` moves only the FXSAVE registers, so a guest is
+  given nothing it could put in the part that is not switched -- and no
+  paravirtualisation. Every MSR is intercepted: the system MSRs (EFER, the
+  PAT, the segment bases, the SYSCALL and SYSENTER registers) are the guest's
+  own state and are served from the VMCB save area, and every other MSR reads
+  zero and swallows a write, which is what a guest's `rdmsr_safe` probes are
+  ready for.
+- **The devices early boot cannot do without** (`hv::devices`): the 8250
+  serial port the console writes to, an 8254 PIT whose counter counts down at
+  1.193182 MHz off the host clock and whose channel-2 output goes high at its
+  terminal count (what `pit_calibrate_tsc` waits on), and an MC146818 RTC
+  that answers a fixed date with the update-in-progress bit clear. Without
+  the last two a guest hangs: it spins on a PIT counter that never counts and
+  an RTC update bit that never clears.
+- **The exit loop** (`hv::run`) that answers all of the above, plus a nested
+  page fault (an unemulated device), a triple fault, and the host's own
+  interrupts, streaming the guest's console to the kernel log a line at a
+  time and stopping with a reason and a register dump.
+
+What this reaches today, on a tinyconfig Linux 6.18 under AMD-V (QEMU's TCG,
+where the guest is twice emulated and slow), is the early console in full:
+
+```
+$ hv on
+$ hv boot /bzImage
+hv: booting /bzImage -- 256 MiB, cmdline "earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check"
+  --- ttyS0 ---
+[    0.000000] Linux version 6.18.53 ...
+[    0.000000] Command line: earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check
+[    0.000000] NX (Execute Disable) protection: active
+...
+[    0.000000] printk: legacy console [ttyS0] enabled
+[    0.000000] Failed to register legacy timer interrupt
+  --- end ttyS0 ---
+```
+
+It stops there because nothing yet delivers the timer interrupt -- the fourth
+demo, and what [What comes next](#what-comes-next) opens with. The gate is
+`scripts/hv-linux-test.py`, a manual one (a `bzImage` is megabytes and CI
+cannot build one in its time), pointed at a kernel by hand.
+
 ## What comes next
 
 From [`plans/03-hypervisor.md`](../plans/03-hypervisor.md), in order, each a
@@ -537,19 +597,19 @@ thing that can be shown in half a minute:
 1. ~~a VM object with nested page tables, and a guest of a few bytes that
    exits where it was told to~~ -- under AMD-V, `hv run exits`;
 2. ~~a guest in long mode under NPT/EPT~~ -- NPT, `hv run hypercall`;
-3. an emulated 8250 on port I/O exits, and a `bzImage` printing its early
-   console;
+3. ~~an emulated 8250 on port I/O exits, and a `bzImage` printing its early
+   console~~ -- `hv boot`, and the guest of [A Linux
+   guest](#a-linux-guest) below;
 4. a full boot to a shell over that UART, with an initramfs, on one vCPU.
 
-What step 3 needs of what is here, beyond the UART itself: guest memory
-large enough for a kernel and an initramfs from somewhere other than 512 KiB
-runs of the page allocator's largest bucket, which gets an eighth of the
-kernel's address space for its mappings and would run out first; a CPUID
-and MSR policy for a guest
-that asks about everything; the guest's FPU state switched with
-`xsave`/`xrstor`; and a vCPU task that lives as long as its VM rather than
-one command. Then, not in that order: the TLB flushed per address space
-rather than whole, the VMX backend with `CR0.NE` on every CPU, and the
+What is left for step 4 is the timer interrupt, and the interrupt controller
+to take it from: a Linux guest today reaches `console [ttyS0] enabled` and
+its clocksource setup and then stops at `Failed to register legacy timer
+interrupt`, because nothing yet delivers IRQ0 -- an 8259 PIC (or a local
+APIC), the PIT's channel 0 raising it, and `event_inj` injecting it when the
+guest has interrupts on. Then an initramfs and an `init` that opens the
+console. Still after that, not in step order: the TLB flushed per address
+space rather than whole, the VMX backend with `CR0.NE` on every CPU, and the
 guests run on the AX41's real AMD-V, which checks the VMCB harder than
 QEMU does.
 
