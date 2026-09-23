@@ -7,10 +7,12 @@
 //! The guest touches none of them directly: it stops at an intercept, and
 //! the run loop hands the exit to the device.
 
+pub mod pic;
 pub mod pit;
 pub mod rtc;
 pub mod uart;
 
+pub use pic::Pic;
 pub use pit::Pit;
 pub use rtc::Rtc;
 pub use uart::Uart;

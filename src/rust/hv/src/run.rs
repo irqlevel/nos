@@ -12,7 +12,7 @@ use hvarch::x86::svm::GuestRegs;
 use hvarch::{Error, Result};
 use kcore::time;
 
-use crate::devices::{Pit, Rtc, Uart};
+use crate::devices::{Pic, Pit, Rtc, Uart};
 use crate::linux::{self, Header, Layout};
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
@@ -57,6 +57,8 @@ pub struct Counts {
     pub msr_gp: u64,
     pub mmio: u64,
     pub host: u64,
+    pub irq: u64,
+    pub hlt: u64,
     pub exits: u64,
 }
 
@@ -66,6 +68,7 @@ pub struct LinuxGuest {
     uart: Uart,
     pit: Pit,
     rtc: Rtc,
+    pic: Pic,
     /// A tally of reads of the low ports, to find a guest spinning on one.
     port_hist: alloc::boxed::Box<[u32; 1024]>,
 }
@@ -80,7 +83,7 @@ impl LinuxGuest {
         vm.memory_mut().add(0, mem_bytes)?;
         let port_hist = alloc::vec![0u32; 1024].into_boxed_slice().try_into()
             .map_err(|_| Error::NoMemory)?;
-        Ok(Self { vm, uart: Uart::new(), pit: Pit::new(), rtc: Rtc::new(), port_hist })
+        Ok(Self { vm, uart: Uart::new(), pit: Pit::new(), rtc: Rtc::new(), pic: Pic::new(), port_hist })
     }
 
     pub fn memory_mut(&mut self) -> &mut GuestMemory {
@@ -127,6 +130,21 @@ impl LinuxGuest {
             if time::boot_time_ns().saturating_sub(start) >= budget_ns {
                 break Stop::Budget;
             }
+
+            /* The timer: a channel-0 period elapsed is an IRQ0 edge. Then,
+             * if any interrupt is pending, inject it when the guest can take
+             * one and ask to be told when it can when it cannot. */
+            if self.pit.ch0_fire() {
+                self.pic.raise(0);
+            }
+            /* COM1's transmitter is always ready, so with its THR-empty
+             * interrupt enabled it asserts IRQ4 -- which is how the serial
+             * driver sends past the first byte, an interrupt at a time. */
+            if self.uart.irq_active() {
+                self.pic.raise(4);
+            }
+            self.deliver_interrupt(&mut counts);
+
             let (exit, _cpu) = match self.vm.enter(machine) {
                 Ok(entered) => entered,
                 Err(refusal) => break Stop::Refused(refusal),
@@ -152,7 +170,19 @@ impl LinuxGuest {
                 Exit::Msr { write } => {
                     self.msr(write, &mut counts);
                 }
-                Exit::Hlt => break Stop::Halted { rip },
+                Exit::Hlt => {
+                    /* A booted kernel idles on HLT, waking on the timer: with
+                     * interrupts on it is waiting for the next one, not dead.
+                     * Re-enter -- deliver_interrupt at the top of the loop
+                     * injects the timer IRQ when its period comes, and the
+                     * guest wakes and runs on. Only a HLT with interrupts off
+                     * is a guest that has stopped for good. */
+                    const IF: u64 = 1 << 9;
+                    if self.vm.vcpu().save().rflags & IF == 0 {
+                        break Stop::Halted { rip };
+                    }
+                    counts.hlt += 1;
+                }
                 Exit::NestedFault { gpa, .. } => {
                     counts.mmio += 1;
                     break Stop::Mmio { gpa, rip };
@@ -161,6 +191,10 @@ impl LinuxGuest {
                 Exit::Exception { vector, .. } => break Stop::Exception { vector, rip },
                 Exit::MachineCheck => break Stop::Exception { vector: 18, rip },
                 Exit::Invalid => break Stop::Invalid,
+                Exit::IrqWindow => {
+                    /* The guest can take an interrupt now; the next entry
+                     * injects it. Nothing to do here. */
+                }
                 Exit::Hypercall => {
                     /* No paravirtualisation is offered; a VMMCALL is a fault
                      * to the guest. Step past it so a stray one does not
@@ -173,6 +207,24 @@ impl LinuxGuest {
         };
 
         (stop, counts)
+    }
+
+    /// Give the guest the highest-priority interrupt the PIC has for it, if
+    /// it can take one; otherwise ask the CPU to exit when it can.
+    fn deliver_interrupt(&mut self, counts: &mut Counts) {
+        match self.pic.pending() {
+            Some((irq, vector)) => {
+                if self.vm.vcpu().interruptible() {
+                    self.vm.vcpu_mut().inject_extint(vector);
+                    self.pic.acknowledge(irq);
+                    self.vm.vcpu_mut().clear_irq_window();
+                    counts.irq += 1;
+                } else {
+                    self.vm.vcpu_mut().request_irq_window();
+                }
+            }
+            None => self.vm.vcpu_mut().clear_irq_window(),
+        }
     }
 
     fn io(&mut self, io: &crate::svm::Io, counts: &mut Counts, on_byte: &mut impl FnMut(u8)) {
@@ -201,15 +253,27 @@ impl LinuxGuest {
                 }
                 counts.port_out += 1;
             }
-        } else if (Pit::owns(io.port) || Rtc::owns(io.port)) && io.size == 1 {
+        } else if (Pit::owns(io.port) || Rtc::owns(io.port) || Pic::owns(io.port)) && io.size == 1 {
             let byte = v.save().rax as u8;
             if io.input {
-                let value = if Pit::owns(io.port) { self.pit.read(io.port) } else { self.rtc.read(io.port) };
+                let value = if Pit::owns(io.port) {
+                    self.pit.read(io.port)
+                } else if Rtc::owns(io.port) {
+                    self.rtc.read(io.port)
+                } else {
+                    self.pic.read(io.port)
+                };
                 let s = self.vm.vcpu_mut().save_mut();
                 s.rax = (s.rax & !0xFF) | value as u64;
                 counts.port_in += 1;
             } else {
-                if Pit::owns(io.port) { self.pit.write(io.port, byte) } else { self.rtc.write(io.port, byte) }
+                if Pit::owns(io.port) {
+                    self.pit.write(io.port, byte);
+                } else if Rtc::owns(io.port) {
+                    self.rtc.write(io.port, byte);
+                } else {
+                    self.pic.write(io.port, byte);
+                }
                 counts.port_out += 1;
             }
         } else if io.input {

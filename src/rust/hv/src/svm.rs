@@ -77,6 +77,9 @@ pub enum Exit {
     Msr { write: bool },
     /// VMMCALL.
     Hypercall,
+    /// The guest reached a point where it could take a virtual interrupt --
+    /// the interrupt window this hypervisor asked for (`request_irq_window`).
+    IrqWindow,
     /// The guest touched a guest physical address with no memory behind it
     /// -- or with memory it may not use that way.
     NestedFault { gpa: u64, error: u64 },
@@ -254,6 +257,7 @@ impl Vcpu {
             vmcb::exit::CPUID => Exit::Cpuid,
             vmcb::exit::MSR => Exit::Msr { write: c.exit_info1 & 1 != 0 },
             vmcb::exit::VMMCALL => Exit::Hypercall,
+            vmcb::exit::VINTR => Exit::IrqWindow,
             vmcb::exit::NPF => Exit::NestedFault { gpa: c.exit_info2, error: c.exit_info1 },
             vmcb::exit::SHUTDOWN => Exit::Shutdown,
             vmcb::exit::INVALID => Exit::Invalid,
@@ -336,6 +340,50 @@ impl Vcpu {
 
     pub fn skip_vmmcall(&mut self) {
         self.skip(LEN_VMMCALL);
+    }
+
+    /// Whether the guest can take a maskable interrupt right now: its
+    /// RFLAGS.IF is set, it is not in the shadow of a STI or MOV SS, and no
+    /// event is already queued for injection.
+    pub fn interruptible(&self) -> bool {
+        let v = self.guest.vmcb();
+        const IF: u64 = 1 << 9;
+        v.save.rflags & IF != 0
+            && v.control.int_state & vmcb::int_state::SHADOW == 0
+            && v.control.event_inj & vmcb::event::VALID == 0
+    }
+
+    /// Inject an external interrupt of `vector` on the next entry: what the
+    /// PIC hands the CPU when it takes an IRQ. Only when [`interruptible`]
+    /// (`Self::interruptible`) says it may be taken.
+    pub fn inject_extint(&mut self, vector: u8) {
+        use vmcb::event;
+        self.guest.vmcb_mut().control.event_inj =
+            event::VALID | event::TYPE_INTR | vector as u64;
+    }
+
+    /// Ask the CPU to exit as soon as the guest could take an interrupt --
+    /// its IF is set and it is out of any shadow -- so a pending IRQ that
+    /// cannot be injected now is injected the moment it can. Uses SVM's
+    /// virtual-interrupt mechanism: a virtual IRQ the guest never really
+    /// takes (its vector is irrelevant, the VINTR intercept fires first),
+    /// masked by the guest's own IF because `V_INTR_MASKING` is set.
+    pub fn request_irq_window(&mut self) {
+        use vmcb::{int_ctl, intercept};
+        let c = &mut self.guest.vmcb_mut().control;
+        c.intercept_misc1 |= intercept::misc1::VINTR;
+        /* V_IRQ with a priority the TPR does not mask (V_IGN_TPR), so the
+         * only thing holding it is the guest's IF -- which is what we want
+         * to be told about. */
+        c.int_ctl = (c.int_ctl & !int_ctl::V_TPR_MASK) | int_ctl::V_IRQ | int_ctl::V_IGN_TPR;
+    }
+
+    /// Take the interrupt-window request back once it is no longer needed.
+    pub fn clear_irq_window(&mut self) {
+        use vmcb::{int_ctl, intercept};
+        let c = &mut self.guest.vmcb_mut().control;
+        c.intercept_misc1 &= !intercept::misc1::VINTR;
+        c.int_ctl &= !int_ctl::V_IRQ;
     }
 
     /// Inject a general-protection fault into the guest on the next entry:
