@@ -27,6 +27,9 @@
 
 extern crate alloc;
 
+#[cfg(target_arch = "x86_64")]
+mod boot;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -38,7 +41,7 @@ use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off [cpu|all]|run <guest|all> [cpu]] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off [cpu|all]|run <guest|all> [cpu]|boot <bzImage> [mem=MiB] [secs=N] [initrd=path] [cmdline=...]] - the CPU's virtualization extension, and guests under it";
 
 struct Hv {
     /// In an `Option` so that unregistering -- which waits out a call of the
@@ -121,6 +124,12 @@ fn command(machine: &Arc<Machine>, args: &str, out: &mut Output) {
         Some("on") => switch(machine, words.next(), true, out),
         Some("off") => switch(machine, words.next(), false, out),
         Some("run") => run(machine, words.next(), words.next(), out),
+        #[cfg(target_arch = "x86_64")]
+        Some("boot") => boot::boot(machine, args.strip_prefix("boot").unwrap_or("").trim_start(), out),
+        #[cfg(not(target_arch = "x86_64"))]
+        Some("boot") => {
+            let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
+        }
         Some(other) => {
             let _ = writeln!(out, "hv: no such thing as \"{}\"", other);
             let _ = writeln!(out, "{}", HELP);
