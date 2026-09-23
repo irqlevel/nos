@@ -170,8 +170,12 @@ back to Ubuntu.
 ### Updating the kernel from inside nos
 
 The kernel GRUB boots and the one-shot flag live together on `nosenv`, a
-plain ext2 partition (`nvme1n1p1`) that GRUB can read and write and that
-nos mounts read-write as its root (`root=LABEL=nosenv`). `/boot` itself is
+plain ext2 partition that GRUB can read and write and that nos mounts
+read-write as its root (`root=LABEL=nosenv`). Under Ubuntu it is
+`nvme1n1p1` on most boots and `nvme0n1p1` on others -- Linux does not number
+the two NVMe controllers in the same order every time, and the other disk's
+first partition is the disk log -- so name it by label, `blkid -L nosenv`,
+never by device: GRUB finds it by UUID and nos by label, for that reason. `/boot` itself is
 left alone on purpose: it is ext3 on an md mirror, which nos could read
 through one member but never write safely, and nothing about updating nos
 needs it. So a new kernel goes in from the [UDP shell](udp-shell.md):
