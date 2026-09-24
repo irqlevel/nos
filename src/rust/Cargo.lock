@@ -508,6 +508,7 @@ dependencies = [
  "hv",
  "kcore",
  "kmod",
+ "netwire",
 ]
 
 [[package]]

@@ -16,6 +16,7 @@ use crate::arp::ArpTable;
 use crate::dhcp::Dhcp;
 use crate::dns::Dns;
 use crate::icmp::Icmp;
+use crate::nat::Nat;
 use crate::netconsole::NETCONSOLE;
 use crate::udp_shell::UdpShell;
 
@@ -23,6 +24,7 @@ static ARP: OnceBox<ArpTable> = OnceBox::new();
 static ICMP: OnceBox<Icmp> = OnceBox::new();
 static DNS: OnceBox<Dns> = OnceBox::new();
 static DHCP: OnceBox<Dhcp> = OnceBox::new();
+static NAT: OnceBox<Nat> = OnceBox::new();
 static UDP_SHELL: OnceBox<UdpShell> = OnceBox::new();
 
 pub(crate) fn arp_table() -> Option<&'static ArpTable> {
@@ -60,6 +62,27 @@ pub(crate) fn dhcp() -> Option<&'static Dhcp> {
         Some(dhcp) => Some(dhcp),
         None => {
             trace!(0, "dhcp: no memory for the client");
+            None
+        }
+    }
+}
+
+/// The resolver and the DHCP client if anything has made them yet: for a
+/// question that must not be what makes them -- one asked from where
+/// nothing may allocate.
+pub(crate) fn dns_if_made() -> Option<&'static Dns> {
+    DNS.get()
+}
+
+pub(crate) fn dhcp_if_made() -> Option<&'static Dhcp> {
+    DHCP.get()
+}
+
+pub(crate) fn nat() -> Option<&'static Nat> {
+    match NAT.get_or_try_init(|| Nat::new().map(Box::new)) {
+        Some(nat) => Some(nat),
+        None => {
+            trace!(0, "nat: no memory");
             None
         }
     }

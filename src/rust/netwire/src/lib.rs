@@ -352,6 +352,18 @@ pub mod udp {
         set_be16(udp, CHECKSUM, 0);
     }
 
+    /// The checksum a datagram carries, over the pseudo-header and the
+    /// datagram: what a sender that fills it in puts there. A sum that comes
+    /// to 0 goes as 0xFFFF, the same number in one's complement, because 0
+    /// in the field says there is no checksum at all (RFC 768).
+    #[inline]
+    pub fn checksum(src_ip: u32, dst_ip: u32, datagram: &[u8]) -> u16 {
+        match super::transport_checksum(IP_PROTO_UDP, src_ip, dst_ip, datagram) {
+            0 => 0xFFFF,
+            sum => sum,
+        }
+    }
+
     /// What fits in one datagram out of this stack.
     pub const MAX_PAYLOAD: usize = MAX_FRAME - ETH_HDR_LEN - IP_HDR_LEN - UDP_HDR_LEN;
 
@@ -476,6 +488,7 @@ pub mod icmp {
     pub const ECHO_REPLY: u8 = 0;
     pub const DEST_UNREACH: u8 = 3;
     pub const ECHO_REQUEST: u8 = 8;
+    pub const TIME_EXCEEDED: u8 = 11;
 
     /* Destination Unreachable codes that are hard errors for TCP
      * (RFC 1122 4.2.3.9) */
@@ -642,31 +655,40 @@ pub mod tcp {
     /// over a segment whose own checksum is right.
     #[inline]
     pub fn checksum(src_ip: u32, dst_ip: u32, segment: &[u8]) -> u16 {
-        let mut sum: u32 = 0;
-
-        /* The pseudo-header, as 16-bit words */
-        sum += (src_ip >> 16) & 0xFFFF;
-        sum += src_ip & 0xFFFF;
-        sum += (dst_ip >> 16) & 0xFFFF;
-        sum += dst_ip & 0xFFFF;
-        sum += IP_PROTO_TCP as u32;
-        sum += segment.len() as u32;
-
-        let mut at = 0;
-        while at + 1 < segment.len() {
-            sum += ((segment[at] as u32) << 8) | segment[at + 1] as u32;
-            at += 2;
-        }
-        if at < segment.len() {
-            sum += (segment[at] as u32) << 8;
-        }
-
-        while sum >> 16 != 0 {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-
-        !(sum as u16)
+        super::transport_checksum(IP_PROTO_TCP, src_ip, dst_ip, segment)
     }
+}
+
+/// The checksum over a transport's pseudo-header -- the addresses, the
+/// protocol and the length -- and then its segment: TCP's, and UDP's but for
+/// the one number UDP sends differently (`udp::checksum`). Answers 0 over a
+/// segment whose own checksum is right.
+#[inline]
+pub fn transport_checksum(protocol: u8, src_ip: u32, dst_ip: u32, segment: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+
+    /* The pseudo-header, as 16-bit words */
+    sum += (src_ip >> 16) & 0xFFFF;
+    sum += src_ip & 0xFFFF;
+    sum += (dst_ip >> 16) & 0xFFFF;
+    sum += dst_ip & 0xFFFF;
+    sum += protocol as u32;
+    sum += segment.len() as u32;
+
+    let mut at = 0;
+    while at + 1 < segment.len() {
+        sum += ((segment[at] as u32) << 8) | segment[at + 1] as u32;
+        at += 2;
+    }
+    if at < segment.len() {
+        sum += (segment[at] as u32) << 8;
+    }
+
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    !(sum as u16)
 }
 
 /// The internet checksum (RFC 1071): the one's complement of the one's

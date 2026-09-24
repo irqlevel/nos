@@ -52,7 +52,7 @@ const TIMER_PERIOD_MS: u64 = 200;
 const DEFAULT_TTL: u8 = 64;
 
 const HASH_SIZE: usize = 32;
-const EPHEMERAL_BASE: u16 = 49152;
+pub(crate) const EPHEMERAL_BASE: u16 = 49152;
 const EPHEMERAL_MAX: u16 = 65535;
 
 /// Connections a listener holds that nobody has accepted yet -- handshakes

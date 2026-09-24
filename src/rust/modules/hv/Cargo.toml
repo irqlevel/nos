@@ -15,3 +15,6 @@ kcore = { path = "../../kcore" }
 # they exist only inside this module, so a kernel without it carries none of
 # the hypervisor at all.
 hv = { path = "../../hv" }
+# The frame formats: the guests' switch answers DHCP itself, and a module
+# cannot link the network layer to borrow them.
+netwire = { path = "../../netwire" }

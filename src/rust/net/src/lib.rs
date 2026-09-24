@@ -23,6 +23,7 @@ pub mod dns;
 pub mod frame;
 pub mod http;
 pub mod icmp;
+pub mod nat;
 pub mod netconsole;
 pub mod nic;
 pub mod selftest;

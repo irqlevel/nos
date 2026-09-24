@@ -304,6 +304,8 @@ struct RxCounters {
     arp: LocalCounter,
     other: LocalCounter,
     drop: LocalCounter,
+    /// What NAT took, to forward or to drop, before the protocols saw it
+    nat: LocalCounter,
 }
 
 #[repr(align(64))]
@@ -319,6 +321,7 @@ impl ConstInit for RxCounters {
     const INIT: Self = RxCounters {
         icmp: LocalCounter::new(), udp: LocalCounter::new(), tcp: LocalCounter::new(),
         arp: LocalCounter::new(), other: LocalCounter::new(), drop: LocalCounter::new(),
+        nat: LocalCounter::new(),
     };
 }
 
@@ -422,6 +425,14 @@ impl Device {
 
     pub fn set_ip(&self, ip: u32) {
         self.ip.store(ip, Ordering::Release);
+    }
+
+    pub fn mask(&self) -> u32 {
+        self.mask.load(Ordering::Acquire)
+    }
+
+    pub fn gw(&self) -> u32 {
+        self.gw.load(Ordering::Acquire)
     }
 
     pub fn set_mask(&self, mask: u32) {
@@ -737,6 +748,13 @@ impl Device {
             }
         }
 
+        /* A guest's packet for the world, or the world's answer to one: NAT's
+         * to forward, and none of the protocols' business. */
+        if crate::nat::intercept(self, data) {
+            counters.nat.add(1);
+            return;
+        }
+
         let packet = &data[ETH_HDR_LEN..];
         match ip::protocol(packet) {
             IP_PROTO_ICMP => {
@@ -879,7 +897,7 @@ impl Device {
         let mut stats = Stats {
             tx_total: self.tx_packets.load(Ordering::Relaxed),
             rx_total: self.rx_packets.load(Ordering::Relaxed),
-            rx_drop: 0, rx_icmp: 0, rx_udp: 0, rx_tcp: 0, rx_arp: 0, rx_other: 0,
+            rx_drop: 0, rx_icmp: 0, rx_udp: 0, rx_tcp: 0, rx_arp: 0, rx_other: 0, rx_nat: 0,
             tx_icmp: 0, tx_udp: 0, tx_tcp: 0, tx_arp: 0, tx_other: 0,
         };
 
@@ -890,6 +908,7 @@ impl Device {
             stats.rx_arp += slot.arp.get();
             stats.rx_other += slot.other.get();
             stats.rx_drop += slot.drop.get();
+            stats.rx_nat += slot.nat.get();
         }
         for slot in self.tx_proto.iter() {
             stats.tx_icmp += slot.icmp.get();
@@ -912,6 +931,7 @@ pub struct Stats {
     pub rx_tcp: usize,
     pub rx_arp: usize,
     pub rx_other: usize,
+    pub rx_nat: usize,
     pub tx_icmp: usize,
     pub tx_udp: usize,
     pub tx_tcp: usize,
@@ -970,6 +990,19 @@ impl DeviceTable {
             let mask = dev.mask.load(Ordering::Acquire);
             mask != 0 && dev.ip() != 0 && dst & mask == dev.ip() & mask
         })
+    }
+
+    /// The device the default route is on -- the first with an address and
+    /// a gateway, `not` aside: where NAT sends what is behind `not`.
+    pub fn uplink(&'static self, not: &Device) -> Option<&'static Device> {
+        self.devices[..self.count()].iter().find(|dev| {
+            !core::ptr::eq(*dev, not) && dev.ip() != 0 && dev.gw() != 0
+        })
+    }
+
+    /// Whether `addr` is one of this machine's own.
+    pub fn is_local(&'static self, addr: u32) -> bool {
+        addr != 0 && self.devices[..self.count()].iter().any(|dev| dev.ip() == addr)
     }
 
     /// The device a handle names: one of the table's, or none. A handle is

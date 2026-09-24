@@ -863,15 +863,88 @@ addresses only on their switch; a forward listens on a port of nos's and,
 for each connection, opens one to the guest's port through `hv0`
 (`kcore::tcp::TcpStream::connect`, new for this) and relays the two with a
 task of its own. The kernel has 64 TCP connections and a forwarded one takes
-two, so a forward carries eight at once and refuses the rest. What is not
-here yet is the way out: the guests have no route beyond nos -- no NAT --
-so a forward is how the world reaches them, and nothing yet is how they reach
-the world.
+two, so a forward carries eight at once and refuses the rest. The other way,
+the guests reach the world through NAT (next).
 
-`scripts/hv-linux-test.py --net` is its gate: two guests, their addresses,
-pings between each guest and nos and between the guests, nos's ping out of
-`hv0`, and a page from one guest's `httpd` fetched from outside the machine
-through `hv forward`.
+### The way out: NAT, DHCP and DNS
+
+```
+$ hv exec 0 wget -q -O - http://10.0.2.2:8000/    # a server beyond nos
+$ hv exec 0 udhcpc -i eth0 -q                     # the switch answers
+$ nat
+nat: on, hv0 (10.0.100.1) out through eth0 (10.0.2.15); 4 of 4096 mappings, ports 32768-36863
+  tcp 10.0.100.2:47410 -> 10.0.2.2:8000 as 32768, 7190 s left
+  udp 10.0.100.2:37716 -> 10.0.2.3:53 as 32771, 297 s left
+out 53  back 744  mapped 4  table full 0  no next hop 0  no frame 0  refused 0
+```
+
+**NAT is the network layer's** (`net/src/nat.rs`), not the module's: it is
+forwarding between two of the stack's devices, and it has to look at every
+packet either of them receives before the protocols do. While the switch
+exists it holds NAT on (`kcore::net::Nat`, a guard: dropped with the switch,
+it turns NAT off) from `hv0` out through the device nos's default route is
+on -- eth0, with the gateway its DHCP lease named. A guest's packet for an
+address off its subnet, and not one of nos's, arrives on `hv0` sent to its
+gateway, 10.0.100.1; instead of the protocols it goes to NAT, which gives its
+flow a mapping -- an external port of nos's, 32768 up -- rewrites its source
+to eth0's address and that port, one hop less to live, and sends it out of
+eth0 to the next hop. What eth0 receives for a mapped port, from the address
+and port the flow went to and nothing else, is rewritten back and sent to the
+guest; so is an ICMP error quoting one of the flow's packets, the packet it
+quotes made the one the guest sent. Whatever else arrives is the stack's, as
+before -- a port `hv forward` listens on is not NAT's unless a guest's flow
+has it, which it cannot, being below 32768.
+
+What it takes: TCP from a SYN on (a segment of a flow it has no mapping for
+is dropped, not mapped mid-stream), UDP, ICMP echo; not fragments, not other
+protocols, and nothing inbound that a guest did not start -- that is
+`hv forward`'s. A mapping lives while its flow is seen and RFC 5382's and
+4787's times after: two hours for a TCP connection that has been answered,
+four minutes before that and after a FIN, ten seconds after a reset, five
+minutes for UDP, one for an echo. The checksums are updated for what changed
+rather than summed again (RFC 1624), so a packet corrupted on the way stays
+detectably corrupt; an ICMP error, whose whole message changes, is checked
+before it is rewritten. The boot self-test (`rust_net_selftest`) checks every
+rewrite against checksums summed from scratch, and the table's filling,
+expiry and reuse.
+
+The table is 4096 mappings and a hash of the guests' side of them, taken
+whole when NAT goes on, so the datapath allocates nothing but the frame a
+packet goes out in, from the pool. It is under a spin lock held for the
+lookup only; the frame is built and sent with it down. When all 4096 are
+live the next flow is refused (`table full`) rather than made to evict one,
+and the table is swept for flows past their time no sooner than the first of
+them can be. The next hop's address comes from the ARP cache without waiting
+-- NAT runs on the receive path, which cannot sleep: an entry past its time is
+still used while it is asked for again, as Linux uses a stale neighbour, and
+the gateway and an on-link DNS server are asked for when NAT goes on, so a
+guest's first packet does not find them missing (`no next hop` counts those
+that did). A request goes out at most every 100 ms whatever a guest floods.
+
+**The switch answers DHCP** (`modules/hv/src/dhcp.rs`). A guest's DHCP
+message never leaves its port: the switch answers it in place with the
+port's address -- the same as `ip=` gives -- a day's lease, the /24 mask, nos
+as the router, and nos's DNS server. Nothing is remembered, because there is
+nothing to choose: a request for any other address is refused (NAK) and the
+client starts again. A distribution that configures its ethernet by DHCP, as
+most do, needs nothing on its command line; one that takes `ip=` gets the
+same address from there.
+
+**The DNS server the guests are given is nos's own** -- its resolver's, or
+the one its lease named (`kcore::net::dns_server`): 10.0.2.3 under QEMU's user
+network, Hetzner's resolvers on the Hetzner boxes. `ip=` carries it as `dns0`,
+which the kernel shows in `/proc/net/pnp` and Alpine's initramfs writes to
+`resolv.conf`, and DHCP as option 6, which systemd-resolved takes. The guests
+ask it through NAT like any other server; nos runs no DNS server of its own.
+
+`scripts/hv-linux-test.py --net` is the network's gate: two guests, their
+addresses, pings between each guest and nos and between the guests, nos's
+ping out of `hv0`, and a page from one guest's `httpd` fetched from outside
+the machine through `hv forward`; then the way out -- `dns0` in the guest's
+`/proc/net/pnp`, a page and a megabyte (md5 compared) from a web server on the
+test machine through NAT, a ping there, `udhcpc` given its port's address,
+nos as its router and nos's DNS server, and `nat` and `hv list` saying so.
+With `--internet`, a name looked up through the DNS server it was given.
 
 ## Guests that stay up
 
@@ -1050,10 +1123,12 @@ ttyS0. `nolapic acpi=off` is the PC it is given -- no local APIC and no ACPI
 tables -- so it takes its interrupts from the 8259s, finds its PCI devices
 through configuration mechanism 1, and takes each virtio device's interrupt
 line from its configuration space. On the switch (`net`) its initramfs
-configures eth0 from the `ip=` the VM is given; `apk add openssh-server`
-installs from the ISO, and through `hv forward` its own sshd is reached from
-outside nos. `reboot` resets it through the keyboard controller, and with
-`restart` it boots again.
+configures eth0 from the `ip=` the VM is given, and writes the `dns0` there
+to `resolv.conf`; through NAT it reaches what nos reaches -- `apk update`
+from Alpine's own mirror, the name looked up through nos's DNS server --
+and `apk add openssh-server` installs from the ISO, its own sshd reached
+from outside nos through `hv forward`. `reboot` resets it through the
+keyboard controller, and with `restart` it boots again.
 
 What it took that the purpose-built kernel did not:
 
@@ -1118,9 +1193,14 @@ systemd provisions a machine nobody sits at. systemd then reaches `running`
 with no unit failed, 38 s after the VM starts under TCG, and a file written
 to its root is still there after a reboot. Its networkd has no `.network`
 for an ethernet interface -- the image expects cloud-init or the like to
-write one -- so on the switch it is given its port's address by hand, and
-reaches nos. That command line runs past the 255 characters nos's
-`/etc/rc` allowed a line; it allows 1023.
+write one -- and one more credential is that file:
+`systemd.set_credential_binary=network.network.50-nos:<base64>` of
+`[Match] Type=ether` / `[Network] DHCP=ipv4`, which systemd-network-generator
+puts in `/run/systemd/network`. networkd then asks the switch's DHCP server,
+takes its port's address, nos as its router and nos's DNS server for
+systemd-resolved, and the guest reaches the world through NAT. That command
+line runs past the 255 characters nos's `/etc/rc` allowed a line; it allows
+1023.
 
 After typing `reboot`, a script cannot wait for the next `login:` with a
 plain `hv wait`: the boot going down still has the last one on its console,
@@ -1135,8 +1215,11 @@ lock, and QEMU throws away its translations of a page that held a guest's
 code as the page is written -- a guest that had run for half a minute took
 36 s to rebuild. The zeroing is done off the lock now (`PageTable::AllocPage`).
 
-The gate is `scripts/hv-distro-test.py --iso alpine-virt-*-x86_64.iso`
-([Tests and gates](testing.md)): manual, since the ISO is a download.
+The gate is `scripts/hv-distro-test.py --iso alpine-virt-*-x86_64.iso
+[--debian debian-*-nocloud-amd64.raw] [--internet]` ([Tests and
+gates](testing.md)): manual, since the images are downloads; `--internet`
+adds what needs the test machine's own way out, a name looked up and a
+mirror fetched from.
 
 ## On real hardware
 
@@ -1246,7 +1329,8 @@ up](#guests-that-stay-up)): the lifecycle the control plane will serve. What
 is left, not in step order: the VMX backend with `CR0.NE` on every CPU.
 The TLB is no longer flushed whole on every entry ([Address space
 identifiers](#address-space-identifiers)), guests have disks and a network
-over legacy virtio ([A disk](#a-disk), [A network](#a-network)), and a
+over legacy virtio ([A disk](#a-disk), [A network](#a-network)) with a way
+out through NAT ([The way out](#the-way-out-nat-dhcp-and-dns)), and a
 distribution boots as it ships ([A distribution](#a-distribution)). Beyond
 stage 3: a local APIC and an SMP guest, modern virtio, and the control
 plane's HTTP API (stage 4).
