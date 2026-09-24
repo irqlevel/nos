@@ -1291,6 +1291,29 @@ faster for it too, Debian at its login prompt in 3.8 s and Alpine in 8.9 s
 that never came. Debian's 343-character `hv start` went through over SSH;
 an exit cost 742 ns with ASIDs and 959 ns flushed, as before.
 
+The way out, on the AX41 the same day (45df223): with both guests on the
+switch, NAT went out through the I210 from the machine's own address, and
+each guest was handed Hetzner's resolver (185.12.64.1) by `ip=` and by the
+switch's DHCP. Alpine resolved its mirror, `apk update`d from it, and
+fetched 100 MB from Hetzner's Helsinki speed-test server in 0.93 s; Debian
+took its address and route by DHCP, synchronised its clock over NTP, pinged
+1.1.1.1 in 1.2 ms, `apt-get update`d over HTTPS (28.5 MB), and fetched
+100 MB over HTTPS in 1.0 s and 1 GB in 16.6 s (65 MB/s). A connection from
+another host to a mapped port was refused by nos's own stack and never
+reached a guest. Over the session NAT carried 10,841 packets out and
+943,241 back, and needed no next hop, frame or mapping it lacked.
+
+Two things it showed that are not NAT's. `apt-get update` fetched those
+28.5 MB in 39 s where one download of the same index took 0.2 s, and the
+guest's port dropped some 1,400 frames meanwhile: apt downloads over several
+connections at once while it decompresses, and a frame for a guest that is
+running -- not halted -- waits in the port's 64-frame inbox until its next
+exit. The switch wakes a halted guest and has nothing to hurry a running
+one; at line rate the inbox fills in under a millisecond. And a command run
+through nos's sshd for longer than the client's keepalive (`ssh -o
+ServerAliveInterval=`) is cut off, since the server answers no keepalive
+while the command runs.
+
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
 in [Real hardware](real-hardware.md) for the machine and in the gate's own
