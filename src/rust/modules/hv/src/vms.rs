@@ -97,6 +97,9 @@ pub struct Shared {
     reset: AtomicBool,
     /// What a parked task waits on: signalled with `stop` and with `reset`.
     wake: Event,
+    /// What has the vCPU leave its guest when a frame comes for it while
+    /// it runs, rather than at the host's next interrupt.
+    kick: hv::Kick,
     running: AtomicBool,
     /// How many times it has been booted again.
     restarts: AtomicU32,
@@ -139,6 +142,7 @@ impl Shared {
             stop: AtomicBool::new(false),
             reset: AtomicBool::new(false),
             wake: Event::new()?,
+            kick: hv::Kick::new(),
             running: AtomicBool::new(true),
             restarts: AtomicU32::new(0),
             attached: AtomicU32::new(0),
@@ -177,10 +181,12 @@ impl Shared {
         self.running.load(Ordering::Acquire)
     }
 
-    /// Wake the vCPU: a halted guest has something to look at -- a frame, a
-    /// key. From any context, interrupts off included.
+    /// Something waits for the guest -- a frame, handed over before this:
+    /// a halted vCPU's task is woken, a vCPU in its guest kicked out of it
+    /// to take it now. From any context, interrupts off included.
     pub(crate) fn wake_up(&self) {
         self.wake.signal();
+        self.kick.kick();
     }
 
     /// Queue `bytes` to be typed at the guest, all of them or -- when they do
@@ -368,7 +374,7 @@ fn vcpu(start: Start) {
             continue;
         };
 
-        let (stop, counts) = g.run(&machine, u64::MAX, &mut host);
+        let (stop, counts) = g.run(&machine, u64::MAX, &mut host, Some(&shared.kick));
         if let Some(line) = host.line.as_mut().filter(|l| !l.text().is_empty()) {
             kcore::trace!(0, "hvvm{}| {}", shared.id, line.text());
             line.clear();
@@ -747,9 +753,9 @@ impl Vms {
             if restarts != 0 {
                 let _ = write!(out, "  restarts {}", restarts);
             }
-            let _ = write!(out, "  exits {}  irq {}  hlt {}  {}",
+            let _ = write!(out, "  exits {}  irq {}  hlt {}  kicks {}  {}",
                 s.exits.load(Ordering::Relaxed), s.irq.load(Ordering::Relaxed),
-                s.hlt.load(Ordering::Relaxed), vm.kernel);
+                s.hlt.load(Ordering::Relaxed), s.kick.sent(), vm.kernel);
             if !running {
                 let _ = write!(out, "  -- {}", *s.reason.lock());
             }

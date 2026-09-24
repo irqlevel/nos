@@ -441,8 +441,14 @@ BusyBox's `nslookup` asks for A and AAAA at once and matches answers to
 questions by their ID alone, which musl takes from the clock's nanoseconds,
 and a TCG guest's clock moves in ticks -- both questions got one ID, and one
 answer was thrown away as the other's duplicate (the capture showed both
-answered). It needs a guest kernel with networking, virtio-net, packet
-sockets and `ip=` configuration built in.
+answered). Last, the megabyte again into a guest kept busy by a loop: it
+must arrive whole, the switch must have kicked the vCPU out of its guest
+for it (`kicks` in `hv list` above 0), and the port must have dropped
+nothing. Under TCG only the first two tell anything -- with the kick taken
+out, `kicks` reads 0 and the check fails, but slirp never outruns the host's
+tick, so no frame was dropped either; the drops show at line rate, on the
+AX41. It needs a guest kernel with networking, virtio-net, packet sockets
+and `ip=` configuration built in.
 
 ### `hv-distro-test.py` -- a distribution, as it ships
 

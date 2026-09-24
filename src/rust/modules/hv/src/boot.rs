@@ -101,7 +101,8 @@ impl Boot {
 
         let secs = self.spec.secs.unwrap_or(DEFAULT_SECS);
         let start = kcore::time::boot_time_ns();
-        let (stop, counts) = guest.run(&self.machine, secs * NS_PER_SEC, &mut host);
+        /* No switch reaches an `hv boot` guest, and nothing kicks it. */
+        let (stop, counts) = guest.run(&self.machine, secs * NS_PER_SEC, &mut host, None);
         let run_ns = kcore::time::boot_time_ns().saturating_sub(start);
         if !host.line.text().is_empty() {
             kcore::trace!(0, "hvguest| {}", host.line.text());

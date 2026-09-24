@@ -542,6 +542,20 @@ void kernel_cpu_run_on(unsigned int cpu,
     target.QueueIPITask(task);
 }
 
+/* An interrupt to `cpu`, now, and nothing waited for: what makes a vCPU that
+   is running a guest there leave it -- a physical interrupt ends the guest's
+   turn -- and costs any other CPU an interrupt with nothing to do. Sent the
+   way SoftIrq's kick is, straight to the interrupt controller: the caller may
+   have interrupts off, and CpuTable::SendIPI takes locks its handler takes
+   too. A CPU that is not running holds it pending, or never sees it. */
+void kernel_cpu_kick(unsigned int cpu)
+{
+    if (cpu >= (unsigned int)Kernel::MaxCpus)
+        return;
+
+    Hal::SendIpi(cpu, Kernel::CpuTable::IPIVector);
+}
+
 void* kernel_alloc_dma_pages(unsigned long count,
     unsigned long* phys_out, unsigned long* actual_pages_out)
 {

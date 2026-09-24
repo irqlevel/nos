@@ -72,6 +72,10 @@ pub enum Exit {
     /// took the CPU back. The host has handled it by the time this is read;
     /// the guest goes straight back in.
     Host,
+    /// Not entered at all: another CPU kicked the vCPU on its way in
+    /// (`hvarch::x86::svm::Kick`), and what it has for the guest -- a frame
+    /// -- is to be handed over first.
+    Kicked,
     Io(Io),
     Hlt,
     Cpuid,

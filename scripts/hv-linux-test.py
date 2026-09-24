@@ -481,7 +481,15 @@ def network(args):
                # their ID alone, which musl makes of the clock's nanoseconds --
                # the same for both, on a guest whose clock moves in ticks.
                x(0, "nslookup -type=a example.com" if args.internet else "true"),
-               "nat", "hv list"]
+               "nat", "hv list",
+               # The megabyte again, into a guest that is busy: a loop has
+               # its one CPU, and a frame that waits for its next exit --
+               # the host's tick -- overflows the port's inbox. The switch
+               # kicks it out of its guest to take each one.
+               x(0, "sh -c 'while :; do :; done' > /dev/null 2>&1 & echo $! > /busy.pid; echo busy"),
+               x(0, "wget -q -O - http://10.0.2.2:%d/big | md5sum" % web, 600),
+               x(0, "kill $(cat /busy.pid); echo idle"),
+               "hv list"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -529,9 +537,10 @@ def network(args):
         pt.check("a page from the guest's httpd, fetched from outside through hv forward",
                  b"nos-http-hello" in body, body[-300:])
 
-        # The way-out lines, each the last run of its text: "hv list" is run
-        # before them too.
-        way = lambda i: ([o for (c, o) in secs if c == way_out[i].strip()] or [""])[-1]
+        # The way-out lines, each by its own occurrence: "hv list" is run
+        # before them, and among them twice.
+        first = len(rc) - 1 - len(way_out)
+        way = lambda i: output_of(secs, way_out[i], rc[:first + i].count(way_out[i])) or ""
         pt.check("ip= gave the guest nos's DNS server, 10.0.2.3", "nameserver 10.0.2.3" in way(0), way(0))
         pt.check("a guest fetches a page from the test machine through NAT", token in way(1), way(1)[-600:])
         pt.check("and pings it", ok_ping(way(2)), way(2)[-600:])
@@ -554,6 +563,13 @@ def network(args):
         pt.check("hv list says the guests go out through NAT, and counts the DHCP answers",
                  "the guests go out through NAT, from 10.0.2.15" in way(9)
                  and re.search(r"[1-9]\d* DHCP answers", way(9)) is not None, way(9)[-800:])
+        pt.check("a busy guest takes the megabyte whole too", "busy" in way(10)
+                 and hashlib.md5(big).hexdigest() in way(11), way(11)[-600:])
+        vm0 = re.search(r"(?m)^vm 0 .*$", way(13))
+        vm0 = vm0.group(0) if vm0 else ""
+        kicks = re.search(r"kicks (\d+)", vm0)
+        pt.check("kicked out of its guest to take the frames, its port dropped none",
+                 kicks is not None and int(kicks.group(1)) > 0 and "dropped" not in vm0, vm0)
     finally:
         server.shutdown()
         pt.kill(p)

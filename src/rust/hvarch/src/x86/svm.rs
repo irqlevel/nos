@@ -10,7 +10,7 @@
 
 use core::arch::{asm, naked_asm};
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use kcore::dma::DmaBuffer;
 use kcore::percpu::{ConstInit, CpuLocal};
@@ -323,6 +323,93 @@ pub enum NotRun {
     /// its own host physical addresses. Nothing in this kernel turns LA57
     /// on; this is where that would be found out, not a guest.
     FiveLevelPaging { cpu: u32 },
+    /// Another CPU kicked the vCPU on its way in ([`Kick`]): something is
+    /// waiting for the guest that the caller is to hand over first. Nothing
+    /// was entered and the VMCB is as it was.
+    Kicked { cpu: u32 },
+}
+
+/// What another CPU does to have a guest that is running leave it -- the
+/// guests' switch, with a frame for it -- and what [`Guest::run`] looks at,
+/// with interrupts off, before it enters: KVM's vCPU mode, as its kick uses
+/// it.
+///
+/// A guest's turn ends when the host takes an interrupt, and not before.
+/// Work handed to a vCPU that is in its guest waits for that -- the host's
+/// next tick, milliseconds, while a busy guest's inbox overflows -- unless
+/// its CPU is interrupted now. The vCPU's side, in this order: `prepare`,
+/// then its last look at what may be waiting for the guest, then
+/// [`Guest::run`] -- which enters only if no kick came meanwhile, and marks
+/// the vCPU outside again on the way back -- or `cancel`, when it does not
+/// enter at all. The other side: what it has for the guest made visible,
+/// then `kick`. The vCPU's last look finds the work, or the kick finds the
+/// vCPU in its guest or on its way in: then its CPU is interrupted, which
+/// ends the guest's turn -- or, taken by the host before interrupts went
+/// off there, leaves the entry to be refused. One interrupt at most per
+/// entry, however many kick.
+pub struct Kick {
+    mode: AtomicU8,
+    /// The CPU the vCPU last entered its guest on.
+    cpu: AtomicU32,
+    /// Interrupts sent: kicks that found the vCPU in its guest or on its
+    /// way in.
+    sent: AtomicU64,
+}
+
+/* A vCPU's modes. */
+const OUTSIDE_GUEST: u8 = 0;
+const IN_GUEST: u8 = 1;
+const EXITING_GUEST: u8 = 2;
+
+impl Kick {
+    pub const fn new() -> Kick {
+        Kick { mode: AtomicU8::new(OUTSIDE_GUEST), cpu: AtomicU32::new(0), sent: AtomicU64::new(0) }
+    }
+
+    /// How many kicks interrupted the vCPU's CPU.
+    pub fn sent(&self) -> u64 {
+        self.sent.load(Ordering::Relaxed)
+    }
+
+    /// The vCPU's: from here a kick refuses its next entry. Before its last
+    /// look at what may be waiting for the guest -- the fence orders the two,
+    /// against `kick`'s.
+    pub fn prepare(&self) {
+        self.mode.store(IN_GUEST, Ordering::SeqCst);
+        fence(Ordering::SeqCst);
+    }
+
+    /// The vCPU's: it will not enter after all -- it halts, or stops.
+    pub fn cancel(&self) {
+        self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
+    }
+
+    /// Another CPU's, from any context: something is waiting for the guest,
+    /// made visible before this.
+    pub fn kick(&self) {
+        fence(Ordering::SeqCst);
+        if self.mode.compare_exchange(IN_GUEST, EXITING_GUEST, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            kcore::cpu::kick(self.cpu.load(Ordering::SeqCst));
+            self.sent.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// [`Guest::run`]'s, with interrupts off on `cpu`: whether to enter.
+    /// The CPU is stored before the mode is read, so that a kick that finds
+    /// the vCPU in its guest after this interrupts the CPU it is on.
+    fn entering(&self, cpu: u32) -> bool {
+        self.cpu.store(cpu, Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) == IN_GUEST {
+            true
+        } else {
+            self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
+            false
+        }
+    }
+
+    fn left(&self) {
+        self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
+    }
 }
 
 /// A nested page table as an entry needs it: the physical address of its
@@ -622,11 +709,16 @@ impl Guest {
     /// on there, a page that stays allocated until this returns: `vmrun`
     /// writes the host's state into whatever `VM_HSAVE_PA` names, and
     /// `#vmexit` reads it back from there.
+    ///
+    /// With `kick`, the entry is the vCPU's in [`Kick`]'s sense: refused
+    /// ([`NotRun::Kicked`]) when a kick came after its `prepare`, and marked
+    /// outside the guest again once it is back.
     pub unsafe fn run(
         &mut self,
         perms: &Permissions,
         nested: Nested,
         host_areas: &[AtomicU64],
+        kick: Option<&Kick>,
     ) -> core::result::Result<u32, NotRun> {
         {
             let c = &mut self.vmcb.get_mut().control;
@@ -672,6 +764,14 @@ impl Guest {
             if cr4 & CR4_LA57 != 0 {
                 return Err(NotRun::FiveLevelPaging { cpu });
             }
+            /* With interrupts off: a kick from here on is an interrupt held
+             * pending on this CPU, which ends the guest's turn as soon as it
+             * begins; one before this is refused here. */
+            if let Some(k) = kick {
+                if !k.entering(cpu) {
+                    return Err(NotRun::Kicked { cpu });
+                }
+            }
             /* Here, with interrupts off, so that the CPU the ASID is for is
              * the CPU `vmrun` runs on. Never 0, the host's: `vmrun` refuses
              * that itself, and the refusal hands the guest nothing. */
@@ -715,6 +815,9 @@ impl Guest {
             let t2 = stamp(timed);
             unsafe { vmrun_stub(guest, regs, host) };
             let t3 = stamp(timed);
+            if let Some(k) = kick {
+                k.left();
+            }
 
             unsafe { asm!("fxsave64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
             if switch_xcr0 {

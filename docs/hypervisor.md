@@ -858,6 +858,22 @@ a halted guest waits on its VM's event, until its timer's next edge or
 something for it -- a frame, a key typed at `hv attach` or `hv send` --
 whichever comes first (`Event::WaitFor`, [the scheduler](scheduler.md#blocking-and-waking)).
 
+**A guest that is running is kicked out of it.** Its turn ends when its
+CPU takes an interrupt, and the device model hands frames over only between
+turns, so a frame for a busy guest used to wait for the host's next tick --
+ten milliseconds, while at line rate the port's 64-frame inbox fills in
+under one. On the AX41 a guest that `apt-get update`d, fetching over several
+connections while it decompressed, lost some 1,400 frames that way and took
+39 s over 28.5 MB. Now the switch kicks the vCPU as KVM does
+(`hvarch::x86::svm::Kick`): the vCPU marks itself on its way in before its
+last look at the inbox, a sender that finds it so marks it exiting and
+interrupts its CPU (`kernel_cpu_kick`, straight to the interrupt controller,
+from any context), and `Guest::run` looks at the mark once more with
+interrupts off: a kick from before that point turns the entry back
+(`Exit::Kicked`), one after it is an interrupt held pending, which ends the
+guest's turn as it begins. One interrupt per entry at most, however many
+frames come; `hv list` counts them (`kicks`).
+
 **`hv forward` is how a guest is reached from outside.** The guests have
 addresses only on their switch; a forward listens on a port of nos's and,
 for each connection, opens one to the guest's port through `hv0`

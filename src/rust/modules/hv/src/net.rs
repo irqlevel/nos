@@ -154,7 +154,10 @@ impl Ports {
         inbox.lens[slot] = frame.len() as u16;
         inbox.count += 1;
         p.waiting.store(inbox.count, Ordering::Release);
-        /* Under the lock: what keeps the VM from going meanwhile. */
+        /* Under the lock: what keeps the VM from going meanwhile. A halted
+         * guest's task is woken; one in its guest is kicked out to take the
+         * frame now -- at the host's next tick, a busy guest's inbox would
+         * have overflowed many times over at line rate. */
         if let Some(owner) = &inbox.owner {
             owner.wake_up();
         }

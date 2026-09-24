@@ -149,7 +149,7 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
         if time::boot_time_ns().saturating_sub(start) >= budget {
             break Stop::Budget;
         }
-        let (exit, cpu) = match vm.enter(machine) {
+        let (exit, cpu) = match vm.enter(machine, None) {
             Ok(entered) => entered,
             Err(refusal) => break Stop::Refused(refusal),
         };
@@ -158,8 +158,9 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
 
         match exit {
             /* Taken by the host on the way out, with the guest's state
-             * safely in the VMCB: straight back in. */
-            Exit::Host => run.host += 1,
+             * safely in the VMCB: straight back in. (Nothing kicks these
+             * guests: none is entered with a `Kick`.) */
+            Exit::Host | Exit::Kicked => run.host += 1,
             Exit::Io(io) if io.size == 1 && !io.string && Uart::owns(COM1, io.port) => {
                 let v = vm.vcpu_mut();
                 let offset = io.port - COM1;
@@ -465,7 +466,7 @@ fn asid_step(vm: &mut Vm, machine: &Machine, tally: &mut Tally, deadline: u64)
         if time::boot_time_ns() >= deadline {
             return Err(String::from("it ran out of time"));
         }
-        let (exit, cpu) = match vm.enter(machine) {
+        let (exit, cpu) = match vm.enter(machine, None) {
             Ok(entered) => entered,
             Err(Refusal::NotOn(cpu)) if tally.cpus == 0 => {
                 tally.not_on = Some(cpu);
