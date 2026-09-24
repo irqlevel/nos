@@ -1083,9 +1083,13 @@ static void CmdLsmod(const char* args, Stdlib::Printer& con)
    skips it at boot. */
 static const char RcPath[] = "/etc/rc";
 static const char RcDir[] = "/etc";
-/* The most of a script read, and the longest line run */
+/* The most of a script read, and the longest line run: long enough for a
+   guest's `hv start` with a distribution's kernel command line, which runs
+   past two hundred characters before it says anything of its own. Lines
+   are copied through a buffer this long on the stack of the task that runs
+   the script, a kernel task's 64 KiB. */
 static const ulong ScriptSizeMax = 16 * Const::KB;
-static const ulong ScriptLineMax = 255;
+static const ulong ScriptLineMax = 1023;
 static const ulong ScriptTag = 'Rc  ';
 
 /* A script, NUL-terminated, in a buffer from Mm::Alloc the caller frees --

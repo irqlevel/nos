@@ -75,7 +75,10 @@ hv console <id> [bytes=N]          the end of one's console
 hv attach <id>                     its console, live, typed at -- ^] detaches (ssh -t)
 hv send <id> <text>                type at it (\\n for a newline)
 hv exec <id> [secs=N] <line>       type a line and print the answer, up to the next prompt
-hv wait <id> [secs=N] <text>       until its console shows text, or it stops
+hv wait <id> [secs=N] [boot=N] <text>
+                                   until its console shows text in this boot -- or,
+                                   with boot=N, once it has restarted N times --
+                                   or it stops
 hv restart <id>                    boot it again from its files, running or stopped
 hv stop <id|all>                   stop it, say how it ended, take it off the list
 hv forward [add <port> <vm> <guest-port> | del <port>]

@@ -97,7 +97,7 @@ swallowing panic messages whole.
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them |
-| `hv-distro-test.py --iso <alpine-virt.iso>` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network, and its own sshd reached from outside |
+| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, its root written to and kept across a reboot |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -451,6 +451,19 @@ pings it; that `apk add openssh-server` installs from the ISO; and that the
 test, from outside QEMU, logs into the guest's own sshd through QEMU's
 forward, nos's `hv forward` and the switch. Two boots and apk under TCG:
 about five minutes. It needs `xorriso`, `ssh` and `ssh-keygen` on the host.
+
+With `--debian debian-13-nocloud-amd64.raw` (the .qcow2 through `qemu-img
+convert -O raw`) it boots Debian's cloud image the same way -- its kernel
+and initrd read out of the image's `/boot` with `sfdisk` and `debugfs`, the
+image, copied sparse, the guest's writable disk -- with systemd-firstboot
+given the root password, locale, keymap and timezone as credentials on the
+kernel command line; and checks that root logs in with that password, that
+`systemctl is-system-running` says running with no unit failed, that its
+root is `/dev/vda1`, ext4, read-write, that its clock is the host's, that
+given its port's address its virtio-net driver reaches nos and nos it, and
+that a file written to its root is still there after `reboot` (waited for
+with `hv wait ... boot=1`, since systemd's `reboot` hands the shell its
+prompt back first).
 
 Under TCG the guest cannot calibrate its TSC against the PIT -- an exit
 costs more than the calibration loop allows -- so it stays on jiffies and

@@ -222,8 +222,10 @@ backend, where a guest can show it working -- not slipped in here.
     hv exec <id> [secs=N] <line>
                                 type a line, print what comes back up to the
                                 prompt after it
-    hv wait <id> [secs=N] <text>
-                                until its console shows text, or it stops
+    hv wait <id> [secs=N] [boot=N] <text>
+                                until this boot's console shows text -- with
+                                boot=N, once it has restarted N times -- or it
+                                stops
     hv restart <id>             boot it again from its files, running or stopped
     hv stop <id|all>            stop it, say how it ended, take it off the list
     hv forward [add <port> <vm> <guest-port> | del <port>]
@@ -1056,6 +1058,48 @@ What it took that the purpose-built kernel did not:
   current boot began.
 - **`disk=path:ro`**: virtio's read-only feature, and a write the device
   refuses itself before any reaches the file.
+- **An `ip=` that names no device.** A kernel told `eth0` waits twelve
+  seconds for it to appear (`DEVICE_WAIT_MAX`), and a distribution's NIC
+  driver is a module its initramfs loads after that; with the field empty
+  the kernel finds no device at once and leaves `ip=` to the initramfs,
+  whose own parser takes the first interface that comes up.
+
+### Debian
+
+Debian 13's `nocloud` cloud image boots the same way: its kernel
+(6.12.107+deb13-amd64, the generic one) and initrd read out of the image's
+own `/boot`, and the image itself -- 3 GiB, a raw file on nos's root -- the
+guest's disk, whose root partition its initramfs-tools mounts read-write:
+
+```
+$ hv start /debian/vmlinuz mem=768 initrd=/debian/initrd disk=/debian/debian.raw net restart cmdline=root=/dev/vda1 ro console=ttyS0 nolapic acpi=off systemd.set_credential=passwd.plaintext-password.root:nos systemd.set_credential=firstboot.locale:C.UTF-8 systemd.set_credential=firstboot.keymap:us systemd.set_credential=firstboot.timezone:UTC
+$ hv wait 0 secs=600 login:
+hv: vm 0 printed "login:", 38931 ms in
+$ hv send 0 root\n
+$ hv send 0 nos\n
+$ hv exec 0 cat /etc/debian_version; uname -r; systemctl is-system-running
+13.7
+6.12.107+deb13-amd64
+running
+```
+
+Its root is locked (`!unprovisioned`) until systemd-firstboot sets it, and
+firstboot asks at the console for the root password, the locale, the keymap
+and the timezone -- a typed line that is not one is "Invalid data" -- so
+`systemd.set_credential=` on the kernel command line gives it all four, as
+systemd provisions a machine nobody sits at. systemd then reaches `running`
+with no unit failed, 38 s after the VM starts under TCG, and a file written
+to its root is still there after a reboot. Its networkd has no `.network`
+for an ethernet interface -- the image expects cloud-init or the like to
+write one -- so on the switch it is given its port's address by hand, and
+reaches nos. That command line runs past the 255 characters nos's
+`/etc/rc` allowed a line; it allows 1023.
+
+After typing `reboot`, a script cannot wait for the next `login:` with a
+plain `hv wait`: the boot going down still has the last one on its console,
+and systemd's `reboot` gives the shell its prompt back before the system
+goes. `hv wait 0 boot=1 login:` waits for the VM's first restart, and then
+for the text in the boot after it.
 
 And one thing in the kernel. Rebuilding the rebooted guest under TCG held
 the page allocator's lock for more than ten seconds, with every other CPU
@@ -1131,9 +1175,11 @@ they are stopped, reached from the shell ([Guests that stay
 up](#guests-that-stay-up)): the lifecycle the control plane will serve. What
 is left, not in step order: the VMX backend with `CR0.NE` on every CPU.
 The TLB is no longer flushed whole on every entry ([Address space
-identifiers](#address-space-identifiers)). Beyond stage 3: a local
-APIC and an SMP guest, host-side virtio, and the control plane's HTTP API
-(stage 4).
+identifiers](#address-space-identifiers)), guests have disks and a network
+over legacy virtio ([A disk](#a-disk), [A network](#a-network)), and a
+distribution boots as it ships ([A distribution](#a-distribution)). Beyond
+stage 3: a local APIC and an SMP guest, modern virtio, and the control
+plane's HTTP API (stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every
