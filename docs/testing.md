@@ -426,10 +426,12 @@ anything past 255, and a distribution's `hv start` is longer. It needs `ssh` and
 `--disk` is another: an ext4 image with a file in it, put on nos's root and
 given to the guest with `disk=`; the guest mounts it, reads the file, writes
 4 MiB and a file of its own, syncs, and reads both back after a remount; the
-report must count the disk's reads, writes and flushes and no error; and
-the image, taken back out of nos's root with `debugfs`, must pass `e2fsck`
-and hold what the guest wrote. It needs a guest kernel with PCI, legacy
-virtio-pci, virtio-blk and ext4 built in.
+report must count the disk's reads, writes and flushes and no error;
+nos's root, which every write of the guest's went through -- the image's
+holes filled, its blocks written over -- must pass `e2fsck` as nos left it,
+stopped rather than unmounted; and the image, taken back out of it with
+`debugfs`, must pass `e2fsck` too and hold what the guest wrote. It needs a
+guest kernel with PCI, legacy virtio-pci, virtio-blk and ext4 built in.
 
 `--net` is the guests' network: two guests with `net`; each has its port's
 address and MAC; a guest pings nos at 10.0.100.1 and each pings the other;

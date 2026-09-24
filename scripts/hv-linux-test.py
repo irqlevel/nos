@@ -362,8 +362,8 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None):
 def disk(args):
     """A disk for the guest: an ext4 image on nos's root, `disk=` to the
     guest, which mounts it, reads what the host put there, writes, syncs and
-    reads back -- and then the image, taken back out of nos's root, is
-    judged by e2fsck and must hold what the guest wrote."""
+    reads back -- and then nos's root is judged by e2fsck, and so is the
+    image, taken back out of it, which must hold what the guest wrote."""
     tmp = tempfile.mkdtemp(prefix="nos-hvdisk-")
     content = os.path.join(tmp, "content")
     os.makedirs(content)
@@ -412,6 +412,13 @@ def disk(args):
                  and int(m.group(3)) > 0 and int(m.group(4)) > 0, stop[-800:])
     finally:
         pt.kill(p)
+
+    # nos's own root, which every write of the guest's went through -- the
+    # holes of the image filled, blocks of it written over -- as nos left it:
+    # stopped, not unmounted, which e2fsck is to find clean all the same.
+    fsck = subprocess.run(["e2fsck", "-fn", image], capture_output=True)
+    pt.check("e2fsck finds nos's root clean after the guest's writes", fsck.returncode == 0,
+             fsck.stdout.decode(errors="replace")[-800:])
 
     # The image as nos's root filesystem has it, after the guest's writes.
     back = os.path.join(tmp, "back.img")
