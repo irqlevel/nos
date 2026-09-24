@@ -613,8 +613,9 @@ def run(args):
             sys.exit("an /etc/rc line is longer than rc takes (255): " + line)
     image = rootfs(tmp, args.bzimage, args.initrd, rc)
 
-    kvm = os.path.exists("/dev/kvm") and not args.tcg and hvt.host_has_svm()
-    print("accelerator: %s" % ("KVM, the host's AMD-V" if kvm else "TCG, -cpu max"))
+    kvm = os.path.exists("/dev/kvm") and not args.tcg and (hvt.host_has_svm() or hvt.host_has_vmx())
+    ext = "the host's AMD-V" if hvt.host_has_svm() else "the host's Intel VT-x (nested)"
+    print("accelerator: %s" % ("KVM, " + ext if kvm else "TCG, -cpu max (AMD-V)"))
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4",
             "-cpu", "host" if kvm else "max",
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,

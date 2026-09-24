@@ -235,6 +235,16 @@ loader -- is written once. The differences that are not hidden that way:
   keeps none, so `run` saves the host's and restores the guest's around the
   world switch by hand. The x87/SSE and XCR0 switch is the same as AMD-V --
   neither extension switches it, and the guest is given x87 alone.
+- **The syscall MSRs are switched through load lists.** `STAR`, `LSTAR`,
+  `CSTAR`, `FMASK` and `KERNEL_GS_BASE` are not VMCS fields, and a guest run
+  with the host's would be catastrophic -- a userspace `SYSCALL` jumps to the
+  host's `LSTAR`, and it was exactly this that a real Linux oopsed on at
+  `RIP: 0x0` the moment it ran `/init`, the kernel itself having booted whole
+  in ring 0 without them. AMD-V moves these with `vmsave`/`vmload`; VMX has
+  no such instruction, so `Guest` keeps a VM-entry MSR-load list (the guest's
+  values, from the shadow) and a VM-exit MSR-load list (the host's, off the
+  CPU), and the CPU loads each in turn. With them, an unmodified Linux boots
+  to a BusyBox shell under VT-x.
 - **Controls, not a permission map.** Every port and every MSR exits by the
   processor-based controls (unconditional I/O exiting, no MSR bitmap), not by
   the 20 KiB of `iopm`/`msrpm` a VMCB points at. Each control field is

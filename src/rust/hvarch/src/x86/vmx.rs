@@ -448,8 +448,30 @@ impl HostRegs {
 /// that policy above reads and writes as though it were a VMCB's save area
 /// (`Save`), the registers the launch stub moves, and the x87/SSE state
 /// `vmlaunch` does not switch.
+/// The MSRs the CPU switches around a guest through the VM-entry and VM-exit
+/// load lists, because they are not VMCS fields and a guest that ran with the
+/// host's would be catastrophic: `SYSCALL` jumps to the host's `LSTAR`, and
+/// `SWAPGS` finds the host's shadow GS base. AMD-V moves these with
+/// `vmsave`/`vmload`; VMX has no such instruction, so the CPU loads the
+/// guest's on entry and the host's on exit from two lists this fills.
+const SWAP_MSRS: [u32; 5] = [
+    0xC000_0081, // IA32_STAR
+    0xC000_0082, // IA32_LSTAR
+    0xC000_0083, // IA32_CSTAR
+    0xC000_0084, // IA32_FMASK
+    0xC000_0102, // IA32_KERNEL_GS_BASE
+];
+/// Where each list sits in the MSR page: 16 bytes an entry (index, reserved,
+/// value), the entry list at the start and the exit list past it.
+const MSR_ENTRY_BASE: usize = 0;
+const MSR_EXIT_BASE: usize = 0x100;
+
 pub struct Guest {
     vmcs: vmcs::VmcsPage,
+    /// One page holding the VM-entry MSR-load list (the guest's values of
+    /// [`SWAP_MSRS`]) and the VM-exit MSR-load list (the host's), each an
+    /// array of 16-byte entries the CPU reads.
+    msr_area: kcore::dma::DmaBuffer,
     /// The guest state, kept in the same shape as an AMD-V save area so the
     /// policy layer is one set of code: synced to the VMCS before an entry
     /// and read back from it after.
@@ -513,10 +535,13 @@ impl Guest {
         fx.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
         fx.push(FxArea::reset());
         let vmcs = vmcs::VmcsPage::new(caps.revision())?;
+        let mut msr_area = kcore::dma::DmaBuffer::new(1).ok_or(Error::NoMemory)?;
+        msr_area.as_mut_slice().fill(0);
         let unrestricted = caps.has(SEC_UNRESTRICTED_GUEST);
 
         Ok(Self {
             vmcs,
+            msr_area,
             save: unsafe { core::mem::zeroed() },
             regs: GuestRegs::default(),
             fx,
@@ -682,8 +707,11 @@ impl Guest {
             vmwrite(EPT_POINTER, eptp);
             vmwrite(VMCS_LINK_POINTER, u64::MAX);
             vmwrite(VPID, 0);
-            vmwrite(VMENTRY_MSR_LOAD_COUNT, 0);
-            vmwrite(VMEXIT_MSR_LOAD_COUNT, 0);
+            let msr_phys = self.msr_area.phys();
+            vmwrite(VMENTRY_MSR_LOAD_ADDR, msr_phys + MSR_ENTRY_BASE as u64);
+            vmwrite(VMENTRY_MSR_LOAD_COUNT, SWAP_MSRS.len() as u64);
+            vmwrite(VMEXIT_MSR_LOAD_ADDR, msr_phys + MSR_EXIT_BASE as u64);
+            vmwrite(VMEXIT_MSR_LOAD_COUNT, SWAP_MSRS.len() as u64);
             vmwrite(VMEXIT_MSR_STORE_COUNT, 0);
             vmwrite(TSC_OFFSET, 0);
             /* The guest owns all of CR0 but for what VMX forces; CR4.VMXE is
@@ -748,6 +776,28 @@ impl Guest {
             vmwrite(GUEST_ACTIVITY_STATE, 0);
             vmwrite(GUEST_INTERRUPTIBILITY, self.interruptibility as u64);
             vmwrite(vmcs::GUEST_PENDING_DBG, 0);
+        }
+    }
+
+    /// Fill the VM-entry MSR-load list with the guest's `SWAP_MSRS` (from the
+    /// shadow, where the policy keeps them) and the VM-exit MSR-load list with
+    /// the host's (off the CPU this runs on), so the CPU loads the guest's on
+    /// entry and puts the host's back on exit.
+    fn fill_msr_lists(&mut self) {
+        let guest = [
+            self.save.star, self.save.lstar, self.save.cstar,
+            self.save.sfmask, self.save.kernel_gs_base,
+        ];
+        for (i, (&msr, &gval)) in SWAP_MSRS.iter().zip(guest.iter()).enumerate() {
+            let host = unsafe { cpu::rdmsr(msr) };
+            let e = MSR_ENTRY_BASE + i * 16;
+            let x = MSR_EXIT_BASE + i * 16;
+            self.msr_area.store::<u32>(e, msr);
+            self.msr_area.store::<u32>(e + 4, 0);
+            self.msr_area.store::<u64>(e + 8, gval);
+            self.msr_area.store::<u32>(x, msr);
+            self.msr_area.store::<u32>(x + 4, 0);
+            self.msr_area.store::<u64>(x + 8, host);
         }
     }
 
@@ -870,6 +920,7 @@ impl Guest {
                 self.host_cpu = cpu as i32;
             }
             unsafe { self.write_guest_state() };
+            self.fill_msr_lists();
             unsafe {
                 /* The interrupt-window control is dynamic: on only while the
                  * policy is waiting to inject an IRQ the guest cannot take
