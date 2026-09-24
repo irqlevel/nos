@@ -850,10 +850,11 @@ the UDP listeners' way.
 **The switch is the module's** (`modules/hv/src/net.rs`). A guest's NIC is a
 port, and a port's number is its address and its MAC (02:00:00:00:64:NN), so
 frames go by their destination MAC with nothing learned: to a port, to `hv0`,
-or to everyone for a broadcast or a MAC no port has. A port's inbox is filled
-from any CPU -- `hv0`'s sink among them, interrupts off -- so it is a spin
-lock with interrupts off over storage taken when the switch was made, and a
-full one drops, counted in `hv list`. A frame put in wakes the guest's vCPU:
+or to everyone for a broadcast or a MAC no port has. A port's inbox holds
+256 frames, the guest's receive ring's worth, and is filled from any CPU --
+`hv0`'s sink among them, interrupts off -- so it is a spin lock with
+interrupts off over storage taken when the port is first claimed, and kept
+for the next VM on it; a full one drops, counted in `hv list`. A frame put in wakes the guest's vCPU:
 a halted guest waits on its VM's event, until its timer's next edge or
 something for it -- a frame, a key typed at `hv attach` or `hv send` --
 whichever comes first (`Event::WaitFor`, [the scheduler](scheduler.md#blocking-and-waking)).
@@ -873,6 +874,26 @@ interrupts off: a kick from before that point turns the entry back
 (`Exit::Kicked`), one after it is an interrupt held pending, which ends the
 guest's turn as it begins. One interrupt per entry at most, however many
 frames come; `hv list` counts them (`kicks`).
+
+Measured on the AX41 in one boot, the same Debian guest and three builds
+of the module loaded in turn, a cold `apt-get update` (28.5 MB) and a
+gigabyte from Hetzner's speed-test server each:
+
+| build | `apt-get update` | frames dropped | 1 GB |
+|---|---|---|---|
+| no kick, 64-frame inbox | 16 s, 10 s | 100, 44 | 52, 42 MB/s |
+| kick, 64 frames | 7 s, 8 s | 437, 141 | 61, 60 MB/s |
+| kick, 256 frames | 9 s, 7 s | 0, 0 | 68, 56 MB/s |
+
+The kick halves the fetch and lifts the bulk rate by a fifth to two fifths
+(about 220,000 kicks for the gigabyte, one per three frames). With frames
+flowing that much faster the 64-frame inbox overflowed more on apt's bursts
+than it had without the kick, and at 256 -- the guest's own ring -- none
+was lost. What the gigabyte still loses (500 to 800 frames) is the guest's
+own ceiling: one vCPU takes each frame through a legacy virtio interrupt
+and the 8259's, several exits apiece, at 55 to 70 MB/s, and TCP paces to
+it. That is the next thing to take out: fewer exits per frame, not more
+room for them.
 
 **`hv forward` is how a guest is reached from outside.** The guests have
 addresses only on their switch; a forward listens on a port of nos's and,
@@ -1324,8 +1345,10 @@ Two things it showed that are not NAT's. `apt-get update` fetched those
 guest's port dropped some 1,400 frames meanwhile: apt downloads over several
 connections at once while it decompresses, and a frame for a guest that is
 running -- not halted -- waits in the port's 64-frame inbox until its next
-exit. The switch wakes a halted guest and has nothing to hurry a running
-one; at line rate the inbox fills in under a millisecond. And a command run
+exit. The switch woke a halted guest and had nothing to hurry a running
+one; at line rate the inbox fills in under a millisecond. It kicks a running
+one now, and the inbox is the guest's ring's size ([A network](#a-network)).
+And a command run
 through nos's sshd for longer than the client's keepalive (`ssh -o
 ServerAliveInterval=`) is cut off, since the server answers no keepalive
 while the command runs.
