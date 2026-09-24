@@ -839,9 +839,9 @@ disk over the whole run, its boot's hundred-odd flushes included (QEMU's
 | with holes: the guest's writes allocate | 11.3 s; 32,640 writes, 134 MB, 4,716 flushes | 2.2 s; 13,530 writes, 55 MB, 317 flushes |
 | whole: the guest's writes overwrite | 3.4 s; 15,534 writes, 64 MB, 1,978 flushes | 0.83 s; 14,559 writes, 60 MB, 112 flushes |
 
-On the AX41 a Debian guest writes at 260 to 290 MB/s, and what `apt-get
-update` leaves dirty goes down in a third of a second where it took half a
-minute ([On real hardware](#on-real-hardware)).
+On the AX41 a Debian guest writes at 360 MB/s and reads at 400, and what
+`apt-get update` leaves dirty goes down in a quarter of a second where it
+took half a minute ([On real hardware](#on-real-hardware)).
 
 `scripts/hv-linux-test.py --disk` is its gate: an ext4 image with a file in
 it on nos's root, the guest mounting it, reading the file, writing 4 MiB and
@@ -1421,11 +1421,30 @@ costing what they change (2c72334, [A disk](#a-disk)), the same guest with
 "Long readout interval" came up in none of it. Afterwards `e2fsck` found
 nos's `nosenv` clean, and the guest's ext4 in its image too, taken
 read-only through a loop device; the image had 0.3 GiB of holes filled on
-the way. What bounds the rate now is ext2 writing a request's blocks one
-4 KiB command at a time, each synchronous: the disk's task is at a whole
-CPU while the guest writes, `profile` putting most of it in the NVMe
-driver's `WaitGroup::Wait` yielding until the command completes. Writing a
-request's blocks at once is the disk's next thing to take out.
+the way. What bounded the rate then was ext2 writing a request's blocks one
+4 KiB command at a time, each synchronous: the disk's task was at a whole
+CPU while the guest wrote, `profile` putting most of it in the NVMe
+driver's `WaitGroup::Wait` yielding until the command completed.
+
+Booted once more with a file's blocks going to the disk in batches, 32
+commands in flight at once (63a7bb2, [Filesystems](filesystems.md)):
+
+| in the Debian guest | a block at a time | in batches |
+|---|---|---|
+| `dd` 1 GiB, a new file / over it again | 261 / 284 MB/s | 363 / 358 MB/s |
+| reading it back, the cache dropped | 231 MB/s | 397 MB/s |
+| the disk's task, while `dd` writes | a whole CPU | 11% of one |
+| `sync` of what `apt-get update` left dirty | ~90 MB in 0.36 s | 102 MB in 0.25 s |
+| a gigabyte fetched to the guest's disk | 82 MB/s | 87 MB/s |
+
+and the guest at its login prompt in 3.5 s, its disk's task having spent a
+third as much CPU reading the boot in. `e2fsck` found `nosenv` and the
+guest's ext4 clean again. What bounds the guest now is its vCPU, at 85% of
+its CPU while `dd` writes: two thirds of that is copying each request's
+data out of guest memory, a page at a time through the kernel's temporary
+window and eight bytes at a time inside it (`FrameCopy`, a `MemCpy` call a
+word), and a fifth the guest itself running. Copying a page as a page is
+the disk's next thing to take out.
 
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
