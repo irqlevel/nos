@@ -150,9 +150,9 @@ pub struct Pit {
     ch: [Channel; 3],
     /// Port 0x61 as last written, less the read-only output bit.
     port61: u8,
-    /// How many channel-0 periods had elapsed at the last `ch0_fire`, so an
-    /// edge is counted once: the running total of IRQ0s the timer owes.
-    ch0_edges_seen: u64,
+    /// How many channel-0 periods have been handed to the run loop as IRQ0
+    /// edges since the count was loaded. What has elapsed beyond it is owed.
+    ch0_edges_given: u64,
     /// In a one-shot mode, whether channel 0's count has been loaded and has
     /// not yet run out: its one edge is still to come.
     ch0_armed: bool,
@@ -175,7 +175,7 @@ impl Pit {
         Self {
             ch: [Channel::new(), Channel::new(), Channel::new()],
             port61: 0,
-            ch0_edges_seen: 0,
+            ch0_edges_given: 0,
             ch0_armed: false,
         }
     }
@@ -241,7 +241,7 @@ impl Pit {
                 if index == 0 {
                     /* A fresh channel-0 program restarts its edge count; a
                      * count loaded in a one-shot mode is one edge to come. */
-                    self.ch0_edges_seen = 0;
+                    self.ch0_edges_given = 0;
                     if loaded {
                         self.ch0_armed = one_shot(self.ch[0].mode);
                     }
@@ -251,12 +251,20 @@ impl Pit {
         }
     }
 
-    /// Whether channel 0 has completed at least one more period since this
-    /// was last asked -- an IRQ0 edge the run loop should raise. Advances the
-    /// seen count by all whole periods elapsed, so a burst behind a slow
-    /// entry collapses to one interrupt rather than a backlog (the tick a
-    /// guest missed while it was not running is not owed to it many times
-    /// over).
+    /// Whether channel 0 has an IRQ0 edge for the run loop to raise now,
+    /// which the loop asks only once the guest has taken the last one.
+    ///
+    /// In the periodic modes every period that elapsed is owed, and handed
+    /// over one at a time: a halted guest's vCPU sleeps until the host wakes
+    /// it, at the host tick's grain, and a guest ticking at 250 Hz that was
+    /// given one edge for every two or three periods that passed counted
+    /// 40% of real time -- a guest keeping time in jiffies falls behind the
+    /// host by more than a minute in two, and one on the TSC has its
+    /// clocksource watchdog, which compares the TSC against jiffies, call
+    /// the TSC unstable. Owed ticks come late and together, as KVM's PIT
+    /// delivers them, but they come. No more than a second's worth is owed:
+    /// a guest the host did not run for longer takes its time up from its
+    /// clocksource, not from a flood.
     pub fn ch0_fire(&mut self) -> bool {
         let ch = &self.ch[0];
         if !ch.running {
@@ -273,8 +281,12 @@ impl Pit {
             return false;
         }
         let edges = ch.elapsed() / ch.reload_ticks();
-        if edges > self.ch0_edges_seen {
-            self.ch0_edges_seen = edges;
+        let most_owed = (PIT_HZ / ch.reload_ticks()).max(1);
+        if edges > self.ch0_edges_given.saturating_add(most_owed) {
+            self.ch0_edges_given = edges - most_owed;
+        }
+        if edges > self.ch0_edges_given {
+            self.ch0_edges_given += 1;
             true
         } else {
             false
@@ -298,7 +310,7 @@ impl Pit {
         let edge = if one_shot(ch.mode) && self.ch0_armed {
             1
         } else if periodic(ch.mode) {
-            self.ch0_edges_seen as u128 + 1
+            self.ch0_edges_given as u128 + 1
         } else {
             return None;
         };

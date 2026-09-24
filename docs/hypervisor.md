@@ -553,8 +553,13 @@ And while a guest runs:
   wakes resumes after it, and the vCPU is not entered again until the PIC
   has an interrupt for it; meanwhile its task sleeps to the timer's next
   edge. `task::sleep` blocks until then and is woken at its CPU's first
-  scheduling point after it -- the host tick, at the latest -- so a 100 Hz
-  guest tick arrives up to 10 ms late, still a hundred a second. Measured on the Linux
+  scheduling point after it -- the host tick, at the latest -- so a guest's
+  tick arrives up to 10 ms late. None is lost: every periodic edge that
+  elapsed is owed to the guest and handed over one at a time, each once it
+  has taken the last (`Pit::ch0_fire`), up to a second's worth. A guest at
+  250 Hz was given one edge for every two or three periods before, and a
+  guest keeping time in jiffies counted 40% of real time (see [On real
+  hardware](#on-real-hardware)). Measured on the Linux
   guest over 120 s of the same boot and a typed `id`: 5,633,131 exits, 5.56
   million of them HLTs, became 76,334 and 11,410; the guest's timer ticks
   went from 11,973 to 11,943; the vCPU's task slept 89% of the run; and the
@@ -593,7 +598,29 @@ hv: an exit, in ns: checks and ASID 127, x87/SSE in 605, vmrun to #vmexit 9012, 
 
 Those are TCG's numbers, and say nothing about a CPU: TCG flushes its own
 TLB on every `vmrun` whatever the VMCB asks, and emulates every instruction
-of the host's side as well as the guest's.
+of the host's side as well as the guest's. On the AX41 (Zen 2, 2026-09-24,
+two rounds, the same to a few ns):
+
+| Between exits | ASIDs kept | TLB flushed every entry | |
+|---|---|---|---|
+| nothing | 731 ns an exit, 1.37 million a second | 940 ns, 1.06 million | -22% |
+| a read of 64 pages | 873 ns | 1321 ns | -34% |
+| a read of 240 pages | 2180 ns | 2448 ns | -11% |
+
+and the profile of an exit (with its own ~40 ns in it):
+
+| | ASIDs kept | flushed |
+|---|---|---|
+| checks and ASID | 90 ns | 90 ns |
+| x87/SSE and XCR0 in | 119 ns | 120 ns |
+| `vmrun` to `#vmexit` | 314 ns | 424 ns |
+| x87/SSE out | 102 ns | 105 ns |
+| the exit handled, the loop | 148 ns | 249 ns |
+
+The flush cost the world switch 110 ns and the host's side after it 100 ns
+more, its own translations walked again; with 64 pages the guest's as well.
+What is left to take is on the host's side of the switch: the x87/SSE
+state and CR4 around it, 220 ns an exit, and the checks' two RDMSRs.
 
 ## arm64
 
@@ -1137,6 +1164,41 @@ run on the real thing is for:
   nothing answers is now answered with a read-only page of all ones; the
   `absent` built-in guest keeps that under TCG, which is no Zen and would
   never read it.
+
+**The second run, 2026-09-24** (8928493, one boot of nos): every built-in
+guest on CPU 0 and CPU 13 again, `asid` among them -- two VMs taking turns
+on one CPU under ASIDs 1 and 2, and a third given 1 again after its
+generation's flush, each reading its own page, on a CPU that keeps
+translations; the exit costs above; and both distributions ([A
+distribution](#a-distribution)) as they ship:
+
+- **Alpine** at its login prompt 22 s after the VM starts. It calibrates
+  its TSC against the emulated PIT (3600.143 MHz), takes the TSC as its
+  clocksource and drives its tick through the PIT's one-shot mode 4
+  (`hrtimer_interrupt`) -- the path TCG never takes by itself; `sleep 2`
+  takes 2.00 s. On the switch it pings nos in 0.05 ms, and `ssh -p 2222
+  root@65.109.93.213`, from the dev host over the internet, lands in its own
+  sshd through nos's I210, `hv forward` and the switch.
+- **Debian** at its login prompt 8.5 s after the VM starts (systemd-analyze:
+  1.0 s kernel, 3.5 s userspace), `running`, no unit failed, its root on the
+  3 GiB image on nos's `nosenv` ext2 -- which `e2fsck` found clean after --
+  a file written there still there after `reboot`, and on the switch it
+  reaches nos and the Alpine guest.
+- Idle, the two cost nos 0.1% of its twelve CPUs (`top`), 560 and 700 exits
+  a second.
+
+And one thing only the real thing showed. Debian's clocksource watchdog,
+which checks the TSC against jiffies, found them 76 ms apart over 512 ms,
+called the TSC unstable and fell back to jiffies -- and then kept 25 s of
+time in 62: at 250 Hz its idle vCPU, woken at the host's 100 Hz tick, was
+given one timer edge for every two or three periods (a hundred a second),
+the rest thrown away. Alpine had kept the TSC and its time. The PIT now owes
+every period that elapsed and hands them over one at a time, as KVM's does
+([What the extension costs](#what-the-extension-costs-while-it-is-on)),
+and `hv-distro-test` checks each guest's idle clock against nos's: 1.000
+with the fix, 0.514 without it under TCG. Over SSH the command line was
+also cut at 255 characters, too short for Debian's `hv start`; it takes
+1023, as `/etc/rc` does.
 
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
