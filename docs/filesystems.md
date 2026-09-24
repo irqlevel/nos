@@ -140,12 +140,27 @@ which can mount the same partition (that is how modules get onto a Hetzner
 box: copy them in under Ubuntu). The rules the driver follows, in place of
 the journal ext2 does not have:
 
-- **Order.** Allocation bitmaps go down first (FUA), then the data and
-  indirect blocks (plain writes) followed by a device flush, then the inode
-  (FUA), then the free counts in the group descriptors and superblock. A
-  crash at any point leaves at worst blocks marked used that nothing
-  references — e2fsck reclaims them — and never a block both referenced and
-  free.
+- **Order.** Allocation bitmaps go down first, then the data and indirect
+  blocks (plain writes) followed by a device flush, then the inode, then
+  the free counts in the group descriptors and superblock. A crash at any
+  point leaves at worst blocks marked used that nothing references —
+  e2fsck reclaims them — and never a block both referenced and free.
+- **A file's data pays for what it changes.** A write that allocated
+  nothing — a disk image having its blocks written over, a guest's — moved
+  no pointer and changed no bit, so nothing is ordered against it: the
+  blocks go down plainly, and so does the inode, and only when the size or
+  the second of the mtime changed; `sync` puts them on the medium, and a
+  guest's flush is a `sync`. A write that allocated flushes the device
+  once — the bitmap and the data it wrote then on the medium — and writes
+  what points at them after that, plainly: each indirect block it filled in
+  once, however many pointers of it the write set (they wait in its buffer
+  for the flush; one written as it was set would have reached the disk
+  before the bitmap), the inode, the counts. So what a write leaves in the
+  device's cache reaches the medium at the next flush -- another write's
+  that allocates, a `sync`, the unmount -- and a caller that needs it there
+  sooner syncs, as the two-step replace, `grubenv` and a guest's flush do.
+  Creates, renames and removes keep the FUA writes of their inodes and
+  bitmaps.
 - **Frees run the other way.** A truncate cuts the tail off the block tree,
   commits the inode without it, and only then clears the bits, in batches of
   512 blocks so a large file does not hold a huge list in memory. A remove
@@ -165,9 +180,11 @@ the journal ext2 does not have:
   backups drift, which e2fsck tolerates (`-b` uses them for recovery only).
 
 Every read and write is a synchronous request to the block device — there
-is no cache. A 3 MiB module read is about 770 block reads, a few tens of
-milliseconds on NVMe. The indirect and doubly-indirect blocks last used are
-kept in memory so a sequential pass does not re-read them per data block.
+is no cache of data. A 3 MiB module read is about 770 block reads, a few
+tens of milliseconds on NVMe. The inode table block, the indirect and the
+doubly-indirect block last used are kept in memory, so a file read or
+written a piece at a time does not read its inode back for every piece, and
+a sequential pass does not re-read its indirect blocks per data block.
 
 ## nanofs, ramfs, procfs
 

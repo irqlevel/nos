@@ -15,6 +15,18 @@
 //! descriptors and the superblock. A machine that stops midway leaves at
 //! worst something unreferenced for e2fsck to reclaim, never a block that is
 //! both in use and free.
+//!
+//! A file's data is written the same way, but a write pays for only what it
+//! changes. One that allocated nothing -- a disk image's, rewriting blocks
+//! it has -- moved no pointer and changed no bit, so nothing is ordered
+//! against it: its blocks go down with plain writes, and its inode only when
+//! the size or the second of its mtime changed, plainly too; `sync` is what
+//! puts them on the medium. One that allocated flushes the device once --
+//! the bitmap and the data it has written then on the medium -- and only
+//! after that writes what points at them: the indirect blocks it filled in,
+//! each once however many of its pointers the write set, the inode and the
+//! counts. Where a write has to move on to another indirect block before it
+//! is done, the one it leaves goes down the same way, after a flush.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -327,21 +339,34 @@ pub struct Ext2 {
     /// Free counts in the descriptors and the superblock changed in memory
     meta_dirty: bool,
 
-    /* Page-aligned scratch, one block used of each. `tmp` serves the inode
-     * table, the superblock and the group descriptors; `data` the data block
-     * read-modify-write and directory blocks; `ind` and `dind` cache the
-     * indirect and doubly-indirect block last used, so a sequential pass over
-     * a file does not re-read them per data block; `bitmap` holds the bitmap
-     * block being allocated from. */
+    /* Page-aligned scratch, one block used of each. `tmp` serves the
+     * superblock and the group descriptors; `itab` caches the inode table
+     * block last used, so that a file written a piece at a time does not
+     * read its inode back from the disk for every piece; `data` the data
+     * block read-modify-write and directory blocks; `ind` and `dind` cache
+     * the indirect and doubly-indirect block last used, so a sequential pass
+     * over a file does not re-read them per data block; `bitmap` holds the
+     * bitmap block being allocated from. */
     tmp: DmaBuffer,
+    itab: DmaBuffer,
+    itab_block: u32,
     data: DmaBuffer,
     ind: DmaBuffer,
     ind_block: u32,
     dind: DmaBuffer,
     dind_block: u32,
+    /// Pointers set in `ind` or `dind` that are not on disk yet: a write
+    /// that allocates fills them in and puts each block down once, after
+    /// the flush that puts what they point at on the medium first
+    /// (`retire_pointers`).
+    ind_dirty: bool,
+    dind_dirty: bool,
     bitmap: DmaBuffer,
     bitmap_block: u32,
     bitmap_dirty: bool,
+    /// Blocks allocated since the mount: a write that finds it unchanged
+    /// allocated nothing, and has nothing to order.
+    allocations: u64,
 }
 
 /// The superblock, off a device that is not mounted. None when the device
@@ -416,14 +441,19 @@ impl Ext2 {
             root: None,
             meta_dirty: false,
             tmp: DmaBuffer::new(1)?,
+            itab: DmaBuffer::new(1)?,
+            itab_block: 0,
             data: DmaBuffer::new(1)?,
             ind: DmaBuffer::new(1)?,
             ind_block: 0,
             dind: DmaBuffer::new(1)?,
             dind_block: 0,
+            ind_dirty: false,
+            dind_dirty: false,
             bitmap: DmaBuffer::new(1)?,
             bitmap_block: 0,
             bitmap_dirty: false,
+            allocations: 0,
         })
     }
 
@@ -477,8 +507,9 @@ impl Ext2 {
     }
 
     /// The primary superblock only. Linux does the same on an ordinary write;
-    /// the backups are refreshed by e2fsck and resize2fs.
-    fn write_super(&mut self) -> bool {
+    /// the backups are refreshed by e2fsck and resize2fs. With `fua`, on the
+    /// medium when this returns.
+    fn write_super(&mut self, fua: bool) -> bool {
         let block = (SUPER_BLOCK_OFFSET / self.block_size()) as u32;
         let off = SUPER_BLOCK_OFFSET % self.block_size();
 
@@ -491,20 +522,20 @@ impl Ext2 {
         if !pod::write(self.tmp.as_mut_slice(), off, &sb) {
             return false;
         }
-        if !self.io.write_block(block, self.tmp.as_slice(), true) {
+        if !self.io.write_block(block, self.tmp.as_slice(), fua) {
             trace!(0, "ext2: write of the superblock failed");
             return false;
         }
         true
     }
 
-    fn write_group_descs(&mut self) -> bool {
+    fn write_group_descs(&mut self, fua: bool) -> bool {
         let bs = self.block_size();
         for i in 0..self.gdt_blocks {
             /* Through tmp: a block-sized slice of the table is not
              * page-aligned for block sizes under a page, and DMA needs it so */
             self.tmp.as_mut_slice()[..bs].copy_from_slice(&self.gdt[i * bs..(i + 1) * bs]);
-            if !self.io.write_block(self.gdt_block + i as u32, self.tmp.as_slice(), true) {
+            if !self.io.write_block(self.gdt_block + i as u32, self.tmp.as_slice(), fua) {
                 trace!(0, "ext2: write of group descriptor block {} failed", i);
                 return false;
             }
@@ -513,14 +544,22 @@ impl Ext2 {
     }
 
     /// Put the in-memory free counts on disk: group descriptors first, then
-    /// the superblock that summarises them.
+    /// the superblock that summarises them -- on the medium when this
+    /// returns.
     fn commit_meta(&mut self) -> bool {
+        self.commit_meta_as(true)
+    }
+
+    /// `commit_meta`, and with `fua` false plain writes: after a flush that
+    /// ordered everything they count, and before the next one, which is
+    /// soon enough for a summary e2fsck recomputes.
+    fn commit_meta_as(&mut self, fua: bool) -> bool {
         if !self.meta_dirty {
             return true;
         }
 
         self.sb.write_time = wall_clock_secs() as u32;
-        if !self.write_group_descs() || !self.write_super() {
+        if !self.write_group_descs(fua) || !self.write_super(fua) {
             return false;
         }
 
@@ -689,7 +728,7 @@ impl Ext2 {
             self.sb.state &= !STATE_VALID;
             self.sb.mount_count = self.sb.mount_count.wrapping_add(1);
             self.sb.mount_time = wall_clock_secs() as u32;
-            if !self.write_super() {
+            if !self.write_super(true) {
                 trace!(0, "ext2: cannot write the superblock, mounting read-only");
                 self.read_only = true;
             }
@@ -716,11 +755,12 @@ impl Ext2 {
         }
 
         if !self.read_only {
+            self.retire_pointers();
             self.flush_bitmap();
             self.commit_meta();
             self.sb.state |= STATE_VALID;
             self.sb.write_time = wall_clock_secs() as u32;
-            self.write_super();
+            self.write_super(true);
             self.io.flush();
         }
 
@@ -728,20 +768,26 @@ impl Ext2 {
         self.root = None;
 
         self.gdt = Vec::new();
+        self.itab_block = 0;
         self.ind_block = 0;
         self.dind_block = 0;
+        self.ind_dirty = false;
+        self.dind_dirty = false;
         self.bitmap_block = 0;
         self.bitmap_dirty = false;
         self.meta_dirty = false;
         self.mounted = false;
     }
 
+    /// Everything written so far on the medium: what a file's writes left to
+    /// the cache -- a rewritten block, an inode that only its mtime changed
+    /// -- and the counts.
     pub fn sync(&mut self) -> bool {
         if !self.mounted || self.read_only {
             return true;
         }
 
-        self.flush_bitmap() && self.commit_meta() && self.io.flush()
+        self.retire_pointers() && self.flush_bitmap() && self.commit_meta() && self.io.flush()
     }
 
     /* ---- inodes ---- */
@@ -770,33 +816,59 @@ impl Ext2 {
         Some((block, byte_offset % self.block_size()))
     }
 
+    /// The inode table block `block` into `itab`, unless it is there already.
+    /// Every inode read and written goes through `itab`, so what it holds is
+    /// what the disk has -- or, between a failed write and the next load,
+    /// nothing at all.
+    fn load_itab(&mut self, block: u32) -> bool {
+        if self.itab_block == block {
+            return true;
+        }
+        self.itab_block = 0;
+        if !self.io.read_block(block, self.itab.as_mut_slice()) {
+            return false;
+        }
+        self.itab_block = block;
+        true
+    }
+
     fn read_inode(&mut self, ino: u32) -> Option<Inode> {
         let (block, off) = self.inode_place(ino)?;
-        if !self.io.read_block(block, self.tmp.as_mut_slice()) {
+        if !self.load_itab(block) {
             trace!(0, "ext2: read of the block holding inode {} failed", ino);
             return None;
         }
-        pod::read::<Inode>(self.tmp.as_slice(), off)
+        pod::read::<Inode>(self.itab.as_slice(), off)
     }
 
     /// Read-modify-write of the inode table block, with FUA: an inode commit
-    /// is the point a change becomes real.
+    /// is the point a change becomes real. Pointers an allocation left in
+    /// the cached indirect blocks go down before it, after a flush.
     fn write_inode(&mut self, ino: u32, inode: &Inode) -> bool {
+        self.retire_pointers() && self.put_inode(ino, inode, true)
+    }
+
+    /// The inode into its table block, and the block to the disk: with
+    /// `fua` on the medium when this returns, else in the device's cache.
+    /// Nothing is ordered before it here; that is the caller's.
+    fn put_inode(&mut self, ino: u32, inode: &Inode, fua: bool) -> bool {
         let (block, off) = match self.inode_place(ino) {
             Some(place) => place,
             None => return false,
         };
 
-        if !self.io.read_block(block, self.tmp.as_mut_slice()) {
+        if !self.load_itab(block) {
             trace!(0, "ext2: read of the block holding inode {} failed", ino);
             return false;
         }
 
-        if !pod::write(self.tmp.as_mut_slice(), off, inode) {
+        if !pod::write(self.itab.as_mut_slice(), off, inode) {
             return false;
         }
-        if !self.io.write_block(block, self.tmp.as_slice(), true) {
+        if !self.io.write_block(block, self.itab.as_slice(), fua) {
             trace!(0, "ext2: write of the block holding inode {} failed", ino);
+            /* The cache holds what the disk may not: read it again. */
+            self.itab_block = 0;
             return false;
         }
         true
@@ -835,11 +907,18 @@ impl Ext2 {
     }
 
     fn flush_bitmap(&mut self) -> bool {
+        self.flush_bitmap_as(true)
+    }
+
+    /// The loaded bitmap block to the disk if it changed: with `fua` on the
+    /// medium when this returns, else ahead of the flush the caller makes
+    /// next.
+    fn flush_bitmap_as(&mut self, fua: bool) -> bool {
         if !self.bitmap_dirty {
             return true;
         }
 
-        if !self.io.write_block(self.bitmap_block, self.bitmap.as_slice(), true) {
+        if !self.io.write_block(self.bitmap_block, self.bitmap.as_slice(), fua) {
             trace!(0, "ext2: write of bitmap block {} failed", self.bitmap_block);
             return false;
         }
@@ -888,6 +967,7 @@ impl Ext2 {
                 let bs = self.block_size();
                 bit_set(&mut self.bitmap.as_mut_slice()[..bs], idx as usize);
                 self.bitmap_dirty = true;
+                self.allocations += 1;
                 let free = self.gd_free_blocks(g);
                 self.gd_set_free_blocks(g, free.saturating_sub(1));
                 self.sb.free_block_count = self.sb.free_block_count.saturating_sub(1);
@@ -934,12 +1014,16 @@ impl Ext2 {
         self.sb.free_block_count = self.sb.free_block_count.saturating_add(1);
         self.meta_dirty = true;
 
-        /* A cached indirect block that is no longer one */
+        /* A cached indirect block that is no longer one: whatever it held
+         * that is not on disk is nobody's now, and written later it would
+         * land in whatever the block is next. */
         if self.ind_block == block {
             self.ind_block = 0;
+            self.ind_dirty = false;
         }
         if self.dind_block == block {
             self.dind_block = 0;
+            self.dind_dirty = false;
         }
         true
     }
@@ -1029,9 +1113,47 @@ impl Ext2 {
 /* ---- block mapping ---- */
 
 impl Ext2 {
+    /// Put down the pointers an allocation set in the cached indirect blocks
+    /// and has not written yet -- after the bitmap that marks what they point
+    /// at, and after a flush, so that what they point at is on the medium,
+    /// marked in use, before anything on it does. Nothing to do, and no
+    /// flush, when no pointer is waiting.
+    fn retire_pointers(&mut self) -> bool {
+        if !self.ind_dirty && !self.dind_dirty {
+            return true;
+        }
+        if !self.flush_bitmap_as(false) || !self.io.flush() {
+            trace!(0, "ext2: the flush before an indirect block's pointers failed");
+            return false;
+        }
+        self.write_pointers()
+    }
+
+    /// The cached indirect blocks with pointers not yet on disk, written
+    /// plainly: the caller has flushed what they point at to the medium.
+    fn write_pointers(&mut self) -> bool {
+        if self.ind_dirty {
+            if !self.write_ind(self.ind_block) {
+                return false;
+            }
+            self.ind_dirty = false;
+        }
+        if self.dind_dirty {
+            if !self.write_dind(self.dind_block) {
+                return false;
+            }
+            self.dind_dirty = false;
+        }
+        true
+    }
+
     fn load_ind(&mut self, block: u32) -> bool {
         if self.ind_block == block {
             return true;
+        }
+        /* What the buffer holds that the disk does not goes down first. */
+        if !self.retire_pointers() {
+            return false;
         }
         if !self.io.read_block(block, self.ind.as_mut_slice()) {
             trace!(0, "ext2: read of indirect block {} failed", block);
@@ -1046,6 +1168,9 @@ impl Ext2 {
         if self.dind_block == block {
             return true;
         }
+        if !self.retire_pointers() {
+            return false;
+        }
         if !self.io.read_block(block, self.dind.as_mut_slice()) {
             trace!(0, "ext2: read of double indirect block {} failed", block);
             self.dind_block = 0;
@@ -1055,7 +1180,11 @@ impl Ext2 {
         true
     }
 
-    /* Indirect blocks go down with a plain write; every path that commits an
+    /* Indirect blocks go down with a plain write. One with pointers an
+     * allocation set waits in its buffer, marked dirty, until the flush that
+     * puts what they point at on the medium (`retire_pointers`); one freshly
+     * allocated is written zeroed at once, so that whatever comes to point
+     * at it finds no pointer it did not set. Every path that commits an
      * inode flushes the device first, so they are on disk before the inode
      * that leads to them. */
 
@@ -1096,8 +1225,12 @@ impl Ext2 {
     }
 
     /// A fresh block, zeroed in the `ind` buffer and on disk, for an indirect
-    /// level that was missing.
+    /// level that was missing. The buffer's last block goes down first if it
+    /// has pointers waiting.
     fn fresh_ind(&mut self, goal_group: u32) -> Option<u32> {
+        if !self.retire_pointers() {
+            return None;
+        }
         let block = self.alloc_block(goal_group)?;
         let bs = self.block_size();
         self.ind.as_mut_slice()[..bs].fill(0);
@@ -1109,6 +1242,9 @@ impl Ext2 {
     }
 
     fn fresh_dind(&mut self, goal_group: u32) -> Option<u32> {
+        if !self.retire_pointers() {
+            return None;
+        }
         let block = self.alloc_block(goal_group)?;
         let bs = self.block_size();
         self.dind.as_mut_slice()[..bs].fill(0);
@@ -1206,11 +1342,11 @@ impl Ext2 {
                 if !allocate {
                     return Some((0, false));
                 }
+                /* The double indirect block stays loaded: `fresh_ind` puts
+                 * down what it has waiting, and keeps it. */
                 let b = self.fresh_ind(goal_group)?;
                 self.set_dind_ptr(l1_index, b);
-                if !self.write_dind(dind_block) {
-                    return None;
-                }
+                self.dind_dirty = true;
                 inode.blocks = inode.blocks.saturating_add(units);
                 ind_block = b;
             } else if !self.io.is_data_block(existing) {
@@ -1242,9 +1378,7 @@ impl Ext2 {
 
         let b = self.alloc_block(goal_group)?;
         self.set_ind_ptr(ind_index, b);
-        if !self.write_ind(ind_block) {
-            return None;
-        }
+        self.ind_dirty = true;
         inode.blocks = inode.blocks.saturating_add(units);
         Some((b, true))
     }
@@ -1420,10 +1554,12 @@ impl Ext2 {
     }
 
     /// Write `data` at `offset`, allocating what the range needs. Data blocks
-    /// go down with plain writes; the caller flushes the device and then
-    /// commits the inode, so the content is on disk before anything points at
-    /// it. On failure the inode still describes every block allocated so far,
-    /// and the caller commits it as it is, which keeps the bitmap honest.
+    /// go down with plain writes; when any was allocated the caller flushes
+    /// the device and then commits the inode, so the content is on disk
+    /// before anything points at it -- and the pointers set in indirect
+    /// blocks wait in their buffers for that flush too. On failure the inode
+    /// still describes every block allocated so far, and the caller commits
+    /// it as it is, which keeps the bitmap honest.
     fn write_inode_data(
         &mut self, inode: &mut Inode, goal_group: u32, data: &[u8], offset: usize,
     ) -> bool {
@@ -1999,16 +2135,30 @@ impl Ext2 {
             return false;
         }
 
+        let before = inode;
+        let allocations = self.allocations;
         let group = self.inode_group(ino);
         let ok = self.write_inode_data(&mut inode, group, data, offset);
 
-        /* Commit order: the allocation bits, the data and indirect blocks,
-         * then the inode that leads to them, then the counts. Also on
-         * failure: the blocks the inode picked up are then owned rather than
-         * leaked. */
-        if !self.flush_bitmap() || !self.io.flush() || !self.write_inode(ino, &inode)
-            || !self.commit_meta()
-        {
+        let committed = if self.allocations != allocations {
+            /* Blocks changed hands. Commit order: the allocation bits and the
+             * data and indirect blocks, on the medium by one flush; then what
+             * points at them -- the indirect blocks' new pointers, the inode
+             * -- and the counts, plainly, for the next flush to put down.
+             * Also on failure: the blocks the inode picked up are then owned
+             * rather than leaked. */
+            self.flush_bitmap_as(false) && self.io.flush() && self.write_pointers()
+                && self.put_inode(ino, &inode, false) && self.commit_meta_as(false)
+        } else if pod::bytes_of(&inode) != pod::bytes_of(&before) {
+            /* Written in place: no pointer moved and no bit changed, so
+             * nothing is ordered against the data. The inode goes down
+             * plainly for what it says of it -- the size, the mtime when its
+             * second changed -- and is left alone when it says nothing new. */
+            self.put_inode(ino, &inode, false)
+        } else {
+            true
+        };
+        if !committed {
             trace!(0, "ext2: commit of inode {} failed", ino);
             return false;
         }
