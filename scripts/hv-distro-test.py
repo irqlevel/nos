@@ -29,13 +29,34 @@ virtio disk:
     into the guest from outside, through QEMU's forward, nos's relay and the
     switch
 
-Manual, like hv-linux-test: the ISO is a download CI does not make, and the
-run is slow under TCG, the guest emulated twice (two boots and apk, about
-five minutes). Point it at the ISO:
+And with `--debian`, a mainstream one: Debian's `nocloud` cloud image,
+systemd and initramfs-tools, its kernel and initrd read out of the image's
+own /boot, its root partition the guest's disk and written to:
+
+  - systemd-firstboot is given what it would ask the console for -- the root
+    password, the locale, the keymap, the timezone -- as credentials on the
+    kernel command line (the image's root is "!unprovisioned" until then);
+    root logs in with that password
+  - it is Debian on its own kernel, `systemctl is-system-running` says
+    running, and no unit failed
+  - its root is /dev/vda1, ext4, read-write; its clock is the host's
+  - on the switch, given its port's address by hand (the image configures
+    no ethernet interface itself), its virtio-net driver reaches nos and
+    nos reaches it
+  - a file written and synced there is still there after `reboot`, the VM
+    built again: what the guest wrote went through nos's ext2 to its file
+
+Manual, like hv-linux-test: the images are downloads CI does not make, and
+the runs are slow under TCG, the guest emulated twice (Alpine: two boots and
+apk, about five minutes; Debian: two boots, about as long). Point it at
+them:
 
     scripts/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso
+    scripts/hv-distro-test.py --debian debian-13-nocloud-amd64.raw
 
-Needs xorriso, ssh and ssh-keygen on the host. `--cmdline-extra` adds to the
+(the Debian image as raw: `qemu-img convert -O raw` the .qcow2). Needs
+xorriso, ssh and ssh-keygen on the host for Alpine, sfdisk and debugfs for
+Debian. `--cmdline-extra` adds to the
 guest's command line: under TCG the guest cannot calibrate its TSC against
 the PIT (an exit costs more than its loop allows) and stays on jiffies and a
 periodic tick; `--cmdline-extra "tsc_early_khz=<the host's TSC kHz>
@@ -83,7 +104,7 @@ def extract(iso, tmp):
     return out
 
 
-def run(args):
+def alpine(args):
     tmp = tempfile.mkdtemp(prefix="nos-hvdistro-")
     files = extract(args.iso, tmp)
     key = os.path.join(tmp, "id_test")
@@ -93,19 +114,19 @@ def run(args):
 
     cmdline = CMDLINE + (" " + args.cmdline_extra if args.cmdline_extra else "")
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
-    login = ["hv wait 0 secs=600 login:", r"hv send 0 root\n", "hv wait 0 secs=120 " + PROMPT]
+    def login(boot):
+        return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 " + PROMPT]
     rc = (["insmod /hv.ko", "hv on",
            "hv start /bzImage mem=%d initrd=/initrd disk=/alpine.iso:ro net restart cmdline=%s"
            % (args.mem, cmdline)]
-          + login
+          + login(0)
           + [x("cat /etc/alpine-release; uname -r"),
              x("date -u +%s"),
              x("cat /sys/block/vda/ro; dd if=/dev/zero of=/dev/vda bs=512 count=1; echo dd=$?"),
-             # Back when the VM has been built again: the line went with the
-             # boot it was typed at, and `hv exec` says so. A `hv wait` for
-             # the next login prompt before then could find this boot's.
-             x("reboot", 600)]
-          + login
+             # The shell may print its prompt before the system goes down:
+             # the boot after this one is what `boot=1` waits for.
+             r"hv send 0 reboot\n"]
+          + login(1)
           + ["hv list",
              x("ip addr show eth0"),
              x("ping -c 3 10.0.100.1"),
@@ -138,12 +159,13 @@ def run(args):
         start = rc[2]
         pt.check("the VM starts, the ISO read-only and on the switch",
                  re.search(r"vm 0 started on cpu \d+", out(start)) is not None, out(start))
-        m = re.search(r'printed "login:", (\d+) ms in', out(login[0]))
-        pt.check("Alpine's own kernel and initramfs boot it to a login prompt", m is not None, out(login[0]))
+        first, second = login(0), login(1)
+        m = re.search(r'printed "login:", (\d+) ms in', out(first[0]))
+        pt.check("Alpine's own kernel and initramfs boot it to a login prompt", m is not None, out(first[0]))
         if m:
             print("  (login prompt %.1f s after the VM started)" % (int(m.group(1)) / 1000.0))
-        pt.check("root logs in, typed at the getty", "printed \"%s\"" % PROMPT in out(login[2]),
-                 out(login[2]))
+        pt.check("root logs in, typed at the getty", "printed \"%s\"" % PROMPT in out(first[2]),
+                 out(first[2]))
         release = out(rc[6])
         pt.check("and it is Alpine, on its virt kernel",
                  re.search(r"^\d+\.\d+\.\d+\s*$", release, re.M) is not None and "-virt" in release, release)
@@ -154,10 +176,9 @@ def run(args):
         ro = out(rc[8])
         pt.check("the ISO is read-only to it: the driver says so, and a write fails",
                  re.search(r"^1\s*$", ro, re.M) is not None and "dd=1" in ro, ro)
-        pt.check("reboot resets it, and the VM is built again",
-                 "the vm restarted" in out(rc[9]), out(rc[9])[-600:])
-        pt.check("to a login prompt again", 'printed "login:"' in out(login[0], 1), out(login[0], 1))
-        pt.check("where root logs in again", "printed \"%s\"" % PROMPT in out(login[2], 1), out(login[2], 1))
+        pt.check("reboot resets it, and the VM boots again to a login prompt",
+                 'printed "login:" in boot 1' in out(second[0]), out(second[0]))
+        pt.check("where root logs in again", "printed \"%s\"" % PROMPT in out(second[2], 1), out(second[2], 1))
         pt.check("hv list counts the reboot", re.search(r"vm 0\s+running.*restarts 1\b", out(rc[13])) is not None,
                  out(rc[13]))
         eth = out(rc[14])
@@ -199,21 +220,169 @@ def run(args):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# Debian's cloud image: its root partition, found by its GPT type, and the
+# kernel and initrd in its /boot, which are the only ones there.
+DEBIAN_ROOT_TYPE = "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"   # Linux x86-64 root
+# The image's root is locked ("!unprovisioned") until systemd-firstboot sets
+# it, which asks at the console for what it is not given: the password, the
+# locale, the keymap and the timezone, handed to it as credentials on the
+# kernel command line, as systemd provisions a machine with no one at it.
+DEBIAN_PASSWORD = "nos"
+DEBIAN_CMDLINE = ("root=/dev/vda1 ro console=ttyS0 nolapic acpi=off"
+                  " systemd.set_credential=passwd.plaintext-password.root:" + DEBIAN_PASSWORD +
+                  " systemd.set_credential=firstboot.locale:C.UTF-8"
+                  " systemd.set_credential=firstboot.keymap:us"
+                  " systemd.set_credential=firstboot.timezone:UTC")
+DEBIAN_PROMPT = "root@localhost:~#"
+
+
+def debian_boot_files(image, tmp):
+    """The kernel and the initrd out of the image's root partition: its
+    offset from sfdisk, the partition cut out sparse, and debugfs to read
+    /boot."""
+    import json
+    table = json.loads(subprocess.run(["sfdisk", "-J", image], check=True, capture_output=True,
+                                      text=True).stdout)["partitiontable"]
+    root = next(p for p in table["partitions"] if p["type"].upper() == DEBIAN_ROOT_TYPE)
+    part = os.path.join(tmp, "root.part")
+    sector = table.get("sectorsize", 512)
+    subprocess.run(["dd", "if=" + image, "of=" + part, "bs=%d" % sector, "skip=%d" % root["start"],
+                    "count=%d" % root["size"], "conv=sparse", "status=none"], check=True)
+    listing = subprocess.run(["debugfs", "-R", "ls /boot", part], check=True, capture_output=True,
+                             text=True).stdout
+    names = listing.split()
+    out = {}
+    for prefix in ("vmlinuz-", "initrd.img-"):
+        name = next(n for n in names if n.startswith(prefix))
+        dst = os.path.join(tmp, prefix.rstrip("-."))
+        subprocess.run(["debugfs", "-R", "dump /boot/%s %s" % (name, dst), part], check=True,
+                       capture_output=True)
+        out[prefix] = dst
+    os.unlink(part)
+    return out["vmlinuz-"], out["initrd.img-"]
+
+
+def debian(args):
+    """Debian's cloud image, as it ships: systemd, initramfs-tools, and its
+    root on the guest's disk, written to -- and still there after a reboot."""
+    tmp = tempfile.mkdtemp(prefix="nos-hvdebian-")
+    vmlinuz, initrd = debian_boot_files(args.debian, tmp)
+    rootdir = os.path.join(tmp, "rootdir")
+    os.makedirs(rootdir)
+    # A copy, holes and all: the guest writes to it, and it is 3 GiB.
+    subprocess.run(["cp", "--sparse=always", args.debian, os.path.join(rootdir, "debian.raw")], check=True)
+    marker = "nos-was-here-%d" % os.getpid()
+
+    x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
+    def login(boot):
+        return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
+                r"hv send 0 %s\n" % DEBIAN_PASSWORD, "hv wait 0 secs=120 " + DEBIAN_PROMPT]
+    rc = (["insmod /hv.ko", "hv on",
+           "hv start /bzImage mem=%d initrd=/initrd disk=/debian.raw net restart cmdline=%s"
+           % (args.debian_mem, DEBIAN_CMDLINE)]
+          + login(0)
+          + [x("cat /etc/debian_version; uname -r"),
+             x("systemctl is-system-running --wait", 300),
+             x("systemctl --failed --no-legend --no-pager | wc -l"),
+             x("findmnt -rno SOURCE,FSTYPE,OPTIONS /"),
+             x("date -u +%s"),
+             x("echo %s > /root/nos.txt && sync && cat /root/nos.txt" % marker),
+             # The image configures no ethernet interface (networkd has no
+             # .network for one, and no cloud-init to write one): its own
+             # virtio-net driver, given the port's address by hand.
+             x("dev=$(ls /sys/class/net | grep -v '^lo$' | head -1); ip addr add %s/24 dev $dev"
+               " && ip link set $dev up && ping -c 3 10.0.100.1" % GUEST_IP),
+             "ping " + GUEST_IP,
+             # systemd's reboot returns at once and bash prints its prompt;
+             # the boot after it is what `boot=1` waits for.
+             r"hv send 0 reboot\n"]
+          + login(1)
+          + [x("cat /root/nos.txt"),
+             "hv list",
+             hvl.RC_LAST])
+    boot = argparse.Namespace(bzimage=vmlinuz, initrd=initrd, root_mib=args.debian_root_mib,
+                              deadline=args.deadline)
+    t_start = time.time()
+    p, log, image = hvl.boot_rc(boot, tmp, rc)
+    t_end = time.time()
+    try:
+        txt = open(log, errors="replace").read()
+        if p is None or p.poll() is not None or not hvl.RC_DONE.search(txt):
+            return
+        secs = hvl.sections(txt)
+
+        def out(line, occurrence=0):
+            return hvl.output_of(secs, line, occurrence) or ""
+
+        first, second = login(0), login(1)
+        m = re.search(r'printed "login:", (\d+) ms in', out(first[0]))
+        pt.check("Debian's own kernel and initrd boot it, systemd, to a login prompt", m is not None,
+                 out(first[0]))
+        if m:
+            print("  (login prompt %.1f s after the VM started)" % (int(m.group(1)) / 1000.0))
+        pt.check("root logs in, with the password systemd-firstboot was given",
+                 "printed \"%s\"" % DEBIAN_PROMPT in out(first[4]), out(first[2]) + out(first[4]))
+        pt.check("and it is Debian, on its own kernel",
+                 re.search(r"^\d+\.\d+\s*$", out(rc[8]), re.M) is not None and "deb" in out(rc[8]), out(rc[8]))
+        pt.check("systemd says the system is running", re.search(r"^running\s*$", out(rc[9]), re.M) is not None,
+                 out(rc[9]))
+        pt.check("with no unit failed", re.search(r"^0\s*$", out(rc[10]), re.M) is not None, out(rc[10]))
+        pt.check("its root is the guest's disk, ext4, read-write",
+                 re.search(r"^/dev/vda1 ext4 rw", out(rc[11]), re.M) is not None, out(rc[11]))
+        m = re.search(r"^(\d{9,})\s*$", out(rc[12]), re.M)
+        pt.check("its clock is the host's", m is not None and t_start - 300 <= int(m.group(1)) <= t_end + 300,
+                 out(rc[12]))
+        pt.check("a file written to its root and synced", re.search(r"^%s\s*$" % marker, out(rc[13]), re.M)
+                 is not None, out(rc[13]))
+        pt.check("reboot resets it, and the VM boots again", 'printed "login:" in boot 1' in out(second[0]),
+                 out(second[0]))
+        pt.check("root logs in again", "printed \"%s\"" % DEBIAN_PROMPT in out(second[4], 1), out(second[4], 1))
+        pt.check("on the switch, its virtio-net driver reaches nos",
+                 re.search(r"3 packets transmitted, 3 (packets )?received", out(rc[14])) is not None,
+                 out(rc[14])[-600:])
+        pt.check("and nos reaches it", "reply from " + GUEST_IP in out(rc[15]), out(rc[15])[-600:])
+        pt.check("and the file is still there: the disk kept what the guest wrote",
+                 re.search(r"^%s\s*$" % marker, out(rc[22]), re.M) is not None, out(rc[22]))
+        pt.check("hv list counts the reboot", re.search(r"vm 0\s+running.*restarts 1\b", out("hv list"))
+                 is not None, out("hv list"))
+    finally:
+        if p is not None:
+            pt.kill(p)
+        if args.keep or pt.failures:
+            print("log at " + log)
+        else:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--iso", required=True, help="Alpine's alpine-virt-*-x86_64.iso")
-    ap.add_argument("--mem", type=int, default=512, help="guest RAM in MiB")
-    ap.add_argument("--cmdline-extra", default="", help="more for the guest's command line")
-    ap.add_argument("--root-mib", type=int, default=256, help="nos's root filesystem, MiB")
+    ap.add_argument("--iso", help="Alpine's alpine-virt-*-x86_64.iso")
+    ap.add_argument("--debian", help="Debian's debian-*-nocloud-amd64.raw (qemu-img convert -O raw a .qcow2)")
+    ap.add_argument("--mem", type=int, default=512, help="the Alpine guest's RAM in MiB")
+    ap.add_argument("--debian-mem", type=int, default=768, help="the Debian guest's RAM in MiB")
+    ap.add_argument("--cmdline-extra", default="", help="more for the Alpine guest's command line")
+    ap.add_argument("--root-mib", type=int, default=256, help="nos's root filesystem for Alpine, MiB")
+    ap.add_argument("--debian-root-mib", type=int, default=3700, help="nos's root filesystem for Debian, MiB")
     ap.add_argument("--deadline", type=int, default=1800, help="seconds to wait for /etc/rc to finish")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
     args = ap.parse_args()
-    for tool in ("xorriso", "ssh", "ssh-keygen"):
+    if not args.iso and not args.debian:
+        sys.exit("hv-distro-test: --iso <alpine-virt.iso>, --debian <debian-nocloud.raw>, or both")
+    tools = []
+    if args.iso:
+        tools += ["xorriso", "ssh", "ssh-keygen"]
+    if args.debian:
+        tools += ["sfdisk", "debugfs"]
+    for tool in tools:
         if shutil.which(tool) is None:
             sys.exit("hv-distro-test needs %s" % tool)
-    if not os.path.exists(args.iso):
-        sys.exit("no %s" % args.iso)
-    run(args)
+    for path in (args.iso, args.debian):
+        if path and not os.path.exists(path):
+            sys.exit("no %s" % path)
+    if args.iso:
+        alpine(args)
+    if args.debian:
+        debian(args)
     print()
     if pt.failures:
         print("FAILED: " + ", ".join(pt.failures))

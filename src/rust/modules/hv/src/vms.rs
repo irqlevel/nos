@@ -931,7 +931,7 @@ impl Vms {
         }
     }
 
-    /// `hv wait <id> [secs=N] <text>`: until the guest's console has `text`
+    /// `hv wait <id> [secs=N] [boot=N] <text>`: until the guest's console has `text`
     /// in it, the guest has stopped, or the time is up.
     pub fn wait(&self, args: &str, out: &mut Output) {
         let (word, rest) = after_word(args);
@@ -942,25 +942,43 @@ impl Vms {
                 return;
             }
         };
-        let (secs, text) = match secs_option(rest, WAIT_DEFAULT_S) {
+        let (secs, rest) = match secs_option(rest, WAIT_DEFAULT_S) {
             Ok(v) => v,
             Err(e) => {
                 let _ = writeln!(out, "hv: {}", e);
                 return;
             }
         };
+        /* `boot=N`: not before its Nth restart -- what a script waits for
+         * after typing `reboot`, since the boot going down still has on its
+         * console what the next one is to print. */
+        let (word, tail) = after_word(rest);
+        let (boot, text) = match word.strip_prefix("boot=") {
+            Some(v) => match v.parse::<u32>() {
+                Ok(n) => (n, tail),
+                Err(_) => {
+                    let _ = writeln!(out, "hv: boot= wants a number of restarts");
+                    return;
+                }
+            },
+            None => (0, rest),
+        };
         if text.is_empty() {
-            let _ = writeln!(out, "hv wait <id> [secs=N] <text>");
+            let _ = writeln!(out, "hv wait <id> [secs=N] [boot=N] <text>");
             return;
         }
         let start = kcore::time::boot_time_ns();
         loop {
             /* Whether it had stopped is read before the console is searched:
-             * a guest that printed the text and then stopped is found. */
+             * a guest that printed the text and then stopped is found. The
+             * restarts before the console's start: the count moves last, so
+             * a boot it has reached has its start in `boot_at` already. */
             let running = shared.running();
+            let restarts = shared.restarts.load(Ordering::Acquire);
             let from = shared.boot_at.load(Ordering::Acquire);
-            if shared.console.lock().contains_since(from, text.as_bytes()) {
-                let _ = writeln!(out, "hv: vm {} printed \"{}\", {} ms in", shared.id, text,
+            if restarts >= boot && shared.console.lock().contains_since(from, text.as_bytes()) {
+                let _ = writeln!(out, "hv: vm {} printed \"{}\"{}, {} ms in", shared.id, text,
+                                 if boot != 0 { alloc::format!(" in boot {}", restarts) } else { String::new() },
                                  kcore::time::boot_time_ns().saturating_sub(start) / NS_PER_MS);
                 return;
             }
