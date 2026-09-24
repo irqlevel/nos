@@ -839,6 +839,10 @@ disk over the whole run, its boot's hundred-odd flushes included (QEMU's
 | with holes: the guest's writes allocate | 11.3 s; 32,640 writes, 134 MB, 4,716 flushes | 2.2 s; 13,530 writes, 55 MB, 317 flushes |
 | whole: the guest's writes overwrite | 3.4 s; 15,534 writes, 64 MB, 1,978 flushes | 0.83 s; 14,559 writes, 60 MB, 112 flushes |
 
+On the AX41 a Debian guest writes at 260 to 290 MB/s, and what `apt-get
+update` leaves dirty goes down in a third of a second where it took half a
+minute ([On real hardware](#on-real-hardware)).
+
 `scripts/hv-linux-test.py --disk` is its gate: an ext4 image with a file in
 it on nos's root, the guest mounting it, reading the file, writing 4 MiB and
 a file of its own, syncing and reading back after a remount -- and then
@@ -1400,6 +1404,28 @@ task, synchronously, through nos's ext2 to the NVMe. Its clocksource
 watchdog saw the stalls too ("Long readout interval", gaps of up to 10 s).
 That is the disk's next thing to take out, as fewer exits per frame is the
 network's.
+
+Booted again with the disk working beside the guest and ext2's writes
+costing what they change (2c72334, [A disk](#a-disk)), the same guest with
+1 GiB, the same afternoon:
+
+| in the Debian guest | before | after |
+|---|---|---|
+| a cold `apt-get update`, 28.5 MB | fetched in 15 to 26 s, 47 to 52 s in all | fetched in 2 s, 3.8 s in all |
+| a gigabyte to `/dev/null` right after it | 44 to 47 s, 23 to 25 MB/s | 9.9 s, 108 MB/s -- the link's rate |
+| `sync` of what `apt` left dirty | 125 MB in 35 s | 90 MB in 0.36 s |
+| `dd` 1 GiB, `conv=fsync`, a new file / over it again | | 261 / 284 MB/s |
+| reading it back, the cache dropped | | 231 MB/s |
+| a gigabyte fetched to the guest's disk | | 13.1 s, 82 MB/s, and `sync` 0.2 s after |
+
+"Long readout interval" came up in none of it. Afterwards `e2fsck` found
+nos's `nosenv` clean, and the guest's ext4 in its image too, taken
+read-only through a loop device; the image had 0.3 GiB of holes filled on
+the way. What bounds the rate now is ext2 writing a request's blocks one
+4 KiB command at a time, each synchronous: the disk's task is at a whole
+CPU while the guest writes, `profile` putting most of it in the NVMe
+driver's `WaitGroup::Wait` yielding until the command completes. Writing a
+request's blocks at once is the disk's next thing to take out.
 
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
