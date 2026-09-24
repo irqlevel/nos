@@ -236,14 +236,25 @@ The differences that are not hidden by the shadow at all:
 
 - **The VMCS is opaque, and per CPU.** It is made as plain memory (a
   privileged instruction at construction would fault, since a VM is made
-  where VMX may be off and on a CPU that will not run the guest); the
-  `vmclear` that puts it in the launch state waits for the first entry, where
-  VMX is known on. Every entry is a `vmlaunch` from the clear state, and
-  every exit ends with a `vmclear`: the VMCS is never current on two CPUs at
-  once, which is what lets a guest's task move CPU between entries -- the
-  AMD VMCB, plain memory, never had the problem. (Faster paths -- `vmresume`,
-  a VMCS pinned per CPU with cross-CPU `vmclear` on migration -- are for
-  later; correctness first.)
+  where VMX may be off and on a CPU that will not run the guest); the first
+  entry `vmclear`s it once, where VMX is known on, into the clear launch state
+  `vmlaunch` needs. From there the VMCS is left *current* after an exit, not
+  `vmclear`ed, and the next entry on the same CPU is a `vmresume`, which does
+  not reload it -- **8.6% fewer nanoseconds an exit under nested KVM** (18.6 ->
+  17.0 µs, `hv bench exits=50000` on the Intel dev box), where a `vmclear`
+  flushes the whole shadow VMCS, and proportionally more on real silicon,
+  where it is a memory flush the earlier per-exit `vmclear` paid every time.
+  The one invariant a resume needs is that a VMCS is never current on two CPUs
+  at once, kept two ways: before a guest's task runs on another CPU its VMCS
+  is `vmclear`ed off the old one, and when a guest is dropped its VMCS is
+  `vmclear`ed off its CPU before the page is freed -- each a `vmclear` run on
+  that CPU by an IPI sent from task context, never with interrupts off, that
+  waits for the CPU to answer. Without the drop one a freed VMCS page would
+  take a `vmptrld`'s write of cached state on that CPU's next entry; the
+  migration one is a safety net, since a guest's task is pinned to one CPU and
+  does not in fact move. Nested KVM will `vmlaunch` an uncleared VMCS, so the
+  first-entry `vmclear` and this whole ordering are for the hardware, not the
+  gate. (The AMD VMCB is plain memory and had none of this to arrange.)
 - **Host state is the hypervisor's to save.** AMD-V's `vmsave`/`vmload` move
   the host's segments and MSRs around `vmrun`; VMX restores the host from the
   VMCS host area, which `HostRegs::capture` fills on the CPU the entry runs

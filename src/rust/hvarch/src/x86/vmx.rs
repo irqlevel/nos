@@ -294,7 +294,7 @@ pub fn enabled() -> bool {
 pub mod vmcs;
 
 use core::mem::offset_of;
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use super::svm::{FxArea, GuestRegs, Kick, NotRun, VECTOR_AC, VECTOR_DB, VECTOR_MC};
 use super::svm::vmcb::{Save, Segment};
@@ -505,8 +505,23 @@ pub struct Guest {
     cr4_fixed0: u64,
     cr4_fixed1: u64,
 
-    /// The VMCS has been `vmclear`ed at least once -- done on the first
-    /// entry, where VMX is known on, not at creation, where it may be off.
+    /// The CPU this guest's VMCS was last made current on with `vmptrld`, or
+    /// -1. It is left current there after an exit -- no per-exit `vmclear` --
+    /// so the next entry on the same CPU can `vmresume` it. Before the guest
+    /// runs on any other CPU the VMCS is `vmclear`ed off this one
+    /// ([`evict_here`]), so it is never current on two CPUs at once.
+    loaded_cpu: AtomicI32,
+    /// The current VMCS is in the launched state, so an entry `vmresume`s it
+    /// rather than `vmlaunch`es: set after a successful entry, cleared with
+    /// the VMCS itself (a migration, a drop, or a VMfail).
+    launched: AtomicBool,
+    /// The VMCS has been `vmclear`ed at least once. A freshly made VMCS is
+    /// plain memory whose launch state is undefined, and `vmlaunch` needs it
+    /// "clear"; the first entry `vmclear`s it (once VMX is known on -- a VM is
+    /// made where it may be off), and from there every `vmclear` is the
+    /// migration/drop/VMfail one, never a per-exit cost. Nested KVM launches
+    /// an uncleared VMCS regardless, so this omission would pass every gate
+    /// and VMfail only on real Intel silicon.
     cleared: bool,
     /// The next entry writes the whole guest state, not only what the policy
     /// changes: true until the first entry, and again whenever `long_mode`
@@ -572,6 +587,8 @@ impl Guest {
             cr0_fixed1: caps.cr0_fixed1,
             cr4_fixed0: caps.cr4_fixed0,
             cr4_fixed1: caps.cr4_fixed1,
+            loaded_cpu: AtomicI32::new(-1),
+            launched: AtomicBool::new(false),
             cleared: false,
             full_sync: true,
             configured: false,
@@ -971,14 +988,52 @@ impl Guest {
         let xsave = self.xsave;
         let fx: *mut FxArea = &mut self.fx[0];
 
-        /* Pinned to this CPU with interrupts off, so the CPU the checks
-         * see and the VMCS is made current on is the CPU `vmlaunch` runs on.
-         * Interrupts off first, then the CPU id -- the other order could
-         * read one CPU and run on another. */
-        let flags = kcore::cpu::irq_save();
-        let cpu = kcore::cpu::id();
-        let ran: core::result::Result<u32, NotRun> = (|| {
-            let expected = host_areas.get(cpu as usize).map_or(0, |a| a.load(core::sync::atomic::Ordering::Acquire));
+        loop {
+            /* Load phase, interrupts on: if our VMCS is still current on
+             * another CPU (the guest's task has migrated since the last
+             * entry), VMCLEAR it there first. That is an IPI that waits for
+             * the other CPU to answer -- safe only from task context, never
+             * with interrupts off -- after which the VMCS is current nowhere,
+             * so the VMPTRLD below cannot make it current on two CPUs at once.
+             * `loaded_cpu` may go stale the instant we read it (the task can
+             * move again); the recheck under `irq_save` below closes that. */
+            let here = kcore::cpu::id();
+            let loaded = self.loaded_cpu.load(Ordering::Acquire);
+            if loaded >= 0 && loaded as u32 != here {
+                let evict = Evict {
+                    phys: vmcs_phys,
+                    loaded_cpu: &self.loaded_cpu,
+                    launched: &self.launched,
+                };
+                kcore::cpu::run_on_with(loaded as u32, &evict, evict_here);
+                /* Now current nowhere: either `evict_here` VMCLEARed it, or the
+                 * target CPU has exited (its VMX state gone with its VMXOFF) and
+                 * the IPI was dropped -- reset here regardless, so this loop
+                 * always makes progress and never spins on a departed CPU. Only
+                 * this guest's own task runs it, so the store races nothing. */
+                self.loaded_cpu.store(-1, Ordering::Release);
+                self.launched.store(false, Ordering::Release);
+            }
+
+            /* Pinned to this CPU with interrupts off, so the CPU the checks
+             * see and the VMCS is made current on is the CPU the entry runs
+             * on. Interrupts off first, then the CPU id -- the other order
+             * could read one CPU and run on another. */
+            let flags = kcore::cpu::irq_save();
+            let cpu = kcore::cpu::id();
+            /* The task may have moved between the load phase and here. If the
+             * VMCS is current on a CPU that is not this one, go back and evict
+             * it with interrupts on, rather than VMPTRLD a second copy. */
+            let stale = {
+                let l = self.loaded_cpu.load(Ordering::Acquire);
+                l >= 0 && l as u32 != cpu
+            };
+            if stale {
+                unsafe { kcore::cpu::irq_restore(flags) };
+                continue;
+            }
+            let ran: core::result::Result<u32, NotRun> = (|| {
+            let expected = host_areas.get(cpu as usize).map_or(0, |a| a.load(Ordering::Acquire));
             if expected == 0 || !enabled() {
                 return Err(NotRun::Off { cpu });
             }
@@ -991,22 +1046,24 @@ impl Guest {
                 }
             }
 
-            /* Make our VMCS current on this CPU. It was left in the clear
-             * state (VMCLEAR at creation, and after every exit), so this is
-             * a launch, never a resume -- which is what lets a guest's task
-             * move CPU between entries without a VMCS ever being current on
-             * two of them at once. */
-            /* The one-time clear the launch state needs, now that VMX is
-             * known on for this CPU. Every exit ends with a `vmclear` too, so
-             * the VMCS is left clear and never current on two CPUs at once. */
+            /* Once, on the first entry: put the fresh VMCS into the clear
+             * launch state its first VMLAUNCH needs (its memory is otherwise
+             * undefined). Every later VMCLEAR is a migration/drop/VMfail one. */
             if !self.cleared {
                 unsafe { vmcs::vmclear(vmcs_phys) };
                 self.cleared = true;
             }
+            /* Make our VMCS current on this CPU -- cheap if it already is,
+             * from an earlier entry that left it current here (no per-exit
+             * VMCLEAR). The entry then VMRESUMEs it if it is in the launched
+             * state, VMLAUNCHes it if not. It stays current after the exit so
+             * the next entry here can resume; a migration VMCLEARs it off
+             * this CPU (above) before another can make it current. */
             if !unsafe { vmcs::vmptrld(vmcs_phys) } {
                 if let Some(k) = kick { k.left(); }
                 return Err(NotRun::Off { cpu });
             }
+            self.loaded_cpu.store(cpu as i32, Ordering::Release);
 
             if !self.configured {
                 unsafe { self.configure(nested.root) };
@@ -1055,7 +1112,8 @@ impl Guest {
                 r8: self.regs.r8, r9: self.regs.r9, r10: self.regs.r10, r11: self.regs.r11,
                 r12: self.regs.r12, r13: self.regs.r13, r14: self.regs.r14, r15: self.regs.r15,
             };
-            let failed = unsafe { vmx_launch_stub(&mut gpr) };
+            let resume = self.launched.load(Ordering::Acquire);
+            let failed = unsafe { vmx_launch_stub(&mut gpr, resume as u64) };
 
             self.save.cr2 = cpu::read_cr2();
             unsafe { cpu::write_cr2(host_cr2) };
@@ -1077,19 +1135,26 @@ impl Guest {
             };
 
             if failed != 0 {
-                /* VMLAUNCH did not start entry (VMfail): the guest state is
-                 * as it was, and the error says why. */
+                /* VMLAUNCH/VMRESUME did not start entry (VMfail): the guest
+                 * state is as it was, and the error says why. VMCLEAR the VMCS
+                 * -- the guest stops on this, and its launch state is now
+                 * unknown -- so it is left clear, not current, not launched. */
                 self.vm_instruction_error = unsafe { vmcs::vmread(vmcs::VM_INSTRUCTION_ERROR) } as u32;
                 self.entry_failed = true;
                 self.exit_reason = 0;
+                unsafe { vmcs::vmclear(vmcs_phys) };
+                self.launched.store(false, Ordering::Release);
+                self.loaded_cpu.store(-1, Ordering::Release);
             } else {
                 self.entry_failed = false;
+                /* The VMCS is launched now: the next entry here resumes it. */
+                self.launched.store(true, Ordering::Release);
                 unsafe { self.read_exit() };
                 unsafe { self.read_guest_state() };
                 self.read_stored_kernel_gs_base();
                 /* The control registers and segments only when the exit is
-                 * one that ends and dumps the guest -- while the VMCS is
-                 * still current, before the vmclear below. */
+                 * one that ends and dumps the guest -- the VMCS is current
+                 * here (it stays current after the exit). */
                 if self.exit_is_stopping() {
                     unsafe { self.read_guest_heavy() };
                 }
@@ -1103,29 +1168,75 @@ impl Guest {
                     unsafe { core::arch::asm!("int 0x12") };
                 }
             }
-            /* Back to the clear state: never current on two CPUs. */
-            unsafe { vmcs::vmclear(vmcs_phys) };
+            /* No per-exit VMCLEAR: the VMCS stays current on this CPU, ready
+             * for the next entry to VMRESUME. It is evicted only on a
+             * migration (the load phase above) or when the guest is dropped. */
             Ok(cpu)
-        })();
-        unsafe { kcore::cpu::irq_restore(flags) };
-        ran
+            })();
+            unsafe { kcore::cpu::irq_restore(flags) };
+            return ran;
+        }
+    }
+}
+
+/// What [`evict_here`] needs to VMCLEAR a guest's VMCS off the CPU it is
+/// current on: its physical address, and the guest's `loaded_cpu`/`launched`
+/// to reset once it is clear. Shared by reference across an IPI, so `Sync`.
+struct Evict<'a> {
+    phys: u64,
+    loaded_cpu: &'a AtomicI32,
+    launched: &'a AtomicBool,
+}
+
+/// VMCLEAR a guest's VMCS off the CPU this runs on -- the target of the IPI
+/// [`Guest::run`]'s load phase (and [`Guest::drop`]) sends when the VMCS must
+/// leave a CPU before it can be made current on another, or before its page
+/// is freed. Runs in IPI context on that CPU; VMCLEAR needs VMX on there,
+/// which it is while any guest exists.
+fn evict_here(e: &Evict) {
+    if enabled() {
+        unsafe { vmcs::vmclear(e.phys) };
+    }
+    e.launched.store(false, Ordering::Release);
+    e.loaded_cpu.store(-1, Ordering::Release);
+}
+
+impl Drop for Guest {
+    fn drop(&mut self) {
+        /* If the VMCS is still current on a CPU, VMCLEAR it there before its
+         * page is freed: else that CPU's next VMPTRLD would write this VMCS's
+         * cached state into freed memory. An IPI that waits -- a drop runs in
+         * task context, interrupts on. */
+        let loaded = self.loaded_cpu.load(Ordering::Acquire);
+        if loaded < 0 {
+            return;
+        }
+        let evict = Evict {
+            phys: self.vmcs.phys(),
+            loaded_cpu: &self.loaded_cpu,
+            launched: &self.launched,
+        };
+        kcore::cpu::run_on_with(loaded as u32, &evict, evict_here);
     }
 }
 
 /// Enter the guest with the GPRs in `gpr`, and come back at its next exit
-/// with them stored back. Returns 0 on a VM exit, non-zero when VMLAUNCH
-/// itself failed (VMfail: the guest never started).
+/// with them stored back. `resume` is non-zero to VMRESUME a VMCS already in
+/// the launched state, zero to VMLAUNCH one that is not. Returns 0 on a VM
+/// exit, non-zero when the VMLAUNCH/VMRESUME itself failed (VMfail: the guest
+/// never started).
 ///
-/// VMLAUNCH loads the guest and, at its exit, jumps to the host RIP this
-/// writes -- back to the `2:` label, on the host RSP this writes -- so the
-/// host's callee-saved registers are on the stack for it to restore. Guest
-/// RSP and RIP are VMCS fields, not the stub's to move.
+/// VMLAUNCH/VMRESUME loads the guest and, at its exit, jumps to the host RIP
+/// this writes -- back to the `2:` label, on the host RSP this writes -- so
+/// the host's callee-saved registers are on the stack for it to restore.
+/// Guest RSP and RIP are VMCS fields, not the stub's to move.
 ///
 /// # Safety
-/// A VMCS of ours is current on this CPU, VMX is on, interrupts are off, and
-/// `gpr` is valid for reads and writes: what [`Guest::run`] holds.
+/// A VMCS of ours is current on this CPU, in the launched state iff `resume`
+/// is non-zero, VMX is on, interrupts are off, and `gpr` is valid for reads
+/// and writes: what [`Guest::run`] holds.
 #[unsafe(naked)]
-unsafe extern "C" fn vmx_launch_stub(gpr: *mut Gpr) -> u64 {
+unsafe extern "C" fn vmx_launch_stub(gpr: *mut Gpr, resume: u64) -> u64 {
     core::arch::naked_asm!(
         /* Host callee-saved, then the gpr pointer for the exit path. */
         "push rbp",
@@ -1141,6 +1252,10 @@ unsafe extern "C" fn vmx_launch_stub(gpr: *mut Gpr) -> u64 {
         "lea rax, [rip + 2f]",
         "mov rdx, {host_rip}",
         "vmwrite rdx, rax",
+        /* The launch/resume choice, taken now from `resume` (rsi, arg 2)
+         * before the guest GPR loads clobber it. `mov` never touches the
+         * flags, so ZF survives every load down to the branch. */
+        "test rsi, rsi",
         /* Guest GPRs from [rdi]; rdi itself last, from its own slot. */
         "mov rax, [rdi + {rax}]",
         "mov rbx, [rdi + {rbx}]",
@@ -1157,9 +1272,14 @@ unsafe extern "C" fn vmx_launch_stub(gpr: *mut Gpr) -> u64 {
         "mov r14, [rdi + {r14}]",
         "mov r15, [rdi + {r15}]",
         "mov rdi, [rdi + {rdi}]",
+        "jnz 3f",
         "vmlaunch",
-        /* Fall-through: VMLAUNCH failed (VMfail). Guest GPRs are loaded, so
-         * restore the pointer and report. */
+        "jmp 4f",
+        "3:",
+        "vmresume",
+        /* Fall-through from either: VMfail. Guest GPRs are loaded, so restore
+         * the pointer and report. */
+        "4:",
         "pop rdi",
         "mov rax, 1",
         "pop r15",
