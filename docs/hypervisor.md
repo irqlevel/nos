@@ -1354,6 +1354,19 @@ ServerAliveInterval=`) was cut off, the server answering no keepalive while
 the command ran; commands run beside their session now, which tends the
 connection meanwhile ([sshd](sshd.md#the-shell-behind-it)).
 
+Booted again with both fixed (50746e4): a 40 s `hv wait` over ssh with
+`ServerAliveInterval=5 ServerAliveCountMax=2` ran its full 40 s, where it
+had been cut off at 14; and a gigabyte through NAT into the Debian guest
+took 9.8 s -- 109.8 MB/s, the link's rate. Not every time: right after a
+cold `apt-get update` the same download took 44 to 47 s. The guest had 125
+MB of apt's lists to write back, a `sync` of them took 35 s -- 3.5 MB/s --
+and the download after that ran at the link's rate again: the guest's disk
+writes stall its vCPU, a virtio-blk request being served on the vCPU's own
+task, synchronously, through nos's ext2 to the NVMe. Its clocksource
+watchdog saw the stalls too ("Long readout interval", gaps of up to 10 s).
+That is the disk's next thing to take out, as fewer exits per frame is the
+network's.
+
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
 in [Real hardware](real-hardware.md) for the machine and in the gate's own
