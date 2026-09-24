@@ -14,7 +14,7 @@ deadlocking. The code lives in `src/cpp/mm/`, with the PTE encoding in
 | `0x0000000000000000` – `0x00007FFFFFFFFFFF` | User half. Mapped only by the x86 bootstrap table, and only until the real table takes over; on arm64 TTBR0 walks are disabled outright after boot |
 | `0xFFFF800000000000` + phys | `KernelSpaceBase`. The bootstrap linear map, and the permanent home of every MMIO mapping |
 | `0xFFFF800001000000` | Kernel image (x86-64; arm64 links at `…40200000`, matching the QEMU virt load address). Split into text RX / rodata RO+NX / data RW+NX late in boot |
-| just above the image | The `TmpMap` window: 512 slots, one L1 table, the only way the kernel touches an arbitrary physical page |
+| just above the image | The `TmpMap` window: 512 slots, one L1 table, the only way the kernel touches an arbitrary physical page -- 448 shared under a lock, and one for each CPU for copying a frame |
 | next huge-page boundary | `PageArray`, one 32-byte descriptor per 4 KiB frame, mapped in 2 MiB pages |
 | after `PageArray` | The `VaAllocator` arena the page allocator hands out |
 
@@ -54,11 +54,25 @@ page goes through `TmpMap`.
 
 ## `TmpMap`: the window onto physical memory
 
-512 consecutive VAs sharing one L1 table, guarded by `TmpMapLock`.
-`TmpMapPage(phys)` finds a free slot, writes the leaf PTE, invalidates the
-local TLB and returns the VA; `TmpUnmapPage` reverses it. `TmpMapRange`
-takes a run of adjacent slots for a structure that crosses a page boundary
-(ACPI tables, mostly).
+512 consecutive VAs sharing one L1 table. The first 448 are shared, guarded
+by `TmpMapLock`: `TmpMapPage(phys)` finds a free slot, writes the leaf PTE,
+invalidates the local TLB, takes a reference on the page and returns the
+VA; `TmpUnmapPage` reverses it. `TmpMapRange` takes a run of adjacent slots
+for a structure that crosses a page boundary (ACPI tables, mostly).
+
+The last 64 are a slot for each CPU, and serve one thing: a copy into or
+out of a frame -- a page handed out by address and mapped nowhere, what a
+guest's memory is made of (`kcore::frame`) -- which is every read and write
+of a guest's memory. `MapFrameSlot(phys)` maps this CPU's slot and
+`UnmapFrameSlot` clears it, with interrupts off from one to the other,
+which makes the slot the copy's alone: no lock, no slot to search for, no
+reference (the frame is the caller's for the call), no memory-map lookup
+(a frame is RAM), and one TLB invalidation instead of two -- the slot was
+not present, and no TLB keeps anything of an entry that was not
+(`Hal::PteMadeValid` is x86's compiler barrier and arm64's `dsb ishst;
+isb`). The frame is mapped only for the length of its copy, and nowhere
+the moment it is done. Through the shared slots, their lock and their two
+flushes had cost a busy guest's vCPU as much as the copy itself.
 
 Two details that are easy to get wrong:
 

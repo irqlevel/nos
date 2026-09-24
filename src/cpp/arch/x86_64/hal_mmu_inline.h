@@ -29,6 +29,16 @@ static inline __attribute__((always_inline)) void TlbFlushAll()
     SetCr3(GetCr3());
 }
 
+/* A leaf entry that was not present has just been made present, and this
+   CPU is about to go through it. x86 caches no translation from a
+   not-present entry, so there is nothing to invalidate, and its walk sees
+   the CPU's own store as a load would: what is left is keeping the compiler
+   from moving the store past the access. */
+static inline __attribute__((always_inline)) void PteMadeValid()
+{
+    asm volatile("" ::: "memory");
+}
+
 static inline __attribute__((always_inline)) bool TlbShootdownNeedsIpi()
 {
     return true; /* invlpg/CR3 are CPU-local; remote CPUs need an IPI */

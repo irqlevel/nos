@@ -2,7 +2,10 @@
 #include "memory_map.h"
 
 #include <kernel/trace.h>
+#include <hal/cpu.h>
+#include <hal/irqchip.h>
 #include <hal/mmu.h>
+#include <kernel/cpu.h>
 #include <kernel/debug.h>
 #include <kernel/preempt.h>
 
@@ -657,7 +660,7 @@ bool PageTable::Setup()
 
     TmpMapL1Page = (PtePage *)mmap.GetKernelEnd();
     TmpMapStart = Stdlib::RoundUp(mmap.GetKernelEnd() + Const::PageSize, HugePageSize);
-    PageArray = (Page*)(TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize);
+    PageArray = (Page*)(TmpMapStart + TmpMapPageCount * Const::PageSize);
     BugOn((ulong)PageArray & (HugePageSize - 1));
 
     ulong pageArrayCount = HighestPhyAddr / Const::PageSize + 1;
@@ -702,16 +705,18 @@ bool PageTable::Setup()
     }
 
     Trace(0, "TmpMapStart 0x%p", TmpMapStart);
-    for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
+    for (size_t i = 0; i < TmpMapPageCount; i++)
     {
         if (!SetupPage(TmpMapStart + i * Const::PageSize, 0, false))
             return false;
-
-        TmpMapPageArray[i] = nullptr;
     }
-
-    auto tmpMapL1PagePhyAddr = GetL1Page(TmpMapStart);
     for (size_t i = 0; i < Stdlib::ArraySize(TmpMapPageArray); i++)
+        TmpMapPageArray[i] = nullptr;
+
+    /* One L1 table for the whole window, the CPUs' frame slots included:
+       TmpMapL1Page is what every slot's entry is written through. */
+    auto tmpMapL1PagePhyAddr = GetL1Page(TmpMapStart);
+    for (size_t i = 0; i < TmpMapPageCount; i++)
         BugOn(tmpMapL1PagePhyAddr != GetL1Page(TmpMapStart + i * Const::PageSize));
 
     if (!SetupPage((ulong)TmpMapL1Page, tmpMapL1PagePhyAddr, false))
@@ -1076,6 +1081,58 @@ ulong PageTable::TmpMapPage(ulong phyAddr)
     return 0;
 }
 
+ulong PageTable::FrameSlotAddress(ulong cpu)
+{
+    /* Every CPU has a slot of its own: a CPU's index is the hardware ID the
+       CPU table is indexed by, and below MaxCpus. */
+    static_assert(FrameSlotCount >= MaxCpus, "a frame slot for every CPU");
+    static_assert(TmpMapSharedCount != 0, "shared slots for TmpMapPage");
+    return TmpMapStart + (TmpMapSharedCount + cpu) * Const::PageSize;
+}
+
+ulong PageTable::MapFrameSlot(ulong phyAddr)
+{
+    /* The slot is this CPU's alone only while nothing can interrupt the copy
+       on it, nor move the copy to another CPU. */
+    BugOn(Hal::IsInterruptEnabled());
+    BugOn(!IsFrameAddress(phyAddr));
+
+    ulong cpu = Hal::GetCurrentCpuHwId();
+    BugOn(cpu >= FrameSlotCount);
+    ulong virtAddr = FrameSlotAddress(cpu);
+    Pte* l1Entry = &TmpMapL1Page->Entry[Pte::L1Index(virtAddr)];
+
+    /* Cleared and flushed by the last copy on this CPU: present, it is a copy
+       that never unmapped, or two copies at once. */
+    BugOn(l1Entry->Present());
+
+    /* Built aside and stored whole, so the walker never sees half of it. */
+    Pte entry;
+    entry.SetAddress(phyAddr);
+    entry.SetWritable();
+    entry.SetNoExecute();
+    entry.SetPresent();
+    l1Entry->Value = entry.Value;
+    /* It was not present, so no TLB holds anything of it: nothing to
+       invalidate, only the store to make the walker's. */
+    Hal::PteMadeValid();
+    return virtAddr;
+}
+
+void PageTable::UnmapFrameSlot(ulong virtAddr)
+{
+    BugOn(Hal::IsInterruptEnabled());
+    ulong cpu = Hal::GetCurrentCpuHwId();
+    BugOn(cpu >= FrameSlotCount || virtAddr != FrameSlotAddress(cpu));
+
+    Pte* l1Entry = &TmpMapL1Page->Entry[Pte::L1Index(virtAddr)];
+    BugOn(!l1Entry->Present());
+    l1Entry->Value = 0;
+    /* The frame is mapped nowhere again once this returns, and the next copy
+       on this CPU finds the slot with nothing of it cached. */
+    Hal::TlbFlushPage(virtAddr);
+}
+
 ulong PageTable::TmpUnmapPage(ulong virtAddr)
 {
     Stdlib::AutoLock lock(TmpMapLock);
@@ -1291,7 +1348,7 @@ bool PageTable::MapRangeLocked(ulong virtAddr, size_t count, const MapSource& sr
         ulong va = virtAddr + i * Const::PageSize;
         ulong l1Index = Pte::L1Index(va);
 
-        BugOn(va >= TmpMapStart && va < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
+        BugOn(va >= TmpMapStart && va < (TmpMapStart + TmpMapPageCount * Const::PageSize));
 
         if (l1Page == nullptr)
         {
@@ -1365,7 +1422,7 @@ void PageTable::UnmapRangeLocked(ulong virtAddr, size_t count, bool freePages)
         ulong va = virtAddr + i * Const::PageSize;
         ulong l1Index = Pte::L1Index(va);
 
-        BugOn(va >= TmpMapStart && va < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
+        BugOn(va >= TmpMapStart && va < (TmpMapStart + TmpMapPageCount * Const::PageSize));
 
         if (l1Page == nullptr)
         {
@@ -1560,7 +1617,7 @@ Page* PageTable::UnmapPage(ulong virtAddr)
         return nullptr;
 
     BugOn(virtAddr & (Const::PageSize - 1));
-    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + Stdlib::ArraySize(TmpMapPageArray) * Const::PageSize));
+    BugOn(virtAddr >= TmpMapStart && virtAddr < (TmpMapStart + TmpMapPageCount * Const::PageSize));
 
     Pte* l1Entry = &l1Page->Entry[Pte::L1Index(virtAddr)];
     if (!l1Entry->Present())
