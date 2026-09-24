@@ -263,10 +263,12 @@ guest over and over from task context, handling each exit between entries.
 ### Its memory
 
 `hv::GuestMemory` is regions of guest physical addresses, each backed by
-host pages -- runs of 512 KiB, the most the page allocator hands out
-contiguously, since the nested table translates page by page and needs no
-more -- zeroed before the guest can see them, so that what a guest finds in
-its memory is what it was given and never what the host left there.
+host pages that are mapped nowhere (`kcore::frame::Frame`): pages of RAM the
+kernel hands out by their address and puts in no table of its own, so that
+a guest of any size costs pages and no kernel address space, and the
+guest's nested table is the only mapping they have. They are zeroed before
+the guest can see them, so that what a guest finds in its memory is what it
+was given and never what the host left there.
 
 Two rules make it the one place that decides what a guest can reach:
 
@@ -275,10 +277,11 @@ Two rules make it the one place that decides what a guest can reach:
   changes under the compiler is undefined behaviour however it is used
   ([`plans/01-rust-strategy.md`](../plans/01-rust-strategy.md) calls this
   the most important decision of the hypervisor). Every access is a copy --
-  `read`, `write`, `read_obj::<T: Pod>`, `write_obj` -- made with volatile
-  loads and stores through `DmaBuffer::load`/`store`, bounds-checked against
-  the region it falls in; an address a guest gave, whatever it is, is at
-  worst `Unmapped`.
+  `read`, `write`, `read_obj::<T: Pod>`, `write_obj` -- bounds-checked
+  against the region it falls in, and made by the kernel through its
+  temporary window onto each page it touches, a page's part of it one call
+  of the architecture's memcpy, which the compiler sees nothing of; an
+  address a guest gave, whatever it is, is at worst `Unmapped`.
 - **The nested page table is inside it.** A guest reaches exactly what its
   nested table maps, and this table maps nothing but pages the same value
   owns: every page is owned before it is mapped, and freed only with the
@@ -1443,8 +1446,10 @@ guest's ext4 clean again. What bounds the guest now is its vCPU, at 85% of
 its CPU while `dd` writes: two thirds of that is copying each request's
 data out of guest memory, a page at a time through the kernel's temporary
 window and eight bytes at a time inside it (`FrameCopy`, a `MemCpy` call a
-word), and a fifth the guest itself running. Copying a page as a page is
-the disk's next thing to take out.
+word), and a fifth the guest itself running. A page's part of a copy is
+one `MemCpy` now: under TCG the guest's 48 MiB `dd ... conv=fsync` onto a
+whole image takes 0.42 s where it took 0.64, and reading it back 0.24 s
+where it took 0.44, on virtio-blk and on NVMe alike.
 
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is

@@ -624,20 +624,30 @@ void kernel_frame_free(unsigned long phys)
     Kernel::Mm::PageTable::GetInstance().FreeFrame(phys);
 }
 
-/* Copy between a frame and the caller's memory through one temp-map slot.
-   Preemption and interrupts are off from the map to the unmap: the unmap
-   invalidates only this CPU's TLB, so a task moved to another CPU mid-copy
-   would leave that slot's translation stale behind it (VirtToPhys has the
-   same window, for the same reason). The frame's side is volatile -- what it
-   holds may be a guest's memory, written while the copy runs -- and moves a
-   word at a time where it is aligned for one; the caller's side goes through
-   MemCpy, since its buffer has no alignment to promise. */
+/* Copy between a frame and the caller's memory through one temp-map slot:
+   out of the frame into `buf`, or `data` into it -- exactly one of the two
+   is given. Preemption and interrupts are off from the map to the unmap: the
+   unmap invalidates only this CPU's TLB, so a task moved to another CPU
+   mid-copy would leave that slot's translation stale behind it (VirtToPhys
+   has the same window, for the same reason).
+
+   What a frame holds may be a guest's memory, written while the copy runs,
+   so nothing here may hold a view of it the compiler could reason about.
+   The range is one call of the architecture's memcpy -- assembly on x86, a
+   function of its own on arm64 -- which the compiler sees nothing of: each
+   byte is read or written once, where the copy says, and a guest racing its
+   own buffer gets what it raced for. (It used to go a word at a time
+   through a volatile pointer, with a MemCpy call for each word on the
+   caller's side: 512 calls a page, and two thirds of a busy guest's vCPU
+   while it wrote to its disk.) */
 static int FrameCopy(unsigned long phys, unsigned long offset,
-    unsigned char* buf, unsigned long len, bool toFrame)
+    unsigned char* buf, const unsigned char* data, unsigned long len)
 {
     if (len == 0)
         return 0;
-    if (!buf || offset >= Const::PageSize || len > Const::PageSize - offset)
+    if ((buf == nullptr) == (data == nullptr))
+        return -1;
+    if (offset >= Const::PageSize || len > Const::PageSize - offset)
         return -1;
 
     auto& pt = Kernel::Mm::PageTable::GetInstance();
@@ -652,36 +662,12 @@ static int FrameCopy(unsigned long phys, unsigned long offset,
         return -1;
     }
 
-    ulong at = va + offset;
-    unsigned long i = 0;
-    while (i < len)
-    {
-        if (((at + i) % sizeof(u64)) == 0 && len - i >= sizeof(u64))
-        {
-            volatile u64* word = reinterpret_cast<volatile u64*>(at + i);
-            u64 value;
-            if (toFrame)
-            {
-                Stdlib::MemCpy(&value, buf + i, sizeof(value));
-                *word = value;
-            }
-            else
-            {
-                value = *word;
-                Stdlib::MemCpy(buf + i, &value, sizeof(value));
-            }
-            i += sizeof(u64);
-        }
-        else
-        {
-            volatile u8* byte = reinterpret_cast<volatile u8*>(at + i);
-            if (toFrame)
-                *byte = buf[i];
-            else
-                buf[i] = *byte;
-            i++;
-        }
-    }
+    /* Inside the page mapped at va: offset and len were checked above. */
+    void* frame = reinterpret_cast<void*>(va + offset);
+    if (data != nullptr)
+        Stdlib::MemCpy(frame, data, len);
+    else
+        Stdlib::MemCpy(buf, frame, len);
 
     pt.TmpUnmapPage(va);
     Kernel::PreemptIrqRestore(flags);
@@ -691,14 +677,13 @@ static int FrameCopy(unsigned long phys, unsigned long offset,
 int kernel_frame_read(unsigned long phys, unsigned long offset,
     unsigned char* buf, unsigned long len)
 {
-    return FrameCopy(phys, offset, buf, len, false);
+    return FrameCopy(phys, offset, buf, nullptr, len);
 }
 
 int kernel_frame_write(unsigned long phys, unsigned long offset,
     const unsigned char* data, unsigned long len)
 {
-    /* FrameCopy only reads the caller's side when toFrame is set. */
-    return FrameCopy(phys, offset, const_cast<unsigned char*>(data), len, true);
+    return FrameCopy(phys, offset, nullptr, data, len);
 }
 
 int kernel_get_random(unsigned char* buf, unsigned long len)
