@@ -22,7 +22,7 @@ mod shell;
 mod table;
 
 pub use disk::{at, claim_as, count, register_driver, release, Disk};
-pub use table::{interrupts_started, BlockDriver};
+pub use table::{interrupts_started, BlockDriver, Piece};
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};

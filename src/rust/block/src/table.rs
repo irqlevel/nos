@@ -24,12 +24,27 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use ffi::block::BlockIo;
 use kcore::block::{SubmitError, IO_FLUSH, SUBMIT_BUSY, SUBMIT_INVALID, SUBMIT_OK, SUBMIT_UNSUPPORTED};
 use kcore::cmd::Output;
+use kcore::consts::PAGE_SIZE;
+use kcore::dma::DmaBuffer;
 use kcore::once::{Once, OnceBox};
 use kcore::sync::SpinLock;
 use kcore::trace;
 
 /// What the table holds.
 pub const MAX_DEVICES: usize = 48;
+
+/// One piece of a batch (`Disk::write_pieces`, `Disk::read_pieces`): `len`
+/// bytes of the batch's buffer from `at`, to or from the device from
+/// `sector` on. A piece is a page of the buffer or the start of one -- `at`
+/// on a page boundary, `len` whole sectors and at most a page -- which is
+/// what every driver's own one-I/O path takes: a driver that cannot do
+/// better does a batch one piece after another.
+#[derive(Clone, Copy, Debug)]
+pub struct Piece {
+    pub sector: u64,
+    pub at: usize,
+    pub len: usize,
+}
 
 /// A block device, as the driver behind it: what the table calls when
 /// somebody reads, writes or flushes the disk.
@@ -59,6 +74,30 @@ pub trait BlockDriver: Sync + 'static {
     /// Push the device's write cache out. A device without one has nothing
     /// to do, which is the default.
     fn flush(&'static self) -> bool {
+        true
+    }
+
+    /// Write each of `pieces` of `buf` at its sector, `base` sectors on --
+    /// where the partition the table was asked for starts -- and return
+    /// once every one is on the device. False when one failed; and by then
+    /// each piece has been written or given up on, so no command of the
+    /// batch has `buf` any more. The table has checked every piece against
+    /// the buffer and the device (`Piece`). The default writes them one
+    /// after another; a device that can have several in flight at once has
+    /// them so.
+    fn write_pieces(&'static self, base: u64, buf: &DmaBuffer, pieces: &[Piece]) -> bool {
+        pieces.iter().all(|p| self.write(base.saturating_add(p.sector), &buf.as_slice()[p.at..p.at + p.len], false))
+    }
+
+    /// Fill each of `pieces` of `buf` from its sector, `base` sectors on,
+    /// and return once every one is in it -- on the same terms as
+    /// `write_pieces`.
+    fn read_pieces(&'static self, base: u64, buf: &mut DmaBuffer, pieces: &[Piece]) -> bool {
+        for p in pieces {
+            if !self.read(base.saturating_add(p.sector), &mut buf.as_mut_slice()[p.at..p.at + p.len]) {
+                return false;
+            }
+        }
         true
     }
 
@@ -221,6 +260,64 @@ pub(crate) fn write(handle: usize, sector: u64, data: &[u8], fua: bool) -> bool 
             write(dev.parent, start + sector, data, fua)
         }
         Backend::Partition { .. } => false,
+    }
+}
+
+/// Where a batch goes on the device `handle` names: the driver, and the
+/// sector the pieces are offset by there -- the partition's start on its
+/// disk. None, and why traced, unless every piece is one (`Piece`): inside
+/// the buffer of `buf_len` bytes, a page of it or the start of one, whole
+/// sectors, and inside the device. The device's own bounds are enough: a
+/// partition is inside its disk, which the table checked when it made it.
+fn batch_target(handle: usize, buf_len: usize, pieces: &[Piece]) -> Option<(&'static dyn BlockDriver, u64)> {
+    let top = device(handle)?;
+    for p in pieces {
+        let inside = match top.sectors_in(p.len) {
+            Some(count) if count != 0 => p.at % PAGE_SIZE == 0 && p.len <= PAGE_SIZE
+                && p.at.checked_add(p.len).is_some_and(|end| end <= buf_len)
+                && top.within(p.sector, count),
+            _ => false,
+        };
+        if !inside {
+            trace!(0, "block: {}: a batch piece of {} bytes at {} of the buffer, to sector {}, is none a device takes",
+                core::str::from_utf8(top.name()).unwrap_or("?"), p.len, p.at, p.sector);
+            return None;
+        }
+    }
+
+    /* Down to the disk. A disk was registered before any partition of it,
+     * so the walk ends; the bound is the table's size all the same. */
+    let mut dev = top;
+    let mut base = 0u64;
+    for _ in 0..MAX_DEVICES {
+        match dev.backend {
+            Backend::Driver(driver) => return Some((driver, base)),
+            Backend::Partition { start } => {
+                base = base.checked_add(start)?;
+                dev = device(dev.parent)?;
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn write_pieces(handle: usize, buf: &DmaBuffer, pieces: &[Piece]) -> bool {
+    if pieces.is_empty() {
+        return true;
+    }
+    match batch_target(handle, buf.len(), pieces) {
+        Some((driver, base)) => driver.write_pieces(base, buf, pieces),
+        None => false,
+    }
+}
+
+pub(crate) fn read_pieces(handle: usize, buf: &mut DmaBuffer, pieces: &[Piece]) -> bool {
+    if pieces.is_empty() {
+        return true;
+    }
+    match batch_target(handle, buf.len(), pieces) {
+        Some((driver, base)) => driver.read_pieces(base, buf, pieces),
+        None => false,
     }
 }
 
