@@ -305,6 +305,14 @@ def attach(args):
 
         c = subprocess.run(ssh + ["root@127.0.0.1", "hv list"], capture_output=True, timeout=120)
         pt.check("the guest runs on after the detach", b"vm 0  running" in c.stdout, repr(c.stdout[-300:]))
+
+        # A command line past the 255 characters the dispatch took once -- as
+        # long as a distribution's `hv start` -- runs whole.
+        text = "nos-" + "x" * 300
+        c = subprocess.run(ssh + ["root@127.0.0.1", "hv wait 0 secs=1 " + text], capture_output=True,
+                           timeout=120)
+        pt.check("a command line over 255 characters runs over ssh",
+                 ('has not printed "%s"' % text).encode() in c.stdout, repr(c.stdout[-300:]))
     finally:
         pt.kill(p)
         if args.keep or pt.failures:

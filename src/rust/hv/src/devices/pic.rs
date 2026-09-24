@@ -170,6 +170,17 @@ impl Pic {
         }
     }
 
+    /// Whether IRQ `irq` is requested or in service: a new edge on it now
+    /// would be the same request again, and lost.
+    pub fn busy(&self, irq: u8) -> bool {
+        let (chip, bit) = match irq {
+            0..=7 => (&self.master, irq),
+            8..=15 => (&self.slave, irq - 8),
+            _ => return false,
+        };
+        (chip.irr | chip.isr) & (1 << bit) != 0
+    }
+
     /// The vector of the highest-priority interrupt the guest could take
     /// now, and the IRQ it is, without acknowledging it. `None` when nothing
     /// is pending or everything is masked or blocked.

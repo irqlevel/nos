@@ -91,6 +91,31 @@ GUEST_IP = "10.0.100.2"
 SSH_PORT = 2222
 
 
+# How long the guest idles while its clock is measured against nos's, and
+# how far the two may part: a guest whose idle vCPU lost ticks counted 40%.
+CLOCK_IDLE_S = 40
+CLOCK_TOLERANCE = 0.1
+
+
+def clock_lines(vm, x):
+    """rc lines that read the guest's uptime and nos's around an idle
+    stretch: what `clock_rate` makes a ratio of."""
+    return [x("cat /proc/uptime"), "uptime",
+            "hv wait %d secs=%d nos-never-prints-this" % (vm, CLOCK_IDLE_S),
+            x("cat /proc/uptime"), "uptime"]
+
+
+def clock_rate(out, lines):
+    """The guest's seconds per nos second over the idle stretch, or None."""
+    num = lambda text: [float(v) for v in re.findall(r"(?m)^(\d+\.\d+)\b", text)]
+    try:
+        g0, g1 = num(out(lines[0], 0))[0], num(out(lines[0], 1))[0]
+        h0, h1 = num(out(lines[1], 0))[0], num(out(lines[1], 1))[0]
+    except IndexError:
+        return None
+    return (g1 - g0) / (h1 - h0) if h1 > h0 else None
+
+
 def extract(iso, tmp):
     """The kernel and the initramfs, out of the ISO where Alpine's boot
     loader finds them."""
@@ -114,6 +139,13 @@ def alpine(args):
 
     cmdline = CMDLINE + (" " + args.cmdline_extra if args.cmdline_extra else "")
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
+    eth_line = x("ip addr show eth0")
+    ping_line = x("ping -c 3 10.0.100.1")
+    apk_line = x("apk add openssh-server", 300)
+    keygen_line = x("ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/ssh_host_ed25519_key && echo keygen-ok", 300)
+    key_line = x("mkdir -p /root/.ssh && echo '%s' > /root/.ssh/authorized_keys && echo key-ok" % pubkey)
+    sshd_line = x("/usr/sbin/sshd -o HostKey=/etc/ssh/ssh_host_ed25519_key && echo sshd-ok")
+    forward_line = "hv forward add %d 0 22" % SSH_PORT
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 " + PROMPT]
     rc = (["insmod /hv.ko", "hv on",
@@ -122,20 +154,21 @@ def alpine(args):
           + login(0)
           + [x("cat /etc/alpine-release; uname -r"),
              x("date -u +%s"),
-             x("cat /sys/block/vda/ro; dd if=/dev/zero of=/dev/vda bs=512 count=1; echo dd=$?"),
-             # The shell may print its prompt before the system goes down:
+             x("cat /sys/block/vda/ro; dd if=/dev/zero of=/dev/vda bs=512 count=1; echo dd=$?")]
+          + clock_lines(0, x)
+          + [# The shell may print its prompt before the system goes down:
              # the boot after this one is what `boot=1` waits for.
              r"hv send 0 reboot\n"]
           + login(1)
           + ["hv list",
-             x("ip addr show eth0"),
-             x("ping -c 3 10.0.100.1"),
+             eth_line,
+             ping_line,
              "ping " + GUEST_IP,
-             x("apk add openssh-server", 300),
-             x("ssh-keygen -q -t ed25519 -N '' -f /etc/ssh/ssh_host_ed25519_key && echo keygen-ok", 300),
-             x("mkdir -p /root/.ssh && echo '%s' > /root/.ssh/authorized_keys && echo key-ok" % pubkey),
-             x("/usr/sbin/sshd -o HostKey=/etc/ssh/ssh_host_ed25519_key && echo sshd-ok"),
-             "hv forward add %d 0 22" % SSH_PORT,
+             apk_line,
+             keygen_line,
+             key_line,
+             sshd_line,
+             forward_line,
              "hv list",
              hvl.RC_LAST])
 
@@ -176,25 +209,30 @@ def alpine(args):
         ro = out(rc[8])
         pt.check("the ISO is read-only to it: the driver says so, and a write fails",
                  re.search(r"^1\s*$", ro, re.M) is not None and "dd=1" in ro, ro)
+        rate = clock_rate(out, clock_lines(0, x))
+        pt.check("idle, its clock keeps the host's time (no tick lost)",
+                 rate is not None and abs(rate - 1) <= CLOCK_TOLERANCE, "rate %s" % rate)
+        if rate is not None:
+            print("  (guest seconds per host second, idle: %.3f)" % rate)
         pt.check("reboot resets it, and the VM boots again to a login prompt",
                  'printed "login:" in boot 1' in out(second[0]), out(second[0]))
         pt.check("where root logs in again", "printed \"%s\"" % PROMPT in out(second[2], 1), out(second[2], 1))
-        pt.check("hv list counts the reboot", re.search(r"vm 0\s+running.*restarts 1\b", out(rc[13])) is not None,
-                 out(rc[13]))
-        eth = out(rc[14])
+        pt.check("hv list counts the reboot", re.search(r"vm 0\s+running.*restarts 1\b", out("hv list")) is not None,
+                 out("hv list"))
+        eth = out(eth_line)
         pt.check("its initramfs configured eth0 from the VM's ip=",
                  GUEST_IP in eth and re.search(r"(?i)02:00:00:00:64:02", eth) is not None, eth)
         pt.check("it pings nos, at 10.0.100.1",
-                 "3 packets transmitted, 3 packets received" in out(rc[15]), out(rc[15])[-600:])
-        pt.check("and nos pings it", "reply from " + GUEST_IP in out(rc[16]), out(rc[16])[-600:])
+                 "3 packets transmitted, 3 packets received" in out(ping_line), out(ping_line)[-600:])
+        pt.check("and nos pings it", "reply from " + GUEST_IP in out("ping " + GUEST_IP), out("ping " + GUEST_IP)[-600:])
         pt.check("apk installs openssh-server from the ISO",
-                 re.search(r"Installing openssh-server \(", out(rc[17])) is not None
-                 and re.search(r"OK: .* packages", out(rc[17])) is not None, out(rc[17])[-600:])
+                 re.search(r"Installing openssh-server \(", out(apk_line)) is not None
+                 and re.search(r"OK: .* packages", out(apk_line)) is not None, out(apk_line)[-600:])
         pt.check("its host key, the authorised key and sshd",
-                 "keygen-ok" in out(rc[18]) and "key-ok" in out(rc[19]) and "sshd-ok" in out(rc[20]),
-                 out(rc[18]) + out(rc[19]) + out(rc[20]))
-        pt.check("hv forward add", "port %d forwarded to vm 0, %s:22" % (SSH_PORT, GUEST_IP) in out(rc[21]),
-                 out(rc[21]))
+                 "keygen-ok" in out(keygen_line) and "key-ok" in out(key_line) and "sshd-ok" in out(sshd_line),
+                 out(keygen_line) + out(key_line) + out(sshd_line))
+        pt.check("hv forward add", "port %d forwarded to vm 0, %s:22" % (SSH_PORT, GUEST_IP) in out(forward_line),
+                 out(forward_line))
 
         # From outside: the host's port, QEMU's forward into nos's 2222, nos's
         # relay into the guest's sshd.
@@ -274,6 +312,10 @@ def debian(args):
     marker = "nos-was-here-%d" % os.getpid()
 
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
+    marker_line = x("echo %s > /root/nos.txt && sync && cat /root/nos.txt" % marker)
+    net_line = x("dev=$(ls /sys/class/net | grep -v '^lo$' | head -1); ip addr add %s/24 dev $dev"
+                 " && ip link set $dev up && ping -c 3 10.0.100.1" % GUEST_IP)
+    kept_line = x("cat /root/nos.txt")
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
                 r"hv send 0 %s\n" % DEBIAN_PASSWORD, "hv wait 0 secs=120 " + DEBIAN_PROMPT]
@@ -285,19 +327,19 @@ def debian(args):
              x("systemctl is-system-running --wait", 300),
              x("systemctl --failed --no-legend --no-pager | wc -l"),
              x("findmnt -rno SOURCE,FSTYPE,OPTIONS /"),
-             x("date -u +%s"),
-             x("echo %s > /root/nos.txt && sync && cat /root/nos.txt" % marker),
+             x("date -u +%s")]
+          + clock_lines(0, x)
+          + [marker_line,
              # The image configures no ethernet interface (networkd has no
              # .network for one, and no cloud-init to write one): its own
              # virtio-net driver, given the port's address by hand.
-             x("dev=$(ls /sys/class/net | grep -v '^lo$' | head -1); ip addr add %s/24 dev $dev"
-               " && ip link set $dev up && ping -c 3 10.0.100.1" % GUEST_IP),
+             net_line,
              "ping " + GUEST_IP,
              # systemd's reboot returns at once and bash prints its prompt;
              # the boot after it is what `boot=1` waits for.
              r"hv send 0 reboot\n"]
           + login(1)
-          + [x("cat /root/nos.txt"),
+          + [kept_line,
              "hv list",
              hvl.RC_LAST])
     boot = argparse.Namespace(bzimage=vmlinuz, initrd=initrd, root_mib=args.debian_root_mib,
@@ -332,17 +374,23 @@ def debian(args):
         m = re.search(r"^(\d{9,})\s*$", out(rc[12]), re.M)
         pt.check("its clock is the host's", m is not None and t_start - 300 <= int(m.group(1)) <= t_end + 300,
                  out(rc[12]))
-        pt.check("a file written to its root and synced", re.search(r"^%s\s*$" % marker, out(rc[13]), re.M)
-                 is not None, out(rc[13]))
+        rate = clock_rate(out, clock_lines(0, x))
+        pt.check("idle, its clock keeps the host's time (no tick lost)",
+                 rate is not None and abs(rate - 1) <= CLOCK_TOLERANCE, "rate %s" % rate)
+        if rate is not None:
+            print("  (guest seconds per host second, idle: %.3f)" % rate)
+        pt.check("a file written to its root and synced", re.search(r"^%s\s*$" % marker, out(marker_line), re.M)
+                 is not None, out(marker_line))
         pt.check("reboot resets it, and the VM boots again", 'printed "login:" in boot 1' in out(second[0]),
                  out(second[0]))
         pt.check("root logs in again", "printed \"%s\"" % DEBIAN_PROMPT in out(second[4], 1), out(second[4], 1))
         pt.check("on the switch, its virtio-net driver reaches nos",
-                 re.search(r"3 packets transmitted, 3 (packets )?received", out(rc[14])) is not None,
-                 out(rc[14])[-600:])
-        pt.check("and nos reaches it", "reply from " + GUEST_IP in out(rc[15]), out(rc[15])[-600:])
+                 re.search(r"3 packets transmitted, 3 (packets )?received", out(net_line)) is not None,
+                 out(net_line)[-600:])
+        pt.check("and nos reaches it", "reply from " + GUEST_IP in out("ping " + GUEST_IP),
+                 out("ping " + GUEST_IP)[-600:])
         pt.check("and the file is still there: the disk kept what the guest wrote",
-                 re.search(r"^%s\s*$" % marker, out(rc[22]), re.M) is not None, out(rc[22]))
+                 re.search(r"^%s\s*$" % marker, out(kept_line), re.M) is not None, out(kept_line))
         pt.check("hv list counts the reboot", re.search(r"vm 0\s+running.*restarts 1\b", out("hv list"))
                  is not None, out("hv list"))
     finally:

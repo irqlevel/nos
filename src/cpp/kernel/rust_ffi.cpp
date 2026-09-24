@@ -46,8 +46,14 @@ static const unsigned long PrinterChunkSize = 128;
 /* kernel_ring_create's ceiling: a ring's cells are one allocation */
 static const unsigned long RingMaxCapacity = 1UL << 20;
 
-/* kernel_cmd_dispatch: the longest command line it runs -- the UDP shell's */
-static const unsigned long DispatchLineMax = 255;
+/* kernel_cmd_dispatch: the longest command line it runs -- as long as a line
+   of /etc/rc (cmd.cpp's ScriptLineMax): a guest's `hv start` over SSH with a
+   distribution's kernel command line runs past two hundred characters before
+   it says anything of its own, and was refused here at 255 on the AX41. The
+   line is copied through a buffer this long on the stack of the task that
+   dispatches it -- an SSH session's or the UDP shell's, 64 KiB each. The UDP
+   shell's own datagrams stay at its CMD_MAX. */
+static const unsigned long DispatchLineMax = 1023;
 
 /* kernel_cmd_dispatch: how much of a command's output waits in memory for a
    moment it may be sent */

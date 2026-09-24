@@ -411,7 +411,9 @@ the running one, which must answer a line typed during its new boot.
 from `/etc/rc`, then an `ssh -tt ... hv attach 0` that types a line, waits
 for its answer and types ^] -- the answer must come back, the detach be
 said, no cursor query reach the terminal, and the guest run on; `hv attach`
-from `/etc/rc`, where nobody can type, must refuse. It needs `ssh` and
+from `/etc/rc`, where nobody can type, must refuse. And a command line of
+over 300 characters sent over ssh must run whole: the dispatch once refused
+anything past 255, and a distribution's `hv start` is longer. It needs `ssh` and
 `ssh-keygen` on the host.
 
 `--disk` is another: an ext4 image with a file in it, put on nos's root and
@@ -464,6 +466,14 @@ given its port's address its virtio-net driver reaches nos and nos it, and
 that a file written to its root is still there after `reboot` (waited for
 with `hv wait ... boot=1`, since systemd's `reboot` hands the shell its
 prompt back first).
+
+Both modes also time the guest's clock against nos's across 40 s of idle --
+its `/proc/uptime` against nos's `uptime` -- and want them within 10%: an
+idle guest whose vCPU was woken only at the host's tick was once given a
+timer edge for every two or three of its periods, and counted 40% of real
+time on the AX41 (0.514 under TCG, which is what this check read before
+the fix and reads 1.000 after). The ±5 minutes the date is allowed could
+not see it.
 
 Under TCG the guest cannot calibrate its TSC against the PIT -- an exit
 costs more than the calibration loop allows -- so it stays on jiffies and

@@ -361,10 +361,14 @@ impl LinuxGuest {
              * HLT would never arrive and the editor would time out. */
             self.feed_console(host);
 
-            /* The timer: a channel-0 period elapsed is an IRQ0 edge. Then,
-             * if any interrupt is pending, inject it when the guest can take
-             * one and ask to be told when it can when it cannot. */
-            if self.pit.ch0_fire() {
+            /* The timer: a channel-0 period elapsed is an IRQ0 edge -- one
+             * owed edge at a time, and only once the last has been taken: an
+             * IRQ0 still requested or in service would swallow the next, and
+             * a tick the guest never saw is time it never counts
+             * (`Pit::ch0_fire`). Then, if any interrupt is pending, inject it
+             * when the guest can take one and ask to be told when it can
+             * when it cannot. */
+            if !self.pic.busy(0) && self.pit.ch0_fire() {
                 self.pic.raise(0);
                 counts.edges0 += 1;
             }
@@ -384,8 +388,13 @@ impl LinuxGuest {
                      * -- nothing else here becomes pending with time: the
                      * console's input is waiting already or waits on the
                      * guest -- and give the CPU to whatever else can use it,
-                     * rather than enter a guest that would only halt again. */
-                    let until = self.pit.next_ch0_edge_ns()
+                     * rather than enter a guest that would only halt again.
+                     * Not for an edge while IRQ0 is still requested or in
+                     * service -- masked, say: none is handed over until the
+                     * guest takes that one, and an owed edge, already due,
+                     * would have the vCPU wake without sleeping for good. */
+                    let edge = if self.pic.busy(0) { None } else { self.pit.next_ch0_edge_ns() };
+                    let until = edge
                         .unwrap_or(u64::MAX)
                         .min(now.saturating_add(MAX_HALT_WAIT_NS))
                         .min(deadline);
