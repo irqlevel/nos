@@ -21,7 +21,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use block::BlockDriver;
+use block::{BlockDriver, Piece};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::{self, DmaBuffer};
 use kcore::interrupt::LegacyInterrupt;
@@ -40,6 +40,9 @@ const MAX_DEVICES: usize = 8;
 /// queue has, so 64 of them is 192 -- the ring is never the thing that runs
 /// out, and the slots are what callers queue for.
 const MAX_SLOTS: usize = 64;
+/// A batch's requests on the ring at once, at most: half the slots, so that
+/// one leaves the other half to everybody else.
+const BATCH_SLOTS: usize = MAX_SLOTS / 2;
 
 const SECTOR_SIZE: usize = 512;
 /// The request queue, which is the only one a virtio-blk has.
@@ -169,11 +172,32 @@ impl Blk {
         }
     }
 
+    /// A slot now, if one is free: for a batch's second request and those
+    /// after it, which do not wait in line -- its first did. Counted as a
+    /// caller that waits is, a ticket to a slot, so that the admission order
+    /// stays in step with the slots given back.
+    fn take_slot_now(&self) -> Option<usize> {
+        let slot = self.take_slot()?;
+        self.next_ticket.fetch_add(1, Ordering::AcqRel);
+        Some(slot)
+    }
+
     /// Write a request header into a slot and hand the chain to the device.
     /// The status byte is the device's answer, read once the wait is over.
     fn request(&self, kind: u32, sector: u64, data: Option<(u64, u32, bool)>) -> bool {
         let slot = self.wait_for_slot();
+        if !self.queue(slot, kind, sector, data) {
+            return false;
+        }
+        self.transport.notify(REQUEST_QUEUE);
+        self.finish(slot)
+    }
 
+    /// Put the request on the ring in `slot`: its header written, its status
+    /// unset, the chain added and its head mapped to the slot. The doorbell is
+    /// the caller's to ring. False -- the slot given back -- when the ring
+    /// would not take it.
+    fn queue(&self, slot: usize, kind: u32, sector: u64, data: Option<(u64, u32, bool)>) -> bool {
         let header = Self::header_offset(slot);
         let status = Self::status_offset(slot);
 
@@ -230,14 +254,80 @@ impl Blk {
             self.give_slot(slot);
             return false;
         }
+        true
+    }
 
-        self.transport.notify(REQUEST_QUEUE);
+    /// The slot's request, done: whether the device says it went through,
+    /// and the slot given back.
+    fn finish(&self, slot: usize) -> bool {
         self.wait_done(slot);
 
         /* What the device wrote, read once it has said it is done. */
+        let status = Self::status_offset(slot);
         let answer = self.inner.lock().dma.bytes(status, 1).map_or(STATUS_UNSET, |byte| byte[0]);
         self.give_slot(slot);
         answer == 0
+    }
+
+    /// Every piece of a batch as a request of its own, up to BATCH_SLOTS of
+    /// them on the ring at once and the device notified once for each lot
+    /// queued; waited for in the order they went in, each slot given back
+    /// as its request is done, so the window slides along the batch. The
+    /// batch waits in line for its first slot when it has nothing out, and
+    /// otherwise takes what is free and waits for its own oldest -- a batch
+    /// that waited for a slot while its own requests sat un-notified on the
+    /// ring would wait for good. A failure ends the queueing, not the
+    /// waiting: nothing returns while a request may still be moving data
+    /// into or out of the buffer.
+    fn batch(&self, kind: u32, buf_phys: u64, base: u64, pieces: &[Piece]) -> bool {
+        let mut window = [0usize; BATCH_SLOTS];
+        let mut head = 0usize;
+        let mut out = 0usize;
+        let mut next = 0usize;
+        let mut ok = true;
+
+        loop {
+            if ok && next < pieces.len() && out < BATCH_SLOTS {
+                let mut slot = if out == 0 { Some(self.wait_for_slot()) } else { self.take_slot_now() };
+                let mut queued = 0usize;
+                while let Some(taken) = slot {
+                    let piece = &pieces[next];
+                    let (Some(sector), Ok(len)) = (base.checked_add(piece.sector), u32::try_from(piece.len)) else {
+                        self.give_slot(taken);
+                        ok = false;
+                        break;
+                    };
+                    let data = Some((buf_phys + piece.at as u64, len, kind == TYPE_IN));
+                    if !self.queue(taken, kind, sector, data) {
+                        ok = false;
+                        break;
+                    }
+                    window[(head + out) % BATCH_SLOTS] = taken;
+                    out += 1;
+                    next += 1;
+                    queued += 1;
+                    if next == pieces.len() || out == BATCH_SLOTS {
+                        break;
+                    }
+                    slot = self.take_slot_now();
+                }
+                if queued != 0 {
+                    self.transport.notify(REQUEST_QUEUE);
+                }
+            }
+            if out == 0 {
+                return ok;
+            }
+
+            /* The batch's oldest, done: its slot back, room for the next. */
+            let taken = window[head];
+            head = (head + 1) % BATCH_SLOTS;
+            out -= 1;
+            if !self.finish(taken) {
+                trace!(0, "virtio-blk: a request of a batch failed");
+                ok = false;
+            }
+        }
     }
 
     /// Wait for one slot's completion: blocked if there is a scheduler to
@@ -335,6 +425,14 @@ impl BlockDriver for Blk {
 
     fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
         self.transfer(sector, data.as_ptr(), data.len(), TYPE_OUT) && (!fua || self.flush())
+    }
+
+    fn write_pieces(&'static self, base: u64, buf: &DmaBuffer, pieces: &[Piece]) -> bool {
+        self.batch(TYPE_OUT, buf.phys(), base, pieces)
+    }
+
+    fn read_pieces(&'static self, base: u64, buf: &mut DmaBuffer, pieces: &[Piece]) -> bool {
+        self.batch(TYPE_IN, buf.phys(), base, pieces)
     }
 
     fn flush(&'static self) -> bool {

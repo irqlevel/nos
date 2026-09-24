@@ -179,12 +179,21 @@ the journal ext2 does not have:
 - Only the primary superblock and group descriptors are updated; the
   backups drift, which e2fsck tolerates (`-b` uses them for recovery only).
 
-Every read and write is a synchronous request to the block device — there
-is no cache of data. A 3 MiB module read is about 770 block reads, a few
-tens of milliseconds on NVMe. The inode table block, the indirect and the
-doubly-indirect block last used are kept in memory, so a file read or
-written a piece at a time does not read its inode back for every piece, and
-a sequential pass does not re-read its indirect blocks per data block.
+There is no cache of data: a file's blocks go to and from the device as
+the call asks for them, a batch at a time -- up to 64 blocks, a page of a
+256 KiB buffer each (`Disk::write_pieces`, `read_pieces`), in flight
+together on NVMe and virtio-blk, where they used to go one synchronous
+request after another. A batch of a write stays under one pointer block --
+the inode's, the indirect block's, one of the doubly-indirect block's --
+because moving on to the next puts the last one down after a flush, and the
+blocks it points at have to be on the disk by then, not waiting in the
+batch. A partial block is read in first, and a block the batch allocated is
+written even when the batch stops short, so it never holds what the disk
+had there before. Metadata -- inodes, bitmaps, directories, indirect
+blocks -- still goes a block at a time. The inode table block, the indirect
+and the doubly-indirect block last used are kept in memory, so a file read
+or written a piece at a time does not read its inode back for every piece,
+and a sequential pass does not re-read its indirect blocks per data block.
 
 ## nanofs, ramfs, procfs
 

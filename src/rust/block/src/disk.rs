@@ -9,9 +9,10 @@ use core::ffi::CStr;
 
 use ffi::block::BlockIo;
 use kcore::block::SubmitError;
+use kcore::dma::DmaBuffer;
 use kcore::error::{Error, Result};
 
-use crate::table;
+use crate::table::{self, Piece};
 
 /// A block device to read and write -- a disk, or a partition of one -- by
 /// the name `disks` shows it under. Block devices stay as long as the
@@ -116,6 +117,23 @@ impl Disk {
 
     pub fn flush(&self) -> Result<()> {
         if table::flush(self.handle) { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// Writes each of `pieces` of `buf` at its sector, and returns once
+    /// every one is on the device -- in flight together where the device
+    /// takes several at once, as NVMe and virtio-blk do, one after another
+    /// where it does not. A piece is a page of `buf` or the start of one,
+    /// whole sectors (`Piece`). An error once they are all done or given
+    /// up on, with some perhaps written: none of them past the device's
+    /// cache (a flush is what does that).
+    pub fn write_pieces(&self, buf: &DmaBuffer, pieces: &[Piece]) -> Result<()> {
+        if table::write_pieces(self.handle, buf, pieces) { Ok(()) } else { Err(Error::IoError) }
+    }
+
+    /// Fills each of `pieces` of `buf` from its sector, as `write_pieces`
+    /// writes them.
+    pub fn read_pieces(&self, buf: &mut DmaBuffer, pieces: &[Piece]) -> Result<()> {
+        if table::read_pieces(self.handle, buf, pieces) { Ok(()) } else { Err(Error::IoError) }
     }
 
     /// How many partitions of it the kernel found

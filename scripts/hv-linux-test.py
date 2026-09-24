@@ -340,10 +340,15 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None):
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, str(args.root_mib), rootdir],
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
 
+    # nos's root on virtio-blk, or with --nvme-root on NVMe: each driver has
+    # its own way of taking a batch of blocks at once.
+    if getattr(args, "nvme_root", False):
+        root_device = ["-device", "nvme,serial=nosroot,drive=drive0"]
+    else:
+        root_device = ["-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4", "-cpu", "max",
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
-            "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
-            "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"] + (qemu or [])
+            "-drive", "file=%s,format=raw,id=drive0,if=none" % image] + root_device + (qemu or [])
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     t0 = time.time()
     txt = ""
@@ -682,6 +687,8 @@ def main():
                     help="instead: a virtio disk for the guest (needs --initrd, and a guest kernel with PCI, "
                          "legacy virtio-pci, virtio-blk and ext4)")
     ap.add_argument("--disk-mib", type=int, default=32, help="the guest disk image's size")
+    ap.add_argument("--nvme-root", action="store_true",
+                    help="nos's root filesystem on an NVMe disk rather than virtio-blk (the AX41's)")
     ap.add_argument("--net", action="store_true",
                     help="instead: the guests' network (needs --initrd, and a guest kernel with PCI, "
                          "legacy virtio-pci, virtio-net, IP and ip= configuration)")

@@ -432,6 +432,9 @@ holes filled, its blocks written over -- must pass `e2fsck` as nos left it,
 stopped rather than unmounted; and the image, taken back out of it with
 `debugfs`, must pass `e2fsck` too and hold what the guest wrote. It needs a
 guest kernel with PCI, legacy virtio-pci, virtio-blk and ext4 built in.
+`--nvme-root` puts nos's root on an NVMe disk instead of virtio-blk: each
+driver takes ext2's batches of blocks its own way, and NVMe's is the one the
+AX41 runs.
 
 `--net` is the guests' network: two guests with `net`; each has its port's
 address and MAC; a guest pings nos at 10.0.100.1 and each pings the other;

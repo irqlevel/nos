@@ -5,7 +5,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use kcore::{trace, dma, io, msix, pci, sync};
 use kcore::bitmap::BitMap;
-use block::BlockDriver;
+use block::{BlockDriver, Piece};
 use kcore::block::{BlockIo, SubmitError, IO_FLUSH, IO_READ, IO_WRITE};
 use kcore::consts::PAGE_SIZE;
 use kcore::once::Once;
@@ -879,6 +879,145 @@ impl NvmeDevice {
     }
 }
 
+/* A batch's commands with the controller at once, at most: half the queue,
+ * so that one leaves the other half to everybody else -- the asynchronous
+ * path's servers, and other tasks' synchronous commands. */
+const BATCH_WINDOW: usize = IO_QUEUE_DEPTH / 2;
+
+impl NvmeDevice {
+    /* The command for one piece of a batch: where it is in memory and on the
+     * namespace. None for a piece the controller cannot take -- the table
+     * checked it against the device already; these are the controller's own
+     * limits, checked where they are known. */
+    fn piece_command(&self, opcode: u8, cid: u16, buf_phys: u64, base: u64, piece: &Piece)
+        -> Option<SubmissionEntry>
+    {
+        let sector_size = self.sector_size as usize;
+        if piece.len == 0 || piece.len % sector_size != 0 {
+            return None;
+        }
+        let count = piece.len / sector_size;
+        let sector = base.checked_add(piece.sector)?;
+        if count > self.max_transfer as usize || sector >= self.capacity
+            || count as u64 > self.capacity - sector
+        {
+            return None;
+        }
+
+        /* PRP entries as `transfer` makes them: a piece is at most a page, so
+         * a second one is there only for a piece that runs into the next. */
+        let prp1 = buf_phys.checked_add(piece.at as u64)?;
+        let offset = prp1 as usize & (PAGE_SIZE - 1);
+        if prp1 & 3 != 0 || offset + piece.len > 2 * PAGE_SIZE {
+            return None;
+        }
+        let prp2 = if offset + piece.len > PAGE_SIZE {
+            (prp1 & !(PAGE_SIZE as u64 - 1)) + PAGE_SIZE as u64
+        } else {
+            0
+        };
+
+        let mut cmd = SubmissionEntry::new(opcode, cid);
+        cmd.nsid  = 1;
+        cmd.prp1  = prp1;
+        cmd.prp2  = prp2;
+        cmd.cdw10 = sector as u32;
+        cmd.cdw11 = (sector >> 32) as u32;
+        cmd.cdw12 = count as u32 - 1;
+        Some(cmd)
+    }
+
+    /* Every piece of a batch as a synchronous command of its own -- the ISR
+     * wakes done[cid] for it as it does for `execute` -- up to BATCH_WINDOW
+     * of them with the controller at once, and the doorbell rung once for
+     * each lot queued. They are waited for in the order they went in, each
+     * ID given back as its command is done, so the window slides along the
+     * batch. A failure ends the submitting, not the waiting: nothing returns
+     * while a command of the batch may still be moving data into or out of
+     * the buffer. */
+    fn batch(&self, opcode: u8, buf_phys: u64, base: u64, pieces: &[Piece]) -> bool {
+        let mut window = [0u16; BATCH_WINDOW];
+        let mut head = 0usize;
+        let mut out = 0usize;
+        let mut next = 0usize;
+        let mut ok = true;
+
+        loop {
+            if ok && next < pieces.len() && out < BATCH_WINDOW {
+                /* With nothing of its own out the batch waits for an ID as a
+                 * single command does; with some it takes what is free, and
+                 * waits for its own oldest rather than for anybody else's. */
+                let held = if out == 0 {
+                    self.lock_with_cid()
+                } else {
+                    let mut submission = self.submission.lock();
+                    submission.alloc_cid().map(|cid| (submission, cid))
+                };
+                match held {
+                    None if out == 0 => {
+                        trace!(0, "NVMe: batch: all CID slots busy");
+                        ok = false;
+                    }
+                    None => {}
+                    Some((mut submission, first)) => {
+                        let mut cid = first;
+                        let mut queued = 0usize;
+                        loop {
+                            let piece = &pieces[next];
+                            let Some(cmd) = self.piece_command(opcode, cid, buf_phys, base, piece) else {
+                                trace!(0, "NVMe: batch: {} bytes at sector {} is no command the controller takes",
+                                    piece.len, piece.sector);
+                                submission.free_cid(cid);
+                                ok = false;
+                                break;
+                            };
+                            self.status[cid as usize].store(0, Ordering::Relaxed);
+                            /* Taken up before the doorbell can bring the
+                             * completion that gives it back, and the kind
+                             * with Release: the ISR has to find a waiter. */
+                            self.done[cid as usize].add(1);
+                            self.kind[cid as usize].store(CID_SYNC, Ordering::Release);
+                            submission.queue.submit(&cmd);
+                            window[(head + out) % BATCH_WINDOW] = cid;
+                            out += 1;
+                            next += 1;
+                            queued += 1;
+                            if next == pieces.len() || out == BATCH_WINDOW {
+                                break;
+                            }
+                            match submission.alloc_cid() {
+                                Some(c) => cid = c,
+                                None => break,
+                            }
+                        }
+                        if queued != 0 {
+                            /* The tail covers any asynchronous command still
+                             * owed a doorbell */
+                            submission.queue.ring_doorbell(&self.regs);
+                            submission.doorbell_owed = false;
+                        }
+                    }
+                }
+            }
+            if out == 0 {
+                return ok;
+            }
+
+            /* The batch's oldest, done: its ID back, room for the next. */
+            let cid = window[head];
+            head = (head + 1) % BATCH_WINDOW;
+            out -= 1;
+            self.done[cid as usize].wait();
+            let status = self.status[cid as usize].load(Ordering::Acquire);
+            self.submission.lock().free_cid(cid);
+            if status != 0 {
+                trace!(0, "NVMe: batch: I/O status={:#x}", status);
+                ok = false;
+            }
+        }
+    }
+}
+
 impl BlockDriver for NvmeDevice {
     fn is_async(&self) -> bool {
         true
@@ -898,6 +1037,14 @@ impl BlockDriver for NvmeDevice {
 
     fn write(&'static self, sector: u64, data: &[u8], fua: bool) -> bool {
         self.transfer(sector, data.as_ptr(), data.len(), true, fua)
+    }
+
+    fn write_pieces(&'static self, base: u64, buf: &dma::DmaBuffer, pieces: &[Piece]) -> bool {
+        self.batch(OPC_WRITE, buf.phys(), base, pieces)
+    }
+
+    fn read_pieces(&'static self, base: u64, buf: &mut dma::DmaBuffer, pieces: &[Piece]) -> bool {
+        self.batch(OPC_READ, buf.phys(), base, pieces)
     }
 
     fn flush(&'static self) -> bool {

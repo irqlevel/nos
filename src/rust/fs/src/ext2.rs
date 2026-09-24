@@ -31,7 +31,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use block::Disk;
+use block::{Disk, Piece};
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
 use kcore::pod::{self, Pod};
@@ -103,6 +103,12 @@ const MAX_NAME_LEN: usize = 255;
 
 /// Blocks a truncate releases between two inode commits (see `truncate_inode`)
 const FREE_BATCH: usize = 512;
+
+/// A file's data goes to and from the disk in batches of this many blocks,
+/// a block to a page of the batch's buffer (`Piece`): 256 KiB of 4 KiB
+/// blocks, a guest disk's largest request, in one go. A buffer this size may
+/// not be there to be had; the largest that is, down to a page, will do.
+const BATCH_PAGES: usize = 64;
 
 /// Recursion cap for a recursive remove
 const MAX_DIR_DEPTH: u32 = 32;
@@ -305,6 +311,25 @@ impl Io {
         self.dev.write(start, &buf[..self.block_size], fua).is_ok()
     }
 
+    /// Block `block` as a piece of a batch, at `at` in its buffer; None past
+    /// the filesystem's end.
+    fn piece(&self, block: u32, at: usize) -> Option<Piece> {
+        if block >= self.block_count {
+            trace!(0, "ext2: block {} beyond {} in a batch", block, self.block_count);
+            return None;
+        }
+        let sectors = (self.block_size / self.sector_size) as u64;
+        Some(Piece { sector: block as u64 * sectors, at, len: self.block_size })
+    }
+
+    fn write_pieces(&self, buf: &DmaBuffer, pieces: &[Piece]) -> bool {
+        self.dev.write_pieces(buf, pieces).is_ok()
+    }
+
+    fn read_pieces(&self, buf: &mut DmaBuffer, pieces: &[Piece]) -> bool {
+        self.dev.read_pieces(buf, pieces).is_ok()
+    }
+
     /// A block number read off the disk (an inode or indirect block pointer)
     /// must land inside the filesystem and past the boot block; anything else
     /// is corruption, and following it would read or overwrite metadata.
@@ -367,6 +392,26 @@ pub struct Ext2 {
     /// Blocks allocated since the mount: a write that finds it unchanged
     /// allocated nothing, and has nothing to order.
     allocations: u64,
+    /// A file's data on its way to or from the disk, a block to a page
+    /// (`BATCH_PAGES`), and the pieces of it one batch is -- room taken
+    /// with the buffer, so that no read or write allocates.
+    batch: DmaBuffer,
+    pieces: Vec<Piece>,
+}
+
+/// The data path's buffer: `BATCH_PAGES`, or the largest run of pages that
+/// can be had short of it, down to one.
+fn batch_buffer() -> Option<DmaBuffer> {
+    let mut pages = BATCH_PAGES;
+    loop {
+        if let Some(buf) = DmaBuffer::new(pages) {
+            return Some(buf);
+        }
+        if pages == 1 {
+            return None;
+        }
+        pages /= 2;
+    }
 }
 
 /// The superblock, off a device that is not mounted. None when the device
@@ -420,6 +465,10 @@ impl Ext2 {
             return None;
         }
 
+        let batch = batch_buffer()?;
+        let mut pieces = Vec::new();
+        pieces.try_reserve_exact(batch.pages()).ok()?;
+
         Some(Ext2 {
             io: Io {
                 dev,
@@ -454,6 +503,8 @@ impl Ext2 {
             bitmap_block: 0,
             bitmap_dirty: false,
             allocations: 0,
+            batch,
+            pieces,
         })
     }
 
@@ -1523,34 +1574,77 @@ impl Ext2 {
         /* A read maps but never allocates, so the inode is not modified */
         let mut scratch = *inode;
 
+        /* A batch at a time: the blocks mapped, a page of the buffer each, the
+         * ones that are there read in one go -- a hole has no piece and reads
+         * as zeros -- and then what was asked for copied out. */
         while done < len {
-            let (phys, _) = match self.map_block(&mut scratch, 0, block_idx, false) {
-                Some(mapped) => mapped,
-                None => {
-                    trace!(0, "ext2: logical block {} is unmappable", block_idx);
-                    return false;
+            let first_done = done;
+            let first_off = byte_off;
+            let mut blocks = 0;
+            self.pieces.clear();
+            while done < len && blocks < self.batch.pages() {
+                let (phys, _) = match self.map_block(&mut scratch, 0, block_idx, false) {
+                    Some(mapped) => mapped,
+                    None => {
+                        trace!(0, "ext2: logical block {} is unmappable", block_idx);
+                        return false;
+                    }
+                };
+                if phys != 0 {
+                    match self.io.piece(phys, blocks * PAGE_SIZE) {
+                        Some(piece) => self.pieces.push(piece),
+                        None => return false,
+                    }
                 }
-            };
-
-            let chunk = (bs - byte_off).min(len - done);
-            if phys == 0 {
-                /* A hole reads as zeros */
-                buf[done..done + chunk].fill(0);
-            } else {
-                if !self.io.read_block(phys, self.data.as_mut_slice()) {
-                    trace!(0, "ext2: read of block {} failed", phys);
-                    return false;
-                }
-                buf[done..done + chunk]
-                    .copy_from_slice(&self.data.as_slice()[byte_off..byte_off + chunk]);
+                done += (bs - byte_off).min(len - done);
+                byte_off = 0;
+                block_idx += 1;
+                blocks += 1;
             }
 
-            done += chunk;
-            byte_off = 0;
-            block_idx += 1;
+            if !self.pieces.is_empty() && !self.io.read_pieces(&mut self.batch, &self.pieces) {
+                trace!(0, "ext2: a read of {} blocks failed", self.pieces.len());
+                return false;
+            }
+
+            let mut out = first_done;
+            let mut off = first_off;
+            let mut next_piece = 0;
+            for block in 0..blocks {
+                let chunk = (bs - off).min(len - out);
+                let at = block * PAGE_SIZE;
+                if self.pieces.get(next_piece).is_some_and(|piece| piece.at == at) {
+                    buf[out..out + chunk].copy_from_slice(&self.batch.as_slice()[at + off..at + off + chunk]);
+                    next_piece += 1;
+                } else {
+                    /* A hole reads as zeros */
+                    buf[out..out + chunk].fill(0);
+                }
+                out += chunk;
+                off = 0;
+            }
         }
 
         true
+    }
+
+    /// Which pointer block leads to logical block `logical`: 0 for the
+    /// inode's own, 1 for the single indirect block, and 2 on for the double
+    /// indirect block's, one each. A batch of a write stays inside one: a
+    /// write that moves on to another indirect block puts the one it leaves
+    /// down after a flush (`retire_pointers`), and what that block points at
+    /// has to be on the disk by then -- written, not waiting in the batch.
+    fn pointer_block(&self, logical: u32) -> u64 {
+        let logical = logical as u64;
+        let direct = DIRECT_BLOCKS as u64;
+        let ppb = self.ptrs_per_block as u64;
+        if logical < direct {
+            0
+        } else if logical < direct + ppb {
+            1
+        } else {
+            2 + (logical - direct - ppb) / ppb
+        }
     }
 
     /// Write `data` at `offset`, allocating what the range needs. Data blocks
@@ -1568,35 +1662,62 @@ impl Ext2 {
         let mut block_idx = (offset / bs) as u32;
         let mut byte_off = offset % bs;
 
+        /* A batch at a time, each inside one pointer block (`pointer_block`):
+         * every block mapped -- allocated if it is missing -- and put in a
+         * page of the buffer, a partial one over what the disk has there or
+         * over zeros for a fresh one, and the lot written in one go. */
         while done < data.len() {
-            let (phys, fresh) = match self.map_block(inode, goal_group, block_idx, true) {
-                Some(mapped) => mapped,
-                None => {
-                    trace!(0, "ext2: logical block {} is unmappable", block_idx);
-                    return false;
-                }
-            };
+            let pointers = self.pointer_block(block_idx);
+            let mut failed = false;
+            self.pieces.clear();
+            while done < data.len() && self.pieces.len() < self.batch.pages()
+                && self.pointer_block(block_idx) == pointers
+            {
+                let (phys, fresh) = match self.map_block(inode, goal_group, block_idx, true) {
+                    Some(mapped) => mapped,
+                    None => {
+                        trace!(0, "ext2: logical block {} is unmappable", block_idx);
+                        failed = true;
+                        break;
+                    }
+                };
 
-            let chunk = (bs - byte_off).min(data.len() - done);
-            if chunk < bs {
-                if fresh {
-                    self.data.as_mut_slice()[..bs].fill(0);
-                } else if !self.io.read_block(phys, self.data.as_mut_slice()) {
-                    trace!(0, "ext2: read of block {} failed", phys);
-                    return false;
+                let at = self.pieces.len() * PAGE_SIZE;
+                let Some(piece) = self.io.piece(phys, at) else {
+                    failed = true;
+                    break;
+                };
+                let chunk = (bs - byte_off).min(data.len() - done);
+                if chunk < bs {
+                    if fresh {
+                        self.batch.as_mut_slice()[at..at + bs].fill(0);
+                    } else if self.io.read_block(phys, self.data.as_mut_slice()) {
+                        self.batch.as_mut_slice()[at..at + bs].copy_from_slice(&self.data.as_slice()[..bs]);
+                    } else {
+                        trace!(0, "ext2: read of block {} failed", phys);
+                        failed = true;
+                        break;
+                    }
                 }
+                self.batch.as_mut_slice()[at + byte_off..at + byte_off + chunk]
+                    .copy_from_slice(&data[done..done + chunk]);
+                self.pieces.push(piece);
+
+                done += chunk;
+                byte_off = 0;
+                block_idx += 1;
             }
 
-            self.data.as_mut_slice()[byte_off..byte_off + chunk]
-                .copy_from_slice(&data[done..done + chunk]);
-            if !self.io.write_block(phys, self.data.as_slice(), false) {
-                trace!(0, "ext2: write of block {} failed", phys);
+            /* What the batch has is written even when it stopped short: a
+             * block it allocated then holds what was meant for it, not
+             * whatever the disk had there before. */
+            if !self.pieces.is_empty() && !self.io.write_pieces(&self.batch, &self.pieces) {
+                trace!(0, "ext2: a write of {} blocks failed", self.pieces.len());
                 return false;
             }
-
-            done += chunk;
-            byte_off = 0;
-            block_idx += 1;
+            if failed {
+                return false;
+            }
         }
 
         let end = offset + data.len();

@@ -457,7 +457,10 @@ ceiling.
   implementation yet.
 - The NVMe driver has one I/O queue, 63 commands deep: 55 open to
   asynchronous I/O -- every instance's on the disk -- and the rest kept for
-  the synchronous path. netblk's queue in front of it is what absorbs a burst.
+  the synchronous path. A filesystem's batch of blocks is synchronous and
+  takes up to half the queue while it lasts, so on a disk with a mounted
+  filesystem that is being written netblk meets Busy sooner. netblk's queue
+  in front of it is what absorbs a burst.
 - IPv4, and no fragments -- there is no reassembly, and a datagram is never
   bigger than the MTU anyway. Only datagrams to the NIC's own address are
   answered: no broadcast, no multicast.

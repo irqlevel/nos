@@ -272,6 +272,14 @@ arrive from any task on any CPU, several at once: what one needs exclusively
 sits behind a lock in the device. A buffer is whole sectors and never empty,
 and the device may DMA straight into it.
 `fn is_async(&self) -> bool { true }` adds `submit`/`kick`.
+`write_pieces`/`read_pieces` take a batch -- pieces of one `DmaBuffer`, each
+a page of it or the start of one (`block::Piece`), the table having checked
+every one -- and by default do them one after another through `write` and
+`read`. A driver that can have several in flight overrides them, as NVMe and
+virtio-blk do: on the waiters its one-I/O path already has, which live as
+long as the device, so no completion can outlive what it touches -- and it
+returns only once every piece is done or refused, the buffer being the
+caller's again only then.
 
 **A NIC** depends on the `net` crate and implements `net::NetDriver` with
 its rings as `type Tx` / `type Rx`.
