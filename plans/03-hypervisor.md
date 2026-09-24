@@ -102,6 +102,35 @@ And against **3.2 and 3.3**, under AMD-V -- the first two of the four demos:
   the host. `hv run <guest|all> [cpu]` runs them on a task of their own,
   bound to a CPU when asked; `hv-test.py` runs them all on the first and the
   last CPU.
+
+And the same two demos **under Intel VT-x**, brought up and debugged under
+nested KVM on the Intel dev box (`kvm_intel nested=1`, `-cpu host`), since
+TCG has no VMX to bring one up under slowly:
+
+- `hvarch::x86::vmx`: the VMCS reached only through `vmread`/`vmwrite` (field
+  encodings and the instructions, no `#[repr(C)]`); `Guest`, which keeps the
+  guest state in the AMD save-area shape as a shadow and syncs it into the
+  VMCS before an entry and back after, so the policy above is one set of
+  code; `HostRegs`, the host state the CPU restores on exit, captured on the
+  CPU the entry runs on; a `vmlaunch` stub; the controls written through
+  `adjust` against the `IA32_VMX_*_CTLS` allowed-0/allowed-1 MSRs; EPT built
+  from the host, only growing, as the nested table is; and the exits decoded
+  into the same neutral `Exit` the AMD side produces. The VMCS is `vmclear`ed
+  on the first entry (not at construction, where VMX may be off) and after
+  every exit, so a `vmlaunch` from the clear state is always valid and no
+  VMCS is ever current on two CPUs -- which is what lets a guest's task move
+  CPU, the AMD VMCB, plain memory, never having had the problem.
+- `hv`: `Backend`, the enum the run loop and the guests reach either vcpu
+  through without an `svm` or a `vmx` in them; `vmx::Vcpu`, the Intel side's
+  policy and exit decoder; `ept`, the EPT arena. `GuestMemory` builds a
+  nested page table or an EPT by the machine's vendor.
+- The nine built-in guests all run under VT-x too, on the first CPU and the
+  last: `hypercall`'s `vmmcall` opcode is patched to `vmcall` (AMD's is a
+  `#UD` on Intel), and `refused` and `asid`, which test AMD-only mechanisms,
+  have a VMX form -- the CPU refusing a non-canonical guest RIP, and three
+  VMs kept apart by their EPTs. `hv-test.py` uses KVM VT-x on an Intel host,
+  KVM AMD-V on an AMD host, and TCG AMD-V otherwise, so both backends are
+  gated.
 - Found on the way: QEMU's TCG before 9.2 does not translate an unpaged
   guest's addresses through the nested table -- a real-mode guest there
   runs out of host memory -- which is why every guest starts paged.
@@ -157,15 +186,14 @@ the way, the 8250's answer to the cursor query became the cursor's real
 column (it said 80, and BusyBox wrapped what was typed) from a buffer of its
 own (the old queue grew with every query a guest never read).
 
-Before the first VMX guest, one change outside the hypervisor: the boot path
-has to set `CR0.NE` on every CPU. VMX requires it, the APs come out of INIT
-without it and nothing sets it, so on the EX44 and the Dell `hv on` refuses
-today with `HostState` -- by design, since `vmxon` would fault rather than
-fail. The kernel has no x87 code for NE to affect (the C++ is built with
-`-mno-80387`, the Rust is soft-float), so the change is one bit beside
-`EnableWxSupport`'s WP; it goes in with the VMX backend, where a guest can
-show it working. [`docs/hypervisor.md`](../docs/hypervisor.md) has the
-detail.
+One change outside the hypervisor came with the first VMX guest: the boot
+path sets `CR0.NE` on every CPU. VMX requires it, and the APs come out of
+INIT without it, so without the change `hv on` refused with `HostState`
+rather than let `vmxon` fault. The kernel has no x87 code for NE to affect
+(the C++ is built with `-mno-80387`, the Rust is soft-float), so it is one
+bit in `boot64.asm`'s `enable_paging`, on the BSP and every AP, beside where
+it clears CD/NW after INIT. `hv info` now reads `host CR0/CR4 yes` on each.
+[`docs/hypervisor.md`](../docs/hypervisor.md) has the detail.
 
 ## Choose VMX vs SVM based on the dev environment
 

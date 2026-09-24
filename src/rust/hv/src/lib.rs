@@ -35,7 +35,11 @@ mod devices;
 #[cfg(target_arch = "x86_64")]
 mod npt;
 #[cfg(target_arch = "x86_64")]
+mod ept;
+#[cfg(target_arch = "x86_64")]
 pub mod svm;
+#[cfg(target_arch = "x86_64")]
+pub mod vmx;
 #[cfg(target_arch = "x86_64")]
 pub mod vm;
 #[cfg(target_arch = "x86_64")]

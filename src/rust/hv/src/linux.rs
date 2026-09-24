@@ -19,7 +19,8 @@
 use hvarch::{Error, Result};
 
 use crate::memory::GuestMemory;
-use crate::svm::{LongMode, Vcpu};
+use crate::svm::LongMode;
+use crate::vm::Backend;
 
 /* Offsets into the setup header / boot_params (they share a layout from
  * 0x1f1 on). From boot.rst and arch/x86/include/uapi/asm/bootparam.h. */
@@ -352,7 +353,7 @@ fn write_gdt(m: &mut GuestMemory) -> Result<()> {
 /// Put the vCPU in the state the 64-bit entry expects: long mode at CPL 0,
 /// the flat __BOOT_CS/__BOOT_DS segments, the guest's own page table and
 /// GDT, `RIP` at the kernel's entry and `RSI` at the zero page.
-pub fn set_entry(vcpu: &mut Vcpu, layout: &Layout) {
+pub fn set_entry(vcpu: &mut Backend, layout: &Layout) {
     vcpu.long_mode(&LongMode {
         entry: layout.kernel_addr + ENTRY64_OFFSET,
         stack: STACK,

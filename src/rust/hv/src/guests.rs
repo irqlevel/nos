@@ -531,6 +531,15 @@ fn asid_check(machine: &Machine, tally: &mut Tally) -> core::result::Result<Stri
     asid_found(&c, 2)?;
     let given = c.vcpu().asid();
 
+    /* VMX runs with VPID off, so there is no ASID to hand out or reuse -- the
+     * TLB is flushed on every transition, and each guest's own EPT is what
+     * keeps its memory its own. The isolation the three VMs just showed is
+     * the whole of what this check can say there; the generation machinery
+     * below is the AMD side's. */
+    if machine.ext() == Ok(hvarch::Ext::Vmx) {
+        return Ok(String::from("each of three VMs read its own page through its own EPT; VMX runs with VPID off, so there is no ASID to reuse"));
+    }
+
     let (cpu_after, after) = hvarch::x86::svm::asid_generation().ok_or_else(|| String::from("no ASIDs on this CPU"))?;
     if tally.cpus != 1u64 << cpu || cpu_after != cpu {
         return Ok(String::from("each read its own page; on more than one CPU, so the end of a generation was not what C was given"));
@@ -898,8 +907,24 @@ const HYPERCALL_HLT: u64 = ENTRY + 0x12B;
 /// What the guest writes at 1 GiB, which its page table sends to 4 GiB.
 const HIGH_VALUE: u64 = 0x6E6F_7320_6869_6768;
 
+/// AMD's hypercall opcode, `vmmcall`, as it sits in `HYPERCALL_CODE`; on
+/// Intel the CPU has `vmcall` instead, and the AMD byte is an invalid opcode.
+const VMMCALL: [u8; 3] = [0x0F, 0x01, 0xD9];
+const VMCALL: [u8; 3] = [0x0F, 0x01, 0xC1];
+
 fn build_hypercall(vm: &mut Vm) -> Result<()> {
-    board(vm, HYPERCALL_CODE)?;
+    /* The one instruction whose encoding is the vendor's: patch the AMD
+     * hypercall to Intel's where the guest runs under VT-x. Both are three
+     * bytes, so nothing after it moves. */
+    let mut code = alloc::vec::Vec::new();
+    code.try_reserve_exact(HYPERCALL_CODE.len()).map_err(|_| hvarch::Error::NoMemory)?;
+    code.extend_from_slice(HYPERCALL_CODE);
+    if vm.is_vmx() {
+        if let Some(at) = code.windows(3).position(|w| w == VMMCALL) {
+            code[at..at + 3].copy_from_slice(&VMCALL);
+        }
+    }
+    board(vm, &code)?;
     vm.memory_mut().add(HIGH, kcore::consts::PAGE_SIZE as u64)
 }
 
@@ -1024,13 +1049,29 @@ fn check_triple(_vm: &Vm, r: &Run) -> core::result::Result<String, String> {
 
 fn build_refused(vm: &mut Vm) -> Result<()> {
     board(vm, SPIN_CODE)?;
-    /* Not-write-through without cache-disable: a combination the manual
-     * lists among the ones `vmrun` refuses. */
-    vm.vcpu_mut().save_mut().cr0 |= crate::svm::CR0_NW;
+    if vm.is_vmx() {
+        /* VMX has no software pre-check to catch a CR0 combination -- it is
+         * the CPU that refuses a guest, at entry, for invalid state. A
+         * non-canonical guest RIP is such a state in a 64-bit guest: VM
+         * entry fails and reports it, rather than running. */
+        vm.vcpu_mut().save_mut().rip = 0x8000_0000_0000_0000;
+    } else {
+        /* Not-write-through without cache-disable: a combination the manual
+         * lists among the ones `vmrun` refuses, caught by the software check
+         * before the CPU ever sees the VMCB. */
+        vm.vcpu_mut().save_mut().cr0 |= crate::svm::CR0_NW;
+    }
     Ok(())
 }
 
-fn check_refused(_vm: &Vm, r: &Run) -> core::result::Result<String, String> {
+fn check_refused(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
+    if vm.is_vmx() {
+        return match r.stop {
+            Stop::Invalid => Ok(String::from(
+                "the CPU refused the VMCS at entry for invalid guest state, reported rather than run")),
+            _ => Err(String::from("it was not refused for the state it breaks")),
+        };
+    }
     match r.stop {
         Stop::Refused(Refusal::Vmcb(rule)) if rule.contains("CR0.NW") && r.cpus == 0 => {
             Ok(String::from("the VMCB never reached the CPU, and the refusal named the rule"))

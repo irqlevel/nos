@@ -10,7 +10,49 @@ use kcore::frame::Frame;
 use kcore::pod::{self, Pod};
 
 #[cfg(target_arch = "x86_64")]
+use crate::ept::Ept;
+#[cfg(target_arch = "x86_64")]
 use crate::npt::Npt;
+#[cfg(target_arch = "x86_64")]
+use hvarch::Vendor;
+
+/// The second-level translation, whichever the machine has: AMD's nested
+/// page table or Intel's extended one. Both are built the same way -- from
+/// the host, only growing -- and offer the same handful of operations, so
+/// the memory above them is one set of code over an enum, not two.
+#[cfg(target_arch = "x86_64")]
+enum SecondLevel {
+    Npt(Npt),
+    Ept(Ept),
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SecondLevel {
+    fn prepare(&mut self, gpa: u64, size: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.prepare(gpa, size),
+            SecondLevel::Ept(t) => t.prepare(gpa, size),
+        }
+    }
+    fn set(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.set(gpa, hpa),
+            SecondLevel::Ept(t) => t.set(gpa, hpa),
+        }
+    }
+    fn set_ro(&mut self, gpa: u64, hpa: u64) -> Result<()> {
+        match self {
+            SecondLevel::Npt(t) => t.set_ro(gpa, hpa),
+            SecondLevel::Ept(t) => t.set_ro(gpa, hpa),
+        }
+    }
+    fn nested(&self) -> hvarch::x86::svm::Nested {
+        match self {
+            SecondLevel::Npt(t) => t.nested(),
+            SecondLevel::Ept(t) => t.nested(),
+        }
+    }
+}
 
 const PAGE: u64 = PAGE_SIZE as u64;
 /// Frames are kept in runs of this many, so that no one allocation of the
@@ -52,7 +94,7 @@ pub struct GuestMemory {
     /* Before the regions and the absent page, so that it is dropped first:
      * the table goes before the pages it maps are back on the free list. */
     #[cfg(target_arch = "x86_64")]
-    npt: Npt,
+    table: SecondLevel,
     regions: Vec<Region>,
     /// A page of all ones, the guest's reads of an absent device: made the
     /// first time one is needed, mapped read-only wherever it is.
@@ -88,14 +130,30 @@ impl Region {
 }
 
 impl GuestMemory {
-    /// No memory at all, and a nested table that maps nothing.
-    pub fn new() -> Result<Self> {
+    /// No memory at all, and a second-level table -- of the kind the
+    /// machine's `vendor` calls for -- that maps nothing.
+    #[cfg(target_arch = "x86_64")]
+    pub fn new(vendor: Vendor) -> Result<Self> {
+        let table = match vendor {
+            Vendor::Svm => SecondLevel::Npt(Npt::new()?),
+            Vendor::Vmx => SecondLevel::Ept(Ept::new()?),
+            _ => return Err(Error::NotImplemented),
+        };
         Ok(Self {
-            #[cfg(target_arch = "x86_64")]
-            npt: Npt::new()?,
+            table,
             regions: Vec::new(),
             #[cfg(target_arch = "x86_64")]
             absent: None,
+            absent_at: Vec::new(),
+        })
+    }
+
+    /// No memory, and no second-level table: this architecture runs no
+    /// guests yet.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            regions: Vec::new(),
             absent_at: Vec::new(),
         })
     }
@@ -134,7 +192,7 @@ impl GuestMemory {
         /* The tables next, which is all that can fail for want of memory:
          * a failure there leaves empty tables and no page mapped. */
         #[cfg(target_arch = "x86_64")]
-        self.npt.prepare(base, size)?;
+        self.table.prepare(base, size)?;
 
         self.regions.try_reserve(1).map_err(|_| Error::NoMemory)?;
         self.regions.push(Region { base, size, runs });
@@ -146,7 +204,7 @@ impl GuestMemory {
             let region = self.regions.last().expect("just pushed");
             let mut gpa = base;
             for frame in region.runs.iter().flatten() {
-                self.npt.set(gpa, frame.phys())?;
+                self.table.set(gpa, frame.phys())?;
                 gpa += PAGE;
             }
         }
@@ -189,8 +247,8 @@ impl GuestMemory {
         }
         let hpa = self.absent.as_ref().map(|f| f.phys()).ok_or(Error::NoMemory)?;
         self.absent_at.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        self.npt.prepare(page, PAGE)?;
-        self.npt.set_ro(page, hpa)?;
+        self.table.prepare(page, PAGE)?;
+        self.table.set_ro(page, hpa)?;
         self.absent_at.push(page);
         Ok(())
     }
@@ -257,6 +315,6 @@ impl GuestMemory {
     /// physical address through, and what the TLB may keep of it.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn nested(&self) -> hvarch::x86::svm::Nested {
-        self.npt.nested()
+        self.table.nested()
     }
 }

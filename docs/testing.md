@@ -348,6 +348,21 @@ one of the first two had, after a generation ended, and each read its own
 page. The unload that follows, and the load after it, are then of a
 hypervisor that has run guests on those CPUs.
 
+Which backend it exercises is the host's. Under KVM, `-cpu host` gives the
+guest the host CPU's own extension -- AMD-V on an AMD host, Intel VT-x on an
+Intel one, nested, since nos is itself a KVM guest -- and TCG's `-cpu max`
+gives AMD-V where there is no KVM, TCG having no VMX at all. So the Intel
+backend is reached only through KVM and the AMD one three ways, and between
+them both are covered. Two guests test a mechanism only one vendor has:
+AMD-V's software VMCB check (`refused`) and its ASID recycling (`asid`).
+Under VT-x the CPU refuses a bad VMCS itself and there is no ASID (VPID is
+off), so those two check the Intel equivalent instead -- a non-canonical
+guest RIP refused at entry, and three VMs isolated by their own EPTs -- with
+the expected output chosen from which extension `hv info` names. It was the
+`refused` guest, run before any `hv on`, that first caught a VMX bug the
+standalone runs could not: a VMCS `vmclear`ed at construction, where VMX may
+be off, faults, so the clear had to move to the first entry.
+
 What `asid` is for -- a translation a reused ASID should not have had --
 can only show on a CPU that keeps translations between entries: TCG flushes
 its own on every `vmrun`. Under TCG it checks the allocator's side, that the

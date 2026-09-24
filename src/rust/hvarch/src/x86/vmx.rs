@@ -290,3 +290,777 @@ pub unsafe fn disable() {
 pub fn enabled() -> bool {
     cpu::read_cr4() & CR4_VMXE != 0
 }
+
+pub mod vmcs;
+
+use core::mem::offset_of;
+use core::sync::atomic::AtomicU64;
+
+use super::svm::{FxArea, GuestRegs, Kick, NotRun, VECTOR_AC, VECTOR_DB, VECTOR_MC};
+use super::svm::vmcb::{Save, Segment};
+
+/* CR0 bits VMX may force in the guest; named here so `write_guest_state` can
+ * lift them out of the fixed set when unrestricted guest relaxes them. */
+const CR0_PE: u64 = 1 << 0;
+const CR0_PG: u64 = 1 << 31;
+
+/// XCR0 while a guest runs: x87 alone, as under AMD-V. `vmlaunch` does not
+/// switch XCR0 and the guest is given no XSAVE, so nothing of another
+/// guest's extended state is reachable.
+const GUEST_XCR0: u64 = 1;
+/// CR4.LA57: five levels of paging (see [`NotRun::FiveLevelPaging`]).
+const CR4_LA57: u64 = 1 << 12;
+/// CR4.VMXE, which VMX forces set in the guest's CR0/CR4 fixed bits even
+/// though the guest is told it has no VMX: masked so the guest reads 0.
+const CR4_VMXE_BIT: u64 = 1 << 13;
+
+/// The guest's general-purpose registers as the launch stub moves them: all
+/// of them but RSP, which is a VMCS field. RAX is here too -- VMX, unlike
+/// AMD-V, keeps no guest RAX of its own.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Gpr {
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+}
+
+/// The host state the CPU restores on a VM exit, as this CPU has it now:
+/// captured on the CPU the entry runs on, because every field of it is that
+/// CPU's own -- its GS base is where its per-CPU data is, its TR its own
+/// task register. Written into the VMCS host area before the entry.
+struct HostRegs {
+    cr0: u64,
+    cr3: u64,
+    cr4: u64,
+    cs: u16,
+    ss: u16,
+    ds: u16,
+    es: u16,
+    fs: u16,
+    gs: u16,
+    tr: u16,
+    fs_base: u64,
+    gs_base: u64,
+    tr_base: u64,
+    gdt_base: u64,
+    idt_base: u64,
+    efer: u64,
+    pat: u64,
+}
+
+/// Read a 16-byte system descriptor (a 64-bit TSS or LDT) out of the GDT and
+/// return its base. The GDT is the host's own, mapped and readable; `sel` is
+/// the selector, its index the entry.
+unsafe fn descriptor_base(gdt_base: u64, sel: u16) -> u64 {
+    let entry = gdt_base + (sel & !0x7) as u64;
+    /* Bytes: base 15:0 at +2, 23:16 at +4, 31:24 at +7, 63:32 at +8. */
+    let lo = unsafe { core::ptr::read_unaligned((entry + 2) as *const u16) } as u64;
+    let mid = unsafe { core::ptr::read_unaligned((entry + 4) as *const u8) } as u64;
+    let hi = unsafe { core::ptr::read_unaligned((entry + 7) as *const u8) } as u64;
+    let top = unsafe { core::ptr::read_unaligned((entry + 8) as *const u32) } as u64;
+    lo | (mid << 16) | (hi << 24) | (top << 32)
+}
+
+impl HostRegs {
+    /// Read every host field off the CPU this runs on.
+    fn capture() -> Self {
+        let (cs, ss, ds, es, fs, gs, tr): (u16, u16, u16, u16, u16, u16, u16);
+        unsafe {
+            core::arch::asm!(
+                "mov {cs:x}, cs", "mov {ss:x}, ss", "mov {ds:x}, ds",
+                "mov {es:x}, es", "mov {fs:x}, fs", "mov {gs:x}, gs",
+                "str {tr:x}",
+                cs = out(reg) cs, ss = out(reg) ss, ds = out(reg) ds,
+                es = out(reg) es, fs = out(reg) fs, gs = out(reg) gs,
+                tr = out(reg) tr, options(nomem, nostack, preserves_flags));
+        }
+        let mut gdtr = [0u8; 10];
+        let mut idtr = [0u8; 10];
+        unsafe {
+            core::arch::asm!("sgdt [{}]", in(reg) gdtr.as_mut_ptr(), options(nostack, preserves_flags));
+            core::arch::asm!("sidt [{}]", in(reg) idtr.as_mut_ptr(), options(nostack, preserves_flags));
+        }
+        let gdt_base = u64::from_le_bytes(gdtr[2..10].try_into().unwrap());
+        let idt_base = u64::from_le_bytes(idtr[2..10].try_into().unwrap());
+        const MSR_FS_BASE: u32 = 0xC000_0100;
+        const MSR_GS_BASE: u32 = 0xC000_0101;
+        const MSR_PAT: u32 = 0x277;
+        Self {
+            cr0: cpu::read_cr0(),
+            cr3: cpu::read_cr3(),
+            cr4: cpu::read_cr4(),
+            cs, ss, ds, es, fs, gs, tr,
+            fs_base: unsafe { cpu::rdmsr(MSR_FS_BASE) },
+            gs_base: unsafe { cpu::rdmsr(MSR_GS_BASE) },
+            tr_base: unsafe { descriptor_base(gdt_base, tr) },
+            gdt_base,
+            idt_base,
+            efer: unsafe { cpu::rdmsr(super::svm::MSR_EFER) },
+            pat: unsafe { cpu::rdmsr(MSR_PAT) },
+        }
+    }
+
+    /// Into the VMCS current on this CPU. A host selector's RPL and table
+    /// bits must be clear (`& !0x7`), and CS and TR must not be null.
+    unsafe fn write(&self) {
+        use vmcs::*;
+        unsafe {
+            vmwrite(HOST_CR0, self.cr0);
+            vmwrite(HOST_CR3, self.cr3);
+            vmwrite(HOST_CR4, self.cr4);
+            vmwrite(HOST_CS_SEL, (self.cs & !0x7) as u64);
+            vmwrite(HOST_SS_SEL, (self.ss & !0x7) as u64);
+            vmwrite(HOST_DS_SEL, (self.ds & !0x7) as u64);
+            vmwrite(HOST_ES_SEL, (self.es & !0x7) as u64);
+            vmwrite(HOST_FS_SEL, (self.fs & !0x7) as u64);
+            vmwrite(HOST_GS_SEL, (self.gs & !0x7) as u64);
+            vmwrite(HOST_TR_SEL, (self.tr & !0x7) as u64);
+            vmwrite(HOST_FS_BASE, self.fs_base);
+            vmwrite(HOST_GS_BASE, self.gs_base);
+            vmwrite(HOST_TR_BASE, self.tr_base);
+            vmwrite(HOST_GDTR_BASE, self.gdt_base);
+            vmwrite(HOST_IDTR_BASE, self.idt_base);
+            vmwrite(HOST_IA32_EFER, self.efer);
+            vmwrite(HOST_IA32_PAT, self.pat);
+            /* nos enters the kernel by SYSCALL, not SYSENTER: the host's
+             * SYSENTER MSRs are 0, and the CPU need not restore junk. */
+            vmwrite(HOST_IA32_SYSENTER_CS, 0);
+            vmwrite(HOST_SYSENTER_ESP, 0);
+            vmwrite(HOST_SYSENTER_EIP, 0);
+        }
+    }
+}
+
+/// A guest's CPU as VT-x keeps it: one VMCS, a shadow of the guest state
+/// that policy above reads and writes as though it were a VMCB's save area
+/// (`Save`), the registers the launch stub moves, and the x87/SSE state
+/// `vmlaunch` does not switch.
+pub struct Guest {
+    vmcs: vmcs::VmcsPage,
+    /// The guest state, kept in the same shape as an AMD-V save area so the
+    /// policy layer is one set of code: synced to the VMCS before an entry
+    /// and read back from it after.
+    save: Save,
+    regs: GuestRegs,
+    /// One element, on the heap: a `Vec` because it can be made fallibly.
+    fx: alloc::vec::Vec<FxArea>,
+    xsave: bool,
+
+    /* Control values, decided once from the CPU's capabilities. */
+    basic: u64,
+    pin: u32,
+    proc1: u32,
+    proc2: u32,
+    exit_ctls: u32,
+    entry_ctls: u32,
+    exceptions: u32,
+    unrestricted: bool,
+    cr0_fixed0: u64,
+    cr0_fixed1: u64,
+    cr4_fixed0: u64,
+    cr4_fixed1: u64,
+
+    /// The VMCS has been `vmclear`ed at least once -- done on the first
+    /// entry, where VMX is known on, not at creation, where it may be off.
+    cleared: bool,
+    /// The static VMCS fields (controls, EPTP, masks) have been written.
+    configured: bool,
+    /// The CPU whose host state is in the VMCS, or -1: rewritten when the
+    /// guest's task has moved.
+    host_cpu: i32,
+    /// An event to inject on the next entry, in VMENTRY_INTR_INFO's format,
+    /// with its error code; consumed by the entry.
+    inject: u64,
+    inject_errcode: u32,
+    /// Ask the CPU to exit the moment the guest could take an interrupt: the
+    /// interrupt-window control, toggled entry to entry.
+    irq_window: bool,
+
+    /* What the last exit wrote, read out before VMCLEAR. */
+    exit_reason: u32,
+    exit_qual: u64,
+    exit_intr_info: u32,
+    exit_intr_errcode: u32,
+    exit_instr_len: u32,
+    idt_vectoring_info: u32,
+    idt_vectoring_errcode: u32,
+    guest_phys: u64,
+    interruptibility: u32,
+    /// A VMLAUNCH that failed outright (VMfail), with the instruction error.
+    vm_instruction_error: u32,
+    entry_failed: bool,
+}
+
+impl Guest {
+    /// A guest CPU on a machine whose VMX `caps` say what its controls may
+    /// be. `exceptions` is the vector bitmap the guest stops at, over the
+    /// ones the host always takes.
+    pub fn new(caps: &Caps, exceptions: u32) -> Result<Self> {
+        let mut fx = alloc::vec::Vec::new();
+        fx.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
+        fx.push(FxArea::reset());
+        let vmcs = vmcs::VmcsPage::new(caps.revision())?;
+        let unrestricted = caps.has(SEC_UNRESTRICTED_GUEST);
+
+        Ok(Self {
+            vmcs,
+            save: unsafe { core::mem::zeroed() },
+            regs: GuestRegs::default(),
+            fx,
+            xsave: cpu::has_xsave(),
+            basic: caps.basic,
+            pin: 0,
+            proc1: 0,
+            proc2: 0,
+            exit_ctls: 0,
+            entry_ctls: 0,
+            exceptions,
+            unrestricted,
+            cr0_fixed0: caps.cr0_fixed0,
+            cr0_fixed1: caps.cr0_fixed1,
+            cr4_fixed0: caps.cr4_fixed0,
+            cr4_fixed1: caps.cr4_fixed1,
+            cleared: false,
+            configured: false,
+            host_cpu: -1,
+            inject: 0,
+            inject_errcode: 0,
+            irq_window: false,
+            exit_reason: 0,
+            exit_qual: 0,
+            exit_intr_info: 0,
+            exit_intr_errcode: 0,
+            exit_instr_len: 0,
+            idt_vectoring_info: 0,
+            idt_vectoring_errcode: 0,
+            guest_phys: 0,
+            interruptibility: 0,
+            vm_instruction_error: 0,
+            entry_failed: false,
+        })
+    }
+
+    pub fn save(&self) -> &Save {
+        &self.save
+    }
+    pub fn save_mut(&mut self) -> &mut Save {
+        &mut self.save
+    }
+    pub fn regs(&self) -> &GuestRegs {
+        &self.regs
+    }
+    pub fn regs_mut(&mut self) -> &mut GuestRegs {
+        &mut self.regs
+    }
+    pub fn save_and_regs_mut(&mut self) -> (&mut Save, &mut GuestRegs) {
+        (&mut self.save, &mut self.regs)
+    }
+    pub fn fx(&self) -> &FxArea {
+        &self.fx[0]
+    }
+
+    /* The last exit, for the policy layer's decoder and its reports. */
+    pub fn exit_reason(&self) -> u32 {
+        self.exit_reason
+    }
+    pub fn exit_qualification(&self) -> u64 {
+        self.exit_qual
+    }
+    pub fn exit_intr_info(&self) -> u32 {
+        self.exit_intr_info
+    }
+    pub fn exit_intr_errcode(&self) -> u32 {
+        self.exit_intr_errcode
+    }
+    pub fn exit_instr_len(&self) -> u32 {
+        self.exit_instr_len
+    }
+    pub fn idt_vectoring_info(&self) -> u32 {
+        self.idt_vectoring_info
+    }
+    pub fn idt_vectoring_errcode(&self) -> u32 {
+        self.idt_vectoring_errcode
+    }
+    pub fn guest_physical_address(&self) -> u64 {
+        self.guest_phys
+    }
+    pub fn interruptibility(&self) -> u32 {
+        self.interruptibility
+    }
+    pub fn vm_instruction_error(&self) -> u32 {
+        self.vm_instruction_error
+    }
+    pub fn entry_failed(&self) -> bool {
+        self.entry_failed
+    }
+
+    /// Queue an event for injection on the next entry: `info` in
+    /// VMENTRY_INTR_INFO's format, `errcode` the error code when its
+    /// deliver-error bit is set.
+    pub fn set_inject(&mut self, info: u32, errcode: u32) {
+        self.inject = info as u64;
+        self.inject_errcode = errcode;
+    }
+    pub fn clear_inject(&mut self) {
+        self.inject = 0;
+    }
+    pub fn inject_valid(&self) -> bool {
+        self.inject as u32 & vmcs::intr::VALID != 0
+    }
+    pub fn set_interruptibility(&mut self, bits: u32) {
+        self.interruptibility = bits;
+    }
+
+    /// Whether to exit as soon as the guest can take an interrupt.
+    pub fn set_irq_window(&mut self, on: bool) {
+        self.irq_window = on;
+    }
+
+    /// Compute and record the control values this CPU allows, once.
+    fn decide_controls(&mut self, basic: u64) {
+        use vmcs::*;
+        self.pin = adjust(
+            PIN_EXTINT_EXITING | PIN_NMI_EXITING,
+            ctls_msr(basic, MSR_VMX_PINBASED_CTLS, MSR_VMX_TRUE_PINBASED_CTLS),
+        );
+        self.proc1 = adjust(
+            PROC_HLT_EXITING | PROC_UNCOND_IO_EXITING | PROC_SECONDARY_CTLS,
+            ctls_msr(basic, MSR_VMX_PROCBASED_CTLS, MSR_VMX_TRUE_PROCBASED_CTLS),
+        );
+        let mut want2 = PROC2_ENABLE_EPT;
+        if self.unrestricted {
+            want2 |= PROC2_UNRESTRICTED_GUEST;
+        }
+        self.proc2 = adjust(want2, MSR_VMX_PROCBASED_CTLS2);
+        self.exit_ctls = adjust(
+            EXIT_HOST_ADDR_SPACE_SIZE | EXIT_LOAD_IA32_EFER | EXIT_SAVE_IA32_EFER
+                | EXIT_LOAD_IA32_PAT | EXIT_SAVE_IA32_PAT,
+            ctls_msr(basic, MSR_VMX_EXIT_CTLS, MSR_VMX_TRUE_EXIT_CTLS),
+        );
+        self.entry_ctls = adjust(
+            ENTRY_IA32E_MODE_GUEST | ENTRY_LOAD_IA32_EFER | ENTRY_LOAD_IA32_PAT,
+            ctls_msr(basic, MSR_VMX_ENTRY_CTLS, MSR_VMX_TRUE_ENTRY_CTLS),
+        );
+    }
+
+    /// Write the fields that do not change entry to entry: the controls, the
+    /// exception bitmap, the EPT pointer, the CR0/CR4 masks and shadows, and
+    /// the VMCS link pointer. The VMCS is current on this CPU.
+    unsafe fn configure(&mut self, eptp: u64) {
+        use vmcs::*;
+        let basic = self.basic;
+        self.decide_controls(basic);
+        unsafe {
+            vmwrite(PIN_BASED_CTLS, self.pin as u64);
+            vmwrite(PROC_BASED_CTLS, self.proc1 as u64);
+            vmwrite(PROC_BASED_CTLS2, self.proc2 as u64);
+            vmwrite(VMEXIT_CTLS, self.exit_ctls as u64);
+            vmwrite(VMENTRY_CTLS, self.entry_ctls as u64);
+            /* Intercept #DB, #AC and #MC always -- the same delivery-loop
+             * denial-of-service the AMD side guards against -- over whatever
+             * else the policy asked. */
+            let host_exc = (1u32 << VECTOR_DB) | (1u32 << VECTOR_AC) | (1u32 << VECTOR_MC);
+            vmwrite(EXCEPTION_BITMAP, (self.exceptions | host_exc) as u64);
+            vmwrite(PAGE_FAULT_ERRCODE_MASK, 0);
+            vmwrite(PAGE_FAULT_ERRCODE_MATCH, 0);
+            vmwrite(CR3_TARGET_COUNT, 0);
+            /* All MSR and I/O accesses exit: no bitmaps, so nothing the
+             * guest reads or writes reaches the host's real MSRs or ports. */
+            vmwrite(EPT_POINTER, eptp);
+            vmwrite(VMCS_LINK_POINTER, u64::MAX);
+            vmwrite(VPID, 0);
+            vmwrite(VMENTRY_MSR_LOAD_COUNT, 0);
+            vmwrite(VMEXIT_MSR_LOAD_COUNT, 0);
+            vmwrite(VMEXIT_MSR_STORE_COUNT, 0);
+            vmwrite(TSC_OFFSET, 0);
+            /* The guest owns all of CR0 but for what VMX forces; CR4.VMXE is
+             * forced set in hardware but read as 0 by the guest, which is
+             * told it has no VMX. */
+            vmwrite(CR0_GUEST_HOST_MASK, 0);
+            vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE_BIT);
+            vmwrite(GUEST_IA32_DEBUGCTL, 0);
+        }
+        self.configured = true;
+    }
+
+    /// Sync the shadow guest state into the VMCS current on this CPU, before
+    /// an entry: every field the policy layer may have changed.
+    unsafe fn write_guest_state(&self) {
+        use vmcs::*;
+        let s = &self.save;
+        let seg = |sel_f: u32, base_f: u32, lim_f: u32, ar_f: u32, g: &Segment| unsafe {
+            vmwrite(sel_f, g.selector as u64);
+            vmwrite(base_f, g.base);
+            vmwrite(lim_f, g.limit as u64);
+            vmwrite(ar_f, ar_from_attrib(g.attrib) as u64);
+        };
+        unsafe {
+            /* CR0/CR4 with the bits VMX forces; with unrestricted guest, PE
+             * and PG are not forced, so a guest could run unpaged -- ours do
+             * not, but the fixed bits are applied honestly. */
+            let mut cr0_f0 = self.cr0_fixed0;
+            if self.unrestricted {
+                cr0_f0 &= !(CR0_PE | CR0_PG);
+            }
+            let guest_cr0 = (s.cr0 | cr0_f0) & self.cr0_fixed1;
+            let guest_cr4 = (s.cr4 | self.cr4_fixed0 | CR4_VMXE_BIT) & self.cr4_fixed1;
+            vmwrite(GUEST_CR0, guest_cr0);
+            vmwrite(CR0_READ_SHADOW, s.cr0);
+            vmwrite(GUEST_CR3, s.cr3);
+            vmwrite(GUEST_CR4, guest_cr4);
+            vmwrite(CR4_READ_SHADOW, s.cr4 & !CR4_VMXE_BIT);
+
+            seg(GUEST_CS_SEL, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR, &s.cs);
+            seg(GUEST_SS_SEL, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_AR, &s.ss);
+            seg(GUEST_DS_SEL, GUEST_DS_BASE, GUEST_DS_LIMIT, GUEST_DS_AR, &s.ds);
+            seg(GUEST_ES_SEL, GUEST_ES_BASE, GUEST_ES_LIMIT, GUEST_ES_AR, &s.es);
+            seg(GUEST_FS_SEL, GUEST_FS_BASE, GUEST_FS_LIMIT, GUEST_FS_AR, &s.fs);
+            seg(GUEST_GS_SEL, GUEST_GS_BASE, GUEST_GS_LIMIT, GUEST_GS_AR, &s.gs);
+            seg(GUEST_LDTR_SEL, GUEST_LDTR_BASE, GUEST_LDTR_LIMIT, GUEST_LDTR_AR, &s.ldtr);
+            seg(GUEST_TR_SEL, GUEST_TR_BASE, GUEST_TR_LIMIT, GUEST_TR_AR, &s.tr);
+            vmwrite(GUEST_GDTR_BASE, s.gdtr.base);
+            vmwrite(GUEST_GDTR_LIMIT, s.gdtr.limit as u64);
+            vmwrite(GUEST_IDTR_BASE, s.idtr.base);
+            vmwrite(GUEST_IDTR_LIMIT, s.idtr.limit as u64);
+
+            vmwrite(GUEST_RSP, s.rsp);
+            vmwrite(GUEST_RIP, s.rip);
+            vmwrite(GUEST_RFLAGS, s.rflags);
+            vmwrite(GUEST_DR7, s.dr7);
+            vmwrite(GUEST_IA32_EFER, s.efer & !super::svm::EFER_SVME);
+            vmwrite(GUEST_IA32_PAT, s.g_pat);
+            vmwrite(GUEST_SYSENTER_CS, s.sysenter_cs);
+            vmwrite(GUEST_SYSENTER_ESP, s.sysenter_esp);
+            vmwrite(GUEST_SYSENTER_EIP, s.sysenter_eip);
+            vmwrite(GUEST_ACTIVITY_STATE, 0);
+            vmwrite(GUEST_INTERRUPTIBILITY, self.interruptibility as u64);
+            vmwrite(vmcs::GUEST_PENDING_DBG, 0);
+        }
+    }
+
+    /// Read the guest state the policy layer reads back out of the VMCS into
+    /// the shadow, after an exit.
+    unsafe fn read_guest_state(&mut self) {
+        use vmcs::*;
+        let s = &mut self.save;
+        let rd = |sel_f: u32, base_f: u32, lim_f: u32, ar_f: u32, g: &mut Segment| unsafe {
+            g.selector = vmread(sel_f) as u16;
+            g.base = vmread(base_f);
+            g.limit = vmread(lim_f) as u32;
+            g.attrib = attrib_from_ar(vmread(ar_f) as u32);
+        };
+        unsafe {
+            s.cr0 = vmread(GUEST_CR0);
+            s.cr3 = vmread(GUEST_CR3);
+            s.cr4 = vmread(GUEST_CR4) & !CR4_VMXE_BIT;
+            rd(GUEST_CS_SEL, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR, &mut s.cs);
+            rd(GUEST_SS_SEL, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_AR, &mut s.ss);
+            rd(GUEST_DS_SEL, GUEST_DS_BASE, GUEST_DS_LIMIT, GUEST_DS_AR, &mut s.ds);
+            rd(GUEST_ES_SEL, GUEST_ES_BASE, GUEST_ES_LIMIT, GUEST_ES_AR, &mut s.es);
+            rd(GUEST_FS_SEL, GUEST_FS_BASE, GUEST_FS_LIMIT, GUEST_FS_AR, &mut s.fs);
+            rd(GUEST_GS_SEL, GUEST_GS_BASE, GUEST_GS_LIMIT, GUEST_GS_AR, &mut s.gs);
+            rd(GUEST_LDTR_SEL, GUEST_LDTR_BASE, GUEST_LDTR_LIMIT, GUEST_LDTR_AR, &mut s.ldtr);
+            rd(GUEST_TR_SEL, GUEST_TR_BASE, GUEST_TR_LIMIT, GUEST_TR_AR, &mut s.tr);
+            s.gdtr.base = vmread(GUEST_GDTR_BASE);
+            s.gdtr.limit = vmread(GUEST_GDTR_LIMIT) as u32;
+            s.idtr.base = vmread(GUEST_IDTR_BASE);
+            s.idtr.limit = vmread(GUEST_IDTR_LIMIT) as u32;
+            s.rsp = vmread(GUEST_RSP);
+            s.rip = vmread(GUEST_RIP);
+            s.rflags = vmread(GUEST_RFLAGS);
+            s.efer = vmread(GUEST_IA32_EFER);
+            s.sysenter_cs = vmread(GUEST_SYSENTER_CS);
+            s.sysenter_esp = vmread(GUEST_SYSENTER_ESP);
+            s.sysenter_eip = vmread(GUEST_SYSENTER_EIP);
+            s.cpl = ((vmread(GUEST_SS_AR) >> 5) & 0x3) as u8;
+            self.interruptibility = vmread(GUEST_INTERRUPTIBILITY) as u32;
+        }
+    }
+
+    /// Read the exit information the decoder needs, after an exit.
+    unsafe fn read_exit(&mut self) {
+        use vmcs::*;
+        unsafe {
+            self.exit_reason = vmread(EXIT_REASON) as u32;
+            self.exit_qual = vmread(EXIT_QUALIFICATION);
+            self.exit_intr_info = vmread(VMEXIT_INTR_INFO) as u32;
+            self.exit_intr_errcode = vmread(VMEXIT_INTR_ERRCODE) as u32;
+            self.exit_instr_len = vmread(VMEXIT_INSTRUCTION_LEN) as u32;
+            self.idt_vectoring_info = vmread(IDT_VECTORING_INFO) as u32;
+            self.idt_vectoring_errcode = vmread(IDT_VECTORING_ERRCODE) as u32;
+            self.guest_phys = vmread(GUEST_PHYSICAL_ADDRESS);
+        }
+    }
+
+    /// Enter the guest on the CPU this runs on and come back at its next
+    /// exit. `nested.root` is this guest's EPT pointer, already formed with
+    /// its memory type and walk length; the exit is read into this `Guest`,
+    /// for [`super`]'s decoder to turn into an exit reason.
+    ///
+    /// # Safety
+    /// `nested.root` names an EPT that maps nothing but memory given to this
+    /// guest, alive until this returns; `host_areas[cpu]` is 0 or the VMXON
+    /// region this CPU was given, and VMX is on for this CPU exactly when
+    /// that is non-zero. As [`super::svm::Guest::run`] for the kick.
+    pub unsafe fn run(
+        &mut self,
+        nested: super::svm::Nested,
+        host_areas: &[AtomicU64],
+        kick: Option<&Kick>,
+    ) -> core::result::Result<u32, NotRun> {
+        let vmcs_phys = self.vmcs.phys();
+        let xsave = self.xsave;
+        let fx: *mut FxArea = &mut self.fx[0];
+
+        /* Pinned to this CPU with interrupts off, so the CPU the checks
+         * see and the VMCS is made current on is the CPU `vmlaunch` runs on.
+         * Interrupts off first, then the CPU id -- the other order could
+         * read one CPU and run on another. */
+        let flags = kcore::cpu::irq_save();
+        let cpu = kcore::cpu::id();
+        let ran: core::result::Result<u32, NotRun> = (|| {
+            let expected = host_areas.get(cpu as usize).map_or(0, |a| a.load(core::sync::atomic::Ordering::Acquire));
+            if expected == 0 || !enabled() {
+                return Err(NotRun::Off { cpu });
+            }
+            if cpu::read_cr4() & CR4_LA57 != 0 {
+                return Err(NotRun::FiveLevelPaging { cpu });
+            }
+            if let Some(k) = kick {
+                if !k.entering(cpu) {
+                    return Err(NotRun::Kicked { cpu });
+                }
+            }
+
+            /* Make our VMCS current on this CPU. It was left in the clear
+             * state (VMCLEAR at creation, and after every exit), so this is
+             * a launch, never a resume -- which is what lets a guest's task
+             * move CPU between entries without a VMCS ever being current on
+             * two of them at once. */
+            /* The one-time clear the launch state needs, now that VMX is
+             * known on for this CPU. Every exit ends with a `vmclear` too, so
+             * the VMCS is left clear and never current on two CPUs at once. */
+            if !self.cleared {
+                unsafe { vmcs::vmclear(vmcs_phys) };
+                self.cleared = true;
+            }
+            if !unsafe { vmcs::vmptrld(vmcs_phys) } {
+                if let Some(k) = kick { k.left(); }
+                return Err(NotRun::Off { cpu });
+            }
+
+            if !self.configured {
+                unsafe { self.configure(nested.root) };
+            }
+            if self.host_cpu != cpu as i32 {
+                unsafe { HostRegs::capture().write() };
+                self.host_cpu = cpu as i32;
+            }
+            unsafe { self.write_guest_state() };
+            unsafe {
+                /* The interrupt-window control is dynamic: on only while the
+                 * policy is waiting to inject an IRQ the guest cannot take
+                 * yet. One vmwrite an entry over the configured value. */
+                let proc1 = self.proc1
+                    | if self.irq_window { vmcs::PROC_INTR_WINDOW_EXITING } else { 0 };
+                vmcs::vmwrite(vmcs::PROC_BASED_CTLS, proc1 as u64);
+                vmcs::vmwrite(vmcs::VMENTRY_INTR_INFO, self.inject);
+                vmcs::vmwrite(vmcs::VMENTRY_EXCEPTION_ERRCODE, self.inject_errcode as u64);
+                if self.inject as u32 & vmcs::intr::VALID != 0 {
+                    vmcs::vmwrite(vmcs::VMENTRY_INSTRUCTION_LEN, self.exit_instr_len as u64);
+                }
+            }
+
+            /* The x87/SSE state and XCR0 are the guest's from here to the
+             * FXSAVE after the exit, exactly as under AMD-V: `vmlaunch` does
+             * not switch them. CR2 is the guest's likewise -- VMX keeps no
+             * guest CR2 -- so save the host's and restore it after. */
+            let host_cr4 = cpu::read_cr4();
+            let window = host_cr4 | cpu::CR4_OSFXSR | if xsave { cpu::CR4_OSXSAVE } else { 0 };
+            unsafe { cpu::write_cr4(window) };
+            let host_xcr0 = if xsave { unsafe { cpu::xgetbv0() } } else { GUEST_XCR0 };
+            let switch_xcr0 = host_xcr0 != GUEST_XCR0;
+            if switch_xcr0 {
+                unsafe { cpu::xsetbv0(GUEST_XCR0) };
+            }
+            unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
+            let host_cr2 = cpu::read_cr2();
+            unsafe { cpu::write_cr2(self.save.cr2) };
+
+            /* GPRs into the block the stub moves, RAX included. */
+            let mut gpr = Gpr {
+                rax: self.save.rax,
+                rbx: self.regs.rbx, rcx: self.regs.rcx, rdx: self.regs.rdx,
+                rsi: self.regs.rsi, rdi: self.regs.rdi, rbp: self.regs.rbp,
+                r8: self.regs.r8, r9: self.regs.r9, r10: self.regs.r10, r11: self.regs.r11,
+                r12: self.regs.r12, r13: self.regs.r13, r14: self.regs.r14, r15: self.regs.r15,
+            };
+            let failed = unsafe { vmx_launch_stub(&mut gpr) };
+
+            self.save.cr2 = cpu::read_cr2();
+            unsafe { cpu::write_cr2(host_cr2) };
+            unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
+            if switch_xcr0 {
+                unsafe { cpu::xsetbv0(host_xcr0) };
+            }
+            unsafe { cpu::write_cr4(host_cr4) };
+            if let Some(k) = kick { k.left(); }
+
+            /* The event, if any, was delivered on entry: not again. */
+            self.inject = 0;
+
+            self.save.rax = gpr.rax;
+            self.regs = GuestRegs {
+                rbx: gpr.rbx, rcx: gpr.rcx, rdx: gpr.rdx, rsi: gpr.rsi, rdi: gpr.rdi, rbp: gpr.rbp,
+                r8: gpr.r8, r9: gpr.r9, r10: gpr.r10, r11: gpr.r11,
+                r12: gpr.r12, r13: gpr.r13, r14: gpr.r14, r15: gpr.r15,
+            };
+
+            if failed != 0 {
+                /* VMLAUNCH did not start entry (VMfail): the guest state is
+                 * as it was, and the error says why. */
+                self.vm_instruction_error = unsafe { vmcs::vmread(vmcs::VM_INSTRUCTION_ERROR) } as u32;
+                self.entry_failed = true;
+                self.exit_reason = 0;
+            } else {
+                self.entry_failed = false;
+                unsafe { self.read_exit() };
+                unsafe { self.read_guest_state() };
+                /* A machine check taken while the guest ran is the host's,
+                 * and the CPU did not deliver it: raise it, as the AMD side
+                 * does, to the handler that treats one as fatal. */
+                if self.exit_reason & vmcs::reason::BASIC_MASK == vmcs::reason::EXCEPTION_NMI
+                    && self.exit_intr_info & vmcs::intr::VECTOR_MASK == VECTOR_MC
+                    && self.exit_intr_info & vmcs::intr::VALID != 0
+                {
+                    unsafe { core::arch::asm!("int 0x12") };
+                }
+            }
+            /* Back to the clear state: never current on two CPUs. */
+            unsafe { vmcs::vmclear(vmcs_phys) };
+            Ok(cpu)
+        })();
+        unsafe { kcore::cpu::irq_restore(flags) };
+        ran
+    }
+}
+
+/// Enter the guest with the GPRs in `gpr`, and come back at its next exit
+/// with them stored back. Returns 0 on a VM exit, non-zero when VMLAUNCH
+/// itself failed (VMfail: the guest never started).
+///
+/// VMLAUNCH loads the guest and, at its exit, jumps to the host RIP this
+/// writes -- back to the `2:` label, on the host RSP this writes -- so the
+/// host's callee-saved registers are on the stack for it to restore. Guest
+/// RSP and RIP are VMCS fields, not the stub's to move.
+///
+/// # Safety
+/// A VMCS of ours is current on this CPU, VMX is on, interrupts are off, and
+/// `gpr` is valid for reads and writes: what [`Guest::run`] holds.
+#[unsafe(naked)]
+unsafe extern "C" fn vmx_launch_stub(gpr: *mut Gpr) -> u64 {
+    core::arch::naked_asm!(
+        /* Host callee-saved, then the gpr pointer for the exit path. */
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "push rdi",
+        /* HOST_RSP and HOST_RIP: where the exit returns. */
+        "mov rax, {host_rsp}",
+        "vmwrite rax, rsp",
+        "lea rax, [rip + 2f]",
+        "mov rdx, {host_rip}",
+        "vmwrite rdx, rax",
+        /* Guest GPRs from [rdi]; rdi itself last, from its own slot. */
+        "mov rax, [rdi + {rax}]",
+        "mov rbx, [rdi + {rbx}]",
+        "mov rcx, [rdi + {rcx}]",
+        "mov rdx, [rdi + {rdx}]",
+        "mov rsi, [rdi + {rsi}]",
+        "mov rbp, [rdi + {rbp}]",
+        "mov r8, [rdi + {r8}]",
+        "mov r9, [rdi + {r9}]",
+        "mov r10, [rdi + {r10}]",
+        "mov r11, [rdi + {r11}]",
+        "mov r12, [rdi + {r12}]",
+        "mov r13, [rdi + {r13}]",
+        "mov r14, [rdi + {r14}]",
+        "mov r15, [rdi + {r15}]",
+        "mov rdi, [rdi + {rdi}]",
+        "vmlaunch",
+        /* Fall-through: VMLAUNCH failed (VMfail). Guest GPRs are loaded, so
+         * restore the pointer and report. */
+        "pop rdi",
+        "mov rax, 1",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        /* The VM-exit lands here, on HOST_RSP: [rsp] is the gpr pointer, and
+         * every register holds the guest's. Save them. */
+        "2:",
+        "push rax",              // stash guest rax
+        "mov rax, [rsp + 8]",    // gpr pointer
+        "mov [rax + {rbx}], rbx",
+        "mov [rax + {rcx}], rcx",
+        "mov [rax + {rdx}], rdx",
+        "mov [rax + {rsi}], rsi",
+        "mov [rax + {rdi}], rdi",
+        "mov [rax + {rbp}], rbp",
+        "mov [rax + {r8}], r8",
+        "mov [rax + {r9}], r9",
+        "mov [rax + {r10}], r10",
+        "mov [rax + {r11}], r11",
+        "mov [rax + {r12}], r12",
+        "mov [rax + {r13}], r13",
+        "mov [rax + {r14}], r14",
+        "mov [rax + {r15}], r15",
+        "pop rcx",               // guest rax
+        "mov [rax + {rax}], rcx",
+        "add rsp, 8",            // drop the gpr pointer
+        "xor eax, eax",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        host_rsp = const vmcs::HOST_RSP,
+        host_rip = const vmcs::HOST_RIP,
+        rax = const offset_of!(Gpr, rax),
+        rbx = const offset_of!(Gpr, rbx),
+        rcx = const offset_of!(Gpr, rcx),
+        rdx = const offset_of!(Gpr, rdx),
+        rsi = const offset_of!(Gpr, rsi),
+        rdi = const offset_of!(Gpr, rdi),
+        rbp = const offset_of!(Gpr, rbp),
+        r8 = const offset_of!(Gpr, r8),
+        r9 = const offset_of!(Gpr, r9),
+        r10 = const offset_of!(Gpr, r10),
+        r11 = const offset_of!(Gpr, r11),
+        r12 = const offset_of!(Gpr, r12),
+        r13 = const offset_of!(Gpr, r13),
+        r14 = const offset_of!(Gpr, r14),
+        r15 = const offset_of!(Gpr, r15),
+    );
+}

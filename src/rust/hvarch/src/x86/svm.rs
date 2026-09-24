@@ -397,7 +397,7 @@ impl Kick {
     /// [`Guest::run`]'s, with interrupts off on `cpu`: whether to enter.
     /// The CPU is stored before the mode is read, so that a kick that finds
     /// the vCPU in its guest after this interrupts the CPU it is on.
-    fn entering(&self, cpu: u32) -> bool {
+    pub(crate) fn entering(&self, cpu: u32) -> bool {
         self.cpu.store(cpu, Ordering::SeqCst);
         if self.mode.load(Ordering::SeqCst) == IN_GUEST {
             true
@@ -407,7 +407,7 @@ impl Kick {
         }
     }
 
-    fn left(&self) {
+    pub(crate) fn left(&self) {
         self.mode.store(OUTSIDE_GUEST, Ordering::SeqCst);
     }
 }
