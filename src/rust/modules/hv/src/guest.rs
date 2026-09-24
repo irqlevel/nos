@@ -325,6 +325,9 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stop: &Stop, counts: &Cou
         "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} host",
         counts.exits, counts.port_in, counts.port_out, counts.cpuid,
         counts.msr_read, counts.msr_write, counts.msr_gp, counts.irq, counts.hlt, counts.host);
+    if counts.kicked != 0 {
+        let _ = writeln!(out, "  kicked     {} entries turned back for a frame that came on the way in", counts.kicked);
+    }
     if counts.ud != 0 || counts.wbinvd != 0 {
         let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past",
             counts.ud, counts.wbinvd);

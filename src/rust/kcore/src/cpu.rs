@@ -52,6 +52,16 @@ pub fn run_on_with<T: Sync>(cpu: u32, arg: &T, f: fn(&T)) {
     run_on(cpu, trampoline::<T>, &call as *const Call<'_, T> as *mut u8);
 }
 
+/// An interrupt to `cpu`, now, waiting for nothing -- `run_on`'s opposite:
+/// from any context, interrupts off included, and nothing runs there but
+/// the interrupt's own handler. What has a vCPU running a guest on that CPU
+/// leave it, a physical interrupt ending the guest's turn. Nothing for a
+/// `cpu` out of range.
+#[inline]
+pub fn kick(cpu: u32) {
+    ffi::cpu::kernel_cpu_kick(cpu)
+}
+
 extern "C" fn nothing(_ctx: *mut u8) {}
 
 /// Returns once every running CPU has taken an interrupt since the call, so

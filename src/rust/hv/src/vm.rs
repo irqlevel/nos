@@ -1,6 +1,6 @@
 //! A virtual machine: its memory, and the CPU that runs in it.
 
-use hvarch::x86::svm::{NotRun, Permissions};
+use hvarch::x86::svm::{Kick, NotRun, Permissions};
 use hvarch::{Error, Ext, Result};
 
 use crate::machine::Machine;
@@ -63,8 +63,11 @@ impl Vm {
     /// say why it did and which CPU it was.
     ///
     /// The caller's task may be moved between one call and the next; each
-    /// entry checks the CPU it finds itself on.
-    pub fn enter(&mut self, machine: &Machine) -> core::result::Result<(Exit, u32), Refusal> {
+    /// entry checks the CPU it finds itself on. With `kick`, the entry is the
+    /// vCPU's in `Kick`'s sense, and one a kick refused is `Exit::Kicked`.
+    pub fn enter(&mut self, machine: &Machine, kick: Option<&Kick>)
+        -> core::result::Result<(Exit, u32), Refusal>
+    {
         self.vcpu.check().map_err(Refusal::Vmcb)?;
         let nested = self.memory.nested();
         /* The nested table is the memory's own and maps nothing but pages
@@ -72,11 +75,14 @@ impl Vm {
          * for the whole of the call; it only gains entries, and its id is
          * its own (`Npt`). A CPU's entry in the machine's host areas is never
          * the address of a page that has gone (`Machine::host_areas`). */
-        let cpu = unsafe { self.vcpu.guest_mut().run(&self.perms, nested, machine.host_areas()) }
-            .map_err(|why| match why {
-                NotRun::Off { cpu } => Refusal::NotOn(cpu),
-                NotRun::FiveLevelPaging { cpu } => Refusal::FiveLevelPaging(cpu),
-            })?;
+        let cpu = match unsafe { self.vcpu.guest_mut().run(&self.perms, nested, machine.host_areas(), kick) } {
+            Ok(cpu) => cpu,
+            /* Nothing ran: no exit to read, and no event of the last one's to
+             * queue again -- it is queued already. */
+            Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
+            Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
+            Err(NotRun::FiveLevelPaging { cpu }) => return Err(Refusal::FiveLevelPaging(cpu)),
+        };
         self.vcpu.requeue_event();
         Ok((self.vcpu.exit(), cpu))
     }

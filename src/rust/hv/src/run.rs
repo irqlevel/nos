@@ -14,7 +14,7 @@
 //! time -- and its CPU goes to whatever else can use it.
 
 use hvarch::x86::svm::vmcb::{self, Save};
-use hvarch::x86::svm::GuestRegs;
+use hvarch::x86::svm::{GuestRegs, Kick};
 use hvarch::{Error, Result};
 use kcore::time;
 
@@ -124,6 +124,9 @@ pub struct Counts {
     pub msr_gp: u64,
     pub mmio: u64,
     pub host: u64,
+    /// Entries refused because a frame came for the guest on its way in
+    /// (`Kick`): handed over first.
+    pub kicked: u64,
     pub irq: u64,
     pub irq0: u64,
     pub irq4: u64,
@@ -337,7 +340,13 @@ impl LinuxGuest {
     /// on `host`'s request, or at the end of `budget_ns` (`u64::MAX` for no
     /// end) -- its console going to and coming from `host`. Returns why it
     /// stopped and what it did.
-    pub fn run(&mut self, machine: &Machine, budget_ns: u64, host: &mut dyn Host) -> (Stop, Counts) {
+    ///
+    /// With `kick`, whoever hands the guest's NICs a frame kicks it there
+    /// (`Kick::kick`): a vCPU in its guest then leaves it at once to take
+    /// the frame, rather than at the host's next interrupt.
+    pub fn run(&mut self, machine: &Machine, budget_ns: u64, host: &mut dyn Host, kick: Option<&Kick>)
+        -> (Stop, Counts)
+    {
         let mut counts = Counts::default();
         let start = time::boot_time_ns();
         let deadline = start.saturating_add(budget_ns);
@@ -379,11 +388,22 @@ impl LinuxGuest {
                 self.pic.raise(4);
             }
             /* Frames for the guest, into what its NICs have posted: before
-             * the halted check, so that one arriving wakes it. */
+             * the halted check, so that one arriving wakes it -- and after
+             * the vCPU is marked on its way in, so that one arriving after
+             * this look kicks the entry back rather than wait out the
+             * guest's turn. */
+            if let Some(k) = kick {
+                k.prepare();
+            }
             self.poll_nics();
 
             if halted {
                 if !self.wakes() {
+                    /* Not entering: a frame from here on wakes the task out
+                     * of its wait instead. */
+                    if let Some(k) = kick {
+                        k.cancel();
+                    }
                     /* Nothing for it yet. Sleep until the timer's next edge
                      * -- nothing else here becomes pending with time: the
                      * console's input is waiting already or waits on the
@@ -409,7 +429,7 @@ impl LinuxGuest {
             }
             self.deliver_interrupt(&mut counts);
 
-            let (exit, _cpu) = match self.vm.enter(machine) {
+            let (exit, _cpu) = match self.vm.enter(machine, kick) {
                 Ok(entered) => entered,
                 Err(refusal) => break Stop::Refused(refusal),
             };
@@ -421,6 +441,8 @@ impl LinuxGuest {
 
             match exit {
                 Exit::Host => counts.host += 1,
+                /* Not entered: round again, and the frame goes in. */
+                Exit::Kicked => counts.kicked += 1,
                 Exit::Io(io) => {
                     if let Some((port, value)) = self.io(&io, &mut counts, host) {
                         break Stop::Reset { port, value, rip };
@@ -506,6 +528,11 @@ impl LinuxGuest {
                 other => break Stop::Unexpected { exit: other, rip },
             }
         };
+        /* However it stopped -- a refusal may come after `prepare` -- the
+         * vCPU is out, and kicks it no longer. */
+        if let Some(k) = kick {
+            k.cancel();
+        }
 
         host.progress(&counts);
         (stop, counts)

@@ -7,6 +7,10 @@ unsafe extern "C" {
         handler: extern "C" fn(*mut u8),
         ctx: *mut u8,
     );
+    /// An interrupt to `cpu`, now, waiting for nothing: from any context,
+    /// interrupts off included. What makes a vCPU running a guest there
+    /// leave it; any other CPU takes an interrupt with nothing to do.
+    pub safe fn kernel_cpu_kick(cpu: u32);
 }
 
 /* Interrupts and preemption off, and back on, for code that holds a lock of
