@@ -1200,6 +1200,14 @@ with the fix, 0.514 without it under TCG. Over SSH the command line was
 also cut at 255 characters, too short for Debian's `hv start`; it takes
 1023, as `/etc/rc` does.
 
+Booted again with the fix (768a56b), the same day: Debian keeps the TSC --
+`Switched to clocksource tsc` at 1.1 s, no watchdog complaint -- and counts
+62.37 s of 62.4, Alpine 62.27; both dates the host's. The two boots were
+faster for it too, Debian at its login prompt in 3.8 s and Alpine in 8.9 s
+(8.5 and 22 s before): the guests' own timers had been waiting on ticks
+that never came. Debian's 343-character `hv start` went through over SSH;
+an exit cost 742 ns with ASIDs and 959 ns flushed, as before.
+
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
 in [Real hardware](real-hardware.md) for the machine and in the gate's own
