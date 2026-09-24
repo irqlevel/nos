@@ -16,6 +16,7 @@ global ApStart16
 %define CR0_PG (1 << 31)
 %define CR0_CD (1 << 30)
 %define CR0_NW (1 << 29)
+%define CR0_NE (1 << 5)
 %define CR4_MCE (1 << 6)
 %define CR4_PAE (1 << 5)
 
@@ -325,9 +326,15 @@ enable_paging:
     ; Left set, every AP runs uncached, and the SDM requires the two logical
     ; processors of one core to hold identical CD/NW, so the BSP's hyperthread
     ; sibling coming up with caches off is undefined behaviour outright.
+    ;
+    ; And NE, native x87 error reporting, which INIT clears as well: nothing
+    ; here uses the x87, but VMX operation requires the bit (it is set in
+    ; IA32_VMX_CR0_FIXED0 on every part), and `vmxon` with it clear is a #GP
+    ; rather than a failure. GRUB leaves the BSP's as firmware had it, so
+    ; without this a machine could take VMX on one CPU and not the next.
     mov eax, cr0
     and eax, ~(CR0_CD | CR0_NW) & 0xFFFFFFFF
-    or eax, CR0_PG
+    or eax, CR0_PG | CR0_NE
     mov cr0, eax
 
     ret
