@@ -279,9 +279,10 @@ Two rules make it the one place that decides what a guest can reach:
   the most important decision of the hypervisor). Every access is a copy --
   `read`, `write`, `read_obj::<T: Pod>`, `write_obj` -- bounds-checked
   against the region it falls in, and made by the kernel through its
-  temporary window onto each page it touches, a page's part of it one call
-  of the architecture's memcpy, which the compiler sees nothing of; an
-  address a guest gave, whatever it is, is at worst `Unmapped`.
+  temporary window onto each page it touches -- the CPU's own slot of it,
+  mapped for that page's part of the copy and nowhere after -- a page's part
+  one call of the architecture's memcpy, which the compiler sees nothing
+  of; an address a guest gave, whatever it is, is at worst `Unmapped`.
 - **The nested page table is inside it.** A guest reaches exactly what its
   nested table maps, and this table maps nothing but pages the same value
   owns: every page is owned before it is mapped, and freed only with the

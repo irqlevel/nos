@@ -42,6 +42,18 @@ static inline __attribute__((always_inline)) bool TlbShootdownNeedsIpi()
     return false; /* tlbi *is broadcasts in hardware */
 }
 
+/* A leaf entry that was not valid has just been made valid, and this CPU is
+   about to go through it. No TLB holds a translation from an invalid entry,
+   so there is nothing to invalidate; the store has to reach the table
+   walker, and later instructions have to see the new translation. */
+static inline __attribute__((always_inline)) void PteMadeValid()
+{
+    asm volatile(
+        "dsb ishst\n"
+        "isb\n"
+        ::: "memory");
+}
+
 static inline __attribute__((always_inline)) ulong GetTranslationRoot()
 {
     ulong root;

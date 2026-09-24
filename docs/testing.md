@@ -19,7 +19,12 @@ Self-tests live in `src/cpp/kernel/test.cpp`; each is a
 `Test::Test()` (called in `main.cpp:Main2`, and from `main_arm64.cpp`) and
 `Test::TestMultiTasking()`, and a failing one returns a non-success
 `Stdlib::Error`. The Rust side's run from the same place, through
-`rust_test` (`src/rust/kernel/src/lib.rs`).
+`rust_test` (`src/rust/kernel/src/lib.rs`) -- among them the frame test
+(`kernel/src/frames.rs`): a page mapped nowhere, written a piece at a time at
+every alignment and read back on every running CPU, each through its own
+slot of the temporary window, which is how every copy of a guest's memory is
+made. A slot that maps the wrong page fails it (`frame selftest: ...`), and
+so the smoke boot, on both architectures.
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.

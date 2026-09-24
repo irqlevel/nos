@@ -231,9 +231,20 @@ public:
 
        FreeFrame: back onto the free list. A page that is on the list
        already -- a frame freed twice -- is a panic here rather than a free
-       list that loops. */
+       list that loops.
+
+       MapFrameSlot: this CPU's own slot of the TmpMap window, mapped onto
+       the frame at phyAddr for one copy into or out of it, and the slot's
+       address; UnmapFrameSlot clears it again, its TLB entry with it. With
+       interrupts off from the map to the unmap -- the caller's -- the slot
+       is that copy's alone, which is what lets it go without TmpMapLock,
+       the slot search and the reference TmpMapPage takes: the frame is the
+       caller's for the length of the call. RAM, so write-back; data, so
+       no-execute. */
     bool IsFrameAddress(ulong phyAddr);
     void FreeFrame(ulong phyAddr);
+    ulong MapFrameSlot(ulong phyAddr);
+    void UnmapFrameSlot(ulong virtAddr);
 
 private:
     PageTable(const PageTable& other) = delete;
@@ -299,8 +310,15 @@ private:
     Kernel::SpinLock TmpMapLock;
     PtePage *TmpMapL1Page;
 
+    /* The TmpMap window, TmpMapPageCount slots in one L1 table: first the
+       ones any CPU takes under TmpMapLock (TmpMapPage, TmpMapRange), then a
+       slot for each CPU, for copying a frame (MapFrameSlot). */
     static const size_t TmpMapPageCount = 512;
-    Page *TmpMapPageArray[TmpMapPageCount];
+    static const size_t FrameSlotCount = 64;
+    static const size_t TmpMapSharedCount = TmpMapPageCount - FrameSlotCount;
+    Page *TmpMapPageArray[TmpMapSharedCount];
+
+    ulong FrameSlotAddress(ulong cpu);
 
     ulong GetL1Page(ulong virtAddr);
 

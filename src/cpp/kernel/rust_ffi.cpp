@@ -624,12 +624,15 @@ void kernel_frame_free(unsigned long phys)
     Kernel::Mm::PageTable::GetInstance().FreeFrame(phys);
 }
 
-/* Copy between a frame and the caller's memory through one temp-map slot:
-   out of the frame into `buf`, or `data` into it -- exactly one of the two
-   is given. Preemption and interrupts are off from the map to the unmap: the
-   unmap invalidates only this CPU's TLB, so a task moved to another CPU
-   mid-copy would leave that slot's translation stale behind it (VirtToPhys
-   has the same window, for the same reason).
+/* Copy between a frame and the caller's memory through this CPU's frame
+   slot of the temp-map window (PageTable::MapFrameSlot): out of the frame
+   into `buf`, or `data` into it -- exactly one of the two is given.
+   Preemption and interrupts are off from the map to the unmap: that is what
+   makes the slot this copy's alone, and the unmap invalidates only this
+   CPU's TLB, so a task moved to another CPU mid-copy would leave the slot's
+   translation stale behind it. (It went through the shared slots, under
+   their lock and with a reference taken and a flush at each end, until the
+   lock and the flushes were as much of a busy guest's vCPU as the copy.)
 
    What a frame holds may be a guest's memory, written while the copy runs,
    so nothing here may hold a view of it the compiler could reason about.
@@ -654,13 +657,10 @@ static int FrameCopy(unsigned long phys, unsigned long offset,
     if (!pt.IsFrameAddress(phys))
         return -1;
 
+    /* Through this CPU's own slot of the window, which interrupts off makes
+       the copy's alone: no lock, no slot to search for, no reference. */
     ulong flags = Kernel::PreemptIrqSave();
-    ulong va = pt.TmpMapPage(phys);
-    if (va == 0)
-    {
-        Kernel::PreemptIrqRestore(flags);
-        return -1;
-    }
+    ulong va = pt.MapFrameSlot(phys);
 
     /* Inside the page mapped at va: offset and len were checked above. */
     void* frame = reinterpret_cast<void*>(va + offset);
@@ -669,7 +669,7 @@ static int FrameCopy(unsigned long phys, unsigned long offset,
     else
         Stdlib::MemCpy(buf, frame, len);
 
-    pt.TmpUnmapPage(va);
+    pt.UnmapFrameSlot(va);
     Kernel::PreemptIrqRestore(flags);
     return 0;
 }
