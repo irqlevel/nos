@@ -251,7 +251,7 @@ def attach(args):
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "128", rootdir],
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
 
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4", "-cpu", "max",
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4"] + accel_args(args) + [
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
             "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
@@ -321,6 +321,17 @@ def attach(args):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def accel_args(args):
+    """The QEMU accelerator flags for nos: KVM `-cpu host` where the host has
+    an extension (AMD-V on AMD, Intel VT-x nested on Intel), else TCG
+    `-cpu max` (AMD-V), which is what a guest is brought up under where there
+    is no KVM. So the Linux path is exercised on whichever backend the host
+    has, the two covered between an AMD host, an Intel host and TCG."""
+    kvm = os.path.exists("/dev/kvm") and not getattr(args, "tcg", False) \
+        and (hvt.host_has_svm() or hvt.host_has_vmx())
+    return ["-cpu", "host", "-enable-kvm"] if kvm else ["-cpu", "max"]
+
+
 def boot_rc(args, tmp, rc, extra=None, qemu=None):
     """nos with /etc/rc and the guest's files on its root, under TCG, run
     until rc's last line has printed. The QEMU process and the serial log;
@@ -346,7 +357,7 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None):
         root_device = ["-device", "nvme,serial=nosroot,drive=drive0"]
     else:
         root_device = ["-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4", "-cpu", "max",
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4"] + accel_args(args) + [
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image] + root_device + (qemu or [])
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -613,16 +624,13 @@ def run(args):
             sys.exit("an /etc/rc line is longer than rc takes (255): " + line)
     image = rootfs(tmp, args.bzimage, args.initrd, rc)
 
-    kvm = os.path.exists("/dev/kvm") and not args.tcg and (hvt.host_has_svm() or hvt.host_has_vmx())
-    ext = "the host's AMD-V" if hvt.host_has_svm() else "the host's Intel VT-x (nested)"
-    print("accelerator: %s" % ("KVM, " + ext if kvm else "TCG, -cpu max (AMD-V)"))
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4",
-            "-cpu", "host" if kvm else "max",
+    accel = accel_args(args)
+    print("accelerator: %s" % ("KVM, the host's %s (nested)" % ("Intel VT-x" if hvt.host_has_vmx() else "AMD-V")
+                               if "-enable-kvm" in accel else "TCG, -cpu max (AMD-V)"))
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4"] + accel + [
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
             "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
-    if kvm:
-        argv += ["-enable-kvm"]
 
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
