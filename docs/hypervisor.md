@@ -843,9 +843,9 @@ disk over the whole run, its boot's hundred-odd flushes included (QEMU's
 | with holes: the guest's writes allocate | 11.3 s; 32,640 writes, 134 MB, 4,716 flushes | 2.2 s; 13,530 writes, 55 MB, 317 flushes |
 | whole: the guest's writes overwrite | 3.4 s; 15,534 writes, 64 MB, 1,978 flushes | 0.83 s; 14,559 writes, 60 MB, 112 flushes |
 
-On the AX41 a Debian guest writes at over 900 MB/s and reads at 1.3 GB/s,
-and what `apt-get update` leaves dirty goes down in a quarter of a second
-where it took half a minute ([On real hardware](#on-real-hardware)).
+On the AX41 a Debian guest writes at 1.2 GB/s and reads at 1.6 GB/s, and
+what `apt-get update` leaves dirty goes down in a few hundredths of a
+second where it took half a minute ([On real hardware](#on-real-hardware)).
 
 `scripts/hv-linux-test.py --disk` is its gate: an ext4 image with a file in
 it on nos's root, the guest mounting it, reading the file, writing 4 MiB and
@@ -1478,6 +1478,26 @@ outside nos the same pipelining has the CDN close the connection in the
 middle of an answer. Whether the faster guest meets it at a new point or
 the CDN changed that afternoon, apt with `-o
 Acquire::http::Pipeline-Depth=0` takes 2 s again.
+
+Then the mapping itself: a copy's page went through the temporary window's
+shared slots, under their lock, with a reference taken and two TLB flushes,
+and that cost the vCPU as much as the copy. Each CPU has a slot of its own
+for it now ([Paging](paging.md#tmpmap-the-window-onto-physical-memory)), a
+page still mapped only for the length of its copy. On the AX41 (56b6da8):
+
+| in the Debian guest | shared slots | a slot per CPU |
+|---|---|---|
+| `dd` 1 GiB, a new file / over it again | 966 / 932 MB/s | 1.2 / 1.2 GB/s |
+| reading it back, the cache dropped | 1.3 GB/s | 1.6 GB/s |
+| `dd` 1.5 GiB, and the vCPU meanwhile | 925 MB/s, 99.9% | 1.2 GB/s, 70% |
+| a gigabyte fetched to `/dev/null` / to the guest's disk | 110 / 102 MB/s | 117 / 107 MB/s |
+
+117 MB/s is what TCP carries over gigabit Ethernet at an MTU of 1500. The
+vCPU's time is two thirds the guest itself now, the copy an eighth, and
+what is left of the mapping -- the flush when a slot is cleared -- under
+4%. The boot's frame self-test passed on all twelve CPUs, each through its
+own slot; `apt-get update` took 2 s with pipelining on and off; `e2fsck`
+found `nosenv` and the guest's ext4 clean.
 
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
