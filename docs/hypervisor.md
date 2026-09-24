@@ -842,9 +842,9 @@ disk over the whole run, its boot's hundred-odd flushes included (QEMU's
 | with holes: the guest's writes allocate | 11.3 s; 32,640 writes, 134 MB, 4,716 flushes | 2.2 s; 13,530 writes, 55 MB, 317 flushes |
 | whole: the guest's writes overwrite | 3.4 s; 15,534 writes, 64 MB, 1,978 flushes | 0.83 s; 14,559 writes, 60 MB, 112 flushes |
 
-On the AX41 a Debian guest writes at 360 MB/s and reads at 400, and what
-`apt-get update` leaves dirty goes down in a quarter of a second where it
-took half a minute ([On real hardware](#on-real-hardware)).
+On the AX41 a Debian guest writes at over 900 MB/s and reads at 1.3 GB/s,
+and what `apt-get update` leaves dirty goes down in a quarter of a second
+where it took half a minute ([On real hardware](#on-real-hardware)).
 
 `scripts/hv-linux-test.py --disk` is its gate: an ext4 image with a file in
 it on nos's root, the guest mounting it, reading the file, writing 4 MiB and
@@ -1450,6 +1450,33 @@ word), and a fifth the guest itself running. A page's part of a copy is
 one `MemCpy` now: under TCG the guest's 48 MiB `dd ... conv=fsync` onto a
 whole image takes 0.42 s where it took 0.64, and reading it back 0.24 s
 where it took 0.44, on virtio-blk and on NVMe alike.
+
+On the AX41 with it (6bf9e84), the same guest:
+
+| in the Debian guest | a word a call | a page a call |
+|---|---|---|
+| `dd` 1 GiB, a new file / over it again | 363 / 358 MB/s | 966 / 932 MB/s |
+| reading it back, the cache dropped | 397 MB/s | 1.3 GB/s |
+| a gigabyte fetched to the guest's disk | 87 MB/s | 102 MB/s |
+
+and its NIC dropped no frame over the downloads, where it had dropped a
+few hundred a gigabyte. While `dd` writes 1.5 GiB at 925 MB/s the vCPU is
+at 99.9% of its CPU and the disk's task at 31%; half of the vCPU's time is
+now the guest itself running, and most of the rest the copies and the
+mapping of the temporary window for each page. `e2fsck` found `nosenv` and
+the guest's ext4 clean.
+
+One thing that boot showed is not nos's: `apt-get update` took 31 s where
+it had taken 2 -- a flat 30 s of it on one request, then a new connection
+that had the answer in 20 ms. apt pipelines its requests, and the CDN
+behind deb.debian.org left the last of them on a connection unanswered: a
+capture in the guest has every byte the CDN sent acknowledged, and nothing
+more from it, data or FIN or RST, until the client gave up and closed --
+then the CDN's answer went on from the very byte after the last one. From
+outside nos the same pipelining has the CDN close the connection in the
+middle of an answer. Whether the faster guest meets it at a new point or
+the CDN changed that afternoon, apt with `-o
+Acquire::http::Pipeline-Depth=0` takes 2 s again.
 
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
