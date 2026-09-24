@@ -14,7 +14,7 @@ use kcore::cmd::Output;
 use kcore::trace;
 
 use crate::paths::Path;
-use crate::vfs::{FileStat, Open, Vfs, OPEN_READ, OPEN_WRITE};
+use crate::vfs::{FileStat, Handle, Open, Vfs, OPEN_READ, OPEN_WRITE};
 use crate::vnode::Kind;
 use crate::vfs_instance;
 
@@ -308,61 +308,117 @@ pub unsafe extern "C" fn kernel_file_read_at(
     total as isize
 }
 
-/// Writes `len` bytes into the file at `offset`, within the size it has -- a
-/// guest's disk image, whose size is its disk's: `len`, or -1 when the
-/// write would reach past the end (refused whole, the file never grown) or
-/// the filesystem refuses. Nothing is synced here: `kernel_file_sync` is the
-/// flush. The file is opened for each call, as `kernel_file_read_at` opens
-/// it.
+/* ---- a file held open (`kcore::fs::File`) ----
+ *
+ * A guest's disk image is read and written for as long as the guest runs, a
+ * request at a time, so it is opened once rather than looked up by its path
+ * for every piece. The handle is the VFS's -- a slot of its table and the
+ * generation of what is in it -- and is looked up on every call that takes
+ * it: a word that is no open file's reads as no file, which is why the calls
+ * that take nothing else are safe for any word. While it is open the file
+ * cannot be removed or renamed, nor its filesystem unmounted. */
+
+/// Opens the regular file at `path` -- or at `<path>.new`, where `locate`
+/// finds it -- for reading, and with `write` not 0 for writing too: its
+/// handle, or 0.
 ///
 /// # Safety
-/// `path` points at `path_len` bytes; `data` at `len`.
+/// `path` points at `path_len` readable bytes.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_file_write_at(
-    path: *const u8, path_len: usize, offset: u64, data: *const u8, len: usize,
-) -> isize {
+pub unsafe extern "C" fn kernel_file_open(path: *const u8, path_len: usize, write: i32) -> usize {
     let (vfs, path) = match (vfs_instance(), unsafe { ffi_path(path, path_len) }) {
         (Some(vfs), Some(path)) => (vfs, path),
+        _ => return 0,
+    };
+
+    let at = match locate(path) {
+        Some(at) => at,
+        None => return 0,
+    };
+    let flags = if write != 0 { OPEN_READ | OPEN_WRITE } else { OPEN_READ };
+    Handle::into_raw(vfs.open(at.as_bytes(), flags))
+}
+
+/// Closes the file. A word that is no open file's is nothing to close.
+#[no_mangle]
+pub extern "C" fn kernel_file_close(file: usize) {
+    if let (Some(vfs), Some(handle)) = (vfs_instance(), Handle::from_raw(file)) {
+        vfs.close(handle);
+    }
+}
+
+/// The open file's size in bytes, or -1 for a word that is no open file.
+#[no_mangle]
+pub extern "C" fn kernel_file_length(file: usize) -> i64 {
+    let (vfs, handle) = match (vfs_instance(), Handle::from_raw(file)) {
+        (Some(vfs), Some(handle)) => (vfs, handle),
+        _ => return -1,
+    };
+    match vfs.length(handle).map(i64::try_from) {
+        Some(Ok(size)) => size,
+        _ => -1,
+    }
+}
+
+/// Up to `cap` bytes of the open file from `offset`: the count read, 0 at or
+/// past its end, or -1.
+///
+/// # Safety
+/// `buf` takes `cap` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_pread(file: usize, offset: u64, buf: *mut u8, cap: usize) -> isize {
+    let (vfs, handle) = match (vfs_instance(), Handle::from_raw(file)) {
+        (Some(vfs), Some(handle)) => (vfs, handle),
+        _ => return -1,
+    };
+    if (buf.is_null() && cap != 0) || isize::try_from(cap).is_err() {
+        return -1;
+    }
+    let offset = match usize::try_from(offset) {
+        Ok(offset) => offset,
+        Err(_) => return 0,
+    };
+    if cap == 0 {
+        return 0;
+    }
+
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf, cap) };
+    match vfs.read_at(handle, offset, buf) {
+        Some(got) => got as isize,
+        None => -1,
+    }
+}
+
+/// Writes `len` bytes into the open file at `offset`, within the size it has
+/// -- a guest's disk image, whose size is its disk's: `len`, or -1 when the
+/// write would reach past the end (refused whole, the file never grown) or
+/// the filesystem refuses. Nothing is synced here: `kernel_file_fsync` is
+/// the flush.
+///
+/// # Safety
+/// `data` points at `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_file_pwrite(file: usize, offset: u64, data: *const u8, len: usize) -> isize {
+    let (vfs, handle) = match (vfs_instance(), Handle::from_raw(file)) {
+        (Some(vfs), Some(handle)) => (vfs, handle),
         _ => return -1,
     };
     if data.is_null() && len != 0 {
         return -1;
     }
-    let Ok(len_signed) = isize::try_from(len) else {
+    let (Ok(len_signed), Ok(offset)) = (isize::try_from(len), usize::try_from(offset)) else {
         return -1;
     };
 
-    let at = match locate(path) {
-        Some(at) => at,
-        None => return -1,
-    };
-    let file = match Open::new(vfs, at.as_bytes(), OPEN_WRITE) {
-        Some(file) => file,
-        None => return -1,
-    };
-    let end = match usize::try_from(offset).ok().and_then(|o| o.checked_add(len)) {
-        Some(end) => end,
-        None => return -1,
-    };
-    if end > file.size() {
-        return -1;
-    }
-    if len == 0 {
-        return 0;
-    }
-    if !file.seek(end - len) || !file.write(unsafe { bytes(data, len) }) {
-        return -1;
-    }
-    len_signed
+    if vfs.write_within(handle, offset, unsafe { bytes(data, len) }) { len_signed } else { -1 }
 }
 
-/// Everything written to every filesystem so far, on its disk: what a
-/// guest's flush asks of the image under it. 0, or -1 when a filesystem
-/// could not.
+/// Everything written to the open file's filesystem so far on its disk's
+/// medium -- what a guest's flush asks of the image under it: 0, or -1.
 #[no_mangle]
-pub extern "C" fn kernel_file_sync() -> i32 {
-    match vfs_instance() {
-        Some(vfs) if vfs.sync() => 0,
+pub extern "C" fn kernel_file_fsync(file: usize) -> i32 {
+    match (vfs_instance(), Handle::from_raw(file)) {
+        (Some(vfs), Some(handle)) if vfs.sync_file(handle) => 0,
         _ => -1,
     }
 }

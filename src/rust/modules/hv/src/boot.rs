@@ -17,8 +17,9 @@ use hv::run::Host;
 use hv::Machine;
 use kcore::cmd::Output;
 use kcore::consts::{MAX_CPUS, NS_PER_SEC};
-use kcore::sync::Mutex;
+use kcore::sync::{Event, Mutex};
 
+use crate::disk::{self, Runner, Wake};
 use crate::guest::{self, LogLine, Ring, Spec};
 
 const USAGE: &str = "hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]";
@@ -39,6 +40,8 @@ struct BootHost {
     /// The module is going: stop now rather than at the end of `secs`, which
     /// the unload would otherwise wait out.
     unloading: Arc<AtomicBool>,
+    /// What its disks wake it by.
+    job: Arc<Boot>,
 }
 
 impl Host for BootHost {
@@ -62,6 +65,12 @@ impl Host for BootHost {
     fn stop_requested(&mut self) -> bool {
         self.unloading.load(Ordering::Acquire)
     }
+
+    /// On the boot's event: a disk that has served something wakes it at
+    /// once; else the timer edge does.
+    fn halt_wait(&mut self, ns: u64) {
+        self.job.doorbell.wait_for(kcore::time::Duration::from_nanos(ns));
+    }
 }
 
 /// The vCPU task's context: the guest to build and run, and where its verdict
@@ -71,12 +80,33 @@ struct Boot {
     spec: Spec,
     report: Mutex<String>,
     unloading: Arc<AtomicBool>,
+    /// Where the guest's disks are served.
+    disk_cpu: u32,
+    /// What a halted vCPU waits on, and what has one in its guest leave it:
+    /// what a disk that has served something rings.
+    doorbell: Event,
+    kick: hv::Kick,
+}
+
+impl Wake for Boot {
+    fn wake(&self) {
+        self.doorbell.signal();
+        self.kick.kick();
+    }
 }
 
 impl Boot {
     fn run(self: Arc<Boot>) {
         let mut report = String::new();
-        let mut guest = match guest::build(&self.machine, &self.spec) {
+        let mut label = String::new();
+        if label.try_reserve(8).is_err() {
+            let _ = writeln!(report, "hv: boot failed -- out of memory");
+            *self.report.lock() = report;
+            return;
+        }
+        label.push_str("boot");
+        let runner = Runner { wake: self.clone(), name: label, cpu: self.disk_cpu };
+        let mut guest = match guest::build(&self.machine, &self.spec, &runner) {
             Ok(guest) => guest,
             Err(why) => {
                 let _ = writeln!(report, "hv: boot failed -- {}", why);
@@ -94,15 +124,15 @@ impl Boot {
             return;
         };
         input.extend_from_slice(&self.spec.input);
-        let mut host = BootHost { ring, line, input, fed: 0, unloading: self.unloading.clone() };
+        let mut host = BootHost { ring, line, input, fed: 0, unloading: self.unloading.clone(), job: self.clone() };
 
         let _ = writeln!(report, "hv: booting {} -- {} MiB, cmdline \"{}\"",
                          self.spec.kernel, self.spec.mem_bytes / (1024 * 1024), self.spec.cmdline);
 
         let secs = self.spec.secs.unwrap_or(DEFAULT_SECS);
         let start = kcore::time::boot_time_ns();
-        /* No switch reaches an `hv boot` guest, and nothing kicks it. */
-        let (stop, counts) = guest.run(&self.machine, secs * NS_PER_SEC, &mut host, None);
+        /* No switch reaches an `hv boot` guest; its disks kick it. */
+        let (stop, counts) = guest.run(&self.machine, secs * NS_PER_SEC, &mut host, Some(&self.kick));
         let run_ns = kcore::time::boot_time_ns().saturating_sub(start);
         if !host.line.text().is_empty() {
             kcore::trace!(0, "hvguest| {}", host.line.text());
@@ -182,7 +212,19 @@ pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloadin
             return;
         }
     };
-    let job = Arc::new(Boot { machine: machine.clone(), spec, report, unloading: unloading.clone() });
+    let Some(doorbell) = Event::new() else {
+        let _ = writeln!(out, "hv: out of memory");
+        return;
+    };
+    let job = Arc::new(Boot {
+        machine: machine.clone(),
+        spec,
+        report,
+        unloading: unloading.clone(),
+        disk_cpu: disk::disk_cpu(cpu, busy),
+        doorbell,
+        kick: hv::Kick::new(),
+    });
     /* On a task of its own, bound to that CPU, so a long boot does not sit
      * on the shell's stack; dropping the handle waits for it. */
     match kcore::task::spawn_on_with("hv/linux", 1u64 << cpu, job.clone(), Boot::run) {

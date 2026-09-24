@@ -36,6 +36,8 @@ mod boot;
 #[cfg(target_arch = "x86_64")]
 mod dhcp;
 #[cfg(target_arch = "x86_64")]
+mod disk;
+#[cfg(target_arch = "x86_64")]
 mod guest;
 #[cfg(target_arch = "x86_64")]
 mod forward;

@@ -793,24 +793,58 @@ chains than the queue holds, an indirect descriptor (not offered), or a
 buffer outside guest memory stop the device, which takes nothing more until
 the driver resets it. A request's header, data and status are taken as
 streams across its readable and writable buffers, whatever the layout; its
-sector range is checked against the disk's size; and the data crosses
-through a 64 KiB buffer of the device's, a chunk at a time -- nothing is
-allocated per request. A request is served before the notify that made it
-available returns: the vCPU waits for its disk.
+sector range is checked against the disk's size, and its size against what
+the driver was told a request may carry.
 
-**The disk's bytes are a trait's** (`hv::disk::Backend`): the module's
-`FileDisk` reads and writes the file where the guest asks
-(`kcore::fs::read_at`, and `write_at`, which writes within the file's size
-and never grows it), and a guest's flush -- offered, and taken by ext4 --
-syncs nos's filesystems (`kcore::fs::sync`). The report counts each disk's
-reads, writes, flushes and errors.
+**The disk works beside the guest.** A request used to be served before the
+notify that made it available returned, the vCPU waiting for its disk -- and
+on the AX41 a guest writing back what `apt-get update` had fetched stalled
+for seconds at a time ([On real hardware](#on-real-hardware)). Now the notify
+only takes the requests off the ring -- a write's data copied out of guest
+memory into a buffer of the device's -- and hands them to the backend, which
+serves them in order on a task of its own, on a CPU other than the vCPU's.
+Each time round the run loop what it has served is given back: a read's
+data copied into the guest, the status written, the chain on the used ring,
+an interrupt; and as it finishes each the task wakes a halted vCPU or kicks
+a running one out of its guest, the NICs' way ([A network](#a-network)).
+Guest memory is touched on the vCPU's task and nowhere else. At most eight
+requests are out at once, each in a 256 KiB buffer taken when the disk is
+made -- the driver is told a request carries at most 64 segments of a page
+(`seg_max`, `size_max`), and the ring's 256 entries hold three of the
+largest -- so nothing is allocated on the way, and a guest that keeps its
+ring full waits for its disk rather than growing anything of nos's.
+
+**The disk's bytes are a trait's** (`hv::disk::Backend`, which is handed a
+request and gives it back served): the module's `FileDisk` holds the image
+open (`kcore::fs::File`, whose handle the kernel looks up on every call; the
+file cannot be removed, nor its filesystem unmounted, while the disk has
+it), reads and writes it where the guest asks -- within the file's size,
+never growing it -- and for a guest's flush, offered and taken by ext4,
+syncs the filesystem it is on. The report counts each disk's reads, writes,
+flushes and errors.
+
+**What a guest's write costs nos's ext2** ([Filesystems](filesystems.md)):
+one into a hole of the image flushes nos's disk once and writes the pointers
+to what it filled after that, where it used to cost a flush and four FUA
+writes, and every block it took a write of its indirect block besides; one
+over blocks the image has flushes nothing, and writes its inode only when
+the second of its mtime changed. The image is also no longer looked up by
+its path for every 64 KiB. The same 48 MiB `dd if=/dev/zero ... conv=fsync`
+in the guest under TCG, as the guest timed it, and what nos asked of its own
+disk over the whole run, its boot's hundred-odd flushes included (QEMU's
+`info blockstats`):
+
+| the image on nos's root | before | after |
+|---|---|---|
+| with holes: the guest's writes allocate | 11.3 s; 32,640 writes, 134 MB, 4,716 flushes | 2.2 s; 13,530 writes, 55 MB, 317 flushes |
+| whole: the guest's writes overwrite | 3.4 s; 15,534 writes, 64 MB, 1,978 flushes | 0.83 s; 14,559 writes, 60 MB, 112 flushes |
 
 `scripts/hv-linux-test.py --disk` is its gate: an ext4 image with a file in
 it on nos's root, the guest mounting it, reading the file, writing 4 MiB and
-a file of its own, syncing and reading back after a remount -- and then the
-image, taken back out of nos's root filesystem, judged by `e2fsck` and
-holding what the guest wrote. It needs a guest kernel with PCI, legacy
-virtio-pci, virtio-blk and ext4.
+a file of its own, syncing and reading back after a remount -- and then
+nos's root judged by `e2fsck`, and the image, taken back out of it, judged
+too and holding what the guest wrote. It needs a guest kernel with PCI,
+legacy virtio-pci, virtio-blk and ext4.
 
 ## A network
 
