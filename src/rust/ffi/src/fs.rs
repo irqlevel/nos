@@ -10,13 +10,6 @@ unsafe extern "C" {
     pub fn kernel_file_read_at(
         path: *const u8, path_len: usize, offset: u64, buf: *mut u8, cap: usize,
     ) -> isize;
-    /// Writes `len` bytes at `offset`, within the file's size -- never growing
-    /// it: `len`, or -1. Not synced.
-    pub fn kernel_file_write_at(
-        path: *const u8, path_len: usize, offset: u64, data: *const u8, len: usize,
-    ) -> isize;
-    /// Every filesystem's writes on its disk: 0, or -1. Sleeps.
-    pub fn kernel_file_sync() -> i32;
     /// Replaces the file's content -- making the file if it is missing --
     /// without ever leaving it empty or half written.
     pub fn kernel_file_write(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;
@@ -25,6 +18,28 @@ unsafe extern "C" {
     pub fn kernel_file_create(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;
     /// Makes a directory; 0 also when there is one by that name already.
     pub fn kernel_dir_create(path: *const u8, path_len: usize) -> i32;
+}
+
+/* A file held open -- a guest's disk image, for as long as the guest runs:
+   its handle is looked up on every call, so any word is safe to pass back,
+   and one that is no open file's reads as no file. All of them sleep. */
+unsafe extern "C" {
+    /// Opens a regular file for reading, and with `write` not 0 for writing
+    /// too: its handle, or 0.
+    pub fn kernel_file_open(path: *const u8, path_len: usize, write: i32) -> usize;
+    /// Closes it; a word that is no open file's is nothing to close.
+    pub safe fn kernel_file_close(file: usize);
+    /// Its size in bytes, or -1.
+    pub safe fn kernel_file_length(file: usize) -> i64;
+    /// Up to cap bytes from `offset`: the count read, 0 at or past the end,
+    /// or -1.
+    pub fn kernel_file_pread(file: usize, offset: u64, buf: *mut u8, cap: usize) -> isize;
+    /// Writes `len` bytes at `offset`, within the file's size -- never
+    /// growing it: `len`, or -1. Not synced.
+    pub fn kernel_file_pwrite(file: usize, offset: u64, data: *const u8, len: usize) -> isize;
+    /// Everything written to the file's filesystem on its disk's medium: 0,
+    /// or -1.
+    pub safe fn kernel_file_fsync(file: usize) -> i32;
 }
 
 /* What procfs puts in its files. Each writes into the buffer given and

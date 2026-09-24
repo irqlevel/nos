@@ -34,6 +34,7 @@ use kcore::consts::{MAX_CPUS, NS_PER_MS, NS_PER_SEC};
 use kcore::sync::{Event, Mutex};
 use kcore::task::TaskHandle;
 
+use crate::disk::{self, Runner, Wake};
 use crate::guest::{self, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
 
@@ -181,9 +182,10 @@ impl Shared {
         self.running.load(Ordering::Acquire)
     }
 
-    /// Something waits for the guest -- a frame, handed over before this:
-    /// a halted vCPU's task is woken, a vCPU in its guest kicked out of it
-    /// to take it now. From any context, interrupts off included.
+    /// Something waits for the guest -- a frame, what a disk served, handed
+    /// over before this: a halted vCPU's task is woken, a vCPU in its guest
+    /// kicked out of it to take it now. From any context, interrupts off
+    /// included.
     pub(crate) fn wake_up(&self) {
         self.wake.signal();
         self.kick.kick();
@@ -239,6 +241,12 @@ impl Shared {
     fn console_raw(&self, from: u64, max: usize, out: &mut Vec<u8>) -> Option<u64> {
         let ring = self.console.lock();
         ring.since(from, max, out).then(|| ring.total())
+    }
+}
+
+impl Wake for Shared {
+    fn wake(&self) {
+        self.wake_up();
     }
 }
 
@@ -311,6 +319,8 @@ struct Start {
     guest: LinuxGuest,
     machine: Arc<Machine>,
     spec: Spec,
+    /// What its disks wake and where they are served, for every boot.
+    runner: Runner,
 }
 
 /// How a `restart` guest's reboots are counted: `RESTART_BURST` in a
@@ -337,7 +347,7 @@ impl Burst {
 /// booted again, or parked on the VM's event until a command asks for a
 /// restart or the end.
 fn vcpu(start: Start) {
-    let Start { shared, guest, machine, spec } = start;
+    let Start { shared, guest, machine, spec, runner } = start;
     let line = if shared.log { LogLine::new() } else { None };
     if shared.log && line.is_none() {
         kcore::trace!(0, "hv: vm {} logs nothing of its console: no memory for a line", shared.id);
@@ -369,7 +379,7 @@ fn vcpu(start: Start) {
                  * build under way from one that failed by the two. */
                 shared.running.store(true, Ordering::Release);
                 shared.reset.store(false, Ordering::Release);
-                guest = reboot(&shared, &machine, &spec, "on request", None);
+                guest = reboot(&shared, &machine, &spec, &runner, "on request", None);
             }
             continue;
         };
@@ -416,7 +426,7 @@ fn vcpu(start: Start) {
         match again {
             /* Booted again -- or, when it cannot be built, stopped saying so,
              * with this boot's report kept. */
-            Some(why) => guest = reboot(&shared, &machine, &spec, why, Some(report)),
+            Some(why) => guest = reboot(&shared, &machine, &spec, &runner, why, Some(report)),
             None => stopped(&shared, reason, Some(report), ended),
         }
     }
@@ -437,14 +447,14 @@ fn stopped(shared: &Shared, reason: String, report: Option<String>, ended: u64) 
 /// Build the guest again from its files, for another boot -- or, when that
 /// fails, say why and leave the VM stopped with `report`, the last boot's,
 /// when there is one to keep.
-fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, why: &str,
+fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, runner: &Runner, why: &str,
           report: Option<String>) -> Option<LinuxGuest> {
     kcore::trace!(0, "hv: vm {} restarting -- {}", shared.id, why);
     /* The new boot's console starts here, before the build -- which is long
      * for a big guest under TCG -- so that `hv wait` meanwhile does not find
      * what the last boot printed. */
     shared.boot_at.store(shared.console_total(), Ordering::Release);
-    match guest::build(machine, spec) {
+    match guest::build(machine, spec, runner) {
         Ok(g) => {
             shared.requeue(&spec.input);
             shared.boot_ns.store(kcore::time::boot_time_ns(), Ordering::Relaxed);
@@ -603,7 +613,8 @@ impl Vms {
                 return;
             }
         };
-        let cpu = match guest::pick_cpu(machine, spec.cpu, &self.load()) {
+        let load = self.load();
+        let cpu = match guest::pick_cpu(machine, spec.cpu, &load) {
             Ok(cpu) => cpu,
             Err(why) => {
                 let _ = writeln!(out, "hv: {}", why);
@@ -669,9 +680,18 @@ impl Vms {
             hold = Some(PortHold { switch, port, kept: false });
         }
 
+        /* Its disks are served off the vCPU's CPU, and wake it. */
+        let mut label = String::new();
+        if label.try_reserve(16).is_err() {
+            let _ = writeln!(out, "hv: vm {} not started -- out of memory", id);
+            return;
+        }
+        let _ = write!(label, "vm{}", id);
+        let runner = Runner { wake: shared.clone(), name: label, cpu: disk::disk_cpu(cpu, &load) };
+
         /* The files are read and the guest's memory filled here, with no lock
          * held: it takes as long as the kernel and the initrd take to read. */
-        let guest = match guest::build(machine, &spec) {
+        let guest = match guest::build(machine, &spec, &runner) {
             Ok(guest) => guest,
             Err(why) => {
                 let _ = writeln!(out, "hv: vm {} not started -- {}", id, why);
@@ -693,7 +713,7 @@ impl Vms {
         let _ = write!(said, "{}, {} MiB, cmdline \"{}\"{}", spec.kernel, mem_mib, spec.cmdline,
                        if spec.restart { ", restarted when it resets" } else { "" });
 
-        let start = Start { shared: shared.clone(), guest, machine: machine.clone(), spec };
+        let start = Start { shared: shared.clone(), guest, machine: machine.clone(), spec, runner };
         let task = match kcore::task::spawn_on_with(&name, 1u64 << cpu, start, vcpu) {
             Some(task) => task,
             None => {

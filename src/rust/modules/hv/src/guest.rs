@@ -10,11 +10,12 @@ use alloc::boxed::Box;
 
 use alloc::sync::Arc;
 
-use hv::disk as blk;
 use hv::linux::Header;
 use hv::run::{Counts, LinuxGuest, Stop, MAX_DISKS};
 use hv::Machine;
 use kcore::consts::{MAX_CPUS, NS_PER_MS};
+
+use crate::disk::{FileDisk, Runner};
 
 /// How much of the file is read at once when streaming it into guest memory.
 const CHUNK: usize = 64 * 1024;
@@ -175,8 +176,9 @@ fn stream(guest: &mut LinuxGuest, path: &str, offset: u64, gpa: u64, len: u64) -
 }
 
 /// Build the guest: its memory, the kernel and the initrd streamed into it,
-/// and the rest of what the boot protocol wants laid out beside them.
-pub fn build(machine: &Machine, spec: &Spec) -> Result<LinuxGuest, String> {
+/// and the rest of what the boot protocol wants laid out beside them; its
+/// disks served for `runner`, who runs it.
+pub fn build(machine: &Machine, spec: &Spec, runner: &Runner) -> Result<LinuxGuest, String> {
     let mut guest = LinuxGuest::new(machine, spec.mem_bytes).map_err(|e| alloc::format!("no guest: {}", e))?;
 
     /* The header is in the first page or two; read enough to parse it. */
@@ -218,56 +220,13 @@ pub fn build(machine: &Machine, spec: &Spec) -> Result<LinuxGuest, String> {
             .map_err(|e| alloc::format!("the NIC: {}", e))?;
     }
     for (i, (path, ro)) in spec.disks.iter().enumerate() {
-        let disk = FileDisk::open(path, *ro)?;
+        let letter = (b'a' + i as u8) as char;
+        let disk = FileDisk::open(path, *ro, runner, letter)?;
         let mut id = String::new();
-        let _ = write!(id, "nos-vd{}", (b'a' + i as u8) as char);
+        let _ = write!(id, "nos-vd{}", letter);
         guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;
     }
     Ok(guest)
-}
-
-/// A guest's disk that is a file of nos's -- an image, whose size is the
-/// disk's, whole sectors of it -- read and written where the guest asks,
-/// and synced by its flush.
-struct FileDisk {
-    path: String,
-    size: u64,
-    read_only: bool,
-}
-
-impl FileDisk {
-    fn open(path: &str, read_only: bool) -> Result<FileDisk, String> {
-        let size = kcore::fs::size(path).map_err(|e| alloc::format!("{}: {}", path, e))?;
-        let size = size - size % blk::SECTOR;
-        if size == 0 {
-            return Err(alloc::format!("{}: not a sector long", path));
-        }
-        Ok(FileDisk { path: String::from(path), size, read_only })
-    }
-}
-
-impl blk::Backend for FileDisk {
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn read(&mut self, offset: u64, buf: &mut [u8]) -> bool {
-        matches!(kcore::fs::read_at(&self.path, offset, buf), Ok(n) if n == buf.len())
-    }
-
-    fn write(&mut self, offset: u64, data: &[u8]) -> bool {
-        /* The device refuses a write to a read-only disk before it gets
-         * here; this is the second no. */
-        !self.read_only && kcore::fs::write_at(&self.path, offset, data).is_ok()
-    }
-
-    fn read_only(&self) -> bool {
-        self.read_only
-    }
-
-    fn flush(&mut self) -> bool {
-        kcore::fs::sync().is_ok()
-    }
 }
 
 /// The CPU a vCPU is to run on: `wanted` if the extension is on there, else
@@ -356,7 +315,7 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stop: &Stop, counts: &Cou
         counts.irq, counts.irq0, counts.irq4, counts.edges0, counts.blocked, irr, isr, imr, m0, r0, run0);
     for (i, (sectors, s, broken)) in guest.disk_stats().enumerate() {
         let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}",
-            (b'a' + i as u8) as char, sectors * blk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
+            (b'a' + i as u8) as char, sectors * hv::disk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
             s.writes, s.written_bytes / 1024, s.flushes, s.errors,
             if broken { "; stopped over a ring the driver broke" } else { "" });
     }

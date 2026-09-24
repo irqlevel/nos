@@ -330,9 +330,9 @@ pub enum NotRun {
 }
 
 /// What another CPU does to have a guest that is running leave it -- the
-/// guests' switch, with a frame for it -- and what [`Guest::run`] looks at,
-/// with interrupts off, before it enters: KVM's vCPU mode, as its kick uses
-/// it.
+/// guests' switch with a frame for it, a disk's task with what it asked --
+/// and what [`Guest::run`] looks at, with interrupts off, before it enters:
+/// KVM's vCPU mode, as its kick uses it.
 ///
 /// A guest's turn ends when the host takes an interrupt, and not before.
 /// Work handed to a vCPU that is in its guest waits for that -- the host's

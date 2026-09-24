@@ -787,6 +787,75 @@ impl Vfs {
         Some(())
     }
 
+    /// As much of `buf` as the file has from `offset`: the count read, 0 at
+    /// or past its end, None on an error. The handle's position is not
+    /// moved, so two callers of one handle do not race on it.
+    pub fn read_at(&self, handle: Handle, offset: usize, buf: &mut [u8]) -> Option<usize> {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        let (mount_id, node, flags) = {
+            let file = inner.file(handle)?;
+            (file.mount_id, file.node, file.flags)
+        };
+        if flags & OPEN_READ == 0 {
+            trace!(0, "vfs: that handle is not open for reading");
+            return None;
+        }
+
+        let fs = &mut inner.mount_by_id(mount_id)?.fs;
+        let size = fs.tree().get(node)?.size;
+        if offset >= size || buf.is_empty() {
+            return Some(0);
+        }
+
+        let take = buf.len().min(size - offset);
+        fs.read(node, &mut buf[..take], offset).then_some(take)
+    }
+
+    /// `data` into the file at `offset`, all of it inside the size the file
+    /// has, or none of it: a disk image, whose size is its disk's, is never
+    /// grown by what its guest writes. The handle's position is not moved.
+    pub fn write_within(&self, handle: Handle, offset: usize, data: &[u8]) -> bool {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        let (mount_id, node, flags) = match inner.file(handle) {
+            Some(file) => (file.mount_id, file.node, file.flags),
+            None => return false,
+        };
+        if flags & OPEN_WRITE == 0 {
+            trace!(0, "vfs: that handle is not open for writing");
+            return false;
+        }
+
+        let Some(fs) = inner.mount_by_id(mount_id).map(|mount| &mut mount.fs) else {
+            return false;
+        };
+        let size = match fs.tree().get(node) {
+            Some(found) => found.size,
+            None => return false,
+        };
+        match offset.checked_add(data.len()) {
+            Some(end) if end <= size => {}
+            _ => return false,
+        }
+        data.is_empty() || fs.write(node, data, offset)
+    }
+
+    /// The filesystem the file is on, synced: everything written to it on
+    /// its disk's medium.
+    pub fn sync_file(&self, handle: Handle) -> bool {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        let mount_id = match inner.file(handle) {
+            Some(file) => file.mount_id,
+            None => return false,
+        };
+        inner.mount_by_id(mount_id).is_some_and(|mount| mount.fs.sync())
+    }
+
     pub fn seek(&self, handle: Handle, pos: usize) -> bool {
         match self.inner.lock().file(handle) {
             Some(file) => {
@@ -812,6 +881,18 @@ impl Vfs {
         inner.mount_by_id(mount_id)
             .and_then(|mount| mount.fs.tree().get(node))
             .map_or(0, |node| node.size)
+    }
+
+    /// The open file's size, or None for a handle that is no open file's.
+    pub fn length(&self, handle: Handle) -> Option<usize> {
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+
+        let (mount_id, node) = {
+            let file = inner.file(handle)?;
+            (file.mount_id, file.node)
+        };
+        Some(inner.mount_by_id(mount_id)?.fs.tree().get(node)?.size)
     }
 
     /// The mount a resolved path is on, if it may be written.

@@ -124,8 +124,8 @@ pub struct Counts {
     pub msr_gp: u64,
     pub mmio: u64,
     pub host: u64,
-    /// Entries refused because a frame came for the guest on its way in
-    /// (`Kick`): handed over first.
+    /// Entries refused because a frame, or a disk's answer, came for the
+    /// guest on its way in (`Kick`): handed over first.
     pub kicked: u64,
     pub irq: u64,
     pub irq0: u64,
@@ -281,6 +281,21 @@ impl LinuxGuest {
         })
     }
 
+    /// What the disks' backends have served, given back to the guest; the
+    /// disks' line raised when that calls for an interrupt.
+    fn poll_disks(&mut self) {
+        let mem = self.vm.memory_mut();
+        let mut raise = false;
+        for d in self.pci_devs.iter_mut() {
+            if let PciDev::Disk(d) = d {
+                raise |= d.poll(mem);
+            }
+        }
+        if raise {
+            self.pic.raise(DISK_IRQ);
+        }
+    }
+
     /// What the NICs' backends have for the guest, into its buffers; the
     /// NICs' line raised when that calls for an interrupt.
     fn poll_nics(&mut self) {
@@ -341,9 +356,10 @@ impl LinuxGuest {
     /// end) -- its console going to and coming from `host`. Returns why it
     /// stopped and what it did.
     ///
-    /// With `kick`, whoever hands the guest's NICs a frame kicks it there
-    /// (`Kick::kick`): a vCPU in its guest then leaves it at once to take
-    /// the frame, rather than at the host's next interrupt.
+    /// With `kick`, whoever hands the guest's NICs a frame, or has served
+    /// what its disks asked, kicks it there (`Kick::kick`): a vCPU in its
+    /// guest then leaves it at once to take the frame or the answer, rather
+    /// than at the host's next interrupt.
     pub fn run(&mut self, machine: &Machine, budget_ns: u64, host: &mut dyn Host, kick: Option<&Kick>)
         -> (Stop, Counts)
     {
@@ -387,15 +403,16 @@ impl LinuxGuest {
             if self.uart.irq_active() {
                 self.pic.raise(4);
             }
-            /* Frames for the guest, into what its NICs have posted: before
-             * the halted check, so that one arriving wakes it -- and after
-             * the vCPU is marked on its way in, so that one arriving after
-             * this look kicks the entry back rather than wait out the
-             * guest's turn. */
+            /* Frames for the guest, into what its NICs have posted, and what
+             * its disks have served: before the halted check, so that one
+             * arriving wakes it -- and after the vCPU is marked on its way
+             * in, so that one arriving after this look kicks the entry back
+             * rather than wait out the guest's turn. */
             if let Some(k) = kick {
                 k.prepare();
             }
             self.poll_nics();
+            self.poll_disks();
 
             if halted {
                 if !self.wakes() {

@@ -1,6 +1,6 @@
 //! Files, for a module to keep its configuration in -- a host key, the keys
-//! allowed to log in. Paths are absolute, and nothing is held open between
-//! calls.
+//! allowed to log in -- by paths that are absolute, with nothing held open
+//! between calls; and a file held open (`File`), for a guest's disk.
 
 use alloc::vec::Vec;
 use ffi::fs;
@@ -53,25 +53,64 @@ pub fn read_at(path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
     Ok(got as usize)
 }
 
-/// Writes `data` into the file at `offset`, within the size the file has --
-/// a disk image, whose size is its disk's: a write that would reach past the
-/// end is refused whole, and the file never grows. Not synced: `sync` is.
-pub fn write_at(path: &str, offset: u64, data: &[u8]) -> Result<()> {
-    let put = unsafe {
-        fs::kernel_file_write_at(path.as_ptr(), path.len(), offset, data.as_ptr(), data.len())
-    };
-    if put < 0 || put as usize != data.len() {
-        return Err(Error::IoError);
-    }
-    Ok(())
+/// A file held open -- a guest's disk image, read and written where the guest
+/// asks for as long as it runs -- and closed when this goes. While it is
+/// open the file cannot be removed or renamed from under whoever has it, nor
+/// its filesystem unmounted. Every call takes the kernel's handle to the
+/// file, which the kernel looks up rather than follows, and positions are
+/// the caller's: two tasks may share one.
+pub struct File {
+    handle: usize,
 }
 
-/// Every filesystem's writes, on its disk: a guest's flush.
-pub fn sync() -> Result<()> {
-    if unsafe { fs::kernel_file_sync() } == 0 {
+impl File {
+    /// The regular file at `path`, for reading -- and with `write` for
+    /// writing too. NotFound when there is none, or it cannot be opened so
+    /// (a directory, a read-only mount).
+    pub fn open(path: &str, write: bool) -> Result<File> {
+        let handle = unsafe { fs::kernel_file_open(path.as_ptr(), path.len(), i32::from(write)) };
+        if handle == 0 {
+            return Err(Error::NotFound);
+        }
+        Ok(File { handle })
+    }
+
+    /// Its size in bytes.
+    pub fn size(&self) -> Result<u64> {
+        u64::try_from(fs::kernel_file_length(self.handle)).map_err(|_| Error::IoError)
+    }
+
+    /// As much of `buf` as the file has from `offset`: the count read, 0 at
+    /// or past its end.
+    pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        /* `buf` is writable for its length, and the handle is looked up. */
+        let got = unsafe { fs::kernel_file_pread(self.handle, offset, buf.as_mut_ptr(), buf.len()) };
+        usize::try_from(got).map_err(|_| Error::IoError)
+    }
+
+    /// Writes `data` into the file at `offset`, within the size the file has
+    /// -- a disk image, whose size is its disk's: a write that would reach
+    /// past the end is refused whole, and the file never grows. Not synced:
+    /// `sync` is.
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        /* `data` is readable for its length, and the handle is looked up. */
+        let put = unsafe { fs::kernel_file_pwrite(self.handle, offset, data.as_ptr(), data.len()) };
+        if usize::try_from(put) != Ok(data.len()) {
+            return Err(Error::IoError);
+        }
         Ok(())
-    } else {
-        Err(Error::IoError)
+    }
+
+    /// Everything written to the file's filesystem, on its disk's medium: a
+    /// guest's flush.
+    pub fn sync(&self) -> Result<()> {
+        if fs::kernel_file_fsync(self.handle) == 0 { Ok(()) } else { Err(Error::IoError) }
+    }
+}
+
+impl Drop for File {
+    fn drop(&mut self) {
+        fs::kernel_file_close(self.handle);
     }
 }
 

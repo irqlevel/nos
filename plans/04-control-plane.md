@@ -61,7 +61,10 @@ and service the virtqueues from the device side.
 ## Backing storage for guest disks
 
 virtio-blk needs a backend. Options, simplest first:
-- A file on nanofs/ext2 exposed as a virtual disk.
+- ~~A file on nanofs/ext2 exposed as a virtual disk.~~ Done: a file of
+  nos's (`disk=`), held open and served in order by a task of the disk's
+  own while the guest runs on; every request comes back to the device,
+  which is what draining it will wait for (docs/hypervisor.md, "A disk").
 - A raw partition (the block layer + MBR partition support already exist).
 
 ## Live-update discipline continues here
