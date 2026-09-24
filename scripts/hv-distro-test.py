@@ -24,6 +24,11 @@ virtio disk:
     `restart` the VM boots again, and root logs in again
   - on the guests' switch (`net`), its initramfs configures eth0 from the
     `ip=` the VM is given; it pings nos at 10.0.100.1 and nos pings it
+  - and it has a way out: its resolv.conf names the DNS server nos was
+    given (`ip=`'s dns0), and it fetches a page from a web server on the
+    test machine -- 10.0.2.2, where QEMU's user network puts it -- through
+    nos's NAT; with `--internet`, it looks up Alpine's mirror by name and
+    `apk update`s from it
   - `apk add openssh-server` from the ISO, a key authorised, sshd started,
     `hv forward` from nos's port 2222 to its port 22 -- and the test logs
     into the guest from outside, through QEMU's forward, nos's relay and the
@@ -40,9 +45,12 @@ own /boot, its root partition the guest's disk and written to:
   - it is Debian on its own kernel, `systemctl is-system-running` says
     running, and no unit failed
   - its root is /dev/vda1, ext4, read-write; its clock is the host's
-  - on the switch, given its port's address by hand (the image configures
-    no ethernet interface itself), its virtio-net driver reaches nos and
-    nos reaches it
+  - on the switch, systemd-networkd takes its address from the switch's
+    DHCP server -- given a .network file as a credential, the image having
+    none for ethernet -- with nos as its router and nos's DNS server for
+    systemd-resolved; its virtio-net driver reaches nos and nos reaches it,
+    curl fetches a page from the test machine through NAT, and with
+    `--internet` it resolves Debian's mirror and fetches from it
   - a file written and synced there is still there after `reboot`, the VM
     built again: what the guest wrote went through nos's ext2 to its file
 
@@ -53,6 +61,7 @@ them:
 
     scripts/hv-distro-test.py --iso alpine-virt-3.24.2-x86_64.iso
     scripts/hv-distro-test.py --debian debian-13-nocloud-amd64.raw
+    scripts/hv-distro-test.py --iso ... --debian ... --internet
 
 (the Debian image as raw: `qemu-img convert -O raw` the .qcow2). Needs
 xorriso, ssh and ssh-keygen on the host for Alpine, sfdisk and debugfs for
@@ -129,9 +138,23 @@ def extract(iso, tmp):
     return out
 
 
+def web(tmp):
+    """A page on a web server on the test machine, for a guest to fetch
+    through NAT: the server, the URL a guest reaches it at, and what the
+    page says."""
+    www = os.path.join(tmp, "www")
+    os.makedirs(www)
+    token = "nos-nat-%d" % os.getpid()
+    with open(os.path.join(www, "nat.txt"), "w") as f:
+        f.write(token + "\n")
+    server, port = hvl.web_server(www)
+    return server, "http://10.0.2.2:%d/nat.txt" % port, token
+
+
 def alpine(args):
     tmp = tempfile.mkdtemp(prefix="nos-hvdistro-")
     files = extract(args.iso, tmp)
+    server, url, token = web(tmp)
     key = os.path.join(tmp, "id_test")
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "hv-distro-test", "-f", key],
                    check=True)
@@ -146,6 +169,14 @@ def alpine(args):
     key_line = x("mkdir -p /root/.ssh && echo '%s' > /root/.ssh/authorized_keys && echo key-ok" % pubkey)
     sshd_line = x("/usr/sbin/sshd -o HostKey=/etc/ssh/ssh_host_ed25519_key && echo sshd-ok")
     forward_line = "hv forward add %d 0 22" % SSH_PORT
+    resolv_line = x("cat /etc/resolv.conf")
+    nat_line = x("wget -q -O - " + url)
+    # One type asked for: BusyBox matches answers to questions by their ID
+    # alone, which musl makes of the clock's nanoseconds -- the same for an A
+    # and an AAAA question, on a guest whose clock moves in ticks.
+    internet = [x("nslookup -type=a dl-cdn.alpinelinux.org"),
+                x("apk -X http://dl-cdn.alpinelinux.org/alpine/v$(cut -d. -f1,2 /etc/alpine-release)/main"
+                  " update", 600)] if args.internet else []
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 " + PROMPT]
     rc = (["insmod /hv.ko", "hv on",
@@ -164,7 +195,10 @@ def alpine(args):
              eth_line,
              ping_line,
              "ping " + GUEST_IP,
-             apk_line,
+             resolv_line,
+             nat_line]
+          + internet
+          + [apk_line,
              keygen_line,
              key_line,
              sshd_line,
@@ -225,6 +259,23 @@ def alpine(args):
         pt.check("it pings nos, at 10.0.100.1",
                  "3 packets transmitted, 3 packets received" in out(ping_line), out(ping_line)[-600:])
         pt.check("and nos pings it", "reply from " + GUEST_IP in out("ping " + GUEST_IP), out("ping " + GUEST_IP)[-600:])
+        pt.check("its resolv.conf names the DNS server nos was given, from ip=",
+                 re.search(r"(?m)^nameserver 10\.0\.2\.3\s*$", out(resolv_line)) is not None, out(resolv_line))
+        pt.check("it fetches a page from the test machine, through nos's NAT", token in out(nat_line),
+                 out(nat_line)[-600:])
+        if args.internet:
+            # The mirror is a CDN's: the name is an alias, and the address
+            # comes under the name it stands for.
+            pt.check("it looks Alpine's mirror up by name, through that DNS server",
+                     re.search(r"Non-authoritative answer:[\s\S]*Address: \d+\.\d+\.\d+\.\d+",
+                               out(internet[0])) is not None, out(internet[0])[-600:])
+            # apk names each repository it has an index of with the index's
+            # version: the mirror's is there only if it was fetched.
+            pt.check("and apk updates from it, over the internet",
+                     re.search(r"v\d+\.\d+\.\d+-\d+-g[0-9a-f]+ \[http://dl-cdn\.alpinelinux\.org/alpine/v[\d.]+/main\]",
+                               out(internet[1])) is not None
+                     and re.search(r"OK: \d+ distinct packages available", out(internet[1])) is not None,
+                     out(internet[1])[-600:])
         pt.check("apk installs openssh-server from the ISO",
                  re.search(r"Installing openssh-server \(", out(apk_line)) is not None
                  and re.search(r"OK: .* packages", out(apk_line)) is not None, out(apk_line)[-600:])
@@ -250,6 +301,7 @@ def alpine(args):
         pt.check("ssh from outside logs into the guest, through hv forward, as root",
                  "uid=0(root)" in answer and "-virt" in answer, answer[-600:])
     finally:
+        server.shutdown()
         if p is not None:
             pt.kill(p)
         if args.keep or pt.failures:
@@ -272,6 +324,10 @@ DEBIAN_CMDLINE = ("root=/dev/vda1 ro console=ttyS0 nolapic acpi=off"
                   " systemd.set_credential=firstboot.keymap:us"
                   " systemd.set_credential=firstboot.timezone:UTC")
 DEBIAN_PROMPT = "root@localhost:~#"
+# What the image lacks to configure its ethernet itself, given the way the
+# rest is: a .network file, as a credential systemd-network-generator puts
+# in /run/systemd/network. Any ethernet link, by DHCP.
+DEBIAN_NETWORK = "[Match]\nType=ether\n\n[Network]\nDHCP=ipv4\n"
 
 
 def debian_boot_files(image, tmp):
@@ -311,17 +367,28 @@ def debian(args):
     subprocess.run(["cp", "--sparse=always", args.debian, os.path.join(rootdir, "debian.raw")], check=True)
     marker = "nos-was-here-%d" % os.getpid()
 
+    server, url, token = web(tmp)
+    import base64
+    cmdline = (DEBIAN_CMDLINE + " systemd.set_credential_binary=network.network.50-nos:" +
+               base64.b64encode(DEBIAN_NETWORK.encode()).decode())
+
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
     marker_line = x("echo %s > /root/nos.txt && sync && cat /root/nos.txt" % marker)
-    net_line = x("dev=$(ls /sys/class/net | grep -v '^lo$' | head -1); ip addr add %s/24 dev $dev"
-                 " && ip link set $dev up && ping -c 3 10.0.100.1" % GUEST_IP)
+    net_lines = [x("ip -4 -o addr show scope global"),
+                 x("ip -4 route show default"),
+                 x("ping -c 3 10.0.100.1"),
+                 x("resolvectl --no-pager dns"),
+                 x("curl -s " + url)]
+    internet = [x("getent hosts deb.debian.org"),
+                x("curl -sI http://deb.debian.org/debian/dists/stable/Release | head -1", 120)
+                ] if args.internet else []
     kept_line = x("cat /root/nos.txt")
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
                 r"hv send 0 %s\n" % DEBIAN_PASSWORD, "hv wait 0 secs=120 " + DEBIAN_PROMPT]
     rc = (["insmod /hv.ko", "hv on",
            "hv start /bzImage mem=%d initrd=/initrd disk=/debian.raw net restart cmdline=%s"
-           % (args.debian_mem, DEBIAN_CMDLINE)]
+           % (args.debian_mem, cmdline)]
           + login(0)
           + [x("cat /etc/debian_version; uname -r"),
              x("systemctl is-system-running --wait", 300),
@@ -329,12 +396,12 @@ def debian(args):
              x("findmnt -rno SOURCE,FSTYPE,OPTIONS /"),
              x("date -u +%s")]
           + clock_lines(0, x)
-          + [marker_line,
-             # The image configures no ethernet interface (networkd has no
-             # .network for one, and no cloud-init to write one): its own
-             # virtio-net driver, given the port's address by hand.
-             net_line,
-             "ping " + GUEST_IP,
+          + [marker_line]
+          # networkd, given its .network as a credential, asks the switch's
+          # DHCP server for an address; with it, nos is the router out.
+          + net_lines
+          + internet
+          + ["ping " + GUEST_IP,
              # systemd's reboot returns at once and bash prints its prompt;
              # the boot after it is what `boot=1` waits for.
              r"hv send 0 reboot\n"]
@@ -344,8 +411,12 @@ def debian(args):
              hvl.RC_LAST])
     boot = argparse.Namespace(bzimage=vmlinuz, initrd=initrd, root_mib=args.debian_root_mib,
                               deadline=args.deadline)
+    # nos's own NIC, on QEMU's user network: its lease is the gateway and
+    # the DNS server the guest's way out is made of.
+    qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
+            "-netdev", "user,id=net0"]
     t_start = time.time()
-    p, log, image = hvl.boot_rc(boot, tmp, rc)
+    p, log, image = hvl.boot_rc(boot, tmp, rc, qemu=qemu)
     t_end = time.time()
     try:
         txt = open(log, errors="replace").read()
@@ -384,9 +455,26 @@ def debian(args):
         pt.check("reboot resets it, and the VM boots again", 'printed "login:" in boot 1' in out(second[0]),
                  out(second[0]))
         pt.check("root logs in again", "printed \"%s\"" % DEBIAN_PROMPT in out(second[4], 1), out(second[4], 1))
+        addr = out(net_lines[0])
+        pt.check("networkd takes the port's address from the switch's DHCP server",
+                 re.search(r"inet %s/24 .*\bdynamic\b" % re.escape(GUEST_IP), addr) is not None, addr[-900:])
+        pt.check("with nos as its router",
+                 re.search(r"default via 10\.0\.100\.1 .*proto dhcp", out(net_lines[1])) is not None,
+                 out(net_lines[1]))
         pt.check("on the switch, its virtio-net driver reaches nos",
-                 re.search(r"3 packets transmitted, 3 (packets )?received", out(net_line)) is not None,
-                 out(net_line)[-600:])
+                 re.search(r"3 packets transmitted, 3 (packets )?received", out(net_lines[2])) is not None,
+                 out(net_lines[2])[-600:])
+        pt.check("systemd-resolved has nos's DNS server, from the lease",
+                 re.search(r"10\.0\.2\.3", out(net_lines[3])) is not None, out(net_lines[3]))
+        pt.check("curl fetches a page from the test machine, through nos's NAT", token in out(net_lines[4]),
+                 out(net_lines[4])[-600:])
+        if args.internet:
+            # The mirror is a CDN's: getent names the address by the name the
+            # alias stands for.
+            pt.check("it resolves Debian's mirror by name", re.search(r"(?m)^[0-9a-fA-F:.]+\s+\S+",
+                     out(internet[0])) is not None, out(internet[0]))
+            pt.check("and fetches from it, over the internet", re.search(r"HTTP/\S+ 200", out(internet[1]))
+                     is not None, out(internet[1]))
         pt.check("and nos reaches it", "reply from " + GUEST_IP in out("ping " + GUEST_IP),
                  out("ping " + GUEST_IP)[-600:])
         pt.check("and the file is still there: the disk kept what the guest wrote",
@@ -394,6 +482,7 @@ def debian(args):
         pt.check("hv list counts the reboot", re.search(r"vm 0\s+running.*restarts 1\b", out("hv list"))
                  is not None, out("hv list"))
     finally:
+        server.shutdown()
         if p is not None:
             pt.kill(p)
         if args.keep or pt.failures:
@@ -412,6 +501,9 @@ def main():
     ap.add_argument("--root-mib", type=int, default=256, help="nos's root filesystem for Alpine, MiB")
     ap.add_argument("--debian-root-mib", type=int, default=3700, help="nos's root filesystem for Debian, MiB")
     ap.add_argument("--deadline", type=int, default=1800, help="seconds to wait for /etc/rc to finish")
+    ap.add_argument("--internet", action="store_true",
+                    help="also reach the internet through NAT: a name looked up, and a distribution's mirror "
+                         "fetched from; needs the test machine to have both")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
     args = ap.parse_args()
     if not args.iso and not args.debian:

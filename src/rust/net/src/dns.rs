@@ -140,6 +140,11 @@ impl Dns {
         true
     }
 
+    /// The server it asks, while it runs; 0 before.
+    pub fn server(&self) -> u32 {
+        if self.is_ready() { self.state.lock().server_ip } else { 0 }
+    }
+
     /* ---- the cache ---- */
 
     fn lookup(&self, name: &[u8]) -> Option<u32> {
@@ -453,4 +458,23 @@ fn skip_name(packet: &[u8], at: usize) -> Option<usize> {
     }
 
     None
+}
+
+/// The DNS server this machine was given: the resolver's while it runs,
+/// else the one the DHCP lease named. 0 for none -- no lease, or one that
+/// named no server. What the hypervisor's guests are handed as theirs.
+/// Allocates nothing, from any context: what has not been made has nothing
+/// to say.
+pub fn upstream() -> u32 {
+    let resolver = abi::dns_if_made().map_or(0, |dns| dns.server());
+    if resolver != 0 {
+        return resolver;
+    }
+    abi::dhcp_if_made().map_or(0, |dhcp| if dhcp.is_ready() { dhcp.lease().dns } else { 0 })
+}
+
+/// `upstream`, for a module: host byte order, 0 for none.
+#[no_mangle]
+pub extern "C" fn kernel_net_dns_server() -> u32 {
+    upstream()
 }

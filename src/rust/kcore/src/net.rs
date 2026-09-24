@@ -245,6 +245,56 @@ impl Nic {
     }
 }
 
+/// Why NAT would not go on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NatError {
+    /// No device has a gateway to go out through: no lease yet, or none of
+    /// them routes anywhere.
+    NoUplink,
+    /// This device will not do: it has no address, or names none.
+    Device,
+    /// It is on already: there is one at a time.
+    Busy,
+    NoMemory,
+}
+
+/// NAT from a device out through the machine's default route, for as long
+/// as this lives: `Nic::nat`.
+pub struct Nat {
+    inner: usize,
+    outer: Nic,
+}
+
+impl Nic {
+    /// NAT on: what is behind this device -- a virtual NIC's guests --
+    /// reaches the world through the device the default route is on, from
+    /// that device's address, until the returned value is dropped. One at a
+    /// time in the whole kernel. Task context: it allocates its table.
+    pub fn nat(&self) -> core::result::Result<Nat, NatError> {
+        let on = net::kernel_net_nat_enable(self.handle);
+        match on.code {
+            0 => Ok(Nat { inner: self.handle, outer: Nic { handle: on.outer } }),
+            1 => Err(NatError::NoUplink),
+            3 => Err(NatError::Busy),
+            4 => Err(NatError::NoMemory),
+            _ => Err(NatError::Device),
+        }
+    }
+}
+
+impl Nat {
+    /// The device it goes out through.
+    pub fn outer(&self) -> Nic {
+        self.outer
+    }
+}
+
+impl Drop for Nat {
+    fn drop(&mut self) {
+        net::kernel_net_nat_disable(self.inner);
+    }
+}
+
 /// A UDP port listened on, from `Nic::listen`; given back on drop, once
 /// no call of its callback is still running -- so what the callback reaches
 /// may go right after. Task context: the drop may wait.
@@ -474,6 +524,13 @@ impl Drop for NetFrame {
 /// had to find the frames an interrupt should have announced.
 pub fn rx_stats() -> RxStats {
     net::kernel_net_rx_stats()
+}
+
+/// The DNS server this machine was given -- its resolver's, or its DHCP
+/// lease's -- host byte order. None when it was given none.
+pub fn dns_server() -> Option<u32> {
+    let ip = net::kernel_net_dns_server();
+    if ip == 0 { None } else { Some(ip) }
 }
 
 /// `dhcp=off`: the kernel was told not to run a DHCP client.

@@ -8,6 +8,18 @@ pub struct Resolved {
     pub mac: [u8; 6],
 }
 
+/// What `kernel_net_nat_enable` answers.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NatOn {
+    /// 0 on; 1 no device has a gateway to go out through; 2 the device
+    /// will not do -- no such device, or one with no address; 3 on
+    /// already; 4 no memory for the table.
+    pub code: i32,
+    /// The device it goes out through, a kernel_net_find handle, when on.
+    pub outer: usize,
+}
+
 /// What `kernel_net_rx_stats` answers: the counters that say whether the
 /// receive path is keeping up, summed over every device. They only grow,
 /// but for `pool_in_flight`, which is a level.
@@ -90,6 +102,21 @@ unsafe extern "C" {
     /// How many bytes the frame's buffer has room for.
     pub fn kernel_netframe_capacity(handle: usize) -> usize;
     pub fn kernel_netframe_set_len(handle: usize, len: usize);
+}
+
+/* NAT (net/src/nat.rs): what is behind one device -- a virtual NIC's guests
+   -- reaches the world through the device the default route is on, from
+   that device's address. One at a time, and off again only by the one that
+   put it on: kcore::net::Nat is that. */
+unsafe extern "C" {
+    /// NAT on, from the device `inner` names -- a kernel_net_find handle.
+    /// Task context: it allocates its table.
+    pub safe fn kernel_net_nat_enable(inner: usize) -> NatOn;
+    /// NAT off, if it is on for the device `inner` names: 1 when it was.
+    pub safe fn kernel_net_nat_disable(inner: usize) -> i32;
+    /// The DNS server this machine was given -- its resolver's, or the
+    /// DHCP lease's -- host byte order; 0 for none.
+    pub safe fn kernel_net_dns_server() -> u32;
 }
 
 /* What netconsole needs of the kernel: what it was asked for, the log that

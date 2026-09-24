@@ -96,8 +96,8 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them |
-| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, its root written to and kept across a reboot |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given |
+| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--internet]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -427,8 +427,22 @@ virtio-pci, virtio-blk and ext4 built in.
 `--net` is the guests' network: two guests with `net`; each has its port's
 address and MAC; a guest pings nos at 10.0.100.1 and each pings the other;
 nos pings a guest out of `hv0`; and a page from one guest's `httpd` is
-fetched from outside QEMU through `hv forward`. It needs a guest kernel with
-networking, virtio-net and `ip=` configuration built in.
+fetched from outside QEMU through `hv forward`. Then the way out, through
+nos's NAT: the guest's `/proc/net/pnp` names nos's DNS server (`ip=`'s
+`dns0`); it fetches a page and a megabyte from a web server the test runs on
+127.0.0.1 -- 10.0.2.2 to QEMU's user network, so beyond nos -- and the
+megabyte's md5 must match; it pings 10.0.2.2; `udhcpc` must be given its
+port's address, nos as its router and nos's DNS server by the switch; and
+`nat` must say it is on from `hv0` through eth0 and count the megabyte's
+segments back, `hv list` the address the guests go out from and the DHCP
+answers. With `--internet`, a name is also looked up through that DNS server
+-- which needs the test machine to resolve names. One question at a time:
+BusyBox's `nslookup` asks for A and AAAA at once and matches answers to
+questions by their ID alone, which musl takes from the clock's nanoseconds,
+and a TCG guest's clock moves in ticks -- both questions got one ID, and one
+answer was thrown away as the other's duplicate (the capture showed both
+answered). It needs a guest kernel with networking, virtio-net, packet
+sockets and `ip=` configuration built in.
 
 ### `hv-distro-test.py` -- a distribution, as it ships
 
@@ -449,7 +463,10 @@ that its clock is the host's, from the emulated RTC, to within minutes; that
 the ISO is read-only to it -- the driver says so and a write fails; that
 `reboot` resets it, `restart` boots it again, and root logs in again; that
 its initramfs configured eth0 from the VM's `ip=`, it pings nos and nos
-pings it; that `apk add openssh-server` installs from the ISO; and that the
+pings it; that its `resolv.conf` names nos's DNS server and it fetches a page
+from the test machine through NAT (with `--internet`, it also looks Alpine's
+mirror up by name and `apk update`s from it); that `apk add openssh-server`
+installs from the ISO; and that the
 test, from outside QEMU, logs into the guest's own sshd through QEMU's
 forward, nos's `hv forward` and the switch. Two boots and apk under TCG:
 about five minutes. It needs `xorriso`, `ssh` and `ssh-keygen` on the host.
@@ -461,8 +478,12 @@ image, copied sparse, the guest's writable disk -- with systemd-firstboot
 given the root password, locale, keymap and timezone as credentials on the
 kernel command line; and checks that root logs in with that password, that
 `systemctl is-system-running` says running with no unit failed, that its
-root is `/dev/vda1`, ext4, read-write, that its clock is the host's, that
-given its port's address its virtio-net driver reaches nos and nos it, and
+root is `/dev/vda1`, ext4, read-write, that its clock is the host's; that
+systemd-networkd, given a `.network` for its ethernet as one more
+credential, takes its port's address, nos as its router and nos's DNS server
+from the switch's DHCP server, reaches nos, and fetches a page from the test
+machine through NAT with curl (with `--internet`, resolves Debian's mirror
+and fetches from it); and that nos reaches it, and
 that a file written to its root is still there after `reboot` (waited for
 with `hv wait ... boot=1`, since systemd's `reboot` hands the shell its
 prompt back first).

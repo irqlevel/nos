@@ -649,8 +649,13 @@ impl Vms {
                 let _ = writeln!(out, "hv: vm {} not started -- every port of the switch is taken", id);
                 return;
             };
+            /* Its way out, and the DNS server it is told of: a guest with no
+             * way out still reaches nos and the other guests. */
+            if let Err(why) = switch.way_out() {
+                let _ = writeln!(out, "hv: vm {} has no way out of the switch -- {}", id, net::nat_why(why));
+            }
             spec.cmdline.push(' ');
-            spec.cmdline.push_str(&net::ip_param(port));
+            spec.cmdline.push_str(&net::ip_param(port, switch.dns()));
             spec.nic = Some(NicSpec { port, switch: switch.clone() });
             hold = Some(PortHold { switch, port, kept: false });
         }
@@ -752,9 +757,17 @@ impl Vms {
         }
         drop(table);
         if let Some(s) = self.switch.lock().as_ref() {
-            let (to_host, refused) = s.host_counts();
-            let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take",
-                             net::dotted(net::HOST_IP), to_host, refused);
+            let (to_host, refused, dhcp) = s.host_counts();
+            let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take, {} DHCP answers",
+                             net::dotted(net::HOST_IP), to_host, refused, dhcp);
+            match s.nat_address() {
+                Some(ip) => {
+                    let _ = writeln!(out, "the guests go out through NAT, from {} (nos's nat command)", net::dotted(ip));
+                }
+                None => {
+                    let _ = writeln!(out, "the guests have no way out: NAT is not on");
+                }
+            }
         }
     }
 

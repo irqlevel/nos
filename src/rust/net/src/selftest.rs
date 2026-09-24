@@ -186,7 +186,8 @@ fn echo_exchange() -> bool {
 /// Everything above. 0 when every check passed.
 #[no_mangle]
 pub extern "C" fn rust_net_selftest() -> i32 {
-    let ok = checksum_vectors() & headers() & arp_packets() & echo_exchange();
+    let ok = checksum_vectors() & headers() & arp_packets() & echo_exchange()
+        & crate::nat::selftest();
 
     if ok {
         trace!(0, "net selftest: passed");

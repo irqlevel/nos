@@ -11,6 +11,13 @@
 //! not come from there -- for a broadcast, a multicast or a MAC that is no
 //! port's.
 //!
+//! The switch is also the guests' way out: while it exists, NAT is on from
+//! `hv0` through the device nos's default route is on, so a guest reaches
+//! whatever nos can, from nos's address (`net/src/nat.rs`). And it answers
+//! DHCP itself (`dhcp.rs`): a guest that asks is told its port's address,
+//! nos as its router and the DNS server nos was given as its own -- which
+//! `ip=` also carries, as its `dns0`.
+//!
 //! A port's inbox holds what waits for the guest's NIC. It is filled from any
 //! CPU, the host's transmit path among them with interrupts off, so it is a
 //! spin lock with interrupts off over storage taken when the switch was made:
@@ -23,11 +30,13 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use kcore::sync::IrqSpinLock;
+use kcore::net::{Nat, NatError};
+use kcore::sync::{IrqSpinLock, Mutex};
 use kcore::vnic::{Attached, Vnic, VnicSink};
 
+use crate::dhcp;
 use crate::vms::Shared;
 
 /// The most ports: a VM each.
@@ -76,9 +85,25 @@ pub fn dotted(ip: u32) -> String {
 /// device, which is the first one there is: a kernel told `eth0` waits
 /// twelve seconds for it to appear, and one whose NIC driver is a module its
 /// initramfs loads (a distribution's) finds none there before it gives up,
-/// and leaves `ip=` to the initramfs.
-pub fn ip_param(port: usize) -> String {
-    alloc::format!("ip={}::{}:{}:::off", dotted(port_ip(port)), dotted(HOST_IP), dotted(MASK))
+/// and leaves `ip=` to the initramfs. Then the DNS server, when there is
+/// one to give: `dns0`, which the kernel shows in /proc/net/pnp and an
+/// initramfs (Alpine's) writes to resolv.conf.
+pub fn ip_param(port: usize, dns: Option<u32>) -> String {
+    let ip = alloc::format!("ip={}::{}:{}:::off", dotted(port_ip(port)), dotted(HOST_IP), dotted(MASK));
+    match dns {
+        Some(dns) => alloc::format!("{}:{}", ip, dotted(dns)),
+        None => ip,
+    }
+}
+
+/// Why the guests have no way out, as `hv` says it.
+pub fn nat_why(why: NatError) -> &'static str {
+    match why {
+        NatError::NoUplink => "no device of nos's has a gateway to send them through",
+        NatError::Device => "hv0 has no address",
+        NatError::Busy => "NAT is on already, for something else",
+        NatError::NoMemory => "out of memory for NAT's table",
+    }
 }
 
 /// What waits for one guest's NIC.
@@ -105,6 +130,11 @@ pub struct Ports {
     vnic: Vnic,
     to_host: AtomicU64,
     refused: AtomicU64,
+    /// The DNS server DHCP hands out, as last asked of the kernel; 0 for
+    /// none.
+    dns: AtomicU32,
+    /// DHCP messages answered.
+    dhcp: AtomicU64,
 }
 
 impl Ports {
@@ -131,10 +161,17 @@ impl Ports {
     }
 
     /// A frame to wherever its destination says, from port `from` -- or
-    /// from `hv0`, which a frame from there never goes back to.
+    /// from `hv0`, which a frame from there never goes back to. A guest's
+    /// DHCP message is answered here, and goes nowhere.
     fn forward(&self, from: Option<usize>, frame: &[u8]) {
-        if frame.len() < 14 {
+        if frame.len() < netwire::ETH_HDR_LEN {
             return;
+        }
+        if let Some(port) = from {
+            if dhcp::is_request(frame) {
+                self.answer_dhcp(port, frame);
+                return;
+            }
         }
         let dst = &frame[..6];
         let broadcast = dst[0] & 1 != 0;
@@ -157,6 +194,18 @@ impl Ports {
             }
         }
         self.to_host(from, frame);
+    }
+
+    fn answer_dhcp(&self, port: usize, frame: &[u8]) {
+        let network = dhcp::Network {
+            server_ip: HOST_IP, server_mac: HOST_MAC, mask: MASK,
+            dns: self.dns.load(Ordering::Relaxed),
+        };
+        let mut reply = [0u8; dhcp::REPLY_MAX];
+        if let Some(len) = dhcp::answer(frame, port_ip(port), &network, &mut reply) {
+            self.dhcp.fetch_add(1, Ordering::Relaxed);
+            self.deliver(port, &reply[..len]);
+        }
     }
 
     fn to_host(&self, from: Option<usize>, frame: &[u8]) {
@@ -215,10 +264,14 @@ impl hv::nic::Backend for PortBackend {
     }
 }
 
-/// The switch: the ports, and `hv0`'s sink attached for as long as it lives.
+/// The switch: the ports, `hv0`'s sink attached for as long as it lives, and
+/// NAT for the guests while there is a way out.
 pub struct Switch {
-    /// Dropped first -- fields go in the order they are declared: `hv0`'s
-    /// sink detached, and any call of it waited out, before the ports go.
+    /// Fields go in the order they are declared. NAT first: no guest's packet
+    /// is sent on once the switch starts to go.
+    nat: Mutex<Option<Nat>>,
+    /// Then `hv0`'s sink detached, and any call of it waited out, before
+    /// the ports go.
     _uplink: Attached,
     ports: Arc<Ports>,
 }
@@ -241,10 +294,43 @@ impl Switch {
                 dropped: AtomicU64::new(0),
             });
         }
-        let ports = Arc::new(Ports { ports, vnic, to_host: AtomicU64::new(0), refused: AtomicU64::new(0) });
+        let ports = Arc::new(Ports {
+            ports, vnic, to_host: AtomicU64::new(0), refused: AtomicU64::new(0),
+            dns: AtomicU32::new(0), dhcp: AtomicU64::new(0),
+        });
+        let nat = Mutex::new(None).ok_or_else(|| String::from("out of memory for the switch"))?;
         let uplink = vnic.attach(Arc::new(Uplink(ports.clone())))
             .ok_or_else(|| String::from("hv0 has a sink attached already -- another load of hv?"))?;
-        Ok(Switch { _uplink: uplink, ports })
+        Ok(Switch { nat, _uplink: uplink, ports })
+    }
+
+    /// The guests' way out: NAT on, if it is not yet, through the device
+    /// nos's default route is on -- the address they go out from, or why
+    /// there is none. Asked at every start of a guest with a NIC, so one
+    /// that finds no way out does not keep the next from having one once
+    /// nos has a lease. Task context.
+    pub fn way_out(&self) -> Result<u32, NatError> {
+        let mut nat = self.nat.lock();
+        if let Some(n) = nat.as_ref() {
+            return Ok(n.outer().ip());
+        }
+        let n = self.ports.vnic.nic().ok_or(NatError::Device)?.nat()?;
+        let ip = n.outer().ip();
+        *nat = Some(n);
+        Ok(ip)
+    }
+
+    /// The address the guests go out from, while NAT is on.
+    pub fn nat_address(&self) -> Option<u32> {
+        self.nat.lock().as_ref().map(|n| n.outer().ip())
+    }
+
+    /// The DNS server the guests are given, asked of the kernel afresh: for
+    /// `ip=`, and for what DHCP hands out from here on.
+    pub fn dns(&self) -> Option<u32> {
+        let dns = kcore::net::dns_server();
+        self.ports.dns.store(dns.unwrap_or(0), Ordering::Relaxed);
+        dns
     }
 
     /// A free port for `vm`: its number, or None when all are taken.
@@ -291,8 +377,10 @@ impl Switch {
         self.ports.ports.get(port).map_or(0, |p| p.dropped.load(Ordering::Relaxed))
     }
 
-    /// What went to the host, and what the host would not take.
-    pub fn host_counts(&self) -> (u64, u64) {
-        (self.ports.to_host.load(Ordering::Relaxed), self.ports.refused.load(Ordering::Relaxed))
+    /// What went to the host, what the host would not take, and the DHCP
+    /// messages answered.
+    pub fn host_counts(&self) -> (u64, u64, u64) {
+        (self.ports.to_host.load(Ordering::Relaxed), self.ports.refused.load(Ordering::Relaxed),
+         self.ports.dhcp.load(Ordering::Relaxed))
     }
 }

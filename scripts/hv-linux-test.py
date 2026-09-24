@@ -431,13 +431,57 @@ def disk(args):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def web_server(root):
+    """A web server on the test machine, serving `root` on 127.0.0.1 --
+    which QEMU's user network puts at 10.0.2.2 for nos, and NAT for the
+    guests behind it: the server and its port."""
+    import functools
+    import http.server
+    import threading
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Quiet, directory=root))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
 def network(args):
     """The guests' network: two guests on the switch, each with its address
     from its port; each pings nos at 10.0.100.1 and the other guest, and
-    nos pings a guest back through hv0."""
+    nos pings a guest back through hv0. Then their way out, NAT from nos's
+    own address: a page and a megabyte from a web server on the test
+    machine -- at 10.0.2.2, where QEMU's user network puts it -- and a ping
+    there; the DNS server nos was given, as ip= hands it to the guest; the
+    switch's DHCP server, asked by udhcpc; and with --internet, a name
+    looked up through that DNS server."""
+    import hashlib
     tmp = tempfile.mkdtemp(prefix="nos-hvnet-")
+    www = os.path.join(tmp, "www")
+    os.makedirs(www)
+    token = "nos-nat-%d" % os.getpid()
+    with open(os.path.join(www, "nat.txt"), "w") as f:
+        f.write(token + "\n")
+    big = os.urandom(1 << 20)
+    with open(os.path.join(www, "big"), "wb") as f:
+        f.write(big)
+    server, web = web_server(www)
     x = lambda vm, line, secs=60: "hv exec %d secs=%d %s" % (vm, secs, line)
     start = "hv start /bzImage mem=%d initrd=/initrd net cmdline=%s" % (args.mem, args.cmdline)
+    way_out = [x(0, "cat /proc/net/pnp"),
+               x(0, "wget -q -O - http://10.0.2.2:%d/nat.txt" % web),
+               x(0, "ping -c 3 10.0.2.2"),
+               x(0, "wget -q -O - http://10.0.2.2:%d/big | md5sum" % web, 600),
+               x(0, "echo 'echo lease $1 $ip $subnet $router $dns' > /dhcp.sh && chmod +x /dhcp.sh"),
+               x(0, "udhcpc -i eth0 -f -q -n -t 5 -s /dhcp.sh"),
+               x(0, "mkdir -p /etc && ln -sf /proc/net/pnp /etc/resolv.conf"),
+               # One type asked for: BusyBox matches answers to questions by
+               # their ID alone, which musl makes of the clock's nanoseconds --
+               # the same for both, on a guest whose clock moves in ticks.
+               x(0, "nslookup -type=a example.com" if args.internet else "true"),
+               "nat", "hv list"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -450,8 +494,7 @@ def network(args):
           x(1, "echo nos-http-hello > /www/index.html"),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
-          "hv forward",
-          RC_LAST]
+          "hv forward"] + way_out + [RC_LAST]
     port = free_port()
     qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
             "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080" % port]
@@ -485,7 +528,34 @@ def network(args):
                 time.sleep(3)
         pt.check("a page from the guest's httpd, fetched from outside through hv forward",
                  b"nos-http-hello" in body, body[-300:])
+
+        # The way-out lines, each the last run of its text: "hv list" is run
+        # before them too.
+        way = lambda i: ([o for (c, o) in secs if c == way_out[i].strip()] or [""])[-1]
+        pt.check("ip= gave the guest nos's DNS server, 10.0.2.3", "nameserver 10.0.2.3" in way(0), way(0))
+        pt.check("a guest fetches a page from the test machine through NAT", token in way(1), way(1)[-600:])
+        pt.check("and pings it", ok_ping(way(2)), way(2)[-600:])
+        pt.check("a megabyte through NAT arrives whole", hashlib.md5(big).hexdigest() in way(3), way(3)[-600:])
+        pt.check("the switch's DHCP server gives the guest its port's address, nos as its router, "
+                 "and nos's DNS server",
+                 re.search(r"lease bound 10\.0\.100\.2 255\.255\.255\.0 10\.0\.100\.1 10\.0\.2\.3", way(5))
+                 is not None, way(5)[-800:])
+        if args.internet:
+            pt.check("a name is looked up through that DNS server",
+                     re.search(r"Name:\s+example\.com[\s\S]*Address", way(7)) is not None, way(7)[-800:])
+        # The megabyte is 700-odd segments in; what goes out is the guest's
+        # acknowledgements, far fewer since its virtio-net driver hands its
+        # stack runs of segments at once.
+        nat = way(8)
+        counts = re.search(r"out (\d+)  back (\d+)  mapped (\d+)", nat)
+        pt.check("nat: on, from hv0 out through eth0, and it carried the guests' packets both ways",
+                 "nat: on, hv0 (10.0.100.1) out through eth0 (10.0.2.15)" in nat and counts is not None
+                 and int(counts.group(1)) > 20 and int(counts.group(2)) > 700, nat[-800:])
+        pt.check("hv list says the guests go out through NAT, and counts the DHCP answers",
+                 "the guests go out through NAT, from 10.0.2.15" in way(9)
+                 and re.search(r"[1-9]\d* DHCP answers", way(9)) is not None, way(9)[-800:])
     finally:
+        server.shutdown()
         pt.kill(p)
         if args.keep or pt.failures:
             print("log at " + log)
@@ -592,6 +662,9 @@ def main():
     ap.add_argument("--net", action="store_true",
                     help="instead: the guests' network (needs --initrd, and a guest kernel with PCI, "
                          "legacy virtio-pci, virtio-net, IP and ip= configuration)")
+    ap.add_argument("--internet", action="store_true",
+                    help="with --net: also look a name up through the DNS server the guest was given, "
+                         "which needs the test machine to resolve names")
     ap.add_argument("--root-mib", type=int, default=128, help="nos's root filesystem image's size")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM even if the host has AMD-V")
     ap.add_argument("--keep", action="store_true", help="keep the serial log (it is kept on a failure anyway)")

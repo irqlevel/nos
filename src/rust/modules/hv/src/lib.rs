@@ -34,6 +34,8 @@ extern crate alloc;
 #[cfg(target_arch = "x86_64")]
 mod boot;
 #[cfg(target_arch = "x86_64")]
+mod dhcp;
+#[cfg(target_arch = "x86_64")]
 mod guest;
 #[cfg(target_arch = "x86_64")]
 mod forward;
