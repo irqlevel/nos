@@ -18,14 +18,17 @@
 //! nos as its router and the DNS server nos was given as its own -- which
 //! `ip=` also carries, as its `dns0`.
 //!
-//! A port's inbox holds what waits for the guest's NIC. It is filled from any
-//! CPU, the host's transmit path among them with interrupts off, so it is a
-//! spin lock with interrupts off over storage taken when the switch was made:
-//! nothing on the way allocates, and a full inbox drops, counted. A frame put
-//! in wakes the VM it belongs to -- a halted guest's vCPU waits on the VM's
-//! event -- by a signal made under the inbox's lock, which is also what
-//! keeps the VM there while it is made: the port gives the VM up in task
-//! context, the lock down.
+//! A port's inbox holds what waits for the guest's NIC: as many frames as the
+//! guest posts buffers for, so that a burst its ring would take is not
+//! dropped on the way to it. It is filled from any CPU, the host's transmit
+//! path among them with interrupts off, so it is a spin lock with interrupts
+//! off over storage taken when the port is first claimed and kept for the
+//! next VM on it: nothing on the way allocates, and a full inbox drops,
+//! counted. A frame put in wakes the VM it belongs to -- a halted guest's
+//! vCPU waits on the VM's event, a running one is kicked out of its guest
+//! (`hv::Kick`) -- by a signal made under the inbox's lock, which is also
+//! what keeps the VM there while it is made: the port gives the VM up in
+//! task context, the lock down.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -41,8 +44,10 @@ use crate::vms::Shared;
 
 /// The most ports: a VM each.
 pub const MAX_PORTS: usize = 16;
-/// Frames an inbox holds.
-const INBOX_FRAMES: usize = 64;
+/// Frames an inbox holds: the guest's receive ring's worth (a virtio NIC's
+/// queue has 256 entries). At 64, a guest fetching over several connections
+/// at once lost frames on every burst, kicked or not.
+const INBOX_FRAMES: usize = 256;
 const FRAME: usize = hv::nic::MAX_FRAME;
 
 /// The host's end: its name, MAC and address, and the subnet's mask.
@@ -110,6 +115,8 @@ pub fn nat_why(why: NatError) -> &'static str {
 struct Inbox {
     /// The VM on the port; None while it is free.
     owner: Option<Arc<Shared>>,
+    /// Room for `INBOX_FRAMES` while a VM owns the port -- taken when the
+    /// port is first claimed, and kept for the next -- and none before.
     frames: Vec<[u8; FRAME]>,
     lens: [u16; INBOX_FRAMES],
     head: usize,
@@ -288,11 +295,10 @@ impl Switch {
         let mut ports = Vec::new();
         ports.try_reserve_exact(MAX_PORTS).map_err(|_| String::from("out of memory for the switch"))?;
         for _ in 0..MAX_PORTS {
-            let mut frames = Vec::new();
-            frames.try_reserve_exact(INBOX_FRAMES).map_err(|_| String::from("out of memory for the switch"))?;
-            frames.resize(INBOX_FRAMES, [0u8; FRAME]);
             ports.push(Port {
-                inbox: IrqSpinLock::new(Inbox { owner: None, frames, lens: [0; INBOX_FRAMES], head: 0, count: 0 }),
+                inbox: IrqSpinLock::new(Inbox {
+                    owner: None, frames: Vec::new(), lens: [0; INBOX_FRAMES], head: 0, count: 0,
+                }),
                 waiting: AtomicUsize::new(0),
                 dropped: AtomicU64::new(0),
             });
@@ -336,21 +342,41 @@ impl Switch {
         dns
     }
 
-    /// A free port for `vm`: its number, or None when all are taken.
-    pub fn claim(&self, vm: &Arc<Shared>) -> Option<usize> {
+    /// A free port for `vm`: its number, or why there is none. The first
+    /// VM on a port gives it its inbox's room, taken here with no lock held.
+    pub fn claim(&self, vm: &Arc<Shared>) -> Result<usize, &'static str> {
         for (i, p) in self.ports.ports.iter().enumerate() {
+            let roomless = {
+                let inbox = p.inbox.lock();
+                if inbox.owner.is_some() {
+                    continue;
+                }
+                inbox.frames.is_empty()
+            };
+            let mut room = Vec::new();
+            if roomless {
+                room.try_reserve_exact(INBOX_FRAMES).map_err(|_| "out of memory for its port's inbox")?;
+                room.resize(INBOX_FRAMES, [0u8; FRAME]);
+            }
             let mut inbox = p.inbox.lock();
-            if inbox.owner.is_none() {
+            /* Taken, or given its room, by another start meanwhile: the room
+             * taken here goes after the lock, and the next port is tried. */
+            if inbox.owner.is_none() && !(inbox.frames.is_empty() && room.is_empty()) {
+                if inbox.frames.is_empty() {
+                    core::mem::swap(&mut inbox.frames, &mut room);
+                }
                 /* An Arc clone under the lock: a count going up, nothing
                  * allocated. */
                 inbox.owner = Some(vm.clone());
                 inbox.head = 0;
                 inbox.count = 0;
                 p.waiting.store(0, Ordering::Release);
-                return Some(i);
+                return Ok(i);
             }
+            drop(inbox);
+            drop(room);
         }
-        None
+        Err("every port of the switch is taken")
     }
 
     /// The port given up, and its VM with it -- dropped here, the lock down.

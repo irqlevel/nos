@@ -651,9 +651,12 @@ impl Vms {
                     return;
                 }
             };
-            let Some(port) = switch.claim(&shared) else {
-                let _ = writeln!(out, "hv: vm {} not started -- every port of the switch is taken", id);
-                return;
+            let port = match switch.claim(&shared) {
+                Ok(port) => port,
+                Err(why) => {
+                    let _ = writeln!(out, "hv: vm {} not started -- {}", id, why);
+                    return;
+                }
             };
             /* Its way out, and the DNS server it is told of: a guest with no
              * way out still reaches nos and the other guests. */
