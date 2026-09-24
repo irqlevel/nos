@@ -170,6 +170,15 @@ class Test:
         check("rekeys in the middle of the output", rc == 0 and out.rstrip("\n") == big.rstrip("\n") and kexes >= 2,
               "%d bytes, %d key exchanges" % (len(out), kexes))
 
+        # A command that prints nothing for seconds, as `hv wait` does for a
+        # minute: the client asks every second whether the server is there
+        # and hangs up after two unanswered, as ServerAliveInterval has it.
+        # The session tends the connection while the command runs beside it
+        rc, out, err = self.ssh(["-o", "ServerAliveInterval=1", "-o", "ServerAliveCountMax=2", "top", "5000"],
+                                timeout=120)
+        check("keepalives are answered while a quiet command runs", rc == 0 and "5000 ms window" in out,
+              (err + out)[-300:])
+
         rc, _, err = self.ssh(["uptime"], key=self.other)
         check("a key not allowed is refused", rc == 255 and "Permission denied" in err, err)
 

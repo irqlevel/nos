@@ -275,6 +275,19 @@ impl crate::Io for CommandIo<'_, '_, '_> {
             }
         }
     }
+
+    fn idle(&mut self, timeout_ms: u64) -> bool {
+        if self.failed.is_some() {
+            return false;
+        }
+        match self.session.tend(timeout_ms) {
+            Ok(open) => open,
+            Err(e) => {
+                self.failed = Some(e);
+                false
+            }
+        }
+    }
 }
 
 impl<'s, 'a> Session<'s, 'a> {
@@ -643,6 +656,39 @@ impl<'s, 'a> Session<'s, 'a> {
             }
             self.heard();
             self.on_message(true)?;
+        }
+    }
+
+    /// While a command runs and neither writes nor reads: the messages that
+    /// come before `timeout_ms` is out handled as `read_typed` handles them
+    /// -- typing kept, not taken -- and a quiet client asked whether it is
+    /// there, as `run` asks one between commands. Whether the channel is
+    /// still open.
+    fn tend(&mut self, timeout_ms: u64) -> Result<bool> {
+        let deadline = self.t.now_ms().saturating_add(timeout_ms);
+        loop {
+            match &self.channel {
+                Some(c) if !c.close_in && !c.close_out => {}
+                _ => return Ok(false),
+            }
+            let now = self.t.now_ms();
+            if now >= deadline {
+                return Ok(true);
+            }
+            let ask_at = self.last_heard.saturating_add(self.cfg.keepalive_ms);
+            if now >= ask_at {
+                if self.keepalive_missed >= self.cfg.keepalive_max {
+                    return Err(Error::Timeout("a client that stopped answering"));
+                }
+                self.keepalive()?;
+                self.keepalive_missed += 1;
+                self.last_heard = now;
+                continue;
+            }
+            if self.t.next(&mut self.payload, core::cmp::min(deadline, ask_at))? {
+                self.heard();
+                self.on_message(true)?;
+            }
         }
     }
 

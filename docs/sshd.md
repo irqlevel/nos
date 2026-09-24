@@ -141,13 +141,19 @@ server's: printable characters, Backspace, Enter, Up and Down through the last
 empty line to log out; line ends are made CR LF. `exit` and `logout` end the
 session. The exit status is always 0: the kernel's commands have none.
 
-A command runs on the session's own task and cannot be interrupted, as on the
-console: ^C typed during `ping` reaches the editor once `ping` is done -- unless
-the command reads what is typed while it runs, which a command may: the
-session hands it the channel's data raw, as the keys are pressed, reading
-more of the connection while it waits (a rekey and a close are dealt with on
-the way), and flushes what the command has printed before each wait, a prompt
-with no line end included. `hv attach` is one such command: the console of a
+A command runs on a task of its own, beside its session, and cannot be
+interrupted, as on the console: ^C typed during `ping` reaches the editor
+once `ping` is done. The session tends the connection meanwhile: it waits on
+the command -- whose output wakes it at once, to go out on the channel -- and
+after every quiet 10 ms reads what the client has sent: a keepalive is
+answered, a window taken, a rekey done, typing kept for the editor, a close
+seen. A command that waits a minute in silence (`hv wait`, `top 60000`) is
+not cut off by a client that asks whether the server is there
+(`ServerAliveInterval`), as it was while the command ran on the session's
+own task and nothing read the connection until it returned. A command may
+also read what is typed while it runs: the session hands it the channel's
+data raw, as the keys are pressed, and flushes what it has printed before
+each wait, a prompt with no line end included. `hv attach` is one such command: the console of a
 guest, typed at through `ssh -t`. What a command does not read is the line
 editor's once it returns. And there is one user: whatever name the client
 gives, a key in the list logs in, and what it can do is what the console
@@ -170,7 +176,8 @@ can.
   more, with its SSH window or its TCP one shut, before its session is given
   up; a stop meanwhile is not held up by it.
 - A command still running holds up `sshd stop`, `rmmod sshd` and `poweroff`
-  until it returns, as a module's command does.
+  until it returns, as a module's command does. `sshd stop` from a session --
+  its own task, or its command's -- is refused: it would wait for itself.
 
 ## How it is put together
 
@@ -183,8 +190,11 @@ can.
   already uses; a module being a build of its own, `sha2` is asked for its
   software backend here as well as in the kernel crate.
 - `src/rust/modules/sshd` -- the kernel's side: the `sshd` command, the files,
-  a listener task and a task for each connection, whose stack the commands it
-  runs share.
+  a listener task, a task for each connection, and one for each command a
+  connection runs, with 16 KiB of its output and 4 KiB of typing between the
+  two (`run_beside`); with no memory for those, the command runs on the
+  session's task as it used to, and nothing reads the connection until it
+  returns.
 - What the kernel exports for it: `kernel_tcp_listen`, `kernel_tcp_accept`
   (with a timeout, returning once the listener is closed), `kernel_tcp_close`,
   `kernel_tcp_abort`, `kernel_tcp_send_timeout`, `kernel_tcp_peer`,
@@ -213,7 +223,9 @@ aborted as dead within a minute.
 On arm64 (`--arch aarch64`, the default; HVF on an Apple Silicon Mac) it loads
 the module over the UDP shell and works it: commands, a shell with a terminal
 and one without, 3 MiB of output through the client's window with rekeys in
-the middle of it, a key it has to refuse, sessions at once, `sshd stop` with a
+the middle of it, a command that prints nothing for five seconds under a
+client that asks every second whether the server is there and gives up after
+two unanswered, a key it has to refuse, sessions at once, `sshd stop` with a
 session open and `rmmod sshd` from inside one; then it puts the module in
 `/etc/rc`, reboots, and checks it came back by itself with the same host key.
 On x86-64 (`--arch x86_64`) the root image carries the module, a key and the
