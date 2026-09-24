@@ -461,10 +461,20 @@ const SWAP_MSRS: [u32; 5] = [
     0xC000_0084, // IA32_FMASK
     0xC000_0102, // IA32_KERNEL_GS_BASE
 ];
+/// IA32_KERNEL_GS_BASE, the one of [`SWAP_MSRS`] the guest changes without a
+/// `wrmsr` the host hears: `swapgs` swaps it with the active GS base, and it
+/// is not a VMCS field. So its guest value has to be *stored* on exit, or a
+/// guest's `swapgs`-established kernel GS base is lost each round and the
+/// next `swapgs` returns junk -- a garbage RSP on the interrupt-return path,
+/// which is what Alpine's kernel double-faulted on before this.
+const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+
 /// Where each list sits in the MSR page: 16 bytes an entry (index, reserved,
-/// value), the entry list at the start and the exit list past it.
+/// value), the entry-load list at the start, the exit-load list past it, and
+/// the exit-store list (KERNEL_GS_BASE alone) past that.
 const MSR_ENTRY_BASE: usize = 0;
 const MSR_EXIT_BASE: usize = 0x100;
+const MSR_STORE_BASE: usize = 0x200;
 
 pub struct Guest {
     vmcs: vmcs::VmcsPage,
@@ -712,7 +722,8 @@ impl Guest {
             vmwrite(VMENTRY_MSR_LOAD_COUNT, SWAP_MSRS.len() as u64);
             vmwrite(VMEXIT_MSR_LOAD_ADDR, msr_phys + MSR_EXIT_BASE as u64);
             vmwrite(VMEXIT_MSR_LOAD_COUNT, SWAP_MSRS.len() as u64);
-            vmwrite(VMEXIT_MSR_STORE_COUNT, 0);
+            vmwrite(VMEXIT_MSR_STORE_ADDR, msr_phys + MSR_STORE_BASE as u64);
+            vmwrite(VMEXIT_MSR_STORE_COUNT, 1);
             vmwrite(TSC_OFFSET, 0);
             /* The guest owns all of CR0 but for what VMX forces; CR4.VMXE is
              * forced set in hardware but read as 0 by the guest, which is
@@ -798,6 +809,20 @@ impl Guest {
             self.msr_area.store::<u32>(x, msr);
             self.msr_area.store::<u32>(x + 4, 0);
             self.msr_area.store::<u64>(x + 8, host);
+        }
+        /* The exit-store list, one entry: the CPU writes the guest's live
+         * KERNEL_GS_BASE (which its `swapgs` may have changed) at +8. */
+        self.msr_area.store::<u32>(MSR_STORE_BASE, MSR_KERNEL_GS_BASE);
+        self.msr_area.store::<u32>(MSR_STORE_BASE + 4, 0);
+    }
+
+    /// The guest's KERNEL_GS_BASE the exit stored, back into the shadow, so
+    /// the next entry loads what the guest's `swapgs` left, not a stale
+    /// `wrmsr` value. Read before the policy handles a `wrmsr` of it, which
+    /// then overrides this with the written value.
+    fn read_stored_kernel_gs_base(&mut self) {
+        if let Some(v) = self.msr_area.load::<u64>(MSR_STORE_BASE + 8) {
+            self.save.kernel_gs_base = v;
         }
     }
 
@@ -990,6 +1015,7 @@ impl Guest {
                 self.entry_failed = false;
                 unsafe { self.read_exit() };
                 unsafe { self.read_guest_state() };
+                self.read_stored_kernel_gs_base();
                 /* A machine check taken while the guest ran is the host's,
                  * and the CPU did not deliver it: raise it, as the AMD side
                  * does, to the handler that treats one as fatal. */

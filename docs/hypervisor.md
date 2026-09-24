@@ -243,8 +243,16 @@ loader -- is written once. The differences that are not hidden that way:
   in ring 0 without them. AMD-V moves these with `vmsave`/`vmload`; VMX has
   no such instruction, so `Guest` keeps a VM-entry MSR-load list (the guest's
   values, from the shadow) and a VM-exit MSR-load list (the host's, off the
-  CPU), and the CPU loads each in turn. With them, an unmodified Linux boots
-  to a BusyBox shell under VT-x.
+  CPU), and the CPU loads each in turn. `KERNEL_GS_BASE` needs one more list:
+  `swapgs` changes it without a `wrmsr` the host hears, so a VM-exit MSR-store
+  list saves the guest's live value back into the shadow -- otherwise the
+  guest's `swapgs`-established kernel GS base is lost each round, and the next
+  `swapgs` returns junk. That was a real distribution kernel double-faulting
+  on a garbage RSP the moment an interrupt returned to user mode; a
+  purpose-built guest that never took one from user mode did not show it.
+  With all three lists, an unmodified Linux -- a tinyconfig to a BusyBox
+  shell, and a full Alpine 3.24 to a root login with its clock, `apk`, disk
+  and network -- runs under VT-x.
 - **Controls, not a permission map.** Every port and every MSR exits by the
   processor-based controls (unconditional I/O exiting, no MSR bitmap), not by
   the 20 KiB of `iopm`/`msrpm` a VMCB points at. Each control field is
