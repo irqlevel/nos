@@ -1350,8 +1350,9 @@ one; at line rate the inbox fills in under a millisecond. It kicks a running
 one now, and the inbox is the guest's ring's size ([A network](#a-network)).
 And a command run
 through nos's sshd for longer than the client's keepalive (`ssh -o
-ServerAliveInterval=`) is cut off, since the server answers no keepalive
-while the command runs.
+ServerAliveInterval=`) was cut off, the server answering no keepalive while
+the command ran; commands run beside their session now, which tends the
+connection meanwhile ([sshd](sshd.md#the-shell-behind-it)).
 
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is

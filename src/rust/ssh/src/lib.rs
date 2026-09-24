@@ -88,6 +88,16 @@ pub trait Io {
     /// nothing more will come: the channel's EOF or close, or the session
     /// failing -- which the session then ends on.
     fn read(&mut self, buf: &mut [u8], timeout_ms: u64) -> Option<usize>;
+    /// Tends the session for up to `timeout_ms`, for a command that runs on
+    /// with nothing to write or read meanwhile: what the client sends is
+    /// handled as it comes -- a keepalive answered, a window taken, typing
+    /// kept for the command's next read or the line editor after it -- and
+    /// a client gone quiet is asked whether it is still there, as between
+    /// commands. A client asks too (`ServerAliveInterval`), and hangs up on
+    /// a server that does not answer. False once the session is over: the
+    /// channel closed, the client gone, the session failing -- which it
+    /// then ends on.
+    fn idle(&mut self, timeout_ms: u64) -> bool;
 }
 
 /// How a server behaves: the same for all its sessions.

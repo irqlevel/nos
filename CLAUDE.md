@@ -72,7 +72,7 @@ What a smoke boot cannot notice has a test of its own, each there for a failure 
 | the disk log | `disklog-test.py` (arm64): nothing else gives `disklog=on` |
 | the trace path, a net device, netconsole | `netconsole-test.py` (arm64): on the Hetzner boxes it is the only console there is |
 | TCP, the HTTP client | `tcp-test.py` (arm64) |
-| TCP's listening side, the module loader, the `ffi` declarations | `sshd-test.py` (arm64). 40 checks pass; `poweroff unloads sshd before the unmount` fails for reasons of its own, unrelated to TCP |
+| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/sshd` | `sshd-test.py` (arm64). 41 checks pass; `poweroff unloads sshd before the unmount` fails for reasons of its own, unrelated to TCP, and `connections past the four logging in are refused` flakes under load: stragglers of the probe burst land after its quiet window |
 | the receive path, the frame pool, `modules/netload`, a module's UDP listener in `kcore::net`, the tick's receive poll (`rxpoll`) | `netload-test.py` (arm64; about seven minutes, by design), and `--arch x86_64`, its short form, after touching the module ABI |
 | `drivers/igb`, the driver seam in `net/src/device.rs` | `tcp-test.py --nic igb` and `netload-test.py --nic igb`: QEMU's 82576, the only way a hardware NIC driver runs anywhere but on a Hetzner box (QEMU 8.0 or later; CI's does not have it, so by hand) |
 | `drivers/usb/` | `usb-test.py` (x86-64): types at the kernel through QEMU's monitor |

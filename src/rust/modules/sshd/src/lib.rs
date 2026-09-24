@@ -17,6 +17,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -28,10 +29,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kcore::cmd::{Command, Output};
 use kcore::error::Error;
 use kcore::net::Nic;
-use kcore::sync::Mutex;
+use kcore::sync::{Event, Mutex};
 use kcore::task::TaskHandle;
 use kcore::tcp::{TcpListener, TcpStream, RECV_TIMEOUT};
-use kcore::time::boot_time_ns;
+use kcore::time::{boot_time_ns, Duration};
 use ssh::{AuthorizedKey, Config, HostKey, PublicKey};
 
 const HELP: &str = "sshd [start [port] [nic=] | stop | allow <key> | deny <fp> | keys [reload]] - SSH server";
@@ -280,7 +281,9 @@ fn stop(state: &State, out: &mut Output) -> Result<(), String> {
        very task it runs in */
     let me = kcore::task::current_id();
     let own = state.server.with(|server| {
-        server.as_ref().map_or(false, |s| s.shared.sessions.with(|v| v.iter().any(|e| e.task_id == me)))
+        server.as_ref().map_or(false, |s| {
+            s.shared.sessions.with(|v| v.iter().any(|e| e.task_id == me || e.command_id == me))
+        })
     });
     if own {
         return Err("this session would wait for itself to end -- stop it from the console or the UDP shell, or rmmod sshd".to_string());
@@ -569,6 +572,9 @@ struct SessionInfo {
     task: Option<TaskHandle>,
     /// The task, as kcore::task::current_id names it.
     task_id: usize,
+    /// The task its command runs on, while one does (0 while none does):
+    /// the session's as much as its own is.
+    command_id: usize,
     /// It has returned, or is about to: the listener may wait for it.
     done: bool,
 }
@@ -654,7 +660,9 @@ fn admit(shared: &Arc<Shared>, stream: TcpStream) {
 
     let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
     shared.sessions.with(|v| {
-        v.push(SessionInfo { id, peer, started: boot_time_ns(), user: None, task: None, task_id: 0, done: false })
+        v.push(SessionInfo {
+            id, peer, started: boot_time_ns(), user: None, task: None, task_id: 0, command_id: 0, done: false,
+        })
     });
 
     let ctx = Box::into_raw(Box::new(SessionCtx { shared: shared.clone(), stream, id })) as *mut u8;
@@ -812,8 +820,247 @@ impl ssh::Shell for KernelShell<'_> {
     }
 
     fn run(&mut self, line: &str, io: &mut dyn ssh::Io) {
-        kcore::cmd::dispatch_session(line, &mut SessionIo(io));
+        /* On a task of its own, with the session tended meanwhile; with no
+           memory or task for that, here, as it always ran -- and a client
+           that asks whether the server is there while it runs is not
+           answered until it returns. */
+        if !run_beside(self.shared, self.id, line, io) {
+            kcore::cmd::dispatch_session(line, &mut SessionIo(io));
+        }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* A command, on a task of its own                                     */
+/* ------------------------------------------------------------------ */
+
+/* A command runs for as long as it takes -- `hv wait` a minute, `top` its
+   window -- and a session that runs it in its own task hears nothing from the
+   client until it returns: not a window opening, not a keepalive. The client
+   asks those (`ServerAliveInterval`) and hangs up on a server that does not
+   answer; so the command runs on a task of its own, and the session tends
+   the connection between moving its output out and the client's typing in. */
+
+/* What a command's output waits in on its way out, and the client's typing on
+   its way in: enough for either side to go on while the other catches up */
+const OUT_ROOM: usize = 16 * 1024;
+const TYPED_ROOM: usize = 4 * 1024;
+/* What is moved at a time */
+const OUT_CHUNK: usize = 2048;
+const TYPED_CHUNK: usize = 256;
+/* How long the session waits on the command before it tends the connection
+   -- output, or the command asking for typing, wakes it at once -- and for
+   how long it tends it then: a client's keepalive is answered within the two,
+   and output is never held up by the connection being tended */
+const TEND_MS: u64 = 10;
+const TEND_SLICE_MS: u64 = 1;
+
+/// What passes between a session and the command it runs beside it.
+struct Pipe {
+    state: Mutex<PipeState>,
+    /// Output, the command asking for typing, the command done.
+    to_session: Event,
+    /// Room for output, typing, the session over.
+    to_command: Event,
+}
+
+struct PipeState {
+    /// Never grown past `OUT_ROOM`, nor `typed` past `TYPED_ROOM`: both have
+    /// their room from the start.
+    out: VecDeque<u8>,
+    typed: VecDeque<u8>,
+    /// The command waits for typing.
+    wants: bool,
+    /// No more typing will come: the channel's EOF or close.
+    closed: bool,
+    /// The session is over: output goes nowhere, and a read ends.
+    gone: bool,
+    /// The command may run: its task is known to the session's entry, so
+    /// that the server tells it for one of its own -- an `sshd stop` from
+    /// it would wait for itself.
+    go: bool,
+    done: bool,
+}
+
+impl Pipe {
+    fn new() -> Option<Pipe> {
+        let mut out = VecDeque::new();
+        out.try_reserve_exact(OUT_ROOM).ok()?;
+        let mut typed = VecDeque::new();
+        typed.try_reserve_exact(TYPED_ROOM).ok()?;
+        Some(Pipe {
+            state: Mutex::new(PipeState {
+                out, typed, wants: false, closed: false, gone: false, go: false, done: false,
+            })?,
+            to_session: Event::new()?,
+            to_command: Event::new()?,
+        })
+    }
+}
+
+/// The command's side of the pipe, as the kernel's shell calls it.
+struct CommandSide(Arc<Pipe>);
+
+impl kcore::cmd::Session for CommandSide {
+    fn write(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let n = {
+                let mut st = self.0.state.lock();
+                if st.gone {
+                    return;
+                }
+                let n = core::cmp::min(OUT_ROOM - st.out.len(), bytes.len());
+                /* Within the room taken at the start: nothing allocates */
+                st.out.extend(&bytes[..n]);
+                n
+            };
+            if n == 0 {
+                /* Full: until the session has taken some out -- looked at
+                   again a turn later, whatever the signal did */
+                self.0.to_command.wait_for(Duration::from_millis(TEND_MS));
+                continue;
+            }
+            self.0.to_session.signal();
+            bytes = &bytes[n..];
+        }
+    }
+
+    fn read(&mut self, buf: &mut [u8], timeout_ns: u64) -> Option<usize> {
+        let deadline = boot_time_ns().saturating_add(timeout_ns);
+        loop {
+            {
+                let mut st = self.0.state.lock();
+                if !st.typed.is_empty() {
+                    let n = core::cmp::min(buf.len(), st.typed.len());
+                    for (b, t) in buf.iter_mut().zip(st.typed.drain(..n)) {
+                        *b = t;
+                    }
+                    st.wants = false;
+                    return Some(n);
+                }
+                if st.closed || st.gone {
+                    st.wants = false;
+                    return None;
+                }
+                let now = boot_time_ns();
+                if buf.is_empty() || now >= deadline {
+                    st.wants = false;
+                    return Some(0);
+                }
+                st.wants = true;
+            }
+            self.0.to_session.signal();
+            let left = deadline.saturating_sub(boot_time_ns());
+            self.0.to_command.wait_for(Duration::from_nanos(core::cmp::min(left, TEND_MS * NS_PER_MS)));
+        }
+    }
+}
+
+/// What the command's task is started with.
+struct Job {
+    line: String,
+    pipe: Arc<Pipe>,
+}
+
+fn command_main(job: Job) {
+    while !job.pipe.state.lock().go {
+        job.pipe.to_command.wait_for(Duration::from_millis(TEND_MS));
+    }
+    kcore::cmd::dispatch_session(&job.line, &mut CommandSide(job.pipe.clone()));
+    job.pipe.state.lock().done = true;
+    job.pipe.to_session.signal();
+}
+
+/// Runs `line` on a task of its own and tends the session `id` while it
+/// does: its output out as it comes, the client's typing in when it asks for
+/// it, and the connection answered in between. Returns once the command has.
+/// False, with nothing run, when there was no memory or no task for it.
+fn run_beside(shared: &Shared, id: u64, line: &str, io: &mut dyn ssh::Io) -> bool {
+    let Some(pipe) = Pipe::new() else { return false };
+    let pipe = Arc::new(pipe);
+    let mut command = String::new();
+    if command.try_reserve_exact(line.len()).is_err() {
+        return false;
+    }
+    command.push_str(line);
+    let Some(task) = kcore::task::spawn_with("sshd/cmd", Job { line: command, pipe: pipe.clone() }, command_main)
+    else {
+        return false;
+    };
+    /* Its task the session's before it runs anything */
+    let set_command = |task_id: usize| {
+        shared.sessions.with(|v| {
+            if let Some(s) = v.iter_mut().find(|s| s.id == id) {
+                s.command_id = task_id;
+            }
+        })
+    };
+    set_command(task.id());
+    pipe.state.lock().go = true;
+    pipe.to_command.signal();
+
+    let mut chunk = [0u8; OUT_CHUNK];
+    let mut typed = [0u8; TYPED_CHUNK];
+    /* The session still has a client to write to */
+    let mut open = true;
+    loop {
+        let (n, done, wants, room) = {
+            let mut st = pipe.state.lock();
+            let n = core::cmp::min(chunk.len(), st.out.len());
+            for (c, b) in chunk.iter_mut().zip(st.out.drain(..n)) {
+                *c = b;
+            }
+            (n, st.done, st.wants, TYPED_ROOM - st.typed.len())
+        };
+        if n > 0 {
+            pipe.to_command.signal();
+            if open {
+                io.write(&chunk[..n]);
+            }
+            continue;
+        }
+        /* Done, and all it wrote gone out: set after its last write */
+        if done {
+            break;
+        }
+        if !open {
+            pipe.to_session.wait_for(Duration::from_millis(TEND_MS));
+            continue;
+        }
+        if wants && room > 0 {
+            let room = core::cmp::min(room, typed.len());
+            match io.read(&mut typed[..room], TEND_MS) {
+                Some(0) => {}
+                Some(k) => {
+                    /* Within the room counted above: only this side adds */
+                    pipe.state.lock().typed.extend(&typed[..k]);
+                    pipe.to_command.signal();
+                }
+                None => {
+                    pipe.state.lock().closed = true;
+                    pipe.to_command.signal();
+                }
+            }
+            continue;
+        }
+        /* Nothing from the command: its output, or its asking for typing,
+           ends the wait at once -- else a turn has passed quiet, and the
+           connection is tended for a slice */
+        if pipe.to_session.wait_for(Duration::from_millis(TEND_MS)) {
+            continue;
+        }
+        if !io.idle(TEND_SLICE_MS) {
+            /* The session is over; the command is not, and is waited for --
+               its task is this module's code */
+            open = false;
+            pipe.state.lock().gone = true;
+            pipe.to_command.signal();
+        }
+    }
+    /* Its task has returned, or is about to: the handle waits for it */
+    drop(task);
+    set_command(0);
+    true
 }
 
 /* The session's side of a command it runs, as the kernel asks for it: the

@@ -176,7 +176,11 @@ sixty-fourth.
 End to end against OpenSSH's own client (see [sshd](sshd.md)). On arm64 it
 loads `sshd.ko` over the UDP shell and has `ssh` work it: commands, a shell
 with a terminal and one without, 3 MiB of output through the client's window
-with rekeys in the middle, a key it has to refuse, sessions at once, a burst
+with rekeys in the middle, a command that prints nothing for five seconds
+while the client asks every second whether the server is there (`ssh -o
+ServerAliveInterval=1 -o ServerAliveCountMax=2 ... top 5000` -- a session
+deaf while its command ran was cut off at three), a key it has to refuse,
+sessions at once, a burst
 of connections past the four that may be logging in, a stop and an `rmmod`
 from inside a session; then it puts the module in `/etc/rc`, reboots, and
 checks it came back by itself with the same host key. On x86-64 it boots an
@@ -185,9 +189,12 @@ in. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
 `ssh`, `ssh-keygen` and host ports 2222, 8000 and 9000 free.
 
-40 checks pass. One fails, `poweroff unloads sshd before the unmount`, for
-reasons of its own that have nothing to do with TCP. A run that fails
-anything else is a regression.
+41 checks pass. One fails, `poweroff unloads sshd before the unmount`, for
+reasons of its own that have nothing to do with TCP; and `connections past
+the four logging in are refused` fails now and then under load -- stragglers
+of the 70-probe burst reach the server after the three quiet seconds the
+test waits for, and are counted among the refusals it looks for (18 where it
+wants 2). A run that fails anything else is a regression.
 
 ### `netblk-test.py` -- a module on the block layer's asynchronous path
 
