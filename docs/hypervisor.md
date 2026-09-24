@@ -214,7 +214,25 @@ The two backends are one shape above `hvarch`: `hv::vm::Backend` is `Svm` or
 real state lives in the VMCS and is reached only through `vmread`/`vmwrite`.
 `Guest::run` in `hvarch::x86::vmx` syncs the shadow into the VMCS before an
 entry and reads it back after, so the policy above -- CPUID, MSRs, the
-loader -- is written once. The differences that are not hidden that way:
+loader -- is written once.
+
+That sync is *lazy*, and has to be: a VMCS holds sixty-odd fields, and eight
+segments of four fields each are most of them, so a full round-trip every
+exit is sixty `vmread`/`vmwrite` -- and under a nested hypervisor, where each
+one traps to the L0 kernel, that is most of the cost of running the guest.
+But the guest owns nearly all of it: CR0/3/4, the segments, GDTR/IDTR, RSP,
+RFLAGS it changes in the VMCS itself, with no exit (no CR or segment
+interception), so the shadow need not carry them at all. The first entry
+writes the whole state; after that only what the policy changes between
+entries goes in -- RIP past an instruction, the system MSRs, the injected
+event -- and only what it reads comes back: where the guest stopped, its
+flags, and FS/GS base, which it *does* change through an intercepted `wrmsr`
+(the per-CPU base, as this kernel keeps its own) as well as un-intercepted.
+The control registers and segments are read only when a guest is being
+stopped and dumped. A full sync every exit was ten times the work, and
+turned a real distribution's boot from seconds into minutes.
+
+The differences that are not hidden by the shadow at all:
 
 - **The VMCS is opaque, and per CPU.** It is made as plain memory (a
   privileged instruction at construction would fault, since a VM is made
