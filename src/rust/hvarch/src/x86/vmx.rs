@@ -508,6 +508,10 @@ pub struct Guest {
     /// The VMCS has been `vmclear`ed at least once -- done on the first
     /// entry, where VMX is known on, not at creation, where it may be off.
     cleared: bool,
+    /// The next entry writes the whole guest state, not only what the policy
+    /// changes: true until the first entry, and again whenever `long_mode`
+    /// resets the state from scratch.
+    full_sync: bool,
     /// The static VMCS fields (controls, EPTP, masks) have been written.
     configured: bool,
     /// The CPU whose host state is in the VMCS, or -1: rewritten when the
@@ -569,6 +573,7 @@ impl Guest {
             cr4_fixed0: caps.cr4_fixed0,
             cr4_fixed1: caps.cr4_fixed1,
             cleared: false,
+            full_sync: true,
             configured: false,
             host_cpu: -1,
             inject: 0,
@@ -737,56 +742,79 @@ impl Guest {
 
     /// Sync the shadow guest state into the VMCS current on this CPU, before
     /// an entry: every field the policy layer may have changed.
-    unsafe fn write_guest_state(&self) {
+    /// Sync the shadow into the VMCS before an entry. The first entry writes
+    /// the whole of it; after that only the fields the policy changes between
+    /// entries, because everything else -- CR0/3/4, the segments, GDTR/IDTR,
+    /// RSP, RFLAGS -- the guest owns and updates in the VMCS itself, without
+    /// an exit (no CR or segment interception), so a round-trip through the
+    /// shadow every exit would be 60-odd `vmread`/`vmwrite` that, under a
+    /// nested hypervisor where each one is an exit to L0, is most of the cost
+    /// of running the guest at all. What is read back is what the policy
+    /// reads (`read_guest_state`); the heavy fields are read on demand, for a
+    /// report (`read_guest_heavy`), on the exits that end a guest.
+    unsafe fn write_guest_state(&mut self) {
         use vmcs::*;
         let s = &self.save;
-        let seg = |sel_f: u32, base_f: u32, lim_f: u32, ar_f: u32, g: &Segment| unsafe {
-            vmwrite(sel_f, g.selector as u64);
-            vmwrite(base_f, g.base);
-            vmwrite(lim_f, g.limit as u64);
-            vmwrite(ar_f, ar_from_attrib(g.attrib) as u64);
-        };
-        unsafe {
-            /* CR0/CR4 with the bits VMX forces; with unrestricted guest, PE
-             * and PG are not forced, so a guest could run unpaged -- ours do
-             * not, but the fixed bits are applied honestly. */
-            let mut cr0_f0 = self.cr0_fixed0;
-            if self.unrestricted {
-                cr0_f0 &= !(CR0_PE | CR0_PG);
+        if self.full_sync {
+            let seg = |sel_f: u32, base_f: u32, lim_f: u32, ar_f: u32, g: &Segment| unsafe {
+                vmwrite(sel_f, g.selector as u64);
+                vmwrite(base_f, g.base);
+                vmwrite(lim_f, g.limit as u64);
+                vmwrite(ar_f, ar_from_attrib(g.attrib) as u64);
+            };
+            unsafe {
+                /* CR0/CR4 with the bits VMX forces; with unrestricted guest,
+                 * PE and PG are not forced. Written once: from here the guest
+                 * changes its own CR0/3/4 in the VMCS, unintercepted. */
+                let mut cr0_f0 = self.cr0_fixed0;
+                if self.unrestricted {
+                    cr0_f0 &= !(CR0_PE | CR0_PG);
+                }
+                let guest_cr0 = (s.cr0 | cr0_f0) & self.cr0_fixed1;
+                let guest_cr4 = (s.cr4 | self.cr4_fixed0 | CR4_VMXE_BIT) & self.cr4_fixed1;
+                vmwrite(GUEST_CR0, guest_cr0);
+                vmwrite(GUEST_CR3, s.cr3);
+                vmwrite(GUEST_CR4, guest_cr4);
+                /* The read shadow masks only VMXE, so its VMXE=0 is what the
+                 * guest reads there forever; the other bits are unmasked and
+                 * read from the live CR, so this too is a one-time write. */
+                vmwrite(CR0_GUEST_HOST_MASK, 0);
+                vmwrite(CR0_READ_SHADOW, s.cr0);
+                vmwrite(CR4_READ_SHADOW, s.cr4 & !CR4_VMXE_BIT);
+
+                seg(GUEST_CS_SEL, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR, &s.cs);
+                seg(GUEST_SS_SEL, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_AR, &s.ss);
+                seg(GUEST_DS_SEL, GUEST_DS_BASE, GUEST_DS_LIMIT, GUEST_DS_AR, &s.ds);
+                seg(GUEST_ES_SEL, GUEST_ES_BASE, GUEST_ES_LIMIT, GUEST_ES_AR, &s.es);
+                seg(GUEST_FS_SEL, GUEST_FS_BASE, GUEST_FS_LIMIT, GUEST_FS_AR, &s.fs);
+                seg(GUEST_GS_SEL, GUEST_GS_BASE, GUEST_GS_LIMIT, GUEST_GS_AR, &s.gs);
+                seg(GUEST_LDTR_SEL, GUEST_LDTR_BASE, GUEST_LDTR_LIMIT, GUEST_LDTR_AR, &s.ldtr);
+                seg(GUEST_TR_SEL, GUEST_TR_BASE, GUEST_TR_LIMIT, GUEST_TR_AR, &s.tr);
+                vmwrite(GUEST_GDTR_BASE, s.gdtr.base);
+                vmwrite(GUEST_GDTR_LIMIT, s.gdtr.limit as u64);
+                vmwrite(GUEST_IDTR_BASE, s.idtr.base);
+                vmwrite(GUEST_IDTR_LIMIT, s.idtr.limit as u64);
+                vmwrite(GUEST_RSP, s.rsp);
+                vmwrite(GUEST_RFLAGS, s.rflags);
+                vmwrite(GUEST_DR7, s.dr7);
+                vmwrite(GUEST_ACTIVITY_STATE, 0);
+                vmwrite(vmcs::GUEST_PENDING_DBG, 0);
             }
-            let guest_cr0 = (s.cr0 | cr0_f0) & self.cr0_fixed1;
-            let guest_cr4 = (s.cr4 | self.cr4_fixed0 | CR4_VMXE_BIT) & self.cr4_fixed1;
-            vmwrite(GUEST_CR0, guest_cr0);
-            vmwrite(CR0_READ_SHADOW, s.cr0);
-            vmwrite(GUEST_CR3, s.cr3);
-            vmwrite(GUEST_CR4, guest_cr4);
-            vmwrite(CR4_READ_SHADOW, s.cr4 & !CR4_VMXE_BIT);
-
-            seg(GUEST_CS_SEL, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR, &s.cs);
-            seg(GUEST_SS_SEL, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_AR, &s.ss);
-            seg(GUEST_DS_SEL, GUEST_DS_BASE, GUEST_DS_LIMIT, GUEST_DS_AR, &s.ds);
-            seg(GUEST_ES_SEL, GUEST_ES_BASE, GUEST_ES_LIMIT, GUEST_ES_AR, &s.es);
-            seg(GUEST_FS_SEL, GUEST_FS_BASE, GUEST_FS_LIMIT, GUEST_FS_AR, &s.fs);
-            seg(GUEST_GS_SEL, GUEST_GS_BASE, GUEST_GS_LIMIT, GUEST_GS_AR, &s.gs);
-            seg(GUEST_LDTR_SEL, GUEST_LDTR_BASE, GUEST_LDTR_LIMIT, GUEST_LDTR_AR, &s.ldtr);
-            seg(GUEST_TR_SEL, GUEST_TR_BASE, GUEST_TR_LIMIT, GUEST_TR_AR, &s.tr);
-            vmwrite(GUEST_GDTR_BASE, s.gdtr.base);
-            vmwrite(GUEST_GDTR_LIMIT, s.gdtr.limit as u64);
-            vmwrite(GUEST_IDTR_BASE, s.idtr.base);
-            vmwrite(GUEST_IDTR_LIMIT, s.idtr.limit as u64);
-
-            vmwrite(GUEST_RSP, s.rsp);
+            self.full_sync = false;
+        }
+        unsafe {
+            /* RIP the policy moves past an instruction; the system MSRs it
+             * changes only through an intercepted `wrmsr`, so writing them
+             * from the shadow each entry is cheap and always current. */
             vmwrite(GUEST_RIP, s.rip);
-            vmwrite(GUEST_RFLAGS, s.rflags);
-            vmwrite(GUEST_DR7, s.dr7);
+            vmwrite(GUEST_FS_BASE, s.fs.base);
+            vmwrite(GUEST_GS_BASE, s.gs.base);
             vmwrite(GUEST_IA32_EFER, s.efer & !super::svm::EFER_SVME);
             vmwrite(GUEST_IA32_PAT, s.g_pat);
             vmwrite(GUEST_SYSENTER_CS, s.sysenter_cs);
             vmwrite(GUEST_SYSENTER_ESP, s.sysenter_esp);
             vmwrite(GUEST_SYSENTER_EIP, s.sysenter_eip);
-            vmwrite(GUEST_ACTIVITY_STATE, 0);
             vmwrite(GUEST_INTERRUPTIBILITY, self.interruptibility as u64);
-            vmwrite(vmcs::GUEST_PENDING_DBG, 0);
         }
     }
 
@@ -828,7 +856,33 @@ impl Guest {
 
     /// Read the guest state the policy layer reads back out of the VMCS into
     /// the shadow, after an exit.
+    /// Read back the little the policy reads every exit: where the guest
+    /// stopped, its stack and flags (the run loop asks whether it can take an
+    /// interrupt), and the interruptibility the CPU set. The heavy state --
+    /// the control registers and segments -- is left in the VMCS and read
+    /// only when a guest is being stopped and dumped ([`read_guest_heavy`]).
     unsafe fn read_guest_state(&mut self) {
+        use vmcs::*;
+        unsafe {
+            self.save.rip = vmread(GUEST_RIP);
+            self.save.rsp = vmread(GUEST_RSP);
+            self.save.rflags = vmread(GUEST_RFLAGS);
+            /* FS and GS base: the guest changes them both ways -- `wrfsbase`
+             * un-intercepted, and `wrmsr` intercepted, which the MSR policy
+             * reads and writes here -- so unlike the rest of a segment they
+             * are synced every exit. Linux keeps its per-CPU data at the GS
+             * base, as this kernel does; a stale one is the guest lost. */
+            self.save.fs.base = vmread(GUEST_FS_BASE);
+            self.save.gs.base = vmread(GUEST_GS_BASE);
+            self.interruptibility = vmread(GUEST_INTERRUPTIBILITY) as u32;
+        }
+    }
+
+    /// The control registers and segments, into the shadow, for a report: read
+    /// while the VMCS is still current, on the exits that end a guest. After
+    /// this the shadow holds the whole guest state, as it did every exit
+    /// before the sync was made lazy.
+    unsafe fn read_guest_heavy(&mut self) {
         use vmcs::*;
         let s = &mut self.save;
         let rd = |sel_f: u32, base_f: u32, lim_f: u32, ar_f: u32, g: &mut Segment| unsafe {
@@ -853,16 +907,33 @@ impl Guest {
             s.gdtr.limit = vmread(GUEST_GDTR_LIMIT) as u32;
             s.idtr.base = vmread(GUEST_IDTR_BASE);
             s.idtr.limit = vmread(GUEST_IDTR_LIMIT) as u32;
-            s.rsp = vmread(GUEST_RSP);
-            s.rip = vmread(GUEST_RIP);
-            s.rflags = vmread(GUEST_RFLAGS);
             s.efer = vmread(GUEST_IA32_EFER);
-            s.sysenter_cs = vmread(GUEST_SYSENTER_CS);
-            s.sysenter_esp = vmread(GUEST_SYSENTER_ESP);
-            s.sysenter_eip = vmread(GUEST_SYSENTER_EIP);
             s.cpl = ((vmread(GUEST_SS_AR) >> 5) & 0x3) as u8;
-            self.interruptibility = vmread(GUEST_INTERRUPTIBILITY) as u32;
         }
+    }
+
+    /// Whether an exit ends the guest -- one the policy will dump, so the
+    /// heavy state is worth reading. The common exits (I/O, CPUID, MSR, HLT,
+    /// the host's interrupt, an interrupt window) are not among them.
+    fn exit_is_stopping(&self) -> bool {
+        use vmcs::reason as r;
+        if self.exit_reason & vmcs::reason::ENTRY_FAILURE != 0 {
+            return true;
+        }
+        let basic = self.exit_reason & vmcs::reason::BASIC_MASK;
+        if basic == r::HLT {
+            /* An idle guest halts with interrupts on, waiting for the timer;
+             * one that halts with them off has stopped for good, and is
+             * dumped -- so read the heavy state only for the latter. */
+            const IF: u64 = 1 << 9;
+            return self.save.rflags & IF == 0;
+        }
+        !matches!(
+            basic,
+            r::IO_INSTRUCTION | r::CPUID | r::RDMSR | r::WRMSR
+                | r::EXTERNAL_INTERRUPT | r::INIT | r::SIPI | r::NMI_WINDOW
+                | r::INTERRUPT_WINDOW | r::VMCALL | r::PAUSE | r::RDTSC | r::RDPMC
+        )
     }
 
     /// Read the exit information the decoder needs, after an exit.
@@ -1016,6 +1087,12 @@ impl Guest {
                 unsafe { self.read_exit() };
                 unsafe { self.read_guest_state() };
                 self.read_stored_kernel_gs_base();
+                /* The control registers and segments only when the exit is
+                 * one that ends and dumps the guest -- while the VMCS is
+                 * still current, before the vmclear below. */
+                if self.exit_is_stopping() {
+                    unsafe { self.read_guest_heavy() };
+                }
                 /* A machine check taken while the guest ran is the host's,
                  * and the CPU did not deliver it: raise it, as the AMD side
                  * does, to the handler that treats one as fatal. */
