@@ -7,10 +7,13 @@
 //! on every entry whatever this module wrote.
 
 use core::fmt::Write;
+use core::sync::atomic::AtomicU64;
 
 use hvarch::x86::svm::vmcb::{self, attrib, Segment};
-use hvarch::x86::svm::{self as arch, Guest, GuestRegs};
+use hvarch::x86::svm::{self as arch, Guest, GuestRegs, Kick, NotRun, Permissions};
 use hvarch::{Caps, Result};
+
+use crate::vm::Refusal;
 
 /* Control register and EFER bits a guest's starting state is made of. */
 pub const CR0_PE: u64 = 1 << 0;
@@ -107,6 +110,9 @@ const HAS_ERROR_CODE: u32 = (1 << 8) | (1 << 10) | (1 << 11) | (1 << 12) | (1 <<
 /// One guest CPU.
 pub struct Vcpu {
     guest: Guest,
+    /// The port and MSR permission maps: every one intercepted. The backend
+    /// owns them, so the world switch and its intercepts are one thing.
+    perms: Permissions,
     /// The CPU writes the next instruction's address into the VMCB itself.
     nrip: bool,
 }
@@ -148,7 +154,28 @@ impl Vcpu {
         c.intercept_exceptions = exceptions;
         /* No ASID: each entry is given one by the CPU it is on
          * (`Guest::run`). */
-        Ok(Self { guest, nrip })
+        Ok(Self { guest, perms: Permissions::intercept_all()?, nrip })
+    }
+
+    /// Enter the guest and come back at its next exit, decoded -- the whole
+    /// of what an entry is: the VMCB checked before the CPU sees it, the
+    /// world switch, the event an exit interrupted put back, and the exit
+    /// read out. A VMCB a rule refuses is [`Refusal::Vmcb`], naming it.
+    pub fn enter(&mut self, nested: arch::Nested, host_areas: &[AtomicU64], kick: Option<&Kick>)
+        -> core::result::Result<(Exit, u32), Refusal>
+    {
+        self.check().map_err(Refusal::Vmcb)?;
+        /* The nested table maps nothing but this guest's own pages and only
+         * grows (`crate::memory`); `host_areas` never names a freed page
+         * (`crate::machine`). */
+        let cpu = match unsafe { self.guest.run(&self.perms, nested, host_areas, kick) } {
+            Ok(cpu) => cpu,
+            Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
+            Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
+            Err(NotRun::FiveLevelPaging { cpu }) => return Err(Refusal::FiveLevelPaging(cpu)),
+        };
+        self.requeue_event();
+        Ok((self.exit(), cpu))
     }
 
     pub fn save(&self) -> &vmcb::Save {
@@ -173,10 +200,6 @@ impl Vcpu {
 
     pub fn save_and_regs_mut(&mut self) -> (&mut vmcb::Save, &mut GuestRegs) {
         self.guest.save_and_regs_mut()
-    }
-
-    pub(crate) fn guest_mut(&mut self) -> &mut Guest {
-        &mut self.guest
     }
 
     /// The ASID of the last entry, for a report.

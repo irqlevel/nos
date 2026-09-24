@@ -169,8 +169,12 @@ paging, and a hypervisor that will not walk the guest's page tables itself
 
 Intel VT-x is written for the hardware this kernel actually runs on: the
 Hetzner EX44 and the Dell laptop are both Intel, where it is native and
-fast. Today `hvarch::x86::vmx` probes and enters root operation; the VMCS
-and the guest come with the rest of the VM.
+fast. It is the whole of a backend now -- the VMCS, EPT, the launch stub and
+the exit decoder -- and every built-in guest runs under it, brought up and
+debugged under nested KVM on the Intel dev box (below). TCG has no VMX at
+all, so the gate uses KVM there; on an AMD host `-cpu host` gives AMD-V, and
+under TCG anywhere `-cpu max` gives AMD-V, so the two backends are covered
+between the three.
 
 **One bit stands between this kernel and `vmxon` on those machines, and it
 is not in the hypervisor.** VMX operation requires `CR0.NE` (bit 5; it is in
@@ -196,8 +200,62 @@ no x87 code to raise one: the C++ is built with `-mno-80387`, so there is no
 x87 instruction in the image and none can appear, and the Rust targets are
 soft-float. It is
 still a change to how every x86 machine boots, the two whose only console is
-the network among them, so it belongs to the change that brings up the VMX
-backend, where a guest can show it working -- not slipped in here.
+the network among them, so it came with the VMX backend, where a guest shows
+it working -- `boot64.asm`'s `enable_paging` sets NE beside where it clears
+CD/NW after INIT, on the BSP and every AP, and `hv info` reads `host CR0/CR4
+yes` on each.
+
+### The VMX backend, and where it differs from AMD-V
+
+The two backends are one shape above `hvarch`: `hv::vm::Backend` is `Svm` or
+`Vmx`, and the run loop and the built-in guests call it without an `svm` or a
+`vmx` in them. The guest state both keep is the AMD save-area layout
+(`vmcb::Save` plus the general registers) -- for VMX a *shadow*, since the
+real state lives in the VMCS and is reached only through `vmread`/`vmwrite`.
+`Guest::run` in `hvarch::x86::vmx` syncs the shadow into the VMCS before an
+entry and reads it back after, so the policy above -- CPUID, MSRs, the
+loader -- is written once. The differences that are not hidden that way:
+
+- **The VMCS is opaque, and per CPU.** It is made as plain memory (a
+  privileged instruction at construction would fault, since a VM is made
+  where VMX may be off and on a CPU that will not run the guest); the
+  `vmclear` that puts it in the launch state waits for the first entry, where
+  VMX is known on. Every entry is a `vmlaunch` from the clear state, and
+  every exit ends with a `vmclear`: the VMCS is never current on two CPUs at
+  once, which is what lets a guest's task move CPU between entries -- the
+  AMD VMCB, plain memory, never had the problem. (Faster paths -- `vmresume`,
+  a VMCS pinned per CPU with cross-CPU `vmclear` on migration -- are for
+  later; correctness first.)
+- **Host state is the hypervisor's to save.** AMD-V's `vmsave`/`vmload` move
+  the host's segments and MSRs around `vmrun`; VMX restores the host from the
+  VMCS host area, which `HostRegs::capture` fills on the CPU the entry runs
+  on -- its CR3, its GS base (where its per-CPU data is), its TR, its GDTR
+  and IDTR. Rewritten when the guest's task has moved CPU, not every entry.
+- **CR2 is nobody's on Intel.** `vmrun` keeps a guest CR2 in the VMCB; VMX
+  keeps none, so `run` saves the host's and restores the guest's around the
+  world switch by hand. The x87/SSE and XCR0 switch is the same as AMD-V --
+  neither extension switches it, and the guest is given x87 alone.
+- **Controls, not a permission map.** Every port and every MSR exits by the
+  processor-based controls (unconditional I/O exiting, no MSR bitmap), not by
+  the 20 KiB of `iopm`/`msrpm` a VMCB points at. Each control field is
+  written through `adjust`, which forces on the bits `IA32_VMX_*_CTLS` says
+  must be 1 and off the ones it forbids -- a value that ignored them fails
+  entry with nothing named. Guest CR4.VMXE is forced set (the fixed MSRs
+  demand it) and masked to read 0, since the guest is told it has no VMX.
+- **A refused entry is the CPU's `VMEXIT_INVALID`, not a software check.**
+  AMD-V's VMCB is checked in software first (`Vcpu::check`) so a bad one is
+  named before the CPU sees it; VMX has no such check -- a bad guest state is
+  the CPU's to refuse, at `vmlaunch`, reported as an entry failure and shown
+  as `Exit::Invalid` with the instruction error. VPID is off, so there is no
+  ASID to hand out or reuse; each guest's own EPT keeps its memory its own,
+  and the TLB is flushed on every transition.
+
+The `hypercall` built-in guest is the one whose *machine code* is a vendor's:
+`vmmcall` (`0F 01 D9`) is AMD's and an invalid opcode on Intel, so the loader
+patches it to `vmcall` (`0F 01 C1`) where the guest runs under VT-x. The
+`refused` and `asid` guests test AMD-only mechanisms, and each has a VMX form
+that tests the Intel equivalent -- the CPU refusing a non-canonical guest
+RIP, and three VMs isolated by their EPTs.
 
 ## What it does today
 
@@ -669,10 +727,12 @@ qemu-system-x86_64 -cpu max -smp 4 -m 1G -cdrom nos.iso \
 
 Under KVM on a Linux host, `-enable-kvm -cpu host` gives the guest the host's
 own extension (nested virtualization: `kvm_intel nested=1` or
-`kvm_amd nested=1`), which is far faster than TCG and is how the VMX path
-will be exercised before it reaches real hardware. On an Intel host that is
-VT-x, whose guests are not written yet, so the gate uses KVM only where the
-host has AMD-V and TCG's otherwise.
+`kvm_amd nested=1`), which is far faster than TCG and is how the VMX path is
+exercised before it reaches real hardware. `scripts/hv-test.py` uses it on
+both: AMD-V on an AMD host, Intel VT-x (nested) on an Intel one, and AMD-V
+under TCG's `-cpu max` where there is no KVM -- TCG has no VMX, so the Intel
+backend is reached only through KVM. The two guests whose verdict differs by
+vendor (`refused`, `asid`) have their expected output chosen from `hv info`.
 
 The gate is `scripts/hv-test.py` ([Tests and gates](testing.md)):
 

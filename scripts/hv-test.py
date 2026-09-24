@@ -122,6 +122,15 @@ GUESTS = {
     "asid": [r"vm C was given ASID \d+, which vm [AB] had, after \d+ generation\(s\) ended, and read its own too"],
 }
 
+# Two of the guests test a mechanism only one vendor has: AMD-V's software
+# VMCB check (`refused`) and its ASID recycling (`asid`). Under Intel VT-x the
+# CPU refuses a bad VMCS itself, and there is no ASID (VPID is off), so the
+# guest checks EPT isolation instead. What each says differs; the rest is one.
+GUESTS_VMX = {
+    "refused": [r"the CPU refused the VMCS at entry for invalid guest state"],
+    "asid": [r"each of three VMs read its own page through its own EPT"],
+}
+
 
 def module(arch):
     ko = os.path.join(ROOT, "out", arch, "modules", "hv.ko")
@@ -159,16 +168,27 @@ def blocks(log):
     return [(cmd, "\n".join(lines)) for cmd, lines in out]
 
 
-def host_has_svm():
-    """Whether KVM would hand the guest AMD-V. `-cpu host` gives it the host
-    CPU's own extension, and the guests here run under AMD-V: on an Intel
-    host that is VT-x, whose guests are not written yet -- there, TCG's
-    AMD-V is the one that runs them."""
+def host_flag(flag):
+    """Whether the host CPU advertises `flag`: which extension `-cpu host`
+    under KVM would hand the guest."""
     try:
         with open("/proc/cpuinfo") as f:
-            return re.search(r"^flags\s*:.*\bsvm\b", f.read(), re.M) is not None
+            return re.search(r"^flags\s*:.*\b%s\b" % flag, f.read(), re.M) is not None
     except OSError:
         return False
+
+
+def host_has_svm():
+    """An AMD host, whose `-cpu host` gives the guest AMD-V."""
+    return host_flag("svm")
+
+
+def host_has_vmx():
+    """An Intel host, whose `-cpu host` gives the guest Intel VT-x -- nested,
+    since nos is itself a guest of KVM. Both backends are tested this way now:
+    AMD-V on an AMD host, VT-x on an Intel one, and AMD-V under TCG where
+    there is no KVM (TCG has no VT-x)."""
+    return host_flag("vmx")
 
 
 def x86(args):
@@ -178,8 +198,9 @@ def x86(args):
     log = os.path.join(tmp, "serial.log")
     image = rootfs(tmp, "x86_64", SCRIPT)
 
-    kvm = os.path.exists("/dev/kvm") and not args.tcg and host_has_svm()
-    print("accelerator: %s" % ("KVM, the host's AMD-V" if kvm else "TCG, -cpu max"))
+    kvm = os.path.exists("/dev/kvm") and not args.tcg and (host_has_svm() or host_has_vmx())
+    ext = "the host's AMD-V" if host_has_svm() else "the host's Intel VT-x (nested)"
+    print("accelerator: %s" % ("KVM, " + ext if kvm else "TCG, -cpu max (AMD-V)"))
     # -cpu max, not the default: qemu64 reports SVM without nested paging,
     # and a hypervisor that will not shadow page tables has no use for that.
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "1G", "-smp", str(CPUS),
@@ -214,12 +235,15 @@ def guest_report(text, name):
     return m.group(0) if m else ""
 
 
-def check_all_guests(text, cpu):
+def check_all_guests(text, cpu, backend):
     """`hv run all <cpu>`: every guest ran there and did what it was told."""
+    guests = dict(GUESTS)
+    if backend == "vmx":
+        guests.update(GUESTS_VMX)
     m = re.search(r"^hv: (\d+) of (\d+) guests ok$", text, re.M)
     pt.check("every built-in guest does what it was told on cpu %d" % cpu,
-             m is not None and m.group(1) == m.group(2) and int(m.group(2)) >= len(GUESTS), text)
-    for name, patterns in GUESTS.items():
+             m is not None and m.group(1) == m.group(2) and int(m.group(2)) >= len(guests), text)
+    for name, patterns in guests.items():
         report = guest_report(text, name)
         good = ("hv: guest %s ok" % name) in report and all(re.search(p, report) for p in patterns)
         if name != "refused":
@@ -236,6 +260,7 @@ def x86_checks(ran):
     pt.check("the module loads", "hv loaded at" in out[0], out[0])
 
     info = out[1]
+    backend = "vmx" if "Intel VT-x" in info else "svm"
     pt.check("the CPU has an extension a guest can run under",
              re.search(r"^hv: .* -- ready$", info, re.M) is not None, info)
     pt.check("with nested paging, which is what makes a guest's memory the CPU's",
@@ -262,8 +287,8 @@ def x86_checks(ran):
     pt.check("and every CPU says so",
              "on for cpu %s of %s" % (ALL_CPUS, ALL_CPUS) in out[11], out[11])
 
-    check_all_guests(out[12], 0)
-    check_all_guests(out[13], CPUS - 1)
+    check_all_guests(out[12], 0, backend)
+    check_all_guests(out[13], CPUS - 1, backend)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
     pt.check("a second insmod is refused", "loaded at" not in out[14], out[14])

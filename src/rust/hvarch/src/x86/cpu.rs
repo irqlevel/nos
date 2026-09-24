@@ -93,6 +93,30 @@ pub fn read_cr4() -> u64 {
     v
 }
 
+#[inline]
+pub fn read_cr3() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr3", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+/// CR2, the faulting linear address. VMX does not switch it around a guest,
+/// so the hypervisor saves the guest's and restores the host's by hand.
+#[inline]
+pub fn read_cr2() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr2", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+/// # Safety
+/// CR2 is the CPU's, shared with whatever faults next: only ever set to a
+/// value that is about to be consumed (a guest's, before entering it).
+#[inline]
+pub unsafe fn write_cr2(value: u64) {
+    unsafe { asm!("mov cr2, {}", in(reg) value, options(nomem, nostack, preserves_flags)) };
+}
+
 /// # Safety
 /// CR4 is the CPU's, not this task's: what is set here is set for everything
 /// that runs on this CPU afterwards, and clearing a bit the kernel depends on
