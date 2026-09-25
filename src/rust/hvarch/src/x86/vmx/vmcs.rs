@@ -186,13 +186,26 @@ pub const PIN_NMI_EXITING: u32 = 1 << 3;
 /* Primary processor-based controls. */
 pub const PROC_INTR_WINDOW_EXITING: u32 = 1 << 2;
 pub const PROC_HLT_EXITING: u32 = 1 << 7;
+pub const PROC_MWAIT_EXITING: u32 = 1 << 10;
+pub const PROC_RDPMC_EXITING: u32 = 1 << 11;
+/// Without these two a guest's `mov cr8` reaches the local APIC's task
+/// priority register itself -- the host's -- and a TPR of 15 keeps every
+/// interrupt but an NMI away from the CPU, the host's tick and kick among
+/// them, for as long as the guest likes and after it has gone.
+pub const PROC_CR8_LOAD_EXITING: u32 = 1 << 19;
+pub const PROC_CR8_STORE_EXITING: u32 = 1 << 20;
 pub const PROC_UNCOND_IO_EXITING: u32 = 1 << 24;
 pub const PROC_USE_MSR_BITMAPS: u32 = 1 << 28;
+pub const PROC_MONITOR_EXITING: u32 = 1 << 29;
 pub const PROC_SECONDARY_CTLS: u32 = 1 << 31;
 
 /* Secondary processor-based controls. */
 pub const PROC2_ENABLE_EPT: u32 = 1 << 1;
 pub const PROC2_ENABLE_VPID: u32 = 1 << 5;
+/// Without it WBINVD runs in the guest as it would on the host: the whole
+/// of the package's shared cache written back and dropped, every core
+/// stalled for milliseconds, as often as the guest cares to.
+pub const PROC2_WBINVD_EXITING: u32 = 1 << 6;
 pub const PROC2_UNRESTRICTED_GUEST: u32 = 1 << 7;
 
 /* VM-exit controls. */
@@ -222,9 +235,28 @@ pub mod intr {
     pub const TYPE_NMI: u32 = 2 << TYPE_SHIFT;
     pub const TYPE_HW_EXCEPTION: u32 = 3 << TYPE_SHIFT;
     pub const TYPE_SOFT_INT: u32 = 4 << TYPE_SHIFT;
+    /// INT1 (ICEBP): a software event like the two below it, delivered
+    /// with an instruction length.
+    pub const TYPE_PRIV_SOFT_EXCEPTION: u32 = 5 << TYPE_SHIFT;
     pub const TYPE_SOFT_EXCEPTION: u32 = 6 << TYPE_SHIFT;
     pub const DELIVER_ERRCODE: u32 = 1 << 11;
     pub const VALID: u32 = 1 << 31;
+}
+
+/* EXIT_QUALIFICATION of a control-register access. */
+pub mod cr_access {
+    /// Bits 3:0: which control register.
+    pub const CR_MASK: u64 = 0xF;
+    /// Bits 5:4: what was done to it.
+    pub const TYPE_SHIFT: u64 = 4;
+    pub const TYPE_MASK: u64 = 0x3 << TYPE_SHIFT;
+    pub const MOV_TO_CR: u64 = 0 << TYPE_SHIFT;
+    pub const MOV_FROM_CR: u64 = 1 << TYPE_SHIFT;
+    /// Bits 11:8: the general-purpose register of a `mov`, numbered as the
+    /// instruction encoding numbers them: RAX, RCX, RDX, RBX, RSP, RBP, RSI,
+    /// RDI, R8-R15.
+    pub const GPR_SHIFT: u64 = 8;
+    pub const GPR_MASK: u64 = 0xF << GPR_SHIFT;
 }
 
 /* Basic exit reasons (EXIT_REASON, bits 15:0). */
@@ -376,6 +408,14 @@ impl VmcsPage {
     }
 }
 
+/* Every VMX instruction reports through the arithmetic flags -- all six
+ * cleared on success, CF for "would not look", ZF for "looked and said no"
+ * -- so none of the wrappers below may say `preserves_flags`: the compiler
+ * would then be free to keep a comparison's result in EFLAGS across the
+ * instruction and branch on it after. The two whose answer is read take
+ * `setna`, which is CF or ZF: `setnc` alone would report a VMCS the CPU
+ * refused for its revision as loaded. */
+
 /// Read a VMCS field of the VMCS current on this CPU.
 ///
 /// # Safety
@@ -387,7 +427,7 @@ pub unsafe fn vmread(field: u32) -> u64 {
     unsafe {
         asm!("vmread {value}, {field}",
              value = out(reg) value, field = in(reg) field as u64,
-             options(nostack, preserves_flags));
+             options(nostack));
     }
     value
 }
@@ -402,7 +442,7 @@ pub unsafe fn vmwrite(field: u32, value: u64) {
     unsafe {
         asm!("vmwrite {field}, {value}",
              field = in(reg) field as u64, value = in(reg) value,
-             options(nostack, preserves_flags));
+             options(nostack));
     }
 }
 
@@ -413,12 +453,12 @@ pub unsafe fn vmwrite(field: u32, value: u64) {
 /// This CPU is in VMX root operation and `phys` is a VMCS page of ours.
 #[inline]
 pub unsafe fn vmptrld(phys: u64) -> bool {
-    let ok: u8;
+    let failed: u8;
     unsafe {
-        asm!("vmptrld qword ptr [{p}]", "setnc {ok}",
-             p = in(reg) &phys, ok = out(reg_byte) ok, options(nostack));
+        asm!("vmptrld qword ptr [{p}]", "setna {failed}",
+             p = in(reg) &phys, failed = out(reg_byte) failed, options(nostack));
     }
-    ok != 0
+    failed == 0
 }
 
 /// Flush the VMCS at `phys` to memory and make it not current on this CPU,
@@ -428,10 +468,49 @@ pub unsafe fn vmptrld(phys: u64) -> bool {
 /// This CPU is in VMX root operation and `phys` is a VMCS page of ours.
 #[inline]
 pub unsafe fn vmclear(phys: u64) -> bool {
-    let ok: u8;
+    let failed: u8;
     unsafe {
-        asm!("vmclear qword ptr [{p}]", "setnc {ok}",
-             p = in(reg) &phys, ok = out(reg_byte) ok, options(nostack));
+        asm!("vmclear qword ptr [{p}]", "setna {failed}",
+             p = in(reg) &phys, failed = out(reg_byte) failed, options(nostack));
     }
-    ok != 0
+    failed == 0
+}
+
+/// The INVEPT types: drop the cached translations made through one EPT, or
+/// through every EPT there has ever been.
+pub const INVEPT_SINGLE_CONTEXT: u64 = 1;
+pub const INVEPT_ALL_CONTEXT: u64 = 2;
+
+/// The operand INVEPT reads: the EPT pointer it is about (ignored by the
+/// all-context type), and a word that must be 0. In memory, 16 bytes.
+#[repr(C, align(16))]
+struct InveptDescriptor {
+    eptp: u64,
+    reserved: u64,
+}
+
+/// Invalidate the guest-physical and combined mappings this CPU has cached
+/// -- those made through the EPT `eptp` names for [`INVEPT_SINGLE_CONTEXT`],
+/// every EPT's for [`INVEPT_ALL_CONTEXT`]. False when the CPU refuses the
+/// type, which [`super::Caps::usable`] rules out.
+///
+/// What VM entries and exits do not do: with VPID off they drop every linear
+/// and combined mapping of the guest's, but a guest-physical mapping is
+/// tagged with the EPT's own address and kept, across transitions and across
+/// VMXOFF and VMXON. So an EPT freed and its page handed to the next guest's
+/// EPT gives that guest the old one's translations -- to pages that are the
+/// host's again -- unless the tag is dropped first.
+///
+/// # Safety
+/// This CPU is in VMX root operation.
+#[inline]
+pub unsafe fn invept(kind: u64, eptp: u64) -> bool {
+    let desc = InveptDescriptor { eptp, reserved: 0 };
+    let failed: u8;
+    unsafe {
+        asm!("invept {kind}, [{desc}]", "setna {failed}",
+             kind = in(reg) kind, desc = in(reg) &desc, failed = out(reg_byte) failed,
+             options(nostack));
+    }
+    failed == 0
 }

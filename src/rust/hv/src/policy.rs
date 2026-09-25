@@ -199,6 +199,11 @@ const MSR_SYSENTER_EIP: u32 = 0x176;
 /// are the host's, and a guest that sets one is refused (a #GP) rather than
 /// let into a state `vmrun` would bounce.
 const EFER_GUEST_MASK: u64 = (1 << 0) | (1 << 8) | (1 << 10) | (1 << 11) | (1 << 14);
+/// Long mode active: the CPU's to set and clear, with paging and LME, and
+/// read-only to a `wrmsr` -- a write that says otherwise is ignored, as the
+/// silicon ignores it, rather than put into the guest's EFER, where it would
+/// be an entry the CPU refuses (VT-x checks it against its IA-32e control).
+const EFER_LMA: u64 = 1 << 10;
 /// The bit the CPU keeps set once long mode is active: the guest never
 /// clears it while it runs 64-bit code, and it is part of its EFER.
 const EFER_SVME: u64 = 1 << 12;
@@ -239,9 +244,9 @@ pub fn wrmsr(save: &mut Save, msr: u32, value: u64) -> bool {
                 return false;
             }
             /* SVME stays set, since the guest runs under SVM whether it
-             * knows it or not; LMA follows LME and paging, which the
-             * consistency check enforces at the next entry. */
-            save.efer = value | EFER_SVME;
+             * knows it or not; LMA stays what the CPU made it -- it follows
+             * LME and paging, not a write. */
+            save.efer = (value & !EFER_LMA) | (save.efer & EFER_LMA) | EFER_SVME;
         }
         MSR_STAR => save.star = value,
         MSR_LSTAR => save.lstar = value,

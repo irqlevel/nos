@@ -327,6 +327,12 @@ pub enum NotRun {
     /// waiting for the guest that the caller is to hand over first. Nothing
     /// was entered and the VMCB is as it was.
     Kicked { cpu: u32 },
+    /// The CPU refused to drop what it had cached through the guest's
+    /// nested table (VMX's INVEPT), which has to happen before the guest's
+    /// first entry on a CPU. It cannot, on a CPU that said it had the
+    /// instruction; a guest is not entered over translations that may be
+    /// another's.
+    Flush { cpu: u32 },
 }
 
 /// What another CPU does to have a guest that is running leave it -- the

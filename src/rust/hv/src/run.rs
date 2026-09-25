@@ -138,9 +138,11 @@ pub struct Counts {
     pub sleeps: u64,
     pub slept_ns: u64,
     /// Instructions the guest was told (by CPUID) it does not have, run
-    /// anyway and answered with #UD; WBINVDs stepped past.
+    /// anyway and answered with #UD; WBINVDs stepped past; `mov`s to and
+    /// from CR8 answered from the shadow task-priority register (VT-x).
     pub ud: u64,
     pub wbinvd: u64,
+    pub cr8: u64,
     pub exits: u64,
 }
 
@@ -534,6 +536,10 @@ impl LinuxGuest {
                 Exit::Other(vmcb::exit::WBINVD) => {
                     counts.wbinvd += 1;
                     self.vm.vcpu_mut().skip_wbinvd();
+                }
+                Exit::Cr8 { write, gpr } => {
+                    counts.cr8 += 1;
+                    self.vm.vcpu_mut().cr8_access(write, gpr);
                 }
                 Exit::Hypercall => {
                     /* No paravirtualisation is offered; a VMMCALL is a fault
