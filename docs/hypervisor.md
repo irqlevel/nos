@@ -232,6 +232,24 @@ The control registers and segments are read only when a guest is being
 stopped and dumped. A full sync every exit was ten times the work, and
 turned a real distribution's boot from seconds into minutes.
 
+And within the light set it is *dirty-tracked*: `Guest` keeps what the VMCS
+last had of each field it may write between entries (`Synced`) and writes
+only what the policy changed -- RIP after a skip, the interruptibility a
+skip clears, a system MSR after a `wrmsr`, the interrupt-window control when
+it toggles, the injected event when there is one (the CPU clears the field's
+valid bit as it takes the event, so with none there is nothing to write).
+That is exact for every field the guest cannot change without an exit. The
+FS and GS bases it *can* -- `wrfsbase`, `swapgs` -- so a copy older than the
+last exit must never be written back (Alpine wedged on exactly that once):
+they are read on the exits where the policy may touch them, `rdmsr` and
+`wrmsr`, and what it leaves is compared with that read alone. On the way out
+the exit reason is read first and the rest by reason: the host's interrupt
+needs nothing more, an instruction its length, port I/O its qualification
+too, and only an exit that may have happened during an event's delivery --
+an exception, an EPT violation -- or one nobody foresaw reads the
+interruption and vectoring words and the guest-physical address. Twelve
+`vmwrite`s and fourteen `vmread`s an exit became one or two and four.
+
 The differences that are not hidden by the shadow at all:
 
 - **The VMCS is opaque, and per CPU.** It is made as plain memory (a
@@ -259,16 +277,19 @@ The differences that are not hidden by the shadow at all:
   the host's segments and MSRs around `vmrun`; VMX restores the host from the
   VMCS host area, which `HostRegs::capture` fills on the CPU the entry runs
   on -- its CR3, its GS base (where its per-CPU data is), its TR, its GDTR
-  and IDTR. Rewritten when the guest's task has moved CPU, not every entry.
-  The CR4 in it is the one the entry runs under, with OSFXSR and OSXSAVE
-  set, not the one the host has between entries: the exit loads CR4 from
-  that field before the FXSAVE that takes the guest's x87/SSE state back and
-  the XSETBV that gives the host its XCR0 back, and captured as the host had
-  it the first may leave the XMM registers out (the manual leaves that to
-  the implementation) and the second is an undefined opcode -- a panic, on a
-  host whose firmware left XCR0 anything but the x87 alone. (`vmrun` saves
-  the CR4 it finds, which is the window's, so AMD-V never had this to get
-  wrong.)
+  and IDTR, and the host's five syscall MSRs into the exit MSR-load list
+  (five `rdmsr`s, and under nested KVM four exits to it, that were paid on
+  every entry before). Rewritten when the guest's task has moved CPU, not
+  every entry -- and only then is the VMCS `vmptrld`ed: each CPU remembers
+  which VMCS is current on it (`CURRENT_VMCS`, kept exact by the VMPTRLD,
+  VMCLEAR and VMXOFF that are the only things to change it), and an entry
+  whose VMCS is current already skips the instruction. The CR4 the exit
+  loads back from the host area has to be the one an entry runs under, with
+  OSFXSR: captured without it -- as it once was, the bit set around each
+  entry and captured before -- the FXSAVE after the exit could leave the XMM
+  registers out and the XSETBV after it was an undefined opcode. Now the
+  bit is the CPU's for as long as VMX is on for it (below), and the capture
+  is right by construction.
 - **The host's NMI is delivered by hand.** Under AMD-V an intercepted NMI
   stays pending until `stgi` and the host takes it then; under VT-x the exit
   *is* its delivery -- the NMI is consumed, and NMIs stay blocked until an
@@ -311,9 +332,14 @@ The differences that are not hidden by the shadow at all:
   With all three lists, an unmodified Linux -- a tinyconfig to a BusyBox
   shell, and a full Alpine 3.24 to a root login with its clock, `apk`, disk
   and network -- runs under VT-x.
-- **Controls, not a permission map.** Every port and every MSR exits by the
-  processor-based controls (unconditional I/O exiting, no MSR bitmap), not by
-  the 20 KiB of `iopm`/`msrpm` a VMCB points at. The rest of AMD-V's
+- **Controls, and one bitmap.** Every port exits by the processor-based
+  controls (unconditional I/O exiting), not by the 12 KiB `iopm` a VMCB
+  points at; every MSR exits by a 4 KiB bitmap with every bit set but three
+  -- the FS, GS and KERNEL_GS bases, the guest's own and nobody else's,
+  which VT-x saves and loads itself (two VMCS fields, and the exit MSR-store
+  and entry MSR-load lists) and which a Linux guest writes at every context
+  switch: two exits a switch, the most frequent a busy guest made, gone
+  (the AMD side's `msrpm` still intercepts them). The rest of AMD-V's
   intercept set is controls too, since VT-x stops a guest at none of them
   unasked: CR8 (above), MONITOR, MWAIT and RDPMC, which CPUID says the guest
   has not got and which run on the host's CPU otherwise, and WBINVD, which
@@ -334,12 +360,23 @@ The differences that are not hidden by the shadow at all:
   the delivery of is given back rebuilt from its vector, type and error code,
   not copied: bit 12 of what the exit wrote is undefined, and the entry field
   wants bits 30:12 clear.
-- **INVEPT, once per CPU a guest runs on.** VPID is off, so there is no ASID
-  to hand out or reuse, and with it off every VM entry and exit drops the
-  guest's linear and combined mappings -- "the TLB is flushed on every
-  transition" is true of those. It is not true of *guest-physical* mappings,
-  the EPT's own translations, which the CPU tags with the EPT's address and
-  keeps across transitions and across VMXOFF and VMXON. A guest destroyed
+- **VPIDs, and INVEPT and INVVPID once per CPU a guest runs on.** A VPID is
+  VT-x's ASID: the tag the TLB keeps a guest's linear and combined mappings
+  under, so that a VM entry or exit need drop neither the guest's nor the
+  host's, which are tagged 0. Without one -- as the backend first ran --
+  every transition dropped both, the host's included: every exit cost the
+  host its translations, as every AMD-V entry did before ASIDs (-22% to -34%
+  of an exit on the AX41). Here a VPID is the guest's for its life, the
+  lowest free one from a lock-free bitmap of 65535 (`vpid_take`), given back
+  when the guest is dropped; AMD's ASIDs are per CPU and per generation, and
+  the third VM of the `asid` built-in guest, under VT-x, is checked to have
+  been given a VPID one of the first two had. What must then never happen is
+  a number's translations from an earlier holder served to the next: a
+  guest's first entry on each CPU runs a single-context INVVPID for its
+  number, and `enable` an all-context one after `vmxon`, for what an earlier
+  load's guests left. EPT has the same hazard one level down: *guest-physical*
+  mappings, the EPT's own translations, which the CPU tags with the EPT's
+  address and keeps across transitions and across VMXOFF and VMXON. A guest destroyed
   frees its EPT; the next guest's EPT is likely made in the same page (the
   allocator hands back what it was last given), so its tag is the old one's,
   and the CPU would serve the old guest's translations -- to pages that are
@@ -731,19 +768,24 @@ And while a guest runs:
   guests moved between CPUs, on a Zen 2 -- rather than on every entry, the
   host's entries included, as it was. `hv bench ... flush` still does that,
   for what it costs ([What an exit costs](#what-an-exit-costs)).
-- **The x87 and SSE state is switched on every entry and exit**, with
-  FXRSTOR before `vmrun` and FXSAVE after, into an area each guest owns --
-  so it is the guest's whichever CPU the vCPU's task is on and whichever
-  guest ran there last. The host uses none of it (its C++ is built without
-  SSE and x87, its Rust is soft-float), so CR4.OSFXSR, without which AMD's
-  FXSAVE leaves the XMM registers out, and CR4.OSXSAVE are set only for the
-  interrupts-off window around `vmrun` and given back before interrupts come
-  on: outside it an SSE instruction in the host still faults. XCR0 is x87
-  alone while a guest runs, and guests are given no XSAVE, so AVX and above
-  fault in a guest even if it turns OSXSAVE on itself. XCR0 is written only
-  when the host's is something else -- nothing in this kernel changes it from
-  the x87 alone a CPU comes out of reset with, firmware that used AVX may
-  have -- since XSETBV serializes the CPU, twice an exit.
+- **The x87 and SSE state is the guest's, switched at the exit and, when
+  it has to be, at the entry.** FXSAVE after every exit into an area each
+  guest owns; FXRSTOR before an entry only when the CPU's registers are not
+  this guest's already -- each CPU remembers whose FXRSTOR was the last on
+  it (`fp::OWNER`, by a number no two guests ever share), and the host uses
+  none of the registers (its C++ is built without SSE and x87, its Rust is
+  soft-float), so between a guest's exit on a CPU and its next entry there
+  they hold what its FXSAVE saved unless another guest's entry came between.
+  CR4.OSFXSR, without which FXSAVE leaves the XMM registers out, is set for
+  a CPU when its extension is turned on and cleared when it is turned off
+  (`hvarch::x86::fp`), not around each entry as before: that was two
+  serializing writes of CR4 and an XGETBV an exit, and under a nested
+  hypervisor an exit to it for each. What is given up is that, while the
+  module is loaded, an SSE instruction in the kernel would run on those CPUs
+  instead of faulting -- a guard against a toolchain slip, not a guest. XCR0
+  is made the x87 alone at the same moment, if firmware left it with more,
+  and put back when the extension goes off; guests are given no XSAVE, so
+  AVX and above fault in a guest even if it turns OSXSAVE on itself.
 - **A halted guest costs its CPU nothing** -- but waits at the host tick's
   grain. A HLT with interrupts on is stepped past, as a CPU an interrupt
   wakes resumes after it, and the vCPU is not entered again until the PIC
@@ -777,14 +819,17 @@ hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]
 ```
 
 `flush` makes every entry flush the whole TLB, as every entry did before
-ASIDs, so the two can be set side by side on one boot; `pages` is what a
-flush costs the guest after it -- each read a translation to walk again --
-where with none it is what it costs the host. `profile` times each entry in
-its parts with the time-stamp counter: the checks and the ASID; the x87/SSE
-registers and XCR0 put in; `vmrun` to `#vmexit`, the stub's VMSAVE and
-VMLOAD and the guest's few instructions included; the registers taken back
-out; and the rest, which is the exit handled and the loop round to the next
-entry:
+ASIDs, so the two can be set side by side on one boot (AMD-V only: under
+VT-x there is no such entry to ask for); `pages` is what a flush costs the
+guest after it -- each read a translation to walk again -- where with none
+it is what it costs the host. `profile` times each entry in its parts with
+the time-stamp counter: the checks and the ASID; the x87/SSE registers put
+in; `vmrun` to `#vmexit`, the stub's VMSAVE and VMLOAD and the guest's few
+instructions included; the registers taken back out; and the rest, which is
+the exit handled and the loop round to the next entry. Under VT-x the parts
+are the checks and VMPTRLD, the shadow written into the VMCS, the registers
+in, `vmresume` to the exit, the registers out, and the exit and guest state
+read out of the VMCS:
 
 ```
 $ hv bench exits=20000 profile
@@ -817,6 +862,28 @@ The flush cost the world switch 110 ns and the host's side after it 100 ns
 more, its own translations walked again; with 64 pages the guest's as well.
 What is left to take is on the host's side of the switch: the x87/SSE
 state and CR4 around it, 220 ns an exit, and the checks' two RDMSRs.
+
+Under VT-x the only numbers so far are nested KVM's on the Intel dev box
+(`-cpu host`, `hv bench exits=50000`), where every unshadowed `vmread` or
+`vmwrite`, every `mov cr4`, VMPTRLD and intercepted `rdmsr` is an exit to
+the outer kernel, and so where the host's side of an exit weighs far more
+than on the silicon; but the parts they took away are the same parts:
+
+| Step, 2026-09-25 | ns an exit | -- |
+|---|---|---|
+| after the review's fixes (CR8, INVEPT, NMI, the intercept set) | 17,900 | |
+| host MSRs cached, VMPTRLD skipped, OSFXSR/XCR0 set once at `hv on` | 12,500 | -30% |
+| VPIDs, FXRSTOR only when another guest ran in between | 11,700 | -7% |
+| the VMCS sync dirty-tracked, the exit read by reason | 5,800 | -50% |
+
+and the profile of the last (`hv bench exits=20000 profile`): checks and
+VMPTRLD 13 ns, VMCS written 22, x87/SSE in 38, `vmresume` to exit 4,610,
+x87/SSE out 53, VMCS read 51, the exit handled and the loop 1,010. The
+4.6 µs in the middle is the outer kernel's round trip for the nested exit,
+not this code's; of the 12 `vmwrite`s and 14 `vmread`s an exit, 4,700 and
+1,500 ns before the dirty tracking, 73 ns are left. On real Intel silicon
+the same instructions are tens of cycles each, so the shape of the gain is
+the same and its size smaller: measured there is what is left to do.
 
 ## arm64
 

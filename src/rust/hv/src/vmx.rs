@@ -78,16 +78,24 @@ impl Vcpu {
         self.guest.save_and_regs_mut()
     }
 
-    /// The VMX backend keeps no ASID or profile of its own yet; the shape of
-    /// the bench and asid checks is the AMD side's. These make the surface
-    /// the run loop calls one for both.
+    /// The bench's flush is the AMD side's -- an entry with no ASID kept;
+    /// under VT-x there is no such entry to ask for -- and this makes the
+    /// surface one for both.
     pub fn set_flush_always(&mut self, _on: bool) {}
-    pub fn set_profile(&mut self, _on: bool) {}
-    pub fn profile(&self) -> Option<hvarch::x86::svm::Profile> {
-        None
+
+    /// Time every entry from now on, or stop (`hvarch::x86::svm::Profile`,
+    /// with its VMCS halves filled in here).
+    pub fn set_profile(&mut self, on: bool) {
+        self.guest.set_profile(on);
     }
+    pub fn profile(&self) -> Option<hvarch::x86::svm::Profile> {
+        self.guest.profile()
+    }
+    /// The VPID the guest's translations are tagged with -- VT-x's ASID,
+    /// held for the guest's life rather than handed out per CPU -- or None
+    /// on a CPU without them.
     pub fn asid(&self) -> Option<u32> {
-        None
+        self.guest.vpid().map(u32::from)
     }
 
     /// Long mode at CPL 0 with paging on: the state a 64-bit kernel is handed

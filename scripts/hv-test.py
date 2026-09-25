@@ -125,13 +125,13 @@ GUESTS = {
 
 # Three of the guests test a mechanism only one vendor has: AMD-V's software
 # VMCB check (`refused`), its ASID recycling (`asid`) and its shadow TPR
-# (`tpr`). Under Intel VT-x the CPU refuses a bad VMCS itself; there is no
-# ASID (VPID is off), so the guest checks EPT isolation instead; and CR8 is
-# the host's, so the guest is stopped at each access and answered from a
-# shadow. What each says differs; the rest is one.
+# (`tpr`). Under Intel VT-x the CPU refuses a bad VMCS itself; the ASID is a
+# VPID held for the guest's life, so the third VM gets one of the first two's
+# back; and CR8 is the host's, so the guest is stopped at each access and
+# answered from a shadow. What each says differs; the rest is one.
 GUESTS_VMX = {
     "refused": [r"the CPU refused the VMCS at entry for invalid guest state"],
-    "asid": [r"each of three VMs read its own page through its own EPT"],
+    "asid": [r"vm C was given VPID \d+, which vm [AB] had, and read its own too"],
     "tpr": [r"wrote 15 to its CR8 and read it back, stopped at each and answered from the shadow, and the host's CR8 is still 0"],
 }
 
