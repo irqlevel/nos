@@ -39,6 +39,11 @@ pub const SEC_EPT: u32 = 1 << 1;
 pub const SEC_VPID: u32 = 1 << 5;
 pub const SEC_UNRESTRICTED_GUEST: u32 = 1 << 7;
 
+/* IA32_VMX_EPT_VPID_CAP: INVEPT is there, and which of its types. */
+pub const EPT_CAP_INVEPT: u64 = 1 << 20;
+pub const EPT_CAP_INVEPT_SINGLE_CONTEXT: u64 = 1 << 25;
+pub const EPT_CAP_INVEPT_ALL_CONTEXT: u64 = 1 << 26;
+
 /// The secondary controls worth a line in a report.
 pub const REPORTED: &[(u32, &str, &str)] = &[
     (SEC_EPT, "extended page tables", "guest physical addresses translated by the CPU"),
@@ -177,6 +182,12 @@ impl Caps {
         self.secondary & control != 0
     }
 
+    /// INVEPT can drop one EPT's translations alone; failing that, a guest's
+    /// first entry on a CPU drops every EPT's there.
+    pub fn invept_single_context(&self) -> bool {
+        self.ept_vpid & EPT_CAP_INVEPT_SINGLE_CONTEXT != 0
+    }
+
     /// Firmware locked `IA32_FEATURE_CONTROL` without allowing VMXON. Left
     /// unlocked, this kernel sets the bit itself; locked the wrong way, only
     /// a BIOS setting will do.
@@ -209,6 +220,15 @@ impl Caps {
             return Err(Error::FirmwareDisabled);
         }
         if !self.has(SEC_EPT) {
+            return Err(Error::NoNestedPaging);
+        }
+        /* And the instruction that drops what the CPU cached through an
+         * EPT (`vmcs::invept`): without it a freed EPT's translations live
+         * on under the next EPT made at the same address. Every CPU with
+         * EPT has both types; one that had not could run no guest safely. */
+        if self.ept_vpid & (EPT_CAP_INVEPT | EPT_CAP_INVEPT_ALL_CONTEXT)
+            != EPT_CAP_INVEPT | EPT_CAP_INVEPT_ALL_CONTEXT
+        {
             return Err(Error::NoNestedPaging);
         }
         if self.memory_type() != MEM_TYPE_WB || self.region_size() as usize > kcore::consts::PAGE_SIZE {
@@ -270,18 +290,38 @@ pub unsafe fn enable(vmxon_phys: u64) -> Result<()> {
         unsafe { cpu::write_cr4(cpu::read_cr4() & !CR4_VMXE) };
         return Err(Error::EnableFailed);
     }
+
+    /* Nothing cached through any EPT survives into this session: VMXOFF and
+     * VMXON drop no guest-physical mapping, so what an earlier load's guests
+     * left in this CPU's TLB is dropped here, by hand. `usable` checked the
+     * type is there; a refusal now is a CPU that is not what it said. */
+    if !unsafe { vmcs::invept(vmcs::INVEPT_ALL_CONTEXT, 0) } {
+        unsafe { asm!("vmxoff", options(nostack)) };
+        unsafe { cpu::write_cr4(cpu::read_cr4() & !CR4_VMXE) };
+        return Err(Error::EnableFailed);
+    }
     Ok(())
 }
 
-/// Leave VMX root operation on the CPU this runs on.
+/// Leave VMX root operation on the CPU this runs on -- unless a guest's VMCS
+/// is still current here, in which case nothing is done and this says so:
+/// VMXOFF under a current VMCS leaves the CPU's cached copy of it nowhere
+/// good (the manual wants every active VMCS `vmclear`ed first), and the
+/// guest that owns it would find the extension gone at its next entry. Only
+/// [`Guest::run`] and the evictions it and [`Guest::drop`] send make a VMCS
+/// current or not, so the count checked here is exact.
 ///
 /// # Safety
-/// Runs on the CPU it is leaving root operation on, that CPU is in root
-/// operation, and no VMCS of ours is still current on it. The VMXON region
-/// may be freed once this has returned.
-pub unsafe fn disable() {
+/// Runs on the CPU it is leaving root operation on, and that CPU is in root
+/// operation. The VMXON region may be freed once this has returned true.
+pub unsafe fn disable() -> bool {
+    let cpu = kcore::cpu::id() as usize;
+    if LOADED.get(cpu).map_or(false, |n| n.load(Ordering::Acquire) != 0) {
+        return false;
+    }
     unsafe { asm!("vmxoff", options(nostack)) };
     unsafe { cpu::write_cr4(cpu::read_cr4() & !CR4_VMXE) };
+    true
 }
 
 /// Whether this CPU is in VMX root operation. There is no flag that says so
@@ -294,10 +334,38 @@ pub fn enabled() -> bool {
 pub mod vmcs;
 
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
+
+use kcore::consts::MAX_CPUS;
 
 use super::svm::{FxArea, GuestRegs, Kick, NotRun, VECTOR_AC, VECTOR_DB, VECTOR_MC};
 use super::svm::vmcb::{Save, Segment};
+
+/// How many guests' VMCSs are current on each CPU: what [`disable`] refuses
+/// VMXOFF over. Counted up where a VMCS is made current ([`now_loaded_on`]) and
+/// down where it is `vmclear`ed off ([`now_unloaded`]), both on the CPU in
+/// question with interrupts off -- as is [`disable`], which is why the count
+/// it reads cannot change under it.
+static LOADED: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// A guest's VMCS is current on `cpu` from here.
+fn now_loaded_on(loaded_cpu: &AtomicI32, cpu: u32) {
+    loaded_cpu.store(cpu as i32, Ordering::Release);
+    if let Some(n) = LOADED.get(cpu as usize) {
+        n.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// A guest's VMCS is current nowhere from here, and in the clear state.
+fn now_unloaded(loaded_cpu: &AtomicI32, launched: &AtomicBool) {
+    let was = loaded_cpu.swap(-1, Ordering::AcqRel);
+    launched.store(false, Ordering::Release);
+    if was >= 0 {
+        if let Some(n) = LOADED.get(was as usize) {
+            n.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
 
 /* CR0 bits VMX may force in the guest; named here so `write_guest_state` can
  * lift them out of the fixed set when unrestricted guest relaxes them. */
@@ -375,8 +443,16 @@ unsafe fn descriptor_base(gdt_base: u64, sel: u16) -> u64 {
 }
 
 impl HostRegs {
-    /// Read every host field off the CPU this runs on.
-    fn capture() -> Self {
+    /// Read every host field off the CPU this runs on -- but CR4, which is
+    /// given: the value the CPU is to come back to at the exit, which is not
+    /// the value it has now. Around an entry CR4 carries OSFXSR and OSXSAVE
+    /// (the guest's x87/SSE state moves through FXSAVE, and XCR0 through
+    /// XSETBV, which need them), and the exit loads CR4 from this field
+    /// before either runs again: captured without them, FXSAVE after the
+    /// exit may leave the XMM registers out, and XSETBV is an undefined
+    /// opcode -- a panic, on a host whose firmware left XCR0 anything but
+    /// the x87 alone.
+    fn capture(cr4: u64) -> Self {
         let (cs, ss, ds, es, fs, gs, tr): (u16, u16, u16, u16, u16, u16, u16);
         unsafe {
             core::arch::asm!(
@@ -401,7 +477,7 @@ impl HostRegs {
         Self {
             cr0: cpu::read_cr0(),
             cr3: cpu::read_cr3(),
-            cr4: cpu::read_cr4(),
+            cr4,
             cs, ss, ds, es, fs, gs, tr,
             fs_base: unsafe { cpu::rdmsr(MSR_FS_BASE) },
             gs_base: unsafe { cpu::rdmsr(MSR_GS_BASE) },
@@ -500,6 +576,8 @@ pub struct Guest {
     entry_ctls: u32,
     exceptions: u32,
     unrestricted: bool,
+    /// INVEPT can name this guest's EPT alone; else it names every EPT.
+    invept_single: bool,
     cr0_fixed0: u64,
     cr0_fixed1: u64,
     cr4_fixed0: u64,
@@ -524,9 +602,14 @@ pub struct Guest {
     /// and VMfail only on real Intel silicon.
     cleared: bool,
     /// The next entry writes the whole guest state, not only what the policy
-    /// changes: true until the first entry, and again whenever `long_mode`
-    /// resets the state from scratch.
+    /// changes: true until the first entry, and again whenever the policy
+    /// has set the whole shadow from scratch ([`mark_full_sync`]) -- the
+    /// only time a full write is right, since between entries the shadow's
+    /// heavy fields are what the guest had at its first entry, not now.
     full_sync: bool,
+    /// The shadow's RSP was set by the policy and goes into the VMCS at the
+    /// next entry: the one heavy field it writes, for a `mov rsp, cr8`.
+    rsp_dirty: bool,
     /// The static VMCS fields (controls, EPTP, masks) have been written.
     configured: bool,
     /// The CPU whose host state is in the VMCS, or -1: rewritten when the
@@ -583,6 +666,7 @@ impl Guest {
             entry_ctls: 0,
             exceptions,
             unrestricted,
+            invept_single: caps.invept_single_context(),
             cr0_fixed0: caps.cr0_fixed0,
             cr0_fixed1: caps.cr0_fixed1,
             cr4_fixed0: caps.cr4_fixed0,
@@ -591,6 +675,7 @@ impl Guest {
             launched: AtomicBool::new(false),
             cleared: false,
             full_sync: true,
+            rsp_dirty: false,
             configured: false,
             host_cpu: -1,
             inject: 0,
@@ -627,6 +712,21 @@ impl Guest {
     }
     pub fn fx(&self) -> &FxArea {
         &self.fx[0]
+    }
+
+    /// The policy has written the whole shadow -- every control register,
+    /// segment and stack -- and the next entry is to load all of it, as the
+    /// first did. Not for a change to one field after the guest has run: the
+    /// rest of the shadow is stale by then, and would overwrite the guest.
+    pub fn mark_full_sync(&mut self) {
+        self.full_sync = true;
+    }
+
+    /// Set the guest's RSP, which the guest otherwise keeps in the VMCS
+    /// itself: written there at the next entry.
+    pub fn set_rsp(&mut self, rsp: u64) {
+        self.save.rsp = rsp;
+        self.rsp_dirty = true;
     }
 
     /* The last exit, for the policy layer's decoder and its reports. */
@@ -693,11 +793,17 @@ impl Guest {
             PIN_EXTINT_EXITING | PIN_NMI_EXITING,
             ctls_msr(basic, MSR_VMX_PINBASED_CTLS, MSR_VMX_TRUE_PINBASED_CTLS),
         );
+        /* The instructions AMD-V's intercept set stops a guest at, where
+         * VMX does not stop it unasked: HLT; every port; CR8, which is the
+         * host's task priority register; MONITOR, MWAIT and RDPMC, which
+         * CPUID says the guest has not got; WBINVD, below. CPUID, INVD,
+         * VMCALL, XSETBV and a triple fault exit unconditionally. */
         self.proc1 = adjust(
-            PROC_HLT_EXITING | PROC_UNCOND_IO_EXITING | PROC_SECONDARY_CTLS,
+            PROC_HLT_EXITING | PROC_UNCOND_IO_EXITING | PROC_CR8_LOAD_EXITING | PROC_CR8_STORE_EXITING
+                | PROC_MWAIT_EXITING | PROC_MONITOR_EXITING | PROC_RDPMC_EXITING | PROC_SECONDARY_CTLS,
             ctls_msr(basic, MSR_VMX_PROCBASED_CTLS, MSR_VMX_TRUE_PROCBASED_CTLS),
         );
-        let mut want2 = PROC2_ENABLE_EPT;
+        let mut want2 = PROC2_ENABLE_EPT | PROC2_WBINVD_EXITING;
         if self.unrestricted {
             want2 |= PROC2_UNRESTRICTED_GUEST;
         }
@@ -757,8 +863,6 @@ impl Guest {
         self.configured = true;
     }
 
-    /// Sync the shadow guest state into the VMCS current on this CPU, before
-    /// an entry: every field the policy layer may have changed.
     /// Sync the shadow into the VMCS before an entry. The first entry writes
     /// the whole of it; after that only the fields the policy changes between
     /// entries, because everything else -- CR0/3/4, the segments, GDTR/IDTR,
@@ -818,6 +922,11 @@ impl Guest {
                 vmwrite(vmcs::GUEST_PENDING_DBG, 0);
             }
             self.full_sync = false;
+            self.rsp_dirty = false;
+        }
+        if self.rsp_dirty {
+            unsafe { vmwrite(GUEST_RSP, s.rsp) };
+            self.rsp_dirty = false;
         }
         unsafe {
             /* RIP the policy moves past an instruction; the system MSRs it
@@ -871,8 +980,6 @@ impl Guest {
         }
     }
 
-    /// Read the guest state the policy layer reads back out of the VMCS into
-    /// the shadow, after an exit.
     /// Read back the little the policy reads every exit: where the guest
     /// stopped, its stack and flags (the run loop asks whether it can take an
     /// interrupt), and the interruptibility the CPU set. The heavy state --
@@ -1011,8 +1118,7 @@ impl Guest {
                  * the IPI was dropped -- reset here regardless, so this loop
                  * always makes progress and never spins on a departed CPU. Only
                  * this guest's own task runs it, so the store races nothing. */
-                self.loaded_cpu.store(-1, Ordering::Release);
-                self.launched.store(false, Ordering::Release);
+                now_unloaded(&self.loaded_cpu, &self.launched);
             }
 
             /* Pinned to this CPU with interrupts off, so the CPU the checks
@@ -1063,13 +1169,39 @@ impl Guest {
                 if let Some(k) = kick { k.left(); }
                 return Err(NotRun::Off { cpu });
             }
-            self.loaded_cpu.store(cpu as i32, Ordering::Release);
+            if self.loaded_cpu.load(Ordering::Acquire) != cpu as i32 {
+                now_loaded_on(&self.loaded_cpu, cpu);
+            }
 
             if !self.configured {
                 unsafe { self.configure(nested.root) };
             }
+            /* CR4 as the entry runs under it: OSFXSR for FXSAVE/FXRSTOR to
+             * move the XMM registers, OSXSAVE for as long as XCR0 is the
+             * guest's. Decided here, before the host state is captured,
+             * because the exit loads CR4 back from that capture and the
+             * FXSAVE and XSETBV after the exit need both bits still set. */
+            let host_cr4 = cpu::read_cr4();
+            let window = host_cr4 | cpu::CR4_OSFXSR | if xsave { cpu::CR4_OSXSAVE } else { 0 };
             if self.host_cpu != cpu as i32 {
-                unsafe { HostRegs::capture().write() };
+                unsafe { HostRegs::capture(window).write() };
+                /* This guest's first entry on this CPU: whatever the CPU has
+                 * cached through an EPT at this address -- an earlier guest's
+                 * translations, the page having been its EPT's before it was
+                 * this one's -- goes now, before an access could hit it. VM
+                 * entries and exits drop nothing tagged with an EPT (with
+                 * VPID off they drop the linear and combined mappings, which
+                 * is what "the TLB is flushed on every transition" means).
+                 * Once per CPU a guest runs on, so its cost is nothing. */
+                let (kind, eptp) = if self.invept_single {
+                    (vmcs::INVEPT_SINGLE_CONTEXT, nested.root)
+                } else {
+                    (vmcs::INVEPT_ALL_CONTEXT, 0)
+                };
+                if !unsafe { vmcs::invept(kind, eptp) } {
+                    if let Some(k) = kick { k.left(); }
+                    return Err(NotRun::Flush { cpu });
+                }
                 self.host_cpu = cpu as i32;
             }
             unsafe { self.write_guest_state() };
@@ -1081,19 +1213,19 @@ impl Guest {
                 let proc1 = self.proc1
                     | if self.irq_window { vmcs::PROC_INTR_WINDOW_EXITING } else { 0 };
                 vmcs::vmwrite(vmcs::PROC_BASED_CTLS, proc1 as u64);
+                /* The event to inject, if any. No instruction length with
+                 * it: the CPU reads that field only for a software interrupt
+                 * or exception, and nothing here injects one -- an external
+                 * interrupt, #UD, #GP, or an interrupted hardware event given
+                 * back, none of which has a length. */
                 vmcs::vmwrite(vmcs::VMENTRY_INTR_INFO, self.inject);
                 vmcs::vmwrite(vmcs::VMENTRY_EXCEPTION_ERRCODE, self.inject_errcode as u64);
-                if self.inject as u32 & vmcs::intr::VALID != 0 {
-                    vmcs::vmwrite(vmcs::VMENTRY_INSTRUCTION_LEN, self.exit_instr_len as u64);
-                }
             }
 
             /* The x87/SSE state and XCR0 are the guest's from here to the
              * FXSAVE after the exit, exactly as under AMD-V: `vmlaunch` does
              * not switch them. CR2 is the guest's likewise -- VMX keeps no
              * guest CR2 -- so save the host's and restore it after. */
-            let host_cr4 = cpu::read_cr4();
-            let window = host_cr4 | cpu::CR4_OSFXSR | if xsave { cpu::CR4_OSXSAVE } else { 0 };
             unsafe { cpu::write_cr4(window) };
             let host_xcr0 = if xsave { unsafe { cpu::xgetbv0() } } else { GUEST_XCR0 };
             let switch_xcr0 = host_xcr0 != GUEST_XCR0;
@@ -1143,8 +1275,7 @@ impl Guest {
                 self.entry_failed = true;
                 self.exit_reason = 0;
                 unsafe { vmcs::vmclear(vmcs_phys) };
-                self.launched.store(false, Ordering::Release);
-                self.loaded_cpu.store(-1, Ordering::Release);
+                now_unloaded(&self.loaded_cpu, &self.launched);
             } else {
                 self.entry_failed = false;
                 /* The VMCS is launched now: the next entry here resumes it. */
@@ -1160,12 +1291,23 @@ impl Guest {
                 }
                 /* A machine check taken while the guest ran is the host's,
                  * and the CPU did not deliver it: raise it, as the AMD side
-                 * does, to the handler that treats one as fatal. */
+                 * does, to the handler that treats one as fatal. An NMI the
+                 * same, and for a reason AMD-V has not: there the NMI stays
+                 * pending until STGI and the host takes it then; here the
+                 * exit *is* its delivery -- the NMI is gone, and NMIs stay
+                 * blocked until an IRET. So it goes to the host's handler by
+                 * hand, through vector 2's gate, whose IRET is what unblocks
+                 * the next one: a panic on another CPU collecting this one's
+                 * stack, or the profiler's counter overflow, is answered
+                 * rather than lost -- which is what KVM does too. */
                 if self.exit_reason & vmcs::reason::BASIC_MASK == vmcs::reason::EXCEPTION_NMI
-                    && self.exit_intr_info & vmcs::intr::VECTOR_MASK == VECTOR_MC
                     && self.exit_intr_info & vmcs::intr::VALID != 0
                 {
-                    unsafe { core::arch::asm!("int 0x12") };
+                    if self.exit_intr_info & vmcs::intr::TYPE_MASK == vmcs::intr::TYPE_NMI {
+                        unsafe { core::arch::asm!("int 2") };
+                    } else if self.exit_intr_info & vmcs::intr::VECTOR_MASK == VECTOR_MC {
+                        unsafe { core::arch::asm!("int 0x12") };
+                    }
                 }
             }
             /* No per-exit VMCLEAR: the VMCS stays current on this CPU, ready
@@ -1197,8 +1339,7 @@ fn evict_here(e: &Evict) {
     if enabled() {
         unsafe { vmcs::vmclear(e.phys) };
     }
-    e.launched.store(false, Ordering::Release);
-    e.loaded_cpu.store(-1, Ordering::Release);
+    now_unloaded(e.loaded_cpu, e.launched);
 }
 
 impl Drop for Guest {
@@ -1217,6 +1358,9 @@ impl Drop for Guest {
             launched: &self.launched,
         };
         kcore::cpu::run_on_with(loaded as u32, &evict, evict_here);
+        /* As in `run`: current nowhere now, whether the IPI ran or the CPU
+         * it was for has gone. */
+        now_unloaded(&self.loaded_cpu, &self.launched);
     }
 }
 

@@ -142,11 +142,16 @@ impl Drop for Hv {
          * has just been freed. */
         let machine = &self.state.machine;
         let was = machine.disable(u64::MAX);
+        if was.busy != 0 {
+            /* Cannot be: every guest was stopped and dropped above, and a
+             * dropped guest's VMCS is current nowhere. Said anyway. */
+            kcore::trace!(0, "hv: WARNING -- a guest's VMCS is still current on cpu mask 0x{:x}", was.busy);
+        }
         let left = machine.hardware_mask();
         if left != 0 {
             kcore::trace!(0, "hv: WARNING -- unloading with the extension still on for cpu mask 0x{:x}", left);
         }
-        kcore::trace!(0, "hv: unloaded, extension off for cpu mask 0x{:x}", was);
+        kcore::trace!(0, "hv: unloaded, extension off for cpu mask 0x{:x}", was.off);
     }
 }
 
@@ -468,6 +473,14 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
             }
         }
     }
+    /* Both are AMD-V's: the flush is the entry with no ASID kept, and the
+     * profile times vmrun's parts. On VT-x every entry flushes anyway and
+     * nothing is timed, so a number under either word would not be what
+     * was asked for. */
+    if (flush || profile) && machine.ext() == Ok(hv::Ext::Vmx) {
+        let _ = writeln!(out, "hv: flush and profile are AMD-V's -- under VT-x the TLB is flushed on every entry, and no profile is kept");
+        return;
+    }
     let Some(result) = Mutex::new(None) else {
         let _ = writeln!(out, "hv: out of memory");
         return;
@@ -556,7 +569,16 @@ fn switch(state: &State, which: Option<&str>, on: bool, out: &mut Output) {
             }
         }
     } else {
-        machine.disable(mask)
+        let was = machine.disable(mask);
+        if was.busy != 0 {
+            /* What the courtesy check above did not see -- an `hv boot` or
+             * `hv run` in another shell, a guest started since: the CPU
+             * itself refused, and stays on. */
+            let _ = write!(out, "hv: a guest's VMCS is still current on cpu ");
+            write_mask(out, was.busy);
+            let _ = writeln!(out, " -- left on; stop the guest first");
+        }
+        was.off
     };
 
     let _ = write!(out, "hv: turned {} for cpu ", if on { "on" } else { "off" });

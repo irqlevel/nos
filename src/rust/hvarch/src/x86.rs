@@ -243,12 +243,18 @@ impl Ext {
         }
     }
 
+    /// Whether it is off now. False is VMX with a guest's VMCS still current
+    /// on this CPU ([`vmx::disable`]), left on: the guest has to go first.
+    ///
     /// # Safety
     /// As [`svm::disable`] and [`vmx::disable`]: on the CPU it is for, with
     /// no guest running there.
-    pub unsafe fn disable(self) {
+    pub unsafe fn disable(self) -> bool {
         match self {
-            Ext::Svm => unsafe { svm::disable() },
+            Ext::Svm => {
+                unsafe { svm::disable() };
+                true
+            }
             Ext::Vmx => unsafe { vmx::disable() },
         }
     }

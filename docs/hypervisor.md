@@ -260,10 +260,39 @@ The differences that are not hidden by the shadow at all:
   VMCS host area, which `HostRegs::capture` fills on the CPU the entry runs
   on -- its CR3, its GS base (where its per-CPU data is), its TR, its GDTR
   and IDTR. Rewritten when the guest's task has moved CPU, not every entry.
+  The CR4 in it is the one the entry runs under, with OSFXSR and OSXSAVE
+  set, not the one the host has between entries: the exit loads CR4 from
+  that field before the FXSAVE that takes the guest's x87/SSE state back and
+  the XSETBV that gives the host its XCR0 back, and captured as the host had
+  it the first may leave the XMM registers out (the manual leaves that to
+  the implementation) and the second is an undefined opcode -- a panic, on a
+  host whose firmware left XCR0 anything but the x87 alone. (`vmrun` saves
+  the CR4 it finds, which is the window's, so AMD-V never had this to get
+  wrong.)
+- **The host's NMI is delivered by hand.** Under AMD-V an intercepted NMI
+  stays pending until `stgi` and the host takes it then; under VT-x the exit
+  *is* its delivery -- the NMI is consumed, and NMIs stay blocked until an
+  IRET. So an NMI exit ends with `int 2` into the host's own handler, whose
+  IRET unblocks the next, the way `#MC` is raised with `int 0x12` on both
+  sides and the way KVM does it. What would otherwise be lost is the panic
+  path collecting this CPU's stack from another (`Cpu N did not answer the
+  NMI`, exactly when the backtrace was wanted) and the profiler's counter
+  overflow, after which its LVT stays masked and the profiler is dead on
+  that CPU.
 - **CR2 is nobody's on Intel.** `vmrun` keeps a guest CR2 in the VMCB; VMX
   keeps none, so `run` saves the host's and restores the guest's around the
   world switch by hand. The x87/SSE and XCR0 switch is the same as AMD-V --
   neither extension switches it, and the guest is given x87 alone.
+- **CR8 is the host's on Intel.** In 64-bit mode CR8 is the local APIC's
+  task priority register, and under VT-x a guest's `mov cr8` reaches the real
+  one unless told not to: 15 there keeps every interrupt but an NMI off the
+  host's CPU -- the tick, the kick, the IPI a TLB shootdown waits for, which
+  would panic the machine ten seconds later -- for as long as the guest
+  likes, and after it has gone, since the exit restores no TPR. AMD-V gives
+  the guest `V_TPR` under `V_INTR_MASKING` and never exits. So the VMX
+  controls stop the guest at every CR8 access (`Exit::Cr8`), and the policy
+  answers from a shadow TPR of the guest's own, a #GP for a value CR8 cannot
+  hold. The `tpr` built-in guest checks both backends.
 - **The syscall MSRs are switched through load lists.** `STAR`, `LSTAR`,
   `CSTAR`, `FMASK` and `KERNEL_GS_BASE` are not VMCS fields, and a guest run
   with the host's would be catastrophic -- a userspace `SYSCALL` jumps to the
@@ -284,25 +313,71 @@ The differences that are not hidden by the shadow at all:
   and network -- runs under VT-x.
 - **Controls, not a permission map.** Every port and every MSR exits by the
   processor-based controls (unconditional I/O exiting, no MSR bitmap), not by
-  the 20 KiB of `iopm`/`msrpm` a VMCB points at. Each control field is
-  written through `adjust`, which forces on the bits `IA32_VMX_*_CTLS` says
-  must be 1 and off the ones it forbids -- a value that ignored them fails
-  entry with nothing named. Guest CR4.VMXE is forced set (the fixed MSRs
-  demand it) and masked to read 0, since the guest is told it has no VMX.
+  the 20 KiB of `iopm`/`msrpm` a VMCB points at. The rest of AMD-V's
+  intercept set is controls too, since VT-x stops a guest at none of them
+  unasked: CR8 (above), MONITOR, MWAIT and RDPMC, which CPUID says the guest
+  has not got and which run on the host's CPU otherwise, and WBINVD, which
+  otherwise writes back and drops the package's whole shared cache -- every
+  core stalled for milliseconds -- as often as the guest cares to; CPUID,
+  INVD, VMCALL, XSETBV and a triple fault exit unconditionally, and RDTSCP,
+  INVPCID and XSAVES are `#UD` in the guest because the secondary controls
+  that would enable them are off. Each control field is written through
+  `adjust`, which forces on the bits `IA32_VMX_*_CTLS` says must be 1 and
+  off the ones it forbids -- a value that ignored them fails entry with
+  nothing named. Guest CR4.VMXE is forced set (the fixed MSRs demand it) and
+  masked to read 0, since the guest is told it has no VMX.
 - **A refused entry is the CPU's `VMEXIT_INVALID`, not a software check.**
   AMD-V's VMCB is checked in software first (`Vcpu::check`) so a bad one is
   named before the CPU sees it; VMX has no such check -- a bad guest state is
   the CPU's to refuse, at `vmlaunch`, reported as an entry failure and shown
-  as `Exit::Invalid` with the instruction error. VPID is off, so there is no
-  ASID to hand out or reuse; each guest's own EPT keeps its memory its own,
-  and the TLB is flushed on every transition.
+  as `Exit::Invalid` with the instruction error. An event an exit interrupted
+  the delivery of is given back rebuilt from its vector, type and error code,
+  not copied: bit 12 of what the exit wrote is undefined, and the entry field
+  wants bits 30:12 clear.
+- **INVEPT, once per CPU a guest runs on.** VPID is off, so there is no ASID
+  to hand out or reuse, and with it off every VM entry and exit drops the
+  guest's linear and combined mappings -- "the TLB is flushed on every
+  transition" is true of those. It is not true of *guest-physical* mappings,
+  the EPT's own translations, which the CPU tags with the EPT's address and
+  keeps across transitions and across VMXOFF and VMXON. A guest destroyed
+  frees its EPT; the next guest's EPT is likely made in the same page (the
+  allocator hands back what it was last given), so its tag is the old one's,
+  and the CPU would serve the old guest's translations -- to pages that are
+  the host's again -- for the new guest's addresses, which are the same low
+  addresses every kernel touches first. Nested KVM keeps its own shadow EPT
+  and shows none of this. So `enable` follows `vmxon` with an all-context
+  INVEPT, dropping what an earlier load's guests left, and a guest's first
+  entry on each CPU (the moment its host state is captured there) is
+  preceded by a single-context INVEPT for its EPT -- once per CPU per guest,
+  which costs nothing, and after which the only translations under that tag
+  are this guest's, an EPT that only grows never making a stale one. `usable`
+  requires the instruction. This is the counterpart of the AMD side's ASID
+  generations, which begin run out at every load for the same reason.
 
 The `hypercall` built-in guest is the one whose *machine code* is a vendor's:
 `vmmcall` (`0F 01 D9`) is AMD's and an invalid opcode on Intel, so the loader
 patches it to `vmcall` (`0F 01 C1`) where the guest runs under VT-x. The
 `refused` and `asid` guests test AMD-only mechanisms, and each has a VMX form
 that tests the Intel equivalent -- the CPU refusing a non-canonical guest
-RIP, and three VMs isolated by their EPTs.
+RIP, and three VMs isolated by their EPTs; `tpr` runs unchanged, and is
+stopped twice under VT-x and not at all under AMD-V.
+
+What the VMX backend does not do yet, and says so rather than pretends:
+
+- **A guest cannot leave long mode.** The "IA-32e mode guest" entry control
+  is fixed and CR0 is not intercepted, so a guest that clears CR0.PG --
+  `kexec`, a crash kernel, `reboot=bios` -- fails its next entry and stops as
+  `Invalid`. Every guest this loader starts is 64-bit from its first
+  instruction, and a Linux `reboot` goes through the 8042 or the reset
+  register first, which are caught before any mode change. The fix is KVM's:
+  CR0.PG in the guest/host mask, and the control toggled on the exit.
+- **Debug registers are not the guest's.** "Load debug controls" is off, so
+  the guest's DR7 is not loaded at an entry, and every exit sets DR7 to
+  0x400: a hardware breakpoint or watchpoint set in a guest (gdb, perf) is
+  gone at its next exit, silently. DR0-3 and DR6 are switched by neither
+  backend. Making them the guest's is MOV-DR exiting with a lazy switch, and
+  `#DB` given back to the guest rather than stopping it -- one job, not yet
+  done.
 
 ## What it does today
 
@@ -356,7 +431,18 @@ not in root operation is an undefined-opcode fault, and this kernel's
 handler panics; so the IPI handler reads the register and acts on what it
 finds. That also makes `hv off` the way back from a CPU some earlier load
 left the extension on for -- the page it was using is gone, but turning it
-off needs no page.
+off needs no page. And on Intel it checks one thing more: that no guest's
+VMCS is current on the CPU. A VMCS is left current after an exit (the next
+entry resumes it), and VMXOFF under one leaves the CPU's cached copy of it
+nowhere good -- the manual wants every active VMCS `vmclear`ed first -- so
+`hvarch` counts the VMCSs current on each CPU, up where one is made current
+and down where it is cleared off, and `vmxoff` is refused while the count is
+not zero: the CPU stays on, keeps its page, and `hv off` names it (`a guest's
+VMCS is still current on cpu 3 -- left on; stop the guest first`). The CPU
+clears its own slot in the host-area table as it goes off, in the same IPI,
+so there is no moment at which an entry is turned away from a CPU that then
+stays on. `rmmod` never meets this: it drops every guest before it turns
+anything off, and a dropped guest's VMCS is current nowhere.
 
 ## A guest
 
@@ -582,6 +668,7 @@ memory behind it -- and 1 GiB to guest physical 4 GiB:
 | `triple` | `int3` with no IDT | a triple fault stops the guest, not the CPU |
 | `refused` | starts with CR0.NW set and CD clear | a VMCB that breaks a rule is refused before the CPU sees it, the rule named |
 | `spin` | `cli; jmp $` | the host's interrupts still get through -- about a hundred a second -- and the host stops it when its 300 ms are up |
+| `tpr` | writes 15 to CR8 -- the task priority register, which masks every interrupt priority -- and reads it back | the guest gets a shadow TPR of its own (AMD-V's `V_TPR`; under VT-x a `mov cr8` stops the guest and is answered from one), and the host's CR8, read afterwards on the CPU the guest ran on, is still 0: a guest cannot hold the host's interrupts off its CPU |
 | `asid` | three VMs on one CPU read a page of their own at one address: two taking turns, and a third given an ASID one of them had | no guest reads another's page through the TLB, and a reused ASID is reused after a flush ([Address space identifiers](#address-space-identifiers)) |
 
 ```
@@ -1267,7 +1354,10 @@ started guest runs on one of the CPUs it names. That is a courtesy and not
 what keeps the CPU safe: every entry checks, with interrupts off until the
 guest is running, that the extension is on and its save area is the one this
 module gave that CPU, so a guest racing an `hv off` finds it off and stops,
-`not entered`. `rmmod hv` stops every guest before it turns the extension off
+`not entered` -- on AMD-V; on Intel the CPU itself refuses to go off while a
+guest's VMCS is current on it ([above](#what-the-extension-costs-while-it-is-on)),
+so an `hv boot` or `hv run` the courtesy check does not see keeps its CPU
+too. `rmmod hv` stops every guest before it turns the extension off
 -- the guests first, an `hv boot` under way among them, so that an `hv exec`
 or `hv wait` waiting on one returns; then the command, whose unregistration
 waits out every call still running (an `hv start` still reading its files

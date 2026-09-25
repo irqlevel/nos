@@ -100,6 +100,16 @@ pub fn read_cr3() -> u64 {
     v
 }
 
+/// CR8, the local APIC's task priority register as 64-bit code reaches it:
+/// what a guest's `mov cr8` would write were it not intercepted, and so what
+/// a test reads to see that it was.
+#[inline]
+pub fn read_cr8() -> u64 {
+    let v: u64;
+    unsafe { asm!("mov {}, cr8", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
 /// CR2, the faulting linear address. VMX does not switch it around a guest,
 /// so the hypervisor saves the guest's and restores the host's by hand.
 #[inline]

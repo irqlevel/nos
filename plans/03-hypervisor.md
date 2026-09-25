@@ -124,13 +124,23 @@ TCG has no VMX to bring one up under slowly:
   through without an `svm` or a `vmx` in them; `vmx::Vcpu`, the Intel side's
   policy and exit decoder; `ept`, the EPT arena. `GuestMemory` builds a
   nested page table or an EPT by the machine's vendor.
-- The nine built-in guests all run under VT-x too, on the first CPU and the
+- The built-in guests all run under VT-x too, on the first CPU and the
   last: `hypercall`'s `vmmcall` opcode is patched to `vmcall` (AMD's is a
   `#UD` on Intel), and `refused` and `asid`, which test AMD-only mechanisms,
   have a VMX form -- the CPU refusing a non-canonical guest RIP, and three
   VMs kept apart by their EPTs. `hv-test.py` uses KVM VT-x on an Intel host,
   KVM AMD-V on an AMD host, and TCG AMD-V otherwise, so both backends are
   gated.
+- A review of the backend against the manual, after the distro boots, found
+  what nested KVM cannot show and fixed it: CR8 not intercepted (a guest
+  could set the host CPU's TPR and keep every interrupt off it); the host
+  CR4 captured without the FXSAVE/XSETBV window the exit needs it to have;
+  no INVEPT anywhere (a freed EPT's translations served under the next EPT
+  at the same address); the host's NMI consumed by the exit instead of
+  delivered; WBINVD, MONITOR, MWAIT and RDPMC running natively; `vmread`/
+  `vmwrite` declared as preserving flags they set; an interrupted event
+  copied with an undefined bit; `vmxoff` under a current VMCS. The `tpr`
+  built-in guest gates the first on both backends.
 - Found on the way: QEMU's TCG before 9.2 does not translate an unpaged
   guest's addresses through the nested table -- a real-mode guest there
   runs out of host memory -- which is why every guest starts paged.

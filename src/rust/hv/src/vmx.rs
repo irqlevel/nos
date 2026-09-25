@@ -40,7 +40,15 @@ const VECTOR_MC: u8 = 18;
 /// One guest CPU under VT-x.
 pub struct Vcpu {
     guest: Guest,
+    /// The guest's task-priority register, CR8: a shadow, since the real
+    /// one is the host's local APIC's, and the guest is given no APIC for
+    /// the value to mean anything to. A `mov` to or from CR8 stops the
+    /// guest and is answered from here.
+    tpr: u8,
 }
+
+/// What CR8 can hold: bits 3:0. A `mov` of more into it is a #GP.
+const TPR_MASK: u64 = 0xF;
 
 impl Vcpu {
     /// A CPU that stops at the instructions a guest of this hypervisor may
@@ -51,7 +59,7 @@ impl Vcpu {
             _ => return Err(hvarch::Error::NoExtension),
         };
         let guest = Guest::new(vmx, exceptions)?;
-        Ok(Self { guest })
+        Ok(Self { guest, tpr: 0 })
     }
 
     pub fn save(&self) -> &Save {
@@ -129,6 +137,9 @@ impl Vcpu {
         s.rsp = l.stack;
         s.rax = 0;
         s.g_pat = PAT_RESET;
+        /* The whole shadow was just set: the next entry loads all of it,
+         * not only the fields a policy changes between entries. */
+        self.guest.mark_full_sync();
     }
 
     /// Enter the guest and come back at its next exit, decoded. The exit is
@@ -141,6 +152,7 @@ impl Vcpu {
             Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
             Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
             Err(NotRun::FiveLevelPaging { cpu }) => return Err(Refusal::FiveLevelPaging(cpu)),
+            Err(NotRun::Flush { cpu }) => return Err(Refusal::Flush(cpu)),
         };
         if self.guest.entry_failed() {
             /* VMLAUNCH itself failed: the guest never started, and the
@@ -199,6 +211,22 @@ impl Vcpu {
             r::WRMSR => Exit::Msr { write: true },
             r::VMCALL => Exit::Hypercall,
             r::INTERRUPT_WINDOW => Exit::IrqWindow,
+            r::CR_ACCESS => {
+                /* CR8 alone is intercepted by choice; the other exit this
+                 * reason can be is a `mov` to CR4 setting VMXE, which the
+                 * guest was told it has not got, and which stops it. */
+                let q = g.exit_qualification();
+                use vmcs::cr_access as cr;
+                let kind = q & cr::TYPE_MASK;
+                if q & cr::CR_MASK == 8 && (kind == cr::MOV_TO_CR || kind == cr::MOV_FROM_CR) {
+                    Exit::Cr8 {
+                        write: kind == cr::MOV_TO_CR,
+                        gpr: ((q & cr::GPR_MASK) >> cr::GPR_SHIFT) as u8,
+                    }
+                } else {
+                    Exit::Other(r::CR_ACCESS as u64)
+                }
+            }
             r::EPT_VIOLATION => {
                 let q = g.exit_qualification();
                 use vmcs::ept_viol;
@@ -233,31 +261,110 @@ impl Vcpu {
             r::MONITOR => Exit::Other(svm_exit::MONITOR),
             r::MWAIT => Exit::Other(svm_exit::MWAIT),
             r::RDTSCP => Exit::Other(svm_exit::RDTSCP),
+            r::RDPMC => Exit::Other(svm_exit::RDPMC),
             other => Exit::Other(other as u64),
         }
     }
 
     /// Give back an event whose delivery an exit cut short: VMX leaves it in
     /// IDT_VECTORING_INFO, and it is lost unless the next entry injects it.
-    /// Not a software interrupt or INT3/INTO, whose RIP still points at the
-    /// instruction (as on the AMD side).
+    /// Not a software interrupt or exception (INT n, INT1, INT3, INTO),
+    /// whose RIP still points at the instruction (as on the AMD side).
     pub fn requeue_event(&mut self) {
+        use vmcs::intr;
         let info = self.guest.idt_vectoring_info();
-        if info & vmcs::intr::VALID == 0 {
+        if info & intr::VALID == 0 {
             return;
         }
-        let typ = info & vmcs::intr::TYPE_MASK;
-        let vector = info & vmcs::intr::VECTOR_MASK;
-        let software = typ == vmcs::intr::TYPE_SOFT_INT
-            || typ == vmcs::intr::TYPE_SOFT_EXCEPTION
-            || (typ == vmcs::intr::TYPE_HW_EXCEPTION && (vector == 3 || vector == 4));
-        if !software {
-            let errcode = if info & vmcs::intr::DELIVER_ERRCODE != 0 {
-                self.guest.idt_vectoring_errcode()
-            } else {
-                0
-            };
-            self.guest.set_inject(info, errcode);
+        let typ = info & intr::TYPE_MASK;
+        let vector = info & intr::VECTOR_MASK;
+        let software = typ == intr::TYPE_SOFT_INT
+            || typ == intr::TYPE_PRIV_SOFT_EXCEPTION
+            || typ == intr::TYPE_SOFT_EXCEPTION
+            || (typ == intr::TYPE_HW_EXCEPTION && (vector == 3 || vector == 4));
+        if software {
+            return;
+        }
+        /* Made from its parts, not copied: the word the exit wrote has an
+         * undefined bit 12, and the entry field wants bits 30:12 clear, or
+         * the entry fails with nothing named. */
+        let mut event = intr::VALID | typ | vector;
+        let errcode = if info & intr::DELIVER_ERRCODE != 0 {
+            event |= intr::DELIVER_ERRCODE;
+            self.guest.idt_vectoring_errcode()
+        } else {
+            0
+        };
+        self.guest.set_inject(event, errcode);
+    }
+
+    /// Answer the guest's `mov` to or from CR8 from its shadow task-priority
+    /// register and step past it: the real CR8 is the host's local APIC's,
+    /// and a guest let at it could hold every interrupt but an NMI off the
+    /// host's CPU. A value CR8 cannot hold is a #GP, as on the silicon, and
+    /// the instruction is not stepped past.
+    pub fn cr8_access(&mut self, write: bool, gpr: u8) {
+        if write {
+            let value = self.gpr(gpr);
+            if value & !TPR_MASK != 0 {
+                self.inject_gp();
+                return;
+            }
+            self.tpr = value as u8;
+        } else {
+            self.set_gpr(gpr, u64::from(self.tpr));
+        }
+        self.skip();
+    }
+
+    /// General-purpose register `n`, as the encoding numbers them.
+    fn gpr(&self, n: u8) -> u64 {
+        let s = self.guest.save();
+        let r = self.guest.regs();
+        match n {
+            0 => s.rax,
+            1 => r.rcx,
+            2 => r.rdx,
+            3 => r.rbx,
+            4 => s.rsp,
+            5 => r.rbp,
+            6 => r.rsi,
+            7 => r.rdi,
+            8 => r.r8,
+            9 => r.r9,
+            10 => r.r10,
+            11 => r.r11,
+            12 => r.r12,
+            13 => r.r13,
+            14 => r.r14,
+            _ => r.r15,
+        }
+    }
+
+    fn set_gpr(&mut self, n: u8, value: u64) {
+        /* RSP the guest keeps in the VMCS: told to the backend, which
+         * writes it there at the next entry. */
+        if n == 4 {
+            self.guest.set_rsp(value);
+            return;
+        }
+        let (s, r) = self.guest.save_and_regs_mut();
+        match n {
+            0 => s.rax = value,
+            1 => r.rcx = value,
+            2 => r.rdx = value,
+            3 => r.rbx = value,
+            5 => r.rbp = value,
+            6 => r.rsi = value,
+            7 => r.rdi = value,
+            8 => r.r8 = value,
+            9 => r.r9 = value,
+            10 => r.r10 = value,
+            11 => r.r11 = value,
+            12 => r.r12 = value,
+            13 => r.r13 = value,
+            14 => r.r14 = value,
+            _ => r.r15 = value,
         }
     }
 

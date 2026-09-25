@@ -267,7 +267,7 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             value, port, hv::run::reset_source(port), rip),
         Stop::Exception { vector, rip } => write!(out, "exception {} at {:#x}", vector, rip),
         Stop::Refused(r) => write!(out, "not entered: {:?}", r),
-        Stop::Invalid => write!(out, "VMEXIT_INVALID -- the CPU refused the VMCB"),
+        Stop::Invalid => write!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
         Stop::Budget => write!(out, "by the host, its time up"),
         Stop::Requested => write!(out, "on request"),
         Stop::Unexpected { exit, rip } => write!(out, "an exit with no handler: {:?} at {:#x}", exit, rip),
@@ -287,9 +287,9 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stop: &Stop, counts: &Cou
     if counts.kicked != 0 {
         let _ = writeln!(out, "  kicked     {} entries turned back for a frame or a disk's answer that came on the way in", counts.kicked);
     }
-    if counts.ud != 0 || counts.wbinvd != 0 {
-        let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past",
-            counts.ud, counts.wbinvd);
+    if counts.ud != 0 || counts.wbinvd != 0 || counts.cr8 != 0 {
+        let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR",
+            counts.ud, counts.wbinvd, counts.cr8);
     }
     let absent = guest.absent_pages();
     if !absent.is_empty() {

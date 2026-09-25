@@ -65,31 +65,54 @@ fn enable_here(req: &Request) {
 }
 
 /// Turn it off again, on the CPU this runs on, and say whether there was
-/// anything to turn off. The same context, and no guest is running here:
-/// whatever was running them is stopped before this is sent.
+/// anything to turn off -- or that there still is: a guest's VMCS current
+/// on this CPU, which VT-x will not go off under ([`Ext::disable`]), and the
+/// guest that owns it is then left to run. The same context as
+/// [`enable_here`], and the moment the CPU lets go of its page: its slot in
+/// the table is cleared here, on the CPU, with interrupts off, so that no
+/// entry -- which reads the slot with interrupts off too -- can find the
+/// page of a CPU the extension has gone off for, and none is turned away
+/// from a CPU it stays on for.
 ///
 /// The check belongs here rather than in the caller -- one IPI instead of
 /// two, and no window in between for the answer to go stale. It has to
 /// happen somewhere: `vmxoff` on a CPU that is not in root operation is an
 /// undefined-opcode fault, and this kernel's handler panics.
-fn disable_here(q: &Query) {
-    let was_on = q.ext.enabled();
-    if was_on {
-        unsafe { q.ext.disable() };
+fn disable_here(d: &Disable) {
+    let answer = if !d.ext.enabled() {
+        OFF
+    } else if unsafe { d.ext.disable() } {
+        ON
+    } else {
+        BUSY
+    };
+    if answer != BUSY {
+        d.host_area.store(0, Ordering::Release);
     }
-    q.answer.store(if was_on { ON } else { OFF }, Ordering::Release);
+    d.answer.store(answer, Ordering::Release);
 }
 
 /// Asking a CPU whether the extension is on for it. Values and an atomic,
 /// for the same reason [`Request`] is.
 struct Query {
     ext: Ext,
-    /// [`NOT_RUN`], or 1 for off and 2 for on.
+    /// [`NOT_RUN`], or [`OFF`] or [`ON`].
+    answer: AtomicU32,
+}
+
+/// Telling a CPU to turn it off: the same, and the CPU's slot in the host
+/// area table for it to clear as it does.
+struct Disable<'a> {
+    ext: Ext,
+    host_area: &'a AtomicU64,
+    /// [`NOT_RUN`], or [`OFF`], [`ON`] or [`BUSY`].
     answer: AtomicU32,
 }
 
 const OFF: u32 = 1;
 const ON: u32 = 2;
+/// Still on: a guest's VMCS is current on the CPU.
+const BUSY: u32 = 3;
 
 impl Query {
     fn new(ext: Ext) -> Self {
@@ -101,6 +124,24 @@ impl Query {
     fn on(&self) -> bool {
         self.answer.load(Ordering::Acquire) == ON
     }
+}
+
+impl<'a> Disable<'a> {
+    fn new(ext: Ext, host_area: &'a AtomicU64) -> Self {
+        Self { ext, host_area, answer: AtomicU32::new(NOT_RUN) }
+    }
+
+    fn answer(&self) -> u32 {
+        self.answer.load(Ordering::Acquire)
+    }
+}
+
+/// What [`Machine::disable`] did: the CPUs it turned the extension off for,
+/// and the ones it could not, a guest's VMCS being current there.
+#[derive(Clone, Copy, Default)]
+pub struct Disabled {
+    pub off: u64,
+    pub busy: u64,
 }
 
 /// Read the CPU's own state, on the CPU it is about.
@@ -143,10 +184,10 @@ pub struct Machine {
     /// The physical address of each CPU's page, or 0: the table's pages as
     /// entering a guest has to check them -- with interrupts off, where the
     /// mutex cannot be taken. Set once the CPU has taken its page and before
-    /// the table holds it; cleared before the CPU is told to let go of it,
-    /// and so before the page is freed. So a CPU's entry here is never the
-    /// address of a page that has gone, nor of one for a CPU the extension
-    /// is off for.
+    /// the table holds it; cleared by the CPU itself as it lets go of it
+    /// (`disable_here`), and so before the page is freed. So a CPU's entry
+    /// here is never the address of a page that has gone, nor of one for a
+    /// CPU the extension is off for.
     host_areas: [AtomicU64; MAX_CPUS],
 }
 
@@ -272,16 +313,19 @@ impl Machine {
     }
 
     /// Turn it off for every CPU in `mask` it is on for, and say which ones
-    /// those were. Never fails: a CPU that does not answer is no longer
-    /// running, and there is nothing left there to turn off.
-    pub fn disable(&self, mask: u64) -> u64 {
+    /// those were -- and which it stays on for, because a guest's VMCS is
+    /// current there ([`Disabled::busy`]); those keep their page, and the
+    /// guest keeps running. Otherwise it does not fail: a CPU that does not
+    /// answer is no longer running, and there is nothing left there to turn
+    /// off.
+    pub fn disable(&self, mask: u64) -> Disabled {
         let ext = match self.ext {
             Ok(ext) => ext,
-            Err(_) => return 0,
+            Err(_) => return Disabled::default(),
         };
         let online = cpu::online_mask();
         let mut cpus = self.cpus.lock();
-        let mut done = 0u64;
+        let mut done = Disabled::default();
 
         for i in 0..MAX_CPUS {
             let bit = 1u64 << i;
@@ -289,24 +333,29 @@ impl Machine {
                 continue;
             }
 
-            /* No entry finds this CPU's page from here on, so no entry finds
-             * a page for a CPU the extension has gone off for. One that
-             * looked before this has interrupts off until its guest exits,
-             * and the IPI below waits for that. */
-            self.host_areas[i].store(0, Ordering::Release);
-
             /* Every CPU asked for, not only the ones this module has a page
              * for: a load that found the extension already on has no page
              * for that CPU and turning it off is still the right thing --
              * the only thing, since the module that did turn it on is gone
-             * and nothing else ever will. */
+             * and nothing else ever will. The CPU clears its own slot as it
+             * goes off (`disable_here`): an entry that looked before has
+             * interrupts off until its guest exits, and the IPI waits for
+             * that; one that looks after finds nothing. */
             if online & bit != 0 {
-                let q = Query::new(ext);
-                cpu::run_on_with(i as u32, &q, disable_here);
-                if q.on() {
-                    done |= bit;
+                let d = Disable::new(ext, &self.host_areas[i]);
+                cpu::run_on_with(i as u32, &d, disable_here);
+                match d.answer() {
+                    BUSY => {
+                        done.busy |= bit;
+                        continue;
+                    }
+                    ON => done.off |= bit,
+                    _ => {}
                 }
             }
+            /* A CPU that is not running, or went between the mask and the
+             * IPI: nothing there to look at the slot again. */
+            self.host_areas[i].store(0, Ordering::Release);
 
             /* The page goes back only after the CPU that was using it has
              * said it is done -- or has stopped, in which case nothing will
@@ -323,7 +372,7 @@ impl Drop for Machine {
     fn drop(&mut self) {
         /* The module is going: leave no CPU in a state the kernel did not
          * boot in. Whoever drops this has already stopped whatever was
-         * running guests. */
+         * running guests -- and dropped them, or a CPU stays on. */
         self.disable(u64::MAX);
     }
 }

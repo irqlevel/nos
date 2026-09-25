@@ -99,6 +99,12 @@ pub enum Exit {
     Shutdown,
     /// `vmrun` refused the VMCB.
     Invalid,
+    /// A `mov` to (`write`) or from CR8 -- the task-priority register --
+    /// with general-purpose register `gpr` (numbered as the encoding does:
+    /// RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8-R15). VT-x stops the guest
+    /// there, since the real CR8 is the host's; AMD-V gives the guest a
+    /// shadow of its own and never exits.
+    Cr8 { write: bool, gpr: u8 },
     Other(u64),
 }
 
@@ -173,6 +179,7 @@ impl Vcpu {
             Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
             Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
             Err(NotRun::FiveLevelPaging { cpu }) => return Err(Refusal::FiveLevelPaging(cpu)),
+            Err(NotRun::Flush { cpu }) => return Err(Refusal::Flush(cpu)),
         };
         self.requeue_event();
         Ok((self.exit(), cpu))

@@ -112,7 +112,9 @@ impl Ext {
 
     /// # Safety
     /// As [`Ext::enable`].
-    pub unsafe fn disable(self) {}
+    pub unsafe fn disable(self) -> bool {
+        true
+    }
 
     pub fn enabled(self) -> bool {
         false

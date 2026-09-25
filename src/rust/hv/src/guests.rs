@@ -23,6 +23,9 @@
 //!              CPU's own answer would be VMEXIT_INVALID and nothing more
 //!   spin       `cli; jmp $` does not keep the host's interrupts out, and
 //!              the host stops it when its time is up
+//!   tpr        CR8, the task priority register, written to 15 and read
+//!              back: the guest's own shadow, not the host CPU's, which
+//!              would otherwise keep every interrupt off that CPU
 //!   asid       three VMs on one CPU, each reading its own page at one
 //!              address: two taking turns never read each other's, and the
 //!              third, given an ASID one of them had, reads its own too --
@@ -99,6 +102,10 @@ struct Run {
     host: u32,
     /// Reads of an absent device answered with a page of all ones.
     absent: u32,
+    /// `mov`s to and from CR8 stopped at and answered from the shadow TPR:
+    /// under VT-x, which stops the guest there; AMD-V keeps the shadow
+    /// itself and never stops.
+    cr8: u32,
     /// The guest's registers at its hypercall: RAX, RBX, RCX, RDX, RSI, RDI,
     /// RBP, R8-R15.
     at_hypercall: Option<[u64; 15]>,
@@ -136,6 +143,7 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
         hypercall: 0,
         host: 0,
         absent: 0,
+        cr8: 0,
         at_hypercall: None,
         uart: Uart::new(),
         serial: String::new(),
@@ -244,6 +252,10 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
             Exit::Exception { vector, error } => break Stop::Exception { vector, error, rip },
             Exit::MachineCheck => break Stop::MachineCheck { rip },
             Exit::Invalid => break Stop::Invalid,
+            Exit::Cr8 { write, gpr } => {
+                vm.vcpu_mut().cr8_access(write, gpr);
+                run.cr8 += 1;
+            }
             other => break Stop::Unexpected { exit: other, rip },
         }
     };
@@ -327,6 +339,14 @@ const GUESTS: &[Spec] = &[
         budget_ms: 300,
         build: build_spin,
         check: check_spin,
+    },
+    Spec {
+        name: "tpr",
+        about: "CR8 -- the host's task priority register -- written to 15 and read back: the guest's own, not the CPU's",
+        exceptions: ALL_EXCEPTIONS,
+        budget_ms: 2000,
+        build: build_tpr,
+        check: check_tpr,
     },
 ];
 
@@ -674,7 +694,9 @@ fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
         Stop::Refused(Refusal::NotOn(cpu)) => writeln!(out, "not entered -- the extension went off for cpu {}", cpu),
         Stop::Refused(Refusal::FiveLevelPaging(cpu)) => writeln!(
             out, "not entered -- cpu {} translates with five levels, and a nested table of four would be walked as five", cpu),
-        Stop::Invalid => writeln!(out, "VMEXIT_INVALID -- the CPU refused the VMCB"),
+        Stop::Refused(Refusal::Flush(cpu)) => writeln!(
+            out, "not entered -- cpu {} would not drop what it had cached through the nested table (INVEPT)", cpu),
+        Stop::Invalid => writeln!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
         Stop::Unexpected { exit, rip } => writeln!(out, "an exit with no answer here: {:?} at {:#x}", exit, rip),
     };
 
@@ -1087,6 +1109,54 @@ const SPIN_CODE: &[u8] = &[
 
 fn build_spin(vm: &mut Vm) -> Result<()> {
     board(vm, SPIN_CODE)
+}
+
+/* CR8 is the local APIC's task-priority register as 64-bit code reaches it,
+ * and in root operation it is the host's: a guest let at the CPU's own could
+ * set it to 15 and keep every interrupt but an NMI -- the host's tick, its
+ * kick, the IPI a TLB shootdown waits for -- off that CPU for as long as it
+ * liked, and after it had gone. VT-x has to be told to stop the guest there
+ * (`Exit::Cr8`, answered from a shadow of the guest's own); AMD-V keeps the
+ * shadow itself (`V_TPR`, under `V_INTR_MASKING`) and never stops. Either
+ * way the guest has to read back what it wrote, and the CPU's own CR8 --
+ * read by the host afterwards, on the CPU the guest ran on -- has to be what
+ * it was. */
+const TPR_CODE: &[u8] = &[
+    0xB8, 0x0F, 0x00, 0x00, 0x00,                   // mov eax, 15
+    0x44, 0x0F, 0x22, 0xC0,                         // mov cr8, rax
+    0x44, 0x0F, 0x20, 0xC3,                         // mov rbx, cr8
+    0x48, 0x89, 0x1C, 0x25, 0x00, 0x70, 0x00, 0x00, // mov [0x7000], rbx
+    0xF4,                                           // hlt
+];
+const TPR_WRITTEN: u64 = 15;
+const TPR_HLT: u64 = ENTRY + 0x15;
+/// The host's own task priority, as this kernel's local APIC setup leaves
+/// it: every interrupt let through.
+const HOST_TPR: u64 = 0;
+
+fn build_tpr(vm: &mut Vm) -> Result<()> {
+    board(vm, TPR_CODE)
+}
+
+fn check_tpr(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
+    halted_at(r, TPR_HLT)?;
+    let read: u64 = read(vm, RESULTS)?;
+    if read != TPR_WRITTEN {
+        return Err(alloc::format!("the guest read {} back from CR8, not the {} it wrote", read, TPR_WRITTEN));
+    }
+    let host = hvarch::x86::cpu::read_cr8();
+    if host != HOST_TPR {
+        return Err(alloc::format!(
+            "the host's CR8 is {} after the guest's write, not {}: the write reached the CPU's own", host, HOST_TPR));
+    }
+    let stops = if vm.is_vmx() { 2 } else { 0 };
+    if r.cr8 != stops {
+        return Err(alloc::format!("the guest was stopped at CR8 {} times, not {}", r.cr8, stops));
+    }
+    Ok(alloc::format!(
+        "the guest wrote 15 to its CR8 and read it back, {}, and the host's CR8 is still {}",
+        if vm.is_vmx() { "stopped at each and answered from the shadow" } else { "the CPU keeping the shadow itself" },
+        HOST_TPR))
 }
 
 fn check_spin(_vm: &Vm, r: &Run) -> core::result::Result<String, String> {

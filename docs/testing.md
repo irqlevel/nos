@@ -353,12 +353,16 @@ guest the host CPU's own extension -- AMD-V on an AMD host, Intel VT-x on an
 Intel one, nested, since nos is itself a KVM guest -- and TCG's `-cpu max`
 gives AMD-V where there is no KVM, TCG having no VMX at all. So the Intel
 backend is reached only through KVM and the AMD one three ways, and between
-them both are covered. Two guests test a mechanism only one vendor has:
-AMD-V's software VMCB check (`refused`) and its ASID recycling (`asid`).
-Under VT-x the CPU refuses a bad VMCS itself and there is no ASID (VPID is
-off), so those two check the Intel equivalent instead -- a non-canonical
-guest RIP refused at entry, and three VMs isolated by their own EPTs -- with
-the expected output chosen from which extension `hv info` names. It was the
+them both are covered. Three guests test a mechanism only one vendor has:
+AMD-V's software VMCB check (`refused`), its ASID recycling (`asid`) and its
+shadow task-priority register (`tpr`). Under VT-x the CPU refuses a bad VMCS
+itself and there is no ASID (VPID is off), so those two check the Intel
+equivalent instead -- a non-canonical guest RIP refused at entry, and three
+VMs isolated by their own EPTs -- and `tpr`, the same bytes on both, is
+stopped at each CR8 access and answered from a shadow, where AMD-V's `V_TPR`
+never stops it; either way the host's own CR8 has to read 0 afterwards, on
+the CPU the guest ran on, which is why the guests run bound to one. The
+expected output is chosen from which extension `hv info` names. It was the
 `refused` guest, run before any `hv on`, that first caught a VMX bug the
 standalone runs could not: a VMCS `vmclear`ed at construction, where VMX may
 be off, faults, so the clear had to move to the first entry.

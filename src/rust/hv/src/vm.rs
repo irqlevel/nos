@@ -25,6 +25,9 @@ pub enum Refusal {
     /// This CPU translates with five levels of page table, which the nested
     /// table would be walked as.
     FiveLevelPaging(u32),
+    /// This CPU would not drop what it had cached through the guest's
+    /// nested table before the guest's first entry there (VMX's INVEPT).
+    Flush(u32),
 }
 
 /// One guest's CPU, of whichever kind the machine runs. Every method the run
@@ -82,6 +85,13 @@ impl Backend {
     }
     pub fn skip_wbinvd(&mut self) {
         match self { Backend::Svm(v) => v.skip_wbinvd(), Backend::Vmx(v) => v.skip_wbinvd() }
+    }
+    /// Answer the guest's `mov` to or from CR8 ([`Exit::Cr8`]) from the
+    /// shadow task-priority register and step past it. AMD-V keeps that
+    /// shadow itself (`V_TPR`, under `V_INTR_MASKING`) and never exits for
+    /// one, so there is nothing for its side to do.
+    pub fn cr8_access(&mut self, write: bool, gpr: u8) {
+        match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.cr8_access(write, gpr) }
     }
     pub fn inject_extint(&mut self, vector: u8) {
         match self { Backend::Svm(v) => v.inject_extint(vector), Backend::Vmx(v) => v.inject_extint(vector) }
