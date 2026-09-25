@@ -473,12 +473,12 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
             }
         }
     }
-    /* Both are AMD-V's: the flush is the entry with no ASID kept, and the
-     * profile times vmrun's parts. On VT-x every entry flushes anyway and
-     * nothing is timed, so a number under either word would not be what
+    /* The flush is AMD-V's: the entry with no ASID kept. On VT-x every
+     * entry flushes anyway, so a number under that word would not be what
      * was asked for. */
-    if (flush || profile) && machine.ext() == Ok(hv::Ext::Vmx) {
-        let _ = writeln!(out, "hv: flush and profile are AMD-V's -- under VT-x the TLB is flushed on every entry, and no profile is kept");
+    let vmx = machine.ext() == Ok(hv::Ext::Vmx);
+    if flush && vmx {
+        let _ = writeln!(out, "hv: flush is AMD-V's -- under VT-x the TLB is flushed on every entry as it is");
         return;
     }
     let Some(result) = Mutex::new(None) else {
@@ -510,10 +510,17 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
                 /* Ticks to nanoseconds by the two clocks' own ratio over the
                  * run: whatever the TSC's rate, the parts add up to the whole. */
                 let part = |ticks: u64| ticks * ns / b.ticks.max(1) / p.entries.max(1);
-                let entry = part(p.checks) + part(p.switch_in) + part(p.world) + part(p.switch_out);
-                let _ = writeln!(out, "hv: an exit, in ns: checks and ASID {}, x87/SSE in {}, vmrun to #vmexit {}, x87/SSE out {}; the rest -- the exit handled, the loop -- {}",
-                    part(p.checks), part(p.switch_in), part(p.world), part(p.switch_out),
-                    (ns / exits).saturating_sub(entry));
+                let entry = part(p.checks) + part(p.sync_in) + part(p.switch_in) + part(p.world)
+                    + part(p.switch_out) + part(p.sync_out);
+                let _ = if vmx {
+                    writeln!(out, "hv: an exit, in ns: checks and VMPTRLD {}, VMCS written {}, x87/SSE in {}, vmresume to exit {}, x87/SSE out {}, VMCS read {}; the rest -- the exit handled, the loop -- {}",
+                        part(p.checks), part(p.sync_in), part(p.switch_in), part(p.world), part(p.switch_out),
+                        part(p.sync_out), (ns / exits).saturating_sub(entry))
+                } else {
+                    writeln!(out, "hv: an exit, in ns: checks and ASID {}, x87/SSE in {}, vmrun to #vmexit {}, x87/SSE out {}; the rest -- the exit handled, the loop -- {}",
+                        part(p.checks), part(p.switch_in), part(p.world), part(p.switch_out),
+                        (ns / exits).saturating_sub(entry))
+                };
             }
         }
         Some(Err(why)) => {

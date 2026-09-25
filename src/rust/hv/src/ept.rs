@@ -83,8 +83,9 @@ pub struct Ept {
     /// index here, never by the address in an entry.
     tables: Vec<Table>,
     /// Its identity, as the nested table's is on the AMD side -- unused by
-    /// VMX, which this hypervisor runs with VPID off, but the shape the
-    /// entry point takes is one for both.
+    /// VMX, whose VPID is the guest's for life rather than the AMD side's
+    /// per-CPU tag over a table, but the shape the entry point takes is one
+    /// for both.
     id: u64,
 }
 

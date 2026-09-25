@@ -551,13 +551,17 @@ fn asid_check(machine: &Machine, tally: &mut Tally) -> core::result::Result<Stri
     asid_found(&c, 2)?;
     let given = c.vcpu().asid();
 
-    /* VMX runs with VPID off, so there is no ASID to hand out or reuse -- the
-     * TLB is flushed on every transition, and each guest's own EPT is what
-     * keeps its memory its own. The isolation the three VMs just showed is
-     * the whole of what this check can say there; the generation machinery
-     * below is the AMD side's. */
+    /* VT-x's ASID is the VPID, held for a guest's life and given back at its
+     * end, the lowest free one taken next: C's is A's or B's, and what the
+     * first entry's INVVPID is for is exactly what a reused ASID's flush is
+     * for on the AMD side. The generation machinery below is AMD's. */
     if machine.ext() == Ok(hvarch::Ext::Vmx) {
-        return Ok(String::from("each of three VMs read its own page through its own EPT; VMX runs with VPID off, so there is no ASID to reuse"));
+        return match (had, given) {
+            (_, None) => Ok(String::from("each of three VMs read its own page through its own EPT; this CPU has no VPIDs, so every transition flushes")),
+            ([Some(a), Some(b)], Some(c)) if c == a || c == b => Ok(alloc::format!(
+                "vm C was given VPID {}, which vm {} had, and read its own too", c, if c == a { "A" } else { "B" })),
+            (had, Some(c)) => Err(alloc::format!("vm C was given VPID {}, which neither A ({:?}) nor B ({:?}) had", c, had[0], had[1])),
+        };
     }
 
     let (cpu_after, after) = hvarch::x86::svm::asid_generation().ok_or_else(|| String::from("no ASIDs on this CPU"))?;

@@ -481,6 +481,11 @@ pub unsafe fn vmclear(phys: u64) -> bool {
 pub const INVEPT_SINGLE_CONTEXT: u64 = 1;
 pub const INVEPT_ALL_CONTEXT: u64 = 2;
 
+/// The INVVPID types this hypervisor uses: drop the cached translations
+/// tagged with one VPID, or with every VPID but the host's.
+pub const INVVPID_SINGLE_CONTEXT: u64 = 1;
+pub const INVVPID_ALL_CONTEXT: u64 = 2;
+
 /// The operand INVEPT reads: the EPT pointer it is about (ignored by the
 /// all-context type), and a word that must be 0. In memory, 16 bytes.
 #[repr(C, align(16))]
@@ -509,6 +514,39 @@ pub unsafe fn invept(kind: u64, eptp: u64) -> bool {
     let failed: u8;
     unsafe {
         asm!("invept {kind}, [{desc}]", "setna {failed}",
+             kind = in(reg) kind, desc = in(reg) &desc, failed = out(reg_byte) failed,
+             options(nostack));
+    }
+    failed == 0
+}
+
+/// The operand INVVPID reads: the VPID in the low word, the rest 0 (the
+/// linear address, for the one type this hypervisor does not use).
+#[repr(C, align(16))]
+struct InvvpidDescriptor {
+    vpid: u64,
+    linear: u64,
+}
+
+/// Invalidate the linear and combined mappings this CPU has cached under
+/// `vpid` ([`INVVPID_SINGLE_CONTEXT`]), or under every VPID but 0, the
+/// host's ([`INVVPID_ALL_CONTEXT`]). False when the CPU refuses the type.
+///
+/// With VPIDs on, a VM entry or exit drops nothing: the guest's translations
+/// wait for it under its VPID, and the host's under VPID 0 -- where with
+/// them off every transition dropped both. What a VPID must then never be
+/// is shared by two guests on one CPU without this in between: a guest's
+/// first entry on a CPU runs it for the VPID it was given, in case an
+/// earlier guest had the number there.
+///
+/// # Safety
+/// This CPU is in VMX root operation.
+#[inline]
+pub unsafe fn invvpid(kind: u64, vpid: u16) -> bool {
+    let desc = InvvpidDescriptor { vpid: u64::from(vpid), linear: 0 };
+    let failed: u8;
+    unsafe {
+        asm!("invvpid {kind}, [{desc}]", "setna {failed}",
              kind = in(reg) kind, desc = in(reg) &desc, failed = out(reg_byte) failed,
              options(nostack));
     }

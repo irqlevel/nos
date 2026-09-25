@@ -141,6 +141,18 @@ TCG has no VMX to bring one up under slowly:
   `vmwrite` declared as preserving flags they set; an interrupted event
   copied with an undefined bit; `vmxoff` under a current VMCS. The `tpr`
   built-in guest gates the first on both backends.
+- Then the entry path was measured (`hv bench profile` under VT-x, the parts
+  as the AMD side has them plus the VMCS written and read) and thinned: the
+  host's syscall MSRs read once per CPU instead of five `rdmsr`s an entry,
+  VMPTRLD skipped when the VMCS is current already (per-CPU `CURRENT_VMCS`),
+  CR4.OSFXSR and an x87-only XCR0 set once at `hv on` instead of around
+  every entry (both backends, `hvarch::x86::fp`), VPIDs so a transition
+  drops neither the guest's TLB nor the host's, FXRSTOR only when another
+  guest's registers are on the CPU (both backends), the VMCS sync dirty-
+  tracked and the exit read by reason, and an MSR bitmap letting the FS, GS
+  and KERNEL_GS bases through. Under nested KVM 17.9 -> 5.8 µs an exit,
+  4.6 of which are the outer kernel's; the silicon's numbers wait for the
+  EX44.
 - Found on the way: QEMU's TCG before 9.2 does not translate an unpaged
   guest's addresses through the nested table -- a real-mode guest there
   runs out of host memory -- which is why every guest starts paged.
