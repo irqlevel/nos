@@ -338,8 +338,10 @@ The differences that are not hidden by the shadow at all:
   -- the FS, GS and KERNEL_GS bases, the guest's own and nobody else's,
   which VT-x saves and loads itself (two VMCS fields, and the exit MSR-store
   and entry MSR-load lists) and which a Linux guest writes at every context
-  switch: two exits a switch, the most frequent a busy guest made, gone
-  (the AMD side's `msrpm` still intercepts them). The rest of AMD-V's
+  switch: two exits a switch, the most frequent a busy guest made, gone --
+  on both sides, since the AMD `msrpm` lets the same three through, the
+  stub's `vmsave` and `vmload` carrying them (`hvarch::x86::PASSTHROUGH_MSRS`
+  is the one list). The rest of AMD-V's
   intercept set is controls too, since VT-x stops a guest at none of them
   unasked: CR8 (above), MONITOR, MWAIT and RDPMC, which CPUID says the guest
   has not got and which run on the host's CPU otherwise, and WBINVD, which
@@ -565,8 +567,10 @@ on on every entry, whatever the VMCB says:
 - nested paging on, over the table the caller's memory owns; SEV, AVIC and
   virtual VMSAVE off, since each has the CPU work at physical addresses the
   VMCB gives it;
-- I/O and MSR permission maps with every bit set, and no way yet to clear
-  one: a port the guest reaches directly is one of the host's devices;
+- I/O and MSR permission maps with every bit set but the three of the
+  guest's own base MSRs (`hvarch::x86::PASSTHROUGH_MSRS`, which the stub's
+  `vmsave`/`vmload` carry), and no way to clear another: a port the guest
+  reaches directly is one of the host's devices;
 - nothing assumed clean;
 - **the ASID, and what the TLB is told on the way in, given by the CPU the
   entry is on** ([Address space identifiers](#address-space-identifiers)):

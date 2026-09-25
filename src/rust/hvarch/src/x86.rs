@@ -9,6 +9,17 @@ use core::fmt::Write;
 
 use crate::{CpuPage, Error, Result, Vendor};
 
+/// The MSRs a guest owns outright, which both backends let it read and
+/// write without an exit: the FS, GS and KERNEL_GS bases. Each is switched
+/// with the guest by the extension itself -- VT-x saves and loads the first
+/// two as VMCS fields and the third through the exit MSR-store and entry
+/// MSR-load lists, AMD-V all three through the `vmsave`/`vmload` around
+/// `vmrun` -- so nothing of the host's is reachable through them, and the
+/// policy's copy is fresh at every exit. A Linux guest writes two of them at
+/// every context switch, the most frequent exits a busy guest made; every
+/// other MSR still exits to the policy in `hv`.
+pub const PASSTHROUGH_MSRS: [u32; 3] = [0xC000_0100, 0xC000_0101, 0xC000_0102];
+
 /// CPUID.1:ECX.
 const ECX_X2APIC: u32 = 1 << 21;
 const ECX_HYPERVISOR: u32 = 1 << 31;

@@ -642,18 +642,12 @@ const MSR_STORE_BASE: usize = 0x200;
 /// The MSR bitmap: a bit an MSR, set for one whose `rdmsr` or `wrmsr` exits,
 /// in four 1 KiB quarters -- reads of 0..0x1FFF, reads of 0xC0000000..,
 /// writes of the first range, writes of the second. Every bit is set but
-/// three: the FS, GS and KERNEL_GS bases, which are the guest's own and
-/// nobody else's -- the first two VMCS fields the exit saves and the entry
-/// loads, the third in the exit MSR-store and entry MSR-load lists above --
-/// and which a Linux guest writes at every context switch (its per-CPU base,
-/// a task's TLS base, the user base kept aside), two exits a switch that
-/// were the most frequent exits a busy guest made. Every other MSR still
-/// exits to the policy in `hv`, which is what keeps the host's CPU the
-/// host's.
+/// those of [`super::PASSTHROUGH_MSRS`], the guest's own bases: the first
+/// two VMCS fields the exit saves and the entry loads, the third in the exit
+/// MSR-store and entry MSR-load lists above.
 const MSR_BITMAP_READ_HIGH: usize = 0x400;
 const MSR_BITMAP_WRITE_HIGH: usize = 0xC00;
 const MSR_HIGH_BASE: u32 = 0xC000_0000;
-const PASSTHROUGH_MSRS: [u32; 3] = [0xC000_0100, 0xC000_0101, 0xC000_0102];
 
 /// What the VMCS holds of the fields the policy may change between entries,
 /// as of the last time each was written to it or read from it: what an
@@ -789,7 +783,7 @@ impl Guest {
         msr_area.as_mut_slice().fill(0);
         let mut msr_bitmap = kcore::dma::DmaBuffer::new(1).ok_or(Error::NoMemory)?;
         msr_bitmap.as_mut_slice().fill(0xFF);
-        for msr in PASSTHROUGH_MSRS {
+        for msr in super::PASSTHROUGH_MSRS {
             let bit = (msr - MSR_HIGH_BASE) as usize;
             for quarter in [MSR_BITMAP_READ_HIGH, MSR_BITMAP_WRITE_HIGH] {
                 msr_bitmap.as_mut_slice()[quarter + bit / 8] &= !(1 << (bit % 8));

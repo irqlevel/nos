@@ -116,8 +116,9 @@ const HAS_ERROR_CODE: u32 = (1 << 8) | (1 << 10) | (1 << 11) | (1 << 12) | (1 <<
 /// One guest CPU.
 pub struct Vcpu {
     guest: Guest,
-    /// The port and MSR permission maps: every one intercepted. The backend
-    /// owns them, so the world switch and its intercepts are one thing.
+    /// The port and MSR permission maps: every one intercepted but the
+    /// guest's own base MSRs. The backend owns them, so the world switch and
+    /// its intercepts are one thing.
     perms: Permissions,
     /// The CPU writes the next instruction's address into the VMCB itself.
     nrip: bool,
@@ -160,7 +161,7 @@ impl Vcpu {
         c.intercept_exceptions = exceptions;
         /* No ASID: each entry is given one by the CPU it is on
          * (`Guest::run`). */
-        Ok(Self { guest, perms: Permissions::intercept_all()?, nrip })
+        Ok(Self { guest, perms: Permissions::new()?, nrip })
     }
 
     /// Enter the guest and come back at its next exit, decoded -- the whole

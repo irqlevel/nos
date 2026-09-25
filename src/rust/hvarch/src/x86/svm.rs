@@ -235,24 +235,39 @@ pub struct GuestRegs {
 }
 
 /// The I/O and MSR permission maps a guest runs under: a set bit is an
-/// access the host hears of. Both are all ones -- every port and every MSR
-/// intercepted -- and there is deliberately no way to clear a bit yet: a
-/// port the guest reaches directly is one of the host's devices, and an MSR
-/// it reaches directly is the host's CPU. Passing some through (FS and GS
-/// base, which are the guest's own) is a decision for when a guest needs
-/// the speed, one MSR at a time.
+/// access the host hears of. Every port is intercepted -- a port the guest
+/// reached directly would be one of the host's devices -- and every MSR but
+/// the three of [`super::PASSTHROUGH_MSRS`], the guest's own bases, which
+/// the stub's `vmsave` after `#vmexit` and `vmload` before `vmrun` carry
+/// between the CPU and the guest's VMCB: what the guest wrote is in the save
+/// area at every exit, and nothing of the host's is reachable through them.
+/// There is no way to clear any other bit, on purpose: an MSR the guest
+/// reached directly is the host's CPU.
 pub struct Permissions {
     iopm: DmaBuffer,
     msrpm: DmaBuffer,
 }
 
+/// The MSR permission map: two bits an MSR, read then write, in three 2 KiB
+/// ranges -- 0..0x1FFF, 0xC0000000..0xC0001FFF at 0x800, 0xC0010000.. at
+/// 0x1000 -- and everything outside them intercepted whatever the map says.
+const MSRPM_HIGH_BASE: u32 = 0xC000_0000;
+const MSRPM_HIGH_OFFSET: usize = 0x800;
+const MSRPM_BITS_PER_MSR: usize = 2;
+
 impl Permissions {
-    pub fn intercept_all() -> Result<Self> {
+    /// Every port and every MSR intercepted, but for the guest's own bases.
+    pub fn new() -> Result<Self> {
         let pages = |bytes: usize| bytes.div_ceil(kcore::consts::PAGE_SIZE);
         let mut iopm = DmaBuffer::new(pages(vmcb::IOPM_BYTES)).ok_or(Error::NoMemory)?;
         let mut msrpm = DmaBuffer::new(pages(vmcb::MSRPM_BYTES)).ok_or(Error::NoMemory)?;
         iopm.as_mut_slice().fill(0xFF);
         msrpm.as_mut_slice().fill(0xFF);
+        for msr in super::PASSTHROUGH_MSRS {
+            let bit = (msr - MSRPM_HIGH_BASE) as usize * MSRPM_BITS_PER_MSR;
+            /* The read bit and the write bit beside it. */
+            msrpm.as_mut_slice()[MSRPM_HIGH_OFFSET + bit / 8] &= !(0b11 << (bit % 8));
+        }
         Ok(Self { iopm, msrpm })
     }
 }
