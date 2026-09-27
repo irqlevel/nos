@@ -44,6 +44,7 @@ const LEAF_TOPOLOGY_V2: u32 = 0x1F;
 const LEAF_HYPERVISOR_BASE: u32 = 0x4000_0000;
 const LEAF_HYPERVISOR_END: u32 = 0x4000_00FF;
 const LEAF_EXT_FEATURES: u32 = 0x8000_0001;
+const LEAF_EXT_POWER: u32 = 0x8000_0007;
 const LEAF_EXT_ADDRESS: u32 = 0x8000_0008;
 const LEAF_SVM: u32 = 0x8000_000A;
 const LEAF_EXT_APIC_ID: u32 = 0x8000_001E;
@@ -151,6 +152,14 @@ const EXT1_EDX_KEEP: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
  * speculation controls a kernel wants to know of -- is the host's. */
 const EXT8_EBX_CLEAR: u32 = (1 << 4) | (1 << 9);
 
+/* Extended leaf 0x80000007: of AMD's power and RAS leaf, the invariant TSC
+ * alone (EDX bit 8), which is the host's and so the guest's -- as KVM gives
+ * it. EBX is the machine-check RAS set: with SUCCOR there, Linux sets up the
+ * deferred-error interrupt through the APIC's extended LVT, a register this
+ * APIC has not got, and logs the #GP and a firmware bug. The machine-check
+ * banks read as zero here; there is nothing to recover from. */
+const EXT7_EDX_INVARIANT_TSC: u32 = 1 << 8;
+
 /// The answer to a CPUID: the four registers it fills.
 pub struct Cpuid {
     pub eax: u32,
@@ -210,6 +219,11 @@ pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
     } else if leaf == LEAF_EXT_FEATURES {
         ecx &= EXT1_ECX_KEEP;
         edx = (edx & EXT1_EDX_KEEP) | apic_edx;
+    } else if leaf == LEAF_EXT_POWER {
+        eax = 0;
+        ebx = 0;
+        ecx = 0;
+        edx &= EXT7_EDX_INVARIANT_TSC;
     } else if leaf == LEAF_EXT_ADDRESS {
         ebx &= !EXT8_EBX_CLEAR;
         ecx = 0;
@@ -240,6 +254,17 @@ const MSR_PAT: u32 = 0x277;
 const MSR_SYSENTER_CS: u32 = 0x174;
 const MSR_SYSENTER_ESP: u32 = 0x175;
 const MSR_SYSENTER_EIP: u32 = 0x176;
+
+/* Two of AMD's that a Linux guest reads to learn what the CPU does, and
+ * finds true: they answer so, and a write to either is swallowed as any
+ * other is. DE_CFG's LFENCE_SERIALIZE -- set on every AMD host CPU by the
+ * kernel (`Hal::SetupSerializingLfence`), as KVM reports it -- and HWCR's
+ * TscFreqSel, read-only 1 on every AMD CPU since family 10h: read as zero,
+ * the guest logs "TSC doesn't count with P0 frequency" as a firmware bug. */
+const MSR_AMD_DE_CFG: u32 = 0xC001_1029;
+const DE_CFG_LFENCE_SERIALIZE: u64 = 1 << 1;
+const MSR_AMD_HWCR: u32 = 0xC001_0015;
+const HWCR_TSC_FREQ_SEL: u64 = 1 << 24;
 
 /// EFER bits the guest may set: SCE, LME, LMA, NXE, FFXSR. SVME and the rest
 /// are the host's, and a guest that sets one is refused (a #GP) rather than
@@ -276,6 +301,8 @@ pub fn rdmsr(save: &Save, msr: u32) -> Option<u64> {
         MSR_SYSENTER_CS => save.sysenter_cs,
         MSR_SYSENTER_ESP => save.sysenter_esp,
         MSR_SYSENTER_EIP => save.sysenter_eip,
+        MSR_AMD_DE_CFG => DE_CFG_LFENCE_SERIALIZE,
+        MSR_AMD_HWCR => HWCR_TSC_FREQ_SEL,
         /* Every other MSR reads as zero: a feature MSR a guest probes and
          * finds empty, which is what a guest that cannot use the feature
          * anyway should see. */

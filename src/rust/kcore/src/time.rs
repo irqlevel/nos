@@ -69,6 +69,15 @@ pub fn boot_time_ns() -> u64 {
     time::kernel_get_boot_time_ns()
 }
 
+/// How fast the cycle counter counts, in Hz: the TSC as the kernel calibrated
+/// it on x86-64, the generic timer on arm64. None while it is not known.
+pub fn cycle_counter_hz() -> Option<u64> {
+    match time::kernel_cycle_counter_hz() {
+        0 => None,
+        hz => Some(hz),
+    }
+}
+
 /// Busy-poll `condition` for up to `iterations` iterations without sleeping.
 ///
 /// Intended for early-boot or IRQ-disabled contexts where sleeping is not

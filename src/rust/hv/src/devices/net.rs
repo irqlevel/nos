@@ -74,6 +74,8 @@ pub struct Net {
     segs: Vec<Seg>,
     /// A frame on its way either way, header included.
     tx_buf: Vec<u8>,
+    /// The header, all zero -- nothing to say -- and the frame behind it:
+    /// what goes into the guest's buffers as it lies.
     rx_buf: Vec<u8>,
     /// The length of a frame in `rx_buf` still waiting for a buffer.
     held: Option<usize>,
@@ -93,8 +95,8 @@ impl Net {
         tx_buf.try_reserve_exact(HDR + MAX_FRAME).map_err(|_| Error::NoMemory)?;
         tx_buf.resize(HDR + MAX_FRAME, 0);
         let mut rx_buf = Vec::new();
-        rx_buf.try_reserve_exact(MAX_FRAME).map_err(|_| Error::NoMemory)?;
-        rx_buf.resize(MAX_FRAME, 0);
+        rx_buf.try_reserve_exact(HDR + MAX_FRAME).map_err(|_| Error::NoMemory)?;
+        rx_buf.resize(HDR + MAX_FRAME, 0);
         Ok(Net {
             transport: Transport::new(F_MAC | F_STATUS, queues),
             backend,
@@ -231,7 +233,7 @@ impl Net {
         loop {
             let len = match self.held {
                 Some(len) => len,
-                None => match self.backend.recv(&mut self.rx_buf) {
+                None => match self.backend.recv(&mut self.rx_buf[HDR..]) {
                     Some(len) if (MIN_FRAME..=MAX_FRAME).contains(&len) => len,
                     Some(_) => continue,
                     None => break,
@@ -270,38 +272,32 @@ impl Net {
         wants && self.transport.interrupt()
     }
 
-    /// The header (all zero: nothing to say) and the frame in `rx_buf`, into
-    /// the chain's writable buffers: what was written, or 0 when they are
-    /// too short for it -- the frame then dropped.
+    /// The header and the frame, as they lie in `rx_buf`, into the chain's
+    /// writable buffers -- one copy a buffer, `GuestMemory` taking it a page
+    /// at a time: what was written, or 0 when they are too short for it --
+    /// the frame then dropped. It went a byte at a time once, through a
+    /// 256-byte bounce buffer whose every piece was mapped on its own -- host
+    /// work on the vCPU's own CPU, for every frame, while the guest waited.
     fn receive(&mut self, mem: &GuestMemory, segs: &[Seg], len: usize) -> usize {
+        let total = HDR + len;
         let room: u64 = segs.iter().filter(|s| s.write).map(|s| u64::from(s.len)).sum();
-        if room < (HDR + len) as u64 {
+        if room < total as u64 {
             self.stats.dropped += 1;
             return 0;
         }
-        let header = [0u8; HDR];
-        let mut src = header.iter().chain(self.rx_buf[..len].iter()).copied();
-        let mut chunk = [0u8; 256];
-        let mut left = HDR + len;
+        let mut done = 0usize;
         for s in segs.iter().filter(|s| s.write) {
-            let mut at = 0u64;
-            while at < u64::from(s.len) && left != 0 {
-                let n = (u64::from(s.len) - at).min(chunk.len() as u64).min(left as u64) as usize;
-                for b in chunk[..n].iter_mut() {
-                    *b = src.next().unwrap_or(0);
-                }
-                if mem.write(s.addr + at, &chunk[..n]).is_err() {
-                    self.stats.dropped += 1;
-                    return 0;
-                }
-                at += n as u64;
-                left -= n;
-            }
-            if left == 0 {
+            if done == total {
                 break;
             }
+            let n = (total - done).min(s.len as usize);
+            if mem.write(s.addr, &self.rx_buf[done..done + n]).is_err() {
+                self.stats.dropped += 1;
+                return 0;
+            }
+            done += n;
         }
         self.stats.received += 1;
-        HDR + len
+        total
     }
 }

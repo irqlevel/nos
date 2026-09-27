@@ -77,6 +77,10 @@ SHELL_MARKERS = [
 DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check"
 # A guest of more than one CPU needs its local APIC: the same, without
 # nolapic. (The loader adds noapic itself: the machine has no IO-APIC.)
+# nos's own CPUs: two cores of two threads each, so that where a guest's CPUs
+# are placed has a topology to go wrong on -- APIC IDs 0 and 1 are one core,
+# 2 and 3 the other, and a guest of two CPUs belongs on both.
+NOS_SMP = "4,sockets=1,cores=2,threads=2"
 DEFAULT_CMDLINE_SMP = "earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check"
 
 # The last line of /etc/rc, and how the console shows it has run: its echo
@@ -146,6 +150,11 @@ def vm_commands(args):
             ("hv list", 0, "hv list says where each of its CPUs runs",
              r"vm 0  running  cpus \d+(,\d+){%d}  " % (args.cpus - 1), True),
         ]
+        if args.cpus == 2:
+            # Two cores to go round, and a thread of each: never both threads
+            # of one core, whose execution units they would share.
+            smp_checks.append(("hv list", 0, "its two CPUs are on two cores, not one core's two threads",
+                               r"vm 0  running  cpus ([01],[23]|[23],[01])  ", True))
     lines = ["hv help", start0, start1, "hv list", "hv stop 1", exec_early, exec_prompt] + smp_lines + [
              send, wait, "hv console 0 bytes=400", "hv list",
              start2, wait_reboot, wait_stop, "hv list",
@@ -291,7 +300,7 @@ def attach(args):
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "128", rootdir],
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
 
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4"] + accel_args(args) + [
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", NOS_SMP] + accel_args(args) + [
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
             "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off",
@@ -397,7 +406,7 @@ def boot_rc(args, tmp, rc, extra=None, qemu=None):
         root_device = ["-device", "nvme,serial=nosroot,drive=drive0"]
     else:
         root_device = ["-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4"] + accel_args(args) + [
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", NOS_SMP] + accel_args(args) + [
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image] + root_device + (qemu or [])
     p = subprocess.Popen(argv, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -667,7 +676,7 @@ def run(args):
     accel = accel_args(args)
     print("accelerator: %s" % ("KVM, the host's %s (nested)" % ("Intel VT-x" if hvt.host_has_vmx() else "AMD-V")
                                if "-enable-kvm" in accel else "TCG, -cpu max (AMD-V)"))
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", "4"] + accel + [
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", NOS_SMP] + accel + [
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
             "-device", "virtio-blk-pci,drive=drive0,disable-legacy=on,disable-modern=off"]

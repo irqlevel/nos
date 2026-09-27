@@ -13,6 +13,7 @@ use alloc::sync::Arc;
 
 use hv::linux::Header;
 use hv::run::{Counts, GuestCpu, Host, LinuxGuest, Stop, Stopped, MAX_DISKS};
+use hv::topology::Topology;
 use hv::{Doorbells, Machine};
 use kcore::consts::{MAX_CPUS, NS_PER_MS};
 use kcore::sync::Mutex;
@@ -34,6 +35,15 @@ const DEFAULT_CMDLINE_SMP: &str = "console=ttyS0";
 /// there is no IO-APIC on this machine, and a kernel that looked for one
 /// would turn its 8259's line to the first CPU off (`hv::run`).
 const NOAPIC: &str = "noapic";
+/// What every guest's command line gets when it has not got it: the TSC's
+/// rate in kHz, which is the host's -- a guest reads the host's TSC, offset
+/// by nothing and scaled by nothing. A kernel that is not told measures it
+/// against the PIT, every read an exit, and gives up when one read takes ten
+/// times the fastest: a vCPU that shares its CPU with the host's own work --
+/// cpu 0's, on the AX41 -- lost its TSC to jiffies one boot in two that way,
+/// with and without SMP. Linux takes this as authoritative from 5.7 on; an
+/// older one passes it on to init, as it does any parameter it does not know.
+const TSC_KHZ: &str = "tsc_early_khz=";
 /// How much of a guest's console is kept: its last this many bytes.
 pub const CONSOLE_BYTES: usize = 64 * 1024;
 
@@ -171,18 +181,28 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
     Ok(spec)
 }
 
-/// The command line the guest's kernel is given: `cmdline`, and -- for a
-/// guest of several CPUs, which has local APICs -- `noapic` after it unless
-/// it says so already: the machine has no IO-APIC.
-fn guest_cmdline(cmdline: &str, smp: bool) -> Result<String, String> {
+/// The command line the guest's kernel is given: `cmdline`; for a guest of
+/// several CPUs, which has local APICs, `noapic` after it unless it says so
+/// already -- the machine has no IO-APIC; and the TSC's rate, `tsc_khz`,
+/// unless it names one already or the host does not know its own.
+fn guest_cmdline(cmdline: &str, smp: bool, tsc_khz: Option<u64>) -> Result<String, String> {
     let mut line = String::new();
-    line.try_reserve(cmdline.len() + NOAPIC.len() + 1).map_err(|_| String::from("out of memory"))?;
-    line.push_str(cmdline);
-    if smp && !cmdline.split_ascii_whitespace().any(|w| w == NOAPIC) {
+    let add = |line: &mut String, word: &str| -> Result<(), String> {
+        line.try_reserve(word.len() + 1).map_err(|_| String::from("out of memory"))?;
         if !line.is_empty() {
             line.push(' ');
         }
-        line.push_str(NOAPIC);
+        line.push_str(word);
+        Ok(())
+    };
+    add(&mut line, cmdline)?;
+    if smp && !cmdline.split_ascii_whitespace().any(|w| w == NOAPIC) {
+        add(&mut line, NOAPIC)?;
+    }
+    if let Some(khz) = tsc_khz {
+        if !cmdline.split_ascii_whitespace().any(|w| w.starts_with(TSC_KHZ)) {
+            add(&mut line, &alloc::format!("{}{}", TSC_KHZ, khz))?;
+        }
     }
     Ok(line)
 }
@@ -254,7 +274,8 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         stream(&guest, path, 0, layout.initrd_addr, layout.initrd_len)?;
     }
 
-    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1)?;
+    let tsc_khz = kcore::time::cycle_counter_hz().map(|hz| hz / 1000).filter(|&khz| khz != 0);
+    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1, tsc_khz)?;
     let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
     guest
         .load(bsp, &header, &first, layout, cmdline.as_bytes())
@@ -274,10 +295,18 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     Ok(Built { guest, cpus })
 }
 
+/// How many vCPUs run on the core CPU `cpu` is a thread of: on it and on its
+/// SMT siblings, with whom a vCPU there shares the core's execution units.
+fn core_load(topo: &Topology, cpu: u32, load: &[u32; MAX_CPUS]) -> u32 {
+    let core = topo.core(cpu);
+    (0..MAX_CPUS as u32).filter(|&c| topo.core(c) == core).map(|c| load[c as usize]).sum()
+}
+
 /// The CPU a vCPU is to run on: `wanted` if the extension is on there, else
-/// the CPU the extension is on for that has fewest vCPUs already (`load`
-/// counts them, by CPU), the higher of any two that tie -- CPU 0 is where
-/// the boot CPU's own work runs, and the last to be given a guest.
+/// the CPU the extension is on for whose core has fewest vCPUs already, and
+/// of those the CPU itself (`load` counts them, by CPU) -- the higher of any
+/// two that tie: CPU 0 is where the boot CPU's own work runs, and the last
+/// to be given a guest.
 pub fn pick_cpu(machine: &Machine, wanted: Option<u32>, load: &[u32; MAX_CPUS]) -> Result<u32, String> {
     let enabled = machine.enabled_mask();
     if enabled == 0 {
@@ -289,21 +318,26 @@ pub fn pick_cpu(machine: &Machine, wanted: Option<u32>, load: &[u32; MAX_CPUS]) 
         }
         return Err(alloc::format!("the extension is not on for cpu {}", cpu));
     }
-    let mut best: Option<u32> = None;
+    let topo = Topology::host();
+    let mut best: Option<(u32, (u32, u32))> = None;
     for cpu in 0..MAX_CPUS as u32 {
         if enabled & (1u64 << cpu) == 0 {
             continue;
         }
-        if best.map_or(true, |b| load[cpu as usize] <= load[b as usize]) {
-            best = Some(cpu);
+        let key = (core_load(&topo, cpu, load), load[cpu as usize]);
+        if best.map_or(true, |(_, k)| key <= k) {
+            best = Some((cpu, key));
         }
     }
-    best.ok_or_else(|| String::from("the extension is on for no CPU -- hv on first"))
+    best.map(|(cpu, _)| cpu).ok_or_else(|| String::from("the extension is on for no CPU -- hv on first"))
 }
 
 /// The host CPUs a guest of `cpus` CPUs runs on, its first CPU's first:
 /// that one by [`pick_cpu`], and each other on a CPU the extension is on
-/// for that none of the guest's has yet, the one with fewest vCPUs, as
+/// for that none of the guest's has yet -- one whose core none of the
+/// guest's CPUs is on where there is one, since two threads of a core share
+/// its execution units; then one sharing the first's last-level cache, where
+/// the CPUs' lines and IPIs go no further; then the least loaded, as
 /// `pick_cpu` chooses. A guest's CPUs never share a host CPU -- one that
 /// spins waiting for another would hold the CPU the other needs to finish
 /// -- so a guest has at most as many as the extension is on for.
@@ -322,17 +356,21 @@ pub fn pick_cpus(machine: &Machine, wanted: Option<u32>, cpus: u32, load: &[u32;
     chosen.push(first);
     let mut load = *load;
     load[first as usize] += 1;
+    let topo = Topology::host();
+    let home = topo.llc(first);
     while chosen.len() < cpus as usize {
-        let mut best: Option<u32> = None;
+        let mut best: Option<(u32, (bool, bool, u32, u32))> = None;
         for cpu in 0..MAX_CPUS as u32 {
             if enabled & (1u64 << cpu) == 0 || chosen.contains(&cpu) {
                 continue;
             }
-            if best.map_or(true, |b| load[cpu as usize] <= load[b as usize]) {
-                best = Some(cpu);
+            let shares_core = chosen.iter().any(|&c| topo.core(c) == topo.core(cpu));
+            let key = (shares_core, topo.llc(cpu) != home, core_load(&topo, cpu, &load), load[cpu as usize]);
+            if best.map_or(true, |(_, k)| key <= k) {
+                best = Some((cpu, key));
             }
         }
-        let cpu = best.ok_or_else(|| String::from("no host CPU left for the guest's next CPU"))?;
+        let (cpu, _) = best.ok_or_else(|| String::from("no host CPU left for the guest's next CPU"))?;
         load[cpu as usize] += 1;
         chosen.push(cpu);
     }
