@@ -485,7 +485,11 @@ boot of this gate, so that where a guest's CPUs go has a topology to be
 wrong on: a guest of two must be on both cores, never on one core's two
 threads -- where the first placement put it (13 and 12 on the AX41, and
 two busy loops there ran at three quarters of the speed). It goes with
-`--disk`, `--nvme-root`, `--net` and `--attach`. The guest kernel
+`--disk`, `--nvme-root`, `--net` and `--attach`, whose guests get the same
+N CPUs -- they once started theirs with one whatever `--cpus` said -- and
+there the guest's `/proc/interrupts` must show its virtio device on MSI-X,
+a vector for the queue, with more than one CPU, and on the 8259 (`XT-PIC`)
+with one, as a guest of one CPU always was. The guest kernel
 needs Linux 6.6 or later with `SMP`, `X86_X2APIC` and `X86_MPPARSE` ([More
 than one CPU](hypervisor.md#more-than-one-cpu) says why), and under TCG the
 gate wants QEMU 9.2 or later, as `hv-test.py` does.

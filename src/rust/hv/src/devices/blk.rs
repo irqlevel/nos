@@ -29,7 +29,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::pci::Identity;
-use super::virtio::{self, Asked, Broken, Queue, Seg, Transport};
+use super::virtio::{self, Asked, Broken, Queue, Raise, Seg, Transport};
 use crate::memory::GuestMemory;
 use crate::{Error, Result};
 
@@ -260,15 +260,26 @@ impl Blk {
         c
     }
 
+    /// Offer MSI-X, with a table of `entries`.
+    pub fn offer_msix(&mut self, entries: u16) -> Option<()> {
+        self.transport.offer_msix(entries)
+    }
+
+    /// Whether the function has MSI-X on, as its capability says now.
+    pub fn set_msix_enabled(&mut self, on: bool) {
+        self.transport.set_msix_enabled(on);
+    }
+
     /// A read of `size` bytes at `offset` in the BAR.
     pub fn io_read(&mut self, offset: u16, size: u8) -> u32 {
-        if offset < virtio::DEVICE_CONFIG {
+        let config = self.transport.config_offset();
+        if offset < config {
             return self.transport.read(offset, size);
         }
         let c = self.config();
         let mut v = 0u32;
         for i in 0..u16::from(size) {
-            let at = usize::from(offset - virtio::DEVICE_CONFIG + i);
+            let at = usize::from(offset - config + i);
             if let Some(b) = c.get(at) {
                 v |= u32::from(*b) << (8 * i);
             }
@@ -276,16 +287,16 @@ impl Blk {
         v
     }
 
-    /// A write of `size` bytes at `offset` in the BAR; true when the
-    /// device's interrupt line is to go up. The configuration is read-only.
-    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory) -> bool {
-        if offset >= virtio::DEVICE_CONFIG {
-            return false;
+    /// A write of `size` bytes at `offset` in the BAR, and the interrupts it
+    /// leaves the device with. The configuration is read-only.
+    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory) -> Raise {
+        if offset >= self.transport.config_offset() {
+            return Raise::default();
         }
         match self.transport.write(offset, size, value) {
             Asked::Notify(0) => {
                 let answered = self.fill(mem);
-                answered && self.interrupt(mem)
+                if answered { self.interrupt(mem) } else { Raise::default() }
             }
             Asked::Reset => {
                 /* The chains with the backend are the old driver's: nothing
@@ -296,18 +307,18 @@ impl Blk {
                 }
                 self.waiting = false;
                 self.broken = None;
-                false
+                Raise::default()
             }
-            _ => false,
+            _ => Raise::default(),
         }
     }
 
     /// What the backend has served, given back to the guest -- a read's data
     /// into its buffers, the status, the chain on the used ring -- and what
-    /// waited on the ring for a buffer, taken now there is one. True when the
-    /// device's interrupt line is to go up. Every time round the run loop,
-    /// so it costs next to nothing when there is nothing.
-    pub fn poll(&mut self, mem: &GuestMemory) -> bool {
+    /// waited on the ring for a buffer, taken now there is one -- and the
+    /// interrupts that leaves the device with. Every time round the run
+    /// loop, so it costs next to nothing when there is nothing.
+    pub fn poll(&mut self, mem: &GuestMemory) -> Raise {
         let mut answered = false;
         let mut back = false;
         while let Some(req) = self.backend.take() {
@@ -317,13 +328,14 @@ impl Blk {
         if back && self.waiting {
             answered |= self.fill(mem);
         }
-        answered && self.interrupt(mem)
+        if answered { self.interrupt(mem) } else { Raise::default() }
     }
 
-    /// The interrupt, when the driver wants one and none is waiting already.
-    fn interrupt(&mut self, mem: &GuestMemory) -> bool {
+    /// The interrupt, when the driver wants one: the line, when none is
+    /// waiting already, or the queue's MSI-X vector.
+    fn interrupt(&mut self, mem: &GuestMemory) -> Raise {
         let wants = self.transport.queue(0).map_or(false, |q| q.wants_interrupt(mem));
-        wants && self.transport.interrupt()
+        if wants { self.transport.interrupt(0) } else { Raise::default() }
     }
 
     /// Take what the driver has made available, while there is a buffer for

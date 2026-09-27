@@ -1884,20 +1884,47 @@ BSP's boot log saying when the firmware left it clear
 (`Hal::SetupSerializingLfence`); a guest of four CPUs across both CCXs (13,
 11, 9 and 5) keeps its TSC.
 
+### Device interrupts, by MSI-X
+
+A guest with local APICs has its disks and NICs interrupt it by MSI-X, as a
+PCI device on a real machine does, and not through the 8259. Each virtio
+function has an MSI-X capability (`devices/pci.rs`) and a memory BAR 1 of
+one page: the vector table at its start, the pending bits after it. That
+page is guest memory -- a region of its own, at 0xFE000000 and a page a PCI
+slot, in the MMIO window and not in the e820 map -- so a guest writes its
+table with plain `mov`s and makes no exit doing it, and no instruction has
+to be decoded. The device reads an entry when it has an interrupt to send:
+the message's address and data (`lapic::msi`), a fixed or lowest-priority
+vector to an x2APIC ID or, in cluster mode, to the first cluster's CPUs,
+the eight an 8-bit field can name -- which is where Linux puts them without
+interrupt remapping. It goes as an IPI would: into the APIC of the CPU
+doing the device's work, or another CPU's mailbox, with a ring. An entry
+masked, or the whole function, sets its pending bit and is sent once it is
+unmasked. With MSI-X on, virtio's legacy header grows the two vector
+registers, and the device's configuration moves from 0x14 to 0x18
+(`devices/virtio.rs`). The BAR stays where "firmware" put it: sizing it
+reads back its size, and another address written reads back the old one.
+
+What that changes is the cost of an interrupt. Through the 8259 each costs
+the guest six exits -- a mask, two EOIs, an unmask, the interrupt status
+read and a dummy one -- and at a gigabit a receive interrupt came every
+other frame; by MSI-X it costs one, the EOI's MSR write. And the guest
+places each vector itself: Debian put its NIC's receive queue on its first
+CPU and its transmit queue and its disk on its second. On the AX41 a
+Debian of two CPUs fetched a gigabyte three times at 117 MB/s -- what TCP
+carries over gigabit Ethernet -- with no frame dropped, its first vCPU's
+host CPU 88% busy and its second's 21%, where through the 8259 the first
+was 96.5% busy, the second idle, the fetch 113 MB/s and a few hundred
+frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
+8259 and that ceiling: 111 MB/s and 586 frames dropped.
+
 ### What it does not do yet
 
-- **Device interrupts reach the first CPU only.** There is no IO-APIC and no
-  MSI, so a disk's or a NIC's interrupt cannot be steered, and the first
-  CPU serves every device. At the link's rate that CPU is the guest's
-  ceiling: fetching a gigabyte, the AX41's Debian had its first vCPU's host
-  CPU 96.5% busy and its second idle, and its port dropped a few hundred
-  frames a gigabyte -- TCP carrying on at 113 MB/s of the 117 the link
-  carries. Each receive interrupt goes through the emulated 8259:
-  its mask, two EOIs and unmask are four port writes and the ISR's read and
-  a dummy one two port reads, six exits an interrupt, and at the link's rate
-  there is one every other frame. MSI-X through the local APIC would be
-  one EOI write an interrupt, to any CPU the guest steers it to; that is the
-  NIC's next thing.
+- **The 8259's devices reach the first CPU only.** There is no IO-APIC, so
+  the PIT's tick and the serial port's interrupts are the first CPU's, and
+  the first CPU's task still does every device's work between its guest's
+  turns: a disk's answer, a NIC's frames. Only the interrupts that follow
+  go where the guest steers them.
 - **A timer is as prompt as the host's tick.** Nothing on the host is set
   for a guest timer's deadline -- `kcore::timer` is periodic, at the
   host's tick -- so a CPU in its guest is handed a timer interrupt at its
@@ -2148,9 +2175,11 @@ The frames its port dropped on the way were not new: the kernel and module
 before these, booted once more for it, dropped 431 and 608 a gigabyte for a
 guest of one CPU, the module of 14a03e0 on the same kernel 139 and none,
 and with the fixes a guest of two dropped 256, 500 and 129 -- the ceiling
-of the vCPU that takes every receive interrupt, in [What it does not do
-yet](#what-it-does-not-do-yet). Its sampled profile over that fetch: 44% of
-its host CPU the guest running, and the rest the exits, spread thin.
+of the vCPU that took every receive interrupt through the 8259, six exits
+apiece. Its sampled profile over that fetch: 44% of its host CPU the guest
+running, and the rest the exits, spread thin. MSI-X took the ceiling away
+for a guest of more than one CPU: three gigabytes at 117 MB/s and not a
+frame dropped ([Device interrupts, by MSI-X](#device-interrupts-by-msi-x)).
 `e2fsck` found `nosenv` and the guest's ext4 clean.
 
 How to repeat it -- the kernel, the modules and the guest on the machine's
@@ -2196,11 +2225,10 @@ out through NAT ([The way out](#the-way-out-nat-dhcp-and-dns)), a
 distribution boots as it ships ([A distribution](#a-distribution)), and a
 guest has as many CPUs as it is given, each with a local APIC ([More than
 one CPU](#more-than-one-cpu)) -- under AMD-V and VT-x both.
-Beyond stage 3: MSI-X, so that a device's interrupts can reach any of a
-guest's CPUs through its local APIC, at one exit an interrupt where the
-8259 costs six -- what bounds a guest's network now ([What it does not do
-yet](#what-it-does-not-do-yet)) -- modern virtio, and the control plane's
-HTTP API (stage 4).
+A guest of more than one CPU takes its devices' interrupts by MSI-X
+([Device interrupts, by MSI-X](#device-interrupts-by-msi-x)). Beyond stage
+3: device work off the first CPU's task, modern virtio, and the control
+plane's HTTP API (stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every

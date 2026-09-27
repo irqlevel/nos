@@ -49,7 +49,8 @@ use kcore::time;
 
 use crate::devices::blk::{self, Blk};
 use crate::devices::net::{self, Net};
-use crate::devices::pci::{Function, PciBus};
+use crate::devices::pci::{self, Function, PciBus};
+use crate::devices::virtio::Raise;
 use crate::devices::{Pic, Pit, Rtc, Uart};
 use crate::lapic::{self, Delivery, Ipi, Lapic, Wrote};
 use crate::linux::{self, Header, Layout};
@@ -71,6 +72,17 @@ const DISK_IO_BASE: u16 = 0xC000;
 const NIC_IO_BASE: u16 = 0xC100;
 const DISK_IRQ: u8 = 11;
 const NIC_IRQ: u8 = 10;
+/// Where a device's MSI-X table page is, for a guest of more than one CPU:
+/// this plus a page for its PCI slot -- in the platform's MMIO window, clear
+/// of the local APIC's page, the IO-APIC's address the MP table gives, and
+/// the page read of an absent device finds; and of the RAM of a guest of up
+/// to 4064 MiB. A guest of more is offered none.
+const MSIX_PAGES: u32 = 0xFE00_0000;
+/// The MSI-X entries each kind of device offers: one for configuration
+/// changes and one a queue -- what Linux's virtio-pci asks for, a vector a
+/// queue.
+const DISK_VECTORS: u16 = 2;
+const NIC_VECTORS: u16 = 3;
 /// The most disks, and NICs, a guest has.
 pub const MAX_DISKS: usize = 4;
 pub const MAX_NICS: usize = 2;
@@ -210,6 +222,9 @@ pub struct Counts {
     /// IPIs this CPU sent, and fixed ones it was sent.
     pub ipi_sent: u64,
     pub ipi_taken: u64,
+    /// Devices' MSI-X messages this CPU sent on their behalf, doing their
+    /// work: into its own APIC or another CPU's mailbox.
+    pub msi: u64,
     /// INITs and start-up IPIs that reset and started this CPU.
     pub init: u64,
     pub started: u64,
@@ -256,6 +271,7 @@ impl Counts {
         self.timer += o.timer;
         self.ipi_sent += o.ipi_sent;
         self.ipi_taken += o.ipi_taken;
+        self.msi += o.msi;
         self.init += o.init;
         self.started += o.started;
         self.nmi += o.nmi;
@@ -416,6 +432,9 @@ struct Platform {
     pci_devs: Vec<PciDev>,
     disks: usize,
     nics: usize,
+    /// Each device's MSI-X entries that came while masked, a bit each, sent
+    /// once unmasked; as `pci_devs`, device by device.
+    msix_pending: Vec<u32>,
     /// A tally of reads of the low ports, to find a guest spinning on one.
     port_hist: Box<[u32; 1024]>,
     /// The first MSR accesses the policy refused with #GP: (MSR, value
@@ -508,6 +527,8 @@ impl LinuxGuest {
         msr_faults.try_reserve_exact(MSR_FAULTS_KEPT).map_err(|_| Error::NoMemory)?;
         let mut pci_devs = Vec::new();
         pci_devs.try_reserve_exact(MAX_DISKS + MAX_NICS).map_err(|_| Error::NoMemory)?;
+        let mut msix_pending = Vec::new();
+        msix_pending.try_reserve_exact(MAX_DISKS + MAX_NICS).map_err(|_| Error::NoMemory)?;
         let platform = Platform {
             uart: Uart::new(),
             pit: Pit::new(),
@@ -517,6 +538,7 @@ impl LinuxGuest {
             pci_devs,
             disks: 0,
             nics: 0,
+            msix_pending,
             port_hist,
             msr_faults,
         };
@@ -558,15 +580,22 @@ impl LinuxGuest {
     /// Give it another disk, over `backend`: `vda`, `vdb`, ... in the order
     /// they are added, each a virtio block device on the PCI bus.
     pub fn add_disk(&mut self, backend: Box<dyn blk::Backend>, id: &str) -> Result<()> {
+        let apic = self.has_apic();
         let mut p = self.platform.lock();
         if p.disks >= MAX_DISKS {
             return Err(Error::NoMemory);
         }
-        let disk = Blk::new(backend, id)?;
+        let mut disk = Blk::new(backend, id)?;
         let io_base = DISK_IO_BASE + (p.disks as u16) * (blk::BAR_SIZE as u16);
-        p.pci.add(Function::device(&Blk::identity(), io_base, blk::BAR_SIZE, DISK_IRQ))?;
+        let mut f = Function::device(&Blk::identity(), io_base, blk::BAR_SIZE, DISK_IRQ);
+        if let Some(page) = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)? {
+            disk.offer_msix(DISK_VECTORS).ok_or(Error::NoMemory)?;
+            f = f.with_msix(DISK_VECTORS, page);
+        }
+        p.pci.add(f)?;
         /* Into the room taken at `new`. */
         p.pci_devs.push(PciDev::Disk(disk));
+        p.msix_pending.push(0);
         p.disks += 1;
         Ok(())
     }
@@ -574,14 +603,21 @@ impl LinuxGuest {
     /// Give it a NIC with `mac`, its frames carried by `backend`: `eth0`,
     /// `eth1`, a virtio network device on the PCI bus.
     pub fn add_nic(&mut self, backend: Box<dyn net::Backend>, mac: [u8; 6]) -> Result<()> {
+        let apic = self.has_apic();
         let mut p = self.platform.lock();
         if p.nics >= MAX_NICS {
             return Err(Error::NoMemory);
         }
-        let nic = Net::new(backend, mac)?;
+        let mut nic = Net::new(backend, mac)?;
         let io_base = NIC_IO_BASE + (p.nics as u16) * (net::BAR_SIZE as u16);
-        p.pci.add(Function::device(&Net::identity(), io_base, net::BAR_SIZE, NIC_IRQ))?;
+        let mut f = Function::device(&Net::identity(), io_base, net::BAR_SIZE, NIC_IRQ);
+        if let Some(page) = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)? {
+            nic.offer_msix(NIC_VECTORS).ok_or(Error::NoMemory)?;
+            f = f.with_msix(NIC_VECTORS, page);
+        }
+        p.pci.add(f)?;
         p.pci_devs.push(PciDev::Nic(nic));
+        p.msix_pending.push(0);
         p.nics += 1;
         Ok(())
     }
@@ -795,7 +831,7 @@ impl LinuxGuest {
                 if p.uart.irq_active() {
                     p.pic.raise(4);
                 }
-                self.poll_devices(&mut p);
+                self.poll_devices(&mut p, me as u32, &mut gc.lapic, &mut gc.counts);
                 extint = gc.lapic.accepts_extint() && p.pic.pending().is_some();
                 /* Not while IRQ0 is still requested or in service -- masked,
                  * say: none is handed over until the guest takes that one,
@@ -1266,19 +1302,122 @@ impl LinuxGuest {
     /// What the disks' backends have served, given back to the guest, and
     /// what the NICs' backends have for it, into its buffers: each kind's
     /// line raised when that calls for an interrupt.
-    fn poll_devices(&self, p: &mut Platform) {
-        let (mut disk, mut nic) = (false, false);
-        for d in p.pci_devs.iter_mut() {
-            match d {
-                PciDev::Disk(d) => disk |= d.poll(&self.memory),
-                PciDev::Nic(n) => nic |= n.poll(&self.memory),
+    fn poll_devices(&self, p: &mut Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts) {
+        let mut raised = [Raise::default(); MAX_DISKS + MAX_NICS];
+        for (d, r) in p.pci_devs.iter_mut().zip(raised.iter_mut()) {
+            *r = match d {
+                PciDev::Disk(d) => d.poll(&self.memory),
+                PciDev::Nic(n) => n.poll(&self.memory),
+            };
+        }
+        for (dev, r) in raised.iter().enumerate() {
+            if r.any() {
+                self.raise(p, me, lapic, counts, dev, *r);
             }
         }
-        if disk {
-            p.pic.raise(DISK_IRQ);
+        /* And what a mask held back, now its mask may be off. */
+        for dev in 0..p.msix_pending.len() {
+            let held = p.msix_pending[dev];
+            if held != 0 {
+                let still = self.msix(p, me, lapic, counts, dev, held);
+                if still != held {
+                    p.msix_pending[dev] = still;
+                    self.write_pba(p, dev);
+                }
+            }
         }
-        if nic {
-            p.pic.raise(NIC_IRQ);
+    }
+
+    /// What device `dev` has for the guest: its line up on the 8259, and
+    /// each MSI-X entry sent.
+    fn raise(&self, p: &mut Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts, dev: usize, r: Raise) {
+        if r.line {
+            let line = match p.pci_devs.get(dev) {
+                Some(PciDev::Disk(_)) => DISK_IRQ,
+                Some(PciDev::Nic(_)) => NIC_IRQ,
+                None => return,
+            };
+            p.pic.raise(line);
+        }
+        if r.vectors != 0 {
+            let held = self.msix(p, me, lapic, counts, dev, r.vectors);
+            if let Some(pending) = p.msix_pending.get_mut(dev) {
+                if *pending | held != *pending {
+                    *pending |= held;
+                    self.write_pba(p, dev);
+                }
+            }
+        }
+    }
+
+    /// Device `dev`'s pending bits, as the guest reads them: a word of them
+    /// in its table page, after the table.
+    fn write_pba(&self, p: &Platform, dev: usize) {
+        let (Some((_, page)), Some(&pending)) = (p.pci.msix(dev + 1), p.msix_pending.get(dev)) else { return };
+        let pba = u64::from(page) + u64::from(pci::MSIX_PBA_OFFSET);
+        let _ = self.memory.write(pba, &u64::from(pending).to_le_bytes());
+    }
+
+    /// Device `dev`'s MSI-X entries in `entries`, a bit each: each sent as
+    /// the message its table entry holds -- read from the table page, which
+    /// is the guest's to write -- unless it or the whole function is masked.
+    /// Those are held, and returned, for the caller to keep pending and send
+    /// from `poll_devices` once unmasked. One the table has not got, or a
+    /// message that is no interrupt, goes nowhere.
+    fn msix(&self, p: &Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts, dev: usize, entries: u32) -> u32 {
+        let Some((control, page)) = p.pci.msix(dev + 1) else { return 0 };
+        if control & pci::MSIX_ENABLE == 0 {
+            return 0;
+        }
+        let size = u32::from(control & pci::MSIX_SIZE_MASK) + 1;
+        let mut held = 0u32;
+        let mut left = entries;
+        while left != 0 {
+            let entry = left.trailing_zeros();
+            left &= left - 1;
+            if entry >= size {
+                continue;
+            }
+            let at = u64::from(page) + u64::from(entry * pci::MSIX_ENTRY);
+            let mut e = [0u8; pci::MSIX_ENTRY as usize];
+            if self.memory.read(at, &mut e).is_err() {
+                continue;
+            }
+            let word = |i: usize| u32::from_le_bytes([e[i], e[i + 1], e[i + 2], e[i + 3]]);
+            if control & pci::MSIX_MASK_ALL != 0 || word(12) & pci::MSIX_ENTRY_MASKED != 0 {
+                held |= 1 << entry;
+                continue;
+            }
+            let address = u64::from(word(0)) | (u64::from(word(4)) << 32);
+            if let Some(ipi) = lapic::msi(address, word(8)) {
+                counts.msi += 1;
+                self.post_msi(me, lapic, &ipi);
+            }
+        }
+        held
+    }
+
+    /// A device's MSI, as `ipi` decodes it: its vector into the request
+    /// register of each CPU it names -- the first of them only, for lowest
+    /// priority -- straight into `lapic` for the CPU `me` doing the device's
+    /// work, and through the mailbox and a ring for any other.
+    fn post_msi(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi) {
+        for (i, target) in self.cpus.iter().enumerate() {
+            let id = i as u32;
+            if !ipi.reaches(id, me) {
+                continue;
+            }
+            if id == me {
+                lapic.accept(ipi.vector);
+            } else {
+                target.mail.post_fixed(ipi.vector);
+                if let Some(d) = self.doorbells.get(i) {
+                    d.ring();
+                }
+            }
+            if ipi.delivery == Delivery::LowestPriority {
+                return;
+            }
         }
     }
 
@@ -1356,11 +1495,13 @@ impl LinuxGuest {
             } else {
                 let value = v.save().rax as u32;
                 p.pci.write(io.port, io.size, value);
+                sync_msix(&mut p);
                 gc.counts.port_out += 1;
             }
         } else if let Some((slot, offset)) = p.pci.io_target(io.port) {
             /* A device's registers: slot n is pci_devs[n - 1]. */
-            let dev = usize::from(slot).checked_sub(1).and_then(|i| p.pci_devs.get_mut(i));
+            let index = usize::from(slot).checked_sub(1);
+            let dev = index.and_then(|i| p.pci_devs.get_mut(i));
             if io.input {
                 let value = match dev {
                     Some(PciDev::Disk(d)) => d.io_read(offset, io.size),
@@ -1371,13 +1512,13 @@ impl LinuxGuest {
                 gc.counts.port_in += 1;
             } else {
                 let value = v.save().rax as u32;
-                let irq = match dev {
-                    Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory).then_some(DISK_IRQ),
-                    Some(PciDev::Nic(n)) => n.io_write(offset, io.size, value, &self.memory).then_some(NIC_IRQ),
-                    None => None,
+                let raised = match dev {
+                    Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory),
+                    Some(PciDev::Nic(n)) => n.io_write(offset, io.size, value, &self.memory),
+                    None => Raise::default(),
                 };
-                if let Some(irq) = irq {
-                    p.pic.raise(irq);
+                if let Some(dev) = index.filter(|_| raised.any()) {
+                    self.raise(&mut p, me, &mut gc.lapic, &mut gc.counts, dev, raised);
                 }
                 gc.counts.port_out += 1;
             }
@@ -1479,6 +1620,38 @@ impl LinuxGuest {
         if p.msr_faults.len() < MSR_FAULTS_KEPT {
             /* Into the room taken at `new`. */
             p.msr_faults.push((msr, value, write));
+        }
+    }
+}
+
+/// The MSI-X table page of the device in PCI slot `slot`, made guest memory:
+/// the page the function's BAR 1 names, where the guest writes its table
+/// and the device reads it. None for a guest with no APIC to take a
+/// message, or one whose RAM reaches that far.
+fn msix_page(memory: &mut GuestMemory, apic: bool, slot: usize) -> Result<Option<u32>> {
+    if !apic {
+        return Ok(None);
+    }
+    let Some(page) = u32::try_from(slot).ok().and_then(|s| s.checked_mul(pci::MSIX_PAGE))
+        .and_then(|off| MSIX_PAGES.checked_add(off)) else { return Ok(None) };
+    match memory.add(u64::from(page), u64::from(pci::MSIX_PAGE)) {
+        Ok(()) => Ok(Some(page)),
+        /* RAM there already: a guest that large goes without. */
+        Err(Error::BadAddress) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Each device's transport told whether its function has MSI-X on: after
+/// every write of configuration space, which is how a driver turns it on --
+/// and what moves the device's own configuration in its BAR.
+fn sync_msix(p: &mut Platform) {
+    let Platform { pci, pci_devs, .. } = p;
+    for (i, d) in pci_devs.iter_mut().enumerate() {
+        let on = pci.msix(i + 1).is_some_and(|(control, _)| control & pci::MSIX_ENABLE != 0);
+        match d {
+            PciDev::Disk(d) => d.set_msix_enabled(on),
+            PciDev::Nic(n) => n.set_msix_enabled(on),
         }
     }
 }
