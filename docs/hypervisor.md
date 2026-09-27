@@ -1001,8 +1001,9 @@ here:
   intercepted: the system MSRs (EFER, the PAT, the segment bases, the
   SYSCALL and SYSENTER registers) are the guest's own state and are served
   from the VMCB save area, the x2APIC's by the local APIC of a guest that
-  has one, and every other MSR reads zero and swallows a write, which is
-  what a guest's `rdmsr_safe` probes are ready for.
+  has one, AMD's DE_CFG and HWCR with the bits a Linux on AMD checks set
+  as the hardware has them, and every other MSR reads zero and swallows a
+  write, which is what a guest's `rdmsr_safe` probes are ready for.
 - **The devices a guest cannot boot without** (`hv::devices`): the 8250
   serial port the console writes to (which raises IRQ4 for the transmitter,
   so the driver sends past its first byte); an 8254 PIT whose counter counts
@@ -1604,11 +1605,18 @@ mirror fetched from.
 
 `cpus=N` on `hv boot` and `hv start` gives a guest N CPUs, up to 16. Each is
 a task of its own on a host CPU of its own: the first where `cpu=` says or
-the least loaded CPU the extension is on for, the others each on the least
-loaded that none of the guest's has yet (`pick_cpus`). Two CPUs of one guest
-never share a host CPU -- a guest CPU spinning while it waits for another
-would hold the host CPU the other needs to finish -- so a guest has at most
-as many CPUs as `hv on` has turned the extension on for.
+on the least loaded core the extension is on for, the others each on a core
+none of the guest's CPUs is on yet where there is one, sharing the first's
+last-level cache where they can, and the least loaded of those
+(`pick_cpus`, over `hv::topology`, which reads a CPU's core and cache from
+its APIC ID and CPUID). Two CPUs of one guest never share a host CPU -- a
+guest CPU spinning while it waits for another would hold the host CPU the
+other needs to finish -- so a guest has at most as many CPUs as `hv on` has
+turned the extension on for. Nor, where it can be helped, a core: placed on
+one core's two threads (13 and 12 on the AX41, as the first placement did),
+two busy loops in a Debian guest took 14.7 s where one alone took 9.7; on
+two cores of one CCX (13 and 11, where it goes now) they take 9.7, and four
+loops on a guest of four CPUs (13, 11, 9 and 5) take 10.0.
 
 ```
 $ hv boot /bzImage mem=256 secs=60 cpus=2 initrd=/initrd cmdline=earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check
@@ -1701,7 +1709,15 @@ TSC's ratio to it, so a kernel need not measure either. Passed through, the
 leaf would name the host's crystal, tens of MHz, and a kernel that took the
 timer's rate from it would have its timer fire tens of times too soon;
 where the host has no frequency to give, the leaf is blank and the kernel
-measures. The topology leaves stay blank, as for one CPU.
+measures. The topology leaves stay blank, as for one CPU. Of leaf
+0x80000007 only the invariant TSC is left: its RAS bits (SUCCOR among them)
+sent Linux's machine-check code to set up AMD's deferred-error interrupt
+through the APIC's extended LVT -- MSR 0x852, a register this APIC has not
+got -- and the #GP came back as an "unchecked MSR access" and two firmware
+bugs in its log. A guest on an AMD host reads DE_CFG's LFENCE-serializing
+bit set, as KVM answers it, and HWCR's TscFreqSel set, as every AMD CPU
+since family 10h has it; read as zero, that one was a "TSC doesn't count
+with P0 frequency!" firmware bug of its own.
 
 **What it needs of the guest's kernel**: Linux 6.6 or later. Before 6.6, a
 kernel given an MP table and an x2APIC already on reads its APIC ID through
@@ -1832,25 +1848,56 @@ delta = 1001`). So PAUSE exits now -- every one under VT-x (PAUSE exiting),
 under AMD-V every 128th where the CPU has a pause filter and every one where
 it has not -- and each exit goes round the loop that hands a tick over as it
 falls due. Measured on the AX41, the guest finds a bus of 999 MHz and keeps
-its timer (`jiffies delta = 100`, `jiffies result ok`). On an Intel host
-(an i5-13500, nested under KVM) exits are quick and even enough that the
-guest calibrates its TSC against the PIT as well, which the AX41's did
-not, and runs tickless on the TSC clocksource. A CPU spinning on
-a lock another of the guest's CPUs holds comes out the same way, and is
-handed its tick when it falls due rather than at the host's next one.
+its timer (`jiffies delta = 100`, `jiffies result ok`), as it does on an
+Intel host (an i5-13500, nested under KVM). A CPU spinning on a lock
+another of the guest's CPUs holds comes out the same way, and is handed its
+tick when it falls due rather than at the host's next one.
 
-Under TCG a guest can still refuse it. The check allows two ticks of 100,
-and a guest there is slow enough that the PIT's ticks owed from the lines it
-printed with interrupts off just before -- through a UART that is itself
-exits -- are still being handed over when the check starts: it counts 106.
-The kernel then keeps its PIT tick on the first CPU and broadcasts it to the
-others by IPI, which works, and costs an IPI a tick per CPU.
+Under TCG a guest refused it once more before it was told its TSC's rate
+(below). The check allows two ticks of 100, and a guest there is slow
+enough that the PIT's ticks owed from the lines it printed with interrupts
+off just before -- through a UART that is itself exits -- were still being
+handed over when the check started: it counted 106. It then kept its PIT
+tick on the first CPU and broadcast it to the others by IPI, which works,
+and costs an IPI a tick per CPU. Told the rate, it has kept its timer in
+both runs since.
+
+**The TSC's rate, handed over.** A kernel on an AMD host measures its TSC
+against the PIT, every read an exit, and gives up if one read takes ten
+times the fastest -- which a vCPU sharing its host CPU with the host's own
+work (sshd, the network stack; cpu 0's, on the AX41) did one boot in two,
+before SMP and after, and ran on jiffies. So every Linux guest's command
+line gets `tsc_early_khz=` with the host's TSC rate, which is the guest's:
+nothing offsets or scales the TSC a guest reads. Linux takes it as
+authoritative from 5.7 on; `hv` leaves one the command line gives alone.
+
+**Two CPUs' TSCs agree.** Placed on two CCXs of the AX41 (0 and 13), Debian
+measured its CPUs' TSCs 2052 cycles apart -- "turning off TSC clock" -- where
+Ubuntu, on the same CPUs, found them in step. Linux's check reads the TSC
+with `lfence; rdtsc` after taking a lock the other CPU held, and trusts the
+LFENCE to hold the RDTSC back until the load before it has completed. On an
+AMD CPU of families 10h to 17h LFENCE does that only with DE_CFG bit 1 set,
+which Linux sets on every CPU and nos did not, and the firmware had not:
+the RDTSC ran ahead of a cache line on its way from the other CCX, and the
+time that took looked like a warp. nos sets the bit on every CPU now, the
+BSP's boot log saying when the firmware left it clear
+(`Hal::SetupSerializingLfence`); a guest of four CPUs across both CCXs (13,
+11, 9 and 5) keeps its TSC.
 
 ### What it does not do yet
 
 - **Device interrupts reach the first CPU only.** There is no IO-APIC and no
   MSI, so a disk's or a NIC's interrupt cannot be steered, and the first
-  CPU serves every device.
+  CPU serves every device. At the link's rate that CPU is the guest's
+  ceiling: fetching a gigabyte, the AX41's Debian had its first vCPU's host
+  CPU 96.5% busy and its second idle, and its port dropped a few hundred
+  frames a gigabyte -- TCP carrying on at 113 MB/s of the 117 the link
+  carries. Each receive interrupt goes through the emulated 8259:
+  its mask, two EOIs and unmask are four port writes and the ISR's read and
+  a dummy one two port reads, six exits an interrupt, and at the link's rate
+  there is one every other frame. MSI-X through the local APIC would be
+  one EOI write an interrupt, to any CPU the guest steers it to; that is the
+  NIC's next thing.
 - **A timer is as prompt as the host's tick.** Nothing on the host is set
   for a guest timer's deadline -- `kcore::timer` is periodic, at the
   host's tick -- so a CPU in its guest is handed a timer interrupt at its
@@ -2080,6 +2127,32 @@ what is left of the mapping -- the flush when a slot is cleared -- under
 own slot; `apt-get update` took 2 s with pipelining on and off; `e2fsck`
 found `nosenv` and the guest's ext4 clean.
 
+Then guests of more than one CPU ([More than one CPU](#more-than-one-cpu)),
+the same Debian image with `cpus=2` and without `nolapic`: at its login
+prompt in 3.2 s, both CPUs online, systemd `running` with no unit failed, a
+gigabyte fetched at 113 to 116 MB/s, 1 GiB written with `fsync` at 1.2 GB/s
+and read back at 1.5; its `reboot` came back with both CPUs, a CPU taken
+offline and back was started again by INIT and a start-up IPI, and its
+`poweroff` ended as it should -- "hlt with interrupts off, on every CPU it
+has". What the first boot of it showed, and the next one fixed:
+
+| in the Debian guest | 14a03e0 | with the fixes |
+|---|---|---|
+| where `cpus=2` put it | 13, 12: one core's two threads | 13, 11: two cores, one CCX |
+| two busy loops, one alone taking 9.7 s | 14.7 s | 9.7 s |
+| its CPUs on two CCXs | a 2052-cycle TSC "warp", jiffies | four CPUs on 13, 11, 9, 5: TSC kept, four loops 10.0 s |
+| one CPU, on host cpu 0 | TSC lost one boot in two | TSC kept, three boots of three |
+| its log | an unchecked MSR access (0x852), three firmware bugs | none |
+
+The frames its port dropped on the way were not new: the kernel and module
+before these, booted once more for it, dropped 431 and 608 a gigabyte for a
+guest of one CPU, the module of 14a03e0 on the same kernel 139 and none,
+and with the fixes a guest of two dropped 256, 500 and 129 -- the ceiling
+of the vCPU that takes every receive interrupt, in [What it does not do
+yet](#what-it-does-not-do-yet). Its sampled profile over that fetch: 44% of
+its host CPU the guest running, and the rest the exits, spread thin.
+`e2fsck` found `nosenv` and the guest's ext4 clean.
+
 How to repeat it -- the kernel, the modules and the guest on the machine's
 `nosenv` partition, one boot of nos by `nosboot`, the shell over ssh -- is
 in [Real hardware](real-hardware.md) for the machine and in the gate's own
@@ -2123,9 +2196,11 @@ out through NAT ([The way out](#the-way-out-nat-dhcp-and-dns)), a
 distribution boots as it ships ([A distribution](#a-distribution)), and a
 guest has as many CPUs as it is given, each with a local APIC ([More than
 one CPU](#more-than-one-cpu)) -- under AMD-V and VT-x both.
-Beyond stage 3: an IO-APIC or MSI so that a device's interrupts can reach
-any of a guest's CPUs, modern virtio, and the control plane's HTTP API
-(stage 4).
+Beyond stage 3: MSI-X, so that a device's interrupts can reach any of a
+guest's CPUs through its local APIC, at one exit an interrupt where the
+8259 costs six -- what bounds a guest's network now ([What it does not do
+yet](#what-it-does-not-do-yet)) -- modern virtio, and the control plane's
+HTTP API (stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every

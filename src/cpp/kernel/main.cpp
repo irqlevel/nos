@@ -265,6 +265,9 @@ void ApMain2()
        after the CR3 load; the only mapping the two disagree about in between
        is the framebuffer, and nothing above touches it. */
     Hal::SetupMemoryTypes();
+    /* As the BSP did: every CPU the same, or an lfence; rdtsc on this one
+       would not be ordered as it is on the others. */
+    Hal::SetupSerializingLfence();
 
     if (Parameters::GetInstance().IsSmpOff())
         Panic("AP cpu started while smp is off");
@@ -862,6 +865,10 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         /* Before the first MapMmioRegion: a write-combining mapping needs
            the PAT entry to exist. */
         Hal::SetupMemoryTypes();
+        /* The firmware's choice, said once: the APs make the same one
+           (ApMain2). */
+        if (Hal::SetupSerializingLfence())
+            Trace(0, "cpu: LFENCE made dispatch-serializing (DE_CFG bit 1 was clear)");
         ulong t0 = (ulong)KernelStart, t1 = (ulong)KernelText;
         ulong r1 = (ulong)KernelRodata, e = (ulong)KernelEnd;
         pt.ProtectRange(t0, t1 - t0, false, true);   /* RX */

@@ -77,7 +77,7 @@ The order below is load-bearing; the notes say why.
 | `Netconsole::Setup()` | Armed as soon as the command line is known, so the log is buffered from the beginning and can be shipped once the link comes up |
 | `BuiltinPageTable::MapHighRam()` | Extends the bootstrap map over RAM above 4 GiB in 1 GiB blocks. It could not run in `Setup()` — there was no memory map yet |
 | `PageTable::Setup()` + `SetCr3` + `SetupFreePagesList()` | The real 4-level page table, the page-descriptor array, and the free list. See [Paging](paging.md) |
-| W^X | `EnableWxSupport` (EFER.NXE), `SetupMemoryTypes` (PAT entry 4 = write-combining), then `ProtectRange` three times: text RX, rodata RO+NX, data RW+NX. Both must precede the first `MapMmioRegion` — an NX bit without NXE faults as reserved, and a write-combining PTE needs the PAT entry to exist |
+| W^X | `EnableWxSupport` (EFER.NXE), `SetupMemoryTypes` (PAT entry 4 = write-combining), `SetupSerializingLfence` (AMD: DE_CFG bit 1, traced when the firmware left it clear), then `ProtectRange` three times: text RX, rodata RO+NX, data RW+NX. The first two must precede the first `MapMmioRegion` — an NX bit without NXE faults as reserved, and a write-combining PTE needs the PAT entry to exist. The third makes `lfence; rdtsc` ordered on an AMD CPU, as Linux makes it: without it a guest's TSC read runs ahead of the load before it, and a guest across two CCXs measured its CPUs' TSCs 2052 cycles apart and gave the TSC up |
 | `Screen::Setup()` | Picks EGA text (BIOS) or the pixel framebuffer (UEFI). Needs `MapMmioRegion`, so it cannot be earlier; must be on the BSP before the APs start, so it cannot be later |
 | `Acpi::Parse()` | RSDP/RSDT/MADT: the LAPIC address, the IOAPIC, the IRQ→GSI overrides, and one `CpuTable::InsertCpu` per LAPIC entry — which is how the kernel learns how many CPUs it has |
 | `PageAllocatorImpl::Setup()` + `AllocatorImpl` | The heap. Nothing may allocate before this line |
@@ -163,8 +163,9 @@ console may not be in either of them (a Raptor Lake iGPU aperture sits at
 `0x40_0000_0000`). An AP has no IDT yet, so a page fault there is a triple
 fault: the machine resets during `StartAll` with nothing on the screen and
 nothing in any log. Hence: NXE, then the kernel page table, then GDT and
-IDT, then the PAT, and only then anything that can print. After that the
-LAPIC, kvmclock for this vcpu, its TSS, and `cpu.Run(ApStartup)`.
+IDT, then the PAT and serializing LFENCE, as the BSP has them, and only
+then anything that can print. After that the LAPIC, kvmclock for this vcpu,
+its TSS, and `cpu.Run(ApStartup)`.
 
 `ApStartup` arms this CPU's LAPIC timer, enables interrupts, publishes
 itself as running, waits for `PreemptOn` on the BSP, runs the multitasking

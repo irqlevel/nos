@@ -38,6 +38,8 @@ pub mod lapic;
 #[cfg(target_arch = "x86_64")]
 pub mod smp;
 #[cfg(target_arch = "x86_64")]
+pub mod topology;
+#[cfg(target_arch = "x86_64")]
 mod npt;
 #[cfg(target_arch = "x86_64")]
 mod ept;

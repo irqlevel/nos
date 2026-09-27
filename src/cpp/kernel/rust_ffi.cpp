@@ -276,6 +276,11 @@ unsigned long long kernel_get_boot_time_ns()
     return Kernel::GetBootTime().GetValue();
 }
 
+unsigned long long kernel_cycle_counter_hz()
+{
+    return Hal::CycleCounterHz();
+}
+
 unsigned long kernel_get_wall_time_secs()
 {
     return Kernel::GetWallTimeSecs();

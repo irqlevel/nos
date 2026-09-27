@@ -80,6 +80,32 @@ static inline __attribute__((always_inline)) void UndefInstr()
 }
 }
 
+#ifdef __cplusplus
+namespace Hal
+{
+
+/* Make LFENCE dispatch-serializing on this CPU where it is not by default,
+   so that an `lfence; rdtsc` reads the counter only once every load before
+   it has completed. That is the ordering a guest's rdtsc_ordered() counts
+   on, and Linux's check that two CPUs' TSCs agree with it: without it an
+   RDTSC runs ahead of a load that misses -- a cache line coming from the
+   other CCX -- and CPUs whose TSCs agree look hundreds of cycles apart. x86:
+   AMD families 10h to 17h and Hygon leave it to DE_CFG (MSR 0xC0011029) bit
+   1, which firmware need not set; Linux sets it on every CPU, and so does
+   this, on the BSP and on each AP. Nothing to do on Intel, where LFENCE is
+   serializing by definition, or under a hypervisor, whose MSR that is.
+   arm64: no-op. True when it had to be set: the firmware left it clear.
+   Defined per arch. */
+bool SetupSerializingLfence();
+
+/* How fast ReadCycleCounter() counts, in Hz: the TSC's rate as the kernel
+   calibrated it on x86, CNTFRQ_EL0 on arm64. 0 while it is not known yet.
+   Defined per arch. */
+ulong CycleCounterHz();
+
+}
+#endif
+
 // Provides namespace Hal { IsInterruptEnabled, IrqSave, IrqRestore,
 // GetSp, SetSp, GetFp, ReadCycleCounter }.
 #if defined(__x86_64__)

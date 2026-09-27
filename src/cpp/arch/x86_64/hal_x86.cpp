@@ -10,6 +10,7 @@
 #include <arch/x86_64/cpuid.h>
 
 #include <arch/x86_64/context.h>
+#include <arch/x86_64/tsc.h>
 #include <lib/stdlib.h>
 #include <lib/printer.h>
 
@@ -95,6 +96,52 @@ void SetupMemoryTypes()
 bool IsWriteCombiningAvailable()
 {
     return WriteCombiningReady;
+}
+
+ulong CycleCounterHz()
+{
+    auto& tsc = Kernel::Tsc::GetInstance();
+    return tsc.IsCalibrated() ? tsc.GetFreqHz() : 0;
+}
+
+bool SetupSerializingLfence()
+{
+    static const u32 LeafVendor = 0;
+    static const u32 LeafFeatures = 1;
+    static const u32 FeaturesEcxHypervisor = 1U << 31;
+    /* "AuthenticAMD" and "HygonGenuine", as EBX, EDX, ECX give them. */
+    static const u32 AmdEbx = 0x68747541, AmdEdx = 0x69746E65, AmdEcx = 0x444D4163;
+    static const u32 HygonEbx = 0x6F677948, HygonEdx = 0x6E65476E, HygonEcx = 0x656E6975;
+    static const u32 FamilyShift = 8, FamilyMask = 0xF;
+    static const u32 ExtFamilyShift = 20, ExtFamilyMask = 0xFF;
+    static const u32 FamilyExtended = 0xF;
+    /* The first family with the MSR, and the one after it without: 11h
+       (Griffin) has no DE_CFG, and serializes LFENCE as 0Fh does. */
+    static const u32 FamilyFirstDeCfg = 0x10;
+    static const u32 FamilyGriffin = 0x11;
+    static const u32 AmdDeCfgMsr = 0xC0011029;
+    static const u64 DeCfgLfenceSerialize = 1ULL << 1;
+
+    CpuidResult v = Cpuid(LeafVendor);
+    bool amd = v.Ebx == AmdEbx && v.Edx == AmdEdx && v.Ecx == AmdEcx;
+    bool hygon = v.Ebx == HygonEbx && v.Edx == HygonEdx && v.Ecx == HygonEcx;
+    if (!amd && !hygon)
+        return false;
+
+    CpuidResult f = Cpuid(LeafFeatures);
+    if (f.Ecx & FeaturesEcxHypervisor)
+        return false;
+    u32 family = (f.Eax >> FamilyShift) & FamilyMask;
+    if (family == FamilyExtended)
+        family += (f.Eax >> ExtFamilyShift) & ExtFamilyMask;
+    if (family < FamilyFirstDeCfg || family == FamilyGriffin)
+        return false;
+
+    u64 cfg = ReadMsr(AmdDeCfgMsr);
+    if (cfg & DeCfgLfenceSerialize)
+        return false;
+    WriteMsr(AmdDeCfgMsr, cfg | DeCfgLfenceSerialize);
+    return true;
 }
 
 ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes)

@@ -42,6 +42,21 @@ void PsciCall(u32 fn)
 namespace Hal
 {
 
+bool SetupSerializingLfence()
+{
+    /* Nothing to set: an ISB orders what follows it on every arm64 CPU. */
+    return false;
+}
+
+ulong CycleCounterHz()
+{
+    /* The generic timer's rate, which firmware sets and nothing changes:
+       what ReadCycleCounter's CNTVCT_EL0 counts at. */
+    u64 freq;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(freq));
+    return freq;
+}
+
 /* PMUv3 exists on the hardware but is not wired up here, and Apple's
    hypervisor does not hand the guest one to test against. */
 bool PmuAvailable()
