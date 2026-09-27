@@ -278,7 +278,7 @@ impl Blk {
 
     /// A write of `size` bytes at `offset` in the BAR; true when the
     /// device's interrupt line is to go up. The configuration is read-only.
-    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &mut GuestMemory) -> bool {
+    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory) -> bool {
         if offset >= virtio::DEVICE_CONFIG {
             return false;
         }
@@ -307,7 +307,7 @@ impl Blk {
     /// waited on the ring for a buffer, taken now there is one. True when the
     /// device's interrupt line is to go up. Every time round the run loop,
     /// so it costs next to nothing when there is nothing.
-    pub fn poll(&mut self, mem: &mut GuestMemory) -> bool {
+    pub fn poll(&mut self, mem: &GuestMemory) -> bool {
         let mut answered = false;
         let mut back = false;
         while let Some(req) = self.backend.take() {
@@ -330,7 +330,7 @@ impl Blk {
     /// it: each request handed to the backend, or -- when there is nothing
     /// for the backend to do -- answered at once. True when something was
     /// given back.
-    fn fill(&mut self, mem: &mut GuestMemory) -> bool {
+    fn fill(&mut self, mem: &GuestMemory) -> bool {
         self.waiting = false;
         let mut answered = false;
         while self.broken.is_none() {
@@ -367,7 +367,7 @@ impl Blk {
 
     /// Serve the request at `head`, from `slot`: handed to the backend
     /// (false), or answered now (true).
-    fn start(&mut self, mem: &mut GuestMemory, slot: usize, head: u16, segs: &[Seg])
+    fn start(&mut self, mem: &GuestMemory, slot: usize, head: u16, segs: &[Seg])
         -> core::result::Result<bool, Broken>
     {
         let (op, offset, len) = match self.classify(mem, segs) {
@@ -397,7 +397,7 @@ impl Blk {
     /// A request the backend has served, given back: its buffer to its slot
     /// whatever became of the chain, and the chain to the driver when there
     /// is still one to give it back to. True when something was.
-    fn complete(&mut self, mem: &mut GuestMemory, req: Request) -> bool {
+    fn complete(&mut self, mem: &GuestMemory, req: Request) -> bool {
         let Request { op, len, buf, ok, slot, .. } = req;
         let Some(s) = self.slots.get_mut(slot) else {
             return false;
@@ -450,7 +450,7 @@ impl Blk {
 
     /// Write the status -- the last byte the device may write -- and give
     /// the chain back with what was written.
-    fn finish(&mut self, mem: &mut GuestMemory, segs: &[Seg], head: u16, status: u8, written: u32) -> core::result::Result<(), Broken> {
+    fn finish(&mut self, mem: &GuestMemory, segs: &[Seg], head: u16, status: u8, written: u32) -> core::result::Result<(), Broken> {
         let last = segs.iter().rev().find(|s| s.write && s.len != 0).ok_or(Broken::Memory)?;
         mem.write(last.addr + u64::from(last.len) - 1, &[status]).map_err(|_| Broken::Memory)?;
         let q = self.transport.queue(0).ok_or(Broken::Index)?;
@@ -460,7 +460,7 @@ impl Blk {
     /// What a request is, from its header: the backend's to serve, or
     /// answered here -- a request past the disk, or larger than the driver
     /// was told one may be, is an I/O error; one with no data is done.
-    fn classify(&mut self, mem: &mut GuestMemory, segs: &[Seg]) -> Next {
+    fn classify(&mut self, mem: &GuestMemory, segs: &[Seg]) -> Next {
         let mut header = [0u8; HEADER];
         if !copy_out(mem, segs, 0, &mut header) {
             self.stats.errors += 1;
@@ -554,7 +554,7 @@ fn copy_out(mem: &GuestMemory, segs: &[Seg], skip: u64, buf: &mut [u8]) -> bool 
 }
 
 /// Copy `data` into the chain's writable stream, from `skip` bytes into it.
-fn copy_in(mem: &mut GuestMemory, segs: &[Seg], skip: u64, data: &[u8]) -> bool {
+fn copy_in(mem: &GuestMemory, segs: &[Seg], skip: u64, data: &[u8]) -> bool {
     let mut skip = skip;
     let mut done = 0usize;
     for s in segs.iter().filter(|s| s.write) {

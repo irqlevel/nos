@@ -4,11 +4,22 @@
 //! Both are intercepted for every guest -- a CPUID the host did not shape
 //! could promise a feature this hypervisor cannot back, and an MSR reaching
 //! the CPU directly is the host's own hardware. So a guest sees a CPU cut
-//! down to what is emulated here: no local APIC, no x2APIC, no XSAVE and so
-//! no AVX (the state switch around `vmrun` moves only the FXSAVE registers),
-//! no paravirtualisation, no virtualization extension of its own. What is
-//! left is enough to decompress and start a 64-bit kernel: long mode, NX,
-//! SYSCALL, the SSE line, the PAT and the plain arithmetic features.
+//! down to what is emulated here: no XSAVE and so no AVX (the state switch
+//! around `vmrun` moves only the FXSAVE registers), no paravirtualisation,
+//! no virtualization extension of its own -- and a local APIC only in a
+//! guest of more than one CPU, where it is an x2APIC (`lapic`) with no
+//! TSC-deadline timer. What is left is enough to decompress and start a
+//! 64-bit kernel, and its other CPUs: long mode, NX, SYSCALL, the SSE line,
+//! the PAT, the APIC and the plain arithmetic features.
+//!
+//! Each of a guest's CPUs is a package of its own, one core and one thread,
+//! its APIC ID its number: leaf 1 says so, and the leaves that would say
+//! otherwise -- the topology ones -- are blank. The CPUs are listed by the
+//! MP table the loader writes (`linux`), with the same IDs. A guest of one
+//! CPU is the PC it always was: no APIC, and no MP table -- which any kernel
+//! boots, where a firmware-enabled x2APIC listed by an MP table takes Linux
+//! 6.6 or later (an older one reads its APIC ID through the xAPIC's page
+//! before it has switched to x2APIC's MSRs).
 //!
 //! The system MSRs -- EFER, the PAT, the segment bases, the SYSCALL and
 //! SYSENTER registers -- are the guest's own state, and the VMCB's save area
@@ -24,9 +35,11 @@ use hvarch::x86::svm::GuestRegs;
 /* CPUID leaves. */
 const LEAF_FEATURES: u32 = 1;
 const LEAF_CACHE: u32 = 4;
+const LEAF_POWER: u32 = 6;
 const LEAF_STRUCTURED: u32 = 7;
 const LEAF_TOPOLOGY: u32 = 0xB;
 const LEAF_XSTATE: u32 = 0xD;
+const LEAF_TSC: u32 = 0x15;
 const LEAF_TOPOLOGY_V2: u32 = 0x1F;
 const LEAF_HYPERVISOR_BASE: u32 = 0x4000_0000;
 const LEAF_HYPERVISOR_END: u32 = 0x4000_00FF;
@@ -36,19 +49,38 @@ const LEAF_SVM: u32 = 0x8000_000A;
 const LEAF_EXT_APIC_ID: u32 = 0x8000_001E;
 const LEAF_ENCRYPTION: u32 = 0x8000_001F;
 
-/* The guest is one CPU with APIC ID 0 in a package of its own, whatever the
- * host CPU its vCPU runs on: leaf 1 EBX says so in its top two bytes -- the
- * initial APIC ID, and the logical processors in the package -- leaf 4 in
- * its core and sharing counts, and leaf 0x80000008 ECX in the core count and
- * the APIC ID's width. The host's numbers there are another machine's: a
- * Linux guest took CPU 3's APIC ID for its own ("APIC ID mismatch"). */
+/* Each of the guest's CPUs is a package of its own, with its own APIC ID,
+ * whatever host CPU its vCPU runs on: leaf 1 EBX says so in its top two
+ * bytes -- the initial APIC ID, and the logical processors in the package --
+ * leaf 4 in its core and sharing counts, and leaf 0x80000008 ECX in the core
+ * count and the APIC ID's width. The host's numbers there are another
+ * machine's: a Linux guest took CPU 3's APIC ID for its own ("APIC ID
+ * mismatch"). */
 const LEAF1_EBX_KEEP: u32 = 0x0000_FFFF;
 const LEAF1_EBX_ONE_CPU: u32 = 1 << 16;
+const LEAF1_EBX_APIC_ID_SHIFT: u32 = 24;
 const LEAF4_EAX_KEEP: u32 = 0x0000_3FFF;
+/// Leaf 1: the APIC (EDX bit 9) and x2APIC mode (ECX bit 21), both
+/// emulated (`lapic`), set whatever the host has.
+const LEAF1_EDX_APIC: u32 = 1 << 9;
+const LEAF1_ECX_X2APIC: u32 = 1 << 21;
+/// Leaf 6 EAX bit 2, ARAT: the APIC timer runs in every C-state. It does --
+/// it is the host's clock -- and without the bit a guest looks for another
+/// timer to wake it from a deep sleep, which it has none of.
+const LEAF6_EAX_ARAT: u32 = 1 << 2;
+/// Leaf 0x15 as a guest with an APIC is told it: the "crystal" the APIC
+/// timer counts is the emulated APIC's bus, 1 GHz (`lapic`), and the TSC's
+/// ratio to it is the host's TSC -- in kHz, over a denominator of a million
+/// kHz. Linux on Intel takes the APIC timer's rate from this leaf and skips
+/// measuring it; passed through, the leaf names the host's crystal, tens of
+/// MHz, and the guest's timer would fire tens of times too soon.
+const LEAF15_CRYSTAL_HZ: u32 = 1_000_000_000;
+const LEAF15_DENOMINATOR_KHZ: u32 = 1_000_000;
 
 /* Leaf 1, ECX: the features kept. Everything not named here is cleared --
- * among them MONITOR, VMX, x2APIC, the TSC deadline timer, XSAVE, OSXSAVE,
- * AVX and the hypervisor bit. */
+ * among them MONITOR, VMX, the TSC deadline timer, XSAVE, OSXSAVE, AVX and
+ * the hypervisor bit. x2APIC is set on top (`LEAF1_ECX_X2APIC`) for a guest
+ * of more than one CPU. */
 const LEAF1_ECX_KEEP: u32 = (1 << 0)   // SSE3
     | (1 << 1)   // PCLMULQDQ
     | (1 << 9)   // SSSE3
@@ -60,8 +92,9 @@ const LEAF1_ECX_KEEP: u32 = (1 << 0)   // SSE3
     | (1 << 25)  // AES-NI
     | (1 << 30); // RDRAND
 
-/* Leaf 1, EDX: the features kept. APIC (bit 9) is cleared, so the guest
- * expects no local APIC -- which this hypervisor does not emulate yet. */
+/* Leaf 1, EDX: the features kept. APIC (bit 9) is set on top of them
+ * (`LEAF1_EDX_APIC`) for a guest of more than one CPU, whatever the host
+ * has, and cleared for one of one. */
 const LEAF1_EDX_KEEP: u32 = (1 << 0)   // FPU
     | (1 << 1)   // VME
     | (1 << 2)   // DE
@@ -99,9 +132,9 @@ const EXT1_ECX_KEEP: u32 = (1 << 0)   // LAHF/SAHF in 64-bit mode
     | (1 << 8);  // PREFETCHW
 
 /* Extended leaf 0x80000001, EDX: what leaf 1 keeps of the bits AMD mirrors
- * there (the APIC again not), SYSCALL, NX, the MMX extensions, 1 GiB pages and
- * long mode. RDTSCP (bit 27) is cleared because its intercept has no answer
- * here but #UD; FFXSR and 3DNow! go too. */
+ * there, SYSCALL, NX, the MMX extensions, 1 GiB pages and long mode. The
+ * APIC's mirror (bit 9) is set as leaf 1's is. RDTSCP (bit 27) is cleared
+ * because its intercept has no answer here but #UD; FFXSR and 3DNow! go too. */
 const EXT1_EDX_KEEP: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
     | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8)   // FPU..CX8, as leaf 1
     | (1 << 11)  // SYSCALL
@@ -126,9 +159,11 @@ pub struct Cpuid {
     pub edx: u32,
 }
 
-/// What the guest is told for CPUID leaf `leaf`, subleaf `sub` (ECX on the
-/// way in, for the leaves that take one).
-pub fn cpuid(leaf: u32, sub: u32) -> Cpuid {
+/// What the guest's CPU whose APIC ID is `apic_id` is told for CPUID leaf
+/// `leaf`, subleaf `sub` (ECX on the way in, for the leaves that take one);
+/// `apic` says whether the guest has local APICs -- one of more than one
+/// CPU -- which leaf 1 then says, the x2APIC with it.
+pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
     /* Leaves this hypervisor blanks outright: the structured-features leaf
      * (its SMEP/SMAP/FSGSBASE/AVX2 are either the guest's own CR4 business
      * or things XSAVE gates, which is off), the XSAVE state leaf, and the
@@ -155,15 +190,26 @@ pub fn cpuid(leaf: u32, sub: u32) -> Cpuid {
     };
     let (mut eax, mut ebx, mut ecx, mut edx) = (host.eax, host.ebx, host.ecx, host.edx);
 
+    let (apic_ecx, apic_edx) = if apic { (LEAF1_ECX_X2APIC, LEAF1_EDX_APIC) } else { (0, 0) };
     if leaf == LEAF_FEATURES {
-        ebx = (ebx & LEAF1_EBX_KEEP) | LEAF1_EBX_ONE_CPU;
-        ecx &= LEAF1_ECX_KEEP;
-        edx &= LEAF1_EDX_KEEP;
+        ebx = (ebx & LEAF1_EBX_KEEP) | LEAF1_EBX_ONE_CPU | ((apic_id & 0xFF) << LEAF1_EBX_APIC_ID_SHIFT);
+        ecx = (ecx & LEAF1_ECX_KEEP) | apic_ecx;
+        edx = (edx & LEAF1_EDX_KEEP) | apic_edx;
     } else if leaf == LEAF_CACHE {
         eax &= LEAF4_EAX_KEEP;
+    } else if leaf == LEAF_POWER && apic {
+        eax |= LEAF6_EAX_ARAT;
+    } else if leaf == LEAF_TSC && apic {
+        /* The host's TSC, from the host's own leaf: crystal times ratio.
+         * Blank when the host does not say -- the guest then measures. */
+        let tsc_khz = (u64::from(ecx) * u64::from(ebx)).checked_div(u64::from(eax)).unwrap_or(0) / 1000;
+        return match u32::try_from(tsc_khz) {
+            Ok(khz) if khz != 0 => Cpuid { eax: LEAF15_DENOMINATOR_KHZ, ebx: khz, ecx: LEAF15_CRYSTAL_HZ, edx: 0 },
+            _ => Cpuid { eax: 0, ebx: 0, ecx: 0, edx: 0 },
+        };
     } else if leaf == LEAF_EXT_FEATURES {
         ecx &= EXT1_ECX_KEEP;
-        edx &= EXT1_EDX_KEEP;
+        edx = (edx & EXT1_EDX_KEEP) | apic_edx;
     } else if leaf == LEAF_EXT_ADDRESS {
         ebx &= !EXT8_EBX_CLEAR;
         ecx = 0;
@@ -207,6 +253,11 @@ const EFER_LMA: u64 = 1 << 10;
 /// The bit the CPU keeps set once long mode is active: the guest never
 /// clears it while it runs 64-bit code, and it is part of its EFER.
 const EFER_SVME: u64 = 1 << 12;
+/// Long mode enable: fixed while paging is on -- the CPU faults a write that
+/// changes it then, and a guest let change it would be one whose EFER says
+/// long mode and whose CPU is not in it, which `vmrun` and VT-x both refuse.
+const EFER_LME: u64 = 1 << 8;
+const CR0_PG: u64 = 1 << 31;
 
 /// What a guest read from MSR `msr`, and whether the read is allowed: `None`
 /// means inject a #GP, which is what a real CPU does for a reserved MSR and
@@ -241,6 +292,10 @@ pub fn wrmsr(save: &mut Save, msr: u32, value: u64) -> bool {
         MSR_EFER => {
             if value & !EFER_GUEST_MASK != 0 {
                 /* A bit the guest may not set -- SVME, or a reserved one. */
+                return false;
+            }
+            if save.cr0 & CR0_PG != 0 && (value ^ save.efer) & EFER_LME != 0 {
+                /* LME changed with paging on: the #GP the CPU gives. */
                 return false;
             }
             /* SVME stays set, since the guest runs under SVM whether it

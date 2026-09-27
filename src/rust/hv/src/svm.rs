@@ -26,6 +26,7 @@ pub const CR0_CD: u64 = 1 << 30;
 pub const CR0_PG: u64 = 1 << 31;
 pub const CR4_PAE: u64 = 1 << 5;
 pub const CR4_MCE: u64 = 1 << 6;
+pub const CR4_PCIDE: u64 = 1 << 17;
 pub const EFER_LME: u64 = 1 << 8;
 pub const EFER_LMA: u64 = 1 << 10;
 pub const EFER_SVME: u64 = 1 << 12;
@@ -42,6 +43,8 @@ pub const PAT_RESET: u64 = 0x0007_0406_0007_0406;
 const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
 const DR6_RESET: u64 = 0xFFFF_0FF0;
 const DR7_RESET: u64 = 0x400;
+/// A real-mode segment's limit: 64 KiB.
+const REAL_MODE_LIMIT: u32 = 0xFFFF;
 
 /// Lengths of the instructions an intercept stops a guest at, for a CPU
 /// without next-RIP save: each intercept is for exactly one instruction, so
@@ -52,6 +55,12 @@ const LEN_CPUID: u64 = 2;
 const LEN_MSR: u64 = 2;
 const LEN_VMMCALL: u64 = 3;
 const LEN_WBINVD: u64 = 2;
+/// PAUSE is `F3 90`, REP NOP.
+const LEN_PAUSE: u64 = 2;
+/// With the pause filter, how many PAUSEs in a row a guest runs before its
+/// PAUSE intercept is taken: a spin a few microseconds long, where every
+/// PAUSE stopping it would cost a spinlock's waiter an exit for each look.
+const PAUSE_FILTER_COUNT: u16 = 128;
 
 /// A port access that stopped the guest.
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +97,9 @@ pub enum Exit {
     /// The guest reached a point where it could take a virtual interrupt --
     /// the interrupt window this hypervisor asked for (`request_irq_window`).
     IrqWindow,
+    /// The guest may be able to take an NMI now: VT-x's NMI window, or on
+    /// AMD-V the IRET that ends the guest's NMI handler.
+    NmiWindow,
     /// The guest touched a guest physical address with no memory behind it
     /// -- or with memory it may not use that way.
     NestedFault { gpa: u64, error: u64 },
@@ -105,7 +117,74 @@ pub enum Exit {
     /// there, since the real CR8 is the host's; AMD-V gives the guest a
     /// shadow of its own and never exits.
     Cr8 { write: bool, gpr: u8 },
+    /// A `mov` to CR0, or an `lmsw`, that changes a bit VT-x keeps for the
+    /// host -- PG, PE, NE -- with `value` what CR0 would become (the whole
+    /// register named, or for `lmsw` its low four bits over CR0's). AMD-V
+    /// intercepts no CR0 write, and never exits for one.
+    Cr0Write { value: u64 },
+    /// PAUSE -- the guest spin-waiting: stopped so that whatever it waits
+    /// for that the host hands over, a timer's tick above all, is handed
+    /// over now rather than at the host's next interrupt.
+    Pause,
     Other(u64),
+}
+
+/// The state INIT and a start-up IPI with `vector` leave a CPU in, into
+/// `s`: real mode at `vector` * 4 KiB, as both backends start one. `efer` is
+/// what EFER holds beside what the guest sets -- SVME, for AMD-V.
+pub fn real_mode(s: &mut vmcb::Save, vector: u8, efer: u64) {
+    let code = Segment {
+        selector: u16::from(vector) << 8,
+        attrib: attrib::P | attrib::S | attrib::CODE | attrib::WRITE_OR_READ | attrib::ACCESSED,
+        limit: REAL_MODE_LIMIT,
+        base: u64::from(vector) << 12,
+    };
+    let data = Segment {
+        selector: 0,
+        attrib: attrib::P | attrib::S | attrib::WRITE_OR_READ | attrib::ACCESSED,
+        limit: REAL_MODE_LIMIT,
+        base: 0,
+    };
+    s.cs = code;
+    s.ds = data;
+    s.es = data;
+    s.ss = data;
+    s.fs = data;
+    s.gs = data;
+    s.gdtr = Segment { limit: REAL_MODE_LIMIT, ..Segment::default() };
+    s.idtr = Segment { limit: REAL_MODE_LIMIT, ..Segment::default() };
+    s.ldtr = Segment { attrib: attrib::P | attrib::TYPE_LDT, limit: REAL_MODE_LIMIT, ..Segment::default() };
+    /* A busy TSS of the 32-bit kind: what reset leaves, and the one type VT-x
+     * takes for TR in every mode a guest can switch to without a new TR. */
+    s.tr = Segment { attrib: attrib::P | attrib::TYPE_TSS64_BUSY, limit: REAL_MODE_LIMIT, ..Segment::default() };
+    s.cpl = 0;
+    s.efer = efer;
+    s.cr0 = CR0_ET;
+    s.cr2 = 0;
+    s.cr3 = 0;
+    s.cr4 = 0;
+    s.dr6 = DR6_RESET;
+    s.dr7 = DR7_RESET;
+    s.rflags = RFLAGS_RESERVED_ONE;
+    s.rip = 0;
+    s.rsp = 0;
+    s.rax = 0;
+    s.star = 0;
+    s.lstar = 0;
+    s.cstar = 0;
+    s.sfmask = 0;
+    s.kernel_gs_base = 0;
+    s.sysenter_cs = 0;
+    s.sysenter_esp = 0;
+    s.sysenter_eip = 0;
+    s.g_pat = PAT_RESET;
+}
+
+/// The general-purpose registers out of reset: all 0 but EDX, which holds
+/// the processor's signature -- family, model and stepping, CPUID leaf 1's
+/// EAX -- as the guest's CPUID gives it.
+pub fn reset_regs() -> GuestRegs {
+    GuestRegs { rdx: u64::from(crate::policy::cpuid(1, 0, 0, true).eax), ..GuestRegs::default() }
 }
 
 /// Exceptions that push an error code, which an intercept of them leaves
@@ -122,6 +201,15 @@ pub struct Vcpu {
     perms: Permissions,
     /// The CPU writes the next instruction's address into the VMCB itself.
     nrip: bool,
+    /// The guest is in its NMI handler: one was injected, and the IRET that
+    /// ends the handler has not yet run. AMD-V keeps no such bit of the
+    /// guest's -- short of vNMI, which this does not use -- so this is it,
+    /// and the IRET intercept is what ends it, as KVM's does.
+    nmi_masked: bool,
+    /// Where the guest's IRET was when it stopped there: the NMI mask ends
+    /// once the guest is past it, at an exit where RIP is elsewhere -- the
+    /// intercept comes before the instruction runs.
+    iret_at: Option<u64>,
 }
 
 /// What a long-mode guest starts from: its page table, a GDT whose entries
@@ -151,17 +239,30 @@ impl Vcpu {
             hvarch::x86::Detail::Svm(svm) => svm.has(arch::NRIP_SAVE),
             _ => false,
         };
+        let filter = match &caps.detail {
+            hvarch::x86::Detail::Svm(svm) => svm.has(arch::PAUSE_FILTER),
+            _ => false,
+        };
         let mut guest = Guest::new()?;
         let c = &mut guest.vmcb_mut().control;
         use vmcb::intercept::{misc1, misc2};
+        /* PAUSE: a guest waiting in a spin loop for a tick of its timer is
+         * given it when it comes, not at the host's next interrupt, ten
+         * milliseconds on -- a kernel that measures one timer against
+         * another while it spins (Linux, its APIC timer against its PIT)
+         * sees them in step only then. After a run of them, where the CPU
+         * can filter; every one, where it cannot. */
         c.intercept_misc1 = misc1::CPUID | misc1::HLT | misc1::RDPMC | misc1::RSM
-            | misc1::TASK_SWITCH | misc1::FERR_FREEZE;
+            | misc1::TASK_SWITCH | misc1::FERR_FREEZE | misc1::PAUSE;
+        if filter {
+            c.pause_filter_count = PAUSE_FILTER_COUNT;
+        }
         c.intercept_misc2 = misc2::VMMCALL | misc2::RDTSCP | misc2::ICEBP | misc2::WBINVD
             | misc2::MONITOR | misc2::MWAIT | misc2::MWAIT_ARMED | misc2::XSETBV | misc2::RDPRU;
         c.intercept_exceptions = exceptions;
         /* No ASID: each entry is given one by the CPU it is on
          * (`Guest::run`). */
-        Ok(Self { guest, perms: Permissions::new()?, nrip })
+        Ok(Self { guest, perms: Permissions::new()?, nrip, nmi_masked: false, iret_at: None })
     }
 
     /// Enter the guest and come back at its next exit, decoded -- the whole
@@ -183,6 +284,21 @@ impl Vcpu {
             Err(NotRun::Flush { cpu }) => return Err(Refusal::Flush(cpu)),
         };
         self.requeue_event();
+        /* The NMI handler's IRET, stopped at on the way in, has run once the
+         * guest is anywhere else: NMIs are the guest's to take again. */
+        if let Some(at) = self.iret_at {
+            if self.save().rip != at {
+                self.iret_at = None;
+                self.nmi_masked = false;
+            }
+        }
+        if self.control().exit_code == vmcb::exit::IRET {
+            /* The end of the NMI handler, about to run: stopped at once, the
+             * intercept off, and the mask kept until the guest is past it. */
+            self.iret_at = Some(self.save().rip);
+            self.guest.vmcb_mut().control.intercept_misc1 &= !vmcb::intercept::misc1::IRET;
+            return Ok((Exit::NmiWindow, cpu));
+        }
         Ok((self.exit(), cpu))
     }
 
@@ -284,6 +400,64 @@ impl Vcpu {
         s.g_pat = PAT_RESET;
     }
 
+    /// Where INIT and then a start-up IPI with `vector` leave a CPU: real
+    /// mode at `vector` * 4 KiB, CS's selector `vector` * 256 and base the
+    /// page, every other segment and table at 0 with a 64 KiB limit, caching
+    /// on (firmware turned it on before the OS was loaded, and INIT leaves
+    /// it as it was), and nothing pending -- and under a fresh ASID, since
+    /// what it translated before its reset is nothing it may use now.
+    pub fn start_at_sipi(&mut self, vector: u8) {
+        real_mode(self.save_mut(), vector, EFER_SVME);
+        *self.regs_mut() = reset_regs();
+        self.init_reset();
+        self.guest.forget_asid();
+    }
+
+    /// What INIT clears beside the registers: an event waiting to be
+    /// injected, the interrupt shadow, a request for an interrupt window,
+    /// and the task priority, `V_TPR`.
+    pub fn init_reset(&mut self) {
+        use vmcb::{int_ctl, intercept};
+        let c = &mut self.guest.vmcb_mut().control;
+        c.event_inj = 0;
+        c.int_state = 0;
+        c.intercept_misc1 &= !(intercept::misc1::VINTR | intercept::misc1::IRET);
+        c.int_ctl &= !(int_ctl::V_IRQ | int_ctl::V_TPR_MASK);
+        self.nmi_masked = false;
+        self.iret_at = None;
+    }
+
+    /// Whether the guest can take an NMI now: not in its NMI handler, not in
+    /// an interrupt shadow, and no event already queued.
+    pub fn nmi_allowed(&self) -> bool {
+        let c = self.control();
+        !self.nmi_masked && c.int_state & vmcb::int_state::SHADOW == 0 && c.event_inj & vmcb::event::VALID == 0
+    }
+
+    /// Inject an NMI on the next entry, and hold the next off until the
+    /// handler's IRET has run -- which is intercepted to be seen.
+    pub fn inject_nmi(&mut self) {
+        use vmcb::{event, intercept};
+        const VECTOR_NMI: u64 = 2;
+        let c = &mut self.guest.vmcb_mut().control;
+        c.event_inj = event::VALID | event::TYPE_NMI | VECTOR_NMI;
+        c.intercept_misc1 |= intercept::misc1::IRET;
+        self.nmi_masked = true;
+        self.iret_at = None;
+    }
+
+    /// The guest's CR8, which `V_TPR` is: written by the guest's `mov` to
+    /// CR8 with no exit, under `V_INTR_MASKING`.
+    pub fn cr8(&self) -> u8 {
+        (self.control().int_ctl & vmcb::int_ctl::V_TPR_MASK) as u8 & 0xF
+    }
+
+    pub fn set_cr8(&mut self, value: u8) {
+        use vmcb::int_ctl;
+        let c = &mut self.guest.vmcb_mut().control;
+        c.int_ctl = (c.int_ctl & !int_ctl::V_TPR_MASK) | u32::from(value & 0xF);
+    }
+
     /// Why the guest stopped, from what `#vmexit` wrote.
     pub fn exit(&self) -> Exit {
         let c = self.control();
@@ -309,6 +483,7 @@ impl Vcpu {
                 })
             }
             vmcb::exit::HLT => Exit::Hlt,
+            vmcb::exit::PAUSE => Exit::Pause,
             vmcb::exit::CPUID => Exit::Cpuid,
             vmcb::exit::MSR => Exit::Msr { write: c.exit_info1 & 1 != 0 },
             vmcb::exit::VMMCALL => Exit::Hypercall,
@@ -397,6 +572,10 @@ impl Vcpu {
         self.skip(LEN_VMMCALL);
     }
 
+    pub fn skip_pause(&mut self) {
+        self.skip(LEN_PAUSE);
+    }
+
     /// Step past a WBINVD, which every x86 CPU has and a guest may run: the
     /// guest's caches are the host's, coherent, and with no device of its
     /// own doing DMA there is nothing its flush would be for. (WBNOINVD is the
@@ -444,10 +623,10 @@ impl Vcpu {
         use vmcb::{int_ctl, intercept};
         let c = &mut self.guest.vmcb_mut().control;
         c.intercept_misc1 |= intercept::misc1::VINTR;
-        /* V_IRQ with a priority the TPR does not mask (V_IGN_TPR), so the
-         * only thing holding it is the guest's IF -- which is what we want
-         * to be told about. */
-        c.int_ctl = (c.int_ctl & !int_ctl::V_TPR_MASK) | int_ctl::V_IRQ | int_ctl::V_IGN_TPR;
+        /* V_IRQ that the TPR does not mask (V_IGN_TPR), so the only thing
+         * holding it is the guest's IF -- which is what we want to be told
+         * about. V_TPR itself is the guest's CR8, and left as it is. */
+        c.int_ctl |= int_ctl::V_IRQ | int_ctl::V_IGN_TPR;
     }
 
     /// Take the interrupt-window request back once it is no longer needed.

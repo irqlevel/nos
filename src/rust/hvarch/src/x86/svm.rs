@@ -678,6 +678,15 @@ impl Guest {
         self.asid.map(|t| t.asid)
     }
 
+    /// Enter under a fresh ASID next time: the guest was reset -- its
+    /// control registers set by the policy rather than by instructions the
+    /// CPU ran, which would have flushed as they went -- and nothing it
+    /// translated under the old one is to be used. Always sound: an ASID
+    /// never handed out this generation has nothing in the TLB.
+    pub fn forget_asid(&mut self) {
+        self.asid = None;
+    }
+
     /// Flush the whole TLB on every entry from now on, or stop: always
     /// sound, since a flush takes nothing from a guest but time.
     pub fn set_flush_always(&mut self, on: bool) {

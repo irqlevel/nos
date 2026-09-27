@@ -2,10 +2,10 @@
 //! print its console and how it ended -- the one-shot form of `hv start`,
 //! which a gate can run from a script and read back whole.
 //!
-//! The guest is built from its files (`guest::build`) and run on a task of its
-//! own, bound to a CPU the extension is on for, until it stops for good -- a
-//! HLT with interrupts off, a triple fault, a touch of memory this hypervisor
-//! does not emulate -- or its time runs out.
+//! The guest is built from its files (`guest::build`) and its CPUs run each on
+//! a task of its own, bound to a CPU the extension is on for, until it stops
+//! for good -- every CPU halted with interrupts off, a triple fault, a touch
+//! of memory this hypervisor does not emulate -- or its time runs out.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -14,84 +14,87 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use hv::run::Host;
-use hv::Machine;
+use hv::{Doorbells, Machine};
 use kcore::cmd::Output;
 use kcore::consts::{MAX_CPUS, NS_PER_SEC};
-use kcore::sync::{Event, Mutex};
+use kcore::sync::Mutex;
 
 use crate::disk::{self, Runner, Wake};
 use crate::guest::{self, LogLine, Ring, Spec};
 
-const USAGE: &str = "hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]";
+const USAGE: &str = "hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]";
 /// How long the guest runs by default, and at most: a Linux boot under TCG,
 /// itself under this hypervisor, is very far from quick.
 const DEFAULT_SECS: u64 = 60;
 const MAX_SECS: u64 = 600;
 
-/// The console of a `hv boot` guest: kept whole for the report, streamed to
-/// the kernel log a line at a time -- so it is on nos's own console live, and
-/// on a machine whose only console is the network that is where a guest's
-/// boot is watched -- and typed at from `input=`.
-struct BootHost {
+/// What a `hv boot` guest's console is: kept whole for the report,
+/// streamed to the kernel log a line at a time -- so it is on nos's own
+/// console live, and on a machine whose only console is the network that
+/// is where a guest's boot is watched -- and typed at from `input=`.
+struct Console {
     ring: Ring,
     line: LogLine,
     input: Vec<u8>,
     fed: usize,
-    /// The module is going: stop now rather than at the end of `secs`, which
-    /// the unload would otherwise wait out.
+}
+
+/// What the guest's CPUs' tasks share of the boot: its console, and
+/// whether the module is going -- stop now rather than at the end of
+/// `secs`, which the unload would otherwise wait out.
+struct BootHost {
+    console: Mutex<Console>,
     unloading: Arc<AtomicBool>,
-    /// What its disks wake it by.
-    job: Arc<Boot>,
 }
 
 impl Host for BootHost {
-    fn output(&mut self, byte: u8) {
-        self.ring.push(byte);
-        if self.line.push(byte) {
-            kcore::trace!(0, "hvguest| {}", self.line.text());
-            self.line.clear();
+    fn output(&self, byte: u8) {
+        let mut c = self.console.lock();
+        c.ring.push(byte);
+        if c.line.push(byte) {
+            kcore::trace!(0, "hvguest| {}", c.line.text());
+            c.line.clear();
         }
     }
 
-    fn input(&mut self, at_prompt: bool) -> Option<u8> {
+    fn input(&self, at_prompt: bool) -> Option<u8> {
         if !at_prompt {
             return None;
         }
-        let byte = *self.input.get(self.fed)?;
-        self.fed += 1;
+        let mut c = self.console.lock();
+        let byte = *c.input.get(c.fed)?;
+        c.fed += 1;
         Some(byte)
     }
 
-    fn stop_requested(&mut self) -> bool {
+    fn stop_requested(&self) -> bool {
         self.unloading.load(Ordering::Acquire)
-    }
-
-    /// On the boot's event: a disk that has served something wakes it at
-    /// once; else the timer edge does.
-    fn halt_wait(&mut self, ns: u64) {
-        self.job.doorbell.wait_for(kcore::time::Duration::from_nanos(ns));
     }
 }
 
-/// The vCPU task's context: the guest to build and run, and where its verdict
-/// goes.
+/// The boot's context: the guest to build and run, where its CPUs run, and
+/// where its verdict goes.
 struct Boot {
     machine: Arc<Machine>,
     spec: Spec,
     report: Mutex<String>,
     unloading: Arc<AtomicBool>,
+    /// The host CPUs its CPUs run on, the first CPU's first -- the one this
+    /// task is bound to.
+    placement: Vec<u32>,
     /// Where the guest's disks are served.
     disk_cpu: u32,
-    /// What a halted vCPU waits on, and what has one in its guest leave it:
-    /// what a disk that has served something rings.
-    doorbell: Event,
-    kick: hv::Kick,
+    /// Each of its CPUs' doorbell: what a halted CPU waits on, and what has
+    /// one in its guest leave it -- the first's rung by a disk that has
+    /// served something.
+    doorbells: Arc<Doorbells>,
 }
 
 impl Wake for Boot {
     fn wake(&self) {
-        self.doorbell.signal();
-        self.kick.kick();
+        if let Some(d) = self.doorbells.get(0) {
+            d.ring();
+        }
     }
 }
 
@@ -106,8 +109,8 @@ impl Boot {
         }
         label.push_str("boot");
         let runner = Runner { wake: self.clone(), name: label, cpu: self.disk_cpu };
-        let mut guest = match guest::build(&self.machine, &self.spec, &runner) {
-            Ok(guest) => guest,
+        let built = match guest::build(&self.machine, &self.spec, &runner, self.doorbells.clone()) {
+            Ok(built) => built,
             Err(why) => {
                 let _ = writeln!(report, "hv: boot failed -- {}", why);
                 *self.report.lock() = report;
@@ -124,26 +127,45 @@ impl Boot {
             return;
         };
         input.extend_from_slice(&self.spec.input);
-        let mut host = BootHost { ring, line, input, fed: 0, unloading: self.unloading.clone(), job: self.clone() };
+        let Some(console) = Mutex::new(Console { ring, line, input, fed: 0 }) else {
+            let _ = writeln!(report, "hv: boot failed -- out of memory for its console");
+            *self.report.lock() = report;
+            return;
+        };
+        let host = Arc::new(BootHost { console, unloading: self.unloading.clone() });
 
-        let _ = writeln!(report, "hv: booting {} -- {} MiB, cmdline \"{}\"",
-                         self.spec.kernel, self.spec.mem_bytes / (1024 * 1024), self.spec.cmdline);
+        let _ = writeln!(report, "hv: booting {} -- {} MiB, {} cpu{}, cmdline \"{}\"",
+                         self.spec.kernel, self.spec.mem_bytes / (1024 * 1024), self.spec.cpus,
+                         if self.spec.cpus == 1 { "" } else { "s" }, self.spec.cmdline);
 
         let secs = self.spec.secs.unwrap_or(DEFAULT_SECS);
         let start = kcore::time::boot_time_ns();
-        /* No switch reaches an `hv boot` guest; its disks kick it. */
-        let (stop, counts) = guest.run(&self.machine, secs * NS_PER_SEC, &mut host, Some(&self.kick));
+        let deadline = start.saturating_add(secs * NS_PER_SEC);
+        let guest = Arc::new(built.guest);
+        /* No switch reaches an `hv boot` guest; its disks ring its first
+         * CPU. */
+        let ran = guest::run_cpus(&guest, built.cpus, &self.placement, &self.machine, deadline, &host, "boot");
         let run_ns = kcore::time::boot_time_ns().saturating_sub(start);
-        if !host.line.text().is_empty() {
-            kcore::trace!(0, "hvguest| {}", host.line.text());
+        let ran = match ran {
+            Ok(ran) => ran,
+            Err(why) => {
+                let _ = writeln!(report, "hv: boot failed -- {}", why);
+                *self.report.lock() = report;
+                return;
+            }
+        };
+        let console = host.console.lock();
+        if !console.line.text().is_empty() {
+            kcore::trace!(0, "hvguest| {}", console.line.text());
         }
 
-        if !host.input.is_empty() {
+        if !console.input.is_empty() {
             let _ = writeln!(report, "  input      {} of {} bytes taken by the guest (uart IER {:#04x})",
-                             host.fed, host.input.len(), guest.uart_ier());
+                             console.fed, console.input.len(), guest.uart_ier());
         }
-        write_console(&mut report, &host.ring);
-        guest::report(&mut report, &guest, &stop, &counts, run_ns);
+        write_console(&mut report, &console.ring);
+        drop(console);
+        guest::report(&mut report, &guest, &ran.stopped, &ran.counts, run_ns);
         *self.report.lock() = report;
     }
 }
@@ -166,8 +188,8 @@ fn write_console(report: &mut String, ring: &Ring) {
     let _ = writeln!(report, "  --- end ttyS0 ---");
 }
 
-/// `hv boot ...`: build the job, run it on a vCPU task of its own, and print
-/// what it reported.
+/// `hv boot ...`: build the job, run it on a vCPU task of its own -- and
+/// its other CPUs on tasks of theirs -- and print what it reported.
 pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloading: &Arc<AtomicBool>,
             out: &mut Output) {
     if let Err(e) = hv::run::ensure_runnable(machine) {
@@ -197,22 +219,16 @@ pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloadin
             return;
         }
     };
-    let cpu = match guest::pick_cpu(machine, spec.cpu, busy) {
-        Ok(cpu) => cpu,
+    let placement = match guest::pick_cpus(machine, spec.cpu, spec.cpus, busy) {
+        Ok(p) => p,
         Err(why) => {
             let _ = writeln!(out, "hv: {}", why);
             return;
         }
     };
+    let cpu = placement[0];
 
-    let report = match Mutex::new(String::new()) {
-        Some(report) => report,
-        None => {
-            let _ = writeln!(out, "hv: out of memory");
-            return;
-        }
-    };
-    let Some(doorbell) = Event::new() else {
+    let (Some(report), Some(doorbells)) = (Mutex::new(String::new()), Doorbells::new(spec.cpus as usize)) else {
         let _ = writeln!(out, "hv: out of memory");
         return;
     };
@@ -222,8 +238,8 @@ pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloadin
         report,
         unloading: unloading.clone(),
         disk_cpu: disk::disk_cpu(cpu, busy),
-        doorbell,
-        kick: hv::Kick::new(),
+        placement,
+        doorbells: Arc::new(doorbells),
     });
     /* On a task of its own, bound to that CPU, so a long boot does not sit
      * on the shell's stack; dropping the handle waits for it. */

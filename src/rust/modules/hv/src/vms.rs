@@ -2,14 +2,15 @@
 //! reach one while it runs -- `list`, `console`, `send`, `exec`, `wait`,
 //! `stop`.
 //!
-//! Each VM is its guest on a vCPU task of its own, bound to a CPU the
-//! extension is on for, and a [`Shared`] that task and the commands both hold:
-//! the console the guest writes to (the last 64 KiB of it), the input waiting
-//! to be typed at it, a stop flag, and the loop's counters as it last gave
-//! them. The guest itself -- its memory, its CPU, its devices -- belongs to
-//! the task alone, and is freed by the task when the guest stops; what is
-//! left of a stopped VM is its console and how it ended, until `hv stop`
-//! takes it off the list.
+//! Each VM is its guest on a task of its own -- the VM's, which runs its
+//! first CPU -- with a task for each of its other CPUs, each bound to a CPU
+//! the extension is on for, and a [`Shared`] those tasks and the commands
+//! all hold: the console the guest writes to (the last 64 KiB of it), the
+//! input waiting to be typed at it, a stop flag, each CPU's doorbell, and
+//! the loops' counters as they last gave them. The guest itself -- its
+//! memory, its CPUs, its devices -- belongs to the tasks alone, and is freed
+//! by the VM's when the guest stops; what is left of a stopped VM is its
+//! console and how it ended, until `hv stop` takes it off the list.
 //!
 //! The task lives as long as the VM does. A guest that stops leaves it parked
 //! on the VM's event, its memory given back, for `hv restart` to boot the
@@ -27,19 +28,19 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use hv::run::{Counts, Host, LinuxGuest, Stop};
-use hv::Machine;
+use hv::run::{Counts, Host};
+use hv::{Doorbells, Machine};
 use kcore::cmd::Output;
 use kcore::consts::{MAX_CPUS, NS_PER_MS, NS_PER_SEC};
-use kcore::sync::{Event, Mutex};
+use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 
 use crate::disk::{self, Runner, Wake};
-use crate::guest::{self, LogLine, NicSpec, Ring, Spec, TermFilter};
+use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
 
 const START_USAGE: &str =
-    "hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]";
+    "hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -89,18 +90,27 @@ struct Input {
     fed_at: u64,
 }
 
-/// What a VM's vCPU task and the commands that reach it share.
+/// What a guest CPU's loop last said it had counted.
+struct CpuStats {
+    exits: AtomicU64,
+    irq: AtomicU64,
+    hlt: AtomicU64,
+}
+
+/// What a VM's tasks and the commands that reach it share.
 pub struct Shared {
     id: u32,
     stop: AtomicBool,
     /// `hv restart`: boot the guest again -- the one running, or the one
     /// parked after it stopped.
     reset: AtomicBool,
-    /// What a parked task waits on: signalled with `stop` and with `reset`.
-    wake: Event,
-    /// What has the vCPU leave its guest when a frame comes for it while
-    /// it runs, rather than at the host's next interrupt.
-    kick: hv::Kick,
+    /// Each of its CPUs' doorbell: what that CPU's task waits on while the
+    /// CPU is halted, and what has it leave its guest when something comes
+    /// for it while it runs, rather than at the host's next interrupt. The
+    /// first CPU's is the one frames, disks and keys ring -- that CPU does
+    /// the devices' work -- and the one the VM's task waits on while the
+    /// guest is parked, rung with `stop` and with `reset`.
+    doorbells: Arc<Doorbells>,
     running: AtomicBool,
     /// How many times it has been booted again.
     restarts: AtomicU32,
@@ -117,10 +127,8 @@ pub struct Shared {
     /// How it ended, in a line and whole; empty while it runs.
     reason: Mutex<String>,
     report: Mutex<String>,
-    /// The loop's counters as it last reported them.
-    exits: AtomicU64,
-    irq: AtomicU64,
-    hlt: AtomicU64,
+    /// The loops' counters as they last reported them, a CPU each.
+    stats: Vec<CpuStats>,
     /// When its current boot began, and when it last stopped.
     boot_ns: AtomicU64,
     /// Where the console was when its current boot began: what `hv wait`
@@ -132,18 +140,22 @@ pub struct Shared {
 }
 
 impl Shared {
-    fn new(id: u32, log: bool, input: &[u8]) -> Option<Shared> {
+    fn new(id: u32, log: bool, input: &[u8], cpus: u32) -> Option<Shared> {
         let mut queue = VecDeque::new();
         queue.try_reserve_exact(INPUT_MAX).ok()?;
         /* `start` refused more than fits. */
         queue.extend(input.iter().take(INPUT_MAX));
         let queued = queue.len();
+        let mut stats = Vec::new();
+        stats.try_reserve_exact(cpus as usize).ok()?;
+        for _ in 0..cpus {
+            stats.push(CpuStats { exits: AtomicU64::new(0), irq: AtomicU64::new(0), hlt: AtomicU64::new(0) });
+        }
         Some(Shared {
             id,
             stop: AtomicBool::new(false),
             reset: AtomicBool::new(false),
-            wake: Event::new()?,
-            kick: hv::Kick::new(),
+            doorbells: Arc::new(Doorbells::new(cpus as usize)?),
             running: AtomicBool::new(true),
             restarts: AtomicU32::new(0),
             attached: AtomicU32::new(0),
@@ -153,9 +165,7 @@ impl Shared {
             pending: AtomicUsize::new(queued),
             reason: Mutex::new(String::new())?,
             report: Mutex::new(String::new())?,
-            exits: AtomicU64::new(0),
-            irq: AtomicU64::new(0),
-            hlt: AtomicU64::new(0),
+            stats,
             boot_ns: AtomicU64::new(kcore::time::boot_time_ns()),
             boot_at: AtomicU64::new(0),
             ended_ns: AtomicU64::new(0),
@@ -183,12 +193,26 @@ impl Shared {
     }
 
     /// Something waits for the guest -- a frame, what a disk served, handed
-    /// over before this: a halted vCPU's task is woken, a vCPU in its guest
-    /// kicked out of it to take it now. From any context, interrupts off
-    /// included.
+    /// over before this: the first CPU's -- which does the devices' work --
+    /// halted task is woken, or the CPU kicked out of its guest to take it
+    /// now. From any context, interrupts off included.
     pub(crate) fn wake_up(&self) {
-        self.wake.signal();
-        self.kick.kick();
+        if let Some(d) = self.doorbells.get(0) {
+            d.ring();
+        }
+    }
+
+    /// Every CPU's task woken, and every CPU out of its guest: for a stop
+    /// or a restart, which each has to see.
+    fn ring_all(&self) {
+        self.doorbells.ring_all();
+    }
+
+    /// The loops' counters, over every CPU: (exits, interrupts, halts).
+    fn totals(&self) -> (u64, u64, u64) {
+        self.stats.iter().fold((0, 0, 0), |(e, i, h), s| {
+            (e + s.exits.load(Ordering::Relaxed), i + s.irq.load(Ordering::Relaxed), h + s.hlt.load(Ordering::Relaxed))
+        })
     }
 
     /// Queue `bytes` to be typed at the guest, all of them or -- when they do
@@ -204,8 +228,11 @@ impl Shared {
         input.queue.extend(bytes.iter());
         input.queued += bytes.len() as u64;
         self.pending.fetch_add(bytes.len(), Ordering::Release);
-        /* A halted guest takes it now, not at its next timer edge. */
-        self.wake.signal();
+        /* A halted guest takes it now, not at its next timer edge: its
+         * first CPU feeds the console. */
+        if let Some(d) = self.doorbells.get(0) {
+            d.signal();
+        }
         Some(input.queued)
     }
 
@@ -250,32 +277,35 @@ impl Wake for Shared {
     }
 }
 
-/// The loop's side of a VM: the guest's console into the ring (and the kernel
-/// log, with `log`), what was typed out of the queue, the stop flag, and the
-/// counters out to where `hv list` reads them.
+/// The loops' side of a VM, which every CPU's task shares: the guest's
+/// console into the ring (and the kernel log, with `log`), what was typed
+/// out of the queue, the stop flag, and each CPU's counters out to where
+/// `hv list` reads them.
 struct VmHost {
     shared: Arc<Shared>,
     /// With `log`, the line of the console on its way to the kernel log.
-    line: Option<LogLine>,
+    line: Mutex<Option<LogLine>>,
     /// What the guest has written to its console: the ring's total, which
-    /// only this pushes to, kept here so that feeding a byte need not take
-    /// the ring's lock to learn it.
-    written: u64,
+    /// only `output` pushes to, kept here so that feeding a byte need not
+    /// take the ring's lock to learn it.
+    written: AtomicU64,
 }
 
 impl Host for VmHost {
-    fn output(&mut self, byte: u8) {
+    fn output(&self, byte: u8) {
         self.shared.console.lock().push(byte);
-        self.written += 1;
-        if let Some(line) = &mut self.line {
-            if line.push(byte) {
-                kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
-                line.clear();
+        self.written.fetch_add(1, Ordering::Relaxed);
+        if self.shared.log {
+            if let Some(line) = self.line.lock().as_mut() {
+                if line.push(byte) {
+                    kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
+                    line.clear();
+                }
             }
         }
     }
 
-    fn input(&mut self, at_prompt: bool) -> Option<u8> {
+    fn input(&self, at_prompt: bool) -> Option<u8> {
         if self.shared.pending.load(Ordering::Acquire) == 0 {
             return None;
         }
@@ -289,38 +319,47 @@ impl Host for VmHost {
         let mut input = self.shared.input.lock();
         let byte = input.queue.pop_front()?;
         input.fed += 1;
-        input.fed_at = self.written;
+        input.fed_at = self.written.load(Ordering::Relaxed);
         self.shared.pending.fetch_sub(1, Ordering::Release);
         Some(byte)
     }
 
-    fn stop_requested(&mut self) -> bool {
+    fn stop_requested(&self) -> bool {
         self.shared.stop.load(Ordering::Acquire) || self.shared.reset.load(Ordering::Acquire)
     }
 
-    /// On the VM's event: a frame for the guest, a key typed at it, a stop
-    /// or a restart wake it at once; else the timer edge does.
-    fn halt_wait(&mut self, ns: u64) {
-        self.shared.wake.wait_for(kcore::time::Duration::from_nanos(ns));
-    }
-
-    fn progress(&mut self, counts: &Counts) {
-        self.shared.exits.store(counts.exits, Ordering::Relaxed);
-        self.shared.irq.store(counts.irq, Ordering::Relaxed);
-        self.shared.hlt.store(counts.hlt, Ordering::Relaxed);
+    fn progress(&self, cpu: u32, counts: &Counts) {
+        if let Some(s) = self.shared.stats.get(cpu as usize) {
+            s.exits.store(counts.exits, Ordering::Relaxed);
+            s.irq.store(counts.irq + counts.apic, Ordering::Relaxed);
+            s.hlt.store(counts.hlt, Ordering::Relaxed);
+        }
     }
 }
 
-/// What a vCPU task starts from: the guest, the machine it runs on, what it
-/// shares with the commands, and the spec it was built from, to build it
-/// again. The guest is the task's alone from here.
+impl VmHost {
+    /// The line of the console not yet ended, to the kernel log: at the end
+    /// of a boot.
+    fn flush_line(&self) {
+        if let Some(line) = self.line.lock().as_mut().filter(|l| !l.text().is_empty()) {
+            kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
+            line.clear();
+        }
+    }
+}
+
+/// What a VM's task starts from: the guest, the machine it runs on, what it
+/// shares with the commands, the spec it was built from, to build it again,
+/// and the host CPUs its CPUs run on. The guest is the task's alone from
+/// here -- and its CPUs' tasks'.
 struct Start {
     shared: Arc<Shared>,
-    guest: LinuxGuest,
+    built: Built,
     machine: Arc<Machine>,
     spec: Spec,
     /// What its disks wake and where they are served, for every boot.
     runner: Runner,
+    placement: Vec<u32>,
 }
 
 /// How a `restart` guest's reboots are counted: `RESTART_BURST` in a
@@ -342,33 +381,39 @@ impl Burst {
     }
 }
 
-/// A VM's vCPU task, for as long as the VM is on the list: its guest until
-/// the guest stops or is stopped, then -- the guest's memory given back --
-/// booted again, or parked on the VM's event until a command asks for a
+/// A VM's task, for as long as the VM is on the list: its guest's first CPU
+/// -- the other CPUs on tasks it starts and waits for -- until the guest
+/// stops or is stopped, then -- the guest's memory given back -- booted
+/// again, or parked on the first CPU's doorbell until a command asks for a
 /// restart or the end.
 fn vcpu(start: Start) {
-    let Start { shared, guest, machine, spec, runner } = start;
+    let Start { shared, built, machine, spec, runner, placement } = start;
     let line = if shared.log { LogLine::new() } else { None };
     if shared.log && line.is_none() {
         kcore::trace!(0, "hv: vm {} logs nothing of its console: no memory for a line", shared.id);
     }
     /* One host for every boot: the console, and where it has got to, is the
      * VM's and not a boot's. */
-    let mut host = VmHost { shared: shared.clone(), line, written: 0 };
-    let mut guest = Some(guest);
+    let Some(line) = Mutex::new(line) else {
+        stopped(&shared, String::from("not started -- out of memory"), None, kcore::time::boot_time_ns());
+        return;
+    };
+    let host = Arc::new(VmHost { shared: shared.clone(), line, written: AtomicU64::new(0) });
+    let mut guest = Some(built);
     let mut burst = Burst { since: 0, count: 0 };
+    let Some(bell) = shared.doorbells.get(0) else { return };
 
     loop {
-        let Some(mut g) = guest.take() else {
+        let Some(built) = guest.take() else {
             /* Parked: nothing to run until a command says what next. The
              * flags are looked at before the wait, not only after: the
-             * signal a stop or a restart came with may have been taken
-             * already -- by a halted guest's wait, which the same event
+             * ring a stop or a restart came with may have been taken
+             * already -- by a halted guest's wait, which the same doorbell
              * ends -- and a park that waited for it would wait for good,
-             * and `hv stop` and the unload with it. A signal still there
+             * and `hv stop` and the unload with it. A ring still there
              * from while the guest ran finds nothing to do. */
             if !shared.stop.load(Ordering::Acquire) && !shared.reset.load(Ordering::Acquire) {
-                shared.wake.wait();
+                bell.wait_forever();
             }
             if shared.stop.load(Ordering::Acquire) {
                 break;
@@ -384,30 +429,44 @@ fn vcpu(start: Start) {
             continue;
         };
 
-        let (stop, counts) = g.run(&machine, u64::MAX, &mut host, Some(&shared.kick));
-        if let Some(line) = host.line.as_mut().filter(|l| !l.text().is_empty()) {
-            kcore::trace!(0, "hvvm{}| {}", shared.id, line.text());
-            line.clear();
-        }
-        host.progress(&counts);
+        let g = Arc::new(built.guest);
+        let mut name = String::new();
+        let _ = name.try_reserve(16);
+        let _ = write!(name, "vm{}", shared.id);
+        let ran = guest::run_cpus(&g, built.cpus, &placement, &machine, u64::MAX, &host, &name);
+        host.flush_line();
 
         let ended = kcore::time::boot_time_ns();
         let ran_ns = ended.saturating_sub(shared.boot_ns.load(Ordering::Relaxed));
         let mut reason = String::new();
         let mut report = String::new();
+        let ran = match ran {
+            Ok(ran) => ran,
+            Err(why) => {
+                let _ = write!(reason, "not run -- {}", why);
+                kcore::trace!(0, "hv: vm {} not run -- {}", shared.id, why);
+                drop(g);
+                stopped(&shared, reason, None, ended);
+                continue;
+            }
+        };
+        for (cpu, counts) in ran.counts.iter().enumerate() {
+            host.progress(cpu as u32, counts);
+        }
         if reason.try_reserve(REASON_BYTES).is_ok() && report.try_reserve(REPORT_BYTES).is_ok() {
-            let _ = guest::describe(&stop, &mut reason);
-            guest::report(&mut report, &g, &stop, &counts, ran_ns);
+            let _ = guest::describe(&ran.stopped.stop, &mut reason);
+            guest::report(&mut report, &g, &ran.stopped, &ran.counts, ran_ns);
         }
         kcore::trace!(0, "hv: vm {} stopped after {} ms -- {}", shared.id, ran_ns / NS_PER_MS, reason);
-        /* Its memory, its CPU and its devices go back before anything else
-         * is built: a reboot needs as much again. */
+        /* Its memory, its CPUs and its devices go back before anything else
+         * is built: a reboot needs as much again. Every CPU's task is done,
+         * so this is the last of the guest. */
         drop(g);
 
         /* What next: another boot -- asked for, or the guest's own reset
          * with `restart` -- or parked until a command says. */
         let asked = shared.reset.swap(false, Ordering::AcqRel);
-        let reset_itself = matches!(stop, Stop::Reset { .. } | Stop::Shutdown { .. });
+        let reset_itself = ran.stopped.stop.is_reset();
         let again = if shared.stop.load(Ordering::Acquire) {
             None
         } else if asked {
@@ -448,13 +507,13 @@ fn stopped(shared: &Shared, reason: String, report: Option<String>, ended: u64) 
 /// fails, say why and leave the VM stopped with `report`, the last boot's,
 /// when there is one to keep.
 fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, runner: &Runner, why: &str,
-          report: Option<String>) -> Option<LinuxGuest> {
+          report: Option<String>) -> Option<Built> {
     kcore::trace!(0, "hv: vm {} restarting -- {}", shared.id, why);
     /* The new boot's console starts here, before the build -- which is long
      * for a big guest under TCG -- so that `hv wait` meanwhile does not find
      * what the last boot printed. */
     shared.boot_at.store(shared.console_total(), Ordering::Release);
-    match guest::build(machine, spec, runner) {
+    match guest::build(machine, spec, runner, shared.doorbells.clone()) {
         Ok(g) => {
             shared.requeue(&spec.input);
             shared.boot_ns.store(kcore::time::boot_time_ns(), Ordering::Relaxed);
@@ -479,10 +538,11 @@ fn reboot(shared: &Shared, machine: &Machine, spec: &Spec, runner: &Runner, why:
 /// A VM as the table keeps it.
 struct Vm {
     shared: Arc<Shared>,
-    /// Its vCPU task, joined by `stop` -- taken out of the table first, and
+    /// Its task, joined by `stop` -- taken out of the table first, and
     /// dropped outside the lock, since dropping it waits.
     task: Option<TaskHandle>,
-    cpu: u32,
+    /// The host CPUs its CPUs run on, its first CPU's first.
+    cpus: Vec<u32>,
     kernel: String,
     mem_mib: u64,
     /// Its port on the switch, with `net`.
@@ -540,11 +600,11 @@ impl Drop for PortHold {
     }
 }
 
-/// Stop a VM taken off the table and wait for its vCPU task: the flag, then
-/// the join, which returns once the guest has stopped and been freed.
+/// Stop a VM taken off the table and wait for its task: the flag, then the
+/// join, which returns once the guest has stopped and been freed.
 fn finish(mut vm: Vm) {
     vm.shared.stop.store(true, Ordering::Release);
-    vm.shared.wake.signal();
+    vm.shared.ring_all();
     drop(vm.task.take());
 }
 
@@ -564,26 +624,31 @@ impl Vms {
         })
     }
 
-    /// How many running VMs each CPU has: what a new vCPU is placed by.
+    /// How many running VMs' CPUs each CPU has: what a new VM's CPUs are
+    /// placed by.
     pub fn load(&self) -> [u32; MAX_CPUS] {
         let mut load = [0u32; MAX_CPUS];
         for vm in &self.table.lock().vms {
             if vm.shared.running() {
-                if let Some(n) = load.get_mut(vm.cpu as usize) {
-                    *n += 1;
+                for &cpu in &vm.cpus {
+                    if let Some(n) = load.get_mut(cpu as usize) {
+                        *n += 1;
+                    }
                 }
             }
         }
         load
     }
 
-    /// A running VM on a CPU in `mask`, if there is one, and its CPU: what
-    /// `hv off` will not turn the extension off under.
+    /// A running VM with a CPU on a host CPU in `mask`, if there is one, and
+    /// that host CPU: what `hv off` will not turn the extension off under.
     pub fn running_on(&self, mask: u64) -> Option<(u32, u32)> {
         let table = self.table.lock();
         table.vms.iter()
-            .find(|vm| vm.shared.running() && vm.cpu < u64::BITS && mask & (1u64 << vm.cpu) != 0)
-            .map(|vm| (vm.shared.id, vm.cpu))
+            .filter(|vm| vm.shared.running())
+            .find_map(|vm| vm.cpus.iter()
+                .find(|&&cpu| cpu < u64::BITS && mask & (1u64 << cpu) != 0)
+                .map(|&cpu| (vm.shared.id, cpu)))
     }
 
     /// The VM `word` names.
@@ -614,13 +679,14 @@ impl Vms {
             }
         };
         let load = self.load();
-        let cpu = match guest::pick_cpu(machine, spec.cpu, &load) {
-            Ok(cpu) => cpu,
+        let placement = match guest::pick_cpus(machine, spec.cpu, spec.cpus, &load) {
+            Ok(p) => p,
             Err(why) => {
                 let _ = writeln!(out, "hv: {}", why);
                 return;
             }
         };
+        let cpu = placement[0];
         if spec.input.len() > INPUT_MAX {
             let _ = writeln!(out, "hv: input= is {} bytes, more than the {} a vm queues", spec.input.len(), INPUT_MAX);
             return;
@@ -642,7 +708,7 @@ impl Vms {
             core::mem::replace(&mut table.next, next)
         };
 
-        let shared = match Shared::new(id, spec.log, &spec.input) {
+        let shared = match Shared::new(id, spec.log, &spec.input, spec.cpus) {
             Some(shared) => Arc::new(shared),
             None => {
                 let _ = writeln!(out, "hv: vm {} not started -- out of memory for its console", id);
@@ -691,29 +757,42 @@ impl Vms {
 
         /* The files are read and the guest's memory filled here, with no lock
          * held: it takes as long as the kernel and the initrd take to read. */
-        let guest = match guest::build(machine, &spec, &runner) {
-            Ok(guest) => guest,
+        let built = match guest::build(machine, &spec, &runner, shared.doorbells.clone()) {
+            Ok(built) => built,
             Err(why) => {
                 let _ = writeln!(out, "hv: vm {} not started -- {}", id, why);
                 return;
             }
         };
+        let mut cpus = Vec::new();
+        if cpus.try_reserve_exact(placement.len()).is_err() {
+            let _ = writeln!(out, "hv: vm {} not started -- out of memory", id);
+            return;
+        }
+        cpus.extend_from_slice(&placement);
         let mem_mib = spec.mem_bytes / (1024 * 1024);
         let mut kernel = String::new();
         let mut name = String::new();
         let mut said = String::new();
+        let mut host_cpus = String::new();
         if kernel.try_reserve_exact(spec.kernel.len()).is_err() || name.try_reserve(16).is_err()
             || said.try_reserve(SAID_BYTES + spec.kernel.len() + spec.cmdline.len()).is_err()
+            || host_cpus.try_reserve(8 + 4 * placement.len()).is_err()
         {
             let _ = writeln!(out, "hv: vm {} not started -- out of memory", id);
             return;
         }
+        host_cpus.push_str(if placement.len() == 1 { "cpu " } else { "cpus " });
+        for (i, c) in placement.iter().enumerate() {
+            let _ = write!(host_cpus, "{}{}", if i == 0 { "" } else { "," }, c);
+        }
         kernel.push_str(&spec.kernel);
         let _ = write!(name, "hv/vm{}", id);
-        let _ = write!(said, "{}, {} MiB, cmdline \"{}\"{}", spec.kernel, mem_mib, spec.cmdline,
+        let _ = write!(said, "{}, {} MiB, {} cpu{}, cmdline \"{}\"{}", spec.kernel, mem_mib, spec.cpus,
+                       if spec.cpus == 1 { "" } else { "s" }, spec.cmdline,
                        if spec.restart { ", restarted when it resets" } else { "" });
 
-        let start = Start { shared: shared.clone(), guest, machine: machine.clone(), spec, runner };
+        let start = Start { shared: shared.clone(), built, machine: machine.clone(), spec, runner, placement };
         let task = match kcore::task::spawn_on_with(&name, 1u64 << cpu, start, vcpu) {
             Some(task) => task,
             None => {
@@ -725,7 +804,7 @@ impl Vms {
         };
 
         let port = hold.as_ref().map(|h| h.port);
-        let vm = Vm { shared, task: Some(task), cpu, kernel, mem_mib, port };
+        let vm = Vm { shared, task: Some(task), cpus, kernel, mem_mib, port };
         let refused = {
             let mut table = self.table.lock();
             if table.closing || table.vms.len() >= MAX_VMS {
@@ -747,7 +826,7 @@ impl Vms {
         if let Some(h) = hold.as_mut() {
             h.kept = true;
         }
-        let _ = writeln!(out, "hv: vm {} started on cpu {} -- {}", id, cpu, said);
+        let _ = writeln!(out, "hv: vm {} started on {} -- {}", id, host_cpus, said);
     }
 
     /// `hv list`.
@@ -762,8 +841,12 @@ impl Vms {
             let s = &vm.shared;
             let running = s.running();
             let until = if running { now } else { s.ended_ns.load(Ordering::Relaxed) };
-            let _ = write!(out, "vm {}  {}  cpu {}  {} MiB  {} s",
-                s.id, if running { "running" } else { "stopped" }, vm.cpu, vm.mem_mib,
+            let _ = write!(out, "vm {}  {}  cpu{} ", s.id, if running { "running" } else { "stopped" },
+                if vm.cpus.len() == 1 { "" } else { "s" });
+            for (i, c) in vm.cpus.iter().enumerate() {
+                let _ = write!(out, "{}{}", if i == 0 { "" } else { "," }, c);
+            }
+            let _ = write!(out, "  {} MiB  {} s", vm.mem_mib,
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);
             if let Some(port) = vm.port {
                 let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
@@ -776,9 +859,9 @@ impl Vms {
             if restarts != 0 {
                 let _ = write!(out, "  restarts {}", restarts);
             }
+            let (exits, irq, hlt) = s.totals();
             let _ = write!(out, "  exits {}  irq {}  hlt {}  kicks {}  {}",
-                s.exits.load(Ordering::Relaxed), s.irq.load(Ordering::Relaxed),
-                s.hlt.load(Ordering::Relaxed), s.kick.sent(), vm.kernel);
+                exits, irq, hlt, s.doorbells.kicks(), vm.kernel);
             if !running {
                 let _ = write!(out, "  -- {}", *s.reason.lock());
             }
@@ -1127,7 +1210,7 @@ impl Vms {
         };
         let before = shared.restarts.load(Ordering::Acquire);
         shared.reset.store(true, Ordering::Release);
-        shared.wake.signal();
+        shared.ring_all();
 
         let deadline = kcore::time::boot_time_ns().saturating_add(RESTART_WAIT_S * NS_PER_SEC);
         loop {
@@ -1189,7 +1272,7 @@ impl Vms {
          * one join at a time. */
         for vm in &self.table.lock().vms {
             vm.shared.stop.store(true, Ordering::Release);
-            vm.shared.wake.signal();
+            vm.shared.ring_all();
         }
         let mut stopped = 0usize;
         loop {

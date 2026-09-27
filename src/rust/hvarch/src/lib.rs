@@ -89,6 +89,9 @@ pub enum Error {
     Unmapped,
     /// Guest memory there already, or an address no nested table can hold.
     BadAddress,
+    /// VT-x without unrestricted guest: a guest CPU cannot run in real
+    /// mode, which is how every CPU but the first of a guest starts.
+    NoUnrestrictedGuest,
 }
 
 impl core::fmt::Display for Error {
@@ -104,6 +107,7 @@ impl core::fmt::Display for Error {
             Error::NotImplemented => "not implemented on this architecture",
             Error::Unmapped => "no guest memory at that address",
             Error::BadAddress => "not a guest physical address that can be given memory",
+            Error::NoUnrestrictedGuest => "VT-x without unrestricted guest cannot start a guest's other CPUs, which start in real mode",
         })
     }
 }
@@ -126,6 +130,7 @@ impl Error {
             Error::HostState => 8,
             Error::Unmapped => 9,
             Error::BadAddress => 10,
+            Error::NoUnrestrictedGuest => 11,
         }
     }
 
@@ -143,6 +148,7 @@ impl Error {
             8 => Error::HostState,
             9 => Error::Unmapped,
             10 => Error::BadAddress,
+            11 => Error::NoUnrestrictedGuest,
             _ => Error::EnableFailed,
         }
     }

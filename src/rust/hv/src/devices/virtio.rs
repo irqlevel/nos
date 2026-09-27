@@ -167,7 +167,7 @@ impl Queue {
 
     /// Give the chain at `head` back, `len` bytes of it written by the
     /// device: the element first, then the index that publishes it.
-    pub fn push(&mut self, mem: &mut GuestMemory, head: u16, len: u32) -> Result<(), Broken> {
+    pub fn push(&mut self, mem: &GuestMemory, head: u16, len: u32) -> Result<(), Broken> {
         let used = self.used_base();
         let slot = u64::from(self.next_used % self.size);
         let mut elem = [0u8; USED_ELEM_SIZE as usize];

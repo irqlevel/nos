@@ -69,9 +69,11 @@ hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]
                                    that many pages, and with the whole TLB flushed on
                                    every entry, as before ASIDs, when told; profile
                                    splits an entry into its parts
-hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
-                                   a Linux guest for secs, then its console and how it ended
-hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+                                   a Linux guest for secs, then its console and how it ended;
+                                   cpus gives it N CPUs, each on a host CPU of its own, the
+                                   first on cpu
+hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself
 hv list                            the started guests

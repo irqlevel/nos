@@ -33,11 +33,16 @@ KVM it is whatever the host CPU has):
     above 4 GiB and every register across a hypercall, a write past its
     memory stopped at the nested table, a triple fault that stops only the
     guest, a VMCB that breaks a rule refused with the rule named, a
-    `cli; jmp $` the host's interrupts get through and the host stops, and
+    `cli; jmp $` the host's interrupts get through and the host stops,
     three VMs on one CPU that each read their own page through the TLB --
     two taking turns, and a third given an ASID one of them had, after the
     flush that ended their generation (meaningful on a CPU that keeps
-    translations; TCG flushes on every entry)
+    translations; TCG flushes on every entry) -- and a guest of two CPUs,
+    each on a host CPU of its own, the first starting the second with INIT
+    and a start-up IPI into real mode, the second reaching long mode and
+    sending the first an IPI, and the first's APIC timer interrupting it.
+    Under TCG that last needs QEMU 9.2 or later, which puts a real-mode
+    guest through the nested page table; the test refuses an older one
   - a second `insmod`, a CPU that does not exist, a word that is not a
     subcommand and a guest that does not exist are each refused
   - `rmmod` with the extension on for every CPU turns it off for every CPU
@@ -121,6 +126,9 @@ GUESTS = {
     "spin": [r"stopped\s+by the host", r"interrupts got through [1-9]\d* times"],
     "tpr": [r"wrote 15 to its CR8 and read it back, the CPU keeping the shadow itself, and the host's CR8 is still 0"],
     "asid": [r"vm C was given ASID \d+, which vm [AB] had, after \d+ generation\(s\) ended, and read its own too"],
+    "smp": [r"cpu 1 started by INIT and a start-up IPI, came up in real mode and reached long mode",
+            r"its IPI reached cpu 0, whose one-shot APIC timer then ran out and interrupted it",
+            r"stopped\s+both CPUs halted with interrupts off"],
 }
 
 # Three of the guests test a mechanism only one vendor has: AMD-V's software
@@ -195,14 +203,38 @@ def host_has_vmx():
     return host_flag("vmx")
 
 
+def qemu_version(binary):
+    """QEMU's version, as a tuple of ints, or None when it will not say."""
+    try:
+        out = subprocess.run([binary, "--version"], capture_output=True, text=True).stdout
+    except OSError:
+        return None
+    m = re.search(r"version (\d+)\.(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+# The first TCG that puts the accesses of a guest with paging off through
+# its nested page table: before it, a real-mode guest's accesses go to the
+# host's own memory. The smp guest's second CPU starts in real mode, as
+# every CPU a start-up IPI starts does -- so under an older TCG it would run
+# out of nos's memory, and corrupt it.
+TCG_REAL_MODE = (9, 2)
+
+
 def x86(args):
     """nos.iso, with the whole script in /etc/rc: there is no remote shell
     on the ISO's command line, and a linear script needs none."""
+    kvm = os.path.exists("/dev/kvm") and not args.tcg and (host_has_svm() or host_has_vmx())
+    version = qemu_version("qemu-system-x86_64")
+    if not kvm and (version is None or version < TCG_REAL_MODE):
+        sys.exit("QEMU %s under TCG: the smp guest needs %d.%d or later, which puts a real-mode guest "
+                 "through the nested page table -- older, its second CPU would run out of nos's own memory"
+                 % (("%d.%d" % version if version else "of unknown version",) + TCG_REAL_MODE))
+
     tmp = tempfile.mkdtemp(prefix="nos-hv-")
     log = os.path.join(tmp, "serial.log")
     image = rootfs(tmp, "x86_64", SCRIPT)
 
-    kvm = os.path.exists("/dev/kvm") and not args.tcg and (host_has_svm() or host_has_vmx())
     ext = "the host's AMD-V" if host_has_svm() else "the host's Intel VT-x (nested)"
     print("accelerator: %s" % ("KVM, " + ext if kvm else "TCG, -cpu max (AMD-V)"))
     # -cpu max, not the default: qemu64 reports SVM without nested paging,
@@ -250,7 +282,10 @@ def check_all_guests(text, cpu, backend):
     for name, patterns in guests.items():
         report = guest_report(text, name)
         good = ("hv: guest %s ok" % name) in report and all(re.search(p, report) for p in patterns)
-        if name != "refused":
+        if name == "smp":
+            # Its first CPU there, its second on another CPU of its own.
+            good = good and re.search(r"ran on\s+cpu %d and (?!%d,)\d+," % (cpu, cpu), report) is not None
+        elif name != "refused":
             good = good and re.search(r"ran on\s+cpu %d," % cpu, report) is not None
         pt.check("  %s, on cpu %d" % (name, cpu), good, report or text)
 

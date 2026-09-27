@@ -30,15 +30,23 @@
 //!              address: two taking turns never read each other's, and the
 //!              third, given an ASID one of them had, reads its own too --
 //!              what a TLB entry left under a reused ASID would get wrong
+//!   smp        a guest of two CPUs, each a task on a host CPU of its own:
+//!              the first starts the second -- INIT and a start-up IPI, as
+//!              a kernel does -- which comes up in real mode, climbs to long
+//!              mode through protected mode, and sends the first an IPI;
+//!              then the first's local APIC timer interrupts it
 //!
 //! Every one starts in long mode with paging on, as a 64-bit Linux kernel
-//! is started. Not only because that is where a guest of this hypervisor is
-//! going: QEMU's TCG before 9.2 does not put the accesses of a guest with
-//! paging off through the nested table at all -- it takes a guest physical
-//! address for a host one -- so a real-mode guest there runs out of the
-//! host's memory, and a gate built on one would be testing the emulator.
+//! is started -- but for the second CPU of `smp`, which starts where a
+//! start-up IPI starts every CPU, in real mode. QEMU's TCG before 9.2 does
+//! not put the accesses of a guest with paging off through the nested table
+//! at all -- it takes a guest physical address for a host one -- so a
+//! real-mode guest there runs out of the host's memory: `smp`, like a Linux
+//! guest of more than one CPU, needs 9.2 or later under TCG (`hv-test.py`
+//! refuses an older one), and a CPU's own extension anywhere else.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use core::fmt::Write;
 
 use hvarch::Result;
@@ -46,6 +54,9 @@ use kcore::time;
 
 use crate::devices::Uart;
 use crate::machine::Machine;
+use crate::memory::GuestMemory;
+use crate::run::{Counts, GuestCpu, Host, LinuxGuest, Stop as GuestStop, Stopped};
+use crate::smp::Doorbells;
 use crate::svm::{Exit, LongMode};
 use crate::vm::{Refusal, Vm};
 
@@ -640,13 +651,17 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
-    GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
+    GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name)).chain(core::iter::once(SMP_NAME))
 }
 
-/// Run the built-in guest `name` on the CPU this is called on and say what
-/// it did. `None` when there is no such guest; otherwise whether it did
-/// what it was told.
-pub fn run_one(machine: &Machine, name: &str, out: &mut dyn Write) -> Option<bool> {
+/// Run the built-in guest `name` on the CPU this is called on -- and, for a
+/// guest of more than one CPU, its others on tasks of their own, on other
+/// CPUs the extension is on for -- and say what it did. `None` when there is
+/// no such guest; otherwise whether it did what it was told.
+pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Option<bool> {
+    if name == SMP_NAME {
+        return Some(run_smp(machine, out));
+    }
     if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
         return Some(run_several(machine, spec, out));
     }
@@ -700,6 +715,8 @@ fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
             out, "not entered -- cpu {} translates with five levels, and a nested table of four would be walked as five", cpu),
         Stop::Refused(Refusal::Flush(cpu)) => writeln!(
             out, "not entered -- cpu {} would not drop what it had cached through the nested table (INVEPT)", cpu),
+        Stop::Refused(Refusal::NotItsMemory) => writeln!(
+            out, "not entered -- the CPU was handed memory other than its guest's"),
         Stop::Invalid => writeln!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
         Stop::Unexpected { exit, rip } => writeln!(out, "an exit with no answer here: {:?} at {:#x}", exit, rip),
     };
@@ -718,6 +735,355 @@ fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
             false
         }
     }
+}
+
+/* The smp guest: two CPUs, the first put in long mode at `ENTRY` on the
+ * guests' machine (`board`'s tables, and a 32-bit code segment beside
+ * them), the second waiting for a start-up IPI, as every CPU but the first
+ * of a PC does. The first gives itself an IDT, sends the second INIT and two
+ * start-up IPIs for `SMP_AP_AT` -- the MP protocol's sequence, as Linux sends
+ * it -- and halts until the second's IPI comes; then sets its APIC timer
+ * running, one-shot, and halts until that interrupts it. The second comes up
+ * in real mode there, loads the GDT, turns on protected mode and then
+ * paging with EFER.LME -- long mode, over the first's page table -- and says
+ * who it is and sends its IPI. Each writes what its x2APIC and CPUID call
+ * it, and each ends halted with interrupts off: when both are, the guest has
+ * stopped, which is how it is found to be done. Each program is the output
+ * of `nasm -f bin`, `bits 64` and `org 0x8000` for the first, `bits 16` to
+ * `bits 64` and `org 0x9000` for the second. */
+const SMP_NAME: &str = "smp";
+const SMP_ABOUT: &str = "two CPUs: the first starts the second -- INIT and a start-up IPI, into real mode -- \
+                         which climbs to long mode and sends it an IPI; then its APIC timer";
+
+const SMP_BSP_CODE: &[u8] = &[
+    0xB9, 0x02, 0x08, 0x00, 0x00,                           // mov ecx, 0x802 ; x2APIC ID
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // mov [0x7000], eax
+    0xB8, 0x01, 0x00, 0x00, 0x00,                           // mov eax, 1
+    0x0F, 0xA2,                                             // cpuid
+    0xC1, 0xEB, 0x18,                                       // shr ebx, 24 ; CPUID's initial APIC ID
+    0x89, 0x1C, 0x25, 0x04, 0x70, 0x00, 0x00,               // mov [0x7004], ebx
+    0x48, 0x8D, 0x05, 0xC6, 0x00, 0x00, 0x00,               // lea rax, [rel ipi] ; gate 0x40: the AP's IPI
+    0xBF, 0x00, 0x64, 0x00, 0x00,                           // mov edi, 0x6400
+    0xE8, 0x96, 0x00, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0xC2, 0x00, 0x00, 0x00,               // lea rax, [rel tick] ; gate 0x41: the APIC timer
+    0xBF, 0x10, 0x64, 0x00, 0x00,                           // mov edi, 0x6410
+    0xE8, 0x85, 0x00, 0x00, 0x00,                           // call gate
+    0x0F, 0x01, 0x1D, 0xCF, 0x00, 0x00, 0x00,               // lidt [rel idtr]
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // mov ecx, 0x830 ; ICR, to APIC ID 1
+    0xBA, 0x01, 0x00, 0x00, 0x00,                           // mov edx, 1
+    0xB8, 0x00, 0x45, 0x00, 0x00,                           // mov eax, 0x4500 ; INIT, asserted
+    0x0F, 0x30,                                             // wrmsr
+    0xB8, 0x00, 0x85, 0x00, 0x00,                           // mov eax, 0x8500 ; INIT, de-asserted
+    0x0F, 0x30,                                             // wrmsr
+    0xB8, 0x09, 0x06, 0x00, 0x00,                           // mov eax, 0x0609 ; start-up at 0x9000
+    0x0F, 0x30,                                             // wrmsr
+    0x0F, 0x30,                                             // wrmsr ; and again, as the MP protocol has it
+    0xFB,                                                   // .ipi: sti
+    0xF4,                                                   // hlt
+    0xFA,                                                   // cli
+    0x83, 0x3C, 0x25, 0x10, 0x70, 0x00, 0x00, 0x00,         // cmp dword [0x7010], 0
+    0x74, 0xF3,                                             // je .ipi
+    0xB9, 0x3E, 0x08, 0x00, 0x00,                           // mov ecx, 0x83e ; timer divide: by 1
+    0x31, 0xD2,                                             // xor edx, edx
+    0xB8, 0x0B, 0x00, 0x00, 0x00,                           // mov eax, 0xb
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x32, 0x08, 0x00, 0x00,                           // mov ecx, 0x832 ; LVT timer: one-shot, vector 0x41
+    0xB8, 0x41, 0x00, 0x00, 0x00,                           // mov eax, 0x41
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x38, 0x08, 0x00, 0x00,                           // mov ecx, 0x838 ; initial count: 2 ms at 1 GHz
+    0xB8, 0x80, 0x84, 0x1E, 0x00,                           // mov eax, 2000000
+    0x0F, 0x30,                                             // wrmsr
+    0xFB,                                                   // .tick: sti
+    0xF4,                                                   // hlt
+    0xFA,                                                   // cli
+    0x83, 0x3C, 0x25, 0x14, 0x70, 0x00, 0x00, 0x00,         // cmp dword [0x7014], 0
+    0x74, 0xF3,                                             // je .tick
+    0xB9, 0x39, 0x08, 0x00, 0x00,                           // mov ecx, 0x839 ; current count: run out
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,               // mov [0x7018], eax
+    0xC7, 0x04, 0x25, 0x0C, 0x70, 0x00, 0x00, 0x42, 0x53, 0x50, 0x30,// mov dword [0x700c], 0x30505342 ; 'BSP0'
+    0xFA,                                                   // .dead: cli
+    0xF4,                                                   // hlt
+    0xEB, 0xFC,                                             // jmp .dead
+    0x66, 0x89, 0x07,                                       // gate: mov [rdi], ax ; an interrupt gate for the handler at rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // mov word [rdi + 4], 0x8e00
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // mov [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x89, 0x47, 0x08,                                       // mov [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // mov dword [rdi + 12], 0
+    0xC3,                                                   // ret
+    0xC7, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,// ipi: mov dword [0x7010], 1
+    0xEB, 0x0B,                                             // jmp eoi
+    0xC7, 0x04, 0x25, 0x14, 0x70, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,// tick: mov dword [0x7014], 1
+    0x50,                                                   // eoi: push rax
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB9, 0x0B, 0x08, 0x00, 0x00,                           // mov ecx, 0x80b ; EOI
+    0x31, 0xC0,                                             // xor eax, eax
+    0x31, 0xD2,                                             // xor edx, edx
+    0x0F, 0x30,                                             // wrmsr
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x1F, 0x04,                                             // idtr: dw 0x42 * 16 - 1
+    0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0x6000
+];
+
+const SMP_AP_CODE: &[u8] = &[
+    0xFA,                                                   // cli
+    0x31, 0xC0,                                             // xor ax, ax
+    0x8E, 0xD8,                                             // mov ds, ax
+    0x66, 0x0F, 0x01, 0x16, 0x97, 0x90,                     // o32 lgdt [gdtr]
+    0x0F, 0x20, 0xC0,                                       // mov eax, cr0
+    0x0C, 0x01,                                             // or al, 1 ; PE
+    0x0F, 0x22, 0xC0,                                       // mov cr0, eax
+    0x66, 0xEA, 0x1B, 0x90, 0x00, 0x00, 0x28, 0x00,         // jmp dword 0x28:ap32
+    0x66, 0xB8, 0x10, 0x00,                                 // mov ax, 0x10
+    0x8E, 0xD8,                                             // mov ds, ax
+    0x8E, 0xC0,                                             // mov es, ax
+    0x8E, 0xD0,                                             // mov ss, ax
+    0x0F, 0x20, 0xE0,                                       // mov eax, cr4
+    0x83, 0xC8, 0x20,                                       // or eax, 0x20 ; PAE
+    0x0F, 0x22, 0xE0,                                       // mov cr4, eax
+    0xB8, 0x00, 0x20, 0x00, 0x00,                           // mov eax, 0x2000 ; the BSP's PML4
+    0x0F, 0x22, 0xD8,                                       // mov cr3, eax
+    0xB9, 0x80, 0x00, 0x00, 0xC0,                           // mov ecx, 0xc0000080 ; EFER.LME
+    0x0F, 0x32,                                             // rdmsr
+    0x0D, 0x00, 0x01, 0x00, 0x00,                           // or eax, 0x100
+    0x0F, 0x30,                                             // wrmsr
+    0x0F, 0x20, 0xC0,                                       // mov eax, cr0
+    0x0D, 0x00, 0x00, 0x00, 0x80,                           // or eax, 0x80000000 ; PG: long mode
+    0x0F, 0x22, 0xC0,                                       // mov cr0, eax
+    0xEA, 0x56, 0x90, 0x00, 0x00, 0x08, 0x00,               // jmp 0x08:ap64
+    0xBC, 0x00, 0xE0, 0x00, 0x00,                           // mov rsp, 0xe000
+    0xB9, 0x02, 0x08, 0x00, 0x00,                           // mov ecx, 0x802 ; x2APIC ID
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x00, 0x71, 0x00, 0x00,               // mov [0x7100], eax
+    0xB8, 0x01, 0x00, 0x00, 0x00,                           // mov eax, 1
+    0x0F, 0xA2,                                             // cpuid
+    0xC1, 0xEB, 0x18,                                       // shr ebx, 24
+    0x89, 0x1C, 0x25, 0x04, 0x71, 0x00, 0x00,               // mov [0x7104], ebx
+    0xC7, 0x04, 0x25, 0x08, 0x71, 0x00, 0x00, 0x41, 0x50, 0x36, 0x34,// mov dword [0x7108], 0x34365041 ; 'AP64'
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // mov ecx, 0x830 ; an IPI to APIC ID 0, vector 0x40
+    0x31, 0xD2,                                             // xor edx, edx
+    0xB8, 0x40, 0x00, 0x00, 0x00,                           // mov eax, 0x40
+    0x0F, 0x30,                                             // wrmsr
+    0xFA,                                                   // .dead: cli
+    0xF4,                                                   // hlt
+    0xEB, 0xFC,                                             // jmp .dead
+    0x2F, 0x00,                                             // gdtr: dw 6 * 8 - 1
+    0x00, 0x10, 0x00, 0x00,                                 // dd 0x1000
+];
+
+/// Where the second CPU starts: the page of the start-up IPI's vector,
+/// 0x09 -- which `SMP_BSP_CODE` sends.
+const SMP_AP_AT: u64 = 0x9000;
+/// The 32-bit flat code segment the second CPU goes through on its way to
+/// long mode, at selector 0x28: after `board`'s null, code, data and TSS.
+const GDT_CODE32: u64 = 0x00CF_9B00_0000_FFFF;
+const SMP_GDT_ENTRIES: u64 = GDT_ENTRIES + 1;
+/* What each CPU leaves at `RESULTS`: the first its x2APIC ID and CPUID's
+ * APIC ID at +0 and +4, 'BSP0' at +0xC once done, 1 at +0x10 when the
+ * second's IPI came and at +0x14 when its timer ran out, and the timer's
+ * count after at +0x18; the second the same two IDs at +0x100 and +0x104,
+ * and 'AP64' at +0x108 once in long mode. */
+const SMP_BSP_ID: u64 = RESULTS;
+const SMP_BSP_CPUID: u64 = RESULTS + 0x4;
+const SMP_BSP_DONE: u64 = RESULTS + 0xC;
+const SMP_IPI: u64 = RESULTS + 0x10;
+const SMP_TICK: u64 = RESULTS + 0x14;
+const SMP_COUNT: u64 = RESULTS + 0x18;
+const SMP_AP_ID: u64 = RESULTS + 0x100;
+const SMP_AP_CPUID: u64 = RESULTS + 0x104;
+const SMP_AP_DONE: u64 = RESULTS + 0x108;
+const SMP_BSP_MARK: u32 = u32::from_le_bytes(*b"BSP0");
+const SMP_AP_MARK: u32 = u32::from_le_bytes(*b"AP64");
+/// IPIs the first CPU sends: INIT, its de-assert, and two start-up IPIs.
+const SMP_BSP_IPIS: u64 = 4;
+const SMP_BUDGET_MS: u64 = 10_000;
+
+/// The host a built-in guest's CPUs run under: no console input, nothing
+/// said, never a stop but its own.
+struct Quiet;
+
+impl Host for Quiet {
+    fn output(&self, _byte: u8) {}
+    fn input(&self, _at_prompt: bool) -> Option<u8> {
+        None
+    }
+    fn stop_requested(&self) -> bool {
+        false
+    }
+}
+
+/// The second CPU of the smp guest, on a task of its own.
+struct SmpAp {
+    guest: Arc<LinuxGuest>,
+    cpu: GuestCpu,
+    machine: Arc<Machine>,
+    deadline: u64,
+    counts: Arc<kcore::sync::Mutex<Counts>>,
+}
+
+fn smp_ap(run: SmpAp) {
+    let SmpAp { guest, mut cpu, machine, deadline, counts } = run;
+    let c = guest.run(&mut cpu, &machine, deadline, &Quiet);
+    *counts.lock() = c;
+    /* Its CPU goes in this task, before the guest: under VT-x the VMCS is
+     * cleared off its host CPU from task context. */
+    drop(cpu);
+}
+
+/// The guests' machine for the smp guest: `board`'s tables in memory it
+/// already has -- the guest's, made with it -- the 32-bit code segment
+/// beside them, both CPUs' code, and the first CPU in long mode at `ENTRY`.
+fn smp_board(m: &GuestMemory, bsp: &mut GuestCpu) -> Result<()> {
+    let tss_low = TSS_LIMIT | (TSS & 0xFF_FFFF) << 16 | TSS_BUSY_PRESENT << 40 | (TSS >> 24 & 0xFF) << 56;
+    let tss_high = TSS >> 32;
+    for (i, entry) in [0, GDT_CODE64, GDT_DATA, tss_low, tss_high, GDT_CODE32].iter().enumerate() {
+        m.write_obj(GDT + i as u64 * 8, entry)?;
+    }
+    m.write_obj(PML4, &(PDPT | PTE_P_W))?;
+    m.write_obj(PDPT, &(PD_LOW | PTE_P_W))?;
+    m.write_obj(PD_LOW, &(PTE_P_W | PTE_LARGE))?;
+    m.write(ENTRY, SMP_BSP_CODE)?;
+    m.write(SMP_AP_AT, SMP_AP_CODE)?;
+    bsp.backend_mut().long_mode(&LongMode {
+        entry: ENTRY,
+        stack: STACK,
+        cr3: PML4,
+        gdt: GDT,
+        gdt_limit: (SMP_GDT_ENTRIES * 8 - 1) as u16,
+        idt_limit: NO_IDT,
+        code_selector: 0x08,
+        data_selector: 0x10,
+        tss_selector: 0x18,
+        tss: TSS,
+    });
+    Ok(())
+}
+
+/// Run the smp guest: its first CPU on this task, its second on a task of
+/// its own on another CPU the extension is on for -- this one, when it is on
+/// for no other.
+fn run_smp(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", SMP_NAME, SMP_ABOUT);
+    let fail = |out: &mut dyn Write, why: &str| {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", SMP_NAME, why);
+        false
+    };
+    let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells)) {
+        Ok(made) => made,
+        Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
+    };
+    let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
+    let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
+    if let Err(e) = smp_board(guest.memory(), &mut bsp) {
+        return fail(out, &alloc::format!("could not be made: {}", e));
+    }
+    let guest = Arc::new(guest);
+    let Some(ap_counts) = kcore::sync::Mutex::new(Counts::default()) else { return fail(out, "out of memory") };
+    let ap_counts = Arc::new(ap_counts);
+
+    let here = kcore::cpu::id();
+    let enabled = machine.enabled_mask();
+    let ap_cpu = (0..u64::BITS).find(|&c| c != here && enabled & (1u64 << c) != 0).unwrap_or(here);
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(SMP_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let run = SmpAp { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, counts: ap_counts.clone() };
+    let Some(task) = kcore::task::spawn_on_with("hv/smp/cpu1", 1u64 << ap_cpu, run, smp_ap) else {
+        return fail(out, "no task for its second CPU");
+    };
+    let bsp_counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    drop(task);
+    drop(bsp);
+    let ns = time::boot_time_ns().saturating_sub(start);
+    let counts = [bsp_counts, *ap_counts.lock()];
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+
+    let states = guest.cpu_states();
+    if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", SMP_NAME, cpu);
+        return false;
+    }
+    let _ = write!(out, "  ran on     cpu");
+    for (i, (_, host)) in states.iter().enumerate() {
+        match host {
+            Some(h) => { let _ = write!(out, " {}{}", h, if i == 0 { " and" } else { "" }); }
+            None => { let _ = write!(out, " (cpu {} never entered)", i); }
+        }
+    }
+    let _ = writeln!(out, ", {} us", ns / kcore::consts::NS_PER_US);
+    let _ = writeln!(out, "  exits      cpu 0: {} ({} wrmsr, {} hlt, {} apic irq); cpu 1: {} ({} wrmsr, {} hlt)",
+                     counts[0].exits, counts[0].msr_write, counts[0].hlt, counts[0].apic,
+                     counts[1].exits, counts[1].msr_write, counts[1].hlt);
+    let mut says = String::new();
+    let _ = crate::guests::describe_stop(&stopped.stop, &mut says);
+    let _ = writeln!(out, "  stopped    {}", says);
+
+    match check_smp(guest.memory(), &stopped, &counts) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", SMP_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", SMP_NAME, why);
+            let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
+            let _ = out.write_str(&stopped.dump);
+            false
+        }
+    }
+}
+
+/// How a guest of the Linux runtime stopped, in a line.
+fn describe_stop(stop: &GuestStop, out: &mut dyn Write) -> core::fmt::Result {
+    match *stop {
+        GuestStop::Halted { rip } => write!(out, "both CPUs halted with interrupts off, the last at {:#x}", rip),
+        GuestStop::Budget => write!(out, "by the host, its {} ms up", SMP_BUDGET_MS),
+        other => write!(out, "{:?}", other),
+    }
+}
+
+fn check_smp(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2]) -> core::result::Result<String, String> {
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not stop with both CPUs halted"));
+    }
+    let word = |gpa: u64| m.read_obj::<u32>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    let (bsp_id, bsp_cpuid) = (word(SMP_BSP_ID)?, word(SMP_BSP_CPUID)?);
+    let (ap_id, ap_cpuid) = (word(SMP_AP_ID)?, word(SMP_AP_CPUID)?);
+    if word(SMP_AP_DONE)? != SMP_AP_MARK {
+        return Err(String::from("the second CPU never reached long mode"));
+    }
+    if (bsp_id, bsp_cpuid, ap_id, ap_cpuid) != (0, 0, 1, 1) {
+        return Err(alloc::format!("the CPUs call themselves {} (CPUID {}) and {} (CPUID {}), not 0 and 1",
+                                  bsp_id, bsp_cpuid, ap_id, ap_cpuid));
+    }
+    if word(SMP_IPI)? != 1 {
+        return Err(String::from("the second CPU's IPI never reached the first"));
+    }
+    if word(SMP_TICK)? != 1 || word(SMP_BSP_DONE)? != SMP_BSP_MARK {
+        return Err(String::from("the first CPU's APIC timer never interrupted it"));
+    }
+    let count = word(SMP_COUNT)?;
+    if count != 0 {
+        return Err(alloc::format!("the one-shot timer reads {} after it ran out, not 0", count));
+    }
+    if counts[1].started != 1 || counts[0].ipi_sent != SMP_BSP_IPIS || counts[1].ipi_sent != 1
+        || counts[0].ipi_taken != 1 || counts[0].timer != 1
+    {
+        return Err(alloc::format!(
+            "the counts are off: cpu 1 started {} times, sent {} IPIs; cpu 0 sent {}, took {}, its timer ran out {} times",
+            counts[1].started, counts[1].ipi_sent, counts[0].ipi_sent, counts[0].ipi_taken, counts[0].timer));
+    }
+    Ok(String::from("cpu 1 started by INIT and a start-up IPI, came up in real mode and reached long mode, \
+                     x2APIC ID 1 and CPUID's the same; its IPI reached cpu 0, whose one-shot APIC timer then ran out and interrupted it"))
 }
 
 /* The guests' machine: 1 MiB of memory with a GDT, a TSS and a page table

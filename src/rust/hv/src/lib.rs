@@ -19,19 +19,24 @@
 //! guest memory owns every page its nested table maps, and the machine
 //! never names a host save area that has been freed.
 //!
-//! What is here is the first two of the four steps
-//! [`plans/03-hypervisor.md`](../../../plans/03-hypervisor.md) lays out:
-//! the machine's extension, turned on for the CPUs that will run a guest and
-//! off again when the module is taken out; and a VM -- guest memory behind a
-//! nested page table, one CPU under AMD-V, the exits decoded -- that runs
-//! the built-in guests of [`guests`]. Intel's VMCS and Arm's EL2 come later,
-//! under the same names.
+//! What is here: the machine's extension, turned on for the CPUs that will
+//! run a guest and off again when the module is taken out; a VM -- guest
+//! memory behind a nested page table, a CPU under AMD-V or Intel VT-x, the
+//! exits decoded -- that runs the built-in guests of [`guests`]; and a PC
+//! for a Linux guest of one CPU or several ([`run`]), with the devices it
+//! boots with, a local APIC for each CPU ([`lapic`]), and what its CPUs
+//! reach each other by ([`smp`]). Arm's EL2 comes later, under the same
+//! names.
 
 extern crate alloc;
 
 mod machine;
 mod memory;
 mod devices;
+#[cfg(target_arch = "x86_64")]
+pub mod lapic;
+#[cfg(target_arch = "x86_64")]
+pub mod smp;
 #[cfg(target_arch = "x86_64")]
 mod npt;
 #[cfg(target_arch = "x86_64")]
@@ -61,6 +66,10 @@ pub use devices::net as nic;
 /// its guest and take it, rather than wait for the host's next interrupt.
 #[cfg(target_arch = "x86_64")]
 pub use hvarch::x86::svm::Kick;
+/// What wakes each CPU of a guest: its task out of a wait, its guest out of
+/// the CPU (`Kick`).
+#[cfg(target_arch = "x86_64")]
+pub use smp::{Doorbell, Doorbells, MAX_VCPUS};
 
 pub use hvarch::{Caps, Error, Ext, Result, Vendor};
 pub use machine::{Machine, Refused};
@@ -79,7 +88,7 @@ pub mod guests {
         core::iter::empty()
     }
 
-    pub fn run_one(_machine: &Machine, _name: &str, _out: &mut dyn Write) -> Option<bool> {
+    pub fn run_one(_machine: &alloc::sync::Arc<Machine>, _name: &str, _out: &mut dyn Write) -> Option<bool> {
         None
     }
 }

@@ -323,6 +323,9 @@ pub mod intercept {
         pub const RDPMC: u32 = 1 << 15;
         pub const CPUID: u32 = 1 << 18;
         pub const RSM: u32 = 1 << 19;
+        /// IRET: what ends a guest's NMI handler, which AMD-V has no bit
+        /// of the guest's to say (short of vNMI).
+        pub const IRET: u32 = 1 << 20;
         pub const INVD: u32 = 1 << 22;
         pub const PAUSE: u32 = 1 << 23;
         pub const HLT: u32 = 1 << 24;
@@ -419,6 +422,7 @@ pub mod exit {
     pub const RDPMC: u64 = 0x06F;
     pub const CPUID: u64 = 0x072;
     pub const RSM: u64 = 0x073;
+    pub const IRET: u64 = 0x074;
     pub const INVD: u64 = 0x076;
     pub const PAUSE: u64 = 0x077;
     pub const HLT: u64 = 0x078;
