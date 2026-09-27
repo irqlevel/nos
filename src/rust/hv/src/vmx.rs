@@ -17,7 +17,18 @@ use crate::vm::Refusal;
 
 /* Control-register and EFER bits a guest's starting state is made of. The
  * AMD side exports these; reuse them, since a guest's CR0 is a guest's CR0. */
-use crate::svm::{CR0_ET, CR0_MP, CR0_NE, CR0_PE, CR0_PG, CR0_WP, CR4_MCE, CR4_PAE, EFER_LMA, EFER_LME};
+use crate::svm::{
+    CR0_CD, CR0_ET, CR0_MP, CR0_NE, CR0_NW, CR0_PE, CR0_PG, CR0_WP, CR4_MCE, CR4_PAE, CR4_PCIDE,
+    EFER_LMA, EFER_LME,
+};
+
+/// CS's access rights as VMX keeps them: L, the 64-bit code bit, is bit 13.
+const AR_L: u32 = 1 << 13;
+/// CR0's architectural half: bits 63:32 are reserved, and a write setting
+/// one is a #GP.
+const CR0_LOW: u64 = 0xFFFF_FFFF;
+/// The CR0 bits LMSW loads: PE, MP, EM and TS.
+const LMSW_BITS: u64 = 0xF;
 
 /// Exit codes this decoder hands the run loop for instructions it does not
 /// answer itself, in the AMD-V namespace the loop already speaks -- so one
@@ -183,7 +194,8 @@ impl Vcpu {
         }
         use vmcs::reason as r;
         match reason & vmcs::reason::BASIC_MASK {
-            r::EXTERNAL_INTERRUPT | r::INIT | r::SIPI | r::NMI_WINDOW => Exit::Host,
+            r::EXTERNAL_INTERRUPT | r::INIT | r::SIPI => Exit::Host,
+            r::NMI_WINDOW => Exit::NmiWindow,
             r::EXCEPTION_NMI => {
                 let info = g.exit_intr_info();
                 if info & vmcs::intr::VALID == 0 {
@@ -214,25 +226,33 @@ impl Vcpu {
                 })
             }
             r::HLT => Exit::Hlt,
+            r::PAUSE => Exit::Pause,
             r::CPUID => Exit::Cpuid,
             r::RDMSR => Exit::Msr { write: false },
             r::WRMSR => Exit::Msr { write: true },
             r::VMCALL => Exit::Hypercall,
             r::INTERRUPT_WINDOW => Exit::IrqWindow,
             r::CR_ACCESS => {
-                /* CR8 alone is intercepted by choice; the other exit this
-                 * reason can be is a `mov` to CR4 setting VMXE, which the
-                 * guest was told it has not got, and which stops it. */
+                /* CR8, which is the host's; a `mov` to CR0 or an `lmsw`
+                 * changing a bit the host keeps of CR0 (`Guest::set_cr0`);
+                 * and the one other exit this reason can be, a `mov` to CR4
+                 * setting VMXE, which the guest was told it has not got,
+                 * and which stops it. */
                 let q = g.exit_qualification();
                 use vmcs::cr_access as cr;
                 let kind = q & cr::TYPE_MASK;
-                if q & cr::CR_MASK == 8 && (kind == cr::MOV_TO_CR || kind == cr::MOV_FROM_CR) {
-                    Exit::Cr8 {
-                        write: kind == cr::MOV_TO_CR,
-                        gpr: ((q & cr::GPR_MASK) >> cr::GPR_SHIFT) as u8,
+                let gpr = ((q & cr::GPR_MASK) >> cr::GPR_SHIFT) as u8;
+                match (q & cr::CR_MASK, kind) {
+                    (8, cr::MOV_TO_CR) | (8, cr::MOV_FROM_CR) => Exit::Cr8 { write: kind == cr::MOV_TO_CR, gpr },
+                    (0, cr::MOV_TO_CR) => Exit::Cr0Write { value: self.gpr(gpr) },
+                    (0, cr::LMSW) => {
+                        /* The low four bits over CR0's, and PE never cleared
+                         * by it: LMSW sets PE and cannot take it back. */
+                        let old = g.exit_cr0();
+                        let src = (q >> cr::LMSW_SOURCE_SHIFT) & LMSW_BITS;
+                        Exit::Cr0Write { value: (old & !LMSW_BITS) | src | (old & CR0_PE) }
                     }
-                } else {
-                    Exit::Other(r::CR_ACCESS as u64)
+                    _ => Exit::Other(r::CR_ACCESS as u64),
                 }
             }
             r::EPT_VIOLATION => {
@@ -325,6 +345,106 @@ impl Vcpu {
         self.skip();
     }
 
+    /// The guest's `mov` to CR0 or `lmsw` of `value`, which changes a bit
+    /// the host keeps (`Exit::Cr0Write`): checked as the CPU checks one --
+    /// a #GP, and the instruction not stepped past, for a value CR0 cannot
+    /// hold or a move between modes the architecture forbids -- and done:
+    /// long mode switched on or off with paging when EFER.LME asks, which
+    /// EFER.LMA and so the "IA-32e mode guest" entry control follow, and CR0
+    /// written at the next entry with what the TLB kept dropped, as the
+    /// instruction would have dropped it.
+    pub fn cr0_write(&mut self, value: u64) {
+        let g = &self.guest;
+        let old = g.exit_cr0();
+        let cr4 = g.exit_cr4();
+        let efer = g.save().efer;
+        let in_64bit = efer & EFER_LMA != 0 && g.exit_cs_ar() & AR_L != 0;
+        /* Outside 64-bit code a `mov` moves 32 bits. */
+        let value = if in_64bit { value } else { value & CR0_LOW };
+        let pg_on = value & CR0_PG != 0 && old & CR0_PG == 0;
+        let pg_off = value & CR0_PG == 0 && old & CR0_PG != 0;
+        let refused = value & !CR0_LOW != 0
+            || (value & CR0_NW != 0 && value & CR0_CD == 0)
+            || (value & CR0_PG != 0 && value & CR0_PE == 0)
+            || (pg_on && efer & EFER_LME != 0 && cr4 & CR4_PAE == 0)
+            /* Paging off from 64-bit code, or with PCIDs on. */
+            || (pg_off && (in_64bit || cr4 & CR4_PCIDE != 0));
+        if refused {
+            self.inject_gp();
+            return;
+        }
+        let mut efer = efer;
+        if pg_on && efer & EFER_LME != 0 {
+            efer |= EFER_LMA;
+        } else if pg_off {
+            efer &= !EFER_LMA;
+        }
+        self.guest.save_mut().efer = efer;
+        self.guest.set_cr0(value);
+        self.skip();
+    }
+
+    /// Where INIT and then a start-up IPI with `vector` leave a CPU: real
+    /// mode at `vector` * 4 KiB (`crate::svm::real_mode`), which VT-x runs
+    /// only as unrestricted guest -- `crate::run` refuses a guest of more
+    /// than one CPU on a CPU without it. The whole state goes into the VMCS
+    /// at the next entry, the "IA-32e mode guest" control off with EFER.LMA,
+    /// and what the TLB held under the guest's VPID is dropped.
+    pub fn start_at_sipi(&mut self, vector: u8) {
+        crate::svm::real_mode(self.guest.save_mut(), vector, 0);
+        *self.guest.regs_mut() = crate::svm::reset_regs();
+        self.init_reset();
+        self.guest.mark_full_sync();
+        self.guest.flush_tlb();
+    }
+
+    /// What INIT clears beside the registers: an event waiting to be
+    /// injected, the interrupt shadow, a request for an interrupt window,
+    /// and the task priority.
+    pub fn init_reset(&mut self) {
+        self.guest.clear_inject();
+        self.guest.set_interruptibility(0);
+        self.guest.set_irq_window(false);
+        self.guest.set_nmi_window(false);
+        self.tpr = 0;
+    }
+
+    /// Whether the guest can take an NMI now: its NMI blocking is its own
+    /// (virtual NMIs) and clear, it is in no interrupt shadow, and no event
+    /// is already queued.
+    pub fn nmi_allowed(&self) -> bool {
+        let blocked = vmcs::INTR_BLOCK_STI | vmcs::INTR_BLOCK_MOV_SS | vmcs::INTR_BLOCK_NMI;
+        self.guest.virtual_nmis() && self.guest.interruptibility() & blocked == 0 && !self.guest.inject_valid()
+    }
+
+    /// Inject an NMI on the next entry: the CPU blocks the next until the
+    /// guest's IRET.
+    pub fn inject_nmi(&mut self) {
+        const VECTOR_NMI: u32 = 2;
+        self.guest.set_inject(vmcs::intr::VALID | vmcs::intr::TYPE_NMI | VECTOR_NMI, 0);
+        self.guest.set_nmi_window(false);
+    }
+
+    /// Ask the CPU to exit as soon as the guest could take an NMI.
+    pub fn request_nmi_window(&mut self) {
+        self.guest.set_nmi_window(true);
+    }
+
+    /// Whether this CPU can run a guest in real mode: an application
+    /// processor, which a start-up IPI starts there.
+    pub fn unrestricted(&self) -> bool {
+        self.guest.unrestricted()
+    }
+
+    /// The guest's CR8, from the shadow its `mov`s are answered from.
+    pub fn cr8(&self) -> u8 {
+        self.tpr
+    }
+
+    pub fn set_cr8(&mut self, value: u8) {
+        self.tpr = value & TPR_MASK as u8;
+    }
+
     /// General-purpose register `n`, as the encoding numbers them.
     fn gpr(&self, n: u8) -> u64 {
         let s = self.guest.save();
@@ -382,14 +502,21 @@ impl Vcpu {
         let len = self.guest.exit_instr_len() as u64;
         let s = self.guest.save_mut();
         s.rip = s.rip.wrapping_add(len);
-        /* Out of any interrupt shadow the stepped instruction was in. */
-        self.guest.set_interruptibility(0);
+        self.leave_shadow();
     }
 
     pub fn skip_io(&mut self, io: &Io) {
         let s = self.guest.save_mut();
         s.rip = io.next_rip;
-        self.guest.set_interruptibility(0);
+        self.leave_shadow();
+    }
+
+    /// Out of any interrupt shadow the stepped instruction was in -- a STI's
+    /// or a MOV SS's -- and nothing else: an NMI handler the guest is in it
+    /// is in still.
+    fn leave_shadow(&mut self) {
+        let bits = self.guest.interruptibility() & !(vmcs::INTR_BLOCK_STI | vmcs::INTR_BLOCK_MOV_SS);
+        self.guest.set_interruptibility(bits);
     }
     pub fn skip_cpuid(&mut self) {
         self.skip();
@@ -398,6 +525,9 @@ impl Vcpu {
         self.skip();
     }
     pub fn skip_vmmcall(&mut self) {
+        self.skip();
+    }
+    pub fn skip_pause(&mut self) {
         self.skip();
     }
     pub fn skip_hlt(&mut self) {

@@ -28,6 +28,10 @@ pub enum Refusal {
     /// This CPU would not drop what it had cached through the guest's
     /// nested table before the guest's first entry there (VMX's INVEPT).
     Flush(u32),
+    /// The guest CPU was handed memory other than the memory it was made
+    /// for ([`Cpu::enter`]): the nested table its VMCB or VMCS names would
+    /// not be that memory's.
+    NotItsMemory,
 }
 
 /// One guest's CPU, of whichever kind the machine runs. Every method the run
@@ -83,6 +87,9 @@ impl Backend {
     pub fn skip_hlt(&mut self) {
         match self { Backend::Svm(v) => v.skip_hlt(), Backend::Vmx(v) => v.skip_hlt() }
     }
+    pub fn skip_pause(&mut self) {
+        match self { Backend::Svm(v) => v.skip_pause(), Backend::Vmx(v) => v.skip_pause() }
+    }
     pub fn skip_wbinvd(&mut self) {
         match self { Backend::Svm(v) => v.skip_wbinvd(), Backend::Vmx(v) => v.skip_wbinvd() }
     }
@@ -93,8 +100,55 @@ impl Backend {
     pub fn cr8_access(&mut self, write: bool, gpr: u8) {
         match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.cr8_access(write, gpr) }
     }
+    /// Whether the CPU can be run in real mode -- where a start-up IPI starts
+    /// one: AMD-V always, VT-x with unrestricted guest.
+    pub fn runs_real_mode(&self) -> bool {
+        match self { Backend::Svm(_) => true, Backend::Vmx(v) => v.unrestricted() }
+    }
+    /// Put the CPU where INIT and then a start-up IPI with `vector` leave
+    /// one: real mode, at `vector` * 4 KiB, everything else as after reset.
+    pub fn start_at_sipi(&mut self, vector: u8) {
+        match self { Backend::Svm(v) => v.start_at_sipi(vector), Backend::Vmx(v) => v.start_at_sipi(vector) }
+    }
+    /// What INIT clears of the CPU beside its registers: an event queued for
+    /// injection, an interrupt shadow, a request for an interrupt window,
+    /// and the task priority.
+    pub fn init_reset(&mut self) {
+        match self { Backend::Svm(v) => v.init_reset(), Backend::Vmx(v) => v.init_reset() }
+    }
+    /// The guest's CR8 -- its task priority, bits 7:4 of the local APIC's
+    /// TPR -- as it stands: AMD-V's `V_TPR`, which the guest writes without
+    /// an exit, or VT-x's shadow of it.
+    pub fn cr8(&self) -> u8 {
+        match self { Backend::Svm(v) => v.cr8(), Backend::Vmx(v) => v.cr8() }
+    }
+    /// Set it, for a write of the local APIC's TPR: the two are one register.
+    pub fn set_cr8(&mut self, value: u8) {
+        match self { Backend::Svm(v) => v.set_cr8(value), Backend::Vmx(v) => v.set_cr8(value) }
+    }
+    /// Answer the guest's `mov` to CR0 or `lmsw` ([`Exit::Cr0Write`]), which
+    /// only VT-x stops a guest at -- for the bits it keeps for itself: PG,
+    /// which switches long mode on or off with it, and PE and NE -- and step
+    /// past it; or give the guest the #GP a value CR0 cannot take is.
+    pub fn cr0_write(&mut self, value: u64) {
+        match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.cr0_write(value) }
+    }
     pub fn inject_extint(&mut self, vector: u8) {
         match self { Backend::Svm(v) => v.inject_extint(vector), Backend::Vmx(v) => v.inject_extint(vector) }
+    }
+    /// Whether the guest can take an NMI now: not in its handler for the
+    /// last, nor in an interrupt shadow, nor with an event already queued.
+    pub fn nmi_allowed(&self) -> bool {
+        match self { Backend::Svm(v) => v.nmi_allowed(), Backend::Vmx(v) => v.nmi_allowed() }
+    }
+    pub fn inject_nmi(&mut self) {
+        match self { Backend::Svm(v) => v.inject_nmi(), Backend::Vmx(v) => v.inject_nmi() }
+    }
+    /// Ask to be told when an NMI could be taken: VT-x's NMI window. AMD-V
+    /// is told by the IRET intercept already on while the guest is in its
+    /// handler, and otherwise at the next exit.
+    pub fn request_nmi_window(&mut self) {
+        match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.request_nmi_window() }
     }
     pub fn inject_ud(&mut self) {
         match self { Backend::Svm(v) => v.inject_ud(), Backend::Vmx(v) => v.inject_ud() }
@@ -131,25 +185,70 @@ impl Backend {
     }
 }
 
-/// One guest: its memory and its one CPU.
+/// One guest CPU: made for the memory of one guest, and entered with that
+/// memory and no other. The nested table its VMCB or VMCS names is that
+/// memory's -- VT-x takes the EPT pointer into the VMCS at the first entry
+/// and never looks again -- so a CPU entered with another guest's memory
+/// would run over a table that may since have been freed. [`Cpu::enter`]
+/// refuses that, so the pairing is kept by the type rather than by care.
+pub struct Cpu {
+    backend: Backend,
+    /// The identity of the nested table it was made for.
+    table: u64,
+}
+
+impl Cpu {
+    /// A CPU for the guest whose memory is `memory`, of whichever kind the
+    /// machine runs, in no state yet, that stops at `exceptions`.
+    pub fn new(machine: &Machine, memory: &GuestMemory, exceptions: u32) -> Result<Self> {
+        let caps = machine.caps();
+        let backend = match machine.ext()? {
+            Ext::Svm => Backend::Svm(crate::svm::Vcpu::new(caps, exceptions)?),
+            Ext::Vmx => Backend::Vmx(crate::vmx::Vcpu::new(caps, exceptions)?),
+        };
+        Ok(Self { backend, table: memory.nested().id })
+    }
+
+    pub fn backend(&self) -> &Backend {
+        &self.backend
+    }
+
+    pub fn backend_mut(&mut self) -> &mut Backend {
+        &mut self.backend
+    }
+
+    /// Run the guest on the CPU this is called on until it next stops, and
+    /// say why it did and which CPU it was. `memory` is the memory this CPU
+    /// was made for, and is borrowed for as long as the guest runs: the
+    /// pages its nested table maps stay the guest's until it has left. With
+    /// `kick`, the entry is the vCPU's in `Kick`'s sense, and one a kick
+    /// refused is `Exit::Kicked`.
+    pub fn enter(&mut self, memory: &GuestMemory, machine: &Machine, kick: Option<&Kick>)
+        -> core::result::Result<(Exit, u32), Refusal>
+    {
+        let nested = memory.nested();
+        if nested.id != self.table {
+            return Err(Refusal::NotItsMemory);
+        }
+        self.backend.enter(nested, machine.host_areas(), kick)
+    }
+}
+
+/// One guest: its memory and its one CPU -- what the built-in guests are.
+/// A guest of several CPUs shares its memory between them instead
+/// (`crate::run::LinuxGuest`), each a [`Cpu`] of its own.
 pub struct Vm {
     memory: GuestMemory,
-    vcpu: Backend,
+    cpu: Cpu,
 }
 
 impl Vm {
     /// An empty machine for a guest of whichever kind this machine runs: no
     /// memory yet, and a CPU in no state yet that stops at `exceptions`.
     pub fn new(machine: &Machine, exceptions: u32) -> Result<Self> {
-        let caps = machine.caps();
-        let vcpu = match machine.ext()? {
-            Ext::Svm => Backend::Svm(crate::svm::Vcpu::new(caps, exceptions)?),
-            Ext::Vmx => Backend::Vmx(crate::vmx::Vcpu::new(caps, exceptions)?),
-        };
-        Ok(Self {
-            memory: GuestMemory::new(caps.vendor())?,
-            vcpu,
-        })
+        let memory = GuestMemory::new(machine.caps().vendor())?;
+        let cpu = Cpu::new(machine, &memory, exceptions)?;
+        Ok(Self { memory, cpu })
     }
 
     pub fn memory(&self) -> &GuestMemory {
@@ -164,15 +263,15 @@ impl Vm {
     /// needs to know only where an instruction differs between the two, the
     /// hypercall (`vmcall` on Intel, `vmmcall` on AMD).
     pub fn is_vmx(&self) -> bool {
-        matches!(self.vcpu, Backend::Vmx(_))
+        matches!(self.cpu.backend, Backend::Vmx(_))
     }
 
     pub fn vcpu(&self) -> &Backend {
-        &self.vcpu
+        &self.cpu.backend
     }
 
     pub fn vcpu_mut(&mut self) -> &mut Backend {
-        &mut self.vcpu
+        &mut self.cpu.backend
     }
 
     /// Run the guest on the CPU this is called on until it next stops, and
@@ -181,7 +280,6 @@ impl Vm {
     pub fn enter(&mut self, machine: &Machine, kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
-        let nested = self.memory.nested();
-        self.vcpu.enter(nested, machine.host_areas(), kick)
+        self.cpu.enter(&self.memory, machine, kick)
     }
 }

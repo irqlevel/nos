@@ -217,6 +217,17 @@ bit in `boot64.asm`'s `enable_paging`, on the BSP and every AP, beside where
 it clears CD/NW after INIT. `hv info` now reads `host CR0/CR4 yes` on each.
 [`docs/hypervisor.md`](../docs/hypervisor.md) has the detail.
 
+And ahead of stage 4, the SMP guest this stage left out: `cpus=N` gives a
+Linux guest N CPUs, each a task on a host CPU of its own, with a local APIC
+each -- an x2APIC, as 3.5 asks, so still no instruction decoder -- found
+through an MP table, started by INIT and a start-up IPI into real mode, and
+reaching each other through lock-free mailboxes rung like a NIC's frames.
+Linux 6.6 and later bring every CPU up and pass every guest gate with two
+CPUs -- the lifecycle, disks, the network, attach -- and the lifecycle with
+four, under AMD-V and VT-x alike -- and keep their APIC timers on the AX41
+and on an Intel host, where QEMU's TCG is sometimes too slow for Linux to
+trust one ([`docs/hypervisor.md`](../docs/hypervisor.md#more-than-one-cpu)).
+
 ## Choose VMX vs SVM based on the dev environment
 
 This choice is driven by where you actually iterate:
@@ -282,7 +293,9 @@ differs. Picking one to start does not lock out the other.
 
 ### Explicitly out of scope for Stage 3
 Disk and network emulation (initramfs covers it), SMP guest (one vCPU), real
-mode, host-side virtio. All of that is Stage 4.
+mode, host-side virtio. All of that is Stage 4. (Disks, a network, SMP guests
+and the real mode their CPUs start in came early anyway; host-side virtio is
+still to come.)
 
 ## Design constraints that Stage 5 depends on (adopt now)
 

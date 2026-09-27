@@ -44,7 +44,7 @@ fn check_here(check: &Check<'_>) {
 }
 
 pub fn selftest() {
-    let Some(mut frame) = Frame::new() else {
+    let Some(frame) = Frame::new() else {
         panic!("frame selftest: no frame to test with");
     };
 

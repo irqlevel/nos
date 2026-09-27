@@ -314,6 +314,26 @@ The differences that are not hidden by the shadow at all:
   controls stop the guest at every CR8 access (`Exit::Cr8`), and the policy
   answers from a shadow TPR of the guest's own, a #GP for a value CR8 cannot
   hold. The `tpr` built-in guest checks both backends.
+- **CR0's PE and PG are the host's to watch.** Every entry checks that the
+  "IA-32e mode guest" control agrees with EFER.LMA and that CR0 is one VMX
+  allows, so a guest that turned paging off or on behind the host's back
+  would fail its next entry. So PE and PG are in CR0's guest/host mask,
+  with NE and the bits VMX fixes: a `mov` to CR0 or an `lmsw` that would
+  change one of them exits (`Exit::Cr0Write`), and the policy does what the
+  CPU would -- a #GP where the architecture has one, EFER.LMA set or
+  cleared as paging goes on or off with LME set, the entry control made to
+  follow at the next entry, and the translations cached under the guest's
+  VPID dropped. Every CPU a start-up IPI starts climbs from real mode this
+  way, which also takes *unrestricted guest*: a CPU without it runs guests
+  of one CPU only ([More than one CPU](#more-than-one-cpu)).
+- **An NMI waits for the guest's IRET.** One of a guest's CPUs can send
+  another an NMI, and a second must wait until the handler of the first
+  has returned. Under VT-x that is the "virtual NMIs" pin control: the
+  guest's NMI blocking is its own, set as one is injected and ended by its
+  IRET, and the NMI-window exit comes the moment a held one can go in.
+  AMD-V has no such control; it intercepts the IRET instead, whose exit
+  comes before the IRET has run, so the blocking ends once the guest's RIP
+  has moved past it -- what KVM does.
 - **The syscall MSRs are switched through load lists.** `STAR`, `LSTAR`,
   `CSTAR`, `FMASK` and `KERNEL_GS_BASE` are not VMCS fields, and a guest run
   with the host's would be catastrophic -- a userspace `SYSCALL` jumps to the
@@ -344,9 +364,11 @@ The differences that are not hidden by the shadow at all:
   is the one list). The rest of AMD-V's
   intercept set is controls too, since VT-x stops a guest at none of them
   unasked: CR8 (above), MONITOR, MWAIT and RDPMC, which CPUID says the guest
-  has not got and which run on the host's CPU otherwise, and WBINVD, which
+  has not got and which run on the host's CPU otherwise; WBINVD, which
   otherwise writes back and drops the package's whole shared cache -- every
-  core stalled for milliseconds -- as often as the guest cares to; CPUID,
+  core stalled for milliseconds -- as often as the guest cares to; and
+  PAUSE, so that a guest spinning comes out to be handed what is due to it
+  ([Time](#time)); CPUID,
   INVD, VMCALL, XSETBV and a triple fault exit unconditionally, and RDTSCP,
   INVPCID and XSAVES are `#UD` in the guest because the secondary controls
   that would enable them are off. Each control field is written through
@@ -403,13 +425,6 @@ stopped twice under VT-x and not at all under AMD-V.
 
 What the VMX backend does not do yet, and says so rather than pretends:
 
-- **A guest cannot leave long mode.** The "IA-32e mode guest" entry control
-  is fixed and CR0 is not intercepted, so a guest that clears CR0.PG --
-  `kexec`, a crash kernel, `reboot=bios` -- fails its next entry and stops as
-  `Invalid`. Every guest this loader starts is 64-bit from its first
-  instruction, and a Linux `reboot` goes through the 8042 or the reset
-  register first, which are caught before any mode change. The fix is KVM's:
-  CR0.PG in the guest/host mask, and the control toggled on the exit.
 - **Debug registers are not the guest's.** "Load debug controls" is off, so
   the guest's DR7 is not loaded at an entry, and every exit sets DR7 to
   0x400: a hardware breakpoint or watchpoint set in a guest (gdb, perf) is
@@ -426,10 +441,12 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
-                                load a Linux bzImage and run it on a vCPU for
-                                secs, then print its console and how it ended
-    hv start <bzImage> [mem=MiB] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+                                load a Linux bzImage and run it on a vCPU --
+                                on cpus of them, each on a host CPU of its
+                                own -- for secs, then print its console and
+                                how it ended
+    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -486,9 +503,11 @@ anything off, and a dropped guest's VMCS is current nowhere.
 ## A guest
 
 A VM is guest memory behind a nested page table, the permission maps it runs
-under, and one CPU (`hv::vm::Vm`). A guest's CPU is a task: `hv run` spawns
-one, bound to a CPU when asked, and waits for it, and the task enters the
-guest over and over from task context, handling each exit between entries.
+under, and one CPU (`hv::vm::Vm`) -- or, for a Linux guest, as many as it is
+given ([More than one CPU](#more-than-one-cpu)). A guest's CPU is a task:
+`hv run` spawns one, bound to a CPU when asked, and waits for it, and the
+task enters the guest over and over from task context, handling each exit
+between entries.
 
 ### Its memory
 
@@ -697,7 +716,9 @@ Each is a handful of instructions, assembled once with NASM and kept in
 its own and checked against what it was told to do. All start in long mode
 at CPL 0 with paging on, 1 MiB of memory with a GDT, a TSS and a page table
 in it that maps the first 2 MiB to themselves -- the second of them with no
-memory behind it -- and 1 GiB to guest physical 4 GiB:
+memory behind it -- and 1 GiB to guest physical 4 GiB; all but the second
+CPU of `smp`, which starts where a start-up IPI starts every CPU, in real
+mode:
 
 | Guest | Does | Shows |
 |---|---|---|
@@ -711,6 +732,7 @@ memory behind it -- and 1 GiB to guest physical 4 GiB:
 | `spin` | `cli; jmp $` | the host's interrupts still get through -- about a hundred a second -- and the host stops it when its 300 ms are up |
 | `tpr` | writes 15 to CR8 -- the task priority register, which masks every interrupt priority -- and reads it back | the guest gets a shadow TPR of its own (AMD-V's `V_TPR`; under VT-x a `mov cr8` stops the guest and is answered from one), and the host's CR8, read afterwards on the CPU the guest ran on, is still 0: a guest cannot hold the host's interrupts off its CPU |
 | `asid` | three VMs on one CPU read a page of their own at one address: two taking turns, and a third given an ASID one of them had | no guest reads another's page through the TLB, and a reused ASID is reused after a flush ([Address space identifiers](#address-space-identifiers)) |
+| `smp` | two CPUs, on two host CPUs: the first sends the second INIT and a start-up IPI; the second comes up in real mode at the vector's page, climbs through protected mode to long mode, writes down its x2APIC ID and CPUID's, and sends the first an IPI; the first, woken by it, arms its APIC timer for one shot and halts until it fires | an application processor started the way Linux starts one, an IPI between two CPUs, and the local APIC timer ([More than one CPU](#more-than-one-cpu)) |
 
 ```
 $ hv run all 3
@@ -733,7 +755,13 @@ hv: guest asid -- three VMs on one CPU, and none reads another's page through th
   exits      24 cpuid, 0 host interrupt
   checked    A and B each read their own page taking turns; vm C was given ASID 1, which vm A had, after 2 generation(s) ended, and read its own too
 hv: guest asid ok
-hv: 9 of 9 guests ok
+hv: guest smp -- two CPUs: the first starts the second -- INIT and a start-up IPI, into real mode -- which climbs to long mode and sends it an IPI; then its APIC timer
+  ran on     cpu 3 and 0, 18192 us
+  exits      cpu 0: 15 (9 wrmsr, 2 hlt, 2 apic irq); cpu 1: 6 (2 wrmsr, 0 hlt)
+  stopped    both CPUs halted with interrupts off, the last at 0x80c3
+  checked    cpu 1 started by INIT and a start-up IPI, came up in real mode and reached long mode, x2APIC ID 1 and CPUID's the same; its IPI reached cpu 0, whose one-shot APIC timer then ran out and interrupted it
+hv: guest smp ok
+hv: 11 of 11 guests ok
 ```
 
 A guest bound to a CPU the extension is not on for is not run, and says
@@ -961,17 +989,20 @@ Three things stand between that entry and a running kernel, and all three are
 here:
 
 - **A CPU cut down to what is emulated** (`hv::policy`). Every CPUID is the
-  host's, masked: no local APIC, no x2APIC, no XSAVE and so no AVX -- the
-  state switch around `vmrun` moves only the FXSAVE registers, so a guest is
-  given nothing it could put in the part that is not switched -- and no
-  paravirtualisation. And one CPU of its own, whichever host CPU its vCPU runs
-  on: leaf 1 says one logical CPU with APIC ID 0, leaves 4 and 0x80000008 one
-  core, and the topology leaves (0xB, 0x1F, 0x8000001E), the SVM leaf and the
-  memory-encryption leaf are blank. Every MSR is intercepted: the system MSRs (EFER, the
-  PAT, the segment bases, the SYSCALL and SYSENTER registers) are the guest's
-  own state and are served from the VMCB save area, and every other MSR reads
-  zero and swallows a write, which is what a guest's `rdmsr_safe` probes are
-  ready for.
+  host's, masked: no XSAVE and so no AVX -- the state switch around `vmrun`
+  moves only the FXSAVE registers, so a guest is given nothing it could put
+  in the part that is not switched -- no paravirtualisation, and for a guest
+  of one CPU no local APIC and no x2APIC (one of more has an emulated
+  x2APIC: [More than one CPU](#more-than-one-cpu)). Each of its CPUs is a
+  package of one, whichever host CPU its vCPU runs on: leaf 1 says one
+  logical CPU, with that CPU's APIC ID -- 0 for a guest of one -- leaves 4
+  and 0x80000008 one core, and the topology leaves (0xB, 0x1F, 0x8000001E),
+  the SVM leaf and the memory-encryption leaf are blank. Every MSR is
+  intercepted: the system MSRs (EFER, the PAT, the segment bases, the
+  SYSCALL and SYSENTER registers) are the guest's own state and are served
+  from the VMCB save area, the x2APIC's by the local APIC of a guest that
+  has one, and every other MSR reads zero and swallows a write, which is
+  what a guest's `rdmsr_safe` probes are ready for.
 - **The devices a guest cannot boot without** (`hv::devices`): the 8250
   serial port the console writes to (which raises IRQ4 for the transmitter,
   so the driver sends past its first byte); an 8254 PIT whose counter counts
@@ -982,7 +1013,8 @@ here:
   runs out in the one-shot modes 0 and 4, which a kernel's high-resolution
   timers drive a count at a time; an MC146818 RTC that answers the host's
   wall clock with the update bit clear; and a pair of 8259 PICs the guest
-  takes its interrupts from, since it runs with no local APIC.
+  takes its interrupts from -- every one of them, for a guest of one CPU,
+  which runs with no local APIC.
 - **The exit loop** (`hv::run`) that answers all of the above, injects the
   highest-priority interrupt the PIC has when the guest can take one (and
   asks the CPU, through SVM's virtual-interrupt window, to exit the moment it
@@ -1568,6 +1600,287 @@ gates](testing.md)): manual, since the images are downloads; `--internet`
 adds what needs the test machine's own way out, a name looked up and a
 mirror fetched from.
 
+## More than one CPU
+
+`cpus=N` on `hv boot` and `hv start` gives a guest N CPUs, up to 16. Each is
+a task of its own on a host CPU of its own: the first where `cpu=` says or
+the least loaded CPU the extension is on for, the others each on the least
+loaded that none of the guest's has yet (`pick_cpus`). Two CPUs of one guest
+never share a host CPU -- a guest CPU spinning while it waits for another
+would hold the host CPU the other needs to finish -- so a guest has at most
+as many CPUs as `hv on` has turned the extension on for.
+
+```
+$ hv boot /bzImage mem=256 secs=60 cpus=2 initrd=/initrd cmdline=earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check
+  --- ttyS0 ---
+[    0.000000] Linux version 6.18.54 ...
+[    0.000000] x2apic: enabled by BIOS, switching to x2apic ops
+[    0.000000] MPTABLE: APIC at: 0xFEE00000
+...
+[    0.004000] APIC: Switched APIC routing to: cluster x2apic
+...
+[    0.388000] smp: Bringing up secondary CPUs ...
+[    0.388000] smpboot: x86: Booting SMP configuration:
+[    0.412000] smp: Brought up 1 node, 2 CPUs
+...
+nos-guest: init is up, / on ramfs, BusyBox v1.30.1
+nos-guest: 2 cpus, online 0-1
+  --- end ttyS0 ---
+  stopped    by the host, its time up, after 60006 ms
+  ...
+  apic       30963 interrupts from the local APICs, 29663 of their timers; 1305 IPIs sent, 1300 taken
+  cpus       2, 1 started by the guest (1 INITs, 1 start-up IPIs taken)
+  cpu 0      60310 exits, 15477 apic irq, 679 ipi sent, 6593 hlt, slept 97% -- halted, on host cpu 3
+  cpu 1      31923 exits, 15486 apic irq, 626 ipi sent, 6629 hlt, slept 97% -- halted, on host cpu 2
+$ hv start /bzImage mem=256 cpus=2 initrd=/initrd cmdline=earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check
+hv: vm 0 started on cpus 3,2 -- /bzImage, 256 MiB, 2 cpus, cmdline "earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check"
+$ hv list
+vm 0  running  cpus 3,2  256 MiB  0 s  exits 0  irq 0  hlt 0  kicks 0  /bzImage
+$ hv exec 0 grep -e LOC -e RES -e CAL /proc/interrupts
+LOC:        266        223   Local timer interrupts
+RES:         11         15   Rescheduling interrupts
+CAL:        125        144   Function call interrupts
+```
+
+(A Linux 6.18 built for the gate -- `hv-linux-test.py --cpus 2` on the
+AX41, nested under KVM; its output trimmed. `noapic` goes on the command
+line by itself, below.)
+
+A guest of one CPU is given exactly the machine it always was -- no APIC in
+CPUID, no MP table, `nolapic` on its default command line -- so a kernel that
+booted before boots the same. What a guest of more is given, and how its CPUs
+run, is below. `hv::run` holds the loop and the platform, `hv::lapic` the
+local APIC, `hv::smp` the mailboxes and doorbells, and `hv::linux` the MP
+table.
+
+### The machine it sees
+
+**A local APIC for every CPU, and only as an x2APIC** (`hv::lapic`). The
+xAPIC is a page of MMIO at 0xFEE00000, and emulating MMIO means decoding the
+instruction that touched it -- the instruction emulator this hypervisor
+exists without ([the plan](../plans/03-hypervisor.md)'s rule). The x2APIC is
+the same registers as MSRs 0x800-0x8FF, and an MSR access is an exit whose
+register and value the CPU hands over. So the APIC comes out of reset with
+x2APIC mode already on, `IA32_APIC_BASE` saying EN and EXTD, as firmware
+leaves it on a machine with more than 255 CPUs, and a guest never has to
+touch the page. The nested table never maps it: a guest that reaches for it
+anyway, or turns x2APIC mode off to use it, is stopped and told why rather
+than answered wrongly. The boot CPU's APIC starts in virtual-wire mode, with
+the spurious-vector register enabled, LINT0 ExtINT and LINT1 NMI, as
+firmware hands it over. What the model has is the register file and what
+each register does to the others: the ID and the logical ID made from it
+(x2APIC cluster mode), the task and processor priorities, the in-service and
+request registers, EOI, the error register, the local vector table, the
+interrupt command register, and the timer (below). A write of the spurious
+register that turns the APIC off masks every LVT entry, as the silicon does.
+
+**An MP table** (`hv::linux`, spec 1.4) in the last kilobyte of low
+memory, at 0x9FC00, where the e820 map has ended RAM and where Linux looks:
+a processor entry for each CPU, the first marked the boot CPU; an ISA bus;
+an IO-APIC entry marked unusable; and the interrupt assignments -- each ISA
+IRQ but the cascade to its own pin, the 8259's ExtINT to LINT0 of the first
+CPU, and NMI to LINT1 of every CPU. Without the assignments Linux complains
+of a BIOS bug and makes up its own. ACPI stays off: the MP table is the
+least a kernel finds its CPUs by.
+
+**No IO-APIC.** The 8259 pair stays wired to the first CPU's LINT0 in
+virtual-wire mode, so every device interrupt -- the PIT's tick, the serial
+port's, the disks' and the NICs' -- is the first CPU's, and its task does
+the devices' work between its guest's turns, as it did for a guest of one
+CPU. `noapic` is added to the command line when it is not there already.
+Without it, x86-64 Linux looks for an IO-APIC whatever the table says -- it
+ignores the table's `pic_mode` -- and on the way `setup_local_APIC` masks
+LINT0 on the boot CPU, and the 8259 is cut off from the only CPU it reaches.
+
+**CPUID.** Leaf 1 says the local APIC is there, and the x2APIC, and gives
+each CPU its APIC ID in EBX[31:24]; leaf 6 says the timer keeps running in
+deep C-states (ARAT), which is true of one counted off the host's clock; and
+where the host's own leaf 0x15 gives its TSC's frequency -- an Intel host's
+does -- the guest's gives the timer's clock, a crystal of 1 GHz, and the
+TSC's ratio to it, so a kernel need not measure either. Passed through, the
+leaf would name the host's crystal, tens of MHz, and a kernel that took the
+timer's rate from it would have its timer fire tens of times too soon;
+where the host has no frequency to give, the leaf is blank and the kernel
+measures. The topology leaves stay blank, as for one CPU.
+
+**What it needs of the guest's kernel**: Linux 6.6 or later. Before 6.6, a
+kernel given an MP table and an x2APIC already on reads its APIC ID through
+the xAPIC's page before it switches to x2APIC operations
+(`register_lapic_address` -> `read_apic_id` -> `native_apic_mem_read`), and
+faults on the page the guest does not have -- a 5.15 kernel oopses there
+before its first line of SMP output. And `CONFIG_SMP`, `CONFIG_X86_X2APIC`
+(which needs `CONFIG_IRQ_REMAP` or `CONFIG_HYPERVISOR_GUEST`) and
+`CONFIG_X86_MPPARSE`. A distribution's kernel has all of them: Alpine's
+`virt` 6.18 brings up two CPUs as it ships. An older kernel still boots on
+one CPU.
+
+### Starting the others
+
+The first CPU starts at the kernel's 64-bit entry, as a guest of one CPU
+does. The others start the way a PC's do: waiting for a start-up IPI. INIT
+puts a CPU back in that state -- its registers the reset state's, anything
+it was about to be injected dropped, its local APIC reset -- and a start-up
+IPI starts one that waits, in real mode at the vector times 4 KiB, CS the
+vector shifted left by eight. A second start-up IPI finds the CPU running
+and is ignored, as the silicon ignores it: Linux sends two. From there
+Linux's trampoline climbs to long mode itself, through protected mode, PAE
+and paging, and joins the kernel.
+
+- **Under AMD-V** real mode needs nothing new: with nested paging the
+  CPU translates the guest's physical addresses through the nested table
+  whatever the guest's own paging is doing. A CPU that is started is given
+  a fresh ASID, so nothing translated for it before the reset is used.
+- **Under VT-x** real mode needs *unrestricted guest*, the secondary control
+  that lets a guest run with paging, or protection, off: a CPU without it
+  refuses a guest of more than one CPU (`NoUnrestrictedGuest`) rather than
+  starts one whose other CPUs could never start. And the climb is a guest
+  changing CR0.PE and CR0.PG, which VMX will not let a guest do behind the
+  host's back where the "IA-32e mode guest" entry control has to agree with
+  EFER.LMA. So PE and PG are in CR0's guest/host mask with NE, a `mov` to
+  CR0 or an `lmsw` that would change one of them exits (`Exit::Cr0Write`),
+  and the policy does what the CPU would: the checks that make it a #GP --
+  bits 63:32 set, NW without CD, PG without PE, paging on in long mode
+  without PAE, paging off from 64-bit code or with PCIDs on -- LMA set or
+  cleared as paging goes on or off with LME set, the entry control made to
+  follow at the next entry, and what the TLB holds under the guest's VPID
+  dropped, as the `mov` would drop it. That also lifts what the VMX
+  backend could not do before: a guest can leave long mode, the way
+  `kexec` does -- which nothing here has run yet.
+
+QEMU's TCG before 9.2 does not put the accesses of a guest with paging off
+through the nested table at all -- it takes a guest physical address for a
+host one -- so a CPU started in real mode there runs out of nos's own memory
+and corrupts it. `hv-test.py` and `hv-linux-test.py --cpus` refuse an older
+QEMU under TCG; KVM, and a CPU's own extension, have always done it right.
+
+### What the CPUs share, and how they reach each other
+
+Each CPU's own state -- its registers, its local APIC -- is its task's
+alone, and may be inside the CPU under a VMCB or a VMCS at any moment. What
+the CPUs share is guarded by what it is:
+
+- **Memory** is copied into and out of by every CPU at once, as the guest's
+  own CPUs write it: `GuestMemory`'s accessors take `&self`, and each copy
+  goes through the calling CPU's own slot with interrupts off
+  (`kcore::frame`), with no reference into a guest page anywhere. The
+  nested table is one for all of a guest's CPUs, and grows under a lock --
+  the read-only page answering a read of a device the platform does not
+  have (`map_absent`) is mapped once, whichever CPUs fault on it together.
+- **The devices** are one platform under one lock, taken for each port
+  access and for each round of the first CPU's device work.
+- **What one CPU sends another** -- a fixed interrupt, an NMI, an INIT, a
+  start-up IPI -- goes into the target's mailbox (`hv::smp`), lock-free: a
+  bitmap of the vectors sent and a word each for an NMI, an INIT and a
+  start-up IPI, taken whole by the target before it next enters. The
+  sender then rings the target's doorbell, which wakes its task if it
+  sleeps and, if it is in its guest, interrupts the host CPU it runs on so
+  that it leaves (the same `Kick` the switch uses for a frame).
+  The vCPU marks itself on its way in before its last look at the mailbox,
+  and a sender posts before it rings, so a message is either found by that
+  look or rings a vCPU that is in its guest or about to be.
+
+The interrupt command register sends to a physical or a logical
+destination -- a cluster and a bitmap of its CPUs, x2APIC's only logical
+mode -- or by shorthand, to itself, to all, or to all but itself; fixed and
+lowest-priority interrupts (the latter to the first CPU it names), NMIs,
+INIT and start-up IPIs. The first CPU takes interrupts from two places, the
+8259 through LINT0 and its own APIC, and when both have one they take turns,
+so that neither can keep the other out. The APIC's task priority is CR8's,
+under AMD-V through the VMCB's `V_TPR` and under VT-x through the CR8 exits
+that already kept the host's own CR8 out of the guest's reach.
+
+An NMI one CPU sends another needs NMI blocking to be the guest's own: set
+as the NMI is injected, ended by the guest's IRET, and the next one held
+until then. Under VT-x that is *virtual NMIs*, with the NMI-window exit to
+inject a held one the moment the guest's IRET unblocks it; under AMD-V it is
+the IRET intercept, whose exit comes before the IRET has run, so blocking
+ends once the guest's RIP has moved past it -- what KVM does.
+
+**Halting.** A CPU that halts with interrupts on is not entered again until
+an interrupt it can take is pending, its task asleep meanwhile, as for one
+CPU. A CPU halted with interrupts off, or waiting for a start-up IPI, can
+be woken only by another CPU. It sets its bit in a mask of such CPUs as it
+goes to wait -- and looks at its mailbox once more after, for mail that
+came meanwhile -- and clears the bit as it wakes, before it takes anything.
+So a set bit is a CPU that has sent nothing since it last found its mailbox
+empty, and a CPU whose own bit makes the mask every CPU's, and that then
+finds every mailbox empty and the mask still whole, knows nobody is left
+awake to send anybody anything: the guest has stopped -- `halted` in its
+report, as a guest of one CPU that runs `cli; hlt` is. The order is the
+point: with the bit cleared by whoever sent the mail instead, a CPU that
+took its mail before the sender got there would run with its bit set, and
+the last of the others to halt could stop a guest that is running.
+
+### Time
+
+Each local APIC has its timer: one-shot and periodic, counting down at a bus
+clock of 1 GHz -- KVM's, and one that makes a count nanoseconds -- with the
+divide configuration a guest writes. A periodic timer that fell behind is
+owed its periods, handed over one at a time as the guest takes each, a
+second's worth at most, as the PIT's channel 0 is. There is no TSC-deadline
+mode, and CPUID says so.
+
+A kernel measures the timer against the PIT before it trusts it
+(`calibrate_APIC_clock`), and while it measures it spins, `cpu_relax()` --
+PAUSE -- round a loop that watches the PIT's ticks go by. A spinning guest
+made no exit, so it left its guest only at the host's own tick, every 10 ms,
+and took the PIT's ticks owed since in a burst there: Linux counted ten
+ticks' worth of APIC timer as one tick, reported a bus of 10005 MHz where
+there is one of 1000, then saw its APIC timer run ten times too slow and
+refused it (`APIC timer disabled due to verification failure`, `jiffies
+delta = 1001`). So PAUSE exits now -- every one under VT-x (PAUSE exiting),
+under AMD-V every 128th where the CPU has a pause filter and every one where
+it has not -- and each exit goes round the loop that hands a tick over as it
+falls due. Measured on the AX41, the guest finds a bus of 999 MHz and keeps
+its timer (`jiffies delta = 100`, `jiffies result ok`). On an Intel host
+(an i5-13500, nested under KVM) exits are quick and even enough that the
+guest calibrates its TSC against the PIT as well, which the AX41's did
+not, and runs tickless on the TSC clocksource. A CPU spinning on
+a lock another of the guest's CPUs holds comes out the same way, and is
+handed its tick when it falls due rather than at the host's next one.
+
+Under TCG a guest can still refuse it. The check allows two ticks of 100,
+and a guest there is slow enough that the PIT's ticks owed from the lines it
+printed with interrupts off just before -- through a UART that is itself
+exits -- are still being handed over when the check starts: it counts 106.
+The kernel then keeps its PIT tick on the first CPU and broadcasts it to the
+others by IPI, which works, and costs an IPI a tick per CPU.
+
+### What it does not do yet
+
+- **Device interrupts reach the first CPU only.** There is no IO-APIC and no
+  MSI, so a disk's or a NIC's interrupt cannot be steered, and the first
+  CPU serves every device.
+- **A timer is as prompt as the host's tick.** Nothing on the host is set
+  for a guest timer's deadline -- `kcore::timer` is periodic, at the
+  host's tick -- so a CPU in its guest is handed a timer interrupt at its
+  next exit, and a CPU asleep is woken for one at the host's next tick
+  at worst. The owed periods keep the count right on average, and PAUSE
+  exits keep a spinning CPU prompt; a CPU computing with no exit at all
+  gets its ticks in bursts of up to 10 ms.
+- **No xAPIC, no TSC-deadline timer, no ACPI.** A kernel built without
+  `X86_MPPARSE` finds one CPU; one told `nox2apic` is stopped at the page.
+
+### Gates
+
+Both run under AMD-V -- QEMU's TCG, and nested KVM on the AX41 -- and under
+VT-x, nested KVM on an i5-13500, where the second CPU's climb from real mode
+is the two CR0 writes the policy emulates.
+
+- `scripts/hv-test.py` runs the built-in `smp` guest on the first and the
+  last CPU: two CPUs, the second started by INIT and a start-up IPI into
+  real mode, climbing to long mode and sending the first an IPI, whose
+  one-shot APIC timer then interrupts it. A run with the start-up IPI
+  ignored, and one with the timer never firing, both fail it.
+- `scripts/hv-linux-test.py --cpus N` boots a real Linux with N CPUs --
+  `smp: Brought up 1 node, N CPUs`, and the report's `N-1 started by the
+  guest` -- then runs the VM phase with them: every CPU online, each taking
+  its own local timer's interrupts, rescheduling IPIs between them, and
+  `hv list` naming the host CPU of each. `--disk`, `--disk --nvme-root`,
+  `--net` and `--attach` take `--cpus` too. The guest kernel needs what is
+  above, plus POSIX timers for BusyBox's `ping`, which paces itself with
+  `alarm()` (a tinyconfig leaves them out).
+
 ## On real hardware
 
 The AX41 (a Ryzen 5 3600, Zen 2) has the whole of AMD-V -- 32768 ASIDs,
@@ -1806,10 +2119,13 @@ is left, not in step order: the VMX backend with `CR0.NE` on every CPU.
 The TLB is no longer flushed whole on every entry ([Address space
 identifiers](#address-space-identifiers)), guests have disks and a network
 over legacy virtio ([A disk](#a-disk), [A network](#a-network)) with a way
-out through NAT ([The way out](#the-way-out-nat-dhcp-and-dns)), and a
-distribution boots as it ships ([A distribution](#a-distribution)). Beyond
-stage 3: a local APIC and an SMP guest, modern virtio, and the control
-plane's HTTP API (stage 4).
+out through NAT ([The way out](#the-way-out-nat-dhcp-and-dns)), a
+distribution boots as it ships ([A distribution](#a-distribution)), and a
+guest has as many CPUs as it is given, each with a local APIC ([More than
+one CPU](#more-than-one-cpu)) -- under AMD-V and VT-x both.
+Beyond stage 3: an IO-APIC or MSI so that a device's interrupts can reach
+any of a guest's CPUs, modern virtio, and the control plane's HTTP API
+(stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every

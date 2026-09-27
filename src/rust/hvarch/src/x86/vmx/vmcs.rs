@@ -182,9 +182,14 @@ pub const BASIC_TRUE_CTLS: u64 = 1 << 55;
 /* Pin-based controls. */
 pub const PIN_EXTINT_EXITING: u32 = 1 << 0;
 pub const PIN_NMI_EXITING: u32 = 1 << 3;
+/// The guest's NMI blocking is its own, and IRET in the guest ends it: what
+/// an NMI injected into a guest needs, and what the NMI-window exit needs.
+pub const PIN_VIRTUAL_NMIS: u32 = 1 << 5;
 
 /* Primary processor-based controls. */
 pub const PROC_INTR_WINDOW_EXITING: u32 = 1 << 2;
+/// Exit as soon as the guest could take an NMI: nothing blocks one.
+pub const PROC_NMI_WINDOW_EXITING: u32 = 1 << 22;
 pub const PROC_HLT_EXITING: u32 = 1 << 7;
 pub const PROC_MWAIT_EXITING: u32 = 1 << 10;
 pub const PROC_RDPMC_EXITING: u32 = 1 << 11;
@@ -197,6 +202,9 @@ pub const PROC_CR8_STORE_EXITING: u32 = 1 << 20;
 pub const PROC_UNCOND_IO_EXITING: u32 = 1 << 24;
 pub const PROC_USE_MSR_BITMAPS: u32 = 1 << 28;
 pub const PROC_MONITOR_EXITING: u32 = 1 << 29;
+/// Every PAUSE exits: a guest spin-waiting is stopped every few
+/// instructions, which is when a timer tick it waits for can be handed over.
+pub const PROC_PAUSE_EXITING: u32 = 1 << 30;
 pub const PROC_SECONDARY_CTLS: u32 = 1 << 31;
 
 /* Secondary processor-based controls. */
@@ -225,6 +233,8 @@ pub const ENTRY_LOAD_IA32_EFER: u32 = 1 << 15;
 /* Guest interruptibility-state bits. */
 pub const INTR_BLOCK_STI: u32 = 1 << 0;
 pub const INTR_BLOCK_MOV_SS: u32 = 1 << 1;
+/// The guest is in its NMI handler (with virtual NMIs: its IRET has not run).
+pub const INTR_BLOCK_NMI: u32 = 1 << 3;
 
 /* VM-entry / VM-exit interruption-information format. */
 pub mod intr {
@@ -252,6 +262,11 @@ pub mod cr_access {
     pub const TYPE_MASK: u64 = 0x3 << TYPE_SHIFT;
     pub const MOV_TO_CR: u64 = 0 << TYPE_SHIFT;
     pub const MOV_FROM_CR: u64 = 1 << TYPE_SHIFT;
+    pub const CLTS: u64 = 2 << TYPE_SHIFT;
+    pub const LMSW: u64 = 3 << TYPE_SHIFT;
+    /// Bits 31:16 of an LMSW's: the value it loads, of which bits 3:0 go
+    /// into CR0.
+    pub const LMSW_SOURCE_SHIFT: u64 = 16;
     /// Bits 11:8: the general-purpose register of a `mov`, numbered as the
     /// instruction encoding numbers them: RAX, RCX, RDX, RBX, RSP, RBP, RSI,
     /// RDI, R8-R15.

@@ -75,6 +75,9 @@ SHELL_MARKERS = [
 ]
 
 DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check"
+# A guest of more than one CPU needs its local APIC: the same, without
+# nolapic. (The loader adds noapic itself: the machine has no IO-APIC.)
+DEFAULT_CMDLINE_SMP = "earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check"
 
 # The last line of /etc/rc, and how the console shows it has run: its echo
 # and the line it prints. Once the shell has the console, the kernel's own
@@ -87,13 +90,19 @@ RC_DONE = re.compile(r"(?m)^> version\n.+\n")
 RC_LOG = "dmesg hv:"
 
 
+def cpus_opt(args):
+    """`cpus=N` for a guest of N CPUs, or nothing for one."""
+    return " cpus=%d" % args.cpus if args.cpus > 1 else ""
+
+
 def vm_commands(args):
     """The long-lived VM phase, as /etc/rc lines, and what each must print.
 
     Each check is (command, occurrence, what, pattern, must): the output of
     the occurrence-th run of that line must (or must not) match."""
-    start0 = "hv start /bzImage mem=%d initrd=/initrd cmdline=%s" % (args.mem, args.cmdline)
-    start1 = "hv start /bzImage mem=64 cmdline=%s" % args.cmdline
+    c = cpus_opt(args)
+    start0 = "hv start /bzImage mem=%d%s initrd=/initrd cmdline=%s" % (args.mem, c, args.cmdline)
+    start1 = "hv start /bzImage mem=64%s cmdline=%s" % (c, args.cmdline)
     # Typed while vm 0 still boots: held until its shell asks for input,
     # and answered at the prompt printed after the line went in.
     exec_early = "hv exec 0 secs=%d id" % args.vm_secs
@@ -103,7 +112,7 @@ def vm_commands(args):
     # A guest that reboots itself: no init, so it panics, and panic=1 makes
     # the panic a reboot a second later. `hv wait` for text it never prints
     # returns when the guest stops, saying why.
-    start2 = "hv start /bzImage mem=64 cmdline=%s panic=1" % args.cmdline
+    start2 = "hv start /bzImage mem=64%s cmdline=%s panic=1" % (c, args.cmdline)
     wait_reboot = "hv wait 2 secs=300 Rebooting in"
     wait_stop = "hv wait 2 secs=300 nos-never-printed"
     # The same stopped guest booted again by hand; then one with `restart`,
@@ -111,10 +120,33 @@ def vm_commands(args):
     # a minute says it is a loop; then the running guest reset by hand, and
     # typed at again once it is back.
     wait_stop2 = "hv wait 2 secs=300 nos-never-printed-2"
-    start3 = "hv start /bzImage mem=64 restart cmdline=%s panic=1" % args.cmdline
+    start3 = "hv start /bzImage mem=64%s restart cmdline=%s panic=1" % (c, args.cmdline)
     wait_loop = "hv wait 3 secs=500 nos-never-printed-3"
     exec_again = "hv exec 0 secs=%d id" % args.vm_secs
-    lines = ["hv help", start0, start1, "hv list", "hv stop 1", exec_early, exec_prompt,
+    # Where a guest's CPUs run, as hv start says: its one host CPU, or a list
+    # of as many as it has.
+    on = r"cpu \d+"
+    # A guest of several CPUs: every one online, each taking its own APIC
+    # timer's interrupts, and the IPIs between them -- rescheduling and
+    # function calls -- delivered.
+    smp_lines = []
+    smp_checks = []
+    if args.cpus > 1:
+        on = r"cpus \d+(,\d+){%d}" % (args.cpus - 1)
+        online = "hv exec 0 cat /sys/devices/system/cpu/online"
+        irqs = "hv exec 0 grep -e LOC -e RES -e CAL /proc/interrupts"
+        smp_lines = [online, irqs]
+        smp_checks = [
+            (online, 0, "every one of the guest's %d CPUs is online" % args.cpus,
+             r"(?m)^0-%d$" % (args.cpus - 1), True),
+            (irqs, 0, "each CPU took its local timer's interrupts",
+             r"(?m)^\s*LOC:" + r"\s+[1-9]\d*" * args.cpus + r"\s", True),
+            (irqs, 0, "and IPIs went between them: rescheduling ones",
+             r"(?m)^\s*RES:(\s+\d+)*\s+[1-9]\d*", True),
+            ("hv list", 0, "hv list says where each of its CPUs runs",
+             r"vm 0  running  cpus \d+(,\d+){%d}  " % (args.cpus - 1), True),
+        ]
+    lines = ["hv help", start0, start1, "hv list", "hv stop 1", exec_early, exec_prompt] + smp_lines + [
              send, wait, "hv console 0 bytes=400", "hv list",
              start2, wait_reboot, wait_stop, "hv list",
              "hv restart 2", wait_stop2, "hv list", "hv stop 2",
@@ -123,8 +155,8 @@ def vm_commands(args):
              "hv off", "rmmod hv", "insmod /hv.ko", "hv", "rmmod hv", RC_LOG]
     checks = [
         ("hv help", 0, "hv help lists the vm commands", r"hv exec <id>", True),
-        (start0, 0, "vm 0 starts", r"hv: vm 0 started on cpu \d+", True),
-        (start1, 0, "vm 1 starts beside it", r"hv: vm 1 started on cpu \d+", True),
+        (start0, 0, "vm 0 starts", r"hv: vm 0 started on %s " % on, True),
+        (start1, 0, "vm 1 starts beside it", r"hv: vm 1 started on %s " % on, True),
         ("hv list", 0, "hv list shows vm 0 running", r"vm 0  running", True),
         ("hv list", 0, "hv list shows vm 1 running", r"vm 1  running", True),
         ("hv stop 1", 0, "vm 1 stops on request, mid-boot", r"hv: vm 1 stopped -- on request", True),
@@ -137,7 +169,7 @@ def vm_commands(args):
         ("hv console 0 bytes=400", 0, "hv console has it too", r"nos42nos", True),
         ("hv list", 1, "vm 0 still running", r"vm 0  running", True),
         ("hv list", 1, "vm 1 gone from the list", r"vm 1 ", False),
-        (start2, 0, "vm 2 starts, to panic and reboot", r"hv: vm 2 started on cpu \d+", True),
+        (start2, 0, "vm 2 starts, to panic and reboot", r"hv: vm 2 started on %s " % on, True),
         (wait_reboot, 0, "vm 2 panics and goes to reboot", r'hv: vm 2 printed "Rebooting in"', True),
         (wait_stop, 0, "its reset stops it, and says so",
          r"hv: vm 2 stopped without printing .* -- the guest asked for a reset, 0xfe to port 0x64", True),
@@ -148,7 +180,7 @@ def vm_commands(args):
         (wait_stop2, 0, "... which resets again, and stops again",
          r"hv: vm 2 stopped without printing .* -- the guest asked for a reset", True),
         ("hv list", 3, "hv list counts the restart", r"vm 2  stopped .* restarts 1 ", True),
-        (start3, 0, "a guest with restart starts", r"hv: vm 3 started on cpu \d+ .*restarted when it resets", True),
+        (start3, 0, "a guest with restart starts", r"hv: vm 3 started on %s .*restarted when it resets" % on, True),
         (wait_loop, 0, "it is booted again at each reset, until the loop is called one",
          r"hv: vm 3 stopped without printing .* -- the guest asked for a reset.* -- reset 6 times in 60 s, left stopped", True),
         ("hv list", 4, "five restarts before it was left stopped", r"vm 3  stopped .* restarts 5 ", True),
@@ -162,7 +194,7 @@ def vm_commands(args):
         (RC_LOG, 0, "rmmod stopped vm 0 itself, and only then turned the extension off",
          r"hv: vm 0 stopped for the unload -- on request[\s\S]*hv: unloaded, extension off for cpu mask", True),
         (RC_LOG, 0, "no unload left the extension on", r"hv: WARNING", False),
-    ]
+    ] + smp_checks
     return lines, checks
 
 
@@ -215,6 +247,14 @@ def check_boot(args, txt):
     for m in args.expect:
         pt.check("the console shows: %s" % m, re.search(re.escape(m), block) is not None,
                  block[-1500:])
+    if args.cpus > 1:
+        # Linux's own count, once it has started every CPU it was told of.
+        pt.check("the guest brought up all %d of its CPUs" % args.cpus,
+                 re.search(r"smp: Brought up \d+ nodes?, %d CPUs" % args.cpus, block) is not None,
+                 block[-1500:])
+        pt.check("and the report says the guest started them",
+                 re.search(r"cpus\s+%d, %d started by the guest" % (args.cpus, args.cpus - 1), txt) is not None,
+                 txt[-2500:])
 
 
 def free_port():
@@ -606,7 +646,7 @@ def run(args):
     tmp = tempfile.mkdtemp(prefix="nos-hvlinux-")
     log = os.path.join(tmp, "serial.log")
 
-    boot_cmd = "hv boot /bzImage mem=%d secs=%d" % (args.mem, args.secs)
+    boot_cmd = "hv boot /bzImage mem=%d secs=%d%s" % (args.mem, args.secs, cpus_opt(args))
     if args.initrd:
         boot_cmd += " initrd=/initrd"
     if args.input:
@@ -678,7 +718,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bzimage", required=True, help="a 64-bit Linux bzImage")
     ap.add_argument("--initrd", help="an initramfs image, optional")
-    ap.add_argument("--cmdline", default=DEFAULT_CMDLINE, help="the guest kernel command line")
+    ap.add_argument("--cmdline", help="the guest kernel command line (default: %r, or with --cpus %r)"
+                    % (DEFAULT_CMDLINE, DEFAULT_CMDLINE_SMP))
+    ap.add_argument("--cpus", type=int, default=1,
+                    help="the guest's CPUs: with more than one, that it brings every one up, and that "
+                         "each takes its timer's interrupts and IPIs (needs a guest kernel with SMP and "
+                         "x2APIC; under TCG, QEMU 9.2 or later)")
     ap.add_argument("--mem", type=int, default=256, help="guest RAM in MiB")
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
     ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")
@@ -712,6 +757,13 @@ def main():
 
     if not os.path.exists(args.bzimage):
         sys.exit("no such bzImage: " + args.bzimage)
+    if args.cmdline is None:
+        args.cmdline = DEFAULT_CMDLINE_SMP if args.cpus > 1 else DEFAULT_CMDLINE
+    if args.cpus > 1 and "-enable-kvm" not in accel_args(args):
+        version = hvt.qemu_version("qemu-system-x86_64")
+        if version is None or version < hvt.TCG_REAL_MODE:
+            sys.exit("--cpus under TCG needs QEMU %d.%d or later: a guest's other CPUs start in real mode, "
+                     "which an older TCG does not put through the nested page table" % hvt.TCG_REAL_MODE)
     if not os.path.exists(os.path.join(ROOT, "nos.iso")):
         sys.exit("build nos.iso first (make)")
 

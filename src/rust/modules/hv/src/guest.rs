@@ -1,6 +1,7 @@
 //! What `hv boot` and `hv start` share: the guest a command line describes,
-//! built from files; the report of how it ended; the ring its console is
-//! kept in; and the console made safe to print.
+//! built from files; its CPUs, placed on host CPUs and run each on a task of
+//! its own; the report of how it ended; the ring its console is kept in;
+//! and the console made safe to print.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -11,9 +12,10 @@ use alloc::boxed::Box;
 use alloc::sync::Arc;
 
 use hv::linux::Header;
-use hv::run::{Counts, LinuxGuest, Stop, MAX_DISKS};
-use hv::Machine;
+use hv::run::{Counts, GuestCpu, Host, LinuxGuest, Stop, Stopped, MAX_DISKS};
+use hv::{Doorbells, Machine};
 use kcore::consts::{MAX_CPUS, NS_PER_MS};
+use kcore::sync::Mutex;
 
 use crate::disk::{FileDisk, Runner};
 
@@ -23,9 +25,15 @@ const CHUNK: usize = 64 * 1024;
 const DEFAULT_MEM_MIB: u64 = 256;
 const MIN_MEM_MIB: u64 = 64;
 const MAX_MEM_MIB: u64 = 4096;
-/// The default command line: the serial console, and no local APIC, which
-/// this hypervisor does not emulate.
+/// The default command line of a guest of one CPU: the serial console, and
+/// no local APIC -- the 8259 and the PIT alone, as such a guest was always
+/// given. One of several CPUs needs its APIC, and gets the console alone.
 const DEFAULT_CMDLINE: &str = "console=ttyS0 nolapic";
+const DEFAULT_CMDLINE_SMP: &str = "console=ttyS0";
+/// What a guest of several CPUs' command line gets when it has not got it:
+/// there is no IO-APIC on this machine, and a kernel that looked for one
+/// would turn its 8259's line to the first CPU off (`hv::run`).
+const NOAPIC: &str = "noapic";
 /// How much of a guest's console is kept: its last this many bytes.
 pub const CONSOLE_BYTES: usize = 64 * 1024;
 
@@ -43,8 +51,10 @@ pub struct Spec {
     pub input: Vec<u8>,
     /// `secs=`, for `hv boot`.
     pub secs: Option<u64>,
-    /// `cpu=`, for `hv start`.
+    /// `cpu=`: the host CPU the guest's first CPU runs on.
     pub cpu: Option<u32>,
+    /// `cpus=`: how many CPUs the guest has, each on a host CPU of its own.
+    pub cpus: u32,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
@@ -87,22 +97,24 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         initrd: None,
         disks: Vec::new(),
         mem_bytes: DEFAULT_MEM_MIB * 1024 * 1024,
-        cmdline: String::from(DEFAULT_CMDLINE),
+        cmdline: String::new(),
         input: Vec::new(),
         secs: None,
         cpu: None,
+        cpus: 1,
         log: false,
         restart: false,
         net: false,
         nic: None,
     };
     let mut mem_mib = DEFAULT_MEM_MIB;
+    let mut cmdline = None;
 
     let mut rest = args.trim_start();
     while !rest.is_empty() {
         /* cmdline= takes everything after it, spaces and all. */
         if let Some(line) = rest.strip_prefix("cmdline=") {
-            spec.cmdline = String::from(line.trim_end());
+            cmdline = Some(String::from(line.trim_end()));
             break;
         }
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
@@ -124,6 +136,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.disks.push((String::from(path), ro));
         } else if let Some(v) = word.strip_prefix("secs=") {
             spec.secs = Some(v.parse().map_err(|_| String::from("secs= wants a number of seconds"))?);
+        } else if let Some(v) = word.strip_prefix("cpus=") {
+            spec.cpus = v.parse().map_err(|_| String::from("cpus= wants a number of CPUs"))?;
         } else if let Some(v) = word.strip_prefix("cpu=") {
             spec.cpu = Some(v.parse().map_err(|_| String::from("cpu= wants a CPU number"))?);
         } else if let Some(v) = word.strip_prefix("input=") {
@@ -147,13 +161,35 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
     if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&mem_mib) {
         return Err(alloc::format!("mem= must be {}..{} MiB", MIN_MEM_MIB, MAX_MEM_MIB));
     }
+    if spec.cpus == 0 || spec.cpus as usize > hv::MAX_VCPUS {
+        return Err(alloc::format!("cpus= must be 1..{}", hv::MAX_VCPUS));
+    }
     spec.mem_bytes = mem_mib * 1024 * 1024;
+    spec.cmdline = cmdline.unwrap_or_else(|| {
+        String::from(if spec.cpus > 1 { DEFAULT_CMDLINE_SMP } else { DEFAULT_CMDLINE })
+    });
     Ok(spec)
+}
+
+/// The command line the guest's kernel is given: `cmdline`, and -- for a
+/// guest of several CPUs, which has local APICs -- `noapic` after it unless
+/// it says so already: the machine has no IO-APIC.
+fn guest_cmdline(cmdline: &str, smp: bool) -> Result<String, String> {
+    let mut line = String::new();
+    line.try_reserve(cmdline.len() + NOAPIC.len() + 1).map_err(|_| String::from("out of memory"))?;
+    line.push_str(cmdline);
+    if smp && !cmdline.split_ascii_whitespace().any(|w| w == NOAPIC) {
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(NOAPIC);
+    }
+    Ok(line)
 }
 
 /// Copy `len` bytes of the file at `path` into guest memory at `gpa`, a chunk
 /// at a time. The file, from `offset` on, must be `len` bytes or more.
-fn stream(guest: &mut LinuxGuest, path: &str, offset: u64, gpa: u64, len: u64) -> Result<(), String> {
+fn stream(guest: &LinuxGuest, path: &str, offset: u64, gpa: u64, len: u64) -> Result<(), String> {
     let mut buf = Vec::new();
     buf.try_reserve_exact(CHUNK).map_err(|_| String::from("out of memory for a read buffer"))?;
     buf.resize(CHUNK, 0);
@@ -167,7 +203,7 @@ fn stream(guest: &mut LinuxGuest, path: &str, offset: u64, gpa: u64, len: u64) -
             return Err(alloc::format!("{} ended {} bytes short", path, len - done));
         }
         guest
-            .memory_mut()
+            .memory()
             .write(gpa + done, &buf[..got])
             .map_err(|_| alloc::format!("guest has no memory at {:#x}", gpa + done))?;
         done += got as u64;
@@ -175,11 +211,18 @@ fn stream(guest: &mut LinuxGuest, path: &str, offset: u64, gpa: u64, len: u64) -
     Ok(())
 }
 
+/// A guest built and not yet run: the guest, and its CPUs for their tasks.
+pub struct Built {
+    pub guest: LinuxGuest,
+    pub cpus: Vec<GuestCpu>,
+}
+
 /// Build the guest: its memory, the kernel and the initrd streamed into it,
 /// and the rest of what the boot protocol wants laid out beside them; its
-/// disks served for `runner`, who runs it.
-pub fn build(machine: &Machine, spec: &Spec, runner: &Runner) -> Result<LinuxGuest, String> {
-    let mut guest = LinuxGuest::new(machine, spec.mem_bytes).map_err(|e| alloc::format!("no guest: {}", e))?;
+/// CPUs, rung by `doorbells`; its disks served for `runner`, who runs it.
+pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doorbells>) -> Result<Built, String> {
+    let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells)
+        .map_err(|e| alloc::format!("no guest: {}", e))?;
 
     /* The header is in the first page or two; read enough to parse it. */
     let mut first = Vec::new();
@@ -206,13 +249,15 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner) -> Result<LinuxGue
         .map_err(|e| alloc::format!("the guest's memory does not fit its kernel: {}", e))?;
 
     /* The 64-bit kernel at its load address, then the initrd high. */
-    stream(&mut guest, &spec.kernel, pm_offset, layout.kernel_addr, kernel_len)?;
+    stream(&guest, &spec.kernel, pm_offset, layout.kernel_addr, kernel_len)?;
     if let Some(path) = &spec.initrd {
-        stream(&mut guest, path, 0, layout.initrd_addr, layout.initrd_len)?;
+        stream(&guest, path, 0, layout.initrd_addr, layout.initrd_len)?;
     }
 
+    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1)?;
+    let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
     guest
-        .load(&header, &first, layout, spec.cmdline.as_bytes())
+        .load(bsp, &header, &first, layout, cmdline.as_bytes())
         .map_err(|e| alloc::format!("laying out the guest: {}", e))?;
 
     if let Some(nic) = &spec.nic {
@@ -226,7 +271,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner) -> Result<LinuxGue
         let _ = write!(id, "nos-vd{}", letter);
         guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;
     }
-    Ok(guest)
+    Ok(Built { guest, cpus })
 }
 
 /// The CPU a vCPU is to run on: `wanted` if the extension is on there, else
@@ -256,15 +301,169 @@ pub fn pick_cpu(machine: &Machine, wanted: Option<u32>, load: &[u32; MAX_CPUS]) 
     best.ok_or_else(|| String::from("the extension is on for no CPU -- hv on first"))
 }
 
+/// The host CPUs a guest of `cpus` CPUs runs on, its first CPU's first:
+/// that one by [`pick_cpu`], and each other on a CPU the extension is on
+/// for that none of the guest's has yet, the one with fewest vCPUs, as
+/// `pick_cpu` chooses. A guest's CPUs never share a host CPU -- one that
+/// spins waiting for another would hold the CPU the other needs to finish
+/// -- so a guest has at most as many as the extension is on for.
+pub fn pick_cpus(machine: &Machine, wanted: Option<u32>, cpus: u32, load: &[u32; MAX_CPUS])
+    -> Result<Vec<u32>, String>
+{
+    let enabled = machine.enabled_mask();
+    if cpus > enabled.count_ones() {
+        return Err(alloc::format!(
+            "{} cpus asked for, and the extension is on for {} -- each of a guest's CPUs runs on a host CPU of its own",
+            cpus, enabled.count_ones()));
+    }
+    let mut chosen = Vec::new();
+    chosen.try_reserve_exact(cpus as usize).map_err(|_| String::from("out of memory"))?;
+    let first = pick_cpu(machine, wanted, load)?;
+    chosen.push(first);
+    let mut load = *load;
+    load[first as usize] += 1;
+    while chosen.len() < cpus as usize {
+        let mut best: Option<u32> = None;
+        for cpu in 0..MAX_CPUS as u32 {
+            if enabled & (1u64 << cpu) == 0 || chosen.contains(&cpu) {
+                continue;
+            }
+            if best.map_or(true, |b| load[cpu as usize] <= load[b as usize]) {
+                best = Some(cpu);
+            }
+        }
+        let cpu = best.ok_or_else(|| String::from("no host CPU left for the guest's next CPU"))?;
+        load[cpu as usize] += 1;
+        chosen.push(cpu);
+    }
+    Ok(chosen)
+}
+
+/// How a guest's run went: how it stopped, and what each of its CPUs
+/// counted, its first CPU's first.
+pub struct Ran {
+    pub stopped: Stopped,
+    pub counts: Vec<Counts>,
+}
+
+/// What a guest's CPUs counted, a slot each: each CPU's task writes its own
+/// as it finishes.
+struct Tally {
+    counts: Mutex<Vec<Counts>>,
+}
+
+/// A CPU of a guest other than its first, and what its task runs it with.
+struct ApRun<H: Host + Send + Sync + 'static> {
+    guest: Arc<LinuxGuest>,
+    cpu: GuestCpu,
+    machine: Arc<Machine>,
+    host: Arc<H>,
+    deadline: u64,
+    tally: Arc<Tally>,
+}
+
+/// The task of a guest's CPU other than its first: its guest until the
+/// guest stops, then its count in the tally -- and its CPU dropped here,
+/// before the task ends: under VT-x its VMCS is cleared off the host CPU it
+/// was current on as it goes, by an IPI from task context.
+fn ap_task<H: Host + Send + Sync + 'static>(run: ApRun<H>) {
+    let ApRun { guest, mut cpu, machine, host, deadline, tally } = run;
+    let counts = guest.run(&mut cpu, &machine, deadline, &*host);
+    if let Some(slot) = tally.counts.lock().get_mut(cpu.index() as usize) {
+        *slot = counts;
+    }
+    drop(cpu);
+}
+
+/// Run a built guest until it stops -- by itself, at `deadline`, or at
+/// `host`'s request -- each of its CPUs on a task bound to its host CPU in
+/// `placement`: the first on the task this is called on, which is bound to
+/// `placement[0]` already, and every other on a task of its own, named
+/// `hv/<name>/cpu<N>`. Returns once every CPU's task is done; or, when a
+/// task cannot be made, why not, the guest stopped and the tasks made
+/// joined.
+pub fn run_cpus<H: Host + Send + Sync + 'static>(
+    guest: &Arc<LinuxGuest>,
+    mut cpus: Vec<GuestCpu>,
+    placement: &[u32],
+    machine: &Arc<Machine>,
+    deadline: u64,
+    host: &Arc<H>,
+    name: &str,
+) -> Result<Ran, String> {
+    let n = cpus.len();
+    if n == 0 || placement.len() != n {
+        return Err(String::from("the guest's CPUs and their places do not match"));
+    }
+    let mut slots = Vec::new();
+    slots.try_reserve_exact(n).map_err(|_| String::from("out of memory"))?;
+    slots.resize(n, Counts::default());
+    let tally = Arc::new(Tally { counts: Mutex::new(slots).ok_or_else(|| String::from("out of memory"))? });
+    let mut tasks = Vec::new();
+    tasks.try_reserve_exact(n - 1).map_err(|_| String::from("out of memory"))?;
+
+    let aps = cpus.split_off(1);
+    let mut bsp = cpus.pop().ok_or_else(|| String::from("no first CPU"))?;
+    let mut failed = None;
+    for (ap, &host_cpu) in aps.into_iter().zip(&placement[1..]) {
+        let index = ap.index();
+        let mut task_name = String::new();
+        if task_name.try_reserve(name.len() + 16).is_err() {
+            failed = Some(index);
+            break;
+        }
+        let _ = write!(task_name, "hv/{}/cpu{}", name, index);
+        let run = ApRun {
+            guest: guest.clone(), cpu: ap, machine: machine.clone(), host: host.clone(), deadline,
+            tally: tally.clone(),
+        };
+        match kcore::task::spawn_on_with(&task_name, 1u64 << host_cpu, run, ap_task::<H>) {
+            Some(task) => tasks.push(task),
+            None => {
+                failed = Some(index);
+                break;
+            }
+        }
+    }
+
+    if let Some(index) = failed {
+        /* The CPUs started see the stop and end; their tasks are joined
+         * as the handles go. */
+        guest.stop(Stop::Requested);
+        drop(tasks);
+        return Err(alloc::format!("no task for the guest's cpu {}", index));
+    }
+    let first = guest.run(&mut bsp, machine, deadline, &**host);
+    /* Every other CPU's task, waited for: they see the guest stopped by the
+     * time this CPU does, or are rung to. */
+    drop(tasks);
+    drop(bsp);
+
+    let mut counts = core::mem::take(&mut *tally.counts.lock());
+    if let Some(slot) = counts.first_mut() {
+        *slot = first;
+    }
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: Stop::Requested, cpu: 0, dump: String::new() });
+    Ok(Ran { stopped, counts })
+}
+
 /// Why the guest stopped, in a line.
 pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
     match *stop {
-        Stop::Halted { rip } => write!(out, "hlt with interrupts off at {:#x}", rip),
+        Stop::Halted { rip } => write!(out, "hlt with interrupts off at {:#x}, on every CPU it has", rip),
+        Stop::Mmio { gpa, rip } if gpa & !0xFFF == hv::lapic::DEFAULT_BASE => write!(out,
+            "a touch of the xAPIC's page at {:#x}, rip {:#x} -- its local APIC is an x2APIC, reached by MSRs; boot it with noapic, and without nox2apic",
+            gpa, rip),
         Stop::Mmio { gpa, rip } => write!(out,
             "a touch of guest physical {:#x}, no memory and no device there, rip {:#x}", gpa, rip),
         Stop::Shutdown { rip } => write!(out, "triple fault at {:#x}", rip),
         Stop::Reset { port, value, rip } => write!(out, "the guest asked for a reset, {:#04x} to port {:#x} ({}), at {:#x}",
             value, port, hv::run::reset_source(port), rip),
+        Stop::Init { rip } => write!(out, "the guest asked for a reset, an INIT to its boot CPU, at {:#x}", rip),
+        Stop::Xapic { rip } => write!(out,
+            "the guest took its local APIC out of x2APIC mode into xAPIC, which is not emulated, at {:#x} -- boot it with noapic, and without nox2apic",
+            rip),
         Stop::Exception { vector, rip } => write!(out, "exception {} at {:#x}", vector, rip),
         Stop::Refused(r) => write!(out, "not entered: {:?}", r),
         Stop::Invalid => write!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
@@ -275,51 +474,88 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
 }
 
 /// How the run ended and what it counted: what `hv boot` and `hv stop` say.
-pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stop: &Stop, counts: &Counts, run_ns: u64) {
+/// `counts` is each CPU's, the first CPU's first.
+pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts: &[Counts], run_ns: u64) {
     let run_ns = run_ns.max(1);
+    let stop = &stopped.stop;
+    let mut total = Counts::default();
+    for c in counts {
+        total.add(c);
+    }
     let _ = write!(out, "  stopped    ");
     let _ = describe(stop, out);
     let _ = writeln!(out, ", after {} ms", run_ns / NS_PER_MS);
     let _ = writeln!(out,
         "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} host",
-        counts.exits, counts.port_in, counts.port_out, counts.cpuid,
-        counts.msr_read, counts.msr_write, counts.msr_gp, counts.irq, counts.hlt, counts.host);
-    if counts.kicked != 0 {
-        let _ = writeln!(out, "  kicked     {} entries turned back for a frame or a disk's answer that came on the way in", counts.kicked);
+        total.exits, total.port_in, total.port_out, total.cpuid,
+        total.msr_read, total.msr_write, total.msr_gp, total.irq + total.apic, total.hlt, total.host);
+    if total.kicked != 0 {
+        let _ = writeln!(out, "  kicked     {} entries turned back for a frame, a disk's answer or an IPI that came on the way in", total.kicked);
     }
-    if counts.ud != 0 || counts.wbinvd != 0 || counts.cr8 != 0 {
-        let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR",
-            counts.ud, counts.wbinvd, counts.cr8);
+    if total.ud != 0 || total.wbinvd != 0 || total.cr8 != 0 || total.cr0 != 0 {
+        let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR, {} CR0 writes (VT-x)",
+            total.ud, total.wbinvd, total.cr8, total.cr0);
     }
     let absent = guest.absent_pages();
     if !absent.is_empty() {
         let _ = write!(out, "  absent     reads of no device answered with all ones at");
-        for gpa in absent {
+        for gpa in &absent {
             let _ = write!(out, " {:#x}", gpa);
         }
         let _ = writeln!(out);
     }
     for (msr, value, write) in guest.msr_faults() {
-        let _ = if *write {
+        let _ = if write {
             writeln!(out, "  #GP        wrmsr {:#x} <- {:#x}", msr, value)
         } else {
             writeln!(out, "  #GP        rdmsr {:#x}", msr)
         };
     }
-    /* How much of the run the vCPU's task spent asleep with the guest halted:
-     * the host CPU an idle guest gives back. */
-    let _ = writeln!(out, "  halted     slept {} ms in {} sleeps, {}% of the run",
-        counts.slept_ns / NS_PER_MS, counts.sleeps, counts.slept_ns * 100 / run_ns);
+    /* How much of the run the vCPUs' tasks spent asleep with the guest
+     * halted: the host CPU an idle guest gives back. */
+    let _ = writeln!(out, "  halted     slept {} ms in {} sleeps, {}% of the run{}",
+        total.slept_ns / NS_PER_MS, total.sleeps,
+        total.slept_ns * 100 / run_ns / counts.len().max(1) as u64,
+        if counts.len() > 1 { " (of each CPU's, on average)" } else { "" });
     let ((irr, isr, imr), (m0, r0, run0)) = guest.irq_debug();
-    let _ = writeln!(out, "  irq        {} total ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
-        counts.irq, counts.irq0, counts.irq4, counts.edges0, counts.blocked, irr, isr, imr, m0, r0, run0);
-    for (i, (sectors, s, broken)) in guest.disk_stats().enumerate() {
+    let _ = writeln!(out, "  irq        {} from the 8259 ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
+        total.irq, total.irq0, total.irq4, total.edges0, total.blocked, irr, isr, imr, m0, r0, run0);
+    if total.apic != 0 || counts.len() > 1 {
+        let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers; {} IPIs sent, {} taken",
+            total.apic, total.timer, total.ipi_sent, total.ipi_taken);
+    }
+    if counts.len() > 1 {
+        let states = guest.cpu_states();
+        let _ = writeln!(out, "  cpus       {}, {} started by the guest ({} INITs, {} start-up IPIs taken)",
+            counts.len(), guest.cpus_started(), total.init, total.started);
+        for (i, c) in counts.iter().enumerate() {
+            let (activity, host) = states.get(i).copied().unwrap_or((hv::run::Activity::Running, None));
+            let _ = write!(out, "  cpu {:<2}     {} exits, {} apic irq, {} ipi sent, {} hlt, slept {}% -- {}",
+                i, c.exits, c.apic, c.ipi_sent, c.hlt, c.slept_ns * 100 / run_ns, activity.name());
+            match host {
+                Some(h) => { let _ = writeln!(out, ", on host cpu {}", h); }
+                None => { let _ = writeln!(out, ", never entered"); }
+            }
+        }
+        /* Said of a guest that ran: one stopped before its first entry
+         * started nothing, and that is no news about its kernel. */
+        let never = (counts.len() as u64 - 1).saturating_sub(guest.cpus_started());
+        if never != 0 && counts.first().is_some_and(|c| c.exits != 0) {
+            let _ = writeln!(out, "  note       {} of its CPUs never started -- a kernel starts none booted with nolapic or without SMP, nor before it gets that far",
+                never);
+        }
+    }
+    if total.nmi != 0 || total.nmi_lost != 0 {
+        let _ = writeln!(out, "  nmi        {} NMIs taken from the guest's other CPUs, {} dropped by a CPU waiting to be started",
+            total.nmi, total.nmi_lost);
+    }
+    for (i, (sectors, s, broken)) in guest.disk_stats().into_iter().enumerate() {
         let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}",
             (b'a' + i as u8) as char, sectors * hv::disk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
             s.writes, s.written_bytes / 1024, s.flushes, s.errors,
             if broken { "; stopped over a ring the driver broke" } else { "" });
     }
-    for (i, (s, broken)) in guest.nic_stats().enumerate() {
+    for (i, (s, broken)) in guest.nic_stats().into_iter().enumerate() {
         let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped{}",
             i, s.sent, s.received, s.dropped,
             if broken { "; stopped over a ring the driver broke" } else { "" });
@@ -332,8 +568,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stop: &Stop, counts: &Cou
         }
         let _ = writeln!(out);
     }
-    if !matches!(stop, Stop::Halted { .. } | Stop::Budget | Stop::Requested | Stop::Reset { .. }) {
-        let _ = guest.dump(out);
+    if !matches!(stop, Stop::Halted { .. } | Stop::Budget | Stop::Requested | Stop::Reset { .. } | Stop::Init { .. }) {
+        if counts.len() > 1 {
+            let _ = writeln!(out, "  stopped by cpu {}:", stopped.cpu);
+        }
+        let _ = out.write_str(&stopped.dump);
     }
 }
 

@@ -459,7 +459,11 @@ fn vpid_give_back(vpid: u16) {
 /* CR0 bits VMX may force in the guest; named here so `write_guest_state` can
  * lift them out of the fixed set when unrestricted guest relaxes them. */
 const CR0_PE: u64 = 1 << 0;
+const CR0_NE: u64 = 1 << 5;
 const CR0_PG: u64 = 1 << 31;
+/// EFER.LMA: long mode active, which the "IA-32e mode guest" entry control
+/// has to match at every entry.
+const EFER_LMA: u64 = 1 << 10;
 
 /* XCR0 while a guest runs is the x87 alone, as under AMD-V -- and so is the
  * host's while VMX is on for the CPU (`super::fp`): `vmlaunch` does not
@@ -669,6 +673,8 @@ struct Synced {
     sysenter_eip: u64,
     interruptibility: u32,
     proc1: u32,
+    /// The VM-entry controls, whose "IA-32e mode guest" follows EFER.LMA.
+    entry_ctls: u32,
 }
 
 pub struct Guest {
@@ -710,6 +716,21 @@ pub struct Guest {
     cr0_fixed1: u64,
     cr4_fixed0: u64,
     cr4_fixed1: u64,
+    /// The CR0 bits the host keeps -- the guest/host mask: a guest's `mov`
+    /// to CR0 that would change one exits instead, and the guest reads them
+    /// from the read shadow. PG, because turning paging on or off with EFER.LME
+    /// set turns long mode on or off, which the "IA-32e mode guest" entry
+    /// control has to follow; PE with it; and every bit VMX fixes -- NE
+    /// above all, which a CPU coming out of INIT has clear and VMX needs set,
+    /// so the guest is let believe it wrote what it wrote.
+    cr0_mask: u64,
+    /// The policy wrote CR0 (`set_cr0`): the next entry writes the VMCS's
+    /// CR0 and its read shadow.
+    cr0_dirty: bool,
+    /// The next entry first drops what the CPU cached under this guest's
+    /// VPID: its CR0 was written by the policy, not by an instruction the
+    /// CPU ran -- which would have flushed as it went -- or it was reset.
+    flush_vpid: bool,
 
     /// The CPU this guest's VMCS was last made current on with `vmptrld`, or
     /// -1. It is left current there after an exit -- no per-exit `vmclear` --
@@ -752,6 +773,9 @@ pub struct Guest {
     /// Ask the CPU to exit the moment the guest could take an interrupt: the
     /// interrupt-window control, toggled entry to entry.
     irq_window: bool,
+    /// The same for an NMI: the NMI-window control, which needs virtual NMIs
+    /// (`virtual_nmis`).
+    nmi_window: bool,
 
     /* What the last exit wrote, read out before VMCLEAR. */
     exit_reason: u32,
@@ -763,6 +787,11 @@ pub struct Guest {
     idt_vectoring_errcode: u32,
     guest_phys: u64,
     interruptibility: u32,
+    /// At a control-register access: CR0 as the guest sees it (the mask's
+    /// bits from the read shadow), CR4, and CS's access rights.
+    exit_cr0: u64,
+    exit_cr4: u64,
+    exit_cs_ar: u32,
     /// A VMLAUNCH that failed outright (VMfail), with the instruction error.
     vm_instruction_error: u32,
     entry_failed: bool,
@@ -791,6 +820,11 @@ impl Guest {
         }
         let unrestricted = caps.has(SEC_UNRESTRICTED_GUEST);
         let vpid = if caps.vpid() { vpid_take().ok_or(Error::NoMemory)? } else { 0 };
+        let mut fixed_on = caps.cr0_fixed0;
+        if unrestricted {
+            fixed_on &= !(CR0_PE | CR0_PG);
+        }
+        let cr0_mask = CR0_PE | CR0_PG | CR0_NE | fixed_on | (!caps.cr0_fixed1 & 0xFFFF_FFFF);
 
         Ok(Self {
             vmcs,
@@ -815,6 +849,9 @@ impl Guest {
             cr0_fixed1: caps.cr0_fixed1,
             cr4_fixed0: caps.cr4_fixed0,
             cr4_fixed1: caps.cr4_fixed1,
+            cr0_mask,
+            cr0_dirty: false,
+            flush_vpid: false,
             loaded_cpu: AtomicI32::new(-1),
             launched: AtomicBool::new(false),
             cleared: false,
@@ -826,6 +863,7 @@ impl Guest {
             inject: 0,
             inject_errcode: 0,
             irq_window: false,
+            nmi_window: false,
             exit_reason: 0,
             exit_qual: 0,
             exit_intr_info: 0,
@@ -835,6 +873,9 @@ impl Guest {
             idt_vectoring_errcode: 0,
             guest_phys: 0,
             interruptibility: 0,
+            exit_cr0: 0,
+            exit_cr4: 0,
+            exit_cs_ar: 0,
             vm_instruction_error: 0,
             entry_failed: false,
             profile: None,
@@ -887,6 +928,59 @@ impl Guest {
     pub fn set_rsp(&mut self, rsp: u64) {
         self.save.rsp = rsp;
         self.rsp_dirty = true;
+    }
+
+    /// Set the guest's CR0 to `value`, as it is to read it: the VMCS's CR0
+    /// gets what VMX forces on top, the read shadow `value`, at the next
+    /// entry -- which also drops what the CPU cached under the guest's VPID,
+    /// as the `mov` this stands for would have. The policy has checked
+    /// `value` is one CR0 may hold, and set EFER.LMA by it.
+    pub fn set_cr0(&mut self, value: u64) {
+        self.save.cr0 = value;
+        self.cr0_dirty = true;
+        self.flush_vpid = true;
+    }
+
+    /// Have the next entry drop what the CPU cached under this guest's VPID:
+    /// the guest was reset, and nothing it translated before is to be used.
+    pub fn flush_tlb(&mut self) {
+        self.flush_vpid = true;
+    }
+
+    /// Whether the CPU has unrestricted guest: a guest may run in real mode,
+    /// or protected mode without paging -- which an application processor
+    /// a start-up IPI starts is.
+    pub fn unrestricted(&self) -> bool {
+        self.unrestricted
+    }
+
+    /// At an exit for a control-register access: CR0 as the guest sees it,
+    /// CR4, and CS's access rights (VMX's format: L is bit 13).
+    pub fn exit_cr0(&self) -> u64 {
+        self.exit_cr0
+    }
+    pub fn exit_cr4(&self) -> u64 {
+        self.exit_cr4
+    }
+    pub fn exit_cs_ar(&self) -> u32 {
+        self.exit_cs_ar
+    }
+
+    /// CR0 as the VMCS holds it for a guest that reads `value`: with the
+    /// bits VMX forces set -- all but PE and PG, with unrestricted guest --
+    /// and the ones it forbids clear.
+    fn hw_cr0(&self, value: u64) -> u64 {
+        let mut fixed_on = self.cr0_fixed0;
+        if self.unrestricted {
+            fixed_on &= !(CR0_PE | CR0_PG);
+        }
+        (value | fixed_on) & self.cr0_fixed1
+    }
+
+    /// The VM-entry controls for a guest whose EFER is `efer`: "IA-32e mode
+    /// guest" exactly when long mode is active, as every entry checks.
+    fn entry_ctls_for(&self, efer: u64) -> u32 {
+        self.entry_ctls | if efer & EFER_LMA != 0 { vmcs::ENTRY_IA32E_MODE_GUEST } else { 0 }
     }
 
     /* The last exit, for the policy layer's decoder and its reports. */
@@ -946,22 +1040,38 @@ impl Guest {
         self.irq_window = on;
     }
 
+    /// Whether to exit as soon as the guest can take an NMI. Nothing, on a
+    /// CPU without virtual NMIs: its next exit comes anyway.
+    pub fn set_nmi_window(&mut self, on: bool) {
+        self.nmi_window = on;
+    }
+
+    /// Whether the guest's NMI blocking is its own, ended by its IRET: an NMI
+    /// is injected into a guest only then. Decided at the first entry.
+    pub fn virtual_nmis(&self) -> bool {
+        self.pin & vmcs::PIN_VIRTUAL_NMIS != 0
+    }
+
     /// Compute and record the control values this CPU allows, once.
     fn decide_controls(&mut self, basic: u64) {
         use vmcs::*;
+        /* Virtual NMIs: the guest's NMI blocking is its own, set as an NMI
+         * is injected and ended by the guest's IRET -- what an NMI one of its
+         * CPUs sends another needs. The host's NMIs exit either way. */
         self.pin = adjust(
-            PIN_EXTINT_EXITING | PIN_NMI_EXITING,
+            PIN_EXTINT_EXITING | PIN_NMI_EXITING | PIN_VIRTUAL_NMIS,
             ctls_msr(basic, MSR_VMX_PINBASED_CTLS, MSR_VMX_TRUE_PINBASED_CTLS),
         );
         /* The instructions AMD-V's intercept set stops a guest at, where
          * VMX does not stop it unasked: HLT; every port; CR8, which is the
          * host's task priority register; MONITOR, MWAIT and RDPMC, which
-         * CPUID says the guest has not got; WBINVD, below. CPUID, INVD,
-         * VMCALL, XSETBV and a triple fault exit unconditionally. */
+         * CPUID says the guest has not got; WBINVD, below; and PAUSE, as the
+         * policy asks of both. CPUID, INVD, VMCALL, XSETBV and a triple fault
+         * exit unconditionally. */
         self.proc1 = adjust(
             PROC_HLT_EXITING | PROC_UNCOND_IO_EXITING | PROC_CR8_LOAD_EXITING | PROC_CR8_STORE_EXITING
                 | PROC_MWAIT_EXITING | PROC_MONITOR_EXITING | PROC_RDPMC_EXITING | PROC_USE_MSR_BITMAPS
-                | PROC_SECONDARY_CTLS,
+                | PROC_PAUSE_EXITING | PROC_SECONDARY_CTLS,
             ctls_msr(basic, MSR_VMX_PROCBASED_CTLS, MSR_VMX_TRUE_PROCBASED_CTLS),
         );
         /* Without the bitmap control every MSR exits, which is the safe way
@@ -983,10 +1093,12 @@ impl Guest {
                 | EXIT_LOAD_IA32_PAT | EXIT_SAVE_IA32_PAT,
             ctls_msr(basic, MSR_VMX_EXIT_CTLS, MSR_VMX_TRUE_EXIT_CTLS),
         );
+        /* "IA-32e mode guest" is not among them: it follows the guest's
+         * EFER.LMA entry to entry (`entry_ctls_for`). */
         self.entry_ctls = adjust(
-            ENTRY_IA32E_MODE_GUEST | ENTRY_LOAD_IA32_EFER | ENTRY_LOAD_IA32_PAT,
+            ENTRY_LOAD_IA32_EFER | ENTRY_LOAD_IA32_PAT,
             ctls_msr(basic, MSR_VMX_ENTRY_CTLS, MSR_VMX_TRUE_ENTRY_CTLS),
-        );
+        ) & !ENTRY_IA32E_MODE_GUEST;
     }
 
     /// Write the fields that do not change entry to entry: the controls, the
@@ -1001,7 +1113,7 @@ impl Guest {
             vmwrite(PROC_BASED_CTLS, self.proc1 as u64);
             vmwrite(PROC_BASED_CTLS2, self.proc2 as u64);
             vmwrite(VMEXIT_CTLS, self.exit_ctls as u64);
-            vmwrite(VMENTRY_CTLS, self.entry_ctls as u64);
+            /* VMENTRY_CTLS the first entry writes, from the guest's EFER. */
             /* Intercept #DB, #AC and #MC always -- the same delivery-loop
              * denial-of-service the AMD side guards against -- over whatever
              * else the policy asked. */
@@ -1025,10 +1137,11 @@ impl Guest {
             vmwrite(VMEXIT_MSR_STORE_ADDR, msr_phys + MSR_STORE_BASE as u64);
             vmwrite(VMEXIT_MSR_STORE_COUNT, 1);
             vmwrite(TSC_OFFSET, 0);
-            /* The guest owns all of CR0 but for what VMX forces; CR4.VMXE is
-             * forced set in hardware but read as 0 by the guest, which is
-             * told it has no VMX. */
-            vmwrite(CR0_GUEST_HOST_MASK, 0);
+            /* The guest owns CR0 but for the bits of `cr0_mask`, which a
+             * `mov` to CR0 changing exits for; CR4.VMXE is forced set in
+             * hardware but read as 0 by the guest, which is told it has no
+             * VMX. */
+            vmwrite(CR0_GUEST_HOST_MASK, self.cr0_mask);
             vmwrite(CR4_GUEST_HOST_MASK, CR4_VMXE_BIT);
             vmwrite(GUEST_IA32_DEBUGCTL, 0);
         }
@@ -1057,25 +1170,23 @@ impl Guest {
                 vmwrite(lim_f, g.limit as u64);
                 vmwrite(ar_f, ar_from_attrib(g.attrib) as u64);
             };
+            let guest_cr0 = self.hw_cr0(s.cr0);
+            let entry_ctls = self.entry_ctls_for(efer);
             unsafe {
                 /* CR0/CR4 with the bits VMX forces; with unrestricted guest,
-                 * PE and PG are not forced. Written once: from here the guest
-                 * changes its own CR0/3/4 in the VMCS, unintercepted. */
-                let mut cr0_f0 = self.cr0_fixed0;
-                if self.unrestricted {
-                    cr0_f0 &= !(CR0_PE | CR0_PG);
-                }
-                let guest_cr0 = (s.cr0 | cr0_f0) & self.cr0_fixed1;
+                 * PE and PG are not forced. From here the guest changes CR3,
+                 * CR4 and the bits of CR0 outside `cr0_mask` in the VMCS
+                 * itself; the mask's bits exit, and the policy writes them
+                 * (`set_cr0`). */
                 let guest_cr4 = (s.cr4 | self.cr4_fixed0 | CR4_VMXE_BIT) & self.cr4_fixed1;
                 vmwrite(GUEST_CR0, guest_cr0);
                 vmwrite(GUEST_CR3, s.cr3);
                 vmwrite(GUEST_CR4, guest_cr4);
-                /* The read shadow masks only VMXE, so its VMXE=0 is what the
-                 * guest reads there forever; the other bits are unmasked and
-                 * read from the live CR, so this too is a one-time write. */
-                vmwrite(CR0_GUEST_HOST_MASK, 0);
+                /* What the guest reads of the host's bits: CR0 as it wrote
+                 * it, and CR4.VMXE clear. */
                 vmwrite(CR0_READ_SHADOW, s.cr0);
                 vmwrite(CR4_READ_SHADOW, s.cr4 & !CR4_VMXE_BIT);
+                vmwrite(VMENTRY_CTLS, entry_ctls as u64);
 
                 seg(GUEST_CS_SEL, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR, &s.cs);
                 seg(GUEST_SS_SEL, GUEST_SS_BASE, GUEST_SS_LIMIT, GUEST_SS_AR, &s.ss);
@@ -1117,11 +1228,22 @@ impl Guest {
                 sysenter_eip: s.sysenter_eip,
                 interruptibility: self.interruptibility,
                 proc1: self.synced.proc1,
+                entry_ctls,
             };
             self.full_sync = false;
             self.rsp_dirty = false;
+            self.cr0_dirty = false;
             return;
         }
+        if self.cr0_dirty {
+            let guest_cr0 = self.hw_cr0(s.cr0);
+            unsafe {
+                vmwrite(GUEST_CR0, guest_cr0);
+                vmwrite(CR0_READ_SHADOW, s.cr0);
+            }
+            self.cr0_dirty = false;
+        }
+        let entry_ctls = self.entry_ctls_for(efer);
         if self.rsp_dirty {
             unsafe { vmwrite(GUEST_RSP, s.rsp) };
             self.rsp_dirty = false;
@@ -1148,6 +1270,10 @@ impl Guest {
             if efer != y.efer {
                 vmwrite(GUEST_IA32_EFER, efer);
                 y.efer = efer;
+            }
+            if entry_ctls != y.entry_ctls {
+                vmwrite(VMENTRY_CTLS, entry_ctls as u64);
+                y.entry_ctls = entry_ctls;
             }
             if s.g_pat != y.pat {
                 vmwrite(GUEST_IA32_PAT, s.g_pat);
@@ -1264,9 +1390,11 @@ impl Guest {
             g.limit = vmread(lim_f) as u32;
             g.attrib = attrib_from_ar(vmread(ar_f) as u32);
         };
+        let mask = self.cr0_mask;
         unsafe {
             s.rsp = vmread(GUEST_RSP);
-            s.cr0 = vmread(GUEST_CR0);
+            /* CR0 as the guest reads it: the host's bits from the shadow. */
+            s.cr0 = (vmread(GUEST_CR0) & !mask) | (vmread(CR0_READ_SHADOW) & mask);
             s.cr3 = vmread(GUEST_CR3);
             s.cr4 = vmread(GUEST_CR4) & !CR4_VMXE_BIT;
             rd(GUEST_CS_SEL, GUEST_CS_BASE, GUEST_CS_LIMIT, GUEST_CS_AR, &mut s.cs);
@@ -1309,6 +1437,7 @@ impl Guest {
             r::IO_INSTRUCTION | r::CPUID | r::RDMSR | r::WRMSR
                 | r::EXTERNAL_INTERRUPT | r::INIT | r::SIPI | r::NMI_WINDOW
                 | r::INTERRUPT_WINDOW | r::VMCALL | r::PAUSE | r::RDTSC | r::RDPMC
+                | r::CR_ACCESS
         )
     }
 
@@ -1330,13 +1459,26 @@ impl Guest {
             (true, true, true)
         } else {
             match basic {
-                r::EXTERNAL_INTERRUPT | r::INTERRUPT_WINDOW | r::NMI_WINDOW | r::PAUSE => (false, false, false),
-                r::HLT | r::CPUID | r::RDMSR | r::WRMSR | r::VMCALL | r::WBINVD | r::RDTSC
+                r::EXTERNAL_INTERRUPT | r::INTERRUPT_WINDOW | r::NMI_WINDOW => (false, false, false),
+                r::HLT | r::PAUSE | r::CPUID | r::RDMSR | r::WRMSR | r::VMCALL | r::WBINVD | r::RDTSC
                 | r::RDPMC | r::XSETBV | r::MONITOR | r::MWAIT | r::RDTSCP | r::INVD => (true, false, false),
-                r::IO_INSTRUCTION => (true, true, false),
+                r::IO_INSTRUCTION | r::CR_ACCESS => (true, true, false),
                 _ => (true, true, true),
             }
         };
+        if basic == r::CR_ACCESS && self.exit_reason & r::ENTRY_FAILURE == 0 {
+            /* What the policy needs to answer a `mov` to or from a control
+             * register: CR0 as the guest sees it, CR4 and CS's L bit for
+             * the checks a write of CR0 makes, and RSP -- the one register a
+             * `mov` may name that the guest keeps in the VMCS. */
+            let mask = self.cr0_mask;
+            unsafe {
+                self.exit_cr0 = (vmread(GUEST_CR0) & !mask) | (vmread(CR0_READ_SHADOW) & mask);
+                self.exit_cr4 = vmread(GUEST_CR4) & !CR4_VMXE_BIT;
+                self.exit_cs_ar = vmread(GUEST_CS_AR) as u32;
+                self.save.rsp = vmread(GUEST_RSP);
+            }
+        }
         unsafe {
             self.exit_instr_len = if len { vmread(VMEXIT_INSTRUCTION_LEN) as u32 } else { 0 };
             self.exit_qual = if qual { vmread(EXIT_QUALIFICATION) } else { 0 };
@@ -1469,6 +1611,9 @@ impl Guest {
                 unsafe { self.configure(nested.root) };
             }
             if self.host_cpu != cpu as i32 {
+                /* A first entry here drops the VPID's translations below, and
+                 * with them whatever a reset asked to be dropped. */
+                self.flush_vpid = false;
                 unsafe { HostRegs::capture().write() };
                 self.fill_host_msrs();
                 /* This guest's first entry on this CPU: whatever the CPU has
@@ -1503,6 +1648,23 @@ impl Guest {
                 }
                 self.host_cpu = cpu as i32;
             }
+            /* The policy wrote CR0, or reset the guest: what the CPU cached
+             * under its VPID goes, as a `mov` to CR0 or an INIT would have
+             * taken it. Without VPIDs every entry and exit flushes anyway. */
+            if self.flush_vpid {
+                if self.vpid != 0 {
+                    let (kind, vpid) = if self.invvpid_single {
+                        (vmcs::INVVPID_SINGLE_CONTEXT, self.vpid)
+                    } else {
+                        (vmcs::INVVPID_ALL_CONTEXT, 0)
+                    };
+                    if !unsafe { vmcs::invvpid(kind, vpid) } {
+                        if let Some(k) = kick { k.left(); }
+                        return Err(NotRun::Flush { cpu });
+                    }
+                }
+                self.flush_vpid = false;
+            }
             let t1 = stamp(timed);
             unsafe { self.write_guest_state() };
             self.fill_guest_msrs();
@@ -1510,8 +1672,10 @@ impl Guest {
                 /* The interrupt-window control is dynamic: on only while the
                  * policy is waiting to inject an IRQ the guest cannot take
                  * yet. Written when it changes. */
+                let nmi_window = self.nmi_window && self.pin & vmcs::PIN_VIRTUAL_NMIS != 0;
                 let proc1 = self.proc1
-                    | if self.irq_window { vmcs::PROC_INTR_WINDOW_EXITING } else { 0 };
+                    | if self.irq_window { vmcs::PROC_INTR_WINDOW_EXITING } else { 0 }
+                    | if nmi_window { vmcs::PROC_NMI_WINDOW_EXITING } else { 0 };
                 if proc1 != self.synced.proc1 {
                     vmcs::vmwrite(vmcs::PROC_BASED_CTLS, proc1 as u64);
                     self.synced.proc1 = proc1;

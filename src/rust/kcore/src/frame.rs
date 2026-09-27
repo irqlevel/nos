@@ -51,7 +51,16 @@ impl Frame {
 
     /// Copy `data` into the page at `offset`. False, and nothing written,
     /// when that is not inside the page.
-    pub fn write(&mut self, offset: usize, data: &[u8]) -> bool {
+    ///
+    /// Through `&self`, as `read` is: the copy goes through the calling
+    /// CPU's own slot of the window with its interrupts off, so two CPUs
+    /// copying into one page at once share nothing of the kernel's -- and
+    /// no reference into the page exists for them to alias. What the page
+    /// holds is not the compiler's to reason about: the guest whose memory
+    /// it is writes it from its own CPUs whenever it runs, several at once
+    /// for a guest of several CPUs, and a host copy racing them gets what
+    /// the race gives, byte by byte.
+    pub fn write(&self, offset: usize, data: &[u8]) -> bool {
         if !inside(offset, data.len()) {
             return false;
         }

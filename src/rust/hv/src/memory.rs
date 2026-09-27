@@ -8,6 +8,7 @@ use hvarch::{Error, Result};
 use kcore::consts::PAGE_SIZE;
 use kcore::frame::Frame;
 use kcore::pod::{self, Pod};
+use kcore::sync::Mutex;
 
 #[cfg(target_arch = "x86_64")]
 use crate::ept::Ept;
@@ -72,6 +73,12 @@ const MMIO_WINDOW: core::ops::Range<u64> = 0xC000_0000..0x1_0000_0000;
 /// walks the whole window is not probing for a device.
 #[cfg(target_arch = "x86_64")]
 const MAX_ABSENT_PAGES: usize = 64;
+/// The local APIC's page in xAPIC mode. A guest's APIC is an x2APIC, reached
+/// through MSRs, and never this page: a guest that reads it has left x2APIC
+/// mode, and is better stopped at the read, naming the page, than answered
+/// with an APIC whose every register is all ones.
+#[cfg(target_arch = "x86_64")]
+pub const XAPIC_PAGE: u64 = 0xFEE0_0000;
 
 /// A guest's memory.
 ///
@@ -90,18 +97,35 @@ const MAX_ABSENT_PAGES: usize = 64;
 /// pages this value owns -- each one owned before it is mapped, and freed
 /// only with the table -- so "the guest can reach host memory it was not
 /// given" is not a thing a caller can get wrong.
+///
+/// A guest of several CPUs shares one: every vCPU's task copies in and out
+/// of it (`read` and `write` take `&self`, each copy a CPU's own), and any
+/// of them may find an absent device (`map_absent`), which grows the table
+/// under a lock. The regions are fixed once the guest is built.
 pub struct GuestMemory {
     /* Before the regions and the absent page, so that it is dropped first:
      * the table goes before the pages it maps are back on the free list. */
     #[cfg(target_arch = "x86_64")]
-    table: SecondLevel,
-    regions: Vec<Region>,
-    /// A page of all ones, the guest's reads of an absent device: made the
-    /// first time one is needed, mapped read-only wherever it is.
+    table: Mutex<SecondLevel>,
+    /// The table's top level and identity, as an entry names them: neither
+    /// changes for as long as the table lives, so an entry reads them here
+    /// without the table's lock.
     #[cfg(target_arch = "x86_64")]
-    absent: Option<Frame>,
+    nested: hvarch::x86::svm::Nested,
+    regions: Vec<Region>,
+    /// The page of all ones a guest's reads of an absent device find, and
+    /// where it is mapped.
+    absent: Mutex<Absent>,
+}
+
+/// What [`GuestMemory::map_absent`] has made so far.
+struct Absent {
+    /// A page of all ones: made the first time one is needed, mapped
+    /// read-only wherever it is.
+    #[cfg(target_arch = "x86_64")]
+    frame: Option<Frame>,
     /// Where it is mapped, page-aligned, in the order the guest found them.
-    absent_at: Vec<u64>,
+    at: Vec<u64>,
 }
 
 /// One run of guest physical addresses with memory behind it.
@@ -122,11 +146,6 @@ impl Region {
         let page = ((gpa - self.base) / PAGE) as usize;
         (&self.runs[page / RUN_FRAMES][page % RUN_FRAMES], (gpa % PAGE) as usize)
     }
-
-    fn frame_mut(&mut self, gpa: u64) -> (&mut Frame, usize) {
-        let page = ((gpa - self.base) / PAGE) as usize;
-        (&mut self.runs[page / RUN_FRAMES][page % RUN_FRAMES], (gpa % PAGE) as usize)
-    }
 }
 
 impl GuestMemory {
@@ -139,12 +158,12 @@ impl GuestMemory {
             Vendor::Vmx => SecondLevel::Ept(Ept::new()?),
             _ => return Err(Error::NotImplemented),
         };
+        let nested = table.nested();
         Ok(Self {
-            table,
+            table: Mutex::new(table).ok_or(Error::NoMemory)?,
+            nested,
             regions: Vec::new(),
-            #[cfg(target_arch = "x86_64")]
-            absent: None,
-            absent_at: Vec::new(),
+            absent: Mutex::new(Absent { frame: None, at: Vec::new() }).ok_or(Error::NoMemory)?,
         })
     }
 
@@ -154,7 +173,7 @@ impl GuestMemory {
     pub fn new() -> Result<Self> {
         Ok(Self {
             regions: Vec::new(),
-            absent_at: Vec::new(),
+            absent: Mutex::new(Absent { at: Vec::new() }).ok_or(Error::NoMemory)?,
         })
     }
 
@@ -192,7 +211,9 @@ impl GuestMemory {
         /* The tables next, which is all that can fail for want of memory:
          * a failure there leaves empty tables and no page mapped. */
         #[cfg(target_arch = "x86_64")]
-        self.table.prepare(base, size)?;
+        let mut table = self.table.lock();
+        #[cfg(target_arch = "x86_64")]
+        table.prepare(base, size)?;
 
         self.regions.try_reserve(1).map_err(|_| Error::NoMemory)?;
         self.regions.push(Region { base, size, runs });
@@ -204,7 +225,7 @@ impl GuestMemory {
             let region = self.regions.last().expect("just pushed");
             let mut gpa = base;
             for frame in region.runs.iter().flatten() {
-                self.table.set(gpa, frame.phys())?;
+                table.set(gpa, frame.phys())?;
                 gpa += PAGE;
             }
         }
@@ -223,39 +244,58 @@ impl GuestMemory {
     /// a write needs the instruction's length, which is a decoder this
     /// hypervisor does not have, and a read of an address outside the window
     /// is a guest's mistake, not a probe. So a write to the page is still a
-    /// nested fault, and stops the guest; so is one read past its RAM.
+    /// nested fault, and stops the guest; so is one read past its RAM. And
+    /// not the local APIC's own page (`XAPIC_PAGE`): a guest's APIC is an
+    /// x2APIC, and one that reads it there has left x2APIC mode.
     #[cfg(target_arch = "x86_64")]
-    pub fn map_absent(&mut self, gpa: u64) -> Result<()> {
+    pub fn map_absent(&self, gpa: u64) -> Result<()> {
         let page = gpa & !(PAGE - 1);
-        if !MMIO_WINDOW.contains(&page) || self.region(page, PAGE_SIZE).is_ok() {
+        if !MMIO_WINDOW.contains(&page) || page == XAPIC_PAGE || self.region(page, PAGE_SIZE).is_ok() {
             return Err(Error::BadAddress);
         }
-        if self.absent_at.len() >= MAX_ABSENT_PAGES {
+        /* The absent pages' lock, then the table's: the one order anything
+         * here takes both in. */
+        let mut absent = self.absent.lock();
+        if absent.at.contains(&page) {
+            /* Another of the guest's CPUs read it first, and it is mapped
+             * already: this one's read runs again and finds it. */
+            return Ok(());
+        }
+        if absent.at.len() >= MAX_ABSENT_PAGES {
             return Err(Error::NoMemory);
         }
-        if self.absent.is_none() {
+        if absent.frame.is_none() {
             /* Filled a piece at a time: a page of it on the task's stack is
              * a page the stack may not have. */
             const PIECE: usize = 512;
-            let mut frame = Frame::new().ok_or(Error::NoMemory)?;
+            let frame = Frame::new().ok_or(Error::NoMemory)?;
             for at in (0..PAGE_SIZE).step_by(PIECE) {
                 if !frame.write(at, &[0xFF; PIECE]) {
                     return Err(Error::NoMemory);
                 }
             }
-            self.absent = Some(frame);
+            absent.frame = Some(frame);
         }
-        let hpa = self.absent.as_ref().map(|f| f.phys()).ok_or(Error::NoMemory)?;
-        self.absent_at.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        self.table.prepare(page, PAGE)?;
-        self.table.set_ro(page, hpa)?;
-        self.absent_at.push(page);
+        let hpa = absent.frame.as_ref().map(|f| f.phys()).ok_or(Error::NoMemory)?;
+        absent.at.try_reserve(1).map_err(|_| Error::NoMemory)?;
+        {
+            let mut table = self.table.lock();
+            table.prepare(page, PAGE)?;
+            table.set_ro(page, hpa)?;
+        }
+        absent.at.push(page);
         Ok(())
     }
 
-    /// Where the guest has read an absent device, for a report.
-    pub fn absent_pages(&self) -> &[u64] {
-        &self.absent_at
+    /// Where the guest has read an absent device, for a report: empty when
+    /// there is no memory to say it in.
+    pub fn absent_pages(&self) -> Vec<u64> {
+        let absent = self.absent.lock();
+        let mut pages = Vec::new();
+        if pages.try_reserve_exact(absent.at.len()).is_ok() {
+            pages.extend_from_slice(&absent.at);
+        }
+        pages
     }
 
     /// How much memory the guest has, over every region.
@@ -284,13 +324,14 @@ impl GuestMemory {
         Ok(())
     }
 
-    /// Copy `data` in at `gpa`.
-    pub fn write(&mut self, gpa: u64, data: &[u8]) -> Result<()> {
-        let index = self.region(gpa, data.len())?;
-        let region = &mut self.regions[index];
+    /// Copy `data` in at `gpa`. Through `&self`, as `read` is: a copy into
+    /// the guest's memory is one more writer of it beside the guest's own
+    /// CPUs, which write it with no reference of the host's in sight.
+    pub fn write(&self, gpa: u64, data: &[u8]) -> Result<()> {
+        let region = &self.regions[self.region(gpa, data.len())?];
         let mut done = 0usize;
         while done < data.len() {
-            let (frame, off) = region.frame_mut(gpa + done as u64);
+            let (frame, off) = region.frame(gpa + done as u64);
             let n = (data.len() - done).min(PAGE_SIZE - off);
             if !frame.write(off, &data[done..done + n]) {
                 return Err(Error::Unmapped);
@@ -307,7 +348,7 @@ impl GuestMemory {
         Ok(value)
     }
 
-    pub fn write_obj<T: Pod>(&mut self, gpa: u64, value: &T) -> Result<()> {
+    pub fn write_obj<T: Pod>(&self, gpa: u64, value: &T) -> Result<()> {
         self.write(gpa, pod::bytes_of(value))
     }
 
@@ -315,6 +356,6 @@ impl GuestMemory {
     /// physical address through, and what the TLB may keep of it.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn nested(&self) -> hvarch::x86::svm::Nested {
-        self.table.nested()
+        self.nested
     }
 }

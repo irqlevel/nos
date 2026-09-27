@@ -101,7 +101,7 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--internet]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
@@ -348,6 +348,18 @@ one of the first two had, after a generation ended, and each read its own
 page. The unload that follows, and the load after it, are then of a
 hypervisor that has run guests on those CPUs.
 
+`smp` is the one guest of two CPUs, its second on another host CPU than
+the first ([More than one CPU](hypervisor.md#more-than-one-cpu)), and its
+verdict is the guest's own record, read out of its memory: the second CPU,
+started by INIT and a start-up IPI, came up in real mode and reached long
+mode, and says it is x2APIC ID 1 and CPUID's 1; its IPI reached the first;
+the first's one-shot APIC timer then ran out and interrupted it, and reads
+0 after; and the counts agree -- one start, one IPI each way, one timer.
+Under TCG it needs QEMU 9.2 or later, and the gate refuses an older one:
+before 9.2, TCG did not put a guest with paging off through the nested
+table at all, and the second CPU's real mode would have run on nos's own
+memory.
+
 Which backend it exercises is the host's. Under KVM, `-cpu host` gives the
 guest the host CPU's own extension -- AMD-V on an AMD host, Intel VT-x on an
 Intel one, nested, since nos is itself a KVM guest -- and TCG's `-cpu max`
@@ -381,7 +393,10 @@ CPUs left on. With the run stub storing R8 into R9's slot, the hypercall
 guest fails on both CPUs, naming R8 as 0. And with the stub's `vmload` of
 the host's state taken out, the kernel panics at the first exit -- a page
 fault at 0 in `Hal::GetCurrentCpuHwId()`, the guest's GS base -- and the
-gate says so.
+gate says so. And `smp` fails two ways more: with the start-up IPI ignored,
+the second CPU never enters, and the report shows the first halted where it
+waits for the second's IPI; with the APIC timer never running out, the
+first halts where it waits for the timer instead.
 
 x86-64 boots the ISO with `-cpu max`: the default `qemu64` model reports SVM
 without nested paging. It uses KVM only when the host CPU has AMD-V, since
@@ -460,6 +475,16 @@ guest kernel with PCI, legacy virtio-pci, virtio-blk and ext4 built in.
 driver takes ext2's batches of blocks its own way, and NVMe's is the one the
 AX41 runs.
 
+`--cpus N` gives every guest of the run N CPUs, the boot's and the VMs'.
+The boot must say `smp: Brought up 1 node, N CPUs`, and its report that the
+guest started N-1 of them; in the VM phase every CPU must be online, each
+must have taken its own local timer's interrupts, rescheduling IPIs must
+have gone between them, and `hv list` must name the host CPU of each. It
+goes with `--disk`, `--nvme-root`, `--net` and `--attach`. The guest kernel
+needs Linux 6.6 or later with `SMP`, `X86_X2APIC` and `X86_MPPARSE` ([More
+than one CPU](hypervisor.md#more-than-one-cpu) says why), and under TCG the
+gate wants QEMU 9.2 or later, as `hv-test.py` does.
+
 `--net` is the guests' network: two guests with `net`; each has its port's
 address and MAC; a guest pings nos at 10.0.100.1 and each pings the other;
 nos pings a guest out of `hv0`; and a page from one guest's `httpd` is
@@ -484,7 +509,10 @@ nothing. Under TCG only the first two tell anything -- with the kick taken
 out, `kicks` reads 0 and the check fails, but slirp never outruns the host's
 tick, so no frame was dropped either; the drops show at line rate, on the
 AX41. It needs a guest kernel with networking, virtio-net, packet sockets
-and `ip=` configuration built in.
+and `ip=` configuration built in, and POSIX timers: BusyBox's `ping` paces
+itself with `alarm()`, which a `tinyconfig` leaves out, and without it the
+guest's `ping` waits for ever after its first answer -- which reads as a
+network that stopped.
 
 ### `hv-distro-test.py` -- a distribution, as it ships
 

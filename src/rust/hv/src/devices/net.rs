@@ -147,7 +147,7 @@ impl Net {
 
     /// A write of `size` bytes at `offset` in the BAR; true when the
     /// interrupt line is to go up.
-    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &mut GuestMemory) -> bool {
+    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory) -> bool {
         if offset >= virtio::DEVICE_CONFIG {
             return false;
         }
@@ -165,7 +165,7 @@ impl Net {
     }
 
     /// Everything the driver has queued to send, to the backend.
-    fn send(&mut self, mem: &mut GuestMemory) -> bool {
+    fn send(&mut self, mem: &GuestMemory) -> bool {
         if self.broken.is_some() {
             return false;
         }
@@ -223,7 +223,7 @@ impl Net {
 
     /// What the backend has for the guest, into the buffers the driver has
     /// posted: true when the interrupt line is to go up.
-    pub fn poll(&mut self, mem: &mut GuestMemory) -> bool {
+    pub fn poll(&mut self, mem: &GuestMemory) -> bool {
         if self.broken.is_some() || !self.transport.queue(RX_QUEUE).map_or(false, |q| q.ready()) {
             return false;
         }
@@ -273,7 +273,7 @@ impl Net {
     /// The header (all zero: nothing to say) and the frame in `rx_buf`, into
     /// the chain's writable buffers: what was written, or 0 when they are
     /// too short for it -- the frame then dropped.
-    fn receive(&mut self, mem: &mut GuestMemory, segs: &[Seg], len: usize) -> usize {
+    fn receive(&mut self, mem: &GuestMemory, segs: &[Seg], len: usize) -> usize {
         let room: u64 = segs.iter().filter(|s| s.write).map(|s| u64::from(s.len)).sum();
         if room < (HDR + len) as u64 {
             self.stats.dropped += 1;

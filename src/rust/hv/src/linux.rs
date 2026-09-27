@@ -15,9 +15,17 @@
 //! own page tables and GDT are built there too -- this loader never holds a
 //! reference into guest memory, and what it writes the guest could have
 //! written itself.
+//!
+//! So is the one table a PC's firmware leaves that the kernel needs to find
+//! its other CPUs: an Intel MultiProcessor Specification table, which a
+//! kernel with ACPI off (or none) reads the CPUs from -- each by its APIC ID
+//! -- and which says there is no IO-APIC it may use. Its interrupts come
+//! through the 8259 to the first CPU's LINT0, as the loader's `noapic` also
+//! tells the kernel.
 
 use hvarch::{Error, Result};
 
+use crate::lapic;
 use crate::memory::GuestMemory;
 use crate::svm::LongMode;
 use crate::vm::Backend;
@@ -79,6 +87,43 @@ const STACK: u64 = 0x6000;
 /// The command line's ceiling, whatever the header allows: it and the zero
 /// page and the tables all live in the first 640 KiB.
 const CMDLINE_MAX: usize = 2048;
+
+/// Where low RAM ends in the e820 map: 639 KiB, the usual top of it, the
+/// last KiB below 640 being where firmware keeps its tables.
+const LOW_TOP: u64 = 0x9_FC00;
+
+/* The MP table: its floating pointer in that last KiB below 640 KiB, the
+ * second place a kernel looks ("the top 1K of base RAM"), and the table
+ * after it. The e820 map ends RAM before it, so the kernel keeps its hands
+ * off it. From the MultiProcessor Specification 1.4, chapter 4. */
+const MP_FLOATING: u64 = LOW_TOP;
+const MP_TABLE: u64 = MP_FLOATING + MP_FLOATING_BYTES as u64;
+const MP_FLOATING_BYTES: usize = 16;
+const MP_HEADER_BYTES: usize = 44;
+const MP_PROCESSOR_BYTES: usize = 20;
+const MP_ENTRY_BYTES: usize = 8;
+/// Specification 1.4.
+const MP_SPEC_REV: u8 = 4;
+const MP_ENTRY_PROCESSOR: u8 = 0;
+const MP_ENTRY_BUS: u8 = 1;
+const MP_ENTRY_IOAPIC: u8 = 2;
+const MP_ENTRY_IO_INTERRUPT: u8 = 3;
+const MP_ENTRY_LOCAL_INTERRUPT: u8 = 4;
+const MP_CPU_ENABLED: u8 = 1 << 0;
+const MP_CPU_BOOT: u8 = 1 << 1;
+/// The local APIC's version, as its register reads (`lapic`).
+const MP_APIC_VERSION: u8 = 0x14;
+const MP_IOAPIC_VERSION: u8 = 0x11;
+const MP_IOAPIC_ADDRESS: u32 = 0xFEC0_0000;
+/* Interrupt types, and a local interrupt destination meaning every APIC. */
+const MP_INT: u8 = 0;
+const MP_NMI: u8 = 1;
+const MP_EXTINT: u8 = 3;
+const MP_ALL_APICS: u8 = 0xFF;
+const MP_ISA_BUS: u8 = 0;
+/// The PC's ISA interrupts: 16, the cascade (2) not among them.
+const ISA_IRQS: u8 = 16;
+const ISA_CASCADE: u8 = 2;
 
 /* boot_params: e820 map. */
 const BP_E820_ENTRIES: usize = 0x1e8;
@@ -250,11 +295,12 @@ fn round_up(v: u64, to: u64) -> u64 {
 /// the GDT. The kernel and the initrd are the module's to stream in, at the
 /// addresses `layout` names; everything here is small and goes in one call.
 pub fn build(
-    memory: &mut GuestMemory,
+    memory: &GuestMemory,
     header: &Header,
     first: &[u8],
     layout: &Layout,
     cmdline: &[u8],
+    cpus: u32,
 ) -> Result<()> {
     if cmdline.len() >= CMDLINE_MAX || cmdline.len() as u32 >= header.cmdline_size {
         return Err(Error::BadAddress);
@@ -280,23 +326,112 @@ pub fn build(
     write_e820(memory, layout.mem_bytes)?;
     write_page_tables(memory)?;
     write_gdt(memory)?;
+    /* A guest of one CPU has no APIC, and so no table of its CPUs. */
+    if cpus > 1 {
+        write_mp_table(memory, cpus)?;
+    }
     Ok(())
 }
 
-fn put8(m: &mut GuestMemory, gpa: u64, v: u8) -> Result<()> {
+fn put8(m: &GuestMemory, gpa: u64, v: u8) -> Result<()> {
     m.write(gpa, &[v])
 }
-fn put32(m: &mut GuestMemory, gpa: u64, v: u32) -> Result<()> {
+fn put32(m: &GuestMemory, gpa: u64, v: u32) -> Result<()> {
     m.write(gpa, &v.to_le_bytes())
 }
-fn put64(m: &mut GuestMemory, gpa: u64, v: u64) -> Result<()> {
+fn put64(m: &GuestMemory, gpa: u64, v: u64) -> Result<()> {
     m.write(gpa, &v.to_le_bytes())
+}
+
+/// The byte that makes `bytes` sum to zero, as each MP structure's
+/// checksum does.
+fn checksum(bytes: &[u8]) -> u8 {
+    0u8.wrapping_sub(bytes.iter().fold(0u8, |a, b| a.wrapping_add(*b)))
+}
+
+/// The MP table for a guest of `cpus` CPUs, APIC IDs 0 up, the first the
+/// boot CPU: a processor entry each, the ISA bus, and the interrupts --
+/// the 8259's on the first CPU's LINT0 (ExtINT), NMI on every CPU's LINT1.
+///
+/// And an IO-APIC marked unusable, with the ISA interrupts wired to it. A
+/// kernel that finds no interrupt entries at all in the table calls it a
+/// BIOS bug and makes up its own; an IO-APIC it is told it may not use,
+/// described with the wiring a PC's would have, it takes as it is -- and
+/// registers nothing, the machine having none (`noapic` says so again).
+fn write_mp_table(m: &GuestMemory, cpus: u32) -> Result<()> {
+    let cpus = usize::try_from(cpus).map_err(|_| Error::BadAddress)?;
+    if cpus == 0 || cpus > crate::smp::MAX_VCPUS {
+        return Err(Error::BadAddress);
+    }
+    let ioapic_id = cpus as u8;
+    let signature = crate::policy::cpuid(1, 0, 0, true);
+
+    /* Built in a buffer on the stack -- every entry the most CPUs need
+     * fits in far less than the KiB the table has -- then copied in. */
+    const TABLE_MAX: usize = MP_HEADER_BYTES + crate::smp::MAX_VCPUS * MP_PROCESSOR_BYTES
+        + (3 + ISA_IRQS as usize + 2) * MP_ENTRY_BYTES;
+    const _: () = assert!(MP_FLOATING_BYTES + TABLE_MAX <= 0x400);
+    let mut t = [0u8; TABLE_MAX];
+    let mut at = MP_HEADER_BYTES;
+    let mut entries = 0u16;
+
+    for id in 0..cpus {
+        let e = &mut t[at..at + MP_PROCESSOR_BYTES];
+        e[0] = MP_ENTRY_PROCESSOR;
+        e[1] = id as u8;
+        e[2] = MP_APIC_VERSION;
+        e[3] = MP_CPU_ENABLED | if id == 0 { MP_CPU_BOOT } else { 0 };
+        e[4..8].copy_from_slice(&(signature.eax & 0xFFF).to_le_bytes());
+        e[8..12].copy_from_slice(&signature.edx.to_le_bytes());
+        at += MP_PROCESSOR_BYTES;
+        entries += 1;
+    }
+    let mut entry = |t: &mut [u8; TABLE_MAX], bytes: [u8; MP_ENTRY_BYTES]| {
+        t[at..at + MP_ENTRY_BYTES].copy_from_slice(&bytes);
+        at += MP_ENTRY_BYTES;
+        entries += 1;
+    };
+    entry(&mut t, [MP_ENTRY_BUS, MP_ISA_BUS, b'I', b'S', b'A', b' ', b' ', b' ']);
+    let io = MP_IOAPIC_ADDRESS.to_le_bytes();
+    /* Flags 0: not usable. */
+    entry(&mut t, [MP_ENTRY_IOAPIC, ioapic_id, MP_IOAPIC_VERSION, 0, io[0], io[1], io[2], io[3]]);
+    /* The 8259's output on the IO-APIC's pin 0, and each ISA interrupt on
+     * the pin of its own number, as a PC wires them. Flags 0: polarity and
+     * trigger as the bus has them. */
+    entry(&mut t, [MP_ENTRY_IO_INTERRUPT, MP_EXTINT, 0, 0, MP_ISA_BUS, 0, ioapic_id, 0]);
+    for irq in 0..ISA_IRQS {
+        if irq != ISA_CASCADE {
+            entry(&mut t, [MP_ENTRY_IO_INTERRUPT, MP_INT, 0, 0, MP_ISA_BUS, irq, ioapic_id, irq]);
+        }
+    }
+    entry(&mut t, [MP_ENTRY_LOCAL_INTERRUPT, MP_EXTINT, 0, 0, MP_ISA_BUS, 0, 0, 0]);
+    entry(&mut t, [MP_ENTRY_LOCAL_INTERRUPT, MP_NMI, 0, 0, MP_ISA_BUS, 0, MP_ALL_APICS, 1]);
+    let len = at;
+
+    t[0..4].copy_from_slice(b"PCMP");
+    t[4..6].copy_from_slice(&(len as u16).to_le_bytes());
+    t[6] = MP_SPEC_REV;
+    t[8..16].copy_from_slice(b"NOS     ");
+    t[16..28].copy_from_slice(b"HYPERVISOR  ");
+    t[34..36].copy_from_slice(&entries.to_le_bytes());
+    t[36..40].copy_from_slice(&(lapic::DEFAULT_BASE as u32).to_le_bytes());
+    t[7] = checksum(&t[..len]);
+    m.write(MP_TABLE, &t[..len])?;
+
+    let mut f = [0u8; MP_FLOATING_BYTES];
+    f[0..4].copy_from_slice(b"_MP_");
+    f[4..8].copy_from_slice(&(MP_TABLE as u32).to_le_bytes());
+    f[8] = 1; // its length, in 16-byte units
+    f[9] = MP_SPEC_REV;
+    /* Feature bytes 0: the table above is there, not a default
+     * configuration, and no IMCR -- virtual-wire mode. */
+    f[10] = checksum(&f);
+    m.write(MP_FLOATING, &f)
 }
 
 /// The memory map the kernel reads instead of asking a BIOS: low RAM, the
 /// hole at 640 KiB, and the rest of RAM from 1 MiB up.
-fn write_e820(m: &mut GuestMemory, mem_bytes: u64) -> Result<()> {
-    const LOW_TOP: u64 = 0x9_FC00; // 639 KiB, the usual top of low RAM
+fn write_e820(m: &GuestMemory, mem_bytes: u64) -> Result<()> {
     const ONE_MIB: u64 = 0x10_0000;
 
     let mut entries = [(0u64, 0u64, 0u32); 2];
@@ -325,7 +460,7 @@ fn write_e820(m: &mut GuestMemory, mem_bytes: u64) -> Result<()> {
 /// pages: every guest physical address a guest of a few GiB has, mapped to
 /// itself, which is what the 64-bit entry needs of the zero page, the
 /// command line and the kernel's init range.
-fn write_page_tables(m: &mut GuestMemory) -> Result<()> {
+fn write_page_tables(m: &GuestMemory) -> Result<()> {
     put64(m, PML4, PDPT | PTE_PRESENT | PTE_WRITE)?;
     for gib in 0..IDENTITY_GIB {
         let pd = PD_BASE + gib * 0x1000;
@@ -340,7 +475,7 @@ fn write_page_tables(m: &mut GuestMemory) -> Result<()> {
 
 /// The GDT the entry names: null, then __BOOT_CS, __BOOT_DS and a 64-bit
 /// TSS, at the selectors the protocol fixes.
-fn write_gdt(m: &mut GuestMemory) -> Result<()> {
+fn write_gdt(m: &GuestMemory) -> Result<()> {
     put64(m, GDT + (BOOT_CS as u64 / 8) * 8, GDT_CODE64)?;
     put64(m, GDT + (BOOT_DS as u64 / 8) * 8, GDT_DATA)?;
     let ti = BOOT_TR as u64 / 8;
