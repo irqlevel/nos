@@ -9,6 +9,15 @@
 //! function's configuration is 256 bytes of plain data, with the few fields
 //! a guest may write -- the command register, BAR 0, the interrupt line --
 //! written through their masks, and everything else read-only.
+//!
+//! A function may also have MSI-X (`Function::with_msix`): a capability in
+//! its configuration, and a memory BAR 1 whose one page holds the vector
+//! table and the pending bits. That page is a page of the guest's own memory
+//! at the address the BAR names -- the guest writes its table with plain
+//! moves and no exit, and the device reads an entry when it has an
+//! interrupt to send -- so a memory BAR needs no instruction decoded either.
+//! It stays where it was put, as firmware would lock it: sizing it reads
+//! back its size, and any other address written reads back the old one.
 
 use alloc::vec::Vec;
 
@@ -34,12 +43,15 @@ const ADDRESS_FUNCTION_MASK: u32 = 0x7;
 const VENDOR_ID: usize = 0x00;
 const DEVICE_ID: usize = 0x02;
 const COMMAND: usize = 0x04;
+const STATUS: usize = 0x06;
 const REVISION: usize = 0x08;
 const CLASS_PROG_IF: usize = 0x09;
 const HEADER_TYPE: usize = 0x0E;
 const BAR0: usize = 0x10;
+const BAR1: usize = 0x14;
 const SUBSYSTEM_VENDOR: usize = 0x2C;
 const SUBSYSTEM_ID: usize = 0x2E;
+const CAPABILITIES: usize = 0x34;
 const INTERRUPT_LINE: usize = 0x3C;
 const INTERRUPT_PIN: usize = 0x3D;
 
@@ -52,6 +64,35 @@ const COMMAND_WRITABLE: u16 = 0x0007;
 const BAR_IO: u32 = 1;
 /// Interrupt pin A.
 const PIN_INTA: u8 = 1;
+/// The status register's "capabilities list" bit: CAPABILITIES points at one.
+const STATUS_CAP_LIST: u16 = 1 << 4;
+
+/* The MSI-X capability, the only one: its ID and next pointer, the message
+ * control word, and where the table and the pending bits are -- an offset
+ * in a BAR, the BAR's number in the low three bits. */
+const MSIX_CAP: usize = 0x40;
+const CAP_ID_MSIX: u8 = 0x11;
+const MSIX_CONTROL: usize = MSIX_CAP + 2;
+const MSIX_TABLE: usize = MSIX_CAP + 4;
+const MSIX_PBA: usize = MSIX_CAP + 8;
+/// The control word's table size field: entries less one.
+pub const MSIX_SIZE_MASK: u16 = 0x7FF;
+/// What a guest may write of the control word: enable and mask-all, the
+/// top two bits -- the high byte's bits 6 and 7.
+const MSIX_CONTROL_WRITABLE_HI: u8 = 0xC0;
+pub const MSIX_ENABLE: u16 = 1 << 15;
+pub const MSIX_MASK_ALL: u16 = 1 << 14;
+/// BAR 1, for the table and the pending bits.
+const MSIX_BIR: u32 = 1;
+/// The BAR's one page: the table at its start, the pending bits here.
+pub const MSIX_PAGE: u32 = 4096;
+pub const MSIX_PBA_OFFSET: u32 = 0x800;
+/// A table entry: the message address (low, high), the data, and the
+/// vector control word, whose bit 0 masks it.
+pub const MSIX_ENTRY: u32 = 16;
+pub const MSIX_ENTRY_MASKED: u32 = 1;
+/// The most entries a function here has: its pending bits are one word.
+pub const MSIX_MAX_ENTRIES: u16 = 32;
 
 /// The most functions on the bus, the host bridge's slot included.
 pub const MAX_SLOTS: usize = 8;
@@ -63,6 +104,8 @@ pub struct Function {
     config: [u8; CONFIG_SIZE],
     /// BAR 0's size in ports, a power of two, or 0 for no BAR.
     bar_size: u32,
+    /// Where BAR 1's page is, for a function with MSI-X; 0 for one without.
+    msix_page: u32,
 }
 
 /// What a device function is, for its header.
@@ -78,7 +121,7 @@ pub struct Identity {
 
 impl Function {
     fn blank(id: &Identity) -> Function {
-        let mut f = Function { config: [0; CONFIG_SIZE], bar_size: 0 };
+        let mut f = Function { config: [0; CONFIG_SIZE], bar_size: 0, msix_page: 0 };
         f.put16(VENDOR_ID, id.vendor);
         f.put16(DEVICE_ID, id.device);
         f.config[REVISION] = id.revision;
@@ -99,6 +142,30 @@ impl Function {
         f.config[INTERRUPT_LINE] = irq;
         f.config[INTERRUPT_PIN] = PIN_INTA;
         f
+    }
+
+    /// The same function with MSI-X: `entries` of them (1 to
+    /// `MSIX_MAX_ENTRIES`), the table and the pending bits in the page at
+    /// `page` -- page-aligned, and the caller's to have made guest memory.
+    pub fn with_msix(mut self, entries: u16, page: u32) -> Function {
+        let entries = entries.clamp(1, MSIX_MAX_ENTRIES);
+        self.msix_page = page & !(MSIX_PAGE - 1);
+        let status = self.get16(STATUS) | STATUS_CAP_LIST;
+        self.put16(STATUS, status);
+        self.config[CAPABILITIES] = MSIX_CAP as u8;
+        self.config[MSIX_CAP] = CAP_ID_MSIX;
+        self.config[MSIX_CAP + 1] = 0;
+        self.put16(MSIX_CONTROL, entries - 1);
+        self.put32(MSIX_TABLE, MSIX_BIR);
+        self.put32(MSIX_PBA, MSIX_PBA_OFFSET | MSIX_BIR);
+        /* A 32-bit memory BAR, not prefetchable: its low bits are 0. */
+        self.put32(BAR1, self.msix_page);
+        self
+    }
+
+    /// MSI-X's control word and page, for a function that has it.
+    fn msix(&self) -> Option<(u16, u32)> {
+        (self.msix_page != 0).then(|| (self.get16(MSIX_CONTROL), self.msix_page))
     }
 
     fn get16(&self, at: usize) -> u16 {
@@ -139,6 +206,15 @@ impl Function {
     /// A write of `size` bytes at `at`, byte by byte through what each byte
     /// of the header lets a guest change.
     fn write(&mut self, at: usize, size: usize, value: u32) {
+        if self.msix_page != 0 && at == BAR1 {
+            /* The whole dword or nothing: all ones sizes it, and reads back
+             * its size; anything else puts it back where it was. */
+            if size == 4 {
+                let v = if value == u32::MAX { !(MSIX_PAGE - 1) } else { self.msix_page };
+                self.put32(BAR1, v);
+            }
+            return;
+        }
         for i in 0..size {
             let byte = (value >> (8 * i)) as u8;
             let off = at + i;
@@ -157,6 +233,10 @@ impl Function {
                     self.config[o] = (byte & mask) | fixed;
                 }
                 INTERRUPT_LINE => self.config[off] = byte,
+                o if o == MSIX_CONTROL + 1 && self.msix_page != 0 => {
+                    let keep = self.config[o] & !MSIX_CONTROL_WRITABLE_HI;
+                    self.config[o] = keep | (byte & MSIX_CONTROL_WRITABLE_HI);
+                }
                 _ => {}
             }
         }
@@ -250,6 +330,12 @@ impl PciBus {
                 self.slots[slot].write(at, size, value);
             }
         }
+    }
+
+    /// Slot `slot`'s MSI-X: the control word (enable, mask-all, the table's
+    /// size) and the page its table is in; None for a function without.
+    pub fn msix(&self, slot: usize) -> Option<(u16, u32)> {
+        self.slots.get(slot).and_then(|f| f.msix())
     }
 
     /// The slot whose I/O BAR `port` falls in, and the offset in it.

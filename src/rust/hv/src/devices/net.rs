@@ -16,7 +16,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::pci::Identity;
-use super::virtio::{self, Asked, Broken, Queue, Seg, Transport};
+use super::virtio::{self, Asked, Broken, Queue, Raise, Seg, Transport};
 use crate::memory::GuestMemory;
 use crate::{Error, Result};
 
@@ -132,26 +132,37 @@ impl Net {
         c
     }
 
+    /// Offer MSI-X, with a table of `entries`.
+    pub fn offer_msix(&mut self, entries: u16) -> Option<()> {
+        self.transport.offer_msix(entries)
+    }
+
+    /// Whether the function has MSI-X on, as its capability says now.
+    pub fn set_msix_enabled(&mut self, on: bool) {
+        self.transport.set_msix_enabled(on);
+    }
+
     /// A read of `size` bytes at `offset` in the BAR.
     pub fn io_read(&mut self, offset: u16, size: u8) -> u32 {
-        if offset < virtio::DEVICE_CONFIG {
+        let config = self.transport.config_offset();
+        if offset < config {
             return self.transport.read(offset, size);
         }
         let c = self.config();
         let mut v = 0u32;
         for i in 0..u16::from(size) {
-            if let Some(b) = c.get(usize::from(offset - virtio::DEVICE_CONFIG + i)) {
+            if let Some(b) = c.get(usize::from(offset - config + i)) {
                 v |= u32::from(*b) << (8 * i);
             }
         }
         v
     }
 
-    /// A write of `size` bytes at `offset` in the BAR; true when the
-    /// interrupt line is to go up.
-    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory) -> bool {
-        if offset >= virtio::DEVICE_CONFIG {
-            return false;
+    /// A write of `size` bytes at `offset` in the BAR, and the interrupts it
+    /// leaves the device with.
+    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory) -> Raise {
+        if offset >= self.transport.config_offset() {
+            return Raise::default();
         }
         match self.transport.write(offset, size, value) {
             Asked::Notify(TX_QUEUE) => self.send(mem),
@@ -160,16 +171,16 @@ impl Net {
             Asked::Reset => {
                 self.broken = None;
                 self.held = None;
-                false
+                Raise::default()
             }
-            _ => false,
+            _ => Raise::default(),
         }
     }
 
     /// Everything the driver has queued to send, to the backend.
-    fn send(&mut self, mem: &GuestMemory) -> bool {
+    fn send(&mut self, mem: &GuestMemory) -> Raise {
         if self.broken.is_some() {
-            return false;
+            return Raise::default();
         }
         let mut sent = false;
         loop {
@@ -199,7 +210,7 @@ impl Net {
             }
         }
         let wants = sent && self.transport.queue(TX_QUEUE).map_or(false, |q| q.wants_interrupt(mem));
-        wants && self.transport.interrupt()
+        if wants { self.transport.interrupt(TX_QUEUE) } else { Raise::default() }
     }
 
     /// One chain the driver sent: the header, then the frame, taken whole.
@@ -224,10 +235,10 @@ impl Net {
     }
 
     /// What the backend has for the guest, into the buffers the driver has
-    /// posted: true when the interrupt line is to go up.
-    pub fn poll(&mut self, mem: &GuestMemory) -> bool {
+    /// posted, and the interrupts that leaves the device with.
+    pub fn poll(&mut self, mem: &GuestMemory) -> Raise {
         if self.broken.is_some() || !self.transport.queue(RX_QUEUE).map_or(false, |q| q.ready()) {
-            return false;
+            return Raise::default();
         }
         let mut delivered = false;
         loop {
@@ -269,7 +280,7 @@ impl Net {
             }
         }
         let wants = delivered && self.transport.queue(RX_QUEUE).map_or(false, |q| q.wants_interrupt(mem));
-        wants && self.transport.interrupt()
+        if wants { self.transport.interrupt(RX_QUEUE) } else { Raise::default() }
     }
 
     /// The header and the frame, as they lie in `rx_buf`, into the chain's

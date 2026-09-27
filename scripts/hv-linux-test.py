@@ -94,6 +94,17 @@ RC_DONE = re.compile(r"(?m)^> version\n.+\n")
 RC_LOG = "dmesg hv:"
 
 
+def interrupt_check(args, text, queue):
+    """How a guest's virtio device interrupts it, from its /proc/interrupts:
+    with a local APIC -- more than one CPU -- by MSI-X, a vector a queue;
+    with none, through the 8259, as a guest of one CPU always was."""
+    if args.cpus > 1:
+        return ("the virtio device interrupts by MSI-X, a vector for its %s queue" % queue,
+                re.search(r"PCI-MSIX\S*\s+\S+\s+virtio\d+-%s" % queue, text) is not None, text[-600:])
+    return ("the virtio device interrupts through the 8259", re.search(r"XT-PIC\s+virtio\d+", text) is not None,
+            text[-600:])
+
+
 def cpus_opt(args):
     """`cpus=N` for a guest of N CPUs, or nothing for one."""
     return " cpus=%d" % args.cpus if args.cpus > 1 else ""
@@ -292,7 +303,7 @@ def attach(args):
     with open(os.path.join(rootdir, "etc", "ssh", "authorized_keys"), "w") as f:
         f.write(open(key + ".pub").read())
     rc = ["insmod /sshd.ko", "sshd start", "insmod /hv.ko", "hv on",
-          "hv start /bzImage mem=%d initrd=/initrd cmdline=%s" % (args.mem, args.cmdline),
+          "hv start /bzImage mem=%d%s initrd=/initrd cmdline=%s" % (args.mem, cpus_opt(args), args.cmdline),
           "hv exec 0 secs=%d id" % args.vm_secs, "hv attach 0", RC_LAST]
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# scripts/hv-linux-test.py --attach\n" + "\n".join(rc) + "\n")
@@ -440,7 +451,7 @@ def disk(args):
 
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
     rc = ["insmod /hv.ko", "hv on",
-          "hv start /bzImage mem=%d initrd=/initrd disk=/disk.img cmdline=%s" % (args.mem, args.cmdline),
+          "hv start /bzImage mem=%d%s initrd=/initrd disk=/disk.img cmdline=%s" % (args.mem, cpus_opt(args), args.cmdline),
           x("id", args.vm_secs),
           x("mount -t devtmpfs devtmpfs /dev"),
           x("cat /sys/block/vda/size"),
@@ -455,6 +466,7 @@ def disk(args):
           x("cat /mnt/written.txt"),
           x("ls -l /mnt/big"),
           x("umount /mnt", 120),
+          x("grep virtio /proc/interrupts"),
           "hv stop 0", RC_LAST]
     p, log, image = boot_rc(args, tmp, rc, {"disk.img": img})
     try:
@@ -471,6 +483,7 @@ def disk(args):
         pt.check("sync returns", "hv: vm 0:" not in out(11), out(11))
         pt.check("remounted, what the guest wrote reads back", "nos-wrote-this" in out(14), out(14))
         pt.check("so does the size of the big one", "4194304" in out(15), out(15))
+        pt.check(*interrupt_check(args, out(17), "req"))
         stop = output_of(secs, "hv stop 0", 0) or ""
         m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
         pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
@@ -541,7 +554,7 @@ def network(args):
         f.write(big)
     server, web = web_server(www)
     x = lambda vm, line, secs=60: "hv exec %d secs=%d %s" % (vm, secs, line)
-    start = "hv start /bzImage mem=%d initrd=/initrd net cmdline=%s" % (args.mem, args.cmdline)
+    start = "hv start /bzImage mem=%d%s initrd=/initrd net cmdline=%s" % (args.mem, cpus_opt(args), args.cmdline)
     way_out = [x(0, "cat /proc/net/pnp"),
                x(0, "wget -q -O - http://10.0.2.2:%d/nat.txt" % web),
                x(0, "ping -c 3 10.0.2.2"),
@@ -555,13 +568,15 @@ def network(args):
                x(0, "nslookup -type=a example.com" if args.internet else "true"),
                "nat", "hv list",
                # The megabyte again, into a guest that is busy: a loop has
-               # its one CPU, and a frame that waits for its next exit --
-               # the host's tick -- overflows the port's inbox. The switch
-               # kicks it out of its guest to take each one.
-               x(0, "sh -c 'while :; do :; done' > /dev/null 2>&1 & echo $! > /busy.pid; echo busy"),
+               # each of its CPUs, and a frame that waits for a CPU's next
+               # exit -- the host's tick -- overflows the port's inbox. The
+               # switch kicks it out of its guest to take each one.
+               x(0, "for i in %s; do sh -c 'while :; do :; done' > /dev/null 2>&1 & echo $! >> /busy.pid; done; echo busy"
+                 % " ".join(str(i) for i in range(args.cpus))),
                x(0, "wget -q -O - http://10.0.2.2:%d/big | md5sum" % web, 600),
                x(0, "kill $(cat /busy.pid); echo idle"),
-               "hv list"]
+               "hv list",
+               x(0, "grep virtio /proc/interrupts")]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -642,6 +657,7 @@ def network(args):
         kicks = re.search(r"kicks (\d+)", vm0)
         pt.check("kicked out of its guest to take the frames, its port dropped none",
                  kicks is not None and int(kicks.group(1)) > 0 and "dropped" not in vm0, vm0)
+        pt.check(*interrupt_check(args, way(14), "input"))
     finally:
         server.shutdown()
         pt.kill(p)

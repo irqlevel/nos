@@ -559,8 +559,8 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     let _ = writeln!(out, "  irq        {} from the 8259 ({} timer, {} serial), {} edges, {} blocked; PIC irr {:#04x} isr {:#04x} imr {:#04x}; PIT ch0 mode {} reload {} run {}",
         total.irq, total.irq0, total.irq4, total.edges0, total.blocked, irr, isr, imr, m0, r0, run0);
     if total.apic != 0 || counts.len() > 1 {
-        let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers; {} IPIs sent, {} taken",
-            total.apic, total.timer, total.ipi_sent, total.ipi_taken);
+        let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers; {} IPIs sent, {} taken; {} MSIs",
+            total.apic, total.timer, total.ipi_sent, total.ipi_taken, total.msi);
     }
     if counts.len() > 1 {
         let states = guest.cpu_states();

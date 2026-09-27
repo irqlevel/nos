@@ -7,7 +7,11 @@
 //! in the BAR: the device's features, the driver's, the selected queue's page
 //! frame number, its size, the queue select, the notify register, the device
 //! status and the interrupt status; the device's own configuration follows at
-//! 0x14.
+//! 0x14 -- or, once the driver has turned MSI-X on for the function, two
+//! registers more come first, the vector for configuration changes and the
+//! selected queue's, and the configuration follows at 0x18. With MSI-X a
+//! queue's interrupt is a message, its table entry's, and the interrupt
+//! status is not used.
 //!
 //! A queue is three rings in guest memory, laid out from its page frame
 //! number: the descriptors, the driver's available ring, and -- on the next
@@ -33,6 +37,14 @@ const DEVICE_STATUS: u16 = 0x12;
 const ISR_STATUS: u16 = 0x13;
 /// Where the device's own configuration begins, with no MSI-X.
 pub const DEVICE_CONFIG: u16 = 0x14;
+/// With MSI-X on: the vector for configuration changes, the selected queue's,
+/// and where the configuration begins then.
+const CONFIG_VECTOR: u16 = 0x14;
+const QUEUE_VECTOR: u16 = 0x16;
+const DEVICE_CONFIG_MSIX: u16 = 0x18;
+/// A vector register's "none": no interrupt for it -- and what reads back
+/// from one a driver set to an entry the table has not got.
+pub const NO_VECTOR: u16 = 0xFFFF;
 
 /// The PCI vendor every virtio device has.
 pub const VENDOR: u16 = 0x1AF4;
@@ -206,6 +218,34 @@ fn read_u16(mem: &GuestMemory, gpa: u64) -> Result<u16, Broken> {
     Ok(u16::from_le_bytes(b))
 }
 
+/// The interrupts a device has for the driver once it has given buffers
+/// back: the INTx line to raise -- an edge, the interrupt status having been
+/// clear -- and MSI-X table entries to send, a bit each.
+#[derive(Clone, Copy, Default)]
+pub struct Raise {
+    pub line: bool,
+    pub vectors: u32,
+}
+
+impl Raise {
+    pub fn or(self, other: Raise) -> Raise {
+        Raise { line: self.line || other.line, vectors: self.vectors | other.vectors }
+    }
+
+    pub fn any(&self) -> bool {
+        self.line || self.vectors != 0
+    }
+}
+
+/// MSI-X as the transport keeps it: the table's size, whether the function
+/// has it on, and the vector each source is to send.
+struct Msix {
+    entries: u16,
+    enabled: bool,
+    config: u16,
+    queues: Vec<u16>,
+}
+
 /// What a write to the header asks of the device.
 pub enum Asked {
     Nothing,
@@ -223,13 +263,41 @@ pub struct Transport {
     isr: u8,
     select: u16,
     queues: Vec<Queue>,
+    msix: Option<Msix>,
 }
 
 impl Transport {
     /// A device offering `features`, with `queues` (the capacity already
     /// taken) of the sizes it wants.
     pub fn new(device_features: u32, queues: Vec<Queue>) -> Transport {
-        Transport { device_features, driver_features: 0, status: 0, isr: 0, select: 0, queues }
+        Transport { device_features, driver_features: 0, status: 0, isr: 0, select: 0, queues, msix: None }
+    }
+
+    /// Offer MSI-X, with a table of `entries`: every source's vector starts
+    /// at none, as a reset leaves it.
+    pub fn offer_msix(&mut self, entries: u16) -> Option<()> {
+        let mut queues = Vec::new();
+        queues.try_reserve_exact(self.queues.len()).ok()?;
+        queues.resize(self.queues.len(), NO_VECTOR);
+        self.msix = Some(Msix { entries, enabled: false, config: NO_VECTOR, queues });
+        Some(())
+    }
+
+    /// The function's MSI-X enable, as its capability has it now: what the
+    /// header's layout and each interrupt follow.
+    pub fn set_msix_enabled(&mut self, on: bool) {
+        if let Some(m) = &mut self.msix {
+            m.enabled = on;
+        }
+    }
+
+    fn msix_on(&self) -> Option<&Msix> {
+        self.msix.as_ref().filter(|m| m.enabled)
+    }
+
+    /// Where the device's own configuration begins in the BAR.
+    pub fn config_offset(&self) -> u16 {
+        if self.msix_on().is_some() { DEVICE_CONFIG_MSIX } else { DEVICE_CONFIG }
     }
 
     pub fn driver_features(&self) -> u32 {
@@ -252,11 +320,18 @@ impl Transport {
         for q in &mut self.queues {
             q.reset();
         }
+        /* The vectors go back to none; whether MSI-X is on is the PCI
+         * function's, which a device reset does not touch. */
+        if let Some(m) = &mut self.msix {
+            m.config = NO_VECTOR;
+            m.queues.iter_mut().for_each(|v| *v = NO_VECTOR);
+        }
     }
 
-    /// The header as bytes, for a read of any size at any offset in it.
-    fn header(&self) -> [u8; DEVICE_CONFIG as usize] {
-        let mut h = [0u8; DEVICE_CONFIG as usize];
+    /// The header as bytes, for a read of any size at any offset in it --
+    /// the vector registers' too, with MSI-X on.
+    fn header(&self) -> [u8; DEVICE_CONFIG_MSIX as usize] {
+        let mut h = [0u8; DEVICE_CONFIG_MSIX as usize];
         let (pfn, size) = self.selected().map_or((0, 0), |q| (q.pfn, q.size));
         put(&mut h, DEVICE_FEATURES, &self.device_features.to_le_bytes());
         put(&mut h, DRIVER_FEATURES, &self.driver_features.to_le_bytes());
@@ -265,6 +340,11 @@ impl Transport {
         put(&mut h, QUEUE_SELECT, &self.select.to_le_bytes());
         put(&mut h, DEVICE_STATUS, &[self.status]);
         put(&mut h, ISR_STATUS, &[self.isr]);
+        if let Some(m) = self.msix_on() {
+            let queue = m.queues.get(usize::from(self.select)).copied().unwrap_or(NO_VECTOR);
+            put(&mut h, CONFIG_VECTOR, &m.config.to_le_bytes());
+            put(&mut h, QUEUE_VECTOR, &queue.to_le_bytes());
+        }
         h
     }
 
@@ -273,10 +353,11 @@ impl Transport {
     /// interrupt.
     pub fn read(&mut self, offset: u16, size: u8) -> u32 {
         let h = self.header();
+        let end = usize::from(self.config_offset());
         let mut v = 0u32;
         for i in 0..u16::from(size) {
             let at = offset + i;
-            if let Some(b) = h.get(usize::from(at)) {
+            if let Some(b) = h[..end].get(usize::from(at)) {
                 v |= u32::from(*b) << (8 * i);
             }
             if at == ISR_STATUS {
@@ -289,8 +370,9 @@ impl Transport {
     /// A write of `size` bytes at `offset` in the header.
     pub fn write(&mut self, offset: u16, size: u8, value: u32) -> Asked {
         let mut h = self.header();
+        let end = usize::from(self.config_offset());
         for i in 0..u16::from(size) {
-            if let Some(b) = h.get_mut(usize::from(offset + i)) {
+            if let Some(b) = h[..end].get_mut(usize::from(offset + i)) {
                 *b = (value >> (8 * i)) as u8;
             }
         }
@@ -319,6 +401,24 @@ impl Transport {
         if touches(QUEUE_NOTIFY, 2) {
             asked = Asked::Notify(get16(&h, QUEUE_NOTIFY));
         }
+        if self.msix_on().is_some() && touches(CONFIG_VECTOR, 4) {
+            let select = usize::from(self.select);
+            if let Some(m) = &mut self.msix {
+                /* An entry the table has not got reads back as none, which
+                 * is how a driver learns the vector was not taken. */
+                let entries = m.entries;
+                let valid = |v: u16| if v < entries { v } else { NO_VECTOR };
+                if touches(CONFIG_VECTOR, 2) {
+                    m.config = valid(get16(&h, CONFIG_VECTOR));
+                }
+                if touches(QUEUE_VECTOR, 2) {
+                    let v = valid(get16(&h, QUEUE_VECTOR));
+                    if let Some(q) = m.queues.get_mut(select) {
+                        *q = v;
+                    }
+                }
+            }
+        }
         if touches(DEVICE_STATUS, 1) {
             self.status = h[usize::from(DEVICE_STATUS)];
             if self.status == 0 {
@@ -329,12 +429,21 @@ impl Transport {
         asked
     }
 
-    /// Note used buffers in the interrupt status: true when it was clear, so
-    /// that the line goes up now -- an edge, which the PIC here takes; while
-    /// it stays set the driver has yet to look, and will see these too.
-    pub fn interrupt(&mut self) -> bool {
+    /// Queue `queue` gave buffers back and the driver wants to hear of it:
+    /// with MSI-X on, its vector's entry to send, if it has one; without,
+    /// the interrupt status noted, and the line to go up when it was clear
+    /// -- an edge, which the PIC here takes; while it stays set the driver
+    /// has yet to look, and will see these too.
+    pub fn interrupt(&mut self, queue: u16) -> Raise {
+        if let Some(m) = self.msix_on() {
+            let v = m.queues.get(usize::from(queue)).copied().unwrap_or(NO_VECTOR);
+            return match 1u32.checked_shl(u32::from(v)) {
+                Some(bit) if v < m.entries => Raise { line: false, vectors: bit },
+                _ => Raise::default(),
+            };
+        }
         let was = self.isr;
         self.isr |= ISR_QUEUE;
-        was == 0
+        Raise { line: was == 0, vectors: 0 }
     }
 }

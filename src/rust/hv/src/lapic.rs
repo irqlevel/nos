@@ -220,6 +220,45 @@ impl Ipi {
     }
 }
 
+/* A message-signalled interrupt, as a device writes it: to an address in
+ * 0xFEExxxxx that says whom -- an 8-bit destination in bits 19:12, logical
+ * or physical by bit 2 -- and data that says what: the vector, and the
+ * delivery mode in bits 10:8. What x86 Linux writes without interrupt
+ * remapping, its destination the x2APIC ID or, in cluster mode, the first
+ * cluster's bits: its eight CPUs are what an 8-bit field can name. */
+const MSI_ADDRESS_BASE: u64 = 0xFEE;
+const MSI_ADDRESS_BASE_SHIFT: u32 = 20;
+const MSI_DEST_SHIFT: u32 = 12;
+const MSI_DEST_MASK: u64 = 0xFF;
+const MSI_DEST_LOGICAL: u64 = 1 << 2;
+const MSI_VECTOR_MASK: u32 = 0xFF;
+const MSI_DELIVERY_SHIFT: u32 = 8;
+const MSI_DELIVERY_MASK: u32 = 0x7;
+const MSI_DELIVERY_FIXED: u32 = 0;
+const MSI_DELIVERY_LOWEST: u32 = 1;
+
+/// The interrupt a device's MSI of `address` and `data` names, as the APIC
+/// bus would carry it -- or None for a write that is no interrupt message,
+/// outside 0xFEExxxxx, or one of a delivery mode no device here sends:
+/// fixed and lowest priority are what a device's are.
+pub fn msi(address: u64, data: u32) -> Option<Ipi> {
+    if address >> MSI_ADDRESS_BASE_SHIFT != MSI_ADDRESS_BASE {
+        return None;
+    }
+    let delivery = match (data >> MSI_DELIVERY_SHIFT) & MSI_DELIVERY_MASK {
+        MSI_DELIVERY_FIXED => Delivery::Fixed,
+        MSI_DELIVERY_LOWEST => Delivery::LowestPriority,
+        _ => return None,
+    };
+    let dest = ((address >> MSI_DEST_SHIFT) & MSI_DEST_MASK) as u32;
+    let destination = if address & MSI_DEST_LOGICAL != 0 {
+        Destination::Logical(dest)
+    } else {
+        Destination::Physical(dest)
+    };
+    Some(Ipi { delivery, vector: (data & MSI_VECTOR_MASK) as u8, destination })
+}
+
 /// The logical ID an x2APIC has, from its ID: the cluster -- the ID over
 /// 16 -- in bits 31:16, and in 15:0 a bit for its place in the cluster.
 pub fn logical_id(id: u32) -> u32 {
