@@ -31,9 +31,9 @@ const MAX_MEM_MIB: u64 = 4096;
 /// given. One of several CPUs needs its APIC, and gets the console alone.
 const DEFAULT_CMDLINE: &str = "console=ttyS0 nolapic";
 const DEFAULT_CMDLINE_SMP: &str = "console=ttyS0";
-/// What a guest of several CPUs' command line gets when it has not got it:
-/// there is no IO-APIC on this machine, and a kernel that looked for one
-/// would turn its 8259's line to the first CPU off (`hv::run`).
+/// What a guest of several CPUs' command line gets when it has not got it,
+/// and has no IO-APIC: a kernel that looked for one would turn its 8259's
+/// line to the first CPU off (`hv::run`).
 const NOAPIC: &str = "noapic";
 /// What every guest's command line gets when it has not got it: the TSC's
 /// rate in kHz, which is the host's -- a guest reads the host's TSC, offset
@@ -69,6 +69,10 @@ pub struct Spec {
     /// the page, rather than in x2APIC mode -- for a kernel that reads the
     /// page before it looks at the mode firmware left.
     pub xapic: bool,
+    /// `ioapic`: an IO-APIC, which a guest of several CPUs routes its
+    /// devices' interrupts through in place of the 8259 -- its local APICs
+    /// out of reset in xAPIC mode with it, as `xapic` has them.
+    pub ioapic: bool,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
@@ -117,6 +121,7 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         cpu: None,
         cpus: 1,
         xapic: false,
+        ioapic: false,
         log: false,
         restart: false,
         net: false,
@@ -161,6 +166,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.log = true;
         } else if word == "xapic" {
             spec.xapic = true;
+        } else if word == "ioapic" {
+            spec.ioapic = true;
         } else if word == "restart" {
             spec.restart = true;
         } else if word == "net" {
@@ -181,6 +188,10 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
     if spec.cpus == 0 || spec.cpus as usize > hv::MAX_VCPUS {
         return Err(alloc::format!("cpus= must be 1..{}", hv::MAX_VCPUS));
     }
+    if spec.ioapic && spec.cpus < 2 {
+        return Err(String::from(
+            "ioapic wants cpus=2 or more: a guest of one CPU has no local APIC for it to deliver to"));
+    }
     spec.mem_bytes = mem_mib * 1024 * 1024;
     spec.cmdline = cmdline.unwrap_or_else(|| {
         String::from(if spec.cpus > 1 { DEFAULT_CMDLINE_SMP } else { DEFAULT_CMDLINE })
@@ -189,10 +200,10 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
 }
 
 /// The command line the guest's kernel is given: `cmdline`; for a guest of
-/// several CPUs, which has local APICs, `noapic` after it unless it says so
-/// already -- the machine has no IO-APIC; and the TSC's rate, `tsc_khz`,
-/// unless it names one already or the host does not know its own.
-fn guest_cmdline(cmdline: &str, smp: bool, tsc_khz: Option<u64>) -> Result<String, String> {
+/// several CPUs, which has local APICs, and no IO-APIC, `noapic` after it
+/// unless it says so already; and the TSC's rate, `tsc_khz`, unless it
+/// names one already or the host does not know its own.
+fn guest_cmdline(cmdline: &str, noapic: bool, tsc_khz: Option<u64>) -> Result<String, String> {
     let mut line = String::new();
     let add = |line: &mut String, word: &str| -> Result<(), String> {
         line.try_reserve(word.len() + 1).map_err(|_| String::from("out of memory"))?;
@@ -203,7 +214,7 @@ fn guest_cmdline(cmdline: &str, smp: bool, tsc_khz: Option<u64>) -> Result<Strin
         Ok(())
     };
     add(&mut line, cmdline)?;
-    if smp && !cmdline.split_ascii_whitespace().any(|w| w == NOAPIC) {
+    if noapic && !cmdline.split_ascii_whitespace().any(|w| w == NOAPIC) {
         add(&mut line, NOAPIC)?;
     }
     if let Some(khz) = tsc_khz {
@@ -248,7 +259,7 @@ pub struct Built {
 /// and the rest of what the boot protocol wants laid out beside them; its
 /// CPUs, rung by `doorbells`; its disks served for `runner`, who runs it.
 pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doorbells>) -> Result<Built, String> {
-    let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic)
+    let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
         .map_err(|e| alloc::format!("no guest: {}", e))?;
 
     /* The header is in the first page or two; read enough to parse it. */
@@ -296,7 +307,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     }
 
     let tsc_khz = kcore::time::cycle_counter_hz().map(|hz| hz / 1000).filter(|&khz| khz != 0);
-    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1, tsc_khz)?;
+    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1 && !spec.ioapic, tsc_khz)?;
     let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
     guest
         .load(bsp, &header, &first, layout, cmdline.as_bytes())
@@ -578,8 +589,12 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             total.apic, total.timer, total.ipi_sent, total.ipi_taken, total.msi);
     }
     if total.mmio_done != 0 {
-        let _ = writeln!(out, "  mmio       {} accesses performed for the guest, its instructions decoded: the xAPIC page's",
+        let _ = writeln!(out, "  mmio       {} accesses performed for the guest, its instructions decoded: the xAPIC page's and the IO-APIC's",
             total.mmio_done);
+    }
+    if let Some(io) = guest.ioapic_stats() {
+        let _ = writeln!(out, "  ioapic     {} interrupts sent, {} of them level-triggered, {} ended by EOI, {} of no delivery mode sent here",
+            io.sent, io.level, io.eois, io.dropped);
     }
     if counts.len() > 1 {
         let states = guest.cpu_states();

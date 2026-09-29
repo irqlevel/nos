@@ -101,7 +101,8 @@ spec.loader.exec_module(hvl)
 pt = hvl.pt
 
 # What Alpine's boot loader gives its kernel, less the console on tty0: the
-# serial console, and a PC of one CPU with no local APIC. (Its ACPI tables it
+# serial console, and a PC of one CPU with no local APIC -- a guest of more
+# has one, and loses the `nolapic` (`machine_cmdline`). (Its ACPI tables it
 # takes; with --acpi-off it is told not to, `ACPI_OFF`.)
 CMDLINE = "console=ttyS0 nolapic modules=loop,squashfs,sd-mod,usb-storage"
 # The machine as it was before it had ACPI: the kernel finds its PCI devices
@@ -173,7 +174,8 @@ def alpine(args):
                    check=True)
     pubkey = open(key + ".pub").read().strip()
 
-    cmdline = CMDLINE + (ACPI_OFF if args.acpi_off else "") + (" " + args.cmdline_extra if args.cmdline_extra else "")
+    cmdline = (machine_cmdline(CMDLINE, args) + (ACPI_OFF if args.acpi_off else "")
+               + (" " + args.cmdline_extra if args.cmdline_extra else ""))
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
     eth_line = x("ip addr show eth0")
     ping_line = x("ping -c 3 10.0.100.1")
@@ -193,8 +195,8 @@ def alpine(args):
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 " + PROMPT]
     rc = (["insmod /hv.ko", "hv on",
-           "hv start /bzImage mem=%d initrd=/initrd disk=/alpine.iso:ro net restart cmdline=%s"
-           % (args.mem, cmdline)]
+           "hv start /bzImage mem=%d%s initrd=/initrd disk=/alpine.iso:ro net restart cmdline=%s"
+           % (args.mem, machine_opt(args), cmdline)]
           + login(0)
           + [x("cat /etc/alpine-release; uname -r"),
              x("date -u +%s"),
@@ -215,8 +217,9 @@ def alpine(args):
              keygen_line,
              key_line,
              sshd_line,
-             forward_line,
-             "hv list",
+             forward_line]
+          + machine_lines(args, x)
+          + ["hv list",
              hvl.RC_LAST])
 
     port = hvl.free_port()
@@ -238,7 +241,7 @@ def alpine(args):
 
         start = rc[2]
         pt.check("the VM starts, the ISO read-only and on the switch",
-                 re.search(r"vm 0 started on cpu \d+", out(start)) is not None, out(start))
+                 re.search(r"vm 0 started on cpus? \d+(,\d+)*", out(start)) is not None, out(start))
         first, second = login(0), login(1)
         m = re.search(r'printed "login:", (\d+) ms in', out(first[0]))
         pt.check("Alpine's own kernel and initramfs boot it to a login prompt", m is not None, out(first[0]))
@@ -297,6 +300,7 @@ def alpine(args):
                  out(keygen_line) + out(key_line) + out(sshd_line))
         pt.check("hv forward add", "port %d forwarded to vm 0, %s:22" % (SSH_PORT, GUEST_IP) in out(forward_line),
                  out(forward_line))
+        machine_checks(args, out, x)
 
         # From outside: the host's port, QEMU's forward into nos's 2222, nos's
         # relay into the guest's sshd.
@@ -385,7 +389,7 @@ def debian(args):
 
     server, url, token = web(tmp)
     import base64
-    cmdline = (DEBIAN_CMDLINE + (ACPI_OFF if args.acpi_off else "") +
+    cmdline = (machine_cmdline(DEBIAN_CMDLINE, args) + (ACPI_OFF if args.acpi_off else "") +
                " systemd.set_credential_binary=network.network.50-nos:" +
                base64.b64encode(DEBIAN_NETWORK.encode()).decode())
 
@@ -404,8 +408,8 @@ def debian(args):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
                 r"hv send 0 %s\n" % DEBIAN_PASSWORD, "hv wait 0 secs=120 " + DEBIAN_PROMPT]
     rc = (["insmod /hv.ko", "hv on",
-           "hv start /bzImage mem=%d initrd=/initrd disk=/debian.raw net restart cmdline=%s"
-           % (args.debian_mem, cmdline)]
+           "hv start /bzImage mem=%d%s initrd=/initrd disk=/debian.raw net restart cmdline=%s"
+           % (args.debian_mem, machine_opt(args), cmdline)]
           + login(0)
           + [x("cat /etc/debian_version; uname -r"),
              x("systemctl is-system-running --wait", 300),
@@ -423,8 +427,9 @@ def debian(args):
              # the boot after it is what `boot=1` waits for.
              r"hv send 0 reboot\n"]
           + login(1)
-          + [kept_line,
-             "hv list",
+          + [kept_line]
+          + machine_lines(args, x)
+          + ["hv list",
              # Pressed, and given long enough for systemd under TCG too.
              STOP_LINE,
              hvl.RC_LAST])
@@ -500,6 +505,7 @@ def debian(args):
                  re.search(r"^%s\s*$" % marker, out(kept_line), re.M) is not None, out(kept_line))
         pt.check("hv list counts the reboot", re.search(r"vm 0\s+running.*restarts 1\b", out("hv list"))
                  is not None, out("hv list"))
+        machine_checks(args, out, x)
         stop = out(STOP_LINE)
         if args.acpi_off:
             pt.check("hv stop presses its power button, which a guest without ACPI never hears: stopped at once",
@@ -521,6 +527,42 @@ def debian(args):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+def machine_opt(args):
+    """`cpus=N` for guests of N CPUs, and `ioapic` for ones with an IO-APIC."""
+    return (" cpus=%d" % args.cpus if args.cpus > 1 else "") + (" ioapic" if args.ioapic else "")
+
+
+def machine_cmdline(cmdline, args):
+    """A distribution's command line for a guest of `args.cpus`: one of more
+    than one has its local APICs, and is not told `nolapic`."""
+    return cmdline.replace(" nolapic", "") if args.cpus > 1 else cmdline
+
+
+def machine_lines(args, x):
+    """What is asked of a guest of more than one CPU: which are online; and
+    of one with an IO-APIC, what came through it."""
+    lines = []
+    if args.cpus > 1:
+        lines.append(x("cat /sys/devices/system/cpu/online"))
+    if args.ioapic:
+        lines.append(x("grep IO-APIC /proc/interrupts"))
+    return lines
+
+
+def machine_checks(args, out, x):
+    """Every CPU online; and the serial console's interrupts, which the
+    login and the shell every line went out by, taken through the IO-APIC."""
+    if args.cpus > 1:
+        online = x("cat /sys/devices/system/cpu/online")
+        pt.check("every one of its %d CPUs is online" % args.cpus,
+                 re.search(r"(?m)^0-%d\s*$" % (args.cpus - 1), out(online)) is not None, out(online))
+    if args.ioapic:
+        pins = x("grep IO-APIC /proc/interrupts")
+        pt.check("its serial port's interrupts came through the IO-APIC's pin 4",
+                 re.search(r"(?m)^\s*4:(\s+\d+)*\s+[1-9]\d*(\s+\d+)*\s+IO-APIC\s+4-edge\s+ttyS0", out(pins))
+                 is not None, out(pins))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iso", help="Alpine's alpine-virt-*-x86_64.iso")
@@ -537,10 +579,16 @@ def main():
     ap.add_argument("--acpi-off", action="store_true",
                     help="boot the distributions with acpi=off: the machine without its ACPI tables, as it was "
                          "before it had them")
+    ap.add_argument("--cpus", type=int, default=1, help="each guest's CPUs")
+    ap.add_argument("--ioapic", action="store_true",
+                    help="each guest with an IO-APIC (hv's `ioapic`; needs --cpus 2 or more): the distribution's "
+                         "own kernel routing its interrupts through it")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
     args = ap.parse_args()
     if not args.iso and not args.debian:
         sys.exit("hv-distro-test: --iso <alpine-virt.iso>, --debian <debian-nocloud.raw>, or both")
+    if args.ioapic and args.cpus < 2:
+        sys.exit("hv-distro-test: --ioapic needs --cpus 2 or more")
     tools = []
     if args.iso:
         tools += ["xorriso", "ssh", "ssh-keygen"]

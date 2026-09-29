@@ -755,7 +755,8 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
-    GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name)).chain(core::iter::once(SMP_NAME))
+    GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
+        .chain([SMP_NAME, IOAPIC_NAME].into_iter())
 }
 
 /// Run the built-in guest `name` on the CPU this is called on -- and, for a
@@ -765,6 +766,9 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Option<bool> {
     if name == SMP_NAME {
         return Some(run_smp(machine, out));
+    }
+    if name == IOAPIC_NAME {
+        return Some(run_ioapic(machine, out));
     }
     if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
         return Some(run_several(machine, spec, out));
@@ -1081,7 +1085,7 @@ fn run_smp(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         false
     };
     let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
-    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true) {
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true, false) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
@@ -1188,6 +1192,279 @@ fn check_smp(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2]) -> core::
     }
     Ok(String::from("cpu 1 started by INIT and a start-up IPI, came up in real mode and reached long mode, \
                      x2APIC ID 1 and CPUID's the same; its IPI reached cpu 0, whose one-shot APIC timer then ran out and interrupted it"))
+}
+
+/* The ioapic guest: the smp guest's machine with an IO-APIC, its first CPU
+ * alone running -- the second waits for a start-up IPI it is never sent --
+ * and its local APIC in xAPIC mode, as a machine with an IO-APIC has it
+ * (`LinuxGuest::new`). It reads the IO-APIC's version, then wires the
+ * serial port's pin, 4, to itself through its page, as an edge: enabling
+ * the THR-empty interrupt raises the line, an edge; writing a byte pulses
+ * it, another; masked, a byte's pulse is lost, and unmasking an
+ * edge-triggered pin sends nothing. Then as a level: the line up, sent,
+ * and sent again at each EOI while it stays up -- the entry's remote IRR
+ * read set in the handler -- until the third handler reads IIR, which
+ * takes the THR-empty interrupt back and the line down; its EOI then sends
+ * nothing, and the entry after reads its remote IRR clear. Every EOI is a
+ * write of the xAPIC page. The output of clang (Intel syntax), `bits 64`
+ * at `ENTRY`, shown in NASM's words. */
+const IOAPIC_NAME: &str = "ioapic";
+const IOAPIC_ABOUT: &str = "an IO-APIC, through its page: the serial port's pin as an edge, then as a level \
+                            ended by EOI and sent again while its line stays up";
+
+const IOAPIC_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0xF6, 0x00, 0x00, 0x00,               // lea rax, [rel edge] ; gate 0x50: the edge-triggered pin's handler
+    0xBF, 0x00, 0xA5, 0x00, 0x00,                           // mov edi, 0xA500
+    0xE8, 0xC6, 0x00, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0xFB, 0x00, 0x00, 0x00,               // lea rax, [rel level] ; gate 0x51: the level-triggered pin's
+    0xBF, 0x10, 0xA5, 0x00, 0x00,                           // mov edi, 0xA510
+    0xE8, 0xB5, 0x00, 0x00, 0x00,                           // call gate
+    0x0F, 0x01, 0x1D, 0x26, 0x01, 0x00, 0x00,               // lidt [rel idtr]
+    0xBE, 0x00, 0x00, 0xC0, 0xFE,                           // mov esi, 0xFEC00000 ; the IO-APIC
+    0xC7, 0x06, 0x01, 0x00, 0x00, 0x00,                     // mov dword [rsi], 1 ; IOREGSEL: the version register
+    0x8B, 0x46, 0x10,                                       // mov eax, dword [rsi + 0x10] ; IOWIN
+    0x89, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // mov dword [0x7000], eax
+    0xC7, 0x06, 0x19, 0x00, 0x00, 0x00,                     // mov dword [rsi], 0x19 ; pin 4's entry, high half: to APIC ID 0
+    0xC7, 0x46, 0x10, 0x00, 0x00, 0x00, 0x00,               // mov dword [rsi + 0x10], 0
+    0xC7, 0x06, 0x18, 0x00, 0x00, 0x00,                     // mov dword [rsi], 0x18 ; low half: vector 0x50, fixed, physical, edge
+    0xC7, 0x46, 0x10, 0x50, 0x00, 0x00, 0x00,               // mov dword [rsi + 0x10], 0x50
+    0x66, 0xBA, 0xF9, 0x03,                                 // mov dx, 0x3F9 ; IER: the THR-empty interrupt on, the line up -- an edge
+    0xB0, 0x02,                                             // mov al, 2
+    0xEE,                                                   // out dx, al
+    0xFB,                                                   // .w1: sti ; its interrupt taken in the halt the sti's shadow covers
+    0xF4,                                                   // hlt
+    0xFA,                                                   // cli
+    0x83, 0x3C, 0x25, 0x04, 0x70, 0x00, 0x00, 0x01,         // cmp dword [0x7004], 1
+    0x72, 0xF3,                                             // jb .w1
+    0x66, 0xBA, 0xF8, 0x03,                                 // mov dx, 0x3F8 ; a byte written: the line pulsed -- an edge
+    0xB0, 0x78,                                             // mov al, 0x78
+    0xEE,                                                   // out dx, al
+    0xFB,                                                   // .w2: sti
+    0xF4,                                                   // hlt
+    0xFA,                                                   // cli
+    0x83, 0x3C, 0x25, 0x04, 0x70, 0x00, 0x00, 0x02,         // cmp dword [0x7004], 2
+    0x72, 0xF3,                                             // jb .w2
+    0xC7, 0x46, 0x10, 0x50, 0x00, 0x01, 0x00,               // mov dword [rsi + 0x10], 0x10050 ; masked: a byte's pulse is lost
+    0xEE,                                                   // out dx, al
+    0xC7, 0x46, 0x10, 0x50, 0x00, 0x00, 0x00,               // mov dword [rsi + 0x10], 0x50 ; and unmasking an edge-triggered pin sends nothing
+    0xFB,                                                   // sti
+    0xB9, 0x10, 0x00, 0x00, 0x00,                           // mov ecx, 16
+    0xE6, 0x80,                                             // .s1: out 0x80, al ; exits, at each of which one pending would go in
+    0xE2, 0xFC,                                             // loop .s1
+    0xFA,                                                   // cli
+    0x66, 0xBA, 0xF9, 0x03,                                 // mov dx, 0x3F9 ; IER 0: the line down
+    0x31, 0xC0,                                             // xor eax, eax
+    0xEE,                                                   // out dx, al
+    0xC7, 0x46, 0x10, 0x51, 0x80, 0x00, 0x00,               // mov dword [rsi + 0x10], 0x8051 ; vector 0x51, level-triggered
+    0xB0, 0x02,                                             // mov al, 2 ; the line up: sent, and again at each EOI while it stays up
+    0xEE,                                                   // out dx, al
+    0xFB,                                                   // .w3: sti
+    0xF4,                                                   // hlt
+    0xFA,                                                   // cli
+    0x83, 0x3C, 0x25, 0x08, 0x70, 0x00, 0x00, 0x03,         // cmp dword [0x7008], 3
+    0x72, 0xF3,                                             // jb .w3
+    0xC7, 0x06, 0x18, 0x00, 0x00, 0x00,                     // mov dword [rsi], 0x18
+    0x8B, 0x46, 0x10,                                       // mov eax, dword [rsi + 0x10] ; the entry after: remote IRR clear
+    0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // mov dword [0x7010], eax
+    0xC7, 0x04, 0x25, 0x14, 0x70, 0x00, 0x00, 0x49, 0x4F, 0x41, 0x50, // mov dword [0x7014], 0x50414F49 ; 'IOAP'
+    0xFA,                                                   // .dead: cli
+    0xF4,                                                   // hlt
+    0xEB, 0xFC,                                             // jmp .dead
+    0x66, 0x89, 0x07,                                       // gate: mov word [rdi], ax ; an interrupt gate for the handler at rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x89, 0x47, 0x08,                                       // mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // mov dword [rdi + 12], 0
+    0xC3,                                                   // ret
+    0x50,                                                   // edge: push rax
+    0xFF, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // inc dword [0x7004]
+    0xB8, 0xB0, 0x00, 0xE0, 0xFE,                           // mov eax, 0xFEE000B0 ; EOI
+    0xC7, 0x00, 0x00, 0x00, 0x00, 0x00,                     // mov dword [rax], 0
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x50,                                                   // level: push rax
+    0x52,                                                   // push rdx
+    0xFF, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,               // inc dword [0x7008]
+    0xB8, 0x00, 0x00, 0xC0, 0xFE,                           // mov eax, 0xFEC00000
+    0xC7, 0x00, 0x18, 0x00, 0x00, 0x00,                     // mov dword [rax], 0x18
+    0x8B, 0x50, 0x10,                                       // mov edx, dword [rax + 0x10] ; the entry in service: remote IRR set
+    0x89, 0x14, 0x25, 0x0C, 0x70, 0x00, 0x00,               // mov dword [0x700C], edx
+    0x83, 0x3C, 0x25, 0x08, 0x70, 0x00, 0x00, 0x03,         // cmp dword [0x7008], 3
+    0x72, 0x05,                                             // jb .eoi
+    0x66, 0xBA, 0xFA, 0x03,                                 // mov dx, 0x3FA ; the third: IIR read, the THR-empty interrupt taken back
+    0xEC,                                                   // in al, dx
+    0xB8, 0xB0, 0x00, 0xE0, 0xFE,                           // .eoi: mov eax, 0xFEE000B0 ; EOI: back to the IO-APIC
+    0xC7, 0x00, 0x00, 0x00, 0x00, 0x00,                     // mov dword [rax], 0
+    0x5A,                                                   // pop rdx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x1F, 0x05,                                             // idtr: dw 0x51F ; 0x52 gates
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
+];
+
+/* What the guest leaves at `RESULTS`: the IO-APIC's version at +0, the edge
+ * interrupts taken at +4 and the level ones at +8, pin 4's entry as the
+ * last level handler read it at +0xC and after at +0x10, and 'IOAP' at
+ * +0x14 once done. Its IDT is at 0xA000 (0x52 gates), and the IO-APIC's
+ * and the local APIC's pages are mapped to themselves, 2 MiB each, through
+ * `PD_MMIO`. */
+const IOAPIC_VERSION: u64 = RESULTS;
+const IOAPIC_EDGES: u64 = RESULTS + 0x4;
+const IOAPIC_LEVELS: u64 = RESULTS + 0x8;
+const IOAPIC_IN_SERVICE: u64 = RESULTS + 0xC;
+const IOAPIC_AFTER: u64 = RESULTS + 0x10;
+const IOAPIC_DONE: u64 = RESULTS + 0x14;
+const IOAPIC_MARK: u32 = u32::from_le_bytes(*b"IOAP");
+/// What the version register reads: version 0x20, 24 entries.
+const IOAPIC_VERSION_READ: u32 = 0x0017_0020;
+/// Pin 4's entry, level-triggered with vector 0x51, and its remote IRR.
+const IOAPIC_LEVEL_ENTRY: u32 = 0x8051;
+const IOAPIC_REMOTE_IRR: u32 = 1 << 14;
+/// The interrupts the guest is to take: two edges, three levels.
+const IOAPIC_EDGES_WANTED: u32 = 2;
+const IOAPIC_LEVELS_WANTED: u32 = 3;
+
+/// The guests' machine for the ioapic guest: `smp_board`'s, but the GDT
+/// without the 32-bit segment, its code, and the IO-APIC's and the local
+/// APIC's pages mapped for it.
+fn ioapic_board(m: &GuestMemory, bsp: &mut GuestCpu) -> Result<()> {
+    let tss_low = TSS_LIMIT | (TSS & 0xFF_FFFF) << 16 | TSS_BUSY_PRESENT << 40 | (TSS >> 24 & 0xFF) << 56;
+    let tss_high = TSS >> 32;
+    for (i, entry) in [0, GDT_CODE64, GDT_DATA, tss_low, tss_high].iter().enumerate() {
+        m.write_obj(GDT + i as u64 * 8, entry)?;
+    }
+    m.write_obj(PML4, &(PDPT | PTE_P_W))?;
+    m.write_obj(PDPT, &(PD_LOW | PTE_P_W))?;
+    m.write_obj(PD_LOW, &(PTE_P_W | PTE_LARGE))?;
+    m.write_obj(PDPT + MMIO_GIB * 8, &(PD_MMIO | PTE_P_W))?;
+    for page in [crate::devices::ioapic::BASE, crate::lapic::DEFAULT_BASE] {
+        let index = (page - MMIO_GIB * GIB) >> 21;
+        m.write_obj(PD_MMIO + index * 8, &((page & !0x1F_FFFF) | PTE_P_W | PTE_LARGE))?;
+    }
+    m.write(ENTRY, IOAPIC_CODE)?;
+    bsp.backend_mut().long_mode(&LongMode {
+        entry: ENTRY,
+        stack: STACK,
+        cr3: PML4,
+        gdt: GDT,
+        gdt_limit: (GDT_ENTRIES * 8 - 1) as u16,
+        idt_limit: NO_IDT,
+        code_selector: 0x08,
+        data_selector: 0x10,
+        tss_selector: 0x18,
+        tss: TSS,
+    });
+    Ok(())
+}
+
+/// Run the ioapic guest: its first CPU on this task, its second -- which
+/// only waits -- on a task of its own, so that it is found asleep when the
+/// first stops.
+fn run_ioapic(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", IOAPIC_NAME, IOAPIC_ABOUT);
+    let fail = |out: &mut dyn Write, why: &str| {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", IOAPIC_NAME, why);
+        false
+    };
+    let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true, true) {
+        Ok(made) => made,
+        Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
+    };
+    let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
+    let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
+    if let Err(e) = ioapic_board(guest.memory(), &mut bsp) {
+        return fail(out, &alloc::format!("could not be made: {}", e));
+    }
+    let guest = Arc::new(guest);
+    let Some(ap_counts) = kcore::sync::Mutex::new(Counts::default()) else { return fail(out, "out of memory") };
+    let ap_counts = Arc::new(ap_counts);
+
+    let here = kcore::cpu::id();
+    let enabled = machine.enabled_mask();
+    let ap_cpu = (0..u64::BITS).find(|&c| c != here && enabled & (1u64 << c) != 0).unwrap_or(here);
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(SMP_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let run = SmpAp { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, counts: ap_counts.clone() };
+    let Some(task) = kcore::task::spawn_on_with("hv/ioapic/cpu1", 1u64 << ap_cpu, run, smp_ap) else {
+        return fail(out, "no task for its second CPU");
+    };
+    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    drop(task);
+    drop(bsp);
+    let ns = time::boot_time_ns().saturating_sub(start);
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", IOAPIC_NAME, cpu);
+        return false;
+    }
+    let host = guest.cpu_states().first().and_then(|&(_, h)| h);
+    match host {
+        Some(h) => { let _ = writeln!(out, "  ran on     cpu {}, {} us", h, ns / kcore::consts::NS_PER_US); }
+        None => { let _ = writeln!(out, "  ran on     no cpu, {} us", ns / kcore::consts::NS_PER_US); }
+    }
+    let stats = guest.ioapic_stats().unwrap_or_default();
+    let _ = writeln!(out, "  exits      {} ({} port in, {} port out, {} MMIO accesses performed, {} hlt); the IO-APIC sent {}, {} of them levels, {} ended by EOI",
+                     counts.exits, counts.port_in, counts.port_out, counts.mmio_done, counts.hlt,
+                     stats.sent, stats.level, stats.eois);
+    let mut says = String::new();
+    let _ = match stopped.stop {
+        GuestStop::Halted { rip } => write!(says, "cpu 0 halted with interrupts off at {:#x}, cpu 1 never started", rip),
+        ref other => describe_stop(other, &mut says),
+    };
+    let _ = writeln!(out, "  stopped    {}", says);
+
+    match check_ioapic(guest.memory(), &stopped, &stats) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", IOAPIC_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", IOAPIC_NAME, why);
+            let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
+            let _ = out.write_str(&stopped.dump);
+            false
+        }
+    }
+}
+
+fn check_ioapic(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioapic::Stats)
+    -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let word = |gpa: u64| m.read_obj::<u32>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    if word(IOAPIC_DONE)? != IOAPIC_MARK {
+        return Err(String::from("it never reached its end"));
+    }
+    let version = word(IOAPIC_VERSION)?;
+    if version != IOAPIC_VERSION_READ {
+        return Err(alloc::format!("the version register reads {:#x}, not {:#x}", version, IOAPIC_VERSION_READ));
+    }
+    let (edges, levels) = (word(IOAPIC_EDGES)?, word(IOAPIC_LEVELS)?);
+    if edges != IOAPIC_EDGES_WANTED || levels != IOAPIC_LEVELS_WANTED {
+        return Err(alloc::format!("it took {} edge interrupts and {} level ones, not {} and {}",
+                                  edges, levels, IOAPIC_EDGES_WANTED, IOAPIC_LEVELS_WANTED));
+    }
+    let (in_service, after) = (word(IOAPIC_IN_SERVICE)?, word(IOAPIC_AFTER)?);
+    if in_service != IOAPIC_LEVEL_ENTRY | IOAPIC_REMOTE_IRR || after != IOAPIC_LEVEL_ENTRY {
+        return Err(alloc::format!("pin 4's entry read {:#x} in service and {:#x} after, not {:#x} and {:#x}",
+                                  in_service, after, IOAPIC_LEVEL_ENTRY | IOAPIC_REMOTE_IRR, IOAPIC_LEVEL_ENTRY));
+    }
+    let wanted = u64::from(IOAPIC_EDGES_WANTED + IOAPIC_LEVELS_WANTED);
+    let levels = u64::from(IOAPIC_LEVELS_WANTED);
+    if stats.sent != wanted || stats.level != levels || stats.eois != levels || stats.dropped != 0 {
+        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {} and dropped {}, not {} ({}), {} and 0",
+                                  stats.sent, stats.level, stats.eois, stats.dropped, wanted, levels, levels));
+    }
+    Ok(String::from("version 0x20's 24 pins; two edges taken, none while masked; three levels, each sent again \
+                     at its EOI while the line stayed up, its remote IRR set in service and clear after"))
 }
 
 /* The guests' machine: 1 MiB of memory with a GDT, a TSS and a page table

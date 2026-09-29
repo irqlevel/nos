@@ -18,7 +18,9 @@
 //!
 //! What is here is the register file and what each register does to the
 //! others: the ID and the logical ID derived from it, the task and
-//! processor priorities, in-service and request registers, EOI, the
+//! processor priorities, in-service, request and trigger-mode registers,
+//! EOI -- which hands a level-triggered interrupt's end back to the caller,
+//! for the IO-APIC it came from (`Wrote::Eoi`) -- the
 //! spurious-vector register that turns the APIC on and off, the error
 //! register, the local vector table, the interrupt command register -- which
 //! hands the IPI it sends back to the caller, who alone can reach the other
@@ -78,7 +80,8 @@ const WORDS: u32 = 8;
 /// The version register: an integrated APIC (0x14), with six entries in its
 /// local vector table (the highest index, 5, in bits 23:16) -- the timer,
 /// thermal, performance counter, LINT0, LINT1 and error ones; no CMCI, and
-/// no suppression of EOI broadcasts.
+/// no suppression of EOI broadcasts: the EOI of a level-triggered interrupt
+/// always goes on to the IO-APIC.
 const VERSION: u32 = 0x14 | (((LVT_ENTRIES - 1) as u32) << 16);
 
 /* The local vector table, in the order of its MSRs from 0x832. */
@@ -339,18 +342,21 @@ pub fn msi(address: u64, data: u32) -> Option<Ipi> {
         MSI_DELIVERY_LOWEST => Delivery::LowestPriority,
         _ => return None,
     };
-    /* All ones is every CPU in a message's 8-bit destination, whatever
-     * mode the APICs are in. */
-    let dest = match ((address >> MSI_DEST_SHIFT) & MSI_DEST_MASK) as u32 {
+    let dest = ((address >> MSI_DEST_SHIFT) & MSI_DEST_MASK) as u8;
+    Some(message(dest, address & MSI_DEST_LOGICAL != 0, delivery, (data & MSI_VECTOR_MASK) as u8))
+}
+
+/// A message on the APIC bus from a device -- an MSI, or an IO-APIC's
+/// redirection entry: an 8-bit destination, `logical` or physical, all
+/// ones for every CPU whatever mode the APICs are in; a delivery mode; a
+/// vector.
+pub fn message(dest: u8, logical: bool, delivery: Delivery, vector: u8) -> Ipi {
+    let dest = match u32::from(dest) {
         XAPIC_BROADCAST => BROADCAST,
         d => d,
     };
-    let destination = if address & MSI_DEST_LOGICAL != 0 {
-        Destination::Logical(dest)
-    } else {
-        Destination::Physical(dest)
-    };
-    Some(Ipi { delivery, vector: (data & MSI_VECTOR_MASK) as u8, destination })
+    let destination = if logical { Destination::Logical(dest) } else { Destination::Physical(dest) };
+    Ipi { delivery, vector, destination }
 }
 
 /// The logical ID an x2APIC has, from its ID: the cluster -- the ID over
@@ -369,6 +375,9 @@ pub enum Wrote {
     Tpr(u8),
     /// An IPI to send.
     Ipi(Ipi),
+    /// A level-triggered interrupt of this vector ended: its EOI goes on to
+    /// the IO-APIC, whose line may be up still (`devices::ioapic`).
+    Eoi(u8),
 }
 
 /// Why a write or read of an APIC register is a #GP, when it is one: an
@@ -533,11 +542,23 @@ impl Lapic {
         }
     }
 
-    /// A fixed interrupt of `vector`, into the request register: from an
-    /// IPI, the timer, or a self-IPI. Dropped by an APIC software-disabled,
-    /// and an illegal vector -- below 16, the exceptions' -- is an error.
-    /// False when it was not taken.
+    /// A fixed interrupt of `vector`, edge-triggered, into the request
+    /// register: from an IPI, the timer, a self-IPI, an MSI, an IO-APIC's
+    /// edge. Dropped by an APIC software-disabled, and an illegal vector --
+    /// below 16, the exceptions' -- is an error. False when it was not
+    /// taken.
     pub fn accept(&mut self, vector: u8) -> bool {
+        self.accept_as(vector, false)
+    }
+
+    /// A fixed interrupt of `vector` from an IO-APIC's level-triggered pin:
+    /// taken as `accept` takes one, and marked in the trigger-mode register,
+    /// so that its EOI goes back to the IO-APIC (`Wrote::Eoi`).
+    pub fn accept_level(&mut self, vector: u8) -> bool {
+        self.accept_as(vector, true)
+    }
+
+    fn accept_as(&mut self, vector: u8, level: bool) -> bool {
         if !self.software_enabled() {
             return false;
         }
@@ -546,20 +567,31 @@ impl Lapic {
             return false;
         }
         set_bit(&mut self.irr, vector);
+        if level {
+            set_bit(&mut self.tmr, vector);
+        } else {
+            clear_bit(&mut self.tmr, vector);
+        }
         true
     }
 
-    /// Several fixed interrupts at once, a bit a vector: what other CPUs
-    /// posted while this one ran.
-    pub fn accept_all(&mut self, words: &[u64; 4]) {
-        for (w, &bits) in words.iter().enumerate() {
+    /// Several fixed interrupts at once, a bit a vector, and which of them
+    /// are level-triggered: what other CPUs posted while this one ran.
+    pub fn accept_all(&mut self, words: &[u64; 4], level: &[u64; 4]) {
+        for (w, (&bits, &levels)) in words.iter().zip(level.iter()).enumerate() {
             let mut left = bits;
             while left != 0 {
                 let bit = left.trailing_zeros();
                 left &= left - 1;
-                self.accept((w as u32 * 64 + bit) as u8);
+                self.accept_as((w as u32 * 64 + bit) as u8, levels & (1 << bit) != 0);
             }
         }
+    }
+
+    /// Whether `vector` is requested and not yet taken: an edge sent for it
+    /// now would be the same request again, and lost.
+    pub fn requested(&self, vector: u8) -> bool {
+        test_bit(&self.irr, vector)
     }
 
     /// The processor priority: the task priority, or the class of the
@@ -587,14 +619,14 @@ impl Lapic {
         set_bit(&mut self.isr, vector);
     }
 
-    /// The highest interrupt in service is done.
-    fn eoi(&mut self) {
-        if let Some(vector) = highest(&self.isr) {
-            clear_bit(&mut self.isr, vector);
-            /* A level-triggered interrupt's EOI goes on to its IO-APIC,
-             * and there is none: every interrupt here is an edge. */
-            clear_bit(&mut self.tmr, vector);
-        }
+    /// The highest interrupt in service is done: its vector, when it was
+    /// level-triggered -- an IO-APIC's, whose EOI goes on to it.
+    fn eoi(&mut self) -> Option<u8> {
+        let vector = highest(&self.isr)?;
+        clear_bit(&mut self.isr, vector);
+        let level = test_bit(&self.tmr, vector);
+        clear_bit(&mut self.tmr, vector);
+        level.then_some(vector)
     }
 
     /// An error: into what the next write of ESR latches, and -- the error
@@ -795,7 +827,9 @@ impl Lapic {
                 if v != 0 && !xapic {
                     return Err(Refused);
                 }
-                self.eoi();
+                if let Some(vector) = self.eoi() {
+                    return Ok(Wrote::Eoi(vector));
+                }
             }
             REG_LDR if xapic => self.ldr = v & LDR_MASK,
             REG_DFR if xapic => self.dfr = (v & DFR_MODEL_MASK) | !DFR_MODEL_MASK,

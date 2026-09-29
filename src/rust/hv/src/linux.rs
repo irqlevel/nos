@@ -19,14 +19,18 @@
 //! So is the one table a PC's firmware leaves that the kernel needs to find
 //! its other CPUs: an Intel MultiProcessor Specification table, which a
 //! kernel with ACPI off (or none) reads the CPUs from -- each by its APIC ID
-//! -- and which says there is no IO-APIC it may use. Its interrupts come
-//! through the 8259 to the first CPU's LINT0, as the loader's `noapic` also
-//! tells the kernel. A kernel with ACPI finds its CPUs in the MADT instead,
-//! among the tables the caller lays out in the BIOS area (`crate::acpi`):
-//! the zero page points at them, and the memory map reserves the area.
+//! -- and its interrupts' wiring: the IO-APIC's pins, which it says the
+//! kernel may use when the guest has one (`devices::ioapic`), and otherwise
+//! not -- its interrupts then come through the 8259 to the first CPU's LINT0,
+//! as the loader's `noapic` also tells the kernel. A kernel with ACPI finds
+//! its CPUs in the MADT instead, among the tables the caller lays out in the
+//! BIOS area (`crate::acpi`): the zero page points at them, and the memory
+//! map reserves the area.
 
 use hvarch::{Error, Result};
 
+use crate::acpi::Route;
+use crate::devices::ioapic;
 use crate::lapic;
 use crate::memory::GuestMemory;
 use crate::svm::LongMode;
@@ -113,19 +117,34 @@ const MP_ENTRY_IO_INTERRUPT: u8 = 3;
 const MP_ENTRY_LOCAL_INTERRUPT: u8 = 4;
 const MP_CPU_ENABLED: u8 = 1 << 0;
 const MP_CPU_BOOT: u8 = 1 << 1;
-/// The local APIC's version, as its register reads (`lapic`).
+/// The local APIC's version, as its register reads (`lapic`), and the
+/// IO-APIC's, as its does (`devices::ioapic`).
 const MP_APIC_VERSION: u8 = 0x14;
-const MP_IOAPIC_VERSION: u8 = 0x11;
-const MP_IOAPIC_ADDRESS: u32 = 0xFEC0_0000;
+const MP_IOAPIC_VERSION: u8 = 0x20;
+const MP_IOAPIC_ADDRESS: u32 = ioapic::BASE as u32;
+/// The IO-APIC entry's flags: usable, or not.
+const MP_IOAPIC_USABLE: u8 = 1 << 0;
 /* Interrupt types, and a local interrupt destination meaning every APIC. */
 const MP_INT: u8 = 0;
 const MP_NMI: u8 = 1;
 const MP_EXTINT: u8 = 3;
 const MP_ALL_APICS: u8 = 0xFF;
-const MP_ISA_BUS: u8 = 0;
+/// The buses: a PCI bus's ID is its number, and so PCI's is 0.
+const MP_PCI_BUS: u8 = 0;
+const MP_ISA_BUS: u8 = 1;
+/// An interrupt entry's flags: polarity and trigger as its bus has them --
+/// ISA's, edge and active high -- or, a PCI function's INTx, level and
+/// active low.
+const MP_FLAGS_BUS: u8 = 0;
+const MP_FLAGS_PCI: u8 = 0x3 | (0x3 << 2);
+/// A PCI interrupt's source: its slot in bits 6:2, its pin (INTA 0) in 1:0.
+const MP_PCI_SLOT_SHIFT: u32 = 2;
+const MP_PCI_INTA: u8 = 0;
 /// The PC's ISA interrupts: 16, the cascade (2) not among them.
 const ISA_IRQS: u8 = 16;
 const ISA_CASCADE: u8 = 2;
+/// The most PCI functions the table routes.
+const MP_MAX_PCI: usize = 8;
 
 /* boot_params: where the ACPI RSDP is (protocol 2.14; padding to an older
  * kernel, which scans the BIOS area for it), and the e820 map. */
@@ -306,10 +325,12 @@ pub struct Firmware {
 
 /// Write the guest's furniture into its memory: the zero page from the
 /// header, the command line, the memory map, the identity page tables and
-/// the GDT -- and the MP table, for a guest of more than one CPU. The kernel
-/// and the initrd are the module's to stream in, at the addresses `layout`
-/// names, and the ACPI tables the caller's, where `firmware` says; the rest
-/// is small and goes in one call.
+/// the GDT -- and the MP table, for a guest of more than one CPU, with its
+/// PCI functions' INTA lines, `pci`, and whether it has an IO-APIC to use.
+/// The kernel and the initrd are the module's to stream in, at the
+/// addresses `layout` names, and the ACPI tables the caller's, where
+/// `firmware` says; the rest is small and goes in one call.
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     memory: &GuestMemory,
     header: &Header,
@@ -318,6 +339,8 @@ pub fn build(
     cmdline: &[u8],
     cpus: u32,
     firmware: Option<Firmware>,
+    pci: &[Route],
+    ioapic: bool,
 ) -> Result<()> {
     if cmdline.len() >= CMDLINE_MAX || cmdline.len() as u32 >= header.cmdline_size {
         return Err(Error::BadAddress);
@@ -348,7 +371,7 @@ pub fn build(
     write_gdt(memory)?;
     /* A guest of one CPU has no APIC, and so no table of its CPUs. */
     if cpus > 1 {
-        write_mp_table(memory, cpus)?;
+        write_mp_table(memory, cpus, pci, ioapic)?;
     }
     Ok(())
 }
@@ -370,17 +393,22 @@ fn checksum(bytes: &[u8]) -> u8 {
 }
 
 /// The MP table for a guest of `cpus` CPUs, APIC IDs 0 up, the first the
-/// boot CPU: a processor entry each, the ISA bus, and the interrupts --
-/// the 8259's on the first CPU's LINT0 (ExtINT), NMI on every CPU's LINT1.
+/// boot CPU: a processor entry each, the PCI and ISA buses, the IO-APIC,
+/// and the interrupts -- the 8259's on the first CPU's LINT0 (ExtINT) and on
+/// the IO-APIC's pin 0, NMI on every CPU's LINT1, each ISA interrupt on the
+/// IO-APIC's pin of its own number but the timer's, which is on pin 2, and
+/// each PCI function's INTA, `pci`, on the pin of its line, level and
+/// active low -- its line's ISA entry left out.
 ///
-/// And an IO-APIC marked unusable, with the ISA interrupts wired to it. A
-/// kernel that finds no interrupt entries at all in the table calls it a
-/// BIOS bug and makes up its own; an IO-APIC it is told it may not use,
-/// described with the wiring a PC's would have, it takes as it is -- and
-/// registers nothing, the machine having none (`noapic` says so again).
-fn write_mp_table(m: &GuestMemory, cpus: u32) -> Result<()> {
+/// The IO-APIC is marked usable when the guest has one, `ioapic`, and not
+/// otherwise. A kernel that finds no interrupt entries at all in the table
+/// calls it a BIOS bug and makes up its own; an IO-APIC it is told it may
+/// not use, described with the wiring a PC's would have, it takes as it is
+/// -- and registers nothing, the machine having none (`noapic` says so
+/// again).
+fn write_mp_table(m: &GuestMemory, cpus: u32, pci: &[Route], ioapic: bool) -> Result<()> {
     let cpus = usize::try_from(cpus).map_err(|_| Error::BadAddress)?;
-    if cpus == 0 || cpus > crate::smp::MAX_VCPUS {
+    if cpus == 0 || cpus > crate::smp::MAX_VCPUS || pci.len() > MP_MAX_PCI {
         return Err(Error::BadAddress);
     }
     let ioapic_id = cpus as u8;
@@ -389,7 +417,7 @@ fn write_mp_table(m: &GuestMemory, cpus: u32) -> Result<()> {
     /* Built in a buffer on the stack -- every entry the most CPUs need
      * fits in far less than the KiB the table has -- then copied in. */
     const TABLE_MAX: usize = MP_HEADER_BYTES + crate::smp::MAX_VCPUS * MP_PROCESSOR_BYTES
-        + (3 + ISA_IRQS as usize + 2) * MP_ENTRY_BYTES;
+        + (4 + ISA_IRQS as usize + MP_MAX_PCI + 2) * MP_ENTRY_BYTES;
     const _: () = assert!(MP_FLOATING_BYTES + TABLE_MAX <= 0x400);
     let mut t = [0u8; TABLE_MAX];
     let mut at = MP_HEADER_BYTES;
@@ -411,21 +439,24 @@ fn write_mp_table(m: &GuestMemory, cpus: u32) -> Result<()> {
         at += MP_ENTRY_BYTES;
         entries += 1;
     };
+    entry(&mut t, [MP_ENTRY_BUS, MP_PCI_BUS, b'P', b'C', b'I', b' ', b' ', b' ']);
     entry(&mut t, [MP_ENTRY_BUS, MP_ISA_BUS, b'I', b'S', b'A', b' ', b' ', b' ']);
     let io = MP_IOAPIC_ADDRESS.to_le_bytes();
-    /* Flags 0: not usable. */
-    entry(&mut t, [MP_ENTRY_IOAPIC, ioapic_id, MP_IOAPIC_VERSION, 0, io[0], io[1], io[2], io[3]]);
-    /* The 8259's output on the IO-APIC's pin 0, and each ISA interrupt on
-     * the pin of its own number, as a PC wires them. Flags 0: polarity and
-     * trigger as the bus has them. */
-    entry(&mut t, [MP_ENTRY_IO_INTERRUPT, MP_EXTINT, 0, 0, MP_ISA_BUS, 0, ioapic_id, 0]);
+    let usable = if ioapic { MP_IOAPIC_USABLE } else { 0 };
+    entry(&mut t, [MP_ENTRY_IOAPIC, ioapic_id, MP_IOAPIC_VERSION, usable, io[0], io[1], io[2], io[3]]);
+    entry(&mut t, [MP_ENTRY_IO_INTERRUPT, MP_EXTINT, MP_FLAGS_BUS, 0, MP_ISA_BUS, 0, ioapic_id, 0]);
     for irq in 0..ISA_IRQS {
-        if irq != ISA_CASCADE {
-            entry(&mut t, [MP_ENTRY_IO_INTERRUPT, MP_INT, 0, 0, MP_ISA_BUS, irq, ioapic_id, irq]);
+        if irq != ISA_CASCADE && !pci.iter().any(|r| r.irq == irq) {
+            let pin = ioapic::isa_pin(irq) as u8;
+            entry(&mut t, [MP_ENTRY_IO_INTERRUPT, MP_INT, MP_FLAGS_BUS, 0, MP_ISA_BUS, irq, ioapic_id, pin]);
         }
     }
-    entry(&mut t, [MP_ENTRY_LOCAL_INTERRUPT, MP_EXTINT, 0, 0, MP_ISA_BUS, 0, 0, 0]);
-    entry(&mut t, [MP_ENTRY_LOCAL_INTERRUPT, MP_NMI, 0, 0, MP_ISA_BUS, 0, MP_ALL_APICS, 1]);
+    for r in pci {
+        let source = (r.slot << MP_PCI_SLOT_SHIFT) | MP_PCI_INTA;
+        entry(&mut t, [MP_ENTRY_IO_INTERRUPT, MP_INT, MP_FLAGS_PCI, 0, MP_PCI_BUS, source, ioapic_id, r.irq]);
+    }
+    entry(&mut t, [MP_ENTRY_LOCAL_INTERRUPT, MP_EXTINT, MP_FLAGS_BUS, 0, MP_ISA_BUS, 0, 0, 0]);
+    entry(&mut t, [MP_ENTRY_LOCAL_INTERRUPT, MP_NMI, MP_FLAGS_BUS, 0, MP_ISA_BUS, 0, MP_ALL_APICS, 1]);
     let len = at;
 
     t[0..4].copy_from_slice(b"PCMP");

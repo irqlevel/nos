@@ -213,6 +213,17 @@ impl Pic {
         }
     }
 
+    /// Whether IRQ `irq` is masked off: on its chip, or -- the slave's -- the
+    /// cascade on the master. A guest that takes its interrupts from an
+    /// IO-APIC masks every line here.
+    pub fn masked(&self, irq: u8) -> bool {
+        match irq {
+            0..=7 => self.master.imr & (1 << irq) != 0,
+            8..=15 => self.slave.imr & (1 << (irq - 8)) != 0 || self.master.imr & (1 << CASCADE_IRQ) != 0,
+            _ => true,
+        }
+    }
+
     /// Whether IRQ `irq` is requested or in service: a new edge on it now
     /// would be the same request again, and lost.
     pub fn busy(&self, irq: u8) -> bool {

@@ -122,11 +122,15 @@ const SIPI_PENDING: u32 = 1 << 8;
 const SIPI_VECTOR: u32 = 0xFF;
 
 /// What other CPUs have sent one CPU and it has not yet taken: fixed
-/// interrupts, a bit a vector; an NMI; an INIT; a start-up IPI's vector.
+/// interrupts, a bit a vector, and which of them an IO-APIC's
+/// level-triggered pin sent; an NMI; an INIT; a start-up IPI's vector.
 /// Written by any of the guest's CPUs at once, read by its own, all
 /// lock-free.
 pub struct Mailbox {
     fixed: [AtomicU64; 4],
+    /// Level-triggered, among `fixed`: set before its `fixed` bit, and taken
+    /// only with it (`take`).
+    level: [AtomicU64; 4],
     nmi: AtomicBool,
     init: AtomicBool,
     sipi: AtomicU32,
@@ -135,6 +139,8 @@ pub struct Mailbox {
 /// What a CPU took out of its mailbox.
 pub struct Mail {
     pub fixed: [u64; 4],
+    /// Which of `fixed` are level-triggered.
+    pub level: [u64; 4],
     pub nmi: bool,
     pub init: bool,
     /// A start-up IPI's vector.
@@ -151,6 +157,7 @@ impl Mailbox {
     pub const fn new() -> Mailbox {
         Mailbox {
             fixed: [const { AtomicU64::new(0) }; 4],
+            level: [const { AtomicU64::new(0) }; 4],
             nmi: AtomicBool::new(false),
             init: AtomicBool::new(false),
             sipi: AtomicU32::new(0),
@@ -159,6 +166,15 @@ impl Mailbox {
 
     pub fn post_fixed(&self, vector: u8) {
         self.fixed[usize::from(vector / 64)].fetch_or(1 << (vector % 64), Ordering::AcqRel);
+    }
+
+    /// A fixed interrupt from a level-triggered pin: its level bit first,
+    /// then its fixed one -- so that whoever takes the fixed bit finds the
+    /// level bit set already.
+    pub fn post_level(&self, vector: u8) {
+        let (w, bit) = (usize::from(vector / 64), 1u64 << (vector % 64));
+        self.level[w].fetch_or(bit, Ordering::AcqRel);
+        self.fixed[w].fetch_or(bit, Ordering::AcqRel);
     }
 
     pub fn post_nmi(&self) {
@@ -199,15 +215,22 @@ impl Mailbox {
         let sipi = self.sipi.swap(0, Ordering::AcqRel);
         let init = self.init.swap(false, Ordering::AcqRel);
         let mut fixed = [0u64; 4];
+        let mut level = [0u64; 4];
         for (w, word) in self.fixed.iter().enumerate() {
             /* A look before the swap: most of the time there is nothing,
              * and a load leaves the line shared where a swap would take it. */
             if word.load(Ordering::Acquire) != 0 {
                 fixed[w] = word.swap(0, Ordering::AcqRel);
+                /* The level bits of the vectors taken, and only theirs: a
+                 * level bit whose fixed bit is not in yet -- posted between
+                 * the swap and here -- stays, for the take that finds its
+                 * fixed bit, and does not go as a level with no interrupt. */
+                level[w] = self.level[w].fetch_and(!fixed[w], Ordering::AcqRel) & fixed[w];
             }
         }
         Mail {
             fixed,
+            level,
             nmi: self.nmi.swap(false, Ordering::AcqRel),
             init,
             sipi: (sipi & SIPI_PENDING != 0).then_some((sipi & SIPI_VECTOR) as u8),

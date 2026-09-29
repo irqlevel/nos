@@ -137,8 +137,12 @@ RC_LOG = "dmesg hv:"
 
 def interrupt_check(args, text, queue):
     """How a guest's virtio device interrupts it, from its /proc/interrupts:
-    with a local APIC -- more than one CPU -- by MSI-X, a vector a queue;
-    with none, through the 8259, as a guest of one CPU always was."""
+    with a local APIC -- more than one CPU -- by MSI-X, a vector a queue,
+    or, told pci=nomsi, by its INTx line through the IO-APIC, a level; with
+    none, through the 8259, as a guest of one CPU always was."""
+    if args.cpus > 1 and args.ioapic and "pci=nomsi" in args.cmdline.split():
+        return ("the virtio device interrupts by its INTx line, level-triggered through the IO-APIC",
+                re.search(r"IO-APIC\s+\d+-fasteoi\s+virtio\d+", text) is not None, text[-600:])
     if args.cpus > 1:
         return ("the virtio device interrupts by MSI-X, a vector for its %s queue" % queue,
                 re.search(r"PCI-MSIX\S*\s+\S+\s+virtio\d+-%s" % queue, text) is not None, text[-600:])
@@ -147,9 +151,11 @@ def interrupt_check(args, text, queue):
 
 
 def cpus_opt(args):
-    """`cpus=N` for a guest of N CPUs, or nothing for one; and `xapic` for a
-    guest whose local APICs come out of reset in xAPIC mode."""
-    return (" cpus=%d" % args.cpus if args.cpus > 1 else "") + (" xapic" if args.xapic else "")
+    """`cpus=N` for a guest of N CPUs, or nothing for one; `xapic` for a
+    guest whose local APICs come out of reset in xAPIC mode; and `ioapic`
+    for one with an IO-APIC."""
+    return ((" cpus=%d" % args.cpus if args.cpus > 1 else "") + (" xapic" if args.xapic else "")
+            + (" ioapic" if args.ioapic else ""))
 
 
 def vm_commands(args):
@@ -211,6 +217,20 @@ def vm_commands(args):
             # of one core, whose execution units they would share.
             smp_checks.append(("hv list", 0, "its two CPUs are on two cores, not one core's two threads",
                                r"vm 0  running  cpus ([01],[23]|[23],[01])  ", True))
+        if args.ioapic:
+            # The PC's own lines through the IO-APIC: the timer's on pin 2,
+            # which the boot counts its ticks by before the local APICs'
+            # timers take over, and the serial port's, which the shell's
+            # every line went out by -- each an edge, and taken.
+            pins = "hv exec 0 grep IO-APIC /proc/interrupts"
+            smp_lines.append(pins)
+            taken = r"(\s+\d+)*\s+[1-9]\d*(\s+\d+)*"
+            smp_checks += [
+                (pins, 0, "the timer's interrupts came through the IO-APIC's pin 2",
+                 r"(?m)^\s*0:%s\s+IO-APIC\s+2-edge\s+timer" % taken, True),
+                (pins, 0, "and the serial port's through its pin 4",
+                 r"(?m)^\s*4:%s\s+IO-APIC\s+4-edge\s+ttyS0" % taken, True),
+            ]
     # With ACPI, a guest whose power button busybox's acpid answers with a
     # poweroff: its SCI and PM timer looked at, then stopped by hv stop,
     # which presses the button and has it turn itself off.
@@ -235,7 +255,9 @@ def vm_commands(args):
         acpi_lines += [start5, "hv exec 5 secs=%d id" % args.vm_secs, "hv stop 5 secs=5"]
         acpi_checks = [
             (start4, 0, "vm 4 starts, to be shut down by its power button", r"hv: vm 4 started on %s " % on, True),
-            (irq9, 0, "its SCI comes through the 8259, as IRQ 9", r"(?m)^\s*9:(\s+\d+)+\s+XT-PIC\s+acpi", True),
+            (irq9, 0, "its SCI comes through the IO-APIC's pin 9, a level" if args.ioapic
+             else "its SCI comes through the 8259, as IRQ 9",
+             r"(?m)^\s*9:(\s+\d+)+\s+%s\s+acpi" % (r"IO-APIC\s+9-fasteoi" if args.ioapic else "XT-PIC"), True),
             (clocks, 0, "the PM timer is one of its clocksources", r"acpi_pm", True),
             ("hv stop 4", 0, "hv stop presses its power button, and acpid has it turn itself off",
              r"hv: vm 4 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register", True),
@@ -368,11 +390,17 @@ def check_boot(args, txt):
                  block[-1500:])
     if args.acpi:
         for m in ACPI_BOOT:
+            if args.ioapic:
+                # Its interrupts routed through the IO-APIC, not the 8259.
+                m = m.replace("Using PIC for", "Using IOAPIC for")
             pt.check("the guest took its ACPI: %s" % m, re.search(m, block) is not None, block[-1500:])
         if args.cpus > 1:
+            # Its CPUs from the MADT -- and, given an IO-APIC there too, its
+            # whole SMP configuration.
+            config = (r"Using ACPI \(MADT\) for SMP configuration information" if args.ioapic
+                      else r"Using ACPI for processor \(LAPIC\) configuration")
             pt.check("and found its CPUs in the MADT",
-                     re.search(r"ACPI: APIC 0x[\s\S]*Using ACPI for processor \(LAPIC\) configuration", block) is not None,
-                     block[-1500:])
+                     re.search(r"ACPI: APIC 0x[\s\S]*" + config, block) is not None, block[-1500:])
         for m in ACPI_NEVER:
             bad = re.search(r"(?m)^.*%s.*$" % m, block)
             pt.check("and said nothing like: %s" % m, bad is None, bad.group(0) if bad else "")
@@ -382,6 +410,14 @@ def check_boot(args, txt):
         # on the page, decoded and performed.
         pt.check("its local APICs were reached through the xAPIC page, each access decoded and performed",
                  re.search(r"mmio\s+[1-9]\d* accesses performed", txt) is not None, txt[-2500:])
+    if args.ioapic:
+        # Its IO-APIC found where the tables put it, version 0x20's 24 pins
+        # its global interrupts 0 up, and interrupts sent through it.
+        pt.check("the guest found its IO-APIC: version 32, at 0xfec00000, GSI 0-23",
+                 re.search(r"IOAPIC\[0\]: apic_id \d+, version 32, address 0xfec00000, GSI 0-23", block)
+                 is not None, block[-1500:])
+        pt.check("and the report says interrupts went through it",
+                 re.search(r"ioapic\s+[1-9]\d* interrupts sent", txt) is not None, txt[-2500:])
     if args.cpus > 1:
         # Linux's own count, once it has started every CPU it was told of.
         pt.check("the guest brought up all %d of its CPUs" % args.cpus,
@@ -871,6 +907,10 @@ def main():
     ap.add_argument("--xapic", action="store_true",
                     help="the guest's local APICs out of reset in xAPIC mode (hv's `xapic`): every access of "
                          "theirs through the page, each instruction decoded and performed by the hypervisor")
+    ap.add_argument("--ioapic", action="store_true",
+                    help="the guest has an IO-APIC (hv's `ioapic`; needs --cpus 2 or more): the timer, the "
+                         "serial port and the SCI routed through it -- and a virtio device's INTx line too, "
+                         "given a --cmdline with pci=nomsi")
     ap.add_argument("--mem", type=int, default=256, help="guest RAM in MiB")
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
     ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")
@@ -906,6 +946,8 @@ def main():
         sys.exit("no such bzImage: " + args.bzimage)
     if args.cmdline is None:
         args.cmdline = DEFAULT_CMDLINE_SMP if args.cpus > 1 else DEFAULT_CMDLINE
+    if args.ioapic and args.cpus < 2:
+        sys.exit("--ioapic needs --cpus 2 or more: its interrupts go to local APICs")
     if args.cpus > 1 and "-enable-kvm" not in accel_args(args):
         version = hvt.qemu_version("qemu-system-x86_64")
         if version is None or version < hvt.TCG_REAL_MODE:

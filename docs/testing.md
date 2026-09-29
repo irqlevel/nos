@@ -102,8 +102,8 @@ swallowing panic messages whole.
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
-| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--internet]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
+| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -376,8 +376,12 @@ MMIO window -- an immediate of each size, REX's registers and a high byte,
 `movzx` and `movsx` -- were each decoded and performed, the device holding
 what was stored and every register what was loaded: the MMIO path
 ([MMIO](hypervisor.md#mmio)) on each backend, with no guest kernel to
-depend on. The unload that follows, and the load after it, are then of a
-hypervisor that has run guests on those CPUs.
+depend on; and for `ioapic` that the IO-APIC sent five interrupts, three
+of them levels each ended by EOI -- its serial port's pin taking two edges
+and none while masked, then a level sent again at each EOI while the line
+stayed up, its remote IRR set in service and clear after ([The
+IO-APIC](hypervisor.md#the-io-apic)). The unload that follows, and the
+load after it, are then of a hypervisor that has run guests on those CPUs.
 
 `smp` is the one guest of two CPUs, its second on another host CPU than
 the first ([More than one CPU](hypervisor.md#more-than-one-cpu)), and its
@@ -590,6 +594,21 @@ firmware left. The kernel
 the gate was brought up with is the 6.18 tinyconfig above plus `ACPI`,
 `ACPI_BUTTON`, `X86_PM_TIMER`, `INPUT` and `INPUT_EVDEV`.
 
+`--ioapic` (with `--cpus 2` or more) gives the guests an IO-APIC (`hv start
+... ioapic`, [The IO-APIC](hypervisor.md#the-io-apic)), their APICs in
+xAPIC mode with it: the boot must find it -- `IOAPIC[0]: ... version 32,
+address 0xfec00000, GSI 0-23` -- and its report count interrupts sent
+through it; in the VM phase `/proc/interrupts` must have the timer's
+ticks on its pin 2 and the serial port's on pin 4, each taken. With
+`--acpi` the kernel routes by it, `Using IOAPIC for interrupt routing`, its
+SMP configuration all from the MADT, and the SCI must come in as a level
+on pin 9. A `--cmdline` without `no_timer_check` has Linux count the
+timer's ticks through it before it trusts it; one with `pci=nomsi` puts a
+virtio device's interrupts on its INTx line, and `--disk` and `--net` must
+then find them level-triggered through the IO-APIC -- sent again at each
+EOI while the device's status is unread, which a lost EOI or a remote IRR
+left set would stall the disk or the network over.
+
 ### `hv-distro-test.py` -- a distribution, as it ships
 
 hv-linux-test's guest is a kernel built for the purpose. This one is a
@@ -653,6 +672,13 @@ costs more than the calibration loop allows -- so it stays on jiffies and
 the PIT's periodic mode. `--cmdline-extra "tsc_early_khz=<kHz>
 tsc=reliable"` puts it on the TSC and high-resolution timers, which drive
 the PIT in one-shot mode, as a real CPU's calibration does by itself.
+
+`--cpus N` gives each guest N CPUs, and their local APICs -- the command
+line then without the `nolapic` a guest of one CPU is given -- and every
+one must come online; with `--ioapic` too, an IO-APIC, and the serial
+console's interrupts -- the getty's, the shell's -- must have come through
+its pin 4 ([The IO-APIC](hypervisor.md#the-io-apic)): a distribution's own
+kernel, not one built for the gate, routing by it.
 
 ## The hardware NIC drivers
 
