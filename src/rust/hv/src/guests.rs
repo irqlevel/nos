@@ -17,6 +17,11 @@
 //!   absent     a read of a device the platform does not have -- AMD's FCH,
 //!              which Linux on a Zen CPU reads at a fixed address -- answered
 //!              with all ones, and a write to it stopped
+//!   mmio       a device's registers in the MMIO window stored to and loaded
+//!              from by the forms of `mov` Linux's accessors are -- an
+//!              immediate of each size, REX registers and a high byte,
+//!              `movzx` and `movsx` -- each access a nested fault the host
+//!              decodes and performs, what came back checked in RAM
 //!   triple     a triple fault stops the guest, not the CPU
 //!   refused    a VMCB that breaks one of `vmrun`'s rules is never handed
 //!              to the CPU, and the refusal names the rule -- where the
@@ -55,6 +60,7 @@ use kcore::time;
 use crate::devices::Uart;
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
+use crate::mmio;
 use crate::run::{Counts, GuestCpu, Host, LinuxGuest, Stop as GuestStop, Stopped};
 use crate::smp::Doorbells;
 use crate::svm::{Exit, LongMode};
@@ -113,6 +119,14 @@ struct Run {
     host: u32,
     /// Reads of an absent device answered with a page of all ones.
     absent: u32,
+    /// Accesses of the `mmio` guest's device, decoded and performed; and
+    /// its registers, as they were written.
+    mmio: u32,
+    dev: [u8; MMIO_DEV_BYTES],
+    /// Time-stamp counter ticks spent performing those accesses -- the walk
+    /// to the instruction, its fetch and decoding, the device -- while the
+    /// CPU's entries are profiled; `hv bench mmio profile` splits it out.
+    emulate: u64,
     /// `mov`s to and from CR8 stopped at and answered from the shadow TPR:
     /// under VT-x, which stops the guest there; AMD-V keeps the shadow
     /// itself and never stops.
@@ -154,6 +168,9 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
         hypercall: 0,
         host: 0,
         absent: 0,
+        mmio: 0,
+        dev: [0; MMIO_DEV_BYTES],
+        emulate: 0,
         cr8: 0,
         at_hypercall: None,
         uart: Uart::new(),
@@ -163,6 +180,7 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
     };
     let start = time::boot_time_ns();
     let budget = budget_ms * kcore::consts::NS_PER_MS;
+    let timed = vm.vcpu().profile().is_some();
 
     run.stop = loop {
         if time::boot_time_ns().saturating_sub(start) >= budget {
@@ -246,6 +264,35 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
                 run.hypercall += 1;
             }
             Exit::Hlt => break Stop::Halted { rip },
+            Exit::NestedFault { gpa, error } if gpa & !(PAGE - 1) == MMIO_DEV => {
+                /* The `mmio` guest's device: the access performed, the
+                 * instruction decoded -- or, one that cannot be, stopped. */
+                use hvarch::x86::svm::vmcb::npf;
+                let t0 = if timed { hvarch::x86::cpu::rdtsc() } else { 0 };
+                let mut bytes = mmio::Bytes::default();
+                let op = match mmio::begin(vm.vcpu(), vm.memory(), gpa, error & npf::WRITE != 0, &mut bytes) {
+                    Ok(op) => op,
+                    Err(_) => break Stop::Fault { gpa, error, rip },
+                };
+                let at = (gpa - MMIO_DEV) as usize;
+                let n = usize::from(op.size());
+                let Some(regs) = run.dev.get_mut(at..at + n) else {
+                    break Stop::Fault { gpa, error, rip };
+                };
+                let mut value = 0u64;
+                if op.is_write() {
+                    regs.copy_from_slice(&op.value.to_le_bytes()[..n]);
+                } else {
+                    for (i, b) in regs.iter().enumerate() {
+                        value |= u64::from(*b) << (8 * i);
+                    }
+                }
+                mmio::finish(vm.vcpu_mut(), &op, value);
+                run.mmio += 1;
+                if timed {
+                    run.emulate += hvarch::x86::cpu::rdtsc().saturating_sub(t0);
+                }
+            }
             Exit::NestedFault { gpa, error } => {
                 /* A read of the MMIO window with no device behind it is
                  * answered with all ones, as the Linux guest's loop answers
@@ -271,6 +318,9 @@ fn run(vm: &mut Vm, machine: &Machine, budget_ms: u64) -> Run {
         }
     };
     run.ns = time::boot_time_ns().saturating_sub(start);
+    /* Nothing enters the guest again: its state as that last exit left it,
+     * whole, for a check that fails to show. */
+    vm.vcpu_mut().read_whole_state();
     run
 }
 
@@ -326,6 +376,14 @@ const GUESTS: &[Spec] = &[
         budget_ms: 2000,
         build: build_absent,
         check: check_absent,
+    },
+    Spec {
+        name: "mmio",
+        about: "a device's registers stored to and loaded from by every form of mov Linux uses, each access decoded and performed",
+        exceptions: ALL_EXCEPTIONS,
+        budget_ms: 2000,
+        build: build_mmio,
+        check: check_mmio,
     },
     Spec {
         name: "triple",
@@ -392,6 +450,20 @@ pub const BENCH_MAX_PAGES: u32 = ((MEMORY - BENCH_PAGES_BASE) / kcore::consts::P
 /// Long enough for a million exits under TCG, twice emulated.
 const BENCH_BUDGET_MS: u64 = 120_000;
 
+/* N loads of the `mmio` guest's device: each a nested fault whose
+ * instruction the host fetches by the guest's paging, decodes and performs --
+ * what an MMIO access costs beside a CPUID's round trip. N goes in at
+ * `BENCH_ROUNDS_AT`, as for the CPUID loop. */
+const BENCH_MMIO_CODE: [u8; 17] = [
+    0xBE, 0x00, 0x00, 0x00, 0x00,                   // mov esi, N
+    0xBF, 0x00, 0x00, 0xB0, 0xFE,                   // mov edi, 0xfeb00000
+    0x8B, 0x07,                                     // .round: mov eax, [rdi]
+    0xFF, 0xCE,                                     // dec esi
+    0x75, 0xFA,                                     // jnz .round
+    0xF4,                                           // hlt
+];
+const BENCH_MMIO_HLT: u64 = ENTRY + 0x10;
+
 /// What `bench` measured.
 pub struct Bench {
     pub exits: u64,
@@ -401,16 +473,23 @@ pub struct Bench {
     /// The host's interrupts among the exits.
     pub host: u32,
     pub profile: Option<hvarch::x86::svm::Profile>,
+    /// Of the time-stamp counter's ticks, those the host spent performing
+    /// the MMIO loads, while profiled: 0 otherwise.
+    pub emulate: u64,
 }
 
 /// What a VM exit costs on the CPU this runs on: `exits` CPUIDs, each after
 /// a read of each of `pages` pages -- with a flush of the whole TLB on every
 /// entry when `flush` says so, for what that costs, and each entry timed in
-/// its parts when `profile` does. Timed from the first entry to the halt --
-/// or why it did not run to its halt.
-pub fn bench(machine: &Machine, exits: u32, pages: u32, flush: bool, profile: bool)
+/// its parts when `profile` does -- or, with `mmio`, as many MMIO loads,
+/// each decoded and performed. Timed from the first entry to the halt -- or
+/// why it did not run to its halt.
+pub fn bench(machine: &Machine, exits: u32, pages: u32, flush: bool, profile: bool, mmio: bool)
     -> core::result::Result<Bench, String>
 {
+    if mmio {
+        return bench_mmio(machine, exits, profile);
+    }
     if pages > BENCH_MAX_PAGES {
         return Err(alloc::format!("{} pages is more than its {}", pages, BENCH_MAX_PAGES));
     }
@@ -428,7 +507,32 @@ pub fn bench(machine: &Machine, exits: u32, pages: u32, flush: bool, profile: bo
     if r.cpuid != exits {
         return Err(alloc::format!("{} CPUID exits of {}", r.cpuid, exits));
     }
-    Ok(Bench { exits: u64::from(r.cpuid), ns: r.ns, ticks, host: r.host, profile: vm.vcpu().profile() })
+    Ok(Bench { exits: u64::from(r.cpuid), ns: r.ns, ticks, host: r.host, profile: vm.vcpu().profile(), emulate: 0 })
+}
+
+/// `bench`'s MMIO loop: `exits` loads of the device's first register.
+fn bench_mmio(machine: &Machine, exits: u32, profile: bool) -> core::result::Result<Bench, String> {
+    let mut code = BENCH_MMIO_CODE;
+    code[BENCH_ROUNDS_AT..BENCH_ROUNDS_AT + 4].copy_from_slice(&exits.to_le_bytes());
+    let mut vm = Vm::new(machine, ALL_EXCEPTIONS).map_err(|e| alloc::format!("no VM: {}", e))?;
+    board(&mut vm, &code).map_err(|e| alloc::format!("no guest: {}", e))?;
+    {
+        let m = vm.memory_mut();
+        m.write_obj(PDPT + MMIO_GIB * 8, &(PD_MMIO | PTE_P_W)).map_err(|e| alloc::format!("no guest: {}", e))?;
+        m.write_obj(PD_MMIO + MMIO_PD_INDEX * 8, &((MMIO_DEV & !0x1F_FFFF) | PTE_P_W | PTE_LARGE))
+            .map_err(|e| alloc::format!("no guest: {}", e))?;
+    }
+    vm.vcpu_mut().set_profile(profile);
+    let t0 = hvarch::x86::cpu::rdtsc();
+    let r = run(&mut vm, machine, BENCH_BUDGET_MS);
+    let ticks = hvarch::x86::cpu::rdtsc().saturating_sub(t0);
+    halted_at(&r, BENCH_MMIO_HLT)?;
+    if r.mmio != exits {
+        return Err(alloc::format!("{} MMIO loads performed of {}", r.mmio, exits));
+    }
+    Ok(Bench {
+        exits: u64::from(r.mmio), ns: r.ns, ticks, host: r.host, profile: vm.vcpu().profile(), emulate: r.emulate,
+    })
 }
 
 /* ---- asid: what the TLB keeps between one guest's entries and another's --
@@ -977,7 +1081,7 @@ fn run_smp(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
         false
     };
     let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
-    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells)) {
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
@@ -1349,26 +1453,37 @@ fn check_hypercall(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
     Ok(String::from("guest physical 4 GiB holds what it wrote; 15 registers went out at the hypercall and 15 answers came back"))
 }
 
+/* The null DS is for the report: loaded without an exit, it is in the state
+ * a fault's report shows only if that state was read at the fault -- under
+ * VT-x, whose EPT violation reads only what performing an access takes, by
+ * `read_whole_state` after the run. */
 const FAULT_CODE: &[u8] = &[
+    0x31, 0xC0,                                     // xor eax, eax
+    0x8E, 0xD8,                                     // mov ds, eax       ; a null DS, fine in 64-bit code
     0xBF, 0x00, 0xF0, 0x1F, 0x00,                   // mov edi, 0x1ff000 ; mapped by its page table, past its memory
     0xC6, 0x07, 0x5A,                               // mov byte [rdi], 0x5a
     0xF4,                                           // hlt
 ];
 const FAULT_GPA: u64 = 0x1F_F000;
-const FAULT_RIP: u64 = ENTRY + 5;
+const FAULT_RIP: u64 = ENTRY + 9;
 
 fn build_fault(vm: &mut Vm) -> Result<()> {
     board(vm, FAULT_CODE)
 }
 
-fn check_fault(_vm: &Vm, r: &Run) -> core::result::Result<String, String> {
+fn check_fault(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
     use hvarch::x86::svm::vmcb::npf;
     match r.stop {
         Stop::Fault { gpa, error, rip } if gpa == FAULT_GPA && rip == FAULT_RIP => {
             if error & npf::WRITE == 0 || error & npf::PRESENT != 0 || error & npf::FINAL == 0 {
                 return Err(alloc::format!("the fault was not a write to nothing: error {:#x}", error));
             }
-            Ok(String::from("stopped at the nested table, at the address and the instruction it was told to"))
+            let ds = vm.vcpu().save().ds.selector;
+            if ds != 0 {
+                return Err(alloc::format!(
+                    "the state a report would show is not the guest's at its fault: DS {:#x}, where it had loaded a null one", ds));
+            }
+            Ok(String::from("stopped at the nested table, at the address and the instruction it was told to, its state read whole"))
         }
         _ => Err(String::from("it did not fault where it was told to")),
     }
@@ -1421,6 +1536,102 @@ fn check_absent(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
         }
         _ => Err(String::from("the write to the absent device did not stop the guest where it was told to")),
     }
+}
+
+/* A device of 32 bytes of registers in the MMIO window, stored to and
+ * loaded from by the forms of `mov` Linux's accessors are, the loads' values
+ * put where the check reads them. Assembled by clang (AT&T source), shown
+ * here in NASM's syntax as the others are. */
+const MMIO_CODE: &[u8] = &[
+    0xBE, 0x00, 0x00, 0xB0, 0xFE,                   // mov esi, 0xfeb00000
+    0xC7, 0x06, 0x44, 0x33, 0x22, 0x11,             // mov dword [rsi], 0x11223344
+    0xC6, 0x46, 0x04, 0x55,                         // mov byte [rsi+4], 0x55
+    0x66, 0xC7, 0x46, 0x06, 0x77, 0x88,             // mov word [rsi+6], 0x8877
+    0x48, 0xB8, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, 0x88, // mov rax, 0x8899aabbccddeeff
+    0x48, 0x89, 0x46, 0x08,                         // mov [rsi+8], rax
+    0x48, 0xC7, 0x46, 0x10, 0xFE, 0xFF, 0xFF, 0xFF, // mov qword [rsi+16], -2
+    0xB7, 0xA5,                                     // mov bh, 0xa5
+    0x88, 0x7E, 0x18,                               // mov [rsi+24], bh
+    0x41, 0xBB, 0x04, 0x03, 0x02, 0x01,             // mov r11d, 0x01020304
+    0x44, 0x89, 0x5E, 0x1C,                         // mov [rsi+28], r11d
+    0x44, 0x8B, 0x0E,                               // mov r9d, [rsi]
+    0x0F, 0xB6, 0x4E, 0x04,                         // movzx ecx, byte [rsi+4]
+    0x48, 0x0F, 0xBF, 0x56, 0x06,                   // movsx rdx, word [rsi+6]
+    0x4C, 0x8B, 0x66, 0x08,                         // mov r12, [rsi+8]
+    0x49, 0xC7, 0xC5, 0xFF, 0xFF, 0xFF, 0xFF,       // mov r13, -1
+    0x66, 0x44, 0x8B, 0x6E, 0x06,                   // mov r13w, [rsi+6]
+    0xB8, 0x78, 0x56, 0x34, 0x12,                   // mov eax, 0x12345678
+    0x8A, 0x66, 0x18,                               // mov ah, [rsi+24]
+    0x0F, 0xBE, 0x7E, 0x18,                         // movsx edi, byte [rsi+24]
+    0x4C, 0x89, 0x0C, 0x25, 0x00, 0x70, 0x00, 0x00, // mov [0x7000], r9
+    0x48, 0x89, 0x0C, 0x25, 0x08, 0x70, 0x00, 0x00, // mov [0x7008], rcx
+    0x48, 0x89, 0x14, 0x25, 0x10, 0x70, 0x00, 0x00, // mov [0x7010], rdx
+    0x4C, 0x89, 0x24, 0x25, 0x18, 0x70, 0x00, 0x00, // mov [0x7018], r12
+    0x4C, 0x89, 0x2C, 0x25, 0x20, 0x70, 0x00, 0x00, // mov [0x7020], r13
+    0x48, 0x89, 0x04, 0x25, 0x28, 0x70, 0x00, 0x00, // mov [0x7028], rax
+    0x48, 0x89, 0x3C, 0x25, 0x30, 0x70, 0x00, 0x00, // mov [0x7030], rdi
+    0xF4,                                           // hlt
+];
+/// The device's page, in the MMIO window, and how many bytes of registers
+/// it has.
+const MMIO_DEV: u64 = 0xFEB0_0000;
+const MMIO_DEV_BYTES: usize = 32;
+const PAGE: u64 = 4096;
+const MMIO_HLT: u64 = ENTRY + 0x9A;
+/// The 2 MiB entry of the fourth gigabyte's page directory that covers it.
+const MMIO_PD_INDEX: u64 = (MMIO_DEV - MMIO_GIB * GIB) >> 21;
+/// The accesses it makes: seven stores and seven loads.
+const MMIO_ACCESSES: u32 = 14;
+/// What its registers hold after the stores, byte by byte.
+const MMIO_DEV_AFTER: [u8; MMIO_DEV_BYTES] = [
+    0x44, 0x33, 0x22, 0x11, 0x55, 0x00, 0x77, 0x88,
+    0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99, 0x88,
+    0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xA5, 0x00, 0x00, 0x00, 0x04, 0x03, 0x02, 0x01,
+];
+/// And the registers the loads left, in the order they are put in RAM:
+/// R9 (a 32-bit load clears the top half), RCX (`movzx`), RDX (`movsx` of
+/// a word), R12 (64 bits), R13 (a 16-bit load leaves the rest), RAX (AH),
+/// RDI (`movsx` of a byte into 32 bits, and the top half cleared).
+const MMIO_LOADED: [u64; 7] = [
+    0x1122_3344,
+    0x55,
+    0xFFFF_FFFF_FFFF_8877,
+    0x8899_AABB_CCDD_EEFF,
+    0xFFFF_FFFF_FFFF_8877,
+    0x1234_A578,
+    0xFFFF_FFA5,
+];
+
+fn build_mmio(vm: &mut Vm) -> Result<()> {
+    board(vm, MMIO_CODE)?;
+    let m = vm.memory_mut();
+    m.write_obj(PDPT + MMIO_GIB * 8, &(PD_MMIO | PTE_P_W))?;
+    m.write_obj(PD_MMIO + MMIO_PD_INDEX * 8, &((MMIO_DEV & !0x1F_FFFF) | PTE_P_W | PTE_LARGE))
+}
+
+fn check_mmio(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
+    match r.stop {
+        Stop::Halted { rip } if rip == MMIO_HLT => {}
+        Stop::Fault { gpa, rip, .. } => {
+            return Err(alloc::format!("the access of {:#x} at {:#x} was not performed", gpa, rip));
+        }
+        _ => return Err(String::from("it did not run to its halt")),
+    }
+    if r.mmio != MMIO_ACCESSES {
+        return Err(alloc::format!("{} accesses performed, not {}", r.mmio, MMIO_ACCESSES));
+    }
+    if r.dev != MMIO_DEV_AFTER {
+        return Err(alloc::format!("the device holds {:02x?}, not {:02x?}", r.dev, MMIO_DEV_AFTER));
+    }
+    for (i, want) in MMIO_LOADED.iter().enumerate() {
+        let got: u64 = read(vm, RESULTS + 8 * i as u64)?;
+        if got != *want {
+            return Err(alloc::format!("load {} left {:#x}, not {:#x}", i, got, want));
+        }
+    }
+    Ok(alloc::format!("{} stores and loads of every size decoded and performed, each value where it belonged",
+                      MMIO_ACCESSES))
 }
 
 const TRIPLE_CODE: &[u8] = &[

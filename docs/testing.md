@@ -101,7 +101,8 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
+| `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--internet]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
@@ -316,6 +317,27 @@ the one failure that looks like success: a driver that enumerates perfectly
 and delivers no report leaves every boot-log check passing, and fails on "a
 command typed on the usb keyboard reaches the shell".
 
+### `insn-test.py` -- the MMIO decoder, against the assembler
+
+The hypervisor performs a guest's MMIO access by decoding the instruction
+that faulted ([MMIO](hypervisor.md#mmio)), and what it decodes is the
+guest's own bytes. A wrong decode looks like success -- a value in the wrong
+register, RIP stepped into the middle of the next instruction -- so the
+decoder is checked against the assembler, on the host, where the file
+compiles as it is: every form of `mov` Linux's MMIO accessors are -- to and
+from registers of each width, REX's and the high bytes, immediates of each
+size, `movzx` and `movsx` -- over sixteen addressing forms, assembled by
+clang and read back by an LLVM objdump, each decoded to the access and the
+length it has; the instructions that must be refused (no memory operand,
+another opcode, a string move, a lock, `movabs`); each instruction cut short
+at every length, which must be refused rather than read as a shorter one;
+and two million random byte strings, which must decode without a panic and
+never to a length past what was there. The guest page walker the
+instruction is fetched by is checked beside it, against page tables built by
+hand: 4 KiB, 2 MiB and 1 GiB pages, five levels, addresses non-canonical and
+unmapped, and a fetch across a page boundary into a page mapped elsewhere.
+It needs clang, `llvm-objdump` and cargo; CI runs it on its x86-64 leg.
+
 ### `hv-test.py` -- the extension turned on and off again, and guests under it
 
 The [hypervisor](hypervisor.md) is a module, and the one piece of state it
@@ -341,11 +363,20 @@ is off for, a guest is not run, and says which CPU. With it on everywhere,
 every [built-in guest](hypervisor.md#the-built-in-guests) runs bound to the
 first CPU and then to the last, and each has to have done what it was told
 -- not only "ok": the report's own lines are checked, the nested page
-fault's address, error code and instruction, the port and CPUID counts, the
+fault's address, error code and instruction -- and that the state a report
+of it would show is the guest's at the fault: a null DS it loaded without
+an exit, which under VT-x, where an EPT violation reads only what
+performing an access takes, is there only if the rest was read after it --
+the port and CPUID counts, the
 fifteen registers each way across the hypercall, a host interrupt count
-above zero for the spin, and for `asid` that the third VM was given an ASID
+above zero for the spin, for `asid` that the third VM was given an ASID
 one of the first two had, after a generation ended, and each read its own
-page. The unload that follows, and the load after it, are then of a
+page, and for `mmio` that its fourteen stores and loads of a device in the
+MMIO window -- an immediate of each size, REX's registers and a high byte,
+`movzx` and `movsx` -- were each decoded and performed, the device holding
+what was stored and every register what was loaded: the MMIO path
+([MMIO](hypervisor.md#mmio)) on each backend, with no guest kernel to
+depend on. The unload that follows, and the load after it, are then of a
 hypervisor that has run guests on those CPUs.
 
 `smp` is the one guest of two CPUs, its second on another host CPU than
@@ -543,7 +574,19 @@ when `secs=5` is up, `its power button went unanswered for 5 s`. Without
 button. In both, after the reload, two guests at their shells are stopped
 together by `hv stop all secs=3`, which must press both buttons at once and
 say of each what became of its press. `--acpi` goes with `--cpus`, `--disk`, `--net` and `--attach`, whose
-guests then find their devices through the DSDT's host bridge. The kernel
+guests then find their devices through the DSDT's host bridge.
+
+`--xapic` has the guests' local APICs come out of reset in xAPIC mode (`hv
+start ... xapic`), and a kernel of more than one CPU then reaches them
+through the page, every access a nested fault the hypervisor decodes and
+performs ([MMIO](hypervisor.md#mmio)): the boot must say so, its report
+counting the accesses, and every check of the VM phase -- the IPIs, the
+timers, a guest's MSI-X with `--disk` and `--net` -- holds as it does in
+x2APIC mode. A `--cmdline` with `nox2apic` is the same from the other
+side: the APICs come out in x2APIC mode and the kernel takes them out of
+it. It is what has a Linux 6.1 without ACPI (`acpi=off`) bring up more than
+one CPU: its MP-table path reads the page before it looks at the mode
+firmware left. The kernel
 the gate was brought up with is the 6.18 tinyconfig above plus `ACPI`,
 `ACPI_BUTTON`, `X86_PM_TIMER`, `INPUT` and `INPUT_EVDEV`.
 

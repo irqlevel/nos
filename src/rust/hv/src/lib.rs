@@ -54,6 +54,12 @@ pub mod linux;
 #[cfg(target_arch = "x86_64")]
 mod acpi;
 #[cfg(target_arch = "x86_64")]
+mod insn;
+#[cfg(target_arch = "x86_64")]
+mod walk;
+#[cfg(target_arch = "x86_64")]
+pub mod mmio;
+#[cfg(target_arch = "x86_64")]
 pub mod policy;
 #[cfg(target_arch = "x86_64")]
 pub mod run;

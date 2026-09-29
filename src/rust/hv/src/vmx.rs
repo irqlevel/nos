@@ -89,6 +89,15 @@ impl Vcpu {
         self.guest.save_and_regs_mut()
     }
 
+    /// Read what the last exit left in the VMCS into the shadow, for a
+    /// report: an exit reads only what its handling needs, and one that
+    /// ends the guest after all -- an EPT violation no device answered --
+    /// has the rest read here, while the VMCS is still current on this CPU.
+    /// False if it no longer is ([`Guest::read_whole_state`]).
+    pub fn read_whole_state(&mut self) -> bool {
+        self.guest.read_whole_state()
+    }
+
     /// The bench's flush is the AMD side's -- an entry with no ASID kept;
     /// under VT-x there is no such entry to ask for -- and this makes the
     /// surface one for both.
@@ -511,6 +520,15 @@ impl Vcpu {
         self.leave_shadow();
     }
 
+    /// Step past an instruction the host performed for the guest, `len`
+    /// bytes long by its own decoding -- an EPT violation reports no length
+    /// -- and out of the interrupt shadow, as `skip` does.
+    pub fn skip_emulated(&mut self, len: u64) {
+        let s = self.guest.save_mut();
+        s.rip = s.rip.wrapping_add(len);
+        self.leave_shadow();
+    }
+
     /// Out of any interrupt shadow the stepped instruction was in -- a STI's
     /// or a MOV SS's -- and nothing else: an NMI handler the guest is in it
     /// is in still.
@@ -584,13 +602,25 @@ impl Vcpu {
         let g = &self.guest;
         let s = g.save();
         let r = g.regs();
-        writeln!(out, "  rip {:#018x}  rsp {:#018x}  rflags {:#x}  cpl {}", s.rip, s.rsp, s.rflags, s.cpl)?;
+        /* The stack pointer, control registers and segments only when they
+         * are this exit's ([`Vcpu::read_whole_state`]): the shadow's older
+         * values are no report of the guest. */
+        let whole = g.whole_state();
+        if whole {
+            writeln!(out, "  rip {:#018x}  rsp {:#018x}  rflags {:#x}  cpl {}", s.rip, s.rsp, s.rflags, s.cpl)?;
+        } else {
+            writeln!(out, "  rip {:#018x}  rflags {:#x}", s.rip, s.rflags)?;
+        }
         writeln!(out, "  rax {:#018x}  rbx {:#018x}  rcx {:#018x}  rdx {:#018x}", s.rax, r.rbx, r.rcx, r.rdx)?;
         writeln!(out, "  rsi {:#018x}  rdi {:#018x}  rbp {:#018x}", r.rsi, r.rdi, r.rbp)?;
-        writeln!(out, "  cr0 {:#x}  cr2 {:#x}  cr3 {:#x}  cr4 {:#x}  efer {:#x}", s.cr0, s.cr2, s.cr3, s.cr4, s.efer)?;
-        for (name, seg) in [("cs", &s.cs), ("ss", &s.ss), ("ds", &s.ds), ("tr", &s.tr)] {
-            writeln!(out, "  {}  {:#06x} attrib {:#05x} limit {:#x} base {:#x}",
-                     name, seg.selector, seg.attrib, seg.limit, seg.base)?;
+        if whole {
+            writeln!(out, "  cr0 {:#x}  cr2 {:#x}  cr3 {:#x}  cr4 {:#x}  efer {:#x}", s.cr0, s.cr2, s.cr3, s.cr4, s.efer)?;
+            for (name, seg) in [("cs", &s.cs), ("ss", &s.ss), ("ds", &s.ds), ("tr", &s.tr)] {
+                writeln!(out, "  {}  {:#06x} attrib {:#05x} limit {:#x} base {:#x}",
+                         name, seg.selector, seg.attrib, seg.limit, seg.base)?;
+            }
+        } else {
+            writeln!(out, "  rsp, the control registers and the segments not read: the VMCS was no longer current here")?;
         }
         writeln!(out, "  exit {:#x}  qual {:#x}  intr {:#x}  idtv {:#x}  instr_err {}",
                  g.exit_reason(), g.exit_qualification(), g.exit_intr_info(),

@@ -65,6 +65,10 @@ pub struct Spec {
     pub cpu: Option<u32>,
     /// `cpus=`: how many CPUs the guest has, each on a host CPU of its own.
     pub cpus: u32,
+    /// `xapic`: its local APICs out of reset in xAPIC mode, reached through
+    /// the page, rather than in x2APIC mode -- for a kernel that reads the
+    /// page before it looks at the mode firmware left.
+    pub xapic: bool,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
@@ -112,6 +116,7 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         secs: None,
         cpu: None,
         cpus: 1,
+        xapic: false,
         log: false,
         restart: false,
         net: false,
@@ -154,6 +159,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.input = unescape(v)?;
         } else if word == "log" {
             spec.log = true;
+        } else if word == "xapic" {
+            spec.xapic = true;
         } else if word == "restart" {
             spec.restart = true;
         } else if word == "net" {
@@ -241,7 +248,7 @@ pub struct Built {
 /// and the rest of what the boot protocol wants laid out beside them; its
 /// CPUs, rung by `doorbells`; its disks served for `runner`, who runs it.
 pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doorbells>) -> Result<Built, String> {
-    let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells)
+    let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic)
         .map_err(|e| alloc::format!("no guest: {}", e))?;
 
     /* The header is in the first page or two; read enough to parse it. */
@@ -493,7 +500,7 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
     match *stop {
         Stop::Halted { rip } => write!(out, "hlt with interrupts off at {:#x}, on every CPU it has", rip),
         Stop::Mmio { gpa, rip } if gpa & !0xFFF == hv::lapic::DEFAULT_BASE => write!(out,
-            "a touch of the xAPIC's page at {:#x}, rip {:#x} -- its local APIC is an x2APIC, reached by MSRs; boot it with noapic, and without nox2apic",
+            "a touch of the xAPIC's page at {:#x}, rip {:#x}, its local APIC in x2APIC mode or off, when the page is none of the APIC's -- a kernel that reads it before it looks at the mode firmware left wants `xapic`",
             gpa, rip),
         Stop::Mmio { gpa, rip } => write!(out,
             "a touch of guest physical {:#x}, no memory and no device there, rip {:#x}", gpa, rip),
@@ -502,9 +509,14 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             value, port, hv::run::reset_source(port), rip),
         Stop::Init { rip } => write!(out, "the guest asked for a reset, an INIT to its boot CPU, at {:#x}", rip),
         Stop::PowerOff { rip } => write!(out, "the guest powered itself off, S5 by its ACPI PM1 control register, at {:#x}", rip),
-        Stop::Xapic { rip } => write!(out,
-            "the guest took its local APIC out of x2APIC mode into xAPIC, which is not emulated, at {:#x} -- boot it with noapic, and without nox2apic",
-            rip),
+        Stop::MmioInsn { gpa, rip, error, bytes } => {
+            write!(out, "an access of guest physical {:#x} at rip {:#x} not performed -- {}; its bytes",
+                gpa, rip, error.describe())?;
+            for b in &bytes.b[..usize::from(bytes.len)] {
+                write!(out, " {:02x}", b)?;
+            }
+            Ok(())
+        }
         Stop::Exception { vector, rip } => write!(out, "exception {} at {:#x}", vector, rip),
         Stop::Refused(r) => write!(out, "not entered: {:?}", r),
         Stop::Invalid => write!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
@@ -564,6 +576,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     if total.apic != 0 || counts.len() > 1 {
         let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers; {} IPIs sent, {} taken; {} MSIs",
             total.apic, total.timer, total.ipi_sent, total.ipi_taken, total.msi);
+    }
+    if total.mmio_done != 0 {
+        let _ = writeln!(out, "  mmio       {} accesses performed for the guest, its instructions decoded: the xAPIC page's",
+            total.mmio_done);
     }
     if counts.len() > 1 {
         let states = guest.cpu_states();

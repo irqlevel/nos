@@ -1,0 +1,12 @@
+# The host-side check of the hypervisor's MMIO decoder and page walker
+# (src/rust/hv/src/{insn,walk}.rs), which scripts/insn-test.py builds and
+# runs: both are plain code over slices, so they compile for the host as
+# they are. No dependencies, so it builds offline.
+[package]
+name = "insn-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+[workspace]
