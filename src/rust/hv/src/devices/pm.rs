@@ -91,7 +91,8 @@ pub struct Pm {
     /// How many times the timer's top bit had flipped when its status was
     /// last cleared: TMR_STS is set once the count moves past it.
     carries_seen: u64,
-    /// Times the SCI was raised, and the power button pressed, and whether
+    /// Times the SCI was delivered -- by the 8259 or the IO-APIC, the run
+    /// loop counting -- and the power button pressed, and whether
     /// the guest's OS ever wrote the event enables -- took the ACPI it was
     /// given, which starts by disabling every event -- for a report.
     pub scis: u64,

@@ -131,6 +131,9 @@ GUESTS = {
     "smp": [r"cpu 1 started by INIT and a start-up IPI, came up in real mode and reached long mode",
             r"its IPI reached cpu 0, whose one-shot APIC timer then ran out and interrupted it",
             r"stopped\s+both CPUs halted with interrupts off"],
+    "ioapic": [r"two edges taken, none while masked; three levels, each sent again at its EOI while the line "
+               r"stayed up, its remote IRR set in service and clear after",
+               r"the IO-APIC sent 5, 3 of them levels, 3 ended by EOI"],
 }
 
 # Three of the guests test a mechanism only one vendor has: AMD-V's software

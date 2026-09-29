@@ -18,17 +18,22 @@
 //! moves, and these do not move -- and its `_PRT` says which 8259 IRQ each
 //! device's INTA is wired to, as its interrupt line register does.
 //!
-//! What is left out would need MMIO -- an IO-APIC, the HPET, PCIe's ECAM --
-//! or is what a guest does without: processor objects (there are no C- or
-//! P-states to describe), the ISA devices (an OS finds a PC's serial port,
-//! RTC and timer where they always are), GPEs. A guest of one CPU, which has
-//! no APIC, gets no MADT; a guest whose kernel has no ACPI, or is told
-//! `acpi=off`, finds its CPUs in the MP table as before.
+//! A guest given an IO-APIC finds it in the MADT, with the two overrides a
+//! PC's has: the timer's IRQ 0 on its pin 2, and the SCI, IRQ 9, a level --
+//! active high, as the 8259's ELCR has it. Every other ISA IRQ is on the pin
+//! of its own number, and the `_PRT`'s numbers are those pins too.
+//!
+//! What is left out would need MMIO -- the HPET, PCIe's ECAM -- or is what a
+//! guest does without: processor objects (there are no C- or P-states to
+//! describe), the ISA devices (an OS finds a PC's serial port, RTC and timer
+//! where they always are), GPEs. A guest of one CPU, which has no APIC,
+//! gets no MADT; a guest whose kernel has no ACPI, or is told `acpi=off`,
+//! finds its CPUs in the MP table as before.
 //!
 //! Everything is laid out into a buffer the caller copies into guest memory:
 //! plain data, with its checksums, holding nothing of the guest's.
 
-use crate::devices::{pm, rtc};
+use crate::devices::{ioapic, pm, rtc};
 use crate::lapic;
 use crate::run::{RESET_CONTROL, RESET_VALUE};
 
@@ -55,6 +60,8 @@ pub struct Machine<'a> {
     /// have local APICs -- a MADT only if so.
     pub cpus: u32,
     pub apic: bool,
+    /// Its IO-APIC's ID, when it has one.
+    pub ioapic: Option<u8>,
     /// Each device on the PCI bus, and its interrupt.
     pub pci: &'a [Route],
     /// The window its functions' memory BARs are in, when any has one: a
@@ -131,6 +138,16 @@ const MADT_LOCAL_APIC: u8 = 0;
 const MADT_LOCAL_APIC_BYTES: u8 = 8;
 const MADT_LOCAL_APIC_NMI: u8 = 4;
 const MADT_LOCAL_APIC_NMI_BYTES: u8 = 6;
+const MADT_IO_APIC: u8 = 1;
+const MADT_IO_APIC_BYTES: u8 = 12;
+const MADT_OVERRIDE: u8 = 2;
+const MADT_OVERRIDE_BYTES: u8 = 10;
+/// An override's bus: ISA.
+const MADT_BUS_ISA: u8 = 0;
+/// An override's flags: polarity and trigger as the bus has them -- ISA's,
+/// edge and active high -- or level and active high, the SCI's.
+const MADT_FLAGS_BUS: u16 = 0;
+const MADT_FLAGS_LEVEL_HIGH: u16 = 0x1 | (0x3 << 2);
 const MADT_ENABLED: u32 = 1 << 0;
 /// The processor UID that means every processor.
 const MADT_ALL_PROCESSORS: u8 = 0xFF;
@@ -292,7 +309,7 @@ pub fn build(m: &Machine, buf: &mut [u8]) -> Option<usize> {
     let madt = if m.apic {
         o.align(TABLE_ALIGN);
         let at = o.at;
-        write_madt(&mut o, m.cpus);
+        write_madt(&mut o, m.cpus, m.ioapic);
         Some(gpa(at))
     } else {
         None
@@ -456,8 +473,10 @@ fn write_fadt(o: &mut Out, facs: u64, dsdt: u64) {
 }
 
 /// The MADT: each CPU's local APIC, enabled, its processor UID its APIC ID;
-/// NMI on every CPU's LINT1; and no IO-APIC.
-fn write_madt(o: &mut Out, cpus: u32) {
+/// the IO-APIC whose ID is `ioapic`, when there is one, its pins global
+/// interrupts 0 up, with the overrides of the timer's IRQ and the SCI's;
+/// and NMI on every CPU's LINT1.
+fn write_madt(o: &mut Out, cpus: u32, ioapic: Option<u8>) {
     if cpus == 0 || cpus > MADT_MAX_CPUS {
         o.overflow = true;
         return;
@@ -471,6 +490,22 @@ fn write_madt(o: &mut Out, cpus: u32) {
         o.u8(id);
         o.u8(id);
         o.u32(MADT_ENABLED);
+    }
+    if let Some(id) = ioapic {
+        o.u8(MADT_IO_APIC);
+        o.u8(MADT_IO_APIC_BYTES);
+        o.u8(id);
+        o.u8(0);
+        o.u32(ioapic::BASE as u32);
+        o.u32(0);
+        for (irq, flags) in [(0u8, MADT_FLAGS_BUS), (pm::SCI_IRQ, MADT_FLAGS_LEVEL_HIGH)] {
+            o.u8(MADT_OVERRIDE);
+            o.u8(MADT_OVERRIDE_BYTES);
+            o.u8(MADT_BUS_ISA);
+            o.u8(irq);
+            o.u32(ioapic::isa_pin(irq) as u32);
+            o.u16(flags);
+        }
     }
     o.u8(MADT_LOCAL_APIC_NMI);
     o.u8(MADT_LOCAL_APIC_NMI_BYTES);

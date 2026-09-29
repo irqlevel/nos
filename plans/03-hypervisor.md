@@ -251,6 +251,18 @@ boots SMP. With its ACPI a 6.1 needed none of it -- the MADT has it pick the
 x2APIC driver first -- which leaves the IO-APIC, the HPET and ECAM as what
 the decoder is for next.
 
+The IO-APIC is the second device on it
+([`docs/hypervisor.md`](../docs/hypervisor.md#the-io-apic)): `ioapic` gives
+a guest of more than one CPU one, the PIT, the serial port, the SCI and
+the PCI functions' INTx on its pins -- edges and levels, a level's EOI
+coming back from the local APIC that took it -- and the MP table and the
+MADT describing it. Linux keeps x2APIC with an IO-APIC only given
+interrupt remapping or a hypervisor it knows, so such a guest's APICs come
+out of reset in xAPIC mode and every access of them is a decoded MMIO
+access. Keeping x2APIC with it -- an emulated IOMMU's interrupt remapping,
+or a name Linux trusts -- is the open question; the HPET and ECAM are
+next.
+
 ## Choose VMX vs SVM based on the dev environment
 
 This choice is driven by where you actually iterate:

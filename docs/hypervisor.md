@@ -448,12 +448,12 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU --
                                 on cpus of them, each on a host CPU of its
                                 own -- for secs, then print its console and
                                 how it ended
-    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -720,9 +720,10 @@ is needed. When `vmrun` refuses anyway, the report dumps the guest's state.
 
 ## The built-in guests
 
-Each is a handful of instructions, assembled once with NASM and kept in
-`hv/src/guests.rs` as bytes beside the source they came from, run in a VM of
-its own and checked against what it was told to do. All start in long mode
+Each is a handful of instructions, assembled once -- with NASM, or with
+clang for `mmio` and `ioapic` -- and kept in `hv/src/guests.rs` as bytes
+beside the source they came from, run in a VM of its own and checked
+against what it was told to do. All start in long mode
 at CPL 0 with paging on, 1 MiB of memory with a GDT, a TSS and a page table
 in it that maps the first 2 MiB to themselves -- the second of them with no
 memory behind it -- and 1 GiB to guest physical 4 GiB; all but the second
@@ -734,23 +735,25 @@ mode:
 | `exits` | reads and writes the debug port 0xE9, asks CPUID a leaf only this hypervisor answers, writes what it got to its memory | port I/O both ways; CPUID answered by the host; the answers read back out of guest memory |
 | `hypercall` | writes through its own page table to guest physical 4 GiB, puts a value of its own in every register, makes a hypercall, writes every register the host answered to its memory | long mode under nested paging, above 4 GiB; the run stub's register save and restore, all 15 registers both ways |
 | `uart` | brings up an 8250 the way a driver does -- divisor behind DLAB, 8N1, FIFO, a scratch-register presence test -- and sends a line polled out of LSR.THRE | the emulated serial port, over port I/O alone |
-| `fault` | writes to 0x1FF000, which its page table maps and the nested one does not | stopped at the nested table, at that address and that instruction: a guest reaches nothing it was not given |
+| `fault` | loads a null DS, then writes to 0x1FF000, which its page table maps and the nested one does not | stopped at the nested table, at that address and that instruction: a guest reaches nothing it was not given -- and the state its report shows is the guest's at the fault, the null DS in it, which under VT-x only reading the whole state for the report gives |
 | `absent` | reads AMD's FCH reset-status register at 0xFED803C0 twice, then writes to it | a read of a device the platform does not have finds all ones -- what Linux on a Zen CPU reads there -- through one read-only page; the write stops the guest |
+| `mmio` | stores to and loads from 32 bytes of a device's registers in the MMIO window, by every form of `mov` Linux's accessors are -- an immediate of each size, REX's registers and a high byte, `movzx` and `movsx` | each access's instruction fetched through the guest's paging, decoded and performed, every value where it belonged ([MMIO](#mmio)) |
 | `triple` | `int3` with no IDT | a triple fault stops the guest, not the CPU |
 | `refused` | starts with CR0.NW set and CD clear | a VMCB that breaks a rule is refused before the CPU sees it, the rule named |
 | `spin` | `cli; jmp $` | the host's interrupts still get through -- about a hundred a second -- and the host stops it when its 300 ms are up |
 | `tpr` | writes 15 to CR8 -- the task priority register, which masks every interrupt priority -- and reads it back | the guest gets a shadow TPR of its own (AMD-V's `V_TPR`; under VT-x a `mov cr8` stops the guest and is answered from one), and the host's CR8, read afterwards on the CPU the guest ran on, is still 0: a guest cannot hold the host's interrupts off its CPU |
 | `asid` | three VMs on one CPU read a page of their own at one address: two taking turns, and a third given an ASID one of them had | no guest reads another's page through the TLB, and a reused ASID is reused after a flush ([Address space identifiers](#address-space-identifiers)) |
 | `smp` | two CPUs, on two host CPUs: the first sends the second INIT and a start-up IPI; the second comes up in real mode at the vector's page, climbs through protected mode to long mode, writes down its x2APIC ID and CPUID's, and sends the first an IPI; the first, woken by it, arms its APIC timer for one shot and halts until it fires | an application processor started the way Linux starts one, an IPI between two CPUs, and the local APIC timer ([More than one CPU](#more-than-one-cpu)) |
+| `ioapic` | on the machine of `smp` with an IO-APIC, its first CPU alone, in xAPIC mode: reads the IO-APIC's version, then wires the serial port's pin to itself -- as an edge, the THR-empty interrupt enabled and a byte written, then one written while masked; as a level, its handler ending it without reading IIR twice, and the third time reading it | edges sent as the line rises and lost while masked; a level sent again at each EOI for as long as its line is up, its remote IRR set until then; every IO-APIC access and every EOI a decoded MMIO access ([The IO-APIC](#the-io-apic)) |
 
 ```
 $ hv run all 3
 ...
 hv: guest fault -- a write to memory its page table maps and the nested one does not
-  ran on     cpu 3, 64 us
+  ran on     cpu 3, 51 us
   exits      0 port in, 0 port out, 0 cpuid, 0 hypercall, 0 host interrupt
-  stopped    nested page fault at gpa 0x1ff000, error 0x100000006, rip 0x8005
-  checked    stopped at the nested table, at the address and the instruction it was told to
+  stopped    nested page fault at gpa 0x1ff000, error 0x100000006, rip 0x8009
+  checked    stopped at the nested table, at the address and the instruction it was told to, its state read whole
 hv: guest fault ok
 ...
 hv: guest spin -- cli; jmp $ -- for as long as the host lets it
@@ -770,7 +773,13 @@ hv: guest smp -- two CPUs: the first starts the second -- INIT and a start-up IP
   stopped    both CPUs halted with interrupts off, the last at 0x80c3
   checked    cpu 1 started by INIT and a start-up IPI, came up in real mode and reached long mode, x2APIC ID 1 and CPUID's the same; its IPI reached cpu 0, whose one-shot APIC timer then ran out and interrupted it
 hv: guest smp ok
-hv: 11 of 11 guests ok
+hv: guest ioapic -- an IO-APIC, through its page: the serial port's pin as an edge, then as a level ended by EOI and sent again while its line stays up
+  ran on     cpu 3, 23669 us
+  exits      50 (1 port in, 21 port out, 22 MMIO accesses performed, 3 hlt); the IO-APIC sent 5, 3 of them levels, 3 ended by EOI
+  stopped    cpu 0 halted with interrupts off at 0x80d4, cpu 1 never started
+  checked    version 0x20's 24 pins; two edges taken, none while masked; three levels, each sent again at its EOI while the line stayed up, its remote IRR set in service and clear after
+hv: guest ioapic ok
+hv: 13 of 13 guests ok
 ```
 
 A guest bound to a CPU the extension is not on for is not run, and says
@@ -1578,9 +1587,12 @@ button and evdev.)
   register is the chipset's 0xCF9, trapped already: a kernel with ACPI
   reboots through it first, `the guest asked for a reset, 0x06 to port
   0xcf9`.
-- **The MADT** lists a local APIC for each CPU and NMI on every LINT1, and
-  no IO-APIC. The MP table is still there: a kernel with ACPI finds its
-  CPUs in the MADT, one without in the MP table, and both are told the same.
+- **The MADT** lists a local APIC for each CPU and NMI on every LINT1 --
+  and, for a guest given one, the IO-APIC, with the two overrides a PC's
+  has: the timer's IRQ 0 on its pin 2, and the SCI a level, active high
+  ([The IO-APIC](#the-io-apic)). The MP table is still there: a kernel with
+  ACPI finds its CPUs in the MADT, one without in the MP table, and both
+  are told the same.
 - **The DSDT** is the one table in AML, and small: `\_S5`, and the PCI host
   bridge. The bridge has to be there. A Linux with ACPI finds PCI through
   the namespace alone and never probes the bus -- `pci_legacy_init` is not
@@ -1623,8 +1635,8 @@ Scope (\_SB)
 ```
 
 What is left out is MMIO this does not emulate yet ([MMIO](#mmio)) -- the
-IO-APIC, the HPET, PCIe's ECAM, whose absence Linux names in the line above
--- and what a guest does without: processor objects (there are no C- or P-states to describe), the
+HPET and PCIe's ECAM, whose absence Linux names in the line above; the
+IO-APIC is there for a guest given one -- and what a guest does without: processor objects (there are no C- or P-states to describe), the
 ISA devices (a kernel finds a PC's serial port, RTC and timer where they
 always are), GPEs, and any sleep state but S5. A guest of one CPU gets no
 MADT: it has no APIC.
@@ -1890,29 +1902,37 @@ stopped and told why rather than answered wrongly. The boot CPU's APIC starts in
 the spurious-vector register enabled, LINT0 ExtINT and LINT1 NMI, as
 firmware hands it over. What the model has is the register file and what
 each register does to the others: the ID and the logical ID made from it
-(x2APIC cluster mode), the task and processor priorities, the in-service and
-request registers, EOI, the error register, the local vector table, the
-interrupt command register, and the timer (below). A write of the spurious
+(x2APIC cluster mode), the task and processor priorities, the in-service,
+request and trigger-mode registers, EOI -- a level-triggered interrupt's
+going back to the IO-APIC it came from ([The IO-APIC](#the-io-apic)) --
+the error register, the local vector table, the interrupt command
+register, and the timer (below). A write of the spurious
 register that turns the APIC off masks every LVT entry, as the silicon does.
 
 **An MP table** (`hv::linux`, spec 1.4) in the last kilobyte of low
 memory, at 0x9FC00, where the e820 map has ended RAM and where Linux looks:
-a processor entry for each CPU, the first marked the boot CPU; an ISA bus;
-an IO-APIC entry marked unusable; and the interrupt assignments -- each ISA
-IRQ but the cascade to its own pin, the 8259's ExtINT to LINT0 of the first
-CPU, and NMI to LINT1 of every CPU. Without the assignments Linux complains
-of a BIOS bug and makes up its own. The MP table is the least a kernel finds
+a processor entry for each CPU, the first marked the boot CPU; the PCI bus
+and an ISA bus; an IO-APIC entry, marked usable only for a guest given
+one; and the interrupt assignments -- the 8259's output on the IO-APIC's
+pin 0 and on LINT0 of the first CPU, each ISA IRQ but the cascade on the
+IO-APIC's pin of its own number but the timer's, which is on pin 2, each
+PCI function's INTA on the pin of its line, level-triggered and active low
+(the ISA entry of that line left out), and NMI to LINT1 of every CPU.
+Without the assignments Linux complains of a BIOS bug and makes up its
+own. The MP table is the least a kernel finds
 its CPUs by; one with ACPI finds them in the MADT ([ACPI](#acpi)), which
 says the same, and takes the MP table only for what the MADT leaves out.
 
-**No IO-APIC.** The 8259 pair stays wired to the first CPU's LINT0 in
-virtual-wire mode, so every device interrupt -- the PIT's tick, the serial
-port's, the disks' and the NICs' -- is the first CPU's, and its task does
-the devices' work between its guest's turns, as it did for a guest of one
-CPU. `noapic` is added to the command line when it is not there already.
-Without it, x86-64 Linux looks for an IO-APIC whatever the table says -- it
-ignores the table's `pic_mode` -- and on the way `setup_local_APIC` masks
-LINT0 on the boot CPU, and the 8259 is cut off from the only CPU it reaches.
+**No IO-APIC, unless asked** ([The IO-APIC](#the-io-apic)). The 8259
+pair stays wired to the first CPU's LINT0 in virtual-wire mode, so every
+device interrupt -- the PIT's tick, the serial port's, the disks' and the
+NICs' -- is the first CPU's, and its task does the devices' work between
+its guest's turns, as it did for a guest of one CPU. `noapic` is added to
+the command line when it is not there already. Without it, x86-64 Linux
+looks for an IO-APIC whatever the table says -- it ignores the table's
+`pic_mode` -- and on the way `setup_local_APIC` masks LINT0 on the boot
+CPU, and the 8259 is cut off from the only CPU it reaches. With `ioapic`
+the machine has one, and the command line is left as it is.
 
 **CPUID.** Leaf 1 says the local APIC is there, and the x2APIC, and gives
 each CPU its APIC ID in EBX[31:24]; leaf 6 says the timer keeps running in
@@ -2134,11 +2154,11 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
 
 ### What it does not do yet
 
-- **The 8259's devices reach the first CPU only.** There is no IO-APIC, so
-  the PIT's tick and the serial port's interrupts are the first CPU's, and
-  the first CPU's task still does every device's work between its guest's
-  turns: a disk's answer, a NIC's frames. Only the interrupts that follow
-  go where the guest steers them.
+- **The first CPU's task does every device's work.** Between its guest's
+  turns it serves a disk's answer and a NIC's frames, with or without an
+  IO-APIC; only the interrupts that follow go where the guest steers them
+  -- through MSI-X, and with `ioapic` the PIT's and the serial port's too.
+  Without one, those two reach the first CPU only.
 - **A timer is as prompt as the host's tick.** Nothing on the host is set
   for a guest timer's deadline -- `kcore::timer` is periodic, at the
   host's tick -- so a CPU in its guest is handed a timer interrupt at its
@@ -2171,8 +2191,8 @@ is the two CR0 writes the policy emulates.
 
 ## MMIO
 
-A device whose registers are memory -- the xAPIC's page first, and next the
-IO-APIC's, the HPET's, a PCIe function's BARs -- is reached by instructions
+A device whose registers are memory -- the xAPIC's page and the IO-APIC's
+first, and next the HPET's, a PCIe function's BARs -- is reached by instructions
 that fault on a page the nested table does not map, and the exit says where
 and whether it wrote: not the register, not the size, not the value, not the
 instruction's length. So a device like that is emulated by decoding the
@@ -2256,6 +2276,85 @@ choose the x2APIC driver before anything reads the page -- so a 6.1 of a
 distribution boots SMP here as it is. And a Linux 6.18 told `nox2apic`,
 which takes its APIC out of x2APIC mode itself ("x2apic disabled"), does
 the same through the page.
+
+### The IO-APIC
+
+The second device on it is the IO-APIC (`hv::devices::ioapic`), for a
+guest of more than one CPU given `ioapic`: 24 pins at 0xFEC00000, version
+0x20, reached through the page's select register and window, and its EOI
+register. Each pin's redirection entry says what an interrupt on it is --
+a vector, a delivery mode, a destination, physical or logical, masked or
+not, edge- or level-triggered -- and a device drives its pin as it drives
+the 8259's line: the PIT's tick on pin 2, the serial port's interrupt on
+pin 4, the SCI on pin 9, each PCI function's INTx on the pin of its line,
+10 or 11; the 8259's own output is pin 0's, as on a PC, and its interrupts
+go to the first CPU as they always did, while its lines are unmasked there.
+The tables say so: the MP table marks the IO-APIC usable and routes each
+PCI function's INTA, level and active low, and the MADT lists it with the
+timer's and the SCI's overrides ([ACPI](#acpi)); `noapic` is not added.
+
+An edge-triggered pin sends as it rises; a level-triggered one while its
+line is up and its last interrupt has been ended -- its remote IRR set as
+it sends, and cleared by the EOI of the local APIC that took it, which the
+APIC broadcasts for a vector it took as a level (its trigger-mode
+register), or by a write of the IO-APIC's EOI register; a line still up
+then sends again. A message goes as a device's MSI does: into the local
+APIC of the CPU whose loop sent it, or through another's mailbox, the
+level bit with it. The serial port had to become a 16550 for this: its
+transmitter's interrupt pending until IIR reports it or a byte is written,
+and each byte written a pulse of its line -- the edge an edge-triggered pin
+sees, where the 8259 was asked again for as long as the line was up. And
+the PIT's next edge waits for the last to be taken where it went: on the
+8259 while its IRQ 0 is unmasked there, and through the IO-APIC while its
+vector is still requested in the first CPU's APIC.
+
+**Its local APICs come out of reset in xAPIC mode.** Linux keeps a
+firmware-enabled x2APIC with an IO-APIC only with interrupt remapping, or
+under a hypervisor it knows to support x2APIC without -- KVM, Xen, Hyper-V
+-- and this one names none (CPUID's hypervisor range is blank). Finding
+its firmware left x2APIC on, a Linux 6.1 or 6.18 turns it off, reading its
+APIC's ID through a page it has not mapped, and faults. So a machine with
+an IO-APIC is the PC most firmware makes, in xAPIC mode, and the kernel
+takes it as it is:
+
+```
+$ hv boot /bzImage cpus=2 ioapic initrd=/initrd cmdline=console=ttyS0
+...
+[    0.081741] IOAPIC[0]: apic_id 2, version 32, address 0xfec00000, GSI 0-23
+[    0.225009] APIC: Switch to symmetric I/O mode setup
+[    0.232303] x2apic: IRQ remapping doesn't support X2APIC mode
+[    0.260088] ..TIMER: vector=0x30 apic1=0 pin1=2 apic2=0 pin2=0
+...
+  mmio       65657 accesses performed for the guest, its instructions decoded: the xAPIC page's and the IO-APIC's
+  ioapic     431 interrupts sent, 0 of them level-triggered, 0 ended by EOI, 0 of no delivery mode sent here
+```
+
+Every access of its APICs is then a decoded MMIO access ([What an exit
+costs](#what-an-exit-costs)); keeping x2APIC mode with an IO-APIC would
+take an IOMMU's interrupt remapping, or a name Linux trusts. Linux checks
+the timer through the IO-APIC itself (`..TIMER`, and its count of ticks
+unless told `no_timer_check`), and routes the ISA lines where it likes --
+the serial port's, here, to the second CPU, which through the 8259 it
+could never have been:
+
+```
+  0:         65          0  IO-APIC   2-edge      timer
+  4:          0        219  IO-APIC   4-edge      ttyS0
+```
+
+With ACPI it routes interrupts `Using IOAPIC`, takes its SMP configuration
+from the MADT with the overrides (`INT_SRC_OVR (bus 0 bus_irq 9
+global_irq 9 high level)`), and the SCI arrives on pin 9 as a level,
+`IO-APIC 9-fasteoi acpi`: the power button's one SCI a level-triggered
+interrupt, ended by EOI, and the guest off by `acpid`. Told `pci=nomsi`, a
+virtio device's INTx comes the same way, `fasteoi` on pin 11 or 10, each
+interrupt ended and sent again while the device's status is unread.
+
+`hv run`'s `ioapic` guest checks it without a kernel: the serial port's pin
+as an edge -- the enable an edge, a byte's pulse another, one while masked
+lost, unmasking sending nothing -- then as a level, sent again at each EOI
+until the handler reads IIR, the entry's remote IRR set in service and
+clear after; every access of the IO-APIC and every EOI through the pages.
 
 ## On real hardware
 
@@ -2532,8 +2631,8 @@ A guest of more than one CPU takes its devices' interrupts by MSI-X
 guest has ACPI's tables and fixed hardware -- its power button what `hv
 stop` presses ([ACPI](#acpi)). MMIO is emulated -- the instruction that
 faulted fetched by the guest's paging, decoded and performed -- and the
-xAPIC page is its first device ([MMIO](#mmio)); next on it are the IO-APIC,
-the HPET and PCIe's ECAM the tables leave out today.
+xAPIC page is its first device, the IO-APIC its second ([MMIO](#mmio));
+next on it are the HPET and PCIe's ECAM the tables leave out today.
 Beyond stage 3: device work off the first CPU's task, modern virtio, and the
 control plane's HTTP API (stage 4).
 

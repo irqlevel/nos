@@ -47,7 +47,7 @@ use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
 
 const START_USAGE: &str =
-    "hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]";
+    "hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take

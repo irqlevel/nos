@@ -16,6 +16,15 @@
 //! (which the driver writes and reads to tell a UART is there at all), and
 //! the loopback path of the modem-control register (likewise a presence
 //! test).
+//!
+//! And its interrupt, as a 16550's is: the receiver's while a byte waits,
+//! and the transmitter's -- THR empty -- asserted when it is enabled and
+//! whenever a byte written has gone, and taken back by a read of IIR that
+//! reports it or by the next byte written. An 8259 is given the line
+//! (`irq_line`) and asked again for as long as it is up; an IO-APIC's pin,
+//! edge-triggered as an ISA one is, sees each byte written as a pulse
+//! (`take_pulse`) -- the line down as it is written and up as it goes --
+//! which is the edge the driver waits for before it writes more.
 
 /// The eight registers, at offsets 0..8 from the port base.
 pub const REGISTERS: u16 = 8;
@@ -141,6 +150,14 @@ pub struct Uart {
     /// shell does when it is at a prompt ready to read: until then, typed
     /// input would be swallowed by the boot, so it is held back.
     prompt_seen: bool,
+    /// The transmitter's interrupt is pending: the holding register is
+    /// empty, and neither a read of IIR that reported it nor a byte written
+    /// has taken it back since it last emptied.
+    thri: bool,
+    /// A byte was written with the transmitter's interrupt enabled: the
+    /// line went down and came back up, an edge the caller has yet to pass
+    /// on (`take_pulse`).
+    pulse: bool,
 }
 
 impl Uart {
@@ -159,6 +176,8 @@ impl Uart {
             col: 0,
             reply: Reply { buf: [0; REPLY_MAX], len: 0, pos: 0 },
             prompt_seen: false,
+            thri: false,
+            pulse: false,
         }
     }
 
@@ -183,11 +202,12 @@ impl Uart {
             IER_DLM if self.dlab() => self.dlm,
             IER_DLM => self.ier,
             IIR_FCR => {
-                /* The pending cause, highest priority first; reading it is
-                 * one of the ways the THR-empty interrupt is cleared. */
+                /* The pending cause, highest priority first; reading it
+                 * when it is the THR-empty interrupt takes that back. */
                 if self.ier & IER_RX != 0 && self.rx.is_some() {
                     IIR_RX
-                } else if self.ier & IER_THRE != 0 {
+                } else if self.ier & IER_THRE != 0 && self.thri {
+                    self.thri = false;
                     IIR_THRE
                 } else {
                     IIR_NONE
@@ -236,6 +256,12 @@ impl Uart {
         match offset {
             RBR_THR_DLL if self.dlab() => self.dll = value,
             RBR_THR_DLL => {
+                /* The write takes the THR-empty interrupt back, and the
+                 * byte leaving at once empties the register again: the
+                 * interrupt is pending as before, and the line, if it is
+                 * enabled, pulsed. */
+                self.thri = true;
+                self.pulse |= self.ier & IER_THRE != 0;
                 if self.mcr & MCR_LOOP != 0 {
                     /* In loopback the byte comes back on the receiver
                      * instead of going out. */
@@ -247,7 +273,15 @@ impl Uart {
                 return Some(value);
             }
             IER_DLM if self.dlab() => self.dlm = value,
-            IER_DLM => self.ier = value,
+            IER_DLM => {
+                /* The THR-empty interrupt enabled with the register empty,
+                 * as it always is here: asserted, as a 16550 asserts it --
+                 * which Linux tests for, turning it off and on again. */
+                if value & IER_THRE != 0 && self.ier & IER_THRE == 0 {
+                    self.thri = true;
+                }
+                self.ier = value;
+            }
             IIR_FCR => {} // FIFO control: accepted and ignored
             LCR => self.lcr = value,
             MCR => self.mcr = value,
@@ -258,12 +292,18 @@ impl Uart {
     }
 
     /// Whether the UART is asserting its interrupt line (IRQ4 on COM1): the
-    /// transmitter-holding-register-empty interrupt is enabled and, since the
-    /// transmitter here is always ready, always pending; the receiver
-    /// interrupt is enabled and a byte is waiting. What the run loop turns
-    /// into a raised IRQ.
-    pub fn irq_active(&self) -> bool {
-        (self.ier & IER_THRE != 0) || (self.ier & IER_RX != 0 && self.rx.is_some())
+    /// transmitter-holding-register-empty interrupt is enabled and pending,
+    /// or the receiver interrupt is enabled and a byte is waiting. What the
+    /// run loop turns into a raised IRQ.
+    pub fn irq_line(&self) -> bool {
+        (self.ier & IER_THRE != 0 && self.thri) || (self.ier & IER_RX != 0 && self.rx.is_some())
+    }
+
+    /// Whether a byte was written with the transmitter's interrupt enabled
+    /// since this last said so: the line went down and up again, an edge an
+    /// edge-triggered pin takes, whatever the line was before.
+    pub fn take_pulse(&mut self) -> bool {
+        core::mem::take(&mut self.pulse)
     }
 
     /// Whether a query reply is waiting to be fed to the guest.

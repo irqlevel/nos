@@ -270,6 +270,11 @@ impl Blk {
         self.transport.set_msix_enabled(on);
     }
 
+    /// Whether it asserts its INTx line now: a level, for an IO-APIC's pin.
+    pub fn line(&self) -> bool {
+        self.transport.line()
+    }
+
     /// A read of `size` bytes at `offset` in the BAR.
     pub fn io_read(&mut self, offset: u16, size: u8) -> u32 {
         let config = self.transport.config_offset();

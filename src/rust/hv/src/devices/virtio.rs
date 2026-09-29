@@ -295,6 +295,14 @@ impl Transport {
         self.msix.as_ref().filter(|m| m.enabled)
     }
 
+    /// Whether the function asserts its INTx line: an interrupt status the
+    /// driver has not read yet -- which is how long a level-triggered line
+    /// stays up -- with MSI-X off, a function with it on having no line in
+    /// use.
+    pub fn line(&self) -> bool {
+        self.isr != 0 && self.msix_on().is_none()
+    }
+
     /// Where the device's own configuration begins in the BAR.
     pub fn config_offset(&self) -> u16 {
         if self.msix_on().is_some() { DEVICE_CONFIG_MSIX } else { DEVICE_CONFIG }

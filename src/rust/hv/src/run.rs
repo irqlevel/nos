@@ -17,13 +17,21 @@
 //! ring of its doorbell (`crate::smp`). Each CPU's own state -- its registers,
 //! its local APIC (`crate::lapic`) -- is its task's alone.
 //!
-//! The PC is one without an IO-APIC: the 8259 pair is wired through the
-//! first CPU's LINT0, in virtual-wire mode, so its interrupts -- the PIT's
-//! tick, the serial port's, the disks' and NICs' -- are all the first CPU's.
-//! That CPU's task also does the devices' work between its guest's turns:
-//! the timer's edges, what the host has for the guest's console, NICs and
-//! disks. The others take their interrupts from their local APICs: their
-//! timers, and each other's IPIs.
+//! The 8259 pair is wired through the first CPU's LINT0, in virtual-wire
+//! mode, so its interrupts -- the PIT's tick, the serial port's, the disks'
+//! and NICs' -- are all the first CPU's. That CPU's task also does the
+//! devices' work between its guest's turns: the timer's edges, what the
+//! host has for the guest's console, NICs and disks. The others take their
+//! interrupts from their local APICs: their timers, and each other's IPIs.
+//!
+//! A guest can have an IO-APIC as well (`devices::ioapic`), with each of
+//! those lines on one of its pins as a PC wires them -- the timer on pin 2,
+//! the others on the pins of their IRQs -- and then the tables say so and
+//! its kernel routes them to any CPU through it, the 8259 masked. Without
+//! one, the tables say there is none to use. A pin's message is delivered
+//! as a device's MSI is -- into the local APIC of the CPU sending it, or
+//! through another's mailbox -- and a level-triggered one's end comes back
+//! from whichever CPU took it, as its APIC's EOI (`LinuxGuest::level_eoi`).
 //!
 //! The platform has ACPI's fixed hardware too (`crate::devices::pm`), and
 //! the tables that describe it all (`crate::acpi`): a kernel with ACPI turns
@@ -55,11 +63,12 @@ use kcore::time;
 
 use crate::acpi;
 use crate::devices::blk::{self, Blk};
+use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
 use crate::devices::pci::{self, Function, PciBus};
 use crate::devices::pm;
 use crate::devices::virtio::Raise;
-use crate::devices::{Pic, Pit, Pm, Rtc, Uart};
+use crate::devices::{IoApic, Pic, Pit, Pm, Rtc, Uart};
 use crate::lapic::{self, Addressing, Delivery, Ipi, Lapic, Wrote};
 use crate::linux::{self, Header, Layout};
 use crate::machine::Machine;
@@ -71,8 +80,9 @@ use crate::vm::{Cpu, Refusal};
 
 pub use crate::smp::Doorbell;
 
-/// COM1, the guest's console.
+/// COM1, the guest's console, and its IRQ.
 const COM1: u16 = 0x3F8;
+const COM1_IRQ: u8 = 4;
 
 /// Where the virtio devices' I/O BARs are put, as a BIOS would put them --
 /// the disks' from 0xC000, the NICs' from 0xC100 -- and the IRQs they share:
@@ -242,6 +252,8 @@ pub struct Counts {
     /// Devices' MSI-X messages this CPU sent on their behalf, doing their
     /// work: into its own APIC or another CPU's mailbox.
     pub msi: u64,
+    /// The IO-APIC's messages this CPU sent, its pins' interrupts.
+    pub ioapic: u64,
     /// MMIO accesses performed for the guest: its xAPIC page's.
     pub mmio_done: u64,
     /// INITs and start-up IPIs that reset and started this CPU.
@@ -291,6 +303,7 @@ impl Counts {
         self.ipi_sent += o.ipi_sent;
         self.ipi_taken += o.ipi_taken;
         self.msi += o.msi;
+        self.ioapic += o.ioapic;
         self.mmio_done += o.mmio_done;
         self.init += o.init;
         self.started += o.started;
@@ -468,6 +481,8 @@ struct Platform {
     rtc: Rtc,
     pic: Pic,
     pm: Pm,
+    /// The IO-APIC, for a guest given one.
+    ioapic: Option<IoApic>,
     pci: PciBus,
     /// What is on the bus, by slot: slot `i + 1` is `pci_devs[i]`. Disks and
     /// NICs in the order they were added, `vda` and `eth0` first.
@@ -545,13 +560,22 @@ impl LinuxGuest {
     /// false -- in xAPIC mode, reached through the page: for a kernel that
     /// reads the page before it looks at the mode firmware left, which a
     /// Linux of 6.5 or older without ACPI does.
-    pub fn new(machine: &Machine, mem_bytes: u64, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool)
+    ///
+    /// With `ioapic`, the machine has an IO-APIC too, its ID the one after
+    /// the CPUs' -- a guest of more than one CPU only, since it delivers to
+    /// local APICs -- and its APICs come out of reset in xAPIC mode, as a
+    /// PC's firmware leaves them: x2APIC mode with an IO-APIC and no
+    /// interrupt remapping is not one the architecture has, and Linux,
+    /// finding its firmware left one so, turns it off -- through a page it
+    /// has not mapped, 6.1 and 6.18 alike, and faults.
+    pub fn new(machine: &Machine, mem_bytes: u64, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool, ioapic: bool)
         -> Result<(Self, Vec<GuestCpu>)>
     {
         let n = cpus as usize;
-        if n == 0 || n > MAX_CPUS || doorbells.len() != n {
+        if n == 0 || n > MAX_CPUS || doorbells.len() != n || (ioapic && n < 2) {
             return Err(Error::BadAddress);
         }
+        let x2apic = x2apic && !ioapic;
         let mut memory = GuestMemory::new(machine.caps().vendor())?;
         memory.add(0, mem_bytes)?;
 
@@ -601,6 +625,7 @@ impl LinuxGuest {
             rtc: Rtc::new(),
             pic: Pic::new(),
             pm: Pm::new(time::boot_time_ns()),
+            ioapic: ioapic.then(|| IoApic::new(cpus as u8)),
             pci: PciBus::new()?,
             pci_devs,
             disks: 0,
@@ -643,6 +668,16 @@ impl LinuxGuest {
     /// mode take a Linux of 6.6 or later.
     pub fn has_apic(&self) -> bool {
         self.cpus.len() > 1
+    }
+
+    /// Whether it has an IO-APIC.
+    pub fn has_ioapic(&self) -> bool {
+        self.platform.lock().ioapic.is_some()
+    }
+
+    /// What its IO-APIC has done, when it has one.
+    pub fn ioapic_stats(&self) -> Option<ioapic::Stats> {
+        self.platform.lock().ioapic.as_ref().map(|io| io.stats)
     }
 
     /// Give it another disk, over `backend`: `vda`, `vdb`, ... in the order
@@ -739,37 +774,49 @@ impl LinuxGuest {
         if bsp.index != 0 || self.loaded {
             return Err(Error::BadAddress);
         }
-        let firmware = self.write_acpi()?;
-        linux::build(&self.memory, header, first, &layout, cmdline, self.cpus(), Some(firmware))?;
+        let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
+        let (n, msix) = self.pci_routes(&mut routes)?;
+        let ioapic = self.has_ioapic();
+        let firmware = self.write_acpi(&routes[..n], msix, ioapic)?;
+        linux::build(&self.memory, header, first, &layout, cmdline, self.cpus(), Some(firmware), &routes[..n], ioapic)?;
         linux::set_entry(bsp.cpu.backend_mut(), &layout);
         self.loaded = true;
         Ok(())
     }
 
-    /// The ACPI tables, for the machine as it is now -- its CPUs, and each
-    /// device on the bus with the IRQ its INTA is wired to -- laid out in the
-    /// BIOS area.
-    fn write_acpi(&self) -> Result<linux::Firmware> {
-        let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
+    /// Each device on the bus with the IRQ its INTA is wired to, into
+    /// `routes`: how many, and whether any function has an MSI-X table.
+    fn pci_routes(&self, routes: &mut [acpi::Route]) -> Result<(usize, bool)> {
+        let p = self.platform.lock();
         let mut n = 0;
-        let msix = {
-            let p = self.platform.lock();
-            for (i, d) in p.pci_devs.iter().enumerate() {
-                let irq = match d {
-                    PciDev::Disk(_) => DISK_IRQ,
-                    PciDev::Nic(_) => NIC_IRQ,
-                };
-                let (Some(route), Ok(slot)) = (routes.get_mut(n), u8::try_from(i + 1)) else {
-                    return Err(Error::BadAddress);
-                };
-                *route = acpi::Route { slot, irq };
-                n += 1;
-            }
-            (0..p.pci_devs.len()).any(|i| p.pci.msix(i + 1).is_some())
-        };
+        for (i, d) in p.pci_devs.iter().enumerate() {
+            let irq = match d {
+                PciDev::Disk(_) => DISK_IRQ,
+                PciDev::Nic(_) => NIC_IRQ,
+            };
+            let (Some(route), Ok(slot)) = (routes.get_mut(n), u8::try_from(i + 1)) else {
+                return Err(Error::BadAddress);
+            };
+            *route = acpi::Route { slot, irq };
+            n += 1;
+        }
+        let msix = (0..p.pci_devs.len()).any(|i| p.pci.msix(i + 1).is_some());
+        Ok((n, msix))
+    }
+
+    /// The ACPI tables, for the machine as it is now -- its CPUs, its
+    /// IO-APIC when `ioapic`, and each device on the bus, `routes` -- laid
+    /// out in the BIOS area.
+    fn write_acpi(&self, routes: &[acpi::Route], msix: bool, ioapic: bool) -> Result<linux::Firmware> {
         /* The window covers every slot's page, whichever have one. */
         let window = msix.then_some((MSIX_PAGES, pci::MAX_SLOTS as u32 * pci::MSIX_PAGE));
-        let machine = acpi::Machine { cpus: self.cpus(), apic: self.has_apic(), pci: &routes[..n], mmio: window };
+        let machine = acpi::Machine {
+            cpus: self.cpus(),
+            apic: self.has_apic(),
+            ioapic: ioapic.then_some(self.cpus() as u8),
+            pci: routes,
+            mmio: window,
+        };
 
         let mut buf = Vec::new();
         buf.try_reserve_exact(acpi::MAX_BYTES).map_err(|_| Error::NoMemory)?;
@@ -927,7 +974,8 @@ impl LinuxGuest {
              * is doing: its console fed, the PIT's edges and the serial
              * port's interrupt raised on the 8259, and what the NICs and
              * disks have for the guest given to it -- raising their lines.
-             * The 8259 then has an interrupt for a CPU that takes them. */
+             * The 8259 then has an interrupt for a CPU that takes them; and
+             * an IO-APIC, what its pins send, delivered from here. */
             let mut extint = false;
             let mut pit_edge = None;
             if me == 0 {
@@ -949,24 +997,29 @@ impl LinuxGuest {
                  * taken: an IRQ0 still requested or in service would swallow
                  * the next, and a tick the guest never saw is time it never
                  * counts (`Pit::ch0_fire`). */
-                if !p.pic.busy(0) && p.pit.ch0_fire() {
+                let mut pins = 0;
+                if !timer_busy(&p, &gc.lapic) && p.pit.ch0_fire() {
                     p.pic.raise(0);
+                    if let Some(io) = p.ioapic.as_mut() {
+                        pins |= io.edge(ioapic::TIMER_PIN);
+                    }
                     gc.counts.edges0 += 1;
                 }
-                /* COM1's transmitter is always ready, so with its THR-empty
-                 * interrupt enabled it asserts IRQ4 -- which is how the
-                 * serial driver sends past the first byte, an interrupt at
-                 * a time. */
-                if p.uart.irq_active() {
-                    p.pic.raise(4);
+                /* COM1's interrupt, for as long as it asserts it: which is
+                 * how the serial driver sends past the first byte, an
+                 * interrupt at a time. */
+                if p.uart.irq_line() {
+                    p.pic.raise(COM1_IRQ);
                 }
                 self.poll_devices(&mut p, me as u32, &mut gc.lapic, &mut gc.counts);
+                pins |= sync_ioapic(&mut p, now);
+                self.ioapic_send(&mut p, pins, me as u32, &mut gc.lapic, &mut gc.counts);
                 extint = gc.lapic.accepts_extint() && p.pic.pending().is_some();
                 /* Not while IRQ0 is still requested or in service -- masked,
                  * say: none is handed over until the guest takes that one,
                  * and an owed edge, already due, would have the vCPU wake
                  * without sleeping for good. */
-                pit_edge = if p.pic.busy(0) { None } else { p.pit.next_ch0_edge_ns() };
+                pit_edge = if timer_busy(&p, &gc.lapic) { None } else { p.pit.next_ch0_edge_ns() };
             } else if gc.lapic.accepts_extint() {
                 extint = self.platform.lock().pic.pending().is_some();
             }
@@ -1084,20 +1137,22 @@ impl LinuxGuest {
                     None
                 }
                 Exit::NestedFault { gpa, error } => {
-                    /* The local APIC's page, in xAPIC mode: the access
-                     * performed for the guest. Else a read of the platform's
-                     * MMIO window that nothing answers is a probe for a
-                     * device that is not there: map all ones and let the
-                     * instruction run again. Anything else -- a write, a
-                     * fetch, a walk of the guest's own tables, an address
-                     * outside the window, the APIC's page in x2APIC mode --
-                     * stops it. */
+                    /* The local APIC's page, in xAPIC mode, and the
+                     * IO-APIC's, when there is one: the access performed for
+                     * the guest. Else a read of the platform's MMIO window
+                     * that nothing answers is a probe for a device that is
+                     * not there: map all ones and let the instruction run
+                     * again. Anything else -- a write, a fetch, a walk of the
+                     * guest's own tables, an address outside the window, the
+                     * APIC's page in x2APIC mode -- stops it. */
                     use vmcb::npf;
                     let data = error & (npf::PRESENT | npf::FETCH) == 0 && error & npf::FINAL != 0;
                     let plain_read = data && error & npf::WRITE == 0;
                     let apic_page = gpa & !(lapic::XAPIC_PAGE_SIZE - 1) == lapic::DEFAULT_BASE;
                     if data && apic_page && self.has_apic() && gc.lapic.xapic() {
                         self.xapic_access(gc, gpa, error & npf::WRITE != 0)
+                    } else if data && IoApic::owns(gpa) && self.has_ioapic() {
+                        self.ioapic_access(gc, gpa, error & npf::WRITE != 0)
                     } else if plain_read && self.memory.map_absent(gpa).is_ok() {
                         None
                     } else {
@@ -1292,7 +1347,7 @@ impl LinuxGuest {
         let taken: u32 = mail.fixed.iter().map(|w| w.count_ones()).sum();
         if taken != 0 {
             gc.counts.ipi_taken += u64::from(taken);
-            gc.lapic.accept_all(&mail.fixed);
+            gc.lapic.accept_all(&mail.fixed, &mail.level);
         }
     }
 
@@ -1540,16 +1595,47 @@ impl LinuxGuest {
     /// priority -- straight into `lapic` for the CPU `me` doing the device's
     /// work, and through the mailbox and a ring for any other.
     fn post_msi(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi) {
+        self.post_message(me, lapic, ipi, false);
+    }
+
+    /// A device's message on the APIC bus -- an MSI, an IO-APIC pin's -- to
+    /// the CPUs it names, as `post_msi` delivers one; `level`, a fixed
+    /// interrupt the local APIC takes as level-triggered, its EOI coming
+    /// back to the IO-APIC. An NMI goes into the mailbox of each CPU named,
+    /// the sender's own included, for its loop to take -- rung, so that one
+    /// already on its way into its guest turns back for it. An INIT from a
+    /// device is none a PC's firmware wires, and is dropped.
+    fn post_message(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi, level: bool) {
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
             let addressing = if id == me { lapic.addressing() } else { target.addressing() };
             if !ipi.reaches(id, addressing, me) {
                 continue;
             }
-            if id == me {
-                lapic.accept(ipi.vector);
-            } else {
-                target.mail.post_fixed(ipi.vector);
+            let posted = match ipi.delivery {
+                Delivery::Fixed | Delivery::LowestPriority if id == me => {
+                    if level {
+                        lapic.accept_level(ipi.vector);
+                    } else {
+                        lapic.accept(ipi.vector);
+                    }
+                    false
+                }
+                Delivery::Fixed | Delivery::LowestPriority => {
+                    if level {
+                        target.mail.post_level(ipi.vector);
+                    } else {
+                        target.mail.post_fixed(ipi.vector);
+                    }
+                    true
+                }
+                Delivery::Nmi => {
+                    target.mail.post_nmi();
+                    true
+                }
+                _ => return,
+            };
+            if posted {
                 if let Some(d) = self.doorbells.get(i) {
                     d.ring();
                 }
@@ -1558,6 +1644,64 @@ impl LinuxGuest {
                 return;
             }
         }
+    }
+
+    /// The interrupts the IO-APIC has to send for `pins`, delivered as its
+    /// messages say, by CPU `me`, whose local APIC is `lapic`.
+    fn ioapic_send(&self, p: &mut Platform, pins: Pins, me: u32, lapic: &mut Lapic, counts: &mut Counts) {
+        let Some(io) = p.ioapic.as_mut() else { return };
+        let mut left = pins;
+        while left != 0 {
+            let pin = left.trailing_zeros() as usize;
+            left &= left - 1;
+            if let Some(m) = io.send(pin) {
+                counts.ioapic += 1;
+                self.post_message(me, lapic, &m.ipi, m.level);
+            }
+        }
+    }
+
+    /// `gc`'s local APIC ended a level-triggered interrupt of `vector`: its
+    /// EOI broadcast to the IO-APIC, which ends the interrupt that pin sent
+    /// -- and sends it again if its line is still up.
+    fn level_eoi(&self, gc: &mut GuestCpu, vector: u8) {
+        let mut p = self.platform.lock();
+        let Some(io) = p.ioapic.as_mut() else { return };
+        let pins = io.eoi(vector);
+        self.ioapic_send(&mut p, pins, gc.index, &mut gc.lapic, &mut gc.counts);
+    }
+
+    /// Perform the guest's access of the IO-APIC's page -- a `write` or a
+    /// read of `gpa` -- by the instruction that faulted: its select, window
+    /// or EOI register read or written, a load's value in its register, the
+    /// instruction stepped past; and what a write sends -- an unmasked level
+    /// that is up, an EOI's interrupt again -- delivered. An instruction
+    /// that cannot be performed stops the guest, showing its bytes.
+    fn ioapic_access(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
+        let mut bytes = mmio::Bytes::default();
+        let op = match mmio::begin(gc.cpu.backend(), &self.memory, gpa, write, &mut bytes) {
+            Ok(op) => op,
+            Err(error) => {
+                let rip = gc.cpu.backend().save().rip;
+                return Some(Stop::MmioInsn { gpa, rip, error, bytes });
+            }
+        };
+        gc.counts.mmio_done += 1;
+        let offset = (gpa & (ioapic::PAGE_SIZE - 1)) as u32;
+        let mut p = self.platform.lock();
+        let read = match p.ioapic.as_mut() {
+            Some(io) if op.is_write() => {
+                let pins = io.mmio_write(offset, op.size(), op.value as u32);
+                self.ioapic_send(&mut p, pins, gc.index, &mut gc.lapic, &mut gc.counts);
+                0
+            }
+            Some(io) => u64::from(io.mmio_read(offset, op.size())),
+            /* The caller found one: never. */
+            None => 0,
+        };
+        drop(p);
+        mmio::finish(gc.cpu.backend_mut(), &op, read);
+        None
     }
 
     /// Answer a port access and step past it -- or, for a write that resets
@@ -1685,10 +1829,14 @@ impl LinuxGuest {
         } else {
             gc.counts.port_out += 1;
         }
+        /* What the access did to the IO-APIC's pins -- the serial port's,
+         * the SCI's, a device's line -- sent from here. */
+        let pins = sync_ioapic(&mut p, time::boot_time_ns());
+        self.ioapic_send(&mut p, pins, me, &mut gc.lapic, &mut gc.counts);
         /* An interrupt left pending on the 8259 by another CPU's access --
          * a device's, the serial port's -- is the first CPU's to take, and
          * it may be asleep or in its guest: ring it. */
-        let ring = me != 0 && (p.pic.pending().is_some() || p.uart.irq_active());
+        let ring = me != 0 && (p.pic.pending().is_some() || p.uart.irq_line());
         drop(p);
         v.skip_io(io);
         if ring {
@@ -1732,6 +1880,7 @@ impl LinuxGuest {
                 Wrote::Done => {}
                 Wrote::Tpr(tpr) => v.set_cr8(tpr >> 4),
                 Wrote::Ipi(ipi) => self.send(gc, ipi),
+                Wrote::Eoi(vector) => self.level_eoi(gc, vector),
             }
             /* The logical ID and the model are this page's to write. */
             self.publish(gc);
@@ -1771,6 +1920,10 @@ impl LinuxGuest {
                     Ok(Wrote::Ipi(ipi)) => {
                         gc.cpu.backend_mut().skip_msr();
                         self.send(gc, ipi);
+                    }
+                    Ok(Wrote::Eoi(vector)) => {
+                        gc.cpu.backend_mut().skip_msr();
+                        self.level_eoi(gc, vector);
                     }
                     Err(lapic::Refused) => self.msr_fault(gc, msr, value, true),
                 }
@@ -1843,19 +1996,67 @@ fn msix_page(memory: &mut GuestMemory, apic: bool, slot: usize) -> Result<Option
     }
 }
 
-/// The SCI's line as the PM registers have it now: requested when an enabled
-/// event is set and IRQ 9 is neither requested nor in service already -- so
-/// that one still set after the guest ended the interrupt is requested again,
-/// as a level-triggered line is -- and withdrawn when none is.
+/// The SCI's line on the 8259 as the PM registers have it now: requested
+/// when an enabled event is set and IRQ 9 is neither requested nor in
+/// service already -- so that one still set after the guest ended the
+/// interrupt is requested again, as a level-triggered line is -- and
+/// withdrawn when none is. Counted where it is delivered: here while IRQ 9
+/// is unmasked, and through the IO-APIC's pin as that sends (`sync_ioapic`).
 fn sync_sci(p: &mut Platform, now: u64) {
     if p.pm.sci(now) {
         if !p.pic.busy(pm::SCI_IRQ) {
             p.pic.raise(pm::SCI_IRQ);
-            p.pm.scis += 1;
+            if !p.pic.masked(pm::SCI_IRQ) {
+                p.pm.scis += 1;
+            }
         }
     } else {
         p.pic.lower(pm::SCI_IRQ);
     }
+}
+
+/// Whether the timer's last edge has not been taken yet, where it went: on
+/// the 8259, IRQ0 requested or in service -- and while the IO-APIC's timer
+/// pin is masked, a masked IRQ0 requested counts too, the guest having
+/// nowhere else to take it; through the IO-APIC's unmasked pin, its vector
+/// still requested in the first CPU's local APIC, `lapic`, when that is the
+/// CPU it goes to -- another CPU's is not this one's to look at, and an edge
+/// for one is sent when it is due.
+fn timer_busy(p: &Platform, lapic: &Lapic) -> bool {
+    let Some(route) = p.ioapic.as_ref().and_then(|io| io.route(ioapic::TIMER_PIN)) else {
+        return p.pic.busy(0);
+    };
+    let pic = !p.pic.masked(0) && p.pic.busy(0);
+    let ioapic = route.reaches(0, lapic.addressing(), 0) && lapic.requested(route.vector);
+    pic || ioapic
+}
+
+/// The IO-APIC's pins as their devices drive them now, when there is one --
+/// the serial port's, pulsed for each byte sent with its interrupt enabled
+/// and up while it asserts it; the SCI's; each PCI line's, up while a
+/// function on it has an interrupt status its driver has not read -- and
+/// the pins that has an interrupt to send. The timer's edges are the
+/// caller's (`LinuxGuest::run`).
+fn sync_ioapic(p: &mut Platform, now: u64) -> Pins {
+    let Platform { ioapic, uart, pm, pci_devs, .. } = p;
+    let Some(io) = ioapic.as_mut() else { return 0 };
+    let serial = ioapic::isa_pin(COM1_IRQ);
+    let mut pins = if uart.take_pulse() { io.edge(serial) } else { 0 };
+    pins |= io.set_line(serial, uart.irq_line());
+    let sci = io.set_line(ioapic::isa_pin(pm::SCI_IRQ), pm.sci(now));
+    if sci != 0 {
+        pm.scis += 1;
+    }
+    pins |= sci;
+    let (mut disk, mut nic) = (false, false);
+    for d in pci_devs.iter() {
+        match d {
+            PciDev::Disk(d) => disk |= d.line(),
+            PciDev::Nic(n) => nic |= n.line(),
+        }
+    }
+    pins |= io.set_line(ioapic::isa_pin(DISK_IRQ), disk);
+    pins | io.set_line(ioapic::isa_pin(NIC_IRQ), nic)
 }
 
 /// Each device's transport told whether its function has MSI-X on: after
