@@ -103,7 +103,7 @@ swallowing panic messages whole.
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
-| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
+| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -672,6 +672,17 @@ costs more than the calibration loop allows -- so it stays on jiffies and
 the PIT's periodic mode. `--cmdline-extra "tsc_early_khz=<kHz>
 tsc=reliable"` puts it on the TSC and high-resolution timers, which drive
 the PIT in one-shot mode, as a real CPU's calibration does by itself.
+
+`--ubuntu` boots Ubuntu 24.04's server cloud image (made raw) as a cloud
+does: its kernel, initrd and GRUB's command line (`root=LABEL=cloudimg-rootfs
+ro console=tty1 console=ttyS0`) read out of its own /boot partition and
+given unchanged, and cloud-init provisioning it from a NoCloud seed -- an ISO
+labelled `cidata`, the VM's second, read-only disk -- with root's password
+and the machine's name. It is checked as Debian is -- systemd running with
+no unit failed, its root read-write and kept across a reboot, the network
+and the way out, `hv stop` turning it off -- but its network comes up from
+the `ip=` hv gives a networked guest, which its initramfs sets and
+cloud-init keeps, rather than by DHCP.
 
 `--cpus N` gives each guest N CPUs, and their local APICs -- the command
 line then without the `nolapic` a guest of one CPU is given -- and every

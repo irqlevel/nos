@@ -57,10 +57,21 @@ own /boot, its root partition the guest's disk and written to:
   - `hv stop` presses its power button: systemd-logind hears it through the
     machine's ACPI, and systemd shuts the system down and turns it off
 
-Both boot with the machine's ACPI tables: their kernels find the PCI host
-bridge, their devices' interrupts and the PM timer through them. `--acpi-off`
-boots them with `acpi=off` instead -- the MP table, PCI by configuration
-mechanism 1, no power button -- the machine as it was before it had ACPI.
+And with `--ubuntu`, Ubuntu 24.04's server cloud image (made raw) the way a
+cloud boots it: its kernel, initrd and GRUB's command line read out of its
+own /boot partition and given to the VM unchanged, and cloud-init
+provisioning it from a NoCloud seed -- an ISO labelled `cidata`, the VM's
+second, read-only disk -- which sets root's password and names the machine.
+The same checks as Debian's but its version, 24.04 on its `-generic`
+kernel, and its network: its initramfs takes the address from the `ip=` hv
+gives a networked guest, and cloud-init keeps it.
+
+All three boot with the machine's ACPI tables: their kernels find the PCI
+host bridge, their devices' interrupts and the PM timer through them.
+`--acpi-off` boots them with `acpi=off` instead -- the MP table, PCI by
+configuration mechanism 1, no power button -- the machine as it was before
+it had ACPI. `--cpus N` gives each guest N CPUs and their local APICs (a
+guest of more than one is not told `nolapic`), and `--ioapic` an IO-APIC.
 
 Manual, like hv-linux-test: the images are downloads CI does not make, and
 the runs are slow under TCG, the guest emulated twice (Alpine: two boots and
@@ -330,6 +341,9 @@ def alpine(args):
 # Debian's cloud image: its root partition, found by its GPT type, and the
 # kernel and initrd in its /boot, which are the only ones there.
 DEBIAN_ROOT_TYPE = "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"   # Linux x86-64 root
+# Ubuntu's (24.04 on): a /boot partition of its own, an XBOOTLDR by its GPT
+# type, with the kernel, the initrd and GRUB's grub.cfg at its root.
+UBUNTU_BOOT_TYPE = "BC13C2FF-59E6-4262-A352-B275FD6F7172"   # Linux extended boot
 # The image's root is locked ("!unprovisioned") until systemd-firstboot sets
 # it, which asks at the console for what it is not given: the password, the
 # locale, the keymap and the timezone, handed to it as credentials on the
@@ -338,60 +352,141 @@ DEBIAN_PASSWORD = "nos"
 # How the Debian guest is ended: its power button, and time for systemd to
 # stop its services and unmount its root, as slow as TCG makes it.
 STOP_LINE = "hv stop 0 secs=300"
-DEBIAN_CMDLINE = ("root=/dev/vda1 ro console=ttyS0 nolapic"
-                  " systemd.set_credential=passwd.plaintext-password.root:" + DEBIAN_PASSWORD +
-                  " systemd.set_credential=firstboot.locale:C.UTF-8"
-                  " systemd.set_credential=firstboot.keymap:us"
-                  " systemd.set_credential=firstboot.timezone:UTC")
+DEBIAN_CREDENTIALS = (" systemd.set_credential=passwd.plaintext-password.root:" + DEBIAN_PASSWORD +
+                      " systemd.set_credential=firstboot.locale:C.UTF-8"
+                      " systemd.set_credential=firstboot.keymap:us"
+                      " systemd.set_credential=firstboot.timezone:UTC")
+DEBIAN_CMDLINE = "root=/dev/vda1 ro console=ttyS0 nolapic" + DEBIAN_CREDENTIALS
 DEBIAN_PROMPT = "root@localhost:~#"
+# Ubuntu's is provisioned by cloud-init, from a NoCloud seed: a disk whose
+# filesystem is labelled `cidata`, with its user-data and meta-data -- here
+# an ISO, the VM's second, read-only disk -- as a cloud's is. Root's password
+# set, and the machine named; the rest is the image's own, its network
+# cloud-init's fallback of DHCP on the first NIC.
+UBUNTU_PASSWORD = "nos"
+UBUNTU_HOSTNAME = "ubuntu"
+UBUNTU_PROMPT = "root@%s:~#" % UBUNTU_HOSTNAME
+UBUNTU_USER_DATA = ("#cloud-config\n"
+                    "disable_root: false\n"
+                    "chpasswd:\n"
+                    "  expire: false\n"
+                    "  users:\n"
+                    "    - {name: root, password: %s, type: text}\n" % UBUNTU_PASSWORD)
+UBUNTU_META_DATA = "instance-id: nos-hv-distro-test\nlocal-hostname: %s\n" % UBUNTU_HOSTNAME
 # What the image lacks to configure its ethernet itself, given the way the
 # rest is: a .network file, as a credential systemd-network-generator puts
 # in /run/systemd/network. Any ethernet link, by DHCP.
 DEBIAN_NETWORK = "[Match]\nType=ether\n\n[Network]\nDHCP=ipv4\n"
 
 
-def debian_boot_files(image, tmp):
-    """The kernel and the initrd out of the image's root partition: its
-    offset from sfdisk, the partition cut out sparse, and debugfs to read
-    /boot."""
+def image_boot_files(image, tmp, part_type, boot):
+    """The kernel and the initrd out of the image's partition of `part_type`
+    -- its offset from sfdisk, the partition cut out sparse, debugfs to read
+    the directory `boot` in it -- and the command line its GRUB gives the
+    kernel, from the first `linux` line of that directory's grub.cfg."""
     import json
     table = json.loads(subprocess.run(["sfdisk", "-J", image], check=True, capture_output=True,
                                       text=True).stdout)["partitiontable"]
-    root = next(p for p in table["partitions"] if p["type"].upper() == DEBIAN_ROOT_TYPE)
-    part = os.path.join(tmp, "root.part")
+    found = next(p for p in table["partitions"] if p["type"].upper() == part_type)
+    part = os.path.join(tmp, "boot.part")
     sector = table.get("sectorsize", 512)
-    subprocess.run(["dd", "if=" + image, "of=" + part, "bs=%d" % sector, "skip=%d" % root["start"],
-                    "count=%d" % root["size"], "conv=sparse", "status=none"], check=True)
-    listing = subprocess.run(["debugfs", "-R", "ls /boot", part], check=True, capture_output=True,
+    subprocess.run(["dd", "if=" + image, "of=" + part, "bs=%d" % sector, "skip=%d" % found["start"],
+                    "count=%d" % found["size"], "conv=sparse", "status=none"], check=True)
+    listing = subprocess.run(["debugfs", "-R", "ls %s" % (boot or "/"), part], check=True, capture_output=True,
                              text=True).stdout
     names = listing.split()
     out = {}
     for prefix in ("vmlinuz-", "initrd.img-"):
         name = next(n for n in names if n.startswith(prefix))
         dst = os.path.join(tmp, prefix.rstrip("-."))
-        subprocess.run(["debugfs", "-R", "dump /boot/%s %s" % (name, dst), part], check=True,
+        subprocess.run(["debugfs", "-R", "dump %s/%s %s" % (boot, name, dst), part], check=True,
                        capture_output=True)
         out[prefix] = dst
+    grub = subprocess.run(["debugfs", "-R", "cat %s/grub/grub.cfg" % boot, part], capture_output=True,
+                          text=True).stdout
     os.unlink(part)
-    return out["vmlinuz-"], out["initrd.img-"]
+    line = next((l.split(None, 2) for l in grub.splitlines() if l.strip().startswith("linux")), None)
+    cmdline = " ".join(line[2].split()) if line and len(line) > 2 else ""
+    return out["vmlinuz-"], out["initrd.img-"], cmdline
 
 
 def debian(args):
     """Debian's cloud image, as it ships: systemd, initramfs-tools, and its
-    root on the guest's disk, written to -- and still there after a reboot."""
-    tmp = tempfile.mkdtemp(prefix="nos-hvdebian-")
-    vmlinuz, initrd = debian_boot_files(args.debian, tmp)
+    root on the guest's disk, written to -- and still there after a reboot --
+    provisioned by systemd's credentials on its command line."""
+    import base64
+
+    def cmdline(grub):
+        base = args.debian_cmdline + DEBIAN_CREDENTIALS if args.debian_cmdline else DEBIAN_CMDLINE
+        return (machine_cmdline(base, args) + (ACPI_OFF if args.acpi_off else "") +
+                " systemd.set_credential_binary=network.network.50-nos:" +
+                base64.b64encode(DEBIAN_NETWORK.encode()).decode())
+
+    cloud(args, argparse.Namespace(
+        title="Debian", tag="debian", image=args.debian, mem=args.debian_mem, root_mib=args.debian_root_mib,
+        part_type=DEBIAN_ROOT_TYPE, boot="/boot", cmdline=cmdline, seed=None,
+        prompt=DEBIAN_PROMPT, password=DEBIAN_PASSWORD, dhcp=True,
+        provisioned="with the password systemd-firstboot was given",
+        version="cat /etc/debian_version; uname -r",
+        version_ok=lambda t: re.search(r"^\d+\.\d+\s*$", t, re.M) is not None and "deb" in t,
+        version_what="and it is Debian, on its own kernel"))
+
+
+def ubuntu(args):
+    """Ubuntu's cloud image, as it ships: its kernel and initrd from its own
+    /boot partition, the command line its GRUB gives them, and cloud-init
+    provisioning it from a NoCloud seed -- the way a cloud boots one."""
+
+    def cmdline(grub):
+        return machine_cmdline(args.ubuntu_cmdline or grub, args) + (ACPI_OFF if args.acpi_off else "")
+
+    cloud(args, argparse.Namespace(
+        title="Ubuntu", tag="ubuntu", image=args.ubuntu, mem=args.ubuntu_mem, root_mib=args.ubuntu_root_mib,
+        part_type=UBUNTU_BOOT_TYPE, boot="", cmdline=cmdline, seed=(UBUNTU_USER_DATA, UBUNTU_META_DATA),
+        prompt=UBUNTU_PROMPT, password=UBUNTU_PASSWORD, dhcp=False,
+        provisioned="with the password cloud-init set from its seed",
+        version=". /etc/os-release; echo $VERSION_ID; uname -r",
+        version_ok=lambda t: re.search(r"^24\.04\s*$", t, re.M) is not None and "-generic" in t,
+        version_what="and it is Ubuntu 24.04, on its own kernel"))
+
+
+def seed_iso(tmp, seed):
+    """A NoCloud seed: an ISO labelled `cidata` with the user-data and the
+    meta-data in it, which cloud-init looks for on every disk."""
+    d = os.path.join(tmp, "seed")
+    os.makedirs(d)
+    for name, text in (("user-data", seed[0]), ("meta-data", seed[1])):
+        with open(os.path.join(d, name), "w") as f:
+            f.write(text)
+    iso = os.path.join(tmp, "seed.iso")
+    subprocess.run(["xorriso", "-as", "mkisofs", "-quiet", "-output", iso, "-volid", "cidata", "-joliet", "-rock",
+                    os.path.join(d, "user-data"), os.path.join(d, "meta-data")], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return iso
+
+
+def cloud(args, d):
+    """A distribution's cloud image, `d`, as it ships: systemd, its own
+    kernel and initrd, and its root on the guest's disk, written to -- and
+    still there after a reboot."""
+    tmp = tempfile.mkdtemp(prefix="nos-hv%s-" % d.tag)
+    vmlinuz, initrd, grub = image_boot_files(d.image, tmp, d.part_type, d.boot)
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(rootdir)
-    # A copy, holes and all: the guest writes to it, and it is 3 GiB.
-    subprocess.run(["cp", "--sparse=always", args.debian, os.path.join(rootdir, "debian.raw")], check=True)
+    # A copy, holes and all: the guest writes to it, and it is gigabytes.
+    raw = "%s.raw" % d.tag
+    subprocess.run(["cp", "--sparse=always", d.image, os.path.join(rootdir, raw)], check=True)
+    disks = " disk=/%s" % raw
+    extra = {}
+    if d.seed is not None:
+        extra["seed.iso"] = seed_iso(tmp, d.seed)
+        disks += " disk=/seed.iso:ro"
     marker = "nos-was-here-%d" % os.getpid()
 
     server, url, token = web(tmp)
-    import base64
-    cmdline = (machine_cmdline(DEBIAN_CMDLINE, args) + (ACPI_OFF if args.acpi_off else "") +
-               " systemd.set_credential_binary=network.network.50-nos:" +
-               base64.b64encode(DEBIAN_NETWORK.encode()).decode())
+    cmdline = d.cmdline(grub)
+    print("  (%s's GRUB line: %s)" % (d.title, grub))
+    print("  (the command line given: %s)" % cmdline[:300])
 
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
     marker_line = x("echo %s > /root/nos.txt && sync && cat /root/nos.txt" % marker)
@@ -406,12 +501,12 @@ def debian(args):
     kept_line = x("cat /root/nos.txt")
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
-                r"hv send 0 %s\n" % DEBIAN_PASSWORD, "hv wait 0 secs=120 " + DEBIAN_PROMPT]
+                r"hv send 0 %s\n" % d.password, "hv wait 0 secs=120 " + d.prompt]
     rc = (["insmod /hv.ko", "hv on",
-           "hv start /bzImage mem=%d%s initrd=/initrd disk=/debian.raw net restart cmdline=%s"
-           % (args.debian_mem, machine_opt(args), cmdline)]
+           "hv start /bzImage mem=%d%s initrd=/initrd%s net restart cmdline=%s"
+           % (d.mem, machine_opt(args), disks, cmdline)]
           + login(0)
-          + [x("cat /etc/debian_version; uname -r"),
+          + [x(d.version),
              x("systemctl is-system-running --wait", 300),
              x("systemctl --failed --no-legend --no-pager | wc -l"),
              x("findmnt -rno SOURCE,FSTYPE,OPTIONS /"),
@@ -433,14 +528,14 @@ def debian(args):
              # Pressed, and given long enough for systemd under TCG too.
              STOP_LINE,
              hvl.RC_LAST])
-    boot = argparse.Namespace(bzimage=vmlinuz, initrd=initrd, root_mib=args.debian_root_mib,
+    boot = argparse.Namespace(bzimage=vmlinuz, initrd=initrd, root_mib=d.root_mib,
                               deadline=args.deadline)
     # nos's own NIC, on QEMU's user network: its lease is the gateway and
     # the DNS server the guest's way out is made of.
     qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
             "-netdev", "user,id=net0"]
     t_start = time.time()
-    p, log, image = hvl.boot_rc(boot, tmp, rc, qemu=qemu)
+    p, log, image = hvl.boot_rc(boot, tmp, rc, extra=extra, qemu=qemu)
     t_end = time.time()
     try:
         txt = open(log, errors="replace").read()
@@ -453,14 +548,13 @@ def debian(args):
 
         first, second = login(0), login(1)
         m = re.search(r'printed "login:", (\d+) ms in', out(first[0]))
-        pt.check("Debian's own kernel and initrd boot it, systemd, to a login prompt", m is not None,
+        pt.check("%s's own kernel and initrd boot it, systemd, to a login prompt" % d.title, m is not None,
                  out(first[0]))
         if m:
             print("  (login prompt %.1f s after the VM started)" % (int(m.group(1)) / 1000.0))
-        pt.check("root logs in, with the password systemd-firstboot was given",
-                 "printed \"%s\"" % DEBIAN_PROMPT in out(first[4]), out(first[2]) + out(first[4]))
-        pt.check("and it is Debian, on its own kernel",
-                 re.search(r"^\d+\.\d+\s*$", out(rc[8]), re.M) is not None and "deb" in out(rc[8]), out(rc[8]))
+        pt.check("root logs in, " + d.provisioned,
+                 "printed \"%s\"" % d.prompt in out(first[4]), out(first[2]) + out(first[4]))
+        pt.check(d.version_what, d.version_ok(out(rc[8])), out(rc[8]))
         pt.check("systemd says the system is running", re.search(r"^running\s*$", out(rc[9]), re.M) is not None,
                  out(rc[9]))
         pt.check("with no unit failed", re.search(r"^0\s*$", out(rc[10]), re.M) is not None, out(rc[10]))
@@ -478,13 +572,21 @@ def debian(args):
                  is not None, out(marker_line))
         pt.check("reboot resets it, and the VM boots again", 'printed "login:" in boot 1' in out(second[0]),
                  out(second[0]))
-        pt.check("root logs in again", "printed \"%s\"" % DEBIAN_PROMPT in out(second[4], 1), out(second[4], 1))
+        pt.check("root logs in again", "printed \"%s\"" % d.prompt in out(second[4], 1), out(second[4], 1))
         addr = out(net_lines[0])
-        pt.check("networkd takes the port's address from the switch's DHCP server",
-                 re.search(r"inet %s/24 .*\bdynamic\b" % re.escape(GUEST_IP), addr) is not None, addr[-900:])
-        pt.check("with nos as its router",
-                 re.search(r"default via 10\.0\.100\.1 .*proto dhcp", out(net_lines[1])) is not None,
-                 out(net_lines[1]))
+        if d.dhcp:
+            pt.check("networkd takes the port's address from the switch's DHCP server",
+                     re.search(r"inet %s/24 .*\bdynamic\b" % re.escape(GUEST_IP), addr) is not None, addr[-900:])
+            pt.check("with nos as its router",
+                     re.search(r"default via 10\.0\.100\.1 .*proto dhcp", out(net_lines[1])) is not None,
+                     out(net_lines[1]))
+        else:
+            # The `ip=` hv puts on a networked guest's command line: its
+            # initramfs sets the address, and cloud-init keeps it.
+            pt.check("it has the port's address, from the ip= hv gives it",
+                     re.search(r"inet %s/24 " % re.escape(GUEST_IP), addr) is not None, addr[-900:])
+            pt.check("with nos as its router",
+                     re.search(r"default via 10\.0\.100\.1 ", out(net_lines[1])) is not None, out(net_lines[1]))
         pt.check("on the switch, its virtio-net driver reaches nos",
                  re.search(r"3 packets transmitted, 3 (packets )?received", out(net_lines[2])) is not None,
                  out(net_lines[2])[-600:])
@@ -572,6 +674,11 @@ def main():
     ap.add_argument("--cmdline-extra", default="", help="more for the Alpine guest's command line")
     ap.add_argument("--root-mib", type=int, default=256, help="nos's root filesystem for Alpine, MiB")
     ap.add_argument("--debian-root-mib", type=int, default=3700, help="nos's root filesystem for Debian, MiB")
+    ap.add_argument("--ubuntu", help="Ubuntu's ubuntu-24.04-server-cloudimg-amd64.img, made raw (qemu-img convert -O raw)")
+    ap.add_argument("--ubuntu-mem", type=int, default=1024, help="the Ubuntu guest's RAM in MiB")
+    ap.add_argument("--ubuntu-root-mib", type=int, default=4400, help="nos's root filesystem for Ubuntu, MiB")
+    ap.add_argument("--ubuntu-cmdline", default="",
+                    help="the Ubuntu kernel's command line in place of the one its image's GRUB gives it")
     ap.add_argument("--deadline", type=int, default=1800, help="seconds to wait for /etc/rc to finish")
     ap.add_argument("--internet", action="store_true",
                     help="also reach the internet through NAT: a name looked up, and a distribution's mirror "
@@ -579,31 +686,38 @@ def main():
     ap.add_argument("--acpi-off", action="store_true",
                     help="boot the distributions with acpi=off: the machine without its ACPI tables, as it was "
                          "before it had them")
+    ap.add_argument("--debian-cmdline", default="",
+                    help="the Debian kernel's command line in place of the gate's own, the provisioning "
+                         "credentials still added -- its image's GRUB line, say")
     ap.add_argument("--cpus", type=int, default=1, help="each guest's CPUs")
     ap.add_argument("--ioapic", action="store_true",
                     help="each guest with an IO-APIC (hv's `ioapic`; needs --cpus 2 or more): the distribution's "
                          "own kernel routing its interrupts through it")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
     args = ap.parse_args()
-    if not args.iso and not args.debian:
-        sys.exit("hv-distro-test: --iso <alpine-virt.iso>, --debian <debian-nocloud.raw>, or both")
+    if not args.iso and not args.debian and not args.ubuntu:
+        sys.exit("hv-distro-test: --iso <alpine-virt.iso>, --debian <debian-nocloud.raw>, --ubuntu <cloudimg.raw>")
     if args.ioapic and args.cpus < 2:
         sys.exit("hv-distro-test: --ioapic needs --cpus 2 or more")
     tools = []
     if args.iso:
         tools += ["xorriso", "ssh", "ssh-keygen"]
-    if args.debian:
+    if args.debian or args.ubuntu:
         tools += ["sfdisk", "debugfs"]
+    if args.ubuntu:
+        tools += ["xorriso"]
     for tool in tools:
         if shutil.which(tool) is None:
             sys.exit("hv-distro-test needs %s" % tool)
-    for path in (args.iso, args.debian):
+    for path in (args.iso, args.debian, args.ubuntu):
         if path and not os.path.exists(path):
             sys.exit("no %s" % path)
     if args.iso:
         alpine(args)
     if args.debian:
         debian(args)
+    if args.ubuntu:
+        ubuntu(args)
     print()
     if pt.failures:
         print("FAILED: " + ", ".join(pt.failures))
