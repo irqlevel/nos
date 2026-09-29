@@ -102,6 +102,7 @@ swallowing panic messages whole.
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
+| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' DHCP server -- fuzzed with overflow checks on |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -337,6 +338,91 @@ instruction is fetched by is checked beside it, against page tables built by
 hand: 4 KiB, 2 MiB and 1 GiB pages, five levels, addresses non-canonical and
 unmapped, and a fetch across a page boundary into a page mapped elsewhere.
 It needs clang, `llvm-objdump` and cargo; CI runs it on its x86-64 leg.
+
+### `hv-fuzz.py` -- everything a guest reaches, fuzzed
+
+A guest decides every value the hypervisor's devices are handed -- every
+port it writes and how wide, every MSR, every byte of its virtio rings and
+MSI-X tables, the instruction behind an MMIO fault, when it halts and with
+what masked -- so a panic, an overflow or a loop that never ends anywhere in
+them is one a guest can cause, on the host, under everyone else's guests.
+`scripts/hv-fuzz` is a host program built from the hypervisor's own sources
+as they are -- `hv/src/devices/*`, `lapic`, `acpi`, `insn`, `walk`,
+`linux`, `mmio`, `policy`, `smp` and `run`, hvarch's VMCB layout, and the
+module's DHCP server (`modules/hv/src/dhcp.rs`) --
+over stand-ins for the kernel (a clock the fuzzer moves, the locks, a
+vCPU's wait) and for the CPU, with overflow checks on as a `RUSTUB=1`
+kernel has them. Each target turns random bytes into what a guest does to
+one device: the serial port, the 8259, the PIT, the RTC, ACPI's fixed
+hardware, PCI configuration space, the local APIC through its MSRs and its
+page, the IO-APIC, MSIs, a virtio disk and NIC driven through rings well
+made and not, the page walker over random page tables, the decoder, the
+Linux loader over headers that parse, the ACPI tables for any machine, and
+the DHCP server over the frames a guest's client sends, well formed and not.
+And `platform` does it to the whole machine: a Linux guest's platform built
+and loaded as `hv boot` builds it -- CPUs, disks, NICs, IO-APIC and all --
+and run by the real run loop, `LinuxGuest::run`, on each of its CPUs, each
+on a thread of its own and one at a time. Where the loop would enter the
+guest, the CPU asks a script what the guest does next: a port, an MSR,
+CPUID, a fault on a device's page with the instruction that made it put
+where the guest's paging finds it, a halt, a window opened, an event taken,
+another CPU's turn -- and between them what a driver does over several
+exits: the 8259 initialised, the APIC turned on or moved between its modes,
+an IO-APIC pin routed, MSI-X turned on and its table filled, a virtio queue
+set up and given requests, another CPU started by INIT and start-up IPIs.
+
+A finding is a panic -- an index out of range, an overflow -- or a broken
+invariant: an interrupt injected into a guest that cannot take one, or over
+an event already on its way in; an exception's vector from the APIC; a disk
+request outside the disk, not in sectors, or past the requests in flight; a
+frame longer than a frame handed to the switch; a DHCP answer that is no
+datagram, or whose checksum is not its own; a vCPU that enters its
+guest or waits with one of the kernel's locks held; a guest whose RAM would
+cover its devices' pages. Or a spin -- the run loop reading the clock a
+million times with neither an entry nor a wait between, which on a host is
+a CPU spun for as long as the guest stays so -- or a hang, ten seconds with
+no input done. Each is reported with the seed and the iteration that make
+it again, and the input written to `out/hv-fuzz/findings/`, to replay
+(`--replay TARGET FILE`) with the panic's own backtrace.
+
+With no arguments every target runs 50000 inputs from seed 1, the same
+ones every time: the gate, which CI runs on its x86-64 leg and which takes
+about a minute. A campaign is `--seed N --seconds S` for as many seeds as
+there are CPUs: each seed another set of inputs. Whether the whole-machine
+runs go deep is `HV_FUZZ_STATS=1`, which says how they ended and after how
+many exits -- a run that ends early reaches little, so every step that ends
+one is about one in 4096 -- and what the inputs reach of each file is
+clang's coverage (`RUSTFLAGS="-C instrument-coverage"`, `llvm-cov report`):
+on the first day the gate's inputs reached 94% of the regions of the
+sources it compiles -- 93% of `run.rs`, 96% to 100% of each device, 99% of
+the local APIC.
+
+What it found on its first day: a virtio buffer at the top of the address
+space made the disk's status write compute its address past 2^64 -- a panic
+in a `RUSTUB=1` kernel and a wrap to page 0 in a plain one -- and a buffer's
+address is since reached only through `Seg::at`, which does the sum
+checked; the Linux loader took a kernel's preferred address below 1 MiB,
+over the zero page, the page tables and the GDT it writes there; and a vCPU
+halted with a periodic APIC timer's interrupt held back by its priorities
+spun its host CPU, its sleep computed from a deadline already past. Reading
+the run loop for it turned up a fourth: a guest of more than 4064 MiB had
+RAM over its IO-APIC's and local APIC's pages, which in xAPIC mode or with
+an IO-APIC left it with devices it could not reach and nothing to say so --
+guest RAM now ends below them (`run::MAX_MEM_BYTES`). And a fifth, not live
+but one check from it: the DHCP server's `is_request` read a frame's
+EtherType before anything had checked the frame held one -- an index out
+of range on a guest's runt frame, which only the switch's own length check
+kept away; it now parses the datagram first, which checks.
+
+What it cannot see: the CPU is a stand-in, so nothing of hvarch -- its
+`unsafe`, the VMCB and VMCS, the entry and the exit -- is fuzzed, only what
+the run loop does with the exits it decodes; the interleavings are the
+script's, at entries and waits, which exercises every path between the
+CPUs but finds no race; the devices' backends -- the disk files, the
+switch -- are stand-ins that check what they are handed; and of the guests'
+network only the DHCP server is fuzzed so far -- the switch and NAT take a
+guest's frames apart too, but stand on the net layer's frames and devices,
+which want stand-ins of their own, and are the next targets to write.
 
 ### `hv-test.py` -- the extension turned on and off again, and guests under it
 

@@ -97,6 +97,10 @@ const CMDLINE_MAX: usize = 2048;
 /// Where low RAM ends in the e820 map: 639 KiB, the usual top of it, the
 /// last KiB below 640 being where firmware keeps its tables.
 const LOW_TOP: u64 = 0x9_FC00;
+/// Where RAM starts again above the hole, and so the lowest a kernel may be
+/// loaded: everything this loader writes, and the firmware's tables, are
+/// below it.
+const ONE_MIB: u64 = 0x10_0000;
 
 /* The MP table: its floating pointer in that last KiB below 640 KiB, the
  * second place a kernel looks ("the top 1K of base RAM"), and the table
@@ -282,6 +286,13 @@ pub fn plan(header: &Header, mem_bytes: u64, kernel_len: u64, initrd_len: u64) -
         return Err(Error::BadAddress);
     }
     let kernel_addr = header.pref_address;
+    /* The header's to say, and so the image's: one that asks for an address
+     * below 1 MiB would be loaded over the zero page, the page tables and
+     * the GDT this loader writes there, and die before its first line of
+     * output (hv-fuzz found it). */
+    if kernel_addr < ONE_MIB {
+        return Err(Error::BadAddress);
+    }
     /* Everything the kernel needs while it starts, from where it is loaded:
      * past this is free for the initrd. */
     let after_kernel = kernel_addr
@@ -484,8 +495,6 @@ fn write_mp_table(m: &GuestMemory, cpus: u32, pci: &[Route], ioapic: bool) -> Re
 /// hole at 640 KiB -- in which the firmware's tables, when there are any,
 /// are reserved -- and the rest of RAM from 1 MiB up.
 fn write_e820(m: &GuestMemory, mem_bytes: u64, firmware: Option<Firmware>) -> Result<()> {
-    const ONE_MIB: u64 = 0x10_0000;
-
     let mut entries = [(0u64, 0u64, 0u32); 3];
     let mut n = 0;
     entries[n] = (0, LOW_TOP, E820_RAM);

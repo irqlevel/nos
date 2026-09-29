@@ -1,0 +1,25 @@
+# The hypervisor's guest-facing code, fuzzed on the host: every device a
+# guest reaches (hv/src/devices/*), its local APIC and IO-APIC, the MMIO
+# decoder, page walker and emulator, the Linux loader and ACPI tables, and
+# the run loop that dispatches a guest's exits (hv/src/run.rs), and the
+# guests' DHCP server -- compiled from their own sources over stand-ins for
+# the kernel and the CPU (scripts/hv-fuzz.py builds and runs it). Nothing
+# but netwire, a path of its own, so it builds offline.
+[package]
+name = "hv-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# What is on the wire, and nothing else: the guests' DHCP server is built on
+# it. No dependencies of its own, so this still builds offline.
+netwire = { path = "../../src/rust/netwire" }
+
+# What a RUSTUB=1 kernel has on: an overflow is a panic, not a wrap -- and a
+# guest that can cause one can bring down the host that runs it.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+
+[workspace]

@@ -469,7 +469,8 @@ impl Blk {
     /// the chain back with what was written.
     fn finish(&mut self, mem: &GuestMemory, segs: &[Seg], head: u16, status: u8, written: u32) -> core::result::Result<(), Broken> {
         let last = segs.iter().rev().find(|s| s.write && s.len != 0).ok_or(Broken::Memory)?;
-        mem.write(last.addr + u64::from(last.len) - 1, &[status]).map_err(|_| Broken::Memory)?;
+        let at = last.at(u64::from(last.len) - 1).ok_or(Broken::Memory)?;
+        mem.write(at, &[status]).map_err(|_| Broken::Memory)?;
         let q = self.transport.queue(0).ok_or(Broken::Index)?;
         q.push(mem, head, written.saturating_add(1))
     }
@@ -561,7 +562,8 @@ fn copy_out(mem: &GuestMemory, segs: &[Seg], skip: u64, buf: &mut [u8]) -> bool 
             continue;
         }
         let n = ((len - skip) as usize).min(buf.len() - done);
-        if mem.read(s.addr + skip, &mut buf[done..done + n]).is_err() {
+        let Some(at) = s.at(skip) else { return false };
+        if mem.read(at, &mut buf[done..done + n]).is_err() {
             return false;
         }
         done += n;
@@ -584,7 +586,8 @@ fn copy_in(mem: &GuestMemory, segs: &[Seg], skip: u64, data: &[u8]) -> bool {
             continue;
         }
         let n = ((len - skip) as usize).min(data.len() - done);
-        if mem.write(s.addr + skip, &data[done..done + n]).is_err() {
+        let Some(at) = s.at(skip) else { return false };
+        if mem.write(at, &data[done..done + n]).is_err() {
             return false;
         }
         done += n;

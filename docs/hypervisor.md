@@ -2127,7 +2127,12 @@ one page: the vector table at its start, the pending bits after it. That
 page is guest memory -- a region of its own, at 0xFE000000 and a page a PCI
 slot, in the MMIO window and not in the e820 map -- so a guest writes its
 table with plain `mov`s and makes no exit doing it, and no instruction has
-to be decoded. The device reads an entry when it has an interrupt to send:
+to be decoded. A guest's RAM ends below these pages, at 4064 MiB at most
+(`run::MAX_MEM_BYTES`, what `mem=` is bounded by): more would run over them,
+and over the IO-APIC's and the local APIC's, and the guest would read and
+write its devices' registers as memory, none of them hearing of it -- an
+APIC in xAPIC mode that is not there, and nothing to say so. The device
+reads an entry when it has an interrupt to send:
 the message's address and data (`lapic::msi`), a fixed or lowest-priority
 vector to an x2APIC ID or, in cluster mode, to the first cluster's CPUs,
 the eight an 8-bit field can name -- which is where Linux puts them without
