@@ -274,13 +274,8 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         stream(&guest, path, 0, layout.initrd_addr, layout.initrd_len)?;
     }
 
-    let tsc_khz = kcore::time::cycle_counter_hz().map(|hz| hz / 1000).filter(|&khz| khz != 0);
-    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1, tsc_khz)?;
-    let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
-    guest
-        .load(bsp, &header, &first, layout, cmdline.as_bytes())
-        .map_err(|e| alloc::format!("laying out the guest: {}", e))?;
-
+    /* Its devices before its furniture: the ACPI tables `load` lays out
+     * describe the bus as it is then. */
     if let Some(nic) = &spec.nic {
         guest.add_nic(Box::new(nic.switch.backend(nic.port)), crate::net::port_mac(nic.port))
             .map_err(|e| alloc::format!("the NIC: {}", e))?;
@@ -292,6 +287,13 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         let _ = write!(id, "nos-vd{}", letter);
         guest.add_disk(Box::new(disk), &id).map_err(|e| alloc::format!("{}: {}", path, e))?;
     }
+
+    let tsc_khz = kcore::time::cycle_counter_hz().map(|hz| hz / 1000).filter(|&khz| khz != 0);
+    let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1, tsc_khz)?;
+    let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
+    guest
+        .load(bsp, &header, &first, layout, cmdline.as_bytes())
+        .map_err(|e| alloc::format!("laying out the guest: {}", e))?;
     Ok(Built { guest, cpus })
 }
 
@@ -499,6 +501,7 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
         Stop::Reset { port, value, rip } => write!(out, "the guest asked for a reset, {:#04x} to port {:#x} ({}), at {:#x}",
             value, port, hv::run::reset_source(port), rip),
         Stop::Init { rip } => write!(out, "the guest asked for a reset, an INIT to its boot CPU, at {:#x}", rip),
+        Stop::PowerOff { rip } => write!(out, "the guest powered itself off, S5 by its ACPI PM1 control register, at {:#x}", rip),
         Stop::Xapic { rip } => write!(out,
             "the guest took its local APIC out of x2APIC mode into xAPIC, which is not emulated, at {:#x} -- boot it with noapic, and without nox2apic",
             rip),
@@ -583,6 +586,16 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
                 never);
         }
     }
+    let acpi = guest.acpi_stats();
+    if acpi.used || acpi.presses != 0 {
+        let _ = write!(out, "  acpi       {}; {} SCIs, the power button pressed {} times",
+            if acpi.used { "taken by the guest's OS" } else { "not taken by the guest's OS" },
+            acpi.scis, acpi.presses);
+        if let Some(t) = acpi.other_sleep {
+            let _ = write!(out, "; asked for sleep type {}, which is not offered", t);
+        }
+        let _ = writeln!(out);
+    }
     if total.nmi != 0 || total.nmi_lost != 0 {
         let _ = writeln!(out, "  nmi        {} NMIs taken from the guest's other CPUs, {} dropped by a CPU waiting to be started",
             total.nmi, total.nmi_lost);
@@ -606,7 +619,9 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         }
         let _ = writeln!(out);
     }
-    if !matches!(stop, Stop::Halted { .. } | Stop::Budget | Stop::Requested | Stop::Reset { .. } | Stop::Init { .. }) {
+    if !matches!(stop, Stop::Halted { .. } | Stop::Budget | Stop::Requested | Stop::Reset { .. } | Stop::Init { .. }
+        | Stop::PowerOff { .. })
+    {
         if counts.len() > 1 {
             let _ = writeln!(out, "  stopped by cpu {}:", stopped.cpu);
         }

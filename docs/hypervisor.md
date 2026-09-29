@@ -463,7 +463,9 @@ What the VMX backend does not do yet, and says so rather than pretends:
                                 boot=N, once it has restarted N times -- or it
                                 stops
     hv restart <id>             boot it again from its files, running or stopped
-    hv stop <id|all>            stop it, say how it ended, take it off the list
+    hv stop <id|all> [secs=N]   press its power button and give it secs (30)
+                                to turn itself off, then stop it; say how it
+                                ended, take it off the list
     hv forward [add <port> <vm> <guest-port> | del <port>]
                                 a port of nos's relayed to a guest's
     hv help                     all of these, a line each
@@ -1027,6 +1029,11 @@ here:
   guest's console to the kernel log a line at a time and stops with a reason
   and a register dump.
 
+And what a PC's firmware leaves a kernel, which it reads instead of asking
+a BIOS: the e820 map, an MP table for a guest of more than one CPU ([More
+than one CPU](#more-than-one-cpu)), and the ACPI tables, with the fixed
+hardware they describe ([ACPI](#acpi)).
+
 What this reaches today, on a tinyconfig Linux 6.18 under AMD-V (QEMU's TCG,
 where the guest is twice emulated and slow), is a full boot to an interactive
 shell:
@@ -1352,7 +1359,7 @@ hv: vm 0 printed "nos42nos", 58 ms in
 $ hv list
 vm 0  running  cpu 3  256 MiB  1 s  exits 18237  irq 284  hlt 92  /bzImage
 $ hv stop 0
-hv: vm 0 stopped -- on request
+hv: vm 0 stopped -- on request -- nothing in it listens to its power button
   stopped    on request, after 1925 ms
   exits      ...
 ```
@@ -1396,12 +1403,16 @@ it nowhere -- and answers with that, from a buffer of its own: a guest that
 asks and never reads the answer costs the host no more than one that asks
 once, where the answer used to be appended to a queue without bound.
 
-**Stopping is a flag and a join.** The loop checks the flag before every
-entry, and a halted guest's task sleeps at most 10 ms at a time, so `hv stop`
-returns within a tick or so of asking: it takes the VM off the list first and
-joins its task after, with no lock held while it waits. A guest that stops by
-itself -- a triple fault, a HLT with interrupts off, a reset -- stays on the
-list as `stopped`, with its reason, until `hv stop` takes it off.
+**Stopping is a question, then a flag and a join.** `hv stop` takes the VM
+off the list first and presses its power button, and a guest that shuts
+down when it is pressed is given `secs` to ([ACPI](#acpi)); the one above,
+a kernel without ACPI, never hears the button, and is stopped at once. Then
+the flag: the loop checks it before every entry, and a halted guest's task
+sleeps at most 10 ms at a time, so the stop comes within a tick or so, and
+the command joins the task after, with no lock held while it waits. A guest
+that stops by itself -- a triple fault, a HLT with interrupts off, a reset, a
+power-off -- stays on the list as `stopped`, with its reason, until `hv
+stop` takes it off.
 
 **A VM's task lives as long as the VM.** When its guest stops, the vCPU task
 gives the guest's memory back and parks on the VM's event, for `hv restart` --
@@ -1432,9 +1443,10 @@ and returns. Keys typed at an attached guest are not held back for a prompt
 the way a script's line is: the person decides when to type.
 
 **A guest that reboots stops, and says so.** Linux reboots -- a `reboot`, a
-panic with `panic=N` -- by pulsing the 8042's reset line (`0xFE` to port
-`0x64`), then by the chipset's reset control (bit 2 of port `0xCF9`, where
-it knows of one), then by a triple fault. Nothing here emulates an 8042 or a
+panic with `panic=N` -- by the reset register its ACPI tables name, when it
+has them (the chipset's reset control, `0x06` to port `0xCF9`); then by
+pulsing the 8042's reset line (`0xFE` to port `0x64`); then by the chipset's
+reset control where it knows of one; then by a triple fault. Nothing here emulates an 8042 or a
 chipset, and on the AX41 the first guest that rebooted spun at 100% of its
 CPU for as long as anyone let it -- 1.3 million reads of the 8042's status in
 48 seconds, waiting for a controller that is not there. Both writes now stop
@@ -1461,8 +1473,9 @@ module gave that CPU, so a guest racing an `hv off` finds it off and stops,
 `not entered` -- on AMD-V; on Intel the CPU itself refuses to go off while a
 guest's VMCS is current on it ([above](#what-the-extension-costs-while-it-is-on)),
 so an `hv boot` or `hv run` the courtesy check does not see keeps its CPU
-too. `rmmod hv` stops every guest before it turns the extension off
--- the guests first, an `hv boot` under way among them, so that an `hv exec`
+too. `rmmod hv` stops every guest before it turns the extension off -- where
+it is, without pressing its power button; `hv stop all` before it shuts them
+down -- the guests first, an `hv boot` under way among them, so that an `hv exec`
 or `hv wait` waiting on one returns; then the command, whose unregistration
 waits out every call still running (an `hv start` still reading its files
 finds the module going when it comes to add its guest, and stops it itself);
@@ -1473,6 +1486,148 @@ by side and one stopped mid-boot, a line typed at the other before its shell
 is up and another at its prompt, `send`, `wait`, `console`, the refused
 `hv off`, and an `rmmod` that stops the guest itself and leaves nothing on for
 the next load.
+
+## ACPI
+
+A PC's firmware leaves its OS tables that say what the machine is, and a
+kernel with ACPI reads them before anything else: where its CPUs are, how to
+turn the machine off and reset it, where its PCI bus is and which interrupt
+each device has. Every Linux guest is given them (`hv::acpi`), and the fixed
+hardware they describe (`hv::devices::pm`). A kernel without ACPI, or told
+`acpi=off`, finds nothing of it in its way and boots as it always did.
+
+```
+[    0.039122] ACPI: RSDP 0x00000000000E0000 000024 (v02 NOS   )
+[    0.042362] ACPI: XSDT 0x00000000000E0240 00002C (v01 NOS    HV       00000001 NOS  00000001)
+[    0.047220] ACPI: FACP 0x00000000000E0120 000114 (v06 NOS    HV       00000001 NOS  00000001)
+[    0.051699] ACPI: DSDT 0x00000000000E0080 00009B (v02 NOS    HV       00000001 NOS  00000001)
+[    0.056005] ACPI: FACS 0x00000000000E0040 000040
+[    0.102725] ACPI: PM-Timer IO Port: 0x608
+...
+[    0.545105] ACPI: Interpreter enabled
+[    0.545535] ACPI: PM: (supports S0 S5)
+[    0.549186] ACPI: Using PIC for interrupt routing
+[    0.565105] ACPI: PCI Root Bridge [PCI0] (domain 0000 [bus 00-ff])
+[    0.577561] acpi PNP0A03:00: fail to add MMCONFIG information, can't access extended configuration space under this bridge
+[    0.589327] pci_bus 0000:00: root bus resource [io  0x0000-0x0cf7 window]
+[    0.593165] pci_bus 0000:00: root bus resource [io  0x0d00-0xffff window]
+[    0.597229] pci_bus 0000:00: root bus resource [bus 00-ff]
+[    0.631608] PCI: Using ACPI for IRQ routing
+[    0.657669] clocksource: acpi_pm: mask: 0xffffff max_cycles: 0xffffff, max_idle_ns: 2085701024 ns
+[    0.769271] input: Power Button as /devices/LNXSYSTM:00/LNXPWRBN:00/input/input0
+[    0.773949] ACPI: button: Power Button [PWRF]
+```
+
+(The gate's guest of one CPU under TCG: a Linux 6.18 with ACPI, its power
+button and evdev.)
+
+- **The tables** go in the BIOS area from 0xE0000, which the e820 map
+  reserves: the RSDP first, where a kernel scanning for it finds it, and the
+  zero page's `acpi_rsdp_addr` pointing at it for one that looks there. An
+  XSDT names the FADT and, for a guest whose CPUs have local APICs, a MADT;
+  the FADT names the FACS and the DSDT. They are ACPI 6.3's, laid out with
+  their checksums into a buffer and copied into guest memory as the MP
+  table is -- nothing of the guest's is kept.
+- **The fixed hardware is all on ports** (0x600-0x60B, as an ICH lays it
+  out): the PM1 event block's status and enable registers, the PM1 control
+  register, and the PM timer -- 24 bits at 3.579545 MHz, counting the host's
+  time from when the guest was made. The host keeps its time by its TSC --
+  under KVM by kvmclock, the TSC scaled -- and the guest reads that TSC and
+  is told its rate, so the two agree; Linux, which checks its TSC against
+  the PM timer every half second once it has one, finds them agreeing. The SCI is the 8259's IRQ 9, and a level: requested while an
+  enabled event is set, requested again if one still is when the guest ends
+  the interrupt, withdrawn when none is. There is no SMI command port -- the
+  machine is in ACPI mode from the start, SCI_EN reading set -- and no GPE
+  block. The edge/level control registers beside the 8259s (0x4D0) keep what
+  is written to them, and start with IRQ 9 level-triggered: what a kernel
+  sets them to, and, finding them so, need not warn that it did. The reset
+  register is the chipset's 0xCF9, trapped already: a kernel with ACPI
+  reboots through it first, `the guest asked for a reset, 0x06 to port
+  0xcf9`.
+- **The MADT** lists a local APIC for each CPU and NMI on every LINT1, and
+  no IO-APIC. The MP table is still there: a kernel with ACPI finds its
+  CPUs in the MADT, one without in the MP table, and both are told the same.
+- **The DSDT** is the one table in AML, and small: `\_S5`, and the PCI host
+  bridge. The bridge has to be there. A Linux with ACPI finds PCI through
+  the namespace alone and never probes the bus -- `pci_legacy_init` is not
+  even called -- so without one the guest would have no disks and no NICs.
+  Its `_CRS` gives bus 0-255, the configuration ports, the I/O either side
+  of them and the window its functions' MSI-X pages are in (a BAR outside
+  every window is one an OS moves, and these are fixed); its `_PRT` routes
+  each device's INTA to the 8259 IRQ its interrupt line register names. As
+  ACPICA's `iasl` disassembles it, for a guest of several CPUs with a NIC
+  and two disks:
+
+```
+Name (_S5, Package (0x04) { 0x05, 0x05, Zero, Zero })
+Scope (\_SB)
+{
+    Device (PCI0)
+    {
+        Name (_HID, EisaId ("PNP0A03") /* PCI Bus */)
+        Name (_UID, Zero)
+        Name (_CRS, ResourceTemplate ()
+        {
+            WordBusNumber (ResourceProducer, MinFixed, MaxFixed, PosDecode,
+                0x0000, 0x0000, 0x00FF, 0x0000, 0x0100,,,)
+            IO (Decode16, 0x0CF8, 0x0CF8, 0x01, 0x08, )
+            WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange,
+                0x0000, 0x0000, 0x0CF7, 0x0000, 0x0CF8,,, , TypeStatic, DenseTranslation)
+            WordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode, EntireRange,
+                0x0000, 0x0D00, 0xFFFF, 0x0000, 0xF300,,, , TypeStatic, DenseTranslation)
+            DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed, NonCacheable, ReadWrite,
+                0x00000000, 0xFE000000, 0xFE007FFF, 0x00000000, 0x00008000,,, , AddressRangeMemory, TypeStatic)
+        })
+        Name (_PRT, Package (0x03)
+        {
+            Package (0x04) { 0x0001FFFF, Zero, Zero, 0x0A },
+            Package (0x04) { 0x0002FFFF, Zero, Zero, 0x0B },
+            Package (0x04) { 0x0003FFFF, Zero, Zero, 0x0B }
+        })
+    }
+}
+```
+
+What is left out is what would need MMIO -- the IO-APIC, the HPET, PCIe's
+ECAM, whose absence Linux names in the line above -- and what a guest does
+without: processor objects (there are no C- or P-states to describe), the
+ISA devices (a kernel finds a PC's serial port, RTC and timer where they
+always are), GPEs, and any sleep state but S5. A guest of one CPU gets no
+MADT: it has no APIC.
+
+**`hv stop` asks first.** It presses the guest's power button -- sets the
+fixed button's status, and raises the SCI if the guest's OS has enabled the
+event -- and gives the guest `secs` (30 unless told) to turn itself off; one
+that does ends `the guest powered itself off, S5 by its ACPI PM1 control
+register`. A kernel hears the button as a key, KEY_POWER on its input
+device, and what answers it is userspace's: systemd-logind shuts a
+distribution down, BusyBox's `acpid` runs `/etc/acpi/PWRF/00000080`. A guest
+that hears it and does nothing is stopped when its time is up, `its power
+button went unanswered for 30 s`. One whose OS never enabled the event -- no
+ACPI, `acpi=off`, not booted that far -- cannot hear it, and the first CPU's
+loop, which takes the press from the command, says so: it is stopped at
+once, `nothing in it listens to its power button`. `secs=0` stops a guest
+without asking, and `hv stop all` presses every button at once and waits for
+the guests together. `rmmod` does not ask: an unload is no place to wait on
+guests -- a module's exit has five seconds before `rmmod` goes on without
+it -- so `hv stop all` first is the way to shut guests down before one.
+
+**A power-off is a write to a port**, as a reset is: SLP_EN with S5's sleep
+type in PM1a's control register. ACPICA writes the type first and the enable
+bit second, and the second stops the VM where the guest wrote it --
+`Stop::PowerOff`, which is not a reset: a guest started with `restart` that
+turns itself off stays off. A sleep type the DSDT does not offer is left
+alone, and the report says the guest asked for it.
+
+The gate is `scripts/hv-linux-test.py --acpi`, with a kernel built with
+ACPI, its button and evdev: the boot's lines above and nothing of a firmware
+bug, a TSC the watchdog marked unstable or a PM timer that failed its checks;
+reboots through 0xCF9; the SCI on IRQ 9 and the PM timer a clocksource;
+`hv stop` answered by `acpid` with a power-off; and a guest that hears the
+button and does nothing, stopped when its time is up. The tables themselves
+were checked with `iasl` as they were written. `scripts/hv-distro-test.py`
+boots Alpine and Debian on their ACPI, and has `hv stop` shut Debian down --
+or, with `--acpi-off`, boots them as before.
 
 ## A distribution
 
@@ -1496,19 +1651,24 @@ $ hv exec 0 date
 Wed Sep 23 21:32:50 UTC 2026
 ```
 
-(Under TCG, twice emulated: 36 s to the login prompt.) Its initramfs loads
-virtio_blk, finds the ISO on `vda`, mounts it and installs the base system
-from the ISO's packages into a tmpfs, and OpenRC brings it up to a getty on
-ttyS0. `nolapic acpi=off` is the PC it is given -- no local APIC and no ACPI
-tables -- so it takes its interrupts from the 8259s, finds its PCI devices
-through configuration mechanism 1, and takes each virtio device's interrupt
-line from its configuration space. On the switch (`net`) its initramfs
-configures eth0 from the `ip=` the VM is given, and writes the `dns0` there
-to `resolv.conf`; through NAT it reaches what nos reaches -- `apk update`
-from Alpine's own mirror, the name looked up through nos's DNS server --
-and `apk add openssh-server` installs from the ISO, its own sshd reached
-from outside nos through `hv forward`. `reboot` resets it through the
-keyboard controller, and with `restart` it boots again.
+(Under TCG, twice emulated: 36 s to the login prompt -- recorded before the
+machine had ACPI, when a distribution was booted `acpi=off`.) Its initramfs
+loads virtio_blk, finds the ISO on `vda`, mounts it and installs the base
+system from the ISO's packages into a tmpfs, and OpenRC brings it up to a
+getty on ttyS0. `nolapic` makes it a PC of one CPU with no local APIC,
+taking its interrupts from the 8259s. With `acpi=off`, as above, it finds
+its PCI devices through configuration mechanism 1 and each virtio device's
+interrupt line in its configuration space; without, as the gate boots it
+now, it takes both from its ACPI tables -- the DSDT's host bridge, and its
+`_PRT` ([ACPI](#acpi)) -- and is at its login prompt 14 s after the VM
+starts, nested under KVM on the i5-13500. On the switch (`net`) its
+initramfs configures eth0 from the `ip=` the VM is given, and writes the
+`dns0` there to `resolv.conf`; through NAT it reaches what nos reaches --
+`apk update` from Alpine's own mirror, the name looked up through nos's DNS
+server -- and `apk add openssh-server` installs from the ISO, its own sshd
+reached from outside nos through `hv forward`. `reboot` resets it -- through
+the reset register its FADT names, or with `acpi=off` the keyboard
+controller -- and with `restart` it boots again.
 
 What it took that the purpose-built kernel did not:
 
@@ -1587,6 +1747,23 @@ plain `hv wait`: the boot going down still has the last one on its console,
 and systemd's `reboot` gives the shell its prompt back before the system
 goes. `hv wait 0 boot=1 login:` waits for the VM's first restart, and then
 for the text in the boot after it.
+
+(The transcript above is from before the machine had ACPI, booted `acpi=off`
+under TCG.) On its ACPI, as the gate boots it now, systemd-logind hears its
+power button, and `hv stop` shuts it down -- its services stopped, its root
+unmounted -- and it turns itself off, nested under KVM on the i5-13500:
+
+```
+$ hv stop 0 secs=300
+hv: vm 0 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff8f1d5ae3
+  stopped    the guest powered itself off, S5 by its ACPI PM1 control register, at 0xffffffff8f1d5ae3, after 7624 ms
+  ...
+  acpi       taken by the guest's OS; 2 SCIs, the power button pressed 1 times
+  vda        3072 MiB: 2499 reads (75589 KiB), 215 writes (3805 KiB), 36 flushes, 0 errors
+```
+
+-- 7.6 s for that whole boot, from its start through the login, the gate's
+commands and the shutdown.
 
 And one thing in the kernel. Rebuilding the rebooted guest under TCG held
 the page allocator's lock for more than ten seconds, with every other CPU
@@ -1688,8 +1865,9 @@ a processor entry for each CPU, the first marked the boot CPU; an ISA bus;
 an IO-APIC entry marked unusable; and the interrupt assignments -- each ISA
 IRQ but the cascade to its own pin, the 8259's ExtINT to LINT0 of the first
 CPU, and NMI to LINT1 of every CPU. Without the assignments Linux complains
-of a BIOS bug and makes up its own. ACPI stays off: the MP table is the
-least a kernel finds its CPUs by.
+of a BIOS bug and makes up its own. The MP table is the least a kernel finds
+its CPUs by; one with ACPI finds them in the MADT ([ACPI](#acpi)), which
+says the same, and takes the MP table only for what the MADT leaves out.
 
 **No IO-APIC.** The 8259 pair stays wired to the first CPU's LINT0 in
 virtual-wire mode, so every device interrupt -- the PIT's tick, the serial
@@ -1932,8 +2110,9 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
   at worst. The owed periods keep the count right on average, and PAUSE
   exits keep a spinning CPU prompt; a CPU computing with no exit at all
   gets its ticks in bursts of up to 10 ms.
-- **No xAPIC, no TSC-deadline timer, no ACPI.** A kernel built without
-  `X86_MPPARSE` finds one CPU; one told `nox2apic` is stopped at the page.
+- **No xAPIC, no TSC-deadline timer.** A kernel built with neither
+  `X86_MPPARSE` nor ACPI finds one CPU; one told `nox2apic` is stopped at
+  the page.
 
 ### Gates
 
@@ -2226,9 +2405,12 @@ distribution boots as it ships ([A distribution](#a-distribution)), and a
 guest has as many CPUs as it is given, each with a local APIC ([More than
 one CPU](#more-than-one-cpu)) -- under AMD-V and VT-x both.
 A guest of more than one CPU takes its devices' interrupts by MSI-X
-([Device interrupts, by MSI-X](#device-interrupts-by-msi-x)). Beyond stage
-3: device work off the first CPU's task, modern virtio, and the control
-plane's HTTP API (stage 4).
+([Device interrupts, by MSI-X](#device-interrupts-by-msi-x)), and every
+guest has ACPI's tables and fixed hardware -- its power button what `hv
+stop` presses ([ACPI](#acpi)). Next is MMIO: an instruction decoder, and
+with it the IO-APIC, the HPET and PCIe's ECAM the tables leave out today.
+Beyond stage 3: device work off the first CPU's task, modern virtio, and the
+control plane's HTTP API (stage 4).
 
 Two constraints from stage 5 (live update) hold from the first line of it:
 all VM state is serializable plain data -- the vCPU register set, every

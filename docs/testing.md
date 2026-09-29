@@ -101,8 +101,8 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs |
-| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--internet]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
+| `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--internet]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
 ### `wx-test.sh` -- W^X
@@ -523,6 +523,30 @@ itself with `alarm()`, which a `tinyconfig` leaves out, and without it the
 guest's `ping` waits for ever after its first answer -- which reads as a
 network that stopped.
 
+`--acpi` says the guest kernel has ACPI, with its power button (`ACPI_BUTTON`)
+and the input device BusyBox's `acpid` reads it from (`INPUT_EVDEV`), and
+checks that it takes the tables the machine gives it ([ACPI](hypervisor.md#acpi)):
+its boot must find the RSDP at 0xE0000, the FADT, DSDT and FACS, the PM timer
+at 0x608, S5, PIC mode, the PCI host bridge and PCI's interrupts routed by its
+`_PRT`, the power button, and the PM timer as a clocksource -- and must say
+nothing of an ACPI error or warning, a firmware bug, the ELCR set behind its
+back, a PM timer that failed its checks, a TSC the clocksource watchdog
+marked unstable, or a PCI interrupt without a GSI. Its reboots must go
+through the FADT's reset register (`0x06 to port 0xcf9`, where a kernel
+without ACPI pulses the 8042's line). In the VM phase one more guest runs
+BusyBox's `acpid`, with a handler that powers off: its SCI must be IRQ 9 on
+the 8259, the PM timer one of its clocksources, and `hv stop` must end it as
+`the guest powered itself off`, the report counting the press; and one more
+without `acpid`, which hears the button and does nothing, must be stopped
+when `secs=5` is up, `its power button went unanswered for 5 s`. Without
+`--acpi`, a guest's `hv stop` must say nothing in it listens to its power
+button. In both, after the reload, two guests at their shells are stopped
+together by `hv stop all secs=3`, which must press both buttons at once and
+say of each what became of its press. `--acpi` goes with `--cpus`, `--disk`, `--net` and `--attach`, whose
+guests then find their devices through the DSDT's host bridge. The kernel
+the gate was brought up with is the 6.18 tinyconfig above plus `ACPI`,
+`ACPI_BUTTON`, `X86_PM_TIMER`, `INPUT` and `INPUT_EVDEV`.
+
 ### `hv-distro-test.py` -- a distribution, as it ships
 
 hv-linux-test's guest is a kernel built for the purpose. This one is a
@@ -565,7 +589,13 @@ machine through NAT with curl (with `--internet`, resolves Debian's mirror
 and fetches from it); and that nos reaches it, and
 that a file written to its root is still there after `reboot` (waited for
 with `hv wait ... boot=1`, since systemd's `reboot` hands the shell its
-prompt back first).
+prompt back first); and that `hv stop` presses its power button and
+systemd-logind has it shut down and turn itself off.
+
+Both boot on the machine's ACPI tables, as their kernels are built to;
+`--acpi-off` boots them with `acpi=off` instead, the machine as it was
+before it had them -- the MP table, PCI by configuration mechanism 1, no
+power button -- and then Debian's `hv stop` must find nothing listening.
 
 Both modes also time the guest's clock against nos's across 40 s of idle --
 its `/proc/uptime` against nos's `uptime` -- and want them within 10%: an

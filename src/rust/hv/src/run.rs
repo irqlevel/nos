@@ -25,6 +25,12 @@
 //! disks. The others take their interrupts from their local APICs: their
 //! timers, and each other's IPIs.
 //!
+//! The platform has ACPI's fixed hardware too (`crate::devices::pm`), and
+//! the tables that describe it all (`crate::acpi`): a kernel with ACPI turns
+//! the machine off through it -- `Stop::PowerOff` -- and hears its power
+//! button, which whoever runs the guest presses (`Host::power_button`) to
+//! ask it to shut down; the SCI it raises is the 8259's IRQ 9.
+//!
 //! A CPU that halts is a vCPU with nothing to do until an interrupt it can
 //! take is pending, and the loop treats it as one: the HLT is stepped past,
 //! as a CPU an interrupt wakes resumes after it, and the vCPU is not entered
@@ -47,11 +53,13 @@ use hvarch::{Error, Result};
 use kcore::sync::Mutex;
 use kcore::time;
 
+use crate::acpi;
 use crate::devices::blk::{self, Blk};
 use crate::devices::net::{self, Net};
 use crate::devices::pci::{self, Function, PciBus};
+use crate::devices::pm;
 use crate::devices::virtio::Raise;
-use crate::devices::{Pic, Pit, Rtc, Uart};
+use crate::devices::{Pic, Pit, Pm, Rtc, Uart};
 use crate::lapic::{self, Delivery, Ipi, Lapic, Wrote};
 use crate::linux::{self, Header, Layout};
 use crate::machine::Machine;
@@ -99,15 +107,20 @@ enum PciDev {
  * command port takes 0xF0-0xFF as "pulse the output lines whose bits are
  * clear", and line 0 is the CPU's reset: Linux writes 0xFE. The chipset's
  * reset control register at 0xCF9 resets when bit 2 is written set -- Linux
- * writes it with SYS_RST first and RST_CPU second. (The third way is a
+ * writes it with SYS_RST first and RST_CPU second, and it is the FADT's
+ * reset register, which a kernel with ACPI tries first. (The third way is a
  * triple fault, `Stop::Shutdown`.) Nothing here emulates an 8042 or a
  * chipset: a read of either port floats to all ones, as on a PC without
  * one, and only the reset is recognised. */
 const I8042_COMMAND: u16 = 0x64;
 const I8042_PULSE: u8 = 0xF0;
 const I8042_RESET_LINE: u8 = 1 << 0;
-const RESET_CONTROL: u16 = 0xCF9;
+pub(crate) const RESET_CONTROL: u16 = 0xCF9;
+const RESET_CONTROL_SYS_RST: u8 = 1 << 1;
 const RESET_CONTROL_RST_CPU: u8 = 1 << 2;
+/// What the FADT tells an OS to write to the reset control register: a full
+/// reset, the system's and the CPU's.
+pub(crate) const RESET_VALUE: u8 = RESET_CONTROL_SYS_RST | RESET_CONTROL_RST_CPU;
 
 /// What a `Stop::Reset`'s port is, for a person: which of the two ways it was.
 pub fn reset_source(port: u16) -> &'static str {
@@ -159,6 +172,9 @@ pub enum Stop {
     /// boot CPU starts again at the reset vector, in firmware this machine
     /// does not have.
     Init { rip: u64 },
+    /// It turned itself off: S5's sleep type written to its PM1 control
+    /// register with the sleep enable bit -- ACPI's soft off, a `poweroff`.
+    PowerOff { rip: u64 },
     /// It took its local APIC out of x2APIC mode into xAPIC mode, a page of
     /// MMIO this hypervisor does not emulate -- a kernel told to use an
     /// IO-APIC this machine has none of, or not to use x2APIC (`nox2apic`).
@@ -319,6 +335,17 @@ pub trait Host: Sync {
     /// `PROGRESS_EVERY` exits, and once more at the end. For a VM that runs
     /// until it is stopped, how anyone else sees it doing.
     fn progress(&self, _cpu: u32, _counts: &Counts) {}
+    /// Whether the guest's power button has been pressed since this last
+    /// said so: asked on every round of the first CPU's loop, with the
+    /// guest's devices locked, and yes once a press. Whoever presses it
+    /// rings the first CPU's doorbell, so that a halted guest hears it now.
+    fn power_button(&self) -> bool {
+        false
+    }
+    /// What became of the press: whether the guest's OS has the power
+    /// button's event enabled, and so is told of it by an SCI -- or has no
+    /// ACPI, or has not got that far, and never hears of it.
+    fn power_button_heard(&self, _heard: bool) {}
 }
 
 /// What a guest CPU is doing, as its loop sees it.
@@ -426,6 +453,7 @@ struct Platform {
     pit: Pit,
     rtc: Rtc,
     pic: Pic,
+    pm: Pm,
     pci: PciBus,
     /// What is on the bus, by slot: slot `i + 1` is `pci_devs[i]`. Disks and
     /// NICs in the order they were added, `vda` and `eth0` first.
@@ -470,6 +498,22 @@ pub struct LinuxGuest {
     /// that CPU sets its bit in `asleep`, whose read-modify-write orders it
     /// for the CPU that sets the last.
     last_halt: AtomicU64,
+    /// Its furniture is laid out (`load`): the ACPI tables describe the
+    /// devices it had then, and it takes no more.
+    loaded: bool,
+}
+
+/// What a guest's OS did with its ACPI, for a report.
+#[derive(Clone, Copy, Debug)]
+pub struct AcpiStats {
+    /// It wrote its event enables -- which an OS taking ACPI starts by, all
+    /// of them off: its kernel took the ACPI it was given.
+    pub used: bool,
+    pub scis: u64,
+    pub presses: u32,
+    /// A sleep type other than S5's it asked for, which nothing was done
+    /// about.
+    pub other_sleep: Option<u8>,
 }
 
 impl LinuxGuest {
@@ -534,6 +578,7 @@ impl LinuxGuest {
             pit: Pit::new(),
             rtc: Rtc::new(),
             pic: Pic::new(),
+            pm: Pm::new(time::boot_time_ns()),
             pci: PciBus::new()?,
             pci_devs,
             disks: 0,
@@ -554,6 +599,7 @@ impl LinuxGuest {
             stopped: Mutex::new(None).ok_or(Error::NoMemory)?,
             started: AtomicU64::new(0),
             last_halt: AtomicU64::new(0),
+            loaded: false,
         };
         Ok((guest, vcpus))
     }
@@ -580,6 +626,10 @@ impl LinuxGuest {
     /// Give it another disk, over `backend`: `vda`, `vdb`, ... in the order
     /// they are added, each a virtio block device on the PCI bus.
     pub fn add_disk(&mut self, backend: Box<dyn blk::Backend>, id: &str) -> Result<()> {
+        if self.loaded {
+            /* The tables have the devices of `load`'s time. */
+            return Err(Error::BadAddress);
+        }
         let apic = self.has_apic();
         let mut p = self.platform.lock();
         if p.disks >= MAX_DISKS {
@@ -603,6 +653,9 @@ impl LinuxGuest {
     /// Give it a NIC with `mac`, its frames carried by `backend`: `eth0`,
     /// `eth1`, a virtio network device on the PCI bus.
     pub fn add_nic(&mut self, backend: Box<dyn net::Backend>, mac: [u8; 6]) -> Result<()> {
+        if self.loaded {
+            return Err(Error::BadAddress);
+        }
         let apic = self.has_apic();
         let mut p = self.platform.lock();
         if p.nics >= MAX_NICS {
@@ -652,19 +705,62 @@ impl LinuxGuest {
     }
 
     /// Write the guest's furniture -- the zero page, the command line, the
-    /// memory map, the page tables, the GDT and the MP table -- and put its
-    /// first CPU, `bsp`, at the kernel's entry. The kernel and initrd bytes
-    /// must already be in memory at the addresses `layout` names; the caller
-    /// streams those in.
+    /// memory map, the page tables, the GDT, the MP table and the ACPI
+    /// tables -- and put its first CPU, `bsp`, at the kernel's entry. The
+    /// kernel and initrd bytes must already be in memory at the addresses
+    /// `layout` names; the caller streams those in. Its disks and NICs must
+    /// have been added already: the tables describe them, and none is taken
+    /// after this.
     pub fn load(&mut self, bsp: &mut GuestCpu, header: &Header, first: &[u8], layout: Layout, cmdline: &[u8])
         -> Result<()>
     {
-        if bsp.index != 0 {
+        if bsp.index != 0 || self.loaded {
             return Err(Error::BadAddress);
         }
-        linux::build(&self.memory, header, first, &layout, cmdline, self.cpus())?;
+        let firmware = self.write_acpi()?;
+        linux::build(&self.memory, header, first, &layout, cmdline, self.cpus(), Some(firmware))?;
         linux::set_entry(bsp.cpu.backend_mut(), &layout);
+        self.loaded = true;
         Ok(())
+    }
+
+    /// The ACPI tables, for the machine as it is now -- its CPUs, and each
+    /// device on the bus with the IRQ its INTA is wired to -- laid out in the
+    /// BIOS area.
+    fn write_acpi(&self) -> Result<linux::Firmware> {
+        let mut routes = [acpi::Route::default(); MAX_DISKS + MAX_NICS];
+        let mut n = 0;
+        let msix = {
+            let p = self.platform.lock();
+            for (i, d) in p.pci_devs.iter().enumerate() {
+                let irq = match d {
+                    PciDev::Disk(_) => DISK_IRQ,
+                    PciDev::Nic(_) => NIC_IRQ,
+                };
+                let (Some(route), Ok(slot)) = (routes.get_mut(n), u8::try_from(i + 1)) else {
+                    return Err(Error::BadAddress);
+                };
+                *route = acpi::Route { slot, irq };
+                n += 1;
+            }
+            (0..p.pci_devs.len()).any(|i| p.pci.msix(i + 1).is_some())
+        };
+        /* The window covers every slot's page, whichever have one. */
+        let window = msix.then_some((MSIX_PAGES, pci::MAX_SLOTS as u32 * pci::MSIX_PAGE));
+        let machine = acpi::Machine { cpus: self.cpus(), apic: self.has_apic(), pci: &routes[..n], mmio: window };
+
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(acpi::MAX_BYTES).map_err(|_| Error::NoMemory)?;
+        buf.resize(acpi::MAX_BYTES, 0);
+        let len = acpi::build(&machine, &mut buf).ok_or(Error::NoMemory)?;
+        self.memory.write(acpi::AREA, &buf[..len])?;
+        Ok(linux::Firmware { rsdp: acpi::AREA, start: acpi::AREA, end: acpi::AREA_END })
+    }
+
+    /// What the guest's OS did with its ACPI.
+    pub fn acpi_stats(&self) -> AcpiStats {
+        let p = self.platform.lock();
+        AcpiStats { used: p.pm.used, scis: p.pm.scis, presses: p.pm.presses, other_sleep: p.pm.other_sleep }
     }
 
     pub fn uart_ier(&self) -> u8 {
@@ -815,6 +911,17 @@ impl LinuxGuest {
             if me == 0 {
                 let mut p = self.platform.lock();
                 feed_console(&mut p, host);
+                /* The power button, when it has been pressed: its status
+                 * latched, and whoever pressed it told whether the guest
+                 * will hear of it. Then the SCI's line as the PM registers
+                 * have it -- raised again if the guest ended its interrupt
+                 * with an event still set, as a level is, and raised when
+                 * the timer's carry is due. */
+                if host.power_button() {
+                    let heard = p.pm.press_power_button();
+                    host.power_button_heard(heard);
+                }
+                sync_sci(&mut p, now);
                 /* The timer: a channel-0 period elapsed is an IRQ0 edge --
                  * one owed edge at a time, and only once the last has been
                  * taken: an IRQ0 still requested or in service would swallow
@@ -1487,6 +1594,22 @@ impl LinuxGuest {
                 }
                 gc.counts.port_out += 1;
             }
+        } else if Pm::owns(io.port) {
+            let now = time::boot_time_ns();
+            if io.input {
+                let value = p.pm.read(io.port, io.size, now);
+                set_in(v.save_mut(), io.size, value);
+                gc.counts.port_in += 1;
+            } else {
+                gc.counts.port_out += 1;
+                let value = v.save().rax as u32;
+                if p.pm.write(io.port, io.size, value, now) {
+                    /* Off: the guest stays where it wrote it, as a machine
+                     * that has lost its power does. */
+                    return Some(Stop::PowerOff { rip: v.save().rip });
+                }
+                sync_sci(&mut p, now);
+            }
         } else if PciBus::owns(io.port) {
             if io.input {
                 let value = p.pci.read(io.port, io.size);
@@ -1639,6 +1762,21 @@ fn msix_page(memory: &mut GuestMemory, apic: bool, slot: usize) -> Result<Option
         /* RAM there already: a guest that large goes without. */
         Err(Error::BadAddress) => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+/// The SCI's line as the PM registers have it now: requested when an enabled
+/// event is set and IRQ 9 is neither requested nor in service already -- so
+/// that one still set after the guest ended the interrupt is requested again,
+/// as a level-triggered line is -- and withdrawn when none is.
+fn sync_sci(p: &mut Platform, now: u64) {
+    if p.pm.sci(now) {
+        if !p.pic.busy(pm::SCI_IRQ) {
+            p.pic.raise(pm::SCI_IRQ);
+            p.pm.scis += 1;
+        }
+    } else {
+        p.pic.lower(pm::SCI_IRQ);
     }
 }
 

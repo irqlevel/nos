@@ -14,12 +14,23 @@
 //! and masking are right; the niceties -- special mask mode, rotating
 //! priority, polled mode -- are not, because a Linux guest on a PIC does not
 //! use them.
+//!
+//! Beside the pair, the chipset's edge/level control registers (ELCR), a bit
+//! a line, set for a level-triggered one: kept as written and read back,
+//! which is all an OS does with them. A line here is raised when its device
+//! has something, and a level-triggered device that still has it after the
+//! interrupt is ended raises it again -- the SCI, whose level is looked at
+//! again every round (`pm`) -- and lowers it, withdrawing a request not yet
+//! taken, when it no longer has it (`lower`).
 
 /* Ports. */
 pub const MASTER_CMD: u16 = 0x20;
 pub const MASTER_DATA: u16 = 0x21;
 pub const SLAVE_CMD: u16 = 0xA0;
 pub const SLAVE_DATA: u16 = 0xA1;
+/// The edge/level control registers: IRQs 0-7, then 8-15.
+pub const ELCR1: u16 = 0x4D0;
+pub const ELCR2: u16 = 0x4D1;
 
 /* Command bytes. */
 const ICW1_INIT: u8 = 0x10;
@@ -31,6 +42,15 @@ const OCW3_READ_IRR: u8 = 0x02;
 
 /// The IRQ the slave is cascaded onto the master at.
 const CASCADE_IRQ: u8 = 2;
+
+/// The ELCR bits a guest may set: every line's but the timer's, the
+/// keyboard's, the cascade, the RTC's and the FPU's (0, 1, 2, 8 and 13),
+/// which are edge-triggered on every PC and whose bits read as zero.
+const ELCR_WRITABLE: u16 = !((1 << 0) | (1 << 1) | (1 << 2) | (1 << 8) | (1 << 13));
+/// The ELCR as firmware leaves it: the SCI's line, IRQ 9, level-triggered --
+/// what an OS with ACPI sets it to, and, finding it so, need not say it did.
+/// The PCI devices' lines an OS sets when it enables them.
+const ELCR_RESET: u16 = 1 << 9;
 
 /// One 8259.
 #[derive(Clone, Copy)]
@@ -144,19 +164,20 @@ impl Chip {
     }
 }
 
-/// The cascaded pair.
+/// The cascaded pair, and the ELCR.
 pub struct Pic {
     master: Chip,
     slave: Chip,
+    elcr: u16,
 }
 
 impl Pic {
     pub fn new() -> Self {
-        Self { master: Chip::new(), slave: Chip::new() }
+        Self { master: Chip::new(), slave: Chip::new(), elcr: ELCR_RESET }
     }
 
     pub fn owns(port: u16) -> bool {
-        matches!(port, MASTER_CMD | MASTER_DATA | SLAVE_CMD | SLAVE_DATA)
+        matches!(port, MASTER_CMD | MASTER_DATA | SLAVE_CMD | SLAVE_DATA | ELCR1 | ELCR2)
     }
 
     /// Raise IRQ `irq` (0-15): mark it requested. 8-15 are the slave's, and
@@ -167,6 +188,28 @@ impl Pic {
         } else if irq < 16 {
             self.slave.irr |= 1 << (irq - 8);
             self.master.irr |= 1 << CASCADE_IRQ;
+        }
+    }
+
+    /// Withdraw IRQ `irq`'s request, if it has one the CPU has not taken: a
+    /// level-triggered line gone low before the interrupt was acknowledged,
+    /// which an 8259 in level mode no longer requests. What is in service
+    /// stays so until its end of interrupt.
+    pub fn lower(&mut self, irq: u8) {
+        match irq {
+            0..=7 => self.master.irr &= !(1 << irq),
+            8..=15 => {
+                let bit = 1 << (irq - 8);
+                if self.slave.irr & bit != 0 {
+                    self.slave.irr &= !bit;
+                    /* The cascade line goes down with the slave's last
+                     * request, as `acknowledge` has it. */
+                    if self.slave.irr == 0 {
+                        self.master.irr &= !(1 << CASCADE_IRQ);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -222,6 +265,8 @@ impl Pic {
             MASTER_DATA => self.master.read_data(),
             SLAVE_CMD => self.slave.read_command(),
             SLAVE_DATA => self.slave.read_data(),
+            ELCR1 => self.elcr as u8,
+            ELCR2 => (self.elcr >> 8) as u8,
             _ => 0xFF,
         }
     }
@@ -238,6 +283,8 @@ impl Pic {
             MASTER_DATA => self.master.data(value),
             SLAVE_CMD => self.slave.command(value),
             SLAVE_DATA => self.slave.data(value),
+            ELCR1 => self.elcr = (self.elcr & 0xFF00) | (u16::from(value) & ELCR_WRITABLE & 0x00FF),
+            ELCR2 => self.elcr = (self.elcr & 0x00FF) | ((u16::from(value) << 8) & ELCR_WRITABLE & 0xFF00),
             _ => {}
         }
     }

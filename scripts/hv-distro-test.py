@@ -20,7 +20,8 @@ virtio disk:
     cursor, as a shell's line editor does), and the guest says what it is
   - its clock is the host's (the emulated RTC), to the minute
   - the ISO is read-only to it: the driver says so and a write fails
-  - `reboot` resets it through the keyboard controller, as a PC does; with
+  - `reboot` resets it through the reset register the machine's ACPI tables
+    name -- the keyboard controller, with `--acpi-off` -- as a PC does; with
     `restart` the VM boots again, and root logs in again
   - on the guests' switch (`net`), its initramfs configures eth0 from the
     `ip=` the VM is given; it pings nos at 10.0.100.1 and nos pings it
@@ -53,6 +54,13 @@ own /boot, its root partition the guest's disk and written to:
     `--internet` it resolves Debian's mirror and fetches from it
   - a file written and synced there is still there after `reboot`, the VM
     built again: what the guest wrote went through nos's ext2 to its file
+  - `hv stop` presses its power button: systemd-logind hears it through the
+    machine's ACPI, and systemd shuts the system down and turns it off
+
+Both boot with the machine's ACPI tables: their kernels find the PCI host
+bridge, their devices' interrupts and the PM timer through them. `--acpi-off`
+boots them with `acpi=off` instead -- the MP table, PCI by configuration
+mechanism 1, no power button -- the machine as it was before it had ACPI.
 
 Manual, like hv-linux-test: the images are downloads CI does not make, and
 the runs are slow under TCG, the guest emulated twice (Alpine: two boots and
@@ -93,8 +101,13 @@ spec.loader.exec_module(hvl)
 pt = hvl.pt
 
 # What Alpine's boot loader gives its kernel, less the console on tty0: the
-# serial console, and a PC with neither a local APIC nor ACPI tables.
-CMDLINE = "console=ttyS0 nolapic acpi=off modules=loop,squashfs,sd-mod,usb-storage"
+# serial console, and a PC of one CPU with no local APIC. (Its ACPI tables it
+# takes; with --acpi-off it is told not to, `ACPI_OFF`.)
+CMDLINE = "console=ttyS0 nolapic modules=loop,squashfs,sd-mod,usb-storage"
+# The machine as it was before it had ACPI: the kernel finds its PCI devices
+# through configuration mechanism 1 and their interrupts in their interrupt
+# line registers, and hears no power button.
+ACPI_OFF = " acpi=off"
 PROMPT = "localhost:~#"
 GUEST_IP = "10.0.100.2"
 SSH_PORT = 2222
@@ -160,7 +173,7 @@ def alpine(args):
                    check=True)
     pubkey = open(key + ".pub").read().strip()
 
-    cmdline = CMDLINE + (" " + args.cmdline_extra if args.cmdline_extra else "")
+    cmdline = CMDLINE + (ACPI_OFF if args.acpi_off else "") + (" " + args.cmdline_extra if args.cmdline_extra else "")
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
     eth_line = x("ip addr show eth0")
     ping_line = x("ping -c 3 10.0.100.1")
@@ -318,7 +331,10 @@ DEBIAN_ROOT_TYPE = "4F68BCE3-E8CD-4DB1-96E7-FBCAF984B709"   # Linux x86-64 root
 # locale, the keymap and the timezone, handed to it as credentials on the
 # kernel command line, as systemd provisions a machine with no one at it.
 DEBIAN_PASSWORD = "nos"
-DEBIAN_CMDLINE = ("root=/dev/vda1 ro console=ttyS0 nolapic acpi=off"
+# How the Debian guest is ended: its power button, and time for systemd to
+# stop its services and unmount its root, as slow as TCG makes it.
+STOP_LINE = "hv stop 0 secs=300"
+DEBIAN_CMDLINE = ("root=/dev/vda1 ro console=ttyS0 nolapic"
                   " systemd.set_credential=passwd.plaintext-password.root:" + DEBIAN_PASSWORD +
                   " systemd.set_credential=firstboot.locale:C.UTF-8"
                   " systemd.set_credential=firstboot.keymap:us"
@@ -369,7 +385,8 @@ def debian(args):
 
     server, url, token = web(tmp)
     import base64
-    cmdline = (DEBIAN_CMDLINE + " systemd.set_credential_binary=network.network.50-nos:" +
+    cmdline = (DEBIAN_CMDLINE + (ACPI_OFF if args.acpi_off else "") +
+               " systemd.set_credential_binary=network.network.50-nos:" +
                base64.b64encode(DEBIAN_NETWORK.encode()).decode())
 
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
@@ -408,6 +425,8 @@ def debian(args):
           + login(1)
           + [kept_line,
              "hv list",
+             # Pressed, and given long enough for systemd under TCG too.
+             STOP_LINE,
              hvl.RC_LAST])
     boot = argparse.Namespace(bzimage=vmlinuz, initrd=initrd, root_mib=args.debian_root_mib,
                               deadline=args.deadline)
@@ -481,6 +500,17 @@ def debian(args):
                  re.search(r"^%s\s*$" % marker, out(kept_line), re.M) is not None, out(kept_line))
         pt.check("hv list counts the reboot", re.search(r"vm 0\s+running.*restarts 1\b", out("hv list"))
                  is not None, out("hv list"))
+        stop = out(STOP_LINE)
+        if args.acpi_off:
+            pt.check("hv stop presses its power button, which a guest without ACPI never hears: stopped at once",
+                     "hv: vm 0 stopped -- on request -- nothing in it listens to its power button" in stop,
+                     stop[-1200:])
+        else:
+            pt.check("hv stop presses its power button, and systemd shuts it down and turns it off",
+                     "hv: vm 0 stopped -- the guest powered itself off" in stop, stop[-1200:])
+            pt.check("its report: ACPI taken, the button pressed once",
+                     re.search(r"acpi\s+taken by the guest's OS; [1-9]\d* SCIs, the power button pressed 1 times",
+                               stop) is not None, stop[-1200:])
     finally:
         server.shutdown()
         if p is not None:
@@ -504,6 +534,9 @@ def main():
     ap.add_argument("--internet", action="store_true",
                     help="also reach the internet through NAT: a name looked up, and a distribution's mirror "
                          "fetched from; needs the test machine to have both")
+    ap.add_argument("--acpi-off", action="store_true",
+                    help="boot the distributions with acpi=off: the machine without its ACPI tables, as it was "
+                         "before it had them")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
     args = ap.parse_args()
     if not args.iso and not args.debian:
