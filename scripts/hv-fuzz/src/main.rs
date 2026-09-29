@@ -4,12 +4,13 @@
 //! ACPI's fixed hardware, PCI configuration space, the virtio disk and NIC,
 //! the local APIC in both its modes, the IO-APIC, the MMIO decoder, page
 //! walker and emulator, the run loop that dispatches every exit, the guests'
-//! DHCP server -- and what a guest's image drives -- the Linux loader's
-//! header parsing and layout --
+//! switch, its DHCP server and NAT -- and what a guest's image drives -- the
+//! Linux loader's header parsing and layout --
 //! compiled from the hypervisor's own sources, as they are, against
 //! stand-ins for the kernel (`kernel`: a clock the fuzzer moves, the locks,
-//! a vCPU's wait) and for the CPU (`cpu`: hvarch's VMCB layout from its own
-//! source, and a CPU whose guest is a script), and guest memory as sparse
+//! a vCPU's wait), for its network layer (`network`: the net devices, their
+//! frames, ARP, `hv0`), and for the CPU (`cpu`: hvarch's VMCB layout from its
+//! own source, and a CPU whose guest is a script), and guest memory as sparse
 //! pages (`memory`). A guest decides every value these functions are
 //! handed, so nothing any of them does with one may bring down the host
 //! that runs it: no panic -- an index out of range, an overflow, which this
@@ -23,8 +24,10 @@
 #![allow(dead_code)]
 
 extern crate alloc;
-extern crate self as kcore;
+extern crate self as ffi;
+extern crate self as hv;
 extern crate self as hvarch;
+extern crate self as kcore;
 
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -40,10 +43,22 @@ macro_rules! invariant {
     };
 }
 
+/// `kcore::trace!`: the formatting checked, the line dropped.
+#[macro_export]
+macro_rules! trace {
+    ($level:expr, $($arg:tt)*) => {{
+        let _ = $level;
+        let _ = format_args!($($arg)*);
+    }};
+}
+
 /* ---- what the sources reach of the kernel and of hvarch ---- */
 
 mod kernel;
-pub use kernel::{consts, dma, sync, time};
+pub use kernel::{cmd, consts, dma, sync, time};
+mod network;
+pub use network::{abi, device, dns, frame, net, nic, tcp, vms, vnic};
+pub use netwire as wire;
 #[path = "../../../src/rust/kcore/src/pod.rs"]
 pub mod pod;
 mod cpu;
@@ -67,17 +82,31 @@ pub mod lapic;
 pub mod linux;
 #[path = "../../../src/rust/hv/src/mmio.rs"]
 pub mod mmio;
+/// NAT, from the net crate: what a guest's packets for the world, and the
+/// world's answers, go through. Its `use kcore::trace` is the kernel's macro;
+/// here `trace!` is the one above, in scope already, and the import unused.
+#[allow(unused_imports)]
+#[path = "../../../src/rust/net/src/nat.rs"]
+pub mod nat;
 #[path = "../../../src/rust/hv/src/policy.rs"]
 pub mod policy;
 #[path = "../../../src/rust/hv/src/run.rs"]
 pub mod run;
 #[path = "../../../src/rust/hv/src/smp.rs"]
 pub mod smp;
+/// The guests' switch, from the module: the ports, `hv0`, DHCP, NAT on.
+#[path = "../../../src/rust/modules/hv/src/net.rs"]
+pub mod switch;
 #[path = "../../../src/rust/hv/src/walk.rs"]
 pub mod walk;
 
+mod guestnet;
 mod platform;
+mod recycle;
 mod targets;
+
+#[global_allocator]
+static ALLOCATOR: recycle::Recycling = recycle::Recycling;
 
 /* ---- the runner ---- */
 
@@ -277,6 +306,7 @@ fn main() {
     }
     if std::env::var_os("HV_FUZZ_STATS").is_some() {
         platform::report();
+        guestnet::report();
     }
     if findings.is_empty() {
         println!("hv-fuzz: {} inputs, no finding", total);

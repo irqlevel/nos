@@ -102,7 +102,7 @@ swallowing panic messages whole.
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
-| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' DHCP server -- fuzzed with overflow checks on |
+| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -348,21 +348,32 @@ what masked -- so a panic, an overflow or a loop that never ends anywhere in
 them is one a guest can cause, on the host, under everyone else's guests.
 `scripts/hv-fuzz` is a host program built from the hypervisor's own sources
 as they are -- `hv/src/devices/*`, `lapic`, `acpi`, `insn`, `walk`,
-`linux`, `mmio`, `policy`, `smp` and `run`, hvarch's VMCB layout, and the
-module's DHCP server (`modules/hv/src/dhcp.rs`) --
-over stand-ins for the kernel (a clock the fuzzer moves, the locks, a
-vCPU's wait) and for the CPU, with overflow checks on as a `RUSTUB=1`
-kernel has them. Each target turns random bytes into what a guest does to
+`linux`, `mmio`, `policy`, `smp` and `run`, hvarch's VMCB layout, the
+module's switch and DHCP server (`modules/hv/src/{net,dhcp}.rs`) and NAT
+(`net/src/nat.rs`) -- over stand-ins for the kernel (a clock the fuzzer
+moves, the locks, a vCPU's wait), for its network layer (the net devices,
+their frames, ARP, `hv0`'s end of the switch) and for the CPU, with
+overflow checks on as a `RUSTUB=1` kernel has them. Each target turns random bytes into what a guest does to
 one device: the serial port, the 8259, the PIT, the RTC, ACPI's fixed
 hardware, PCI configuration space, the local APIC through its MSRs and its
 page, the IO-APIC, MSIs, a virtio disk and NIC driven through rings well
 made and not, the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
-And `platform` does it to the whole machine: a Linux guest's platform built
+The guests' network has three: `switch`, guests on its ports and `hv0`
+sending each other frames of every kind -- as themselves and as each other
+-- held to a model of where each must go and what each must count; `nat`,
+guests' packets out into the world and the world's answers back, each
+rewrite checked field by field and its sums summed from scratch; and
+`guestnet`, the two as the module wires them, guests on the switch reaching
+the world through NAT. And `platform` does it to the whole machine: a Linux guest's platform built
 and loaded as `hv boot` builds it -- CPUs, disks, NICs, IO-APIC and all --
 and run by the real run loop, `LinuxGuest::run`, on each of its CPUs, each
-on a thread of its own and one at a time. Where the loop would enter the
+on a thread of its own and one at a time -- the one turn handed from thread
+to thread directly, and the clock moved on to the next deadline when every
+CPU waits, so that nothing sleeps on a real clock: sixteen times the runs a
+second of the first harness, whose CPUs slept for real, and ten processes
+at once some forty times theirs. Where the loop would enter the
 guest, the CPU asks a script what the guest does next: a port, an MSR,
 CPUID, a fault on a device's page with the instruction that made it put
 where the guest's paging finds it, a halt, a window opened, an event taken,
@@ -376,7 +387,14 @@ invariant: an interrupt injected into a guest that cannot take one, or over
 an event already on its way in; an exception's vector from the APIC; a disk
 request outside the disk, not in sectors, or past the requests in flight; a
 frame longer than a frame handed to the switch; a DHCP answer that is no
-datagram, or whose checksum is not its own; a vCPU that enters its
+datagram, or whose checksum is not its own; a frame the switch put
+elsewhere than its destination says, or counted otherwise; a packet NAT
+rewrote in any field but its own, or with a sum it did not have, a port
+given to one flow while another was live on it, an answer let in that no
+live flow asked for or kept out that one did, a packet counted twice or
+not at all; what a guest takes from the world for another guest's address,
+and what `hv0` or a guest takes from a guest not sent as that guest; a
+vCPU that enters its
 guest or waits with one of the kernel's locks held; a guest whose RAM would
 cover its devices' pages. Or a spin -- the run loop reading the clock a
 million times with neither an entry nor a wait between, which on a host is
@@ -387,7 +405,7 @@ it again, and the input written to `out/hv-fuzz/findings/`, to replay
 
 With no arguments every target runs 50000 inputs from seed 1, the same
 ones every time: the gate, which CI runs on its x86-64 leg and which takes
-about a minute. A campaign is `--seed N --seconds S` for as many seeds as
+about half a minute. A campaign is `--seed N --seconds S` for as many seeds as
 there are CPUs: each seed another set of inputs. Whether the whole-machine
 runs go deep is `HV_FUZZ_STATS=1`, which says how they ended and after how
 many exits -- a run that ends early reaches little, so every step that ends
@@ -414,15 +432,32 @@ EtherType before anything had checked the frame held one -- an index out
 of range on a guest's runt frame, which only the switch's own length check
 kept away; it now parses the datagram first, which checks.
 
+And on the day the switch and NAT became targets, `guestnet` found a guest
+could send as another: the switch passed on a frame from any MAC and any
+address, and NAT answers a flow at the MAC its last packet came from -- so
+a guest that sent one packet of another guest's flow, with that guest's
+address, took the flow, and the world's answers to it came to its port.
+The same frames could tell `hv0`'s ARP table another guest's address was
+its own. The switch now checks what comes in at each port, as a cloud's
+virtual switch does (`ingress` in `modules/hv/src/net.rs`): IPv4 or ARP
+only, from the port's MAC, an IPv4 packet from the port's address and an
+ARP message with the port's MAC and address -- or none yet, a probe's --
+as its sender; the one packet with no address yet is a DHCP client's,
+which the switch answers itself. The rest is dropped and counted -- `hv
+list` says how many a guest sent as another -- and the targets hold the
+switch to it both ways: `switch` to a model of the rule, `guestnet` to
+what the rule is for.
+
 What it cannot see: the CPU is a stand-in, so nothing of hvarch -- its
 `unsafe`, the VMCB and VMCS, the entry and the exit -- is fuzzed, only what
 the run loop does with the exits it decodes; the interleavings are the
 script's, at entries and waits, which exercises every path between the
 CPUs but finds no race; the devices' backends -- the disk files, the
-switch -- are stand-ins that check what they are handed; and of the guests'
-network only the DHCP server is fuzzed so far -- the switch and NAT take a
-guest's frames apart too, but stand on the net layer's frames and devices,
-which want stand-ins of their own, and are the next targets to write.
+switch in `platform` -- are stand-ins that check what they are handed; and
+under the switch and NAT the net layer is a stand-in too -- its devices,
+frames and ARP table, `hv0`'s receive path run on the caller's thread --
+so what they do is fuzzed, one frame at a time, and the receive path's own
+concurrency is not.
 
 ### `hv-test.py` -- the extension turned on and off again, and guests under it
 
@@ -638,11 +673,20 @@ for it (`kicks` in `hv list` above 0), and the port must have dropped
 nothing. Under TCG only the first two tell anything -- with the kick taken
 out, `kicks` reads 0 and the check fails, but slirp never outruns the host's
 tick, so no frame was dropped either; the drops show at line rate, on the
-AX41. It needs a guest kernel with networking, virtio-net, packet sockets
-and `ip=` configuration built in, and POSIX timers: BusyBox's `ping` paces
-itself with `alarm()`, which a `tinyconfig` leaves out, and without it the
-guest's `ping` waits for ever after its first answer -- which reads as a
-network that stopped.
+AX41. And one guest claims the other's address -- `ip addr add` of it,
+`arping` from it, a ping from it -- and must get nothing back: the switch
+stops what a guest sends as another at its port, so nos, which would answer
+both, hears neither; and `hv list` must count the frames against the guest
+that sent them and no other. (nos's ARP table is no steady witness: with
+the check taken out of the switch the claim reached it, and the other
+guest's own ARP put the entry right again -- once before the test could
+look, and once not, when the fetch through `hv forward`, which the test
+makes last, reached the claiming guest instead of the other's `httpd`.) It
+needs a guest kernel with networking, virtio-net, packet sockets and `ip=`
+configuration built in, and POSIX timers: BusyBox's `ping` paces itself
+with `alarm()`, which a `tinyconfig` leaves out, and without it the guest's
+`ping` waits for ever after its first answer -- which reads as a network
+that stopped.
 
 `--acpi` says the guest kernel has ACPI, with its power button (`ACPI_BUTTON`)
 and the input device BusyBox's `acpid` reads it from (`INPUT_EVDEV`), and

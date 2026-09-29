@@ -7,17 +7,20 @@ the instruction behind an MMIO fault -- and so a panic, an overflow or a
 loop that never ends in any of them is one a guest can cause, on the host,
 under everyone else's guests. scripts/hv-fuzz is a host program built from
 the hypervisor's own sources (src/rust/hv/src/{devices/*,lapic,acpi,insn,
-walk,linux,mmio,policy,smp,run}.rs, hvarch's VMCB layout, and the module's
-DHCP server, src/rust/modules/hv/src/dhcp.rs) over stand-ins
-for the kernel and the CPU, with overflow checks on as a RUSTUB=1 kernel has
-them. Each target turns random bytes into what a guest does to one device --
-or, for `platform`, to the whole machine: a Linux guest's platform built and
-loaded as `hv boot` builds it, run by the real run loop on its first CPU,
-with a script in place of the CPU saying what the guest does at each entry.
-A panic, a broken invariant (an interrupt lost, a disk request outside the
-disk, a frame longer than a frame) and a spin -- the run loop neither
-entering the guest nor sleeping -- are each reported with the seed and
-iteration that make them again, and the input in a file to replay.
+walk,linux,mmio,policy,smp,run}.rs, hvarch's VMCB layout, the module's
+switch and DHCP server, src/rust/modules/hv/src/{net,dhcp}.rs, and NAT,
+src/rust/net/src/nat.rs) over stand-ins for the kernel, its network layer
+and the CPU, with overflow checks on as a RUSTUB=1 kernel has them. Each
+target turns random bytes into what a guest does to one device, or to the
+guests' network -- or, for `platform`, to the whole machine: a Linux
+guest's platform built and loaded as `hv boot` builds it, run by the real
+run loop on each of its CPUs, with a script in place of the CPU saying what
+the guest does at each entry. A panic, a broken invariant (an interrupt
+lost, a disk request outside the disk, a frame longer than a frame, a NAT
+rewrite wrong, a guest taking another's traffic or sending as another) and
+a spin -- the run loop neither entering the guest nor sleeping -- are each
+reported with the seed and iteration that make them again, and the input in
+a file to replay.
 
 By default every target runs a fixed number of inputs from a fixed seed, the
 same every time: a gate. A campaign is `--seconds` a target and seeds of

@@ -206,7 +206,8 @@ pub mod machine {
 
 pub mod vm {
     use std::cell::Cell;
-    use std::sync::{Condvar, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::machine::Machine;
     use crate::memory::GuestMemory;
@@ -484,106 +485,190 @@ pub mod vm {
     }
 
     /* A guest of several CPUs runs each on a thread of its own, as the
-     * kernel runs each on a task -- one at a time, the one holding the baton:
-     * so a run is the same every time, and the order the CPUs run in is the
-     * script's to choose, where a CPU would leave the host -- entering its
-     * guest (`Next::Switch`), or waiting to be woken (`sleep`). */
+     * kernel runs each on a task -- one at a time, the one with the turn: so
+     * a run is the same every time, and the order the CPUs run in is decided
+     * here and by the script, where a CPU leaves the host. A CPU that enters
+     * its guest may be told another runs first (`Next::Switch`); one that
+     * waits to be woken hands the turn on as a host would: to a CPU that can
+     * run -- in its guest, or rung -- and when none can, to the sleeper due
+     * first, the clock jumped to when it is due. Nothing passes the turn
+     * round a ring of sleepers, and a wake-up is the one thread's it is for. */
+    #[derive(Clone)]
+    enum Turn {
+        /// Has the turn.
+        Running,
+        /// In its guest, or not started: runs when handed the turn.
+        Ready,
+        /// Waiting to be woken -- rung, or at `until`.
+        Asleep { until: u64, rung: Arc<AtomicBool> },
+        Done,
+    }
+
     struct Baton {
+        cpus: Vec<Turn>,
+        threads: Vec<Option<std::thread::Thread>>,
         holder: usize,
-        alive: Vec<bool>,
         /// A thread panicked: the rest leave their runs, for it to be reported.
         abort: bool,
     }
 
+    impl Baton {
+        /// Who runs after `me`, which is waiting (Ready or Asleep) or done: a
+        /// CPU that can run -- the first after `me` round the ring, `me`
+        /// last -- or else the sleeper due first, the clock moved on to when
+        /// it is; None when every CPU is done.
+        fn pick(&self, me: usize) -> Option<(usize, u64)> {
+            let n = self.cpus.len();
+            let order = (1..=n).map(|k| (me + k) % n);
+            let runnable = |t: &Turn| match t {
+                Turn::Ready => true,
+                Turn::Asleep { rung, .. } => rung.load(Ordering::Relaxed),
+                _ => false,
+            };
+            if let Some(i) = order.clone().find(|&i| runnable(&self.cpus[i])) {
+                return Some((i, 0));
+            }
+            order.filter_map(|i| match &self.cpus[i] {
+                Turn::Asleep { until, .. } => Some((i, *until)),
+                _ => None,
+            }).min_by_key(|&(_, until)| until)
+        }
+    }
+
     static BATON: Mutex<Option<Baton>> = Mutex::new(None);
-    static TURN: Condvar = Condvar::new();
+    /// Turns handed from one thread to another, for `HV_FUZZ_STATS`.
+    pub static HANDOFFS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    pub static SLEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     thread_local! {
         static VCPU: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// This thread runs CPU `i`.
+    fn baton() -> std::sync::MutexGuard<'static, Option<Baton>> {
+        BATON.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// This thread runs CPU `i`: and, with the CPUs on threads, it is the
+    /// thread a turn for `i` wakes.
     pub fn set_vcpu(i: usize) {
         VCPU.with(|v| v.set(i));
+        if let Some(b) = baton().as_mut() {
+            if let Some(t) = b.threads.get_mut(i) {
+                *t = Some(std::thread::current());
+            }
+        }
     }
 
     /// `n` CPUs on threads of their own from here, the first to run first.
     pub fn begin_threads(n: usize) {
-        *BATON.lock().unwrap_or_else(|e| e.into_inner()) = Some(Baton { holder: 0, alive: vec![true; n], abort: false });
+        let mut cpus = vec![Turn::Ready; n];
+        cpus[0] = Turn::Running;
+        *baton() = Some(Baton { cpus, threads: vec![None; n], holder: 0, abort: false });
     }
 
     pub fn end_threads() {
-        *BATON.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *baton() = None;
+    }
+
+    /// Whether the CPUs are on threads of their own.
+    pub fn threaded() -> bool {
+        baton().is_some()
     }
 
     /// Wait for CPU `me`'s turn.
     pub fn wait_turn(me: usize) {
-        let mut b = BATON.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            match b.as_ref() {
-                None => return,
-                Some(b) if b.abort => panic!("aborted: another CPU's thread panicked"),
-                Some(b) if b.holder == me => return,
-                Some(_) => {}
+            {
+                let mut b = baton();
+                match b.as_mut() {
+                    None => return,
+                    Some(b) if b.abort => panic!("aborted: another CPU's thread panicked"),
+                    Some(b) if b.holder == me => {
+                        b.cpus[me] = Turn::Running;
+                        return;
+                    }
+                    Some(_) => {}
+                }
             }
-            b = TURN.wait(b).unwrap_or_else(|e| e.into_inner());
+            /* An unpark before the park is kept: no turn is missed. */
+            std::thread::park();
         }
     }
 
-    /// Hand the turn to CPU `to`, if it still runs.
-    fn pass(to: usize) {
-        let mut b = BATON.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(b) = b.as_mut() {
-            if b.alive.get(to).copied().unwrap_or(false) {
-                b.holder = to;
-            }
+    /// The turn from `me`, now `state`, to whoever runs next -- `me` itself
+    /// when it is the one: true when it is.
+    fn hand_on(me: usize, state: Turn) -> bool {
+        let mut b = baton();
+        let Some(bt) = b.as_mut() else { return true };
+        bt.cpus[me] = state;
+        let Some((next, due)) = bt.pick(me) else { return true };
+        crate::time::reach(due);
+        if next == me {
+            bt.cpus[me] = Turn::Running;
+            return true;
         }
-        TURN.notify_all();
+        bt.holder = next;
+        let thread = bt.threads[next].clone();
+        drop(b);
+        HANDOFFS.fetch_add(1, Ordering::Relaxed);
+        if let Some(t) = thread {
+            t.unpark();
+        }
+        false
     }
 
-    /// The CPU after `me` that still runs, round the ring.
-    fn after(me: usize) -> Option<usize> {
-        let b = BATON.lock().unwrap_or_else(|e| e.into_inner());
-        let b = b.as_ref()?;
-        let n = b.alive.len();
-        (1..=n).map(|k| (me + k) % n).find(|&i| b.alive[i])
-    }
-
-    /// CPU `me` waits to be woken: the next that runs has its turn, and this
-    /// one its own again when the ring comes round.
-    pub fn sleep() {
+    /// CPU `me` waits to be woken -- by `rung`, or at `until`: the turn goes
+    /// on, and this returns when it is this CPU's again.
+    pub fn sleep_until(until: u64, rung: &Arc<AtomicBool>) {
+        SLEEPS.fetch_add(1, Ordering::Relaxed);
         let me = VCPU.with(|v| v.get());
-        match after(me) {
-            Some(next) if next != me => {
-                pass(next);
-                wait_turn(me);
-            }
-            _ => {}
+        if !hand_on(me, Turn::Asleep { until, rung: rung.clone() }) {
+            wait_turn(me);
         }
+    }
+
+    /// CPU `me`, in its guest, lets `to` run first -- if `to` can run.
+    fn switch_to(me: usize, to: usize) {
+        {
+            let mut b = baton();
+            let Some(bt) = b.as_mut() else { return };
+            let can = match bt.cpus.get(to) {
+                Some(Turn::Ready) => true,
+                Some(Turn::Asleep { until, rung }) => rung.load(Ordering::Relaxed) || *until <= crate::time::peek(),
+                _ => false,
+            };
+            if to == me || !can {
+                return;
+            }
+            bt.cpus[me] = Turn::Ready;
+            bt.holder = to;
+            let thread = bt.threads[to].clone();
+            drop(b);
+            HANDOFFS.fetch_add(1, Ordering::Relaxed);
+            if let Some(t) = thread {
+                t.unpark();
+            }
+        }
+        wait_turn(me);
     }
 
     /// CPU `me`'s thread is done: the next has its turn.
     pub fn finished(me: usize) {
-        let next = {
-            let mut b = BATON.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(b) = b.as_mut() {
-                b.alive[me] = false;
-            }
-            drop(b);
-            after(me)
-        };
-        if let Some(next) = next {
-            pass(next);
-        }
-        TURN.notify_all();
+        hand_on(me, Turn::Done);
     }
 
     /// A thread panicked: every other leaves its run.
     pub fn abort() {
-        if let Some(b) = BATON.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            b.abort = true;
+        let threads = match baton().as_mut() {
+            Some(b) => {
+                b.abort = true;
+                b.threads.clone()
+            }
+            None => Vec::new(),
+        };
+        for t in threads.into_iter().flatten() {
+            t.unpark();
         }
-        TURN.notify_all();
     }
 
     pub struct Cpu {
@@ -617,12 +702,7 @@ pub mod vm {
                 match next {
                     None => return Ok((Exit::Shutdown, me as u32)),
                     Some(Next::Exit(exit)) => return Ok((exit, me as u32)),
-                    Some(Next::Switch(to)) => {
-                        if to != me {
-                            pass(to);
-                            wait_turn(me);
-                        }
-                    }
+                    Some(Next::Switch(to)) => switch_to(me, to),
                 }
             }
         }

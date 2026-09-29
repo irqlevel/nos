@@ -5,6 +5,7 @@
 //! and the MMIO window's absent pages, which read as all ones once mapped.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Mutex;
 
 use crate::{Error, Result, Vendor};
@@ -15,6 +16,29 @@ pub const MAX_GPA: u64 = 1 << 48;
 const MMIO_WINDOW: core::ops::Range<u64> = 0xC000_0000..0x1_0000_0000;
 const MAX_ABSENT_PAGES: usize = 64;
 pub const XAPIC_PAGE: u64 = 0xFEE0_0000;
+
+/// A page number's hash: one multiply. The map's default, SipHash, was what
+/// a run of the whole machine spent most on after the vCPUs' threads -- the
+/// loader and the devices reach memory a few bytes at a time -- and a page
+/// number needs no defence against a chosen key.
+#[derive(Default)]
+struct PageHash(u64);
+
+impl Hasher for PageHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x100_0000_01B3);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+type Pages = HashMap<u64, Box<[u8; PAGE as usize]>, BuildHasherDefault<PageHash>>;
 
 struct Region {
     base: u64,
@@ -29,13 +53,13 @@ impl Region {
 
 pub struct GuestMemory {
     regions: Vec<Region>,
-    pages: Mutex<HashMap<u64, Box<[u8; PAGE as usize]>>>,
+    pages: Mutex<Pages>,
     absent: Mutex<Vec<u64>>,
 }
 
 impl GuestMemory {
     pub fn new(_vendor: Vendor) -> Result<GuestMemory> {
-        Ok(GuestMemory { regions: Vec::new(), pages: Mutex::new(HashMap::new()), absent: Mutex::new(Vec::new()) })
+        Ok(GuestMemory { regions: Vec::new(), pages: Mutex::new(Pages::default()), absent: Mutex::new(Vec::new()) })
     }
 
     /// `size` bytes from 0: what the device targets run over.
