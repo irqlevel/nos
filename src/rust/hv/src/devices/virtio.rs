@@ -69,12 +69,25 @@ const USED_ELEM_SIZE: u64 = 8;
 const AVAIL_NO_INTERRUPT: u16 = 1;
 
 /// A driver's buffer, from a descriptor: where it is, how long, and whether
-/// the device writes it (or reads it).
+/// the device writes it (or reads it). Where it is is the guest's to say --
+/// up to the top of the address space and past it -- so it is reached only
+/// through `at`, which does the sum checked: `addr + offset` done by hand
+/// was a panic in a kernel that checks overflow and a wrap to page 0 in one
+/// that does not, for any guest that asked for either (hv-fuzz found it).
 #[derive(Clone, Copy)]
 pub struct Seg {
-    pub addr: u64,
+    addr: u64,
     pub len: u32,
     pub write: bool,
+}
+
+impl Seg {
+    /// The guest physical address `offset` bytes into the buffer: None at or
+    /// past its end, and past the end of the address space.
+    #[inline]
+    pub fn at(&self, offset: u64) -> Option<u64> {
+        if offset < u64::from(self.len) { self.addr.checked_add(offset) } else { None }
+    }
 }
 
 /// A ring the driver made that the device will not follow.

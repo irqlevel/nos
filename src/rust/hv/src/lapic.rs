@@ -679,9 +679,16 @@ impl Lapic {
 
     /// When the timer next runs out, host nanoseconds: what a halted CPU
     /// sleeps until at most. None with no interrupt to come -- stopped, run
-    /// out, or masked.
+    /// out, or masked -- and none for a periodic timer whose last period
+    /// still waits in the request register: `timer` hands over the next only
+    /// once that one is taken, which a CPU halted with it requested does not
+    /// do until something else wakes it -- the priorities holding it back,
+    /// say. Its deadline is in the past by then, and a halted CPU that slept
+    /// until it would not sleep at all: the loop spun, a host CPU's whole
+    /// time, for as long as the guest stayed so (hv-fuzz found it).
     pub fn next_timer_ns(&self) -> Option<u64> {
-        if self.lvt[LVT_TIMER] & LVT_MASKED != 0 {
+        let lvt = self.lvt[LVT_TIMER];
+        if lvt & LVT_MASKED != 0 || (lvt & TIMER_PERIODIC != 0 && test_bit(&self.irr, lvt as u8)) {
             return None;
         }
         self.timer.deadline

@@ -18,6 +18,7 @@ bin
 *.vmdk
 src/cpp/kernel/symtab_data.cpp
 src/rust/target/
+scripts/*/target/
 out/
 .claude/
 

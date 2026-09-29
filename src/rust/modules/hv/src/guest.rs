@@ -25,7 +25,7 @@ const CHUNK: usize = 64 * 1024;
 /// The default guest RAM, and the range it may be given in.
 const DEFAULT_MEM_MIB: u64 = 256;
 const MIN_MEM_MIB: u64 = 64;
-const MAX_MEM_MIB: u64 = 4096;
+const MAX_MEM_MIB: u64 = hv::run::MAX_MEM_BYTES / (1024 * 1024);
 /// The default command line of a guest of one CPU: the serial console, and
 /// no local APIC -- the 8259 and the PIT alone, as such a guest was always
 /// given. One of several CPUs needs its APIC, and gets the console alone.

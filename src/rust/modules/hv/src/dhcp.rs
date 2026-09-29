@@ -76,10 +76,14 @@ pub struct Network {
 }
 
 /// Whether a frame is a DHCP client's message -- UDP from port 68 to 67 --
-/// which is this server's to answer, and nobody else's to see.
+/// which is this server's to answer, and nobody else's to see. Any frame at
+/// all: the datagram parsed first, which checks the frame is long enough to
+/// hold one, and its EtherType read only then -- the other way round, a
+/// frame shorter than an Ethernet header was an index out of range, which
+/// only the switch's own check kept from happening (hv-fuzz found it).
 pub fn is_request(frame: &[u8]) -> bool {
-    eth::ether_type(frame) == ETH_TYPE_IP
-        && udp::parse(frame).is_some_and(|d| d.dst_port == SERVER_PORT && d.src_port == CLIENT_PORT)
+    udp::parse(frame).is_some_and(|d| d.dst_port == SERVER_PORT && d.src_port == CLIENT_PORT)
+        && eth::ether_type(frame) == ETH_TYPE_IP
 }
 
 /// What a message's options say: its type, the address asked for, and the

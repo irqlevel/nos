@@ -94,9 +94,15 @@ const NIC_IRQ: u8 = 10;
 /// Where a device's MSI-X table page is, for a guest of more than one CPU:
 /// this plus a page for its PCI slot -- in the platform's MMIO window, clear
 /// of the local APIC's page, the IO-APIC's address the MP table gives, and
-/// the page read of an absent device finds; and of the RAM of a guest of up
-/// to 4064 MiB. A guest of more is offered none.
+/// the page read of an absent device finds.
 const MSIX_PAGES: u32 = 0xFE00_0000;
+/// The most RAM a guest has: one region from 0, ending below the devices'
+/// pages -- the MSI-X tables', the IO-APIC's, the local APIC's. Past them it
+/// would cover them, and the guest would read and write its devices'
+/// registers as memory, none of them hearing of it: an APIC in xAPIC mode
+/// that is not there, with nothing to say so. More RAM than this is a hole
+/// below 4 GiB and RAM above it, as a PC has.
+pub const MAX_MEM_BYTES: u64 = MSIX_PAGES as u64;
 /// The MSI-X entries each kind of device offers: one for configuration
 /// changes and one a queue -- what Linux's virtio-pci asks for, a vector a
 /// queue.
@@ -572,7 +578,7 @@ impl LinuxGuest {
         -> Result<(Self, Vec<GuestCpu>)>
     {
         let n = cpus as usize;
-        if n == 0 || n > MAX_CPUS || doorbells.len() != n || (ioapic && n < 2) {
+        if n == 0 || n > MAX_CPUS || doorbells.len() != n || (ioapic && n < 2) || mem_bytes > MAX_MEM_BYTES {
             return Err(Error::BadAddress);
         }
         let x2apic = x2apic && !ioapic;
@@ -1981,19 +1987,15 @@ impl LinuxGuest {
 /// The MSI-X table page of the device in PCI slot `slot`, made guest memory:
 /// the page the function's BAR 1 names, where the guest writes its table
 /// and the device reads it. None for a guest with no APIC to take a
-/// message, or one whose RAM reaches that far.
+/// message. RAM never reaches it (`MAX_MEM_BYTES`).
 fn msix_page(memory: &mut GuestMemory, apic: bool, slot: usize) -> Result<Option<u32>> {
     if !apic {
         return Ok(None);
     }
     let Some(page) = u32::try_from(slot).ok().and_then(|s| s.checked_mul(pci::MSIX_PAGE))
         .and_then(|off| MSIX_PAGES.checked_add(off)) else { return Ok(None) };
-    match memory.add(u64::from(page), u64::from(pci::MSIX_PAGE)) {
-        Ok(()) => Ok(Some(page)),
-        /* RAM there already: a guest that large goes without. */
-        Err(Error::BadAddress) => Ok(None),
-        Err(e) => Err(e),
-    }
+    memory.add(u64::from(page), u64::from(pci::MSIX_PAGE))?;
+    Ok(Some(page))
 }
 
 /// The SCI's line on the 8259 as the PM registers have it now: requested

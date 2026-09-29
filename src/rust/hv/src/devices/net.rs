@@ -229,7 +229,9 @@ impl Net {
         let mut done = 0usize;
         for s in segs.iter().filter(|s| !s.write) {
             let n = s.len as usize;
-            if mem.read(s.addr, &mut self.tx_buf[done..done + n]).is_err() {
+            /* A buffer of no bytes has none to take, wherever it says it is. */
+            let Some(at) = s.at(0) else { continue };
+            if mem.read(at, &mut self.tx_buf[done..done + n]).is_err() {
                 self.stats.dropped += 1;
                 return;
             }
@@ -307,7 +309,8 @@ impl Net {
                 break;
             }
             let n = (total - done).min(s.len as usize);
-            if mem.write(s.addr, &self.rx_buf[done..done + n]).is_err() {
+            let Some(at) = s.at(0) else { continue };
+            if mem.write(at, &self.rx_buf[done..done + n]).is_err() {
                 self.stats.dropped += 1;
                 return 0;
             }
