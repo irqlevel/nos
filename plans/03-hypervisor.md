@@ -228,6 +228,17 @@ four, under AMD-V and VT-x alike -- and keep their APIC timers on the AX41
 and on an Intel host, where QEMU's TCG is sometimes too slow for Linux to
 trust one ([`docs/hypervisor.md`](../docs/hypervisor.md#more-than-one-cpu)).
 
+Then ACPI, which a distribution's kernel expects and a control plane needs
+to shut a guest down rather than pull its plug: every Linux guest is given
+the tables -- an XSDT, a FADT, a MADT, and a DSDT in AML with S5 and the PCI
+host bridge, through which a kernel with ACPI finds its PCI devices -- and
+the fixed hardware they describe, all on ports, so again no instruction
+decoder: the PM1 registers, the PM timer, the SCI on the 8259's IRQ 9, the
+reset register. `hv stop` presses the guest's power button and gives it time
+to turn itself off ([`docs/hypervisor.md`](../docs/hypervisor.md#acpi)). What
+the tables leave out is what would need MMIO -- the IO-APIC, the HPET, PCIe's
+ECAM -- and that is the decoder's to bring.
+
 ## Choose VMX vs SVM based on the dev environment
 
 This choice is driven by where you actually iterate:

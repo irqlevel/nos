@@ -30,6 +30,14 @@ answered once it is (`hv exec`), and one typed at its prompt; `hv send` and
 a running guest; and `rmmod` stopping that guest itself, with nothing left
 on for the next load to find.
 
+With --acpi -- a guest kernel with ACPI, the power button and evdev -- also
+that it takes the machine's ACPI tables: the boot finds the RSDP, the PM
+timer, the PCI host bridge and the power button, and says nothing of a
+firmware bug; its reboots go through the FADT's reset register; its SCI is
+the 8259's IRQ 9; and `hv stop` presses its power button, which busybox's
+acpid answers with a poweroff -- S5 -- while `rmmod` waits out a guest that
+hears the button and does nothing.
+
 Exit code 0 = every required marker appeared.
 """
 
@@ -74,6 +82,39 @@ SHELL_MARKERS = [
     r"BusyBox",
 ]
 
+# With --acpi: what the boot says of the tables it was given, in the order
+# it says it -- the RSDP where the loader put it, the FADT's PM timer, the
+# namespace up, S5 found, PIC mode, the host bridge the DSDT describes and
+# PCI's interrupts routed by its _PRT, the fixed power button, and the PM
+# timer a clocksource -- and what it must not say: nothing of a firmware
+# bug, and nothing of a register the tables gave it that did not work.
+ACPI_BOOT = [
+    r"ACPI: RSDP 0x00000000000E0000 000024 \(v02 NOS   \)",
+    r"ACPI: FACP 0x",
+    r"ACPI: DSDT 0x",
+    r"ACPI: FACS 0x",
+    r"ACPI: PM-Timer IO Port: 0x608",
+    r"ACPI: Interpreter enabled",
+    r"ACPI: PM: \(supports S0 S5\)",
+    r"ACPI: Using PIC for interrupt routing",
+    r"ACPI: PCI Root Bridge \[PCI0\] \(domain 0000 \[bus 00-ff\]\)",
+    r"PCI: Using ACPI for IRQ routing",
+    r"input: Power Button as ",
+    r"clocksource: acpi_pm: mask: 0xffffff",
+]
+ACPI_NEVER = [
+    r"ACPI (BIOS )?(Error|Warning)",
+    r"\[Firmware Bug\]",
+    r"setting ELCR",
+    r"PM-Timer (had inconsistent|failed consistency|running at invalid)",
+    # The clocksource watchdog, which has the PM timer to check the TSC
+    # against now: by the skew, or by a read-back it took too long for. (Not
+    # the bring-up's warp test, whose "TSCs unsynchronized" is the host's TSC
+    # and no business of ACPI's: TCG's differ between its CPUs.)
+    r"(clocksource 'tsc' as unstable|marking tsc unstable|TSC unstable due to clocksource watchdog)",
+    r"no GSI",
+]
+
 DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check"
 # A guest of more than one CPU needs its local APIC: the same, without
 # nolapic. (The loader adds noapic itself: the machine has no IO-APIC.)
@@ -116,6 +157,9 @@ def vm_commands(args):
     Each check is (command, occurrence, what, pattern, must): the output of
     the occurrence-th run of that line must (or must not) match."""
     c = cpus_opt(args)
+    # How the guest resets its machine: with ACPI, by the FADT's reset
+    # register first; without, by the 8042's reset line.
+    reset_by = r"0x06 to port 0xcf9" if args.acpi else r"0xfe to port 0x64"
     start0 = "hv start /bzImage mem=%d%s initrd=/initrd cmdline=%s" % (args.mem, c, args.cmdline)
     start1 = "hv start /bzImage mem=64%s cmdline=%s" % (c, args.cmdline)
     # Typed while vm 0 still boots: held until its shell asks for input,
@@ -166,20 +210,71 @@ def vm_commands(args):
             # of one core, whose execution units they would share.
             smp_checks.append(("hv list", 0, "its two CPUs are on two cores, not one core's two threads",
                                r"vm 0  running  cpus ([01],[23]|[23],[01])  ", True))
-    lines = ["hv help", start0, start1, "hv list", "hv stop 1", exec_early, exec_prompt] + smp_lines + [
+    # With ACPI, a guest whose power button busybox's acpid answers with a
+    # poweroff: its SCI and PM timer looked at, then stopped by hv stop,
+    # which presses the button and has it turn itself off.
+    acpi_lines = []
+    acpi_checks = []
+    if args.acpi:
+        # Its own words, in another order: a line that is start0's again
+        # would find start0's output.
+        start4 = "hv start /bzImage initrd=/initrd mem=%d%s cmdline=%s" % (args.mem, c, args.cmdline)
+        handler = "/etc/acpi/PWRF/00000080"
+        irq9 = "hv exec 4 grep -e acpi -e virtio /proc/interrupts"
+        clocks = "hv exec 4 cat /sys/devices/system/clocksource/clocksource0/available_clocksource"
+        acpi_lines = [start4, "hv exec 4 secs=%d mkdir -p /etc/acpi/PWRF" % args.vm_secs,
+                      "hv exec 4 echo '#!/bin/sh' > %s" % handler,
+                      "hv exec 4 echo 'poweroff -f' >> %s" % handler,
+                      "hv exec 4 chmod +x %s" % handler,
+                      "hv exec 4 acpid -l /acpid.log -p /acpid.pid", irq9, clocks, "hv stop 4"]
+        # And one that hears the button and has nothing to answer it: at its
+        # shell, so its kernel has the event enabled; stopped when its time
+        # is up, and saying so.
+        start5 = "hv start /bzImage initrd=/initrd mem=64%s cmdline=%s" % (c, args.cmdline)
+        acpi_lines += [start5, "hv exec 5 secs=%d id" % args.vm_secs, "hv stop 5 secs=5"]
+        acpi_checks = [
+            (start4, 0, "vm 4 starts, to be shut down by its power button", r"hv: vm 4 started on %s " % on, True),
+            (irq9, 0, "its SCI comes through the 8259, as IRQ 9", r"(?m)^\s*9:(\s+\d+)+\s+XT-PIC\s+acpi", True),
+            (clocks, 0, "the PM timer is one of its clocksources", r"acpi_pm", True),
+            ("hv stop 4", 0, "hv stop presses its power button, and acpid has it turn itself off",
+             r"hv: vm 4 stopped -- the guest powered itself off, S5 by its ACPI PM1 control register", True),
+            ("hv stop 4", 0, "the report: ACPI taken, the SCI raised, the power button pressed once",
+             r"acpi\s+taken by the guest's OS; [1-9]\d* SCIs, the power button pressed 1 times", True),
+            ("hv stop 5 secs=5", 0, "a guest that hears its power button and does nothing is stopped when its time is up",
+             r"hv: vm 5 stopped -- on request -- its power button went unanswered for 5 s", True),
+        ]
+    # vm 1, stopped mid-boot: a kernel without ACPI never hears its power
+    # button, and is stopped at once all the same; one with ACPI may have got
+    # as far as hearing it, and is stopped without asking.
+    stop1 = "hv stop 1 secs=0" if args.acpi else "hv stop 1"
+    stopped1 = (r"(?m)hv: vm 1 stopped -- on request\s*$" if args.acpi
+                else r"hv: vm 1 stopped -- on request -- nothing in it listens to its power button")
+    # After the reload, two guests at their shells stopped together: every
+    # power button pressed at once, and each guest's stop saying what became
+    # of its press -- a kernel with ACPI hears it and does nothing, one
+    # without never hears it.
+    start_a = "hv start /bzImage mem=64%s initrd=/initrd cmdline=%s" % (c, args.cmdline)
+    start_b = "hv start /bzImage mem=72%s initrd=/initrd cmdline=%s" % (c, args.cmdline)
+    stop_all = "hv stop all secs=3"
+    all_note = (r"its power button went unanswered for 3 s" if args.acpi
+                else r"nothing in it listens to its power button")
+    lines = ["hv help", start0, start1, "hv list", stop1, exec_early, exec_prompt] + smp_lines + [
              send, wait, "hv console 0 bytes=400", "hv list",
              start2, wait_reboot, wait_stop, "hv list",
              "hv restart 2", wait_stop2, "hv list", "hv stop 2",
-             start3, wait_loop, "hv list", "hv stop 3",
+             start3, wait_loop, "hv list", "hv stop 3"] + acpi_lines + [
              "hv restart 0", exec_again, "hv list",
-             "hv off", "rmmod hv", "insmod /hv.ko", "hv", "rmmod hv", RC_LOG]
+             "hv off", "rmmod hv", "insmod /hv.ko", "hv",
+             "hv on", start_a, start_b, "hv exec 0 secs=%d id" % args.vm_secs, "hv exec 1 secs=%d id" % args.vm_secs,
+             stop_all, "rmmod hv", RC_LOG]
+
     checks = [
         ("hv help", 0, "hv help lists the vm commands", r"hv exec <id>", True),
         (start0, 0, "vm 0 starts", r"hv: vm 0 started on %s " % on, True),
         (start1, 0, "vm 1 starts beside it", r"hv: vm 1 started on %s " % on, True),
         ("hv list", 0, "hv list shows vm 0 running", r"vm 0  running", True),
         ("hv list", 0, "hv list shows vm 1 running", r"vm 1  running", True),
-        ("hv stop 1", 0, "vm 1 stops on request, mid-boot", r"hv: vm 1 stopped -- on request", True),
+        (stop1, 0, "vm 1 stops on request, mid-boot", stopped1, True),
         (exec_early, 0, "a line typed during boot is answered at the prompt after it",
          r"# id\nuid=0 gid=0\n", True),
         (exec_early, 0, "... and nothing was left waiting", r"hv: vm 0: ", False),
@@ -192,7 +287,7 @@ def vm_commands(args):
         (start2, 0, "vm 2 starts, to panic and reboot", r"hv: vm 2 started on %s " % on, True),
         (wait_reboot, 0, "vm 2 panics and goes to reboot", r'hv: vm 2 printed "Rebooting in"', True),
         (wait_stop, 0, "its reset stops it, and says so",
-         r"hv: vm 2 stopped without printing .* -- the guest asked for a reset, 0xfe to port 0x64", True),
+         r"hv: vm 2 stopped without printing .* -- the guest asked for a reset, %s" % reset_by, True),
         ("hv list", 2, "hv list keeps it, stopped, with its reason",
          r"vm 2  stopped .* -- the guest asked for a reset", True),
         ("hv stop 2", 0, "hv stop takes it off the list", r"hv: vm 2 stopped -- the guest asked for a reset", True),
@@ -213,8 +308,11 @@ def vm_commands(args):
         (RC_LOG, 0, "vm 1's vCPU said how it ended", r"hv: vm 1 stopped after \d+ ms -- on request", True),
         (RC_LOG, 0, "rmmod stopped vm 0 itself, and only then turned the extension off",
          r"hv: vm 0 stopped for the unload -- on request[\s\S]*hv: unloaded, extension off for cpu mask", True),
+        (RC_LOG, 0, "and without asking it first", r"(?m)hv: vm 0 stopped for the unload -- on request\s*$", True),
         (RC_LOG, 0, "no unload left the extension on", r"hv: WARNING", False),
-    ] + smp_checks
+        (stop_all, 0, "hv stop all presses every button at once, and says what became of each press",
+         r"hv: vm 0 stopped -- on request -- %s[\s\S]*hv: vm 1 stopped -- on request -- %s" % (all_note, all_note), True),
+    ] + smp_checks + acpi_checks
     return lines, checks
 
 
@@ -267,6 +365,16 @@ def check_boot(args, txt):
     for m in args.expect:
         pt.check("the console shows: %s" % m, re.search(re.escape(m), block) is not None,
                  block[-1500:])
+    if args.acpi:
+        for m in ACPI_BOOT:
+            pt.check("the guest took its ACPI: %s" % m, re.search(m, block) is not None, block[-1500:])
+        if args.cpus > 1:
+            pt.check("and found its CPUs in the MADT",
+                     re.search(r"ACPI: APIC 0x[\s\S]*Using ACPI for processor \(LAPIC\) configuration", block) is not None,
+                     block[-1500:])
+        for m in ACPI_NEVER:
+            bad = re.search(r"(?m)^.*%s.*$" % m, block)
+            pt.check("and said nothing like: %s" % m, bad is None, bad.group(0) if bad else "")
     if args.cpus > 1:
         # Linux's own count, once it has started every CPU it was told of.
         pt.check("the guest brought up all %d of its CPUs" % args.cpus,
@@ -749,6 +857,10 @@ def main():
                     help="the guest's CPUs: with more than one, that it brings every one up, and that "
                          "each takes its timer's interrupts and IPIs (needs a guest kernel with SMP and "
                          "x2APIC; under TCG, QEMU 9.2 or later)")
+    ap.add_argument("--acpi", action="store_true",
+                    help="the guest kernel has ACPI (with its power button and evdev): check that it takes "
+                         "the machine's tables, reboots by the FADT's reset register, and shuts down when "
+                         "hv stop presses its power button")
     ap.add_argument("--mem", type=int, default=256, help="guest RAM in MiB")
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
     ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")

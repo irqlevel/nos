@@ -17,6 +17,13 @@
 //! guest again from its files or `hv stop` to end it; with `restart`, a guest
 //! that resets itself -- a reboot -- is booted again straight away.
 //!
+//! `stop` asks first: it presses the guest's power button, which a kernel
+//! with ACPI hears and a distribution's init answers by shutting down -- its
+//! services stopped, its disks unmounted -- and turning the machine off, and
+//! waits for that a while before it stops the guest where it is. A guest that
+//! does not listen to the button is stopped at once, and so is every guest
+//! when the module goes.
+//!
 //! A command never holds the table's lock while it waits: `stop` takes the
 //! VM off the table, and only then joins its task; `exec` and `wait` poll the
 //! console a lock at a time.
@@ -26,7 +33,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use hv::run::{Counts, Host};
 use hv::{Doorbells, Machine};
@@ -72,6 +79,18 @@ const ATTACH_POLL_MS: u64 = 20;
 const DETACH: u8 = 0x1D;
 /// Keys taken from the session at a time.
 const ATTACH_KEYS: usize = 256;
+/// How long `hv stop` gives a guest to turn itself off once its power
+/// button is pressed, unless told: long enough for a distribution's init to
+/// stop its services and unmount its disks.
+const STOP_DEFAULT_S: u64 = 30;
+/* The power button, as `hv stop` presses it and the first CPU's loop takes
+ * it: pressed, taken by the loop, and then whether the guest's OS heard it
+ * -- had the button's event enabled -- or not. */
+const BUTTON_UP: u8 = 0;
+const BUTTON_PRESSED: u8 = 1;
+const BUTTON_TAKEN: u8 = 2;
+const BUTTON_HEARD: u8 = 3;
+const BUTTON_UNHEARD: u8 = 4;
 /// Room for how a VM ended, taken before it is written.
 const REASON_BYTES: usize = 256;
 /// Room for what `hv start` says, beside the kernel's path and command line.
@@ -104,6 +123,8 @@ pub struct Shared {
     /// `hv restart`: boot the guest again -- the one running, or the one
     /// parked after it stopped.
     reset: AtomicBool,
+    /// Its power button: `BUTTON_UP` until `hv stop` presses it.
+    button: AtomicU8,
     /// Each of its CPUs' doorbell: what that CPU's task waits on while the
     /// CPU is halted, and what has it leave its guest when something comes
     /// for it while it runs, rather than at the host's next interrupt. The
@@ -155,6 +176,7 @@ impl Shared {
             id,
             stop: AtomicBool::new(false),
             reset: AtomicBool::new(false),
+            button: AtomicU8::new(BUTTON_UP),
             doorbells: Arc::new(Doorbells::new(cpus as usize)?),
             running: AtomicBool::new(true),
             restarts: AtomicU32::new(0),
@@ -190,6 +212,35 @@ impl Shared {
 
     fn running(&self) -> bool {
         self.running.load(Ordering::Acquire)
+    }
+
+    /// Press its power button, when it is running: the first CPU's loop
+    /// takes the press, woken to it now. Whether it was pressed.
+    fn press(&self) -> bool {
+        if !self.running() {
+            return false;
+        }
+        self.button.store(BUTTON_PRESSED, Ordering::Release);
+        self.wake_up();
+        true
+    }
+
+    /// Whether it is still to be waited for after a press: running, and
+    /// neither known deaf to the button nor never pressed.
+    fn shutting_down(&self) -> bool {
+        self.running()
+            && matches!(self.button.load(Ordering::Acquire), BUTTON_PRESSED | BUTTON_TAKEN | BUTTON_HEARD)
+    }
+
+    /// What became of `hv stop`'s press, just before the guest is stopped:
+    /// asked while it may still be running.
+    fn asked(&self, secs: u64) -> Asked {
+        match self.button.load(Ordering::Acquire) {
+            BUTTON_UP => Asked::Nothing,
+            _ if !self.running() => Asked::Nothing,
+            BUTTON_UNHEARD => Asked::Unheard,
+            _ => Asked::Unanswered(secs),
+        }
     }
 
     /// Something waits for the guest -- a frame, what a disk served, handed
@@ -271,6 +322,29 @@ impl Shared {
     }
 }
 
+/// What became of `hv stop`'s press of a guest's power button, as it adds
+/// to how the guest ended.
+#[derive(Clone, Copy)]
+enum Asked {
+    /// Not pressed -- `secs=0`, or the guest was not running -- or answered:
+    /// the guest stopped by itself, and how it ended says how.
+    Nothing,
+    /// Nothing in the guest listens to it: stopped at once.
+    Unheard,
+    /// It heard, and was still running after this many seconds.
+    Unanswered(u64),
+}
+
+impl core::fmt::Display for Asked {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Asked::Nothing => Ok(()),
+            Asked::Unheard => write!(f, " -- nothing in it listens to its power button"),
+            Asked::Unanswered(secs) => write!(f, " -- its power button went unanswered for {} s", secs),
+        }
+    }
+}
+
 impl Wake for Shared {
     fn wake(&self) {
         self.wake_up();
@@ -334,6 +408,19 @@ impl Host for VmHost {
             s.irq.store(counts.irq + counts.apic, Ordering::Relaxed);
             s.hlt.store(counts.hlt, Ordering::Relaxed);
         }
+    }
+
+    fn power_button(&self) -> bool {
+        /* Asked on every exit of the first CPU: a load, and the locked
+         * exchange only for a press. */
+        self.shared.button.load(Ordering::Relaxed) == BUTTON_PRESSED
+            && self.shared.button
+                .compare_exchange(BUTTON_PRESSED, BUTTON_TAKEN, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    fn power_button_heard(&self, heard: bool) {
+        self.shared.button.store(if heard { BUTTON_HEARD } else { BUTTON_UNHEARD }, Ordering::Release);
     }
 }
 
@@ -581,6 +668,28 @@ fn secs_option(rest: &str, default: u64) -> Result<(u64, &str), String> {
             _ => Err(alloc::format!("secs= must be 1..{}", WAIT_MAX_S)),
         },
         None => Ok((default, rest)),
+    }
+}
+
+/// `hv stop`'s `secs=N` after the VM's word: 0 -- stop it without asking --
+/// to `WAIT_MAX_S`, or `STOP_DEFAULT_S` when it is not there.
+fn stop_secs(rest: &str) -> Result<u64, String> {
+    let (word, tail) = after_word(rest);
+    if word.is_empty() {
+        return Ok(STOP_DEFAULT_S);
+    }
+    match word.strip_prefix("secs=").map(|v| v.parse::<u64>()) {
+        Some(Ok(s)) if s <= WAIT_MAX_S && tail.is_empty() => Ok(s),
+        _ => Err(alloc::format!("hv stop <id|all> [secs=0..{}]", WAIT_MAX_S)),
+    }
+}
+
+/// Wait until none of the guests `waiting` finds is still shutting down
+/// after its power button was pressed, or `secs` have gone by.
+fn wait_shut_down(secs: u64, mut waiting: impl FnMut() -> bool) {
+    let deadline = kcore::time::boot_time_ns().saturating_add(secs.saturating_mul(NS_PER_SEC));
+    while waiting() && kcore::time::boot_time_ns() < deadline {
+        kcore::task::sleep_ms(POLL_MS);
     }
 }
 
@@ -1232,18 +1341,28 @@ impl Vms {
         }
     }
 
-    /// `hv stop <id|all>`: stop it, wait for its vCPU, say how it ended, and
-    /// take it off the list.
+    /// `hv stop <id|all> [secs=N]`: take it off the list, press its power
+    /// button and give it `secs` to turn itself off; then stop it where it
+    /// is, if it is still running, wait for its vCPUs, and say how it ended.
+    /// One that does not listen to the button is stopped at once, and
+    /// `secs=0` stops it without asking.
     pub fn stop(&self, args: &str, out: &mut Output) {
-        let (word, _) = after_word(args);
+        let (word, rest) = after_word(args);
+        let secs = match stop_secs(rest) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(out, "{}", e);
+                return;
+            }
+        };
         if word == "all" {
-            self.stop_all(Some(out));
+            self.stop_all(Some(out), secs);
             return;
         }
         let id: u32 = match word.parse() {
             Ok(id) => id,
             Err(_) => {
-                let _ = writeln!(out, "hv stop <id|all>");
+                let _ = writeln!(out, "hv stop <id|all> [secs=N]");
                 return;
             }
         };
@@ -1259,18 +1378,36 @@ impl Vms {
         };
         let shared = vm.shared.clone();
         let port = vm.port;
+        if secs != 0 && shared.press() {
+            wait_shut_down(secs, || shared.shutting_down());
+        }
+        let asked = shared.asked(secs);
         finish(vm);
         self.release(port);
-        let _ = writeln!(out, "hv: vm {} stopped -- {}", id, *shared.reason.lock());
+        let _ = writeln!(out, "hv: vm {} stopped -- {}{}", id, *shared.reason.lock(), asked);
         out.write_bytes(shared.report.lock().as_bytes());
     }
 
     /// Stop every VM and take it off the list, saying how each ended -- to
-    /// `out`, or, with no one to say it to, to the kernel log.
-    pub fn stop_all(&self, mut out: Option<&mut Output>) {
-        /* Every stop flag first, so that the VMs stop together rather than
-         * one join at a time. */
-        for vm in &self.table.lock().vms {
+    /// `out`, or, with no one to say it to, to the kernel log: every power
+    /// button pressed at once and the guests given `secs` together to turn
+    /// themselves off, as `stop` gives one.
+    pub fn stop_all(&self, mut out: Option<&mut Output>, secs: u64) {
+        if secs != 0 {
+            let mut pressed = false;
+            for vm in &self.table.lock().vms {
+                pressed |= vm.shared.press();
+            }
+            if pressed {
+                wait_shut_down(secs, || self.table.lock().vms.iter().any(|vm| vm.shared.shutting_down()));
+            }
+        }
+        /* Then every stop flag, so that those left stop together rather than
+         * one join at a time -- and what became of each press noted first: a
+         * guest stopped says nothing of it. */
+        let mut asked = [(u32::MAX, Asked::Nothing); MAX_VMS];
+        for (note, vm) in asked.iter_mut().zip(self.table.lock().vms.iter()) {
+            *note = (vm.shared.id, vm.shared.asked(secs));
             vm.shared.stop.store(true, Ordering::Release);
             vm.shared.ring_all();
         }
@@ -1285,15 +1422,16 @@ impl Vms {
             };
             let shared = vm.shared.clone();
             let port = vm.port;
+            let asked = asked.iter().find(|(id, _)| *id == shared.id).map_or(Asked::Nothing, |&(_, a)| a);
             finish(vm);
             self.release(port);
             stopped += 1;
             let reason = shared.reason.lock();
             match out.as_deref_mut() {
                 Some(out) => {
-                    let _ = writeln!(out, "hv: vm {} stopped -- {}", shared.id, *reason);
+                    let _ = writeln!(out, "hv: vm {} stopped -- {}{}", shared.id, *reason, asked);
                 }
-                None => kcore::trace!(0, "hv: vm {} stopped for the unload -- {}", shared.id, *reason),
+                None => kcore::trace!(0, "hv: vm {} stopped for the unload -- {}{}", shared.id, *reason, asked),
             }
         }
         if stopped == 0 {
@@ -1307,7 +1445,11 @@ impl Vms {
     /// stops -- and then the switch goes, `hv0`'s sink detached.
     pub fn close(&self) {
         self.table.lock().closing = true;
-        self.stop_all(None);
+        /* Where they are, without asking: an unload is no place to wait on
+         * guests -- rmmod gives a module's exit five seconds before it goes
+         * on in the background -- and `hv stop all` first is the way to shut
+         * them down. */
+        self.stop_all(None, 0);
         let switch = self.switch.lock().take();
         drop(switch);
     }

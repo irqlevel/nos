@@ -21,7 +21,9 @@
 //! kernel with ACPI off (or none) reads the CPUs from -- each by its APIC ID
 //! -- and which says there is no IO-APIC it may use. Its interrupts come
 //! through the 8259 to the first CPU's LINT0, as the loader's `noapic` also
-//! tells the kernel.
+//! tells the kernel. A kernel with ACPI finds its CPUs in the MADT instead,
+//! among the tables the caller lays out in the BIOS area (`crate::acpi`):
+//! the zero page points at them, and the memory map reserves the area.
 
 use hvarch::{Error, Result};
 
@@ -125,12 +127,15 @@ const MP_ISA_BUS: u8 = 0;
 const ISA_IRQS: u8 = 16;
 const ISA_CASCADE: u8 = 2;
 
-/* boot_params: e820 map. */
+/* boot_params: where the ACPI RSDP is (protocol 2.14; padding to an older
+ * kernel, which scans the BIOS area for it), and the e820 map. */
+const BP_ACPI_RSDP_ADDR: usize = 0x070;
 const BP_E820_ENTRIES: usize = 0x1e8;
 const BP_E820_TABLE: usize = 0x2d0;
 const E820_ENTRY_BYTES: usize = 20;
 const E820_MAX_ENTRIES: usize = 128;
 const E820_RAM: u32 = 1;
+const E820_RESERVED: u32 = 2;
 
 /* Guest page-table entry bits. */
 const PTE_PRESENT: u64 = 1 << 0;
@@ -290,10 +295,21 @@ fn round_up(v: u64, to: u64) -> u64 {
     (v + to - 1) & !(to - 1)
 }
 
+/// Firmware's tables the caller has laid out below 1 MiB: where the ACPI
+/// RSDP is, and the range they take, which the memory map reserves.
+#[derive(Clone, Copy, Debug)]
+pub struct Firmware {
+    pub rsdp: u64,
+    pub start: u64,
+    pub end: u64,
+}
+
 /// Write the guest's furniture into its memory: the zero page from the
 /// header, the command line, the memory map, the identity page tables and
-/// the GDT. The kernel and the initrd are the module's to stream in, at the
-/// addresses `layout` names; everything here is small and goes in one call.
+/// the GDT -- and the MP table, for a guest of more than one CPU. The kernel
+/// and the initrd are the module's to stream in, at the addresses `layout`
+/// names, and the ACPI tables the caller's, where `firmware` says; the rest
+/// is small and goes in one call.
 pub fn build(
     memory: &GuestMemory,
     header: &Header,
@@ -301,6 +317,7 @@ pub fn build(
     layout: &Layout,
     cmdline: &[u8],
     cpus: u32,
+    firmware: Option<Firmware>,
 ) -> Result<()> {
     if cmdline.len() >= CMDLINE_MAX || cmdline.len() as u32 >= header.cmdline_size {
         return Err(Error::BadAddress);
@@ -323,7 +340,10 @@ pub fn build(
     memory.write(CMDLINE, cmdline)?;
     put8(memory, CMDLINE + cmdline.len() as u64, 0)?;
 
-    write_e820(memory, layout.mem_bytes)?;
+    if let Some(f) = firmware {
+        put64(memory, BOOT_PARAMS + BP_ACPI_RSDP_ADDR as u64, f.rsdp)?;
+    }
+    write_e820(memory, layout.mem_bytes, firmware)?;
     write_page_tables(memory)?;
     write_gdt(memory)?;
     /* A guest of one CPU has no APIC, and so no table of its CPUs. */
@@ -430,14 +450,22 @@ fn write_mp_table(m: &GuestMemory, cpus: u32) -> Result<()> {
 }
 
 /// The memory map the kernel reads instead of asking a BIOS: low RAM, the
-/// hole at 640 KiB, and the rest of RAM from 1 MiB up.
-fn write_e820(m: &GuestMemory, mem_bytes: u64) -> Result<()> {
+/// hole at 640 KiB -- in which the firmware's tables, when there are any,
+/// are reserved -- and the rest of RAM from 1 MiB up.
+fn write_e820(m: &GuestMemory, mem_bytes: u64, firmware: Option<Firmware>) -> Result<()> {
     const ONE_MIB: u64 = 0x10_0000;
 
-    let mut entries = [(0u64, 0u64, 0u32); 2];
+    let mut entries = [(0u64, 0u64, 0u32); 3];
     let mut n = 0;
     entries[n] = (0, LOW_TOP, E820_RAM);
     n += 1;
+    if let Some(f) = firmware {
+        if f.start < LOW_TOP || f.end > ONE_MIB || f.start >= f.end {
+            return Err(Error::BadAddress);
+        }
+        entries[n] = (f.start, f.end - f.start, E820_RESERVED);
+        n += 1;
+    }
     if mem_bytes > ONE_MIB {
         entries[n] = (ONE_MIB, mem_bytes - ONE_MIB, E820_RAM);
         n += 1;

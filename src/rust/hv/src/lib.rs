@@ -24,9 +24,9 @@
 //! memory behind a nested page table, a CPU under AMD-V or Intel VT-x, the
 //! exits decoded -- that runs the built-in guests of [`guests`]; and a PC
 //! for a Linux guest of one CPU or several ([`run`]), with the devices it
-//! boots with, a local APIC for each CPU ([`lapic`]), and what its CPUs
-//! reach each other by ([`smp`]). Arm's EL2 comes later, under the same
-//! names.
+//! boots with, a local APIC for each CPU ([`lapic`]), what its CPUs reach
+//! each other by ([`smp`]), and the ACPI tables that describe it (`acpi`).
+//! Arm's EL2 comes later, under the same names.
 
 extern crate alloc;
 
@@ -51,6 +51,8 @@ pub mod vmx;
 pub mod vm;
 #[cfg(target_arch = "x86_64")]
 pub mod linux;
+#[cfg(target_arch = "x86_64")]
+mod acpi;
 #[cfg(target_arch = "x86_64")]
 pub mod policy;
 #[cfg(target_arch = "x86_64")]

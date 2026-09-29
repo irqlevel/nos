@@ -30,8 +30,8 @@ const STATUS_A: u8 = 0x0A;
 const STATUS_B: u8 = 0x0B;
 const STATUS_C: u8 = 0x0C;
 const STATUS_D: u8 = 0x0D;
-/// Where a PC's CMOS keeps the century, as ACPI's FADT names it by default.
-const CENTURY: u8 = 0x32;
+/// Where a PC's CMOS keeps the century, as the FADT names it (`acpi`).
+pub const CENTURY: u8 = 0x32;
 
 /// Status A: the update-in-progress bit, which is kept clear here.
 const STATUS_A_UIP: u8 = 1 << 7;

@@ -22,9 +22,9 @@
 //!     hv boot /bzImage initrd=/initrd secs=60   -- a Linux guest, for a while
 //!     hv start /bzImage initrd=/initrd          -- one that runs until stopped
 //!     hv exec 0 uname -a                        -- a line typed at its shell
-//!     hv stop 0
+//!     hv stop 0        -- its power button pressed: it shuts down, or is stopped
 //!     hv off
-//!     rmmod hv         -- stops every guest still running first
+//!     rmmod hv         -- stops every guest still running first, where it is
 //!
 //! The built-in guests are a few bytes each (`hv::guests`); the Linux ones
 //! are x86-64 only, so far (`plans/03-hypervisor.md`).
@@ -86,7 +86,9 @@ hv wait <id> [secs=N] [boot=N] <text>
                                    with boot=N, once it has restarted N times --
                                    or it stops
 hv restart <id>                    boot it again from its files, running or stopped
-hv stop <id|all>                   stop it, say how it ended, take it off the list
+hv stop <id|all> [secs=N]          press its power button and give it secs (30) to turn
+                                   itself off, then stop it; say how it ended, take it off
+                                   the list -- secs=0 stops it without asking
 hv forward [add <port> <vm> <guest-port> | del <port>]
                                    a port of nos's relayed to a guest's (net guests)
 ";
