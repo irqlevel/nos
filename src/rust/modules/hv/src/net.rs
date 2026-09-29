@@ -11,6 +11,18 @@
 //! not come from there -- for a broadcast, a multicast or a MAC that is no
 //! port's.
 //!
+//! What a guest sends is checked where it comes in (`ingress`): it has to
+//! be IPv4 or ARP, sent as the guest on that port -- from the port's MAC,
+//! an IPv4 packet from the port's address, an ARP message with the port's
+//! MAC and address as its sender, or no address yet, as an ARP probe has.
+//! The one IPv4 packet with no address yet is a DHCP client's, which the
+//! switch answers and nothing past it sees. Anything else is dropped,
+//! counted. A guest sending as another could take that guest's flows through
+//! NAT, which answers a flow at the MAC its last packet came from, and tell
+//! `hv0` another's address was its own; and a protocol the switch carried
+//! without looking at it -- IPv6, which nothing of nos's speaks -- would be
+//! one where it could do both, the day something of nos's did.
+//!
 //! The switch is also the guests' way out: while it exists, NAT is on from
 //! `hv0` through the device nos's default route is on, so a guest reaches
 //! whatever nos can, from nos's address (`net/src/nat.rs`). And it answers
@@ -128,7 +140,10 @@ struct Port {
     /// `count`, readable without the lock: the vCPU looks every time round
     /// its loop, and takes the lock only when there is something.
     waiting: AtomicUsize,
+    /// Frames for the VM on the port that its inbox had no room for, and
+    /// frames it sent as another guest -- since it claimed the port.
     dropped: AtomicU64,
+    spoofed: AtomicU64,
 }
 
 /// The ports, shared by the switch, every guest's NIC and `hv0`'s sink.
@@ -142,6 +157,47 @@ pub struct Ports {
     dns: AtomicU32,
     /// DHCP messages answered.
     dhcp: AtomicU64,
+    /// Frames from the guests the switch does not carry: neither IPv4 nor
+    /// ARP, or too short to be.
+    foreign: AtomicU64,
+}
+
+/// What a frame a guest sent is, where it comes into the switch.
+enum Ingress {
+    /// IPv4 or ARP, sent as the guest on its port: on its way.
+    Own,
+    /// A DHCP client's request, from the port's address or none yet: the
+    /// switch's to answer, and nobody else's to see.
+    Dhcp,
+    /// Sent as another: another's MAC, or IPv4 or ARP from another's
+    /// address.
+    Spoofed,
+    /// Neither IPv4 nor ARP, or too short to be either.
+    Foreign,
+}
+
+/// What `frame`, from the guest on `port`, is. The ARP fields are read where
+/// the kernel's ARP table reads them, whatever the header says of their
+/// sizes.
+fn ingress(port: usize, frame: &[u8]) -> Ingress {
+    use netwire::{arp, eth, ip, ARP_LEN, ETH_HDR_LEN, ETH_TYPE_ARP, ETH_TYPE_IP, IP_HDR_LEN};
+    let Some(body) = frame.get(ETH_HDR_LEN..) else { return Ingress::Foreign };
+    let (mac, addr) = (port_mac(port), port_ip(port));
+    let own = match eth::ether_type(frame) {
+        ETH_TYPE_IP if body.len() >= IP_HDR_LEN => {
+            let src = ip::src(body);
+            if dhcp::is_request(frame) && (src == 0 || src == addr) {
+                return if eth::src(frame) == mac { Ingress::Dhcp } else { Ingress::Spoofed };
+            }
+            src == addr
+        }
+        ETH_TYPE_ARP if body.len() >= ARP_LEN => {
+            let sender = arp::sender_ip(body);
+            arp::sender_mac(body) == mac && (sender == 0 || sender == addr)
+        }
+        _ => return Ingress::Foreign,
+    };
+    if own && eth::src(frame) == mac { Ingress::Own } else { Ingress::Spoofed }
 }
 
 impl Ports {
@@ -171,16 +227,30 @@ impl Ports {
     }
 
     /// A frame to wherever its destination says, from port `from` -- or
-    /// from `hv0`, which a frame from there never goes back to. A guest's
-    /// DHCP message is answered here, and goes nowhere.
+    /// from `hv0`, which a frame from there never goes back to. What a guest
+    /// sends goes on only if it is its own; its DHCP message is answered
+    /// here, and goes nowhere.
     fn forward(&self, from: Option<usize>, frame: &[u8]) {
         if frame.len() < netwire::ETH_HDR_LEN {
             return;
         }
         if let Some(port) = from {
-            if dhcp::is_request(frame) {
-                self.answer_dhcp(port, frame);
-                return;
+            match ingress(port, frame) {
+                Ingress::Own => {}
+                Ingress::Dhcp => {
+                    self.answer_dhcp(port, frame);
+                    return;
+                }
+                Ingress::Spoofed => {
+                    if let Some(p) = self.ports.get(port) {
+                        p.spoofed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
+                Ingress::Foreign => {
+                    self.foreign.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
             }
         }
         let dst = &frame[..6];
@@ -301,11 +371,12 @@ impl Switch {
                 }),
                 waiting: AtomicUsize::new(0),
                 dropped: AtomicU64::new(0),
+                spoofed: AtomicU64::new(0),
             });
         }
         let ports = Arc::new(Ports {
             ports, vnic, to_host: AtomicU64::new(0), refused: AtomicU64::new(0),
-            dns: AtomicU32::new(0), dhcp: AtomicU64::new(0),
+            dns: AtomicU32::new(0), dhcp: AtomicU64::new(0), foreign: AtomicU64::new(0),
         });
         let nat = Mutex::new(None).ok_or_else(|| String::from("out of memory for the switch"))?;
         let uplink = vnic.attach(Arc::new(Uplink(ports.clone())))
@@ -371,6 +442,8 @@ impl Switch {
                 inbox.head = 0;
                 inbox.count = 0;
                 p.waiting.store(0, Ordering::Release);
+                p.dropped.store(0, Ordering::Relaxed);
+                p.spoofed.store(0, Ordering::Relaxed);
                 return Ok(i);
             }
             drop(inbox);
@@ -401,15 +474,18 @@ impl Switch {
         self.ports.vnic.nic()
     }
 
-    /// Frames a port's inbox had no room for.
-    pub fn dropped(&self, port: usize) -> u64 {
-        self.ports.ports.get(port).map_or(0, |p| p.dropped.load(Ordering::Relaxed))
+    /// Frames for the VM on a port that its inbox had no room for, and
+    /// frames it sent as another guest.
+    pub fn dropped(&self, port: usize) -> (u64, u64) {
+        self.ports.ports.get(port).map_or((0, 0), |p| {
+            (p.dropped.load(Ordering::Relaxed), p.spoofed.load(Ordering::Relaxed))
+        })
     }
 
-    /// What went to the host, what the host would not take, and the DHCP
-    /// messages answered.
-    pub fn host_counts(&self) -> (u64, u64, u64) {
+    /// What went to the host, what the host would not take, the DHCP
+    /// messages answered, and the frames of no protocol the switch carries.
+    pub fn host_counts(&self) -> (u64, u64, u64, u64) {
         (self.ports.to_host.load(Ordering::Relaxed), self.ports.refused.load(Ordering::Relaxed),
-         self.ports.dhcp.load(Ordering::Relaxed))
+         self.ports.dhcp.load(Ordering::Relaxed), self.ports.foreign.load(Ordering::Relaxed))
     }
 }

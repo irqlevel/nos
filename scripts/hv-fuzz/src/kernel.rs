@@ -41,6 +41,21 @@ pub mod time {
         now.saturating_add(ns).min(END)
     }
 
+    /// What the clock says, without the read costing time or counting as a
+    /// read: for the scheduler of the vCPUs' threads, which is no code of
+    /// the host's.
+    pub fn peek() -> u64 {
+        NOW.load(Ordering::Relaxed)
+    }
+
+    /// The clock moved on to `t`, if it is short of it.
+    pub fn reach(t: u64) {
+        let now = NOW.load(Ordering::Relaxed);
+        if t > now {
+            NOW.store(t.min(END), Ordering::Relaxed);
+        }
+    }
+
     pub fn boot_time_ns() -> u64 {
         let reads = IDLE_READS.with(|r| {
             r.set(r.get() + 1);
@@ -69,6 +84,7 @@ pub mod time {
         NOW.store(later(NOW.load(Ordering::Relaxed), ns), Ordering::Relaxed);
     }
 
+
     #[derive(Clone, Copy, Debug)]
     pub struct Duration(u64);
 
@@ -85,6 +101,7 @@ pub mod time {
 pub mod sync {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     thread_local! {
         /// The kernel's locks this thread holds.
@@ -135,32 +152,58 @@ pub mod sync {
         }
     }
 
-    /// What a vCPU's task waits on. There is one thread: a wait for a
-    /// signal that has not come is the time passing that it waits for.
+    /// The spin locks, as their users see them: `SpinLock::new` fallible
+    /// as the kernel's is, `IrqSpinLock::new` not; held, they count as the
+    /// kernel's locks.
+    pub struct SpinLock<T>(Mutex<T>);
+
+    impl<T> SpinLock<T> {
+        pub fn new(value: T) -> Option<SpinLock<T>> {
+            Mutex::new(value).map(SpinLock)
+        }
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            self.0.lock()
+        }
+    }
+
+    pub struct IrqSpinLock<T>(Mutex<T>);
+
+    impl<T> IrqSpinLock<T> {
+        pub const fn new(value: T) -> IrqSpinLock<T> {
+            IrqSpinLock(Mutex(std::sync::Mutex::new(value)))
+        }
+        pub fn lock(&self) -> MutexGuard<'_, T> {
+            self.0.lock()
+        }
+    }
+
+    /// What a vCPU's task waits on. A wait for a signal that has not come
+    /// is the others' turn (`vm::sleep_until`) and the time passing that it
+    /// waits for -- all of it the time passing, with one thread.
     pub struct Event {
-        signalled: AtomicBool,
+        signalled: Arc<AtomicBool>,
     }
 
     impl Event {
         pub fn new() -> Option<Event> {
-            Some(Event { signalled: AtomicBool::new(false) })
+            Some(Event { signalled: Arc::new(AtomicBool::new(false)) })
         }
         pub fn signal(&self) {
             self.signalled.store(true, Ordering::Relaxed);
         }
-        /// True when signalled; otherwise the other vCPUs run (`vm::sleep`)
-        /// and the time passes, and false unless one of them signalled it.
+        /// True when signalled; otherwise false, once the time has come.
         pub fn wait_for(&self, d: crate::time::Duration) -> bool {
             crate::time::progressed();
             invariant!(held() == 0, "a vCPU waits with {} of the kernel's locks held", held());
             if self.signalled.swap(false, Ordering::Relaxed) {
                 return true;
             }
-            crate::vm::sleep();
+            let until = crate::time::later(crate::time::peek(), d.as_nanos());
+            crate::vm::sleep_until(until, &self.signalled);
             if self.signalled.swap(false, Ordering::Relaxed) {
                 return true;
             }
-            crate::time::advance(d.as_nanos());
+            crate::time::reach(until);
             false
         }
         pub fn wait(&self) {
@@ -190,6 +233,19 @@ pub mod dma {
         }
         pub fn as_pod_mut<T: crate::pod::Pod>(&mut self) -> Option<&mut T> {
             None
+        }
+    }
+}
+
+/// A shell command's output, as the net crate's commands write theirs.
+pub mod cmd {
+    #[derive(Default)]
+    pub struct Output(pub String);
+
+    impl core::fmt::Write for Output {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0.push_str(s);
+            Ok(())
         }
     }
 }

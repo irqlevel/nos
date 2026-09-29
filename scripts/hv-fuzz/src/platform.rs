@@ -16,8 +16,8 @@
 //! shutdown, which ends the run.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::devices::blk;
 use crate::linux::{self, Header};
@@ -64,13 +64,14 @@ const REFUSED: [&[u8]; 4] = [&[0x8B, 0x27], &[0xA5], &[0x01, 0x07], &[0x0F, 0x0B
 struct HostState {
     input: Mutex<VecDeque<u8>>,
     button: AtomicBool,
-    /// Rounds of the loops since the guest was last entered: a guest that
-    /// sleeps for good is stopped by whoever runs it, here after a while.
-    idle: std::sync::atomic::AtomicU32,
+    /// When the guest was last entered: one that sleeps for good is stopped
+    /// by whoever runs it, here after a while.
+    last_entry: AtomicU64,
 }
 
-/// That many rounds with no entry, and the run is stopped.
-const IDLE_ROUNDS: u32 = 1000;
+/// That long with no entry, virtual time, and the run is stopped: longer
+/// than any timer a guest's script arms but the APIC's longest.
+const IDLE_NS: u64 = crate::consts::NS_PER_SEC;
 
 struct FuzzHost(Arc<HostState>);
 
@@ -80,7 +81,7 @@ impl Host for FuzzHost {
         self.0.input.lock().unwrap().pop_front()
     }
     fn stop_requested(&self) -> bool {
-        self.0.idle.fetch_add(1, Ordering::Relaxed) >= IDLE_ROUNDS
+        time::peek() > self.0.last_entry.load(Ordering::Relaxed).saturating_add(IDLE_NS)
     }
     fn power_button(&self) -> bool {
         self.0.button.swap(false, Ordering::Relaxed)
@@ -509,7 +510,7 @@ fn io_exit(v: &mut Backend, port: u16, size: u8, input: bool) -> Exit {
 
 impl vm::Guest for Script {
     fn next(&mut self, cpu: usize, v: &mut Backend, mem: &GuestMemory) -> Option<vm::Next> {
-        self.host.idle.store(0, Ordering::Relaxed);
+        self.host.last_entry.store(time::peek(), Ordering::Relaxed);
         self.me = cpu;
         if v.save().cr0 & 1 == 0 {
             /* Started by INIT and a start-up IPI, in real mode: its
@@ -794,40 +795,91 @@ fn header() -> (Header, Vec<u8>) {
 static ENDS: Mutex<std::collections::BTreeMap<String, (u64, u64)>> = Mutex::new(std::collections::BTreeMap::new());
 
 pub fn report() {
+    let runs: u64 = ENDS.lock().unwrap().values().map(|(n, _)| n).sum();
+    println!("  platform: {} runs, {} turns handed between threads, {} waits", runs,
+             vm::HANDOFFS.load(Ordering::Relaxed), vm::SLEEPS.load(Ordering::Relaxed));
     for (kind, (n, exits)) in ENDS.lock().unwrap().iter() {
         println!("  platform: {:>8} runs ended {:<12} {:>6} exits each", n, kind, exits / n.max(&1));
     }
 }
 
-/// Run each of the guest's CPUs on a thread of its own, the first first and
-/// then as the script passes the turn: their exits, all told. A panic on
-/// one has the others leave their runs, and is the run's.
-fn run_threads(guest: &LinuxGuest, vcpus: &mut [crate::run::GuestCpu], machine: &Machine, deadline: u64,
-               host: &FuzzHost) -> u64 {
-    vm::begin_threads(vcpus.len());
-    let results = std::thread::scope(|scope| {
-        let handles: Vec<_> = vcpus.iter_mut().enumerate().map(|(i, gc)| {
-            scope.spawn(move || {
-                vm::set_vcpu(i);
-                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    vm::wait_turn(i);
-                    guest.run(gc, machine, deadline, host).exits
-                }));
-                if ran.is_err() {
-                    vm::abort();
+/// A job for one of the threads a guest's CPUs run on: a CPU's run, its
+/// exits -- or its panic.
+type Job = Box<dyn FnOnce() -> u64 + Send>;
+type Ran = std::thread::Result<u64>;
+
+/// The threads a guest's CPUs run on, made once and kept: a run of several
+/// CPUs hands each thread a job, rather than making threads for it and
+/// joining them -- which, a run of four CPUs taking a tenth of a
+/// millisecond, was most of what the process spent.
+struct Pool {
+    workers: Vec<mpsc::Sender<Job>>,
+    done_tx: mpsc::Sender<Ran>,
+    done: mpsc::Receiver<Ran>,
+}
+
+impl Pool {
+    fn new() -> Pool {
+        let (done_tx, done) = mpsc::channel();
+        Pool { workers: Vec::new(), done_tx, done }
+    }
+
+    /// `jobs` run, a thread each: what each came to, in no order.
+    fn run(&mut self, jobs: Vec<Job>) -> Vec<Ran> {
+        while self.workers.len() < jobs.len() {
+            let (tx, rx) = mpsc::channel::<Job>();
+            let done = self.done_tx.clone();
+            std::thread::spawn(move || {
+                for job in rx {
+                    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    if done.send(ran).is_err() {
+                        break;
+                    }
                 }
-                vm::finished(i);
-                ran
-            })
-        }).collect();
-        handles.into_iter().map(|h| h.join()).collect::<Vec<_>>()
-    });
+            });
+            self.workers.push(tx);
+        }
+        let n = jobs.len();
+        for (worker, job) in self.workers.iter().zip(jobs) {
+            worker.send(job).expect("a worker thread to take its job");
+        }
+        (0..n).map(|_| self.done.recv().expect("a worker thread to answer")).collect()
+    }
+}
+
+thread_local! {
+    static POOL: std::cell::RefCell<Pool> = std::cell::RefCell::new(Pool::new());
+}
+
+/// Run each of the guest's CPUs on a thread of the pool, the first first and
+/// then as the turn passes: their exits, all told. A panic on one has the
+/// others leave their runs, and is the run's.
+fn run_threads(guest: &Arc<LinuxGuest>, vcpus: Vec<crate::run::GuestCpu>, machine: &Arc<Machine>, deadline: u64,
+               host: &Arc<FuzzHost>) -> u64 {
+    vm::begin_threads(vcpus.len());
+    let jobs: Vec<Job> = vcpus.into_iter().enumerate().map(|(i, mut gc)| {
+        let (guest, machine, host) = (guest.clone(), machine.clone(), host.clone());
+        Box::new(move || {
+            vm::set_vcpu(i);
+            time::progressed();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                vm::wait_turn(i);
+                guest.run(&mut gc, &machine, deadline, &*host).exits
+            }));
+            if ran.is_err() {
+                vm::abort();
+            }
+            vm::finished(i);
+            ran.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }) as Job
+    }).collect();
+    let results = POOL.with(|p| p.borrow_mut().run(jobs));
     vm::end_threads();
     let mut exits = 0;
     for ran in results {
         match ran {
-            Ok(Ok(n)) => exits += n,
-            Ok(Err(panic)) | Err(panic) => std::panic::resume_unwind(panic),
+            Ok(n) => exits += n,
+            Err(panic) => std::panic::resume_unwind(panic),
         }
     }
     exits
@@ -847,8 +899,12 @@ pub fn platform(r: &mut Input) {
     }
     let Ok((mut guest, mut vcpus)) = made else { return };
 
+    /* Disks: none, mostly, or one -- each takes its 2 MiB of request
+     * buffers when it is made, zeroed, which for a run of the whole machine
+     * is more than the rest of it; the disk has a target of its own, and a
+     * NIC drives the same interrupt paths for a sliver of the memory. */
     let mut disks = Vec::new();
-    for i in 0..r.below(3) {
+    for i in 0..r.pick(&[0u64, 0, 0, 0, 1, 1, 1, 2]) {
         let size = blk::SECTOR * (1 + r.below(1 << 16));
         let state = Arc::new(Mutex::new(DiskState::new(size, r.u8() < 32)));
         if guest.add_disk(Box::new(Disk(state.clone())), &format!("fuzz{}", i)).is_ok() {
@@ -856,7 +912,7 @@ pub fn platform(r: &mut Input) {
         }
     }
     let mut nics = Vec::new();
-    for i in 0..r.below(2) {
+    for i in 0..r.pick(&[0u64, 1, 1, 2]) {
         let state = Arc::new(Mutex::new(NicState::default()));
         if guest.add_nic(Box::new(Nic(state.clone())), [2, 0, 0, 0, 0x64, i as u8]).is_ok() {
             nics.push(state);
@@ -870,7 +926,7 @@ pub fn platform(r: &mut Input) {
     invariant!(guest.load(bsp, &h, &first, layout, &cmdline).is_ok(), "a plain kernel's load failed");
 
     let host = Arc::new(HostState { input: Mutex::new(VecDeque::new()), button: AtomicBool::new(false),
-                                    idle: std::sync::atomic::AtomicU32::new(0) });
+                                    last_entry: AtomicU64::new(time::peek()) });
     let devices = disks.len() + nics.len();
     let n = cpus as usize;
     let first_xapic = cpus > 1 && (!x2apic || ioapic);
@@ -891,12 +947,13 @@ pub fn platform(r: &mut Input) {
     };
     vm::set_guest(Some(Box::new(script)));
     let deadline = time::boot_time_ns() + 3600 * crate::consts::NS_PER_SEC;
-    let fuzz_host = FuzzHost(host.clone());
+    let fuzz_host = Arc::new(FuzzHost(host.clone()));
+    let (guest, machine) = (Arc::new(guest), Arc::new(machine));
     let exits = if n == 1 {
         vm::set_vcpu(0);
-        guest.run(&mut vcpus[0], &machine, deadline, &fuzz_host).exits
+        guest.run(&mut vcpus[0], &machine, deadline, &*fuzz_host).exits
     } else {
-        run_threads(&guest, &mut vcpus, &machine, deadline, &fuzz_host)
+        run_threads(&guest, vcpus, &machine, deadline, &fuzz_host)
     };
     vm::set_guest(None);
     let stopped = guest.take_stopped();

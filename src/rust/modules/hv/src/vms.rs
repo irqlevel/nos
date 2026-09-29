@@ -960,9 +960,13 @@ impl Vms {
             if let Some(port) = vm.port {
                 let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
             }
-            let dropped = vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.dropped(p))).unwrap_or(0);
+            let (dropped, spoofed) =
+                vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.dropped(p))).unwrap_or((0, 0));
             if dropped != 0 {
                 let _ = write!(out, "  {} frames dropped for it", dropped);
+            }
+            if spoofed != 0 {
+                let _ = write!(out, "  {} frames it sent as another guest, dropped", spoofed);
             }
             let restarts = s.restarts.load(Ordering::Relaxed);
             if restarts != 0 {
@@ -978,9 +982,10 @@ impl Vms {
         }
         drop(table);
         if let Some(s) = self.switch.lock().as_ref() {
-            let (to_host, refused, dhcp) = s.host_counts();
-            let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take, {} DHCP answers",
-                             net::dotted(net::HOST_IP), to_host, refused, dhcp);
+            let (to_host, refused, dhcp, foreign) = s.host_counts();
+            let _ = writeln!(out, "hv0 {}/24: {} frames from the guests to nos, {} it would not take, {} DHCP answers, \
+                                   {} neither IPv4 nor ARP (dropped)",
+                             net::dotted(net::HOST_IP), to_host, refused, dhcp, foreign);
             match s.nat_address() {
                 Some(ip) => {
                     let _ = writeln!(out, "the guests go out through NAT, from {} (nos's nat command)", net::dotted(ip));

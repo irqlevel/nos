@@ -727,7 +727,21 @@ def network(args):
                x(0, "wget -q -O - http://10.0.2.2:%d/big | md5sum" % web, 600),
                x(0, "kill $(cat /busy.pid); echo idle"),
                "hv list",
-               x(0, "grep virtio /proc/interrupts")]
+               x(0, "grep virtio /proc/interrupts"),
+               # A guest sending as another is stopped at its port: the first
+               # claims the second's address -- ARP asked from it, a ping
+               # from it -- which, let through, would teach nos's ARP table
+               # the address is the first's, and hand it the second's
+               # traffic. nos, which answers both, must hear neither. (Its
+               # table is no steady witness: in a control run with the check
+               # taken out of the switch, the second's own ARP put it right
+               # again before `arp` could show it -- and in another did not,
+               # and the fetch through `hv forward`, which the test makes
+               # after all of this, reached the first guest instead of the
+               # second's httpd.)
+               x(0, "ip addr add 10.0.100.3/32 dev eth0 && arping -c 2 -w 3 -I eth0 -s 10.0.100.3 10.0.100.1; "
+                    "ping -c 2 -W 2 -I 10.0.100.3 10.0.100.1; ip addr del 10.0.100.3/32 dev eth0; echo claimed"),
+               "hv list"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -807,8 +821,18 @@ def network(args):
         vm0 = vm0.group(0) if vm0 else ""
         kicks = re.search(r"kicks (\d+)", vm0)
         pt.check("kicked out of its guest to take the frames, its port dropped none",
-                 kicks is not None and int(kicks.group(1)) > 0 and "dropped" not in vm0, vm0)
+                 kicks is not None and int(kicks.group(1)) > 0 and "frames dropped for it" not in vm0, vm0)
         pt.check(*interrupt_check(args, way(14), "input"))
+        claim = way(15)
+        pt.check("a guest that claims another's address, ARP and IPv4, gets nothing back: nos heard none of it",
+                 "claimed" in claim and re.search(r"Received 0 response", claim) is not None
+                 and re.search(r"2 packets transmitted, 0 packets received", claim) is not None, claim[-800:])
+        vm0 = re.search(r"(?m)^vm 0 .*$", way(16))
+        vm1 = re.search(r"(?m)^vm 1 .*$", way(16))
+        spoofed = re.search(r"(\d+) frames it sent as another guest", vm0.group(0) if vm0 else "")
+        pt.check("hv list counts what the switch stopped against the guest that sent it, and only that guest",
+                 spoofed is not None and int(spoofed.group(1)) >= 4
+                 and vm1 is not None and "as another" not in vm1.group(0), way(16)[-800:])
     finally:
         server.shutdown()
         pt.kill(p)

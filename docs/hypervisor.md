@@ -1249,6 +1249,22 @@ a halted guest waits on its VM's event, until its timer's next edge or
 something for it -- a frame, a key typed at `hv attach` or `hv send` --
 whichever comes first (`Event::WaitFor`, [the scheduler](scheduler.md#blocking-and-waking)).
 
+**What a guest sends has to be its own.** A frame is checked where it comes
+in at a port (`ingress`), as a cloud's virtual switch checks it: IPv4 or ARP
+-- nothing of nos's speaks anything else, and nothing the switch cannot
+check goes through it -- from the port's MAC; an IPv4 packet from the
+port's address; an ARP message with the port's MAC as its sender's, and
+the port's address as its sender's or none yet, as a probe has. The one
+IPv4 packet with no address yet is a DHCP client's, which the switch
+answers itself. The rest is dropped: a frame sent as another guest counted
+against the guest that sent it in `hv list`, one of another protocol --
+IPv6, which every Linux sends at boot -- on `hv0`'s line. Without it a guest
+could take another's flows through NAT, which answers a flow at the MAC its
+last packet came from -- one packet with the other's address and the flow's
+ports was enough -- and tell `hv0`'s ARP table another's address was its
+own. `hv-fuzz`'s `guestnet` target found that
+([testing](testing.md#hv-fuzzpy----everything-a-guest-reaches-fuzzed)).
+
 **A guest that is running is kicked out of it.** Its turn ends when its
 CPU takes an interrupt, and the device model hands frames over only between
 turns, so a frame for a busy guest used to wait for the host's next tick --
