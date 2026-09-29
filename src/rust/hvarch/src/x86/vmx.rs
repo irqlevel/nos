@@ -795,6 +795,12 @@ pub struct Guest {
     /// A VMLAUNCH that failed outright (VMfail), with the instruction error.
     vm_instruction_error: u32,
     entry_failed: bool,
+    /// The shadow holds the whole of the guest's state: its control
+    /// registers, segments and descriptor tables too, which an exit that
+    /// does not end a guest leaves in the VMCS ([`read_guest_heavy`]) -- as
+    /// they are before the first entry, and after the policy has set them
+    /// all ([`mark_full_sync`]).
+    whole_state: bool,
     /// Where each entry's time goes, while a benchmark asks.
     profile: Option<Profile>,
 }
@@ -878,6 +884,7 @@ impl Guest {
             exit_cs_ar: 0,
             vm_instruction_error: 0,
             entry_failed: false,
+            whole_state: true,
             profile: None,
         })
     }
@@ -921,6 +928,7 @@ impl Guest {
     /// rest of the shadow is stale by then, and would overwrite the guest.
     pub fn mark_full_sync(&mut self) {
         self.full_sync = true;
+        self.whole_state = true;
     }
 
     /// Set the guest's RSP, which the guest otherwise keeps in the VMCS
@@ -1378,9 +1386,10 @@ impl Guest {
     }
 
     /// The control registers and segments, into the shadow, for a report: read
-    /// while the VMCS is still current, on the exits that end a guest. After
-    /// this the shadow holds the whole guest state, as it did every exit
-    /// before the sync was made lazy.
+    /// while the VMCS is still current, on the exits that end a guest, or
+    /// after one for a report ([`read_whole_state`]). After this the shadow
+    /// holds the whole guest state, as it did every exit before the sync was
+    /// made lazy.
     unsafe fn read_guest_heavy(&mut self) {
         use vmcs::*;
         let s = &mut self.save;
@@ -1414,11 +1423,81 @@ impl Guest {
         }
         self.synced.fs_base = s.fs.base;
         self.synced.gs_base = s.gs.base;
+        self.whole_state = true;
+    }
+
+    /// What performing the instruction an EPT violation faulted at takes,
+    /// into the shadow: CR0 as the guest reads it, CR3 and CR4, to walk its
+    /// paging to the instruction; CS's rights, for the mode it is decoded
+    /// in, and CS's base where the CPU adds it -- outside 64-bit code; RSP,
+    /// the one register an instruction may name that the guest keeps in the
+    /// VMCS; and the CPL, SS's DPL. EFER the shadow has already: the guest
+    /// changes it only by a `wrmsr` the policy answers, and LMA only with a
+    /// CR0.PG that exits.
+    ///
+    /// Not the whole heavy state: that is forty-odd fields, and under a
+    /// nested KVM most of them -- the selectors, the limits, most segments'
+    /// rights, GDTR, IDTR, EFER -- are not in the shadow VMCS it keeps, so
+    /// each is an exit to it; the control registers, RSP and CS's and SS's
+    /// rights are. Read whole, an MMIO access cost five CPUID exits on
+    /// nested VT-x. A fault that ends the guest has the rest read for its
+    /// report ([`read_whole_state`]).
+    unsafe fn read_guest_fault(&mut self) {
+        use vmcs::*;
+        let mask = self.cr0_mask;
+        let s = &mut self.save;
+        unsafe {
+            s.rsp = vmread(GUEST_RSP);
+            s.cr0 = (vmread(GUEST_CR0) & !mask) | (vmread(CR0_READ_SHADOW) & mask);
+            s.cr3 = vmread(GUEST_CR3);
+            s.cr4 = vmread(GUEST_CR4) & !CR4_VMXE_BIT;
+            s.cs.attrib = attrib_from_ar(vmread(GUEST_CS_AR) as u32);
+            s.cpl = ((vmread(GUEST_SS_AR) >> 5) & 0x3) as u8;
+            if s.efer & EFER_LMA == 0 || s.cs.attrib & super::svm::vmcb::attrib::L == 0 {
+                s.cs.base = vmread(GUEST_CS_BASE);
+            }
+        }
+    }
+
+    /// Read the rest of the guest's state into the shadow, for a report of
+    /// the exit it last made -- the control registers, segments and
+    /// descriptor tables an exit that does not end a guest leaves in the
+    /// VMCS -- if its VMCS is still current on this CPU: it is, unless
+    /// another guest's was loaded over it since the exit, or the task has
+    /// moved. Nothing has entered the guest since, so the VMCS holds that
+    /// exit's state still. False if it could not be read, the shadow's
+    /// older values left as they were, for the report to say so rather
+    /// than show them as the guest's.
+    pub fn read_whole_state(&mut self) -> bool {
+        if self.whole_state {
+            return true;
+        }
+        let flags = kcore::cpu::irq_save();
+        /* With interrupts off, what is current here cannot change under the
+         * check: the VMPTRLD in `run`, a VMCLEAR (`evict_here`, an IPI) and
+         * VMXOFF (`disable`, an IPI) all run on this CPU with them off. */
+        let cpu = kcore::cpu::id() as usize;
+        let phys = self.vmcs.phys();
+        let current = enabled()
+            && CURRENT_VMCS.get(cpu).is_some_and(|c| c.load(Ordering::Acquire) == phys);
+        if current {
+            unsafe { self.read_guest_heavy() };
+        }
+        unsafe { kcore::cpu::irq_restore(flags) };
+        current
+    }
+
+    /// Whether the shadow holds the whole guest state ([`read_whole_state`]),
+    /// or only what its last exit's handling reads.
+    pub fn whole_state(&self) -> bool {
+        self.whole_state
     }
 
     /// Whether an exit ends the guest -- one the policy will dump, so the
     /// heavy state is worth reading. The common exits (I/O, CPUID, MSR, HLT,
-    /// the host's interrupt, an interrupt window) are not among them.
+    /// the host's interrupt, an interrupt window) are not among them, nor an
+    /// EPT violation, which is mostly an MMIO access performed for the guest
+    /// and reads what that takes ([`read_guest_fault`]).
     fn exit_is_stopping(&self) -> bool {
         use vmcs::reason as r;
         if self.exit_reason & vmcs::reason::ENTRY_FAILURE != 0 {
@@ -1437,7 +1516,7 @@ impl Guest {
             r::IO_INSTRUCTION | r::CPUID | r::RDMSR | r::WRMSR
                 | r::EXTERNAL_INTERRUPT | r::INIT | r::SIPI | r::NMI_WINDOW
                 | r::INTERRUPT_WINDOW | r::VMCALL | r::PAUSE | r::RDTSC | r::RDPMC
-                | r::CR_ACCESS
+                | r::CR_ACCESS | r::EPT_VIOLATION
         )
     }
 
@@ -1762,9 +1841,13 @@ impl Guest {
                 self.read_stored_kernel_gs_base();
                 /* The control registers and segments only when the exit is
                  * one that ends and dumps the guest -- the VMCS is current
-                 * here (it stays current after the exit). */
+                 * here (it stays current after the exit); an EPT violation
+                 * what performing its instruction takes. */
+                self.whole_state = false;
                 if self.exit_is_stopping() {
                     unsafe { self.read_guest_heavy() };
+                } else if self.exit_reason & vmcs::reason::BASIC_MASK == vmcs::reason::EPT_VIOLATION {
+                    unsafe { self.read_guest_fault() };
                 }
                 /* A machine check taken while the guest ran is the host's,
                  * and the CPU did not deliver it: raise it, as the AMD side

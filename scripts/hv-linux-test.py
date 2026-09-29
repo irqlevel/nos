@@ -147,8 +147,9 @@ def interrupt_check(args, text, queue):
 
 
 def cpus_opt(args):
-    """`cpus=N` for a guest of N CPUs, or nothing for one."""
-    return " cpus=%d" % args.cpus if args.cpus > 1 else ""
+    """`cpus=N` for a guest of N CPUs, or nothing for one; and `xapic` for a
+    guest whose local APICs come out of reset in xAPIC mode."""
+    return (" cpus=%d" % args.cpus if args.cpus > 1 else "") + (" xapic" if args.xapic else "")
 
 
 def vm_commands(args):
@@ -375,6 +376,12 @@ def check_boot(args, txt):
         for m in ACPI_NEVER:
             bad = re.search(r"(?m)^.*%s.*$" % m, block)
             pt.check("and said nothing like: %s" % m, bad is None, bad.group(0) if bad else "")
+    if args.cpus > 1 and (args.xapic or "nox2apic" in args.cmdline.split()):
+        # Its local APICs in xAPIC mode -- left there by firmware, or taken
+        # there by the kernel -- and every access of theirs a nested fault
+        # on the page, decoded and performed.
+        pt.check("its local APICs were reached through the xAPIC page, each access decoded and performed",
+                 re.search(r"mmio\s+[1-9]\d* accesses performed", txt) is not None, txt[-2500:])
     if args.cpus > 1:
         # Linux's own count, once it has started every CPU it was told of.
         pt.check("the guest brought up all %d of its CPUs" % args.cpus,
@@ -861,6 +868,9 @@ def main():
                     help="the guest kernel has ACPI (with its power button and evdev): check that it takes "
                          "the machine's tables, reboots by the FADT's reset register, and shuts down when "
                          "hv stop presses its power button")
+    ap.add_argument("--xapic", action="store_true",
+                    help="the guest's local APICs out of reset in xAPIC mode (hv's `xapic`): every access of "
+                         "theirs through the page, each instruction decoded and performed by the hypervisor")
     ap.add_argument("--mem", type=int, default=256, help="guest RAM in MiB")
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
     ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")

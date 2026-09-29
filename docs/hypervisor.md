@@ -230,7 +230,14 @@ flags, and FS/GS base, which it *does* change through an intercepted `wrmsr`
 (the per-CPU base, as this kernel keeps its own) as well as un-intercepted.
 The control registers and segments are read only when a guest is being
 stopped and dumped. A full sync every exit was ten times the work, and
-turned a real distribution's boot from seconds into minutes.
+turned a real distribution's boot from seconds into minutes. An EPT
+violation, which is mostly an MMIO access performed for the guest
+([MMIO](#mmio)), reads what performing it takes and no more: CR0, CR3 and
+CR4 for the walk to its instruction, CS's rights for the mode (and CS's
+base outside 64-bit code), RSP, the CPL. One that ends the guest after all
+has the rest read for its report while the VMCS is still current on that
+CPU (`Guest::read_whole_state`), and a report that could not read it says
+so, rather than show the shadow's older values as the guest's.
 
 And within the light set it is *dirty-tracked*: `Guest` keeps what the VMCS
 last had of each field it may write between entries (`Synced`) and writes
@@ -441,12 +448,12 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU --
                                 on cpus of them, each on a host CPU of its
                                 own -- for secs, then print its console and
                                 how it ended
-    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -849,7 +856,7 @@ read of each of `pages` pages 4 KiB apart -- on a task bound to one CPU, and
 times it:
 
 ```
-hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]
+hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile] [mmio]
 ```
 
 `flush` makes every entry flush the whole TLB, as every entry did before
@@ -918,6 +925,33 @@ not this code's; of the 12 `vmwrite`s and 14 `vmread`s an exit, 4,700 and
 1,500 ns before the dirty tracking, 73 ns are left. On real Intel silicon
 the same instructions are tens of cycles each, so the shape of the gain is
 the same and its size smaller: measured there is what is left to do.
+
+`mmio` has the guest make MMIO loads instead -- `mov eax, [rdi]` from a
+device's page in the MMIO window, each a nested fault whose instruction the
+host walks to, fetches, decodes and performs ([MMIO](#mmio)) -- and with
+`profile` says what of an exit the access itself took. Under nested KVM,
+2026-09-29, 200,000 of each on one CPU (the access's share from a run of
+20,000 under `profile`):
+
+| | a CPUID exit | an MMIO load | the access itself |
+|---|---|---|---|
+| AX41 (Zen 2, AMD-V) | 10.3 µs | 11.7 µs | 1.1 µs |
+| rserver (i5-13500, VT-x) | 5.8 µs | 8.7 µs | 2.4 µs |
+| rserver, the whole guest state read at every EPT violation | 5.8 µs | 30.8 µs | |
+
+The last line is the first measurement, and why an EPT violation now reads
+only what performing an access takes ([The VMX
+backend](#the-vmx-backend-and-where-it-differs-from-amd-v)): of the
+forty-odd fields a report wants, most are ones a nested KVM keeps out of
+the shadow VMCS it gives L1, each an exit to it, and 25 µs of every access
+went there. What is left above a CPUID exit is L0's longer way through a
+nested fault (0.3 µs under VT-x, none to measure under AMD-V) and the
+access itself -- three reads of the guest's page tables (the bench's code
+is on a 2 MiB page; four for a 4 KiB one) and one of its instruction, each
+a copy through the frame window with a mapping of its own made and
+dropped, and the decoding, which is a few dozen branches. On
+the silicon all of it is shorter; the copies are where to look if an
+MMIO-heavy guest makes it matter.
 
 ## arm64
 
@@ -1588,9 +1622,9 @@ Scope (\_SB)
 }
 ```
 
-What is left out is what would need MMIO -- the IO-APIC, the HPET, PCIe's
-ECAM, whose absence Linux names in the line above -- and what a guest does
-without: processor objects (there are no C- or P-states to describe), the
+What is left out is MMIO this does not emulate yet ([MMIO](#mmio)) -- the
+IO-APIC, the HPET, PCIe's ECAM, whose absence Linux names in the line above
+-- and what a guest does without: processor objects (there are no C- or P-states to describe), the
 ISA devices (a kernel finds a PC's serial port, RTC and timer where they
 always are), GPEs, and any sleep state but S5. A guest of one CPU gets no
 MADT: it has no APIC.
@@ -1840,17 +1874,19 @@ table.
 
 ### The machine it sees
 
-**A local APIC for every CPU, and only as an x2APIC** (`hv::lapic`). The
-xAPIC is a page of MMIO at 0xFEE00000, and emulating MMIO means decoding the
-instruction that touched it -- the instruction emulator this hypervisor
-exists without ([the plan](../plans/03-hypervisor.md)'s rule). The x2APIC is
-the same registers as MSRs 0x800-0x8FF, and an MSR access is an exit whose
-register and value the CPU hands over. So the APIC comes out of reset with
-x2APIC mode already on, `IA32_APIC_BASE` saying EN and EXTD, as firmware
-leaves it on a machine with more than 255 CPUs, and a guest never has to
-touch the page. The nested table never maps it: a guest that reaches for it
-anyway, or turns x2APIC mode off to use it, is stopped and told why rather
-than answered wrongly. The boot CPU's APIC starts in virtual-wire mode, with
+**A local APIC for every CPU, as an x2APIC unless told** (`hv::lapic`).
+The x2APIC is its registers as MSRs 0x800-0x8FF, and an MSR access is an
+exit whose register and value the CPU hands over; the xAPIC is the same
+registers as a page of MMIO at 0xFEE00000, each access a nested fault whose
+instruction has to be decoded ([MMIO](#mmio)). So the APIC comes out of
+reset with x2APIC mode already on, `IA32_APIC_BASE` saying EN and EXTD, as
+firmware leaves it on a machine with more than 255 CPUs, and a kernel that
+keeps it never touches the page -- or, with `xapic`, in xAPIC mode, as most
+PCs' firmware leaves it. A kernel may move between the modes as the
+architecture allows -- off and back, as `nox2apic` has Linux do -- and the
+APIC answers in the mode it is in. The nested table never maps the page: a
+guest that reaches for it in x2APIC mode, when it is none of the APIC's, is
+stopped and told why rather than answered wrongly. The boot CPU's APIC starts in virtual-wire mode, with
 the spurious-vector register enabled, LINT0 ExtINT and LINT1 NMI, as
 firmware hands it over. What the model has is the register file and what
 each register does to the others: the ID and the logical ID made from it
@@ -2110,9 +2146,8 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
   at worst. The owed periods keep the count right on average, and PAUSE
   exits keep a spinning CPU prompt; a CPU computing with no exit at all
   gets its ticks in bursts of up to 10 ms.
-- **No xAPIC, no TSC-deadline timer.** A kernel built with neither
-  `X86_MPPARSE` nor ACPI finds one CPU; one told `nox2apic` is stopped at
-  the page.
+- **No TSC-deadline timer.** A kernel built with neither `X86_MPPARSE` nor
+  ACPI finds one CPU.
 
 ### Gates
 
@@ -2133,6 +2168,94 @@ is the two CR0 writes the policy emulates.
   `--net` and `--attach` take `--cpus` too. The guest kernel needs what is
   above, plus POSIX timers for BusyBox's `ping`, which paces itself with
   `alarm()` (a tinyconfig leaves them out).
+
+## MMIO
+
+A device whose registers are memory -- the xAPIC's page first, and next the
+IO-APIC's, the HPET's, a PCIe function's BARs -- is reached by instructions
+that fault on a page the nested table does not map, and the exit says where
+and whether it wrote: not the register, not the size, not the value, not the
+instruction's length. So a device like that is emulated by decoding the
+instruction, which is three pieces here, none with any `unsafe`:
+
+- **The walk** (`hv::walk`): the guest's RIP to a guest physical address by
+  its own paging -- long mode's four or five levels and their 1 GiB and
+  2 MiB pages, or none -- and the instruction's up to fifteen bytes read from
+  guest RAM a page at a time: an instruction may cross into a page mapped
+  elsewhere, or not at all. The permissions are not checked: the CPU fetched
+  the instruction already, and faulted on its data.
+- **The decoder** (`hv::insn`): what Linux's MMIO accessors are. `readl`,
+  `writel` and their kind are `mov`s in inline assembly -- a register loaded
+  from memory or stored to it, an immediate stored, and `movzx`/`movsx` for
+  the narrow reads -- the set Linux itself decodes when it emulates MMIO for
+  a confidential guest (`insn_decode_mmio`). The memory operand may take any
+  form a compiler picks (a fixmap address is an absolute displacement
+  through a SIB byte), so every ModRM and SIB form is stepped over; the
+  address is not worked out, the fault having given it. Anything else --
+  another opcode, a string move, a lock, 16-bit addressing -- is refused.
+  It was checked against what `clang` assembles for 1054 instructions (every
+  opcode over sixteen addressing forms, the registers REX and the high bytes
+  name, immediates of each size), each also cut short at every length --
+  refused, never mistaken for a shorter instruction -- and against two
+  million random byte strings: no panic, and no length past what was there.
+- **The emulator** (`hv::mmio`), in two steps, the device being the caller's.
+  `begin` fetches and decodes, and checks the instruction against the fault
+  -- that the fault was an instruction's at all, and not an interrupt's
+  delivery pushing to a stack or reading an IDT on the page; a load for a
+  read and a store for a write, which an instruction another of the guest's
+  CPUs changed under the fault need not be; the access inside the page; no
+  load into RSP, which VT-x writes back only on its full sync -- and hands
+  back the access and a store's value. The caller reads or writes
+  its device. `finish` puts a load's value in its register -- zero- or
+  sign-extended, a 32-bit destination clearing the top half as the CPU's
+  does -- and steps RIP past. Nothing in the guest changes before `finish`,
+  and an access that cannot be performed stops the guest with its bytes:
+  `an access of guest physical 0x... at rip 0x... not performed -- ...; its
+  bytes ...`.
+
+`hv run`'s `mmio` guest checks the three together on each backend: a device
+of 32 bytes of registers in the MMIO window, stored to by an immediate of
+each size, a 64-bit register, REX's and BH, and loaded from by `mov` into
+32-, 64- and 16-bit registers and AH, `movzx` and `movsx` -- fourteen
+accesses, each value checked where it went. What an access costs, beside an
+exit the CPU decodes itself, is under [What an exit
+costs](#what-an-exit-costs): `hv bench mmio`.
+
+### The xAPIC
+
+The first device on it is the local APIC's page. Its APIC comes out of
+reset in x2APIC mode, and a kernel that keeps it there -- Linux does --
+never touches the page; one that leaves the mode, or whose firmware left
+the APIC in xAPIC mode, now reaches the same register file through the page
+(`Lapic::mmio_read`, `mmio_write`), where the two modes differ as the
+architecture has them differ: the ID in bits 31:24, a writable logical ID
+and destination format -- flat or cluster, which the other CPUs' IPIs and a
+device's MSIs are matched against, each CPU publishing its own -- the ICR
+in two halves, and what x2APIC mode faults xAPIC mode ignoring. The page
+stays where firmware put it: a write of `IA32_APIC_BASE` moving it is a
+#GP, since a page that is a device to one CPU and RAM to another is no
+machine. Two guests use it:
+
+```
+$ hv boot /bzImage cpus=2 xapic initrd=/initrd cmdline=console=ttyS0 acpi=off
+  --- ttyS0 ---
+...
+[    0.622101] smp: Brought up 1 node, 2 CPUs
+...
+  apic       59776 interrupts from the local APICs, 59486 of their timers; 294 IPIs sent, 290 taken; 0 MSIs
+  mmio       60828 accesses performed for the guest, its instructions decoded: the xAPIC page's
+```
+
+Linux 6.1 -- Debian 12's -- booted without ACPI, `xapic` having its APICs
+come out of reset in xAPIC mode, brings up both its CPUs with every EOI,
+IPI and timer write through the page. Without `xapic` it cannot: its MP
+table path reads the page before it looks at the mode firmware left, and
+with x2APIC on it had not mapped the page and page-faulted in its own
+`register_lapic_address`. With its ACPI it needs neither -- the MADT has it
+choose the x2APIC driver before anything reads the page -- so a 6.1 of a
+distribution boots SMP here as it is. And a Linux 6.18 told `nox2apic`,
+which takes its APIC out of x2APIC mode itself ("x2apic disabled"), does
+the same through the page.
 
 ## On real hardware
 
@@ -2407,8 +2530,10 @@ one CPU](#more-than-one-cpu)) -- under AMD-V and VT-x both.
 A guest of more than one CPU takes its devices' interrupts by MSI-X
 ([Device interrupts, by MSI-X](#device-interrupts-by-msi-x)), and every
 guest has ACPI's tables and fixed hardware -- its power button what `hv
-stop` presses ([ACPI](#acpi)). Next is MMIO: an instruction decoder, and
-with it the IO-APIC, the HPET and PCIe's ECAM the tables leave out today.
+stop` presses ([ACPI](#acpi)). MMIO is emulated -- the instruction that
+faulted fetched by the guest's paging, decoded and performed -- and the
+xAPIC page is its first device ([MMIO](#mmio)); next on it are the IO-APIC,
+the HPET and PCIe's ECAM the tables leave out today.
 Beyond stage 3: device work off the first CPU's task, modern virtio, and the
 control plane's HTTP API (stage 4).
 

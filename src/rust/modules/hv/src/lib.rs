@@ -64,16 +64,17 @@ const USAGE: &str = "\
 hv [info]                          what the CPU has, and which CPUs the extension is on for
 hv on|off [cpu|all]                turn the extension on or off
 hv run <guest|all> [cpu]           run the built-in guests
-hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]
+hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile] [mmio]
                                    what a VM exit costs: CPUIDs, each after a read of
                                    that many pages, and with the whole TLB flushed on
                                    every entry, as before ASIDs, when told; profile
-                                   splits an entry into its parts
-hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+                                   splits an entry into its parts; mmio times MMIO
+                                   loads instead, each decoded and performed
+hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                    a Linux guest for secs, then its console and how it ended;
                                    cpus gives it N CPUs, each on a host CPU of its own, the
                                    first on cpu
-hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself
 hv list                            the started guests
@@ -426,7 +427,7 @@ const BENCH_DEFAULT: u32 = 100_000;
 #[cfg(target_arch = "x86_64")]
 const BENCH_MAX: u32 = 10_000_000;
 #[cfg(target_arch = "x86_64")]
-const BENCH_USAGE: &str = "hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile]";
+const BENCH_USAGE: &str = "hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile] [mmio]";
 
 /// What `hv bench` runs on its CPU.
 #[cfg(target_arch = "x86_64")]
@@ -436,6 +437,7 @@ struct BenchJob {
     pages: u32,
     flush: bool,
     profile: bool,
+    mmio: bool,
     result: Mutex<Option<core::result::Result<hv::guests::Bench, String>>>,
 }
 
@@ -456,7 +458,7 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
         return;
     }
     let mut cpu = u64::BITS - 1 - enabled.leading_zeros();
-    let (mut exits, mut pages, mut flush, mut profile) = (BENCH_DEFAULT, 0u32, false, false);
+    let (mut exits, mut pages, mut flush, mut profile, mut mmio) = (BENCH_DEFAULT, 0u32, false, false, false);
     for word in words {
         let (key, value) = word.split_once('=').unwrap_or((word, ""));
         let number = value.parse::<u32>();
@@ -470,6 +472,7 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
             ("pages", Ok(n)) if n <= hv::guests::BENCH_MAX_PAGES => pages = n,
             ("flush", _) if value.is_empty() => flush = true,
             ("profile", _) if value.is_empty() => profile = true,
+            ("mmio", _) if value.is_empty() => mmio = true,
             _ => {
                 let _ = writeln!(out, "hv: {} -- exits 1..{}, pages 0..{}", BENCH_USAGE, BENCH_MAX,
                                  hv::guests::BENCH_MAX_PAGES);
@@ -481,6 +484,10 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
      * entry flushes anyway, so a number under that word would not be what
      * was asked for. */
     let vmx = machine.ext() == Ok(hv::Ext::Vmx);
+    if mmio && (pages != 0 || flush) {
+        let _ = writeln!(out, "hv: mmio is a loop of MMIO loads alone -- without pages or flush");
+        return;
+    }
     if flush && vmx {
         let _ = writeln!(out, "hv: flush is AMD-V's -- under VT-x the TLB is flushed on every entry as it is");
         return;
@@ -489,9 +496,9 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
         let _ = writeln!(out, "hv: out of memory");
         return;
     };
-    let job = Arc::new(BenchJob { machine: machine.clone(), exits, pages, flush, profile, result });
+    let job = Arc::new(BenchJob { machine: machine.clone(), exits, pages, flush, profile, mmio, result });
     let task = kcore::task::spawn_on_with("hv/bench", 1u64 << cpu, job.clone(), |job: Arc<BenchJob>| {
-        let r = hv::guests::bench(&job.machine, job.exits, job.pages, job.flush, job.profile);
+        let r = hv::guests::bench(&job.machine, job.exits, job.pages, job.flush, job.profile, job.mmio);
         *job.result.lock() = Some(r);
     });
     match task {
@@ -507,9 +514,14 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
         Some(Ok(b)) => {
             let ns = b.ns.max(1);
             let exits = b.exits.max(1);
-            let _ = writeln!(out, "hv: {} exits on cpu {}, {} pages read between, {}: {} ms, {} ns an exit, {} a second ({} host interrupts among them)",
-                b.exits, cpu, pages, if flush { "the TLB flushed on every entry" } else { "ASIDs kept" },
-                ns / 1_000_000, ns / exits, b.exits * 1_000_000_000 / ns, b.host);
+            let _ = if mmio {
+                writeln!(out, "hv: {} MMIO loads on cpu {}, each a nested fault decoded and performed: {} ms, {} ns an access, {} a second ({} host interrupts among them)",
+                    b.exits, cpu, ns / 1_000_000, ns / exits, b.exits * 1_000_000_000 / ns, b.host)
+            } else {
+                writeln!(out, "hv: {} exits on cpu {}, {} pages read between, {}: {} ms, {} ns an exit, {} a second ({} host interrupts among them)",
+                    b.exits, cpu, pages, if flush { "the TLB flushed on every entry" } else { "ASIDs kept" },
+                    ns / 1_000_000, ns / exits, b.exits * 1_000_000_000 / ns, b.host)
+            };
             if let Some(p) = b.profile {
                 /* Ticks to nanoseconds by the two clocks' own ratio over the
                  * run: whatever the TSC's rate, the parts add up to the whole. */
@@ -517,13 +529,19 @@ fn bench<'a>(machine: &Arc<Machine>, words: impl Iterator<Item = &'a str>, out: 
                 let entry = part(p.checks) + part(p.sync_in) + part(p.switch_in) + part(p.world)
                     + part(p.switch_out) + part(p.sync_out);
                 let _ = if vmx {
-                    writeln!(out, "hv: an exit, in ns: checks and VMPTRLD {}, VMCS written {}, x87/SSE in {}, vmresume to exit {}, x87/SSE out {}, VMCS read {}; the rest -- the exit handled, the loop -- {}",
+                    write!(out, "hv: an exit, in ns: checks and VMPTRLD {}, VMCS written {}, x87/SSE in {}, vmresume to exit {}, x87/SSE out {}, VMCS read {}; the rest -- the exit handled, the loop -- {}",
                         part(p.checks), part(p.sync_in), part(p.switch_in), part(p.world), part(p.switch_out),
                         part(p.sync_out), (ns / exits).saturating_sub(entry))
                 } else {
-                    writeln!(out, "hv: an exit, in ns: checks and ASID {}, x87/SSE in {}, vmrun to #vmexit {}, x87/SSE out {}; the rest -- the exit handled, the loop -- {}",
+                    write!(out, "hv: an exit, in ns: checks and ASID {}, x87/SSE in {}, vmrun to #vmexit {}, x87/SSE out {}; the rest -- the exit handled, the loop -- {}",
                         part(p.checks), part(p.switch_in), part(p.world), part(p.switch_out),
                         (ns / exits).saturating_sub(entry))
+                };
+                let _ = if mmio {
+                    writeln!(out, ", of which the access -- the walk to its instruction, the fetch, the decoding, the device -- {}",
+                        part(b.emulate))
+                } else {
+                    writeln!(out)
                 };
             }
         }

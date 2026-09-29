@@ -44,6 +44,15 @@ jobs:
             ./scripts/smoke-arm64.sh --skip-build
           fi
 
+      # The hypervisor's MMIO decoder turns a guest's bytes into the access
+      # it performs for it, and a wrong decode looks like success: checked
+      # against the encodings clang gives, on the host.
+      - name: MMIO decoder test (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/insn-test.py
+
       # The smoke disks carry no partition table, so nothing else here would
       # notice the partition reader breaking.
       - name: Partition table test (${{ matrix.arch }}, TCG)

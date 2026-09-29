@@ -1,20 +1,20 @@
-//! A guest CPU's local APIC -- as an x2APIC, reached only through MSRs.
+//! A guest CPU's local APIC, in either of its modes: x2APIC, reached
+//! through MSRs, and xAPIC, a page of MMIO at 0xFEE00000.
 //!
 //! A guest of more than one CPU cannot do without a local APIC: it is what
 //! one CPU interrupts another through (an IPI), what starts the others at
-//! all (INIT and the start-up IPI), and each CPU's own timer. It has two
-//! ways in. The xAPIC is a page of MMIO at 0xFEE00000, and emulating a page
-//! of MMIO means decoding the instruction that touched it -- `mov`, and
-//! every form a compiler picks for it -- which is the instruction emulator
-//! this hypervisor exists without. The x2APIC is the same registers as MSRs
-//! 0x800-0x8FF, and an MSR access is an exit whose register, value and
-//! length the CPU hands over already. So a guest is given an x2APIC, turned
-//! on as firmware on a machine with more than 255 CPUs leaves one, and never
-//! the page: its every register is an intercepted `rdmsr` or `wrmsr` answered
-//! here, and a guest that turns x2APIC mode off to use the page is stopped
-//! and told why (`Wrote::Xapic`) -- Linux never does, unless it is told to
-//! use an IO-APIC this machine does not have (`noapic`, which the loader
-//! passes).
+//! all (INIT and the start-up IPI), and each CPU's own timer. The x2APIC is
+//! its registers as MSRs 0x800-0x8FF, and an MSR access is an exit whose
+//! register, value and length the CPU hands over; so a guest is given an
+//! x2APIC, turned on as firmware on a machine with more than 255 CPUs leaves
+//! one, and a kernel that keeps it -- Linux does -- never touches the page.
+//! One that turns x2APIC mode off (`nox2apic`), or a guest whose firmware
+//! leaves it in xAPIC mode, reaches the same registers through the page:
+//! every access a nested fault, the instruction decoded and performed by
+//! `crate::mmio`, and the register answered here (`mmio_read`,
+//! `mmio_write`). The two differ where the architecture has them differ --
+//! the ID's place, a writable logical ID and destination format, the ICR in
+//! two halves, what is reserved -- and are one register file otherwise.
 //!
 //! What is here is the register file and what each register does to the
 //! others: the ID and the logical ID derived from it, the task and
@@ -142,8 +142,32 @@ const ICR_BUSY: u64 = 1 << 12;
 /// Reserved in x2APIC mode, and a #GP when set: bits 31:20, 17:16 and 13.
 const ICR_RESERVED: u64 = 0xFFF0_0000 | (0x3 << 16) | (1 << 13);
 
-/// The broadcast destination, physical or logical.
+/// The broadcast destination, physical or logical: an x2APIC's.
 const BROADCAST: u32 = u32::MAX;
+/// An xAPIC's, and a message's with an 8-bit destination.
+const XAPIC_BROADCAST: u32 = 0xFF;
+
+/* xAPIC mode: the page's registers are at their x2APIC MSR's offset times
+ * 16, each 32 bits at the start of its 16 bytes. */
+/// The page's size.
+pub const XAPIC_PAGE_SIZE: u64 = 4096;
+const XAPIC_STRIDE_SHIFT: u32 = 4;
+const XAPIC_REG_BYTES: u32 = 4;
+/// Registers xAPIC mode has and x2APIC mode has not.
+const REG_APR: u32 = 0x09;
+const REG_RRD: u32 = 0x0C;
+const REG_DFR: u32 = 0x0E;
+const REG_ICR_HIGH: u32 = 0x31;
+/// The xAPIC ID's place: bits 31:24.
+const XAPIC_ID_SHIFT: u32 = 24;
+/// The logical ID's bits in the LDR, and the destination model's in the
+/// DFR: flat (all ones) or cluster (0); the rest of the DFR reads ones.
+const LDR_MASK: u32 = 0xFF00_0000;
+const DFR_MODEL_MASK: u32 = 0xF000_0000;
+const DFR_RESET: u32 = u32::MAX;
+const DFR_FLAT: u32 = 0xF000_0000;
+/// xAPIC mode's ICR: the destination in bits 63:56 -- ICR_HIGH's 31:24.
+const XAPIC_ICR_DEST_SHIFT: u64 = 56;
 
 /// The timer's divide configuration register: bits 0, 1 and 3.
 const DIVIDE_WRITABLE: u32 = 0b1011;
@@ -184,14 +208,62 @@ pub enum Delivery {
 /// Whom an IPI is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Destination {
-    /// The CPU whose x2APIC ID is this; `BROADCAST` for every CPU.
+    /// The CPU whose APIC ID is this; all ones for every CPU -- 32 of them
+    /// from an x2APIC, 8 from an xAPIC or a message.
     Physical(u32),
-    /// The CPUs whose logical ID -- a cluster (bits 31:16) and a bit in it
-    /// (15:0) -- matches: the cluster the same and a bit in common.
+    /// The CPUs whose logical ID matches, each by its own mode: an x2APIC's
+    /// -- a cluster (bits 31:16) and a bit in it -- the cluster the same and a
+    /// bit in common; an xAPIC's eight bits by its destination model.
     Logical(u32),
     SelfOnly,
     All,
     AllButSelf,
+}
+
+/// A local APIC's mode, as IA32_APIC_BASE has it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Off: EN clear.
+    Off,
+    Xapic,
+    X2apic,
+}
+
+/// What a message needs to know of an APIC to tell whether it is for it,
+/// beside its ID: its mode, and in xAPIC mode its logical ID and whether its
+/// model is flat. What another CPU matches its IPIs against, from the copy
+/// each CPU publishes ([`Addressing::pack`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Addressing {
+    pub mode: Mode,
+    /// The xAPIC logical ID: LDR bits 31:24.
+    pub ldr: u8,
+    pub flat: bool,
+}
+
+impl Addressing {
+    const MODE_MASK: u64 = 0x3;
+    const LDR_SHIFT: u32 = 8;
+    const FLAT: u64 = 1 << 16;
+
+    /// As a word, for a CPU to publish where the others read it.
+    pub fn pack(self) -> u64 {
+        let mode = match self.mode {
+            Mode::Off => 0,
+            Mode::Xapic => 1,
+            Mode::X2apic => 2,
+        };
+        mode | (u64::from(self.ldr) << Self::LDR_SHIFT) | if self.flat { Self::FLAT } else { 0 }
+    }
+
+    pub fn unpack(w: u64) -> Addressing {
+        let mode = match w & Self::MODE_MASK {
+            0 => Mode::Off,
+            1 => Mode::Xapic,
+            _ => Mode::X2apic,
+        };
+        Addressing { mode, ldr: (w >> Self::LDR_SHIFT) as u8, flat: w & Self::FLAT != 0 }
+    }
 }
 
 /// An IPI a write of the ICR sends: for the caller to deliver, since only
@@ -204,18 +276,35 @@ pub struct Ipi {
 }
 
 impl Ipi {
-    /// Whether the CPU with x2APIC ID `id` is among those this is for, the
-    /// sender's being `from`.
-    pub fn reaches(&self, id: u32, from: u32) -> bool {
+    /// Whether the CPU with APIC ID `id`, addressed as `target`, is among
+    /// those this is for, the sender's being `from`.
+    pub fn reaches(&self, id: u32, target: Addressing, from: u32) -> bool {
         match self.destination {
-            Destination::Physical(BROADCAST) | Destination::Logical(BROADCAST) | Destination::All => true,
-            Destination::Physical(dest) => dest == id,
+            Destination::All => true,
+            Destination::SelfOnly => id == from,
+            Destination::AllButSelf => id != from,
+            Destination::Physical(BROADCAST) | Destination::Logical(BROADCAST) => true,
+            Destination::Physical(dest) => {
+                dest == id || (target.mode == Mode::Xapic && dest == XAPIC_BROADCAST)
+            }
+            Destination::Logical(dest) if target.mode == Mode::Xapic => {
+                let d = dest as u8;
+                if dest > XAPIC_BROADCAST {
+                    false
+                } else if dest == XAPIC_BROADCAST {
+                    true
+                } else if target.flat {
+                    d & target.ldr != 0
+                } else {
+                    /* Cluster: the top four bits the cluster, the low four
+                     * a bit each for its members. */
+                    d >> 4 == target.ldr >> 4 && d & target.ldr & 0xF != 0
+                }
+            }
             Destination::Logical(dest) => {
                 let ldr = logical_id(id);
                 ldr >> 16 == dest >> 16 && ldr & dest & 0xFFFF != 0
             }
-            Destination::SelfOnly => id == from,
-            Destination::AllButSelf => id != from,
         }
     }
 }
@@ -250,7 +339,12 @@ pub fn msi(address: u64, data: u32) -> Option<Ipi> {
         MSI_DELIVERY_LOWEST => Delivery::LowestPriority,
         _ => return None,
     };
-    let dest = ((address >> MSI_DEST_SHIFT) & MSI_DEST_MASK) as u32;
+    /* All ones is every CPU in a message's 8-bit destination, whatever
+     * mode the APICs are in. */
+    let dest = match ((address >> MSI_DEST_SHIFT) & MSI_DEST_MASK) as u32 {
+        XAPIC_BROADCAST => BROADCAST,
+        d => d,
+    };
     let destination = if address & MSI_DEST_LOGICAL != 0 {
         Destination::Logical(dest)
     } else {
@@ -275,10 +369,6 @@ pub enum Wrote {
     Tpr(u8),
     /// An IPI to send.
     Ipi(Ipi),
-    /// The guest took the APIC out of x2APIC mode into xAPIC mode, the page
-    /// of MMIO this hypervisor does not emulate: the guest is to be stopped,
-    /// and told why.
-    Xapic,
 }
 
 /// Why a write or read of an APIC register is a #GP, when it is one: an
@@ -335,19 +425,24 @@ pub struct Lapic {
     icr: u64,
     lvt: [u32; LVT_ENTRIES],
     timer: Timer,
+    /// xAPIC mode's logical ID (bits 31:24) and destination format, as
+    /// written; x2APIC mode's logical ID is its ID's, and it has no format.
+    ldr: u32,
+    dfr: u32,
 }
 
 impl Lapic {
-    /// The APIC of the CPU whose x2APIC ID is `id`, as firmware leaves it:
-    /// in x2APIC mode. The boot CPU's is on, in the virtual-wire mode a PC's
-    /// firmware leaves it in -- LINT0 taking the 8259's interrupts, LINT1
-    /// NMIs -- which is how a guest that uses no APIC at all (`nolapic`)
-    /// still takes its interrupts from the 8259; the others' are off, with
-    /// every entry masked, until the guest brings them up.
-    pub fn new(id: u32, bsp: bool) -> Lapic {
+    /// The APIC of the CPU whose APIC ID is `id`, as firmware leaves it: in
+    /// x2APIC mode, or -- `x2apic` false -- in xAPIC mode, as most PCs'
+    /// firmware leaves it. The boot CPU's is on, in the virtual-wire mode a
+    /// PC's firmware leaves it in -- LINT0 taking the 8259's interrupts,
+    /// LINT1 NMIs -- which is how a guest that uses no APIC at all
+    /// (`nolapic`) still takes its interrupts from the 8259; the others'
+    /// are off, with every entry masked, until the guest brings them up.
+    pub fn new(id: u32, bsp: bool, x2apic: bool) -> Lapic {
         let mut apic = Lapic {
             id,
-            base: DEFAULT_BASE | BASE_EN | BASE_EXTD | if bsp { BASE_BSP } else { 0 },
+            base: DEFAULT_BASE | BASE_EN | if x2apic { BASE_EXTD } else { 0 } | if bsp { BASE_BSP } else { 0 },
             tpr: 0,
             svr: SVR_RESET,
             isr: [0; WORDS as usize],
@@ -358,6 +453,8 @@ impl Lapic {
             icr: 0,
             lvt: [LVT_MASKED; LVT_ENTRIES],
             timer: Timer { initial: 0, divide: 0, loaded_ns: 0, deadline: None },
+            ldr: 0,
+            dfr: DFR_RESET,
         };
         if bsp {
             apic.svr = SVR_RESET | SVR_ENABLE;
@@ -371,7 +468,7 @@ impl Lapic {
     /// base MSR -- the mode among them -- which INIT does not touch.
     pub fn init(&mut self) {
         let (id, base) = (self.id, self.base);
-        *self = Lapic::new(id, false);
+        *self = Lapic::new(id, false, true);
         self.base = base;
     }
 
@@ -383,6 +480,27 @@ impl Lapic {
     /// interrupts on its INTR pin directly, and nothing else.
     pub fn enabled(&self) -> bool {
         self.base & BASE_EN != 0
+    }
+
+    /// In xAPIC mode: on, and not extended -- its registers the page's.
+    pub fn xapic(&self) -> bool {
+        self.base & (BASE_EN | BASE_EXTD) == BASE_EN
+    }
+
+    /// What another CPU's message is matched against: see [`Addressing`].
+    pub fn addressing(&self) -> Addressing {
+        let mode = if !self.enabled() {
+            Mode::Off
+        } else if self.x2apic() {
+            Mode::X2apic
+        } else {
+            Mode::Xapic
+        };
+        Addressing {
+            mode,
+            ldr: (self.ldr >> XAPIC_ID_SHIFT) as u8,
+            flat: self.dfr & DFR_MODEL_MASK == DFR_FLAT,
+        }
     }
 
     /// Software-enabled: SVR bit 8. Off, it takes no fixed interrupt, and
@@ -560,33 +678,77 @@ impl Lapic {
         if msr == MSR_APIC_BASE {
             return Ok(self.base);
         }
-        /* Every other register is x2APIC mode's: with the APIC off, an MSR
-         * that is not there. */
+        /* Every other register is x2APIC mode's: in xAPIC mode, or with the
+         * APIC off, an MSR that is not there. */
         if !self.x2apic() {
             return Err(Refused);
         }
         let reg = msr - MSR_X2APIC_FIRST;
+        if reg == REG_ICR {
+            return Ok(self.icr);
+        }
+        self.read_register(reg, now, false).map(u64::from).ok_or(Refused)
+    }
+
+    /// The 32-bit register `reg` -- by its x2APIC MSR's offset -- as the mode
+    /// reads it, `xapic` or not, at `now`; None for no register, or one
+    /// write-only. The ICR's two halves are xAPIC mode's; x2APIC mode reads
+    /// it whole (`rdmsr`).
+    fn read_register(&self, reg: u32, now: u64, xapic: bool) -> Option<u32> {
         let value = match reg {
+            REG_ID if xapic => self.id << XAPIC_ID_SHIFT,
             REG_ID => self.id,
             REG_VERSION => VERSION,
             REG_TPR => u32::from(self.tpr),
+            /* xAPIC mode's arbitration priority and remote read, which no
+             * guest of an integrated APIC asks for: nothing. */
+            REG_APR | REG_RRD if xapic => 0,
             REG_PPR => u32::from(self.ppr()),
+            REG_LDR if xapic => self.ldr,
             REG_LDR => logical_id(self.id),
+            REG_DFR if xapic => self.dfr,
             REG_SVR => self.svr,
             r if (REG_ISR..REG_ISR + WORDS).contains(&r) => self.isr[(r - REG_ISR) as usize],
             r if (REG_TMR..REG_TMR + WORDS).contains(&r) => self.tmr[(r - REG_TMR) as usize],
             r if (REG_IRR..REG_IRR + WORDS).contains(&r) => self.irr[(r - REG_IRR) as usize],
             REG_ESR => self.esr,
-            REG_ICR => return Ok(self.icr),
+            /* The delivery-status bit reads idle: an IPI is sent as it is
+             * written. */
+            REG_ICR if xapic => self.icr as u32,
+            REG_ICR_HIGH if xapic => (self.icr >> 32) as u32,
             r if (REG_LVT_TIMER..=REG_LVT_ERROR).contains(&r) => self.lvt[(r - REG_LVT_TIMER) as usize],
             REG_TIMER_INITIAL => self.timer.initial,
             REG_TIMER_CURRENT => self.current_count(now),
             REG_TIMER_DIVIDE => self.timer.divide,
             /* EOI and SELF IPI are write-only; the rest of the range is no
              * register at all. */
-            _ => return Err(Refused),
+            _ => return None,
         };
-        Ok(u64::from(value))
+        Some(value)
+    }
+
+    /// A read of `size` bytes at `offset` in the xAPIC page, at `now`: the
+    /// bytes of the register there, and nothing -- zero -- past its 32 bits
+    /// or where there is no register. The caller keeps the size's bytes.
+    pub fn mmio_read(&self, offset: u32, size: u8, now: u64) -> u32 {
+        let within = offset & ((1 << XAPIC_STRIDE_SHIFT) - 1);
+        if within + u32::from(size) > XAPIC_REG_BYTES {
+            return 0;
+        }
+        let value = self.read_register(offset >> XAPIC_STRIDE_SHIFT, now, true).unwrap_or(0);
+        value >> (8 * within)
+    }
+
+    /// A write of `size` bytes of `value` at `offset` in the xAPIC page, at
+    /// `now`: what it did that the caller has to act on. A register is
+    /// written whole or not at all -- an access of another size, or not at a
+    /// register's start, is dropped, as is a write of no writable register:
+    /// xAPIC mode has no #GP to answer one with.
+    pub fn mmio_write(&mut self, offset: u32, size: u8, value: u32, now: u64) -> Wrote {
+        if offset & ((1 << XAPIC_STRIDE_SHIFT) - 1) != 0 || u32::from(size) != XAPIC_REG_BYTES {
+            return Wrote::Done;
+        }
+        self.write_register(offset >> XAPIC_STRIDE_SHIFT, value, now, true).unwrap_or(Wrote::Done)
     }
 
     /// In x2APIC mode: on, and extended.
@@ -605,27 +767,45 @@ impl Lapic {
         }
         let reg = msr - MSR_X2APIC_FIRST;
         if reg == REG_ICR {
-            return self.write_icr(value).map(|ipi| ipi.map_or(Wrote::Done, Wrote::Ipi));
+            return self.write_icr(value, false).map(|ipi| ipi.map_or(Wrote::Done, Wrote::Ipi));
         }
         /* Bits 63:32 are reserved in every register but the ICR. */
         if value >> 32 != 0 {
             return Err(Refused);
         }
-        let v = value as u32;
+        self.write_register(reg, value as u32, now, false)
+    }
+
+    /// A write of `v` to the 32-bit register `reg` -- by its x2APIC MSR's
+    /// offset -- in the mode it is in, `xapic` or not: what it did, or
+    /// [`Refused`] for what x2APIC mode faults -- a read-only register, a
+    /// reserved bit, a value it wants to be 0 -- and xAPIC mode drops.
+    fn write_register(&mut self, reg: u32, v: u32, now: u64, xapic: bool) -> Result<Wrote, Refused> {
         match reg {
             REG_TPR => {
-                if v & !0xFF != 0 {
+                if v & !0xFF != 0 && !xapic {
                     return Err(Refused);
                 }
                 self.tpr = v as u8;
                 return Ok(Wrote::Tpr(self.tpr));
             }
             REG_EOI => {
-                /* x2APIC mode wants 0 written, and faults anything else. */
-                if v != 0 {
+                /* x2APIC mode wants 0 written, and faults anything else;
+                 * xAPIC mode takes any value. */
+                if v != 0 && !xapic {
                     return Err(Refused);
                 }
                 self.eoi();
+            }
+            REG_LDR if xapic => self.ldr = v & LDR_MASK,
+            REG_DFR if xapic => self.dfr = (v & DFR_MODEL_MASK) | !DFR_MODEL_MASK,
+            REG_ICR if xapic => {
+                /* The low half sends, with the high half's destination. */
+                let icr = (self.icr & !u64::from(u32::MAX)) | u64::from(v);
+                return self.write_icr(icr, true).map(|ipi| ipi.map_or(Wrote::Done, Wrote::Ipi));
+            }
+            REG_ICR_HIGH if xapic => {
+                self.icr = (self.icr & u64::from(u32::MAX)) | (u64::from(v) << 32);
             }
             REG_SVR => {
                 self.svr = v & SVR_WRITABLE;
@@ -640,7 +820,7 @@ impl Lapic {
             REG_ESR => {
                 /* A write latches the errors since the last one; x2APIC
                  * mode wants the write itself to be 0. */
-                if v != 0 {
+                if v != 0 && !xapic {
                     return Err(Refused);
                 }
                 self.esr = self.esr_pending;
@@ -669,7 +849,7 @@ impl Lapic {
             REG_TIMER_DIVIDE => {
                 self.timer.divide = v & DIVIDE_WRITABLE;
             }
-            REG_SELF_IPI => {
+            REG_SELF_IPI if !xapic => {
                 /* The vector alone, in bits 7:0. */
                 if v & !0xFF != 0 {
                     return Err(Refused);
@@ -692,11 +872,15 @@ impl Lapic {
     /// xAPIC (EN) and x2APIC (EN and EXTD), and the architecture forbids
     /// two moves -- x2APIC straight to xAPIC, and off straight to x2APIC --
     /// and EXTD without EN: each a #GP, as are the reserved bits. The BSP
-    /// bit is the platform's, and a write keeps it as it was. Into xAPIC
-    /// mode is allowed and not emulated: the caller stops the guest
-    /// (`Wrote::Xapic`).
+    /// bit is the platform's, and a write keeps it as it was. And the page
+    /// stays where firmware put it: a guest moving it would have the page it
+    /// left be RAM to one of its CPUs and a device to another, which no
+    /// guest does -- a #GP.
     fn write_base(&mut self, value: u64) -> Result<Wrote, Refused> {
         if value & !(BASE_ADDRESS | BASE_BSP | BASE_EXTD | BASE_EN) != 0 {
+            return Err(Refused);
+        }
+        if value & BASE_ADDRESS != DEFAULT_BASE {
             return Err(Refused);
         }
         let value = (value & !BASE_BSP) | (self.base & BASE_BSP);
@@ -716,15 +900,15 @@ impl Lapic {
             self.init();
             self.base = value;
         }
-        Ok(if new == BASE_EN { Wrote::Xapic } else { Wrote::Done })
+        Ok(Wrote::Done)
     }
 
     /// A write of the interrupt command register: the IPI it sends, or a
-    /// #GP for a reserved bit set. An IPI with a vector no fixed interrupt
-    /// may have, or a delivery mode no IPI has, is an error on this APIC,
-    /// and sends nothing.
-    fn write_icr(&mut self, value: u64) -> Result<Option<Ipi>, Refused> {
-        if value & ICR_RESERVED != 0 {
+    /// #GP for a reserved bit set -- in x2APIC mode; xAPIC mode ignores them.
+    /// An IPI with a vector no fixed interrupt may have, or a delivery mode
+    /// no IPI has, is an error on this APIC, and sends nothing.
+    fn write_icr(&mut self, value: u64, xapic: bool) -> Result<Option<Ipi>, Refused> {
+        if value & ICR_RESERVED != 0 && !xapic {
             return Err(Refused);
         }
         let value = value & !ICR_BUSY;
@@ -749,7 +933,11 @@ impl Lapic {
             self.error(ESR_SEND_ILLEGAL_VECTOR);
             return Ok(None);
         }
-        let dest = (value >> ICR_DEST_SHIFT) as u32;
+        let dest = if xapic {
+            (value >> XAPIC_ICR_DEST_SHIFT) as u32
+        } else {
+            (value >> ICR_DEST_SHIFT) as u32
+        };
         let destination = match (value >> ICR_SHORTHAND_SHIFT) & ICR_SHORTHAND_MASK {
             1 => Destination::SelfOnly,
             2 => Destination::All,

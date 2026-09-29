@@ -239,6 +239,18 @@ to turn itself off ([`docs/hypervisor.md`](../docs/hypervisor.md#acpi)). What
 the tables leave out is what would need MMIO -- the IO-APIC, the HPET, PCIe's
 ECAM -- and that is the decoder's to bring.
 
+Then the decoder, which 3.5 kept out for as long as nothing needed it: an
+access of a device's page is a nested fault, and the instruction behind it
+is fetched by the guest's own paging, decoded -- the forms of `mov` Linux's
+MMIO accessors are, the set Linux itself decodes for a confidential guest,
+checked against clang's encodings in CI -- and performed, with no `unsafe`
+([`docs/hypervisor.md`](../docs/hypervisor.md#mmio)). Its first device is
+the xAPIC page, the local APIC's other mode: a guest told `nox2apic`, or
+given `xapic`, reaches its APIC through it, and a Linux 6.1 without ACPI
+boots SMP. With its ACPI a 6.1 needed none of it -- the MADT has it pick the
+x2APIC driver first -- which leaves the IO-APIC, the HPET and ECAM as what
+the decoder is for next.
+
 ## Choose VMX vs SVM based on the dev environment
 
 This choice is driven by where you actually iterate:

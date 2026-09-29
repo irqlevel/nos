@@ -75,6 +75,11 @@ impl Backend {
     pub fn skip_io(&mut self, io: &Io) {
         match self { Backend::Svm(v) => v.skip_io(io), Backend::Vmx(v) => v.skip_io(io) }
     }
+    /// Step past an instruction the host performed, `len` bytes by its own
+    /// decoding (`crate::mmio`), and out of any interrupt shadow.
+    pub fn skip_emulated(&mut self, len: u64) {
+        match self { Backend::Svm(v) => v.skip_emulated(len), Backend::Vmx(v) => v.skip_emulated(len) }
+    }
     pub fn skip_cpuid(&mut self) {
         match self { Backend::Svm(v) => v.skip_cpuid(), Backend::Vmx(v) => v.skip_cpuid() }
     }
@@ -170,6 +175,15 @@ impl Backend {
     }
     pub fn dump(&self, out: &mut dyn core::fmt::Write) -> core::fmt::Result {
         match self { Backend::Svm(v) => v.dump(out), Backend::Vmx(v) => v.dump(out) }
+    }
+    /// Have the whole of the last exit's state in hand for a [`dump`]: under
+    /// VT-x an exit reads only what its handling needs, and the rest is read
+    /// now if the VMCS is still current here; the VMCB is memory, and whole
+    /// always. False if it could not be read -- and the dump says so.
+    ///
+    /// [`dump`]: Backend::dump
+    pub fn read_whole_state(&mut self) -> bool {
+        match self { Backend::Svm(_) => true, Backend::Vmx(v) => v.read_whole_state() }
     }
     pub fn set_flush_always(&mut self, on: bool) {
         match self { Backend::Svm(v) => v.set_flush_always(on), Backend::Vmx(v) => v.set_flush_always(on) }

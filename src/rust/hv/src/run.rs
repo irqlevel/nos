@@ -60,10 +60,11 @@ use crate::devices::pci::{self, Function, PciBus};
 use crate::devices::pm;
 use crate::devices::virtio::Raise;
 use crate::devices::{Pic, Pit, Pm, Rtc, Uart};
-use crate::lapic::{self, Delivery, Ipi, Lapic, Wrote};
+use crate::lapic::{self, Addressing, Delivery, Ipi, Lapic, Wrote};
 use crate::linux::{self, Header, Layout};
 use crate::machine::Machine;
 use crate::memory::GuestMemory;
+use crate::mmio;
 use crate::smp::{Doorbells, Mailbox, MAX_VCPUS};
 use crate::svm::Exit;
 use crate::vm::{Cpu, Refusal};
@@ -175,10 +176,10 @@ pub enum Stop {
     /// It turned itself off: S5's sleep type written to its PM1 control
     /// register with the sleep enable bit -- ACPI's soft off, a `poweroff`.
     PowerOff { rip: u64 },
-    /// It took its local APIC out of x2APIC mode into xAPIC mode, a page of
-    /// MMIO this hypervisor does not emulate -- a kernel told to use an
-    /// IO-APIC this machine has none of, or not to use x2APIC (`nox2apic`).
-    Xapic { rip: u64 },
+    /// An MMIO access of a device's that could not be performed for it:
+    /// the instruction at `rip` that reached `gpa`, as far as it was read
+    /// (`bytes`), and why (`error`).
+    MmioInsn { gpa: u64, rip: u64, error: mmio::Error, bytes: mmio::Bytes },
     /// An exception the host intercepts (#DB, #AC, #MC) fired.
     Exception { vector: u8, rip: u64 },
     /// The CPU refused the VMCB, or the extension went off under it.
@@ -241,6 +242,8 @@ pub struct Counts {
     /// Devices' MSI-X messages this CPU sent on their behalf, doing their
     /// work: into its own APIC or another CPU's mailbox.
     pub msi: u64,
+    /// MMIO accesses performed for the guest: its xAPIC page's.
+    pub mmio_done: u64,
     /// INITs and start-up IPIs that reset and started this CPU.
     pub init: u64,
     pub started: u64,
@@ -288,6 +291,7 @@ impl Counts {
         self.ipi_sent += o.ipi_sent;
         self.ipi_taken += o.ipi_taken;
         self.msi += o.msi;
+        self.mmio_done += o.mmio_done;
         self.init += o.init;
         self.started += o.started;
         self.nmi += o.nmi;
@@ -445,6 +449,16 @@ struct CpuShared {
     activity: AtomicU8,
     /// The host CPU it last entered its guest on; `u32::MAX` before its first.
     host_cpu: AtomicU32,
+    /// How a message finds its local APIC -- its mode, and in xAPIC mode its
+    /// logical ID and model -- as it last published ([`Addressing::pack`]).
+    addressing: AtomicU64,
+}
+
+impl CpuShared {
+    /// Its local APIC's addressing, as it last published it.
+    fn addressing(&self) -> Addressing {
+        Addressing::unpack(self.addressing.load(Ordering::Relaxed))
+    }
 }
 
 /// The guest's devices: what its CPUs share under one lock.
@@ -526,7 +540,12 @@ impl LinuxGuest {
     ///
     /// Under VT-x, a guest of more than one CPU needs unrestricted guest:
     /// its other CPUs start in real mode.
-    pub fn new(machine: &Machine, mem_bytes: u64, cpus: u32, doorbells: Arc<Doorbells>)
+    ///
+    /// Their local APICs come out of reset in x2APIC mode, or -- `x2apic`
+    /// false -- in xAPIC mode, reached through the page: for a kernel that
+    /// reads the page before it looks at the mode firmware left, which a
+    /// Linux of 6.5 or older without ACPI does.
+    pub fn new(machine: &Machine, mem_bytes: u64, cpus: u32, doorbells: Arc<Doorbells>, x2apic: bool)
         -> Result<(Self, Vec<GuestCpu>)>
     {
         let n = cpus as usize;
@@ -546,10 +565,12 @@ impl LinuxGuest {
                 return Err(Error::NoUnrestrictedGuest);
             }
             let activity = if i == 0 { Activity::Running } else { Activity::WaitForSipi };
+            let lapic = Lapic::new(i, i == 0, x2apic);
+            let addressing = lapic.addressing().pack();
             vcpus.push(GuestCpu {
                 index: i,
                 cpu,
-                lapic: Lapic::new(i, i == 0),
+                lapic,
                 activity,
                 nmi_pending: false,
                 last_from_pic: false,
@@ -560,6 +581,7 @@ impl LinuxGuest {
                 extint: AtomicBool::new(i == 0),
                 activity: AtomicU8::new(activity.code()),
                 host_cpu: AtomicU32::new(u32::MAX),
+                addressing: AtomicU64::new(addressing),
             });
         }
 
@@ -1062,16 +1084,21 @@ impl LinuxGuest {
                     None
                 }
                 Exit::NestedFault { gpa, error } => {
-                    /* A read of the platform's MMIO window that nothing
-                     * answers is a probe for a device that is not there: map
-                     * all ones and let the instruction run again. Anything
-                     * else -- a write, a fetch, a walk of the guest's own
-                     * tables, an address outside the window, the xAPIC's
-                     * page -- stops it. */
+                    /* The local APIC's page, in xAPIC mode: the access
+                     * performed for the guest. Else a read of the platform's
+                     * MMIO window that nothing answers is a probe for a
+                     * device that is not there: map all ones and let the
+                     * instruction run again. Anything else -- a write, a
+                     * fetch, a walk of the guest's own tables, an address
+                     * outside the window, the APIC's page in x2APIC mode --
+                     * stops it. */
                     use vmcb::npf;
-                    let plain_read = error & (npf::PRESENT | npf::WRITE | npf::FETCH) == 0
-                        && error & npf::FINAL != 0;
-                    if plain_read && self.memory.map_absent(gpa).is_ok() {
+                    let data = error & (npf::PRESENT | npf::FETCH) == 0 && error & npf::FINAL != 0;
+                    let plain_read = data && error & npf::WRITE == 0;
+                    let apic_page = gpa & !(lapic::XAPIC_PAGE_SIZE - 1) == lapic::DEFAULT_BASE;
+                    if data && apic_page && self.has_apic() && gc.lapic.xapic() {
+                        self.xapic_access(gc, gpa, error & npf::WRITE != 0)
+                    } else if plain_read && self.memory.map_absent(gpa).is_ok() {
                         None
                     } else {
                         gc.counts.mmio += 1;
@@ -1147,12 +1174,13 @@ impl LinuxGuest {
     /// Stop the guest, `gc` being the CPU that stops it: how it stopped is
     /// the first CPU's to say that does, with its state for the report, and
     /// every CPU is rung to see it.
-    fn stop_with(&self, stop: Stop, gc: &GuestCpu) {
+    fn stop_with(&self, stop: Stop, gc: &mut GuestCpu) {
         {
             let mut stopped = self.stopped.lock();
             if stopped.is_none() {
                 let mut dump = String::new();
                 if gc.activity != Activity::WaitForSipi && dump.try_reserve(DUMP_BYTES).is_ok() {
+                    gc.cpu.backend_mut().read_whole_state();
                     let _ = gc.dump(&mut dump);
                 }
                 *stopped = Some(Stopped { stop, cpu: gc.index, dump });
@@ -1167,13 +1195,14 @@ impl LinuxGuest {
     /// registers are nothing the guest did, or from outside (`stop`). Called
     /// by every CPU as it leaves its loop, so the first out that has state
     /// to show shows it.
-    fn fill_dump(&self, gc: &GuestCpu) {
+    fn fill_dump(&self, gc: &mut GuestCpu) {
         if gc.activity == Activity::WaitForSipi {
             return;
         }
         let mut stopped = self.stopped.lock();
         if let Some(s) = stopped.as_mut() {
             if s.dump.is_empty() && s.dump.try_reserve(DUMP_BYTES).is_ok() {
+                gc.cpu.backend_mut().read_whole_state();
                 let _ = gc.dump(&mut s.dump);
                 s.cpu = gc.index;
             }
@@ -1233,6 +1262,7 @@ impl LinuxGuest {
              * (`send`), and never comes this far. */
             gc.counts.init += 1;
             gc.lapic.init();
+            self.publish(gc);
             gc.cpu.backend_mut().init_reset();
             self.set_activity(gc, Activity::WaitForSipi);
         }
@@ -1359,7 +1389,8 @@ impl LinuxGuest {
         let me = from.index;
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
-            if !ipi.reaches(id, me) {
+            let addressing = if id == me { from.lapic.addressing() } else { target.addressing() };
+            if !ipi.reaches(id, addressing, me) {
                 continue;
             }
             match ipi.delivery {
@@ -1511,7 +1542,8 @@ impl LinuxGuest {
     fn post_msi(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi) {
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
-            if !ipi.reaches(id, me) {
+            let addressing = if id == me { lapic.addressing() } else { target.addressing() };
+            if !ipi.reaches(id, addressing, me) {
                 continue;
             }
             if id == me {
@@ -1665,6 +1697,53 @@ impl LinuxGuest {
         None
     }
 
+    /// `gc`'s local APIC's addressing, where the other CPUs match their
+    /// messages against it: after anything that may change it -- its mode,
+    /// its xAPIC logical ID and model, an INIT.
+    fn publish(&self, gc: &GuestCpu) {
+        if let Some(s) = self.cpus.get(gc.index as usize) {
+            s.addressing.store(gc.lapic.addressing().pack(), Ordering::Relaxed);
+        }
+    }
+
+    /// Perform the guest's access of its local APIC's page, in xAPIC mode --
+    /// a `write` or a read of `gpa` -- by the instruction that faulted: the
+    /// register read or written, a load's value in its register, the
+    /// instruction stepped past; and what a write does beyond the register,
+    /// done -- the task priority's CR8, an IPI sent. An instruction that
+    /// cannot be performed stops the guest, showing its bytes.
+    fn xapic_access(&self, gc: &mut GuestCpu, gpa: u64, write: bool) -> Option<Stop> {
+        let mut bytes = mmio::Bytes::default();
+        let op = match mmio::begin(gc.cpu.backend(), &self.memory, gpa, write, &mut bytes) {
+            Ok(op) => op,
+            Err(error) => {
+                let rip = gc.cpu.backend().save().rip;
+                return Some(Stop::MmioInsn { gpa, rip, error, bytes });
+            }
+        };
+        gc.counts.mmio_done += 1;
+        let offset = (gpa & (lapic::XAPIC_PAGE_SIZE - 1)) as u32;
+        let now = time::boot_time_ns();
+        if op.is_write() {
+            let wrote = gc.lapic.mmio_write(offset, op.size(), op.value as u32, now);
+            let v = gc.cpu.backend_mut();
+            mmio::finish(v, &op, 0);
+            match wrote {
+                Wrote::Done => {}
+                Wrote::Tpr(tpr) => v.set_cr8(tpr >> 4),
+                Wrote::Ipi(ipi) => self.send(gc, ipi),
+            }
+            /* The logical ID and the model are this page's to write. */
+            self.publish(gc);
+        } else {
+            let cr8 = gc.cpu.backend().cr8();
+            gc.lapic.sync_cr8(cr8);
+            let value = gc.lapic.mmio_read(offset, op.size(), now);
+            mmio::finish(gc.cpu.backend_mut(), &op, u64::from(value));
+        }
+        None
+    }
+
     /// Answer an `rdmsr` or `wrmsr`: the local APIC's registers and its base
     /// MSR from the APIC, the rest from the policy.
     fn msr(&self, gc: &mut GuestCpu, write: bool) -> Option<Stop> {
@@ -1693,11 +1772,10 @@ impl LinuxGuest {
                         gc.cpu.backend_mut().skip_msr();
                         self.send(gc, ipi);
                     }
-                    Ok(Wrote::Xapic) => {
-                        return Some(Stop::Xapic { rip: gc.cpu.backend().save().rip });
-                    }
                     Err(lapic::Refused) => self.msr_fault(gc, msr, value, true),
                 }
+                /* The base MSR moves it between modes. */
+                self.publish(gc);
             } else {
                 let cr8 = gc.cpu.backend().cr8();
                 gc.lapic.sync_cr8(cr8);

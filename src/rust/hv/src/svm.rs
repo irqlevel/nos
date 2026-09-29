@@ -549,6 +549,16 @@ impl Vcpu {
         v.control.int_state &= !vmcb::int_state::SHADOW;
     }
 
+    /// Step past an instruction the host performed for the guest, `len`
+    /// bytes long by its own decoding -- never by the CPU's next RIP, which a
+    /// nested fault does not give -- and out of the interrupt shadow it may
+    /// have been in, as `skip` does.
+    pub fn skip_emulated(&mut self, len: u64) {
+        let v = self.guest.vmcb_mut();
+        v.save.rip = v.save.rip.wrapping_add(len);
+        v.control.int_state &= !vmcb::int_state::SHADOW;
+    }
+
     /// Step past an I/O instruction: its end is always known.
     pub fn skip_io(&mut self, io: &Io) {
         let v = self.guest.vmcb_mut();
