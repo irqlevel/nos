@@ -31,6 +31,7 @@ Parameters::Parameters()
     , ConMode(ConsoleBoth)
     , DhcpMd(DhcpOn)
     , UdpShellPort(0)
+    , NetconsoleIp(0)
     , NetconsolePort(0)
     , NetconsoleTailKb(0)
     , NetFrameCount(0)
@@ -42,6 +43,7 @@ Parameters::Parameters()
     , DiskLogOn(false)
     , Parsed(false)
 {
+    Cmdline[0] = '\0';
     Stdlib::MemSet(&Root, 0, sizeof(Root));
     Root.Mode = RootNone;
 }

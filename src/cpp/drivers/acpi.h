@@ -143,22 +143,62 @@ private:
        rather than dereferenced. */
     ulong RootEntry(size_t index);
 
+    /* Parse's work: what it maps is left for Parse to let go of */
+    Stdlib::Error ParseTables();
     Stdlib::Error ParseTablePointers();
     Stdlib::Error ParseMADT();
 
-    ACPISDTHeader* LookupTable(const char *name);
+    /* The table of that signature Parse is reading, and its length */
+    ACPISDTHeader* LookupTable(const char *name, u32& length);
 
     char OemId[7];
 
     ACPISDTHeader* Root;
+    u32 RootLength;
     bool RootIsXsdt;
 
-    /* Firmware table counts are not small and not predictable: the Hetzner
-       EX44 lists 25, eleven of them SSDTs, and the SSDT count moves with
-       every BIOS revision. Overrunning this used to abort the whole parse,
-       which the caller turns into a boot panic. 128 pointers is a kilobyte. */
-    static const size_t MaxTables = 128;
+    /* The tables this kernel reads, one of each kind, mapped through the
+       TmpMap window while Parse reads them: Table[i] is WantedTables[i]'s,
+       TableLength[i] its length -- what of it is mapped, and all a parser
+       reads. Every other table the root lists is looked at and let go of at
+       once, and these and the root when Parse is done, whichever way it
+       ends: what the kernel keeps of ACPI is the values Parse takes out of
+       it, and the local APIC's and the IO-APIC's pages. A firmware's table
+       count is not small and not predictable -- the Hetzner EX44 lists 25,
+       eleven of them SSDTs, and the count moves with every BIOS revision --
+       and a slot of the window held is one every page allocation after it
+       goes without. */
+    static const size_t MaxTables = 4;
     ACPISDTHeader* Table[MaxTables];
+    u32 TableLength[MaxTables];
+
+    /* The longest table mapped, the root or one of those read -- a MADT of
+       a thousand CPUs, each with its x2APIC and NMI entries, is 42 KiB. A
+       longer one is refused, so that what Parse holds of the window at once
+       is bounded: the root and a table of each kind, at most 17 pages
+       each. */
+    static const u32 MaxTableLength = 64 * 1024;
+
+    /* WantedTables' index of signature, or -1 */
+    static long WantedIndex(const char* signature);
+
+    /* The header of the SDT at phys, mapped -- SDTs are only 4-byte
+       aligned, so it may straddle two pages -- or nullptr, which is said:
+       past the physical address space, or no room in the window */
+    ACPISDTHeader* MapHeader(ulong phys);
+
+    /* The SDT at phys, whose header MapHeader mapped, mapped whole, its
+       length read once into length; the header's mapping is let go of.
+       nullptr, which is said, for a table not to be mapped -- shorter than
+       its header, longer than MaxTableLength, reaching past the physical
+       address space -- or no room in the window */
+    ACPISDTHeader* MapWhole(ACPISDTHeader* header, ulong phys, u32& length);
+
+    /* Let go of the root and the tables */
+    void ReleaseTables();
+
+    /* Let go of the TmpMap pages a mapping of len bytes at va holds */
+    static void UnmapTableRange(void* va, ulong len);
 
     static const bool checkRsdtChecksum = false;
     static const u64 RSDPSignature = 0x2052545020445352ULL; //'RSD PTR '
@@ -176,7 +216,27 @@ private:
     IrqToGsiEntry IrqToGsi[64];
     size_t IrqToGsiSize;
 
-    bool RegisterIrqToGsi(u8 irq, u32 gsi, u16 flags);
+    /* An Interrupt Source Override: the first for an IRQ is the one taken,
+       and one naming a GSI past what the interrupt layer takes (an u8) or
+       past the table's room is left out, which is said -- none of them is
+       reason enough to lose ACPI, and the boot with it. */
+    void RegisterIrqToGsi(u8 irq, u32 gsi, u16 flags);
+
+    /* The GSI base of the IO-APIC IoApicAddress maps, ~0U while none */
+    u32 IoApicGsiBase;
+
+    /* What of an APIC's page its registers take, from the address the MADT
+       gives. The local APIC's are the page, which the architecture puts at
+       a page's start (IA32_APIC_BASE holds a page frame); an IO-APIC's are
+       words at 0x00 and 0x10, and at 0x40 the EOI register of a later one.
+       An address whose registers would run past its page is refused: the
+       drivers' accesses would land in the TmpMap window's next slot, and
+       in whatever page that maps. */
+    static const ulong LapicRegisterBytes = Const::PageSize;
+    static const ulong IoApicRegisterBytes = 0x44;
+
+    /* Whether registers of that many bytes at phys stay in its page */
+    static bool RegistersInPage(ulong phys, ulong bytes);
 
     /* Generic Address Structure (ACPI spec 5.2.3.2) */
     struct GenericAddressStructure

@@ -3,10 +3,13 @@
 fuzzed on the host.
 
 The kernel's C++ reads things nobody checked before it: the device tree the
-arm64 boot is handed, the firmware's memory map, the GRUB environment block
-`grubenv` reads off /boot. What is in them is whoever made them's to choose,
-and a read past an end, an index out of range or a wrap there is a boot that
-dies without a word, or a page handed out that the firmware still uses.
+arm64 boot is handed, the Multiboot2 information and the ACPI tables the x86
+one is, the firmware's memory map, the command line, the GRUB environment
+block `grubenv` reads off /boot, a module's .ko. What is in them is whoever
+made them's to choose, and a read past an end, an index out of range or a
+wrap there is a boot that dies without a word, or a page handed out that the
+firmware still uses. Under all of it is the memory management, whose error
+paths no boot takes.
 fuzz/cpp holds a host program for each: the kernel's own sources, compiled
 as they are under the address and undefined-behaviour sanitizers, over
 stand-ins for the kernel around them (fuzz/cpp/common) and a host HAL in
@@ -16,11 +19,14 @@ block grub-editenv could have written, and each of them damaged -- and holds
 what the code makes of it to a model of what its header says it does.
 
 The targets: fdt (the device tree reader and Board::Setup), memmap (the
-memory map and the free-page scan's questions of it) and grubenv (the GRUB
-environment block). docs/testing.md says what each checks.
+memory map and the free-page scan's questions of it), grubenv (the GRUB
+environment block), module (the module loader), pagetable (the page tables
+and the physical page allocator), heap (the kernel heap), cmdline (the
+command line), multiboot (Multiboot2's tags) and acpi (the ACPI tables, over
+an emulated TmpMap window). docs/testing.md says what each checks.
 
 By default every target runs its own number of inputs from a fixed seed, the
-same every time: the gate, well under a minute. A campaign is `--seconds` a
+same every time: the gate, a minute and a half. A campaign is `--seconds` a
 target and seeds of its own:
 
     python3 scripts/cpp-fuzz.py                          # the gate

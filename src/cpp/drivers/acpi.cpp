@@ -11,10 +11,12 @@ namespace Kernel
 
 Acpi::Acpi()
     : Root(nullptr)
+    , RootLength(0)
     , RootIsXsdt(false)
     , LapicAddress(nullptr)
     , IoApicAddress(nullptr)
     , IrqToGsiSize(0)
+    , IoApicGsiBase(~0U)
     , Pm1aCntPort(0)
     , ResetRegValid(false)
     , ResetRegPort(0)
@@ -28,6 +30,7 @@ Acpi::Acpi()
     for (size_t i = 0; i < Stdlib::ArraySize(Table); i++)
     {
         Table[i] = nullptr;
+        TableLength[i] = 0;
     }
 }
 
@@ -202,10 +205,10 @@ Stdlib::Error Acpi::ParseRootTable(ACPISDTHeader* root)
 
     if (checkRsdtChecksum)
     {
-        if (ComputeSum(root, root->Length) != 0)
+        if (ComputeSum(root, RootLength) != 0)
         {
             Trace(AcpiLL, "%s 0x%p checksum failed 0x%p vs 0x%p", signature,
-                root, (ulong)ComputeSum(root, root->Length), (ulong)root->Checksum);
+                root, (ulong)ComputeSum(root, RootLength), (ulong)root->Checksum);
              return MakeError(Stdlib::Error::NotFound);
         }
     }
@@ -230,109 +233,169 @@ ulong Acpi::RootEntry(size_t index)
     return (ulong)value;
 }
 
-Acpi::ACPISDTHeader* Acpi::LookupTable(const char *name)
+namespace
 {
+
+/* What this kernel reads of ACPI: the MADT, the FADT, the HPET table and
+   the WDAT (Acpi::Table has one slot for each) */
+const char* const WantedTables[] = { "APIC", "FACP", "HPET", "WDAT" };
+
+}
+
+long Acpi::WantedIndex(const char* signature)
+{
+    static_assert(sizeof(WantedTables) / sizeof(WantedTables[0]) == MaxTables, "a slot of Table for each table read");
+
+    for (size_t i = 0; i < Stdlib::ArraySize(WantedTables); i++)
+    {
+        if (Stdlib::StrnCmp(signature, WantedTables[i], 4) == 0)
+            return (long)i;
+    }
+
+    return -1;
+}
+
+void Acpi::UnmapTableRange(void* va, ulong len)
+{
+    auto& pt = Mm::PageTable::GetInstance();
+
+    ulong start = reinterpret_cast<ulong>(va) & ~(Const::PageSize - 1);
+    ulong end = reinterpret_cast<ulong>(va) + len;
+    for (ulong page = start; page < end; page += Const::PageSize)
+        pt.TmpUnmapPage(page);
+}
+
+Acpi::ACPISDTHeader* Acpi::MapHeader(ulong phys)
+{
+    if (phys > Mm::MemoryMap::MaxPhysAddr - sizeof(ACPISDTHeader))
+    {
+        Trace(0, "Acpi: table at 0x%p, past the physical address space", phys);
+        return nullptr;
+    }
+
+    auto* header = reinterpret_cast<ACPISDTHeader*>(
+        Mm::PageTable::GetInstance().TmpMapRange(phys, sizeof(ACPISDTHeader)));
+    if (header == nullptr)
+        Trace(0, "Acpi: can't map table at 0x%p", phys);
+    return header;
+}
+
+Acpi::ACPISDTHeader* Acpi::MapWhole(ACPISDTHeader* header, ulong phys, u32& length)
+{
+    length = header->Length;
+    char signature[5];
+    Stdlib::MemCpy(signature, header->Signature, sizeof(header->Signature));
+    signature[4] = '\0';
+
+    if (length < sizeof(ACPISDTHeader) || length > MaxTableLength ||
+        length > Mm::MemoryMap::MaxPhysAddr - phys)
+    {
+        Trace(0, "Acpi: %s at 0x%p length %u, not a table to map", signature, phys, (ulong)length);
+        UnmapTableRange(header, sizeof(ACPISDTHeader));
+        return nullptr;
+    }
+
+    /* Mapped again, as long as it says it is: what a parser reads of it is
+       that range, and the fuzzer holds the parsers to it byte for byte */
+    UnmapTableRange(header, sizeof(ACPISDTHeader));
+    auto* table = reinterpret_cast<ACPISDTHeader*>(Mm::PageTable::GetInstance().TmpMapRange(phys, length));
+    if (table == nullptr)
+        Trace(0, "Acpi: can't map %s at 0x%p length %u", signature, phys, (ulong)length);
+    return table;
+}
+
+void Acpi::ReleaseTables()
+{
+    for (size_t i = 0; i < Stdlib::ArraySize(Table); i++)
+    {
+        if (Table[i] != nullptr)
+        {
+            UnmapTableRange(Table[i], TableLength[i]);
+            Table[i] = nullptr;
+            TableLength[i] = 0;
+        }
+    }
+
+    if (Root != nullptr)
+    {
+        UnmapTableRange(Root, RootLength);
+        Root = nullptr;
+        RootLength = 0;
+    }
+}
+
+Acpi::ACPISDTHeader* Acpi::LookupTable(const char *name, u32& length)
+{
+    length = 0;
     if (Stdlib::StrLen(name) != 4)
     {
         return nullptr;
     }
 
-    for (size_t i = 0; i < Stdlib::ArraySize(Table); i++)
-    {
-        if (Table[i] != nullptr && Stdlib::StrnCmp(Table[i]->Signature, name, 4) == 0)
-        {
-            return Table[i];
-        }
-    }
+    long index = WantedIndex(name);
+    if (index < 0)
+        return nullptr;
 
-    return nullptr;
+    length = TableLength[index];
+    return Table[index];
 }
 
 Stdlib::Error Acpi::ParseTablePointers()
 {
-    Stdlib::Error err;
-
-    if (Root->Length <= sizeof(*Root))
+    if (RootLength <= sizeof(ACPISDTHeader))
         return MakeError(Stdlib::Error::NotFound);
 
     const size_t entrySize = RootIsXsdt ? sizeof(u64) : sizeof(u32);
-    size_t tableCount = (Root->Length - OFFSET_OF(ACPISDTHeader, Entry)) / entrySize;
+    size_t tableCount = (RootLength - OFFSET_OF(ACPISDTHeader, Entry)) / entrySize;
     Trace(0, "Acpi: %s, %u tables", RootIsXsdt ? "Xsdt" : "Rsdt", tableCount);
-
-    auto& pt = Mm::PageTable::GetInstance();
 
     for (size_t i = 0; i < tableCount; i++)
     {
-        if (i >= Stdlib::ArraySize(Table))
-        {
-            /* Keep what was collected rather than losing ACPI altogether:
-               the tables this kernel looks up are APIC, FACP, HPET, MCFG and
-               WDAT, and a machine missing one SSDT still boots, while a
-               machine with no ACPI at all panics. */
-            Trace(0, "Acpi: table array full at %u of %u, ignoring the rest",
-                (ulong)i, (ulong)tableCount);
-            break;
-        }
-
-        /*
-         * First map just the header page to read Length, then re-map
-         * the full table so that parsers have a contiguous VA range.
-         */
+        /* The header first, for the signature: a table this kernel reads is
+           then mapped whole, so that its parser has it at one VA range */
         ulong entryPhys = RootEntry(i);
-        ulong physOffset = entryPhys & (Const::PageSize - 1);
-
-        /* TmpMapAddress maps only the entry's page; if the SDT header (whose
-           Length field at offset 4 we read next) would straddle the page
-           boundary, map the header range instead so the read stays in bounds. */
-        bool headerStraddles = (physOffset + sizeof(ACPISDTHeader) > Const::PageSize);
-        ACPISDTHeader* header = headerStraddles
-            ? reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(entryPhys, sizeof(ACPISDTHeader)))
-            : reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(entryPhys));
-        if (!header)
-        {
-            Trace(0, "Acpi: can't map table %u phys 0x%p", (ulong)i, entryPhys);
-            return MakeError(Stdlib::Error::NoMemory);
-        }
-
-        u32 tableLength = header->Length;
-        if (tableLength < sizeof(ACPISDTHeader))
-        {
-            Trace(0, "Acpi: table %u length %u too small", (ulong)i, (ulong)tableLength);
-            return MakeError(Stdlib::Error::InvalidValue);
-        }
-
-        if (physOffset + tableLength > Const::PageSize)
-        {
-            /* Table spans pages — unmap the header mapping (one page, or two if
-               it straddled) and re-map the full range contiguously. */
-            ulong hdrVaPage = reinterpret_cast<ulong>(header) & ~(Const::PageSize - 1);
-            pt.TmpUnmapPage(hdrVaPage);
-            if (headerStraddles)
-                pt.TmpUnmapPage(hdrVaPage + Const::PageSize);
-            header = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(entryPhys, tableLength));
-            if (!header)
-            {
-                Trace(0, "Acpi: can't map table %u range phys 0x%p len %u",
-                    (ulong)i, entryPhys, (ulong)tableLength);
-                return MakeError(Stdlib::Error::NoMemory);
-            }
-        }
+        ACPISDTHeader* header = MapHeader(entryPhys);
+        if (header == nullptr)
+            continue;
 
         char tableSignature[5];
         Stdlib::MemCpy(tableSignature, header->Signature, sizeof(header->Signature));
         tableSignature[4] = '\0';
 
-        Trace(AcpiLL, "Acpi: table 0x%p %s len %u", header, tableSignature, (ulong)tableLength);
+        /* A table this kernel does not read, or a second of one it does, is
+           let go of here: neither is worth a slot of the window */
+        long wanted = WantedIndex(tableSignature);
+        if (wanted < 0 || Table[wanted] != nullptr)
+        {
+            Trace(AcpiLL, "Acpi: table %u %s len %u not kept", (ulong)i, tableSignature,
+                (ulong)header->Length);
+            UnmapTableRange(header, sizeof(ACPISDTHeader));
+            continue;
+        }
 
-        Table[i] = header;
+        u32 tableLength = 0;
+        ACPISDTHeader* table = MapWhole(header, entryPhys, tableLength);
+        if (table == nullptr)
+            continue;
+
+        Trace(AcpiLL, "Acpi: table 0x%p %s len %u", table, tableSignature, (ulong)tableLength);
+
+        Table[wanted] = table;
+        TableLength[wanted] = tableLength;
     }
 
-     return MakeError(Stdlib::Error::Success);
+    return MakeError(Stdlib::Error::Success);
+}
+
+bool Acpi::RegistersInPage(ulong phys, ulong bytes)
+{
+    return (phys & (Const::PageSize - 1)) <= Const::PageSize - bytes;
 }
 
 Stdlib::Error Acpi::ParseMADT()
 {
-    ACPISDTHeader* sdtHeader = LookupTable("APIC");
+    u32 length = 0;
+    ACPISDTHeader* sdtHeader = LookupTable("APIC", length);
     if (sdtHeader == nullptr)
     {
         return MakeError(Stdlib::Error::NotFound);
@@ -340,18 +403,31 @@ Stdlib::Error Acpi::ParseMADT()
 
     Trace(AcpiLL, "Acpi: MADT 0x%p", sdtHeader);
 
+    if (length < sizeof(ACPISDTHeader) + sizeof(MadtHeader))
+    {
+        Trace(0, "Acpi: MADT too short: %u", (ulong)length);
+        return MakeError(Stdlib::Error::InvalidValue);
+    }
+
     MadtHeader* header = reinterpret_cast<MadtHeader*>(sdtHeader + 1);
     Trace(AcpiLL, "Acpi: MADT LIntCtrl 0x%p flags 0x%p",
         (ulong)header->LocalIntCtrlAddress, (ulong)header->Flags);
 
-    LapicAddress = (void *)Mm::PageTable::GetInstance().TmpMapAddress(header->LocalIntCtrlAddress);
+    const ulong lapicPhys = header->LocalIntCtrlAddress;
+    if (!RegistersInPage(lapicPhys, LapicRegisterBytes))
+    {
+        Trace(0, "Acpi: MADT local APIC at 0x%p, not a page", lapicPhys);
+        return MakeError(Stdlib::Error::InvalidValue);
+    }
+
+    LapicAddress = (void *)Mm::PageTable::GetInstance().TmpMapAddress(lapicPhys);
     if (LapicAddress == nullptr)
     {
         return MakeError(Stdlib::Error::NoMemory);
     }
 
     MadtEntry* entry = &header->Entry[0];
-    void* madtEnd = Stdlib::MemAdd(sdtHeader, sdtHeader->Length);
+    void* madtEnd = Stdlib::MemAdd(sdtHeader, length);
 
     /* Check the 2-byte entry header is within the table before reading
        entry->Length, then that the whole entry fits -- a truncated or corrupt
@@ -394,15 +470,35 @@ Stdlib::Error Acpi::ParseMADT()
                 return MakeError(Stdlib::Error::InvalidValue);
             MadtIoApicEntry* ioApicEntry = reinterpret_cast<MadtIoApicEntry*>(entry + 1);
 
-            IoApicAddress = (void *)Mm::PageTable::GetInstance().TmpMapAddress(ioApicEntry->IoApicAddress);
-            if (IoApicAddress == nullptr)
+            Trace(AcpiLL, "Acpi: MADT ioApicId %u addr 0x%p gsi 0x%p",
+                (ulong)ioApicEntry->IoApicId, (ulong)ioApicEntry->IoApicAddress,
+                (ulong)ioApicEntry->GlobalSystemInterruptBase);
+
+            /* The IO-APIC driver takes a GSI for the index of its pin, so the
+               one it drives is the one whose pins start at GSI 0 -- the
+               legacy IRQs' -- or, on a machine with none such, the first.
+               A machine may have several (AMD's FCH and GNB): only the one
+               kept is mapped. */
+            const u32 base = ioApicEntry->GlobalSystemInterruptBase;
+            const ulong ioApicPhys = ioApicEntry->IoApicAddress;
+            if (!RegistersInPage(ioApicPhys, IoApicRegisterBytes))
+            {
+                Trace(0, "Acpi: MADT IO-APIC at 0x%p, its registers across a page, ignored", ioApicPhys);
+                break;
+            }
+            if (IoApicAddress != nullptr && (IoApicGsiBase == 0 || base != 0))
+                break;
+
+            void* mapped = (void *)Mm::PageTable::GetInstance().TmpMapAddress(ioApicPhys);
+            if (mapped == nullptr)
             {
                 return MakeError(Stdlib::Error::NoMemory);
             }
 
-            Trace(AcpiLL, "Acpi: MADT ioApicId %u addr 0x%p gsi 0x%p",
-                (ulong)ioApicEntry->IoApicId, (ulong)ioApicEntry->IoApicAddress,
-                (ulong)ioApicEntry->GlobalSystemInterruptBase);
+            if (IoApicAddress != nullptr)
+                UnmapTableRange(IoApicAddress, 1);
+            IoApicAddress = mapped;
+            IoApicGsiBase = base;
             break;
         }
         case MadtEntryTypeIntSrcOverride:
@@ -415,9 +511,7 @@ Stdlib::Error Acpi::ParseMADT()
                 (ulong)isoEntry->BusSource, (ulong)isoEntry->IrqSource, (ulong)isoEntry->GlobalSystemInterrupt,
                 (ulong)isoEntry->Flags);
 
-            if (!RegisterIrqToGsi(isoEntry->IrqSource, isoEntry->GlobalSystemInterrupt, isoEntry->Flags))
-                return MakeError(Stdlib::Error::NoMemory);
-
+            RegisterIrqToGsi(isoEntry->IrqSource, isoEntry->GlobalSystemInterrupt, isoEntry->Flags);
             break;
         }
         default:
@@ -427,19 +521,28 @@ Stdlib::Error Acpi::ParseMADT()
         entry = static_cast<MadtEntry*>(Stdlib::MemAdd(entry, entry->Length));
     }
 
+    /* The interrupts are the IO-APIC's to route: without one to drive, the
+       boot would fault in its driver at address 0 */
+    if (IoApicAddress == nullptr)
+    {
+        Trace(0, "Acpi: MADT names no IO-APIC");
+        return MakeError(Stdlib::Error::NotFound);
+    }
+
     return MakeError(Stdlib::Error::Success);
 }
 
 void Acpi::ParseFADT()
 {
-    ACPISDTHeader* sdtHeader = LookupTable("FACP");
+    u32 length = 0;
+    ACPISDTHeader* sdtHeader = LookupTable("FACP", length);
     if (sdtHeader == nullptr)
     {
         Trace(AcpiLL, "Acpi: no FADT table");
         return;
     }
 
-    ulong bodyLen = sdtHeader->Length - sizeof(ACPISDTHeader);
+    ulong bodyLen = length - sizeof(ACPISDTHeader);
     FadtFields* fadt = reinterpret_cast<FadtFields*>(sdtHeader + 1);
 
     /* Pm1aCntBlk sits at body offset +28; need at least 32 bytes of body */
@@ -485,16 +588,17 @@ u8 Acpi::GetCenturyRegister()
 
 void Acpi::ParseHPET()
 {
-    ACPISDTHeader* sdtHeader = LookupTable("HPET");
+    u32 length = 0;
+    ACPISDTHeader* sdtHeader = LookupTable("HPET", length);
     if (sdtHeader == nullptr)
     {
         Trace(AcpiLL, "Acpi: no HPET table");
         return;
     }
 
-    if (sdtHeader->Length < sizeof(ACPISDTHeader) + sizeof(HpetTableBody))
+    if (length < sizeof(ACPISDTHeader) + sizeof(HpetTableBody))
     {
-        Trace(0, "Acpi: HPET table too short: %u", (ulong)sdtHeader->Length);
+        Trace(0, "Acpi: HPET table too short: %u", (ulong)length);
         return;
     }
 
@@ -525,23 +629,24 @@ void Acpi::ParseHPET()
  */
 void Acpi::ParseWDAT()
 {
-    ACPISDTHeader* sdtHeader = LookupTable("WDAT");
+    u32 length = 0;
+    ACPISDTHeader* sdtHeader = LookupTable("WDAT", length);
     if (sdtHeader == nullptr)
     {
         Trace(AcpiLL, "Acpi: no WDAT table");
         return;
     }
 
-    if (sdtHeader->Length < sizeof(ACPISDTHeader) + sizeof(WdatTableBody))
+    if (length < sizeof(ACPISDTHeader) + sizeof(WdatTableBody))
     {
-        Trace(0, "Acpi: WDAT table too short: %u", (ulong)sdtHeader->Length);
+        Trace(0, "Acpi: WDAT table too short: %u", (ulong)length);
         return;
     }
 
     WdatTableBody* wdat = reinterpret_cast<WdatTableBody*>(sdtHeader + 1);
 
     /* Trust the table length over the Entries count */
-    size_t maxEntries = (sdtHeader->Length - sizeof(ACPISDTHeader) - sizeof(WdatTableBody))
+    size_t maxEntries = (length - sizeof(ACPISDTHeader) - sizeof(WdatTableBody))
         / sizeof(WdatEntry);
     size_t entries = wdat->Entries;
     if (entries > maxEntries)
@@ -570,6 +675,32 @@ void Acpi::ParseWDAT()
 
 Stdlib::Error Acpi::Parse()
 {
+    Stdlib::Error err = ParseTables();
+
+    /* The tables are read once, here: what is kept of them is the values
+       taken out, and on a failure not even the APICs' pages, which nothing
+       is then to use */
+    ReleaseTables();
+    if (!err.Ok())
+    {
+        if (LapicAddress != nullptr)
+        {
+            UnmapTableRange(LapicAddress, 1);
+            LapicAddress = nullptr;
+        }
+        if (IoApicAddress != nullptr)
+        {
+            UnmapTableRange(IoApicAddress, 1);
+            IoApicAddress = nullptr;
+            IoApicGsiBase = ~0U;
+        }
+    }
+
+    return err;
+}
+
+Stdlib::Error Acpi::ParseTables()
+{
     Stdlib::Error err;
     ulong rootPhysAddr = 0;
     if (!FindRootTable(rootPhysAddr, RootIsXsdt))
@@ -577,47 +708,19 @@ Stdlib::Error Acpi::Parse()
         return MakeError(Stdlib::Error::NotFound);
     }
 
-    auto& pt = Mm::PageTable::GetInstance();
-
-    /* TmpMapAddress maps a single page and SDTs are only 4-byte aligned:
-       if the RSDT header (Length at offset 4) straddles the page boundary,
-       map the header range instead -- the same defense ParseTablePointers
-       applies to every other SDT. */
-    ulong rootPhysOff = rootPhysAddr & (Const::PageSize - 1);
-    bool headerStraddles = (rootPhysOff + sizeof(ACPISDTHeader) > Const::PageSize);
-    ACPISDTHeader* rsdt = headerStraddles
-        ? reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rootPhysAddr, sizeof(ACPISDTHeader)))
-        : reinterpret_cast<ACPISDTHeader*>(pt.TmpMapAddress(rootPhysAddr));
-    if (!rsdt)
+    ACPISDTHeader* header = MapHeader(rootPhysAddr);
+    if (header == nullptr)
         return MakeError(Stdlib::Error::NoMemory);
 
-    u32 rootLength = rsdt->Length;
-    if (rootLength < sizeof(ACPISDTHeader))
-    {
-        Trace(0, "Acpi: rsdt length %u too small", (ulong)rootLength);
+    Root = MapWhole(header, rootPhysAddr, RootLength);
+    if (Root == nullptr)
         return MakeError(Stdlib::Error::InvalidValue);
-    }
 
-    /* Re-map the full table before ParseRootTable: its checksum walks all
-       Length bytes, which may extend past the header mapping. */
-    if (rootPhysOff + rootLength > Const::PageSize)
-    {
-        ulong hdrVaPage = reinterpret_cast<ulong>(rsdt) & ~(Const::PageSize - 1);
-        pt.TmpUnmapPage(hdrVaPage);
-        if (headerStraddles)
-            pt.TmpUnmapPage(hdrVaPage + Const::PageSize);
-        rsdt = reinterpret_cast<ACPISDTHeader*>(pt.TmpMapRange(rootPhysAddr, rootLength));
-        if (!rsdt)
-            return MakeError(Stdlib::Error::NoMemory);
-    }
-
-    err = ParseRootTable(rsdt);
+    err = ParseRootTable(Root);
     if (!err.Ok())
     {
         return err;
     }
-
-    Root = rsdt;
 
     err = ParseTablePointers();
     if (!err.Ok())
@@ -650,17 +753,32 @@ void* Acpi::GetIoApicAddress()
     return IoApicAddress;
 }
 
-bool Acpi::RegisterIrqToGsi(u8 irq, u32 gsi, u16 flags)
+void Acpi::RegisterIrqToGsi(u8 irq, u32 gsi, u16 flags)
 {
-    if (IrqToGsiSize >= Stdlib::ArraySize(IrqToGsi))
-        return false;
+    /* Interrupt::Register takes a GSI in an u8 */
+    static const u32 MaxGsi = 0xFF;
+
+    for (size_t i = 0; i < IrqToGsiSize; i++)
+    {
+        if (IrqToGsi[i].Irq == irq)
+        {
+            Trace(0, "Acpi: second override of irq %u (to gsi %u) ignored", (ulong)irq, (ulong)gsi);
+            return;
+        }
+    }
+
+    if (gsi > MaxGsi || IrqToGsiSize >= Stdlib::ArraySize(IrqToGsi))
+    {
+        Trace(0, "Acpi: override of irq %u to gsi %u ignored: %s", (ulong)irq, (ulong)gsi,
+            (gsi > MaxGsi) ? "past the GSIs taken" : "no room");
+        return;
+    }
 
     auto& entry = IrqToGsi[IrqToGsiSize];
     entry.Irq = irq;
     entry.Gsi = gsi;
     entry.Flags = flags;
     IrqToGsiSize++;
-    return true;
 }
 
 u16 Acpi::GetIrqFlags(u8 irq)

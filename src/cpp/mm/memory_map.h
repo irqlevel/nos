@@ -32,6 +32,10 @@ public:
        (x86's MAXPHYADDR, arm64 with LPA), so no RAM or device is there. */
     static const ulong MaxPhysAddr = 1UL << 52;
 
+    /* How many regions the map holds: what Linux's boot protocol passes
+       (E820_MAX_ENTRIES_ZEROPAGE) */
+    static const size_t MaxRegions = 128;
+
     ulong GetKernelStart();
 
     ulong GetKernelEnd();
@@ -107,7 +111,7 @@ private:
         ulong Type;
     };
 
-    MemoryRegion Region[64];
+    MemoryRegion Region[MaxRegions];
     size_t Size;
 
     /* Index of the region that last answered IsUsableRam. A hint only: it is

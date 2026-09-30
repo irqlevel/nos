@@ -18,6 +18,10 @@ static u8 AcpiRsdpCopy[64];
 static size_t AcpiRsdpSize;
 static bool AcpiRsdpIsNew;
 
+/* Regions the kernel adds to the memory map itself once the firmware's are
+   in: PageArray's, with room to spare */
+static const ulong KernelCarveOuts = 4;
+
 static bool FramebufferPresent;
 static u8 FramebufferType;
 static FramebufferInfo Framebuffer;
@@ -68,13 +72,15 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
 
     const void* mbInfoEnd = Stdlib::MemAdd(MbInfo, MbInfo->TotalSize);
     MultiBootTag * tag;
+    /* A tag's header is read only once it is known to be inside the info: an
+       info with no end tag, or one shorter than its header, ends here */
     for (tag = reinterpret_cast<MultiBootTag*>(MbInfo + 1);
+        Stdlib::MemAdd(tag, sizeof(*tag)) <= mbInfoEnd &&
         tag->Type != MultiBootTagTypeEnd;
         )
     {
         /* A malformed tag must not walk past the info buffer or spin forever */
-        if (Stdlib::MemAdd(tag, sizeof(*tag)) > mbInfoEnd ||
-            Stdlib::MemAdd(tag, tag->Size) > mbInfoEnd ||
+        if (Stdlib::MemAdd(tag, tag->Size) > mbInfoEnd ||
             tag->Size < sizeof(*tag))
         {
             Trace(0, "Malformed tag %u size %u, stop parsing", (ulong)tag->Type, (ulong)tag->Size);
@@ -105,17 +111,46 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
             if (mmap->EntrySize < sizeof(MultiBootMmapEntry))
                 break;
 
-            for (entry = &mmap->Entry[0];
-                 Stdlib::MemAdd(entry, mmap->EntrySize) <= Stdlib::MemAdd(mmap, mmap->Size);
-                 entry = reinterpret_cast<MultiBootMmapEntry*>(Stdlib::MemAdd(entry, mmap->EntrySize)))
+            /* The map is a table of fixed size, and this runs before any
+               console a headless machine has: a firmware's map too long for
+               it must not stop the boot without a word. So reserved regions
+               go in first and usable RAM after, leaving room for the
+               kernel's own carve-outs (PageArray's): a reserved region left
+               out would be pages handed out that are not RAM, a usable one
+               only RAM not used, which is said. Only reserved regions too
+               many for the table by themselves stop the boot. */
+            auto& memoryMap = Kernel::Mm::MemoryMap::GetInstance();
+            ulong dropped = 0;
+            ulong droppedBytes = 0;
+            for (ulong pass = 0; pass < 2; pass++)
             {
-                Trace(0, "Mmap addr 0x%p len 0x%p type %u",
-                    entry->Addr, entry->Len, (ulong)entry->Type);
+                const bool usablePass = (pass == 1);
+                for (entry = &mmap->Entry[0];
+                     Stdlib::MemAdd(entry, mmap->EntrySize) <= Stdlib::MemAdd(mmap, mmap->Size);
+                     entry = reinterpret_cast<MultiBootMmapEntry*>(Stdlib::MemAdd(entry, mmap->EntrySize)))
+                {
+                    const bool usable = (entry->Type == MultiBootMemoryAvailable);
+                    if (usable != usablePass)
+                        continue;
 
-                if (!Kernel::Mm::MemoryMap::GetInstance().AddRegion((ulong)entry->Addr, (ulong)entry->Len, (ulong)entry->Type))
-                    Panic("Can't add memory region");
+                    Trace(0, "Mmap addr 0x%p len 0x%p type %u",
+                        entry->Addr, entry->Len, (ulong)entry->Type);
 
+                    if (usable && memoryMap.GetRegionCount() + KernelCarveOuts >= Kernel::Mm::MemoryMap::MaxRegions)
+                    {
+                        dropped++;
+                        droppedBytes += entry->Len;
+                        continue;
+                    }
+
+                    if (!memoryMap.AddRegion((ulong)entry->Addr, (ulong)entry->Len, (ulong)entry->Type))
+                        Panic("Can't add memory region");
+                }
             }
+
+            if (dropped != 0)
+                Trace(0, "mm: %u usable regions, %u MiB, past what the memory map holds, not used",
+                    dropped, droppedBytes / Const::MB);
             break;
         }
         case MultiBootTagTypeCmdline:

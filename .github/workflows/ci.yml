@@ -82,10 +82,12 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/net-fuzz.py
 
-      # The device tree the arm64 boot is handed, the firmware's memory map,
-      # the GRUB environment block on /boot: what the kernel's C++ reads
-      # before anything checked it, and a read past an end or a wrap there
-      # is a boot that dies without a word. That C++ fuzzed on the host
+      # The device tree the arm64 boot is handed, the Multiboot2 tags and
+      # the ACPI tables the x86 one is, the firmware's memory map, the
+      # command line, the GRUB environment block on /boot, a module's .ko:
+      # what the kernel's C++ reads before anything checked it, and a read
+      # past an end or a wrap there is a boot that dies without a word; and
+      # the memory management under everything. That C++ fuzzed on the host
       # under the address and UB sanitizers, the same inputs every run.
       - name: C++ fuzz (host)
         if: matrix.arch == 'aarch64'

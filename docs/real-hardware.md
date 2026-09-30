@@ -146,6 +146,17 @@ many. TCG refuses to expose `perfctr-core` at all, so this box is the only
 place the arming path has ever run — everything before it was the CPUID
 gate declining.
 
+**Interrupt controllers.** The MADT lists two IO-APICs, the FCH's (id 13,
+`0xFEC00000`, its pins from GSI 0) first and the GNB's (id 14, `0xFEC01000`,
+from GSI 24) second -- the first machine here with more than one. The
+IO-APIC driver takes a GSI for the index of its pin, so the one it can drive
+is the one at GSI 0; until 2026-09-30 ACPI kept the last one listed, and the
+legacy IRQs -- the HPET's tick, IRQ 0 by way of GSI 2, among them -- were set
+up on pins of the GNB's that none of those lines reaches. Nothing noticed:
+the tick only wakes the other CPUs until each runs its local APIC timer, and
+the kernel's clock reads a counter rather than counting ticks. It drives the
+FCH's now, and `irqstat` counts the HPET's tick at its 100 Hz.
+
 **Diagnostics.** With no serial port and the NIC itself under bring-up, the
 boot log had nowhere to go, which is what `disklog` is for: every traced
 line from the first one of the boot is queued, without a lock, until the raw
