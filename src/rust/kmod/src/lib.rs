@@ -31,8 +31,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 #[alloc_error_handler]
-fn alloc_error(_layout: core::alloc::Layout) -> ! {
-    ffi::panic::alloc_error()
+fn alloc_error(layout: core::alloc::Layout) -> ! {
+    ffi::panic::alloc_error(layout)
 }
 
 /// A module while it is loaded. Its init hands one back and `rmmod` drops

@@ -17,8 +17,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 #[alloc_error_handler]
-fn alloc_error(_layout: core::alloc::Layout) -> ! {
-    ffi::panic::alloc_error()
+fn alloc_error(layout: core::alloc::Layout) -> ! {
+    ffi::panic::alloc_error(layout)
 }
 
 #[no_mangle]
