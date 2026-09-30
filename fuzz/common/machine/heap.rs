@@ -11,7 +11,7 @@
 //! the kernel's, and is let be (`sched::harness`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use super::sched;
 
@@ -19,6 +19,21 @@ pub struct Heap;
 
 /// A panic has begun: its message is allocated too, and must be let be.
 pub static PANICKING: AtomicBool = AtomicBool::new(false);
+
+/// Bytes the kernel's code allocated and has not freed -- not the fuzzer's
+/// own, its log and its bookkeeping (`sched::harness`): what a target holds
+/// to staying the same across work that should leave nothing behind.
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+
+pub fn live() -> isize {
+    LIVE.load(Ordering::Relaxed)
+}
+
+fn count(bytes: isize) {
+    if !sched::exempt() {
+        LIVE.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
 
 pub fn check(what: &str, size: usize) {
     if sched::irq_off() == 0 || sched::exempt() || PANICKING.load(Ordering::Relaxed) {
@@ -35,11 +50,16 @@ unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         check("allocates", layout.size());
         // SAFETY: the caller's contract is the system's.
-        unsafe { System.alloc(layout) }
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            count(layout.size() as isize);
+        }
+        p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         check("frees", layout.size());
+        count(-(layout.size() as isize));
         // SAFETY: as above.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -47,12 +67,20 @@ unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         check("allocates", layout.size());
         // SAFETY: as above.
-        unsafe { System.alloc_zeroed(layout) }
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            count(layout.size() as isize);
+        }
+        p
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         check("reallocates", new_size);
         // SAFETY: as above.
-        unsafe { System.realloc(ptr, layout, new_size) }
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            count(new_size as isize - layout.size() as isize);
+        }
+        p
     }
 }

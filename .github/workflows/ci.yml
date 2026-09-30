@@ -62,6 +62,16 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/hv-fuzz.py
 
+      # What is on a disk is whoever wrote it's to choose, and a panic, a
+      # write where nothing may write or an image left corrupt there is
+      # anyone's to cause: the block and filesystem layers fuzzed on the
+      # host, the same inputs every run.
+      - name: Storage fuzz (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/fs-fuzz.py
+
       # Everything the network hands the kernel is somebody else's to choose,
       # and a panic, a lock broken or a spin there is anyone's to cause: the
       # network layer, TLS and sshd fuzzed on the host, the same inputs every

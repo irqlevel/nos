@@ -245,7 +245,13 @@ fn probe_gpt(disk: Disk, sector_size: usize) {
          * 16 KiB at the usual 128 slots, and only the first few are ever
          * used on a disk anyone here would prepare. */
         if i % per_sector == 0 {
-            let lba = header.entry_lba + (i / per_sector) as u64;
+            /* The array's place comes off the disk: one that runs off the
+             * end of the numbers ends the table, as one past the disk's
+             * end does. */
+            let lba = match header.entry_lba.checked_add((i / per_sector) as u64) {
+                Some(lba) => lba,
+                None => break,
+            };
             if !read_sector(&disk, lba, &mut ebuf.as_mut_slice()[..sector_size]) {
                 break;
             }
@@ -259,13 +265,12 @@ fn probe_gpt(disk: Disk, sector_size: usize) {
             continue;
         }
 
-        let first = le64(entry, 32);
-        let last = le64(entry, 40); /* inclusive */
-        if last < first {
-            continue;
-        }
+        let (first, count) = match gpt_extent(entry) {
+            Some(extent) => extent,
+            None => continue,
+        };
 
-        if !add_partition(disk, first, last - first + 1, i as u32) {
+        if !add_partition(disk, first, count, i as u32) {
             break;
         }
     }
@@ -506,7 +511,10 @@ fn dump_gpt(disk: &Disk, sector_size: usize, out: &mut Output) {
 
     for i in 0..shown as usize {
         if i % per_sector == 0 {
-            let lba = header.entry_lba + (i / per_sector) as u64;
+            let lba = match header.entry_lba.checked_add((i / per_sector) as u64) {
+                Some(lba) => lba,
+                None => break,
+            };
             if !read_sector(disk, lba, &mut ebuf.as_mut_slice()[..sector_size]) {
                 break;
             }
@@ -518,18 +526,25 @@ fn dump_gpt(disk: &Disk, sector_size: usize, out: &mut Output) {
             continue;
         }
 
-        let first = le64(entry, 32);
-        let last = le64(entry, 40);
-        if last < first {
-            continue;
-        }
-
-        let sectors = last - first + 1;
+        let (first, sectors) = match gpt_extent(entry) {
+            Some(extent) => extent,
+            None => continue,
+        };
         let _ = writeln!(out, "  {}  {:<12} {:<12} {:>5} MB  {}",
             i + 1, first, sectors,
-            (sectors * sector_size as u64) / (1024 * 1024),
+            sectors.saturating_mul(sector_size as u64) / (1024 * 1024),
             Guid(&entry[..GPT_GUID_LEN]));
     }
+}
+
+/// Where a GPT entry's partition is: its first sector and how many there
+/// are -- None for one that ends before it starts, or that says it is all
+/// 2^64 of them, which no count holds.
+fn gpt_extent(entry: &[u8]) -> Option<(u64, u64)> {
+    let first = le64(entry, 32);
+    let last = le64(entry, 40); /* inclusive */
+    let count = last.checked_sub(first)?.checked_add(1)?;
+    Some((first, count))
 }
 
 /// A GPT GUID as tools print it: the first three fields little-endian, the

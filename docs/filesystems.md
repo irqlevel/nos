@@ -78,8 +78,9 @@ A mounted filesystem claims its block device (`kernel_blockdev_claim_as`) until
 it is unmounted, and so do the disk log and a module writing to a device
 direct (`blkload`'s write tests) -- and the shell's `format` and `diskwrite`,
 for as long as they write. A claim is refused while another overlaps
-it — the same device, the disk a partition is on, or a partition of that
-disk — so a mount fails (`vfs: the device is in use by a mounted filesystem`
+it — a stretch of the same disk: the same device, the disk a partition is on,
+a partition of that disk, or another partition of it that the disk's table
+has overlap (the table is whoever wrote the disk's to choose) — so a mount fails (`vfs: the device is in use by a mounted filesystem`
 in dmesg) on the disk under a mounted partition, on the disk log's area, or
 on a device a write test is running on; and those, in turn, keep off a
 mounted one. Reads need no claim.
@@ -121,10 +122,16 @@ direct, indirect and doubly-indirect blocks (a file can reach 4 GiB at 4 KiB
 blocks; the triple-indirect block is not implemented and a file needing it is
 refused), sparse files, directories of any size. Directories are read from
 disk the first time a path walk enters them, not at mount, so the memory
-cost is what is used, not what is on the disk.
+cost is what is used, not what is on the disk -- all of a directory or none
+of it: one whose read fails part way keeps nothing it read, and is read
+again whole at the next look.
 
 What it refuses, and why:
 
+- a geometry that does not hold together: more blocks than the device has, an
+  inode count that is not its groups' inodes, a group whose bitmaps or inode
+  table lie outside the filesystem. Every number the driver works out from
+  the superblock is then one that cannot overflow or lead off the device.
 - any `incompat` feature other than `filetype` — ext3 with journal recovery
   pending, ext4 extents, `64bit`, `meta_bg`: same magic, different format.
 - an image without `filetype` (rev 0): directory entries do not say what
@@ -134,6 +141,12 @@ What it refuses, and why:
   would silently break.
 - symlinks and device nodes are left out of the tree; a file over 4 GiB is
   skipped with a message.
+- a write or a truncate past what the blocks map -- 64 MiB at 1 KiB blocks,
+  512 MiB at 2 KiB, 4 GiB at 4 KiB -- is refused whole, before anything is
+  allocated. A write that fails part way (the disk full, a block that would
+  not read) gives back what it allocated past the end of the file, and the
+  file keeps the size it had; what it wrote inside that size stays.
+- a name with a NUL in it: the VFS refuses one for every filesystem.
 
 Writing keeps the on-disk structures consistent for e2fsck and for Linux,
 which can mount the same partition (that is how modules get onto a Hetzner
@@ -144,7 +157,10 @@ the journal ext2 does not have:
   blocks (plain writes) followed by a device flush, then the inode, then
   the free counts in the group descriptors and superblock. A crash at any
   point leaves at worst blocks marked used that nothing references —
-  e2fsck reclaims them — and never a block both referenced and free.
+  e2fsck reclaims them — and never a block both referenced and free. A
+  create is the same: the bits, then the inode, then the name; and one
+  undone after an error writes its inode deleted before freeing the bits,
+  or, when that write fails, leaves them taken.
 - **A file's data pays for what it changes.** A write that allocated
   nothing — a disk image having its blocks written over, a guest's — moved
   no pointer and changed no bit, so nothing is ordered against it: the
@@ -165,7 +181,8 @@ the journal ext2 does not have:
   commits the inode without it, and only then clears the bits, in batches of
   512 blocks so a large file does not hold a huge list in memory. A remove
   takes the name out of its directory first, so a crash leaves an orphan for
-  `lost+found`, never a name leading nowhere.
+  `lost+found`, never a name leading nowhere; a directory goes deepest first,
+  by a walk and not a recursion, as deep as the paths reach.
 - **Renames add the new name before dropping the old one**, so a crash
   leaves the file reachable twice, which e2fsck reduces to once.
 - **The `valid` state bit is cleared at a read-write mount and set again
@@ -202,7 +219,13 @@ nanofs (`src/rust/fs/src/nanofs.rs`) is the kernel's own small checksummed files
 with the inode committed last. It predates ext2 write support and remains
 for what it is good at — a small, self-verifying store (`format nanofs`,
 `mount nanofs`, `scripts/mkfs_nanofs.py`) — and takes the whole file API,
-including writes at an offset and truncates, by rewriting the file.
+including writes at an offset and truncates, by rewriting the file. The
+mount reads the whole tree, by a walk with a stack of its own, so a tree as
+deep as the inodes allow reads back whole; a read checks the file's data
+against its checksum the first time after a mount or a write, not on every
+piece. Mounted read-only it writes nothing, not even the bitmap repair the
+mount makes of a reachable inode or block marked free. `format` and `mount`
+refuse a device smaller than the layout (69 MB) before touching it.
 
 ramfs (`src/rust/fs/src/ramfs.rs`) is the in-memory filesystem the fallback
 layout puts on `/`, and what `TestVfs` exercises at every boot: a file is
@@ -243,7 +266,8 @@ driver left it as it should.
 
 ## Checking it
 
-`fstest [dir] [size]` from the shell, or `fstest=on` at boot, runs
+`fstest [dir] [size]` from the shell (`size` at least 8 KiB), or `fstest=on`
+at boot, runs
 The self-test (`src/rust/fs/src/selftest.rs`) runs in a directory it makes and removes: write
 and read back, append, write at an offset, truncate both ways with the gap
 checked for zeros, rename, move into a subdirectory, `readdir`, the

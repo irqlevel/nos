@@ -35,8 +35,6 @@ pub const DATA_START: u32 = 1 + INODE_COUNT;
 pub const MAX_BLOCKS: usize = 256;
 pub const MAX_DIR_ENTRIES: usize = 256;
 pub const MAX_FILE_SIZE: usize = MAX_BLOCKS * BLOCK_SIZE;
-/// Recursion cap for the mount-time tree walk (32 KiB kernel stack)
-pub const MAX_DIR_DEPTH: u32 = 32;
 
 const TYPE_FREE: u32 = 0;
 const INODE_TYPE_FILE: u32 = 1;
@@ -166,11 +164,19 @@ pub struct NanoFs {
     tree: Tree,
     /// The vnode of each inode, by index
     vnodes: Vec<Option<NodeId>>,
-    /// Inodes whose walk is still on the recursion stack. A directory entry
-    /// naming one of those is a cycle in the image; linking it would put a
-    /// cycle in the VFS tree.
+    /// Directories whose entries the mount's walk is still going through. A
+    /// directory entry naming one of those is a cycle in the image; linking
+    /// it would put a cycle in the VFS tree.
     walking: Vec<bool>,
+    /// Files whose data has matched its checksum since the mount, or since
+    /// they were last written: a read checks the whole file's, and only the
+    /// first read of it need -- or reading a file a piece at a time would
+    /// read all of it for every piece.
+    verified: Vec<bool>,
     mounted: bool,
+    /// Mounted read-only: nothing is written, not even what the mount would
+    /// repair.
+    read_only: bool,
 }
 
 impl NanoFs {
@@ -183,14 +189,17 @@ impl NanoFs {
 
         let mut vnodes = Vec::new();
         let mut walking = Vec::new();
+        let mut verified = Vec::new();
         if vnodes.try_reserve_exact(INODE_COUNT as usize).is_err()
             || walking.try_reserve_exact(INODE_COUNT as usize).is_err()
+            || verified.try_reserve_exact(INODE_COUNT as usize).is_err()
         {
             trace!(0, "nanofs: no memory for the vnode table");
             return None;
         }
         vnodes.resize(INODE_COUNT as usize, None);
         walking.resize(INODE_COUNT as usize, false);
+        verified.resize(INODE_COUNT as usize, false);
 
         Some(NanoFs {
             io: Io { dev, sectors_per_block: (BLOCK_SIZE as u64 / sector_size) as u32 },
@@ -201,7 +210,9 @@ impl NanoFs {
             tree: Tree::new(),
             vnodes,
             walking,
+            verified,
             mounted: false,
+            read_only: false,
         })
     }
 
@@ -314,11 +325,15 @@ impl NanoFs {
 
     /* ---- mount ---- */
 
-    pub fn mount(&mut self) -> bool {
+    pub fn mount(&mut self, read_only: bool) -> bool {
         if self.mounted {
             trace!(0, "nanofs: already mounted");
             return false;
         }
+        if !fits(&self.io.dev) {
+            return false;
+        }
+        self.read_only = read_only;
 
         if !self.io.read_block(0, self.sb.as_mut_slice()) {
             trace!(0, "nanofs: the superblock could not be read");
@@ -357,7 +372,7 @@ impl NanoFs {
             return false;
         }
 
-        if self.walk(0, 0).is_none() {
+        if !self.load_tree() {
             trace!(0, "nanofs: the root inode could not be read");
             self.free_all();
             return false;
@@ -375,8 +390,10 @@ impl NanoFs {
             return;
         }
 
-        self.flush_super();
-        self.io.flush();
+        if !self.read_only {
+            self.flush_super();
+            self.io.flush();
+        }
         self.mounted = false;
         self.free_all();
     }
@@ -385,13 +402,23 @@ impl NanoFs {
         /* Every node there is, linked into the tree or not */
         self.tree.clear();
         self.vnodes.fill(None);
+        self.verified.fill(false);
     }
 
     pub fn sync(&mut self) -> bool {
-        if !self.mounted {
+        if !self.mounted || self.read_only {
             return true;
         }
         self.io.flush()
+    }
+
+    /// Whether a change may be made: false, and why traced, on a
+    /// filesystem mounted read-only.
+    fn writable(&self) -> bool {
+        if self.read_only {
+            trace!(0, "nanofs: read-only");
+        }
+        !self.read_only
     }
 
     /// Checksums are integrity, not authentication: a crafted image can carry
@@ -440,25 +467,82 @@ impl NanoFs {
             }
         }
 
-        if repaired {
+        /* Mounted read-only, the repair is the mount's to know and nobody's
+         * to write: nothing will allocate. */
+        if repaired && !self.read_only {
             self.flush_super();
         }
     }
 
-    /// Read the inode's vnode and, for a directory, everything under it.
-    /// None when the inode is free, damaged or out of range.
-    fn walk(&mut self, idx: u32, depth: u32) -> Option<NodeId> {
+    /// Read the whole tree, from the root down: every inode reachable made a
+    /// vnode, linked under the directory that names it. A walk with a stack
+    /// of its own and not a recursion, so that a tree as deep as the
+    /// filesystem lets one be made -- a directory in every inode -- costs
+    /// no kernel stack. False when the root cannot be read.
+    fn load_tree(&mut self) -> bool {
+        struct Frame {
+            idx: u32,
+            node: NodeId,
+            entries: Vec<u32>,
+            next: usize,
+        }
+
+        let (root, root_dir) = match self.load_inode(0) {
+            Some(loaded) => loaded,
+            None => return false,
+        };
+        let mut stack: Vec<Frame> = Vec::new();
+        if let Some(entries) = root_dir {
+            self.walking[0] = true;
+            stack.push(Frame { idx: 0, node: root, entries, next: 0 });
+        }
+
+        while let Some(top) = stack.last_mut() {
+            if top.next == top.entries.len() {
+                self.walking[top.idx as usize] = false;
+                stack.pop();
+                continue;
+            }
+            let child = top.entries[top.next];
+            top.next += 1;
+            let parent = top.node;
+
+            if child >= INODE_COUNT {
+                trace!(0, "nanofs: inode {} is out of range", child);
+                continue;
+            }
+            /* A corrupted image may name this directory itself, an
+             * ancestor still being walked -- a cycle, the root included --
+             * or an inode already linked somewhere else. Any of the three
+             * would make a tree that is not one: each has its vnode
+             * already. */
+            if self.vnodes[child as usize].is_some() {
+                continue;
+            }
+            let (node, dir) = match self.load_inode(child) {
+                Some(loaded) => loaded,
+                None => continue,
+            };
+            self.tree.insert_child(parent, node);
+            if let Some(entries) = dir {
+                if stack.try_reserve(1).is_err() {
+                    trace!(0, "nanofs: no memory to walk directory {}", child);
+                    continue;
+                }
+                self.walking[child as usize] = true;
+                stack.push(Frame { idx: child, node, entries, next: 0 });
+            }
+        }
+        true
+    }
+
+    /// Inode `idx`'s vnode, made and not linked anywhere yet; and, for a
+    /// directory with entries, the inodes they name. None when the inode
+    /// is free, damaged or out of range.
+    fn load_inode(&mut self, idx: u32) -> Option<(NodeId, Option<Vec<u32>>)> {
         if idx >= INODE_COUNT {
             trace!(0, "nanofs: inode {} is out of range", idx);
             return None;
-        }
-        if depth >= MAX_DIR_DEPTH {
-            trace!(0, "nanofs: the directory depth limit of {} was reached at inode {}",
-                MAX_DIR_DEPTH, idx);
-            return None;
-        }
-        if let Some(node) = self.vnodes[idx as usize] {
-            return Some(node);
         }
 
         if !self.read_inode(idx) {
@@ -497,32 +581,10 @@ impl NanoFs {
             /* The whole tree is read here, so a directory is complete */
             made.dir_loaded = is_dir;
         }
-
         self.vnodes[idx as usize] = Some(node);
-        self.walking[idx as usize] = true;
 
-        if is_dir && size > 0 {
-            for child in self.dir_entries(idx, first_block, size) {
-                let loaded = match self.walk(child, depth + 1) {
-                    Some(loaded) => loaded,
-                    None => continue,
-                };
-                /* A corrupted image may name this directory itself, an
-                 * ancestor still being walked -- a cycle, the root
-                 * included -- or an inode already linked somewhere else.
-                 * Any of the three would make a tree that is not one. */
-                if loaded == node
-                    || self.walking[child as usize]
-                    || self.tree.is_linked(loaded)
-                {
-                    continue;
-                }
-                self.tree.insert_child(node, loaded);
-            }
-        }
-
-        self.walking[idx as usize] = false;
-        Some(node)
+        let entries = if is_dir && size > 0 { Some(self.dir_entries(idx, first_block, size)) } else { None };
+        Some((node, entries))
     }
 
     /// The inode indices a directory's entries name. They are copied out of
@@ -745,6 +807,9 @@ impl NanoFs {
     }
 
     pub fn create_file(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        if !self.writable() {
+            return None;
+        }
         let dir_idx = self.create_into(dir, name)?;
         let idx = self.take_inode()?;
 
@@ -770,6 +835,9 @@ impl NanoFs {
     }
 
     pub fn create_dir(&mut self, dir: NodeId, name: &[u8]) -> Option<NodeId> {
+        if !self.writable() {
+            return None;
+        }
         let dir_idx = self.create_into(dir, name)?;
         let idx = self.take_inode()?;
         let block = match self.take_data_block() {
@@ -863,6 +931,9 @@ impl NanoFs {
     /// then are the old blocks given back: a crash at any point leaves
     /// either the old file or the new one, never a mix.
     fn rewrite(&mut self, file: NodeId, new_size: usize, data: &[u8], offset: usize) -> bool {
+        if !self.writable() {
+            return false;
+        }
         if new_size > MAX_FILE_SIZE {
             trace!(0, "nanofs: a size of {} is more than the {} a file holds",
                 new_size, MAX_FILE_SIZE);
@@ -910,6 +981,7 @@ impl NanoFs {
                 self.give_back_data_block(old_blocks[i]);
             }
             self.tree[file].size = 0;
+            self.verified[idx as usize] = false;
             return true;
         }
 
@@ -1002,6 +1074,7 @@ impl NanoFs {
         }
 
         self.tree[file].size = new_size;
+        self.verified[idx as usize] = false;
         true
     }
 
@@ -1096,29 +1169,42 @@ impl NanoFs {
             return false;
         }
 
-        if stored != 0 && self.data_checksum(&blocks[..], size) != stored {
-            trace!(0, "nanofs: the data of inode {} does not match its checksum", idx);
-            return false;
+        if stored != 0 && !self.verified[idx as usize] {
+            if self.data_checksum(&blocks[..], size) != stored {
+                trace!(0, "nanofs: the data of inode {} does not match its checksum", idx);
+                return false;
+            }
+            self.verified[idx as usize] = true;
         }
 
         true
     }
 
-    /// Take a node out of its directory, give back its blocks and inode, and
-    /// free the vnode; a directory goes with everything under it.
-    fn remove_tree(&mut self, node: NodeId) -> bool {
-        let (idx, is_dir) = match self.tree.get(node) {
-            Some(found) => (found.ino as u32, found.is_dir()),
-            None => return false,
-        };
-
-        if is_dir {
-            while let Some(child) = self.tree.first_child(node) {
-                if !self.remove_tree(child) {
-                    return false;
-                }
+    /// Take `top` away with everything under it, deepest first: each time
+    /// down to something with nothing under it, and that removed. A walk
+    /// and not a recursion, as the mount's is.
+    fn remove_tree(&mut self, top: NodeId) -> bool {
+        loop {
+            let mut at = top;
+            while let Some(child) = self.tree.first_child(at) {
+                at = child;
+            }
+            if !self.remove_one(at) {
+                return false;
+            }
+            if at == top {
+                return true;
             }
         }
+    }
+
+    /// Give back a node's blocks and inode -- a file, or a directory with
+    /// nothing left under it -- and free the vnode.
+    fn remove_one(&mut self, node: NodeId) -> bool {
+        let idx = match self.tree.get(node) {
+            Some(found) => found.ino as u32,
+            None => return false,
+        };
 
         /* Blocks go back only if the inode can be trusted to name its own:
          * a damaged one could name blocks another file owns. */
@@ -1142,12 +1228,16 @@ impl NanoFs {
         self.give_back_inode(idx);
 
         self.vnodes[idx as usize] = None;
+        self.verified[idx as usize] = false;
         /* Nothing is under it any more: this takes the one node away */
         self.tree.free_tree(node);
         true
     }
 
     pub fn remove(&mut self, node: NodeId) -> bool {
+        if !self.writable() {
+            return false;
+        }
         let idx = match self.ino_of(node) {
             Some(idx) => idx,
             None => {
@@ -1175,6 +1265,9 @@ impl NanoFs {
     }
 
     pub fn rename(&mut self, node: NodeId, new_dir: NodeId, new_name: &[u8]) -> bool {
+        if !self.writable() {
+            return false;
+        }
         let idx = match self.ino_of(node) {
             Some(idx) if !new_name.is_empty() => idx,
             _ => {
@@ -1250,12 +1343,29 @@ impl NanoFs {
     }
 }
 
+/// Whether the device holds the whole layout -- every block the superblock,
+/// the inodes and the data are -- which is fixed: said, and false, when it
+/// does not.
+fn fits(dev: &Disk) -> bool {
+    let need = (DATA_START as u64 + DATA_BLOCK_COUNT as u64) * BLOCK_SIZE as u64;
+    let have = dev.sectors().saturating_mul(dev.sector_size());
+    if have < need {
+        trace!(0, "nanofs: {} takes {} bytes, and the device has {}", dev.name(), need, have);
+        return false;
+    }
+    true
+}
+
 /// Write a fresh nanofs onto the device: a superblock, a root directory and
-/// nothing in it.
+/// nothing in it. Nothing is written to a device the layout does not fit:
+/// the first blocks would be gone before the last failed.
 pub fn format(dev: &Disk) -> bool {
     let sector_size = dev.sector_size();
     if sector_size == 0 || BLOCK_SIZE as u64 % sector_size != 0 {
         trace!(0, "nanofs: a sector size of {} does not divide a block", sector_size);
+        return false;
+    }
+    if !fits(dev) {
         return false;
     }
 
@@ -1333,7 +1443,7 @@ impl FileSystem for NanoFs {
     }
 
     fn mount(&mut self, read_only: bool) -> Option<bool> {
-        if NanoFs::mount(self) { Some(read_only) } else { None }
+        if NanoFs::mount(self, read_only) { Some(read_only) } else { None }
     }
 
     fn unmount(&mut self) {

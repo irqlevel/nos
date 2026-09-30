@@ -1,7 +1,10 @@
 //! The kernel's C++ half, as the `ffi` crate declares it: each function here
 //! is one of its `extern "C"` declarations, defined -- the linker takes it
-//! for the C++ one -- over the fuzzer's machine. Only what the linked code
-//! reaches is here; a declaration nothing calls needs no definition.
+//! for the C++ one -- over the fuzzer's machine. Only what some fuzzer's
+//! linked code reaches is here, and only what every machine has: what one
+//! layer's kernel alone reaches -- the network's command line, the disk
+//! log's -- is that fuzzer's own. A declaration nothing calls needs no
+//! definition.
 //!
 //! Every one runs as the fuzzer's own code (`sched::harness`): what it
 //! allocates is not the kernel's.
@@ -396,41 +399,6 @@ pub unsafe extern "C" fn kernel_free_dma_pages(ptr: *mut u8) {
 #[no_mangle]
 pub extern "C" fn kernel_virt_to_phys(virt: *const u8) -> u64 {
     virt as u64
-}
-
-/* ---- the kernel command line ---- */
-
-#[no_mangle]
-pub extern "C" fn kernel_param_dhcp_off() -> i32 {
-    super::params().dhcp_off as i32
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_param_dns_on() -> i32 {
-    super::params().dns_on as i32
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_param_rxpoll_on() -> i32 {
-    super::params().rxpoll_on as i32
-}
-
-/// # Safety
-/// The three are writable.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_netconsole_params(ip: *mut u32, port: *mut u16, tail_kb: *mut usize) -> i32 {
-    match super::params().netconsole {
-        Some((i, p, t)) => {
-            // SAFETY: `kcore::net::netconsole_params`'s locals.
-            unsafe {
-                *ip = i;
-                *port = p;
-                *tail_kb = t;
-            }
-            1
-        }
-        None => 0,
-    }
 }
 
 /// Every line the kernel log holds, oldest first: what the fuzzer traced

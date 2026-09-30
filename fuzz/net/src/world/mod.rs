@@ -36,37 +36,6 @@ pub const DNS_IP: u32 = 0x0A00_0203;
 pub const MASK: u32 = 0xFFFF_FF00;
 pub const GW_MAC: [u8; 6] = [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02];
 
-/* ---- each input ---- */
-
-/// How much of an input is the world's own: the seed of its chaos -- which
-/// task goes first, where one is preempted -- and of the entropy pool.
-const HEADER: usize = 8;
-
-/// The machine as each input finds it: the clock where it starts, the pool
-/// seeded from the input, the chaos chosen.
-pub fn begin(data: &[u8]) {
-    let mut seed = [0u8; HEADER];
-    for (i, b) in data.iter().take(HEADER).enumerate() {
-        seed[i] = *b;
-    }
-    let word = u64::from_le_bytes(seed);
-    /* Preemption at a lock let go of: never, for half the inputs, and for
-     * the rest one time in 64, 16 or 4. */
-    let preempt = match seed[0] {
-        0..=127 => 0,
-        128..=191 => 64,
-        192..=239 => 16,
-        _ => 4,
-    };
-    sched::begin_input(preempt, word);
-    machine::seed_random(word);
-}
-
-/// The input past the world's header: what the target reads.
-pub fn script(data: &[u8]) -> &[u8] {
-    data.get(HEADER..).unwrap_or(&[])
-}
-
 /* ---- the machine's programs ---- */
 
 /// A call a program on the machine makes, on a task of its own: its answer

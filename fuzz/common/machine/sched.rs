@@ -9,7 +9,7 @@
 //! soft IRQ runs in task context, one type at a time; a timer fires from
 //! interrupt context. When nobody can run, the clock moves on to the first
 //! deadline -- nothing here sleeps on a real clock. The world -- the
-//! fuzzer's own thread, which runs the target's script and the network
+//! fuzzer's own thread, which runs the target's script and whatever is
 //! around the machine -- is a task too, and the one soft IRQs run on.
 //!
 //! And the kernel's rules are checked where they are broken, each a finding:
@@ -275,9 +275,19 @@ fn reach(t: u64) {
     }
 }
 
-/// Wall-clock seconds: a date the fuzzer's certificates are valid at.
+/// Where the wall clock is when an input starts: a date the net fuzzer's
+/// certificates are valid at, unless a fuzzer says otherwise.
+static WALL_BASE: AtomicU64 = AtomicU64::new(1_830_000_000);
+
+/// The wall clock at the start of every input from now on: set once, at
+/// boot.
+pub fn set_wall_base(secs: u64) {
+    WALL_BASE.store(secs, Ordering::Relaxed);
+}
+
+/// Wall-clock seconds.
 pub fn wall_secs() -> u64 {
-    1_830_000_000 + (now() - START.min(now())) / 1_000_000_000
+    WALL_BASE.load(Ordering::Relaxed) + (now() - START.min(now())) / 1_000_000_000
 }
 
 /* ---- booting, and each input ---- */
@@ -492,7 +502,7 @@ pub fn interrupt<R>(f: impl FnOnce() -> R) -> R {
 
 /// That the running task may wait here -- else what it is doing is a
 /// finding.
-fn check_may_wait(what: &str) {
+pub fn check_may_wait(what: &str) {
     match ctx() {
         Ctx::Softirq => panic!("invariant: a soft IRQ handler {}: every packet waits for it -- the receive path \
                                 must never sleep", what),

@@ -23,6 +23,10 @@ use crate::vfs_instance;
 const WRITE_CHUNK: usize = 64 * 1024;
 const READ_CHUNK: usize = 12345;
 
+/// The big file at its smallest: the patch in its middle and the cut past
+/// it have to land inside it, as more than a block's worth.
+pub const MIN_BIG_SIZE: usize = 8192;
+
 /// Where a report goes: the log always, and the shell as well when the test
 /// was asked for from there.
 struct Reporter<'a> {
@@ -261,6 +265,13 @@ fn verify(vfs: &Vfs, path: &str, rbuf: &mut [u8], expect_len: usize,
 
 pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
     let mut report = Reporter { out };
+
+    /* The size is whoever asked's -- the shell's, a module's -- and the
+     * big file's patch and cut are worked out from it. */
+    if big_size < MIN_BIG_SIZE {
+        report.say(dir, "a big file under the smallest the test takes");
+        return false;
+    }
 
     let vfs = match vfs_instance() {
         Some(vfs) => vfs,

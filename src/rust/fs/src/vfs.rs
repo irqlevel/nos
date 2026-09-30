@@ -552,6 +552,12 @@ impl Vfs {
                 trace!(0, "vfs: a name in that path is longer than {} bytes", NAME_MAX - 1);
                 return None;
             }
+            /* No filesystem here keeps one: ext2's format forbids it, and
+             * nanofs's names end at the first. */
+            if component.contains(&0) {
+                trace!(0, "vfs: a name in that path has a NUL in it");
+                return None;
+            }
 
             let last = components.peek().is_none();
 
