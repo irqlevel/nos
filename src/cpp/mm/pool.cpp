@@ -25,14 +25,14 @@ Pool::~Pool()
 {
     Stdlib::AutoLock lock(Lock);
 
-    Trace(0, "0x%p blockSize %u peekBlockCount %u", this, BlockSize, PeekBlockCount);
+    Trace(0, "0x%p blockSize %lu peekBlockCount %lu", this, BlockSize, PeekBlockCount);
 
     if (BlockCount != 0)
-        Trace(0, "0x%p blockSize %u blockCount %u", this, BlockSize, BlockCount);
+        Trace(0, "0x%p blockSize %lu blockCount %lu", this, BlockSize, BlockCount);
 
     for (auto link = BlockList.Flink; link != &BlockList; link = link->Flink) {
         auto block = CONTAINING_RECORD(link, Block, Link);
-        Trace(0, "0x%p block 0x%p tag 0x%p", this, block, block->Tag);
+        Trace(0, "0x%p block 0x%p tag 0x%lX", this, block, block->Tag);
     }
 
     /* The pages stay mapped. Free() hands a page back the moment its last

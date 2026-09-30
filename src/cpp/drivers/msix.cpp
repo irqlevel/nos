@@ -77,7 +77,7 @@ bool MsixTable::MapBarForTable(Pci::DeviceInfo* dev, u8 bar, ulong offsetInBar,
 
     if (barVal & 1)
     {
-        Trace(0, "MsixTable: BAR%u is I/O, not MMIO", (ulong)bar);
+        Trace(0, "MsixTable: BAR%lu is I/O, not MMIO", (ulong)bar);
         return false;
     }
 
@@ -118,7 +118,7 @@ bool MsixTable::MapBarForTable(Pci::DeviceInfo* dev, u8 bar, ulong offsetInBar,
         return false;
     }
 
-    Trace(0, "MsixTable: BAR%u phys 0x%p size 0x%p table off 0x%p",
+    Trace(0, "MsixTable: BAR%lu phys 0x%lX size 0x%lX table off 0x%lX",
         (ulong)bar, physAddr, barSize, offsetInBar);
 
     auto& pt = Mm::PageTable::GetInstance();
@@ -176,7 +176,7 @@ bool MsixTable::Setup(Pci::DeviceInfo* dev, const ulong* mappedBars)
     {
         Table = (volatile u8*)(mappedBars[bir] + offInBar);
         mapped = true;
-        Trace(0, "MsixTable: reusing BAR%u VA 0x%p off 0x%p",
+        Trace(0, "MsixTable: reusing BAR%lu VA 0x%lX off 0x%lX",
             (ulong)bir, mappedBars[bir], offInBar);
     }
 
@@ -192,7 +192,7 @@ bool MsixTable::Setup(Pci::DeviceInfo* dev, const ulong* mappedBars)
     for (u16 i = 0; i < Count; i++)
         Mask(i);
 
-    Trace(0, "MsixTable: %u entries cap 0x%p", (ulong)Count, (ulong)cap);
+    Trace(0, "MsixTable: %lu entries cap 0x%lX", (ulong)Count, (ulong)cap);
     return true;
 }
 

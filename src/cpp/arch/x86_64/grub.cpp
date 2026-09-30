@@ -83,11 +83,11 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
         if (Stdlib::MemAdd(tag, tag->Size) > mbInfoEnd ||
             tag->Size < sizeof(*tag))
         {
-            Trace(0, "Malformed tag %u size %u, stop parsing", (ulong)tag->Type, (ulong)tag->Size);
+            Trace(0, "Malformed tag %lu size %lu, stop parsing", (ulong)tag->Type, (ulong)tag->Size);
             break;
         }
 
-        Trace(0, "Tag %u Size %u", (ulong)tag->Type, (ulong)tag->Size);
+        Trace(0, "Tag %lu Size %lu", (ulong)tag->Type, (ulong)tag->Size);
         switch (tag->Type)
         {
         case MultiBootTagTypeBootDev:
@@ -96,7 +96,7 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
                 break;
 
             MultiBootTagBootDev* bdev = reinterpret_cast<MultiBootTagBootDev*>(tag);
-            Trace(0, "Boot dev 0x%p 0x%p 0x%p",
+            Trace(0, "Boot dev 0x%lX 0x%lX 0x%lX",
                 (ulong)bdev->BiosDev, (ulong)bdev->Slice, (ulong)bdev->Part);
             break;
         }
@@ -133,8 +133,8 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
                     if (usable != usablePass)
                         continue;
 
-                    Trace(0, "Mmap addr 0x%p len 0x%p type %u",
-                        entry->Addr, entry->Len, (ulong)entry->Type);
+                    Trace(0, "Mmap addr 0x%lX len 0x%lX type %lu",
+                        (ulong)entry->Addr, (ulong)entry->Len, (ulong)entry->Type);
 
                     if (usable && memoryMap.GetRegionCount() + KernelCarveOuts >= Kernel::Mm::MemoryMap::MaxRegions)
                     {
@@ -149,7 +149,7 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
             }
 
             if (dropped != 0)
-                Trace(0, "mm: %u usable regions, %u MiB, past what the memory map holds, not used",
+                Trace(0, "mm: %lu usable regions, %lu MiB, past what the memory map holds, not used",
                     dropped, droppedBytes / Const::MB);
             break;
         }
@@ -185,13 +185,13 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
         case MultiBootTagTypeAcpiOld:
         {
             SaveAcpiRsdp(tag, false);
-            Trace(0, "Acpi old RSDP tag, size %u", (ulong)tag->Size);
+            Trace(0, "Acpi old RSDP tag, size %lu", (ulong)tag->Size);
             break;
         }
         case MultiBootTagTypeAcpiNew:
         {
             SaveAcpiRsdp(tag, true);
-            Trace(0, "Acpi new RSDP tag, size %u", (ulong)tag->Size);
+            Trace(0, "Acpi new RSDP tag, size %lu", (ulong)tag->Size);
             break;
         }
         case MultiBootTagTypeFramebuffer:
@@ -232,8 +232,8 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
                 Framebuffer.BlueSize = 8;
             }
 
-            Trace(0, "Framebuffer addr 0x%p %ux%u pitch %u bpp %u type %u",
-                fb->Addr, (ulong)fb->Width, (ulong)fb->Height,
+            Trace(0, "Framebuffer addr 0x%lX %lux%lu pitch %lu bpp %lu type %lu",
+                (ulong)fb->Addr, (ulong)fb->Width, (ulong)fb->Height,
                 (ulong)fb->Pitch, (ulong)fb->Bpp, (ulong)fb->FbType);
             break;
         }

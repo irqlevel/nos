@@ -25,7 +25,7 @@ BlockAllocatorImpl::BlockAllocatorImpl()
 
 bool BlockAllocatorImpl::Setup(ulong startAddress, ulong endAddress, ulong blockSize)
 {
-    Trace(0, "0x%p start 0x%p end 0x%p bsize %u", this, startAddress, endAddress, blockSize);
+    Trace(0, "0x%p start 0x%lX end 0x%lX bsize %lu", this, startAddress, endAddress, blockSize);
 
     Stdlib::AutoLock lock(Lock);
     if (Total != 0)
@@ -50,7 +50,7 @@ bool BlockAllocatorImpl::Setup(ulong startAddress, ulong endAddress, ulong block
         Total++;
     }
 
-    Trace(0, "0x%p start 0x%p end 0x%p bsize %u total %u", this, StartAddress, EndAddress, BlockSize, Total);
+    Trace(0, "0x%p start 0x%lX end 0x%lX bsize %lu total %lu", this, StartAddress, EndAddress, BlockSize, Total);
 
     return (Total != 0) ? true : false;
 }
@@ -61,16 +61,16 @@ BlockAllocatorImpl::~BlockAllocatorImpl()
 
     if (Usage != 0)
     {
-        Trace(0, "0x%p usage %u blockSize %u", this, Usage, BlockSize);
+        Trace(0, "0x%p usage %lu blockSize %lu", this, Usage, BlockSize);
         for (ListEntry* le = ActiveBlockList.Flink; le != &ActiveBlockList; le = le->Flink)
         {
             BlockEntry* b = CONTAINING_RECORD(le, BlockEntry, ListLink);
-            Trace(0, "leak entry 0x%p magic 0x%p frames %u", b, b->Magic, b->NumFrames);
+            Trace(0, "leak entry 0x%p magic 0x%lX frames %lu", b, b->Magic, b->NumFrames);
 
             for (size_t i = 0; i < b->NumFrames; i++)
-                Trace(0, "leak entry 0x%p stack[%u]=0x%p", b, i, b->Frames[i]);
+                Trace(0, "leak entry 0x%p stack[%lu]=0x%lX", b, i, b->Frames[i]);
         }
-        Trace(0, "0x%p usage %u blockSize %u", this, Usage, BlockSize);
+        Trace(0, "0x%p usage %lu blockSize %lu", this, Usage, BlockSize);
     }
 
     BugOn(Usage != 0);

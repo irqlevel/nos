@@ -64,7 +64,7 @@ void RegisterCommon(InterruptHandler& handler, u8 intId, bool edge, bool level)
     gic.EnableIrq(intId, ReadMpidr(), edge);
     handler.OnInterruptRegister(intId, intId);
 
-    Trace(0, "Interrupt: intid %u registered %s", (ulong)intId,
+    Trace(0, "Interrupt: intid %lu registered %s", (ulong)intId,
         level ? "level" : "edge");
 }
 

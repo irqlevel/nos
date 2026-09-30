@@ -31,7 +31,7 @@ void Lapic::Enable()
 {
     ulong msr = ReadMsr(BaseMsr);
 
-    Trace(LapicLL, "Lapic: msr 0x%p base 0x%p", msr, Acpi::GetInstance().GetLapicAddress());
+    Trace(LapicLL, "Lapic: msr 0x%lX base 0x%p", msr, Acpi::GetInstance().GetLapicAddress());
 
     /* Firmware may hand off with the APIC in x2APIC mode, where the
        MMIO window is dead. The SDM forbids switching x2APIC->xAPIC
@@ -55,10 +55,10 @@ void Lapic::Enable()
     WriteReg(TprIndex, 0xFF);// Disable all interrupts
     WriteReg(SpIvIndex, 0x100 | SpuriousVector);// bit 8 = APIC software enable
 
-    Trace(LapicLL, "Lapic: tpr 0x%p dfr 0x%p ldr 0x%p spiv 0x%p",
+    Trace(LapicLL, "Lapic: tpr 0x%lX dfr 0x%lX ldr 0x%lX spiv 0x%lX",
         (ulong)ReadReg(TprIndex), (ulong)ReadReg(DfrIndex), (ulong)ReadReg(LdrIndex), (ulong)ReadReg(SpIvIndex));
 
-    Trace(LapicLL, "Lapic: apicId 0x%p", (ulong)GetApicId());
+    Trace(LapicLL, "Lapic: apicId 0x%lX", (ulong)GetApicId());
 
     /* The ID is known and the MMIO window is live: give this CPU its GS slot
        so nothing has to come back here to ask again. */
@@ -78,7 +78,7 @@ void Lapic::MaskLvt(ulong index, const char* name)
     if (value & LvtMasked)
         return;
 
-    Trace(0, "Lapic: masking lvt %s 0x%p", name, (ulong)value);
+    Trace(0, "Lapic: masking lvt %s 0x%lX", name, (ulong)value);
 
     WriteReg(index, value | LvtMasked);
 }
@@ -229,7 +229,7 @@ u32 Lapic::CalibrateTimer(ulong hz)
     {
         /* Ran the counter to zero, or the clock did not move: either way
            the measurement is not one to build a tick on. */
-        Trace(0, "Lapic: timer calibration failed (remaining %u, elapsed %u)",
+        Trace(0, "Lapic: timer calibration failed (remaining %lu, elapsed %lu)",
             (ulong)remaining, elapsed);
         return 0;
     }
@@ -240,11 +240,11 @@ u32 Lapic::CalibrateTimer(ulong hz)
 
     if (count == 0 || count > 0xFFFFFFFFUL)
     {
-        Trace(0, "Lapic: timer count %u out of range", count);
+        Trace(0, "Lapic: timer count %lu out of range", count);
         return 0;
     }
 
-    Trace(0, "Lapic: timer %u ticks/s, count %u for %u Hz",
+    Trace(0, "Lapic: timer %lu ticks/s, count %lu for %lu Hz",
         ticksPerSec, count, hz);
 
     return (u32)count;

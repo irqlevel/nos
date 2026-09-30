@@ -105,7 +105,7 @@ void Cpu::Init(ulong index)
     Index = index;
     State |= StateInited;
 
-    Trace(0, "Cpu 0x%p %u inited", this, Index);
+    Trace(0, "Cpu 0x%p %lu inited", this, Index);
 }
 
 void Cpu::Reset()
@@ -375,7 +375,7 @@ void CpuTable::SendTlbIPI(ulong cpuMask, IPITask tasks[MaxCpus])
     }
 
     if (silent != 0)
-        Panic("TLB shootdown: cpus 0x%p never acknowledged (asked 0x%p)",
+        Panic("TLB shootdown: cpus 0x%lX never acknowledged (asked 0x%lX)",
             silent, cpuMask);
 }
 
@@ -479,7 +479,7 @@ void Cpu::IPI(Context* ctx)
 
     if (exit)
     {
-        Trace(0, "Cpu %u exited, state 0x%p, IPI count %u",
+        Trace(0, "Cpu %lu exited, state 0x%lX, IPI count %lu",
             Index, State, IPIConter.Get());
 
         /* Complete any IPI tasks queued during the exit transition and refuse
@@ -733,7 +733,9 @@ void CpuTable::Reset()
 
 bool Cpu::Run(Task::Func func, void *ctx)
 {
-    IdleTaskPtr = Mm::TAlloc<Task, Tag>("idle%u", Index);
+    char name[TaskNameLen];
+    Stdlib::SnPrintf(name, sizeof(name), "idle%lu", Index);
+    IdleTaskPtr = Mm::TAlloc<Task, Tag>(name);
     if (IdleTaskPtr == nullptr)
     {
         return false;

@@ -23,6 +23,17 @@ typedef uint64_t u64;
 #define likely(x)       __builtin_expect((x),1)
 #define unlikely(x)     __builtin_expect((x),0)
 
+/* A function that takes a format string and the arguments it names, checked
+   at every call as printf's are: fmtIndex is the format's parameter -- from
+   1, and the implicit this is the first of a member function -- and
+   firstArg the first argument's, or 0 for a va_list. Stdlib::VsnPrintf
+   reads each argument as C's printf does, the length modifiers included,
+   so what -Wformat accepts is what gets printed; and -Werror makes the rest
+   -- a ulong under %u, a string under %d, an argument too few -- a build
+   that fails, where it was a value read from half a register or past the
+   last one passed. */
+#define PRINTF_FORMAT(fmtIndex, firstArg) __attribute__((format(printf, fmtIndex, firstArg)))
+
 /* __builtin_offsetof, what offsetof is: the old &((type*)0)->field made a
    member access through a null pointer, which is undefined behaviour -- the
    first report the UBSan build made (docs/build.md). Some of the types an

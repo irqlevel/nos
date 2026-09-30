@@ -39,7 +39,7 @@ VgaTerm::VgaTerm()
         Panic("Can't map page");
     }
 
-    Trace(0, "Vga 0x%p buf 0x%p mapped at 0x%p", this, BufPhyAddr, Buf);
+    Trace(0, "Vga 0x%p buf 0x%lX mapped at 0x%p", this, BufPhyAddr, Buf);
 
     /* Set cursor shape to underline (scan lines 13-15) */
     Outb(VgaBase, 0x0A);

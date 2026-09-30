@@ -94,7 +94,7 @@ bool Tsc::Calibrate()
         Invariant = (leaf8007.Edx & CpuidBitInvariantTsc) != 0;
     }
 
-    Trace(0, "TSC: invariant=%u", (ulong)Invariant);
+    Trace(0, "TSC: invariant=%lu", (ulong)Invariant);
 
     ulong samples[CalibrationRounds];
 
@@ -143,7 +143,7 @@ bool Tsc::Calibrate()
     BaseTsc = ReadTsc();
     Calibrated = true;
 
-    Trace(0, "TSC: frequency %u Hz (%u MHz)", FreqHz, FreqHz / HzPerMHz);
+    Trace(0, "TSC: frequency %lu Hz (%lu MHz)", FreqHz, FreqHz / HzPerMHz);
 
     return true;
 }
@@ -185,7 +185,7 @@ bool Tsc::SetupKvmClock()
 
     KvmClockAvail = true;
 
-    Trace(0, "TSC: kvmclock enabled, pvclock at phys 0x%p virt 0x%p",
+    Trace(0, "TSC: kvmclock enabled, pvclock at phys 0x%lX virt 0x%lX",
         PvClockPhys, (ulong)PvClock);
 
     return true;
@@ -199,7 +199,7 @@ bool Tsc::EnableKvmClockSelf()
     ulong idx = Lapic::GetApicId();
     if (idx >= PvClockEntryCount)
     {
-        Trace(0, "TSC: apic id %u exceeds pvclock entries", idx);
+        Trace(0, "TSC: apic id %lu exceeds pvclock entries", idx);
         return false;
     }
 

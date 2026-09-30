@@ -8,8 +8,8 @@ namespace Stdlib
 class Printer
 {
 public:
-    virtual void Printf(const char *fmt, ...) = 0;
-    virtual void VPrintf(const char *fmt, va_list args) = 0;
+    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) = 0;
+    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) = 0;
     virtual void PrintString(const char *s) = 0;
     virtual void Backspace() = 0;
 
@@ -42,7 +42,7 @@ public:
             Buf[0] = '\0';
     }
 
-    virtual void Printf(const char *fmt, ...) override
+    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override
     {
         va_list args;
         va_start(args, fmt);
@@ -50,7 +50,7 @@ public:
         va_end(args);
     }
 
-    virtual void VPrintf(const char *fmt, va_list args) override
+    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override
     {
         if (Pos + 1 >= Size)
             return;

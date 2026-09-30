@@ -326,14 +326,14 @@ Stdlib::Error CheckHeader(LoadCtx& ctx, Stdlib::Printer& out)
 
     if (eh->Machine != Hal::ModuleElfMachine())
     {
-        out.Printf("module: built for ELF machine %u, this kernel runs on %u\n",
+        out.Printf("module: built for ELF machine %lu, this kernel runs on %lu\n",
             (ulong)eh->Machine, (ulong)Hal::ModuleElfMachine());
         return MakeError(Stdlib::Error::InvalidValue);
     }
 
     if (eh->Type != Elf::TypeDyn)
     {
-        out.Printf("module: ELF type %u, not a shared object\n", (ulong)eh->Type);
+        out.Printf("module: ELF type %lu, not a shared object\n", (ulong)eh->Type);
         return MakeError(Stdlib::Error::InvalidValue);
     }
 
@@ -382,7 +382,7 @@ Stdlib::Error CheckSegments(LoadCtx& ctx, Stdlib::Printer& out)
 
         if ((ph.Flags & Elf::PfW) != 0 && (ph.Flags & Elf::PfX) != 0)
         {
-            out.Printf("module: segment %u is both writable and executable\n", i);
+            out.Printf("module: segment %lu is both writable and executable\n", i);
             return MakeError(Stdlib::Error::InvalidValue);
         }
 
@@ -390,7 +390,7 @@ Stdlib::Error CheckSegments(LoadCtx& ctx, Stdlib::Printer& out)
             !InFile(ctx.Size, ph.Offset, ph.Filesz) ||
             ph.Memsz > MaxImageSize || ph.Vaddr > MaxImageSize - ph.Memsz)
         {
-            out.Printf("module: segment %u is corrupt, too big or not page-aligned\n", i);
+            out.Printf("module: segment %lu is corrupt, too big or not page-aligned\n", i);
             return MakeError(Stdlib::Error::HeaderCorrupt);
         }
 
@@ -404,7 +404,7 @@ Stdlib::Error CheckSegments(LoadCtx& ctx, Stdlib::Printer& out)
             const ulong otherEnd = Stdlib::RoundUp(other.Vaddr + other.Memsz, Const::PageSize);
             if (ph.Vaddr < otherEnd && other.Vaddr < segEnd)
             {
-                out.Printf("module: segments %u and %u share a page\n", j, i);
+                out.Printf("module: segments %lu and %lu share a page\n", j, i);
                 return MakeError(Stdlib::Error::Overlap);
             }
         }
@@ -423,7 +423,7 @@ Stdlib::Error CheckSegments(LoadCtx& ctx, Stdlib::Printer& out)
 
     if (end > MaxImageSize)
     {
-        out.Printf("module: %u KiB image, more than the %u KiB a module may take\n",
+        out.Printf("module: %lu KiB image, more than the %lu KiB a module may take\n",
             end / Const::KB, MaxImageSize / Const::KB);
         return MakeError(Stdlib::Error::BadSize);
     }
@@ -506,7 +506,7 @@ void FindFunctions(LoadCtx& ctx)
         const ulong bytes = lines * sizeof(ModuleSymbol) + sh.Size + 1;
         if (lines == 0 || bytes > MaxImageSize - ctx.ImageSize)
         {
-            Trace(ModuleLL, "module: %u function names left out, %u bytes of them", lines, sh.Size);
+            Trace(ModuleLL, "module: %lu function names left out, %lu bytes of them", lines, (ulong)sh.Size);
             return;
         }
 
@@ -556,14 +556,14 @@ Stdlib::Error CheckImports(LoadCtx& ctx, Stdlib::Printer& out)
         const char* name = SymName(ctx, sym);
         if (name == nullptr || name[0] == '\0')
         {
-            out.Printf("module: undefined dynamic symbol %u has no name\n", i);
+            out.Printf("module: undefined dynamic symbol %lu has no name\n", i);
             return MakeError(Stdlib::Error::DataCorrupt);
         }
 
         const ulong addr = LookupKernel(name);
         if (addr != 0)
         {
-            Trace(ModuleLL, "module: %s -> 0x%p", name, addr);
+            Trace(ModuleLL, "module: %s -> 0x%lX", name, addr);
             ctx.Imports++;
 
             for (ulong j = 0; j < Stdlib::ArraySize(PermanentImports); j++)
@@ -595,14 +595,14 @@ Stdlib::Error ApplyReloc(const LoadCtx& ctx, const Elf::Rela& rela, Stdlib::Prin
 
     if (kind == Hal::ModuleReloc::Unsupported)
     {
-        out.Printf("module: relocation type %u at 0x%p is not one a module may have\n",
-            (ulong)type, rela.Offset);
+        out.Printf("module: relocation type %lu at 0x%lX is not one a module may have\n",
+            (ulong)type, (ulong)rela.Offset);
         return MakeError(Stdlib::Error::NotImplemented);
     }
 
     if (rela.Offset > ctx.ImageSize - sizeof(ulong))
     {
-        out.Printf("module: relocation at 0x%p is outside the image\n", rela.Offset);
+        out.Printf("module: relocation at 0x%lX is outside the image\n", (ulong)rela.Offset);
         return MakeError(Stdlib::Error::DataCorrupt);
     }
 
@@ -616,8 +616,8 @@ Stdlib::Error ApplyReloc(const LoadCtx& ctx, const Elf::Rela& rela, Stdlib::Prin
         const u32 index = Elf::RelaSym(rela.Info);
         if (index == 0 || index >= ctx.SymCount)
         {
-            out.Printf("module: relocation at 0x%p names symbol %u of %u\n",
-                rela.Offset, (ulong)index, ctx.SymCount);
+            out.Printf("module: relocation at 0x%lX names symbol %lu of %lu\n",
+                (ulong)rela.Offset, (ulong)index, ctx.SymCount);
             return MakeError(Stdlib::Error::DataCorrupt);
         }
 
@@ -626,7 +626,7 @@ Stdlib::Error ApplyReloc(const LoadCtx& ctx, const Elf::Rela& rela, Stdlib::Prin
         {
             if (sym.Value >= ctx.ImageSize)
             {
-                out.Printf("module: symbol %u is outside the image\n", (ulong)index);
+                out.Printf("module: symbol %lu is outside the image\n", (ulong)index);
                 return MakeError(Stdlib::Error::DataCorrupt);
             }
             value = ctx.Base + sym.Value + rela.Addend;
@@ -663,7 +663,7 @@ Stdlib::Error Relocate(const LoadCtx& ctx, Stdlib::Printer& out)
         if (sh.Entsize != sizeof(Elf::Rela) || !Aligned8(sh.Offset) ||
             !InFile(ctx.Size, sh.Offset, sh.Size))
         {
-            out.Printf("module: relocation section %u corrupt\n", i);
+            out.Printf("module: relocation section %lu corrupt\n", i);
             return MakeError(Stdlib::Error::DataCorrupt);
         }
 
@@ -731,7 +731,7 @@ void BuildFunctions(const LoadCtx& ctx, LoadedModule& module)
         if (!ParseFunctionLine(line, offset, name) || offset >= ctx.ImageSize ||
             (count != 0 && offset < index[count - 1].Offset))
         {
-            Trace(0, "module: %s: function table bad at line %u, left out", module.Name, count + 1);
+            Trace(0, "module: %s: function table bad at line %lu, left out", module.Name, count + 1);
             return;
         }
 
@@ -817,7 +817,7 @@ Stdlib::Error CheckInfo(const LoadCtx& ctx, const ModuleInfo& info, LoadedModule
 
     if (info.Version != InfoVersion)
     {
-        out.Printf("module: header version %u, this kernel reads %u\n",
+        out.Printf("module: header version %lu, this kernel reads %lu\n",
             (ulong)info.Version, (ulong)InfoVersion);
         return MakeError(Stdlib::Error::InvalidValue);
     }
@@ -845,7 +845,7 @@ Stdlib::Error CheckInfo(const LoadCtx& ctx, const ModuleInfo& info, LoadedModule
 
     if (len == 0 || len == InfoNameLen || info.Name[len] != '\0')
     {
-        out.Printf("module: the module's name is not a printable word of at most %u characters\n",
+        out.Printf("module: the module's name is not a printable word of at most %lu characters\n",
             ModuleTable::NameMax);
         return MakeError(Stdlib::Error::InvalidValue);
     }
@@ -874,7 +874,7 @@ Stdlib::Error MapImage(LoadCtx& ctx, LoadedModule& module, Stdlib::Printer& out)
 
     if (!AllocPageRun(module.Image, bytes))
     {
-        out.Printf("module: no memory for a %u KiB image\n", bytes / Const::KB);
+        out.Printf("module: no memory for a %lu KiB image\n", bytes / Const::KB);
         return MakeError(Stdlib::Error::NoMemory);
     }
 
@@ -902,8 +902,8 @@ Stdlib::Error Protect(const LoadCtx& ctx, Stdlib::Printer& out)
 
         const bool writable = (ph.Flags & Elf::PfW) != 0;
         const bool executable = (ph.Flags & Elf::PfX) != 0;
-        Trace(ModuleLL, "module: [0x%p, 0x%p) %s%s", ctx.Base + ph.Vaddr,
-            ctx.Base + ph.Vaddr + ph.Memsz, writable ? "rw" : "r", executable ? "x" : "");
+        Trace(ModuleLL, "module: [0x%lX, 0x%lX) %s%s", (ulong)(ctx.Base + ph.Vaddr),
+            (ulong)(ctx.Base + ph.Vaddr + ph.Memsz), writable ? "rw" : "r", executable ? "x" : "");
         ok = pt.SetRangeProtection(ctx.Base + ph.Vaddr,
             Stdlib::RoundUp(ph.Memsz, Const::PageSize), writable, executable);
     }
@@ -1051,7 +1051,7 @@ void RunJob(void* ctx)
        the kernel log is where it can still be read */
     if (job->State.Cmpxchg(JobDone, JobRunning) != JobRunning)
     {
-        Trace(0, "module: %s %s, done in the background, error %u: %s",
+        Trace(0, "module: %s %s, done in the background, error %lu: %s",
             job->Unload ? "rmmod" : "insmod", job->Arg, (ulong)job->Result, job->Output);
     }
 
@@ -1149,9 +1149,9 @@ Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& 
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    Trace(0, "module: %s loaded at 0x%p, %u KiB, %u kernel imports, %u functions named",
+    Trace(0, "module: %s loaded at 0x%lX, %lu KiB, %lu kernel imports, %lu functions named",
         name, base, kib, imports, functions);
-    out.Printf("module: %s loaded at 0x%p\n", name, base);
+    out.Printf("module: %s loaded at 0x%lX\n", name, base);
     return MakeSuccess();
 }
 
@@ -1168,7 +1168,7 @@ Stdlib::Error ModuleTable::LoadFile(const char* path, Stdlib::Printer& out)
     const ulong size = (ulong)got;
     if (size == 0 || size > MaxImageSize)
     {
-        out.Printf("module: %s is %u bytes; a module file is 1 to %u\n", path, size, MaxImageSize);
+        out.Printf("module: %s is %lu bytes; a module file is 1 to %lu\n", path, size, MaxImageSize);
         return MakeError(Stdlib::Error::BadSize);
     }
 
@@ -1290,7 +1290,7 @@ void ModuleTable::UnloadAll()
     }
 
     if (left != 0)
-        Trace(0, "module: %u left loaded: permanent, or in another task's hands", left);
+        Trace(0, "module: %lu left loaded: permanent, or in another task's hands", left);
 }
 
 void ModuleTable::StartLoad(const char* path, Stdlib::Printer& out)
@@ -1313,7 +1313,7 @@ void ModuleTable::StartJob(bool unload, const char* arg, Stdlib::Printer& out)
     }
 
     ModuleJob* job = Mm::TAlloc<ModuleJob, Tag>(unload, arg);
-    Task* task = (job != nullptr) ? Mm::TAlloc<Task, Tag>("%s", what) : nullptr;
+    Task* task = (job != nullptr) ? Mm::TAlloc<Task, Tag>(what) : nullptr;
     if (task == nullptr || !task->Start(RunJob, job))
     {
         /* Never ran: no one else holds the job */
@@ -1341,7 +1341,7 @@ void ModuleTable::StartJob(bool unload, const char* arg, Stdlib::Printer& out)
     {
         out.PrintString(job->Output);
         if (job->Result != Stdlib::Error::Success)
-            out.Printf("%s: %s failed, error %u\n", what, arg, (ulong)job->Result);
+            out.Printf("%s: %s failed, error %lu\n", what, arg, (ulong)job->Result);
     }
 
     PutJob(job);
@@ -1394,7 +1394,7 @@ void ModuleTable::Dump(Stdlib::Printer& out)
         if (!found)
             break;
 
-        out.Printf("%s  %u KiB at 0x%p, %u kernel imports%s%s\n", name, kib, base, imports,
+        out.Printf("%s  %lu KiB at 0x%lX, %lu kernel imports%s%s\n", name, kib, base, imports,
             permanent ? ", permanent" : "",
             (phase == ModulePhase::Loading) ? ", loading" :
             (phase == ModulePhase::Unloading) ? ", unloading" : "");
@@ -1424,10 +1424,10 @@ bool ModuleTable::Describe(ulong addr, char* buf, ulong size)
         const ulong offset = addr - module->Image.Base;
         const ModuleSymbol* function = FindFunction(*module, offset);
         if (function != nullptr)
-            Stdlib::SnPrintf(buf, size, "%s+0x%p [%s]", function->Name,
+            Stdlib::SnPrintf(buf, size, "%s+0x%lX [%s]", function->Name,
                 offset - function->Offset, module->Name);
         else
-            Stdlib::SnPrintf(buf, size, "[%s]+0x%p", module->Name, offset);
+            Stdlib::SnPrintf(buf, size, "[%s]+0x%lX", module->Name, offset);
         found = true;
         break;
     }
@@ -1456,7 +1456,7 @@ bool ModuleTable::DescribeAll(char* buf, ulong size)
          entry = entry->Flink)
     {
         const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, ListEntry);
-        Stdlib::SnPrintf(buf + pos, size - pos, "%s%s 0x%p+0x%p", any ? ", " : "",
+        Stdlib::SnPrintf(buf + pos, size - pos, "%s%s 0x%lX+0x%lX", any ? ", " : "",
             module->Name, module->Image.Base, module->ImageSize);
         buf[size - 1] = '\0';
         pos += Stdlib::StrLen(buf + pos);

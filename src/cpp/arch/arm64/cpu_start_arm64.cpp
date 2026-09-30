@@ -104,7 +104,7 @@ void ReportCpuStacks(Stdlib::Printer& printer, ulong& worstFree)
         if (free == stacks[i].Size)
             continue;
 
-        printer.Printf("static %u %u %u %s\n", stacks[i].Id,
+        printer.Printf("static %lu %lu %lu %s\n", stacks[i].Id,
             stacks[i].Size - free, stacks[i].Size, stacks[i].Name);
 
         if (free < worstFree)
@@ -118,7 +118,7 @@ bool CpuTable::StartAll()
 
     ulong entryPhys = (ulong)&SecondaryEntry[0] - Mm::MemoryMap::KernelSpaceBase;
 
-    Trace(0, "Starting cpus, entry 0x%p", entryPhys);
+    Trace(0, "Starting cpus, entry 0x%lX", entryPhys);
 
     /* The boot stack runs down into this guard, and past it into the
        identity tables every AP walks as it turns its MMU on (boot.S). A
@@ -162,7 +162,7 @@ bool CpuTable::StartAll()
 
         if (maxCpus != 0 && running >= maxCpus)
         {
-            Trace(0, "Cpu %u left parked, maxcpus is %u", index, maxCpus);
+            Trace(0, "Cpu %lu left parked, maxcpus is %lu", index, maxCpus);
             continue;
         }
 
@@ -170,7 +170,7 @@ bool CpuTable::StartAll()
             entryPhys, index);
         if (err != 0)
         {
-            Trace(0, "Cpu %u CPU_ON failed %d", index, err);
+            Trace(0, "Cpu %lu CPU_ON failed %ld", index, err);
             return false;
         }
 
@@ -214,13 +214,13 @@ bool CpuTable::StartAll()
 
         if (!(GetCpu(index).GetState() & Cpu::StateRunning))
         {
-            Trace(0, "Cpu %u still not running after %u ms",
+            Trace(0, "Cpu %lu still not running after %lu ms",
                 index, ApTimeoutMs);
             return false;
         }
     }
 
-    Trace(0, "Cpus started, %u running", running);
+    Trace(0, "Cpus started, %lu running", running);
 
     return true;
 }

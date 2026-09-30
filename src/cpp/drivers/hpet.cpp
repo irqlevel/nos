@@ -51,7 +51,7 @@ bool Hpet::Setup()
     ulong va = Mm::PageTable::GetInstance().MapMmioRegion(basePhys, Const::PageSize);
     if (va == 0)
     {
-        Trace(0, "HPET: MapMmioRegion failed for phys 0x%p", basePhys);
+        Trace(0, "HPET: MapMmioRegion failed for phys 0x%lX", basePhys);
         return false;
     }
 
@@ -70,7 +70,7 @@ bool Hpet::Setup()
 
     if (PeriodFs == 0 || PeriodFs > 0x05F5E100ULL /* 100 ns max per spec */)
     {
-        Trace(0, "HPET: invalid period %u fs", (ulong)PeriodFs);
+        Trace(0, "HPET: invalid period %lu fs", (ulong)PeriodFs);
         Mmio = nullptr;
         return false;
     }
@@ -81,7 +81,7 @@ bool Hpet::Setup()
     /* Nanoseconds per tick at DesiredHz */
     TickPeriodNs = Const::NanoSecsInSec / DesiredHz;
 
-    Trace(0, "HPET: phys 0x%p va 0x%p period %u fs freq %u Hz timers %u",
+    Trace(0, "HPET: phys 0x%lX va 0x%lX period %lu fs freq %lu Hz timers %lu",
         basePhys, va, (ulong)PeriodFs, FreqHz_, numTimers);
 
     /* Timer 0 must support periodic mode: the TYPE_CNF bit is ignored
@@ -122,7 +122,7 @@ bool Hpet::Setup()
     conf |= ConfEnableCnf | ConfLegRtCnf;
     WriteReg(RegGenConf, conf);
 
-    Trace(0, "HPET: configured, ticksPerInt %u (100 Hz)", (ulong)ticksPerInterrupt);
+    Trace(0, "HPET: configured, ticksPerInt %lu (100 Hz)", (ulong)ticksPerInterrupt);
     return true;
 }
 

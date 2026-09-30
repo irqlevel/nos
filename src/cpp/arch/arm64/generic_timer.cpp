@@ -74,7 +74,7 @@ bool GenericTimer::Setup()
 
     ArmTimer(TickInterval);
 
-    Trace(0, "GenericTimer: per-cpu tick %u Hz interval %u intid %u",
+    Trace(0, "GenericTimer: per-cpu tick %lu Hz interval %lu intid %lu",
         TickHz, TickInterval, (ulong)TimerIntId);
     return true;
 }

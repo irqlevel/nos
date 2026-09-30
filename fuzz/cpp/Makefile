@@ -35,7 +35,7 @@ COMMON := fuzz/cpp/common/runner.cpp fuzz/cpp/common/kernel.cpp \
           src/cpp/kernel/atomic.cpp
 HEAP := fuzz/cpp/common/heap.cpp
 
-TARGETS := fdt memmap grubenv module pagetable heap cmdline multiboot acpi
+TARGETS := fdt memmap grubenv module pagetable heap cmdline multiboot acpi format
 
 SRC_fdt := $(COMMON) fuzz/cpp/targets/fdt.cpp \
            src/cpp/arch/arm64/fdt.cpp src/cpp/arch/arm64/board.cpp
@@ -54,6 +54,8 @@ SRC_multiboot := $(COMMON) fuzz/cpp/targets/multiboot.cpp src/cpp/mm/memory_map.
                  src/cpp/kernel/parameters.cpp
 SRC_acpi := $(COMMON) fuzz/cpp/common/cpu.cpp fuzz/cpp/targets/acpi.cpp src/cpp/drivers/acpi.cpp \
             src/cpp/lib/error.cpp
+# lib/format.cpp is COMMON's
+SRC_format := $(COMMON) fuzz/cpp/targets/format.cpp
 # The kernel heap itself: no heap.cpp under it
 SRC_heap := $(COMMON) fuzz/cpp/common/cpu.cpp fuzz/cpp/targets/heap.cpp \
             src/cpp/mm/allocator.cpp src/cpp/mm/pool.cpp src/cpp/mm/page_allocator.cpp \

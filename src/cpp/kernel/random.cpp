@@ -46,13 +46,13 @@ bool HwRandomSource::SelfTest()
        loops inside the HAL have already been patient. */
     if (ok < Draws / 2)
     {
-        Trace(0, "HwRandom: only %u of %u draws succeeded", ok, Draws);
+        Trace(0, "HwRandom: only %lu of %lu draws succeeded", ok, Draws);
         return false;
     }
 
     if (!differs)
     {
-        Trace(0, "HwRandom: every draw returned 0x%p", (ulong)first);
+        Trace(0, "HwRandom: every draw returned 0x%lX", (ulong)first);
         return false;
     }
 
@@ -177,7 +177,7 @@ bool JitterSource::GetRandom(u8* buf, ulong len)
             /* Every measurement took exactly as long as the one before it:
                either the counter is too coarse to see this much work, or it
                is not running. Biased bytes would be worse than none. */
-            Trace(0, "Jitter: no variance in %u cycle-counter measurements",
+            Trace(0, "Jitter: no variance in %lu cycle-counter measurements",
                 (ulong)(2 * MaxPairsPerByte));
             return false;
         }
@@ -442,7 +442,7 @@ void Random::Reseed()
             Seeded = true;
     }
 
-    Trace(0, "Random: reseeded from %u of %u sources", contributed,
+    Trace(0, "Random: reseeded from %lu of %lu sources", contributed,
         table.GetCount());
 }
 
@@ -473,8 +473,8 @@ void Random::Dump(Stdlib::Printer& printer)
         bytes = BytesGenerated;
     }
 
-    printer.Printf("pool: chacha20 %s, hardware entropy %s, reseeds %u, "
-        "bytes out %u\n", seeded ? "seeded" : "UNSEEDED", hw ? "yes" : "no",
+    printer.Printf("pool: chacha20 %s, hardware entropy %s, reseeds %lu, "
+        "bytes out %lu\n", seeded ? "seeded" : "UNSEEDED", hw ? "yes" : "no",
         reseeds, bytes);
     printer.Printf("sources:\n");
 

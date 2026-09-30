@@ -105,7 +105,7 @@ void Idt::DummyInterrupt(Context* ctx, u8 vector)
        over the error code some of them push, so there is no returning. */
     if (vector < FirstDeviceVector)
     {
-        PanicCtx(ctx, VectorHasErrorCode(vector), "Unknown exception, vector 0x%p",
+        PanicCtx(ctx, VectorHasErrorCode(vector), "Unknown exception, vector 0x%lX",
             (ulong)vector);
         return;
     }
@@ -119,11 +119,11 @@ void Idt::DummyInterrupt(Context* ctx, u8 vector)
     long count = DummyInterruptCounter.Get();
     if (count <= MaxDummyReports)
     {
-        Trace(0, "Unknown interrupt, vector 0x%p rip 0x%p count %u",
+        Trace(0, "Unknown interrupt, vector 0x%lX rip 0x%lX count %lu",
             (ulong)vector, ctx->GetRetRip(), (ulong)count);
 
         /* The screen is the only channel on a machine with no serial port */
-        Screen::Printf("Unknown interrupt, vector 0x%p\n", (ulong)vector);
+        Screen::Printf("Unknown interrupt, vector 0x%lX\n", (ulong)vector);
     }
 
     /* EOI only what the LAPIC actually has in service: a vector delivered

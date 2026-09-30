@@ -51,7 +51,7 @@ void TimeInit()
         FreqHz = ReadCntfrq();
         BootCount = ReadCntvct();
     }
-    Trace(0, "TimeInit: generic timer freq %u Hz", FreqHz);
+    Trace(0, "TimeInit: generic timer freq %lu Hz", FreqHz);
 
     /* PL031 RTC: seconds since the Unix epoch (QEMU virt), through the
        premapped device GiB. The x86 twin reads the CMOS RTC. */
@@ -63,7 +63,7 @@ void TimeInit()
         ulong bootedSecs = CountToNs(ReadCntvct() - BootCount) /
             Const::NanoSecsInSec;
         BootEpochSecs = now - bootedSecs;
-        Trace(0, "TimeInit: rtc epoch %u", (ulong)now);
+        Trace(0, "TimeInit: rtc epoch %lu", (ulong)now);
     }
 }
 

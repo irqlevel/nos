@@ -634,7 +634,7 @@ void Parameters::Parse(const char *cmdline)
 
         char shown[MaxParamLen + 1];
         Stdlib::StrnCpy(shown, rest, sizeof(shown));
-        Trace(0, "Cmdline: longer than %u characters, ignoring from '%s'",
+        Trace(0, "Cmdline: longer than %lu characters, ignoring from '%s'",
             (ulong)(CmdlineLen - 1), shown);
     }
 
@@ -656,7 +656,7 @@ void Parameters::Parse(const char *cmdline)
             char shown[MaxParamLen + 1];
             Stdlib::StrnCpy(shown, &Cmdline[start], shownLen + 1);
             if (i - start > MaxParamLen)
-                Trace(0, "Cmdline: ignoring '%s...', longer than the %u characters "
+                Trace(0, "Cmdline: ignoring '%s...', longer than the %lu characters "
                     "a parameter can have", shown, (ulong)MaxParamLen);
             else
                 Trace(0, "Cmdline: ignoring '%s'", shown);

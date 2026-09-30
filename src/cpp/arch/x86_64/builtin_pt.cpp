@@ -147,14 +147,14 @@ void BuiltinPageTable::MapHighRam()
 
     if (!CpuHasGiantPages())
     {
-        Trace(0, "mm: no 1GiB page support, RAM above 0x%p stays unusable",
+        Trace(0, "mm: no 1GiB page support, RAM above 0x%lX stays unusable",
             LowMapLimit);
         return;
     }
 
     if (ramEnd > TopLimit)
     {
-        Trace(0, "mm: usable RAM ends at 0x%p, past what one PDPT covers",
+        Trace(0, "mm: usable RAM ends at 0x%lX, past what one PDPT covers",
             ramEnd);
         ramEnd = TopLimit;
     }
@@ -185,7 +185,7 @@ void BuiltinPageTable::MapHighRam()
         return;
 
     MappedLimit = ramEnd;
-    Trace(0, "mm: bootstrap map extended to 0x%p with %u 1GiB blocks",
+    Trace(0, "mm: bootstrap map extended to 0x%lX with %lu 1GiB blocks",
         MappedLimit, blocks);
 }
 

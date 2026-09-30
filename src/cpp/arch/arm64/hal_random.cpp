@@ -102,7 +102,7 @@ void ProbeHwRandom()
         /* Reading RNDR on a core without FEAT_RNG is an undefined
            instruction, so this check is the whole reason the probe is a trace
            line and not a synchronous exception. */
-        Trace(0, "HwRandom: no FEAT_RNG on this cpu (id_aa64isar0_el1 0x%p)",
+        Trace(0, "HwRandom: no FEAT_RNG on this cpu (id_aa64isar0_el1 0x%lX)",
             isar0);
         return;
     }

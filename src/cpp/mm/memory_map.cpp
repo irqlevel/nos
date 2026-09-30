@@ -24,14 +24,14 @@ bool MemoryMap::AddRegion(ulong addr, ulong len, ulong type)
 
     if (addr >= MaxPhysAddr)
     {
-        Trace(0, "mm: region 0x%p len 0x%p type %u is past the physical address space, dropped",
+        Trace(0, "mm: region 0x%lX len 0x%lX type %lu is past the physical address space, dropped",
             addr, len, type);
         return true;
     }
 
     if (len > MaxPhysAddr - addr)
     {
-        Trace(0, "mm: region 0x%p len 0x%p type %u reaches past the physical address space, cut at 0x%p",
+        Trace(0, "mm: region 0x%lX len 0x%lX type %lu reaches past the physical address space, cut at 0x%lX",
             addr, len, type, MaxPhysAddr);
         len = MaxPhysAddr - addr;
     }
@@ -89,8 +89,8 @@ bool MemoryMap::IsUsableRam(ulong phyAddr)
        every page allocation and every page-table walk; a real server's map
        has twenty-odd regions to walk past. The queries come in bursts inside
        one region, so try the region that answered last before scanning. */
-    size_t hint = LastUsableRegion;
-    if (hint < Size)
+    long hint = LastUsableRegion.Get();
+    if (hint >= 0 && (size_t)hint < Size)
     {
         auto& region = Region[hint];
         if (region.Type == UsableRamType &&
@@ -106,7 +106,7 @@ bool MemoryMap::IsUsableRam(ulong phyAddr)
 
         if (phyAddr >= region.Addr && phyAddr < (region.Addr + region.Len))
         {
-            LastUsableRegion = i;
+            LastUsableRegion.Set((long)i);
             return true;
         }
     }

@@ -18,7 +18,7 @@ Interrupt::VectorEntry Interrupt::Vectors[MaxVectors];
 
 void Interrupt::Register(InterruptHandler& handler, u8 irq, u8 vector)
 {
-    Trace(0, "Register interrupt irq 0x%p vector 0x%p fn 0x%p",
+    Trace(0, "Register interrupt irq 0x%lX vector 0x%lX fn 0x%p",
         (ulong)irq, (ulong)vector, handler.GetHandlerFn());
 
     /* `irq` is a GSI (callers pass acpi.GetGsiByIrq()). Claiming a GSI or
@@ -30,14 +30,14 @@ void Interrupt::Register(InterruptHandler& handler, u8 irq, u8 vector)
         VectorEntry& other = Vectors[v];
         if (other.HandlerCount > 0 && other.Gsi == irq)
         {
-            Trace(0, "Register interrupt: gsi 0x%p already owned by vector 0x%p, refused",
+            Trace(0, "Register interrupt: gsi 0x%lX already owned by vector 0x%lX, refused",
                 (ulong)irq, v);
             return;
         }
     }
     if (Vectors[vector].HandlerCount > 0)
     {
-        Trace(0, "Register interrupt: vector 0x%p already in use, refused",
+        Trace(0, "Register interrupt: vector 0x%lX already in use, refused",
             (ulong)vector);
         return;
     }
@@ -80,7 +80,7 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
                    this GSI. Chaining a level PCI handler onto it would
                    re-program the pin and feed the edge handler phantom
                    interrupts -- refuse loudly instead. */
-                Trace(0, "Register level interrupt irq 0x%p: gsi 0x%p owned by edge vector 0x%p, refused",
+                Trace(0, "Register level interrupt irq 0x%lX: gsi 0x%lX owned by edge vector 0x%lX, refused",
                     (ulong)irq, (ulong)gsi, v);
                 return;
             }
@@ -88,7 +88,7 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
             /* GSI already registered -- chain this handler onto the existing vector */
             if (ve.HandlerCount >= MaxSharedHandlers)
             {
-                Trace(0, "Register level interrupt irq 0x%p: too many shared handlers", (ulong)irq);
+                Trace(0, "Register level interrupt irq 0x%lX: too many shared handlers", (ulong)irq);
                 return;
             }
 
@@ -98,7 +98,7 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
             /* Switch to shared dispatch stub */
             Idt::GetInstance().SetDescriptor((u8)v, IdtDescriptor::Encode(SharedInterruptStub));
 
-            Trace(0, "Register shared level interrupt irq 0x%p vector 0x%p handler %u",
+            Trace(0, "Register shared level interrupt irq 0x%lX vector 0x%lX handler %lu",
                 (ulong)irq, (ulong)v, (ulong)ve.HandlerCount);
 
             handler.OnInterruptRegister(irq, (u8)v);
@@ -110,12 +110,12 @@ void Interrupt::RegisterLevel(InterruptHandler& handler, u8 irq, u8 vector)
        overwrite another device's IDT entry */
     if (Vectors[vector].HandlerCount > 0)
     {
-        Trace(0, "Register level interrupt irq 0x%p: vector 0x%p already in use, refused",
+        Trace(0, "Register level interrupt irq 0x%lX: vector 0x%lX already in use, refused",
             (ulong)irq, (ulong)vector);
         return;
     }
 
-    Trace(0, "Register level interrupt irq 0x%p gsi 0x%p vector 0x%p fn 0x%p activeHigh %u",
+    Trace(0, "Register level interrupt irq 0x%lX gsi 0x%lX vector 0x%lX fn 0x%p activeHigh %lu",
         (ulong)irq, (ulong)gsi, (ulong)vector, handler.GetHandlerFn(), (ulong)activeHigh);
 
     ulong cpu = IrqBalance::GetInstance().AssignIoApicIrq(gsi);

@@ -21,8 +21,8 @@ public:
     void Puts(const char *s);
     void Cls();
 
-    virtual void VPrintf(const char *fmt, va_list args) override;
-    virtual void Printf(const char *fmt, ...) override;
+    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override;
+    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override;
     virtual void PrintString(const char *s) override;
     virtual void Backspace() override;
 

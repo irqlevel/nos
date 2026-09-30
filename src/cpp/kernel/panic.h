@@ -18,9 +18,9 @@ public:
         return Instance;
     }
 
-    void DoPanic(const char *fmt, ...);
+    PRINTF_FORMAT(2, 3) void DoPanic(const char *fmt, ...);
 
-    void DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...);
+    PRINTF_FORMAT(4, 5) void DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...);
 
     bool IsActive();
 
@@ -73,7 +73,7 @@ private:
 #define Panic(fmt, ...)                                             \
 do {                                                                \
     auto& panicker = Kernel::Panicker::GetInstance();               \
-    panicker.DoPanic("PANIC:%s():%s,%u: " fmt "\n",                 \
+    panicker.DoPanic("PANIC:%s():%s,%lu: " fmt "\n",                \
         __func__, Stdlib::TruncateFileName(__FILE__),               \
         (ulong)__LINE__, ##__VA_ARGS__);                            \
 } while (false)
@@ -82,7 +82,7 @@ do {                                                                \
 do {                                                                \
     auto& panicker = Kernel::Panicker::GetInstance();               \
     panicker.DoPanicCtx(ctx, hasErrCode,                            \
-        "PANIC:%s():%s,%u: " fmt "\n",                              \
+        "PANIC:%s():%s,%lu: " fmt "\n",                             \
         __func__, Stdlib::TruncateFileName(__FILE__),               \
         (ulong)__LINE__, ##__VA_ARGS__);                            \
 } while (false)
@@ -90,7 +90,7 @@ do {                                                                \
 static inline bool DoBugOn(const char *func, const char *file, int line)
 {
     auto& panicker = Kernel::Panicker::GetInstance();
-    panicker.DoPanic("PANIC:%s():%s,%u: BUG\n", func, file, (ulong)line);
+    panicker.DoPanic("PANIC:%s():%s,%lu: BUG\n", func, file, (ulong)line);
     return true;
 }
 

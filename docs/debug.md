@@ -42,6 +42,18 @@ threw away every line that reported it -- so the longest reports, a Rust
 panic's message among them, reached the console as their prefix and nothing
 else (`RUST PANIC: ` followed by the backtrace). `TestSnPrintf` covers it.
 
+Every format is C's printf, checked by the compiler: the functions that
+take one carry `PRINTF_FORMAT` (`include/types.h`), the build has
+`-Wformat=2 -Werror`, and `VsnPrintf` reads each argument as the length
+modifier names it -- an int under `%u`, a `ulong` under `%lu`. Until then
+every integer conversion read a 64-bit slot and the convention was to cast
+each argument to `ulong`; an argument that was not -- the trace level
+itself, in every `Trace` -- was read with whatever the other half of its
+register or stack slot held. A format that is not a literal at its call is
+a build error, so none can slip past the check through a variable or a
+template. `cpp-fuzz.py`'s `format` target holds `VsnPrintf` to the host's
+own `vsnprintf`.
+
 The boot sequence itself, and what each marker means, is in
 [Boot](boot.md); `profile` and its two sample sources are in
 [Profiler](profiler.md).

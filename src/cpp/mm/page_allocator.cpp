@@ -28,7 +28,7 @@ bool FixedPageAllocator::Setup(ulong vaStart, ulong vaEnd, ulong pageCount)
     PageCount = pageCount;
     ulong blockSize = pageCount * Const::PageSize;
 
-    Trace(0, "0x%p start 0x%p end 0x%p pages %u", this, vaStart, vaEnd, PageCount);
+    Trace(0, "0x%p start 0x%lX end 0x%lX pages %lu", this, vaStart, vaEnd, PageCount);
     return VaAlloc.Setup(vaStart, vaEnd, blockSize);
 }
 
@@ -154,7 +154,7 @@ bool PageAllocatorImpl::Setup()
     ulong startAddress = pt.GetVaEnd();
     ulong endAddress = startAddress + ((7 * freePagesCount) / 10) * Const::PageSize;
 
-    Trace(0, "setup 0x%p start 0x%p end 0x%p free pages %u", this, startAddress, endAddress, freePagesCount);
+    Trace(0, "setup 0x%p start 0x%lX end 0x%lX free pages %lu", this, startAddress, endAddress, freePagesCount);
 
     size_t sizePerBalloc = (endAddress - startAddress) / Stdlib::ArraySize(FixedPgAlloc);
     for (size_t i = 0; i < Stdlib::ArraySize(FixedPgAlloc); i++)
@@ -256,12 +256,12 @@ void PageAllocatorImpl::UnmapPages(void* ptr, size_t numPages)
     size_t log = Stdlib::Log2(numPages);
     if (log >= Stdlib::ArraySize(FixedPgAlloc))
     {
-        Panic("Can't unmap addr 0x%p numPages %u", ptr, numPages);
+        Panic("Can't unmap addr 0x%p numPages %lu", ptr, numPages);
         return;
     }
 
     if (!FixedPgAlloc[log].Unmap(ptr, numPages))
-        Panic("Can't unmap addr 0x%p numPages %u", ptr, numPages);
+        Panic("Can't unmap addr 0x%p numPages %lu", ptr, numPages);
 }
 
 void* PageAllocatorImpl::MapLargePages(size_t numPages, ulong* physAddrs)
@@ -279,7 +279,7 @@ void PageAllocatorImpl::UnmapLargePages(void* ptr, size_t numPages)
     BugOn(numPages == 0 || numPages > PageTable::MaxLargeMapPages);
 
     if (!LargePgAlloc.Unmap(ptr, numPages))
-        Panic("Can't unmap large run 0x%p numPages %u", ptr, numPages);
+        Panic("Can't unmap large run 0x%p numPages %lu", ptr, numPages);
 }
 
 }

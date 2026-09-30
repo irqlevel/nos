@@ -124,12 +124,12 @@ bool PageTable::GetFreePages(ulong excludeLimit)
         if (memEnd > BuiltinMapLimit)
             memEnd = BuiltinMapLimit;
 
-        Trace(PageAllocatorLL, "Phy memStart 0x%p memEnd 0x%p", memStart, memEnd);
+        Trace(PageAllocatorLL, "Phy memStart 0x%lX memEnd 0x%lX", memStart, memEnd);
 
         if (memStart >= memEnd)
             continue;
 
-        Trace(PageAllocatorLL, "GetFreePages: region 0x%p-0x%p", memStart, memEnd);
+        Trace(PageAllocatorLL, "GetFreePages: region 0x%lX-0x%lX", memStart, memEnd);
 
         ulong address = memStart;
         while (address < memEnd)
@@ -157,7 +157,7 @@ bool PageTable::GetFreePages(ulong excludeLimit)
 
                 if (TotalPagesCount >= nextProgress)
                 {
-                    Trace(0, "mm: free list, %u of %u MiB",
+                    Trace(0, "mm: free list, %lu of %lu MiB",
                         (TotalPagesCount * Const::PageSize) / Const::MB, usableMiB);
                     nextProgress += ProgressPages;
                 }
@@ -182,10 +182,10 @@ bool PageTable::GetFreePages(ulong excludeLimit)
                 *head = address;
             }
         }
-        Trace(PageAllocatorLL, "GetFreePages: inner loop done, total %u", TotalPagesCount);
+        Trace(PageAllocatorLL, "GetFreePages: inner loop done, total %lu", TotalPagesCount);
     }
 
-    Trace(PageAllocatorLL, "GetFreePages done, HighestPhyAddr 0x%p TotalPages %u",
+    Trace(PageAllocatorLL, "GetFreePages done, HighestPhyAddr 0x%lX TotalPages %lu",
         HighestPhyAddr, TotalPagesCount);
 
     /* Say plainly how much of the machine's RAM the kernel actually took.
@@ -195,12 +195,12 @@ bool PageTable::GetFreePages(ulong excludeLimit)
     ulong usable = mmap.GetUsableRamBytes();
     ulong unreachable = mmap.GetUsableRamBytesAbove(BuiltinMapLimit);
 
-    Trace(0, "mm: %u MiB usable RAM reported, %u MiB reachable (%u pages)",
+    Trace(0, "mm: %lu MiB usable RAM reported, %lu MiB reachable (%lu pages)",
         usable / Const::MB, (TotalPagesCount * Const::PageSize) / Const::MB,
         TotalPagesCount);
 
     if (unreachable != 0)
-        Trace(0, "mm: %u MiB of it is above the bootstrap map at 0x%p and is not used",
+        Trace(0, "mm: %lu MiB of it is above the bootstrap map at 0x%lX and is not used",
             unreachable / Const::MB, BuiltinMapLimit);
 
     return true;
@@ -265,7 +265,7 @@ void PageTable::DrainEarlyFreeList()
 
         if (FreePagesCount >= nextProgress)
         {
-            Trace(0, "mm: %u MiB onto the free list",
+            Trace(0, "mm: %lu MiB onto the free list",
                 (FreePagesCount * Const::PageSize) / Const::MB);
             nextProgress += ProgressPages;
         }
@@ -390,7 +390,7 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr, bool executable)
         Root = GetFreePage();
         if (!Root)
             return false;
-        Trace(0, "Root 0x%p", Root);
+        Trace(0, "Root 0x%lX", Root);
     }
 
     PtePage* l4Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(Root);
@@ -432,7 +432,7 @@ bool PageTable::SetupPage(ulong virtAddr, ulong phyAddr, bool executable)
     PtePage* l1Page = (PtePage*)BuiltinPageTable::GetInstance().PhysToVirt(l2Entry->Address());
     Pte *l1Entry = &l1Page->Entry[l1Index];
 
-    Trace(5, "va 0x%p pha 0x%p l4 %u(0x%p) l3 %u(0x%p) l2 %u(0x%p) l1 %u(0x%p)",
+    Trace(5, "va 0x%lX pha 0x%lX l4 %lu(0x%p) l3 %lu(0x%p) l2 %lu(0x%p) l1 %lu(0x%p)",
         virtAddr, phyAddr, l4Index, l4Entry, l3Index, l3Entry, l2Index, l2Entry, l1Index, l1Entry);
 
     if (l1Entry->Present())
@@ -673,7 +673,7 @@ bool PageTable::Setup()
         Stdlib::RoundUp(bpt.VirtToPhys(pageArrayLimit), HugePageSize));
     if (PageArrayPhys == 0)
     {
-        Trace(0, "mm: no %u MiB contiguous window for PageArray",
+        Trace(0, "mm: no %lu MiB contiguous window for PageArray",
             pageArrayBytes / Const::MB);
         return false;
     }
@@ -686,7 +686,7 @@ bool PageTable::Setup()
         return false;
     }
 
-    Trace(0, "mm: PageArray %u MiB at phys 0x%p, %u huge pages",
+    Trace(0, "mm: PageArray %lu MiB at phys 0x%lX, %lu huge pages",
         pageArrayBytes / Const::MB, PageArrayPhys, pageArrayBytes / HugePageSize);
 
     if (!GetFreePages(bpt.VirtToPhys(pageArrayLimit)))
@@ -704,7 +704,7 @@ bool PageTable::Setup()
         }
     }
 
-    Trace(0, "TmpMapStart 0x%p", TmpMapStart);
+    Trace(0, "TmpMapStart 0x%lX", TmpMapStart);
     for (size_t i = 0; i < TmpMapPageCount; i++)
     {
         if (!SetupPage(TmpMapStart + i * Const::PageSize, 0, false))
@@ -725,15 +725,15 @@ bool PageTable::Setup()
     if (!SetupPage(0, 0, false))
         return false;
 
-    Trace(0, "PageArray setup, highestPhyAddr 0x%p", HighestPhyAddr);
+    Trace(0, "PageArray setup, highestPhyAddr 0x%lX", HighestPhyAddr);
 
-    Trace(0, "PageArray setup, pageArray 0x%p pageArrayLimit 0x%p", PageArray, pageArrayLimit);
+    Trace(0, "PageArray setup, pageArray 0x%p pageArrayLimit 0x%lX", PageArray, pageArrayLimit);
 
     for (ulong offset = 0; offset < pageArrayBytes; offset += HugePageSize)
     {
         if (!SetupHugePage((ulong)PageArray + offset, PageArrayPhys + offset))
         {
-            Trace(0, "mm: can't map PageArray at 0x%p", (ulong)PageArray + offset);
+            Trace(0, "mm: can't map PageArray at 0x%lX", (ulong)PageArray + offset);
             return false;
         }
     }
@@ -761,7 +761,7 @@ bool PageTable::Setup()
 
     PageArrayCount = pageArrayCount;
 
-    Trace(0, "PageArray setup done, count %u", PageArrayCount);
+    Trace(0, "PageArray setup done, count %lu", PageArrayCount);
     return true;
 }
 
@@ -780,7 +780,7 @@ bool PageTable::SetupFreePagesList()
         ExcludedPages = 0;
     }
 
-    Trace(0, "FreePagesCount %u", FreePagesCount);
+    Trace(0, "FreePagesCount %lu", FreePagesCount);
     return true;
 }
 
@@ -845,12 +845,12 @@ void PageTable::CheckFreeList(Stdlib::Printer& printer)
             outsideRam++;
     }
 
-    printer.Printf("pages: %u descriptors, %u on the free list (counter says %u)\n",
+    printer.Printf("pages: %lu descriptors, %lu on the free list (counter says %lu)\n",
         PageArrayCount, onList, FreePagesCount);
-    printer.Printf("free pages inside a reserved region: %u\n", inReserved);
-    printer.Printf("free pages inside the kernel image:  %u\n", inKernel);
-    printer.Printf("free pages outside usable RAM:       %u\n", outsideRam);
-    printer.Printf("descriptors with a wrong phys addr:  %u\n", wrongPhys);
+    printer.Printf("free pages inside a reserved region: %lu\n", inReserved);
+    printer.Printf("free pages inside the kernel image:  %lu\n", inKernel);
+    printer.Printf("free pages outside usable RAM:       %lu\n", outsideRam);
+    printer.Printf("descriptors with a wrong phys addr:  %lu\n", wrongPhys);
 
     bool ok = (inReserved == 0) && (inKernel == 0) && (outsideRam == 0) &&
         (wrongPhys == 0);
@@ -907,7 +907,7 @@ void PageTable::ZeroPage(Page* page)
     Task* task = PreemptDisableTask();
     ulong va = TmpMapPage(page->GetPhyAddress());
     if (va == 0)
-        Panic("ZeroPage: no TmpMap slot for page 0x%p: the window's %u shared slots are all held",
+        Panic("ZeroPage: no TmpMap slot for page 0x%lX: the window's %lu shared slots are all held",
             page->GetPhyAddress(), (ulong)TmpMapSharedCount);
     Stdlib::MemSet((void*)va, 0, Const::PageSize);
     TmpUnmapPage(va);
@@ -985,13 +985,13 @@ Page* PageTable::AllocContiguousPages(ulong count)
         }
 
         if (examined > LongSearchEntries)
-            Trace(0, "AllocContiguousPages: %u pages found after %u entries",
+            Trace(0, "AllocContiguousPages: %lu pages found after %lu entries",
                 count, examined);
 
         return first;
     }
 
-    Trace(0, "AllocContiguousPages: no run of %u pages in %u entries",
+    Trace(0, "AllocContiguousPages: no run of %lu pages in %lu entries",
         count, examined);
     return nullptr;
 }
@@ -1434,7 +1434,7 @@ void PageTable::UnmapRangeLocked(ulong virtAddr, size_t count, bool freePages)
                undo among them -- goes on as if they were not */
             l1Page = WalkToL1Locked(va, false);
             if (l1Page == nullptr)
-                Panic("UnmapRangeLocked: no TmpMap slot to walk to 0x%p, %u pages left mapped",
+                Panic("UnmapRangeLocked: no TmpMap slot to walk to 0x%lX, %lu pages left mapped",
                     va, (ulong)(count - i));
         }
 

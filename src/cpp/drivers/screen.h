@@ -23,7 +23,7 @@ bool Setup();
 bool IsReady();
 
 void PrintString(const char *s);
-void Printf(const char *fmt, ...);
+PRINTF_FORMAT(1, 2) void Printf(const char *fmt, ...);
 void Backspace();
 void Cls();
 

@@ -59,7 +59,7 @@ void* AllocatorImpl::Alloc(size_t size, ulong tag)
 
 	size_t log = Log2(reqSize);
 
-	Trace(AllocatorLL, "0x%p size 0x%p log 0x%p", this, size, log);
+	Trace(AllocatorLL, "0x%p size 0x%lX log 0x%lX", this, size, log);
 	if (BugOn(log < StartLog || log > EndLog || (log - StartLog) >= Stdlib::ArraySize(Pool)))
 	{
 		return nullptr;

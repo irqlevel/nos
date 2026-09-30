@@ -38,7 +38,9 @@ bool SoftIrq::Init()
         if (!(cpuMask & (1UL << i)))
             continue;
 
-        Task* task = Mm::TAlloc<Task, Tag>("softirq/%u", i);
+        char name[TaskNameLen];
+        Stdlib::SnPrintf(name, sizeof(name), "softirq/%lu", i);
+        Task* task = Mm::TAlloc<Task, Tag>(name);
         if (!task)
         {
             Stop();

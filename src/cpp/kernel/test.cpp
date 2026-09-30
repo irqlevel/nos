@@ -75,7 +75,7 @@ Stdlib::Error TestBtree()
     {
         if (!tree.Insert(key[pos[i]], value[pos[i]]))
         {
-            Trace(TestLL, "TestBtree: cant insert key %llu", key[pos[i]]);
+            Trace(TestLL, "TestBtree: cant insert key %u", key[pos[i]]);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
@@ -111,7 +111,7 @@ Stdlib::Error TestBtree()
     {
         if (!tree.Delete(key[pos[i]]))
         {
-            Trace(TestLL, "TestBtree: cant delete key[%lu][%lu]=%llu", i, pos[i], key[pos[i]]);
+            Trace(TestLL, "TestBtree: cant delete key[%lu][%lu]=%u", i, pos[i], key[pos[i]]);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
@@ -187,7 +187,7 @@ Stdlib::Error TestBtree()
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    Trace(TestLL, "TestBtree: min depth %d max depth %d", tree.MinDepth(), tree.MaxDepth());
+    Trace(TestLL, "TestBtree: min depth %ld max depth %ld", tree.MinDepth(), tree.MaxDepth());
 
     tree.Clear();
     if (!tree.Check())
@@ -209,13 +209,13 @@ Stdlib::Error TestAllocator()
     {
         if (size % 500 == 0)
         {
-            Trace(0, "TestAllocator: alloc size %u", size);
+            Trace(0, "TestAllocator: alloc size %lu", size);
         }
 
         u8 *block = new (Mm::NoThrow) u8[size];
         if (block == nullptr)
         {
-            Trace(0, "TestAllocator: alloc failed at size %u", size);
+            Trace(0, "TestAllocator: alloc failed at size %lu", size);
             return Stdlib::Error::NoMemory;
         }
 
@@ -694,7 +694,7 @@ Stdlib::Error TestContiguousPages()
 
     /* Alloc 1 page */
     ulong freeBefore = pt.GetFreePagesCount();
-    Trace(0, "TestContiguousPages: free pages before %u", freeBefore);
+    Trace(0, "TestContiguousPages: free pages before %lu", freeBefore);
 
     Mm::Page* p1 = pt.AllocContiguousPages(1);
     if (!p1)
@@ -723,7 +723,7 @@ Stdlib::Error TestContiguousPages()
     {
         if (ptr1[i] != 0xAB)
         {
-            Trace(0, "TestContiguousPages: pattern mismatch at %u", i);
+            Trace(0, "TestContiguousPages: pattern mismatch at %lu", i);
             pt.TmpUnmapPage(va1);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
@@ -754,13 +754,13 @@ Stdlib::Error TestContiguousPages()
 
     /* Verify physical contiguity */
     ulong basePhys = p4->GetPhyAddress();
-    Trace(0, "TestContiguousPages: 4 pages at phys 0x%p", basePhys);
+    Trace(0, "TestContiguousPages: 4 pages at phys 0x%lX", basePhys);
     Mm::Page* pageArray = p4;
     for (ulong j = 0; j < 4; j++)
     {
         if (pageArray[j].GetPhyAddress() != basePhys + j * Const::PageSize)
         {
-            Trace(0, "TestContiguousPages: page %u phys 0x%p expected 0x%p",
+            Trace(0, "TestContiguousPages: page %lu phys 0x%lX expected 0x%lX",
                 j, pageArray[j].GetPhyAddress(), basePhys + j * Const::PageSize);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
@@ -785,7 +785,7 @@ Stdlib::Error TestContiguousPages()
         {
             if (ptr[i] != expected)
             {
-                Trace(0, "TestContiguousPages: page %u byte %u: 0x%p expected 0x%p",
+                Trace(0, "TestContiguousPages: page %lu byte %lu: 0x%lX expected 0x%lX",
                     j, i, (ulong)ptr[i], (ulong)expected);
                 pt.TmpUnmapPage(va);
                 return MakeError(Stdlib::Error::Unsuccessful);
@@ -802,7 +802,7 @@ Stdlib::Error TestContiguousPages()
 
     if (pt.GetFreePagesCount() != freeBefore4)
     {
-        Trace(0, "TestContiguousPages: free count mismatch after free 4: %u expected %u",
+        Trace(0, "TestContiguousPages: free count mismatch after free 4: %lu expected %lu",
             pt.GetFreePagesCount(), freeBefore4);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
@@ -814,13 +814,13 @@ Stdlib::Error TestContiguousPages()
         Mm::Page* pages = pt.AllocContiguousPages(2);
         if (!pages)
         {
-            Trace(0, "TestContiguousPages: round %u alloc failed", round);
+            Trace(0, "TestContiguousPages: round %lu alloc failed", round);
             return MakeError(Stdlib::Error::NoMemory);
         }
 
         if (pages[1].GetPhyAddress() != pages[0].GetPhyAddress() + Const::PageSize)
         {
-            Trace(0, "TestContiguousPages: round %u not contiguous", round);
+            Trace(0, "TestContiguousPages: round %lu not contiguous", round);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
 
@@ -829,7 +829,7 @@ Stdlib::Error TestContiguousPages()
 
         if (pt.GetFreePagesCount() != freeNow)
         {
-            Trace(0, "TestContiguousPages: round %u free count mismatch", round);
+            Trace(0, "TestContiguousPages: round %lu free count mismatch", round);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
@@ -865,7 +865,7 @@ Stdlib::Error TestPageAllocator()
         {
             if (p[i] != 0xAA)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(1) mismatch at %u", i);
+                Trace(0, "TestPageAllocator: AllocMapPages(1) mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -896,7 +896,7 @@ Stdlib::Error TestPageAllocator()
         {
             if (p[i] != 0xBB)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(2) page0 mismatch at %u", i);
+                Trace(0, "TestPageAllocator: AllocMapPages(2) page0 mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -904,7 +904,7 @@ Stdlib::Error TestPageAllocator()
         {
             if (p[Const::PageSize + i] != 0xCC)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(2) page1 mismatch at %u", i);
+                Trace(0, "TestPageAllocator: AllocMapPages(2) page1 mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -945,7 +945,7 @@ Stdlib::Error TestPageAllocator()
         {
             if (p[i] != 0xDD)
             {
-                Trace(0, "TestPageAllocator: MapPages page0 mismatch at %u", i);
+                Trace(0, "TestPageAllocator: MapPages page0 mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -953,7 +953,7 @@ Stdlib::Error TestPageAllocator()
         {
             if (p[Const::PageSize + i] != 0xEE)
             {
-                Trace(0, "TestPageAllocator: MapPages page1 mismatch at %u", i);
+                Trace(0, "TestPageAllocator: MapPages page1 mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -973,7 +973,7 @@ Stdlib::Error TestPageAllocator()
         {
             if (t0[i] != 0xDD)
             {
-                Trace(0, "TestPageAllocator: post-unmap page0 mismatch at %u", i);
+                Trace(0, "TestPageAllocator: post-unmap page0 mismatch at %lu", i);
                 pt.TmpUnmapPage(va0);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
@@ -991,7 +991,7 @@ Stdlib::Error TestPageAllocator()
         {
             if (t1[i] != 0xEE)
             {
-                Trace(0, "TestPageAllocator: post-unmap page1 mismatch at %u", i);
+                Trace(0, "TestPageAllocator: post-unmap page1 mismatch at %lu", i);
                 pt.TmpUnmapPage(va1);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
@@ -1004,7 +1004,7 @@ Stdlib::Error TestPageAllocator()
 
         if (pt.GetFreePagesCount() != freePagesBefore)
         {
-            Trace(0, "TestPageAllocator: free count mismatch: %u expected %u",
+            Trace(0, "TestPageAllocator: free count mismatch: %lu expected %lu",
                 pt.GetFreePagesCount(), freePagesBefore);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
@@ -1018,7 +1018,7 @@ Stdlib::Error TestPageAllocator()
             void* ptr = Mm::AllocMapPages(1, &physAddr);
             if (!ptr)
             {
-                Trace(0, "TestPageAllocator: round %u AllocMapPages failed", round);
+                Trace(0, "TestPageAllocator: round %lu AllocMapPages failed", round);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
 
@@ -1026,7 +1026,7 @@ Stdlib::Error TestPageAllocator()
             Stdlib::MemSet(p, (u8)(0x10 + round), Const::PageSize);
             if (p[0] != (u8)(0x10 + round))
             {
-                Trace(0, "TestPageAllocator: round %u pattern mismatch", round);
+                Trace(0, "TestPageAllocator: round %lu pattern mismatch", round);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
 
@@ -1041,7 +1041,7 @@ Stdlib::Error TestPageAllocator()
             Mm::Page* page = pt.AllocContiguousPages(1);
             if (!page)
             {
-                Trace(0, "TestPageAllocator: MapPages round %u alloc failed", round);
+                Trace(0, "TestPageAllocator: MapPages round %lu alloc failed", round);
                 return MakeError(Stdlib::Error::NoMemory);
             }
 
@@ -1049,7 +1049,7 @@ Stdlib::Error TestPageAllocator()
             void* ptr = Mm::MapPages(1, &pa);
             if (!ptr)
             {
-                Trace(0, "TestPageAllocator: MapPages round %u map failed", round);
+                Trace(0, "TestPageAllocator: MapPages round %lu map failed", round);
                 pt.FreePage(page);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
@@ -1058,7 +1058,7 @@ Stdlib::Error TestPageAllocator()
             Stdlib::MemSet(p, (u8)(0x50 + round), Const::PageSize);
             if (p[0] != (u8)(0x50 + round))
             {
-                Trace(0, "TestPageAllocator: MapPages round %u pattern mismatch", round);
+                Trace(0, "TestPageAllocator: MapPages round %lu pattern mismatch", round);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
 
@@ -1108,7 +1108,7 @@ Stdlib::Error TestPageAllocator()
             u8* base = p + pg * Const::PageSize;
             if (base[0] != expected || base[Const::PageSize - 1] != expected)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(32) page %u mismatch", pg);
+                Trace(0, "TestPageAllocator: AllocMapPages(32) page %lu mismatch", pg);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -1117,7 +1117,7 @@ Stdlib::Error TestPageAllocator()
 
         if (pt.GetFreePagesCount() != freePagesBefore)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(32) free count mismatch: %u expected %u",
+            Trace(0, "TestPageAllocator: AllocMapPages(32) free count mismatch: %lu expected %lu",
                 pt.GetFreePagesCount(), freePagesBefore);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
@@ -1161,7 +1161,7 @@ Stdlib::Error TestPageAllocator()
             u8* base = p + pg * Const::PageSize;
             if (base[0] != expected || base[Const::PageSize - 1] != expected)
             {
-                Trace(0, "TestPageAllocator: AllocMapPages(128) page %u mismatch", pg);
+                Trace(0, "TestPageAllocator: AllocMapPages(128) page %lu mismatch", pg);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -1170,7 +1170,7 @@ Stdlib::Error TestPageAllocator()
 
         if (pt.GetFreePagesCount() != freePagesBefore)
         {
-            Trace(0, "TestPageAllocator: AllocMapPages(128) free count mismatch: %u expected %u",
+            Trace(0, "TestPageAllocator: AllocMapPages(128) free count mismatch: %lu expected %lu",
                 pt.GetFreePagesCount(), freePagesBefore);
             return MakeError(Stdlib::Error::Unsuccessful);
         }
@@ -1192,7 +1192,7 @@ Stdlib::Error TestMemSet()
         {
             if (buf[i] != 0xAA)
             {
-                Trace(0, "TestMemSet: basic fill mismatch at %u", i);
+                Trace(0, "TestMemSet: basic fill mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -1207,7 +1207,7 @@ Stdlib::Error TestMemSet()
         {
             if (buf[i] != 0)
             {
-                Trace(0, "TestMemSet: zero fill mismatch at %u", i);
+                Trace(0, "TestMemSet: zero fill mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -1224,7 +1224,7 @@ Stdlib::Error TestMemSet()
             {
                 if (buf[i] != 0xCD)
                 {
-                    Trace(0, "TestMemSet: odd size %u mismatch at %u", sz, i);
+                    Trace(0, "TestMemSet: odd size %lu mismatch at %lu", sz, i);
                     return MakeError(Stdlib::Error::Unsuccessful);
                 }
             }
@@ -1233,7 +1233,7 @@ Stdlib::Error TestMemSet()
             {
                 if (buf[i] != 0)
                 {
-                    Trace(0, "TestMemSet: odd size %u overflow at %u", sz, i);
+                    Trace(0, "TestMemSet: odd size %lu overflow at %lu", sz, i);
                     return MakeError(Stdlib::Error::Unsuccessful);
                 }
             }
@@ -1259,7 +1259,7 @@ Stdlib::Error TestMemCpy()
         {
             if (dst[i] != src[i])
             {
-                Trace(0, "TestMemCpy: basic copy mismatch at %u", i);
+                Trace(0, "TestMemCpy: basic copy mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -1278,7 +1278,7 @@ Stdlib::Error TestMemCpy()
             {
                 if (dst[i] != src[i])
                 {
-                    Trace(0, "TestMemCpy: odd size %u mismatch at %u", sz, i);
+                    Trace(0, "TestMemCpy: odd size %lu mismatch at %lu", sz, i);
                     return MakeError(Stdlib::Error::Unsuccessful);
                 }
             }
@@ -1287,7 +1287,7 @@ Stdlib::Error TestMemCpy()
             {
                 if (dst[i] != 0)
                 {
-                    Trace(0, "TestMemCpy: odd size %u overflow at %u", sz, i);
+                    Trace(0, "TestMemCpy: odd size %lu overflow at %lu", sz, i);
                     return MakeError(Stdlib::Error::Unsuccessful);
                 }
             }
@@ -1313,7 +1313,7 @@ Stdlib::Error TestMemMove()
         {
             if (dst[i] != src[i])
             {
-                Trace(0, "TestMemMove: non-overlap mismatch at %u", i);
+                Trace(0, "TestMemMove: non-overlap mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -1329,7 +1329,7 @@ Stdlib::Error TestMemMove()
         {
             if (buf[8 + i] != (u8)(i & 0xFF))
             {
-                Trace(0, "TestMemMove: overlap fwd mismatch at %u: 0x%p expected 0x%p",
+                Trace(0, "TestMemMove: overlap fwd mismatch at %lu: 0x%lX expected 0x%lX",
                     i, (ulong)buf[8 + i], (ulong)(u8)(i & 0xFF));
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
@@ -1346,7 +1346,7 @@ Stdlib::Error TestMemMove()
         {
             if (buf[i] != (u8)((i + 8) & 0xFF))
             {
-                Trace(0, "TestMemMove: overlap bwd mismatch at %u: 0x%p expected 0x%p",
+                Trace(0, "TestMemMove: overlap bwd mismatch at %lu: 0x%lX expected 0x%lX",
                     i, (ulong)buf[i], (ulong)(u8)((i + 8) & 0xFF));
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
@@ -1363,7 +1363,7 @@ Stdlib::Error TestMemMove()
         {
             if (buf[i] != (u8)(i & 0xFF))
             {
-                Trace(0, "TestMemMove: same ptr mismatch at %u", i);
+                Trace(0, "TestMemMove: same ptr mismatch at %lu", i);
                 return MakeError(Stdlib::Error::Unsuccessful);
             }
         }
@@ -1397,7 +1397,7 @@ Stdlib::Error TestMemMove()
             {
                 if (buf[3 + i] != expected[i])
                 {
-                    Trace(0, "TestMemMove: odd sz %u overlap fwd mismatch at %u", sz, i);
+                    Trace(0, "TestMemMove: odd sz %lu overlap fwd mismatch at %lu", sz, i);
                     return MakeError(Stdlib::Error::Unsuccessful);
                 }
             }
@@ -1417,7 +1417,7 @@ Stdlib::Error TestMemMove()
             {
                 if (buf[i] != (u8)((i + 3) & 0xFF))
                 {
-                    Trace(0, "TestMemMove: odd sz %u overlap bwd mismatch at %u", sz, i);
+                    Trace(0, "TestMemMove: odd sz %lu overlap bwd mismatch at %lu", sz, i);
                     return MakeError(Stdlib::Error::Unsuccessful);
                 }
             }
@@ -1545,7 +1545,7 @@ Stdlib::Error TestStrLen()
     /* Known string */
     if (Stdlib::StrLen("hello") != 5)
     {
-        Trace(0, "TestStrLen: 'hello' failed, got %u", Stdlib::StrLen("hello"));
+        Trace(0, "TestStrLen: 'hello' failed, got %lu", Stdlib::StrLen("hello"));
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
@@ -1554,7 +1554,7 @@ Stdlib::Error TestStrLen()
         char buf[10] = {'\xFF', '\xFE', '\x01', '\0', 'X', '\0'};
         if (Stdlib::StrLen(buf) != 3)
         {
-            Trace(0, "TestStrLen: high bytes failed, got %u", Stdlib::StrLen(buf));
+            Trace(0, "TestStrLen: high bytes failed, got %lu", Stdlib::StrLen(buf));
             return MakeError(Stdlib::Error::Unsuccessful);
         }
     }
@@ -1777,7 +1777,7 @@ Stdlib::Error TestSnPrintf()
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%u", (ulong)42);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lu", (ulong)42);
     if (rc < 0 || Stdlib::StrCmp(buf, "42") != 0)
     {
         Trace(0, "TestSnPrintf: %%u failed: '%s'", buf);
@@ -1791,7 +1791,7 @@ Stdlib::Error TestSnPrintf()
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%u", (ulong)0);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lu", (ulong)0);
     if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
     {
         Trace(0, "TestSnPrintf: %%u zero failed: '%s'", buf);
@@ -1814,28 +1814,28 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* %d signed decimal */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d", (long)42);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld", (long)42);
     if (rc < 0 || Stdlib::StrCmp(buf, "42") != 0)
     {
         Trace(0, "TestSnPrintf: %%d positive failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d", (long)-1);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld", (long)-1);
     if (rc < 0 || Stdlib::StrCmp(buf, "-1") != 0)
     {
         Trace(0, "TestSnPrintf: %%d -1 failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d", (long)-12345);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld", (long)-12345);
     if (rc < 0 || Stdlib::StrCmp(buf, "-12345") != 0)
     {
         Trace(0, "TestSnPrintf: %%d negative failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d", (long)0);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld", (long)0);
     if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
     {
         Trace(0, "TestSnPrintf: %%d zero failed: '%s'", buf);
@@ -1843,21 +1843,21 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* %x lowercase hex */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%x", (ulong)0);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lx", (ulong)0);
     if (rc < 0 || Stdlib::StrCmp(buf, "0") != 0)
     {
         Trace(0, "TestSnPrintf: %%x zero failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%x", (ulong)0xDEAD);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lx", (ulong)0xDEAD);
     if (rc < 0 || Stdlib::StrCmp(buf, "dead") != 0)
     {
         Trace(0, "TestSnPrintf: %%x deadbeef failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%x", (ulong)255);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lx", (ulong)255);
     if (rc < 0 || Stdlib::StrCmp(buf, "ff") != 0)
     {
         Trace(0, "TestSnPrintf: %%x 255 failed: '%s'", buf);
@@ -1865,14 +1865,14 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* %X uppercase hex */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%X", (ulong)0xDEAD);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lX", (ulong)0xDEAD);
     if (rc < 0 || Stdlib::StrCmp(buf, "DEAD") != 0)
     {
         Trace(0, "TestSnPrintf: %%X failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%X", (ulong)255);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%lX", (ulong)255);
     if (rc < 0 || Stdlib::StrCmp(buf, "FF") != 0)
     {
         Trace(0, "TestSnPrintf: %%X 255 failed: '%s'", buf);
@@ -1880,14 +1880,14 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* Zero-padded width: %08x */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%08x", (ulong)0xFF);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%08lx", (ulong)0xFF);
     if (rc < 0 || Stdlib::StrCmp(buf, "000000ff") != 0)
     {
         Trace(0, "TestSnPrintf: %%08x failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%016X", (ulong)0xABCD1234);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%016lX", (ulong)0xABCD1234);
     if (rc < 0 || Stdlib::StrCmp(buf, "00000000ABCD1234") != 0)
     {
         Trace(0, "TestSnPrintf: %%016X failed: '%s'", buf);
@@ -1895,7 +1895,7 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* Zero-padded decimal: %05u */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%05u", (ulong)42);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%05lu", (ulong)42);
     if (rc < 0 || Stdlib::StrCmp(buf, "00042") != 0)
     {
         Trace(0, "TestSnPrintf: %%05u failed: '%s'", buf);
@@ -1903,7 +1903,7 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* Zero-padded signed: %05d with negative */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%05d", (long)-42);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%05ld", (long)-42);
     if (rc < 0 || Stdlib::StrCmp(buf, "-0042") != 0)
     {
         Trace(0, "TestSnPrintf: %%05d negative failed: '%s'", buf);
@@ -1911,7 +1911,7 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* Zero-padded signed: value fills width */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%03d", (long)12345);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%03ld", (long)12345);
     if (rc < 0 || Stdlib::StrCmp(buf, "12345") != 0)
     {
         Trace(0, "TestSnPrintf: %%03d overflow failed: '%s'", buf);
@@ -1919,14 +1919,14 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* Width with no zero-pad (space padding) */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%5u", (ulong)42);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%5lu", (ulong)42);
     if (rc < 0 || Stdlib::StrCmp(buf, "   42") != 0)
     {
         Trace(0, "TestSnPrintf: %%5u space pad failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%8x", (ulong)0xFF);
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%8lx", (ulong)0xFF);
     if (rc < 0 || Stdlib::StrCmp(buf, "      ff") != 0)
     {
         Trace(0, "TestSnPrintf: %%8x space pad failed: '%s'", buf);
@@ -1942,7 +1942,7 @@ Stdlib::Error TestSnPrintf()
     }
 
     /* Mixed specifiers in one format string */
-    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%d %u %x %X %s %%",
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%ld %lu %lx %lX %s %%",
                           (long)-7, (ulong)100, (ulong)0xAB, (ulong)0xCD, "ok");
     if (rc < 0 || Stdlib::StrCmp(buf, "-7 100 ab CD ok %") != 0)
     {
@@ -1985,7 +1985,7 @@ Stdlib::Error TestSnPrintf()
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
-    rc = Stdlib::SnPrintf(small, sizeof(small), "%u", (ulong)123456789);
+    rc = Stdlib::SnPrintf(small, sizeof(small), "%lu", (ulong)123456789);
     if (rc != 7 || Stdlib::StrCmp(small, "1234...") != 0)
     {
         Trace(0, "TestSnPrintf: long %%u not truncated: '%s' (%d)", small, rc);
@@ -1997,6 +1997,40 @@ Stdlib::Error TestSnPrintf()
     if (rc != 7 || Stdlib::StrCmp(small, "abcdefg") != 0)
     {
         Trace(0, "TestSnPrintf: exact fit failed: '%s' (%d)", small, rc);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Each argument read as the type it was passed as, which the length
+       modifier names (PRINTF_FORMAT): an int is not read as a 64-bit slot.
+       Twelve of them, so that the ones past the third are on the stack on
+       x86-64 and past the fifth on arm64 (buf, size and fmt take three of
+       the six and eight registers), where an int read as a long brings the
+       other half of its slot with it. */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%u %lu %d %ld %x %lx %u %lu %d %ld %X %lX",
+        (u32)0xFFFFFFFF, (ulong)1 << 40, (int)-5, (long)-6, (u32)0xAB, (ulong)0xCD00000000UL,
+        (u32)7, (ulong)8, (int)-9, (long)-10, (u32)0xEF, (ulong)0x1200000000UL);
+    if (rc < 0 || Stdlib::StrCmp(buf,
+        "4294967295 1099511627776 -5 -6 ab cd00000000 7 8 -9 -10 EF 1200000000") != 0)
+    {
+        Trace(0, "TestSnPrintf: widths failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* hh and h: a char or a short, passed as an int */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%hhu %hhd %hu %hd",
+        (u8)200, (s8)-3, (u16)60000, (s16)-30000);
+    if (rc < 0 || Stdlib::StrCmp(buf, "200 -3 60000 -30000") != 0)
+    {
+        Trace(0, "TestSnPrintf: hh/h failed: '%s'", buf);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* z a size_t, ll a long long, their extremes included */
+    rc = Stdlib::SnPrintf(buf, sizeof(buf), "%zu %lld %llu %llx",
+        (size_t)123, (long long)-9223372036854775807LL - 1, 18446744073709551615ULL, 0xABCULL);
+    if (rc < 0 || Stdlib::StrCmp(buf, "123 -9223372036854775808 18446744073709551615 abc") != 0)
+    {
+        Trace(0, "TestSnPrintf: z/ll failed: '%s'", buf);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
@@ -2271,7 +2305,7 @@ Stdlib::Error TestGrubEnv()
     for (ulong i = 0; i < 8 && !full; i++)
     {
         char name[8];
-        Stdlib::SnPrintf(name, sizeof(name), "big%u", i);
+        Stdlib::SnPrintf(name, sizeof(name), "big%lu", i);
         Stdlib::MemCpy(copy, block, sizeof(block));
         if (!env.Set(name, big))
         {
@@ -2356,7 +2390,7 @@ static Stdlib::Error CheckSymbolizer(const char* output)
         Stdlib::StrStr(where, "mod_modtest::double+0x") == nullptr ||
         Stdlib::StrStr(where, "[modtest]") == nullptr)
     {
-        Trace(0, "TestModules: modtest's double() at 0x%p named '%s'", addr, where);
+        Trace(0, "TestModules: modtest's double() at 0x%lX named '%s'", addr, where);
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
@@ -2517,7 +2551,7 @@ Stdlib::Error TestModules()
         Stdlib::Error err = modules.Load(copy, size, out);
         if (err.GetCode() != expected || modules.IsLoaded("modtest"))
         {
-            Trace(0, "TestModules: %s: error %u, expected %u: %s", what,
+            Trace(0, "TestModules: %s: error %lu, expected %lu: %s", what,
                 (ulong)err.GetCode(), (ulong)expected, out.Get());
             result = MakeError(Stdlib::Error::Unsuccessful);
         }
@@ -2698,13 +2732,13 @@ static bool TestSpinLockPreempt()
         !released || !underSpin || !releasedSpin || !underReads ||
         !underRead || !releasedRead || !underWrite || !releasedWrite)
     {
-        Trace(0, "TestSpinLockPreempt: outer %u inner %u twice %u "
-            "under inner %u released %u spin %u released spin %u",
+        Trace(0, "TestSpinLockPreempt: outer %lu inner %lu twice %lu "
+            "under inner %lu released %lu spin %lu released spin %lu",
             (ulong)underOuter, (ulong)innerTaken, (ulong)outerTakenTwice,
             (ulong)underInner, (ulong)released, (ulong)underSpin,
             (ulong)releasedSpin);
-        Trace(0, "TestSpinLockPreempt: rw reads %u read %u released %u "
-            "write %u released %u", (ulong)underReads, (ulong)underRead,
+        Trace(0, "TestSpinLockPreempt: rw reads %lu read %lu released %lu "
+            "write %lu released %lu", (ulong)underReads, (ulong)underRead,
             (ulong)releasedRead, (ulong)underWrite, (ulong)releasedWrite);
         return false;
     }
@@ -2720,7 +2754,7 @@ void TestMultiTaskingTaskFunc(void *ctx)
     {
         auto& cpu = GetCpu();
         auto task = Task::GetCurrentTask();
-        Trace(TestLL, "Hello from task 0x%p pid %u cpu %u", task, task->Pid, cpu.GetIndex());
+        Trace(TestLL, "Hello from task 0x%p pid %lu cpu %lu", task, task->Pid, cpu.GetIndex());
         Sleep(100 * Const::NanoSecsInMs);
     }
 }
@@ -2871,7 +2905,7 @@ static bool TestEventWaitFor()
         task->Wait();
         ok = (p->TimedOut.Get() == 1 && p->Signalled.Get() == 1);
         if (!ok)
-            Trace(0, "TestEventWaitFor: timed out %u, signalled %u",
+            Trace(0, "TestEventWaitFor: timed out %lu, signalled %lu",
                 (ulong)p->TimedOut.Get(), (ulong)p->Signalled.Get());
     }
     else
@@ -2957,7 +2991,7 @@ static bool TestSleepBlocks()
     ulong sleptNs = Stdlib::ArraySize(task) * SleepTestRounds * SleepTestNs;
     if (runNs * SleepTestPercent > sleptNs * SleepTestMaxRunPercent)
     {
-        Trace(0, "TestSleepBlocks: two sleepers on one CPU ran %u us of the %u us they slept",
+        Trace(0, "TestSleepBlocks: two sleepers on one CPU ran %lu us of the %lu us they slept",
             runNs / Const::NanoSecsInUsec, sleptNs / Const::NanoSecsInUsec);
         return false;
     }
@@ -2989,7 +3023,7 @@ static bool TestPreemptDeferred()
 
     if (!pendingUnder || pendingAfter || !counted)
     {
-        Trace(0, "TestPreemptDeferred: pending under the lock %u, after the unlock %u, counted %u",
+        Trace(0, "TestPreemptDeferred: pending under the lock %lu, after the unlock %lu, counted %lu",
             (ulong)pendingUnder, (ulong)pendingAfter, (ulong)counted);
         return false;
     }

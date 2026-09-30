@@ -66,7 +66,14 @@ public:
     using Func = void (*)(void *ctx);
 
     Task();
-    Task(const char* fmt, ...);
+
+    /* A task named name, as it is. Not a format: a task is made through
+       TAlloc, and a format handed on through a template reaches the
+       constructor as a variable no compiler can check against its
+       arguments -- "idle%u" was given a ulong that way, which nothing
+       saw. A name to be formatted is made with SnPrintf first, where the
+       check is. */
+    explicit Task(const char* name);
 
     bool Run(class TaskQueue& taskQueue, Func func, void* ctx);
 
@@ -84,7 +91,7 @@ public:
     void SetStopping();
     bool IsStopping();
 
-    void SetName(const char *fmt, ...);
+    PRINTF_FORMAT(2, 3) void SetName(const char *fmt, ...);
     const char* GetName();
 
     /* Bytes of this task's stack that the poison scan still finds intact --

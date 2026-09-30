@@ -62,7 +62,7 @@ void Panicker::DumpContext()
     if (Hal::IrqChipReady())
     {
         ulong cpuId = CpuTable::GetInstance().GetCurrentCpuId();
-        Stdlib::SnPrintf(buf, sizeof(buf), "CPU: %u\n", cpuId);
+        Stdlib::SnPrintf(buf, sizeof(buf), "CPU: %lu\n", cpuId);
         PrintOutput(buf);
     }
 
@@ -70,7 +70,7 @@ void Panicker::DumpContext()
     Task* task = Task::TryGetCurrentTask();
     if (task != nullptr)
     {
-        Stdlib::SnPrintf(buf, sizeof(buf), "Task: pid %u name %s\n",
+        Stdlib::SnPrintf(buf, sizeof(buf), "Task: pid %lu name %s\n",
             task->Pid, task->GetName());
         PrintOutput(buf);
     }
@@ -86,10 +86,10 @@ void Panicker::DumpBacktrace(ulong* frames, size_t count)
     for (size_t i = 0; i < count; i++)
     {
         if (symtab.Describe(frames[i], where, sizeof(where)))
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%u] 0x%p %s\n",
+            Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX %s\n",
                 (ulong)i, frames[i], where);
         else
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%u] 0x%p\n",
+            Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX\n",
                 (ulong)i, frames[i]);
         PrintOutput(buf);
     }
@@ -196,7 +196,7 @@ void Panicker::CollectRemoteStacks()
     {
         if (parked & (1UL << i))
         {
-            Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %u parked\n", i);
+            Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %lu parked\n", i);
             PrintOutput(buf);
             continue;
         }
@@ -206,12 +206,12 @@ void Panicker::CollectRemoteStacks()
 
         if (RemoteDone[i].Get() != 2)
         {
-            Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %u did not answer the NMI\n", i);
+            Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %lu did not answer the NMI\n", i);
             PrintOutput(buf);
             continue;
         }
 
-        Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %u backtrace:\n", i);
+        Stdlib::SnPrintf(buf, sizeof(buf), "Cpu %lu backtrace:\n", i);
         PrintOutput(buf);
         DumpBacktrace(RemoteFrame[i], RemoteCount[i]);
     }

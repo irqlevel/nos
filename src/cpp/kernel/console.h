@@ -16,7 +16,7 @@ public:
         return Instance;
     }
 
-    virtual void Printf(const char *fmt, ...) override
+    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override
     {
         va_list args;
         va_start(args, fmt);
@@ -24,7 +24,7 @@ public:
         va_end(args);
     }
 
-    virtual void VPrintf(const char *fmt, va_list args) override
+    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override
     {
         char str[256];
         if (Stdlib::VsnPrintf(str, sizeof(str), fmt, args) < 0)

@@ -36,7 +36,7 @@ public:
     void IncCounter()
     {
         Counter.Inc();
-        Trace(SharedPtrLL, "objref 0x%p obj 0x%p inc counter %d", this, Object, Counter.Get());
+        Trace(SharedPtrLL, "objref 0x%p obj 0x%p inc counter %ld", this, Object, Counter.Get());
     }
 
     int GetCounter()
@@ -61,13 +61,13 @@ public:
     {
         if (Counter.DecAndTest())
         {
-            Trace(SharedPtrLL, "objref 0x%p obj 0x%p dec counter %d", this, Object, Counter.Get());
+            Trace(SharedPtrLL, "objref 0x%p obj 0x%p dec counter %ld", this, Object, Counter.Get());
 
             Deleter()(Object);
             Object = nullptr;
             return true;
         }
-        Trace(SharedPtrLL, "objref 0x%p obj 0x%p dec counter %d", this, Object, Counter.Get());
+        Trace(SharedPtrLL, "objref 0x%p obj 0x%p dec counter %ld", this, Object, Counter.Get());
 
         return false;
     }

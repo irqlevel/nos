@@ -74,7 +74,7 @@ LDSCRIPT = $(LDSCRIPT_$(ARCH))
 KERNEL = $(KERNEL_$(ARCH))
 
 CPPFLAGS = -I$(CURDIR)/src/cpp -I$(CURDIR)/src/cpp/lib -I$(OUT)
-CXXFLAGS = --target=$(TARGET) -std=c++20 -g3 -ggdb3 -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -fno-omit-frame-pointer -Wall -Wextra -Werror $(ARCH_CXXFLAGS_$(ARCH)) -DKERNEL_VERSION=\"$(VERSION)\"
+CXXFLAGS = --target=$(TARGET) -std=c++20 -g3 -ggdb3 -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -fno-omit-frame-pointer -Wall -Wextra -Wformat=2 -Werror $(ARCH_CXXFLAGS_$(ARCH)) -DKERNEL_VERSION=\"$(VERSION)\"
 # `function` checks an indirect call against a signature put in front of
 # every function, which the Rust and assembly callees here do not have;
 # `vptr` needs RTTI.

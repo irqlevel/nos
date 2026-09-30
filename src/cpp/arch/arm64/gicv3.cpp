@@ -76,7 +76,7 @@ bool Gic::Setup(ulong gicdPhys, ulong gicrPhys, ulong gicrSize)
     {
     }
 
-    Trace(0, "Gic: gicd 0x%p gicr 0x%p maxIntId %u", GicdBase, GicrBase,
+    Trace(0, "Gic: gicd 0x%lX gicr 0x%lX maxIntId %lu", GicdBase, GicrBase,
         (ulong)maxIntId);
 
     if (!CpuInit())
@@ -108,7 +108,7 @@ bool Gic::CpuInit()
     ulong rd = RedistBaseForCpu();
     if (rd == 0)
     {
-        Trace(0, "Gic: no redistributor for mpidr 0x%p", ReadMpidr());
+        Trace(0, "Gic: no redistributor for mpidr 0x%lX", ReadMpidr());
         return false;
     }
 
