@@ -103,6 +103,7 @@ swallowing panic messages whole.
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
+| `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -458,6 +459,150 @@ under the switch and NAT the net layer is a stand-in too -- its devices,
 frames and ARP table, `hv0`'s receive path run on the caller's thread --
 so what they do is fuzzed, one frame at a time, and the receive path's own
 concurrency is not.
+
+### `net-fuzz.py` -- everything the network hands the kernel, fuzzed
+
+Everything the network hands the kernel is somebody else's to choose --
+every frame on the wire, every answer a server gives the HTTP client, the
+DHCP client and the resolver, every byte an SSH client sends the server --
+so a panic, an overflow, a lock broken or a loop that never ends anywhere on
+those paths is one somebody else can cause, and on the Hetzner boxes the
+network is the only console there is. `scripts/net-fuzz` is a host program
+built from the kernel's own crates as they are -- `net`, `netwire`, `tls`,
+`fs`, `ssh` and the sshd module's source, over `kcore` and `ffi` -- linked
+with the rest of a kernel written for the purpose (`src/machine/`): its C++
+half as the `ffi` crate declares it, the locks, tasks, events, soft IRQs,
+timers, the clock, the entropy pool, the log, the command table. The tasks
+are threads, one of them running at a time as on a CPU of its own, handed
+the turn when it blocks or -- as often as the input says -- where it lets a
+lock go; a sleep ends at the tick it would end at in the kernel, and the
+clock jumps to the next deadline when every task waits, so an hour of a
+lease or a day of a DNS record costs what its timers cost. What the kernel
+says of its locks is held to: sleeping with a spin lock held or interrupts
+off, a soft IRQ handler that sleeps, a lock taken twice or in both orders, a
+mutex let go by a task that does not hold it, a task that ends holding one,
+an allocation or a free with interrupts off -- each a finding where it
+happens. Overflow checks are on, as a `RUSTUB=1` kernel has them. Each input
+runs in a process of its own, forked from one booted machine: the layer's
+statics are the kernel's, and one input's must not leak into the next.
+
+The machine's NIC is the fuzzer's, and the wire goes to the world
+(`src/world/`): a link that delays, reorders, duplicates and loses as the
+input says, a LAN whose hosts answer ARP or do not, and a model of each
+protocol's other end. Every frame the machine sends is checked as a
+receiver would check it (`check.rs`): headers whole and every checksum
+right, no source address the machine does not have or no host may have,
+nothing to an address no packet may go to (RFC 1122 3.2.1.3), a unicast
+never on the link's broadcast address (3.3.6), a multicast on its group's
+own, TCP's flags in combinations that mean something. The targets:
+
+- `stack`: frames of every kind -- ARP, ICMP, UDP to every port with a
+  listener, TCP, IPv6, noise -- from addresses that are and are not hosts,
+  into the receive path;
+- `tcp`: connections both ways with a peer model that keeps every byte of
+  both streams (each byte a function of its offset, so a byte delivered that
+  was never sent, or twice, is seen), checks every segment the machine sends
+  against RFC 9293 -- the window, the sequence space, what may carry data --
+  and does what peers do: retransmits, probes a zero window, resets, goes
+  quiet; and an attacker off the path injecting segments at every sequence
+  number, an ICMP error at every quoted one;
+- `http` and `https`: the HTTP client fetching through chains of redirects
+  from a server that answers well -- whose result is then known exactly --
+  or to break it: numbers longer than any field, chunk sizes of every
+  length, headers that never end, a redirect anywhere, a connection reset,
+  a pause past the idle timeout. Over TLS the server is rustls driven by
+  hand as the `tls` crate drives the client, with a certificate from the
+  fuzzer's own CA (`certs/make.sh`) or one run out, for another address,
+  or from nobody -- which the client must refuse before its request goes --
+  in TLS 1.2, 1.3 or both, with a close_notify or without, and now and then
+  a byte of what it sends flipped: a body the client gives back is the
+  answer's, from its start, and one it calls whole is whole;
+- `dns`: the resolver against a server that answers with CNAME chains,
+  compressed names, errors, nothing, and answers forged by address, port,
+  id and flag; the cache held to the TTL, a day at most;
+- `dhcp`: the client getting and keeping a lease from a server that NAKs,
+  goes quiet, answers another transaction or another client, offers
+  addresses no host may have, changes its terms, and a rogue that answers
+  first. What it sends must be what its state calls for (RFC 2131 4.3); what
+  it binds to, an ACK's terms, all of them, on the device; and no address
+  kept past its lease or its refusal;
+- `icmp`: pings both ways and ARP under them -- the world's echo requests
+  well made and not, ARP requests and replies well made, malformed, and
+  lying, and the shell's `ping`, `udpsend` and `arp`: the cache learns only
+  what RFC 826's merge lets it, and a host that answers every ping gets
+  every round;
+- `udpshell`: the shell over UDP asked by clients near and far, in
+  datagrams well made and not; every reply whole, in order, flagged at its
+  end, and exactly what the command printed;
+- `netconsole`: the kernel log to a collector that is there, beyond the
+  gateway or not yet, from a machine without an address, whose NIC stalls,
+  logging past what the ring holds and from tasks in the middle of a send:
+  the datagrams numbered with no gap of the machine's making, each line at
+  most once, in order, and all of it in the end but what the ring says it
+  dropped;
+- `ssh`: the sshd module on a ramfs root, and SSH clients (`sshc.rs`) that
+  log in with the key it knows or a stranger's or a signature over the
+  wrong session, run a command or a shell with a window of their choosing,
+  rekey, answer keepalives or not, or break the protocol at one point of it
+  -- a version line of HTTP, no cipher in common, a point of small order, a
+  length past any, an IGNORE where the strict exchange allows none, a packet
+  tampered with, a channel before the login, more data than the window.
+  Every packet the server sends is opened and checked, its key exchange
+  signed by its host key over the hash both ends made; a login is had
+  exactly when the known key signs the right session; a command's output
+  comes back whole; a client that breaks the protocol is told so.
+
+At the end of every input the machine must hold nothing: no TCP slot, no
+frame out of the pool, no task. A finding is any of that, a panic, a spin
+(a million reads of the clock with no other task given the turn) or a hang
+(twenty seconds of an input), each with the seed and iteration that make it
+again and the input written to `out/net-fuzz/findings/` -- `--replay
+TARGET FILE`, with `--trace` for every frame both ways and every line
+traced.
+
+With no arguments every target runs its own number of inputs from seed 1 --
+three hundred of `ssh`, five thousand of `icmp` -- the same ones every
+time: the gate, a couple of minutes, which CI runs on its arm64 leg. A
+campaign is `--seed N --seconds S`, a seed for each CPU.
+
+What it found on its first day, each fixed:
+
+- the receive path delivered IPv4 it should have dropped: fragments, bad
+  header checksums, sources of 0.0.0.0 and broadcast addresses, UDP with a
+  wrong checksum -- and answered them, as addresses not its own;
+- TCP took an out-of-window segment's window for the connection's, so a
+  guessed segment could shut a connection's window for good; took a SYN
+  with ACK, RST or FIN for a connection request; answered port 0 and
+  broadcast addresses; answered nothing to a zero-window probe; kept the
+  window of before a retransmission and sent past the peer's; and its
+  connect called a peer that answered and closed at once a failure;
+- the HTTP client's chunk sizes, status codes and redirect ports
+  overflowed -- a panic in a `RUSTUB=1` kernel -- it called broken chunking
+  complete, and it took a response cut inside its headers for a body made of
+  its own status line;
+- the TLS client took a stream cut inside a record, and a receive that
+  timed out, for the end of the stream: a body with no length that stalled
+  came back whole;
+- ARP waited ten seconds a try on an idle CPU; its cache learnt every
+  sender of every request on the link, which RFC 826 does not -- a busy
+  link pushing out the hosts the machine talks to -- and took broadcast,
+  multicast and its own MAC, and 0.0.0.0, broadcast and its own address;
+- a UDP datagram or a ping to a host whose ARP went unanswered was sent to
+  the link's broadcast address, every host on it handed somebody else's
+  datagram -- and netconsole's records were spent on it, lost; datagrams to
+  0.0.0.0 and 127/8 left the machine, and one could leave from 0.0.0.0 when
+  DHCP let the address go mid-send;
+- the DHCP client, once it had renewed, started again from DISCOVER while
+  bound -- its lease overwritten by an offer's terms and never renewed
+  again; it kept its address past the lease and after a refusal, put only
+  the address of a renewal on the device, and took addresses no host may
+  have;
+- the UDP shell ran a line longer than it holds cut short;
+- netconsole's drain slept 200 ms at a time holding the log's lock, with
+  interrupts off, whenever the device had no address -- the guard of a
+  `match`'s scrutinee lives to the end of the match -- and every line any
+  CPU traced waited behind it; and a batch whose records the ring evicted
+  while it was on its way was sent again.
 
 ### `hv-test.py` -- the extension turned on and off again, and guests under it
 

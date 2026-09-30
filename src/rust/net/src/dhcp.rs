@@ -1,9 +1,14 @@
-//! DHCP: how the machine gets its address, and keeps it.
+//! DHCP: how the machine gets its address, keeps it -- and lets it go.
 //!
-//! A task does DISCOVER, REQUEST, and then sleeps until half the lease is
-//! gone and renews. A renewal is unicast to the server that granted the
-//! lease, as RFC 2131 asks, and falls back to broadcast when the server's
-//! Ethernet address cannot be resolved -- which is what rebinding is.
+//! A task does DISCOVER, REQUEST, and then keeps the lease as RFC 2131 4.4.5
+//! has a client keep one: from T1, half its time, it asks the server that
+//! granted it to renew it -- unicast, as the RFC asks, falling back to
+//! broadcast when the server's Ethernet address cannot be resolved; from T2,
+//! seven eighths of its time, any server, broadcast, which is rebinding;
+//! each again at half the time left. When a server refuses, or the time is
+//! up, the address comes off the device and the task starts again from
+//! DISCOVER: a machine that went on using an address past its lease would be
+//! answering for somebody else's.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -13,7 +18,7 @@ use kcore::task::TaskHandle;
 use kcore::trace;
 
 use crate::abi;
-use crate::wire::{eth, ip, udp, Mac, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN,
+use crate::wire::{eth, ip, udp, Ipv4, Mac, ETH_HDR_LEN, ETH_TYPE_IP, IP_HDR_LEN,
                   IP_PROTO_UDP, MAC_BROADCAST, UDP_HDR_LEN};
 
 pub const CLIENT_PORT: u16 = 68;
@@ -63,6 +68,23 @@ const RX_MAX: usize = 1500;
 const EXCHANGE_TIMEOUT_MS: u64 = 3000;
 const POLL_INTERVAL_MS: u64 = 10;
 const TRIES: u32 = 3;
+/// Between two tries at getting a lease, and after the last of them.
+const TRY_GAP_MS: u64 = 2000;
+const NO_LEASE_MS: u64 = 5000;
+
+/// The shortest lease the client keeps to: a shorter one is taken as this,
+/// as dhcpcd takes one, so that a server that says 0 does not have the
+/// client asking again and again. T1 is then ten seconds, which was always
+/// the least it waited.
+const MIN_LEASE_SECS: u32 = 20;
+/// A lease with no end (RFC 2131 3.3).
+const INFINITE_LEASE: u32 = 0xFFFF_FFFF;
+/// The least time between two tries at renewing, or at rebinding. RFC 2131
+/// 4.4.5 says sixty seconds, which a lease of the least length would never
+/// get to try twice.
+const RETRY_MIN_MS: u64 = 10_000;
+/// How long a wait for T1 sleeps at a time: how soon a stop is heard.
+const WAIT_STEP_MS: u64 = 1000;
 
 /// What the lease turned out to be.
 #[derive(Clone, Copy, Default)]
@@ -75,6 +97,36 @@ pub struct Lease {
     pub lease_secs: u32,
 }
 
+/// When a lease is renewed, rebound and let go of: milliseconds since boot,
+/// counted from when the REQUEST that got it went out (RFC 2131 4.4.1).
+struct Times {
+    t1: u64,
+    t2: u64,
+    end: u64,
+}
+
+impl Times {
+    /// None for a lease with no end.
+    fn of(start_ms: u64, secs: u32) -> Option<Times> {
+        if secs == INFINITE_LEASE {
+            return None;
+        }
+        let len = u64::from(secs.max(MIN_LEASE_SECS)) * 1000;
+        Some(Times { t1: start_ms + len / 2, t2: start_ms + len / 8 * 7, end: start_ms + len })
+    }
+}
+
+/// What a REQUEST is for (RFC 2131 4.3.2).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    /// The address just offered, of the server that offered it.
+    Select,
+    /// The lease held, of the server that granted it.
+    Renew,
+    /// The lease held, of any server.
+    Rebind,
+}
+
 struct Received {
     buf: [u8; RX_MAX],
     len: usize,
@@ -85,6 +137,7 @@ struct Received {
 /// of it. None of it is on a path where the lock could matter.
 struct State {
     rx: Received,
+    /// What the last ACK said -- never what an offer did.
     lease: Lease,
     offered_ip: u32,
     server_id: u32,
@@ -106,6 +159,25 @@ pub struct Dhcp {
     running: AtomicBool,
 }
 
+fn now_ms() -> u64 {
+    kcore::time::boot_time().as_nanos() / kcore::consts::NS_PER_MS
+}
+
+/// Sleeps until `deadline`, in milliseconds since boot, a second at a time
+/// so that a stop is heard: false when the task is asked to stop first.
+fn sleep_until(deadline: u64) -> bool {
+    loop {
+        if kcore::task::stopping() {
+            return false;
+        }
+        let now = now_ms();
+        if now >= deadline {
+            return true;
+        }
+        kcore::task::sleep_ms((deadline - now).min(WAIT_STEP_MS));
+    }
+}
+
 impl Dhcp {
     pub fn new() -> Option<Dhcp> {
         Some(Dhcp {
@@ -125,6 +197,7 @@ impl Dhcp {
         })
     }
 
+    /// Whether the client holds a lease: bound, renewing or rebinding.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
@@ -163,6 +236,8 @@ impl Dhcp {
     }
 
     /// Stop the client and give up the port. Waits for the task to leave.
+    /// The address stays on the device -- the way down still logs over it
+    /// -- but nobody keeps its lease any more, so the client is not ready.
     pub fn stop(&self) {
         let task = self.task.lock().take();
         if let Some(task) = task {
@@ -173,6 +248,7 @@ impl Dhcp {
 
         self.unlisten();
         self.state.lock().nic = None;
+        self.ready.store(false, Ordering::Release);
         self.running.store(false, Ordering::Release);
     }
 
@@ -217,8 +293,24 @@ impl Dhcp {
     }
 
     /// A received datagram on the client port, from the receive softirq.
+    /// Only an answer in this client's transaction is kept: DHCP answers are
+    /// broadcast, and another client's -- or a stranger's -- must not take
+    /// the one place this client's own answer needs.
     fn receive(&self, frame: &[u8]) {
+        let msg = match udp::parse(frame) {
+            Some(datagram) => datagram.payload,
+            None => return,
+        };
+        if msg.len() < PACKET_LEN + 4 || msg[OP] != BOOTREPLY {
+            return;
+        }
+        let xid = u32::from_be_bytes([msg[XID], msg[XID + 1], msg[XID + 2], msg[XID + 3]]);
+
         let mut state = self.state.lock();
+        let mine = state.nic.is_some_and(|nic| msg[CHADDR..CHADDR + 6] == nic.mac());
+        if xid != state.xid || !mine {
+            return;
+        }
         let rx = &mut state.rx;
 
         if rx.ready {
@@ -232,12 +324,12 @@ impl Dhcp {
         rx.ready = true;
     }
 
-    /// Waits for a message of `want`; false once the timeout passes, or at
-    /// once when the server says no.
+    /// Waits for a message of `want`; false once the timeout passes, at
+    /// once when the server says no, and when the task is asked to stop.
     fn wait_for(&self, want: u8, timeout_ms: u64) -> bool {
         let mut left = timeout_ms;
 
-        while left > 0 {
+        while left > 0 && !kcore::task::stopping() {
             let mut frame = [0u8; RX_MAX];
             let mut len = 0;
             {
@@ -282,18 +374,19 @@ impl Dhcp {
         self.wait_for(OFFER, EXCHANGE_TIMEOUT_MS)
     }
 
-    fn request(&self, renewing: bool) -> bool {
+    /// A REQUEST, and up to `timeout_ms` for its answer.
+    fn request(&self, ask: Ask, timeout_ms: u64) -> bool {
         let nic = match self.nic() {
             Some(nic) => nic,
             None => return false,
         };
 
         let mut frame = [0u8; MAX_FRAME];
-        let len = self.build_request(&nic, &mut frame, renewing);
+        let len = self.build_request(&nic, &mut frame, ask);
 
         self.arm();
         nic.send_raw(&frame[..len]);
-        self.wait_for(ACK, EXCHANGE_TIMEOUT_MS)
+        self.wait_for(ACK, timeout_ms)
     }
 
     /* ---- building ---- */
@@ -347,24 +440,25 @@ impl Dhcp {
         at + 1
     }
 
-    fn build_request(&self, nic: &Nic, frame: &mut [u8], renewing: bool) -> usize {
+    fn build_request(&self, nic: &Nic, frame: &mut [u8], ask: Ask) -> usize {
         let (lease, offered, server) = {
             let state = self.state.lock();
             (state.lease, state.offered_ip, state.server_id)
         };
 
         /* Selecting (after an offer): the address asked for and the server
-         * it came from. Renewing: neither, and the address carried in ciaddr
-         * instead -- some servers refuse or ignore a renewal that still
-         * carries options 50 and 54 (RFC 2131). */
-        let options_len = if renewing { 3 + 1 } else { 3 + 6 + 6 + 1 };
+         * it came from. Renewing or rebinding: neither, and the address
+         * carried in ciaddr instead -- some servers refuse or ignore a
+         * renewal that still carries options 50 and 54 (RFC 2131). */
+        let selecting = ask == Ask::Select;
+        let options_len = if selecting { 3 + 6 + 6 + 1 } else { 3 + 1 };
 
         /* RFC 2131 4.3.2: a renewal is unicast to the server that granted
-         * the lease; with no answer for its address this becomes a
-         * rebinding broadcast. */
+         * the lease; with no answer for its address it goes to everyone, as
+         * rebinding does. */
         let mut dst_mac = MAC_BROADCAST;
         let mut unicast = false;
-        if renewing && lease.server_ip != 0 {
+        if ask == Ask::Renew && lease.server_ip != 0 {
             if let Some(arp) = abi::arp_table() {
                 if let Some(mac) = arp.resolve(nic, nic.route_ip(lease.server_ip)) {
                     dst_mac = mac;
@@ -373,18 +467,19 @@ impl Dhcp {
             }
         }
 
+        let held = if selecting { 0 } else { lease.ip };
         let mut at = self.build_head(
             nic, frame, &dst_mac,
-            if renewing { lease.ip } else { 0 },
+            held,
             if unicast { lease.server_ip } else { 0xFFFF_FFFF },
             options_len,
-            /* Renewing, this machine holds a routable address, so the server
-             * can answer it directly: no broadcast flag. */
-            if renewing { 0 } else { FLAG_BROADCAST },
-            if renewing { lease.ip } else { 0 });
+            /* Renewing or rebinding, this machine holds a routable address,
+             * so the server can answer it directly: no broadcast flag. */
+            if selecting { FLAG_BROADCAST } else { 0 },
+            held);
 
         at = put_option(frame, at, OPT_MESSAGE_TYPE, &[REQUEST]);
-        if !renewing {
+        if selecting {
             at = put_option(frame, at, OPT_REQUESTED_IP, &offered.to_be_bytes());
             at = put_option(frame, at, OPT_SERVER_ID, &server.to_be_bytes());
         }
@@ -402,7 +497,7 @@ impl Dhcp {
             None => return false,
         };
 
-        let datagram = match crate::udp::parse(frame) {
+        let datagram = match udp::parse(frame) {
             Some(datagram) => datagram,
             None => return false,
         };
@@ -479,11 +574,23 @@ impl Dhcp {
         if kind != want {
             return false;
         }
+        /* An address no host may have is no lease, whoever offers it: a
+         * server that offers one is broken, or is not a server, and taking it
+         * would have the machine send from an address no packet may come
+         * from. */
+        if !crate::wire::host_address(yiaddr, found.mask) {
+            trace!(0, "dhcp: {} offered {} mask {}, which no host may have: ignored",
+                Ipv4(found.server_ip), Ipv4(yiaddr), Ipv4(found.mask));
+            return false;
+        }
 
         let mut state = self.state.lock();
-        state.offered_ip = yiaddr;
-        state.server_id = found.server_ip;
-        state.lease = found;
+        if kind == OFFER {
+            state.offered_ip = yiaddr;
+            state.server_id = found.server_ip;
+        } else {
+            state.lease = found;
+        }
         true
     }
 
@@ -496,73 +603,132 @@ impl Dhcp {
 
     fn run(&'static self) {
         while !kcore::task::stopping() {
-            self.listen();
-
-            let mut bound = false;
-            for _ in 0..TRIES {
-                if kcore::task::stopping() {
-                    break;
+            match self.acquire() {
+                Some(start) => self.keep(start),
+                None => {
+                    trace!(0, "dhcp: no lease");
+                    sleep_until(now_ms() + NO_LEASE_MS);
                 }
-                self.next_transaction();
-
-                if self.discover() && self.request(false) {
-                    bound = true;
-                    break;
-                }
-                kcore::task::sleep_ms(2000);
-            }
-
-            self.unlisten();
-
-            if !bound {
-                trace!(0, "dhcp: no lease");
-                kcore::task::sleep_ms(5000);
-                continue;
-            }
-
-            let lease = self.lease();
-            if let Some(nic) = self.nic() {
-                nic.set_ip(lease.ip);
-                nic.set_mask(lease.mask);
-                nic.set_gw(lease.router);
-            }
-            self.ready.store(true, Ordering::Release);
-
-            trace!(0, "dhcp: bound ip {}.{}.{}.{} mask {}.{}.{}.{} gw {}.{}.{}.{} lease {}",
-                (lease.ip >> 24) & 0xFF, (lease.ip >> 16) & 0xFF,
-                (lease.ip >> 8) & 0xFF, lease.ip & 0xFF,
-                (lease.mask >> 24) & 0xFF, (lease.mask >> 16) & 0xFF,
-                (lease.mask >> 8) & 0xFF, lease.mask & 0xFF,
-                (lease.router >> 24) & 0xFF, (lease.router >> 16) & 0xFF,
-                (lease.router >> 8) & 0xFF, lease.router & 0xFF,
-                lease.lease_secs);
-
-            /* T1: half the lease, and never less than ten seconds */
-            let t1 = (lease.lease_secs as u64 / 2).max(10);
-            for _ in 0..t1 {
-                if kcore::task::stopping() {
-                    return;
-                }
-                kcore::task::sleep_ms(1000);
-            }
-
-            trace!(0, "dhcp: renewing");
-            self.listen();
-            self.next_transaction();
-            let renewed = self.request(true);
-            self.unlisten();
-
-            if renewed {
-                let lease = self.lease();
-                if let Some(nic) = self.nic() {
-                    nic.set_ip(lease.ip);
-                }
-                trace!(0, "dhcp: renewed, lease {}", lease.lease_secs);
-            } else {
-                trace!(0, "dhcp: the renewal was refused, starting again");
-                self.ready.store(false, Ordering::Release);
             }
         }
+    }
+
+    /// INIT to BOUND: a DISCOVER, then a REQUEST for what was offered, a few
+    /// times over. When the lease it got starts -- when its REQUEST went out
+    /// -- or None.
+    fn acquire(&'static self) -> Option<u64> {
+        self.listen();
+
+        let mut start = None;
+        for _ in 0..TRIES {
+            if kcore::task::stopping() {
+                break;
+            }
+            self.next_transaction();
+
+            if self.discover() {
+                let sent = now_ms();
+                if self.request(Ask::Select, EXCHANGE_TIMEOUT_MS) {
+                    start = Some(sent);
+                    break;
+                }
+            }
+            if !sleep_until(now_ms() + TRY_GAP_MS) {
+                break;
+            }
+        }
+
+        self.unlisten();
+        if start.is_some() {
+            self.bind("bound");
+        }
+        start
+    }
+
+    /// BOUND, RENEWING and REBINDING (RFC 2131 4.4.5): the lease renewed by
+    /// its server from T1 and by any server from T2, each tried again at
+    /// half the time left; and let go of when a server refuses it or its time
+    /// runs out. Returns when it has been, or the task is asked to stop.
+    fn keep(&'static self, mut start: u64) {
+        'lease: loop {
+            let times = match Times::of(start, self.lease().lease_secs) {
+                Some(times) => times,
+                None => {
+                    /* A lease with no end: nothing to do but be stopped. */
+                    while sleep_until(now_ms() + WAIT_STEP_MS) {}
+                    return;
+                }
+            };
+
+            let mut next = times.t1;
+            loop {
+                if !sleep_until(next) {
+                    return;
+                }
+                let now = now_ms();
+                if now >= times.end {
+                    self.let_go("the lease ran out");
+                    return;
+                }
+
+                let ask = if now >= times.t2 { Ask::Rebind } else { Ask::Renew };
+                trace!(0, "dhcp: {}", if ask == Ask::Renew { "renewing" } else { "rebinding" });
+                self.listen();
+                self.next_transaction();
+                /* Not waited for past the lease's end, which comes when it
+                 * comes, answer or none. */
+                let renewed = self.request(ask, EXCHANGE_TIMEOUT_MS.min(times.end - now));
+                let refused = self.naked.load(Ordering::Acquire);
+                self.unlisten();
+
+                if renewed {
+                    self.bind("renewed");
+                    start = now;
+                    continue 'lease;
+                }
+                if refused {
+                    self.let_go("the renewal was refused");
+                    return;
+                }
+                /* No answer: again at half the time left before T2 -- or,
+                 * rebinding, before the end. */
+                let limit = if ask == Ask::Renew { times.t2 } else { times.end };
+                let now = now_ms();
+                next = (now + limit.saturating_sub(now) / 2).max(now + RETRY_MIN_MS).min(limit);
+            }
+        }
+    }
+
+    /// The lease the last ACK gave, onto the device -- address, mask and
+    /// gateway, all three every time, since a renewal may bring a new mask
+    /// or router -- and the client ready.
+    fn bind(&self, what: &str) {
+        let lease = self.lease();
+        if let Some(nic) = self.nic() {
+            nic.set_ip(lease.ip);
+            nic.set_mask(lease.mask);
+            nic.set_gw(lease.router);
+        }
+        self.ready.store(true, Ordering::Release);
+
+        trace!(0, "dhcp: {} ip {} mask {} gw {} lease {}", what, Ipv4(lease.ip),
+            Ipv4(lease.mask), Ipv4(lease.router), lease.lease_secs);
+    }
+
+    /// The lease is gone: the client is not ready, and its address comes off
+    /// the device, so that nothing more goes out from an address that is
+    /// somebody else's to have now.
+    fn let_go(&self, why: &str) {
+        self.ready.store(false, Ordering::Release);
+        let lease = self.lease();
+        if let Some(nic) = self.nic() {
+            if nic.ip() == lease.ip {
+                nic.set_ip(0);
+                nic.set_mask(0);
+                nic.set_gw(0);
+            }
+        }
+        trace!(0, "dhcp: {}: {} let go", why, Ipv4(lease.ip));
     }
 }
 

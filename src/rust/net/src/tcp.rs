@@ -49,6 +49,8 @@ const TIME_WAIT_MS: u64 = 60_000;
 const FIN_WAIT2_TIMEOUT_MS: u64 = 60_000;
 const CONNECT_TIMEOUT_MS: u64 = 5000;
 const TIMER_PERIOD_MS: u64 = 200;
+/// The least time between two ACKs for segments from outside the window.
+const OOW_ACK_GAP_MS: u64 = 500;
 const DEFAULT_TTL: u8 = 64;
 
 const HASH_SIZE: usize = 32;
@@ -234,6 +236,8 @@ struct Inner {
     time_wait_at: u64,
     /// The zero-window probe's
     persist_at: u64,
+    /// When a segment from outside the window was last answered
+    oow_ack_at: u64,
 
     need_cleanup: bool,
     /// Our FIN has been acknowledged
@@ -257,7 +261,7 @@ impl Inner {
             send_buf: Ring::new(SEND_BUF),
             recv_buf: Ring::new(RECV_BUF),
             rto_ms: INITIAL_RTO_MS,
-            retransmit_at: 0, retransmit_count: 0, time_wait_at: 0, persist_at: 0,
+            retransmit_at: 0, retransmit_count: 0, time_wait_at: 0, persist_at: 0, oow_ack_at: 0,
             need_cleanup: false, fin_acked: false, owned_by_app: false,
             accepted: false,
         }
@@ -290,6 +294,7 @@ impl Inner {
         self.retransmit_count = 0;
         self.time_wait_at = 0;
         self.persist_at = 0;
+        self.oow_ack_at = 0;
         self.need_cleanup = false;
         self.fin_acked = false;
         self.owned_by_app = false;
@@ -655,11 +660,20 @@ impl Tcp {
     fn process_ack(&'static self, inner: &mut Inner, segment_seq: u32, ack: u32,
         wnd: u16, now: u64)
     {
-        /* RFC 793: take the advertisement only from a segment newer than the
-         * one that last set the window, so a reordered stale advertisement
-         * cannot undo it. */
-        if before(inner.snd_wl1, segment_seq)
-            || (inner.snd_wl1 == segment_seq && before_eq(inner.snd_wl2, ack))
+        /* RFC 9293 3.10.7.4: take the advertisement only from a segment
+         * that acknowledges something this end sent -- SND.UNA =< SEG.ACK
+         * =< SND.NXT, so that one which is no part of the peer's stream
+         * cannot set it -- and that is newer than the one that last set
+         * it, so that a reordered stale one cannot undo it. Newer by its
+         * sequence number, as the RFC has it, or by its acknowledgement, as
+         * Linux has it (tcp_may_update_window): a retransmission carries
+         * the peer's current acknowledgement and window under an old
+         * sequence number, and a window kept from before it, with the
+         * edge of what it acknowledges moved on, is room the peer never
+         * offered. */
+        if before_eq(inner.snd_una, ack) && before_eq(ack, inner.snd_nxt)
+            && (before(inner.snd_una, ack) || before(inner.snd_wl1, segment_seq)
+                || (inner.snd_wl1 == segment_seq && before_eq(inner.snd_wl2, ack)))
         {
             inner.snd_wnd = wnd as u32;
             inner.snd_wl1 = segment_seq;
@@ -700,6 +714,21 @@ impl Tcp {
 
         self.send_ack(inner);
     }
+}
+
+/// Whether some of a segment of `len` sequence numbers -- its data, and a
+/// SYN and a FIN each one -- starting at `seq` lies in the receive window
+/// (RFC 9293 3.10.7.4). A shut window takes only what is at its edge: for
+/// the acknowledgement it carries, since there is no room for its data.
+fn acceptable(inner: &Inner, seq: u32, len: u32) -> bool {
+    let in_window = |s: u32| s.wrapping_sub(inner.rcv_nxt) < inner.rcv_wnd;
+    if inner.rcv_wnd == 0 {
+        return seq == inner.rcv_nxt;
+    }
+    if len == 0 {
+        return in_window(seq);
+    }
+    in_window(seq) || in_window(seq.wrapping_add(len - 1))
 }
 
 /// The IP checksum again, over a header whose time to live has been changed
@@ -744,6 +773,34 @@ impl Tcp {
             conn.conn_ready.store(true, Ordering::Release);
             conn.data_ready.store(true, Ordering::Release);
             return Event::Rst;
+        }
+
+        /* RFC 9293 3.10.7.4: in a synchronized state a segment counts only
+         * when some of it is in the receive window. One outside it is an
+         * old duplicate, or no part of the peer's stream at all: it is
+         * answered with an ACK that says where this end is, and nothing in
+         * it -- its acknowledgement, its window, its data -- is taken.
+         * Without this a segment from anywhere in the sequence space set the
+         * send window, and an off-path host with the four addresses could
+         * shut a connection's window, or open it past what the peer can
+         * take, and hold the peer's own updates off as older than its. */
+        if matches!(inner.state, State::Established | State::FinWait1 | State::FinWait2
+            | State::CloseWait | State::Closing | State::LastAck)
+        {
+            let seg_len = len + (flags & seg::SYN != 0) as u32 + (flags & seg::FIN != 0) as u32;
+            if !acceptable(inner, seq, seg_len) {
+                /* The ACK is what a zero-window probe is sent to hear. At
+                 * most one a half second, as Linux limits these
+                 * (tcp_invalid_ratelimit): two ends that each find the
+                 * other's segments outside their window -- both windows
+                 * shut, data outstanding both ways -- would otherwise
+                 * answer each other's answers for as long as they last. */
+                if now >= inner.oow_ack_at.saturating_add(OOW_ACK_GAP_MS) {
+                    inner.oow_ack_at = now;
+                    self.send_ack(inner);
+                }
+                return Event::None;
+            }
         }
 
         match inner.state {
@@ -993,6 +1050,15 @@ impl Tcp {
         let flags = seg::flags(segment);
         let peer_mac = eth::src(frame);
 
+        /* Port 0 is nobody's (RFC 6335): no connection has it, and nothing
+         * is answered to it. And TCP is between two hosts: a segment to a
+         * broadcast address -- which the receive path lets through for UDP
+         * -- is nobody's either (RFC 1122 4.2.3.10), and answered, it would
+         * be answered from the broadcast address. */
+        if local_port == 0 || remote_port == 0 || !crate::device::DEVICES.is_local(local_ip) {
+            return;
+        }
+
         let pool = self.pool.lock();
 
         /* The four addresses, exactly */
@@ -1011,8 +1077,12 @@ impl Tcp {
             return;
         }
 
-        /* A SYN for something listening */
-        if flags & seg::SYN != 0 && pool.find_listener(local_ip, local_port).is_some() {
+        /* A SYN for something listening -- a SYN alone: in LISTEN an ACK
+         * is answered with a reset, a RST ignored (RFC 9293 3.10.7.2), and
+         * a SYN that carries either, or a FIN, is no request to connect. */
+        if flags & (seg::SYN | seg::ACK_FLAG | seg::RST | seg::FIN) == seg::SYN
+            && pool.find_listener(local_ip, local_port).is_some()
+        {
             let mut pool = pool;
 
             /* Dropped, as a full accept queue drops it: the peer tries again
@@ -1226,17 +1296,26 @@ impl Tcp {
         drop(inner);
         self.conn_count.fetch_add(1, Ordering::Relaxed);
 
+        /* Looked at once more after the last sleep, whatever the clock
+         * says by then: an answer that came in during it is an answer. */
         let deadline = now_ms() + CONNECT_TIMEOUT_MS;
-        while now_ms() < deadline {
+        loop {
             if conn.conn_ready.load(Ordering::Acquire) {
                 let state = conn.inner.lock().state;
 
-                if state == State::Established {
+                /* Up -- and maybe closed by the peer already: a server
+                 * that answers and closes at once has its answer and its
+                 * FIN in before this task looks, and what it sent is
+                 * still here to read. */
+                if matches!(state, State::Established | State::CloseWait) {
                     return Some(conn);
                 }
                 /* Refused, or reset */
                 self.close(conn);
                 return None;
+            }
+            if now_ms() >= deadline {
+                break;
             }
             kcore::task::sleep_ms(1);
         }

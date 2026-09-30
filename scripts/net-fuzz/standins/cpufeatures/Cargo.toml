@@ -1,0 +1,12 @@
+# cpufeatures, as the fuzzer builds the RustCrypto crates: no CPU has any
+# feature, so every one of them takes its portable software backend -- which
+# is the one the kernel runs, its SIMD being off (src/rust/.cargo/config.toml
+# forces the same). The real crate would ask macOS through libc, which the
+# vendored tree does not carry. Put in place of the real crate by
+# `[patch.crates-io]` in the fuzzer's manifest.
+[package]
+name = "cpufeatures"
+version = "0.2.17"
+edition = "2018"
+
+[lib]

@@ -1,0 +1,20 @@
+# getrandom, as the fuzzer builds it: always the custom source the `tls`
+# crate registers -- the kernel's entropy pool, which in the fuzzer is a
+# stream of the input's own. The real crate uses it only on a target with no
+# source of its own and asks the host's everywhere else, and a TLS handshake
+# drawing on the host's randomness would be a different handshake every run:
+# no finding in it could be made again. Put in place of the real crate by
+# `[patch.crates-io]` in the fuzzer's manifest, so it has the real one's
+# name, version and features.
+[package]
+name = "getrandom"
+version = "0.2.17"
+edition = "2018"
+
+[lib]
+
+[features]
+custom = []
+std = []
+js = []
+rdrand = []

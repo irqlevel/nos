@@ -11,6 +11,7 @@
 //! under a flood it took a fifth of the CPU that the receive softirq runs on.
 
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::nic::{Lent, Nic, RxContext, UdpHandler, UdpListener};
@@ -54,6 +55,10 @@ const TRUNCATED: &[u8] = b"\n[output truncated]\n";
 struct Request {
     cmd: [u8; CMD_MAX],
     len: usize,
+    /// How long the command was when it did not fit: it is not run cut
+    /// short -- a `write` cut short writes something else -- but answered
+    /// with why not.
+    too_long: usize,
     from_ip: u32,
     from_port: u16,
     /// Echoed back exactly as it arrived, in the order it arrived in
@@ -103,6 +108,14 @@ impl Reply {
     }
 }
 
+/// What the shell says itself goes in the reply as a command's output does.
+impl Write for Reply {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.collect(s.as_bytes());
+        Ok(())
+    }
+}
+
 pub struct UdpShell {
     state: SpinLock<State>,
     /// Signalled when a command is in, and by `stop`
@@ -128,7 +141,7 @@ impl UdpShell {
         Some(UdpShell {
             state: SpinLock::new(State {
                 request: Request {
-                    cmd: [0; CMD_MAX], len: 0, from_ip: 0, from_port: 0,
+                    cmd: [0; CMD_MAX], len: 0, too_long: 0, from_ip: 0, from_port: 0,
                     seq: [0; 4], ready: false,
                 },
                 nic: None,
@@ -234,9 +247,16 @@ impl UdpShell {
             return;
         }
 
-        let len = declared.min(CMD_MAX);
-        request.cmd[..len].copy_from_slice(&payload[HDR_LEN..HDR_LEN + len]);
+        /* Whatever line ending the client used is not part of the command,
+         * and not what makes it too long. */
+        let mut text = &payload[HDR_LEN..HDR_LEN + declared];
+        while let [rest @ .., b'\n' | b'\r'] = text {
+            text = rest;
+        }
+        let len = text.len().min(CMD_MAX);
+        request.cmd[..len].copy_from_slice(&text[..len]);
         request.len = len;
+        request.too_long = if text.len() > CMD_MAX { text.len() } else { 0 };
         request.from_ip = datagram.src_ip;
         request.from_port = datagram.src_port;
         request.seq.copy_from_slice(&payload[HDR_SEQ..HDR_SEQ + 4]);
@@ -285,14 +305,14 @@ impl UdpShell {
 
     fn serve(&self, reply: &mut Reply) {
         while !kcore::task::stopping() {
-            let (cmd, len, to_ip, to_port, seq) = {
+            let (cmd, len, too_long, to_ip, to_port, seq) = {
                 let mut state = self.state.lock();
                 let request = &mut state.request;
                 if !request.ready {
-                    (None, 0, 0, 0, [0u8; 4])
+                    (None, 0, 0, 0, 0, [0u8; 4])
                 } else {
                     request.ready = false;
-                    (Some(request.cmd), request.len, request.from_ip,
+                    (Some(request.cmd), request.len, request.too_long, request.from_ip,
                      request.from_port, request.seq)
                 }
             };
@@ -315,20 +335,25 @@ impl UdpShell {
                 continue;
             }
 
-            let line = match core::str::from_utf8(&cmd[..len]) {
-                Ok(line) => line,
-                Err(_) => {
-                    trace!(0, "udpshell: a command that is not text, dropped");
-                    continue;
-                }
-            };
-
-            trace!(0, "udpshell: cmd '{}' from {}.{}.{}.{}:{}", line,
-                (to_ip >> 24) & 0xFF, (to_ip >> 16) & 0xFF,
-                (to_ip >> 8) & 0xFF, to_ip & 0xFF, to_port);
-
             reply.clear();
-            kcore::cmd::dispatch(line, &mut |piece: &[u8]| reply.collect(piece));
+            if too_long != 0 {
+                trace!(0, "udpshell: a command of {} bytes, not run", too_long);
+                let _ = writeln!(reply, "command too long: {} bytes, at most {}", too_long, CMD_MAX);
+            } else {
+                let line = match core::str::from_utf8(&cmd[..len]) {
+                    Ok(line) => line,
+                    Err(_) => {
+                        trace!(0, "udpshell: a command that is not text, dropped");
+                        continue;
+                    }
+                };
+
+                trace!(0, "udpshell: cmd '{}' from {}.{}.{}.{}:{}", line,
+                    (to_ip >> 24) & 0xFF, (to_ip >> 16) & 0xFF,
+                    (to_ip >> 8) & 0xFF, to_ip & 0xFF, to_port);
+
+                kcore::cmd::dispatch(line, &mut |piece: &[u8]| reply.collect(piece));
+            }
             reply.finish();
 
             let nic = match self.state.lock().nic {

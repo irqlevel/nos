@@ -81,6 +81,10 @@ struct Ring {
     used: usize,
     /// Records evicted because the ring was full
     dropped: usize,
+    /// Bytes evicted from the head, ever, wrapping -- to make room, or
+    /// trimmed: what a sender that peeked a batch takes off what it pops
+    /// once the batch is out, since they were the batch's oldest.
+    evicted: usize,
 }
 
 impl Ring {
@@ -130,6 +134,7 @@ impl Ring {
             Some(len) => {
                 self.pop(RECORD_HDR + len, None);
                 self.dropped += 1;
+                self.evicted = self.evicted.wrapping_add(RECORD_HDR + len);
             }
             None => {
                 /* Should not happen; start again rather than spin */
@@ -153,6 +158,7 @@ impl Ring {
             }
             self.pop(record, None);
             self.dropped += 1;
+            self.evicted = self.evicted.wrapping_add(record);
             region -= record;
         }
     }
@@ -171,6 +177,18 @@ impl Ring {
 
         self.push(&[(text.len() & 0xFF) as u8, ((text.len() >> 8) & 0xFF) as u8]);
         self.push(text);
+    }
+
+    /// A batch peeked when `evicted` was what it was, and sent: off the head.
+    /// Whatever was evicted since came off the head first, where the batch
+    /// began, so it is that much less -- all of it gone, perhaps. Popping it
+    /// whole ate live records; not popping it at all sent the rest of it
+    /// again.
+    fn pop_sent(&mut self, consumed: usize, evicted: usize) {
+        let gone = self.evicted.wrapping_sub(evicted);
+        if gone < consumed {
+            self.pop(consumed - gone, None);
+        }
     }
 
     /// As many whole records as fit in `out`, without consuming them. What
@@ -253,7 +271,7 @@ pub struct Netconsole {
 /// reason.
 pub static NETCONSOLE: Netconsole = Netconsole {
     log: IrqSpinLock::new(Log {
-        ring: Ring { buf: [0; RING_SIZE], head: 0, used: 0, dropped: 0 },
+        ring: Ring { buf: [0; RING_SIZE], head: 0, used: 0, dropped: 0, evicted: 0 },
         seq: 0,
         panic_backlog: 0,
         nic: None,
@@ -424,8 +442,14 @@ impl Netconsole {
 
         while !kcore::task::stopping() {
             /* No address yet -- DHCP still running, or no static one set:
-             * keep buffering, the backlog goes out as soon as there is one. */
-            let nic = match self.log.lock().nic {
+             * keep buffering, the backlog goes out as soon as there is one.
+             * The device is read under the lock and the lock let go of before
+             * anything else: a guard in a `match`'s scrutinee lives to the
+             * end of the match, and this one slept here, 200 ms at a time,
+             * with the log's lock held and interrupts off -- every line any
+             * CPU traced meanwhile spinning on it. */
+            let attached = self.log.lock().nic;
+            let nic = match attached {
                 Some(nic) if nic.ip() != 0 => nic,
                 _ => {
                     kcore::task::sleep_ms(NO_LINK_POLL_MS);
@@ -435,10 +459,10 @@ impl Netconsole {
 
             self.trim_backlog_once();
 
-            let (len, consumed, dropped, seq) = {
+            let (len, consumed, evicted, seq) = {
                 let log = self.log.lock();
                 let (len, consumed) = log.ring.peek_batch(&mut packet[DGRAM_HDR..]);
-                (len, consumed, log.ring.dropped, log.seq)
+                (len, consumed, log.ring.evicted, log.seq)
             };
 
             if len == 0 {
@@ -463,12 +487,9 @@ impl Netconsole {
                 let mut log = self.log.lock();
                 log.seq = seq.wrapping_add(1);
                 /* An append may have evicted from the head while the lock
-                 * was down, in which case what was just sent is already gone
-                 * and popping again would eat live records. The drop count
-                 * is the only other thing that moves the head. */
-                if log.ring.dropped == dropped {
-                    log.ring.pop(consumed, None);
-                }
+                 * was down: what was just sent is then partly or wholly gone
+                 * already. */
+                log.ring.pop_sent(consumed, evicted);
             }
 
             kcore::task::sleep_ms(SEND_PACE_MS);
@@ -556,9 +577,9 @@ impl Netconsole {
         let mut packet = [0u8; DGRAM_MAX];
         let mut failures = 0;
         for _ in 0..PANIC_MAX_PACKETS {
-            let (len, consumed, seq) = self.in_panic(|log| {
+            let (len, consumed, evicted, seq) = self.in_panic(|log| {
                 let (len, consumed) = log.ring.peek_batch(&mut packet[DGRAM_HDR..]);
-                (len, consumed, log.seq)
+                (len, consumed, log.ring.evicted, log.seq)
             });
             if len == 0 {
                 break;
@@ -566,9 +587,11 @@ impl Netconsole {
 
             if self.send_batch(&nic, &mut packet, len, seq) {
                 self.sent.fetch_add(1, Ordering::Relaxed);
+                /* What the send traced on the way may have filled the ring
+                 * and evicted from its head. */
                 self.in_panic(|log| {
                     log.seq = seq.wrapping_add(1);
-                    log.ring.pop(consumed, None);
+                    log.ring.pop_sent(consumed, evicted);
                 });
                 failures = 0;
                 continue;

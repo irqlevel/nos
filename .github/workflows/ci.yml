@@ -62,6 +62,16 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/hv-fuzz.py
 
+      # Everything the network hands the kernel is somebody else's to choose,
+      # and a panic, a lock broken or a spin there is anyone's to cause: the
+      # network layer, TLS and sshd fuzzed on the host, the same inputs every
+      # run. On this leg, the hypervisor's fuzz being on the other.
+      - name: Network fuzz (host)
+        if: matrix.arch == 'aarch64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/net-fuzz.py
+
       # The smoke disks carry no partition table, so nothing else here would
       # notice the partition reader breaking.
       - name: Partition table test (${{ matrix.arch }}, TCG)

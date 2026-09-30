@@ -1,0 +1,17 @@
+# webpki-roots, as the fuzzer builds the TLS client: the roots it trusts are
+# one, the fuzzer's own certificate authority (../../certs/ca.der), whose
+# server certificate the fuzzer's TLS server presents. The client's code and
+# rustls's are what the kernel runs; only what they are told to trust is not
+# Mozilla's -- no certificate the fuzzer could make would chain to one of
+# those. Put in place of the real crate by `[patch.crates-io]` in the
+# fuzzer's manifest, so it has the real one's name and version.
+[package]
+name = "webpki-roots"
+version = "1.0.9"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+pki-types = { package = "rustls-pki-types", version = "1.8", default-features = false }
+webpki = { package = "rustls-webpki", version = "0.103.14", default-features = false }

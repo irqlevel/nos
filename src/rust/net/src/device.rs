@@ -383,6 +383,8 @@ pub struct Device {
     tx_proto: PerCpu<TxCounters>,
     tx_packets: AtomicUsize,
     rx_packets: AtomicUsize,
+    /// Datagrams refused for an address no packet may go to.
+    tx_refused: AtomicUsize,
 }
 
 impl Device {
@@ -408,6 +410,7 @@ impl Device {
             tx_proto: PerCpu::new(),
             tx_packets: AtomicUsize::new(0),
             rx_packets: AtomicUsize::new(0),
+            tx_refused: AtomicUsize::new(0),
         }
     }
 
@@ -513,10 +516,19 @@ impl Device {
             };
             while tx.queue.len() < TX_CAPACITY {
                 match frames.pop() {
-                    Some(frame) => tx.queue.push(frame),
+                    /* Whoever built it -- the stack, NAT, a module -- hears
+                     * the send failed, and the frame is released with what
+                     * the driver finishes. */
+                    Some(frame) if !goes_anywhere(frame.bytes()) => {
+                        tx.done.push(frame);
+                        self.tx_refused.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(frame) => {
+                        tx.queue.push(frame);
+                        queued += 1;
+                    }
                     None => break,
                 }
-                queued += 1;
             }
 
             /* The driver, with the queue and its own ring both lent out of
@@ -615,6 +627,16 @@ impl Device {
             _ => counters.other.add(1),
         }
     }
+}
+
+/// Whether a frame may leave the machine: anything but an IPv4 datagram to
+/// an address no packet may go to (RFC 1122 3.2.1.3) -- "this network", a
+/// loopback address, which must never appear outside a host, a reserved
+/// one. Whatever builds such a datagram, it stops here.
+fn goes_anywhere(data: &[u8]) -> bool {
+    data.len() < ETH_HDR_LEN + IP_HDR_LEN
+        || eth::ether_type(data) != ETH_TYPE_IP
+        || crate::wire::deliverable(ip::dst(&data[ETH_HDR_LEN..]))
 }
 
 /* ---- receiving ---- */
@@ -755,6 +777,13 @@ impl Device {
             return;
         }
 
+        /* The one place a packet is judged for this machine's protocols:
+         * past here each of them may take the header as what it says. */
+        if !self.for_this_machine(data) {
+            counters.drop.add(1);
+            return;
+        }
+
         let packet = &data[ETH_HDR_LEN..];
         match ip::protocol(packet) {
             IP_PROTO_ICMP => {
@@ -774,7 +803,26 @@ impl Device {
                 if ip_len == 0 || data.len() < ETH_HDR_LEN + ip_len + UDP_HDR_LEN {
                     return;
                 }
-                let port = udp::dst_port(&data[ETH_HDR_LEN + ip_len..]);
+                /* The datagram as its own length has it, within the packet,
+                 * and its checksum right when it carries one: RFC 1122
+                 * 4.1.3.4 has a datagram whose checksum is wrong dropped,
+                 * and a listener -- a disk served over UDP, say -- has no
+                 * other way to tell its bytes were changed on the way. */
+                let datagram = &data[ETH_HDR_LEN + ip_len..ETH_HDR_LEN + ip::total_len(packet) as usize];
+                if datagram.len() < UDP_HDR_LEN {
+                    counters.drop.add(1);
+                    return;
+                }
+                let udp_len = udp::length(datagram) as usize;
+                if udp_len < UDP_HDR_LEN || udp_len > datagram.len()
+                    || (crate::wire::be16(datagram, udp::CHECKSUM) != 0
+                        && crate::wire::transport_checksum(IP_PROTO_UDP, ip::src(packet), ip::dst(packet),
+                            &datagram[..udp_len]) != 0)
+                {
+                    counters.drop.add(1);
+                    return;
+                }
+                let port = udp::dst_port(datagram);
 
                 /* The callback ran under the listener lock -- with interrupts
                  * off -- on every datagram. On the CPU the NIC's interrupt
@@ -808,6 +856,48 @@ impl Device {
                 counters.drop.add(1);
             }
         }
+    }
+}
+
+impl Device {
+    /// Whether an IPv4 packet is one for this machine's own protocols (RFC
+    /// 1122 3.2.1): a header that says what it is -- version 4, its length
+    /// inside the packet and the packet inside the frame, its checksum
+    /// right; the whole of a datagram, there being no reassembly here to
+    /// make a fragment anybody's; from an address a packet can come from --
+    /// not nobody, not a broadcast or a multicast group, not the loopback
+    /// net, not this machine itself -- and to one of this machine's, or to
+    /// everyone on the device's link. The protocols past it take the header
+    /// as what it says: without it they answered a packet from 0.0.0.0 or
+    /// from a broadcast address, and answered as whatever address a packet
+    /// was sent to, the machine's or not.
+    ///
+    /// The one exception is a DHCP server's answer to a device with no
+    /// address yet, which may be sent to the address it is offering.
+    fn for_this_machine(&self, data: &[u8]) -> bool {
+        let packet = &data[ETH_HDR_LEN..];
+        let ihl = ip::header_len(packet);
+        let total = ip::total_len(packet) as usize;
+        if ip::version(packet) != 4 || ihl == 0 || ihl > packet.len() || total < ihl || total > packet.len() {
+            return false;
+        }
+        if crate::wire::checksum(&packet[..ihl]) != 0 || ip::is_fragment(packet) {
+            return false;
+        }
+
+        let (src, dst) = (ip::src(packet), ip::dst(packet));
+        let (mine, mask) = (self.ip(), self.mask());
+        let link_broadcast = |addr: u32| mask != 0 && mine != 0 && addr == mine | !mask;
+        let nobodys = src == 0 || src >> 24 == 127 || src >= 0xE000_0000;
+        if nobodys || link_broadcast(src) || DEVICES.is_local(src) {
+            return false;
+        }
+
+        if dst == 0xFFFF_FFFF || link_broadcast(dst) || DEVICES.is_local(dst) {
+            return true;
+        }
+        mine == 0 && ip::protocol(packet) == IP_PROTO_UDP && total >= ihl + UDP_HDR_LEN
+            && udp::dst_port(&packet[ihl..]) == crate::dhcp::CLIENT_PORT
     }
 }
 
@@ -897,6 +987,7 @@ impl Device {
         let mut stats = Stats {
             tx_total: self.tx_packets.load(Ordering::Relaxed),
             rx_total: self.rx_packets.load(Ordering::Relaxed),
+            tx_refused: self.tx_refused.load(Ordering::Relaxed),
             rx_drop: 0, rx_icmp: 0, rx_udp: 0, rx_tcp: 0, rx_arp: 0, rx_other: 0, rx_nat: 0,
             tx_icmp: 0, tx_udp: 0, tx_tcp: 0, tx_arp: 0, tx_other: 0,
         };
@@ -925,6 +1016,8 @@ impl Device {
 pub struct Stats {
     pub tx_total: usize,
     pub rx_total: usize,
+    /// Datagrams to an address no packet may go to, never sent.
+    pub tx_refused: usize,
     pub rx_drop: usize,
     pub rx_icmp: usize,
     pub rx_udp: usize,
