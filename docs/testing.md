@@ -105,7 +105,7 @@ swallowing panic messages whole.
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
-| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko` -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
+| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, ACPI tables and command line -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -772,8 +772,11 @@ up, and e2fsck renames the other -- so the checks count it unclean.
 ### `cpp-fuzz.py` -- what the C++ is handed, and the memory under everything, fuzzed
 
 The kernel's C++ reads things nobody checked before it: the device tree the
-arm64 boot is handed, the firmware's memory map, the GRUB environment block
-`grubenv` reads off `/boot`, a module's `.ko`. And under everything the
+arm64 boot is handed, the Multiboot2 information GRUB hands the x86 one and
+the ACPI tables its firmware leaves in memory, the firmware's memory map,
+the command line, the GRUB environment block `grubenv` reads off `/boot`, a
+module's `.ko`. Most of it is read before a headless machine has any
+console at all. And under everything the
 kernel does is its C++ memory management, whose error paths -- a table that
 cannot be allocated half way down a walk, a heap with no page left -- no boot
 takes. A read past an end, an index out of range or a wrap in any of them is
@@ -844,7 +847,39 @@ what its header says it does:
   with pages and maps failing on the input's word: every block the size
   asked for, aligned, mapped and nobody else's, what was written into it
   there when it is freed, nothing refused while there is memory and VA to
-  give, and every page back but the bitmaps' once everything is freed.
+  give, and every page back but the bitmaps' once everything is freed;
+- `cmdline`: command lines of the parameters the kernel takes, with values
+  of every kind -- numbers at and past their limits, addresses that are
+  not, labels and UUIDs --, words it does not know, strays, and lines longer
+  than the buffer, cut anywhere: every getter held to a reader of
+  `parameters.h`, and a parameter the buffer's end cuts through left out
+  whole, never read as the shorter one it would be;
+- `multiboot`: Multiboot2 infos as GRUB makes them -- memory maps of every
+  entry size, and one longer than the map holds; the command line; both
+  RSDP tags; the framebuffer; the tags this kernel skips -- and damaged:
+  sizes that lie, a tag past the info's end, no end tag. What
+  `ParseMultiBootInfo` leaves -- the memory map region by region, the
+  command line, the RSDP's copy, the framebuffer -- is held to the tags
+  read in order, the map's reserved regions before its usable RAM;
+- `acpi`: the tables in a physical memory of the input's, sparse, zeros
+  where nothing was put: an RSDP in the Multiboot tag's copy, the EBDA or
+  the BIOS area, among decoys; an RSDT or an XSDT; and tables below and
+  above 4 GiB, across page ends and over each other -- a MADT of every entry
+  kind, FADTs, HPET tables and WDATs of every length and each side of the
+  fields the kernel reads, the SSDTs and the rest a firmware lists, seconds
+  of the kinds read among them --, now and then damaged anywhere. The TmpMap
+  window is emulated to the slot: a mapping is a copy of the pages it maps
+  between poisoned ones, a table's mapping is poisoned outside the table,
+  so that a read past a table's length is a report and not a read of its
+  neighbour, and the window refuses a mapping where the input says. A
+  machine is held to a reader of it written from `acpi.h` -- the RSDP the
+  search finds, the first table of each kind that can be mapped, the CPUs,
+  the IO-APIC the driver can drive, the overrides, the FADT's, HPET's and
+  WDAT's fields, whether it boots at all; and any machine, the window cut
+  short or not, to this: nothing mapped past the physical address space or
+  longer than a table may be, no more of the window held at once than
+  `acpi.h` bounds, and when the parse is done nothing held but the two
+  APICs' pages -- and not those if it failed.
 
 The runner (`fuzz/cpp/common/runner.cpp`) is `fuzz/common`'s, but for one
 thing: inputs run in batches, one after another in a process forked for the
@@ -856,7 +891,7 @@ bug and says so. Each finding comes with the seed and iteration that make it
 again and the input in `out/cpp-fuzz/findings/` -- `--replay TARGET FILE`,
 with `--trace` for the kernel's trace lines. `CPP_FUZZ_STATS=1` adds how
 often each target reached each state it counts. With no arguments every
-target runs its own number of inputs from seed 1: the gate, about a minute,
+target runs its own number of inputs from seed 1: the gate, a minute and a half,
 which CI runs on its arm64 leg. It needs clang and make on the host, and
 nothing else; the programs of each host are built in a directory of their
 own (`out/cpp-fuzz/<system>-<machine>/`), since a Mac and a container share
@@ -904,11 +939,48 @@ leave pages mapped behind a map that said no -- panic saying so, where one
 was a bare `BugOn` and the other returned without a word. No walk needs more
 than two slots, which `pagetable` checks.
 
-What it does not reach yet: the x86 boot's own readers -- Multiboot2's tags
-(`arch/x86_64/grub.cpp`), the ACPI tables (`drivers/acpi.cpp`) -- and the
-command line (`kernel/parameters.cpp`); `PageTable::Setup` and the free list's
-build, which run on the bootstrap linear map; and anything that needs a
-second CPU. `mm/block_allocator.cpp` is not fuzzed: nothing uses it.
+And when the x86 boot's own readers were added, each fixed:
+
+- Multiboot2: the walk read a tag's type before it knew the tag's header was
+  inside the info -- an info with no end tag read past its end. And a
+  firmware map longer than the memory map's 64 regions was a panic before
+  any console a headless machine has: the map holds 128 now, what Linux's
+  boot protocol passes, and a map longer than that is not a boot that stops
+  -- its reserved regions go in first, and the usable RAM past what leaves
+  room for the kernel's own regions is left out, and said;
+- ACPI: every table the root listed stayed mapped in the TmpMap window for
+  good -- the EX44's 25, of a window of 448 slots every page allocation needs
+  one of -- where four are read. The four are mapped while `Parse` reads them
+  and let go of after, and so is the root, whichever way it ends; what is
+  kept is the values, and the two APICs' pages. A table with a length short
+  of its header, or one the window could not map, failed the whole parse --
+  a panic at boot -- where only the MADT is needed: a table not to be mapped
+  is skipped now, and said. Nothing bounded a table's length -- 4 GiB failed
+  the boot, a few hundred pages would have held the window --, and an XSDT
+  entry past the physical address space was mapped, its bits above 51
+  landing in the PTE's flags: a table longer than 64 KiB, or out of the
+  address space, is not mapped. The MADT was read past a table shorter than
+  its own header; each IO-APIC listed was mapped over the one before, the
+  last kept and the others' slots leaked -- on the AX41, whose MADT lists
+  the FCH's at GSI 0 first and the GNB's past it second, the legacy IRQs, the
+  HPET's tick among them, were set up on pins of the GNB's that none of
+  those lines reaches ([Real hardware](real-hardware.md)) --, where the
+  driver can drive the one at GSI 0; an APIC whose registers would run past
+  its page, which put the drivers' accesses in the window's next slot, is
+  refused; a MADT naming no IO-APIC booted on to a fault at address 0 in
+  its driver, where it fails the parse, saying so. More than 64 interrupt
+  source overrides failed the boot, a second for an IRQ took a slot nothing
+  read, one to a GSI past 255 was cut to a byte by the interrupt layer: the
+  first for an IRQ is taken, and the rest said.
+- the command line: `Parameters`'s constructor left two members unset --
+  zeros in the kernel only because the object's storage is static.
+
+What it does not reach yet: `PageTable::Setup` and the free list's build,
+which run on the bootstrap linear map; and anything that needs a second
+CPU. `mm/block_allocator.cpp` is not fuzzed: nothing uses it. The legacy
+search finds an RSDP only whole within a page -- the kernel maps the BIOS
+area a page at a time --, which the reader holds it to: the Multiboot tag,
+GRUB's copy, is the path every machine this kernel boots on takes.
 
 ### `hv-test.py` -- the extension turned on and off again, and guests under it
 

@@ -94,7 +94,7 @@ void Run(Fuzz::Input& in)
        or one past MaxPhysAddr, and of the rest what is below it. */
     const u128 top = MemoryMap::MaxPhysAddr;
     bool many = in.Chance(8);
-    ulong count = many ? 70 : in.Below(14);
+    ulong count = many ? MemoryMap::MaxRegions + 6 : in.Below(14);
     std::vector<ulong> types;
     for (ulong i = 0; i < count; i++)
     {
@@ -108,7 +108,7 @@ void Run(Fuzz::Input& in)
             Fuzz::Reached("a region kept nothing of");
             continue;
         }
-        if (map.size() >= 64)
+        if (map.size() >= MemoryMap::MaxRegions)
         {
             INVARIANT(!added, "AddRegion took region %lu into a full map", i);
             continue;
@@ -123,7 +123,7 @@ void Run(Fuzz::Input& in)
         map.push_back({addr, end, type == MemoryMap::UsableRamType});
         types.push_back(type);
     }
-    Fuzz::Reached(map.size() >= 64 ? "a full map" : "a map");
+    Fuzz::Reached(map.size() >= MemoryMap::MaxRegions ? "a full map" : "a map");
     INVARIANT(mmap.GetRegionCount() == map.size(), "the map holds %lu regions, not %lu", mmap.GetRegionCount(),
         map.size());
     for (size_t i = 0; i < map.size(); i++)

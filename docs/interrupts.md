@@ -85,7 +85,12 @@ interrupts.
 
 ## x86-64: IOAPIC routing
 
-`Interrupt::Register` programs the redirection entry directly.
+`Interrupt::Register` programs the redirection entry directly. The IOAPIC
+driven is one: the MADT's whose pins start at GSI 0, the legacy IRQs' (or,
+on a machine with none such, the first listed) -- a machine may have several,
+as AMD's does, the FCH's at GSI 0 and the GNB's past it, and the driver
+takes a GSI for the index of its pin. An override naming a GSI past 255, or
+an IRQ overridden once already, is left out and said.
 `RegisterLevel` first asks ACPI for the GSI the ISA IRQ maps to and for the
 MADT polarity flags (bits [1:0]: 00 = bus default, 01 = active high,
 11 = active low; PCI's bus default is active low), then asks `IrqBalance`
