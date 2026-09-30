@@ -351,7 +351,10 @@ fn write_out(w: &mut Writer) {
             continue;
         }
 
-        let n = w.pending_used.min(IO_BUF_SIZE);
+        /* Whole sectors of the transfer buffer at most: a sector size that
+         * does not divide a page -- 520 bytes, as some disks have -- would
+         * otherwise round a full buffer's worth up past its end. */
+        let n = w.pending_used.min(IO_BUF_SIZE / sector_size * sector_size);
         if n == 0 {
             break;
         }
@@ -608,7 +611,9 @@ pub fn setup() -> bool {
         CLAIM.store(claim, Ordering::Relaxed);
         AREA_SECTORS.store(header.area_sectors, Ordering::Relaxed);
         SECTOR_SIZE.store(header.sector_size, Ordering::Relaxed);
-        BOOT_SEQ.store(header.boot_seq + 1, Ordering::Relaxed);
+        /* The count comes off the disk: one at its top starts again. */
+        let boot = header.boot_seq.wrapping_add(1);
+        BOOT_SEQ.store(boot, Ordering::Relaxed);
         w.cursor = 0;
         w.full = false;
         ENABLED.store(true, Ordering::Release);
@@ -626,7 +631,7 @@ pub fn setup() -> bool {
         }
 
         trace!(0, "DiskLog: {}, boot {}, {} sectors of {} bytes",
-            dev.name(), header.boot_seq + 1,
+            dev.name(), boot,
             header.area_sectors, header.sector_size);
 
         /* The boot so far -- the whole ring, the line above with it -- goes

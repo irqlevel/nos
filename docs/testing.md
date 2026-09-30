@@ -104,6 +104,7 @@ swallowing panic messages whole.
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
+| `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -470,7 +471,8 @@ those paths is one somebody else can cause, and on the Hetzner boxes the
 network is the only console there is. `fuzz/net` is a host program
 built from the kernel's own crates as they are -- `net`, `netwire`, `tls`,
 `fs`, `ssh` and the sshd module's source, over `kcore` and `ffi` -- linked
-with the rest of a kernel written for the purpose (`src/machine/`): its C++
+with the rest of a kernel written for the purpose (`fuzz/common/machine/`,
+which `fs-fuzz` shares, and the NIC in `src/machine/`): its C++
 half as the `ffi` crate declares it, the locks, tasks, events, soft IRQs,
 timers, the clock, the entropy pool, the log, the command table. The tasks
 are threads, one of them running at a time as on a CPU of its own, handed
@@ -603,6 +605,168 @@ What it found on its first day, each fixed:
   `match`'s scrutinee lives to the end of the match -- and every line any
   CPU traced waited behind it; and a batch whose records the ring evicted
   while it was on its way was sent again.
+
+### `fs-fuzz.py` -- everything a disk hands the kernel, fuzzed
+
+What is on a disk is whoever wrote it's to choose -- a disk that came with
+the machine, an image somebody made, a filesystem another kernel left half
+written -- and a device says itself how many sectors it has and how big
+one is. So a panic, an overflow, a lock broken, a loop that never ends or a
+write where nothing may write, anywhere on the paths that read a disk, is
+one somebody else can cause. `fuzz/fs` is a host program built from the
+kernel's own crates -- `block` and `fs`, over `kcore` and `ffi` as they are
+-- on the machine `net-fuzz` runs on (`fuzz/common/`: the C++ half, the
+tasks one at a time, the lock rules, a process for each input), and disks
+whose media are the fuzzer's (`src/machine/disk.rs`): of any geometry a
+device may claim -- 520-byte sectors, 2^64 of them -- each with a volatile
+write cache that a plain write goes into and a flush or a forced write
+through, a power switch that pictures, at chosen requests, what the medium
+would hold -- the cache's writes each put down or not -- and requests that
+fail. Every request is checked where it arrives, as the block layer's
+contract with a driver says: whole sectors, inside the device, never from
+where the caller may not sleep, and no write to a disk nothing should be
+writing -- a filesystem mounted read-only or not mounted, a partition table
+being read.
+
+The images are the fuzzer's own (`src/image/`), made from the formats and
+not from the drivers: an ext2 as mke2fs lays one out -- every block size,
+one group or many, sparse superblocks or not, 128- and 256-byte inodes --
+with a tree put on it, files with holes and without, directories with
+deleted entries between their live ones; a nanofs as `format` and the
+driver leave one; MBRs and GPTs; the disk log's header. And judged the same
+way: `ext2::check` reads an image as e2fsck -fn does -- every inode with
+links in use, every block claimed once, directories parsed, link counts,
+bitmaps and every count -- and sorts what it finds into *corrupt* (what no
+crash of a correct driver may leave: a block in use and free, a block two
+inodes hold, a name leading to an inode not in use) and *unclean* (what
+e2fsck still fixes: a leak, a count, a link count, the state bit). The two
+were checked against e2fsprogs over hundreds of images (`FS_FUZZ_DUMP=<dir>`
+writes each image judged): what `check` calls clean, e2fsck passes; what
+e2fsck faults, `check` calls unclean or corrupt. The targets:
+
+- `part`: MBRs and GPTs of every shape -- protective and not, CRCs right
+  and wrong, entry sizes and counts past sense, slots overlapping, LBAs at
+  the top of the numbers -- on disks of every geometry; the partitions the
+  probe registers held to a reader of the table written from `block`'s
+  documentation (which slots, where, under what name), and the probe's
+  writes to none; I/O and batches through every device held to its bounds
+  and rebased onto the right sectors of its disk; claims taken and given
+  back, held to what they are for: never two writers on a sector;
+- `disklog`: prepared areas on disks and partitions, headers damaged, the
+  device held by something else, sector sizes of every kind, lines logged
+  before the area is known and after, from tasks and interrupt handlers;
+  the area the documentation says is taken, its header right, its text every
+  line in the order it came as far as the area holds it, nothing written
+  anywhere else;
+- `ext2` and `nanofs`: sound images mounted, read-only and not, and worked
+  through the VFS -- opens with every flag, reads, writes and seeks at every
+  edge of a block and of the indirect blocks, truncates both ways, creates,
+  renames, removes, chains of directories forty deep -- each call's answer
+  held to a model of the tree and the files open on it (`targets/fsops.rs`,
+  the VFS's rules and the filesystem's limits written down), the tree read
+  back through the VFS held to the model's, the image a clean unmount
+  leaves clean and holding the model's tree, and mounted again, the same. A
+  call the filesystem refused for want of room is held to having changed
+  nothing -- a write to having left the file its size, a first part of the
+  new data in it at most. Every power cut is at worst unclean -- which is
+  what ext2's commit order and nanofs's copy-on-write promise -- and so is
+  a run in which requests failed;
+- `ext2bad` and `nanofsbad`: sound images with a few fields made what they
+  must not be -- the superblock's geometry, a group's descriptor, an inode's
+  mode, size, links and block pointers (outside, into the metadata, into
+  another file, at itself), a directory's entries, an indirect block, a
+  bitmap; nanofs's with their checksums put right, as a lie told well is --
+  mounted if the driver takes them and worked through the VFS, held to what
+  holds for any image: a directory that lists the same twice running, a name
+  it lists that can be looked up, a file that reads no more than its size, a
+  walk of it all that changes nothing leaving the kernel's heap as it found
+  it, nothing read or written once it is unmounted;
+- `vfs`: a ramfs at the root held to the model, and procfs, ext2, nanofs
+  and ramfs mounted beside it and taken down again at paths nested,
+  doubled, without a slash and too long; tasks of their own at work on those
+  meanwhile; the C ABI (`kernel_vfs_*`) handed words that are open files,
+  were, and never were; and the file ABI (`kernel_file_*`) a module keeps its
+  configuration through, each call held to what its composition of VFS
+  calls does to the model. A mount taken exactly when its path is free and
+  well formed, its device nobody else's and there is room; an unmount
+  refused while anything is open on it; a rename between mounts refused;
+  and the disks' filesystems clean after `unmount_all`;
+- `shell`: the storage commands the console, the UDP shell and SSH run --
+  `mount`, `format`, `cp -r`, `fstest`, `diskwrite` and the rest -- with
+  arguments of every kind, after `fstest` has passed on ramfs, ext2 and
+  nanofs as each came; every disk no command wrote to raw clean at the end;
+- `rootfs`: `root=` none, `auto`, a device, a label, a UUID, over disks and
+  partitions carrying an ext2 labelled `nos` or not, a nanofs, something that
+  only looks like ext2, or nothing; what is mounted where held to what
+  `rootfs.rs` documents, and what it mounted for writing clean after the
+  shutdown's unmount.
+
+Each finding comes with the seed and iteration that make it again and the
+input in `out/fs-fuzz/findings/` -- `--replay TARGET FILE`, with `--trace` for
+every request each disk takes and every call the target makes.
+`FS_FUZZ_STATS=1` adds how often each target reached each state it counts.
+With no arguments every target runs its own number of inputs from seed 1,
+the same every time: the gate, about two minutes, which CI runs on its x86-64
+leg. A campaign is `--seed N --seconds S`.
+
+What it found on its first day, each fixed:
+
+- the device table bounded a partition's requests and not a whole disk's:
+  a filesystem's block number past the end of its disk went to the driver,
+  every driver trusted to refuse it; now nothing outside a device reaches
+  its driver, the asynchronous path included;
+- the GPT reader added to an LBA and a count that come off the disk
+  without a check -- a table on a disk that claims 2^64 sectors overflowed
+  them, a panic in a `RUSTUB=1` kernel -- and the claims kept a disk and its
+  partitions apart but not two partitions a table has overlap: two writers
+  on the same sectors;
+- the disk log, on a device whose sectors do not divide a page -- 520 bytes,
+  as some disks have -- ran a full batch past its buffer: a panic at boot
+  with `disklog=on`; and a header's boot count at its top overflowed;
+- ext2 took the superblock's geometry on trust: a block count past the
+  device, an inode count that is not its groups', a group's inode table
+  running out of the filesystem -- a crafted image overflowed the group
+  count, a panic, and could point the driver outside its device;
+- ext2's `create_dir` wrote the new directory's inode before the bitmap that
+  marks its block, and `create_file` before its inode's bit: a power cut
+  between leaves an inode in use on bits the bitmap has free, for the next
+  create to take. And a create undone after an error freed the bits under an
+  inode already on disk in use -- a block two files come to share. The bits
+  now go down first, and an undo writes the inode deleted before it frees
+  anything, and leaves a leak when it cannot;
+- an ext2 write that ran out of room part way left the blocks it had taken
+  past the end of the file, which e2fsck calls a bad size; one past what the
+  blocks map went in part way, and a truncate past it made a file that
+  could not be read to its end. A write past the end is refused whole now,
+  and one that fails gives back what it took and leaves the file its size;
+- ext2's remove was a recursion capped at 32 levels and nanofs's one without
+  a cap, and nanofs's mount read the tree by a recursion that stopped at 32:
+  ext2 made a tree it could not remove, and nanofs one whose deep part was
+  gone at the next mount. All three are walks now, with no limit but the
+  tree's;
+- an ext2 directory whose load failed part way -- a block past what the
+  driver maps -- kept what it had read so far and read it again at every
+  look: every `ls` of it grew the tree, for good. A load is all or nothing
+  now; `ext2bad` and `nanofsbad` walk every image three times and hold the
+  kernel's heap to what it was after the second;
+- names with a NUL in them went onto disk, which e2fsck calls illegal and
+  nanofs cuts at the NUL; the VFS refuses them;
+- a nanofs mounted read-only wrote its superblock at the unmount, and at the
+  mount when it repaired a bitmap;
+- `format nanofs` on a device too small for nanofs wrote its first two
+  blocks over whatever was there before it failed; format and mount now
+  refuse such a device first;
+- nanofs checked a file's whole checksum on every read, so reading a file a
+  piece at a time cost the square of its length -- a megabyte through `cat`,
+  256 reads of all 256 blocks; now once after a mount or a write;
+- `fstest / 1` underflowed the big file's patch offset -- a panic from any
+  shell.
+
+What it leaves, known: after a device error in the middle of a create or a
+rename, the directory in memory may disagree with the one on disk until the
+next mount, and a later create of the same name can leave that name in the
+directory twice. Nothing is lost or shared -- the first is the one looked
+up, and e2fsck renames the other -- so the checks count it unclean.
 
 ### `hv-test.py` -- the extension turned on and off again, and guests under it
 

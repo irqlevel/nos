@@ -1,0 +1,30 @@
+# The storage layers fuzzed on the host: the kernel's own Rust crates --
+# `block` (the device table, the partition tables, the claims, the disk log)
+# and `fs` (the VFS, ext2, nanofs, ramfs, procfs, the file ABI, the shell's
+# commands), over `kcore` and `ffi` as they are -- linked into a host
+# program that is the rest of the kernel: the C++ half the `ffi` crate
+# declares (fuzz/common) and disks whose media are the fuzzer's. What is on
+# a disk is whoever wrote it's to choose, so every byte the layers read off
+# one is an input. scripts/fs-fuzz.py builds and runs it.
+[package]
+name = "fs-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The kernel's crates, built for the host as they are for the kernel.
+ffi = { path = "../../src/rust/ffi" }
+kcore = { path = "../../src/rust/kcore" }
+block = { path = "../../src/rust/block" }
+fs = { path = "../../src/rust/fs" }
+
+# What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
+# a wrap, and core's checks of its own unsafe preconditions are made.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+# Line tables, for a replay's backtrace.
+debug = "line-tables-only"
+
+[workspace]

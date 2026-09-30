@@ -478,7 +478,7 @@ fn parse_size(text: &str) -> Option<usize> {
     };
     let size: usize = digits.parse().ok()?;
     let size = size.checked_mul(mult)?;
-    if size > MAX_BIG_SIZE { None } else { Some(size) }
+    if !(crate::selftest::MIN_BIG_SIZE..=MAX_BIG_SIZE).contains(&size) { None } else { Some(size) }
 }
 
 pub fn fstest(args: &str, out: &mut Output) {

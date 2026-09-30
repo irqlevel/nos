@@ -110,9 +110,6 @@ const FREE_BATCH: usize = 512;
 /// not be there to be had; the largest that is, down to a page, will do.
 const BATCH_PAGES: usize = 64;
 
-/// Recursion cap for a recursive remove
-const MAX_DIR_DEPTH: u32 = 32;
-
 /* ---- on-disk structures ---- */
 
 #[repr(C)]
@@ -712,13 +709,33 @@ impl Ext2 {
                 self.sb.first_data_block, self.sb.block_count);
             return false;
         }
+
+        /* The filesystem fits its device, as Linux refuses one that does
+         * not: every block the superblock's numbers lead to is then one
+         * the device has. */
+        let device_blocks = self.io.dev.sectors() / (block_size / self.io.sector_size) as u64;
+        if self.sb.block_count as u64 > device_blocks {
+            trace!(0, "ext2: {} blocks do not fit the device's {}", self.sb.block_count, device_blocks);
+            return false;
+        }
         self.io.first_data_block = self.sb.first_data_block;
         self.io.block_count = self.sb.block_count;
 
-        self.group_count = (self.sb.block_count - self.sb.first_data_block
-            + self.sb.blocks_per_group - 1) / self.sb.blocks_per_group;
+        self.group_count = (self.sb.block_count - self.sb.first_data_block)
+            .div_ceil(self.sb.blocks_per_group);
         if self.group_count == 0 {
             trace!(0, "ext2: zero groups");
+            return false;
+        }
+
+        /* Every group holds the same number of inodes, and every inode is
+         * in a group: what e2fsck and Linux hold an image to, and what makes
+         * an inode's number, its group and its place in the table sums that
+         * cannot overflow. */
+        if self.group_count as u64 * self.sb.inodes_per_group as u64 != self.sb.inode_count as u64 {
+            trace!(0, "ext2: {} inodes, where {} groups of {} make {}", self.sb.inode_count,
+                self.group_count, self.sb.inodes_per_group,
+                self.group_count as u64 * self.sb.inodes_per_group as u64);
             return false;
         }
 
@@ -746,10 +763,15 @@ impl Ext2 {
                 .copy_from_slice(&self.tmp.as_slice()[..block_size]);
         }
 
+        /* A group's inode table, the whole of it, inside the filesystem. */
+        let table_blocks = (self.sb.inodes_per_group as u64 * self.inode_size as u64)
+            .div_ceil(block_size as u64);
         for g in 0..self.group_count {
+            let table = self.gd_inode_table(g);
             if !self.io.is_data_block(self.gd_block_bitmap(g))
                 || !self.io.is_data_block(self.gd_inode_bitmap(g))
-                || !self.io.is_data_block(self.gd_inode_table(g))
+                || !self.io.is_data_block(table)
+                || table as u64 + table_blocks > self.sb.block_count as u64
             {
                 trace!(0, "ext2: group {} descriptor points outside the filesystem", g);
                 return self.mount_failed();
@@ -1275,6 +1297,15 @@ impl Ext2 {
         (self.block_size() / BLOCKS_UNIT as usize) as u32
     }
 
+    /// The biggest a file can be: what the direct, single- and
+    /// double-indirect blocks map -- this driver does not do the triple
+    /// indirect block -- and what a 32-bit size holds.
+    fn max_size(&self) -> u64 {
+        let bs = self.block_size() as u64;
+        let ppb = self.ptrs_per_block as u64;
+        ((DIRECT_BLOCKS as u64 + ppb + ppb * ppb) * bs).min(u32::MAX as u64)
+    }
+
     /// A fresh block, zeroed in the `ind` buffer and on disk, for an indirect
     /// level that was missing. The buffer's last block goes down first if it
     /// has pointers waiting.
@@ -1734,7 +1765,7 @@ impl Ext2 {
     /// bitmap, so a crash leaks at most one batch to e2fsck and never leaves
     /// a block both in use and free.
     fn truncate_inode(&mut self, ino: u32, inode: &mut Inode, new_size: usize) -> bool {
-        if new_size > u32::MAX as usize {
+        if new_size as u64 > self.max_size() {
             trace!(0, "ext2: size {} is too large", new_size);
             return false;
         }
@@ -1838,15 +1869,39 @@ impl Ext2 {
     /// Read a directory's entries into its vnode the first time it is needed.
     /// Only what a path walk touches is ever loaded, so a big tree costs
     /// memory in proportion to what is used, not to what is on disk.
+    ///
+    /// All of it or none: a directory that fails part way -- a block that
+    /// will not read, one past what the driver maps -- is left with no
+    /// children and not loaded, as it was. What it had adopted before the
+    /// failure would otherwise be adopted again by every look at it, the
+    /// tree growing with each.
     pub fn load_dir(&mut self, dir: NodeId) -> bool {
-        let dir_ino = match self.tree.get(dir) {
+        match self.tree.get(dir) {
             Some(node) if node.is_dir() => {
                 if node.dir_loaded {
                     return true;
                 }
-                node.ino as u32
             }
             _ => return false,
+        }
+        if self.read_dir_entries(dir) {
+            return true;
+        }
+        /* An unloaded directory has no children of its own: none can be
+         * made in it, and nothing under it opened, before it loads. */
+        while let Some(child) = self.tree.first_child(dir) {
+            self.tree.free_tree(child);
+        }
+        false
+    }
+
+    /// The directory's entries, adopted as its children, and the directory
+    /// marked loaded: false, with what was adopted so far left for the
+    /// caller, at the first failure.
+    fn read_dir_entries(&mut self, dir: NodeId) -> bool {
+        let dir_ino = match self.tree.get(dir) {
+            Some(node) => node.ino as u32,
+            None => return false,
         };
 
         let inode = match self.read_inode(dir_ino) {
@@ -2236,9 +2291,12 @@ impl Ext2 {
             return true;
         }
 
+        /* Refused whole, before anything is allocated: a write that ran into
+         * the end part way would leave the blocks it had allocated past the
+         * size, which it never got to move. */
         let end = offset as u64 + data.len() as u64;
-        if end > u32::MAX as u64 {
-            trace!(0, "ext2: a write of {} bytes at {} is past what ext2 holds",
+        if end > self.max_size() {
+            trace!(0, "ext2: a write of {} bytes at {} is past what ext2 holds here",
                 data.len(), offset);
             return false;
         }
@@ -2282,6 +2340,19 @@ impl Ext2 {
         if !committed {
             trace!(0, "ext2: commit of inode {} failed", ino);
             return false;
+        }
+
+        /* A write that failed part way -- the disk full, a block that would
+         * not read -- may have allocated blocks past the file's end, which
+         * it never got to move. They go again, and the file keeps the size
+         * it had: nothing is left past it for e2fsck to find. */
+        if !ok && self.allocations != allocations && end > before.size as u64 {
+            inode.size = end as u32;
+            if !self.truncate_inode(ino, &mut inode, before.size as usize)
+                || !self.flush_bitmap() || !self.commit_meta()
+            {
+                trace!(0, "ext2: the blocks a failed write took past the end of inode {} were not given back", ino);
+            }
         }
 
         self.tree[file].size = inode.size as usize;
@@ -2365,19 +2436,20 @@ impl Ext2 {
         let group = self.inode_group(dir_ino);
         let ino = self.alloc_inode(group, false)?;
 
-        /* The inode and its allocation bit are on disk before anything names
-         * it: a crash in between leaves an unreferenced inode for e2fsck, not
-         * a name leading nowhere */
+        /* Its allocation bit, then the inode, both on disk before anything
+         * names it: a crash in between leaves an unreferenced inode for
+         * e2fsck, not a name leading nowhere -- nor an inode in use that the
+         * bitmap has free, for the next create to take. */
         let inode = Ext2::new_inode(MODE_FILE_DEFAULT);
-        if !self.write_inode(ino, &inode) || !self.flush_bitmap() || !self.commit_meta() {
+        if !self.flush_bitmap() || !self.write_inode(ino, &inode) || !self.commit_meta() {
             trace!(0, "ext2: commit of inode {} failed", ino);
-            self.give_back_inode(ino, false);
+            self.give_back(ino, None, false);
             return None;
         }
 
         if !self.add_dir_entry(dir_ino, &mut dir_inode, ino, name, DIR_TYPE_FILE) {
             trace!(0, "ext2: the directory entry could not be added");
-            self.give_back_inode(ino, false);
+            self.give_back(ino, None, false);
             return None;
         }
 
@@ -2391,16 +2463,22 @@ impl Ext2 {
         self.new_vnode(Some(dir), name, Kind::File, ino, 0)
     }
 
-    /// Undo an allocation a create could not finish, and put what that
-    /// changed on disk; there is nothing to do about a failure here.
-    fn give_back_inode(&mut self, ino: u32, is_dir: bool) {
-        self.free_inode(ino, is_dir);
-        self.flush_bitmap();
-        self.commit_meta();
-    }
-
-    fn give_back(&mut self, ino: u32, block: u32, is_dir: bool) {
-        self.free_block(block);
+    /// Undo an allocation a create could not finish -- the inode, and the
+    /// directory's block if it had one -- and put what that changed on
+    /// disk. The inode goes down deleted first: it may be on disk in use
+    /// already, and freed bits under an inode in use would be handed out
+    /// again while it still held them. Should that write fail, the bits stay
+    /// taken: a leak for e2fsck, not a block two files come to share.
+    fn give_back(&mut self, ino: u32, block: Option<u32>, is_dir: bool) {
+        let mut dead: Inode = pod::zeroed();
+        dead.delete_time = wall_clock_secs() as u32;
+        if !self.write_inode(ino, &dead) {
+            trace!(0, "ext2: inode {} could not be undone, and stays taken", ino);
+            return;
+        }
+        if let Some(block) = block {
+            self.free_block(block);
+        }
         self.free_inode(ino, is_dir);
         self.flush_bitmap();
         self.commit_meta();
@@ -2440,19 +2518,22 @@ impl Ext2 {
         inode.blocks = self.block_units();
         inode.block[0] = block;
 
+        /* The commit order: the block's content and its allocation bit,
+         * then the inode that holds it. The other way round, a crash
+         * between leaves a block in use that the bitmap has free. */
         if !self.io.write_block(block, self.data.as_slice(), true)
-            || !self.write_inode(ino, &inode)
             || !self.flush_bitmap()
+            || !self.write_inode(ino, &inode)
             || !self.commit_meta()
         {
             trace!(0, "ext2: commit of inode {} failed", ino);
-            self.give_back(ino, block, true);
+            self.give_back(ino, Some(block), true);
             return None;
         }
 
         if !self.add_dir_entry(dir_ino, &mut dir_inode, ino, name, DIR_TYPE_DIR) {
             trace!(0, "ext2: the directory entry could not be added");
-            self.give_back(ino, block, true);
+            self.give_back(ino, Some(block), true);
             return None;
         }
 
@@ -2578,28 +2659,47 @@ impl Ext2 {
         true
     }
 
-    /// Take `node` out of its parent, release its blocks and inode, and free
-    /// the vnode; a directory goes with everything under it. The name goes
-    /// first, so a crash leaves at worst an orphan for e2fsck.
-    fn remove_node(&mut self, node: NodeId, depth: u32) -> bool {
-        if depth >= MAX_DIR_DEPTH {
-            trace!(0, "ext2: the directory depth limit of {} was reached", MAX_DIR_DEPTH);
-            return false;
+    /// Take `top` away with everything under it, deepest first: each time
+    /// down to something with nothing under it, and that removed. A walk
+    /// and not a recursion, so that a tree as deep as the paths allow --
+    /// which is what a directory made here can be -- costs no stack.
+    fn remove_tree(&mut self, top: NodeId) -> bool {
+        loop {
+            let mut at = top;
+            loop {
+                match self.tree.get(at) {
+                    Some(found) if found.is_dir() => {}
+                    Some(_) => break,
+                    None => return false,
+                }
+                if !self.load_dir(at) {
+                    return false;
+                }
+                match self.tree.first_child(at) {
+                    Some(child) => at = child,
+                    None => break,
+                }
+            }
+            if !self.remove_node(at) {
+                return false;
+            }
+            if at == top {
+                return true;
+            }
         }
+    }
 
+    /// Take `node` -- a file, or a directory with nothing left in it --
+    /// out of its parent, release its blocks and inode, and free the vnode.
+    /// The name goes first, so a crash leaves at worst an orphan for
+    /// e2fsck.
+    fn remove_node(&mut self, node: NodeId) -> bool {
         let (ino, is_dir) = match self.tree.get(node) {
             Some(found) => (found.ino as u32, found.is_dir()),
             None => return false,
         };
-        if is_dir {
-            if !self.load_dir(node) {
-                return false;
-            }
-            while let Some(child) = self.tree.first_child(node) {
-                if !self.remove_node(child, depth + 1) {
-                    return false;
-                }
-            }
+        if self.tree.first_child(node).is_some() {
+            return false;
         }
 
         let parent_ino = match self.tree.parent(node) {
@@ -2661,7 +2761,7 @@ impl Ext2 {
             return false;
         }
 
-        let ok = self.remove_node(node, 0);
+        let ok = self.remove_tree(node);
         if !self.flush_bitmap() || !self.commit_meta() {
             return false;
         }

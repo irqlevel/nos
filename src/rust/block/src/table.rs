@@ -234,12 +234,15 @@ pub(crate) fn read(handle: usize, sector: u64, buf: &mut [u8]) -> bool {
         None => return false,
     };
 
+    /* Inside the device, whatever the device is: a driver is never asked
+     * for a sector it does not have, whoever worked the number out -- a
+     * filesystem from what its superblock claims, a shell command. */
+    if !dev.within(sector, count) {
+        return false;
+    }
     match dev.backend {
         Backend::Driver(driver) => driver.read(sector, buf),
-        Backend::Partition { start } if dev.within(sector, count) => {
-            read(dev.parent, start + sector, buf)
-        }
-        Backend::Partition { .. } => false,
+        Backend::Partition { start } => read(dev.parent, start + sector, buf),
     }
 }
 
@@ -254,12 +257,12 @@ pub(crate) fn write(handle: usize, sector: u64, data: &[u8], fua: bool) -> bool 
         None => return false,
     };
 
+    if !dev.within(sector, count) {
+        return false;
+    }
     match dev.backend {
         Backend::Driver(driver) => driver.write(sector, data, fua),
-        Backend::Partition { start } if dev.within(sector, count) => {
-            write(dev.parent, start + sector, data, fua)
-        }
-        Backend::Partition { .. } => false,
+        Backend::Partition { start } => write(dev.parent, start + sector, data, fua),
     }
 }
 
@@ -354,25 +357,25 @@ pub(crate) fn kick(handle: usize) {
 pub(crate) fn submit(handle: usize, io: &BlockIo, kick_now: bool) -> Result<(), SubmitError> {
     let dev = device(handle).ok_or(SubmitError::Invalid)?;
 
+    /* A flush is about the device, not about a range of it: passed on as it
+     * is. Anything else is inside the device, as a synchronous request is. */
+    if io.op != IO_FLUSH && !dev.within(io.sector, io.count as u64) {
+        /* Refused, but a kick is still a kick: what was queued before it
+         * without a doorbell is owed one. */
+        if kick_now {
+            kick(handle);
+        }
+        return Err(SubmitError::Invalid);
+    }
+
     let start = match dev.backend {
         Backend::Driver(driver) if driver.is_async() => return driver.submit(io, kick_now),
         Backend::Driver(_) => return Err(SubmitError::Unsupported),
         Backend::Partition { start } => start,
     };
 
-    /* A flush is about the device, not about a range of it: passed on as it
-     * is. */
     if io.op == IO_FLUSH {
         return submit(dev.parent, io, kick_now);
-    }
-
-    if !dev.within(io.sector, io.count as u64) {
-        /* Refused, but a kick is still a kick: what was queued before it
-         * without a doorbell is owed one. */
-        if kick_now {
-            kick(dev.parent);
-        }
-        return Err(SubmitError::Invalid);
     }
 
     /* Moved onto the disk in a copy: the caller's io is only read, so it can
@@ -545,26 +548,43 @@ pub fn claims_setup() -> bool {
     }
 }
 
-/// Whether writing to one device can touch the other: the same device, or a
-/// disk and a partition of it.
+/// The whole disk a device is on -- its handle -- and the stretch of it
+/// the device is: its first sector there, and how many. None for a handle
+/// that names no device.
+fn extent(handle: usize) -> Option<(usize, u64, u64)> {
+    let mut at = handle;
+    let mut dev = device(at)?;
+    let count = dev.capacity;
+    let mut first = 0u64;
+    /* Down to the disk. A disk was registered before any partition of it,
+     * so the walk ends; the bound is the table's size all the same. */
+    for _ in 0..MAX_DEVICES {
+        match dev.backend {
+            Backend::Driver(_) => return Some((at, first, count)),
+            Backend::Partition { start } => {
+                first = first.checked_add(start)?;
+                at = dev.parent;
+                dev = device(at)?;
+            }
+        }
+    }
+    None
+}
+
+/// Whether writing to one device can touch the other: whether the two are
+/// stretches of one disk that share a sector -- the same device, a disk and
+/// a partition of it, and two partitions a table has overlap, which it may:
+/// the table is whoever wrote the disk's to choose. A device whose extent
+/// cannot be worked out is taken to overlap everything.
 fn overlap(a: usize, b: usize) -> bool {
-    let mut walk = a;
-    while walk != 0 {
-        if walk == b {
-            return true;
+    match (extent(a), extent(b)) {
+        (Some((disk_a, first_a, count_a)), Some((disk_b, first_b, count_b))) => {
+            disk_a == disk_b
+                && first_a < first_b.saturating_add(count_b)
+                && first_b < first_a.saturating_add(count_a)
         }
-        walk = parent(walk);
+        _ => true,
     }
-
-    let mut walk = b;
-    while walk != 0 {
-        if walk == a {
-            return true;
-        }
-        walk = parent(walk);
-    }
-
-    false
 }
 
 /// Claim a device against mounts, the disk log and other writers, naming
