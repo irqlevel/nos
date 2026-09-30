@@ -465,6 +465,9 @@ extern "C" void MainArm64(void* dtb)
 
     Trace(0, "nos arm64: dtb 0x%p bootargs '%s' cpus %u", dtb,
         board.BootArgs, board.CpuCount);
+    if (board.Refused != 0)
+        Trace(0, "nos arm64: dtb: %u values refused -- out of reach, not an interrupt the kernel "
+            "takes, or unreadable -- the defaults in their place", board.Refused);
 
     auto& mmap = Mm::MemoryMap::GetInstance();
     for (ulong i = 0; i < board.MemRegionCount; i++)

@@ -82,6 +82,15 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/net-fuzz.py
 
+      # The device tree the arm64 boot is handed, the firmware's memory map,
+      # the GRUB environment block on /boot: what the kernel's C++ reads
+      # before anything checked it, and a read past an end or a wrap there
+      # is a boot that dies without a word. That C++ fuzzed on the host
+      # under the address and UB sanitizers, the same inputs every run.
+      - name: C++ fuzz (host)
+        if: matrix.arch == 'aarch64'
+        run: python3 scripts/cpp-fuzz.py
+
       # The smoke disks carry no partition table, so nothing else here would
       # notice the partition reader breaking.
       - name: Partition table test (${{ matrix.arch }}, TCG)

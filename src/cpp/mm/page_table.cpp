@@ -906,7 +906,9 @@ void PageTable::ZeroPage(Page* page)
 {
     Task* task = PreemptDisableTask();
     ulong va = TmpMapPage(page->GetPhyAddress());
-    BugOn(!va);
+    if (va == 0)
+        Panic("ZeroPage: no TmpMap slot for page 0x%p: the window's %u shared slots are all held",
+            page->GetPhyAddress(), (ulong)TmpMapSharedCount);
     Stdlib::MemSet((void*)va, 0, Const::PageSize);
     TmpUnmapPage(va);
     PreemptEnableTask(task);
@@ -1426,9 +1428,14 @@ void PageTable::UnmapRangeLocked(ulong virtAddr, size_t count, bool freePages)
 
         if (l1Page == nullptr)
         {
+            /* A missing level is a BugOn in the walk, so this is a window
+               with no slot for it: the pages from va on would stay mapped
+               with their references while the caller -- MapRangeLocked's
+               undo among them -- goes on as if they were not */
             l1Page = WalkToL1Locked(va, false);
             if (l1Page == nullptr)
-                return;
+                Panic("UnmapRangeLocked: no TmpMap slot to walk to 0x%p, %u pages left mapped",
+                    va, (ulong)(count - i));
         }
 
         Pte* l1Entry = &l1Page->Entry[l1Index];

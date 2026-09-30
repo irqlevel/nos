@@ -105,6 +105,7 @@ swallowing panic messages whole.
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
+| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko` -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -767,6 +768,147 @@ rename, the directory in memory may disagree with the one on disk until the
 next mount, and a later create of the same name can leave that name in the
 directory twice. Nothing is lost or shared -- the first is the one looked
 up, and e2fsck renames the other -- so the checks count it unclean.
+
+### `cpp-fuzz.py` -- what the C++ is handed, and the memory under everything, fuzzed
+
+The kernel's C++ reads things nobody checked before it: the device tree the
+arm64 boot is handed, the firmware's memory map, the GRUB environment block
+`grubenv` reads off `/boot`, a module's `.ko`. And under everything the
+kernel does is its C++ memory management, whose error paths -- a table that
+cannot be allocated half way down a walk, a heap with no page left -- no boot
+takes. A read past an end, an index out of range or a wrap in any of them is
+a boot that dies without a word, or a page handed out that something still
+uses; and in C++ the language does not stop it where it happens. So
+`fuzz/cpp` builds each of them for the host from the kernel's own sources,
+as they are, under the address and undefined-behaviour sanitizers, over
+stand-ins for the kernel around them (`fuzz/cpp/common/`: the tracer, the
+panic path -- a panic is a finding --, the locks, which hold the kernel's
+rules -- one taken twice, one let go of when not held, an allocation with one
+held are findings --, the heap with each block counted and able to fail) and
+a HAL of the host's own (`fuzz/cpp/host/`), which comes before `src/cpp` on
+the include path and takes the place of each arch's inline one: no
+privileged instruction, and the MMU's hooks -- a TLB flush, an entry made
+valid -- where a target that models the MMU sees what the kernel did to its
+tables. `fuzz/cpp/Makefile` lists what each target is built from, as the
+kernel's Makefile lists what it is.
+
+The targets, each holding what the code makes of its input to a model of
+what its header says it does:
+
+- `fdt`: device trees of QEMU virt's shape -- memory, chosen, PSCI, a GICv3
+  and its ITS, PCIe, the PL011 and PL031, virtio-mmio, the timer, the CPUs --
+  with cell counts, property lengths, strings, interrupts and windows of
+  every kind, and damaged: nesting that ends more nodes than it began,
+  lengths and name offsets that lie, a header that does, a blob cut short.
+  A sound one's board -- what `Board::Setup` took of each node, the
+  refusals counted, the fallbacks for the rest -- is held to a reader of the
+  tree written from `board.h`; any board to what the kernel acts on:
+  windows the linear map reaches, interrupts it can take, bus numbers that
+  are bus numbers;
+- `memmap`: firmware maps with regions that overlap, are empty, or run past
+  the physical address space, and the questions the page allocator asks of
+  them -- the free-page scan, `IsReserved`, `IsUsableRam`, the RAM totals --
+  answered naively, page by page, in 128-bit arithmetic that cannot wrap;
+- `grubenv`: blocks grub-editenv could have written, damaged, and bytes;
+  `Set`, `Unset`, `Get` and `ForEach` held to the model's variables, room
+  counted to the byte -- and on any block, a `Set` that says yes is what `Get`
+  gives back and one that says no changes nothing;
+- `module`: `.ko` files as the build makes them, for x86-64 and for arm64 --
+  segments, dynamic symbols and relocations, the function table, the kmod
+  header -- made to say what the loader must refuse, and damaged, handed to
+  the loader's own `Stage` (all of `Load` up to the module's init, which a
+  fuzzer does not run). A sound one's image is held to the segments and the
+  relocations, byte for byte; its pages' permissions, its imports, its
+  function table and the lookups a backtrace makes through it to the file.
+  Nothing is written past the image (ASan poisons a page either side),
+  nothing is asked to be writable and executable, and whatever the loader
+  refused, or failed to allocate, leaves every page, mapping and heap block
+  as it found them;
+- `pagetable`: the page tables and the physical page allocator past
+  `Setup`, whose state is set up as `Setup` leaves it (it runs on the
+  bootstrap linear map, which a host process has not got) over a physical
+  memory of the host's and an MMU emulated where the kernel reaches memory
+  through it, the TmpMap window: a slot is loaded with the page its entry
+  maps when the kernel flushes it or makes the entry valid, the page gets the
+  slot's contents back when it is unmapped, and an unmapped slot is poisoned
+  for ASan. Pages allocated one at a time and in runs, mapped in every form,
+  unmapped, protected, temp-mapped and written through, frames copied
+  through a CPU's slot, MMIO mapped -- on machines taken to their last pages
+  and in a window with two slots left -- are held to `page_table.h`'s
+  rules: every page's reference count, every translation, every page free,
+  held, a table or the machine's and never two, pages handed out zeroed, a
+  map that fails leaving nothing of its own, no TmpMap slot left behind;
+- `heap`: `Mm::Alloc` and `Mm::Free`, the pools, the page runs and the three
+  ways a driver maps pages, over a page table as `page_table.h` promises it
+  and a VA region of the host's -- mapped VA is memory, the rest poisoned --
+  with pages and maps failing on the input's word: every block the size
+  asked for, aligned, mapped and nobody else's, what was written into it
+  there when it is freed, nothing refused while there is memory and VA to
+  give, and every page back but the bitmaps' once everything is freed.
+
+The runner (`fuzz/cpp/common/runner.cpp`) is `fuzz/common`'s, but for one
+thing: inputs run in batches, one after another in a process forked for the
+batch, the target's `Reset` putting the kernel's statics back between them
+-- a fork of a process under ASan costs macOS fifteen milliseconds. A
+finding ends its batch and is run again alone in a fresh process, whose
+report is the one given; one that does not come back alone is `Reset`'s own
+bug and says so. Each finding comes with the seed and iteration that make it
+again and the input in `out/cpp-fuzz/findings/` -- `--replay TARGET FILE`,
+with `--trace` for the kernel's trace lines. `CPP_FUZZ_STATS=1` adds how
+often each target reached each state it counts. With no arguments every
+target runs its own number of inputs from seed 1: the gate, about a minute,
+which CI runs on its arm64 leg. It needs clang and make on the host, and
+nothing else; the programs of each host are built in a directory of their
+own (`out/cpp-fuzz/<system>-<machine>/`), since a Mac and a container share
+the tree.
+
+What it found on its first day, each fixed:
+
+- the device tree reader let an `END_NODE` with no node open take the depth
+  below the root, and the next node wrote its cell counts at index -1 of the
+  walker's stacks: a write into `.bss` outside them, from the first thing
+  the arm64 boot reads. And `Board::Setup` read every `reg` and `interrupts`
+  by the tree's own cell counts and not the property's length -- a count of
+  3 or 2^32, or a property shorter than it said, read past the blob -- and
+  took `bootargs` without its NUL. Properties are read through `Fdt::Prop`
+  now, every read bounded by its length, a third cell refused;
+- `Board` took whatever the tree said and the kernel then acted on it: an
+  interrupt number the arm64 interrupt table (256 INTIDs, an u8 at
+  registration) would cut to another, a device window past the linear map,
+  bus numbers truncated to u8. What the kernel cannot act on is refused now,
+  counted, and said at boot; and the UART's and the RTC's interrupts fall
+  back on their own, where one the tree placed with no interrupt was set up
+  on INTID 0, an SGI. The blob is held to the 2 MiB the boot protocol
+  allows;
+- the memory map kept a region running past 2^64 as it was, and every
+  question about it wrapped: a reserved region hidden from the free-page
+  scan, its pages handed out. A region is cut at 2^52, the physical address
+  space of both arches, when it is added, empty ones dropped -- one of those
+  counted as overlapping by `IsReserved` and not by the scan;
+- the GRUB environment block's `ForEach` read a line with no `=` into the
+  next line's name, where `Set` found that line by itself: `Set` said yes
+  and `Get` -- and GRUB -- read something else. `Set` and `Unset` also wrote
+  blocks `ForEach` then called malformed, and `Unset` one with no newline
+  before the padding. The two ways of reading the block share one parser
+  now, and `Set` and `Unset` refuse a block it rejects, as `grub_env.h`
+  said they did;
+- the heap's pools allocated a page with their spin lock held, interrupts
+  off: when mapping it failed, the page allocator shot down every CPU's TLB
+  and waited for them, and a CPU spinning on that pool's lock never answers.
+  The page is allocated with the lock let go of now, as `Pool::Free` already
+  gave one back.
+
+And two loud ends made plainer: with no TmpMap slot free, `ZeroPage` and an
+unmap's walk -- `MapRangeLocked`'s undo among them, which would otherwise
+leave pages mapped behind a map that said no -- panic saying so, where one
+was a bare `BugOn` and the other returned without a word. No walk needs more
+than two slots, which `pagetable` checks.
+
+What it does not reach yet: the x86 boot's own readers -- Multiboot2's tags
+(`arch/x86_64/grub.cpp`), the ACPI tables (`drivers/acpi.cpp`) -- and the
+command line (`kernel/parameters.cpp`); `PageTable::Setup` and the free list's
+build, which run on the bootstrap linear map; and anything that needs a
+second CPU. `mm/block_allocator.cpp` is not fuzzed: nothing uses it.
 
 ### `hv-test.py` -- the extension turned on and off again, and guests under it
 

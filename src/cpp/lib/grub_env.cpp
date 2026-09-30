@@ -104,6 +104,59 @@ bool GrubEnvBlock::FreeSpace(ulong& space)
     return true;
 }
 
+bool GrubEnvBlock::ParseLine(ulong pos, ulong limit, ulong& nameEnd, ulong& next)
+{
+    /* A backslash would make NextLine and FindLine step over what follows it,
+       and a NUL cut the name ForEach hands out short of the one FindLine
+       compares */
+    ulong p = pos;
+    while (p < limit && Buf[p] != '=')
+    {
+        char c = Buf[p];
+        if (c == '\n' || c == '\\' || c == '\0' || p - pos >= MaxNameLen)
+            return false;
+        p++;
+    }
+    if (p >= limit)
+        return false;
+    nameEnd = p;
+
+    p++;
+    while (p < limit && Buf[p] != '\n')
+        p += (Buf[p] == '\\') ? 2 : 1;
+    if (p >= limit)
+        return false;
+
+    next = p + 1;
+    return true;
+}
+
+bool GrubEnvBlock::WellFormed(ulong limit)
+{
+    ulong pos = SignatureLen;
+    while (pos < limit)
+    {
+        char c = Buf[pos];
+        ulong next;
+        if (c == '#' || c == '\n' || c == '\r')
+        {
+            /* A comment whose last newline is escaped runs on into whatever
+               comes after it */
+            next = NextLine(pos);
+            if (next > limit)
+                return false;
+        }
+        else
+        {
+            ulong nameEnd;
+            if (!ParseLine(pos, limit, nameEnd, next))
+                return false;
+        }
+        pos = next;
+    }
+    return true;
+}
+
 bool GrubEnvBlock::Set(const char* name, const char* value)
 {
     if (!IsValid() || !ValidName(name) || value == nullptr)
@@ -113,7 +166,7 @@ bool GrubEnvBlock::Set(const char* name, const char* value)
     ulong newLen = EscapedLen(value);
 
     ulong space;
-    if (!FreeSpace(space))
+    if (!FreeSpace(space) || !WellFormed(space))
         return false;
     ulong room = Size - space;
 
@@ -168,8 +221,12 @@ bool GrubEnvBlock::Unset(const char* name)
     if (!IsValid() || !ValidName(name))
         return false;
 
+    ulong space;
+    if (!FreeSpace(space) || !WellFormed(space))
+        return false;
+
     ulong nameLen = StrLen(name);
-    long line = FindLine(name, nameLen, Size);
+    long line = FindLine(name, nameLen, space);
     if (line < 0)
         return false;
 
@@ -192,46 +249,39 @@ bool GrubEnvBlock::ForEach(Visitor visitor, void* ctx)
     while (pos < Size)
     {
         char c = Buf[pos];
-        if (c != '#' && c != '\n' && c != '\r')
+        if (c == '#' || c == '\n' || c == '\r')
         {
-            ulong nameStart = pos;
-            while (pos < Size && Buf[pos] != '=')
-                pos++;
-            if (pos == Size)
-                return false;
-            ulong nameEnd = pos;
-
-            ulong valueStart = ++pos;
-            while (pos < Size && Buf[pos] != '\n')
-                pos += (Buf[pos] == '\\') ? 2 : 1;
-            if (pos >= Size)
-                return false;
-
-            char name[MaxNameLen + 1];
-            ulong nameLen = nameEnd - nameStart;
-            if (nameLen > MaxNameLen)
-                nameLen = MaxNameLen;
-            MemCpy(name, Buf + nameStart, nameLen);
-            name[nameLen] = '\0';
-
-            /* The scan above stopped on this line's newline and stepped
-               over escapes the same way, so the walk cannot run past it */
-            char value[MaxValueLen + 1];
-            ulong valueLen = 0;
-            for (ulong i = valueStart; Buf[i] != '\n'; i++)
-            {
-                if (Buf[i] == '\\')
-                    i++;
-                if (valueLen < MaxValueLen)
-                    value[valueLen++] = Buf[i];
-            }
-            value[valueLen] = '\0';
-
-            if (!visitor(name, value, ctx))
-                return true;
+            pos = NextLine(pos);
+            continue;
         }
 
-        pos = NextLine(pos);
+        ulong nameEnd, next;
+        if (!ParseLine(pos, Size, nameEnd, next))
+            return false;
+
+        /* ParseLine bounds the name by MaxNameLen */
+        char name[MaxNameLen + 1];
+        ulong nameLen = nameEnd - pos;
+        MemCpy(name, Buf + pos, nameLen);
+        name[nameLen] = '\0';
+
+        /* ParseLine stopped on this line's newline and stepped over escapes
+           the same way, so the walk cannot run past it */
+        char value[MaxValueLen + 1];
+        ulong valueLen = 0;
+        for (ulong i = nameEnd + 1; Buf[i] != '\n'; i++)
+        {
+            if (Buf[i] == '\\')
+                i++;
+            if (valueLen < MaxValueLen)
+                value[valueLen++] = Buf[i];
+        }
+        value[valueLen] = '\0';
+
+        if (!visitor(name, value, ctx))
+            return true;
+
+        pos = next;
     }
 
     return true;

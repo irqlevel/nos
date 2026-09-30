@@ -62,31 +62,64 @@ void Pool::Init(size_t blockSize, class PageAllocator* pgAlloc)
     PgAlloc = pgAlloc;
 }
 
+Pool::Page* Pool::NewPage()
+{
+    Page* page = static_cast<Page*>(PgAlloc->Alloc(1));
+    if (page == nullptr)
+        return nullptr;
+
+    page->Link.Init();
+    page->BlockCount = 0;
+    page->BlockList.Init();
+
+    Block* block = reinterpret_cast<Block*>(&page->Data[0]);
+    while (Stdlib::MemAdd(block, sizeof(*block) + BlockSize) <= Stdlib::MemAdd(page, Const::PageSize))
+    {
+        page->BlockList.InsertTail(&block->Link);
+        block = static_cast<Block*>(Stdlib::MemAdd(block, sizeof(*block) + BlockSize));
+        page->BlockCount++;
+    }
+    page->MaxBlockCount = page->BlockCount;
+    return page;
+}
+
+/* A page for the pool is allocated with the lock let go of, as Free gives
+   one back: the page allocator may shoot down every CPU's TLB and wait for
+   them all, and a CPU spinning on this lock with its interrupts off would
+   never answer. The new page is this call's alone until it is on the list;
+   if another CPU put one there meanwhile, it goes back. */
 void *Pool::Alloc(ulong tag)
 {
-    Stdlib::AutoLock lock(Lock);
-
-    if (FreePageList.IsEmpty())
     {
-        Page* page = static_cast<Page*>(PgAlloc->Alloc(1));
-        if (page == nullptr)
-        {
-            return nullptr;
-        }
-        page->BlockCount = 0;
-        page->BlockList.Init();
+        Stdlib::AutoLock lock(Lock);
 
-        Block* block = reinterpret_cast<Block*>(&page->Data[0]);
-        while (Stdlib::MemAdd(block, sizeof(*block) + BlockSize) <= Stdlib::MemAdd(page, Const::PageSize))
-        {
-            page->BlockList.InsertTail(&block->Link);
-            block = static_cast<Block*>(Stdlib::MemAdd(block, sizeof(*block) + BlockSize));
-            page->BlockCount++;
-        }
-        page->MaxBlockCount = page->BlockCount;
-        FreePageList.InsertHead(&page->Link);
+        if (!FreePageList.IsEmpty())
+            return TakeBlockLocked(tag);
     }
 
+    Page* page = NewPage();
+    if (page == nullptr)
+        return nullptr;
+
+    Page* spare = nullptr;
+    void* result;
+    {
+        Stdlib::AutoLock lock(Lock);
+
+        if (FreePageList.IsEmpty())
+            FreePageList.InsertHead(&page->Link);
+        else
+            spare = page;
+        result = TakeBlockLocked(tag);
+    }
+
+    if (spare != nullptr)
+        PgAlloc->Free(spare);
+    return result;
+}
+
+void* Pool::TakeBlockLocked(ulong tag)
+{
     Page* page = CONTAINING_RECORD(FreePageList.Flink, Page, Link);
     BugOn(page->BlockList.IsEmpty());
     Block* block = CONTAINING_RECORD(page->BlockList.RemoveHead(), Block, Link);

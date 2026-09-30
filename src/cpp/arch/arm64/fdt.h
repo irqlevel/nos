@@ -1,6 +1,7 @@
 #pragma once
 
 #include <include/types.h>
+#include <include/const.h>
 
 namespace Kernel
 {
@@ -9,7 +10,13 @@ namespace Kernel
    #address-cells/#size-cells tracking. Read-only, no allocation; parsed
    once at early boot by Board::Setup(). Not a general-purpose parser --
    just enough for QEMU virt (memory, chosen, psci, gic, pl011, pl031,
-   virtio_mmio, timer, cpus). */
+   virtio_mmio, timer, cpus).
+
+   The blob is whatever the firmware put there, so nothing it says is
+   trusted past what it can be checked against: the header's sizes against
+   the largest blob the boot protocol allows, every offset against the block
+   it points into, the nesting against the depth the walker keeps, and every
+   property read against the property's own length (Prop). */
 class Fdt final
 {
 public:
@@ -24,21 +31,55 @@ public:
         u32 SizeCells;          /* #size-cells inherited from parent */
     };
 
+    /* A property's value: its bytes, and how many there are. Every read is
+       bounded by the length, so a property shorter than its reader expects
+       is a refusal, never a read past its end. */
+    class Prop final
+    {
+    public:
+        Prop()
+            : Data(nullptr)
+            , Len(0)
+        {
+        }
+
+        Prop(const u8* data, u32 len)
+            : Data(data)
+            , Len(len)
+        {
+        }
+
+        bool Present() const { return Data != nullptr; }
+        u32 Length() const { return Len; }
+
+        /* The big-endian u32 cell at index; false past the value's end. */
+        bool Cell(ulong index, u32& value) const;
+
+        /* count cells from cell index on, read as one big-endian number:
+           no cells are 0, and more than two do not fit a u64 and are
+           refused, as is a run past the value's end. */
+        bool Cells(ulong index, u32 count, u64& value) const;
+
+        /* The value as a string: only if it is NUL-terminated within its
+           length, nullptr otherwise. */
+        const char* String() const;
+
+    private:
+        const u8* Data;
+        u32 Len;
+    };
+
     bool Setup(const void* dtb);
 
     bool IsValid() const { return Valid; }
 
     /* Iterate nodes in structure order. Pass zeroed Node to start; returns
-       false when the tree is exhausted. */
+       false when the tree is exhausted, or found corrupt. */
     bool NextNode(Node& node);
 
-    /* Property access on the node the cursor points at. */
-    const void* GetProp(const Node& node, const char* name, u32& lenOut);
-    const char* GetPropString(const Node& node, const char* name);
-
-    /* Read cell i (0-based) of a reg-like property as a cellCount-cell
-       big-endian integer. */
-    static u64 ReadCells(const void* prop, ulong index, u32 cellCount);
+    /* The property of the node the cursor points at; absent if the node has
+       none of that name. */
+    Prop GetProp(const Node& node, const char* name);
 
     /* True if the node's compatible list contains the given string. */
     bool IsCompatible(const Node& node, const char* compat);
@@ -46,6 +87,10 @@ public:
     ulong GetTotalSize() const { return TotalSize; }
 
     static u32 Be32(const void* p);
+
+    /* The largest blob the arm64 boot protocol allows (Linux's
+       Documentation/arch/arm64/booting.rst): nothing past it is the DTB's. */
+    static const ulong MaxSize = 2 * Const::MB;
 
 private:
     const u8* Base = nullptr;

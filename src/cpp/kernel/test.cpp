@@ -2296,6 +2296,20 @@ Stdlib::Error TestGrubEnv()
             return MakeError(Stdlib::Error::Unsuccessful);
     }
 
+    /* A line with no '=' would lend its text to the next line's name as
+       ForEach -- and GRUB -- read it, while Set would find "a" on a line of
+       its own: the block is malformed, and Set and Unset leave it as it was */
+    {
+        static const char lines[] = "b\na=1\n";
+        GrubEnvBlock::Format(block, sizeof(block));
+        Stdlib::MemCpy(block + GrubEnvBlock::SignatureLen, lines, sizeof(lines) - 1);
+        Stdlib::MemCpy(copy, block, sizeof(block));
+        count = 0;
+        if (env.ForEach(CountGrubEnvVar, &count) || env.Set("a", "2") || env.Unset("a") ||
+            Stdlib::MemCmp(copy, block, sizeof(block)) != 0)
+            return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
     /* Not a block at all */
     block[0] = 'x';
     if (env.IsValid() || env.Set("nos_next", "nos-next") || env.Get("a", value, sizeof(value)))

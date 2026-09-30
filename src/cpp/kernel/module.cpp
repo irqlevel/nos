@@ -963,6 +963,51 @@ Stdlib::Error Prepare(LoadCtx& ctx, LoadedModule& module, const ModuleInfo*& inf
     return Protect(ctx, out);
 }
 
+/* Everything of a load before the module's name is claimed and its init
+   runs: the file checked, the image mapped, filled, relocated and
+   protected, and its header found and checked. On success the module is the
+   caller's, to list or to release; on failure nothing is left of it. */
+Stdlib::Error Stage(const void* image, ulong size, LoadedModule*& module, const ModuleInfo*& info,
+    Stdlib::Printer& out)
+{
+    LoadCtx ctx(image, size);
+
+    module = nullptr;
+    info = nullptr;
+
+    Stdlib::Error err = CheckHeader(ctx, out);
+    if (err.Ok())
+        err = CheckSegments(ctx, out);
+    if (err.Ok())
+        err = FindSymbols(ctx, out);
+    if (err.Ok())
+        err = CheckImports(ctx, out);
+    if (!err.Ok())
+        return err;
+
+    FindFunctions(ctx);
+
+    module = Mm::TAlloc<LoadedModule, Tag>();
+    if (module == nullptr)
+    {
+        out.Printf("module: out of memory\n");
+        return MakeError(Stdlib::Error::NoMemory);
+    }
+    module->Imports = ctx.Imports;
+    module->PermanentBy = ctx.PermanentBy;
+
+    err = Prepare(ctx, *module, info, out);
+    if (!err.Ok())
+    {
+        ReleaseModule(module);
+        module = nullptr;
+        info = nullptr;
+        return err;
+    }
+
+    return MakeSuccess();
+}
+
 /* An insmod or rmmod handed to a task of its own, and what the task has to
    say about it. Two references: the task's, and the one of whoever started
    it, who may stop waiting before the task is done. */
@@ -1046,36 +1091,11 @@ void ModuleTable::Remove(LoadedModule* module)
 
 Stdlib::Error ModuleTable::Load(const void* image, ulong size, Stdlib::Printer& out)
 {
-    LoadCtx ctx(image, size);
-
-    Stdlib::Error err = CheckHeader(ctx, out);
-    if (err.Ok())
-        err = CheckSegments(ctx, out);
-    if (err.Ok())
-        err = FindSymbols(ctx, out);
-    if (err.Ok())
-        err = CheckImports(ctx, out);
+    LoadedModule* module;
+    const ModuleInfo* info;
+    Stdlib::Error err = Stage(image, size, module, info, out);
     if (!err.Ok())
         return err;
-
-    FindFunctions(ctx);
-
-    LoadedModule* module = Mm::TAlloc<LoadedModule, Tag>();
-    if (module == nullptr)
-    {
-        out.Printf("module: out of memory\n");
-        return MakeError(Stdlib::Error::NoMemory);
-    }
-    module->Imports = ctx.Imports;
-    module->PermanentBy = ctx.PermanentBy;
-
-    const ModuleInfo* info = nullptr;
-    err = Prepare(ctx, *module, info, out);
-    if (!err.Ok())
-    {
-        ReleaseModule(module);
-        return err;
-    }
 
     /* On the list while its init runs -- a backtrace from inside it can name
        it -- unless the name is taken, whatever that module is doing */

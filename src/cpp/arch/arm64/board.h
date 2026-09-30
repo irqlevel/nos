@@ -2,13 +2,22 @@
 
 #include <include/types.h>
 
+#include "fdt.h"
+
 namespace Kernel
 {
 
 /* Board description parsed once from the DTB at early boot (under the
    bootstrap linear map, before the page allocator exists). Hardcoded QEMU
    virt values remain as fallbacks behind "if (!found)" so bring-up does
-   not depend on parser completeness. */
+   not depend on parser completeness.
+
+   What the tree says is taken only as far as the kernel can act on it: a
+   device's registers where the linear map reaches them (LinearMapReach), an
+   interrupt the kernel can take (an INTID IsTakenIntId passes), bus numbers
+   that are bus numbers. What fails that is refused -- left as if the tree
+   had not said it, the fallback's to fill -- and counted in Refused, which
+   the boot traces once there is a console to say it on. */
 class Board final
 {
 public:
@@ -80,6 +89,18 @@ public:
     ulong CpuCount = 0;
     ulong CpuMpidr[MaxBoardCpus];
 
+    /* Values of the tree's refused (see the class's comment) */
+    ulong Refused = 0;
+
+    /* How far above physical 0 the kernel's linear map reaches: the most a
+       physical address can be for KernelSpaceBase + it to be an address. */
+    static const ulong LinearMapReach = 1UL << 47;
+
+    /* The INTIDs the kernel can take: the GIC's PPIs and the SPIs below the
+       256 its interrupt table holds (interrupt_arm64.cpp) and its
+       registration's u8 carries. */
+    static bool IsTakenIntId(u32 intId);
+
 private:
     Board() = default;
     ~Board() = default;
@@ -89,6 +110,14 @@ private:
     Board& operator=(Board&& other) = delete;
 
     void ApplyFallbacks();
+
+    /* [base, base + size) inside LinearMapReach; counts a refusal if not */
+    bool Reachable(u64 base, u64 size);
+
+    /* A reg-like property's <address size> pair from cell index on, in the
+       parent's cells, and Reachable; a pair it cannot read is a refusal too.
+       False, and nothing counted, if there is no such property. */
+    bool ReadWindow(const Fdt::Prop& reg, ulong index, u32 ac, u32 sc, u64& base, u64& size);
 };
 
 }
