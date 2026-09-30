@@ -90,7 +90,7 @@ void SetupMemoryTypes()
 
     WriteCombiningReady = true;
 
-    Trace(0, "PAT: 0x%p, entry %u = WC", (ulong)pat, (ulong)WcEntry);
+    Trace(0, "PAT: 0x%lX, entry %lu = WC", (ulong)pat, (ulong)WcEntry);
 }
 
 bool IsWriteCombiningAvailable()
@@ -264,7 +264,7 @@ void PrintCpuInfo(Stdlib::Printer& con)
     con.Printf("vendor %s\n", vendor);
     if (brand[0] != '\0')
         con.Printf("model  %s\n", brand);
-    con.Printf("family %u model %u stepping %u, max leaf 0x%p ext 0x%p\n",
+    con.Printf("family %lu model %lu stepping %lu, max leaf 0x%lX ext 0x%lX\n",
         family, model, stepping, (ulong)r0.Eax, (ulong)maxExtended);
 
     CpuidResult ext1 = (maxExtended >= ExtendedLeafBase + 1)
@@ -310,7 +310,7 @@ void PrintCpuInfo(Stdlib::Printer& con)
         bool perfMonV2 = (r22.Eax & 1u) != 0;
         bool extCore = (ext1.Ecx & (1u << 23)) != 0;
 
-        con.Printf("amd perfmon: %u core counters 48 bits, perfctr-core %s, "
+        con.Printf("amd perfmon: %lu core counters 48 bits, perfctr-core %s, "
             "perfmon v2 %s\n",
             perfMonV2 ? (ulong)(r22.Ebx & 0xF) : (extCore ? 6UL : 4UL),
             extCore ? "yes" : "NO", perfMonV2 ? "yes" : "no");
@@ -323,8 +323,8 @@ void PrintCpuInfo(Stdlib::Printer& con)
            than its tick. */
         CpuidResult r10 = (r0.Eax >= 0xA) ? Cpuid(0xA) : CpuidResult{0, 0, 0, 0};
         ulong perfVersion = r10.Eax & 0xFF;
-        con.Printf("arch perfmon: version %u, %u general counters %u bits, "
-            "%u fixed counters %u bits\n",
+        con.Printf("arch perfmon: version %lu, %u general counters %u bits, "
+            "%lu fixed counters %lu bits\n",
             perfVersion, (r10.Eax >> 8) & 0xFF, (r10.Eax >> 16) & 0xFF,
             (ulong)(r10.Edx & 0x1F), (ulong)((r10.Edx >> 5) & 0xFF));
     }
@@ -337,7 +337,7 @@ void PrintCpuInfo(Stdlib::Printer& con)
        itself. */
     ulong spurious = Kernel::Pmu::SpuriousNmiCount();
     if (spurious != 0)
-        con.Printf("  %u late performance-counter nmis absorbed\n", spurious);
+        con.Printf("  %lu late performance-counter nmis absorbed\n", spurious);
 }
 
 bool PmuAvailable()
@@ -362,14 +362,14 @@ const char* PmuName()
 
 void PrintCpuState(Stdlib::Printer& con)
 {
-    con.Printf("ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
+    con.Printf("ss 0x%lX cs 0x%lX ds 0x%lX gs 0x%lX fs 0x%lX es 0x%lX",
         (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
 
-    con.Printf("rflags 0x%p rsp 0x%p rip 0x%p\n",
+    con.Printf("rflags 0x%lX rsp 0x%lX rip 0x%lX\n",
         GetRflags(), GetRsp(), GetRip());
 
-    con.Printf("cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
+    con.Printf("cr0 0x%lX cr2 0x%lX cr3 0x%lX cr4 0x%lX",
         GetCr0(), GetCr2(), GetCr3(), GetCr4());
 }
 

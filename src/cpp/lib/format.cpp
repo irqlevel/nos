@@ -128,7 +128,68 @@ static int TruncateAt(char *s, size_t size, size_t pos)
     return (int)pos;
 }
 
-int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
+namespace
+{
+
+/* A length modifier, as C's printf reads one: the type an integer argument
+   was passed as. -Wformat holds every call to it (PRINTF_FORMAT), so an
+   argument is read as what it is -- never as a ulong where an int was
+   passed, which left half the value to whatever the register or the stack
+   slot held before. */
+enum LengthModifier
+{
+    LengthNone,     /* int */
+    LengthChar,     /* hh: a char, passed as int */
+    LengthShort,    /* h: a short, passed as int */
+    LengthLong,     /* l */
+    LengthLongLong, /* ll */
+    LengthSize,     /* z: a size_t */
+};
+
+/* The next argument of an unsigned conversion (u x X) */
+ulong ReadUnsigned(va_list* ap, LengthModifier length)
+{
+    switch (length)
+    {
+    /* A char or a short, of either signedness, arrives promoted to int */
+    case LengthChar:
+        return (unsigned char)va_arg(*ap, int);
+    case LengthShort:
+        return (unsigned short)va_arg(*ap, int);
+    case LengthLong:
+        return va_arg(*ap, unsigned long);
+    case LengthLongLong:
+        return va_arg(*ap, unsigned long long);
+    case LengthSize:
+        return va_arg(*ap, size_t);
+    case LengthNone:
+        break;
+    }
+    return va_arg(*ap, unsigned int);
+}
+
+/* The next argument of a signed conversion (d) */
+long ReadSigned(va_list* ap, LengthModifier length)
+{
+    switch (length)
+    {
+    case LengthChar:
+        return (signed char)va_arg(*ap, int);
+    case LengthShort:
+        return (short)va_arg(*ap, int);
+    case LengthLong:
+        return va_arg(*ap, long);
+    case LengthLongLong:
+        return va_arg(*ap, long long);
+    case LengthSize:
+        return va_arg(*ap, ssize_t);
+    case LengthNone:
+        break;
+    }
+    return va_arg(*ap, int);
+}
+
+int Format(char *s, size_t size, const char *fmt, va_list* ap)
 {
     size_t i;
     char t;
@@ -181,30 +242,33 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                     { TerminateOnError(s, size, (size_t)pos); return -1; }
             }
 
-            /* Skip optional 'l'/'ll' length modifiers: every integer
-               conversion consumes a full 64-bit vararg slot (callers cast
-               to ulong/long per project convention, and long == long long
-               on LP64), so the modifiers are consumed, never interpreted.
-               Without the second skip, %llu left 'l' as the conversion
-               character and the whole message was dropped as an error. */
-            if (tp == 'l') {
+            /* Parse an optional length modifier: hh, h, l, ll or z */
+            LengthModifier length = LengthNone;
+            if (tp == 'h' || tp == 'l' || tp == 'z') {
+                char first = tp;
                 i++;
                 tp = fmt[i];
-                if (tp == '\0')
-                    { TerminateOnError(s, size, (size_t)pos); return -1; }
-                if (tp == 'l') {
+                if (first == 'z')
+                    length = LengthSize;
+                else if (tp == first) {
+                    length = (first == 'h') ? LengthChar : LengthLongLong;
                     i++;
                     tp = fmt[i];
-                    if (tp == '\0')
-                        { TerminateOnError(s, size, (size_t)pos); return -1; }
-                }
+                } else
+                    length = (first == 'h') ? LengthShort : LengthLong;
+                if (tp == '\0')
+                    { TerminateOnError(s, size, (size_t)pos); return -1; }
             }
+
+            /* A length modifier is for an integer conversion only */
+            if (length != LengthNone && tp != 'u' && tp != 'd' && tp != 'x' && tp != 'X')
+                { TerminateOnError(s, size, (size_t)pos); return -1; }
 
             i++; /* consume the specifier */
 
             switch (tp) {
             case 'u': {
-                ulong val = va_arg(arg, ulong);
+                ulong val = ReadUnsigned(ap, length);
                 char tmp[24];
                 rc = __UlongToString(val, 10, tmp, sizeof(tmp));
                 if (rc < 0)
@@ -228,7 +292,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 break;
             }
             case 'd': {
-                long val = va_arg(arg, long);
+                long val = ReadSigned(ap, length);
                 bool negative = (val < 0);
                 ulong uval = negative ? (ulong)(-(val + 1)) + 1 : (ulong)val;
                 char tmp[24];
@@ -275,7 +339,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
             }
             case 'x':
             case 'X': {
-                ulong val = va_arg(arg, ulong);
+                ulong val = ReadUnsigned(ap, length);
                 char tmp[24];
                 rc = __UlongToString(val, 16, tmp, sizeof(tmp), tp == 'x');
                 if (rc < 0)
@@ -301,7 +365,7 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
             case 'p': {
                 if (sizeof(void *) != sizeof(ulong))
                     { TerminateOnError(s, size, (size_t)pos); return -1; }
-                void *val = va_arg(arg, void *);
+                void *val = va_arg(*ap, void *);
                 ulong uval = (ulong)val;
                 char tmp[24];
                 rc = __UlongToString(uval, 16, tmp, sizeof(tmp));
@@ -326,13 +390,13 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
                 break;
             }
             case 'c': {
-                int val = va_arg(arg, int);
+                int val = va_arg(*ap, int);
                 if (!PutChar(val & 0xFF, s, size, pos++))
                     return TruncateAt(s, size, (size_t)pos);
                 break;
             }
             case 's': {
-                const char *val = va_arg(arg, char *);
+                const char *val = va_arg(*ap, char *);
                 if (val == nullptr)
                     val = "(null)";
                 size_t val_len = StrLen(val);
@@ -373,6 +437,21 @@ int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
         return TruncateAt(s, size, (size_t)pos);
 
     return pos;
+}
+
+}
+
+int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg)
+{
+    /* The readers above take the list by pointer, and only a va_list
+       object's address is the same thing on both arches: a va_list
+       parameter is an array decayed to a pointer on x86-64, a struct on
+       arm64. */
+    va_list ap;
+    va_copy(ap, arg);
+    int len = Format(s, size, fmt, &ap);
+    va_end(ap);
+    return len;
 }
 
 int SnPrintf(char* buf, size_t size, const char* fmt, ...)

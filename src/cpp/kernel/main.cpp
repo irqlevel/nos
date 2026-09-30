@@ -71,13 +71,13 @@ do {                                                    \
 
 void TraceCpuState(ulong cpu)
 {
-    Trace(0, "Cpu %u cr0 0x%p cr2 0x%p cr3 0x%p cr4 0x%p",
+    Trace(0, "Cpu %lu cr0 0x%lX cr2 0x%lX cr3 0x%lX cr4 0x%lX",
         cpu, GetCr0(), GetCr2(), GetCr3(), GetCr4());
 
-    Trace(0, "Cpu %u rflags 0x%p rsp 0x%p rip 0x%p",
+    Trace(0, "Cpu %lu rflags 0x%lX rsp 0x%lX rip 0x%lX",
         cpu, GetRflags(), GetRsp(), GetRip());
 
-    Trace(0, "Cpu %u ss 0x%p cs 0x%p ds 0x%p gs 0x%p fs 0x%p es 0x%p",
+    Trace(0, "Cpu %lu ss 0x%lX cs 0x%lX ds 0x%lX gs 0x%lX fs 0x%lX es 0x%lX",
         cpu, (ulong)GetSs(), (ulong)GetCs(), (ulong)GetDs(),
         (ulong)GetGs(), (ulong)GetFs(), (ulong)GetEs());
 }
@@ -189,7 +189,7 @@ static void HaltTcoWatchdog()
     Outw(tcoBase + Tco1Sts, 1 << 3);
     Outw(tcoBase + Tco2Sts, 1 << 1);
 
-    Trace(0, "TCO watchdog halted (tcoBase 0x%p via %s%s)", (ulong)tcoBase, source,
+    Trace(0, "TCO watchdog halted (tcoBase 0x%lX via %s%s)", (ulong)tcoBase, source,
         firmwareWatchdog ? ", ACPI WDAT owns it" : "");
 }
 
@@ -204,7 +204,7 @@ void ApStartup(void *ctx)
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
 
-    Trace(0, "Cpu %u running rflags 0x%p task 0x%p",
+    Trace(0, "Cpu %lu running rflags 0x%lX task 0x%p",
         cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
 
     TraceCpuState(cpu.GetIndex());
@@ -285,11 +285,11 @@ void ApMain2()
     /* GDT is loaded (above); give this CPU its TSS so #DF has an IST stack */
     Gdt::GetInstance().SetupTssSelf(cpu.GetIndex());
 
-    Trace(0, "Cpu %u rsp 0x%p (static stack)", cpu.GetIndex(), GetRsp());
+    Trace(0, "Cpu %lu rsp 0x%lX (static stack)", cpu.GetIndex(), GetRsp());
 
     if (!cpu.Run(ApStartup, nullptr))
     {
-        Trace(0, "Can't run cpu %u task", cpu.GetIndex());
+        Trace(0, "Can't run cpu %lu task", cpu.GetIndex());
         return;
     }
 }
@@ -459,7 +459,7 @@ void BpStartup(void* ctx)
         auto& cpu = cpus.GetCurrentCpu();
         auto& acpi = Acpi::GetInstance();
 
-        Trace(0, "Cpu %u running rflags 0x%p task 0x%p",
+        Trace(0, "Cpu %lu running rflags 0x%lX task 0x%p",
             cpu.GetIndex(), GetRflags(), Task::GetCurrentTask());
 
         TraceCpuState(cpu.GetIndex());
@@ -531,7 +531,7 @@ void BpStartup(void* ctx)
 
         Trace(0, "Idt saved");
 
-        Trace(0, "Interrupts enabled %u", (ulong)Hal::IsInterruptEnabled());
+        Trace(0, "Interrupts enabled %lu", (ulong)Hal::IsInterruptEnabled());
 
         BugOn(Hal::IsInterruptEnabled());
 
@@ -541,7 +541,7 @@ void BpStartup(void* ctx)
 
         kernel_blockdev_set_interrupts_started();
 
-        Trace(0, "Interrupts enabled %u", (ulong)Hal::IsInterruptEnabled());
+        Trace(0, "Interrupts enabled %lu", (ulong)Hal::IsInterruptEnabled());
 
         /*
          * TSC calibration uses PIT channel 2 with busy-polling (~150ms).
@@ -567,7 +567,7 @@ void BpStartup(void* ctx)
         {
             Lapic::StartTimer(CpuTable::TimerVector, LapicTimerCount);
             cpus.SetPerCpuTimer();
-            Trace(0, "Tick: per-cpu local apic timer at %u Hz", (ulong)Hpet::DesiredHz);
+            Trace(0, "Tick: per-cpu local apic timer at %lu Hz", (ulong)Hpet::DesiredHz);
         }
         else
         {
@@ -581,7 +581,7 @@ void BpStartup(void* ctx)
             if (!cpus.StartAll())
             {
                 /* Diagnostic: did the AP reach ApMain()? */
-                Trace(0, "AP diag: ApStartedFlag=%u",
+                Trace(0, "AP diag: ApStartedFlag=%lu",
                       (ulong)ApStartedFlag);
                 Panic("Can't start all cpus");
                 return;
@@ -736,7 +736,7 @@ static void WxProbeHeap()
 
     *reinterpret_cast<volatile u8*>(va) = RetOpcode;
     Hal::SyncInstructionCache((ulong)va, sizeof(RetOpcode));
-    Trace(0, "W^X probe: calling into a heap page 0x%p (expect page fault)", (ulong)va);
+    Trace(0, "W^X probe: calling into a heap page 0x%lX (expect page fault)", (ulong)va);
     reinterpret_cast<void (*)()>(va)();
     Trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
 }
@@ -748,10 +748,10 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     Panicker::GetInstance();
     Watchdog::GetInstance();
 
-    Trace(0, "Cpu rsp 0x%p rbp 0x%p", GetRsp(), GetRbp());
+    Trace(0, "Cpu rsp 0x%lX rbp 0x%lX", GetRsp(), GetRbp());
     for (ulong i = 0; i < MaxCpus; i++)
     {
-        Trace(0, "Static stack[%u] base 0x%p top 0x%p",
+        Trace(0, "Static stack[%lu] base 0x%lX top 0x%lX",
             i, (ulong)&Stack[i][0], (ulong)&Stack[i][CpuStackSize]);
     }
 
@@ -794,9 +794,9 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
-    Trace(0, "Paging root 0x%p old cr3 0x%p", bpt.GetRoot(), GetCr3());
+    Trace(0, "Paging root 0x%lX old cr3 0x%lX", bpt.GetRoot(), GetCr3());
     SetCr3(bpt.GetRoot());
-    Trace(0, "Set new cr3 0x%p", GetCr3());
+    Trace(0, "Set new cr3 0x%lX", GetCr3());
 
     Gdt::GetInstance().Save();
     ExceptionTable::GetInstance().RegisterExceptionHandlers();
@@ -827,7 +827,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
     rust_netconsole_setup();
 
     auto& mmap = Mm::MemoryMap::GetInstance();
-    Trace(0, "Enter kernel: start 0x%p end 0x%p",
+    Trace(0, "Enter kernel: start 0x%lX end 0x%lX",
         mmap.GetKernelStart(), mmap.GetKernelEnd());
 
     if (mmap.GetKernelEnd() <= bpt.PhysToVirt(MB))
@@ -848,9 +848,9 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         break;
     }
 
-    Trace(0, "Paging root 0x%p old cr3 0x%p", pt.GetRoot(), GetCr3());
+    Trace(0, "Paging root 0x%lX old cr3 0x%lX", pt.GetRoot(), GetCr3());
     SetCr3(pt.GetRoot());
-    Trace(0, "Set new cr3 0x%p", GetCr3());
+    Trace(0, "Set new cr3 0x%lX", GetCr3());
     if (!pt.SetupFreePagesList())
     {
         Panic("Can't setup paging");
@@ -874,11 +874,11 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
         pt.ProtectRange(t0, t1 - t0, false, true);   /* RX */
         pt.ProtectRange(t1, r1 - t1, false, false);  /* RO+NX */
         pt.ProtectRange(r1, e - r1, true, false);    /* RW+NX */
-        Trace(0, "W^X: text [0x%p,0x%p) rodata [0x%p,0x%p) data [0x%p,0x%p)",
+        Trace(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             t0, t1, t1, r1, r1, e);
         if (Parameters::GetInstance().IsWxProbeText())
         {
-            Trace(0, "W^X probe: writing to text 0x%p (expect page fault)", t0);
+            Trace(0, "W^X probe: writing to text 0x%lX (expect page fault)", t0);
             *reinterpret_cast<volatile u32*>(t0) = 0;
             Trace(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
         }
@@ -897,7 +897,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
             break;
         }
         auto va = pt.TmpMapPage(page->GetPhyAddress());
-        Trace(0, "va 0x%p pha 0x%p", va, page->GetPhyAddress());
+        Trace(0, "va 0x%lX pha 0x%lX", va, page->GetPhyAddress());
         Stdlib::MemSet((void *)va, 0, Const::PageSize);
         pt.TmpUnmapPage(va);
         pt.FreePage(page);
@@ -960,7 +960,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     Trace(0, "After test");
     Ubsan::Announce();
-    Screen::Printf("Self test complete, error %u\n", (ulong)err.GetCode());
+    Screen::Printf("Self test complete, error %lu\n", (ulong)err.GetCode());
 
     auto& pci = Pci::GetInstance();
     pci.Scan();
@@ -1002,7 +1002,7 @@ void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     if (!cpu.Run(BpStartup, nullptr))
     {
-        Panic("Can't run cpu %u task", cpu.GetIndex());
+        Panic("Can't run cpu %lu task", cpu.GetIndex());
         break;
     }
 
@@ -1034,7 +1034,7 @@ void ReportCpuStacks(Stdlib::Printer& printer, ulong& worstFree)
         if (free == CpuStackSize)
             continue;
 
-        printer.Printf("static %u %u %u cpu-boot\n", i,
+        printer.Printf("static %lu %lu %lu cpu-boot\n", i,
             (ulong)CpuStackSize - free, (ulong)CpuStackSize);
 
         if (free < worstFree)

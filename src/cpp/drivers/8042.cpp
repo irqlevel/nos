@@ -16,9 +16,9 @@ IO8042::IO8042()
     , Mod(0)
     , Extended(0)
 {
-    Trace(0, "IO8042 0x%p status 0x%p", this, (ulong)Inb(StatusPort));
+    Trace(0, "IO8042 0x%p status 0x%lX", this, (ulong)Inb(StatusPort));
 
-    Screen::Printf("IO8042 status 0x%p\n", (ulong)Inb(StatusPort));
+    Screen::Printf("IO8042 status 0x%lX\n", (ulong)Inb(StatusPort));
 
     ReadData();
 }
@@ -82,7 +82,7 @@ void IO8042::OnTick(TimerCallback& callback)
         static char shiftMap[0x80] = "__!@#$%^&*()_+_" "\tQWERTYUIOP{}\n" "_ASDFGHJKL:\"~" "_|ZXCVBNM<>?_" "*_ _";
         u8 code = Buf.Get();
 
-        Trace(KbdLL, "Kbd: code 0x%p", (ulong)code);
+        Trace(KbdLL, "Kbd: code 0x%lX", (ulong)code);
 
         if (code == 0xE0)
         {

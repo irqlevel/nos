@@ -101,7 +101,7 @@ bool Rtc::ReadTime(RtcTime& t)
     else
         t.Year = DefaultCentury + yr1;
 
-    Trace(0, "RTC: %u-%u-%u %u:%u:%u",
+    Trace(0, "RTC: %lu-%lu-%lu %lu:%lu:%lu",
         (ulong)t.Year, (ulong)t.Month, (ulong)t.Day,
         (ulong)t.Hour, (ulong)t.Minute, (ulong)t.Second);
 

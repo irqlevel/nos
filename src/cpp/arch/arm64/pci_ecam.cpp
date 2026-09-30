@@ -96,7 +96,7 @@ static u8 AssignBar(Pci& pci, Pci::DeviceInfo* d, u8 bar)
     ulong addr = (*next + (size - 1)) & ~(size - 1); /* natural alignment */
     if (addr + size > end)
     {
-        Trace(0, "PciAssign: window exhausted for %u:%u.%u bar%u size 0x%p",
+        Trace(0, "PciAssign: window exhausted for %lu:%lu.%lu bar%lu size 0x%lX",
             (ulong)d->Bus, (ulong)d->Slot, (ulong)d->Func, (ulong)bar, size);
         return is64 ? 2 : 1;
     }
@@ -107,7 +107,7 @@ static u8 AssignBar(Pci& pci, Pci::DeviceInfo* d, u8 bar)
     if (is64)
         pci.WriteDword(d->Bus, d->Slot, d->Func, (u16)(off + 4), (u32)(addr >> 32));
 
-    Trace(0, "PciAssign: %u:%u.%u bar%u -> 0x%p size 0x%p %s",
+    Trace(0, "PciAssign: %lu:%lu.%lu bar%lu -> 0x%lX size 0x%lX %s",
         (ulong)d->Bus, (ulong)d->Slot, (ulong)d->Func, (ulong)bar, addr, size,
         is64 ? "64" : "32");
 
@@ -151,7 +151,7 @@ void PciAssignResources(void* devices, ulong count, ulong stride)
             u8 intId = (u8)(32 + 3 + ((d->Slot + pin - 1) % 4));
             pci.WriteByte(d->Bus, d->Slot, d->Func, 0x3C, intId);
             d->InterruptLine = intId;
-            Trace(0, "PciIntx: %u:%u.%u pin %u -> intid %u",
+            Trace(0, "PciIntx: %lu:%lu.%lu pin %lu -> intid %lu",
                 (ulong)d->Bus, (ulong)d->Slot, (ulong)d->Func, (ulong)pin, (ulong)intId);
         }
 
@@ -190,7 +190,7 @@ bool PciEcamSetup()
 
     EcamVa = va;
     EcamBusesMapped = buses;
-    Trace(0, "PciEcamSetup: ecam 0x%p va 0x%p buses %u mmio32 0x%p+0x%p",
+    Trace(0, "PciEcamSetup: ecam 0x%lX va 0x%lX buses %lu mmio32 0x%lX+0x%lX",
         board.EcamBase, va, buses, board.PciMmio32Base, board.PciMmio32Size);
     return true;
 }

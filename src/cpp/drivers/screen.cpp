@@ -48,7 +48,7 @@ bool Setup()
     {
         /* Indexed-color (palette) modes are not supported: there is no
            text mode to fall back to either, so the screen stays dark. */
-        Trace(0, "Screen: unsupported framebuffer type %u, no video console",
+        Trace(0, "Screen: unsupported framebuffer type %lu, no video console",
             (ulong)fb->Type);
         return false;
     }

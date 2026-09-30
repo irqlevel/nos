@@ -39,9 +39,9 @@ TaskQueue::~TaskQueue()
 }
 
 /* No task is started here: the fuzzed code runs in the one there is. */
-Task::Task(const char* fmt, ...)
+Task::Task(const char* name)
 {
-    (void)fmt;
+    (void)name;
     Fuzz::HostHalUnreachable("Task::Task");
 }
 

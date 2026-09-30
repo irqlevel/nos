@@ -60,7 +60,7 @@ void* operator new(size_t size)
 {
     void* ptr = Kernel::Mm::Alloc(size, 0);
     if (ptr == nullptr)
-        Panic("operator new: out of memory (size %u)", (ulong)size);
+        Panic("operator new: out of memory (size %lu)", (ulong)size);
     return ptr;
 }
 
@@ -68,7 +68,7 @@ void* operator new[](size_t size)
 {
     void* ptr = Kernel::Mm::Alloc(size, 0);
     if (ptr == nullptr)
-        Panic("operator new[]: out of memory (size %u)", (ulong)size);
+        Panic("operator new[]: out of memory (size %lu)", (ulong)size);
     return ptr;
 }
 

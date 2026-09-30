@@ -151,13 +151,13 @@ void TimeInit()
     if (Rtc::GetInstance().ReadTime(rtc))
     {
         RtcEpochSecs = Rtc::ToUnixEpoch(rtc) - GetBootTime().GetSecs();
-        Trace(0, "Time: RTC epoch %u", RtcEpochSecs);
+        Trace(0, "Time: RTC epoch %lu", RtcEpochSecs);
     }
 
     /* Counts from the kernel's own start, not from this line: the
        restart-at-zero this replaces hid how long the self test and the
        device probe really take. */
-    Trace(0, "Time: boot time %u ns", GetBootTime().GetValue());
+    Trace(0, "Time: boot time %lu ns", GetBootTime().GetValue());
 }
 
 Stdlib::Time GetBootTime()

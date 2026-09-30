@@ -88,7 +88,7 @@ public:
     {
     }
 
-    virtual void Printf(const char *fmt, ...) override
+    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override
     {
         va_list args;
         va_start(args, fmt);
@@ -96,7 +96,7 @@ public:
         va_end(args);
     }
 
-    virtual void VPrintf(const char *fmt, va_list args) override
+    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override
     {
         char text[FormatMax];
         if (Stdlib::VsnPrintf(text, sizeof(text), fmt, args) < 0)
@@ -138,7 +138,7 @@ public:
 
         char note[128];
         Stdlib::BufferPrinter bp(note, sizeof(note));
-        bp.Printf("\n[%u bytes of output dropped: printed with a lock held, past the %u that can wait]\n",
+        bp.Printf("\n[%lu bytes of output dropped: printed with a lock held, past the %lu that can wait]\n",
             Dropped, Size);
         Fn(Ctx, reinterpret_cast<const unsigned char*>(note), Stdlib::StrLen(note));
         Dropped = 0;
@@ -213,14 +213,14 @@ void kernel_trace(unsigned int level, const unsigned char* msg, unsigned long le
     Stdlib::MemCpy(buf, msg, n);
     buf[n] = '\0';
     auto time = Kernel::GetBootTime();
-    Kernel::Tracer::GetInstance().Output("%u:%u.%06u:%s\n",
+    Kernel::Tracer::GetInstance().Output("%u:%lu.%06lu:%s\n",
         level, time.GetSecs(), time.GetUsecs(), buf);
 }
 
 void* kernel_alloc(unsigned long size, unsigned long align)
 {
     if (align == 0 || (align & (align - 1)) != 0)
-        Panic("kernel_alloc: bad align %u", align);
+        Panic("kernel_alloc: bad align %lu", align);
 
     /* Mm::Alloc guarantees 8-byte alignment */
     if (align <= 8)
@@ -407,8 +407,8 @@ static Kernel::Task* NewRustTask(const unsigned char* name, unsigned long nameLe
 
     Stdlib::MemCpy(buf, name, len);
     buf[len] = '\0';
-    /* Never the format itself: a '%' in the name is the caller's */
-    return Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>("%s", buf);
+    /* A name, not a format: a '%' in it is the caller's */
+    return Kernel::Mm::TAlloc<Kernel::Task, RustAllocTag>(buf);
 }
 
 unsigned long kernel_task_spawn(const unsigned char* name, unsigned long nameLen,
@@ -537,7 +537,7 @@ void kernel_cpu_run_on(unsigned int cpu,
     if (!(state & Kernel::Cpu::StateRunning) ||
         (state & (Kernel::Cpu::StateExiting | Kernel::Cpu::StateExited)))
     {
-        Trace(0, "kernel_cpu_run_on: cpu %u not running (state 0x%p)",
+        Trace(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
               (ulong)cpu, state);
         return;
     }
@@ -1069,7 +1069,7 @@ unsigned long kernel_interrupt_register_level(
                 RustIrqSlots[i].Ctx = nullptr;
                 RustIrqSlots[i].Used = false;
                 RustIrqLock.WriteUnlockIrqRestore(flags);
-                Trace(0, "kernel_interrupt_register_level: irq %u refused",
+                Trace(0, "kernel_interrupt_register_level: irq %lu refused",
                       (ulong)irq_line);
                 return 0;
             }
@@ -1523,7 +1523,7 @@ static void DispatchTo(const unsigned char* line, unsigned long len,
     {
         char note[96];
         Stdlib::BufferPrinter bp(note, sizeof(note));
-        bp.Printf("command too long: %u characters, the most is %u\n", len, DispatchLineMax);
+        bp.Printf("command too long: %lu characters, the most is %lu\n", len, DispatchLineMax);
         sink(ctx, reinterpret_cast<const unsigned char*>(note), Stdlib::StrLen(note));
         return;
     }

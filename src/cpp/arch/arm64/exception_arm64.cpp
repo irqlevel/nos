@@ -41,14 +41,14 @@ extern "C" void ArmSyncEntry(Context* ctx)
     ulong iss = ctx->Esr & 0x1FFFFFF;
 
     PanicCtx(ctx, false,
-        "sync exception: %s (esr 0x%p ec 0x%p iss 0x%p) far 0x%p elr 0x%p",
+        "sync exception: %s (esr 0x%lX ec 0x%lX iss 0x%lX) far 0x%lX elr 0x%lX",
         EcName(ec), ctx->Esr, ec, iss, ctx->Far, ctx->Elr);
 }
 
 extern "C" void ArmUnexpectedEntry(Context* ctx, ulong index)
 {
     PanicCtx(ctx, false,
-        "unexpected exception vector %u (esr 0x%p far 0x%p elr 0x%p)",
+        "unexpected exception vector %lu (esr 0x%lX far 0x%lX elr 0x%lX)",
         index, ctx->Esr, ctx->Far, ctx->Elr);
 }
 

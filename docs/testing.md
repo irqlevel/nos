@@ -105,7 +105,7 @@ swallowing panic messages whole.
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
-| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, ACPI tables and command line -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
+| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -879,7 +879,19 @@ what its header says it does:
   short or not, to this: nothing mapped past the physical address space or
   longer than a table may be, no more of the window held at once than
   `acpi.h` bounds, and when the parse is done nothing held but the two
-  APICs' pages -- and not those if it failed.
+  APICs' pages -- and not those if it failed;
+- `format`: `Stdlib::VsnPrintf`, which every traced line, panic and
+  command's output goes through, against the host's own `vsnprintf` --
+  what `PRINTF_FORMAT`'s check rests on. Random formats of what it
+  implements (`d u x X c s`, `%%`, the flags `0` and `-`, widths, the length
+  modifiers `hh h l ll z`) among literal text, over two fixed lists of
+  twelve arguments -- ints, longs and strings side by side, some in
+  registers and some on the stack -- each conversion matching the type at
+  its place, and each int made by cutting a long at the call, so that a
+  reader taking an int as a long reads the other half of its slot: what
+  fits must be the host's output byte for byte and its length, and what
+  does not, the host's output cut where `VsnPrintf` cuts it and marked with
+  `...`.
 
 The runner (`fuzz/cpp/common/runner.cpp`) is `fuzz/common`'s, but for one
 thing: inputs run in batches, one after another in a process forked for the
@@ -975,9 +987,31 @@ And when the x86 boot's own readers were added, each fixed:
 - the command line: `Parameters`'s constructor left two members unset --
   zeros in the kernel only because the object's storage is static.
 
+And when the formatter was put under the compiler's check: `VsnPrintf`
+read every integer conversion as a 64-bit slot, whatever the argument was,
+and nothing checked a call -- the convention was to cast each argument to
+`ulong`. The ones that were not were read with whatever the other half of
+their register or stack slot held: the trace level in every `Trace` (an
+int under `%u`), and a few `%d`s and `%u`s of ints. `VsnPrintf` reads C's
+printf now, the length modifiers included; every printf-like function
+carries `PRINTF_FORMAT`, the build has `-Wformat=2`, and 924 conversions
+were rewritten to say what they print -- `%lu`, and `%lX` for the addresses
+passed as `ulong` under `%p`, which prints what `%p` printed. Two formats
+no check could see, and which the new reading would have misread, were
+found by `-Wformat-nonliteral` and the template it cannot look through:
+`profile`'s usage, a variable, and the idle and softirq tasks' names,
+handed through `TAlloc<Task>` -- `"idle%u"` over a `ulong`. The first is a
+constant the check reads, and a `Task` takes a name rather than a
+format. The boot log is
+the same line for line on both arches, digits aside. And `MemoryMap`'s
+region hint, which `memcheck` read and wrote with no lock while other CPUs
+mapped, is an `Atomic`.
+
 What it does not reach yet: `PageTable::Setup` and the free list's build,
-which run on the bootstrap linear map; and anything that needs a second
-CPU. `mm/block_allocator.cpp` is not fuzzed: nothing uses it. The legacy
+which run on the bootstrap linear map; anything that needs a second CPU;
+and the block allocator under the dmesg ring (`mm/block_allocator.cpp`),
+which every traced line takes a message from -- though not, as this page
+used to say, something nothing uses. The legacy
 search finds an RSDP only whole within a page -- the kernel maps the BIOS
 area a page at a time --, which the reader holds it to: the Multiboot tag,
 GRUB's copy, is the path every machine this kernel boots on takes.

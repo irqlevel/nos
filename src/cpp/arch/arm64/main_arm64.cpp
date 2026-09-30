@@ -167,7 +167,7 @@ static void ApStartupArm(void* ctx)
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
 
-    Trace(0, "Cpu %u running task 0x%p", cpu.GetIndex(),
+    Trace(0, "Cpu %lu running task 0x%p", cpu.GetIndex(),
         Task::GetCurrentTask());
 
     BugOn(Hal::IsInterruptEnabled());
@@ -235,7 +235,7 @@ static void BpStartupArm(void* ctx)
             Slots[count].Reserved = 0;
             count++;
         }
-        Trace(0, "virtio-mmio: %u windows from the device tree", count);
+        Trace(0, "virtio-mmio: %lu windows from the device tree", count);
 
         rust_virtio_blk_init_mmio(Slots, count);
         rust_virtio_scsi_init_mmio(Slots, count);
@@ -381,7 +381,7 @@ static void WxProbeHeap()
 
     *reinterpret_cast<volatile u32*>(va) = RetInsn;
     Hal::SyncInstructionCache((ulong)va, sizeof(RetInsn));
-    Trace(0, "W^X probe: calling into a heap page 0x%p (expect instr abort)", (ulong)va);
+    Trace(0, "W^X probe: calling into a heap page 0x%lX (expect instr abort)", (ulong)va);
     reinterpret_cast<void (*)()>(va)();
     Trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
 }
@@ -394,14 +394,14 @@ extern "C" void ApMainArm64(ulong index)
     SetupVectors();
 
     if (!Gic::GetInstance().CpuInit())
-        Panic("Can't init gic on cpu %u", index);
+        Panic("Can't init gic on cpu %lu", index);
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
     BugOn(cpu.GetIndex() != index);
 
     if (!cpu.Run(ApStartupArm, nullptr))
     {
-        Trace(0, "Can't run cpu %u task", cpu.GetIndex());
+        Trace(0, "Can't run cpu %lu task", cpu.GetIndex());
         return;
     }
 }
@@ -463,10 +463,10 @@ extern "C" void MainArm64(void* dtb)
        so the earliest traces are always at the default level. */
     Tracer::GetInstance().SetLevel(Parameters::DefaultLogLevel);
 
-    Trace(0, "nos arm64: dtb 0x%p bootargs '%s' cpus %u", dtb,
+    Trace(0, "nos arm64: dtb 0x%p bootargs '%s' cpus %lu", dtb,
         board.BootArgs, board.CpuCount);
     if (board.Refused != 0)
-        Trace(0, "nos arm64: dtb: %u values refused -- out of reach, not an interrupt the kernel "
+        Trace(0, "nos arm64: dtb: %lu values refused -- out of reach, not an interrupt the kernel "
             "takes, or unreadable -- the defaults in their place", board.Refused);
 
     auto& mmap = Mm::MemoryMap::GetInstance();
@@ -474,7 +474,7 @@ extern "C" void MainArm64(void* dtb)
     {
         mmap.AddRegion(board.MemRegions[i].Addr, board.MemRegions[i].Size,
             MemRegionUsableRam);
-        Trace(0, "memory 0x%p size 0x%p", board.MemRegions[i].Addr,
+        Trace(0, "memory 0x%lX size 0x%lX", board.MemRegions[i].Addr,
             board.MemRegions[i].Size);
     }
     /* Keep the allocator away from the DTB */
@@ -492,7 +492,7 @@ extern "C" void MainArm64(void* dtb)
        everything until the network can carry it away. */
     rust_netconsole_setup();
 
-    Trace(0, "Enter kernel: start 0x%p end 0x%p",
+    Trace(0, "Enter kernel: start 0x%lX end 0x%lX",
         mmap.GetKernelStart(), mmap.GetKernelEnd());
 
     auto& bpt = Mm::BuiltinPageTable::GetInstance();
@@ -501,7 +501,7 @@ extern "C" void MainArm64(void* dtb)
 
     bpt.MapHighRam();
 
-    Trace(0, "Builtin paging root 0x%p", bpt.GetRoot());
+    Trace(0, "Builtin paging root 0x%lX", bpt.GetRoot());
     Hal::SetTranslationRoot(bpt.GetRoot());
     Trace(0, "Builtin paging active");
 
@@ -509,7 +509,7 @@ extern "C" void MainArm64(void* dtb)
     if (!pt.Setup())
         Panic("Can't setup paging");
 
-    Trace(0, "Paging root 0x%p", pt.GetRoot());
+    Trace(0, "Paging root 0x%lX", pt.GetRoot());
 
     /* Keep the UART (and the rest of the MMIO GiB) mapped across the
        root switch: install the device block while the builtin linear map
@@ -536,12 +536,12 @@ extern "C" void MainArm64(void* dtb)
         pt.ProtectRange(textEnd, rodataEnd - textEnd, false, false);      /* RO+NX */
         pt.ProtectRange(rodataEnd, imgEnd - rodataEnd, true, false);      /* RW+NX */
         asm volatile("dsb ish; isb");
-        Trace(0, "W^X: text [0x%p,0x%p) rodata [0x%p,0x%p) data [0x%p,0x%p)",
+        Trace(0, "W^X: text [0x%lX,0x%lX) rodata [0x%lX,0x%lX) data [0x%lX,0x%lX)",
             textStart, textEnd, textEnd, rodataEnd, rodataEnd, imgEnd);
 
         if (Parameters::GetInstance().IsWxProbeText())
         {
-            Trace(0, "W^X probe: writing to text 0x%p (expect data abort)", textStart);
+            Trace(0, "W^X probe: writing to text 0x%lX (expect data abort)", textStart);
             *reinterpret_cast<volatile u32*>(textStart) = 0;
             Trace(0, "W^X probe: text write SUCCEEDED (W^X broken!)");
         }
@@ -554,7 +554,7 @@ extern "C" void MainArm64(void* dtb)
         if (!page)
             Panic("Can't alloc page");
         auto va = pt.TmpMapPage(page->GetPhyAddress());
-        Trace(0, "va 0x%p pha 0x%p", va, page->GetPhyAddress());
+        Trace(0, "va 0x%lX pha 0x%lX", va, page->GetPhyAddress());
         Stdlib::MemSet((void *)va, 0, Const::PageSize);
         pt.TmpUnmapPage(va);
         pt.FreePage(page);

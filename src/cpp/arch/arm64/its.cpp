@@ -99,7 +99,7 @@ bool Its::Setup(ulong itsPhys, ulong gicrBase, ulong gicrSize)
     IttEntrySize = ((typer >> 4) & 0xF) + 1;
     Pta = (typer >> 19) & 1;
 
-    Trace(0, "Its: typer 0x%p eventbits %u devbits %u itt-entsz %u pta %u",
+    Trace(0, "Its: typer 0x%lX eventbits %lu devbits %lu itt-entsz %lu pta %lu",
         typer, (ulong)EventIdBits, (ulong)DeviceIdBits, (ulong)IttEntrySize, (ulong)Pta);
 
     /* Config table covers all LPIs from 8192 up; size it to what we use.
@@ -204,7 +204,7 @@ bool Its::EnableLpisOnRedist(ulong gicrBase, ulong gicrSize)
         BootRdBase = 0;
     }
 
-    Trace(0, "Its: LPIs enabled on rd 0x%p propbaser 0x%p", rd, propbaser);
+    Trace(0, "Its: LPIs enabled on rd 0x%lX propbaser 0x%lX", rd, propbaser);
     return true;
 }
 
@@ -253,7 +253,7 @@ bool Its::ProvisionTables()
 
         Write64(reg, val);
         u64 readback = Read64(reg);
-        Trace(0, "Its: baser[%u] type %u entsz %u pages %u -> 0x%p",
+        Trace(0, "Its: baser[%lu] type %lu entsz %lu pages %lu -> 0x%lX",
             (ulong)i, (ulong)type, (ulong)entrySize, pages, readback);
     }
     return true;
@@ -298,7 +298,7 @@ bool Its::WaitCommands()
             return true;
         asm volatile("yield");
     }
-    Trace(0, "Its: command queue stall (creadr 0x%p cwriter 0x%p)",
+    Trace(0, "Its: command queue stall (creadr 0x%lX cwriter 0x%lX)",
         Read64(ItsBase + GitsCreadr), CmdWriteOff);
     return false;
 }
@@ -382,7 +382,7 @@ bool Its::MapDevice(u32 deviceId, u32 numEvents)
 
     Devices[free].DeviceId = deviceId;
     Devices[free].Used = true;
-    Trace(0, "Its: mapped device 0x%p itt 0x%p eventbits %u",
+    Trace(0, "Its: mapped device 0x%lX itt 0x%lX eventbits %u",
         (ulong)deviceId, ittPhys, eventBits);
     return true;
 }
@@ -432,7 +432,7 @@ u32 Its::MapEvent(u32 deviceId, u32 eventId, InterruptHandler& handler,
 
     handler.OnInterruptRegister((u8)0, (u8)0);
 
-    Trace(0, "Its: event dev 0x%p ev %u -> lpi %u addr 0x%p",
+    Trace(0, "Its: event dev 0x%lX ev %lu -> lpi %lu addr 0x%lX",
         (ulong)deviceId, (ulong)eventId, (ulong)lpi, msiAddr);
     return eventId; /* MSI data = eventId */
 }

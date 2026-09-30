@@ -75,7 +75,7 @@ bool VaAllocator::Setup(ulong vaStart, ulong vaEnd, ulong blockSize)
     for (ulong i = 0; i < bitmapBlocks; i++)
         Stdlib::Bitmap(BitmapPtr, BlockCount).SetBit(i);
 
-    Trace(0, "0x%p start 0x%p end 0x%p bsize 0x%p bcount %u bmpages %u",
+    Trace(0, "0x%p start 0x%lX end 0x%lX bsize 0x%lX bcount %lu bmpages %lu",
         this, VaStart, VaEnd, BlockSize, BlockCount, bitmapPages);
     return true;
 }

@@ -58,7 +58,7 @@ void IoApic::Enable()
         SetEntry(i, 1 << MaskedShift);
     }
 
-    Trace(IoApicLL, "IO Apic ver 0x%p pins %u", ver, pins);
+    Trace(IoApicLL, "IO Apic ver 0x%X pins %lu", ver, pins);
 }
 
 void IoApic::SetEntry(u8 index, u64 data)
@@ -77,7 +77,7 @@ u64 IoApic::CheckDest(u8 irq, u64 apicId)
     /* Never silently alias onto whatever apic id the low four bits happen to
        name -- that is how an interrupt goes missing for good. Fall back to
        the boot CPU, which is always addressable, and say so. */
-    Trace(0, "IoApic: irq 0x%p apicId %u exceeds physical destination range %u, using 0",
+    Trace(0, "IoApic: irq 0x%lX apicId %lu exceeds physical destination range %lu, using 0",
         (ulong)irq, (ulong)apicId, (ulong)MaxPhysicalDest);
 
     return 0;
@@ -98,7 +98,7 @@ void IoApic::SetIrq(u8 irq, u64 apicId, u8 vector)
     data |= 0 << MaskedShift; // disable: no
     data |= apicId << DestShift; //destination id
 
-    Trace(IoApicLL, "SetIrq irq 0x%p apicId 0x%p vector 0x%p data 0x%p",
+    Trace(IoApicLL, "SetIrq irq 0x%lX apicId 0x%lX vector 0x%lX data 0x%lX",
         (ulong)irq, (ulong)apicId, (ulong)vector, (ulong)data);
 
     SetEntry(irq, data);
@@ -115,7 +115,7 @@ void IoApic::SetIrqDestination(u8 irq, u64 apicId)
     high = (high & 0x00FFFFFFU) | ((u32)apicId << 24);
     WriteRegister(RedTbl + 2 * irq + 1, high);
 
-    Trace(IoApicLL, "SetIrqDestination irq 0x%p apicId 0x%p",
+    Trace(IoApicLL, "SetIrqDestination irq 0x%lX apicId 0x%lX",
         (ulong)irq, (ulong)apicId);
 }
 
@@ -134,7 +134,7 @@ void IoApic::SetIrqLevel(u8 irq, u64 apicId, u8 vector, bool activeHigh)
     data |= 0 << MaskedShift; // disable: no
     data |= apicId << DestShift; //destination id
 
-    Trace(IoApicLL, "SetIrqLevel irq 0x%p apicId 0x%p vector 0x%p data 0x%p activeHigh %u",
+    Trace(IoApicLL, "SetIrqLevel irq 0x%lX apicId 0x%lX vector 0x%lX data 0x%lX activeHigh %lu",
         (ulong)irq, (ulong)apicId, (ulong)vector, (ulong)data, (ulong)activeHigh);
 
     SetEntry(irq, data);

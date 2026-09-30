@@ -129,7 +129,7 @@ bool MsixTable::Setup(Pci::DeviceInfo* dev, const ulong* mappedBars)
     u32 deviceId = ((u32)dev->Bus << 8) | ((u32)dev->Slot << 3) | dev->Func;
     Its::GetInstance().MapDevice(deviceId, Count);
 
-    Trace(0, "MsixTable(its): %u entries cap 0x%p dev 0x%p",
+    Trace(0, "MsixTable(its): %lu entries cap 0x%lX dev 0x%lX",
         (ulong)Count, (ulong)cap, (ulong)deviceId);
     return true;
 }

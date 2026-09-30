@@ -47,7 +47,7 @@ bool Profiler::Allocate()
         Cpu_[i].Records = (Record*)Mm::Alloc(SamplesPerCpu * sizeof(Record), Tag);
         if (Cpu_[i].Records == nullptr)
         {
-            Trace(0, "Profiler: no memory for cpu %u buffer", i);
+            Trace(0, "Profiler: no memory for cpu %lu buffer", i);
             return false;
         }
     }
@@ -305,13 +305,13 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
     /* Which clock these came off matters for reading them: at 100 Hz a
        function has to be very hot to appear at all, and nothing that runs
        with interrupts off appears ever. */
-    printer.Printf("%u samples on %u cpus, %u dropped, source %s\n",
+    printer.Printf("%lu samples on %lu cpus, %lu dropped, source %s\n",
         total, cpus, dropped, UsePmu ? Hal::PmuName() : "tick");
 
     if (total == 0)
     {
         if (pidFilter != NoPidFilter)
-            printer.Printf("(no sample landed in pid %u -- it may have been "
+            printer.Printf("(no sample landed in pid %lu -- it may have been "
                 "asleep the whole window, which is what a task that is not "
                 "running looks like)\n", pidFilter);
         else if (UsePmu)
@@ -328,7 +328,7 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
     }
 
     if (unfolded != 0)
-        printer.Printf("%u samples past the %u chains this report holds\n",
+        printer.Printf("%lu samples past the %lu chains this report holds\n",
             unfolded, (ulong)MaxChains);
 
     for (ulong i = 0; i < chainCount && i < chainLimit; i++)
@@ -354,16 +354,16 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
             /* Not the kernel's: named now, if a module still has it */
             char where[SymbolTable::DescribeMax];
             if (!symtab.Describe(chains[i].Frame[0], where, sizeof(where)))
-                Stdlib::SnPrintf(where, sizeof(where), "0x%p", chains[i].Frame[0]);
-            printer.Printf("%u.%u%% %u %s\n", permille / 10, permille % 10,
+                Stdlib::SnPrintf(where, sizeof(where), "0x%lX", chains[i].Frame[0]);
+            printer.Printf("%lu.%lu%% %lu %s\n", permille / 10, permille % 10,
                 chains[i].Count, where);
         }
         else if (chains[i].LeafLow == chains[i].LeafHigh)
-            printer.Printf("%u.%u%% %u %s+0x%p\n", permille / 10, permille % 10,
+            printer.Printf("%lu.%lu%% %lu %s+0x%lX\n", permille / 10, permille % 10,
                 chains[i].Count, SymbolName(chains[i].LeafName),
                 chains[i].LeafLow);
         else
-            printer.Printf("%u.%u%% %u %s+0x%p..0x%p\n",
+            printer.Printf("%lu.%lu%% %lu %s+0x%lX..0x%lX\n",
                 permille / 10, permille % 10, chains[i].Count,
                 SymbolName(chains[i].LeafName),
                 chains[i].LeafLow, chains[i].LeafHigh);
@@ -377,7 +377,7 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
             if (symtab.Describe(chains[i].Frame[f], where, sizeof(where)))
                 printer.Printf("        <- %s\n", where);
             else
-                printer.Printf("        <- 0x%p\n", chains[i].Frame[f]);
+                printer.Printf("        <- 0x%lX\n", chains[i].Frame[f]);
         }
     }
 

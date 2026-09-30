@@ -22,8 +22,9 @@ The targets: fdt (the device tree reader and Board::Setup), memmap (the
 memory map and the free-page scan's questions of it), grubenv (the GRUB
 environment block), module (the module loader), pagetable (the page tables
 and the physical page allocator), heap (the kernel heap), cmdline (the
-command line), multiboot (Multiboot2's tags) and acpi (the ACPI tables, over
-an emulated TmpMap window). docs/testing.md says what each checks.
+command line), multiboot (Multiboot2's tags), acpi (the ACPI tables, over
+an emulated TmpMap window) and format (the kernel's printf, against the
+host's). docs/testing.md says what each checks.
 
 By default every target runs its own number of inputs from a fixed seed, the
 same every time: the gate, a minute and a half. A campaign is `--seconds` a

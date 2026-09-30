@@ -69,12 +69,12 @@ void IrqBalance::ApplyLockHeld(Entry& entry)
     if (entry.Kind == KindIoApic)
     {
         IoApic::GetInstance().SetIrqDestination(entry.Gsi, entry.Cpu);
-        Trace(0, "IrqBalance: gsi 0x%p -> cpu %u", (ulong)entry.Gsi, entry.Cpu);
+        Trace(0, "IrqBalance: gsi 0x%lX -> cpu %lu", (ulong)entry.Gsi, entry.Cpu);
     }
     else
     {
         entry.Table->Retarget(entry.Index, (u32)entry.Cpu);
-        Trace(0, "IrqBalance: msix 0x%p[%u] -> cpu %u",
+        Trace(0, "IrqBalance: msix 0x%lX[%lu] -> cpu %lu",
             (ulong)entry.Table, (ulong)entry.Index, entry.Cpu);
     }
 }
@@ -158,7 +158,7 @@ void IrqBalance::Balance()
     ulong cpuMask = CpuTable::GetInstance().GetRunningCpus();
     ulong ioApicMask = cpuMask & IoApicTargetMask;
 
-    Trace(0, "IrqBalance: %u irqs balanced over cpu mask 0x%p, ioapic-reachable 0x%p",
+    Trace(0, "IrqBalance: %lu irqs balanced over cpu mask 0x%lX, ioapic-reachable 0x%lX",
         EntryCount, cpuMask, ioApicMask);
 }
 

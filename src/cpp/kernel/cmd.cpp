@@ -126,7 +126,7 @@ static void CmdLscpu(const char* args, Stdlib::Printer& con)
             count++;
     }
 
-    con.Printf("cpus %u running, id mask 0x%p, bsp %u\n",
+    con.Printf("cpus %lu running, id mask 0x%lX, bsp %lu\n",
         count, mask, cpus.GetBspIndexNoLock());
 
     Hal::PrintCpuInfo(con);
@@ -177,7 +177,7 @@ static void CmdLoglevel(const char* args, Stdlib::Printer& con)
     const char* tok = Stdlib::NextToken(args, end);
     if (!tok)
     {
-        con.Printf("loglevel %u\n", (ulong)tracer.GetLevel());
+        con.Printf("loglevel %lu\n", (ulong)tracer.GetLevel());
         return;
     }
 
@@ -187,7 +187,7 @@ static void CmdLoglevel(const char* args, Stdlib::Printer& con)
     ulong level;
     if (!Stdlib::ParseUlong(buf, level) || level > (ulong)MaxTraceLevel)
     {
-        con.Printf("usage: loglevel [0-%u]\n", (ulong)MaxTraceLevel);
+        con.Printf("usage: loglevel [0-%lu]\n", (ulong)MaxTraceLevel);
         return;
     }
 
@@ -197,14 +197,14 @@ static void CmdLoglevel(const char* args, Stdlib::Printer& con)
        is most of an afternoon. Raising the level is loud: level 4 traces every
        allocation, and every line also goes out the serial port. */
     tracer.SetLevel((int)level);
-    con.Printf("loglevel %u\n", level);
+    con.Printf("loglevel %lu\n", level);
 }
 
 static void CmdUptime(const char* args, Stdlib::Printer& con)
 {
     (void)args;
     auto time = GetBootTime();
-    con.Printf("%u.%u\n", time.GetSecs(), time.GetUsecs());
+    con.Printf("%lu.%lu\n", time.GetSecs(), time.GetUsecs());
 }
 
 static void CmdDate(const char* args, Stdlib::Printer& con)
@@ -262,7 +262,7 @@ static void CmdDate(const char* args, Stdlib::Printer& con)
     }
     ulong d = days + 1;
 
-    con.Printf("%u-%u-%u %u:%u:%u UTC\n", y, mo, d, h, m, s);
+    con.Printf("%lu-%lu-%lu %lu:%lu:%lu UTC\n", y, mo, d, h, m, s);
 }
 
 /* Percentages are per CPU, the way top has always reported them: a thread
@@ -288,7 +288,7 @@ static void CmdTop(const char* args, Stdlib::Printer& con)
         ulong ms;
         if (!Stdlib::ParseUlong(buf, ms) || ms == 0 || ms > MaxIntervalMs)
         {
-            con.Printf("usage: top [interval-ms, 1-%u]\n", MaxIntervalMs);
+            con.Printf("usage: top [interval-ms, 1-%lu]\n", MaxIntervalMs);
             return;
         }
         intervalMs = ms;
@@ -386,25 +386,25 @@ static void CmdTop(const char* args, Stdlib::Printer& con)
             busy += permille[i];
     }
 
-    con.Printf("cpus %u, %u tasks, %u ms window, busy %u.%u%% of %u00%%\n",
+    con.Printf("cpus %lu, %lu tasks, %lu ms window, busy %lu.%lu%% of %lu00%%\n",
         cpus, (ulong)n1, intervalMs, busy / 10, busy % 10, cpus);
     con.Printf("  pid    cpu%%  name\n");
 
     for (size_t i = 0; i < n1; i++)
     {
-        con.Printf("%u %u.%u %s\n", after[i].Pid,
+        con.Printf("%lu %lu.%lu %s\n", after[i].Pid,
             permille[i] / 10, permille[i] % 10, after[i].Name);
     }
 
     Mm::Free(after);
     Mm::Free(before);
 
-    con.Printf("task migrations since boot: %u\n", (ulong)GetTaskMigrationCount());
+    con.Printf("task migrations since boot: %lu\n", (ulong)GetTaskMigrationCount());
     /* The window's count first: it is what the load being looked at did. The
        one since boot starts at one per CPU, on its idle task, that the boot
        self-test makes on purpose (TestPreemptDeferred). */
-    con.Printf("preemptions deferred: %u in the window, %u of them on an idle task; "
-        "%u since boot, %u on an idle task\n",
+    con.Printf("preemptions deferred: %lu in the window, %lu of them on an idle task; "
+        "%lu since boot, %lu on an idle task\n",
         (ulong)(deferred1 - deferred0), (ulong)(deferredIdle1 - deferredIdle0),
         (ulong)deferred1, (ulong)deferredIdle1);
 }
@@ -423,8 +423,10 @@ static void CmdProfile(const char* args, Stdlib::Printer& con)
     ulong pid = Profiler::NoPidFilter;
     ulong chains = Profiler::TopChains;
 
-    static const char* Usage =
-        "usage: profile [ms, 1-%u] [pid|all] [chains]\n";
+    /* Both consts: -Wformat reads a format through a pointer that cannot
+       change */
+    static const char* const Usage =
+        "usage: profile [ms, 1-%lu] [pid|all] [chains]\n";
 
     if (tok)
     {
@@ -482,9 +484,9 @@ static void CmdProfile(const char* args, Stdlib::Printer& con)
     Sleep(ms * Const::NanoSecsInMs);
     profiler.Stop();
 
-    con.Printf("profiled %u ms", ms);
+    con.Printf("profiled %lu ms", ms);
     if (pid != Profiler::NoPidFilter)
-        con.Printf(", pid %u only", pid);
+        con.Printf(", pid %lu only", pid);
     con.Printf("\n");
 
     profiler.Report(con, pid, chains);
@@ -510,7 +512,7 @@ static void CmdStacks(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    con.Printf("closest any stack came to its end: %u bytes free\n", worstFree);
+    con.Printf("closest any stack came to its end: %lu bytes free\n", worstFree);
 }
 
 
@@ -531,8 +533,8 @@ static void CmdMemusage(const char* args, Stdlib::Printer& con)
     (void)args;
     auto& pt = Mm::PageTable::GetInstance();
 
-    con.Printf("freePages: %u\n", pt.GetFreePagesCount());
-    con.Printf("totalPages: %u\n", pt.GetTotalPagesCount());
+    con.Printf("freePages: %lu\n", pt.GetFreePagesCount());
+    con.Printf("totalPages: %lu\n", pt.GetTotalPagesCount());
 }
 
 static void CmdMemcheck(const char* args, Stdlib::Printer& con)
@@ -554,7 +556,7 @@ static void CmdMeminfo(const char* args, Stdlib::Printer& con)
         if (!mmap.GetRegion(i, addr, len, type))
             break;
 
-        con.Printf("0x%p 0x%p %s\n", addr, len,
+        con.Printf("0x%lX 0x%lX %s\n", addr, len,
             Mm::MemoryMap::GetRegionTypeName(type));
 
         if (type == Mm::MemoryMap::UsableRamType)
@@ -569,12 +571,12 @@ static void CmdMeminfo(const char* args, Stdlib::Printer& con)
     ulong usable = mmap.GetUsableRamBytes();
     ulong unused = mmap.GetUsableRamBytesAbove(mapLimit);
 
-    con.Printf("usable: %u MiB in %u regions\n", usable / Const::MB, usableRegions);
-    con.Printf("mapped: %u MiB, bootstrap map ends at 0x%p\n",
+    con.Printf("usable: %lu MiB in %lu regions\n", usable / Const::MB, usableRegions);
+    con.Printf("mapped: %lu MiB, bootstrap map ends at 0x%lX\n",
         (usable - unused) / Const::MB, mapLimit);
     if (unused != 0)
-        con.Printf("unused: %u MiB above the bootstrap map\n", unused / Const::MB);
-    con.Printf("pages: %u free of %u\n",
+        con.Printf("unused: %lu MiB above the bootstrap map\n", unused / Const::MB);
+    con.Printf("pages: %lu free of %lu\n",
         pt.GetFreePagesCount(), pt.GetTotalPagesCount());
 }
 
@@ -586,7 +588,7 @@ static void CmdIrqstat(const char* args, Stdlib::Printer& con)
         InterruptSource src = (InterruptSource)i;
         long count = InterruptStats::Get(src);
         if (count > 0)
-            con.Printf("%s: %u\n", InterruptStats::GetName(src), count);
+            con.Printf("%s: %lu\n", InterruptStats::GetName(src), count);
     }
 }
 
@@ -649,7 +651,7 @@ static void CmdCrc32(const char* args, Stdlib::Printer& con)
     kernel_vfs_close(file);
 
     if (ok)
-        con.Printf("%s: crc32 0x%p, %u bytes\n", path, (ulong)crc, total);
+        con.Printf("%s: crc32 0x%lX, %lu bytes\n", path, (ulong)crc, total);
     else
         con.Printf("read failed\n");
 }
@@ -681,7 +683,7 @@ static char* GrubenvReadFile(const char* path, ulong& size, Stdlib::Printer& con
     size = kernel_vfs_size(file);
     if (size < Stdlib::GrubEnvBlock::MinSize || size > GrubenvMaxSize)
     {
-        con.Printf("%s: %u bytes is not a GRUB environment block\n", path, size);
+        con.Printf("%s: %lu bytes is not a GRUB environment block\n", path, size);
         kernel_vfs_close(file);
         return nullptr;
     }
@@ -788,7 +790,7 @@ static void CmdGrubenv(const char* args, Stdlib::Printer& con)
         }
         else
         {
-            con.Printf("cannot set %s: not a name GRUB takes, or no room in %u bytes\n",
+            con.Printf("cannot set %s: not a name GRUB takes, or no room in %lu bytes\n",
                 name, size);
             Mm::Free(block);
             return;
@@ -888,9 +890,9 @@ static void DumpStackTrace(ulong* frames, size_t count, Stdlib::Printer& con)
     {
         char where[SymbolTable::DescribeMax];
         if (symtab.Describe(frames[i], where, sizeof(where)))
-            con.Printf("  [%u] 0x%p %s\n", (ulong)i, frames[i], where);
+            con.Printf("  [%lu] 0x%lX %s\n", (ulong)i, frames[i], where);
         else
-            con.Printf("  [%u] 0x%p\n", (ulong)i, frames[i]);
+            con.Printf("  [%lu] 0x%lX\n", (ulong)i, frames[i]);
     }
 }
 
@@ -929,7 +931,7 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
     ObjectPtr<Task> task(TaskTable::GetInstance().Lookup(pid));
     if (!task)
     {
-        con.Printf("task %u not found\n", pid);
+        con.Printf("task %lu not found\n", pid);
         return;
     }
 
@@ -941,7 +943,7 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
     {
         /* Target is the current task on this CPU */
         count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
-        con.Printf("task %u (%s) running on current cpu:\n", task->Pid, task->GetName());
+        con.Printf("task %lu (%s) running on current cpu:\n", task->Pid, task->GetName());
         DumpStackTrace(frames, count, con);
         return;
     }
@@ -966,7 +968,7 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
 
         if (runCpu == ~0UL)
         {
-            con.Printf("task %u (%s) running but cpu not found\n",
+            con.Printf("task %lu (%s) running but cpu not found\n",
                 task->Pid, task->GetName());
             return;
         }
@@ -977,7 +979,7 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
         IPITask ipiTask(CmdBtIPIFunc, &btCtx);
         CpuTable::GetInstance().GetCpu(runCpu).QueueIPITask(ipiTask);
 
-        con.Printf("task %u (%s) running on cpu %u:\n",
+        con.Printf("task %lu (%s) running on cpu %lu:\n",
             task->Pid, task->GetName(), runCpu);
         DumpStackTrace(btCtx.Frames, btCtx.Count, con);
         return;
@@ -985,7 +987,7 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
 
     if (state == Task::StateExited)
     {
-        con.Printf("task %u (%s) has exited\n", task->Pid, task->GetName());
+        con.Printf("task %lu (%s) has exited\n", task->Pid, task->GetName());
         return;
     }
 
@@ -993,14 +995,14 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
     ulong savedRsp = task->Rsp;
     if (savedRsp == 0)
     {
-        con.Printf("task %u (%s) has no saved context\n", task->Pid, task->GetName());
+        con.Printf("task %lu (%s) has no saved context\n", task->Pid, task->GetName());
         return;
     }
 
     count = StackTrace::CaptureFrom(Hal::TaskSavedFramePointer(savedRsp),
         frames, Stdlib::ArraySize(frames));
 
-    con.Printf("task %u (%s) state %u:\n", task->Pid, task->GetName(), (ulong)state);
+    con.Printf("task %lu (%s) state %lu:\n", task->Pid, task->GetName(), (ulong)state);
     DumpStackTrace(frames, count, con);
 }
 
@@ -1129,7 +1131,7 @@ static char* ReadScript(const char* path, ulong& size, bool& whole, Stdlib::Prin
         ulong keep = size;
         while (keep > 0 && text[keep - 1] != '\n')
             keep--;
-        out.Printf("rc: %s is %u bytes; only its whole lines in the first %u are read\n",
+        out.Printf("rc: %s is %lu bytes; only its whole lines in the first %lu are read\n",
             path, total, size);
         size = keep;
     }
@@ -1183,7 +1185,7 @@ public:
     {
     }
 
-    virtual void Printf(const char *fmt, ...) override
+    virtual PRINTF_FORMAT(2, 3) void Printf(const char *fmt, ...) override
     {
         va_list args;
         va_start(args, fmt);
@@ -1191,7 +1193,7 @@ public:
         va_end(args);
     }
 
-    virtual void VPrintf(const char *fmt, va_list args) override
+    virtual PRINTF_FORMAT(2, 0) void VPrintf(const char *fmt, va_list args) override
     {
         char text[FormatMax];
         if (Stdlib::VsnPrintf(text, sizeof(text), fmt, args) < 0)
@@ -1234,7 +1236,7 @@ public:
             start = (end < Len && Buf[end] == '\n') ? end + 1 : end;
         }
         if (Dropped != 0)
-            Trace(0, "%s[%u more bytes it printed not logged]", Prefix, Dropped);
+            Trace(0, "%s[%lu more bytes it printed not logged]", Prefix, Dropped);
 
         Len = 0;
         Dropped = 0;
@@ -1304,7 +1306,7 @@ static void RcShow(Stdlib::Printer& con)
         ulong n = (len < ScriptLineMax) ? len : ScriptLineMax;
         Stdlib::MemCpy(shown, line, n);
         shown[n] = '\0';
-        con.Printf("%u  %s\n", number, shown);
+        con.Printf("%lu  %s\n", number, shown);
     }
     if (number == 0)
         con.Printf("rc: %s is empty\n", RcPath);
@@ -1358,7 +1360,7 @@ static bool RcRewrite(ulong skip, const char* add, Stdlib::Printer& con)
         if (skip > lines)
         {
             Mm::Free(old);
-            con.Printf("rc: %s has no line %u\n", RcPath, skip);
+            con.Printf("rc: %s has no line %lu\n", RcPath, skip);
             return false;
         }
     }
@@ -1368,7 +1370,7 @@ static bool RcRewrite(ulong skip, const char* add, Stdlib::Printer& con)
     {
         if (old != nullptr)
             Mm::Free(old);
-        con.Printf("rc: %s would pass %u bytes\n", RcPath, ScriptSizeMax);
+        con.Printf("rc: %s would pass %lu bytes\n", RcPath, ScriptSizeMax);
         return false;
     }
 
@@ -1440,7 +1442,7 @@ static void CmdRc(const char* args, Stdlib::Printer& con)
         if (len == 0)
             con.Printf("usage: rc add <command line>\n");
         else if (len > ScriptLineMax)
-            con.Printf("rc: at most %u characters a line\n", ScriptLineMax);
+            con.Printf("rc: at most %lu characters a line\n", ScriptLineMax);
         else if (RcRewrite(0, rest, con))
             con.Printf("rc: added to %s: %s\n", RcPath, rest);
     }
@@ -1787,7 +1789,7 @@ bool Cmd::RunScript(const char* path, Stdlib::Printer& out, ScriptStep step, voi
                 continue;
             if (len > ScriptLineMax)
             {
-                out.Printf("rc: line %u is longer than %u characters, skipped\n", number, ScriptLineMax);
+                out.Printf("rc: line %lu is longer than %lu characters, skipped\n", number, ScriptLineMax);
                 continue;
             }
             Stdlib::MemCpy(cmd, line, len);

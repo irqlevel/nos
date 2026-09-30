@@ -215,18 +215,18 @@ void FormatValue(char* buf, size_t size, const TypeDescriptor* type, ulong value
     }
     if (!IsInline(type))
     {
-        Stdlib::SnPrintf(buf, size, "<a %u-bit value>", (ulong)BitWidth(type));
+        Stdlib::SnPrintf(buf, size, "<a %lu-bit value>", (ulong)BitWidth(type));
         return;
     }
     if (IsSigned(type))
     {
-        Stdlib::SnPrintf(buf, size, "%d", SignedValue(type, value));
+        Stdlib::SnPrintf(buf, size, "%ld", SignedValue(type, value));
         return;
     }
 
     unsigned width = BitWidth(type);
     ulong masked = (width >= MaxInlineBits) ? value : (value & ((1UL << width) - 1));
-    Stdlib::SnPrintf(buf, size, "%u", masked);
+    Stdlib::SnPrintf(buf, size, "%lu", masked);
 }
 
 void Emit(const char* text)
@@ -260,7 +260,7 @@ void Report(const SourceLocation* loc, const char* what)
 {
     char line[LineMax];
     ulong count = __atomic_add_fetch(&ReportCount, 1, __ATOMIC_RELAXED);
-    Stdlib::SnPrintf(line, sizeof(line), "UBSAN: %s at %s:%u:%u",
+    Stdlib::SnPrintf(line, sizeof(line), "UBSAN: %s at %s:%lu:%lu",
         what, loc->File, (ulong)loc->Line, (ulong)(loc->Column & ~ReportedBit));
 
     if (!__atomic_load_n(&WarnOnly, __ATOMIC_RELAXED))
@@ -278,13 +278,13 @@ void Report(const SourceLocation* loc, const char* what)
     for (size_t i = 0; i < frameCount; i++)
     {
         if (SymbolTable::GetInstance().Describe(frames[i], where, sizeof(where)))
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%u] 0x%p %s\n", (ulong)i, frames[i], where);
+            Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX %s\n", (ulong)i, frames[i], where);
         else
-            Stdlib::SnPrintf(buf, sizeof(buf), "  [%u] 0x%p\n", (ulong)i, frames[i]);
+            Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX\n", (ulong)i, frames[i]);
         Emit(buf);
     }
 
-    Stdlib::SnPrintf(buf, sizeof(buf), "UBSAN: %u report(s) so far\n", count);
+    Stdlib::SnPrintf(buf, sizeof(buf), "UBSAN: %lu report(s) so far\n", count);
     Emit(buf);
 
     Hal::IrqRestore(flags);
@@ -297,7 +297,7 @@ void Report(const SourceLocation* loc, const char* what)
     if (Begin(loc))
         Report(loc, what);
 
-    Panic("UBSAN: %s at %s:%u", what, loc->File, (ulong)loc->Line);
+    Panic("UBSAN: %s at %s:%lu", what, loc->File, (ulong)loc->Line);
     __builtin_unreachable();
 }
 
@@ -380,10 +380,10 @@ void __ubsan_handle_type_mismatch_v1(void* data, ulong pointer)
     if (pointer == 0)
         Stdlib::SnPrintf(what, sizeof(what), "%s null pointer of type %s", check, TypeName(d->Type));
     else if (pointer & (alignment - 1))
-        Stdlib::SnPrintf(what, sizeof(what), "%s misaligned address 0x%p for type %s, which requires %u byte alignment",
+        Stdlib::SnPrintf(what, sizeof(what), "%s misaligned address 0x%lX for type %s, which requires %lu byte alignment",
             check, pointer, TypeName(d->Type), alignment);
     else
-        Stdlib::SnPrintf(what, sizeof(what), "%s address 0x%p with insufficient space for an object of type %s",
+        Stdlib::SnPrintf(what, sizeof(what), "%s address 0x%lX with insufficient space for an object of type %s",
             check, pointer, TypeName(d->Type));
     Report(&d->Loc, what);
 }
@@ -395,7 +395,7 @@ void __ubsan_handle_alignment_assumption(void* data, ulong pointer, ulong alignm
         return;
 
     char what[LineMax];
-    Stdlib::SnPrintf(what, sizeof(what), "assumption of %u byte alignment (offset %u) for pointer 0x%p of type %s failed",
+    Stdlib::SnPrintf(what, sizeof(what), "assumption of %lu byte alignment (offset %lu) for pointer 0x%lX of type %s failed",
         alignment, offset, pointer, TypeName(d->Type));
     Report(&d->Loc, what);
 }
@@ -456,7 +456,7 @@ void __ubsan_handle_shift_out_of_bounds(void* data, ulong lhs, ulong rhs)
     if (IsNegative(d->RhsType, rhs))
         Stdlib::SnPrintf(what, sizeof(what), "shift exponent %s is negative", right);
     else if (IsInline(d->RhsType) && rhs >= BitWidth(d->LhsType))
-        Stdlib::SnPrintf(what, sizeof(what), "shift exponent %s is too large for %u-bit type %s",
+        Stdlib::SnPrintf(what, sizeof(what), "shift exponent %s is too large for %lu-bit type %s",
             right, (ulong)BitWidth(d->LhsType), TypeName(d->LhsType));
     else if (IsNegative(d->LhsType, lhs))
         Stdlib::SnPrintf(what, sizeof(what), "left shift of negative value %s", left);
@@ -557,7 +557,7 @@ void __ubsan_handle_nonnull_arg(void* data)
         return;
 
     char what[LineMax];
-    Stdlib::SnPrintf(what, sizeof(what), "null pointer passed as argument %d, which is declared never to be null",
+    Stdlib::SnPrintf(what, sizeof(what), "null pointer passed as argument %ld, which is declared never to be null",
         (long)d->ArgIndex);
     Report(&d->Loc, what);
 }
@@ -572,11 +572,11 @@ void __ubsan_handle_pointer_overflow(void* data, ulong base, ulong result)
     if (base == 0 && result == 0)
         Stdlib::SnPrintf(what, sizeof(what), "applying zero offset to null pointer");
     else if (base == 0)
-        Stdlib::SnPrintf(what, sizeof(what), "applying non-zero offset 0x%p to null pointer", result);
+        Stdlib::SnPrintf(what, sizeof(what), "applying non-zero offset 0x%lX to null pointer", result);
     else if (result == 0)
-        Stdlib::SnPrintf(what, sizeof(what), "applying non-zero offset to non-null pointer 0x%p produced null pointer", base);
+        Stdlib::SnPrintf(what, sizeof(what), "applying non-zero offset to non-null pointer 0x%lX produced null pointer", base);
     else
-        Stdlib::SnPrintf(what, sizeof(what), "pointer arithmetic on 0x%p overflowed to 0x%p", base, result);
+        Stdlib::SnPrintf(what, sizeof(what), "pointer arithmetic on 0x%lX overflowed to 0x%lX", base, result);
     Report(&d->Loc, what);
 }
 

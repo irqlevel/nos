@@ -33,7 +33,7 @@ bool StartCpu(Cpu& cpu, ulong index, ulong startupVector)
     static const ulong ApTimeoutMs = 1000;
     static const ulong ApPollIntervalMs = 1;
 
-    Trace(0, "Cpu %u: INIT+SIPI vector 0x%p", index, startupVector);
+    Trace(0, "Cpu %lu: INIT+SIPI vector 0x%lX", index, startupVector);
 
     Lapic::SendInit(index);
     BusyWait(InitDelayMs * Const::NanoSecsInMs);
@@ -55,7 +55,7 @@ bool StartCpu(Cpu& cpu, ulong index, ulong startupVector)
         BusyWait(ApPollIntervalMs * Const::NanoSecsInMs);
     }
 
-    Trace(0, "Cpu %u still not running after %u ms", index, ApTimeoutMs);
+    Trace(0, "Cpu %lu still not running after %lu ms", index, ApTimeoutMs);
 
     return false;
 }
@@ -66,7 +66,7 @@ bool CpuTable::StartAll()
 {
     ulong startupCode = (ulong)ApStart16;
 
-    Trace(0, "Starting cpus, startupCode 0x%p", startupCode);
+    Trace(0, "Starting cpus, startupCode 0x%lX", startupCode);
 
     if (startupCode & (Const::PageSize - 1))
         return false;
@@ -87,7 +87,7 @@ bool CpuTable::StartAll()
 
         if (maxCpus != 0 && running >= maxCpus)
         {
-            Trace(0, "Cpu %u left parked, maxcpus is %u", index, maxCpus);
+            Trace(0, "Cpu %lu left parked, maxcpus is %lu", index, maxCpus);
             continue;
         }
 
@@ -97,7 +97,7 @@ bool CpuTable::StartAll()
         running++;
     }
 
-    Trace(0, "Cpus started, %u running", running);
+    Trace(0, "Cpus started, %lu running", running);
 
     return true;
 }

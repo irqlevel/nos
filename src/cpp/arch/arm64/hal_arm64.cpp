@@ -100,18 +100,18 @@ void PrintCpuInfo(Stdlib::Printer& con)
     default: break;
     }
 
-    con.Printf("implementer 0x%p (%s)\n", implementer, name);
-    con.Printf("part 0x%p variant %u revision %u, midr 0x%p\n",
+    con.Printf("implementer 0x%lX (%s)\n", implementer, name);
+    con.Printf("part 0x%lX variant %lu revision %lu, midr 0x%lX\n",
         (midr >> 4) & 0xFFF, (midr >> 20) & 0xF, midr & 0xF, midr);
 
     /* Log2 of the words in the smallest cache line, per CTR_EL0. */
-    con.Printf("cache line: i %u bytes, d %u bytes\n",
+    con.Printf("cache line: i %lu bytes, d %lu bytes\n",
         4UL << (ctr & 0xF), 4UL << ((ctr >> 16) & 0xF));
 
     /* PARange, the physical address width this core can address. */
     static const u8 ParangeBits[] = { 32, 36, 40, 42, 44, 48, 52, 56 };
     ulong parange = mmfr0 & 0xF;
-    con.Printf("physical address bits %u\n",
+    con.Printf("physical address bits %lu\n",
         (parange < Stdlib::ArraySize(ParangeBits))
             ? (ulong)ParangeBits[parange] : 0UL);
 }
@@ -120,19 +120,19 @@ void PrintCpuState(Stdlib::Printer& con)
 {
     ulong v;
     asm volatile("mrs %0, CurrentEL" : "=r"(v));
-    con.Printf("el %u sp 0x%p", v >> 2, Hal::GetSp());
+    con.Printf("el %lu sp 0x%lX", v >> 2, Hal::GetSp());
     asm volatile("mrs %0, sctlr_el1" : "=r"(v));
-    con.Printf(" sctlr 0x%p", v);
+    con.Printf(" sctlr 0x%lX", v);
     asm volatile("mrs %0, tcr_el1" : "=r"(v));
-    con.Printf(" tcr 0x%p\n", v);
+    con.Printf(" tcr 0x%lX\n", v);
     asm volatile("mrs %0, ttbr1_el1" : "=r"(v));
-    con.Printf("ttbr1 0x%p", v);
+    con.Printf("ttbr1 0x%lX", v);
     asm volatile("mrs %0, mair_el1" : "=r"(v));
-    con.Printf(" mair 0x%p", v);
+    con.Printf(" mair 0x%lX", v);
     asm volatile("mrs %0, daif" : "=r"(v));
-    con.Printf(" daif 0x%p", v);
+    con.Printf(" daif 0x%lX", v);
     asm volatile("mrs %0, vbar_el1" : "=r"(v));
-    con.Printf(" vbar 0x%p mpidr %u\n", v, Hal::GetCurrentCpuHwId());
+    con.Printf(" vbar 0x%lX mpidr %lu\n", v, Hal::GetCurrentCpuHwId());
 }
 
 void EnableWxSupport()

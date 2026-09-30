@@ -215,7 +215,7 @@ void Dmesg::Dump(Stdlib::Printer& printer, ulong lastLines, const char* filter)
 
     ulong lost = GetLost();
     if (lost != 0)
-        printer.Printf("dmesg: %u earlier lines lost\n", lost);
+        printer.Printf("dmesg: %lu earlier lines lost\n", lost);
 
     DmesgMsg* msg = (lastLines != 0) ? TailStart(lastLines) : Next(nullptr);
 

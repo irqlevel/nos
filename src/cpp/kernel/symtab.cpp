@@ -54,7 +54,7 @@ bool SymbolTable::Describe(ulong addr, char* buf, ulong size)
     ulong offset;
     if (Resolve(addr, name, offset))
     {
-        Stdlib::SnPrintf(buf, size, "%s+0x%p", name, offset);
+        Stdlib::SnPrintf(buf, size, "%s+0x%lX", name, offset);
         return true;
     }
 

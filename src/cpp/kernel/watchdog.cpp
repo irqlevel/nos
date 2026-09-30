@@ -143,7 +143,7 @@ void Watchdog::Check()
                 ulong deltaNs = CycleCounterDeltaToNs(now - lockTime);
                 if (deltaNs > timeoutNs && lock->WatchdogReported.Cmpxchg(1, 0) == 0)
                 {
-                    Trace(0, "Spinlock 0x%p is held too long %u", lock, deltaNs);
+                    Trace(0, "Spinlock 0x%p is held too long %lu", lock, deltaNs);
                 }
 
                 if (deltaNs > stuckNs && stuck == nullptr)
@@ -158,7 +158,7 @@ void Watchdog::Check()
         /* Outside the list lock: Panic prints, and printing must not run with
            this held. */
         if (stuck != nullptr)
-            Panic("Spinlock 0x%p stuck, held %u ns", (ulong)stuck, stuckHeldNs);
+            Panic("Spinlock 0x%lX stuck, held %lu ns", (ulong)stuck, stuckHeldNs);
     }
 }
 
@@ -190,9 +190,9 @@ void Watchdog::UnregisterSpinLock(RawSpinLock& lock)
 
 void Watchdog::Dump(Stdlib::Printer& printer)
 {
-    printer.Printf("locks watched: %u\n", SpinLockCounter.Get());
-    printer.Printf("table walks:   %u\n", CheckCounter.Get());
-    printer.Printf("buckets:       %u\n", (ulong)Stdlib::ArraySize(SpinLockList));
+    printer.Printf("locks watched: %lu\n", SpinLockCounter.Get());
+    printer.Printf("table walks:   %lu\n", CheckCounter.Get());
+    printer.Printf("buckets:       %lu\n", (ulong)Stdlib::ArraySize(SpinLockList));
 
     /* Which slice of the table each CPU walks. The slices have to be dense
        and disjoint, or a bucket belongs to nobody and a lock stuck in it is
@@ -202,7 +202,7 @@ void Watchdog::Dump(Stdlib::Printer& printer)
         if (CpuSlice[i].Stride == 0)
             continue;
 
-        printer.Printf("cpu %u: %u buckets, from %u every %u\n", i,
+        printer.Printf("cpu %lu: %lu buckets, from %lu every %lu\n", i,
             (ulong)((Stdlib::ArraySize(SpinLockList) - CpuSlice[i].First +
                 CpuSlice[i].Stride - 1) / CpuSlice[i].Stride),
             CpuSlice[i].First, CpuSlice[i].Stride);

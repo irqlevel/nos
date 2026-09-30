@@ -290,25 +290,25 @@ bool FbTerm::Setup(const FbInfo& info)
 
     if (info.Bpp != 32 && info.Bpp != 24 && info.Bpp != 16)
     {
-        Trace(0, "Fb: unsupported bpp %u", (ulong)info.Bpp);
+        Trace(0, "Fb: unsupported bpp %lu", (ulong)info.Bpp);
         return false;
     }
 
     if (info.Width < Font8x16Width || info.Height < Font8x16Height)
     {
-        Trace(0, "Fb: mode too small %ux%u", (ulong)info.Width, (ulong)info.Height);
+        Trace(0, "Fb: mode too small %lux%lu", (ulong)info.Width, (ulong)info.Height);
         return false;
     }
 
     if (info.PhyAddr == 0 || (info.PhyAddr & (Const::PageSize - 1)) != 0)
     {
-        Trace(0, "Fb: unaligned framebuffer 0x%p", info.PhyAddr);
+        Trace(0, "Fb: unaligned framebuffer 0x%lX", info.PhyAddr);
         return false;
     }
 
     if (info.Pitch < (ulong)info.Width * (info.Bpp / 8))
     {
-        Trace(0, "Fb: bad pitch %u for bpp %u", (ulong)info.Pitch, (ulong)info.Bpp);
+        Trace(0, "Fb: bad pitch %lu for bpp %lu", (ulong)info.Pitch, (ulong)info.Bpp);
         return false;
     }
 
@@ -321,7 +321,7 @@ bool FbTerm::Setup(const FbInfo& info)
         Mm::PageTable::MmioWriteCombining);
     if (va == 0)
     {
-        Trace(0, "Fb: can't map framebuffer 0x%p size %u", info.PhyAddr, sizeBytes);
+        Trace(0, "Fb: can't map framebuffer 0x%lX size %lu", info.PhyAddr, sizeBytes);
         return false;
     }
 
@@ -349,7 +349,7 @@ bool FbTerm::Setup(const FbInfo& info)
 
     ReadyFlag = true;
 
-    Trace(0, "Fb: %ux%u bpp %u pitch %u phys 0x%p va 0x%p grid %ux%u",
+    Trace(0, "Fb: %lux%lu bpp %lu pitch %lu phys 0x%lX va 0x%lX grid %lux%lu",
         (ulong)Width, (ulong)Height, (ulong)info.Bpp, (ulong)Pitch,
         info.PhyAddr, va, (ulong)Cols, (ulong)Rows);
 

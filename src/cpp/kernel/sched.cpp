@@ -345,7 +345,7 @@ void TaskQueue::Clear()
         task->Put();
     }
 
-    Trace(0, "TaskQueue 0x%p counters: sched %u switch context %u",
+    Trace(0, "TaskQueue 0x%p counters: sched %lu switch context %lu",
         this, ScheduleCounter.Get(), SwitchContextCounter.Get());
 }
 

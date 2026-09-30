@@ -294,9 +294,13 @@ int __UlongToString(ulong src, u8 dst_base, char *dst, size_t dst_size, bool low
 
 int UlongToString(ulong src, u8 dst_base, char *dst, size_t dst_size, bool lowercase = false);
 
-int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg);
+/* C's vsnprintf and snprintf, for the conversions d u x X p c s, the flags
+   0 and -, a width, and the length modifiers hh h l ll z (PRINTF_FORMAT).
+   What does not fit is cut, marked with "...", and the length written
+   returned. */
+PRINTF_FORMAT(3, 0) int VsnPrintf(char *s, size_t size, const char *fmt, va_list arg);
 
-int SnPrintf(char* buf, size_t size, const char* fmt, ...);
+PRINTF_FORMAT(3, 4) int SnPrintf(char* buf, size_t size, const char* fmt, ...);
 
 int StrCmp(const char *s1, const char *s2);
 

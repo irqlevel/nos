@@ -31,13 +31,11 @@ Task::Task()
     Name[0] = '\0';
 }
 
-Task::Task(const char* fmt, ...)
+Task::Task(const char* name)
     : Task()
 {
-    va_list args;
-    va_start(args, fmt);
-    Stdlib::VsnPrintf(Name, Stdlib::ArraySize(Name), fmt, args);
-    va_end(args);
+    /* Cut as a format's output is, marked where it is cut */
+    Stdlib::SnPrintf(Name, Stdlib::ArraySize(Name), "%s", name);
     Trace(TaskLL, "task 0x%p %s", this, Name);
 }
 
@@ -54,7 +52,7 @@ void Task::Release()
 
     if (StackPtr != nullptr)
     {
-        Trace(TaskLL, "task 0x%p %s free stack 0x%p",
+        Trace(TaskLL, "task 0x%p %s free stack 0x%lX",
             this, Name, (ulong)StackPtr);
         delete StackPtr;
         StackPtr = nullptr;
@@ -136,7 +134,7 @@ void Task::ExecCallback()
     if (this != curr)
     {
         DiagnoseGetCurrentTask();
-        Trace(0, "ExecCallback: this 0x%p GetCurrentTask 0x%p rsp 0x%p",
+        Trace(0, "ExecCallback: this 0x%lX GetCurrentTask 0x%lX rsp 0x%lX",
             (ulong)this, (ulong)curr, Hal::GetSp());
         BugOn(true);
     }
@@ -173,7 +171,7 @@ bool Task::PrepareStart(Func func, void* ctx)
        never touched. */
     StackProbe::Poison(&StackPtr->StackBottom[0], sizeof(StackPtr->StackBottom));
 
-    Trace(TaskLL, "task 0x%p %s stack 0x%p top 0x%p",
+    Trace(TaskLL, "task 0x%p %s stack 0x%lX top 0x%lX",
         this, Name, (ulong)StackPtr, (ulong)&StackPtr->StackTop[0]);
 
     if (!TaskTable::GetInstance().Insert(this))
@@ -281,17 +279,17 @@ void Task::DiagnoseGetCurrentTask()
     ulong rsp = Hal::GetSp();
     struct Stack* stackPtr = reinterpret_cast<struct Stack *>(rsp & (~(StackSize - 1)));
 
-    Trace(0, "DiagTask: rsp 0x%p base 0x%p", rsp, (ulong)stackPtr);
-    Trace(0, "DiagTask: Magic1 0x%p expect 0x%p", stackPtr->Magic1, StackMagic1);
-    Trace(0, "DiagTask: Magic2 0x%p expect 0x%p", stackPtr->Magic2, StackMagic2);
-    Trace(0, "DiagTask: StackBottom+page 0x%p StackTop 0x%p",
+    Trace(0, "DiagTask: rsp 0x%lX base 0x%lX", rsp, (ulong)stackPtr);
+    Trace(0, "DiagTask: Magic1 0x%lX expect 0x%lX", stackPtr->Magic1, StackMagic1);
+    Trace(0, "DiagTask: Magic2 0x%lX expect 0x%lX", stackPtr->Magic2, StackMagic2);
+    Trace(0, "DiagTask: StackBottom+page 0x%lX StackTop 0x%lX",
         (ulong)&stackPtr->StackBottom[0] + Const::PageSize,
         (ulong)&stackPtr->StackTop[0]);
 
     if (stackPtr->Magic1 == StackMagic1 && stackPtr->Magic2 == StackMagic2)
     {
         Task* task = stackPtr->Task;
-        Trace(0, "DiagTask: Task 0x%p TaskMagic 0x%p expect 0x%p",
+        Trace(0, "DiagTask: Task 0x%lX TaskMagic 0x%lX expect 0x%lX",
             (ulong)task, task->Magic, TaskMagic);
     }
 }
@@ -464,7 +462,7 @@ size_t TaskTable::SampleCpu(CpuSample* out, size_t max)
         {
             if (++walked > MaxTasksPerList)
             {
-                Trace(0, "SampleCpu: task list %u does not end after %u entries",
+                Trace(0, "SampleCpu: task list %lu does not end after %lu entries",
                     (ulong)i, (ulong)MaxTasksPerList);
                 break;
             }
@@ -504,7 +502,7 @@ void TaskTable::Stacks(Stdlib::Printer& printer, ulong& worstFree)
         {
             if (++walked > MaxTasksPerList)
             {
-                printer.Printf("task list %u does not end after %u entries\n",
+                printer.Printf("task list %lu does not end after %lu entries\n",
                     (ulong)i, (ulong)MaxTasksPerList);
                 break;
             }
@@ -514,7 +512,7 @@ void TaskTable::Stacks(Stdlib::Printer& printer, ulong& worstFree)
             if (free == 0)
                 continue;
 
-            printer.Printf("task %u %u %u %s\n", task->Pid,
+            printer.Printf("task %lu %lu %lu %s\n", task->Pid,
                 (ulong)Task::StackSize - free, (ulong)Task::StackSize, task->GetName());
 
             if (free < worstFree)
@@ -538,15 +536,15 @@ void TaskTable::Ps(Stdlib::Printer& printer)
         {
             if (++walked > MaxTasksPerList)
             {
-                printer.Printf("task list %u does not end after %u entries\n",
+                printer.Printf("task list %lu does not end after %lu entries\n",
                     (ulong)i, (ulong)MaxTasksPerList);
-                Trace(0, "Ps: task list %u does not end after %u entries",
+                Trace(0, "Ps: task list %lu does not end after %lu entries",
                     (ulong)i, (ulong)MaxTasksPerList);
                 break;
             }
 
             Task* task = CONTAINING_RECORD(currEntry, Task, TableListEntry);
-            printer.Printf("%u %u 0x%p %u.%u %u %s\n",
+            printer.Printf("%lu %lu 0x%lX %lu.%lu %lu %s\n",
                 task->Pid, task->State.Get(), task->Flags.Get(), task->Runtime.GetSecs(),
                 task->Runtime.GetUsecs(), task->ContextSwitches.Get(), task->GetName());
         }

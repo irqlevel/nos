@@ -1,6 +1,7 @@
 #pragma once
 
 #include <include/types.h>
+#include <kernel/atomic.h>
 
 namespace Kernel
 {
@@ -114,10 +115,13 @@ private:
     MemoryRegion Region[MaxRegions];
     size_t Size;
 
-    /* Index of the region that last answered IsUsableRam. A hint only: it is
-       written without a lock and bounds-checked on read, so a stale value
-       costs a full scan and never a wrong answer. */
-    size_t LastUsableRegion;
+    /* Index of the region that last answered IsUsableRam. A hint only, and
+       shared: temp mappings ask under TmpMapLock, and memcheck asks with no
+       lock at all, from any CPU. So it is an Atomic -- a plain word would
+       be a data race, however harmless its value -- and every read of it
+       is bounds-checked: a stale value costs a full scan, never a wrong
+       answer. */
+    Atomic LastUsableRegion;
 };
 
 }

@@ -467,7 +467,7 @@ void Pci::Scan()
                 u16 progIf = GetProgIF(bus, slot, function);
                 u16 revId = GetRevisionID(bus, slot, function);
 
-                Trace(0, "vnd %s(0x%p) dev %s(0x%p) %s(0x%p) %s(0x%p) p 0x%p r 0x%p",
+                Trace(0, "vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX",
                     VendorToStr(vendor), (ulong)vendor, DeviceToStr(vendor, device), (ulong)device, ClassToStr(cls), (ulong)cls, SubClassToStr(cls, scls), (ulong)scls, (ulong)progIf, (ulong)revId);
 
                 if (DeviceCount < MaxDevices)
@@ -525,7 +525,7 @@ void Pci::Dump(Stdlib::Printer& printer)
         if (!d.Valid)
             continue;
 
-        printer.Printf("vnd %s(0x%p) dev %s(0x%p) %s(0x%p) %s(0x%p) p 0x%p r 0x%p\n",
+        printer.Printf("vnd %s(0x%lX) dev %s(0x%lX) %s(0x%lX) %s(0x%lX) p 0x%lX r 0x%lX\n",
             VendorToStr(d.Vendor), (ulong)d.Vendor, DeviceToStr(d.Vendor, d.Device), (ulong)d.Device, ClassToStr(d.Class), (ulong)d.Class, SubClassToStr(d.Class, d.SubClass), (ulong)d.SubClass, (ulong)d.ProgIF, (ulong)d.RevisionID);
     }
 }

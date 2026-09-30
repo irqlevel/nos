@@ -59,9 +59,9 @@ public:
         return Instance;
     }
 
-    void Output(const char *fmt, ...);
+    PRINTF_FORMAT(2, 3) void Output(const char *fmt, ...);
 
-    void Output(Stdlib::Error& err, const char *fmt, ...);
+    PRINTF_FORMAT(3, 4) void Output(Stdlib::Error& err, const char *fmt, ...);
 
     void SetLevel(int level);
 
@@ -92,8 +92,8 @@ do {                                                                \
     if (unlikely((level) <= tracer.GetLevel()))                     \
     {                                                               \
         auto time = Kernel::GetBootTime();                          \
-        tracer.Output("%u:%u.%06u:%s(),%s,%u: " fmt "\n",            \
-            (level), time.GetSecs(), time.GetUsecs(),               \
+        tracer.Output("%lu:%lu.%06lu:%s(),%s,%lu: " fmt "\n",        \
+            (ulong)(level), time.GetSecs(), time.GetUsecs(),        \
             __func__, Stdlib::TruncateFileName(__FILE__),           \
             (ulong)__LINE__, ##__VA_ARGS__);                        \
     }                                                               \
@@ -105,8 +105,8 @@ do {                                                                \
     if (unlikely(0 <= tracer.GetLevel()))                           \
     {                                                               \
         auto time = Kernel::GetBootTime();                          \
-        tracer.Output("%u:%u.%06u:%s(),%s,%u: Error %u at %s(),%s,%u: " fmt "\n",   \
-            0, time.GetSecs(), time.GetUsecs(),                     \
+        tracer.Output("%lu:%lu.%06lu:%s(),%s,%lu: Error %lu at %s(),%s,%lu: " fmt "\n",   \
+            0UL, time.GetSecs(), time.GetUsecs(),                   \
             __func__, Stdlib::TruncateFileName(__FILE__),           \
             (ulong)__LINE__, (ulong)err.GetCode(), err.GetFunc(), Stdlib::TruncateFileName(err.GetFile()),  \
             (ulong)err.GetLine(), ##__VA_ARGS__);                                  \
