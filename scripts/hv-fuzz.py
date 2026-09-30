@@ -5,7 +5,7 @@ A guest decides every value the hypervisor's devices are handed -- every
 port it writes, every MSR, every byte of its virtio rings and MSI-X tables,
 the instruction behind an MMIO fault -- and so a panic, an overflow or a
 loop that never ends in any of them is one a guest can cause, on the host,
-under everyone else's guests. scripts/hv-fuzz is a host program built from
+under everyone else's guests. fuzz/hv is a host program built from
 the hypervisor's own sources (src/rust/hv/src/{devices/*,lapic,acpi,insn,
 walk,linux,mmio,policy,smp,run}.rs, hvarch's VMCB layout, the module's
 switch and DHCP server, src/rust/modules/hv/src/{net,dhcp}.rs, and NAT,
@@ -52,7 +52,7 @@ GATE_ITERATIONS = '50000'
 def main():
     args = sys.argv[1:]
     build = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',
-                            '--manifest-path', os.path.join(HERE, 'hv-fuzz', 'Cargo.toml'),
+                            '--manifest-path', os.path.join(ROOT, 'fuzz', 'hv', 'Cargo.toml'),
                             '--target-dir', OUT])
     if build.returncode != 0:
         print('hv-fuzz: the build failed')

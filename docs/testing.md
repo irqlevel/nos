@@ -347,7 +347,7 @@ port it writes and how wide, every MSR, every byte of its virtio rings and
 MSI-X tables, the instruction behind an MMIO fault, when it halts and with
 what masked -- so a panic, an overflow or a loop that never ends anywhere in
 them is one a guest can cause, on the host, under everyone else's guests.
-`scripts/hv-fuzz` is a host program built from the hypervisor's own sources
+`fuzz/hv` is a host program built from the hypervisor's own sources
 as they are -- `hv/src/devices/*`, `lapic`, `acpi`, `insn`, `walk`,
 `linux`, `mmio`, `policy`, `smp` and `run`, hvarch's VMCB layout, the
 module's switch and DHCP server (`modules/hv/src/{net,dhcp}.rs`) and NAT
@@ -467,7 +467,7 @@ every frame on the wire, every answer a server gives the HTTP client, the
 DHCP client and the resolver, every byte an SSH client sends the server --
 so a panic, an overflow, a lock broken or a loop that never ends anywhere on
 those paths is one somebody else can cause, and on the Hetzner boxes the
-network is the only console there is. `scripts/net-fuzz` is a host program
+network is the only console there is. `fuzz/net` is a host program
 built from the kernel's own crates as they are -- `net`, `netwire`, `tls`,
 `fs`, `ssh` and the sshd module's source, over `kcore` and `ffi` -- linked
 with the rest of a kernel written for the purpose (`src/machine/`): its C++
