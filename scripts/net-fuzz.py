@@ -5,7 +5,7 @@ Everything the network hands the kernel is somebody else's to choose --
 every frame on the wire, every answer a server gives the HTTP client, the
 DHCP client and the resolver, every byte an SSH client sends the server --
 so a panic, an overflow, a lock broken or a loop that never ends anywhere on
-those paths is one somebody else can cause. scripts/net-fuzz is a host
+those paths is one somebody else can cause. fuzz/net is a host
 program built from the kernel's own crates -- `net` (Ethernet, ARP, IPv4,
 ICMP, UDP, TCP, DHCP, DNS, the HTTP client, the UDP shell, netconsole),
 `tls`, `fs`, `ssh` and the sshd module's source, over `kcore` and `ffi` as
@@ -74,7 +74,7 @@ def main():
     # for the kernel -- and makes any build under it a kernel build -- so it
     # is said here, and cargo is run from the root.
     build = subprocess.run(['cargo', 'build', '--release', '--offline', '--quiet',
-                            '--manifest-path', os.path.join(HERE, 'net-fuzz', 'Cargo.toml'),
+                            '--manifest-path', os.path.join(ROOT, 'fuzz', 'net', 'Cargo.toml'),
                             '--target-dir', OUT,
                             '--config', 'source.crates-io.replace-with="vendored-sources"',
                             '--config', 'source.vendored-sources.directory="%s"' % VENDOR,

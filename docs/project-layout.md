@@ -50,6 +50,7 @@ src/rust/
   rust-toolchain.toml  The dated nightly everything is built with
 build/        Linker scripts, GRUB configs, the awk script that makes the module export table
 scripts/      Build, run, debug and GDB helpers, and the gates (docs/testing.md)
+fuzz/         The fuzzers, host programs built from the kernel's own sources and run by their gates in scripts/: hv/ (the hypervisor's devices, its run loop, the guests' switch and NAT; hv-fuzz.py) and net/ (the network layer, TLS and sshd, against a model of the world around the machine; net-fuzz.py). Outside src/rust, whose .cargo/config.toml would make any cargo build under it a kernel build
 docs/         This directory
 plans/        The roadmap
 ```
