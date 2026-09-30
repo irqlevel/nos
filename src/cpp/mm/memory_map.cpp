@@ -19,6 +19,23 @@ MemoryMap::MemoryMap()
 
 bool MemoryMap::AddRegion(ulong addr, ulong len, ulong type)
 {
+    if (len == 0)
+        return true;
+
+    if (addr >= MaxPhysAddr)
+    {
+        Trace(0, "mm: region 0x%p len 0x%p type %u is past the physical address space, dropped",
+            addr, len, type);
+        return true;
+    }
+
+    if (len > MaxPhysAddr - addr)
+    {
+        Trace(0, "mm: region 0x%p len 0x%p type %u reaches past the physical address space, cut at 0x%p",
+            addr, len, type, MaxPhysAddr);
+        len = MaxPhysAddr - addr;
+    }
+
     if (Size >= Stdlib::ArraySize(Region))
         return false;
 
@@ -30,47 +47,6 @@ bool MemoryMap::AddRegion(ulong addr, ulong len, ulong type)
     Size++;
 
     return true;
-}
-
-bool MemoryMap::FindRegion(ulong base, ulong limit, ulong& start, ulong& end)
-{
-    start = 0;
-    end = 0;
-    for (size_t i = 0; i < Size; i++)
-    {
-        auto& region = Region[i];
-        if (region.Type != UsableRamType)
-            continue;
-
-        if (region.Len == 0)
-            continue;
-
-        if (region.Addr + region.Len <= base)
-            continue;
-
-        ulong regionBase = (region.Addr < base) ? base : region.Addr;
-        ulong regionLength = (region.Addr < base) ?
-            (region.Len - (base - region.Addr)) : region.Len;
-
-        if ((regionBase + regionLength) > limit)
-        {
-            if (regionBase >= limit)
-                continue;
-
-            regionLength = limit - regionBase;
-        }
-
-        if ((end - start) < regionLength)
-        {
-            start = regionBase;
-            end = regionBase + regionLength;
-        }
-    }
-
-    if (end > start && start != 0)
-        return true;
-
-    return false;
 }
 
 MemoryMap::~MemoryMap()
@@ -90,6 +66,9 @@ ulong MemoryMap::GetKernelEnd()
 
 bool MemoryMap::IsReserved(ulong phyAddr, ulong len)
 {
+    /* Up to the top of the space, for a range the caller let run past it */
+    const ulong end = (len > ~0UL - phyAddr) ? ~0UL : phyAddr + len;
+
     for (size_t i = 0; i < Size; i++)
     {
         auto& region = Region[i];
@@ -97,7 +76,7 @@ bool MemoryMap::IsReserved(ulong phyAddr, ulong len)
             continue;
 
         if (phyAddr < (region.Addr + region.Len) &&
-            region.Addr < (phyAddr + len))
+            region.Addr < end)
             return true;
     }
 
@@ -176,10 +155,14 @@ ulong MemoryMap::GetReservedEnd(ulong phyAddr)
 {
     ulong end = 0;
 
+    /* Nothing is there to reserve (AddRegion) */
+    if (phyAddr >= MaxPhysAddr)
+        return 0;
+
     for (size_t i = 0; i < Size; i++)
     {
         auto& region = Region[i];
-        if (region.Type == UsableRamType || region.Len == 0)
+        if (region.Type == UsableRamType)
             continue;
 
         /* The overlap test IsReserved does, for the page at phyAddr. */
@@ -205,7 +188,7 @@ ulong MemoryMap::GetNextReservedStart(ulong phyAddr, ulong limit)
     for (size_t i = 0; i < Size; i++)
     {
         auto& region = Region[i];
-        if (region.Type == UsableRamType || region.Len == 0)
+        if (region.Type == UsableRamType)
             continue;
 
         /* Rounded down: a region starting mid-page makes that whole page

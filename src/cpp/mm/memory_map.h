@@ -19,9 +19,18 @@ public:
     }
     ~MemoryMap();
 
+    /* A region as the firmware reported it, or one the kernel carves out;
+       false only when the map has no room left. A firmware's map is
+       whatever it says, so the region is kept as the map can answer for
+       it: an empty one is dropped, and one reaching past MaxPhysAddr is
+       cut there -- or dropped, if it starts past it -- which leaves every
+       Addr + Len in the map at most MaxPhysAddr, and no query's arithmetic
+       able to wrap. */
     bool AddRegion(ulong addr, ulong len, ulong type);
 
-    bool FindRegion(ulong base, ulong limit, ulong& start, ulong& end);
+    /* No CPU either arch runs on has a physical address past 52 bits
+       (x86's MAXPHYADDR, arm64 with LPA), so no RAM or device is there. */
+    static const ulong MaxPhysAddr = 1UL << 52;
 
     ulong GetKernelStart();
 

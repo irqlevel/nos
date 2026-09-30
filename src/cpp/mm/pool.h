@@ -44,6 +44,14 @@ private:
     /* Tag stamped on freed blocks to detect double-free */
     static const ulong FreedTag = 0xF7EEF7EEF7EEF7EEUL;
 
+    /* A page from the page allocator, its blocks threaded on its list;
+       nullptr if there is none. Called without Lock. */
+    Page* NewPage();
+
+    /* A block off the first page on FreePageList, which is not empty. Lock
+       must be held. */
+    void* TakeBlockLocked(ulong tag);
+
     size_t BlockSize;
     ListEntry FreePageList;
     ListEntry PageList;

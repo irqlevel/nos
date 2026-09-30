@@ -211,7 +211,12 @@ in `x0`, MMU off, at the load address.
 the EL1 vectors, poisons the boot stack, and parses the device tree
 (`Board::Setup`) for memory regions, the CPU list, the PL011, the GIC
 distributor/redistributors, the ITS, the virtio-mmio slots, the PCIe ECAM
-window and the kernel command line. `TPIDR_EL1` is then re-seeded with this
+window and the kernel command line. It takes of the tree only what the
+kernel can act on -- register windows the linear map reaches, interrupts
+its 256-entry table can take, bus numbers that are bus numbers -- and every
+read of a property is bounded by the property's length (`Fdt::Prop`); what
+it refuses is left to the QEMU virt fallbacks and counted, and the boot
+says how many (`dtb: N values refused`). `TPIDR_EL1` is then re-seeded with this
 CPU's *linear* index from the DTB CPU list — `boot.S` could only guess
 MPIDR.Aff0, which is right on QEMU virt and wrong on clustered-affinity
 hardware.

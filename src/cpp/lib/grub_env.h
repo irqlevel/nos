@@ -55,12 +55,20 @@ public:
        block is unchanged then. */
     bool Set(const char* name, const char* value);
 
-    /* Remove a variable; false when it was not set. */
+    /* Remove a variable; false when it was not set, or the block is
+       malformed, and the block is unchanged then. */
     bool Unset(const char* name);
 
     /* Visit every variable in order; the visitor returns false to stop.
-       Returns false when the block is malformed -- a line without '=' or
-       without a newline before the end -- and stops there. */
+       Returns false when the block is malformed and stops there: a line
+       that is not a comment and has no '=' before its end, a name longer
+       than MaxNameLen or holding a backslash or a NUL, a value without a
+       newline before the end of the block. A block is malformed by the same
+       rules for Set and Unset, which find a variable's line on their own:
+       over those lines the two ways of reading the block could not agree on
+       where a line starts -- a line without '=' would lend its text to the
+       next one's name -- so a Set could say yes to what Get and GRUB then
+       read as something else. */
     typedef bool (*Visitor)(const char* name, const char* value, void* ctx);
     bool ForEach(Visitor visitor, void* ctx);
 
@@ -79,6 +87,15 @@ private:
     /* Where the '#' padding at the end begins; false when what precedes it
        is not a newline, which is a block GRUB will not write to either */
     bool FreeSpace(ulong& space);
+
+    /* The variable line at pos, as ForEach reads it: where its name ends
+       and where the line after it begins, before limit; false when it is not
+       one (ForEach says what that is) */
+    bool ParseLine(ulong pos, ulong limit, ulong& nameEnd, ulong& next);
+
+    /* Every line before limit a comment, a blank or a variable line, the
+       last of them ending exactly there */
+    bool WellFormed(ulong limit);
 
     static bool ValidName(const char* name);
     static ulong EscapedLen(const char* value);

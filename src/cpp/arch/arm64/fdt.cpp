@@ -98,6 +98,12 @@ bool Fdt::Setup(const void* dtb)
     StringsOff = Be32(&hdr.OffDtStrings);
     StringsSize = Be32(&hdr.SizeDtStrings);
 
+    /* The blob's own size is the one thing nothing else can check, so it
+       is held to what the boot protocol allows: the walkers read no byte
+       past it, and the memory map reserves exactly that much */
+    if (TotalSize < sizeof(FdtHeader) || TotalSize > MaxSize)
+        return false;
+
     /* A truncated/corrupt header must not steer the walkers out of the
        blob; every later bound derives from these */
     if (StructOff > TotalSize || StructSize > TotalSize - StructOff ||
@@ -148,11 +154,12 @@ bool Fdt::NextNode(Node& node)
             if (depth + 1 >= MaxDepth)
                 return false;
             depth++;
-            /* Children inherit the parent's cells until overridden */
+            /* Children inherit the parent's cells until overridden. depth is
+               the root's 0 at least: an END_NODE with none open is refused */
             if (depth + 1 < MaxDepth)
             {
-                AddressCellsStack[depth + 1] = (depth >= 0) ? AddressCellsStack[depth] : 2;
-                SizeCellsStack[depth + 1] = (depth >= 0) ? SizeCellsStack[depth] : 1;
+                AddressCellsStack[depth + 1] = AddressCellsStack[depth];
+                SizeCellsStack[depth + 1] = SizeCellsStack[depth];
             }
 
             node.Name = name;
@@ -162,18 +169,22 @@ bool Fdt::NextNode(Node& node)
             node.SizeCells = SizeCellsStack[depth];
 
             /* Peek this node's #address-cells/#size-cells for its children */
-            u32 len;
-            const void* p = GetProp(node, "#address-cells", len);
-            if (p != nullptr && len == 4 && depth + 1 < MaxDepth)
-                AddressCellsStack[depth + 1] = Be32(p);
-            p = GetProp(node, "#size-cells", len);
-            if (p != nullptr && len == 4 && depth + 1 < MaxDepth)
-                SizeCellsStack[depth + 1] = Be32(p);
+            u32 cells;
+            Prop prop = GetProp(node, "#address-cells");
+            if (prop.Length() == 4 && prop.Cell(0, cells) && depth + 1 < MaxDepth)
+                AddressCellsStack[depth + 1] = cells;
+            prop = GetProp(node, "#size-cells");
+            if (prop.Length() == 4 && prop.Cell(0, cells) && depth + 1 < MaxDepth)
+                SizeCellsStack[depth + 1] = cells;
 
             return true;
         }
         else if (tok == TokEndNode)
         {
+            /* One more end than there were beginnings: no node is open to
+               end, and the cell stacks have no entry below the root's */
+            if (depth < 0)
+                return false;
             depth--;
             off += 4;
         }
@@ -199,16 +210,15 @@ bool Fdt::NextNode(Node& node)
     return false;
 }
 
-const void* Fdt::GetProp(const Node& node, const char* name, u32& lenOut)
+Fdt::Prop Fdt::GetProp(const Node& node, const char* name)
 {
-    lenOut = 0;
     if (!Valid)
-        return nullptr;
+        return Prop();
 
     /* Properties come right after BEGIN_NODE + name, before any subnode */
     ulong nameLen = BoundedNameLen(node.Offset + 4);
     if (nameLen == (ulong)-1)
-        return nullptr;
+        return Prop();
     ulong off = node.Offset + 4 + AlignUp4(nameLen + 1);
     ulong limit = StructOff + StructSize;
 
@@ -218,16 +228,13 @@ const void* Fdt::GetProp(const Node& node, const char* name, u32& lenOut)
         if (tok == TokProp)
         {
             if (off + 12 > limit)
-                return nullptr;
+                return Prop();
             u32 len = Be32(Base + off + 4);
             u32 nameOff = Be32(Base + off + 8);
             if (len > limit - off - 12)
-                return nullptr; /* value would run past the struct block */
+                return Prop(); /* value would run past the struct block */
             if (StringMatches(nameOff, name))
-            {
-                lenOut = len;
-                return Base + off + 12;
-            }
+                return Prop(Base + off + 12, len);
             off += 12 + AlignUp4(len);
         }
         else if (tok == TokNop)
@@ -237,42 +244,52 @@ const void* Fdt::GetProp(const Node& node, const char* name, u32& lenOut)
         else
         {
             /* BEGIN_NODE (subnode), END_NODE or END: no more properties */
-            return nullptr;
+            return Prop();
         }
     }
-    return nullptr;
+    return Prop();
 }
 
-const char* Fdt::GetPropString(const Node& node, const char* name)
+bool Fdt::Prop::Cell(ulong index, u32& value) const
 {
-    u32 len;
-    const void* p = GetProp(node, name, len);
-    if (p == nullptr || len == 0)
+    if (Data == nullptr || index >= Len / 4)
+        return false;
+
+    value = Be32(Data + index * 4);
+    return true;
+}
+
+bool Fdt::Prop::Cells(ulong index, u32 count, u64& value) const
+{
+    /* Two cells are a u64; a third would be shifted out without a word */
+    static const u32 MaxCells = 2;
+
+    if (Data == nullptr || count > MaxCells || index > Len / 4 || count > Len / 4 - index)
+        return false;
+
+    value = 0;
+    for (u32 i = 0; i < count; i++)
+        value = (value << 32) | Be32(Data + (index + i) * 4);
+    return true;
+}
+
+const char* Fdt::Prop::String() const
+{
+    if (Data == nullptr || Len == 0 || Data[Len - 1] != '\0')
         return nullptr;
-    return static_cast<const char*>(p);
-}
 
-u64 Fdt::ReadCells(const void* prop, ulong index, u32 cellCount)
-{
-    const u8* p = static_cast<const u8*>(prop) + index * cellCount * 4;
-    u64 val = 0;
-    for (u32 i = 0; i < cellCount; i++)
-    {
-        val = (val << 32) | Be32(p + i * 4);
-    }
-    return val;
+    return reinterpret_cast<const char*>(Data);
 }
 
 bool Fdt::IsCompatible(const Node& node, const char* compat)
 {
-    u32 len;
-    const void* p = GetProp(node, "compatible", len);
-    if (p == nullptr)
-        return false;
+    Prop prop = GetProp(node, "compatible");
 
-    const char* s = static_cast<const char*>(p);
-    if (len == 0 || s[len - 1] != '\0')
-        return false; /* a compatible list is NUL-terminated by definition */
+    /* A compatible list is NUL-terminated by definition */
+    const char* s = prop.String();
+    if (s == nullptr)
+        return false;
+    const ulong len = prop.Length();
 
     ulong pos = 0;
     while (pos < len)
