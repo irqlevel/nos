@@ -1,0 +1,54 @@
+# The network layer fuzzed on the host: the kernel's own Rust crates --
+# `net` (Ethernet, ARP, IP, ICMP, UDP, TCP, DHCP, DNS, HTTP, the UDP shell,
+# netconsole), `tls`, `fs` (a ramfs root for sshd), `ssh` and the sshd
+# module's source, over `kcore` and `ffi` as they are -- linked into a host
+# program that is the rest of the kernel: the C++ half the `ffi` crate
+# declares (locks, tasks, timers, soft IRQs, the clock, the command table), a
+# NIC, and the network around the machine. scripts/net-fuzz.py builds and
+# runs it.
+[package]
+name = "net-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The kernel's crates, built for the host as they are for the kernel.
+ffi = { path = "../../src/rust/ffi" }
+kcore = { path = "../../src/rust/kcore" }
+netwire = { path = "../../src/rust/netwire" }
+net = { path = "../../src/rust/net" }
+tls = { path = "../../src/rust/tls" }
+fs = { path = "../../src/rust/fs" }
+ssh = { path = "../../src/rust/ssh" }
+# What the sshd module's source needs of a module's runtime.
+kmod = { path = "standins/kmod" }
+# The other end of the protocols the kernel speaks: the fuzzer's TLS server
+# and SSH client. The features are the kernel's own, so that the crates the
+# two share are built the same.
+rustls = { version = "0.23", default-features = false, features = ["custom-provider", "tls12", "hashbrown"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc", "tls12"] }
+x25519-dalek = { version = "2", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+chacha20 = { version = "0.9", default-features = false }
+poly1305 = { version = "0.8", default-features = false }
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+# Three crates.io crates stood in for, each for a reason its manifest gives:
+# randomness that is the input's, so a run is the same every time; no CPU
+# features, the kernel's software backends; and a CA the fuzzer's server can
+# present a certificate from.
+[patch.crates-io]
+getrandom = { path = "standins/getrandom" }
+cpufeatures = { path = "standins/cpufeatures" }
+webpki-roots = { path = "standins/webpki-roots" }
+
+# What a RUSTUB=1 kernel has on, in every crate: an overflow is a panic, not
+# a wrap, and core's checks of its own unsafe preconditions are made.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+# Line tables, for a replay's backtrace.
+debug = "line-tables-only"
+
+[workspace]

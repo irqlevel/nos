@@ -234,6 +234,9 @@ enum ChunkState {
     DataEnd,
     /// The zero-size chunk arrived
     Done,
+    /// The framing is not chunking: a size line with no digits, or a size
+    /// larger than any body. Nothing more is read, and the body is short.
+    Broken,
 }
 
 /// The chunk framing (RFC 9112 7.1), decoded as the bytes arrive: the body
@@ -250,7 +253,14 @@ impl ChunkDecoder {
         ChunkDecoder { state: ChunkState::Size, remaining: 0, saw_digit: false }
     }
 
+    /// Nothing more is to be read: the last chunk came, or the framing
+    /// broke.
     fn done(&self) -> bool {
+        matches!(self.state, ChunkState::Done | ChunkState::Broken)
+    }
+
+    /// The last chunk came: the body is whole.
+    fn whole(&self) -> bool {
         self.state == ChunkState::Done
     }
 
@@ -258,7 +268,7 @@ impl ChunkDecoder {
     fn feed(&mut self, src: &[u8], out: &mut BodyWriter) -> bool {
         let mut at = 0;
 
-        while at < src.len() && self.state != ChunkState::Done {
+        while at < src.len() && !self.done() {
             match self.state {
                 ChunkState::Size => {
                     let digit = match src[at] {
@@ -272,12 +282,22 @@ impl ChunkDecoder {
                             self.state = if self.saw_digit {
                                 ChunkState::Ext
                             } else {
-                                ChunkState::Done
+                                ChunkState::Broken
                             };
                             continue;
                         }
                     };
-                    self.remaining = self.remaining * 16 + digit;
+                    /* A size is the server's to write: one past what a
+                     * size can be is garbage too, not a number to wrap --
+                     * a panic, with the overflow checks a RUSTUB=1 kernel
+                     * has on. */
+                    match self.remaining.checked_mul(16).and_then(|r| r.checked_add(digit)) {
+                        Some(r) => self.remaining = r,
+                        None => {
+                            self.state = ChunkState::Broken;
+                            continue;
+                        }
+                    }
                     self.saw_digit = true;
                     at += 1;
                 }
@@ -312,7 +332,7 @@ impl ChunkDecoder {
                         self.state = ChunkState::Size;
                     }
                 }
-                ChunkState::Done => {}
+                ChunkState::Done | ChunkState::Broken => {}
             }
         }
 
@@ -405,7 +425,7 @@ impl<'a> Body<'a> {
             return false;
         }
         match self.decoder.as_ref() {
-            Some(decoder) => decoder.done(),
+            Some(decoder) => decoder.whole(),
             None => self.content_length == 0 || self.writer.written >= self.content_length,
         }
     }
@@ -451,8 +471,10 @@ fn parse_url(url: &[u8]) -> Option<Url> {
         at = 7;
     }
 
+    /* The authority ends at the path, the port -- or the query, a URL's
+     * path being allowed to be empty (RFC 3986 3.3). */
     let host_start = at;
-    while at < url.len() && url[at] != b'/' && url[at] != b':' {
+    while at < url.len() && url[at] != b'/' && url[at] != b':' && url[at] != b'?' {
         at += 1;
     }
     let host_len = at - host_start;
@@ -464,25 +486,41 @@ fn parse_url(url: &[u8]) -> Option<Url> {
 
     if at < url.len() && url[at] == b':' {
         at += 1;
+        /* Refused as soon as it is past what a port can be: a redirect's
+         * target is the server's to write, and a number longer than any
+         * port would not stop at wrapping round. Nothing but the path or
+         * the query may follow it, either: "80x" is no port. */
         let mut port = 0u32;
         while at < url.len() && url[at].is_ascii_digit() {
             port = port * 10 + (url[at] - b'0') as u32;
+            if port > 65535 {
+                return None;
+            }
             at += 1;
         }
-        if port == 0 || port > 65535 {
+        if port == 0 || (at < url.len() && url[at] != b'/' && url[at] != b'?') {
             return None;
         }
         out.port = port as u16;
     }
 
     /* The path, query included. Never cut short: a truncated path is a
-     * different resource. */
+     * different resource -- as is one whose query was left behind: an empty
+     * path in front of a query is "/". */
     if at < url.len() && url[at] == b'/' {
         let len = url.len() - at;
         if len >= MAX_URL_LEN {
             return None;
         }
         out.path[..len].copy_from_slice(&url[at..]);
+        out.path_len = len;
+    } else if at < url.len() {
+        let len = url.len() - at + 1;
+        if len >= MAX_URL_LEN {
+            return None;
+        }
+        out.path[0] = b'/';
+        out.path[1..len].copy_from_slice(&url[at..]);
         out.path_len = len;
     } else {
         out.path[0] = b'/';
@@ -523,8 +561,12 @@ fn send_request(transport: &mut Transport, url: &Url) -> bool {
     transport.send(&request)
 }
 
-/// The status code off the status line.
+/// The status code off the status line: its three digits (RFC 9112 4),
+/// or 0 for a line that has no such code -- a number of any other length
+/// is not one, and one longer than an `i32` would not stop at wrapping.
 fn parse_status(buf: &[u8]) -> i32 {
+    const DIGITS: usize = 3;
+
     let mut at = 0;
     while at < buf.len() && buf[at] != b' ' {
         at += 1;
@@ -533,12 +575,11 @@ fn parse_status(buf: &[u8]) -> i32 {
         at += 1;
     }
 
-    let mut status = 0;
-    while at < buf.len() && buf[at].is_ascii_digit() {
-        status = status * 10 + (buf[at] - b'0') as i32;
-        at += 1;
+    let digits = buf[at.min(buf.len())..].iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits != DIGITS {
+        return 0;
     }
-    status
+    buf[at..at + DIGITS].iter().fold(0, |status, &b| status * 10 + (b - b'0') as i32)
 }
 
 /// The response, with the body handed to the sink as it arrives. `location`
@@ -591,20 +632,19 @@ fn recv_response(
         return None;
     }
 
-    resp.status = parse_status(&buf[..total]);
-
     let header_end = match header_end {
         Some(end) => end,
         None => {
-            /* The peer hung up before the headers ended: what arrived is
-             * all there is, and it is the body. */
-            resp.body_len = sink.take(&buf[..total]);
-            resp.content_length = resp.body_len;
-            resp.truncated = 1;
-            resp.ok = 1;
-            return Some(0);
+            /* The peer hung up before the headers ended: that is no answer.
+             * Taken for the body, a response cut in its headers -- by the
+             * connection, or by a TLS session that broke -- came out as a
+             * body made of its own status line, and "ok". */
+            trace!(0, "http: the connection ended inside the headers, {} bytes in", total);
+            return None;
         }
     };
+
+    resp.status = parse_status(&buf[..header_end]);
 
     let headers = &buf[..header_end];
     resp.content_length = header_number(headers, b"Content-Length:");

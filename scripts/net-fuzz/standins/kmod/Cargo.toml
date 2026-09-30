@@ -1,0 +1,14 @@
+# kmod, as the fuzzer builds a module's source: `Module` and `module!`, and
+# the init that `module!` names made something the fuzzer calls in place of
+# `insmod` -- dropping what it returns is the fuzzer's `rmmod`. The real
+# crate is a module's allocator and panic handler, which a host program has
+# of its own, and needs a nightly for them.
+[package]
+name = "kmod"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+
+[dependencies]
+kcore = { path = "../../../../src/rust/kcore" }

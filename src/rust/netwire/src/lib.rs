@@ -98,6 +98,28 @@ pub fn parse_ipv4(text: &[u8]) -> Option<u32> {
     Some((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
 }
 
+/* ---- what an address may be ---- */
+
+/// Whether a packet may go to `addr` at all (RFC 1122 3.2.1.3): not "this
+/// network" (0/8), not a loopback address (127/8), which must never appear
+/// outside a host, and not a reserved one (240/4) -- the limited broadcast
+/// aside. A multicast group may be sent to.
+#[inline]
+pub fn deliverable(addr: u32) -> bool {
+    let first = addr >> 24;
+    first != 0 && first != 127 && (addr < 0xF000_0000 || addr == u32::MAX)
+}
+
+/// Whether a host may have `addr` on a subnet of `mask` (RFC 1122 3.2.1.3):
+/// not "this network", not loopback, not a multicast or reserved address,
+/// and not the subnet's broadcast when it has one -- a subnet of one or two
+/// addresses does not. A mask of 0 is a subnet not known.
+#[inline]
+pub fn host_address(addr: u32, mask: u32) -> bool {
+    let first = addr >> 24;
+    first != 0 && first != 127 && addr < 0xE000_0000 && !(mask.count_zeros() >= 2 && addr | mask == u32::MAX)
+}
+
 /* ---- scalars ---- */
 
 #[inline]

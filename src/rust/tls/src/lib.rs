@@ -161,13 +161,13 @@ impl<T: Transport> TlsStream<T> {
         })
     }
 
-    /* Reads one socketful of TLS bytes into `incoming`. False on EOF or
-       error, which ends the connection either way. */
-    fn fill(&mut self) -> bool {
+    /* Reads one socketful of TLS bytes into `incoming`: what the socket
+       said -- how many, 0 at its end, negative for an error or a timeout.
+       A record larger than the buffer is an error too: the peer is not
+       speaking TLS the way we can follow. */
+    fn fill(&mut self) -> isize {
         if self.incoming_used == self.incoming.len() {
-            /* A record larger than the buffer: the peer is not speaking TLS
-               the way we can follow. */
-            return false;
+            return -1;
         }
 
         let got = self
@@ -175,11 +175,11 @@ impl<T: Transport> TlsStream<T> {
             .recv(&mut self.incoming[self.incoming_used..], IO_TIMEOUT_MS);
         if got <= 0 {
             trace!(0, "tls: receive ended: {}", got);
-            return false;
+            return got;
         }
 
         self.incoming_used += got as usize;
-        true
+        got
     }
 
     /* One turn of the state machine. `app_out`, if any, is application data
@@ -269,7 +269,8 @@ impl<T: Transport> TlsStream<T> {
                 }
                 Step::Ready
             }
-            ConnectionState::Closed => Step::Closed,
+            /* The peer's close_notify: nothing more will come. */
+            ConnectionState::Closed | ConnectionState::PeerClosed => Step::Closed,
             _ => Step::Progress,
         };
 
@@ -287,7 +288,7 @@ impl<T: Transport> TlsStream<T> {
             match self.step(&mut nothing) {
                 Some(Step::Ready) => return true,
                 Some(Step::NeedRead) => {
-                    if !self.fill() {
+                    if self.fill() <= 0 {
                         self.failed = true;
                         return false;
                     }
@@ -320,7 +321,7 @@ impl<T: Transport> TlsStream<T> {
                     }
                 }
                 Some(Step::NeedRead) => {
-                    if !self.fill() {
+                    if self.fill() <= 0 {
                         self.failed = true;
                         return -1;
                     }
@@ -368,12 +369,22 @@ impl<T: Transport> TlsStream<T> {
                 /* Ready means the session is up with nothing decrypted
                    pending: like NeedRead, the next thing to do is listen. */
                 Some(Step::NeedRead) | Some(Step::Ready) => {
-                    if !self.fill() {
+                    match self.fill() {
+                        got if got > 0 => {}
                         /* EOF without close_notify is how many servers end
                            a Connection: close response. The caller sees a
                            clean end of stream, and the HTTP framing above
-                           decides whether that was short. */
-                        self.closed = true;
+                           decides whether that was short -- when it comes
+                           between two records. Inside one, the stream was
+                           cut: a record's worth of it is missing. */
+                        0 if self.incoming_used == 0 => self.closed = true,
+                        /* A timeout, a reset, a record cut short: not the
+                           end of the stream, which a caller would take for
+                           the whole of a body with no length. */
+                        _ => {
+                            self.failed = true;
+                            return -1;
+                        }
                     }
                 }
                 Some(Step::Closed) => {

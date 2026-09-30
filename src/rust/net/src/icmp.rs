@@ -14,7 +14,7 @@ use kcore::trace;
 
 use crate::arp::ArpTable;
 use crate::wire::{self, eth, icmp, ip, ETH_HDR_LEN, ETH_TYPE_IP, ICMP_HDR_LEN,
-                  IP_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP, MAC_BROADCAST};
+                  IP_HDR_LEN, IP_PROTO_ICMP, IP_PROTO_TCP};
 
 /// What an echo request this kernel sends carries after the header.
 const PAYLOAD_LEN: usize = 32;
@@ -201,9 +201,12 @@ impl Icmp {
     pub fn send_echo_request(&self, nic: &Nic, arp: &ArpTable, dst: u32, id: u16, seq: u16)
         -> bool
     {
-        /* Off-subnet destinations are reached through the gateway */
-        let target = nic.route_ip(dst);
-        let dst_mac = arp.resolve(nic, target).unwrap_or(MAC_BROADCAST);
+        /* Off-subnet destinations are reached through the gateway; one
+         * nothing answers for is not pinged at all. */
+        let dst_mac = match arp.destination(nic, dst) {
+            Some(mac) => mac,
+            None => return false,
+        };
 
         let msg_len = ICMP_HDR_LEN + PAYLOAD_LEN;
         let frame_len = ETH_HDR_LEN + IP_HDR_LEN + msg_len;

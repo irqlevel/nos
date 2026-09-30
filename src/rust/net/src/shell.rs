@@ -59,8 +59,8 @@ pub fn net(_args: &str, out: &mut Output) {
                 st.tx_total, st.rx_total, st.rx_drop);
             let _ = writeln!(out, "  rx  icmp:{} udp:{} tcp:{} arp:{} other:{} nat:{}",
                 st.rx_icmp, st.rx_udp, st.rx_tcp, st.rx_arp, st.rx_other, st.rx_nat);
-            let _ = writeln!(out, "  tx  icmp:{} udp:{} tcp:{} arp:{} other:{}",
-                st.tx_icmp, st.tx_udp, st.tx_tcp, st.tx_arp, st.tx_other);
+            let _ = writeln!(out, "  tx  icmp:{} udp:{} tcp:{} arp:{} other:{} refused:{}",
+                st.tx_icmp, st.tx_udp, st.tx_tcp, st.tx_arp, st.tx_other, st.tx_refused);
         }
     }
 
