@@ -74,8 +74,10 @@ public:
 
     /* addr as "function+0xoff [module]" into buf when it is inside a loaded
        module -- copied, since the module may go the moment this returns.
-       Never waits, so a panic may call it: false if the table is busy. */
-    bool Describe(ulong addr, char* buf, ulong size);
+       Never waits, so a panic may call it: false if the table is busy.
+       returnAddress: addr is a return address, named by the call before it
+       (SymbolTable::DescribeReturn); the offset is still addr's. */
+    bool Describe(ulong addr, bool returnAddress, char* buf, ulong size);
 
     /* The loaded modules, "name base+size" each, into buf for the panic
        report. Never waits either; false if there are none, or no telling. */

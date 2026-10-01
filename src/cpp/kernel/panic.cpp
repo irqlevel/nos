@@ -85,7 +85,7 @@ void Panicker::DumpBacktrace(ulong* frames, size_t count)
     PrintOutput("Backtrace:\n");
     for (size_t i = 0; i < count; i++)
     {
-        if (symtab.Describe(frames[i], where, sizeof(where)))
+        if (symtab.DescribeReturn(frames[i], where, sizeof(where)))
             Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX %s\n",
                 (ulong)i, frames[i], where);
         else

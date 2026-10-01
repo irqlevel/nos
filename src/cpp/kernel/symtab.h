@@ -31,6 +31,15 @@ public:
        neither. Never waits, so a panic may call it as well as bt. */
     bool Describe(ulong addr, char* buf, ulong size);
 
+    /* Describe, for a return address -- what a backtrace's frames are: the
+       function is the one holding ret - 1, the call's own last byte. A call
+       to a function that does not return is its caller's last instruction,
+       so the address after it is the next function's first, and naming ret
+       itself put every frame of a panic under the function that happened
+       to follow it in the image, at +0x0. The offset printed is ret's, just
+       past the call, as before. */
+    bool DescribeReturn(ulong ret, char* buf, ulong size);
+
     /* Room for what Describe writes before it truncates */
     static const ulong DescribeMax = 160;
 

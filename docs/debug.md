@@ -17,9 +17,14 @@ arm64 (start `./scripts/qemu-arm64.sh -s`, needs `gdb-multiarch`):
 ./scripts/gdb-arm64.sh
 ```
 
-Stack traces resolve symbols from a table baked into the kernel by a two-pass
-link (`out/$(ARCH)/pass1.elf` → `nm` → `symtab_data.cpp` → final ELF), so
-`bt <pid>` and the panic handler name functions without an external symbol file.
+Stack traces resolve symbols from a table baked into the kernel by a
+three-pass link (`out/$(ARCH)/pass2.elf` → `nm` → `symtab_data.cpp` → final
+ELF, checked against the final ELF; [Build](build.md)), so `bt <pid>` and the
+panic handler name functions without an external symbol file. A frame is a
+return address, named by the call before it (`SymbolTable::DescribeReturn`):
+after a call to a function that does not return -- every panic's -- the
+address is the next function's first byte, and naming it as it stood put the
+frame under that next function at `+0x0`.
 
 ## Without a serial port
 

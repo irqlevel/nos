@@ -32,15 +32,25 @@ old path. Make reports one as `No rule to make target`, not as an error in
 any source file -- which is one more reason to gate on the exit code of a
 build and not on what it printed.
 
-**The link is two-pass.** Stack traces resolve symbols from a table baked
-into the kernel: the build links `out/$(ARCH)/pass1.elf`, runs `nm` over it
-to generate `out/$(ARCH)/symtab_data.cpp`, and then links the final ELF (the
-`symtab_data` rules in the `Makefile`). The table of functions a loadable
-module may call is made from the same first pass
-([Loadable modules](modules.md#what-a-module-may-call)). Pass 1 links
-against empty weak stand-ins for both tables, in `kernel/pass1_tables.cpp`,
-a file that indexes neither. Anything that touches the link or symbol
-resolution has to keep both passes working.
+**The link is three-pass.** Stack traces resolve symbols from a table baked
+into the kernel. The build links `out/$(ARCH)/pass1.elf`, and makes from it
+the table of functions a loadable module may call
+([Loadable modules](modules.md#what-a-module-may-call)); links
+`out/$(ARCH)/pass2.elf`, the final link without the symbol table; runs `nm`
+over that to generate `out/$(ARCH)/symtab_data.cpp`; and links the final ELF
+with the table last, after the Rust staticlib (the `pass2` and `symtab`
+rules in the `Makefile`). The symbol table used to come from pass 1, which
+has no export table -- and the export table's references pull members out of
+the staticlib in an order of their own, so the final image laid out a good
+part of the Rust code elsewhere than the table said (8498 functions on x86,
+most by 0x6670 bytes) and backtraces named frames after functions they were
+not in. The table is data only and moves no code, so the final image's
+functions are where pass 2 had them; the link checks that it is so -- the
+table made again from the final ELF must be the one in it -- and fails the
+build if not. Passes 1 and 2 link against empty weak stand-ins for the
+tables they lack, in `kernel/pass1_tables.cpp`, a file that indexes neither.
+Anything that touches the link or symbol resolution has to keep all three
+working, and the check green.
 
 **The link refuses a static constructor.** This kernel runs no
 `.init_array`: a global whose type has a non-`constexpr` constructor or a

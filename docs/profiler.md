@@ -22,7 +22,7 @@ The code is `kernel/profiler.cpp`; the performance-counter backend is
 
 Most of a profiler already existed in this kernel and is reused rather than
 rebuilt: `SymbolTable::Resolve` turns an address into a name using the table
-the [two-pass link](debug.md) bakes into the image, and
+the [three-pass link](build.md) bakes into the image, and
 `StackTrace::CaptureFromSp` walks the frame-pointer chain, which is intact
 because the whole kernel is built with `-fno-omit-frame-pointer`. What was
 left was to take a sample and count them up.

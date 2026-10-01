@@ -2403,6 +2403,35 @@ static Stdlib::Error CheckSymbolizer(const char* output)
         return MakeError(Stdlib::Error::Unsuccessful);
     }
 
+    /* A backtrace's frames are return addresses, named by the call before
+       them: one a byte into a function is that function's, at +0x1 -- in the
+       kernel and in a module alike -- and one at a function's first byte is
+       the end of whatever precedes it, which is what a call that does not
+       return leaves on the stack, never the function at +0x0 */
+    const ulong self = reinterpret_cast<ulong>(&CheckSymbolizer);
+    where[0] = '\0';
+    if (!symtab.DescribeReturn(self + 1, where, sizeof(where)) ||
+        Stdlib::StrStr(where, "CheckSymbolizer+0x1") == nullptr)
+    {
+        Trace(0, "TestModules: a return address a byte into CheckSymbolizer named '%s'", where);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+    where[0] = '\0';
+    if (symtab.DescribeReturn(self, where, sizeof(where)) &&
+        Stdlib::StrStr(where, "CheckSymbolizer+0x0") != nullptr)
+    {
+        Trace(0, "TestModules: a return address at CheckSymbolizer's start named '%s'", where);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+    where[0] = '\0';
+    if (!symtab.DescribeReturn(addr + 1, where, sizeof(where)) ||
+        Stdlib::StrStr(where, "mod_modtest::double+0x1 [modtest]") == nullptr ||
+        symtab.DescribeReturn(0, where, sizeof(where)))
+    {
+        Trace(0, "TestModules: a return address a byte into modtest's double() named '%s'", where);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
     return MakeSuccess();
 }
 
