@@ -16,6 +16,7 @@
 #include <hal/cpu.h>
 
 #include <lib/btree.h>
+#include <lib/checksum.h>
 #include <lib/error.h>
 #include <lib/grub_env.h>
 #include <lib/stdlib.h>
@@ -1941,6 +1942,26 @@ Stdlib::Error TestMemRoutines()
     return MakeSuccess();
 }
 
+/* CRC-32 against the check value every implementation of it is held to, and
+   the streaming form fed in pieces against the whole */
+Stdlib::Error TestCrc32()
+{
+    static const char Check[] = "123456789";
+    static const u32 CheckCrc = 0xCBF43926;
+    const ulong len = sizeof(Check) - 1;
+
+    u32 whole = Stdlib::Crc32(Check, len);
+    u32 pieces = 0;
+    for (ulong at = 0; at < len; at += 2)
+        pieces = Stdlib::Crc32Update(pieces, Check + at, (len - at < 2) ? len - at : 2);
+    if (whole != CheckCrc || pieces != CheckCrc || Stdlib::Crc32(Check, 0) != 0)
+    {
+        Trace(0, "TestCrc32: 0x%x whole, 0x%x in pieces, not 0x%x", whole, pieces, CheckCrc);
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+    return MakeSuccess();
+}
+
 Stdlib::Error TestSnPrintf()
 {
     Trace(0, "TestSnPrintf: started");
@@ -2784,6 +2805,10 @@ Stdlib::Error Test()
         return err;
 
     err = TestMemRoutines();
+    if (!err.Ok())
+        return err;
+
+    err = TestCrc32();
     if (!err.Ok())
         return err;
 
