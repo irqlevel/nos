@@ -485,6 +485,46 @@ CPU runs with interrupts off and may not allocate; `kcore::cpu::run_on_with`
 carries it over as a borrowed value rather than a word to cast back, which
 is sound because `run_on` does not return until the handler has run.
 
+## heapbench
+
+`heapbench` (`src/rust/modules/heapbench`) times the kernel heap as Rust code
+reaches it -- `Box`, `Vec`, `String` go through the global allocator to
+`kernel_alloc`, and so does everything it allocates. Each workload runs on
+one CPU and then on N at once, a task bound to each CPU, and reports the
+time an operation took as the workers saw it, and the operations a second of
+all of them together. Under QEMU on an M-series Mac (arm64, HVF, four CPUs):
+
+```
+$ insmod /heapbench.ko
+$ heapbench
+heapbench: 200 ms a run, on 1 CPU and on 4
+  workload       ns/op 1cpu   ns/op 4cpu    Mops/s 4cpu
+  pair 16             170.1        165.1           24.2
+  pair 1536           161.7        171.8           23.2
+  pair 4096           139.6       1868.1            2.1
+  pair 262144         160.7       1425.9            2.8
+  batch 64            209.0        325.2           12.2
+  grow 64k           5427.5       8239.6            0.4
+  pass 256            481.7        583.1            6.8
+```
+
+    heapbench [cpus=N] [ms=200]
+
+- `pair S`: an allocation of S bytes and its free. The sizes are the ones the
+  heap treats differently: its pools' classes (16 to 1024), the largest
+  class, whose block has a page to itself (1536, 2032), and the page
+  allocator's runs (4096 and up).
+- `batch S`: 64 allocations, then their frees -- what a pool's page refill
+  and give-back cost.
+- `grow 64k`: a vector grown to 64 KiB in 512-byte pieces and dropped, every
+  reallocation an allocation, a copy and a free.
+- `pass S` checks as much as it measures: each worker fills a batch with a
+  byte of its own, hands it to the next worker and checks and frees the batch
+  handed to it -- every block freed on another CPU than the one that took
+  it. A block that comes back changed ends the run with `CORRUPT`.
+- Nothing panics on a refusal: an allocation the heap refuses ends the run
+  and says so.
+
 ## Backtraces
 
 A frame in a module's code is named like the kernel's own, with the module

@@ -359,10 +359,96 @@ ulong VaFree(ulong log)
     return free;
 }
 
+/* Blocks every CPU's cache holds */
+ulong CachedCount()
+{
+    ulong n = 0;
+    for (auto& cache : Heap().Caches)
+        for (auto& size : cache.Sizes)
+            n += size.Count;
+    return n;
+}
+
+/* Blocks the page allocator keeps, of every size */
+ulong KeptCount()
+{
+    ulong n = 0;
+    for (auto& list : PageAllocatorImpl::GetInstance().KeptBlocks)
+        n += list.Count;
+    return n;
+}
+
+/* What the heap keeps for its next allocations, between two operations:
+   no more than its bounds, each kept block whole -- mapped, marked, its own
+   and nobody's in use -- and each pool's kept pages empty */
+void CheckKept()
+{
+    auto& pa = PageAllocatorImpl::GetInstance();
+    for (ulong log = 0; log < Stdlib::ArraySize(pa.KeptBlocks); log++)
+    {
+        auto& list = pa.KeptBlocks[log];
+        INVARIANT(list.Count <= list.Limit, "%lu blocks of %lu pages kept, past the bound of %lu", list.Count,
+            1UL << log, list.Limit);
+        ulong n = 0;
+        for (auto* kept = list.Head; kept != nullptr; kept = kept->Next)
+        {
+            ulong va = reinterpret_cast<ulong>(kept);
+            INVARIANT(++n <= list.Count, "the list of kept %lu-page blocks is longer than its count %lu",
+                1UL << log, list.Count);
+            INVARIANT(pa.FixedPgAlloc[log].Contains(kept), "a kept block 0x%lx not of its size's VA", va);
+            INVARIANT(IsMapped(va, (1UL << log) * PageBytes), "a kept block 0x%lx not all mapped", va);
+            INVARIANT(kept->Mark == PageAllocatorImpl::KeptMark, "a kept block 0x%lx without its mark", va);
+            auto live = Live.upper_bound(va + (1UL << log) * PageBytes - 1);
+            INVARIANT(live == Live.begin() || std::prev(live)->first + std::prev(live)->second.Size <= va,
+                "a kept block 0x%lx that a block in use overlaps", va);
+        }
+        INVARIANT(n == list.Count, "%lu kept %lu-page blocks on a list that counts %lu", n, 1UL << log,
+            list.Count);
+    }
+
+    auto& heap = Heap();
+    for (auto& pool : heap.Pool)
+        INVARIANT(pool.EmptyPages <= Kernel::Mm::Pool::EmptyPagesKept, "a pool of %lu-byte blocks keeps %lu empty "
+            "pages", pool.BlockSize, pool.EmptyPages);
+
+    /* Every CPU's cache: within its bound, each block in it free -- its tag
+       the pool's FreedTag -- in no other cache and nobody's in use (whose
+       address is the block's past the heap's header) */
+    std::set<ulong> cached;
+    for (ulong cpu = 0; cpu < Stdlib::ArraySize(heap.Caches); cpu++)
+    {
+        for (ulong p = 0; p < AllocatorImpl::PoolCount; p++)
+        {
+            auto& size = heap.Caches[cpu].Sizes[p];
+            INVARIANT(size.Count <= size.Limit, "CPU %lu caches %lu blocks of pool %lu, past its bound of %lu", cpu,
+                size.Count, p, size.Limit);
+            for (ulong i = 0; i < size.Count; i++)
+            {
+                ulong block = reinterpret_cast<ulong>(size.Blocks[i]);
+                auto* header = reinterpret_cast<Kernel::Mm::Pool::Block*>(block) - 1;
+                INVARIANT(static_cast<ulong>(header->Tag.Get()) == Kernel::Mm::Pool::FreedTag,
+                    "CPU %lu caches 0x%lx, whose tag 0x%lx is not a free block's", cpu, block,
+                    static_cast<ulong>(header->Tag.Get()));
+                INVARIANT(cached.insert(block).second, "0x%lx cached twice", block);
+                INVARIANT(!Live.count(block + sizeof(AllocatorImpl::Header)), "CPU %lu caches 0x%lx, which is in use",
+                    cpu, block);
+            }
+        }
+    }
+}
+
 void Alloc(Fuzz::Input& in)
 {
     ulong size = Size(in);
-    void* p = Heap().Alloc(size, 0x54657374);
+    /* Rust's allocations, which ask for no contents in particular */
+    const bool uninit = in.Bool();
+    ulong keptBefore = KeptCount();
+    ulong cachedBefore = CachedCount();
+    void* p = uninit ? Heap().AllocUninit(size, 0x54657374) : Heap().Alloc(size, 0x54657374);
+    if (KeptCount() < keptBefore)
+        Fuzz::Reached(uninit ? "a kept block handed out as it was" : "a kept block handed out zeroed");
+    if (CachedCount() < cachedBefore)
+        Fuzz::Reached("a block from a CPU's cache");
     if (p == nullptr)
     {
         /* Past the largest run, no page or no VA for one -- a pool's block
@@ -377,8 +463,18 @@ void Alloc(Fuzz::Input& in)
     }
     ulong va = reinterpret_cast<ulong>(p);
     INVARIANT(va % 8 == 0, "Alloc(%lu) gave 0x%lx, not 8-aligned", size, va);
+    const bool pages = size + 8 >= PageBytes / 2;
+    if (pages && !uninit)
+    {
+        /* Zeroed, as fresh pages are -- a block the page allocator kept
+           from a free included, whatever was written into it before */
+        INVARIANT(IsMapped(va, size), "Alloc gave 0x%lx for %lu bytes, which is not all mapped", va, size);
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(va);
+        for (ulong i = 0; i < size; i++)
+            INVARIANT(bytes[i] == 0, "Alloc(%lu) gave 0x%lx with a byte not zero at +%lu", size, va, i);
+    }
     Place(va, {size, static_cast<uint8_t>(1 + in.Below(255)), Block::Heap, {}}, "Alloc");
-    Fuzz::Reached(size + 8 >= PageBytes / 2 ? "a page allocation" : "a pool allocation");
+    Fuzz::Reached(pages ? "a page allocation" : "a pool allocation");
 }
 
 void Free(Fuzz::Input& in)
@@ -395,8 +491,13 @@ void Free(Fuzz::Input& in)
     switch (b.How)
     {
     case Block::Heap:
+    {
+        ulong cachedBefore = CachedCount();
         Heap().Free(reinterpret_cast<void*>(va));
+        if (CachedCount() < cachedBefore)
+            Fuzz::Reached("a CPU's cache spilled to its pool");
         break;
+    }
     case Block::Run:
         pa.UnmapFreePages(reinterpret_cast<void*>(va));
         break;
@@ -506,8 +607,19 @@ void Run(Fuzz::Input& in)
     Boot(in);
     for (int ops = 0; ops < 200 && in.More(); ops++)
     {
-        switch (in.U8() % 12)
+        /* Which CPU the operation runs on: a block freed on another than
+           the one it was taken on moves between their caches; past the
+           caches' CPUs there is none, and the pools are reached directly */
+        if (in.Chance(32))
+            Fuzz::CurrentCpu = in.Chance(16) ? AllocatorImpl::CacheCpus + in.Below(4) : in.Below(4);
+        switch (in.U8() % 13)
         {
+        case 12:
+            /* What the heap keeps for its next allocations given back,
+               with blocks still out */
+            if (Heap().Trim())
+                Fuzz::Reached("a trim that gave something back");
+            break;
         case 0:
         case 1:
         case 2:
@@ -542,18 +654,22 @@ void Run(Fuzz::Input& in)
             break;
         }
         Fuzz::CheckNoLocksHeld("an operation");
+        CheckKept();
     }
 
-    /* Everything freed: every block as it was written, and every page back
-       but the VA allocators' bitmaps */
+    /* Everything freed and the heap trimmed: every block as it was written,
+       and every page back but the VA allocators' bitmaps -- none left in
+       a pool's kept page or among the page allocator's kept blocks */
     P.FailAfter = -1;
     P.MapFailAfter = -1;
     for (auto& l : Live)
         CheckFill(l.first, l.second, "at the end");
     while (!Live.empty())
         Free(in);
+    Heap().Trim();
     INVARIANT(P.All.size() - P.FreeCount == Baseline, "%lu pages still out once everything is freed, where the "
         "bitmaps hold %lu", P.All.size() - P.FreeCount, Baseline);
+    INVARIANT(!Heap().Trim(), "a second trim found something the first left");
 }
 
 void Reset()
