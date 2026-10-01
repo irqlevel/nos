@@ -494,6 +494,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mod-heapbench"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+ "kmod",
+]
+
+[[package]]
 name = "mod-hello"
 version = "0.1.0"
 dependencies = [
