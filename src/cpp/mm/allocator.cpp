@@ -1,6 +1,5 @@
 #include "allocator.h"
 
-#include <hal/irqchip.h>
 #include <include/const.h>
 #include <kernel/cpu.h>
 #include <kernel/panic.h>
@@ -141,16 +140,8 @@ void AllocatorImpl::Free(void* ptr)
 
 AllocatorImpl::CpuCache* AllocatorImpl::ThisCpuCache()
 {
-	/* On x86 a CPU learns which it is from its local APIC until it has
-	   published its per-CPU slot, and there is no APIC to ask before the
-	   ACPI tables are read -- which the heap's first allocations precede */
-	if (!Hal::IrqChipReady())
-		return nullptr;
-
-	/* A task moved to another CPU after this reads the wrong cache, which
-	   its lock keeps as safe as the right one */
-	ulong cpu = Hal::GetCurrentCpuHwId();
-	if (cpu >= Stdlib::ArraySize(Caches))
+	ulong cpu;
+	if (!CacheCpu(cpu))
 		return nullptr;
 	return &Caches[cpu];
 }

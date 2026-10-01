@@ -5,6 +5,7 @@
 #include <lib/list_entry.h>
 
 #include "block_allocator.h"
+#include "cpu_cache.h"
 #include "va_allocator.h"
 #include "page_table.h"
 
@@ -56,7 +57,11 @@ private:
     ulong PageCount;
 };
 
-class PageAllocatorImpl : public PageAllocator
+/* final, with a destructor that is not virtual: the per-CPU caches below are
+   aligned to cache lines, which makes the class over-aligned, and a virtual
+   destructor of an over-aligned class calls the aligned operator delete the
+   kernel does not have. The one instance is a static nobody deletes. */
+class PageAllocatorImpl final : public PageAllocator
 {
 public:
 	static PageAllocatorImpl& GetInstance()
@@ -86,7 +91,7 @@ public:
 
 private:
     PageAllocatorImpl();
-    virtual ~PageAllocatorImpl();
+    ~PageAllocatorImpl();
 
     /* Free and Alloc keep a block of the heap's freed with its pages still
        mapped, and hand it out again: a block that comes back costs neither
@@ -119,7 +124,48 @@ private:
     static constexpr ulong KeptPagesMax = 128;
     static constexpr ulong KeptRamShare = 1024;
 
+    /* In front of KeptBlocks, for the three smallest sizes -- a page, two,
+       four -- a few kept blocks a CPU, under a lock only that CPU takes
+       (and Trim), as AllocatorImpl's caches are in front of its pools: four
+       CPUs allocating pages took KeptBlocks' lock in turn, and a pair of
+       4 KiB blocks cost ten times on four what it did on one (heapbench).
+       A free a full cache cannot take spills the older half of it to
+       KeptBlocks; an allocation an empty one cannot serve takes from
+       there. A block in a CPU's cache is kept as one in KeptBlocks is:
+       mapped, marked, nobody's. */
+    static constexpr size_t CpuKeptLogs = 3;
+    /* Pages a CPU keeps of each of those sizes: four blocks of a page, two
+       of two, one of four -- and none past KeptBlocks' own bound */
+    static constexpr ulong CpuKeptPages = 4;
+
+    struct CpuKeptSize
+    {
+        ulong Count = 0;
+        /* 0 until Setup, which keeps nothing */
+        ulong Limit = 0;
+        Kept* Blocks[CpuKeptPages];
+    };
+
+    struct alignas(64) CpuKept
+    {
+        SpinLock Lock;
+        CpuKeptSize Sizes[CpuKeptLogs];
+    };
+
+    /* This CPU's cache of kept blocks, for a size it has one of; nullptr
+       otherwise */
+    CpuKept* ThisCpuKept(size_t log);
+
+    /* A freed block onto this CPU's cache, or KeptBlocks; false if neither
+       took it */
     bool Keep(size_t log, void* ptr);
+    /* A block onto KeptBlocks; false if it is full */
+    bool KeepShared(size_t log, Kept* block);
+    /* Whether a block is kept, in any CPU's cache or KeptBlocks: the
+       double-free check, for a block that carries the mark */
+    bool IsKept(size_t log, Kept* block);
+    /* A kept block, its mark cleared, from this CPU's cache or KeptBlocks;
+       nullptr if there is none */
     void* TakeKept(size_t log);
     /* Which of FixedPgAlloc holds addr; false if none does */
     bool ClassOf(void* addr, size_t& log);
@@ -144,6 +190,7 @@ private:
     FixedPageAllocator LargePgAlloc;
 
     KeptList KeptBlocks[PageLogLimit];
+    CpuKept CpuKeptBlocks[CacheCpus]; /* cpu_cache.h's */
 };
 
 }
