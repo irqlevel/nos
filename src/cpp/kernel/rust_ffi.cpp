@@ -261,7 +261,11 @@ void kernel_free(void* ptr, unsigned long size, unsigned long align)
     Stdlib::MemCpy(buf, msg, n);
     buf[n] = '\0';
     Kernel::Panicker::GetInstance().DoPanic("RUST PANIC: %s\n", buf);
-    for (;;) {}
+    /* Not an empty loop: one with no side effect is one the compiler may
+       assume ends, and take out -- and this function would fall through
+       into whatever follows it */
+    for (;;)
+        Pause();
 }
 
 void kernel_get_boot_time(unsigned long* secs, unsigned long* usecs)

@@ -59,7 +59,11 @@ void RegisterCommon(InterruptHandler& handler, u8 intId, bool edge, bool level)
         return;
     ve.Level = level;
     ve.Handlers[ve.HandlerCount] = &handler;
-    ve.HandlerCount = ve.HandlerCount + 1;
+    /* The handler written before the count that lets an interrupt on another
+       CPU reach it -- a level line shared is enabled already. Release: the
+       compiler and the CPU both keep the order, which plain stores at -O2
+       promise neither. */
+    __atomic_store_n(&ve.HandlerCount, static_cast<u8>(ve.HandlerCount + 1), __ATOMIC_RELEASE);
 
     gic.EnableIrq(intId, ReadMpidr(), edge);
     handler.OnInterruptRegister(intId, intId);
@@ -147,13 +151,16 @@ extern "C" void ArmIrqEntry(Context* ctx)
         }
 
         auto& ve = IntIds[intId];
-        if (ve.HandlerCount == 0)
+        /* Acquire, the other half of RegisterCommon's release: every handler
+           counted is one whose pointer is there to call */
+        const u8 count = __atomic_load_n(&ve.HandlerCount, __ATOMIC_ACQUIRE);
+        if (count == 0)
         {
             InterruptStats::Inc(IrqDummy);
         }
         else
         {
-            for (u8 i = 0; i < ve.HandlerCount; i++)
+            for (u8 i = 0; i < count; i++)
                 ve.Handlers[i]->OnInterrupt(ctx);
         }
 

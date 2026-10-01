@@ -233,7 +233,12 @@ void ApStartup(void *ctx)
     }
 }
 
-void ApMain2()
+/* Never inlined: called just after ALLOC_CPU_STACK has moved the stack
+   pointer, and the caller's frame is still addressed off the frame pointer
+   of the stack it left. Inlined, this function's locals would live in that
+   frame -- on the trampoline's stack, which the real page tables do not
+   map. A call starts a frame of its own on the new stack. */
+__attribute__((noinline)) void ApMain2()
 {
     AtomicReadAndInc(&ApStartedFlag); /* 2: entered ApMain2 */
 
@@ -741,7 +746,8 @@ static void WxProbeHeap()
     Trace(0, "W^X probe: heap execute SUCCEEDED (W^X broken!)");
 }
 
-void Main2(Grub::MultiBootInfoHeader *MbInfo)
+/* Never inlined, as ApMain2 is not: see there */
+__attribute__((noinline)) void Main2(Grub::MultiBootInfoHeader *MbInfo)
 {
     do {
 

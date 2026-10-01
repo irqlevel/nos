@@ -38,8 +38,10 @@ long AtomicTestBit(volatile long *pvalue, ulong bit);
 
 void SwitchContext(ulong nextRsp, ulong* currRsp, void (*callback)(void* ctx), void* ctx);
 
-long SetJmp(void *ctx);
-void LongJmp(void *ctx, long result);
+/* returns_twice: the optimiser must not keep anything in a register across
+   a SetJmp that a LongJmp back into it would find changed */
+long SetJmp(void *ctx) __attribute__((returns_twice));
+__attribute__((noreturn)) void LongJmp(void *ctx, long result);
 
 #ifdef __cplusplus
 }
