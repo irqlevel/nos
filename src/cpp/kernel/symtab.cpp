@@ -58,7 +58,23 @@ bool SymbolTable::Describe(ulong addr, char* buf, ulong size)
         return true;
     }
 
-    return ModuleTable::GetInstance().Describe(addr, buf, size);
+    return ModuleTable::GetInstance().Describe(addr, false, buf, size);
+}
+
+bool SymbolTable::DescribeReturn(ulong ret, char* buf, ulong size)
+{
+    if (ret == 0)
+        return false;
+
+    const char* name;
+    ulong offset;
+    if (Resolve(ret - 1, name, offset))
+    {
+        Stdlib::SnPrintf(buf, size, "%s+0x%lX", name, offset + 1);
+        return true;
+    }
+
+    return ModuleTable::GetInstance().Describe(ret, true, buf, size);
 }
 
 }

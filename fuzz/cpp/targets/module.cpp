@@ -809,10 +809,13 @@ void Lookups(Fuzz::Input& in, LoadedModule& m)
         char buf[96];
         size_t size = 1 + in.Below(sizeof(buf));
         memset(buf, 'x', sizeof(buf));
-        bool named = table.Describe(addr, buf, size);
+        /* A return address is looked up a byte back, at its call */
+        const bool ret = in.Bool();
+        bool named = table.Describe(addr, ret, buf, size);
         INVARIANT(!named || memchr(buf, 0, size) != nullptr, "Describe left its buffer unterminated");
-        if (addr - m.Image.Base < m.ImageSize)
-            INVARIANT(named, "Describe does not know 0x%lx, in the module", addr);
+        const ulong at = ret ? addr - 1 : addr;
+        if (!(ret && addr == 0) && at - m.Image.Base < m.ImageSize)
+            INVARIANT(named, "Describe does not know 0x%lx%s, in the module", addr, ret ? ", a return address" : "");
         const ModuleSymbol* f = FindFunction(m, addr - m.Image.Base);
         if (f != nullptr)
             INVARIANT(f->Offset <= addr - m.Image.Base && addr - m.Image.Base < m.TextEnd,

@@ -1404,8 +1404,13 @@ void ModuleTable::Dump(Stdlib::Printer& out)
         out.Printf("no modules loaded\n");
 }
 
-bool ModuleTable::Describe(ulong addr, char* buf, ulong size)
+bool ModuleTable::Describe(ulong addr, bool returnAddress, char* buf, ulong size)
 {
+    if (returnAddress && addr == 0)
+        return false;
+    /* What is looked up: the call's last byte, for a return address */
+    const ulong at = returnAddress ? addr - 1 : addr;
+
     bool acquired = false;
     const ulong flags = Lock.TryLockIrqSave(acquired);
     if (!acquired)
@@ -1418,11 +1423,11 @@ bool ModuleTable::Describe(ulong addr, char* buf, ulong size)
     for (Stdlib::ListEntry* entry = List.Flink; entry != &List; entry = entry->Flink)
     {
         const LoadedModule* module = CONTAINING_RECORD(entry, LoadedModule, ListEntry);
-        if (addr < module->Image.Base || addr >= module->Image.Base + module->ImageSize)
+        if (at < module->Image.Base || at >= module->Image.Base + module->ImageSize)
             continue;
 
         const ulong offset = addr - module->Image.Base;
-        const ModuleSymbol* function = FindFunction(*module, offset);
+        const ModuleSymbol* function = FindFunction(*module, at - module->Image.Base);
         if (function != nullptr)
             Stdlib::SnPrintf(buf, size, "%s+0x%lX [%s]", function->Name,
                 offset - function->Offset, module->Name);

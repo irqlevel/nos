@@ -889,7 +889,7 @@ static void DumpStackTrace(ulong* frames, size_t count, Stdlib::Printer& con)
     for (size_t i = 0; i < count; i++)
     {
         char where[SymbolTable::DescribeMax];
-        if (symtab.Describe(frames[i], where, sizeof(where)))
+        if (symtab.DescribeReturn(frames[i], where, sizeof(where)))
             con.Printf("  [%lu] 0x%lX %s\n", (ulong)i, frames[i], where);
         else
             con.Printf("  [%lu] 0x%lX\n", (ulong)i, frames[i]);

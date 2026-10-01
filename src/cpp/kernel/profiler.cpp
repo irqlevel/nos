@@ -374,7 +374,7 @@ void Profiler::Report(Stdlib::Printer& printer, ulong pidFilter, ulong chainLimi
         for (ulong f = 1; f < chains[i].Depth; f++)
         {
             char where[SymbolTable::DescribeMax];
-            if (symtab.Describe(chains[i].Frame[f], where, sizeof(where)))
+            if (symtab.DescribeReturn(chains[i].Frame[f], where, sizeof(where)))
                 printer.Printf("        <- %s\n", where);
             else
                 printer.Printf("        <- 0x%lX\n", chains[i].Frame[f]);

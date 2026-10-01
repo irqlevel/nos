@@ -446,20 +446,44 @@ nos-arm64.img: $(KERNEL)
 smoke:
 	./scripts/smoke-test.sh
 
+# The link is three-pass. Pass 1 is what the module export table is made
+# from. Pass 2 is the final link without the symbol table -- the export table
+# in it, whose references pull members out of the Rust staticlib in an order
+# of their own: made from pass 1, which has no export table, the symbol table
+# named code that the final link had laid out elsewhere (8498 functions of the
+# x86 image moved, most by 0x6670 bytes), and a frame in it after a function
+# it is not in. The symbol table is made from pass 2, and the final link adds
+# it last, after the staticlib: data only, it moves no code. That the final
+# image's functions are where its table says is checked after the link,
+# which fails the build if they are not.
 $(OUT)/pass1.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(RUST_LIB)
 	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(RUST_LIB)
 
-$(OUT)/symtab_data.cpp: $(OUT)/pass1.elf
+$(OUT)/pass2.elf: $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB) $(FLAVOR_STAMP)
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB)
+
+# The symbol table stack traces name frames by (kernel/symtab.cpp): every
+# function of an ELF's text, in address order. $(call symtab,elf,cpp)
+define symtab
+@printf '#include "kernel/symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $(2)
+@$(NM) -Cn $(1) | awk '/^[0-9a-fA-F]+ [TtWw] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $(2)
+@printf '};\nconst size_t SymbolTable::SymbolCount = sizeof(Symbols)/sizeof(Symbols[0]);\n}\n' >> $(2)
+endef
+
+$(OUT)/symtab_data.cpp: $(OUT)/pass2.elf
 	@echo "Generating symbol table..."
-	@printf '#include "kernel/symtab.h"\nnamespace Kernel {\nconst SymEntry SymbolTable::Symbols[] = {\n' > $@
-	@$(NM) -Cn $< | awk '/^[0-9a-fA-F]+ [TtWw] / { addr=$$1; name=""; for(i=3;i<=NF;i++){name=name (i>3?" ":"") $$i}; sub(/\(.*/, "", name); gsub(/"/, "\\\"", name); printf "    { 0x%s, \"%s\" },\n", addr, name }' >> $@
-	@printf '};\nconst size_t SymbolTable::SymbolCount = sizeof(Symbols)/sizeof(Symbols[0]);\n}\n' >> $@
+	$(call symtab,$<,$@)
 
 $(OUT)/symtab_data.o: $(OUT)/symtab_data.cpp src/cpp/kernel/symtab.h
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)/module_exports.o $(RUST_LIB) $(FLAVOR_STAMP)
-	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)/module_exports.o $(RUST_LIB)
+	$(LD) $(LDFLAGS) -T $< -o $@ $(OBJS) $(OUT)/modtest_blob.o $(OUT)/module_exports.o $(RUST_LIB) $(OUT)/symtab_data.o
+	$(call symtab,$@,$(OUT)/symtab_final.cpp)
+	@cmp -s $(OUT)/symtab_final.cpp $(OUT)/symtab_data.cpp || { \
+	    echo "$@: its functions are not where its symbol table says, and every backtrace would name the wrong ones:"; \
+	    diff $(OUT)/symtab_data.cpp $(OUT)/symtab_final.cpp | head -5; \
+	    rm -f $@; exit 1; }
 
 clean:
 	rm -rf out kernel64.elf kernel-arm64.elf nos-arm64.img *.bin *.iso iso

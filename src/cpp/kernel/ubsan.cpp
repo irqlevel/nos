@@ -277,7 +277,7 @@ void Report(const SourceLocation* loc, const char* what)
     char buf[SymbolTable::DescribeMax + ValueMax];
     for (size_t i = 0; i < frameCount; i++)
     {
-        if (SymbolTable::GetInstance().Describe(frames[i], where, sizeof(where)))
+        if (SymbolTable::GetInstance().DescribeReturn(frames[i], where, sizeof(where)))
             Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX %s\n", (ulong)i, frames[i], where);
         else
             Stdlib::SnPrintf(buf, sizeof(buf), "  [%lu] 0x%lX\n", (ulong)i, frames[i]);
