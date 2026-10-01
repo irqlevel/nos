@@ -188,6 +188,15 @@ bool PageAllocatorImpl::Setup()
         KeptBlocks[i].Limit = keptPages >> i;
     }
 
+    /* A CPU keeps no more of a size than KeptBlocks may: on a machine too
+       small to keep any, none */
+    for (auto& cpu : CpuKeptBlocks)
+    {
+        Stdlib::AutoLock lock(cpu.Lock);
+        for (size_t i = 0; i < CpuKeptLogs; i++)
+            cpu.Sizes[i].Limit = Stdlib::Min<ulong>(CpuKeptPages >> i, KeptBlocks[i].Limit);
+    }
+
     return true;
 }
 
@@ -252,21 +261,71 @@ void PageAllocatorImpl::Release(void* addr)
         Panic("Can't free addr 0x%p", addr);
 }
 
+PageAllocatorImpl::CpuKept* PageAllocatorImpl::ThisCpuKept(size_t log)
+{
+    ulong cpu;
+    if (log >= CpuKeptLogs || !CacheCpu(cpu))
+        return nullptr;
+    return &CpuKeptBlocks[cpu];
+}
+
 bool PageAllocatorImpl::Keep(size_t log, void* ptr)
 {
     BugOn(log >= Stdlib::ArraySize(KeptBlocks));
-    auto& list = KeptBlocks[log];
     Kept* block = static_cast<Kept*>(ptr);
 
-    Stdlib::AutoLock lock(list.Lock);
-    /* A block on the list carries the mark; one that is not may too, by
-       chance, so the mark only says where to look */
-    if (block->Mark == KeptMark)
+    /* A kept block carries the mark, and TakeKept clears it on the way
+       out: one that has it now is kept already -- a second free -- or its
+       owner wrote those very words, so the mark only says where to look */
+    if (block->Mark == KeptMark && IsKept(log, block))
+        Panic("Double free of 0x%p", ptr);
+
+    CpuKept* cpu = ThisCpuKept(log);
+    if (cpu == nullptr)
+        return KeepShared(log, block);
+
+    Kept* spill[CpuKeptPages];
+    ulong spilled = 0;
+    bool cached = false;
     {
-        for (Kept* kept = list.Head; kept != nullptr; kept = kept->Next)
-            if (kept == block)
-                Panic("Double free of 0x%p", ptr);
+        Stdlib::AutoLock lock(cpu->Lock);
+        CpuKeptSize& size = cpu->Sizes[log];
+        if (size.Limit != 0)
+        {
+            if (size.Count >= size.Limit)
+            {
+                /* The older half: the newer is likelier still in this
+                   CPU's data cache */
+                spilled = (size.Limit + 1) / 2;
+                for (ulong i = 0; i < spilled; i++)
+                    spill[i] = size.Blocks[i];
+                for (ulong i = spilled; i < size.Count; i++)
+                    size.Blocks[i - spilled] = size.Blocks[i];
+                size.Count -= spilled;
+            }
+            block->Mark = KeptMark;
+            size.Blocks[size.Count++] = block;
+            cached = true;
+        }
     }
+    if (!cached)
+        return KeepShared(log, block);
+
+    /* With this CPU's lock let go of: what KeptBlocks has no room for is
+       unmapped, and the shootdown waits on every other CPU */
+    for (ulong i = 0; i < spilled; i++)
+    {
+        if (!KeepShared(log, spill[i]) && !FixedPgAlloc[log].Free(spill[i]))
+            Panic("Can't free kept block 0x%p", spill[i]);
+    }
+    return true;
+}
+
+bool PageAllocatorImpl::KeepShared(size_t log, Kept* block)
+{
+    auto& list = KeptBlocks[log];
+
+    Stdlib::AutoLock lock(list.Lock);
     if (list.Count >= list.Limit)
         return false;
 
@@ -277,17 +336,59 @@ bool PageAllocatorImpl::Keep(size_t log, void* ptr)
     return true;
 }
 
+/* Every CPU's cache and KeptBlocks, each under its own lock -- never two at
+   once. Only for a block that carries the mark, which a block handed out
+   does not, so a free reaches here for a double free or a block whose
+   owner happened to write the mark's very words. */
+bool PageAllocatorImpl::IsKept(size_t log, Kept* block)
+{
+    if (log < CpuKeptLogs)
+    {
+        for (auto& cpu : CpuKeptBlocks)
+        {
+            Stdlib::AutoLock lock(cpu.Lock);
+            const CpuKeptSize& size = cpu.Sizes[log];
+            for (ulong i = 0; i < size.Count; i++)
+                if (size.Blocks[i] == block)
+                    return true;
+        }
+    }
+
+    auto& list = KeptBlocks[log];
+    Stdlib::AutoLock lock(list.Lock);
+    for (Kept* kept = list.Head; kept != nullptr; kept = kept->Next)
+        if (kept == block)
+            return true;
+    return false;
+}
+
 void* PageAllocatorImpl::TakeKept(size_t log)
 {
     BugOn(log >= Stdlib::ArraySize(KeptBlocks));
-    auto& list = KeptBlocks[log];
+    Kept* block = nullptr;
 
-    Stdlib::AutoLock lock(list.Lock);
-    Kept* block = list.Head;
+    CpuKept* cpu = ThisCpuKept(log);
+    if (cpu != nullptr)
+    {
+        Stdlib::AutoLock lock(cpu->Lock);
+        CpuKeptSize& size = cpu->Sizes[log];
+        if (size.Count > 0)
+            block = size.Blocks[--size.Count];
+    }
+
     if (block == nullptr)
-        return nullptr;
-    list.Head = block->Next;
-    list.Count--;
+    {
+        auto& list = KeptBlocks[log];
+        Stdlib::AutoLock lock(list.Lock);
+        block = list.Head;
+        if (block == nullptr)
+            return nullptr;
+        list.Head = block->Next;
+        list.Count--;
+    }
+
+    /* The caller's now: unmarked, so that its free does not go looking */
+    block->Mark = 0;
     return block;
 }
 
@@ -296,6 +397,30 @@ void* PageAllocatorImpl::TakeKept(size_t log)
 bool PageAllocatorImpl::Trim()
 {
     bool trimmed = false;
+    for (auto& cpu : CpuKeptBlocks)
+    {
+        for (size_t log = 0; log < CpuKeptLogs; log++)
+        {
+            Kept* blocks[CpuKeptPages];
+            ulong count;
+            {
+                Stdlib::AutoLock lock(cpu.Lock);
+                CpuKeptSize& size = cpu.Sizes[log];
+                count = size.Count;
+                for (ulong i = 0; i < count; i++)
+                    blocks[i] = size.Blocks[i];
+                size.Count = 0;
+            }
+
+            for (ulong i = 0; i < count; i++)
+            {
+                if (!FixedPgAlloc[log].Free(blocks[i]))
+                    Panic("Can't free kept block 0x%p", blocks[i]);
+                trimmed = true;
+            }
+        }
+    }
+
     for (size_t log = 0; log < Stdlib::ArraySize(KeptBlocks); log++)
     {
         Kept* head;

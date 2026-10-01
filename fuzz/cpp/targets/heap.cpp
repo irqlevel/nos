@@ -372,10 +372,38 @@ ulong CachedCount()
 /* Blocks the page allocator keeps, of every size */
 ulong KeptCount()
 {
+    auto& pa = PageAllocatorImpl::GetInstance();
     ulong n = 0;
-    for (auto& list : PageAllocatorImpl::GetInstance().KeptBlocks)
+    for (auto& list : pa.KeptBlocks)
         n += list.Count;
+    for (auto& cpu : pa.CpuKeptBlocks)
+        for (auto& size : cpu.Sizes)
+            n += size.Count;
     return n;
+}
+
+/* Blocks every CPU's cache of kept blocks holds */
+ulong CpuKeptCount()
+{
+    ulong n = 0;
+    for (auto& cpu : PageAllocatorImpl::GetInstance().CpuKeptBlocks)
+        for (auto& size : cpu.Sizes)
+            n += size.Count;
+    return n;
+}
+
+/* A kept block as it must be, wherever it is kept: of its size's VA, all
+   mapped, marked, and nobody's in use; and kept once */
+void CheckKeptBlock(PageAllocatorImpl& pa, ulong log, ulong va, std::set<ulong>& seen)
+{
+    auto* kept = reinterpret_cast<PageAllocatorImpl::Kept*>(va);
+    INVARIANT(pa.FixedPgAlloc[log].Contains(kept), "a kept block 0x%lx not of its size's VA", va);
+    INVARIANT(IsMapped(va, (1UL << log) * PageBytes), "a kept block 0x%lx not all mapped", va);
+    INVARIANT(kept->Mark == PageAllocatorImpl::KeptMark, "a kept block 0x%lx without its mark", va);
+    auto live = Live.upper_bound(va + (1UL << log) * PageBytes - 1);
+    INVARIANT(live == Live.begin() || std::prev(live)->first + std::prev(live)->second.Size <= va,
+        "a kept block 0x%lx that a block in use overlaps", va);
+    INVARIANT(seen.insert(va).second, "the block 0x%lx kept twice", va);
 }
 
 /* What the heap keeps for its next allocations, between two operations:
@@ -384,26 +412,35 @@ ulong KeptCount()
 void CheckKept()
 {
     auto& pa = PageAllocatorImpl::GetInstance();
+    std::set<ulong> kept;
     for (ulong log = 0; log < Stdlib::ArraySize(pa.KeptBlocks); log++)
     {
         auto& list = pa.KeptBlocks[log];
         INVARIANT(list.Count <= list.Limit, "%lu blocks of %lu pages kept, past the bound of %lu", list.Count,
             1UL << log, list.Limit);
         ulong n = 0;
-        for (auto* kept = list.Head; kept != nullptr; kept = kept->Next)
+        for (auto* block = list.Head; block != nullptr; block = block->Next)
         {
-            ulong va = reinterpret_cast<ulong>(kept);
             INVARIANT(++n <= list.Count, "the list of kept %lu-page blocks is longer than its count %lu",
                 1UL << log, list.Count);
-            INVARIANT(pa.FixedPgAlloc[log].Contains(kept), "a kept block 0x%lx not of its size's VA", va);
-            INVARIANT(IsMapped(va, (1UL << log) * PageBytes), "a kept block 0x%lx not all mapped", va);
-            INVARIANT(kept->Mark == PageAllocatorImpl::KeptMark, "a kept block 0x%lx without its mark", va);
-            auto live = Live.upper_bound(va + (1UL << log) * PageBytes - 1);
-            INVARIANT(live == Live.begin() || std::prev(live)->first + std::prev(live)->second.Size <= va,
-                "a kept block 0x%lx that a block in use overlaps", va);
+            CheckKeptBlock(pa, log, reinterpret_cast<ulong>(block), kept);
         }
         INVARIANT(n == list.Count, "%lu kept %lu-page blocks on a list that counts %lu", n, 1UL << log,
             list.Count);
+    }
+
+    /* Each CPU's: within its bound, which is within KeptBlocks' */
+    for (ulong cpu = 0; cpu < Stdlib::ArraySize(pa.CpuKeptBlocks); cpu++)
+    {
+        for (ulong log = 0; log < PageAllocatorImpl::CpuKeptLogs; log++)
+        {
+            auto& size = pa.CpuKeptBlocks[cpu].Sizes[log];
+            INVARIANT(size.Count <= size.Limit && size.Limit <= pa.KeptBlocks[log].Limit,
+                "CPU %lu keeps %lu blocks of %lu pages, its bound %lu and the shared one %lu", cpu, size.Count,
+                1UL << log, size.Limit, pa.KeptBlocks[log].Limit);
+            for (ulong i = 0; i < size.Count; i++)
+                CheckKeptBlock(pa, log, reinterpret_cast<ulong>(size.Blocks[i]), kept);
+        }
     }
 
     auto& heap = Heap();
@@ -444,7 +481,10 @@ void Alloc(Fuzz::Input& in)
     const bool uninit = in.Bool();
     ulong keptBefore = KeptCount();
     ulong cachedBefore = CachedCount();
+    ulong cpuKeptBefore = CpuKeptCount();
     void* p = uninit ? Heap().AllocUninit(size, 0x54657374) : Heap().Alloc(size, 0x54657374);
+    if (CpuKeptCount() < cpuKeptBefore)
+        Fuzz::Reached("a kept block from a CPU's own");
     if (KeptCount() < keptBefore)
         Fuzz::Reached(uninit ? "a kept block handed out as it was" : "a kept block handed out zeroed");
     if (CachedCount() < cachedBefore)
@@ -611,7 +651,7 @@ void Run(Fuzz::Input& in)
            the one it was taken on moves between their caches; past the
            caches' CPUs there is none, and the pools are reached directly */
         if (in.Chance(32))
-            Fuzz::CurrentCpu = in.Chance(16) ? AllocatorImpl::CacheCpus + in.Below(4) : in.Below(4);
+            Fuzz::CurrentCpu = in.Chance(16) ? Kernel::Mm::CacheCpus + in.Below(4) : in.Below(4);
         switch (in.U8() % 13)
         {
         case 12:

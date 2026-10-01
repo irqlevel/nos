@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cpu_cache.h"
 #include "page_allocator.h"
 #include "pool.h"
 
@@ -82,7 +83,6 @@ private:
 	   Trim -- and trades them with the pools half a cache at a time, the
 	   pool's lock once a batch. A block in a cache is free: FreedTag, and
 	   nobody's. */
-	static constexpr size_t CacheCpus = 64; /* Kernel::MaxCpus: allocator.cpp checks */
 	static constexpr size_t CacheBlocksMax = 16;
 	/* The most a CPU's cache of one size holds: CacheBlocksMax blocks, and
 	   no more bytes than a page -- two of the largest blocks, each of which
@@ -114,7 +114,7 @@ private:
 
 	Pool Pool[PoolCount];
 	PageAllocator* PgAlloc;
-	CpuCache Caches[CacheCpus];
+	CpuCache Caches[CacheCpus]; /* cpu_cache.h's */
 };
 
 }
