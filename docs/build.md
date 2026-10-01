@@ -52,6 +52,29 @@ tables they lack, in `kernel/pass1_tables.cpp`, a file that indexes neither.
 Anything that touches the link or symbol resolution has to keep all three
 working, and the check green.
 
+**The C++ is built at -O2** -- until 2026-10 it had no -O at all, so clang's
+-O0 (`CXX_OPT` in the `Makefile`). What a stack walk needs is kept whatever
+the optimiser does: a frame pointer in every function, a leaf included
+(`-mno-omit-leaf-frame-pointer`, so the function the profiler interrupts
+has its caller in the sample), and no sibling calls
+(`-fno-optimize-sibling-calls`, so a tail call does not take its caller out
+of a backtrace) -- `bt`, the panic handler and `profile` see every frame but
+an inlined function's, which is its caller's. `-fno-strict-aliasing` and
+`-fno-delete-null-pointer-checks` as Linux has them: the heap and the page
+tables read raw memory through whatever struct it is at the time. What -O2
+asks of the code that -O0 never did:
+
+- a wait on memory another CPU, an interrupt or a device writes goes through
+  `Atomic`, an asm with a `"memory"` clobber, or a volatile access; a call
+  the compiler cannot see into is enough only while it stays that way
+- a publish to another CPU is release/acquire (`__atomic_store_n`/
+  `__atomic_load_n`) or `Hal::SmpWmb`/`SmpRmb`: plain stores may be
+  reordered by the compiler now, not only by an arm64 CPU
+- a function called after its caller moved the stack pointer is
+  `noinline` (`Main2`, `ApMain2`, after `ALLOC_CPU_STACK`)
+- an endless loop has a side effect in it (`Pause()`): an empty one is one
+  the compiler may assume ends, and take out
+
 **The link refuses a static constructor.** This kernel runs no
 `.init_array`: a global whose type has a non-`constexpr` constructor or a
 non-trivial destructor would be left as zeroes, and was -- `Pci`'s config lock
