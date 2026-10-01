@@ -15,6 +15,11 @@ void* Alloc(size_t size, ulong tag)
 	return AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Alloc(size, tag);
 }
 
+void* AllocUninit(size_t size, ulong tag)
+{
+	return AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).AllocUninit(size, tag);
+}
+
 void Free(void* ptr)
 {
 	AllocatorImpl::GetInstance(&PageAllocatorImpl::GetInstance()).Free(ptr);

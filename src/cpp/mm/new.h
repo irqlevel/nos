@@ -11,6 +11,10 @@ namespace Mm
 
 void* Alloc(size_t size, ulong tag);
 
+/* Alloc with no promise about what the block holds: for Rust's global
+   allocator (AllocatorImpl::AllocUninit) */
+void* AllocUninit(size_t size, ulong tag);
+
 void Free(void* ptr);
 
 void* AllocMapPages(size_t numPages, ulong* physAddr);

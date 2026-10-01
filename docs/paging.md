@@ -178,8 +178,31 @@ makes a leak report name its owner). An 8-byte header goes on every request,
 so the smallest class actually reached is 16 bytes and the largest is 2 KiB;
 a request of 2040 bytes or more goes straight to the page allocator. `Free`
 tells the two apart by alignment — a page-aligned pointer came from the page
-allocator — and checks a magic word otherwise. Freed blocks are stamped with
-a poison tag, which is how a double free is caught.
+allocator — and checks a magic word otherwise. A free block carries a poison
+tag, swapped for the owner's and back by compare-and-swap, which is how a
+double free is caught — on two CPUs at once too — and a block handed out
+twice, or written into while free.
+
+What the heap keeps between a free and the next allocation, so that neither
+costs what the first one did (`heapbench`, below, measures each):
+
+- **A cache per CPU in front of the pools.** A few free blocks of each size,
+  under a lock only that CPU takes, traded with the pool half a cache at a
+  time — so allocations of one size on several CPUs do not all queue on the
+  pool's lock. Used once the CPU can say which it is (`Hal::IrqChipReady`).
+- **An empty page per pool.** The largest class's block has a page to
+  itself, so without it every allocation and free of 1 to 2 KiB was a page
+  mapped and unmapped.
+- **Freed blocks of the page allocator, still mapped** — a bounded list per
+  size, a thousandth of RAM at most and never more than 512 KiB a size. A
+  block that comes back costs no map and, on x86, no TLB shootdown of every
+  other CPU. `Mm::Alloc` zeroes a kept block, as fresh pages always are;
+  `Mm::AllocUninit`, what Rust's global allocator calls, does not —
+  `GlobalAlloc::alloc` promises no contents, and `alloc_zeroed` zeroes on the
+  Rust side. DMA buffers (`UnmapFreePages`) are never kept.
+
+`AllocatorImpl::Trim` gives all of it back; an allocation that finds no page
+or no VA trims the page allocator's lists and tries once more before refusing.
 
 `operator new` sits on top of `Mm::Alloc`, and its contract is unusual:
 **plain `new T(...)` panics on OOM and never returns nullptr**. The
@@ -272,6 +295,8 @@ machine.
 - `meminfo` — the firmware memory map, and how much of it the kernel
   actually uses (RAM reported vs. RAM reachable).
 - `memusage` — free and total page counts.
+- `heapbench` (a module, `insmod /heapbench.ko`; [Modules](modules.md)) —
+  what an allocation and a free cost, size by size, on one CPU and on all.
 - `memcheck` — `CheckFreeList` walks every descriptor and reports any page
   that is on the free list but must not be: inside a reserved region, inside
   the kernel image, or outside usable RAM. That invariant is what the whole

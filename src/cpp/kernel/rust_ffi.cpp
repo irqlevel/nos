@@ -222,15 +222,17 @@ void* kernel_alloc(unsigned long size, unsigned long align)
     if (align == 0 || (align & (align - 1)) != 0)
         Panic("kernel_alloc: bad align %lu", align);
 
-    /* Mm::Alloc guarantees 8-byte alignment */
+    /* Mm::Alloc guarantees 8-byte alignment. AllocUninit: GlobalAlloc::alloc
+       promises nothing about the contents, and alloc_zeroed zeroes them on
+       the Rust side. */
     if (align <= 8)
-        return Kernel::Mm::Alloc(size, RustAllocTag);
+        return Kernel::Mm::AllocUninit(size, RustAllocTag);
 
     /* Over-aligned (#[repr(align)] / SIMD types): over-allocate and stash
        the original pointer just below the aligned address for kernel_free */
     if (size > (unsigned long)-1 - align - sizeof(void*))
         return nullptr;
-    void* raw = Kernel::Mm::Alloc(size + align + sizeof(void*), RustAllocTag);
+    void* raw = Kernel::Mm::AllocUninit(size + align + sizeof(void*), RustAllocTag);
     if (raw == nullptr)
         return nullptr;
     unsigned long aligned =

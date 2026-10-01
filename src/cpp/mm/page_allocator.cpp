@@ -140,6 +140,11 @@ bool FixedPageAllocator::Free(void* addr)
     return true;
 }
 
+bool FixedPageAllocator::Contains(void* addr)
+{
+    return VaAlloc.Contains((ulong)addr);
+}
+
 PageAllocatorImpl::PageAllocatorImpl()
 {
 }
@@ -176,6 +181,13 @@ bool PageAllocatorImpl::Setup()
         return false;
     }
 
+    ulong keptPages = Stdlib::Min<ulong>(KeptPagesMax, freePagesCount / KeptRamShare);
+    for (size_t i = 0; i < Stdlib::ArraySize(KeptBlocks); i++)
+    {
+        Stdlib::AutoLock lock(KeptBlocks[i].Lock);
+        KeptBlocks[i].Limit = keptPages >> i;
+    }
+
     return true;
 }
 
@@ -184,7 +196,7 @@ PageAllocatorImpl::~PageAllocatorImpl()
     Trace(0, "0x%p dtor", this);
 }
 
-void* PageAllocatorImpl::Alloc(size_t numPages)
+void* PageAllocatorImpl::Alloc(size_t numPages, bool zero)
 {
     BugOn(numPages == 0);
 
@@ -192,20 +204,118 @@ void* PageAllocatorImpl::Alloc(size_t numPages)
     if (log >= Stdlib::ArraySize(FixedPgAlloc))
         return nullptr;
 
-    return FixedPgAlloc[log].Alloc();
+    /* Zeroed when asked, as a block of fresh pages always is: whoever had
+       it last wrote into it, and a caller of Mm::Alloc may count on what
+       the page allocator has always handed out */
+    void* kept = TakeKept(log);
+    if (kept != nullptr)
+    {
+        if (zero)
+            Stdlib::MemSet(kept, 0, (1UL << log) * Const::PageSize);
+        return kept;
+    }
+
+    void* block = FixedPgAlloc[log].Alloc();
+    /* No page, or no VA of this size: what the caches hold may be both */
+    if (block == nullptr && Trim())
+        block = FixedPgAlloc[log].Alloc();
+    return block;
 }
 
 void PageAllocatorImpl::Free(void* addr)
 {
+    size_t log;
+    if (!ClassOf(addr, log))
+        Panic("Can't free addr 0x%p", addr);
+
+    if (!Keep(log, addr))
+        Release(addr);
+}
+
+bool PageAllocatorImpl::ClassOf(void* addr, size_t& log)
+{
     for (size_t i = 0; i < Stdlib::ArraySize(FixedPgAlloc); i++)
     {
-        if (FixedPgAlloc[i].Free(addr))
+        if (FixedPgAlloc[i].Contains(addr))
         {
-            return;
+            log = i;
+            return true;
         }
     }
+    return false;
+}
 
-    Panic("Can't free addr 0x%p", addr);
+void PageAllocatorImpl::Release(void* addr)
+{
+    size_t log;
+    if (!ClassOf(addr, log) || !FixedPgAlloc[log].Free(addr))
+        Panic("Can't free addr 0x%p", addr);
+}
+
+bool PageAllocatorImpl::Keep(size_t log, void* ptr)
+{
+    BugOn(log >= Stdlib::ArraySize(KeptBlocks));
+    auto& list = KeptBlocks[log];
+    Kept* block = static_cast<Kept*>(ptr);
+
+    Stdlib::AutoLock lock(list.Lock);
+    /* A block on the list carries the mark; one that is not may too, by
+       chance, so the mark only says where to look */
+    if (block->Mark == KeptMark)
+    {
+        for (Kept* kept = list.Head; kept != nullptr; kept = kept->Next)
+            if (kept == block)
+                Panic("Double free of 0x%p", ptr);
+    }
+    if (list.Count >= list.Limit)
+        return false;
+
+    block->Next = list.Head;
+    block->Mark = KeptMark;
+    list.Head = block;
+    list.Count++;
+    return true;
+}
+
+void* PageAllocatorImpl::TakeKept(size_t log)
+{
+    BugOn(log >= Stdlib::ArraySize(KeptBlocks));
+    auto& list = KeptBlocks[log];
+
+    Stdlib::AutoLock lock(list.Lock);
+    Kept* block = list.Head;
+    if (block == nullptr)
+        return nullptr;
+    list.Head = block->Next;
+    list.Count--;
+    return block;
+}
+
+/* Each list is taken whole under its lock and released with the lock let
+   go of: a release unmaps, and the shootdown waits on every other CPU */
+bool PageAllocatorImpl::Trim()
+{
+    bool trimmed = false;
+    for (size_t log = 0; log < Stdlib::ArraySize(KeptBlocks); log++)
+    {
+        Kept* head;
+        {
+            Stdlib::AutoLock lock(KeptBlocks[log].Lock);
+            head = KeptBlocks[log].Head;
+            KeptBlocks[log].Head = nullptr;
+            KeptBlocks[log].Count = 0;
+        }
+
+        while (head != nullptr)
+        {
+            Kept* next = head->Next;
+            if (!FixedPgAlloc[log].Free(head))
+                Panic("Can't free kept block 0x%p", head);
+            head = next;
+            trimmed = true;
+        }
+    }
+    return trimmed;
 }
 
 void* PageAllocatorImpl::AllocMapPages(size_t numPages, ulong* physAddr)
@@ -216,13 +326,22 @@ void* PageAllocatorImpl::AllocMapPages(size_t numPages, ulong* physAddr)
     if (log >= Stdlib::ArraySize(FixedPgAlloc))
         return nullptr;
 
+    /* Kept blocks hold pages and this size's VA both: once more without
+       them before refusing */
+    void* result = TryAllocMapPages(log, physAddr);
+    if (result == nullptr && Trim())
+        result = TryAllocMapPages(log, physAddr);
+    return result;
+}
+
+void* PageAllocatorImpl::TryAllocMapPages(size_t log, ulong* physAddr)
+{
     size_t roundedPages = 1UL << log;
     auto& pt = PageTable::GetInstance();
     Page* pages = pt.AllocContiguousPages(roundedPages);
     if (!pages)
         return nullptr;
 
-    *physAddr = pages->GetPhyAddress();
     void* result = FixedPgAlloc[log].Map(pages);
     if (!result)
     {
@@ -230,12 +349,15 @@ void* PageAllocatorImpl::AllocMapPages(size_t numPages, ulong* physAddr)
             pt.FreePage(&pages[i]);
         return nullptr;
     }
+    *physAddr = pages->GetPhyAddress();
     return result;
 }
 
+/* Not kept: a DMA buffer's pages go back to the page allocator as they
+   always have */
 void PageAllocatorImpl::UnmapFreePages(void* ptr)
 {
-    Free(ptr);
+    Release(ptr);
 }
 
 void* PageAllocatorImpl::MapPages(size_t numPages, ulong* physAddrs)
