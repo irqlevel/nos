@@ -75,6 +75,23 @@ KERNEL = $(KERNEL_$(ARCH))
 
 CPPFLAGS = -I$(CURDIR)/src/cpp -I$(CURDIR)/src/cpp/lib -I$(OUT)
 CXXFLAGS = --target=$(TARGET) -std=c++20 -g3 -ggdb3 -fno-exceptions -fno-rtti -ffreestanding -nostdlib -fno-builtin -fno-omit-frame-pointer -Wall -Wextra -Wformat=2 -Werror $(ARCH_CXXFLAGS_$(ARCH)) -DKERNEL_VERSION=\"$(VERSION)\"
+# Optimised. Until 2026-10 the C++ had no -O at all, so clang's -O0; the
+# rest keeps what a stack walk needs whatever the optimiser does -- every
+# frame on the frame-pointer chain:
+#   -mno-omit-leaf-frame-pointer   a leaf the profiler interrupts still has a
+#                                  frame, so its caller is in the sample
+#   -fno-optimize-sibling-calls    a tail call does not replace the caller's
+#                                  frame, so the caller is in a backtrace
+# and drops two optimisations a kernel's code is not written for:
+#   -fno-strict-aliasing           the heap's headers, a pool's pages, the
+#                                  page tables are all raw memory read through
+#                                  the struct of the moment
+#   -fno-delete-null-pointer-checks  a null check after a dereference stays,
+#                                  to report what it catches
+# Signed overflow stays undefined (no -fwrapv): UBSAN=1 builds report it.
+CXX_OPT = -O2 -mno-omit-leaf-frame-pointer -fno-optimize-sibling-calls -fno-strict-aliasing \
+    -fno-delete-null-pointer-checks
+CXXFLAGS += $(CXX_OPT)
 # `function` checks an indirect call against a signature put in front of
 # every function, which the Rust and assembly callees here do not have;
 # `vptr` needs RTTI.
