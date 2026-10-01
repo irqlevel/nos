@@ -1762,6 +1762,185 @@ Stdlib::Error TestStrStr()
     return MakeSuccess();
 }
 
+/* MemSet, MemCpy and MemMove held to a byte at a time -- on arm64 the
+   assembly of string.S, which every copy the kernel makes goes through, its
+   Rust's included; on x86 stdlib_asm.asm's. Every size to two blocks past
+   the 64-byte loop, at every alignment of the destination to 16 and four of
+   the source; MemMove over every overlap either way; and once at a size
+   past two pages. The guard bytes either side of what was written must come
+   through untouched. */
+namespace
+{
+
+const u8 MemGuardByte = 0xA5;
+const u8 MemSetByte = 0x5C;
+const ulong MemGuard = 16;
+const ulong MemSmallMax = 130;
+const ulong MemEdges[] = { 191, 192, 193, 255, 256, 257 };
+const ulong MemSrcOffsets[] = { 0, 3, 8, 13 };
+const ulong MemAlign = 16;
+const ulong MemLarge = 2 * Const::PageSize + 77;
+const ulong MemBufSize = MemLarge + 2 * MemAlign + 2 * MemGuard;
+const ulong MemTag = 'memt';
+/* Copies, and sets, of MemLarge bytes the throughput check times: half a
+   megabyte, a quarter of a millisecond at a byte a cycle */
+const ulong MemRateRounds = 64;
+const ulong NsPerUs = 1000;
+
+u8 MemPattern(ulong i)
+{
+    return static_cast<u8>(i * 7 + 13);
+}
+
+/* What dst holds after [at, at + n) was set from expected(i - at), the rest
+   still guard bytes; false, said, otherwise */
+bool MemCheck(const char* what, const u8* dst, ulong cap, ulong at, ulong n, const u8* from, bool set)
+{
+    for (ulong i = 0; i < cap; i++)
+    {
+        u8 expected = MemGuardByte;
+        if (i >= at && i < at + n)
+            expected = set ? MemSetByte : from[i - at];
+        if (dst[i] != expected)
+        {
+            Trace(0, "TestMemRoutines: %s of %lu at +%lu: byte %lu is 0x%x, not 0x%x", what, n, at, i,
+                static_cast<unsigned int>(dst[i]), static_cast<unsigned int>(expected));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MemCase(u8* src, u8* dst, ulong n, ulong srcOff, ulong dstOff)
+{
+    const ulong cap = dstOff + n + MemGuard;
+    for (ulong i = 0; i < srcOff + n; i++)
+        src[i] = MemPattern(i);
+
+    Stdlib::MemSet(dst, MemGuardByte, cap);
+    Stdlib::MemCpy(dst + dstOff, src + srcOff, n);
+    if (!MemCheck("MemCpy", dst, cap, dstOff, n, src + srcOff, false))
+        return false;
+
+    /* MemMove without an overlap is a copy */
+    Stdlib::MemSet(dst, MemGuardByte, cap);
+    Stdlib::MemMove(dst + dstOff, src + srcOff, n);
+    if (!MemCheck("MemMove", dst, cap, dstOff, n, src + srcOff, false))
+        return false;
+
+    /* The guard bytes set a byte at a time, so MemSet is held to the loop and
+       not to itself */
+    for (ulong i = 0; i < cap; i++)
+        dst[i] = MemGuardByte;
+    Stdlib::MemSet(dst + dstOff, MemSetByte, n);
+    return MemCheck("MemSet", dst, cap, dstOff, n, nullptr, true);
+}
+
+/* MemMove of n bytes within buf, from+src to from+dst, against a copy made a
+   byte at a time through ref */
+bool MemOverlap(u8* buf, u8* ref, ulong cap, ulong src, ulong dst, ulong n)
+{
+    for (ulong i = 0; i < cap; i++)
+        buf[i] = MemPattern(i);
+    for (ulong i = 0; i < n; i++)
+        ref[i] = buf[src + i];
+
+    Stdlib::MemMove(buf + dst, buf + src, n);
+    for (ulong i = 0; i < cap; i++)
+    {
+        u8 expected = (i >= dst && i < dst + n) ? ref[i - dst] : MemPattern(i);
+        if (buf[i] != expected)
+        {
+            Trace(0, "TestMemRoutines: MemMove of %lu from +%lu to +%lu: byte %lu is 0x%x, not 0x%x", n, src, dst,
+                i, static_cast<unsigned int>(buf[i]), static_cast<unsigned int>(expected));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool MemRoutines(u8* src, u8* dst, u8* ref)
+{
+    for (ulong n = 0; n <= MemSmallMax + Stdlib::ArraySize(MemEdges); n++)
+    {
+        ulong size = (n <= MemSmallMax) ? n : MemEdges[n - MemSmallMax - 1];
+        for (ulong dstOff = 0; dstOff < MemAlign; dstOff++)
+        {
+            for (ulong srcOff : MemSrcOffsets)
+            {
+                if (!MemCase(src, dst, size, srcOff, dstOff))
+                    return false;
+            }
+        }
+    }
+
+    /* Overlaps: every shift of up to 20 either way, at a base off any
+       boundary */
+    const ulong base = MemGuard + 2 * MemAlign + 3;
+    const long shiftMax = 20;
+    for (ulong n = 0; n <= MemSmallMax + Stdlib::ArraySize(MemEdges); n++)
+    {
+        ulong size = (n <= MemSmallMax) ? n : MemEdges[n - MemSmallMax - 1];
+        for (long shift = -shiftMax; shift <= shiftMax; shift++)
+        {
+            ulong to = static_cast<ulong>(static_cast<long>(base) + shift);
+            if (!MemOverlap(dst, ref, base + size + shiftMax + MemGuard, base, to, size))
+                return false;
+        }
+    }
+
+    /* Past two pages, unaligned both ways, and moved onto itself by a block
+       and a byte, up and down */
+    if (!MemCase(src, dst, MemLarge, 5, 3))
+        return false;
+    const ulong largeCap = MemLarge + 2 * MemAlign + MemGuard;
+    if (!MemOverlap(dst, ref, largeCap, MemAlign, MemAlign + 65, MemLarge - 65) ||
+        !MemOverlap(dst, ref, largeCap, MemAlign + 65, MemAlign, MemLarge - 65) ||
+        !MemOverlap(dst, ref, largeCap, MemAlign, MemAlign + 1, MemLarge - 1) ||
+        !MemOverlap(dst, ref, largeCap, MemAlign + 1, MemAlign, MemLarge - 1))
+        return false;
+    return true;
+}
+
+/* What MemCpy and MemSet cost, said every boot: MB/s, a byte a microsecond */
+void MemRate(u8* src, u8* dst)
+{
+    const ulong start = GetBootTime().GetValue();
+    for (ulong r = 0; r < MemRateRounds; r++)
+        Stdlib::MemCpy(dst, src, MemLarge);
+    const ulong copied = GetBootTime().GetValue();
+    for (ulong r = 0; r < MemRateRounds; r++)
+        Stdlib::MemSet(dst, static_cast<u8>(r), MemLarge);
+    const ulong set = GetBootTime().GetValue();
+
+    const ulong bytes = MemRateRounds * MemLarge;
+    const ulong copyNs = (copied > start) ? copied - start : 1;
+    const ulong setNs = (set > copied) ? set - copied : 1;
+    Trace(0, "TestMemRoutines: MemCpy %lu MB/s, MemSet %lu MB/s", bytes * NsPerUs / copyNs,
+        bytes * NsPerUs / setNs);
+}
+
+}
+
+Stdlib::Error TestMemRoutines()
+{
+    Trace(0, "TestMemRoutines: started");
+
+    u8* bufs = static_cast<u8*>(Mm::Alloc(3 * MemBufSize, MemTag));
+    if (bufs == nullptr)
+        return MakeError(Stdlib::Error::NoMemory);
+
+    bool ok = MemRoutines(bufs, bufs + MemBufSize, bufs + 2 * MemBufSize);
+    if (ok)
+        MemRate(bufs, bufs + MemBufSize);
+    Mm::Free(bufs);
+    if (!ok)
+        return MakeError(Stdlib::Error::Unsuccessful);
+
+    Trace(0, "TestMemRoutines: complete");
+    return MakeSuccess();
+}
+
 Stdlib::Error TestSnPrintf()
 {
     Trace(0, "TestSnPrintf: started");
@@ -2601,6 +2780,10 @@ Stdlib::Error Test()
     Trace(0, "Self-test in progress, please wait...");
 
     err = TestAllocator();
+    if (!err.Ok())
+        return err;
+
+    err = TestMemRoutines();
     if (!err.Ok())
         return err;
 

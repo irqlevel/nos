@@ -265,7 +265,8 @@ ASM_S_SRC_x86_64 =
 ASM_S_SRC_aarch64 = \
     src/cpp/arch/arm64/boot.S \
     src/cpp/arch/arm64/asm.S \
-    src/cpp/arch/arm64/vectors.S
+    src/cpp/arch/arm64/vectors.S \
+    src/cpp/arch/arm64/string.S
 ASM_S_SRC = $(ASM_S_SRC_$(ARCH))
 
 OBJS = $(patsubst src/cpp/%.cpp,$(OUT)/%.o,$(CXX_SRC)) $(patsubst src/cpp/%.asm,$(OUT)/%.o,$(ASM_SRC)) $(patsubst src/cpp/%.S,$(OUT)/%.o,$(ASM_S_SRC))
