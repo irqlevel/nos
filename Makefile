@@ -163,7 +163,6 @@ CXX_SRC_x86_64 =   \
     src/cpp/kernel/object_table.cpp \
     src/cpp/kernel/parameters.cpp \
     src/cpp/kernel/raw_spin_lock.cpp \
-    src/cpp/kernel/lockless_ring.cpp \
     src/cpp/kernel/profiler.cpp \
     src/cpp/kernel/raw_rw_spin_lock.cpp \
     src/cpp/kernel/rw_mutex.cpp \
@@ -226,7 +225,6 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/atomic.cpp \
     src/cpp/kernel/spin_lock.cpp \
     src/cpp/kernel/raw_spin_lock.cpp \
-    src/cpp/kernel/lockless_ring.cpp \
     src/cpp/kernel/profiler.cpp \
     src/cpp/kernel/raw_rw_spin_lock.cpp \
     src/cpp/kernel/preempt.cpp \

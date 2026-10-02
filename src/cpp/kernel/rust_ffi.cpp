@@ -5,7 +5,6 @@
 #include "mutex.h"
 #include "wait_group.h"
 #include "event.h"
-#include "lockless_ring.h"
 #include "spin_lock.h"
 #include "raw_spin_lock.h"
 #include "raw_rw_spin_lock.h"
@@ -42,9 +41,6 @@ static const ulong RustAllocTag = 'rust';
 static const unsigned long PrinterChunkSize = 128;
 
 /* Longer than any net device's name: VirtioNet's are at most 7 */
-
-/* kernel_ring_create's ceiling: a ring's cells are one allocation */
-static const unsigned long RingMaxCapacity = 1UL << 20;
 
 /* kernel_cmd_dispatch: the longest command line it runs -- as long as a line
    of /etc/rc (cmd.cpp's ScriptLineMax): a guest's `hv start` over SSH with a
@@ -1805,76 +1801,6 @@ int kernel_root_read_only()
 int kernel_root_fstest()
 {
     return Kernel::Parameters::GetInstance().IsFsTest() ? 1 : 0;
-}
-
-/* The kernel's lockless ring for Rust (kcore::ring): a bounded MPMC queue of
-   words, safe from any context. The ring and its cells are allocated apart,
-   as NetFramePool does it. */
-struct RustRing
-{
-    Kernel::LocklessRing Ring;
-    Kernel::LocklessRing::Cell* Cells;
-};
-
-unsigned long kernel_ring_create(unsigned long capacity)
-{
-    if (capacity == 0 || capacity > RingMaxCapacity || (capacity & (capacity - 1)) != 0)
-        return 0;
-
-    auto* cells = static_cast<Kernel::LocklessRing::Cell*>(
-        Kernel::Mm::Alloc(capacity * sizeof(Kernel::LocklessRing::Cell), RustAllocTag));
-    if (cells == nullptr)
-        return 0;
-
-    RustRing* ring = Kernel::Mm::TAlloc<RustRing, RustAllocTag>();
-    if (ring == nullptr)
-    {
-        Kernel::Mm::Free(cells);
-        return 0;
-    }
-
-    ring->Cells = cells;
-    if (!ring->Ring.Setup(cells, capacity))
-    {
-        ring->~RustRing();
-        Kernel::Mm::Free(ring);
-        Kernel::Mm::Free(cells);
-        return 0;
-    }
-
-    return (unsigned long)ring;
-}
-
-void kernel_ring_destroy(unsigned long handle)
-{
-    if (handle == 0)
-        return;
-
-    RustRing* ring = reinterpret_cast<RustRing*>(handle);
-    Kernel::LocklessRing::Cell* cells = ring->Cells;
-    ring->~RustRing();
-    Kernel::Mm::Free(ring);
-    Kernel::Mm::Free(cells);
-}
-
-int kernel_ring_push(unsigned long handle, unsigned long value)
-{
-    return reinterpret_cast<RustRing*>(handle)->Ring.Enqueue((void*)value) ? 1 : 0;
-}
-
-int kernel_ring_pop(unsigned long handle, unsigned long* value)
-{
-    void* data;
-    if (!reinterpret_cast<RustRing*>(handle)->Ring.Dequeue(data))
-        return 0;
-
-    *value = (unsigned long)data;
-    return 1;
-}
-
-unsigned long kernel_ring_count(unsigned long handle)
-{
-    return reinterpret_cast<RustRing*>(handle)->Ring.Count();
 }
 
 /* Net devices from Rust, both sides of them -- the driver's and the

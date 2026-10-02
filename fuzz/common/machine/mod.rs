@@ -1,9 +1,9 @@
 //! The machine the kernel's crates run on in a fuzzer: the kernel's C++
 //! half, as the `ffi` crate declares it (`ffi`: locks, tasks, soft IRQs,
-//! timers, the clock, the entropy pool, the log, the command table, the
-//! lockless ring), the CPUs that run its tasks one at a time (`sched`) and
-//! its allocator (`heap`). What a fuzzer's layer has of its own -- a NIC, a
-//! disk, a command line -- the fuzzer adds beside it.
+//! timers, the clock, the entropy pool, the log and the command table), the
+//! CPUs that run its tasks one at a time (`sched`) and its allocator
+//! (`heap`). What a fuzzer's layer has of its own -- a NIC, a disk, a
+//! command line -- the fuzzer adds beside it.
 
 pub mod cmd;
 pub mod ffi;
@@ -139,55 +139,6 @@ pub fn trace_mark() -> u64 {
 /// The lines traced since `mark` that the log still holds.
 pub fn traced_since(mark: u64) -> Vec<Vec<u8>> {
     DMESG.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(n, _)| *n >= mark).map(|(_, l)| l.clone()).collect()
-}
-
-/* ---- the lockless ring ---- */
-
-struct Ring {
-    words: VecDeque<usize>,
-    capacity: usize,
-    alive: bool,
-}
-
-static RINGS: Mutex<Vec<Ring>> = Mutex::new(Vec::new());
-
-pub fn ring_create(capacity: usize) -> usize {
-    if capacity == 0 || !capacity.is_power_of_two() {
-        return 0;
-    }
-    let mut r = RINGS.lock().unwrap_or_else(|e| e.into_inner());
-    r.push(Ring { words: VecDeque::with_capacity(capacity), capacity, alive: true });
-    r.len()
-}
-
-fn with_ring<R>(ring: usize, f: impl FnOnce(&mut Ring) -> R) -> R {
-    let mut r = RINGS.lock().unwrap_or_else(|e| e.into_inner());
-    match ring.checked_sub(1).and_then(|i| r.get_mut(i)) {
-        Some(ring) if ring.alive => f(ring),
-        _ => panic!("invariant: ring {} is no ring", ring),
-    }
-}
-
-pub fn ring_destroy(ring: usize) {
-    with_ring(ring, |r| r.alive = false)
-}
-
-pub fn ring_push(ring: usize, value: usize) -> bool {
-    with_ring(ring, |r| {
-        if r.words.len() == r.capacity {
-            return false;
-        }
-        r.words.push_back(value);
-        true
-    })
-}
-
-pub fn ring_pop(ring: usize) -> Option<usize> {
-    with_ring(ring, |r| r.words.pop_front())
-}
-
-pub fn ring_count(ring: usize) -> usize {
-    with_ring(ring, |r| r.words.len())
 }
 
 /* ---- the CPUs ---- */

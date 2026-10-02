@@ -2,7 +2,7 @@
 //! own -- no allocation anywhere, so it can be a `static` and be used from
 //! the first line of the boot, before there is a page allocator.
 //!
-//! The structure is Vyukov's, the same one `kernel/lockless_ring.h` uses:
+//! The structure is Vyukov's, the same one `ring::LocklessRing` uses:
 //! every cell carries a sequence number, and a producer or consumer claims a
 //! slot by advancing a shared position with a single compare-and-swap.
 //! Sequence numbers only ever increase, so there is no ABA to have and no
@@ -11,7 +11,7 @@
 //! the places that must not -- a hard IRQ handler, code under a spinlock, the
 //! panic path.
 //!
-//! One difference from the kernel's, and the reason this can be a `static`
+//! One difference from `LocklessRing`, and the reason this can be a `static`
 //! with no initialiser to run: Vyukov's cells start with `seq[i] = i`, which
 //! no constant can express for an array. Each cell here holds that number
 //! **less its own index**, which starts every cell at zero. The index is a

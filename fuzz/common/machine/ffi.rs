@@ -314,42 +314,6 @@ pub unsafe extern "C" fn kernel_panic(msg: *const u8, len: usize) -> ! {
     panic!("the kernel panicked: {}", msg)
 }
 
-/* ---- the lockless ring ---- */
-
-#[no_mangle]
-pub extern "C" fn kernel_ring_create(capacity: usize) -> usize {
-    sched::harness(|| super::ring_create(capacity))
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_ring_destroy(ring: usize) {
-    sched::harness(|| super::ring_destroy(ring))
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_ring_push(ring: usize, value: usize) -> i32 {
-    sched::harness(|| super::ring_push(ring, value)) as i32
-}
-
-/// # Safety
-/// `value` is writable.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_ring_pop(ring: usize, value: *mut usize) -> i32 {
-    match sched::harness(|| super::ring_pop(ring)) {
-        Some(v) => {
-            // SAFETY: the caller's local, `LocklessRing::pop`'s.
-            unsafe { *value = v };
-            1
-        }
-        None => 0,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn kernel_ring_count(ring: usize) -> usize {
-    sched::harness(|| super::ring_count(ring))
-}
-
 /* ---- memory ---- */
 
 /// Pages for a device to reach: the host's, page-aligned and zeroed, their

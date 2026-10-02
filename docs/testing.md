@@ -24,7 +24,19 @@ Self-tests live in `src/cpp/kernel/test.cpp`; each is a
 every alignment and read back on every running CPU, each through its own
 slot of the temporary window, which is how every copy of a guest's memory is
 made. A slot that maps the wrong page fails it (`frame selftest: ...`), and
-so the smoke boot, on both architectures.
+so the smoke boot, on both architectures. The ring test
+(`kernel/src/ring.rs`) takes `kcore::ring::LocklessRing` -- what the frame
+pool and netblk pass frames and requests through -- full and empty lap after
+lap, then runs one producer and one consumer through two cells, and two of
+each through sixteen, each task on a CPU of its own where there are four:
+nothing lost, nothing twice, each producer's values in its order, and what a
+producer wrote before a push seen by whoever pops it. That last is what a
+memory ordering too weak would break on arm64 alone, and the one-to-one run
+is what catches it: a ring whose sequences were relaxed failed eight boots
+of eight under HVF, while TCG on an x86 host may never show it. Its line
+says what a push and a pop cost on one CPU and how long each run took
+(`ring selftest: passed ...`): a number every boot prints is noticed when it
+moves.
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.
