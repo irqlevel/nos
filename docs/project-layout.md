@@ -18,7 +18,7 @@ src/cpp/
   kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, timers, the timekeeping seam (time.h), locks (spinlock, mutex, seqlock, rwlock), panic and backtrace, the dmesg ring buffer, the command line (parameters.cpp), the interactive shell (cmd.cpp), the input layer (input.cpp), the ChaCha20 random pool every source feeds and everything reads from (random.cpp, entropy.h), the boot self-tests (test.cpp), the module loader (module.cpp), the Rust FFI bridge (rust_ffi.cpp), the symbol table
   drivers/    Hardware: serial, the console (screen.cpp picks EGA text on BIOS or the 8x16-font pixel framebuffer under UEFI), PIT, HPET, RTC, the 8042 keyboard, PCI, MSI-X, ACPI. No virtio and no USB: both are Rust (src/rust/virtio, src/rust/drivers)
   mm/         Memory: 4-level page tables (the VirtToPhys walk, ProtectRange), the page allocator (fixed-size block allocators), the pool allocator, the VA allocator, new/delete
-  lib/        Freestanding stdlib equivalents (Stdlib::): list, vector, btree, ring buffer, bitmap, CRC32, ChaCha20, formatting, errors and results, smart pointers. MemSet/MemCpy/StrLen and their like are per architecture (arch/x86_64/stdlib_asm.asm, arch/arm64/stdlib_c.cpp)
+  lib/        Freestanding stdlib equivalents (Stdlib::): list, vector, ring buffer, bitmap, CRC32, ChaCha20, formatting, errors and results, smart pointers. MemSet/MemCpy/StrLen and their like are per architecture (arch/x86_64/stdlib_asm.asm, arch/arm64/stdlib_c.cpp)
   include/    Shared headers
 src/rust/
   ffi/        Raw extern "C" FFI declarations for kernel services

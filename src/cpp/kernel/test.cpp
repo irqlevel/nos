@@ -15,7 +15,6 @@
 #include "event.h"
 #include <hal/cpu.h>
 
-#include <lib/btree.h>
 #include <lib/checksum.h>
 #include <lib/error.h>
 #include <lib/grub_env.h>
@@ -33,174 +32,6 @@ namespace Test
 {
 
 static const ulong Tag = 'Test';
-
-Stdlib::Error TestBtree()
-{
-    Stdlib::Error err;
-
-    Trace(0, "TestBtree: started");
-
-    size_t keyCount = 431;
-
-    Stdlib::Vector<size_t> pos;
-    if (!pos.ReserveAndUse(keyCount))
-        return MakeError(Stdlib::Error::NoMemory);
-
-    for (size_t i = 0; i < keyCount; i++)
-    {
-        pos[i] = i;
-    }
-
-    Stdlib::Vector<u32> key;
-    if (!key.ReserveAndUse(keyCount))
-        return MakeError(Stdlib::Error::NoMemory);
-    for (size_t i = 0; i < keyCount; i++)
-        key[i] = i;
-
-    Stdlib::Vector<u32> value;
-    if (!value.ReserveAndUse(keyCount))
-        return MakeError(Stdlib::Error::NoMemory);
-
-    for (size_t i = 0; i < keyCount; i++)
-        value[i] = i;
-
-    Stdlib::Btree<u32, u32, 4> tree;
-
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    for (size_t i = 0; i < keyCount; i++)
-    {
-        if (!tree.Insert(key[pos[i]], value[pos[i]]))
-        {
-            Trace(TestLL, "TestBtree: cant insert key %u", key[pos[i]]);
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-    }
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    for (size_t i = 0; i < keyCount; i++)
-    {
-        bool exist;
-        auto foundValue = tree.Lookup(key[pos[i]], exist);
-        if (!exist)
-        {
-            Trace(TestLL, "TestBtree: cant find key");
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-
-        if (foundValue != value[pos[i]])
-        {
-            Trace(TestLL, "TestBtree: unexpected found value");
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-    }
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    for (size_t i = 0; i < keyCount / 2; i++)
-    {
-        if (!tree.Delete(key[pos[i]]))
-        {
-            Trace(TestLL, "TestBtree: cant delete key[%lu][%lu]=%u", i, pos[i], key[pos[i]]);
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-    }
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    for (size_t i = keyCount / 2; i < keyCount; i++)
-    {
-        bool exist;
-        auto foundValue = tree.Lookup(key[pos[i]], exist);
-        if (!exist)
-        {
-            Trace(TestLL, "TestBtree: cant find key");
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-
-        if (foundValue != value[pos[i]])
-        {
-            Trace(TestLL, "TestBtree: unexpected found value");
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-    }
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    for (size_t i = keyCount / 2; i < keyCount; i++)
-    {
-        if (!tree.Delete(key[pos[i]]))
-        {
-            Trace(TestLL, "TestBtree: cant delete key");
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-    }
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    for (size_t i = 0; i < keyCount; i++)
-    {
-        bool exist;
-        tree.Lookup(key[pos[i]], exist);
-        if (exist)
-        {
-            Trace(TestLL, "TestBtree: key still exist");
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-    }
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    for (size_t i = 0; i < keyCount; i++)
-    {
-        if (!tree.Insert(key[pos[i]], value[pos[i]]))
-        {
-            Trace(TestLL, "TestBtree: can't insert key'");
-            return MakeError(Stdlib::Error::Unsuccessful);
-        }
-    }
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    Trace(TestLL, "TestBtree: min depth %ld max depth %ld", tree.MinDepth(), tree.MaxDepth());
-
-    tree.Clear();
-    if (!tree.Check())
-    {
-        Trace(TestLL, "TestBtree: check failed");
-        return MakeError(Stdlib::Error::Unsuccessful);
-    }
-
-    Trace(TestLL, "TestBtree: complete");
-
-    return MakeError(Stdlib::Error::Success);
-}
 
 Stdlib::Error TestAllocator()
 {
@@ -2809,10 +2640,6 @@ Stdlib::Error Test()
         return err;
 
     err = TestCrc32();
-    if (!err.Ok())
-        return err;
-
-    err = TestBtree();
     if (!err.Ok())
         return err;
 
