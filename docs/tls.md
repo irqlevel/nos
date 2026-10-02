@@ -18,7 +18,7 @@ What the kernel supplies, and already had:
 | TLS needs | comes from |
 |---|---|
 | a byte transport | the TCP of `src/rust/net` (`tcp.rs`) |
-| randomness | `Kernel::Random` — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
+| randomness | the kernel's pool (`src/rust/random`, reached through `kcore::random`) — a ChaCha20 pool over RDSEED/RDRAND, RNDR, virtio-rng and timing jitter, see [Randomness](random.md) |
 | a wall clock, for certificate validity | `GetWallTimeSecs()` |
 | a heap | the Rust global allocator over `Mm::Alloc` |
 

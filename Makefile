@@ -170,15 +170,12 @@ CXX_SRC_x86_64 =   \
     src/cpp/kernel/stack_probe.cpp \
     src/cpp/kernel/symtab.cpp \
     src/cpp/kernel/pass1_tables.cpp \
-    src/cpp/kernel/entropy.cpp \
-    src/cpp/kernel/random.cpp \
     src/cpp/kernel/rust_ffi.cpp \
     src/cpp/kernel/module.cpp \
     src/cpp/lib/stdlib.cpp  \
     src/cpp/lib/format.cpp \
     src/cpp/lib/bitmap.cpp \
     src/cpp/lib/checksum.cpp \
-    src/cpp/lib/chacha20.cpp \
     src/cpp/lib/grub_env.cpp \
     src/cpp/lib/list_entry.cpp  \
     src/cpp/lib/error.cpp   \
@@ -246,14 +243,11 @@ CXX_SRC_aarch64 = \
     src/cpp/kernel/test.cpp \
     src/cpp/kernel/cmd.cpp \
     src/cpp/kernel/input.cpp \
-    src/cpp/kernel/entropy.cpp \
-    src/cpp/kernel/random.cpp \
     src/cpp/lib/stdlib.cpp \
     src/cpp/lib/format.cpp \
     src/cpp/lib/error.cpp \
     src/cpp/lib/bitmap.cpp \
     src/cpp/lib/checksum.cpp \
-    src/cpp/lib/chacha20.cpp \
     src/cpp/lib/grub_env.cpp \
     src/cpp/lib/list_entry.cpp \
     src/cpp/mm/memory_map.cpp \

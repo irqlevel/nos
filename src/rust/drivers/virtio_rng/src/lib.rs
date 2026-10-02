@@ -16,14 +16,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kcore::consts::PAGE_SIZE;
 use kcore::dma::DmaBuffer;
-use kcore::entropy;
 use kcore::pci;
 use kcore::sync::SpinLock;
 use kcore::trace;
 use virtio::mmio::{MmioTransport, Slot};
 use virtio::{Buf, Queue, Transport};
 
-/// Four of them, as the entropy table has room for (kernel/entropy.h).
+/// Four of them, as the pool's table of sources has room for
+/// (src/rust/random).
 const MAX_DEVICES: usize = 4;
 
 /// How long a request is waited for before the device is given up on. The
@@ -149,9 +149,9 @@ impl Rng {
     }
 }
 
-/// What the kernel's entropy pool calls (kernel/entropy.h). Runs in task
+/// What the kernel's entropy pool calls (src/rust/random). Runs in task
 /// context, from a reseed.
-impl entropy::Source for Rng {
+impl random::Source for Rng {
     fn fill(&'static self, buf: &mut [u8]) -> bool {
         Rng::fill(self, buf)
     }
@@ -163,12 +163,11 @@ fn register(rng: Rng) {
     let rng: &'static Rng = Box::leak(Box::new(rng));
     let name = core::str::from_utf8(&rng.name).unwrap_or("rng?");
 
-    match entropy::register_source(name, rng) {
-        Some(_source) => {
-            DEVICES.fetch_add(1, Ordering::AcqRel);
-            trace!(0, "virtio-rng: {} is an entropy source", name);
-        }
-        None => trace!(0, "virtio-rng: the entropy table would not take another source"),
+    if random::register_source(name, rng) {
+        DEVICES.fetch_add(1, Ordering::AcqRel);
+        trace!(0, "virtio-rng: {} is an entropy source", name);
+    } else {
+        trace!(0, "virtio-rng: the entropy table would not take another source");
     }
 }
 

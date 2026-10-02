@@ -20,7 +20,7 @@
 #include <kernel/ubsan.h>
 #include <kernel/time.h>
 #include <kernel/test.h>
-#include <kernel/random.h>
+#include <hal/random.h>
 #include <kernel/cpu.h>
 #include <kernel/preempt.h>
 #include <kernel/cmd.h>
@@ -49,6 +49,9 @@ extern "C" int rust_disklog_setup();
 extern "C" void rust_disklog_stop();
 extern "C" void rust_test();
 extern "C" void rust_fini();
+/* The random pool is Rust (src/rust/random), the x86 twin's counterpart */
+extern "C" bool rust_random_setup();
+extern "C" void rust_random_reseed();
 /* The partition table reader (src/rust/block), the x86 twin's counterpart */
 extern "C" void rust_partitions_probe();
 
@@ -247,7 +250,7 @@ static void BpStartupArm(void* ctx)
 
         /* The virtio-rng carries the pool on this arch: no cpu here that the
            kernel runs on implements FEAT_RNG, Apple's included. */
-        Random::GetInstance().Reseed();
+        rust_random_reseed();
     }
 
     auto& cpus = CpuTable::GetInstance();
@@ -570,10 +573,11 @@ extern "C" void MainArm64(void* dtb)
 
     TimeInit();
 
-    /* Before the self-tests, which ask the pool for bytes: seeding needs no
-       heap and no device. The virtio-rng is folded in later, once the mmio
-       slots have been probed. */
-    if (!Random::GetInstance().Setup())
+    /* Before anything can ask the pool for bytes: seeding needs no heap and
+       no device, only the probe of the cpu's instruction first. The
+       virtio-rng is folded in later, once the mmio slots have been probed. */
+    Hal::ProbeHwRandom();
+    if (!rust_random_setup())
         Trace(0, "Random: unseeded at boot, https will fail until a source turns up");
 
     Trace(0, "Before test");

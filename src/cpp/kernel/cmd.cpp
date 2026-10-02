@@ -9,8 +9,6 @@
 #include "time.h"
 #include "watchdog.h"
 #include "parameters.h"
-#include "entropy.h"
-#include "random.h"
 #include "console.h"
 #include "mutex.h"
 #include "task.h"
@@ -828,61 +826,6 @@ static void CmdVersion(const char* args, Stdlib::Printer& con)
     con.Printf("nos %s (%s)\n", KERNEL_VERSION, KERNEL_GIT_REV);
 }
 
-static void CmdRandom(const char* args, Stdlib::Printer& con)
-{
-    ulong len = 16;
-    if (args[0] != '\0')
-    {
-        if (!Stdlib::ParseUlong(args, len) || len == 0 || len > 1024)
-        {
-            con.Printf("usage: random [len] (1..1024, default 16)\n");
-            return;
-        }
-    }
-
-    auto& random = Random::GetInstance();
-    if (!random.IsSeeded())
-    {
-        con.Printf("entropy pool is not seeded\n");
-        return;
-    }
-
-    u8 buf[1024];
-    random.GetBytes(buf, len);
-
-    static const char hex[] = "0123456789abcdef";
-    for (ulong i = 0; i < len; i++)
-    {
-        char s[3];
-        s[0] = hex[(buf[i] >> 4) & 0xF];
-        s[1] = hex[buf[i] & 0xF];
-        s[2] = '\0';
-        con.PrintString(s);
-    }
-    con.Printf("\n");
-}
-
-static void CmdEntropy(const char* args, Stdlib::Printer& con)
-{
-    auto& random = Random::GetInstance();
-
-    if (Stdlib::StrCmp(args, "reseed") == 0)
-    {
-        /* Worth having by hand: a source can appear after the pool was seeded
-           (a virtio-rng behind a bus that was scanned late), and on a machine
-           whose only console is a UDP socket this is how one finds out
-           whether it answers. */
-        random.Reseed();
-    }
-    else if (args[0] != '\0')
-    {
-        con.Printf("usage: entropy [reseed]\n");
-        return;
-    }
-
-    random.Dump(con);
-}
-
 static void DumpStackTrace(ulong* frames, size_t count, Stdlib::Printer& con)
 {
     auto& symtab = SymbolTable::GetInstance();
@@ -1509,8 +1452,6 @@ static const CmdEntry Commands[] = {
     { "rmmod",     CmdRmmod,     "rmmod <name> - unload a kernel module" },
     { "lsmod",     CmdLsmod,     "lsmod - list the loaded kernel modules" },
     { "rc",        CmdRc,        "rc [add <command line>|del <n>|clear|run] - show or edit /etc/rc, run at boot" },
-    { "random",    CmdRandom,    "random [len] - get random bytes as hex" },
-    { "entropy",   CmdEntropy,   "entropy [reseed] - show the random pool and its sources" },
     { "version",   CmdVersion,   "version - show kernel version" },
     { "bt",        CmdBt,        "bt <pid> - show task backtrace" },
     { "panic",     CmdPanic,     "panic [pf|div0|ud] - trigger kernel panic" },

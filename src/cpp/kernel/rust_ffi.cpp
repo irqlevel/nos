@@ -13,10 +13,9 @@
 #include "sched.h"
 #include "preempt.h"
 #include "cpu.h"
-#include "random.h"
-#include "entropy.h"
 #include "interrupt.h"
 #include <hal/cpu.h>
+#include <hal/random.h>
 #include <hal/context.h>
 #include <hal/irq_stubs.h>
 #include "softirq.h"
@@ -281,6 +280,13 @@ unsigned long long kernel_get_boot_time_ns()
 unsigned long long kernel_cycle_counter_hz()
 {
     return Hal::CycleCounterHz();
+}
+
+/* The cycle counter as it stands: the TSC on x86-64, the generic timer's
+   virtual count on arm64 */
+unsigned long long kernel_read_cycle_counter()
+{
+    return Hal::ReadCycleCounter();
 }
 
 unsigned long kernel_get_wall_time_secs()
@@ -691,24 +697,6 @@ int kernel_frame_write(unsigned long phys, unsigned long offset,
     const unsigned char* data, unsigned long len)
 {
     return FrameCopy(phys, offset, nullptr, data, len);
-}
-
-int kernel_get_random(unsigned char* buf, unsigned long len)
-{
-    if (!buf || len == 0)
-        return 0;
-
-    /* The pool, not a source: on a bare-metal machine with no virtio-rng
-       there is no source to read, and this returning 0 is what a TLS
-       handshake fails with (rustls: FailedToGetRandomBytes). An unseeded pool
-       still has to fail here -- a handshake keyed from a zero pool would be
-       worse than no handshake. */
-    auto& random = Kernel::Random::GetInstance();
-    if (!random.IsSeeded())
-        return 0;
-
-    random.GetBytes(buf, (ulong)len);
-    return 1;
 }
 
 /* ---- Soft IRQ ---- */
@@ -1396,55 +1384,51 @@ void kernel_msix_unregister_handler(unsigned long handle)
 
 } /* extern "C" */
 
-/* ---- Entropy source bridge ---- */
+/* ---- The CPU's random instruction ---- */
 
-/* A source of raw entropy implemented in Rust -- the virtio-rng driver --
-   put in front of the kernel's pool (kernel/entropy.h). Registration is for
-   good, as it is for a C++ source, so nothing here is ever freed. */
-struct RustEntropyOps
+/* hal/random.h for the pool, which is Rust (src/rust/random): which
+   instruction the CPU has, and one draw from it. Values in and values out,
+   and safe at any time: a draw reads only the flags ProbeHwRandom sets, so on
+   a CPU with no instruction, or before the probe, it fails rather than
+   faulting. */
+struct HwRandomDraw
 {
-    const char* Name;
-    int (*GetRandom)(void* ctx, void* buf, unsigned long len);
-    void* Ctx;
-};
-
-class RustEntropySource : public Kernel::EntropySource
-{
-public:
-    RustEntropyOps Ops;
-
-    const char* GetName() override { return Ops.Name; }
-
-    bool GetRandom(u8* buf, ulong len) override
-    {
-        return Ops.GetRandom(Ops.Ctx, buf, (unsigned long)len) == 0;
-    }
+    unsigned long long Value;
+    unsigned long long Ok;      /* 1 when Value is a draw */
 };
 
 extern "C" {
 
-unsigned long kernel_entropy_source_register(const char* name,
-    int (*getRandom)(void* ctx, void* buf, unsigned long len), void* ctx)
+unsigned int kernel_hw_random_kind()
 {
-    if (!name || !getRandom)
-        return 0;
+    return (unsigned int)Hal::GetHwRandomKind();
+}
 
-    RustEntropySource* src = Kernel::Mm::TAlloc<RustEntropySource, RustAllocTag>();
-    if (!src)
-        return 0;
-
-    src->Ops.Name = name;
-    src->Ops.GetRandom = getRandom;
-    src->Ops.Ctx = ctx;
-
-    if (!Kernel::EntropySourceTable::GetInstance().Register(src))
+/* The CPU's whitened output: RDRAND, RNDR */
+HwRandomDraw kernel_hw_random()
+{
+    HwRandomDraw draw = { 0, 0 };
+    u64 value = 0;
+    if (Hal::HwRandom(value))
     {
-        src->~RustEntropySource();
-        Kernel::Mm::Free(src);
-        return 0;
+        draw.Value = value;
+        draw.Ok = 1;
     }
+    return draw;
+}
 
-    return (unsigned long)src;
+/* Its raw conditioned entropy where it has an instruction for that (RDSEED,
+   RNDRRS), the whitened output where it has not */
+HwRandomDraw kernel_hw_random_seed()
+{
+    HwRandomDraw draw = { 0, 0 };
+    u64 value = 0;
+    if (Hal::HwRandomSeed(value))
+    {
+        draw.Value = value;
+        draw.Ok = 1;
+    }
+    return draw;
 }
 
 } /* extern "C" */

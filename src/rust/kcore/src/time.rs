@@ -69,6 +69,14 @@ pub fn boot_time_ns() -> u64 {
     time::kernel_get_boot_time_ns()
 }
 
+/// The cycle counter as it stands: the TSC on x86-64, the generic timer's
+/// virtual count on arm64. A number to take differences of, at
+/// `cycle_counter_hz`.
+#[inline]
+pub fn cycle_counter() -> u64 {
+    time::kernel_read_cycle_counter()
+}
+
 /// How fast the cycle counter counts, in Hz: the TSC as the kernel calibrated
 /// it on x86-64, the generic timer on arm64. None while it is not known.
 pub fn cycle_counter_hz() -> Option<u64> {
