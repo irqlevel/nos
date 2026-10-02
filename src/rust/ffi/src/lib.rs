@@ -26,4 +26,3 @@ pub mod tcp;
 pub mod acpi;
 pub mod cmd;
 pub mod fs;
-pub mod ring;

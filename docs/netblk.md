@@ -192,7 +192,7 @@ is the Ethernet CRC of each hop.
 
 ### What connects the pieces
 
-- **Three lockless rings** (the kernel's `LocklessRing`, one compare-and-swap
+- **Three lockless rings** (`kcore::ring::LocklessRing`, one compare-and-swap
   an operation): free slots; requests, from the receive softirq to the worker;
   completions, from the disk's interrupt handler to the worker. They are as
   large as the instance has slots, so a push never fails. Nothing on the path
