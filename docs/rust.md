@@ -215,8 +215,8 @@ able to say why.
 |---|---|
 | `consts` | `PAGE_SIZE`, `SECTOR_SIZE`, `KB`/`MB`/`GB`, `NS_PER_SEC`/`MS`/`US` |
 | `trace` | `trace!(level, "fmt {}", arg)`; level 0 is always visible |
-| `time` | `Duration`, `boot_time()`, `boot_time_ns()` (full resolution), `wall_clock_secs()` |
-| `random` | `fill_random(&mut [u8])`, `random_u64()` |
+| `time` | `Duration`, `boot_time()`, `boot_time_ns()` (full resolution), `wall_clock_secs()`, `cycle_counter()` |
+| `random` | `fill_random(&mut [u8])`, `random_u64()` -- the pool (`src/rust/random`) through the C ABI, for a layer as for a module: the seam a fuzzer stands in for. `hw_kind()`, `hw_random()`, `hw_random_seed()` -- the CPU's own instruction, which the pool takes as a source |
 | `sync` | **Locks own what they guard**: `Mutex<T>` (sleeps), `SpinLock<T>` (the kernel's), `IrqSpinLock<T>` and `PreemptSpinLock<T>` (const-constructible, for statics; the first also `try_lock`), `TryLock<T>` (never waited for; the holder may sleep). `lock()` gives a guard that derefs to the data. `WaitGroup`, `Event` (one waiter blocks, anyone signals — hard IRQ included; a blocked waiter's CPU gets an IPI) |
 | `once` | `Once<T>` (set once by boot or a `setup`, read from anywhere) and `OnceBox<T>` (made on first use; racing makers get the same one) |
 | `percpu` | `PerCpu<T>` + `LocalCounter` (statistics any CPU may read, added to with no bus lock), `CpuLocal<T>` (state only its own CPU touches, reached with interrupts off through `with`) |
@@ -234,7 +234,6 @@ able to say why.
 | `barrier` | `dma_wmb`, `dma_rmb` (`dmb oshst`/`oshld` on arm64) |
 | `pod` | `unsafe trait Pod`, then `pod::read`/`write`/`zeroed`: how an on-disk or on-wire structure is read out of a buffer; `bytes_of`/`bytes_of_mut`, a value as the bytes it is |
 | `cmd` | `Command::register` — a shell command whose handler writes to an `Output`, and can read what is typed at it while it runs (`Output::read_input`: only an SSH session has anyone typing); unregistered on drop, after any running call returns. `dispatch` — run a command line as the console would, its output handed to a closure as it is printed; `dispatch_session` — the same with a `Session` that is also where typing comes from |
-| `entropy` | `trait Source` + `register_source(name, &'static S)` — a hardware generator the pool reseeds from |
 | `block` | **for a module.** `Disk` — an existing disk or partition by name: synchronous `read`/`write`/`flush`, `partitions`; asynchronous `submit(&BlockIo, kick)`/`kick` straight to physical memory, the completion callback from interrupt context (`can_submit`: NVMe and its partitions); `claim` → `DiskClaim` before writing, refused while a mount, the disk log or another writer holds the device or one overlapping it. The image uses the `block` crate itself: `block::Disk`, the same shape with no ABI in between, plus `count`/`at`, `name`/`parent`/`handle` and `claim_as` |
 | `net` | **for a module.** `Nic` — an existing device by name: `ip`, `mac`; `listen(port, Arc<H>)` → `UdpListener`, which owns its `UdpHandler` until it is dropped — `on_frame(Lent, &mut RxContext)` for each datagram, `on_batch_end(&mut RxContext)` when a receive batch ends, `RxOwned<T>` for what only those two touch, `TxBatch<N>` for the frames that go to the NIC together; `resolve(ip)` (the Ethernet address a frame to `ip` goes to: route, then ARP; sleeps), `tx_room` (how much the transmit queue will take), `transmit`, `transmit_raw`; `NetFrame` (`alloc_tx`, `data_mut`, `data_raw_mut`, `data_phys`, `set_len`); `rx_stats` (whether the receive path is keeping up); `nat()` → `Nat`, NAT from the device out through the default route's for as long as the guard lives, and `dns_server` (the one nos was given). A frame is an owned value from the moment a listener keeps one (`Lent::retain`) to the moment it goes to the NIC: no module sees the word the kernel knows it by. And for the net layer, what the kernel command line said (`dhcp_off`, `dns_on`, `netconsole_params`) and `replay_kernel_log`. The image uses the `net` crate itself: `net::Nic`, `net::Frame`, typed `UdpHandler` listeners |
 | `tcp` | **for a module.** `TcpListener::bind(&Nic, port)` → `accept(timeout)` → `TcpStream` (`send_all`, `send` with a timeout, `recv`, `peer`), each closed on drop; a listener's drop resets what it never accepted |
@@ -244,11 +243,10 @@ able to say why.
 ## Writing a driver
 
 The traits' own comments (`block/src/table.rs`, `net/src/device.rs`,
-`kcore/src/entropy.rs`) are the contract, and the smallest real driver of
+`random/src/lib.rs`) are the contract, and the smallest real driver of
 each kind is the example: `drivers/virtio_blk` (block; `drivers/nvme` for
 the asynchronous path), `drivers/r8168` (a NIC), `drivers/virtio_rng` (an
-entropy source -- the one kind that still goes through a `kcore` trampoline,
-because the pool is C++).
+entropy source).
 
 **The device lives for good.** It is `Box::leak`ed, so it is `&'static`:
 what the interrupt is pointed at and what the layer's table keeps, as a

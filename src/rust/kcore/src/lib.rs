@@ -16,7 +16,6 @@ pub mod tcp;
 pub mod io;
 pub mod dma;
 pub mod frame;
-pub mod entropy;
 pub mod procinfo;
 pub mod random;
 pub mod once;

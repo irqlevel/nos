@@ -11,8 +11,8 @@
    not have FEAT_RNG, so a QEMU virt guest under HVF sees no RNDR, and TCG
    offers it only with -cpu max. That is precisely why this reports its absence
    cleanly instead of assuming a random instruction exists -- on that machine
-   the entropy comes from virtio-rng and the timing collector, and
-   Kernel::Random does not care which of the three it got. On an Ampere or
+   the entropy comes from virtio-rng and the timing collector, and the pool
+   does not care which of the three it got. On an Ampere or
    Graviton core, which do implement FEAT_RNG, this becomes the primary source
    with nothing else to change. */
 
@@ -118,14 +118,9 @@ void ProbeHwRandom()
     Trace(0, "HwRandom: rndr yes");
 }
 
-bool HasHwRandom()
+HwRandomKind GetHwRandomKind()
 {
-    return HaveRndr;
-}
-
-const char* HwRandomName()
-{
-    return HaveRndr ? "rndr" : "none";
+    return HaveRndr ? HwRandomKind::Rndr : HwRandomKind::None;
 }
 
 bool HwRandom(u64& out)

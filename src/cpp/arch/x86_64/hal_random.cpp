@@ -130,17 +130,12 @@ void ProbeHwRandom()
     Trace(0, "HwRandom: rdrand yes, rdseed %s", HaveRdSeed ? "yes" : "no");
 }
 
-bool HasHwRandom()
-{
-    return HaveRdRand;
-}
-
-const char* HwRandomName()
+HwRandomKind GetHwRandomKind()
 {
     if (!HaveRdRand)
-        return "none";
+        return HwRandomKind::None;
 
-    return HaveRdSeed ? "rdseed" : "rdrand";
+    return HaveRdSeed ? HwRandomKind::RdSeed : HwRandomKind::RdRand;
 }
 
 bool HwRandom(u64& out)

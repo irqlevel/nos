@@ -10,6 +10,7 @@
 #include <arch/x86_64/asm.h>
 #include <hal/power.h>
 #include <hal/mmu.h>
+#include <hal/random.h>
 #include "cpu.h"
 #include "cmd.h"
 #include "interrupt.h"
@@ -23,7 +24,6 @@
 #include "softirq.h"
 #include "irq_balance.h"
 #include "time.h"
-#include "random.h"
 #include <arch/x86_64/tsc.h>
 
 #include <arch/x86_64/grub.h>
@@ -436,6 +436,12 @@ extern "C" void kernel_vfs_unmount_all();
 extern "C" int rust_disklog_setup();
 extern "C" void rust_disklog_stop();
 extern "C" void rust_test();
+
+/* The random pool is Rust (src/rust/random): seeded at boot from what the
+   machine itself can be measured for, before anything asks it for bytes,
+   and again once the devices that can do better are up. */
+extern "C" bool rust_random_setup();
+extern "C" void rust_random_reseed();
 /* The partition table reader (src/rust/block): registers a block device for
    every partition of every disk the kernel has not looked at yet. */
 extern "C" void rust_partitions_probe();
@@ -518,7 +524,7 @@ void BpStartup(void* ctx)
         /* Now that the devices are here, fold what they can give into the
            pool: on a machine with a virtio-rng this is where it stops resting
            on what the boot itself could be measured for. */
-        Random::GetInstance().Reseed();
+        rust_random_reseed();
 
         Trace(0, "Interrupts registered");
 
@@ -945,11 +951,12 @@ __attribute__((noinline)) void Main2(Grub::MultiBootInfoHeader *MbInfo)
 
     HaltTcoWatchdog();
 
-    /* Before the self-tests, which ask the pool for bytes, and before
-       anything else can: seeding needs no heap and no device, only the cycle
-       counter and whatever instruction the cpu has. The devices that can do
-       better are folded in by the Reseed() in BpStartup. */
-    if (!Random::GetInstance().Setup())
+    /* Before anything can ask the pool for bytes: seeding needs no heap and
+       no device, only the cycle counter and whatever instruction the cpu
+       has, which the probe finds first. The devices that can do better are
+       folded in by the rust_random_reseed() in BpStartup. */
+    Hal::ProbeHwRandom();
+    if (!rust_random_setup())
         Trace(0, "Random: unseeded at boot, https will fail until a source turns up");
 
     Screen::Printf("Self test begin, please wait...\n");

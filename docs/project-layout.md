@@ -15,14 +15,15 @@ src/cpp/
   arch/
     x86_64/   Multiboot2 entry + AP trampoline (boot64.asm, NASM), CPU primitives (asm.asm, asm.h), IDT/GDT, exceptions, TSC/kvmclock, LAPIC/IOAPIC/PIC, PTE encoding (pte.h), GRUB info parsing, the string routines in assembly (stdlib_asm.asm), HAL inline/impl backends. Only arch code, x86-only drivers and three documented exemptions (kernel/main.cpp, kernel/cmd.cpp, kernel/irq_balance.cpp) may include these headers
     arm64/    Linux-Image boot + PSCI SMP (boot.S), the boot path itself (main_arm64.cpp), EL1 vectors, GICv3 + ITS (LPIs for PCIe MSI), generic timer, PL011, FDT parser, PCIe ECAM, PTE encoding, the string routines in portable C (stdlib_c.cpp), link stubs for the x86-only entry points common driver code names (x86_driver_stubs.cpp), HAL backends
-  kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, timers, the timekeeping seam (time.h), locks (spinlock, mutex, seqlock, rwlock), panic and backtrace, the dmesg ring buffer, the command line (parameters.cpp), the interactive shell (cmd.cpp), the input layer (input.cpp), the ChaCha20 random pool every source feeds and everything reads from (random.cpp, entropy.h), the boot self-tests (test.cpp), the module loader (module.cpp), the Rust FFI bridge (rust_ffi.cpp), the symbol table
+  kernel/     Core: scheduling, tasks, interrupt dispatch, SoftIrq, timers, the timekeeping seam (time.h), locks (spinlock, mutex, seqlock, rwlock), panic and backtrace, the dmesg ring buffer, the command line (parameters.cpp), the interactive shell (cmd.cpp), the input layer (input.cpp), the boot self-tests (test.cpp), the module loader (module.cpp), the Rust FFI bridge (rust_ffi.cpp), the symbol table
   drivers/    Hardware: serial, the console (screen.cpp picks EGA text on BIOS or the 8x16-font pixel framebuffer under UEFI), PIT, HPET, RTC, the 8042 keyboard, PCI, MSI-X, ACPI. No virtio and no USB: both are Rust (src/rust/virtio, src/rust/drivers)
   mm/         Memory: 4-level page tables (the VirtToPhys walk, ProtectRange), the page allocator (fixed-size block allocators), the pool allocator, the VA allocator, new/delete
-  lib/        Freestanding stdlib equivalents (Stdlib::): list, vector, ring buffer, bitmap, CRC32, ChaCha20, formatting, errors and results, smart pointers. MemSet/MemCpy/StrLen and their like are per architecture (arch/x86_64/stdlib_asm.asm, arch/arm64/stdlib_c.cpp)
+  lib/        Freestanding stdlib equivalents (Stdlib::): list, vector, ring buffer, bitmap, CRC32, formatting, errors and results, smart pointers. MemSet/MemCpy/StrLen and their like are per architecture (arch/x86_64/stdlib_asm.asm, arch/arm64/stdlib_c.cpp)
   include/    Shared headers
 src/rust/
   ffi/        Raw extern "C" FFI declarations for kernel services
   kcore/      Safe Rust wrappers around kernel services: sync, DMA, MMIO, MSI-X, interrupts, timers, tasks, PCI -- and the block, net, TCP and file layers *as a loadable module reaches them*, across the C ABI (inside the image the crates below call each other as crates)
+  random/     The kernel's random pool: ChaCha20 with fast key erasure, seeded from the CPU's instruction (through hal/random.h), timing jitter and the sources that register with it (virtio-rng); kernel_get_random, which the layers and the modules reach through kcore::random; the `random` and `entropy` commands (docs/random.md)
   drivers/
     nvme/     NVMe block device driver (PCI, MSI-X, admin/IO queues)
     usb/      xHCI host controller (rings, contexts, root-port and hub enumeration) + the HID boot-protocol keyboard on it

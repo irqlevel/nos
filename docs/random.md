@@ -1,11 +1,37 @@
 # Randomness
 
-Everything in the kernel that needs random bytes asks `Kernel::Random`
-(`kernel/random.h`): the TLS client for its handshake keys, the shell's
-`random` command, anything later that needs a token or a nonce. It is one
-ChaCha20 generator, seeded from every entropy source the machine turns out to
-have. This page is what those sources are, what the generator does with them,
-and what is and is not being claimed.
+Everything in the kernel that needs random bytes asks one pool, the `random`
+crate (`src/rust/random`): the TLS client for its handshake keys, TCP for its
+initial sequence numbers, DHCP and DNS for their ids, the SSH server for its
+keys, the shell's `random` command, anything later that needs a token or a
+nonce. It is one ChaCha20 generator, seeded from every entropy source the
+machine turns out to have. This page is what those sources are, what the
+generator does with them, and what is and is not being claimed.
+
+## Where it lives
+
+The pool is Rust, in the image: a `static` with nothing to construct, behind a
+lock that allocates nothing (`IrqSpinLock`), because the boot seeds it from
+`Main2`, long before `rust_init`. What reaches it, and how:
+
+- **the layers and the modules** -- `net`, `tls`, `fs`, the sshd module --
+  through `kcore::random` (`fill_random`, `random_u64`), which is the C ABI's
+  `kernel_get_random`, defined in the crate. In the image that is a call from
+  Rust into Rust across the C ABI, and it is on purpose: it is the seam the
+  fuzzers stand in for (`fuzz/common/machine`), so that what is random in a
+  fuzzer is the input's -- the TCP target hands out sequence numbers that are
+  about to wrap.
+- **a hardware generator's driver** registers as a trait object,
+  `random::register_source(name, &'static dyn random::Source)` --
+  `drivers/virtio_rng`.
+- **the boot**, C++: `Hal::ProbeHwRandom()` and then `rust_random_setup()` in
+  `Main2` / `MainArm64`, `rust_random_reseed()` once the devices are up.
+- **the CPU's instruction** is the one piece left in C++, behind
+  `hal/random.h`, because it is an instruction and the HAL is where those
+  are: the pool asks for it through calls that take values and give values
+  back (`kernel_hw_random_kind`, `kernel_hw_random`, `kernel_hw_random_seed`
+  in `rust_ffi.cpp`, `kcore::random::hw_*` in Rust), which fail rather than
+  fault on a CPU without one.
 
 ## What this replaced
 
@@ -35,7 +61,7 @@ what a generator is for — sources contribute, the generator answers.
 | `rdseed` / `rdrand` | x86-64, `arch/x86_64/hal_random.cpp` | the CPU's own DRBG. RDSEED taps the conditioned output of the physical noise source and is what another generator wants to be keyed from; RDRAND is the AES-CTR DRBG downstream of it — faster, never dry, one more deterministic step from the noise |
 | `rndr` | arm64, `arch/arm64/hal_random.cpp` | FEAT_RNG, the same idea (RNDRRS reseeds before answering, RNDR does not). Optional from Armv8.5 and **not implemented by Apple's M-series**, so no arm64 machine nos runs on today has it |
 | `rng0`… | `src/rust/drivers/virtio_rng` | virtio-rng, i.e. the host's entropy. Present under QEMU, absent on bare metal — exactly the wrong way round from the CPU instruction, which is why both exist |
-| `jitter` | `kernel/random.cpp` | timing jitter, the fallback (below) |
+| `jitter` | `src/rust/random/src/jitter.rs` | timing jitter, the fallback (below) |
 
 `hal/random.h` is the seam for the CPU instruction, so common code never asks
 which architecture it is on. `Hal::ProbeHwRandom()` runs once on the BSP and is
@@ -43,8 +69,8 @@ what decides whether the instruction exists: reading RNDR on a core without
 FEAT_RNG is an undefined-instruction trap, and CPUID has to be checked before
 RDRAND for the same reason. It also honours `hwrng=off`.
 
-The probe answering "yes" is not enough. `HwRandomSource::SelfTest()` draws
-eight values and refuses the instruction unless at least half of them arrive
+The probe answering "yes" is not enough. `cpu::self_test()`
+(`src/rust/random/src/cpu.rs`) draws eight values and refuses the instruction unless at least half of them arrive
 and at least two differ — which is what a broken RDRAND looks like (some AMD
 parts answer `0xFFFF'FFFF'FFFF'FFFF` forever after a resume) and what a
 hypervisor that stubs the instruction out looks like too. In both cases the
@@ -53,11 +79,15 @@ capability bit still says the instruction is there.
 ## Timing jitter, and what it is worth
 
 On a machine with no random instruction and no virtio-rng, the only thing left
-that differs between two boots is how long things take. `JitterSource` times a
+that differs between two boots is how long things take. The collector times a
 dependent read-modify-write walk over a 4 KiB buffer — the trip count and the
 starting offset depend on the state the last measurement left, so the walk
 cannot be prefetched or unrolled into something of fixed cost — and keeps the
-low bit of the duration. Pairs of those bits go through von Neumann extraction:
+low bit of the duration. The buffer is on the caller's stack, its own for the
+call, so two reseeds at once share nothing; its address is put out of the
+compiler's sight first, so that the cycle-counter calls on either side of a
+walk are calls it must take to read the walk, and it cannot move the walk out
+from between them. Pairs of those bits go through von Neumann extraction:
 a pair that agrees is discarded, a pair that differs contributes one bit, which
 removes whatever fixed bias the low bit has at the cost of most of the samples.
 
@@ -75,15 +105,15 @@ it, the counter is too coarse to see this much work, or is not running.
 ## The generator
 
 Both halves are Linux's construction, in miniature. ChaCha20's block function
-(`lib/chacha20.cpp`, RFC 8439, checked at boot against the RFC's own test
-vector in `TestChaCha20`) is the only primitive.
+(`src/rust/random/src/chacha20.rs`, RFC 8439, checked at boot against the
+RFC's own test vector by `random::selftest`) is the only primitive.
 
 ```
-        sources                   pool                     callers
-  rdseed ------\                                    /--- kernel_get_random -> rustls
-  rng0 --------->  AddEntropy  ->  Key[32]  ->  GetBytes ---- random [len]
-  jitter ------/     absorb          |          fast key
-  boot marks --/                     \---- erasure ---/
+        sources                   pool                  callers
+  rdseed ------\                                 /--- kernel_get_random -> rustls, TCP, ...
+  rng0 --------->  add_entropy  ->  key[32]  ->  fill ---- random [len]
+  jitter ------/     absorb          |        fast key
+  boot marks --/                     \--- erasure --/
 ```
 
 **Output — fast key erasure.** A request generates one ChaCha20 block over the
@@ -106,17 +136,19 @@ the pool worse.**
 
 | when | what |
 |---|---|
-| `Main2` / `MainArm64`, before the self-tests | `Random::Setup()` — probe the CPU instruction, register the sources that need no device, seed from them. No heap, no device |
-| `BpStartup` / `BpStartupArm`, after the virtio probe | `Random::Reseed()` — fold in every registered source, virtio-rng now included |
-| `entropy reseed` | the same, by hand |
+| `Main2` / `MainArm64`, before anything can ask for bytes | `Hal::ProbeHwRandom()`, then `rust_random_setup()` — register the sources that need no device, seed from them. No heap, no device |
+| `BpStartup` / `BpStartupArm`, after the virtio probe | `rust_random_reseed()` — fold in every registered source, virtio-rng now included |
+| `rust_test` | `random::selftest` — the block function against RFC 8439, then the pool's output |
+| `entropy reseed` | the reseed, by hand |
 
-Setup has to precede the self-tests because they ask the pool for bytes. On
+Setup comes first because nothing may ask the pool for bytes before it. On
 arm64 nothing better than jitter exists at that point — no FEAT_RNG on any
 core nos runs on, and the virtio-mmio slots have not been probed yet — so the
 pool is seeded from jitter there and the reseed after device bring-up is what
-puts hardware entropy into it. `Setup()` returning false, which takes a machine
-with no random instruction *and* a cycle counter too coarse for the jitter
-collector, is not fatal: boot says so plainly and HTTPS is what stops working.
+puts hardware entropy into it. Setup finding nothing to seed from, which takes
+a machine with no random instruction *and* a cycle counter too coarse for the
+jitter collector (as under TCG), is not fatal: boot says so plainly, and HTTPS
+is what does not work until a reseed finds a source.
 
 There is no periodic reseed. A CSPRNG needs one good seed, and the rest of what
 Linux reseeds against — recovery from a state compromise across a

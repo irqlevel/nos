@@ -6,4 +6,7 @@ unsafe extern "C" {
     /// The cycle counter's rate in Hz -- the TSC's on x86-64, the generic
     /// timer's on arm64 -- or 0 while it is not known
     pub safe fn kernel_cycle_counter_hz() -> u64;
+    /// The cycle counter as it stands -- the TSC, the generic timer's
+    /// virtual count
+    pub safe fn kernel_read_cycle_counter() -> u64;
 }

@@ -9,6 +9,7 @@ crate-type = ["staticlib"]
 [dependencies]
 ffi = { path = "../ffi" }
 kcore = { path = "../kcore" }
+random = { path = "../random" }
 block = { path = "../block" }
 fs = { path = "../fs" }
 net = { path = "../net" }

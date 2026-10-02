@@ -8,4 +8,5 @@ name = "virtio_rng"
 
 [dependencies]
 kcore = { path = "../../kcore" }
+random = { path = "../../random" }
 virtio = { path = "../../virtio" }

@@ -448,6 +448,7 @@ dependencies = [
  "nvme",
  "r8125",
  "r8168",
+ "random",
  "sha2",
  "usb",
  "virtio-blk",
@@ -819,6 +820,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "random"
+version = "0.1.0"
+dependencies = [
+ "kcore",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1169,6 +1177,7 @@ name = "virtio-rng"
 version = "0.1.0"
 dependencies = [
  "kcore",
+ "random",
  "virtio",
 ]
 

@@ -25,6 +25,9 @@ fn alloc_error(layout: core::alloc::Layout) -> ! {
 #[no_mangle]
 pub extern "C" fn rust_init() {
     hello::hello();
+    /* The pool itself was seeded from Main2 (rust_random_setup); this puts
+       its `random` and `entropy` commands in front of whoever runs one. */
+    random::init();
     /* The partition table reader: its own entry point is called from the
        boot path, and this puts its shell command in front of whoever runs
        one. */
@@ -118,6 +121,7 @@ fn tco_init() {
 #[no_mangle]
 pub extern "C" fn rust_test() {
     hello::test();
+    random::selftest();
     sha256::selftest();
     frames::selftest();
     ring::selftest();
