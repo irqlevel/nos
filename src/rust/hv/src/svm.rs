@@ -13,6 +13,7 @@ use hvarch::x86::svm::vmcb::{self, attrib, Segment};
 use hvarch::x86::svm::{self as arch, Guest, GuestRegs, Kick, NotRun, Permissions};
 use hvarch::{Caps, Result};
 
+use crate::memory::GuestMemory;
 use crate::vm::Refusal;
 
 /* Control register and EFER bits a guest's starting state is made of. */
@@ -265,18 +266,22 @@ impl Vcpu {
         Ok(Self { guest, perms: Permissions::new()?, nrip, nmi_masked: false, iret_at: None })
     }
 
-    /// Enter the guest and come back at its next exit, decoded -- the whole
-    /// of what an entry is: the VMCB checked before the CPU sees it, the
-    /// world switch, the event an exit interrupted put back, and the exit
-    /// read out. A VMCB a rule refuses is [`Refusal::Vmcb`], naming it.
-    pub fn enter(&mut self, nested: arch::Nested, host_areas: &[AtomicU64], kick: Option<&Kick>)
+    /// Enter the guest over `memory`'s nested table and come back at its
+    /// next exit, decoded -- the whole of what an entry is: the VMCB checked
+    /// before the CPU sees it, the world switch, the event an exit
+    /// interrupted put back, and the exit read out. A VMCB a rule refuses is
+    /// [`Refusal::Vmcb`], naming it. The crate's own: a table comes only from
+    /// the memory that owns every page it maps, and only
+    /// [`crate::vm::Cpu::enter`] calls this, with the memory the CPU was
+    /// made for.
+    pub(crate) fn enter(&mut self, memory: &GuestMemory, host_areas: &[AtomicU64], kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         self.check().map_err(Refusal::Vmcb)?;
-        /* The nested table maps nothing but this guest's own pages and only
-         * grows (`crate::memory`); `host_areas` never names a freed page
-         * (`crate::machine`). */
-        let cpu = match unsafe { self.guest.run(&self.perms, nested, host_areas, kick) } {
+        /* The nested table is `memory`'s: it maps nothing but that guest's
+         * own pages and only grows (`crate::memory`); `host_areas` never
+         * names a freed page (`crate::machine`). */
+        let cpu = match unsafe { self.guest.run(&self.perms, memory.nested(), host_areas, kick) } {
             Ok(cpu) => cpu,
             Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
             Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
@@ -659,14 +664,16 @@ impl Vcpu {
 
     /// Inject a general-protection fault into the guest on the next entry:
     /// what a real CPU raises for a reserved MSR or an instruction the guest
-    /// may not run. `#GP` pushes an error code, 0 here. The guest's RIP is
-    /// left where it faulted, not stepped past -- the faulting instruction
-    /// did not complete.
+    /// may not run. `#GP` pushes an error code, 0 here -- in protected mode;
+    /// in real mode (an AP between its start-up IPI and PE) a CPU pushes
+    /// none, and a handler there would take the word for its return
+    /// address. The guest's RIP is left where it faulted, not stepped past
+    /// -- the faulting instruction did not complete.
     pub fn inject_gp(&mut self) {
         use vmcb::event;
         const VECTOR_GP: u64 = 13;
-        self.guest.vmcb_mut().control.event_inj =
-            event::VALID | event::TYPE_EXCEPTION | event::ERROR_VALID | VECTOR_GP;
+        let code = if self.guest.vmcb().save.cr0 & CR0_PE != 0 { event::ERROR_VALID } else { 0 };
+        self.guest.vmcb_mut().control.event_inj = event::VALID | event::TYPE_EXCEPTION | code | VECTOR_GP;
     }
 
     /// What `vmrun` would refuse this VMCB for, if anything -- the checks of

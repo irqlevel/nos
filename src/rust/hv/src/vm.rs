@@ -6,7 +6,7 @@
 use core::sync::atomic::AtomicU64;
 
 use hvarch::x86::svm::vmcb::Save;
-use hvarch::x86::svm::{GuestRegs, Kick, Nested, Profile};
+use hvarch::x86::svm::{GuestRegs, Kick, Profile};
 use hvarch::{Ext, Result};
 
 use crate::machine::Machine;
@@ -46,12 +46,12 @@ pub enum Backend {
  * ten into one, but at the cost of the risk the convention names -- a reader
  * could not see what each does -- so they are written out. */
 impl Backend {
-    fn enter(&mut self, nested: Nested, host_areas: &[AtomicU64], kick: Option<&Kick>)
+    fn enter(&mut self, memory: &GuestMemory, host_areas: &[AtomicU64], kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         match self {
-            Backend::Svm(v) => v.enter(nested, host_areas, kick),
-            Backend::Vmx(v) => v.enter(nested, host_areas, kick),
+            Backend::Svm(v) => v.enter(memory, host_areas, kick),
+            Backend::Vmx(v) => v.enter(memory, host_areas, kick),
         }
     }
     pub fn save(&self) -> &Save {
@@ -240,11 +240,10 @@ impl Cpu {
     pub fn enter(&mut self, memory: &GuestMemory, machine: &Machine, kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
-        let nested = memory.nested();
-        if nested.id != self.table {
+        if memory.nested().id != self.table {
             return Err(Refusal::NotItsMemory);
         }
-        self.backend.enter(nested, machine.host_areas(), kick)
+        self.backend.enter(memory, machine.host_areas(), kick)
     }
 }
 
