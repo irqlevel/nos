@@ -2760,15 +2760,19 @@ someone else's; then speed.
    (the guest stops as `Invalid`) and AMD-V pushes a word its handler does
    not expect. Fix: no error code with CR0.PE clear.
 7. **In the module.**
-   - `hv exec` stops working for good after a boot that threw away unread
-     input: `Shared::requeue` clears the queue but `fed` never catches up
-     with `queued`, so `fed_at` is `None` from then on.
+   - ~~`hv exec` stops working for good after a boot that threw away unread
+     input~~ -- done: what a new boot throws away is counted as fed and
+     noted as lost (`Input::lost`), and an `hv exec` waiting on a line of it
+     says the line went with that boot. What it was: `Shared::requeue`
+     cleared the queue but `fed` never caught up with `queued`, so `fed_at`
+     was `None` from then on.
    - Forwards and NAT's mappings outlive their VM. `hv stop` gives the port
      back to the switch, and the next `hv start ... net` takes the lowest
      free one -- the same MAC and the same address (`port_ip`) -- and with
      it the old VM's forwards and the answers to its flows, which `nat.rs`
      has no way to forget by inner address. Fix: a VM's forwards and its
-     mappings go with its port.
+     mappings go with its port. The forwards do now (`Forwards::drop_vm`,
+     from `hv stop`); the mappings are still to go.
    - Two VMs can open one image read-write (`FileDisk::open`; the VFS has
      no exclusive writer): two ext4s on one set of blocks. Fix: a claim per
      image -- writers alone, readers together -- refused out loud.
@@ -2782,10 +2786,11 @@ someone else's; then speed.
      shut down -- up to `secs` -- so meanwhile `rmmod` does not see it,
      `hv list` does not show it, and its CPUs can be given to a new VM.
      Fix: a stopping state, and off the table after.
-   - An unload that finds a guest's VMCS still current on a CPU says so --
-     and then frees that CPU's VMXON page anyway (`Machine::disable` keeps
-     it, the machine's drop frees it). Leak it, or panic, rather than leave
-     a CPU in VMX operation over a freed page.
+   - ~~An unload that finds a guest's VMCS still current on a CPU says so
+     -- and then frees that CPU's VMXON page anyway~~ -- done: the
+     machine's drop leaks such a page, and says so, rather than leave a CPU
+     in VMX operation over freed RAM. What it was: `Machine::disable` kept
+     the page and the machine's drop freed it.
 8. ~~**The safe half enters a guest over any table it is handed.**~~ Done:
    both `enter`s are the crate's own and take the `&GuestMemory` whose
    table they enter over -- a table comes only from the memory that owns
