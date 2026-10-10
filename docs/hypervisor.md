@@ -2703,8 +2703,19 @@ someone else's; then speed.
    every other vCPU that touches a port waits on the lock, and every frame
    goes into the switch at memcpy speed. Fix: at most a queue's worth of
    chains a pass, the rest left for the next round.
-2. **An unprivileged process stops its whole VM.** Every intercepted
-   exception is a stop (`Stop::Exception` in `run.rs`), #DB and #AC are
+2. **An unprivileged process stops its whole VM.** Done but for VT-x's
+   #DB: the run loop gives a guest its own #AC back on both backends, and
+   its #DB under AMD-V -- a single step, and ICEBP, stepped past -- once
+   nothing an exit cut short is on its way in (`GuestCpu::exception`); an
+   instruction of VMX's, SVM's or GETSEC is answered #UD, RDPMC #GP. The
+   `debug` built-in guest single-steps and runs an `int1` and its own
+   handler must see both, DR6 right; hv-fuzz's platform target gives the
+   run loop the guest's #DB and #AC, now and then over an event still on
+   its way in. Left: VT-x's #DB, whose DR6 the exit does not write -- it has
+   to be put in the register by hand before the entry, the pending
+   single-step bit set where a shadow asks for it -- and which `debug`
+   still sees stop the guest there. What it was: every intercepted
+   exception was a stop (`Stop::Exception` in `run.rs`), #DB and #AC are
    intercepted always (CVE-2015-5307 and 8104), and an exit the run loop
    does not know is a stop too (`Stop::Unexpected`). A single step -- gdb's
    `stepi`, ptrace, a uprobe -- `int1`, an unaligned access with EFLAGS.AC

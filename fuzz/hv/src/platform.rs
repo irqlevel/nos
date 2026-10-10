@@ -543,7 +543,22 @@ impl Script {
                     None => continue,
                 }
             }
-            let op = r.op(34)?;
+            let op = r.op(35)?;
+            if op == 34 {
+                /* The guest's own #DB -- a single step -- or #AC, which the
+                 * host intercepts and gives back; now and then while an
+                 * event an exit cut short is still on its way in, as
+                 * `requeue_event` leaves one, which has to go in first. */
+                let exit = if r.bool() {
+                    Exit::Exception { vector: 17, error: Some(0) }
+                } else {
+                    Exit::Exception { vector: 1, error: None }
+                };
+                if r.u8() >= 64 {
+                    v.take_event();
+                }
+                return Some(vm::Next::Exit(exit));
+            }
             let exit = match op {
                 0..=5 => {
                     /* A port: one of the platform's, a device's, or any. */
@@ -746,8 +761,12 @@ impl Script {
                     v.regs_mut().r9 = r.value64();
                     Exit::Cr8 { write, gpr }
                 }
+                /* An instruction the guest was told nothing of -- a VMX or
+                 * SVM one, GETSEC -- answered #UD. */
+                28 if r.u8() < 48 => Exit::Undefined,
                 28 => Exit::Other(if r.rare() { code::INVD } else {
-                    r.pick(&[code::MONITOR, code::MWAIT, code::RDTSCP, code::XSETBV, code::WBINVD, code::RDPRU])
+                    r.pick(&[code::MONITOR, code::MWAIT, code::RDTSCP, code::XSETBV, code::WBINVD, code::RDPRU,
+                             code::RDPMC, code::ICEBP])
                 }),
                 29 => Exit::Hypercall,
                 30 => Exit::Host,

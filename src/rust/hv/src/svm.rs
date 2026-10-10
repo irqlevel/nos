@@ -56,6 +56,7 @@ const LEN_CPUID: u64 = 2;
 const LEN_MSR: u64 = 2;
 const LEN_VMMCALL: u64 = 3;
 const LEN_WBINVD: u64 = 2;
+const LEN_ICEBP: u64 = 1;
 /// PAUSE is `F3 90`, REP NOP.
 const LEN_PAUSE: u64 = 2;
 /// With the pause filter, how many PAUSEs in a row a guest runs before its
@@ -127,6 +128,10 @@ pub enum Exit {
     /// for that the host hands over, a timer's tick above all, is handed
     /// over now rather than at the host's next interrupt.
     Pause,
+    /// An instruction of a virtualization extension's own -- VMX's or
+    /// SVM's -- or GETSEC, which CPUID tells the guest it has not got and a
+    /// CPU without them faults #UD on: what the guest is given.
+    Undefined,
     Other(u64),
 }
 
@@ -492,6 +497,10 @@ impl Vcpu {
             vmcb::exit::CPUID => Exit::Cpuid,
             vmcb::exit::MSR => Exit::Msr { write: c.exit_info1 & 1 != 0 },
             vmcb::exit::VMMCALL => Exit::Hypercall,
+            /* SVM's own instructions, intercepted for the host: a guest
+             * told it has no SVM is owed the #UD a CPU without it gives. */
+            vmcb::exit::VMRUN | vmcb::exit::VMLOAD | vmcb::exit::VMSAVE | vmcb::exit::STGI
+            | vmcb::exit::CLGI | vmcb::exit::SKINIT | vmcb::exit::INVLPGA => Exit::Undefined,
             vmcb::exit::VINTR => Exit::IrqWindow,
             vmcb::exit::NPF => Exit::NestedFault { gpa: c.exit_info2, error: c.exit_info1 },
             vmcb::exit::SHUTDOWN => Exit::Shutdown,
@@ -598,6 +607,23 @@ impl Vcpu {
     /// save tells them apart; the CPUID policy does not offer it.)
     pub fn skip_wbinvd(&mut self) {
         self.skip(LEN_WBINVD);
+    }
+
+    /// Step past an ICEBP (`int1`), intercepted: the #DB it raises, which
+    /// the run loop gives the guest next, is a trap's, delivered after it.
+    pub fn skip_icebp(&mut self) {
+        self.skip(LEN_ICEBP);
+    }
+
+    /// Give the guest an exception of its own the host intercepted -- #DB,
+    /// #AC, intercepted always for the delivery loops a guest could make of
+    /// them -- as the CPU would have delivered it: the hardware exception,
+    /// with its error code when it has one. A #DB's DR6 the CPU wrote into
+    /// the VMCB as it took the exit, and it goes back in from there.
+    pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
+        use vmcb::event;
+        let code = error.map_or(0, |e| event::ERROR_VALID | (u64::from(e) << event::ERROR_SHIFT));
+        self.guest.vmcb_mut().control.event_inj = event::VALID | event::TYPE_EXCEPTION | code | u64::from(vector);
     }
 
     /// Whether an event is queued for injection on the next entry -- one

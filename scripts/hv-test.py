@@ -134,18 +134,24 @@ GUESTS = {
     "ioapic": [r"two edges taken, none while masked; three levels, each sent again at its EOI while the line "
                r"stayed up, its remote IRR set in service and clear after",
                r"the IO-APIC sent 5, 3 of them levels, 3 ended by EOI"],
+    "debug": [r"both #DBs its own handler's: the single step's with DR6\.BS, after the NOP; the ICEBP's with no bit",
+              r"2 exceptions given back"],
 }
 
-# Three of the guests test a mechanism only one vendor has: AMD-V's software
-# VMCB check (`refused`), its ASID recycling (`asid`) and its shadow TPR
-# (`tpr`). Under Intel VT-x the CPU refuses a bad VMCS itself; the ASID is a
-# VPID held for the guest's life, so the third VM gets one of the first two's
-# back; and CR8 is the host's, so the guest is stopped at each access and
-# answered from a shadow. What each says differs; the rest is one.
+# Four of the guests test a mechanism only one vendor has: AMD-V's software
+# VMCB check (`refused`), its ASID recycling (`asid`), its shadow TPR
+# (`tpr`) and the DR6 its VMCB keeps at a #DB (`debug`). Under Intel VT-x the
+# CPU refuses a bad VMCS itself; the ASID is a VPID held for the guest's
+# life, so the third VM gets one of the first two's back; CR8 is the host's,
+# so the guest is stopped at each access and answered from a shadow; and a
+# #DB is not given back yet. What each says differs; the rest is one.
 GUESTS_VMX = {
     "refused": [r"the CPU refused the VMCS at entry for invalid guest state"],
     "asid": [r"vm C was given VPID \d+, which vm [AB] had, and read its own too"],
     "tpr": [r"wrote 15 to its CR8 and read it back, stopped at each and answered from the shadow, and the host's CR8 is still 0"],
+    # VT-x writes no DR6 at a #DB exit, and gives the guest no #DB back
+    # until the register is put right by hand: the single step stops it.
+    "debug": [r"VT-x gives no #DB back yet: the single step stopped it, after the NOP"],
 }
 
 
