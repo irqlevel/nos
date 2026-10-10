@@ -113,7 +113,7 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
-| `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
+| `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
@@ -354,6 +354,19 @@ hand: 4 KiB, 2 MiB and 1 GiB pages, five levels, addresses non-canonical and
 unmapped, and a fetch across a page boundary into a page mapped elsewhere.
 It needs clang, `llvm-objdump` and cargo; CI runs it on its x86-64 leg.
 
+The other decoder in the file, of a `mov` to or from a control register
+(`decode_mov_cr`) -- what an intercept of CR4 stops a guest at, on a CPU
+that does not name the register -- is checked the same way: every `mov` to
+and from CR0, CR2, CR3, CR4 and CR8 through eight registers, REX's among
+them, assembled by clang and decoded in 64-bit code and, without a REX --
+which 32-bit code reads as an INC or a DEC, and is refused -- in 32-bit
+code too; each cut short at every length; by hand, what no assembler gives
+and a CPU takes or refuses -- prefixes it passes over, a ModRM whose mod
+field it ignores with nothing after it, a lock and a repeat, a REX that is
+not the last byte before the opcode; and the random bytes. Each decoder
+must refuse the other's every form. A control run with REX.B left out of
+the register failed 31 of its cases.
+
 ### `hv-fuzz.py` -- everything a guest reaches, fuzzed
 
 A guest decides every value the hypervisor's devices are handed -- every
@@ -393,8 +406,10 @@ second of the first harness, whose CPUs slept for real, and ten processes
 at once some forty times theirs. Where the loop would enter the
 guest, the CPU asks a script what the guest does next: a port, an MSR,
 CPUID, a fault on a device's page with the instruction that made it put
-where the guest's paging finds it, a halt, a window opened, an event taken,
-another CPU's turn -- and between them what a driver does over several
+where the guest's paging finds it, a `mov` to or from CR4 put there the
+same way -- under AMD-V, which stops a guest at each -- a halt, a window
+opened, an event taken, another CPU's turn -- and between them what a
+driver does over several
 exits: the 8259 initialised, the APIC turned on or moved between its modes,
 an IO-APIC pin routed, MSI-X turned on and its table filled, a virtio queue
 set up and given requests, another CPU started by INIT and start-up IPIs.
@@ -415,7 +430,17 @@ not at all; what a guest takes from the world for another guest's address,
 and what `hv0` or a guest takes from a guest not sent as that guest; a
 vCPU that enters its
 guest or waits with one of the kernel's locks held; a guest whose RAM would
-cover its devices' pages. Or a spin -- the run loop reading the clock a
+cover its devices' pages; a `mov` of CR4 that by the CPU's next entry has
+not come to what the script reckons -- a read whose register does not hold
+the CR4 the guest wrote, a write a CPU takes that is not the guest's CR4
+with MCE in the register and RIP past it, one a CPU refuses that is not a
+#GP with CR4 as it was -- or a CR4 written with a bit the guest's CPUID does
+not offer, PAE cleared in long mode, or a bit a CPU translates by changed
+and the guest's TLB not flushed. (Control runs with the CPUID's mask left
+out, PGE's flush left out, and reads answered from the register rather than
+the guest's CR4 failed at the first, the first and the fourth input; the
+first run of the checks found the script's own 32-bit belief outliving the
+INIT that put its CPU back in long mode.) Or a spin -- the run loop reading the clock a
 million times with neither an entry nor a wait between, which on a host is
 a CPU spun for as long as the guest stays so -- or a hang, ten seconds with
 no input done. Each is reported with the seed and the iteration that make
@@ -1087,7 +1112,21 @@ a Linux guest's CPUs go through, that a single step and an `int1` -- each a
 DR6.BS and after the stepped instruction, the second after the ICEBP: a
 user process's `stepi` once stopped its whole VM. Under VT-x, which gives
 no #DB back yet, it checks the single step stops the guest there instead,
-so that the day it does, the check has to be changed with it. The unload
+so that the day it does, the check has to be changed with it. And for
+`cr4`, through the same loop, that the guest read back each CR4 it wrote --
+MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that SMEP, which
+its CPUID does not offer, PAE cleared in long mode and bit 32 were each a
+#GP with no error code, CR4 as it was; and that the host performed all
+eleven of its accesses. On QEMU's TCG -- known by its hypervisor leaf's
+signature -- which checks a read of any control register against CR0's
+intercept and so stops no read of CR4, it holds the reads to the register
+instead, MCE in it, and the host to its five writes; its VMCB must ask for
+the reads either way. A control run with MCE kept nowhere -- neither
+`hvarch` setting it at entry nor `set_cr4` -- failed there: the register it
+read lost MCE at the first write. Under VT-x, which does not stop a guest at CR4 yet,
+it checks only what any CPU does -- PAE cleared and bit 32 refused, CR4
+unchanged -- and says so; that branch has not been run, no Intel machine
+being at hand when it was written. The unload
 that follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.
 

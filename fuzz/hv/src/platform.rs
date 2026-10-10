@@ -109,7 +109,54 @@ struct CpuPlan {
     asked_xapic: Option<bool>,
     /// In 32-bit protected mode, paging off, rather than long mode.
     protected32: bool,
+    /// What its last `mov` of CR4 should have come to, for its next entry
+    /// to see.
+    cr4: Option<Cr4Expect>,
 }
+
+/// What a `mov` to or from CR4 the script put at a CPU's RIP should have
+/// done by that CPU's next entry -- by the script's own reckoning, not
+/// `cr.rs`'s.
+#[derive(Clone, Copy, Debug)]
+enum Cr4Expect {
+    /// Read into register `gpr`: `want` there, and RIP past the `len` bytes
+    /// of the instruction at `rip`.
+    Read { gpr: u8, want: u64, rip: u64, len: u64 },
+    /// `value` written: the guest's CR4, MCE in the register, RIP past it.
+    Written { value: u64, rip: u64, len: u64 },
+    /// `value` refused, as a CPU without a bit's feature refuses it: a #GP
+    /// on its way in, CR4 still `old`, RIP still on the instruction.
+    Refused { value: u64, old: u64, rip: u64 },
+}
+
+/// General-purpose register `n` of the guest's, numbered as an instruction
+/// names them: the fuzzer's own table, not the emulator's.
+fn gpr_slot(v: &mut Backend, n: u8) -> &mut u64 {
+    let (sv, regs) = v.save_and_regs_mut();
+    match n {
+        0 => &mut sv.rax,
+        1 => &mut regs.rcx,
+        2 => &mut regs.rdx,
+        3 => &mut regs.rbx,
+        4 => &mut sv.rsp,
+        5 => &mut regs.rbp,
+        6 => &mut regs.rsi,
+        7 => &mut regs.rdi,
+        8 => &mut regs.r8,
+        9 => &mut regs.r9,
+        10 => &mut regs.r10,
+        11 => &mut regs.r11,
+        12 => &mut regs.r12,
+        13 => &mut regs.r13,
+        14 => &mut regs.r14,
+        _ => &mut regs.r15,
+    }
+}
+
+const CR4_PAE: u64 = 1 << 5;
+const CR4_MCE: u64 = 1 << 6;
+/// Prefixes a CPU passes over on a `mov` of a control register.
+const CR_PREFIXES: [u8; 8] = [0x66, 0x67, 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65];
 
 /// The guest: a script, and what its drivers know of the machine.
 struct Script {
@@ -131,6 +178,8 @@ struct Script {
     cr3: u64,
     /// Where the next instruction goes.
     code: u64,
+    /// Under VT-x, which does not stop a guest at CR4: none of its `mov`s.
+    vmx: bool,
 }
 
 impl Script {
@@ -225,6 +274,79 @@ impl Script {
             14 => regs.r14 = value,
             _ => regs.r15 = value,
         }
+    }
+
+    /// A `mov` to or from CR4 at the guest's RIP, as a kernel makes one: a
+    /// read; a bit its CPUID offers turned over -- PGE most of all, which
+    /// Linux's global TLB flush turns -- MCE among them; a bit it does not
+    /// offer, or PAE cleared in long mode, which a CPU refuses. Through any
+    /// register, with prefixes a CPU passes over and a ModRM whose mod field
+    /// it ignores; and what it should come to, for the CPU's next entry to
+    /// see (`Cr4Expect`). Now and then the bytes are not the exit's --
+    /// another control register, the other way, a lock, anything -- which
+    /// stops the guest, and nothing is expected of them.
+    fn cr4_insn(&mut self, v: &mut Backend, mem: &GuestMemory, r: &mut Input) -> Exit {
+        const PGE: u64 = 1 << 7;
+        const LOW32: u64 = 0xFFFF_FFFF;
+        let long = !self.cpus[self.me].protected32;
+        let width = if long { u64::MAX } else { LOW32 };
+        let write = r.bool();
+        let gpr = r.below(if long { 16 } else { 8 }) as u8;
+        let allowed = crate::policy::cr4_allowed();
+        let old = v.cr4();
+        let offered: Vec<u64> = (0..32).map(|b| 1u64 << b).filter(|b| allowed & b != 0 && !(long && *b == CR4_PAE))
+            .collect();
+        let denied: Vec<u64> = (0..64).map(|b| 1u64 << b).filter(|b| allowed & b == 0).collect();
+        let value = match r.u8() % 8 {
+            0..=2 if allowed & PGE != 0 => old ^ PGE,
+            0..=5 if !offered.is_empty() => old ^ offered[r.below(offered.len() as u64) as usize],
+            6 if long => old & !CR4_PAE,
+            _ => old | denied[r.below(denied.len() as u64) as usize],
+        };
+        /* What the CPU takes of the register: in 32-bit code its low half,
+         * whatever is above it. */
+        let taken = value & width;
+        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0);
+
+        let mut insn = Vec::new();
+        if r.u8() < 24 {
+            insn.push(r.pick(&CR_PREFIXES));
+        }
+        let rex = if gpr >= 8 { 0x41 } else { 0 } | if long && r.u8() < 24 { 0x48 } else { 0 };
+        if rex != 0 {
+            insn.push(rex);
+        }
+        let md = if r.u8() < 24 { r.below(3) as u8 } else { 3 };
+        insn.extend_from_slice(&[0x0F, if write { 0x22 } else { 0x20 }, (md << 6) | (4 << 3) | (gpr & 7)]);
+        let len = insn.len() as u64;
+        let stops = r.rare();
+        if stops {
+            let modrm = insn.len() - 1;
+            match r.u8() % 4 {
+                0 => insn[modrm] = (insn[modrm] & !0x38) | (r.pick(&[0u8, 2, 3, 5, 6, 7]) << 3),
+                1 => insn[modrm - 1] ^= 0x20 ^ 0x22,
+                2 => insn.insert(0, 0xF0),
+                _ => insn = (0..1 + r.below(15)).map(|_| r.u8()).collect(),
+            }
+        }
+
+        self.code = CODE + (self.code + 16 - CODE) % (2 * MIB);
+        let rip = self.code;
+        let _ = mem.write(rip, &insn);
+        v.save_mut().rip = rip;
+        /* A write's value; a read's register holds anything first, all of
+         * which the read is to replace. */
+        *gpr_slot(v, gpr) = if write { value } else { r.value64() };
+        if !stops {
+            self.cpus[self.me].cr4 = Some(if !write {
+                Cr4Expect::Read { gpr, want: old & width, rip, len }
+            } else if refused {
+                Cr4Expect::Refused { value: taken, old, rip }
+            } else {
+                Cr4Expect::Written { value: taken, rip, len }
+            });
+        }
+        Exit::Cr4 { write }
     }
 
     /// The exit for a planned step, with what the guest did for it.
@@ -503,6 +625,36 @@ impl crate::targets::Memory for PlannedMemory {
     }
 }
 
+/// Hold the run loop to what a `mov` of CR4 the script made should have
+/// done (`Cr4Expect`), at the next entry of the CPU that made it.
+fn check_cr4(v: &mut Backend, e: Cr4Expect) {
+    let rip = v.save().rip;
+    match e {
+        Cr4Expect::Read { gpr, want, rip: at, len } => {
+            let got = *gpr_slot(v, gpr);
+            invariant!(got == want && rip == at.wrapping_add(len),
+                       "a mov of CR4 into register {} at {:#x} left {:#x} there, where the guest's CR4 is {:#x}, \
+                        and RIP at {:#x}, not {:#x}", gpr, at, got, want, rip, at.wrapping_add(len));
+            cr4_checked("platform: CR4 read");
+        }
+        Cr4Expect::Written { value, rip: at, len } => {
+            invariant!(v.cr4() == value && v.save().cr4 == value | CR4_MCE && rip == at.wrapping_add(len),
+                       "a mov of {:#x} to CR4 at {:#x} left the guest's CR4 {:#x}, the register {:#x} and RIP at \
+                        {:#x}: wanted it, it with MCE, and {:#x}", value, at, v.cr4(), v.save().cr4, rip,
+                       at.wrapping_add(len));
+            cr4_checked(if value & CR4_MCE == 0 { "platform: CR4 written, MCE cleared" }
+                                    else { "platform: CR4 written" });
+        }
+        Cr4Expect::Refused { value, old, rip: at } => {
+            invariant!(v.event == Some(vm::Event::Exception(13)) && v.cr4() == old && rip == at,
+                       "a mov of {:#x} to CR4 at {:#x}, which a CPU refuses, left event {:#x?}, the guest's CR4 \
+                        {:#x} (was {:#x}) and RIP at {:#x}", value, at, v.event, v.cr4(), old, rip);
+            invariant!(v.save().cr4 & CR4_MCE != 0, "CR4's register lost MCE: {:#x}", v.save().cr4);
+            cr4_checked("platform: CR4 write refused");
+        }
+    }
+}
+
 fn io_exit(v: &mut Backend, port: u16, size: u8, input: bool) -> Exit {
     let rip = v.save().rip;
     Exit::Io(Io { port, size, input, string: false, rep: false, next_rip: rip.wrapping_add(2) })
@@ -514,9 +666,13 @@ impl vm::Guest for Script {
         self.me = cpu;
         if v.save().cr0 & 1 == 0 {
             /* Started by INIT and a start-up IPI, in real mode: its
-             * trampoline takes it to long mode on the boot CPU's tables. */
+             * trampoline takes it to long mode on the boot CPU's tables --
+             * and what it did before the INIT is gone, 32-bit code that it
+             * was in among it. */
             v.long_mode(&LongMode { entry: CODE, stack: 0x7_0000 + 0x1000 * cpu as u64, cr3: self.cr3,
                                     code_selector: 0x10, data_selector: 0x18, ..LongMode::default() });
+            self.cpus[cpu].cr4 = None;
+            self.cpus[cpu].protected32 = false;
         }
         let data = core::mem::take(&mut self.data);
         let mut r = Input::resume(&data, self.at);
@@ -535,6 +691,9 @@ impl Script {
                 self.cpus[self.me].xapic = !asked;
             }
         }
+        if let Some(e) = self.cpus[self.me].cr4.take() {
+            check_cr4(v, e);
+        }
         loop {
             if let Some(s) = self.plan().pop_front() {
                 v.take_event();
@@ -543,7 +702,16 @@ impl Script {
                     None => continue,
                 }
             }
-            let op = r.op(35)?;
+            let op = r.op(36)?;
+            if op == 35 {
+                /* A `mov` of CR4, which AMD-V stops the guest at. */
+                if self.vmx {
+                    continue;
+                }
+                v.take_event();
+                let exit = self.cr4_insn(v, mem, r);
+                return Some(vm::Next::Exit(exit));
+            }
             if op == 34 {
                 /* The guest's own #DB -- a single step -- or #AC, which the
                  * host intercepts and gives back; now and then while an
@@ -812,6 +980,13 @@ fn header() -> (Header, Vec<u8>) {
 /// How runs ended, and their exits: `HV_FUZZ_STATS=1` prints them, for
 /// telling whether the script reaches deep or ends its runs early.
 static ENDS: Mutex<std::collections::BTreeMap<String, (u64, u64)>> = Mutex::new(std::collections::BTreeMap::new());
+/// The `mov`s of CR4 held to what they should have done, by what they did.
+static CR4_CHECKED: Mutex<std::collections::BTreeMap<&'static str, u64>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+fn cr4_checked(what: &'static str) {
+    *CR4_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_insert(0) += 1;
+}
 
 pub fn report() {
     let runs: u64 = ENDS.lock().unwrap().values().map(|(n, _)| n).sum();
@@ -819,6 +994,9 @@ pub fn report() {
              vm::HANDOFFS.load(Ordering::Relaxed), vm::SLEEPS.load(Ordering::Relaxed));
     for (kind, (n, exits)) in ENDS.lock().unwrap().iter() {
         println!("  platform: {:>8} runs ended {:<12} {:>6} exits each", n, kind, exits / n.max(&1));
+    }
+    for (what, n) in CR4_CHECKED.lock().unwrap().iter() {
+        println!("  {}: {}", what, n);
     }
 }
 
@@ -959,10 +1137,11 @@ pub fn platform(r: &mut Input) {
         apic: cpus > 1,
         ioapic,
         cpus: (0..n).map(|_| CpuPlan { plan: VecDeque::new(), xapic: first_xapic, asked_xapic: None,
-                                       protected32: false }).collect(),
+                                       protected32: false, cr4: None }).collect(),
         me: 0,
         cr3: vcpus[0].backend_mut().save().cr3,
         code: CODE,
+        vmx: machine.caps().vendor() == Vendor::Vmx,
     };
     vm::set_guest(Some(Box::new(script)));
     let deadline = time::boot_time_ns() + 3600 * crate::consts::NS_PER_SEC;
@@ -982,6 +1161,7 @@ pub fn platform(r: &mut Input) {
         let mut kind = what.split([' ', '(', '{']).next().unwrap_or("").to_string();
         match &s.stop {
             crate::run::Stop::MmioInsn { error, .. } => kind = format!("{}/{:?}", kind, error),
+            crate::run::Stop::CrInsn { error, .. } => kind = format!("{}/{:?}", kind, error),
             crate::run::Stop::Mmio { gpa, .. } => kind = format!("{}/{:x}", kind, gpa >> 20),
             _ => {}
         }

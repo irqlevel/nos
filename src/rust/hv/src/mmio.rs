@@ -109,18 +109,11 @@ fn mode(save: &Save) -> Option<Mode> {
     }
 }
 
-/// Decode the instruction the guest faulted at on `gpa`, a `write` or a
-/// read, and check it against the fault: the access to make, or why not.
-/// `bytes` gets what was fetched, whatever the outcome.
-pub fn begin(v: &Backend, memory: &GuestMemory, gpa: u64, write: bool, bytes: &mut Bytes) -> Result<Op, Error> {
-    /* An event whose delivery the fault cut short is queued again by the
-     * time the exit is handled (`requeue_event`): the access was the
-     * delivery's, and the instruction at RIP -- the one the event came
-     * before -- has nothing to do with it. */
-    if v.event_queued() {
-        return Err(Error::Delivery);
-    }
-    let save = v.save();
+/// The instruction at the guest's RIP, as much of it as its memory has --
+/// up to the longest an instruction is -- fetched into `bytes` by the
+/// guest's own paging; and the mode it is to be decoded in. Error::Mode or
+/// Error::Fetch where it cannot be.
+pub(crate) fn fetch(save: &Save, memory: &GuestMemory, bytes: &mut Bytes) -> Result<Mode, Error> {
     let mode = mode(save).ok_or(Error::Mode)?;
     let paging = Paging { cr0: save.cr0, cr3: save.cr3, cr4: save.cr4, efer: save.efer };
     /* 64-bit code ignores CS's base; 32-bit code adds it, and wraps at 4 GiB. */
@@ -135,8 +128,24 @@ pub fn begin(v: &Backend, memory: &GuestMemory, gpa: u64, write: bool, bytes: &m
     let read_bytes = |gpa: u64, buf: &mut [u8]| memory.read(gpa, buf).is_ok();
     let n = walk::fetch(&paging, la, &mut bytes.b, read_u64, read_bytes).map_err(Error::Fetch)?;
     bytes.len = n as u8;
+    Ok(mode)
+}
 
-    let insn = insn::decode(&bytes.b[..n], mode).ok_or(Error::Decode)?;
+/// Decode the instruction the guest faulted at on `gpa`, a `write` or a
+/// read, and check it against the fault: the access to make, or why not.
+/// `bytes` gets what was fetched, whatever the outcome.
+pub fn begin(v: &Backend, memory: &GuestMemory, gpa: u64, write: bool, bytes: &mut Bytes) -> Result<Op, Error> {
+    /* An event whose delivery the fault cut short is queued again by the
+     * time the exit is handled (`requeue_event`): the access was the
+     * delivery's, and the instruction at RIP -- the one the event came
+     * before -- has nothing to do with it. */
+    if v.event_queued() {
+        return Err(Error::Delivery);
+    }
+    let save = v.save();
+    let mode = fetch(save, memory, bytes)?;
+
+    let insn = insn::decode(&bytes.b[..usize::from(bytes.len)], mode).ok_or(Error::Decode)?;
     if insn.access.is_write() != write {
         return Err(Error::Direction);
     }
@@ -198,7 +207,7 @@ fn sign_extend(value: u64, size: u8) -> u64 {
 }
 
 /// The whole of register `num`, as the guest has it.
-fn gpr(save: &Save, regs: &GuestRegs, num: u8) -> u64 {
+pub(crate) fn gpr(save: &Save, regs: &GuestRegs, num: u8) -> u64 {
     match num {
         0 => save.rax,
         1 => regs.rcx,
@@ -219,7 +228,7 @@ fn gpr(save: &Save, regs: &GuestRegs, num: u8) -> u64 {
     }
 }
 
-fn gpr_mut<'a>(save: &'a mut Save, regs: &'a mut GuestRegs, num: u8) -> &'a mut u64 {
+pub(crate) fn gpr_mut<'a>(save: &'a mut Save, regs: &'a mut GuestRegs, num: u8) -> &'a mut u64 {
     match num {
         0 => &mut save.rax,
         1 => &mut regs.rcx,

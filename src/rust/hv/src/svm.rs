@@ -124,6 +124,10 @@ pub enum Exit {
     /// register named, or for `lmsw` its low four bits over CR0's). AMD-V
     /// intercepts no CR0 write, and never exits for one.
     Cr0Write { value: u64 },
+    /// A `mov` to (`write`) or from CR4, which AMD-V stops a guest at every
+    /// time: so that the CR4 it runs with keeps MCE, and it reads back the
+    /// one it wrote (`crate::cr`). VT-x does not stop a guest here yet.
+    Cr4 { write: bool },
     /// PAUSE -- the guest spin-waiting: stopped so that whatever it waits
     /// for that the host hands over, a timer's tick above all, is handed
     /// over now rather than at the host's next interrupt.
@@ -216,6 +220,10 @@ pub struct Vcpu {
     /// once the guest is past it, at an exit where RIP is elsewhere -- the
     /// intercept comes before the instruction runs.
     iret_at: Option<u64>,
+    /// The CR4 the guest believes it has: what it last wrote, or started
+    /// with. The VMCB's -- the one it runs with -- is this with MCE, which
+    /// `hvarch` keeps there; the guest's reads of CR4 are answered from this.
+    cr4: u64,
 }
 
 /// What a long-mode guest starts from: its page table, a GDT whose entries
@@ -266,9 +274,12 @@ impl Vcpu {
         c.intercept_misc2 = misc2::VMMCALL | misc2::RDTSCP | misc2::ICEBP | misc2::WBINVD
             | misc2::MONITOR | misc2::MWAIT | misc2::MWAIT_ARMED | misc2::XSETBV | misc2::RDPRU;
         c.intercept_exceptions = exceptions;
+        /* CR4: its writes, which `hvarch` intercepts whatever this asks, and
+         * its reads, which the guest's own CR4 answers (`crate::cr`). */
+        c.intercept_cr = vmcb::intercept::cr::READ_CR4 | vmcb::intercept::cr::WRITE_CR4;
         /* No ASID: each entry is given one by the CPU it is on
          * (`Guest::run`). */
-        Ok(Self { guest, perms: Permissions::new()?, nrip, nmi_masked: false, iret_at: None })
+        Ok(Self { guest, perms: Permissions::new()?, nrip, nmi_masked: false, iret_at: None, cr4: 0 })
     }
 
     /// Enter the guest over `memory`'s nested table and come back at its
@@ -377,6 +388,9 @@ impl Vcpu {
             limit: flat,
             base: 0,
         };
+        /* MCE, as every kernel sets it -- and the VMCB's has it whatever the
+         * guest does with it later (`hvarch`). */
+        self.cr4 = CR4_PAE | CR4_MCE;
         let s = self.save_mut();
         s.cs = code;
         s.ds = data;
@@ -397,9 +411,6 @@ impl Vcpu {
         s.efer = EFER_SVME | EFER_LME | EFER_LMA;
         s.cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_WP | CR0_PG;
         s.cr3 = l.cr3;
-        /* MCE, as every kernel sets it: with it clear, a machine check
-         * while the guest runs is a shutdown, and would be reported as the
-         * guest's triple fault. */
         s.cr4 = CR4_PAE | CR4_MCE;
         s.dr6 = DR6_RESET;
         s.dr7 = DR7_RESET;
@@ -418,9 +429,29 @@ impl Vcpu {
     /// what it translated before its reset is nothing it may use now.
     pub fn start_at_sipi(&mut self, vector: u8) {
         real_mode(self.save_mut(), vector, EFER_SVME);
+        /* CR4 0, as reset leaves it -- the guest's; the VMCB's keeps MCE. */
+        self.cr4 = 0;
+        self.save_mut().cr4 = CR4_MCE;
         *self.regs_mut() = reset_regs();
         self.init_reset();
         self.guest.forget_asid();
+    }
+
+    /// The CR4 the guest believes it has, which its reads of CR4 get.
+    pub fn cr4(&self) -> u64 {
+        self.cr4
+    }
+
+    /// Make `value` the guest's CR4, from a write of it performed for the
+    /// guest (`crate::cr`): what its reads get from now on, and with MCE the
+    /// CR4 it runs with; with `flush`, its TLB flushed -- the next entry is
+    /// under a fresh ASID -- as the CPU flushes it for the bits that changed.
+    pub fn set_cr4(&mut self, value: u64, flush: bool) {
+        self.cr4 = value;
+        self.save_mut().cr4 = value | CR4_MCE;
+        if flush {
+            self.guest.forget_asid();
+        }
     }
 
     /// What INIT clears beside the registers: an event waiting to be
@@ -473,6 +504,8 @@ impl Vcpu {
         let c = self.control();
         match c.exit_code {
             vmcb::exit::INTR | vmcb::exit::NMI | vmcb::exit::SMI | vmcb::exit::INIT => Exit::Host,
+            vmcb::exit::CR4_READ => Exit::Cr4 { write: false },
+            vmcb::exit::CR4_WRITE => Exit::Cr4 { write: true },
             vmcb::exit::IOIO => {
                 let info = c.exit_info1;
                 use vmcb::ioio;

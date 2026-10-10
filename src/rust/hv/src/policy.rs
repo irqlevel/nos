@@ -232,6 +232,71 @@ pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
     Cpuid { eax, ebx, ecx, edx }
 }
 
+/// A register of a CPUID answer.
+#[derive(Clone, Copy)]
+enum Word {
+    Ebx,
+    Ecx,
+    Edx,
+}
+
+/* CR4's bits, each with the feature a CPU has it with: the leaf, the
+ * register and the bit that offer it. A CPU without the feature raises #GP
+ * for its bit. A bit not here is never the guest's: one this policy comes to
+ * offer is to be added, or the guest's kernel finds its CR4 write refused. */
+const CR4_FEATURES: &[(u64, u32, Word, u32)] = &[
+    (1 << 0, LEAF_FEATURES, Word::Edx, 1),     // VME
+    (1 << 1, LEAF_FEATURES, Word::Edx, 1),     // PVI, VME's
+    (1 << 2, LEAF_FEATURES, Word::Edx, 4),     // TSD: the TSC
+    (1 << 3, LEAF_FEATURES, Word::Edx, 2),     // DE
+    (1 << 4, LEAF_FEATURES, Word::Edx, 3),     // PSE
+    (1 << 5, LEAF_FEATURES, Word::Edx, 6),     // PAE
+    (1 << 6, LEAF_FEATURES, Word::Edx, 7),     // MCE
+    (1 << 7, LEAF_FEATURES, Word::Edx, 13),    // PGE
+    (1 << 9, LEAF_FEATURES, Word::Edx, 24),    // OSFXSR: FXSR
+    (1 << 10, LEAF_FEATURES, Word::Edx, 25),   // OSXMMEXCPT: SSE
+    (1 << 11, LEAF_STRUCTURED, Word::Ecx, 2),  // UMIP
+    (1 << 12, LEAF_STRUCTURED, Word::Ecx, 16), // LA57
+    (1 << 13, LEAF_FEATURES, Word::Ecx, 5),    // VMXE: VMX
+    (1 << 14, LEAF_FEATURES, Word::Ecx, 6),    // SMXE: SMX
+    (1 << 16, LEAF_STRUCTURED, Word::Ebx, 0),  // FSGSBASE
+    (1 << 17, LEAF_FEATURES, Word::Ecx, 17),   // PCIDE: PCID
+    (1 << 18, LEAF_FEATURES, Word::Ecx, 26),   // OSXSAVE: XSAVE
+    (1 << 20, LEAF_STRUCTURED, Word::Ebx, 7),  // SMEP
+    (1 << 21, LEAF_STRUCTURED, Word::Ebx, 20), // SMAP
+    (1 << 22, LEAF_STRUCTURED, Word::Ecx, 3),  // PKE: PKU
+    (1 << 23, LEAF_STRUCTURED, Word::Ecx, 7),  // CET: shadow stacks,
+    (1 << 23, LEAF_STRUCTURED, Word::Edx, 20), // or indirect-branch tracking
+];
+/// CR4.PCE: RDPMC at any privilege level -- an instruction every x86-64 CPU
+/// has, and so a bit no feature offers.
+const CR4_PCE: u64 = 1 << 8;
+
+/// The CR4 bits a guest may set: those whose feature the CPUID it is told
+/// offers (`cpuid`), and PCE. Any other is the #GP a CPU without the
+/// feature gives (`crate::cr`), so no feature reaches a guest behind its
+/// CPUID's back -- PKE above all, whose PKRU nothing switches between
+/// guests. Today that is VME and PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE,
+/// OSFXSR and OSXMMEXCPT, as the host has them: the structured-features
+/// leaf is blank, and PCID and XSAVE are not offered.
+pub fn cr4_allowed() -> u64 {
+    let features = cpuid(LEAF_FEATURES, 0, 0, false);
+    let structured = cpuid(LEAF_STRUCTURED, 0, 0, false);
+    let mut allowed = CR4_PCE;
+    for &(bit, leaf, word, feature) in CR4_FEATURES {
+        let answer = if leaf == LEAF_FEATURES { &features } else { &structured };
+        let value = match word {
+            Word::Ebx => answer.ebx,
+            Word::Ecx => answer.ecx,
+            Word::Edx => answer.edx,
+        };
+        if value & (1 << feature) != 0 {
+            allowed |= bit;
+        }
+    }
+    allowed
+}
+
 /// Apply a CPUID answer to the guest's registers: EAX and the GPRs the run
 /// stub keeps for EBX, ECX, EDX.
 pub fn apply_cpuid(save: &mut Save, regs: &mut GuestRegs, r: &Cpuid) {

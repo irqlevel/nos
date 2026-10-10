@@ -136,15 +136,24 @@ GUESTS = {
                r"the IO-APIC sent 5, 3 of them levels, 3 ended by EOI"],
     "debug": [r"both #DBs its own handler's: the single step's with DR6\.BS, after the NOP; the ICEBP's with no bit",
               r"2 exceptions given back"],
+    # Its reads are stopped and answered by the host -- 11 accesses
+    # performed -- except on QEMU's TCG, which checks a read of CR4 against
+    # CR0's intercept and so never stops one: 5, its writes. The guest's own
+    # check knows which by the hypervisor's CPUID signature.
+    "cr4": [r"while the CPU's CR4 kept MCE; SMEP, PAE cleared and bit 32 each a #GP, CR4 as it was",
+            r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
+            r"\b(?:11|5) of CR4 performed, 3 refused"],
 }
 
-# Four of the guests test a mechanism only one vendor has: AMD-V's software
+# Five of the guests test a mechanism only one vendor has: AMD-V's software
 # VMCB check (`refused`), its ASID recycling (`asid`), its shadow TPR
-# (`tpr`) and the DR6 its VMCB keeps at a #DB (`debug`). Under Intel VT-x the
-# CPU refuses a bad VMCS itself; the ASID is a VPID held for the guest's
-# life, so the third VM gets one of the first two's back; CR8 is the host's,
-# so the guest is stopped at each access and answered from a shadow; and a
-# #DB is not given back yet. What each says differs; the rest is one.
+# (`tpr`), the DR6 its VMCB keeps at a #DB (`debug`) and its CR4 intercept
+# (`cr4`). Under Intel VT-x the CPU refuses a bad VMCS itself; the ASID is a
+# VPID held for the guest's life, so the third VM gets one of the first two's
+# back; CR8 is the host's, so the guest is stopped at each access and
+# answered from a shadow; a #DB is not given back yet; and CR4 is not
+# intercepted yet, the CPU taking every write itself. What each says
+# differs; the rest is one.
 GUESTS_VMX = {
     "refused": [r"the CPU refused the VMCS at entry for invalid guest state"],
     "asid": [r"vm C was given VPID \d+, which vm [AB] had, and read its own too"],
@@ -152,6 +161,9 @@ GUESTS_VMX = {
     # VT-x writes no DR6 at a #DB exit, and gives the guest no #DB back
     # until the register is put right by hand: the single step stops it.
     "debug": [r"VT-x gives no #DB back yet: the single step stopped it, after the NOP"],
+    # Not run under VT-x this round: what any CPU does with the writes, and
+    # nothing the host keeps.
+    "cr4": [r"VT-x does not stop a guest at CR4 yet"],
 }
 
 

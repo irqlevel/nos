@@ -15,7 +15,11 @@ instructions that must be refused (no memory operand, another opcode, a
 string move, a lock, `movabs`). Each is also cut short at every length,
 which must be refused rather than read as a shorter instruction, and two
 million random byte strings must decode without a panic and never to a
-length past what was there. The walker is checked against page tables built
+length past what was there. The same for its other decoder, of a `mov` to
+or from a control register -- what an intercept of CR4 stops a guest at --
+over CR0, CR2, CR3, CR4 and CR8 and eight registers, REX's among them, in
+64-bit and, without a REX, 32-bit code; each decoder must refuse the
+other's every form. The walker is checked against page tables built
 by hand: 4 KiB, 2 MiB and 1 GiB pages, five levels, non-canonical and
 unmapped addresses, and a fetch across a page boundary.
 
@@ -42,6 +46,7 @@ for i in range(8, 16):
     W16['r%dw' % i] = i
     B8['r%db' % i] = i
 HIGH = {'ah': 0, 'ch': 1, 'dh': 2, 'bh': 3}
+CR = {'cr0': 0, 'cr2': 2, 'cr3': 3, 'cr4': 4, 'cr8': 8}
 
 # The memory operands: base, base and displacement both ways, an index and a
 # scale, R12 and R13 (which need a SIB byte and a displacement of their
@@ -102,6 +107,13 @@ def cases():
         out.append(('movzbw %s, %%dx' % m, 'L 1 2 Z 2 0'))
         out.append(('movsbw %s, %%dx' % m, 'L 1 2 S 2 0'))
     out += [(bad, '-') for bad in REFUSED]
+    # `mov` to and from the control registers: what an intercept of CR4
+    # stops a guest at, decoded for the register the exit does not name
+    # ("C cr gpr write"). CR8 takes REX.R, R8-R15 REX.B.
+    for c in ['cr0', 'cr2', 'cr3', 'cr4', 'cr8']:
+        for r in ['rax', 'rcx', 'rsp', 'rbp', 'rdi', 'r8', 'r13', 'r15']:
+            out.append(('movq %%%s, %%%s' % (r, c), 'C %d %d 1' % (CR[c], R[r])))
+            out.append(('movq %%%s, %%%s' % (c, r), 'C %d %d 0' % (CR[c], R[r])))
     return out
 
 

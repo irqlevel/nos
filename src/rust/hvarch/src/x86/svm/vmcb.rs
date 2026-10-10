@@ -311,6 +311,12 @@ impl VmcbPage {
 
 /// Intercept bits, by the word of the control area they are in.
 pub mod intercept {
+    /// `Control::intercept_cr`: a control register's reads at its number,
+    /// its writes sixteen above.
+    pub mod cr {
+        pub const READ_CR4: u32 = 1 << 4;
+        pub const WRITE_CR4: u32 = 1 << 20;
+    }
     /// `Control::intercept_misc1`.
     pub mod misc1 {
         pub const INTR: u32 = 1 << 0;
@@ -411,6 +417,10 @@ pub mod event {
 
 /// `Control::exit_code`: why the guest stopped (appendix C).
 pub mod exit {
+    /// A `mov` from CR4, and one to it: a control register's reads at
+    /// 0x000 and on, its writes at 0x010 and on.
+    pub const CR4_READ: u64 = 0x004;
+    pub const CR4_WRITE: u64 = 0x014;
     pub const EXCP_BASE: u64 = 0x040;
     pub const EXCP_LAST: u64 = 0x05F;
     pub const INTR: u64 = 0x060;

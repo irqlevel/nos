@@ -72,6 +72,13 @@ pub mod x86 {
             pub edx: u32,
         }
 
+        /// What every AMD64 CPU's leaf 1 EDX has: FPU, DE, PSE, TSC, MSR,
+        /// PAE, MCE, CX8, APIC, SEP, MTRR, PGE, MCA, CMOV, PAT, PSE-36,
+        /// CLFLUSH, MMX, FXSR, SSE and SSE2. A host without PAE has no long
+        /// mode, and its guest's CR4 -- PAE set from its start -- could take
+        /// no write at all.
+        const AMD64_LEAF1_EDX: u32 = 0x078B_FBFD;
+
         pub fn cpuid_count(leaf: u32, sub: u32) -> Option<CpuidResult> {
             let base = if leaf >= 0x8000_0000 { 0x8000_0000 } else { 0 };
             if leaf - base > 0x28 {
@@ -82,7 +89,11 @@ pub mod x86 {
                 h = (h ^ (h >> 31)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
                 h as u32
             };
-            Some(CpuidResult { eax: word(), ebx: word(), ecx: word(), edx: word() })
+            let mut r = CpuidResult { eax: word(), ebx: word(), ecx: word(), edx: word() };
+            if leaf == 1 {
+                r.edx |= AMD64_LEAF1_EDX;
+            }
+            Some(r)
         }
     }
 
@@ -162,6 +173,7 @@ pub mod svm {
         Invalid,
         Cr8 { write: bool, gpr: u8 },
         Cr0Write { value: u64 },
+        Cr4 { write: bool },
         Pause,
         Undefined,
         Other(u64),
@@ -234,6 +246,11 @@ pub mod vm {
     }
 
     const RFLAGS_IF: u64 = 1 << 9;
+    const EFER_LMA: u64 = 1 << 10;
+    const CR4_PSE: u64 = 1 << 4;
+    const CR4_PAE: u64 = 1 << 5;
+    const CR4_MCE: u64 = 1 << 6;
+    const CR4_PGE: u64 = 1 << 7;
 
     /// A guest CPU's state, as the run loop sees it through a backend.
     pub struct Backend {
@@ -252,6 +269,9 @@ pub mod vm {
         pub taken: Vec<Event>,
         /// VT-x's, as the machine's vendor says: which gives no #DB back.
         vmx: bool,
+        /// The CR4 the guest believes it has, as svm.rs keeps it: the
+        /// register, `save.cr4`, has MCE besides.
+        cr4: u64,
     }
 
     impl Default for Backend {
@@ -274,6 +294,7 @@ pub mod vm {
                 cr8: 0,
                 taken: Vec::new(),
                 vmx: false,
+                cr4: 0,
             }
         }
 
@@ -319,10 +340,34 @@ pub mod vm {
             s.efer = (1 << 12) | (1 << 8) | (1 << 10);
             s.cr0 = 0x8005_0033;
             s.cr3 = l.cr3;
-            s.cr4 = 0x20 | 0x40;
+            s.cr4 = CR4_PAE | CR4_MCE;
             s.rip = l.entry;
             s.rsp = l.stack;
             s.rflags = 2;
+            self.cr4 = CR4_PAE | CR4_MCE;
+        }
+
+        /// As svm.rs's: the CR4 the guest believes it has.
+        pub fn cr4(&self) -> u64 {
+            self.cr4
+        }
+
+        /// As svm.rs's: `value` the guest's CR4, and with MCE the register's
+        /// -- held to what a write the run loop performed may be, by rules of
+        /// the fuzzer's own: no bit the guest's CPUID does not offer, PAE kept
+        /// in long mode, and the TLB flushed where a bit a CPU translates by
+        /// changed.
+        pub fn set_cr4(&mut self, value: u64, flush: bool) {
+            invariant!(!self.vmx, "a CR4 write performed for a guest under VT-x, which never stops one at CR4");
+            let allowed = crate::policy::cr4_allowed();
+            invariant!(value & !allowed == 0, "CR4 written with {:#x}: bits {:#x} the guest's CPUID does not offer",
+                       value, value & !allowed);
+            invariant!(self.save.efer & EFER_LMA == 0 || value & CR4_PAE != 0,
+                       "CR4 written with {:#x}: PAE cleared in long mode", value);
+            invariant!(flush || (self.cr4 ^ value) & (CR4_PSE | CR4_PAE | CR4_PGE) == 0,
+                       "CR4 written from {:#x} to {:#x}, and the guest's TLB not flushed", self.cr4, value);
+            self.cr4 = value;
+            self.save.cr4 = value | CR4_MCE;
         }
 
         fn step(&mut self, len: u64) {
@@ -383,8 +428,10 @@ pub mod vm {
                                      limit: 0xFFFF, base: u64::from(vector) << 12 };
             self.save.rip = 0;
             self.save.cr0 = 0x10;
+            self.save.cr4 = CR4_MCE;
             self.save.efer = 1 << 12;
             self.save.rflags = 2;
+            self.cr4 = 0;
         }
         pub fn init_reset(&mut self) {
             self.event = None;
