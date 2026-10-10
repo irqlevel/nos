@@ -2716,7 +2716,11 @@ someone else's; then speed.
    #AC with error code 0, ICEBP as a #DB, #UD for the VMX instructions and
    for RDPMC. Half of the job [the VMX backend's debug-register
    item](#the-vmx-backend-and-where-it-differs-from-amd-v) names.
-3. **A virtqueue's indices are copied a byte at a time.** `read_u16` of
+3. ~~**A virtqueue's indices are copied a byte at a time.**~~ Done: a
+   ring's indices and flags are read and written as one aligned access --
+   `GuestMemory::read_u16` and `write_u16`, over `Frame::load_u16` and
+   `store_u16` and the kernel's `kernel_frame_load16` and `store16` -- the
+   load an acquire and the store a release. What it was: `read_u16` of
    `avail.idx` and `Queue::push`'s store of `used.idx` go through
    `GuestMemory::read` and `write` to `FrameCopy`, whose `MemCpy` is a
    `rep movsb` of two bytes: nothing makes the two one access. When a

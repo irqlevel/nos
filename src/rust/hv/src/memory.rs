@@ -341,6 +341,32 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// The 16-bit word at `gpa`, read as one access with acquire order --
+    /// whole, where `read` copies a byte at a time and another of the
+    /// guest's CPUs may be storing the word meanwhile: a virtqueue's indices
+    /// (`kcore::frame::Frame::load_u16`). An address that is not even is
+    /// refused, as one outside the guest's memory is.
+    pub fn read_u16(&self, gpa: u64) -> Result<u16> {
+        if gpa % 2 != 0 {
+            return Err(Error::BadAddress);
+        }
+        let region = &self.regions[self.region(gpa, 2)?];
+        let (frame, off) = region.frame(gpa);
+        frame.load_u16(off).ok_or(Error::Unmapped)
+    }
+
+    /// `value` stored at `gpa` as one access with release order: what was
+    /// written before it is there before it, for a driver on another CPU
+    /// that reads the word and then what it publishes.
+    pub fn write_u16(&self, gpa: u64, value: u16) -> Result<()> {
+        if gpa % 2 != 0 {
+            return Err(Error::BadAddress);
+        }
+        let region = &self.regions[self.region(gpa, 2)?];
+        let (frame, off) = region.frame(gpa);
+        if frame.store_u16(off, value) { Ok(()) } else { Err(Error::Unmapped) }
+    }
+
     /// The `T` at `gpa`, as it is this instant.
     pub fn read_obj<T: Pod>(&self, gpa: u64) -> Result<T> {
         let mut value = pod::zeroed::<T>();

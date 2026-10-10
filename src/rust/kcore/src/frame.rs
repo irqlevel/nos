@@ -67,6 +67,32 @@ impl Frame {
         /* The page is this value's, and `data` is readable for its length. */
         unsafe { frame::kernel_frame_write(self.phys, offset, data.as_ptr(), data.len()) == 0 }
     }
+
+    /// The 16-bit word at `offset`, loaded as one access -- whole, where a
+    /// copy of its two bytes could take one from before another CPU's store
+    /// of it and one from after -- with acquire order: what was written
+    /// before the word is there to read after it. What a virtqueue's indices
+    /// are read with. None when `offset` is not an aligned word's inside the
+    /// page.
+    pub fn load_u16(&self, offset: usize) -> Option<u16> {
+        if offset % 2 != 0 || !inside(offset, 2) {
+            return None;
+        }
+        let mut value = 0u16;
+        /* The page is this value's, and `value` is a word to write. */
+        (unsafe { frame::kernel_frame_load16(self.phys, offset, &mut value) } == 0).then_some(value)
+    }
+
+    /// `value` stored at `offset` as one access, with release order: what
+    /// was written before it is there before it. False, and nothing stored,
+    /// when `offset` is not an aligned word's inside the page.
+    pub fn store_u16(&self, offset: usize, value: u16) -> bool {
+        if offset % 2 != 0 || !inside(offset, 2) {
+            return false;
+        }
+        /* The page is this value's. */
+        unsafe { frame::kernel_frame_store16(self.phys, offset, value) == 0 }
+    }
 }
 
 fn inside(offset: usize, len: usize) -> bool {
