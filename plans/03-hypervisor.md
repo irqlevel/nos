@@ -263,6 +263,15 @@ access. Keeping x2APIC with it -- an emulated IOMMU's interrupt remapping,
 or a name Linux trusts -- is the open question; the HPET and ECAM are
 next.
 
+Then a review of the whole, on 2026-10-10, which left a list of what to fix
+before stage 4 builds on it -- bugs a guest can reach (one holds a host task
+for good, an unprivileged process stops its VM), the isolation that has to
+come before other people's guests (no speculative-execution mitigation; a
+CPUID and MSR policy that swallows what it does not know; the host's own
+services and the world's metadata open to the guests), the CPU a guest is
+shown (SSE4.2 and nothing after it), speed, and tests:
+[`docs/hypervisor.md`](../docs/hypervisor.md#what-a-review-found).
+
 ## Choose VMX vs SVM based on the dev environment
 
 This choice is driven by where you actually iterate:
@@ -357,7 +366,7 @@ visible sub-demos above.
 
 ## Exit criteria
 
-All met, under AMD-V (SVM); the VMX backend and the arm64 EL2 backend remain.
+All met, under AMD-V (SVM) and Intel VT-x; the arm64 EL2 backend remains.
 
 - ~~Trivial guest runs under VMXON/vmrun and exits as expected~~ — `hv run`.
 - ~~A long-mode guest runs under EPT/NPT~~ — NPT, `hv run hypercall`.
