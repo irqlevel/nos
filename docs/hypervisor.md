@@ -2752,7 +2752,9 @@ someone else's; then speed.
    which without decode assists wants its instruction decoded. The same
    mask should keep PKE -- PKRU is switched by nobody -- and the other bits
    CPUID denies the guest.
-6. **#GP goes in with an error code whatever the CPU's mode.** Both
+6. ~~**#GP goes in with an error code whatever the CPU's mode.**~~ Done:
+   `inject_gp` gives the error code only with CR0.PE set, on both
+   backends. What it was: both
    backends' `inject_gp` set the error code. A CPU in real mode -- an AP
    between its start-up IPI and PE -- takes none: VT-x refuses the entry
    (the guest stops as `Invalid`) and AMD-V pushes a word its handler does
@@ -2784,14 +2786,18 @@ someone else's; then speed.
      and then frees that CPU's VMXON page anyway (`Machine::disable` keeps
      it, the machine's drop frees it). Leak it, or panic, rather than leave
      a CPU in VMX operation over a freed page.
-8. **The safe half enters a guest over any table it is handed.**
+8. ~~**The safe half enters a guest over any table it is handed.**~~ Done:
+   both `enter`s are the crate's own and take the `&GuestMemory` whose
+   table they enter over -- a table comes only from the memory that owns
+   its pages, and the module cannot reach either. What it was:
    `svm::Vcpu::enter` and `vmx::Vcpu::enter` are safe `pub fn`s taking a
    `Nested` whose `root` and `id` are public, and `Vm::vcpu_mut` reaches
    them: the invariant the crate split is for -- a guest's nested table maps
    its own pages -- is a promise of the one caller, `Cpu::enter`, not a
    property of the types. Fix: `enter` crate-private and taking
    `&GuestMemory`, a `Nested` that only `npt` and `ept` can make.
-9. **An unchecked add on a guest's RIP.** The VT-x I/O exit's `next_rip` is
+9. ~~**An unchecked add on a guest's RIP.**~~ Done: it wraps, as the CPU
+   does. What it was: the VT-x I/O exit's `next_rip` is
    `rip + length` with no wrap, where everything else wraps: an `in` at the
    top of the address space is a host panic in a `RUSTUB=1` build. The
    fuzzer does not compile `hv/src/vmx.rs`, which is why it went unseen.
