@@ -16,4 +16,11 @@ unsafe extern "C" {
     /// Copy `len` bytes from `data` into the frame at `offset`: 0, or -1
     /// with nothing copied, as `kernel_frame_read`.
     pub fn kernel_frame_write(phys: u64, offset: usize, data: *const u8, len: usize) -> i32;
+    /// The 16-bit word at `offset` in the frame, loaded as one access with
+    /// acquire order into `value`: 0, or -1 with nothing loaded when that is
+    /// not an aligned word inside one page of RAM.
+    pub fn kernel_frame_load16(phys: u64, offset: usize, value: *mut u16) -> i32;
+    /// `value` stored at `offset` in the frame as one access with release
+    /// order: 0, or -1 with nothing stored, as `kernel_frame_load16`.
+    pub fn kernel_frame_store16(phys: u64, offset: usize, value: u16) -> i32;
 }

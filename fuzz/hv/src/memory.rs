@@ -195,6 +195,24 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// A word read whole, as the real one reads it (one access); refused at
+    /// an odd address, as there. Through `read`, so a racer sees it.
+    pub fn read_u16(&self, gpa: u64) -> Result<u16> {
+        if gpa % 2 != 0 {
+            return Err(Error::BadAddress);
+        }
+        let mut b = [0u8; 2];
+        self.read(gpa, &mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+
+    pub fn write_u16(&self, gpa: u64, value: u16) -> Result<()> {
+        if gpa % 2 != 0 {
+            return Err(Error::BadAddress);
+        }
+        self.write(gpa, &value.to_le_bytes())
+    }
+
     /// As the real one decides it: a page of the MMIO window that is no
     /// region's and not the local APIC's, up to 64 of them.
     pub fn map_absent(&self, gpa: u64) -> Result<()> {
