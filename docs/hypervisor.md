@@ -2726,7 +2726,11 @@ someone else's; then speed.
    used index half written. Fix: an aligned load and store of 2, 4 and 8
    bytes as one access in `kcore::frame`, through the CPU's slot, for the
    ring's indices and flags.
-4. **A CPU's x87/SSE owner goes stale when a vCPU moves.** `fp::OWNER` says
+4. ~~**A CPU's x87/SSE owner goes stale when a vCPU moves.**~~ Done: a
+   guest that loads its registers on a CPU takes its mark off every other
+   (`fp::registers_loaded`), so its number is on one CPU at most -- the
+   last it loaded on -- and `registers_are` means what it says. What it
+   was: `fp::OWNER` says
    whose registers a CPU holds, and an entry skips its FXRSTOR when they are
    the guest's own; nothing takes the mark away when the same guest loads
    them on another CPU. A task that runs on A, then B, then A again resumes

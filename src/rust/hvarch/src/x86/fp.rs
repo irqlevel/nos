@@ -36,7 +36,10 @@ use super::cpu;
 /// guest's exit on a CPU and its next entry there they still hold what its
 /// FXSAVE at the exit saved, unless another guest's entry loaded its own in
 /// between, which the number then says. A number is never given twice, so
-/// a guest dropped and another made in its memory cannot be taken for it.
+/// a guest dropped and another made in its memory cannot be taken for it;
+/// and it is on one CPU at most, the last its guest loaded on
+/// ([`registers_loaded`]), since a CPU it ran on before holds what its
+/// registers were then.
 static OWNER: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
@@ -52,9 +55,23 @@ pub fn registers_are(cpu: u32, id: u64) -> bool {
     OWNER.get(cpu as usize).map_or(false, |o| o.load(Ordering::Relaxed) == id)
 }
 
-/// Guest `id` has just loaded its registers on `cpu`.
+/// Guest `id` has just loaded its registers on `cpu` -- and so they are its
+/// on no other: a CPU it loaded them on before holds what they were when it
+/// last left its guest there, older than what it brings back now. A guest's
+/// task can move (`hv run` without a CPU is one the scheduler places), and
+/// marked on both, a guest that ran on A, then B, then A again skipped its
+/// load on A and went on with the registers of its first stay there. Only
+/// an entry that loads comes here, so looking at every CPU's mark costs
+/// nothing an entry pays every time. The guest runs on one CPU at a time, so
+/// no entry of its own races this; another guest's entry on that CPU may
+/// put its own mark there meanwhile, which the compare-and-swap leaves.
 #[inline]
 pub fn registers_loaded(cpu: u32, id: u64) {
+    for (i, o) in OWNER.iter().enumerate() {
+        if i != cpu as usize && o.load(Ordering::Relaxed) == id {
+            let _ = o.compare_exchange(id, 0, Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
     if let Some(o) = OWNER.get(cpu as usize) {
         o.store(id, Ordering::Relaxed);
     }
