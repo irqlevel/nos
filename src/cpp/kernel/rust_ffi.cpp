@@ -625,10 +625,23 @@ unsigned long kernel_virt_to_phys(const void* virt_addr)
 
 /* ---- Frames: pages of RAM mapped nowhere (kcore::frame) ---- */
 
+/* The RAM frames may not take: what the kernel goes on needing once guests
+   have the rest -- its heap, the pages their nested tables are made of, a
+   module loaded later. A sixteenth of the machine, and no less than 64 MiB.
+   Without it a guest given more memory than the machine had free took the
+   last page, and the next allocation anywhere that may not fail -- a plain
+   `new`, a Rust Box -- panicked the host under every other guest. */
+static const unsigned long FrameReserveMinBytes = 64ul << 20;
+static const unsigned long FrameReserveFraction = 16;
+
 unsigned long kernel_frame_alloc()
 {
-    /* AllocPage zeroes what it hands out, through the temp map. */
-    Kernel::Mm::Page* page = Kernel::Mm::PageTable::GetInstance().AllocPage();
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
+    const unsigned long keep = Stdlib::Max(FrameReserveMinBytes / Const::PageSize,
+        pt.GetTotalPagesCount() / FrameReserveFraction);
+    /* AllocPageKeeping zeroes what it hands out, through the temp map, as
+       AllocPage does. */
+    Kernel::Mm::Page* page = pt.AllocPageKeeping(keep);
     return page ? page->GetPhyAddress() : 0;
 }
 

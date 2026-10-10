@@ -2766,26 +2766,35 @@ someone else's; then speed.
      says the line went with that boot. What it was: `Shared::requeue`
      cleared the queue but `fed` never caught up with `queued`, so `fed_at`
      was `None` from then on.
-   - Forwards and NAT's mappings outlive their VM. `hv stop` gives the port
-     back to the switch, and the next `hv start ... net` takes the lowest
-     free one -- the same MAC and the same address (`port_ip`) -- and with
-     it the old VM's forwards and the answers to its flows, which `nat.rs`
-     has no way to forget by inner address. Fix: a VM's forwards and its
-     mappings go with its port. The forwards do now (`Forwards::drop_vm`,
-     from `hv stop`); the mappings are still to go.
+   - ~~Forwards and NAT's mappings outlive their VM~~ -- done: `hv stop`
+     takes a VM's forwards away with it (`Forwards::drop_vm`), and the
+     switch has NAT forget its address's flows as it gives the port back
+     (`Switch::release`, `Nat::forget`, `kernel_net_nat_forget`); hv-fuzz's
+     `nat` target forgets guests and holds the table to it, and
+     `hv-linux-test.py --net` stops a VM with a forward and flows and looks.
+     What it was: `hv stop` gave the port back to the switch, and the next
+     `hv start ... net` took the lowest free one -- the same MAC and the
+     same address (`port_ip`) -- and with it the old VM's forwards and the
+     answers to its flows.
    - Two VMs can open one image read-write (`FileDisk::open`; the VFS has
      no exclusive writer): two ext4s on one set of blocks. Fix: a claim per
      image -- writers alone, readers together -- refused out loud.
-   - Nothing keeps host memory back. `mem=` is checked against 4064 MiB
-     alone, for up to 16 VMs, and guest memory is taken a frame at a time
-     from the free list everything else uses: a start can empty it, and the
-     next infallible allocation anywhere panics the host. It is taken before
-     the bzImage is even read (`guest::build`), too. Fix: refuse a start
-     that would leave less than a reserve; parse the image first.
-   - `hv stop` takes the VM off the table before it waits for the guest to
-     shut down -- up to `secs` -- so meanwhile `rmmod` does not see it,
-     `hv list` does not show it, and its CPUs can be given to a new VM.
-     Fix: a stopping state, and off the table after.
+   - ~~Nothing keeps host memory back~~ -- done: a frame is not taken
+     past a reserve the kernel keeps for itself, a sixteenth of the machine
+     and no less than 64 MiB (`kernel_frame_alloc`, over
+     `PageTable::AllocPageKeeping`), so a guest too large is refused out of
+     memory rather than taking the last page; and `guest::build` reads and
+     plans the image before it takes any of the guest's memory. The size of
+     the reserve is a guess to revisit. What it was: `mem=` was checked
+     against 4064 MiB alone, for up to 16 VMs, guest memory taken a frame at
+     a time from the free list everything else uses -- a start could empty
+     it, and the next infallible allocation anywhere panicked the host.
+   - ~~`hv stop` takes the VM off the table before it waits for the guest
+     to shut down~~ -- done: it stays on the list, `stopping`, while its
+     power button has its time -- its CPUs counted, `hv off` and an unload
+     seeing it, a second stop and a restart refused -- and an unload ends
+     the wait. What it was: for up to `secs`, `rmmod` did not see it, `hv
+     list` did not show it, and its CPUs could be given to a new VM.
    - ~~An unload that finds a guest's VMCS still current on a CPU says so
      -- and then frees that CPU's VMXON page anyway~~ -- done: the
      machine's drop leaks such a page, and says so, rather than leave a CPU

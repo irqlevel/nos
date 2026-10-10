@@ -209,6 +209,11 @@ public:
     void CheckFreeList(Stdlib::Printer& printer);
 
     Page* AllocPage();
+    /* A page, zeroed, as AllocPage gives one -- or none while the free list
+       holds `keep` pages or fewer: what an allocation that must leave the
+       rest of the kernel its memory takes (kernel_frame_alloc, a guest's
+       RAM). The count is looked at under the lock the page is taken under. */
+    Page* AllocPageKeeping(ulong keep);
     static const ulong MaxContiguousPages = 128;
 
     /* The most pages Mm::MapLargePages maps at one run of VA: 16 MiB, for

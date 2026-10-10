@@ -137,6 +137,11 @@ struct CpuStats {
 pub struct Shared {
     id: u32,
     stop: AtomicBool,
+    /// `hv stop` has it: the VM stays on the list -- its CPUs counted where
+    /// a new VM is placed, `hv off` and an unload seeing it -- while its
+    /// power button is given its time; a second stop and a restart are
+    /// refused meanwhile.
+    stopping: AtomicBool,
     /// `hv restart`: boot the guest again -- the one running, or the one
     /// parked after it stopped.
     reset: AtomicBool,
@@ -192,6 +197,7 @@ impl Shared {
         Some(Shared {
             id,
             stop: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
             reset: AtomicBool::new(false),
             button: AtomicU8::new(BUTTON_UP),
             doorbells: Arc::new(Doorbells::new(cpus as usize)?),
@@ -988,8 +994,12 @@ impl Vms {
             let s = &vm.shared;
             let running = s.running();
             let until = if running { now } else { s.ended_ns.load(Ordering::Relaxed) };
-            let _ = write!(out, "vm {}  {}  cpu{} ", s.id, if running { "running" } else { "stopped" },
-                if vm.cpus.len() == 1 { "" } else { "s" });
+            let state = match (running, s.stopping.load(Ordering::Acquire)) {
+                (true, true) => "stopping",
+                (true, false) => "running",
+                (false, _) => "stopped",
+            };
+            let _ = write!(out, "vm {}  {}  cpu{} ", s.id, state, if vm.cpus.len() == 1 { "" } else { "s" });
             for (i, c) in vm.cpus.iter().enumerate() {
                 let _ = write!(out, "{}{}", if i == 0 { "" } else { "," }, c);
             }
@@ -1364,6 +1374,10 @@ impl Vms {
                 return;
             }
         };
+        if shared.stopping.load(Ordering::Acquire) {
+            let _ = writeln!(out, "hv: vm {} is being stopped -- not restarted", shared.id);
+            return;
+        }
         let before = shared.restarts.load(Ordering::Acquire);
         shared.reset.store(true, Ordering::Release);
         shared.ring_all();
@@ -1373,6 +1387,13 @@ impl Vms {
             kcore::task::sleep_ms(POLL_MS);
             if shared.restarts.load(Ordering::Acquire) != before {
                 let _ = writeln!(out, "hv: vm {} restarted", shared.id);
+                return;
+            }
+            /* Stopped meanwhile -- by a command, or the unload: its task
+             * leaves on the stop flag without taking the reset up, and there
+             * is nothing to wait for. */
+            if shared.stop.load(Ordering::Acquire) {
+                let _ = writeln!(out, "hv: vm {} was stopped -- not restarted", shared.id);
                 return;
             }
             /* Taken up, and not running: its build failed, or it was
@@ -1388,11 +1409,12 @@ impl Vms {
         }
     }
 
-    /// `hv stop <id|all> [secs=N]`: take it off the list, press its power
-    /// button and give it `secs` to turn itself off; then stop it where it
-    /// is, if it is still running, wait for its vCPUs, and say how it ended.
-    /// One that does not listen to the button is stopped at once, and
-    /// `secs=0` stops it without asking.
+    /// `hv stop <id|all> [secs=N]`: press its power button and give it
+    /// `secs` to turn itself off -- on the list meanwhile, `stopping`, its
+    /// CPUs its own -- then take it off the list, stop it where it is, if it
+    /// is still running, wait for its vCPUs, and say how it ended. One that
+    /// does not listen to the button is stopped at once, and `secs=0` stops
+    /// it without asking.
     pub fn stop(&self, args: &str, out: &mut Output, forwards: &Forwards) {
         let (word, rest) = after_word(args);
         let secs = match stop_secs(rest) {
@@ -1413,22 +1435,38 @@ impl Vms {
                 return;
             }
         };
-        let vm = {
-            let mut table = self.table.lock();
-            match table.vms.iter().position(|vm| vm.shared.id == id) {
-                Some(i) => table.vms.remove(i),
+        /* On the list while its power button has its time: its CPUs are
+         * still in use, and an unload has to see it. */
+        let shared = {
+            let table = self.table.lock();
+            match table.vms.iter().find(|vm| vm.shared.id == id) {
+                Some(vm) => vm.shared.clone(),
                 None => {
                     let _ = writeln!(out, "hv: no vm {}", id);
                     return;
                 }
             }
         };
-        let shared = vm.shared.clone();
-        let port = vm.port;
+        if shared.stopping.swap(true, Ordering::AcqRel) {
+            let _ = writeln!(out, "hv: vm {} is being stopped already", id);
+            return;
+        }
         if secs != 0 && shared.press() {
-            wait_shut_down(secs, || shared.shutting_down());
+            /* Not past an unload, which stops it at once itself. */
+            wait_shut_down(secs, || shared.shutting_down() && !self.table.lock().closing);
         }
         let asked = shared.asked(secs);
+        let vm = {
+            let mut table = self.table.lock();
+            table.vms.iter().position(|vm| vm.shared.id == id).map(|i| table.vms.remove(i))
+        };
+        let Some(vm) = vm else {
+            /* `hv stop all`, or the unload, took it meanwhile, and says how
+             * it ended. */
+            let _ = writeln!(out, "hv: vm {} was stopped meanwhile", id);
+            return;
+        };
+        let port = vm.port;
         finish(vm);
         self.release(port);
         let forwarded = forwards.drop_vm(id);

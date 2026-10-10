@@ -4,8 +4,9 @@
    page table is the only mapping of it there is. */
 unsafe extern "C" {
     /// A zeroed page off the free list: its physical address, 0 when there
-    /// is none. Sound anywhere -- a frame nobody frees is a leak, not
-    /// undefined behaviour.
+    /// is none past the reserve the kernel keeps for itself (a sixteenth of
+    /// the machine, at least 64 MiB). Sound anywhere -- a frame nobody frees
+    /// is a leak, not undefined behaviour.
     pub safe fn kernel_frame_alloc() -> u64;
     /// Back onto the free list. The kernel panics on an address that is not
     /// a page, and on a page that is on the free list already.

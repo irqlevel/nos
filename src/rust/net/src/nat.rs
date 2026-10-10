@@ -212,6 +212,22 @@ impl Table {
         self.active -= 1;
     }
 
+    /// Every mapping of `inner_ip`'s freed, live or not, and how many there
+    /// were: its guest is gone, and the address goes to the next guest on
+    /// its port, which must not be handed the answers to the flows of the
+    /// one before -- a TCP connection's sequence numbers among them.
+    fn forget(&mut self, inner_ip: u32) -> usize {
+        let mut n = 0;
+        for i in 0..ENTRIES {
+            let e = &self.entries[i];
+            if e.proto != 0 && e.inner_ip == inner_ip {
+                self.release(i);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Every mapping that has run out, freed; and when the first of the rest
     /// will.
     fn sweep(&mut self, now: u64) {
@@ -402,6 +418,18 @@ impl Nat {
             trace!(0, "nat: off");
         }
         was
+    }
+
+    /// Every mapping of the guest at `inner_ip` behind `inner` forgotten,
+    /// if NAT is on for `inner`: how many there were. A pass over the whole
+    /// table under its lock -- for a guest that has gone, not for a packet.
+    pub fn forget(&self, inner: &'static Device, inner_ip: u32) -> Option<usize> {
+        let mut on = self.on.lock();
+        let o = on.as_mut()?;
+        if !core::ptr::eq(o.inner, inner) {
+            return None;
+        }
+        Some(o.table.forget(inner_ip))
     }
 
     /// While it is on: the two devices and how many mappings there are; and
@@ -872,6 +900,16 @@ pub extern "C" fn kernel_net_nat_enable(inner: usize) -> ffi::net::NatOn {
 pub extern "C" fn kernel_net_nat_disable(inner: usize) -> i32 {
     match (DEVICES.by_handle(inner), crate::abi::nat()) {
         (Some(dev), Some(nat)) if nat.disable(dev) => 1,
+        _ => 0,
+    }
+}
+
+/// Every mapping of the guest at `ip` (host byte order) behind the device
+/// `inner` names forgotten, if NAT is on for it: how many there were.
+#[no_mangle]
+pub extern "C" fn kernel_net_nat_forget(inner: usize, ip: u32) -> u32 {
+    match (DEVICES.by_handle(inner), crate::abi::nat()) {
+        (Some(dev), Some(nat)) => nat.forget(dev, ip).map_or(0, |n| n as u32),
         _ => 0,
     }
 }
