@@ -250,7 +250,7 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "restart" => state.vms.restart(rest, out),
         #[cfg(target_arch = "x86_64")]
-        "stop" => state.vms.stop(rest, out),
+        "stop" => state.vms.stop(rest, out, &state.forwards),
         #[cfg(target_arch = "x86_64")]
         "forward" => forward_command(state, rest, out),
         #[cfg(not(target_arch = "x86_64"))]

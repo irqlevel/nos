@@ -267,6 +267,33 @@ impl Forwards {
         }
     }
 
+    /// Every forward to `vm` taken away, and how many there were: the VM is
+    /// stopped and off the list, and its port of the switch -- its MAC and
+    /// its address -- goes to the next VM started, which a forward kept by
+    /// the address would relay to. Taken off the table under its lock with
+    /// nothing allocated, and ended after, as `del` ends one.
+    pub fn drop_vm(&self, vm: u32) -> usize {
+        let mut gone: [Option<Forward>; MAX_FORWARDS] = Default::default();
+        let mut n = 0;
+        {
+            let mut table = self.table.lock();
+            let mut i = 0;
+            /* The table holds MAX_FORWARDS at most, so `gone` holds them. */
+            while i < table.len() && n < MAX_FORWARDS {
+                if table[i].vm == vm {
+                    gone[n] = Some(table.swap_remove(i));
+                    n += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for f in gone.iter_mut().filter_map(Option::take) {
+            end(f);
+        }
+        n
+    }
+
     /// Every forward taken away: the module is going.
     pub fn close(&self) {
         loop {

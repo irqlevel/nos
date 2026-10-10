@@ -43,6 +43,7 @@ use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 
 use crate::disk::{self, Runner, Wake};
+use crate::forward::Forwards;
 use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
 
@@ -107,6 +108,22 @@ struct Input {
     /// The console's total when the last byte was fed: whatever the guest
     /// printed from there on, it printed after that byte was there to read.
     fed_at: u64,
+    /// The bytes the last new boot threw away unread, by number: after the
+    /// first, up to and including the second. Counted as fed, so that the
+    /// count goes on in step with what is typed after -- `hv exec` waits for
+    /// `fed` to reach its line's number, and a count left behind by bytes
+    /// that will never be fed had every later line wait in vain.
+    lost: (u64, u64),
+}
+
+/// What became of a byte typed at a guest, by its number.
+enum Fed {
+    /// Still queued.
+    Waiting,
+    /// Fed, the console then this long.
+    At(u64),
+    /// Thrown away by a new boot before the guest read it.
+    Lost,
 }
 
 /// What a guest CPU's loop last said it had counted.
@@ -183,7 +200,7 @@ impl Shared {
             attached: AtomicU32::new(0),
             typed: AtomicBool::new(false),
             console: Mutex::new(Ring::new()?)?,
-            input: Mutex::new(Input { queue, queued: queued as u64, fed: 0, fed_at: 0 })?,
+            input: Mutex::new(Input { queue, queued: queued as u64, fed: 0, fed_at: 0, lost: (0, 0) })?,
             pending: AtomicUsize::new(queued),
             reason: Mutex::new(String::new())?,
             report: Mutex::new(String::new())?,
@@ -198,8 +215,21 @@ impl Shared {
     /// A new boot's input: what `input=` types at its first prompt, in place
     /// of whatever was still waiting for the one before.
     fn requeue(&self, bytes: &[u8]) {
+        /* The console's end, read before the input's lock is taken: the
+         * console's lock is never taken under it. */
+        let end = self.console_total();
         let mut input = self.input.lock();
         self.typed.store(false, Ordering::Release);
+        /* What the last boot never read goes with it: counted as fed, as if
+         * read at the console's end, so that the numbers of what is typed
+         * from here on still meet `fed` -- and noted as lost, for a command
+         * waiting on one of them to say so. */
+        let dropped = input.queue.len() as u64;
+        if dropped != 0 {
+            input.lost = (input.fed, input.fed + dropped);
+            input.fed += dropped;
+            input.fed_at = end;
+        }
         input.queue.clear();
         /* `start` refused more than fits. */
         input.queue.extend(bytes.iter().take(INPUT_MAX));
@@ -287,11 +317,19 @@ impl Shared {
         Some(input.queued)
     }
 
-    /// Where the console was when byte `seq` of the input -- or one after it
-    /// -- was fed to the guest, once it has been.
-    fn fed_at(&self, seq: u64) -> Option<u64> {
+    /// What became of byte `seq` of the input: where the console was when
+    /// it -- or one after it -- was fed to the guest, once it has been; or
+    /// that a new boot threw it away.
+    fn fed_at(&self, seq: u64) -> Fed {
         let input = self.input.lock();
-        (input.fed >= seq).then_some(input.fed_at)
+        let (after, upto) = input.lost;
+        if seq > after && seq <= upto {
+            Fed::Lost
+        } else if input.fed >= seq {
+            Fed::At(input.fed_at)
+        } else {
+            Fed::Waiting
+        }
     }
 
     /// The console from `from` on, at most `max` bytes, made safe to print;
@@ -1124,16 +1162,20 @@ impl Vms {
         let mut seen = None;
         let why = loop {
             kcore::task::sleep_ms(POLL_MS);
-            if let Some(at) = shared.fed_at(seq) {
-                let total = shared.console_total();
-                if seen != Some(total) {
-                    seen = Some(total);
-                    if let Some((text, _)) = shared.console_since(at, guest::CONSOLE_BYTES) {
-                        if at_prompt(&text) {
-                            break None;
+            match shared.fed_at(seq) {
+                Fed::At(at) => {
+                    let total = shared.console_total();
+                    if seen != Some(total) {
+                        seen = Some(total);
+                        if let Some((text, _)) = shared.console_since(at, guest::CONSOLE_BYTES) {
+                            if at_prompt(&text) {
+                                break None;
+                            }
                         }
                     }
                 }
+                Fed::Lost => break Some("the vm booted again before it read the line, which went with that boot"),
+                Fed::Waiting => {}
             }
             if !shared.running() {
                 break Some("the vm stopped");
@@ -1142,7 +1184,7 @@ impl Vms {
                 break Some("the vm restarted, and the line went with the boot it was typed at");
             }
             if kcore::time::boot_time_ns() >= deadline {
-                break Some(if shared.fed_at(seq).is_some() {
+                break Some(if matches!(shared.fed_at(seq), Fed::At(_)) {
                     "no prompt came back in time"
                 } else {
                     "the guest has not read the line -- it is not at a prompt; the line stays queued"
@@ -1351,7 +1393,7 @@ impl Vms {
     /// is, if it is still running, wait for its vCPUs, and say how it ended.
     /// One that does not listen to the button is stopped at once, and
     /// `secs=0` stops it without asking.
-    pub fn stop(&self, args: &str, out: &mut Output) {
+    pub fn stop(&self, args: &str, out: &mut Output, forwards: &Forwards) {
         let (word, rest) = after_word(args);
         let secs = match stop_secs(rest) {
             Ok(s) => s,
@@ -1361,7 +1403,7 @@ impl Vms {
             }
         };
         if word == "all" {
-            self.stop_all(Some(out), secs);
+            self.stop_all(Some(out), secs, Some(forwards));
             return;
         }
         let id: u32 = match word.parse() {
@@ -1389,15 +1431,20 @@ impl Vms {
         let asked = shared.asked(secs);
         finish(vm);
         self.release(port);
+        let forwarded = forwards.drop_vm(id);
         let _ = writeln!(out, "hv: vm {} stopped -- {}{}", id, *shared.reason.lock(), asked);
+        if forwarded != 0 {
+            let _ = writeln!(out, "hv: its {} forward(s) taken away with it", forwarded);
+        }
         out.write_bytes(shared.report.lock().as_bytes());
     }
 
     /// Stop every VM and take it off the list, saying how each ended -- to
     /// `out`, or, with no one to say it to, to the kernel log: every power
     /// button pressed at once and the guests given `secs` together to turn
-    /// themselves off, as `stop` gives one.
-    pub fn stop_all(&self, mut out: Option<&mut Output>, secs: u64) {
+    /// themselves off, as `stop` gives one. Each one's forwards go with it,
+    /// when there are `forwards` still to take them from.
+    pub fn stop_all(&self, mut out: Option<&mut Output>, secs: u64, forwards: Option<&Forwards>) {
         if secs != 0 {
             let mut pressed = false;
             for vm in &self.table.lock().vms {
@@ -1430,6 +1477,9 @@ impl Vms {
             let asked = asked.iter().find(|(id, _)| *id == shared.id).map_or(Asked::Nothing, |&(_, a)| a);
             finish(vm);
             self.release(port);
+            if let Some(f) = forwards {
+                f.drop_vm(shared.id);
+            }
             stopped += 1;
             let reason = shared.reason.lock();
             match out.as_deref_mut() {
@@ -1453,8 +1503,8 @@ impl Vms {
         /* Where they are, without asking: an unload is no place to wait on
          * guests -- rmmod gives a module's exit five seconds before it goes
          * on in the background -- and `hv stop all` first is the way to shut
-         * them down. */
-        self.stop_all(None, 0);
+         * them down. The forwards went before this, every one of them. */
+        self.stop_all(None, 0, None);
         let switch = self.switch.lock().take();
         drop(switch);
     }
