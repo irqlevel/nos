@@ -163,6 +163,7 @@ pub mod svm {
         Cr8 { write: bool, gpr: u8 },
         Cr0Write { value: u64 },
         Pause,
+        Undefined,
         Other(u64),
     }
 
@@ -249,6 +250,8 @@ pub mod vm {
         cr8: u8,
         /// Every event the guest took, in order.
         pub taken: Vec<Event>,
+        /// VT-x's, as the machine's vendor says: which gives no #DB back.
+        vmx: bool,
     }
 
     impl Default for Backend {
@@ -270,6 +273,7 @@ pub mod vm {
                 nmi_masked: false,
                 cr8: 0,
                 taken: Vec::new(),
+                vmx: false,
             }
         }
 
@@ -434,6 +438,17 @@ pub mod vm {
         }
         pub fn inject_gp(&mut self) {
             self.queue(Event::Exception(13));
+        }
+        pub fn reflect_exception(&mut self, vector: u8, _error: Option<u32>) {
+            invariant!(vector == 1 || vector == 17, "exception {} given back to the guest", vector);
+            invariant!(!(self.vmx && vector == 1), "a #DB given back under VT-x, whose DR6 is not put right");
+            self.queue(Event::Exception(vector));
+        }
+        pub fn reflects_debug(&self) -> bool {
+            !self.vmx
+        }
+        pub fn skip_icebp(&mut self) {
+            self.step(1);
         }
         pub fn request_irq_window(&mut self) {
             self.irq_window = true;
@@ -676,8 +691,10 @@ pub mod vm {
     }
 
     impl Cpu {
-        pub fn new(_machine: &Machine, _memory: &GuestMemory, _exceptions: u32) -> crate::Result<Cpu> {
-            Ok(Cpu { backend: Backend::new() })
+        pub fn new(machine: &Machine, _memory: &GuestMemory, _exceptions: u32) -> crate::Result<Cpu> {
+            let mut backend = Backend::new();
+            backend.vmx = machine.caps().vendor() == crate::Vendor::Vmx;
+            Ok(Cpu { backend })
         }
         pub fn backend(&self) -> &Backend {
             &self.backend

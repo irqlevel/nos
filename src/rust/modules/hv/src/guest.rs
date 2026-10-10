@@ -561,9 +561,9 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     if total.kicked != 0 {
         let _ = writeln!(out, "  kicked     {} entries turned back for a frame, a disk's answer or an IPI that came on the way in", total.kicked);
     }
-    if total.ud != 0 || total.wbinvd != 0 || total.cr8 != 0 || total.cr0 != 0 {
-        let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR, {} CR0 writes (VT-x)",
-            total.ud, total.wbinvd, total.cr8, total.cr0);
+    if total.ud != 0 || total.wbinvd != 0 || total.cr8 != 0 || total.cr0 != 0 || total.reflected != 0 {
+        let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR, {} CR0 writes (VT-x), {} #DB and #AC given back",
+            total.ud, total.wbinvd, total.cr8, total.cr0, total.reflected);
     }
     let absent = guest.absent_pages();
     if !absent.is_empty() {

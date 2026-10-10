@@ -161,6 +161,22 @@ impl Backend {
     pub fn inject_gp(&mut self) {
         match self { Backend::Svm(v) => v.inject_gp(), Backend::Vmx(v) => v.inject_gp() }
     }
+    pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
+        match self { Backend::Svm(v) => v.reflect_exception(vector, error), Backend::Vmx(v) => v.reflect_exception(vector, error) }
+    }
+    /// Whether a #DB the host intercepted goes back to the guest: under
+    /// AMD-V, whose VMCB holds the DR6 the CPU wrote at the exit. VT-x writes
+    /// no DR6 at a #DB exit, and the guest's has to be put in the register
+    /// by hand before the entry -- with the pending single-step bit where a
+    /// shadow asks for it -- which is not done yet: there a #DB still stops
+    /// the VM, and says so.
+    pub fn reflects_debug(&self) -> bool {
+        matches!(self, Backend::Svm(_))
+    }
+    /// Step past an ICEBP AMD-V intercepted; VT-x has none to step past.
+    pub fn skip_icebp(&mut self) {
+        match self { Backend::Svm(v) => v.skip_icebp(), Backend::Vmx(_) => {} }
+    }
     pub fn request_irq_window(&mut self) {
         match self { Backend::Svm(v) => v.request_irq_window(), Backend::Vmx(v) => v.request_irq_window() }
     }

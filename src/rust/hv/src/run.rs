@@ -83,6 +83,10 @@ pub use crate::smp::Doorbell;
 /// COM1, the guest's console, and its IRQ.
 const COM1: u16 = 0x3F8;
 const COM1_IRQ: u8 = 4;
+/// The exceptions of a guest's own the host intercepts -- so that the CPU
+/// cannot be made to deliver one inside another for good -- and gives back.
+const VECTOR_DB: u8 = 1;
+const VECTOR_AC: u8 = 17;
 
 /// Where the virtio devices' I/O BARs are put, as a BIOS would put them --
 /// the disks' from 0xC000, the NICs' from 0xC100 -- and the IRQs they share:
@@ -278,10 +282,14 @@ pub struct Counts {
     pub sleeps: u64,
     pub slept_ns: u64,
     /// Instructions the guest was told (by CPUID) it does not have, run
-    /// anyway and answered with #UD; WBINVDs stepped past; `mov`s to and
-    /// from CR8 answered from the shadow task-priority register (VT-x); and
-    /// `mov`s to CR0 that changed a bit VT-x keeps for the host.
+    /// anyway and answered with #UD -- or, RDPMC, the #GP of a counter not
+    /// there; WBINVDs stepped past; `mov`s to and from CR8 answered from the
+    /// shadow task-priority register (VT-x); and `mov`s to CR0 that changed
+    /// a bit VT-x keeps for the host.
     pub ud: u64,
+    /// Exceptions of the guest's own the host intercepted and gave back:
+    /// #DB -- a single step, `int1` -- and #AC.
+    pub reflected: u64,
     pub wbinvd: u64,
     pub cr8: u64,
     pub cr0: u64,
@@ -321,6 +329,7 @@ impl Counts {
         self.sleeps += o.sleeps;
         self.slept_ns += o.slept_ns;
         self.ud += o.ud;
+        self.reflected += o.reflected;
         self.wbinvd += o.wbinvd;
         self.cr8 += o.cr8;
         self.cr0 += o.cr0;
@@ -423,6 +432,10 @@ pub struct GuestCpu {
     /// An NMI another CPU sent it, not yet injected: an NMI is latched, one
     /// at a time, until the CPU can take it.
     nmi_pending: bool,
+    /// An exception of the guest's own -- #DB, #AC -- the host intercepted
+    /// and gives back, with its error code: injected before anything else
+    /// once nothing an exit cut short is on its way in (`deliver`).
+    exception: Option<(u8, Option<u32>)>,
     /// The last interrupt injected came from the 8259: when it and the APIC
     /// both have one, they take turns (`LinuxGuest::deliver`).
     last_from_pic: bool,
@@ -603,6 +616,7 @@ impl LinuxGuest {
                 lapic,
                 activity,
                 nmi_pending: false,
+                exception: None,
                 last_from_pic: false,
                 counts: Counts::default(),
             });
@@ -1167,7 +1181,40 @@ impl LinuxGuest {
                     }
                 }
                 Exit::Shutdown => Some(Stop::Shutdown { rip }),
+                /* #AC, and #DB where the backend can give it back, are
+                 * intercepted only so that a guest cannot have the CPU
+                 * deliver one inside another for good (CVE-2015-5307 and
+                 * 8104): the guest's own -- a user process's single step,
+                 * its unaligned access with AC set -- goes back to it, not
+                 * a stop of its whole VM. */
+                Exit::Exception { vector, error }
+                    if vector == VECTOR_AC || (vector == VECTOR_DB && gc.cpu.backend().reflects_debug()) =>
+                {
+                    gc.counts.reflected += 1;
+                    gc.exception = Some((vector, error));
+                    None
+                }
                 Exit::Exception { vector, .. } => Some(Stop::Exception { vector, rip }),
+                /* `int1`, intercepted by AMD-V: stepped past, and its #DB
+                 * given as the trap it is, after the instruction. */
+                Exit::Other(vmcb::exit::ICEBP) if gc.cpu.backend().reflects_debug() => {
+                    gc.counts.reflected += 1;
+                    gc.cpu.backend_mut().skip_icebp();
+                    gc.exception = Some((VECTOR_DB, None));
+                    None
+                }
+                Exit::Undefined => {
+                    gc.counts.ud += 1;
+                    gc.cpu.backend_mut().inject_ud();
+                    None
+                }
+                /* RDPMC, of counters CPUID does not say are there: the #GP
+                 * a CPU gives for a counter it has not got. */
+                Exit::Other(vmcb::exit::RDPMC) => {
+                    gc.counts.ud += 1;
+                    gc.cpu.backend_mut().inject_gp();
+                    None
+                }
                 Exit::MachineCheck => Some(Stop::Exception { vector: 18, rip }),
                 Exit::Invalid => Some(Stop::Invalid),
                 /* The guest can take an interrupt, or an NMI, now; the next
@@ -1325,6 +1372,8 @@ impl LinuxGuest {
             gc.lapic.init();
             self.publish(gc);
             gc.cpu.backend_mut().init_reset();
+            /* What the CPU had to deliver goes with the reset. */
+            gc.exception = None;
             self.set_activity(gc, Activity::WaitForSipi);
         }
         if let Some(vector) = mail.sipi {
@@ -1383,6 +1432,19 @@ impl LinuxGuest {
     /// tick -- Linux, which disables an APIC timer whose count strays two
     /// jiffies from its PIT's -- would see them apart when they are not.
     fn deliver(&self, gc: &mut GuestCpu, extint: bool) {
+        /* An exception given back first: it is the guest's last instruction's.
+         * Not over an event an exit cut short and has put back, which goes
+         * in first -- the two one after the other, as the CPU delivers a
+         * benign exception and the event it interrupted -- and nothing else
+         * this entry. */
+        if let Some((vector, error)) = gc.exception {
+            let v = gc.cpu.backend_mut();
+            if !v.event_queued() {
+                v.reflect_exception(vector, error);
+                gc.exception = None;
+            }
+            return;
+        }
         if gc.nmi_pending {
             let v = gc.cpu.backend_mut();
             if v.nmi_allowed() {

@@ -252,6 +252,12 @@ impl Vcpu {
             r::RDMSR => Exit::Msr { write: false },
             r::WRMSR => Exit::Msr { write: true },
             r::VMCALL => Exit::Hypercall,
+            /* VMX's own instructions and GETSEC exit in non-root operation
+             * whatever the CPL, before the CPU checks it: a guest told it
+             * has neither is owed the #UD a CPU without them gives -- not a
+             * stop of its whole VM for a user process's `vmxoff`. */
+            r::VMCLEAR | r::VMLAUNCH | r::VMPTRLD | r::VMPTRST | r::VMREAD | r::VMRESUME | r::VMWRITE
+            | r::VMXOFF | r::VMXON | r::INVEPT | r::INVVPID | r::VMFUNC | r::GETSEC => Exit::Undefined,
             r::INTERRUPT_WINDOW => Exit::IrqWindow,
             r::CR_ACCESS => {
                 /* CR8, which is the host's; a `mov` to CR0 or an `lmsw`
@@ -589,6 +595,19 @@ impl Vcpu {
     pub fn inject_ud(&mut self) {
         const VECTOR_UD: u32 = 6;
         self.guest.set_inject(vmcs::intr::VALID | vmcs::intr::TYPE_HW_EXCEPTION | VECTOR_UD, 0);
+    }
+
+    /// Give the guest an exception of its own the host intercepted -- #AC
+    /// here; #DB not yet, whose DR6 VT-x does not write at the exit (its
+    /// exit qualification has it) and which goes back only with the
+    /// register put right by hand before the entry -- as the CPU would have
+    /// delivered it: the hardware exception, with its error code.
+    pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
+        let code = if error.is_some() { vmcs::intr::DELIVER_ERRCODE } else { 0 };
+        self.guest.set_inject(
+            vmcs::intr::VALID | vmcs::intr::TYPE_HW_EXCEPTION | code | u32::from(vector),
+            error.unwrap_or(0),
+        );
     }
 
     /// A general-protection fault on the next entry, its error code 0 --

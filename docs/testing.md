@@ -1074,8 +1074,15 @@ depend on; and for `ioapic` that the IO-APIC sent five interrupts, three
 of them levels each ended by EOI -- its serial port's pin taking two edges
 and none while masked, then a level sent again at each EOI while the line
 stayed up, its remote IRR set in service and clear after ([The
-IO-APIC](hypervisor.md#the-io-apic)). The unload that follows, and the
-load after it, are then of a hypervisor that has run guests on those CPUs.
+IO-APIC](hypervisor.md#the-io-apic)); and for `debug`, through the run loop
+a Linux guest's CPUs go through, that a single step and an `int1` -- each a
+#DB the host intercepts -- reached the guest's own handler, the first with
+DR6.BS and after the stepped instruction, the second after the ICEBP: a
+user process's `stepi` once stopped its whole VM. Under VT-x, which gives
+no #DB back yet, it checks the single step stops the guest there instead,
+so that the day it does, the check has to be changed with it. The unload
+that follows, and the load after it, are then of a hypervisor that has run
+guests on those CPUs.
 
 `smp` is the one guest of two CPUs, its second on another host CPU than
 the first ([More than one CPU](hypervisor.md#more-than-one-cpu)), and its
