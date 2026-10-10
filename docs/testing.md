@@ -1154,6 +1154,20 @@ an early console on, PCI, ACPI and SMP off is enough -- and run
 scripts/hv-linux-test.py --bzimage /path/to/bzImage
 ```
 
+The initramfs `--initrd` takes is a static BusyBox and an `/init` that
+mounts `/proc` and `/sys`, says `nos-guest: init is up`, turns the kernel's
+console messages down (`dmesg -n 1`) and runs `sh` -- a kernel line printed
+after the shell's prompt hides the prompt from the module. Which BusyBox
+matters three ways. Its line editor has to ask the terminal where the
+cursor is (`FEATURE_EDITING_ASK_TERMINAL`): the module types a line at a
+guest only once it has heard that question, which a shell asks at its
+prompt, and with a BusyBox that never asks, every `hv exec` waits out its
+time and says the guest is not at a prompt. `--net` wants its `httpd`; and
+its exec has to run a script with no `#!` line through the shell, as
+glibc's does, for the `udhcpc -s` script `--net` writes. Ubuntu 24.04's
+static BusyBox 1.36.1 does all three; Alpine's `busybox-static` has no
+`httpd` and runs no such script; the official `busybox` image's never asks.
+
 Under AMD-V, which on a machine with no hardware SVM is QEMU's TCG, itself
 under nothing faster -- so the guest's decompressor and early boot are twice
 emulated and slow, and the whole run is a couple of minutes (`--secs` sets
@@ -1180,7 +1194,15 @@ it -- so the gate ends on a command's output (`version`) rather than on
 `dmesg hv:`. `--skip-boot` and `--skip-vms` run one half. The same phase
 restarts guests: a stopped one by `hv restart`, one started with `restart`
 that resets itself until the sixth reset in a minute leaves it stopped, and
-the running one, which must answer a line typed during its new boot.
+the running one, which must answer a line typed during its new boot. And
+one more guest is started with an `input=` and restarted before its first
+prompt -- the input held for that prompt, so the boot after throws it away
+unread, every time -- and must answer the next line at its prompt: input a
+boot throws away once left every later `hv exec` waiting out its time and
+then saying the line was not read. The guest ran the line all the same, so
+its answer is in the output either way, and the check that holds is that
+`hv exec` said nothing of a line not read: a control run with the fix taken
+out passed while it looked for the answer alone, and fails it now.
 
 `--attach` is a boot of its own for `hv attach`: sshd and a guest started
 from `/etc/rc`, then an `ssh -tt ... hv attach 0` that types a line, waits
@@ -1254,7 +1276,11 @@ that sent them and no other. (nos's ARP table is no steady witness: with
 the check taken out of the switch the claim reached it, and the other
 guest's own ARP put the entry right again -- once before the test could
 look, and once not, when the fetch through `hv forward`, which the test
-makes last, reached the claiming guest instead of the other's `httpd`.) It
+makes last, reached the claiming guest instead of the other's `httpd`.)
+Then one guest is stopped with a forward to it and its flows in NAT's table:
+its forward has to go with it, the other's stay, and `nat` show no mapping
+of its address -- the next VM on its port has its MAC and address, and was
+once relayed to and answered for the stopped one. It
 needs a guest kernel with networking, virtio-net, packet sockets and `ip=`
 configuration built in, and POSIX timers: BusyBox's `ping` paces itself
 with `alarm()`, which a `tinyconfig` leaves out, and without it the guest's

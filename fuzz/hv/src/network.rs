@@ -285,6 +285,9 @@ pub mod net {
         pub fn outer(&self) -> Nic {
             self.outer
         }
+        pub fn forget(&self, ip: u32) -> usize {
+            crate::nat::kernel_net_nat_forget(self.inner, ip) as usize
+        }
     }
 
     impl Drop for Nat {

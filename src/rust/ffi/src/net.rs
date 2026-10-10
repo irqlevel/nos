@@ -114,6 +114,10 @@ unsafe extern "C" {
     pub safe fn kernel_net_nat_enable(inner: usize) -> NatOn;
     /// NAT off, if it is on for the device `inner` names: 1 when it was.
     pub safe fn kernel_net_nat_disable(inner: usize) -> i32;
+    /// Every mapping of the guest at `ip` (host byte order) behind the
+    /// device `inner` names forgotten, if NAT is on for it: how many there
+    /// were. Values only, the handle looked up in the device table.
+    pub safe fn kernel_net_nat_forget(inner: usize, ip: u32) -> u32;
     /// The DNS server this machine was given -- its resolver's, or the
     /// DHCP lease's -- host byte order; 0 for none.
     pub safe fn kernel_net_dns_server() -> u32;

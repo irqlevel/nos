@@ -462,6 +462,12 @@ impl Switch {
             inbox.owner.take()
         };
         drop(owner);
+        /* The port's address goes with it to the next VM to claim it: what
+         * NAT has mapped for this one's flows goes now, or the next would be
+         * answered for them -- a TCP connection's sequence numbers too. */
+        if let Some(n) = self.nat.lock().as_ref() {
+            n.forget(port_ip(port));
+        }
     }
 
     /// The backend a guest's NIC on `port` is built with.
