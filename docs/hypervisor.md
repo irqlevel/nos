@@ -589,6 +589,28 @@ on on every entry, whatever the VMCB says:
 - the intercept of #MC -- and since an intercepted machine check is not
   delivered to the host by the CPU, `run` raises vector 18 itself before
   interrupts come back on, into the kernel's own handler, which panics;
+- CR4.MCE set in the CR4 the guest runs with, and the intercept of every
+  write of CR4, so that the guest cannot clear it in the register either:
+  with MCE clear a machine check is no exception but a shutdown -- the
+  guest's triple fault, as the exit has it -- and the host never hears of
+  it. What the guest believes CR4 holds is the policy's to keep: `hv`
+  intercepts its reads of CR4 as well, and answers them, and performs its
+  writes, from the CR4 the guest wrote (`hv/src/cr.rs`, `crate::cr`) -- the
+  instruction fetched by the guest's paging and decoded, as an MMIO
+  access's is, since a CPU without decode assists (QEMU's, a nested
+  hypervisor's) does not name the register. A write of a bit the guest's
+  CPUID does not offer is the #GP a CPU without the feature gives, so PKE,
+  SMEP, FSGSBASE, LA57, OSXSAVE and PCIDE stay off; one a CPU would not take
+  where the guest is -- PAE cleared in long mode, PCIDE with a PCID in CR3 --
+  is a #GP too; and a write that changes a bit a CPU translates by flushes
+  the guest's TLB, as the CPU would. QEMU's TCG never stops a guest at a
+  read of CR4, whatever the VMCB asks: its decoder checks a read of any
+  control register against CR0's read intercept, adding the register's
+  number to the exit code only when the code is not 0 -- and CR0's read is
+  (`decode_op`, `target/i386/tcg/decode-new.c.inc`, QEMU 10.2). There the
+  guest reads the register, MCE in it, and its writes are the host's all
+  the same. Intercepting CR0's reads too would catch them there, and on a
+  real CPU catch SMSW, which a guest's user process may run;
 - physical interrupts masked by the host's flag, not the guest's
   (`V_INTR_MASKING`), so a guest sitting with interrupts off cannot keep the
   host's out;
@@ -745,6 +767,8 @@ mode:
 | `asid` | three VMs on one CPU read a page of their own at one address: two taking turns, and a third given an ASID one of them had | no guest reads another's page through the TLB, and a reused ASID is reused after a flush ([Address space identifiers](#address-space-identifiers)) |
 | `smp` | two CPUs, on two host CPUs: the first sends the second INIT and a start-up IPI; the second comes up in real mode at the vector's page, climbs through protected mode to long mode, writes down its x2APIC ID and CPUID's, and sends the first an IPI; the first, woken by it, arms its APIC timer for one shot and halts until it fires | an application processor started the way Linux starts one, an IPI between two CPUs, and the local APIC timer ([More than one CPU](#more-than-one-cpu)) |
 | `ioapic` | on the machine of `smp` with an IO-APIC, its first CPU alone, in xAPIC mode: reads the IO-APIC's version, then wires the serial port's pin to itself -- as an edge, the THR-empty interrupt enabled and a byte written, then one written while masked; as a level, its handler ending it without reading IIR twice, and the third time reading it | edges sent as the line rises and lost while masked; a level sent again at each EOI for as long as its line is up, its remote IRR set until then; every IO-APIC access and every EOI a decoded MMIO access ([The IO-APIC](#the-io-apic)) |
+| `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS; under VT-x, which gives no #DB back yet, the single step stops it |
+| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and SMEP, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and SMEP -- which its CPUID does not offer -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x, which does not stop a guest at CR4 yet, the CPU takes each write itself |
 
 ```
 $ hv run all 3
@@ -779,7 +803,7 @@ hv: guest ioapic -- an IO-APIC, through its page: the serial port's pin as an ed
   stopped    cpu 0 halted with interrupts off at 0x80d4, cpu 1 never started
   checked    version 0x20's 24 pins; two edges taken, none while masked; three levels, each sent again at its EOI while the line stayed up, its remote IRR set in service and clear after
 hv: guest ioapic ok
-hv: 13 of 13 guests ok
+hv: 15 of 15 guests ok
 ```
 
 A guest bound to a CPU the extension is not on for is not run, and says
@@ -2769,16 +2793,31 @@ someone else's; then speed.
    are bound to a CPU each, so today only `hv run` without a CPU can move;
    anything that moves a vCPU later meets it. Fix: skip the FXRSTOR only on
    the CPU the guest last loaded its registers on.
-5. **CR4.MCE is the guest's.** VT-x's CR4 guest/host mask is VMXE alone,
-   and AMD-V intercepts no CR at all, so a guest can clear MCE -- a kernel
-   built without `X86_MCE` does, from Linux's source -- and a machine check
-   on that CPU while it runs is a shutdown: the host sees the guest's triple
-   fault, restarts it, and never hears of the #MC. KVM keeps the host's MCE
-   in the hardware CR4 under both vendors. Fix: MCE in the VT-x mask, the
-   guest's value in the read shadow; under AMD-V a CR4 write intercept,
-   which without decode assists wants its instruction decoded. The same
-   mask should keep PKE -- PKRU is switched by nobody -- and the other bits
-   CPUID denies the guest.
+5. **CR4.MCE is the guest's** -- ~~under AMD-V~~, done there: `hvarch`'s
+   `Guest::run` sets MCE in the CR4 the guest runs with and intercepts
+   every write of CR4, whatever the policy asks; `hv` intercepts the reads
+   too, keeps the CR4 the guest wrote and answers from it (`hv/src/cr.rs`:
+   the instruction fetched and decoded, `insn::decode_mov_cr`, since QEMU's
+   and a nested hypervisor's CPUs give no decode assists), refuses with #GP
+   a bit the guest's CPUID does not offer -- PKE among them, which closes the
+   PKRU half of item 7 below under AMD-V -- and a write no CPU takes in long
+   mode, and flushes the guest's TLB where the CPU would. The `cr4` built-in
+   guest, hv-fuzz's platform target (every read and write held to what it
+   should have done, at the CPU's next entry) and insn-test's control
+   registers are its gates; a Linux guest of one CPU and of two boots
+   through it. The cost is an exit for every `mov` of CR4 -- two for each of
+   Linux's global TLB flushes, which toggle PGE. QEMU's TCG, where the gates
+   run, stops no read of CR4 (a bug of its own, [above](#what-entering-a-guest-cannot-be-told-to-do)):
+   there the reads are checked by the fuzzer alone, and the `cr4` guest says
+   which it saw. **Left: VT-x**, whose CR4
+   guest/host mask is still VMXE alone: MCE in the mask, the guest's value
+   in the read shadow, and the bits CPUID denies kept off the same way. What
+   it was: AMD-V intercepted no CR at all and VT-x's mask was VMXE alone, so
+   a guest could clear MCE -- a kernel built without `X86_MCE` does, from
+   Linux's source -- and a machine check on that CPU while it ran was a
+   shutdown: the host saw the guest's triple fault, restarted it, and never
+   heard of the #MC. KVM keeps the host's MCE in the hardware CR4 under both
+   vendors.
 6. ~~**#GP goes in with an error code whatever the CPU's mode.**~~ Done:
    `inject_gp` gives the error code only with CR0.PE set, on both
    backends. What it was: both
@@ -2903,8 +2942,10 @@ someone else's; then speed.
    thread. Fix: an isolation mode -- whole cores to a guest -- or SMT off.
 7. **Debug registers and PKRU.** DR0-3, and DR6 under VT-x, are switched by
    neither backend ([above](#the-vmx-backend-and-where-it-differs-from-amd-v)):
-   one guest's breakpoints are another's. On a host with PKU a guest sets
-   CR4.PKE and PKRU, which nothing switches either.
+   one guest's breakpoints are another's. On a host with PKU a guest under
+   VT-x sets CR4.PKE and PKRU, which nothing switches either; under AMD-V
+   its write of CR4.PKE is a #GP (item 5), its CPUID not offering PKU, and
+   WRPKRU is then the #UD it is without PKE.
 8. **VT-x's controls are taken on trust.** `adjust` drops a control the CPU,
    or an outer hypervisor, does not allow, and only the MSR bitmap is looked
    at again: a CR8, WBINVD, I/O, external-interrupt or NMI exit gone missing

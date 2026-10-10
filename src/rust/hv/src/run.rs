@@ -62,6 +62,7 @@ use kcore::sync::Mutex;
 use kcore::time;
 
 use crate::acpi;
+use crate::cr;
 use crate::devices::blk::{self, Blk};
 use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
@@ -200,6 +201,9 @@ pub enum Stop {
     /// the instruction at `rip` that reached `gpa`, as far as it was read
     /// (`bytes`), and why (`error`).
     MmioInsn { gpa: u64, rip: u64, error: mmio::Error, bytes: mmio::Bytes },
+    /// A `mov` to or from CR4 that could not be performed for it (`cr`):
+    /// the instruction at `rip`, as far as it was read, and why.
+    CrInsn { rip: u64, error: cr::Error, bytes: mmio::Bytes },
     /// An exception the host intercepts (#DB, #AC, #MC) fired.
     Exception { vector: u8, rip: u64 },
     /// The CPU refused the VMCB, or the extension went off under it.
@@ -293,6 +297,11 @@ pub struct Counts {
     pub wbinvd: u64,
     pub cr8: u64,
     pub cr0: u64,
+    /// `mov`s to and from CR4 performed for the guest (AMD-V, `crate::cr`),
+    /// and of those writes the ones refused with #GP: a bit its CPUID does
+    /// not offer, or one a CPU would not take where it was.
+    pub cr4: u64,
+    pub cr4_gp: u64,
     pub exits: u64,
 }
 
@@ -333,6 +342,8 @@ impl Counts {
         self.wbinvd += o.wbinvd;
         self.cr8 += o.cr8;
         self.cr0 += o.cr0;
+        self.cr4 += o.cr4;
+        self.cr4_gp += o.cr4_gp;
         self.exits += o.exits;
     }
 }
@@ -549,6 +560,9 @@ pub struct LinuxGuest {
     /// Its furniture is laid out (`load`): the ACPI tables describe the
     /// devices it had then, and it takes no more.
     loaded: bool,
+    /// The CR4 bits its CPUs may set, by the CPUID they are told
+    /// (`policy::cr4_allowed`): asked of the host once, not at every write.
+    cr4_allowed: u64,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -667,6 +681,7 @@ impl LinuxGuest {
             started: AtomicU64::new(0),
             last_halt: AtomicU64::new(0),
             loaded: false,
+            cr4_allowed: crate::policy::cr4_allowed(),
         };
         Ok((guest, vcpus))
     }
@@ -1248,6 +1263,18 @@ impl LinuxGuest {
                     gc.counts.cr0 += 1;
                     gc.cpu.backend_mut().cr0_write(value);
                     None
+                }
+                Exit::Cr4 { write } => {
+                    gc.counts.cr4 += 1;
+                    let mut bytes = mmio::Bytes::default();
+                    match cr::cr4_access(gc.cpu.backend_mut(), &self.memory, write, self.cr4_allowed, &mut bytes) {
+                        Ok(cr::Done::Refused) => {
+                            gc.counts.cr4_gp += 1;
+                            None
+                        }
+                        Ok(cr::Done::Read | cr::Done::Written) => None,
+                        Err(error) => Some(Stop::CrInsn { rip, error, bytes }),
+                    }
                 }
                 /* Spin-waiting: stepped past, and round the loop, where a
                  * tick it may be waiting for is handed over. */

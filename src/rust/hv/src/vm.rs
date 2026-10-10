@@ -138,6 +138,18 @@ impl Backend {
     pub fn cr0_write(&mut self, value: u64) {
         match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.cr0_write(value) }
     }
+    /// The CR4 the guest believes it has: under AMD-V what it last wrote,
+    /// which its reads of CR4 get ([`Exit::Cr4`]), while the register keeps
+    /// MCE; under VT-x, which does not stop a guest at CR4 yet, the register.
+    pub fn cr4(&self) -> u64 {
+        match self { Backend::Svm(v) => v.cr4(), Backend::Vmx(v) => v.save().cr4 }
+    }
+    /// Make `value` the guest's CR4, for a write of it `crate::cr` performed
+    /// -- its TLB flushed with `flush`. Only AMD-V stops a guest at a CR4
+    /// write, so there is nothing for VT-x's side to do.
+    pub fn set_cr4(&mut self, value: u64, flush: bool) {
+        match self { Backend::Svm(v) => v.set_cr4(value, flush), Backend::Vmx(_) => {} }
+    }
     pub fn inject_extint(&mut self, vector: u8) {
         match self { Backend::Svm(v) => v.inject_extint(vector), Backend::Vmx(v) => v.inject_extint(vector) }
     }
