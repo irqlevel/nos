@@ -766,9 +766,34 @@ impl Fs {
             self.read_tree(b"/", 0);
             return;
         }
+        self.identities();
         let model = self.model.tree.clone();
         if let Some(d) = self.compare_at(b"/", &model, 0) {
             panic!("invariant: the tree read back is not the model's: {}", d);
+        }
+    }
+
+    /// Which file each open handle is, through the file ABI a guest's disk
+    /// claims its image by (`kernel_file_mount`, `kernel_file_key`): one
+    /// for two handles on one path, another for two on two -- a sound tree
+    /// has no file under two names.
+    fn identities(&self) {
+        let ids: Vec<(Vec<u8>, Option<(u64, u64)>)> = self.model.open.iter().map(|(h, o)| {
+            let w = Handle::into_raw(Some(*h));
+            let (mount, key) = (fs::files::kernel_file_mount(w), fs::files::kernel_file_key(w));
+            (join(&o.path), (mount != 0 && key != 0).then_some((mount, key)))
+        }).collect();
+        for (i, (p, id)) in ids.iter().enumerate() {
+            self.check(id.is_some(), format_args!("the open file {} is no file, by its identity", show(p)));
+            for (q, other) in &ids[..i] {
+                self.check((p == q) == (id == other), format_args!("the open files {} and {} are {:?} and {:?}",
+                                                                   show(p), show(q), id, other));
+                if p == q {
+                    reached("one file open twice, one identity");
+                } else if id.map(|x| x.0) == other.map(|x| x.0) {
+                    reached("two files open on one mount, two identities");
+                }
+            }
         }
     }
 

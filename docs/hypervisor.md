@@ -1121,6 +1121,22 @@ $ hv exec 0 mount /dev/vda /mnt
 $ hv exec 0 cat /mnt/hello.txt
 ```
 
+**An image is one writer's, or any number of readers'.** A guest's disk
+claims its image as it opens it, by the file rather than the path -- its
+mount and inode, so two names of one image are one: a disk that writes it
+has it alone, and disks that only read it (`:ro`) share it. Two guests'
+filesystems on one set of blocks would each wreck the other's with nothing
+to say so; a start or a boot that cannot have its claim is refused, saying
+whose the image is --
+
+```
+$ hv start /bzImage initrd=/initrd disk=/disk.img:ro cmdline=console=ttyS0 nolapic
+hv: vm 1 not started -- /disk.img: vm 0's disk writes it
+```
+
+-- and the claim goes with the disk, when its VM stops. It holds among the
+VMs only: nos's own shell is not held to it (`modules/hv/src/disk.rs`).
+
 **Legacy virtio over PCI, reached by port I/O** -- so still no instruction
 decoded anywhere. PCI's configuration space is the PC's mechanism #1, an
 address written to 0xCF8 and the data at 0xCFC, for bus 0: a host bridge at
@@ -2787,9 +2803,19 @@ someone else's; then speed.
      `hv start ... net` took the lowest free one -- the same MAC and the
      same address (`port_ip`) -- and with it the old VM's forwards and the
      answers to its flows.
-   - Two VMs can open one image read-write (`FileDisk::open`; the VFS has
-     no exclusive writer): two ext4s on one set of blocks. Fix: a claim per
-     image -- writers alone, readers together -- refused out loud.
+   - ~~Two VMs can open one image read-write~~ -- done: a guest's disk
+     claims its image as it opens it (`disk::Claims`), by the file -- its
+     mount and inode (`kernel_file_mount`, `kernel_file_key`), so two
+     names of one image are one -- a disk that writes it alone and any
+     number that only read it together, and a start or a boot that cannot
+     have its claim is refused saying whose the image is; the claim goes
+     with the disk.
+     Among the VMs only: nos's own shell is not held to it.
+     `hv-linux-test.py` refuses a writer and a reader beside a writer, and
+     a writer beside two readers; `fs-fuzz.py` holds every open file's
+     identity to the model's. What it was: `FileDisk::open` opened the
+     file read-write for every VM that named it, and the VFS has no
+     exclusive writer -- two ext4s on one set of blocks.
    - ~~Nothing keeps host memory back~~ -- done: a frame is not taken
      past a reserve the kernel keeps for itself, a sixteenth of the machine
      and no less than 64 MiB (`kernel_frame_alloc`, over

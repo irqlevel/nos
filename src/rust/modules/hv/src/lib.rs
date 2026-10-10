@@ -232,7 +232,7 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "bench" => bench(machine, words, out),
         #[cfg(target_arch = "x86_64")]
-        "boot" => boot::boot(machine, rest, &state.vms.load(), &state.unloading, out),
+        "boot" => boot::boot(machine, rest, &state.vms.load(), &state.unloading, state.vms.claims(), out),
         #[cfg(target_arch = "x86_64")]
         "start" => state.vms.start(machine, rest, out),
         #[cfg(target_arch = "x86_64")]

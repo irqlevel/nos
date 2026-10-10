@@ -19,7 +19,7 @@ use kcore::cmd::Output;
 use kcore::consts::{MAX_CPUS, NS_PER_SEC};
 use kcore::sync::Mutex;
 
-use crate::disk::{self, Runner, Wake};
+use crate::disk::{self, Claims, Holder, Runner, Wake};
 use crate::guest::{self, LogLine, Ring, Spec};
 
 const USAGE: &str = "hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]";
@@ -82,8 +82,10 @@ struct Boot {
     /// The host CPUs its CPUs run on, the first CPU's first -- the one this
     /// task is bound to.
     placement: Vec<u32>,
-    /// Where the guest's disks are served.
+    /// Where the guest's disks are served, and the claims every guest's
+    /// disks hold on their images.
     disk_cpu: u32,
+    claims: Arc<Claims>,
     /// Each of its CPUs' doorbell: what a halted CPU waits on, and what has
     /// one in its guest leave it -- the first's rung by a disk that has
     /// served something.
@@ -108,7 +110,13 @@ impl Boot {
             return;
         }
         label.push_str("boot");
-        let runner = Runner { wake: self.clone(), name: label, cpu: self.disk_cpu };
+        let runner = Runner {
+            wake: self.clone(),
+            name: label,
+            cpu: self.disk_cpu,
+            claims: self.claims.clone(),
+            holder: Holder::Boot,
+        };
         let built = match guest::build(&self.machine, &self.spec, &runner, self.doorbells.clone()) {
             Ok(built) => built,
             Err(why) => {
@@ -191,7 +199,7 @@ fn write_console(report: &mut String, ring: &Ring) {
 /// `hv boot ...`: build the job, run it on a vCPU task of its own -- and
 /// its other CPUs on tasks of theirs -- and print what it reported.
 pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloading: &Arc<AtomicBool>,
-            out: &mut Output) {
+            claims: Arc<Claims>, out: &mut Output) {
     if let Err(e) = hv::run::ensure_runnable(machine) {
         let _ = writeln!(out, "hv: no guest can run here -- {}", e);
         return;
@@ -238,6 +246,7 @@ pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloadin
         report,
         unloading: unloading.clone(),
         disk_cpu: disk::disk_cpu(cpu, busy),
+        claims,
         placement,
         doorbells: Arc::new(doorbells),
     });

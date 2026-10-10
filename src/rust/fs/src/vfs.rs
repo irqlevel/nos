@@ -889,6 +889,24 @@ impl Vfs {
             .map_or(0, |node| node.size)
     }
 
+    /// Which file the open file is: its mount -- whose id no other mount is
+    /// ever given, and never 0 -- and on it the file's on-disk inode, so
+    /// that two names of one file are one; or, on a filesystem that keeps
+    /// none, its node. Neither is ever 0.
+    pub fn identity(&self, handle: Handle) -> Option<(u64, u64)> {
+        /// Marks a node's key apart from an inode number.
+        const NODE_KEY: u64 = 1 << 63;
+        let mut guard = self.inner.lock();
+        let inner = &mut *guard;
+        let (mount_id, node) = {
+            let file = inner.file(handle)?;
+            (file.mount_id, file.node)
+        };
+        let ino = inner.mount_by_id(mount_id)?.fs.tree().get(node)?.ino;
+        let key = if ino != 0 { ino as u64 } else { NODE_KEY | node.key() };
+        Some((mount_id, key))
+    }
+
     /// The open file's size, or None for a handle that is no open file's.
     pub fn length(&self, handle: Handle) -> Option<usize> {
         let mut guard = self.inner.lock();
