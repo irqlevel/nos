@@ -42,7 +42,7 @@ use kcore::consts::{MAX_CPUS, NS_PER_MS, NS_PER_SEC};
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 
-use crate::disk::{self, Runner, Wake};
+use crate::disk::{self, Claims, Holder, Runner, Wake};
 use crate::forward::Forwards;
 use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
@@ -56,7 +56,7 @@ const START_USAGE: &str =
 const RESTART_BURST: u32 = 5;
 const RESTART_WINDOW_NS: u64 = 60 * NS_PER_SEC;
 /// The most VMs at once: each is a task and at least 64 MiB of RAM.
-const MAX_VMS: usize = 16;
+pub(crate) const MAX_VMS: usize = 16;
 /// The most input waiting for one guest.
 const INPUT_MAX: usize = 4096;
 /// What `hv console` shows unless asked for more.
@@ -693,6 +693,9 @@ pub struct Vms {
     /// The guests' switch, made by the first `net` guest and kept until the
     /// module goes.
     switch: Mutex<Option<Arc<Switch>>>,
+    /// The claims the guests' disks hold on their images -- `hv boot`'s
+    /// too, which takes them from here.
+    claims: Arc<Claims>,
 }
 
 /// The first word of `args`, and the rest after it -- the text of `send`,
@@ -774,7 +777,13 @@ impl Vms {
         Some(Vms {
             table: Mutex::new(Table { next: 0, vms, closing: false })?,
             switch: Mutex::new(None)?,
+            claims: Arc::new(Claims::new()?),
         })
+    }
+
+    /// The claims the guests' disks hold on their images (`disk::Claims`).
+    pub fn claims(&self) -> Arc<Claims> {
+        self.claims.clone()
     }
 
     /// How many running VMs' CPUs each CPU has: what a new VM's CPUs are
@@ -906,7 +915,13 @@ impl Vms {
             return;
         }
         let _ = write!(label, "vm{}", id);
-        let runner = Runner { wake: shared.clone(), name: label, cpu: disk::disk_cpu(cpu, &load) };
+        let runner = Runner {
+            wake: shared.clone(),
+            name: label,
+            cpu: disk::disk_cpu(cpu, &load),
+            claims: self.claims.clone(),
+            holder: Holder::Vm(id),
+        };
 
         /* The files are read and the guest's memory filled here, with no lock
          * held: it takes as long as the kernel and the initrd take to read. */

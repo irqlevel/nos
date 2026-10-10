@@ -707,7 +707,14 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   calls does to the model. A mount taken exactly when its path is free and
   well formed, its device nobody else's and there is room; an unmount
   refused while anything is open on it; a rename between mounts refused;
-  and the disks' filesystems clean after `unmount_all`;
+  and the disks' filesystems clean after `unmount_all`. Which file an open
+  file is (`kernel_file_mount` and `kernel_file_key`, what a guest's disk
+  claims its image by): one for two handles on one path and two for two paths, on every
+  filesystem the model holds (`Fs::compare`, so ext2's and nanofs's targets
+  too); two mounts for files on two -- an ext2's and a nanofs's numbers are
+  alike; and a word that is no open file told so. A
+  control run with the node's key left out of a ramfs file's identity
+  failed at the first input, and one with the mount left out at the 41st;
 - `shell`: the storage commands the console, the UDP shell and SSH run --
   `mount`, `format`, `cp -r`, `fstest`, `diskwrite` and the rest -- with
   arguments of every kind, after `fstest` has passed on ramfs, ext2 and
@@ -1209,7 +1216,14 @@ boot throws away once left every later `hv exec` waiting out its time and
 then saying the line was not read. The guest ran the line all the same, so
 its answer is in the output either way, and the check that holds is that
 `hv exec` said nothing of a line not read: a control run with the fix taken
-out passed while it looked for the answer alone, and fails it now.
+out passed while it looked for the answer alone, and fails it now. Then five
+guests are started against one image on nos's root, `/claimed.img`: a guest
+whose disk writes it, and then a second writer and a reader, both refused;
+the writer stopped, two readers, side by side, and a writer refused under
+them -- each refusal saying whose the image is, and every refused start
+taking a number all the same, which is what the checks count on. The guests
+have no initrd and get no further than their panic, holding their disks the
+while.
 
 `--attach` is a boot of its own for `hv attach`: sshd and a guest started
 from `/etc/rc`, then an `ssh -tt ... hv attach 0` that types a line, waits
