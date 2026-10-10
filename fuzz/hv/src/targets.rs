@@ -593,6 +593,35 @@ impl DriverQueue {
     fn avail(&self) -> u64 {
         self.pfn * PAGE + 16 * QUEUE_SIZE
     }
+    /// The used ring: on the page boundary after the available ring's flags,
+    /// index, entries and used_event.
+    fn used(&self) -> u64 {
+        (self.avail() + 6 + 2 * QUEUE_SIZE).next_multiple_of(PAGE)
+    }
+}
+
+/// How many chains a racing CPU posts before it calls the device's pass one
+/// with no end: twice the queue, where a pass takes a queue's worth at most.
+const RACE_POSTS: usize = 2 * QUEUE_SIZE as usize;
+
+/// `call` -- a notify, or a round of the devices -- while another CPU of the
+/// guest keeps `q` topped up with the chain it published last
+/// (`memory::Racer`): the device has to end its pass by itself. The driver's
+/// own idea of its index is brought up to date after.
+fn racing(mem: &GuestMemory, q: &mut DriverQueue, call: impl FnOnce()) {
+    if q.pfn == 0 {
+        call();
+        return;
+    }
+    let mut b = [0u8; 2];
+    let last = u64::from(q.avail_idx.wrapping_sub(1)) % QUEUE_SIZE;
+    let head = if mem.read(q.avail() + 4 + 2 * last, &mut b).is_ok() { u16::from_le_bytes(b) } else { 0 };
+    mem.race(q.avail() + 2, q.avail() + 4, q.used() + 2, QUEUE_SIZE as u16, head, RACE_POSTS);
+    call();
+    mem.stop_race();
+    if mem.read(q.avail() + 2, &mut b).is_ok() {
+        q.avail_idx = u16::from_le_bytes(b);
+    }
 }
 
 /// Where a driver writes what the device is to find: guest memory, of
@@ -765,7 +794,7 @@ fn blk_target(r: &mut Input) {
         disk.offer_msix(2);
     }
     let mut q = DriverQueue::default();
-    while let Some(op) = r.op(12) {
+    while let Some(op) = r.op(13) {
         match op {
             0 => {
                 disk.io_read(r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size());
@@ -811,10 +840,25 @@ fn blk_target(r: &mut Input) {
                 s.ready += 1 + r.below(4) as usize;
                 s.fail = r.u8() % 8 == 0;
             }
-            _ => {
+            11 => {
                 disk.set_msix_enabled(r.bool());
                 disk.line();
                 disk.broken();
+            }
+            _ => {
+                /* A request, then another CPU posting it again and again
+                 * while the device takes from the ring: one answered at once
+                 * -- a GET_ID, one past the disk -- takes no buffer, so the
+                 * pass is not ended for want of one and has to end itself. */
+                blk_request(&mem, &mut q, r);
+                let notify = r.bool();
+                racing(&mem, &mut q, || {
+                    if notify {
+                        disk.io_write(QUEUE_NOTIFY, 2, 0, &mem);
+                    } else {
+                        disk.poll(&mem);
+                    }
+                });
             }
         }
     }
@@ -849,7 +893,7 @@ fn net_target(r: &mut Input) {
         nic.offer_msix(3);
     }
     let mut queues = [DriverQueue::default(); 2];
-    while let Some(op) = r.op(12) {
+    while let Some(op) = r.op(13) {
         let which = r.below(2) as usize;
         match op {
             0 => {
@@ -905,10 +949,35 @@ fn net_target(r: &mut Input) {
                 let frame: Vec<u8> = (0..n).map(|_| r.u8()).collect();
                 state.lock().unwrap().rx.push_back(frame);
             }
-            _ => {
+            11 => {
                 nic.set_msix_enabled(r.bool());
                 nic.line();
                 nic.broken();
+            }
+            _ => {
+                /* Another CPU keeping a ring topped up while the device takes
+                 * from it: the transmit ring through a notify, or the receive
+                 * ring through a round of the devices with frames enough to
+                 * fill it twice over. Either pass has to end itself. */
+                if which == 1 {
+                    let segs = [(gpa(r), 10, false), (gpa(r), 60, false)];
+                    chain(&mem, &mut queues[1], r, &segs);
+                    racing(&mem, &mut queues[1], || {
+                        nic.io_write(QUEUE_NOTIFY, 2, 1, &mem);
+                    });
+                } else {
+                    {
+                        let mut s = state.lock().unwrap();
+                        while s.rx.len() < RACE_POSTS + 2 {
+                            s.rx.push_back(vec![0x5A; 60]);
+                        }
+                    }
+                    let segs = [(gpa(r), 1526, true)];
+                    chain(&mem, &mut queues[0], r, &segs);
+                    racing(&mem, &mut queues[0], || {
+                        nic.poll(&mem);
+                    });
+                }
             }
         }
     }

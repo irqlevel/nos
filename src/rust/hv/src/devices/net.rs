@@ -40,6 +40,15 @@ pub const BAR_SIZE: u32 = 0x40;
 const RX_QUEUE: u16 = 0;
 const TX_QUEUE: u16 = 1;
 const QUEUE_SIZE: u16 = 256;
+/// The most chains taken off a queue in one pass: a queue's worth. A driver
+/// cannot have more than that available at once, so such a pass takes all
+/// that was there when it began; what is posted while it runs -- by the
+/// guest's other CPUs, into descriptors the pass gave back -- is the next
+/// pass's: the notify that comes with it, or the next round of the devices
+/// (`poll`). Unbounded, a guest that kept a ring topped up from a second
+/// CPU, by plain writes and no exit, held the CPU running the pass in the
+/// host for good, the platform's lock with it (hv-fuzz's racing CPU).
+const PASS: usize = QUEUE_SIZE as usize;
 
 /// Features: a MAC address of the device's, and a link status.
 const F_MAC: u32 = 1 << 5;
@@ -79,6 +88,9 @@ pub struct Net {
     rx_buf: Vec<u8>,
     /// The length of a frame in `rx_buf` still waiting for a buffer.
     held: Option<usize>,
+    /// A transmit pass ended at its bound, with chains perhaps still on the
+    /// ring: the next round of the devices goes on with them.
+    tx_more: bool,
     broken: Option<Broken>,
     pub stats: Stats,
 }
@@ -105,6 +117,7 @@ impl Net {
             tx_buf,
             rx_buf,
             held: None,
+            tx_more: false,
             broken: None,
             stats: Stats::default(),
         })
@@ -172,23 +185,31 @@ impl Net {
         match self.transport.write(offset, size, value) {
             Asked::Notify(TX_QUEUE) => self.send(mem),
             /* Buffers posted for receiving: whatever is waiting can go. */
-            Asked::Notify(RX_QUEUE) => self.poll(mem),
+            Asked::Notify(RX_QUEUE) => self.deliver(mem),
             Asked::Reset => {
                 self.broken = None;
                 self.held = None;
+                self.tx_more = false;
                 Raise::default()
             }
             _ => Raise::default(),
         }
     }
 
-    /// Everything the driver has queued to send, to the backend.
+    /// What the driver has queued to send, to the backend: a pass's worth.
     fn send(&mut self, mem: &GuestMemory) -> Raise {
+        self.tx_more = false;
         if self.broken.is_some() {
             return Raise::default();
         }
         let mut sent = false;
+        let mut left = PASS;
         loop {
+            if left == 0 {
+                self.tx_more = true;
+                break;
+            }
+            left -= 1;
             let mut segs = core::mem::take(&mut self.segs);
             let popped = match self.transport.queue(TX_QUEUE) {
                 Some(q) if q.ready() => q.pop(mem, &mut segs),
@@ -241,14 +262,23 @@ impl Net {
         self.stats.sent += 1;
     }
 
-    /// What the backend has for the guest, into the buffers the driver has
-    /// posted, and the interrupts that leaves the device with.
+    /// A round of the device, each time round the run loop: what a transmit
+    /// pass left at its bound sent, and what the backend has for the guest
+    /// delivered -- and the interrupts that leaves the device with.
     pub fn poll(&mut self, mem: &GuestMemory) -> Raise {
+        let sent = if self.tx_more { self.send(mem) } else { Raise::default() };
+        sent.or(self.deliver(mem))
+    }
+
+    /// What the backend has for the guest, into the buffers the driver has
+    /// posted -- a pass's worth -- and the interrupts that leaves the device
+    /// with. What is left waits with the backend for the next round.
+    fn deliver(&mut self, mem: &GuestMemory) -> Raise {
         if self.broken.is_some() || !self.transport.queue(RX_QUEUE).map_or(false, |q| q.ready()) {
             return Raise::default();
         }
         let mut delivered = false;
-        loop {
+        for _ in 0..PASS {
             let len = match self.held {
                 Some(len) => len,
                 None => match self.backend.recv(&mut self.rx_buf[HDR..]) {
