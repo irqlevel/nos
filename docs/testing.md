@@ -372,7 +372,9 @@ overflow checks on as a `RUSTUB=1` kernel has them. Each target turns random byt
 one device: the serial port, the 8259, the PIT, the RTC, ACPI's fixed
 hardware, PCI configuration space, the local APIC through its MSRs and its
 page, the IO-APIC, MSIs, a virtio disk and NIC driven through rings well
-made and not, the page walker over random page tables, the decoder, the
+made and not -- and raced: another of the guest's CPUs topping a ring up
+by plain writes while the device takes from it, as nothing on the host can
+stop it doing -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
 The guests' network has three: `switch`, guests on its ports and `hv0`
@@ -401,6 +403,8 @@ A finding is a panic -- an index out of range, an overflow -- or a broken
 invariant: an interrupt injected into a guest that cannot take one, or over
 an event already on its way in; an exception's vector from the APIC; a disk
 request outside the disk, not in sectors, or past the requests in flight; a
+device that, its ring raced, takes twice what the ring holds in one call --
+a pass that, on a host, would never end; a
 frame longer than a frame handed to the switch; a DHCP answer that is no
 datagram, or whose checksum is not its own; a frame the switch put
 elsewhere than its destination says, or counted otherwise; a packet NAT

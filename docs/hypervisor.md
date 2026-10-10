@@ -2685,7 +2685,13 @@ someone else's; then speed.
 
 #### Bugs
 
-1. **A guest can hold one of its CPUs' tasks in the host for good.** The
+1. ~~**A guest can hold one of its CPUs' tasks in the host for good.**~~
+   Done: a pass takes a queue's worth of chains at most -- all a driver can
+   have available at once -- and leaves the rest to the next round of the
+   devices (`PASS` in `devices/net.rs` and `devices/blk.rs`); hv-fuzz's
+   racing CPU (`Racer` in `fuzz/hv/src/memory.rs`) tops a ring up while a
+   notify or a round runs, and found both old loops in its first ten
+   inputs. What it was: the
    virtio-net transmit loop (`Net::send`) and the virtio-blk one
    (`Blk::fill`) go round until `Queue::pop` finds nothing, and `pop` reads
    the driver's `avail` index afresh each time -- with no budget, no look at
@@ -2935,7 +2941,8 @@ someone else's; then speed.
   place. Three targets would have caught this review's bugs: the exit
   decoders over made-up VMCBs and VMCSs (bug 9), a model of the input
   queue's `type_in`, `requeue` and `fed_at` (bug 7's `hv exec`), and a
-  second vCPU that keeps re-posting chains (bug 1).
+  second vCPU that keeps re-posting chains (bug 1 -- there now, in the
+  `blk` and `net` targets).
 - No gate covers leaks over many starts and stops, a `mem=` past free
   memory, sixteen guests, `rmmod` or `poweroff` with I/O in flight, a port
   or a forward used again, one image given twice, or a run of hours.
