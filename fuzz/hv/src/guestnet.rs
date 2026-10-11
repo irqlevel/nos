@@ -93,6 +93,13 @@ struct Model {
     spoofed: [u64; MAX_PORTS],
     /// Frames delivered to each port's VM, which it is woken for once each.
     woken: [u64; MAX_PORTS],
+    /// Each port's frames on `hv0`'s backlog since the stack's last pass,
+    /// and those its share kept out; its sends to every port their rate
+    /// kept out, and its bucket for them: tokens, and when topped up.
+    on_backlog: [usize; MAX_PORTS],
+    over_share: [u64; MAX_PORTS],
+    flooded: [u64; MAX_PORTS],
+    flood: [(u64, u64); MAX_PORTS],
     to_host: u64,
     refused: u64,
     dhcp: u64,
@@ -112,6 +119,10 @@ impl Model {
             dropped: [0; MAX_PORTS],
             spoofed: [0; MAX_PORTS],
             woken: [0; MAX_PORTS],
+            on_backlog: [0; MAX_PORTS],
+            over_share: [0; MAX_PORTS],
+            flooded: [0; MAX_PORTS],
+            flood: [(switch::FLOOD_BURST, 0); MAX_PORTS],
             to_host: 0,
             refused: 0,
             dhcp: 0,
@@ -134,16 +145,38 @@ impl Model {
         self.woken[p] += 1;
     }
 
+    /// A guest's frame for `hv0`: within its port's share of the backlog --
+    /// all of it over the ports a VM has, counted from the stack's last
+    /// pass -- or kept out, counted against the port.
     fn to_host(&mut self, from: Option<usize>, frame: &[u8]) {
-        if from.is_none() {
+        let Some(p) = from else { return };
+        let in_use = self.owned.iter().filter(|o| **o).count().max(1);
+        if self.on_backlog[p] >= vnic::BACKLOG / in_use {
+            self.over_share[p] += 1;
             return;
         }
         if self.refuse || frame.len() > MAX_FRAME {
             self.refused += 1;
         } else {
+            self.on_backlog[p] += 1;
             self.to_host += 1;
             self.stack.push(frame.to_vec());
         }
+    }
+
+    /// Whether port `p` may send to every port now: `FLOOD_BURST` at once,
+    /// and `FLOOD_PER_SEC` after.
+    fn may_flood(&mut self, p: usize) -> bool {
+        let now = time::peek();
+        let (mut tokens, mut at) = self.flood[p];
+        let earned = now.saturating_sub(at).saturating_mul(switch::FLOOD_PER_SEC) / NS_PER_SEC;
+        if earned != 0 {
+            tokens = tokens.saturating_add(earned).min(switch::FLOOD_BURST);
+            at = now;
+        }
+        let may = tokens != 0;
+        self.flood[p] = (if may { tokens - 1 } else { tokens }, at);
+        may
     }
 
     fn forward(&mut self, from: Option<usize>, frame: &[u8]) {
@@ -182,6 +215,12 @@ impl Model {
                 if Some(q) != from {
                     self.deliver(q, frame);
                 }
+                return;
+            }
+        }
+        if let Some(p) = from {
+            if !self.may_flood(p) {
+                self.flooded[p] += 1;
                 return;
             }
         }
@@ -341,6 +380,10 @@ pub fn switch_target(r: &mut Input) {
                         m.woken[p] = 0;
                         m.dropped[p] = 0;
                         m.spoofed[p] = 0;
+                        m.on_backlog[p] = 0;
+                        m.over_share[p] = 0;
+                        m.flooded[p] = 0;
+                        m.flood[p] = (switch::FLOOD_BURST, time::peek());
                         vms[p] = Some(vm);
                         backends[p] = Some(sw.backend(p));
                     }
@@ -361,13 +404,18 @@ pub fn switch_target(r: &mut Input) {
                 }
             }
             2..=4 => {
-                /* A guest's frame, from a port that has a NIC on it. */
+                /* A guest's frame, from a port that has a NIC on it -- or a
+                 * burst of it, past its share of hv0's backlog and past its
+                 * rate to every port. */
                 let p = r.below(MAX_PORTS as u64) as usize;
                 if backends[p].is_some() {
                     let f = frame(r, Some(p));
-                    m.forward(Some(p), &f);
-                    if let Some(b) = backends[p].as_mut() {
-                        b.send(&f);
+                    let n = if r.u8() < 16 { 1 + r.below(300) } else { 1 };
+                    for _ in 0..n {
+                        m.forward(Some(p), &f);
+                        if let Some(b) = backends[p].as_mut() {
+                            b.send(&f);
+                        }
                     }
                 }
             }
@@ -420,19 +468,26 @@ pub fn switch_target(r: &mut Input) {
                 invariant!(param.starts_with("ip=10.0.100."), "a port's ip= of {}", param);
                 let _ = (switch::nat_why(crate::net::NatError::Busy), sw.host_nic().map(|n| n.ip()));
             }
+            9 => {
+                /* Time going by: a port's rate to every port earned back. */
+                time::advance(r.pick(&[NS_PER_SEC / 1000, NS_PER_SEC / 10, NS_PER_SEC, 10 * NS_PER_SEC]));
+            }
             _ => {}
         }
         /* The counts, and what the stack was handed, as the model has them. */
         for p in 0..MAX_PORTS {
-            invariant!(sw.dropped(p) == (m.dropped[p], m.spoofed[p]),
-                       "port {} dropped {:?} (for want of room, and sent as another), the model {:?}",
-                       p, sw.dropped(p), (m.dropped[p], m.spoofed[p]));
+            let want = switch::PortCounts { dropped: m.dropped[p], spoofed: m.spoofed[p],
+                                            over_share: m.over_share[p], flooded: m.flooded[p] };
+            invariant!(sw.counts(p) == want, "port {} lost {:?}, the model {:?}", p, sw.counts(p), want);
         }
         let counts = sw.host_counts();
         let want_counts = (m.to_host, m.refused, m.dhcp, m.foreign);
         invariant!(counts == want_counts, "host counts {:?}, the model {:?}", counts, want_counts);
         let stack = network::take_stack();
         let hv0_in = network::take_hv0_in();
+        /* A pass of the stack's over hv0's backlog: every port's share
+         * counted afresh. */
+        m.on_backlog = [0; MAX_PORTS];
         let want = core::mem::take(&mut m.stack);
         invariant!(stack == want && hv0_in == want, "the stack was handed {} frames, hv0 {}, the model {}",
                    stack.len(), hv0_in.len(), want.len());

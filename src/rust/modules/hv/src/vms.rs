@@ -1034,13 +1034,18 @@ impl Vms {
             if let Some(port) = vm.port {
                 let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
             }
-            let (dropped, spoofed) =
-                vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.dropped(p))).unwrap_or((0, 0));
-            if dropped != 0 {
-                let _ = write!(out, "  {} frames dropped for it", dropped);
+            let lost = vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.counts(p))).unwrap_or_default();
+            if lost.dropped != 0 {
+                let _ = write!(out, "  {} frames dropped for it", lost.dropped);
             }
-            if spoofed != 0 {
-                let _ = write!(out, "  {} frames it sent as another guest, dropped", spoofed);
+            if lost.spoofed != 0 {
+                let _ = write!(out, "  {} frames it sent as another guest, dropped", lost.spoofed);
+            }
+            if lost.over_share != 0 {
+                let _ = write!(out, "  {} frames for hv0 past its share of the backlog, dropped", lost.over_share);
+            }
+            if lost.flooded != 0 {
+                let _ = write!(out, "  {} frames for every port past their rate, dropped", lost.flooded);
             }
             let restarts = s.restarts.load(Ordering::Relaxed);
             if restarts != 0 {

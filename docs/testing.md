@@ -410,7 +410,11 @@ MSR on Intel, and IBPB and AutoIBRS offered with the model told -- each
 failed within its first 1,600 inputs.
 The guests' network has three: `switch`, guests on its ports and `hv0`
 sending each other frames of every kind -- as themselves and as each other
--- held to a model of where each must go and what each must count; `nat`,
+-- held to a model of where each must go and what each must count, a
+guest's bursts among them, past its share of `hv0`'s backlog (the backlog
+over the ports in use, counted afresh at each of the stack's passes) and
+past its rate to every port, the clock moved on now and then for the rate
+to come back; `nat`,
 guests' packets out into the world and the world's answers back, each
 rewrite checked field by field and its sums summed from scratch; and
 `guestnet`, the two as the module wires them, guests on the switch reaching
@@ -1403,7 +1407,10 @@ for it (`kicks` in `hv list` above 0), and the port must have dropped
 nothing. Under TCG only the first two tell anything -- with the kick taken
 out, `kicks` reads 0 and the check fails, but slirp never outruns the host's
 tick, so no frame was dropped either; the drops show at line rate, on the
-AX41. And one guest claims the other's address -- `ip addr add` of it,
+AX41. Nor may either guest's traffic so far -- DHCP, ARP, pings, the two
+megabytes -- have gone past its share of `hv0`'s backlog or its rate to
+every port: those are for a guest that floods, which the `switch` target of
+`hv-fuzz.py` makes. And one guest claims the other's address -- `ip addr add` of it,
 `arping` from it, a ping from it -- and must get nothing back: the switch
 stops what a guest sends as another at its port, so nos, which would answer
 both, hears neither; and `hv list` must count the frames against the guest

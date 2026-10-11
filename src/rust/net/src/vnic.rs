@@ -21,7 +21,7 @@
 //! and then waits out any call of it still running, so the module can go
 //! after -- the UDP listeners' way (`Device::unlisten_udp`).
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use kcore::once::Once;
 use kcore::sync::IrqSpinLock;
@@ -34,8 +34,9 @@ use crate::nic::Nic;
 /// The most virtual NICs there are.
 const MAX_VNICS: usize = 4;
 /// The most frames handed in and not yet taken by a receive pass: what is
-/// past it is dropped, and counted.
-const RX_BACKLOG: usize = 256;
+/// past it is dropped, and counted. `kcore`'s number, which a module shares
+/// out among its own senders by.
+const RX_BACKLOG: usize = kcore::vnic::BACKLOG;
 /// An Ethernet frame, header and all, less the FCS: the longest handed in.
 const MAX_FRAME: usize = 1514;
 const MIN_FRAME: usize = 14;
@@ -55,9 +56,11 @@ pub struct Vnic {
     sink: IrqSpinLock<Option<Sink>>,
     /// Calls of the handler under way: what a detach waits out.
     in_flight: AtomicUsize,
-    /// Frames handed in, for the next receive pass, and how many.
+    /// Frames handed in, for the next receive pass, and how many; and how
+    /// many passes have emptied it.
     rx: IrqSpinLock<FrameQueue>,
     backlog: AtomicUsize,
+    drains: AtomicU64,
     nic: Once<Nic>,
     /// What went out to the module, what went nowhere (nothing attached),
     /// what came in, and what could not.
@@ -89,6 +92,7 @@ impl NetDriver for Vnic {
     fn process_rx(&'static self, _rx: &mut (), queue: &mut RxQueue<'_>) {
         let mut frames = self.rx.lock().take();
         self.backlog.fetch_sub(frames.len(), Ordering::AcqRel);
+        self.drains.fetch_add(1, Ordering::AcqRel);
         queue.deliver(&mut frames);
     }
 }
@@ -196,6 +200,7 @@ fn make(name: &str, mac: [u8; 6], ip: u32, mask: u32) -> Option<usize> {
         in_flight: AtomicUsize::new(0),
         rx: IrqSpinLock::new(FrameQueue::new()),
         backlog: AtomicUsize::new(0),
+        drains: AtomicU64::new(0),
         nic: Once::new(),
         to_module: AtomicUsize::new(0),
         unattached: AtomicUsize::new(0),
@@ -291,4 +296,11 @@ pub unsafe extern "C" fn kernel_vnic_receive(vnic: usize, frame: *const u8, len:
 #[no_mangle]
 pub extern "C" fn kernel_vnic_device(vnic: usize) -> usize {
     by_handle(vnic).and_then(|v| v.nic()).map_or(0, |nic| nic.device().handle())
+}
+
+/// How many receive passes have emptied a virtual NIC's backlog -- or 0 for
+/// a bad handle: a module sharing the backlog out counts afresh at each.
+#[no_mangle]
+pub extern "C" fn kernel_vnic_drains(vnic: usize) -> u64 {
+    by_handle(vnic).map_or(0, |v| v.drains.load(Ordering::Acquire))
 }
