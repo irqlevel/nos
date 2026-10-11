@@ -1434,7 +1434,11 @@ back, a PM timer that failed its checks, a TSC the clocksource watchdog
 marked unstable, or a PCI interrupt without a GSI. Its reboots must go
 through the FADT's reset register (`0x06 to port 0xcf9`, where a kernel
 without ACPI pulses the 8042's line). In the VM phase one more guest runs
-BusyBox's `acpid`, with a handler that powers off: its SCI must be IRQ 9 on
+BusyBox's `acpid`, with a handler that powers off -- a devtmpfs mounted
+first, which the initramfs's `/init` does not mount and without which there
+is no `/dev/input` for `acpid` to read the button from (the gate failed so,
+the button unanswered, until it mounted one), the button's `event` device
+then checked for: its SCI must be IRQ 9 on
 the 8259, the PM timer one of its clocksources, and `hv stop` must end it as
 `the guest powered itself off`, the report counting the press; and one more
 without `acpid`, which hears the button and does nothing, must be stopped
