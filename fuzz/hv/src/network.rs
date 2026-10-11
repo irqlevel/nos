@@ -305,7 +305,15 @@ pub mod net {
 
 /// `kcore::vnic`: the one virtual NIC, `hv0`.
 pub mod vnic {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
+
+    /// `kcore::vnic::BACKLOG`, as the switch shares it out.
+    pub const BACKLOG: usize = 256;
+
+    /// The stack's passes over `hv0`'s backlog: one each time the target
+    /// takes what `hv0` was handed (`take_hv0_in`).
+    pub static DRAINS: AtomicU64 = AtomicU64::new(0);
 
     pub trait VnicSink: Send + Sync + 'static {
         fn on_frame(&self, frame: &[u8]);
@@ -332,6 +340,9 @@ pub mod vnic {
         }
         pub fn nic(&self) -> Option<crate::net::Nic> {
             crate::net::Nic::from_handle(crate::device::HV0.handle())
+        }
+        pub fn drains(&self) -> u64 {
+            DRAINS.load(Ordering::Relaxed)
         }
         pub fn attach<S: VnicSink>(&self, sink: Arc<S>) -> Option<Attached> {
             let mut s = super::locked(&STATE);
@@ -411,8 +422,10 @@ pub fn take_stack() -> Vec<Vec<u8>> {
     core::mem::take(&mut *locked(&STACK))
 }
 
-/// Frames `hv0` took in since last asked, NAT's among them.
+/// Frames `hv0` took in since last asked, NAT's among them: a pass of the
+/// stack's over its backlog, which the switch's shares count from.
 pub fn take_hv0_in() -> Vec<Vec<u8>> {
+    vnic::DRAINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     core::mem::take(&mut *locked(&HV0_IN))
 }
 

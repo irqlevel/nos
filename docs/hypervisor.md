@@ -1314,6 +1314,19 @@ a halted guest waits on its VM's event, until its timer's next edge or
 something for it -- a frame, a key typed at `hv attach` or `hv send` --
 whichever comes first (`Event::WaitFor`, [the scheduler](scheduler.md#blocking-and-waking)).
 
+**What the guests share is shared out.** `hv0`'s backlog -- the 256 frames
+handed in and not yet taken by the stack's receive pass
+(`kcore::vnic::BACKLOG`), which every guest's traffic to nos and through NAT
+goes on -- takes from a port, between two of the stack's passes over it, no
+more than its share: the backlog over the ports a VM has, so a guest alone
+has all of it and one of several sending as fast as it can leaves the rest
+theirs. The switch learns of a pass from the count of them the virtual NIC
+keeps (`Vnic::drains`) and counts each port's share afresh from it. And what
+a guest sends to every port -- a broadcast, a multicast, a MAC no port has
+-- is a copy into every inbox and a wake or a kick of every VM: 64 at once
+and 256 a second after, a token bucket a port. What either keeps out is
+dropped and counted against the guest in `hv list`.
+
 **What a guest sends has to be its own.** A frame is checked where it comes
 in at a port (`ingress`), as a cloud's virtual switch checks it: IPv4 or ARP
 -- nothing of nos's speaks anything else, and nothing the switch cannot
@@ -3036,7 +3049,7 @@ someone else's; then speed.
    and the subnet's broadcast and nothing else, so 169.254.169.254 -- the
    host VM's credentials -- the private networks and the host's own LAN
    were all open.
-5. **What the guests share has no quota.** NAT's half is done: a full
+5. ~~**What the guests share has no quota.**~~ Done. NAT's half: a full
    table gives a new flow the mapping used least lately of the guest that
    holds the most -- the asker's own when it holds as many as any -- where
    it refused every new flow, so one guest that filled it kept every other
@@ -3047,9 +3060,17 @@ someone else's; then speed.
    it; refusing when full, as before, failed it at once. And the soonest a
    sweep may find a flow run out is kept as each flow's time is, where a
    flow made after the last sweep could run out unseen and be counted live
-   for up to two hours. Left: one 256-frame backlog for `hv0`; a broadcast
-   copied to every port, each a wake or a kick. Fix: a share of the backlog,
-   and a rate, per port.
+   for up to two hours. And the switch's: a port takes no more of `hv0`'s
+   256-frame backlog, between two of the stack's passes over it, than the
+   backlog over the ports in use, and sends to every port at 64 at once and
+   256 a second ([A network](#a-network)); hv-fuzz's `switch` target bursts
+   a guest's frames past both and holds every port's counts to a model of
+   its own -- no share at all, no rate, a share not divided and one never
+   counted afresh each failed within 40 inputs. What it was: one NAT table
+   of 4096 mappings that refused a new flow when full rather than take the
+   flooder's; one 256-frame backlog for `hv0` that a guest sending as fast
+   as it could filled before the others' frames came; a broadcast copied to
+   every port, each a wake or a kick, at any rate.
 6. **Two VMs can share a core.** `pick_cpus` keeps a guest's own CPUs off
    each other's cores, for speed; nothing keeps another guest off them, and
    the host's tasks serving another guest's disk can run on the sibling

@@ -1042,6 +1042,13 @@ def network(args):
         kicks = re.search(r"kicks (\d+)", vm0)
         pt.check("kicked out of its guest to take the frames, its port dropped none",
                  kicks is not None and int(kicks.group(1)) > 0 and "frames dropped for it" not in vm0, vm0)
+        # What the switch shares out -- hv0's backlog, a port's rate to
+        # every port -- is for a guest that floods, not for this: DHCP, ARP,
+        # pings and two megabytes through NAT, one into a busy guest.
+        guests = re.findall(r"(?m)^vm [01] .*$", way(13))
+        pt.check("neither guest's traffic went past its share of hv0's backlog or its rate to every port",
+                 len(guests) == 2 and not any("past its share" in g or "past their rate" in g for g in guests),
+                 "\n".join(guests))
         pt.check(*interrupt_check(args, way(14), "input"))
         claim = way(15)
         pt.check("a guest that claims another's address, ARP and IPv4, gets nothing back: nos heard none of it",

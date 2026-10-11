@@ -41,15 +41,26 @@
 //! (`hv::Kick`) -- by a signal made under the inbox's lock, which is also
 //! what keeps the VM there while it is made: the port gives the VM up in
 //! task context, the lock down.
+//!
+//! What the guests share is shared out. `hv0`'s backlog -- every guest's
+//! traffic to nos and through NAT goes on it -- takes from a port, between
+//! two of the stack's passes over it, no more than its share: the backlog
+//! over the ports in use, so that a guest alone has all of it and one of
+//! several sending as fast as it can leaves the rest theirs. And what a
+//! guest sends to every port -- a broadcast, a multicast, a MAC no port has
+//! -- is a copy into every inbox and a wake or a kick of every VM: as many
+//! at once as `FLOOD_BURST`, and `FLOOD_PER_SEC` after. What either keeps
+//! out is dropped, counted against the port.
 
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use kcore::consts::NS_PER_SEC;
 use kcore::net::{Nat, NatError};
 use kcore::sync::{IrqSpinLock, Mutex};
-use kcore::vnic::{Attached, Vnic, VnicSink};
+use kcore::vnic::{Attached, Vnic, VnicSink, BACKLOG};
 
 use crate::dhcp;
 use crate::vms::Shared;
@@ -61,6 +72,10 @@ pub const MAX_PORTS: usize = 16;
 /// at once lost frames on every burst, kicked or not.
 const INBOX_FRAMES: usize = 256;
 const FRAME: usize = hv::nic::MAX_FRAME;
+/// What a port may send to every port at once, and how many a second after:
+/// ARP and DHCP's few, with room to spare.
+pub const FLOOD_BURST: u64 = 64;
+pub const FLOOD_PER_SEC: u64 = 256;
 
 /// The host's end: its name, MAC and address, and the subnet's mask.
 const HOST_IF: &str = "hv0";
@@ -135,6 +150,32 @@ struct Inbox {
     count: usize,
 }
 
+/// A port's sends to every port: how many it may make now, and when that was
+/// last topped up.
+struct Flood {
+    tokens: u64,
+    at: u64,
+}
+
+impl Flood {
+    const FULL: Flood = Flood { tokens: FLOOD_BURST, at: 0 };
+
+    /// Whether one more may go at `now`: `FLOOD_BURST` at once, and
+    /// `FLOOD_PER_SEC` after.
+    fn take(&mut self, now: u64) -> bool {
+        let earned = now.saturating_sub(self.at).saturating_mul(FLOOD_PER_SEC) / NS_PER_SEC;
+        if earned != 0 {
+            self.tokens = self.tokens.saturating_add(earned).min(FLOOD_BURST);
+            self.at = now;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
 struct Port {
     inbox: IrqSpinLock<Inbox>,
     /// `count`, readable without the lock: the vCPU looks every time round
@@ -144,11 +185,33 @@ struct Port {
     /// frames it sent as another guest -- since it claimed the port.
     dropped: AtomicU64,
     spoofed: AtomicU64,
+    /// Its frames on `hv0`'s backlog since the stack's pass `drain` -- its
+    /// share spent -- and those its share kept out. Only its guest's sends
+    /// touch them, which its NIC makes one at a time.
+    drain: AtomicU64,
+    on_backlog: AtomicUsize,
+    over_share: AtomicU64,
+    /// Its sends to every port, and those their rate kept out.
+    flood: IrqSpinLock<Flood>,
+    flooded: AtomicU64,
+}
+
+/// What a port's guest lost, since it claimed the port: frames for it its
+/// inbox had no room for, frames it sent as another guest, frames for `hv0`
+/// past its share of the backlog, and sends to every port past their rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct PortCounts {
+    pub dropped: u64,
+    pub spoofed: u64,
+    pub over_share: u64,
+    pub flooded: u64,
 }
 
 /// The ports, shared by the switch, every guest's NIC and `hv0`'s sink.
 pub struct Ports {
     ports: Vec<Port>,
+    /// The ports a VM has: how many `hv0`'s backlog is shared among.
+    in_use: AtomicUsize,
     vnic: Vnic,
     to_host: AtomicU64,
     refused: AtomicU64,
@@ -267,7 +330,15 @@ impl Ports {
                 return;
             }
         }
-        /* Everyone: a broadcast, a multicast, a MAC that is no port's. */
+        /* Everyone: a broadcast, a multicast, a MAC that is no port's --
+         * from a guest, at its rate. */
+        if let Some(port) = from {
+            let Some(p) = self.ports.get(port) else { return };
+            if !p.flood.lock().take(kcore::time::boot_time_ns()) {
+                p.flooded.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
         for p in 0..self.ports.len() {
             if Some(p) != from {
                 self.deliver(p, frame);
@@ -288,15 +359,30 @@ impl Ports {
         }
     }
 
+    /// A guest's frame onto `hv0`'s backlog, within the port's share of it.
     fn to_host(&self, from: Option<usize>, frame: &[u8]) {
-        if from.is_none() {
+        let Some(p) = from.and_then(|port| self.ports.get(port)) else { return };
+        /* Its share counted afresh from each pass of the stack's, which
+         * empties the backlog. */
+        let drains = self.vnic.drains();
+        if p.drain.swap(drains, Ordering::Relaxed) != drains {
+            p.on_backlog.store(0, Ordering::Relaxed);
+        }
+        if p.on_backlog.load(Ordering::Relaxed) >= self.share() {
+            p.over_share.fetch_add(1, Ordering::Relaxed);
             return;
         }
         if self.vnic.receive(frame) {
+            p.on_backlog.fetch_add(1, Ordering::Relaxed);
             self.to_host.fetch_add(1, Ordering::Relaxed);
         } else {
             self.refused.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// A port's share of `hv0`'s backlog: all of it over the ports in use.
+    fn share(&self) -> usize {
+        BACKLOG / self.in_use.load(Ordering::Relaxed).max(1)
     }
 
     /// The next frame in a port's inbox, into `buf`.
@@ -372,10 +458,15 @@ impl Switch {
                 waiting: AtomicUsize::new(0),
                 dropped: AtomicU64::new(0),
                 spoofed: AtomicU64::new(0),
+                drain: AtomicU64::new(0),
+                on_backlog: AtomicUsize::new(0),
+                over_share: AtomicU64::new(0),
+                flood: IrqSpinLock::new(Flood::FULL),
+                flooded: AtomicU64::new(0),
             });
         }
         let ports = Arc::new(Ports {
-            ports, vnic, to_host: AtomicU64::new(0), refused: AtomicU64::new(0),
+            ports, in_use: AtomicUsize::new(0), vnic, to_host: AtomicU64::new(0), refused: AtomicU64::new(0),
             dns: AtomicU32::new(0), dhcp: AtomicU64::new(0), foreign: AtomicU64::new(0),
         });
         let nat = Mutex::new(None).ok_or_else(|| String::from("out of memory for the switch"))?;
@@ -444,6 +535,11 @@ impl Switch {
                 p.waiting.store(0, Ordering::Release);
                 p.dropped.store(0, Ordering::Relaxed);
                 p.spoofed.store(0, Ordering::Relaxed);
+                p.on_backlog.store(0, Ordering::Relaxed);
+                p.over_share.store(0, Ordering::Relaxed);
+                p.flooded.store(0, Ordering::Relaxed);
+                *p.flood.lock() = Flood { tokens: FLOOD_BURST, at: kcore::time::boot_time_ns() };
+                self.ports.in_use.fetch_add(1, Ordering::Relaxed);
                 return Ok(i);
             }
             drop(inbox);
@@ -461,6 +557,9 @@ impl Switch {
             p.waiting.store(0, Ordering::Release);
             inbox.owner.take()
         };
+        if owner.is_some() {
+            self.ports.in_use.fetch_sub(1, Ordering::Relaxed);
+        }
         drop(owner);
         /* The port's address goes with it to the next VM to claim it: what
          * NAT has mapped for this one's flows goes now, or the next would be
@@ -480,11 +579,13 @@ impl Switch {
         self.ports.vnic.nic()
     }
 
-    /// Frames for the VM on a port that its inbox had no room for, and
-    /// frames it sent as another guest.
-    pub fn dropped(&self, port: usize) -> (u64, u64) {
-        self.ports.ports.get(port).map_or((0, 0), |p| {
-            (p.dropped.load(Ordering::Relaxed), p.spoofed.load(Ordering::Relaxed))
+    /// What the VM on a port lost, since it claimed it (`PortCounts`).
+    pub fn counts(&self, port: usize) -> PortCounts {
+        self.ports.ports.get(port).map_or(PortCounts::default(), |p| PortCounts {
+            dropped: p.dropped.load(Ordering::Relaxed),
+            spoofed: p.spoofed.load(Ordering::Relaxed),
+            over_share: p.over_share.load(Ordering::Relaxed),
+            flooded: p.flooded.load(Ordering::Relaxed),
         })
     }
 

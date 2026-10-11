@@ -10,6 +10,12 @@ use ffi::net;
 
 use crate::net::Nic;
 
+/// The frames a virtual NIC holds that were handed in and not yet taken by
+/// a receive pass (`net/src/vnic.rs` keeps that many): what a module hands
+/// in past them is refused. One number, the kernel's and every module's, so
+/// that a module sharing it out among its own senders shares what there is.
+pub const BACKLOG: usize = 256;
+
 /// What a module attaches to a virtual NIC. `on_frame` runs on the transmit
 /// path of the device -- whichever CPU sends, interrupts off -- so it copies
 /// the frame and returns: nothing that sleeps, allocates or takes long.
@@ -37,6 +43,14 @@ impl Vnic {
     /// The net device it is: for TCP to what is behind it, and ARP.
     pub fn nic(&self) -> Option<Nic> {
         Nic::from_handle(net::kernel_vnic_device(self.handle))
+    }
+
+    /// How many receive passes have taken what was handed in: a count that
+    /// moves each time the backlog is emptied -- for a module that shares
+    /// the `BACKLOG` out among its own senders, between two of them.
+    #[inline]
+    pub fn drains(&self) -> u64 {
+        net::kernel_vnic_drains(self.handle)
     }
 
     /// Everything the stack sends out of it, to `sink`, until the returned
