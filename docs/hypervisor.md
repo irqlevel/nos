@@ -2918,14 +2918,23 @@ someone else's; then speed.
    retpolines. Fix: an allow-list for every leaf, as leaf 1 and 0x80000001
    have; a #GP for an MSR nobody named; a speculation bit only beside the
    MSR that makes it true.
-3. **The guests reach the host's own TCP services.** `find_listener` in
-   `net/src/tcp.rs` matches the address and the port, not the device, and
-   sshd listens at every address: a guest connects to 10.0.100.1:22, and
-   four connections that never log in hold every slot for logging in -- on
-   the Hetzner boxes, the only console there is -- as often as they time
-   out. Forwards draw on the same 64 connections the machine has. Fix: a
-   listener bound to its device, or the switch passing to `hv0` only what
-   is for a service the guests are meant to reach.
+3. ~~**The guests reach the host's own TCP services.**~~ Done: a TCP
+   listener and a connection belong to their device (`net/src/tcp.rs`, a
+   slot's `device`) -- a listener takes a SYN only from the device it was
+   opened on, as `kcore::tcp::TcpListener` always said it did, and a
+   connection a segment or an ICMP error only from its own -- so sshd and
+   `hv forward`'s ports, on eth0, refuse a guest on `hv0`, at nos's address
+   there and at eth0's, and an ICMP error from a guest cannot abort a
+   connection of nos's over eth0. UDP's listeners were each device's
+   already. net-fuzz's `tcp` target has a guest send SYNs from a second
+   device; `hv-linux-test.py --net` has two guests `nc` nos's sshd and the
+   test machine reach it from outside. What it was: `find_listener`
+   matched the address and the port, not the device, and sshd listened at
+   every address: a guest connected to 10.0.100.1:22 -- the control run's
+   guests had the banner both ways -- and four connections that never
+   logged in held every slot for logging in, on the Hetzner boxes the only
+   console there is. Forwards still draw on the same 64 connections the
+   machine has (item 5).
 4. **NAT lets a guest go anywhere nos can.** `routable` refuses 0/8, 127/8,
    multicast and the subnet's broadcast, and nothing else: 169.254.169.254
    -- a cloud's metadata server, the host VM's credentials behind it -- the

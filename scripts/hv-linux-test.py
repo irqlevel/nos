@@ -805,7 +805,13 @@ def network(args):
                "hv forward add 8081 0 80",
                "hv stop 0",
                "hv forward",
-               "nat"]
+               "nat",
+               # nos's own services are not the guests': sshd listens on eth0,
+               # and a guest's connection to it -- at nos's address on hv0, or
+               # at eth0's through hv0 -- is refused. It once got the banner,
+               # and four that never logged in held every slot for logging in.
+               x(1, "echo | nc -w 5 10.0.100.1 22; echo nc-hv0-done"),
+               x(1, "echo | nc -w 5 10.0.2.15 22; echo nc-eth0-done")]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -818,11 +824,13 @@ def network(args):
           x(1, "echo nos-http-hello > /www/index.html"),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
-          "hv forward"] + way_out + [RC_LAST]
+          "hv forward", "insmod /sshd.ko", "sshd start"] + way_out + [RC_LAST]
     port = free_port()
+    ssh_port = free_port()
     qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
-            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080" % port]
-    p, log, image = boot_rc(args, tmp, rc, qemu=qemu)
+            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080,hostfwd=tcp:127.0.0.1:%d-:22" % (port, ssh_port)]
+    sshd = os.path.join(ROOT, "out", "x86_64", "modules", "sshd.ko")
+    p, log, image = boot_rc(args, tmp, rc, extra={"sshd.ko": sshd}, qemu=qemu)
     try:
         if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
             return
@@ -904,6 +912,22 @@ def network(args):
                  "port 8081" not in way(19) and "port 8080 -> vm 1" in way(19), way(19))
         pt.check("NAT keeps no mapping of the stopped VM's address",
                  "nat: on" in way(20) and "10.0.100.2:" not in way(20), way(20)[-800:])
+        # sshd answers from outside, by eth0 -- so a guest's refusal below is
+        # the listener's doing, not a server that never started.
+        banner = b""
+        for attempt in range(10):
+            try:
+                with socket.create_connection(("127.0.0.1", ssh_port), timeout=30) as s:
+                    banner = s.recv(64)
+                break
+            except Exception as e:
+                banner = repr(e).encode()
+                time.sleep(3)
+        pt.check("nos's sshd answers from outside, by eth0", banner.startswith(b"SSH-2.0"), banner)
+        for i, where in ((21, "at nos's address on hv0"), (22, "at eth0's address, through hv0")):
+            pt.check("a guest's connection to nos's sshd %s is refused" % where,
+                     "nc-" in way(i) and "SSH-2.0" not in way(i)
+                     and re.search(r"(?i)connection refused", way(i)) is not None, way(i)[-400:])
     finally:
         server.shutdown()
         pt.kill(p)

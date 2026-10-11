@@ -120,7 +120,7 @@ impl Icmp {
             }
             (icmp::DEST_UNREACH, code) => {
                 self.rx_other.fetch_add(1, Ordering::Relaxed);
-                self.unreachable(code, msg);
+                self.unreachable(nic, code, msg);
             }
             _ => {
                 self.rx_other.fetch_add(1, Ordering::Relaxed);
@@ -169,7 +169,7 @@ impl Icmp {
     /// A destination that could not be reached. The hard errors abort the
     /// quoted connection instead of leaving it to retransmit into a void
     /// (RFC 1122 4.2.3.9); the rest are counted and dropped.
-    fn unreachable(&self, code: u8, msg: &[u8]) {
+    fn unreachable(&self, nic: &Nic, code: u8, msg: &[u8]) {
         if code != icmp::PROTO_UNREACH && code != icmp::PORT_UNREACH {
             return;
         }
@@ -191,7 +191,7 @@ impl Icmp {
 
         /* The quoted segment is one this machine sent: its source is our end */
         let seg = &quoted[quoted_len..];
-        crate::tcp::TCP.on_icmp_unreachable(
+        crate::tcp::TCP.on_icmp_unreachable(nic,
             ip::src(quoted), wire::be16(seg, 0),
             ip::dst(quoted), wire::be16(seg, 2),
             wire::be32(seg, 4));

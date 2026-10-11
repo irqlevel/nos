@@ -12,14 +12,16 @@ use std::sync::Mutex;
 
 use super::sched;
 
-/// The NICs there are.
-pub const NICS: usize = 1;
+/// The NICs there are: eth0, which every target has, and a second a target
+/// may register for itself -- a device none of the machine's services
+/// listens on, as the hypervisor's switch is (`targets::tcp`).
+pub const NICS: usize = 2;
 
 pub struct FuzzNic {
     index: usize,
 }
 
-pub static DRIVERS: [FuzzNic; NICS] = [FuzzNic { index: 0 }];
+pub static DRIVERS: [FuzzNic; NICS] = [FuzzNic { index: 0 }, FuzzNic { index: 1 }];
 
 pub struct Wire {
     /// What the stack sent out of each NIC, oldest first.
