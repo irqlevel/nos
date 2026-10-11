@@ -287,6 +287,13 @@ impl Nat {
     pub fn outer(&self) -> Nic {
         self.outer
     }
+
+    /// Every mapping of the guest at `ip` (host byte order) forgotten: its
+    /// guest has gone, and its address goes to the next one. How many there
+    /// were.
+    pub fn forget(&self, ip: u32) -> usize {
+        net::kernel_net_nat_forget(self.inner, ip) as usize
+    }
 }
 
 impl Drop for Nat {

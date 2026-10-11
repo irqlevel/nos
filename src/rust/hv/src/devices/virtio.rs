@@ -191,7 +191,9 @@ impl Queue {
     }
 
     /// Give the chain at `head` back, `len` bytes of it written by the
-    /// device: the element first, then the index that publishes it.
+    /// device: the element first, then the index that publishes it -- a
+    /// store of the whole word, after the element, which the driver reads
+    /// on another CPU while it runs (`GuestMemory::write_u16`).
     pub fn push(&mut self, mem: &GuestMemory, head: u16, len: u32) -> Result<(), Broken> {
         let used = self.used_base();
         let slot = u64::from(self.next_used % self.size);
@@ -200,7 +202,7 @@ impl Queue {
         elem[4..].copy_from_slice(&len.to_le_bytes());
         mem.write(used + 4 + USED_ELEM_SIZE * slot, &elem).map_err(|_| Broken::Memory)?;
         self.next_used = self.next_used.wrapping_add(1);
-        mem.write(used + 2, &self.next_used.to_le_bytes()).map_err(|_| Broken::Memory)
+        mem.write_u16(used + 2, self.next_used).map_err(|_| Broken::Memory)
     }
 
     /// Whether the driver wants an interrupt for what was given back.
@@ -225,10 +227,12 @@ fn get32(h: &[u8], at: u16) -> u32 {
     u32::from_le_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]])
 }
 
+/// A word of a ring, read whole: an index or the flags, which the driver
+/// stores on another CPU while the device reads -- a copy of its two bytes
+/// could take one from either side of that store, and an index read so,
+/// 0x01FF for 0x0100, is a ring that looks overrun.
 fn read_u16(mem: &GuestMemory, gpa: u64) -> Result<u16, Broken> {
-    let mut b = [0u8; 2];
-    mem.read(gpa, &mut b).map_err(|_| Broken::Memory)?;
-    Ok(u16::from_le_bytes(b))
+    mem.read_u16(gpa).map_err(|_| Broken::Memory)
 }
 
 /// The interrupts a device has for the driver once it has given buffers

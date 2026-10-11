@@ -113,7 +113,7 @@ swallowing panic messages whole.
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
-| `insn-test.py` | host (CI) | the hypervisor's MMIO decoder and guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
+| `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
@@ -354,6 +354,19 @@ hand: 4 KiB, 2 MiB and 1 GiB pages, five levels, addresses non-canonical and
 unmapped, and a fetch across a page boundary into a page mapped elsewhere.
 It needs clang, `llvm-objdump` and cargo; CI runs it on its x86-64 leg.
 
+The other decoder in the file, of a `mov` to or from a control register
+(`decode_mov_cr`) -- what an intercept of CR4 stops a guest at, on a CPU
+that does not name the register -- is checked the same way: every `mov` to
+and from CR0, CR2, CR3, CR4 and CR8 through eight registers, REX's among
+them, assembled by clang and decoded in 64-bit code and, without a REX --
+which 32-bit code reads as an INC or a DEC, and is refused -- in 32-bit
+code too; each cut short at every length; by hand, what no assembler gives
+and a CPU takes or refuses -- prefixes it passes over, a ModRM whose mod
+field it ignores with nothing after it, a lock and a repeat, a REX that is
+not the last byte before the opcode; and the random bytes. Each decoder
+must refuse the other's every form. A control run with REX.B left out of
+the register failed 31 of its cases.
+
 ### `hv-fuzz.py` -- everything a guest reaches, fuzzed
 
 A guest decides every value the hypervisor's devices are handed -- every
@@ -372,7 +385,9 @@ overflow checks on as a `RUSTUB=1` kernel has them. Each target turns random byt
 one device: the serial port, the 8259, the PIT, the RTC, ACPI's fixed
 hardware, PCI configuration space, the local APIC through its MSRs and its
 page, the IO-APIC, MSIs, a virtio disk and NIC driven through rings well
-made and not, the page walker over random page tables, the decoder, the
+made and not -- and raced: another of the guest's CPUs topping a ring up
+by plain writes while the device takes from it, as nothing on the host can
+stop it doing -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
 The guests' network has three: `switch`, guests on its ports and `hv0`
@@ -391,8 +406,10 @@ second of the first harness, whose CPUs slept for real, and ten processes
 at once some forty times theirs. Where the loop would enter the
 guest, the CPU asks a script what the guest does next: a port, an MSR,
 CPUID, a fault on a device's page with the instruction that made it put
-where the guest's paging finds it, a halt, a window opened, an event taken,
-another CPU's turn -- and between them what a driver does over several
+where the guest's paging finds it, a `mov` to or from CR4 put there the
+same way -- under AMD-V, which stops a guest at each -- a halt, a window
+opened, an event taken, another CPU's turn -- and between them what a
+driver does over several
 exits: the 8259 initialised, the APIC turned on or moved between its modes,
 an IO-APIC pin routed, MSI-X turned on and its table filled, a virtio queue
 set up and given requests, another CPU started by INIT and start-up IPIs.
@@ -401,6 +418,8 @@ A finding is a panic -- an index out of range, an overflow -- or a broken
 invariant: an interrupt injected into a guest that cannot take one, or over
 an event already on its way in; an exception's vector from the APIC; a disk
 request outside the disk, not in sectors, or past the requests in flight; a
+device that, its ring raced, takes twice what the ring holds in one call --
+a pass that, on a host, would never end; a
 frame longer than a frame handed to the switch; a DHCP answer that is no
 datagram, or whose checksum is not its own; a frame the switch put
 elsewhere than its destination says, or counted otherwise; a packet NAT
@@ -411,7 +430,17 @@ not at all; what a guest takes from the world for another guest's address,
 and what `hv0` or a guest takes from a guest not sent as that guest; a
 vCPU that enters its
 guest or waits with one of the kernel's locks held; a guest whose RAM would
-cover its devices' pages. Or a spin -- the run loop reading the clock a
+cover its devices' pages; a `mov` of CR4 that by the CPU's next entry has
+not come to what the script reckons -- a read whose register does not hold
+the CR4 the guest wrote, a write a CPU takes that is not the guest's CR4
+with MCE in the register and RIP past it, one a CPU refuses that is not a
+#GP with CR4 as it was -- or a CR4 written with a bit the guest's CPUID does
+not offer, PAE cleared in long mode, or a bit a CPU translates by changed
+and the guest's TLB not flushed. (Control runs with the CPUID's mask left
+out, PGE's flush left out, and reads answered from the register rather than
+the guest's CR4 failed at the first, the first and the fourth input; the
+first run of the checks found the script's own 32-bit belief outliving the
+INIT that put its CPU back in long mode.) Or a spin -- the run loop reading the clock a
 million times with neither an entry nor a wait between, which on a host is
 a CPU spun for as long as the guest stays so -- or a hang, ten seconds with
 no input done. Each is reported with the seed and the iteration that make
@@ -703,7 +732,14 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   calls does to the model. A mount taken exactly when its path is free and
   well formed, its device nobody else's and there is room; an unmount
   refused while anything is open on it; a rename between mounts refused;
-  and the disks' filesystems clean after `unmount_all`;
+  and the disks' filesystems clean after `unmount_all`. Which file an open
+  file is (`kernel_file_mount` and `kernel_file_key`, what a guest's disk
+  claims its image by): one for two handles on one path and two for two paths, on every
+  filesystem the model holds (`Fs::compare`, so ext2's and nanofs's targets
+  too); two mounts for files on two -- an ext2's and a nanofs's numbers are
+  alike; and a word that is no open file told so. A
+  control run with the node's key left out of a ramfs file's identity
+  failed at the first input, and one with the mount left out at the 41st;
 - `shell`: the storage commands the console, the UDP shell and SSH run --
   `mount`, `format`, `cp -r`, `fstest`, `diskwrite` and the rest -- with
   arguments of every kind, after `fstest` has passed on ramfs, ext2 and
@@ -1070,8 +1106,29 @@ depend on; and for `ioapic` that the IO-APIC sent five interrupts, three
 of them levels each ended by EOI -- its serial port's pin taking two edges
 and none while masked, then a level sent again at each EOI while the line
 stayed up, its remote IRR set in service and clear after ([The
-IO-APIC](hypervisor.md#the-io-apic)). The unload that follows, and the
-load after it, are then of a hypervisor that has run guests on those CPUs.
+IO-APIC](hypervisor.md#the-io-apic)); and for `debug`, through the run loop
+a Linux guest's CPUs go through, that a single step and an `int1` -- each a
+#DB the host intercepts -- reached the guest's own handler, the first with
+DR6.BS and after the stepped instruction, the second after the ICEBP: a
+user process's `stepi` once stopped its whole VM. Under VT-x, which gives
+no #DB back yet, it checks the single step stops the guest there instead,
+so that the day it does, the check has to be changed with it. And for
+`cr4`, through the same loop, that the guest read back each CR4 it wrote --
+MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that SMEP, which
+its CPUID does not offer, PAE cleared in long mode and bit 32 were each a
+#GP with no error code, CR4 as it was; and that the host performed all
+eleven of its accesses. On QEMU's TCG -- known by its hypervisor leaf's
+signature -- which checks a read of any control register against CR0's
+intercept and so stops no read of CR4, it holds the reads to the register
+instead, MCE in it, and the host to its five writes; its VMCB must ask for
+the reads either way. A control run with MCE kept nowhere -- neither
+`hvarch` setting it at entry nor `set_cr4` -- failed there: the register it
+read lost MCE at the first write. Under VT-x, which does not stop a guest at CR4 yet,
+it checks only what any CPU does -- PAE cleared and bit 32 refused, CR4
+unchanged -- and says so; that branch has not been run, no Intel machine
+being at hand when it was written. The unload
+that follows, and the load after it, are then of a hypervisor that has run
+guests on those CPUs.
 
 `smp` is the one guest of two CPUs, its second on another host CPU than
 the first ([More than one CPU](hypervisor.md#more-than-one-cpu)), and its
@@ -1150,6 +1207,20 @@ an early console on, PCI, ACPI and SMP off is enough -- and run
 scripts/hv-linux-test.py --bzimage /path/to/bzImage
 ```
 
+The initramfs `--initrd` takes is a static BusyBox and an `/init` that
+mounts `/proc` and `/sys`, says `nos-guest: init is up`, turns the kernel's
+console messages down (`dmesg -n 1`) and runs `sh` -- a kernel line printed
+after the shell's prompt hides the prompt from the module. Which BusyBox
+matters three ways. Its line editor has to ask the terminal where the
+cursor is (`FEATURE_EDITING_ASK_TERMINAL`): the module types a line at a
+guest only once it has heard that question, which a shell asks at its
+prompt, and with a BusyBox that never asks, every `hv exec` waits out its
+time and says the guest is not at a prompt. `--net` wants its `httpd`; and
+its exec has to run a script with no `#!` line through the shell, as
+glibc's does, for the `udhcpc -s` script `--net` writes. Ubuntu 24.04's
+static BusyBox 1.36.1 does all three; Alpine's `busybox-static` has no
+`httpd` and runs no such script; the official `busybox` image's never asks.
+
 Under AMD-V, which on a machine with no hardware SVM is QEMU's TCG, itself
 under nothing faster -- so the guest's decompressor and early boot are twice
 emulated and slow, and the whole run is a couple of minutes (`--secs` sets
@@ -1176,7 +1247,22 @@ it -- so the gate ends on a command's output (`version`) rather than on
 `dmesg hv:`. `--skip-boot` and `--skip-vms` run one half. The same phase
 restarts guests: a stopped one by `hv restart`, one started with `restart`
 that resets itself until the sixth reset in a minute leaves it stopped, and
-the running one, which must answer a line typed during its new boot.
+the running one, which must answer a line typed during its new boot. And
+one more guest is started with an `input=` and restarted before its first
+prompt -- the input held for that prompt, so the boot after throws it away
+unread, every time -- and must answer the next line at its prompt: input a
+boot throws away once left every later `hv exec` waiting out its time and
+then saying the line was not read. The guest ran the line all the same, so
+its answer is in the output either way, and the check that holds is that
+`hv exec` said nothing of a line not read: a control run with the fix taken
+out passed while it looked for the answer alone, and fails it now. Then five
+guests are started against one image on nos's root, `/claimed.img`: a guest
+whose disk writes it, and then a second writer and a reader, both refused;
+the writer stopped, two readers, side by side, and a writer refused under
+them -- each refusal saying whose the image is, and every refused start
+taking a number all the same, which is what the checks count on. The guests
+have no initrd and get no further than their panic, holding their disks the
+while.
 
 `--attach` is a boot of its own for `hv attach`: sshd and a guest started
 from `/etc/rc`, then an `ssh -tt ... hv attach 0` that types a line, waits
@@ -1250,7 +1336,11 @@ that sent them and no other. (nos's ARP table is no steady witness: with
 the check taken out of the switch the claim reached it, and the other
 guest's own ARP put the entry right again -- once before the test could
 look, and once not, when the fetch through `hv forward`, which the test
-makes last, reached the claiming guest instead of the other's `httpd`.) It
+makes last, reached the claiming guest instead of the other's `httpd`.)
+Then one guest is stopped with a forward to it and its flows in NAT's table:
+its forward has to go with it, the other's stay, and `nat` show no mapping
+of its address -- the next VM on its port has its MAC and address, and was
+once relayed to and answered for the stopped one. It
 needs a guest kernel with networking, virtio-net, packet sockets and `ip=`
 configuration built in, and POSIX timers: BusyBox's `ping` paces itself
 with `alarm()`, which a `tinyconfig` leaves out, and without it the guest's

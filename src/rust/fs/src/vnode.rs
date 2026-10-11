@@ -53,6 +53,12 @@ impl NodeId {
     fn index(self) -> usize {
         self.slot.get() as usize - 1
     }
+
+    /// The id as one word: its slot and generation, which no other node
+    /// ever has together.
+    pub fn key(self) -> u64 {
+        (u64::from(self.slot.get()) << 32) | u64::from(self.generation)
+    }
 }
 
 pub struct Node {

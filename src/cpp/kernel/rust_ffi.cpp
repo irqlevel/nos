@@ -625,10 +625,23 @@ unsigned long kernel_virt_to_phys(const void* virt_addr)
 
 /* ---- Frames: pages of RAM mapped nowhere (kcore::frame) ---- */
 
+/* The RAM frames may not take: what the kernel goes on needing once guests
+   have the rest -- its heap, the pages their nested tables are made of, a
+   module loaded later. A sixteenth of the machine, and no less than 64 MiB.
+   Without it a guest given more memory than the machine had free took the
+   last page, and the next allocation anywhere that may not fail -- a plain
+   `new`, a Rust Box -- panicked the host under every other guest. */
+static const unsigned long FrameReserveMinBytes = 64ul << 20;
+static const unsigned long FrameReserveFraction = 16;
+
 unsigned long kernel_frame_alloc()
 {
-    /* AllocPage zeroes what it hands out, through the temp map. */
-    Kernel::Mm::Page* page = Kernel::Mm::PageTable::GetInstance().AllocPage();
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
+    const unsigned long keep = Stdlib::Max(FrameReserveMinBytes / Const::PageSize,
+        pt.GetTotalPagesCount() / FrameReserveFraction);
+    /* AllocPageKeeping zeroes what it hands out, through the temp map, as
+       AllocPage does. */
+    Kernel::Mm::Page* page = pt.AllocPageKeeping(keep);
     return page ? page->GetPhyAddress() : 0;
 }
 
@@ -697,6 +710,52 @@ int kernel_frame_write(unsigned long phys, unsigned long offset,
     const unsigned char* data, unsigned long len)
 {
     return FrameCopy(phys, offset, nullptr, data, len);
+}
+
+/* One 16-bit word of a frame, loaded or stored whole: a single access,
+   which FrameCopy's MemCpy is not -- on x86 a `rep movsb`, a byte after a
+   byte. A word a guest's other CPUs write while the host reads it -- a
+   virtqueue's index -- has to be read whole: the high byte of 0x0100 with
+   the low byte of the 0x00FF it replaced is 0x01FF, a ring that looks
+   overrun. The load is an acquire and the store a release: what a driver
+   published before its index is there to be read after the index is, and
+   what this side wrote before its own index is there before the index
+   says so. The same slot of the window as FrameCopy's, with preemption and
+   interrupts off for the same reason. -1, and nothing done, for a word
+   that is not an aligned one inside a page of RAM. */
+static bool FrameWordInside(unsigned long phys, unsigned long offset)
+{
+    return offset < Const::PageSize && offset % sizeof(unsigned short) == 0
+        && Kernel::Mm::PageTable::GetInstance().IsFrameAddress(phys);
+}
+
+int kernel_frame_load16(unsigned long phys, unsigned long offset, unsigned short* value)
+{
+    if (value == nullptr || !FrameWordInside(phys, offset))
+        return -1;
+
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
+    ulong flags = Kernel::PreemptIrqSave();
+    ulong va = pt.MapFrameSlot(phys);
+    /* Aligned, inside the page mapped at va: checked above. */
+    *value = __atomic_load_n(reinterpret_cast<unsigned short*>(va + offset), __ATOMIC_ACQUIRE);
+    pt.UnmapFrameSlot(va);
+    Kernel::PreemptIrqRestore(flags);
+    return 0;
+}
+
+int kernel_frame_store16(unsigned long phys, unsigned long offset, unsigned short value)
+{
+    if (!FrameWordInside(phys, offset))
+        return -1;
+
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
+    ulong flags = Kernel::PreemptIrqSave();
+    ulong va = pt.MapFrameSlot(phys);
+    __atomic_store_n(reinterpret_cast<unsigned short*>(va + offset), value, __ATOMIC_RELEASE);
+    pt.UnmapFrameSlot(va);
+    Kernel::PreemptIrqRestore(flags);
+    return 0;
 }
 
 /* ---- Soft IRQ ---- */

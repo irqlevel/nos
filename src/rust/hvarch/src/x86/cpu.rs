@@ -35,6 +35,26 @@ pub fn cpuid_count(leaf: u32, sub: u32) -> Option<CpuidResult> {
     Some(__cpuid_count(leaf, sub))
 }
 
+/// The signature in the CPUID leaf of a hypervisor this kernel runs under,
+/// 0x4000_0000 -- `TCGTCGTCGTCG` for QEMU's TCG, `KVMKVMKVM` and three NULs
+/// for KVM -- or None on a CPU that says there is none (leaf 1, ECX bit 31).
+/// The hypervisor's leaves are a range of their own, which `cpuid`'s check
+/// of the basic and extended ranges would refuse; that bit is theirs.
+pub fn hypervisor_signature() -> Option<[u8; 12]> {
+    const LEAF_FEATURES: u32 = 1;
+    const ECX_HYPERVISOR: u32 = 1 << 31;
+    const LEAF_HYPERVISOR: u32 = 0x4000_0000;
+    if cpuid(LEAF_FEATURES)?.ecx & ECX_HYPERVISOR == 0 {
+        return None;
+    }
+    let r = __cpuid(LEAF_HYPERVISOR);
+    let mut signature = [0u8; 12];
+    signature[..4].copy_from_slice(&r.ebx.to_le_bytes());
+    signature[4..8].copy_from_slice(&r.ecx.to_le_bytes());
+    signature[8..].copy_from_slice(&r.edx.to_le_bytes());
+    Some(signature)
+}
+
 /// The vendor string as CPUID leaf 0 spells it: "GenuineIntel",
 /// "AuthenticAMD", or what a hypervisor says it is.
 pub fn vendor_id() -> [u8; 12] {

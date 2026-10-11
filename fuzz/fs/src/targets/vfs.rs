@@ -253,6 +253,34 @@ impl World {
                    paths.iter().map(|(p, k)| format!("{} {}", show(p), k)).collect::<Vec<_>>(),
                    want.iter().map(|(p, k)| format!("{} {}", show(p), k)).collect::<Vec<_>>());
         let _ = crate::machine::cmd::run("mounts");
+        self.identities();
+    }
+
+    /// Which mount each open file is on, by the identity a guest's disk
+    /// claims its image by (`kernel_file_mount`): one for files on one
+    /// mount, another for files on two, whatever their inodes -- an ext2's
+    /// and a nanofs's numbers are alike. (`Fs::compare` holds the root's
+    /// files to one another; every mount with a file open stays mounted.)
+    fn identities(&self) {
+        let ids: Vec<(&[u8], Option<(u64, u64)>)> = self.root.model.open.iter().map(|(h, _)| (&b"/"[..], *h))
+            .chain(self.others.iter().map(|(h, owner)| (&owner[..], *h)))
+            .map(|(owner, h)| {
+                let w = Handle::into_raw(Some(h));
+                let (mount, key) = (fs::files::kernel_file_mount(w), fs::files::kernel_file_key(w));
+                (owner, (mount != 0 && key != 0).then_some((mount, key)))
+            })
+            .collect();
+        for (i, &(a, x)) in ids.iter().enumerate() {
+            let Some(x) = x else { panic!("invariant: a file open on {} is no file, by its identity", show(a)) };
+            for &(b, y) in &ids[..i] {
+                let Some(y) = y else { continue };
+                invariant!((a == b) == (x.0 == y.0), "files open on {} and {} are on mounts {} and {}", show(a), show(b),
+                           x.0, y.0);
+                if a != b {
+                    reached("files open on two mounts, two mounts by their identities");
+                }
+            }
+        }
     }
 
     /// A task of its own at work on the other mounts, as another program
@@ -349,7 +377,7 @@ fn word(r: &mut Input, w: &World) -> usize {
 
 impl World {
     fn abi(&mut self, r: &mut Input) {
-        match r.u8() % 6 {
+        match r.u8() % 7 {
             0 => {
                 /* An open by pointer and length: none, too long, or one of
                  * the model's. */
@@ -428,6 +456,24 @@ impl World {
                 };
                 invariant!(want.is_none_or(|x| x == got), "kernel_vfs_size of {:#x} is {}, and the model's {:?}", w,
                            got, want);
+            }
+            5 => {
+                /* Which file a word is: a guest's disk claims its image by
+                 * it. `Fs::compare` holds the answers for open files to one
+                 * another; here, an open file's are a file's whole, and a
+                 * word that is none is told so. */
+                let w = word(r, self);
+                let known = classify(self, w);
+                let (mount, key) = (fs::files::kernel_file_mount(w), fs::files::kernel_file_key(w));
+                match known {
+                    Word::Root(_) => invariant!(mount != 0 && key != 0,
+                                                "an open file's identity is mount {} key {:#x}", mount, key),
+                    Word::Nothing => {
+                        invariant!(mount == 0 && key == 0, "{:#x}, no open file, is mount {} key {:#x}", w, mount, key);
+                        reached("the identity of no open file refused");
+                    }
+                    Word::Other => {}
+                }
             }
             4 => {
                 let w = word(r, self);

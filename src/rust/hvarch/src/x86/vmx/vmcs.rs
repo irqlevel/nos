@@ -319,6 +319,12 @@ pub mod reason {
     pub const RDRAND: u32 = 57;
     pub const INVPCID: u32 = 58;
     pub const RDSEED: u32 = 61;
+    /* VMX's own instructions and GETSEC, which exit unconditionally in VMX
+     * non-root operation -- before the CPU looks at the CPL. */
+    pub const GETSEC: u32 = 11;
+    pub const INVEPT: u32 = 50;
+    pub const INVVPID: u32 = 53;
+    pub const VMFUNC: u32 = 59;
     /// EXIT_REASON bit 31: VM entry failed rather than a guest exit.
     pub const ENTRY_FAILURE: u32 = 1 << 31;
     /// Bits 15:0.

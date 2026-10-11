@@ -876,6 +876,19 @@ Page* PageTable::AllocPage()
     return page;
 }
 
+Page* PageTable::AllocPageKeeping(ulong keep)
+{
+    Page* page = nullptr;
+    {
+        Stdlib::AutoLock lock(Lock);
+        if (FreePagesCount > keep)
+            page = TakeFreePageNoLock();
+    }
+    if (page)
+        ZeroPage(page);
+    return page;
+}
+
 Page* PageTable::AllocPageNoLock()
 {
     Page* page = TakeFreePageNoLock();

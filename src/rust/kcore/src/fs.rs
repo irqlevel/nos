@@ -80,6 +80,15 @@ impl File {
         u64::try_from(fs::kernel_file_length(self.handle)).map_err(|_| Error::IoError)
     }
 
+    /// Which file this is: the same for two opens of one file, under one
+    /// name or two, for as long as either is open -- what a claim on the
+    /// file is keyed by. None for a handle the kernel no longer knows.
+    pub fn identity(&self) -> Option<FileId> {
+        let mount = fs::kernel_file_mount(self.handle);
+        let key = fs::kernel_file_key(self.handle);
+        (mount != 0 && key != 0).then_some(FileId { mount, key })
+    }
+
     /// As much of `buf` as the file has from `offset`: the count read, 0 at
     /// or past its end.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
@@ -112,6 +121,13 @@ impl Drop for File {
     fn drop(&mut self) {
         fs::kernel_file_close(self.handle);
     }
+}
+
+/// Which file an open file is (`File::identity`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FileId {
+    mount: u64,
+    key: u64,
 }
 
 /// Replaces the file's content, making the file if it is missing: the new

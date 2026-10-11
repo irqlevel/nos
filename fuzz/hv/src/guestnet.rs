@@ -646,6 +646,20 @@ fn table_flow(port: u16) -> Option<Key> {
     })
 }
 
+/// Whether NAT's table has a live mapping of `inner_ip`'s, as `nat` lists
+/// them.
+fn table_maps(inner_ip: u32) -> bool {
+    const NONE: nat::Mapping = nat::Mapping { proto: 0, inner_ip: 0, inner_port: 0, remote_ip: 0, remote_port: 0,
+                                              port: 0, left_ns: 0 };
+    thread_local! {
+        static ALL: std::cell::RefCell<Vec<nat::Mapping>> = std::cell::RefCell::new(vec![NONE; nat::ENTRIES]);
+    }
+    let Some(nat) = crate::abi::nat() else { return false };
+    ALL.with_borrow_mut(|all| {
+        nat.state(all).is_some_and(|(_, _, _, n)| all[..n].iter().any(|m| m.inner_ip == inner_ip))
+    })
+}
+
 /// Packets the oracle judged: sent out, sent back -- for `HV_FUZZ_STATS`.
 pub static OUT_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BACK_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1106,7 +1120,25 @@ pub fn nat_target(r: &mut Input) {
                         m = NatModel::default();
                     }
                 }
-                _ => {}
+                _ => {
+                    /* A guest gone (`Switch::release`): every mapping of its
+                     * address forgotten through the C ABI the module has,
+                     * and none of them left -- the next guest on its port has
+                     * its address, and must be answered for no flow of the
+                     * one before. Its flows go from the model too: an answer
+                     * on one of their ports is the table's to drop now. */
+                    let guest = if r.u8() < 230 { SUBNET | (2 + r.below(16) as u32) } else { r.u32() };
+                    nat::kernel_net_nat_forget(HV0.handle(), guest);
+                    let gone: Vec<u16> = m.by_port.iter().filter(|(_, f)| f.key.1 == guest).map(|(p, _)| *p).collect();
+                    for p in &gone {
+                        if let Some(f) = m.by_port.remove(p) {
+                            m.by_key.remove(&f.key);
+                        }
+                    }
+                    m.recent.retain(|p| !gone.contains(p));
+                    m.unsent.retain(|k, _| k.1 != guest);
+                    invariant!(!table_maps(guest), "NAT still maps a flow of {:#x}'s after forgetting it", guest);
+                }
             },
         }
     }

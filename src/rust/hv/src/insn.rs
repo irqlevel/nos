@@ -24,6 +24,11 @@
 //! MMIO access this decodes, and is `None`: the caller stops the guest and
 //! shows the bytes, rather than guess. Pure code over a slice, and nothing
 //! of the guest's is trusted: every length is checked against what is there.
+//!
+//! And one more, apart: a `mov` to or from a control register
+//! ([`decode_mov_cr`]), which an intercept of CR4 stops the guest at
+//! (`crate::cr`) -- the same bytes fetched the same way, for the register
+//! the exit does not name.
 
 /// The most bytes an x86 instruction has.
 pub const MAX_LEN: usize = 15;
@@ -40,6 +45,7 @@ const REX_BASE: u8 = 0x40;
 const REX_MASK: u8 = 0xF0;
 const REX_W: u8 = 1 << 3;
 const REX_R: u8 = 1 << 2;
+const REX_B: u8 = 1 << 0;
 
 /* Opcodes. */
 const MOV_STORE_8: u8 = 0x88;
@@ -53,6 +59,9 @@ const MOVZX_8: u8 = 0xB6;
 const MOVZX_16: u8 = 0xB7;
 const MOVSX_8: u8 = 0xBE;
 const MOVSX_16: u8 = 0xBF;
+/// `mov` from a control register, and to one: 0x0F 0x20 and 0x0F 0x22.
+const MOV_FROM_CR: u8 = 0x20;
+const MOV_TO_CR: u8 = 0x22;
 
 /* ModRM and SIB fields. */
 const MOD_SHIFT: u8 = 6;
@@ -284,6 +293,67 @@ pub fn decode(bytes: &[u8], mode: Mode) -> Option<Insn> {
         }
     };
     Some(Insn { access, len: c.at as u8 })
+}
+
+/// A `mov` to or from a control register, decoded: which one, which
+/// general-purpose register, which way, and how long the instruction is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MovCr {
+    /// The control register's number, 0-15: ModRM's reg field, REX.R its
+    /// top bit.
+    pub cr: u8,
+    /// The general-purpose register, numbered as `Reg`'s are: ModRM's rm
+    /// field, REX.B its top bit. Always the whole register -- 64 bits in
+    /// 64-bit mode, 32 in 32-bit code.
+    pub gpr: u8,
+    /// To the control register, rather than from it.
+    pub write: bool,
+    pub len: u8,
+}
+
+/// Decode a `mov` to or from a control register at the start of `bytes`, in
+/// `mode` -- what a control-register intercept stops a guest at, without
+/// saying which register it names on a CPU with no decode assists -- or
+/// None for anything else. As the CPU does, the ModRM byte's mod field is
+/// ignored: the operand is a register whatever it says, and nothing follows
+/// the ModRM byte. Prefixes the CPU ignores here are passed over -- operand
+/// and address size, segment overrides; a lock (AMD's other name for CR8)
+/// and a repeat are refused, as is a REX anywhere but just before the
+/// opcode.
+pub fn decode_mov_cr(bytes: &[u8], mode: Mode) -> Option<MovCr> {
+    let bytes = &bytes[..bytes.len().min(MAX_LEN)];
+    let mut c = Bytes { b: bytes, at: 0 };
+    let mut rex = 0u8;
+    loop {
+        let b = c.peek()?;
+        match b {
+            OPERAND_SIZE | ADDRESS_SIZE => {}
+            LOCK | REP | REPNE => return None,
+            b if SEGMENT_OVERRIDES.contains(&b) => {}
+            b if mode == Mode::Long && b & REX_MASK == REX_BASE => {
+                c.next()?;
+                rex = b;
+                if c.peek()? != TWO_BYTE {
+                    return None;
+                }
+                break;
+            }
+            _ => break,
+        }
+        c.next()?;
+    }
+    if c.next()? != TWO_BYTE {
+        return None;
+    }
+    let write = match c.next()? {
+        MOV_TO_CR => true,
+        MOV_FROM_CR => false,
+        _ => return None,
+    };
+    let modrm = c.next()?;
+    let cr = ((modrm >> REG_SHIFT) & FIELD_MASK) | if rex & REX_R != 0 { 8 } else { 0 };
+    let gpr = (modrm & FIELD_MASK) | if rex & REX_B != 0 { 8 } else { 0 };
+    Some(MovCr { cr, gpr, write, len: c.at as u8 })
 }
 
 /// What the opcode said the access is, before the operand is decoded.

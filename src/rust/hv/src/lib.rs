@@ -60,6 +60,8 @@ mod walk;
 #[cfg(target_arch = "x86_64")]
 pub mod mmio;
 #[cfg(target_arch = "x86_64")]
+pub mod cr;
+#[cfg(target_arch = "x86_64")]
 pub mod policy;
 #[cfg(target_arch = "x86_64")]
 pub mod run;

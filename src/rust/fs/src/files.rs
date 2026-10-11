@@ -347,6 +347,28 @@ pub extern "C" fn kernel_file_close(file: usize) {
     }
 }
 
+/// The mount the open file is on: an id no other mount is ever given, and
+/// never 0 -- or 0 for a word that is no open file. With
+/// `kernel_file_key`, which file it is.
+#[no_mangle]
+pub extern "C" fn kernel_file_mount(file: usize) -> u64 {
+    match (vfs_instance(), Handle::from_raw(file)) {
+        (Some(vfs), Some(handle)) => vfs.identity(handle).map_or(0, |(mount, _)| mount),
+        _ => 0,
+    }
+}
+
+/// Which file on its mount the open file is: its on-disk inode -- or its
+/// node, on a filesystem that keeps none -- so that two names of one file
+/// are one; never 0 -- or 0 for a word that is no open file.
+#[no_mangle]
+pub extern "C" fn kernel_file_key(file: usize) -> u64 {
+    match (vfs_instance(), Handle::from_raw(file)) {
+        (Some(vfs), Some(handle)) => vfs.identity(handle).map_or(0, |(_, key)| key),
+        _ => 0,
+    }
+}
+
 /// The open file's size in bytes, or -1 for a word that is no open file.
 #[no_mangle]
 pub extern "C" fn kernel_file_length(file: usize) -> i64 {
