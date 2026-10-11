@@ -143,6 +143,11 @@ GUESTS = {
     "cr4": [r"while the CPU's CR4 kept MCE; SMEP, PAE cleared and bit 32 each a #GP, CR4 as it was",
             r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
             r"\b(?:11|5) of CR4 performed, 3 refused"],
+    # Every MSR comes to the policy on both backends, so this one says the
+    # same under either.
+    "msr": [r"SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
+            r"CPUID offers no speculation control and no PMU, and says a hypervisor is there",
+            r"\b5 rdmsr, 3 wrmsr, 4 refused"],
 }
 
 # Five of the guests test a mechanism only one vendor has: AMD-V's software

@@ -35,6 +35,11 @@ const ADDRESS_BUS_SHIFT: u32 = 16;
 const ADDRESS_DEVICE_SHIFT: u32 = 11;
 const ADDRESS_FUNCTION_SHIFT: u32 = 8;
 const ADDRESS_REGISTER_MASK: u32 = 0xFC;
+/// Bits 30:24, reserved -- where AMD's chipsets take bits 11:8 of an
+/// extended register's number (ECS, which a guest on Zen turns on through
+/// NB_CFG and the policy reports on). No function here has a register past
+/// 255, so an address with any of them set names none, and reads all ones.
+const ADDRESS_RESERVED: u32 = 0x7F00_0000;
 const ADDRESS_BUS_MASK: u32 = 0xFF;
 const ADDRESS_DEVICE_MASK: u32 = 0x1F;
 const ADDRESS_FUNCTION_MASK: u32 = 0x7;
@@ -281,12 +286,12 @@ impl PciBus {
     }
 
     /// The function CONFIG_ADDRESS names, and the byte in its space `port`
-    /// is at -- or None, for an access with the enable bit clear, another
-    /// bus, a function past 0 or a slot with nothing in it, which read as
-    /// all ones.
+    /// is at -- or None, for an access with the enable bit clear, a register
+    /// past 255 (`ADDRESS_RESERVED`), another bus, a function past 0 or a
+    /// slot with nothing in it, which read as all ones.
     fn target(&self, port: u16) -> Option<(usize, usize)> {
         let a = self.address;
-        if a & ADDRESS_ENABLE == 0 || (a >> ADDRESS_BUS_SHIFT) & ADDRESS_BUS_MASK != 0 {
+        if a & ADDRESS_ENABLE == 0 || a & ADDRESS_RESERVED != 0 || (a >> ADDRESS_BUS_SHIFT) & ADDRESS_BUS_MASK != 0 {
             return None;
         }
         if (a >> ADDRESS_FUNCTION_SHIFT) & ADDRESS_FUNCTION_MASK != 0 {

@@ -114,11 +114,11 @@ swallowing panic messages whole.
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
-| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
+| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
@@ -390,6 +390,24 @@ by plain writes while the device takes from it, as nothing on the host can
 stop it doing -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
+`policy` holds the CPUID and MSR policy to a model of its own
+(`fuzz/hv/src/policymodel.rs`), over a host CPU made up an input -- which
+vendor's, the tops of its two ranges of leaves, below the policy's and
+above, and every bit of every leaf: every leaf a guest can ask answered with
+no more of the host's than the model lets through, and nothing for one it
+does not name or past the top the guest is told; every MSR the model names
+read and written as it says -- a refused write leaving the guest's state as
+it was, a taken one read back -- and every other refused both ways; and a
+table, from the manuals, of what each CPUID bit promises the guest that sees
+it, the MSR it will use or the bit of EFER it will set, which must then be
+answered. IBPB offered with PRED_CMD refused, or AutoIBRS with its EFER bit,
+is a finding at the first input. The model is written from the manuals and
+not from the policy, so a leaf, a bit or an MSR the policy comes to offer is
+a finding until the model is told of it too; nine mutants of the policy --
+the old swallowing of every MSR, every leaf passed through, the tops not
+held, a PAT of any bytes, addresses not canonical, FFXSR in EFER, an AMD
+MSR on Intel, and IBPB and AutoIBRS offered with the model told -- each
+failed within its first 1,600 inputs.
 The guests' network has three: `switch`, guests on its ports and `hv0`
 sending each other frames of every kind -- as themselves and as each other
 -- held to a model of where each must go and what each must count; `nat`,
@@ -1138,7 +1156,17 @@ the reads either way. A control run with MCE kept nowhere -- neither
 read lost MCE at the first write. Under VT-x, which does not stop a guest at CR4 yet,
 it checks only what any CPU does -- PAE cleared and bit 32 refused, CR4
 unchanged -- and says so; that branch has not been run, no Intel machine
-being at hand when it was written. The unload
+being at hand when it was written. And for `msr`, through the same loop,
+that SPEC_CTRL and PRED_CMD, which its CPUID does not offer, AMD's LS_CFG,
+which the policy names for no CPU, and MTRRs turned on, which nothing
+keeps, were each a #GP its own handler took -- in that order, with no
+error code, and in the host's count of five reads, three writes and four
+refusals; that MCG_CAP, MCG_STATUS and the PAT were answered; and that
+CPUID told it of no speculation control and no PMU, of no basic leaf past
+0x16, and of a hypervisor. Every MSR but the three segment bases comes to
+the same policy on either backend, so it says the same under VT-x. A
+control build whose policy did not name MCG_STATUS failed it, a fifth #GP
+on both CPUs it ran on. The unload
 that follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.
 
@@ -1208,7 +1236,20 @@ Linux `bzImage` by the boot protocol, runs it on a vCPU for a set time, and
 reports its serial console. The gate boots nos with a `bzImage` on its root
 filesystem and an `/etc/rc` that turns the extension on and runs `hv boot`,
 and looks in the report for the kernel's banner and the first lines of its
-early setup.
+early setup -- and for what must not be there: an "unchecked MSR access
+error", a refusal of an MSR the kernel took for there and read without
+being ready for a fault, or an "MCA architectural violation", the panic a
+refused machine-check register is. Which MSRs a kernel reads that way
+depends on its configuration and on the CPU's vendor, family and model, so
+after touching the CPUID and MSR policy run the boot with a kernel that has
+machine checks, MTRRs and PAT (`X86_MCE`, `MTRR`, `X86_PAT`, as a
+distribution's does), on TCG's `max` and with `--qemu-cpu EPYC-Rome-v1` (a
+Zen 2, family 0x17, whose kernel polls the machine-check banks at boot,
+reads AMD's NB_CFG and probes LS_CFG) and `--qemu-cpu
+Skylake-Client-v1,+svm,+npt,+nrip-save` (an Intel CPU given AMD-V, whose
+kernel reads MISC_ENABLE, the microcode revision and the platform ID) --
+TCG's `max` is an AMD family 6, which takes few of those paths. The MSRs
+the guest was refused, which it was ready for, are printed as a note.
 
 It is a **manual** gate, not in CI: a `bzImage` is megabytes and CI cannot
 build one in the time it has, so the gate is pointed at a kernel by hand.

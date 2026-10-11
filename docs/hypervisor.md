@@ -1057,22 +1057,43 @@ into guest memory: everything it writes the guest could have written itself.
 Three things stand between that entry and a running kernel, and all three are
 here:
 
-- **A CPU cut down to what is emulated** (`hv::policy`). Every CPUID is the
-  host's, masked: no XSAVE and so no AVX -- the state switch around `vmrun`
-  moves only the FXSAVE registers, so a guest is given nothing it could put
-  in the part that is not switched -- no paravirtualisation, and for a guest
-  of one CPU no local APIC and no x2APIC (one of more has an emulated
-  x2APIC: [More than one CPU](#more-than-one-cpu)). Each of its CPUs is a
-  package of one, whichever host CPU its vCPU runs on: leaf 1 says one
+- **A CPU cut down to what is emulated** (`hv::policy`), and named whole.
+  CPUID is an allow-list: a leaf the policy does not name is all zeros, as
+  is every leaf past the tops it reports -- 0x16 and 0x8000_0021, or the
+  host's if lower -- and of the leaves it names a guest is told the host's
+  bits it lets through: no XSAVE and so no AVX -- the state switch around
+  `vmrun` moves only the FXSAVE registers, so a guest is given nothing it
+  could put in the part that is not switched -- no paravirtualisation, no
+  speculation control (none has its MSR behind it yet), of the power leaf
+  ARAT alone, and for a guest of one CPU no local APIC and no x2APIC (one of
+  more has an emulated x2APIC: [More than one CPU](#more-than-one-cpu)); and
+  the hypervisor bit, since there is one, which has Linux leave the
+  microcode loader and the bare-metal chicken bits alone. Each of its CPUs
+  is a package of one, whichever host CPU its vCPU runs on: leaf 1 says one
   logical CPU, with that CPU's APIC ID -- 0 for a guest of one -- leaves 4
   and 0x80000008 one core, and the topology leaves (0xB, 0x1F, 0x8000001E),
   the SVM leaf and the memory-encryption leaf are blank. Every MSR is
-  intercepted: the system MSRs (EFER, the PAT, the segment bases, the
-  SYSCALL and SYSENTER registers) are the guest's own state and are served
-  from the VMCB save area, the x2APIC's by the local APIC of a guest that
-  has one, AMD's DE_CFG and HWCR with the bits a Linux on AMD checks set
-  as the hardware has them, and every other MSR reads zero and swallows a
-  write, which is what a guest's `rdmsr_safe` probes are ready for.
+  intercepted but the three segment bases, and every one is an allow-list's
+  too: the system MSRs (EFER, the PAT, the segment bases, the SYSCALL and
+  SYSENTER registers) are the guest's own state and are served from the
+  VMCB save area -- a PAT entry that is no memory type, an address that is
+  not canonical, an EFER bit its CPUID does not offer each a #GP, as the CPU
+  gives -- the x2APIC's by the local APIC of a guest that has one, the TSC
+  as the host's; and a few answer as a CPU with nothing behind them would,
+  each taking a write that leaves it as it is and no other: the MTRRs (none,
+  and off) and the machine-check registers (no banks, nothing to report),
+  which leaf 1 offers and Linux reads with no fallback for a fault -- a
+  fault on a machine-check register is a panic to it -- the microcode
+  revision, none, and of each vendor what Linux reads of every such CPU
+  without asking: Intel's platform ID and MISC_ENABLE, its fast strings as
+  the host has them; AMD's HWCR, DE_CFG and NB_CFG, with the bits a Linux
+  on AMD checks set as the hardware has them. Every other MSR is a #GP,
+  read or written -- what a guest's `rdmsr_safe` probes are ready for, and
+  a line in the VM's report. One a guest's user can reach is refused on
+  purpose: DEBUGCTL, whose BTF `ptrace`'s block-step sets -- Linux says so
+  once ("unchecked MSR access error") and steps by instruction instead,
+  where a write kept nowhere would have it believe it steps by branch.
+  LBR virtualization in the VMCB would let BTF work.
 - **The devices a guest cannot boot without** (`hv::devices`): the 8250
   serial port the console writes to (which raises IRQ4 for the transmitter,
   so the driver sends past its first byte); an 8254 PIT whose counter counts
@@ -2928,20 +2949,52 @@ someone else's; then speed.
    without retpolines, with neither eIBRS nor AutoIBRS turned on. Zen 2 (the
    AX41) has BTI, Retbleed and SRSO; the i5-13500, BHI and RFDS; Skylake,
    L1TF and MDS. KVM's set is the reference.
-2. **The CPUID and MSR policy is a block-list, and it swallows.** Every MSR
-   it does not name reads 0 and takes any write without a #GP -- though
-   `rdmsr`'s comment promises a `None` for one -- and every leaf it does not
-   name is the host's. Extended leaf 0x80000008 EBX goes through but for
-   two bits, so a guest on AMD is told of IBPB, IBRS, STIBP and SSBD and
-   writes PRED_CMD and SPEC_CTRL into nothing while its sysfs says it is
-   mitigated: a failure that passes in silence. On AMD newer than the AX41
-   it is worse, from Linux's source: Zen 3's INVLPGB is offered while the
-   VMCB does not enable it (a #UD in Linux 6.15's TLB flushes), and Zen 4's
-   AutoIBRS is offered while the EFER bit that turns it on is refused --
-   which Linux does not notice, and runs with neither AutoIBRS nor
-   retpolines. Fix: an allow-list for every leaf, as leaf 1 and 0x80000001
-   have; a #GP for an MSR nobody named; a speculation bit only beside the
-   MSR that makes it true.
+2. ~~**The CPUID and MSR policy is a block-list, and it swallows.**~~ Done:
+   both are allow-lists (`hv/src/policy.rs`, [A Linux
+   guest](#a-linux-guest)). A leaf the policy does not name is all zeros,
+   as is every leaf past the tops it reports, 0x16 and 0x8000_0021; of
+   leaf 6 a guest is told ARAT alone, of 0x80000008 the address widths,
+   CLZERO, the FP error pointers and two attacks the CPU is not open to, of
+   0x80000021 what is true of the silicon and asks nothing of the host. No
+   speculation control is offered -- none has its MSR behind it yet (item 1)
+   -- nor INVLPGB or AutoIBRS; the hypervisor bit is set. An MSR the policy
+   does not name is a #GP both ways; what it names is the guest's own
+   state, the TSC, or a constant that takes a write leaving it as it is and
+   refuses any other: the MTRRs off, machine checks with no banks, the
+   microcode revision none, and of each vendor what Linux reads of every
+   such CPU without asking. The guest's own state takes what the CPU would:
+   a PAT entry that is no memory type, an address that is not canonical
+   and an EFER bit the CPUID does not offer (FFXSR) are #GPs, where they were
+   a VMCB `vmrun` refused; and since NB_CFG says AMD's extended
+   configuration is on, a CONFIG_ADDRESS that names a register past 255
+   reads all ones. hv-fuzz's `policy` target holds the policy to a model
+   written from the manuals, with a table of what each CPUID bit promises:
+   nine mutants, the old swallowing and IBPB offered among them, each failed
+   within 1,600 inputs. `hv-test.py`'s `msr` guest has the run loop refuse
+   SPEC_CTRL, PRED_CMD, an MSR nobody names and MTRRs turned on, and answer
+   the machine-check registers and the PAT; a build that refused
+   MCG_STATUS failed it. `hv-linux-test.py` holds every boot's console to
+   no "unchecked MSR access error" and no "MCA architectural violation",
+   run with a guest kernel that has machine checks, MTRRs and PAT, as a
+   distribution's does, on QEMU's `max`, on a Zen 2 (`--qemu-cpu
+   EPYC-Rome-v1`) and on an Intel CPU given AMD-V (`--qemu-cpu
+   Skylake-Client-v1,+svm,+npt,+nrip-save`): the Zen 2's kernel probed
+   LS_CFG, SYSCFG and the legacy PMU and was refused each, which it was
+   ready for -- it no longer takes LS_CFG for an SSBD that wrote into
+   nothing -- and the Intel's no longer turns its fast strings off or calls
+   its microcode old; with MCG_STATUS refused, the Zen 2's guest panicked
+   at boot ("MCA architectural violation!") and the check failed. What it
+   was: every MSR the policy did not name read 0
+   and took any write without a #GP -- though `rdmsr`'s comment promised a
+   `None` for one -- and every leaf it did not name was the host's.
+   Extended leaf 0x80000008 EBX went through but for two bits, so a guest
+   on AMD was told of IBPB, IBRS, STIBP and SSBD and wrote PRED_CMD and
+   SPEC_CTRL into nothing while its sysfs said it was mitigated: a failure
+   that passes in silence. On AMD newer than the AX41 it was worse, from
+   Linux's source: Zen 3's INVLPGB was offered while the VMCB does not
+   enable it (a #UD in Linux 6.15's TLB flushes), and Zen 4's AutoIBRS was
+   offered while the EFER bit that turns it on was refused -- which Linux
+   does not notice, and ran with neither AutoIBRS nor retpolines.
 3. ~~**The guests reach the host's own TCP services.**~~ Done: a TCP
    listener and a connection belong to their device (`net/src/tcp.rs`, a
    slot's `device`) -- a listener takes a SYN only from the device it was
@@ -3017,15 +3070,18 @@ someone else's; then speed.
    start -- no SMEP, SMAP or UMIP for the guest's kernel, no FSGSBASE, ERMS
    or BMI; and on Intel no ARCH_CAPABILITIES, so Linux takes the CPU for one
    with Meltdown and isolates its page tables -- without PCID, a whole TLB
-   flush at every system call. The hypervisor bit is clear as well: the
-   guest believes it is on bare metal. First step: PCID, an allow-list for
-   leaf 7, ARCH_CAPABILITIES from the host's; then XSAVE, with XCR0
-   switched and leaf 0xD made up for it.
-2. **MSRs that read 0 and should not**, by the rule above: on Intel,
-   MISC_ENABLE without fast strings, which Linux answers by turning REP
-   MOVS's fast paths off ("Disabled fast string operations"); MTRR offered
-   but MTRRcap and the default type 0, which a Linux 6.1 (Debian 12)
-   answers by leaving PAT off -- both from Linux's source.
+   flush at every system call. (The hypervisor bit, clear until the policy
+   became an allow-list -- the guest believing it was on bare metal -- is
+   set now: [above](#before-other-peoples-guests), item 2.) First step:
+   PCID, leaf 7 opened bit by bit in the allow-list, ARCH_CAPABILITIES from
+   the host's; then XSAVE, with XCR0 switched and leaf 0xD made up for it.
+2. **MSRs that read 0 and should not.** Intel's MISC_ENABLE without fast
+   strings, which Linux answered by turning REP MOVS's fast paths off
+   ("Disabled fast string operations"), has them as the host has now.
+   Left: MTRR offered but MTRRcap and the default type 0 -- MTRRs "disabled
+   by BIOS" -- which a Linux 6.1 (Debian 12) answers by leaving PAT off,
+   from its source; a default type of write-back, written back as the guest
+   sets it, would close it, with the MTRRs kept per CPU.
 3. **Devices, smaller.** The 16550 never sets IIR's FIFO bits, so Linux
    takes it for a 16450 and writes it a byte an interrupt; the RTC never
    interrupts (status B is read-only, C always 0, IRQ 8 never raised), so
