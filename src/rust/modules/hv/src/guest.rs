@@ -15,7 +15,7 @@ use hv::linux::Header;
 use hv::run::{Counts, GuestCpu, Host, LinuxGuest, Stop, Stopped, MAX_DISKS};
 use hv::topology::Topology;
 use hv::{Doorbells, Machine};
-use kcore::consts::{MAX_CPUS, NS_PER_MS};
+use kcore::consts::{MAX_CPUS, NS_PER_MS, NS_PER_SEC};
 use kcore::sync::Mutex;
 
 use crate::disk::{FileDisk, Runner};
@@ -787,19 +787,65 @@ impl Esc {
     }
 }
 
+/// The most lines of one guest's console the kernel log takes at once, and
+/// how many a second after that: the host's log -- dmesg, its serial line,
+/// netconsole on a box with no other console -- is the host's, and a guest
+/// that prints as fast as it can would otherwise have it for its own. A
+/// boot's worth goes through whole.
+const LOG_BURST: u64 = 1000;
+const LOG_LINES_PER_SEC: u64 = 50;
+
 /// A guest's console for the kernel log, a line at a time: printable ASCII
-/// only, escape sequences left out whole, the line cut at `LOG_LINE`. Its
-/// room is taken when it is made, so a byte never allocates.
+/// only, escape sequences left out whole, the line cut at `LOG_LINE`; and
+/// no more lines than `LOG_BURST` at once and `LOG_LINES_PER_SEC` after --
+/// what is left out is counted, for the caller to say. Its room is taken
+/// when it is made, so a byte never allocates.
 pub struct LogLine {
     text: String,
     esc: Esc,
+    /// Lines the log may take now, and when they were last topped up.
+    tokens: u64,
+    topped_at: u64,
+    /// Lines left out that no notice has said yet, and when the last notice
+    /// was given: one a second at most, so that saying what was left out
+    /// does not cost the log as many lines again.
+    dropped: u64,
+    told_at: u64,
 }
 
 impl LogLine {
     pub fn new() -> Option<LogLine> {
         let mut text = String::new();
         text.try_reserve_exact(LOG_LINE).ok()?;
-        Some(LogLine { text, esc: Esc::Text })
+        let now = kcore::time::boot_time_ns();
+        Some(LogLine { text, esc: Esc::Text, tokens: LOG_BURST, topped_at: now, dropped: 0, told_at: now })
+    }
+
+    /// Whether the line that ended goes to the kernel log, at `now`: Some,
+    /// with how many lines left out the caller is to say before it -- zero
+    /// but once a second at most -- or None, and it is one more left out.
+    pub fn admit(&mut self, now: u64) -> Option<u64> {
+        let earned = now.saturating_sub(self.topped_at).saturating_mul(LOG_LINES_PER_SEC) / NS_PER_SEC;
+        if earned != 0 {
+            self.tokens = self.tokens.saturating_add(earned).min(LOG_BURST);
+            self.topped_at = now;
+        }
+        if self.tokens == 0 {
+            self.dropped += 1;
+            return None;
+        }
+        self.tokens -= 1;
+        if self.dropped == 0 || now.saturating_sub(self.told_at) < NS_PER_SEC {
+            return Some(0);
+        }
+        self.told_at = now;
+        Some(core::mem::take(&mut self.dropped))
+    }
+
+    /// The lines left out that no notice has said yet: for the caller to say
+    /// at the end.
+    pub fn take_dropped(&mut self) -> u64 {
+        core::mem::take(&mut self.dropped)
     }
 
     /// Take a byte; true when it ended a line, which `text` then holds until

@@ -416,7 +416,12 @@ impl Host for VmHost {
         if self.shared.log {
             if let Some(line) = self.line.lock().as_mut() {
                 if line.push(byte) {
-                    kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
+                    if let Some(dropped) = line.admit(kcore::time::boot_time_ns()) {
+                        if dropped != 0 {
+                            kcore::trace!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
+                        }
+                        kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
+                    }
                     line.clear();
                 }
             }
@@ -469,10 +474,16 @@ impl Host for VmHost {
 }
 
 impl VmHost {
-    /// The line of the console not yet ended, to the kernel log: at the end
-    /// of a boot.
+    /// The line of the console not yet ended, to the kernel log, and how many
+    /// were left out that no notice has said: at the end of a boot.
     fn flush_line(&self) {
-        if let Some(line) = self.line.lock().as_mut().filter(|l| !l.text().is_empty()) {
+        let mut line = self.line.lock();
+        let Some(line) = line.as_mut() else { return };
+        let dropped = line.take_dropped();
+        if dropped != 0 {
+            kcore::trace!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
+        }
+        if !line.text().is_empty() {
             kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
             line.clear();
         }

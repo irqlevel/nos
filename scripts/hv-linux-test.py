@@ -215,6 +215,22 @@ def vm_commands(args):
     claim_stop = ["hv stop %d secs=0" % (claim_vm + k) for k in (0, 3, 4)]
     claim_lines = [claim_rw, claim_rw, claim_ro, claim_stop[0],
                    claim_ro, claim_ro, claim_rw, claim_stop[1], claim_stop[2]]
+    # A guest whose console goes to nos's log, printing as fast as it can:
+    # the log takes a boot's worth and then a rate (`modules/hv/src/guest.rs`,
+    # LogLine), and says how many it left out; the guest's own console keeps
+    # all of it. dmesg's count of the lines it has pushed out is read just
+    # before the flood and just after (`flood_checks`).
+    fv = flood_vm(args)
+    flood_start = "hv start /bzImage mem=64%s initrd=/initrd log cmdline=%s" % (c, args.cmdline)
+    flood_ready = "hv exec %d secs=%d echo flood-ready" % (fv, args.vm_secs)
+    # The marker the guest prints is not the one typed, which the shell's
+    # echo would show at once: it waits for the end of the flood.
+    flood_send = r"hv send %d seq 1 %d; echo flood-$((6*7))\n" % (fv, FLOOD_LINES)
+    flood_wait = "hv wait %d secs=%d flood-42" % (fv, args.vm_secs)
+    flood_console = "hv console %d bytes=200" % fv
+    flood_stop = "hv stop %d secs=0" % fv
+    flood_lines = [flood_start, flood_ready, FLOOD_BEFORE, flood_send, flood_wait, FLOOD_AFTER,
+                   flood_console, flood_stop]
     # Where a guest's CPUs run, as hv start says: its one host CPU, or a list
     # of as many as it has.
     on = r"cpu \d+"
@@ -313,7 +329,7 @@ def vm_commands(args):
              "hv restart 2", wait_stop2, "hv list", "hv stop 2",
              start3, wait_loop, "hv list", "hv stop 3"] + acpi_lines + [
              "hv restart 0", exec_again, "hv list",
-             start_lost, restart_lost, exec_after_lost, stop_lost] + claim_lines + [
+             start_lost, restart_lost, exec_after_lost, stop_lost] + claim_lines + flood_lines + [
              "hv off", "rmmod hv", "insmod /hv.ko", "hv",
              "hv on", start_a, start_b, "hv exec 0 secs=%d id" % args.vm_secs, "hv exec 1 secs=%d id" % args.vm_secs,
              stop_all, "rmmod hv", RC_LOG]
@@ -376,6 +392,11 @@ def vm_commands(args):
          % (claim_vm + 5, CLAIMED_IMAGE, claim_vm + 3, claim_vm + 4), True),
         (claim_stop[1], 0, "the readers stopped", r"hv: vm %d stopped" % (claim_vm + 3), True),
         (claim_stop[2], 0, "both", r"hv: vm %d stopped" % (claim_vm + 4), True),
+        (flood_start, 0, "a guest whose console goes to nos's log", r"hv: vm %d started" % fv, True),
+        (flood_ready, 0, "reaches its shell", r"flood-ready", True),
+        (flood_wait, 0, "and prints %d lines as fast as it can" % FLOOD_LINES, r"flood-42", True),
+        (flood_console, 0, "its own console keeps all of them", r"(?m)^%d\s*$" % FLOOD_LINES, True),
+        (flood_stop, 0, "and it stops", r"hv: vm %d stopped" % fv, True),
         ("hv off", 0, "hv off will not pull the extension from under vm 0",
          r"hv: vm 0 is running on cpu \d+ -- hv stop it first", True),
         ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),
@@ -422,6 +443,83 @@ def rootfs(tmp, bzimage, initrd, rc):
     subprocess.run([os.path.join(HERE, "mkrootfs.sh"), image, "128", rootdir],
                    cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
     return image
+
+
+# How many lines the flooding guest prints: more than nos's log takes in a
+# boot's worth and the time the flood takes under TCG, by far.
+FLOOD_LINES = 20000
+# dmesg's count of the lines it has pushed out, read just before the flood
+# and just after: the newest line alone, through a filter it does not match.
+FLOOD_BEFORE = "dmesg 1 flood-before"
+FLOOD_AFTER = "dmesg 1 flood-after"
+# dmesg's slots (`Dmesg::MaxMsgs`, src/cpp/kernel/dmesg.h): how many more
+# lines it can have taken than its count of lines pushed out grew by.
+DMESG_SLOTS = 2048
+
+
+def flood_vm(args):
+    """The flooding guest's number: after the lost-input guest and the six
+    starts of the claim checks, each of which takes a number."""
+    return (6 if args.acpi else 4) + 1 + 6
+
+
+def lost_lines(out):
+    """dmesg's count of the lines it has pushed out, as a dmesg prints it:
+    nothing printed is none yet."""
+    m = re.search(r"dmesg: (\d+) earlier lines lost", out)
+    return int(m.group(1)) if m else 0
+
+
+def flood_checks(args, secs):
+    """What nos's log took of the flooding guest's console: fewer than half
+    its lines -- the growth of dmesg's count of the lines it pushed out over
+    the flood, and its slots on top -- and of the lines left out, a notice
+    once a second at most that says exactly how many: checked against the
+    gaps in the numbers seq printed since the notice before, over what of
+    the flood the log still holds."""
+    fv = flood_vm(args)
+    before, after = output_of(secs, FLOOD_BEFORE, 0), output_of(secs, FLOOD_AFTER, 0)
+    if not pt.check("dmesg counted its lines before the flood and after", before is not None and after is not None,
+                    "no output for %r or %r" % (FLOOD_BEFORE, FLOOD_AFTER)):
+        return
+    took = lost_lines(after) - lost_lines(before) + DMESG_SLOTS
+    pt.check("nos's log took fewer than half of the flood's %d lines" % FLOOD_LINES,
+             took < FLOOD_LINES // 2, "%d lines at most" % took)
+
+    # The log's lines from the guest, oldest first, each with its time.
+    log = output_of(secs, RC_LOG, 0) or ""
+    lines = re.findall(r"(?m)^\d+:(\d+\.\d+):.*?hvvm%d\| (.*?)\s*$" % fv, log)
+    checked, wrong, told_at, too_soon = 0, [], None, []
+    left = last = said = said_at = None
+    for (at, text) in lines:
+        notice = re.fullmatch(r"\.\.\. (\d+) lines not logged", text)
+        if notice:
+            said, said_at = int(notice.group(1)), float(at)
+        elif not text.isdigit():
+            # The shell's lines, before the flood and after: a notice is
+            # held to the gaps between two of seq's lines only -- and the
+            # one the guest's stop gives, whatever the time, to neither.
+            left = last = said = None
+        else:
+            n = int(text)
+            if last is not None and left is not None:
+                left += n - last - 1
+            if said is not None:
+                # The line the notice came before: the notice counts every
+                # line left out since the one the notice before came with.
+                if left is not None:
+                    checked += 1
+                    if left != said:
+                        wrong.append((said, left, n))
+                if told_at is not None and said_at - told_at < 1.0:
+                    too_soon.append(said_at)
+                told_at = said_at
+                left, said = 0, None
+            last = n
+    pt.check("and said how many it left out, to the line",
+             checked >= 3 and not wrong,
+             "%d notices held to seq's numbers; said, left out, before: %s" % (checked, wrong[:8]))
+    pt.check("once a second at most", checked >= 3 and not too_soon, "notices less than a second apart: %s" % too_soon[:8])
 
 
 def check_boot(args, txt):
@@ -1022,6 +1120,8 @@ def run(args):
                 continue
             found = re.search(pattern, out) is not None
             pt.check(what, found == must, out[-1500:])
+        if vm_checks:
+            flood_checks(args, secs)
     finally:
         pt.kill(p)
         if args.verbose and os.path.exists(log):
