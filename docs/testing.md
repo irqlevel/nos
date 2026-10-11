@@ -1274,7 +1274,17 @@ the writer stopped, two readers, side by side, and a writer refused under
 them -- each refusal saying whose the image is, and every refused start
 taking a number all the same, which is what the checks count on. The guests
 have no initrd and get no further than their panic, holding their disks the
-while.
+while. Then one guest started with `log`, whose console nos's log takes,
+prints twenty thousand lines as fast as it can (`seq`, the end marked by a
+line it computes, `flood-$((6*7))`, so that the shell's echo of what was
+typed is not taken for it): nos's log must take fewer than half of them --
+a boot's worth and then a rate. A dmesg is a ring that holds the newest two
+thousand lines, so what the flood put in it is read from its count of the
+lines it pushed out, before the flood and after, the ring's slots added on
+top. Of the lines left out, nos says how many once a second at most, and
+each notice must name exactly the gaps in `seq`'s numbers since the one
+before, over what of the flood the ring still holds. And the guest's own
+console must keep the last line.
 
 `--attach` is a boot of its own for `hv attach`: sshd and a guest started
 from `/etc/rc`, then an `ssh -tt ... hv attach 0` that types a line, waits

@@ -1093,8 +1093,12 @@ here:
   `sti; hlt; cli` returns to its idle loop, and out of the STI's interrupt
   shadow -- and the vCPU is not entered again until an interrupt is pending
   for it, its task asleep until the timer's next edge. It streams the
-  guest's console to the kernel log a line at a time and stops with a reason
-  and a register dump.
+  guest's console to the kernel log a line at a time -- a boot's worth, a
+  thousand lines, and then fifty a second, what it leaves out said once a
+  second at most (`... N lines not logged`), so that a guest printing as
+  fast as it can does not have the host's log, serial line and netconsole
+  for its own; the console itself, which the report and `hv console` show,
+  keeps every byte -- and stops with a reason and a register dump.
 
 And what a PC's firmware leaves a kernel, which it reads instead of asking
 a BIOS: the e820 map, an MP table for a guest of more than one CPU ([More
@@ -2990,9 +2994,20 @@ someone else's; then speed.
    or an outer hypervisor, does not allow, and only the MSR bitmap is looked
    at again: a CR8, WBINVD, I/O, external-interrupt or NMI exit gone missing
    would go unnoticed. Fix: a required set, and a guest refused without it.
-9. **A guest's console is the host's log.** `hv boot`, and `hv start ...
-   log`, put every console line into the kernel's log at level 0 with no
-   limit -- dmesg, the serial console, netconsole. Fix: a rate per VM.
+9. ~~**A guest's console is the host's log.**~~ Done: a guest's console
+   goes to the kernel log a boot's worth at once -- a thousand lines --
+   and fifty lines a second after that, per VM (`modules/hv/src/guest.rs`,
+   `LogLine::admit`); what is left out is counted, and said once a second
+   at most, before the next line logged, and when the boot ends -- a notice
+   for every line logged after a gap would have doubled the rate -- and the
+   console itself keeps every byte. `hv-linux-test.py` floods one guest's
+   console with twenty thousand lines and holds the log to fewer than half
+   of them -- by dmesg's count of the lines it pushed out, read before the
+   flood and after -- every notice to the gaps in the numbers it came
+   between, and the guest's console to all of them; on the stack before,
+   the log took all of them and said nothing. What it was: `hv boot`, and
+   `hv start ... log`, put every console line into the kernel's log at
+   level 0 with no limit -- dmesg, the serial console, netconsole.
 
 #### The CPU a guest is shown
 

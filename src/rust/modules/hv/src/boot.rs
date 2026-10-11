@@ -52,7 +52,12 @@ impl Host for BootHost {
         let mut c = self.console.lock();
         c.ring.push(byte);
         if c.line.push(byte) {
-            kcore::trace!(0, "hvguest| {}", c.line.text());
+            if let Some(dropped) = c.line.admit(kcore::time::boot_time_ns()) {
+                if dropped != 0 {
+                    kcore::trace!(0, "hvguest| ... {} lines not logged", dropped);
+                }
+                kcore::trace!(0, "hvguest| {}", c.line.text());
+            }
             c.line.clear();
         }
     }
@@ -162,7 +167,11 @@ impl Boot {
                 return;
             }
         };
-        let console = host.console.lock();
+        let mut console = host.console.lock();
+        let dropped = console.line.take_dropped();
+        if dropped != 0 {
+            kcore::trace!(0, "hvguest| ... {} lines not logged", dropped);
+        }
         if !console.line.text().is_empty() {
             kcore::trace!(0, "hvguest| {}", console.line.text());
         }
