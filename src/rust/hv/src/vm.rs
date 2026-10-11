@@ -6,7 +6,7 @@
 use core::sync::atomic::AtomicU64;
 
 use hvarch::x86::svm::vmcb::Save;
-use hvarch::x86::svm::{GuestRegs, Kick, Nested, Profile};
+use hvarch::x86::svm::{GuestRegs, Kick, Profile};
 use hvarch::{Ext, Result};
 
 use crate::machine::Machine;
@@ -46,12 +46,12 @@ pub enum Backend {
  * ten into one, but at the cost of the risk the convention names -- a reader
  * could not see what each does -- so they are written out. */
 impl Backend {
-    fn enter(&mut self, nested: Nested, host_areas: &[AtomicU64], kick: Option<&Kick>)
+    fn enter(&mut self, memory: &GuestMemory, host_areas: &[AtomicU64], kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         match self {
-            Backend::Svm(v) => v.enter(nested, host_areas, kick),
-            Backend::Vmx(v) => v.enter(nested, host_areas, kick),
+            Backend::Svm(v) => v.enter(memory, host_areas, kick),
+            Backend::Vmx(v) => v.enter(memory, host_areas, kick),
         }
     }
     pub fn save(&self) -> &Save {
@@ -138,6 +138,18 @@ impl Backend {
     pub fn cr0_write(&mut self, value: u64) {
         match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.cr0_write(value) }
     }
+    /// The CR4 the guest believes it has: under AMD-V what it last wrote,
+    /// which its reads of CR4 get ([`Exit::Cr4`]), while the register keeps
+    /// MCE; under VT-x, which does not stop a guest at CR4 yet, the register.
+    pub fn cr4(&self) -> u64 {
+        match self { Backend::Svm(v) => v.cr4(), Backend::Vmx(v) => v.save().cr4 }
+    }
+    /// Make `value` the guest's CR4, for a write of it `crate::cr` performed
+    /// -- its TLB flushed with `flush`. Only AMD-V stops a guest at a CR4
+    /// write, so there is nothing for VT-x's side to do.
+    pub fn set_cr4(&mut self, value: u64, flush: bool) {
+        match self { Backend::Svm(v) => v.set_cr4(value, flush), Backend::Vmx(_) => {} }
+    }
     pub fn inject_extint(&mut self, vector: u8) {
         match self { Backend::Svm(v) => v.inject_extint(vector), Backend::Vmx(v) => v.inject_extint(vector) }
     }
@@ -160,6 +172,22 @@ impl Backend {
     }
     pub fn inject_gp(&mut self) {
         match self { Backend::Svm(v) => v.inject_gp(), Backend::Vmx(v) => v.inject_gp() }
+    }
+    pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
+        match self { Backend::Svm(v) => v.reflect_exception(vector, error), Backend::Vmx(v) => v.reflect_exception(vector, error) }
+    }
+    /// Whether a #DB the host intercepted goes back to the guest: under
+    /// AMD-V, whose VMCB holds the DR6 the CPU wrote at the exit. VT-x writes
+    /// no DR6 at a #DB exit, and the guest's has to be put in the register
+    /// by hand before the entry -- with the pending single-step bit where a
+    /// shadow asks for it -- which is not done yet: there a #DB still stops
+    /// the VM, and says so.
+    pub fn reflects_debug(&self) -> bool {
+        matches!(self, Backend::Svm(_))
+    }
+    /// Step past an ICEBP AMD-V intercepted; VT-x has none to step past.
+    pub fn skip_icebp(&mut self) {
+        match self { Backend::Svm(v) => v.skip_icebp(), Backend::Vmx(_) => {} }
     }
     pub fn request_irq_window(&mut self) {
         match self { Backend::Svm(v) => v.request_irq_window(), Backend::Vmx(v) => v.request_irq_window() }
@@ -240,11 +268,10 @@ impl Cpu {
     pub fn enter(&mut self, memory: &GuestMemory, machine: &Machine, kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
-        let nested = memory.nested();
-        if nested.id != self.table {
+        if memory.nested().id != self.table {
             return Err(Refusal::NotItsMemory);
         }
-        self.backend.enter(nested, machine.host_areas(), kick)
+        self.backend.enter(memory, machine.host_areas(), kick)
     }
 }
 

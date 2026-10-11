@@ -12,6 +12,7 @@ use hvarch::x86::svm::vmcb::{attrib, Save, Segment};
 use hvarch::x86::svm::{GuestRegs, Kick, NotRun};
 use hvarch::{Caps, Result};
 
+use crate::memory::GuestMemory;
 use crate::svm::{Exit, Io, LongMode};
 use crate::vm::Refusal;
 
@@ -170,12 +171,20 @@ impl Vcpu {
         self.guest.mark_full_sync();
     }
 
-    /// Enter the guest and come back at its next exit, decoded. The exit is
-    /// the neutral [`Exit`]; a VM-entry the CPU refused is [`Exit::Invalid`].
-    pub fn enter(&mut self, nested: hvarch::x86::svm::Nested, host_areas: &[core::sync::atomic::AtomicU64], kick: Option<&Kick>)
+    /// Enter the guest over `memory`'s nested table and come back at its
+    /// next exit, decoded. The exit is the neutral [`Exit`]; a VM-entry the
+    /// CPU refused is [`Exit::Invalid`]. The crate's own: a table comes
+    /// only from the memory that owns every page it maps, and only
+    /// [`crate::vm::Cpu::enter`] calls this -- with the memory the CPU was
+    /// made for, which the VMCS's EPT pointer, taken at the first entry,
+    /// goes on naming.
+    pub(crate) fn enter(&mut self, memory: &GuestMemory, host_areas: &[core::sync::atomic::AtomicU64], kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
-        let cpu = match unsafe { self.guest.run(nested, host_areas, kick) } {
+        /* The table is `memory`'s, which owns every page it maps and only
+         * ever adds to it; `host_areas` never names a freed page
+         * (`crate::machine`). */
+        let cpu = match unsafe { self.guest.run(memory.nested(), host_areas, kick) } {
             Ok(cpu) => cpu,
             Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
             Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
@@ -231,7 +240,10 @@ impl Vcpu {
                     input: q & io::IN != 0,
                     string: q & io::STRING != 0,
                     rep: q & io::REP != 0,
-                    next_rip: g.save().rip + g.exit_instr_len() as u64,
+                    /* The guest's RIP plus a length: wrapped, as the CPU
+                     * wraps it, where an add that checked would be a host
+                     * panic for an `in` at the top of the address space. */
+                    next_rip: g.save().rip.wrapping_add(u64::from(g.exit_instr_len())),
                 })
             }
             r::HLT => Exit::Hlt,
@@ -240,6 +252,12 @@ impl Vcpu {
             r::RDMSR => Exit::Msr { write: false },
             r::WRMSR => Exit::Msr { write: true },
             r::VMCALL => Exit::Hypercall,
+            /* VMX's own instructions and GETSEC exit in non-root operation
+             * whatever the CPL, before the CPU checks it: a guest told it
+             * has neither is owed the #UD a CPU without them gives -- not a
+             * stop of its whole VM for a user process's `vmxoff`. */
+            r::VMCLEAR | r::VMLAUNCH | r::VMPTRLD | r::VMPTRST | r::VMREAD | r::VMRESUME | r::VMWRITE
+            | r::VMXOFF | r::VMXON | r::INVEPT | r::INVVPID | r::VMFUNC | r::GETSEC => Exit::Undefined,
             r::INTERRUPT_WINDOW => Exit::IrqWindow,
             r::CR_ACCESS => {
                 /* CR8, which is the host's; a `mov` to CR0 or an `lmsw`
@@ -579,12 +597,28 @@ impl Vcpu {
         self.guest.set_inject(vmcs::intr::VALID | vmcs::intr::TYPE_HW_EXCEPTION | VECTOR_UD, 0);
     }
 
+    /// Give the guest an exception of its own the host intercepted -- #AC
+    /// here; #DB not yet, whose DR6 VT-x does not write at the exit (its
+    /// exit qualification has it) and which goes back only with the
+    /// register put right by hand before the entry -- as the CPU would have
+    /// delivered it: the hardware exception, with its error code.
+    pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
+        let code = if error.is_some() { vmcs::intr::DELIVER_ERRCODE } else { 0 };
+        self.guest.set_inject(
+            vmcs::intr::VALID | vmcs::intr::TYPE_HW_EXCEPTION | code | u32::from(vector),
+            error.unwrap_or(0),
+        );
+    }
+
+    /// A general-protection fault on the next entry, its error code 0 --
+    /// in protected mode. A CPU in real mode pushes none (an AP between its
+    /// start-up IPI and PE), and VT-x refuses an entry that would deliver
+    /// one to a guest whose CR0.PE is clear: the guest stopped as `Invalid`
+    /// for a #GP it was owed.
     pub fn inject_gp(&mut self) {
         const VECTOR_GP: u32 = 13;
-        self.guest.set_inject(
-            vmcs::intr::VALID | vmcs::intr::TYPE_HW_EXCEPTION | vmcs::intr::DELIVER_ERRCODE | VECTOR_GP,
-            0,
-        );
+        let code = if self.guest.save().cr0 & CR0_PE != 0 { vmcs::intr::DELIVER_ERRCODE } else { 0 };
+        self.guest.set_inject(vmcs::intr::VALID | vmcs::intr::TYPE_HW_EXCEPTION | code | VECTOR_GP, 0);
     }
 
     /// Ask the CPU to exit the moment the guest can take an interrupt: VMX's

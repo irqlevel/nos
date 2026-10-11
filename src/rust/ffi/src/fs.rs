@@ -31,6 +31,13 @@ unsafe extern "C" {
     pub safe fn kernel_file_close(file: usize);
     /// Its size in bytes, or -1.
     pub safe fn kernel_file_length(file: usize) -> i64;
+    /// The mount it is on, never 0 -- or 0. With `kernel_file_key`, which
+    /// file it is.
+    pub safe fn kernel_file_mount(file: usize) -> u64;
+    /// Which file on its mount it is: its on-disk inode or, where the
+    /// filesystem keeps none, its node -- two names of one file are one --
+    /// never 0; or 0.
+    pub safe fn kernel_file_key(file: usize) -> u64;
     /// Up to cap bytes from `offset`: the count read, 0 at or past the end,
     /// or -1.
     pub fn kernel_file_pread(file: usize, offset: u64, buf: *mut u8, cap: usize) -> isize;

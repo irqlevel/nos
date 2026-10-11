@@ -373,6 +373,23 @@ impl Drop for Machine {
         /* The module is going: leave no CPU in a state the kernel did not
          * boot in. Whoever drops this has already stopped whatever was
          * running guests -- and dropped them, or a CPU stays on. */
-        self.disable(u64::MAX);
+        let left = self.disable(u64::MAX);
+        if left.busy == 0 {
+            return;
+        }
+        /* A CPU that would not go off -- a guest's VMCS still current there,
+         * which cannot be once every guest is dropped -- is in VMX operation
+         * over its page, which the CPU may write at any moment. Freed with
+         * the machine, it would be RAM the allocator hands out again while
+         * the CPU still writes it: kept for good instead -- leaked, and said
+         * so -- rather than turned into a corruption nobody sees. */
+        let mut cpus = self.cpus.lock();
+        for page in cpus.page.iter_mut() {
+            if let Some(p) = page.take() {
+                core::mem::forget(p);
+            }
+        }
+        drop(cpus);
+        kcore::trace!(0, "hv: cpu mask 0x{:x} stays in VMX operation: its pages are kept, never freed", left.busy);
     }
 }

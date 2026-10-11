@@ -64,7 +64,7 @@ use crate::mmio;
 use crate::run::{Counts, GuestCpu, Host, LinuxGuest, Stop as GuestStop, Stopped};
 use crate::smp::Doorbells;
 use crate::svm::{Exit, LongMode};
-use crate::vm::{Refusal, Vm};
+use crate::vm::{Backend, Refusal, Vm};
 
 /// COM1's port base: the serial console a guest's `console=ttyS0` writes to.
 const COM1: u16 = 0x3F8;
@@ -756,7 +756,7 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, IOAPIC_NAME].into_iter())
+        .chain([SMP_NAME, IOAPIC_NAME, DEBUG_NAME, CR4_NAME].into_iter())
 }
 
 /// Run the built-in guest `name` on the CPU this is called on -- and, for a
@@ -769,6 +769,12 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     }
     if name == IOAPIC_NAME {
         return Some(run_ioapic(machine, out));
+    }
+    if name == DEBUG_NAME {
+        return Some(run_debug(machine, out));
+    }
+    if name == CR4_NAME {
+        return Some(run_cr4(machine, out));
     }
     if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
         return Some(run_several(machine, spec, out));
@@ -1465,6 +1471,445 @@ fn check_ioapic(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioap
     }
     Ok(String::from("version 0x20's 24 pins; two edges taken, none while masked; three levels, each sent again \
                      at its EOI while the line stayed up, its remote IRR set in service and clear after"))
+}
+
+/* ---- debug: a guest's own #DB given back to it ---- */
+
+const DEBUG_NAME: &str = "debug";
+const DEBUG_ABOUT: &str = "a single step and an int1, each a #DB of the guest's own: intercepted, and given back \
+                           to its handler by the run loop rather than stopping it";
+
+/* A Linux guest's CPU, one, in long mode with an IDT of its own: TF set by
+ * POPFQ, a NOP single-stepped -- a #DB after it, DR6.BS set -- and an ICEBP
+ * (`int1`) -- a #DB after it too, no DR6 bit of its own. Its handler counts
+ * each and keeps DR6 and where it returns to, clears TF in the frame and DR6
+ * for the next, and the guest leaves its mark and halts. Assembled from
+ * this source with clang, the offsets in the comments its listing's. */
+const DEBUG_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0x52, 0x00, 0x00, 0x00,               // 00: lea rax, [rip + db] ; gate 1, #DB
+    0xBF, 0x10, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA010
+    0xE8, 0x22, 0x00, 0x00, 0x00,                           // 0c: call gate
+    0x0F, 0x01, 0x1D, 0x83, 0x00, 0x00, 0x00,               // 11: lidt [rip + idtr]
+    0x9C,                                                   // 18: pushfq
+    0x48, 0x81, 0x0C, 0x24, 0x00, 0x01, 0x00, 0x00,         // 19: or qword [rsp], 0x100 ; TF
+    0x9D,                                                   // 21: popfq ; set: the trap comes after the next
+    0x90,                                                   // 22: nop ; single-stepped: a #DB after it
+    0xF1,                                                   // 23: int1 ; a #DB, as a trap, after it
+    0xC7, 0x04, 0x25, 0x48, 0x70, 0x00, 0x00,               // 24: mov dword [0x7048], 'DBUG'
+    0x44, 0x42, 0x55, 0x47,
+    0xFA,                                                   // 2f: cli
+    0xF4,                                                   // 30: .dead: hlt
+    0xEB, 0xFD,                                             // 31: jmp .dead
+    0x66, 0x89, 0x07,                                       // 33: gate: mov word [rdi], ax ; an interrupt gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 36: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 3c: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // 42: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // 46: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // 4a: shr rax, 16
+    0x89, 0x47, 0x08,                                       // 4e: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // 51: mov dword [rdi + 12], 0
+    0xC3,                                                   // 58: ret
+    0x50,                                                   // 59: db: push rax
+    0x53,                                                   // 5a: push rbx
+    0x8B, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // 5b: mov eax, dword [0x7000] ; how many so far
+    0x83, 0xF8, 0x04,                                       // 62: cmp eax, 4
+    0x73, 0x18,                                             // 65: jae .full
+    0x0F, 0x21, 0xF3,                                       // 67: mov rbx, dr6
+    0x48, 0x89, 0x1C, 0xC5, 0x08, 0x70, 0x00, 0x00,         // 6a: mov qword [0x7008 + rax*8], rbx
+    0x48, 0x8B, 0x5C, 0x24, 0x10,                           // 72: mov rbx, qword [rsp + 16] ; where it returns to
+    0x48, 0x89, 0x1C, 0xC5, 0x28, 0x70, 0x00, 0x00,         // 77: mov qword [0x7028 + rax*8], rbx
+    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // 7f: .full: inc dword [0x7000]
+    0x48, 0x81, 0x64, 0x24, 0x20, 0xFF, 0xFE, 0xFF, 0xFF,   // 86: and qword [rsp + 32], ~0x100 ; TF off in the frame
+    0xBB, 0xF0, 0x0F, 0xFF, 0xFF,                           // 8f: mov ebx, 0xFFFF0FF0
+    0x0F, 0x23, 0xF3,                                       // 94: mov dr6, rbx ; for the next
+    0x5B,                                                   // 97: pop rbx
+    0x58,                                                   // 98: pop rax
+    0x48, 0xCF,                                             // 99: iretq
+    0x1F, 0x00,                                             // 9b: idtr: dw 0x1F ; two gates
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
+];
+
+/* What the guest leaves at `RESULTS`: the #DBs its handler took at +0, the
+ * DR6 each read at +8 on, where each returned to at +0x28 on, and 'DBUG'
+ * at +0x48 once done. */
+const DEBUG_COUNT: u64 = RESULTS;
+const DEBUG_DR6: u64 = RESULTS + 0x8;
+const DEBUG_RETURN: u64 = RESULTS + 0x28;
+const DEBUG_DONE: u64 = RESULTS + 0x48;
+const DEBUG_MARK: u32 = u32::from_le_bytes(*b"DBUG");
+/// Where each #DB returns to: after the stepped NOP, and after the ICEBP.
+const DEBUG_STEP_RETURN: u64 = ENTRY + 0x23;
+const DEBUG_ICEBP_RETURN: u64 = ENTRY + 0x24;
+/// DR6's single-step bit, and its breakpoint bits.
+const DR6_BS: u64 = 1 << 14;
+const DR6_B0_3: u64 = 0xF;
+const DEBUG_BUDGET_MS: u64 = 10_000;
+
+/// One CPU's machine for a guest run through the run loop a Linux guest's
+/// go through: `code` at `ENTRY`, in long mode, with the GDT, the TSS and
+/// the page table every guest here has, and no IDT until it loads its own.
+fn one_cpu_board(m: &GuestMemory, bsp: &mut GuestCpu, code: &[u8]) -> Result<()> {
+    let tss_low = TSS_LIMIT | (TSS & 0xFF_FFFF) << 16 | TSS_BUSY_PRESENT << 40 | (TSS >> 24 & 0xFF) << 56;
+    let tss_high = TSS >> 32;
+    for (i, entry) in [0, GDT_CODE64, GDT_DATA, tss_low, tss_high].iter().enumerate() {
+        m.write_obj(GDT + i as u64 * 8, entry)?;
+    }
+    m.write_obj(PML4, &(PDPT | PTE_P_W))?;
+    m.write_obj(PDPT, &(PD_LOW | PTE_P_W))?;
+    m.write_obj(PD_LOW, &(PTE_P_W | PTE_LARGE))?;
+    m.write(ENTRY, code)?;
+    bsp.backend_mut().long_mode(&LongMode {
+        entry: ENTRY,
+        stack: STACK,
+        cr3: PML4,
+        gdt: GDT,
+        gdt_limit: (GDT_ENTRIES * 8 - 1) as u16,
+        idt_limit: NO_IDT,
+        code_selector: 0x08,
+        data_selector: 0x10,
+        tss_selector: 0x18,
+        tss: TSS,
+    });
+    Ok(())
+}
+
+/// Run the debug guest: one CPU, through the run loop a Linux guest's go
+/// through, where a #DB of the guest's own is given back.
+fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", DEBUG_NAME, DEBUG_ABOUT);
+    let fail = |out: &mut dyn Write, why: &str| {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", DEBUG_NAME, why);
+        false
+    };
+    let Some(doorbells) = Doorbells::new(1) else { return fail(out, "out of memory") };
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 1, Arc::new(doorbells), false, false) {
+        Ok(made) => made,
+        Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
+    };
+    let Some(mut bsp) = cpus.pop() else { return fail(out, "no CPU") };
+    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, DEBUG_CODE) {
+        return fail(out, &alloc::format!("could not be made: {}", e));
+    }
+    let vmx = matches!(machine.ext(), Ok(hvarch::Ext::Vmx));
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(DEBUG_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    drop(bsp);
+    let ns = time::boot_time_ns().saturating_sub(start);
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", DEBUG_NAME, cpu);
+        return false;
+    }
+    let host = guest.cpu_states().first().and_then(|&(_, h)| h);
+    match host {
+        Some(h) => { let _ = writeln!(out, "  ran on     cpu {}, {} us", h, ns / kcore::consts::NS_PER_US); }
+        None => { let _ = writeln!(out, "  ran on     no cpu, {} us", ns / kcore::consts::NS_PER_US); }
+    }
+    let _ = writeln!(out, "  exits      {}, {} exceptions given back", counts.exits, counts.reflected);
+    let mut says = String::new();
+    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = writeln!(out, "  stopped    {}", says);
+
+    match check_debug(guest.memory(), &stopped, vmx) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", DEBUG_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", DEBUG_NAME, why);
+            let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
+            let _ = out.write_str(&stopped.dump);
+            false
+        }
+    }
+}
+
+/// Under AMD-V: both #DBs reached the guest's handler, the first with DR6.BS
+/// and after the stepped NOP, the second with no DR6 bit and after the ICEBP,
+/// and the guest ran on to its halt. Under VT-x, which gives no #DB back yet:
+/// the single step stopped the guest, after the NOP, its handler never run.
+fn check_debug(m: &GuestMemory, stopped: &Stopped, vmx: bool) -> core::result::Result<String, String> {
+    let qword = |gpa| m.read_obj::<u64>(gpa).map_err(|e| alloc::format!("its results cannot be read: {}", e));
+    let count = m.read_obj::<u32>(DEBUG_COUNT).map_err(|e| alloc::format!("its results cannot be read: {}", e))?;
+    if vmx {
+        return match stopped.stop {
+            GuestStop::Exception { vector: 1, rip } if rip == DEBUG_STEP_RETURN && count == 0 => {
+                Ok(String::from("VT-x gives no #DB back yet: the single step stopped it, after the NOP, as it \
+                                 should until it does"))
+            }
+            ref other => {
+                let mut says = String::new();
+                let _ = describe_stop(other, &mut says);
+                Err(alloc::format!("under VT-x it should have stopped at its single step; it {}, its handler run {} times",
+                                   says, count))
+            }
+        };
+    }
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(alloc::format!("it did not run to its halt: its handler ran {} times", count));
+    }
+    let done = m.read_obj::<u32>(DEBUG_DONE).map_err(|e| alloc::format!("its results cannot be read: {}", e))?;
+    if done != DEBUG_MARK || count != 2 {
+        return Err(alloc::format!("its handler ran {} times, not 2, and its mark is {:#x}", count, done));
+    }
+    let (step_dr6, step_at) = (qword(DEBUG_DR6)?, qword(DEBUG_RETURN)?);
+    if step_dr6 & DR6_BS == 0 || step_at != DEBUG_STEP_RETURN {
+        return Err(alloc::format!("the single step's #DB read DR6 {:#x} and returned to {:#x}: wanted BS, and {:#x}",
+                                  step_dr6, step_at, DEBUG_STEP_RETURN));
+    }
+    let (icebp_dr6, icebp_at) = (qword(DEBUG_DR6 + 8)?, qword(DEBUG_RETURN + 8)?);
+    if icebp_dr6 & (DR6_BS | DR6_B0_3) != 0 || icebp_at != DEBUG_ICEBP_RETURN {
+        return Err(alloc::format!("the ICEBP's #DB read DR6 {:#x} and returned to {:#x}: wanted no step or breakpoint \
+                                   bit, and {:#x}", icebp_dr6, icebp_at, DEBUG_ICEBP_RETURN));
+    }
+    Ok(String::from("both #DBs its own handler's: the single step's with DR6.BS, after the NOP; the ICEBP's with \
+                     no bit, after it -- and it ran on to its halt"))
+}
+
+/* ---- cr4: the guest's CR4 its own to read, MCE the host's to keep ---- */
+
+const CR4_NAME: &str = "cr4";
+const CR4_ABOUT: &str = "a guest's CR4: MCE cleared in what it reads back and kept in the CPU's, and a bit its CPUID \
+                         does not offer, PAE cleared in long mode and a reserved bit each a #GP";
+
+/* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #GP
+ * handler counts each, keeps its error code and steps over the 3-byte `mov`
+ * that raised it. It reads CR4; writes PAE alone, MCE cleared; then PAE and
+ * SMEP, which its CPUID does not offer; then 0, PAE cleared in long mode;
+ * then PAE and PGE through R9, read back through R13; then a bit above 31 --
+ * reading CR4 after each -- and leaves its mark and halts. Assembled from
+ * this source with clang, the offsets in the comments its listing's. */
+const CR4_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0xB5, 0x00, 0x00, 0x00,               // 00: lea rax, [rip + gp] ; gate 13, #GP
+    0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA0D0
+    0xE8, 0x85, 0x00, 0x00, 0x00,                           // 0c: call gate
+    0x0F, 0x01, 0x1D, 0xC4, 0x00, 0x00, 0x00,               // 11: lidt [rip + idtr]
+    0x0F, 0x20, 0xE0,                                       // 18: mov rax, cr4
+    0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,         // 1b: mov qword [0x7008], rax ; as it started
+    0xB8, 0x20, 0x00, 0x00, 0x00,                           // 23: mov eax, 0x20 ; PAE alone: MCE cleared
+    0x0F, 0x22, 0xE0,                                       // 28: mov cr4, rax
+    0x0F, 0x20, 0xE0,                                       // 2b: mov rax, cr4
+    0x48, 0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,         // 2e: mov qword [0x7010], rax
+    0xB8, 0x20, 0x00, 0x10, 0x00,                           // 36: mov eax, 0x100020 ; and SMEP: #GP
+    0x0F, 0x22, 0xE0,                                       // 3b: mov cr4, rax
+    0x0F, 0x20, 0xE0,                                       // 3e: mov rax, cr4
+    0x48, 0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,         // 41: mov qword [0x7018], rax
+    0x31, 0xC0,                                             // 49: xor eax, eax ; PAE cleared in long mode: #GP
+    0x0F, 0x22, 0xE0,                                       // 4b: mov cr4, rax
+    0x0F, 0x20, 0xE0,                                       // 4e: mov rax, cr4
+    0x48, 0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,         // 51: mov qword [0x7020], rax
+    0x41, 0xB9, 0xA0, 0x00, 0x00, 0x00,                     // 59: mov r9d, 0xA0 ; PAE and PGE
+    0x41, 0x0F, 0x22, 0xE1,                                 // 5f: mov cr4, r9
+    0x41, 0x0F, 0x20, 0xE5,                                 // 63: mov r13, cr4
+    0x4C, 0x89, 0x2C, 0x25, 0x28, 0x70, 0x00, 0x00,         // 67: mov qword [0x7028], r13
+    0x48, 0xB8, 0xA0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, // 6f: mov rax, 0x1000000A0 ; bit 32: #GP
+    0x0F, 0x22, 0xE0,                                       // 79: mov cr4, rax
+    0x0F, 0x20, 0xE0,                                       // 7c: mov rax, cr4
+    0x48, 0x89, 0x04, 0x25, 0x30, 0x70, 0x00, 0x00,         // 7f: mov qword [0x7030], rax
+    0xC7, 0x04, 0x25, 0x38, 0x70, 0x00, 0x00,               // 87: mov dword [0x7038], 'CR4!'
+    0x43, 0x52, 0x34, 0x21,
+    0xFA,                                                   // 92: cli
+    0xF4,                                                   // 93: .dead: hlt
+    0xEB, 0xFD,                                             // 94: jmp .dead
+    0x66, 0x89, 0x07,                                       // 96: gate: mov word [rdi], ax ; an interrupt gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // 99: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // 9f: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // a5: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // a9: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // ad: shr rax, 16
+    0x89, 0x47, 0x08,                                       // b1: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // b4: mov dword [rdi + 12], 0
+    0xC3,                                                   // bb: ret
+    0x50,                                                   // bc: gp: push rax
+    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // bd: inc dword [0x7000] ; how many
+    0x8B, 0x44, 0x24, 0x08,                                 // c4: mov eax, dword [rsp + 8] ; its error code
+    0x89, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // c8: mov dword [0x7004], eax
+    0x48, 0x83, 0x44, 0x24, 0x10, 0x03,                     // cf: add qword [rsp + 16], 3 ; past the mov
+    0x58,                                                   // d5: pop rax
+    0x48, 0x83, 0xC4, 0x08,                                 // d6: add rsp, 8 ; the error code
+    0x48, 0xCF,                                             // da: iretq
+    0xDF, 0x00,                                             // dc: idtr: dw 0xDF ; fourteen gates
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
+];
+
+/* What the guest leaves at `RESULTS`: the #GPs its handler took at +0, the
+ * last one's error code at +4, the six CR4s it read at +8 on, and 'CR4!' at
+ * +0x38 once done. */
+const CR4_GPS: u64 = RESULTS;
+const CR4_ERROR: u64 = RESULTS + 0x4;
+const CR4_READS: u64 = RESULTS + 0x8;
+const CR4_DONE: u64 = RESULTS + 0x38;
+const CR4_MARK: u32 = u32::from_le_bytes(*b"CR4!");
+/// How many CR4s it reads, how many times it writes it, and how many of the
+/// writes a CPU refuses: SMEP, PAE cleared, bit 32.
+const CR4_READ_COUNT: usize = 6;
+const CR4_WRITE_COUNT: u64 = 5;
+const CR4_REFUSED: u32 = 3;
+const CR4_BUDGET_MS: u64 = 10_000;
+/* CR4's bits as the guest has them. */
+const CR4_PAE: u64 = 1 << 5;
+const CR4_MCE: u64 = 1 << 6;
+const CR4_PGE: u64 = 1 << 7;
+
+/// Run the cr4 guest: one CPU, through the run loop a Linux guest's go
+/// through, where AMD-V stops it at every `mov` of CR4.
+fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", CR4_NAME, CR4_ABOUT);
+    let fail = |out: &mut dyn Write, why: &str| {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", CR4_NAME, why);
+        false
+    };
+    let Some(doorbells) = Doorbells::new(1) else { return fail(out, "out of memory") };
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 1, Arc::new(doorbells), false, false) {
+        Ok(made) => made,
+        Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
+    };
+    let Some(mut bsp) = cpus.pop() else { return fail(out, "no CPU") };
+    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, CR4_CODE) {
+        return fail(out, &alloc::format!("could not be made: {}", e));
+    }
+    let vmx = matches!(machine.ext(), Ok(hvarch::Ext::Vmx));
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(CR4_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    /* The CR4 the guest believes it has, the one the CPU ran it with, and
+     * whether its VMCB asked to stop its reads of CR4. */
+    let backend = bsp.backend_mut();
+    let held = Held {
+        believed: backend.cr4(),
+        register: backend.save().cr4,
+        reads_asked: matches!(&*backend, Backend::Svm(v)
+            if v.control().intercept_cr & hvarch::x86::svm::vmcb::intercept::cr::READ_CR4 != 0),
+    };
+    drop(bsp);
+    let ns = time::boot_time_ns().saturating_sub(start);
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", CR4_NAME, cpu);
+        return false;
+    }
+    let host = guest.cpu_states().first().and_then(|&(_, h)| h);
+    match host {
+        Some(h) => { let _ = writeln!(out, "  ran on     cpu {}, {} us", h, ns / kcore::consts::NS_PER_US); }
+        None => { let _ = writeln!(out, "  ran on     no cpu, {} us", ns / kcore::consts::NS_PER_US); }
+    }
+    let _ = writeln!(out, "  exits      {}, {} of CR4 performed, {} refused", counts.exits, counts.cr4, counts.cr4_gp);
+    let mut says = String::new();
+    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = writeln!(out, "  stopped    {}", says);
+
+    match check_cr4(guest.memory(), &stopped, &counts, &held, vmx) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", CR4_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", CR4_NAME, why);
+            let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
+            let _ = out.write_str(&stopped.dump);
+            false
+        }
+    }
+}
+
+/// What the host held of the cr4 guest's CPU when it stopped.
+struct Held {
+    /// The CR4 the guest believes it has.
+    believed: u64,
+    /// The CR4 the CPU ran it with.
+    register: u64,
+    /// Its VMCB asked the CPU to stop it at a read of CR4.
+    reads_asked: bool,
+}
+
+/// Whether this machine is QEMU's TCG, by its hypervisor leaf's signature:
+/// whose AMD-V checks a `mov` from any control register against CR0's read
+/// intercept, not the register's own -- its decoder adds the register's
+/// number to the exit code only when the code is not 0, and a read of CR0's
+/// is (`decode_op` in QEMU 10.2's `target/i386/tcg/decode-new.c.inc`) -- and
+/// so never stops a guest at a read of CR4. A real AMD CPU, and KVM's
+/// nested AMD-V, do.
+fn under_qemu_tcg() -> bool {
+    hvarch::x86::cpu::hypervisor_signature() == Some(*b"TCGTCGTCGTCG")
+}
+
+/// Under AMD-V: the guest read back what it wrote -- MCE cleared, then PGE
+/// set -- while the CPU's CR4 kept MCE; SMEP, which its CPUID does not
+/// offer, PAE cleared in long mode and bit 32 were each a #GP, with no
+/// error code, CR4 as it was; and every read and write was performed by the
+/// host. On QEMU's TCG, which does not stop a guest at a read of CR4 though
+/// its VMCB asks (`under_qemu_tcg`), the reads are the CPU's own, and give
+/// the register, MCE in it; the writes are the host's all the same. Under
+/// VT-x, which does not stop a guest at CR4 yet, what any CPU does: the
+/// last two refused, and it ran to its halt.
+fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, vmx: bool)
+    -> core::result::Result<String, String>
+{
+    let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let done = m.read_obj::<u32>(CR4_DONE).map_err(unread)?;
+    let gps = m.read_obj::<u32>(CR4_GPS).map_err(unread)?;
+    let error = m.read_obj::<u32>(CR4_ERROR).map_err(unread)?;
+    let mut reads = [0u64; CR4_READ_COUNT];
+    for (i, r) in reads.iter_mut().enumerate() {
+        *r = m.read_obj::<u64>(CR4_READS + 8 * i as u64).map_err(unread)?;
+    }
+    if done != CR4_MARK {
+        return Err(alloc::format!("its mark is {:#x}", done));
+    }
+    if vmx {
+        /* PAE cleared in long mode, and bit 32: refused by any CPU, CR4 as
+         * it was. SMEP is the host's to have or not. */
+        if gps < 2 || reads[3] != reads[2] || reads[5] != reads[4] {
+            return Err(alloc::format!("its #GPs were {} and it read CR4 {:#x?}: wanted PAE cleared and bit 32 \
+                                       refused, CR4 unchanged by each", gps, reads));
+        }
+        return Ok(String::from("VT-x does not stop a guest at CR4 yet: the CPU took every write itself -- PAE \
+                                cleared in long mode and bit 32 refused -- and keeps no MCE for the host"));
+    }
+    if !held.reads_asked {
+        return Err(String::from("its VMCB does not ask to stop it at a read of CR4"));
+    }
+    /* What it reads: the CR4 it wrote, its reads stopped and answered by the
+     * host -- or on QEMU's TCG, the register's, MCE in it. */
+    let tcg = under_qemu_tcg();
+    let (want, performed) = if tcg {
+        ([CR4_PAE | CR4_MCE, CR4_PAE | CR4_MCE, CR4_PAE | CR4_MCE, CR4_PAE | CR4_MCE,
+          CR4_PAE | CR4_PGE | CR4_MCE, CR4_PAE | CR4_PGE | CR4_MCE], CR4_WRITE_COUNT)
+    } else {
+        ([CR4_PAE | CR4_MCE, CR4_PAE, CR4_PAE, CR4_PAE, CR4_PAE | CR4_PGE, CR4_PAE | CR4_PGE],
+         CR4_READ_COUNT as u64 + CR4_WRITE_COUNT)
+    };
+    if reads != want {
+        return Err(alloc::format!("it read CR4 {:#x?}, not {:#x?}{}", reads, want,
+                                  if tcg { ", the register's on QEMU's TCG" } else { "" }));
+    }
+    if gps != CR4_REFUSED || error != 0 {
+        return Err(alloc::format!("its #GPs were {}, the last's error code {:#x}: wanted {} and 0", gps, error,
+                                  CR4_REFUSED));
+    }
+    if held.believed != CR4_PAE | CR4_PGE || held.register != CR4_PAE | CR4_PGE | CR4_MCE {
+        return Err(alloc::format!("it believes CR4 is {:#x} and the CPU ran it with {:#x}: wanted {:#x}, and that \
+                                   with MCE", held.believed, held.register, CR4_PAE | CR4_PGE));
+    }
+    if counts.cr4 != performed || counts.cr4_gp != u64::from(CR4_REFUSED) {
+        return Err(alloc::format!("the host performed {} of its CR4 accesses and refused {}: wanted {} and {}",
+                                  counts.cr4, counts.cr4_gp, performed, CR4_REFUSED));
+    }
+    let writes = "while the CPU's CR4 kept MCE; SMEP, PAE cleared and bit 32 each a #GP, CR4 as it was";
+    Ok(if tcg {
+        alloc::format!("its writes the host's, MCE cleared in the CR4 the host keeps for it, {} -- its reads the \
+                        CPU's own, QEMU's TCG not stopping a read of CR4 though the VMCB asks", writes)
+    } else {
+        alloc::format!("it read back what it wrote, MCE cleared and then PGE set, {}", writes)
+    })
 }
 
 /* The guests' machine: 1 MiB of memory with a GDT, a TSS and a page table

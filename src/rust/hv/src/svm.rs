@@ -13,6 +13,7 @@ use hvarch::x86::svm::vmcb::{self, attrib, Segment};
 use hvarch::x86::svm::{self as arch, Guest, GuestRegs, Kick, NotRun, Permissions};
 use hvarch::{Caps, Result};
 
+use crate::memory::GuestMemory;
 use crate::vm::Refusal;
 
 /* Control register and EFER bits a guest's starting state is made of. */
@@ -55,6 +56,7 @@ const LEN_CPUID: u64 = 2;
 const LEN_MSR: u64 = 2;
 const LEN_VMMCALL: u64 = 3;
 const LEN_WBINVD: u64 = 2;
+const LEN_ICEBP: u64 = 1;
 /// PAUSE is `F3 90`, REP NOP.
 const LEN_PAUSE: u64 = 2;
 /// With the pause filter, how many PAUSEs in a row a guest runs before its
@@ -122,10 +124,18 @@ pub enum Exit {
     /// register named, or for `lmsw` its low four bits over CR0's). AMD-V
     /// intercepts no CR0 write, and never exits for one.
     Cr0Write { value: u64 },
+    /// A `mov` to (`write`) or from CR4, which AMD-V stops a guest at every
+    /// time: so that the CR4 it runs with keeps MCE, and it reads back the
+    /// one it wrote (`crate::cr`). VT-x does not stop a guest here yet.
+    Cr4 { write: bool },
     /// PAUSE -- the guest spin-waiting: stopped so that whatever it waits
     /// for that the host hands over, a timer's tick above all, is handed
     /// over now rather than at the host's next interrupt.
     Pause,
+    /// An instruction of a virtualization extension's own -- VMX's or
+    /// SVM's -- or GETSEC, which CPUID tells the guest it has not got and a
+    /// CPU without them faults #UD on: what the guest is given.
+    Undefined,
     Other(u64),
 }
 
@@ -210,6 +220,10 @@ pub struct Vcpu {
     /// once the guest is past it, at an exit where RIP is elsewhere -- the
     /// intercept comes before the instruction runs.
     iret_at: Option<u64>,
+    /// The CR4 the guest believes it has: what it last wrote, or started
+    /// with. The VMCB's -- the one it runs with -- is this with MCE, which
+    /// `hvarch` keeps there; the guest's reads of CR4 are answered from this.
+    cr4: u64,
 }
 
 /// What a long-mode guest starts from: its page table, a GDT whose entries
@@ -260,23 +274,30 @@ impl Vcpu {
         c.intercept_misc2 = misc2::VMMCALL | misc2::RDTSCP | misc2::ICEBP | misc2::WBINVD
             | misc2::MONITOR | misc2::MWAIT | misc2::MWAIT_ARMED | misc2::XSETBV | misc2::RDPRU;
         c.intercept_exceptions = exceptions;
+        /* CR4: its writes, which `hvarch` intercepts whatever this asks, and
+         * its reads, which the guest's own CR4 answers (`crate::cr`). */
+        c.intercept_cr = vmcb::intercept::cr::READ_CR4 | vmcb::intercept::cr::WRITE_CR4;
         /* No ASID: each entry is given one by the CPU it is on
          * (`Guest::run`). */
-        Ok(Self { guest, perms: Permissions::new()?, nrip, nmi_masked: false, iret_at: None })
+        Ok(Self { guest, perms: Permissions::new()?, nrip, nmi_masked: false, iret_at: None, cr4: 0 })
     }
 
-    /// Enter the guest and come back at its next exit, decoded -- the whole
-    /// of what an entry is: the VMCB checked before the CPU sees it, the
-    /// world switch, the event an exit interrupted put back, and the exit
-    /// read out. A VMCB a rule refuses is [`Refusal::Vmcb`], naming it.
-    pub fn enter(&mut self, nested: arch::Nested, host_areas: &[AtomicU64], kick: Option<&Kick>)
+    /// Enter the guest over `memory`'s nested table and come back at its
+    /// next exit, decoded -- the whole of what an entry is: the VMCB checked
+    /// before the CPU sees it, the world switch, the event an exit
+    /// interrupted put back, and the exit read out. A VMCB a rule refuses is
+    /// [`Refusal::Vmcb`], naming it. The crate's own: a table comes only from
+    /// the memory that owns every page it maps, and only
+    /// [`crate::vm::Cpu::enter`] calls this, with the memory the CPU was
+    /// made for.
+    pub(crate) fn enter(&mut self, memory: &GuestMemory, host_areas: &[AtomicU64], kick: Option<&Kick>)
         -> core::result::Result<(Exit, u32), Refusal>
     {
         self.check().map_err(Refusal::Vmcb)?;
-        /* The nested table maps nothing but this guest's own pages and only
-         * grows (`crate::memory`); `host_areas` never names a freed page
-         * (`crate::machine`). */
-        let cpu = match unsafe { self.guest.run(&self.perms, nested, host_areas, kick) } {
+        /* The nested table is `memory`'s: it maps nothing but that guest's
+         * own pages and only grows (`crate::memory`); `host_areas` never
+         * names a freed page (`crate::machine`). */
+        let cpu = match unsafe { self.guest.run(&self.perms, memory.nested(), host_areas, kick) } {
             Ok(cpu) => cpu,
             Err(NotRun::Kicked { cpu }) => return Ok((Exit::Kicked, cpu)),
             Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
@@ -367,6 +388,9 @@ impl Vcpu {
             limit: flat,
             base: 0,
         };
+        /* MCE, as every kernel sets it -- and the VMCB's has it whatever the
+         * guest does with it later (`hvarch`). */
+        self.cr4 = CR4_PAE | CR4_MCE;
         let s = self.save_mut();
         s.cs = code;
         s.ds = data;
@@ -387,9 +411,6 @@ impl Vcpu {
         s.efer = EFER_SVME | EFER_LME | EFER_LMA;
         s.cr0 = CR0_PE | CR0_MP | CR0_ET | CR0_NE | CR0_WP | CR0_PG;
         s.cr3 = l.cr3;
-        /* MCE, as every kernel sets it: with it clear, a machine check
-         * while the guest runs is a shutdown, and would be reported as the
-         * guest's triple fault. */
         s.cr4 = CR4_PAE | CR4_MCE;
         s.dr6 = DR6_RESET;
         s.dr7 = DR7_RESET;
@@ -408,9 +429,29 @@ impl Vcpu {
     /// what it translated before its reset is nothing it may use now.
     pub fn start_at_sipi(&mut self, vector: u8) {
         real_mode(self.save_mut(), vector, EFER_SVME);
+        /* CR4 0, as reset leaves it -- the guest's; the VMCB's keeps MCE. */
+        self.cr4 = 0;
+        self.save_mut().cr4 = CR4_MCE;
         *self.regs_mut() = reset_regs();
         self.init_reset();
         self.guest.forget_asid();
+    }
+
+    /// The CR4 the guest believes it has, which its reads of CR4 get.
+    pub fn cr4(&self) -> u64 {
+        self.cr4
+    }
+
+    /// Make `value` the guest's CR4, from a write of it performed for the
+    /// guest (`crate::cr`): what its reads get from now on, and with MCE the
+    /// CR4 it runs with; with `flush`, its TLB flushed -- the next entry is
+    /// under a fresh ASID -- as the CPU flushes it for the bits that changed.
+    pub fn set_cr4(&mut self, value: u64, flush: bool) {
+        self.cr4 = value;
+        self.save_mut().cr4 = value | CR4_MCE;
+        if flush {
+            self.guest.forget_asid();
+        }
     }
 
     /// What INIT clears beside the registers: an event waiting to be
@@ -463,6 +504,8 @@ impl Vcpu {
         let c = self.control();
         match c.exit_code {
             vmcb::exit::INTR | vmcb::exit::NMI | vmcb::exit::SMI | vmcb::exit::INIT => Exit::Host,
+            vmcb::exit::CR4_READ => Exit::Cr4 { write: false },
+            vmcb::exit::CR4_WRITE => Exit::Cr4 { write: true },
             vmcb::exit::IOIO => {
                 let info = c.exit_info1;
                 use vmcb::ioio;
@@ -487,6 +530,10 @@ impl Vcpu {
             vmcb::exit::CPUID => Exit::Cpuid,
             vmcb::exit::MSR => Exit::Msr { write: c.exit_info1 & 1 != 0 },
             vmcb::exit::VMMCALL => Exit::Hypercall,
+            /* SVM's own instructions, intercepted for the host: a guest
+             * told it has no SVM is owed the #UD a CPU without it gives. */
+            vmcb::exit::VMRUN | vmcb::exit::VMLOAD | vmcb::exit::VMSAVE | vmcb::exit::STGI
+            | vmcb::exit::CLGI | vmcb::exit::SKINIT | vmcb::exit::INVLPGA => Exit::Undefined,
             vmcb::exit::VINTR => Exit::IrqWindow,
             vmcb::exit::NPF => Exit::NestedFault { gpa: c.exit_info2, error: c.exit_info1 },
             vmcb::exit::SHUTDOWN => Exit::Shutdown,
@@ -595,6 +642,23 @@ impl Vcpu {
         self.skip(LEN_WBINVD);
     }
 
+    /// Step past an ICEBP (`int1`), intercepted: the #DB it raises, which
+    /// the run loop gives the guest next, is a trap's, delivered after it.
+    pub fn skip_icebp(&mut self) {
+        self.skip(LEN_ICEBP);
+    }
+
+    /// Give the guest an exception of its own the host intercepted -- #DB,
+    /// #AC, intercepted always for the delivery loops a guest could make of
+    /// them -- as the CPU would have delivered it: the hardware exception,
+    /// with its error code when it has one. A #DB's DR6 the CPU wrote into
+    /// the VMCB as it took the exit, and it goes back in from there.
+    pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
+        use vmcb::event;
+        let code = error.map_or(0, |e| event::ERROR_VALID | (u64::from(e) << event::ERROR_SHIFT));
+        self.guest.vmcb_mut().control.event_inj = event::VALID | event::TYPE_EXCEPTION | code | u64::from(vector);
+    }
+
     /// Whether an event is queued for injection on the next entry -- one
     /// given back from `exit_int_info` by [`requeue_event`](Self::requeue_event),
     /// or one the policy injected. A vCPU with one has somewhere to go, halted
@@ -659,14 +723,16 @@ impl Vcpu {
 
     /// Inject a general-protection fault into the guest on the next entry:
     /// what a real CPU raises for a reserved MSR or an instruction the guest
-    /// may not run. `#GP` pushes an error code, 0 here. The guest's RIP is
-    /// left where it faulted, not stepped past -- the faulting instruction
-    /// did not complete.
+    /// may not run. `#GP` pushes an error code, 0 here -- in protected mode;
+    /// in real mode (an AP between its start-up IPI and PE) a CPU pushes
+    /// none, and a handler there would take the word for its return
+    /// address. The guest's RIP is left where it faulted, not stepped past
+    /// -- the faulting instruction did not complete.
     pub fn inject_gp(&mut self) {
         use vmcb::event;
         const VECTOR_GP: u64 = 13;
-        self.guest.vmcb_mut().control.event_inj =
-            event::VALID | event::TYPE_EXCEPTION | event::ERROR_VALID | VECTOR_GP;
+        let code = if self.guest.vmcb().save.cr0 & CR0_PE != 0 { event::ERROR_VALID } else { 0 };
+        self.guest.vmcb_mut().control.event_inj = event::VALID | event::TYPE_EXCEPTION | code | VECTOR_GP;
     }
 
     /// What `vmrun` would refuse this VMCB for, if anything -- the checks of

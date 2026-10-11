@@ -113,6 +113,13 @@ pub const SECTOR: u64 = 512;
 /// ring this size holds three of the largest at once -- and the device has
 /// one on its way back while the backend serves the next.
 const QUEUE_SIZE: u16 = 256;
+/// The most chains taken off the queue in one pass: a queue's worth, all a
+/// driver can have available at once. A request answered here -- a GET_ID,
+/// one past the disk -- takes no buffer, so running out of buffers does not
+/// end a pass of them; unbounded, a guest that kept the ring topped up with
+/// such requests from a second CPU held the CPU running the pass in the host
+/// for good (hv-fuzz's racing CPU). What is left is the next round's.
+const PASS: usize = QUEUE_SIZE as usize;
 
 /// Features: a limit on a segment's size and on the segments a request may
 /// have, flush, and a disk that is read-only.
@@ -189,6 +196,9 @@ pub struct Blk {
     /// A chain may be waiting on the ring for a slot: the device looks again
     /// when a buffer comes back.
     waiting: bool,
+    /// A pass ended at its bound, with chains perhaps still on the ring: the
+    /// next round goes on with them.
+    more: bool,
     id: [u8; ID_BYTES],
     /// Set when the driver made a ring this device will not follow: no more
     /// requests are taken until it resets the device.
@@ -222,6 +232,7 @@ impl Blk {
             backend,
             slots,
             waiting: false,
+            more: false,
             id: name,
             broken: None,
             stats: Stats::default(),
@@ -311,6 +322,7 @@ impl Blk {
                     s.head = None;
                 }
                 self.waiting = false;
+                self.more = false;
                 self.broken = None;
                 Raise::default()
             }
@@ -320,9 +332,10 @@ impl Blk {
 
     /// What the backend has served, given back to the guest -- a read's data
     /// into its buffers, the status, the chain on the used ring -- and what
-    /// waited on the ring for a buffer, taken now there is one -- and the
-    /// interrupts that leaves the device with. Every time round the run
-    /// loop, so it costs next to nothing when there is nothing.
+    /// waited on the ring for a buffer, taken now there is one, or what a
+    /// pass left at its bound -- and the interrupts that leaves the device
+    /// with. Every time round the run loop, so it costs next to nothing when
+    /// there is nothing.
     pub fn poll(&mut self, mem: &GuestMemory) -> Raise {
         let mut answered = false;
         let mut back = false;
@@ -330,7 +343,7 @@ impl Blk {
             back = true;
             answered |= self.complete(mem, req);
         }
-        if back && self.waiting {
+        if self.more || (back && self.waiting) {
             answered |= self.fill(mem);
         }
         if answered { self.interrupt(mem) } else { Raise::default() }
@@ -344,13 +357,20 @@ impl Blk {
     }
 
     /// Take what the driver has made available, while there is a buffer for
-    /// it: each request handed to the backend, or -- when there is nothing
-    /// for the backend to do -- answered at once. True when something was
-    /// given back.
+    /// it and a pass's worth at most: each request handed to the backend, or
+    /// -- when there is nothing for the backend to do -- answered at once.
+    /// True when something was given back.
     fn fill(&mut self, mem: &GuestMemory) -> bool {
         self.waiting = false;
+        self.more = false;
         let mut answered = false;
+        let mut left = PASS;
         while self.broken.is_none() {
+            if left == 0 {
+                self.more = true;
+                break;
+            }
+            left -= 1;
             let Some(slot) = self.slots.iter().position(|s| s.head.is_none() && s.buf.is_some()) else {
                 /* Every buffer is with the backend: the rest waits on the
                  * ring until one comes back. */

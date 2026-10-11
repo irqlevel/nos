@@ -70,6 +70,8 @@ pub mod memory;
 pub mod devices;
 #[path = "../../../src/rust/hv/src/acpi.rs"]
 pub mod acpi;
+#[path = "../../../src/rust/hv/src/cr.rs"]
+pub mod cr;
 /// The guests' DHCP server, from the module: what a guest's DHCP client's
 /// frames reach.
 #[path = "../../../src/rust/modules/hv/src/dhcp.rs"]

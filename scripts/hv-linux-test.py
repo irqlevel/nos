@@ -116,6 +116,9 @@ ACPI_NEVER = [
 ]
 
 DEFAULT_CMDLINE = "earlyprintk=serial,ttyS0,115200 console=ttyS0 nolapic no_timer_check"
+# The image two guests' disks claim at once, on nos's root.
+CLAIMED_IMAGE = "claimed.img"
+CLAIMED_BYTES = 1 << 20
 # A guest of more than one CPU needs its local APIC: the same, without
 # nolapic. (The loader adds noapic itself: the machine has no IO-APIC.)
 # nos's own CPUs: two cores of two threads each, so that where a guest's CPUs
@@ -189,6 +192,29 @@ def vm_commands(args):
     start3 = "hv start /bzImage mem=64%s restart cmdline=%s panic=1" % (c, args.cmdline)
     wait_loop = "hv wait 3 secs=500 nos-never-printed-3"
     exec_again = "hv exec 0 secs=%d id" % args.vm_secs
+    # A guest whose `input=` its first boot never reads: held until its
+    # shell's first prompt, and restarted before that -- so the boot after
+    # throws it away unfed, every time -- and then a line typed at it must be
+    # answered all the same. (`hv exec` once waited for good on any line
+    # after input a boot had thrown away.) Its number follows the guests
+    # before it, two more with --acpi.
+    lost_vm = 6 if args.acpi else 4
+    start_lost = "hv start /bzImage mem=64%s initrd=/initrd input=id\\n cmdline=%s" % (c, args.cmdline)
+    restart_lost = "hv restart %d" % lost_vm
+    exec_after_lost = "hv exec %d secs=%d echo nos-after-lost" % (lost_vm, args.vm_secs)
+    stop_lost = "hv stop %d" % lost_vm
+    # One image under two guests' disks: a writer has it alone, readers
+    # share it -- among the VMs; nos's own shell is not held to it. The
+    # guests have no initrd and get no further than their panic, holding
+    # their disks the while (`panic=0`: a `--cmdline` that reboots on one
+    # would take the claim away); a start refused still takes a number.
+    # Stopped without the button, which a panicked guest does not hear.
+    claim_vm = lost_vm + 1
+    claim_rw = "hv start /bzImage mem=64%s disk=/%s cmdline=%s panic=0" % (c, CLAIMED_IMAGE, args.cmdline)
+    claim_ro = "hv start /bzImage mem=64%s disk=/%s:ro cmdline=%s panic=0" % (c, CLAIMED_IMAGE, args.cmdline)
+    claim_stop = ["hv stop %d secs=0" % (claim_vm + k) for k in (0, 3, 4)]
+    claim_lines = [claim_rw, claim_rw, claim_ro, claim_stop[0],
+                   claim_ro, claim_ro, claim_rw, claim_stop[1], claim_stop[2]]
     # Where a guest's CPUs run, as hv start says: its one host CPU, or a list
     # of as many as it has.
     on = r"cpu \d+"
@@ -287,6 +313,7 @@ def vm_commands(args):
              "hv restart 2", wait_stop2, "hv list", "hv stop 2",
              start3, wait_loop, "hv list", "hv stop 3"] + acpi_lines + [
              "hv restart 0", exec_again, "hv list",
+             start_lost, restart_lost, exec_after_lost, stop_lost] + claim_lines + [
              "hv off", "rmmod hv", "insmod /hv.ko", "hv",
              "hv on", start_a, start_b, "hv exec 0 secs=%d id" % args.vm_secs, "hv exec 1 secs=%d id" % args.vm_secs,
              stop_all, "rmmod hv", RC_LOG]
@@ -325,6 +352,30 @@ def vm_commands(args):
         ("hv restart 0", 0, "hv restart resets the running guest", r"hv: vm 0 restarted", True),
         (exec_again, 0, "and its new boot answers a line typed during it", r"# id\nuid=0 gid=0\n", True),
         ("hv list", 5, "running again, one restart counted", r"vm 0  running .* restarts 1 ", True),
+        (start_lost, 0, "a guest started with input for its first prompt", r"hv: vm %d started" % lost_vm, True),
+        (restart_lost, 0, "restarted before that prompt, the input thrown away unread",
+         r"hv: vm %d restarted" % lost_vm, True),
+        (exec_after_lost, 0, "a line typed after a boot threw input away is answered all the same",
+         r"(?m)^nos-after-lost$", True),
+        # The guest runs the line either way: what broke was `hv exec`, which
+        # waited its whole time for a feed that never came and then said the
+        # line was not read -- under its answer, which the check above finds.
+        (exec_after_lost, 0, "... at its prompt, not after waiting out its time",
+         r"hv: vm %d: " % lost_vm, False),
+        (stop_lost, 0, "and it stops", r"hv: vm %d stopped" % lost_vm, True),
+        (claim_rw, 0, "a guest's disk on an image", r"hv: vm %d started" % claim_vm, True),
+        (claim_rw, 1, "a second guest's disk writing it is refused, saying whose it is",
+         r"hv: vm %d not started -- /%s: vm %d's disk writes it" % (claim_vm + 1, CLAIMED_IMAGE, claim_vm), True),
+        (claim_ro, 0, "and one reading it too",
+         r"hv: vm %d not started -- /%s: vm %d's disk writes it" % (claim_vm + 2, CLAIMED_IMAGE, claim_vm), True),
+        (claim_stop[0], 0, "the writer stopped, its claim goes with it", r"hv: vm %d stopped" % claim_vm, True),
+        (claim_ro, 1, "then a guest reading it", r"hv: vm %d started" % (claim_vm + 3), True),
+        (claim_ro, 2, "and another beside it: readers share it", r"hv: vm %d started" % (claim_vm + 4), True),
+        (claim_rw, 2, "but none writes it under them",
+         r"hv: vm %d not started -- /%s: vm (%d|%d)'s disk reads it, and this one would write it"
+         % (claim_vm + 5, CLAIMED_IMAGE, claim_vm + 3, claim_vm + 4), True),
+        (claim_stop[1], 0, "the readers stopped", r"hv: vm %d stopped" % (claim_vm + 3), True),
+        (claim_stop[2], 0, "both", r"hv: vm %d stopped" % (claim_vm + 4), True),
         ("hv off", 0, "hv off will not pull the extension from under vm 0",
          r"hv: vm 0 is running on cpu \d+ -- hv stop it first", True),
         ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),
@@ -360,6 +411,9 @@ def rootfs(tmp, bzimage, initrd, rc):
     shutil.copy(bzimage, os.path.join(rootdir, "bzImage"))
     if initrd:
         shutil.copy(initrd, os.path.join(rootdir, "initrd"))
+    # An image for two guests' disks to claim at once (`vm_commands`).
+    with open(os.path.join(rootdir, CLAIMED_IMAGE), "wb") as f:
+        f.truncate(CLAIMED_BYTES)
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
         f.write("# scripts/hv-linux-test.py\n" + "\n".join(rc) + "\n")
 
@@ -741,7 +795,17 @@ def network(args):
                # second's httpd.)
                x(0, "ip addr add 10.0.100.3/32 dev eth0 && arping -c 2 -w 3 -I eth0 -s 10.0.100.3 10.0.100.1; "
                     "ping -c 2 -W 2 -I 10.0.100.3 10.0.100.1; ip addr del 10.0.100.3/32 dev eth0; echo claimed"),
-               "hv list"]
+               "hv list",
+               # A VM stopped takes its forwards with it, and NAT forgets
+               # its address's flows -- the next VM to claim its port has its
+               # MAC and address, and must be neither relayed to for it nor
+               # answered for it. vm 0's flows above are in NAT's table still,
+               # closing or not; vm 1's forward, which the fetch from outside
+               # uses after all of this, stays.
+               "hv forward add 8081 0 80",
+               "hv stop 0",
+               "hv forward",
+               "nat"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -833,6 +897,13 @@ def network(args):
         pt.check("hv list counts what the switch stopped against the guest that sent it, and only that guest",
                  spoofed is not None and int(spoofed.group(1)) >= 4
                  and vm1 is not None and "as another" not in vm1.group(0), way(16)[-800:])
+        pt.check("a forward to vm 0 is added", "port 8081 forwarded to vm 0, 10.0.100.2:80" in way(17), way(17))
+        pt.check("hv stop takes the stopped VM's forward away with it",
+                 "its 1 forward(s) taken away with it" in way(18), way(18)[-600:])
+        pt.check("hv forward no longer lists it, and still lists the other VM's",
+                 "port 8081" not in way(19) and "port 8080 -> vm 1" in way(19), way(19))
+        pt.check("NAT keeps no mapping of the stopped VM's address",
+                 "nat: on" in way(20) and "10.0.100.2:" not in way(20), way(20)[-800:])
     finally:
         server.shutdown()
         pt.kill(p)

@@ -51,15 +51,80 @@ impl Region {
     }
 }
 
+/// Another CPU of the guest's, keeping a ring topped up while a device takes
+/// from it -- by plain writes to memory, with no exit to stop it: each time
+/// the device reads the available index, one more chain is published, the
+/// chain at `head` again, while the used index says the ring has room for
+/// it. A device that follows that for as long as it goes on holds its CPU in
+/// the host for good, and the racer says so after `left` posts.
+struct Racer {
+    /// The available ring's index, and its first entry.
+    idx: u64,
+    ring: u64,
+    /// The used ring's index: what the device has given back.
+    used: u64,
+    size: u16,
+    head: u16,
+    posts: usize,
+    left: usize,
+}
+
 pub struct GuestMemory {
     regions: Vec<Region>,
     pages: Mutex<Pages>,
     absent: Mutex<Vec<u64>>,
+    racer: Mutex<Option<Racer>>,
 }
 
 impl GuestMemory {
     pub fn new(_vendor: Vendor) -> Result<GuestMemory> {
-        Ok(GuestMemory { regions: Vec::new(), pages: Mutex::new(Pages::default()), absent: Mutex::new(Vec::new()) })
+        Ok(GuestMemory {
+            regions: Vec::new(),
+            pages: Mutex::new(Pages::default()),
+            absent: Mutex::new(Vec::new()),
+            racer: Mutex::new(None),
+        })
+    }
+
+    /// Race the device on the ring whose available index is at `idx`, its
+    /// entries from `ring` and its used index at `used`, posting `head`
+    /// again and again (`Racer`), `most` times at most -- until `stop_race`.
+    pub fn race(&self, idx: u64, ring: u64, used: u64, size: u16, head: u16, most: usize) {
+        *self.racer.lock().unwrap() = Some(Racer { idx, ring, used, size, head, posts: 0, left: most });
+    }
+
+    /// The race over: how many chains the racer posted.
+    pub fn stop_race(&self) -> usize {
+        self.racer.lock().unwrap().take().map_or(0, |r| r.posts)
+    }
+
+    /// A read the device made, as the racer sees it: one of the available
+    /// index has it publish the next chain, when the ring has room for one.
+    fn race_after_read(&self, gpa: u64, len: usize) {
+        let mut racer = self.racer.lock().unwrap();
+        let Some(r) = racer.as_mut() else { return };
+        if !(gpa < r.idx.saturating_add(2) && r.idx < gpa.saturating_add(len as u64)) {
+            return;
+        }
+        let mut b = [0u8; 2];
+        if self.read_unraced(r.idx, &mut b).is_err() {
+            return;
+        }
+        let idx = u16::from_le_bytes(b);
+        if self.read_unraced(r.used, &mut b).is_err() {
+            return;
+        }
+        if idx.wrapping_sub(u16::from_le_bytes(b)) >= r.size {
+            return;
+        }
+        invariant!(r.left > 0,
+                   "a device took {} chains in one call while another CPU kept its ring topped up: a pass with no end",
+                   r.posts);
+        r.left -= 1;
+        r.posts += 1;
+        let slot = u64::from(idx % r.size);
+        let _ = self.write(r.ring + 2 * slot, &r.head.to_le_bytes());
+        let _ = self.write(r.idx, &idx.wrapping_add(1).to_le_bytes());
     }
 
     /// `size` bytes from 0: what the device targets run over.
@@ -93,6 +158,12 @@ impl GuestMemory {
     }
 
     pub fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<()> {
+        self.read_unraced(gpa, buf)?;
+        self.race_after_read(gpa, buf.len());
+        Ok(())
+    }
+
+    fn read_unraced(&self, gpa: u64, buf: &mut [u8]) -> Result<()> {
         self.inside(gpa, buf.len())?;
         let pages = self.pages.lock().unwrap();
         let mut done = 0usize;
@@ -122,6 +193,24 @@ impl GuestMemory {
             done += n;
         }
         Ok(())
+    }
+
+    /// A word read whole, as the real one reads it (one access); refused at
+    /// an odd address, as there. Through `read`, so a racer sees it.
+    pub fn read_u16(&self, gpa: u64) -> Result<u16> {
+        if gpa % 2 != 0 {
+            return Err(Error::BadAddress);
+        }
+        let mut b = [0u8; 2];
+        self.read(gpa, &mut b)?;
+        Ok(u16::from_le_bytes(b))
+    }
+
+    pub fn write_u16(&self, gpa: u64, value: u16) -> Result<()> {
+        if gpa % 2 != 0 {
+            return Err(Error::BadAddress);
+        }
+        self.write(gpa, &value.to_le_bytes())
     }
 
     /// As the real one decides it: a page of the MMIO window that is no

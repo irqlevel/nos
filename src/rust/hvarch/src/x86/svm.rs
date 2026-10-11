@@ -301,6 +301,12 @@ impl Permissions {
 ///   the guest is the policy's to do.
 /// - #MC: a machine check is the host's to know of. An intercepted one is
 ///   not delivered to the host by the CPU, so `run` raises it itself.
+/// - CR4 writes, and CR4.MCE: with MCE clear a machine check is no
+///   exception but a shutdown -- the guest's triple fault, as the exit has
+///   it -- and the host never hears of it. So the CR4 the guest runs with
+///   keeps MCE whatever the VMCB says, and the guest cannot clear it in the
+///   register itself: a write is an exit. What the guest believes CR4 holds
+///   is the policy's to keep, and to answer its reads with.
 ///
 /// And what the CPU would otherwise do on its own at physical addresses the
 /// VMCB names -- AVIC's backing page and tables, SEV's state, virtual
@@ -325,9 +331,12 @@ pub const VECTOR_DB: u32 = 1;
 pub const VECTOR_AC: u32 = 17;
 pub const VECTOR_MC: u32 = 18;
 const HOST_EXCEPTIONS: u32 = (1 << VECTOR_DB) | (1 << VECTOR_AC) | (1 << VECTOR_MC);
+const HOST_CR: u32 = vmcb::intercept::cr::WRITE_CR4;
 
 /// CR4.LA57: five levels of page table.
 const CR4_LA57: u64 = 1 << 12;
+/// CR4.MCE: a machine check an exception, not a shutdown.
+const CR4_MCE: u64 = 1 << 6;
 
 /// Why a guest was not entered on `cpu`, the CPU the entry found itself on.
 #[derive(Clone, Copy, Debug)]
@@ -727,8 +736,9 @@ impl Guest {
     /// `vmrun` runs.
     ///
     /// Before it enters, the VMCB is made safe for the host whatever the
-    /// caller put in it: the intercepts in `HOST_MISC1`, `HOST_MISC2` and
-    /// `HOST_EXCEPTIONS` set, physical interrupts masked by the host's flag
+    /// caller put in it: the intercepts in `HOST_CR`, `HOST_MISC1`,
+    /// `HOST_MISC2` and `HOST_EXCEPTIONS` set, CR4.MCE set in the guest's
+    /// CR4, physical interrupts masked by the host's flag
     /// and not the guest's, nested paging on over `nested` and SEV, AVIC
     /// and virtual VMSAVE off, the permission maps `perms`, and nothing
     /// assumed clean. The ASID and the TLB control are this CPU's to give
@@ -762,7 +772,10 @@ impl Guest {
         kick: Option<&Kick>,
     ) -> core::result::Result<u32, NotRun> {
         {
-            let c = &mut self.vmcb.get_mut().control;
+            let v = self.vmcb.get_mut();
+            v.save.cr4 |= CR4_MCE;
+            let c = &mut v.control;
+            c.intercept_cr |= HOST_CR;
             c.intercept_misc1 |= HOST_MISC1;
             c.intercept_misc2 |= HOST_MISC2;
             c.intercept_exceptions |= HOST_EXCEPTIONS;

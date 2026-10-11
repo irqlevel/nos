@@ -259,8 +259,10 @@ pub struct Built {
 /// and the rest of what the boot protocol wants laid out beside them; its
 /// CPUs, rung by `doorbells`; its disks served for `runner`, who runs it.
 pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doorbells>) -> Result<Built, String> {
-    let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
-        .map_err(|e| alloc::format!("no guest: {}", e))?;
+    /* The image first, and its layout planned, before any of the guest's
+     * memory is taken: a path that is not a bzImage, or a kernel that does
+     * not fit, costs nothing -- not a few gigabytes taken, zeroed and given
+     * back. */
 
     /* The header is in the first page or two; read enough to parse it. */
     let mut first = Vec::new();
@@ -285,6 +287,9 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
 
     let layout = hv::linux::plan(&header, spec.mem_bytes, kernel_len, initrd_len)
         .map_err(|e| alloc::format!("the guest's memory does not fit its kernel: {}", e))?;
+
+    let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
+        .map_err(|e| alloc::format!("no guest: {}", e))?;
 
     /* The 64-bit kernel at its load address, then the initrd high. */
     stream(&guest, &spec.kernel, pm_offset, layout.kernel_addr, kernel_len)?;
@@ -528,6 +533,13 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             }
             Ok(())
         }
+        Stop::CrInsn { rip, error, bytes } => {
+            write!(out, "a mov to or from CR4 at rip {:#x} not performed -- {}; its bytes", rip, error.describe())?;
+            for b in &bytes.b[..usize::from(bytes.len)] {
+                write!(out, " {:02x}", b)?;
+            }
+            Ok(())
+        }
         Stop::Exception { vector, rip } => write!(out, "exception {} at {:#x}", vector, rip),
         Stop::Refused(r) => write!(out, "not entered: {:?}", r),
         Stop::Invalid => write!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
@@ -556,9 +568,13 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     if total.kicked != 0 {
         let _ = writeln!(out, "  kicked     {} entries turned back for a frame, a disk's answer or an IPI that came on the way in", total.kicked);
     }
-    if total.ud != 0 || total.wbinvd != 0 || total.cr8 != 0 || total.cr0 != 0 {
-        let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR, {} CR0 writes (VT-x)",
-            total.ud, total.wbinvd, total.cr8, total.cr0);
+    if total.ud != 0 || total.wbinvd != 0 || total.cr8 != 0 || total.cr0 != 0 || total.reflected != 0 {
+        let _ = writeln!(out, "  answered   {} #UD for instructions CPUID did not offer, {} WBINVD stepped past, {} CR8 from the shadow TPR, {} CR0 writes (VT-x), {} #DB and #AC given back",
+            total.ud, total.wbinvd, total.cr8, total.cr0, total.reflected);
+    }
+    if total.cr4 != 0 {
+        let _ = writeln!(out, "  cr4        {} reads and writes performed (AMD-V), {} writes refused with #GP",
+            total.cr4, total.cr4_gp);
     }
     let absent = guest.absent_pages();
     if !absent.is_empty() {
