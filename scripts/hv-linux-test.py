@@ -295,7 +295,13 @@ def vm_commands(args):
         handler = "/etc/acpi/PWRF/00000080"
         irq9 = "hv exec 4 grep -e acpi -e virtio /proc/interrupts"
         clocks = "hv exec 4 cat /sys/devices/system/clocksource/clocksource0/available_clocksource"
+        # acpid reads the button from its input device, whose node only a
+        # devtmpfs makes -- which the initramfs's /init does not mount, as
+        # the disk phase knows too: without it, /dev/input is not there and
+        # the button goes unanswered.
+        inputs = "hv exec 4 ls /dev/input"
         acpi_lines = [start4, "hv exec 4 secs=%d mkdir -p /etc/acpi/PWRF" % args.vm_secs,
+                      "hv exec 4 mount -t devtmpfs devtmpfs /dev", inputs,
                       "hv exec 4 echo '#!/bin/sh' > %s" % handler,
                       "hv exec 4 echo 'poweroff -f' >> %s" % handler,
                       "hv exec 4 chmod +x %s" % handler,
@@ -307,6 +313,7 @@ def vm_commands(args):
         acpi_lines += [start5, "hv exec 5 secs=%d id" % args.vm_secs, "hv stop 5 secs=5"]
         acpi_checks = [
             (start4, 0, "vm 4 starts, to be shut down by its power button", r"hv: vm 4 started on %s " % on, True),
+            (inputs, 0, "its power button is an input device acpid can read", r"(?m)^event\d+\s*$", True),
             (irq9, 0, "its SCI comes through the IO-APIC's pin 9, a level" if args.ioapic
              else "its SCI comes through the 8259, as IRQ 9",
              r"(?m)^\s*9:(\s+\d+)+\s+%s\s+acpi" % (r"IO-APIC\s+9-fasteoi" if args.ioapic else "XT-PIC"), True),
