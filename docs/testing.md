@@ -414,7 +414,13 @@ sending each other frames of every kind -- as themselves and as each other
 guests' packets out into the world and the world's answers back, each
 rewrite checked field by field and its sums summed from scratch; and
 `guestnet`, the two as the module wires them, guests on the switch reaching
-the world through NAT. And `platform` does it to the whole machine: a Linux guest's platform built
+the world through NAT. `nat` floods the table past full now and then and
+holds every flow a full table takes to its rule -- the one used least lately
+of the guest that holds the most, the asker's own when it holds as many as
+any -- from the table's own listing before the packet, a sample of them,
+and a packet given no room to a guest past the 64 the table keeps shares
+for; and it runs NAT's boot self-test once, which holds the cases random
+input seldom makes, a tie and every slot held. And `platform` does it to the whole machine: a Linux guest's platform built
 and loaded as `hv boot` builds it -- CPUs, disks, NICs, IO-APIC and all --
 and run by the real run loop, `LinuxGuest::run`, on each of its CPUs, each
 on a thread of its own and one at a time -- the one turn handed from thread

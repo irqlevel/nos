@@ -631,6 +631,12 @@ struct NatModel {
     /// The networks `nat allow` let through, as (network, mask): NAT's word
     /// outlives NAT going off and on, and so does this.
     allowed: Vec<(u32, u32)>,
+    /// Packets that met a full table wanting a new mapping, this input: one
+    /// in `SHARE_SAMPLE` is judged by its share (`check_share`), and no
+    /// more than `SHARE_JUDGED`; and whether a flood filled the table yet.
+    full_seen: usize,
+    judged: usize,
+    flooded: bool,
 }
 
 impl NatModel {
@@ -779,6 +785,189 @@ fn table_maps(inner_ip: u32) -> bool {
     })
 }
 
+/// The inner hosts NAT's table keeps a share for at once -- `nat.rs`'s
+/// `HOSTS`, which the model has to know to judge a packet given no room.
+const NAT_HOSTS: usize = 64;
+
+/// NAT's table, whole, as `nat` lists it: how many live mappings each host
+/// holds, and whose each port is (0 for none), by its place from
+/// `PORT_BASE`.
+struct Shares {
+    counts: Vec<(u32, usize)>,
+    owners: Vec<u32>,
+}
+
+impl Shares {
+    fn count(&self, ip: u32) -> usize {
+        self.counts.iter().find(|&&(h, _)| h == ip).map_or(0, |&(_, n)| n)
+    }
+}
+
+fn table_shares() -> Shares {
+    const NONE: nat::Mapping = nat::Mapping { proto: 0, inner_ip: 0, inner_port: 0, remote_ip: 0, remote_port: 0,
+                                              port: 0, left_ns: 0 };
+    thread_local! {
+        static ALL: std::cell::RefCell<Vec<nat::Mapping>> = std::cell::RefCell::new(vec![NONE; nat::ENTRIES]);
+    }
+    let mut shares = Shares { counts: Vec::new(), owners: vec![0; nat::ENTRIES] };
+    if let Some(nat) = crate::abi::nat() {
+        ALL.with_borrow_mut(|all| {
+            if let Some((_, _, _, n)) = nat.state(all) {
+                for m in &all[..n] {
+                    match shares.counts.iter_mut().find(|(h, _)| *h == m.inner_ip) {
+                        Some((_, c)) => *c += 1,
+                        None => shares.counts.push((m.inner_ip, 1)),
+                    }
+                    shares.owners[usize::from(m.port - PORT_BASE)] = m.inner_ip;
+                }
+            }
+        });
+    }
+    shares
+}
+
+/// The port NAT's table has `key`'s flow on, live: one listing of it.
+fn table_port(key: Key) -> Option<u16> {
+    const NONE: nat::Mapping = nat::Mapping { proto: 0, inner_ip: 0, inner_port: 0, remote_ip: 0, remote_port: 0,
+                                              port: 0, left_ns: 0 };
+    thread_local! {
+        static ALL: std::cell::RefCell<Vec<nat::Mapping>> = std::cell::RefCell::new(vec![NONE; nat::ENTRIES]);
+    }
+    let nat = crate::abi::nat()?;
+    ALL.with_borrow_mut(|all| {
+        let (_, _, _, n) = nat.state(all)?;
+        all[..n].iter()
+            .find(|m| (m.proto, m.inner_ip, m.inner_port, m.remote_ip, m.remote_port) == key)
+            .map(|m| m.port)
+    })
+}
+
+/// What a full table held before a guest's packet that may need a new
+/// mapping -- one of a flow the model knows no live mapping of: its hosts'
+/// shares and whose each port was. None for a table not full, and for a
+/// packet of a flow the model has mapped, which the table would not take a
+/// flow for: listing a full table for every packet was most of what the
+/// target spent.
+fn shares_if_full(frame: &[u8], m: &mut NatModel) -> Option<Shares> {
+    if try_packet_key(frame).is_some_and(|key| m.by_key.contains_key(&key)) {
+        return None;
+    }
+    let nat = crate::abi::nat()?;
+    let (_, _, active, _) = nat.state(&mut [])?;
+    if active != nat::ENTRIES {
+        return None;
+    }
+    m.full_seen += 1;
+    if m.full_seen % SHARE_SAMPLE != 1 || m.judged == SHARE_JUDGED {
+        return None;
+    }
+    m.judged += 1;
+    Some(table_shares())
+}
+
+/// One in this many packets that meet a full table wanting a new mapping is
+/// judged by the share: each judging lists the whole table, and a flood met
+/// a full one hundreds of thousands of times a gate. Counted per input, so
+/// that a finding comes again from its seed and iteration.
+const SHARE_SAMPLE: usize = 8;
+const SHARE_JUDGED: usize = 64;
+
+/// The port NAT sent a guest's packet out from: its source port, or its
+/// echo's identifier.
+fn out_port(out: &[u8]) -> u16 {
+    let o = &out[ETH_HDR_LEN..];
+    let ihl = ip::header_len(o);
+    let (s, _, _) = fields(ip::protocol(o));
+    wire::be16(&o[ihl..], s)
+}
+
+/// The flow a packet is of, if it is whole enough to say: an IPv4 header
+/// and the transport's ports, or an echo's identifier.
+fn try_packet_key(frame: &[u8]) -> Option<Key> {
+    let p = frame.get(ETH_HDR_LEN..)?;
+    if p.len() < IP_HDR_LEN {
+        return None;
+    }
+    let ihl = ip::header_len(p);
+    let (s, d, _) = fields(ip::protocol(p));
+    if p.len() < ihl + s.max(d) + 2 {
+        return None;
+    }
+    Some(packet_key(frame))
+}
+
+/// The flow a guest's packet is of: its protocol, source, source port,
+/// destination and destination port -- 0 for ICMP's.
+fn packet_key(frame: &[u8]) -> Key {
+    let p = &frame[ETH_HDR_LEN..];
+    let ihl = ip::header_len(p);
+    let (s, d, _) = fields(ip::protocol(p));
+    let l4 = &p[ihl..];
+    let remote_port = if ip::protocol(p) == IP_PROTO_ICMP { 0 } else { wire::be16(l4, d) };
+    (ip::protocol(p), ip::src(p), wire::be16(l4, s), ip::dst(p), remote_port)
+}
+
+/// A guest's packet given a mapping by taking a live flow's, or given no
+/// room, held to the share a full table keeps: the flow taken is one of the
+/// host holding the most -- the asker's own when it holds as many as any,
+/// of several holding the most the lowest address's -- and a packet finds
+/// no room only from a host past the `NAT_HOSTS` that hold mappings. The
+/// flow taken is gone from the model.
+fn check_share(frame: &[u8], before: [usize; 9], after: [usize; 9], shares: Option<Shares>, sent: Option<u16>,
+               m: &mut NatModel) {
+    if after[3] == before[3] && after[8] == before[8] {
+        return;
+    }
+    /* A packet NAT made a mapping for, or wanted to: whole enough for its
+     * ports to be read. */
+    let key = packet_key(frame);
+    let asker = key.1;
+    if after[3] > before[3] {
+        let now = table_shares();
+        invariant!(now.counts.len() >= NAT_HOSTS && now.count(asker) == 0,
+                   "{}'s packet found no room, {} hosts holding mappings ({} of them its own)", wire::Ipv4(asker),
+                   now.counts.len(), now.count(asker));
+    }
+    if after[8] == before[8] {
+        return;
+    }
+    /* Its port: the one it went out from -- or, not sent, the table's. */
+    let Some(port) = sent.or_else(|| table_port(key)) else {
+        panic!("invariant: a live flow taken for {:?}, which has no mapping after", key)
+    };
+    /* Taken for a flow the model had a mapping of: gone from the table
+     * without the model seeing it go -- run out, or taken for another --
+     * and the table's word is all there is. Forgotten, not judged. */
+    let Some(before) = shares else {
+        forget_port(m, port);
+        return;
+    };
+    let victim = before.owners[usize::from(port - PORT_BASE)];
+    invariant!(victim != 0, "port {} given to {:?} for a live flow's, and none was on it", port, key);
+    let mine = before.count(asker);
+    let most = before.counts.iter().map(|&(_, n)| n).max().unwrap_or(0);
+    let want = if mine >= most {
+        asker
+    } else {
+        before.counts.iter().filter(|&&(_, n)| n == most).map(|&(ip, _)| ip).min().unwrap_or(0)
+    };
+    invariant!(victim == want, "{}'s new flow took a flow of {}, which holds {}; {} holds {} and the most is {}: \
+                                the flow was {}'s to give", wire::Ipv4(asker), wire::Ipv4(victim),
+               before.count(victim), wire::Ipv4(asker), mine, most, wire::Ipv4(want));
+    TAKEN_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    forget_port(m, port);
+}
+
+/// The flow the model had on `port`, gone: a full table took it.
+fn forget_port(m: &mut NatModel, port: u16) {
+    if let Some(f) = m.by_port.remove(&port) {
+        if m.by_key.get(&f.key) == Some(&port) {
+            m.by_key.remove(&f.key);
+        }
+    }
+    m.recent.retain(|&p| p != port);
+}
+
 /// Packets the oracle judged: sent out, sent back -- for `HV_FUZZ_STATS`.
 pub static OUT_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Packets NAT denied, checked; and the rejects their guests were answered with.
@@ -788,6 +977,8 @@ pub static BACK_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub static MUST_LET_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ANSWERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static NO_NAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Flows a full table took from a host for another's, each checked.
+pub static TAKEN_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -795,27 +986,28 @@ pub fn report() {
         println!("  nat: {} packets checked out, {} back ({} of them answers a live flow had to let in); {} answers \
                   tried; {} inputs with no NAT", OUT_CHECKED.load(Relaxed), BACK_CHECKED.load(Relaxed),
                  MUST_LET_IN.load(Relaxed), ANSWERS.load(Relaxed), NO_NAT.load(Relaxed));
-        println!("  nat: {} packets denied, checked; {} rejects checked", DENIED_CHECKED.load(Relaxed),
-                 REJECTS_CHECKED.load(Relaxed));
+        println!("  nat: {} packets denied, checked; {} rejects checked; {} flows a full table took, checked",
+                 DENIED_CHECKED.load(Relaxed), REJECTS_CHECKED.load(Relaxed), TAKEN_CHECKED.load(Relaxed));
     }
 }
 
-fn counters() -> [usize; 8] {
+fn counters() -> [usize; 9] {
     let c = &COUNTERS;
     let l = |a: &std::sync::atomic::AtomicUsize| a.load(std::sync::atomic::Ordering::Relaxed);
-    [l(&c.out), l(&c.back), l(&c.mapped), l(&c.full), l(&c.no_hop), l(&c.no_frame), l(&c.refused), l(&c.denied)]
+    [l(&c.out), l(&c.back), l(&c.mapped), l(&c.full), l(&c.no_hop), l(&c.no_frame), l(&c.refused), l(&c.denied),
+     l(&c.taken)]
 }
 
 /// A packet NAT took is counted once, as what became of it -- sent out,
 /// sent back, dropped for one reason, denied -- and one it did not take not
 /// at all.
-fn check_counted(taken: bool, before: [usize; 8], after: [usize; 8]) {
+fn check_counted(taken: bool, before: [usize; 9], after: [usize; 9]) {
     let d: Vec<usize> = before.iter().zip(after.iter()).map(|(b, a)| a - b).collect();
     let fates = d[0] + d[1] + d[3] + d[4] + d[5] + d[6] + d[7];
     if taken {
-        invariant!(fates == 1 && d[2] <= 1, "a packet NAT took counted {:?}", d);
+        invariant!(fates == 1 && d[2] <= 1 && d[8] <= d[2], "a packet NAT took counted {:?}", d);
     } else {
-        invariant!(fates == 0 && d[2] == 0, "a packet NAT left to the stack counted {:?}", d);
+        invariant!(fates == 0 && d[2] == 0 && d[8] == 0, "a packet NAT left to the stack counted {:?}", d);
     }
 }
 
@@ -953,11 +1145,13 @@ fn outbound(r: &mut Input, m: &mut NatModel) {
         frame.extend((0..r.below(40)).map(|i| i as u8));
     }
 
+    let shares = shares_if_full(&frame, m);
     let before = counters();
     let taken = nat::intercept(&HV0, &frame);
     let after = counters();
     check_counted(taken, before, after);
     let sent = ETH0.take_sent();
+    check_share(&frame, before, after, shares, sent.first().map(|o| out_port(o)), m);
     let back = HV0.take_sent();
     let (target_proto, target, target_port) = target_of(&frame);
     if after[7] > before[7] {
@@ -1163,6 +1357,10 @@ fn inbound(r: &mut Input, m: &mut NatModel) {
 /// NAT between `hv0` and an uplink with a gateway: guests' packets out, the
 /// world's back, time passing, the table filled, NAT off and on again.
 pub fn nat_target(r: &mut Input) {
+    /* NAT's own self-test, as each boot runs it: its table's shares, in
+     * the cases a random input seldom makes -- ties, every slot held. */
+    static SELFTEST: std::sync::Once = std::sync::Once::new();
+    SELFTEST.call_once(|| invariant!(nat::selftest(), "NAT's boot self-test failed"));
     network::reset();
     let outer_ip = r.pick(&[0xC0A8_010Au32, 0x0A00_020F, 0x5F10_2030]);
     let mask = r.pick(&[0xFFFF_FF00u32, 0xFFFF_0000, 0]);
@@ -1207,19 +1405,39 @@ pub fn nat_target(r: &mut Input) {
             8 => {
                 /* Many flows at once, as many as the table holds and past
                  * it: each checked as any other. */
-                let n = if r.u8() < 4 { 4200 } else { r.pick(&[8u32, 64, 256]) };
+                /* One flood that fills the table, at most, an input: what
+                 * comes after it is what the share is for. */
+                let n = if r.u8() < 4 && !m.flooded { 4200 } else { r.pick(&[8u32, 64, 256]) };
+                m.flooded |= n == 4200;
                 let guest = SUBNET | (2 + r.below(16) as u32);
                 let remote = r.pick(&REMOTES);
+                /* The flood's datagrams are one, drawn from the input once
+                 * and sent from a port each, with no checksum -- which IPv4
+                 * lets UDP have, and NAT keeps as none: drawn for each, a
+                 * flood took more bytes than an input has, and nothing came
+                 * after it. A smaller burst draws each, as any packet does. */
+                let datagram = transport(r, IP_PROTO_UDP, guest, remote, 10000, 53, 4, Sum::Right, 0, 0);
                 for i in 0..n {
                     let sport = 10000u16.wrapping_add(i as u16);
-                    let l4 = transport(r, IP_PROTO_UDP, guest, remote, sport, 53, 4, Sum::Right, 0, 0);
+                    let l4 = if n == 4200 {
+                        let mut l4 = datagram.clone();
+                        wire::set_be16(&mut l4, udp::SRC_PORT, sport);
+                        wire::set_be16(&mut l4, udp::CHECKSUM, 0);
+                        l4
+                    } else {
+                        transport(r, IP_PROTO_UDP, guest, remote, sport, 53, 4, Sum::Right, 0, 0)
+                    };
                     let packet = ipv4(IP_HDR_LEN, i as u16, 0, 64, IP_PROTO_UDP, guest, remote, &l4,
                                       IP_HDR_LEN + l4.len(), false);
                     let frame = ethernet(HOST_MAC, guest_mac(guest), &packet);
+                    let shares = shares_if_full(&frame, &mut m);
                     let before = counters();
                     let taken = nat::intercept(&HV0, &frame);
-                    check_counted(taken, before, counters());
-                    if let Some(out) = ETH0.take_sent().first() {
+                    let after = counters();
+                    check_counted(taken, before, after);
+                    let sent = ETH0.take_sent();
+                    check_share(&frame, before, after, shares, sent.first().map(|o| out_port(o)), &mut m);
+                    if let Some(out) = sent.first() {
                         check_out(&frame, out, &mut m);
                     }
                 }

@@ -62,10 +62,16 @@ pub const ENTRIES: usize = 4096;
 pub const PORT_BASE: u16 = 32768;
 pub const PORT_LAST: u16 = PORT_BASE + (ENTRIES - 1) as u16;
 const BUCKETS: usize = 4096;
-/// No entry: the end of a hash chain, or of the free list.
+/// No entry: the end of a hash chain, of the free list, or of a host's list.
 const NONE: u16 = u16::MAX;
+/// The inner hosts that hold mappings at once: the guests -- the switch has
+/// sixteen ports -- with room to spare. A packet of one past them has no
+/// mapping made for it, and is counted as `full`.
+const HOSTS: usize = 64;
 
 const _: () = assert!(ENTRIES < NONE as usize && BUCKETS.is_power_of_two());
+/* A host's slot is an entry's byte; its count, a u16, holds the whole table. */
+const _: () = assert!(HOSTS <= u8::MAX as usize + 1 && ENTRIES <= u16::MAX as usize);
 const _: () = assert!(PORT_LAST < crate::tcp::EPHEMERAL_BASE);
 /* One offset for the ports of both transports. */
 const _: () = assert!(tcp::SRC_PORT == udp::SRC_PORT && tcp::DST_PORT == udp::DST_PORT);
@@ -107,12 +113,30 @@ struct Entry {
     expires: u64,
     /// The next entry in its hash chain -- or, free, on the free list.
     next: u16,
+    /// Its host's slot (`Table::hosts`), and its neighbours on that host's
+    /// list, the one used less lately and the one used more.
+    host: u8,
+    older: u16,
+    newer: u16,
 }
 
 const FREE: Entry = Entry {
     proto: 0, seen: 0, inner_ip: 0, inner_port: 0, inner_mac: [0; 6], remote_ip: 0,
-    remote_port: 0, expires: 0, next: NONE,
+    remote_port: 0, expires: 0, next: NONE, host: 0, older: NONE, newer: NONE,
 };
+
+/// An inner host's share of the table: its mappings, listed from the one
+/// used least lately to the one used last, and how many -- a slot with none
+/// is free.
+#[derive(Clone, Copy)]
+struct Host {
+    ip: u32,
+    count: u16,
+    lru: u16,
+    mru: u16,
+}
+
+const NO_HOST: Host = Host { ip: 0, count: 0, lru: NONE, mru: NONE };
 
 impl Entry {
     fn lifetime(&self) -> u64 {
@@ -154,10 +178,15 @@ impl Key {
     }
 }
 
-/// The mappings: entry `i` is external port `PORT_BASE + i`.
+/// The mappings: entry `i` is external port `PORT_BASE + i`. And each inner
+/// host's share of them: when every one is live and another flow wants one,
+/// the host that holds the most gives up the one it used least lately -- so
+/// a guest that opens flows as fast as it can takes them from itself, not
+/// from the rest, as a table that refused every new flow once full let it.
 struct Table {
     entries: Vec<Entry>,
     buckets: Vec<u16>,
+    hosts: [Host; HOSTS],
     /// The first free entry.
     free: u16,
     active: usize,
@@ -165,6 +194,12 @@ struct Table {
     /// the soonest a sweep can find one. A table full of live flows is not
     /// swept for every packet that wants a mapping.
     sweep_at: u64,
+}
+
+/// A mapping made: its entry, and whether a live flow's was taken for it.
+struct Made {
+    at: usize,
+    taken: bool,
 }
 
 impl Table {
@@ -178,7 +213,7 @@ impl Table {
         let mut buckets = Vec::new();
         buckets.try_reserve_exact(BUCKETS).ok()?;
         buckets.resize(BUCKETS, NONE);
-        Some(Table { entries, buckets, free: 0, active: 0, sweep_at: 0 })
+        Some(Table { entries, buckets, hosts: [NO_HOST; HOSTS], free: 0, active: 0, sweep_at: 0 })
     }
 
     /// The live mapping for `key`. One that has run out is let go here.
@@ -198,7 +233,65 @@ impl Table {
         None
     }
 
-    /// Entry `i` out of its chain and onto the free list.
+    /// The slot of the host at `ip`, if it holds a mapping.
+    fn host(&self, ip: u32) -> Option<usize> {
+        self.hosts.iter().position(|h| h.count != 0 && h.ip == ip)
+    }
+
+    /// Entry `i` onto the end of host `h`'s list: the one used last.
+    fn link(&mut self, i: usize, h: usize) {
+        let mru = self.hosts[h].mru;
+        let e = &mut self.entries[i];
+        e.host = h as u8;
+        e.older = mru;
+        e.newer = NONE;
+        if mru == NONE {
+            self.hosts[h].lru = i as u16;
+        } else {
+            self.entries[usize::from(mru)].newer = i as u16;
+        }
+        self.hosts[h].mru = i as u16;
+        self.hosts[h].count += 1;
+    }
+
+    /// Entry `i` off its host's list; a host left with none frees its slot.
+    fn unlink(&mut self, i: usize) {
+        let e = self.entries[i];
+        let h = usize::from(e.host);
+        if e.older == NONE {
+            self.hosts[h].lru = e.newer;
+        } else {
+            self.entries[usize::from(e.older)].newer = e.newer;
+        }
+        if e.newer == NONE {
+            self.hosts[h].mru = e.older;
+        } else {
+            self.entries[usize::from(e.newer)].older = e.older;
+        }
+        self.hosts[h].count -= 1;
+    }
+
+    /// Entry `i` to run out at `when` -- and the next sweep no later: a flow
+    /// made or kept after the last one may run out before what it found, a
+    /// UDP flow's five minutes among TCP's two hours, and a full table must
+    /// not count it live past then.
+    fn expire_at(&mut self, i: usize, when: u64) {
+        self.entries[i].expires = when;
+        self.sweep_at = self.sweep_at.min(when);
+    }
+
+    /// Entry `i` used by a packet of its flow, either way: the last on its
+    /// host's list.
+    fn touch(&mut self, i: usize) {
+        let h = usize::from(self.entries[i].host);
+        if usize::from(self.hosts[h].mru) != i {
+            self.unlink(i);
+            self.link(i, h);
+        }
+    }
+
+    /// Entry `i` out of its chain and its host's list, and onto the free
+    /// list.
     fn release(&mut self, i: usize) {
         let bucket = Key::of(&self.entries[i]).bucket();
         let mut at = self.buckets[bucket];
@@ -216,6 +309,7 @@ impl Table {
                 self.entries[usize::from(prev)].next = next;
             }
         }
+        self.unlink(i);
         self.entries[i] = Entry { next: self.free, ..FREE };
         self.free = i as u16;
         self.active -= 1;
@@ -226,13 +320,11 @@ impl Table {
     /// its port, which must not be handed the answers to the flows of the
     /// one before -- a TCP connection's sequence numbers among them.
     fn forget(&mut self, inner_ip: u32) -> usize {
+        let Some(h) = self.host(inner_ip) else { return 0 };
         let mut n = 0;
-        for i in 0..ENTRIES {
-            let e = &self.entries[i];
-            if e.proto != 0 && e.inner_ip == inner_ip {
-                self.release(i);
-                n += 1;
-            }
+        while self.hosts[h].count != 0 {
+            self.release(usize::from(self.hosts[h].lru));
+            n += 1;
         }
         n
     }
@@ -255,27 +347,53 @@ impl Table {
         self.sweep_at = soonest;
     }
 
-    /// A new mapping for `key`, for its caller to give a time: a free entry,
-    /// or -- none left -- one whose flow has run out. None when every one is
-    /// live.
-    fn insert(&mut self, key: &Key, mac: Mac, now: u64) -> Option<usize> {
-        if self.free == NONE && now >= self.sweep_at {
+    /// A new mapping for `key`, for its caller to give a time: a free entry;
+    /// none free, one whose flow has run out; every one live, the one used
+    /// least lately of the host that holds the most -- the asker's own when
+    /// it holds as many as any, and of several holding the most the lowest
+    /// address's. None for a host past the `HOSTS` that hold mappings.
+    fn insert(&mut self, key: &Key, mac: Mac, now: u64) -> Option<Made> {
+        let no_slot = |t: &Table| t.host(key.inner_ip).is_none() && !t.hosts.iter().any(|h| h.count == 0);
+        /* What has run out first: an entry for the flow, and a slot for its
+         * host, if every one holds only flows gone quiet. */
+        if (self.free == NONE || no_slot(self)) && now >= self.sweep_at {
             self.sweep(now);
         }
-        if self.free == NONE {
+        if no_slot(self) {
             return None;
         }
+        let taken = self.free == NONE;
+        if taken {
+            let mine = self.host(key.inner_ip).map_or(0, |h| self.hosts[h].count);
+            let most = self.hosts.iter().map(|h| h.count).max().unwrap_or(0);
+            let victim = if mine >= most {
+                self.host(key.inner_ip)
+            } else {
+                self.hosts.iter().enumerate().filter(|(_, h)| h.count == most)
+                    .min_by_key(|(_, h)| h.ip).map(|(j, _)| j)
+            }?;
+            self.release(usize::from(self.hosts[victim].lru));
+        }
+        let h = match self.host(key.inner_ip) {
+            Some(h) => h,
+            None => {
+                let h = self.hosts.iter().position(|h| h.count == 0)?;
+                self.hosts[h] = Host { ip: key.inner_ip, ..NO_HOST };
+                h
+            }
+        };
         let i = usize::from(self.free);
         self.free = self.entries[i].next;
         let bucket = key.bucket();
         self.entries[i] = Entry {
             proto: key.proto, seen: 0, inner_ip: key.inner_ip, inner_port: key.inner_port,
             inner_mac: mac, remote_ip: key.remote_ip, remote_port: key.remote_port,
-            expires: now, next: self.buckets[bucket],
+            expires: now, next: self.buckets[bucket], ..FREE
         };
         self.buckets[bucket] = i as u16;
         self.active += 1;
-        Some(i)
+        self.link(i, h);
+        Some(Made { at: i, taken })
     }
 }
 
@@ -309,8 +427,12 @@ pub struct Counters {
     pub back: AtomicUsize,
     /// Mappings made.
     pub mapped: AtomicUsize,
-    /// Packets that wanted a mapping when every one was live.
+    /// Packets that wanted a mapping and could not have one: from a host
+    /// past the `HOSTS` that hold mappings.
     pub full: AtomicUsize,
+    /// Mappings made by taking a live flow's, every one being live: from
+    /// the host that holds the most.
+    pub taken: AtomicUsize,
     /// Packets whose next hop's address ARP did not have yet.
     pub no_hop: AtomicUsize,
     /// Packets there was no frame for, or no room on the device.
@@ -328,6 +450,7 @@ pub static COUNTERS: Counters = Counters {
     back: AtomicUsize::new(0),
     mapped: AtomicUsize::new(0),
     full: AtomicUsize::new(0),
+    taken: AtomicUsize::new(0),
     no_hop: AtomicUsize::new(0),
     no_frame: AtomicUsize::new(0),
     refused: AtomicUsize::new(0),
@@ -715,9 +838,12 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
                 return true;
             }
             None => match o.table.insert(&key, mac, now) {
-                Some(i) => {
+                Some(made) => {
                     count(&COUNTERS.mapped);
-                    i
+                    if made.taken {
+                        count(&COUNTERS.taken);
+                    }
+                    made.at
                 }
                 None => {
                     count(&COUNTERS.full);
@@ -725,6 +851,7 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
                 }
             },
         };
+        o.table.touch(i);
         let e = &mut o.table.entries[i];
         if p.proto == IP_PROTO_TCP {
             /* A connection starting again on the mapping the last one left:
@@ -740,7 +867,8 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
             }
         }
         e.inner_mac = mac;
-        e.expires = now.saturating_add(e.lifetime());
+        let when = now.saturating_add(e.lifetime());
+        o.table.expire_at(i, when);
         (o.outer, PORT_BASE + i as u16)
     };
 
@@ -840,7 +968,8 @@ fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
     let (inner, inner_ip, inner_port, inner_mac) = {
         let mut on = nat.on.lock();
         let Some(o) = on.as_mut() else { return false };
-        let e = &mut o.table.entries[usize::from(answer.port - PORT_BASE)];
+        let at = usize::from(answer.port - PORT_BASE);
+        let e = &mut o.table.entries[at];
         if e.proto != answer.proto || e.remote_ip != answer.far_ip
             || e.remote_port != answer.far_port || e.expires <= now
         {
@@ -848,7 +977,8 @@ fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
         }
         /* An error says nothing of the flow being alive, and a packet that
          * is dropped here no more. */
-        if answer.quoted_ihl.is_none() && p.ttl > 1 {
+        let alive = answer.quoted_ihl.is_none() && p.ttl > 1;
+        if alive {
             if e.proto == IP_PROTO_TCP {
                 let flags = tcp::flags(l4);
                 e.seen |= SEEN_ANSWER;
@@ -859,9 +989,14 @@ fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
                     e.seen |= SEEN_RST;
                 }
             }
-            e.expires = now.saturating_add(e.lifetime());
         }
-        (o.inner, e.inner_ip, e.inner_port, e.inner_mac)
+        let to = (o.inner, e.inner_ip, e.inner_port, e.inner_mac);
+        if alive {
+            let when = now.saturating_add(e.lifetime());
+            o.table.expire_at(at, when);
+            o.table.touch(at);
+        }
+        to
     };
     if p.ttl <= 1 {
         count(&COUNTERS.refused);
@@ -1160,9 +1295,9 @@ pub fn shell(args: &str, out: &mut Output) {
     let _ = writeln!(out);
     let c = &COUNTERS;
     let load = |counter: &AtomicUsize| counter.load(Ordering::Relaxed);
-    let _ = writeln!(out, "out {}  back {}  mapped {}  table full {}  no next hop {}  no frame {}  refused {}  \
-                           denied {}",
-        load(&c.out), load(&c.back), load(&c.mapped), load(&c.full), load(&c.no_hop),
+    let _ = writeln!(out, "out {}  back {}  mapped {}  taken from the most {}  no room {}  no next hop {}  \
+                           no frame {}  refused {}  denied {}",
+        load(&c.out), load(&c.back), load(&c.mapped), load(&c.taken), load(&c.full), load(&c.no_hop),
         load(&c.no_frame), load(&c.refused), load(&c.denied));
 }
 
@@ -1209,6 +1344,8 @@ fn check(what: &str, ok: bool) -> bool {
 }
 
 const GUEST: u32 = 0x0A00_6402; /* 10.0.100.2 */
+const OTHER: u32 = 0x0A00_6403; /* 10.0.100.3 */
+const THIRD: u32 = 0x0A00_6404; /* 10.0.100.4 */
 const OUTSIDE: u32 = 0x0A00_020F; /* 10.0.2.15 */
 const REMOTE: u32 = 0x5DB8_D822; /* 93.184.216.34 */
 const ROUTER: u32 = 0xC0A8_0001; /* 192.168.0.1 */
@@ -1325,38 +1462,136 @@ fn zero_sum() -> bool {
 }
 
 fn table() -> bool {
+    filled() & shares()
+}
+
+/// A mapping of `host`'s, its port `i`: one flow of a guest's.
+fn flow(host: u32, i: usize) -> Key {
+    Key { proto: IP_PROTO_UDP, inner_ip: host, inner_port: i as u16, remote_ip: REMOTE, remote_port: 53 }
+}
+
+/// The table filled, run out, and filled again.
+fn filled() -> bool {
     let Some(mut t) = Table::new() else {
         return check("a table to test with", false);
     };
-    let key = |i: usize| Key { proto: IP_PROTO_UDP, inner_ip: GUEST, inner_port: i as u16,
-                               remote_ip: REMOTE, remote_port: 53 };
     const BORN: u64 = 1000;
     let mut ok = true;
     for i in 0..ENTRIES {
-        match t.insert(&key(i), [0; 6], 0) {
-            Some(at) => t.entries[at].expires = BORN + i as u64,
-            None => ok = false,
+        match t.insert(&flow(GUEST, i), [0; 6], 0) {
+            Some(Made { at, taken: false }) => t.entries[at].expires = BORN + i as u64,
+            _ => ok = false,
         }
     }
     ok = check("the table takes every mapping", ok && t.active == ENTRIES);
-    ok &= check("and then no more", t.insert(&key(ENTRIES), [0; 6], 0).is_none());
-    ok &= check("and finds each one", (0..ENTRIES).all(|i| t.find(&key(i), 0).is_some()));
+    ok &= check("and finds each one", (0..ENTRIES).all(|i| t.find(&flow(GUEST, i), 0).is_some()));
 
     /* The first half run out: a sweep frees those and only those, and is
      * not tried again before the rest can have. */
     let half = BORN + (ENTRIES / 2) as u64 - 1;
-    ok &= check("what ran out is swept", t.insert(&key(ENTRIES), [0; 6], half).is_some()
-        && t.active == ENTRIES / 2 + 1 && t.sweep_at == half + 1);
+    ok &= check("what ran out is swept",
+        matches!(t.insert(&flow(GUEST, ENTRIES), [0; 6], half), Some(Made { taken: false, .. }))
+            && t.active == ENTRIES / 2 + 1 && t.sweep_at == half + 1);
     ok &= check("and what did not is kept",
-        (ENTRIES / 2..ENTRIES).all(|i| t.find(&key(i), half).is_some())
-            && (0..ENTRIES / 2).all(|i| t.find(&key(i), half).is_none()));
+        (ENTRIES / 2..ENTRIES).all(|i| t.find(&flow(GUEST, i), half).is_some())
+            && (0..ENTRIES / 2).all(|i| t.find(&flow(GUEST, i), half).is_none()));
 
     let before = t.active;
-    let i = t.find(&key(ENTRIES - 1), half).unwrap_or(0);
+    let i = t.find(&flow(GUEST, ENTRIES - 1), half).unwrap_or(0);
     t.release(i);
     ok &= check("one let go is gone",
-        t.active == before - 1 && t.find(&key(ENTRIES - 1), half).is_none());
+        t.active == before - 1 && t.find(&flow(GUEST, ENTRIES - 1), half).is_none());
     ok &= check("and its port is the next one out",
-        t.insert(&key(ENTRIES - 1), [0; 6], half) == Some(i));
+        t.insert(&flow(GUEST, ENTRIES - 1), [0; 6], half).map(|m| m.at) == Some(i));
+    ok
+}
+
+/// The table full of live flows: a guest's next flow takes its own used
+/// least lately, and another guest's takes from the one that holds the most
+/// -- whichever flows it opens, a guest cannot have every mapping there is.
+fn shares() -> bool {
+    let Some(mut t) = Table::new() else {
+        return check("a table to test with", false);
+    };
+    const LIVE: u64 = u64::MAX;
+    let count = |t: &Table, host: u32| t.host(host).map_or(0, |h| usize::from(t.hosts[h].count));
+    let made = |t: &mut Table, host: u32, i: usize| match t.insert(&flow(host, i), [0; 6], 0) {
+        Some(m) => {
+            t.entries[m.at].expires = LIVE;
+            Some(m.taken)
+        }
+        None => None,
+    };
+    let mut ok = true;
+    for i in 0..ENTRIES {
+        ok &= made(&mut t, GUEST, i) == Some(false);
+    }
+    ok = check("one guest's flows fill the table", ok && t.active == ENTRIES && count(&t, GUEST) == ENTRIES);
+
+    /* Its first flow used again: the second is the one used least lately. */
+    if let Some(i) = t.find(&flow(GUEST, 0), 0) {
+        t.touch(i);
+    }
+    ok &= check("a full table gives a guest its own flow used least lately",
+        made(&mut t, GUEST, ENTRIES) == Some(true) && t.find(&flow(GUEST, 1), 0).is_none()
+            && t.find(&flow(GUEST, 0), 0).is_some() && t.active == ENTRIES);
+
+    ok &= check("and another guest's flow takes from the guest holding the most",
+        made(&mut t, OTHER, 0) == Some(true) && t.find(&flow(GUEST, 2), 0).is_none()
+            && count(&t, GUEST) == ENTRIES - 1 && count(&t, OTHER) == 1);
+    let mut taken = true;
+    for i in 1..16 {
+        taken &= made(&mut t, OTHER, i) == Some(true);
+    }
+    ok &= check("each of its flows, while it holds fewer",
+        taken && count(&t, OTHER) == 16 && count(&t, GUEST) == ENTRIES - 16 && t.active == ENTRIES);
+
+    ok &= check("forget lets one guest's flows go, and only them",
+        t.forget(GUEST) == ENTRIES - 16 && t.active == 16 && count(&t, GUEST) == 0
+            && count(&t, OTHER) == 16 && (0..16).all(|i| t.find(&flow(OTHER, i), 0).is_some()));
+    ok & ties() & slots()
+}
+
+/// Two guests holding as many each: a third's flow takes from the one at
+/// the lower address -- one rule, the same every time.
+fn ties() -> bool {
+    let Some(mut t) = Table::new() else {
+        return check("a table to test with", false);
+    };
+    let mut ok = true;
+    for i in 0..ENTRIES {
+        let host = if i % 2 == 0 { GUEST } else { OTHER };
+        match t.insert(&flow(host, i), [0; 6], 0) {
+            Some(Made { at, taken: false }) => t.expire_at(at, u64::MAX),
+            _ => ok = false,
+        }
+    }
+    let count = |t: &Table, host: u32| t.host(host).map_or(0, |h| usize::from(t.hosts[h].count));
+    let third = t.insert(&flow(THIRD, 0), [0; 6], 0).map(|m| m.taken);
+    check("a tie goes against the lower address",
+        ok && third == Some(true) && count(&t, GUEST) == ENTRIES / 2 - 1 && count(&t, OTHER) == ENTRIES / 2
+            && count(&t, THIRD) == 1)
+}
+
+/// Every slot held by a host: one past them has no mapping made -- until a
+/// host's flows run out, and its slot is swept free for the next.
+fn slots() -> bool {
+    let Some(mut t) = Table::new() else {
+        return check("a table to test with", false);
+    };
+    const QUIET: u64 = 5000;
+    let host = |h: usize| GUEST + 0x100 + h as u32;
+    let mut ok = true;
+    for h in 0..HOSTS {
+        match t.insert(&flow(host(h), 0), [0; 6], 0) {
+            Some(Made { at, taken: false }) => t.expire_at(at, if h == 0 { QUIET } else { u64::MAX }),
+            _ => ok = false,
+        }
+    }
+    ok = check("a slot for each host there is room for", ok && t.active == HOSTS);
+    ok &= check("and none for one more", t.insert(&flow(host(HOSTS), 0), [0; 6], QUIET - 1).is_none());
+    ok &= check("until a host's flows run out, which frees its slot",
+        matches!(t.insert(&flow(host(HOSTS), 0), [0; 6], QUIET), Some(Made { taken: false, .. }))
+            && t.active == HOSTS && t.host(host(0)).is_none() && t.host(host(HOSTS)).is_some());
     ok
 }
