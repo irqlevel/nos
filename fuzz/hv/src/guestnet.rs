@@ -628,6 +628,125 @@ struct NatModel {
     /// no frame -- and the guest's MAC: the table has them, and an answer
     /// on the port is let in.
     unsent: BTreeMap<Key, [u8; 6]>,
+    /// The networks `nat allow` let through, as (network, mask): NAT's word
+    /// outlives NAT going off and on, and so does this.
+    allowed: Vec<(u32, u32)>,
+}
+
+impl NatModel {
+    /// The model of a NAT gone off and on again: a new table, the same
+    /// word on where the guests may go.
+    fn fresh(&mut self) {
+        let allowed = core::mem::take(&mut self.allowed);
+        *self = NatModel { allowed, ..NatModel::default() };
+    }
+}
+
+/// The networks a guest is kept from, as (network, mask) -- the fuzzer's own
+/// list, not `nat.rs`'s: link-local, where a cloud's metadata server is, the
+/// private networks, and the shared space.
+const KEPT_NETS: [(u32, u32); 5] = [(0xA9FE_0000, 0xFFFF_0000), (0x0A00_0000, 0xFF00_0000),
+                                    (0xAC10_0000, 0xFFF0_0000), (0xC0A8_0000, 0xFFFF_0000),
+                                    (0x6440_0000, 0xFFC0_0000)];
+/// Where a guest's packets for those go in an input: the metadata server,
+/// a host of each private network and of the shared space.
+const KEPT_HOSTS: [u32; 5] = [0xA9FE_A9FE, 0x0A01_0203, 0xAC1F_0001, 0xC0A8_0164, 0x647F_FFFE];
+
+/// Whether NAT must keep a guest's packet of `proto` for `dst`, at TCP's or
+/// UDP's port `port`, from the world, by the model: a kept network, or the
+/// uplink's own subnet -- but a network `allow` let through, and the DNS
+/// server the guests are given at port 53, by UDP or by TCP.
+fn kept(m: &NatModel, proto: u8, dst: u32, port: u16) -> bool {
+    let dns = network::dns::upstream();
+    if dns != 0 && dst == dns && port == 53 && (proto == IP_PROTO_UDP || proto == IP_PROTO_TCP) {
+        return false;
+    }
+    let (ip, mask) = (ETH0.ip(), ETH0.mask());
+    let denied = KEPT_NETS.iter().any(|&(n, k)| dst & k == n) || (mask != 0 && dst & mask == ip & mask);
+    denied && !m.allowed.iter().any(|&(n, k)| dst & k == n)
+}
+
+/// What a guest's IPv4 frame is for, as NAT reads it: its protocol, where
+/// it goes, and TCP's or UDP's destination port -- 0 for anything else, or
+/// a transport header too short to have one.
+fn target_of(frame: &[u8]) -> (u8, u32, u16) {
+    let p = &frame[ETH_HDR_LEN..];
+    let ihl = ip::header_len(p);
+    let len = usize::from(ip::total_len(p)).min(p.len());
+    let proto = ip::protocol(p);
+    let l4 = if ihl <= len { &p[ihl..len] } else { &p[..0] };
+    let port = match proto {
+        IP_PROTO_TCP if l4.len() >= tcp::HDR_LEN => wire::be16(l4, tcp::DST_PORT),
+        IP_PROTO_UDP if l4.len() >= UDP_HDR_LEN => wire::be16(l4, udp::DST_PORT),
+        _ => 0,
+    };
+    (proto, ip::dst(p), port)
+}
+
+/// `nat allow` or `nat deny` of a network -- a kept one mostly, now and then
+/// anything, everything (0.0.0.0/0), or no network at all -- through the
+/// shell command a person types, and the model with it; then the networks
+/// NAT lets through held to the model's.
+fn allow_op(r: &mut Input, m: &mut NatModel, nat: &nat::Nat) {
+    let (net, bits) = match r.u8() % 8 {
+        0..=3 => {
+            let (n, k) = r.pick(&KEPT_NETS);
+            (n, k.count_ones())
+        }
+        4 => (r.pick(&KEPT_HOSTS), 32),
+        5 => (ETH0.ip(), r.pick(&[32u32, 24, 16])),
+        6 => (r.u32(), r.below(33) as u32),
+        _ => (0, 0),
+    };
+    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    let allow = r.u8() < 160;
+    let garbage = r.u8() < 16;
+    let args = if garbage {
+        r.pick(&["allow", "allow 1.2.3", "deny 1.2.3.4/33", "allow 1.2.3.4 5.6.7.8", "frob 1.2.3.4", "allow /8"])
+            .to_string()
+    } else {
+        format!("{} {}/{}", if allow { "allow" } else { "deny" }, wire::Ipv4(net), bits)
+    };
+    let mut out = crate::cmd::Output::default();
+    nat::shell(&args, &mut out);
+    if !garbage {
+        let key = (net & mask, mask);
+        if !allow {
+            m.allowed.retain(|x| *x != key);
+        } else if !m.allowed.contains(&key) && m.allowed.len() < nat::ALLOWED_MAX {
+            m.allowed.push(key);
+        }
+    }
+    let mut nets = [(0, 0); nat::ALLOWED_MAX];
+    let n = nat.allowed(&mut nets);
+    let mut got = nets[..n].to_vec();
+    let mut want = m.allowed.clone();
+    got.sort_unstable();
+    want.sort_unstable();
+    invariant!(got == want, "nat {:?}: NAT lets {:?} through, the model {:?} ({:?})", args, got, want, out.0);
+}
+
+/// What NAT answered a guest with for a packet it denied: to the guest's MAC
+/// and address from `hv0`'s, a destination unreachable, communication
+/// administratively prohibited, every sum right, quoting the packet's header
+/// and the eight bytes after it.
+fn check_reject(frame: &[u8], back: &[u8]) {
+    REJECTS_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    const ADMIN_PROHIBITED: u8 = 13;
+    let p = &frame[ETH_HDR_LEN..];
+    let ihl = ip::header_len(p);
+    let quoted = (ihl + 8).min(usize::from(ip::total_len(p)));
+    invariant!(back.len() == ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + quoted,
+               "a reject of {} bytes for a packet quoting {}", back.len(), quoted);
+    invariant!(back[..6] == frame[6..12] && back[6..12] == HOST_MAC && wire::be16(back, 12) == ETH_TYPE_IP,
+               "a reject sent to {:02x?} from {:02x?}", &back[..6], &back[6..12]);
+    let o = &back[ETH_HDR_LEN..];
+    invariant!(ip::protocol(o) == IP_PROTO_ICMP && ip::src(o) == HOST_IP && ip::dst(o) == ip::src(p)
+               && wire::checksum(&o[..IP_HDR_LEN]) == 0, "a reject's header wrong");
+    let m = &o[IP_HDR_LEN..];
+    invariant!(icmp::kind(m) == icmp::DEST_UNREACH && icmp::code(m) == ADMIN_PROHIBITED && wire::checksum(m) == 0,
+               "a reject of type {} code {}, or its sum wrong", icmp::kind(m), icmp::code(m));
+    invariant!(m[ICMP_HDR_LEN..] == p[..quoted], "a reject quoting other bytes than the packet's");
 }
 
 /// The flow NAT's table has on `port`, live, as `nat` lists it.
@@ -662,6 +781,9 @@ fn table_maps(inner_ip: u32) -> bool {
 
 /// Packets the oracle judged: sent out, sent back -- for `HV_FUZZ_STATS`.
 pub static OUT_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Packets NAT denied, checked; and the rejects their guests were answered with.
+pub static DENIED_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static REJECTS_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BACK_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MUST_LET_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ANSWERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -673,20 +795,23 @@ pub fn report() {
         println!("  nat: {} packets checked out, {} back ({} of them answers a live flow had to let in); {} answers \
                   tried; {} inputs with no NAT", OUT_CHECKED.load(Relaxed), BACK_CHECKED.load(Relaxed),
                  MUST_LET_IN.load(Relaxed), ANSWERS.load(Relaxed), NO_NAT.load(Relaxed));
+        println!("  nat: {} packets denied, checked; {} rejects checked", DENIED_CHECKED.load(Relaxed),
+                 REJECTS_CHECKED.load(Relaxed));
     }
 }
 
-fn counters() -> [usize; 7] {
+fn counters() -> [usize; 8] {
     let c = &COUNTERS;
     let l = |a: &std::sync::atomic::AtomicUsize| a.load(std::sync::atomic::Ordering::Relaxed);
-    [l(&c.out), l(&c.back), l(&c.mapped), l(&c.full), l(&c.no_hop), l(&c.no_frame), l(&c.refused)]
+    [l(&c.out), l(&c.back), l(&c.mapped), l(&c.full), l(&c.no_hop), l(&c.no_frame), l(&c.refused), l(&c.denied)]
 }
 
 /// A packet NAT took is counted once, as what became of it -- sent out,
-/// sent back, dropped for one reason -- and one it did not take not at all.
-fn check_counted(taken: bool, before: [usize; 7], after: [usize; 7]) {
+/// sent back, dropped for one reason, denied -- and one it did not take not
+/// at all.
+fn check_counted(taken: bool, before: [usize; 8], after: [usize; 8]) {
     let d: Vec<usize> = before.iter().zip(after.iter()).map(|(b, a)| a - b).collect();
-    let fates = d[0] + d[1] + d[3] + d[4] + d[5] + d[6];
+    let fates = d[0] + d[1] + d[3] + d[4] + d[5] + d[6] + d[7];
     if taken {
         invariant!(fates == 1 && d[2] <= 1, "a packet NAT took counted {:?}", d);
     } else {
@@ -777,7 +902,13 @@ fn outbound(r: &mut Input, m: &mut NatModel) {
             _ => guest,
         };
         let dst = match r.u8() % 16 {
-            0..=9 => r.pick(&REMOTES),
+            0..=7 => r.pick(&REMOTES),
+            8 => r.pick(&KEPT_HOSTS),
+            /* The uplink's own subnet, and the DNS server the guests are
+             * given -- theirs to ask at port 53 alone. */
+            9 if r.bool() => (ETH0.ip() & ETH0.mask()) | (2 + r.below(200) as u32),
+            9 if network::dns::upstream() != 0 => network::dns::upstream(),
+            9 => r.pick(&KEPT_HOSTS),
             10 => SUBNET | r.below(256) as u32,
             11 => ETH0.ip(),
             12 => ETH0.ip() | !ETH0.mask(),
@@ -827,10 +958,30 @@ fn outbound(r: &mut Input, m: &mut NatModel) {
     let after = counters();
     check_counted(taken, before, after);
     let sent = ETH0.take_sent();
-    invariant!(HV0.take_sent().is_empty(), "a guest's packet sent back to the guests");
+    let back = HV0.take_sent();
+    let (target_proto, target, target_port) = target_of(&frame);
+    if after[7] > before[7] {
+        /* Denied: for where the model keeps the guests from, and out of
+         * neither device but as a reject to its guest. */
+        DENIED_CHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        invariant!(kept(m, target_proto, target, target_port), "a guest's packet for {}:{} denied, where it may go",
+                   wire::Ipv4(target), target_port);
+        invariant!(sent.is_empty() && back.len() <= 1, "a denied packet sent on: {} out, {} back", sent.len(),
+                   back.len());
+        if let Some(b) = back.first() {
+            check_reject(&frame, b);
+        }
+    } else {
+        invariant!(back.is_empty(), "a guest's packet sent back to the guests");
+    }
     invariant!(sent.len() <= 1 && (sent.is_empty() || taken), "{} packets sent for one ({})", sent.len(), taken);
     match sent.first() {
-        Some(out) => check_out(&frame, out, m),
+        Some(out) => {
+            invariant!(!kept(m, target_proto, target, target_port),
+                       "a guest's packet for {}:{} sent out, where NAT keeps the guests from", wire::Ipv4(target),
+                       target_port);
+            check_out(&frame, out, m)
+        }
         None if after[2] > before[2] => {
             /* Mapped, and not sent: the key as the packet had it. */
             let p = &frame[ETH_HDR_LEN..];
@@ -1021,7 +1172,11 @@ pub fn nat_target(r: &mut Input) {
     if r.u8() < 32 {
         crate::device::SPARE.set([0x52, 0x54, 0, 0, 0, 9], r.u32(), MASK, 0);
     }
-    network::dns::UPSTREAM.store(r.pick(&[0u32, (outer_ip & mask) | 53, 0x0808_0808]), std::sync::atomic::Ordering::Relaxed);
+    /* The DNS server the guests are given: none, one on the uplink's
+     * subnet, one in the world, QEMU's user network's, or a cloud's
+     * metadata server, which answers DNS there too. */
+    network::dns::UPSTREAM.store(r.pick(&[0u32, (outer_ip & mask) | 53, 0x0808_0808, 0x0A00_0203, 0xA9FE_A9FE]),
+                                 std::sync::atomic::Ordering::Relaxed);
     if r.u8() < 230 {
         network::arp_learn(gw, GW_MAC);
     }
@@ -1035,6 +1190,11 @@ pub fn nat_target(r: &mut Input) {
     invariant!(core::ptr::eq(outer, &ETH0), "NAT out through {:?}", core::str::from_utf8(outer.name()));
     invariant!(matches!(nat.enable(&HV0, None), Err(nat::NatError::Busy)), "NAT on twice");
     let mut m = NatModel::default();
+    /* Now and then the host lets the guests through to a kept network, as
+     * a test machine does its own -- by the shell command a person types. */
+    for _ in 0..r.below(3) {
+        allow_op(r, &mut m, nat);
+    }
 
     while let Some(op) = r.op(10) {
         match op {
@@ -1064,7 +1224,7 @@ pub fn nat_target(r: &mut Input) {
                     }
                 }
             }
-            _ => match r.u8() % 6 {
+            _ => match r.u8() % 7 {
                 0 => {
                     /* What `nat` shows. */
                     let mut shown = [nat::Mapping { proto: 0, inner_ip: 0, inner_port: 0, remote_ip: 0,
@@ -1099,7 +1259,7 @@ pub fn nat_target(r: &mut Input) {
                     invariant!(nat::kernel_net_nat_disable(HV0.handle()) == 0, "NAT off twice");
                     let on = nat::kernel_net_nat_enable(HV0.handle());
                     invariant!(on.code == 0 && on.outer == ETH0.handle(), "NAT back on: {:?}", on);
-                    m = NatModel::default();
+                    m.fresh();
                 }
                 4 => {
                     /* A device NAT cannot take -- none, hv0 as its own way
@@ -1117,9 +1277,10 @@ pub fn nat_target(r: &mut Input) {
                         invariant!(nat::kernel_net_nat_enable(HV0.handle()).code == 1, "NAT on with no uplink");
                         ETH0.set(ETH0_MAC, ETH0.ip(), ETH0.mask(), gw);
                         invariant!(nat::kernel_net_nat_enable(HV0.handle()).code == 0, "NAT back on");
-                        m = NatModel::default();
+                        m.fresh();
                     }
                 }
+                5 => allow_op(r, &mut m, nat),
                 _ => {
                     /* A guest gone (`Switch::release`): every mapping of its
                      * address forgotten through the C ABI the module has,

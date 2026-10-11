@@ -812,6 +812,14 @@ def network(args):
                # and four that never logged in held every slot for logging in.
                x(1, "echo | nc -w 5 10.0.100.1 22; echo nc-hv0-done"),
                x(1, "echo | nc -w 5 10.0.2.15 22; echo nc-eth0-done")]
+    # Where NAT keeps the guests from, before the test machine is let
+    # through: it is on nos's uplink's own subnet, 10.0.2.0/24 -- and
+    # 169.254.169.254 is where a cloud's metadata server answers. A guest's
+    # connect there is refused at once ("No route to host"), not left to
+    # time out.
+    kept = [x(0, "wget -q -T 5 -O - http://10.0.2.2:%d/nat.txt; echo nat-kept-done" % web),
+            x(0, "wget -q -T 5 -O - http://169.254.169.254/; echo nat-metadata-done"),
+            "nat allow 10.0.2.2/32"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -824,7 +832,7 @@ def network(args):
           x(1, "echo nos-http-hello > /www/index.html"),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
-          "hv forward", "insmod /sshd.ko", "sshd start"] + way_out + [RC_LAST]
+          "hv forward", "insmod /sshd.ko", "sshd start"] + kept + way_out + [RC_LAST]
     port = free_port()
     ssh_port = free_port()
     qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
@@ -861,6 +869,17 @@ def network(args):
         pt.check("a page from the guest's httpd, fetched from outside through hv forward",
                  b"nos-http-hello" in body, body[-300:])
 
+        # Kept from the test machine and the metadata server, until let
+        # through.
+        kept_out = [output_of(secs, line, 0) or "" for line in kept]
+        pt.check("NAT keeps a guest from the test machine, on nos's uplink's own subnet, at once",
+                 "nat-kept-done" in kept_out[0] and token not in kept_out[0]
+                 and "No route to host" in kept_out[0], kept_out[0][-400:])
+        pt.check("and from 169.254.169.254, a cloud's metadata server",
+                 "nat-metadata-done" in kept_out[1] and "No route to host" in kept_out[1], kept_out[1][-400:])
+        pt.check("nat allow lets the test machine through", "nat: 10.0.2.2/32 let through" in kept_out[2],
+                 kept_out[2])
+
         # The way-out lines, each by its own occurrence: "hv list" is run
         # before them, and among them twice.
         first = len(rc) - 1 - len(way_out)
@@ -884,6 +903,10 @@ def network(args):
         pt.check("nat: on, from hv0 out through eth0, and it carried the guests' packets both ways",
                  "nat: on, hv0 (10.0.100.1) out through eth0 (10.0.2.15)" in nat and counts is not None
                  and int(counts.group(1)) > 20 and int(counts.group(2)) > 700, nat[-800:])
+        pt.check("nat says where the guests are kept from, what is let through, and what it denied",
+                 "kept from 169.254.0.0/16" in nat and "and eth0's 10.0.2.0/24" in nat
+                 and "let through: 10.0.2.2/32" in nat and re.search(r"denied [1-9]\d*", nat) is not None,
+                 nat[-800:])
         pt.check("hv list says the guests go out through NAT, and counts the DHCP answers",
                  "the guests go out through NAT, from 10.0.2.15" in way(9)
                  and re.search(r"[1-9]\d* DHCP answers", way(9)) is not None, way(9)[-800:])

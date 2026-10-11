@@ -29,6 +29,15 @@
 //! receive paths use it and the shell looks at it, so it is under a lock --
 //! held for the lookup, never for the frame, which is built and sent with the
 //! lock down.
+//!
+//! Where a guest may go is the world past this machine's edge, not what is
+//! behind it: a packet for a cloud's metadata server and link-local's rest
+//! (169.254/16), a private network (10/8, 172.16/12, 192.168/16),
+//! carrier-grade NAT's shared space (100.64/10) or the uplink's own subnet --
+//! the host's LAN -- is kept from the world (`kept`), and its guest answered
+//! with an ICMP error, so that it fails at once rather than waiting out its
+//! retries. `nat allow` lets a network through; the DNS server the guests
+//! are given is theirs to ask at port 53, wherever it is.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -280,6 +289,11 @@ struct On {
 /// NAT's one instance (`abi::nat`).
 pub struct Nat {
     on: SpinLock<Option<On>>,
+    /// The networks `nat allow` let through the deny list -- kept while NAT
+    /// goes off and on, as the host's word on where its guests may go. Its
+    /// room is all taken up front: the receive path reads it, and an allow
+    /// allocates nothing.
+    allowed: SpinLock<Allowed>,
 }
 
 /* The two devices while NAT is on, for the receive path's one look at every
@@ -304,6 +318,9 @@ pub struct Counters {
     /// Packets NAT does not take: another protocol, a fragment, no time to
     /// live left, a TCP segment of no flow it knows.
     pub refused: AtomicUsize,
+    /// Packets for where the guests are kept from (`kept`), each answered
+    /// with an ICMP error.
+    pub denied: AtomicUsize,
 }
 
 pub static COUNTERS: Counters = Counters {
@@ -314,6 +331,7 @@ pub static COUNTERS: Counters = Counters {
     no_hop: AtomicUsize::new(0),
     no_frame: AtomicUsize::new(0),
     refused: AtomicUsize::new(0),
+    denied: AtomicUsize::new(0),
 };
 
 fn count(counter: &AtomicUsize) {
@@ -351,7 +369,52 @@ const NO_MAPPING: Mapping = Mapping {
 
 impl Nat {
     pub fn new() -> Option<Nat> {
-        Some(Nat { on: SpinLock::new(None)? })
+        let allowed = Allowed { nets: [(0, 0); ALLOWED_MAX], count: 0 };
+        Some(Nat { on: SpinLock::new(None)?, allowed: SpinLock::new(allowed)? })
+    }
+
+    /// Let the guests reach the network `net`/`mask` though the deny list
+    /// keeps them from it: false when `ALLOWED_MAX` are let through already.
+    /// One let through already is there once.
+    pub fn allow(&self, net: u32, mask: u32) -> bool {
+        let net = (net & mask, mask);
+        let mut a = self.allowed.lock();
+        if a.nets[..a.count].contains(&net) {
+            return true;
+        }
+        if a.count == ALLOWED_MAX {
+            return false;
+        }
+        let n = a.count;
+        a.nets[n] = net;
+        a.count = n + 1;
+        true
+    }
+
+    /// Take `net`/`mask` back off what `allow` let through: whether it was
+    /// there.
+    pub fn disallow(&self, net: u32, mask: u32) -> bool {
+        let net = (net & mask, mask);
+        let mut a = self.allowed.lock();
+        let n = a.count;
+        let Some(i) = a.nets[..n].iter().position(|x| *x == net) else { return false };
+        a.nets[i] = a.nets[n - 1];
+        a.count = n - 1;
+        true
+    }
+
+    /// What `allow` let through, into `out`: how many.
+    pub fn allowed(&self, out: &mut [(u32, u32); ALLOWED_MAX]) -> usize {
+        let a = self.allowed.lock();
+        out[..a.count].copy_from_slice(&a.nets[..a.count]);
+        a.count
+    }
+
+    /// Whether a guest's packet of `proto` for `dst`, at `port`, is kept
+    /// from the world through `outer` (`kept`).
+    fn keeps(&self, outer: &Device, proto: u8, dst: u32, port: u16) -> bool {
+        let a = self.allowed.lock();
+        kept(proto, dst, port, (outer.ip(), outer.mask()), &a.nets[..a.count], crate::dns::upstream())
     }
 
     /// NAT on, from `inner` out through `outer` -- or, with none named,
@@ -463,6 +526,70 @@ fn name(dev: &Device) -> &str {
     core::str::from_utf8(dev.name()).unwrap_or("?")
 }
 
+/* ---- where a guest may go ---- */
+
+/// The networks a guest is kept from unless `nat allow` lets it through, as
+/// (network, mask): link-local, where a cloud's metadata server answers --
+/// 169.254.169.254, the host VM's credentials behind it -- the private
+/// networks, where the host's own LAN and its neighbours are, and
+/// carrier-grade NAT's shared space, where some clouds keep theirs. The
+/// uplink's own subnet is kept too, whatever it is (`kept`).
+const DENIED: [(u32, u32); 5] = [
+    (0xA9FE_0000, 0xFFFF_0000), /* 169.254/16 */
+    (0x0A00_0000, 0xFF00_0000), /* 10/8 */
+    (0xAC10_0000, 0xFFF0_0000), /* 172.16/12 */
+    (0xC0A8_0000, 0xFFFF_0000), /* 192.168/16 */
+    (0x6440_0000, 0xFFC0_0000), /* 100.64/10 */
+];
+/// Where the DNS server the guests are given is theirs to ask, wherever it
+/// is: on QEMU's user network 10.0.2.3, on a cloud its metadata server.
+const DNS_PORT: u16 = 53;
+/// The most networks `nat allow` lets through at once.
+pub const ALLOWED_MAX: usize = 16;
+
+/// The networks `nat allow` let through, as (network, mask).
+struct Allowed {
+    nets: [(u32, u32); ALLOWED_MAX],
+    count: usize,
+}
+
+/// Whether a guest's packet of `proto` for `dst`, at TCP's or UDP's port
+/// `port`, is kept from the world: for a denied network, or the uplink's own
+/// subnet (`uplink`, as network and mask; a mask of 0 for none), unless one
+/// of `allowed` takes it in -- or it is for `dns`, the DNS server the guests
+/// are given, at its port. Pure, for the boot self-test.
+fn kept(proto: u8, dst: u32, port: u16, uplink: (u32, u32), allowed: &[(u32, u32)], dns: u32) -> bool {
+    if dns != 0 && dst == dns && port == DNS_PORT && (proto == IP_PROTO_UDP || proto == IP_PROTO_TCP) {
+        return false;
+    }
+    let (net, mask) = uplink;
+    let denied = DENIED.iter().any(|&(n, m)| dst & m == n) || (mask != 0 && dst & mask == net & mask);
+    denied && !allowed.iter().any(|&(n, m)| dst & m == n)
+}
+
+/// A network a person wrote -- `a.b.c.d`, or `a.b.c.d/n` -- as (network,
+/// mask), the address's host bits cleared.
+fn parse_net(text: &str) -> Option<(u32, u32)> {
+    const BITS: u32 = 32;
+    let (addr, bits) = match text.split_once('/') {
+        Some((a, b)) => (a, b.parse::<u32>().ok().filter(|&b| b <= BITS)?),
+        None => (text, BITS),
+    };
+    let ip = wire::parse_ipv4(addr.as_bytes())?;
+    let mask = if bits == 0 { 0 } else { u32::MAX << (BITS - bits) };
+    Some((ip & mask, mask))
+}
+
+/// A network as `a.b.c.d/n`.
+struct Net((u32, u32));
+
+impl core::fmt::Display for Net {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (net, mask) = self.0;
+        write!(f, "{}/{}", Ipv4(net), mask.count_ones())
+    }
+}
+
 /// What the receive path of `dev` asks of every IPv4 frame before the
 /// protocols see it: true when NAT has taken it -- sent it on, or dropped it
 /// for good -- and the stack is not to look at it.
@@ -560,11 +687,17 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
             return true;
         }
     };
+    let Some(nat) = crate::abi::nat() else { return false };
+    /* Where the guests are kept from: answered, so that it fails now. */
+    if nat.keeps(outer, p.proto, p.dst, remote_port) {
+        count(&COUNTERS.denied);
+        reject(inner, frame, &p);
+        return true;
+    }
     if p.ttl <= 1 {
         count(&COUNTERS.refused);
         return true;
     }
-    let Some(nat) = crate::abi::nat() else { return false };
     let key = Key { proto: p.proto, inner_ip: p.src, inner_port: port, remote_ip: p.dst, remote_port };
     let mac = eth::src(frame);
     let now = time::boot_time_ns();
@@ -758,6 +891,30 @@ fn copy(bytes: &[u8]) -> Option<Frame> {
     out.fill(bytes).then_some(out)
 }
 
+/// What a guest is answered with for a packet to where it is kept from: a
+/// destination unreachable, communication administratively prohibited
+/// (RFC 1812 5.2.7.1), from the inner device's address -- its gateway's --
+/// to its MAC, quoting the packet's header and the eight bytes after it
+/// (RFC 792). Its connect then fails at once, "no route to host", rather
+/// than wait out its retries. Nothing is sent when there is no frame for it;
+/// and it never answers an ICMP error, NAT taking none of a guest's.
+fn reject(inner: &'static Device, frame: &[u8], p: &Packet) {
+    const ADMIN_PROHIBITED: u8 = 13;
+    const MAX_IHL: usize = 60;
+    let quoted = (p.ihl + QUOTED_L4).min(p.len);
+    let icmp_len = ICMP_HDR_LEN + quoted;
+    let total = ETH_HDR_LEN + IP_HDR_LEN + icmp_len;
+    let mut buf = [0u8; ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + MAX_IHL + QUOTED_L4];
+    eth::write(&mut buf, &eth::src(frame), &inner.mac(), ETH_TYPE_IP);
+    ip::write(&mut buf[ETH_HDR_LEN..], IP_PROTO_ICMP, inner.ip(), p.src, icmp_len, 0);
+    let at = ETH_HDR_LEN + IP_HDR_LEN;
+    buf[at + ICMP_HDR_LEN..total].copy_from_slice(&frame[ETH_HDR_LEN..ETH_HDR_LEN + quoted]);
+    icmp::write(&mut buf[at..], icmp::DEST_UNREACH, ADMIN_PROHIBITED, 0, 0, icmp_len);
+    if let Some(f) = copy(&buf[..total]) {
+        let _ = inner.as_nic().transmit(f);
+    }
+}
+
 /* ---- the rewriting: an IPv4 packet in place, its header first ---- */
 
 /// A guest's packet as it goes out: from `src`:`port`, one hop on.
@@ -916,11 +1073,46 @@ pub extern "C" fn kernel_net_nat_forget(inner: usize, ip: u32) -> u32 {
 
 /* ---- the shell ---- */
 
-/// `nat`: whether it is on and between which devices, what it has done,
-/// and the first of its mappings.
-pub fn shell(_args: &str, out: &mut Output) {
+/// `nat`: whether it is on and between which devices, where the guests are
+/// kept from, what it has done, and the first of its mappings. `nat allow
+/// <net>` lets the guests reach a network the deny list keeps them from --
+/// `a.b.c.d`, or `a.b.c.d/n` -- and `nat deny <net>` takes that back.
+pub fn shell(args: &str, out: &mut Output) {
+    let mut words = args.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (None, _, _) => {}
+        (Some(verb @ ("allow" | "deny")), Some(text), None) => {
+            let Some(nat) = crate::abi::nat() else {
+                let _ = writeln!(out, "nat: none");
+                return;
+            };
+            let Some((net, mask)) = parse_net(text) else {
+                let _ = writeln!(out, "nat: {} is no network -- a.b.c.d, or a.b.c.d/n", text);
+                return;
+            };
+            let what = Net((net, mask));
+            let _ = if verb == "allow" {
+                if nat.allow(net, mask) {
+                    writeln!(out, "nat: {} let through", what)
+                } else {
+                    writeln!(out, "nat: {} not let through -- {} networks are, the most there may be", what,
+                             ALLOWED_MAX)
+                }
+            } else if nat.disallow(net, mask) {
+                writeln!(out, "nat: {} kept from the guests again", what)
+            } else {
+                writeln!(out, "nat: {} was not let through", what)
+            };
+            return;
+        }
+        _ => {
+            let _ = writeln!(out, "usage: nat [allow|deny <a.b.c.d[/n]>]");
+            return;
+        }
+    }
     let mut shown = [NO_MAPPING; SHOWN];
-    match crate::abi::nat().and_then(|nat| nat.state(&mut shown)) {
+    let state = crate::abi::nat().and_then(|nat| nat.state(&mut shown));
+    match state {
         None => {
             let _ = writeln!(out, "nat: off");
         }
@@ -943,11 +1135,35 @@ pub fn shell(_args: &str, out: &mut Output) {
             }
         }
     }
+    /* Where the guests are kept from, and what is let through of it. */
+    let _ = write!(out, "kept from");
+    for &net in &DENIED {
+        let _ = write!(out, " {}", Net(net));
+    }
+    match state {
+        Some((_, outer, _, _)) if outer.mask() != 0 => {
+            let _ = write!(out, " and {}'s {}", name(outer), Net((outer.ip() & outer.mask(), outer.mask())));
+        }
+        _ => {
+            let _ = write!(out, " and the uplink's subnet");
+        }
+    }
+    let mut allowed = [(0, 0); ALLOWED_MAX];
+    let n = crate::abi::nat().map_or(0, |nat| nat.allowed(&mut allowed));
+    let _ = write!(out, "; let through:");
+    if n == 0 {
+        let _ = write!(out, " none");
+    }
+    for &net in &allowed[..n] {
+        let _ = write!(out, " {}", Net(net));
+    }
+    let _ = writeln!(out);
     let c = &COUNTERS;
     let load = |counter: &AtomicUsize| counter.load(Ordering::Relaxed);
-    let _ = writeln!(out, "out {}  back {}  mapped {}  table full {}  no next hop {}  no frame {}  refused {}",
+    let _ = writeln!(out, "out {}  back {}  mapped {}  table full {}  no next hop {}  no frame {}  refused {}  \
+                           denied {}",
         load(&c.out), load(&c.back), load(&c.mapped), load(&c.full), load(&c.no_hop),
-        load(&c.no_frame), load(&c.refused));
+        load(&c.no_frame), load(&c.refused), load(&c.denied));
 }
 
 /* ---- what the boot self-test checks ---- */
@@ -957,7 +1173,32 @@ pub fn shell(_args: &str, out: &mut Output) {
 /// UDP cannot send as it is. And the table filled, run out, and filled
 /// again.
 pub fn selftest() -> bool {
-    rewrites() & zero_sum() & table()
+    rewrites() & zero_sum() & table() & policy()
+}
+
+/// Where a guest may go: kept from a cloud's metadata server, the private
+/// networks and the uplink's own subnet; let through to the world, to what
+/// `nat allow` names, and to the DNS server at its port alone. And a
+/// network as a person writes one.
+fn policy() -> bool {
+    const METADATA: u32 = 0xA9FE_A9FE; /* 169.254.169.254 */
+    const PRIVATE: u32 = 0xAC1F_0001; /* 172.31.0.1 */
+    const SHARED: u32 = 0x647F_FFFE; /* 100.127.255.254 */
+    const UPLINK: (u32, u32) = (0x5F10_2000, 0xFFFF_FFC0); /* 95.16.32.0/26 */
+    const NEIGHBOUR: u32 = 0x5F10_2011; /* 95.16.32.17 */
+    const DNS: u32 = 0x0A00_0203; /* 10.0.2.3 */
+    const PRIVATE_NET: (u32, u32) = (0xAC10_0000, 0xFFF0_0000); /* 172.16/12 */
+    check("the metadata server kept", kept(IP_PROTO_TCP, METADATA, 80, UPLINK, &[], 0))
+        & check("a private network kept", kept(IP_PROTO_UDP, PRIVATE, 1234, UPLINK, &[], 0))
+        & check("the shared space kept", kept(IP_PROTO_ICMP, SHARED, 0, UPLINK, &[], 0))
+        & check("the uplink's neighbour kept", kept(IP_PROTO_TCP, NEIGHBOUR, 22, UPLINK, &[], 0))
+        & check("the world let through", !kept(IP_PROTO_TCP, REMOTE, 443, UPLINK, &[], 0))
+        & check("an allowed network let through", !kept(IP_PROTO_ICMP, PRIVATE, 0, UPLINK, &[PRIVATE_NET], 0))
+        & check("the DNS server at its port", !kept(IP_PROTO_UDP, DNS, DNS_PORT, UPLINK, &[], DNS))
+        & check("the DNS server at another port kept", kept(IP_PROTO_TCP, DNS, 80, UPLINK, &[], DNS))
+        & check("a network parsed", parse_net("10.0.2.2/24") == Some((0x0A00_0200, 0xFFFF_FF00))
+                && parse_net("1.2.3.4") == Some((0x0102_0304, u32::MAX)) && parse_net("0.0.0.0/0") == Some((0, 0))
+                && parse_net("1.2.3.4/33").is_none() && parse_net("1.2.3/8").is_none())
 }
 
 fn check(what: &str, ok: bool) -> bool {

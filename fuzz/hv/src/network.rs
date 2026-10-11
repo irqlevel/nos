@@ -421,6 +421,14 @@ pub fn take_hv0_in() -> Vec<Vec<u8>> {
 pub fn reset() {
     if let Some(nat) = abi::nat() {
         nat.disable(&device::HV0);
+        /* What `nat allow` let through outlives NAT going off, as the
+         * host's word does: taken back, for the next input to start as
+         * the machine does. */
+        let mut nets = [(0, 0); crate::nat::ALLOWED_MAX];
+        let n = nat.allowed(&mut nets);
+        for &(net, mask) in &nets[..n] {
+            nat.disallow(net, mask);
+        }
     }
     vnic::reset();
     for d in [&device::HV0, &device::ETH0, &device::SPARE] {
