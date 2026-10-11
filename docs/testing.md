@@ -426,7 +426,14 @@ elsewhere than its destination says, or counted otherwise; a packet NAT
 rewrote in any field but its own, or with a sum it did not have, a port
 given to one flow while another was live on it, an answer let in that no
 live flow asked for or kept out that one did, a packet counted twice or
-not at all; what a guest takes from the world for another guest's address,
+not at all; a guest's packet for where NAT keeps the guests from -- a
+metadata server, a private network, the uplink's own subnet -- sent out,
+one for where they may go denied, a reject other than an administratively
+prohibited to its guest quoting it, or the networks NAT lets through other
+than `nat allow` and `nat deny` left them (control runs with nothing
+denied, the DNS server not let through, `nat allow` ignored and the
+reject's code wrong failed at inputs 16, 29, 1 and 16); what a guest takes
+from the world for another guest's address,
 and what `hv0` or a guest takes from a guest not sent as that guest; a
 vCPU that enters its
 guest or waits with one of the kernel's locks held; a guest whose RAM would
@@ -1313,15 +1320,21 @@ gate wants QEMU 9.2 or later, as `hv-test.py` does.
 `--net` is the guests' network: two guests with `net`; each has its port's
 address and MAC; a guest pings nos at 10.0.100.1 and each pings the other;
 nos pings a guest out of `hv0`; and a page from one guest's `httpd` is
-fetched from outside QEMU through `hv forward`. Then the way out, through
-nos's NAT: the guest's `/proc/net/pnp` names nos's DNS server (`ip=`'s
+fetched from outside QEMU through `hv forward`. Then where NAT keeps the
+guests from: a fetch from the test machine -- 10.0.2.2, on nos's uplink's
+own subnet -- and one from 169.254.169.254, a cloud's metadata server, must
+each fail at once with "No route to host", and `nat allow 10.0.2.2/32` must
+let the test machine through (on the stack before the deny list, the guest
+had the page, and NAT mapped its connection to the metadata address). Then
+the way out, through nos's NAT: the guest's `/proc/net/pnp` names nos's DNS server (`ip=`'s
 `dns0`); it fetches a page and a megabyte from a web server the test runs on
 127.0.0.1 -- 10.0.2.2 to QEMU's user network, so beyond nos -- and the
 megabyte's md5 must match; it pings 10.0.2.2; `udhcpc` must be given its
 port's address, nos as its router and nos's DNS server by the switch; and
 `nat` must say it is on from `hv0` through eth0 and count the megabyte's
-segments back, `hv list` the address the guests go out from and the DHCP
-answers. With `--internet`, a name is also looked up through that DNS server
+segments back, say where the guests are kept from, what is let through and
+how many packets it denied, `hv list` the address the guests go out from and
+the DHCP answers. With `--internet`, a name is also looked up through that DNS server
 -- which needs the test machine to resolve names. One question at a time:
 BusyBox's `nslookup` asks for A and AAAA at once and matches answers to
 questions by their ID alone, which musl takes from the clock's nanoseconds,
@@ -1430,7 +1443,9 @@ the ISO is read-only to it -- the driver says so and a write fails; that
 `reboot` resets it, `restart` boots it again, and root logs in again; that
 its initramfs configured eth0 from the VM's `ip=`, it pings nos and nos
 pings it; that its `resolv.conf` names nos's DNS server and it fetches a page
-from the test machine through NAT (with `--internet`, it also looks Alpine's
+from the test machine through NAT -- which `/etc/rc` lets through first,
+`nat allow 10.0.2.2/32`, the test machine being on nos's uplink's own subnet
+-- (with `--internet`, it also looks Alpine's
 mirror up by name and `apk update`s from it); that `apk add openssh-server`
 installs from the ISO; and that the
 test, from outside QEMU, logs into the guest's own sshd through QEMU's

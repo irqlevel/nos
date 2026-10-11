@@ -1381,7 +1381,27 @@ has it, which it cannot, being below 32768.
 What it takes: TCP from a SYN on (a segment of a flow it has no mapping for
 is dropped, not mapped mid-stream), UDP, ICMP echo; not fragments, not other
 protocols, and nothing inbound that a guest did not start -- that is
-`hv forward`'s. A mapping lives while its flow is seen and RFC 5382's and
+`hv forward`'s.
+
+**Where a guest may go is the world past nos's edge, not what is behind
+it.** NAT keeps the guests from link-local (169.254/16, where a cloud's
+metadata server answers at 169.254.169.254, the host VM's credentials
+behind it), the private networks (10/8, 172.16/12, 192.168/16), carrier-grade
+NAT's shared space (100.64/10), where some clouds keep theirs, and the
+uplink's own subnet -- the host's LAN, its neighbours -- whatever that is. A
+guest's packet for any of them is not mapped: it is counted (`denied`) and
+answered with an ICMP destination unreachable, communication
+administratively prohibited, from 10.0.100.1, quoting it -- so its connect
+fails at once, "No route to host", rather than waiting out its retries. The
+DNS server the guests are given is theirs to ask at port 53, wherever it is
+(10.0.2.3 under QEMU's user network; on a cloud, the metadata server's
+address). `nat allow <net>` lets a network through -- the test machine,
+under QEMU, is on the uplink's subnet at 10.0.2.2 -- and `nat deny <net>`
+takes that back; up to 16, kept while NAT goes off and on, as the host's
+word. `nat` says what is kept and what is let through. The rule is a pure
+function (`kept`) the boot self-test checks; hv-fuzz's `nat` target holds
+every packet to a model of its own (nothing to a kept network out, every
+reject right, the list as `nat allow` and `nat deny` left it). A mapping lives while its flow is seen and RFC 5382's and
 4787's times after: two hours for a TCP connection that has been answered,
 four minutes before that and after a FIN, ten seconds after a reset, five
 minutes for UDP, one for an echo. The checksums are updated for what changed
@@ -2935,11 +2955,22 @@ someone else's; then speed.
    logged in held every slot for logging in, on the Hetzner boxes the only
    console there is. Forwards still draw on the same 64 connections the
    machine has (item 5).
-4. **NAT lets a guest go anywhere nos can.** `routable` refuses 0/8, 127/8,
-   multicast and the subnet's broadcast, and nothing else: 169.254.169.254
-   -- a cloud's metadata server, the host VM's credentials behind it -- the
-   private networks and the host's own LAN are all open. Fix: a deny list
-   by default.
+4. ~~**NAT lets a guest go anywhere nos can.**~~ Done: NAT keeps the
+   guests from link-local, the private networks, the shared space and the
+   uplink's own subnet unless `nat allow` lets a network through, the DNS
+   server they are given at port 53 aside, and answers a guest's packet for
+   any of them with an ICMP "administratively prohibited"
+   ([The way out](#the-way-out-nat-dhcp-and-dns)). hv-fuzz's `nat` target
+   holds every packet to a model of the rule -- control runs with nothing
+   denied, the DNS server not let through, `nat allow` ignored and the
+   reject's code wrong each failed within thirty inputs -- and
+   `hv-linux-test.py --net` has a guest refused at the test machine and at
+   169.254.169.254 before `nat allow 10.0.2.2/32`; on the stack before, the
+   guest had the test machine's page and NAT mapped its connection to the
+   metadata address. What it was: `routable` refused 0/8, 127/8, multicast
+   and the subnet's broadcast and nothing else, so 169.254.169.254 -- the
+   host VM's credentials -- the private networks and the host's own LAN
+   were all open.
 5. **What the guests share has no quota.** One NAT table of 4096 mappings
    for all of them, which refuses a new flow when it is full rather than
    take the flooder's oldest; one 256-frame backlog for `hv0`; a broadcast

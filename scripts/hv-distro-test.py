@@ -205,7 +205,9 @@ def alpine(args):
                   " update", 600)] if args.internet else []
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 " + PROMPT]
-    rc = (["insmod /hv.ko", "hv on",
+    # The test machine is on nos's uplink's own subnet, which NAT keeps the
+    # guests from until it is let through.
+    rc = (["insmod /hv.ko", "hv on", "nat allow 10.0.2.2/32",
            "hv start /bzImage mem=%d%s initrd=/initrd disk=/alpine.iso:ro net restart cmdline=%s"
            % (args.mem, machine_opt(args), cmdline)]
           + login(0)
@@ -250,7 +252,7 @@ def alpine(args):
         def out(line, occurrence=0):
             return hvl.output_of(secs, line, occurrence) or ""
 
-        start = rc[2]
+        start = rc[3]
         pt.check("the VM starts, the ISO read-only and on the switch",
                  re.search(r"vm 0 started on cpus? \d+(,\d+)*", out(start)) is not None, out(start))
         first, second = login(0), login(1)
@@ -260,14 +262,14 @@ def alpine(args):
             print("  (login prompt %.1f s after the VM started)" % (int(m.group(1)) / 1000.0))
         pt.check("root logs in, typed at the getty", "printed \"%s\"" % PROMPT in out(first[2]),
                  out(first[2]))
-        release = out(rc[6])
+        release = out(rc[7])
         pt.check("and it is Alpine, on its virt kernel",
                  re.search(r"^\d+\.\d+\.\d+\s*$", release, re.M) is not None and "-virt" in release, release)
-        m = re.search(r"^(\d{9,})\s*$", out(rc[7]), re.M)
+        m = re.search(r"^(\d{9,})\s*$", out(rc[8]), re.M)
         pt.check("its clock is the host's, from the emulated RTC",
                  m is not None and t_start - 300 <= int(m.group(1)) <= t_end + 300,
-                 "%s (host %d..%d)" % (out(rc[7]), t_start, t_end))
-        ro = out(rc[8])
+                 "%s (host %d..%d)" % (out(rc[8]), t_start, t_end))
+        ro = out(rc[9])
         pt.check("the ISO is read-only to it: the driver says so, and a write fails",
                  re.search(r"^1\s*$", ro, re.M) is not None and "dd=1" in ro, ro)
         rate = clock_rate(out, clock_lines(0, x))
@@ -502,7 +504,7 @@ def cloud(args, d):
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
                 r"hv send 0 %s\n" % d.password, "hv wait 0 secs=120 " + d.prompt]
-    rc = (["insmod /hv.ko", "hv on",
+    rc = (["insmod /hv.ko", "hv on", "nat allow 10.0.2.2/32",
            "hv start /bzImage mem=%d%s initrd=/initrd%s net restart cmdline=%s"
            % (d.mem, machine_opt(args), disks, cmdline)]
           + login(0)
@@ -554,15 +556,15 @@ def cloud(args, d):
             print("  (login prompt %.1f s after the VM started)" % (int(m.group(1)) / 1000.0))
         pt.check("root logs in, " + d.provisioned,
                  "printed \"%s\"" % d.prompt in out(first[4]), out(first[2]) + out(first[4]))
-        pt.check(d.version_what, d.version_ok(out(rc[8])), out(rc[8]))
-        pt.check("systemd says the system is running", re.search(r"^running\s*$", out(rc[9]), re.M) is not None,
-                 out(rc[9]))
-        pt.check("with no unit failed", re.search(r"^0\s*$", out(rc[10]), re.M) is not None, out(rc[10]))
+        pt.check(d.version_what, d.version_ok(out(rc[9])), out(rc[9]))
+        pt.check("systemd says the system is running", re.search(r"^running\s*$", out(rc[10]), re.M) is not None,
+                 out(rc[10]))
+        pt.check("with no unit failed", re.search(r"^0\s*$", out(rc[11]), re.M) is not None, out(rc[11]))
         pt.check("its root is the guest's disk, ext4, read-write",
-                 re.search(r"^/dev/vda1 ext4 rw", out(rc[11]), re.M) is not None, out(rc[11]))
-        m = re.search(r"^(\d{9,})\s*$", out(rc[12]), re.M)
+                 re.search(r"^/dev/vda1 ext4 rw", out(rc[12]), re.M) is not None, out(rc[12]))
+        m = re.search(r"^(\d{9,})\s*$", out(rc[13]), re.M)
         pt.check("its clock is the host's", m is not None and t_start - 300 <= int(m.group(1)) <= t_end + 300,
-                 out(rc[12]))
+                 out(rc[13]))
         rate = clock_rate(out, clock_lines(0, x))
         pt.check("idle, its clock keeps the host's time (no tick lost)",
                  rate is not None and abs(rate - 1) <= CLOCK_TOLERANCE, "rate %s" % rate)
