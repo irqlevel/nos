@@ -1383,7 +1383,7 @@ $ nat
 nat: on, hv0 (10.0.100.1) out through eth0 (10.0.2.15); 4 of 4096 mappings, ports 32768-36863
   tcp 10.0.100.2:47410 -> 10.0.2.2:8000 as 32768, 7190 s left
   udp 10.0.100.2:37716 -> 10.0.2.3:53 as 32771, 297 s left
-out 53  back 744  mapped 4  table full 0  no next hop 0  no frame 0  refused 0
+out 53  back 744  mapped 4  taken from the most 0  no room 0  no next hop 0  no frame 0  refused 0  denied 0
 ```
 
 **NAT is the network layer's** (`net/src/nat.rs`), not the module's: it is
@@ -1440,9 +1440,17 @@ The table is 4096 mappings and a hash of the guests' side of them, taken
 whole when NAT goes on, so the datapath allocates nothing but the frame a
 packet goes out in, from the pool. It is under a spin lock held for the
 lookup only; the frame is built and sent with it down. When all 4096 are
-live the next flow is refused (`table full`) rather than made to evict one,
-and the table is swept for flows past their time no sooner than the first of
-them can be. The next hop's address comes from the ARP cache without waiting
+live, the next flow takes one: the one used least lately of the guest that
+holds the most -- its own, when the asker holds as many as any (`taken from
+the most`). Each guest's mappings are a list in the order they were last
+used, in either direction, so the one to give up is found at once; a guest
+that opens flows as fast as it can takes them from itself, and cannot have
+every mapping there is, as it could while a full table refused every new
+flow. The table keeps a share for 64 guests at once, the switch having 16
+ports; a packet of a guest past them is refused (`no room`). It is swept for
+flows past their time no sooner than the first of them can be -- the soonest
+of every flow's time, kept as each is made or kept alive, since a UDP flow's
+five minutes can run out under a TCP flow's two hours. The next hop's address comes from the ARP cache without waiting
 -- NAT runs on the receive path, which cannot sleep: an entry past its time is
 still used while it is asked for again, as Linux uses a stale neighbour, and
 the gateway and an on-link DNS server are asked for when NAT goes on, so a
@@ -3028,11 +3036,20 @@ someone else's; then speed.
    and the subnet's broadcast and nothing else, so 169.254.169.254 -- the
    host VM's credentials -- the private networks and the host's own LAN
    were all open.
-5. **What the guests share has no quota.** One NAT table of 4096 mappings
-   for all of them, which refuses a new flow when it is full rather than
-   take the flooder's oldest; one 256-frame backlog for `hv0`; a broadcast
-   copied to every port, each a wake or a kick. Fix: mappings and rates per
-   port.
+5. **What the guests share has no quota.** NAT's half is done: a full
+   table gives a new flow the mapping used least lately of the guest that
+   holds the most -- the asker's own when it holds as many as any -- where
+   it refused every new flow, so one guest that filled it kept every other
+   from the world ([The way out](#the-way-out-nat-dhcp-and-dns)). The boot
+   self-test holds the shares to the rule -- a guest's own flow, another
+   guest's taken from the one holding the most, a tie, every slot held --
+   and hv-fuzz's `nat` target floods the table and holds each flow taken to
+   it; refusing when full, as before, failed it at once. And the soonest a
+   sweep may find a flow run out is kept as each flow's time is, where a
+   flow made after the last sweep could run out unseen and be counted live
+   for up to two hours. Left: one 256-frame backlog for `hv0`; a broadcast
+   copied to every port, each a wake or a kick. Fix: a share of the backlog,
+   and a rate, per port.
 6. **Two VMs can share a core.** `pick_cpus` keeps a guest's own CPUs off
    each other's cores, for speed; nothing keeps another guest off them, and
    the host's tasks serving another guest's disk can run on the sibling
