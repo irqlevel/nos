@@ -340,18 +340,26 @@ struct Slot {
     local_port: u16,
     remote_ip: u32,
     remote_port: u16,
+    /// The device it belongs to: the one a listener was opened on, the one
+    /// a connection came in or went out by. A segment from any other is
+    /// not its own, whatever addresses it carries -- the guests' switch
+    /// (`hv0`) reaches neither a service listening on eth0 nor a
+    /// connection made over it.
+    device: Option<Nic>,
 }
 
 impl Slot {
     const FREE: Slot = Slot {
         used: false, listening: false,
         local_ip: 0, local_port: 0, remote_ip: 0, remote_port: 0,
+        device: None,
     };
 
-    fn is(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16) -> bool {
+    fn is(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16, nic: &Nic) -> bool {
         self.used && !self.listening
             && self.local_ip == local_ip && self.local_port == local_port
             && self.remote_ip == remote_ip && self.remote_port == remote_port
+            && self.device.is_some_and(|d| d.is(nic))
     }
 }
 
@@ -379,13 +387,13 @@ impl Pool {
     }
 
     /// The slot those four addresses name.
-    fn lookup(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16)
+    fn lookup(&self, local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16, nic: &Nic)
         -> Option<usize>
     {
         let mut at = self.buckets[hash_index(local_ip, local_port, remote_ip, remote_port)];
         while at >= 0 {
             let index = at as usize;
-            if self.slots[index].is(local_ip, local_port, remote_ip, remote_port) {
+            if self.slots[index].is(local_ip, local_port, remote_ip, remote_port, nic) {
                 return Some(index);
             }
             at = self.next[index];
@@ -393,13 +401,16 @@ impl Pool {
         None
     }
 
-    /// The listener for that address and port. One bound to an address must
-    /// not take a segment aimed at another, while a wildcard one takes any.
-    fn find_listener(&self, local_ip: u32, local_port: u16) -> Option<usize> {
+    /// The listener for that address and port on `nic`, the device the SYN
+    /// came in by: one opened on another device is not asked. One bound to
+    /// an address must not take a segment aimed at another, while a
+    /// wildcard one takes any.
+    fn find_listener(&self, local_ip: u32, local_port: u16, nic: &Nic) -> Option<usize> {
         (0..MAX_CONNECTIONS).find(|&i| {
             let slot = &self.slots[i];
             slot.used && slot.listening && slot.local_port == local_port
                 && (slot.local_ip == local_ip || slot.local_ip == 0)
+                && slot.device.is_some_and(|d| d.is(nic))
         })
     }
 
@@ -1061,8 +1072,8 @@ impl Tcp {
 
         let pool = self.pool.lock();
 
-        /* The four addresses, exactly */
-        if let Some(index) = pool.lookup(local_ip, local_port, remote_ip, remote_port) {
+        /* The four addresses, exactly, on the device it came in by */
+        if let Some(index) = pool.lookup(local_ip, local_port, remote_ip, remote_port, nic) {
             let conn = &self.conns[index];
             /* Locked before the pool is let go of: that is what stops the
              * slot changing hands in between. */
@@ -1081,7 +1092,7 @@ impl Tcp {
          * is answered with a reset, a RST ignored (RFC 9293 3.10.7.2), and
          * a SYN that carries either, or a FIN, is no request to connect. */
         if flags & (seg::SYN | seg::ACK_FLAG | seg::RST | seg::FIN) == seg::SYN
-            && pool.find_listener(local_ip, local_port).is_some()
+            && pool.find_listener(local_ip, local_port, nic).is_some()
         {
             let mut pool = pool;
 
@@ -1094,6 +1105,7 @@ impl Tcp {
             let index = match pool.alloc(Slot {
                 used: true, listening: false,
                 local_ip, local_port, remote_ip, remote_port,
+                device: Some(*nic),
             }) {
                 Some(index) => index,
                 None => return,
@@ -1175,8 +1187,11 @@ impl Tcp {
         pending >= LISTEN_BACKLOG
     }
 
-    /// A destination unreachable quoting a segment this machine sent.
-    pub fn on_icmp_unreachable(&'static self, local_ip: u32, local_port: u16,
+    /// A destination unreachable quoting a segment this machine sent, come
+    /// in by `nic`: an error from another device than the connection's is
+    /// none of its business -- a guest behind the switch cannot abort a
+    /// connection of nos's over eth0 with one.
+    pub fn on_icmp_unreachable(&'static self, nic: &Nic, local_ip: u32, local_port: u16,
         remote_ip: u32, remote_port: u16, quoted_seq: u32)
     {
         if !self.initialized.load(Ordering::Acquire) {
@@ -1184,7 +1199,7 @@ impl Tcp {
         }
 
         let pool = self.pool.lock();
-        let index = match pool.lookup(local_ip, local_port, remote_ip, remote_port) {
+        let index = match pool.lookup(local_ip, local_port, remote_ip, remote_port, nic) {
             Some(index) => index,
             None => return,
         };
@@ -1252,7 +1267,7 @@ impl Tcp {
         } else {
             /* Two connections with the same four addresses would take each
              * other's segments. */
-            if pool.lookup(nic.ip(), src_port, dst_ip, dst_port).is_some() {
+            if pool.lookup(nic.ip(), src_port, dst_ip, dst_port, nic).is_some() {
                 drop(pool);
                 trace!(0, "tcp: port {} is already connected to that address", src_port);
                 return None;
@@ -1264,6 +1279,7 @@ impl Tcp {
         let index = match pool.alloc(Slot {
             used: true, listening: false,
             local_ip, local_port: src_port, remote_ip: dst_ip, remote_port: dst_port,
+            device: Some(*nic),
         }) {
             Some(index) => index,
             None => {
@@ -1325,8 +1341,10 @@ impl Tcp {
         None
     }
 
-    /// A passive open, at every address this machine has -- a connection
-    /// belongs to the device it arrives on.
+    /// A passive open on `nic`: a SYN that comes in by it, for any address
+    /// this machine has, and none that comes in by another device -- a
+    /// guest behind the hypervisor's switch does not reach a service
+    /// listening on eth0. A connection belongs to the device it arrives on.
     pub fn listen(&'static self, nic: &Nic, port: u16) -> Option<&'static Conn> {
         if !self.initialized.load(Ordering::Acquire) {
             return None;
@@ -1347,6 +1365,7 @@ impl Tcp {
         let index = pool.alloc(Slot {
             used: true, listening: true,
             local_ip: 0, local_port: port, remote_ip: 0, remote_port: 0,
+            device: Some(*nic),
         })?;
 
         let mut inner = self.take_fresh(index);

@@ -549,7 +549,12 @@ own, TCP's flags in combinations that mean something. The targets:
   against RFC 9293 -- the window, the sequence space, what may carry data --
   and does what peers do: retransmits, probes a zero window, resets, goes
   quiet; and an attacker off the path injecting segments at every sequence
-  number, an ICMP error at every quoted one;
+  number, an ICMP error at every quoted one. And now and then a second
+  device, eth1, standing for the hypervisor's switch, from which a guest
+  sends a SYN to a port the machine listens on -- at eth1's address or at
+  eth0's: a listener takes connections from its own device alone, so no
+  SYN-ACK may go out to it on either wire (the first input of the control
+  run with the device left out of the listener's lookup got one);
 - `http` and `https`: the HTTP client fetching through chains of redirects
   from a server that answers well -- whose result is then known exactly --
   or to break it: numbers longer than any field, chunk sizes of every
@@ -1340,7 +1345,14 @@ makes last, reached the claiming guest instead of the other's `httpd`.)
 Then one guest is stopped with a forward to it and its flows in NAT's table:
 its forward has to go with it, the other's stay, and `nat` show no mapping
 of its address -- the next VM on its port has its MAC and address, and was
-once relayed to and answered for the stopped one. It
+once relayed to and answered for the stopped one. Last, nos's own services
+are not the guests': sshd is started on nos, and must give its banner to
+the test machine through a port QEMU forwards to eth0 -- so a guest's
+refusal is the listener's doing, not a server that never started -- while
+a guest's `nc` to nos's port 22, at 10.0.100.1 on `hv0` and at eth0's
+address through `hv0`, must be refused. A guest once had the banner both
+ways, and four connections that never logged in held every slot sshd has
+for logging in -- on the Hetzner boxes, the only console there is. It
 needs a guest kernel with networking, virtio-net, packet sockets and `ip=`
 configuration built in, and POSIX timers: BusyBox's `ping` paces itself
 with `alarm()`, which a `tinyconfig` leaves out, and without it the guest's
