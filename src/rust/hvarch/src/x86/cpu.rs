@@ -66,6 +66,25 @@ pub fn vendor_id() -> [u8; 12] {
     out
 }
 
+/// IA32_MISC_ENABLE, and its bit that lets `rep movs` and `rep stos` take
+/// their fast paths.
+const MSR_MISC_ENABLE: u32 = 0x1A0;
+const MISC_ENABLE_FAST_STRING: u64 = 1 << 0;
+
+/// Whether this CPU runs its string instructions fast: IA32_MISC_ENABLE's
+/// bit 0, which an Intel CPU's firmware turns on -- what a guest on it is
+/// told, its `rep movs` being this CPU's. False on any other vendor's,
+/// which has no such MSR.
+pub fn fast_strings() -> bool {
+    if vendor_id() != *b"GenuineIntel" {
+        return false;
+    }
+    // SAFETY: every Intel CPU since the Pentium 4 has IA32_MISC_ENABLE, and
+    // this kernel runs on none older: it is 64-bit.
+    let misc = unsafe { rdmsr(MSR_MISC_ENABLE) };
+    misc & MISC_ENABLE_FAST_STRING != 0
+}
+
 /// # Safety
 /// The CPU has this MSR. Reading one it does not have is a #GP, and this
 /// kernel's #GP handler panics -- so every caller here reads the CPUID bit

@@ -104,6 +104,7 @@ pub mod walk;
 
 mod guestnet;
 mod platform;
+mod policymodel;
 mod recycle;
 mod targets;
 

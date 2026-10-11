@@ -1087,7 +1087,12 @@ pub fn platform(r: &mut Input) {
     let x2apic = r.bool();
     let ioapic = cpus > 1 && r.bool();
     let mem_bytes = r.pick(&[64 * MIB, 128 * MIB, 256 * MIB, 3072 * MIB, 4064 * MIB, 4096 * MIB]);
-    let machine = Machine::new(if r.bool() { Vendor::Svm } else { Vendor::Vmx });
+    let vmx = r.bool();
+    /* The host whose CPUID the policy shapes, before the guest is made --
+     * which asks it what CR4 may take: an AMD CPU under AMD-V, an Intel one
+     * under VT-x. */
+    crate::x86::cpu::set_host((r.u64() & !1) | u64::from(vmx));
+    let machine = Machine::new(if vmx { Vendor::Vmx } else { Vendor::Svm });
     let Some(doorbells) = Doorbells::new(cpus as usize) else { return };
     let made = LinuxGuest::new(&machine, mem_bytes, cpus, Arc::new(doorbells), x2apic, ioapic);
     if mem_bytes > crate::run::MAX_MEM_BYTES {

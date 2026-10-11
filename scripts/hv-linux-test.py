@@ -82,6 +82,16 @@ SHELL_MARKERS = [
     r"BusyBox",
 ]
 
+# What no boot may say, with ACPI or without: that its kernel took an MSR
+# for there and was refused it at an access not ready for a refusal -- the
+# policy answers what the guest's CPUID says it has and refuses the rest
+# (`hv/src/policy.rs`) -- and the panic a refused read of a machine-check
+# register is.
+NEVER = [
+    r"unchecked MSR access error",
+    r"MCA architectural violation",
+]
+
 # With --acpi: what the boot says of the tables it was given, in the order
 # it says it -- the RSDP where the loader put it, the FADT's PM timer, the
 # namespace up, S5 found, PIC mode, the host bridge the DSDT describes and
@@ -540,6 +550,15 @@ def check_boot(args, txt):
     for m in args.expect:
         pt.check("the console shows: %s" % m, re.search(re.escape(m), block) is not None,
                  block[-1500:])
+    for m in NEVER:
+        bad = re.search(r"(?m)^.*%s.*$" % m, block)
+        pt.check("the console says nothing like: %s" % m, bad is None, bad.group(0) if bad else "")
+    # What its kernel asked of MSRs nobody names, and was refused -- probes
+    # it was ready for, else the check above fails: the report lists the
+    # first few. On a machine of another vendor or family, other probes.
+    refused = re.findall(r"(?m)^\s+#GP\s+((?:rd|wr)msr 0x[0-9a-f]+)", txt)
+    if refused:
+        print("note: the guest was refused %s" % ", ".join(refused))
     if args.acpi:
         for m in ACPI_BOOT:
             if args.ioapic:
@@ -690,9 +709,10 @@ def accel_args(args):
     `-cpu max` (AMD-V), which is what a guest is brought up under where there
     is no KVM. So the Linux path is exercised on whichever backend the host
     has, the two covered between an AMD host, an Intel host and TCG."""
-    kvm = os.path.exists("/dev/kvm") and not getattr(args, "tcg", False) \
+    qemu_cpu = getattr(args, "qemu_cpu", None)
+    kvm = os.path.exists("/dev/kvm") and not getattr(args, "tcg", False) and not qemu_cpu \
         and (hvt.host_has_svm() or hvt.host_has_vmx())
-    return ["-cpu", "host", "-enable-kvm"] if kvm else ["-cpu", "max"]
+    return ["-cpu", "host", "-enable-kvm"] if kvm else ["-cpu", qemu_cpu or "max"]
 
 
 def boot_rc(args, tmp, rc, extra=None, qemu=None):
@@ -1082,7 +1102,7 @@ def run(args):
 
     accel = accel_args(args)
     print("accelerator: %s" % ("KVM, the host's %s (nested)" % ("Intel VT-x" if hvt.host_has_vmx() else "AMD-V")
-                               if "-enable-kvm" in accel else "TCG, -cpu max (AMD-V)"))
+                               if "-enable-kvm" in accel else "TCG, -cpu %s (AMD-V)" % accel[1]))
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", NOS_SMP] + accel + [
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
@@ -1180,6 +1200,10 @@ def main():
                          "which needs the test machine to resolve names")
     ap.add_argument("--root-mib", type=int, default=128, help="nos's root filesystem image's size")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM even if the host has AMD-V")
+    ap.add_argument("--qemu-cpu", metavar="MODEL",
+                    help="the CPU nos runs on, under TCG, in place of max: a named one -- EPYC-Rome, a Zen 2; "
+                         "Skylake-Client,+svm, an Intel CPU with AMD-V -- whose family and model the guest's "
+                         "kernel then takes the paths of, its MSRs above all")
     ap.add_argument("--keep", action="store_true", help="keep the serial log (it is kept on a failure anyway)")
     ap.add_argument("--verbose", action="store_true", help="print the whole serial log at the end")
     args = ap.parse_args()
