@@ -25,10 +25,11 @@
 //! shows the bytes, rather than guess. Pure code over a slice, and nothing
 //! of the guest's is trusted: every length is checked against what is there.
 //!
-//! And one more, apart: a `mov` to or from a control register
+//! And two more, apart: a `mov` to or from a control register
 //! ([`decode_mov_cr`]), which an intercept of CR4 stops the guest at
-//! (`crate::cr`) -- the same bytes fetched the same way, for the register
-//! the exit does not name.
+//! (`crate::cr`), and one of a debug register ([`decode_mov_dr`]), which an
+//! intercept of DR0-DR3 does (`crate::dr`) -- the same bytes fetched the
+//! same way, for the register the exit does not name.
 
 /// The most bytes an x86 instruction has.
 pub const MAX_LEN: usize = 15;
@@ -62,6 +63,9 @@ const MOVSX_16: u8 = 0xBF;
 /// `mov` from a control register, and to one: 0x0F 0x20 and 0x0F 0x22.
 const MOV_FROM_CR: u8 = 0x20;
 const MOV_TO_CR: u8 = 0x22;
+/// `mov` from a debug register, and to one: 0x0F 0x21 and 0x0F 0x23.
+const MOV_FROM_DR: u8 = 0x21;
+const MOV_TO_DR: u8 = 0x23;
 
 /* ModRM and SIB fields. */
 const MOD_SHIFT: u8 = 6;
@@ -321,6 +325,38 @@ pub struct MovCr {
 /// and a repeat are refused, as is a REX anywhere but just before the
 /// opcode.
 pub fn decode_mov_cr(bytes: &[u8], mode: Mode) -> Option<MovCr> {
+    let (cr, gpr, write, len) = decode_mov_special(bytes, mode, MOV_TO_CR, MOV_FROM_CR)?;
+    Some(MovCr { cr, gpr, write, len })
+}
+
+/// A `mov` to or from a debug register, decoded as [`MovCr`] is: which one,
+/// which general-purpose register, which way, and how long the instruction
+/// is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MovDr {
+    /// The debug register's number, 0-15: ModRM's reg field, REX.R its top
+    /// bit -- 8 and above an #UD a CPU raises before any intercept.
+    pub dr: u8,
+    /// The general-purpose register, as [`MovCr::gpr`].
+    pub gpr: u8,
+    /// To the debug register, rather than from it.
+    pub write: bool,
+    pub len: u8,
+}
+
+/// Decode a `mov` to or from a debug register at the start of `bytes`, in
+/// `mode` -- what a debug-register intercept stops a guest at -- or None for
+/// anything else: the same encoding as a control register's, two opcodes
+/// over, decoded by the same rules ([`decode_mov_cr`]).
+pub fn decode_mov_dr(bytes: &[u8], mode: Mode) -> Option<MovDr> {
+    let (dr, gpr, write, len) = decode_mov_special(bytes, mode, MOV_TO_DR, MOV_FROM_DR)?;
+    Some(MovDr { dr, gpr, write, len })
+}
+
+/// A `mov` to or from a control or a debug register, by its two opcodes:
+/// the special register's number, the general-purpose register's, whether
+/// it writes the special one, and the instruction's length.
+fn decode_mov_special(bytes: &[u8], mode: Mode, to: u8, from: u8) -> Option<(u8, u8, bool, u8)> {
     let bytes = &bytes[..bytes.len().min(MAX_LEN)];
     let mut c = Bytes { b: bytes, at: 0 };
     let mut rex = 0u8;
@@ -346,14 +382,14 @@ pub fn decode_mov_cr(bytes: &[u8], mode: Mode) -> Option<MovCr> {
         return None;
     }
     let write = match c.next()? {
-        MOV_TO_CR => true,
-        MOV_FROM_CR => false,
+        op if op == to => true,
+        op if op == from => false,
         _ => return None,
     };
     let modrm = c.next()?;
-    let cr = ((modrm >> REG_SHIFT) & FIELD_MASK) | if rex & REX_R != 0 { 8 } else { 0 };
+    let special = ((modrm >> REG_SHIFT) & FIELD_MASK) | if rex & REX_R != 0 { 8 } else { 0 };
     let gpr = (modrm & FIELD_MASK) | if rex & REX_B != 0 { 8 } else { 0 };
-    Some(MovCr { cr, gpr, write, len: c.at as u8 })
+    Some((special, gpr, write, c.at as u8))
 }
 
 /// What the opcode said the access is, before the operand is decoded.

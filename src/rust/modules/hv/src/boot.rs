@@ -16,10 +16,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use hv::run::Host;
 use hv::{Doorbells, Machine};
 use kcore::cmd::Output;
-use kcore::consts::{MAX_CPUS, NS_PER_SEC};
+use kcore::consts::NS_PER_SEC;
 use kcore::sync::Mutex;
 
-use crate::disk::{self, Claims, Holder, Runner, Wake};
+use crate::cores::{Cores, Hold};
+use crate::disk::{Claims, Holder, Runner, Wake};
 use crate::guest::{self, LogLine, Ring, Spec};
 
 const USAGE: &str = "hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]";
@@ -52,7 +53,12 @@ impl Host for BootHost {
         let mut c = self.console.lock();
         c.ring.push(byte);
         if c.line.push(byte) {
-            kcore::trace!(0, "hvguest| {}", c.line.text());
+            if let Some(dropped) = c.line.admit(kcore::time::boot_time_ns()) {
+                if dropped != 0 {
+                    kcore::trace!(0, "hvguest| ... {} lines not logged", dropped);
+                }
+                kcore::trace!(0, "hvguest| {}", c.line.text());
+            }
             c.line.clear();
         }
     }
@@ -86,6 +92,9 @@ struct Boot {
     /// disks hold on their images.
     disk_cpu: u32,
     claims: Arc<Claims>,
+    /// Its hold on the CPUs it runs on, and its disks', until the boot is
+    /// over and the job dropped.
+    _hold: Hold,
     /// Each of its CPUs' doorbell: what a halted CPU waits on, and what has
     /// one in its guest leave it -- the first's rung by a disk that has
     /// served something.
@@ -162,7 +171,11 @@ impl Boot {
                 return;
             }
         };
-        let console = host.console.lock();
+        let mut console = host.console.lock();
+        let dropped = console.line.take_dropped();
+        if dropped != 0 {
+            kcore::trace!(0, "hvguest| ... {} lines not logged", dropped);
+        }
         if !console.line.text().is_empty() {
             kcore::trace!(0, "hvguest| {}", console.line.text());
         }
@@ -198,7 +211,7 @@ fn write_console(report: &mut String, ring: &Ring) {
 
 /// `hv boot ...`: build the job, run it on a vCPU task of its own -- and
 /// its other CPUs on tasks of theirs -- and print what it reported.
-pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloading: &Arc<AtomicBool>,
+pub fn boot(machine: &Arc<Machine>, args: &str, cores: &Cores, unloading: &Arc<AtomicBool>,
             claims: Arc<Claims>, out: &mut Output) {
     if let Err(e) = hv::run::ensure_runnable(machine) {
         let _ = writeln!(out, "hv: no guest can run here -- {}", e);
@@ -227,13 +240,14 @@ pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloadin
             return;
         }
     };
-    let placement = match guest::pick_cpus(machine, spec.cpu, spec.cpus, busy) {
-        Ok(p) => p,
+    let (place, hold) = match cores.take(machine, spec.cpu, spec.cpus, !spec.disks.is_empty(), Some(Holder::Boot)) {
+        Ok(taken) => taken,
         Err(why) => {
             let _ = writeln!(out, "hv: {}", why);
             return;
         }
     };
+    let placement = place.vcpus;
     let cpu = placement[0];
 
     let (Some(report), Some(doorbells)) = (Mutex::new(String::new()), Doorbells::new(spec.cpus as usize)) else {
@@ -245,8 +259,9 @@ pub fn boot(machine: &Arc<Machine>, args: &str, busy: &[u32; MAX_CPUS], unloadin
         spec,
         report,
         unloading: unloading.clone(),
-        disk_cpu: disk::disk_cpu(cpu, busy),
+        disk_cpu: place.disk,
         claims,
+        _hold: hold,
         placement,
         doorbells: Arc::new(doorbells),
     });

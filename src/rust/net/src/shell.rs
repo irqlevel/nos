@@ -352,7 +352,7 @@ pub fn register_all() {
         ("net", "net - show network devices", net),
         ("netpool", "netpool - recycled net frame pool state", netpool),
         ("arp", "arp - show ARP table", arp),
-        ("nat", "nat - NAT state, counters and mappings", crate::nat::shell),
+        ("nat", "nat [allow|deny <a.b.c.d[/n]>] - NAT state, where the guests are kept from, counters and mappings", crate::nat::shell),
         ("netconsole", "netconsole - kernel log over UDP state", netconsole),
         ("icmpstat", "icmpstat - ICMP counters", icmpstat),
         ("tcpstat", "tcpstat - TCP connections and counters", tcpstat),

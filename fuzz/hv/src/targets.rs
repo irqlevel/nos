@@ -44,6 +44,8 @@ pub static ALL: &[Target] = &[
     Target { name: "nat", run: crate::guestnet::nat_target, max_len: 8192 },
     Target { name: "guestnet", run: crate::guestnet::guestnet_target, max_len: 4096 },
     Target { name: "platform", run: crate::platform::platform, max_len: 16384 },
+    Target { name: "policy", run: crate::policymodel::policy_target, max_len: 1024 },
+    Target { name: "place", run: crate::placemodel::place_target, max_len: 2048 },
 ];
 
 /// The input, read as a stream of choices: past its end every read is 0, and
@@ -322,9 +324,18 @@ fn pci_bus(r: &mut Input) {
                 let address = match r.u8() {
                     0..=199 => pci_address(r.below(4) as u32, r.pick(&PCI_REGS)),
                     200..=239 => pci_address(r.below(32) as u32, r.below(64) as u32 * 4) | (r.below(8) as u32) << 8,
+                    /* A register past 255, as AMD's extended configuration
+                     * puts its number's high bits in 27:24: no function here
+                     * has one, so it is nobody's. */
+                    240..=247 => pci_address(r.below(4) as u32, r.pick(&PCI_REGS)) | (1 + r.below(15) as u32) << 24,
                     _ => r.u32(),
                 };
                 bus.write(pci::CONFIG_ADDRESS, 4, address);
+                if address & 0x8000_0000 != 0 && address & 0x7F00_0000 != 0 {
+                    let got = bus.read(pci::CONFIG_DATA, 4);
+                    invariant!(got == u32::MAX, "configuration address {:#x}, a register past 255, read {:#x}",
+                               address, got);
+                }
             }
             1 => {
                 bus.read(pci::CONFIG_DATA + r.below(4) as u16, r.io_size());

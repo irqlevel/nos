@@ -69,9 +69,11 @@ lines in `/etc/rc`, and boot without it.
     sshd keys [reload]
 
 - `start` loads the host key -- or makes one, the first time -- and the
-  authorized keys, and listens on the port at every address the machine has,
-  so a DHCP renewal that moves the address does not leave it deaf (`nic=`
-  names the device whose address it shows). It fails when the host key file
+  authorized keys, and listens on the port of one device -- `nic=`, eth0 by
+  default -- at every address the machine has, so a DHCP renewal that moves
+  the address does not leave it deaf. Only a connection that comes in by
+  that device is its: a guest behind the hypervisor's switch (`hv0`) is
+  refused, at nos's address there and at eth0's. It fails when the host key file
   is there and cannot be read: a new key in its place would make every client
   that knew the old one refuse to connect, so it has to be moved out of the
   way on purpose -- and a key is only ever made where there is no file, never

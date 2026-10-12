@@ -66,6 +66,25 @@ pub fn vendor_id() -> [u8; 12] {
     out
 }
 
+/// IA32_MISC_ENABLE, and its bit that lets `rep movs` and `rep stos` take
+/// their fast paths.
+const MSR_MISC_ENABLE: u32 = 0x1A0;
+const MISC_ENABLE_FAST_STRING: u64 = 1 << 0;
+
+/// Whether this CPU runs its string instructions fast: IA32_MISC_ENABLE's
+/// bit 0, which an Intel CPU's firmware turns on -- what a guest on it is
+/// told, its `rep movs` being this CPU's. False on any other vendor's,
+/// which has no such MSR.
+pub fn fast_strings() -> bool {
+    if vendor_id() != *b"GenuineIntel" {
+        return false;
+    }
+    // SAFETY: every Intel CPU since the Pentium 4 has IA32_MISC_ENABLE, and
+    // this kernel runs on none older: it is 64-bit.
+    let misc = unsafe { rdmsr(MSR_MISC_ENABLE) };
+    misc & MISC_ENABLE_FAST_STRING != 0
+}
+
 /// # Safety
 /// The CPU has this MSR. Reading one it does not have is a #GP, and this
 /// kernel's #GP handler panics -- so every caller here reads the CPUID bit
@@ -155,6 +174,30 @@ pub unsafe fn write_cr2(value: u64) {
 #[inline]
 pub unsafe fn write_cr4(value: u64) {
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nomem, nostack, preserves_flags)) };
+}
+
+/// Write DR`N`, one of the four breakpoint address registers -- `N` 0 to 3,
+/// which the compiler holds it to.
+///
+/// # Safety
+/// DR0-DR3 are the CPU's, and a breakpoint DR7 enables is armed at whatever
+/// they hold, for whatever runs here. Only while DR7 enables none of them:
+/// the host's, which nothing in this kernel writes and every `#vmexit`
+/// leaves with all four off -- so that an address put here is matched only
+/// against a guest's accesses, under the DR7 `vmrun` loads for it.
+#[inline]
+pub unsafe fn write_debug_addr<const N: usize>(value: u64) {
+    const { assert!(N < 4) };
+    /* Each arm is the one instruction, for its register; the caller's
+     * promise above is the whole of what any of them needs. */
+    unsafe {
+        match N {
+            0 => asm!("mov dr0, {}", in(reg) value, options(nomem, nostack, preserves_flags)),
+            1 => asm!("mov dr1, {}", in(reg) value, options(nomem, nostack, preserves_flags)),
+            2 => asm!("mov dr2, {}", in(reg) value, options(nomem, nostack, preserves_flags)),
+            _ => asm!("mov dr3, {}", in(reg) value, options(nomem, nostack, preserves_flags)),
+        }
+    }
 }
 
 /// CR4.OSFXSR: FXSAVE and FXRSTOR move the XMM registers and MXCSR too.

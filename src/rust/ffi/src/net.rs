@@ -171,4 +171,6 @@ unsafe extern "C" {
     pub fn kernel_vnic_receive(vnic: usize, frame: *const u8, len: usize) -> i32;
     /// The net device it is, a `kernel_net_find` handle; 0 for none.
     pub safe fn kernel_vnic_device(vnic: usize) -> usize;
+    /// How many receive passes have emptied its backlog; 0 for a bad handle.
+    pub safe fn kernel_vnic_drains(vnic: usize) -> u64;
 }

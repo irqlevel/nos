@@ -101,16 +101,17 @@ SCRIPT = [
     "hv",                   # 11
     "hv run all 0",         # 12
     "hv run all %d" % (CPUS - 1),  # 13
-    "insmod /hv.ko",        # 14
-    "hv on 99",             # 15
-    "hv nonsense",          # 16
-    "hv run nonsense",      # 17
-    "rmmod hv",             # 18
-    "insmod /hv.ko",        # 19
-    "hv",                   # 20
-    "rmmod hv",             # 21
-    "lsmod",                # 22
-    "dmesg 400 hv:",        # 23
+    "hv",                   # 14
+    "insmod /hv.ko",        # 15
+    "hv on 99",             # 16
+    "hv nonsense",          # 17
+    "hv run nonsense",      # 18
+    "rmmod hv",             # 19
+    "insmod /hv.ko",        # 20
+    "hv",                   # 21
+    "rmmod hv",             # 22
+    "lsmod",                # 23
+    "dmesg 400 hv:",        # 24
 ]
 
 # What `hv run all` has to have said about each guest, beyond its verdict.
@@ -143,17 +144,30 @@ GUESTS = {
     "cr4": [r"while the CPU's CR4 kept MCE; SMEP, PAE cleared and bit 32 each a #GP, CR4 as it was",
             r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
             r"\b(?:11|5) of CR4 performed, 3 refused"],
+    # Every MSR comes to the policy on both backends, so this one says the
+    # same under either.
+    "msr": [r"SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
+            r"CPUID offers no speculation control and no PMU, and says a hypervisor is there",
+            r"\b5 rdmsr, 3 wrmsr, 4 refused"],
+    # Two VMs, one after the other on the CPU the guests run on: the second
+    # must read 0 where the first left its own, and each one's breakpoint,
+    # on an instruction of its own, fire -- DR0-DR3 made its own before each
+    # of its entries. An execution breakpoint: QEMU's TCG never gets past a
+    # store a data breakpoint watches in a nested guest.
+    "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
+           r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
+           r"\b14 and 14 of DR0-DR3 performed, 1 and 1 exceptions given back"],
 }
 
-# Five of the guests test a mechanism only one vendor has: AMD-V's software
+# Six of the guests test a mechanism only one vendor has: AMD-V's software
 # VMCB check (`refused`), its ASID recycling (`asid`), its shadow TPR
-# (`tpr`), the DR6 its VMCB keeps at a #DB (`debug`) and its CR4 intercept
-# (`cr4`). Under Intel VT-x the CPU refuses a bad VMCS itself; the ASID is a
-# VPID held for the guest's life, so the third VM gets one of the first two's
-# back; CR8 is the host's, so the guest is stopped at each access and
-# answered from a shadow; a #DB is not given back yet; and CR4 is not
-# intercepted yet, the CPU taking every write itself. What each says
-# differs; the rest is one.
+# (`tpr`), the DR6 its VMCB keeps at a #DB (`debug`), its CR4 intercept
+# (`cr4`) and the DR0-DR3 it keeps apart (`dr`). Under Intel VT-x the CPU
+# refuses a bad VMCS itself; the ASID is a VPID held for the guest's life, so
+# the third VM gets one of the first two's back; CR8 is the host's, so the
+# guest is stopped at each access and answered from a shadow; a #DB is not
+# given back yet; and neither CR4 nor DR0-DR3 is intercepted yet, the CPU
+# taking every write itself. What each says differs; the rest is one.
 GUESTS_VMX = {
     "refused": [r"the CPU refused the VMCS at entry for invalid guest state"],
     "asid": [r"vm C was given VPID \d+, which vm [AB] had, and read its own too"],
@@ -164,6 +178,9 @@ GUESTS_VMX = {
     # Not run under VT-x this round: what any CPU does with the writes, and
     # nothing the host keeps.
     "cr4": [r"VT-x does not stop a guest at CR4 yet"],
+    # Its breakpoint's #DB stops it, and the second VM reads what the
+    # first left in the CPU's registers.
+    "dr": [r"VT-x does not keep a guest's DR0-DR3 apart yet"],
 }
 
 
@@ -353,24 +370,36 @@ def x86_checks(ran):
     check_all_guests(out[13], CPUS - 1, backend)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
-    pt.check("a second insmod is refused", "loaded at" not in out[14], out[14])
-    pt.check("a CPU that does not exist is refused", "is not a CPU" in out[15], out[15])
-    pt.check("and a word that is not a subcommand", "no such thing" in out[16], out[16])
-    pt.check("and a guest that does not exist", "run which guest?" in out[17], out[17])
+    # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after
+    # another guest's there: an IBPB between each two where the CPU has
+    # one (`hv::spec`), and a count of them either way. AMD-V's alone.
+    if backend == "svm":
+        m = re.search(r"guests switched on a CPU (\d+) times(, an IBPB between each two \((\d+) issued\))?", out[14])
+        switches = int(m.group(1)) if m else 0
+        pt.check("the guests switched on a CPU at least twice a guest, each switch counted",
+                 switches >= 2 * len(GUESTS), out[14])
+        pt.check("and each with an IBPB where the CPU has one",
+                 m is not None and (m.group(3) is None and "has no IBPB" in out[14]
+                                    or m.group(3) is not None and int(m.group(3)) == switches), out[14])
 
-    pt.check("rmmod with it on for every CPU unloads", "hv unloaded" in out[18], out[18])
+    pt.check("a second insmod is refused", "loaded at" not in out[15], out[15])
+    pt.check("a CPU that does not exist is refused", "is not a CPU" in out[16], out[16])
+    pt.check("and a word that is not a subcommand", "no such thing" in out[17], out[17])
+    pt.check("and a guest that does not exist", "run which guest?" in out[18], out[18])
+
+    pt.check("rmmod with it on for every CPU unloads", "hv unloaded" in out[19], out[19])
 
     # The one that the rest of them are for: this load asks every CPU what it
     # has, and it has to be nothing -- after every guest above has run.
-    pt.check("loading it again finds it off for every CPU", "hv loaded at" in out[19], out[19])
+    pt.check("loading it again finds it off for every CPU", "hv loaded at" in out[20], out[20])
     pt.check("and nothing was left on by the unload before it",
-             "on for cpu none of %s" % ALL_CPUS in out[20], out[20])
-    pt.check("it unloads again", "hv unloaded" in out[21], out[21])
-    pt.check("and leaves no module behind", "no modules loaded" in out[22], out[22])
+             "on for cpu none of %s" % ALL_CPUS in out[21], out[21])
+    pt.check("it unloads again", "hv unloaded" in out[22], out[22])
+    pt.check("and leaves no module behind", "no modules loaded" in out[23], out[23])
 
     # What the module traced: not on the serial console, because the shell
     # suppresses trace output there once it starts, so the script asks dmesg.
-    logged = out[23]
+    logged = out[24]
     pt.check("the kernel log says the extension went off for every CPU on the unload",
              "extension off for cpu mask %s" % ALL_MASK in logged, logged)
     pt.check("and nothing warned", "WARNING" not in logged, logged)

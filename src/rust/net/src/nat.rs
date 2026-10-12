@@ -29,6 +29,15 @@
 //! receive paths use it and the shell looks at it, so it is under a lock --
 //! held for the lookup, never for the frame, which is built and sent with the
 //! lock down.
+//!
+//! Where a guest may go is the world past this machine's edge, not what is
+//! behind it: a packet for a cloud's metadata server and link-local's rest
+//! (169.254/16), a private network (10/8, 172.16/12, 192.168/16),
+//! carrier-grade NAT's shared space (100.64/10) or the uplink's own subnet --
+//! the host's LAN -- is kept from the world (`kept`), and its guest answered
+//! with an ICMP error, so that it fails at once rather than waiting out its
+//! retries. `nat allow` lets a network through; the DNS server the guests
+//! are given is theirs to ask at port 53, wherever it is.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -53,10 +62,16 @@ pub const ENTRIES: usize = 4096;
 pub const PORT_BASE: u16 = 32768;
 pub const PORT_LAST: u16 = PORT_BASE + (ENTRIES - 1) as u16;
 const BUCKETS: usize = 4096;
-/// No entry: the end of a hash chain, or of the free list.
+/// No entry: the end of a hash chain, of the free list, or of a host's list.
 const NONE: u16 = u16::MAX;
+/// The inner hosts that hold mappings at once: the guests -- the switch has
+/// sixteen ports -- with room to spare. A packet of one past them has no
+/// mapping made for it, and is counted as `full`.
+const HOSTS: usize = 64;
 
 const _: () = assert!(ENTRIES < NONE as usize && BUCKETS.is_power_of_two());
+/* A host's slot is an entry's byte; its count, a u16, holds the whole table. */
+const _: () = assert!(HOSTS <= u8::MAX as usize + 1 && ENTRIES <= u16::MAX as usize);
 const _: () = assert!(PORT_LAST < crate::tcp::EPHEMERAL_BASE);
 /* One offset for the ports of both transports. */
 const _: () = assert!(tcp::SRC_PORT == udp::SRC_PORT && tcp::DST_PORT == udp::DST_PORT);
@@ -98,12 +113,30 @@ struct Entry {
     expires: u64,
     /// The next entry in its hash chain -- or, free, on the free list.
     next: u16,
+    /// Its host's slot (`Table::hosts`), and its neighbours on that host's
+    /// list, the one used less lately and the one used more.
+    host: u8,
+    older: u16,
+    newer: u16,
 }
 
 const FREE: Entry = Entry {
     proto: 0, seen: 0, inner_ip: 0, inner_port: 0, inner_mac: [0; 6], remote_ip: 0,
-    remote_port: 0, expires: 0, next: NONE,
+    remote_port: 0, expires: 0, next: NONE, host: 0, older: NONE, newer: NONE,
 };
+
+/// An inner host's share of the table: its mappings, listed from the one
+/// used least lately to the one used last, and how many -- a slot with none
+/// is free.
+#[derive(Clone, Copy)]
+struct Host {
+    ip: u32,
+    count: u16,
+    lru: u16,
+    mru: u16,
+}
+
+const NO_HOST: Host = Host { ip: 0, count: 0, lru: NONE, mru: NONE };
 
 impl Entry {
     fn lifetime(&self) -> u64 {
@@ -145,10 +178,15 @@ impl Key {
     }
 }
 
-/// The mappings: entry `i` is external port `PORT_BASE + i`.
+/// The mappings: entry `i` is external port `PORT_BASE + i`. And each inner
+/// host's share of them: when every one is live and another flow wants one,
+/// the host that holds the most gives up the one it used least lately -- so
+/// a guest that opens flows as fast as it can takes them from itself, not
+/// from the rest, as a table that refused every new flow once full let it.
 struct Table {
     entries: Vec<Entry>,
     buckets: Vec<u16>,
+    hosts: [Host; HOSTS],
     /// The first free entry.
     free: u16,
     active: usize,
@@ -156,6 +194,12 @@ struct Table {
     /// the soonest a sweep can find one. A table full of live flows is not
     /// swept for every packet that wants a mapping.
     sweep_at: u64,
+}
+
+/// A mapping made: its entry, and whether a live flow's was taken for it.
+struct Made {
+    at: usize,
+    taken: bool,
 }
 
 impl Table {
@@ -169,7 +213,7 @@ impl Table {
         let mut buckets = Vec::new();
         buckets.try_reserve_exact(BUCKETS).ok()?;
         buckets.resize(BUCKETS, NONE);
-        Some(Table { entries, buckets, free: 0, active: 0, sweep_at: 0 })
+        Some(Table { entries, buckets, hosts: [NO_HOST; HOSTS], free: 0, active: 0, sweep_at: 0 })
     }
 
     /// The live mapping for `key`. One that has run out is let go here.
@@ -189,7 +233,65 @@ impl Table {
         None
     }
 
-    /// Entry `i` out of its chain and onto the free list.
+    /// The slot of the host at `ip`, if it holds a mapping.
+    fn host(&self, ip: u32) -> Option<usize> {
+        self.hosts.iter().position(|h| h.count != 0 && h.ip == ip)
+    }
+
+    /// Entry `i` onto the end of host `h`'s list: the one used last.
+    fn link(&mut self, i: usize, h: usize) {
+        let mru = self.hosts[h].mru;
+        let e = &mut self.entries[i];
+        e.host = h as u8;
+        e.older = mru;
+        e.newer = NONE;
+        if mru == NONE {
+            self.hosts[h].lru = i as u16;
+        } else {
+            self.entries[usize::from(mru)].newer = i as u16;
+        }
+        self.hosts[h].mru = i as u16;
+        self.hosts[h].count += 1;
+    }
+
+    /// Entry `i` off its host's list; a host left with none frees its slot.
+    fn unlink(&mut self, i: usize) {
+        let e = self.entries[i];
+        let h = usize::from(e.host);
+        if e.older == NONE {
+            self.hosts[h].lru = e.newer;
+        } else {
+            self.entries[usize::from(e.older)].newer = e.newer;
+        }
+        if e.newer == NONE {
+            self.hosts[h].mru = e.older;
+        } else {
+            self.entries[usize::from(e.newer)].older = e.older;
+        }
+        self.hosts[h].count -= 1;
+    }
+
+    /// Entry `i` to run out at `when` -- and the next sweep no later: a flow
+    /// made or kept after the last one may run out before what it found, a
+    /// UDP flow's five minutes among TCP's two hours, and a full table must
+    /// not count it live past then.
+    fn expire_at(&mut self, i: usize, when: u64) {
+        self.entries[i].expires = when;
+        self.sweep_at = self.sweep_at.min(when);
+    }
+
+    /// Entry `i` used by a packet of its flow, either way: the last on its
+    /// host's list.
+    fn touch(&mut self, i: usize) {
+        let h = usize::from(self.entries[i].host);
+        if usize::from(self.hosts[h].mru) != i {
+            self.unlink(i);
+            self.link(i, h);
+        }
+    }
+
+    /// Entry `i` out of its chain and its host's list, and onto the free
+    /// list.
     fn release(&mut self, i: usize) {
         let bucket = Key::of(&self.entries[i]).bucket();
         let mut at = self.buckets[bucket];
@@ -207,6 +309,7 @@ impl Table {
                 self.entries[usize::from(prev)].next = next;
             }
         }
+        self.unlink(i);
         self.entries[i] = Entry { next: self.free, ..FREE };
         self.free = i as u16;
         self.active -= 1;
@@ -217,13 +320,11 @@ impl Table {
     /// its port, which must not be handed the answers to the flows of the
     /// one before -- a TCP connection's sequence numbers among them.
     fn forget(&mut self, inner_ip: u32) -> usize {
+        let Some(h) = self.host(inner_ip) else { return 0 };
         let mut n = 0;
-        for i in 0..ENTRIES {
-            let e = &self.entries[i];
-            if e.proto != 0 && e.inner_ip == inner_ip {
-                self.release(i);
-                n += 1;
-            }
+        while self.hosts[h].count != 0 {
+            self.release(usize::from(self.hosts[h].lru));
+            n += 1;
         }
         n
     }
@@ -246,27 +347,53 @@ impl Table {
         self.sweep_at = soonest;
     }
 
-    /// A new mapping for `key`, for its caller to give a time: a free entry,
-    /// or -- none left -- one whose flow has run out. None when every one is
-    /// live.
-    fn insert(&mut self, key: &Key, mac: Mac, now: u64) -> Option<usize> {
-        if self.free == NONE && now >= self.sweep_at {
+    /// A new mapping for `key`, for its caller to give a time: a free entry;
+    /// none free, one whose flow has run out; every one live, the one used
+    /// least lately of the host that holds the most -- the asker's own when
+    /// it holds as many as any, and of several holding the most the lowest
+    /// address's. None for a host past the `HOSTS` that hold mappings.
+    fn insert(&mut self, key: &Key, mac: Mac, now: u64) -> Option<Made> {
+        let no_slot = |t: &Table| t.host(key.inner_ip).is_none() && !t.hosts.iter().any(|h| h.count == 0);
+        /* What has run out first: an entry for the flow, and a slot for its
+         * host, if every one holds only flows gone quiet. */
+        if (self.free == NONE || no_slot(self)) && now >= self.sweep_at {
             self.sweep(now);
         }
-        if self.free == NONE {
+        if no_slot(self) {
             return None;
         }
+        let taken = self.free == NONE;
+        if taken {
+            let mine = self.host(key.inner_ip).map_or(0, |h| self.hosts[h].count);
+            let most = self.hosts.iter().map(|h| h.count).max().unwrap_or(0);
+            let victim = if mine >= most {
+                self.host(key.inner_ip)
+            } else {
+                self.hosts.iter().enumerate().filter(|(_, h)| h.count == most)
+                    .min_by_key(|(_, h)| h.ip).map(|(j, _)| j)
+            }?;
+            self.release(usize::from(self.hosts[victim].lru));
+        }
+        let h = match self.host(key.inner_ip) {
+            Some(h) => h,
+            None => {
+                let h = self.hosts.iter().position(|h| h.count == 0)?;
+                self.hosts[h] = Host { ip: key.inner_ip, ..NO_HOST };
+                h
+            }
+        };
         let i = usize::from(self.free);
         self.free = self.entries[i].next;
         let bucket = key.bucket();
         self.entries[i] = Entry {
             proto: key.proto, seen: 0, inner_ip: key.inner_ip, inner_port: key.inner_port,
             inner_mac: mac, remote_ip: key.remote_ip, remote_port: key.remote_port,
-            expires: now, next: self.buckets[bucket],
+            expires: now, next: self.buckets[bucket], ..FREE
         };
         self.buckets[bucket] = i as u16;
         self.active += 1;
-        Some(i)
+        self.link(i, h);
+        Some(Made { at: i, taken })
     }
 }
 
@@ -280,6 +407,11 @@ struct On {
 /// NAT's one instance (`abi::nat`).
 pub struct Nat {
     on: SpinLock<Option<On>>,
+    /// The networks `nat allow` let through the deny list -- kept while NAT
+    /// goes off and on, as the host's word on where its guests may go. Its
+    /// room is all taken up front: the receive path reads it, and an allow
+    /// allocates nothing.
+    allowed: SpinLock<Allowed>,
 }
 
 /* The two devices while NAT is on, for the receive path's one look at every
@@ -295,8 +427,12 @@ pub struct Counters {
     pub back: AtomicUsize,
     /// Mappings made.
     pub mapped: AtomicUsize,
-    /// Packets that wanted a mapping when every one was live.
+    /// Packets that wanted a mapping and could not have one: from a host
+    /// past the `HOSTS` that hold mappings.
     pub full: AtomicUsize,
+    /// Mappings made by taking a live flow's, every one being live: from
+    /// the host that holds the most.
+    pub taken: AtomicUsize,
     /// Packets whose next hop's address ARP did not have yet.
     pub no_hop: AtomicUsize,
     /// Packets there was no frame for, or no room on the device.
@@ -304,6 +440,9 @@ pub struct Counters {
     /// Packets NAT does not take: another protocol, a fragment, no time to
     /// live left, a TCP segment of no flow it knows.
     pub refused: AtomicUsize,
+    /// Packets for where the guests are kept from (`kept`), each answered
+    /// with an ICMP error.
+    pub denied: AtomicUsize,
 }
 
 pub static COUNTERS: Counters = Counters {
@@ -311,9 +450,11 @@ pub static COUNTERS: Counters = Counters {
     back: AtomicUsize::new(0),
     mapped: AtomicUsize::new(0),
     full: AtomicUsize::new(0),
+    taken: AtomicUsize::new(0),
     no_hop: AtomicUsize::new(0),
     no_frame: AtomicUsize::new(0),
     refused: AtomicUsize::new(0),
+    denied: AtomicUsize::new(0),
 };
 
 fn count(counter: &AtomicUsize) {
@@ -351,7 +492,52 @@ const NO_MAPPING: Mapping = Mapping {
 
 impl Nat {
     pub fn new() -> Option<Nat> {
-        Some(Nat { on: SpinLock::new(None)? })
+        let allowed = Allowed { nets: [(0, 0); ALLOWED_MAX], count: 0 };
+        Some(Nat { on: SpinLock::new(None)?, allowed: SpinLock::new(allowed)? })
+    }
+
+    /// Let the guests reach the network `net`/`mask` though the deny list
+    /// keeps them from it: false when `ALLOWED_MAX` are let through already.
+    /// One let through already is there once.
+    pub fn allow(&self, net: u32, mask: u32) -> bool {
+        let net = (net & mask, mask);
+        let mut a = self.allowed.lock();
+        if a.nets[..a.count].contains(&net) {
+            return true;
+        }
+        if a.count == ALLOWED_MAX {
+            return false;
+        }
+        let n = a.count;
+        a.nets[n] = net;
+        a.count = n + 1;
+        true
+    }
+
+    /// Take `net`/`mask` back off what `allow` let through: whether it was
+    /// there.
+    pub fn disallow(&self, net: u32, mask: u32) -> bool {
+        let net = (net & mask, mask);
+        let mut a = self.allowed.lock();
+        let n = a.count;
+        let Some(i) = a.nets[..n].iter().position(|x| *x == net) else { return false };
+        a.nets[i] = a.nets[n - 1];
+        a.count = n - 1;
+        true
+    }
+
+    /// What `allow` let through, into `out`: how many.
+    pub fn allowed(&self, out: &mut [(u32, u32); ALLOWED_MAX]) -> usize {
+        let a = self.allowed.lock();
+        out[..a.count].copy_from_slice(&a.nets[..a.count]);
+        a.count
+    }
+
+    /// Whether a guest's packet of `proto` for `dst`, at `port`, is kept
+    /// from the world through `outer` (`kept`).
+    fn keeps(&self, outer: &Device, proto: u8, dst: u32, port: u16) -> bool {
+        let a = self.allowed.lock();
+        kept(proto, dst, port, (outer.ip(), outer.mask()), &a.nets[..a.count], crate::dns::upstream())
     }
 
     /// NAT on, from `inner` out through `outer` -- or, with none named,
@@ -463,6 +649,70 @@ fn name(dev: &Device) -> &str {
     core::str::from_utf8(dev.name()).unwrap_or("?")
 }
 
+/* ---- where a guest may go ---- */
+
+/// The networks a guest is kept from unless `nat allow` lets it through, as
+/// (network, mask): link-local, where a cloud's metadata server answers --
+/// 169.254.169.254, the host VM's credentials behind it -- the private
+/// networks, where the host's own LAN and its neighbours are, and
+/// carrier-grade NAT's shared space, where some clouds keep theirs. The
+/// uplink's own subnet is kept too, whatever it is (`kept`).
+const DENIED: [(u32, u32); 5] = [
+    (0xA9FE_0000, 0xFFFF_0000), /* 169.254/16 */
+    (0x0A00_0000, 0xFF00_0000), /* 10/8 */
+    (0xAC10_0000, 0xFFF0_0000), /* 172.16/12 */
+    (0xC0A8_0000, 0xFFFF_0000), /* 192.168/16 */
+    (0x6440_0000, 0xFFC0_0000), /* 100.64/10 */
+];
+/// Where the DNS server the guests are given is theirs to ask, wherever it
+/// is: on QEMU's user network 10.0.2.3, on a cloud its metadata server.
+const DNS_PORT: u16 = 53;
+/// The most networks `nat allow` lets through at once.
+pub const ALLOWED_MAX: usize = 16;
+
+/// The networks `nat allow` let through, as (network, mask).
+struct Allowed {
+    nets: [(u32, u32); ALLOWED_MAX],
+    count: usize,
+}
+
+/// Whether a guest's packet of `proto` for `dst`, at TCP's or UDP's port
+/// `port`, is kept from the world: for a denied network, or the uplink's own
+/// subnet (`uplink`, as network and mask; a mask of 0 for none), unless one
+/// of `allowed` takes it in -- or it is for `dns`, the DNS server the guests
+/// are given, at its port. Pure, for the boot self-test.
+fn kept(proto: u8, dst: u32, port: u16, uplink: (u32, u32), allowed: &[(u32, u32)], dns: u32) -> bool {
+    if dns != 0 && dst == dns && port == DNS_PORT && (proto == IP_PROTO_UDP || proto == IP_PROTO_TCP) {
+        return false;
+    }
+    let (net, mask) = uplink;
+    let denied = DENIED.iter().any(|&(n, m)| dst & m == n) || (mask != 0 && dst & mask == net & mask);
+    denied && !allowed.iter().any(|&(n, m)| dst & m == n)
+}
+
+/// A network a person wrote -- `a.b.c.d`, or `a.b.c.d/n` -- as (network,
+/// mask), the address's host bits cleared.
+fn parse_net(text: &str) -> Option<(u32, u32)> {
+    const BITS: u32 = 32;
+    let (addr, bits) = match text.split_once('/') {
+        Some((a, b)) => (a, b.parse::<u32>().ok().filter(|&b| b <= BITS)?),
+        None => (text, BITS),
+    };
+    let ip = wire::parse_ipv4(addr.as_bytes())?;
+    let mask = if bits == 0 { 0 } else { u32::MAX << (BITS - bits) };
+    Some((ip & mask, mask))
+}
+
+/// A network as `a.b.c.d/n`.
+struct Net((u32, u32));
+
+impl core::fmt::Display for Net {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (net, mask) = self.0;
+        write!(f, "{}/{}", Ipv4(net), mask.count_ones())
+    }
+}
+
 /// What the receive path of `dev` asks of every IPv4 frame before the
 /// protocols see it: true when NAT has taken it -- sent it on, or dropped it
 /// for good -- and the stack is not to look at it.
@@ -560,11 +810,17 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
             return true;
         }
     };
+    let Some(nat) = crate::abi::nat() else { return false };
+    /* Where the guests are kept from: answered, so that it fails now. */
+    if nat.keeps(outer, p.proto, p.dst, remote_port) {
+        count(&COUNTERS.denied);
+        reject(inner, frame, &p);
+        return true;
+    }
     if p.ttl <= 1 {
         count(&COUNTERS.refused);
         return true;
     }
-    let Some(nat) = crate::abi::nat() else { return false };
     let key = Key { proto: p.proto, inner_ip: p.src, inner_port: port, remote_ip: p.dst, remote_port };
     let mac = eth::src(frame);
     let now = time::boot_time_ns();
@@ -582,9 +838,12 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
                 return true;
             }
             None => match o.table.insert(&key, mac, now) {
-                Some(i) => {
+                Some(made) => {
                     count(&COUNTERS.mapped);
-                    i
+                    if made.taken {
+                        count(&COUNTERS.taken);
+                    }
+                    made.at
                 }
                 None => {
                     count(&COUNTERS.full);
@@ -592,6 +851,7 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
                 }
             },
         };
+        o.table.touch(i);
         let e = &mut o.table.entries[i];
         if p.proto == IP_PROTO_TCP {
             /* A connection starting again on the mapping the last one left:
@@ -607,7 +867,8 @@ fn outbound(inner: &'static Device, frame: &[u8]) -> bool {
             }
         }
         e.inner_mac = mac;
-        e.expires = now.saturating_add(e.lifetime());
+        let when = now.saturating_add(e.lifetime());
+        o.table.expire_at(i, when);
         (o.outer, PORT_BASE + i as u16)
     };
 
@@ -707,7 +968,8 @@ fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
     let (inner, inner_ip, inner_port, inner_mac) = {
         let mut on = nat.on.lock();
         let Some(o) = on.as_mut() else { return false };
-        let e = &mut o.table.entries[usize::from(answer.port - PORT_BASE)];
+        let at = usize::from(answer.port - PORT_BASE);
+        let e = &mut o.table.entries[at];
         if e.proto != answer.proto || e.remote_ip != answer.far_ip
             || e.remote_port != answer.far_port || e.expires <= now
         {
@@ -715,7 +977,8 @@ fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
         }
         /* An error says nothing of the flow being alive, and a packet that
          * is dropped here no more. */
-        if answer.quoted_ihl.is_none() && p.ttl > 1 {
+        let alive = answer.quoted_ihl.is_none() && p.ttl > 1;
+        if alive {
             if e.proto == IP_PROTO_TCP {
                 let flags = tcp::flags(l4);
                 e.seen |= SEEN_ANSWER;
@@ -726,9 +989,14 @@ fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
                     e.seen |= SEEN_RST;
                 }
             }
-            e.expires = now.saturating_add(e.lifetime());
         }
-        (o.inner, e.inner_ip, e.inner_port, e.inner_mac)
+        let to = (o.inner, e.inner_ip, e.inner_port, e.inner_mac);
+        if alive {
+            let when = now.saturating_add(e.lifetime());
+            o.table.expire_at(at, when);
+            o.table.touch(at);
+        }
+        to
     };
     if p.ttl <= 1 {
         count(&COUNTERS.refused);
@@ -756,6 +1024,30 @@ fn inbound(outer: &'static Device, frame: &[u8]) -> bool {
 fn copy(bytes: &[u8]) -> Option<Frame> {
     let mut out = Frame::alloc_tx(bytes.len())?;
     out.fill(bytes).then_some(out)
+}
+
+/// What a guest is answered with for a packet to where it is kept from: a
+/// destination unreachable, communication administratively prohibited
+/// (RFC 1812 5.2.7.1), from the inner device's address -- its gateway's --
+/// to its MAC, quoting the packet's header and the eight bytes after it
+/// (RFC 792). Its connect then fails at once, "no route to host", rather
+/// than wait out its retries. Nothing is sent when there is no frame for it;
+/// and it never answers an ICMP error, NAT taking none of a guest's.
+fn reject(inner: &'static Device, frame: &[u8], p: &Packet) {
+    const ADMIN_PROHIBITED: u8 = 13;
+    const MAX_IHL: usize = 60;
+    let quoted = (p.ihl + QUOTED_L4).min(p.len);
+    let icmp_len = ICMP_HDR_LEN + quoted;
+    let total = ETH_HDR_LEN + IP_HDR_LEN + icmp_len;
+    let mut buf = [0u8; ETH_HDR_LEN + IP_HDR_LEN + ICMP_HDR_LEN + MAX_IHL + QUOTED_L4];
+    eth::write(&mut buf, &eth::src(frame), &inner.mac(), ETH_TYPE_IP);
+    ip::write(&mut buf[ETH_HDR_LEN..], IP_PROTO_ICMP, inner.ip(), p.src, icmp_len, 0);
+    let at = ETH_HDR_LEN + IP_HDR_LEN;
+    buf[at + ICMP_HDR_LEN..total].copy_from_slice(&frame[ETH_HDR_LEN..ETH_HDR_LEN + quoted]);
+    icmp::write(&mut buf[at..], icmp::DEST_UNREACH, ADMIN_PROHIBITED, 0, 0, icmp_len);
+    if let Some(f) = copy(&buf[..total]) {
+        let _ = inner.as_nic().transmit(f);
+    }
 }
 
 /* ---- the rewriting: an IPv4 packet in place, its header first ---- */
@@ -916,11 +1208,46 @@ pub extern "C" fn kernel_net_nat_forget(inner: usize, ip: u32) -> u32 {
 
 /* ---- the shell ---- */
 
-/// `nat`: whether it is on and between which devices, what it has done,
-/// and the first of its mappings.
-pub fn shell(_args: &str, out: &mut Output) {
+/// `nat`: whether it is on and between which devices, where the guests are
+/// kept from, what it has done, and the first of its mappings. `nat allow
+/// <net>` lets the guests reach a network the deny list keeps them from --
+/// `a.b.c.d`, or `a.b.c.d/n` -- and `nat deny <net>` takes that back.
+pub fn shell(args: &str, out: &mut Output) {
+    let mut words = args.split_whitespace();
+    match (words.next(), words.next(), words.next()) {
+        (None, _, _) => {}
+        (Some(verb @ ("allow" | "deny")), Some(text), None) => {
+            let Some(nat) = crate::abi::nat() else {
+                let _ = writeln!(out, "nat: none");
+                return;
+            };
+            let Some((net, mask)) = parse_net(text) else {
+                let _ = writeln!(out, "nat: {} is no network -- a.b.c.d, or a.b.c.d/n", text);
+                return;
+            };
+            let what = Net((net, mask));
+            let _ = if verb == "allow" {
+                if nat.allow(net, mask) {
+                    writeln!(out, "nat: {} let through", what)
+                } else {
+                    writeln!(out, "nat: {} not let through -- {} networks are, the most there may be", what,
+                             ALLOWED_MAX)
+                }
+            } else if nat.disallow(net, mask) {
+                writeln!(out, "nat: {} kept from the guests again", what)
+            } else {
+                writeln!(out, "nat: {} was not let through", what)
+            };
+            return;
+        }
+        _ => {
+            let _ = writeln!(out, "usage: nat [allow|deny <a.b.c.d[/n]>]");
+            return;
+        }
+    }
     let mut shown = [NO_MAPPING; SHOWN];
-    match crate::abi::nat().and_then(|nat| nat.state(&mut shown)) {
+    let state = crate::abi::nat().and_then(|nat| nat.state(&mut shown));
+    match state {
         None => {
             let _ = writeln!(out, "nat: off");
         }
@@ -943,11 +1270,35 @@ pub fn shell(_args: &str, out: &mut Output) {
             }
         }
     }
+    /* Where the guests are kept from, and what is let through of it. */
+    let _ = write!(out, "kept from");
+    for &net in &DENIED {
+        let _ = write!(out, " {}", Net(net));
+    }
+    match state {
+        Some((_, outer, _, _)) if outer.mask() != 0 => {
+            let _ = write!(out, " and {}'s {}", name(outer), Net((outer.ip() & outer.mask(), outer.mask())));
+        }
+        _ => {
+            let _ = write!(out, " and the uplink's subnet");
+        }
+    }
+    let mut allowed = [(0, 0); ALLOWED_MAX];
+    let n = crate::abi::nat().map_or(0, |nat| nat.allowed(&mut allowed));
+    let _ = write!(out, "; let through:");
+    if n == 0 {
+        let _ = write!(out, " none");
+    }
+    for &net in &allowed[..n] {
+        let _ = write!(out, " {}", Net(net));
+    }
+    let _ = writeln!(out);
     let c = &COUNTERS;
     let load = |counter: &AtomicUsize| counter.load(Ordering::Relaxed);
-    let _ = writeln!(out, "out {}  back {}  mapped {}  table full {}  no next hop {}  no frame {}  refused {}",
-        load(&c.out), load(&c.back), load(&c.mapped), load(&c.full), load(&c.no_hop),
-        load(&c.no_frame), load(&c.refused));
+    let _ = writeln!(out, "out {}  back {}  mapped {}  taken from the most {}  no room {}  no next hop {}  \
+                           no frame {}  refused {}  denied {}",
+        load(&c.out), load(&c.back), load(&c.mapped), load(&c.taken), load(&c.full), load(&c.no_hop),
+        load(&c.no_frame), load(&c.refused), load(&c.denied));
 }
 
 /* ---- what the boot self-test checks ---- */
@@ -957,7 +1308,32 @@ pub fn shell(_args: &str, out: &mut Output) {
 /// UDP cannot send as it is. And the table filled, run out, and filled
 /// again.
 pub fn selftest() -> bool {
-    rewrites() & zero_sum() & table()
+    rewrites() & zero_sum() & table() & policy()
+}
+
+/// Where a guest may go: kept from a cloud's metadata server, the private
+/// networks and the uplink's own subnet; let through to the world, to what
+/// `nat allow` names, and to the DNS server at its port alone. And a
+/// network as a person writes one.
+fn policy() -> bool {
+    const METADATA: u32 = 0xA9FE_A9FE; /* 169.254.169.254 */
+    const PRIVATE: u32 = 0xAC1F_0001; /* 172.31.0.1 */
+    const SHARED: u32 = 0x647F_FFFE; /* 100.127.255.254 */
+    const UPLINK: (u32, u32) = (0x5F10_2000, 0xFFFF_FFC0); /* 95.16.32.0/26 */
+    const NEIGHBOUR: u32 = 0x5F10_2011; /* 95.16.32.17 */
+    const DNS: u32 = 0x0A00_0203; /* 10.0.2.3 */
+    const PRIVATE_NET: (u32, u32) = (0xAC10_0000, 0xFFF0_0000); /* 172.16/12 */
+    check("the metadata server kept", kept(IP_PROTO_TCP, METADATA, 80, UPLINK, &[], 0))
+        & check("a private network kept", kept(IP_PROTO_UDP, PRIVATE, 1234, UPLINK, &[], 0))
+        & check("the shared space kept", kept(IP_PROTO_ICMP, SHARED, 0, UPLINK, &[], 0))
+        & check("the uplink's neighbour kept", kept(IP_PROTO_TCP, NEIGHBOUR, 22, UPLINK, &[], 0))
+        & check("the world let through", !kept(IP_PROTO_TCP, REMOTE, 443, UPLINK, &[], 0))
+        & check("an allowed network let through", !kept(IP_PROTO_ICMP, PRIVATE, 0, UPLINK, &[PRIVATE_NET], 0))
+        & check("the DNS server at its port", !kept(IP_PROTO_UDP, DNS, DNS_PORT, UPLINK, &[], DNS))
+        & check("the DNS server at another port kept", kept(IP_PROTO_TCP, DNS, 80, UPLINK, &[], DNS))
+        & check("a network parsed", parse_net("10.0.2.2/24") == Some((0x0A00_0200, 0xFFFF_FF00))
+                && parse_net("1.2.3.4") == Some((0x0102_0304, u32::MAX)) && parse_net("0.0.0.0/0") == Some((0, 0))
+                && parse_net("1.2.3.4/33").is_none() && parse_net("1.2.3/8").is_none())
 }
 
 fn check(what: &str, ok: bool) -> bool {
@@ -968,6 +1344,8 @@ fn check(what: &str, ok: bool) -> bool {
 }
 
 const GUEST: u32 = 0x0A00_6402; /* 10.0.100.2 */
+const OTHER: u32 = 0x0A00_6403; /* 10.0.100.3 */
+const THIRD: u32 = 0x0A00_6404; /* 10.0.100.4 */
 const OUTSIDE: u32 = 0x0A00_020F; /* 10.0.2.15 */
 const REMOTE: u32 = 0x5DB8_D822; /* 93.184.216.34 */
 const ROUTER: u32 = 0xC0A8_0001; /* 192.168.0.1 */
@@ -1084,38 +1462,136 @@ fn zero_sum() -> bool {
 }
 
 fn table() -> bool {
+    filled() & shares()
+}
+
+/// A mapping of `host`'s, its port `i`: one flow of a guest's.
+fn flow(host: u32, i: usize) -> Key {
+    Key { proto: IP_PROTO_UDP, inner_ip: host, inner_port: i as u16, remote_ip: REMOTE, remote_port: 53 }
+}
+
+/// The table filled, run out, and filled again.
+fn filled() -> bool {
     let Some(mut t) = Table::new() else {
         return check("a table to test with", false);
     };
-    let key = |i: usize| Key { proto: IP_PROTO_UDP, inner_ip: GUEST, inner_port: i as u16,
-                               remote_ip: REMOTE, remote_port: 53 };
     const BORN: u64 = 1000;
     let mut ok = true;
     for i in 0..ENTRIES {
-        match t.insert(&key(i), [0; 6], 0) {
-            Some(at) => t.entries[at].expires = BORN + i as u64,
-            None => ok = false,
+        match t.insert(&flow(GUEST, i), [0; 6], 0) {
+            Some(Made { at, taken: false }) => t.entries[at].expires = BORN + i as u64,
+            _ => ok = false,
         }
     }
     ok = check("the table takes every mapping", ok && t.active == ENTRIES);
-    ok &= check("and then no more", t.insert(&key(ENTRIES), [0; 6], 0).is_none());
-    ok &= check("and finds each one", (0..ENTRIES).all(|i| t.find(&key(i), 0).is_some()));
+    ok &= check("and finds each one", (0..ENTRIES).all(|i| t.find(&flow(GUEST, i), 0).is_some()));
 
     /* The first half run out: a sweep frees those and only those, and is
      * not tried again before the rest can have. */
     let half = BORN + (ENTRIES / 2) as u64 - 1;
-    ok &= check("what ran out is swept", t.insert(&key(ENTRIES), [0; 6], half).is_some()
-        && t.active == ENTRIES / 2 + 1 && t.sweep_at == half + 1);
+    ok &= check("what ran out is swept",
+        matches!(t.insert(&flow(GUEST, ENTRIES), [0; 6], half), Some(Made { taken: false, .. }))
+            && t.active == ENTRIES / 2 + 1 && t.sweep_at == half + 1);
     ok &= check("and what did not is kept",
-        (ENTRIES / 2..ENTRIES).all(|i| t.find(&key(i), half).is_some())
-            && (0..ENTRIES / 2).all(|i| t.find(&key(i), half).is_none()));
+        (ENTRIES / 2..ENTRIES).all(|i| t.find(&flow(GUEST, i), half).is_some())
+            && (0..ENTRIES / 2).all(|i| t.find(&flow(GUEST, i), half).is_none()));
 
     let before = t.active;
-    let i = t.find(&key(ENTRIES - 1), half).unwrap_or(0);
+    let i = t.find(&flow(GUEST, ENTRIES - 1), half).unwrap_or(0);
     t.release(i);
     ok &= check("one let go is gone",
-        t.active == before - 1 && t.find(&key(ENTRIES - 1), half).is_none());
+        t.active == before - 1 && t.find(&flow(GUEST, ENTRIES - 1), half).is_none());
     ok &= check("and its port is the next one out",
-        t.insert(&key(ENTRIES - 1), [0; 6], half) == Some(i));
+        t.insert(&flow(GUEST, ENTRIES - 1), [0; 6], half).map(|m| m.at) == Some(i));
+    ok
+}
+
+/// The table full of live flows: a guest's next flow takes its own used
+/// least lately, and another guest's takes from the one that holds the most
+/// -- whichever flows it opens, a guest cannot have every mapping there is.
+fn shares() -> bool {
+    let Some(mut t) = Table::new() else {
+        return check("a table to test with", false);
+    };
+    const LIVE: u64 = u64::MAX;
+    let count = |t: &Table, host: u32| t.host(host).map_or(0, |h| usize::from(t.hosts[h].count));
+    let made = |t: &mut Table, host: u32, i: usize| match t.insert(&flow(host, i), [0; 6], 0) {
+        Some(m) => {
+            t.entries[m.at].expires = LIVE;
+            Some(m.taken)
+        }
+        None => None,
+    };
+    let mut ok = true;
+    for i in 0..ENTRIES {
+        ok &= made(&mut t, GUEST, i) == Some(false);
+    }
+    ok = check("one guest's flows fill the table", ok && t.active == ENTRIES && count(&t, GUEST) == ENTRIES);
+
+    /* Its first flow used again: the second is the one used least lately. */
+    if let Some(i) = t.find(&flow(GUEST, 0), 0) {
+        t.touch(i);
+    }
+    ok &= check("a full table gives a guest its own flow used least lately",
+        made(&mut t, GUEST, ENTRIES) == Some(true) && t.find(&flow(GUEST, 1), 0).is_none()
+            && t.find(&flow(GUEST, 0), 0).is_some() && t.active == ENTRIES);
+
+    ok &= check("and another guest's flow takes from the guest holding the most",
+        made(&mut t, OTHER, 0) == Some(true) && t.find(&flow(GUEST, 2), 0).is_none()
+            && count(&t, GUEST) == ENTRIES - 1 && count(&t, OTHER) == 1);
+    let mut taken = true;
+    for i in 1..16 {
+        taken &= made(&mut t, OTHER, i) == Some(true);
+    }
+    ok &= check("each of its flows, while it holds fewer",
+        taken && count(&t, OTHER) == 16 && count(&t, GUEST) == ENTRIES - 16 && t.active == ENTRIES);
+
+    ok &= check("forget lets one guest's flows go, and only them",
+        t.forget(GUEST) == ENTRIES - 16 && t.active == 16 && count(&t, GUEST) == 0
+            && count(&t, OTHER) == 16 && (0..16).all(|i| t.find(&flow(OTHER, i), 0).is_some()));
+    ok & ties() & slots()
+}
+
+/// Two guests holding as many each: a third's flow takes from the one at
+/// the lower address -- one rule, the same every time.
+fn ties() -> bool {
+    let Some(mut t) = Table::new() else {
+        return check("a table to test with", false);
+    };
+    let mut ok = true;
+    for i in 0..ENTRIES {
+        let host = if i % 2 == 0 { GUEST } else { OTHER };
+        match t.insert(&flow(host, i), [0; 6], 0) {
+            Some(Made { at, taken: false }) => t.expire_at(at, u64::MAX),
+            _ => ok = false,
+        }
+    }
+    let count = |t: &Table, host: u32| t.host(host).map_or(0, |h| usize::from(t.hosts[h].count));
+    let third = t.insert(&flow(THIRD, 0), [0; 6], 0).map(|m| m.taken);
+    check("a tie goes against the lower address",
+        ok && third == Some(true) && count(&t, GUEST) == ENTRIES / 2 - 1 && count(&t, OTHER) == ENTRIES / 2
+            && count(&t, THIRD) == 1)
+}
+
+/// Every slot held by a host: one past them has no mapping made -- until a
+/// host's flows run out, and its slot is swept free for the next.
+fn slots() -> bool {
+    let Some(mut t) = Table::new() else {
+        return check("a table to test with", false);
+    };
+    const QUIET: u64 = 5000;
+    let host = |h: usize| GUEST + 0x100 + h as u32;
+    let mut ok = true;
+    for h in 0..HOSTS {
+        match t.insert(&flow(host(h), 0), [0; 6], 0) {
+            Some(Made { at, taken: false }) => t.expire_at(at, if h == 0 { QUIET } else { u64::MAX }),
+            _ => ok = false,
+        }
+    }
+    ok = check("a slot for each host there is room for", ok && t.active == HOSTS);
+    ok &= check("and none for one more", t.insert(&flow(host(HOSTS), 0), [0; 6], QUIET - 1).is_none());
+    ok &= check("until a host's flows run out, which frees its slot",
+        matches!(t.insert(&flow(host(HOSTS), 0), [0; 6], QUIET), Some(Made { taken: false, .. }))
+            && t.active == HOSTS && t.host(host(0)).is_none() && t.host(host(HOSTS)).is_some());
     ok
 }

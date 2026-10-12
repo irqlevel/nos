@@ -72,6 +72,8 @@ pub mod devices;
 pub mod acpi;
 #[path = "../../../src/rust/hv/src/cr.rs"]
 pub mod cr;
+#[path = "../../../src/rust/hv/src/dr.rs"]
+pub mod dr;
 /// The guests' DHCP server, from the module: what a guest's DHCP client's
 /// frames reach.
 #[path = "../../../src/rust/modules/hv/src/dhcp.rs"]
@@ -90,6 +92,8 @@ pub mod mmio;
 #[allow(unused_imports)]
 #[path = "../../../src/rust/net/src/nat.rs"]
 pub mod nat;
+#[path = "../../../src/rust/hv/src/place.rs"]
+pub mod place;
 #[path = "../../../src/rust/hv/src/policy.rs"]
 pub mod policy;
 #[path = "../../../src/rust/hv/src/run.rs"]
@@ -103,7 +107,9 @@ pub mod switch;
 pub mod walk;
 
 mod guestnet;
+mod placemodel;
 mod platform;
+mod policymodel;
 mod recycle;
 mod targets;
 
@@ -309,6 +315,7 @@ fn main() {
     if std::env::var_os("HV_FUZZ_STATS").is_some() {
         platform::report();
         guestnet::report();
+        placemodel::report();
     }
     if findings.is_empty() {
         println!("hv-fuzz: {} inputs, no finding", total);

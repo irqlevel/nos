@@ -38,11 +38,12 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize
 use hv::run::{Counts, Host};
 use hv::{Doorbells, Machine};
 use kcore::cmd::Output;
-use kcore::consts::{MAX_CPUS, NS_PER_MS, NS_PER_SEC};
+use kcore::consts::{NS_PER_MS, NS_PER_SEC};
 use kcore::sync::Mutex;
 use kcore::task::TaskHandle;
 
-use crate::disk::{self, Claims, Holder, Runner, Wake};
+use crate::cores::{Cores, Hold};
+use crate::disk::{Claims, Holder, Runner, Wake};
 use crate::forward::Forwards;
 use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
@@ -416,7 +417,12 @@ impl Host for VmHost {
         if self.shared.log {
             if let Some(line) = self.line.lock().as_mut() {
                 if line.push(byte) {
-                    kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
+                    if let Some(dropped) = line.admit(kcore::time::boot_time_ns()) {
+                        if dropped != 0 {
+                            kcore::trace!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
+                        }
+                        kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
+                    }
                     line.clear();
                 }
             }
@@ -469,10 +475,16 @@ impl Host for VmHost {
 }
 
 impl VmHost {
-    /// The line of the console not yet ended, to the kernel log: at the end
-    /// of a boot.
+    /// The line of the console not yet ended, to the kernel log, and how many
+    /// were left out that no notice has said: at the end of a boot.
     fn flush_line(&self) {
-        if let Some(line) = self.line.lock().as_mut().filter(|l| !l.text().is_empty()) {
+        let mut line = self.line.lock();
+        let Some(line) = line.as_mut() else { return };
+        let dropped = line.take_dropped();
+        if dropped != 0 {
+            kcore::trace!(0, "hvvm{}| ... {} lines not logged", self.shared.id, dropped);
+        }
+        if !line.text().is_empty() {
             kcore::trace!(0, "hvvm{}| {}", self.shared.id, line.text());
             line.clear();
         }
@@ -491,6 +503,9 @@ struct Start {
     /// What its disks wake and where they are served, for every boot.
     runner: Runner,
     placement: Vec<u32>,
+    /// Its hold on those CPUs and its disks', for as long as the task runs:
+    /// through every boot and while it is parked, until `hv stop`.
+    hold: Hold,
 }
 
 /// How a `restart` guest's reboots are counted: `RESTART_BURST` in a
@@ -518,7 +533,9 @@ impl Burst {
 /// again, or parked on the first CPU's doorbell until a command asks for a
 /// restart or the end.
 fn vcpu(start: Start) {
-    let Start { shared, built, machine, spec, runner, placement } = start;
+    let Start { shared, built, machine, spec, runner, placement, hold } = start;
+    /* Given back when this returns, the VM gone. */
+    let _hold = hold;
     let line = if shared.log { LogLine::new() } else { None };
     if shared.log && line.is_none() {
         kcore::trace!(0, "hv: vm {} logs nothing of its console: no memory for a line", shared.id);
@@ -674,6 +691,8 @@ struct Vm {
     task: Option<TaskHandle>,
     /// The host CPUs its CPUs run on, its first CPU's first.
     cpus: Vec<u32>,
+    /// The one its disks are served on, when it has disks.
+    disk_cpu: Option<u32>,
     kernel: String,
     mem_mib: u64,
     /// Its port on the switch, with `net`.
@@ -786,22 +805,6 @@ impl Vms {
         self.claims.clone()
     }
 
-    /// How many running VMs' CPUs each CPU has: what a new VM's CPUs are
-    /// placed by.
-    pub fn load(&self) -> [u32; MAX_CPUS] {
-        let mut load = [0u32; MAX_CPUS];
-        for vm in &self.table.lock().vms {
-            if vm.shared.running() {
-                for &cpu in &vm.cpus {
-                    if let Some(n) = load.get_mut(cpu as usize) {
-                        *n += 1;
-                    }
-                }
-            }
-        }
-        load
-    }
-
     /// A running VM with a CPU on a host CPU in `mask`, if there is one, and
     /// that host CPU: what `hv off` will not turn the extension off under.
     pub fn running_on(&self, mask: u64) -> Option<(u32, u32)> {
@@ -824,7 +827,7 @@ impl Vms {
     }
 
     /// `hv start`: build the guest, put it on a vCPU task, and come back.
-    pub fn start(&self, machine: &Arc<Machine>, args: &str, out: &mut Output) {
+    pub fn start(&self, machine: &Arc<Machine>, cores: &Cores, args: &str, out: &mut Output) {
         if let Err(e) = hv::run::ensure_runnable(machine) {
             let _ = writeln!(out, "hv: no guest can run here -- {}", e);
             return;
@@ -840,14 +843,20 @@ impl Vms {
                 return;
             }
         };
-        let load = self.load();
-        let placement = match guest::pick_cpus(machine, spec.cpu, spec.cpus, &load) {
-            Ok(p) => p,
+        /* Its place, and its hold on it, before anything is made: two
+         * starts at once are given cores apart. The hold is named once the
+         * VM has a number, and given back with the task -- or here, on the
+         * way out of a start that goes no further. */
+        let has_disks = !spec.disks.is_empty();
+        let (place, core_hold) = match cores.take(machine, spec.cpu, spec.cpus, has_disks, None) {
+            Ok(taken) => taken,
             Err(why) => {
                 let _ = writeln!(out, "hv: {}", why);
                 return;
             }
         };
+        let placement = place.vcpus;
+        let disk_cpu = place.disk;
         let cpu = placement[0];
         if spec.input.len() > INPUT_MAX {
             let _ = writeln!(out, "hv: input= is {} bytes, more than the {} a vm queues", spec.input.len(), INPUT_MAX);
@@ -869,6 +878,7 @@ impl Vms {
             };
             core::mem::replace(&mut table.next, next)
         };
+        core_hold.held_by(Holder::Vm(id));
 
         let shared = match Shared::new(id, spec.log, &spec.input, spec.cpus) {
             Some(shared) => Arc::new(shared),
@@ -918,7 +928,7 @@ impl Vms {
         let runner = Runner {
             wake: shared.clone(),
             name: label,
-            cpu: disk::disk_cpu(cpu, &load),
+            cpu: disk_cpu,
             claims: self.claims.clone(),
             holder: Holder::Vm(id),
         };
@@ -960,7 +970,9 @@ impl Vms {
                        if spec.cpus == 1 { "" } else { "s" }, spec.cmdline,
                        if spec.restart { ", restarted when it resets" } else { "" });
 
-        let start = Start { shared: shared.clone(), built, machine: machine.clone(), spec, runner, placement };
+        let start = Start {
+            shared: shared.clone(), built, machine: machine.clone(), spec, runner, placement, hold: core_hold,
+        };
         let task = match kcore::task::spawn_on_with(&name, 1u64 << cpu, start, vcpu) {
             Some(task) => task,
             None => {
@@ -972,7 +984,7 @@ impl Vms {
         };
 
         let port = hold.as_ref().map(|h| h.port);
-        let vm = Vm { shared, task: Some(task), cpus, kernel, mem_mib, port };
+        let vm = Vm { shared, task: Some(task), cpus, disk_cpu: has_disks.then_some(disk_cpu), kernel, mem_mib, port };
         let refused = {
             let mut table = self.table.lock();
             if table.closing || table.vms.len() >= MAX_VMS {
@@ -1018,18 +1030,26 @@ impl Vms {
             for (i, c) in vm.cpus.iter().enumerate() {
                 let _ = write!(out, "{}{}", if i == 0 { "" } else { "," }, c);
             }
+            if let Some(cpu) = vm.disk_cpu {
+                let _ = write!(out, "  disks on cpu {}", cpu);
+            }
             let _ = write!(out, "  {} MiB  {} s", vm.mem_mib,
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);
             if let Some(port) = vm.port {
                 let _ = write!(out, "  {}", net::dotted(net::port_ip(port)));
             }
-            let (dropped, spoofed) =
-                vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.dropped(p))).unwrap_or((0, 0));
-            if dropped != 0 {
-                let _ = write!(out, "  {} frames dropped for it", dropped);
+            let lost = vm.port.and_then(|p| self.switch.lock().as_ref().map(|s| s.counts(p))).unwrap_or_default();
+            if lost.dropped != 0 {
+                let _ = write!(out, "  {} frames dropped for it", lost.dropped);
             }
-            if spoofed != 0 {
-                let _ = write!(out, "  {} frames it sent as another guest, dropped", spoofed);
+            if lost.spoofed != 0 {
+                let _ = write!(out, "  {} frames it sent as another guest, dropped", lost.spoofed);
+            }
+            if lost.over_share != 0 {
+                let _ = write!(out, "  {} frames for hv0 past its share of the backlog, dropped", lost.over_share);
+            }
+            if lost.flooded != 0 {
+                let _ = write!(out, "  {} frames for every port past their rate, dropped", lost.flooded);
             }
             let restarts = s.restarts.load(Ordering::Relaxed);
             if restarts != 0 {
