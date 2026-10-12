@@ -13,9 +13,8 @@ use alloc::sync::Arc;
 
 use hv::linux::Header;
 use hv::run::{Counts, GuestCpu, Host, LinuxGuest, Stop, Stopped, MAX_DISKS};
-use hv::topology::Topology;
 use hv::{Doorbells, Machine};
-use kcore::consts::{MAX_CPUS, NS_PER_MS, NS_PER_SEC};
+use kcore::consts::{NS_PER_MS, NS_PER_SEC};
 use kcore::sync::Mutex;
 
 use crate::disk::{FileDisk, Runner};
@@ -318,88 +317,6 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         .load(bsp, &header, &first, layout, cmdline.as_bytes())
         .map_err(|e| alloc::format!("laying out the guest: {}", e))?;
     Ok(Built { guest, cpus })
-}
-
-/// How many vCPUs run on the core CPU `cpu` is a thread of: on it and on its
-/// SMT siblings, with whom a vCPU there shares the core's execution units.
-fn core_load(topo: &Topology, cpu: u32, load: &[u32; MAX_CPUS]) -> u32 {
-    let core = topo.core(cpu);
-    (0..MAX_CPUS as u32).filter(|&c| topo.core(c) == core).map(|c| load[c as usize]).sum()
-}
-
-/// The CPU a vCPU is to run on: `wanted` if the extension is on there, else
-/// the CPU the extension is on for whose core has fewest vCPUs already, and
-/// of those the CPU itself (`load` counts them, by CPU) -- the higher of any
-/// two that tie: CPU 0 is where the boot CPU's own work runs, and the last
-/// to be given a guest.
-pub fn pick_cpu(machine: &Machine, wanted: Option<u32>, load: &[u32; MAX_CPUS]) -> Result<u32, String> {
-    let enabled = machine.enabled_mask();
-    if enabled == 0 {
-        return Err(String::from("the extension is on for no CPU -- hv on first"));
-    }
-    if let Some(cpu) = wanted {
-        if (cpu as usize) < MAX_CPUS && enabled & (1u64 << cpu) != 0 {
-            return Ok(cpu);
-        }
-        return Err(alloc::format!("the extension is not on for cpu {}", cpu));
-    }
-    let topo = Topology::host();
-    let mut best: Option<(u32, (u32, u32))> = None;
-    for cpu in 0..MAX_CPUS as u32 {
-        if enabled & (1u64 << cpu) == 0 {
-            continue;
-        }
-        let key = (core_load(&topo, cpu, load), load[cpu as usize]);
-        if best.map_or(true, |(_, k)| key <= k) {
-            best = Some((cpu, key));
-        }
-    }
-    best.map(|(cpu, _)| cpu).ok_or_else(|| String::from("the extension is on for no CPU -- hv on first"))
-}
-
-/// The host CPUs a guest of `cpus` CPUs runs on, its first CPU's first:
-/// that one by [`pick_cpu`], and each other on a CPU the extension is on
-/// for that none of the guest's has yet -- one whose core none of the
-/// guest's CPUs is on where there is one, since two threads of a core share
-/// its execution units; then one sharing the first's last-level cache, where
-/// the CPUs' lines and IPIs go no further; then the least loaded, as
-/// `pick_cpu` chooses. A guest's CPUs never share a host CPU -- one that
-/// spins waiting for another would hold the CPU the other needs to finish
-/// -- so a guest has at most as many as the extension is on for.
-pub fn pick_cpus(machine: &Machine, wanted: Option<u32>, cpus: u32, load: &[u32; MAX_CPUS])
-    -> Result<Vec<u32>, String>
-{
-    let enabled = machine.enabled_mask();
-    if cpus > enabled.count_ones() {
-        return Err(alloc::format!(
-            "{} cpus asked for, and the extension is on for {} -- each of a guest's CPUs runs on a host CPU of its own",
-            cpus, enabled.count_ones()));
-    }
-    let mut chosen = Vec::new();
-    chosen.try_reserve_exact(cpus as usize).map_err(|_| String::from("out of memory"))?;
-    let first = pick_cpu(machine, wanted, load)?;
-    chosen.push(first);
-    let mut load = *load;
-    load[first as usize] += 1;
-    let topo = Topology::host();
-    let home = topo.llc(first);
-    while chosen.len() < cpus as usize {
-        let mut best: Option<(u32, (bool, bool, u32, u32))> = None;
-        for cpu in 0..MAX_CPUS as u32 {
-            if enabled & (1u64 << cpu) == 0 || chosen.contains(&cpu) {
-                continue;
-            }
-            let shares_core = chosen.iter().any(|&c| topo.core(c) == topo.core(cpu));
-            let key = (shares_core, topo.llc(cpu) != home, core_load(&topo, cpu, &load), load[cpu as usize]);
-            if best.map_or(true, |(_, k)| key <= k) {
-                best = Some((cpu, key));
-            }
-        }
-        let (cpu, _) = best.ok_or_else(|| String::from("no host CPU left for the guest's next CPU"))?;
-        load[cpu as usize] += 1;
-        chosen.push(cpu);
-    }
-    Ok(chosen)
 }
 
 /// How a guest's run went: how it stopped, and what each of its CPUs

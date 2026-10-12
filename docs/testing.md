@@ -395,6 +395,20 @@ by plain writes while the device takes from it, as nothing on the host can
 stop it doing -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
+`place` holds where guests are put on the host's cores (`hv/src/place.rs`)
+to a model of its own (`fuzz/hv/src/placemodel.rs`), over hosts made up an
+input -- one, two or four threads a core, caches shared by one to sixteen
+cores, CPUs missing from the numbering and the extension off on some -- on
+which guests are started and stopped, and the rule changed between, as the
+input says: a guest refused only where no place exists, and for the reason
+that comes first; each vCPU on a CPU of its own the extension is on for,
+the first where `cpu=` said; and, its cores its own, none of them with
+another guest's CPU on it, every one of them but one filled before the next
+is taken, and its disks' task on a spare thread of its own cores, then on a
+core no guest has, then beside a vCPU of its own. Five mutants of the rule
+-- later cores not checked, one vCPU a core, the disks' task on a held core,
+`cpu=`'s core not checked, the disks' task elsewhere before a spare thread
+of its own -- each failed within two inputs.
 `policy` holds the CPUID and MSR policy to a model of its own
 (`fuzz/hv/src/policymodel.rs`), over a host CPU made up an input -- which
 vendor's, the tops of its two ranges of leaves, below the policy's and
@@ -1400,9 +1414,18 @@ must have taken its own local timer's interrupts, rescheduling IPIs must
 have gone between them, and `hv list` must name the host CPU of each. nos
 runs with two cores of two threads (`-smp 4,cores=2,threads=2`) in every
 boot of this gate, so that where a guest's CPUs go has a topology to be
-wrong on: a guest of two must be on both cores, never on one core's two
-threads -- where the first placement put it (13 and 12 on the AX41, and
-two busy loops there ran at three quarters of the speed). It goes with
+wrong on: a guest's cores being its own, a guest of two must be on one
+core's two threads and the next guest on the other core. (Where the guests
+are all one's own, `hv cores shared` puts a guest's CPUs on cores apart:
+two busy loops on one core's two threads ran at three quarters of the
+speed, 13 and 12 on the AX41.) In every run the VM phase must put vm 0 and
+vm 1 on cores apart, refuse a third guest while the two hold both cores --
+saying the free cores hold none, before the guest takes a number -- and
+have `hv cores` name which guest holds which CPUs; the image claims, three
+guests at once beside vm 0, run under `hv cores shared` and switch it back
+after. And `--disk`'s guest must have its disk served on its own core: the
+other thread of its CPU's, or, its two CPUs filling that core, the other
+core. It goes with
 `--disk`, `--nvme-root`, `--net` and `--attach`, whose guests get the same
 N CPUs -- they once started theirs with one whatever `--cpus` said -- and
 there the guest's `/proc/interrupts` must show its virtio device on MSI-X,

@@ -13,6 +13,8 @@ use core::arch::x86_64::CpuidResult;
 
 use hvarch::x86::cpu;
 
+pub use crate::place::Topology;
+
 /// Intel's deterministic cache parameters.
 const LEAF_CACHE: u32 = 4;
 /// The x2APIC topology leaf: subleaf 0 is the SMT level.
@@ -36,32 +38,10 @@ const CACHE_SHARING_MASK: u32 = 0xFFF;
 /// More subleaves than any CPU has caches.
 const CACHE_SUBLEAVES: u32 = 16;
 
-/// The widths an APIC ID divides into: a core's threads, and the CPUs that
-/// share the last-level cache.
-#[derive(Clone, Copy, Debug)]
-pub struct Topology {
-    smt_shift: u32,
-    llc_shift: u32,
-}
-
-impl Topology {
-    /// What CPUID says on the CPU this runs on. Where it says nothing, every
-    /// CPU is a core of its own, and all of them share one cache.
-    pub fn host() -> Topology {
-        Topology { smt_shift: smt_shift(), llc_shift: llc_shift() }
-    }
-
-    /// The core CPU `cpu` is a thread of.
-    #[inline]
-    pub fn core(&self, cpu: u32) -> u32 {
-        cpu.checked_shr(self.smt_shift).unwrap_or(0)
-    }
-
-    /// The last-level cache CPU `cpu` shares.
-    #[inline]
-    pub fn llc(&self, cpu: u32) -> u32 {
-        cpu.checked_shr(self.llc_shift).unwrap_or(0)
-    }
+/// The host's, as CPUID says on the CPU this runs on. Where it says
+/// nothing, every CPU is a core of its own, and all of them share one cache.
+pub fn host() -> Topology {
+    Topology::of(smt_shift(), llc_shift())
 }
 
 /// A leaf the CPU has, or None: `cpu::cpuid_count` checks the range.

@@ -133,7 +133,8 @@ CLAIMED_BYTES = 1 << 20
 # nolapic. (The loader adds noapic itself: the machine has no IO-APIC.)
 # nos's own CPUs: two cores of two threads each, so that where a guest's CPUs
 # are placed has a topology to go wrong on -- APIC IDs 0 and 1 are one core,
-# 2 and 3 the other, and a guest of two CPUs belongs on both.
+# 2 and 3 the other. A guest's cores are its own (`hv cores`): one of two
+# CPUs fills a core's two threads, and leaves the other core to the next.
 NOS_SMP = "4,sockets=1,cores=2,threads=2"
 DEFAULT_CMDLINE_SMP = "earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check"
 
@@ -182,6 +183,10 @@ def vm_commands(args):
     reset_by = r"0x06 to port 0xcf9" if args.acpi else r"0xfe to port 0x64"
     start0 = "hv start /bzImage mem=%d%s initrd=/initrd cmdline=%s" % (args.mem, c, args.cmdline)
     start1 = "hv start /bzImage mem=64%s cmdline=%s" % (c, args.cmdline)
+    # A third guest while the two hold both cores: refused, its cores being
+    # its own -- before it takes a number, so the numbers after are as they
+    # were.
+    start_full = "hv start /bzImage mem=80%s cmdline=%s" % (c, args.cmdline)
     # Typed while vm 0 still boots: held until its shell asks for input,
     # and answered at the prompt printed after the line went in.
     exec_early = "hv exec 0 secs=%d id" % args.vm_secs
@@ -223,8 +228,11 @@ def vm_commands(args):
     claim_rw = "hv start /bzImage mem=64%s disk=/%s cmdline=%s panic=0" % (c, CLAIMED_IMAGE, args.cmdline)
     claim_ro = "hv start /bzImage mem=64%s disk=/%s:ro cmdline=%s panic=0" % (c, CLAIMED_IMAGE, args.cmdline)
     claim_stop = ["hv stop %d secs=0" % (claim_vm + k) for k in (0, 3, 4)]
-    claim_lines = [claim_rw, claim_rw, claim_ro, claim_stop[0],
-                   claim_ro, claim_ro, claim_rw, claim_stop[1], claim_stop[2]]
+    # Three guests at once beside vm 0, on a machine of two cores: their
+    # cores shared for it (`hv cores shared`), which is not what this tests,
+    # and their own again after.
+    claim_lines = ["hv cores shared", claim_rw, claim_rw, claim_ro, claim_stop[0],
+                   claim_ro, claim_ro, claim_rw, claim_stop[1], claim_stop[2], "hv cores own"]
     # A guest whose console goes to nos's log, printing as fast as it can:
     # the log takes a boot's worth and then a rate (`modules/hv/src/guest.rs`,
     # LogLine), and says how many it left out; the guest's own console keeps
@@ -265,10 +273,10 @@ def vm_commands(args):
              r"vm 0  running  cpus \d+(,\d+){%d}  " % (args.cpus - 1), True),
         ]
         if args.cpus == 2:
-            # Two cores to go round, and a thread of each: never both threads
-            # of one core, whose execution units they would share.
-            smp_checks.append(("hv list", 0, "its two CPUs are on two cores, not one core's two threads",
-                               r"vm 0  running  cpus ([01],[23]|[23],[01])  ", True))
+            # Its cores its own, its CPUs filling their threads: one core's
+            # two, a vCPU a thread, and the other core left to vm 1.
+            smp_checks.append(("hv list", 0, "its two CPUs are one core's two threads, a core of its own",
+                               r"vm 0  running  cpus (2,3|3,2|0,1|1,0)  ", True))
         if args.ioapic:
             # The PC's own lines through the IO-APIC: the timer's on pin 2,
             # which the boot counts its ticks by before the local APICs'
@@ -340,7 +348,7 @@ def vm_commands(args):
     stop_all = "hv stop all secs=3"
     all_note = (r"its power button went unanswered for 3 s" if args.acpi
                 else r"nothing in it listens to its power button")
-    lines = ["hv help", start0, start1, "hv list", stop1, exec_early, exec_prompt] + smp_lines + [
+    lines = ["hv help", start0, start1, "hv list", start_full, "hv cores", stop1, exec_early, exec_prompt] + smp_lines + [
              send, wait, "hv console 0 bytes=400", "hv list",
              start2, wait_reboot, wait_stop, "hv list",
              "hv restart 2", wait_stop2, "hv list", "hv stop 2",
@@ -357,6 +365,18 @@ def vm_commands(args):
         (start1, 0, "vm 1 starts beside it", r"hv: vm 1 started on %s " % on, True),
         ("hv list", 0, "hv list shows vm 0 running", r"vm 0  running", True),
         ("hv list", 0, "hv list shows vm 1 running", r"vm 1  running", True),
+        ("hv list", 0, "each on cores of its own: one on CPUs 2 and 3's, the other on 0 and 1's",
+         r"(?s)vm 0  running  cpus? [23](,[23])?  .*vm 1  running  cpus? [01](,[01])?  "
+         r"|vm 0  running  cpus? [01](,[01])?  .*vm 1  running  cpus? [23](,[23])?  ", True),
+        (start_full, 0, "a third, both cores held, is refused for want of a core of its own",
+         r"hv: %d cpus asked for, and the cores no other guest has a CPU on hold 0 -- a guest's cores are its own"
+         % args.cpus, True),
+        ("hv cores", 0, "hv cores says a guest's cores are its own, and which guest holds which CPUs",
+         r"cores own -- a guest is given whole cores[\s\S]*vm 0: cpu[\s\S]*vm 1: cpu", True),
+        ("hv cores shared", 0, "hv cores shared lets guests share a core's threads",
+         r"cores shared -- guests may be given threads of one core", True),
+        ("hv cores own", 0, "and hv cores own gives each its own again", r"cores own -- a guest is given whole cores",
+         True),
         (stop1, 0, "vm 1 stops on request, mid-boot", stopped1, True),
         (exec_early, 0, "a line typed during boot is answered at the prompt after it",
          r"# id\nuid=0 gid=0\n", True),
@@ -797,6 +817,7 @@ def disk(args):
           x("ls -l /mnt/big"),
           x("umount /mnt", 120),
           x("grep virtio /proc/interrupts"),
+          "hv list",
           "hv stop 0", RC_LAST]
     p, log, image = boot_rc(args, tmp, rc, {"disk.img": img})
     try:
@@ -814,6 +835,13 @@ def disk(args):
         pt.check("remounted, what the guest wrote reads back", "nos-wrote-this" in out(14), out(14))
         pt.check("so does the size of the big one", "4194304" in out(15), out(15))
         pt.check(*interrupt_check(args, out(17), "req"))
+        # Its disk's task on its own core -- the other thread of its vCPU's
+        # -- or, its CPUs filling that core, on the core no guest has.
+        own_disk = (r"vm 0  running  cpu (3  disks on cpu 2|2  disks on cpu 3|1  disks on cpu 0|0  disks on cpu 1)  "
+                    if args.cpus == 1 else
+                    r"vm 0  running  cpus ([23],[23]  disks on cpu [01]|[01],[01]  disks on cpu [23])  ")
+        pt.check("its disk is served on a thread of a core of its own", re.search(own_disk, out(18)) is not None,
+                 out(18)[-300:])
         stop = output_of(secs, "hv stop 0", 0) or ""
         m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
         pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
