@@ -1972,19 +1972,43 @@ mirror fetched from.
 ## More than one CPU
 
 `cpus=N` on `hv boot` and `hv start` gives a guest N CPUs, up to 16. Each is
-a task of its own on a host CPU of its own: the first where `cpu=` says or
-on the least loaded core the extension is on for, the others each on a core
-none of the guest's CPUs is on yet where there is one, sharing the first's
-last-level cache where they can, and the least loaded of those
-(`pick_cpus`, over `hv::topology`, which reads a CPU's core and cache from
-its APIC ID and CPUID). Two CPUs of one guest never share a host CPU -- a
-guest CPU spinning while it waits for another would hold the host CPU the
-other needs to finish -- so a guest has at most as many CPUs as `hv on` has
-turned the extension on for. Nor, where it can be helped, a core: placed on
-one core's two threads (13 and 12 on the AX41, as the first placement did),
-two busy loops in a Debian guest took 14.7 s where one alone took 9.7; on
-two cores of one CCX (13 and 11, where it goes now) they take 9.7, and four
-loops on a guest of four CPUs (13, 11, 9 and 5) take 10.0.
+a task of its own on a host CPU of its own, and where they go is
+`hv::place`'s to say, over `hv::topology` -- which reads a CPU's core and
+cache from its APIC ID and CPUID -- by the rule `hv cores` sets. Two CPUs of
+one guest never share a host CPU -- a guest CPU spinning while it waits for
+another would hold the host CPU the other needs to finish -- so a guest has
+at most as many CPUs as `hv on` has turned the extension on for.
+
+**A guest's cores are its own** (`hv cores own`, the default). Two CPUs on
+one core's two threads share its execution units, its caches and its
+buffers -- what every SMT side channel stands on, MDS, L1TF and port
+contention among them -- so a guest is given whole cores no other guest has
+a CPU on, its vCPUs or the task that serves its disks, and its vCPUs fill
+their threads: a vCPU a thread, as a cloud sells them, where a vCPU a core
+would leave a thread idle beside each. The first where `cpu=` says, or on
+the free core with the most threads -- CPU 0's last, where the boot CPU's own
+work runs, and the higher threads of a core first, CPU 0 the last of all --
+then the threads left on it, then on cores sharing its last-level cache. Its
+disks' task goes on a spare thread of its own cores, then on a core no guest
+has -- which it then holds as well -- then beside a vCPU of its own. A guest
+that would need a core another has -- `cpu=` on one, or more CPUs than the
+free cores have threads -- is refused, saying so. The place and the hold on
+it are taken under one lock (`modules/hv/src/cores.rs`), so two guests
+started at once from two shells cannot both be given a core; an `hv start`
+guest holds its cores until `hv stop` -- parked too, for the restart that
+runs it there again -- and an `hv boot` guest until its run is over. `hv
+cores` says the rule and who holds which CPUs; `hv list` says where each
+guest's disks are served.
+
+What it costs: a guest's own CPUs share their core. On one core's two
+threads (13 and 12 on the AX41) two busy loops in a Debian guest took 14.7 s
+where one alone took 9.7; on two cores of one CCX (13 and 11) they took 9.7,
+and four loops on a guest of four CPUs (13, 11, 9 and 5) 10.0 -- the
+placement `hv cores shared` gives: the first on the least loaded core, each
+other on a core none of the guest's CPUs is on yet where there is one,
+sharing the first's last-level cache where it can, the least loaded of
+those, whoever else is there. That is for a machine whose guests are all
+one's own.
 
 ```
 $ hv boot /bzImage mem=256 secs=60 cpus=2 initrd=/initrd cmdline=earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check
@@ -3094,10 +3118,26 @@ someone else's; then speed.
    flooder's; one 256-frame backlog for `hv0` that a guest sending as fast
    as it could filled before the others' frames came; a broadcast copied to
    every port, each a wake or a kick, at any rate.
-6. **Two VMs can share a core.** `pick_cpus` keeps a guest's own CPUs off
-   each other's cores, for speed; nothing keeps another guest off them, and
-   the host's tasks serving another guest's disk can run on the sibling
-   thread. Fix: an isolation mode -- whole cores to a guest -- or SMT off.
+6. ~~**Two VMs can share a core.**~~ Done: a guest's cores are its own
+   ([More than one CPU](#more-than-one-cpu)) -- whole cores no other guest
+   has a CPU on, its vCPUs or its disks' task, its vCPUs filling their
+   threads, its disks' task on a spare thread of its own cores, then on a
+   core no guest has; refused where there is none, and `hv cores shared`
+   for a machine whose guests are all one's own. The place and the hold on
+   it are taken under one lock, so two starts at once are given cores
+   apart. hv-fuzz's `place` target holds every placement and every refusal
+   to a model of its own over made-up hosts -- threads a core, caches,
+   CPUs missing and off -- and five mutants (later cores not checked, one
+   vCPU a core, the disks' task on a held core, `cpu=`'s core not checked,
+   the disks' task elsewhere before a spare thread of its own) each failed
+   within two inputs; hv-linux-test puts vm 0 and vm 1 on cores apart,
+   refuses a third while both are held, and serves a guest's disk on its
+   own core. What it was: `pick_cpus` kept a guest's own CPUs off each
+   other's cores, for speed, and nothing kept another guest off them, nor
+   the task serving another guest's disk off the sibling thread. Left: the
+   host's own tasks -- the network stack among them, which carries every
+   guest's frames -- still run on any core; a core of the host's own for
+   them is core scheduling, not placement.
 7. **Debug registers and PKRU, under VT-x.** AMD-V's half is done: a
    guest's DR0-3 are its own, every `mov` of them intercepted and performed
    on a copy per vCPU, and the CPU's made that copy before each entry --
@@ -3182,11 +3222,13 @@ someone else's; then speed.
 3. **Fewer exits a request.** No EVENT_IDX and no NO_NOTIFY, though both
    work on legacy virtio; and a guest of one CPU has no local APIC, so no
    MSI-X -- six exits an interrupt through the 8259.
-4. **The EX44's E-cores first.** A CPU's number here is its APIC ID, the
-   E-cores' are the highest (48 to 62, [Real hardware](real-hardware.md)),
-   and `pick_cpu` gives a tie to the highest CPU: the first guests and
-   their disks' tasks land on the slow cores. Fix: rank by core type
-   (CPUID leaf 0x1A).
+4. **The EX44's E-cores first, with shared cores.** A CPU's number here is
+   its APIC ID, the E-cores' are the highest (48 to 62, [Real
+   hardware](real-hardware.md)), and `hv cores shared` gives a tie to the
+   highest CPU: the first guests and their disks' tasks land on the slow
+   cores. With a guest's cores its own a core of more threads goes first,
+   which there is a P-core, but no rule knows a P-core from an E-core of
+   two threads. Fix: rank by core type (CPUID leaf 0x1A).
 5. **PAUSE.** VT-x exits at every PAUSE, with no pause-loop exiting; AMD-V
    sets the pause filter's count and leaves its threshold unused.
 6. **The larger ones.** APICv and AVIC -- EOIs, the TPR and IPIs without an
