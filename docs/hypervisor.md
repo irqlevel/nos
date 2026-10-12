@@ -435,10 +435,13 @@ What the VMX backend does not do yet, and says so rather than pretends:
 - **Debug registers are not the guest's.** "Load debug controls" is off, so
   the guest's DR7 is not loaded at an entry, and every exit sets DR7 to
   0x400: a hardware breakpoint or watchpoint set in a guest (gdb, perf) is
-  gone at its next exit, silently. DR0-3 and DR6 are switched by neither
-  backend. Making them the guest's is MOV-DR exiting with a lazy switch, and
-  `#DB` given back to the guest rather than stopping it -- one job, not yet
-  done.
+  gone at its next exit, silently. Nor are DR0-3 and DR6 switched: under
+  AMD-V a guest's DR0-3 are its own ([What entering a guest cannot be told
+  to do](#what-entering-a-guest-cannot-be-told-to-do)), and under VT-x one
+  guest's breakpoint addresses are still the next guest's to read. Making
+  them the guest's is MOV-DR exiting over the same four per vCPU and their
+  load before an entry, DR6 put in by hand, and `#DB` given back to the
+  guest rather than stopping it -- one job, not yet done.
 
 ## What it does today
 
@@ -611,6 +614,25 @@ on on every entry, whatever the VMCB says:
   guest reads the register, MCE in it, and its writes are the host's all
   the same. Intercepting CR0's reads too would catch them there, and on a
   real CPU catch SMSW, which a guest's user process may run;
+- the intercept of every read and write of DR0-DR3, and the CPU's four made
+  the guest's own before each entry. The breakpoint addresses are the
+  CPU's, not the VMCB's -- `vmrun` switches DR6 and DR7, not them -- so
+  without both a guest would read whatever the last guest on its CPU left
+  there, and a breakpoint it set would be moved by the next guest's write,
+  or left behind when its vCPU moved to another CPU. Each `Guest` keeps its
+  own four, from which the policy answers the guest's `mov`s and into which
+  it performs them (`hv/src/dr.rs`, `crate::dr`, the instruction decoded as
+  CR4's is); its own DR7, which `vmrun` loads, arms them. A record per CPU
+  of what its four hold (`LoadedDebugAddrs`) has an entry write only the
+  ones that differ -- nothing else in the kernel writes them, the guest
+  cannot, and neither `vmrun` nor `#vmexit` does -- so a guest that never
+  sets a breakpoint costs no write at all, where four writes of a debug
+  register, each serializing, would cost every entry. A `mov` above CPL 0
+  is the #GP a CPU gives, and one under DR7's general detect the #DB --
+  DR6.BD set, GD cleared, the move not made -- where a CPU checks either
+  after the intercept rather than before. QEMU's TCG, whose slip with CR0's
+  read code is above, adds the register's number to a debug register's
+  code, which is never 0: there the intercepts are each register's own;
 - physical interrupts masked by the host's flag, not the guest's
   (`V_INTR_MASKING`), so a guest sitting with interrupts off cannot keep the
   host's out;
@@ -768,6 +790,7 @@ mode:
 | `smp` | two CPUs, on two host CPUs: the first sends the second INIT and a start-up IPI; the second comes up in real mode at the vector's page, climbs through protected mode to long mode, writes down its x2APIC ID and CPUID's, and sends the first an IPI; the first, woken by it, arms its APIC timer for one shot and halts until it fires | an application processor started the way Linux starts one, an IPI between two CPUs, and the local APIC timer ([More than one CPU](#more-than-one-cpu)) |
 | `ioapic` | on the machine of `smp` with an IO-APIC, its first CPU alone, in xAPIC mode: reads the IO-APIC's version, then wires the serial port's pin to itself -- as an edge, the THR-empty interrupt enabled and a byte written, then one written while masked; as a level, its handler ending it without reading IIR twice, and the third time reading it | edges sent as the line rises and lost while masked; a level sent again at each EOI for as long as its line is up, its remote IRR set until then; every IO-APIC access and every EOI a decoded MMIO access ([The IO-APIC](#the-io-apic)) |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS; under VT-x, which gives no #DB back yet, the single step stops it |
+| `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which does not keep a guest's four apart yet, the second reads what the first left, and the breakpoint's #DB stops it |
 | `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and SMEP, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and SMEP -- which its CPUID does not offer -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x, which does not stop a guest at CR4 yet, the CPU takes each write itself |
 
 ```
@@ -3075,12 +3098,26 @@ someone else's; then speed.
    each other's cores, for speed; nothing keeps another guest off them, and
    the host's tasks serving another guest's disk can run on the sibling
    thread. Fix: an isolation mode -- whole cores to a guest -- or SMT off.
-7. **Debug registers and PKRU.** DR0-3, and DR6 under VT-x, are switched by
-   neither backend ([above](#the-vmx-backend-and-where-it-differs-from-amd-v)):
-   one guest's breakpoints are another's. On a host with PKU a guest under
-   VT-x sets CR4.PKE and PKRU, which nothing switches either; under AMD-V
-   its write of CR4.PKE is a #GP (item 5), its CPUID not offering PKU, and
-   WRPKRU is then the #UD it is without PKE.
+7. **Debug registers and PKRU, under VT-x.** AMD-V's half is done: a
+   guest's DR0-3 are its own, every `mov` of them intercepted and performed
+   on a copy per vCPU, and the CPU's made that copy before each entry --
+   writing only what differs from what the CPU holds ([What entering a
+   guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)).
+   hv-test's `dr` guest runs two VMs on one CPU, the second reading 0 where
+   the first left its own and each one's breakpoint firing at its own
+   address -- the world switch before this failed it, the second VM
+   reading the first's breakpoint address and pattern, and one without the
+   load, or loading only when the guest's DR7 enabled a breakpoint, never
+   fired the first's breakpoint; hv-fuzz's platform target holds every `mov` of them -- a read,
+   a write, at CPL 3, under general detect -- to a model of its own, and
+   seven mutants of `hv/src/dr.rs` each failed within 145 inputs. What it
+   was: DR0-3 switched by neither backend, one guest's breakpoint addresses
+   the next's to read and to move. Left: VT-x, which switches neither DR0-3
+   nor DR6 ([above](#the-vmx-backend-and-where-it-differs-from-amd-v)); and
+   on a host with PKU a guest under VT-x sets CR4.PKE and PKRU, which
+   nothing switches either. Under AMD-V its write of CR4.PKE is a #GP (item
+   5), its CPUID not offering PKU, and WRPKRU is then the #UD it is without
+   PKE.
 8. **VT-x's controls are taken on trust.** `adjust` drops a control the CPU,
    or an outer hypervisor, does not allow, and only the MSR bitmap is looked
    at again: a CR8, WBINVD, I/O, external-interrupt or NMI exit gone missing

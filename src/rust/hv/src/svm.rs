@@ -44,6 +44,8 @@ pub const PAT_RESET: u64 = 0x0007_0406_0007_0406;
 const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
 const DR6_RESET: u64 = 0xFFFF_0FF0;
 const DR7_RESET: u64 = 0x400;
+/// How many debug registers an exit code can name a `mov` of, each way.
+const DEBUG_REGS: u64 = 16;
 /// A real-mode segment's limit: 64 KiB.
 const REAL_MODE_LIMIT: u32 = 0xFFFF;
 
@@ -128,6 +130,12 @@ pub enum Exit {
     /// time: so that the CR4 it runs with keeps MCE, and it reads back the
     /// one it wrote (`crate::cr`). VT-x does not stop a guest here yet.
     Cr4 { write: bool },
+    /// A `mov` to (`write`) or from debug register `dr`, which AMD-V stops
+    /// a guest at for DR0-DR3, the breakpoint addresses, every time: they
+    /// are the CPU's, not the VMCB's, and the guest's are kept apart from
+    /// them and answered from there (`crate::dr`). VT-x does not stop a
+    /// guest here yet.
+    Dr { write: bool, dr: u8 },
     /// PAUSE -- the guest spin-waiting: stopped so that whatever it waits
     /// for that the host hands over, a timer's tick above all, is handed
     /// over now rather than at the host's next interrupt.
@@ -391,6 +399,8 @@ impl Vcpu {
         /* MCE, as every kernel sets it -- and the VMCB's has it whatever the
          * guest does with it later (`hvarch`). */
         self.cr4 = CR4_PAE | CR4_MCE;
+        /* No breakpoint address, as out of reset; DR6 and DR7 below. */
+        *self.guest.debug_addrs_mut() = [0; 4];
         let s = self.save_mut();
         s.cs = code;
         s.ds = data;
@@ -432,6 +442,9 @@ impl Vcpu {
         /* CR4 0, as reset leaves it -- the guest's; the VMCB's keeps MCE. */
         self.cr4 = 0;
         self.save_mut().cr4 = CR4_MCE;
+        /* And DR0-DR3 0, as INIT leaves them; DR6 and DR7 are the VMCB's,
+         * and `real_mode` set them. */
+        *self.guest.debug_addrs_mut() = [0; 4];
         *self.regs_mut() = reset_regs();
         self.init_reset();
         self.guest.forget_asid();
@@ -440,6 +453,18 @@ impl Vcpu {
     /// The CR4 the guest believes it has, which its reads of CR4 get.
     pub fn cr4(&self) -> u64 {
         self.cr4
+    }
+
+    /// The guest's DR0-DR3, which its reads of them get (`crate::dr`).
+    pub fn debug_addrs(&self) -> [u64; 4] {
+        *self.guest.debug_addrs()
+    }
+
+    /// Make `addrs` the guest's DR0-DR3, for a write of one performed for
+    /// the guest (`crate::dr`): what its reads get from now on, and the
+    /// CPU's from its next entry.
+    pub fn set_debug_addrs(&mut self, addrs: [u64; 4]) {
+        *self.guest.debug_addrs_mut() = addrs;
     }
 
     /// Make `value` the guest's CR4, from a write of it performed for the
@@ -506,6 +531,12 @@ impl Vcpu {
             vmcb::exit::INTR | vmcb::exit::NMI | vmcb::exit::SMI | vmcb::exit::INIT => Exit::Host,
             vmcb::exit::CR4_READ => Exit::Cr4 { write: false },
             vmcb::exit::CR4_WRITE => Exit::Cr4 { write: true },
+            code if (vmcb::exit::DR_READ..vmcb::exit::DR_READ + DEBUG_REGS).contains(&code) => {
+                Exit::Dr { write: false, dr: (code - vmcb::exit::DR_READ) as u8 }
+            }
+            code if (vmcb::exit::DR_WRITE..vmcb::exit::DR_WRITE + DEBUG_REGS).contains(&code) => {
+                Exit::Dr { write: true, dr: (code - vmcb::exit::DR_WRITE) as u8 }
+            }
             vmcb::exit::IOIO => {
                 let info = c.exit_info1;
                 use vmcb::ioio;

@@ -307,6 +307,13 @@ impl Permissions {
 ///   keeps MCE whatever the VMCB says, and the guest cannot clear it in the
 ///   register itself: a write is an exit. What the guest believes CR4 holds
 ///   is the policy's to keep, and to answer its reads with.
+/// - DR0-DR3, read and written: the four breakpoint addresses are the CPU's
+///   -- `vmrun` switches DR6 and DR7, not them -- so a guest would read
+///   whatever the last guest on the CPU left there, and a breakpoint it set
+///   would be moved by the next guest's write, or left behind when its vCPU
+///   moved to another CPU. A guest's are its own instead
+///   ([`Guest::debug_addrs`]), made the CPU's before each of its entries,
+///   and its `mov`s of them are the policy's to answer from there.
 ///
 /// And what the CPU would otherwise do on its own at physical addresses the
 /// VMCB names -- AVIC's backing page and tables, SEV's state, virtual
@@ -332,6 +339,7 @@ pub const VECTOR_AC: u32 = 17;
 pub const VECTOR_MC: u32 = 18;
 const HOST_EXCEPTIONS: u32 = (1 << VECTOR_DB) | (1 << VECTOR_AC) | (1 << VECTOR_MC);
 const HOST_CR: u32 = vmcb::intercept::cr::WRITE_CR4;
+const HOST_DR: u32 = vmcb::intercept::dr::READ_DR0_3 | vmcb::intercept::dr::WRITE_DR0_3;
 
 /// CR4.LA57: five levels of page table.
 const CR4_LA57: u64 = 1 << 12;
@@ -580,6 +588,55 @@ impl Drop for AsidLimit {
     }
 }
 
+/// What a CPU's DR0-DR3 hold: the four the last guest's entry there made
+/// them, or None until one has since the module was loaded -- what was
+/// there before is nothing this load knows.
+///
+/// It stays true from one entry to the next because nothing else writes
+/// them: nothing in this kernel has a `mov` to a debug register but
+/// [`cpu::write_debug_addr`], called from here alone; a guest's own `mov`s
+/// to them are intercepted (`HOST_DR`); and neither `vmrun` nor `#vmexit`
+/// touches them. So an entry writes only the ones the guest's differ in --
+/// none at all for a guest that never sets a breakpoint, on a CPU whose
+/// last guest never did either -- where writing all four, each of them a
+/// serializing instruction, would cost every entry.
+///
+/// Touched only by [`Guest::run`], on its own CPU with interrupts off: a
+/// [`CpuLocal`].
+struct LoadedDebugAddrs(Option<[u64; 4]>);
+
+impl ConstInit for LoadedDebugAddrs {
+    const INIT: Self = LoadedDebugAddrs(None);
+}
+
+static LOADED_DEBUG_ADDRS: CpuLocal<LoadedDebugAddrs> = CpuLocal::new();
+
+impl LoadedDebugAddrs {
+    /// Make this CPU's DR0-DR3 `want`.
+    ///
+    /// # Safety
+    /// As [`cpu::write_debug_addr`]: the host's DR7 enables no breakpoint.
+    unsafe fn load(&mut self, want: &[u64; 4]) {
+        let have = self.0;
+        let differs = |n: usize| have.map_or(true, |h| h[n] != want[n]);
+        unsafe {
+            if differs(0) {
+                cpu::write_debug_addr::<0>(want[0]);
+            }
+            if differs(1) {
+                cpu::write_debug_addr::<1>(want[1]);
+            }
+            if differs(2) {
+                cpu::write_debug_addr::<2>(want[2]);
+            }
+            if differs(3) {
+                cpu::write_debug_addr::<3>(want[3]);
+            }
+        }
+        self.0 = Some(*want);
+    }
+}
+
 /// The guest's x87, MMX and SSE registers, in FXSAVE's format: what
 /// `vmrun` does not switch, and so what [`Guest::run`] does, on every entry
 /// and exit. The host uses none of these registers -- its C++ is built
@@ -637,11 +694,16 @@ pub struct Profile {
 
 /// A guest's CPU as SVM keeps it: the VMCB, the registers `vmrun` leaves to
 /// software, the page the host's own FS, GS, TR, LDTR and syscall MSRs
-/// wait in while the guest runs, and the x87 and SSE state.
+/// wait in while the guest runs, the x87 and SSE state, and the breakpoint
+/// addresses.
 pub struct Guest {
     vmcb: VmcbPage,
     host: VmcbPage,
     regs: GuestRegs,
+    /// Its DR0-DR3: what its `mov`s of them -- each one intercepted,
+    /// `HOST_DR` -- read and write, and what the CPU's are made before each
+    /// entry. 0 out of reset.
+    debug_addrs: [u64; 4],
     /// One element, on the heap: a `Vec` because it can be made fallibly.
     fx: alloc::vec::Vec<FxArea>,
     /// Which guest's registers a CPU holds, this one being this
@@ -665,6 +727,7 @@ impl Guest {
             vmcb: VmcbPage::new()?,
             host: VmcbPage::new()?,
             regs: GuestRegs::default(),
+            debug_addrs: [0; 4],
             fx,
             fp_id: super::fp::owner_id(),
             asid: None,
@@ -722,6 +785,18 @@ impl Guest {
         &mut self.regs
     }
 
+    /// The guest's DR0-DR3: what its reads of them get, and where the
+    /// breakpoints its DR7 enables are while it runs. Any value is sound to
+    /// load: it is matched against the guest's own accesses alone, and only
+    /// while the DR7 `vmrun` loads for the guest enables it.
+    pub fn debug_addrs(&self) -> &[u64; 4] {
+        &self.debug_addrs
+    }
+
+    pub fn debug_addrs_mut(&mut self) -> &mut [u64; 4] {
+        &mut self.debug_addrs
+    }
+
     /// The save area and the registers together, for a caller that has to
     /// touch both (CPUID fills RAX and RBX/RCX/RDX): two disjoint fields, so
     /// the borrow checker is content where two calls would not be.
@@ -736,12 +811,13 @@ impl Guest {
     /// `vmrun` runs.
     ///
     /// Before it enters, the VMCB is made safe for the host whatever the
-    /// caller put in it: the intercepts in `HOST_CR`, `HOST_MISC1`,
-    /// `HOST_MISC2` and `HOST_EXCEPTIONS` set, CR4.MCE set in the guest's
-    /// CR4, physical interrupts masked by the host's flag
+    /// caller put in it: the intercepts in `HOST_CR`, `HOST_DR`,
+    /// `HOST_MISC1`, `HOST_MISC2` and `HOST_EXCEPTIONS` set, CR4.MCE set in
+    /// the guest's CR4, physical interrupts masked by the host's flag
     /// and not the guest's, nested paging on over `nested` and SEV, AVIC
     /// and virtual VMSAVE off, the permission maps `perms`, and nothing
-    /// assumed clean. The ASID and the TLB control are this CPU's to give
+    /// assumed clean; and the CPU's DR0-DR3 are made the guest's
+    /// ([`LoadedDebugAddrs`]). The ASID and the TLB control are this CPU's to give
     /// ([`Asids`]): the one the guest had while it keeps to this CPU, this
     /// generation and this table, the next one otherwise, and a flush of
     /// everything when a generation ends.
@@ -776,6 +852,7 @@ impl Guest {
             v.save.cr4 |= CR4_MCE;
             let c = &mut v.control;
             c.intercept_cr |= HOST_CR;
+            c.intercept_dr |= HOST_DR;
             c.intercept_misc1 |= HOST_MISC1;
             c.intercept_misc2 |= HOST_MISC2;
             c.intercept_exceptions |= HOST_EXCEPTIONS;
@@ -794,6 +871,7 @@ impl Guest {
         let regs: *mut GuestRegs = &mut self.regs;
         let fx: *mut FxArea = &mut self.fx[0];
         let fp_id = self.fp_id;
+        let debug_addrs = self.debug_addrs;
         let flush_always = self.flush_always;
         let tag = &mut self.asid;
         let vmcb = &mut self.vmcb;
@@ -852,6 +930,16 @@ impl Guest {
             if !super::fp::registers_are(cpu, fp_id) {
                 unsafe { asm!("fxrstor64 [{}]", in(reg) fx, options(nostack, preserves_flags)) };
                 super::fp::registers_loaded(cpu, fp_id);
+            }
+            /* The breakpoint addresses are the guest's from here on, armed
+             * by its own DR7 once `vmrun` loads it. The host's DR7 enables
+             * none: nothing in this kernel writes it, and the `#vmexit` of
+             * any earlier entry here left it with all four off. `with` is
+             * None only on a CPU past the table -- refused above already --
+             * or inside another `with` of its own, which this is not; and
+             * a guest is not entered with another's addresses. */
+            if LOADED_DEBUG_ADDRS.with(|loaded, _| unsafe { loaded.load(&debug_addrs) }).is_none() {
+                return Err(NotRun::Off { cpu });
             }
 
             /* The two VMCBs are pages this guest owns, `regs` is its own

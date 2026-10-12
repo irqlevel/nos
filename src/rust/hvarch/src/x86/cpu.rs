@@ -176,6 +176,30 @@ pub unsafe fn write_cr4(value: u64) {
     unsafe { asm!("mov cr4, {}", in(reg) value, options(nomem, nostack, preserves_flags)) };
 }
 
+/// Write DR`N`, one of the four breakpoint address registers -- `N` 0 to 3,
+/// which the compiler holds it to.
+///
+/// # Safety
+/// DR0-DR3 are the CPU's, and a breakpoint DR7 enables is armed at whatever
+/// they hold, for whatever runs here. Only while DR7 enables none of them:
+/// the host's, which nothing in this kernel writes and every `#vmexit`
+/// leaves with all four off -- so that an address put here is matched only
+/// against a guest's accesses, under the DR7 `vmrun` loads for it.
+#[inline]
+pub unsafe fn write_debug_addr<const N: usize>(value: u64) {
+    const { assert!(N < 4) };
+    /* Each arm is the one instruction, for its register; the caller's
+     * promise above is the whole of what any of them needs. */
+    unsafe {
+        match N {
+            0 => asm!("mov dr0, {}", in(reg) value, options(nomem, nostack, preserves_flags)),
+            1 => asm!("mov dr1, {}", in(reg) value, options(nomem, nostack, preserves_flags)),
+            2 => asm!("mov dr2, {}", in(reg) value, options(nomem, nostack, preserves_flags)),
+            _ => asm!("mov dr3, {}", in(reg) value, options(nomem, nostack, preserves_flags)),
+        }
+    }
+}
+
 /// CR4.OSFXSR: FXSAVE and FXRSTOR move the XMM registers and MXCSR too.
 pub const CR4_OSFXSR: u64 = 1 << 9;
 /// CR4.OSXSAVE: XGETBV and XSETBV may be executed.

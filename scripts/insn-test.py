@@ -15,11 +15,12 @@ instructions that must be refused (no memory operand, another opcode, a
 string move, a lock, `movabs`). Each is also cut short at every length,
 which must be refused rather than read as a shorter instruction, and two
 million random byte strings must decode without a panic and never to a
-length past what was there. The same for its other decoder, of a `mov` to
+length past what was there. The same for its other decoders, of a `mov` to
 or from a control register -- what an intercept of CR4 stops a guest at --
-over CR0, CR2, CR3, CR4 and CR8 and eight registers, REX's among them, in
-64-bit and, without a REX, 32-bit code; each decoder must refuse the
-other's every form. The walker is checked against page tables built
+over CR0, CR2, CR3, CR4 and CR8, and of one to or from a debug register --
+what an intercept of DR0-DR3 does -- over DR0-DR3, DR6 and DR7, each with
+eight registers, REX's among them, in 64-bit and, without a REX, 32-bit
+code; each decoder must refuse the others' every form. The walker is checked against page tables built
 by hand: 4 KiB, 2 MiB and 1 GiB pages, five levels, non-canonical and
 unmapped addresses, and a fetch across a page boundary.
 
@@ -47,6 +48,7 @@ for i in range(8, 16):
     B8['r%db' % i] = i
 HIGH = {'ah': 0, 'ch': 1, 'dh': 2, 'bh': 3}
 CR = {'cr0': 0, 'cr2': 2, 'cr3': 3, 'cr4': 4, 'cr8': 8}
+DR = {'dr0': 0, 'dr1': 1, 'dr2': 2, 'dr3': 3, 'dr6': 6, 'dr7': 7}
 
 # The memory operands: base, base and displacement both ways, an index and a
 # scale, R12 and R13 (which need a SIB byte and a displacement of their
@@ -114,6 +116,13 @@ def cases():
         for r in ['rax', 'rcx', 'rsp', 'rbp', 'rdi', 'r8', 'r13', 'r15']:
             out.append(('movq %%%s, %%%s' % (r, c), 'C %d %d 1' % (CR[c], R[r])))
             out.append(('movq %%%s, %%%s' % (c, r), 'C %d %d 0' % (CR[c], R[r])))
+    # And to and from the debug registers: what an intercept of DR0-DR3
+    # stops a guest at ("D dr gpr write"); DR6 and DR7, which are not
+    # intercepted, for the decoder all the same.
+    for d in ['dr0', 'dr1', 'dr2', 'dr3', 'dr6', 'dr7']:
+        for r in ['rax', 'rcx', 'rsp', 'rbp', 'rdi', 'r8', 'r13', 'r15']:
+            out.append(('movq %%%s, %%%s' % (r, d), 'D %d %d 1' % (DR[d], R[r])))
+            out.append(('movq %%%s, %%%s' % (d, r), 'D %d %d 0' % (DR[d], R[r])))
     return out
 
 

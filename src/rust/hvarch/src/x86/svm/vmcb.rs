@@ -317,6 +317,12 @@ pub mod intercept {
         pub const READ_CR4: u32 = 1 << 4;
         pub const WRITE_CR4: u32 = 1 << 20;
     }
+    /// `Control::intercept_dr`, laid out as `intercept_cr` is: the reads
+    /// and the writes of DR0-DR3, the four breakpoint addresses.
+    pub mod dr {
+        pub const READ_DR0_3: u32 = 0xF;
+        pub const WRITE_DR0_3: u32 = 0xF << 16;
+    }
     /// `Control::intercept_misc1`.
     pub mod misc1 {
         pub const INTR: u32 = 1 << 0;
@@ -421,6 +427,10 @@ pub mod exit {
     /// 0x000 and on, its writes at 0x010 and on.
     pub const CR4_READ: u64 = 0x004;
     pub const CR4_WRITE: u64 = 0x014;
+    /// A `mov` from a debug register, at 0x020 and on by its number, and
+    /// one to it, at 0x030 and on.
+    pub const DR_READ: u64 = 0x020;
+    pub const DR_WRITE: u64 = 0x030;
     pub const EXCP_BASE: u64 = 0x040;
     pub const EXCP_LAST: u64 = 0x05F;
     pub const INTR: u64 = 0x060;
