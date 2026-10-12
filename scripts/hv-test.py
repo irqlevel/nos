@@ -148,17 +148,25 @@ GUESTS = {
     "msr": [r"SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
             r"CPUID offers no speculation control and no PMU, and says a hypervisor is there",
             r"\b5 rdmsr, 3 wrmsr, 4 refused"],
+    # Two VMs, one after the other on the CPU the guests run on: the second
+    # must read 0 where the first left its own, and each one's breakpoint,
+    # on an instruction of its own, fire -- DR0-DR3 made its own before each
+    # of its entries. An execution breakpoint: QEMU's TCG never gets past a
+    # store a data breakpoint watches in a nested guest.
+    "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
+           r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
+           r"\b14 and 14 of DR0-DR3 performed, 1 and 1 exceptions given back"],
 }
 
-# Five of the guests test a mechanism only one vendor has: AMD-V's software
+# Six of the guests test a mechanism only one vendor has: AMD-V's software
 # VMCB check (`refused`), its ASID recycling (`asid`), its shadow TPR
-# (`tpr`), the DR6 its VMCB keeps at a #DB (`debug`) and its CR4 intercept
-# (`cr4`). Under Intel VT-x the CPU refuses a bad VMCS itself; the ASID is a
-# VPID held for the guest's life, so the third VM gets one of the first two's
-# back; CR8 is the host's, so the guest is stopped at each access and
-# answered from a shadow; a #DB is not given back yet; and CR4 is not
-# intercepted yet, the CPU taking every write itself. What each says
-# differs; the rest is one.
+# (`tpr`), the DR6 its VMCB keeps at a #DB (`debug`), its CR4 intercept
+# (`cr4`) and the DR0-DR3 it keeps apart (`dr`). Under Intel VT-x the CPU
+# refuses a bad VMCS itself; the ASID is a VPID held for the guest's life, so
+# the third VM gets one of the first two's back; CR8 is the host's, so the
+# guest is stopped at each access and answered from a shadow; a #DB is not
+# given back yet; and neither CR4 nor DR0-DR3 is intercepted yet, the CPU
+# taking every write itself. What each says differs; the rest is one.
 GUESTS_VMX = {
     "refused": [r"the CPU refused the VMCS at entry for invalid guest state"],
     "asid": [r"vm C was given VPID \d+, which vm [AB] had, and read its own too"],
@@ -169,6 +177,9 @@ GUESTS_VMX = {
     # Not run under VT-x this round: what any CPU does with the writes, and
     # nothing the host keeps.
     "cr4": [r"VT-x does not stop a guest at CR4 yet"],
+    # Its breakpoint's #DB stops it, and the second VM reads what the
+    # first left in the CPU's registers.
+    "dr": [r"VT-x does not keep a guest's DR0-DR3 apart yet"],
 }
 
 

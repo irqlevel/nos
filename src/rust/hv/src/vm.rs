@@ -150,6 +150,19 @@ impl Backend {
     pub fn set_cr4(&mut self, value: u64, flush: bool) {
         match self { Backend::Svm(v) => v.set_cr4(value, flush), Backend::Vmx(_) => {} }
     }
+    /// The guest's DR0-DR3, which its reads of them get ([`Exit::Dr`]):
+    /// under AMD-V its own, kept apart from the CPU's. VT-x does not stop a
+    /// guest at a debug register yet, nor keeps its four apart: there they
+    /// are the CPU's, and nothing asks this.
+    pub fn debug_addrs(&self) -> [u64; 4] {
+        match self { Backend::Svm(v) => v.debug_addrs(), Backend::Vmx(_) => [0; 4] }
+    }
+    /// Make `addrs` the guest's DR0-DR3, for a write of one `crate::dr`
+    /// performed: under AMD-V, the CPU's from its next entry on. Only AMD-V
+    /// stops a guest at one, so there is nothing for VT-x's side to do.
+    pub fn set_debug_addrs(&mut self, addrs: [u64; 4]) {
+        match self { Backend::Svm(v) => v.set_debug_addrs(addrs), Backend::Vmx(_) => {} }
+    }
     pub fn inject_extint(&mut self, vector: u8) {
         match self { Backend::Svm(v) => v.inject_extint(vector), Backend::Vmx(v) => v.inject_extint(vector) }
     }

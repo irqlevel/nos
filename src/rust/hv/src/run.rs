@@ -63,6 +63,7 @@ use kcore::time;
 
 use crate::acpi;
 use crate::cr;
+use crate::dr;
 use crate::devices::blk::{self, Blk};
 use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
@@ -204,6 +205,9 @@ pub enum Stop {
     /// A `mov` to or from CR4 that could not be performed for it (`cr`):
     /// the instruction at `rip`, as far as it was read, and why.
     CrInsn { rip: u64, error: cr::Error, bytes: mmio::Bytes },
+    /// A `mov` to or from DR0-DR3 that could not be performed for it
+    /// (`dr`): the instruction at `rip`, as far as it was read, and why.
+    DrInsn { rip: u64, error: dr::Error, bytes: mmio::Bytes },
     /// An exception the host intercepts (#DB, #AC, #MC) fired.
     Exception { vector: u8, rip: u64 },
     /// The CPU refused the VMCB, or the extension went off under it.
@@ -302,6 +306,11 @@ pub struct Counts {
     /// not offer, or one a CPU would not take where it was.
     pub cr4: u64,
     pub cr4_gp: u64,
+    /// `mov`s to and from DR0-DR3 the guest stopped at (AMD-V,
+    /// `crate::dr`), and of those the ones not made: a #GP above CPL 0, or
+    /// a #DB with DR7's general detect on.
+    pub dr: u64,
+    pub dr_refused: u64,
     pub exits: u64,
 }
 
@@ -344,6 +353,8 @@ impl Counts {
         self.cr0 += o.cr0;
         self.cr4 += o.cr4;
         self.cr4_gp += o.cr4_gp;
+        self.dr += o.dr;
+        self.dr_refused += o.dr_refused;
         self.exits += o.exits;
     }
 }
@@ -1274,6 +1285,18 @@ impl LinuxGuest {
                         }
                         Ok(cr::Done::Read | cr::Done::Written) => None,
                         Err(error) => Some(Stop::CrInsn { rip, error, bytes }),
+                    }
+                }
+                Exit::Dr { write, dr: n } => {
+                    gc.counts.dr += 1;
+                    let mut bytes = mmio::Bytes::default();
+                    match dr::dr_access(gc.cpu.backend_mut(), &self.memory, write, n, &mut bytes) {
+                        Ok(dr::Done::Refused | dr::Done::Detected) => {
+                            gc.counts.dr_refused += 1;
+                            None
+                        }
+                        Ok(dr::Done::Read | dr::Done::Written) => None,
+                        Err(error) => Some(Stop::DrInsn { rip, error, bytes }),
                     }
                 }
                 /* Spin-waiting: stepped past, and round the loop, where a

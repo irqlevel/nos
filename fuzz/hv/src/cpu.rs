@@ -235,6 +235,7 @@ pub mod svm {
         Cr8 { write: bool, gpr: u8 },
         Cr0Write { value: u64 },
         Cr4 { write: bool },
+        Dr { write: bool, dr: u8 },
         Pause,
         Undefined,
         Other(u64),
@@ -333,6 +334,8 @@ pub mod vm {
         /// The CR4 the guest believes it has, as svm.rs keeps it: the
         /// register, `save.cr4`, has MCE besides.
         cr4: u64,
+        /// The guest's DR0-DR3, as svm.rs keeps them apart from the CPU's.
+        debug_addrs: [u64; 4],
     }
 
     impl Default for Backend {
@@ -356,6 +359,7 @@ pub mod vm {
                 taken: Vec::new(),
                 vmx: false,
                 cr4: 0,
+                debug_addrs: [0; 4],
             }
         }
 
@@ -406,6 +410,7 @@ pub mod vm {
             s.rsp = l.stack;
             s.rflags = 2;
             self.cr4 = CR4_PAE | CR4_MCE;
+            self.debug_addrs = [0; 4];
         }
 
         /// As svm.rs's: the CR4 the guest believes it has.
@@ -429,6 +434,18 @@ pub mod vm {
                        "CR4 written from {:#x} to {:#x}, and the guest's TLB not flushed", self.cr4, value);
             self.cr4 = value;
             self.save.cr4 = value | CR4_MCE;
+        }
+
+        /// As svm.rs's: the guest's DR0-DR3.
+        pub fn debug_addrs(&self) -> [u64; 4] {
+            self.debug_addrs
+        }
+
+        /// As svm.rs's: `addrs` the guest's DR0-DR3 -- under AMD-V alone,
+        /// the one backend that stops a guest at them.
+        pub fn set_debug_addrs(&mut self, addrs: [u64; 4]) {
+            invariant!(!self.vmx, "a debug register written for a guest under VT-x, which never stops one there");
+            self.debug_addrs = addrs;
         }
 
         fn step(&mut self, len: u64) {
@@ -493,6 +510,7 @@ pub mod vm {
             self.save.efer = 1 << 12;
             self.save.rflags = 2;
             self.cr4 = 0;
+            self.debug_addrs = [0; 4];
         }
         pub fn init_reset(&mut self) {
             self.event = None;

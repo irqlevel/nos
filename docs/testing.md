@@ -363,9 +363,14 @@ which 32-bit code reads as an INC or a DEC, and is refused -- in 32-bit
 code too; each cut short at every length; by hand, what no assembler gives
 and a CPU takes or refuses -- prefixes it passes over, a ModRM whose mod
 field it ignores with nothing after it, a lock and a repeat, a REX that is
-not the last byte before the opcode; and the random bytes. Each decoder
-must refuse the other's every form. A control run with REX.B left out of
-the register failed 31 of its cases.
+not the last byte before the opcode; and the random bytes. And the third,
+of a `mov` to or from a debug register (`decode_mov_dr`) -- what an
+intercept of DR0-DR3 stops a guest at -- the same way over DR0-DR3, DR6 and
+DR7, with REX.R's DR8 and up by hand, which a CPU raises #UD for before any
+intercept and which `crate::dr` then finds is not the exit's register. Each
+decoder must refuse the others' every form. A control run with REX.B left
+out of the register failed 31 of its cases; one with the debug registers'
+two opcodes swapped, 164.
 
 ### `hv-fuzz.py` -- everything a guest reaches, fuzzed
 
@@ -434,8 +439,8 @@ second of the first harness, whose CPUs slept for real, and ten processes
 at once some forty times theirs. Where the loop would enter the
 guest, the CPU asks a script what the guest does next: a port, an MSR,
 CPUID, a fault on a device's page with the instruction that made it put
-where the guest's paging finds it, a `mov` to or from CR4 put there the
-same way -- under AMD-V, which stops a guest at each -- a halt, a window
+where the guest's paging finds it, a `mov` to or from CR4 or DR0-DR3 put
+there the same way -- under AMD-V, which stops a guest at each -- a halt, a window
 opened, an event taken, another CPU's turn -- and between them what a
 driver does over several
 exits: the 8259 initialised, the APIC turned on or moved between its modes,
@@ -475,7 +480,19 @@ and the guest's TLB not flushed. (Control runs with the CPUID's mask left
 out, PGE's flush left out, and reads answered from the register rather than
 the guest's CR4 failed at the first, the first and the fourth input; the
 first run of the checks found the script's own 32-bit belief outliving the
-INIT that put its CPU back in long mode.) Or a spin -- the run loop reading the clock a
+INIT that put its CPU back in long mode.) A `mov` of DR0-DR3 the same: a
+read whose register does not hold what the guest's writes made the
+register, a write that is not the guest's from then on with RIP past it,
+one made at CPL 3 -- which a CPU faults before the exit -- that is not a
+#GP, or one under DR7's general detect that is not a #DB with DR6.BD set
+and GD clear, the instruction not run either way; and the guest's four, at
+every one of its entries after, other than its writes made them. (Seven
+mutants of `hv/src/dr.rs` -- a write into another register, a read of 0,
+no CPL check, no general detect, GD left set, a write in 32-bit code
+keeping its high half, the instruction not stepped past -- each failed
+within 145 inputs; the first run of the checks found the script's model
+outliving the `long_mode` its return from 32-bit code calls, which zeroes
+them as a boot loader leaves a CPU.) Or a spin -- the run loop reading the clock a
 million times with neither an entry nor a wait between, which on a host is
 a CPU spun for as long as the guest stays so -- or a hang, ten seconds with
 no input done. Each is reported with the seed and the iteration that make
@@ -1176,7 +1193,24 @@ CPUID told it of no speculation control and no PMU, of no basic leaf past
 0x16, and of a hypervisor. Every MSR but the three segment bases comes to
 the same policy on either backend, so it says the same under VT-x. A
 control build whose policy did not name MCG_STATUS failed it, a fifth #GP
-on both CPUs it ran on. The unload
+on both CPUs it ran on. And for `dr`, two VMs of one CPU each, one after
+the other on the CPU the guests run on: that the second read 0 in DR0-DR3
+as it started, where the first had left its own -- and where the CPU's
+four were the guests', it read those -- that each read back the pattern it wrote,
+and that each one's breakpoint, on a `ret` of its own, fired once, with
+DR6.B0 and at the `ret`, which only its own DR0 made the CPU's before its
+entry can do; then that every one of its fourteen `mov`s of them was the
+host's to perform. An execution breakpoint, not a data one: QEMU 10.2's TCG
+never gets past a store a data breakpoint watches in a nested guest -- it
+retries the store for good and takes no interrupt, so `hv run` never comes
+back -- and a control build that left the four the CPU's hung the same.
+The world switch before this failed it on both CPUs, the second VM
+reading the first's breakpoint address and pattern. Without the load
+before the entry, and with a load only when
+the guest's DR7 enabled a breakpoint as it was entered -- which a guest
+then enables without an exit -- the first VM's breakpoint never fired, on
+both CPUs. Under VT-x, which does not keep a guest's four apart yet, it
+says what the second read, and holds it to nothing. The unload
 that follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.
 

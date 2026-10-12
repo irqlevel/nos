@@ -540,6 +540,13 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             }
             Ok(())
         }
+        Stop::DrInsn { rip, error, bytes } => {
+            write!(out, "a mov to or from DR0-DR3 at rip {:#x} not performed -- {}; its bytes", rip, error.describe())?;
+            for b in &bytes.b[..usize::from(bytes.len)] {
+                write!(out, " {:02x}", b)?;
+            }
+            Ok(())
+        }
         Stop::Exception { vector, rip } => write!(out, "exception {} at {:#x}", vector, rip),
         Stop::Refused(r) => write!(out, "not entered: {:?}", r),
         Stop::Invalid => write!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
@@ -575,6 +582,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     if total.cr4 != 0 {
         let _ = writeln!(out, "  cr4        {} reads and writes performed (AMD-V), {} writes refused with #GP",
             total.cr4, total.cr4_gp);
+    }
+    if total.dr != 0 {
+        let _ = writeln!(out, "  dr0-3      {} reads and writes of its own (AMD-V), {} not made: a #GP or a #DB in their place",
+            total.dr, total.dr_refused);
     }
     let absent = guest.absent_pages();
     if !absent.is_empty() {
