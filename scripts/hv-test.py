@@ -101,16 +101,17 @@ SCRIPT = [
     "hv",                   # 11
     "hv run all 0",         # 12
     "hv run all %d" % (CPUS - 1),  # 13
-    "insmod /hv.ko",        # 14
-    "hv on 99",             # 15
-    "hv nonsense",          # 16
-    "hv run nonsense",      # 17
-    "rmmod hv",             # 18
-    "insmod /hv.ko",        # 19
-    "hv",                   # 20
-    "rmmod hv",             # 21
-    "lsmod",                # 22
-    "dmesg 400 hv:",        # 23
+    "hv",                   # 14
+    "insmod /hv.ko",        # 15
+    "hv on 99",             # 16
+    "hv nonsense",          # 17
+    "hv run nonsense",      # 18
+    "rmmod hv",             # 19
+    "insmod /hv.ko",        # 20
+    "hv",                   # 21
+    "rmmod hv",             # 22
+    "lsmod",                # 23
+    "dmesg 400 hv:",        # 24
 ]
 
 # What `hv run all` has to have said about each guest, beyond its verdict.
@@ -369,24 +370,36 @@ def x86_checks(ran):
     check_all_guests(out[13], CPUS - 1, backend)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
-    pt.check("a second insmod is refused", "loaded at" not in out[14], out[14])
-    pt.check("a CPU that does not exist is refused", "is not a CPU" in out[15], out[15])
-    pt.check("and a word that is not a subcommand", "no such thing" in out[16], out[16])
-    pt.check("and a guest that does not exist", "run which guest?" in out[17], out[17])
+    # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after
+    # another guest's there: an IBPB between each two where the CPU has
+    # one (`hv::spec`), and a count of them either way. AMD-V's alone.
+    if backend == "svm":
+        m = re.search(r"guests switched on a CPU (\d+) times(, an IBPB between each two \((\d+) issued\))?", out[14])
+        switches = int(m.group(1)) if m else 0
+        pt.check("the guests switched on a CPU at least twice a guest, each switch counted",
+                 switches >= 2 * len(GUESTS), out[14])
+        pt.check("and each with an IBPB where the CPU has one",
+                 m is not None and (m.group(3) is None and "has no IBPB" in out[14]
+                                    or m.group(3) is not None and int(m.group(3)) == switches), out[14])
 
-    pt.check("rmmod with it on for every CPU unloads", "hv unloaded" in out[18], out[18])
+    pt.check("a second insmod is refused", "loaded at" not in out[15], out[15])
+    pt.check("a CPU that does not exist is refused", "is not a CPU" in out[16], out[16])
+    pt.check("and a word that is not a subcommand", "no such thing" in out[17], out[17])
+    pt.check("and a guest that does not exist", "run which guest?" in out[18], out[18])
+
+    pt.check("rmmod with it on for every CPU unloads", "hv unloaded" in out[19], out[19])
 
     # The one that the rest of them are for: this load asks every CPU what it
     # has, and it has to be nothing -- after every guest above has run.
-    pt.check("loading it again finds it off for every CPU", "hv loaded at" in out[19], out[19])
+    pt.check("loading it again finds it off for every CPU", "hv loaded at" in out[20], out[20])
     pt.check("and nothing was left on by the unload before it",
-             "on for cpu none of %s" % ALL_CPUS in out[20], out[20])
-    pt.check("it unloads again", "hv unloaded" in out[21], out[21])
-    pt.check("and leaves no module behind", "no modules loaded" in out[22], out[22])
+             "on for cpu none of %s" % ALL_CPUS in out[21], out[21])
+    pt.check("it unloads again", "hv unloaded" in out[22], out[22])
+    pt.check("and leaves no module behind", "no modules loaded" in out[23], out[23])
 
     # What the module traced: not on the serial console, because the shell
     # suppresses trace output there once it starts, so the script asks dmesg.
-    logged = out[23]
+    logged = out[24]
     pt.check("the kernel log says the extension went off for every CPU on the unload",
              "extension off for cpu mask %s" % ALL_MASK in logged, logged)
     pt.check("and nothing warned", "WARNING" not in logged, logged)
