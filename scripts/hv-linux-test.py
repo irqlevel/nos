@@ -82,6 +82,16 @@ SHELL_MARKERS = [
     r"BusyBox",
 ]
 
+# What no boot may say, with ACPI or without: that its kernel took an MSR
+# for there and was refused it at an access not ready for a refusal -- the
+# policy answers what the guest's CPUID says it has and refuses the rest
+# (`hv/src/policy.rs`) -- and the panic a refused read of a machine-check
+# register is.
+NEVER = [
+    r"unchecked MSR access error",
+    r"MCA architectural violation",
+]
+
 # With --acpi: what the boot says of the tables it was given, in the order
 # it says it -- the RSDP where the loader put it, the FADT's PM timer, the
 # namespace up, S5 found, PIC mode, the host bridge the DSDT describes and
@@ -123,7 +133,8 @@ CLAIMED_BYTES = 1 << 20
 # nolapic. (The loader adds noapic itself: the machine has no IO-APIC.)
 # nos's own CPUs: two cores of two threads each, so that where a guest's CPUs
 # are placed has a topology to go wrong on -- APIC IDs 0 and 1 are one core,
-# 2 and 3 the other, and a guest of two CPUs belongs on both.
+# 2 and 3 the other. A guest's cores are its own (`hv cores`): one of two
+# CPUs fills a core's two threads, and leaves the other core to the next.
 NOS_SMP = "4,sockets=1,cores=2,threads=2"
 DEFAULT_CMDLINE_SMP = "earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check"
 
@@ -172,6 +183,10 @@ def vm_commands(args):
     reset_by = r"0x06 to port 0xcf9" if args.acpi else r"0xfe to port 0x64"
     start0 = "hv start /bzImage mem=%d%s initrd=/initrd cmdline=%s" % (args.mem, c, args.cmdline)
     start1 = "hv start /bzImage mem=64%s cmdline=%s" % (c, args.cmdline)
+    # A third guest while the two hold both cores: refused, its cores being
+    # its own -- before it takes a number, so the numbers after are as they
+    # were.
+    start_full = "hv start /bzImage mem=80%s cmdline=%s" % (c, args.cmdline)
     # Typed while vm 0 still boots: held until its shell asks for input,
     # and answered at the prompt printed after the line went in.
     exec_early = "hv exec 0 secs=%d id" % args.vm_secs
@@ -213,8 +228,27 @@ def vm_commands(args):
     claim_rw = "hv start /bzImage mem=64%s disk=/%s cmdline=%s panic=0" % (c, CLAIMED_IMAGE, args.cmdline)
     claim_ro = "hv start /bzImage mem=64%s disk=/%s:ro cmdline=%s panic=0" % (c, CLAIMED_IMAGE, args.cmdline)
     claim_stop = ["hv stop %d secs=0" % (claim_vm + k) for k in (0, 3, 4)]
-    claim_lines = [claim_rw, claim_rw, claim_ro, claim_stop[0],
-                   claim_ro, claim_ro, claim_rw, claim_stop[1], claim_stop[2]]
+    # Three guests at once beside vm 0, on a machine of two cores: their
+    # cores shared for it (`hv cores shared`), which is not what this tests,
+    # and their own again after.
+    claim_lines = ["hv cores shared", claim_rw, claim_rw, claim_ro, claim_stop[0],
+                   claim_ro, claim_ro, claim_rw, claim_stop[1], claim_stop[2], "hv cores own"]
+    # A guest whose console goes to nos's log, printing as fast as it can:
+    # the log takes a boot's worth and then a rate (`modules/hv/src/guest.rs`,
+    # LogLine), and says how many it left out; the guest's own console keeps
+    # all of it. dmesg's count of the lines it has pushed out is read just
+    # before the flood and just after (`flood_checks`).
+    fv = flood_vm(args)
+    flood_start = "hv start /bzImage mem=64%s initrd=/initrd log cmdline=%s" % (c, args.cmdline)
+    flood_ready = "hv exec %d secs=%d echo flood-ready" % (fv, args.vm_secs)
+    # The marker the guest prints is not the one typed, which the shell's
+    # echo would show at once: it waits for the end of the flood.
+    flood_send = r"hv send %d seq 1 %d; echo flood-$((6*7))\n" % (fv, FLOOD_LINES)
+    flood_wait = "hv wait %d secs=%d flood-42" % (fv, args.vm_secs)
+    flood_console = "hv console %d bytes=200" % fv
+    flood_stop = "hv stop %d secs=0" % fv
+    flood_lines = [flood_start, flood_ready, FLOOD_BEFORE, flood_send, flood_wait, FLOOD_AFTER,
+                   flood_console, flood_stop]
     # Where a guest's CPUs run, as hv start says: its one host CPU, or a list
     # of as many as it has.
     on = r"cpu \d+"
@@ -239,10 +273,10 @@ def vm_commands(args):
              r"vm 0  running  cpus \d+(,\d+){%d}  " % (args.cpus - 1), True),
         ]
         if args.cpus == 2:
-            # Two cores to go round, and a thread of each: never both threads
-            # of one core, whose execution units they would share.
-            smp_checks.append(("hv list", 0, "its two CPUs are on two cores, not one core's two threads",
-                               r"vm 0  running  cpus ([01],[23]|[23],[01])  ", True))
+            # Its cores its own, its CPUs filling their threads: one core's
+            # two, a vCPU a thread, and the other core left to vm 1.
+            smp_checks.append(("hv list", 0, "its two CPUs are one core's two threads, a core of its own",
+                               r"vm 0  running  cpus (2,3|3,2|0,1|1,0)  ", True))
         if args.ioapic:
             # The PC's own lines through the IO-APIC: the timer's on pin 2,
             # which the boot counts its ticks by before the local APICs'
@@ -269,7 +303,13 @@ def vm_commands(args):
         handler = "/etc/acpi/PWRF/00000080"
         irq9 = "hv exec 4 grep -e acpi -e virtio /proc/interrupts"
         clocks = "hv exec 4 cat /sys/devices/system/clocksource/clocksource0/available_clocksource"
+        # acpid reads the button from its input device, whose node only a
+        # devtmpfs makes -- which the initramfs's /init does not mount, as
+        # the disk phase knows too: without it, /dev/input is not there and
+        # the button goes unanswered.
+        inputs = "hv exec 4 ls /dev/input"
         acpi_lines = [start4, "hv exec 4 secs=%d mkdir -p /etc/acpi/PWRF" % args.vm_secs,
+                      "hv exec 4 mount -t devtmpfs devtmpfs /dev", inputs,
                       "hv exec 4 echo '#!/bin/sh' > %s" % handler,
                       "hv exec 4 echo 'poweroff -f' >> %s" % handler,
                       "hv exec 4 chmod +x %s" % handler,
@@ -281,6 +321,7 @@ def vm_commands(args):
         acpi_lines += [start5, "hv exec 5 secs=%d id" % args.vm_secs, "hv stop 5 secs=5"]
         acpi_checks = [
             (start4, 0, "vm 4 starts, to be shut down by its power button", r"hv: vm 4 started on %s " % on, True),
+            (inputs, 0, "its power button is an input device acpid can read", r"(?m)^event\d+\s*$", True),
             (irq9, 0, "its SCI comes through the IO-APIC's pin 9, a level" if args.ioapic
              else "its SCI comes through the 8259, as IRQ 9",
              r"(?m)^\s*9:(\s+\d+)+\s+%s\s+acpi" % (r"IO-APIC\s+9-fasteoi" if args.ioapic else "XT-PIC"), True),
@@ -307,13 +348,13 @@ def vm_commands(args):
     stop_all = "hv stop all secs=3"
     all_note = (r"its power button went unanswered for 3 s" if args.acpi
                 else r"nothing in it listens to its power button")
-    lines = ["hv help", start0, start1, "hv list", stop1, exec_early, exec_prompt] + smp_lines + [
+    lines = ["hv help", start0, start1, "hv list", start_full, "hv cores", stop1, exec_early, exec_prompt] + smp_lines + [
              send, wait, "hv console 0 bytes=400", "hv list",
              start2, wait_reboot, wait_stop, "hv list",
              "hv restart 2", wait_stop2, "hv list", "hv stop 2",
              start3, wait_loop, "hv list", "hv stop 3"] + acpi_lines + [
              "hv restart 0", exec_again, "hv list",
-             start_lost, restart_lost, exec_after_lost, stop_lost] + claim_lines + [
+             start_lost, restart_lost, exec_after_lost, stop_lost] + claim_lines + flood_lines + [
              "hv off", "rmmod hv", "insmod /hv.ko", "hv",
              "hv on", start_a, start_b, "hv exec 0 secs=%d id" % args.vm_secs, "hv exec 1 secs=%d id" % args.vm_secs,
              stop_all, "rmmod hv", RC_LOG]
@@ -324,6 +365,18 @@ def vm_commands(args):
         (start1, 0, "vm 1 starts beside it", r"hv: vm 1 started on %s " % on, True),
         ("hv list", 0, "hv list shows vm 0 running", r"vm 0  running", True),
         ("hv list", 0, "hv list shows vm 1 running", r"vm 1  running", True),
+        ("hv list", 0, "each on cores of its own: one on CPUs 2 and 3's, the other on 0 and 1's",
+         r"(?s)vm 0  running  cpus? [23](,[23])?  .*vm 1  running  cpus? [01](,[01])?  "
+         r"|vm 0  running  cpus? [01](,[01])?  .*vm 1  running  cpus? [23](,[23])?  ", True),
+        (start_full, 0, "a third, both cores held, is refused for want of a core of its own",
+         r"hv: %d cpus asked for, and the cores no other guest has a CPU on hold 0 -- a guest's cores are its own"
+         % args.cpus, True),
+        ("hv cores", 0, "hv cores says a guest's cores are its own, and which guest holds which CPUs",
+         r"cores own -- a guest is given whole cores[\s\S]*vm 0: cpu[\s\S]*vm 1: cpu", True),
+        ("hv cores shared", 0, "hv cores shared lets guests share a core's threads",
+         r"cores shared -- guests may be given threads of one core", True),
+        ("hv cores own", 0, "and hv cores own gives each its own again", r"cores own -- a guest is given whole cores",
+         True),
         (stop1, 0, "vm 1 stops on request, mid-boot", stopped1, True),
         (exec_early, 0, "a line typed during boot is answered at the prompt after it",
          r"# id\nuid=0 gid=0\n", True),
@@ -376,6 +429,11 @@ def vm_commands(args):
          % (claim_vm + 5, CLAIMED_IMAGE, claim_vm + 3, claim_vm + 4), True),
         (claim_stop[1], 0, "the readers stopped", r"hv: vm %d stopped" % (claim_vm + 3), True),
         (claim_stop[2], 0, "both", r"hv: vm %d stopped" % (claim_vm + 4), True),
+        (flood_start, 0, "a guest whose console goes to nos's log", r"hv: vm %d started" % fv, True),
+        (flood_ready, 0, "reaches its shell", r"flood-ready", True),
+        (flood_wait, 0, "and prints %d lines as fast as it can" % FLOOD_LINES, r"flood-42", True),
+        (flood_console, 0, "its own console keeps all of them", r"(?m)^%d\s*$" % FLOOD_LINES, True),
+        (flood_stop, 0, "and it stops", r"hv: vm %d stopped" % fv, True),
         ("hv off", 0, "hv off will not pull the extension from under vm 0",
          r"hv: vm 0 is running on cpu \d+ -- hv stop it first", True),
         ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),
@@ -424,6 +482,83 @@ def rootfs(tmp, bzimage, initrd, rc):
     return image
 
 
+# How many lines the flooding guest prints: more than nos's log takes in a
+# boot's worth and the time the flood takes under TCG, by far.
+FLOOD_LINES = 20000
+# dmesg's count of the lines it has pushed out, read just before the flood
+# and just after: the newest line alone, through a filter it does not match.
+FLOOD_BEFORE = "dmesg 1 flood-before"
+FLOOD_AFTER = "dmesg 1 flood-after"
+# dmesg's slots (`Dmesg::MaxMsgs`, src/cpp/kernel/dmesg.h): how many more
+# lines it can have taken than its count of lines pushed out grew by.
+DMESG_SLOTS = 2048
+
+
+def flood_vm(args):
+    """The flooding guest's number: after the lost-input guest and the six
+    starts of the claim checks, each of which takes a number."""
+    return (6 if args.acpi else 4) + 1 + 6
+
+
+def lost_lines(out):
+    """dmesg's count of the lines it has pushed out, as a dmesg prints it:
+    nothing printed is none yet."""
+    m = re.search(r"dmesg: (\d+) earlier lines lost", out)
+    return int(m.group(1)) if m else 0
+
+
+def flood_checks(args, secs):
+    """What nos's log took of the flooding guest's console: fewer than half
+    its lines -- the growth of dmesg's count of the lines it pushed out over
+    the flood, and its slots on top -- and of the lines left out, a notice
+    once a second at most that says exactly how many: checked against the
+    gaps in the numbers seq printed since the notice before, over what of
+    the flood the log still holds."""
+    fv = flood_vm(args)
+    before, after = output_of(secs, FLOOD_BEFORE, 0), output_of(secs, FLOOD_AFTER, 0)
+    if not pt.check("dmesg counted its lines before the flood and after", before is not None and after is not None,
+                    "no output for %r or %r" % (FLOOD_BEFORE, FLOOD_AFTER)):
+        return
+    took = lost_lines(after) - lost_lines(before) + DMESG_SLOTS
+    pt.check("nos's log took fewer than half of the flood's %d lines" % FLOOD_LINES,
+             took < FLOOD_LINES // 2, "%d lines at most" % took)
+
+    # The log's lines from the guest, oldest first, each with its time.
+    log = output_of(secs, RC_LOG, 0) or ""
+    lines = re.findall(r"(?m)^\d+:(\d+\.\d+):.*?hvvm%d\| (.*?)\s*$" % fv, log)
+    checked, wrong, told_at, too_soon = 0, [], None, []
+    left = last = said = said_at = None
+    for (at, text) in lines:
+        notice = re.fullmatch(r"\.\.\. (\d+) lines not logged", text)
+        if notice:
+            said, said_at = int(notice.group(1)), float(at)
+        elif not text.isdigit():
+            # The shell's lines, before the flood and after: a notice is
+            # held to the gaps between two of seq's lines only -- and the
+            # one the guest's stop gives, whatever the time, to neither.
+            left = last = said = None
+        else:
+            n = int(text)
+            if last is not None and left is not None:
+                left += n - last - 1
+            if said is not None:
+                # The line the notice came before: the notice counts every
+                # line left out since the one the notice before came with.
+                if left is not None:
+                    checked += 1
+                    if left != said:
+                        wrong.append((said, left, n))
+                if told_at is not None and said_at - told_at < 1.0:
+                    too_soon.append(said_at)
+                told_at = said_at
+                left, said = 0, None
+            last = n
+    pt.check("and said how many it left out, to the line",
+             checked >= 3 and not wrong,
+             "%d notices held to seq's numbers; said, left out, before: %s" % (checked, wrong[:8]))
+    pt.check("once a second at most", checked >= 3 and not too_soon, "notices less than a second apart: %s" % too_soon[:8])
+
+
 def check_boot(args, txt):
     """The one-shot `hv boot`: its report block, and the console in it."""
     if not pt.check("the guest ran and its console came back",
@@ -442,6 +577,15 @@ def check_boot(args, txt):
     for m in args.expect:
         pt.check("the console shows: %s" % m, re.search(re.escape(m), block) is not None,
                  block[-1500:])
+    for m in NEVER:
+        bad = re.search(r"(?m)^.*%s.*$" % m, block)
+        pt.check("the console says nothing like: %s" % m, bad is None, bad.group(0) if bad else "")
+    # What its kernel asked of MSRs nobody names, and was refused -- probes
+    # it was ready for, else the check above fails: the report lists the
+    # first few. On a machine of another vendor or family, other probes.
+    refused = re.findall(r"(?m)^\s+#GP\s+((?:rd|wr)msr 0x[0-9a-f]+)", txt)
+    if refused:
+        print("note: the guest was refused %s" % ", ".join(refused))
     if args.acpi:
         for m in ACPI_BOOT:
             if args.ioapic:
@@ -592,9 +736,10 @@ def accel_args(args):
     `-cpu max` (AMD-V), which is what a guest is brought up under where there
     is no KVM. So the Linux path is exercised on whichever backend the host
     has, the two covered between an AMD host, an Intel host and TCG."""
-    kvm = os.path.exists("/dev/kvm") and not getattr(args, "tcg", False) \
+    qemu_cpu = getattr(args, "qemu_cpu", None)
+    kvm = os.path.exists("/dev/kvm") and not getattr(args, "tcg", False) and not qemu_cpu \
         and (hvt.host_has_svm() or hvt.host_has_vmx())
-    return ["-cpu", "host", "-enable-kvm"] if kvm else ["-cpu", "max"]
+    return ["-cpu", "host", "-enable-kvm"] if kvm else ["-cpu", qemu_cpu or "max"]
 
 
 def boot_rc(args, tmp, rc, extra=None, qemu=None):
@@ -672,6 +817,7 @@ def disk(args):
           x("ls -l /mnt/big"),
           x("umount /mnt", 120),
           x("grep virtio /proc/interrupts"),
+          "hv list",
           "hv stop 0", RC_LAST]
     p, log, image = boot_rc(args, tmp, rc, {"disk.img": img})
     try:
@@ -689,6 +835,13 @@ def disk(args):
         pt.check("remounted, what the guest wrote reads back", "nos-wrote-this" in out(14), out(14))
         pt.check("so does the size of the big one", "4194304" in out(15), out(15))
         pt.check(*interrupt_check(args, out(17), "req"))
+        # Its disk's task on its own core -- the other thread of its vCPU's
+        # -- or, its CPUs filling that core, on the core no guest has.
+        own_disk = (r"vm 0  running  cpu (3  disks on cpu 2|2  disks on cpu 3|1  disks on cpu 0|0  disks on cpu 1)  "
+                    if args.cpus == 1 else
+                    r"vm 0  running  cpus ([23],[23]  disks on cpu [01]|[01],[01]  disks on cpu [23])  ")
+        pt.check("its disk is served on a thread of a core of its own", re.search(own_disk, out(18)) is not None,
+                 out(18)[-300:])
         stop = output_of(secs, "hv stop 0", 0) or ""
         m = re.search(r"vda +(\d+) MiB: (\d+) reads .*?, (\d+) writes .*?, (\d+) flushes, (\d+) errors", stop)
         pt.check("the report counts the disk's work, and no errors", m is not None and m.group(5) == "0"
@@ -805,7 +958,21 @@ def network(args):
                "hv forward add 8081 0 80",
                "hv stop 0",
                "hv forward",
-               "nat"]
+               "nat",
+               # nos's own services are not the guests': sshd listens on eth0,
+               # and a guest's connection to it -- at nos's address on hv0, or
+               # at eth0's through hv0 -- is refused. It once got the banner,
+               # and four that never logged in held every slot for logging in.
+               x(1, "echo | nc -w 5 10.0.100.1 22; echo nc-hv0-done"),
+               x(1, "echo | nc -w 5 10.0.2.15 22; echo nc-eth0-done")]
+    # Where NAT keeps the guests from, before the test machine is let
+    # through: it is on nos's uplink's own subnet, 10.0.2.0/24 -- and
+    # 169.254.169.254 is where a cloud's metadata server answers. A guest's
+    # connect there is refused at once ("No route to host"), not left to
+    # time out.
+    kept = [x(0, "wget -q -T 5 -O - http://10.0.2.2:%d/nat.txt; echo nat-kept-done" % web),
+            x(0, "wget -q -T 5 -O - http://169.254.169.254/; echo nat-metadata-done"),
+            "nat allow 10.0.2.2/32"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -818,11 +985,13 @@ def network(args):
           x(1, "echo nos-http-hello > /www/index.html"),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
-          "hv forward"] + way_out + [RC_LAST]
+          "hv forward", "insmod /sshd.ko", "sshd start"] + kept + way_out + [RC_LAST]
     port = free_port()
+    ssh_port = free_port()
     qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
-            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080" % port]
-    p, log, image = boot_rc(args, tmp, rc, qemu=qemu)
+            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080,hostfwd=tcp:127.0.0.1:%d-:22" % (port, ssh_port)]
+    sshd = os.path.join(ROOT, "out", "x86_64", "modules", "sshd.ko")
+    p, log, image = boot_rc(args, tmp, rc, extra={"sshd.ko": sshd}, qemu=qemu)
     try:
         if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
             return
@@ -853,6 +1022,17 @@ def network(args):
         pt.check("a page from the guest's httpd, fetched from outside through hv forward",
                  b"nos-http-hello" in body, body[-300:])
 
+        # Kept from the test machine and the metadata server, until let
+        # through.
+        kept_out = [output_of(secs, line, 0) or "" for line in kept]
+        pt.check("NAT keeps a guest from the test machine, on nos's uplink's own subnet, at once",
+                 "nat-kept-done" in kept_out[0] and token not in kept_out[0]
+                 and "No route to host" in kept_out[0], kept_out[0][-400:])
+        pt.check("and from 169.254.169.254, a cloud's metadata server",
+                 "nat-metadata-done" in kept_out[1] and "No route to host" in kept_out[1], kept_out[1][-400:])
+        pt.check("nat allow lets the test machine through", "nat: 10.0.2.2/32 let through" in kept_out[2],
+                 kept_out[2])
+
         # The way-out lines, each by its own occurrence: "hv list" is run
         # before them, and among them twice.
         first = len(rc) - 1 - len(way_out)
@@ -876,6 +1056,10 @@ def network(args):
         pt.check("nat: on, from hv0 out through eth0, and it carried the guests' packets both ways",
                  "nat: on, hv0 (10.0.100.1) out through eth0 (10.0.2.15)" in nat and counts is not None
                  and int(counts.group(1)) > 20 and int(counts.group(2)) > 700, nat[-800:])
+        pt.check("nat says where the guests are kept from, what is let through, and what it denied",
+                 "kept from 169.254.0.0/16" in nat and "and eth0's 10.0.2.0/24" in nat
+                 and "let through: 10.0.2.2/32" in nat and re.search(r"denied [1-9]\d*", nat) is not None,
+                 nat[-800:])
         pt.check("hv list says the guests go out through NAT, and counts the DHCP answers",
                  "the guests go out through NAT, from 10.0.2.15" in way(9)
                  and re.search(r"[1-9]\d* DHCP answers", way(9)) is not None, way(9)[-800:])
@@ -886,6 +1070,13 @@ def network(args):
         kicks = re.search(r"kicks (\d+)", vm0)
         pt.check("kicked out of its guest to take the frames, its port dropped none",
                  kicks is not None and int(kicks.group(1)) > 0 and "frames dropped for it" not in vm0, vm0)
+        # What the switch shares out -- hv0's backlog, a port's rate to
+        # every port -- is for a guest that floods, not for this: DHCP, ARP,
+        # pings and two megabytes through NAT, one into a busy guest.
+        guests = re.findall(r"(?m)^vm [01] .*$", way(13))
+        pt.check("neither guest's traffic went past its share of hv0's backlog or its rate to every port",
+                 len(guests) == 2 and not any("past its share" in g or "past their rate" in g for g in guests),
+                 "\n".join(guests))
         pt.check(*interrupt_check(args, way(14), "input"))
         claim = way(15)
         pt.check("a guest that claims another's address, ARP and IPv4, gets nothing back: nos heard none of it",
@@ -904,6 +1095,22 @@ def network(args):
                  "port 8081" not in way(19) and "port 8080 -> vm 1" in way(19), way(19))
         pt.check("NAT keeps no mapping of the stopped VM's address",
                  "nat: on" in way(20) and "10.0.100.2:" not in way(20), way(20)[-800:])
+        # sshd answers from outside, by eth0 -- so a guest's refusal below is
+        # the listener's doing, not a server that never started.
+        banner = b""
+        for attempt in range(10):
+            try:
+                with socket.create_connection(("127.0.0.1", ssh_port), timeout=30) as s:
+                    banner = s.recv(64)
+                break
+            except Exception as e:
+                banner = repr(e).encode()
+                time.sleep(3)
+        pt.check("nos's sshd answers from outside, by eth0", banner.startswith(b"SSH-2.0"), banner)
+        for i, where in ((21, "at nos's address on hv0"), (22, "at eth0's address, through hv0")):
+            pt.check("a guest's connection to nos's sshd %s is refused" % where,
+                     "nc-" in way(i) and "SSH-2.0" not in way(i)
+                     and re.search(r"(?i)connection refused", way(i)) is not None, way(i)[-400:])
     finally:
         server.shutdown()
         pt.kill(p)
@@ -937,7 +1144,7 @@ def run(args):
 
     accel = accel_args(args)
     print("accelerator: %s" % ("KVM, the host's %s (nested)" % ("Intel VT-x" if hvt.host_has_vmx() else "AMD-V")
-                               if "-enable-kvm" in accel else "TCG, -cpu max (AMD-V)"))
+                               if "-enable-kvm" in accel else "TCG, -cpu %s (AMD-V)" % accel[1]))
     argv = ["qemu-system-x86_64", "-display", "none", "-m", "2G", "-smp", NOS_SMP] + accel + [
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
@@ -975,6 +1182,8 @@ def run(args):
                 continue
             found = re.search(pattern, out) is not None
             pt.check(what, found == must, out[-1500:])
+        if vm_checks:
+            flood_checks(args, secs)
     finally:
         pt.kill(p)
         if args.verbose and os.path.exists(log):
@@ -1033,6 +1242,10 @@ def main():
                          "which needs the test machine to resolve names")
     ap.add_argument("--root-mib", type=int, default=128, help="nos's root filesystem image's size")
     ap.add_argument("--tcg", action="store_true", help="do not use KVM even if the host has AMD-V")
+    ap.add_argument("--qemu-cpu", metavar="MODEL",
+                    help="the CPU nos runs on, under TCG, in place of max: a named one -- EPYC-Rome, a Zen 2; "
+                         "Skylake-Client,+svm, an Intel CPU with AMD-V -- whose family and model the guest's "
+                         "kernel then takes the paths of, its MSRs above all")
     ap.add_argument("--keep", action="store_true", help="keep the serial log (it is kept on a failure anyway)")
     ap.add_argument("--verbose", action="store_true", help="print the whole serial log at the end")
     args = ap.parse_args()

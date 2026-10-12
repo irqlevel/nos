@@ -44,9 +44,11 @@ unsafe impl Send for TcpListener {}
 unsafe impl Sync for TcpListener {}
 
 impl TcpListener {
-    /// Listens on `port` of `nic`: on its address, or on any if it has none
-    /// yet. Busy when someone listens on the port already, or every
-    /// connection slot the kernel has is taken.
+    /// Listens on `port` of `nic`: a connection that comes in by `nic`, for
+    /// any of the machine's addresses -- and none that comes in by another
+    /// device, so a guest behind the hypervisor's switch does not reach a
+    /// server on eth0. Busy when someone listens on the port already, or
+    /// every connection slot the kernel has is taken.
     pub fn bind(nic: &Nic, port: u16) -> Result<Self> {
         if port == 0 {
             return Err(Error::InvalidValue);

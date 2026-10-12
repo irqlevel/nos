@@ -2,6 +2,7 @@
 
 pub mod cpu;
 pub mod fp;
+pub mod spec;
 pub mod svm;
 pub mod vmx;
 

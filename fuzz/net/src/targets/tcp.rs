@@ -37,6 +37,14 @@ const LISTEN_PORTS: [u16; 3] = [7001, 7002, 22];
 const PEER_PORT_BASE: u16 = 8000;
 const PEER_SRC_BASE: u16 = 30000;
 
+/// A second device, eth1, standing for the hypervisor's switch (`hv0`):
+/// the machine's address on it, and a guest behind it and its ports.
+const ETH1_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x64, 0x01];
+const ETH1_IP: u32 = 0x0A00_6401;
+const GUEST_IP: u32 = 0x0A00_6402;
+const GUEST_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x64, 0x02];
+const GUEST_PORT_BASE: u16 = 40000;
+
 /// What the peer and the LAN do with what the machine sends.
 struct Wire {
     lan: Lan,
@@ -108,6 +116,8 @@ struct State {
     /// Connections the machine accepted, by the peer's port: each once.
     accepted: BTreeMap<u16, usize>,
     lossy: bool,
+    /// eth1, when the input registered it.
+    guest: Option<net::Nic>,
 }
 
 fn conn_word(c: &'static Conn) -> usize {
@@ -362,6 +372,42 @@ impl State {
     /// A segment from outside the connection: the peer's addresses and
     /// ports, and whatever else the attacker picks -- from outside every
     /// window, which must change nothing, or anywhere, which may.
+    /// A guest on eth1 -- behind the hypervisor's switch -- sends a SYN to a
+    /// port the machine listens on, at eth1's address or at eth0's: a
+    /// listener takes connections that arrive on its own device alone, so
+    /// the machine answers with a reset, and its SYN-ACK goes out on
+    /// neither wire. (A guest once reached nos's sshd so, and four
+    /// connections that never logged in held every slot for logging in.)
+    fn guest_syn(&mut self, r: &mut Input) {
+        if self.guest.is_none() {
+            return;
+        }
+        let port = r.pick(&LISTEN_PORTS);
+        let dst = if r.bool() { ETH1_IP } else { ETH0_IP };
+        let sport = GUEST_PORT_BASE + r.below(1000) as u16;
+        let s = frames::tcp(GUEST_IP, dst, sport, port, r.u32(), 0, seg::SYN, 65535, &frames::mss(1460), &[],
+                            Sum::Right);
+        let f = frames::ipv4(ETH1_MAC, GUEST_MAC, &Ip::new(GUEST_IP, dst, IP_PROTO_TCP), &s);
+        let sent_before = self.w.net.sent.len();
+        crate::machine::nic::wire().inbound[1].push_back(f);
+        sched::softirq_raise(kcore::softirq::TYPE_NET_RX);
+        self.w.pump();
+        let mut out: Vec<Vec<u8>> = crate::machine::nic::wire().out[1].drain(..).collect();
+        out.extend(self.w.net.sent[sent_before..].iter().cloned());
+        for f in &out {
+            let Some(p) = crate::world::check::ipv4_parts(f) else { continue };
+            if p.proto != IP_PROTO_TCP || p.dst != GUEST_IP || p.l4.len() < seg::HDR_LEN
+                || seg::dst_port(p.l4) != sport
+            {
+                continue;
+            }
+            invariant!(seg::flags(p.l4) & (seg::SYN | seg::ACK_FLAG) != seg::SYN | seg::ACK_FLAG,
+                       "a guest on eth1 had the machine's SYN-ACK for port {} at {}: a listener on eth0 took a \
+                        connection from another device", port, netwire::Ipv4(dst));
+        }
+        crate::common::runner::reached("tcp: a guest's SYN on another device, refused");
+    }
+
     fn inject(&mut self, r: &mut Input) {
         let eps = &self.w.peers.tcp.eps;
         if eps.is_empty() {
@@ -460,8 +506,18 @@ pub fn tcp(r: &mut Input) {
     }
 
     let listeners = LISTEN_PORTS.iter().map(|&p| (p, TCP.listen(&nic, p))).collect();
+    /* Now and then the second device, which nothing listens on: the
+     * hypervisor's switch, with a guest behind it. */
+    let guest = if r.u8() < 96 {
+        net::register("eth1", ETH1_MAC, &crate::machine::nic::DRIVERS[1], (), ()).inspect(|eth1| {
+            eth1.set_ip(ETH1_IP);
+            eth1.set_mask(MASK);
+        })
+    } else {
+        None
+    };
     let mut st = State { w, links: Vec::new(), listeners, accepts: Vec::new(), next_peer_port: PEER_PORT_BASE,
-                         next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy };
+                         next_src_port: PEER_SRC_BASE, nic, peer_ip, accepted: BTreeMap::new(), lossy, guest };
 
     while let Some(op) = r.op(20) {
         let k = if st.links.is_empty() { 0 } else { r.below(st.links.len() as u64) as usize };
@@ -544,6 +600,7 @@ pub fn tcp(r: &mut Input) {
                     l.fragile = true;
                 }
             }
+            17 => st.guest_syn(r),
             _ => {
                 /* Time: mostly a little, now and then long enough for a
                  * timer to run out -- a connect's, TIME-WAIT, the

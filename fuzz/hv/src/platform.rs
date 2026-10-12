@@ -112,6 +112,12 @@ struct CpuPlan {
     /// What its last `mov` of CR4 should have come to, for its next entry
     /// to see.
     cr4: Option<Cr4Expect>,
+    /// What its last `mov` of a debug register should have come to, for its
+    /// next entry to see.
+    dr: Option<DrExpect>,
+    /// Its DR0-DR3 by the script's own reckoning: what its writes that a
+    /// CPU takes made them, 0 out of reset and INIT.
+    dr_model: [u64; 4],
 }
 
 /// What a `mov` to or from CR4 the script put at a CPU's RIP should have
@@ -127,6 +133,25 @@ enum Cr4Expect {
     /// `value` refused, as a CPU without a bit's feature refuses it: a #GP
     /// on its way in, CR4 still `old`, RIP still on the instruction.
     Refused { value: u64, old: u64, rip: u64 },
+}
+
+/// What a `mov` to or from DR0-DR3 the script put at a CPU's RIP should have
+/// done by that CPU's next entry -- by the script's own reckoning, not
+/// `dr.rs`'s. In every case the guest's four are the model's
+/// (`CpuPlan::dr_model`), which a write a CPU takes has moved on already.
+#[derive(Clone, Copy, Debug)]
+enum DrExpect {
+    /// Read into register `gpr`: `want` there, and RIP past the `len` bytes
+    /// of the instruction at `rip`.
+    Read { gpr: u8, want: u64, rip: u64, len: u64 },
+    /// Written: RIP past it.
+    Written { rip: u64, len: u64 },
+    /// Made at CPL 3, which a CPU faults before the exit: a #GP on its way
+    /// in, RIP still on the instruction.
+    Refused { rip: u64 },
+    /// Made with DR7's general detect on: a #DB on its way in, DR6.BD set,
+    /// GD cleared, RIP still on the instruction.
+    Detected { rip: u64 },
 }
 
 /// General-purpose register `n` of the guest's, numbered as an instruction
@@ -347,6 +372,84 @@ impl Script {
             });
         }
         Exit::Cr4 { write }
+    }
+
+    /// A `mov` to or from DR0-DR3 at the guest's RIP, as a kernel makes one:
+    /// a read, or a write of any address, through any register, with
+    /// prefixes a CPU passes over and a ModRM whose mod field it ignores --
+    /// and now and then with DR7's general detect on, or at CPL 3, which a
+    /// CPU faults before the exit; and what it should come to (`DrExpect`).
+    /// Now and then the bytes are not the exit's -- another debug register,
+    /// the other way, DR8 and up, a lock, anything -- which stops the guest,
+    /// and nothing is expected of them.
+    fn dr_insn(&mut self, v: &mut Backend, mem: &GuestMemory, r: &mut Input) -> Exit {
+        const LOW32: u64 = 0xFFFF_FFFF;
+        const DR7_GD: u64 = 1 << 13;
+        let long = !self.cpus[self.me].protected32;
+        let width = if long { u64::MAX } else { LOW32 };
+        let write = r.bool();
+        let n = r.below(4) as u8;
+        let gpr = r.below(if long { 16 } else { 8 }) as u8;
+        let value = r.value64();
+        let detect = r.u8() < 16;
+        let user = r.u8() < 8;
+
+        let mut insn = Vec::new();
+        if r.u8() < 24 {
+            insn.push(r.pick(&CR_PREFIXES));
+        }
+        let rex = if gpr >= 8 { 0x41 } else { 0 } | if long && r.u8() < 24 { 0x48 } else { 0 };
+        if rex != 0 {
+            insn.push(rex);
+        }
+        let md = if r.u8() < 24 { r.below(3) as u8 } else { 3 };
+        insn.extend_from_slice(&[0x0F, if write { 0x23 } else { 0x21 }, (md << 6) | (n << 3) | (gpr & 7)]);
+        let len = insn.len() as u64;
+        let stops = r.rare();
+        if stops {
+            let modrm = insn.len() - 1;
+            match r.u8() % 5 {
+                0 => insn[modrm] = (insn[modrm] & !0x38) | (((n + 1 + r.below(7) as u8) & 7) << 3),
+                1 => insn[modrm - 1] ^= 0x21 ^ 0x23,
+                2 => insn.insert(0, 0xF0),
+                3 if long => {
+                    /* REX.R: DR8 and up, which a CPU raises #UD for. */
+                    let at = modrm - 2;
+                    if at > 0 && insn[at - 1] & 0xF0 == 0x40 {
+                        insn[at - 1] |= 0x44;
+                    } else {
+                        insn.insert(at, 0x44);
+                    }
+                }
+                _ => insn = (0..1 + r.below(15)).map(|_| r.u8()).collect(),
+            }
+        }
+
+        self.code = CODE + (self.code + 16 - CODE) % (2 * MIB);
+        let rip = self.code;
+        let _ = mem.write(rip, &insn);
+        v.save_mut().rip = rip;
+        /* A write's value; a read's register holds anything first, all of
+         * which the read is to replace. */
+        *gpr_slot(v, gpr) = if write { value } else { r.value64() };
+        let s = v.save_mut();
+        s.dr7 = if detect { s.dr7 | DR7_GD } else { s.dr7 & !DR7_GD };
+        s.cpl = if user { 3 } else { 0 };
+        if !stops {
+            let plan = &mut self.cpus[self.me];
+            let at = usize::from(n);
+            plan.dr = Some(if user {
+                DrExpect::Refused { rip }
+            } else if detect {
+                DrExpect::Detected { rip }
+            } else if write {
+                plan.dr_model[at] = value & width;
+                DrExpect::Written { rip, len }
+            } else {
+                DrExpect::Read { gpr, want: plan.dr_model[at] & width, rip, len }
+            });
+        }
+        Exit::Dr { write, dr: n }
     }
 
     /// The exit for a planned step, with what the guest did for it.
@@ -635,14 +738,14 @@ fn check_cr4(v: &mut Backend, e: Cr4Expect) {
             invariant!(got == want && rip == at.wrapping_add(len),
                        "a mov of CR4 into register {} at {:#x} left {:#x} there, where the guest's CR4 is {:#x}, \
                         and RIP at {:#x}, not {:#x}", gpr, at, got, want, rip, at.wrapping_add(len));
-            cr4_checked("platform: CR4 read");
+            mov_checked("platform: CR4 read");
         }
         Cr4Expect::Written { value, rip: at, len } => {
             invariant!(v.cr4() == value && v.save().cr4 == value | CR4_MCE && rip == at.wrapping_add(len),
                        "a mov of {:#x} to CR4 at {:#x} left the guest's CR4 {:#x}, the register {:#x} and RIP at \
                         {:#x}: wanted it, it with MCE, and {:#x}", value, at, v.cr4(), v.save().cr4, rip,
                        at.wrapping_add(len));
-            cr4_checked(if value & CR4_MCE == 0 { "platform: CR4 written, MCE cleared" }
+            mov_checked(if value & CR4_MCE == 0 { "platform: CR4 written, MCE cleared" }
                                     else { "platform: CR4 written" });
         }
         Cr4Expect::Refused { value, old, rip: at } => {
@@ -650,9 +753,50 @@ fn check_cr4(v: &mut Backend, e: Cr4Expect) {
                        "a mov of {:#x} to CR4 at {:#x}, which a CPU refuses, left event {:#x?}, the guest's CR4 \
                         {:#x} (was {:#x}) and RIP at {:#x}", value, at, v.event, v.cr4(), old, rip);
             invariant!(v.save().cr4 & CR4_MCE != 0, "CR4's register lost MCE: {:#x}", v.save().cr4);
-            cr4_checked("platform: CR4 write refused");
+            mov_checked("platform: CR4 write refused");
         }
     }
+}
+
+/// Hold the run loop to what a `mov` of DR0-DR3 the script made should have
+/// done (`DrExpect`), at the next entry of the CPU that made it -- and the
+/// guest's four, whatever the `mov` came to, to the script's own reckoning of
+/// them (`model`). Back at CPL 0 after, which only the `mov` was made at.
+fn check_dr(v: &mut Backend, e: DrExpect, model: [u64; 4]) {
+    const DR6_BD: u64 = 1 << 13;
+    const DR7_GD: u64 = 1 << 13;
+    let rip = v.save().rip;
+    let addrs = v.debug_addrs();
+    invariant!(addrs == model, "the guest's DR0-DR3 are {:#x?}, where its writes made them {:#x?}", addrs, model);
+    match e {
+        DrExpect::Read { gpr, want, rip: at, len } => {
+            let got = *gpr_slot(v, gpr);
+            invariant!(got == want && rip == at.wrapping_add(len),
+                       "a mov of a debug register into register {} at {:#x} left {:#x} there, where the guest's is \
+                        {:#x}, and RIP at {:#x}, not {:#x}", gpr, at, got, want, rip, at.wrapping_add(len));
+            mov_checked("platform: DR0-DR3 read");
+        }
+        DrExpect::Written { rip: at, len } => {
+            invariant!(rip == at.wrapping_add(len),
+                       "a mov to a debug register at {:#x} left RIP at {:#x}, not {:#x}", at, rip, at.wrapping_add(len));
+            mov_checked("platform: DR0-DR3 written");
+        }
+        DrExpect::Refused { rip: at } => {
+            invariant!(v.event == Some(vm::Event::Exception(13)) && rip == at,
+                       "a mov of a debug register at CPL 3 at {:#x} left event {:#x?} and RIP at {:#x}: wanted a \
+                        #GP and the instruction not run", at, v.event, rip);
+            mov_checked("platform: DR0-DR3 at CPL 3, refused");
+        }
+        DrExpect::Detected { rip: at } => {
+            let (dr6, dr7) = (v.save().dr6, v.save().dr7);
+            invariant!(v.event == Some(vm::Event::Exception(1)) && rip == at && dr6 & DR6_BD != 0 && dr7 & DR7_GD == 0,
+                       "a mov of a debug register under general detect at {:#x} left event {:#x?}, RIP at {:#x}, \
+                        DR6 {:#x} and DR7 {:#x}: wanted a #DB, the instruction not run, BD set and GD clear",
+                       at, v.event, rip, dr6, dr7);
+            mov_checked("platform: DR0-DR3 under general detect, a #DB");
+        }
+    }
+    v.save_mut().cpl = 0;
 }
 
 fn io_exit(v: &mut Backend, port: u16, size: u8, input: bool) -> Exit {
@@ -672,6 +816,8 @@ impl vm::Guest for Script {
             v.long_mode(&LongMode { entry: CODE, stack: 0x7_0000 + 0x1000 * cpu as u64, cr3: self.cr3,
                                     code_selector: 0x10, data_selector: 0x18, ..LongMode::default() });
             self.cpus[cpu].cr4 = None;
+            self.cpus[cpu].dr = None;
+            self.cpus[cpu].dr_model = [0; 4];
             self.cpus[cpu].protected32 = false;
         }
         let data = core::mem::take(&mut self.data);
@@ -694,6 +840,9 @@ impl Script {
         if let Some(e) = self.cpus[self.me].cr4.take() {
             check_cr4(v, e);
         }
+        if let Some(e) = self.cpus[self.me].dr.take() {
+            check_dr(v, e, self.cpus[self.me].dr_model);
+        }
         loop {
             if let Some(s) = self.plan().pop_front() {
                 v.take_event();
@@ -702,7 +851,16 @@ impl Script {
                     None => continue,
                 }
             }
-            let op = r.op(36)?;
+            let op = r.op(37)?;
+            if op == 36 {
+                /* A `mov` of DR0-DR3, which AMD-V stops the guest at. */
+                if self.vmx {
+                    continue;
+                }
+                v.take_event();
+                let exit = self.dr_insn(v, mem, r);
+                return Some(vm::Next::Exit(exit));
+            }
             if op == 35 {
                 /* A `mov` of CR4, which AMD-V stops the guest at. */
                 if self.vmx {
@@ -912,6 +1070,9 @@ impl Script {
                         s.efer = 1 << 12;
                         s.cr0 = 0x11;
                     } else {
+                        /* As a boot loader leaves a CPU, as `long_mode` has
+                         * it -- DR0-DR3 0 among it. */
+                        c.dr_model = [0; 4];
                         v.long_mode(&LongMode { entry: CODE, stack: 0x7_0000 + 0x1000 * self.me as u64, cr3: self.cr3,
                                                 code_selector: 0x10, data_selector: 0x18, ..LongMode::default() });
                     }
@@ -980,12 +1141,13 @@ fn header() -> (Header, Vec<u8>) {
 /// How runs ended, and their exits: `HV_FUZZ_STATS=1` prints them, for
 /// telling whether the script reaches deep or ends its runs early.
 static ENDS: Mutex<std::collections::BTreeMap<String, (u64, u64)>> = Mutex::new(std::collections::BTreeMap::new());
-/// The `mov`s of CR4 held to what they should have done, by what they did.
-static CR4_CHECKED: Mutex<std::collections::BTreeMap<&'static str, u64>> =
+/// The `mov`s of CR4 and of DR0-DR3 held to what they should have done, by
+/// what they did.
+static MOV_CHECKED: Mutex<std::collections::BTreeMap<&'static str, u64>> =
     Mutex::new(std::collections::BTreeMap::new());
 
-fn cr4_checked(what: &'static str) {
-    *CR4_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_insert(0) += 1;
+fn mov_checked(what: &'static str) {
+    *MOV_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_insert(0) += 1;
 }
 
 pub fn report() {
@@ -995,7 +1157,7 @@ pub fn report() {
     for (kind, (n, exits)) in ENDS.lock().unwrap().iter() {
         println!("  platform: {:>8} runs ended {:<12} {:>6} exits each", n, kind, exits / n.max(&1));
     }
-    for (what, n) in CR4_CHECKED.lock().unwrap().iter() {
+    for (what, n) in MOV_CHECKED.lock().unwrap().iter() {
         println!("  {}: {}", what, n);
     }
 }
@@ -1087,7 +1249,12 @@ pub fn platform(r: &mut Input) {
     let x2apic = r.bool();
     let ioapic = cpus > 1 && r.bool();
     let mem_bytes = r.pick(&[64 * MIB, 128 * MIB, 256 * MIB, 3072 * MIB, 4064 * MIB, 4096 * MIB]);
-    let machine = Machine::new(if r.bool() { Vendor::Svm } else { Vendor::Vmx });
+    let vmx = r.bool();
+    /* The host whose CPUID the policy shapes, before the guest is made --
+     * which asks it what CR4 may take: an AMD CPU under AMD-V, an Intel one
+     * under VT-x. */
+    crate::x86::cpu::set_host((r.u64() & !1) | u64::from(vmx));
+    let machine = Machine::new(if vmx { Vendor::Vmx } else { Vendor::Svm });
     let Some(doorbells) = Doorbells::new(cpus as usize) else { return };
     let made = LinuxGuest::new(&machine, mem_bytes, cpus, Arc::new(doorbells), x2apic, ioapic);
     if mem_bytes > crate::run::MAX_MEM_BYTES {
@@ -1137,7 +1304,7 @@ pub fn platform(r: &mut Input) {
         apic: cpus > 1,
         ioapic,
         cpus: (0..n).map(|_| CpuPlan { plan: VecDeque::new(), xapic: first_xapic, asked_xapic: None,
-                                       protected32: false, cr4: None }).collect(),
+                                       protected32: false, cr4: None, dr: None, dr_model: [0; 4] }).collect(),
         me: 0,
         cr3: vcpus[0].backend_mut().save().cr3,
         code: CODE,
@@ -1162,6 +1329,7 @@ pub fn platform(r: &mut Input) {
         match &s.stop {
             crate::run::Stop::MmioInsn { error, .. } => kind = format!("{}/{:?}", kind, error),
             crate::run::Stop::CrInsn { error, .. } => kind = format!("{}/{:?}", kind, error),
+            crate::run::Stop::DrInsn { error, .. } => kind = format!("{}/{:?}", kind, error),
             crate::run::Stop::Mmio { gpa, .. } => kind = format!("{}/{:x}", kind, gpa >> 20),
             _ => {}
         }

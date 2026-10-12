@@ -1,6 +1,7 @@
 //! The hypervisor's MMIO decoder and page walker, checked on the host: the
-//! decoder -- and its other, of a `mov` to or from a control register --
-//! against the encodings clang gives for every instruction form
+//! decoder -- and its others, of a `mov` to or from a control register and
+//! of one to or from a debug register -- against the encodings clang gives
+//! for every instruction form
 //! scripts/insn-test.py lists (the cases file, its first argument), each also
 //! cut short at every length, and against random bytes; the walker against
 //! page tables built here by hand. The two files are compiled as they are in
@@ -11,7 +12,7 @@ mod insn;
 #[path = "../../../src/rust/hv/src/walk.rs"]
 mod walk;
 
-use insn::{decode, decode_mov_cr, Access, Extend, Insn, Mode, MovCr, Reg};
+use insn::{decode, decode_mov_cr, decode_mov_dr, Access, Extend, Insn, Mode, MovCr, MovDr, Reg};
 use std::collections::HashMap;
 
 fn hex(s: &str) -> Vec<u8> {
@@ -53,10 +54,20 @@ fn decoder() {
             bad += b;
             continue;
         }
-        /* No MMIO form is a `mov` of a control register. */
+        if parts[1].starts_with('D') {
+            let (o, b) = mov_dr_case(&bytes, &padded, parts[1], parts[2]);
+            ok += o;
+            bad += b;
+            continue;
+        }
+        /* No MMIO form is a `mov` of a control or a debug register. */
         if let Some(m) = decode_mov_cr(&padded, Mode::Long) {
             bad += 1;
             println!("MOV CR {}: {} -> {:?}", parts[2], parts[0], m);
+        }
+        if let Some(m) = decode_mov_dr(&padded, Mode::Long) {
+            bad += 1;
+            println!("MOV DR {}: {} -> {:?}", parts[2], parts[0], m);
         }
         let want = expected(parts[1], bytes.len());
         let got = decode(&padded, Mode::Long);
@@ -95,9 +106,16 @@ fn decoder() {
                 decoded += 1;
                 assert!(m.len as usize <= n && m.len >= 3 && m.cr < 16 && m.gpr < 16, "{:?} of {}", m, n);
             }
+            if let Some(m) = decode_mov_dr(&b[..n], mode) {
+                decoded += 1;
+                assert!(m.len as usize <= n && m.len >= 3 && m.dr < 16 && m.gpr < 16, "{:?} of {}", m, n);
+            }
         }
     }
     let (o, b) = mov_cr_by_hand();
+    ok += o;
+    bad += b;
+    let (o, b) = mov_dr_by_hand();
     ok += o;
     bad += b;
     println!("decoder: {} reference cases right, {} wrong; random: {} decoded, none past its bytes", ok, bad, decoded);
@@ -116,7 +134,7 @@ fn mov_cr_case(bytes: &[u8], padded: &[u8], e: &str, source: &str) -> (u32, u32)
     for mode in [Mode::Long, Mode::Protected32] {
         let got = decode_mov_cr(padded, mode);
         let right = if rex && mode == Mode::Protected32 { got.is_none() } else { got == Some(want) };
-        if right && decode(padded, mode).is_none() {
+        if right && decode(padded, mode).is_none() && decode_mov_dr(padded, mode).is_none() {
             ok += 1;
         } else {
             bad += 1;
@@ -160,6 +178,72 @@ fn mov_cr_by_hand() -> (u32, u32) {
     let (mut ok, mut bad) = (0, 0);
     for (bytes, mode, want) in cases {
         let got = decode_mov_cr(bytes, *mode);
+        if got == *want {
+            ok += 1;
+        } else {
+            bad += 1;
+            println!("MISMATCH by hand {:02x?} in {:?}: got {:?}, want {:?}", bytes, mode, got, want);
+        }
+    }
+    (ok, bad)
+}
+
+/// A `mov` of a debug register, "D dr gpr write" in the cases file, held
+/// to what a control register's is (`mov_cr_case`) -- and refused by the
+/// MMIO decoder and the control registers' both.
+fn mov_dr_case(bytes: &[u8], padded: &[u8], e: &str, source: &str) -> (u32, u32) {
+    let f: Vec<u8> = e.split_whitespace().skip(1).map(|x| x.parse().unwrap()).collect();
+    let want = MovDr { dr: f[0], gpr: f[1], write: f[2] == 1, len: bytes.len() as u8 };
+    let rex = bytes.iter().take_while(|&&b| b != 0x0F).any(|b| b & 0xF0 == 0x40);
+    let (mut ok, mut bad) = (0, 0);
+    for mode in [Mode::Long, Mode::Protected32] {
+        let got = decode_mov_dr(padded, mode);
+        let right = if rex && mode == Mode::Protected32 { got.is_none() } else { got == Some(want) };
+        if right && decode(padded, mode).is_none() && decode_mov_cr(padded, mode).is_none() {
+            ok += 1;
+        } else {
+            bad += 1;
+            println!("MISMATCH {} in {:?}: {:02x?} -> got {:?}, want {:?}", source, mode, bytes, got, want);
+        }
+        for cut in 0..bytes.len() {
+            if let Some(g) = decode_mov_dr(&bytes[..cut], mode) {
+                bad += 1;
+                println!("TRUNCATED {} at {} in {:?}: {:?}", source, cut, mode, g);
+            }
+        }
+    }
+    (ok, bad)
+}
+
+/// As `mov_cr_by_hand`, for a debug register: prefixes passed over, a mod
+/// field ignored, a lock and a repeat refused, a REX that is not the last
+/// byte before the opcode refused, REX.R naming DR8 and up -- the #UD a CPU
+/// raises before any intercept, which `crate::dr` then finds is not the
+/// exit's -- and the control registers' opcodes not its own.
+fn mov_dr_by_hand() -> (u32, u32) {
+    let mov = |dr, gpr, write, len| Some(MovDr { dr, gpr, write, len });
+    let cases: &[(&[u8], Mode, Option<MovDr>)] = &[
+        (&[0x2E, 0x0F, 0x23, 0xC0], Mode::Long, mov(0, 0, true, 4)),
+        (&[0x66, 0x0F, 0x21, 0xCB], Mode::Protected32, mov(1, 3, false, 4)),
+        (&[0x67, 0x3E, 0x0F, 0x23, 0xDF], Mode::Protected32, mov(3, 7, true, 5)),
+        (&[0x0F, 0x23, 0x10], Mode::Long, mov(2, 0, true, 3)),
+        (&[0x0F, 0x21, 0x59, 0x12], Mode::Long, mov(3, 1, false, 3)),
+        (&[0x49, 0x0F, 0x23, 0xC7], Mode::Long, mov(0, 15, true, 4)),
+        (&[0x44, 0x0F, 0x21, 0xC0], Mode::Long, mov(8, 0, false, 4)),
+        (&[0x0F, 0x21, 0xF0], Mode::Long, mov(6, 0, false, 3)),
+        (&[0xF0, 0x0F, 0x23, 0xC0], Mode::Long, None),
+        (&[0xF3, 0x0F, 0x23, 0xC0], Mode::Long, None),
+        (&[0xF2, 0x0F, 0x21, 0xC0], Mode::Long, None),
+        (&[0x48, 0x41, 0x0F, 0x23, 0xC0], Mode::Long, None),
+        (&[0x41, 0x2E, 0x0F, 0x23, 0xC0], Mode::Long, None),
+        (&[0x41, 0x0F, 0x23, 0xC0], Mode::Protected32, None),
+        (&[0x0F, 0x20, 0xC0], Mode::Long, None),
+        (&[0x0F, 0x22, 0xC0], Mode::Long, None),
+        (&[0x0F, 0x23], Mode::Long, None),
+    ];
+    let (mut ok, mut bad) = (0, 0);
+    for (bytes, mode, want) in cases {
+        let got = decode_mov_dr(bytes, *mode);
         if got == *want {
             ok += 1;
         } else {

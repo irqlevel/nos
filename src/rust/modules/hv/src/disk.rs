@@ -13,8 +13,9 @@
 //! at a count first, every time round its loop, and takes the lock only
 //! when something is there.
 //!
-//! The task is on a CPU of its own, not the vCPU's (`disk_cpu`): the disk
-//! works while the guest runs rather than when it stops. It is the disk's for
+//! The task is on a CPU of its own, not the vCPU's (`hv::place`): the disk
+//! works while the guest runs rather than when it stops -- a thread of the
+//! guest's own core where it has one free, since its cores are its own. It is the disk's for
 //! as long as the disk is: dropping the disk tells it to stop -- after the
 //! request it is serving, if any -- and waits for it, and what it had not
 //! served goes with the queues.
@@ -27,7 +28,6 @@ use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use hv::disk::{self as blk, Op, Request};
-use kcore::consts::MAX_CPUS;
 use kcore::fs::{File, FileId};
 use kcore::sync::{Event, Mutex};
 use kcore::task::TaskHandle;
@@ -154,28 +154,6 @@ impl Drop for Claim {
         if let Some(i) = held.iter().position(|h| h.id == self.id && h.by == self.by) {
             held.swap_remove(i);
         }
-    }
-}
-
-/// The CPU a guest's disks are served on: an online one other than its
-/// vCPU's -- the vCPU's own only on a machine of one CPU -- with the fewest
-/// vCPUs (`load` counts them, by CPU), the higher of any two that tie, CPU 0
-/// last: where the boot CPU's own work runs.
-pub fn disk_cpu(vcpu: u32, load: &[u32; MAX_CPUS]) -> u32 {
-    let online = kcore::cpu::online_mask();
-    let mut best: Option<u32> = None;
-    for cpu in 1..MAX_CPUS as u32 {
-        if cpu == vcpu || online & (1u64 << cpu) == 0 {
-            continue;
-        }
-        if best.map_or(true, |b| load[cpu as usize] <= load[b as usize]) {
-            best = Some(cpu);
-        }
-    }
-    match best {
-        Some(cpu) => cpu,
-        None if vcpu != 0 => 0,
-        None => vcpu,
     }
 }
 

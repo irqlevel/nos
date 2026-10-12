@@ -45,6 +45,12 @@ impl Nic {
         DEVICES.by_handle(handle).map(Nic)
     }
 
+    /// Whether `other` is this same device.
+    #[inline]
+    pub fn is(&self, other: &Nic) -> bool {
+        core::ptr::eq(self.0, other.0)
+    }
+
     pub fn device(&self) -> &'static Device {
         self.0
     }

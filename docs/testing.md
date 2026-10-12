@@ -114,11 +114,11 @@ swallowing panic messages whole.
 | `usb-test.py` | x86-64 | `drivers/usb/` |
 | `hv-test.py [--arch x86_64\|aarch64]` | both | `hv`, `hvarch`, `modules/hv` -- the hypervisor |
 | `insn-test.py` | host (CI) | the hypervisor's MMIO decoder, its decoder of a `mov` of a control register, and its guest page walker (`hv/src/{insn,walk}.rs`), against the encodings clang gives |
-| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
+| `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 
@@ -363,9 +363,14 @@ which 32-bit code reads as an INC or a DEC, and is refused -- in 32-bit
 code too; each cut short at every length; by hand, what no assembler gives
 and a CPU takes or refuses -- prefixes it passes over, a ModRM whose mod
 field it ignores with nothing after it, a lock and a repeat, a REX that is
-not the last byte before the opcode; and the random bytes. Each decoder
-must refuse the other's every form. A control run with REX.B left out of
-the register failed 31 of its cases.
+not the last byte before the opcode; and the random bytes. And the third,
+of a `mov` to or from a debug register (`decode_mov_dr`) -- what an
+intercept of DR0-DR3 stops a guest at -- the same way over DR0-DR3, DR6 and
+DR7, with REX.R's DR8 and up by hand, which a CPU raises #UD for before any
+intercept and which `crate::dr` then finds is not the exit's register. Each
+decoder must refuse the others' every form. A control run with REX.B left
+out of the register failed 31 of its cases; one with the debug registers'
+two opcodes swapped, 164.
 
 ### `hv-fuzz.py` -- everything a guest reaches, fuzzed
 
@@ -390,13 +395,55 @@ by plain writes while the device takes from it, as nothing on the host can
 stop it doing -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
+`place` holds where guests are put on the host's cores (`hv/src/place.rs`)
+to a model of its own (`fuzz/hv/src/placemodel.rs`), over hosts made up an
+input -- one, two or four threads a core, caches shared by one to sixteen
+cores, CPUs missing from the numbering and the extension off on some -- on
+which guests are started and stopped, and the rule changed between, as the
+input says: a guest refused only where no place exists, and for the reason
+that comes first; each vCPU on a CPU of its own the extension is on for,
+the first where `cpu=` said; and, its cores its own, none of them with
+another guest's CPU on it, every one of them but one filled before the next
+is taken, and its disks' task on a spare thread of its own cores, then on a
+core no guest has, then beside a vCPU of its own. Five mutants of the rule
+-- later cores not checked, one vCPU a core, the disks' task on a held core,
+`cpu=`'s core not checked, the disks' task elsewhere before a spare thread
+of its own -- each failed within two inputs.
+`policy` holds the CPUID and MSR policy to a model of its own
+(`fuzz/hv/src/policymodel.rs`), over a host CPU made up an input -- which
+vendor's, the tops of its two ranges of leaves, below the policy's and
+above, and every bit of every leaf: every leaf a guest can ask answered with
+no more of the host's than the model lets through, and nothing for one it
+does not name or past the top the guest is told; every MSR the model names
+read and written as it says -- a refused write leaving the guest's state as
+it was, a taken one read back -- and every other refused both ways; and a
+table, from the manuals, of what each CPUID bit promises the guest that sees
+it, the MSR it will use or the bit of EFER it will set, which must then be
+answered. IBPB offered with PRED_CMD refused, or AutoIBRS with its EFER bit,
+is a finding at the first input. The model is written from the manuals and
+not from the policy, so a leaf, a bit or an MSR the policy comes to offer is
+a finding until the model is told of it too; nine mutants of the policy --
+the old swallowing of every MSR, every leaf passed through, the tops not
+held, a PAT of any bytes, addresses not canonical, FFXSR in EFER, an AMD
+MSR on Intel, and IBPB and AutoIBRS offered with the model told -- each
+failed within its first 1,600 inputs.
 The guests' network has three: `switch`, guests on its ports and `hv0`
 sending each other frames of every kind -- as themselves and as each other
--- held to a model of where each must go and what each must count; `nat`,
+-- held to a model of where each must go and what each must count, a
+guest's bursts among them, past its share of `hv0`'s backlog (the backlog
+over the ports in use, counted afresh at each of the stack's passes) and
+past its rate to every port, the clock moved on now and then for the rate
+to come back; `nat`,
 guests' packets out into the world and the world's answers back, each
 rewrite checked field by field and its sums summed from scratch; and
 `guestnet`, the two as the module wires them, guests on the switch reaching
-the world through NAT. And `platform` does it to the whole machine: a Linux guest's platform built
+the world through NAT. `nat` floods the table past full now and then and
+holds every flow a full table takes to its rule -- the one used least lately
+of the guest that holds the most, the asker's own when it holds as many as
+any -- from the table's own listing before the packet, a sample of them,
+and a packet given no room to a guest past the 64 the table keeps shares
+for; and it runs NAT's boot self-test once, which holds the cases random
+input seldom makes, a tie and every slot held. And `platform` does it to the whole machine: a Linux guest's platform built
 and loaded as `hv boot` builds it -- CPUs, disks, NICs, IO-APIC and all --
 and run by the real run loop, `LinuxGuest::run`, on each of its CPUs, each
 on a thread of its own and one at a time -- the one turn handed from thread
@@ -406,8 +453,8 @@ second of the first harness, whose CPUs slept for real, and ten processes
 at once some forty times theirs. Where the loop would enter the
 guest, the CPU asks a script what the guest does next: a port, an MSR,
 CPUID, a fault on a device's page with the instruction that made it put
-where the guest's paging finds it, a `mov` to or from CR4 put there the
-same way -- under AMD-V, which stops a guest at each -- a halt, a window
+where the guest's paging finds it, a `mov` to or from CR4 or DR0-DR3 put
+there the same way -- under AMD-V, which stops a guest at each -- a halt, a window
 opened, an event taken, another CPU's turn -- and between them what a
 driver does over several
 exits: the 8259 initialised, the APIC turned on or moved between its modes,
@@ -426,7 +473,14 @@ elsewhere than its destination says, or counted otherwise; a packet NAT
 rewrote in any field but its own, or with a sum it did not have, a port
 given to one flow while another was live on it, an answer let in that no
 live flow asked for or kept out that one did, a packet counted twice or
-not at all; what a guest takes from the world for another guest's address,
+not at all; a guest's packet for where NAT keeps the guests from -- a
+metadata server, a private network, the uplink's own subnet -- sent out,
+one for where they may go denied, a reject other than an administratively
+prohibited to its guest quoting it, or the networks NAT lets through other
+than `nat allow` and `nat deny` left them (control runs with nothing
+denied, the DNS server not let through, `nat allow` ignored and the
+reject's code wrong failed at inputs 16, 29, 1 and 16); what a guest takes
+from the world for another guest's address,
 and what `hv0` or a guest takes from a guest not sent as that guest; a
 vCPU that enters its
 guest or waits with one of the kernel's locks held; a guest whose RAM would
@@ -440,7 +494,19 @@ and the guest's TLB not flushed. (Control runs with the CPUID's mask left
 out, PGE's flush left out, and reads answered from the register rather than
 the guest's CR4 failed at the first, the first and the fourth input; the
 first run of the checks found the script's own 32-bit belief outliving the
-INIT that put its CPU back in long mode.) Or a spin -- the run loop reading the clock a
+INIT that put its CPU back in long mode.) A `mov` of DR0-DR3 the same: a
+read whose register does not hold what the guest's writes made the
+register, a write that is not the guest's from then on with RIP past it,
+one made at CPL 3 -- which a CPU faults before the exit -- that is not a
+#GP, or one under DR7's general detect that is not a #DB with DR6.BD set
+and GD clear, the instruction not run either way; and the guest's four, at
+every one of its entries after, other than its writes made them. (Seven
+mutants of `hv/src/dr.rs` -- a write into another register, a read of 0,
+no CPL check, no general detect, GD left set, a write in 32-bit code
+keeping its high half, the instruction not stepped past -- each failed
+within 145 inputs; the first run of the checks found the script's model
+outliving the `long_mode` its return from 32-bit code calls, which zeroes
+them as a boot loader leaves a CPU.) Or a spin -- the run loop reading the clock a
 million times with neither an entry nor a wait between, which on a host is
 a CPU spun for as long as the guest stays so -- or a hang, ten seconds with
 no input done. Each is reported with the seed and the iteration that make
@@ -549,7 +615,12 @@ own, TCP's flags in combinations that mean something. The targets:
   against RFC 9293 -- the window, the sequence space, what may carry data --
   and does what peers do: retransmits, probes a zero window, resets, goes
   quiet; and an attacker off the path injecting segments at every sequence
-  number, an ICMP error at every quoted one;
+  number, an ICMP error at every quoted one. And now and then a second
+  device, eth1, standing for the hypervisor's switch, from which a guest
+  sends a SYN to a port the machine listens on -- at eth1's address or at
+  eth0's: a listener takes connections from its own device alone, so no
+  SYN-ACK may go out to it on either wire (the first input of the control
+  run with the device left out of the listener's lookup got one);
 - `http` and `https`: the HTTP client fetching through chains of redirects
   from a server that answers well -- whose result is then known exactly --
   or to break it: numbers longer than any field, chunk sizes of every
@@ -1126,7 +1197,39 @@ the reads either way. A control run with MCE kept nowhere -- neither
 read lost MCE at the first write. Under VT-x, which does not stop a guest at CR4 yet,
 it checks only what any CPU does -- PAE cleared and bit 32 refused, CR4
 unchanged -- and says so; that branch has not been run, no Intel machine
-being at hand when it was written. The unload
+being at hand when it was written. And for `msr`, through the same loop,
+that SPEC_CTRL and PRED_CMD, which its CPUID does not offer, AMD's LS_CFG,
+which the policy names for no CPU, and MTRRs turned on, which nothing
+keeps, were each a #GP its own handler took -- in that order, with no
+error code, and in the host's count of five reads, three writes and four
+refusals; that MCG_CAP, MCG_STATUS and the PAT were answered; and that
+CPUID told it of no speculation control and no PMU, of no basic leaf past
+0x16, and of a hypervisor. Every MSR but the three segment bases comes to
+the same policy on either backend, so it says the same under VT-x. A
+control build whose policy did not name MCG_STATUS failed it, a fifth #GP
+on both CPUs it ran on. And for `dr`, two VMs of one CPU each, one after
+the other on the CPU the guests run on: that the second read 0 in DR0-DR3
+as it started, where the first had left its own -- and where the CPU's
+four were the guests', it read those -- that each read back the pattern it wrote,
+and that each one's breakpoint, on a `ret` of its own, fired once, with
+DR6.B0 and at the `ret`, which only its own DR0 made the CPU's before its
+entry can do; then that every one of its fourteen `mov`s of them was the
+host's to perform. An execution breakpoint, not a data one: QEMU 10.2's TCG
+never gets past a store a data breakpoint watches in a nested guest -- it
+retries the store for good and takes no interrupt, so `hv run` never comes
+back -- and a control build that left the four the CPU's hung the same.
+The world switch before this failed it on both CPUs, the second VM
+reading the first's breakpoint address and pattern. Without the load
+before the entry, and with a load only when
+the guest's DR7 enabled a breakpoint as it was entered -- which a guest
+then enables without an exit -- the first VM's breakpoint never fired, on
+both CPUs. Under VT-x, which does not keep a guest's four apart yet, it
+says what the second read, and holds it to nothing. Under AMD-V `hv`, after both rounds, must count at least
+two switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
+after another guest's -- each with an IBPB where the CPU offers one, which
+QEMU's TCG does not, and `hv` must say so; every guest ran through the run
+stub's clearing of the registers and refill of the return stack after each
+exit. The unload
 that follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.
 
@@ -1196,7 +1299,20 @@ Linux `bzImage` by the boot protocol, runs it on a vCPU for a set time, and
 reports its serial console. The gate boots nos with a `bzImage` on its root
 filesystem and an `/etc/rc` that turns the extension on and runs `hv boot`,
 and looks in the report for the kernel's banner and the first lines of its
-early setup.
+early setup -- and for what must not be there: an "unchecked MSR access
+error", a refusal of an MSR the kernel took for there and read without
+being ready for a fault, or an "MCA architectural violation", the panic a
+refused machine-check register is. Which MSRs a kernel reads that way
+depends on its configuration and on the CPU's vendor, family and model, so
+after touching the CPUID and MSR policy run the boot with a kernel that has
+machine checks, MTRRs and PAT (`X86_MCE`, `MTRR`, `X86_PAT`, as a
+distribution's does), on TCG's `max` and with `--qemu-cpu EPYC-Rome-v1` (a
+Zen 2, family 0x17, whose kernel polls the machine-check banks at boot,
+reads AMD's NB_CFG and probes LS_CFG) and `--qemu-cpu
+Skylake-Client-v1,+svm,+npt,+nrip-save` (an Intel CPU given AMD-V, whose
+kernel reads MISC_ENABLE, the microcode revision and the platform ID) --
+TCG's `max` is an AMD family 6, which takes few of those paths. The MSRs
+the guest was refused, which it was ready for, are printed as a note.
 
 It is a **manual** gate, not in CI: a `bzImage` is megabytes and CI cannot
 build one in the time it has, so the gate is pointed at a kernel by hand.
@@ -1262,7 +1378,24 @@ the writer stopped, two readers, side by side, and a writer refused under
 them -- each refusal saying whose the image is, and every refused start
 taking a number all the same, which is what the checks count on. The guests
 have no initrd and get no further than their panic, holding their disks the
-while.
+while. Then one guest started with `log`, whose console nos's log takes,
+prints twenty thousand lines as fast as it can (`seq`, the end marked by a
+line it computes, `flood-$((6*7))`, so that the shell's echo of what was
+typed is not taken for it): nos's log must take fewer than half of them --
+a boot's worth and then a rate. A dmesg is a ring that holds the newest two
+thousand lines, so what the flood put in it is read from its count of the
+lines it pushed out, before the flood and after, the ring's slots added on
+top. Of the lines left out, nos says how many once a second at most, and
+each notice must name exactly the gaps in `seq`'s numbers since the one
+before, over what of the flood the ring still holds. And the guest's own
+console must keep the last line. Two of these are bound to time under TCG
+-- six resets in a minute, the flood within `--vm-secs` -- and with `--cpus
+2` a loaded machine fails them with or without the change under test: back
+to back on 2026-10-12, a build with and one without the speculation work
+failed the same three, the restarting guest never making six resets inside
+a minute in its 500 s, where the one build had passed all of them an hour
+before. Run it again on
+a quiet machine before reading a failure of those two as the change's.
 
 `--attach` is a boot of its own for `hv attach`: sshd and a guest started
 from `/etc/rc`, then an `ssh -tt ... hv attach 0` that types a line, waits
@@ -1293,9 +1426,18 @@ must have taken its own local timer's interrupts, rescheduling IPIs must
 have gone between them, and `hv list` must name the host CPU of each. nos
 runs with two cores of two threads (`-smp 4,cores=2,threads=2`) in every
 boot of this gate, so that where a guest's CPUs go has a topology to be
-wrong on: a guest of two must be on both cores, never on one core's two
-threads -- where the first placement put it (13 and 12 on the AX41, and
-two busy loops there ran at three quarters of the speed). It goes with
+wrong on: a guest's cores being its own, a guest of two must be on one
+core's two threads and the next guest on the other core. (Where the guests
+are all one's own, `hv cores shared` puts a guest's CPUs on cores apart:
+two busy loops on one core's two threads ran at three quarters of the
+speed, 13 and 12 on the AX41.) In every run the VM phase must put vm 0 and
+vm 1 on cores apart, refuse a third guest while the two hold both cores --
+saying the free cores hold none, before the guest takes a number -- and
+have `hv cores` name which guest holds which CPUs; the image claims, three
+guests at once beside vm 0, run under `hv cores shared` and switch it back
+after. And `--disk`'s guest must have its disk served on its own core: the
+other thread of its CPU's, or, its two CPUs filling that core, the other
+core. It goes with
 `--disk`, `--nvme-root`, `--net` and `--attach`, whose guests get the same
 N CPUs -- they once started theirs with one whatever `--cpus` said -- and
 there the guest's `/proc/interrupts` must show its virtio device on MSI-X,
@@ -1308,15 +1450,21 @@ gate wants QEMU 9.2 or later, as `hv-test.py` does.
 `--net` is the guests' network: two guests with `net`; each has its port's
 address and MAC; a guest pings nos at 10.0.100.1 and each pings the other;
 nos pings a guest out of `hv0`; and a page from one guest's `httpd` is
-fetched from outside QEMU through `hv forward`. Then the way out, through
-nos's NAT: the guest's `/proc/net/pnp` names nos's DNS server (`ip=`'s
+fetched from outside QEMU through `hv forward`. Then where NAT keeps the
+guests from: a fetch from the test machine -- 10.0.2.2, on nos's uplink's
+own subnet -- and one from 169.254.169.254, a cloud's metadata server, must
+each fail at once with "No route to host", and `nat allow 10.0.2.2/32` must
+let the test machine through (on the stack before the deny list, the guest
+had the page, and NAT mapped its connection to the metadata address). Then
+the way out, through nos's NAT: the guest's `/proc/net/pnp` names nos's DNS server (`ip=`'s
 `dns0`); it fetches a page and a megabyte from a web server the test runs on
 127.0.0.1 -- 10.0.2.2 to QEMU's user network, so beyond nos -- and the
 megabyte's md5 must match; it pings 10.0.2.2; `udhcpc` must be given its
 port's address, nos as its router and nos's DNS server by the switch; and
 `nat` must say it is on from `hv0` through eth0 and count the megabyte's
-segments back, `hv list` the address the guests go out from and the DHCP
-answers. With `--internet`, a name is also looked up through that DNS server
+segments back, say where the guests are kept from, what is let through and
+how many packets it denied, `hv list` the address the guests go out from and
+the DHCP answers. With `--internet`, a name is also looked up through that DNS server
 -- which needs the test machine to resolve names. One question at a time:
 BusyBox's `nslookup` asks for A and AAAA at once and matches answers to
 questions by their ID alone, which musl takes from the clock's nanoseconds,
@@ -1328,7 +1476,10 @@ for it (`kicks` in `hv list` above 0), and the port must have dropped
 nothing. Under TCG only the first two tell anything -- with the kick taken
 out, `kicks` reads 0 and the check fails, but slirp never outruns the host's
 tick, so no frame was dropped either; the drops show at line rate, on the
-AX41. And one guest claims the other's address -- `ip addr add` of it,
+AX41. Nor may either guest's traffic so far -- DHCP, ARP, pings, the two
+megabytes -- have gone past its share of `hv0`'s backlog or its rate to
+every port: those are for a guest that floods, which the `switch` target of
+`hv-fuzz.py` makes. And one guest claims the other's address -- `ip addr add` of it,
 `arping` from it, a ping from it -- and must get nothing back: the switch
 stops what a guest sends as another at its port, so nos, which would answer
 both, hears neither; and `hv list` must count the frames against the guest
@@ -1340,7 +1491,14 @@ makes last, reached the claiming guest instead of the other's `httpd`.)
 Then one guest is stopped with a forward to it and its flows in NAT's table:
 its forward has to go with it, the other's stay, and `nat` show no mapping
 of its address -- the next VM on its port has its MAC and address, and was
-once relayed to and answered for the stopped one. It
+once relayed to and answered for the stopped one. Last, nos's own services
+are not the guests': sshd is started on nos, and must give its banner to
+the test machine through a port QEMU forwards to eth0 -- so a guest's
+refusal is the listener's doing, not a server that never started -- while
+a guest's `nc` to nos's port 22, at 10.0.100.1 on `hv0` and at eth0's
+address through `hv0`, must be refused. A guest once had the banner both
+ways, and four connections that never logged in held every slot sshd has
+for logging in -- on the Hetzner boxes, the only console there is. It
 needs a guest kernel with networking, virtio-net, packet sockets and `ip=`
 configuration built in, and POSIX timers: BusyBox's `ping` paces itself
 with `alarm()`, which a `tinyconfig` leaves out, and without it the guest's
@@ -1358,7 +1516,11 @@ back, a PM timer that failed its checks, a TSC the clocksource watchdog
 marked unstable, or a PCI interrupt without a GSI. Its reboots must go
 through the FADT's reset register (`0x06 to port 0xcf9`, where a kernel
 without ACPI pulses the 8042's line). In the VM phase one more guest runs
-BusyBox's `acpid`, with a handler that powers off: its SCI must be IRQ 9 on
+BusyBox's `acpid`, with a handler that powers off -- a devtmpfs mounted
+first, which the initramfs's `/init` does not mount and without which there
+is no `/dev/input` for `acpid` to read the button from (the gate failed so,
+the button unanswered, until it mounted one), the button's `event` device
+then checked for: its SCI must be IRQ 9 on
 the 8259, the PM timer one of its clocksources, and `hv stop` must end it as
 `the guest powered itself off`, the report counting the press; and one more
 without `acpid`, which hears the button and does nothing, must be stopped
@@ -1418,7 +1580,9 @@ the ISO is read-only to it -- the driver says so and a write fails; that
 `reboot` resets it, `restart` boots it again, and root logs in again; that
 its initramfs configured eth0 from the VM's `ip=`, it pings nos and nos
 pings it; that its `resolv.conf` names nos's DNS server and it fetches a page
-from the test machine through NAT (with `--internet`, it also looks Alpine's
+from the test machine through NAT -- which `/etc/rc` lets through first,
+`nat allow 10.0.2.2/32`, the test machine being on nos's uplink's own subnet
+-- (with `--internet`, it also looks Alpine's
 mirror up by name and `apk update`s from it); that `apk add openssh-server`
 installs from the ISO; and that the
 test, from outside QEMU, logs into the guest's own sshd through QEMU's

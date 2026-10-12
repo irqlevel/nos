@@ -756,7 +756,7 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, IOAPIC_NAME, DEBUG_NAME, CR4_NAME].into_iter())
+        .chain([SMP_NAME, IOAPIC_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME].into_iter())
 }
 
 /// Run the built-in guest `name` on the CPU this is called on -- and, for a
@@ -775,6 +775,12 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
     }
     if name == CR4_NAME {
         return Some(run_cr4(machine, out));
+    }
+    if name == MSR_NAME {
+        return Some(run_msr(machine, out));
+    }
+    if name == DR_NAME {
+        return Some(run_dr(machine, out));
     }
     if let Some(spec) = SEVERAL.iter().find(|g| g.name == name) {
         return Some(run_several(machine, spec, out));
@@ -1669,6 +1675,310 @@ fn check_debug(m: &GuestMemory, stopped: &Stopped, vmx: bool) -> core::result::R
                      no bit, after it -- and it ran on to its halt"))
 }
 
+/* ---- dr: a guest's DR0-DR3 its own ---- */
+
+const DR_NAME: &str = "dr";
+const DR_ABOUT: &str = "two VMs on one CPU, one after the other: each reads DR0-DR3 as it starts, writes a pattern \
+                        of its own into them and reads it back, and sets a breakpoint on an instruction of its own \
+                        -- neither reads the other's, and each one's breakpoint fires";
+
+/* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #DB
+ * handler counts each, keeps DR6 and where it returns to, and turns the
+ * breakpoints off -- an execution breakpoint is a fault, and its
+ * instruction would raise it again. It reads DR0-DR3 as it starts; writes a
+ * pattern of its own into them -- the host's word at +0x100 and the three
+ * after it -- through four registers, and reads it back through a fifth;
+ * points DR0 at its breakpoint, the host's word at +0x108 -- one of the two
+ * `ret`s, each VM's its own -- arms it in DR7 for execution and calls it --
+ * a #DB at the `ret`, before it runs -- then reads DR0 once more, leaves its
+ * mark and halts. An execution breakpoint rather than a data one: QEMU
+ * 10.2's TCG never gets past a store a data breakpoint watches in a nested
+ * guest -- it retries the store for good, takes no interrupt, and the host
+ * has lost the CPU -- with these registers the guest's or the CPU's.
+ * Assembled from this source with clang, the offsets in the comments its
+ * listing's. */
+const DR_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0xE5, 0x00, 0x00, 0x00,               // 00: start: lea rax, [rip + db] ; gate 1, #DB
+    0xBF, 0x10, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA010
+    0xE8, 0xB5, 0x00, 0x00, 0x00,                           // 0c: call gate
+    0x0F, 0x01, 0x1D, 0x0A, 0x01, 0x00, 0x00,               // 11: lidt [rip + idtr]
+    0x0F, 0x21, 0xC0,                                       // 18: mov rax, dr0 ; DR0-DR3 as the CPU starts: 0
+    0x48, 0x89, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,         // 1b: mov [0x7000], rax
+    0x0F, 0x21, 0xC8,                                       // 23: mov rax, dr1
+    0x48, 0x89, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,         // 26: mov [0x7008], rax
+    0x0F, 0x21, 0xD0,                                       // 2e: mov rax, dr2
+    0x48, 0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,         // 31: mov [0x7010], rax
+    0x0F, 0x21, 0xD8,                                       // 39: mov rax, dr3
+    0x48, 0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,         // 3c: mov [0x7018], rax
+    0x48, 0x8B, 0x1C, 0x25, 0x00, 0x71, 0x00, 0x00,         // 44: mov rbx, [0x7100] ; a pattern of its own into them
+    0x0F, 0x23, 0xC3,                                       // 4c: mov dr0, rbx
+    0x48, 0x8D, 0x4B, 0x01,                                 // 4f: lea rcx, [rbx + 1]
+    0x0F, 0x23, 0xC9,                                       // 53: mov dr1, rcx
+    0x48, 0x8D, 0x53, 0x02,                                 // 56: lea rdx, [rbx + 2]
+    0x0F, 0x23, 0xD2,                                       // 5a: mov dr2, rdx
+    0x4C, 0x8D, 0x4B, 0x03,                                 // 5d: lea r9, [rbx + 3]
+    0x41, 0x0F, 0x23, 0xD9,                                 // 61: mov dr3, r9
+    0x41, 0x0F, 0x21, 0xC2,                                 // 65: mov r10, dr0 ; and back, through R10
+    0x4C, 0x89, 0x14, 0x25, 0x20, 0x70, 0x00, 0x00,         // 69: mov [0x7020], r10
+    0x41, 0x0F, 0x21, 0xCA,                                 // 71: mov r10, dr1
+    0x4C, 0x89, 0x14, 0x25, 0x28, 0x70, 0x00, 0x00,         // 75: mov [0x7028], r10
+    0x41, 0x0F, 0x21, 0xD2,                                 // 7d: mov r10, dr2
+    0x4C, 0x89, 0x14, 0x25, 0x30, 0x70, 0x00, 0x00,         // 81: mov [0x7030], r10
+    0x41, 0x0F, 0x21, 0xDA,                                 // 89: mov r10, dr3
+    0x4C, 0x89, 0x14, 0x25, 0x38, 0x70, 0x00, 0x00,         // 8d: mov [0x7038], r10
+    0x48, 0x8B, 0x3C, 0x25, 0x08, 0x71, 0x00, 0x00,         // 95: mov rdi, [0x7108] ; its breakpoint: one of the two rets
+    0x0F, 0x23, 0xC7,                                       // 9d: mov dr0, rdi
+    0xB8, 0x01, 0x04, 0x00, 0x00,                           // a0: mov eax, 0x401 ; DR7: L0, on execution
+    0x0F, 0x23, 0xF8,                                       // a5: mov dr7, rax
+    0xFF, 0xD7,                                             // a8: call rdi ; a #DB at the ret, before it runs
+    0x0F, 0x21, 0xC0,                                       // aa: mov rax, dr0
+    0x48, 0x89, 0x04, 0x25, 0x58, 0x70, 0x00, 0x00,         // ad: mov [0x7058], rax
+    0xC7, 0x04, 0x25, 0x60, 0x70, 0x00, 0x00,               // b5: mov dword [0x7060], 'DREG'
+    0x44, 0x52, 0x45, 0x47,
+    0xFA,                                                   // c0: cli
+    0xF4,                                                   // c1: dead: hlt
+    0xEB, 0xFD,                                             // c2: jmp dead
+    0xC3,                                                   // c4: ret_a: ret ; vm A's breakpoint
+    0xC3,                                                   // c5: ret_b: ret ; vm B's
+    0x66, 0x89, 0x07,                                       // c6: gate: mov word [rdi], ax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // c9: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // cf: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // d5: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // d9: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // dd: shr rax, 16
+    0x89, 0x47, 0x08,                                       // e1: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // e4: mov dword [rdi + 12], 0
+    0xC3,                                                   // eb: ret
+    0x50,                                                   // ec: db: push rax
+    0x53,                                                   // ed: push rbx
+    0x48, 0xFF, 0x04, 0x25, 0x40, 0x70, 0x00, 0x00,         // ee: inc qword [0x7040] ; how many
+    0x0F, 0x21, 0xF3,                                       // f6: mov rbx, dr6
+    0x48, 0x89, 0x1C, 0x25, 0x48, 0x70, 0x00, 0x00,         // f9: mov [0x7048], rbx
+    0x48, 0x8B, 0x5C, 0x24, 0x10,                           // 101: mov rbx, [rsp + 16] ; where it returns to: the ret
+    0x48, 0x89, 0x1C, 0x25, 0x50, 0x70, 0x00, 0x00,         // 106: mov [0x7050], rbx
+    0xBB, 0xF0, 0x0F, 0xFF, 0xFF,                           // 10e: mov ebx, 0xFFFF0FF0
+    0x0F, 0x23, 0xF3,                                       // 113: mov dr6, rbx ; for the next
+    0xBB, 0x00, 0x04, 0x00, 0x00,                           // 116: mov ebx, 0x400
+    0x0F, 0x23, 0xFB,                                       // 11b: mov dr7, rbx ; off, or the ret faults again
+    0x5B,                                                   // 11e: pop rbx
+    0x58,                                                   // 11f: pop rax
+    0x48, 0xCF,                                             // 120: iretq
+    0x1F, 0x00,                                             // 122: idtr: dw 0x1F ; two gates
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
+];
+
+/* What the guest leaves at `RESULTS`: DR0-DR3 as it started at +0, as it
+ * read them back at +0x20, the #DBs its handler took at +0x40, the DR6 and
+ * where the last returned to at +0x48 and +0x50, DR0 at the end at +0x58,
+ * and 'DREG' at +0x60 once done; and what the host gives it, at +0x100 and
+ * +0x108. */
+const DR_FIRST: u64 = RESULTS;
+const DR_BACK: u64 = RESULTS + 0x20;
+const DR_COUNT: u64 = RESULTS + 0x40;
+const DR_DR6: u64 = RESULTS + 0x48;
+const DR_RETURN: u64 = RESULTS + 0x50;
+const DR_LAST: u64 = RESULTS + 0x58;
+const DR_DONE: u64 = RESULTS + 0x60;
+const DR_MARK: u32 = u32::from_le_bytes(*b"DREG");
+const DR_PATTERN: u64 = RESULTS + 0x100;
+const DR_BREAK: u64 = RESULTS + 0x108;
+/// The two `ret`s, one each VM's breakpoint: in a place of its own, so that
+/// a breakpoint left at the other's would not fire.
+const DR_RET_A: u64 = ENTRY + 0xC4;
+const DR_RET_B: u64 = ENTRY + 0xC5;
+/// DR6's bit for a breakpoint of DR0's.
+const DR6_B0: u64 = 1 << 0;
+/// The `mov`s of DR0-DR3 each VM makes: four reads, four writes, the four
+/// read back, DR0 pointed at its breakpoint and read at the end.
+const DR_MOVES: u64 = 14;
+/// The two VMs: the first word of each one's pattern -- a kernel's
+/// address, nothing a CPU out of reset holds -- and its breakpoint.
+const DR_VMS: [(u64, u64); 2] = [(0xFFFF_FFFF_8100_0000, DR_RET_A), (0xFFFF_FFFF_8200_0000, DR_RET_B)];
+const DR_BUDGET_MS: u64 = 10_000;
+
+/// What one VM of the dr guest did: where it ran, what the run loop
+/// counted, how it stopped, and what it left.
+struct DrRun {
+    cpu: Option<u32>,
+    us: u64,
+    counts: Counts,
+    stopped: Stopped,
+    /// Its VMCB asked the CPU to stop it at every read and write of
+    /// DR0-DR3.
+    asked: bool,
+    first: [u64; 4],
+    back: [u64; 4],
+    count: u64,
+    dr6: u64,
+    returned: u64,
+    last: u64,
+    done: u32,
+}
+
+/// Run one VM of the dr guest, with `pattern` and the breakpoint `at` its
+/// own, on the CPU this runs on.
+fn run_dr_vm(machine: &Arc<Machine>, pattern: u64, at: u64) -> core::result::Result<DrRun, String> {
+    let made = |e: hvarch::Error| alloc::format!("could not be made: {}", e);
+    let Some(doorbells) = Doorbells::new(1) else { return Err(String::from("out of memory")) };
+    let (guest, mut cpus) = LinuxGuest::new(machine, MEMORY, 1, Arc::new(doorbells), false, false).map_err(made)?;
+    let Some(mut bsp) = cpus.pop() else { return Err(String::from("no CPU")) };
+    let m = guest.memory();
+    one_cpu_board(m, &mut bsp, DR_CODE)
+        .and_then(|_| m.write_obj(DR_PATTERN, &pattern))
+        .and_then(|_| m.write_obj(DR_BREAK, &at))
+        .map_err(made)?;
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(DR_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    use hvarch::x86::svm::vmcb::intercept::dr::{READ_DR0_3, WRITE_DR0_3};
+    let asked = matches!(&*bsp.backend_mut(), Backend::Svm(v)
+        if v.control().intercept_dr & (READ_DR0_3 | WRITE_DR0_3) == READ_DR0_3 | WRITE_DR0_3);
+    drop(bsp);
+    let us = time::boot_time_ns().saturating_sub(start) / kcore::consts::NS_PER_US;
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    let cpu = guest.cpu_states().first().and_then(|&(_, h)| h);
+    let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
+    let qword = |at: u64| m.read_obj::<u64>(at).map_err(unread);
+    let four = |at: u64| -> core::result::Result<[u64; 4], String> {
+        Ok([qword(at)?, qword(at + 8)?, qword(at + 16)?, qword(at + 24)?])
+    };
+    Ok(DrRun {
+        cpu,
+        us,
+        counts,
+        stopped,
+        asked,
+        first: four(DR_FIRST)?,
+        back: four(DR_BACK)?,
+        count: qword(DR_COUNT)?,
+        dr6: qword(DR_DR6)?,
+        returned: qword(DR_RETURN)?,
+        last: qword(DR_LAST)?,
+        done: m.read_obj::<u32>(DR_DONE).map_err(unread)?,
+    })
+}
+
+/// Run the dr guest: two VMs of one CPU each, one after the other on the
+/// CPU this runs on, through the run loop a Linux guest's go through.
+fn run_dr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", DR_NAME, DR_ABOUT);
+    let vmx = matches!(machine.ext(), Ok(hvarch::Ext::Vmx));
+    let mut runs = alloc::vec::Vec::new();
+    for &(pattern, at) in DR_VMS.iter() {
+        match run_dr_vm(machine, pattern, at) {
+            Ok(run) => {
+                if let GuestStop::Refused(Refusal::NotOn(cpu)) = run.stopped.stop {
+                    let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first",
+                                     DR_NAME, cpu);
+                    return false;
+                }
+                runs.push(run);
+            }
+            Err(why) => {
+                let _ = writeln!(out, "hv: guest {} FAILED -- {}", DR_NAME, why);
+                return false;
+            }
+        }
+    }
+    let [a, b] = runs.as_slice() else {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {} VMs run, not two", DR_NAME, runs.len());
+        return false;
+    };
+    let on = |c: Option<u32>| c.map_or(String::from("no cpu"), |c| alloc::format!("cpu {}", c));
+    let _ = writeln!(out, "  ran on     {}, {} us -- vm A; vm B on {}, {} us", on(a.cpu), a.us, on(b.cpu), b.us);
+    let _ = writeln!(out, "  exits      {} and {}, {} and {} of DR0-DR3 performed, {} and {} exceptions given back",
+                     a.counts.exits, b.counts.exits, a.counts.dr, b.counts.dr, a.counts.reflected,
+                     b.counts.reflected);
+    let (mut says_a, mut says_b) = (String::new(), String::new());
+    let _ = describe_stop(&a.stopped.stop, &mut says_a);
+    let _ = describe_stop(&b.stopped.stop, &mut says_b);
+    let _ = writeln!(out, "  stopped    vm A {}; vm B {}", says_a, says_b);
+
+    match check_dr(a, b, vmx) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", DR_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", DR_NAME, why);
+            for (name, run) in [("A", a), ("B", b)] {
+                let _ = writeln!(out, "  vm {}'s cpu {} as it stopped:", name, run.stopped.cpu);
+                let _ = out.write_str(&run.stopped.dump);
+            }
+            false
+        }
+    }
+}
+
+/// Under AMD-V: both VMs ran on one CPU -- where the first's addresses would
+/// be the second's to read, were the CPU's DR0-DR3 the guests' -- each to
+/// its halt; each read 0 in all four as it started, the second where the
+/// first had left its own; each read back the pattern it wrote; each one's
+/// breakpoint, at an address of its own, fired once -- DR6.B0, at its `ret`
+/// -- which only DR0 made its own before its entry can do; and each VMCB
+/// asked to stop every `mov` of DR0-DR3, every one performed by the host.
+/// Under VT-x, which does not keep a guest's four apart yet: what the second
+/// read is said, and nothing is held to it.
+fn check_dr(a: &DrRun, b: &DrRun, vmx: bool) -> core::result::Result<String, String> {
+    if vmx {
+        return Ok(alloc::format!("VT-x does not keep a guest's DR0-DR3 apart yet: vm B read {} as it started",
+                                 dr_four(&b.first)));
+    }
+    if a.cpu.is_none() || a.cpu != b.cpu {
+        return Err(alloc::format!("the VMs ran on {:?} and {:?}: not one CPU, where the first's registers would be \
+                                   the second's", a.cpu, b.cpu));
+    }
+    /* Each property for both VMs before the next: what each was to see --
+     * 0 where the other had left its own -- before how the host made it so,
+     * so that a world switch which does not keep them apart is told by that
+     * and not by its mechanism. */
+    let runs = [("A", a, DR_VMS[0]), ("B", b, DR_VMS[1])];
+    for (name, run, _) in runs {
+        if !matches!(run.stopped.stop, GuestStop::Halted { .. }) || run.done != DR_MARK {
+            return Err(alloc::format!("vm {} did not run to its halt: its mark is {:#x}", name, run.done));
+        }
+    }
+    for (name, run, _) in runs {
+        if run.first != [0; 4] {
+            return Err(alloc::format!("vm {} read DR0-DR3 {} as it started, not 0", name, dr_four(&run.first)));
+        }
+    }
+    for (name, run, (pattern, _)) in runs {
+        let want = [pattern, pattern + 1, pattern + 2, pattern + 3];
+        if run.back != want {
+            return Err(alloc::format!("vm {} read back {}, not the {} it wrote", name, dr_four(&run.back),
+                                      dr_four(&want)));
+        }
+    }
+    for (name, run, (_, at)) in runs {
+        if run.count != 1 || run.dr6 & DR6_B0 == 0 || run.returned != at || run.last != at
+            || run.counts.reflected != 1
+        {
+            return Err(alloc::format!("vm {}'s breakpoint at {:#x}: its handler ran {} times ({} given back), read \
+                                       DR6 {:#x} and returned to {:#x}, and DR0 was {:#x} at the end: wanted once, \
+                                       B0, and the breakpoint's address both", name, at, run.count,
+                                      run.counts.reflected, run.dr6, run.returned, run.last));
+        }
+    }
+    for (name, run, _) in runs {
+        if !run.asked || run.counts.dr != DR_MOVES || run.counts.dr_refused != 0 {
+            return Err(alloc::format!("vm {}'s VMCB asked to stop its movs of DR0-DR3: {}; {} performed and {} not \
+                                       made, where it made {}", name, run.asked, run.counts.dr,
+                                      run.counts.dr_refused, DR_MOVES));
+        }
+    }
+    Ok(alloc::format!("vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote -- \
+                       {} movs each, performed by the host -- and each one's breakpoint fired at its own address: \
+                       DR6.B0, at its ret", DR_MOVES))
+}
+
+/// Four registers' values, on one line.
+fn dr_four(r: &[u64; 4]) -> String {
+    alloc::format!("{:#x} {:#x} {:#x} {:#x}", r[0], r[1], r[2], r[3])
+}
+
 /* ---- cr4: the guest's CR4 its own to read, MCE the host's to keep ---- */
 
 const CR4_NAME: &str = "cr4";
@@ -1910,6 +2220,237 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
     } else {
         alloc::format!("it read back what it wrote, MCE cleared and then PGE set, {}", writes)
     })
+}
+
+/* ---- msr: the MSRs a guest is answered, a #GP for every other ---- */
+
+const MSR_NAME: &str = "msr";
+const MSR_ABOUT: &str = "a guest's MSRs: SPEC_CTRL and PRED_CMD, which its CPUID does not offer, an MSR nobody \
+                         names and MTRRs turned on, which nothing keeps, each a #GP; the machine-check registers \
+                         and the PAT answered; and CPUID with no speculation control and no PMU in it";
+
+/* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #GP
+ * handler counts each, keeps the MSR it was refused (ECX, eight at most)
+ * and its error code, and steps over the 2-byte `rdmsr` or `wrmsr` that
+ * raised it. It reads SPEC_CTRL and writes an IBPB to PRED_CMD; reads AMD's
+ * LS_CFG, which this policy names for no CPU; turns its MTRRs on,
+ * write-back; reads MCG_CAP, MCG_STATUS and the PAT; turns the MTRRs off --
+ * which they are; then asks CPUID for 0x8000_0008, 0xA, 0 and 1 -- and
+ * leaves its mark and halts. Assembled from this source with clang, the
+ * offsets in the comments its listing's. */
+const MSR_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0xF3, 0x00, 0x00, 0x00,               // 00: lea rax, [rip + gp] ; gate 13, #GP
+    0xBF, 0xD0, 0xA0, 0x00, 0x00,                           // 07: mov edi, 0xA0D0
+    0xE8, 0xC3, 0x00, 0x00, 0x00,                           // 0c: call gate
+    0x0F, 0x01, 0x1D, 0x13, 0x01, 0x00, 0x00,               // 11: lidt [rip + idtr]
+    0xB9, 0x48, 0x00, 0x00, 0x00,                           // 18: mov ecx, 0x48 ; SPEC_CTRL: #GP
+    0x0F, 0x32,                                             // 1d: rdmsr
+    0xB9, 0x49, 0x00, 0x00, 0x00,                           // 1f: mov ecx, 0x49 ; PRED_CMD, IBPB: #GP
+    0xB8, 0x01, 0x00, 0x00, 0x00,                           // 24: mov eax, 1
+    0x31, 0xD2,                                             // 29: xor edx, edx
+    0x0F, 0x30,                                             // 2b: wrmsr
+    0xB9, 0x20, 0x10, 0x01, 0xC0,                           // 2d: mov ecx, 0xC0011020 ; LS_CFG: #GP
+    0x0F, 0x32,                                             // 32: rdmsr
+    0xB9, 0xFF, 0x02, 0x00, 0x00,                           // 34: mov ecx, 0x2FF ; MTRRs on, write-back: #GP
+    0xB8, 0x06, 0x08, 0x00, 0x00,                           // 39: mov eax, 0x806
+    0x31, 0xD2,                                             // 3e: xor edx, edx
+    0x0F, 0x30,                                             // 40: wrmsr
+    0xB9, 0x79, 0x01, 0x00, 0x00,                           // 42: mov ecx, 0x179 ; MCG_CAP
+    0x0F, 0x32,                                             // 47: rdmsr
+    0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // 49: mov dword [0x7010], eax
+    0x89, 0x14, 0x25, 0x14, 0x70, 0x00, 0x00,               // 50: mov dword [0x7014], edx
+    0xB9, 0x7A, 0x01, 0x00, 0x00,                           // 57: mov ecx, 0x17A ; MCG_STATUS
+    0x0F, 0x32,                                             // 5c: rdmsr
+    0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,               // 5e: mov dword [0x7018], eax
+    0x89, 0x14, 0x25, 0x1C, 0x70, 0x00, 0x00,               // 65: mov dword [0x701C], edx
+    0xB9, 0x77, 0x02, 0x00, 0x00,                           // 6c: mov ecx, 0x277 ; the PAT
+    0x0F, 0x32,                                             // 71: rdmsr
+    0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,               // 73: mov dword [0x7020], eax
+    0x89, 0x14, 0x25, 0x24, 0x70, 0x00, 0x00,               // 7a: mov dword [0x7024], edx
+    0xB9, 0xFF, 0x02, 0x00, 0x00,                           // 81: mov ecx, 0x2FF ; MTRRs off, as they are
+    0x31, 0xC0,                                             // 86: xor eax, eax
+    0x31, 0xD2,                                             // 88: xor edx, edx
+    0x0F, 0x30,                                             // 8a: wrmsr
+    0xB8, 0x08, 0x00, 0x00, 0x80,                           // 8c: mov eax, 0x80000008
+    0x31, 0xC9,                                             // 91: xor ecx, ecx
+    0x0F, 0xA2,                                             // 93: cpuid
+    0x89, 0x1C, 0x25, 0x28, 0x70, 0x00, 0x00,               // 95: mov dword [0x7028], ebx
+    0xB8, 0x0A, 0x00, 0x00, 0x00,                           // 9c: mov eax, 0xA
+    0x31, 0xC9,                                             // a1: xor ecx, ecx
+    0x0F, 0xA2,                                             // a3: cpuid
+    0x89, 0x04, 0x25, 0x2C, 0x70, 0x00, 0x00,               // a5: mov dword [0x702C], eax
+    0x31, 0xC0,                                             // ac: xor eax, eax
+    0x0F, 0xA2,                                             // ae: cpuid
+    0x89, 0x04, 0x25, 0x30, 0x70, 0x00, 0x00,               // b0: mov dword [0x7030], eax
+    0xB8, 0x01, 0x00, 0x00, 0x00,                           // b7: mov eax, 1
+    0x0F, 0xA2,                                             // bc: cpuid
+    0x89, 0x0C, 0x25, 0x34, 0x70, 0x00, 0x00,               // be: mov dword [0x7034], ecx
+    0xC7, 0x04, 0x25, 0x38, 0x70, 0x00, 0x00,               // c5: mov dword [0x7038], 'MSR!'
+    0x4D, 0x53, 0x52, 0x21,
+    0xFA,                                                   // d0: cli
+    0xF4,                                                   // d1: .dead: hlt
+    0xEB, 0xFD,                                             // d2: jmp .dead
+    0x66, 0x89, 0x07,                                       // d4: gate: mov word [rdi], ax ; an interrupt gate for rax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // d7: mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // dd: mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // e3: shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // e7: mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // eb: shr rax, 16
+    0x89, 0x47, 0x08,                                       // ef: mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // f2: mov dword [rdi + 12], 0
+    0xC3,                                                   // f9: ret
+    0x50,                                                   // fa: gp: push rax
+    0x8B, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // fb: mov eax, dword [0x7000] ; how many so far
+    0x83, 0xE0, 0x07,                                       // 102: and eax, 7
+    0x89, 0x0C, 0x85, 0x40, 0x70, 0x00, 0x00,               // 105: mov dword [0x7040 + rax * 4], ecx ; which MSR
+    0xFF, 0x04, 0x25, 0x00, 0x70, 0x00, 0x00,               // 10c: inc dword [0x7000]
+    0x8B, 0x44, 0x24, 0x08,                                 // 113: mov eax, dword [rsp + 8] ; its error code
+    0x89, 0x04, 0x25, 0x04, 0x70, 0x00, 0x00,               // 117: mov dword [0x7004], eax
+    0x48, 0x83, 0x44, 0x24, 0x10, 0x02,                     // 11e: add qword [rsp + 16], 2 ; past the rdmsr or wrmsr
+    0x58,                                                   // 124: pop rax
+    0x48, 0x83, 0xC4, 0x08,                                 // 125: add rsp, 8 ; the error code
+    0x48, 0xCF,                                             // 129: iretq
+    0xDF, 0x00,                                             // 12b: idtr: dw 0xDF ; fourteen gates
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
+];
+
+/* What the guest leaves at `RESULTS`: the #GPs its handler took at +0, the
+ * last one's error code at +4; MCG_CAP, MCG_STATUS and the PAT at +0x10,
+ * +0x18 and +0x20; CPUID 0x8000_0008's EBX, 0xA's EAX, 0's EAX and 1's ECX
+ * at +0x28 on; 'MSR!' at +0x38 once done; and the MSR of each #GP, in turn,
+ * at +0x40. */
+const MSR_GPS: u64 = RESULTS;
+const MSR_ERROR: u64 = RESULTS + 0x4;
+const MSR_MCG_CAP: u64 = RESULTS + 0x10;
+const MSR_MCG_STATUS: u64 = RESULTS + 0x18;
+const MSR_PAT: u64 = RESULTS + 0x20;
+const MSR_EXT8_EBX: u64 = RESULTS + 0x28;
+const MSR_PMU_EAX: u64 = RESULTS + 0x2C;
+const MSR_TOP: u64 = RESULTS + 0x30;
+const MSR_LEAF1_ECX: u64 = RESULTS + 0x34;
+const MSR_DONE: u64 = RESULTS + 0x38;
+const MSR_REFUSALS: u64 = RESULTS + 0x40;
+const MSR_MARK: u32 = u32::from_le_bytes(*b"MSR!");
+/// The MSRs it is refused, in turn: SPEC_CTRL, PRED_CMD, LS_CFG and the
+/// MTRRs' default type, written with them on.
+const MSR_REFUSED: [u32; 4] = [0x48, 0x49, 0xC001_1020, 0x2FF];
+/// What it reads of MSRs, and writes: five and three.
+const MSR_READS: u64 = 5;
+const MSR_WRITES: u64 = 3;
+/// What a guest is not told of in 0x8000_0008's EBX: INVLPGB, IBPB, IBRS,
+/// STIBP, SSBD, VIRT_SSBD and PSFD -- each the host's to back, and none
+/// backed.
+const MSR_SPECULATION: u32 = (1 << 3) | (1 << 12) | (1 << 14) | (1 << 15) | (1 << 24) | (1 << 25) | (1 << 28);
+/// The highest basic leaf a guest may be told of, and leaf 1's hypervisor
+/// bit.
+const MSR_BASIC_TOP: u32 = 0x16;
+const MSR_HYPERVISOR: u32 = 1 << 31;
+const MSR_BUDGET_MS: u64 = 10_000;
+
+/// Run the msr guest: one CPU, through the run loop a Linux guest's go
+/// through, where every MSR but the three segment bases stops it.
+fn run_msr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", MSR_NAME, MSR_ABOUT);
+    let fail = |out: &mut dyn Write, why: &str| {
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", MSR_NAME, why);
+        false
+    };
+    let Some(doorbells) = Doorbells::new(1) else { return fail(out, "out of memory") };
+    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 1, Arc::new(doorbells), false, false) {
+        Ok(made) => made,
+        Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
+    };
+    let Some(mut bsp) = cpus.pop() else { return fail(out, "no CPU") };
+    if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, MSR_CODE) {
+        return fail(out, &alloc::format!("could not be made: {}", e));
+    }
+    let start = time::boot_time_ns();
+    let deadline = start.saturating_add(MSR_BUDGET_MS * kcore::consts::NS_PER_MS);
+    let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
+    drop(bsp);
+    let ns = time::boot_time_ns().saturating_sub(start);
+    let stopped = guest.take_stopped()
+        .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
+    if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", MSR_NAME, cpu);
+        return false;
+    }
+    let host = guest.cpu_states().first().and_then(|&(_, h)| h);
+    match host {
+        Some(h) => { let _ = writeln!(out, "  ran on     cpu {}, {} us", h, ns / kcore::consts::NS_PER_US); }
+        None => { let _ = writeln!(out, "  ran on     no cpu, {} us", ns / kcore::consts::NS_PER_US); }
+    }
+    let _ = writeln!(out, "  exits      {}, {} rdmsr, {} wrmsr, {} refused", counts.exits, counts.msr_read,
+                     counts.msr_write, counts.msr_gp);
+    let mut says = String::new();
+    let _ = describe_stop(&stopped.stop, &mut says);
+    let _ = writeln!(out, "  stopped    {}", says);
+
+    match check_msr(guest.memory(), &stopped, &counts, &guest.msr_faults()) {
+        Ok(checked) => {
+            let _ = writeln!(out, "  checked    {}", checked);
+            let _ = writeln!(out, "hv: guest {} ok", MSR_NAME);
+            true
+        }
+        Err(why) => {
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", MSR_NAME, why);
+            let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
+            let _ = out.write_str(&stopped.dump);
+            false
+        }
+    }
+}
+
+/// The msr guest's four refusals, in turn and each its own handler's, with
+/// no error code; what it was answered; and what CPUID told it -- on either
+/// backend, whose MSR exits both come to the same policy.
+fn check_msr(m: &GuestMemory, stopped: &Stopped, counts: &Counts, faults: &[(u32, u64, bool)])
+    -> core::result::Result<String, String>
+{
+    let unread = |e: hvarch::Error| alloc::format!("its results cannot be read: {}", e);
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let done = m.read_obj::<u32>(MSR_DONE).map_err(unread)?;
+    if done != MSR_MARK {
+        return Err(alloc::format!("its mark is {:#x}", done));
+    }
+    let gps = m.read_obj::<u32>(MSR_GPS).map_err(unread)?;
+    let error = m.read_obj::<u32>(MSR_ERROR).map_err(unread)?;
+    let mut refused = [0u32; MSR_REFUSED.len()];
+    for (i, r) in refused.iter_mut().enumerate() {
+        *r = m.read_obj::<u32>(MSR_REFUSALS + 4 * i as u64).map_err(unread)?;
+    }
+    if gps as usize != MSR_REFUSED.len() || refused != MSR_REFUSED || error != 0 {
+        return Err(alloc::format!("its #GPs were {}, at MSRs {:#x?}, the last's error code {:#x}: wanted {:#x?} \
+                                   and 0", gps, refused, error, MSR_REFUSED));
+    }
+    let host_saw: alloc::vec::Vec<u32> = faults.iter().map(|&(msr, _, _)| msr).collect();
+    if counts.msr_gp != MSR_REFUSED.len() as u64 || host_saw != MSR_REFUSED
+        || counts.msr_read != MSR_READS || counts.msr_write != MSR_WRITES {
+        return Err(alloc::format!("the host refused {} MSRs ({:#x?}) of {} reads and {} writes: wanted {:#x?} of {} \
+                                   and {}", counts.msr_gp, host_saw, counts.msr_read, counts.msr_write, MSR_REFUSED,
+                                  MSR_READS, MSR_WRITES));
+    }
+    let mcg_cap = m.read_obj::<u64>(MSR_MCG_CAP).map_err(unread)?;
+    let mcg_status = m.read_obj::<u64>(MSR_MCG_STATUS).map_err(unread)?;
+    let pat = m.read_obj::<u64>(MSR_PAT).map_err(unread)?;
+    if mcg_cap != 0 || mcg_status != 0 || pat != crate::svm::PAT_RESET {
+        return Err(alloc::format!("it read MCG_CAP {:#x}, MCG_STATUS {:#x} and the PAT {:#x}: wanted no banks, \
+                                   nothing to report and {:#x}", mcg_cap, mcg_status, pat, crate::svm::PAT_RESET));
+    }
+    let ext8_ebx = m.read_obj::<u32>(MSR_EXT8_EBX).map_err(unread)?;
+    let pmu = m.read_obj::<u32>(MSR_PMU_EAX).map_err(unread)?;
+    let top = m.read_obj::<u32>(MSR_TOP).map_err(unread)?;
+    let leaf1_ecx = m.read_obj::<u32>(MSR_LEAF1_ECX).map_err(unread)?;
+    if ext8_ebx & MSR_SPECULATION != 0 || pmu != 0 || top > MSR_BASIC_TOP || leaf1_ecx & MSR_HYPERVISOR == 0 {
+        return Err(alloc::format!("CPUID told it 0x8000_0008 EBX {:#x}, 0xA EAX {:#x}, a top of {:#x} and leaf 1 ECX \
+                                   {:#x}: wanted none of {:#x}, no PMU, no higher than {:#x} and the hypervisor bit",
+                                  ext8_ebx, pmu, top, leaf1_ecx, MSR_SPECULATION, MSR_BASIC_TOP));
+    }
+    Ok(String::from("SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took; MCG_CAP, \
+                     MCG_STATUS and the PAT answered; CPUID offers no speculation control and no PMU, and says a \
+                     hypervisor is there"))
 }
 
 /* The guests' machine: 1 MiB of memory with a GDT, a TSS and a page table

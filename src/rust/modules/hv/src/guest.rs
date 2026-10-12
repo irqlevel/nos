@@ -13,9 +13,8 @@ use alloc::sync::Arc;
 
 use hv::linux::Header;
 use hv::run::{Counts, GuestCpu, Host, LinuxGuest, Stop, Stopped, MAX_DISKS};
-use hv::topology::Topology;
 use hv::{Doorbells, Machine};
-use kcore::consts::{MAX_CPUS, NS_PER_MS};
+use kcore::consts::{NS_PER_MS, NS_PER_SEC};
 use kcore::sync::Mutex;
 
 use crate::disk::{FileDisk, Runner};
@@ -320,88 +319,6 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     Ok(Built { guest, cpus })
 }
 
-/// How many vCPUs run on the core CPU `cpu` is a thread of: on it and on its
-/// SMT siblings, with whom a vCPU there shares the core's execution units.
-fn core_load(topo: &Topology, cpu: u32, load: &[u32; MAX_CPUS]) -> u32 {
-    let core = topo.core(cpu);
-    (0..MAX_CPUS as u32).filter(|&c| topo.core(c) == core).map(|c| load[c as usize]).sum()
-}
-
-/// The CPU a vCPU is to run on: `wanted` if the extension is on there, else
-/// the CPU the extension is on for whose core has fewest vCPUs already, and
-/// of those the CPU itself (`load` counts them, by CPU) -- the higher of any
-/// two that tie: CPU 0 is where the boot CPU's own work runs, and the last
-/// to be given a guest.
-pub fn pick_cpu(machine: &Machine, wanted: Option<u32>, load: &[u32; MAX_CPUS]) -> Result<u32, String> {
-    let enabled = machine.enabled_mask();
-    if enabled == 0 {
-        return Err(String::from("the extension is on for no CPU -- hv on first"));
-    }
-    if let Some(cpu) = wanted {
-        if (cpu as usize) < MAX_CPUS && enabled & (1u64 << cpu) != 0 {
-            return Ok(cpu);
-        }
-        return Err(alloc::format!("the extension is not on for cpu {}", cpu));
-    }
-    let topo = Topology::host();
-    let mut best: Option<(u32, (u32, u32))> = None;
-    for cpu in 0..MAX_CPUS as u32 {
-        if enabled & (1u64 << cpu) == 0 {
-            continue;
-        }
-        let key = (core_load(&topo, cpu, load), load[cpu as usize]);
-        if best.map_or(true, |(_, k)| key <= k) {
-            best = Some((cpu, key));
-        }
-    }
-    best.map(|(cpu, _)| cpu).ok_or_else(|| String::from("the extension is on for no CPU -- hv on first"))
-}
-
-/// The host CPUs a guest of `cpus` CPUs runs on, its first CPU's first:
-/// that one by [`pick_cpu`], and each other on a CPU the extension is on
-/// for that none of the guest's has yet -- one whose core none of the
-/// guest's CPUs is on where there is one, since two threads of a core share
-/// its execution units; then one sharing the first's last-level cache, where
-/// the CPUs' lines and IPIs go no further; then the least loaded, as
-/// `pick_cpu` chooses. A guest's CPUs never share a host CPU -- one that
-/// spins waiting for another would hold the CPU the other needs to finish
-/// -- so a guest has at most as many as the extension is on for.
-pub fn pick_cpus(machine: &Machine, wanted: Option<u32>, cpus: u32, load: &[u32; MAX_CPUS])
-    -> Result<Vec<u32>, String>
-{
-    let enabled = machine.enabled_mask();
-    if cpus > enabled.count_ones() {
-        return Err(alloc::format!(
-            "{} cpus asked for, and the extension is on for {} -- each of a guest's CPUs runs on a host CPU of its own",
-            cpus, enabled.count_ones()));
-    }
-    let mut chosen = Vec::new();
-    chosen.try_reserve_exact(cpus as usize).map_err(|_| String::from("out of memory"))?;
-    let first = pick_cpu(machine, wanted, load)?;
-    chosen.push(first);
-    let mut load = *load;
-    load[first as usize] += 1;
-    let topo = Topology::host();
-    let home = topo.llc(first);
-    while chosen.len() < cpus as usize {
-        let mut best: Option<(u32, (bool, bool, u32, u32))> = None;
-        for cpu in 0..MAX_CPUS as u32 {
-            if enabled & (1u64 << cpu) == 0 || chosen.contains(&cpu) {
-                continue;
-            }
-            let shares_core = chosen.iter().any(|&c| topo.core(c) == topo.core(cpu));
-            let key = (shares_core, topo.llc(cpu) != home, core_load(&topo, cpu, &load), load[cpu as usize]);
-            if best.map_or(true, |(_, k)| key <= k) {
-                best = Some((cpu, key));
-            }
-        }
-        let (cpu, _) = best.ok_or_else(|| String::from("no host CPU left for the guest's next CPU"))?;
-        load[cpu as usize] += 1;
-        chosen.push(cpu);
-    }
-    Ok(chosen)
-}
-
 /// How a guest's run went: how it stopped, and what each of its CPUs
 /// counted, its first CPU's first.
 pub struct Ran {
@@ -540,6 +457,13 @@ pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
             }
             Ok(())
         }
+        Stop::DrInsn { rip, error, bytes } => {
+            write!(out, "a mov to or from DR0-DR3 at rip {:#x} not performed -- {}; its bytes", rip, error.describe())?;
+            for b in &bytes.b[..usize::from(bytes.len)] {
+                write!(out, " {:02x}", b)?;
+            }
+            Ok(())
+        }
         Stop::Exception { vector, rip } => write!(out, "exception {} at {:#x}", vector, rip),
         Stop::Refused(r) => write!(out, "not entered: {:?}", r),
         Stop::Invalid => write!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
@@ -575,6 +499,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     if total.cr4 != 0 {
         let _ = writeln!(out, "  cr4        {} reads and writes performed (AMD-V), {} writes refused with #GP",
             total.cr4, total.cr4_gp);
+    }
+    if total.dr != 0 {
+        let _ = writeln!(out, "  dr0-3      {} reads and writes of its own (AMD-V), {} not made: a #GP or a #DB in their place",
+            total.dr, total.dr_refused);
     }
     let absent = guest.absent_pages();
     if !absent.is_empty() {
@@ -787,19 +715,65 @@ impl Esc {
     }
 }
 
+/// The most lines of one guest's console the kernel log takes at once, and
+/// how many a second after that: the host's log -- dmesg, its serial line,
+/// netconsole on a box with no other console -- is the host's, and a guest
+/// that prints as fast as it can would otherwise have it for its own. A
+/// boot's worth goes through whole.
+const LOG_BURST: u64 = 1000;
+const LOG_LINES_PER_SEC: u64 = 50;
+
 /// A guest's console for the kernel log, a line at a time: printable ASCII
-/// only, escape sequences left out whole, the line cut at `LOG_LINE`. Its
-/// room is taken when it is made, so a byte never allocates.
+/// only, escape sequences left out whole, the line cut at `LOG_LINE`; and
+/// no more lines than `LOG_BURST` at once and `LOG_LINES_PER_SEC` after --
+/// what is left out is counted, for the caller to say. Its room is taken
+/// when it is made, so a byte never allocates.
 pub struct LogLine {
     text: String,
     esc: Esc,
+    /// Lines the log may take now, and when they were last topped up.
+    tokens: u64,
+    topped_at: u64,
+    /// Lines left out that no notice has said yet, and when the last notice
+    /// was given: one a second at most, so that saying what was left out
+    /// does not cost the log as many lines again.
+    dropped: u64,
+    told_at: u64,
 }
 
 impl LogLine {
     pub fn new() -> Option<LogLine> {
         let mut text = String::new();
         text.try_reserve_exact(LOG_LINE).ok()?;
-        Some(LogLine { text, esc: Esc::Text })
+        let now = kcore::time::boot_time_ns();
+        Some(LogLine { text, esc: Esc::Text, tokens: LOG_BURST, topped_at: now, dropped: 0, told_at: now })
+    }
+
+    /// Whether the line that ended goes to the kernel log, at `now`: Some,
+    /// with how many lines left out the caller is to say before it -- zero
+    /// but once a second at most -- or None, and it is one more left out.
+    pub fn admit(&mut self, now: u64) -> Option<u64> {
+        let earned = now.saturating_sub(self.topped_at).saturating_mul(LOG_LINES_PER_SEC) / NS_PER_SEC;
+        if earned != 0 {
+            self.tokens = self.tokens.saturating_add(earned).min(LOG_BURST);
+            self.topped_at = now;
+        }
+        if self.tokens == 0 {
+            self.dropped += 1;
+            return None;
+        }
+        self.tokens -= 1;
+        if self.dropped == 0 || now.saturating_sub(self.told_at) < NS_PER_SEC {
+            return Some(0);
+        }
+        self.told_at = now;
+        Some(core::mem::take(&mut self.dropped))
+    }
+
+    /// The lines left out that no notice has said yet: for the caller to say
+    /// at the end.
+    pub fn take_dropped(&mut self) -> u64 {
+        core::mem::take(&mut self.dropped)
     }
 
     /// Take a byte; true when it ended a line, which `text` then holds until

@@ -34,6 +34,8 @@ extern crate alloc;
 #[cfg(target_arch = "x86_64")]
 mod boot;
 #[cfg(target_arch = "x86_64")]
+mod cores;
+#[cfg(target_arch = "x86_64")]
 mod dhcp;
 #[cfg(target_arch = "x86_64")]
 mod disk;
@@ -57,7 +59,7 @@ use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|bench|boot|start|list|console|attach|send|exec|wait|restart|stop|forward|help] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|bench|boot|start|list|console|attach|send|exec|wait|restart|stop|forward|cores|help] - the CPU's virtualization extension, and guests under it";
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
@@ -77,6 +79,10 @@ hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [initrd=p
 hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself
+hv cores [own|shared]              whether a guest's cores are its own -- whole cores no
+                                   other guest has a CPU on, its CPUs filling their
+                                   threads, and refused where there are none -- or may be
+                                   shared; and which guests hold which CPUs
 hv list                            the started guests
 hv console <id> [bytes=N]          the end of one's console
 hv attach <id>                     its console, live, typed at -- ^] detaches (ssh -t)
@@ -99,6 +105,10 @@ struct State {
     machine: Arc<Machine>,
     #[cfg(target_arch = "x86_64")]
     vms: vms::Vms,
+    /// Which guests hold which host CPUs, and whether a guest's cores are
+    /// its own: what every Linux guest is placed by.
+    #[cfg(target_arch = "x86_64")]
+    cores: cores::Cores,
     #[cfg(target_arch = "x86_64")]
     forwards: forward::Forwards,
     /// Set as the module starts to go: an `hv boot` running then stops at
@@ -170,6 +180,8 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
         #[cfg(target_arch = "x86_64")]
         vms: vms::Vms::new().ok_or(kcore::error::Error::NoMemory)?,
         #[cfg(target_arch = "x86_64")]
+        cores: cores::Cores::new().ok_or(kcore::error::Error::NoMemory)?,
+        #[cfg(target_arch = "x86_64")]
         forwards: forward::Forwards::new().ok_or(kcore::error::Error::NoMemory)?,
         #[cfg(target_arch = "x86_64")]
         unloading: Arc::new(core::sync::atomic::AtomicBool::new(false)),
@@ -208,6 +220,22 @@ fn kernel_error(e: hv::Error) -> kcore::error::Error {
     }
 }
 
+/// `hv cores [own|shared]`: set the rule new guests are placed by, and say
+/// it and who holds what.
+#[cfg(target_arch = "x86_64")]
+fn cores_command(cores: &cores::Cores, word: Option<&str>, out: &mut Output) {
+    match word {
+        None => {}
+        Some("own") => cores.set_own(true),
+        Some("shared") => cores.set_own(false),
+        Some(other) => {
+            let _ = writeln!(out, "hv: cores own or cores shared, not \"{}\"", other);
+            return;
+        }
+    }
+    cores.report(out);
+}
+
 fn command(state: &State, args: &str, out: &mut Output) {
     let machine = &state.machine;
     /* The subcommand, and what follows it spaces and all: a command line, the
@@ -232,9 +260,11 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "bench" => bench(machine, words, out),
         #[cfg(target_arch = "x86_64")]
-        "boot" => boot::boot(machine, rest, &state.vms.load(), &state.unloading, state.vms.claims(), out),
+        "boot" => boot::boot(machine, rest, &state.cores, &state.unloading, state.vms.claims(), out),
         #[cfg(target_arch = "x86_64")]
-        "start" => state.vms.start(machine, rest, out),
+        "start" => state.vms.start(machine, &state.cores, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "cores" => cores_command(&state.cores, words.next(), out),
         #[cfg(target_arch = "x86_64")]
         "list" => state.vms.list(out),
         #[cfg(target_arch = "x86_64")]
@@ -255,7 +285,7 @@ fn command(state: &State, args: &str, out: &mut Output) {
         "forward" => forward_command(state, rest, out),
         #[cfg(not(target_arch = "x86_64"))]
         "boot" | "start" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart" | "stop" | "forward"
-        | "bench" => {
+        | "bench" | "cores" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {
@@ -302,6 +332,23 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
     }
 }
 
+/// What keeps one guest's speculation off the host and the next guest
+/// (`hv::spec`), and how often it was needed: AMD-V's.
+#[cfg(target_arch = "x86_64")]
+fn speculation(out: &mut Output) {
+    let (switches, barriers, ibpb, auto_ibrs) = hv::spec::report();
+    if ibpb {
+        let _ = writeln!(out, "hv: guests switched on a CPU {} times, an IBPB between each two ({} issued)",
+                         switches, barriers);
+    } else {
+        let _ = writeln!(out, "hv: guests switched on a CPU {} times; the CPU has no IBPB to put between them",
+                         switches);
+    }
+    if auto_ibrs {
+        let _ = writeln!(out, "hv: automatic IBRS on -- the host's indirect branches are not a guest's to steer");
+    }
+}
+
 fn status(machine: &Machine, out: &mut Output) {
     match machine.ext() {
         Ok(ext) => {
@@ -329,6 +376,10 @@ fn status(machine: &Machine, out: &mut Output) {
                 let _ = write!(out, "hv: WARNING -- off for cpu ");
                 write_mask(out, lost);
                 let _ = writeln!(out, " though this module turned it on: something turned it off behind its back");
+            }
+            #[cfg(target_arch = "x86_64")]
+            if ext.vendor() == hv::Vendor::Svm {
+                speculation(out);
             }
         }
         Err(e) => {

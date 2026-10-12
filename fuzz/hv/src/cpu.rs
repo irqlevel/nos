@@ -61,9 +61,9 @@ pub mod vmcb;
 
 pub mod x86 {
     pub mod cpu {
-        /// A host CPU's CPUID leaf, as policy.rs asks for one: made up from
-        /// the leaf, the same every time -- what the policy passes through
-        /// of it is the policy's business.
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// A host CPU's CPUID leaf, as policy.rs asks for one.
         #[derive(Clone, Copy, Debug)]
         pub struct CpuidResult {
             pub eax: u32,
@@ -79,17 +79,78 @@ pub mod x86 {
         /// no write at all.
         const AMD64_LEAF1_EDX: u32 = 0x078B_FBFD;
 
+        /// The host CPU the policy asks about: one an input, set before the
+        /// input makes a guest (`set_host`) -- which vendor's, the top of
+        /// each range of leaves, and every bit of every leaf made up from
+        /// it, so that over a campaign each bit is the host's now and then,
+        /// and the policy has to keep from a guest every one it does not
+        /// name.
+        static HOST: AtomicU64 = AtomicU64::new(0);
+
+        /// The tops of the basic and the extended range a host may have:
+        /// Zen 2's (0x10 and 0x8000_001F), Raptor Lake's (0x20 and
+        /// 0x8000_0008), Zen 4's (0x10 and 0x8000_0028), and around them --
+        /// below the policy's own tops and above.
+        const BASIC_TOPS: [u32; 6] = [0x0D, 0x10, 0x15, 0x16, 0x20, 0x28];
+        const EXT_TOPS: [u32; 5] = [0x8000_0008, 0x8000_001F, 0x8000_0021, 0x8000_0026, 0x8000_0028];
+
+        pub fn set_host(seed: u64) {
+            HOST.store(seed, Ordering::Relaxed);
+        }
+
+        fn host() -> u64 {
+            HOST.load(Ordering::Relaxed)
+        }
+
+        /// Whether this input's host is an Intel CPU; an AMD one otherwise.
+        pub fn host_is_intel() -> bool {
+            host() & 1 != 0
+        }
+
+        pub fn vendor_id() -> [u8; 12] {
+            if host_is_intel() { *b"GenuineIntel" } else { *b"AuthenticAMD" }
+        }
+
+        /// Whether the host runs its string instructions fast: an Intel
+        /// host's choice, made up with the rest of it.
+        pub fn fast_strings() -> bool {
+            host_is_intel() && host() & 2 != 0
+        }
+
+        /// The host's TSC: a count that goes up with every read.
+        pub fn rdtsc() -> u64 {
+            static TSC: AtomicU64 = AtomicU64::new(0);
+            TSC.fetch_add(1, Ordering::Relaxed)
+        }
+
+        /// The tops of this input's host's two ranges.
+        pub fn host_tops() -> (u32, u32) {
+            let h = host();
+            (BASIC_TOPS[(h >> 4) as usize % BASIC_TOPS.len()], EXT_TOPS[(h >> 8) as usize % EXT_TOPS.len()])
+        }
+
         pub fn cpuid_count(leaf: u32, sub: u32) -> Option<CpuidResult> {
-            let base = if leaf >= 0x8000_0000 { 0x8000_0000 } else { 0 };
-            if leaf - base > 0x28 {
+            let (basic_top, ext_top) = host_tops();
+            let (base, top) = if leaf >= 0x8000_0000 { (0x8000_0000, ext_top) } else { (0, basic_top) };
+            if leaf > top {
                 return None;
             }
-            let mut h = (u64::from(leaf) << 32 | u64::from(sub)) ^ 0x9E37_79B9_7F4A_7C15;
+            let mut h = (u64::from(leaf) << 32 | u64::from(sub)) ^ 0x9E37_79B9_7F4A_7C15 ^ host().rotate_left(17);
             let mut word = || {
                 h = (h ^ (h >> 31)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                h = h ^ (h >> 29);
                 h as u32
             };
             let mut r = CpuidResult { eax: word(), ebx: word(), ecx: word(), edx: word() };
+            if leaf == base {
+                /* The top of the range, and the vendor -- which AMD's
+                 * extended range says again and Intel's does not. */
+                let v = vendor_id();
+                let word = |i: usize| u32::from_le_bytes([v[i], v[i + 1], v[i + 2], v[i + 3]]);
+                let says = base == 0 || !host_is_intel();
+                r = CpuidResult { eax: top, ebx: if says { word(0) } else { 0 }, ecx: if says { word(8) } else { 0 },
+                                  edx: if says { word(4) } else { 0 } };
+            }
             if leaf == 1 {
                 r.edx |= AMD64_LEAF1_EDX;
             }
@@ -174,6 +235,7 @@ pub mod svm {
         Cr8 { write: bool, gpr: u8 },
         Cr0Write { value: u64 },
         Cr4 { write: bool },
+        Dr { write: bool, dr: u8 },
         Pause,
         Undefined,
         Other(u64),
@@ -272,6 +334,8 @@ pub mod vm {
         /// The CR4 the guest believes it has, as svm.rs keeps it: the
         /// register, `save.cr4`, has MCE besides.
         cr4: u64,
+        /// The guest's DR0-DR3, as svm.rs keeps them apart from the CPU's.
+        debug_addrs: [u64; 4],
     }
 
     impl Default for Backend {
@@ -295,6 +359,7 @@ pub mod vm {
                 taken: Vec::new(),
                 vmx: false,
                 cr4: 0,
+                debug_addrs: [0; 4],
             }
         }
 
@@ -345,6 +410,7 @@ pub mod vm {
             s.rsp = l.stack;
             s.rflags = 2;
             self.cr4 = CR4_PAE | CR4_MCE;
+            self.debug_addrs = [0; 4];
         }
 
         /// As svm.rs's: the CR4 the guest believes it has.
@@ -368,6 +434,18 @@ pub mod vm {
                        "CR4 written from {:#x} to {:#x}, and the guest's TLB not flushed", self.cr4, value);
             self.cr4 = value;
             self.save.cr4 = value | CR4_MCE;
+        }
+
+        /// As svm.rs's: the guest's DR0-DR3.
+        pub fn debug_addrs(&self) -> [u64; 4] {
+            self.debug_addrs
+        }
+
+        /// As svm.rs's: `addrs` the guest's DR0-DR3 -- under AMD-V alone,
+        /// the one backend that stops a guest at them.
+        pub fn set_debug_addrs(&mut self, addrs: [u64; 4]) {
+            invariant!(!self.vmx, "a debug register written for a guest under VT-x, which never stops one there");
+            self.debug_addrs = addrs;
         }
 
         fn step(&mut self, len: u64) {
@@ -432,6 +510,7 @@ pub mod vm {
             self.save.efer = 1 << 12;
             self.save.rflags = 2;
             self.cr4 = 0;
+            self.debug_addrs = [0; 4];
         }
         pub fn init_reset(&mut self) {
             self.event = None;
