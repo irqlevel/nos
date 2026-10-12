@@ -614,6 +614,14 @@ on on every entry, whatever the VMCB says:
   guest reads the register, MCE in it, and its writes are the host's all
   the same. Intercepting CR0's reads too would catch them there, and on a
   real CPU catch SMSW, which a guest's user process may run;
+- what of the guest's speculation the world switch can keep from the host
+  and from the next guest (`hvarch::x86::spec`): after the exit, the
+  guest's values cleared out of every register the run stub returns with,
+  and the return stack refilled before the host's first `ret` -- a guest's
+  return addresses left there would have the host's returns predicted to
+  them; before the entry, an IBPB where the guest is another than the last
+  on the CPU, told apart by its nested table's id, where the CPU has IBPB;
+  and automatic IBRS turned on with the extension, where the CPU has it;
 - the intercept of every read and write of DR0-DR3, and the CPU's four made
   the guest's own before each entry. The breakpoint addresses are the
   CPU's, not the VMCB's -- `vmrun` switches DR6 and DR7, not them -- so
@@ -899,9 +907,15 @@ And while a guest runs:
   million of them HLTs, became 76,334 and 11,410; the guest's timer ticks
   went from 11,973 to 11,943; the vCPU's task slept 89% of the run; and the
   QEMU process under it went from 106% of a host CPU to 46%.
-- **No speculative-execution mitigation yet**: no return-stack refill after
-  an exit, no IBPB between guests. What KVM does there matters before this
-  runs other people's guests, and is not done.
+- **Speculation, AMD-V's half of it** (`hvarch::x86::spec`): after every
+  exit the guest's values are cleared out of the registers the run stub
+  returns with, and the return stack is refilled before the host's first
+  `ret` -- 32 calls, KVM's fill; an IBPB goes between two guests on a CPU
+  where the CPU has one; and automatic IBRS is on while the extension is,
+  where the CPU has that (Zen 4 and later). `hv` counts the guests switched
+  on a CPU and the IBPBs between them. What is left of it, SRSO and
+  Retbleed among it, is item 1 of [Before other people's
+  guests](#before-other-peoples-guests).
 - Each entry reads `EFER` and `VM_HSAVE_PA` on the CPU, and checks the VMCB
   against the manual's rules, before `vmrun`.
 
@@ -3007,16 +3021,29 @@ someone else's; then speed.
 
 #### Before other people's guests
 
-1. **No speculative-execution mitigation at all** ([What the extension
-   costs](#what-the-extension-costs-while-it-is-on) says so of two). After
-   an exit there is no return-stack refill, and the guest's values are left
-   in the caller-saved registers the stubs return with; between two guests
-   on a CPU, no IBPB; the guest's SPEC_CTRL is not switched; no VERW where
-   MDS, TAA or RFDS apply (the EX44's E-cores have RFDS), no L1D flush where
-   L1TF does (the Dell), no BHI clearing; and the host itself is built
-   without retpolines, with neither eIBRS nor AutoIBRS turned on. Zen 2 (the
-   AX41) has BTI, Retbleed and SRSO; the i5-13500, BHI and RFDS; Skylake,
-   L1TF and MDS. KVM's set is the reference.
+1. **Speculative-execution mitigation: AMD-V's world switch done, the rest
+   not.** Done ([What entering a guest cannot be told to
+   do](#what-entering-a-guest-cannot-be-told-to-do)): after every exit the
+   guest's values are cleared out of the registers the run stub returns
+   with, and the return stack is refilled before the host's first `ret`;
+   an IBPB goes between two guests on a CPU where the CPU has one; and
+   automatic IBRS is on while the extension is where the CPU has that.
+   hv-test runs every built-in guest through the first two on CPU 0 and on
+   CPU 3, and holds `hv` to at least two switches between guests a guest,
+   each with an IBPB where the CPU offers one. QEMU's TCG offers neither
+   IBPB nor automatic IBRS, so those two writes have run on no machine yet;
+   the AX41's Zen 2, which has IBPB, is where the first will. What it was:
+   none of it, the guest's values left in the caller-saved registers the
+   stub returned with. Left: on Zen 1 to 4 (the AX41), SRSO and Retbleed,
+   which want the host's every `ret` through an untrained return thunk --
+   a compiler's job, for the whole kernel -- or an IBPB at every exit, and
+   BTI where there is no automatic IBRS, which wants the host built with
+   retpolines; a guest's own speculation control (IBRS, STIBP, SSBD, IBPB),
+   offered to none until its MSR is switched with it; and VT-x's half --
+   the registers and the return stack after an exit, IBPB, VERW where MDS,
+   TAA or RFDS apply (the EX44's E-cores have RFDS), an L1D flush where L1TF
+   does (the Dell), BHI clearing, eIBRS. The i5-13500 has BHI and RFDS;
+   Skylake, L1TF and MDS. KVM's set is the reference.
 2. ~~**The CPUID and MSR policy is a block-list, and it swallows.**~~ Done:
    both are allow-lists (`hv/src/policy.rs`, [A Linux
    guest](#a-linux-guest)). A leaf the policy does not name is all zeros,

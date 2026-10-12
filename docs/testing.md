@@ -1224,7 +1224,12 @@ before the entry, and with a load only when
 the guest's DR7 enabled a breakpoint as it was entered -- which a guest
 then enables without an exit -- the first VM's breakpoint never fired, on
 both CPUs. Under VT-x, which does not keep a guest's four apart yet, it
-says what the second read, and holds it to nothing. The unload
+says what the second read, and holds it to nothing. Under AMD-V `hv`, after both rounds, must count at least
+two switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
+after another guest's -- each with an IBPB where the CPU offers one, which
+QEMU's TCG does not, and `hv` must say so; every guest ran through the run
+stub's clearing of the registers and refill of the return stack after each
+exit. The unload
 that follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.
 
@@ -1383,7 +1388,14 @@ lines it pushed out, before the flood and after, the ring's slots added on
 top. Of the lines left out, nos says how many once a second at most, and
 each notice must name exactly the gaps in `seq`'s numbers since the one
 before, over what of the flood the ring still holds. And the guest's own
-console must keep the last line.
+console must keep the last line. Two of these are bound to time under TCG
+-- six resets in a minute, the flood within `--vm-secs` -- and with `--cpus
+2` a loaded machine fails them with or without the change under test: back
+to back on 2026-10-12, a build with and one without the speculation work
+failed the same three, the restarting guest never making six resets inside
+a minute in its 500 s, where the one build had passed all of them an hour
+before. Run it again on
+a quiet machine before reading a failure of those two as the change's.
 
 `--attach` is a boot of its own for `hv attach`: sshd and a guest started
 from `/etc/rc`, then an `ssh -tt ... hv attach 0` that types a line, waits

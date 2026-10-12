@@ -332,6 +332,23 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
     }
 }
 
+/// What keeps one guest's speculation off the host and the next guest
+/// (`hv::spec`), and how often it was needed: AMD-V's.
+#[cfg(target_arch = "x86_64")]
+fn speculation(out: &mut Output) {
+    let (switches, barriers, ibpb, auto_ibrs) = hv::spec::report();
+    if ibpb {
+        let _ = writeln!(out, "hv: guests switched on a CPU {} times, an IBPB between each two ({} issued)",
+                         switches, barriers);
+    } else {
+        let _ = writeln!(out, "hv: guests switched on a CPU {} times; the CPU has no IBPB to put between them",
+                         switches);
+    }
+    if auto_ibrs {
+        let _ = writeln!(out, "hv: automatic IBRS on -- the host's indirect branches are not a guest's to steer");
+    }
+}
+
 fn status(machine: &Machine, out: &mut Output) {
     match machine.ext() {
         Ok(ext) => {
@@ -359,6 +376,10 @@ fn status(machine: &Machine, out: &mut Output) {
                 let _ = write!(out, "hv: WARNING -- off for cpu ");
                 write_mask(out, lost);
                 let _ = writeln!(out, " though this module turned it on: something turned it off behind its back");
+            }
+            #[cfg(target_arch = "x86_64")]
+            if ext.vendor() == hv::Vendor::Svm {
+                speculation(out);
             }
         }
         Err(e) => {

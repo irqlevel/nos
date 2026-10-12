@@ -82,6 +82,10 @@ pub use devices::net as nic;
 /// its guest and take it, rather than wait for the host's next interrupt.
 #[cfg(target_arch = "x86_64")]
 pub use hvarch::x86::svm::Kick;
+/// What keeps a guest's speculation off the host and the next guest, and
+/// what of it this machine has.
+#[cfg(target_arch = "x86_64")]
+pub use hvarch::x86::spec;
 /// What wakes each CPU of a guest: its task out of a wait, its guest out of
 /// the CPU (`Kick`).
 #[cfg(target_arch = "x86_64")]

@@ -161,8 +161,10 @@ pub unsafe fn enable(host_area_phys: u64) -> Result<()> {
         unsafe { cpu::wrmsr(MSR_VM_HSAVE_PA, 0) };
         return Err(Error::EnableFailed);
     }
-    /* The host's x87/SSE control bits as every entry wants them, once. */
+    /* The host's x87/SSE control bits as every entry wants them, once; and
+     * what keeps a guest's speculation off the host's (`super::spec`). */
     unsafe { super::fp::on() };
+    unsafe { super::spec::on() };
     Ok(())
 }
 
@@ -174,6 +176,7 @@ pub unsafe fn enable(host_area_phys: u64) -> Result<()> {
 /// has returned.
 pub unsafe fn disable() {
     /* What `enable` set for the entries: nothing, on a CPU it never ran on. */
+    unsafe { super::spec::off() };
     unsafe { super::fp::off() };
     /* KVM's order: the address, then the enable bit. Either order has a
      * window -- SVM on with no save area, or SVM off still naming the page
@@ -941,6 +944,11 @@ impl Guest {
             if LOADED_DEBUG_ADDRS.with(|loaded, _| unsafe { loaded.load(&debug_addrs) }).is_none() {
                 return Err(NotRun::Off { cpu });
             }
+            /* Another guest than the last on this CPU: the predictors it
+             * trained are not to steer this one (`super::spec`). */
+            if !super::spec::entering(nested.id) {
+                return Err(NotRun::Off { cpu });
+            }
 
             /* The two VMCBs are pages this guest owns, `regs` is its own
              * field, and the checks above are the rest of what the stub
@@ -981,6 +989,10 @@ impl Guest {
     }
 }
 
+/// How many return addresses the stub puts in the return stack after an
+/// exit: as many as any CPU's holds (KVM's RSB_CLEAR_LOOPS).
+const RSB_ENTRIES: u32 = 32;
+
 /// Enter the guest whose VMCB is at `guest_vmcb` with the registers in
 /// `regs`, and come back at its next `#vmexit` with the registers stored
 /// back into `regs`.
@@ -999,6 +1011,9 @@ impl Guest {
 /// - `cli` just after, so that `stgi` at the end opens GIF with interrupts
 ///   still off; the interrupt that ended the guest's turn is taken when the
 ///   caller turns them back on.
+/// - After the exit, the guest's values cleared out of every register the
+///   caller is not given back, and the return stack refilled before the
+///   first `ret` (`super::spec`).
 ///
 /// The SysV callee-saved registers are the host's to keep and the guest
 /// overwrites them all, so they go on the stack, which `#vmexit` gives back
@@ -1061,6 +1076,35 @@ unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb
         "mov [rsi + {r15}], r15",
         "pop rdi",
         "mov [rsi + {rsi}], rdi",
+        /* The guest's values out of every register the caller is not
+         * given back by the pops below: none reaches host code running past
+         * a branch it has not resolved (`super::spec`). RSI holds `regs`,
+         * the host's own; RAX, the host VMCB's address. */
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor edi, edi",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        /* The return stack refilled before the first `ret` can be predicted
+         * from what the guest left in it: calls of the stub's own, each
+         * over a trap that a return predicted to it lands on, the stack put
+         * back after every two, and a fence for the loop's last branch --
+         * KVM's FILL_RETURN_BUFFER. GIF is clear, so nothing runs between
+         * the exit and this. */
+        "mov ecx, {rsb_pairs}",
+        "2:",
+        "call 3f",
+        "int3",
+        "3:",
+        "call 4f",
+        "int3",
+        "4:",
+        "add rsp, 16",
+        "dec ecx",
+        "jnz 2b",
+        "lfence",
         "vmsave rax",
         "mov rax, [rsp + 8]",
         "vmload rax",
@@ -1073,6 +1117,7 @@ unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb
         "pop rbx",
         "pop rbp",
         "ret",
+        rsb_pairs = const RSB_ENTRIES / 2,
         rbx = const offset_of!(GuestRegs, rbx),
         rcx = const offset_of!(GuestRegs, rcx),
         rdx = const offset_of!(GuestRegs, rdx),
