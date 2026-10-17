@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang lld llvm nasm cppcheck \
             grub2-common grub-pc-bin grub-efi-amd64-bin xorriso mtools \
-            qemu-system-x86 qemu-system-arm
+            qemu-system-x86 qemu-system-arm squashfs-tools parted e2fsprogs
           # The pinned nightly, not whatever nightly is today: src/rust/vendor
           # only resolves against the one src/rust/rust-toolchain.toml names.
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
@@ -43,6 +43,19 @@ jobs:
           else
             ./scripts/smoke-arm64.sh --skip-build
           fi
+
+      # What a release's system image does on a server (docs/install.md):
+      # nos-install pours it onto a partition, the server's GRUB boots nos
+      # from there once, by UUID, its sshd lets in the key it was given and
+      # no UDP shell answers; an update keeps the host key, takes a UDP shell
+      # asked for and keeps the old kernel for a rollback. losetup and mount
+      # are root's, so the Linux half runs under sudo.
+      - name: System image test (x86_64, TCG)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          make image
+          python3 scripts/image-test.py
 
       # The hypervisor's MMIO decoder turns a guest's bytes into the access
       # it performs for it, and a wrong decode looks like success: checked

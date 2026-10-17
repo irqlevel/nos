@@ -57,7 +57,10 @@ On a machine whose only console is the network this is how the UDP shell,
 which runs any command for anyone who can send it a datagram, stops being
 needed: boot once with `udpshell=`, fetch the module from the release the
 kernel came from ([Releases](modules.md#releases)), allow a key, put the two
-lines in `/etc/rc`, and boot without it.
+lines in `/etc/rc`, and boot without it. A server set up from the system image
+starts out that way: the image's `/etc/rc` is those two lines, the module at
+`/lib/modules/sshd.ko`, and `nos-install --ssh-key` allows the key
+([Install](install.md)).
 
 ## The command
 

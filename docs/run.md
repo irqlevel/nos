@@ -63,11 +63,13 @@ raw disk; `root=auto` finds it by its label (see
 
 QEMU `virt` board, HVF-accelerated on Apple Silicon (`NOS_TCG=1` forces TCG;
 HVF is about 4x faster). virtio-mmio blk/net/rng are attached, serial goes to
-`nos-arm64.log`, the UDP shell is forwarded on `:9000`:
+`nos-arm64.log`. The UDP shell is off, as in every shipped configuration;
+`NOS_UDPSHELL=9000` turns it on and it is forwarded on `:9000`:
 
 ```sh
 ./scripts/qemu-arm64.sh
 ./scripts/smoke-arm64.sh              # boot smoke test (SMOKE_HVF=1 for HVF)
+NOS_UDPSHELL=9000 ./scripts/qemu-arm64.sh
 python3 scripts/udpsh.py 127.0.0.1    # remote shell over UDP
 ```
 
