@@ -14,9 +14,18 @@ set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# The commit the kernel says it is (`version`): worked out here, since the
+# builder image has no git, as scripts/build-iso-docker.sh does
+if [ -z "${GIT_DESC:-}" ]; then
+    GIT_DESC="$(git -C "$PROJECT_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    if git -C "$PROJECT_ROOT" status --porcelain -uno 2>/dev/null | grep -q .; then
+        GIT_DESC="$GIT_DESC-dirty"
+    fi
+fi
+
 # Step 1: Build kernel inside Docker
 docker build --platform linux/amd64 -t nos-builder "$PROJECT_ROOT"
-docker run --platform linux/amd64 --rm -e "VERSION=${VERSION:-dev}" -v "$PROJECT_ROOT:/src" -w /src nos-builder bash -c 'make clean && make nocheck'
+docker run --platform linux/amd64 --rm -e "VERSION=${VERSION:-dev}" -e "GIT_DESC=$GIT_DESC" -v "$PROJECT_ROOT:/src" -w /src nos-builder bash -c 'make clean && make nocheck'
 
 # Step 2: Build the disk image inside Docker
 ROOTFS_MOUNT=""
