@@ -14,6 +14,7 @@ bin
 *.img
 *.disk
 *.qcow2
+*.squashfs
 *.d
 *.vmdk
 src/cpp/kernel/symtab_data.cpp

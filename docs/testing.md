@@ -121,6 +121,7 @@ swallowing panic messages whole.
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
+| `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install`, `root=UUID=` |
 
 ### `wx-test.sh` -- W^X
 
@@ -217,6 +218,34 @@ the four logging in are refused` fails now and then under load -- stragglers
 of the 70-probe burst reach the server after the three quiet seconds the
 test waits for, and are counted among the refusals it looks for (18 where it
 wants 2). A run that fails anything else is a regression.
+
+### `image-test.py` -- the system image, poured and booted as on a server
+
+What a release's `nos-x86_64.squashfs` has to do on a server
+([Install](install.md)), which nothing else here tries. The disk is an MBR
+with two partitions: a "host" one holding GRUB as a server's `/boot` would,
+whose first entry stands in for the server's own system and says so on the
+serial line, and a blank one for nos; it is attached as NVMe, as on the
+Hetzner boxes. The test mounts the image and runs the `nos-install` in it as
+a server would -- under Linux, as root, on a block device, the partitions as
+loop devices: under `sudo` on Linux and in CI, in the nos-builder image with
+`--privileged` on a Mac -- with `--ssh-key` and `--boot-once`, then builds
+the host's `grub.cfg` the way `grub-mkconfig` would, the machine's entry
+first and what `/etc/grub.d/42_nos` prints after it.
+
+The first boot must be nos, once -- the entry from the image's `nos.cfg`,
+the root mounted by UUID read-write -- with sshd started by the image's
+`/etc/rc`, a host key made and the given key let in, the kernel and the root's
+`/VERSION` both the image's, no `udpshell` on the command line and no UDP
+shell answering. The second boot must be the host's own entry: GRUB cleared
+the flag. Then `nos-install update`, finding the partition through the GRUB
+entry, over what nos wrote: e2fsck finds the partition clean, the host key
+nos made stays, the old kernel and modules go to `.prev`, the UDP shell it
+is asked for goes into the kernel parameters and a boot is armed; the third
+boot must answer with the same host key and, now, on the UDP shell. Last,
+`status`, `rollback` and `uninstall`, and e2fsck once more. Needs
+`qemu-system-x86_64`, `ssh`, `ssh-keygen`, `ssh-keyscan`, and the image
+built (`make image`, `scripts/build-image.sh`); about four minutes under TCG.
 
 ### `netblk-test.py` -- a module on the block layer's asynchronous path
 

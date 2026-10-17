@@ -238,6 +238,27 @@ SIZE_MB=4096 ROOTFS=my-root ./scripts/build-disk.sh   # bigger, with my-root/ co
 
 This produces `nos.qcow2` (MBR, virtio-blk compatible, suitable for KVM-based public clouds including Google Cloud Compute Engine). It runs entirely inside Docker and needs no `--privileged`: the filesystem is populated by `mke2fs -d` and GRUB's boot code is written with `dd`. See [Run](run.md#google-cloud) for deploying it and [Filesystems](filesystems.md) for the root filesystem itself.
 
+## System image
+
+The release artifact a server is set up from ([Install](install.md)):
+
+```sh
+make image                     # nos-x86_64.squashfs, on Linux with the toolchain
+./scripts/build-image.sh       # the same in Docker; --clean builds from nothing
+```
+
+A read-only squashfs of the kernel, every module built with it, the GRUB
+entries that boot it (`build/image/nos.cfg`), the default `/etc/rc`
+(`build/image/rc`), `scripts/nos-install` and a `VERSION` naming the build.
+Owners, times and modes are fixed (`mksquashfs -all-root -all-time 0
+-mkfs-time 0 -no-xattrs`), so the same kernel and modules make the same
+bytes. The revision in `VERSION` is read from the header the kernel was
+compiled with, so the two cannot disagree; `VERSION=` is the make variable,
+as the kernel's is, so give `make image` the one the kernel was built with
+(the release workflow builds both in one builder image with one value).
+x86-64 only: what boots it is a server's own GRUB, over Multiboot2. Needs
+`mksquashfs` (squashfs-tools, in the Docker image).
+
 ## Firmware: BIOS and UEFI
 
 Both firmware flavours are supported by the same `nos.iso`: `grub-mkrescue`

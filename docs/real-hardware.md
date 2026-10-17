@@ -234,5 +234,10 @@ kernel interface ([Modules](modules.md#releases)):
     wget https://github.com/irqlevel/nos/releases/download/<tag>/blkload-x86_64.ko /blkload.ko
     insmod /blkload.ko
 
+These boxes were set up by hand, before there was a release image to set one
+up from. A new server is set up with `nos-install` from the system image,
+which makes the partition, the GRUB entry and the one-shot flag that the
+sections above describe building by hand ([Install](install.md)).
+
 Other firmware, chipsets, NICs and disks are untested; treat bare-metal support
 as "works on the three machines it was debugged on".
