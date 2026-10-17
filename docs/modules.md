@@ -142,6 +142,10 @@ $ wget https://github.com/irqlevel/nos/releases/download/<tag>/blkload-x86_64.ko
 $ insmod /blkload.ko
 ```
 
+The release's system image, `nos-x86_64.squashfs`, carries them all too, in
+`/lib/modules` next to the kernel they were built with, and that is where a
+server set up from it loads them from ([Install](install.md)).
+
 Take it from the release the running kernel came from (`version` names it):
 the kernel from another release may have another kernel interface, and then
 refuses the module ([What a module may call](#what-a-module-may-call)). The

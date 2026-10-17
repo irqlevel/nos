@@ -1,0 +1,763 @@
+#!/bin/bash
+# nos-install: pour a nos system image onto a partition of this machine and
+# boot nos from it through this machine's own GRUB (docs/install.md).
+#
+#   nos-install install <partition> [options]    put the image on <partition>
+#   nos-install update [<partition>] [options]   a new image over the one there
+#   nos-install rollback [<partition>]           back to the image before it
+#   nos-install boot [<partition>] [--reboot]    boot nos once, the next time
+#   nos-install status [<partition>]             what is installed and armed
+#   nos-install uninstall                        take nos out of GRUB's menu
+#
+# Options of install and update:
+#   --image FILE          the image (nos-x86_64.squashfs); by default the one
+#                         this script is in, mounted
+#   --format              a new filesystem on the partition even when it has
+#                         one: everything on it is lost
+#   --ssh-key KEY         a key sshd lets in, as a .pub file or as the line
+#                         itself; ssh-ed25519 only; may be given more than once
+#   --udpshell[=PORT]     the shell over UDP, on PORT (9000): anyone who can
+#                         send this machine a datagram runs commands in its
+#                         kernel. Off unless asked for
+#   --netconsole IP:PORT  the kernel log, over UDP, to IP:PORT
+#   --cmdline "ARGS"      more kernel parameters (docs/kernel-parameters.md)
+#   --boot-once           boot nos once, the next time
+#   --reboot              and reboot now
+#
+# --udpshell, --netconsole and --cmdline set the kernel parameters this
+# machine boots nos with; update keeps the ones it had unless given any of
+# them, which then replace the lot (--cmdline "" clears them).
+#
+# <partition> is named on install; afterwards the GRUB entry names it
+# (/etc/grub.d/42_nos). Runs under Linux, as root, on the machine itself.
+#
+# Install pours the image onto a plain partition as an ext2 filesystem that
+# nos mounts read-write as its root -- the kernel in /boot, the modules built
+# with it in /lib/modules, /etc/rc, the grubenv -- and adds the entry to this
+# machine's GRUB that boots it. The machine's default does not change: nos
+# boots once when asked (boot, --boot-once), and the boot after that is the
+# default again, so a nos that never comes up is a reset away from it.
+#
+# For a test: NOS_GRUB_D in place of /etc/grub.d, NOS_UPDATE_GRUB in place of
+# update-grub (true: nothing), NOS_ALLOW_ANY_DISK=1 not to ask what the
+# partition's disk is.
+
+set -euo pipefail
+# A failure inside $(...) is a failure too (bash 4.4 and later)
+shopt -s inherit_errexit 2>/dev/null || true
+umask 022
+export LC_ALL=C
+
+GRUB_D=${NOS_GRUB_D:-/etc/grub.d}
+SNIPPET=$GRUB_D/42_nos
+LABEL=nos
+UDPSHELL_DEFAULT_PORT=9000
+# The kernel reads 255 characters of its command line, and nos.cfg puts
+# "root=UUID=<36> dhcp=auto dns=on " in front of what is kept here
+CMDLINE_MAX=191
+# What nos's ext2 reads and writes (docs/filesystems.md): any other feature
+# is a filesystem it mounts read-only, or not at all
+EXT2_FEATURES_OK=" ext_attr resize_inode dir_index filetype sparse_super large_file "
+
+die() { echo "nos-install: $*" >&2; exit 1; }
+warn() { echo "nos-install: WARNING: $*" >&2; }
+say() { echo "nos-install: $*"; }
+
+usage() {
+    sed -n '2,/^$/s/^# \{0,1\}//p' "$0" >&2
+    exit "${1:-2}"
+}
+
+# Mount points this run made (unmounted, then removed when empty) and
+# scratch directories (removed whole; never a mount point)
+MOUNT_DIRS=()
+TEMP_DIRS=()
+cleanup() {
+    local i
+    for (( i = ${#MOUNT_DIRS[@]} - 1; i >= 0; i-- )); do
+        if umount "${MOUNT_DIRS[i]}" 2>/dev/null || ! mountpoint -q "${MOUNT_DIRS[i]}"; then
+            rmdir "${MOUNT_DIRS[i]}" 2>/dev/null || true
+        else
+            warn "could not unmount ${MOUNT_DIRS[i]}"
+        fi
+    done
+    for i in ${TEMP_DIRS[@]+"${TEMP_DIRS[@]}"}; do
+        rm -rf "$i"
+    done
+}
+trap cleanup EXIT
+
+need() {
+    local missing= t
+    for t in "$@"; do
+        command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+    done
+    [ -z "$missing" ] || die "this needs$missing"
+}
+
+# GRUB's own tool for its environment block, under either of its names
+EDITENV=
+need_editenv() {
+    if command -v grub-editenv >/dev/null 2>&1; then
+        EDITENV=grub-editenv
+    elif command -v grub2-editenv >/dev/null 2>&1; then
+        EDITENV=grub2-editenv
+    else
+        die "no grub-editenv: GRUB's tools are not installed"
+    fi
+}
+
+editenv() {
+    [ -n "$EDITENV" ] || need_editenv
+    "$EDITENV" "$@"
+}
+
+# ---- the image ---------------------------------------------------------
+
+IMAGE=
+IMG=
+
+open_image() {
+    if [ -n "$IMAGE" ]; then
+        [ -f "$IMAGE" ] || die "no image at $IMAGE"
+        local dir
+        dir=$(mktemp -d /tmp/nos-image.XXXXXX)
+        if mount -t squashfs -o loop,ro "$IMAGE" "$dir" 2>/dev/null; then
+            MOUNT_DIRS+=("$dir")
+            IMG=$dir
+        elif command -v unsquashfs >/dev/null 2>&1; then
+            rmdir "$dir"
+            dir=$(mktemp -d /tmp/nos-image.XXXXXX)
+            TEMP_DIRS+=("$dir")
+            unsquashfs -no-progress -d "$dir/root" "$IMAGE" >/dev/null ||
+                die "cannot unpack $IMAGE"
+            IMG=$dir/root
+        else
+            rmdir "$dir"
+            die "cannot open $IMAGE: no squashfs mount here, and no unsquashfs"
+        fi
+    else
+        IMG=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+    fi
+
+    [ -f "$IMG/VERSION" ] && [ -f "$IMG/boot/kernel64.elf" ] &&
+        [ -d "$IMG/lib/modules" ] && [ -f "$IMG/boot/grub/nos.cfg" ] ||
+        die "$IMG is not a nos image: run the nos-install in a mounted image, or give --image"
+
+    local arch
+    arch=$(version_of "$IMG/VERSION" arch)
+    [ "$arch" = "$(uname -m)" ] ||
+        die "the image is for ${arch:-an unknown machine}, this machine is $(uname -m)"
+}
+
+# A value of a VERSION file: version, revision, arch, module_abi
+version_of() {
+    sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1
+}
+
+describe() {
+    if [ -f "$1" ]; then
+        echo "nos $(version_of "$1" version) ($(version_of "$1" revision))"
+    else
+        echo "none"
+    fi
+}
+
+# ---- the partition -----------------------------------------------------
+
+PART=
+
+check_partition() {
+    local dev=$1 name sys holders
+    [ -b "$dev" ] || die "$dev is not a block device"
+    name=$(basename "$(readlink -f "$dev")")
+    sys=/sys/class/block/$name
+    [ -d "$sys" ] || die "$dev: no $sys"
+
+    holders=$(ls -A "$sys/holders" 2>/dev/null || true)
+    [ -z "$holders" ] ||
+        die "$dev is in use by $holders (RAID, LVM, device mapper): nos reads none of them, it needs a plain partition"
+
+    if [ -n "$(blkid -p -o value -s PTTYPE "$dev" 2>/dev/null || true)" ] ||
+        [ "$(lsblk -nro NAME "$dev" 2>/dev/null | wc -l)" -gt 1 ]; then
+        die "$dev is a disk with partitions on it: name one of them"
+    fi
+
+    case "$(findmnt -rno TARGET --source "$dev" 2>/dev/null | head -n 1)" in
+        /|/boot|/boot/efi|/usr|/var|/home) die "$dev is one of this system's own filesystems" ;;
+    esac
+}
+
+# Warnings, not refusals: GRUB boots nos from anything the firmware reads,
+# but what nos does after that depends on what it has drivers for
+check_hardware() {
+    local dev=$1 path d id found=
+    if [ "${NOS_ALLOW_ANY_DISK:-0}" != 1 ]; then
+        path=$(readlink -f "/sys/class/block/$(basename "$(readlink -f "$dev")")")
+        case "$path" in
+            */nvme/*|*/virtio*) ;;
+            *) warn "$dev is not on an NVMe or a virtio disk, which is all nos reads: GRUB will load the kernel from it, but nos will not find its root on it -- no modules, no /etc/rc, no sshd" ;;
+        esac
+    fi
+
+    # The network is a server's only console. The parts nos's drivers claim:
+    # drivers/r8168, drivers/r8125, drivers/igb, virtio-net
+    for d in /sys/bus/pci/devices/*; do
+        [ -r "$d/vendor" ] || continue
+        id=$(cat "$d/vendor"):$(cat "$d/device")
+        case "$id" in
+            0x10ec:0x8168|0x10ec:0x8125|\
+            0x8086:0x10c9|0x8086:0x10e8|0x8086:0x150a|\
+            0x8086:0x1533|0x8086:0x1536|0x8086:0x1537|0x8086:0x1538|\
+            0x8086:0x1539|0x8086:0x157b|0x8086:0x157c|\
+            0x1af4:0x1000|0x1af4:0x1041)
+                found="$found $(basename "$d")" ;;
+        esac
+    done
+    [ -n "$found" ] ||
+        warn "no network card here that nos has a driver for (RTL8168, RTL8125, Intel 82576/I210/I211, virtio-net): booted, nos cannot be reached"
+
+    if [ -d /sys/firmware/efi ]; then
+        local sb
+        sb=$(od -An -t u1 -j 4 -N 1 \
+            /sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c 2>/dev/null | tr -d ' ' || true)
+        [ "$sb" != 1 ] ||
+            warn "Secure Boot is on: GRUB will not load nos (multiboot2 under lockdown) -- turn it off in the firmware"
+    fi
+}
+
+check_ext2() {
+    local feats f bad=
+    feats=$(dumpe2fs -h "$1" 2>/dev/null | sed -n 's/^Filesystem features:[[:space:]]*//p')
+    [ -n "$feats" ] || die "cannot read the ext2 superblock of $1"
+    for f in $feats; do
+        case "$EXT2_FEATURES_OK" in
+            *" $f "*) ;;
+            *) bad="$bad $f" ;;
+        esac
+    done
+    [ -z "$bad" ] ||
+        die "$1 has filesystem features nos cannot write:$bad -- --format makes a new filesystem there"
+    case " $feats " in
+        *" filetype "*) ;;
+        *) die "$1 has no filetype feature, which nos needs -- --format makes a new filesystem there" ;;
+    esac
+}
+
+MNT=
+MOUNTED_HERE=0
+
+# e2fsck before a write as well as after: what is found after should be
+# what the write did, not what was there. A filesystem mounted elsewhere
+# cannot be checked, and is not
+fsck_partition() {
+    local dev=$1 when=$2
+    [ -z "$(findmnt -rno TARGET --source "$dev" 2>/dev/null || true)" ] || return 0
+    if ! e2fsck -fn "$dev" >/dev/null 2>&1; then
+        e2fsck -fn "$dev" >&2 || true
+        die "e2fsck finds $dev damaged $when -- e2fsck -f $dev repairs it"
+    fi
+}
+
+# Mounted where the system has it, or here; "ro" for a look only
+mount_partition() {
+    local dev=$1 how=${2:-rw} mp
+    mp=$(findmnt -rno TARGET --source "$dev" 2>/dev/null | head -n 1 || true)
+    if [ -n "$mp" ]; then
+        [ "$how" = ro ] ||
+            findmnt -rno OPTIONS --source "$dev" | head -n 1 | grep -qE '(^|,)rw(,|$)' ||
+            die "$dev is mounted read-only at $mp"
+        MNT=$mp
+        MOUNTED_HERE=0
+    else
+        MNT=$(mktemp -d /tmp/nos-part.XXXXXX)
+        if ! mount -o "$how" "$dev" "$MNT"; then
+            rmdir "$MNT"
+            die "cannot mount $dev"
+        fi
+        MOUNT_DIRS+=("$MNT")
+        MOUNTED_HERE=1
+    fi
+    case "$MNT" in
+        ''|/) die "$dev mounted at '$MNT'" ;;
+    esac
+}
+
+unmount_partition() {
+    local dev=$1
+    sync -f "$MNT"
+    if [ "$MOUNTED_HERE" = 1 ]; then
+        umount "$MNT" || die "cannot unmount $dev from $MNT"
+        rmdir "$MNT" 2>/dev/null || true
+        MOUNTED_HERE=0
+    fi
+}
+
+# The partition the GRUB entry names
+registered_uuid() {
+    [ -f "$SNIPPET" ] || return 0
+    sed -n 's/^set nos_uuid=\([0-9a-fA-F-]*\)$/\1/p' "$SNIPPET" | head -n 1
+}
+
+resolve_partition() {
+    if [ -n "$PART" ]; then
+        return
+    fi
+    local uuid
+    uuid=$(registered_uuid)
+    [ -n "$uuid" ] || die "no partition named, and no GRUB entry ($SNIPPET) to take one from"
+    PART=$(blkid -U "$uuid" 2>/dev/null || true)
+    [ -n "$PART" ] || die "the GRUB entry names UUID $uuid, and no partition has it"
+}
+
+# ---- what goes onto it -------------------------------------------------
+
+KEYS=()
+
+add_ssh_key() {
+    local src=$1 text line type blob rest why from= taken=0
+    if [ -f "$src" ]; then
+        text=$(cat "$src")
+        from=$src
+    else
+        case "$src" in
+            ssh-*|ecdsa-*|sk-*) text=$src ;;
+            *) die "--ssh-key: no file $src, and it is not a key" ;;
+        esac
+    fi
+    while IFS= read -r line; do
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+        read -r type blob rest <<<"$line"
+        # A file -- an authorized_keys, say -- gives what sshd can take of
+        # it, and says what it leaves; a key given as itself is taken whole
+        # or refused
+        if [ "$type" != ssh-ed25519 ]; then
+            case "$type" in
+                ssh-*|ecdsa-*|sk-*) why="a $type key: nos's sshd takes ssh-ed25519 only (ssh-keygen -t ed25519)" ;;
+                *) why="options in front of the key, which nos's sshd would not honour" ;;
+            esac
+            [ -n "$from" ] || die "--ssh-key: $why"
+            warn "--ssh-key $from: left out $why"
+            continue
+        fi
+        [[ "${blob:-}" =~ ^[A-Za-z0-9+/]+=*$ ]] || die "--ssh-key: not a key: $line"
+        KEYS+=("$line")
+        taken=$((taken + 1))
+    done <<<"$text"
+    [ "$taken" -gt 0 ] || die "--ssh-key ${from:-$src}: no ssh-ed25519 key in it"
+}
+
+UDPSHELL=
+NETCONSOLE=
+EXTRA=
+SET_CMDLINE=0
+CMDLINE=
+
+compose_cmdline() {
+    local parts=() words=() t
+    [ -z "$UDPSHELL" ] || parts+=("udpshell=$UDPSHELL")
+    [ -z "$NETCONSOLE" ] || parts+=("netconsole=$NETCONSOLE")
+    # Split on blanks only: a * in it is not a file name
+    read -r -a words <<<"$EXTRA" || true
+    for t in ${words[@]+"${words[@]}"}; do
+        [[ "$t" =~ ^[A-Za-z0-9_.:,/+=-]+$ ]] ||
+            die "--cmdline: '$t' -- a kernel parameter is key=value (docs/kernel-parameters.md)"
+        parts+=("$t")
+    done
+    CMDLINE=${parts[*]+"${parts[*]}"}
+    [ "${#CMDLINE}" -le "$CMDLINE_MAX" ] ||
+        die "the kernel parameters are ${#CMDLINE} characters, past the $CMDLINE_MAX left of the kernel's 255"
+}
+
+# A file or directory of the image into place: the new one beside the old
+# first, then the old one to .prev and the new one in its stead
+replace() {
+    local from=$1 to=$2
+    rm -rf "$to.new"
+    cp -r "$from" "$to.new"
+    sync -f "$(dirname "$to")"
+    if [ -e "$to" ]; then
+        rm -rf "$to.prev"
+        mv -T "$to" "$to.prev"
+    fi
+    mv -T "$to.new" "$to"
+}
+
+put_system() {
+    local mnt=$1 line
+    mkdir -p "$mnt/boot/grub" "$mnt/lib" "$mnt/etc/ssh"
+
+    # The kernel, its modules and the VERSION that names them go together,
+    # and what was there goes to .prev together (rollback)
+    replace "$IMG/boot/kernel64.elf" "$mnt/boot/kernel64.elf"
+    replace "$IMG/lib/modules" "$mnt/lib/modules"
+    replace "$IMG/VERSION" "$mnt/VERSION"
+    rm -rf "$mnt/boot/grub/nos.cfg.new"
+    cp "$IMG/boot/grub/nos.cfg" "$mnt/boot/grub/nos.cfg.new"
+    mv -T "$mnt/boot/grub/nos.cfg.new" "$mnt/boot/grub/nos.cfg"
+
+    # /etc is this machine's: the image's /etc/rc goes only where there is
+    # none, and one that loads a module from elsewhere is said, since that
+    # module is of another build now, which the kernel refuses
+    if [ ! -e "$mnt/etc/rc" ]; then
+        cp "$IMG/etc/rc" "$mnt/etc/rc"
+    else
+        while IFS= read -r line; do
+            case "$line" in
+                insmod\ /lib/modules/*) ;;
+                insmod\ *) warn "/etc/rc on it runs '$line': that module is not the image's, and a kernel refuses one built against another kernel interface" ;;
+            esac
+        done < "$mnt/etc/rc"
+    fi
+
+    local keys=$mnt/etc/ssh/authorized_keys k blob
+    for k in ${KEYS[@]+"${KEYS[@]}"}; do
+        read -r _ blob _ <<<"$k"
+        if [ -f "$keys" ] && grep -qF " $blob" "$keys"; then
+            continue
+        fi
+        if [ -s "$keys" ] && [ -n "$(tail -c 1 "$keys")" ]; then
+            echo >> "$keys"
+        fi
+        echo "$k" >> "$keys"
+        say "sshd lets in: $k"
+    done
+
+    # The grubenv: what this machine boots nos with, and the one-shot flag
+    # GRUB reads and clears (42_nos) -- in place, its one block, which is
+    # why it is only ever written by GRUB's own tool
+    [ -f "$mnt/grubenv" ] || editenv "$mnt/grubenv" create
+    if [ "$SET_CMDLINE" = 1 ]; then
+        editenv "$mnt/grubenv" set "nos_cmdline=$CMDLINE"
+    fi
+}
+
+# ---- GRUB --------------------------------------------------------------
+
+snippet_text() {
+    cat <<'EOF' | sed "s/@NOS_UUID@/$1/"
+#!/bin/sh
+# nos: written by nos-install (docs/install.md). Finds the nos partition by
+# its UUID, loads what this machine boots nos with and the one-shot flag from
+# the grubenv there, and takes the menu entries from the image on it
+# (/boot/grub/nos.cfg). nos_next is cleared before anything is loaded, so a
+# nos that does not come up is followed by this machine's default. Delete
+# this file and run update-grub to take nos out of the menu; the partition is
+# left as it is.
+cat <<'GRUB'
+insmod part_msdos
+insmod part_gpt
+insmod ext2
+set nos_uuid=@NOS_UUID@
+set nos_root=
+search --no-floppy --fs-uuid --set=nos_root ${nos_uuid}
+if [ -n "${nos_root}" ]; then
+  set nos_next=
+  set nos_cmdline=
+  load_env -f (${nos_root})/grubenv nos_next nos_cmdline
+  if [ -f (${nos_root})/boot/grub/nos.cfg ]; then
+    source (${nos_root})/boot/grub/nos.cfg
+  fi
+  if [ -n "${nos_next}" ]; then
+    set default="${nos_next}"
+    set fallback=0
+    set nos_next=
+    save_env -f (${nos_root})/grubenv nos_next
+    set timeout_style=menu
+    set timeout=3
+  fi
+fi
+GRUB
+EOF
+}
+
+grub_cfg() {
+    if [ -f /boot/grub/grub.cfg ]; then
+        echo /boot/grub/grub.cfg
+    elif [ -f /boot/grub2/grub.cfg ]; then
+        echo /boot/grub2/grub.cfg
+    fi
+    return 0
+}
+
+# GRUB's configuration made again from /etc/grub.d, and checked: with nos in
+# it ("in") or not ("out")
+regenerate_grub() {
+    local expect=$1 cfg
+    if [ -n "${NOS_UPDATE_GRUB+x}" ]; then
+        $NOS_UPDATE_GRUB || die "$NOS_UPDATE_GRUB failed"
+        return
+    fi
+    if command -v update-grub >/dev/null 2>&1; then
+        say "update-grub"
+        update-grub >/dev/null 2>&1 || { update-grub >&2 || true; die "update-grub failed"; }
+    elif command -v grub-mkconfig >/dev/null 2>&1 && [ -d /boot/grub ]; then
+        say "grub-mkconfig"
+        grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || die "grub-mkconfig failed"
+    elif command -v grub2-mkconfig >/dev/null 2>&1 && [ -d /boot/grub2 ]; then
+        say "grub2-mkconfig"
+        grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1 || die "grub2-mkconfig failed"
+    else
+        die "no update-grub or grub-mkconfig here: is GRUB this machine's boot loader?"
+    fi
+
+    cfg=$(grub_cfg)
+    [ -n "$cfg" ] || die "no grub.cfg in /boot/grub or /boot/grub2 after the update"
+    if [ "$expect" = out ]; then
+        ! grep -q "^set nos_uuid=" "$cfg" || die "$cfg still has nos in it"
+        return
+    fi
+    grep -q "^set nos_uuid=" "$cfg" ||
+        die "$cfg has no nos in it after the update -- is $SNIPPET run by grub-mkconfig?"
+    # The entries nos.cfg defines are made at boot and are not in grub.cfg:
+    # one there by the same id is someone else's, and it would be booted
+    if grep -nE "(--id|menuentry_id_option)[= ]+['\"]?nos(-next)?['\"]?([ {]|$)" "$cfg" >&2; then
+        warn "another GRUB entry, above, has the id nos or nos-next (/etc/grub.d/40_custom?): GRUB boots the first entry by an id, which is not this image's -- remove it"
+    fi
+}
+
+# /etc/grub.d/42_nos for the partition with this UUID; GRUB's configuration
+# made again when it changed, or when asked to be
+install_snippet() {
+    local uuid=$1 always=$2 old tmp
+    [ -d "$GRUB_D" ] || die "no $GRUB_D: is GRUB this machine's boot loader?"
+    old=$(registered_uuid)
+    if [ -n "$old" ] && [ "$old" != "$uuid" ]; then
+        warn "the GRUB entry named the partition with UUID $old; it names $uuid now"
+    fi
+    tmp=$(mktemp "$GRUB_D/.42_nos.XXXXXX")
+    snippet_text "$uuid" > "$tmp"
+    chmod 755 "$tmp"
+    if [ -f "$SNIPPET" ] && cmp -s "$tmp" "$SNIPPET"; then
+        rm -f "$tmp"
+        [ "$always" = 1 ] || return 0
+    else
+        mv -T "$tmp" "$SNIPPET"
+        say "wrote $SNIPPET"
+    fi
+    regenerate_grub in
+}
+
+reboot_now() {
+    say "rebooting"
+    sync
+    if command -v systemctl >/dev/null 2>&1; then
+        exec systemctl reboot
+    fi
+    exec reboot
+}
+
+# ---- the commands ------------------------------------------------------
+
+FORMAT=0
+BOOT_ONCE=0
+REBOOT=0
+# The options given, for the commands that take few of them
+SEEN=
+
+parse_options() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -*) SEEN="$SEEN ${1%%=*}" ;;
+        esac
+        case "$1" in
+            --image) [ $# -ge 2 ] || usage; IMAGE=$2; shift ;;
+            --image=*) IMAGE=${1#*=} ;;
+            --format) FORMAT=1 ;;
+            --ssh-key) [ $# -ge 2 ] || usage; add_ssh_key "$2"; shift ;;
+            --ssh-key=*) add_ssh_key "${1#*=}" ;;
+            --udpshell) UDPSHELL=$UDPSHELL_DEFAULT_PORT; SET_CMDLINE=1 ;;
+            --udpshell=*)
+                UDPSHELL=${1#*=}
+                [[ "$UDPSHELL" =~ ^[0-9]+$ ]] && [ "$UDPSHELL" -ge 1 ] && [ "$UDPSHELL" -le 65535 ] ||
+                    die "--udpshell: $UDPSHELL is not a port"
+                SET_CMDLINE=1 ;;
+            --netconsole|--netconsole=*)
+                if [ "$1" = --netconsole ]; then
+                    [ $# -ge 2 ] || usage
+                    NETCONSOLE=$2
+                    shift
+                else
+                    NETCONSOLE=${1#*=}
+                fi
+                [[ "$NETCONSOLE" =~ ^[0-9]+(\.[0-9]+){3}:[0-9]+$ ]] ||
+                    die "--netconsole: $NETCONSOLE is not IP:PORT"
+                SET_CMDLINE=1 ;;
+            --cmdline) [ $# -ge 2 ] || usage; EXTRA=$2; SET_CMDLINE=1; shift ;;
+            --cmdline=*) EXTRA=${1#*=}; SET_CMDLINE=1 ;;
+            --boot-once) BOOT_ONCE=1 ;;
+            --reboot) BOOT_ONCE=1; REBOOT=1 ;;
+            -h|--help) usage 0 ;;
+            -*) die "unknown option $1 (--help)" ;;
+            *)
+                [ -z "$PART" ] || die "one partition, not $PART and $1"
+                PART=$1 ;;
+        esac
+        shift
+    done
+}
+
+# Refuses an option the command does not take
+only_options() {
+    local o
+    for o in $SEEN; do
+        case " $* " in
+            *" $o "*) ;;
+            *) die "$COMMAND does not take $o" ;;
+        esac
+    done
+}
+
+cmd_install() {
+    local mode=$1 fs uuid before cmdline
+    need blkid findmnt lsblk mount umount mountpoint mkfs.ext2 dumpe2fs e2fsck
+    need_editenv
+    if [ "$mode" = install ]; then
+        [ -n "$PART" ] || die "install onto which partition? (nos-install install /dev/nvme0n1p4)"
+    else
+        [ "$FORMAT" = 0 ] || die "update keeps what is on the partition; --format is install's"
+    fi
+    resolve_partition
+    compose_cmdline
+    open_image
+    check_partition "$PART"
+    check_hardware "$PART"
+
+    fs=$(blkid -p -o value -s TYPE "$PART" 2>/dev/null || true)
+    if [ "$FORMAT" = 1 ] || [ -z "$fs" ]; then
+        [ "$mode" = install ] || die "$PART has no filesystem: install the image on it"
+        [ -z "$(findmnt -rno TARGET --source "$PART" 2>/dev/null || true)" ] ||
+            die "$PART is mounted: unmount it to make a new filesystem there"
+        say "making an ext2 filesystem on $PART${fs:+, in place of its $fs}"
+        mkfs.ext2 -F -q -L "$LABEL" -b 4096 -m 0 -O ^dir_index "$PART" ||
+            die "mkfs.ext2 on $PART failed"
+        # This machine's mke2fs.conf may have added what nos cannot write
+        check_ext2 "$PART"
+        # A new filesystem starts from what the options say
+        SET_CMDLINE=1
+    elif [ "$fs" = ext2 ]; then
+        check_ext2 "$PART"
+        fsck_partition "$PART" "before anything is written"
+    else
+        die "$PART has a $fs filesystem on it, which nos does not take -- --format makes a new one in its place (everything on it is lost)"
+    fi
+
+    mount_partition "$PART"
+    before=$(describe "$MNT/VERSION")
+    put_system "$MNT"
+    if [ "$BOOT_ONCE" = 1 ]; then
+        editenv "$MNT/grubenv" set nos_next=nos
+    fi
+    cmdline=$(editenv "$MNT/grubenv" list | sed -n 's/^nos_cmdline=//p')
+    unmount_partition "$PART"
+    fsck_partition "$PART" "after the image was put on it"
+
+    uuid=$(blkid -p -o value -s UUID "$PART")
+    [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "$PART has no UUID GRUB can find it by"
+    install_snippet "$uuid" "$([ "$mode" = install ] && echo 1 || echo 0)"
+
+    say "$PART: $(describe "$IMG/VERSION"), was $before"
+    say "this machine's kernel parameters: ${cmdline:-none}"
+    if [ "${#KEYS[@]}" = 0 ] && [ "$mode" = install ]; then
+        warn "no --ssh-key: sshd lets nobody in until /etc/ssh/authorized_keys on $PART has a key"
+    fi
+    if [ "$BOOT_ONCE" = 1 ]; then
+        say "the next boot is nos, once; the one after it is this machine's default"
+        [ "$REBOOT" = 0 ] || reboot_now
+    else
+        say "nos-install boot --reboot boots it once"
+    fi
+}
+
+cmd_rollback() {
+    local p m
+    need blkid findmnt lsblk mount umount mountpoint e2fsck
+    resolve_partition
+    check_partition "$PART"
+    fsck_partition "$PART" "before anything is written"
+    mount_partition "$PART"
+    m=$MNT
+    for p in boot/kernel64.elf lib/modules VERSION; do
+        [ -e "$m/$p.prev" ] || die "nothing to go back to: no /$p.prev on $PART"
+    done
+    for p in boot/kernel64.elf lib/modules VERSION; do
+        rm -rf "$m/$p.back"
+        mv -T "$m/$p" "$m/$p.back"
+        mv -T "$m/$p.prev" "$m/$p"
+        mv -T "$m/$p.back" "$m/$p.prev"
+    done
+    say "$PART: $(describe "$m/VERSION"), and $(describe "$m/VERSION.prev") is the one to go back to"
+    unmount_partition "$PART"
+    fsck_partition "$PART" "after the rollback"
+}
+
+cmd_boot() {
+    need blkid findmnt lsblk mount umount mountpoint e2fsck
+    need_editenv
+    resolve_partition
+    check_partition "$PART"
+    [ -f "$SNIPPET" ] || warn "no $SNIPPET: this machine's GRUB does not look for nos"
+    mount_partition "$PART"
+    [ -f "$MNT/grubenv" ] || die "no grubenv on $PART: install the image on it first"
+    editenv "$MNT/grubenv" set nos_next=nos
+    say "the next boot is nos, $(describe "$MNT/VERSION"), once"
+    unmount_partition "$PART"
+    [ "$REBOOT" = 0 ] || reboot_now
+}
+
+cmd_status() {
+    local uuid next mp
+    need blkid findmnt lsblk mount umount mountpoint
+    need_editenv
+    uuid=$(registered_uuid)
+    if [ -n "$uuid" ]; then
+        echo "GRUB entry:  $SNIPPET, UUID $uuid"
+    else
+        echo "GRUB entry:  none"
+    fi
+    resolve_partition
+    mp=$(findmnt -rno TARGET --source "$PART" 2>/dev/null | head -n 1 || true)
+    echo "partition:   $PART${mp:+, mounted at $mp}"
+    mount_partition "$PART" ro
+    echo "installed:   $(describe "$MNT/VERSION")"
+    echo "previous:    $(describe "$MNT/VERSION.prev")"
+    if [ -f "$MNT/grubenv" ]; then
+        echo "parameters:  $(editenv "$MNT/grubenv" list | sed -n 's/^nos_cmdline=//p')"
+        next=$(editenv "$MNT/grubenv" list | sed -n 's/^nos_next=//p')
+        if [ -n "$next" ]; then
+            echo "next boot:   $next, once"
+        else
+            echo "next boot:   this machine's default"
+        fi
+    else
+        echo "grubenv:     none"
+    fi
+    echo "ssh keys:    $(grep -c '^ssh-' "$MNT/etc/ssh/authorized_keys" 2>/dev/null || true)"
+    unmount_partition "$PART"
+}
+
+cmd_uninstall() {
+    [ -z "$PART" ] || die "uninstall takes no partition: it takes nos out of GRUB's menu"
+    [ -f "$SNIPPET" ] || die "no $SNIPPET: nos is not in GRUB's menu"
+    rm -f "$SNIPPET"
+    say "removed $SNIPPET"
+    regenerate_grub out
+    say "nos is out of GRUB's menu; the partition is as it was"
+}
+
+[ $# -ge 1 ] || usage
+COMMAND=$1
+shift
+case "$COMMAND" in
+    -h|--help|help) usage 0 ;;
+esac
+[ "$(id -u)" = 0 ] || die "run as root"
+parse_options "$@"
+case "$COMMAND" in
+    install|update) cmd_install "$COMMAND" ;;
+    boot) only_options --reboot --boot-once; cmd_boot ;;
+    rollback|status|uninstall) only_options; "cmd_$COMMAND" ;;
+    *) die "no command $COMMAND (--help)" ;;
+esac

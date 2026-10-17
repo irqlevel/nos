@@ -1,0 +1,8 @@
+# /etc/rc: shell commands nos runs once at boot, after DHCP (docs/sshd.md).
+# From the nos system image; nos-install leaves one already there alone.
+#
+# sshd makes its host key on the first start and keeps it in
+# /etc/ssh/ssh_host_ed25519_key; it lets in the keys in
+# /etc/ssh/authorized_keys (nos-install --ssh-key).
+insmod /lib/modules/sshd.ko
+sshd start

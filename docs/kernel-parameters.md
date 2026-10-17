@@ -15,8 +15,13 @@ different one. The warnings land in `dmesg`, which the
 [netconsole](netconsole.md) replays from the start of the boot.
 
 The defaults the shipped configs use are `dhcp=auto dns=on root=auto
-fstest=on` on the x86-64 ISO, `dhcp=auto dns=on udpshell=9000 root=auto` on
-the disk image, and `dhcp=auto dns=on udpshell=9000 root=auto` on arm64.
+fstest=on` on the x86-64 ISO, `console=serial dhcp=auto dns=on root=auto` on
+the disk image, `dhcp=auto dns=on root=auto` on arm64 (`scripts/qemu-arm64.sh`),
+and `root=UUID=<partition> dhcp=auto dns=on` on a server the system image is
+poured onto ([Install](install.md)). None of them starts the UDP shell: it
+runs any command for anyone who can send the machine a datagram, so it is on
+only where `udpshell=` is given -- `nos-install --udpshell`,
+`NOS_UDPSHELL=9000 ./scripts/qemu-arm64.sh`, a test's own command line.
 
 ## CPUs
 
@@ -41,7 +46,7 @@ the disk image, and `dhcp=auto dns=on udpshell=9000 root=auto` on arm64.
 - `dhcp=off` — disable DHCP entirely (even via shell command)
 - `dhcp=on` — enable DHCP only via shell command (default)
 - `dns=on` — enable DNS resolver (uses DHCP-provided DNS server; requires `dhcp=auto`)
-- `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`). See [UDP remote shell](udp-shell.md)
+- `udpshell=PORT` — start UDP remote shell on the given port (e.g. `udpshell=9000`). Off unless given: it has no authentication. See [UDP remote shell](udp-shell.md)
 - `netframes=N` — frames in the network frame pool (64–65536); watch `netpool` for misses
 - `rxpoll=on` — have the tick look at the receive path as well as the NIC's interrupt (off by default, see `DeviceTable::poll_rx` in `src/rust/net/src/device.rs`)
 

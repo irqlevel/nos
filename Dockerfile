@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y \
     cppcheck \
     parted \
     e2fsprogs \
+    squashfs-tools \
     qemu-utils \
     qemu-system-x86 \
     qemu-system-arm \

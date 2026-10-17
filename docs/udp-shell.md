@@ -5,6 +5,13 @@ the kernel listens for commands on that UDP port. It runs whatever any
 datagram carrying its magic asks, unencrypted and with no authentication:
 fine on a VM's private network, not on a port the internet can reach. For
 that, [sshd](sshd.md) serves the same shell over SSH, to the keys it is given.
+
+So it is off unless asked for, in every configuration the tree ships: the
+ISO, the disk image, `scripts/qemu-arm64.sh` (`NOS_UDPSHELL=9000` turns it
+on there) and a server the system image is poured onto, where
+`nos-install --udpshell` asks for it ([Install](install.md)). The tests that
+drive the kernel through it put `udpshell=` on their own command lines.
+
 A lightweight protocol header (16 bytes: magic, sequence number, chunk index, flags, payload length) frames every packet, enabling the client to validate replies, reassemble multi-chunk responses in order, and detect the end of a response without relying on timeouts.
 
 Connect with the included Python client:
