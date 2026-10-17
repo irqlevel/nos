@@ -20,12 +20,27 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: ./scripts/build-disk.sh
 
+      # The system image a server's partition is poured from (docs/install.md):
+      # the kernel and modules the step above built, in the builder image it
+      # left, with the same VERSION and commit -- so nothing is rebuilt and the
+      # image's VERSION names the kernel in it.
+      - name: Build the system image
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # GIT_DESC as build-disk.sh worked it out: a checkout has no
+          # changes, so the commit alone
+          docker run --platform linux/amd64 --rm -e VERSION \
+            -e GIT_DESC="$(git rev-parse --short HEAD)" \
+            -v "$PWD:/src" -w /src nos-builder make image
+
       - name: Stage the release files
         run: |
           mkdir -p dist
           cp bin/kernel64.elf dist/kernel-x86_64.elf
           cp nos.iso          dist/nos.iso
           cp nos.qcow2        dist/nos.qcow2
+          cp nos-x86_64.squashfs dist/nos-x86_64.squashfs
           # Every module the Makefile builds, named for the kernel it loads
           # into: blkload.ko goes up as blkload-x86_64.ko. No match leaves
           # the pattern itself, and cp fails the step on it.
@@ -124,6 +139,19 @@ jobs:
             `latest` works too, without naming the tag:
             `https://github.com/${{ github.repository }}/releases/latest/download/kernel-x86_64.elf`
 
+            ### System image (x86-64 servers)
+
+            `nos-x86_64.squashfs`: the kernel, every module built with it, the
+            GRUB entries that boot it and `nos-install`, which pours it onto a
+            partition of a server running Linux with GRUB and boots nos from
+            there once -- [docs/install.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/install.md).
+
+            ```sh
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/nos-x86_64.squashfs
+            mount -o loop,ro nos-x86_64.squashfs /mnt
+            /mnt/nos-install install /dev/nvme0n1p4 --ssh-key ~/.ssh/id_ed25519.pub --reboot
+            ```
+
             ### Kernel modules
 
             Every loadable module in the tree, built with the kernels above:
@@ -146,5 +174,6 @@ jobs:
             dist/nos-arm64.img
             dist/nos.iso
             dist/nos.qcow2
+            dist/nos-x86_64.squashfs
             dist/*.ko
             dist/SHA256SUMS

@@ -295,7 +295,7 @@ RUST_SRC = $(shell find src/rust -name '*.rs' -not -path 'src/rust/target/*') \
         src/rust/.cargo/config.toml \
         src/rust/rust-toolchain.toml)
 
-.PHONY: all check nocheck clean rust smoke modules
+.PHONY: all check nocheck clean rust smoke modules image
 
 # The generated .d files are ordinary makefiles, so the first target of the
 # first one make reads becomes the default goal -- on an incremental build a
@@ -453,6 +453,43 @@ nos-arm64.img: $(KERNEL)
 	@mkdir -p bin
 	cp $(KERNEL) bin/kernel-arm64.elf
 
+# The system image (docs/install.md): the kernel, every module built with it,
+# the GRUB entries that boot it, the default /etc/rc and nos-install, in one
+# read-only squashfs that nos-install pours onto a server's partition. x86-64
+# only: what boots it is the machine's own GRUB, over Multiboot2. Owners,
+# times and modes are fixed, so the same build makes the same bytes and the
+# image's sha256 names what is in it. The revision in its VERSION is read
+# from the header the kernel was compiled with, so the two cannot differ;
+# VERSION, the release name, is the make variable, as the kernel's is -- give
+# `make image` the one the kernel was built with.
+IMAGE = nos-$(ARCH).squashfs
+IMAGE_STAGE = $(OUT)/image
+
+ifeq ($(ARCH),x86_64)
+image: $(IMAGE)
+else
+image:
+	@echo "image: x86-64 only -- a server's GRUB boots it, over Multiboot2" >&2; exit 1
+endif
+
+$(IMAGE): $(KERNEL) $(MODULE_KO) build/image/nos.cfg build/image/rc scripts/nos-install
+	rm -rf $(IMAGE_STAGE) $@.tmp
+	mkdir -p $(IMAGE_STAGE)/boot/grub $(IMAGE_STAGE)/lib/modules $(IMAGE_STAGE)/etc
+	install -m 0644 $(KERNEL) $(IMAGE_STAGE)/boot/kernel64.elf
+	install -m 0644 $(MODULE_KO) $(IMAGE_STAGE)/lib/modules/
+	install -m 0644 build/image/nos.cfg $(IMAGE_STAGE)/boot/grub/nos.cfg
+	install -m 0644 build/image/rc $(IMAGE_STAGE)/etc/rc
+	install -m 0755 scripts/nos-install $(IMAGE_STAGE)/nos-install
+	printf 'version=%s\nrevision=%s\narch=%s\nmodule_abi=%s\n' '$(VERSION)' \
+	    "$$(sed -n 's/^#define KERNEL_GIT_REV "\(.*\)"$$/\1/p' $(OUT)/version_gen.h)" \
+	    '$(ARCH)' '$(MODULE_ABI)' > $(IMAGE_STAGE)/VERSION
+	@grep -q '^revision=.' $(IMAGE_STAGE)/VERSION || { echo "$@: no revision in $(OUT)/version_gen.h"; exit 1; }
+	chmod 0644 $(IMAGE_STAGE)/VERSION
+	find $(IMAGE_STAGE) -type d -exec chmod 0755 {} +
+	mksquashfs $(IMAGE_STAGE) $@.tmp -noappend -comp gzip -all-root -no-xattrs \
+	    -mkfs-time 0 -all-time 0 -quiet -no-progress
+	mv $@.tmp $@
+
 smoke:
 	./scripts/smoke-test.sh
 
@@ -496,5 +533,5 @@ $(KERNEL): $(LDSCRIPT) $(OBJS) $(OUT)/modtest_blob.o $(OUT)/symtab_data.o $(OUT)
 	    rm -f $@; exit 1; }
 
 clean:
-	rm -rf out kernel64.elf kernel-arm64.elf nos-arm64.img *.bin *.iso iso
+	rm -rf out kernel64.elf kernel-arm64.elf nos-arm64.img *.bin *.iso iso nos-*.squashfs
 	cd src/rust && cargo clean 2>/dev/null || true

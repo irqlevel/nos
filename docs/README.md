@@ -1,8 +1,9 @@
 # nos documentation
 
 - [Features](features.md) — everything the kernel does today, by subsystem
-- [Build](build.md) — native and Docker builds, arm64, the undefined-behaviour flavours (`UBSAN=1` for the C++, `RUSTUB=1` for the Rust), the disk image, BIOS vs. UEFI on the ISO
+- [Build](build.md) — native and Docker builds, arm64, the undefined-behaviour flavours (`UBSAN=1` for the C++, `RUSTUB=1` for the Rust), the disk image, the system image, BIOS vs. UEFI on the ISO
 - [Run](run.md) — QEMU on x86-64 (KVM, TCG, OVMF) and arm64 (HVF), Google Cloud
+- [Install](install.md) — nos on a server: the release's system image poured onto a partition with `nos-install`, booted once through the server's own GRUB, updated, rolled back
 - [Real hardware](real-hardware.md) — the Dell Latitude 5480 laptop and the Hetzner EX44 (Intel) and AX41 (AMD) servers
 - [Debug](debug.md) — GDB, getting a log off a box with no serial port
 - [Tests and gates](testing.md) — the self-tests every boot runs, the smoke boots, and the gate each subsystem has for what a smoke boot cannot notice: what it checks and when to run it
