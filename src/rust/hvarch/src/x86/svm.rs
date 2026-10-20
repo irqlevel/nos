@@ -13,7 +13,7 @@ use core::mem::offset_of;
 use core::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use kcore::dma::DmaBuffer;
-use kcore::percpu::{ConstInit, CpuLocal};
+use kcore::percpu::ConstInit;
 
 use super::cpu;
 use crate::{Error, Result};
@@ -164,7 +164,7 @@ pub unsafe fn enable(host_area_phys: u64) -> Result<()> {
     /* The host's x87/SSE control bits as every entry wants them, once; and
      * what keeps a guest's speculation off the host's (`super::spec`). */
     unsafe { super::fp::on() };
-    unsafe { super::spec::on() };
+    unsafe { super::spec::on(false) };
     Ok(())
 }
 
@@ -372,6 +372,12 @@ pub enum NotRun {
     /// instruction; a guest is not entered over translations that may be
     /// another's.
     Flush { cpu: u32 },
+    /// The CPU -- or the hypervisor under this one -- will not take a VT-x
+    /// control the host needs to keep the guest off what is the host's: an
+    /// exit for its interrupts, its ports, its CR8, its debug registers, a
+    /// WBINVD, or the switch of EFER, the PAT and DR7. `field` names the
+    /// control field and `missing` the bits it lacks; nothing was entered.
+    Controls { cpu: u32, field: &'static str, missing: u32 },
 }
 
 /// What another CPU does to have a guest that is running leave it -- the
@@ -487,9 +493,9 @@ pub struct Nested {
 /// run out, each time the module is loaded, so that nothing an earlier
 /// load's guests left in a TLB is there for this one's.
 ///
-/// Touched only by [`Guest::run`], on its own CPU with interrupts off: a
-/// [`CpuLocal`].
-struct Asids {
+/// Touched only by [`Guest::run`], on its own CPU with interrupts off: the
+/// CPU's own, in its [`super::Entries`].
+pub(super) struct Asids {
     /// 0 until the CPU first hands one out: no guest's tag has it.
     generation: u64,
     /// The next to hand out; past `max`, the generation is over.
@@ -508,8 +514,6 @@ impl ConstInit for Asids {
      * with the flush that begins it. */
     const INIT: Self = Asids { generation: 0, next: 1, max: 0, flush: false };
 }
-
-static ASIDS: CpuLocal<Asids> = CpuLocal::new();
 
 /// Where a guest's ASID came from: the CPU and the generation it was handed
 /// out in, and the nested table it translates through.
@@ -566,7 +570,7 @@ impl Asids {
 /// The CPU this runs on, and its ASID generation: how many times it has run
 /// out, 0 before it first handed one out. For a test.
 pub fn asid_generation() -> Option<(u32, u64)> {
-    ASIDS.with(|a, cpu| (cpu as u32, a.generation))
+    super::ENTRIES.with(|e, cpu| (cpu as u32, e.asids.generation))
 }
 
 /// No more than `n` ASIDs handed out a generation, for as long as this
@@ -593,33 +597,37 @@ impl Drop for AsidLimit {
 
 /// What a CPU's DR0-DR3 hold: the four the last guest's entry there made
 /// them, or None until one has since the module was loaded -- what was
-/// there before is nothing this load knows.
+/// there before is nothing this load knows. One for both extensions, since
+/// a CPU runs guests under one of them.
 ///
 /// It stays true from one entry to the next because nothing else writes
 /// them: nothing in this kernel has a `mov` to a debug register but
 /// [`cpu::write_debug_addr`], called from here alone; a guest's own `mov`s
-/// to them are intercepted (`HOST_DR`); and neither `vmrun` nor `#vmexit`
-/// touches them. So an entry writes only the ones the guest's differ in --
-/// none at all for a guest that never sets a breakpoint, on a CPU whose
-/// last guest never did either -- where writing all four, each of them a
-/// serializing instruction, would cost every entry.
+/// to them are intercepted (`HOST_DR` under AMD-V, every `mov` of a debug
+/// register under VT-x); and neither `vmrun` and `#vmexit` nor a VM entry
+/// and exit touches them. So an entry writes only the ones the guest's
+/// differ in -- none at all for a guest that never sets a breakpoint, on a
+/// CPU whose last guest never did either -- where writing all four, each of
+/// them a serializing instruction, would cost every entry.
 ///
-/// Touched only by [`Guest::run`], on its own CPU with interrupts off: a
-/// [`CpuLocal`].
-struct LoadedDebugAddrs(Option<[u64; 4]>);
+/// Touched only by either `Guest::run`, on its own CPU with interrupts
+/// off: the CPU's own, in its [`super::Entries`].
+pub(super) struct LoadedDebugAddrs(Option<[u64; 4]>);
 
 impl ConstInit for LoadedDebugAddrs {
     const INIT: Self = LoadedDebugAddrs(None);
 }
 
-static LOADED_DEBUG_ADDRS: CpuLocal<LoadedDebugAddrs> = CpuLocal::new();
-
 impl LoadedDebugAddrs {
-    /// Make this CPU's DR0-DR3 `want`.
+    /// Make this CPU's DR0-DR3 `want`, a guest's own, before its entry: the
+    /// breakpoints its DR7 enables are armed here once the entry loads that
+    /// DR7.
     ///
     /// # Safety
-    /// As [`cpu::write_debug_addr`]: the host's DR7 enables no breakpoint.
-    unsafe fn load(&mut self, want: &[u64; 4]) {
+    /// As [`cpu::write_debug_addr`]: the host's DR7 enables no breakpoint --
+    /// nothing in this kernel writes it, and `#vmexit` and a VM exit both
+    /// leave it with all four off.
+    pub(super) unsafe fn load(&mut self, want: &[u64; 4]) {
         let have = self.0;
         let differs = |n: usize| have.map_or(true, |h| h[n] != want[n]);
         unsafe {
@@ -883,7 +891,7 @@ impl Guest {
         /* `with` is None only on a CPU past the table, which no CPU the
          * extension is on for is. */
         let off = || NotRun::Off { cpu: kcore::cpu::id() };
-        ASIDS.with(|asids, cpu| {
+        super::ENTRIES.with(|entries, cpu| {
             let cpu = cpu as u32;
             let timed = profile.is_some();
             let t0 = stamp(timed);
@@ -910,7 +918,7 @@ impl Guest {
             /* Here, with interrupts off, so that the CPU the ASID is for is
              * the CPU `vmrun` runs on. Never 0, the host's: `vmrun` refuses
              * that itself, and the refusal hands the guest nothing. */
-            let (asid, mut control) = asids.assign(tag, cpu, nested.id).ok_or(NotRun::Off { cpu })?;
+            let (asid, mut control) = entries.asids.assign(tag, cpu, nested.id).ok_or(NotRun::Off { cpu })?;
             if flush_always {
                 control = vmcb::tlb::FLUSH_ALL;
             }
@@ -937,18 +945,11 @@ impl Guest {
             /* The breakpoint addresses are the guest's from here on, armed
              * by its own DR7 once `vmrun` loads it. The host's DR7 enables
              * none: nothing in this kernel writes it, and the `#vmexit` of
-             * any earlier entry here left it with all four off. `with` is
-             * None only on a CPU past the table -- refused above already --
-             * or inside another `with` of its own, which this is not; and
-             * a guest is not entered with another's addresses. */
-            if LOADED_DEBUG_ADDRS.with(|loaded, _| unsafe { loaded.load(&debug_addrs) }).is_none() {
-                return Err(NotRun::Off { cpu });
-            }
+             * any earlier entry here left it with all four off. */
+            unsafe { entries.debug_addrs.load(&debug_addrs) };
             /* Another guest than the last on this CPU: the predictors it
              * trained are not to steer this one (`super::spec`). */
-            if !super::spec::entering(nested.id) {
-                return Err(NotRun::Off { cpu });
-            }
+            entries.spec.entering(nested.id);
 
             /* The two VMCBs are pages this guest owns, `regs` is its own
              * field, and the checks above are the rest of what the stub
@@ -971,7 +972,7 @@ impl Guest {
             }
 
             let exit_code = vmcb.get().control.exit_code;
-            asids.entered(control, exit_code);
+            entries.asids.entered(control, exit_code);
 
             /* Still on this CPU, with interrupts off: an intercepted machine
              * check is one the host's handler has not seen, and the CPU will
@@ -988,10 +989,6 @@ impl Guest {
         .unwrap_or_else(|| Err(off()))
     }
 }
-
-/// How many return addresses the stub puts in the return stack after an
-/// exit: as many as any CPU's holds (KVM's RSB_CLEAR_LOOPS).
-const RSB_ENTRIES: u32 = 32;
 
 /// Enter the guest whose VMCB is at `guest_vmcb` with the registers in
 /// `regs`, and come back at its next `#vmexit` with the registers stored
@@ -1117,7 +1114,7 @@ unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb
         "pop rbx",
         "pop rbp",
         "ret",
-        rsb_pairs = const RSB_ENTRIES / 2,
+        rsb_pairs = const super::spec::RSB_ENTRIES / 2,
         rbx = const offset_of!(GuestRegs, rbx),
         rcx = const offset_of!(GuestRegs, rcx),
         rdx = const offset_of!(GuestRegs, rdx),

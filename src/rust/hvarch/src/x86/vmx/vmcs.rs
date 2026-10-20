@@ -199,6 +199,9 @@ pub const PROC_RDPMC_EXITING: u32 = 1 << 11;
 /// them, for as long as the guest likes and after it has gone.
 pub const PROC_CR8_LOAD_EXITING: u32 = 1 << 19;
 pub const PROC_CR8_STORE_EXITING: u32 = 1 << 20;
+/// Every `mov` to or from a debug register exits: the four breakpoint
+/// addresses are the CPU's, not the VMCS's, and DR6 is no field either.
+pub const PROC_MOV_DR_EXITING: u32 = 1 << 23;
 pub const PROC_UNCOND_IO_EXITING: u32 = 1 << 24;
 pub const PROC_USE_MSR_BITMAPS: u32 = 1 << 28;
 pub const PROC_MONITOR_EXITING: u32 = 1 << 29;
@@ -217,6 +220,8 @@ pub const PROC2_WBINVD_EXITING: u32 = 1 << 6;
 pub const PROC2_UNRESTRICTED_GUEST: u32 = 1 << 7;
 
 /* VM-exit controls. */
+/// DR7 and IA32_DEBUGCTL saved into the VMCS at every exit, the host's DR7
+/// left at 0x400 by the exit itself.
 pub const EXIT_SAVE_DEBUG: u32 = 1 << 2;
 pub const EXIT_HOST_ADDR_SPACE_SIZE: u32 = 1 << 9;
 pub const EXIT_SAVE_IA32_PAT: u32 = 1 << 18;
@@ -225,6 +230,9 @@ pub const EXIT_SAVE_IA32_EFER: u32 = 1 << 20;
 pub const EXIT_LOAD_IA32_EFER: u32 = 1 << 21;
 
 /* VM-entry controls. */
+/// DR7 and IA32_DEBUGCTL loaded from the VMCS at every entry: without it a
+/// guest runs with the host's DR7, which enables no breakpoint, and the
+/// guest's are never armed.
 pub const ENTRY_LOAD_DEBUG: u32 = 1 << 2;
 pub const ENTRY_IA32E_MODE_GUEST: u32 = 1 << 9;
 pub const ENTRY_LOAD_IA32_PAT: u32 = 1 << 14;
@@ -272,6 +280,32 @@ pub mod cr_access {
     /// RDI, R8-R15.
     pub const GPR_SHIFT: u64 = 8;
     pub const GPR_MASK: u64 = 0xF << GPR_SHIFT;
+}
+
+/* EXIT_QUALIFICATION of a `mov` to or from a debug register. */
+pub mod dr_access {
+    /// Bits 2:0: which debug register.
+    pub const DR_MASK: u64 = 0x7;
+    /// Bit 4: set for a `mov` from the debug register, clear for one to it.
+    pub const FROM_DR: u64 = 1 << 4;
+    /// Bits 11:8: the general-purpose register, numbered as the instruction
+    /// encoding numbers them.
+    pub const GPR_SHIFT: u64 = 8;
+    pub const GPR_MASK: u64 = 0xF << GPR_SHIFT;
+}
+
+/* EXIT_QUALIFICATION of a #DB, and the guest's pending debug exceptions:
+ * what DR6 would have been given -- which a #DB that exits does not write. */
+pub mod debug {
+    /// B0-B3: the breakpoints whose condition was met.
+    pub const B0_3: u64 = 0xF;
+    /// BD: a `mov` of a debug register with DR7.GD set.
+    pub const BD: u64 = 1 << 13;
+    /// BS: a single step.
+    pub const BS: u64 = 1 << 14;
+    /// RTM: inside a transactional region -- which DR6 has the other way
+    /// up, set when it is not.
+    pub const RTM: u64 = 1 << 16;
 }
 
 /* Basic exit reasons (EXIT_REASON, bits 15:0). */
