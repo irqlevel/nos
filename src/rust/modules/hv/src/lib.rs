@@ -53,6 +53,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::Write;
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use hv::Machine;
 use kcore::cmd::{Command, Output};
@@ -333,20 +335,86 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
 }
 
 /// What keeps one guest's speculation off the host and the next guest
-/// (`hv::spec`), and how often it was needed: AMD-V's.
+/// (`hv::spec`), and how often it was needed -- for VT-x, as the CPU this
+/// runs on has it; and a warning for every CPU of `hardware`, those the
+/// extension is on for, whose IA32_SPEC_CTRL no longer has what `hv on`
+/// set there, asked of each CPU's register.
 #[cfg(target_arch = "x86_64")]
-fn speculation(out: &mut Output) {
-    let (switches, barriers, ibpb, auto_ibrs) = hv::spec::report();
-    if ibpb {
+fn speculation(out: &mut Output, hardware: u64) {
+    use hv::spec::Ibrs;
+    let mut undone = 0u64;
+    for i in 0..MAX_CPUS {
+        if hardware & (1u64 << i) == 0 {
+            continue;
+        }
+        let answer = AtomicU32::new(SPEC_UNASKED);
+        kcore::cpu::run_on_with(i as u32, &answer, ask_spec_ctrl);
+        if answer.load(Ordering::Acquire) == SPEC_UNDONE {
+            undone |= 1u64 << i;
+        }
+    }
+    if undone != 0 {
+        let _ = write!(out, "hv: WARNING -- IA32_SPEC_CTRL on cpu ");
+        write_mask(out, undone);
+        let _ = writeln!(out, " no longer has what hv on set there: something wrote it behind this module's back");
+    }
+    let r = hv::spec::report();
+    if r.ibpb {
         let _ = writeln!(out, "hv: guests switched on a CPU {} times, an IBPB between each two ({} issued)",
-                         switches, barriers);
+                         r.switches, r.barriers);
     } else {
         let _ = writeln!(out, "hv: guests switched on a CPU {} times; the CPU has no IBPB to put between them",
-                         switches);
+                         r.switches);
     }
-    if auto_ibrs {
+    if r.auto_ibrs {
         let _ = writeln!(out, "hv: automatic IBRS on -- the host's indirect branches are not a guest's to steer");
     }
+    let i = r.intel;
+    let bhi = if i.bhi_dis_s { ", and BHI_DIS_S: nor by the branch history a guest leaves" } else { "" };
+    match i.ibrs {
+        Some(Ibrs::Enhanced) => {
+            let _ = writeln!(out, "hv: enhanced IBRS on -- the host's indirect branches are not a guest's to steer{}",
+                             bhi);
+        }
+        Some(Ibrs::EveryExit) => {
+            let _ = writeln!(out, "hv: IBRS written after every exit -- the host's indirect branches are not a \
+                                   guest's to steer{}", bhi);
+        }
+        None => {}
+    }
+    if i.verw {
+        let _ = writeln!(out, "hv: the CPU's buffers cleared (VERW) before every entry -- MDS, TAA or RFDS");
+    }
+    if i.l1d_flush {
+        let _ = writeln!(out, "hv: the L1 data cache flushed before every entry -- L1TF");
+    }
+    if i.bhi_open {
+        let _ = writeln!(out, "hv: this CPU is open to branch history injection and has no BHI_DIS_S to close it: \
+                               the host's indirect branches are a guest's to steer through the history it leaves");
+    }
+}
+
+/* What `ask_spec_ctrl` answers: not asked (a CPU that did not run it),
+ * nothing set there to keep, kept, undone. */
+#[cfg(target_arch = "x86_64")]
+const SPEC_UNASKED: u32 = 0;
+#[cfg(target_arch = "x86_64")]
+const SPEC_NONE: u32 = 1;
+#[cfg(target_arch = "x86_64")]
+const SPEC_HELD: u32 = 2;
+#[cfg(target_arch = "x86_64")]
+const SPEC_UNDONE: u32 = 3;
+
+/// Whether the CPU this runs on still has the IA32_SPEC_CTRL `hv on` set
+/// there: the IPI `speculation` sends each CPU.
+#[cfg(target_arch = "x86_64")]
+fn ask_spec_ctrl(answer: &AtomicU32) {
+    let held = match hv::spec::held() {
+        None => SPEC_NONE,
+        Some(true) => SPEC_HELD,
+        Some(false) => SPEC_UNDONE,
+    };
+    answer.store(held, Ordering::Release);
 }
 
 fn status(machine: &Machine, out: &mut Output) {
@@ -378,9 +446,7 @@ fn status(machine: &Machine, out: &mut Output) {
                 let _ = writeln!(out, " though this module turned it on: something turned it off behind its back");
             }
             #[cfg(target_arch = "x86_64")]
-            if ext.vendor() == hv::Vendor::Svm {
-                speculation(out);
-            }
+            speculation(out, hardware);
         }
         Err(e) => {
             let _ = writeln!(out, "hv: no guest can run here -- {}", e);

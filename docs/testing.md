@@ -1215,9 +1215,9 @@ IO-APIC](hypervisor.md#the-io-apic)); and for `debug`, through the run loop
 a Linux guest's CPUs go through, that a single step and an `int1` -- each a
 #DB the host intercepts -- reached the guest's own handler, the first with
 DR6.BS and after the stepped instruction, the second after the ICEBP: a
-user process's `stepi` once stopped its whole VM. Under VT-x, which gives
-no #DB back yet, it checks the single step stops the guest there instead,
-so that the day it does, the check has to be changed with it. And for
+user process's `stepi` once stopped its whole VM. Under VT-x the same --
+its DR6 the one the exit said, VT-x writing none at a #DB that exits, and
+its handler's `mov`s of DR6 answered by the host. And for
 `cr4`, through the same loop, that the guest read back each CR4 it wrote --
 MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that SMEP, which
 its CPUID does not offer, PAE cleared in long mode and bit 32 were each a
@@ -1228,10 +1228,12 @@ intercept and so stops no read of CR4, it holds the reads to the register
 instead, MCE in it, and the host to its five writes; its VMCB must ask for
 the reads either way. A control run with MCE kept nowhere -- neither
 `hvarch` setting it at entry nor `set_cr4` -- failed there: the register it
-read lost MCE at the first write. Under VT-x, which does not stop a guest at CR4 yet,
-it checks only what any CPU does -- PAE cleared and bit 32 refused, CR4
-unchanged -- and says so; that branch has not been run, no Intel machine
-being at hand when it was written. And for `msr`, through the same loop,
+read lost MCE at the first write. Under VT-x, which stops a guest at a
+write of CR4 only where it changes a bit the host keeps, and answers its
+reads from the read shadow, it holds the reads to the same CR4s, the CPU's
+to MCE kept and VMXE, and the host to three writes performed -- MCE
+cleared, SMEP, bit 32 -- and two refused: PAE cleared in long mode is the
+CPU's own #GP, and PGE set its own write. And for `msr`, through the same loop,
 that SPEC_CTRL and PRED_CMD, which its CPUID does not offer, AMD's LS_CFG,
 which the policy names for no CPU, and MTRRs turned on, which nothing
 keeps, were each a #GP its own handler took -- in that order, with no
@@ -1244,27 +1246,29 @@ control build whose policy did not name MCG_STATUS failed it, a fifth #GP
 on both CPUs it ran on. And for `dr`, two VMs of one CPU each, one after
 the other on the CPU the guests run on: that the second read 0 in DR0-DR3
 as it started, where the first had left its own -- and where the CPU's
-four were the guests', it read those -- that each read back the pattern it wrote,
-and that each one's breakpoint, on a `ret` of its own, fired once, with
-DR6.B0 and at the `ret`, which only its own DR0 made the CPU's before its
-entry can do; then that every one of its fourteen `mov`s of them was the
-host's to perform. An execution breakpoint, not a data one: QEMU 10.2's TCG
-never gets past a store a data breakpoint watches in a nested guest -- it
-retries the store for good and takes no interrupt, so `hv run` never comes
-back -- and a control build that left the four the CPU's hung the same.
-The world switch before this failed it on both CPUs, the second VM
-reading the first's breakpoint address and pattern. Without the load
-before the entry, and with a load only when
-the guest's DR7 enabled a breakpoint as it was entered -- which a guest
-then enables without an exit -- the first VM's breakpoint never fired, on
-both CPUs. Under VT-x, which does not keep a guest's four apart yet, it
-says what the second read, and holds it to nothing. Under AMD-V `hv`, after both rounds, must count at least
-two switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
+four were the guests', it read those -- that each read back the pattern it
+wrote, and that each one's breakpoint, on a `ret` of its own, fired once,
+with DR6.B0 and at the `ret`, which only its own DR0 made the CPU's before
+its entry can do; then that every one of its fourteen `mov`s of them was
+the host's to perform. An execution breakpoint, not a data one: QEMU
+10.2's TCG never gets past a store a data breakpoint watches in a nested
+guest -- it retries the store for good and takes no interrupt, so `hv run`
+never comes back -- and a control build that left the four the CPU's hung
+the same. The world switch before this failed it on both CPUs, the second
+VM reading the first's breakpoint address and pattern. Without the load
+before the entry, and with a load only when the guest's DR7 enabled a
+breakpoint as it was entered -- which a guest then enables without an
+exit -- the first VM's breakpoint never fired, on both CPUs. Under VT-x,
+which stops a guest at every `mov` of a debug register, the same, with
+eighteen `mov`s the host's: DR7 armed, and in the handler DR6 read and
+cleared and DR7 turned off. After both rounds `hv` must count at least two
+switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
 after another guest's -- each with an IBPB where the CPU offers one, which
-QEMU's TCG does not, and `hv` must say so; every guest ran through the run
-stub's clearing of the registers and refill of the return stack after each
-exit. The unload
-that follows, and the load after it, are then of a hypervisor that has run
+QEMU's TCG does not, and `hv` must say so; and where `hv on` set
+IA32_SPEC_CTRL -- under VT-x, its IBRS -- every CPU's register, read back,
+must still have it. Every guest ran through the run stub's clearing of the
+registers and refill of the return stack after each exit. The unload that
+follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.
 
 `smp` is the one guest of two CPUs, its second on another host CPU than
