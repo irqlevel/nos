@@ -8,6 +8,8 @@ pub mod vmx;
 
 use core::fmt::Write;
 
+use kcore::percpu::{ConstInit, CpuLocal};
+
 use crate::{CpuPage, Error, Result, Vendor};
 
 /// The MSRs a guest owns outright, which both backends let it read and
@@ -20,6 +22,32 @@ use crate::{CpuPage, Error, Result, Vendor};
 /// every context switch, the most frequent exits a busy guest made; every
 /// other MSR still exits to the policy in `hv`.
 pub const PASSTHROUGH_MSRS: [u32; 3] = [0xC000_0100, 0xC000_0101, 0xC000_0102];
+
+/// What a CPU keeps of the guests it enters, under whichever extension it
+/// runs them: the ASIDs it hands out (AMD-V's), what its DR0-DR3 hold, and
+/// what keeps one guest's speculation from the host and from the next.
+///
+/// One [`CpuLocal`] for all of it, which each `Guest::run` takes once an
+/// entry -- as what holds the entry on its CPU with interrupts off, which
+/// both need anyway. A `with` is three calls into the kernel (interrupts
+/// off, which CPU this is, interrupts back on): with a `CpuLocal` each,
+/// VT-x's entry made three more of them than it needed, 400 of the 2,200 ns
+/// an exit took on the EX44.
+struct Entries {
+    asids: svm::Asids,
+    debug_addrs: svm::LoadedDebugAddrs,
+    spec: spec::State,
+}
+
+impl ConstInit for Entries {
+    const INIT: Self = Entries {
+        asids: svm::Asids::INIT,
+        debug_addrs: svm::LoadedDebugAddrs::INIT,
+        spec: spec::State::INIT,
+    };
+}
+
+static ENTRIES: CpuLocal<Entries> = CpuLocal::new();
 
 /// CPUID.1:ECX.
 const ECX_X2APIC: u32 = 1 << 21;

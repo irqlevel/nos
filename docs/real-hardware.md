@@ -62,6 +62,17 @@ boot log — self-tests, AP bring-up, xHCI enumeration, DHCP — went out over U
 to `scripts/netconsole.py` as it was produced. xHCI also came up on that board:
 26 root ports, three hubs, and a USB keyboard enumerated behind one of them.
 
+Since 2026-10-20 it boots nos from the system image ([Install](install.md))
+beside Ubuntu, one boot at a time. The halves of Ubuntu's swap array were
+cut from 32 GiB to 16 on both disks to make room for a 16 GiB partition on
+each: nos's root, ext2, which `nos-install` poured, on one, and on the other
+a 64 MiB [disk log](kernel-parameters.md) area, for a boot that dies before
+its network is up (`nos_cmdline=disklog=on` in the root's `/grubenv`).
+Ubuntu's GRUB boots nos when `nos_next` there asks, and Ubuntu again after;
+Linux swaps the two NVMe disks' names from boot to boot, so both partitions
+are named by UUID. nos's sshd answers with a host key of its own. VT-x runs
+guests there ([The EX44, under VT-x](hypervisor.md#the-ex44-under-vt-x)).
+
 ## Hetzner AX41-1-LTD dedicated server
 
 A **Hetzner AX41-1-LTD** (AMD Ryzen 5 3600 — Zen 2, family 17h, 6 cores /

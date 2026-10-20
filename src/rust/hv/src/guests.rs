@@ -837,6 +837,9 @@ fn run_spec(machine: &Machine, spec: &Spec, out: &mut dyn Write) -> bool {
             out, "not entered -- cpu {} would not drop what it had cached through the nested table (INVEPT)", cpu),
         Stop::Refused(Refusal::NotItsMemory) => writeln!(
             out, "not entered -- the CPU was handed memory other than its guest's"),
+        Stop::Refused(Refusal::Controls { cpu, field, missing }) => writeln!(
+            out, "not entered -- cpu {} will not take the {} controls {:#x}, which the host needs", cpu, field,
+            missing),
         Stop::Invalid => writeln!(out, "the CPU refused the entry (VMEXIT_INVALID on AMD-V, a VM-entry failure on VT-x)"),
         Stop::Unexpected { exit, rip } => writeln!(out, "an exit with no answer here: {:?} at {:#x}", exit, rip),
     };
@@ -1596,7 +1599,6 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     if let Err(e) = one_cpu_board(guest.memory(), &mut bsp, DEBUG_CODE) {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
-    let vmx = matches!(machine.ext(), Ok(hvarch::Ext::Vmx));
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(DEBUG_BUDGET_MS * kcore::consts::NS_PER_MS);
     let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
@@ -1618,7 +1620,7 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = describe_stop(&stopped.stop, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
-    match check_debug(guest.memory(), &stopped, vmx) {
+    match check_debug(guest.memory(), &stopped) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
             let _ = writeln!(out, "hv: guest {} ok", DEBUG_NAME);
@@ -1633,27 +1635,14 @@ fn run_debug(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     }
 }
 
-/// Under AMD-V: both #DBs reached the guest's handler, the first with DR6.BS
-/// and after the stepped NOP, the second with no DR6 bit and after the ICEBP,
-/// and the guest ran on to its halt. Under VT-x, which gives no #DB back yet:
-/// the single step stopped the guest, after the NOP, its handler never run.
-fn check_debug(m: &GuestMemory, stopped: &Stopped, vmx: bool) -> core::result::Result<String, String> {
+/// Both #DBs reached the guest's handler, the first with DR6.BS and after
+/// the stepped NOP, the second with no DR6 bit and after the ICEBP, and the
+/// guest ran on to its halt -- under VT-x the DR6 its handler read the
+/// host's, put together from what the exit said, and every `mov` of DR6
+/// answered by the host.
+fn check_debug(m: &GuestMemory, stopped: &Stopped) -> core::result::Result<String, String> {
     let qword = |gpa| m.read_obj::<u64>(gpa).map_err(|e| alloc::format!("its results cannot be read: {}", e));
     let count = m.read_obj::<u32>(DEBUG_COUNT).map_err(|e| alloc::format!("its results cannot be read: {}", e))?;
-    if vmx {
-        return match stopped.stop {
-            GuestStop::Exception { vector: 1, rip } if rip == DEBUG_STEP_RETURN && count == 0 => {
-                Ok(String::from("VT-x gives no #DB back yet: the single step stopped it, after the NOP, as it \
-                                 should until it does"))
-            }
-            ref other => {
-                let mut says = String::new();
-                let _ = describe_stop(other, &mut says);
-                Err(alloc::format!("under VT-x it should have stopped at its single step; it {}, its handler run {} times",
-                                   says, count))
-            }
-        };
-    }
     if !matches!(stopped.stop, GuestStop::Halted { .. }) {
         return Err(alloc::format!("it did not run to its halt: its handler ran {} times", count));
     }
@@ -1791,6 +1780,10 @@ const DR6_B0: u64 = 1 << 0;
 /// The `mov`s of DR0-DR3 each VM makes: four reads, four writes, the four
 /// read back, DR0 pointed at its breakpoint and read at the end.
 const DR_MOVES: u64 = 14;
+/// Every `mov` of a debug register each VM makes, which VT-x stops a guest
+/// at: those, DR7 armed, and in its #DB handler DR6 read and cleared and
+/// DR7 turned off.
+const DR_MOVES_ALL: u64 = 18;
 /// The two VMs: the first word of each one's pattern -- a kernel's
 /// address, nothing a CPU out of reset holds -- and its breakpoint.
 const DR_VMS: [(u64, u64); 2] = [(0xFFFF_FFFF_8100_0000, DR_RET_A), (0xFFFF_FFFF_8200_0000, DR_RET_B)];
@@ -1804,7 +1797,7 @@ struct DrRun {
     counts: Counts,
     stopped: Stopped,
     /// Its VMCB asked the CPU to stop it at every read and write of
-    /// DR0-DR3.
+    /// DR0-DR3, or its VMCS at every `mov` of a debug register.
     asked: bool,
     first: [u64; 4],
     back: [u64; 4],
@@ -1831,8 +1824,10 @@ fn run_dr_vm(machine: &Arc<Machine>, pattern: u64, at: u64) -> core::result::Res
     let deadline = start.saturating_add(DR_BUDGET_MS * kcore::consts::NS_PER_MS);
     let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
     use hvarch::x86::svm::vmcb::intercept::dr::{READ_DR0_3, WRITE_DR0_3};
-    let asked = matches!(&*bsp.backend_mut(), Backend::Svm(v)
-        if v.control().intercept_dr & (READ_DR0_3 | WRITE_DR0_3) == READ_DR0_3 | WRITE_DR0_3);
+    let asked = match &*bsp.backend_mut() {
+        Backend::Svm(v) => v.control().intercept_dr & (READ_DR0_3 | WRITE_DR0_3) == READ_DR0_3 | WRITE_DR0_3,
+        Backend::Vmx(v) => v.stops_debug_movs(),
+    };
     drop(bsp);
     let us = time::boot_time_ns().saturating_sub(start) / kcore::consts::NS_PER_US;
     let stopped = guest.take_stopped()
@@ -1887,7 +1882,8 @@ fn run_dr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     };
     let on = |c: Option<u32>| c.map_or(String::from("no cpu"), |c| alloc::format!("cpu {}", c));
     let _ = writeln!(out, "  ran on     {}, {} us -- vm A; vm B on {}, {} us", on(a.cpu), a.us, on(b.cpu), b.us);
-    let _ = writeln!(out, "  exits      {} and {}, {} and {} of DR0-DR3 performed, {} and {} exceptions given back",
+    let _ = writeln!(out, "  exits      {} and {}, {} and {} movs of debug registers performed, {} and {} exceptions \
+                           given back",
                      a.counts.exits, b.counts.exits, a.counts.dr, b.counts.dr, a.counts.reflected,
                      b.counts.reflected);
     let (mut says_a, mut says_b) = (String::new(), String::new());
@@ -1912,20 +1908,16 @@ fn run_dr(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     }
 }
 
-/// Under AMD-V: both VMs ran on one CPU -- where the first's addresses would
-/// be the second's to read, were the CPU's DR0-DR3 the guests' -- each to
-/// its halt; each read 0 in all four as it started, the second where the
-/// first had left its own; each read back the pattern it wrote; each one's
+/// Both VMs ran on one CPU -- where the first's addresses would be the
+/// second's to read, were the CPU's DR0-DR3 the guests' -- each to its halt;
+/// each read 0 in all four as it started, the second where the first had
+/// left its own; each read back the pattern it wrote; each one's
 /// breakpoint, at an address of its own, fired once -- DR6.B0, at its `ret`
 /// -- which only DR0 made its own before its entry can do; and each VMCB
-/// asked to stop every `mov` of DR0-DR3, every one performed by the host.
-/// Under VT-x, which does not keep a guest's four apart yet: what the second
-/// read is said, and nothing is held to it.
+/// asked to stop every `mov` of DR0-DR3, every one performed by the host --
+/// under VT-x each VMCS every `mov` of a debug register, DR6 and DR7's too.
 fn check_dr(a: &DrRun, b: &DrRun, vmx: bool) -> core::result::Result<String, String> {
-    if vmx {
-        return Ok(alloc::format!("VT-x does not keep a guest's DR0-DR3 apart yet: vm B read {} as it started",
-                                 dr_four(&b.first)));
-    }
+    let moves = if vmx { DR_MOVES_ALL } else { DR_MOVES };
     if a.cpu.is_none() || a.cpu != b.cpu {
         return Err(alloc::format!("the VMs ran on {:?} and {:?}: not one CPU, where the first's registers would be \
                                    the second's", a.cpu, b.cpu));
@@ -1963,15 +1955,15 @@ fn check_dr(a: &DrRun, b: &DrRun, vmx: bool) -> core::result::Result<String, Str
         }
     }
     for (name, run, _) in runs {
-        if !run.asked || run.counts.dr != DR_MOVES || run.counts.dr_refused != 0 {
-            return Err(alloc::format!("vm {}'s VMCB asked to stop its movs of DR0-DR3: {}; {} performed and {} not \
-                                       made, where it made {}", name, run.asked, run.counts.dr,
-                                      run.counts.dr_refused, DR_MOVES));
+        if !run.asked || run.counts.dr != moves || run.counts.dr_refused != 0 {
+            return Err(alloc::format!("vm {}'s {} asked to stop its movs of debug registers: {}; {} performed and {} \
+                                       not made, where it made {}", name, if vmx { "VMCS" } else { "VMCB" }, run.asked,
+                                      run.counts.dr, run.counts.dr_refused, moves));
         }
     }
     Ok(alloc::format!("vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote -- \
-                       {} movs each, performed by the host -- and each one's breakpoint fired at its own address: \
-                       DR6.B0, at its ret", DR_MOVES))
+                       {} movs of debug registers each, performed by the host -- and each one's breakpoint fired at \
+                       its own address: DR6.B0, at its ret", moves))
 }
 
 /// Four registers' values, on one line.
@@ -2058,6 +2050,14 @@ const CR4_MARK: u32 = u32::from_le_bytes(*b"CR4!");
 const CR4_READ_COUNT: usize = 6;
 const CR4_WRITE_COUNT: u64 = 5;
 const CR4_REFUSED: u32 = 3;
+/// Under VT-x, which stops a guest at a write that changes a bit the host
+/// keeps and answers its reads from the read shadow: the writes that stop
+/// it -- MCE cleared, SMEP, bit 32 -- and of those the ones refused. PAE
+/// cleared is the CPU's own #GP, and PGE set the CPU's own write.
+const CR4_VMX_EXITS: u64 = 3;
+const CR4_VMX_REFUSED: u64 = 2;
+/// VMX's bit, set in the CR4 a guest runs with under VT-x.
+const CR4_VMXE: u64 = 1 << 13;
 const CR4_BUDGET_MS: u64 = 10_000;
 /* CR4's bits as the guest has them. */
 const CR4_PAE: u64 = 1 << 5;
@@ -2065,7 +2065,8 @@ const CR4_MCE: u64 = 1 << 6;
 const CR4_PGE: u64 = 1 << 7;
 
 /// Run the cr4 guest: one CPU, through the run loop a Linux guest's go
-/// through, where AMD-V stops it at every `mov` of CR4.
+/// through, where AMD-V stops it at every `mov` of CR4 and VT-x at every
+/// write that changes a bit the host keeps.
 fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "hv: guest {} -- {}", CR4_NAME, CR4_ABOUT);
     let fail = |out: &mut dyn Write, why: &str| {
@@ -2086,13 +2087,16 @@ fn run_cr4(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let deadline = start.saturating_add(CR4_BUDGET_MS * kcore::consts::NS_PER_MS);
     let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
     /* The CR4 the guest believes it has, the one the CPU ran it with, and
-     * whether its VMCB asked to stop its reads of CR4. */
+     * whether its VMCB asked to stop its reads of CR4 -- its VMCS, to keep
+     * MCE for the host. */
     let backend = bsp.backend_mut();
     let held = Held {
         believed: backend.cr4(),
-        register: backend.save().cr4,
-        reads_asked: matches!(&*backend, Backend::Svm(v)
-            if v.control().intercept_cr & hvarch::x86::svm::vmcb::intercept::cr::READ_CR4 != 0),
+        register: backend.cr4_register(),
+        reads_asked: match &*backend {
+            Backend::Svm(v) => v.control().intercept_cr & hvarch::x86::svm::vmcb::intercept::cr::READ_CR4 != 0,
+            Backend::Vmx(v) => v.cr4_mask() & CR4_MCE != 0,
+        },
     };
     drop(bsp);
     let ns = time::boot_time_ns().saturating_sub(start);
@@ -2133,7 +2137,8 @@ struct Held {
     believed: u64,
     /// The CR4 the CPU ran it with.
     register: u64,
-    /// Its VMCB asked the CPU to stop it at a read of CR4.
+    /// Its VMCB asked the CPU to stop it at a read of CR4; its VMCS keeps
+    /// MCE in the guest/host mask.
     reads_asked: bool,
 }
 
@@ -2155,8 +2160,10 @@ fn under_qemu_tcg() -> bool {
 /// host. On QEMU's TCG, which does not stop a guest at a read of CR4 though
 /// its VMCB asks (`under_qemu_tcg`), the reads are the CPU's own, and give
 /// the register, MCE in it; the writes are the host's all the same. Under
-/// VT-x, which does not stop a guest at CR4 yet, what any CPU does: the
-/// last two refused, and it ran to its halt.
+/// VT-x the same CR4s read back -- the read shadow's, its reads stopped
+/// nowhere -- while the CPU's kept MCE: the three writes that changed a bit
+/// the host keeps stopped and performed by the host, SMEP and bit 32
+/// refused, and PAE cleared in long mode the CPU's own #GP.
 fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, vmx: bool)
     -> core::result::Result<String, String>
 {
@@ -2175,14 +2182,28 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
         return Err(alloc::format!("its mark is {:#x}", done));
     }
     if vmx {
-        /* PAE cleared in long mode, and bit 32: refused by any CPU, CR4 as
-         * it was. SMEP is the host's to have or not. */
-        if gps < 2 || reads[3] != reads[2] || reads[5] != reads[4] {
-            return Err(alloc::format!("its #GPs were {} and it read CR4 {:#x?}: wanted PAE cleared and bit 32 \
-                                       refused, CR4 unchanged by each", gps, reads));
+        let want = [CR4_PAE | CR4_MCE, CR4_PAE, CR4_PAE, CR4_PAE, CR4_PAE | CR4_PGE, CR4_PAE | CR4_PGE];
+        if !held.reads_asked {
+            return Err(String::from("its VMCS does not keep CR4.MCE for the host"));
         }
-        return Ok(String::from("VT-x does not stop a guest at CR4 yet: the CPU took every write itself -- PAE \
-                                cleared in long mode and bit 32 refused -- and keeps no MCE for the host"));
+        if reads != want {
+            return Err(alloc::format!("it read CR4 {:#x?}, not {:#x?}", reads, want));
+        }
+        if gps != CR4_REFUSED || error != 0 {
+            return Err(alloc::format!("its #GPs were {}, the last's error code {:#x}: wanted {} and 0", gps, error,
+                                      CR4_REFUSED));
+        }
+        if held.believed != CR4_PAE | CR4_PGE || held.register & !CR4_VMXE != CR4_PAE | CR4_PGE | CR4_MCE {
+            return Err(alloc::format!("it believes CR4 is {:#x} and the CPU ran it with {:#x}: wanted {:#x}, and \
+                                       that with MCE", held.believed, held.register, CR4_PAE | CR4_PGE));
+        }
+        if counts.cr4 != CR4_VMX_EXITS || counts.cr4_gp != CR4_VMX_REFUSED {
+            return Err(alloc::format!("the host performed {} of its CR4 writes and refused {}: wanted {} and {}",
+                                      counts.cr4, counts.cr4_gp, CR4_VMX_EXITS, CR4_VMX_REFUSED));
+        }
+        return Ok(String::from("it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- \
+                                while the CPU's CR4 kept MCE; the three writes of a bit the host keeps the host's, \
+                                SMEP and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was"));
     }
     if !held.reads_asked {
         return Err(String::from("its VMCB does not ask to stop it at a read of CR4"));
