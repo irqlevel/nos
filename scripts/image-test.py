@@ -17,7 +17,12 @@ status, rollback and uninstall.
 
 The disk: an MBR with a "host" partition holding GRUB as a server's /boot
 would -- its default entry stands in for the machine's own OS and says so on
-the serial line -- and a blank one for nos, on NVMe as on the Hetzner boxes.
+the serial line -- and a blank one for nos, on virtio-blk. Not on NVMe, as on
+the Hetzner boxes: the SeaBIOS of Ubuntu 22.04's QEMU (1.15), which CI runs,
+finds an NVMe disk and boots nothing from it -- "Booting from Hard Disk...",
+GRUB's core image never read, and nothing on the serial line -- where a newer
+one boots it; nos reads both, and the disk's driver is the smoke boot's to
+test, not this.
 The Linux side (losetup, mkfs, mount, nos-install) runs under sudo on Linux,
 and in the nos-builder image, --privileged, elsewhere; QEMU runs here.
 
@@ -241,7 +246,7 @@ class Machine:
         self.log = os.path.join(self.tmp, "serial-%s.log" % name)
         argv = ["qemu-system-x86_64", "-display", "none", "-no-reboot", "-m", "1G", "-smp", "2",
                 "-drive", "file=%s,format=raw,if=none,id=d0" % os.path.join(self.tmp, "disk.raw"),
-                "-device", "nvme,drive=d0,serial=nos0,bootindex=0",
+                "-device", "virtio-blk-pci,drive=d0,bootindex=0,disable-legacy=on,disable-modern=off",
                 "-netdev", "user,id=n0,hostfwd=tcp:127.0.0.1:%d-:22,hostfwd=udp:127.0.0.1:%d-:%d"
                 % (self.ssh_port, self.udp_port, SHELL_PORT),
                 "-device", "virtio-net-pci,netdev=n0,disable-legacy=on,disable-modern=off",

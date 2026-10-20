@@ -225,8 +225,13 @@ What a release's `nos-x86_64.squashfs` has to do on a server
 ([Install](install.md)), which nothing else here tries. The disk is an MBR
 with two partitions: a "host" one holding GRUB as a server's `/boot` would,
 whose first entry stands in for the server's own system and says so on the
-serial line, and a blank one for nos; it is attached as NVMe, as on the
-Hetzner boxes. The test mounts the image and runs the `nos-install` in it as
+serial line, and a blank one for nos; it is attached as virtio-blk. The
+Hetzner boxes have NVMe, which nos reads as well, but the SeaBIOS of Ubuntu
+22.04's QEMU (1.15), which CI runs, boots nothing from an NVMe disk: it says
+"Booting from Hard Disk...", GRUB's core image is never read, and nothing
+reaches the serial line -- the test's first boot waited out its time in CI
+on every run until the disk was moved, while a Mac's newer SeaBIOS booted
+it. The test mounts the image and runs the `nos-install` in it as
 a server would -- under Linux, as root, on a block device, the partitions as
 loop devices: under `sudo` on Linux and in CI, in the nos-builder image with
 `--privileged` on a Mac -- with `--ssh-key` and `--boot-once`, then builds
