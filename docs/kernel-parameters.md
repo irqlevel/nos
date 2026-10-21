@@ -28,6 +28,7 @@ only where `udpshell=` is given -- `nos-install --udpshell`,
 - `smp=off` — disable SMP, run on BSP only
 - `maxcpus=N` — bring up at most N CPUs, the BSP included (`maxcpus=2` = BSP + one AP); the rest stay parked. Bisects an SMP bring-up failure without giving up SMP entirely
 - `hwp=off` — x86-64: leave every CPU's clock where firmware left it, rather than turning on hardware P-states (HWP) and letting the CPU pick its own up to its turbo. Firmware's is usually the base clock: the EX44's cores ran at 2.5 GHz with it, their turbo being 4.8. See [Boot](boot.md)
+- `ucode=off` — x86-64: load no microcode from the module GRUB put beside the kernel (`module2 /boot/ucode ucode`, which [Install](install.md) sets up); every CPU runs the revision firmware loaded. See [Boot](boot.md)
 
 ## Console and logging
 

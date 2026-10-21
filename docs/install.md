@@ -105,7 +105,11 @@ What `install` does, in order, stopping at the first thing that is wrong:
    there. On a partition that had them, the old ones go to `.prev`, the
    three together, for `rollback`. `/etc` is the machine's: the image's
    `/etc/rc` goes in only where there is none, and the keys are added to
-   `/etc/ssh/authorized_keys`.
+   `/etc/ssh/authorized_keys`. The machine's microcode -- Intel's file for
+   its CPU from `/lib/firmware/intel-ucode`, which the server's own system
+   keeps current -- goes to `/boot/ucode`, which GRUB loads beside the
+   kernel; with none there (an AMD CPU, no `intel-microcode` package), nos
+   runs firmware's.
 4. Writes `/grubenv` on it -- this machine's kernel parameters, and the
    one-shot flag -- and checks the filesystem with `e2fsck`, before the
    write and after it.
@@ -191,7 +195,8 @@ mount -o loop,ro nos-x86_64.squashfs /mnt
 
 `update` finds the partition through `42_nos` and puts the new kernel,
 modules and `nos.cfg` there; the old kernel, modules and `/VERSION` go to
-`.prev` together. `/etc` -- `rc`, the keys, the host key -- and everything
+`.prev` together, and the microcode is taken again from the server's
+`/lib/firmware`. `/etc` -- `rc`, the keys, the host key -- and everything
 else on the partition stay. The kernel parameters stay too, unless
 `--udpshell`, `--netconsole` or `--cmdline` is given: then those replace them
 all (`--cmdline ""` clears them). A kernel and its modules are only ever
@@ -201,7 +206,7 @@ somewhere else.
 
 `nos-install rollback` swaps the current kernel, modules and `/VERSION` with
 the `.prev` ones. `nos-install status` says what is installed and what was,
-the kernel parameters and whether a boot is armed. `nos-install uninstall`
+the kernel parameters, the microcode's revision and whether a boot is armed. `nos-install uninstall`
 takes `42_nos` out and nos out of the menu, and leaves the partition alone.
 
 From inside a running nos, without Linux, a kernel can be tried before it
@@ -229,6 +234,7 @@ On the partition, which is nos's root:
 | `/boot/grub/nos.cfg` | the image | the entries `nos` and `nos-next` |
 | `/lib/modules/`, `/lib/modules.prev/` | the image | the kernel's modules, and the ones before them |
 | `/VERSION`, `.prev` | the image | what is installed, and what was |
+| `/boot/ucode` | the server's `/lib/firmware/intel-ucode`, at every install and update | this CPU's microcode, which nos loads on every CPU as it boots ([Boot](boot.md#x86-64-the-application-processors)) |
 | `/grubenv` | nos-install | `nos_cmdline`, this machine's kernel parameters; `nos_next`, the one-shot flag |
 | `/etc/rc` | the image, the first time | the boot script: the machine's after that (`rc` edits it) |
 | `/etc/ssh/authorized_keys` | `--ssh-key` | the keys sshd lets in (`sshd allow` adds one from inside) |

@@ -74,6 +74,7 @@ The order below is load-bearing; the notes say why.
 | PIC remap + disable | The 8259s are moved out of the exception vectors and then masked; interrupts come from the IOAPIC |
 | `Dmesg::Setup()` | The ring buffer, so every trace from here is recoverable after the fact |
 | `Grub::ParseMultiBootInfo` | The firmware memory map, the framebuffer, the kernel image bounds, and the command line — which is what `Parameters::Parse` reads. Until this point the trace level is necessarily the default |
+| `Microcode::LoadOnBsp` | Intel's microcode, from the module GRUB loaded beside the kernel as `ucode`, read through the bootstrap map -- a module is below 4 GiB -- before the page allocator can hand its pages out; the update for this CPU copied into the image for the APs (see below) |
 | `Netconsole::Setup()` | Armed as soon as the command line is known, so the log is buffered from the beginning and can be shipped once the link comes up |
 | `BuiltinPageTable::MapHighRam()` | Extends the bootstrap map over RAM above 4 GiB in 1 GiB blocks. It could not run in `Setup()` — there was no memory map yet |
 | `PageTable::Setup()` + `SetCr3` + `SetupFreePagesList()` | The real 4-level page table, the page-descriptor array, and the free list. See [Paging](paging.md) |
@@ -163,9 +164,10 @@ console may not be in either of them (a Raptor Lake iGPU aperture sits at
 `0x40_0000_0000`). An AP has no IDT yet, so a page fault there is a triple
 fault: the machine resets during `StartAll` with nothing on the screen and
 nothing in any log. Hence: NXE, then the kernel page table, then GDT and
-IDT, then the PAT and serializing LFENCE, as the BSP has them, and only
-then anything that can print. After that the LAPIC, kvmclock for this vcpu,
-its clock (HWP), its TSS, and `cpu.Run(ApStartup)`.
+IDT, then the microcode the BSP kept, then the PAT and serializing LFENCE,
+as the BSP has them, and only then anything that can print -- what the
+microcode did among the first. After that the LAPIC, kvmclock for this
+vcpu, its clock (HWP), its TSS, and `cpu.Run(ApStartup)`.
 
 **The clock.** An Intel CPU runs at the ratio firmware last asked for until
 something asks for another, and firmware asks for the base clock: on the
@@ -187,6 +189,35 @@ C-states. HWP is turned on before any other of its MSRs is read: the SDM
 allows none of them before, and a first version that read its capabilities
 first never answered from its boot on the EX44, which had to be reset by
 hand.
+
+**The microcode.** A CPU runs the microcode firmware loaded until something
+loads a newer one, and firmware's is as old as the firmware: the EX44 ran
+its firmware's 0x3a under nos, where its Linux loads 0x3e, of October 2025
+-- and a mitigation the kernel or a guest relies on is only as good as the
+microcode under it. So nos loads Intel's update as Linux does from its
+initramfs, early and on every CPU. `nos-install` puts the machine's own
+file from the server's `/lib/firmware/intel-ucode` at `/boot/ucode`
+([Install](install.md)), GRUB loads it beside the kernel as the module
+`ucode`, and the BSP, right after the Multiboot2 information is read,
+chooses its update from it (`arch/x86_64/microcode_file.cpp`): every update
+in the file is held to the format -- the header's and the loader's
+versions, its sizes, its checksum, an extended signature table's -- before
+anything in it is believed, the walk stops at the first that is not sound,
+and of those before it the newest for this CPU's signature and platform is
+the one, if it is newer than what the CPU runs. The BSP copies it into the
+kernel image -- 1 MiB is kept for it; a client part's is a few hundred KiB
+-- since the module's pages are the page allocator's from then on, loads it
+(IA32_BIOS_UPDT_TRIG) and checks the CPU now runs its revision; each AP
+loads the same update as it comes up, held to the format and to its own CPU
+again. Both say what they did: `microcode: revision 0x3a -> 0x3e, of
+2025-10-12` on the BSP, a line on each AP. A CPU shares its microcode with
+others -- a core's two threads, an E-core module's four cores -- and the
+first of them to load it loads it for all: on the EX44 a P-core's first
+thread and an E-core module's first core load it, and the rest find they
+run it already. Nothing is loaded under a hypervisor, whose CPU's microcode
+is the host's, on a CPU that is not Intel's, or with `ucode=off`; arm64 has
+none to load. `cpp-fuzz.py`'s `ucode` target holds the file's reading to
+the SDM.
 
 `ApStartup` arms this CPU's LAPIC timer, enables interrupts, publishes
 itself as running, waits for `PreemptOn` on the BSP, runs the multitasking
