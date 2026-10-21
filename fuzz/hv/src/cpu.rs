@@ -234,8 +234,8 @@ pub mod svm {
         Invalid,
         Cr8 { write: bool, gpr: u8 },
         Cr0Write { value: u64 },
-        Cr4 { write: bool },
-        Dr { write: bool, dr: u8 },
+        Cr4 { write: bool, gpr: Option<u8> },
+        Dr { write: bool, dr: u8, gpr: Option<u8> },
         Pause,
         Undefined,
         Other(u64),
@@ -297,6 +297,7 @@ pub mod vm {
         FiveLevelPaging(u32),
         Flush(u32),
         NotItsMemory,
+        Controls { cpu: u32, field: &'static str, missing: u32 },
     }
 
     /// An event on its way into the guest.
@@ -313,6 +314,9 @@ pub mod vm {
     const CR4_PAE: u64 = 1 << 5;
     const CR4_MCE: u64 = 1 << 6;
     const CR4_PGE: u64 = 1 << 7;
+    /// DR6 and DR7 as reset leaves them, as both backends start a CPU.
+    const DR6_RESET: u64 = 0xFFFF_0FF0;
+    const DR7_RESET: u64 = 0x400;
 
     /// A guest CPU's state, as the run loop sees it through a backend.
     pub struct Backend {
@@ -329,8 +333,13 @@ pub mod vm {
         cr8: u8,
         /// Every event the guest took, in order.
         pub taken: Vec<Event>,
-        /// VT-x's, as the machine's vendor says: which gives no #DB back.
+        /// VT-x's, as the machine's vendor says: whose exits name the
+        /// register of a `mov` of a control or a debug register, and the
+        /// instruction's length (`exit_len`), where AMD-V's have it decoded.
         vmx: bool,
+        /// The length of the instruction the guest stopped at, as a VT-x
+        /// exit says it: set by the script with the exit.
+        exit_len: u64,
         /// The CR4 the guest believes it has, as svm.rs keeps it: the
         /// register, `save.cr4`, has MCE besides.
         cr4: u64,
@@ -358,6 +367,7 @@ pub mod vm {
                 cr8: 0,
                 taken: Vec::new(),
                 vmx: false,
+                exit_len: 0,
                 cr4: 0,
                 debug_addrs: [0; 4],
             }
@@ -377,6 +387,24 @@ pub mod vm {
         }
         pub fn regs_mut(&mut self) -> &mut GuestRegs {
             &mut self.regs
+        }
+        /// As vm.rs's: register `n`, set for an instruction performed for
+        /// the guest.
+        pub fn set_gpr(&mut self, n: u8, value: u64) {
+            *crate::mmio::gpr_mut(&mut self.save, &mut self.regs, n) = value;
+        }
+        /// The script's: the length of the instruction its next exit stopped
+        /// at, which VT-x's exit says.
+        pub fn set_exit_len(&mut self, len: u64) {
+            self.exit_len = len;
+        }
+        /// As vm.rs's: the length the exit says -- VT-x's -- or None.
+        pub fn exit_insn_len(&self) -> Option<u64> {
+            self.vmx.then_some(self.exit_len)
+        }
+        /// As svm.rs's and vmx.rs's: long mode active, and CS's L bit.
+        pub fn in_64bit_code(&self) -> bool {
+            self.save.efer & EFER_LMA != 0 && self.save.cs.attrib & attrib::L != 0
         }
 
         /// As svm.rs's: flat 64-bit code and data, paging on.
@@ -406,6 +434,8 @@ pub mod vm {
             s.cr0 = 0x8005_0033;
             s.cr3 = l.cr3;
             s.cr4 = CR4_PAE | CR4_MCE;
+            s.dr6 = DR6_RESET;
+            s.dr7 = DR7_RESET;
             s.rip = l.entry;
             s.rsp = l.stack;
             s.rflags = 2;
@@ -418,13 +448,12 @@ pub mod vm {
             self.cr4
         }
 
-        /// As svm.rs's: `value` the guest's CR4, and with MCE the register's
-        /// -- held to what a write the run loop performed may be, by rules of
-        /// the fuzzer's own: no bit the guest's CPUID does not offer, PAE kept
-        /// in long mode, and the TLB flushed where a bit a CPU translates by
-        /// changed.
+        /// As svm.rs's and vmx.rs's: `value` the guest's CR4, and with MCE
+        /// the register's -- held to what a write the run loop performed may
+        /// be, by rules of the fuzzer's own: no bit the guest's CPUID does not
+        /// offer, PAE kept in long mode, and the TLB flushed where a bit a CPU
+        /// translates by changed.
         pub fn set_cr4(&mut self, value: u64, flush: bool) {
-            invariant!(!self.vmx, "a CR4 write performed for a guest under VT-x, which never stops one at CR4");
             let allowed = crate::policy::cr4_allowed();
             invariant!(value & !allowed == 0, "CR4 written with {:#x}: bits {:#x} the guest's CPUID does not offer",
                        value, value & !allowed);
@@ -436,16 +465,36 @@ pub mod vm {
             self.save.cr4 = value | CR4_MCE;
         }
 
+        /// As svm.rs's and vmx.rs's: the CR4 the CPU runs the guest with.
+        pub fn cr4_register(&self) -> u64 {
+            self.save.cr4
+        }
+
+        /// The script's, under VT-x: a `mov` to CR4 the CPU performed itself,
+        /// changing only bits the guest owns -- no exit, and what the next
+        /// exit for a control register reads back.
+        pub fn cpu_wrote_cr4(&mut self, value: u64) {
+            invariant!(self.vmx, "a CR4 write the CPU performed without an exit, under AMD-V, which stops every one");
+            self.cr4 = value;
+            self.save.cr4 = value | CR4_MCE;
+        }
+
         /// As svm.rs's: the guest's DR0-DR3.
         pub fn debug_addrs(&self) -> [u64; 4] {
             self.debug_addrs
         }
 
-        /// As svm.rs's: `addrs` the guest's DR0-DR3 -- under AMD-V alone,
-        /// the one backend that stops a guest at them.
+        /// As svm.rs's and vmx.rs's: `addrs` the guest's DR0-DR3.
         pub fn set_debug_addrs(&mut self, addrs: [u64; 4]) {
-            invariant!(!self.vmx, "a debug register written for a guest under VT-x, which never stops one there");
             self.debug_addrs = addrs;
+        }
+
+        /// As vm.rs's: `value` the guest's DR7 -- held to what DR7 can
+        /// hold: bit 10 set, 12, 14, 15 and everything above 31 clear.
+        pub fn set_dr7(&mut self, value: u64) {
+            invariant!(value & 0x400 != 0 && value & !0xFFFF_2FFF == 0 && value >> 32 == 0,
+                       "DR7 made {:#x}, which DR7 cannot hold", value);
+            self.save.dr7 = value;
         }
 
         fn step(&mut self, len: u64) {
@@ -509,6 +558,8 @@ pub mod vm {
             self.save.cr4 = CR4_MCE;
             self.save.efer = 1 << 12;
             self.save.rflags = 2;
+            self.save.dr6 = DR6_RESET;
+            self.save.dr7 = DR7_RESET;
             self.cr4 = 0;
             self.debug_addrs = [0; 4];
         }
@@ -567,11 +618,7 @@ pub mod vm {
         }
         pub fn reflect_exception(&mut self, vector: u8, _error: Option<u32>) {
             invariant!(vector == 1 || vector == 17, "exception {} given back to the guest", vector);
-            invariant!(!(self.vmx && vector == 1), "a #DB given back under VT-x, whose DR6 is not put right");
             self.queue(Event::Exception(vector));
-        }
-        pub fn reflects_debug(&self) -> bool {
-            !self.vmx
         }
         pub fn skip_icebp(&mut self) {
             self.step(1);

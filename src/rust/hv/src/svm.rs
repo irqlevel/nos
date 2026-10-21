@@ -127,15 +127,20 @@ pub enum Exit {
     /// intercepts no CR0 write, and never exits for one.
     Cr0Write { value: u64 },
     /// A `mov` to (`write`) or from CR4, which AMD-V stops a guest at every
-    /// time: so that the CR4 it runs with keeps MCE, and it reads back the
-    /// one it wrote (`crate::cr`). VT-x does not stop a guest here yet.
-    Cr4 { write: bool },
+    /// time and VT-x at a write that changes a bit the host keeps -- MCE
+    /// among them: so that the CR4 it runs with keeps MCE, and it reads back
+    /// the one it wrote (`crate::cr`). `gpr` is the general-purpose register
+    /// where the exit names it -- VT-x's always -- and None where the
+    /// instruction is to be decoded for it.
+    Cr4 { write: bool, gpr: Option<u8> },
     /// A `mov` to (`write`) or from debug register `dr`, which AMD-V stops
-    /// a guest at for DR0-DR3, the breakpoint addresses, every time: they
-    /// are the CPU's, not the VMCB's, and the guest's are kept apart from
-    /// them and answered from there (`crate::dr`). VT-x does not stop a
-    /// guest here yet.
-    Dr { write: bool, dr: u8 },
+    /// a guest at for DR0-DR3, the breakpoint addresses, and VT-x for every
+    /// one: they are the CPU's, not the VMCB's or the VMCS's, and the
+    /// guest's are kept apart from them and answered from there
+    /// (`crate::dr`) -- under VT-x DR6 too, which it does not switch, and
+    /// DR7, which it does but would not otherwise see written. `gpr` as for
+    /// [`Exit::Cr4`].
+    Dr { write: bool, dr: u8, gpr: Option<u8> },
     /// PAUSE -- the guest spin-waiting: stopped so that whatever it waits
     /// for that the host hands over, a timer's tick above all, is handed
     /// over now rather than at the host's next interrupt.
@@ -311,6 +316,7 @@ impl Vcpu {
             Err(NotRun::Off { cpu }) => return Err(Refusal::NotOn(cpu)),
             Err(NotRun::FiveLevelPaging { cpu }) => return Err(Refusal::FiveLevelPaging(cpu)),
             Err(NotRun::Flush { cpu }) => return Err(Refusal::Flush(cpu)),
+            Err(NotRun::Controls { cpu, field, missing }) => return Err(Refusal::Controls { cpu, field, missing }),
         };
         self.requeue_event();
         /* The NMI handler's IRET, stopped at on the way in, has run once the
@@ -455,6 +461,13 @@ impl Vcpu {
         self.cr4
     }
 
+    /// Whether the guest is in 64-bit code: long mode active, and CS's L
+    /// bit -- the VMCB's, as of the exit.
+    pub fn in_64bit_code(&self) -> bool {
+        let s = self.save();
+        s.efer & EFER_LMA != 0 && s.cs.attrib & attrib::L != 0
+    }
+
     /// The guest's DR0-DR3, which its reads of them get (`crate::dr`).
     pub fn debug_addrs(&self) -> [u64; 4] {
         *self.guest.debug_addrs()
@@ -529,13 +542,13 @@ impl Vcpu {
         let c = self.control();
         match c.exit_code {
             vmcb::exit::INTR | vmcb::exit::NMI | vmcb::exit::SMI | vmcb::exit::INIT => Exit::Host,
-            vmcb::exit::CR4_READ => Exit::Cr4 { write: false },
-            vmcb::exit::CR4_WRITE => Exit::Cr4 { write: true },
+            vmcb::exit::CR4_READ => Exit::Cr4 { write: false, gpr: None },
+            vmcb::exit::CR4_WRITE => Exit::Cr4 { write: true, gpr: None },
             code if (vmcb::exit::DR_READ..vmcb::exit::DR_READ + DEBUG_REGS).contains(&code) => {
-                Exit::Dr { write: false, dr: (code - vmcb::exit::DR_READ) as u8 }
+                Exit::Dr { write: false, dr: (code - vmcb::exit::DR_READ) as u8, gpr: None }
             }
             code if (vmcb::exit::DR_WRITE..vmcb::exit::DR_WRITE + DEBUG_REGS).contains(&code) => {
-                Exit::Dr { write: true, dr: (code - vmcb::exit::DR_WRITE) as u8 }
+                Exit::Dr { write: true, dr: (code - vmcb::exit::DR_WRITE) as u8, gpr: None }
             }
             vmcb::exit::IOIO => {
                 let info = c.exit_info1;

@@ -144,14 +144,18 @@ enum DrExpect {
     /// Read into register `gpr`: `want` there, and RIP past the `len` bytes
     /// of the instruction at `rip`.
     Read { gpr: u8, want: u64, rip: u64, len: u64 },
-    /// Written: RIP past it.
-    Written { rip: u64, len: u64 },
+    /// Written: RIP past it -- and with `dr67`, DR6 or DR7 (`.0`) holding
+    /// `.1` after it, as those registers take what is written.
+    Written { rip: u64, len: u64, dr67: Option<(u8, u64)> },
     /// Made at CPL 3, which a CPU faults before the exit: a #GP on its way
     /// in, RIP still on the instruction.
     Refused { rip: u64 },
     /// Made with DR7's general detect on: a #DB on its way in, DR6.BD set,
     /// GD cleared, RIP still on the instruction.
     Detected { rip: u64 },
+    /// DR4 or DR5 under CR4.DE, which VT-x's exit comes before: a #UD on
+    /// its way in, RIP still on the instruction.
+    Undefined { rip: u64 },
 }
 
 /// General-purpose register `n` of the guest's, numbered as an instruction
@@ -180,6 +184,18 @@ fn gpr_slot(v: &mut Backend, n: u8) -> &mut u64 {
 
 const CR4_PAE: u64 = 1 << 5;
 const CR4_MCE: u64 = 1 << 6;
+const CR4_DE: u64 = 1 << 3;
+/// The CR4 bits a guest under VT-x writes without an exit, where its CPUID
+/// offers them -- vmx.rs's choice, which the fuzzer does not compile, as
+/// the model has it: VME, PVI, TSD, DE, PSE, PAE, PGE, PCE, OSFXSR and
+/// OSXMMEXCPT. A `mov` changing any other bit exits.
+const CR4_GUEST_OWNS: u64 = 0x7BF;
+/// DR6 and DR7 as a write leaves them: the bits each takes as written, and
+/// the ones that read as 1 whatever is written.
+const DR6_VOLATILE: u64 = 0xE00F;
+const DR6_FIXED_1: u64 = 0xFFFF_0FF0;
+const DR7_VOLATILE: u64 = 0xFFFF_2BFF;
+const DR7_FIXED_1: u64 = 0x400;
 /// Prefixes a CPU passes over on a `mov` of a control register.
 const CR_PREFIXES: [u8; 8] = [0x66, 0x67, 0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65];
 
@@ -203,7 +219,9 @@ struct Script {
     cr3: u64,
     /// Where the next instruction goes.
     code: u64,
-    /// Under VT-x, which does not stop a guest at CR4: none of its `mov`s.
+    /// Under VT-x, whose exits name the register of a `mov` and its length,
+    /// stop a guest at a write of CR4 only where it changes a bit the host
+    /// keeps, and at every `mov` of a debug register.
     vmx: bool,
 }
 
@@ -371,7 +389,7 @@ impl Script {
                 Cr4Expect::Written { value: taken, rip, len }
             });
         }
-        Exit::Cr4 { write }
+        Exit::Cr4 { write, gpr: None }
     }
 
     /// A `mov` to or from DR0-DR3 at the guest's RIP, as a kernel makes one:
@@ -444,12 +462,121 @@ impl Script {
                 DrExpect::Detected { rip }
             } else if write {
                 plan.dr_model[at] = value & width;
-                DrExpect::Written { rip, len }
+                DrExpect::Written { rip, len, dr67: None }
             } else {
                 DrExpect::Read { gpr, want: plan.dr_model[at] & width, rip, len }
             });
         }
-        Exit::Dr { write, dr: n }
+        Exit::Dr { write, dr: n, gpr: None }
+    }
+
+    /// A `mov` of CR4 under VT-x, as a kernel makes one: what `cr4_insn`
+    /// writes. A write that changes only bits the guest owns is the CPU's
+    /// own, with no exit -- or its own #GP, PAE cleared in long mode, which
+    /// the host never sees -- and the script makes it so itself; one that
+    /// changes a bit the host keeps exits, naming its register and its
+    /// length, and is held to what it should come to (`Cr4Expect`). A read
+    /// never exits: the read shadow answers it.
+    fn cr4_insn_vmx(&mut self, v: &mut Backend, r: &mut Input) -> Option<Exit> {
+        const PGE: u64 = 1 << 7;
+        const LOW32: u64 = 0xFFFF_FFFF;
+        let long = !self.cpus[self.me].protected32;
+        let width = if long { u64::MAX } else { LOW32 };
+        let gpr = r.below(if long { 16 } else { 8 }) as u8;
+        let allowed = crate::policy::cr4_allowed();
+        let owns = CR4_GUEST_OWNS & allowed;
+        let old = v.cr4();
+        let offered: Vec<u64> = (0..32).map(|b| 1u64 << b).filter(|b| allowed & b != 0 && !(long && *b == CR4_PAE))
+            .collect();
+        let denied: Vec<u64> = (0..64).map(|b| 1u64 << b).filter(|b| allowed & b == 0).collect();
+        let value = match r.u8() % 8 {
+            0..=2 if allowed & PGE != 0 => old ^ PGE,
+            0..=5 if !offered.is_empty() => old ^ offered[r.below(offered.len() as u64) as usize],
+            6 if long => old & !CR4_PAE,
+            _ => old | denied[r.below(denied.len() as u64) as usize],
+        };
+        let taken = value & width;
+        if (taken ^ old) & !owns == 0 {
+            if !(long && taken & CR4_PAE == 0) {
+                v.cpu_wrote_cr4(taken);
+            }
+            return None;
+        }
+        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0);
+        let len = 3 + u64::from(gpr >= 8) + r.below(2);
+        self.code = CODE + (self.code + 16 - CODE) % (2 * MIB);
+        let rip = self.code;
+        v.save_mut().rip = rip;
+        v.set_exit_len(len);
+        *gpr_slot(v, gpr) = value;
+        self.cpus[self.me].cr4 = Some(if refused {
+            Cr4Expect::Refused { value: taken, old, rip }
+        } else {
+            Cr4Expect::Written { value: taken, rip, len }
+        });
+        Some(Exit::Cr4 { write: true, gpr: Some(gpr) })
+    }
+
+    /// A `mov` of a debug register under VT-x, which stops a guest at every
+    /// one: DR0-DR7 -- DR4 and DR5 DR6 and DR7 by other names, or a #UD
+    /// under CR4.DE, which the script turns over now and then as the guest's
+    /// own -- a read, or a write of anything, DR6 and DR7 with a bit above
+    /// 31 now and then; at CPL 3 and under general detect too. Its register
+    /// and its length are the exit's; what it should come to, `DrExpect`.
+    fn dr_insn_vmx(&mut self, v: &mut Backend, r: &mut Input) -> Exit {
+        const LOW32: u64 = 0xFFFF_FFFF;
+        const DR7_GD: u64 = 1 << 13;
+        let long = !self.cpus[self.me].protected32;
+        let width = if long { u64::MAX } else { LOW32 };
+        let write = r.bool();
+        let dr = r.below(8) as u8;
+        let gpr = r.below(if long { 16 } else { 8 }) as u8;
+        let value = if r.u8() < 64 { r.value64() & LOW32 } else { r.value64() };
+        let detect = r.u8() < 16;
+        let user = r.u8() < 8;
+        if r.u8() < 32 && crate::policy::cr4_allowed() & CR4_DE != 0 {
+            v.cpu_wrote_cr4(v.cr4() ^ CR4_DE);
+        }
+        let undefined = (dr == 4 || dr == 5) && v.cr4() & CR4_DE != 0;
+        let len = 3 + u64::from(gpr >= 8) + r.below(2);
+
+        self.code = CODE + (self.code + 16 - CODE) % (2 * MIB);
+        let rip = self.code;
+        v.save_mut().rip = rip;
+        v.set_exit_len(len);
+        *gpr_slot(v, gpr) = if write { value } else { r.value64() };
+        let s = v.save_mut();
+        s.dr7 = if detect { s.dr7 | DR7_GD } else { s.dr7 & !DR7_GD };
+        s.cpl = if user { 3 } else { 0 };
+        let (dr6, dr7) = (s.dr6, s.dr7);
+        let n = if dr == 4 || dr == 5 { dr + 2 } else { dr };
+        let plan = &mut self.cpus[self.me];
+        let taken = value & width;
+        plan.dr = Some(if undefined {
+            DrExpect::Undefined { rip }
+        } else if user {
+            DrExpect::Refused { rip }
+        } else if detect {
+            DrExpect::Detected { rip }
+        } else if write {
+            match n {
+                6 | 7 if taken >> 32 != 0 => DrExpect::Refused { rip },
+                6 => DrExpect::Written { rip, len, dr67: Some((6, (taken & DR6_VOLATILE) | DR6_FIXED_1)) },
+                7 => DrExpect::Written { rip, len, dr67: Some((7, (taken & DR7_VOLATILE) | DR7_FIXED_1)) },
+                _ => {
+                    plan.dr_model[usize::from(n)] = taken;
+                    DrExpect::Written { rip, len, dr67: None }
+                }
+            }
+        } else {
+            let want = match n {
+                6 => dr6,
+                7 => dr7,
+                _ => plan.dr_model[usize::from(n)],
+            };
+            DrExpect::Read { gpr, want: want & width, rip, len }
+        });
+        Exit::Dr { write, dr, gpr: Some(gpr) }
     }
 
     /// The exit for a planned step, with what the guest did for it.
@@ -776,10 +903,23 @@ fn check_dr(v: &mut Backend, e: DrExpect, model: [u64; 4]) {
                         {:#x}, and RIP at {:#x}, not {:#x}", gpr, at, got, want, rip, at.wrapping_add(len));
             mov_checked("platform: DR0-DR3 read");
         }
-        DrExpect::Written { rip: at, len } => {
+        DrExpect::Written { rip: at, len, dr67 } => {
             invariant!(rip == at.wrapping_add(len),
                        "a mov to a debug register at {:#x} left RIP at {:#x}, not {:#x}", at, rip, at.wrapping_add(len));
-            mov_checked("platform: DR0-DR3 written");
+            match dr67 {
+                Some((n, want)) => {
+                    let got = if n == 6 { v.save().dr6 } else { v.save().dr7 };
+                    invariant!(got == want, "a mov to DR{} at {:#x} left it {:#x}, not {:#x}", n, at, got, want);
+                    mov_checked(if n == 6 { "platform: DR6 written" } else { "platform: DR7 written" });
+                }
+                None => mov_checked("platform: DR0-DR3 written"),
+            }
+        }
+        DrExpect::Undefined { rip: at } => {
+            invariant!(v.event == Some(vm::Event::Exception(6)) && rip == at,
+                       "a mov of DR4 or DR5 under CR4.DE at {:#x} left event {:#x?} and RIP at {:#x}: wanted a #UD \
+                        and the instruction not run", at, v.event, rip);
+            mov_checked("platform: DR4 or DR5 under CR4.DE, a #UD");
         }
         DrExpect::Refused { rip: at } => {
             invariant!(v.event == Some(vm::Event::Exception(13)) && rip == at,
@@ -853,20 +993,22 @@ impl Script {
             }
             let op = r.op(37)?;
             if op == 36 {
-                /* A `mov` of DR0-DR3, which AMD-V stops the guest at. */
-                if self.vmx {
-                    continue;
-                }
+                /* A `mov` of a debug register: of DR0-DR3, which AMD-V stops
+                 * the guest at, or of any, which VT-x does. */
                 v.take_event();
-                let exit = self.dr_insn(v, mem, r);
+                let exit = if self.vmx { self.dr_insn_vmx(v, r) } else { self.dr_insn(v, mem, r) };
                 return Some(vm::Next::Exit(exit));
             }
             if op == 35 {
-                /* A `mov` of CR4, which AMD-V stops the guest at. */
-                if self.vmx {
-                    continue;
-                }
+                /* A `mov` of CR4, which AMD-V stops the guest at, and VT-x
+                 * where it changes a bit the host keeps. */
                 v.take_event();
+                if self.vmx {
+                    match self.cr4_insn_vmx(v, r) {
+                        Some(exit) => return Some(vm::Next::Exit(exit)),
+                        None => continue,
+                    }
+                }
                 let exit = self.cr4_insn(v, mem, r);
                 return Some(vm::Next::Exit(exit));
             }

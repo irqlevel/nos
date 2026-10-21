@@ -430,18 +430,77 @@ that tests the Intel equivalent -- the CPU refusing a non-canonical guest
 RIP, and three VMs isolated by their EPTs; `tpr` runs unchanged, and is
 stopped twice under VT-x and not at all under AMD-V.
 
+What AMD-V's [entry keeps whatever the VMCB says](#what-entering-a-guest-cannot-be-told-to-do),
+`hvarch::x86::vmx::Guest` keeps whatever the policy asked -- its own way,
+since VT-x's controls are not AMD-V's intercepts:
+
+- **CR4.MCE is the host's.** The CR4 guest/host mask holds MCE and VMXE
+  whatever `hv` asks, and every bit `hv` does not let the guest own
+  (`Guest::new`'s `cr4_own`: VME, PVI, TSD, DE, PSE, PAE, PGE, PCE, OSFXSR and
+  OSXMMEXCPT, where its CPUID offers them): the VMCS's CR4 keeps MCE set and
+  the guest reads the read shadow's. A `mov` to CR4 that changes a bit of
+  the mask exits, naming its register and length, and `crate::cr` performs
+  it from there -- a bit its CPUID does not offer the #GP a CPU without the
+  feature gives, so PKE, and with it PKRU, stays the guest's to have only
+  where it is offered -- and writes the register and the shadow at the next
+  entry. A read never exits, the shadow answering it, and a write of the
+  guest's own bits never does either: Linux's global TLB flush turns PGE
+  over twice, with no exit, where AMD-V stops every `mov` of CR4. PAE
+  cleared in long mode is then the CPU's own #GP.
+- **The debug registers are the guest's.** Every `mov` of one exits ("MOV-DR
+  exiting"), named by the exit -- register, direction, general-purpose
+  register -- and `crate::dr` answers it: DR0-3 from four of the guest's
+  own, made the CPU's before each entry through the same per-CPU record AMD-V
+  uses (`svm::LoadedDebugAddrs`); DR6 from the guest's own, which is no VMCS
+  field and is never put in the register -- every read of it exits -- and
+  DR7 the VMCS's, which "load debug controls" puts in the register at the
+  entry and the exit takes back out, leaving the host's with all four off.
+  DR4 and DR5 are DR6 and DR7 again, or a #UD under CR4.DE; a `mov` above
+  CPL 0 the #GP, under general detect the #DB, and a DR6 or DR7 written with
+  a bit above 31 the #GP, which the exit comes before the CPU's check of.
+- **A #DB of the guest's own goes back to it.** VT-x writes no DR6 at a #DB
+  that exits -- the exit qualification has what it would have written -- so
+  the exit puts it into the guest's DR6 as the CPU would have (B0-B3 cleared
+  first, RTM's bit the other way up; KVM's `kvm_deliver_exception_payload`),
+  and the run loop gives the #DB back with GD cleared from DR7, as a CPU
+  entering the handler clears it; a single step taken out of a STI or MOV SS
+  shadow with TF set is marked pending, which the CPU does at every exit but
+  this one and the entry checks. ICEBP's #DB exits at the instruction, as a
+  privileged software exception: stepped past, and its #DB given as the trap
+  it is, as AMD-V's intercept of it is.
+- **The controls the host needs are required.** `adjust` drops a control the
+  CPU -- or a hypervisor under this one -- does not allow; one the host
+  cannot do without dropped refuses the guest, naming the field and the bits
+  (`Refusal::Controls`): the exits for its interrupts and NMIs, its ports,
+  CR8, MONITOR, MWAIT, RDPMC, every `mov` of a debug register and WBINVD,
+  nested paging, the 64-bit host, the switch of EFER, the PAT and DR7 -- and
+  what the guest was promised, unrestricted guest and its VPID. A guest run
+  without one of them would be the host's to lose.
+- **The world switch keeps a guest's speculation off the host**
+  (`hvarch::x86::spec`), what CPUID and IA32_ARCH_CAPABILITIES say decided
+  for each CPU as the extension is turned on there, with KVM's as the
+  reference: after every exit the guest's values cleared out of every
+  register the stub returns with and the return stack refilled before its
+  first `ret`, as AMD-V's stub does; an IBPB between two guests on a CPU;
+  IBRS in IA32_SPEC_CTRL while the extension is on -- enhanced, set once, on
+  the EX44, and legacy, a barrier only when written, written again after
+  every exit on a CPU without it (Skylake) -- with BHI_DIS_S beside it where
+  the CPU has the control; VERW, the CPU's buffers cleared, the last thing
+  before every entry where MDS, TAA or RFDS apply (the EX44's E-cores have
+  RFDS); and the L1 data cache flushed before every entry where L1TF lets a
+  guest read it (Skylake). `hv` says which of them the CPU it runs on has,
+  and reads every CPU's IA32_SPEC_CTRL back, warning where it no longer
+  has what `hv on` set there. What each costs an exit on the EX44 is in
+  [What an exit costs](#what-an-exit-costs).
+
 What the VMX backend does not do yet, and says so rather than pretends:
 
-- **Debug registers are not the guest's.** "Load debug controls" is off, so
-  the guest's DR7 is not loaded at an entry, and every exit sets DR7 to
-  0x400: a hardware breakpoint or watchpoint set in a guest (gdb, perf) is
-  gone at its next exit, silently. Nor are DR0-3 and DR6 switched: under
-  AMD-V a guest's DR0-3 are its own ([What entering a guest cannot be told
-  to do](#what-entering-a-guest-cannot-be-told-to-do)), and under VT-x one
-  guest's breakpoint addresses are still the next guest's to read. Making
-  them the guest's is MOV-DR exiting over the same four per vCPU and their
-  load before an entry, DR6 put in by hand, and `#DB` given back to the
-  guest rather than stopping it -- one job, not yet done.
+- **Branch history cleared by hand.** A CPU with enhanced IBRS that is open
+  to branch history injection and has no BHI_DIS_S -- Ice Lake, Tiger Lake,
+  or an Alder Lake and later under a hypervisor that does not pass the
+  control through, as QEMU 8.2's `-cpu host` does not -- wants the software
+  sequence that clears the history at every exit; `hv` names such a CPU
+  instead. None of the three machines here is one.
 
 ## What it does today
 
@@ -676,8 +735,10 @@ The TLB tags every translation a guest makes with the ASID it ran under and
 keeps it until something flushes it. Every entry flushed the whole TLB at
 first, because every guest ran under ASID 1: always right, and every exit
 cost the guest its translations and the host its own. Now each CPU hands its
-ASIDs out itself, the way KVM does -- `Asids` in `hvarch/src/x86/svm.rs`, a
-`CpuLocal` only `Guest::run` touches, on its own CPU with interrupts off:
+ASIDs out itself, the way KVM does -- `Asids` in `hvarch/src/x86/svm.rs`,
+the CPU's own, in the one `CpuLocal` both `Guest::run`s take once an entry
+with interrupts off (`Entries` in `hvarch/src/x86.rs`, beside the CPU's
+debug addresses and its speculation state):
 
 - each ASID is handed out at most once a **generation**, and a generation
   ends when they run out -- 32767 on a Zen 2, 15 under TCG -- with a flush of
@@ -797,9 +858,9 @@ mode:
 | `asid` | three VMs on one CPU read a page of their own at one address: two taking turns, and a third given an ASID one of them had | no guest reads another's page through the TLB, and a reused ASID is reused after a flush ([Address space identifiers](#address-space-identifiers)) |
 | `smp` | two CPUs, on two host CPUs: the first sends the second INIT and a start-up IPI; the second comes up in real mode at the vector's page, climbs through protected mode to long mode, writes down its x2APIC ID and CPUID's, and sends the first an IPI; the first, woken by it, arms its APIC timer for one shot and halts until it fires | an application processor started the way Linux starts one, an IPI between two CPUs, and the local APIC timer ([More than one CPU](#more-than-one-cpu)) |
 | `ioapic` | on the machine of `smp` with an IO-APIC, its first CPU alone, in xAPIC mode: reads the IO-APIC's version, then wires the serial port's pin to itself -- as an edge, the THR-empty interrupt enabled and a byte written, then one written while masked; as a level, its handler ending it without reading IIR twice, and the third time reading it | edges sent as the line rises and lost while masked; a level sent again at each EOI for as long as its line is up, its remote IRR set until then; every IO-APIC access and every EOI a decoded MMIO access ([The IO-APIC](#the-io-apic)) |
-| `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS; under VT-x, which gives no #DB back yet, the single step stops it |
-| `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which does not keep a guest's four apart yet, the second reads what the first left, and the breakpoint's #DB stops it |
-| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and SMEP, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and SMEP -- which its CPUID does not offer -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x, which does not stop a guest at CR4 yet, the CPU takes each write itself |
+| `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
+| `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
+| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and SMEP, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and SMEP -- which its CPUID does not offer -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
 
 ```
 $ hv run all 3
@@ -974,7 +1035,7 @@ more, its own translations walked again; with 64 pages the guest's as well.
 What is left to take is on the host's side of the switch: the x87/SSE
 state and CR4 around it, 220 ns an exit, and the checks' two RDMSRs.
 
-Under VT-x the only numbers so far are nested KVM's on the Intel dev box
+Under VT-x the first numbers were nested KVM's on the Intel dev box
 (`-cpu host`, `hv bench exits=50000`), where every unshadowed `vmread` or
 `vmwrite`, every `mov cr4`, VMPTRLD and intercepted `rdmsr` is an exit to
 the outer kernel, and so where the host's side of an exit weighs far more
@@ -995,6 +1056,56 @@ not this code's; of the 12 `vmwrite`s and 14 `vmread`s an exit, 4,700 and
 1,500 ns before the dirty tracking, 73 ns are left. On real Intel silicon
 the same instructions are tens of cycles each, so the shape of the gain is
 the same and its size smaller: measured there is what is left to do.
+
+On the silicon -- the EX44's i5-13500, 2026-10-20, nos booted beside Ubuntu
+from its system image ([On real hardware](#on-real-hardware)), `hv bench
+exits=200000`, each number the same to a few ns over two to six loads of
+the module -- an exit costs 1.69 µs on a P-core (CPU 0) and 2.07 µs on an
+E-core (CPU 62) without the speculation mitigations ([What a review
+found](#what-a-review-found), item 1), and 1.82 and 2.49 µs with them. Each
+one's share, from a module built without it:
+
+| An exit, ns | P-core | E-core |
+|---|---|---|
+| without the mitigations (master's module, f3b0285) | 1,690 | 2,065 |
+| with all of them | 1,818 | 2,490 |
+| -- the return stack refilled with 2 entries, not 32 | -18 | -30 |
+| -- no BHI_DIS_S | -22 | -287 |
+| -- no VERW | -30 | -106 |
+| -- no IBRS, and so no BHI_DIS_S | -50 | -303 |
+| -- none of the four | -97 | -431 |
+
+All of it is 7% of an exit on a P-core and 20% on an E-core, two thirds of
+that BHI_DIS_S: a cost not of the switch but of every indirect branch the
+host takes there while the extension is on, which the profile puts in "the
+rest" (625 ns without the mitigations, 903 with). Linux on the same machine
+runs its whole kernel under BHI_DIS_S and pays it everywhere. What is left
+between none of the four and master, 30 ns on the P-core and nothing to
+measure on the E-core, is the rest of the review's fixes: DR7 switched by
+the entry and the exit themselves, the registers cleared, the record of
+the CPU's debug registers. One thing not explained: the first load of the
+module after a boot runs its E-core exits at 2.2 µs, BHI_DIS_S's share
+gone, though `hv`, reading every CPU's IA32_SPEC_CTRL back, finds it set
+there; every later load is at 2.49.
+
+The P-core's profile, without the mitigations and with them:
+
+| | without | with |
+|---|---|---|
+| checks and VMPTRLD | 17 ns | 21 ns |
+| VMCS written | 20 | 21 |
+| x87/SSE in | 63 | 63 |
+| `vmresume` to exit | 950 | 1,041 |
+| x87/SSE out | 86 | 86 |
+| VMCS read | 20 | 20 |
+| the exit handled, the loop | 550-573 | 605 |
+
+The first build with them took three `CpuLocal`s an entry -- the CPU's
+debug registers, the last guest it entered, its mitigations -- and its
+checks were 418 ns, each `with` being calls into the kernel to turn
+interrupts off and on and to ask which CPU this is. They are one now
+(`Entries` in `hvarch/src/x86.rs`), which the entry takes once as what
+holds it on its CPU, as AMD-V's did with its ASIDs alone.
 
 `mmio` has the guest make MMIO loads instead -- `mov eax, [rdi]` from a
 device's page in the MMIO window, each a nested fault whose instruction the
@@ -1019,9 +1130,11 @@ nested fault (0.3 µs under VT-x, none to measure under AMD-V) and the
 access itself -- three reads of the guest's page tables (the bench's code
 is on a 2 MiB page; four for a 4 KiB one) and one of its instruction, each
 a copy through the frame window with a mapping of its own made and
-dropped, and the decoding, which is a few dozen branches. On
-the silicon all of it is shorter; the copies are where to look if an
-MMIO-heavy guest makes it matter.
+dropped, and the decoding, which is a few dozen branches. The copies are
+where to look if an MMIO-heavy guest makes it matter: on the EX44's silicon
+(2026-10-20, a P-core) a CPUID exit is 1.8 µs, an MMIO load 4.5, and the
+access 2.5 of that -- no less than under nested KVM, being the host's own
+work, and so there most of what an MMIO access costs.
 
 ## arm64
 
@@ -2787,6 +2900,49 @@ ssh root@<box> 'hv boot /hvguest/bzImage initrd=/hvguest/initrd secs=20 input=id
 ssh root@<box> reboot     # the one-shot is spent: back to Ubuntu
 ```
 
+### The EX44, under VT-x
+
+The EX44 (an i5-13500: six P-cores of two threads and eight E-cores, with
+EPT, VPIDs and unrestricted guest) is the first Intel silicon VT-x has run
+on; everything before it was nested KVM. nos booted there from its system
+image, beside Ubuntu, on 2026-10-20 ([Real hardware](real-hardware.md)).
+
+**The first run** (master's module, f3b0285): `hv info` ready, every
+built-in guest passed on a P-core (CPU 0) and an E-core (62), and an exit
+cost 1.67 and 2.07 µs on them -- against 5.8 µs nested. Linux 6.18 ran with
+one, two and four CPUs; a virtio disk took writes with `fsync` at 1.0 to 1.2
+GB/s and gave reads at 1.5; a guest fetched a gigabyte through NAT in 9.1 s
+(118 MB/s) and served a page to the internet through `hv forward`; Alpine
+3.24.2 came to its login prompt in 13 s and rebooted through 0xCF9 into a
+restart; and `rmmod` with five VMs running stopped them all and left VMX off
+on all twenty CPUs. It also showed, on the silicon, the VT-x halves of the
+review that were still open -- a guest's #DB not given back, its CR4 not
+intercepted, DR0-DR3 readable by the next VM, no speculation control -- and
+two things that are not bugs of the extension: a guest of four CPUs placed
+on one P-core's two threads and two E-cores (where its CPUs are placed knows
+nothing of P and E yet), and the first write into a sparse disk image's
+holes at 170 to 180 MB/s, against a gigabyte a second once its blocks are
+there.
+
+**The second** (the review's VT-x halves done -- item 1, 7 and 8, bugs 2 and
+5): seventeen of seventeen built-in guests on a thread of each of two
+P-cores (CPUs 0 and 41) and on two E-cores (48 and 62), `debug`, `cr4` and
+`dr` among them; every CPU deciding its own mitigations -- enhanced IBRS
+with BHI_DIS_S, VERW for RFDS, no L1D flush, which is Linux's reading of the
+same CPU -- and an IBPB between guests, 159 in the session; Linux with one
+CPU and with two, both online and each taking its own timer, and a disk
+written at 1.1 GB/s with `fsync` and read at 1.5; Alpine at its login prompt
+in 13 s with the TSC its clock and not a line of its log an error, fetching
+its package index through NAT; `rmmod` and a load again with nothing left
+on. What the mitigations cost an exit is in [What an exit
+costs](#what-an-exit-costs): 7% on a P-core, 20% on an E-core.
+
+To repeat it there: build in Ubuntu, mount nos's root by its UUID, copy
+`hv.ko` and the guests onto it, `grub-editenv <root>/grubenv set
+nos_next=nos` and reboot -- nos for one boot, Ubuntu after it ([Install:
+nos on a server](install.md)) -- then `insmod`, `hv on` and the rest over
+ssh as above.
+
 ## What comes next
 
 From [`plans/03-hypervisor.md`](../plans/03-hypervisor.md), in order, each a
@@ -2870,18 +3026,18 @@ someone else's; then speed.
    every other vCPU that touches a port waits on the lock, and every frame
    goes into the switch at memcpy speed. Fix: at most a queue's worth of
    chains a pass, the rest left for the next round.
-2. **An unprivileged process stops its whole VM.** Done but for VT-x's
-   #DB: the run loop gives a guest its own #AC back on both backends, and
-   its #DB under AMD-V -- a single step, and ICEBP, stepped past -- once
-   nothing an exit cut short is on its way in (`GuestCpu::exception`); an
-   instruction of VMX's, SVM's or GETSEC is answered #UD, RDPMC #GP. The
-   `debug` built-in guest single-steps and runs an `int1` and its own
-   handler must see both, DR6 right; hv-fuzz's platform target gives the
-   run loop the guest's #DB and #AC, now and then over an event still on
-   its way in. Left: VT-x's #DB, whose DR6 the exit does not write -- it has
-   to be put in the register by hand before the entry, the pending
-   single-step bit set where a shadow asks for it -- and which `debug`
-   still sees stop the guest there. What it was: every intercepted
+2. ~~**An unprivileged process stops its whole VM.**~~ Done: the run loop
+   gives a guest its own #AC and #DB back on both backends -- a single step,
+   and ICEBP, stepped past -- once nothing an exit cut short is on its way
+   in (`GuestCpu::exception`); an instruction of VMX's, SVM's or GETSEC is
+   answered #UD, RDPMC #GP. Under VT-x, whose exit writes no DR6, the DR6
+   its qualification says goes into the guest's at the exit, and a single
+   step out of an interrupt shadow is marked pending for the entry
+   ([The VMX backend](#the-vmx-backend-and-where-it-differs-from-amd-v)).
+   The `debug` built-in guest single-steps and runs an `int1` and its own
+   handler must see both, DR6 right, on both backends; hv-fuzz's platform
+   target gives the run loop the guest's #DB and #AC, now and then over an
+   event still on its way in. What it was: every intercepted
    exception was a stop (`Stop::Exception` in `run.rs`), #DB and #AC are
    intercepted always (CVE-2015-5307 and 8104), and an exit the run loop
    does not know is a stop too (`Stop::Unexpected`). A single step -- gdb's
@@ -2920,7 +3076,7 @@ someone else's; then speed.
    are bound to a CPU each, so today only `hv run` without a CPU can move;
    anything that moves a vCPU later meets it. Fix: skip the FXRSTOR only on
    the CPU the guest last loaded its registers on.
-5. **CR4.MCE is the guest's** -- ~~under AMD-V~~, done there: `hvarch`'s
+5. ~~**CR4.MCE is the guest's.**~~ Done -- under AMD-V: `hvarch`'s
    `Guest::run` sets MCE in the CR4 the guest runs with and intercepts
    every write of CR4, whatever the policy asks; `hv` intercepts the reads
    too, keeps the CR4 the guest wrote and answers from it (`hv/src/cr.rs`:
@@ -2936,11 +3092,14 @@ someone else's; then speed.
    Linux's global TLB flushes, which toggle PGE. QEMU's TCG, where the gates
    run, stops no read of CR4 (a bug of its own, [above](#what-entering-a-guest-cannot-be-told-to-do)):
    there the reads are checked by the fuzzer alone, and the `cr4` guest says
-   which it saw. **Left: VT-x**, whose CR4
-   guest/host mask is still VMXE alone: MCE in the mask, the guest's value
-   in the read shadow, and the bits CPUID denies kept off the same way. What
-   it was: AMD-V intercepted no CR at all and VT-x's mask was VMXE alone, so
-   a guest could clear MCE -- a kernel built without `X86_MCE` does, from
+   which it saw. And under VT-x, where the CR4 guest/host mask was VMXE
+   alone: MCE in the mask with every bit the guest does not own, the
+   guest's value in the read shadow, the register keeping MCE, and a write
+   that changes a bit of the mask performed by `crate::cr` as AMD-V's are --
+   the `cr4` guest read back what it wrote while the CPU's kept MCE, on the
+   EX44 and under nested KVM. What it was: AMD-V intercepted no CR at all
+   and VT-x's mask was VMXE alone, so a guest could clear MCE -- a kernel
+   built without `X86_MCE` does, from
    Linux's source -- and a machine check on that CPU while it ran was a
    shutdown: the host saw the guest's triple fault, restarted it, and never
    heard of the #MC. KVM keeps the host's MCE in the hardware CR4 under both
@@ -3021,8 +3180,9 @@ someone else's; then speed.
 
 #### Before other people's guests
 
-1. **Speculative-execution mitigation: AMD-V's world switch done, the rest
-   not.** Done ([What entering a guest cannot be told to
+1. **Speculative-execution mitigation: the world switch done, under both
+   extensions; what is not the world switch's, not.** Done under AMD-V
+   ([What entering a guest cannot be told to
    do](#what-entering-a-guest-cannot-be-told-to-do)): after every exit the
    guest's values are cleared out of the registers the run stub returns
    with, and the return stack is refilled before the host's first `ret`;
@@ -3038,12 +3198,30 @@ someone else's; then speed.
    which want the host's every `ret` through an untrained return thunk --
    a compiler's job, for the whole kernel -- or an IBPB at every exit, and
    BTI where there is no automatic IBRS, which wants the host built with
-   retpolines; a guest's own speculation control (IBRS, STIBP, SSBD, IBPB),
-   offered to none until its MSR is switched with it; and VT-x's half --
-   the registers and the return stack after an exit, IBPB, VERW where MDS,
-   TAA or RFDS apply (the EX44's E-cores have RFDS), an L1D flush where L1TF
-   does (the Dell), BHI clearing, eIBRS. The i5-13500 has BHI and RFDS;
-   Skylake, L1TF and MDS. KVM's set is the reference.
+   retpolines; and a guest's own speculation control (IBRS, STIBP, SSBD,
+   IBPB), offered to none until its MSR is switched with it. Done under VT-x
+   ([The VMX backend](#the-vmx-backend-and-where-it-differs-from-amd-v)),
+   decided for each CPU from what CPUID and IA32_ARCH_CAPABILITIES say of
+   it, with KVM's as the reference: the registers cleared and the return
+   stack refilled after every exit, as AMD-V's stub does; the IBPB between
+   guests; IBRS while the extension is on -- enhanced, set once, and on a
+   CPU without it written again after every exit -- with BHI_DIS_S where
+   the CPU has the control; VERW before every entry where MDS, TAA or RFDS
+   apply; and the L1 data cache flushed before every entry where L1TF does.
+   On the EX44's i5-13500 that is enhanced IBRS, BHI_DIS_S and VERW -- RFDS,
+   by its E-cores -- what Linux reports for it ("Enhanced / Automatic IBRS;
+   BHI: BHI_DIS_S", "Clear Register File"); on the Dell's Skylake it would be
+   legacy IBRS, VERW and the L1D flush. hv-test holds VT-x to the switches
+   and IBPBs as it does AMD-V, and `hv` reads every CPU's IA32_SPEC_CTRL
+   back, warning where it lost what `hv on` set. On the EX44 they cost an
+   exit 7% on a P-core and 20% on an E-core, most of that BHI_DIS_S ([What
+   an exit costs](#what-an-exit-costs)). Left under VT-x: the software
+   sequence that clears the branch history, for a CPU with enhanced IBRS
+   open to BHI and without BHI_DIS_S -- none of the machines here, but nos
+   under nested KVM on QEMU 8.2, which does not pass BHI_DIS_S through, and
+   `hv` says so -- and L1TF with hyper-threading, which an L1D flush does
+   not reach: the sibling's guest reads the cache meanwhile, and only a
+   guest's whole cores with the host's work kept off them would.
 2. ~~**The CPUID and MSR policy is a block-list, and it swallows.**~~ Done:
    both are allow-lists (`hv/src/policy.rs`, [A Linux
    guest](#a-linux-guest)). A leaf the policy does not name is all zeros,
@@ -3165,9 +3343,10 @@ someone else's; then speed.
    host's own tasks -- the network stack among them, which carries every
    guest's frames -- still run on any core; a core of the host's own for
    them is core scheduling, not placement.
-7. **Debug registers and PKRU, under VT-x.** AMD-V's half is done: a
-   guest's DR0-3 are its own, every `mov` of them intercepted and performed
-   on a copy per vCPU, and the CPU's made that copy before each entry --
+7. ~~**Debug registers and PKRU, under VT-x.**~~ Done, under both. Under
+   AMD-V a guest's DR0-3 are its own, every `mov` of them intercepted and
+   performed on a copy per vCPU, and the CPU's made that copy before each
+   entry --
    writing only what differs from what the CPU holds ([What entering a
    guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)).
    hv-test's `dr` guest runs two VMs on one CPU, the second reading 0 where
@@ -3175,20 +3354,33 @@ someone else's; then speed.
    address -- the world switch before this failed it, the second VM
    reading the first's breakpoint address and pattern, and one without the
    load, or loading only when the guest's DR7 enabled a breakpoint, never
-   fired the first's breakpoint; hv-fuzz's platform target holds every `mov` of them -- a read,
-   a write, at CPL 3, under general detect -- to a model of its own, and
+   fired the first's breakpoint; hv-fuzz's platform target holds every
+   `mov` of them -- a read, a write, at CPL 3, under general detect -- to a
+   model of its own, and
    seven mutants of `hv/src/dr.rs` each failed within 145 inputs. What it
    was: DR0-3 switched by neither backend, one guest's breakpoint addresses
-   the next's to read and to move. Left: VT-x, which switches neither DR0-3
-   nor DR6 ([above](#the-vmx-backend-and-where-it-differs-from-amd-v)); and
-   on a host with PKU a guest under VT-x sets CR4.PKE and PKRU, which
-   nothing switches either. Under AMD-V its write of CR4.PKE is a #GP (item
-   5), its CPUID not offering PKU, and WRPKRU is then the #UD it is without
-   PKE.
-8. **VT-x's controls are taken on trust.** `adjust` drops a control the CPU,
-   or an outer hypervisor, does not allow, and only the MSR bitmap is looked
-   at again: a CR8, WBINVD, I/O, external-interrupt or NMI exit gone missing
-   would go unnoticed. Fix: a required set, and a guest refused without it.
+   the next's to read and to move. Under VT-x every `mov` of a debug
+   register exits and `crate::dr` answers it -- DR0-3 from the guest's own
+   four, made the CPU's before its entries as AMD-V's are, DR6 from the
+   guest's own, DR7 the VMCS's, which the entry loads
+   ([above](#the-vmx-backend-and-where-it-differs-from-amd-v)); the `dr`
+   guest's second VM reads 0 there too, each breakpoint firing at its own
+   address, all eighteen `mov`s of a debug register the host's, and the
+   platform target holds DR4-DR7 to its model as well -- three mutants of
+   `dr.rs` (DR6 written whole, the #UD of DR4 and DR5 checked after the CPL,
+   no #GP for a bit above 31) each failed at once. And PKRU: a guest's write
+   of CR4.PKE is a #GP under both now (item 5), its CPUID not offering PKU,
+   and WRPKRU is then the #UD it is without PKE -- under VT-x it was the
+   guest's to set, and nothing switched the register.
+8. ~~**VT-x's controls are taken on trust.**~~ Done: a control the host
+   needs that `adjust` dropped -- the exits for interrupts and NMIs, ports,
+   CR8, MONITOR, MWAIT, RDPMC, every `mov` of a debug register and WBINVD,
+   EPT, the 64-bit host, EFER's, the PAT's and DR7's switch -- or one the
+   guest was promised, unrestricted guest and its VPID, refuses the guest,
+   naming the field and the bits (`Refusal::Controls`). What it was:
+   `adjust` dropped a control the CPU, or an outer hypervisor, did not
+   allow, and only the MSR bitmap was looked at again: a CR8, WBINVD, I/O,
+   external-interrupt or NMI exit gone missing would have gone unnoticed.
 9. ~~**A guest's console is the host's log.**~~ Done: a guest's console
    goes to the kernel log a boot's worth at once -- a thousand lines --
    and fifty lines a second after that, per VM (`modules/hv/src/guest.rs`,

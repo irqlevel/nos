@@ -32,6 +32,10 @@ pub enum Refusal {
     /// for ([`Cpu::enter`]): the nested table its VMCB or VMCS names would
     /// not be that memory's.
     NotItsMemory,
+    /// This CPU -- or a hypervisor under this one -- will not take a VT-x
+    /// control the host needs to keep a guest off what is the host's:
+    /// `missing`, of the `field` controls.
+    Controls { cpu: u32, field: &'static str, missing: u32 },
 }
 
 /// One guest's CPU, of whichever kind the machine runs. Every method the run
@@ -68,6 +72,19 @@ impl Backend {
     }
     pub fn regs_mut(&mut self) -> &mut GuestRegs {
         match self { Backend::Svm(v) => v.regs_mut(), Backend::Vmx(v) => v.regs_mut() }
+    }
+    /// Set general-purpose register `n`, numbered as the encoding numbers
+    /// them, for an instruction performed for the guest: RSP the VMCB's
+    /// under AMD-V, and under VT-x the VMCS's, written at the next entry --
+    /// where the shadow's alone would be lost.
+    pub fn set_gpr(&mut self, n: u8, value: u64) {
+        match self {
+            Backend::Svm(v) => {
+                let (save, regs) = v.save_and_regs_mut();
+                *crate::mmio::gpr_mut(save, regs, n) = value;
+            }
+            Backend::Vmx(v) => v.set_gpr(n, value),
+        }
     }
     pub fn long_mode(&mut self, l: &LongMode) {
         match self { Backend::Svm(v) => v.long_mode(l), Backend::Vmx(v) => v.long_mode(l) }
@@ -138,30 +155,53 @@ impl Backend {
     pub fn cr0_write(&mut self, value: u64) {
         match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.cr0_write(value) }
     }
-    /// The CR4 the guest believes it has: under AMD-V what it last wrote,
-    /// which its reads of CR4 get ([`Exit::Cr4`]), while the register keeps
-    /// MCE; under VT-x, which does not stop a guest at CR4 yet, the register.
+    /// The CR4 the guest believes it has, which its reads of CR4 get: what
+    /// it last wrote of the bits the host keeps -- MCE among them -- while
+    /// the register keeps MCE set. Under AMD-V the whole of it is what it
+    /// last wrote ([`Exit::Cr4`]); under VT-x the register's other bits,
+    /// which the guest writes without an exit, as of its last exit for a
+    /// control or a debug register, a fault, or a stop.
     pub fn cr4(&self) -> u64 {
-        match self { Backend::Svm(v) => v.cr4(), Backend::Vmx(v) => v.save().cr4 }
+        match self { Backend::Svm(v) => v.cr4(), Backend::Vmx(v) => v.cr4() }
     }
     /// Make `value` the guest's CR4, for a write of it `crate::cr` performed
-    /// -- its TLB flushed with `flush`. Only AMD-V stops a guest at a CR4
-    /// write, so there is nothing for VT-x's side to do.
+    /// -- its TLB flushed with `flush`.
     pub fn set_cr4(&mut self, value: u64, flush: bool) {
-        match self { Backend::Svm(v) => v.set_cr4(value, flush), Backend::Vmx(_) => {} }
+        match self { Backend::Svm(v) => v.set_cr4(value, flush), Backend::Vmx(v) => v.set_cr4(value, flush) }
     }
-    /// The guest's DR0-DR3, which its reads of them get ([`Exit::Dr`]):
-    /// under AMD-V its own, kept apart from the CPU's. VT-x does not stop a
-    /// guest at a debug register yet, nor keeps its four apart: there they
-    /// are the CPU's, and nothing asks this.
+    /// The CR4 the CPU runs the guest with: MCE in it whatever the guest
+    /// wrote.
+    pub fn cr4_register(&self) -> u64 {
+        match self { Backend::Svm(v) => v.save().cr4, Backend::Vmx(v) => v.cr4_register() }
+    }
+    /// The guest's DR0-DR3, which its reads of them get ([`Exit::Dr`]): its
+    /// own, kept apart from the CPU's, which are made them before its every
+    /// entry.
     pub fn debug_addrs(&self) -> [u64; 4] {
-        match self { Backend::Svm(v) => v.debug_addrs(), Backend::Vmx(_) => [0; 4] }
+        match self { Backend::Svm(v) => v.debug_addrs(), Backend::Vmx(v) => v.debug_addrs() }
     }
     /// Make `addrs` the guest's DR0-DR3, for a write of one `crate::dr`
-    /// performed: under AMD-V, the CPU's from its next entry on. Only AMD-V
-    /// stops a guest at one, so there is nothing for VT-x's side to do.
+    /// performed: the CPU's from its next entry on.
     pub fn set_debug_addrs(&mut self, addrs: [u64; 4]) {
-        match self { Backend::Svm(v) => v.set_debug_addrs(addrs), Backend::Vmx(_) => {} }
+        match self { Backend::Svm(v) => v.set_debug_addrs(addrs), Backend::Vmx(v) => v.set_debug_addrs(addrs) }
+    }
+    /// Make `value` the guest's DR7, for a write of it -- or general
+    /// detect's clearing of GD -- `crate::dr` performed: the VMCB's, which
+    /// `vmrun` loads, or the VMCS's, which the entry loads.
+    pub fn set_dr7(&mut self, value: u64) {
+        match self { Backend::Svm(v) => v.save_mut().dr7 = value, Backend::Vmx(v) => v.set_dr7(value) }
+    }
+    /// The length of the instruction the guest stopped at, where the exit
+    /// says it -- VT-x's do, for every instruction that exits -- and None
+    /// where the host has to decode it to know.
+    pub fn exit_insn_len(&self) -> Option<u64> {
+        match self { Backend::Svm(_) => None, Backend::Vmx(v) => Some(v.exit_insn_len()) }
+    }
+    /// Whether the guest was in 64-bit code at the instruction it stopped
+    /// at: long mode active, and CS's L bit -- as of the exit, under VT-x
+    /// one for a control or a debug register.
+    pub fn in_64bit_code(&self) -> bool {
+        match self { Backend::Svm(v) => v.in_64bit_code(), Backend::Vmx(v) => v.in_64bit_code() }
     }
     pub fn inject_extint(&mut self, vector: u8) {
         match self { Backend::Svm(v) => v.inject_extint(vector), Backend::Vmx(v) => v.inject_extint(vector) }
@@ -189,18 +229,11 @@ impl Backend {
     pub fn reflect_exception(&mut self, vector: u8, error: Option<u32>) {
         match self { Backend::Svm(v) => v.reflect_exception(vector, error), Backend::Vmx(v) => v.reflect_exception(vector, error) }
     }
-    /// Whether a #DB the host intercepted goes back to the guest: under
-    /// AMD-V, whose VMCB holds the DR6 the CPU wrote at the exit. VT-x writes
-    /// no DR6 at a #DB exit, and the guest's has to be put in the register
-    /// by hand before the entry -- with the pending single-step bit where a
-    /// shadow asks for it -- which is not done yet: there a #DB still stops
-    /// the VM, and says so.
-    pub fn reflects_debug(&self) -> bool {
-        matches!(self, Backend::Svm(_))
-    }
-    /// Step past an ICEBP AMD-V intercepted; VT-x has none to step past.
+    /// Step past an ICEBP (`int1`), which stopped the guest -- AMD-V's
+    /// intercept of it, or VT-x's of the #DB it raises, which exits at the
+    /// instruction -- for its #DB to be given as the trap it is, after it.
     pub fn skip_icebp(&mut self) {
-        match self { Backend::Svm(v) => v.skip_icebp(), Backend::Vmx(_) => {} }
+        match self { Backend::Svm(v) => v.skip_icebp(), Backend::Vmx(v) => v.skip_icebp() }
     }
     pub fn request_irq_window(&mut self) {
         match self { Backend::Svm(v) => v.request_irq_window(), Backend::Vmx(v) => v.request_irq_window() }

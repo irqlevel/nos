@@ -165,7 +165,12 @@ able to say why.
 - **Per-CPU state** is `PerCpu<LocalCounter…>` for numbers and `CpuLocal<T>`
   for anything exclusive -- never an `UnsafeCell<[T; MAX_CPUS]>` indexed by
   `cpu::id()`, which is a data race the moment a task migrates between the
-  index and the access.
+  index and the access. A `with` is three calls into the kernel --
+  interrupts off, which CPU this is, interrupts back on -- so a hot path
+  keeps what it needs of its CPU in one `CpuLocal` and takes it once: the
+  hypervisor's entry had three, one a table, and they cost every exit on the
+  EX44 400 ns of its 2.2 µs (`Entries` in `hvarch/src/x86.rs` is the one
+  now).
 - **What only the receive path touches** is an `RxOwned<T>`, reached with
   the `&mut RxContext` the receive pass makes once and lends down: a
   driver's receive ring, and the replies a listener gathers during a batch.

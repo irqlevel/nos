@@ -1207,23 +1207,21 @@ impl LinuxGuest {
                     }
                 }
                 Exit::Shutdown => Some(Stop::Shutdown { rip }),
-                /* #AC, and #DB where the backend can give it back, are
-                 * intercepted only so that a guest cannot have the CPU
-                 * deliver one inside another for good (CVE-2015-5307 and
-                 * 8104): the guest's own -- a user process's single step,
-                 * its unaligned access with AC set -- goes back to it, not
-                 * a stop of its whole VM. */
-                Exit::Exception { vector, error }
-                    if vector == VECTOR_AC || (vector == VECTOR_DB && gc.cpu.backend().reflects_debug()) =>
-                {
+                /* #AC and #DB are intercepted only so that a guest cannot
+                 * have the CPU deliver one inside another for good
+                 * (CVE-2015-5307 and 8104): the guest's own -- a user
+                 * process's single step, its unaligned access with AC set --
+                 * goes back to it, not a stop of its whole VM. */
+                Exit::Exception { vector, error } if vector == VECTOR_AC || vector == VECTOR_DB => {
                     gc.counts.reflected += 1;
                     gc.exception = Some((vector, error));
                     None
                 }
                 Exit::Exception { vector, .. } => Some(Stop::Exception { vector, rip }),
-                /* `int1`, intercepted by AMD-V: stepped past, and its #DB
-                 * given as the trap it is, after the instruction. */
-                Exit::Other(vmcb::exit::ICEBP) if gc.cpu.backend().reflects_debug() => {
+                /* `int1` -- AMD-V's intercept of it, or VT-x's of the #DB
+                 * it raises, which exits at the instruction: stepped past,
+                 * and its #DB given as the trap it is, after it. */
+                Exit::Other(vmcb::exit::ICEBP) => {
                     gc.counts.reflected += 1;
                     gc.cpu.backend_mut().skip_icebp();
                     gc.exception = Some((VECTOR_DB, None));
@@ -1275,10 +1273,10 @@ impl LinuxGuest {
                     gc.cpu.backend_mut().cr0_write(value);
                     None
                 }
-                Exit::Cr4 { write } => {
+                Exit::Cr4 { write, gpr } => {
                     gc.counts.cr4 += 1;
                     let mut bytes = mmio::Bytes::default();
-                    match cr::cr4_access(gc.cpu.backend_mut(), &self.memory, write, self.cr4_allowed, &mut bytes) {
+                    match cr::cr4_access(gc.cpu.backend_mut(), &self.memory, write, self.cr4_allowed, gpr, &mut bytes) {
                         Ok(cr::Done::Refused) => {
                             gc.counts.cr4_gp += 1;
                             None
@@ -1287,11 +1285,11 @@ impl LinuxGuest {
                         Err(error) => Some(Stop::CrInsn { rip, error, bytes }),
                     }
                 }
-                Exit::Dr { write, dr: n } => {
+                Exit::Dr { write, dr: n, gpr } => {
                     gc.counts.dr += 1;
                     let mut bytes = mmio::Bytes::default();
-                    match dr::dr_access(gc.cpu.backend_mut(), &self.memory, write, n, &mut bytes) {
-                        Ok(dr::Done::Refused | dr::Done::Detected) => {
+                    match dr::dr_access(gc.cpu.backend_mut(), &self.memory, write, n, gpr, &mut bytes) {
+                        Ok(dr::Done::Refused | dr::Done::Undefined | dr::Done::Detected) => {
                             gc.counts.dr_refused += 1;
                             None
                         }

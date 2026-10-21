@@ -38,6 +38,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+sys.path.insert(0, HERE)
+
+import parttest as pt  # noqa: E402  (scripts/parttest.py)
 
 SSH_PORT = 2222
 HTTP_PORT = 8000
@@ -306,7 +309,7 @@ def aarch64(t):
     t.mkrootfs(image, empty)
     with open(os.path.join(t.tmp, "big.txt"), "w") as f:
         f.write(("x" * 63 + "\n") * (BIG // 64))
-    shutil.copy(os.path.join(ROOT, "out", "aarch64", "modules", "sshd.ko"), os.path.join(t.tmp, "sshd.ko"))
+    shutil.copy(pt.module_path("aarch64", "sshd"), os.path.join(t.tmp, "sshd.ko"))
     serve_http(t.tmp)
 
     hvf = platform.system() == "Darwin" and platform.machine() == "arm64" and not t.tcg
@@ -426,7 +429,7 @@ def x86_64(t):
     log = os.path.join(t.tmp, "serial.log")
     rootdir = os.path.join(t.tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc", "ssh"))
-    shutil.copy(os.path.join(ROOT, "out", "x86_64", "modules", "sshd.ko"), os.path.join(rootdir, "sshd.ko"))
+    shutil.copy(pt.module_path("x86_64", "sshd"), os.path.join(rootdir, "sshd.ko"))
     with open(os.path.join(rootdir, "etc", "ssh", "authorized_keys"), "w") as f:
         f.write("# the test's key\n" + t.pub + "\n")
     with open(os.path.join(rootdir, "etc", "rc"), "w") as f:

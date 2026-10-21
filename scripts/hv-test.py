@@ -156,36 +156,37 @@ GUESTS = {
     # store a data breakpoint watches in a nested guest.
     "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
            r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
-           r"\b14 and 14 of DR0-DR3 performed, 1 and 1 exceptions given back"],
+           r"\b14 and 14 movs of debug registers performed, 1 and 1 exceptions given back"],
 }
 
-# Six of the guests test a mechanism only one vendor has: AMD-V's software
-# VMCB check (`refused`), its ASID recycling (`asid`), its shadow TPR
-# (`tpr`), the DR6 its VMCB keeps at a #DB (`debug`), its CR4 intercept
-# (`cr4`) and the DR0-DR3 it keeps apart (`dr`). Under Intel VT-x the CPU
-# refuses a bad VMCS itself; the ASID is a VPID held for the guest's life, so
-# the third VM gets one of the first two's back; CR8 is the host's, so the
-# guest is stopped at each access and answered from a shadow; a #DB is not
-# given back yet; and neither CR4 nor DR0-DR3 is intercepted yet, the CPU
-# taking every write itself. What each says differs; the rest is one.
+# Five of the guests test a mechanism each vendor has its own way: AMD-V's
+# software VMCB check (`refused`), its ASID recycling (`asid`), its shadow
+# TPR (`tpr`), its CR4 intercepts (`cr4`) and its intercept of DR0-DR3
+# (`dr`). Under Intel VT-x the CPU refuses a bad VMCS itself; the ASID is a
+# VPID held for the guest's life, so the third VM gets one of the first two's
+# back; CR8 is the host's, so the guest is stopped at each access and
+# answered from a shadow; a write of CR4 stops it only where it changes a bit
+# the host keeps -- three of five -- its reads the read shadow's, and PAE
+# cleared the CPU's own #GP; and every `mov` of a debug register stops it,
+# DR6's and DR7's in its #DB handler too -- eighteen. What each says differs;
+# the rest is one, `debug` among it: a #DB given back with the DR6 the exit
+# said.
 GUESTS_VMX = {
     "refused": [r"the CPU refused the VMCS at entry for invalid guest state"],
     "asid": [r"vm C was given VPID \d+, which vm [AB] had, and read its own too"],
     "tpr": [r"wrote 15 to its CR8 and read it back, stopped at each and answered from the shadow, and the host's CR8 is still 0"],
-    # VT-x writes no DR6 at a #DB exit, and gives the guest no #DB back
-    # until the register is put right by hand: the single step stops it.
-    "debug": [r"VT-x gives no #DB back yet: the single step stopped it, after the NOP"],
-    # Not run under VT-x this round: what any CPU does with the writes, and
-    # nothing the host keeps.
-    "cr4": [r"VT-x does not stop a guest at CR4 yet"],
-    # Its breakpoint's #DB stops it, and the second VM reads what the
-    # first left in the CPU's registers.
-    "dr": [r"VT-x does not keep a guest's DR0-DR3 apart yet"],
+    "cr4": [r"it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- while the CPU's CR4 "
+            r"kept MCE",
+            r"SMEP and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
+            r"\b3 of CR4 performed, 2 refused"],
+    "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
+           r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
+           r"\b18 and 18 movs of debug registers performed, 1 and 1 exceptions given back"],
 }
 
 
 def module(arch):
-    ko = os.path.join(ROOT, "out", arch, "modules", "hv.ko")
+    ko = pt.module_path(arch, "hv")
     if not os.path.exists(ko):
         sys.exit("no %s -- make modules ARCH=%s first" % (ko, arch))
     return ko
@@ -372,15 +373,19 @@ def x86_checks(ran):
 
     # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after
     # another guest's there: an IBPB between each two where the CPU has
-    # one (`hv::spec`), and a count of them either way. AMD-V's alone.
-    if backend == "svm":
-        m = re.search(r"guests switched on a CPU (\d+) times(, an IBPB between each two \((\d+) issued\))?", out[14])
-        switches = int(m.group(1)) if m else 0
-        pt.check("the guests switched on a CPU at least twice a guest, each switch counted",
-                 switches >= 2 * len(GUESTS), out[14])
-        pt.check("and each with an IBPB where the CPU has one",
-                 m is not None and (m.group(3) is None and "has no IBPB" in out[14]
-                                    or m.group(3) is not None and int(m.group(3)) == switches), out[14])
+    # one (`hv::spec`), and a count of them either way, under both
+    # extensions.
+    m = re.search(r"guests switched on a CPU (\d+) times(, an IBPB between each two \((\d+) issued\))?", out[14])
+    switches = int(m.group(1)) if m else 0
+    pt.check("the guests switched on a CPU at least twice a guest, each switch counted",
+             switches >= 2 * len(GUESTS), out[14])
+    pt.check("and each with an IBPB where the CPU has one",
+             m is not None and (m.group(3) is None and "has no IBPB" in out[14]
+                                or m.group(3) is not None and int(m.group(3)) == switches), out[14])
+    # Read back from every CPU's register, where `hv on` set one: what it
+    # set is still there after the guests.
+    pt.check("and every CPU's IA32_SPEC_CTRL still has what hv on set there",
+             "IA32_SPEC_CTRL" not in out[14], out[14])
 
     pt.check("a second insmod is refused", "loaded at" not in out[15], out[15])
     pt.check("a CPU that does not exist is refused", "is not a CPU" in out[16], out[16])
