@@ -40,7 +40,8 @@
 #
 # For a test: NOS_GRUB_D in place of /etc/grub.d, NOS_UPDATE_GRUB in place of
 # update-grub (true: nothing), NOS_ALLOW_ANY_DISK=1 not to ask what the
-# partition's disk is.
+# partition's disk is, NOS_CPUINFO and NOS_UCODE_DIR in place of /proc/cpuinfo
+# and /lib/firmware/intel-ucode.
 
 set -euo pipefail
 # A failure inside $(...) is a failure too (bash 4.4 and later)
@@ -425,12 +426,51 @@ put_system() {
         say "sshd lets in: $k"
     done
 
+    put_ucode "$mnt"
+
     # The grubenv: what this machine boots nos with, and the one-shot flag
     # GRUB reads and clears (42_nos) -- in place, its one block, which is
     # why it is only ever written by GRUB's own tool
     [ -f "$mnt/grubenv" ] || editenv "$mnt/grubenv" create
     if [ "$SET_CMDLINE" = 1 ]; then
         editenv "$mnt/grubenv" set "nos_cmdline=$CMDLINE"
+    fi
+}
+
+# This machine's microcode, from its own system, which keeps it current:
+# Intel's file for this CPU, /lib/firmware/intel-ucode/<family>-<model>-
+# <stepping>, at /boot/ucode, which GRUB loads beside the kernel and the
+# kernel loads on every CPU as it boots (docs/boot.md); none, and nos runs
+# firmware's. Refreshed by every install and update.
+put_ucode() {
+    local mnt=$1 dir=${NOS_UCODE_DIR:-/lib/firmware/intel-ucode} name
+    name=$(awk -F': *' '
+        /^vendor_id/ { vendor = $2 }
+        /^cpu family/ { family = $2 }
+        /^model[ \t]*:/ { model = $2 }
+        /^stepping/ { stepping = $2 }
+        /^$/ { exit }
+        END { if (vendor == "GenuineIntel") printf "%02x-%02x-%02x", family, model, stepping }
+    ' "${NOS_CPUINFO:-/proc/cpuinfo}")
+    if [ -n "$name" ] && [ -f "$dir/$name" ]; then
+        rm -f "$mnt/boot/ucode.new"
+        cp "$dir/$name" "$mnt/boot/ucode.new"
+        mv -T "$mnt/boot/ucode.new" "$mnt/boot/ucode"
+        say "microcode: $dir/$name, revision $(ucode_revision "$mnt/boot/ucode")"
+    elif [ -e "$mnt/boot/ucode" ]; then
+        rm -f "$mnt/boot/ucode"
+        say "microcode: none for this CPU here; nos runs firmware's"
+    fi
+}
+
+# The revision of the first update in a microcode file, as its header has it
+ucode_revision() {
+    local word
+    word=$(od -An -tx4 -j4 -N4 "$1" | tr -d ' \n')
+    if [ -n "$word" ]; then
+        printf '0x%x' "0x$word"
+    else
+        printf 'unknown (the file is too short)'
     fi
 }
 
@@ -708,7 +748,7 @@ cmd_boot() {
 }
 
 cmd_status() {
-    local uuid next mp
+    local uuid next mp params
     need blkid findmnt lsblk mount umount mountpoint
     need_editenv
     uuid=$(registered_uuid)
@@ -724,7 +764,8 @@ cmd_status() {
     echo "installed:   $(describe "$MNT/VERSION")"
     echo "previous:    $(describe "$MNT/VERSION.prev")"
     if [ -f "$MNT/grubenv" ]; then
-        echo "parameters:  $(editenv "$MNT/grubenv" list | sed -n 's/^nos_cmdline=//p')"
+        params=$(editenv "$MNT/grubenv" list | sed -n 's/^nos_cmdline=//p')
+        echo "parameters:  ${params:-none}"
         next=$(editenv "$MNT/grubenv" list | sed -n 's/^nos_next=//p')
         if [ -n "$next" ]; then
             echo "next boot:   $next, once"
@@ -735,6 +776,11 @@ cmd_status() {
         echo "grubenv:     none"
     fi
     echo "ssh keys:    $(grep -c '^ssh-' "$MNT/etc/ssh/authorized_keys" 2>/dev/null || true)"
+    if [ -f "$MNT/boot/ucode" ]; then
+        echo "microcode:   revision $(ucode_revision "$MNT/boot/ucode") at /boot/ucode"
+    else
+        echo "microcode:   none; nos runs firmware's"
+    fi
     unmount_partition "$PART"
 }
 

@@ -27,6 +27,7 @@ Parameters::Parameters()
     , ItsEnabled(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
     , HwRngOff(false)
     , HwpOff(false)
+    , UcodeOff(false)
     , WxProbeMd(WxProbeOff)
     , UsbOff(false)
     , RcOff(false)
@@ -87,6 +88,11 @@ bool Parameters::IsHwRngOff()
 bool Parameters::IsHwpOff()
 {
     return HwpOff;
+}
+
+bool Parameters::IsUcodeOff()
+{
+    return UcodeOff;
 }
 
 bool Parameters::IsItsEnabled()
@@ -361,6 +367,10 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     else if (Stdlib::StrCmp(key, "hwp") == 0)
     {
         HwpOff = (Stdlib::StrCmp(value, "off") == 0);
+    }
+    else if (Stdlib::StrCmp(key, "ucode") == 0)
+    {
+        UcodeOff = (Stdlib::StrCmp(value, "off") == 0);
     }
     else if (Stdlib::StrCmp(key, "wxprobe") == 0)
     {

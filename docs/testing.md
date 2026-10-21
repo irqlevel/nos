@@ -118,7 +118,7 @@ swallowing panic messages whole.
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
-| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
+| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -255,8 +255,13 @@ The first boot must be nos, once -- the entry from the image's `nos.cfg`,
 the root mounted by UUID read-write -- with sshd started by the image's
 `/etc/rc`, a host key made and the given key let in, the kernel and the root's
 `/VERSION` both the image's, no `udpshell` on the command line and no UDP
-shell answering. The second boot must be the host's own entry: GRUB cleared
-the flag. Then `nos-install update`, finding the partition through the GRUB
+shell answering. The install is given a made-up machine's `/proc/cpuinfo`
+and firmware directory (`NOS_CPUINFO`, `NOS_UCODE_DIR`) holding a file of
+one microcode update for its CPU: it has to say it put that file at
+`/boot/ucode`, GRUB has to hand it to the kernel as the module `ucode`, and
+the kernel has to find it and say why it loads nothing under QEMU, whose
+CPU is a hypervisor's. The second boot must be the host's own entry: GRUB
+cleared the flag. Then `nos-install update`, finding the partition through the GRUB
 entry, over what nos wrote: e2fsck finds the partition clean, the host key
 nos made stays, the old kernel and modules go to `.prev`, the UDP shell it
 is asked for goes into the kernel parameters and a boot is armed; the third
@@ -1022,11 +1027,26 @@ what its header says it does:
   whole, never read as the shorter one it would be;
 - `multiboot`: Multiboot2 infos as GRUB makes them -- memory maps of every
   entry size, and one longer than the map holds; the command line; both
-  RSDP tags; the framebuffer; the tags this kernel skips -- and damaged:
-  sizes that lie, a tag past the info's end, no end tag. What
+  RSDP tags; the framebuffer; modules, `ucode` among other names and names
+  the tag cuts short, of ranges empty or not; the tags this kernel skips --
+  and damaged: sizes that lie, a tag past the info's end, no end tag. What
   `ParseMultiBootInfo` leaves -- the memory map region by region, the
-  command line, the RSDP's copy, the framebuffer -- is held to the tags
-  read in order, the map's reserved regions before its usable RAM;
+  command line, the RSDP's copy, the framebuffer, the microcode module's
+  range -- is held to the tags read in order, the map's reserved regions
+  before its usable RAM;
+- `ucode`: files of Intel's microcode updates (`arch/x86_64/microcode_file.cpp`),
+  what GRUB loads from `/boot/ucode` and the BSP chooses its CPU's update
+  from, built update by update as Intel lays one out -- the original
+  2048-byte format, data and total sizes of their own, an extended signature
+  table naming other CPUs and platforms, every checksum made right -- for the
+  CPU the input makes up or for another, of revisions above and below the
+  one it runs; then one update made unsound in a way the SDM rules out, bytes
+  after the last, or bytes of anything written over it. Over a file the
+  generator made, `Choose` is held to a model written from the SDM (Vol. 3A,
+  10.11.1): the newest update for the CPU above its revision, of those before
+  the first unsound one; over any file, a choice is an update inside the
+  file, sound by the model's reading of one, for the CPU and newer than what
+  it runs;
 - `acpi`: the tables in a physical memory of the input's, sparse, zeros
   where nothing was put: an RSDP in the Multiboot tag's copy, the EBDA or
   the BIOS area, among decoys; an RSDT or an XSDT; and tables below and

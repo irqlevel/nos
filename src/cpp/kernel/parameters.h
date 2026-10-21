@@ -71,6 +71,10 @@ public:
        than turning on hardware P-states (Hal::SetupCpuPerformance) */
     bool IsHwpOff();
 
+    /* ucode=off -- x86: load no microcode from the module GRUB put beside
+       the kernel; the CPUs run firmware's (arch/x86_64/microcode.h) */
+    bool IsUcodeOff();
+
     bool IsConsoleSerial();
     bool IsConsoleVga();
     bool IsConsoleBoth();
@@ -181,6 +185,7 @@ private:
     bool ItsEnabled;
     bool HwRngOff;
     bool HwpOff;
+    bool UcodeOff;
     WxProbeMode WxProbeMd;
     bool UsbOff;
     bool RcOff;

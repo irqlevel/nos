@@ -50,7 +50,8 @@ struct Expected
 {
     bool TraceVga = false, PanicVga = false, SmpOff = false, ItsEnabled = true, HwRngOff = false;
     int WxProbe = 0; /* off, text, heap */
-    bool UsbOff = false, RcOff = false;
+    bool UsbOff = false, RcOff = false, HwpOff = false, UcodeOff = false;
+    ulong PanicResetSecs = 0;
     int Console = 0; /* both, serial, vga */
     int Dhcp = 0;    /* on, auto, off */
     ulong MaxCpus = 0, NetFrames = 0, TailKb = 0;
@@ -149,8 +150,13 @@ void Take(Expected& e, const std::string& token)
     unsigned long long n;
     if (key == "trace" && value == "vga")
         e.TraceVga = true;
-    else if (key == "panic" && value == "vga")
-        e.PanicVga = true;
+    else if (key == "panic")
+    {
+        if (value == "vga")
+            e.PanicVga = true;
+        else if (Number(value, n) && n <= Parameters::PanicResetSecsMax)
+            e.PanicResetSecs = n;
+    }
     else if (key == "its")
         e.ItsEnabled = value != "off";
     else if (key == "usb")
@@ -159,6 +165,10 @@ void Take(Expected& e, const std::string& token)
         e.RcOff = value == "off";
     else if (key == "hwrng")
         e.HwRngOff = value == "off";
+    else if (key == "hwp")
+        e.HwpOff = value == "off";
+    else if (key == "ucode")
+        e.UcodeOff = value == "off";
     else if (key == "wxprobe")
     {
         if (value == "on" || value == "text")
@@ -314,9 +324,9 @@ Expected Read(const std::string& line)
 
 /* ---- the line ---- */
 
-const char* const Words[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "wxprobe", "smp", "maxcpus", "console",
-                             "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes", "nctail", "loglevel",
-                             "root", "fstest", "disklog", "dns"};
+const char* const Words[] = {"trace", "panic", "its", "usb", "rc", "hwrng", "hwp", "ucode", "wxprobe", "smp",
+                             "maxcpus", "console", "dhcp", "udpshell", "netconsole", "rxpoll", "ubsan", "netframes",
+                             "nctail", "loglevel", "root", "fstest", "disklog", "dns"};
 
 const char* const BadIps[] = {"1.2.3", "1.2.3.4.5", "01.2.3.4", "1..2.3", "a.b.c.d", "1.2.3.4:5",
                               "255.255.255.255"};
@@ -325,8 +335,8 @@ const char* const Strays[] = {"quiet", "splash", "r", "=", "a=", "=b", "foo=bar"
                               "ro=1"};
 
 const char* const Values[] = {"on", "off", "vga", "serial", "both", "auto", "text", "heap", "warn", "", "0", "1",
-                              "64", "65", "65535", "65536", "1024", "1025", "5", "6", "18446744073709551615",
-                              "18446744073709551616", "-1", "1x", "abc"};
+                              "64", "65", "65535", "65536", "1024", "1025", "3600", "3601", "5", "6",
+                              "18446744073709551615", "18446744073709551616", "-1", "1x", "abc"};
 
 std::string Value(Fuzz::Input& in, const std::string& key)
 {
@@ -425,6 +435,8 @@ void Run(Fuzz::Input& in)
     INVARIANT(e.Kept == p.GetCmdline(), "the line kept is '%s', not '%s'", p.GetCmdline(), e.Kept.c_str());
     INVARIANT(p.IsTraceVga() == e.TraceVga && p.IsPanicVga() == e.PanicVga && p.IsSmpOff() == e.SmpOff,
         "trace, panic or smp read wrong");
+    INVARIANT(p.GetPanicResetSecs() == e.PanicResetSecs, "panic=%lu, not %lu", p.GetPanicResetSecs(), e.PanicResetSecs);
+    INVARIANT(p.IsHwpOff() == e.HwpOff && p.IsUcodeOff() == e.UcodeOff, "hwp or ucode read wrong");
     INVARIANT(p.IsItsEnabled() == e.ItsEnabled && p.IsHwRngOff() == e.HwRngOff && p.IsUsbOff() == e.UsbOff &&
         p.IsRcOff() == e.RcOff, "its, hwrng, usb or rc read wrong");
     INVARIANT(p.IsWxProbeText() == (e.WxProbe == 1) && p.IsWxProbeHeap() == (e.WxProbe == 2), "wxprobe read wrong");

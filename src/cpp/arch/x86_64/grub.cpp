@@ -22,9 +22,23 @@ static bool AcpiRsdpIsNew;
    in: PageArray's, with room to spare */
 static const ulong KernelCarveOuts = 4;
 
+/* The `ucode` module's physical range; UcodeEnd 0 for none */
+static const char UcodeModuleName[] = "ucode";
+static ulong UcodeStart;
+static ulong UcodeEnd;
+
 static bool FramebufferPresent;
 static u8 FramebufferType;
 static FramebufferInfo Framebuffer;
+
+bool GetUcodeModule(ulong& phys, ulong& len)
+{
+    if (UcodeEnd == 0)
+        return false;
+    phys = UcodeStart;
+    len = UcodeEnd - UcodeStart;
+    return true;
+}
 
 const void* GetAcpiRsdp(size_t& size)
 {
@@ -180,6 +194,39 @@ void ParseMultiBootInfo(MultiBootInfoHeader *MbInfo)
             Trace(0, "Cmdline %s", cmdLine->String);
             Kernel::Parameters::GetInstance().Parse(cmdLine->String);
 
+            break;
+        }
+        case MultiBootTagTypeModule:
+        {
+            if (tag->Size <= sizeof(MultiBootTagModule))
+                break;
+
+            MultiBootTagModule* module = reinterpret_cast<MultiBootTagModule*>(tag);
+
+            /* Its command line must be NUL-terminated within the tag */
+            size_t maxLen = tag->Size - sizeof(MultiBootTagModule);
+            size_t nameLen = 0;
+            while (nameLen < maxLen && module->CmdLine[nameLen] != '\0')
+                nameLen++;
+            if (nameLen == maxLen)
+            {
+                Trace(0, "Module tag's command line is not NUL-terminated, ignored");
+                break;
+            }
+            if (Stdlib::StrCmp(module->CmdLine, UcodeModuleName) != 0)
+            {
+                Trace(0, "Module %s ignored", module->CmdLine);
+                break;
+            }
+            if (module->ModEnd <= module->ModStart)
+            {
+                Trace(0, "Module ucode is empty, ignored");
+                break;
+            }
+
+            UcodeStart = module->ModStart;
+            UcodeEnd = module->ModEnd;
+            Trace(0, "Module ucode 0x%lX-0x%lX", UcodeStart, UcodeEnd);
             break;
         }
         case MultiBootTagTypeAcpiOld:

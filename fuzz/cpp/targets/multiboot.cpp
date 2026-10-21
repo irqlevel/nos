@@ -1,14 +1,16 @@
 // The Multiboot2 information (arch/x86_64/grub.cpp): what GRUB hands the x86
 // kernel before anything else runs -- the firmware's memory map, the command
-// line, a copy of the ACPI RSDP, the framebuffer -- in a buffer of tags whose
-// every size and count is GRUB's, or the firmware's, to say. An info is built
-// from the input tag by tag, as GRUB lays one out -- the tags GRUB gives and
-// ones it may, of every size a tag of their kind can be -- and damaged or not:
-// a total size that lies, tags that lie about theirs, no end tag, bytes of
-// anything. A sound one is held to a reader of the info written from
-// grub.h and grub.cpp: the memory map's regions -- reserved ones first, then
-// usable RAM while there is room -- the line kept, the RSDP copied (the new
-// one over the old), the framebuffer; any one to nothing read past it.
+// line, a copy of the ACPI RSDP, the framebuffer, the microcode module -- in
+// a buffer of tags whose every size and count is GRUB's, or the firmware's,
+// to say. An info is built from the input tag by tag, as GRUB lays one out --
+// the tags GRUB gives and ones it may, of every size a tag of their kind can
+// be -- and damaged or not: a total size that lies, tags that lie about
+// theirs, no end tag, bytes of anything. A sound one is held to a reader of
+// the info written from grub.h and grub.cpp: the memory map's regions --
+// reserved ones first, then usable RAM while there is room -- the line kept,
+// the RSDP copied (the new one over the old), the framebuffer, the last
+// `ucode` module whose name ends inside its tag and whose range is not empty;
+// any one to nothing read past it.
 #include "host.h"
 
 /* The loader's own file, for its statics, which Reset puts back */
@@ -148,6 +150,25 @@ Tag RsdpTag(Fuzz::Input& in, bool isNew)
     return t;
 }
 
+/* A module: its range, of any extent or none, and its command line --
+   `ucode`, what the kernel takes, another name, or one cut short with no
+   NUL inside the tag */
+Tag ModuleTag(Fuzz::Input& in)
+{
+    Tag t{3, {}};
+    u32 start = in.Chance(8) ? in.U32() : static_cast<u32>(in.Below(1ULL << 32) & ~0xFFFULL);
+    u32 end = in.Chance(8) ? start - static_cast<u32>(in.Below(2)) : start + static_cast<u32>(in.Below(1 << 20));
+    Put(t.Body, 0, start, 4);
+    Put(t.Body, 4, end, 4);
+    static const char* const Names[] = {"ucode", "ucode", "ucode", "", "ucod", "ucode2", "initrd"};
+    std::string name = in.Pick(Names);
+    for (char c : name)
+        t.Body.push_back(static_cast<uint8_t>(c));
+    if (!in.Chance(16))
+        t.Body.push_back(0);
+    return t;
+}
+
 Tag FbTag(Fuzz::Input& in)
 {
     Tag t{8, {}};
@@ -213,6 +234,8 @@ struct Expected
     bool FbPresent = false;
     Fb Framebuffer{};
     bool FbColors = false;
+    bool Ucode = false;
+    u32 UcodeStart = 0, UcodeEnd = 0;
 };
 
 /* AddRegion, as memory_map.h says it keeps a region */
@@ -268,7 +291,7 @@ void Run(Fuzz::Input& in)
     Expected e;
     for (int n = in.Below(10); n > 0; n--)
     {
-        switch (in.U8() % 8)
+        switch (in.U8() % 9)
         {
         case 0:
         case 1:
@@ -300,9 +323,13 @@ void Run(Fuzz::Input& in)
             tags.push_back(t);
             break;
         }
+        case 7:
+            tags.push_back(ModuleTag(in));
+            break;
         default:
         {
-            /* A tag this kernel does not read: a name, a module, ELF sections */
+            /* A tag this kernel does not read: a name, ELF sections -- or a
+               module whose body is anything */
             static const u32 Others[] = {2, 3, 4, 9, 10, 21};
             Tag t{static_cast<u32>(in.Chance(32) ? in.Range(16, 40) : in.Pick(Others)), {}};
             t.Body = Fuzz::Noise(in.U32(), in.Below(64));
@@ -403,6 +430,31 @@ void Run(Fuzz::Input& in)
             e.RsdpNew = isNew;
             break;
         }
+        case 3:
+        {
+            /* The module's range, then its name, which must end inside the
+               tag; `ucode` with a range that is not empty is kept, the last
+               such over any before */
+            if (t.Body.size() <= 8)
+                break;
+            const uint8_t* name = t.Body.data() + 8;
+            size_t room = t.Body.size() - 8;
+            const void* nul = memchr(name, 0, room);
+            if (nul == nullptr)
+                break;
+            if (strcmp(reinterpret_cast<const char*>(name), "ucode") != 0)
+                break;
+            u32 start, end;
+            memcpy(&start, t.Body.data(), 4);
+            memcpy(&end, t.Body.data() + 4, 4);
+            if (end <= start)
+                break;
+            e.Ucode = true;
+            e.UcodeStart = start;
+            e.UcodeEnd = end;
+            Fuzz::Reached("a ucode module");
+            break;
+        }
         case 8:
         {
             if (t.Body.size() < 24)
@@ -445,6 +497,11 @@ void Run(Fuzz::Input& in)
             Parameters::GetInstance().GetCmdline(), e.Kept.c_str());
     INVARIANT(rsdpSize == e.Rsdp.size() && (rsdpSize == 0 || memcmp(rsdp, e.Rsdp.data(), rsdpSize) == 0),
         "the RSDP kept is %zu bytes, not the %zu of the tag it should be", rsdpSize, e.Rsdp.size());
+    ulong ucodePhys = 0, ucodeLen = 0;
+    bool ucode = Grub::GetUcodeModule(ucodePhys, ucodeLen);
+    INVARIANT(ucode == e.Ucode && (!ucode || (ucodePhys == e.UcodeStart && ucodeLen == u64(e.UcodeEnd) - e.UcodeStart)),
+        "the ucode module kept is %s 0x%lx+0x%lx, where the info's is %s 0x%x-0x%x", ucode ? "" : "none,", ucodePhys,
+        ucodeLen, e.Ucode ? "" : "none,", e.UcodeStart, e.UcodeEnd);
     INVARIANT(Grub::HasFramebufferInfo() == e.FbPresent, "a framebuffer %s", e.FbPresent ? "lost" : "from nowhere");
     if (e.FbPresent)
     {
@@ -476,6 +533,8 @@ void Reset()
     Grub::FramebufferPresent = false;
     Grub::FramebufferType = 0;
     Grub::Framebuffer = Grub::FramebufferInfo();
+    Grub::UcodeStart = 0;
+    Grub::UcodeEnd = 0;
 }
 
 }
