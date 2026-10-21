@@ -160,6 +160,15 @@ enum DrExpect {
 
 /// General-purpose register `n` of the guest's, numbered as an instruction
 /// names them: the fuzzer's own table, not the emulator's.
+/// Whether a CPU refuses a write of CR4 from `old` to `new` for PCIDE's
+/// sake (SDM, MOV to CR4): a #GP where it is turned on outside IA-32e mode,
+/// or with a PCID in CR3 -- its low twelve bits not zero.
+fn pcide_refused(old: u64, new: u64, long: bool, cr3: u64) -> bool {
+    const CR4_PCIDE: u64 = 1 << 17;
+    const CR3_PCID: u64 = 0xFFF;
+    new & !old & CR4_PCIDE != 0 && (!long || cr3 & CR3_PCID != 0)
+}
+
 fn gpr_slot(v: &mut Backend, n: u8) -> &mut u64 {
     let (sv, regs) = v.save_and_regs_mut();
     match n {
@@ -349,7 +358,8 @@ impl Script {
         /* What the CPU takes of the register: in 32-bit code its low half,
          * whatever is above it. */
         let taken = value & width;
-        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0);
+        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0)
+            || pcide_refused(old, taken, long, v.save().cr3);
 
         let mut insn = Vec::new();
         if r.u8() < 24 {
@@ -502,7 +512,8 @@ impl Script {
             }
             return None;
         }
-        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0);
+        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0)
+            || pcide_refused(old, taken, long, v.save().cr3);
         let len = 3 + u64::from(gpr >= 8) + r.below(2);
         self.code = CODE + (self.code + 16 - CODE) % (2 * MIB);
         let rip = self.code;
@@ -590,6 +601,11 @@ impl Script {
             Step::Wrmsr { msr, value } => {
                 if msr == 0x1B {
                     self.cpus[self.me].asked_xapic = Some(value & (1 << 10) == 0);
+                }
+                if v.virtualizes(msr) {
+                    /* The CPU's to perform, under virtual-interrupt delivery:
+                     * no exit, but an EOI's the bitmap names. */
+                    return v.virtual_wrmsr(msr, value);
                 }
                 v.regs_mut().rcx = u64::from(msr);
                 v.regs_mut().rdx = value >> 32;
@@ -1051,10 +1067,18 @@ impl Script {
                         _ => r.pick(&MSRS),
                     };
                     let value = if (0x800..0x900).contains(&msr) { apic_value(r, msr - 0x800) } else { r.value64() };
+                    let write = r.bool();
+                    if write && v.virtualizes(msr) {
+                        v.take_event();
+                        match v.virtual_wrmsr(msr, value) {
+                            Some(exit) => return Some(vm::Next::Exit(exit)),
+                            None => continue,
+                        }
+                    }
                     v.regs_mut().rcx = u64::from(msr) | if r.u8() < 8 { r.value64() << 32 } else { 0 };
                     v.regs_mut().rdx = value >> 32;
                     v.save_mut().rax = value & 0xFFFF_FFFF;
-                    Exit::Msr { write: r.bool() }
+                    Exit::Msr { write }
                 }
                 8 => {
                     v.save_mut().rax = u64::from(r.pick(&LEAVES)) | if r.u8() < 16 { u64::from(r.u32()) } else { 0 };
@@ -1225,6 +1249,11 @@ impl Script {
                     return Some(vm::Next::Switch(r.below(self.cpus.len() as u64) as usize));
                 }
                 26 => Exit::Pause,
+                27 if v.has_vapic() => {
+                    /* A `mov` to CR8 under the TPR shadow: VTPR, no exit. */
+                    v.virtual_cr8(r.u8());
+                    continue;
+                }
                 27 => {
                     let write = r.bool();
                     let gpr = r.below(16) as u8;
@@ -1301,6 +1330,9 @@ pub fn report() {
     }
     for (what, n) in MOV_CHECKED.lock().unwrap().iter() {
         println!("  {}: {}", what, n);
+    }
+    for (what, n) in vm::APICV.lock().unwrap().iter() {
+        println!("  platform: virtual APIC: {:>8} {}", n, what);
     }
 }
 
@@ -1404,6 +1436,13 @@ pub fn platform(r: &mut Input) {
         return;
     }
     let Ok((mut guest, mut vcpus)) = made else { return };
+    /* VT-x's virtual APIC, where the CPU is said to have one -- and the
+     * guest let use it, mostly. */
+    let vapic = vmx && r.bool();
+    for c in vcpus.iter_mut() {
+        c.backend_mut().vapic = vapic;
+    }
+    guest.set_apicv(r.u8() >= 32);
 
     /* Disks: none, mostly, or one -- each takes its 2 MiB of request
      * buffers when it is made, zeroed, which for a run of the whole machine

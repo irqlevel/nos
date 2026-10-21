@@ -38,6 +38,10 @@ private:
        handler and the panicking CPU prints them. */
     void CollectRemoteStacks();
 
+    /* panic=N: the machine reset N seconds after the report has gone out.
+       Returns where nothing asked for it. */
+    void ResetIfAsked();
+
     static const size_t RemoteFrameCount = 12;
 
     /* Kept in step with Kernel::MaxCpus by a static_assert in panic.cpp;

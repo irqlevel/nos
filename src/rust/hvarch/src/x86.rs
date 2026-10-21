@@ -186,6 +186,8 @@ impl Caps {
                 for (bit, name, note) in vmx::REPORTED {
                     feature(out, name, caps.has(*bit), note)?;
                 }
+                feature(out, "APIC virtualization", caps.apicv(),
+                        "an x2APIC guest's interrupts delivered, and its EOIs taken, by the CPU without an exit")?;
 
                 /* The one line on this page that is about this kernel
                  * rather than the CPU: `vmxon` faults, not fails, when the

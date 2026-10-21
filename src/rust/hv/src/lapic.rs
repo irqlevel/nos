@@ -416,6 +416,34 @@ impl Timer {
     }
 }
 
+/// What virtual-interrupt delivery takes of a local APIC to the CPU at an
+/// entry (VT-x, `crate::vmx`): the requested and in-service vectors, those
+/// of them level-triggered -- whose EOIs the CPU must still hand back -- and
+/// the task priority; a bit a vector in eight words.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Vectors {
+    pub irr: [u32; WORDS as usize],
+    pub isr: [u32; WORDS as usize],
+    pub tmr: [u32; WORDS as usize],
+    pub tpr: u8,
+}
+
+impl Vectors {
+    /// The vectors whose EOI must exit: the level-triggered ones, as the
+    /// four 64-bit words of VT-x's EOI-exit bitmap.
+    pub fn eoi_exit(&self) -> [u64; 4] {
+        let mut bitmap = [0u64; 4];
+        for (i, w) in bitmap.iter_mut().enumerate() {
+            *w = u64::from(self.tmr[2 * i]) | (u64::from(self.tmr[2 * i + 1]) << 32);
+        }
+        bitmap
+    }
+}
+
+/// Vectors 0-15, the exceptions': no fixed interrupt has one, and none is
+/// ever requested or in service here (`accept`).
+const EXCEPTION_VECTORS: u32 = 0xFFFF;
+
 /// One CPU's local APIC.
 #[derive(Clone)]
 pub struct Lapic {
@@ -617,6 +645,42 @@ impl Lapic {
     pub fn acknowledge(&mut self, vector: u8) {
         clear_bit(&mut self.irr, vector);
         set_bit(&mut self.isr, vector);
+    }
+
+    /// Whether the CPU may deliver this APIC's interrupts itself, VT-x's
+    /// virtual-interrupt delivery: in x2APIC mode -- whose EOI, TPR and
+    /// SELF_IPI are the MSR writes the CPU then performs -- and software
+    /// enabled, a disabled APIC's requests being held, not delivered.
+    pub fn delivers_itself(&self) -> bool {
+        self.x2apic() && self.software_enabled()
+    }
+
+    /// What virtual-interrupt delivery is handed at an entry.
+    pub fn vectors(&self) -> Vectors {
+        Vectors { irr: self.irr, isr: self.isr, tmr: self.tmr, tpr: self.tpr }
+    }
+
+    /// What virtual-interrupt delivery left at an exit: interrupts the CPU
+    /// delivered (out of the request register, into service), EOIs and
+    /// self-IPIs it performed, the task priority the guest wrote. An
+    /// exception's vector the CPU would set for a self-IPI of one is no
+    /// request here, as a write of the register would have refused it.
+    pub fn from_cpu(&mut self, irr: &[u32; WORDS as usize], isr: &[u32; WORDS as usize], tpr: u8) {
+        self.irr = *irr;
+        self.isr = *isr;
+        self.irr[0] &= !EXCEPTION_VECTORS;
+        self.isr[0] &= !EXCEPTION_VECTORS;
+        self.tpr = tpr;
+    }
+
+    /// The EOI of `vector` the CPU performed and stopped the guest after,
+    /// the EOI-exit bitmap naming it (`Vectors::eoi_exit`): out of service
+    /// already, and its vector when it was level-triggered, for the IO-APIC.
+    pub fn virtual_eoi(&mut self, vector: u8) -> Option<u8> {
+        clear_bit(&mut self.isr, vector);
+        let level = test_bit(&self.tmr, vector);
+        clear_bit(&mut self.tmr, vector);
+        level.then_some(vector)
     }
 
     /// The highest interrupt in service is done: its vector, when it was

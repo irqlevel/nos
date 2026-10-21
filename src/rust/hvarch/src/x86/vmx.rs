@@ -36,8 +36,14 @@ pub const CR4_VMXE: u64 = 1 << 13;
 pub const PROC_SECONDARY_CTLS: u32 = 1 << 31;
 
 pub const SEC_EPT: u32 = 1 << 1;
+pub const SEC_VIRTUALIZE_X2APIC: u32 = 1 << 4;
 pub const SEC_VPID: u32 = 1 << 5;
 pub const SEC_UNRESTRICTED_GUEST: u32 = 1 << 7;
+pub const SEC_VIRTUAL_INTR_DELIVERY: u32 = 1 << 9;
+
+/// The primary control the two above are built on: CR8 and the virtual
+/// APIC's task priority in a page of the guest's own.
+pub const PROC_TPR_SHADOW: u32 = 1 << 21;
 
 /* IA32_VMX_EPT_VPID_CAP: INVEPT and INVVPID are there, and which of their
  * types. */
@@ -107,6 +113,8 @@ pub struct Caps {
     pub basic: u64,
     /// `IA32_FEATURE_CONTROL`: whether firmware left VMX usable.
     pub feature_control: u64,
+    /// The primary processor-based controls this CPU allows to be 1.
+    pub primary: u32,
     /// The secondary processor-based controls this CPU allows to be 1, or 0
     /// when it has no secondary controls at all.
     pub secondary: u32,
@@ -147,6 +155,7 @@ impl Caps {
         Some(Self {
             basic,
             feature_control,
+            primary,
             secondary,
             ept_vpid,
             cr0_fixed0: unsafe { cpu::rdmsr(MSR_VMX_CR0_FIXED0) },
@@ -184,6 +193,15 @@ impl Caps {
     #[inline]
     pub fn has(&self, control: u32) -> bool {
         self.secondary & control != 0
+    }
+
+    /// The CPU delivers a guest's interrupts and takes its EOIs itself, in
+    /// x2APIC mode: the TPR shadow, x2APIC virtualization and
+    /// virtual-interrupt delivery are all there to be had.
+    pub fn apicv(&self) -> bool {
+        self.primary & PROC_TPR_SHADOW != 0
+            && self.has(SEC_VIRTUALIZE_X2APIC)
+            && self.has(SEC_VIRTUAL_INTR_DELIVERY)
     }
 
     /// INVEPT can drop one EPT's translations alone; failing that, a guest's
@@ -496,14 +514,36 @@ const CR4_HOST_KEEPS: u64 = CR4_MCE | CR4_VMXE_BIT;
  * not allow; one of these dropped refuses the guest ([`NotRun::Controls`]),
  * where a guest run without it would be the host's to lose. */
 const PIN_REQUIRED: u32 = vmcs::PIN_EXTINT_EXITING | vmcs::PIN_NMI_EXITING;
+/* CR8 is kept from the host's APIC by one of two: every `mov` of it exiting
+ * (`CR8_EXITING`), or the TPR shadow, where the guest has a virtual APIC. */
 const PROC_REQUIRED: u32 = vmcs::PROC_HLT_EXITING | vmcs::PROC_UNCOND_IO_EXITING
-    | vmcs::PROC_CR8_LOAD_EXITING | vmcs::PROC_CR8_STORE_EXITING | vmcs::PROC_MWAIT_EXITING
-    | vmcs::PROC_MONITOR_EXITING | vmcs::PROC_RDPMC_EXITING | vmcs::PROC_MOV_DR_EXITING
-    | vmcs::PROC_SECONDARY_CTLS;
+    | vmcs::PROC_MWAIT_EXITING | vmcs::PROC_MONITOR_EXITING | vmcs::PROC_RDPMC_EXITING
+    | vmcs::PROC_MOV_DR_EXITING | vmcs::PROC_SECONDARY_CTLS;
+const CR8_EXITING: u32 = vmcs::PROC_CR8_LOAD_EXITING | vmcs::PROC_CR8_STORE_EXITING;
+/// The secondary controls a guest with a virtual APIC has while its APIC is
+/// in x2APIC mode ([`Guest::set_apicv`]).
+const PROC2_APICV: u32 = vmcs::PROC2_VIRTUALIZE_X2APIC | vmcs::PROC2_VIRTUAL_INTR_DELIVERY;
 const PROC2_REQUIRED: u32 = vmcs::PROC2_ENABLE_EPT | vmcs::PROC2_WBINVD_EXITING;
 const EXIT_REQUIRED: u32 = vmcs::EXIT_HOST_ADDR_SPACE_SIZE | vmcs::EXIT_LOAD_IA32_EFER
     | vmcs::EXIT_SAVE_IA32_EFER | vmcs::EXIT_LOAD_IA32_PAT | vmcs::EXIT_SAVE_IA32_PAT;
 const ENTRY_REQUIRED: u32 = vmcs::ENTRY_LOAD_IA32_EFER | vmcs::ENTRY_LOAD_IA32_PAT | vmcs::ENTRY_LOAD_DEBUG;
+
+/* Pause-loop exiting, where the CPU has it, in TSC ticks. A guest spinning
+ * on PAUSE in its kernel -- waiting on a lock, an IPI's answer, a tick it
+ * counts while it calibrates its timer -- exits once it has spun
+ * `PLE_WINDOW`, about 26 us at the EX44's 2.5 GHz TSC, and is handed what
+ * fell due meanwhile: soon enough for a tick a millisecond apart, where an
+ * exit at every PAUSE cost a spinning CPU an exit's 1.8 us for each PAUSE
+ * of tens of cycles. A PAUSE within `PLE_GAP` of the last is the same loop:
+ * a loop's turn on Skylake and later, whose PAUSE alone is some 140 cycles
+ * and whose core may run below its TSC's clock, is longer than the 128 KVM
+ * takes, and a gap too short finds no loop and makes no exit at all. */
+const PLE_GAP_TICKS: u64 = 1024;
+const PLE_WINDOW_TICKS: u64 = 65536;
+
+/// The EOI-exit bitmap's four fields, vectors 0-63 first.
+const EOI_EXIT_FIELDS: [u32; 4] =
+    [vmcs::EOI_EXIT_BITMAP0, vmcs::EOI_EXIT_BITMAP1, vmcs::EOI_EXIT_BITMAP2, vmcs::EOI_EXIT_BITMAP3];
 
 /* What the launch stub does around the world switch (its `flags`). */
 /// VMRESUME, the VMCS being in the launched state; else VMLAUNCH.
@@ -688,8 +728,24 @@ const MSR_STORE_BASE: usize = 0x200;
 /// two VMCS fields the exit saves and the entry loads, the third in the exit
 /// MSR-store and entry MSR-load lists above.
 const MSR_BITMAP_READ_HIGH: usize = 0x400;
+const MSR_BITMAP_WRITE_LOW: usize = 0x800;
 const MSR_BITMAP_WRITE_HIGH: usize = 0xC00;
 const MSR_HIGH_BASE: u32 = 0xC000_0000;
+
+/// The x2APIC registers whose writes virtual-interrupt delivery performs --
+/// TPR, EOI and SELF_IPI -- and which the MSR bitmap lets through while it
+/// is on. No read is let through: without APIC-register virtualization a
+/// read of anything but TPR would reach the CPU's own APIC.
+const APICV_WRITES: [u32; 3] = [0x808, 0x80B, 0x83F];
+
+/* The virtual-APIC page: an APIC's registers at their xAPIC offsets, 16
+ * bytes apart -- VTPR at 0x80, VISR's eight words from 0x100, VIRR's from
+ * 0x200. */
+const VAPIC_TPR: usize = 0x80;
+const VAPIC_ISR: usize = 0x100;
+const VAPIC_IRR: usize = 0x200;
+const VAPIC_STRIDE: usize = 0x10;
+pub const VAPIC_WORDS: usize = 8;
 
 /// What the VMCS holds of the fields the policy may change between entries,
 /// as of the last time each was written to it or read from it: what an
@@ -711,6 +767,10 @@ struct Synced {
     sysenter_eip: u64,
     interruptibility: u32,
     proc1: u32,
+    /// The secondary controls, whose x2APIC virtualization and
+    /// virtual-interrupt delivery follow the guest's APIC (`set_apicv`).
+    proc2: u32,
+    eoi_exit: [u64; 4],
     /// The VM-entry controls, whose "IA-32e mode guest" follows EFER.LMA.
     entry_ctls: u32,
 }
@@ -723,6 +783,17 @@ pub struct Guest {
     msr_area: kcore::dma::DmaBuffer,
     /// One page: the MSR bitmap above.
     msr_bitmap: kcore::dma::DmaBuffer,
+    /// One page: the guest's virtual APIC -- VTPR, and its VIRR and VISR --
+    /// where the CPU can deliver its interrupts itself and was asked to
+    /// ([`Caps::apicv`], `Guest::new`); None where not, and CR8 then exits.
+    /// The CPU reads and writes it only inside an entry this owner makes.
+    vapic: Option<kcore::dma::DmaBuffer>,
+    /// Virtual-interrupt delivery and x2APIC virtualization on from the next
+    /// entry ([`set_apicv`](Self::set_apicv)).
+    apicv_on: bool,
+    /// The EOI-exit bitmap the next entry has: the vectors whose EOI, which
+    /// the CPU performs, still exits.
+    eoi_exit: [u64; 4],
     /// The guest state, kept in the same shape as an AMD-V save area so the
     /// policy layer is one set of code: synced to the VMCS before an entry
     /// and read back from it after.
@@ -875,7 +946,7 @@ impl Guest {
     /// writes without an exit -- every other one, and MCE and VMXE whatever
     /// this says, a `mov` to CR4 that changes it exits, for the policy to
     /// answer ([`set_cr4`](Self::set_cr4)).
-    pub fn new(caps: &Caps, exceptions: u32, cr4_own: u64) -> Result<Self> {
+    pub fn new(caps: &Caps, exceptions: u32, cr4_own: u64, apicv: bool) -> Result<Self> {
         let mut fx = alloc::vec::Vec::new();
         fx.try_reserve_exact(1).map_err(|_| Error::NoMemory)?;
         fx.push(FxArea::reset());
@@ -890,6 +961,13 @@ impl Guest {
                 msr_bitmap.as_mut_slice()[quarter + bit / 8] &= !(1 << (bit % 8));
             }
         }
+        let vapic = if apicv && caps.apicv() {
+            let mut page = kcore::dma::DmaBuffer::new(1).ok_or(Error::NoMemory)?;
+            page.as_mut_slice().fill(0);
+            Some(page)
+        } else {
+            None
+        };
         let unrestricted = caps.has(SEC_UNRESTRICTED_GUEST);
         let vpid = if caps.vpid() { vpid_take().ok_or(Error::NoMemory)? } else { 0 };
         let mut fixed_on = caps.cr0_fixed0;
@@ -902,6 +980,9 @@ impl Guest {
             vmcs,
             msr_area,
             msr_bitmap,
+            vapic,
+            apicv_on: false,
+            eoi_exit: [0; 4],
             save: unsafe { core::mem::zeroed() },
             regs: GuestRegs::default(),
             fx,
@@ -1186,6 +1267,112 @@ impl Guest {
         self.interruptibility = bits;
     }
 
+    /// Whether the guest has a virtual APIC: CR8 its VTPR, under the TPR
+    /// shadow, and virtual-interrupt delivery to be had while its APIC is in
+    /// x2APIC mode ([`set_apicv`](Self::set_apicv)).
+    pub fn has_vapic(&self) -> bool {
+        self.vapic.is_some()
+    }
+
+    /// Virtual-interrupt delivery and x2APIC virtualization, on or off from
+    /// the next entry. On, the CPU delivers what VIRR holds itself, when the
+    /// guest can take it, and performs the guest's writes of its x2APIC's
+    /// TPR, EOI and SELF_IPI registers on the page -- the MSR bitmap letting
+    /// those three through, and only while on: off, they exit as every other
+    /// x2APIC register's do. Nothing without a virtual APIC.
+    pub fn set_apicv(&mut self, on: bool) {
+        if self.vapic.is_none() || on == self.apicv_on {
+            return;
+        }
+        self.apicv_on = on;
+        let bitmap = self.msr_bitmap.as_mut_slice();
+        for msr in APICV_WRITES {
+            let (byte, bit) = (MSR_BITMAP_WRITE_LOW + msr as usize / 8, msr % 8);
+            if on {
+                bitmap[byte] &= !(1 << bit);
+            } else {
+                bitmap[byte] |= 1 << bit;
+            }
+        }
+    }
+
+    /// Whether the next entry has virtual-interrupt delivery on.
+    pub fn apicv(&self) -> bool {
+        self.apicv_on
+    }
+
+    /// VTPR, the guest's task priority under the TPR shadow: what its `mov`s
+    /// of CR8 read and write (bits 7:4) and, under virtual-interrupt
+    /// delivery, its writes of the x2APIC's TPR. 0 without a virtual APIC.
+    pub fn virtual_tpr(&self) -> u8 {
+        self.vapic.as_ref().and_then(|p| p.load::<u32>(VAPIC_TPR)).unwrap_or(0) as u8
+    }
+
+    pub fn set_virtual_tpr(&mut self, tpr: u8) {
+        if let Some(p) = self.vapic.as_mut() {
+            p.store::<u32>(VAPIC_TPR, u32::from(tpr));
+        }
+    }
+
+    /// VIRR and VISR, a bit a vector in eight words, as the CPU left them --
+    /// interrupts delivered, EOIs and self-IPIs performed -- or as the run
+    /// loop set them for the next entry. Zero without a virtual APIC.
+    pub fn virtual_irr(&self) -> [u32; VAPIC_WORDS] {
+        self.vapic_words(VAPIC_IRR)
+    }
+
+    pub fn virtual_isr(&self) -> [u32; VAPIC_WORDS] {
+        self.vapic_words(VAPIC_ISR)
+    }
+
+    pub fn set_virtual_irr(&mut self, words: &[u32; VAPIC_WORDS]) {
+        self.set_vapic_words(VAPIC_IRR, words);
+    }
+
+    pub fn set_virtual_isr(&mut self, words: &[u32; VAPIC_WORDS]) {
+        self.set_vapic_words(VAPIC_ISR, words);
+    }
+
+    /// The vectors, a bit each, whose EOI exits though the CPU performs it:
+    /// the level-triggered ones, whose end the IO-APIC has to hear of.
+    pub fn set_eoi_exit(&mut self, bitmap: [u64; 4]) {
+        self.eoi_exit = bitmap;
+    }
+
+    fn vapic_words(&self, base: usize) -> [u32; VAPIC_WORDS] {
+        let mut words = [0; VAPIC_WORDS];
+        if let Some(p) = self.vapic.as_ref() {
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = p.load::<u32>(base + i * VAPIC_STRIDE).unwrap_or(0);
+            }
+        }
+        words
+    }
+
+    fn set_vapic_words(&mut self, base: usize, words: &[u32; VAPIC_WORDS]) {
+        if let Some(p) = self.vapic.as_mut() {
+            for (i, &w) in words.iter().enumerate() {
+                p.store::<u32>(base + i * VAPIC_STRIDE, w);
+            }
+        }
+    }
+
+    /// RVI and SVI as the guest interrupt status has them: the highest
+    /// vector in VIRR, and in VISR, each 0 for none.
+    fn intr_status(&self) -> u16 {
+        let highest = |words: [u32; VAPIC_WORDS]| -> u16 {
+            for i in (0..VAPIC_WORDS).rev() {
+                if words[i] != 0 {
+                    return (i as u16) * 32 + (31 - words[i].leading_zeros() as u16);
+                }
+            }
+            0
+        };
+        let rvi = highest(self.virtual_irr());
+        let svi = highest(self.virtual_isr());
+        rvi | (svi << 8)
+    }
+
     /// Whether to exit as soon as the guest can take an interrupt.
     pub fn set_irq_window(&mut self, on: bool) {
         self.irq_window = on;
@@ -1221,12 +1408,19 @@ impl Guest {
          * host's task priority register; MONITOR, MWAIT and RDPMC, which
          * CPUID says the guest has not got; every `mov` of a debug register,
          * whose four addresses and DR6 are the CPU's; WBINVD, below; and
-         * PAUSE, as the policy asks of both. CPUID, INVD, VMCALL, XSETBV and
-         * a triple fault exit unconditionally. */
+         * PAUSE, as the policy asks of both -- at a loop of them that has
+         * spun a while where the CPU has pause-loop exiting (`PLE_GAP_TICKS`),
+         * and at every one where it has not, as under a hypervisor that does
+         * not pass it on. CPUID, INVD, VMCALL, XSETBV and a triple fault exit
+         * unconditionally. */
+        let ple = adjust(PROC2_PAUSE_LOOP_EXITING, MSR_VMX_PROCBASED_CTLS2) & PROC2_PAUSE_LOOP_EXITING != 0;
+        /* CR8: the virtual APIC's VTPR under the TPR shadow, where the guest
+         * has one; else every `mov` of it exits, for the run loop's shadow. */
+        let cr8 = if self.vapic.is_some() { PROC_USE_TPR_SHADOW } else { CR8_EXITING };
         self.proc1 = adjust(
-            PROC_HLT_EXITING | PROC_UNCOND_IO_EXITING | PROC_CR8_LOAD_EXITING | PROC_CR8_STORE_EXITING
+            PROC_HLT_EXITING | PROC_UNCOND_IO_EXITING | cr8
                 | PROC_MWAIT_EXITING | PROC_MONITOR_EXITING | PROC_RDPMC_EXITING | PROC_MOV_DR_EXITING
-                | PROC_USE_MSR_BITMAPS | PROC_PAUSE_EXITING | PROC_SECONDARY_CTLS,
+                | PROC_USE_MSR_BITMAPS | if ple { 0 } else { PROC_PAUSE_EXITING } | PROC_SECONDARY_CTLS,
             ctls_msr(basic, MSR_VMX_PROCBASED_CTLS, MSR_VMX_TRUE_PROCBASED_CTLS),
         );
         /* Without the bitmap control every MSR exits, which is the safe way
@@ -1236,6 +1430,9 @@ impl Guest {
             self.msr_bitmap.as_mut_slice().fill(0xFF);
         }
         let mut want2 = PROC2_ENABLE_EPT | PROC2_WBINVD_EXITING;
+        if ple {
+            want2 |= PROC2_PAUSE_LOOP_EXITING;
+        }
         if self.unrestricted {
             want2 |= PROC2_UNRESTRICTED_GUEST;
         }
@@ -1261,10 +1458,20 @@ impl Guest {
          * controls, and the guest's own -- a VPID handed out, a real-mode
          * CPU -- where the flags above say it has them. */
         let promised2 = want2 & (PROC2_UNRESTRICTED_GUEST | PROC2_ENABLE_VPID);
-        let checks: [(&'static str, u32, u32); 5] = [
+        /* With a virtual APIC: the TPR shadow, and the two controls its
+         * x2APIC mode turns on, which the CPU said it had (`Caps::apicv`) --
+         * asked again here, of the CPU the guest runs on. */
+        let (cr8_needed, apicv_got, apicv_needed) = if self.vapic.is_some() {
+            (PROC_USE_TPR_SHADOW, adjust(want2 | PROC2_APICV, MSR_VMX_PROCBASED_CTLS2), PROC2_APICV)
+        } else {
+            (CR8_EXITING, 0, 0)
+        };
+        let checks: [(&'static str, u32, u32); 7] = [
             ("pin-based", self.pin, PIN_REQUIRED),
             ("processor-based", self.proc1, PROC_REQUIRED),
+            ("processor-based (CR8)", self.proc1, cr8_needed),
             ("secondary processor-based", self.proc2, PROC2_REQUIRED | promised2),
+            ("secondary processor-based (APIC virtualization)", apicv_got, apicv_needed),
             ("VM-exit", self.exit_ctls, EXIT_REQUIRED),
             ("VM-entry", self.entry_ctls, ENTRY_REQUIRED),
         ];
@@ -1299,6 +1506,10 @@ impl Guest {
             vmwrite(PAGE_FAULT_ERRCODE_MASK, 0);
             vmwrite(PAGE_FAULT_ERRCODE_MATCH, 0);
             vmwrite(CR3_TARGET_COUNT, 0);
+            if self.proc2 & PROC2_PAUSE_LOOP_EXITING != 0 {
+                vmwrite(PLE_GAP, PLE_GAP_TICKS);
+                vmwrite(PLE_WINDOW, PLE_WINDOW_TICKS);
+            }
             /* Every port exits, and every MSR but the three bases the bitmap
              * lets through: nothing else the guest reads or writes reaches
              * the host's real MSRs or ports. */
@@ -1322,8 +1533,22 @@ impl Guest {
             vmwrite(CR0_GUEST_HOST_MASK, self.cr0_mask);
             vmwrite(CR4_GUEST_HOST_MASK, self.cr4_mask);
             vmwrite(GUEST_IA32_DEBUGCTL, 0);
+            /* The virtual APIC's page, and its fields as an APIC out of
+             * reset has them: written whatever the guest's mode, since a
+             * VMCS field nobody wrote holds whatever it held. No TPR
+             * threshold: a `mov` to CR8 never exits for one. */
+            if let Some(page) = &self.vapic {
+                vmwrite(VIRTUAL_APIC_PAGE_ADDR, page.phys());
+                vmwrite(TPR_THRESHOLD, 0);
+                vmwrite(GUEST_INTR_STATUS, 0);
+                for (field, word) in EOI_EXIT_FIELDS.iter().zip(self.eoi_exit) {
+                    vmwrite(*field, word);
+                }
+            }
         }
         self.synced.proc1 = self.proc1;
+        self.synced.proc2 = self.proc2;
+        self.synced.eoi_exit = self.eoi_exit;
         self.configured = true;
         Ok(())
     }
@@ -1407,6 +1632,8 @@ impl Guest {
                 sysenter_eip: s.sysenter_eip,
                 interruptibility: self.interruptibility,
                 proc1: self.synced.proc1,
+                proc2: self.synced.proc2,
+                eoi_exit: self.synced.eoi_exit,
                 entry_ctls,
             };
             self.cr4_shadow = s.cr4;
@@ -1743,6 +1970,8 @@ impl Guest {
                 r::HLT | r::PAUSE | r::CPUID | r::RDMSR | r::WRMSR | r::VMCALL | r::WBINVD | r::RDTSC
                 | r::RDPMC | r::XSETBV | r::MONITOR | r::MWAIT | r::RDTSCP | r::INVD => (true, false, false),
                 r::IO_INSTRUCTION | r::CR_ACCESS | r::DR_ACCESS => (true, true, false),
+                /* Trap-like, past the WRMSR already: its vector alone. */
+                r::EOI_INDUCED => (false, true, false),
                 _ => (true, true, true),
             }
         };
@@ -2009,6 +2238,26 @@ impl Guest {
             if proc1 != self.synced.proc1 {
                 vmcs::vmwrite(vmcs::PROC_BASED_CTLS, proc1 as u64);
                 self.synced.proc1 = proc1;
+            }
+            /* x2APIC virtualization and virtual-interrupt delivery while the
+             * guest's APIC is in x2APIC mode and on (`set_apicv`), and then
+             * where its interrupts stand -- RVI and SVI, from the page the
+             * run loop filled -- and which of their EOIs still exit. */
+            if self.vapic.is_some() {
+                let proc2 = self.proc2 | if self.apicv_on { PROC2_APICV } else { 0 };
+                if proc2 != self.synced.proc2 {
+                    vmcs::vmwrite(vmcs::PROC_BASED_CTLS2, proc2 as u64);
+                    self.synced.proc2 = proc2;
+                }
+                if self.apicv_on {
+                    vmcs::vmwrite(vmcs::GUEST_INTR_STATUS, u64::from(self.intr_status()));
+                    if self.eoi_exit != self.synced.eoi_exit {
+                        for (field, word) in EOI_EXIT_FIELDS.iter().zip(self.eoi_exit) {
+                            vmcs::vmwrite(*field, word);
+                        }
+                        self.synced.eoi_exit = self.eoi_exit;
+                    }
+                }
             }
             /* The event to inject, when there is one: the CPU clears the
              * field's valid bit as it takes the event, so with none to

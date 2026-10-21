@@ -144,6 +144,78 @@ bool SetupSerializingLfence()
     return true;
 }
 
+bool SetupCpuPerformance(CpuPerformance* out)
+{
+    static const u32 LeafBasic = 0;
+    static const u32 LeafFeatures = 1;
+    static const u32 LeafPower = 6;
+    static const u32 FeaturesEcxHypervisor = 1U << 31;
+    /* CPUID.06H:EAX: HWP, and its energy/performance preference field. */
+    static const u32 PowerEaxHwp = 1U << 7;
+    static const u32 PowerEaxHwpEpp = 1U << 10;
+    static const u32 PmEnableMsr = 0x770;
+    static const u64 PmEnableHwp = 1ULL << 0;
+    static const u32 HwpCapabilitiesMsr = 0x771;
+    static const u32 HwpRequestMsr = 0x774;
+    /* Every field of both MSRs used here is a byte. */
+    static const u64 FieldMask = 0xFF;
+    static const u32 CapHighestShift = 0;
+    static const u32 CapGuaranteedShift = 8;
+    static const u32 CapLowestShift = 24;
+    static const u32 ReqMinShift = 0;
+    static const u32 ReqMaxShift = 8;
+    static const u32 ReqDesiredShift = 16;
+    static const u32 ReqEppShift = 24;
+    /* intel_pstate's default preference, "balance_performance". */
+    static const u64 EppBalancePerformance = 0x80;
+
+    *out = CpuPerformance{};
+    if (Kernel::Parameters::GetInstance().IsHwpOff())
+        return false;
+    if (Cpuid(LeafBasic).Eax < LeafPower)
+        return false;
+    if (Cpuid(LeafFeatures).Ecx & FeaturesEcxHypervisor)
+        return false;
+    u32 power = Cpuid(LeafPower).Eax;
+    if (!(power & PowerEaxHwp))
+        return false;
+
+    /* HWP on first: every HWP MSR but IA32_PM_ENABLE and the interrupt
+       one may be touched only once it is (SDM 15.4.2). A first version read
+       the capabilities before, and the EX44 -- no serial port, no network up
+       yet -- never answered from that boot and had to be reset by hand. */
+    u64 enable = ReadMsr(PmEnableMsr);
+    if (!(enable & PmEnableHwp))
+        WriteMsr(PmEnableMsr, enable | PmEnableHwp);
+
+    /* A range that makes no sense leaves HWP choosing within whatever
+       request it starts with, rather than one built from it. */
+    u64 caps = ReadMsr(HwpCapabilitiesMsr);
+    u64 highest = (caps >> CapHighestShift) & FieldMask;
+    u64 guaranteed = (caps >> CapGuaranteedShift) & FieldMask;
+    u64 lowest = (caps >> CapLowestShift) & FieldMask;
+    if (highest == 0 || lowest > highest || guaranteed > highest)
+        return false;
+
+    /* The whole range, and no desired level: the CPU picks its clock
+       itself, inside it. What else the request holds -- an activity window,
+       a package-level request -- stays as firmware left it. */
+    u64 request = ReadMsr(HwpRequestMsr);
+    request &= ~((FieldMask << ReqMinShift) | (FieldMask << ReqMaxShift) | (FieldMask << ReqDesiredShift));
+    request |= (lowest << ReqMinShift) | (highest << ReqMaxShift);
+    if (power & PowerEaxHwpEpp)
+    {
+        request &= ~(FieldMask << ReqEppShift);
+        request |= EppBalancePerformance << ReqEppShift;
+    }
+    WriteMsr(HwpRequestMsr, request);
+
+    out->Lowest = (u32)lowest;
+    out->Guaranteed = (u32)guaranteed;
+    out->Highest = (u32)highest;
+    return true;
+}
+
 ulong MmioPremappedVa(ulong physAddr, ulong sizeBytes)
 {
     (void)physAddr;
@@ -487,13 +559,19 @@ void PowerOff()
 void Reset()
 {
     Trace(0, "Reboot");
+    ResetNow();
+}
 
-    /* Try ACPI FADT RESET_REG first */
+void ResetNow()
+{
+    static const int SettleSpins = 1000000;
+
+    /* Try ACPI FADT RESET_REG first: parsed or not, it is only read here */
     auto& acpi = Kernel::Acpi::GetInstance();
     if (acpi.HasResetReg())
     {
         Outb((u16)acpi.GetResetRegPort(), acpi.GetResetValue());
-        for (volatile int i = 0; i < 1000000; i = i + 1) {}
+        for (volatile int i = 0; i < SettleSpins; i = i + 1) {}
     }
 
     /* Keyboard controller reset (pulse CPU reset line) */
@@ -501,6 +579,16 @@ void Reset()
 
     /* Fallback: PCI reset register */
     Outb(0xCF9, 0x06);
+    for (volatile int i = 0; i < SettleSpins; i = i + 1) {}
+
+    /* Last: a triple fault -- an IDT with no entries, and an exception it
+       cannot deliver -- which every x86 machine answers with a reset. */
+    struct __attribute__((packed))
+    {
+        u16 Limit;
+        u64 Base;
+    } noIdt = { 0, 0 };
+    asm volatile("lidt %0; int3" : : "m"(noIdt) : "memory");
 
     while (1) Hlt();
 }

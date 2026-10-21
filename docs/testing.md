@@ -102,6 +102,7 @@ swallowing panic messages whole.
 | Gate | Arch | Run it after touching |
 |---|---|---|
 | `wx-test.sh [--arch x86_64\|aarch64]` | both | a mapping path |
+| `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `ext2-test.py` | arm64 | ext2 |
 | `nanofs-test.py` | arm64 | nanofs |
@@ -117,7 +118,7 @@ swallowing panic messages whole.
 | `hv-fuzz.py [--seed N --seconds S]` | host (CI) | anything a guest reaches in the hypervisor -- its devices, local APIC and IO-APIC, the MMIO path, the Linux loader and ACPI tables, the CPUID and MSR policy, the run loop that dispatches its exits, on every CPU of a guest of several, and the guests' network: the switch, its DHCP server and NAT -- fuzzed with overflow checks on |
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
-| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
+| `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
 | `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
@@ -132,6 +133,18 @@ notices a mapping that stops being NX -- everything still works -- and the
 heap probe is the one that fails if a mapping path ever stops setting NX on
 the leaves it writes. `--skip-build`; `WX_HVF=1` for the arm64 boots under
 HVF. See [Paging](paging.md#mmio-cacheability-and-wx).
+
+### `panic-test.sh` -- a panic that resets the machine, when asked
+
+Two boots that panic on purpose (`wxprobe=text`, early in boot), under QEMU's
+`-no-reboot`, so that a reset is QEMU exiting by itself: with `panic=1` it has
+to reset within twenty seconds of the report, having said it would; without,
+it has to still be there eight seconds after it, the report on its console. A
+server whose only console is the network has nothing else to bring it back
+from a panic -- the EX44 stayed dark until it was reset by hand from the
+provider's panel after a boot that died before its network was up -- and
+the system image boots nos with `panic=10`, after which GRUB boots the
+server's own system. `--skip-build`; `PANIC_HVF=1` for the arm64 boots under HVF.
 
 ### `parttest.py` -- partition tables
 
@@ -242,8 +255,13 @@ The first boot must be nos, once -- the entry from the image's `nos.cfg`,
 the root mounted by UUID read-write -- with sshd started by the image's
 `/etc/rc`, a host key made and the given key let in, the kernel and the root's
 `/VERSION` both the image's, no `udpshell` on the command line and no UDP
-shell answering. The second boot must be the host's own entry: GRUB cleared
-the flag. Then `nos-install update`, finding the partition through the GRUB
+shell answering. The install is given a made-up machine's `/proc/cpuinfo`
+and firmware directory (`NOS_CPUINFO`, `NOS_UCODE_DIR`) holding a file of
+one microcode update for its CPU: it has to say it put that file at
+`/boot/ucode`, GRUB has to hand it to the kernel as the module `ucode`, and
+the kernel has to find it and say why it loads nothing under QEMU, whose
+CPU is a hypervisor's. The second boot must be the host's own entry: GRUB
+cleared the flag. Then `nos-install update`, finding the partition through the GRUB
 entry, over what nos wrote: e2fsck finds the partition clean, the host key
 nos made stays, the old kernel and modules go to `.prev`, the UDP shell it
 is asked for goes into the kernel parameters and a boot is armed; the third
@@ -1009,11 +1027,26 @@ what its header says it does:
   whole, never read as the shorter one it would be;
 - `multiboot`: Multiboot2 infos as GRUB makes them -- memory maps of every
   entry size, and one longer than the map holds; the command line; both
-  RSDP tags; the framebuffer; the tags this kernel skips -- and damaged:
-  sizes that lie, a tag past the info's end, no end tag. What
+  RSDP tags; the framebuffer; modules, `ucode` among other names and names
+  the tag cuts short, of ranges empty or not; the tags this kernel skips --
+  and damaged: sizes that lie, a tag past the info's end, no end tag. What
   `ParseMultiBootInfo` leaves -- the memory map region by region, the
-  command line, the RSDP's copy, the framebuffer -- is held to the tags
-  read in order, the map's reserved regions before its usable RAM;
+  command line, the RSDP's copy, the framebuffer, the microcode module's
+  range -- is held to the tags read in order, the map's reserved regions
+  before its usable RAM;
+- `ucode`: files of Intel's microcode updates (`arch/x86_64/microcode_file.cpp`),
+  what GRUB loads from `/boot/ucode` and the BSP chooses its CPU's update
+  from, built update by update as Intel lays one out -- the original
+  2048-byte format, data and total sizes of their own, an extended signature
+  table naming other CPUs and platforms, every checksum made right -- for the
+  CPU the input makes up or for another, of revisions above and below the
+  one it runs; then one update made unsound in a way the SDM rules out, bytes
+  after the last, or bytes of anything written over it. Over a file the
+  generator made, `Choose` is held to a model written from the SDM (Vol. 3A,
+  10.11.1): the newest update for the CPU above its revision, of those before
+  the first unsound one; over any file, a choice is an update inside the
+  file, sound by the model's reading of one, for the CPU and newer than what
+  it runs;
 - `acpi`: the tables in a physical memory of the input's, sparse, zeros
   where nothing was put: an RSDP in the Multiboot tag's copy, the EBDA or
   the BIOS area, among decoys; an RSDT or an XSDT; and tables below and
@@ -1211,7 +1244,19 @@ depend on; and for `ioapic` that the IO-APIC sent five interrupts, three
 of them levels each ended by EOI -- its serial port's pin taking two edges
 and none while masked, then a level sent again at each EOI while the line
 stayed up, its remote IRR set in service and clear after ([The
-IO-APIC](hypervisor.md#the-io-apic)); and for `debug`, through the run loop
+IO-APIC](hypervisor.md#the-io-apic)); for `apicv`, on the same machine in
+x2APIC mode, that self-IPIs at and below CR8's class were held -- none
+taken, both read in IRR -- and with CR8 0 taken by priority, 0x50 and then
+0x30, with 0x70 nested in 0x30's handler, ISR read showing each in service;
+that three levels from the IO-APIC were each ended by the x2APIC's EOI and
+sent again while the line stayed up; that nothing was left in service; and
+who did it: the host, injecting all six, under AMD-V or where the CPU has no
+APIC virtualization, and the CPU -- `hv info`'s *APIC virtualization* --
+delivering all six and taking their EOIs under VT-x, the guest stopped after
+the three level-triggered ones alone ([Interrupts the CPU delivers
+itself](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
+there `tpr`'s CR8 is the virtual APIC's VTPR and no `mov` of it exits; and
+for `debug`, through the run loop
 a Linux guest's CPUs go through, that a single step and an `int1` -- each a
 #DB the host intercepts -- reached the guest's own handler, the first with
 DR6.BS and after the stepped instruction, the second after the ICEBP: a
@@ -1219,8 +1264,8 @@ user process's `stepi` once stopped its whole VM. Under VT-x the same --
 its DR6 the one the exit said, VT-x writing none at a #DB that exits, and
 its handler's `mov`s of DR6 answered by the host. And for
 `cr4`, through the same loop, that the guest read back each CR4 it wrote --
-MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that SMEP, which
-its CPUID does not offer, PAE cleared in long mode and bit 32 were each a
+MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that PKE, which
+its CPUID never offers, PAE cleared in long mode and bit 32 were each a
 #GP with no error code, CR4 as it was; and that the host performed all
 eleven of its accesses. On QEMU's TCG -- known by its hypervisor leaf's
 signature -- which checks a read of any control register against CR0's
@@ -1232,7 +1277,7 @@ read lost MCE at the first write. Under VT-x, which stops a guest at a
 write of CR4 only where it changes a bit the host keeps, and answers its
 reads from the read shadow, it holds the reads to the same CR4s, the CPU's
 to MCE kept and VMXE, and the host to three writes performed -- MCE
-cleared, SMEP, bit 32 -- and two refused: PAE cleared in long mode is the
+cleared, PKE, bit 32 -- and two refused: PAE cleared in long mode is the
 CPU's own #GP, and PGE set its own write. And for `msr`, through the same loop,
 that SPEC_CTRL and PRED_CMD, which its CPUID does not offer, AMD's LS_CFG,
 which the policy names for no CPU, and MTRRs turned on, which nothing

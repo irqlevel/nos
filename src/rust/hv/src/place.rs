@@ -24,16 +24,30 @@ use kcore::consts::MAX_CPUS;
 /// The widths an APIC ID divides into: a core's threads, and the CPUs that
 /// share the last-level cache. On x86 the kernel numbers a CPU by its APIC
 /// ID, so a CPU's number shifted right by the one is its core, by the other
-/// its cache domain; `crate::topology` reads the widths from CPUID.
+/// its cache domain; `crate::topology` reads the widths from CPUID. And on
+/// a hybrid part, which CPUs are of its slower kind of core.
 #[derive(Clone, Copy, Debug)]
 pub struct Topology {
     smt_shift: u32,
     llc_shift: u32,
+    slow: u64,
 }
 
 impl Topology {
     pub const fn of(smt_shift: u32, llc_shift: u32) -> Topology {
-        Topology { smt_shift, llc_shift }
+        Topology { smt_shift, llc_shift, slow: 0 }
+    }
+
+    /// The same machine, `slow` the CPUs of a hybrid part's slower kind of
+    /// core -- Intel's E-cores, `crate::topology` asks each CPU which it is.
+    pub const fn hybrid(self, slow: u64) -> Topology {
+        Topology { slow, ..self }
+    }
+
+    /// Whether CPU `cpu` is of the slower kind.
+    #[inline]
+    pub fn slow(&self, cpu: u32) -> bool {
+        self.slow & bit(cpu) != 0
     }
 
     /// The core CPU `cpu` is a thread of.
@@ -181,6 +195,22 @@ fn own(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Option
     if n > free.count_ones() {
         return Err(Refused::NoCores { asked: n, room: free.count_ones() });
     }
+    /* One kind of core for the whole guest where one has room for it: its
+     * kernel takes its CPUs for equals, and on the EX44 an E-core ran a busy
+     * loop 16% slower than a P-core at the same clock, and with each at its
+     * turbo 58%. The faster kind first, or the kind of the CPU asked for;
+     * both only where neither has room alone. */
+    let fast = free & !topo.slow;
+    let slow = free & topo.slow;
+    let pool = match wanted {
+        Some(cpu) => {
+            let kind = if topo.slow(cpu) { slow } else { fast };
+            if kind.count_ones() >= n { kind } else { free }
+        }
+        None if fast.count_ones() >= n => fast,
+        None if slow.count_ones() >= n => slow,
+        None => free,
+    };
 
     let mut vcpus = Vec::new();
     vcpus.try_reserve_exact(n as usize).map_err(|_| Refused::NoMemory)?;
@@ -193,10 +223,10 @@ fn own(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Option
     while (vcpus.len() as u32) < n {
         let core = match next.take() {
             Some(core) => core,
-            None => best_core(topo, free, chosen, home).ok_or(Refused::NoCores { asked: n, room: free.count_ones() })?,
+            None => best_core(topo, pool, chosen, home).ok_or(Refused::NoCores { asked: n, room: free.count_ones() })?,
         };
         chosen |= bit(core);
-        let mut on_core = threads(topo, free, core);
+        let mut on_core = threads(topo, pool, core);
         if let Some(cpu) = wanted.filter(|&cpu| topo.core(cpu) == core && vcpus.is_empty()) {
             vcpus.push(cpu);
             on_core &= !bit(cpu);
@@ -219,10 +249,11 @@ fn own(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Option
 
 /// The free core a guest takes next, of those with a CPU in `free` it has
 /// not `chosen`: one sharing the last-level cache `home` with its first,
-/// where it has one; then not CPU 0's, where the boot CPU's own work runs;
-/// then the one with the most threads to fill; then the higher.
+/// where it has one; then of the faster kind; then not CPU 0's, where the
+/// boot CPU's own work runs; then the one with the most threads to fill;
+/// then the higher.
 fn best_core(topo: &Topology, free: u64, chosen: u64, home: Option<u32>) -> Option<u32> {
-    let mut best: Option<(u32, (bool, bool, u32, u32))> = None;
+    let mut best: Option<(u32, (bool, bool, bool, u32, u32))> = None;
     for cpu in 0..MAX_CPUS as u32 {
         if free & bit(cpu) == 0 {
             continue;
@@ -231,7 +262,7 @@ fn best_core(topo: &Topology, free: u64, chosen: u64, home: Option<u32>) -> Opti
         if chosen & bit(core) != 0 {
             continue;
         }
-        let key = (home.map_or(true, |h| topo.llc(cpu) == h), core != topo.core(0),
+        let key = (home.map_or(true, |h| topo.llc(cpu) == h), !topo.slow(cpu), core != topo.core(0),
                    threads(topo, free, core).count_ones(), core);
         if best.map_or(true, |(_, k)| key > k) {
             best = Some((core, key));
@@ -242,12 +273,14 @@ fn best_core(topo: &Topology, free: u64, chosen: u64, home: Option<u32>) -> Opti
 
 /// Where a guest whose vCPUs have the cores `chosen` serves its disks: on a
 /// thread of those cores no vCPU of its is on, where there is one online;
-/// then on a core no guest has, sharing its cache where one does -- which
-/// the guest then holds as well; then on its own last vCPU's CPU, sharing
-/// time with it rather than a core with another guest. CPU 0 last at each.
+/// then on a core no guest has, sharing its cache where one does, of the
+/// slower kind where there is one -- the task waits on the disk, and a fast
+/// core is a guest's -- which the guest then holds as well; then on its own
+/// last vCPU's CPU, sharing time with it rather than a core with another
+/// guest. CPU 0 last at each.
 fn own_disk(topo: &Topology, online: u64, held: u64, chosen: u64, vcpus: &[u32], home: Option<u32>) -> u32 {
     let mine = vcpus.iter().fold(0u64, |m, &cpu| m | bit(cpu));
-    let mut best: Option<(u32, (bool, bool, bool, u32))> = None;
+    let mut best: Option<(u32, (bool, bool, bool, bool, u32))> = None;
     for cpu in 0..MAX_CPUS as u32 {
         if online & bit(cpu) == 0 || mine & bit(cpu) != 0 {
             continue;
@@ -257,7 +290,7 @@ fn own_disk(topo: &Topology, online: u64, held: u64, chosen: u64, vcpus: &[u32],
         if !own_core && held & bit(core) != 0 {
             continue;
         }
-        let key = (own_core, home.map_or(true, |h| topo.llc(cpu) == h), cpu != 0, cpu);
+        let key = (own_core, home.map_or(true, |h| topo.llc(cpu) == h), topo.slow(cpu), cpu != 0, cpu);
         if best.map_or(true, |(_, k)| key > k) {
             best = Some((cpu, key));
         }
@@ -278,13 +311,14 @@ fn core_load(topo: &Topology, cpu: u32, load: &[u32; MAX_CPUS]) -> u32 {
 }
 
 /// The first CPU: `wanted`, or the CPU the extension is on for whose core
-/// has fewest vCPUs already, and of those the CPU itself -- the higher of
-/// any two that tie: CPU 0 is where the boot CPU's own work runs, and the
-/// last to be given a guest. Each other on a CPU none of the guest's has
-/// yet: one whose core none of the guest's CPUs is on where there is one,
-/// since two threads of a core share its execution units; then one sharing
-/// the first's last-level cache, where the CPUs' lines and IPIs go no
-/// further; then the least loaded, as the first. And its disks' task on an
+/// has fewest vCPUs already, of the faster kind of core where a hybrid part
+/// has one, and of those the CPU itself -- the higher of any two that tie:
+/// CPU 0 is where the boot CPU's own work runs, and the last to be given a
+/// guest. Each other on a CPU none of the guest's has yet: one whose core
+/// none of the guest's CPUs is on where there is one, since two threads of
+/// a core share its execution units; then one sharing the first's
+/// last-level cache, where the CPUs' lines and IPIs go no further; then one
+/// of the first's kind of core; then the least loaded, as the first. And its disks' task on an
 /// online CPU other than its first vCPU's -- that one's only on a machine of
 /// one CPU -- with the fewest vCPUs, the higher of two that tie, CPU 0 last.
 fn shared(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Option<u32>, n: u32)
@@ -294,12 +328,12 @@ fn shared(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Opt
     let first = match wanted {
         Some(cpu) => cpu,
         None => {
-            let mut best: Option<(u32, (u32, u32))> = None;
+            let mut best: Option<(u32, (u32, bool, u32))> = None;
             for cpu in 0..MAX_CPUS as u32 {
                 if enabled & bit(cpu) == 0 {
                     continue;
                 }
-                let key = (core_load(topo, cpu, &load), load[cpu as usize]);
+                let key = (core_load(topo, cpu, &load), topo.slow(cpu), load[cpu as usize]);
                 if best.map_or(true, |(_, k)| key <= k) {
                     best = Some((cpu, key));
                 }
@@ -313,13 +347,14 @@ fn shared(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Opt
     load[first as usize] += 1;
     let home = topo.llc(first);
     while (vcpus.len() as u32) < n {
-        let mut best: Option<(u32, (bool, bool, u32, u32))> = None;
+        let mut best: Option<(u32, (bool, bool, bool, u32, u32))> = None;
         for cpu in 0..MAX_CPUS as u32 {
             if enabled & bit(cpu) == 0 || vcpus.contains(&cpu) {
                 continue;
             }
             let shares_core = vcpus.iter().any(|&c| topo.core(c) == topo.core(cpu));
-            let key = (shares_core, topo.llc(cpu) != home, core_load(topo, cpu, &load), load[cpu as usize]);
+            let key = (shares_core, topo.llc(cpu) != home, topo.slow(cpu) != topo.slow(first),
+                       core_load(topo, cpu, &load), load[cpu as usize]);
             if best.map_or(true, |(_, k)| key <= k) {
                 best = Some((cpu, key));
             }

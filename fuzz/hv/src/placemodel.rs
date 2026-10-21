@@ -6,10 +6,15 @@
 //! where there is one, then on a core no guest has, then on a vCPU's CPU of
 //! its own; under either rule each vCPU on a CPU of its own the extension is
 //! on for, the first where it was asked to be; and a guest refused only
-//! where it has no place, for the reason that comes first. The host is
-//! made up -- its threads a core, how many cores share a cache, which CPUs
-//! are online and which the extension is on for -- and guests are started
-//! and stopped on it, and the rule changed between, as an input says.
+//! where it has no place, for the reason that comes first. On a hybrid
+//! part, under `Cores::Own`, a guest's vCPUs on one kind of core where one
+//! has room for all of them -- the faster where it has, or the kind of the
+//! CPU asked for -- and its disks' task, put on a core no guest had, on the
+//! slower kind where its cache has one. The host is made up -- its threads
+//! a core, how many cores share a cache, which cores are of the slower
+//! kind, which CPUs are online and which the extension is on for -- and
+//! guests are started and stopped on it, and the rule changed between, as
+//! an input says.
 
 use crate::place::{self, Cores, Placement, Refused, Taken, Topology};
 use crate::targets::Input;
@@ -40,7 +45,12 @@ fn on_cores(topo: &Topology, mask: u64, cores: u64) -> u64 {
 pub fn place_target(r: &mut Input) {
     /* One, two or four threads a core; a cache shared by one to sixteen. */
     let smt = r.below(3) as u32;
-    let topo = Topology::of(smt, smt + r.below(5) as u32);
+    let llc = smt + r.below(5) as u32;
+    /* Half the hosts hybrid: whole cores of the slower kind, as an input
+     * picks them. */
+    let slow_cores = if r.bool() { r.u64() } else { 0 };
+    let slow = (0..CPUS).filter(|&c| slow_cores & bit(c >> smt) != 0).fold(0u64, |m, c| m | bit(c));
+    let topo = Topology::of(smt, llc).hybrid(slow);
     /* Up to 64 CPUs, CPU 0 always among them and some missing -- a hybrid
      * part's cores of one thread leave holes in the numbering. */
     let count = 1 + r.below(u64::from(CPUS)) as u32;
@@ -142,6 +152,25 @@ fn check(topo: &Topology, own: bool, enabled: u64, online: u64, taken: u64, want
         return;
     }
 
+    /* One kind of core where one has room: the CPU asked for's, or the
+     * faster, then the slower. */
+    let slow = (0..CPUS).filter(|&c| topo.slow(c)).fold(0u64, |m, c| m | bit(c));
+    let (fast_room, slow_room) = ((free & !slow).count_ones(), (free & slow).count_ones());
+    let one_kind = match wanted {
+        Some(w) if topo.slow(w) => (slow_room >= n).then_some(slow),
+        Some(_) => (fast_room >= n).then_some(!slow),
+        None if fast_room >= n => Some(!slow),
+        None if slow_room >= n => Some(slow),
+        None => None,
+    };
+    if let Some(kind) = one_kind {
+        invariant!(mine & !kind == 0, "vCPUs {:?} of both kinds of core, or of the slower, where one kind ({:#x}) has \
+                                       room for all {} -- the faster {}, the slower {}", p.vcpus, kind, n, fast_room,
+                   slow_room);
+    } else if mine & slow != 0 && mine & !slow != 0 {
+        placed("place: own cores, both kinds");
+    }
+
     /* Its cores are its own. */
     let cores = cores_of(topo, mine);
     invariant!(cores & held == 0, "vCPUs {:?} on cores another guest has a CPU on ({:#x})", p.vcpus, held);
@@ -168,6 +197,13 @@ fn check(topo: &Topology, own: bool, enabled: u64, online: u64, taken: u64, want
     } else if elsewhere != 0 {
         invariant!(elsewhere & bit(p.disk) != 0, "the disks' task on cpu {}, with no thread of its own cores spare \
                                                   and a core no guest has ({:#x})", p.disk, elsewhere);
+        /* Its first vCPU's cache, where it has one of those; and of them a
+         * slow core's, where there is one. */
+        let home = topo.llc(p.vcpus[0]);
+        let near = (0..CPUS).filter(|&c| elsewhere & bit(c) != 0 && topo.llc(c) == home).fold(0u64, |m, c| m | bit(c));
+        let pool = if near != 0 { near } else { elsewhere };
+        invariant!(pool & slow == 0 || slow & bit(p.disk) != 0, "the disks' task on cpu {}, a fast core, where a \
+                                                                    slow one was free ({:#x})", p.disk, pool & slow);
         placed("place: disks on a core no guest had");
     } else {
         invariant!(mine & bit(p.disk) != 0, "the disks' task on cpu {}, with nowhere but its own vCPUs' CPUs",

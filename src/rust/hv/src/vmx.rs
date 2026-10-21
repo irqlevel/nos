@@ -84,10 +84,11 @@ const CR4_GUEST_OWNS: u64 = CR4_VME | CR4_PVI | CR4_TSD | CR4_DE | CR4_PSE | CR4
 /// One guest CPU under VT-x.
 pub struct Vcpu {
     guest: Guest,
-    /// The guest's task-priority register, CR8: a shadow, since the real
-    /// one is the host's local APIC's, and the guest is given no APIC for
-    /// the value to mean anything to. A `mov` to or from CR8 stops the
-    /// guest and is answered from here.
+    /// The guest's task-priority register, CR8, where the CPU gives it no
+    /// virtual APIC (`Guest::has_vapic`): a shadow, since the real one is
+    /// the host's local APIC's. A `mov` to or from CR8 then stops the guest
+    /// and is answered from here; with a virtual APIC its VTPR is CR8, and
+    /// no `mov` of it exits.
     tpr: u8,
 }
 
@@ -103,8 +104,11 @@ impl Vcpu {
             _ => return Err(hvarch::Error::NoExtension),
         };
         /* Of the bits a guest may own, those its CPUID offers it: any other
-         * write of one exits, and is the #GP its CPUID promises. */
-        let guest = Guest::new(vmx, exceptions, CR4_GUEST_OWNS & crate::policy::cr4_allowed())?;
+         * write of one exits, and is the #GP its CPUID promises. And a
+         * virtual APIC wherever the CPU has one to give: CR8 the guest's own
+         * without an exit, and virtual-interrupt delivery for the run loop
+         * to turn on while the guest's APIC is in x2APIC mode. */
+        let guest = Guest::new(vmx, exceptions, CR4_GUEST_OWNS & crate::policy::cr4_allowed(), true)?;
         Ok(Self { guest, tpr: 0 })
     }
 
@@ -313,6 +317,7 @@ impl Vcpu {
                 })
             }
             r::HLT => Exit::Hlt,
+            r::EOI_INDUCED => Exit::Eoi { vector: (g.exit_qualification() & u64::from(u8::MAX)) as u8 },
             r::PAUSE => Exit::Pause,
             r::CPUID => Exit::Cpuid,
             r::RDMSR => Exit::Msr { write: false },
@@ -445,9 +450,9 @@ impl Vcpu {
                 self.inject_gp();
                 return;
             }
-            self.tpr = value as u8;
+            self.set_cr8(value as u8);
         } else {
-            self.set_gpr(gpr, u64::from(self.tpr));
+            self.set_gpr(gpr, u64::from(self.cr8()));
         }
         self.skip();
     }
@@ -516,7 +521,7 @@ impl Vcpu {
         self.guest.set_interruptibility(0);
         self.guest.set_irq_window(false);
         self.guest.set_nmi_window(false);
-        self.tpr = 0;
+        self.set_cr8(0);
     }
 
     /// Whether the guest can take an NMI now: its NMI blocking is its own
@@ -546,9 +551,51 @@ impl Vcpu {
         self.guest.unrestricted()
     }
 
-    /// The guest's CR8, from the shadow its `mov`s are answered from.
+    /// The guest's CR8: its virtual APIC's VTPR, bits 7:4, or the shadow its
+    /// `mov`s are answered from.
     pub fn cr8(&self) -> u8 {
-        self.tpr
+        if self.guest.has_vapic() {
+            self.guest.virtual_tpr() >> 4
+        } else {
+            self.tpr
+        }
+    }
+
+    /// Whether the CPU can deliver this guest's interrupts itself
+    /// ([`load_apic`](Self::load_apic)).
+    pub fn has_vapic(&self) -> bool {
+        self.guest.has_vapic()
+    }
+
+    /// Virtual-interrupt delivery for the next entry, from where the guest's
+    /// local APIC stands: what it has requested and in service, the
+    /// level-triggered of them -- whose EOIs exit -- and its task priority,
+    /// into the virtual APIC; and the CPU delivers what the priorities let
+    /// through as the guest can take it, and performs its EOIs, task
+    /// priority writes and self-IPIs, without an exit. Nothing without a
+    /// virtual APIC.
+    pub fn load_apic(&mut self, v: &crate::lapic::Vectors) {
+        if !self.guest.has_vapic() {
+            return;
+        }
+        self.guest.set_virtual_irr(&v.irr);
+        self.guest.set_virtual_isr(&v.isr);
+        self.guest.set_virtual_tpr(v.tpr);
+        self.guest.set_eoi_exit(v.eoi_exit());
+        self.guest.set_apicv(true);
+    }
+
+    /// No virtual-interrupt delivery from the next entry: the guest's APIC
+    /// out of x2APIC mode, or off, and its interrupts injected by the run
+    /// loop. CR8 stays VTPR.
+    pub fn apicv_off(&mut self) {
+        self.guest.set_apicv(false);
+    }
+
+    /// What virtual-interrupt delivery left in the virtual APIC by the exit,
+    /// taken back for the local APIC: VIRR, VISR and VTPR.
+    pub fn take_apic(&mut self) -> ([u32; hvarch::x86::vmx::VAPIC_WORDS], [u32; hvarch::x86::vmx::VAPIC_WORDS], u8) {
+        (self.guest.virtual_irr(), self.guest.virtual_isr(), self.guest.virtual_tpr())
     }
 
     /// The CR4 the guest believes it has: the host's bits as it last wrote
@@ -616,8 +663,16 @@ impl Vcpu {
         self.skip();
     }
 
+    /// CR8 written for the guest -- its APIC's task priority, written
+    /// through a register the CPU did not perform: VTPR's bits 7:4, the low
+    /// four 0 as a `mov` to CR8 leaves them, or the shadow.
     pub fn set_cr8(&mut self, value: u8) {
-        self.tpr = value & TPR_MASK as u8;
+        let value = value & TPR_MASK as u8;
+        if self.guest.has_vapic() {
+            self.guest.set_virtual_tpr(value << 4);
+        } else {
+            self.tpr = value;
+        }
     }
 
     /// General-purpose register `n`, as the encoding numbers them.

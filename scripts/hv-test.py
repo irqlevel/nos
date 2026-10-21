@@ -135,13 +135,19 @@ GUESTS = {
     "ioapic": [r"two edges taken, none while masked; three levels, each sent again at its EOI while the line "
                r"stayed up, its remote IRR set in service and clear after",
                r"the IO-APIC sent 5, 3 of them levels, 3 ended by EOI"],
+    # What the guest sees has to be the same whoever delivers its
+    # interrupts; who does is said after the dash -- the host here.
+    "apicv": [r"CR8 5 held 0x50 and 0x30, both read in IRR; CR8 0 let 0x50 in, then 0x30 with 0x70 nested in its "
+              r"handler, ISR showing each in service; three levels from the IO-APIC, sent again at each EOI while "
+              r"the line stayed up; nothing left in service -- the host injected all six",
+              r"the IO-APIC sent 3, 3 of them levels, 3 ended by EOI"],
     "debug": [r"both #DBs its own handler's: the single step's with DR6\.BS, after the NOP; the ICEBP's with no bit",
               r"2 exceptions given back"],
     # Its reads are stopped and answered by the host -- 11 accesses
     # performed -- except on QEMU's TCG, which checks a read of CR4 against
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
     # check knows which by the hypervisor's CPUID signature.
-    "cr4": [r"while the CPU's CR4 kept MCE; SMEP, PAE cleared and bit 32 each a #GP, CR4 as it was",
+    "cr4": [r"while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was",
             r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
             r"\b(?:11|5) of CR4 performed, 3 refused"],
     # Every MSR comes to the policy on both backends, so this one says the
@@ -165,7 +171,8 @@ GUESTS = {
 # (`dr`). Under Intel VT-x the CPU refuses a bad VMCS itself; the ASID is a
 # VPID held for the guest's life, so the third VM gets one of the first two's
 # back; CR8 is the host's, so the guest is stopped at each access and
-# answered from a shadow; a write of CR4 stops it only where it changes a bit
+# answered from a shadow -- where the CPU has no APIC virtualization
+# (`GUESTS_APICV`); a write of CR4 stops it only where it changes a bit
 # the host keeps -- three of five -- its reads the read shadow's, and PAE
 # cleared the CPU's own #GP; and every `mov` of a debug register stops it,
 # DR6's and DR7's in its #DB handler too -- eighteen. What each says differs;
@@ -177,7 +184,7 @@ GUESTS_VMX = {
     "tpr": [r"wrote 15 to its CR8 and read it back, stopped at each and answered from the shadow, and the host's CR8 is still 0"],
     "cr4": [r"it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- while the CPU's CR4 "
             r"kept MCE",
-            r"SMEP and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
+            r"PKE and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
             r"\b3 of CR4 performed, 2 refused"],
     "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
            r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
@@ -312,11 +319,27 @@ def guest_report(text, name):
     return m.group(0) if m else ""
 
 
-def check_all_guests(text, cpu, backend):
+# Under VT-x with APIC virtualization (`hv info`): CR8 is the virtual APIC's
+# VTPR, never an exit, and an x2APIC guest's interrupts are the CPU's to
+# deliver and its EOIs the CPU's to take -- but for the three level-triggered
+# ones, which it stops the guest after, for the IO-APIC.
+GUESTS_APICV = {
+    "tpr": [r"wrote 15 to its CR8 and read it back, the CPU keeping it in the virtual APIC's VTPR, and the "
+            r"host's CR8 is still 0"],
+    "apicv": [GUESTS["apicv"][0].replace("the host injected all six",
+                                         "the CPU delivered all six itself and took their EOIs, stopping the guest "
+                                         "after the three level-triggered ones for the IO-APIC"),
+              GUESTS["apicv"][1]],
+}
+
+
+def check_all_guests(text, cpu, backend, apicv):
     """`hv run all <cpu>`: every guest ran there and did what it was told."""
     guests = dict(GUESTS)
     if backend == "vmx":
         guests.update(GUESTS_VMX)
+    if apicv:
+        guests.update(GUESTS_APICV)
     m = re.search(r"^hv: (\d+) of (\d+) guests ok$", text, re.M)
     pt.check("every built-in guest does what it was told on cpu %d" % cpu,
              m is not None and m.group(1) == m.group(2) and int(m.group(2)) >= len(guests), text)
@@ -367,8 +390,10 @@ def x86_checks(ran):
     pt.check("and every CPU says so",
              "on for cpu %s of %s" % (ALL_CPUS, ALL_CPUS) in out[11], out[11])
 
-    check_all_guests(out[12], 0, backend)
-    check_all_guests(out[13], CPUS - 1, backend)
+    apicv = re.search(r"APIC virtualization\s+yes", info) is not None
+    print("APIC virtualization: %s" % ("yes" if apicv else "no"))
+    check_all_guests(out[12], 0, backend, apicv)
+    check_all_guests(out[13], CPUS - 1, backend, apicv)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
     # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after

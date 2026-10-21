@@ -7,11 +7,15 @@
 //! gives both widths, the same on every CPU of the one package design the
 //! kernel runs on. Two CPUs of a guest on one core's two threads share its
 //! execution units -- on the AX41 two spinning guest CPUs there took 14.7 s
-//! for what one did alone in 9.7, where on two cores they took 9.9.
+//! for what one did alone in 9.7, where on two cores they took 9.9. And on a
+//! hybrid part the CPUs are not equals: an EX44 E-core ran a busy loop 58%
+//! slower than a P-core, each at its turbo.
 
 use core::arch::x86_64::CpuidResult;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use hvarch::x86::cpu;
+use kcore::consts::MAX_CPUS;
 
 pub use crate::place::Topology;
 
@@ -37,11 +41,50 @@ const CACHE_SHARING_SHIFT: u32 = 14;
 const CACHE_SHARING_MASK: u32 = 0xFFF;
 /// More subleaves than any CPU has caches.
 const CACHE_SUBLEAVES: u32 = 16;
+/// Leaf 7, EDX bit 15: a hybrid part, of two kinds of core.
+const LEAF_STRUCTURED: u32 = 7;
+const EDX_HYBRID: u32 = 1 << 15;
+/// The hybrid leaf: EAX[31:24] the kind of core the CPU running it is --
+/// Intel's Atom, an E-core, or its Core, a P-core.
+const LEAF_HYBRID: u32 = 0x1A;
+const CORE_TYPE_SHIFT: u32 = 24;
+const CORE_TYPE_ATOM: u32 = 0x20;
 
-/// The host's, as CPUID says on the CPU this runs on. Where it says
-/// nothing, every CPU is a core of its own, and all of them share one cache.
+/// The host's, as CPUID says on the CPU this runs on -- and, on a hybrid
+/// part, on each CPU, which kind of core it is. Where CPUID says nothing,
+/// every CPU is a core of its own, all of one kind, sharing one cache. Task
+/// context: on a hybrid part it asks every CPU by an IPI, which waits.
 pub fn host() -> Topology {
-    Topology::of(smt_shift(), llc_shift())
+    Topology::of(smt_shift(), llc_shift()).hybrid(slow_cpus())
+}
+
+/// The CPUs of a hybrid part's slower kind -- Intel's E-cores -- each asked
+/// on itself, the hybrid leaf answering for the CPU that runs it; none on
+/// a part of one kind.
+fn slow_cpus() -> u64 {
+    if !leaf(LEAF_STRUCTURED, 0).is_some_and(|r| r.edx & EDX_HYBRID != 0) {
+        return 0;
+    }
+    let online = kcore::cpu::online_mask();
+    let mut slow = 0u64;
+    for cpu in 0..MAX_CPUS as u32 {
+        let cpu_bit = 1u64.checked_shl(cpu).unwrap_or(0);
+        if online & cpu_bit == 0 {
+            continue;
+        }
+        let kind = AtomicU32::new(0);
+        kcore::cpu::run_on_with(cpu, &kind, core_type_here);
+        if kind.load(Ordering::Acquire) == CORE_TYPE_ATOM {
+            slow |= cpu_bit;
+        }
+    }
+    slow
+}
+
+/// The kind of core the CPU this runs on is: the IPI `slow_cpus` sends.
+fn core_type_here(kind: &AtomicU32) {
+    let core_type = leaf(LEAF_HYBRID, 0).map_or(0, |r| r.eax >> CORE_TYPE_SHIFT);
+    kind.store(core_type, Ordering::Release);
 }
 
 /// A leaf the CPU has, or None: `cpu::cpuid_count` checks the range.
