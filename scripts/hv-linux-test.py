@@ -646,7 +646,7 @@ def attach(args):
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc", "ssh"))
     shutil.copy(hvt.module("x86_64"), rootdir)
-    shutil.copy(os.path.join(ROOT, "out", "x86_64", "modules", "sshd.ko"), rootdir)
+    shutil.copy(hvt.pt.module_path("x86_64", "sshd"), rootdir)
     shutil.copy(args.bzimage, os.path.join(rootdir, "bzImage"))
     shutil.copy(args.initrd, os.path.join(rootdir, "initrd"))
     with open(os.path.join(rootdir, "etc", "ssh", "authorized_keys"), "w") as f:
@@ -990,7 +990,7 @@ def network(args):
     ssh_port = free_port()
     qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
             "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080,hostfwd=tcp:127.0.0.1:%d-:22" % (port, ssh_port)]
-    sshd = os.path.join(ROOT, "out", "x86_64", "modules", "sshd.ko")
+    sshd = hvt.pt.module_path("x86_64", "sshd")
     p, log, image = boot_rc(args, tmp, rc, extra={"sshd.ko": sshd}, qemu=qemu)
     try:
         if p.poll() is not None or not RC_DONE.search(open(log, errors="replace").read()):
