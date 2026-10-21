@@ -160,6 +160,15 @@ enum DrExpect {
 
 /// General-purpose register `n` of the guest's, numbered as an instruction
 /// names them: the fuzzer's own table, not the emulator's.
+/// Whether a CPU refuses a write of CR4 from `old` to `new` for PCIDE's
+/// sake (SDM, MOV to CR4): a #GP where it is turned on outside IA-32e mode,
+/// or with a PCID in CR3 -- its low twelve bits not zero.
+fn pcide_refused(old: u64, new: u64, long: bool, cr3: u64) -> bool {
+    const CR4_PCIDE: u64 = 1 << 17;
+    const CR3_PCID: u64 = 0xFFF;
+    new & !old & CR4_PCIDE != 0 && (!long || cr3 & CR3_PCID != 0)
+}
+
 fn gpr_slot(v: &mut Backend, n: u8) -> &mut u64 {
     let (sv, regs) = v.save_and_regs_mut();
     match n {
@@ -349,7 +358,8 @@ impl Script {
         /* What the CPU takes of the register: in 32-bit code its low half,
          * whatever is above it. */
         let taken = value & width;
-        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0);
+        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0)
+            || pcide_refused(old, taken, long, v.save().cr3);
 
         let mut insn = Vec::new();
         if r.u8() < 24 {
@@ -502,7 +512,8 @@ impl Script {
             }
             return None;
         }
-        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0);
+        let refused = taken & !allowed != 0 || (long && taken & CR4_PAE == 0)
+            || pcide_refused(old, taken, long, v.save().cr3);
         let len = 3 + u64::from(gpr >= 8) + r.below(2);
         self.code = CODE + (self.code + 16 - CODE) % (2 * MIB);
         let rip = self.code;

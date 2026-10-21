@@ -1980,7 +1980,7 @@ const CR4_ABOUT: &str = "a guest's CR4: MCE cleared in what it reads back and ke
 /* A Linux guest's CPU, one, in long mode with an IDT of its own, whose #GP
  * handler counts each, keeps its error code and steps over the 3-byte `mov`
  * that raised it. It reads CR4; writes PAE alone, MCE cleared; then PAE and
- * SMEP, which its CPUID does not offer; then 0, PAE cleared in long mode;
+ * PKE, which its CPUID never offers; then 0, PAE cleared in long mode;
  * then PAE and PGE through R9, read back through R13; then a bit above 31 --
  * reading CR4 after each -- and leaves its mark and halts. Assembled from
  * this source with clang, the offsets in the comments its listing's. */
@@ -1995,7 +1995,7 @@ const CR4_CODE: &[u8] = &[
     0x0F, 0x22, 0xE0,                                       // 28: mov cr4, rax
     0x0F, 0x20, 0xE0,                                       // 2b: mov rax, cr4
     0x48, 0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,         // 2e: mov qword [0x7010], rax
-    0xB8, 0x20, 0x00, 0x10, 0x00,                           // 36: mov eax, 0x100020 ; and SMEP: #GP
+    0xB8, 0x20, 0x00, 0x40, 0x00,                           // 36: mov eax, 0x400020 ; and PKE: #GP
     0x0F, 0x22, 0xE0,                                       // 3b: mov cr4, rax
     0x0F, 0x20, 0xE0,                                       // 3e: mov rax, cr4
     0x48, 0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,         // 41: mov qword [0x7018], rax
@@ -2046,13 +2046,13 @@ const CR4_READS: u64 = RESULTS + 0x8;
 const CR4_DONE: u64 = RESULTS + 0x38;
 const CR4_MARK: u32 = u32::from_le_bytes(*b"CR4!");
 /// How many CR4s it reads, how many times it writes it, and how many of the
-/// writes a CPU refuses: SMEP, PAE cleared, bit 32.
+/// writes a CPU refuses: PKE, PAE cleared, bit 32.
 const CR4_READ_COUNT: usize = 6;
 const CR4_WRITE_COUNT: u64 = 5;
 const CR4_REFUSED: u32 = 3;
 /// Under VT-x, which stops a guest at a write that changes a bit the host
 /// keeps and answers its reads from the read shadow: the writes that stop
-/// it -- MCE cleared, SMEP, bit 32 -- and of those the ones refused. PAE
+/// it -- MCE cleared, PKE, bit 32 -- and of those the ones refused. PAE
 /// cleared is the CPU's own #GP, and PGE set the CPU's own write.
 const CR4_VMX_EXITS: u64 = 3;
 const CR4_VMX_REFUSED: u64 = 2;
@@ -2154,15 +2154,15 @@ fn under_qemu_tcg() -> bool {
 }
 
 /// Under AMD-V: the guest read back what it wrote -- MCE cleared, then PGE
-/// set -- while the CPU's CR4 kept MCE; SMEP, which its CPUID does not
-/// offer, PAE cleared in long mode and bit 32 were each a #GP, with no
+/// set -- while the CPU's CR4 kept MCE; PKE, which its CPUID never
+/// offers, PAE cleared in long mode and bit 32 were each a #GP, with no
 /// error code, CR4 as it was; and every read and write was performed by the
 /// host. On QEMU's TCG, which does not stop a guest at a read of CR4 though
 /// its VMCB asks (`under_qemu_tcg`), the reads are the CPU's own, and give
 /// the register, MCE in it; the writes are the host's all the same. Under
 /// VT-x the same CR4s read back -- the read shadow's, its reads stopped
 /// nowhere -- while the CPU's kept MCE: the three writes that changed a bit
-/// the host keeps stopped and performed by the host, SMEP and bit 32
+/// the host keeps stopped and performed by the host, PKE and bit 32
 /// refused, and PAE cleared in long mode the CPU's own #GP.
 fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, vmx: bool)
     -> core::result::Result<String, String>
@@ -2203,7 +2203,7 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
         }
         return Ok(String::from("it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- \
                                 while the CPU's CR4 kept MCE; the three writes of a bit the host keeps the host's, \
-                                SMEP and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was"));
+                                PKE and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was"));
     }
     if !held.reads_asked {
         return Err(String::from("its VMCB does not ask to stop it at a read of CR4"));
@@ -2234,7 +2234,7 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
         return Err(alloc::format!("the host performed {} of its CR4 accesses and refused {}: wanted {} and {}",
                                   counts.cr4, counts.cr4_gp, performed, CR4_REFUSED));
     }
-    let writes = "while the CPU's CR4 kept MCE; SMEP, PAE cleared and bit 32 each a #GP, CR4 as it was";
+    let writes = "while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was";
     Ok(if tcg {
         alloc::format!("its writes the host's, MCE cleared in the CR4 the host keeps for it, {} -- its reads the \
                         CPU's own, QEMU's TCG not stopping a read of CR4 though the VMCB asks", writes)

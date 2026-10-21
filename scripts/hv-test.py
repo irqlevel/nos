@@ -141,7 +141,7 @@ GUESTS = {
     # performed -- except on QEMU's TCG, which checks a read of CR4 against
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
     # check knows which by the hypervisor's CPUID signature.
-    "cr4": [r"while the CPU's CR4 kept MCE; SMEP, PAE cleared and bit 32 each a #GP, CR4 as it was",
+    "cr4": [r"while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was",
             r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
             r"\b(?:11|5) of CR4 performed, 3 refused"],
     # Every MSR comes to the policy on both backends, so this one says the
@@ -177,7 +177,7 @@ GUESTS_VMX = {
     "tpr": [r"wrote 15 to its CR8 and read it back, stopped at each and answered from the shadow, and the host's CR8 is still 0"],
     "cr4": [r"it read back what it wrote, MCE cleared and then PGE set -- the read shadow's -- while the CPU's CR4 "
             r"kept MCE",
-            r"SMEP and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
+            r"PKE and bit 32 each a #GP, and PAE cleared the CPU's own #GP, CR4 as it was",
             r"\b3 of CR4 performed, 2 refused"],
     "dr": [r"vm B read DR0-DR3 as 0 where vm A had left its own, each read back the pattern it wrote",
            r"each one's breakpoint fired at its own address: DR6\.B0, at its ret",
