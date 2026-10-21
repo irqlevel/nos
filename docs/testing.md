@@ -1232,8 +1232,8 @@ user process's `stepi` once stopped its whole VM. Under VT-x the same --
 its DR6 the one the exit said, VT-x writing none at a #DB that exits, and
 its handler's `mov`s of DR6 answered by the host. And for
 `cr4`, through the same loop, that the guest read back each CR4 it wrote --
-MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that SMEP, which
-its CPUID does not offer, PAE cleared in long mode and bit 32 were each a
+MCE cleared, then PGE set -- while the CPU's CR4 kept MCE; that PKE, which
+its CPUID never offers, PAE cleared in long mode and bit 32 were each a
 #GP with no error code, CR4 as it was; and that the host performed all
 eleven of its accesses. On QEMU's TCG -- known by its hypervisor leaf's
 signature -- which checks a read of any control register against CR0's
@@ -1245,7 +1245,7 @@ read lost MCE at the first write. Under VT-x, which stops a guest at a
 write of CR4 only where it changes a bit the host keeps, and answers its
 reads from the read shadow, it holds the reads to the same CR4s, the CPU's
 to MCE kept and VMXE, and the host to three writes performed -- MCE
-cleared, SMEP, bit 32 -- and two refused: PAE cleared in long mode is the
+cleared, PKE, bit 32 -- and two refused: PAE cleared in long mode is the
 CPU's own #GP, and PGE set its own write. And for `msr`, through the same loop,
 that SPEC_CTRL and PRED_CMD, which its CPUID does not offer, AMD's LS_CFG,
 which the policy names for no CPU, and MTRRs turned on, which nothing

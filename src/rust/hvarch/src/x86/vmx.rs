@@ -505,6 +505,19 @@ const EXIT_REQUIRED: u32 = vmcs::EXIT_HOST_ADDR_SPACE_SIZE | vmcs::EXIT_LOAD_IA3
     | vmcs::EXIT_SAVE_IA32_EFER | vmcs::EXIT_LOAD_IA32_PAT | vmcs::EXIT_SAVE_IA32_PAT;
 const ENTRY_REQUIRED: u32 = vmcs::ENTRY_LOAD_IA32_EFER | vmcs::ENTRY_LOAD_IA32_PAT | vmcs::ENTRY_LOAD_DEBUG;
 
+/* Pause-loop exiting, where the CPU has it, in TSC ticks. A guest spinning
+ * on PAUSE in its kernel -- waiting on a lock, an IPI's answer, a tick it
+ * counts while it calibrates its timer -- exits once it has spun
+ * `PLE_WINDOW`, about 26 us at the EX44's 2.5 GHz TSC, and is handed what
+ * fell due meanwhile: soon enough for a tick a millisecond apart, where an
+ * exit at every PAUSE cost a spinning CPU an exit's 1.8 us for each PAUSE
+ * of tens of cycles. A PAUSE within `PLE_GAP` of the last is the same loop:
+ * a loop's turn on Skylake and later, whose PAUSE alone is some 140 cycles
+ * and whose core may run below its TSC's clock, is longer than the 128 KVM
+ * takes, and a gap too short finds no loop and makes no exit at all. */
+const PLE_GAP_TICKS: u64 = 1024;
+const PLE_WINDOW_TICKS: u64 = 65536;
+
 /* What the launch stub does around the world switch (its `flags`). */
 /// VMRESUME, the VMCS being in the launched state; else VMLAUNCH.
 const RUN_RESUME: u64 = 1 << 0;
@@ -1221,12 +1234,16 @@ impl Guest {
          * host's task priority register; MONITOR, MWAIT and RDPMC, which
          * CPUID says the guest has not got; every `mov` of a debug register,
          * whose four addresses and DR6 are the CPU's; WBINVD, below; and
-         * PAUSE, as the policy asks of both. CPUID, INVD, VMCALL, XSETBV and
-         * a triple fault exit unconditionally. */
+         * PAUSE, as the policy asks of both -- at a loop of them that has
+         * spun a while where the CPU has pause-loop exiting (`PLE_GAP_TICKS`),
+         * and at every one where it has not, as under a hypervisor that does
+         * not pass it on. CPUID, INVD, VMCALL, XSETBV and a triple fault exit
+         * unconditionally. */
+        let ple = adjust(PROC2_PAUSE_LOOP_EXITING, MSR_VMX_PROCBASED_CTLS2) & PROC2_PAUSE_LOOP_EXITING != 0;
         self.proc1 = adjust(
             PROC_HLT_EXITING | PROC_UNCOND_IO_EXITING | PROC_CR8_LOAD_EXITING | PROC_CR8_STORE_EXITING
                 | PROC_MWAIT_EXITING | PROC_MONITOR_EXITING | PROC_RDPMC_EXITING | PROC_MOV_DR_EXITING
-                | PROC_USE_MSR_BITMAPS | PROC_PAUSE_EXITING | PROC_SECONDARY_CTLS,
+                | PROC_USE_MSR_BITMAPS | if ple { 0 } else { PROC_PAUSE_EXITING } | PROC_SECONDARY_CTLS,
             ctls_msr(basic, MSR_VMX_PROCBASED_CTLS, MSR_VMX_TRUE_PROCBASED_CTLS),
         );
         /* Without the bitmap control every MSR exits, which is the safe way
@@ -1236,6 +1253,9 @@ impl Guest {
             self.msr_bitmap.as_mut_slice().fill(0xFF);
         }
         let mut want2 = PROC2_ENABLE_EPT | PROC2_WBINVD_EXITING;
+        if ple {
+            want2 |= PROC2_PAUSE_LOOP_EXITING;
+        }
         if self.unrestricted {
             want2 |= PROC2_UNRESTRICTED_GUEST;
         }
@@ -1299,6 +1319,10 @@ impl Guest {
             vmwrite(PAGE_FAULT_ERRCODE_MASK, 0);
             vmwrite(PAGE_FAULT_ERRCODE_MATCH, 0);
             vmwrite(CR3_TARGET_COUNT, 0);
+            if self.proc2 & PROC2_PAUSE_LOOP_EXITING != 0 {
+                vmwrite(PLE_GAP, PLE_GAP_TICKS);
+                vmwrite(PLE_WINDOW, PLE_WINDOW_TICKS);
+            }
             /* Every port exits, and every MSR but the three bases the bitmap
              * lets through: nothing else the guest reads or writes reaches
              * the host's real MSRs or ports. */

@@ -662,7 +662,7 @@ on on every entry, whatever the VMCB says:
   access's is, since a CPU without decode assists (QEMU's, a nested
   hypervisor's) does not name the register. A write of a bit the guest's
   CPUID does not offer is the #GP a CPU without the feature gives, so PKE,
-  SMEP, FSGSBASE, LA57, OSXSAVE and PCIDE stay off; one a CPU would not take
+  LA57, OSXSAVE and CET stay off; one a CPU would not take
   where the guest is -- PAE cleared in long mode, PCIDE with a PCID in CR3 --
   is a #GP too; and a write that changes a bit a CPU translates by flushes
   the guest's TLB, as the CPU would. QEMU's TCG never stops a guest at a
@@ -860,7 +860,7 @@ mode:
 | `ioapic` | on the machine of `smp` with an IO-APIC, its first CPU alone, in xAPIC mode: reads the IO-APIC's version, then wires the serial port's pin to itself -- as an edge, the THR-empty interrupt enabled and a byte written, then one written while masked; as a level, its handler ending it without reading IIR twice, and the third time reading it | edges sent as the line rises and lost while masked; a level sent again at each EOI for as long as its line is up, its remote IRR set until then; every IO-APIC access and every EOI a decoded MMIO access ([The IO-APIC](#the-io-apic)) |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
 | `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
-| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and SMEP, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and SMEP -- which its CPUID does not offer -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
+| `cr4` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: reads CR4, writes PAE alone -- MCE cleared -- then PAE and PKE, 0, PAE and PGE through R9 (read back through R13), and bit 32, reading CR4 after each | every `mov` of CR4 performed by the host: the guest reads back what it wrote while the CPU's CR4 keeps MCE, and PKE -- which its CPUID never offers -- PAE cleared in long mode and a reserved bit each a #GP, CR4 as it was ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); on QEMU's TCG, which stops no read of CR4, its reads are the register's, MCE in it, and the writes the host's all the same; under VT-x its reads are the read shadow's, and three of its writes -- those that change a bit the host keeps -- the host's, PAE cleared the CPU's own #GP |
 
 ```
 $ hv run all 3
@@ -1100,6 +1100,13 @@ The P-core's profile, without the mitigations and with them:
 | VMCS read | 20 | 20 |
 | the exit handled, the loop | 550-573 | 605 |
 
+Those are numbers at the base clock, 2.5 GHz, where firmware left every
+core and nos kept it until it turned hardware P-states on ([Boot](boot.md),
+the clock): with the cores up to their turbo an exit costs 1,018 ns on a
+P-core and 1,512 on an E-core, an MMIO access 2.5 us, and the profile reads
+checks 12 ns, the VMCS written 12, x87/SSE in 35, `vmresume` to exit 587,
+x87/SSE out 49, the VMCS read 11, the rest 339.
+
 The first build with them took three `CpuLocal`s an entry -- the CPU's
 debug registers, the last guest it entered, its mitigations -- and its
 checks were 418 ns, each `with` being calls into the kernel to turn
@@ -1214,8 +1221,16 @@ here:
   bits it lets through: no XSAVE and so no AVX -- the state switch around
   `vmrun` moves only the FXSAVE registers, so a guest is given nothing it
   could put in the part that is not switched -- no paravirtualisation, no
-  speculation control (none has its MSR behind it yet), of the power leaf
-  ARAT alone, and for a guest of one CPU no local APIC and no x2APIC (one of
+  speculation control (none has its MSR behind it yet); of the structured
+  leaf, 7, what runs as it is and owns no state of the host's -- SMEP, SMAP
+  and UMIP for the guest's kernel, FSGSBASE over bases the VMCS and the VMCB
+  keep, BMI, ADX, ERMS and FSRM, RDSEED, SHA, CLFLUSHOPT and CLWB,
+  SERIALIZE -- with MD_CLEAR, VERW clearing the CPU's buffers in a guest as
+  anywhere, and ARCH_CAPABILITIES, whose MSR reads as the host's but for
+  the bits that are not facts of the CPU (IBRS_ALL, whose SPEC_CTRL is not
+  the guest's, and those naming an MSR nothing answers); PCID, but not
+  INVPCID, which VT-x would need a control for; of the power leaf ARAT
+  alone, and for a guest of one CPU no local APIC and no x2APIC (one of
   more has an emulated x2APIC: [More than one CPU](#more-than-one-cpu)); and
   the hypervisor bit, since there is one, which has Linux leave the
   microcode loader and the bare-metal chicken bits alone. Each of its CPUs
@@ -1236,7 +1251,8 @@ here:
   fault on a machine-check register is a panic to it -- the microcode
   revision, none, and of each vendor what Linux reads of every such CPU
   without asking: Intel's platform ID and MISC_ENABLE, its fast strings as
-  the host has them; AMD's HWCR, DE_CFG and NB_CFG, with the bits a Linux
+  the host has them; ARCH_CAPABILITIES where leaf 7 offers it, read-only;
+  AMD's HWCR, DE_CFG and NB_CFG, with the bits a Linux
   on AMD checks set as the hardware has them. Every other MSR is a #GP,
   read or written -- what a guest's `rdmsr_safe` probes are ready for, and
   a line in the VM's report. One a guest's user can reach is refused on
@@ -2101,7 +2117,8 @@ mirror fetched from.
 `cpus=N` on `hv boot` and `hv start` gives a guest N CPUs, up to 16. Each is
 a task of its own on a host CPU of its own, and where they go is
 `hv::place`'s to say, over `hv::topology` -- which reads a CPU's core and
-cache from its APIC ID and CPUID -- by the rule `hv cores` sets. Two CPUs of
+cache from its APIC ID and CPUID, and on a hybrid part asks each CPU which
+kind of core it is (leaf 0x1A) -- by the rule `hv cores` sets. Two CPUs of
 one guest never share a host CPU -- a guest CPU spinning while it waits for
 another would hold the host CPU the other needs to finish -- so a guest has
 at most as many CPUs as `hv on` has turned the extension on for.
@@ -2112,12 +2129,19 @@ buffers -- what every SMT side channel stands on, MDS, L1TF and port
 contention among them -- so a guest is given whole cores no other guest has
 a CPU on, its vCPUs or the task that serves its disks, and its vCPUs fill
 their threads: a vCPU a thread, as a cloud sells them, where a vCPU a core
-would leave a thread idle beside each. The first where `cpu=` says, or on
-the free core with the most threads -- CPU 0's last, where the boot CPU's own
-work runs, and the higher threads of a core first, CPU 0 the last of all --
-then the threads left on it, then on cores sharing its last-level cache. Its
-disks' task goes on a spare thread of its own cores, then on a core no guest
-has -- which it then holds as well -- then beside a vCPU of its own. A guest
+would leave a thread idle beside each. On a hybrid part all of a guest's
+vCPUs are of one kind of core where one kind has room for all of them --
+the faster, or the kind of the CPU `cpu=` names -- since a guest's kernel
+takes its CPUs for equals, and an EX44 E-core runs a busy loop 16% slower
+than a P-core at one clock and 58% slower at their turbos; both kinds only
+where neither has room alone. The first where `cpu=` says, or on the free
+core with the most threads -- CPU 0's last, where the boot CPU's own work
+runs, and the higher threads of a core first, CPU 0 the last of all -- then
+the threads left on it, then on cores sharing its last-level cache, the
+faster kind first. Its disks' task goes on a spare thread of its own cores,
+then on a core no guest has, of the slower kind where its cache has one --
+the task waits on the disk, and a fast core is a guest's; it then holds that
+core as well -- then beside a vCPU of its own. A guest
 that would need a core another has -- `cpu=` on one, or more CPUs than the
 free cores have threads -- is refused, saying so. The place and the hold on
 it are taken under one lock (`modules/hv/src/cores.rs`), so two guests
@@ -2131,11 +2155,11 @@ What it costs: a guest's own CPUs share their core. On one core's two
 threads (13 and 12 on the AX41) two busy loops in a Debian guest took 14.7 s
 where one alone took 9.7; on two cores of one CCX (13 and 11) they took 9.7,
 and four loops on a guest of four CPUs (13, 11, 9 and 5) 10.0 -- the
-placement `hv cores shared` gives: the first on the least loaded core, each
-other on a core none of the guest's CPUs is on yet where there is one,
-sharing the first's last-level cache where it can, the least loaded of
-those, whoever else is there. That is for a machine whose guests are all
-one's own.
+placement `hv cores shared` gives: the first on the least loaded core, of
+the faster kind where loads tie, each other on a core none of the guest's
+CPUs is on yet where there is one, sharing the first's last-level cache
+where it can, of the first's kind, the least loaded of those, whoever else
+is there. That is for a machine whose guests are all one's own.
 
 ```
 $ hv boot /bzImage mem=256 secs=60 cpus=2 initrd=/initrd cmdline=earlyprintk=serial,ttyS0,115200 console=ttyS0 no_timer_check
@@ -2374,10 +2398,17 @@ and took the PIT's ticks owed since in a burst there: Linux counted ten
 ticks' worth of APIC timer as one tick, reported a bus of 10005 MHz where
 there is one of 1000, then saw its APIC timer run ten times too slow and
 refused it (`APIC timer disabled due to verification failure`, `jiffies
-delta = 1001`). So PAUSE exits now -- every one under VT-x (PAUSE exiting),
-under AMD-V every 128th where the CPU has a pause filter and every one where
-it has not -- and each exit goes round the loop that hands a tick over as it
-falls due. Measured on the AX41, the guest finds a bus of 999 MHz and keeps
+delta = 1001`). So PAUSE exits now -- under VT-x at a loop of them in the
+guest's kernel that has spun 65536 TSC ticks (pause-loop exiting, 26 us at
+the EX44's 2.5 GHz, each PAUSE within 1024 ticks of the last), and at every
+one where the CPU has no pause-loop exiting, as a nested KVM may not pass it
+on; under AMD-V every 128th where the CPU has a pause filter and every one
+where it has not -- and each exit goes round the loop that hands a tick over
+as it falls due. An exit at every PAUSE cost a spinning CPU an exit's 1.8
+us for each PAUSE of tens of cycles. The gap is wider than KVM's 128 ticks:
+a loop's turn on Skylake and later, whose PAUSE alone is some 140 cycles of
+a core that may run below its TSC's clock, is longer than that, and a gap
+too short finds no loop at all. Measured on the AX41, the guest finds a bus of 999 MHz and keeps
 its timer (`jiffies delta = 100`, `jiffies result ok`), as it does on an
 Intel host (an i5-13500, nested under KVM). A CPU spinning on a lock
 another of the guest's CPUs holds comes out the same way, and is handed its
@@ -3398,17 +3429,25 @@ someone else's; then speed.
 
 #### The CPU a guest is shown
 
-1. **SSE4.2, and nothing after it.** Leaf 7 and the XSAVE leaf are blank,
-   and leaf 1 keeps no PCID, XSAVE or AVX (`policy.rs`). So there is no AVX
-   -- a distribution built for x86-64-v3 (RHEL 10 and its rebuilds) does not
-   start -- no SMEP, SMAP or UMIP for the guest's kernel, no FSGSBASE, ERMS
-   or BMI; and on Intel no ARCH_CAPABILITIES, so Linux takes the CPU for one
-   with Meltdown and isolates its page tables -- without PCID, a whole TLB
-   flush at every system call. (The hypervisor bit, clear until the policy
-   became an allow-list -- the guest believing it was on bare metal -- is
-   set now: [above](#before-other-peoples-guests), item 2.) First step:
-   PCID, leaf 7 opened bit by bit in the allow-list, ARCH_CAPABILITIES from
-   the host's; then XSAVE, with XCR0 switched and leaf 0xD made up for it.
+1. **SSE4.2, and nothing after it.** Half done: leaf 7 is open bit by bit
+   -- SMEP, SMAP, UMIP, FSGSBASE, BMI, ADX, ERMS and FSRM, RDSEED, SHA,
+   CLFLUSHOPT and CLWB, SERIALIZE, MD_CLEAR -- PCID is offered, and
+   ARCH_CAPABILITIES reads as the host's but for what is not a fact of the
+   CPU ([A Linux guest](#a-linux-guest)). Alpine's kernel on the EX44 said
+   before "meltdown: Mitigation: PTI" -- its page tables isolated, a whole
+   TLB flush at every system call, no PCID -- MDS and RFDS "Vulnerable: no
+   microcode", L1TF mitigated by PTE inversion, and none of SMEP, SMAP or
+   UMIP in its flags; after, Meltdown, MDS, L1TF and the iTLB multihit "Not
+   affected", RFDS "Mitigation: Clear Register File", and every one of
+   those in its flags. PCID it turns off itself there ("Incomplete global
+   flushes", an Alder Lake and Raptor Lake erratum); on another CPU it is
+   used. Left: XSAVE, with XCR0 switched and leaf 0xD made up for it -- no
+   AVX, so a distribution built for x86-64-v3 (RHEL 10 and its rebuilds)
+   does not start -- and the speculation controls, SPEC_CTRL switched with
+   the guest: Spectre v2 retpolines in the guest, its store bypass open.
+   (The hypervisor bit, clear until the policy became an allow-list -- the
+   guest believing it was on bare metal -- is set now:
+   [above](#before-other-peoples-guests), item 2.)
 2. **MSRs that read 0 and should not.** Intel's MISC_ENABLE without fast
    strings, which Linux answered by turning REP MOVS's fast paths off
    ("Disabled fast string operations"), has them as the host has now.
@@ -3441,15 +3480,24 @@ someone else's; then speed.
 3. **Fewer exits a request.** No EVENT_IDX and no NO_NOTIFY, though both
    work on legacy virtio; and a guest of one CPU has no local APIC, so no
    MSI-X -- six exits an interrupt through the 8259.
-4. **The EX44's E-cores first, with shared cores.** A CPU's number here is
-   its APIC ID, the E-cores' are the highest (48 to 62, [Real
-   hardware](real-hardware.md)), and `hv cores shared` gives a tie to the
-   highest CPU: the first guests and their disks' tasks land on the slow
-   cores. With a guest's cores its own a core of more threads goes first,
-   which there is a P-core, but no rule knows a P-core from an E-core of
-   two threads. Fix: rank by core type (CPUID leaf 0x1A).
-5. **PAUSE.** VT-x exits at every PAUSE, with no pause-loop exiting; AMD-V
-   sets the pause filter's count and leaves its threshold unused.
+4. ~~**The EX44's E-cores first, with shared cores.**~~ Done: `hv::topology`
+   asks each CPU of a hybrid part which kind of core it is (leaf 0x1A), and
+   placement puts a guest's vCPUs on one kind where one has room for them
+   all, the faster first; a tie under `hv cores shared` goes to the faster
+   kind; and a disks' task given a core of its own takes a slow one. The
+   hv fuzzer's `place` target holds it to hybrid hosts made up an input,
+   and three mutants -- no kind kept, the slower first, a disks' task on a
+   fast core -- each failed at its first input. What it was: no rule knew
+   a P-core from an E-core; `hv cores shared` gave a tie to the highest
+   CPU, which on the EX44 is an E-core, and a guest of four CPUs went on
+   one P-core's two threads and two E-cores.
+5. ~~**PAUSE.**~~ Done under VT-x: pause-loop exiting where the CPU has it
+   ([More than one CPU](#more-than-one-cpu)), every PAUSE where it has not.
+   On the EX44 a guest of two CPUs booting for twenty seconds exited 99,297
+   times where it had exited 299,508, its APIC timer calibrated as before
+   (`jiffies result ok`).
+   Left: AMD-V sets the pause filter's count and leaves its threshold
+   unused.
 6. **The larger ones.** APICv and AVIC -- EOIs, the TPR and IPIs without an
    exit; device work off the first CPU's task, with a lock a device and the
    ring pages mapped once rather than at every access; nested leaves of 2
@@ -3457,9 +3505,9 @@ someone else's; then speed.
    preemption timer, a host one-shot and halt polling for the guests'
    timers; virtio-net's checksum and segmentation offloads, which 2.5 Gbit
    on the EX44 needs.
-7. **What has not been measured.** An exit under VT-x on silicon -- every
-   VT-x number here is nested KVM's; the time each kind of exit takes
-   inside `LinuxGuest::run`; fio and iperf in a guest.
+7. **What has not been measured.** The time each kind of exit takes
+   inside `LinuxGuest::run`; fio and iperf in a guest. (An exit under VT-x
+   on silicon is measured now: [What an exit costs](#what-an-exit-costs).)
 
 #### Lifecycle, and stages 4 and 5
 
@@ -3499,5 +3547,8 @@ someone else's; then speed.
 - No gate covers leaks over many starts and stops, a `mem=` past free
   memory, sixteen guests, `rmmod` or `poweroff` with I/O in flight, a port
   or a forward used again, one image given twice, or a run of hours.
-- Hardware: no guest has run under VT-x on silicon, only under nested KVM;
-  the arm64 backend reports and does not enter.
+- Hardware: VT-x has run on the EX44's silicon by hand ([On real
+  hardware](#on-real-hardware)), and its gates run under nested KVM; the
+  Dell's Skylake, whose paths -- legacy IBRS written after every exit, the
+  L1D flush -- no other machine here takes, never; the arm64 backend
+  reports and does not enter.

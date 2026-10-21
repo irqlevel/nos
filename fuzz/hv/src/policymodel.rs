@@ -28,10 +28,11 @@ const EXT_TOP: u32 = 0x8000_0021;
 
 /* Leaf 1 ECX: SSE3, PCLMULQDQ, SSSE3, CMPXCHG16B, SSE4.1, SSE4.2, MOVBE,
  * POPCNT, AES-NI, RDRAND -- instructions that run on the CPU as they are,
- * on registers the FXSAVE area holds. x2APIC for a guest with APICs, and
- * the hypervisor bit, are the policy's own. */
-const LEAF1_ECX: u32 = (1 << 0) | (1 << 1) | (1 << 9) | (1 << 13) | (1 << 19) | (1 << 20) | (1 << 22) | (1 << 23)
-    | (1 << 25) | (1 << 30);
+ * on registers the FXSAVE area holds -- and PCID, tags in the guest's own
+ * TLB entries. x2APIC for a guest with APICs, and the hypervisor bit, are
+ * the policy's own. */
+const LEAF1_ECX: u32 = (1 << 0) | (1 << 1) | (1 << 9) | (1 << 13) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 22)
+    | (1 << 23) | (1 << 25) | (1 << 30);
 const LEAF1_ECX_X2APIC: u32 = 1 << 21;
 const LEAF1_ECX_HYPERVISOR: u32 = 1 << 31;
 /* Leaf 1 EDX: FPU, VME, DE, PSE, TSC, MSR, PAE, MCE, CX8, SEP, MTRR, PGE,
@@ -62,6 +63,24 @@ const EXT8_EBX: u32 = (1 << 0) | (1 << 2) | (1 << 26) | (1 << 29);
  * by TSA-SQ or TSA-L1. */
 const EXT21_EAX: u32 = (1 << 0) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 29) | (1 << 30);
 const EXT21_ECX: u32 = (1 << 1) | (1 << 2);
+
+/* Leaf 7, subleaf 0: FSGSBASE, BMI1, the x87 FDP and CS/DS facts, SMEP,
+ * BMI2, ERMS, RDSEED, ADX, SMAP, CLFLUSHOPT, CLWB and SHA in EBX; UMIP in
+ * ECX; FSRM, MD_CLEAR, SERIALIZE and ARCH_CAPABILITIES in EDX -- what runs
+ * as it is, on no state the host would switch, and facts of the CPU. No
+ * other subleaf. */
+const LEAF7_EBX: u32 = (1 << 0) | (1 << 3) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 13) | (1 << 18)
+    | (1 << 19) | (1 << 20) | (1 << 23) | (1 << 24) | (1 << 29);
+const LEAF7_ECX: u32 = 1 << 2;
+const LEAF7_EDX: u32 = (1 << 4) | (1 << 10) | (1 << 14) | (1 << 29);
+
+/* IA32_ARCH_CAPABILITIES as a guest may read it: of the host's, the bits
+ * that say what the CPU is not open to and what VERW clears -- RDCL_NO,
+ * RSBA, SSB_NO, MDS_NO, PSCHANGE_MC_NO, TAA_NO, the three MMIO stale data
+ * NOs, FB_CLEAR, RRSBA, BHI_NO, PBRSB_NO, GDS_NO, RFDS_NO, RFDS_CLEAR and
+ * ITS_NO -- and none that names an MSR or a control the guest would use. */
+const ARCH_CAP: u64 = (1 << 0) | (1 << 2) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 8) | (1 << 13) | (1 << 14)
+    | (1 << 15) | (1 << 17) | (1 << 19) | (1 << 20) | (1 << 24) | (1 << 26) | (1 << 27) | (1 << 28) | (1 << 62);
 
 /// Leaves a guest is given as the host has them: descriptions of caches,
 /// TLBs, frequencies and the brand -- nothing a guest can turn on.
@@ -128,6 +147,12 @@ fn check_leaf(leaf: u32, sub: u32, apic_id: u32, apic: bool, (basic_top, ext_top
             want(g[1..] == h[1..], "EBX to EDX: the host's");
         }
         6 => want(g == [arat, 0, 0, 0], "ARAT for a guest with APICs, and nothing else"),
+        7 if sub == 0 => {
+            want(g[0] == 0, "EAX: no subleaf past 0");
+            want(leaked(g[1], h[1], LEAF7_EBX, 0) == 0, "EBX within the model's");
+            want(leaked(g[2], h[2], LEAF7_ECX, 0) == 0, "ECX within the model's");
+            want(leaked(g[3], h[3], LEAF7_EDX, 0) == 0, "EDX within the model's");
+        }
         0x15 if apic => want(g == [0; 4] || (g[0] == 1_000_000 && g[1] != 0 && g[2] == 1_000_000_000 && g[3] == 0),
                              "the TSC over the emulated APIC's 1 GHz, or nothing"),
         0x15 => want(g == h, "the host's"),
@@ -275,6 +300,9 @@ enum Kind {
     Fixed(u64),
     /// Intel's MISC_ENABLE: fixed, at what the host's fast strings make it.
     MiscEnable,
+    /// IA32_ARCH_CAPABILITIES: read-only, the host's masked to `ARCH_CAP`,
+    /// where the host has it; a #GP where it has not.
+    ArchCapabilities,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -317,6 +345,7 @@ const MSRS: &[(u32, Of, Kind)] = &[
     (0x8B, Of::Every, Kind::Fixed(0)),                   // the microcode revision: none
     (0x17, Of::Intel, Kind::ReadOnly(0)),                // the platform ID
     (0x1A0, Of::Intel, Kind::MiscEnable),
+    (0x10A, Of::Every, Kind::ArchCapabilities),
     (0xC001_0015, Of::Amd, Kind::Fixed(1 << 24)),        // HWCR: TscFreqSel
     (0xC001_001F, Of::Amd, Kind::Fixed(1 << 46)),        // NB_CFG: CF8's extended configuration
     (0xC001_1029, Of::Amd, Kind::Fixed(1 << 1)),         // DE_CFG: LFENCE serializing
@@ -358,7 +387,7 @@ fn takes(k: Kind, value: u64, save: &Save) -> bool {
         Kind::Own(Takes::Address) => canonical(value),
         Kind::Efer => value & !(EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE) == 0
             && !(save.cr0 & CR0_PG != 0 && (value ^ save.efer) & EFER_LME != 0),
-        Kind::Tsc | Kind::ReadOnly(_) => false,
+        Kind::Tsc | Kind::ReadOnly(_) | Kind::ArchCapabilities => false,
         Kind::Fixed(v) => value == v,
         Kind::MiscEnable => value == misc_enable(),
     }
@@ -378,6 +407,7 @@ fn check_rdmsr(save: &Save, msr: u32) {
         Some(Kind::Own(_)) | Some(Kind::Efer) | Some(Kind::Tsc) => got.is_some(),
         Some(Kind::ReadOnly(v)) | Some(Kind::Fixed(v)) => got == Some(v),
         Some(Kind::MiscEnable) => got == Some(misc_enable()),
+        Some(Kind::ArchCapabilities) => got == cpu::arch_capabilities().map(|v| v & ARCH_CAP),
     };
     invariant!(ok, "rdmsr {:#x} answered {:#x?}, where the model has it {:?} (intel {})", msr, got, kind(msr),
                cpu::host_is_intel());
@@ -414,6 +444,7 @@ fn msr_value(r: &mut Input, k: Option<Kind>) -> u64 {
         0 => match k {
             Some(Kind::ReadOnly(v)) | Some(Kind::Fixed(v)) => v,
             Some(Kind::MiscEnable) => misc_enable(),
+            Some(Kind::ArchCapabilities) => cpu::arch_capabilities().unwrap_or(0),
             Some(Kind::Efer) => r.pick(&[EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE, EFER_LME, EFER_SCE | EFER_NXE]),
             _ => r.value64(),
         },
