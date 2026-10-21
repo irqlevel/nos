@@ -122,6 +122,28 @@ impl Backend {
     pub fn cr8_access(&mut self, write: bool, gpr: u8) {
         match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.cr8_access(write, gpr) }
     }
+    /// Whether the CPU can deliver the guest's interrupts itself -- VT-x's
+    /// virtual-interrupt delivery, over a virtual APIC -- for the run loop
+    /// to hand them to it rather than inject them. AMD-V: no (AVIC is not
+    /// used).
+    pub fn has_vapic(&self) -> bool {
+        match self { Backend::Svm(_) => false, Backend::Vmx(v) => v.has_vapic() }
+    }
+    /// Virtual-interrupt delivery on for the next entry, from `v`
+    /// (`crate::vmx::Vcpu::load_apic`); nothing on AMD-V.
+    pub fn load_apic(&mut self, v: &crate::lapic::Vectors) {
+        match self { Backend::Svm(_) => {}, Backend::Vmx(c) => c.load_apic(v) }
+    }
+    /// Virtual-interrupt delivery off from the next entry.
+    pub fn apicv_off(&mut self) {
+        match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.apicv_off() }
+    }
+    /// What virtual-interrupt delivery left by the exit, taken back for the
+    /// local APIC: the requested and in-service vectors, and the task
+    /// priority.
+    pub fn take_apic(&mut self) -> ([u32; 8], [u32; 8], u8) {
+        match self { Backend::Svm(_) => ([0; 8], [0; 8], 0), Backend::Vmx(v) => v.take_apic() }
+    }
     /// Whether the CPU can be run in real mode -- where a start-up IPI starts
     /// one: AMD-V always, VT-x with unrestricted guest.
     pub fn runs_real_mode(&self) -> bool {
