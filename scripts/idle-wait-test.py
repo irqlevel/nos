@@ -99,7 +99,7 @@ def main():
         return 1
 
     # blkload.ko, not netblk.ko, on the root image
-    nb.module_path = lambda arch: os.path.join(ROOT, "out", "x86_64", "modules", "blkload.ko")
+    nb.module_path = lambda arch: nb.pt.module_path("x86_64", "blkload")
 
     tmp = tempfile.mkdtemp(prefix="idle-wait-")
     try:
