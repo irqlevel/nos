@@ -486,9 +486,9 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     let _ = describe(stop, out);
     let _ = writeln!(out, ", after {} ms", run_ns / NS_PER_MS);
     let _ = writeln!(out,
-        "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} host",
+        "  exits      {} total: {} port in, {} port out, {} cpuid, {} rdmsr, {} wrmsr ({} #GP), {} irq, {} hlt, {} pause, {} host",
         total.exits, total.port_in, total.port_out, total.cpuid,
-        total.msr_read, total.msr_write, total.msr_gp, total.irq + total.apic, total.hlt, total.host);
+        total.msr_read, total.msr_write, total.msr_gp, total.irq + total.apic, total.hlt, total.pause, total.host);
     if total.kicked != 0 {
         let _ = writeln!(out, "  kicked     {} entries turned back for a frame, a disk's answer or an IPI that came on the way in", total.kicked);
     }

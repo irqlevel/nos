@@ -82,6 +82,10 @@ pub const VMENTRY_INTR_INFO: u32 = 0x4016;
 pub const VMENTRY_EXCEPTION_ERRCODE: u32 = 0x4018;
 pub const VMENTRY_INSTRUCTION_LEN: u32 = 0x401A;
 pub const PROC_BASED_CTLS2: u32 = 0x401E;
+/// Pause-loop exiting's two limits, in TSC ticks: the most between two
+/// PAUSEs of one loop, and how long a loop may spin before it exits.
+pub const PLE_GAP: u32 = 0x4020;
+pub const PLE_WINDOW: u32 = 0x4022;
 
 /* 32-bit read-only data. */
 pub const VM_INSTRUCTION_ERROR: u32 = 0x4400;
@@ -218,6 +222,10 @@ pub const PROC2_ENABLE_VPID: u32 = 1 << 5;
 /// stalled for milliseconds, as often as the guest cares to.
 pub const PROC2_WBINVD_EXITING: u32 = 1 << 6;
 pub const PROC2_UNRESTRICTED_GUEST: u32 = 1 << 7;
+/// A VM exit at a loop of PAUSEs at CPL 0 that has spun longer than
+/// `PLE_WINDOW`, each PAUSE within `PLE_GAP` of the last, rather than at
+/// every PAUSE (`PROC_PAUSE_EXITING`, which must then be off).
+pub const PROC2_PAUSE_LOOP_EXITING: u32 = 1 << 10;
 
 /* VM-exit controls. */
 /// DR7 and IA32_DEBUGCTL saved into the VMCS at every exit, the host's DR7

@@ -117,6 +117,16 @@ pub mod x86 {
             host_is_intel() && host() & 2 != 0
         }
 
+        /// The host's IA32_ARCH_CAPABILITIES, where its CPUID offers it (leaf
+        /// 7, EDX bit 29): every bit made up with the rest of the host.
+        pub fn arch_capabilities() -> Option<u64> {
+            const EDX_ARCH_CAPABILITIES: u32 = 1 << 29;
+            if cpuid_count(7, 0)?.edx & EDX_ARCH_CAPABILITIES == 0 {
+                return None;
+            }
+            Some(host().rotate_left(29) ^ 0x5851_F42D_4C95_7F2D)
+        }
+
         /// The host's TSC: a count that goes up with every read.
         pub fn rdtsc() -> u64 {
             static TSC: AtomicU64 = AtomicU64::new(0);
