@@ -186,7 +186,7 @@ GUESTS_VMX = {
 
 
 def module(arch):
-    ko = os.path.join(ROOT, "out", arch, "modules", "hv.ko")
+    ko = pt.module_path(arch, "hv")
     if not os.path.exists(ko):
         sys.exit("no %s -- make modules ARCH=%s first" % (ko, arch))
     return ko

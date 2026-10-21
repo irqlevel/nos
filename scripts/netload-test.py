@@ -298,7 +298,7 @@ def panicked(log):
 
 def x86(args):
     """nos.iso, with everything asked of the module from /etc/rc."""
-    module = os.path.join(ROOT, "out", "x86_64", "modules", "netload.ko")
+    module = pt.module_path("x86_64", "netload")
     if not os.path.exists(module):
         sys.exit("no %s -- make first" % module)
 
@@ -413,7 +413,7 @@ def main():
     if args.arch == "x86_64":
         return x86(args)
 
-    module = os.path.join(ROOT, "out", "aarch64", "modules", "netload.ko")
+    module = pt.module_path("aarch64", "netload")
     if not os.path.exists(module):
         sys.exit("no %s -- make ARCH=aarch64 first" % module)
 
