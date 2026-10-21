@@ -13,6 +13,7 @@
 #include <hal/irqchip.h>
 #include <hal/barrier.h>
 #include <hal/console.h>
+#include <hal/power.h>
 
 
 /* The disk log is Rust (src/rust/block/src/disklog.rs). */
@@ -38,6 +39,32 @@ Panicker::~Panicker()
 bool Panicker::IsActive()
 {
     return (Active.Get() != 0) ? true : false;
+}
+
+/* After the report: on the screen, the serial port and -- flushed by the
+   caller -- the netconsole and the disk log. Timed on the cycle counter,
+   which takes no lock and wants no interrupt; before the counter is
+   calibrated, at once. Only the CPU whose report it is: the others are
+   halted. */
+void Panicker::ResetIfAsked()
+{
+    ulong secs = Parameters::GetInstance().GetPanicResetSecs();
+    if (secs == 0)
+        return;
+
+    char buf[96];
+    Stdlib::SnPrintf(buf, sizeof(buf), "panic: resetting the machine in %lu s (panic=%lu)\n", secs, secs);
+    PrintOutput(buf);
+
+    ulong hz = Hal::CycleCounterHz();
+    if (hz != 0)
+    {
+        u64 start = Hal::ReadCycleCounter();
+        u64 wait = (u64)secs * hz;
+        while (Hal::ReadCycleCounter() - start < wait)
+            Pause();
+    }
+    Hal::ResetNow();
 }
 
 void Panicker::PrintOutput(const char* str)
@@ -256,6 +283,8 @@ void Panicker::DoPanic(const char *fmt, ...)
            wedged costs nothing that was still needed. */
         rust_netconsole_panic_flush();
         rust_disklog_panic_flush();
+
+        ResetIfAsked();
     }
 
     for (;;)
@@ -305,6 +334,8 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
            wedged costs nothing that was still needed. */
         rust_netconsole_panic_flush();
         rust_disklog_panic_flush();
+
+        ResetIfAsked();
     }
 
     for (;;)

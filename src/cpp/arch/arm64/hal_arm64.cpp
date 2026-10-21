@@ -48,6 +48,13 @@ bool SetupSerializingLfence()
     return false;
 }
 
+bool SetupCpuPerformance(CpuPerformance* out)
+{
+    /* The clock is firmware's to set here, through PSCI and SCMI. */
+    *out = CpuPerformance{};
+    return false;
+}
+
 ulong CycleCounterHz()
 {
     /* The generic timer's rate, which firmware sets and nothing changes:
@@ -245,6 +252,11 @@ void PowerOff()
 }
 
 void Reset()
+{
+    ResetNow();
+}
+
+void ResetNow()
 {
     PsciCall(PsciSystemReset);
     for (;;)

@@ -6,7 +6,8 @@ the kernel, every module built with it, the GRUB entries that boot it, a
 default `/etc/rc` and `nos-install`, the script that pours it onto a
 partition. The server keeps its own Linux and its own GRUB; nos gets a
 partition of its own and an entry in that GRUB, and boots **once** when asked,
-so a nos that never comes up is a reset away from the server's own system.
+so a nos that never comes up is a reset away from the server's own system --
+and one that panics resets itself, ten seconds after its report (`panic=10`).
 
 That is how the Hetzner boxes in [Real hardware](real-hardware.md) run nos.
 They were set up by hand, before this existed; a new machine is set up as
@@ -140,9 +141,10 @@ entry stays the fallback. So:
   -- is followed by the server's own system after a reset (Hetzner's robot
   can do one), with nothing left to undo.
 
-The kernel's command line is `root=UUID=<the partition> dhcp=auto dns=on`
-and whatever this machine was given (`--udpshell`, `--netconsole`,
-`--cmdline`). nos mounts the partition read-write as its root, takes an
+The kernel's command line is `root=UUID=<the partition> dhcp=auto dns=on
+panic=10` and whatever this machine was given (`--udpshell`, `--netconsole`,
+`--cmdline`) -- `panic=10` resets a nos that panics ten seconds after its
+report, to the server's own system after a one-shot boot. nos mounts the partition read-write as its root, takes an
 address by DHCP and runs `/etc/rc`, whose `sshd start` makes the host key the
 first time -- from the kernel's entropy pool, into
 `/etc/ssh/ssh_host_ed25519_key`, kept there for every boot after -- and lets
