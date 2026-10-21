@@ -33,6 +33,10 @@ pub const GUEST_FS_SEL: u32 = 0x0808;
 pub const GUEST_GS_SEL: u32 = 0x080A;
 pub const GUEST_LDTR_SEL: u32 = 0x080C;
 pub const GUEST_TR_SEL: u32 = 0x080E;
+/// RVI, bits 7:0 -- the highest vector requested in the virtual-APIC page --
+/// and SVI, bits 15:8 -- the highest in service: what virtual-interrupt
+/// delivery starts from at an entry and keeps up as the guest runs.
+pub const GUEST_INTR_STATUS: u32 = 0x0810;
 
 /* 16-bit host state. */
 pub const HOST_ES_SEL: u32 = 0x0C00;
@@ -51,7 +55,16 @@ pub const VMEXIT_MSR_STORE_ADDR: u32 = 0x2006;
 pub const VMEXIT_MSR_LOAD_ADDR: u32 = 0x2008;
 pub const VMENTRY_MSR_LOAD_ADDR: u32 = 0x200A;
 pub const TSC_OFFSET: u32 = 0x2010;
+/// The page that holds the guest's virtual APIC under the TPR shadow:
+/// VTPR, and with virtual-interrupt delivery its VIRR and VISR too.
+pub const VIRTUAL_APIC_PAGE_ADDR: u32 = 0x2012;
 pub const EPT_POINTER: u32 = 0x201A;
+/// Four 64-bit words, a bit a vector: an EOI the CPU virtualizes of a vector
+/// set here exits after it (`reason::EOI_INDUCED`).
+pub const EOI_EXIT_BITMAP0: u32 = 0x201C;
+pub const EOI_EXIT_BITMAP1: u32 = 0x201E;
+pub const EOI_EXIT_BITMAP2: u32 = 0x2020;
+pub const EOI_EXIT_BITMAP3: u32 = 0x2022;
 
 /* 64-bit read-only data. */
 pub const GUEST_PHYSICAL_ADDRESS: u32 = 0x2400;
@@ -81,6 +94,9 @@ pub const VMENTRY_MSR_LOAD_COUNT: u32 = 0x4014;
 pub const VMENTRY_INTR_INFO: u32 = 0x4016;
 pub const VMENTRY_EXCEPTION_ERRCODE: u32 = 0x4018;
 pub const VMENTRY_INSTRUCTION_LEN: u32 = 0x401A;
+/// Under the TPR shadow without virtual-interrupt delivery, a `mov` to CR8
+/// below this (bits 3:0) exits; 0 for never.
+pub const TPR_THRESHOLD: u32 = 0x401C;
 pub const PROC_BASED_CTLS2: u32 = 0x401E;
 /// Pause-loop exiting's two limits, in TSC ticks: the most between two
 /// PAUSEs of one loop, and how long a loop may spin before it exits.
@@ -203,6 +219,10 @@ pub const PROC_RDPMC_EXITING: u32 = 1 << 11;
 /// them, for as long as the guest likes and after it has gone.
 pub const PROC_CR8_LOAD_EXITING: u32 = 1 << 19;
 pub const PROC_CR8_STORE_EXITING: u32 = 1 << 20;
+/// The other way to keep CR8 the guest's: its `mov`s of CR8 read and write
+/// VTPR, in the virtual-APIC page, and the APIC's task priority is never
+/// touched -- what the controls below are built on.
+pub const PROC_USE_TPR_SHADOW: u32 = 1 << 21;
 /// Every `mov` to or from a debug register exits: the four breakpoint
 /// addresses are the CPU's, not the VMCS's, and DR6 is no field either.
 pub const PROC_MOV_DR_EXITING: u32 = 1 << 23;
@@ -216,6 +236,11 @@ pub const PROC_SECONDARY_CTLS: u32 = 1 << 31;
 
 /* Secondary processor-based controls. */
 pub const PROC2_ENABLE_EPT: u32 = 1 << 1;
+/// RDMSR and WRMSR of 800H-8FFH that the MSR bitmap lets through are of the
+/// virtual APIC, not the CPU's -- a read of anything but TPR, without
+/// APIC-register virtualization, being of the CPU's: which is why the bitmap
+/// lets through only the three writes virtual-interrupt delivery takes.
+pub const PROC2_VIRTUALIZE_X2APIC: u32 = 1 << 4;
 pub const PROC2_ENABLE_VPID: u32 = 1 << 5;
 /// Without it WBINVD runs in the guest as it would on the host: the whole
 /// of the package's shared cache written back and dropped, every core
@@ -226,6 +251,10 @@ pub const PROC2_UNRESTRICTED_GUEST: u32 = 1 << 7;
 /// `PLE_WINDOW`, each PAUSE within `PLE_GAP` of the last, rather than at
 /// every PAUSE (`PROC_PAUSE_EXITING`, which must then be off).
 pub const PROC2_PAUSE_LOOP_EXITING: u32 = 1 << 10;
+/// The CPU delivers the virtual APIC's interrupts itself -- the highest in
+/// VIRR, when the guest can take it and it is above VPPR -- and performs its
+/// EOIs, writes of its task priority and its self-IPIs, all without an exit.
+pub const PROC2_VIRTUAL_INTR_DELIVERY: u32 = 1 << 9;
 
 /* VM-exit controls. */
 /// DR7 and IA32_DEBUGCTL saved into the VMCS at every exit, the host's DR7
@@ -353,6 +382,10 @@ pub mod reason {
     pub const MONITOR: u32 = 39;
     pub const PAUSE: u32 = 40;
     pub const ENTRY_FAIL_MACHINE_CHECK: u32 = 41;
+    /// An EOI virtualized of a vector the EOI-exit bitmap names, after the
+    /// CPU has taken it out of VISR: trap-like, its vector in the
+    /// qualification's bits 7:0.
+    pub const EOI_INDUCED: u32 = 45;
     pub const EPT_VIOLATION: u32 = 48;
     pub const EPT_MISCONFIG: u32 = 49;
     pub const RDTSCP: u32 = 51;

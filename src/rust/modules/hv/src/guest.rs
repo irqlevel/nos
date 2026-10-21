@@ -72,6 +72,10 @@ pub struct Spec {
     /// devices' interrupts through in place of the 8259 -- its local APICs
     /// out of reset in xAPIC mode with it, as `xapic` has them.
     pub ioapic: bool,
+    /// `apicv`: its local APICs' interrupts delivered, and their EOIs taken,
+    /// by the CPU where it can (VT-x's virtual-interrupt delivery, for an
+    /// x2APIC guest) rather than injected by the run loop.
+    pub apicv: bool,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
@@ -121,6 +125,7 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         cpus: 1,
         xapic: false,
         ioapic: false,
+        apicv: false,
         log: false,
         restart: false,
         net: false,
@@ -167,6 +172,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.xapic = true;
         } else if word == "ioapic" {
             spec.ioapic = true;
+        } else if word == "apicv" {
+            spec.apicv = true;
         } else if word == "restart" {
             spec.restart = true;
         } else if word == "net" {
@@ -289,6 +296,7 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
 
     let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
         .map_err(|e| alloc::format!("no guest: {}", e))?;
+    guest.set_apicv(spec.apicv);
 
     /* The 64-bit kernel at its load address, then the initrd high. */
     stream(&guest, &spec.kernel, pm_offset, layout.kernel_addr, kernel_len)?;
@@ -531,6 +539,10 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
     if total.apic != 0 || counts.len() > 1 {
         let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers; {} IPIs sent, {} taken; {} MSIs",
             total.apic, total.timer, total.ipi_sent, total.ipi_taken, total.msi);
+    }
+    if total.vid != 0 {
+        let _ = writeln!(out, "  apicv      {} entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); {} EOIs it stopped the guest after, of level-triggered vectors",
+            total.vid, total.eoi_exits);
     }
     if total.mmio_done != 0 {
         let _ = writeln!(out, "  mmio       {} accesses performed for the guest, its instructions decoded: the xAPIC page's and the IO-APIC's",

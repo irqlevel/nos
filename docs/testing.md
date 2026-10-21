@@ -1244,7 +1244,19 @@ depend on; and for `ioapic` that the IO-APIC sent five interrupts, three
 of them levels each ended by EOI -- its serial port's pin taking two edges
 and none while masked, then a level sent again at each EOI while the line
 stayed up, its remote IRR set in service and clear after ([The
-IO-APIC](hypervisor.md#the-io-apic)); and for `debug`, through the run loop
+IO-APIC](hypervisor.md#the-io-apic)); for `apicv`, on the same machine in
+x2APIC mode, that self-IPIs at and below CR8's class were held -- none
+taken, both read in IRR -- and with CR8 0 taken by priority, 0x50 and then
+0x30, with 0x70 nested in 0x30's handler, ISR read showing each in service;
+that three levels from the IO-APIC were each ended by the x2APIC's EOI and
+sent again while the line stayed up; that nothing was left in service; and
+who did it: the host, injecting all six, under AMD-V or where the CPU has no
+APIC virtualization, and the CPU -- `hv info`'s *APIC virtualization* --
+delivering all six and taking their EOIs under VT-x, the guest stopped after
+the three level-triggered ones alone ([Interrupts the CPU delivers
+itself](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
+there `tpr`'s CR8 is the virtual APIC's VTPR and no `mov` of it exits; and
+for `debug`, through the run loop
 a Linux guest's CPUs go through, that a single step and an `int1` -- each a
 #DB the host intercepts -- reached the guest's own handler, the first with
 DR6.BS and after the stepped instruction, the second after the ICEBP: a

@@ -141,6 +141,11 @@ pub enum Exit {
     /// DR7, which it does but would not otherwise see written. `gpr` as for
     /// [`Exit::Cr4`].
     Dr { write: bool, dr: u8, gpr: Option<u8> },
+    /// The guest ended an interrupt in service by its x2APIC's EOI, which
+    /// the CPU performed -- VT-x's virtual-interrupt delivery -- and stopped
+    /// it after, `vector` being one whose end the host must hear of: a
+    /// level-triggered one, for the IO-APIC.
+    Eoi { vector: u8 },
     /// PAUSE -- the guest spin-waiting: stopped so that whatever it waits
     /// for that the host hands over, a timer's tick above all, is handed
     /// over now rather than at the host's next interrupt.
