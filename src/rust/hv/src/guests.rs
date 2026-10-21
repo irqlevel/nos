@@ -756,7 +756,7 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, IOAPIC_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME].into_iter())
+        .chain([SMP_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME].into_iter())
 }
 
 /// Run the built-in guest `name` on the CPU this is called on -- and, for a
@@ -768,7 +768,10 @@ pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Optio
         return Some(run_smp(machine, out));
     }
     if name == IOAPIC_NAME {
-        return Some(run_ioapic(machine, out));
+        return Some(run_ioapic(machine, &IOAPIC_GUEST, out));
+    }
+    if name == APICV_NAME {
+        return Some(run_ioapic(machine, &APICV_GUEST, out));
     }
     if name == DEBUG_NAME {
         return Some(run_debug(machine, out));
@@ -1342,10 +1345,10 @@ const IOAPIC_REMOTE_IRR: u32 = 1 << 14;
 const IOAPIC_EDGES_WANTED: u32 = 2;
 const IOAPIC_LEVELS_WANTED: u32 = 3;
 
-/// The guests' machine for the ioapic guest: `smp_board`'s, but the GDT
-/// without the 32-bit segment, its code, and the IO-APIC's and the local
-/// APIC's pages mapped for it.
-fn ioapic_board(m: &GuestMemory, bsp: &mut GuestCpu) -> Result<()> {
+/// The guests' machine for a guest with an IO-APIC: `smp_board`'s, but the
+/// GDT without the 32-bit segment, its `code`, and the IO-APIC's and the
+/// local APIC's pages mapped for it.
+fn ioapic_board(m: &GuestMemory, bsp: &mut GuestCpu, code: &[u8]) -> Result<()> {
     let tss_low = TSS_LIMIT | (TSS & 0xFF_FFFF) << 16 | TSS_BUSY_PRESENT << 40 | (TSS >> 24 & 0xFF) << 56;
     let tss_high = TSS >> 32;
     for (i, entry) in [0, GDT_CODE64, GDT_DATA, tss_low, tss_high].iter().enumerate() {
@@ -1359,7 +1362,7 @@ fn ioapic_board(m: &GuestMemory, bsp: &mut GuestCpu) -> Result<()> {
         let index = (page - MMIO_GIB * GIB) >> 21;
         m.write_obj(PD_MMIO + index * 8, &((page & !0x1F_FFFF) | PTE_P_W | PTE_LARGE))?;
     }
-    m.write(ENTRY, IOAPIC_CODE)?;
+    m.write(ENTRY, code)?;
     bsp.backend_mut().long_mode(&LongMode {
         entry: ENTRY,
         stack: STACK,
@@ -1375,25 +1378,44 @@ fn ioapic_board(m: &GuestMemory, bsp: &mut GuestCpu) -> Result<()> {
     Ok(())
 }
 
-/// Run the ioapic guest: its first CPU on this task, its second -- which
-/// only waits -- on a task of its own, so that it is found asleep when the
-/// first stops.
-fn run_ioapic(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
-    let _ = writeln!(out, "hv: guest {} -- {}", IOAPIC_NAME, IOAPIC_ABOUT);
+/// A guest of the IO-APIC's machine (`ioapic_board`): its name, what it
+/// does, its code, whether its interrupts are the CPU's to deliver where it
+/// can (`LinuxGuest::set_apicv`), and what it has to have done -- by its
+/// memory, how it stopped, what the IO-APIC did, what its first CPU
+/// counted, and whether that CPU had a virtual APIC.
+struct IoGuest {
+    name: &'static str,
+    about: &'static str,
+    code: &'static [u8],
+    apicv: bool,
+    check: fn(&GuestMemory, &Stopped, &crate::devices::ioapic::Stats, &Counts, bool)
+        -> core::result::Result<String, String>,
+}
+
+const IOAPIC_GUEST: IoGuest =
+    IoGuest { name: IOAPIC_NAME, about: IOAPIC_ABOUT, code: IOAPIC_CODE, apicv: false, check: check_ioapic };
+
+/// Run a guest of the IO-APIC's machine: its first CPU on this task, its
+/// second -- which only waits -- on a task of its own, so that it is found
+/// asleep when the first stops.
+fn run_ioapic(machine: &Arc<Machine>, spec: &IoGuest, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let fail = |out: &mut dyn Write, why: &str| {
-        let _ = writeln!(out, "hv: guest {} FAILED -- {}", IOAPIC_NAME, why);
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
         false
     };
     let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
-    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true, true) {
+    let (mut guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true, true) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
     let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
     let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
-    if let Err(e) = ioapic_board(guest.memory(), &mut bsp) {
+    if let Err(e) = ioapic_board(guest.memory(), &mut bsp, spec.code) {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
+    guest.set_apicv(spec.apicv);
+    let vapic = spec.apicv && bsp.backend_mut().has_vapic();
     let guest = Arc::new(guest);
     let Some(ap_counts) = kcore::sync::Mutex::new(Counts::default()) else { return fail(out, "out of memory") };
     let ap_counts = Arc::new(ap_counts);
@@ -1404,7 +1426,7 @@ fn run_ioapic(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(SMP_BUDGET_MS * kcore::consts::NS_PER_MS);
     let run = SmpAp { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, counts: ap_counts.clone() };
-    let Some(task) = kcore::task::spawn_on_with("hv/ioapic/cpu1", 1u64 << ap_cpu, run, smp_ap) else {
+    let Some(task) = kcore::task::spawn_on_with("hv/io/cpu1", 1u64 << ap_cpu, run, smp_ap) else {
         return fail(out, "no task for its second CPU");
     };
     let counts = guest.run(&mut bsp, machine, deadline, &Quiet);
@@ -1414,7 +1436,7 @@ fn run_ioapic(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let stopped = guest.take_stopped()
         .unwrap_or(Stopped { stop: GuestStop::Requested, cpu: 0, dump: String::new() });
     if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
-        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", IOAPIC_NAME, cpu);
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", spec.name, cpu);
         return false;
     }
     let host = guest.cpu_states().first().and_then(|&(_, h)| h);
@@ -1433,14 +1455,14 @@ fn run_ioapic(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     };
     let _ = writeln!(out, "  stopped    {}", says);
 
-    match check_ioapic(guest.memory(), &stopped, &stats) {
+    match (spec.check)(guest.memory(), &stopped, &stats, &counts, vapic) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
-            let _ = writeln!(out, "hv: guest {} ok", IOAPIC_NAME);
+            let _ = writeln!(out, "hv: guest {} ok", spec.name);
             true
         }
         Err(why) => {
-            let _ = writeln!(out, "hv: guest {} FAILED -- {}", IOAPIC_NAME, why);
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
             let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
             let _ = out.write_str(&stopped.dump);
             false
@@ -1448,8 +1470,8 @@ fn run_ioapic(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     }
 }
 
-fn check_ioapic(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioapic::Stats)
-    -> core::result::Result<String, String>
+fn check_ioapic(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioapic::Stats, _counts: &Counts,
+                _vapic: bool) -> core::result::Result<String, String>
 {
     if !matches!(stopped.stop, GuestStop::Halted { .. }) {
         return Err(String::from("it did not run to its halt"));
@@ -1480,6 +1502,298 @@ fn check_ioapic(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioap
     }
     Ok(String::from("version 0x20's 24 pins; two edges taken, none while masked; three levels, each sent again \
                      at its EOI while the line stayed up, its remote IRR set in service and clear after"))
+}
+
+/* ---- apicv: a local APIC's interrupts, the CPU's to deliver and end ---- */
+
+/* The apicv guest: the ioapic guest's machine, its first CPU's local APIC
+ * taken to x2APIC mode -- by the base MSR, from the xAPIC mode a machine
+ * with an IO-APIC leaves it in -- where under VT-x the CPU delivers its
+ * interrupts itself and performs its EOIs, task-priority writes and
+ * self-IPIs (virtual-interrupt delivery, `crate::vmx::Vcpu::load_apic`),
+ * and elsewhere the run loop injects them: what the guest sees has to be the
+ * same. With CR8 at 5 it sends itself 0x50 and 0x30, neither above the
+ * class, takes neither -- at instruction boundaries with interrupts on, and
+ * over an exit -- and reads both in IRR. CR8 0: 0x50 comes first, its
+ * handler reading it in ISR; then 0x30, whose handler sends itself 0x70 and
+ * takes it nested, ISR read with both in service, before its own EOI. Then
+ * the serial port's pin through the IO-APIC as a level, three times, each
+ * ended by the x2APIC's EOI -- which under virtual-interrupt delivery the CPU
+ * performs, and stops the guest after, the vector being level-triggered:
+ * for the IO-APIC to hear of it and send again while the line stays up. Last,
+ * ISR read whole: nothing left in service. The output of `nasm -f bin`,
+ * `bits 64` and `org 0x8000`, its source's comments and labels. */
+const APICV_NAME: &str = "apicv";
+const APICV_ABOUT: &str = "an x2APIC's interrupts -- self-IPIs held by CR8 and taken by priority, one nested, and a \
+                           level from the IO-APIC ended by EOI -- the CPU's to deliver and end under VT-x";
+
+const APICV_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0x9E, 0x01, 0x00, 0x00,               // start: lea rax, [rel h30] ; gate 0x30: a self-IPI below the task priority
+    0xBF, 0x00, 0xA3, 0x00, 0x00,                           // mov edi, 0xA300
+    0xE8, 0x23, 0x01, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0xEA, 0x01, 0x00, 0x00,               // lea rax, [rel h41] ; gate 0x41: the serial port's pin, level-triggered
+    0xBF, 0x10, 0xA4, 0x00, 0x00,                           // mov edi, 0xA410
+    0xE8, 0x12, 0x01, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0x5A, 0x01, 0x00, 0x00,               // lea rax, [rel h50] ; gate 0x50: a self-IPI at the task priority's class
+    0xBF, 0x00, 0xA5, 0x00, 0x00,                           // mov edi, 0xA500
+    0xE8, 0x01, 0x01, 0x00, 0x00,                           // call gate
+    0x48, 0x8D, 0x05, 0x98, 0x01, 0x00, 0x00,               // lea rax, [rel h70] ; gate 0x70: a self-IPI over one in service
+    0xBF, 0x00, 0xA7, 0x00, 0x00,                           // mov edi, 0xA700
+    0xE8, 0xF0, 0x00, 0x00, 0x00,                           // call gate
+    0x0F, 0x01, 0x1D, 0xED, 0x01, 0x00, 0x00,               // lidt [rel idtr]
+    0xB9, 0x1B, 0x00, 0x00, 0x00,                           // mov ecx, 0x1B ; IA32_APIC_BASE: firmware left xAPIC mode, the machine having an IO-APIC
+    0x0F, 0x32,                                             // rdmsr
+    0x0D, 0x00, 0x04, 0x00, 0x00,                           // or eax, 0x400 ; EXTD: x2APIC mode, its registers MSRs from here
+    0x0F, 0x30,                                             // wrmsr
+    0xB9, 0x0F, 0x08, 0x00, 0x00,                           // mov ecx, 0x80F ; SVR: on
+    0x31, 0xD2,                                             // xor edx, edx
+    0xB8, 0xFF, 0x01, 0x00, 0x00,                           // mov eax, 0x1FF
+    0x0F, 0x30,                                             // wrmsr
+    0xB8, 0x05, 0x00, 0x00, 0x00,                           // mov eax, 5 ; CR8 5: the task priority's class
+    0x44, 0x0F, 0x22, 0xC0,                                 // mov cr8, rax
+    0xB9, 0x3F, 0x08, 0x00, 0x00,                           // mov ecx, 0x83F ; SELF_IPI: 0x50 and 0x30, neither above class 5 -- held
+    0xB8, 0x50, 0x00, 0x00, 0x00,                           // mov eax, 0x50
+    0x0F, 0x30,                                             // wrmsr
+    0xB8, 0x30, 0x00, 0x00, 0x00,                           // mov eax, 0x30
+    0x0F, 0x30,                                             // wrmsr
+    0xFB,                                                   // sti
+    0x90,                                                   // nop ; boundaries with interrupts on, and an exit: none may come
+    0xE6, 0x80,                                             // out 0x80, al
+    0x90,                                                   // nop
+    0xFA,                                                   // cli
+    0x8B, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,               // mov eax, dword [0x7008]
+    0x89, 0x04, 0x25, 0x20, 0x70, 0x00, 0x00,               // mov dword [0x7020], eax ; what came while held: none
+    0xB9, 0x21, 0x08, 0x00, 0x00,                           // mov ecx, 0x821 ; IRR, vectors 0x20-0x3F: 0x30 requested
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x0C, 0x70, 0x00, 0x00,               // mov dword [0x700C], eax
+    0xB9, 0x22, 0x08, 0x00, 0x00,                           // mov ecx, 0x822 ; IRR, vectors 0x40-0x5F: 0x50 requested
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // mov dword [0x7010], eax
+    0x31, 0xC0,                                             // xor eax, eax ; CR8 0: 0x50 first, then 0x30 -- inside whose handler 0x70
+    0x44, 0x0F, 0x22, 0xC0,                                 // mov cr8, rax
+    0xFB,                                                   // .w1: sti
+    0xF4,                                                   // hlt
+    0xFA,                                                   // cli
+    0x83, 0x3C, 0x25, 0x08, 0x70, 0x00, 0x00, 0x04,         // cmp dword [0x7008], 4
+    0x72, 0xF3,                                             // jb .w1
+    0xBE, 0x00, 0x00, 0xC0, 0xFE,                           // mov esi, 0xFEC00000 ; the IO-APIC: pin 4 to APIC ID 0, vector 0x41, level-triggered
+    0xC7, 0x06, 0x19, 0x00, 0x00, 0x00,                     // mov dword [rsi], 0x19
+    0xC7, 0x46, 0x10, 0x00, 0x00, 0x00, 0x00,               // mov dword [rsi + 0x10], 0
+    0xC7, 0x06, 0x18, 0x00, 0x00, 0x00,                     // mov dword [rsi], 0x18
+    0xC7, 0x46, 0x10, 0x41, 0x80, 0x00, 0x00,               // mov dword [rsi + 0x10], 0x8041
+    0x66, 0xBA, 0xF9, 0x03,                                 // mov dx, 0x3F9 ; IER: THR empty -- the line up, sent, and again at each EOI while it stays up
+    0xB0, 0x02,                                             // mov al, 2
+    0xEE,                                                   // out dx, al
+    0xFB,                                                   // .w2: sti
+    0xF4,                                                   // hlt
+    0xFA,                                                   // cli
+    0x83, 0x3C, 0x25, 0x24, 0x70, 0x00, 0x00, 0x03,         // cmp dword [0x7024], 3
+    0x72, 0xF3,                                             // jb .w2
+    0xC7, 0x06, 0x18, 0x00, 0x00, 0x00,                     // mov dword [rsi], 0x18
+    0x8B, 0x46, 0x10,                                       // mov eax, dword [rsi + 0x10] ; pin 4's entry after: remote IRR clear
+    0x89, 0x04, 0x25, 0x2C, 0x70, 0x00, 0x00,               // mov dword [0x702C], eax
+    0x31, 0xDB,                                             // xor ebx, ebx ; ISR, all eight words: nothing left in service
+    0xB9, 0x10, 0x08, 0x00, 0x00,                           // mov ecx, 0x810
+    0x0F, 0x32,                                             // .isr: rdmsr
+    0x09, 0xC3,                                             // or ebx, eax
+    0xFF, 0xC1,                                             // inc ecx
+    0x81, 0xF9, 0x18, 0x08, 0x00, 0x00,                     // cmp ecx, 0x818
+    0x72, 0xF2,                                             // jb .isr
+    0x89, 0x1C, 0x25, 0x30, 0x70, 0x00, 0x00,               // mov dword [0x7030], ebx
+    0xC7, 0x04, 0x25, 0x34, 0x70, 0x00, 0x00, 0x41, 0x50, 0x49, 0x43, // mov dword [0x7034], 0x43495041 ; 'APIC'
+    0xFA,                                                   // .dead: cli
+    0xF4,                                                   // hlt
+    0xEB, 0xFC,                                             // jmp .dead
+    0x66, 0x89, 0x07,                                       // gate: mov word [rdi], ax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x89, 0x47, 0x08,                                       // mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // mov dword [rdi + 12], 0
+    0xC3,                                                   // ret
+    0x53,                                                   // record: push rbx
+    0x8B, 0x1C, 0x25, 0x08, 0x70, 0x00, 0x00,               // mov ebx, dword [0x7008]
+    0x88, 0x83, 0x00, 0x70, 0x00, 0x00,                     // mov byte [0x7000 + rbx], al
+    0xFF, 0x04, 0x25, 0x08, 0x70, 0x00, 0x00,               // inc dword [0x7008]
+    0x5B,                                                   // pop rbx
+    0xC3,                                                   // ret
+    0x50,                                                   // eoi: push rax
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB9, 0x0B, 0x08, 0x00, 0x00,                           // mov ecx, 0x80B
+    0x31, 0xC0,                                             // xor eax, eax
+    0x31, 0xD2,                                             // xor edx, edx
+    0x0F, 0x30,                                             // wrmsr
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0xC3,                                                   // ret
+    0x50,                                                   // h50: push rax
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB0, 0x50,                                             // mov al, 0x50
+    0xE8, 0xCD, 0xFF, 0xFF, 0xFF,                           // call record
+    0xB9, 0x12, 0x08, 0x00, 0x00,                           // mov ecx, 0x812 ; ISR, vectors 0x40-0x5F: 0x50 in service
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x14, 0x70, 0x00, 0x00,               // mov dword [0x7014], eax
+    0xE8, 0xD1, 0xFF, 0xFF, 0xFF,                           // call eoi
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x50,                                                   // h30: push rax
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB0, 0x30,                                             // mov al, 0x30
+    0xE8, 0xAB, 0xFF, 0xFF, 0xFF,                           // call record
+    0xB9, 0x3F, 0x08, 0x00, 0x00,                           // mov ecx, 0x83F ; SELF_IPI 0x70: class 7 over the class 3 in service
+    0x31, 0xD2,                                             // xor edx, edx
+    0xB8, 0x70, 0x00, 0x00, 0x00,                           // mov eax, 0x70
+    0x0F, 0x30,                                             // wrmsr
+    0xFB,                                                   // sti ; taken here, the handler nested
+    0x90,                                                   // nop
+    0x90,                                                   // nop
+    0xFA,                                                   // cli
+    0xB0, 0x31,                                             // mov al, 0x31 ; back in 0x30's handler after 0x70's
+    0xE8, 0x92, 0xFF, 0xFF, 0xFF,                           // call record
+    0xE8, 0xA4, 0xFF, 0xFF, 0xFF,                           // call eoi
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x50,                                                   // h70: push rax
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB0, 0x70,                                             // mov al, 0x70
+    0xE8, 0x7E, 0xFF, 0xFF, 0xFF,                           // call record
+    0xB9, 0x11, 0x08, 0x00, 0x00,                           // mov ecx, 0x811 ; ISR, vectors 0x20-0x3F: 0x30 in service beneath
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x18, 0x70, 0x00, 0x00,               // mov dword [0x7018], eax
+    0xB9, 0x13, 0x08, 0x00, 0x00,                           // mov ecx, 0x813 ; ISR, vectors 0x60-0x7F: 0x70 itself
+    0x0F, 0x32,                                             // rdmsr
+    0x89, 0x04, 0x25, 0x1C, 0x70, 0x00, 0x00,               // mov dword [0x701C], eax
+    0xE8, 0x74, 0xFF, 0xFF, 0xFF,                           // call eoi ; ends 0x70, the highest; 0x30 stays in service
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x50,                                                   // h41: push rax
+    0x52,                                                   // push rdx
+    0xFF, 0x04, 0x25, 0x24, 0x70, 0x00, 0x00,               // inc dword [0x7024]
+    0xB8, 0x00, 0x00, 0xC0, 0xFE,                           // mov eax, 0xFEC00000
+    0xC7, 0x00, 0x18, 0x00, 0x00, 0x00,                     // mov dword [rax], 0x18
+    0x8B, 0x50, 0x10,                                       // mov edx, dword [rax + 0x10] ; the entry in service: remote IRR set
+    0x89, 0x14, 0x25, 0x28, 0x70, 0x00, 0x00,               // mov dword [0x7028], edx
+    0x83, 0x3C, 0x25, 0x24, 0x70, 0x00, 0x00, 0x03,         // cmp dword [0x7024], 3
+    0x72, 0x05,                                             // jb .eoi
+    0x66, 0xBA, 0xFA, 0x03,                                 // mov dx, 0x3FA ; the third: IIR read, the THR-empty interrupt taken back, the line down
+    0xEC,                                                   // in al, dx
+    0xE8, 0x3D, 0xFF, 0xFF, 0xFF,                           // .eoi: call eoi ; level-triggered: the IO-APIC hears of it, and sends again while the line is up
+    0x5A,                                                   // pop rdx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x0F, 0x07,                                             // idtr: dw 0x70F ; 0x71 gates
+    0x00, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0xA000
+];
+
+/* What the guest leaves at `RESULTS`: its handlers' vectors as they ran, a
+ * byte each from +0 (0x31 for 0x30's after 0x70's), and how many at +8; IRR
+ * for vectors 0x20-0x3F and 0x40-0x5F while CR8 held them at +0xC and +0x10;
+ * ISR for 0x40-0x5F in 0x50's handler at +0x14, for 0x20-0x3F and 0x60-0x7F
+ * in 0x70's at +0x18 and +0x1C; the handlers run while CR8 held them at
+ * +0x20; the level interrupts taken at +0x24, pin 4's entry as the last
+ * handler read it at +0x28 and after at +0x2C; ISR's words or'ed together at
+ * the end at +0x30; and 'APIC' at +0x34 once done. */
+const APICV_ORDER: u64 = RESULTS;
+const APICV_TAKEN: u64 = RESULTS + 0x8;
+const APICV_IRR_HELD: [u64; 2] = [RESULTS + 0xC, RESULTS + 0x10];
+const APICV_ISR_50: u64 = RESULTS + 0x14;
+const APICV_ISR_70: [u64; 2] = [RESULTS + 0x18, RESULTS + 0x1C];
+const APICV_WHILE_HELD: u64 = RESULTS + 0x20;
+const APICV_LEVELS: u64 = RESULTS + 0x24;
+const APICV_IN_SERVICE: u64 = RESULTS + 0x28;
+const APICV_AFTER: u64 = RESULTS + 0x2C;
+const APICV_ISR_END: u64 = RESULTS + 0x30;
+const APICV_DONE: u64 = RESULTS + 0x34;
+const APICV_MARK: u32 = u32::from_le_bytes(*b"APIC");
+/// The order its handlers ran in.
+const APICV_ORDER_WANTED: [u8; 4] = [0x50, 0x30, 0x70, 0x31];
+/// Bit 16 of a word of IRR or ISR: 0x30, 0x50 and 0x70 each, in theirs.
+const APICV_BIT: u32 = 1 << 16;
+/// Pin 4's entry: level-triggered, vector 0x41.
+const APICV_LEVEL_ENTRY: u32 = 0x8041;
+const APICV_LEVELS_WANTED: u32 = 3;
+/// The interrupts it takes: three self-IPIs, three levels.
+const APICV_INTERRUPTS: u64 = 6;
+
+const APICV_GUEST: IoGuest =
+    IoGuest { name: APICV_NAME, about: APICV_ABOUT, code: APICV_CODE, apicv: true, check: check_apicv };
+
+fn check_apicv(m: &GuestMemory, stopped: &Stopped, stats: &crate::devices::ioapic::Stats, counts: &Counts,
+               vapic: bool) -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not run to its halt"));
+    }
+    let word = |gpa: u64| m.read_obj::<u32>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    if word(APICV_DONE)? != APICV_MARK {
+        return Err(String::from("it never reached its end"));
+    }
+    let held = word(APICV_WHILE_HELD)?;
+    if held != 0 {
+        return Err(alloc::format!("{} handlers ran while CR8 held both interrupts back", held));
+    }
+    let irr = [word(APICV_IRR_HELD[0])?, word(APICV_IRR_HELD[1])?];
+    if irr != [APICV_BIT; 2] {
+        return Err(alloc::format!("IRR read {:#x} and {:#x} while CR8 held 0x30 and 0x50, not {:#x} each",
+                                  irr[0], irr[1], APICV_BIT));
+    }
+    let taken = word(APICV_TAKEN)?;
+    let order = word(APICV_ORDER)?.to_le_bytes();
+    if taken != APICV_ORDER_WANTED.len() as u32 || order != APICV_ORDER_WANTED {
+        return Err(alloc::format!("its handlers ran {} times, in the order {:02x?}, not {:02x?}",
+                                  taken, order, APICV_ORDER_WANTED));
+    }
+    let isr = [word(APICV_ISR_50)?, word(APICV_ISR_70[0])?, word(APICV_ISR_70[1])?];
+    if isr != [APICV_BIT; 3] {
+        return Err(alloc::format!("ISR read {:#x} in 0x50's handler and {:#x}, {:#x} in 0x70's, not {:#x} each",
+                                  isr[0], isr[1], isr[2], APICV_BIT));
+    }
+    let levels = word(APICV_LEVELS)?;
+    let (in_service, after) = (word(APICV_IN_SERVICE)?, word(APICV_AFTER)?);
+    if levels != APICV_LEVELS_WANTED || in_service != APICV_LEVEL_ENTRY | IOAPIC_REMOTE_IRR || after != APICV_LEVEL_ENTRY {
+        return Err(alloc::format!("{} levels taken, pin 4's entry {:#x} in service and {:#x} after -- not {}, {:#x} and {:#x}",
+                                  levels, in_service, after, APICV_LEVELS_WANTED,
+                                  APICV_LEVEL_ENTRY | IOAPIC_REMOTE_IRR, APICV_LEVEL_ENTRY));
+    }
+    let left = word(APICV_ISR_END)?;
+    if left != 0 {
+        return Err(alloc::format!("ISR read {:#x} at the end: an EOI lost", left));
+    }
+    let wanted = u64::from(APICV_LEVELS_WANTED);
+    if stats.sent != wanted || stats.level != wanted || stats.eois != wanted || stats.dropped != 0 {
+        return Err(alloc::format!("the IO-APIC sent {} ({} levels), ended {} and dropped {}, not {} each and 0",
+                                  stats.sent, stats.level, stats.eois, stats.dropped, wanted));
+    }
+    /* Under virtual-interrupt delivery the host injects none of them and
+     * hears of the three level EOIs alone; else it injects all six. */
+    let (injected, ended) = if vapic { (0, wanted) } else { (APICV_INTERRUPTS, 0) };
+    if counts.apic != injected || counts.eoi_exits != ended || (vapic && counts.vid == 0) || (!vapic && counts.vid != 0) {
+        return Err(alloc::format!("the host injected {} of its APIC's interrupts and was stopped after {} EOIs, {} entries \
+                                   with virtual-interrupt delivery -- not {} and {}{}", counts.apic, counts.eoi_exits,
+                                  counts.vid, injected, ended, if vapic { ", and some" } else { ", and none" }));
+    }
+    Ok(alloc::format!("CR8 5 held 0x50 and 0x30, both read in IRR; CR8 0 let 0x50 in, then 0x30 with 0x70 nested in \
+                       its handler, ISR showing each in service; three levels from the IO-APIC, sent again at each EOI \
+                       while the line stayed up; nothing left in service -- {}",
+                      if vapic {
+                          "the CPU delivered all six itself and took their EOIs, stopping the guest after the three \
+                           level-triggered ones for the IO-APIC"
+                      } else {
+                          "the host injected all six"
+                      }))
 }
 
 /* ---- debug: a guest's own #DB given back to it ---- */
@@ -3014,13 +3328,23 @@ fn check_tpr(vm: &Vm, r: &Run) -> core::result::Result<String, String> {
         return Err(alloc::format!(
             "the host's CR8 is {} after the guest's write, not {}: the write reached the CPU's own", host, HOST_TPR));
     }
-    let stops = if vm.is_vmx() { 2 } else { 0 };
+    /* VT-x stops the guest at each `mov` and answers it from a shadow, but
+     * where the guest has a virtual APIC: its VTPR is CR8 then, under the
+     * TPR shadow, as AMD-V's V_TPR is. */
+    let shadowed = vm.is_vmx() && !vm.vcpu().has_vapic();
+    let stops = if shadowed { 2 } else { 0 };
     if r.cr8 != stops {
         return Err(alloc::format!("the guest was stopped at CR8 {} times, not {}", r.cr8, stops));
     }
     Ok(alloc::format!(
         "the guest wrote 15 to its CR8 and read it back, {}, and the host's CR8 is still {}",
-        if vm.is_vmx() { "stopped at each and answered from the shadow" } else { "the CPU keeping the shadow itself" },
+        if shadowed {
+            "stopped at each and answered from the shadow"
+        } else if vm.is_vmx() {
+            "the CPU keeping it in the virtual APIC's VTPR"
+        } else {
+            "the CPU keeping the shadow itself"
+        },
         HOST_TPR))
 }
 

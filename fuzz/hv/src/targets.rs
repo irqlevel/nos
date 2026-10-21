@@ -377,6 +377,7 @@ fn pci_bus(r: &mut Input) {
  * entries, the timer's initial and current counts and divider, self-IPI. */
 pub const APIC_REGS: [u32; 27] = [0x02, 0x03, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x18, 0x20,
                               0x28, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3E, 0x3F, 0x3F];
+const APIC_TPR: u32 = 0x08;
 pub const APIC_EOI: u32 = 0x0B;
 const APIC_SVR: u32 = 0x0F;
 const APIC_ICR: u32 = 0x30;
@@ -384,6 +385,7 @@ const APIC_ICR_HIGH: u32 = 0x31;
 const APIC_LVT_TIMER: u32 = 0x32;
 const APIC_TIMER_INITIAL: u32 = 0x38;
 const APIC_TIMER_DIVIDE: u32 = 0x3E;
+const APIC_SELF_IPI: u32 = 0x3F;
 
 /// A register: one of the APIC's, mostly -- a word of the 256-bit ones, or
 /// anywhere in the range.
@@ -418,6 +420,9 @@ pub fn apic_value(r: &mut Input, reg: u32) -> u64 {
         }
         APIC_ICR_HIGH => u64::from(r.u8()) << 24,
         APIC_EOI => 0,
+        /* A priority, a class at a time as a kernel raises it; a vector. */
+        APIC_TPR => u64::from(r.u8() & if r.bool() { 0xF0 } else { 0xFF }),
+        APIC_SELF_IPI => vector,
         _ => u64::from(r.u32()),
     }
 }

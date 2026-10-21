@@ -264,6 +264,11 @@ pub struct Counts {
     pub apic: u64,
     /// The local APIC timer's interrupts requested.
     pub timer: u64,
+    /// Entries with the APIC's interrupts the CPU's to deliver, and its EOIs
+    /// to take (VT-x's virtual-interrupt delivery); and those EOIs it
+    /// stopped the guest after, of level-triggered vectors.
+    pub vid: u64,
+    pub eoi_exits: u64,
     /// IPIs this CPU sent, and fixed ones it was sent.
     pub ipi_sent: u64,
     pub ipi_taken: u64,
@@ -332,6 +337,8 @@ impl Counts {
         self.edges0 += o.edges0;
         self.apic += o.apic;
         self.timer += o.timer;
+        self.vid += o.vid;
+        self.eoi_exits += o.eoi_exits;
         self.ipi_sent += o.ipi_sent;
         self.ipi_taken += o.ipi_taken;
         self.msi += o.msi;
@@ -574,6 +581,9 @@ pub struct LinuxGuest {
     /// The CR4 bits its CPUs may set, by the CPUID they are told
     /// (`policy::cr4_allowed`): asked of the host once, not at every write.
     cr4_allowed: u64,
+    /// Whether its CPUs' interrupts are the CPU's to deliver where it can
+    /// (VT-x's virtual-interrupt delivery): only where `set_apicv` asked.
+    apicv: bool,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -693,6 +703,7 @@ impl LinuxGuest {
             last_halt: AtomicU64::new(0),
             loaded: false,
             cr4_allowed: crate::policy::cr4_allowed(),
+            apicv: false,
         };
         Ok((guest, vcpus))
     }
@@ -706,6 +717,18 @@ impl LinuxGuest {
     pub fn cpus(&self) -> u32 {
         self.cpus.len() as u32
     }
+
+    /// Whether its CPUs' interrupts are the CPU's to deliver, where it can
+    /// (VT-x's virtual-interrupt delivery, `crate::vmx::Vcpu::load_apic`),
+    /// set before it runs; off, as it is unless asked, the run loop injects
+    /// them. Asked for, not the default: without posted interrupts an
+    /// interrupt for a CPU in its guest still takes a kick to hand over,
+    /// and with no EOI exit to find it at, more of them do -- see
+    /// docs/hypervisor.md for what that costs.
+    pub fn set_apicv(&mut self, on: bool) {
+        self.apicv = on;
+    }
+
 
     /// Whether its CPUs have local APICs: a guest of more than one CPU. One
     /// of one is the PC it always was -- an 8259 on the CPU's interrupt pin,
@@ -1113,9 +1136,26 @@ impl LinuxGuest {
                 }
                 Activity::Running => {}
             }
-            self.deliver(gc, extint);
+            /* The CPU delivers the APIC's interrupts itself where it can,
+             * and the guest's APIC is in x2APIC mode and on: handed where
+             * the APIC stands, and given back what it did at the exit, before
+             * anything here looks at the APIC again. */
+            let apicv = self.apicv && self.has_apic() && gc.cpu.backend().has_vapic() && gc.lapic.delivers_itself();
+            self.deliver(gc, extint, apicv);
+            if apicv {
+                let vectors = gc.lapic.vectors();
+                gc.cpu.backend_mut().load_apic(&vectors);
+                gc.counts.vid += 1;
+            } else {
+                gc.cpu.backend_mut().apicv_off();
+            }
 
-            let (exit, host_cpu) = match gc.cpu.enter(&self.memory, machine, Some(kick)) {
+            let entered = gc.cpu.enter(&self.memory, machine, Some(kick));
+            if apicv {
+                let (irr, isr, tpr) = gc.cpu.backend_mut().take_apic();
+                gc.lapic.from_cpu(&irr, &isr, tpr);
+            }
+            let (exit, host_cpu) = match entered {
                 Ok(entered) => entered,
                 Err(refusal) => {
                     self.stop_with(Stop::Refused(refusal), gc);
@@ -1154,6 +1194,16 @@ impl LinuxGuest {
                     None
                 }
                 Exit::Msr { write } => self.msr(gc, write),
+                Exit::Eoi { vector } => {
+                    /* An EOI the CPU performed, of a vector whose end the
+                     * IO-APIC has to hear: out of service already, by the
+                     * page the exit gave back. */
+                    gc.counts.eoi_exits += 1;
+                    if let Some(level) = gc.lapic.virtual_eoi(vector) {
+                        self.level_eoi(gc, level);
+                    }
+                    None
+                }
                 Exit::Hlt => {
                     /* Step past it either way: a CPU an interrupt wakes
                      * from HLT resumes at the instruction after it -- Linux's
@@ -1479,7 +1529,11 @@ impl LinuxGuest {
     /// kernel that checks the one against the other while it waits for a
     /// tick -- Linux, which disables an APIC timer whose count strays two
     /// jiffies from its PIT's -- would see them apart when they are not.
-    fn deliver(&self, gc: &mut GuestCpu, extint: bool) {
+    ///
+    /// With `apicv` the APIC's interrupts are the CPU's to deliver (VT-x's
+    /// virtual-interrupt delivery): only an exception, an NMI and the
+    /// 8259's go in from here.
+    fn deliver(&self, gc: &mut GuestCpu, extint: bool, apicv: bool) {
         /* An exception given back first: it is the guest's last instruction's.
          * Not over an event an exit cut short and has put back, which goes
          * in first -- the two one after the other, as the CPU delivers a
@@ -1507,7 +1561,7 @@ impl LinuxGuest {
         }
         let cr8 = gc.cpu.backend().cr8();
         gc.lapic.sync_cr8(cr8);
-        let apic = gc.lapic.pending();
+        let apic = if apicv { None } else { gc.lapic.pending() };
         if !extint && apic.is_none() {
             gc.cpu.backend_mut().clear_irq_window();
             return;
