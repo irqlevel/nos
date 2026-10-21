@@ -2449,14 +2449,27 @@ in turns: 3.7-5.9 s (4.85 on average) against 5.6-5.8 s (5.72), faster in
 9 of the 10, the two guests exiting 0.67-1.58 million times against 2.3-2.6
 million.
 
-Halt polling, a halted CPU watching for an interrupt a while before its
-task sleeps, is another lever on that load: watching its mailbox for a
-fixed 200 us at each wait took the transfer from 5.7 s to 3.9 s, without
-posted interrupts, either way. A watch that adapted -- grown while waits
-end soon, shrunk while they do not, KVM's way, per halt or per wait,
-watching the doorbell too or the mailbox alone -- came to 5-7 s, slower
-than no watch at all, and why -- the core's clock under HWP, a guest's two
-CPUs being one core's two threads -- is not measured yet; none is in the
+**Halt polling** -- a halted CPU watching for an interrupt a while before
+its task sleeps -- is not a lever on that load; what looked like one was
+interrupt moderation, by accident. Measured apart, posted interrupts on,
+two runs each: a 200 us watch of a CPU's mailbox and its doorbell took the
+transfer from 3.9-5.1 s to 6.3-6.5 s, a 50 us one to 4.7-6.0 s. A watch
+hands each frame's interrupt over at once, so the receiving guest takes one
+frame an interrupt (1.00, against 1.4-2.0 with no watch) and acknowledges
+every one or two, 265,000-277,000 ACKs against 111,000-151,000, and the
+sender's TCP, answered that often, sends more and smaller frames -- each
+one more exit on both sides. The 200 us watch that had taken the transfer
+from 5.7 s to 3.9 s watched the mailbox alone: on the receiving guest's
+first CPU, halted, it left the doorbell the switch rings for the devices'
+work unanswered until it ran out, so the frames for that guest waited up to
+200 us and went into its ring together -- 18.9 an interrupt, 41,000 ACKs,
+3.9 s; where that CPU was not halted nothing waited, 1.8 an interrupt and
+4.9 s. Adaptive watches came to 5-7 s for the same reason: they shrank the
+first CPU's watch to nothing, and answered the rest at once. Moderation
+done on purpose -- an interrupt held a bounded while for the frames behind
+it -- needs a host timer finer than the tick: the same wait slept rather
+than spun, which the 100 Hz tick makes 5-10 ms, held 260-290 frames an
+interrupt and took 12.5-14.6 s, the TCP window run dry. None is in the
 tree.
 
 The `apicv` built-in guest asks for it, and holds both ways to one result:
@@ -2587,7 +2600,8 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
   for a guest timer's deadline -- `kcore::timer` is periodic, at the
   host's tick -- so a CPU in its guest is handed a timer interrupt at its
   next exit, and a CPU asleep is woken for one at the host's next tick
-  at worst. The owed periods keep the count right on average, and PAUSE
+  at worst: on the EX44 a guest's `usleep 1000`, a hundred times over,
+  took 0.99 s, and `usleep 100000` 109 ms. The owed periods keep the count right on average, and PAUSE
   exits keep a spinning CPU prompt; a CPU computing with no exit at all
   gets its ticks in bursts of up to 10 ms.
 - **No TSC-deadline timer.** A kernel built with neither `X86_MPPARSE` nor
@@ -3593,14 +3607,18 @@ someone else's; then speed.
 6. **The larger ones.** ~~APICv and posted interrupts~~ done under VT-x, in
    x2APIC mode ([Interrupts the CPU delivers
    itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
-   left: halt polling, measured there and not yet understood; the xAPIC
+   left: a NIC's receive interrupts moderated on purpose, which halt
+   polling turned out to have been doing by accident (measured there), and
+   which needs a host one-shot finer than the tick; the xAPIC
    page's virtualization, and AMD's AVIC; device work off the first CPU's
    task, with a lock a device and the
    ring pages mapped once rather than at every access; nested leaves of 2
    MiB and 1 GiB, over guest memory taken in runs that size; the VMX
-   preemption timer, a host one-shot and halt polling for the guests'
-   timers; virtio-net's checksum and segmentation offloads, which 2.5 Gbit
-   on the EX44 needs.
+   preemption timer and a host one-shot for the guests' timers -- a halted
+   guest's `usleep 1000` takes 10 ms on the EX44, the host's tick
+   ([What it does not do yet](#what-it-does-not-do-yet)); virtio-net's checksum and segmentation offloads,
+   which 2.5 Gbit on the EX44 needs, and with which a TCP stream would be
+   a fortieth of the frames, exits and interrupts it is.
 7. **What has not been measured.** The time each kind of exit takes
    inside `LinuxGuest::run`; fio and iperf in a guest. (An exit under VT-x
    on silicon is measured now: [What an exit costs](#what-an-exit-costs).)
