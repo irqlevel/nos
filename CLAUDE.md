@@ -65,6 +65,7 @@ What a smoke boot cannot notice has a test of its own, each there for a failure 
 | After touching | Run (`scripts/`) |
 |---|---|
 | a mapping path | `wx-test.sh [--arch x86_64\|aarch64]` |
+| the panic path, `panic=N`, a reset (`Hal::ResetNow`) | `panic-test.sh [--arch x86_64\|aarch64]` |
 | the block layer, the partition tables | `parttest.py [--arch aarch64\|x86_64]`; a batch (`Disk::write_pieces`, a driver's `write_pieces`/`read_pieces`): `hv-linux-test.py --disk` and `--disk --nvme-root` |
 | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through | `netblk-test.py [--arch x86_64\|aarch64]` (`--arch aarch64` on a Mac) |
 | ext2 | `ext2-test.py` (arm64): lets `e2fsck` judge the image; its file data under a guest's disk -- holes filled, blocks written over, in batches -- `hv-linux-test.py --disk [--nvme-root]` (x86-64), which judges nos's root the same way, on virtio-blk and on NVMe |

@@ -102,6 +102,7 @@ swallowing panic messages whole.
 | Gate | Arch | Run it after touching |
 |---|---|---|
 | `wx-test.sh [--arch x86_64\|aarch64]` | both | a mapping path |
+| `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `ext2-test.py` | arm64 | ext2 |
 | `nanofs-test.py` | arm64 | nanofs |
@@ -132,6 +133,18 @@ notices a mapping that stops being NX -- everything still works -- and the
 heap probe is the one that fails if a mapping path ever stops setting NX on
 the leaves it writes. `--skip-build`; `WX_HVF=1` for the arm64 boots under
 HVF. See [Paging](paging.md#mmio-cacheability-and-wx).
+
+### `panic-test.sh` -- a panic that resets the machine, when asked
+
+Two boots that panic on purpose (`wxprobe=text`, early in boot), under QEMU's
+`-no-reboot`, so that a reset is QEMU exiting by itself: with `panic=1` it has
+to reset within twenty seconds of the report, having said it would; without,
+it has to still be there eight seconds after it, the report on its console. A
+server whose only console is the network has nothing else to bring it back
+from a panic -- the EX44 stayed dark until it was reset by hand from the
+provider's panel after a boot that died before its network was up -- and
+the system image boots nos with `panic=10`, after which GRUB boots the
+server's own system. `--skip-build`; `PANIC_HVF=1` for the arm64 boots under HVF.
 
 ### `parttest.py` -- partition tables
 

@@ -35,6 +35,13 @@ public:
 
     bool IsTraceVga();
     bool IsPanicVga();
+
+    /* panic=N -- reset the machine N seconds after a panic's report, 1 to
+       PanicResetSecsMax; 0, the default, keeps it stopped with the report
+       on its screen. For a machine whose only console is the network,
+       whose next boot is its own OS: back there with no hand on it. */
+    ulong GetPanicResetSecs();
+    static const ulong PanicResetSecsMax = 3600;
     bool IsSmpOff();
 
     /* maxcpus=N -- bring up at most N CPUs, the BSP included. 0 = no cap. */
@@ -59,6 +66,10 @@ public:
        RNDR). For seeing what a machine without one does, on a machine that
        has one; the pool then falls back on virtio-rng and timing jitter. */
     bool IsHwRngOff();
+
+    /* hwp=off -- x86: leave the CPUs' clock where firmware left it rather
+       than turning on hardware P-states (Hal::SetupCpuPerformance) */
+    bool IsHwpOff();
 
     bool IsConsoleSerial();
     bool IsConsoleVga();
@@ -164,10 +175,12 @@ private:
     char Cmdline[CmdlineLen];
     bool TraceVga;
     bool PanicVga;
+    ulong PanicResetSecs;
     bool SmpOff;
     ulong MaxCpusLimit;
     bool ItsEnabled;
     bool HwRngOff;
+    bool HwpOff;
     WxProbeMode WxProbeMd;
     bool UsbOff;
     bool RcOff;

@@ -100,6 +100,31 @@ namespace Hal
    Defined per arch. */
 bool SetupSerializingLfence();
 
+/* What SetupCpuPerformance left a CPU asking for: on x86 with HWP, the
+   range of performance levels it now picks its own clock from -- lowest to
+   highest, turbo included -- and the level it guarantees, all in the CPU's
+   own units, which on a hybrid part are not the same for its two kinds of
+   core. All zero where nothing was done. */
+struct CpuPerformance
+{
+    u32 Lowest;
+    u32 Guaranteed;
+    u32 Highest;
+};
+
+/* Let this CPU run as fast as it can while it is busy, rather than at the
+   clock firmware left it at. x86 with hardware P-states (HWP, Skylake and
+   later): HWP turned on, and the CPU asked for its whole range, lowest to
+   highest, with the clock its own pick at the balanced-performance
+   preference -- what Linux's intel_pstate asks by default. Without it an
+   Intel CPU stays at the ratio firmware set, its base clock: on the EX44
+   (i5-13500) every core ran at 2.5 GHz, its P-cores' turbo being 4.8.
+   Nothing under a hypervisor, whose MSRs those are, without HWP, or with
+   hwp=off; arm64: nothing. Turning HWP on cannot be undone short of a
+   reset. True when HWP was set up, with `out` filled; on the BSP and on
+   each AP. Defined per arch. */
+bool SetupCpuPerformance(CpuPerformance* out);
+
 /* How fast ReadCycleCounter() counts, in Hz: the TSC's rate as the kernel
    calibrated it on x86, CNTFRQ_EL0 on arm64. 0 while it is not known yet.
    Defined per arch. */
