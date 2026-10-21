@@ -371,7 +371,9 @@ pub fn report() -> Report {
     Report {
         switches: SWITCHES.load(Ordering::Relaxed),
         barriers: BARRIERS.load(Ordering::Relaxed),
-        ibpb: IBPB.load(Ordering::Relaxed),
+        /* CPUID's answer, not the flag `on` keeps for the entries: before
+         * any CPU has the extension on, that says no for a CPU that has it */
+        ibpb: has_ibpb(),
         auto_ibrs: auto,
         intel: ENTRIES.with(|e, _| e.spec.intel).unwrap_or_default(),
     }
