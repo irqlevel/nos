@@ -413,9 +413,13 @@ pub fn apic_value(r: &mut Input, reg: u32) -> u64 {
         APIC_TIMER_DIVIDE => r.below(16),
         APIC_ICR => {
             /* Delivery mode, logical, level assert, level trigger, a
-             * shorthand -- and in x2APIC mode the destination above. */
-            let low = vector | (r.below(8) << 8) | u64::from(r.bool()) << 11 | u64::from(r.bool()) << 14
-                | u64::from(r.bool()) << 15 | (r.below(4) << 18);
+             * shorthand -- and in x2APIC mode the destination above. Half of
+             * them a fixed IPI to one CPU, as most a kernel sends are. */
+            let fixed = r.bool();
+            let mode = if fixed { 0 } else { r.below(8) };
+            let shorthand = if fixed { 0 } else { r.below(4) };
+            let low = vector | (mode << 8) | u64::from(r.bool() && !fixed) << 11 | u64::from(r.bool()) << 14
+                | u64::from(r.bool() && !fixed) << 15 | (shorthand << 18);
             low | (u64::from(r.pick(&[0u32, 1, 2, 3, 0xF, 0xFF, 0xFFFF_FFFF])) << 32)
         }
         APIC_ICR_HIGH => u64::from(r.u8()) << 24,

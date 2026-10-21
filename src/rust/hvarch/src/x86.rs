@@ -188,6 +188,8 @@ impl Caps {
                 }
                 feature(out, "APIC virtualization", caps.apicv(),
                         "an x2APIC guest's interrupts delivered, and its EOIs taken, by the CPU without an exit")?;
+                feature(out, "posted interrupts", caps.posted(),
+                        "and another CPU's handed to it in its guest, without an exit")?;
 
                 /* The one line on this page that is about this kernel
                  * rather than the CPU: `vmxon` faults, not fails, when the

@@ -62,6 +62,21 @@ pub fn kick(cpu: u32) {
     ffi::cpu::kernel_cpu_kick(cpu)
 }
 
+/// The notification of an interrupt posted for a vCPU running on `cpu`
+/// (VT-x's posted interrupts): taken by the CPU in its guest without an
+/// exit, and out of one an interrupt that only ends itself. From any
+/// context; nothing for a `cpu` out of range.
+#[inline]
+pub fn notify(cpu: u32) {
+    ffi::cpu::kernel_cpu_notify(cpu)
+}
+
+/// The vector [`notify`] sends: a VMCS's posted-interrupt notification
+/// vector.
+pub fn posted_interrupt_vector() -> u8 {
+    ffi::cpu::kernel_posted_interrupt_vector()
+}
+
 extern "C" fn nothing(_ctx: *mut u8) {}
 
 /// Returns once every running CPU has taken an interrupt since the call, so

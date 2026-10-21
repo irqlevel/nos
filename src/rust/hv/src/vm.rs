@@ -134,6 +134,16 @@ impl Backend {
     pub fn load_apic(&mut self, v: &crate::lapic::Vectors) {
         match self { Backend::Svm(_) => {}, Backend::Vmx(c) => c.load_apic(v) }
     }
+    /// Whether interrupts posted for this CPU can be taken in its guest
+    /// without an exit (VT-x's posted interrupts); AMD-V: no.
+    pub fn posted_capable(&self) -> bool {
+        match self { Backend::Svm(_) => false, Backend::Vmx(v) => v.posted_capable() }
+    }
+    /// Where its interrupts are posted, before its first entry: true when
+    /// taken (`crate::vmx::Vcpu::set_posted`).
+    pub fn set_posted(&mut self, posted: alloc::sync::Arc<hvarch::x86::vmx::PostedInterrupts>) -> bool {
+        match self { Backend::Svm(_) => false, Backend::Vmx(v) => v.set_posted(posted) }
+    }
     /// Virtual-interrupt delivery off from the next entry.
     pub fn apicv_off(&mut self) {
         match self { Backend::Svm(_) => {}, Backend::Vmx(v) => v.apicv_off() }

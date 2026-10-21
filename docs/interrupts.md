@@ -48,6 +48,7 @@ are (`hal/irqchip.h`: `IrqEoi`, `SendIpi`, `GetCurrentCpuHwId`,
 | — | the virtio devices are Rust drivers and take one of the shared Rust slots below, on a line or as MSI-X |
 | `0x38`–`0x3F` | Legacy INTx lines requested by Rust drivers (8 slots) |
 | `0x40`–`0xEF` | MSI-X vectors, handed out in order by `MsixTable::AllocVector` |
+| `0xFC` | Posted-interrupt notification (`Hal::PostedVector`): a vCPU in its guest takes it without an exit (VT-x's posted interrupts, [the hypervisor](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)); one out of its guest only ends it |
 | `0xFD` | Local APIC timer — this CPU's tick |
 | `0xFE` | IPI (`Hal::IpiVector`) |
 | `0xFF` | Local APIC spurious vector |

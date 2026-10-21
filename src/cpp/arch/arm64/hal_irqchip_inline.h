@@ -13,6 +13,9 @@ namespace Hal
 /* IPI vector: IDT slot on x86, SGI INTID on arm64 */
 constexpr u8 IpiVector = 1;
 
+/* No posted interrupts here: a vCPU's notification is the IPI. */
+constexpr u8 PostedVector = IpiVector;
+
 static inline __attribute__((always_inline)) ulong GetCurrentCpuHwId()
 {
     /* Per-CPU index cached in TPIDR_EL1 at CPU startup (boot.S), so this is

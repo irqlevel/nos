@@ -25,6 +25,7 @@ const char* InterruptStats::GetName(InterruptSource src)
     case IrqMsix:       return "msix";
     case IrqDummy:      return "dummy";
     case IrqSpurious:   return "spurious";
+    case IrqPosted:     return "posted";
     default:            return "unknown";
     }
 }
