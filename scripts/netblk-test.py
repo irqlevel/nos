@@ -35,6 +35,7 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import netblk  # noqa: E402  (scripts/netblk.py)
+import parttest as pt  # noqa: E402  (scripts/parttest.py)
 
 KERNELS = {
     "x86_64": os.path.join(ROOT, "bin", "kernel64.elf"),
@@ -68,7 +69,7 @@ menuentry "nos" {
 
 
 def module_path(arch):
-    return os.path.join(ROOT, "out", arch, "modules", "netblk.ko")
+    return pt.module_path(arch, "netblk")
 
 
 class TestFailure(Exception):

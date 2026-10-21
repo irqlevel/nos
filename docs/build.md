@@ -153,7 +153,11 @@ The first report is a panic, with the site:
 
 which makes every gate a UB check over the code it drives: build with
 `UBSAN=1`, and run the gate on the images as they are (`--skip-build` where it
-builds). CI boots it on both architectures, after everything else. To collect
+builds). A gate that loads a module takes it from the flavour the stamp names
+(`module_path` in `scripts/parttest.py`): a module from `out/$(ARCH)/` loads
+into the instrumented kernel just as well, and a gate run that way would pass
+without the module's own checks. CI boots it on both architectures, after
+everything else. To collect
 every report of a boot instead, boot with `ubsan=warn`: each site reports
 once, with a backtrace, and the kernel goes on. A report goes out through the
 writers the panic path uses -- the serial port, polled, and the disk log --

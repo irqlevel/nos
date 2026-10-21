@@ -78,6 +78,22 @@ def sparse(path, size):
         f.truncate(size)
 
 
+def module_path(arch, name):
+    """Module `name` as the last build of `arch` made it -- the build whose
+    images a test boots: in out/<arch>/modules, or out/<arch>-ubsan/modules
+    after a UBSAN=1 build, which the Makefile's flavour stamp says. The other
+    directory may hold the other flavour's, which loads just as well -- the
+    ABI is the same -- and a gate on a UB build would then run a module
+    without its checks, and pass."""
+    try:
+        with open(os.path.join(ROOT, "out", "flavor-" + arch)) as f:
+            flavor = f.read().strip()
+    except OSError:
+        flavor = "plain"
+    out = arch + ("-ubsan" if flavor.split("+")[0] == "ubsan" else "")
+    return os.path.join(ROOT, "out", out, "modules", name + ".ko")
+
+
 def put(path, lba, data):
     with open(path, "r+b") as f:
         f.seek(lba * SECTOR)
