@@ -177,6 +177,7 @@ struct MultiBootTagAcpi
 };
 
 const u32 MultiBootTagTypeEnd = 0;
+const u32 MultiBootTagTypeModule = 3;
 const u32 MultiBootTagTypeMmap = 6;
 const u32 MultiBootTagTypeBootDev = 5;
 const u32 MultiBootTagTypeCmdline = 1;
@@ -208,6 +209,12 @@ struct FramebufferInfo
     u8 BluePos;
     u8 BlueSize;
 };
+
+/* The physical range of the module GRUB loaded with the command line
+   `ucode` -- this CPU's microcode, `module2 /boot/ucode ucode` -- for the
+   BSP to choose an update from while the bootstrap map still reaches it
+   (Microcode::LoadOnBsp). False when there is none. */
+bool GetUcodeModule(ulong& phys, ulong& len);
 
 /* True if GRUB provided a framebuffer tag. */
 bool HasFramebufferInfo();

@@ -27,6 +27,7 @@
 #include <arch/x86_64/tsc.h>
 
 #include <arch/x86_64/grub.h>
+#include <arch/x86_64/microcode.h>
 
 #include <lib/error.h>
 #include <lib/stdlib.h>
@@ -264,6 +265,11 @@ __attribute__((noinline)) void ApMain2()
     Idt::GetInstance().Save();
     AtomicReadAndInc(&ApStartedFlag); /* 4: GDT+IDT loaded */
 
+    /* The update the BSP kept, as early as a fault here is a report: said
+       below, once this CPU's index is known */
+    Microcode::Result ucode;
+    Microcode::LoadOnAp(&ucode);
+
     /* Same PAT as the BSP before this CPU can touch a write-combining
        mapping (the framebuffer console is already mapped by now). Its trace
        is the first console write an AP makes, which is why it has to come
@@ -286,6 +292,16 @@ __attribute__((noinline)) void ApMain2()
     Tsc::GetInstance().EnableKvmClockSelf();
 
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+
+    if (Microcode::Kept())
+    {
+        if (ucode.Skipped == nullptr)
+            Trace(0, "Cpu %lu: microcode revision 0x%x -> 0x%x", cpu.GetIndex(), ucode.Before, ucode.After);
+        else if (ucode.Asked)
+            Trace(0, "Cpu %lu: microcode %s (revision 0x%x)", cpu.GetIndex(), ucode.Skipped, ucode.Before);
+        else
+            Trace(0, "Cpu %lu: microcode %s", cpu.GetIndex(), ucode.Skipped);
+    }
 
     /* Its clock its own to raise, as the BSP's is: each CPU's range its own,
        the two kinds of core of a hybrid part giving different ones. */
@@ -840,6 +856,26 @@ __attribute__((noinline)) void Main2(Grub::MultiBootInfoHeader *MbInfo)
     Grub::ParseMultiBootInfo((Grub::MultiBootInfoHeader *)bpt.PhysToVirt((ulong)MbInfo));
 
     Tracer::GetInstance().SetLevel(Parameters::GetInstance().GetLogLevel());
+
+    /* Microcode, as early as it can be: this CPU's update from the module
+       GRUB loaded, while the bootstrap map still reaches it -- below 4 GiB,
+       as a module's range is -- kept for the APs (ApMain2). */
+    {
+        ulong ucodePhys = 0, ucodeLen = 0;
+        if (Grub::GetUcodeModule(ucodePhys, ucodeLen))
+        {
+            Microcode::Result ucode;
+            Microcode::LoadOnBsp((const u8*)bpt.PhysToVirt(ucodePhys), ucodeLen, &ucode);
+            if (ucode.Skipped == nullptr)
+                Trace(0, "microcode: revision 0x%x -> 0x%x, of %04x-%02x-%02x", ucode.Before, ucode.After,
+                    ucode.Date & Microcode::DateYearMask, ucode.Date >> Microcode::DateMonthShift,
+                    (ucode.Date >> Microcode::DateDayShift) & Microcode::DateDayMask);
+            else if (ucode.Asked)
+                Trace(0, "microcode: %s (revision 0x%x)", ucode.Skipped, ucode.Before);
+            else
+                Trace(0, "microcode: %s", ucode.Skipped);
+        }
+    }
 
     /* Arm log capture as soon as the command line is known: the ring buffers
        everything until the network can carry it away. */
