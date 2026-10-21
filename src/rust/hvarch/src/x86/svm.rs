@@ -445,6 +445,24 @@ impl Kick {
         }
     }
 
+    /// Another CPU's, from any context, once it has posted an interrupt for
+    /// the vCPU (`vmx::PostedInterrupts::post`): the posted-interrupt
+    /// notification to the CPU the vCPU is in its guest on, or on its way
+    /// in to -- which takes what was posted there without an exit -- and
+    /// true; false when it is neither, for the caller to wake it instead.
+    /// A vCPU on its way in looks at what was posted after `prepare`, so it
+    /// either finds the interrupt or is sent the notification; one that
+    /// left meanwhile takes the notification as a host interrupt with
+    /// nothing to do, and what was posted at its next look.
+    pub fn notify(&self) -> bool {
+        fence(Ordering::SeqCst);
+        if self.mode.load(Ordering::SeqCst) != IN_GUEST {
+            return false;
+        }
+        kcore::cpu::notify(self.cpu.load(Ordering::SeqCst));
+        true
+    }
+
     /// [`Guest::run`]'s, with interrupts off on `cpu`: whether to enter.
     /// The CPU is stored before the mode is read, so that a kick that finds
     /// the vCPU in its guest after this interrupts the CPU it is on.

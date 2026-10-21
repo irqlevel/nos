@@ -1255,8 +1255,13 @@ APIC virtualization, and the CPU -- `hv info`'s *APIC virtualization* --
 delivering all six and taking their EOIs under VT-x, the guest stopped after
 the three level-triggered ones alone ([Interrupts the CPU delivers
 itself](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
-there `tpr`'s CR8 is the virtual APIC's VTPR and no `mov` of it exits; and
-for `debug`, through the run loop
+there `tpr`'s CR8 is the virtual APIC's VTPR and no `mov` of it exits; for
+`posted`, two CPUs both running, that the first counted all thousand of the
+fixed IPIs the second sent it while it spun -- and who handed them over:
+where the CPU has posted interrupts (`hv info`) each was posted and the
+notification sent for nine in ten at least, the first CPU taking them in
+its guest and leaving it a tenth as many times at most, and elsewhere the
+host; and for `debug`, through the run loop
 a Linux guest's CPUs go through, that a single step and an `int1` -- each a
 #DB the host intercepts -- reached the guest's own handler, the first with
 DR6.BS and after the stepped instruction, the second after the ICEBP: a

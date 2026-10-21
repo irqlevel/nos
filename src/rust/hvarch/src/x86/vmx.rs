@@ -45,6 +45,13 @@ pub const SEC_VIRTUAL_INTR_DELIVERY: u32 = 1 << 9;
 /// APIC's task priority in a page of the guest's own.
 pub const PROC_TPR_SHADOW: u32 = 1 << 21;
 
+/// The pin-based control that takes a posted interrupt into the guest
+/// without an exit, and the VM-exit control it needs.
+pub const PIN_POSTED_INTERRUPTS: u32 = 1 << 7;
+pub const EXIT_ACK_INTR_ON_EXIT: u32 = 1 << 15;
+const MSR_VMX_PINBASED: u32 = 0x481;
+const MSR_VMX_EXIT: u32 = 0x483;
+
 /* IA32_VMX_EPT_VPID_CAP: INVEPT and INVVPID are there, and which of their
  * types. */
 pub const EPT_CAP_INVEPT: u64 = 1 << 20;
@@ -115,6 +122,9 @@ pub struct Caps {
     pub feature_control: u64,
     /// The primary processor-based controls this CPU allows to be 1.
     pub primary: u32,
+    /// The pin-based and the VM-exit controls this CPU allows to be 1.
+    pub pin: u32,
+    pub exit: u32,
     /// The secondary processor-based controls this CPU allows to be 1, or 0
     /// when it has no secondary controls at all.
     pub secondary: u32,
@@ -139,8 +149,11 @@ impl Caps {
         let basic = unsafe { cpu::rdmsr(MSR_VMX_BASIC) };
         let feature_control = unsafe { cpu::rdmsr(MSR_FEATURE_CONTROL) };
 
-        /* A capability MSR's high half is what the CPU allows to be 1. */
+        /* A capability MSR's high half is what the CPU allows to be 1 -- the
+         * same in the TRUE MSRs. */
         let primary = (unsafe { cpu::rdmsr(MSR_VMX_PROCBASED_CTLS) } >> 32) as u32;
+        let pin = (unsafe { cpu::rdmsr(MSR_VMX_PINBASED) } >> 32) as u32;
+        let exit = (unsafe { cpu::rdmsr(MSR_VMX_EXIT) } >> 32) as u32;
         let secondary = if primary & PROC_SECONDARY_CTLS != 0 {
             (unsafe { cpu::rdmsr(MSR_VMX_PROCBASED_CTLS2) } >> 32) as u32
         } else {
@@ -156,6 +169,8 @@ impl Caps {
             basic,
             feature_control,
             primary,
+            pin,
+            exit,
             secondary,
             ept_vpid,
             cr0_fixed0: unsafe { cpu::rdmsr(MSR_VMX_CR0_FIXED0) },
@@ -202,6 +217,13 @@ impl Caps {
         self.primary & PROC_TPR_SHADOW != 0
             && self.has(SEC_VIRTUALIZE_X2APIC)
             && self.has(SEC_VIRTUAL_INTR_DELIVERY)
+    }
+
+    /// The CPU takes an interrupt posted for a guest in its guest, without
+    /// an exit: APIC virtualization, posted-interrupt processing, and the
+    /// exit control that acknowledges the host's interrupts it needs.
+    pub fn posted(&self) -> bool {
+        self.apicv() && self.pin & PIN_POSTED_INTERRUPTS != 0 && self.exit & EXIT_ACK_INTR_ON_EXIT != 0
     }
 
     /// INVEPT can drop one EPT's translations alone; failing that, a guest's
@@ -766,6 +788,9 @@ struct Synced {
     sysenter_esp: u64,
     sysenter_eip: u64,
     interruptibility: u32,
+    /// The pin-based controls, whose posted-interrupt processing follows
+    /// virtual-interrupt delivery.
+    pin: u32,
     proc1: u32,
     /// The secondary controls, whose x2APIC virtualization and
     /// virtual-interrupt delivery follow the guest's APIC (`set_apicv`).
@@ -794,6 +819,14 @@ pub struct Guest {
     /// The EOI-exit bitmap the next entry has: the vectors whose EOI, which
     /// the CPU performs, still exits.
     eoi_exit: [u64; 4],
+    /// Where other CPUs post its interrupts, for the CPU to take in the
+    /// guest while virtual-interrupt delivery is on ([`set_posted`]): the
+    /// VMCS names it from the first entry, and every external interrupt's
+    /// exit acknowledges the interrupt then -- `acked`, delivered to the
+    /// host by hand after the exit ([`deliver_host_interrupt`]).
+    posted: Option<alloc::sync::Arc<PostedInterrupts>>,
+    posted_capable: bool,
+    acked: Option<u8>,
     /// The guest state, kept in the same shape as an AMD-V save area so the
     /// policy layer is one set of code: synced to the VMCS before an entry
     /// and read back from it after.
@@ -980,9 +1013,12 @@ impl Guest {
             vmcs,
             msr_area,
             msr_bitmap,
+            posted_capable: vapic.is_some() && caps.posted(),
             vapic,
             apicv_on: false,
             eoi_exit: [0; 4],
+            posted: None,
+            acked: None,
             save: unsafe { core::mem::zeroed() },
             regs: GuestRegs::default(),
             fx,
@@ -1274,6 +1310,26 @@ impl Guest {
         self.vapic.is_some()
     }
 
+    /// Whether interrupts posted for it can be taken in the guest
+    /// ([`set_posted`](Self::set_posted)): a virtual APIC, and the CPU's
+    /// posted-interrupt processing.
+    pub fn posted_capable(&self) -> bool {
+        self.posted_capable
+    }
+
+    /// `posted` is where other CPUs post its interrupts: taken by the CPU
+    /// in the guest while virtual-interrupt delivery is on, the rest of the
+    /// time by the run loop ([`PostedInterrupts::take`]). Before its first
+    /// entry only, which names it in the VMCS; false, and nothing kept,
+    /// after it or on a CPU without posted-interrupt processing.
+    pub fn set_posted(&mut self, posted: alloc::sync::Arc<PostedInterrupts>) -> bool {
+        if !self.posted_capable || self.configured {
+            return false;
+        }
+        self.posted = Some(posted);
+        true
+    }
+
     /// Virtual-interrupt delivery and x2APIC virtualization, on or off from
     /// the next entry. On, the CPU delivers what VIRR holds itself, when the
     /// guest can take it, and performs the guest's writes of its x2APIC's
@@ -1442,9 +1498,13 @@ impl Guest {
         self.proc2 = adjust(want2, MSR_VMX_PROCBASED_CTLS2);
         /* DR7 saved at the exit and loaded at the entry: the guest's own,
          * its breakpoints armed while it runs and none of them after. */
+        /* With posted interrupts, every external interrupt's exit
+         * acknowledges it, for the host to be handed by hand: what
+         * posted-interrupt processing needs. */
+        let ack = if self.posted.is_some() { EXIT_ACK_INTR_ON_EXIT } else { 0 };
         self.exit_ctls = adjust(
             EXIT_HOST_ADDR_SPACE_SIZE | EXIT_LOAD_IA32_EFER | EXIT_SAVE_IA32_EFER
-                | EXIT_LOAD_IA32_PAT | EXIT_SAVE_IA32_PAT | EXIT_SAVE_DEBUG,
+                | EXIT_LOAD_IA32_PAT | EXIT_SAVE_IA32_PAT | EXIT_SAVE_DEBUG | ack,
             ctls_msr(basic, MSR_VMX_EXIT_CTLS, MSR_VMX_TRUE_EXIT_CTLS),
         );
         /* "IA-32e mode guest" is not among them: it follows the guest's
@@ -1466,8 +1526,19 @@ impl Guest {
         } else {
             (CR8_EXITING, 0, 0)
         };
-        let checks: [(&'static str, u32, u32); 7] = [
+        /* With posted interrupts: their processing, which the entries turn
+         * on with virtual-interrupt delivery, and the exit's acknowledgement. */
+        let (posted_got, posted_needed, ack_needed) = if self.posted.is_some() {
+            let got = adjust(self.pin | PIN_POSTED_INTERRUPTS,
+                             ctls_msr(basic, MSR_VMX_PINBASED_CTLS, MSR_VMX_TRUE_PINBASED_CTLS));
+            (got, PIN_POSTED_INTERRUPTS, EXIT_ACK_INTR_ON_EXIT)
+        } else {
+            (0, 0, 0)
+        };
+        let checks: [(&'static str, u32, u32); 9] = [
             ("pin-based", self.pin, PIN_REQUIRED),
+            ("pin-based (posted interrupts)", posted_got, posted_needed),
+            ("VM-exit (posted interrupts)", self.exit_ctls, ack_needed),
             ("processor-based", self.proc1, PROC_REQUIRED),
             ("processor-based (CR8)", self.proc1, cr8_needed),
             ("secondary processor-based", self.proc2, PROC2_REQUIRED | promised2),
@@ -1545,7 +1616,14 @@ impl Guest {
                     vmwrite(*field, word);
                 }
             }
+            /* Where interrupts are posted for it, and the vector their
+             * notification is. */
+            if let Some(posted) = &self.posted {
+                vmwrite(POSTED_INTR_NV, u64::from(kcore::cpu::posted_interrupt_vector()));
+                vmwrite(POSTED_INTR_DESC_ADDR, posted.phys());
+            }
         }
+        self.synced.pin = self.pin;
         self.synced.proc1 = self.proc1;
         self.synced.proc2 = self.proc2;
         self.synced.eoi_exit = self.eoi_exit;
@@ -1631,6 +1709,7 @@ impl Guest {
                 sysenter_esp: s.sysenter_esp,
                 sysenter_eip: s.sysenter_eip,
                 interruptibility: self.interruptibility,
+                pin: self.synced.pin,
                 proc1: self.synced.proc1,
                 proc2: self.synced.proc2,
                 eoi_exit: self.synced.eoi_exit,
@@ -2000,6 +2079,18 @@ impl Guest {
             self.save.cr0 = self.exit_cr0;
             self.save.cr4 = self.exit_cr4;
         }
+        /* An external interrupt the exit acknowledged: the host's, delivered
+         * to nothing yet -- `run` hands it over once the CPU's entries are
+         * let go of. */
+        self.acked = None;
+        if basic == r::EXTERNAL_INTERRUPT && self.exit_reason & r::ENTRY_FAILURE == 0
+            && self.exit_ctls & EXIT_ACK_INTR_ON_EXIT != 0
+        {
+            let info = unsafe { vmread(VMEXIT_INTR_INFO) } as u32;
+            if info & intr::VALID != 0 {
+                self.acked = Some((info & intr::VECTOR_MASK) as u8);
+            }
+        }
         unsafe {
             self.exit_instr_len = if len { vmread(VMEXIT_INSTRUCTION_LEN) as u32 } else { 0 };
             self.exit_qual = if qual { vmread(EXIT_QUALIFICATION) } else { 0 };
@@ -2082,6 +2173,14 @@ impl Guest {
                 }
                 Some(unsafe { self.enter(entries, cpu, nested, host_areas, kick) })
             });
+            /* The host's interrupt an exit acknowledged, handed to its handler
+             * now that the CPU's entries are let go of: its handler may
+             * switch tasks. */
+            if let Some(vector) = self.acked.take() {
+                /* Acknowledged at this CPU's last exit and delivered no
+                 * other way; `with` has returned, no borrow held. */
+                unsafe { deliver_host_interrupt(vector) };
+            }
             match ran {
                 Some(Some(ran)) => return ran,
                 Some(None) => continue,
@@ -2244,6 +2343,15 @@ impl Guest {
              * where its interrupts stand -- RVI and SVI, from the page the
              * run loop filled -- and which of their EOIs still exit. */
             if self.vapic.is_some() {
+                /* Posted interrupts taken in the guest while, and only
+                 * while, virtual-interrupt delivery is on -- which they
+                 * need. */
+                let pin = self.pin
+                    | if self.apicv_on && self.posted.is_some() { vmcs::PIN_POSTED_INTERRUPTS } else { 0 };
+                if pin != self.synced.pin {
+                    vmcs::vmwrite(vmcs::PIN_BASED_CTLS, pin as u64);
+                    self.synced.pin = pin;
+                }
                 let proc2 = self.proc2 | if self.apicv_on { PROC2_APICV } else { 0 };
                 if proc2 != self.synced.proc2 {
                     vmcs::vmwrite(vmcs::PROC_BASED_CTLS2, proc2 as u64);
@@ -2393,6 +2501,119 @@ impl Guest {
          * for the next entry to VMRESUME. It is evicted only on a
          * migration (the load phase above) or when the guest is dropped. */
         Ok(cpu)
+    }
+}
+
+/// What another CPU posts a guest CPU's interrupts into, for the CPU to
+/// take in the guest (VT-x's posted interrupts): PIR, a request bit a
+/// vector, and ON, a notification outstanding -- the descriptor as the SDM
+/// lays it out (Vol. 3C, 30.6), 64 bytes aligned to 64, so one physical
+/// range: the CPU reads and writes it with locked operations while the guest
+/// runs, as the posting CPUs do, and as the vCPU's own task does when it
+/// takes what was posted ([`take`](Self::take)). A plain object of atomics,
+/// its physical address what the VMCS names; whoever holds the guest CPU
+/// holds an `Arc` of it, so it outlives every entry that names it.
+#[repr(C, align(64))]
+pub struct PostedInterrupts {
+    pir: [AtomicU64; 4],
+    control: AtomicU64,
+    _rest: [AtomicU64; 3],
+}
+
+/// ON: a notification is outstanding, and the posting CPU that set it sent
+/// it or woke the vCPU.
+const PI_ON: u64 = 1 << 0;
+
+impl PostedInterrupts {
+    pub fn new() -> PostedInterrupts {
+        PostedInterrupts {
+            pir: [const { AtomicU64::new(0) }; 4],
+            control: AtomicU64::new(0),
+            _rest: [const { AtomicU64::new(0) }; 3],
+        }
+    }
+
+    /// Post `vector`: true when ON was clear, and the caller is to send the
+    /// notification (`Kick::notify`) or wake the vCPU; false when one is
+    /// outstanding already, which the vCPU takes this one with.
+    pub fn post(&self, vector: u8) -> bool {
+        self.pir[usize::from(vector / 64)].fetch_or(1 << (vector % 64), Ordering::SeqCst);
+        self.control.fetch_or(PI_ON, Ordering::SeqCst) & PI_ON == 0
+    }
+
+    /// What was posted and is not taken yet -- by an earlier look, or by the
+    /// CPU in the guest -- a bit a vector in four words; ON cleared first,
+    /// so that what is posted after is notified again. None while ON is
+    /// clear: a poster sets it after its bit.
+    pub fn take(&self) -> Option<[u64; 4]> {
+        if self.control.fetch_and(!PI_ON, Ordering::SeqCst) & PI_ON == 0 {
+            return None;
+        }
+        let mut words = [0u64; 4];
+        for (w, p) in words.iter_mut().zip(self.pir.iter()) {
+            *w = p.swap(0, Ordering::SeqCst);
+        }
+        Some(words)
+    }
+
+    /// Where the CPU finds it.
+    fn phys(&self) -> u64 {
+        kcore::dma::virt_to_phys(self as *const PostedInterrupts as *const u8)
+    }
+}
+
+impl Default for PostedInterrupts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/* The host's interrupt handlers by vector, each an `int` and a `ret`: what
+ * delivers an interrupt the CPU acknowledged at a VM exit -- and so to
+ * nothing -- through the host's IDT, as the CPU would have: the frame, the
+ * stack aligned, interrupts off in the handler and as they were after its
+ * IRET (`deliver_host_interrupt`). Four bytes each, from vector 32: CD ib,
+ * C3, and an INT3 nothing reaches. */
+const FIRST_EXTERNAL_VECTOR: u8 = 32;
+const INT_STUB_BYTES: u64 = 4;
+core::arch::global_asm!(
+    ".pushsection .text.hvarch_int_vectors, \"ax\"",
+    ".balign 16",
+    ".globl hvarch_int_vectors",
+    ".hidden hvarch_int_vectors",
+    "hvarch_int_vectors:",
+    ".set hvarch_int_n, 32",
+    ".rept 224",
+    ".byte 0xCD, hvarch_int_n",
+    "ret",
+    "int3",
+    ".set hvarch_int_n, hvarch_int_n + 1",
+    ".endr",
+    ".popsection",
+);
+
+/// Run the host's handler for `vector`, an interrupt the CPU acknowledged
+/// at a VM exit (the exit control above) and so delivered to nothing: by an
+/// `int` of it, through the host's IDT, as the CPU would have delivered it.
+///
+/// # Safety
+/// `vector` is one the CPU acknowledged for the host at this CPU's last
+/// exit, delivered no other way and only this once; and no per-CPU borrow is
+/// held -- the handler may switch tasks (`Preempt`), as an interrupt taken
+/// with interrupts on may.
+unsafe fn deliver_host_interrupt(vector: u8) {
+    /* An external interrupt has a vector above the exceptions'; an `int` of
+     * one of those would be the exception's handler with no error code. */
+    assert!(vector >= FIRST_EXTERNAL_VECTOR, "an interrupt acknowledged for the host with vector {}", vector);
+    let offset = u64::from(vector - FIRST_EXTERNAL_VECTOR) * INT_STUB_BYTES;
+    unsafe {
+        asm!(
+            "lea rcx, [rip + hvarch_int_vectors]",
+            "add rcx, rax",
+            "call rcx",
+            in("rax") offset,
+            clobber_abi("C"),
+        );
     }
 }
 

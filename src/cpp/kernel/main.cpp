@@ -554,6 +554,7 @@ void BpStartup(void* ctx)
         idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
         idt.SetDescriptor(CpuTable::TimerVector,
             IdtDescriptor::Encode(LapicTimerInterruptStub));
+        idt.SetDescriptor(Hal::PostedVector, IdtDescriptor::Encode(PostedInterruptStub));
 
         /* Install a benign handler for the LAPIC spurious-interrupt vector so a
            spurious IRQ counts a stat instead of hitting DummyInterrupt's panic. */

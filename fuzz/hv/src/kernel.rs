@@ -195,6 +195,9 @@ pub mod sync {
         pub fn wait_for(&self, d: crate::time::Duration) -> bool {
             crate::time::progressed();
             invariant!(held() == 0, "a vCPU waits with {} of the kernel's locks held", held());
+            if !self.signalled.load(Ordering::Relaxed) {
+                crate::vm::check_nothing_posted();
+            }
             if self.signalled.swap(false, Ordering::Relaxed) {
                 return true;
             }

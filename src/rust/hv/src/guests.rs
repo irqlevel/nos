@@ -756,7 +756,7 @@ fn run_several(machine: &Machine, spec: &SeveralSpec, out: &mut dyn Write) -> bo
 /// The names of the built-in guests, for a command's help.
 pub fn names() -> impl Iterator<Item = &'static str> {
     GUESTS.iter().map(|g| g.name).chain(SEVERAL.iter().map(|g| g.name))
-        .chain([SMP_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME].into_iter())
+        .chain([SMP_NAME, POSTED_NAME, IOAPIC_NAME, APICV_NAME, DEBUG_NAME, CR4_NAME, MSR_NAME, DR_NAME].into_iter())
 }
 
 /// Run the built-in guest `name` on the CPU this is called on -- and, for a
@@ -765,7 +765,10 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 /// no such guest; otherwise whether it did what it was told.
 pub fn run_one(machine: &Arc<Machine>, name: &str, out: &mut dyn Write) -> Option<bool> {
     if name == SMP_NAME {
-        return Some(run_smp(machine, out));
+        return Some(run_smp(machine, &SMP_GUEST, out));
+    }
+    if name == POSTED_NAME {
+        return Some(run_smp(machine, &POSTED_GUEST, out));
     }
     if name == IOAPIC_NAME {
         return Some(run_ioapic(machine, &IOAPIC_GUEST, out));
@@ -1067,7 +1070,7 @@ fn smp_ap(run: SmpAp) {
 /// The guests' machine for the smp guest: `board`'s tables in memory it
 /// already has -- the guest's, made with it -- the 32-bit code segment
 /// beside them, both CPUs' code, and the first CPU in long mode at `ENTRY`.
-fn smp_board(m: &GuestMemory, bsp: &mut GuestCpu) -> Result<()> {
+fn smp_board(m: &GuestMemory, bsp: &mut GuestCpu, bsp_code: &[u8], ap_code: &[u8]) -> Result<()> {
     let tss_low = TSS_LIMIT | (TSS & 0xFF_FFFF) << 16 | TSS_BUSY_PRESENT << 40 | (TSS >> 24 & 0xFF) << 56;
     let tss_high = TSS >> 32;
     for (i, entry) in [0, GDT_CODE64, GDT_DATA, tss_low, tss_high, GDT_CODE32].iter().enumerate() {
@@ -1076,8 +1079,8 @@ fn smp_board(m: &GuestMemory, bsp: &mut GuestCpu) -> Result<()> {
     m.write_obj(PML4, &(PDPT | PTE_P_W))?;
     m.write_obj(PDPT, &(PD_LOW | PTE_P_W))?;
     m.write_obj(PD_LOW, &(PTE_P_W | PTE_LARGE))?;
-    m.write(ENTRY, SMP_BSP_CODE)?;
-    m.write(SMP_AP_AT, SMP_AP_CODE)?;
+    m.write(ENTRY, bsp_code)?;
+    m.write(SMP_AP_AT, ap_code)?;
     bsp.backend_mut().long_mode(&LongMode {
         entry: ENTRY,
         stack: STACK,
@@ -1093,25 +1096,46 @@ fn smp_board(m: &GuestMemory, bsp: &mut GuestCpu) -> Result<()> {
     Ok(())
 }
 
-/// Run the smp guest: its first CPU on this task, its second on a task of
-/// its own on another CPU the extension is on for -- this one, when it is on
-/// for no other.
-fn run_smp(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
-    let _ = writeln!(out, "hv: guest {} -- {}", SMP_NAME, SMP_ABOUT);
+/// A guest of the smp guest's machine (`smp_board`): two CPUs, the first in
+/// long mode at `ENTRY` running `bsp`, the second waiting for a start-up
+/// IPI with `ap` at `SMP_AP_AT`; whether its interrupts are the CPU's to
+/// deliver where it can (`LinuxGuest::set_apicv`); and what it has to have
+/// done -- by its memory, how it stopped, what each CPU counted, the guest's
+/// posted-interrupt counts, and whether its first CPU took its interrupts
+/// posted.
+struct SmpGuest {
+    name: &'static str,
+    about: &'static str,
+    bsp: &'static [u8],
+    ap: &'static [u8],
+    apicv: bool,
+    check: fn(&GuestMemory, &Stopped, &[Counts; 2], (u64, u64), bool) -> core::result::Result<String, String>,
+}
+
+const SMP_GUEST: SmpGuest =
+    SmpGuest { name: SMP_NAME, about: SMP_ABOUT, bsp: SMP_BSP_CODE, ap: SMP_AP_CODE, apicv: false, check: check_smp };
+
+/// Run a guest of the smp guest's machine: its first CPU on this task, its
+/// second on a task of its own on another CPU the extension is on for --
+/// this one, when it is on for no other.
+fn run_smp(machine: &Arc<Machine>, spec: &SmpGuest, out: &mut dyn Write) -> bool {
+    let _ = writeln!(out, "hv: guest {} -- {}", spec.name, spec.about);
     let fail = |out: &mut dyn Write, why: &str| {
-        let _ = writeln!(out, "hv: guest {} FAILED -- {}", SMP_NAME, why);
+        let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
         false
     };
     let Some(doorbells) = Doorbells::new(2) else { return fail(out, "out of memory") };
-    let (guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true, false) {
+    let (mut guest, mut cpus) = match LinuxGuest::new(machine, MEMORY, 2, Arc::new(doorbells), true, false) {
         Ok(made) => made,
         Err(e) => return fail(out, &alloc::format!("could not be made: {}", e)),
     };
     let Some(ap) = cpus.pop() else { return fail(out, "no second CPU") };
     let Some(mut bsp) = cpus.pop() else { return fail(out, "no first CPU") };
-    if let Err(e) = smp_board(guest.memory(), &mut bsp) {
+    if let Err(e) = smp_board(guest.memory(), &mut bsp, spec.bsp, spec.ap) {
         return fail(out, &alloc::format!("could not be made: {}", e));
     }
+    guest.set_apicv(spec.apicv);
+    let posted = spec.apicv && bsp.backend_mut().posted_capable();
     let guest = Arc::new(guest);
     let Some(ap_counts) = kcore::sync::Mutex::new(Counts::default()) else { return fail(out, "out of memory") };
     let ap_counts = Arc::new(ap_counts);
@@ -1122,7 +1146,7 @@ fn run_smp(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let start = time::boot_time_ns();
     let deadline = start.saturating_add(SMP_BUDGET_MS * kcore::consts::NS_PER_MS);
     let run = SmpAp { guest: guest.clone(), cpu: ap, machine: machine.clone(), deadline, counts: ap_counts.clone() };
-    let Some(task) = kcore::task::spawn_on_with("hv/smp/cpu1", 1u64 << ap_cpu, run, smp_ap) else {
+    let Some(task) = kcore::task::spawn_on_with("hv/2cpu/cpu1", 1u64 << ap_cpu, run, smp_ap) else {
         return fail(out, "no task for its second CPU");
     };
     let bsp_counts = guest.run(&mut bsp, machine, deadline, &Quiet);
@@ -1135,7 +1159,7 @@ fn run_smp(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
 
     let states = guest.cpu_states();
     if let GuestStop::Refused(Refusal::NotOn(cpu)) = stopped.stop {
-        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", SMP_NAME, cpu);
+        let _ = writeln!(out, "hv: guest {} not run -- the extension is not on for cpu {}: hv on first", spec.name, cpu);
         return false;
     }
     let _ = write!(out, "  ran on     cpu");
@@ -1149,18 +1173,23 @@ fn run_smp(machine: &Arc<Machine>, out: &mut dyn Write) -> bool {
     let _ = writeln!(out, "  exits      cpu 0: {} ({} wrmsr, {} hlt, {} apic irq); cpu 1: {} ({} wrmsr, {} hlt)",
                      counts[0].exits, counts[0].msr_write, counts[0].hlt, counts[0].apic,
                      counts[1].exits, counts[1].msr_write, counts[1].hlt);
+    let posted_stats = guest.posted_stats();
+    if posted_stats.0 != 0 {
+        let _ = writeln!(out, "  posted     {} interrupts posted for a CPU to take in its guest, {} with a notification",
+                         posted_stats.0, posted_stats.1);
+    }
     let mut says = String::new();
     let _ = crate::guests::describe_stop(&stopped.stop, &mut says);
     let _ = writeln!(out, "  stopped    {}", says);
 
-    match check_smp(guest.memory(), &stopped, &counts) {
+    match (spec.check)(guest.memory(), &stopped, &counts, posted_stats, posted) {
         Ok(checked) => {
             let _ = writeln!(out, "  checked    {}", checked);
-            let _ = writeln!(out, "hv: guest {} ok", SMP_NAME);
+            let _ = writeln!(out, "hv: guest {} ok", spec.name);
             true
         }
         Err(why) => {
-            let _ = writeln!(out, "hv: guest {} FAILED -- {}", SMP_NAME, why);
+            let _ = writeln!(out, "hv: guest {} FAILED -- {}", spec.name, why);
             let _ = writeln!(out, "  cpu {} as it stopped:", stopped.cpu);
             let _ = out.write_str(&stopped.dump);
             false
@@ -1177,7 +1206,9 @@ fn describe_stop(stop: &GuestStop, out: &mut dyn Write) -> core::fmt::Result {
     }
 }
 
-fn check_smp(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2]) -> core::result::Result<String, String> {
+fn check_smp(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2], _posted: (u64, u64), _by_cpu: bool)
+    -> core::result::Result<String, String>
+{
     if !matches!(stopped.stop, GuestStop::Halted { .. }) {
         return Err(String::from("it did not stop with both CPUs halted"));
     }
@@ -1210,6 +1241,174 @@ fn check_smp(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2]) -> core::
     }
     Ok(String::from("cpu 1 started by INIT and a start-up IPI, came up in real mode and reached long mode, \
                      x2APIC ID 1 and CPUID's the same; its IPI reached cpu 0, whose one-shot APIC timer then ran out and interrupted it"))
+}
+
+/* ---- posted: interrupts from another CPU, taken in the guest ---- */
+
+/* The posted guest: the smp guest's machine, asking for its interrupts to
+ * be the CPU's to deliver (`LinuxGuest::set_apicv`). The first CPU starts
+ * the second, as the smp guest's does, and spins with interrupts on and no
+ * HLT, counting an IPI's handler, until it has counted `POSTED_IPIS`; the
+ * second, in long mode, sends it that many fixed IPIs, one at a time --
+ * each once the last is counted, since one of a vector already requested
+ * would be taken with it. Under VT-x with posted interrupts each IPI is
+ * posted in the first CPU's descriptor and its notification sent to the
+ * CPU it runs on, which takes it in its guest: the first CPU leaves its
+ * guest for its host's own interrupts alone, not once an IPI. Elsewhere the
+ * host hands each over -- the first CPU kicked out of its guest for it.
+ * The output of `nasm -f bin`: the first's at `ENTRY`, `bits 64`, the
+ * second's at `SMP_AP_AT`, `bits 16` to `bits 64`. */
+const POSTED_NAME: &str = "posted";
+const POSTED_ABOUT: &str = "two CPUs running: the second sends the first a thousand IPIs while it spins -- under VT-x \
+                            with posted interrupts each taken in its guest, without an exit";
+
+const POSTED_BSP_CODE: &[u8] = &[
+    0x48, 0x8D, 0x05, 0x76, 0x00, 0x00, 0x00,               // start: lea rax, [rel ipi] ; gate 0x40: the second CPU's IPI
+    0xBF, 0x00, 0x64, 0x00, 0x00,                           // mov edi, 0x6400
+    0xE8, 0x46, 0x00, 0x00, 0x00,                           // call gate
+    0x0F, 0x01, 0x1D, 0x7F, 0x00, 0x00, 0x00,               // lidt [rel idtr]
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // mov ecx, 0x830 ; ICR, to APIC ID 1
+    0xBA, 0x01, 0x00, 0x00, 0x00,                           // mov edx, 1
+    0xB8, 0x00, 0x45, 0x00, 0x00,                           // mov eax, 0x4500 ; INIT, asserted
+    0x0F, 0x30,                                             // wrmsr
+    0xB8, 0x00, 0x85, 0x00, 0x00,                           // mov eax, 0x8500 ; INIT, de-asserted
+    0x0F, 0x30,                                             // wrmsr
+    0xB8, 0x09, 0x06, 0x00, 0x00,                           // mov eax, 0x0609 ; start-up at 0x9000
+    0x0F, 0x30,                                             // wrmsr
+    0x0F, 0x30,                                             // wrmsr ; and again, as the MP protocol has it
+    0xFB,                                                   // sti ; interrupts on, and no HLT: each IPI taken where it spins
+    0x81, 0x3C, 0x25, 0x10, 0x70, 0x00, 0x00, 0xE8, 0x03, 0x00, 0x00, // .spin: cmp dword [0x7010], N
+    0x72, 0xF3,                                             // jb .spin
+    0xFA,                                                   // cli
+    0xC7, 0x04, 0x25, 0x0C, 0x70, 0x00, 0x00, 0x50, 0x53, 0x54, 0x30, // mov dword [0x700C], 0x30545350 ; 'PST0'
+    0xFA,                                                   // .dead: cli
+    0xF4,                                                   // hlt
+    0xEB, 0xFC,                                             // jmp .dead
+    0x66, 0x89, 0x07,                                       // gate: mov word [rdi], ax
+    0x66, 0xC7, 0x47, 0x02, 0x08, 0x00,                     // mov word [rdi + 2], 0x08
+    0x66, 0xC7, 0x47, 0x04, 0x00, 0x8E,                     // mov word [rdi + 4], 0x8E00
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x66, 0x89, 0x47, 0x06,                                 // mov word [rdi + 6], ax
+    0x48, 0xC1, 0xE8, 0x10,                                 // shr rax, 16
+    0x89, 0x47, 0x08,                                       // mov dword [rdi + 8], eax
+    0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,               // mov dword [rdi + 12], 0
+    0xC3,                                                   // ret
+    0xFF, 0x04, 0x25, 0x10, 0x70, 0x00, 0x00,               // ipi: inc dword [0x7010]
+    0x50,                                                   // push rax
+    0x51,                                                   // push rcx
+    0x52,                                                   // push rdx
+    0xB9, 0x0B, 0x08, 0x00, 0x00,                           // mov ecx, 0x80B
+    0x31, 0xC0,                                             // xor eax, eax
+    0x31, 0xD2,                                             // xor edx, edx
+    0x0F, 0x30,                                             // wrmsr
+    0x5A,                                                   // pop rdx
+    0x59,                                                   // pop rcx
+    0x58,                                                   // pop rax
+    0x48, 0xCF,                                             // iretq
+    0x0F, 0x04,                                             // idtr: dw 0x41 * 16 - 1 ; 0x41 gates
+    0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,         // dq 0x6000
+];
+
+const POSTED_AP_CODE: &[u8] = &[
+    0xFA,                                                   // cli
+    0x31, 0xC0,                                             // xor ax, ax
+    0x8E, 0xD8,                                             // mov ds, ax
+    0x66, 0x0F, 0x01, 0x16, 0x8F, 0x90,                     // o32 lgdt [gdtr]
+    0x0F, 0x20, 0xC0,                                       // mov eax, cr0
+    0x0C, 0x01,                                             // or al, 1 ; PE
+    0x0F, 0x22, 0xC0,                                       // mov cr0, eax
+    0x66, 0xEA, 0x1B, 0x90, 0x00, 0x00, 0x28, 0x00,         // jmp dword 0x28:ap32
+    0x66, 0xB8, 0x10, 0x00,                                 // ap32: mov ax, 0x10
+    0x8E, 0xD8,                                             // mov ds, ax
+    0x8E, 0xC0,                                             // mov es, ax
+    0x8E, 0xD0,                                             // mov ss, ax
+    0x0F, 0x20, 0xE0,                                       // mov eax, cr4
+    0x83, 0xC8, 0x20,                                       // or eax, 0x20 ; PAE
+    0x0F, 0x22, 0xE0,                                       // mov cr4, eax
+    0xB8, 0x00, 0x20, 0x00, 0x00,                           // mov eax, 0x2000 ; the first CPU's PML4
+    0x0F, 0x22, 0xD8,                                       // mov cr3, eax
+    0xB9, 0x80, 0x00, 0x00, 0xC0,                           // mov ecx, 0xc0000080 ; EFER.LME
+    0x0F, 0x32,                                             // rdmsr
+    0x0D, 0x00, 0x01, 0x00, 0x00,                           // or eax, 0x100
+    0x0F, 0x30,                                             // wrmsr
+    0x0F, 0x20, 0xC0,                                       // mov eax, cr0
+    0x0D, 0x00, 0x00, 0x00, 0x80,                           // or eax, 0x80000000 ; PG: long mode
+    0x0F, 0x22, 0xC0,                                       // mov cr0, eax
+    0xEA, 0x56, 0x90, 0x00, 0x00, 0x08, 0x00,               // jmp 0x08:ap64
+    0xBC, 0x00, 0xE0, 0x00, 0x00,                           // ap64: mov rsp, 0xe000
+    0xB9, 0x30, 0x08, 0x00, 0x00,                           // mov ecx, 0x830 ; ICR: vector 0x40, fixed, to APIC ID 0
+    0x31, 0xD2,                                             // xor edx, edx
+    0x31, 0xDB,                                             // xor ebx, ebx ; IPIs sent
+    0xB8, 0x40, 0x00, 0x00, 0x00,                           // .send: mov eax, 0x40
+    0x0F, 0x30,                                             // wrmsr
+    0xFF, 0xC3,                                             // inc ebx
+    0xF3, 0x90,                                             // .wait: pause ; until the first CPU has taken it: an IPI of the same vector pending would take the next with it
+    0x39, 0x1C, 0x25, 0x10, 0x70, 0x00, 0x00,               // cmp dword [0x7010], ebx
+    0x72, 0xF5,                                             // jb .wait
+    0x81, 0xFB, 0xE8, 0x03, 0x00, 0x00,                     // cmp ebx, N
+    0x72, 0xE4,                                             // jb .send
+    0xC7, 0x04, 0x25, 0x08, 0x71, 0x00, 0x00, 0x41, 0x50, 0x36, 0x34, // mov dword [0x7108], 0x34365041 ; 'AP64'
+    0xFA,                                                   // .dead: cli
+    0xF4,                                                   // hlt
+    0xEB, 0xFC,                                             // jmp .dead
+    0x2F, 0x00,                                             // gdtr: dw 6 * 8 - 1
+    0x00, 0x10, 0x00, 0x00,                                 // dd 0x1000
+];
+
+/* What the guest leaves at `RESULTS`: the second CPU's IPIs the first
+ * counted at +0x10, 'PST0' at +0xC once it had all, and the second's 'AP64'
+ * at +0x108 once it had sent them. */
+const POSTED_COUNT: u64 = RESULTS + 0x10;
+const POSTED_BSP_DONE: u64 = RESULTS + 0xC;
+const POSTED_AP_DONE: u64 = RESULTS + 0x108;
+const POSTED_BSP_MARK: u32 = u32::from_le_bytes(*b"PST0");
+/// The IPIs the second CPU sends.
+const POSTED_IPIS: u64 = 1000;
+/// Under posted interrupts: the most the first CPU may have left its guest
+/// while they came -- its host's own interrupts, a tenth of them at most --
+/// and the fewest of them a notification has to have been sent for.
+const POSTED_MOST_EXITS: u64 = POSTED_IPIS / 10;
+const POSTED_FEWEST_NOTIFIED: u64 = POSTED_IPIS * 9 / 10;
+
+const POSTED_GUEST: SmpGuest = SmpGuest {
+    name: POSTED_NAME,
+    about: POSTED_ABOUT,
+    bsp: POSTED_BSP_CODE,
+    ap: POSTED_AP_CODE,
+    apicv: true,
+    check: check_posted,
+};
+
+fn check_posted(m: &GuestMemory, stopped: &Stopped, counts: &[Counts; 2], posted: (u64, u64), by_cpu: bool)
+    -> core::result::Result<String, String>
+{
+    if !matches!(stopped.stop, GuestStop::Halted { .. }) {
+        return Err(String::from("it did not stop with both CPUs halted"));
+    }
+    let word = |gpa: u64| m.read_obj::<u32>(gpa).map_err(|e| alloc::format!("guest memory at {:#x}: {}", gpa, e));
+    if word(POSTED_AP_DONE)? != SMP_AP_MARK || word(POSTED_BSP_DONE)? != POSTED_BSP_MARK {
+        return Err(String::from("it never reached its end"));
+    }
+    let count = u64::from(word(POSTED_COUNT)?);
+    if count != POSTED_IPIS || counts[1].ipi_sent != POSTED_IPIS {
+        return Err(alloc::format!("the first CPU counted {} IPIs of the {} the second sent, not {}",
+                                  count, counts[1].ipi_sent, POSTED_IPIS));
+    }
+    let (n_posted, notified) = posted;
+    if !by_cpu {
+        if n_posted != 0 {
+            return Err(alloc::format!("{} interrupts posted where nothing takes them so", n_posted));
+        }
+        return Ok(alloc::format!("the first CPU took all {} of the second's IPIs while it spun, the host handing each \
+                                  over: it left its guest {} times", POSTED_IPIS, counts[0].exits));
+    }
+    if n_posted != POSTED_IPIS || notified < POSTED_FEWEST_NOTIFIED || counts[0].exits > POSTED_MOST_EXITS {
+        return Err(alloc::format!("{} IPIs posted, {} notified, the first CPU leaving its guest {} times -- not {}, \
+                                   {} or more, and {} at most", n_posted, notified, counts[0].exits, POSTED_IPIS,
+                                  POSTED_FEWEST_NOTIFIED, POSTED_MOST_EXITS));
+    }
+    Ok(alloc::format!("the first CPU took all {} of the second's IPIs while it spun, each posted and {} notified -- \
+                       taken in its guest, which it left {} times", POSTED_IPIS, notified, counts[0].exits))
 }
 
 /* The ioapic guest: the smp guest's machine with an IO-APIC, its first CPU

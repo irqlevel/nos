@@ -510,12 +510,12 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU --
                                 on cpus of them, each on a host CPU of its
                                 own -- for secs, then print its console and
                                 how it ended
-    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -858,6 +858,7 @@ mode:
 | `asid` | three VMs on one CPU read a page of their own at one address: two taking turns, and a third given an ASID one of them had | no guest reads another's page through the TLB, and a reused ASID is reused after a flush ([Address space identifiers](#address-space-identifiers)) |
 | `smp` | two CPUs, on two host CPUs: the first sends the second INIT and a start-up IPI; the second comes up in real mode at the vector's page, climbs through protected mode to long mode, writes down its x2APIC ID and CPUID's, and sends the first an IPI; the first, woken by it, arms its APIC timer for one shot and halts until it fires | an application processor started the way Linux starts one, an IPI between two CPUs, and the local APIC timer ([More than one CPU](#more-than-one-cpu)) |
 | `ioapic` | on the machine of `smp` with an IO-APIC, its first CPU alone, in xAPIC mode: reads the IO-APIC's version, then wires the serial port's pin to itself -- as an edge, the THR-empty interrupt enabled and a byte written, then one written while masked; as a level, its handler ending it without reading IIR twice, and the third time reading it | edges sent as the line rises and lost while masked; a level sent again at each EOI for as long as its line is up, its remote IRR set until then; every IO-APIC access and every EOI a decoded MMIO access ([The IO-APIC](#the-io-apic)) |
+| `posted` | on the machine of `smp`, asking for its interrupts to be the CPU's: the second CPU, started as `smp`'s is, sends the first a thousand fixed IPIs, one at a time, while the first spins with interrupts on and no HLT, counting them | where the CPU has posted interrupts each is posted and notified and taken by the first CPU in its guest, which leaves it a handful of times rather than once an IPI; elsewhere the host hands each over ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `apicv` | on the machine of `ioapic`, its first CPU's local APIC taken to x2APIC mode by the base MSR: with CR8 at 5 sends itself 0x50 and 0x30 and reads both in IRR; with CR8 at 0 takes 0x50, then 0x30, whose handler sends itself 0x70 and takes it nested, each handler reading ISR; then the serial port's pin through the IO-APIC as a level, three times, each ended by the x2APIC's EOI; and ISR read whole at the end | the same to the guest whoever delivers its interrupts: under VT-x with APIC virtualization the CPU delivers all six and takes their EOIs, stopping the guest after the three level-triggered ones for the IO-APIC; elsewhere the host injects them ([Interrupts the CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)) |
 | `debug` | one CPU, through the run loop a Linux guest's go through, with an IDT of its own: sets TF with POPFQ and single-steps a NOP, then runs an ICEBP (`int1`) | each a #DB of the guest's own -- intercepted for the delivery loops a guest could make of it -- given back to its handler, the single step's with DR6.BS -- under VT-x, which writes no DR6 at a #DB that exits, the DR6 its exit said, and every `mov` of DR6 the host's |
 | `dr` | two VMs of one CPU each, one after the other on the CPU the guests run on, through the run loop a Linux guest's go through, with an IDT of its own: each reads DR0-DR3, writes a pattern of its own into them through four registers and reads it back through a fifth, then points DR0 at a `ret` of its own -- each VM's elsewhere -- arms it in DR7 for execution and calls it, its #DB handler turning the breakpoint off | every `mov` of DR0-DR3 the host's: the second VM reads 0 where the first left its own, each reads back its pattern, and each one's breakpoint fires -- DR6.B0, at its `ret` -- which only its own DR0, made the CPU's before its entry, can do. An execution breakpoint and not a data one: QEMU 10.2's TCG never gets past a store a data breakpoint watches in a nested guest, retrying it for good with no interrupt taken, whoever's DR0-DR3 are the CPU's ([What entering a guest cannot be told to do](#what-entering-a-guest-cannot-be-told-to-do)); under VT-x, which stops a guest at every `mov` of a debug register, the same, its DR6 and DR7 the host's too |
@@ -2393,53 +2394,66 @@ guest's CPUs under VT-x has a *virtual APIC*: a page of its own
 registers (VTPR, VIRR, VISR) the CPU itself works. CR8 is VTPR, for every
 guest, and no `mov` of it exits.
 
-For a guest that asks for it -- `apicv` on `hv boot` or `hv start` -- and
-while its local APIC is in x2APIC mode and on, the run loop turns
-virtual-interrupt delivery on for each entry (`hv::vmx::Vcpu::load_apic`):
-where the APIC stands -- what it has requested and in service, and its
-task priority -- goes into the page, and the CPU, not the run loop,
-delivers the highest request the priorities let through as soon as the
-guest can take it, and performs the guest's EOIs, its writes of the task
-priority and its self-IPIs on the page, none of them an exit. At the exit
-the run loop takes the page back into the APIC before anything looks at it
-(`Lapic::from_cpu`), so the rest of the loop -- a halted CPU's wake-up, a
-read of IRR, an IPI's acceptance -- sees what the CPU did. The MSR bitmap
-lets the guest's writes of those three registers through only while this
-is on; every read of an x2APIC register still exits, since without
-APIC-register virtualization a read let through would be of the CPU's own
-APIC. An EOI of a level-triggered vector -- an IO-APIC's, which it has to
-hear of to send again while its line is up -- the CPU still stops the guest
-after (the EOI-exit bitmap, from the APIC's trigger-mode register:
-`Exit::Eoi`). In xAPIC mode, with the APIC off or software-disabled, on a
-CPU without APIC virtualization, under AMD-V (whose AVIC is not used) and
-for a guest that did not ask, the run loop injects every interrupt as
-before.
+By default where the CPU has posted interrupts too -- `hv info` says --
+and for a guest that asks for it (`apicv` on `hv boot` or `hv start`;
+`noapicv` turns it off), while the guest's local APIC is in x2APIC mode
+and on, the run loop turns virtual-interrupt delivery on for each entry
+(`hv::vmx::Vcpu::load_apic`): where the APIC stands -- what it has
+requested and in service, and its task priority -- goes into the page, and
+the CPU, not the run loop, delivers the highest request the priorities let
+through as soon as the guest can take it, and performs the guest's EOIs,
+its writes of the task priority and its self-IPIs on the page, none of
+them an exit. At the exit the run loop takes the page back into the APIC
+before anything looks at it (`Lapic::from_cpu`), so the rest of the loop --
+a halted CPU's wake-up, a read of IRR, an IPI's acceptance -- sees what the
+CPU did. The MSR bitmap lets the guest's writes of those three registers
+through only while this is on; every read of an x2APIC register still
+exits, since without APIC-register virtualization a read let through would
+be of the CPU's own APIC. An EOI of a level-triggered vector -- an
+IO-APIC's, which it has to hear of to send again while its line is up --
+the CPU still stops the guest after (the EOI-exit bitmap, from the APIC's
+trigger-mode register: `Exit::Eoi`). In xAPIC mode, with the APIC off or
+software-disabled, on a CPU without APIC virtualization, under AMD-V
+(whose AVIC is not used) and for a guest that turned it off, the run loop
+injects every interrupt as before.
 
-**Why it is asked for and not the default.** What comes from outside the
-CPU -- a timer's interrupt, another CPU's IPI, a device's MSI -- still goes
-into the APIC at an exit and into the page at the next entry, a CPU in its
-guest kicked out by its doorbell to be handed it. Posted interrupts would
-hand those over without the exit, but they need the host's own interrupts
-acknowledged at the exit -- this kernel takes them after it -- and are not
-used yet. Without them a guest of several CPUs whose device interrupts go
-to a CPU other than the first -- whose task does every device's work and
-sends the MSI -- loses: the EOI exit that interrupt took was cheap, and the
-moment the run loop found the next one's mail at; without it the CPU stays
-in its guest, and the next MSI has to kick it out, an IPI and an exit
-dearer than the EOI's exit. On the EX44, two guests of two CPUs sending
-500 MB of TCP to each other through the switch, 13 runs each way: the
-guests exited 25-50% less with it every time, but took 5.88 s on average
-with it (4.3-6.8 s) and 5.70 s without (5.5-5.8 s) -- 4.3 s when the
-sending guest took its NIC's interrupts on its first CPU, where the MSI is
-its own task's and needs no kick, and 5.9-6.8 s when it took them on its
-second, where the host-interrupt exits the kicks are rose from 132,000 to
-179,000.
+**Posted interrupts.** What comes from outside the CPU -- another CPU's
+IPI, a device's MSI -- each guest CPU takes posted: its fixed, edge-triggered
+interrupts go into a descriptor of its own (`hvarch::x86::vmx::PostedInterrupts`,
+64 bytes the VMCS names), and if it is in its guest, or on its way in, the
+sender sends the CPU it runs on the notification vector, 0xFC
+(`kcore::cpu::notify`, `Kick::notify`): the CPU takes what was posted into
+VIRR there and delivers it, no exit. A CPU out of its guest is rung as
+before, and folds what was posted into its APIC before it next looks at it
+(`take_posted`); one that left its guest just then takes the notification
+as a host interrupt that only ends itself. Level-triggered interrupts, NMIs,
+INITs and start-up IPIs still go through the mailbox and a kick. Posted
+interrupts need every external interrupt's exit to acknowledge the
+interrupt -- the host's, delivered to nothing yet -- so `hvarch` hands each
+to the host by hand, by an `int` of its vector through the host's own IDT,
+once the CPU's entries are let go of, since its handler may switch tasks
+(`deliver_host_interrupt`).
+
+**Why the default waits for posted interrupts.** Without them an interrupt
+for a CPU in its guest has to kick it out to be handed over, and with no
+EOI exit for the run loop to find the next one's mail at, more of them do:
+a kick, an IPI and an exit, is dearer than the EOI's exit it replaced. On
+the EX44, two guests of two CPUs sending 500 MB of TCP to each other through
+the switch, 13 runs each way: without posted interrupts the guests exited
+25-50% less but took 5.88 s on average (4.3-6.8 s) against 5.70 s (5.5-5.8
+s) -- 4.3 s when the sending guest took its NIC's interrupts on its first
+CPU, whose task does the devices' work and posts the MSI to itself, and
+5.9-6.8 s when it took them on its second, its host-interrupt exits going
+from 132,000 to 179,000. With posted interrupts, 10 runs each way, taken
+in turns: 3.7-5.9 s (4.85 on average) against 5.6-5.8 s (5.72), faster in
+9 of the 10, the two guests exiting 0.67-1.58 million times against 2.3-2.6
+million.
 
 Halt polling, a halted CPU watching for an interrupt a while before its
-task sleeps, is the larger lever on that load: watching its mailbox for a
-fixed 200 us at each wait took the same transfer from 5.7 s to 3.9 s, with
-virtual-interrupt delivery or without. A watch that adapted -- grown while
-waits end soon, shrunk while they do not, KVM's way, per halt or per wait,
+task sleeps, is another lever on that load: watching its mailbox for a
+fixed 200 us at each wait took the transfer from 5.7 s to 3.9 s, without
+posted interrupts, either way. A watch that adapted -- grown while waits
+end soon, shrunk while they do not, KVM's way, per halt or per wait,
 watching the doorbell too or the mailbox alone -- came to 5-7 s, slower
 than no watch at all, and why -- the core's clock under HWP, a guest's two
 CPUs being one core's two threads -- is not measured yet; none is in the
@@ -2447,12 +2461,17 @@ tree.
 
 The `apicv` built-in guest asks for it, and holds both ways to one result:
 self-IPIs held by CR8 and taken by priority, one nested, IRR and ISR read
-back, and three levels from the IO-APIC ended by the x2APIC's EOI; and the
-hv fuzzer's `platform` target, which asks for it on most VT-x machines it
-makes up, models the CPU's side -- delivery by priority, the EOI, task
-priority and self-IPI writes it performs, the EOI exit -- and holds the run
-loop to losing nothing the CPU left in the page between an exit and the
-next entry.
+back, and three levels from the IO-APIC ended by the x2APIC's EOI. The
+`posted` guest's second CPU sends its first a thousand IPIs while it spins:
+taken in its guest, each notified, where the CPU has posted interrupts --
+on the EX44 the first CPU left its guest 9 times -- and handed over by the
+host elsewhere. The hv fuzzer's `platform` target models the CPU's side --
+delivery by priority, the EOI, task priority and self-IPI writes it
+performs, the EOI exit, a posted interrupt taken in the guest and the
+notification's exit where it is not -- and holds the run loop to losing
+nothing the CPU left in the page between an exit and the next entry, to
+taking what was posted before every entry and to never waiting with it
+untaken.
 
 ### Time
 
@@ -3571,14 +3590,12 @@ someone else's; then speed.
    (`jiffies result ok`).
    Left: AMD-V sets the pause filter's count and leaves its threshold
    unused.
-6. **The larger ones.** APICv's EOIs, task priority and self-IPIs are
-   there under VT-x, in x2APIC mode, for a guest that asks ([Interrupts the
-   CPU delivers itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
-   the default once posted interrupts hand another CPU's interrupts over
-   without a kick -- which needs the host's interrupts acknowledged at the
-   exit and dispatched by `hvarch` -- and halt polling, measured above and
-   not yet understood; the xAPIC page's virtualization, and AMD's AVIC;
-   device work off the first CPU's task, with a lock a device and the
+6. **The larger ones.** ~~APICv and posted interrupts~~ done under VT-x, in
+   x2APIC mode ([Interrupts the CPU delivers
+   itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
+   left: halt polling, measured there and not yet understood; the xAPIC
+   page's virtualization, and AMD's AVIC; device work off the first CPU's
+   task, with a lock a device and the
    ring pages mapped once rather than at every access; nested leaves of 2
    MiB and 1 GiB, over guest memory taken in runs that size; the VMX
    preemption timer, a host one-shot and halt polling for the guests'

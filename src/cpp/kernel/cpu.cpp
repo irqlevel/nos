@@ -631,6 +631,16 @@ extern "C" void IPInterrupt(Context* ctx)
     cpu.IPI(ctx);
 }
 
+/* A posted interrupt's notification that found its vCPU out of its guest
+   (Hal::PostedVector): the vCPU folds what was posted for it into its APIC
+   before it next enters, so there is nothing to do but end the interrupt. */
+extern "C" void PostedInterrupt(Context* ctx)
+{
+    (void)ctx;
+    InterruptStats::Inc(IrqPosted);
+    Hal::IrqEoi(Hal::PostedVector);
+}
+
 extern "C" void LapicTimerInterrupt(Context* ctx)
 {
     InterruptStats::Inc(IrqLapicTimer);
