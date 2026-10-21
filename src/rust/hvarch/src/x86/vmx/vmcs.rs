@@ -23,6 +23,9 @@ use crate::{Error, Result};
 
 /* 16-bit control. */
 pub const VPID: u32 = 0x0000;
+/// The vector whose interrupt, arriving in the guest, is the notification
+/// of interrupts posted for it: taken by the CPU without an exit.
+pub const POSTED_INTR_NV: u32 = 0x0002;
 
 /* 16-bit guest state. */
 pub const GUEST_ES_SEL: u32 = 0x0800;
@@ -58,6 +61,8 @@ pub const TSC_OFFSET: u32 = 0x2010;
 /// The page that holds the guest's virtual APIC under the TPR shadow:
 /// VTPR, and with virtual-interrupt delivery its VIRR and VISR too.
 pub const VIRTUAL_APIC_PAGE_ADDR: u32 = 0x2012;
+/// The posted-interrupt descriptor: 64 bytes, aligned to 64.
+pub const POSTED_INTR_DESC_ADDR: u32 = 0x2016;
 pub const EPT_POINTER: u32 = 0x201A;
 /// Four 64-bit words, a bit a vector: an EOI the CPU virtualizes of a vector
 /// set here exits after it (`reason::EOI_INDUCED`).
@@ -205,6 +210,10 @@ pub const PIN_NMI_EXITING: u32 = 1 << 3;
 /// The guest's NMI blocking is its own, and IRET in the guest ends it: what
 /// an NMI injected into a guest needs, and what the NMI-window exit needs.
 pub const PIN_VIRTUAL_NMIS: u32 = 1 << 5;
+/// An interrupt of the notification vector arriving in the guest has the
+/// CPU take what is posted in the descriptor into VIRR, without an exit --
+/// with virtual-interrupt delivery and the exit below, which it needs.
+pub const PIN_POSTED_INTERRUPTS: u32 = 1 << 7;
 
 /* Primary processor-based controls. */
 pub const PROC_INTR_WINDOW_EXITING: u32 = 1 << 2;
@@ -261,6 +270,10 @@ pub const PROC2_VIRTUAL_INTR_DELIVERY: u32 = 1 << 9;
 /// left at 0x400 by the exit itself.
 pub const EXIT_SAVE_DEBUG: u32 = 1 << 2;
 pub const EXIT_HOST_ADDR_SPACE_SIZE: u32 = 1 << 9;
+/// An external interrupt's exit acknowledges it with the local APIC, its
+/// vector in the exit's interruption information: the host's to run the
+/// handler of, the CPU having delivered it to nothing.
+pub const EXIT_ACK_INTR_ON_EXIT: u32 = 1 << 15;
 pub const EXIT_SAVE_IA32_PAT: u32 = 1 << 18;
 pub const EXIT_LOAD_IA32_PAT: u32 = 1 << 19;
 pub const EXIT_SAVE_IA32_EFER: u32 = 1 << 20;

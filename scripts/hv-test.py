@@ -141,6 +141,9 @@ GUESTS = {
               r"handler, ISR showing each in service; three levels from the IO-APIC, sent again at each EOI while "
               r"the line stayed up; nothing left in service -- the host injected all six",
               r"the IO-APIC sent 3, 3 of them levels, 3 ended by EOI"],
+    # Who hands the second CPU's IPIs over -- the host here -- is said after
+    # the colon; that the first took them all is what has to be the same.
+    "posted": [r"the first CPU took all 1000 of the second's IPIs while it spun, the host handing each over"],
     "debug": [r"both #DBs its own handler's: the single step's with DR6\.BS, after the NOP; the ICEBP's with no bit",
               r"2 exceptions given back"],
     # Its reads are stopped and answered by the host -- 11 accesses
@@ -333,20 +336,32 @@ GUESTS_APICV = {
 }
 
 
-def check_all_guests(text, cpu, backend, apicv):
+# And with posted interrupts too (`hv info`): another CPU's IPIs taken by the
+# first in its guest, each notified, the first leaving its guest a handful of
+# times rather than once an IPI.
+GUESTS_POSTED = {
+    "posted": [r"the first CPU took all 1000 of the second's IPIs while it spun, each posted and \d+ notified -- "
+               r"taken in its guest, which it left \d+ times",
+               r"posted\s+1000 interrupts posted for a CPU to take in its guest"],
+}
+
+
+def check_all_guests(text, cpu, backend, apicv, posted):
     """`hv run all <cpu>`: every guest ran there and did what it was told."""
     guests = dict(GUESTS)
     if backend == "vmx":
         guests.update(GUESTS_VMX)
     if apicv:
         guests.update(GUESTS_APICV)
+    if posted:
+        guests.update(GUESTS_POSTED)
     m = re.search(r"^hv: (\d+) of (\d+) guests ok$", text, re.M)
     pt.check("every built-in guest does what it was told on cpu %d" % cpu,
              m is not None and m.group(1) == m.group(2) and int(m.group(2)) >= len(guests), text)
     for name, patterns in guests.items():
         report = guest_report(text, name)
         good = ("hv: guest %s ok" % name) in report and all(re.search(p, report) for p in patterns)
-        if name == "smp":
+        if name in ("smp", "posted"):
             # Its first CPU there, its second on another CPU of its own.
             good = good and re.search(r"ran on\s+cpu %d and (?!%d,)\d+," % (cpu, cpu), report) is not None
         elif name != "refused":
@@ -391,9 +406,10 @@ def x86_checks(ran):
              "on for cpu %s of %s" % (ALL_CPUS, ALL_CPUS) in out[11], out[11])
 
     apicv = re.search(r"APIC virtualization\s+yes", info) is not None
-    print("APIC virtualization: %s" % ("yes" if apicv else "no"))
-    check_all_guests(out[12], 0, backend, apicv)
-    check_all_guests(out[13], CPUS - 1, backend, apicv)
+    posted = re.search(r"posted interrupts\s+yes", info) is not None
+    print("APIC virtualization: %s, posted interrupts: %s" % ("yes" if apicv else "no", "yes" if posted else "no"))
+    check_all_guests(out[12], 0, backend, apicv, posted)
+    check_all_guests(out[13], CPUS - 1, backend, apicv, posted)
     pt.check("no guest failed", "FAILED" not in out[12] + out[13], out[12] + out[13])
 
     # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after

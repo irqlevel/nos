@@ -569,6 +569,25 @@ void kernel_cpu_kick(unsigned int cpu)
     Hal::SendIpi(cpu, Kernel::CpuTable::IPIVector);
 }
 
+/* The notification of an interrupt posted for the vCPU running on `cpu`
+   (Hal::PostedVector): the CPU takes it in the guest without an exit, and
+   out of one it is an interrupt that only ends itself. Sent as the kick is,
+   from any context. */
+void kernel_cpu_notify(unsigned int cpu)
+{
+    if (cpu >= (unsigned int)Kernel::MaxCpus)
+        return;
+
+    Hal::SendIpi(cpu, Hal::PostedVector);
+}
+
+/* The vector kernel_cpu_notify sends: what a VMCS names as its
+   posted-interrupt notification vector. */
+unsigned char kernel_posted_interrupt_vector(void)
+{
+    return Hal::PostedVector;
+}
+
 void* kernel_alloc_dma_pages(unsigned long count,
     unsigned long* phys_out, unsigned long* actual_pages_out)
 {
