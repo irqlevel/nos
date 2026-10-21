@@ -67,7 +67,6 @@ pub(super) const MSR_SPEC_CTRL: u32 = 0x48;
 const SPEC_CTRL_IBRS: u64 = 1 << 0;
 /// BHI_DIS_S: branch history not used for predictions at CPL 0.
 const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
-const MSR_ARCH_CAPABILITIES: u32 = 0x10A;
 const MSR_FLUSH_CMD: u32 = 0x10B;
 const FLUSH_CMD_L1D: u64 = 1 << 0;
 /// CPUID 0x8000_0008 EBX: IBPB, through PRED_CMD -- AMD's.
@@ -89,8 +88,6 @@ const EDX_MD_CLEAR: u32 = 1 << 10;
 const EDX_IBRS_IBPB: u32 = 1 << 26;
 /// IA32_FLUSH_CMD's L1D flush.
 const EDX_L1D_FLUSH: u32 = 1 << 28;
-/// IA32_ARCH_CAPABILITIES.
-const EDX_ARCH_CAPABILITIES: u32 = 1 << 29;
 const SUBLEAF_BHI: u32 = 2;
 /// Subleaf 2 EDX: BHI_DIS_S in IA32_SPEC_CTRL.
 const EDX_BHI_CTRL: u32 = 1 << 4;
@@ -197,12 +194,7 @@ fn intel_decide() -> (Intel, Option<(u64, u64)>) {
     let Some(features) = cpu::cpuid_count(LEAF_STRUCTURED, 0) else {
         return (Intel::default(), None);
     };
-    let caps = if features.edx & EDX_ARCH_CAPABILITIES != 0 {
-        /* The MSR is there where CPUID says it is. */
-        unsafe { cpu::rdmsr(MSR_ARCH_CAPABILITIES) }
-    } else {
-        0
-    };
+    let caps = cpu::arch_capabilities().unwrap_or(0);
     let bhi_ctrl = features.eax >= SUBLEAF_BHI
         && cpu::cpuid_count(LEAF_STRUCTURED, SUBLEAF_BHI).is_some_and(|r| r.edx & EDX_BHI_CTRL != 0);
     let enhanced = caps & CAP_IBRS_ALL != 0;
@@ -379,7 +371,9 @@ pub fn report() -> Report {
     Report {
         switches: SWITCHES.load(Ordering::Relaxed),
         barriers: BARRIERS.load(Ordering::Relaxed),
-        ibpb: IBPB.load(Ordering::Relaxed),
+        /* CPUID's answer, not the flag `on` keeps for the entries: before
+         * any CPU has the extension on, that says no for a CPU that has it */
+        ibpb: has_ibpb(),
         auto_ibrs: auto,
         intel: ENTRIES.with(|e, _| e.spec.intel).unwrap_or_default(),
     }

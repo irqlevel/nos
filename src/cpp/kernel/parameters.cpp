@@ -21,10 +21,13 @@ static const ulong NetconsoleTailKbMax = 1024;
 Parameters::Parameters()
     : TraceVga(false)
     , PanicVga(false)
+    , PanicResetSecs(0)
     , SmpOff(false)
     , MaxCpusLimit(0)
     , ItsEnabled(true)  /* PCIe MSI via GICv3 ITS is on by default; its=off to disable */
     , HwRngOff(false)
+    , HwpOff(false)
+    , UcodeOff(false)
     , WxProbeMd(WxProbeOff)
     , UsbOff(false)
     , RcOff(false)
@@ -62,6 +65,11 @@ bool Parameters::IsPanicVga()
     return PanicVga;
 }
 
+ulong Parameters::GetPanicResetSecs()
+{
+    return PanicResetSecs;
+}
+
 bool Parameters::IsSmpOff()
 {
     return SmpOff;
@@ -75,6 +83,16 @@ ulong Parameters::GetMaxCpus()
 bool Parameters::IsHwRngOff()
 {
     return HwRngOff;
+}
+
+bool Parameters::IsHwpOff()
+{
+    return HwpOff;
+}
+
+bool Parameters::IsUcodeOff()
+{
+    return UcodeOff;
 }
 
 bool Parameters::IsItsEnabled()
@@ -316,9 +334,14 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     }
     else if (Stdlib::StrCmp(key, "panic") == 0)
     {
+        ulong secs = 0;
         if (Stdlib::StrCmp(value, "vga") == 0)
         {
             PanicVga = true;
+        }
+        else if (Stdlib::ParseUlong(value, secs) && secs <= PanicResetSecsMax)
+        {
+            PanicResetSecs = secs;
         }
         else
         {
@@ -340,6 +363,14 @@ bool Parameters::ParseParameter(const char *cmdline, size_t start, size_t end)
     else if (Stdlib::StrCmp(key, "hwrng") == 0)
     {
         HwRngOff = (Stdlib::StrCmp(value, "off") == 0);
+    }
+    else if (Stdlib::StrCmp(key, "hwp") == 0)
+    {
+        HwpOff = (Stdlib::StrCmp(value, "off") == 0);
+    }
+    else if (Stdlib::StrCmp(key, "ucode") == 0)
+    {
+        UcodeOff = (Stdlib::StrCmp(value, "off") == 0);
     }
     else if (Stdlib::StrCmp(key, "wxprobe") == 0)
     {
