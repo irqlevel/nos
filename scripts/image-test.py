@@ -9,11 +9,14 @@ runs it, finds that partition by its UUID, takes its menu entries from the
 image there and boots nos once. nos mounts the partition as its root by the
 UUID, runs the image's /etc/rc, whose sshd makes a host key and lets in the
 key nos-install was given; and no UDP shell answers, since none was asked
-for. The boot after that is the machine's own entry again: GRUB cleared the
-flag. Then nos-install update over what nos has written: the kernel and its
-modules replaced and the old ones kept for a rollback, /etc and the host key
-kept, and the kernel parameters it is given -- the UDP shell -- taken; and
-status, rollback and uninstall.
+for. The machine's microcode -- a made-up Intel CPU's, from a made-up
+/proc/cpuinfo and firmware directory -- goes onto the partition, GRUB hands
+it to the kernel as the module `ucode`, and the kernel finds it and says why
+it loads nothing under QEMU. The boot after that is the machine's own entry
+again: GRUB cleared the flag. Then nos-install update over what nos has
+written: the kernel and its modules replaced and the old ones kept for a
+rollback, /etc and the host key kept, and the kernel parameters it is given
+-- the UDP shell -- taken; and status, rollback and uninstall.
 
 The disk: an MBR with a "host" partition holding GRUB as a server's /boot
 would -- its default entry stands in for the machine's own OS and says so on
@@ -115,7 +118,8 @@ unmount_last() {
 }
 # nos-install as a server runs it: from the image, mounted
 nos_install() {
-    NOS_GRUB_D="$T/grub.d" NOS_UPDATE_GRUB=true NOS_ALLOW_ANY_DISK=1 "$T/img/nos-install" "$@"
+    NOS_GRUB_D="$T/grub.d" NOS_UPDATE_GRUB=true NOS_ALLOW_ANY_DISK=1 \
+        NOS_CPUINFO="$T/cpuinfo" NOS_UCODE_DIR="$T/intel-ucode" "$T/img/nos-install" "$@"
 }
 mount_at "$IMAGE" img loop,ro
 cp img/VERSION img-version.out
@@ -344,6 +348,23 @@ class Machine:
             sock.close()
 
 
+# A made-up machine for its microcode: the EX44's CPU, an i5-13500, as
+# /proc/cpuinfo names it, and a file of one update for it, as Intel lays one
+# out -- the original format, every checksum right -- of a revision of its own
+FAKE_CPUINFO = ("processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 191\n"
+                "model name\t: 13th Gen Intel(R) Core(TM) i5-13500\nstepping\t: 2\n\nprocessor\t: 1\n")
+FAKE_UCODE_NAME = "06-bf-02"
+FAKE_UCODE_REVISION = 0x7777
+
+
+def fake_ucode():
+    def header(checksum):
+        return struct.pack("<12I", 1, FAKE_UCODE_REVISION, 0x10212026, 0xB06F2, checksum, 1, 0x07, 0, 0, 0, 0, 0)
+    data = bytes(2000)
+    words = struct.unpack("<%dI" % ((48 + len(data)) // 4), header(0) + data)
+    return header((-sum(words)) & 0xFFFFFFFF) + data
+
+
 def expected_version(text):
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     return "nos %s (%s)" % (fields.get("version", "?"), fields.get("revision", "?"))
@@ -355,9 +376,17 @@ def run(tmp, image):
     key = os.path.join(tmp, "id_test")
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "image-test", "-f", key], check=True)
 
+    with open(os.path.join(tmp, "cpuinfo"), "w") as f:
+        f.write(FAKE_CPUINFO)
+    os.makedirs(os.path.join(tmp, "intel-ucode"))
+    with open(os.path.join(tmp, "intel-ucode", FAKE_UCODE_NAME), "wb") as f:
+        f.write(fake_ucode())
+
     ok, out = linux.run("nos-install install", PREPARE)
     if not check("nos-install install", ok):
         return linux
+    check("install puts the machine's microcode beside the kernel",
+          "intel-ucode/%s, revision 0x%x" % (FAKE_UCODE_NAME, FAKE_UCODE_REVISION) in out, out)
     want = expected_version(linux.read("img-version.out"))
     check("install says it puts no key nowhere: it was given one", "no --ssh-key" not in out, out)
     snippet = linux.read("grub.cfg.made")
@@ -370,6 +399,9 @@ def run(tmp, image):
         check("GRUB boots nos once, from the image's entry", m.wait_log("Loading nos...", 180), m.text()[-2000:])
         check("nos boots", m.wait_log("boot: complete", BOOT_TIMEOUT), m.text()[-3000:])
         text = m.text()
+        check("GRUB hands the kernel the microcode as the module ucode, and the kernel says it loads none under "
+              "QEMU", "Module ucode 0x" in text and "microcode: not loaded:" in text,
+              [line for line in text.splitlines() if "ucode" in line or "microcode" in line][:6])
         check("its root is the partition, by UUID, read-write",
               "MountRootFs: mounted ext2 on /" in text and "(rw)" in text, text[-3000:])
         version = m.wait_ssh(300)

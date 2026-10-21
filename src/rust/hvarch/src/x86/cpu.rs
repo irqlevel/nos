@@ -85,6 +85,20 @@ pub fn fast_strings() -> bool {
     misc & MISC_ENABLE_FAST_STRING != 0
 }
 
+/// IA32_ARCH_CAPABILITIES: what the CPU says it is not open to, and what it
+/// has -- where its CPUID offers the MSR (leaf 7, EDX bit 29), and None
+/// where it does not.
+pub fn arch_capabilities() -> Option<u64> {
+    const LEAF_STRUCTURED: u32 = 7;
+    const EDX_ARCH_CAPABILITIES: u32 = 1 << 29;
+    const MSR_ARCH_CAPABILITIES: u32 = 0x10A;
+    if cpuid_count(LEAF_STRUCTURED, 0)?.edx & EDX_ARCH_CAPABILITIES == 0 {
+        return None;
+    }
+    // SAFETY: the MSR is there where CPUID offers it.
+    Some(unsafe { rdmsr(MSR_ARCH_CAPABILITIES) })
+}
+
 /// # Safety
 /// The CPU has this MSR. Reading one it does not have is a #GP, and this
 /// kernel's #GP handler panics -- so every caller here reads the CPUID bit

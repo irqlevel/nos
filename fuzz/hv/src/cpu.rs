@@ -117,6 +117,16 @@ pub mod x86 {
             host_is_intel() && host() & 2 != 0
         }
 
+        /// The host's IA32_ARCH_CAPABILITIES, where its CPUID offers it (leaf
+        /// 7, EDX bit 29): every bit made up with the rest of the host.
+        pub fn arch_capabilities() -> Option<u64> {
+            const EDX_ARCH_CAPABILITIES: u32 = 1 << 29;
+            if cpuid_count(7, 0)?.edx & EDX_ARCH_CAPABILITIES == 0 {
+                return None;
+            }
+            Some(host().rotate_left(29) ^ 0x5851_F42D_4C95_7F2D)
+        }
+
         /// The host's TSC: a count that goes up with every read.
         pub fn rdtsc() -> u64 {
             static TSC: AtomicU64 = AtomicU64::new(0);
@@ -236,6 +246,7 @@ pub mod svm {
         Cr0Write { value: u64 },
         Cr4 { write: bool, gpr: Option<u8> },
         Dr { write: bool, dr: u8, gpr: Option<u8> },
+        Eoi { vector: u8 },
         Pause,
         Undefined,
         Other(u64),
@@ -345,6 +356,31 @@ pub mod vm {
         cr4: u64,
         /// The guest's DR0-DR3, as svm.rs keeps them apart from the CPU's.
         debug_addrs: [u64; 4],
+        /// VT-x's virtual APIC, as the machine is said to have one: CR8 its
+        /// VTPR, never an exit, and while the run loop has virtual-interrupt
+        /// delivery on (`apicv`), this model is the CPU that delivers VIRR's
+        /// interrupts, performs the guest's EOIs, TPR writes and self-IPIs,
+        /// and stops it after an EOI the EOI-exit bitmap names.
+        pub vapic: bool,
+        apicv: bool,
+        virr: [u32; 8],
+        visr: [u32; 8],
+        vtpr: u8,
+        eoi_exit: [u64; 4],
+        /// Entered with virtual-interrupt delivery on, and what the CPU did
+        /// not yet taken back (`take_apic`); and what was, for the next
+        /// load to keep -- every request and service the CPU left, but
+        /// across an INIT.
+        apicv_entered: bool,
+        stored: Option<([u32; 8], [u32; 8])>,
+    }
+
+    /// What the modelled virtual APIC did, for `HV_FUZZ_STATS`.
+    pub static APICV: Mutex<std::collections::BTreeMap<&'static str, u64>> =
+        Mutex::new(std::collections::BTreeMap::new());
+
+    fn apicv_did(what: &'static str) {
+        *APICV.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_insert(0) += 1;
     }
 
     impl Default for Backend {
@@ -370,6 +406,14 @@ pub mod vm {
                 exit_len: 0,
                 cr4: 0,
                 debug_addrs: [0; 4],
+                vapic: false,
+                apicv: false,
+                virr: [0; 8],
+                visr: [0; 8],
+                vtpr: 0,
+                eoi_exit: [0; 4],
+                apicv_entered: false,
+                stored: None,
             }
         }
 
@@ -570,13 +614,116 @@ pub mod vm {
             self.nmi_window = false;
             self.nmi_masked = false;
             self.cr8 = 0;
+            self.vtpr = 0;
+            /* What the CPU left is the APIC's no more: INIT resets it. */
+            self.stored = None;
+            self.apicv_entered = false;
         }
         pub fn cr8(&self) -> u8 {
-            self.cr8
+            if self.vapic { self.vtpr >> 4 } else { self.cr8 }
         }
         pub fn set_cr8(&mut self, value: u8) {
             invariant!(value < 16, "CR8 set to {:#x}", value);
-            self.cr8 = value;
+            if self.vapic {
+                self.vtpr = value << 4;
+            } else {
+                self.cr8 = value;
+            }
+        }
+
+        /* VT-x's virtual APIC, as vmx.rs's `Vcpu` hands it over and the CPU
+         * works it (Intel SDM vol. 3C, 30.1-30.5). */
+        pub fn has_vapic(&self) -> bool {
+            self.vapic
+        }
+        pub fn load_apic(&mut self, v: &crate::lapic::Vectors) {
+            invariant!(self.vapic, "virtual-interrupt delivery asked of a CPU with no virtual APIC");
+            invariant!(!self.apicv_entered,
+                       "an entry with virtual-interrupt delivery on whose interrupts were never taken back");
+            if let Some((irr, isr)) = self.stored.take() {
+                apicv_did("entries held to what the CPU left at the exit before");
+                for w in 0..8 {
+                    invariant!(irr[w] & !(v.irr[w] | v.isr[w]) & if w == 0 { !0xFFFF } else { !0 } == 0,
+                               "vectors {:#x} of word {} the CPU left requested are neither requested nor in service at the next entry",
+                               irr[w] & !(v.irr[w] | v.isr[w]), w);
+                    invariant!(isr[w] & !v.isr[w] & if w == 0 { !0xFFFF } else { !0 } == 0,
+                               "vectors {:#x} of word {} the CPU left in service are not at the next entry",
+                               isr[w] & !v.isr[w], w);
+                }
+            }
+            self.virr = v.irr;
+            self.visr = v.isr;
+            self.vtpr = v.tpr;
+            self.eoi_exit = v.eoi_exit();
+            self.apicv = true;
+        }
+        pub fn apicv_off(&mut self) {
+            invariant!(!self.apicv_entered,
+                       "an entry with virtual-interrupt delivery on whose interrupts were never taken back");
+            self.apicv = false;
+            self.stored = None;
+        }
+        pub fn take_apic(&mut self) -> ([u32; 8], [u32; 8], u8) {
+            self.apicv_entered = false;
+            self.stored = Some((self.virr, self.visr));
+            (self.virr, self.visr, self.vtpr)
+        }
+        /// The guest's CPU entered: an entry that hands back what the CPU did.
+        pub fn entered(&mut self) {
+            if self.apicv {
+                self.apicv_entered = true;
+            }
+        }
+        /// Whether the guest's writes of x2APIC register `msr` are the CPU's
+        /// to perform: TPR, EOI and SELF_IPI, under virtual-interrupt
+        /// delivery.
+        pub fn virtualizes(&self, msr: u32) -> bool {
+            self.apicv && matches!(msr, 0x808 | 0x80B | 0x83F)
+        }
+        /// The guest's write of `value` to `msr`, which the CPU performs
+        /// (`virtualizes`): nothing for one it faults -- a #GP the guest
+        /// takes itself -- and an EOI-induced exit for an EOI of a vector the
+        /// bitmap names.
+        pub fn virtual_wrmsr(&mut self, msr: u32, value: u64) -> Option<Exit> {
+            match msr {
+                0x808 if value >> 8 == 0 => {
+                    apicv_did("TPR writes performed");
+                    self.vtpr = value as u8;
+                }
+                0x80B if value == 0 => {
+                    let vector = highest8(&self.visr)?;
+                    self.visr[usize::from(vector / 32)] &= !(1 << (vector % 32));
+                    if self.eoi_exit[usize::from(vector / 64)] & (1 << (vector % 64)) != 0 {
+                        apicv_did("EOIs performed and exited after, level-triggered");
+                        return Some(Exit::Eoi { vector });
+                    }
+                    apicv_did("EOIs performed");
+                }
+                0x83F if value >> 8 == 0 => {
+                    apicv_did("self-IPIs performed");
+                    self.virr[usize::from(value as u8 / 32)] |= 1 << (value as u8 % 32);
+                }
+                _ => apicv_did("writes faulted"),
+            }
+            None
+        }
+        /// A `mov` to CR8 the CPU performed, under the TPR shadow.
+        pub fn virtual_cr8(&mut self, value: u8) {
+            apicv_did("CR8 writes performed");
+            self.vtpr = (value & 0xF) << 4;
+        }
+        /// What virtual-interrupt delivery hands the guest now, if anything:
+        /// the highest vector requested, when its class is above the
+        /// processor priority's, the guest takes interrupts and no
+        /// interrupt window is asked for -- whose exit comes first.
+        fn virtual_pending(&self) -> Option<u8> {
+            if !self.apicv || self.irq_window || self.save.rflags & RFLAGS_IF == 0 || self.shadow || self.event.is_some() {
+                return None;
+            }
+            let rvi = highest8(&self.virr)?;
+            let svi = highest8(&self.visr).unwrap_or(0);
+            let ppr = if self.vtpr >> 4 >= svi >> 4 { self.vtpr } else { svi & 0xF0 };
+            (rvi >> 4 > ppr >> 4).then_some(rvi)
         }
         pub fn cr0_write(&mut self, value: u64) {
             self.save.cr0 = value;
@@ -637,7 +784,8 @@ pub mod vm {
         }
 
         /// The guest entered: what was queued for it, taken -- the one way
-        /// an event leaves the queue, but for INIT's reset.
+        /// an event leaves the queue, but for INIT's reset -- or, with none,
+        /// what virtual-interrupt delivery hands it.
         pub fn take_event(&mut self) {
             if let Some(e) = self.event.take() {
                 self.taken.push(e);
@@ -645,8 +793,18 @@ pub mod vm {
                 if e == Event::Nmi {
                     self.nmi_window = false;
                 }
+            } else if let Some(vector) = self.virtual_pending() {
+                self.virr[usize::from(vector / 32)] &= !(1 << (vector % 32));
+                self.visr[usize::from(vector / 32)] |= 1 << (vector % 32);
+                self.taken.push(Event::Interrupt(vector));
+                apicv_did("interrupts delivered");
             }
         }
+    }
+
+    /// The highest vector set in eight words of a bit each.
+    fn highest8(words: &[u32; 8]) -> Option<u8> {
+        (0..8).rev().find(|&w| words[w] != 0).map(|w| (w as u32 * 32 + 31 - words[w].leading_zeros()) as u8)
     }
 
     /// What a guest does at an entry of one of its CPUs.
@@ -885,6 +1043,7 @@ pub mod vm {
             let me = VCPU.with(|v| v.get());
             invariant!(crate::sync::held() == 0, "CPU {} enters its guest with {} of the kernel's locks held", me,
                        crate::sync::held());
+            self.backend.entered();
             loop {
                 crate::time::progressed();
                 let next = GUEST.lock().unwrap_or_else(|e| e.into_inner()).as_mut()

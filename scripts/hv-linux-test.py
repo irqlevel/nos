@@ -166,10 +166,11 @@ def interrupt_check(args, text, queue):
 
 def cpus_opt(args):
     """`cpus=N` for a guest of N CPUs, or nothing for one; `xapic` for a
-    guest whose local APICs come out of reset in xAPIC mode; and `ioapic`
-    for one with an IO-APIC."""
+    guest whose local APICs come out of reset in xAPIC mode; `ioapic` for
+    one with an IO-APIC; and `apicv` for one whose interrupts the CPU
+    delivers itself where it can."""
     return ((" cpus=%d" % args.cpus if args.cpus > 1 else "") + (" xapic" if args.xapic else "")
-            + (" ioapic" if args.ioapic else ""))
+            + (" ioapic" if args.ioapic else "") + (" apicv" if args.apicv else ""))
 
 
 def vm_commands(args):
@@ -624,6 +625,14 @@ def check_boot(args, txt):
         pt.check("and the report says the guest started them",
                  re.search(r"cpus\s+%d, %d started by the guest" % (args.cpus, args.cpus - 1), txt) is not None,
                  txt[-2500:])
+    if args.apicv and args.cpus > 1 and not (args.xapic or args.ioapic) and accel_args(args)[1] == "host" \
+            and hvt.host_has_vmx():
+        # Asked for, under VT-x, in x2APIC mode: the CPU delivered its
+        # interrupts, and the host injected none of the APICs'. (A CPU
+        # without APIC virtualization -- `hv info` -- would fail this.)
+        pt.check("the CPU delivered its local APICs' interrupts itself, the host injecting none of them",
+                 re.search(r"(?m)^\s+apicv\s+[1-9]\d* entries with the CPU delivering", txt) is not None
+                 and re.search(r"(?m)^\s+apic\s+0 interrupts from the local APICs", txt) is not None, txt[-2500:])
 
 
 def free_port():
@@ -1215,6 +1224,10 @@ def main():
                     help="the guest has an IO-APIC (hv's `ioapic`; needs --cpus 2 or more): the timer, the "
                          "serial port and the SCI routed through it -- and a virtio device's INTx line too, "
                          "given a --cmdline with pci=nomsi")
+    ap.add_argument("--apicv", action="store_true",
+                    help="the guest's interrupts delivered, and their EOIs taken, by the CPU where it can (hv's "
+                         "`apicv`: VT-x's virtual-interrupt delivery, for a guest of more than one CPU in x2APIC "
+                         "mode; the report must then say so)")
     ap.add_argument("--mem", type=int, default=256, help="guest RAM in MiB")
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
     ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")

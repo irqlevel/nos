@@ -111,13 +111,17 @@ const LEAF15_CRYSTAL_HZ: u32 = 1_000_000_000;
 const LEAF15_DENOMINATOR_KHZ: u32 = 1_000_000;
 
 /* Leaf 1, ECX: the features kept. Everything not named here is cleared --
- * among them MONITOR, VMX, PDCM, PCID, the TSC deadline timer, XSAVE,
- * OSXSAVE and AVX. x2APIC is set on top (`LEAF1_ECX_X2APIC`) for a guest of
- * more than one CPU, and the hypervisor bit for every guest. */
+ * among them MONITOR, VMX, PDCM, the TSC deadline timer, XSAVE, OSXSAVE and
+ * AVX. x2APIC is set on top (`LEAF1_ECX_X2APIC`) for a guest of more than
+ * one CPU, and the hypervisor bit for every guest. PCID is the guest's own:
+ * its TLB entries tagged under its VPID or ASID as the CPU tags them, CR4's
+ * bit turned on under `crate::cr`'s rules; INVPCID, which VT-x would need a
+ * control for, is not offered with it. */
 const LEAF1_ECX_KEEP: u32 = (1 << 0)   // SSE3
     | (1 << 1)   // PCLMULQDQ
     | (1 << 9)   // SSSE3
     | (1 << 13)  // CMPXCHG16B
+    | (1 << 17)  // PCID
     | (1 << 19)  // SSE4.1
     | (1 << 20)  // SSE4.2
     | (1 << 22)  // MOVBE
@@ -149,6 +153,39 @@ const LEAF1_EDX_KEEP: u32 = (1 << 0)   // FPU
     | (1 << 24)  // FXSR
     | (1 << 25)  // SSE
     | (1 << 26); // SSE2
+
+/* Leaf 7, subleaf 0, the structured features: what runs on the CPU as it
+ * is, with nothing of the host's behind it to switch, and what CR4 bits the
+ * guest owns turn on -- SMEP, SMAP and UMIP for its kernel, FSGSBASE over
+ * bases the VMCS and the VMCB keep -- and facts of the silicon. Its EAX, the
+ * last subleaf, is 0: the others are not offered. Among what is cleared:
+ * AVX2 and AVX-512, AMX (state XSAVE would switch, and XSAVE is not offered),
+ * HLE and RTM, MPX, PT, SGX, PKU (a PKRU nothing switches), CET, WAITPKG,
+ * TSC_ADJUST, INVPCID, RDPID, LA57, the hybrid flag, and the speculation
+ * controls -- IBRS and IBPB, STIBP, SSBD, L1D_FLUSH -- whose MSRs are not
+ * the guest's to write. */
+const LEAF7_EBX_KEEP: u32 = (1 << 0)   // FSGSBASE
+    | (1 << 3)   // BMI1
+    | (1 << 6)   // the x87 data pointer kept at exceptions only
+    | (1 << 7)   // SMEP
+    | (1 << 8)   // BMI2
+    | (1 << 9)   // ERMS: fast REP MOVSB and STOSB
+    | (1 << 13)  // the x87's CS and DS deprecated
+    | (1 << 18)  // RDSEED
+    | (1 << 19)  // ADX
+    | (1 << 20)  // SMAP
+    | (1 << 23)  // CLFLUSHOPT
+    | (1 << 24)  // CLWB
+    | (1 << 29); // SHA
+const LEAF7_ECX_KEEP: u32 = 1 << 2; // UMIP
+/* In EDX: fast short REP MOVSB; MD_CLEAR -- VERW clears the CPU's buffers,
+ * which it does in a guest as anywhere, and which a guest's kernel needs to
+ * know to use it; SERIALIZE; and ARCH_CAPABILITIES, which the guest reads
+ * from the host's (`MSR_ARCH_CAPABILITIES`). */
+const LEAF7_EDX_KEEP: u32 = (1 << 4)   // FSRM
+    | (1 << 10)  // MD_CLEAR
+    | (1 << 14)  // SERIALIZE
+    | (1 << 29); // ARCH_CAPABILITIES
 
 /* Extended leaf 0x80000001, ECX: the features kept, on the same terms as
  * leaf 1's -- anything not named is cleared. That list was once "all of it
@@ -265,6 +302,9 @@ pub fn cpuid(leaf: u32, sub: u32, apic_id: u32, apic: bool) -> Cpuid {
          * the rest -- APERF/MPERF, HWP, the energy bias, the thermal sensor
          * -- each names MSRs this hypervisor does not answer. */
         LEAF_POWER => Cpuid { eax: if apic { LEAF6_EAX_ARAT } else { 0 }, ebx: 0, ecx: 0, edx: 0 },
+        LEAF_STRUCTURED if sub == 0 => {
+            Cpuid { eax: 0, ebx: ebx & LEAF7_EBX_KEEP, ecx: ecx & LEAF7_ECX_KEEP, edx: edx & LEAF7_EDX_KEEP }
+        }
         LEAF_TSC if apic => {
             /* The host's TSC, from the host's own leaf: crystal times
              * ratio. Blank when the host does not say -- the guest then
@@ -332,8 +372,9 @@ const CR4_PCE: u64 = 1 << 8;
 /// feature gives (`crate::cr`), so no feature reaches a guest behind its
 /// CPUID's back -- PKE above all, whose PKRU nothing switches between
 /// guests. Today that is VME and PVI, TSD, DE, PSE, PAE, MCE, PGE, PCE,
-/// OSFXSR and OSXMMEXCPT, as the host has them: the structured-features
-/// leaf is blank, and PCID and XSAVE are not offered.
+/// OSFXSR and OSXMMEXCPT, UMIP, FSGSBASE, PCIDE, SMEP and SMAP, each where
+/// the host has its feature; never OSXSAVE, PKE, LA57 or CET, whose
+/// features are not offered.
 pub fn cr4_allowed() -> u64 {
     let features = cpuid(LEAF_FEATURES, 0, 0, false);
     let structured = cpuid(LEAF_STRUCTURED, 0, 0, false);
@@ -406,6 +447,35 @@ const MSR_UCODE_REV: u32 = 0x8B;
 /// (0xCE): what reads it is ready for a fault, and intel_pstate, which is
 /// not, only runs where leaf 6 offers APERF/MPERF.
 const MSR_PLATFORM_ID: u32 = 0x17;
+/// IA32_ARCH_CAPABILITIES, where the host's CPUID offers it, as the
+/// guest reads it: the host's, but only the bits that say what the CPU is
+/// not open to, or what an instruction the guest has does -- facts of the
+/// silicon and its microcode, true of a guest on it. Without them Linux
+/// takes the CPU for one open to everything its model was ever open to: on
+/// the EX44 it isolated its page tables for Meltdown (with no PCID, a whole
+/// TLB flush at every system call) and reported MDS and RFDS unmitigated.
+/// Not IBRS_ALL, whose SPEC_CTRL is not the guest's; not SKIP_L1DFL_VMENTRY,
+/// a hypervisor's, and the guest runs none; nor any bit that names an MSR
+/// this policy does not answer -- TSX_CTRL, FB_CLEAR_CTRL, GDS_CTRL,
+/// DOITM, the energy filter's -- which a kernel told of one writes.
+const MSR_ARCH_CAPABILITIES: u32 = 0x10A;
+const ARCH_CAP_GUEST: u64 = (1 << 0)   // RDCL_NO: not open to Meltdown
+    | (1 << 2)   // RSBA: a RET may be predicted from elsewhere than the RSB
+    | (1 << 4)   // SSB_NO
+    | (1 << 5)   // MDS_NO
+    | (1 << 6)   // PSCHANGE_MC_NO
+    | (1 << 8)   // TAA_NO
+    | (1 << 13)  // SBDR_SSDP_NO
+    | (1 << 14)  // FBSDP_NO
+    | (1 << 15)  // PSDP_NO
+    | (1 << 17)  // FB_CLEAR: VERW clears the fill buffers
+    | (1 << 19)  // RRSBA
+    | (1 << 20)  // BHI_NO
+    | (1 << 24)  // PBRSB_NO
+    | (1 << 26)  // GDS_NO
+    | (1 << 27)  // RFDS_NO
+    | (1 << 28)  // RFDS_CLEAR: VERW clears the register file
+    | (1 << 62); // ITS_NO
 /// Intel's IA32_MISC_ENABLE: fast strings as the host has them -- a guest's
 /// `rep movs` is the host CPU's -- and branch tracing and PEBS unavailable,
 /// as they are. Read as zero, Linux turned its fast string paths off ("Disabled
@@ -465,6 +535,9 @@ fn constant(msr: u32) -> Option<Constant> {
         MSR_MTRR_CAP | MSR_MCG_CAP => Constant::ReadOnly(0),
         MSR_MTRR_DEF_TYPE | MSR_MCG_STATUS | MSR_UCODE_REV => Constant::Fixed(0),
         MSR_PLATFORM_ID if vendor == Vendor::Intel => Constant::ReadOnly(0),
+        /* Where the host's CPUID offers it, which is what offers it to the
+         * guest too (`LEAF7_EDX_KEEP`), whoever made the CPU. */
+        MSR_ARCH_CAPABILITIES => Constant::ReadOnly(cpu::arch_capabilities()? & ARCH_CAP_GUEST),
         MSR_MISC_ENABLE if vendor == Vendor::Intel => Constant::Fixed(
             if cpu::fast_strings() { MISC_ENABLE_FAST_STRING } else { 0 }
                 | MISC_ENABLE_BTS_UNAVAILABLE | MISC_ENABLE_PEBS_UNAVAILABLE),
