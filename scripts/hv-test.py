@@ -150,9 +150,14 @@ GUESTS = {
     # performed -- except on QEMU's TCG, which checks a read of CR4 against
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
     # check knows which by the hypervisor's CPUID signature.
+    # The host performs every access, 11 of them, or on QEMU's TCG -- which
+    # stops no read of CR4 -- the 5 writes; and refuses PKE, PAE cleared and
+    # bit 32. A CPU may refuse the last two itself, before its intercept, as
+    # the AX41's Zen 2 does under KVM: then 9 and 1, and the guest says so.
     "cr4": [r"while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was",
             r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
-            r"\b(?:11|5) of CR4 performed, 3 refused"],
+            r"\b(?:(?:11|5) of CR4 performed, 3 refused|9 of CR4 performed, 1 refused\b.*\n(?:.*\n)*.*"
+            r"2 of them the CPU's own, before its intercept)"],
     # Every MSR comes to the policy on both backends, so this one says the
     # same under either.
     "msr": [r"SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
@@ -290,7 +295,11 @@ def x86(args):
     print("accelerator: %s" % ("KVM, " + ext if kvm else "TCG, -cpu max (AMD-V)"))
     # -cpu max, not the default: qemu64 reports SVM without nested paging,
     # and a hypervisor that will not shadow page tables has no use for that.
-    argv = ["qemu-system-x86_64", "-display", "none", "-m", "1G", "-smp", str(CPUS),
+    # Cores of two threads, as the servers' are: under KVM on an AMD host
+    # that is what has `hv on` set STIBP on every CPU, which the read-back
+    # of IA32_SPEC_CTRL below then holds it to.
+    argv = ["qemu-system-x86_64", "-display", "none", "-m", "1G",
+            "-smp", "%d,sockets=1,cores=%d,threads=2" % (CPUS, CPUS // 2),
             "-cpu", "host" if kvm else "max",
             "-cdrom", os.path.join(ROOT, "nos.iso"), "-serial", "file:" + log,
             "-drive", "file=%s,format=raw,id=drive0,if=none" % image,
@@ -414,15 +423,19 @@ def x86_checks(ran):
 
     # Every guest above ran a VM of its own on CPU 0 and on CPU 3 -- after
     # another guest's there: an IBPB between each two where the CPU has
-    # one (`hv::spec`), and a count of them either way, under both
-    # extensions.
-    m = re.search(r"guests switched on a CPU (\d+) times(, an IBPB between each two \((\d+) issued\))?", out[14])
+    # one (`hv::spec`) -- the one after every exit, on an AMD CPU a guest
+    # could otherwise steer the host's branches or returns on (BTI,
+    # Retbleed, SRSO): Zen 2 under KVM on the AX41 -- and a count of them
+    # either way, under both extensions.
+    m = re.search(r"guests switched on a CPU (\d+) times(, an IBPB between each two \((\d+) issued\)"
+                  r"|; an IBPB after every exit, (\d+) issued, is between each two)?", out[14])
     switches = int(m.group(1)) if m else 0
     pt.check("the guests switched on a CPU at least twice a guest, each switch counted",
              switches >= 2 * len(GUESTS), out[14])
     pt.check("and each with an IBPB where the CPU has one",
-             m is not None and (m.group(3) is None and "has no IBPB" in out[14]
-                                or m.group(3) is not None and int(m.group(3)) == switches), out[14])
+             m is not None and (m.group(3) is None and m.group(4) is None and "has no IBPB" in out[14]
+                                or m.group(3) is not None and int(m.group(3)) == switches
+                                or m.group(4) is not None and int(m.group(4)) >= switches), out[14])
     # Read back from every CPU's register, where `hv on` set one: what it
     # set is still there after the guests.
     pt.check("and every CPU's IA32_SPEC_CTRL still has what hv on set there",

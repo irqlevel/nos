@@ -86,7 +86,70 @@ public:
 
     bool Start(Func func, void* ctx);
 
-    void Wait();
+    /* Waits for the task to exit, and says so when that takes long: once
+       reportNs have passed -- who waits, for which task, for how long, and
+       where that task is (Locate) -- and again each time the wait has
+       doubled, or JoinReportMaxNs on, whichever is sooner. It never gives
+       up: a task that has not exited is still using whatever its waiter is
+       about to free. A join that never ends is a stop, an unload or a
+       shutdown that never ends, and one that says nothing is the worst
+       outcome there is: the report is the TLB shootdown's naming of the
+       CPUs that never answered, for the tasks every stop path waits on. */
+    void Wait(ulong reportNs = JoinReportNs);
+
+    static const ulong JoinReportNs = 10 * Const::NanoSecsInSec;
+    static const ulong JoinReportMaxNs = 300 * Const::NanoSecsInSec;
+
+    /* Waits that Wait has reported, since boot */
+    static long GetJoinReportCount();
+
+    static const size_t WhereFrames = 16;
+
+    /* Where a task is, as Locate found it */
+    struct Where
+    {
+        enum Kind : ulong
+        {
+            /* Not started, or never still long enough to be read */
+            Unknown,
+            Exited,
+            /* Off every CPU: blocked, asleep, or runnable and waiting for
+               one. Frames as its switch left them. */
+            Switched,
+            /* On Cpu, where the interrupt that asked it landed: at Pc,
+               Frames from there. The asker's own task too, Pc 0. */
+            Running,
+            /* Not off its CPU, and SilentCpus took no interrupt in
+               AnswerNs to say whether it is on theirs: interrupts off
+               there, which is where such a task usually is. */
+            Silent,
+        };
+
+        Kind What;
+        bool Blocked;
+        bool Asleep;
+        ulong Cpu;
+        ulong Pc;
+        ulong SilentCpus;
+        ulong AnswerNs;
+        size_t Count;
+        ulong Frames[WhereFrames];
+
+        /* What, in words, into buf: "asleep", "running on cpu 3 at
+           Spin+0x1c", ... */
+        void Describe(char* buf, size_t size);
+    };
+
+    /* Where this task is, now: its return addresses, innermost first, and
+       for a task on a CPU which one and where it was. A task off its CPU is
+       read off its stack, and held to not having run while it was read; one
+       on a CPU is asked, by an IPI to every other CPU, whose answers are
+       waited for up to LocateAnswerNs -- a CPU with interrupts off takes no
+       IPI, and is named instead. From task context, since it waits; one at
+       a time across the machine. */
+    void Locate(Where& where, ulong answerNs = LocateAnswerNs);
+
+    static const ulong LocateAnswerNs = 1 * Const::NanoSecsInSec;
 
     void SetStopping();
     bool IsStopping();
@@ -186,6 +249,18 @@ private:
     static void Exec(void *task);
 
     bool PrepareStart(Func func, void* ctx);
+
+    /* Wait's report, after waitedNs */
+    void ReportJoin(ulong waitedNs);
+
+    /* Locate, under its lock; and its case of a task off its CPU, false if
+       the task ran while being read */
+    void LocateLocked(Where& where, ulong answerNs);
+    bool LocateSwitched(Where& where);
+
+    /* Looks a task Locate finds in neither place keeps getting: off its
+       CPU when asked on one, on one when read off its stack */
+    static const ulong LocateAttempts = 4;
 
     Stack* StackPtr;
     Func Function;
