@@ -35,6 +35,7 @@ pub static ALL: &[Target] = &[
     Target { name: "msi", run: msi, max_len: 1024 },
     Target { name: "blk", run: blk_target, max_len: 8192 },
     Target { name: "net", run: net_target, max_len: 8192 },
+    Target { name: "offload", run: crate::offloadmodel::offload_target, max_len: 4096 },
     Target { name: "walk", run: walk, max_len: 2048 },
     Target { name: "insn", run: insn, max_len: 256 },
     Target { name: "linux", run: linux, max_len: 4096 },
@@ -927,6 +928,12 @@ fn net_target(r: &mut Input) {
      * the time the device said it would look again (`rx_due`). */
     if r.u8() < 192 {
         nic.set_rx_moderation(r.pick(&[1_000u64, 20_000, 100_000, 1_000_000]));
+    }
+    /* Its transmit offloads offered, mostly: a driver that accepts them may
+     * send what is to be cut through the ring (`offload` holds the cutting
+     * to a model). */
+    if r.u8() < 48 {
+        nic.set_offloads(false);
     }
     let mut queues = [DriverQueue::default(); 2];
     while let Some(op) = r.op(14) {
