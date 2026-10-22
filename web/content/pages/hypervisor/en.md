@@ -1,11 +1,12 @@
 ---
 title: "The hypervisor"
 description: "A type-1 hypervisor in Rust that loads into a running nos as a module and boots unmodified Linux, Alpine and Debian as they ship, on AMD-V and Intel VT-x."
+updated: 2026-10-22
 ---
 
 nos has a hypervisor of its own: two Rust crates — `hvarch`, the CPU's virtualization extension, and `hv`, everything above it — in a loadable module, `hv.ko`, that goes into a running kernel with `insmod` and comes back out with `rmmod`. Loaded, it turns AMD-V or Intel VT-x on and runs guests: tiny built-in ones that each check one mechanism, an unmodified Linux `bzImage`, and Alpine's ISO and Debian's cloud image as they ship — with several CPUs, virtio disks, a network with NAT, ACPI and a power button. On bare metal there is no Linux underneath; nos owns the machine.
 
-It is stage 3 of the [roadmap](https://github.com/irqlevel/nos/blob/master/plans/README.md), whose end is a bare-metal cloud node with no Linux host, managed over HTTP and updated live under its guests. The goal is other people's Linux guests on the machine, so isolation comes before speed. The full reference is [The hypervisor](/docs/hypervisor), some 3,600 lines; this is the five-minute version.
+It is stage 3 of the [roadmap](https://github.com/irqlevel/nos/blob/master/plans/README.md), whose end is a bare-metal cloud node with no Linux host, managed over HTTP and updated live under its guests. The goal is other people's Linux guests on the machine, so isolation comes before speed. The full reference is [The hypervisor](/docs/hypervisor), some 3,800 lines; this is the five-minute version.
 
 ## Why a module
 
@@ -23,13 +24,13 @@ The line between code that touches the extension and code that does not is drawn
 
 | Crate | Lines | `unsafe` sites |
 |---|---|---|
-| `hvarch` — the extension | 6,339 | 195 |
-| `hv` — everything above it | 17,647 | 4 |
-| `modules/hv` — the module | 5,246 | 0 |
+| `hvarch` — the extension | 6,593 | 201 |
+| `hv` — everything above it | 18,929 | 4 |
+| `modules/hv` — the module | 5,506 | 0 |
 
 The four in `hv` are the two IPI handlers that turn the extension on and off and the two guest entries, one per backend. The entries are private to the crate and take the `&GuestMemory` whose table they enter over, so their preconditions are invariants of types:
 
-- **Guest memory** is pages mapped nowhere but the guest's nested table, zeroed before the guest sees them. Nothing hands out a Rust reference into it — the guest may write it at any moment from any CPU, and a reference to memory changing under the compiler is undefined behaviour — so every access is a bounds-checked copy ([Its memory](/docs/hypervisor#its-memory)).
+- **Guest memory** is pages mapped nowhere but the guest's nested table, zeroed before the guest sees them; only a virtio queue's rings are mapped for the host as well, while the queue is up. Nothing hands out a Rust reference into it — the guest may write it at any moment from any CPU, and a reference to memory changing under the compiler is undefined behaviour — so every access is a bounds-checked copy, or, on those rings, one volatile load or store at a checked, aligned offset ([Its memory](/docs/hypervisor#its-memory)).
 - **The nested page table lives inside it**, maps only pages that same value owns, and only grows. A guest reaching host memory it was not given is not a mistake a caller can make.
 
 Keeping the CPU behind one crate is also what lets [`hv-fuzz.py`](/docs/testing#hv-fuzzpy----everything-a-guest-reaches-fuzzed) compile most of `hv` for the host, over a stand-in CPU, and fuzz it in CI ([Fuzzing the kernel on the host](/blog/fuzzing-the-kernel-on-the-host)).
@@ -42,11 +43,11 @@ Intel VT-x is for the machines nos actually runs on — the Hetzner EX44 and the
 
 ## What it runs
 
-- **Built-in guests.** Eighteen, each a handful of instructions kept as bytes beside its source in [`guests.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/guests.rs) and checked against what it was told to do: memory above 4 GiB and every register across a hypercall, a write stopped by the nested table, a triple fault that stops the guest and not the CPU, `cli; jmp $` stopped by the host anyway, a second CPU started by INIT and a start-up IPI ([The built-in guests](/docs/hypervisor#the-built-in-guests)).
+- **Built-in guests.** Nineteen, each a handful of instructions kept as bytes beside its source in [`guests.rs`](https://github.com/irqlevel/nos/blob/master/src/rust/hv/src/guests.rs) and checked against what it was told to do: memory above 4 GiB and every register across a hypercall, a write stopped by the nested table, a triple fault that stops the guest and not the CPU, `cli; jmp $` stopped by the host anyway, a second CPU started by INIT and a start-up IPI, a thousand IPIs to a spinning CPU, taken in its guest where the CPU has posted interrupts ([The built-in guests](/docs/hypervisor#the-built-in-guests)).
 - **An unmodified Linux.** `hv boot` loads a 64-bit `bzImage` by the boot protocol over an emulated 8250, 8254 PIT, MC146818 RTC and two 8259s; CPUID and MSRs are allow-lists ([A Linux guest](/docs/hypervisor#a-linux-guest); the story is in [Linux under the nos hypervisor](/blog/linux-under-nos-hypervisor)).
 - **Distributions as they ship.** Alpine's `virt` ISO, the ISO itself the guest's read-only disk, to a root login; Debian 13's cloud image under systemd, `running` with no failed unit ([A distribution](/docs/hypervisor#a-distribution)).
-- **Several CPUs.** `cpus=N`, up to 16, each with a local APIC — x2APIC unless told `xapic` — all but the first started like a PC's, by INIT and a start-up IPI into real mode; virtio interrupts come by MSI-X, and an IO-APIC on request ([More than one CPU](/docs/hypervisor#more-than-one-cpu)).
-- **Disks and a network.** `disk=` is a legacy virtio-blk over a file of nos's, whose rings the host trusts none of. `net` is a virtio-net port on the module's switch: nos at 10.0.100.1 behind its virtual NIC `hv0`, NAT out, DHCP answered by the switch, and `hv forward` for the way in ([A disk](/docs/hypervisor#a-disk), [A network](/docs/hypervisor#a-network)).
+- **Several CPUs.** `cpus=N`, up to 16, each with a local APIC — x2APIC unless told `xapic` — all but the first started like a PC's, by INIT and a start-up IPI into real mode; virtio interrupts come by MSI-X, and an IO-APIC on request ([More than one CPU](/docs/hypervisor#more-than-one-cpu)). Under VT-x, where the CPU has posted interrupts, it delivers an x2APIC guest's interrupts itself, another CPU's IPIs and devices' MSIs included, with no exit ([Interrupts the CPU delivers itself](/docs/hypervisor#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)).
+- **Disks and a network.** `disk=` is a legacy virtio-blk over a file of nos's, whose rings the host trusts none of. `net` is a virtio-net port on the module's switch: nos at 10.0.100.1 behind its virtual NIC `hv0`, NAT out, DHCP answered by the switch, and `hv forward` for the way in; its checksums and TCP's sends of up to 64 KiB are offloaded both ways, a send carried whole from one guest to another, and its receive interrupts held at least 100 µs apart ([A disk](/docs/hypervisor#a-disk), [A network](/docs/hypervisor#a-network), [Faster guest networking](/blog/faster-guest-networking)).
 - **ACPI and MMIO.** Every guest gets ACPI tables and the fixed hardware they describe, so `hv stop` presses a power button that systemd-logind or BusyBox's `acpid` answers ([ACPI](/docs/hypervisor#acpi)). Memory-mapped devices — the xAPIC page and the IO-APIC so far — work by fetching the faulting instruction through the guest's page tables and decoding it, with no `unsafe` ([MMIO](/docs/hypervisor#mmio)).
 
 ## A session
@@ -87,8 +88,8 @@ What keeps a guest from the host and from other guests is set below the policy, 
 - **Speculation at the world switch**: registers cleared after every exit, the return stack refilled, an IBPB between guests, plus automatic IBRS on AMD, and IBRS with BHI_DIS_S, VERW and the L1D flush on Intel, where the CPU needs them ([Guest speculation isolation](/blog/guest-speculation-isolation)).
 - **Registers a guest believes are its own**: DR0–DR3 kept per guest; CR4 read back as written while the CPU's keeps MCE.
 - **Cores**: by default whole cores no other guest has a CPU on — two threads of a core share what MDS and L1TF exploit.
-- **Network and host services**: a frame must carry its port's MAC and address; a guest reaches neither nos's sshd nor its connections; NAT keeps guests off the cloud's metadata address, the private networks and the uplink's subnet unless `nat allow` says otherwise; shared resources have per-guest quotas.
-- **Memory**: a reserve no guest can take, a sixteenth of RAM and at least 64 MiB.
+- **Network and host services**: a frame must carry its port's MAC and address, and a send a guest leaves its NIC to cut makes 256 frames at most; a guest reaches neither nos's sshd nor its connections; NAT keeps guests off the cloud's metadata address, the private networks and the uplink's subnet unless `nat allow` says otherwise; shared resources have per-guest quotas.
+- **Memory**: a reserve no guest can take, a sixteenth of RAM and at least 64 MiB; and a device maps its rings for the host eight times, then once a second, since every mapping undone interrupts every host CPU.
 
 Each fix came with a gate — a built-in guest, a check in `hv-linux-test.py`, a model in `hv-fuzz.py` — most shown to fail against the code they replaced. What is still open is listed too, SRSO and Retbleed on Zen 1 to 4 among it ([Before other people's guests](/docs/hypervisor#before-other-peoples-guests)).
 
@@ -110,7 +111,7 @@ An MMIO access costs more, since the host walks to, fetches and decodes the inst
 
 - **QEMU's TCG** and **nested KVM** on AMD and Intel hosts, where the gates run.
 - **The AX41** (Ryzen 5 3600, Zen 2), bare metal: Linux reaching `Run /init` 18 ms into its clock, against half a second under TCG; Debian at its login prompt in under four seconds; a gigabyte fetched through NAT at 117 MB/s; a guest's disk written at 1.2 GB/s. Its first run stopped twice where TCG never had — CPUID leaf 0x80000001 passed MWAITX through, and Linux on a Zen reads AMD's FCH at a fixed address whether or not one exists ([On real hardware](/docs/hypervisor#on-real-hardware)).
-- **The EX44** (i5-13500, six P-cores and eight E-cores), bare metal, VT-x, since 2026-10-20: the built-in guests on P- and E-cores, Linux with one, two and four CPUs, a virtio disk at 1.0–1.2 GB/s with `fsync`, Alpine at its login prompt in 13 s, and `rmmod` with five VMs running leaving VMX off on all twenty CPUs ([The EX44, under VT-x](/docs/hypervisor#the-ex44-under-vt-x)).
+- **The EX44** (i5-13500, six P-cores and eight E-cores), bare metal, VT-x, since 2026-10-20: the built-in guests on P- and E-cores, Linux with one, two and four CPUs, a virtio disk at 1.0–1.2 GB/s with `fsync`, Alpine at its login prompt in 13 s, and `rmmod` with five VMs running leaving VMX off on all twenty CPUs ([The EX44, under VT-x](/docs/hypervisor#the-ex44-under-vt-x)). Since 2026-10-22 one guest there sends another 500 MB of TCP in 2.72–2.83 s, where it took 5.72, and a web server's five fetches of 100 MB take 0.29 s, 1.8 GB/s ([Faster guest networking](/blog/faster-guest-networking)).
 - **Not yet**: the Dell's Skylake; and arm64, where a hypervisor is an exception level a kernel runs at, not an extension it turns on — nos drops from EL2 to EL1 at boot, so that backend only reports what EL2 would offer ([arm64](/docs/hypervisor#arm64)).
 
 ## The commands
@@ -135,7 +136,7 @@ The full syntax is in [Shell commands](/docs/shell-commands); the gates are in [
 Stage 3's four demos are done — a guest of a few bytes, long mode under nested paging, a `bzImage`'s early console, a full boot to a shell — and disks, networking and SMP guests, which the plan left for stage 4, came early. Next, from [What comes next](/docs/hypervisor#what-comes-next):
 
 - **More MMIO devices**: the HPET and PCIe's ECAM, which the guests' ACPI tables leave out today.
-- **Speed**: device work off the first CPU's task; the disk path off the VFS's single lock; fewer exits per request; posted interrupts; XSAVE for guests, without which there is no AVX and an x86-64-v3 distribution does not start; modern virtio.
+- **Speed**, after [posted interrupts, a one-shot timer, offloads and mapped rings](/blog/faster-guest-networking): device work off the first CPU's task, for guests with MSI-X and a CPU to spare (for a guest of one CPU, a NIC's own task measured no faster); the disk path off the VFS's single lock; fewer exits per request; the CPU's own interrupt delivery for xAPIC guests, and AMD's AVIC; XSAVE for guests, without which there is no AVX and an x86-64-v3 distribution does not start; modern virtio.
 - **Stage 4, the control plane** ([plan](https://github.com/irqlevel/nos/blob/master/plans/04-control-plane.md)): an HTTP API on nos's own TCP stack — create, list, destroy, stream a console — with typed VM specs, definitions kept across reboots, and quotas.
 - **Stage 5, live update** ([plan](https://github.com/irqlevel/nos/blob/master/plans/05-live-update.md)): a new host kernel under running guests, their RAM left in place, under 100 ms of downtime. It needs all VM state to be plain serializable data and no device model to hold pointers into kernel memory — which does not fully hold yet. The first milestone needs no kexec: `rmmod hv`, then `insmod hv`, with the guests still running.
 - **arm64**: the EL2 backend, a change to the boot path rather than to the module.
