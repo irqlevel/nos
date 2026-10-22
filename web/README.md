@@ -22,6 +22,9 @@ web/
     lib/dictionaries.ts         every interface string, in both languages
     lib/docs-manifest.ts        how docs/ is grouped, with Russian titles
   Dockerfile, docker-compose.yml, Caddyfile, .env.example
+  VERSION                       the version a release is tagged with
+  scripts/release.sh            build the image; --upload ships it to the server over ssh
+  scripts/verify-site.py        check a running site end to end, from its sitemap
 ```
 
 The documentation section is **the repository's own `docs/`**, rendered at
@@ -157,13 +160,8 @@ python3 scripts/verify-site.py https://<domain>
 To publish new posts or the current docs: `git pull && docker compose up -d --build`.
 
 The build runs on the server and wants about 1.5 GB of memory. On a smaller box,
-add swap, or build the image elsewhere and load it:
-
-```sh
-docker compose build web && docker save nos-web | ssh server docker load
-# then on the server
-docker compose up -d --no-build
-```
+add swap, or release from your own machine (below): then the server builds
+nothing and needs no checkout at all.
 
 The web container runs as an unprivileged user on a read-only filesystem with
 every capability dropped, and is reachable only through Caddy. The pages send
@@ -175,3 +173,56 @@ has to be added to that policy first.
 Node and Caddy are pinned to a minor version (`node:24.22-alpine`,
 `caddy:2.11-alpine`), so a rebuild picks up their patch releases; the npm
 dependencies are exact versions with a lockfile.
+
+## Release from your machine
+
+`scripts/release.sh` builds the image tagged with the site's version and, with
+`--upload`, ships it to the server over ssh and starts it there:
+
+```sh
+scripts/release.sh                       # build nos-web:<version> here
+scripts/release.sh --upload              # build it for the server, ship it, start it there
+scripts/release.sh --upload root@host    # the same, to another destination
+scripts/release.sh --up                  # build it and start it on this machine
+scripts/release.sh --help
+```
+
+- **The version** is `VERSION`; `IMAGE_VERSION` in `.env` (or the environment)
+  overrides it for a release, and `IMAGE_NAME` names the image (`nos-web`).
+  Bump `VERSION` for each release: `latest` is refused, it is what a plain
+  `docker compose up --build` calls its build.
+- **Where it goes**: `DEPLOY_HOST` (`user@host`, or a `Host` of `~/.ssh/config`),
+  `DEPLOY_DIR` (`nos-web`, under the remote home unless absolute) and
+  `DEPLOY_SSH_OPTS` (`-p 2222 -i ~/.ssh/deploy_key`) in `.env`. The server needs
+  Docker with its compose plugin, and a user that may run them.
+- **The image carries `SITE_URL`**, made from `DOMAIN`: release with the `.env` of
+  the deployment the image is for.
+
+What `--upload` does, and what it refuses to skip:
+
+1. Asks the server for its platform and builds for it -- x86-64 for a Hetzner box
+   when releasing from an arm64 Mac. The build stages run natively and only the
+   image's last stage is the server's platform, so that takes seconds, not an
+   emulated build; the Dockerfile fails the build should native code ever turn up
+   in that stage.
+2. Checks the Caddyfile with the Caddy image the compose file names. A Caddyfile
+   Caddy refuses stops the release before anything on the server changes.
+3. Sends the image -- `docker save | gzip | ssh docker load` -- unless the server
+   already has that very build.
+4. Puts `docker-compose.yml`, the `Caddyfile` and this `.env` into `DEPLOY_DIR`,
+   with `IMAGE_NAME` and `IMAGE_VERSION` pinned in that `.env`, so the server runs
+   exactly the image it was sent.
+5. Runs `docker compose up -d` there, waits until the web container is healthy
+   and runs that image, then reloads Caddy so it takes the new Caddyfile, or
+   starts Caddy afresh if it is not running. Anything short of that is reported
+   with the containers' last log lines, and the script exits 1.
+
+A release does not take the site down: Caddy stays up, and holds requests for up
+to 15 seconds while the web container is replaced (`lb_try_duration` in the
+`Caddyfile`). Measured on a test server: a hundred requests during a release,
+every one answered.
+
+Every version sent stays on the server. To roll back, set `IMAGE_VERSION` in its
+`.env` to an earlier one (`docker image ls nos-web` lists them) and run
+`docker compose up -d --no-build` in `DEPLOY_DIR`. Old ones go with
+`docker image rm nos-web:<version>`.

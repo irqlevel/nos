@@ -16,5 +16,10 @@ www.{$DOMAIN} {
 		Strict-Transport-Security "max-age=31536000"
 		-Server
 	}
-	reverse_proxy web:3000
+	reverse_proxy web:3000 {
+		# A release replaces the web container: hold a request for up to
+		# 15 s until the new one answers, rather than answer it with a 502.
+		lb_try_duration 15s
+		lb_try_interval 250ms
+	}
 }
