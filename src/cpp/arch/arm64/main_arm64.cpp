@@ -277,6 +277,12 @@ static void BpStartupArm(void* ctx)
         return;
     }
 
+    if (!Test::TestTaskLocate())
+    {
+        Panic("Task locate test failed");
+        return;
+    }
+
     Trace(0, "After test");
     Ubsan::Announce();
 

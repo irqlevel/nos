@@ -11,13 +11,17 @@ extern "C" void __attribute__((noreturn)) Arm64RunOnStack(ulong stackTop, void (
 namespace Hal
 {
 
+/* SwitchContext's frame in asm.S, in words, and the one x29 is saved in */
+static const ulong SwitchFrameWords = 14;
+static const ulong SwitchFrameFp = 12;
+
 /* Frame layout must match SwitchContext in asm.S:
    [DAIF, pad][x19,x20][x21,x22][x23,x24][x25,x26][x27,x28][x29,x30] */
 ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
 {
     ulong* sp = (ulong*)(stackTop & ~0xFUL);
-    sp -= 14;
-    for (int i = 0; i < 14; i++)
+    sp -= SwitchFrameWords;
+    for (ulong i = 0; i < SwitchFrameWords; i++)
         sp[i] = 0;
     /* DAIF: IRQs enabled, D/A/F stay masked — the PSTATE every other
        context runs with (boot masks all four, InterruptEnable clears only
@@ -30,10 +34,14 @@ ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
     return (ulong)sp;
 }
 
-ulong TaskSavedFramePointer(ulong savedSp)
+ulong TaskSavedFramePointer(ulong savedSp, ulong stackBase, ulong stackLimit)
 {
+    if (savedSp % sizeof(ulong) != 0 || savedSp < stackBase || savedSp > stackLimit ||
+        stackLimit - savedSp < SwitchFrameWords * sizeof(ulong))
+        return 0;
+
     /* SwitchContext frame slot 12 = x29 (see asm.S layout comment) */
-    return ((ulong*)savedSp)[12];
+    return ((ulong*)savedSp)[SwitchFrameFp];
 }
 
 void RunOnStack(ulong stackTop, void (*fn)(void*), void* ctx)

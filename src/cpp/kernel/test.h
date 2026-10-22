@@ -11,6 +11,9 @@ Stdlib::Error Test();
 
 bool TestMultiTasking();
 
+/* Task::Locate and Wait's report: once, from the BSP, with every CPU up */
+bool TestTaskLocate();
+
 }
 
 }

@@ -3761,10 +3761,15 @@ someone else's; then speed.
 
 - A host `poweroff` or `reboot` stops every guest as `rmmod` does
   (`stop_all` with no grace): no power button is pressed.
-- `finish` and `FileDisk::drop` wait for their tasks with no deadline: a
+- ~~`finish` and `FileDisk::drop` wait for their tasks with no deadline: a
   disk task stuck in a read hangs `hv stop`, `rmmod` and the host's
-  shutdown with nothing said. Wanted: a wait that names what did not
-  answer, as the TLB shootdown does.
+  shutdown with nothing said.~~ Done for every join in the kernel
+  (`Task::Wait`, [Scheduler](scheduler.md#waiting-for-one-to-end)): a wait
+  still going after ten seconds is reported -- who waits, for which task
+  (`hv/vm3`, `hv/vm3/vda`, `hv/vm3/cpu1`), for how long, and where that task
+  is, its frames named, or the CPU it is on that takes no interrupt -- and
+  again each time the wait has doubled. It still waits: a task that has
+  not exited is still using what its waiter would free.
 - Stage 4 needs what the shell's strings stand in for today: a typed
   `start(Spec) -> Result<Id>` and status, names, VM definitions kept across
   a reboot, images handled -- claims, copies -- and quotas.

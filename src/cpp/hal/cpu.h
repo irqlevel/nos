@@ -61,8 +61,13 @@ namespace Hal
 ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg);
 
 /* Frame pointer recorded in a suspended task's SwitchContext frame
-   (task->Rsp on x86 points at a Context; arm64 at the asm.S frame). */
-ulong TaskSavedFramePointer(ulong savedSp);
+   (task->Rsp on x86 points at a Context; arm64 at the asm.S frame), or 0
+   when that frame is not all inside [stackBase, stackLimit). The saved
+   stack pointer is read without anything holding the task still -- by bt,
+   by a report on a join that does not end (Task::Locate) -- so it may be
+   one the task has since moved on from, and a frame read outside the
+   stack would fault where a stale one inside it only names wrong frames. */
+ulong TaskSavedFramePointer(ulong savedSp, ulong stackBase, ulong stackLimit);
 
 /* Switch to a fresh stack and call fn(ctx) there, never returning.
    Switching SP mid-function is not expressible safely in C++ (the
