@@ -295,6 +295,12 @@ impl Permissions {
 /// - STGI, CLGI: the physical GIF, which masks every interrupt the host has.
 /// - SKINIT: reinitialises the CPU into a secure loader.
 /// - XSETBV: XCR0 is the CPU's, and `vmrun` does not switch it.
+/// - HLT, MWAIT, MWAIT armed: a guest never idles a thread of the host's
+///   itself. A thread that idles switches its core between its SMT modes,
+///   and on Zen 1 and 2 a `ret` on the other thread may then be predicted
+///   from what the idling one left in the return stack (SMT_RSB) -- a
+///   guest's, if the guest idled it; the host's, refilled at the exit,
+///   when the host does (`super::spec`).
 /// - #DB and #AC: a guest can make delivering either raise it again --
 ///   a data breakpoint on the stack its own #DB frame is pushed to, an #AC
 ///   handler whose frame is misaligned -- and the CPU then loops inside the
@@ -329,14 +335,17 @@ const HOST_MISC1: u32 = vmcb::intercept::misc1::INTR
     | vmcb::intercept::misc1::INVLPGA
     | vmcb::intercept::misc1::IOIO_PROT
     | vmcb::intercept::misc1::MSR_PROT
-    | vmcb::intercept::misc1::SHUTDOWN;
+    | vmcb::intercept::misc1::SHUTDOWN
+    | vmcb::intercept::misc1::HLT;
 const HOST_MISC2: u32 = vmcb::intercept::misc2::VMRUN
     | vmcb::intercept::misc2::VMLOAD
     | vmcb::intercept::misc2::VMSAVE
     | vmcb::intercept::misc2::STGI
     | vmcb::intercept::misc2::CLGI
     | vmcb::intercept::misc2::SKINIT
-    | vmcb::intercept::misc2::XSETBV;
+    | vmcb::intercept::misc2::XSETBV
+    | vmcb::intercept::misc2::MWAIT
+    | vmcb::intercept::misc2::MWAIT_ARMED;
 pub const VECTOR_DB: u32 = 1;
 pub const VECTOR_AC: u32 = 17;
 pub const VECTOR_MC: u32 = 18;
@@ -968,13 +977,18 @@ impl Guest {
             /* Another guest than the last on this CPU: the predictors it
              * trained are not to steer this one (`super::spec`). */
             entries.spec.entering(nested.id);
+            let speculation = entries.spec.svm_entry();
+            let flags = if speculation.ibpb_exit() { RUN_IBPB } else { 0 };
 
             /* The two VMCBs are pages this guest owns, `regs` is its own
-             * field, and the checks above are the rest of what the stub
-             * needs. */
+             * field, the checks above are the rest of what the stub needs,
+             * and RUN_IBPB is given only where `super::spec` found IBPB. */
             let t2 = stamp(timed);
-            unsafe { vmrun_stub(guest, regs, host) };
+            unsafe { vmrun_stub(guest, regs, host, flags) };
             let t3 = stamp(timed);
+            if flags & RUN_IBPB != 0 {
+                speculation.count_exit_barrier(cpu);
+            }
             if let Some(k) = kick {
                 k.left();
             }
@@ -1008,6 +1022,9 @@ impl Guest {
     }
 }
 
+/// [`vmrun_stub`]'s flags: an IBPB right after the exit.
+const RUN_IBPB: u64 = 1 << 0;
+
 /// Enter the guest whose VMCB is at `guest_vmcb` with the registers in
 /// `regs`, and come back at its next `#vmexit` with the registers stored
 /// back into `regs`.
@@ -1026,9 +1043,13 @@ impl Guest {
 /// - `cli` just after, so that `stgi` at the end opens GIF with interrupts
 ///   still off; the interrupt that ended the guest's turn is taken when the
 ///   caller turns them back on.
-/// - After the exit, the guest's values cleared out of every register the
-///   caller is not given back, and the return stack refilled before the
-///   first `ret` (`super::spec`).
+/// - After the exit, with `flags` holding [`RUN_IBPB`], an IBPB as soon as
+///   the guest's registers are stored: before the return stack's refill,
+///   the host's first `ret` and any branch of the host's a guest could
+///   have trained.
+/// - Then the guest's values cleared out of every register the caller is
+///   not given back, and the return stack refilled before the first `ret`
+///   (`super::spec`).
 ///
 /// The SysV callee-saved registers are the host's to keep and the guest
 /// overwrites them all, so they go on the stack, which `#vmexit` gives back
@@ -1036,10 +1057,11 @@ impl Guest {
 ///
 /// # Safety
 /// SVM is on for this CPU, its host save area is live, interrupts are off,
-/// both VMCBs are pages that stay allocated, and `regs` is valid for reads
-/// and writes: what [`Guest::run`] checks and owns.
+/// both VMCBs are pages that stay allocated, `regs` is valid for reads and
+/// writes, and [`RUN_IBPB`] is given only on a CPU with IBPB: what
+/// [`Guest::run`] checks and owns, the last from `super::spec`.
 #[unsafe(naked)]
-unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb: u64) {
+unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb: u64, flags: u64) {
     naked_asm!(
         "push rbp",
         "push rbx",
@@ -1047,7 +1069,9 @@ unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb
         "push r13",
         "push r14",
         "push r15",
-        /* What is needed after the exit: the host VMCB, then `regs`. */
+        /* What is needed after the exit: the flags, the host VMCB, then
+         * `regs`. */
+        "push rcx",
         "push rdx",
         "push rsi",
         "clgi",
@@ -1091,10 +1115,24 @@ unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb
         "mov [rsi + {r15}], r15",
         "pop rdi",
         "mov [rsi + {rsi}], rdi",
+        /* The IBPB, where the flags ask for it: what the guest trained is
+         * gone before anything of the host's is predicted from it. Its
+         * flag is a compare with memory, as VT-x's stub has them; RAX, the
+         * guest VMCB's address `vmsave` wants below, is kept in RDI, which
+         * is cleared after. */
+        "test qword ptr [rsp + 16], {run_ibpb}",
+        "jz 5f",
+        "mov rdi, rax",
+        "mov ecx, {msr_pred_cmd}",
+        "mov eax, {pred_cmd_ibpb}",
+        "xor edx, edx",
+        "wrmsr",
+        "mov rax, rdi",
+        "5:",
         /* The guest's values out of every register the caller is not
          * given back by the pops below: none reaches host code running past
          * a branch it has not resolved (`super::spec`). RSI holds `regs`,
-         * the host's own; RAX, the host VMCB's address. */
+         * the host's own; RAX, the guest VMCB's address. */
         "xor ecx, ecx",
         "xor edx, edx",
         "xor edi, edi",
@@ -1124,7 +1162,7 @@ unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb
         "mov rax, [rsp + 8]",
         "vmload rax",
         "stgi",
-        "add rsp, 16",
+        "add rsp, 24",
         "pop r15",
         "pop r14",
         "pop r13",
@@ -1133,6 +1171,9 @@ unsafe extern "C" fn vmrun_stub(guest_vmcb: u64, regs: *mut GuestRegs, host_vmcb
         "pop rbp",
         "ret",
         rsb_pairs = const super::spec::RSB_ENTRIES / 2,
+        run_ibpb = const RUN_IBPB,
+        msr_pred_cmd = const super::spec::MSR_PRED_CMD,
+        pred_cmd_ibpb = const super::spec::PRED_CMD_IBPB,
         rbx = const offset_of!(GuestRegs, rbx),
         rcx = const offset_of!(GuestRegs, rcx),
         rdx = const offset_of!(GuestRegs, rdx),

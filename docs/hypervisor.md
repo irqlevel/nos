@@ -993,12 +993,31 @@ And while a guest runs:
 - **Speculation, AMD-V's half of it** (`hvarch::x86::spec`): after every
   exit the guest's values are cleared out of the registers the run stub
   returns with, and the return stack is refilled before the host's first
-  `ret` -- 32 calls, KVM's fill; an IBPB goes between two guests on a CPU
-  where the CPU has one; and automatic IBRS is on while the extension is,
-  where the CPU has that (Zen 4 and later). `hv` counts the guests switched
-  on a CPU and the IBPBs between them. What is left of it, SRSO and
-  Retbleed among it, is item 1 of [Before other people's
-  guests](#before-other-peoples-guests).
+  `ret` -- 32 calls, KVM's fill; automatic IBRS is on while the extension
+  is, where the CPU has that (Zen 4 and later); and what else a CPU needs
+  is decided from its family and CPUID as the extension goes on there,
+  with Linux's list of which family is open to what as the reference. An
+  IBPB right after every exit -- in the stub, as soon as the guest's
+  registers are stored, before the return stack's refill and the host's
+  first `ret` -- where a guest could otherwise steer the host's branches or
+  returns: BTI on a CPU without automatic IBRS, since this kernel has no
+  retpolines; Retbleed (Zen 1 and 2, and the two families before); and
+  SRSO (Zen 1 to 5) where the IBPB flushes return predictions too, which
+  Zen 1 and 2's does and a later one's where CPUID says IBPB_BRTYPE. That
+  is Linux's `retbleed=ibpb` and `spec_rstack_overflow=ibpb-vmexit` for a
+  host whose only way in from a guest is an exit, and it is also the IBPB
+  between two guests on a CPU, which goes in by itself only where there is
+  none after every exit. STIBP in IA32_SPEC_CTRL where a core has two
+  threads: the IBPB clears what a guest trained on this thread, not what
+  one on the sibling goes on training. And HLT and MWAIT always exit
+  (`svm::HOST_MISC1`): a thread idling switches its core between SMT modes,
+  and on Zen 1 and 2 a `ret` on the other thread may then be predicted from
+  what the idler left in the return stack (SMT_RSB) -- the host's, refilled,
+  when only the host idles one. `hv` counts the guests switched on a CPU
+  and the IBPBs issued, says what each one closes, and names what a CPU is
+  open to with nothing to close it: BTI or Retbleed without IBPB, SRSO
+  without IBPB_BRTYPE, two threads without STIBP -- QEMU's TCG, under
+  which hv-test runs where there is no KVM, is the first and the last.
 - Each entry reads `EFER` and `VM_HSAVE_PA` on the CPU, and checks the VMCB
   against the manual's rules, before `vmrun`.
 
@@ -1056,6 +1075,30 @@ The flush cost the world switch 110 ns and the host's side after it 100 ns
 more, its own translations walked again; with 64 pages the guest's as well.
 What is left to take is on the host's side of the switch: the x87/SSE
 state and CR4 around it, 220 ns an exit, and the checks' two RDMSRs.
+
+Those numbers are from before the IBPB after every exit that a Zen 2 now
+gets ([What entering a guest cannot be told to
+do](#what-entering-a-guest-cannot-be-told-to-do)), which is not measured on
+the silicon yet. Measured nested -- nos under KVM on the AX41's Ubuntu,
+`-cpu host` with cores of two threads, `hv bench cpu=3 exits=200000`, three
+rounds of each, 2026-10-22 -- it is all of what that work costs, and STIBP
+nothing (Linux there keeps STIBP on itself, so KVM switches nothing):
+
+| An exit, ns | nested, on the AX41 |
+|---|---|
+| neither (the commit before) | 10,190-10,260 |
+| STIBP alone | 10,030-10,050 |
+| the IBPB after every exit, and STIBP | 14,790-14,950 |
+
+The profile puts half of the IBPB's 4.7 µs in `vmrun` to `#vmexit` (5,200
+to 7,560 ns), where the stub writes PRED_CMD, and the other half in the
+exit handled and the loop (2,200 to 4,200): the host's code after the
+barrier running on predictors it emptied. Under nested KVM both are
+inflated by the outer kernel's round trips, and what they come to on the
+silicon is for a boot of nos on the AX41 to say. The cheaper way to the
+same end -- the host built with an untrained return thunk and retpolines,
+so that no IBPB is needed at all -- is left in [What a review
+found](#what-a-review-found), item 1.
 
 Under VT-x the first numbers were nested KVM's on the Intel dev box
 (`-cpu host`, `hv bench exits=50000`), where every unshadowed `vmread` or
@@ -3458,11 +3501,22 @@ someone else's; then speed.
    IBPB nor automatic IBRS, so those two writes have run on no machine yet;
    the AX41's Zen 2, which has IBPB, is where the first will. What it was:
    none of it, the guest's values left in the caller-saved registers the
-   stub returned with. Left: on Zen 1 to 4 (the AX41), SRSO and Retbleed,
-   which want the host's every `ret` through an untrained return thunk --
-   a compiler's job, for the whole kernel -- or an IBPB at every exit, and
-   BTI where there is no automatic IBRS, which wants the host built with
-   retpolines; and a guest's own speculation control (IBRS, STIBP, SSBD,
+   stub returned with. ~~On Zen 1 to 4 (the AX41), SRSO and Retbleed,
+   and BTI where there is no automatic IBRS.~~ Done by an IBPB after every
+   exit, decided for each CPU from its family and CPUID, with STIBP where a
+   core has two threads and HLT and MWAIT always exits (SMT_RSB) -- what
+   Linux does for a host whose only way in from a guest is an exit
+   ([What entering a guest cannot be told to
+   do](#what-entering-a-guest-cannot-be-told-to-do)); `hv` names what a CPU
+   is open to with nothing to close it, and hv-test gives its machine cores
+   of two threads, so that under KVM on an AMD host it holds every CPU to
+   the STIBP `hv on` set. Left: the cheaper way to the same end, the host's
+   every `ret` through an untrained return thunk and its indirect branches
+   through retpolines -- a compiler's job, for the whole kernel, C++, Rust
+   and the modules; a Zen 3 or 4 whose microcode has IBPB_BRTYPE but whose
+   CPUID does not say so, which Linux finds by a write to PRED_CMD and this
+   takes for open to SRSO; Zen 5's cheaper control of SRSO and TSA's VERW
+   (Zen 3 and 4); and a guest's own speculation control (IBRS, STIBP, SSBD,
    IBPB), offered to none until its MSR is switched with it. Done under VT-x
    ([The VMX backend](#the-vmx-backend-and-where-it-differs-from-amd-v)),
    decided for each CPU from what CPUID and IA32_ARCH_CAPABILITIES say of

@@ -359,7 +359,11 @@ fn speculation(out: &mut Output, hardware: u64) {
         let _ = writeln!(out, " no longer has what hv on set there: something wrote it behind this module's back");
     }
     let r = hv::spec::report();
-    if r.ibpb {
+    let a = r.amd;
+    if a.ibpb_exit {
+        let _ = writeln!(out, "hv: guests switched on a CPU {} times; an IBPB after every exit, {} issued, is between \
+                               each two", r.switches, r.exit_barriers);
+    } else if r.ibpb {
         let _ = writeln!(out, "hv: guests switched on a CPU {} times, an IBPB between each two ({} issued)",
                          r.switches, r.barriers);
     } else {
@@ -368,6 +372,32 @@ fn speculation(out: &mut Output, hardware: u64) {
     }
     if r.auto_ibrs {
         let _ = writeln!(out, "hv: automatic IBRS on -- the host's indirect branches are not a guest's to steer");
+    }
+    if a.ibpb_exit {
+        let _ = write!(out, "hv: an IBPB after every exit --");
+        let mut sep = " ";
+        for (open, name) in [(a.bti, "BTI"), (a.retbleed, "Retbleed"), (a.srso && !a.srso_open, "SRSO")] {
+            if open {
+                let _ = write!(out, "{}{}", sep, name);
+                sep = ", ";
+            }
+        }
+        let _ = writeln!(out, ": what a guest trained steers none of the host's branches and returns");
+    }
+    if a.stibp {
+        let _ = writeln!(out, "hv: STIBP on -- what a guest trains on one thread of a core steers nothing on the other");
+    }
+    if a.branches_open {
+        let _ = writeln!(out, "hv: this CPU is open to {} and has no IBPB to close it: the host's branches are a \
+                               guest's to steer", if a.retbleed { "BTI and Retbleed" } else { "BTI" });
+    }
+    if a.srso_open {
+        let _ = writeln!(out, "hv: this CPU is open to SRSO and is not said to flush return predictions with its IBPB \
+                               (IBPB_BRTYPE): the host's returns are a guest's to steer");
+    }
+    if a.smt_open {
+        let _ = writeln!(out, "hv: a core's two threads share their branch predictors here, and the CPU has no STIBP to \
+                               keep them apart");
     }
     let i = r.intel;
     let bhi = if i.bhi_dis_s { ", and BHI_DIS_S: nor by the branch history a guest leaves" } else { "" };

@@ -1342,9 +1342,12 @@ eighteen `mov`s the host's: DR7 armed, and in the handler DR6 read and
 cleared and DR7 turned off. After both rounds `hv` must count at least two
 switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
 after another guest's -- each with an IBPB where the CPU offers one, which
-QEMU's TCG does not, and `hv` must say so; and where `hv on` set
-IA32_SPEC_CTRL -- under VT-x, its IBRS -- every CPU's register, read back,
-must still have it. Every guest ran through the run stub's clearing of the
+QEMU's TCG does not, and `hv` must say so; on an AMD CPU a guest could
+otherwise steer the host's branches or returns on -- the AX41's Zen 2,
+under KVM -- that is the IBPB after every exit, issued at least once a
+switch. And where `hv on` set IA32_SPEC_CTRL -- under VT-x, its IBRS; under
+AMD-V, STIBP, for which the machine's cores have two threads each -- every
+CPU's register, read back, must still have it. Every guest ran through the run stub's clearing of the
 registers and refill of the return stack after each exit. The unload that
 follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.
