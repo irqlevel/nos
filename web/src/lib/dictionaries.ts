@@ -102,7 +102,7 @@ const en: Dictionary = {
     meta: {
         title: "nos — an OS kernel in C++ and Rust with a hypervisor of its own",
         description:
-            "nos is a hobby x86-64 and arm64 operating system kernel in C++20 and Rust with a type-1 hypervisor that boots Linux guests. Docs, how-to guides and a blog.",
+            "nos is an x86-64 and arm64 operating system kernel in C++20 and Rust with a type-1 hypervisor that boots Linux guests. Docs, how-to guides and a blog.",
     },
     nav: {
         home: "Home",
@@ -121,7 +121,7 @@ const en: Dictionary = {
         eyebrow: "x86-64 · arm64 · C++20 · Rust",
         title: "An OS kernel built to be safe by design",
         lead:
-            "nos is a hobby operating system kernel for x86-64 and arm64, written in C++20, Rust and assembly. It boots in QEMU, on KVM clouds, on Apple Silicon and on bare-metal servers — and it is growing into a cloud node that runs Linux guests under its own Rust hypervisor.",
+            "nos is an operating system kernel for x86-64 and arm64, written in C++20, Rust and assembly. It boots in QEMU, on KVM clouds, on Apple Silicon and on bare-metal servers — and it is growing into a cloud node that runs Linux guests under its own Rust hypervisor.",
         ctaAbout: "What is nos",
         ctaRun: "Run it in QEMU",
         ctaGithub: "Source on GitHub",
@@ -278,7 +278,7 @@ const en: Dictionary = {
         home: "Go home",
     },
     footer: {
-        tagline: "A hobby x86-64 and arm64 kernel in C++20 and Rust, and a hypervisor of its own.",
+        tagline: "An x86-64 and arm64 kernel in C++20 and Rust, and a hypervisor of its own.",
         project: "Project",
         learn: "Learn",
         source: "Source",
@@ -292,7 +292,7 @@ const ru: Dictionary = {
     meta: {
         title: "nos — ядро ОС на C++ и Rust с собственным гипервизором",
         description:
-            "nos — хобби-ядро операционной системы для x86-64 и arm64 на C++20 и Rust с гипервизором первого типа, который загружает гостевые Linux. Документация, руководства и блог.",
+            "nos — ядро операционной системы для x86-64 и arm64 на C++20 и Rust с гипервизором первого типа, который загружает гостевые Linux. Документация, руководства и блог.",
     },
     nav: {
         home: "Главная",
@@ -311,7 +311,7 @@ const ru: Dictionary = {
         eyebrow: "x86-64 · arm64 · C++20 · Rust",
         title: "Ядро ОС, безопасное по построению",
         lead:
-            "nos — хобби-ядро операционной системы для x86-64 и arm64 на C++20, Rust и ассемблере. Оно загружается в QEMU, в облаках на KVM, на Apple Silicon и на выделенных серверах — и вырастает в облачный узел, который запускает гостевые Linux под собственным гипервизором на Rust.",
+            "nos — ядро операционной системы для x86-64 и arm64 на C++20, Rust и ассемблере. Оно загружается в QEMU, в облаках на KVM, на Apple Silicon и на выделенных серверах — и вырастает в облачный узел, который запускает гостевые Linux под собственным гипервизором на Rust.",
         ctaAbout: "Что такое nos",
         ctaRun: "Запустить в QEMU",
         ctaGithub: "Исходники на GitHub",
@@ -469,7 +469,7 @@ const ru: Dictionary = {
         home: "На главную",
     },
     footer: {
-        tagline: "Хобби-ядро для x86-64 и arm64 на C++20 и Rust — и собственный гипервизор.",
+        tagline: "Ядро для x86-64 и arm64 на C++20 и Rust — и собственный гипервизор.",
         project: "Проект",
         learn: "Изучить",
         source: "Код",
