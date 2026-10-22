@@ -44,7 +44,7 @@ A kernel service reaches Rust in three steps: a C++ function in `rust_ffi.cpp` (
 
 **Modules** are how optional things ship: a server, a load generator, a diagnostic. A module is a Rust crate built into a `.ko` and loaded into a running kernel with `insmod`. The loader binds it against an export table generated from the `ffi` declarations, gives each segment the permissions its header asks for (never writable and executable at once), and refuses a module built against another kernel interface. The SSH server is a module; so is `netblk`, which serves an NVMe disk over UDP with zero copies; so is the hypervisor.
 
-**The hypervisor** is three crates. `hvarch` holds the CPU's virtualization extension and nearly all of the hypervisor's `unsafe`: 195 sites. `hv` holds everything above it (guest memory, the exit loop, the emulated devices) in about 12,000 lines of code with 4 `unsafe` sites. `modules/hv` holds the shell commands and has none. All three are compiled only into `hv.ko`, so a kernel without the module contains no hypervisor at all.
+**The hypervisor** is three crates. `hvarch` holds the CPU's virtualization extension and nearly all of the hypervisor's `unsafe`: 201 sites. `hv` holds everything above it (guest memory, the exit loop, the emulated devices) in about 12,000 lines of code with 4 `unsafe` sites. `modules/hv` holds the shell commands and has none. All three are compiled only into `hv.ko`, so a kernel without the module contains no hypervisor at all.
 
 The long form is in [Rust in the kernel](/docs/rust) and [Project layout](/docs/project-layout).
 
