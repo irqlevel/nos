@@ -58,6 +58,7 @@ mod kernel;
 pub use kernel::{cmd, consts, dma, sync, time};
 mod network;
 pub use network::{abi, device, dns, frame, net, nic, tcp, vms, vnic};
+pub use devices::offload;
 pub use netwire as wire;
 #[path = "../../../src/rust/kcore/src/pod.rs"]
 pub mod pod;
@@ -107,6 +108,7 @@ pub mod switch;
 pub mod walk;
 
 mod guestnet;
+mod netrx;
 mod offloadmodel;
 mod placemodel;
 mod platform;
@@ -318,6 +320,7 @@ fn main() {
         guestnet::report();
         placemodel::report();
         offloadmodel::report();
+        netrx::report();
     }
     if findings.is_empty() {
         println!("hv-fuzz: {} inputs, no finding", total);

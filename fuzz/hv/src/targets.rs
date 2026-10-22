@@ -36,6 +36,7 @@ pub static ALL: &[Target] = &[
     Target { name: "blk", run: blk_target, max_len: 8192 },
     Target { name: "net", run: net_target, max_len: 8192 },
     Target { name: "offload", run: crate::offloadmodel::offload_target, max_len: 4096 },
+    Target { name: "netrx", run: crate::netrx::netrx_target, max_len: 2048 },
     Target { name: "walk", run: walk, max_len: 2048 },
     Target { name: "insn", run: insn, max_len: 256 },
     Target { name: "linux", run: linux, max_len: 4096 },
@@ -889,7 +890,12 @@ fn blk_target(r: &mut Input) {
 /// frames to deliver, as the fuzzer makes them.
 #[derive(Default)]
 pub struct NicState {
-    pub rx: VecDeque<Vec<u8>>,
+    /// Frames for the guest -- whole, their checksum left to finish, or
+    /// sends carried whole.
+    pub rx: VecDeque<(Vec<u8>, crate::offload::Rx)>,
+    /// What the device last told it its guest takes (`Backend::takes`),
+    /// which `netrx` holds to the driver's features.
+    pub takes: crate::offload::Takes,
 }
 
 pub struct Nic(pub Arc<Mutex<NicState>>);
@@ -898,11 +904,42 @@ impl net::Backend for Nic {
     fn send(&mut self, frame: &[u8]) {
         invariant!(frame.len() <= net::MAX_FRAME, "a frame of {} bytes sent, past {}", frame.len(), net::MAX_FRAME);
     }
+    /// The next frame finished -- whole, before it is cut to `buf` -- as
+    /// the switch's own `recv` hands one; a send carried whole, which no
+    /// frame's buffer holds, dropped.
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let f = self.0.lock().unwrap().rx.pop_front()?;
-        let n = f.len().min(buf.len());
-        buf[..n].copy_from_slice(&f[..n]);
-        Some(n)
+        use crate::offload::Rx;
+        let mut s = self.0.lock().unwrap();
+        loop {
+            let (mut f, rx) = s.rx.pop_front()?;
+            match rx {
+                Rx::Whole(_) => continue,
+                Rx::Partial(p) => p.complete(&mut f),
+                Rx::Done => {}
+            }
+            let n = f.len().min(buf.len());
+            buf[..n].copy_from_slice(&f[..n]);
+            return Some(n);
+        }
+    }
+    /// What waits, as the switch hands it over: each as it was put in,
+    /// whatever the device has said its guest takes since -- a frame put in
+    /// before its driver took other features is the device's to finish, or
+    /// drop -- and a send carried whole only when it fits.
+    fn recv_with(&mut self, buf: &mut [u8]) -> Option<(usize, crate::offload::Rx)> {
+        let mut s = self.0.lock().unwrap();
+        loop {
+            let (f, rx) = s.rx.pop_front()?;
+            if matches!(rx, crate::offload::Rx::Whole(_)) && f.len() > buf.len() {
+                continue;
+            }
+            let n = f.len().min(buf.len());
+            buf[..n].copy_from_slice(&f[..n]);
+            return Some((n, rx));
+        }
+    }
+    fn takes(&mut self, takes: crate::offload::Takes) {
+        self.0.lock().unwrap().takes = takes;
     }
 }
 
@@ -996,7 +1033,7 @@ fn net_target(r: &mut Input) {
             10 => {
                 let n = r.pick(&[0usize, 13, 14, 60, 64, 1500, 1514, 1515, 4000]);
                 let frame: Vec<u8> = (0..n).map(|_| r.u8()).collect();
-                state.lock().unwrap().rx.push_back(frame);
+                state.lock().unwrap().rx.push_back((frame, crate::offload::Rx::Done));
             }
             11 => {
                 nic.set_msix_enabled(r.bool());
@@ -1018,7 +1055,7 @@ fn net_target(r: &mut Input) {
                     {
                         let mut s = state.lock().unwrap();
                         while s.rx.len() < RACE_POSTS + 2 {
-                            s.rx.push_back(vec![0x5A; 60]);
+                            s.rx.push_back((vec![0x5A; 60], crate::offload::Rx::Done));
                         }
                     }
                     let segs = [(gpa(r), 1526, true)];
