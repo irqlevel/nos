@@ -110,6 +110,11 @@ hreflang alternates, with `x-default` on the English one.
   `BreadcrumbList`)
 - `GOOGLE_SITE_VERIFICATION` / `YANDEX_VERIFICATION` put the verification meta tags
   in every page
+- `YANDEX_METRIKA_ID` puts a Yandex Metrica counter in every page, early in
+  `<head>`, and reports the pages reached without a reload as hits
+  (`src/components/MetrikaHits.tsx`); the Content-Security-Policy then lets
+  Metrica's hosts in, and its sites frame the pages for Session Replay. Without
+  it a build has no counter and a policy of this origin alone
 
 After the first deploy: add the site in [Google Search Console](https://search.google.com/search-console)
 and [Yandex Webmaster](https://webmaster.yandex.com), verify it with the meta tag
@@ -167,8 +172,8 @@ The web container runs as an unprivileged user on a read-only filesystem with
 every capability dropped, and is reachable only through Caddy. The pages send
 `X-Content-Type-Options`, `Referrer-Policy`, `X-Frame-Options` and a
 `Content-Security-Policy` that allows only this origin (`next.config.ts`);
-Caddy adds HSTS. Anything loaded from another origin -- an analytics script, say --
-has to be added to that policy first.
+Caddy adds HSTS. Anything loaded from another origin has to be added to that
+policy first, as Yandex Metrica's hosts are when the build has a counter.
 
 Node and Caddy are pinned to a minor version (`node:24.22-alpine`,
 `caddy:2.11-alpine`), so a rebuild picks up their patch releases; the npm
