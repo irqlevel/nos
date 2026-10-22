@@ -25,6 +25,11 @@ namespace Kernel
             ulong prevRbp = *(ulong *)(currRbp);
             ulong retAddress = *(ulong *)(currRbp + sizeof(ulong));
 
+            /* The outermost frame of a task's: nothing called its entry
+               function (Hal::BuildTaskFrame) */
+            if (retAddress == 0)
+                break;
+
             frames[i++] = retAddress;
 
             /* Stack grows downward: caller's RBP must be strictly higher */

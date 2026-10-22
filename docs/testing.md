@@ -41,6 +41,14 @@ millisecond twenty-one times while the CPU halts between interrupts: the
 median sleep must be under 5 ms -- 1.0-2.4 under HVF and TCG, 10.0 when the
 CPU's timer is not armed for a sleeper's deadline and the tick wakes it
 ([the local timer](scheduler.md#the-local-timer)).
+Once, from the boot CPU with the others up, `TestTaskLocate` finds tasks
+where they are ([waiting for one to end](scheduler.md#waiting-for-one-to-end)):
+one blocked on an event, read off its stack; one on another CPU with
+interrupts off, which must be named as that CPU's after the tenth of a
+second the test waits for it; one spinning on that CPU, caught there by the
+IPI -- through the slot the deaf CPU answered late, which has to be
+reusable -- each held to frames naming the function it is in; and a join
+of 50 ms reported at a report interval of 20.
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.
@@ -1334,9 +1342,12 @@ eighteen `mov`s the host's: DR7 armed, and in the handler DR6 read and
 cleared and DR7 turned off. After both rounds `hv` must count at least two
 switches between guests a guest -- each guest's VM on CPU 0 and on CPU 3,
 after another guest's -- each with an IBPB where the CPU offers one, which
-QEMU's TCG does not, and `hv` must say so; and where `hv on` set
-IA32_SPEC_CTRL -- under VT-x, its IBRS -- every CPU's register, read back,
-must still have it. Every guest ran through the run stub's clearing of the
+QEMU's TCG does not, and `hv` must say so; on an AMD CPU a guest could
+otherwise steer the host's branches or returns on -- the AX41's Zen 2,
+under KVM -- that is the IBPB after every exit, issued at least once a
+switch. And where `hv on` set IA32_SPEC_CTRL -- under VT-x, its IBRS; under
+AMD-V, STIBP, for which the machine's cores have two threads each -- every
+CPU's register, read back, must still have it. Every guest ran through the run stub's clearing of the
 registers and refill of the return stack after each exit. The unload that
 follows, and the load after it, are then of a hypervisor that has run
 guests on those CPUs.

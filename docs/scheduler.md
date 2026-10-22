@@ -355,6 +355,53 @@ returning from its function: `ExecCallback` calls `Exit()`, which stamps the
 exit time, removes the task from the table, sets `StateExited` and calls
 `Schedule()` — which never returns.
 
+### Waiting for one to end
+
+`Task::Wait()` is the join every stop path makes -- a Rust `TaskHandle`
+dropped or waited on among them: `hv stop` waiting for a guest's task, the
+guest's disk waiting for its own, `rmmod`, the host's shutdown. It never
+gives up, because a task that has not exited is still using whatever its
+waiter is about to free. It does not wait in silence either: ten seconds in,
+and again each time the wait has doubled (five minutes apart at most), it
+reports to the kernel log who waits, for which task, for how long, and where
+that task is, its frames named --
+
+```
+join: shell (pid 12) has waited 10000 ms for hv/vm3/vda (pid 57) to exit, and it is blocked
+join:   [0] 0xFFFF80000105AF99 Kernel::TaskQueue::Schedule+0x449
+join:   [1] 0xFFFF80000105B594 Kernel::ScheduleCurrent+0x154
+...
+```
+
+-- which is what the TLB shootdown's naming of the CPUs that never answered
+is for a CPU, for a task. Where a task is comes from `Task::Locate`, which
+`bt` uses too:
+
+- **Off its CPU** -- blocked, asleep, or runnable and waiting for its turn --
+  it is read off its own stack: the frame pointer its switch saved, the
+  chain walked inside the stack's bounds (`Hal::TaskSavedFramePointer`
+  checks the saved frame lies inside them too, since the saved stack pointer
+  is read with nothing holding the task still). The read is a seqlock's:
+  kept only if the task's switch count and state show it did not run while
+  it was read, and looked at again if it did. A lost race names wrong frames
+  and is thrown away; it cannot fault, because the stack stays mapped while
+  the asker holds its reference.
+- **On a CPU**, it is asked about: an IPI to every other CPU, whose handler
+  checks whether the task it landed on is the one wanted and, if so, records
+  where it was -- the interrupted instruction and the frames above it.
+- **On a CPU that does not answer** -- interrupts off, which is usually
+  where such a task is -- the CPU is named after a second instead: "on a cpu
+  that would not answer: cpus 0x20 took no interrupt in 1000 ms". What the
+  IPI writes into is one slot per CPU, made the first time that CPU is asked
+  and kept for good, never the asker's stack: a CPU that takes the IPI late
+  would otherwise write into a stack long since reused. A slot whose IPI is
+  still unanswered is not sent again, and the CPU is named again; one
+  answered late is reused.
+
+The boot self-test `TestTaskLocate` holds each case to frames that name the
+function the task is in -- a CPU kept deaf for a tenth of a second included
+-- and has a join reported.
+
 ## The idle task
 
 Each CPU's idle task is created by `Cpu::Run()`, pinned to that CPU and
@@ -382,5 +429,5 @@ soft IRQs still run, and halts.
 | `ps` | Every task: pid, state, flags, accumulated runtime, context switches, name |
 | `top [ms]` | Per-task CPU use over a window, as a percentage per CPU (a busy thread reads 100%, a 20-CPU box tops out at 2000%), plus the migration count and the deferred reschedules |
 | `stacks` | High-water mark of every task stack and every static boot stack |
-| `bt <pid>` | Stack trace of a task, using an IPI to capture it if it is running on another CPU |
+| `bt <pid>` | Where a task is and its stack trace (`Task::Locate`, [above](#waiting-for-one-to-end)): read off its stack when it is off its CPU, caught by an IPI on the CPU running it, or the CPUs that would not answer one named |
 | `profile` | Where the time actually goes — see [Profiler](profiler.md) |

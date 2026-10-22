@@ -2563,6 +2563,12 @@ const CR4_MARK: u32 = u32::from_le_bytes(*b"CR4!");
 const CR4_READ_COUNT: usize = 6;
 const CR4_WRITE_COUNT: u64 = 5;
 const CR4_REFUSED: u32 = 3;
+/// Of those, the ones no CR4 takes in long mode on any CPU -- PAE cleared,
+/// a bit above 31 -- which an AMD CPU may refuse itself, before its
+/// intercept: the AX41's Zen 2 does, under KVM, and QEMU's TCG leaves them
+/// to the host. PKE is refused only because the guest's CPUID does not
+/// offer it, and that is the host's to do wherever it runs.
+const CR4_CPU_REFUSABLE: u64 = 2;
 /// Under VT-x, which stops a guest at a write that changes a bit the host
 /// keeps and answers its reads from the read shadow: the writes that stop
 /// it -- MCE cleared, PKE, bit 32 -- and of those the ones refused. PAE
@@ -2670,9 +2676,11 @@ fn under_qemu_tcg() -> bool {
 /// set -- while the CPU's CR4 kept MCE; PKE, which its CPUID never
 /// offers, PAE cleared in long mode and bit 32 were each a #GP, with no
 /// error code, CR4 as it was; and every read and write was performed by the
-/// host. On QEMU's TCG, which does not stop a guest at a read of CR4 though
-/// its VMCB asks (`under_qemu_tcg`), the reads are the CPU's own, and give
-/// the register, MCE in it; the writes are the host's all the same. Under
+/// host, but for the two refusals a CPU may make itself before its
+/// intercept (`CR4_CPU_REFUSABLE`). On QEMU's TCG, which does not stop a
+/// guest at a read of CR4 though its VMCB asks (`under_qemu_tcg`), the
+/// reads are the CPU's own, and give the register, MCE in it; the writes
+/// are the host's all the same. Under
 /// VT-x the same CR4s read back -- the read shadow's, its reads stopped
 /// nowhere -- while the CPU's kept MCE: the three writes that changed a bit
 /// the host keeps stopped and performed by the host, PKE and bit 32
@@ -2743,16 +2751,26 @@ fn check_cr4(m: &GuestMemory, stopped: &Stopped, counts: &Counts, held: &Held, v
         return Err(alloc::format!("it believes CR4 is {:#x} and the CPU ran it with {:#x}: wanted {:#x}, and that \
                                    with MCE", held.believed, held.register, CR4_PAE | CR4_PGE));
     }
-    if counts.cr4 != performed || counts.cr4_gp != u64::from(CR4_REFUSED) {
-        return Err(alloc::format!("the host performed {} of its CR4 accesses and refused {}: wanted {} and {}",
-                                  counts.cr4, counts.cr4_gp, performed, CR4_REFUSED));
+    /* What did not reach the host is what the CPU refused itself: no more
+     * than it may, and with what the host refused, every refusal the
+     * guest's handler took. */
+    let by_cpu = performed.saturating_sub(counts.cr4);
+    if counts.cr4 > performed || by_cpu > CR4_CPU_REFUSABLE || counts.cr4_gp + by_cpu != u64::from(CR4_REFUSED) {
+        return Err(alloc::format!("the host performed {} of its CR4 accesses and refused {}: wanted {} and {}, or \
+                                   up to {} fewer of each, refused by the CPU itself",
+                                  counts.cr4, counts.cr4_gp, performed, CR4_REFUSED, CR4_CPU_REFUSABLE));
     }
     let writes = "while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was";
-    Ok(if tcg {
-        alloc::format!("its writes the host's, MCE cleared in the CR4 the host keeps for it, {} -- its reads the \
-                        CPU's own, QEMU's TCG not stopping a read of CR4 though the VMCB asks", writes)
+    let own = if by_cpu == 0 {
+        String::new()
     } else {
-        alloc::format!("it read back what it wrote, MCE cleared and then PGE set, {}", writes)
+        alloc::format!(" -- {} of them the CPU's own, before its intercept", by_cpu)
+    };
+    Ok(if tcg {
+        alloc::format!("its writes the host's, MCE cleared in the CR4 the host keeps for it, {}{} -- its reads the \
+                        CPU's own, QEMU's TCG not stopping a read of CR4 though the VMCB asks", writes, own)
+    } else {
+        alloc::format!("it read back what it wrote, MCE cleared and then PGE set, {}{}", writes, own)
     })
 }
 

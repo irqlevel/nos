@@ -13,7 +13,6 @@
 #include "mutex.h"
 #include "task.h"
 #include "stack_probe.h"
-#include "stack_trace.h"
 #include "symtab.h"
 #include "profiler.h"
 #include "module.h"
@@ -839,18 +838,6 @@ static void DumpStackTrace(ulong* frames, size_t count, Stdlib::Printer& con)
     }
 }
 
-struct BtCtx
-{
-    ulong Frames[16];
-    size_t Count;
-};
-
-static void CmdBtIPIFunc(void* ctx, Context* ipiCtx)
-{
-    auto* bt = static_cast<BtCtx*>(ctx);
-    bt->Count = StackTrace::CaptureFrom(ipiCtx->GetFramePointer(), bt->Frames, Stdlib::ArraySize(bt->Frames));
-}
-
 static void CmdBt(const char* args, Stdlib::Printer& con)
 {
     const char* end;
@@ -878,75 +865,13 @@ static void CmdBt(const char* args, Stdlib::Printer& con)
         return;
     }
 
-    ulong frames[16];
-    size_t count = 0;
+    Task::Where where;
+    task->Locate(where);
 
-    Task* self = Task::GetCurrentTask();
-    if (task.Get() == self)
-    {
-        /* Target is the current task on this CPU */
-        count = StackTrace::Capture(frames, Stdlib::ArraySize(frames));
-        con.Printf("task %lu (%s) running on current cpu:\n", task->Pid, task->GetName());
-        DumpStackTrace(frames, count, con);
-        return;
-    }
-
-    long state = task->State.Get();
-    if (state == Task::StateRunning)
-    {
-        /* Task is running on another CPU — find which one */
-        ulong cpuMask = CpuTable::GetInstance().GetRunningCpus();
-        ulong runCpu = ~0UL;
-        for (ulong i = 0; i < MaxCpus; i++)
-        {
-            if (!(cpuMask & (1UL << i)))
-                continue;
-            auto& cpuTaskQueue = CpuTable::GetInstance().GetCpu(i).GetTaskQueue();
-            if (task->TaskQueue == &cpuTaskQueue)
-            {
-                runCpu = i;
-                break;
-            }
-        }
-
-        if (runCpu == ~0UL)
-        {
-            con.Printf("task %lu (%s) running but cpu not found\n",
-                task->Pid, task->GetName());
-            return;
-        }
-
-        BtCtx btCtx;
-        btCtx.Count = 0;
-
-        IPITask ipiTask(CmdBtIPIFunc, &btCtx);
-        CpuTable::GetInstance().GetCpu(runCpu).QueueIPITask(ipiTask);
-
-        con.Printf("task %lu (%s) running on cpu %lu:\n",
-            task->Pid, task->GetName(), runCpu);
-        DumpStackTrace(btCtx.Frames, btCtx.Count, con);
-        return;
-    }
-
-    if (state == Task::StateExited)
-    {
-        con.Printf("task %lu (%s) has exited\n", task->Pid, task->GetName());
-        return;
-    }
-
-    /* Task is waiting/sleeping — walk from saved context */
-    ulong savedRsp = task->Rsp;
-    if (savedRsp == 0)
-    {
-        con.Printf("task %lu (%s) has no saved context\n", task->Pid, task->GetName());
-        return;
-    }
-
-    count = StackTrace::CaptureFrom(Hal::TaskSavedFramePointer(savedRsp),
-        frames, Stdlib::ArraySize(frames));
-
-    con.Printf("task %lu (%s) state %lu:\n", task->Pid, task->GetName(), (ulong)state);
-    DumpStackTrace(frames, count, con);
+    char what[2 * SymbolTable::DescribeMax];
+    where.Describe(what, sizeof(what));
+    con.Printf("task %lu (%s) %s:\n", task->Pid, task->GetName(), what);
+    DumpStackTrace(where.Frames, where.Count, con);
 }
 
 static void CmdPanic(const char* args, Stdlib::Printer& con)

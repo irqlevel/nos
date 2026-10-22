@@ -273,6 +273,10 @@ ulong BuildTaskFrame(ulong stackTop, ulong entry, ulong arg)
        happens to put StackTop. */
     ulong* rsp = (ulong *)((stackTop & ~(AbiStackAlign - 1)) - AbiStackAlign);
     rsp[0] = entry; /* return address SwitchContext's ret pops */
+    /* and the entry function's own, which it has none of: 0 ends a
+       backtrace there (StackTrace::CaptureFrom), where the stack's poison
+       read as one more frame of every task's */
+    rsp[1] = 0;
     Kernel::Context* regs = (Kernel::Context*)((ulong)rsp - sizeof(*regs));
     Stdlib::MemSet(regs, 0, sizeof(*regs));
     regs->Rdi = arg;         /* 1st argument for the entry function */
@@ -445,8 +449,13 @@ void PrintCpuState(Stdlib::Printer& con)
         GetCr0(), GetCr2(), GetCr3(), GetCr4());
 }
 
-ulong TaskSavedFramePointer(ulong savedSp)
+ulong TaskSavedFramePointer(ulong savedSp, ulong stackBase, ulong stackLimit)
 {
+    /* SwitchContext's PushAll is a Context, all of it */
+    if (savedSp % sizeof(ulong) != 0 || savedSp < stackBase || savedSp > stackLimit ||
+        stackLimit - savedSp < sizeof(Kernel::Context))
+        return 0;
+
     return ((Kernel::Context*)savedSp)->Rbp;
 }
 
