@@ -455,7 +455,12 @@ IPv4 to be cut, a frame whose checksum is left to the device, and noise,
 each well made or not -- held frame by frame to a model of its own written
 from virtio's and the RFCs' words, and on their own terms: no frame over
 1514 bytes, every checksum right, the payloads in order adding up to the
-send's -- the page walker over random page tables, the decoder, the
+send's; what it puts into the buffers its driver posts (`netrx`) -- a frame
+into one chain, or spread over mergeable buffers with their count in its
+header, a send carried whole with the header that says how to cut it, a
+checksum left to finish with the header that says where, or finished first
+for a driver that takes none so -- each used element held to the model's
+chain, length and bytes -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
 `place` holds where guests are put on the host's cores (`hv/src/place.rs`)
@@ -497,7 +502,10 @@ guest's bursts among them, past its share of `hv0`'s backlog (the backlog
 over the ports in use, counted afresh at each of the stack's passes) and
 past its rate to every port, the clock moved on now and then for the rate
 to come back, and ports whose NIC holds its receive interrupts, a frame for
-which wakes nobody while the inbox is under half full; `nat`,
+which wakes nobody while the inbox is under half full -- and sends of TCP
+whole and frames with their checksum left to finish among them, each handed
+so to a port whose guest takes it so, and cut, or finished, for every other
+and for `hv0`; `nat`,
 guests' packets out into the world and the world's answers back, each
 rewrite checked field by field and its sums summed from scratch; and
 `guestnet`, the two as the module wires them, guests on the switch reaching

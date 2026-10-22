@@ -623,8 +623,8 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             if broken { "; stopped over a ring the driver broke" } else { "" });
     }
     for (i, (s, broken)) in guest.nic_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped, {} sends cut into frames by the device{}",
-            i, s.sent, s.received, s.dropped, s.cut,
+        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}",
+            i, s.sent, s.received, s.dropped, s.large, s.whole,
             if broken { "; stopped over a ring the driver broke" } else { "" });
     }
     let hot = guest.hot_ports(6);

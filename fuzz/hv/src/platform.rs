@@ -1227,7 +1227,7 @@ impl Script {
                     }
                     for n in &self.nics {
                         let len = r.pick(&[60usize, 64, 590, 1514, 1515, 20]);
-                        n.lock().unwrap().rx.push_back((0..len).map(|i| i as u8).collect());
+                        n.lock().unwrap().rx.push_back(((0..len).map(|i| i as u8).collect(), crate::offload::Rx::Done));
                     }
                     Exit::Host
                 }

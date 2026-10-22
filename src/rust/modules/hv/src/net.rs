@@ -55,7 +55,9 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use hv::offload::{self, Partial, Rx, Takes, Tcp4};
 
 use kcore::consts::NS_PER_SEC;
 use kcore::net::{Nat, NatError};
@@ -72,6 +74,15 @@ pub const MAX_PORTS: usize = 16;
 /// at once lost frames on every burst, kicked or not.
 const INBOX_FRAMES: usize = 256;
 const FRAME: usize = hv::nic::MAX_FRAME;
+/// Sends of TCP up to 64 KiB an inbox holds whole at once, for a guest
+/// whose NIC takes them so (`Backend::takes_whole`), in room of their own
+/// taken with the inbox's: one more waits as frames, cut.
+const WHOLE_SENDS: usize = 8;
+const SEND: usize = offload::MAX_SEND;
+/// An inbox entry that is a frame and not a whole send.
+const NOT_WHOLE: u8 = u8::MAX;
+/// Every room for a whole send, a bit each.
+const ALL_SENDS: u8 = ((1u16 << WHOLE_SENDS) - 1) as u8;
 /// What a port may send to every port at once, and how many a second after:
 /// ARP and DHCP's few, with room to spare.
 pub const FLOOD_BURST: u64 = 64;
@@ -148,6 +159,44 @@ struct Inbox {
     lens: [u16; INBOX_FRAMES],
     head: usize,
     count: usize,
+    /// Which entries are whole sends -- their room, or `NOT_WHOLE` -- and
+    /// the room for them: `WHOLE_SENDS` of `SEND` bytes, taken with the
+    /// frames' and apart, the heap having no half megabyte in one piece to
+    /// give; their lengths, how each is to be cut, and which are free, a bit
+    /// each.
+    whole: [u8; INBOX_FRAMES],
+    /// A frame's checksum left to finish, where its guest's NIC takes them
+    /// so.
+    partial: [Option<Partial>; INBOX_FRAMES],
+    sends: Vec<Vec<u8>>,
+    send_lens: [usize; WHOLE_SENDS],
+    layouts: [Option<Tcp4>; WHOLE_SENDS],
+    free_sends: u8,
+}
+
+impl Inbox {
+    /// Empty, every room for a whole send free.
+    fn clear(&mut self) {
+        self.head = 0;
+        self.count = 0;
+        self.whole = [NOT_WHOLE; INBOX_FRAMES];
+        self.partial = [None; INBOX_FRAMES];
+        self.layouts = [None; WHOLE_SENDS];
+        self.free_sends = ALL_SENDS;
+    }
+
+    /// The entry at the head taken off, its room for a whole send freed.
+    fn pop(&mut self) {
+        let w = usize::from(self.whole[self.head]);
+        if w < WHOLE_SENDS {
+            self.free_sends |= 1 << w;
+            self.layouts[w] = None;
+        }
+        self.whole[self.head] = NOT_WHOLE;
+        self.partial[self.head] = None;
+        self.head = (self.head + 1) % INBOX_FRAMES;
+        self.count -= 1;
+    }
 }
 
 /// A port's sends to every port: how many it may make now, and when that was
@@ -198,6 +247,10 @@ struct Port {
     /// own, its receive interrupts held till then (`Backend::quiet_until`):
     /// a frame put in before it wakes nobody.
     quiet_until: AtomicU64,
+    /// Whether its VM's NIC takes checksums left to finish, and sends of TCP
+    /// whole (`Backend::takes`).
+    takes_partial: AtomicBool,
+    takes_whole: AtomicBool,
 }
 
 /// What a port's guest lost, since it claimed the port: frames for it its
@@ -270,6 +323,12 @@ fn ingress(port: usize, frame: &[u8]) -> Ingress {
 impl Ports {
     /// A frame into a port's inbox, and its VM woken.
     fn deliver(&self, port: usize, frame: &[u8]) {
+        self.deliver_rx(port, frame, None);
+    }
+
+    /// A frame into a port's inbox -- its checksum left to finish, for a NIC
+    /// that takes them so -- and its VM woken.
+    fn deliver_rx(&self, port: usize, frame: &[u8], partial: Option<Partial>) {
         let Some(p) = self.ports.get(port) else { return };
         let mut inbox = p.inbox.lock();
         if inbox.owner.is_none() {
@@ -282,8 +341,45 @@ impl Ports {
         let slot = (inbox.head + inbox.count) % INBOX_FRAMES;
         inbox.frames[slot][..frame.len()].copy_from_slice(frame);
         inbox.lens[slot] = frame.len() as u16;
+        inbox.whole[slot] = NOT_WHOLE;
+        inbox.partial[slot] = partial;
         inbox.count += 1;
         p.waiting.store(inbox.count, Ordering::Release);
+        Self::wake(p, &inbox);
+    }
+
+    /// A send of TCP up to 64 KiB into a port's inbox whole, for a VM whose
+    /// NIC takes it so, and its VM woken: false where it does not, or there
+    /// is no room for it whole -- the caller cuts it then.
+    fn deliver_whole(&self, port: usize, frame: &[u8], layout: Tcp4) -> bool {
+        let Some(p) = self.ports.get(port) else { return true };
+        if !p.takes_whole.load(Ordering::Acquire) || frame.len() > SEND {
+            return false;
+        }
+        let mut inbox = p.inbox.lock();
+        if inbox.owner.is_none() {
+            return true;
+        }
+        if inbox.count == INBOX_FRAMES || inbox.free_sends == 0 || inbox.sends.len() < WHOLE_SENDS {
+            return false;
+        }
+        let w = inbox.free_sends.trailing_zeros() as usize;
+        inbox.free_sends &= !(1 << w);
+        inbox.sends[w][..frame.len()].copy_from_slice(frame);
+        inbox.send_lens[w] = frame.len();
+        inbox.layouts[w] = Some(layout);
+        let slot = (inbox.head + inbox.count) % INBOX_FRAMES;
+        inbox.whole[slot] = w as u8;
+        inbox.partial[slot] = None;
+        inbox.count += 1;
+        p.waiting.store(inbox.count, Ordering::Release);
+        Self::wake(p, &inbox);
+        true
+    }
+
+    /// A port's VM woken for what was just put in its inbox -- under the
+    /// lock, which keeps the VM there while it is.
+    fn wake(p: &Port, inbox: &Inbox) {
         /* Not while its NIC holds its receive interrupts: its round comes
          * for what is here by then on its own, and a kick per frame would
          * hand each over alone -- unless the inbox is filling, which a
@@ -300,6 +396,51 @@ impl Ports {
         if let Some(owner) = &inbox.owner {
             owner.wake_up();
         }
+    }
+
+    /// A frame from port `from`'s guest whose checksum it left to finish: so
+    /// to the port it is for, if that port's NIC takes it so, and finished
+    /// for anyone else -- `hv0` and NAT, everyone -- going on as a frame
+    /// sent would.
+    fn forward_partial(&self, from: usize, frame: &mut [u8], partial: Partial) {
+        if frame.len() >= netwire::ETH_HDR_LEN && matches!(ingress(from, frame), Ingress::Own) && frame[0] & 1 == 0 {
+            if let Some(q) = port_of(&frame[..6]) {
+                if q != from && self.ports.get(q).is_some_and(|p| p.takes_partial.load(Ordering::Acquire)) {
+                    self.deliver_rx(q, frame, Some(partial));
+                    return;
+                }
+            }
+        }
+        partial.complete(frame);
+        self.forward(Some(from), frame);
+    }
+
+    /// A send of TCP up to 64 KiB from port `from`'s guest, held up by its
+    /// NIC (`offload::check_tcp4`): whole to the port it is for, if that
+    /// port's NIC takes it so and has room, and cut into frames for anyone
+    /// else -- another guest, `hv0` and NAT, everyone -- each going on as a
+    /// frame sent would.
+    fn forward_tcp4(&self, from: usize, frame: &[u8], layout: Tcp4) {
+        if frame.len() < netwire::ETH_HDR_LEN {
+            return;
+        }
+        if !matches!(ingress(from, frame), Ingress::Own) {
+            /* Not its own, or not what it says: each frame cut from it would
+             * be refused and counted the same, one by one. */
+            let mut seg = [0u8; FRAME];
+            offload::segment_tcp4(frame, layout, &mut seg, &mut |f| self.forward(Some(from), f));
+            return;
+        }
+        let dst = &frame[..6];
+        if dst[0] & 1 == 0 {
+            if let Some(p) = port_of(dst) {
+                if p != from && self.deliver_whole(p, frame, layout) {
+                    return;
+                }
+            }
+        }
+        let mut seg = [0u8; FRAME];
+        offload::segment_tcp4(frame, layout, &mut seg, &mut |f| self.forward(Some(from), f));
     }
 
     /// A frame to wherever its destination says, from port `from` -- or
@@ -398,23 +539,47 @@ impl Ports {
         BACKLOG / self.in_use.load(Ordering::Relaxed).max(1)
     }
 
-    /// The next frame in a port's inbox, into `buf`.
-    fn take(&self, port: usize, buf: &mut [u8]) -> Option<usize> {
+    /// The next frame in a port's inbox, into `buf` -- or a send carried
+    /// whole, and how it is to be cut, if `buf` has the room; one it has
+    /// not is dropped, counted. A checksum left to finish is finished first,
+    /// over the whole frame, for a caller that takes none partial (`finish`).
+    fn take(&self, port: usize, buf: &mut [u8], finish: bool) -> Option<(usize, Rx)> {
         let p = self.ports.get(port)?;
         if p.waiting.load(Ordering::Acquire) == 0 {
             return None;
         }
         let mut inbox = p.inbox.lock();
-        if inbox.count == 0 {
-            return None;
+        while inbox.count != 0 {
+            let slot = inbox.head;
+            let w = usize::from(inbox.whole[slot]);
+            let got = if w < WHOLE_SENDS {
+                let len = inbox.send_lens[w];
+                let layout = inbox.layouts[w];
+                if len <= buf.len() {
+                    buf[..len].copy_from_slice(&inbox.sends[w][..len]);
+                    layout.map(|t| (len, Rx::Whole(t)))
+                } else {
+                    p.dropped.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            } else {
+                let whole_len = usize::from(inbox.lens[slot]);
+                let mut rx = inbox.partial[slot].map_or(Rx::Done, Rx::Partial);
+                if let (Rx::Partial(partial), true) = (rx, finish) {
+                    partial.complete(&mut inbox.frames[slot][..whole_len]);
+                    rx = Rx::Done;
+                }
+                let len = whole_len.min(buf.len());
+                buf[..len].copy_from_slice(&inbox.frames[slot][..len]);
+                Some((len, rx))
+            };
+            inbox.pop();
+            p.waiting.store(inbox.count, Ordering::Release);
+            if got.is_some() {
+                return got;
+            }
         }
-        let slot = inbox.head;
-        let len = usize::from(inbox.lens[slot]).min(buf.len());
-        buf[..len].copy_from_slice(&inbox.frames[slot][..len]);
-        inbox.head = (inbox.head + 1) % INBOX_FRAMES;
-        inbox.count -= 1;
-        p.waiting.store(inbox.count, Ordering::Release);
-        Some(len)
+        None
     }
 }
 
@@ -438,8 +603,30 @@ impl hv::nic::Backend for PortBackend {
         self.ports.forward(Some(self.port), frame);
     }
 
+    fn send_partial(&mut self, frame: &mut [u8], partial: Partial) {
+        self.ports.forward_partial(self.port, frame, partial);
+    }
+
+    fn send_tcp4(&mut self, frame: &[u8], layout: Tcp4) {
+        self.ports.forward_tcp4(self.port, frame, layout);
+    }
+
+    /// A frame, its checksum finished if it was left to -- a whole send has
+    /// no room in `buf` and is dropped, which none is put in for a NIC that
+    /// has not said it takes them.
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
-        self.ports.take(self.port, buf)
+        self.ports.take(self.port, buf, true).map(|(len, _)| len)
+    }
+
+    fn recv_with(&mut self, buf: &mut [u8]) -> Option<(usize, Rx)> {
+        self.ports.take(self.port, buf, false)
+    }
+
+    fn takes(&mut self, takes: Takes) {
+        if let Some(p) = self.ports.ports.get(self.port) {
+            p.takes_partial.store(takes.partial, Ordering::Release);
+            p.takes_whole.store(takes.whole, Ordering::Release);
+        }
     }
 
     fn quiet_until(&mut self, until_ns: u64) {
@@ -473,6 +660,9 @@ impl Switch {
             ports.push(Port {
                 inbox: IrqSpinLock::new(Inbox {
                     owner: None, frames: Vec::new(), lens: [0; INBOX_FRAMES], head: 0, count: 0,
+                    whole: [NOT_WHOLE; INBOX_FRAMES], partial: [None; INBOX_FRAMES], sends: Vec::new(),
+                    send_lens: [0; WHOLE_SENDS],
+                    layouts: [None; WHOLE_SENDS], free_sends: ALL_SENDS,
                 }),
                 waiting: AtomicUsize::new(0),
                 dropped: AtomicU64::new(0),
@@ -483,6 +673,8 @@ impl Switch {
                 flood: IrqSpinLock::new(Flood::FULL),
                 flooded: AtomicU64::new(0),
                 quiet_until: AtomicU64::new(0),
+                takes_partial: AtomicBool::new(false),
+                takes_whole: AtomicBool::new(false),
             });
         }
         let ports = Arc::new(Ports {
@@ -536,9 +728,17 @@ impl Switch {
                 inbox.frames.is_empty()
             };
             let mut room = Vec::new();
+            let mut sends = Vec::new();
             if roomless {
                 room.try_reserve_exact(INBOX_FRAMES).map_err(|_| "out of memory for its port's inbox")?;
                 room.resize(INBOX_FRAMES, [0u8; FRAME]);
+                sends.try_reserve_exact(WHOLE_SENDS).map_err(|_| "out of memory for its port's inbox")?;
+                for _ in 0..WHOLE_SENDS {
+                    let mut send = Vec::new();
+                    send.try_reserve_exact(SEND).map_err(|_| "out of memory for its port's inbox")?;
+                    send.resize(SEND, 0);
+                    sends.push(send);
+                }
             }
             let mut inbox = p.inbox.lock();
             /* Taken, or given its room, by another start meanwhile: the room
@@ -546,12 +746,12 @@ impl Switch {
             if inbox.owner.is_none() && !(inbox.frames.is_empty() && room.is_empty()) {
                 if inbox.frames.is_empty() {
                     core::mem::swap(&mut inbox.frames, &mut room);
+                    core::mem::swap(&mut inbox.sends, &mut sends);
                 }
                 /* An Arc clone under the lock: a count going up, nothing
                  * allocated. */
                 inbox.owner = Some(vm.clone());
-                inbox.head = 0;
-                inbox.count = 0;
+                inbox.clear();
                 p.waiting.store(0, Ordering::Release);
                 p.dropped.store(0, Ordering::Relaxed);
                 p.spoofed.store(0, Ordering::Relaxed);
@@ -559,12 +759,15 @@ impl Switch {
                 p.over_share.store(0, Ordering::Relaxed);
                 p.flooded.store(0, Ordering::Relaxed);
                 p.quiet_until.store(0, Ordering::Release);
+                p.takes_partial.store(false, Ordering::Release);
+                p.takes_whole.store(false, Ordering::Release);
                 *p.flood.lock() = Flood { tokens: FLOOD_BURST, at: kcore::time::boot_time_ns() };
                 self.ports.in_use.fetch_add(1, Ordering::Relaxed);
                 return Ok(i);
             }
             drop(inbox);
             drop(room);
+            drop(sends);
         }
         Err("every port of the switch is taken")
     }
@@ -574,7 +777,7 @@ impl Switch {
         let Some(p) = self.ports.ports.get(port) else { return };
         let owner = {
             let mut inbox = p.inbox.lock();
-            inbox.count = 0;
+            inbox.clear();
             p.waiting.store(0, Ordering::Release);
             inbox.owner.take()
         };
