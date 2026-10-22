@@ -77,6 +77,10 @@ pub struct Spec {
     /// delivery, for an x2APIC guest), or injected by the run loop. Neither,
     /// the CPU's where it takes another CPU's interrupts posted too.
     pub apicv: Option<bool>,
+    /// `rxmod=US`: its NICs' receive interrupts no closer than this apart,
+    /// 0 for each as its frame comes; unset, hv's default
+    /// (`hv::run::RX_MODERATION_DEFAULT_NS`).
+    pub rxmod_us: Option<u64>,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
@@ -127,6 +131,7 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         xapic: false,
         ioapic: false,
         apicv: None,
+        rxmod_us: None,
         log: false,
         restart: false,
         net: false,
@@ -177,6 +182,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.apicv = Some(true);
         } else if word == "noapicv" {
             spec.apicv = Some(false);
+        } else if let Some(v) = word.strip_prefix("rxmod=") {
+            spec.rxmod_us = Some(v.parse().map_err(|_| String::from("rxmod= wants microseconds"))?);
         } else if word == "restart" {
             spec.restart = true;
         } else if word == "net" {
@@ -301,6 +308,9 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         .map_err(|e| alloc::format!("no guest: {}", e))?;
     if let Some(on) = spec.apicv {
         guest.set_apicv(on);
+    }
+    if let Some(us) = spec.rxmod_us {
+        guest.set_rx_moderation(us.saturating_mul(kcore::consts::NS_PER_US));
     }
 
     /* The 64-bit kernel at its load address, then the initrd high. */

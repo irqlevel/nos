@@ -510,12 +510,12 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU --
                                 on cpus of them, each on a host CPU of its
                                 own -- for secs, then print its console and
                                 how it ended
-    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -1548,6 +1548,40 @@ and the 8259's, several exits apiece, at 55 to 70 MB/s, and TCP paces to
 it. That is the next thing to take out: fewer exits per frame, not more
 room for them.
 
+**Receive interrupts, moderated.** A guest that takes its frames faster than
+they come takes an interrupt for every one and acknowledges every one or
+two: two guests of two CPUs sending TCP to each other through the switch got
+1.1 frames an interrupt, and the receiver sent 140,000-180,000 ACKs for 500
+MB. So a NIC's receive interrupts are held at least 100 us apart
+(`Net::set_rx_moderation`; `rxmod=US` on `hv boot` and `hv start`, 0 for
+none), as a real NIC's interrupt throttling holds them: what arrives goes
+into the guest's buffers at once, its interrupt waits until the time since
+the last is up, and then one takes all that came; a frame after a quiet
+spell is interrupted for at once. Meanwhile the switch kicks nobody for a
+frame -- a kick each would hand each over alone -- unless the port's inbox
+is half full (`Backend::quiet_until`), and the vCPU that does the devices'
+work comes back at the end of the window on its own (`Net::rx_due`): slept
+to when its guest is halted, and armed on its host CPU's timer before each
+entry otherwise, one more timer edge ([Time](#time)). On the EX44, the TCP
+pair, three runs at each window, taken in turns:
+
+| window | frames an interrupt | receiver's ACKs | 500 MB |
+|---|---|---|---|
+| none | 1.12-1.17 | 137,000-176,000 | 4.57-5.15 s (4.88) |
+| 25 us | 2.6-2.8 | 140,000-168,000 | 4.47-5.22 s (4.72) |
+| 50 us | 4.7-5.0 | 102,000-144,000 | 4.13-4.80 s (4.57) |
+| 100 us | 9.7-10.2 | 63,000-87,000 | 3.94-4.07 s (4.01) |
+| 200 us | 20.0-20.5 | 33,000-47,000 | 3.70-3.86 s (3.77) |
+
+The cost is latency where frames come close together: a hundred small HTTP
+fetches between the two, each its own connection, took 0.07 s with none,
+0.05-0.07 s at 50 and 100 us and 0.08-0.09 s at 200 us; a ping's round trip,
+0.24-0.30 ms on average, was the same at every window. Hence 100 us. hv-fuzz
+holds the NIC to raising what it owes by the time it said it would look
+again -- which found a queue taken down owing for good, a round the run loop
+would have made without a pause -- the switch's wakes to a model that knows
+each port's window, and runs whole machines with it on and off.
+
 **`hv forward` is how a guest is reached from outside.** The guests have
 addresses only on their switch; a forward listens on a port of nos's and,
 for each connection, opens one to the guest's port through `hv0`
@@ -2471,7 +2505,8 @@ done on purpose -- an interrupt held a bounded while for the frames behind
 it -- needs a host timer finer than the tick, which there is now ([the local
 timer](scheduler.md#the-local-timer)): the same wait slept rather than
 spun, which the 100 Hz tick made 5-10 ms, held 260-290 frames an interrupt
-and took 12.5-14.6 s, the TCP window run dry. None is in the tree.
+and took 12.5-14.6 s, the TCP window run dry. It is in the tree now, at 100
+us ([A network](#a-network)); halt polling is not.
 
 The `apicv` built-in guest asks for it, and holds both ways to one result:
 self-IPIs held by CR8 and taken by priority, one nested, IRR and ISR read
@@ -3617,9 +3652,9 @@ someone else's; then speed.
 6. **The larger ones.** ~~APICv and posted interrupts~~ done under VT-x, in
    x2APIC mode ([Interrupts the CPU delivers
    itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
-   left: a NIC's receive interrupts moderated on purpose, which halt
-   polling turned out to have been doing by accident (measured there), and
-   which the host's one-shot timer now makes possible; the xAPIC
+   ~~a NIC's receive interrupts moderated~~ done ([A network](#a-network)),
+   halt polling having turned out to do it by accident;
+   left: the xAPIC
    page's virtualization, and AMD's AVIC; device work off the first CPU's
    task, with a lock a device and the
    ring pages mapped once rather than at every access; nested leaves of 2

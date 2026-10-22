@@ -369,6 +369,16 @@ impl Counts {
 
 /// The most MSR accesses answered with #GP kept for a report.
 const MSR_FAULTS_KEPT: usize = 8;
+
+/// How far apart a NIC's receive interrupts are held at least, unless a
+/// guest asks otherwise (`rxmod=`), and the most it may ask: a frame after a
+/// quiet spell is still interrupted for at once (`net::Net::set_rx_moderation`).
+/// 100 us, from what the EX44 measured (docs/hypervisor.md): two guests'
+/// TCP through the switch 18% faster, ten frames an interrupt where there
+/// was one, and a hundred small HTTP fetches between them as quick as
+/// without; 200 us was 23% faster but made each fetch a quarter slower.
+pub const RX_MODERATION_DEFAULT_NS: u64 = 100_000;
+pub const MAX_RX_MODERATION_NS: u64 = 1_000_000;
 /// How many exits go by between reports of progress while the guest does
 /// not halt: a busy VM's counters are still seen moving.
 const PROGRESS_EVERY: u64 = 4096;
@@ -597,6 +607,9 @@ pub struct LinuxGuest {
     /// ones whose notification was sent to the CPU it was in its guest on.
     posted: AtomicU64,
     notified: AtomicU64,
+    /// How far apart its NICs' receive interrupts are held at least
+    /// (`set_rx_moderation`).
+    rx_moderation_ns: u64,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -722,6 +735,7 @@ impl LinuxGuest {
             apicv: None,
             posted: AtomicU64::new(0),
             notified: AtomicU64::new(0),
+            rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
         };
         Ok((guest, vcpus))
     }
@@ -745,6 +759,20 @@ impl LinuxGuest {
     /// find it at, more of them do -- docs/hypervisor.md has what that costs.
     pub fn set_apicv(&mut self, on: bool) {
         self.apicv = Some(on);
+    }
+
+    /// Its NICs' receive interrupts no closer than `ns` apart -- 0 for each
+    /// as its frame comes (`net::Net::set_rx_moderation`); the default is
+    /// [`RX_MODERATION_DEFAULT_NS`]. For the NICs it has and those it is
+    /// given after.
+    pub fn set_rx_moderation(&mut self, ns: u64) {
+        let ns = ns.min(MAX_RX_MODERATION_NS);
+        self.rx_moderation_ns = ns;
+        for d in self.platform.lock().pci_devs.iter_mut() {
+            if let PciDev::Nic(n) = d {
+                n.set_rx_moderation(ns);
+            }
+        }
     }
 
 
@@ -812,6 +840,7 @@ impl LinuxGuest {
             return Err(Error::NoMemory);
         }
         let mut nic = Net::new(backend, mac)?;
+        nic.set_rx_moderation(self.rx_moderation_ns);
         let io_base = NIC_IO_BASE + (p.nics as u16) * (net::BAR_SIZE as u16);
         let mut f = Function::device(&Net::identity(), io_base, net::BAR_SIZE, NIC_IRQ);
         if let Some(page) = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)? {
@@ -1084,6 +1113,7 @@ impl LinuxGuest {
              * an IO-APIC, what its pins send, delivered from here. */
             let mut extint = false;
             let mut pit_edge = None;
+            let mut devices_due = None;
             if me == 0 {
                 let mut p = self.platform.lock();
                 feed_console(&mut p, host);
@@ -1117,7 +1147,15 @@ impl LinuxGuest {
                 if p.uart.irq_line() {
                     p.pic.raise(COM1_IRQ);
                 }
-                self.poll_devices(&mut p, me as u32, &mut gc.lapic, &mut gc.counts);
+                self.poll_devices(&mut p, me as u32, &mut gc.lapic, &mut gc.counts, now);
+                /* When the devices' round has to come again on its own: a
+                 * receive interrupt held, and frames that woke nobody while
+                 * it is (`Net::rx_due`) -- slept to, or armed before the
+                 * guest is entered, below. */
+                devices_due = p.pci_devs.iter().filter_map(|d| match d {
+                    PciDev::Nic(n) => n.rx_due(now),
+                    PciDev::Disk(_) => None,
+                }).min();
                 pins |= sync_ioapic(&mut p, now);
                 self.ioapic_send(&mut p, pins, me as u32, &mut gc.lapic, &mut gc.counts);
                 extint = gc.lapic.accepts_extint() && p.pic.pending().is_some();
@@ -1159,6 +1197,7 @@ impl LinuxGuest {
                          * would only halt again. */
                         let until = pit_edge
                             .unwrap_or(u64::MAX)
+                            .min(devices_due.unwrap_or(u64::MAX))
                             .min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX))
                             .min(now.saturating_add(MAX_HALT_WAIT_NS))
                             .min(deadline);
@@ -1191,7 +1230,9 @@ impl LinuxGuest {
              * timer armed for it, so that a guest computing with no exit is
              * taken out of it then, as a halted one is woken then -- not at
              * the host's next tick, ten edges of a 1000 Hz guest late. */
-            let edge = pit_edge.unwrap_or(u64::MAX).min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX));
+            let edge = pit_edge.unwrap_or(u64::MAX)
+                .min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX))
+                .min(devices_due.unwrap_or(u64::MAX));
             if edge != u64::MAX {
                 kcore::cpu::timer_at(edge);
             }
@@ -1757,12 +1798,12 @@ impl LinuxGuest {
     /// What the disks' backends have served, given back to the guest, and
     /// what the NICs' backends have for it, into its buffers: each kind's
     /// line raised when that calls for an interrupt.
-    fn poll_devices(&self, p: &mut Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts) {
+    fn poll_devices(&self, p: &mut Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts, now: u64) {
         let mut raised = [Raise::default(); MAX_DISKS + MAX_NICS];
         for (d, r) in p.pci_devs.iter_mut().zip(raised.iter_mut()) {
             *r = match d {
                 PciDev::Disk(d) => d.poll(&self.memory),
-                PciDev::Nic(n) => n.poll(&self.memory),
+                PciDev::Nic(n) => n.poll(&self.memory, now),
             };
         }
         for (dev, r) in raised.iter().enumerate() {
@@ -2076,7 +2117,7 @@ impl LinuxGuest {
                 let value = v.save().rax as u32;
                 let raised = match dev {
                     Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory),
-                    Some(PciDev::Nic(n)) => n.io_write(offset, io.size, value, &self.memory),
+                    Some(PciDev::Nic(n)) => n.io_write(offset, io.size, value, &self.memory, time::boot_time_ns()),
                     None => Raise::default(),
                 };
                 if let Some(dev) = index.filter(|_| raised.any()) {

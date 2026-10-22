@@ -905,6 +905,17 @@ impl net::Backend for Nic {
     }
 }
 
+/// After a round of the NIC at `now` (`poll`): no receive interrupt still
+/// owed with its time up -- the round raises what is due -- and what it
+/// promised its backend, the next time it looks, ahead of `now`. Not after a
+/// notify: a transmit queue's runs no receive round, and what is due waits
+/// for the next, which a due time already past makes at once.
+fn rx_promise_kept(nic: &Net, now: u64) {
+    if let Some(due) = nic.rx_due(now) {
+        invariant!(due > now, "a receive interrupt owed since {} ns, and the round at {} did not raise it", due, now);
+    }
+}
+
 fn net_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
     let state = Arc::new(Mutex::new(NicState::default()));
@@ -912,8 +923,13 @@ fn net_target(r: &mut Input) {
     if r.bool() {
         nic.offer_msix(3);
     }
+    /* Receive interrupts moderated, on most inputs: what is owed comes by
+     * the time the device said it would look again (`rx_due`). */
+    if r.u8() < 192 {
+        nic.set_rx_moderation(r.pick(&[1_000u64, 20_000, 100_000, 1_000_000]));
+    }
     let mut queues = [DriverQueue::default(); 2];
-    while let Some(op) = r.op(13) {
+    while let Some(op) = r.op(14) {
         let which = r.below(2) as usize;
         match op {
             0 => {
@@ -921,22 +937,22 @@ fn net_target(r: &mut Input) {
             }
             1 => {
                 let (offset, size, value) = (r.below(u64::from(net::BAR_SIZE)) as u16, r.io_size(), r.value32());
-                nic.io_write(offset, size, value, &mem);
+                nic.io_write(offset, size, value, &mem, time::boot_time_ns());
             }
             2 => {
                 let mut write = |offset: u16, size: u8, value: u32| {
-                    nic.io_write(offset, size, value, &mem);
+                    nic.io_write(offset, size, value, &mem, time::boot_time_ns());
                 };
                 let index = if r.u8() < 240 { which as u16 } else { r.u16() };
                 setup_queue(r, &mut write, &mut queues[which], index);
             }
             3 => {
                 let status = r.pick(&[0, 1, 3, 7, 15, 0x80, 0xFF]);
-                nic.io_write(DEVICE_STATUS, 1, status, &mem);
+                nic.io_write(DEVICE_STATUS, 1, status, &mem, time::boot_time_ns());
             }
             4 => {
                 let queue = if r.u8() < 240 { which as u16 } else { r.u16() };
-                nic.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem);
+                nic.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem, time::boot_time_ns());
             }
             5 => {
                 let (at, n) = (gpa(r), r.below(64) as usize);
@@ -962,7 +978,13 @@ fn net_target(r: &mut Input) {
                 chain(&mem, &mut queues[1], r, &segs);
             }
             8 | 9 => {
-                nic.poll(&mem);
+                let now = time::boot_time_ns();
+                nic.poll(&mem, now);
+                rx_promise_kept(&nic, now);
+            }
+            13 => {
+                /* Time going by: a held receive interrupt's due, or not yet. */
+                time::advance(r.pick(&[500u64, 20_000, 100_000, 2_000_000]));
             }
             10 => {
                 let n = r.pick(&[0usize, 13, 14, 60, 64, 1500, 1514, 1515, 4000]);
@@ -983,7 +1005,7 @@ fn net_target(r: &mut Input) {
                     let segs = [(gpa(r), 10, false), (gpa(r), 60, false)];
                     chain(&mem, &mut queues[1], r, &segs);
                     racing(&mem, &mut queues[1], || {
-                        nic.io_write(QUEUE_NOTIFY, 2, 1, &mem);
+                        nic.io_write(QUEUE_NOTIFY, 2, 1, &mem, time::boot_time_ns());
                     });
                 } else {
                     {
@@ -995,7 +1017,7 @@ fn net_target(r: &mut Input) {
                     let segs = [(gpa(r), 1526, true)];
                     chain(&mem, &mut queues[0], r, &segs);
                     racing(&mem, &mut queues[0], || {
-                        nic.poll(&mem);
+                        nic.poll(&mem, time::boot_time_ns());
                     });
                 }
             }
