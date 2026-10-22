@@ -34,23 +34,57 @@ function siteUrl(phase: string): string {
     return url.origin;
 }
 
+// A Yandex Metrica counter's number, or nothing: a build without one carries no counter at all.
+function metrikaId(): string | undefined {
+    const raw = process.env.YANDEX_METRIKA_ID;
+    if (!raw) {
+        return undefined;
+    }
+    if (!/^[0-9]{1,12}$/.test(raw)) {
+        throw new Error(`YANDEX_METRIKA_ID must be the counter's number: ${raw}`);
+    }
+    return raw;
+}
+
+/*
+ * Where Yandex Metrica reaches, from its CSP guide: the tag and its hits on
+ * the mc.* hosts and yastatic.net, over HTTPS and WebSockets; and, for Session
+ * Replay (Webvisor), the Metrica sites that show this site in a frame.
+ */
+const metrikaHosts = ["mc.yandex.ru", "mc.yandex.com", "mc.yandex.by", "mc.yandex.kz", "mc.yandex.com.tr", "mc.yandex.uz", "mc.webvisor.com", "mc.webvisor.org"];
+const metrikaFrameAncestors = [
+    "metrika.yandex.ru", "metrika.yandex.by", "metrika.yandex.kz", "metrika.yandex.uz", "metrika.yandex",
+    "metrica.yandex.com", "metrica.yandex.com.tr", "metrica.yandex.ru", "metrica.yandex.by", "metrica.yandex.kz", "metrica.yandex",
+    "metrica.ya.ru", "metrika.ya.ru",
+    "analytics.yandex.ru", "analytics.yandex.com", "analytics.yandex.by", "analytics.yandex.kz", "analytics.yandex.com.tr",
+    "metr.yandex.ru", "metr.yandex.com", "metr.yandex.by", "metr.yandex.kz", "metr.yandex.com.tr",
+];
+
 /*
  * Inline scripts stay allowed: the App Router streams its payload through them,
  * and a nonce would make every page dynamic. Everything else is this origin's
- * own -- fonts are bundled, nothing is loaded from a third party.
+ * own -- fonts are bundled -- except Yandex Metrica's hosts when the build has
+ * a counter, and then the Metrica sites may frame the pages for Session Replay.
  */
-const contentSecurityPolicy = [
-    "default-src 'self'",
-    "script-src 'self' 'unsafe-inline'",
-    "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: https://raw.githubusercontent.com",
-    "font-src 'self'",
-    "connect-src 'self'",
-    "object-src 'none'",
-    "base-uri 'self'",
-    "form-action 'self'",
-    "frame-ancestors 'none'",
-].join("; ");
+function contentSecurityPolicy(metrika: boolean): string {
+    const https = metrika ? metrikaHosts.map((h) => `https://${h}`) : [];
+    const wss = metrika ? metrikaHosts.map((h) => `wss://${h}`) : [];
+    const ancestors = metrika ? ["'self'", ...metrikaFrameAncestors.map((h) => `https://${h}`)] : ["'none'"];
+    return [
+        "default-src 'self'",
+        ["script-src 'self' 'unsafe-inline'", ...https, ...(metrika ? ["https://yastatic.net"] : [])].join(" "),
+        "style-src 'self' 'unsafe-inline'",
+        ["img-src 'self' data: https://raw.githubusercontent.com", ...https].join(" "),
+        "font-src 'self'",
+        ["connect-src 'self'", ...https, ...wss].join(" "),
+        ["frame-src 'self'", ...(metrika ? ["blob:", ...https] : [])].join(" "),
+        ["child-src 'self'", ...(metrika ? ["blob:", ...https] : [])].join(" "),
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        `frame-ancestors ${ancestors.join(" ")}`,
+    ].join("; ");
+}
 
 export default function config(phase: string): NextConfig {
     const env: Record<string, string> = { SITE_URL: siteUrl(phase) };
@@ -60,16 +94,23 @@ export default function config(phase: string): NextConfig {
             env[key] = value;
         }
     }
+    const metrika = metrikaId();
+    if (metrika) {
+        env.YANDEX_METRIKA_ID = metrika;
+    }
 
     const headers = [
         { key: "X-Content-Type-Options", value: "nosniff" },
         { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-        { key: "X-Frame-Options", value: "DENY" },
         { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), browsing-topics=()" },
     ];
+    // Session Replay shows the pages in a frame on Metrica's sites; frame-ancestors says which.
+    if (!metrika) {
+        headers.push({ key: "X-Frame-Options", value: "DENY" });
+    }
     // The dev server needs eval and a websocket for hot reload.
     if (phase !== PHASE_DEVELOPMENT_SERVER) {
-        headers.push({ key: "Content-Security-Policy", value: contentSecurityPolicy });
+        headers.push({ key: "Content-Security-Policy", value: contentSecurityPolicy(metrika !== undefined) });
     }
 
     return {
