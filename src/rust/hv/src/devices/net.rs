@@ -213,6 +213,11 @@ impl Net {
         self.broken
     }
 
+    /// Whether a queue of its has its rings copied (`Transport::rings_copied`).
+    pub fn rings_copied(&self) -> bool {
+        self.transport.rings_copied()
+    }
+
     /// The offloads offered -- checksums and TCP's sends of up to 64 KiB,
     /// both ways, and mergeable buffers -- or not, the device as it was
     /// before them, for a guest to be measured or run without. Before the
@@ -286,7 +291,7 @@ impl Net {
         if offset >= self.transport.config_offset() {
             return Raise::default();
         }
-        match self.transport.write(offset, size, value) {
+        match self.transport.write(offset, size, value, mem, now) {
             Asked::Notify(TX_QUEUE) => self.send(mem),
             /* Buffers posted for receiving: whatever is waiting can go. */
             Asked::Notify(RX_QUEUE) => self.deliver(mem, now),

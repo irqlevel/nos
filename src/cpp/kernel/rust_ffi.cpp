@@ -792,6 +792,41 @@ int kernel_frame_store16(unsigned long phys, unsigned long offset, unsigned shor
     return 0;
 }
 
+/* A few frames mapped into the kernel's space together, in the order given,
+   read-write and never executable, for as long as the Rust side keeps them
+   so (kcore::frame::Mapped): a guest's pages the host reads and writes at
+   every frame it handles -- a virtqueue's rings -- which FrameCopy maps and
+   unmaps again at every access, a TLB flush each time. Through MapPages, so
+   the VA is the allocator's to track. The frames stay the caller's, and
+   allocated until kernel_frames_unmap has run: the mapping holds them by
+   their address and nothing else. 0 when there are none or more than
+   FramesMapMax, one is no frame, or no address is left. */
+static const unsigned long FramesMapMax = 4;
+
+unsigned long kernel_frames_map(const unsigned long* phys, unsigned long count)
+{
+    if (phys == nullptr || count == 0 || count > FramesMapMax)
+        return 0;
+
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
+    ulong frames[FramesMapMax];
+    for (unsigned long i = 0; i < count; i++)
+    {
+        if (!pt.IsFrameAddress(phys[i]))
+            return 0;
+        frames[i] = phys[i];
+    }
+    return reinterpret_cast<unsigned long>(Kernel::Mm::MapPages(count, frames));
+}
+
+/* A kernel_frames_map undone: `va` and `count` as it returned and was
+   given. The unmap shoots the address down on every CPU and waits for each
+   to answer, so it is never called with a spin lock held. */
+void kernel_frames_unmap(unsigned long va, unsigned long count)
+{
+    Kernel::Mm::UnmapPages(reinterpret_cast<void*>(va), count);
+}
+
 /* ---- Soft IRQ ---- */
 
 void kernel_softirq_raise(unsigned long type)
