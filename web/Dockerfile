@@ -37,11 +37,13 @@ COPY --from=docs . /src/docs
 ARG SITE_URL
 ARG GOOGLE_SITE_VERIFICATION=""
 ARG YANDEX_VERIFICATION=""
+ARG YANDEX_METRIKA_ID=""
 ARG BUILDPLATFORM
 RUN mkdir -p public && \
     SITE_URL="$SITE_URL" \
     GOOGLE_SITE_VERIFICATION="$GOOGLE_SITE_VERIFICATION" \
     YANDEX_VERIFICATION="$YANDEX_VERIFICATION" \
+    YANDEX_METRIKA_ID="$YANDEX_METRIKA_ID" \
     npm run build && \
     rm -rf .next/standalone/node_modules/sharp \
            .next/standalone/node_modules/@img \

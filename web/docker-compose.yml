@@ -24,6 +24,7 @@ services:
         SITE_URL: https://${DOMAIN:?set DOMAIN in .env}
         GOOGLE_SITE_VERIFICATION: ${GOOGLE_SITE_VERIFICATION:-}
         YANDEX_VERIFICATION: ${YANDEX_VERIFICATION:-}
+        YANDEX_METRIKA_ID: ${YANDEX_METRIKA_ID:-}
         VERSION: ${IMAGE_VERSION:-latest}
         REVISION: ${REVISION:-}
     # A release pins IMAGE_VERSION; a plain `docker compose up --build` makes :latest.
