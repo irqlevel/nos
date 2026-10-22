@@ -36,7 +36,11 @@ is what catches it: a ring whose sequences were relaxed failed eight boots
 of eight under HVF, while TCG on an x86 host may never show it. Its line
 says what a push and a pop cost on one CPU and how long each run took
 (`ring selftest: passed ...`): a number every boot prints is noticed when it
-moves.
+moves. And on every CPU `TestSleepPrompt` has a task of its own sleep a
+millisecond twenty-one times while the CPU halts between interrupts: the
+median sleep must be under 5 ms -- 1.0-2.4 under HVF and TCG, 10.0 when the
+CPU's timer is not armed for a sleeper's deadline and the tick wakes it
+([the local timer](scheduler.md#the-local-timer)).
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.

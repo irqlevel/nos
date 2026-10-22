@@ -36,14 +36,18 @@ public:
     static void WriteLvtPerfCounterNmi();
     static void MaskLvtPerfCounter();
 
-    /* Counts the local timer against the established clock and returns the
-       initial-count value for hz ticks a second, or 0 if it could not be
-       measured. Runs once, on the BSP: the count is a property of the bus
-       clock, which every core shares. */
-    static u32 CalibrateTimer(ulong hz);
+    /* Counts the local timer against the established clock: its rate,
+       kept for ArmTimer, and false if it could not be measured. Runs once,
+       on the BSP: the rate is a property of the bus clock, which every core
+       shares. */
+    static bool CalibrateTimer();
 
-    /* Arm this CPU's local timer, periodic, on the given vector. */
-    static void StartTimer(u8 vector, u32 initialCount);
+    /* This CPU's local timer, one-shot on the given vector, not armed. */
+    static void StartTimer(u8 vector);
+
+    /* Fire this CPU's local timer once, deltaNs from now: a write of the
+       initial count, which restarts it (Hal::LocalTimerArm). */
+    static void ArmTimer(ulong deltaNs);
 
     /* Is `vector` currently in service on this CPU? Used by the shared
        interrupt dispatch to identify the vector that actually fired. */
@@ -93,7 +97,21 @@ private:
     /* Divide-configuration encoding for /16 (SDM 11.5.4). */
     static const u32 TimerDivideBy16 = 0x3;
 
-    static const u32 LvtTimerPeriodic = (1u << 17);
+    /* The timer mode, bits 18:17: one-shot is zero. */
+    static const u32 LvtTimerOneShot = 0;
+
+    /* Counts of the local timer a second, at the divide above: measured
+       once by CalibrateTimer, 0 until then. */
+    static ulong TimerTicksPerSec;
+
+    /* ArmTimer counts a part in this many over the delay it is asked for:
+       the rate is a measurement, and one a little fast would fire before a
+       sleeper's deadline -- for one more interrupt to take it. Late by as
+       much costs nothing. */
+    static const ulong TimerLateParts = 1024;
+
+    /* The initial-count register's 32 bits. */
+    static constexpr ulong MaxTimerCount = 0xFFFFFFFFUL;
 
     static const ulong IcrLowIndex = 0x30;
     static const ulong IcrHighIndex = 0x31;
