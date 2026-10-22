@@ -9,7 +9,7 @@ import { JsonLd } from "@/components/JsonLd";
 import { getEntries } from "@/lib/content";
 import { getDictionary, type StageStatus } from "@/lib/dictionaries";
 import { isLocale } from "@/lib/i18n";
-import { pageMetadata } from "@/lib/seo";
+import { organizationLd, pageMetadata } from "@/lib/seo";
 import { absoluteUrl, site } from "@/lib/site";
 
 interface Props {
@@ -64,6 +64,7 @@ export default async function Home({ params }: Props) {
     const structured = {
         "@context": "https://schema.org",
         "@graph": [
+            organizationLd(),
             {
                 "@type": "WebSite",
                 "@id": absoluteUrl("/#website"),
@@ -71,6 +72,7 @@ export default async function Home({ params }: Props) {
                 name: site.name,
                 description: dict.meta.description,
                 inLanguage: locale,
+                publisher: { "@id": absoluteUrl("/#organization") },
             },
             {
                 "@type": "SoftwareSourceCode",

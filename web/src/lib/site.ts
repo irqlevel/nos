@@ -11,6 +11,8 @@ export const site = {
     // What a relative link in docs/ resolves to when it leaves docs/.
     repoBlob: "https://github.com/irqlevel/nos/blob/master/",
     repoRaw: "https://raw.githubusercontent.com/irqlevel/nos/master/",
+    // The square logo search engines are given (app/logo.png): Google wants 112 px or more.
+    logo: { path: "/logo.png", size: 512 },
     verification: {
         google: process.env.GOOGLE_SITE_VERIFICATION,
         yandex: process.env.YANDEX_VERIFICATION,
