@@ -1,0 +1,57 @@
+# The nos website behind Caddy, which obtains and renews its TLS certificate
+# from Let's Encrypt by itself. Set DOMAIN and ACME_EMAIL in .env (copy
+# .env.example), point the domain's DNS at this server, open ports 80 and 443,
+# then:
+#
+#   docker compose up -d --build
+#
+# Rebuild after a `git pull` to publish new posts and the current docs/.
+
+name: nos-web
+
+services:
+  web:
+    build:
+      context: .
+      additional_contexts:
+        docs: ../docs
+      args:
+        SITE_URL: https://${DOMAIN:?set DOMAIN in .env}
+        GOOGLE_SITE_VERIFICATION: ${GOOGLE_SITE_VERIFICATION:-}
+        YANDEX_VERIFICATION: ${YANDEX_VERIFICATION:-}
+    image: nos-web
+    restart: unless-stopped
+    # Reached only through Caddy, on the compose network.
+    expose:
+      - "3000"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/.next/cache:mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The certificates and the ACME account: keep them, or every restart asks Let's Encrypt again.
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
