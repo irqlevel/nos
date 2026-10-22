@@ -290,6 +290,13 @@ impl Transport {
         Transport { device_features, driver_features: 0, status: 0, isr: 0, select: 0, queues, msix: None }
     }
 
+    /// The features offered, before a driver has read them: what the
+    /// device is, for a guest's next boot.
+    pub fn set_device_features(&mut self, features: u32) {
+        self.device_features = features;
+        self.driver_features &= features;
+    }
+
     /// Offer MSI-X, with a table of `entries`: every source's vector starts
     /// at none, as a reset leaves it.
     pub fn offer_msix(&mut self, entries: u16) -> Option<()> {

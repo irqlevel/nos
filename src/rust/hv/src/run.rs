@@ -608,8 +608,10 @@ pub struct LinuxGuest {
     posted: AtomicU64,
     notified: AtomicU64,
     /// How far apart its NICs' receive interrupts are held at least
-    /// (`set_rx_moderation`).
+    /// (`set_rx_moderation`), and whether they offer their transmit
+    /// offloads (`set_offloads`).
     rx_moderation_ns: u64,
+    offloads: bool,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -736,6 +738,7 @@ impl LinuxGuest {
             posted: AtomicU64::new(0),
             notified: AtomicU64::new(0),
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
+            offloads: true,
         };
         Ok((guest, vcpus))
     }
@@ -759,6 +762,18 @@ impl LinuxGuest {
     /// find it at, more of them do -- docs/hypervisor.md has what that costs.
     pub fn set_apicv(&mut self, on: bool) {
         self.apicv = Some(on);
+    }
+
+    /// Its NICs' transmit offloads offered (the default) or not
+    /// (`net::Net::set_offloads`), for the NICs it has and those it is given
+    /// after; set before it boots.
+    pub fn set_offloads(&mut self, on: bool) {
+        self.offloads = on;
+        for d in self.platform.lock().pci_devs.iter_mut() {
+            if let PciDev::Nic(n) = d {
+                n.set_offloads(on);
+            }
+        }
     }
 
     /// Its NICs' receive interrupts no closer than `ns` apart -- 0 for each
@@ -841,6 +856,7 @@ impl LinuxGuest {
         }
         let mut nic = Net::new(backend, mac)?;
         nic.set_rx_moderation(self.rx_moderation_ns);
+        nic.set_offloads(self.offloads);
         let io_base = NIC_IO_BASE + (p.nics as u16) * (net::BAR_SIZE as u16);
         let mut f = Function::device(&Net::identity(), io_base, net::BAR_SIZE, NIC_IRQ);
         if let Some(page) = msix_page(&mut self.memory, apic, p.pci_devs.len() + 1)? {

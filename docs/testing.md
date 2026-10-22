@@ -450,7 +450,12 @@ made and not -- and raced: another of the guest's CPUs topping a ring up
 by plain writes while the device takes from it, as nothing on the host can
 stop it doing; the NIC with its receive interrupts held apart, the clock
 moved on between rounds, and held after each to owing none it should have
-raised (`rx_due`) -- the page walker over random page tables, the decoder, the
+raised (`rx_due`); its transmit offloads (`offload`), every send -- TCP over
+IPv4 to be cut, a frame whose checksum is left to the device, and noise,
+each well made or not -- held frame by frame to a model of its own written
+from virtio's and the RFCs' words, and on their own terms: no frame over
+1514 bytes, every checksum right, the payloads in order adding up to the
+send's -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
 `place` holds where guests are put on the host's cores (`hv/src/place.rs`)

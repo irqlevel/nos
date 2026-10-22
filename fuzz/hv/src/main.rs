@@ -107,6 +107,7 @@ pub mod switch;
 pub mod walk;
 
 mod guestnet;
+mod offloadmodel;
 mod placemodel;
 mod platform;
 mod policymodel;
@@ -316,6 +317,7 @@ fn main() {
         platform::report();
         guestnet::report();
         placemodel::report();
+        offloadmodel::report();
     }
     if findings.is_empty() {
         println!("hv-fuzz: {} inputs, no finding", total);
