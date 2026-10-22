@@ -2,12 +2,16 @@
 //! adds them -- whole pages, clear of each other, below `MAX_GPA` -- each
 //! kept as the pages written so far, a page never written reading as
 //! zeroes; every access inside one region or refused, as the real one's is;
-//! and the MMIO window's absent pages, which read as all ones once mapped.
+//! the MMIO window's absent pages, which read as all ones once mapped; and
+//! a device's rings mapped (`map`), with the real mapping's bounds and
+//! alignment, or refused when a target says so.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use crate::pod::{self, Pod};
 use crate::{Error, Result, Vendor};
 
 const PAGE: u64 = 4096;
@@ -69,20 +73,33 @@ struct Racer {
     left: usize,
 }
 
+/// What the memory and every mapping of it share: the pages, and the racer
+/// that watches reads of them. Its reads and writes are inside the memory's
+/// regions, which whoever calls them has checked.
+struct Shared {
+    pages: Mutex<Pages>,
+    racer: Mutex<Option<Racer>>,
+}
+
 pub struct GuestMemory {
     regions: Vec<Region>,
-    pages: Mutex<Pages>,
+    shared: Arc<Shared>,
     absent: Mutex<Vec<u64>>,
-    racer: Mutex<Option<Racer>>,
+    /// `map` refuses, as the real one does with no address left.
+    refuse_maps: AtomicBool,
+    /// Mappings made: each one undone is an address the real kernel shoots
+    /// down on every CPU, which a device makes only so many of (`held_to`).
+    maps: AtomicUsize,
 }
 
 impl GuestMemory {
     pub fn new(_vendor: Vendor) -> Result<GuestMemory> {
         Ok(GuestMemory {
             regions: Vec::new(),
-            pages: Mutex::new(Pages::default()),
+            shared: Arc::new(Shared { pages: Mutex::new(Pages::default()), racer: Mutex::new(None) }),
             absent: Mutex::new(Vec::new()),
-            racer: Mutex::new(None),
+            refuse_maps: AtomicBool::new(false),
+            maps: AtomicUsize::new(0),
         })
     }
 
@@ -90,16 +107,136 @@ impl GuestMemory {
     /// entries from `ring` and its used index at `used`, posting `head`
     /// again and again (`Racer`), `most` times at most -- until `stop_race`.
     pub fn race(&self, idx: u64, ring: u64, used: u64, size: u16, head: u16, most: usize) {
-        *self.racer.lock().unwrap() = Some(Racer { idx, ring, used, size, head, posts: 0, left: most });
+        *self.shared.racer.lock().unwrap() = Some(Racer { idx, ring, used, size, head, posts: 0, left: most });
     }
 
     /// The race over: how many chains the racer posted.
     pub fn stop_race(&self) -> usize {
-        self.racer.lock().unwrap().take().map_or(0, |r| r.posts)
+        self.shared.racer.lock().unwrap().take().map_or(0, |r| r.posts)
+    }
+
+    /// From now on `map` refuses, or maps again: what a device does with its
+    /// rings copied instead, the kernel having had no address for them.
+    pub fn refuse_maps(&self, refuse: bool) {
+        self.refuse_maps.store(refuse, Ordering::Relaxed);
+    }
+
+    /// As the real one maps them: the pages from `gpa` that `len` bytes
+    /// reach, four at most, all in one region -- reached by offset with the
+    /// real mapping's bounds and alignment held (`Mapping`).
+    pub fn map(&self, gpa: u64, len: usize) -> Result<Mapping> {
+        if gpa % PAGE != 0 || len == 0 {
+            return Err(Error::BadAddress);
+        }
+        let pages = len.div_ceil(PAGE as usize);
+        if pages > MAPPED_MAX {
+            return Err(Error::BadAddress);
+        }
+        self.inside(gpa, pages * PAGE as usize)?;
+        if self.refuse_maps.load(Ordering::Relaxed) {
+            return Err(Error::NoMemory);
+        }
+        self.maps.fetch_add(1, Ordering::Relaxed);
+        Ok(Mapping { shared: self.shared.clone(), base: gpa, bytes: pages * PAGE as usize })
+    }
+
+    /// The mappings its one device made since `since`, on the fuzzer's
+    /// clock, held to what the device may make: a burst of eight, and one a
+    /// second after (`virtio::Maps`) -- each a host-wide shootdown when it
+    /// is undone, which a guest setting its queues up over and over must not
+    /// have at will.
+    pub fn held_to_map_budget(&self, since: u64) {
+        let made = self.maps.load(Ordering::Relaxed) as u64;
+        let earned = crate::time::boot_time_ns().saturating_sub(since) / 1_000_000_000;
+        invariant!(made <= MAPS_BURST + earned,
+                   "{} ring mappings made in {} s, past the {} and one a second a device may make", made, earned, MAPS_BURST);
+    }
+}
+
+/// As `virtio::MAPS_BURST`.
+const MAPS_BURST: u64 = 8;
+
+/// As kcore's `frame::MAPPED_MAX`.
+const MAPPED_MAX: usize = 4;
+
+/// Pages mapped (`GuestMemory::map`), as kcore's `frame::Mapped` is reached:
+/// a value at an offset, inside and aligned for its type or refused, the
+/// racer seeing every read as it sees the memory's own.
+pub struct Mapping {
+    shared: Arc<Shared>,
+    base: u64,
+    bytes: usize,
+}
+
+impl Mapping {
+    fn holds<T>(&self, offset: usize) -> bool {
+        let size = core::mem::size_of::<T>();
+        offset % core::mem::align_of::<T>() == 0 && offset <= self.bytes && size <= self.bytes - offset
+    }
+
+    pub fn load<T: Pod>(&self, offset: usize) -> Option<T> {
+        if !self.holds::<T>(offset) {
+            return None;
+        }
+        let mut value = pod::zeroed::<T>();
+        self.shared.read(self.base + offset as u64, pod::bytes_of_mut(&mut value));
+        Some(value)
+    }
+
+    pub fn store<T: Pod>(&self, offset: usize, value: T) -> bool {
+        if !self.holds::<T>(offset) {
+            return false;
+        }
+        self.shared.write(self.base + offset as u64, pod::bytes_of(&value));
+        true
+    }
+
+    pub fn load_u16(&self, offset: usize) -> Option<u16> {
+        self.load::<u16>(offset)
+    }
+
+    pub fn store_u16(&self, offset: usize, value: u16) -> bool {
+        self.store::<u16>(offset, value)
+    }
+}
+
+impl Shared {
+    fn read(&self, gpa: u64, buf: &mut [u8]) {
+        self.read_unraced(gpa, buf);
+        self.race_after_read(gpa, buf.len());
+    }
+
+    fn read_unraced(&self, gpa: u64, buf: &mut [u8]) {
+        let pages = self.pages.lock().unwrap();
+        let mut done = 0usize;
+        while done < buf.len() {
+            let at = gpa + done as u64;
+            let off = (at % PAGE) as usize;
+            let n = (buf.len() - done).min(PAGE as usize - off);
+            match pages.get(&(at / PAGE)) {
+                Some(p) => buf[done..done + n].copy_from_slice(&p[off..off + n]),
+                None => buf[done..done + n].fill(0),
+            }
+            done += n;
+        }
+    }
+
+    fn write(&self, gpa: u64, data: &[u8]) {
+        let mut pages = self.pages.lock().unwrap();
+        let mut done = 0usize;
+        while done < data.len() {
+            let at = gpa + done as u64;
+            let off = (at % PAGE) as usize;
+            let n = (data.len() - done).min(PAGE as usize - off);
+            let p = pages.entry(at / PAGE).or_insert_with(|| Box::new([0; PAGE as usize]));
+            p[off..off + n].copy_from_slice(&data[done..done + n]);
+            done += n;
+        }
     }
 
     /// A read the device made, as the racer sees it: one of the available
     /// index has it publish the next chain, when the ring has room for one.
+    /// The racer's ring is one a target laid out inside the memory.
     fn race_after_read(&self, gpa: u64, len: usize) {
         let mut racer = self.racer.lock().unwrap();
         let Some(r) = racer.as_mut() else { return };
@@ -107,13 +244,9 @@ impl GuestMemory {
             return;
         }
         let mut b = [0u8; 2];
-        if self.read_unraced(r.idx, &mut b).is_err() {
-            return;
-        }
+        self.read_unraced(r.idx, &mut b);
         let idx = u16::from_le_bytes(b);
-        if self.read_unraced(r.used, &mut b).is_err() {
-            return;
-        }
+        self.read_unraced(r.used, &mut b);
         if idx.wrapping_sub(u16::from_le_bytes(b)) >= r.size {
             return;
         }
@@ -123,10 +256,12 @@ impl GuestMemory {
         r.left -= 1;
         r.posts += 1;
         let slot = u64::from(idx % r.size);
-        let _ = self.write(r.ring + 2 * slot, &r.head.to_le_bytes());
-        let _ = self.write(r.idx, &idx.wrapping_add(1).to_le_bytes());
+        self.write(r.ring + 2 * slot, &r.head.to_le_bytes());
+        self.write(r.idx, &idx.wrapping_add(1).to_le_bytes());
     }
+}
 
+impl GuestMemory {
     /// `size` bytes from 0: what the device targets run over.
     pub fn with_size(size: u64) -> GuestMemory {
         let mut m = GuestMemory::new(Vendor::Svm).expect("memory");
@@ -158,40 +293,14 @@ impl GuestMemory {
     }
 
     pub fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<()> {
-        self.read_unraced(gpa, buf)?;
-        self.race_after_read(gpa, buf.len());
-        Ok(())
-    }
-
-    fn read_unraced(&self, gpa: u64, buf: &mut [u8]) -> Result<()> {
         self.inside(gpa, buf.len())?;
-        let pages = self.pages.lock().unwrap();
-        let mut done = 0usize;
-        while done < buf.len() {
-            let at = gpa + done as u64;
-            let off = (at % PAGE) as usize;
-            let n = (buf.len() - done).min(PAGE as usize - off);
-            match pages.get(&(at / PAGE)) {
-                Some(p) => buf[done..done + n].copy_from_slice(&p[off..off + n]),
-                None => buf[done..done + n].fill(0),
-            }
-            done += n;
-        }
+        self.shared.read(gpa, buf);
         Ok(())
     }
 
     pub fn write(&self, gpa: u64, data: &[u8]) -> Result<()> {
         self.inside(gpa, data.len())?;
-        let mut pages = self.pages.lock().unwrap();
-        let mut done = 0usize;
-        while done < data.len() {
-            let at = gpa + done as u64;
-            let off = (at % PAGE) as usize;
-            let n = (data.len() - done).min(PAGE as usize - off);
-            let p = pages.entry(at / PAGE).or_insert_with(|| Box::new([0; PAGE as usize]));
-            p[off..off + n].copy_from_slice(&data[done..done + n]);
-            done += n;
-        }
+        self.shared.write(gpa, data);
         Ok(())
     }
 

@@ -809,11 +809,17 @@ fn blk_request(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input) {
 
 fn blk_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
+    let since = time::boot_time_ns();
     let size = if r.bool() { blk::SECTOR * r.below(1 << 16) } else { r.value64() & !(blk::SECTOR - 1) };
     let state = Arc::new(Mutex::new(DiskState::new(size, r.bool())));
     let mut disk = Blk::new(Box::new(Disk(state.clone())), "fuzz").expect("a disk");
     if r.bool() {
         disk.offer_msix(2);
+    }
+    /* Its rings copied rather than mapped, on some inputs: what a queue is
+     * left with when the kernel has no address for them. */
+    if r.u8() < 48 {
+        mem.refuse_maps(true);
     }
     let mut q = DriverQueue::default();
     while let Some(op) = r.op(13) {
@@ -823,22 +829,22 @@ fn blk_target(r: &mut Input) {
             }
             1 => {
                 let (offset, size, value) = (r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size(), r.value32());
-                disk.io_write(offset, size, value, &mem);
+                disk.io_write(offset, size, value, &mem, time::boot_time_ns());
             }
             2 => {
                 let mut write = |offset: u16, size: u8, value: u32| {
-                    disk.io_write(offset, size, value, &mem);
+                    disk.io_write(offset, size, value, &mem, time::boot_time_ns());
                 };
                 let index = if r.u8() < 240 { 0 } else { r.u16() };
                 setup_queue(r, &mut write, &mut q, index);
             }
             3 => {
                 let status = r.pick(&[0, 1, 3, 7, 15, 0x80, 0xFF]);
-                disk.io_write(DEVICE_STATUS, 1, status, &mem);
+                disk.io_write(DEVICE_STATUS, 1, status, &mem, time::boot_time_ns());
             }
             4 => {
                 let queue = if r.u8() < 240 { 0 } else { r.u16() };
-                disk.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem);
+                disk.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem, time::boot_time_ns());
             }
             5 => {
                 let (at, n) = (gpa(r), r.below(64) as usize);
@@ -852,7 +858,7 @@ fn blk_target(r: &mut Input) {
                 for _ in 0..1 + r.below(2 * blk::IN_FLIGHT as u64) {
                     blk_request(&mem, &mut q, r);
                 }
-                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem);
+                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
             }
             8 | 9 => {
                 disk.poll(&mem);
@@ -876,7 +882,7 @@ fn blk_target(r: &mut Input) {
                 let notify = r.bool();
                 racing(&mem, &mut q, || {
                     if notify {
-                        disk.io_write(QUEUE_NOTIFY, 2, 0, &mem);
+                        disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
                     } else {
                         disk.poll(&mem);
                     }
@@ -884,6 +890,7 @@ fn blk_target(r: &mut Input) {
             }
         }
     }
+    mem.held_to_map_budget(since);
 }
 
 /// The guests' switch as a NIC's backend sees it: frames sent checked, and
@@ -956,6 +963,7 @@ fn rx_promise_kept(nic: &Net, now: u64) {
 
 fn net_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
+    let since = time::boot_time_ns();
     let state = Arc::new(Mutex::new(NicState::default()));
     let mut nic = Net::new(Box::new(Nic(state.clone())), [2, 0, 0, 0, 0x64, 2]).expect("a NIC");
     if r.bool() {
@@ -971,6 +979,10 @@ fn net_target(r: &mut Input) {
      * to a model). */
     if r.u8() < 48 {
         nic.set_offloads(false);
+    }
+    /* Its rings copied rather than mapped, on some inputs, as the disk's. */
+    if r.u8() < 48 {
+        mem.refuse_maps(true);
     }
     let mut queues = [DriverQueue::default(); 2];
     while let Some(op) = r.op(14) {
@@ -1067,6 +1079,7 @@ fn net_target(r: &mut Input) {
             }
         }
     }
+    mem.held_to_map_budget(since);
 }
 
 /* ---- the MMIO path: the page walk and the decoder ---- */

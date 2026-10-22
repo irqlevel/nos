@@ -871,28 +871,30 @@ impl LinuxGuest {
     }
 
     /// What each disk has done: (sectors, statistics, whether a ring of the
-    /// driver's stopped it). Empty when there is no memory to say it in.
-    pub fn disk_stats(&self) -> Vec<(u64, blk::Stats, bool)> {
+    /// driver's stopped it, whether its rings are copied rather than mapped).
+    /// Empty when there is no memory to say it in.
+    pub fn disk_stats(&self) -> Vec<(u64, blk::Stats, bool, bool)> {
         let p = self.platform.lock();
         let mut v = Vec::new();
         if v.try_reserve_exact(p.disks).is_ok() {
             for d in &p.pci_devs {
                 if let PciDev::Disk(d) = d {
-                    v.push((d.sectors(), d.stats, d.broken().is_some()));
+                    v.push((d.sectors(), d.stats, d.broken().is_some(), d.rings_copied()));
                 }
             }
         }
         v
     }
 
-    /// What each NIC has done: (statistics, whether a ring stopped it).
-    pub fn nic_stats(&self) -> Vec<(net::Stats, bool)> {
+    /// What each NIC has done: (statistics, whether a ring stopped it,
+    /// whether its rings are copied rather than mapped).
+    pub fn nic_stats(&self) -> Vec<(net::Stats, bool, bool)> {
         let p = self.platform.lock();
         let mut v = Vec::new();
         if v.try_reserve_exact(p.nics).is_ok() {
             for d in &p.pci_devs {
                 if let PciDev::Nic(n) = d {
-                    v.push((n.stats, n.broken().is_some()));
+                    v.push((n.stats, n.broken().is_some(), n.rings_copied()));
                 }
             }
         }
@@ -2132,7 +2134,7 @@ impl LinuxGuest {
             } else {
                 let value = v.save().rax as u32;
                 let raised = match dev {
-                    Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory),
+                    Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory, time::boot_time_ns()),
                     Some(PciDev::Nic(n)) => n.io_write(offset, io.size, value, &self.memory, time::boot_time_ns()),
                     None => Raise::default(),
                 };

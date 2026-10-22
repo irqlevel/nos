@@ -603,6 +603,25 @@ Two rules make it the one place that decides what a guest can reach:
   mapped for that page's part of the copy and nowhere after -- a page's part
   one call of the architecture's memcpy, which the compiler sees nothing
   of; an address a guest gave, whatever it is, is at worst `Unmapped`.
+  A queue's rings are the one exception to the window, and not to the
+  rule: a device reads and writes them at every request, and a copy maps
+  and unmaps a page -- a TLB flush -- at every access, a dozen a frame. So
+  they are mapped while the queue is up (`GuestMemory::map`, three pages
+  a queue, through `Mm::MapPages`) and still reached a value at a time --
+  one volatile load or store at a checked, aligned offset, an index with
+  acquire or release (`kcore::frame::Mapped`). The mapping holds a share of
+  its region's frames (`kcore::frame::Run`), so none is freed while it is
+  mapped, whichever of the guest and its devices goes last. Undoing one
+  shoots its address down on every host CPU, so a device makes eight and
+  then one a second (`virtio::Maps`): a guest that set its queues up over
+  and over would otherwise have every CPU of the host interrupted at will,
+  and past the budget its rings are copied, as before, and the report
+  says so. On the EX44, between two guests of two CPUs: `dd | nc` 4.15 s
+  where it took 2.72, and 4.45 where it took 2.83 with the offloads, five
+  runs of each; BusyBox's `httpd` serving 100 MB five times over 0.29 s
+  where it took 0.47 -- 1.8 GB/s -- and 0.62 where it took 1.63-1.68
+  without the offloads. A dozen pages mapped and flushed a frame had been
+  most of what the host spent on one.
 - **The nested page table is inside it.** A guest reaches exactly what its
   nested table maps, and this table maps nothing but pages the same value
   owns: every page is owned before it is mapped, and freed only with the
@@ -1503,8 +1522,8 @@ leaves its checksums to the device gathers each frame from pages too --
 scatter-gather comes on with them -- three or four descriptors a frame
 where it was two, and every descriptor and buffer the device reads is a
 guest page mapped and unmapped on the host, one access at a time: the
-likeliest cost, and what mapping a ring's pages once is to take away
-([Speed](#speed), item 6). A checksum the device finishes it sums eight
+likeliest cost, and the rings' pages mapped once took most of it away: 2.83
+s against 2.72, the two within their spread ([Its memory](#its-memory)). A checksum the device finishes it sums eight
 bytes at a time, since two bytes at a time made that 3-5% slower than the
 guest's own, taken as it copies. hv-fuzz's `offload` target holds every
 send, well made and not, to a model of its own, frame by frame; two mutants
@@ -3711,15 +3730,15 @@ someone else's; then speed.
    halt polling having turned out to do it by accident;
    left: the xAPIC
    page's virtualization, and AMD's AVIC; device work off the first CPU's
-   task, with a lock a device and the
-   ring pages mapped once rather than at every access; nested leaves of 2
+   task, with a lock a device (~~the ring pages mapped once rather than at
+   every access~~ done, [Its memory](#its-memory)); nested leaves of 2
    MiB and 1 GiB, over guest memory taken in runs that size; the VMX
    preemption timer, which would take a computing guest out at its timer's
    edge without the host interrupt that does it now ([Time](#time));
    ~~virtio-net's offloads~~ done both ways ([A network](#a-network)): a
-   stream between two guests is a fortieth of the frames it was. Without
-   the ring pages mapped once, a driver's scatter-gather costs a sender of
-   one segment at a time 7%.
+   stream between two guests is a fortieth of the frames it was, and a
+   driver's scatter-gather, which cost a sender of one segment at a time 7%
+   while every ring access mapped a page, 4% since -- inside the spread.
 7. **What has not been measured.** The time each kind of exit takes
    inside `LinuxGuest::run`; fio and iperf in a guest. (An exit under VT-x
    on silicon is measured now: [What an exit costs](#what-an-exit-costs).)

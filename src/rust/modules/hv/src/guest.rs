@@ -460,6 +460,13 @@ pub fn run_cpus<H: Host + Send + Sync + 'static>(
     Ok(Ran { stopped, counts })
 }
 
+/// What a device's report adds when a queue of its has its rings copied
+/// rather than mapped: set up too often -- or with no address left for them
+/// -- to be given a mapping, and the slower for it.
+fn copied_note(copied: bool) -> &'static str {
+    if copied { "; rings copied, not mapped -- set up too often, or no address left" } else { "" }
+}
+
 /// Why the guest stopped, in a line.
 pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
     match *stop {
@@ -616,16 +623,16 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  nmi        {} NMIs taken from the guest's other CPUs, {} dropped by a CPU waiting to be started",
             total.nmi, total.nmi_lost);
     }
-    for (i, (sectors, s, broken)) in guest.disk_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}",
+    for (i, (sectors, s, broken, copied)) in guest.disk_stats().into_iter().enumerate() {
+        let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}{}",
             (b'a' + i as u8) as char, sectors * hv::disk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
             s.writes, s.written_bytes / 1024, s.flushes, s.errors,
-            if broken { "; stopped over a ring the driver broke" } else { "" });
+            if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
     }
-    for (i, (s, broken)) in guest.nic_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}",
+    for (i, (s, broken, copied)) in guest.nic_stats().into_iter().enumerate() {
+        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}{}",
             i, s.sent, s.received, s.dropped, s.large, s.whole,
-            if broken { "; stopped over a ring the driver broke" } else { "" });
+            if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
     }
     let hot = guest.hot_ports(6);
     if !hot.is_empty() {
