@@ -88,6 +88,14 @@ pub fn timer_at(deadline_ns: u64) {
     ffi::cpu::kernel_cpu_timer_at(deadline_ns)
 }
 
+/// A spin's pause: the CPU told this one is waiting on what another
+/// changes -- a ring a guest fills -- so that its sibling thread runs the
+/// faster meanwhile, and nothing more.
+#[inline]
+pub fn relax() {
+    core::hint::spin_loop();
+}
+
 extern "C" fn nothing(_ctx: *mut u8) {}
 
 /// Returns once every running CPU has taken an interrupt since the call, so

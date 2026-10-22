@@ -95,10 +95,12 @@ impl Cores {
     }
 
     /// A place for a guest of `n` CPUs -- the first on `wanted` if it names
-    /// one, its disks' task too where it has `disks` -- and its hold on it,
-    /// `holder`'s, or named later ([`Hold::held_by`]); or why not.
-    pub fn take(&self, machine: &Machine, wanted: Option<u32>, n: u32, disks: bool, holder: Option<Holder>)
-        -> Result<(Placement, Hold), String>
+    /// one, its disks' task too where it has `disks`, and its NICs' where it
+    /// has `nics` and one is to be had (`Placement::nics`) -- and its hold
+    /// on it, `holder`'s, or named later ([`Hold::held_by`]); or why not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn take(&self, machine: &Machine, wanted: Option<u32>, n: u32, disks: bool, nics: bool,
+                holder: Option<Holder>) -> Result<(Placement, Hold), String>
     {
         let policy = if self.own() { Policy::Own } else { Policy::Shared };
         let topo = hv::topology::host();
@@ -115,7 +117,7 @@ impl Cores {
                 }
             }
         }
-        let p = place::place(&topo, policy, enabled, online, &taken, wanted, n, disks).map_err(describe)?;
+        let p = place::place(&topo, policy, enabled, online, &taken, wanted, n, disks, nics).map_err(describe)?;
         let id = holds.next;
         holds.next += 1;
         let vcpus = p.vcpus.iter().fold(0u64, |m, &cpu| m | bit(cpu));

@@ -15,7 +15,7 @@
 //! another CPU started by INIT and start-up IPIs. The script ends in a
 //! shutdown, which ends the run.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -26,7 +26,7 @@ use crate::memory::GuestMemory;
 use crate::run::{Host, LinuxGuest};
 use crate::smp::Doorbells;
 use crate::svm::{Exit, Io, LongMode};
-use crate::targets::{apic_value, blk_segments, chain, gpa_in, DiskState, Disk, DriverQueue, Input, NicState, Nic,
+use crate::targets::{apic_value, blk_segments, chain, chain_clean, gpa_in, DiskState, Disk, DriverQueue, Input, NicState, Nic,
                      APIC_EOI, APIC_REGS};
 use crate::vm::{self, Backend};
 use crate::x86::svm::vmcb::{exit as code, npf};
@@ -92,6 +92,14 @@ impl Host for FuzzHost {
 /// the guest writes on the way.
 enum Step {
     Out { port: u16, size: u8, value: u32 },
+    /// A queue's notify, as a driver makes one: none while the device's
+    /// flags at `flags` say it wants none, as Linux's reads them after its
+    /// barrier (`virtqueue_kick_prepare`). Device `dev`'s, its available
+    /// index `published` by then.
+    Notify { port: u16, queue: u32, flags: Option<u64>, dev: usize, published: u16 },
+    /// Device `dev` set up again from here: what it was handed before is
+    /// the old driver's (`Script::sends`).
+    Forget { dev: usize },
     In { port: u16, size: u8 },
     Wrmsr { msr: u32, value: u64 },
     Mmio { gpa: u64, store: bool, value: u64 },
@@ -215,6 +223,26 @@ struct Script {
     host: Arc<HostState>,
     disks: Vec<Arc<Mutex<DiskState>>>,
     nics: Vec<Arc<Mutex<NicState>>>,
+    /// The guest's doorbells: what a frame put in for its NICs rings, as the
+    /// switch rings them (`Doorbells::ring_nics`).
+    doorbells: Arc<Doorbells>,
+    /// Its NICs are served by a task of their own, on the thread after the
+    /// CPUs': one more a CPU may hand the turn to (`Next::Switch`).
+    served: bool,
+    /// A guest that keeps its rings its own: no write of configuration
+    /// space or of a device's registers but its drivers', a queue's pages
+    /// apart from every other's, buffers clear of the rings. Only such a
+    /// guest has every chain it makes announced to the device by a notify
+    /// that reaches it -- one whose BAR it turned off, or whose ring a frame
+    /// was written over, finds its device late by its own doing -- and only
+    /// its runs are held to the NICs' task never finding work after a sleep
+    /// no ring ended.
+    tidy: bool,
+    /// What each NIC's driver last handed its transmit queue by a notify,
+    /// made or held: when, its available index then, and where the device's
+    /// used index is -- for a tidy run to be held to the device taking all
+    /// of it.
+    sends: Arc<Mutex<HashMap<usize, (u64, u16, u64)>>>,
     /// Each device's queues, disks first: a disk's one, a NIC's two.
     queues: Vec<[DriverQueue; 2]>,
     /// Whether it has local APICs at all: a guest of one CPU has none.
@@ -598,6 +626,31 @@ impl Script {
                 Some(io_exit(v, port, size, false))
             }
             Step::In { port, size } => Some(io_exit(v, port, size, true)),
+            Step::Forget { dev } => {
+                self.sends.lock().unwrap().remove(&dev);
+                None
+            }
+            Step::Notify { port, queue, flags, dev, published } => {
+                if self.is_nic(dev) && queue == 1 {
+                    if let Some(at) = flags {
+                        self.sends.lock().unwrap().insert(dev, (crate::time::peek(), published, at + 2));
+                    }
+                }
+                /* Held only where the device itself said it wants none: a
+                 * flag the guest's own buffers wrote over -- a frame
+                 * received onto a ring, two rings on one page -- is not the
+                 * device's to be held to, and a driver whose rings nothing
+                 * overwrote would notify. */
+                let mut f = [0u8; 2];
+                let quiet = flags.is_some_and(|at| mem.read(at, &mut f).is_ok() && u16::from_le_bytes(f) & 1 != 0
+                                                   && mem.device_stored(at, u16::from_le_bytes(f)));
+                if quiet {
+                    NOTIFIES_HELD.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                v.save_mut().rax = u64::from(queue);
+                Some(io_exit(v, port, 2, false))
+            }
             Step::Wrmsr { msr, value } => {
                 if msr == 0x1B {
                     self.cpus[self.me].asked_xapic = Some(value & (1 << 10) == 0);
@@ -736,19 +789,27 @@ impl Script {
                 let dev = r.below(self.queues.len().max(1) as u64) as u32;
                 self.plan_msix(dev, r);
             }
-            6 | 7 if !self.queues.is_empty() => {
+            6 | 7 if !self.queues.is_empty() && (!self.tidy || self.me == 0) => {
                 /* A virtio device's queue set up: I/O on, reset, the queue's
                  * page, the driver ready -- after MSI-X, as a driver that
-                 * uses it turns it on first. */
+                 * uses it turns it on first. A tidy guest's first CPU drives
+                 * its devices, so that one plan orders all of it. */
                 let dev = r.below(self.queues.len() as u64) as usize;
                 if r.bool() {
                     self.plan_msix(dev as u32, r);
                 }
                 let base = self.io_base(dev);
                 let queue = if self.is_nic(dev) { r.below(2) as usize } else { 0 };
-                let pfn = 0x100 + r.below(0x700);
+                let pfn = if self.tidy { 0x100 + 4 * (2 * dev + queue) as u64 } else { 0x100 + r.below(0x700) };
+                self.plan().push_back(Step::Forget { dev });
                 self.pci_write(dev as u32 + 1, 0x04, 2, 0x7);
                 self.plan().push_back(Step::Out { port: base + 0x12, size: 1, value: 0 });
+                /* A tidy driver's rings are fresh: zeroed after the reset
+                 * that let go of the old ones, as Linux allocates them --
+                 * nothing of the device's last flags or used index in them. */
+                if self.tidy {
+                    self.plan().push_back(Step::Poke { gpa: pfn * 4096, bytes: vec![0; 3 * 4096] });
+                }
                 self.plan().push_back(Step::Out { port: base + 0x12, size: 1, value: 3 });
                 self.plan().push_back(Step::Out { port: base + 0x04, size: 4, value: r.u32() });
                 self.plan().push_back(Step::Out { port: base + 0x0E, size: 2, value: queue as u32 });
@@ -760,6 +821,11 @@ impl Script {
                     self.plan().push_back(Step::Out { port: base + 0x16, size: 2, value: 1 + queue as u32 });
                 }
                 self.plan().push_back(Step::Out { port: base + 0x12, size: 1, value: 7 });
+                /* The reset took the device's other queue down with it: a
+                 * tidy driver sets that one up again before it uses it. */
+                if self.tidy {
+                    self.queues[dev] = [DriverQueue::default(); 2];
+                }
                 self.queues[dev][queue] = DriverQueue::at(pfn);
             }
             8 if self.apic && self.cpus.len() > 1 => {
@@ -803,32 +869,40 @@ impl Script {
                 self.plan().push_back(Step::Out { port: 0x602, size: 2, value: 0x100 | u32::from(r.u8() & 1) });
                 self.host.button.store(r.bool(), Ordering::Relaxed);
             }
-            _ if !self.queues.is_empty() => {
+            _ if !self.queues.is_empty() && (!self.tidy || self.me == 0) => {
                 /* Requests: a disk's, a NIC's buffers or frames, and the
                  * notify that hands them over. */
                 let dev = r.below(self.queues.len() as u64) as usize;
                 let base = self.io_base(dev);
                 let queue = if self.is_nic(dev) { r.below(2) as usize } else { 0 };
                 let mem_view = PlannedMemory::default();
+                let tidy = self.tidy;
+                let buffer = |r: &mut Input| if tidy { 32 * MIB + (r.below(28 * MIB) & !0xFFF) } else { gpa_in(r, 64 * MIB) };
                 for _ in 0..1 + r.below(6) {
                     let segs = if self.is_nic(dev) {
                         if queue == 0 {
-                            vec![(gpa_in(r, 64 * MIB), 1526, true)]
+                            vec![(buffer(r), 1526, true)]
                         } else {
                             let len = 60 + r.below(1500) as u32;
-                            vec![(gpa_in(r, 64 * MIB), 10, false), (gpa_in(r, 64 * MIB), len, false)]
+                            vec![(buffer(r), 10, false), (buffer(r), len, false)]
                         }
-                    } else if r.u8() < 192 {
+                    } else if r.u8() < 192 || self.tidy {
                         self.valid_request(&mem_view, r, dev)
                     } else {
                         blk_segments(&mem_view, r, 64 * MIB)
                     };
-                    chain(&mem_view, &mut self.queues[dev][queue], r, &segs);
+                    if self.tidy {
+                        chain_clean(&mem_view, &mut self.queues[dev][queue], r, &segs);
+                    } else {
+                        chain(&mem_view, &mut self.queues[dev][queue], r, &segs);
+                    }
                 }
                 for (gpa, bytes) in mem_view.take() {
                     self.plan().push_back(Step::Poke { gpa, bytes });
                 }
-                self.plan().push_back(Step::Out { port: base + 0x10, size: 2, value: queue as u32 });
+                let flags = self.queues[dev][queue].used_flags();
+                let published = self.queues[dev][queue].published();
+                self.plan().push_back(Step::Notify { port: base + 0x10, queue: queue as u32, flags, dev, published });
             }
             _ => {}
         }
@@ -1067,6 +1141,10 @@ impl Script {
                         6 => COM1 + r.below(8) as u16,
                         _ => r.u16(),
                     };
+                    /* A tidy guest leaves configuration space and its devices'
+                     * registers to their drivers. */
+                    let port = if self.tidy && ((0xCF8..=0xCFF).contains(&port)
+                                                || (DISK_IO_BASE..NIC_IO_BASE + 0x100).contains(&port)) { 0x80 } else { port };
                     let size = if r.u8() < 160 { 1 } else { r.pick(&[1u8, 2, 4]) };
                     let input = r.bool();
                     v.save_mut().rax = if r.bool() { u64::from(r.u8()) } else { r.value64() };
@@ -1196,7 +1274,7 @@ impl Script {
                 }
                 20 => {
                     /* Memory the guest writes: an MSI-X table, a ring, anything. */
-                    let at = if r.bool() { MSIX_PAGES + r.below(8 * 4096) } else { gpa_in(r, 64 * MIB) };
+                    let at = if r.bool() || self.tidy { MSIX_PAGES + r.below(8 * 4096) } else { gpa_in(r, 64 * MIB) };
                     let bytes: Vec<u8> = (0..1 + r.below(32)).map(|_| r.u8()).collect();
                     let _ = mem.write(at, &bytes);
                     continue;
@@ -1213,9 +1291,14 @@ impl Script {
                 }
                 23 => {
                     /* The guest ran a while: mostly microseconds, now and then
-                     * a host that did not run it for seconds. */
+                     * a host that did not run it for seconds. The NICs' task,
+                     * on a CPU of its own, ran meanwhile too: its turn, if it
+                     * has anything to do. */
                     time::advance(r.pick(&[0, 1_000, 50_000, 1_000_000, 4_000_000, 10_000_000, 100_000_000,
                                            2_000_000_000]));
+                    if self.served {
+                        return Some(vm::Next::Switch(self.cpus.len()));
+                    }
                     continue;
                 }
                 24 => {
@@ -1228,6 +1311,9 @@ impl Script {
                     for n in &self.nics {
                         let len = r.pick(&[60usize, 64, 590, 1514, 1515, 20]);
                         n.lock().unwrap().rx.push_back(((0..len).map(|i| i as u8).collect(), crate::offload::Rx::Done));
+                    }
+                    if !self.nics.is_empty() {
+                        self.doorbells.ring_nics();
                     }
                     Exit::Host
                 }
@@ -1259,9 +1345,11 @@ impl Script {
                     }
                     continue;
                 }
-                32 | 33 if self.cpus.len() > 1 => {
-                    /* Another CPU runs a while, this one in its guest. */
-                    return Some(vm::Next::Switch(r.below(self.cpus.len() as u64) as usize));
+                32 | 33 if self.cpus.len() > 1 || self.served => {
+                    /* Another CPU runs a while, this one in its guest -- or
+                     * the NICs' task does, polling the rings this CPU fills. */
+                    let threads = self.cpus.len() + usize::from(self.served);
+                    return Some(vm::Next::Switch(r.below(threads as u64) as usize));
                 }
                 26 => Exit::Pause,
                 27 if v.has_vapic() => {
@@ -1336,6 +1424,15 @@ static MOV_CHECKED: Mutex<std::collections::BTreeMap<&'static str, u64>> =
 /// sent for them, for `HV_FUZZ_STATS`.
 static POSTED: AtomicU64 = AtomicU64::new(0);
 static NOTIFIED: AtomicU64 = AtomicU64::new(0);
+/// Runs whose NICs a task of their own served, the notifies the scripted
+/// drivers held back for a device that said it wanted none, and the sends
+/// held to being taken, for `HV_FUZZ_STATS`.
+static NIC_TASK_RUNS: AtomicU64 = AtomicU64::new(0);
+static NOTIFIES_HELD: AtomicU64 = AtomicU64::new(0);
+static SENDS_CHECKED: AtomicU64 = AtomicU64::new(0);
+/// How long before a run's end a tidy guest's sends must have been taken by:
+/// past every wait the NICs' task makes.
+const SENDS_TAKEN_NS: u64 = 30_000_000;
 
 fn mov_checked(what: &'static str) {
     *MOV_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_insert(0) += 1;
@@ -1354,6 +1451,9 @@ pub fn report() {
     }
     println!("  platform: {} interrupts posted, {} notifications sent", POSTED.load(Ordering::Relaxed),
              NOTIFIED.load(Ordering::Relaxed));
+    println!("  platform: {} runs with their NICs served by a task, {} notifies held back as the device asked, {} sends held to being taken",
+             NIC_TASK_RUNS.load(Ordering::Relaxed), NOTIFIES_HELD.load(Ordering::Relaxed),
+             SENDS_CHECKED.load(Ordering::Relaxed));
     for (what, n) in vm::APICV.lock().unwrap().iter() {
         println!("  platform: virtual APIC: {:>8} {}", n, what);
     }
@@ -1411,9 +1511,10 @@ thread_local! {
 /// then as the turn passes: their exits, all told. A panic on one has the
 /// others leave their runs, and is the run's.
 fn run_threads(guest: &Arc<LinuxGuest>, vcpus: Vec<crate::run::GuestCpu>, machine: &Arc<Machine>, deadline: u64,
-               host: &Arc<FuzzHost>) -> u64 {
-    vm::begin_threads(vcpus.len());
-    let jobs: Vec<Job> = vcpus.into_iter().enumerate().map(|(i, mut gc)| {
+               host: &Arc<FuzzHost>, served: bool) -> u64 {
+    let n = vcpus.len();
+    vm::begin_threads(n + usize::from(served));
+    let mut jobs: Vec<Job> = vcpus.into_iter().enumerate().map(|(i, mut gc)| {
         let (guest, machine, host) = (guest.clone(), machine.clone(), host.clone());
         Box::new(move || {
             vm::set_vcpu(i);
@@ -1429,6 +1530,24 @@ fn run_threads(guest: &Arc<LinuxGuest>, vcpus: Vec<crate::run::GuestCpu>, machin
             ran.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         }) as Job
     }).collect();
+    /* The task that serves the NICs, a turn of its own after the CPUs'. */
+    if served {
+        let guest = guest.clone();
+        jobs.push(Box::new(move || {
+            vm::set_vcpu(n);
+            time::progressed();
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                vm::wait_turn(n);
+                guest.serve_nics();
+                0u64
+            }));
+            if ran.is_err() {
+                vm::abort();
+            }
+            vm::finished(n);
+            ran.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }) as Job);
+    }
     let results = POOL.with(|p| p.borrow_mut().run(jobs));
     vm::end_threads();
     let mut exits = 0;
@@ -1457,7 +1576,8 @@ pub fn platform(r: &mut Input) {
     machine.vapic = vmx && r.bool();
     machine.posted = machine.vapic && r.u8() >= 64;
     let Some(doorbells) = Doorbells::new(cpus as usize) else { return };
-    let made = LinuxGuest::new(&machine, mem_bytes, cpus, Arc::new(doorbells), x2apic, ioapic);
+    let doorbells = Arc::new(doorbells);
+    let made = LinuxGuest::new(&machine, mem_bytes, cpus, doorbells.clone(), x2apic, ioapic);
     if mem_bytes > crate::run::MAX_MEM_BYTES {
         invariant!(made.is_err(), "a guest of {} MiB made, its RAM over its devices' pages", mem_bytes / MIB);
         return;
@@ -1474,6 +1594,11 @@ pub fn platform(r: &mut Input) {
     }
     if r.u8() < 48 {
         guest.set_offloads(false);
+    }
+    /* How long its NICs' task polls, when it has one: never, a moment, or
+     * hv's default. */
+    if r.bool() {
+        guest.set_nic_poll(r.pick(&[0u64, 1_000, 50_000]));
     }
 
     /* Disks: none, mostly, or one -- each takes its 2 MiB of request
@@ -1505,6 +1630,12 @@ pub fn platform(r: &mut Input) {
     let host = Arc::new(HostState { input: Mutex::new(VecDeque::new()), button: AtomicBool::new(false),
                                     last_entry: AtomicU64::new(time::peek()) });
     let devices = disks.len() + nics.len();
+    /* Its NICs served by a task of their own on most inputs that have NICs,
+     * a thread beside the CPUs' -- by its first CPU's loop on the rest. */
+    let served = !nics.is_empty() && r.u8() >= 64;
+    let tidy = r.bool();
+    let sends = Arc::new(Mutex::new(HashMap::new()));
+    let disks_n = disks.len();
     let n = cpus as usize;
     let first_xapic = cpus > 1 && (!x2apic || ioapic);
     let script = Script {
@@ -1513,6 +1644,10 @@ pub fn platform(r: &mut Input) {
         host: host.clone(),
         disks,
         nics,
+        doorbells,
+        served,
+        tidy,
+        sends: sends.clone(),
         queues: vec![[DriverQueue::default(); 2]; devices],
         apic: cpus > 1,
         ioapic,
@@ -1527,12 +1662,37 @@ pub fn platform(r: &mut Input) {
     let deadline = time::boot_time_ns() + 3600 * crate::consts::NS_PER_SEC;
     let fuzz_host = Arc::new(FuzzHost(host.clone()));
     let (guest, machine) = (Arc::new(guest), Arc::new(machine));
-    let exits = if n == 1 {
+    let exits = if n == 1 && !served {
         vm::set_vcpu(0);
         guest.run(&mut vcpus[0], &machine, deadline, &*fuzz_host).exits
     } else {
-        run_threads(&guest, vcpus, &machine, deadline, &fuzz_host)
+        run_threads(&guest, vcpus, &machine, deadline, &fuzz_host, served)
     };
+    /* Every frame and notify rings the NICs' task: a round of its that found
+     * work after a sleep no ring ended is a wake lost. */
+    let (rounds, _, _, late, _) = guest.nic_task_stats();
+    invariant!(!tidy || late == 0, "the NICs' task found work after {} sleeps no ring ended, in {} rounds", late, rounds);
+    /* And a tidy guest's sends are all taken: what it handed its NICs a while
+     * before the end -- notified, or queued with its device asking for no
+     * notify -- the device took, unless a ring it followed broke. */
+    if tidy {
+        let end = time::peek();
+        let broken: Vec<bool> = guest.nic_stats().iter().map(|s| s.1).collect();
+        for (&dev, &(at, published, used_idx)) in sends.lock().unwrap().iter() {
+            let mut b = [0u8; 2];
+            if end.saturating_sub(at) < SENDS_TAKEN_NS || guest.memory().read(used_idx, &mut b).is_err()
+                || broken.get(dev - disks_n).copied().unwrap_or(true) {
+                continue;
+            }
+            let taken = u16::from_le_bytes(b);
+            invariant!(taken == published, "eth{}'s driver handed it chains up to {} {} ms before the end, and it took \
+                                            them up to {}", dev - disks_n, published, (end - at) / 1_000_000, taken);
+            SENDS_CHECKED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if served && rounds != 0 {
+        NIC_TASK_RUNS.fetch_add(1, Ordering::Relaxed);
+    }
     vm::set_guest(None);
     let stopped = guest.take_stopped();
     invariant!(stopped.is_some(), "the run ended with no stop recorded");

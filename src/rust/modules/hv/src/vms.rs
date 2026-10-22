@@ -49,7 +49,7 @@ use crate::guest::{self, Built, LogLine, NicSpec, Ring, Spec, TermFilter};
 use crate::net::{self, Switch};
 
 const START_USAGE: &str =
-    "hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]";
+    "hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [nonictask] [nicpoll=US] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]";
 /// How many times a `restart` guest is booted again after resetting itself
 /// within `RESTART_WINDOW_NS` before that is taken for a loop and it is left
 /// stopped: a guest that reboots in its first second would otherwise take
@@ -290,6 +290,13 @@ impl Shared {
         }
     }
 
+    /// A frame for the guest, handed over before this: whoever serves its
+    /// NICs -- their task, or the first CPU -- woken or kicked to take it.
+    /// From any context, interrupts off included.
+    pub(crate) fn frames_came(&self) {
+        self.doorbells.ring_nics();
+    }
+
     /// Every CPU's task woken, and every CPU out of its guest: for a stop
     /// or a restart, which each has to see.
     fn ring_all(&self) {
@@ -503,6 +510,8 @@ struct Start {
     /// What its disks wake and where they are served, for every boot.
     runner: Runner,
     placement: Vec<u32>,
+    /// Where its NICs' task runs, when it has one (`Placement::nics`).
+    nics: Option<u32>,
     /// Its hold on those CPUs and its disks', for as long as the task runs:
     /// through every boot and while it is parked, until `hv stop`.
     hold: Hold,
@@ -533,7 +542,7 @@ impl Burst {
 /// again, or parked on the first CPU's doorbell until a command asks for a
 /// restart or the end.
 fn vcpu(start: Start) {
-    let Start { shared, built, machine, spec, runner, placement, hold } = start;
+    let Start { shared, built, machine, spec, runner, placement, nics, hold } = start;
     /* Given back when this returns, the VM gone. */
     let _hold = hold;
     let line = if shared.log { LogLine::new() } else { None };
@@ -581,7 +590,7 @@ fn vcpu(start: Start) {
         let mut name = String::new();
         let _ = name.try_reserve(16);
         let _ = write!(name, "vm{}", shared.id);
-        let ran = guest::run_cpus(&g, built.cpus, &placement, &machine, u64::MAX, &host, &name);
+        let ran = guest::run_cpus(&g, built.cpus, &placement, nics, &machine, u64::MAX, &host, &name);
         host.flush_line();
 
         let ended = kcore::time::boot_time_ns();
@@ -691,8 +700,10 @@ struct Vm {
     task: Option<TaskHandle>,
     /// The host CPUs its CPUs run on, its first CPU's first.
     cpus: Vec<u32>,
-    /// The one its disks are served on, when it has disks.
+    /// The one its disks are served on, when it has disks, and its NICs,
+    /// when it has a task for them.
     disk_cpu: Option<u32>,
+    nic_cpu: Option<u32>,
     kernel: String,
     mem_mib: u64,
     /// Its port on the switch, with `net`.
@@ -848,7 +859,7 @@ impl Vms {
          * VM has a number, and given back with the task -- or here, on the
          * way out of a start that goes no further. */
         let has_disks = !spec.disks.is_empty();
-        let (place, core_hold) = match cores.take(machine, spec.cpu, spec.cpus, has_disks, None) {
+        let (place, core_hold) = match cores.take(machine, spec.cpu, spec.cpus, has_disks, spec.net && !spec.nonictask, None) {
             Ok(taken) => taken,
             Err(why) => {
                 let _ = writeln!(out, "hv: {}", why);
@@ -857,6 +868,7 @@ impl Vms {
         };
         let placement = place.vcpus;
         let disk_cpu = place.disk;
+        let nic_cpu = place.nics;
         let cpu = placement[0];
         if spec.input.len() > INPUT_MAX {
             let _ = writeln!(out, "hv: input= is {} bytes, more than the {} a vm queues", spec.input.len(), INPUT_MAX);
@@ -971,7 +983,8 @@ impl Vms {
                        if spec.restart { ", restarted when it resets" } else { "" });
 
         let start = Start {
-            shared: shared.clone(), built, machine: machine.clone(), spec, runner, placement, hold: core_hold,
+            shared: shared.clone(), built, machine: machine.clone(), spec, runner, placement, nics: nic_cpu,
+            hold: core_hold,
         };
         let task = match kcore::task::spawn_on_with(&name, 1u64 << cpu, start, vcpu) {
             Some(task) => task,
@@ -984,7 +997,8 @@ impl Vms {
         };
 
         let port = hold.as_ref().map(|h| h.port);
-        let vm = Vm { shared, task: Some(task), cpus, disk_cpu: has_disks.then_some(disk_cpu), kernel, mem_mib, port };
+        let vm = Vm { shared, task: Some(task), cpus, disk_cpu: has_disks.then_some(disk_cpu), nic_cpu, kernel, mem_mib,
+                      port };
         let refused = {
             let mut table = self.table.lock();
             if table.closing || table.vms.len() >= MAX_VMS {
@@ -1032,6 +1046,9 @@ impl Vms {
             }
             if let Some(cpu) = vm.disk_cpu {
                 let _ = write!(out, "  disks on cpu {}", cpu);
+            }
+            if let Some(cpu) = vm.nic_cpu {
+                let _ = write!(out, "  nics on cpu {}", cpu);
             }
             let _ = write!(out, "  {} MiB  {} s", vm.mem_mib,
                 until.saturating_sub(s.boot_ns.load(Ordering::Relaxed)) / NS_PER_SEC);

@@ -75,6 +75,7 @@ pub fn place_target(r: &mut Input) {
                 /* Now and then past the 64 a mask has. */
                 let wanted = (r.u8() < 48).then(|| r.below(u64::from(CPUS) + 2) as u32);
                 let disks = r.bool();
+                let nics = r.bool();
                 let mut taken = Taken::none();
                 for g in &guests {
                     taken.cpus |= g.vcpus | g.disk;
@@ -85,8 +86,11 @@ pub fn place_target(r: &mut Input) {
                     }
                 }
                 let rule = if own { Cores::Own } else { Cores::Shared };
-                let got = place::place(&topo, rule, enabled, online, &taken, wanted, n, disks);
+                let got = place::place(&topo, rule, enabled, online, &taken, wanted, n, disks, nics);
                 check(&topo, own, enabled, online, taken.cpus, wanted, n, disks, &got);
+                if let Ok(p) = &got {
+                    check_nics(&topo, own, online, disks, nics, p);
+                }
                 if let Ok(p) = got {
                     let vcpus = p.vcpus.iter().fold(0u64, |m, &c| m | bit(c));
                     guests.push(Guest { vcpus, disk: if disks { bit(p.disk) } else { 0 } });
@@ -209,6 +213,42 @@ fn check(topo: &Topology, own: bool, enabled: u64, online: u64, taken: u64, want
         invariant!(mine & bit(p.disk) != 0, "the disks' task on cpu {}, with nowhere but its own vCPUs' CPUs",
                    p.disk);
         placed("place: disks beside a vCPU of its own");
+    }
+}
+
+/// The task that serves a guest's NICs (`Placement::nics`): none without
+/// NICs; with them, its disks' task's CPU where that runs no vCPU of the
+/// guest's -- its disks given, or its cores shared -- and else, its cores its
+/// own, a spare thread of them where one is online, and else none: never
+/// one of its own vCPUs' CPUs, which every frame would take out of its
+/// guest, and never a core taken for that task alone.
+fn check_nics(topo: &Topology, own: bool, online: u64, disks: bool, nics: bool, p: &Placement) {
+    if !nics {
+        invariant!(p.nics.is_none(), "a NICs' task on {:?} for a guest with no NICs", p.nics);
+        return;
+    }
+    let mine = p.vcpus.iter().fold(0u64, |m, &c| m | bit(c));
+    let with_disks = (disks || !own) && mine & bit(p.disk) == 0;
+    let spare = if own { on_cores(topo, online & !mine, cores_of(topo, mine)) } else { 0 };
+    match p.nics {
+        Some(cpu) => {
+            invariant!(online & bit(cpu) != 0, "the NICs' task on cpu {}, which is not online", cpu);
+            invariant!(mine & bit(cpu) == 0, "the NICs' task on cpu {}, one of its own vCPUs'", cpu);
+            if with_disks {
+                invariant!(cpu == p.disk, "the NICs' task on cpu {} where its disks' task's cpu {} was to be had",
+                           cpu, p.disk);
+                placed("place: NICs with its disks");
+            } else {
+                invariant!(spare & bit(cpu) != 0, "the NICs' task on cpu {}, no spare thread of its own cores ({:#x})",
+                           cpu, spare);
+                placed("place: NICs on a spare thread of its own");
+            }
+        }
+        None => {
+            invariant!(!with_disks, "no NICs' task where its disks' task's cpu {} was to be had", p.disk);
+            invariant!(spare == 0, "no NICs' task with a spare thread of its own cores ({:#x})", spare);
+            placed("place: NICs served by its first CPU");
+        }
     }
 }
 

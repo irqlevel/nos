@@ -90,11 +90,17 @@ impl Taken {
 
 /// Where a guest goes: its vCPUs' CPUs, its first CPU's first, and the CPU
 /// the task that serves its disks runs on -- with no disks, its first
-/// vCPU's, which nothing runs on for them.
+/// vCPU's, which nothing runs on for them. And the CPU the task that serves
+/// its NICs runs on, where it has NICs and a CPU is to be had that runs no
+/// vCPU of its and takes no core for that task alone: its disks' task's, or
+/// a spare thread of its own cores. None, its NICs are its first CPU's to
+/// serve -- a task beside one of its own vCPUs would take that vCPU out of
+/// its guest for every frame, as the first CPU's serving them does.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Placement {
     pub vcpus: Vec<u32>,
     pub disk: u32,
+    pub nics: Option<u32>,
 }
 
 /// Why a guest was given no place.
@@ -124,12 +130,13 @@ fn bit(cpu: u32) -> u64 {
     1u64.checked_shl(cpu).unwrap_or(0)
 }
 
-/// Where a guest of `n` CPUs goes, with disks or not, its first CPU on
-/// `wanted` if it names one: on CPUs the extension is on for (`enabled`),
-/// its disks' task on one that is online (`online`), and as `cores` says,
-/// beside what the guests running `taken`.
+/// Where a guest of `n` CPUs goes, with disks or not and NICs or not, its
+/// first CPU on `wanted` if it names one: on CPUs the extension is on for
+/// (`enabled`), its devices' tasks on ones that are online (`online`), and
+/// as `cores` says, beside what the guests running `taken`.
+#[allow(clippy::too_many_arguments)]
 pub fn place(topo: &Topology, cores: Cores, enabled: u64, online: u64, taken: &Taken, wanted: Option<u32>, n: u32,
-             disks: bool) -> Result<Placement, Refused>
+             disks: bool, nics: bool) -> Result<Placement, Refused>
 {
     if enabled == 0 {
         return Err(Refused::NoneOn);
@@ -145,10 +152,31 @@ pub fn place(topo: &Topology, cores: Cores, enabled: u64, online: u64, taken: &T
     if n > enabled.count_ones() {
         return Err(Refused::TooMany { asked: n, on: enabled.count_ones() });
     }
-    match cores {
-        Cores::Own => own(topo, enabled, online, taken, wanted, n, disks),
-        Cores::Shared => shared(topo, enabled, online, taken, wanted, n),
+    let mut p = match cores {
+        Cores::Own => own(topo, enabled, online, taken, wanted, n, disks)?,
+        Cores::Shared => shared(topo, enabled, online, taken, wanted, n)?,
+    };
+    if nics {
+        p.nics = nics_cpu(topo, cores, online, disks, &p);
     }
+    Ok(p)
+}
+
+/// Where the task that serves a guest's NICs runs (`Placement::nics`): its
+/// disks' task's CPU where it has disks -- or, its cores shared, wherever
+/// the disks' task would go -- and that is no vCPU's of its; else, its cores
+/// its own, a spare thread of them, online, the highest; else none.
+fn nics_cpu(topo: &Topology, cores: Cores, online: u64, disks: bool, p: &Placement) -> Option<u32> {
+    let mine = p.vcpus.iter().fold(0u64, |m, &cpu| m | bit(cpu));
+    if (disks || cores == Cores::Shared) && mine & bit(p.disk) == 0 {
+        return Some(p.disk);
+    }
+    if cores == Cores::Shared {
+        return None;
+    }
+    let own_cores = cores_of(topo, mine);
+    (0..MAX_CPUS as u32).rev()
+        .find(|&cpu| online & bit(cpu) != 0 && mine & bit(cpu) == 0 && own_cores & bit(topo.core(cpu)) != 0)
 }
 
 /* ---- own: whole cores to a guest, its vCPUs filling their threads ---- */
@@ -244,7 +272,7 @@ fn own(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Option
     }
 
     let disk = if disks { own_disk(topo, online, held, chosen, &vcpus, home) } else { vcpus[0] };
-    Ok(Placement { vcpus, disk })
+    Ok(Placement { vcpus, disk, nics: None })
 }
 
 /// The free core a guest takes next, of those with a CPU in `free` it has
@@ -378,5 +406,5 @@ fn shared(topo: &Topology, enabled: u64, online: u64, taken: &Taken, wanted: Opt
         None if first != 0 => 0,
         None => first,
     };
-    Ok(Placement { vcpus, disk })
+    Ok(Placement { vcpus, disk, nics: None })
 }

@@ -84,6 +84,14 @@ pub struct Spec {
     /// `nooffload`: its NICs without their transmit offloads -- checksums
     /// and TCP's segmentation left to its own kernel, as before them.
     pub nooffload: bool,
+    /// `nonictask`: its NICs served by its first CPU's loop, as they were
+    /// before they had a task of their own: for a guest to be measured, or
+    /// run, without one.
+    pub nonictask: bool,
+    /// `nicpoll=US`: how long its NICs' task polls after a round that moved
+    /// a frame, its driver told not to notify meanwhile; 0, never; unset,
+    /// hv's default (`hv::run::NIC_POLL_DEFAULT_NS`).
+    pub nicpoll_us: Option<u64>,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
@@ -136,6 +144,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         apicv: None,
         rxmod_us: None,
         nooffload: false,
+        nonictask: false,
+        nicpoll_us: None,
         log: false,
         restart: false,
         net: false,
@@ -188,6 +198,10 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.apicv = Some(false);
         } else if word == "nooffload" {
             spec.nooffload = true;
+        } else if word == "nonictask" {
+            spec.nonictask = true;
+        } else if let Some(v) = word.strip_prefix("nicpoll=") {
+            spec.nicpoll_us = Some(v.parse().map_err(|_| String::from("nicpoll= wants microseconds"))?);
         } else if let Some(v) = word.strip_prefix("rxmod=") {
             spec.rxmod_us = Some(v.parse().map_err(|_| String::from("rxmod= wants microseconds"))?);
         } else if word == "restart" {
@@ -321,6 +335,9 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     if spec.nooffload {
         guest.set_offloads(false);
     }
+    if let Some(us) = spec.nicpoll_us {
+        guest.set_nic_poll(us.saturating_mul(kcore::consts::NS_PER_US));
+    }
 
     /* The 64-bit kernel at its load address, then the initrd high. */
     stream(&guest, &spec.kernel, pm_offset, layout.kernel_addr, kernel_len)?;
@@ -387,17 +404,25 @@ fn ap_task<H: Host + Send + Sync + 'static>(run: ApRun<H>) {
     drop(cpu);
 }
 
+/// The task that serves a guest's NICs, for as long as the guest runs.
+fn nic_task(guest: Arc<LinuxGuest>) {
+    guest.serve_nics();
+}
+
 /// Run a built guest until it stops -- by itself, at `deadline`, or at
 /// `host`'s request -- each of its CPUs on a task bound to its host CPU in
 /// `placement`: the first on the task this is called on, which is bound to
 /// `placement[0]` already, and every other on a task of its own, named
-/// `hv/<name>/cpu<N>`. Returns once every CPU's task is done; or, when a
-/// task cannot be made, why not, the guest stopped and the tasks made
-/// joined.
+/// `hv/<name>/cpu<N>`. With `nics`, its NICs are served by a task of their
+/// own on that host CPU, `hv/<name>/nics` (`LinuxGuest::serve_nics`) --
+/// without one, by its first CPU's loop. Returns once every task is done;
+/// or, when a CPU's task cannot be made, why not, the guest stopped and the
+/// tasks made joined.
 pub fn run_cpus<H: Host + Send + Sync + 'static>(
     guest: &Arc<LinuxGuest>,
     mut cpus: Vec<GuestCpu>,
     placement: &[u32],
+    nics: Option<u32>,
     machine: &Arc<Machine>,
     deadline: u64,
     host: &Arc<H>,
@@ -406,6 +431,21 @@ pub fn run_cpus<H: Host + Send + Sync + 'static>(
     let n = cpus.len();
     if n == 0 || placement.len() != n {
         return Err(String::from("the guest's CPUs and their places do not match"));
+    }
+    /* Its NICs' task first, so that the CPUs' first notify finds it -- it
+     * takes the NICs over as it starts, and a frame or a notify before then
+     * is the first CPU's -- and ended by the stop that ends the CPUs. With
+     * no task to be had, the first CPU serves them, as it does with none. */
+    let mut nic_task_handle = None;
+    if let Some(cpu) = nics {
+        let mut task_name = String::new();
+        if task_name.try_reserve(name.len() + 16).is_ok() {
+            let _ = write!(task_name, "hv/{}/nics", name);
+            nic_task_handle = kcore::task::spawn_on_with(&task_name, 1u64 << cpu, guest.clone(), nic_task);
+        }
+        if nic_task_handle.is_none() {
+            kcore::trace!(0, "hv: {}'s NICs served by its first CPU -- no task for them", name);
+        }
     }
     let mut slots = Vec::new();
     slots.try_reserve_exact(n).map_err(|_| String::from("out of memory"))?;
@@ -439,16 +479,19 @@ pub fn run_cpus<H: Host + Send + Sync + 'static>(
     }
 
     if let Some(index) = failed {
-        /* The CPUs started see the stop and end; their tasks are joined
-         * as the handles go. */
+        /* The CPUs started see the stop and end, and the NICs' task with
+         * them; their tasks are joined as the handles go. */
         guest.stop(Stop::Requested);
         drop(tasks);
+        drop(nic_task_handle);
         return Err(alloc::format!("no task for the guest's cpu {}", index));
     }
     let first = guest.run(&mut bsp, machine, deadline, &**host);
     /* Every other CPU's task, waited for: they see the guest stopped by the
-     * time this CPU does, or are rung to. */
+     * time this CPU does, or are rung to -- and the NICs' task, rung by the
+     * same stop. */
     drop(tasks);
+    drop(nic_task_handle);
     drop(bsp);
 
     let mut counts = core::mem::take(&mut *tally.counts.lock());
@@ -633,6 +676,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}{}",
             i, s.sent, s.received, s.dropped, s.large, s.whole,
             if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
+    }
+    let (rounds, msis, sleeps, late, polled_ns) = guest.nic_task_stats();
+    if rounds != 0 {
+        let _ = writeln!(out, "  nic task   {} rounds, {} MSIs sent, slept {} times, polled {} ms; {} rounds found work after a sleep no ring ended{}",
+            rounds, msis, sleeps, polled_ns / kcore::consts::NS_PER_MS, late, if late != 0 { " -- wakes lost" } else { "" });
     }
     let hot = guest.hot_ports(6);
     if !hot.is_empty() {

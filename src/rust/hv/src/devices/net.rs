@@ -162,6 +162,13 @@ pub struct Net {
     rx_quiet_ns: u64,
     rx_quiet_until: u64,
     rx_owed: bool,
+    /// Its rounds are a task's (`set_served`): a notify leaves its queue for
+    /// the next one rather than running a pass itself.
+    served: bool,
+    /// Its driver is told not to notify of what it queues to send
+    /// (`set_tx_notify`): every round looks at the ring, as no notify will
+    /// say there is something on it.
+    tx_quiet: bool,
     broken: Option<Broken>,
     pub stats: Stats,
 }
@@ -193,6 +200,8 @@ impl Net {
             rx_quiet_ns: 0,
             rx_quiet_until: 0,
             rx_owed: false,
+            served: false,
+            tx_quiet: false,
             broken: None,
             stats: Stats::default(),
         })
@@ -247,6 +256,55 @@ impl Net {
         (self.rx_quiet_until > now || self.rx_owed).then_some(self.rx_quiet_until)
     }
 
+    /// Its rounds made by a task of their own from now (`poll`, at each
+    /// `kick` and each frame the backend has), or by whoever notifies again:
+    /// served, a notify only says which queue to look at (`kick`), and the
+    /// vCPU that wrote it goes back to its guest at once.
+    pub fn set_served(&mut self, served: bool) {
+        self.served = served;
+    }
+
+    /// Whether its rounds are a task's (`set_served`).
+    pub fn served(&self) -> bool {
+        self.served
+    }
+
+    /// Queue `queue` was notified while served: what the driver queued to
+    /// send goes in the next round.
+    pub fn kick(&mut self, queue: u16) {
+        if queue == TX_QUEUE {
+            self.tx_more = true;
+        }
+    }
+
+    /// Whether a transmit pass ended at its bound with chains still on the
+    /// ring: the next round is due at once.
+    pub fn busy(&self) -> bool {
+        self.tx_more
+    }
+
+    /// The driver told to notify of what it queues to send, or not to,
+    /// while its task polls the ring (`virtio::Queue::set_notify`). Nothing
+    /// for a queue that is down or a ring the device stopped following.
+    pub fn set_tx_notify(&mut self, mem: &GuestMemory, on: bool) {
+        self.tx_quiet = false;
+        if self.broken.is_some() {
+            return;
+        }
+        if let Some(q) = self.transport.queue(TX_QUEUE).filter(|q| q.ready()) {
+            let told = q.set_notify(mem, on).is_ok();
+            self.tx_quiet = !on && told;
+        }
+    }
+
+    /// Whether the driver has queued what to send that no pass has taken --
+    /// found so, it goes in the next round, as if notified.
+    pub fn tx_found(&mut self, mem: &GuestMemory) -> bool {
+        let found = self.broken.is_none() && self.transport.queue(TX_QUEUE).is_some_and(|q| q.pending(mem));
+        self.tx_more |= found;
+        found
+    }
+
     /// Until when its receive interrupts are held, as the last one raised
     /// left them: what has whoever does the device's rounds come back then,
     /// when it changes behind its back (`LinuxGuest::run`).
@@ -299,6 +357,10 @@ impl Net {
             return Raise::default();
         }
         match self.transport.write(offset, size, value, mem, now) {
+            Asked::Notify(queue) if self.served => {
+                self.kick(queue);
+                Raise::default()
+            }
             Asked::Notify(TX_QUEUE) => self.send(mem),
             /* Buffers posted for receiving: whatever is waiting can go. */
             Asked::Notify(RX_QUEUE) => self.deliver(mem, now),
@@ -306,6 +368,7 @@ impl Net {
                 self.broken = None;
                 self.held = None;
                 self.tx_more = false;
+                self.tx_quiet = false;
                 self.rx_owed = false;
                 self.tell(Takes::default());
                 Raise::default()
@@ -405,11 +468,12 @@ impl Net {
     }
 
     /// A round of the device at `now`, each time round the run loop: what a
-    /// transmit pass left at its bound sent, and what the backend has for
-    /// the guest delivered -- and the interrupts that leaves the device
-    /// with, a receive interrupt owed among them once its time is up.
+    /// transmit pass left at its bound sent -- or, its driver told not to
+    /// notify, whatever is on the ring -- and what the backend has for the
+    /// guest delivered; and the interrupts that leaves the device with, a
+    /// receive interrupt owed among them once its time is up.
     pub fn poll(&mut self, mem: &GuestMemory, now: u64) -> Raise {
-        let sent = if self.tx_more { self.send(mem) } else { Raise::default() };
+        let sent = if self.tx_more || self.tx_quiet { self.send(mem) } else { Raise::default() };
         sent.or(self.deliver(mem, now))
     }
 

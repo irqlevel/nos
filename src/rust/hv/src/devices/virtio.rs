@@ -67,6 +67,8 @@ const DESC_SIZE: usize = 16;
 const USED_ELEM_SIZE: usize = 8;
 /// The available ring's flag: the driver wants no interrupt.
 const AVAIL_NO_INTERRUPT: u16 = 1;
+/// The used ring's flag: the device wants no notify.
+const USED_NO_NOTIFY: u16 = 1;
 
 /// A driver's buffer, from a descriptor: where it is, how long, and whether
 /// the device writes it (or reads it). Where it is is the guest's to say --
@@ -279,6 +281,22 @@ impl Queue {
         published
     }
 
+    /// The driver told to notify the device of what it makes available, or
+    /// not to -- while the device looks at the ring on its own, polling. The
+    /// driver checks the flag after it publishes what it queued, fenced; so
+    /// a device that tells it to again has to look once more after its own
+    /// fence, for what was queued while the flag still said not to.
+    pub fn set_notify(&mut self, mem: &GuestMemory, on: bool) -> Result<(), Broken> {
+        let used = self.used_at();
+        self.rings(mem).put_word(used, if on { 0 } else { USED_NO_NOTIFY })
+    }
+
+    /// Whether the driver has made chains available the device has not
+    /// taken: false for a ring that is no ring.
+    pub fn pending(&self, mem: &GuestMemory) -> bool {
+        self.ready() && self.waiting(mem).is_ok_and(|n| n != 0)
+    }
+
     /// Whether the driver wants an interrupt for what was given back -- read
     /// after a full fence. The driver turns interrupts back on and then
     /// looks for what came meanwhile; without the fence, the device's load
@@ -379,6 +397,14 @@ fn get32(h: &[u8], at: u16) -> u32 {
     u32::from_le_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]])
 }
 
+
+/// The queue a write of `size` bytes of `value` at `offset` notifies, when it
+/// is a write of the notify register and of nothing else -- a driver's kick,
+/// which says only which queue to look at: what can be handed to whoever
+/// serves the device without the device's lock (`LinuxGuest::serve_nics`).
+pub fn notify_of(offset: u16, size: u8, value: u32) -> Option<u16> {
+    (offset == QUEUE_NOTIFY && size == 2).then_some(value as u16)
+}
 
 /// The interrupts a device has for the driver once it has given buffers
 /// back: the INTx line to raise -- an edge, the interrupt status having been

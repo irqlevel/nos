@@ -409,6 +409,11 @@ pub mod vms {
         pub fn wake_up(&self) {
             self.woken.fetch_add(1, Ordering::Relaxed);
         }
+        /// As the module's: whoever serves the guest's NICs woken -- here,
+        /// counted as a wake, which the switch's model holds it to.
+        pub fn frames_came(&self) {
+            self.woken.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

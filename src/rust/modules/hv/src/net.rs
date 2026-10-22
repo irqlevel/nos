@@ -394,7 +394,7 @@ impl Ports {
          * frame now -- at the host's next tick, a busy guest's inbox would
          * have overflowed many times over at line rate. */
         if let Some(owner) = &inbox.owner {
-            owner.wake_up();
+            owner.frames_came();
         }
     }
 

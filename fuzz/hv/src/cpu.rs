@@ -67,6 +67,13 @@ pub fn timer_at(deadline_ns: u64) {
     vm::arm_timer(deadline_ns);
 }
 
+/// `kcore::cpu::relax`: a spin's pause -- here the clock moved on a
+/// microsecond, and the turn handed to any other thread that can run, so a
+/// task polling a ring lets the guest's CPUs fill it.
+pub fn relax() {
+    vm::relax();
+}
+
 pub mod x86 {
     pub mod cpu {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1099,6 +1106,17 @@ pub mod vm {
             t.unpark();
         }
         false
+    }
+
+    /// The thread spinning on what others change (`kcore::cpu::relax`): the
+    /// clock moved on a microsecond, and the turn to the next thread that can
+    /// run, if one can -- back when it is this one's again.
+    pub fn relax() {
+        crate::time::advance(1_000);
+        let me = VCPU.with(|v| v.get());
+        if threaded() && !hand_on(me, Turn::Ready) {
+            wait_turn(me);
+        }
     }
 
     /// CPU `me` waits to be woken -- by `rung`, or at `until`: the turn goes

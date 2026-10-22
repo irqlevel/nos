@@ -72,9 +72,13 @@ pub const MAX_VCPUS: usize = 16;
 
 /// A guest's doorbells, one per CPU, made with the VM and kept for its life
 /// -- across its reboots, since whoever rings them (the switch with a frame,
-/// a command with a key) knows the VM and not the boot.
+/// a command with a key) knows the VM and not the boot. And the bell of the
+/// task that serves its NICs, while one does (`LinuxGuest::serve_nics`):
+/// what a frame for the guest rings then, in place of its first CPU's.
 pub struct Doorbells {
     cpus: Vec<Doorbell>,
+    nics: Event,
+    nics_served: AtomicBool,
 }
 
 impl Doorbells {
@@ -89,7 +93,7 @@ impl Doorbells {
         for _ in 0..cpus {
             v.push(Doorbell::new()?);
         }
-        Some(Doorbells { cpus: v })
+        Some(Doorbells { cpus: v, nics: Event::new()?, nics_served: AtomicBool::new(false) })
     }
 
     pub fn len(&self) -> usize {
@@ -103,11 +107,37 @@ impl Doorbells {
         self.cpus.get(i)
     }
 
-    /// Every CPU's: for a stop, which each has to see.
+    /// Every CPU's, and the NICs' task's: for a stop, which each has to see.
     pub fn ring_all(&self) {
         for d in &self.cpus {
             d.ring();
         }
+        self.nics.signal();
+    }
+
+    /// Something waits for the guest's NICs -- a frame from the switch, a
+    /// queue notified -- put where they look before this: their task woken,
+    /// while one serves them, and the first CPU rung otherwise, whose loop
+    /// does the devices' rounds then. From any context, interrupts off
+    /// included.
+    pub fn ring_nics(&self) {
+        if self.nics_served.load(Ordering::Acquire) {
+            self.nics.signal();
+        } else if let Some(d) = self.cpus.first() {
+            d.ring();
+        }
+    }
+
+    /// A task serves the guest's NICs from now (`LinuxGuest::serve_nics`),
+    /// or no longer does.
+    pub fn serve_nics(&self, served: bool) {
+        self.nics_served.store(served, Ordering::Release);
+    }
+
+    /// The NICs' task, with nothing to do: until rung, or `ns` have passed.
+    /// True when rung.
+    pub fn wait_nics(&self, ns: u64) -> bool {
+        self.nics.wait_for(Duration::from_nanos(ns))
     }
 
     /// Interrupts their kicks have sent, over every CPU.

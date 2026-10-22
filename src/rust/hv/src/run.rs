@@ -70,7 +70,7 @@ use crate::devices::ioapic::{self, Pins};
 use crate::devices::net::{self, Net};
 use crate::devices::pci::{self, Function, PciBus};
 use crate::devices::pm;
-use crate::devices::virtio::Raise;
+use crate::devices::virtio::{self, Raise};
 use crate::devices::{IoApic, Pic, Pit, Pm, Rtc, Uart};
 use crate::lapic::{self, Addressing, Delivery, Ipi, Lapic, Wrote};
 use crate::linux::{self, Header, Layout};
@@ -124,7 +124,68 @@ pub const MAX_CPUS: usize = MAX_VCPUS;
 /// A device on the guest's PCI bus, by its slot.
 enum PciDev {
     Disk(Blk),
-    Nic(Net),
+    Nic(Arc<NicCell>),
+}
+
+/// A NIC, as the guest's CPUs and the task that serves it share it
+/// (`LinuxGuest::serve_nics`): the device under a lock of its own -- which
+/// the task holds while it moves frames, the platform's free meanwhile --
+/// and beside it what is read without that lock. Where both are taken, the
+/// platform's is taken first; nothing takes the platform's with this held.
+struct NicCell {
+    nic: Mutex<Nic>,
+    /// Its INTx line as the device last left it: what the 8259's and the
+    /// IO-APIC's pins follow (`sync_ioapic`).
+    line: AtomicBool,
+    /// The queues notified while a task serves it, a bit each: what the
+    /// task's next round looks at (`virtio::notify_of`).
+    kicked: AtomicU32,
+    /// Some of its MSI-X entries are held, masked (`Nic::pending`): for the
+    /// first CPU's loop to send once their mask is off.
+    held: AtomicBool,
+}
+
+/// The device, and what interrupting by MSI-X takes of its PCI function --
+/// which only the platform's lock reaches otherwise.
+struct Nic {
+    net: Net,
+    /// The function's MSI-X capability as configuration space has it, its
+    /// control word and its table's page: copied in at every write of the
+    /// space (`sync_msix`).
+    msix: Option<(u16, u32)>,
+    /// Its entries that came while masked, a bit each: sent once unmasked,
+    /// and shown to the guest meanwhile in the table page's pending bits.
+    pending: u32,
+}
+
+/// What a NIC's round left (`LinuxGuest::nic_round`): its INTx line raised,
+/// when it has to be looked at again on its own, whether its transmit pass
+/// stopped at its bound with more to send, how many MSIs it sent, and
+/// whether it moved a frame either way.
+struct NicRound {
+    line: bool,
+    due: Option<u64>,
+    busy: bool,
+    msis: u64,
+    moved: bool,
+}
+
+/// Who sends a device's message: guest CPU `me`, whose own local APIC
+/// (`lapic`) takes what it sends itself -- or, with no APIC, the task that
+/// serves the NICs, which is none of the guest's CPUs and posts to all.
+struct Sender<'a> {
+    me: u32,
+    lapic: Option<&'a mut Lapic>,
+}
+
+impl<'a> Sender<'a> {
+    fn cpu(me: u32, lapic: &'a mut Lapic) -> Sender<'a> {
+        Sender { me, lapic: Some(lapic) }
+    }
+
+    fn task() -> Sender<'a> {
+        Sender { me: u32::MAX, lapic: None }
+    }
 }
 
 /* The two ways a PC guest resets its machine by port I/O. The 8042's
@@ -165,6 +226,15 @@ const RFLAGS_IF: u64 = 1 << 9;
 /// until the deadline, and is woken at its CPU's next scheduling point, the
 /// tick at the latest).
 const MAX_HALT_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
+/// The longest the task that serves a guest's NICs sleeps with nothing due:
+/// everything it is for rings it, so this is only how long a wake that was
+/// lost costs -- and the rounds that find work after it are counted.
+const NIC_TASK_WAIT_NS: u64 = 10 * kcore::consts::NS_PER_MS;
+/// How long the task that serves a guest's NICs polls after a round that
+/// moved a frame, the drivers told not to notify meanwhile (`set_nic_poll`),
+/// and the most it may be set to.
+pub const NIC_POLL_DEFAULT_NS: u64 = 50 * kcore::consts::NS_PER_US;
+pub const MAX_NIC_POLL_NS: u64 = kcore::consts::NS_PER_MS;
 /// The longest a CPU asleep for good -- halted with interrupts off, or
 /// waiting for a start-up IPI -- sleeps before it looks again. Only another
 /// CPU can wake one, by ringing it, and a stop rings every CPU; this is a
@@ -612,6 +682,19 @@ pub struct LinuxGuest {
     /// offloads (`set_offloads`).
     rx_moderation_ns: u64,
     offloads: bool,
+    /// A task serves its NICs (`serve_nics`): the first CPU's loop leaves
+    /// their rounds to it. And what that task did, for a report: its rounds,
+    /// the MSIs it sent, the times it slept, and the rounds that found work
+    /// after a sleep that ended at its cap.
+    nics_served: AtomicBool,
+    nic_rounds: AtomicU64,
+    nic_msis: AtomicU64,
+    nic_sleeps: AtomicU64,
+    nic_late: AtomicU64,
+    nic_polled_ns: AtomicU64,
+    /// How long that task polls after a round that moved a frame
+    /// (`set_nic_poll`).
+    nic_poll_ns: u64,
 }
 
 /// What a guest's OS did with its ACPI, for a report.
@@ -739,6 +822,13 @@ impl LinuxGuest {
             notified: AtomicU64::new(0),
             rx_moderation_ns: RX_MODERATION_DEFAULT_NS,
             offloads: true,
+            nics_served: AtomicBool::new(false),
+            nic_rounds: AtomicU64::new(0),
+            nic_msis: AtomicU64::new(0),
+            nic_sleeps: AtomicU64::new(0),
+            nic_late: AtomicU64::new(0),
+            nic_polled_ns: AtomicU64::new(0),
+            nic_poll_ns: NIC_POLL_DEFAULT_NS,
         };
         Ok((guest, vcpus))
     }
@@ -769,11 +859,20 @@ impl LinuxGuest {
     /// after; set before it boots.
     pub fn set_offloads(&mut self, on: bool) {
         self.offloads = on;
-        for d in self.platform.lock().pci_devs.iter_mut() {
-            if let PciDev::Nic(n) = d {
-                n.set_offloads(on);
+        for d in self.platform.lock().pci_devs.iter() {
+            if let PciDev::Nic(c) = d {
+                c.nic.lock().net.set_offloads(on);
             }
         }
+    }
+
+    /// How long the task that serves its NICs (`serve_nics`) polls their
+    /// rings and backends after a round that moved a frame -- its drivers
+    /// told not to notify of what they queue to send meanwhile -- before it
+    /// tells them to again and sleeps: 0, never, a notify waking it for each
+    /// send. [`NIC_POLL_DEFAULT_NS`] unset; [`MAX_NIC_POLL_NS`] at most.
+    pub fn set_nic_poll(&mut self, ns: u64) {
+        self.nic_poll_ns = ns.min(MAX_NIC_POLL_NS);
     }
 
     /// Its NICs' receive interrupts no closer than `ns` apart -- 0 for each
@@ -783,9 +882,9 @@ impl LinuxGuest {
     pub fn set_rx_moderation(&mut self, ns: u64) {
         let ns = ns.min(MAX_RX_MODERATION_NS);
         self.rx_moderation_ns = ns;
-        for d in self.platform.lock().pci_devs.iter_mut() {
-            if let PciDev::Nic(n) = d {
-                n.set_rx_moderation(ns);
+        for d in self.platform.lock().pci_devs.iter() {
+            if let PciDev::Nic(c) = d {
+                c.nic.lock().net.set_rx_moderation(ns);
             }
         }
     }
@@ -863,8 +962,14 @@ impl LinuxGuest {
             nic.offer_msix(NIC_VECTORS).ok_or(Error::NoMemory)?;
             f = f.with_msix(NIC_VECTORS, page);
         }
+        let cell = Arc::new(NicCell {
+            nic: Mutex::new(Nic { net: nic, msix: None, pending: 0 }).ok_or(Error::NoMemory)?,
+            line: AtomicBool::new(false),
+            kicked: AtomicU32::new(0),
+            held: AtomicBool::new(false),
+        });
         p.pci.add(f)?;
-        p.pci_devs.push(PciDev::Nic(nic));
+        p.pci_devs.push(PciDev::Nic(cell));
         p.msix_pending.push(0);
         p.nics += 1;
         Ok(())
@@ -893,8 +998,9 @@ impl LinuxGuest {
         let mut v = Vec::new();
         if v.try_reserve_exact(p.nics).is_ok() {
             for d in &p.pci_devs {
-                if let PciDev::Nic(n) = d {
-                    v.push((n.stats, n.broken().is_some(), n.rings_copied()));
+                if let PciDev::Nic(c) = d {
+                    let n = c.nic.lock();
+                    v.push((n.net.stats, n.net.broken().is_some(), n.net.rings_copied()));
                 }
             }
         }
@@ -1061,6 +1167,170 @@ impl LinuxGuest {
         self.doorbells.ring_all();
     }
 
+    /// The guest's NICs served from the task this is called on until the
+    /// guest stops: each one's rounds made here -- what a notify left for it
+    /// sent, what its backend has for the guest delivered, its MSIs posted
+    /// to the CPUs they are for -- rather than by the first CPU's loop and
+    /// inside the notify of whichever CPU wrote one. So no guest CPU leaves
+    /// its guest for a frame, and one that notifies goes back to it at once.
+    /// Woken by a frame from the switch and by a notify
+    /// (`Doorbells::ring_nics`), at its receive window's end, and by the
+    /// stop; returns at once for a guest with no NIC.
+    ///
+    /// A round that finds work after a sleep that ended at the cap rather
+    /// than at a ring is counted (`nic_task_stats`): every frame and notify
+    /// rings the task, so one is a wake that was lost, and a report says so
+    /// rather than the guest seeing 10 ms more on a frame.
+    ///
+    /// After a round that moved a frame the task polls -- round after round,
+    /// for `set_nic_poll`'s while past the last that moved one -- and the
+    /// drivers are told meanwhile not to notify of what they queue to send
+    /// (`Net::set_tx_notify`): a send then costs the guest no exit, and the
+    /// task no wake. Then it tells them to notify again, fences, and looks
+    /// once more before it sleeps: a driver checks the flag after it
+    /// publishes, fenced, so what it queued while told not to is found by
+    /// that look -- the two fences one on each side, as for interrupts
+    /// (`virtio::Queue::wants_interrupt`).
+    pub fn serve_nics(&self) {
+        let mut cells: Vec<Arc<NicCell>> = Vec::new();
+        {
+            let p = self.platform.lock();
+            if cells.try_reserve_exact(p.nics).is_err() {
+                return;
+            }
+            for d in &p.pci_devs {
+                if let PciDev::Nic(c) = d {
+                    cells.push(c.clone());
+                }
+            }
+        }
+        if cells.is_empty() {
+            return;
+        }
+        /* The devices first, then the guest's word for it: a notify that
+         * finds the guest's still clear runs under a device that keeps what
+         * it was asked for and rings the task (`io`). */
+        for c in &cells {
+            c.nic.lock().net.set_served(true);
+        }
+        self.nics_served.store(true, Ordering::Release);
+        self.doorbells.serve_nics(true);
+        let mut capped = false;
+        /* Polling: the drivers told not to notify, since `quiet_since`, until
+         * a while past the last round that moved a frame. */
+        let mut quiet_since: Option<u64> = None;
+        let mut poll_until = 0u64;
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            let now = time::boot_time_ns();
+            let cap = now.saturating_add(NIC_TASK_WAIT_NS);
+            let mut due = cap;
+            let mut busy = false;
+            let mut moved = false;
+            for c in &cells {
+                let round = self.nic_round(c, now, &mut Sender::task());
+                self.nic_rounds.fetch_add(1, Ordering::Relaxed);
+                self.nic_msis.fetch_add(round.msis, Ordering::Relaxed);
+                if round.line {
+                    self.nic_line(now);
+                }
+                if let Some(d) = round.due {
+                    due = due.min(d);
+                }
+                busy |= round.busy;
+                moved |= round.moved;
+            }
+            if capped && moved {
+                self.nic_late.fetch_add(1, Ordering::Relaxed);
+            }
+            capped = false;
+            if moved && self.nic_poll_ns != 0 {
+                poll_until = now.saturating_add(self.nic_poll_ns);
+                if quiet_since.is_none() {
+                    self.nics_notify(&cells, false);
+                    quiet_since = Some(now);
+                }
+            }
+            if busy {
+                continue;
+            }
+            if let Some(since) = quiet_since {
+                if now < poll_until {
+                    kcore::cpu::relax();
+                    continue;
+                }
+                /* Told to notify again, then one more look: what was queued
+                 * while they were told not to came with no notify. */
+                self.nics_notify(&cells, true);
+                core::sync::atomic::fence(Ordering::SeqCst);
+                quiet_since = None;
+                self.nic_polled_ns.fetch_add(now.saturating_sub(since), Ordering::Relaxed);
+                let mut found = false;
+                for c in &cells {
+                    found |= c.nic.lock().net.tx_found(&self.memory);
+                }
+                if found {
+                    continue;
+                }
+            }
+            let now = time::boot_time_ns();
+            if due > now {
+                self.nic_sleeps.fetch_add(1, Ordering::Relaxed);
+                let rung = self.doorbells.wait_nics(due - now);
+                capped = !rung && due == cap;
+            }
+        }
+        if quiet_since.is_some() {
+            self.nics_notify(&cells, true);
+        }
+        self.doorbells.serve_nics(false);
+        self.nics_served.store(false, Ordering::Release);
+        for c in &cells {
+            c.nic.lock().net.set_served(false);
+        }
+    }
+
+    /// Each of `cells`' drivers told to notify of what it queues to send, or
+    /// not to (`Net::set_tx_notify`). A spin's pause before they are told
+    /// again: nothing to a CPU, and in hv-fuzz another thread's turn -- the
+    /// one place a guest's CPU can publish a chain and find the flag still
+    /// set between the task's last round and its telling them, which the look
+    /// after it (`serve_nics`) is for.
+    fn nics_notify(&self, cells: &[Arc<NicCell>], on: bool) {
+        if on {
+            kcore::cpu::relax();
+        }
+        for c in cells {
+            c.nic.lock().net.set_tx_notify(&self.memory, on);
+        }
+    }
+
+    /// A served NIC's INTx line raised, given to the 8259 and the IO-APIC
+    /// from its task -- the platform's lock taken with the device's let go
+    /// -- and whoever takes the 8259's interrupts rung.
+    fn nic_line(&self, now: u64) {
+        let mut p = self.platform.lock();
+        p.pic.raise(NIC_IRQ);
+        let pins = sync_ioapic(&mut p, now);
+        self.ioapic_send_from(&mut p, pins, &mut Sender::task());
+        let ring = p.pic.pending().is_some();
+        drop(p);
+        if ring {
+            self.ring_extint();
+        }
+    }
+
+    /// What the task that serves its NICs did (`serve_nics`): its rounds,
+    /// the MSIs it sent, the times it slept, the rounds that found work
+    /// after a sleep no ring ended, and the time it polled.
+    pub fn nic_task_stats(&self) -> (u64, u64, u64, u64, u64) {
+        (self.nic_rounds.load(Ordering::Relaxed), self.nic_msis.load(Ordering::Relaxed),
+         self.nic_sleeps.load(Ordering::Relaxed), self.nic_late.load(Ordering::Relaxed),
+         self.nic_polled_ns.load(Ordering::Relaxed))
+    }
+
     /// Run guest CPU `gc` on the CPU this is called on until the guest
     /// stops -- for good, on `host`'s request, by one of its CPUs, or at
     /// `deadline` (host nanoseconds since boot; `u64::MAX` for none) -- its
@@ -1165,15 +1435,10 @@ impl LinuxGuest {
                 if p.uart.irq_line() {
                     p.pic.raise(COM1_IRQ);
                 }
-                self.poll_devices(&mut p, me as u32, &mut gc.lapic, &mut gc.counts, now);
-                /* When the devices' round has to come again on its own: a
-                 * receive interrupt held, and frames that woke nobody while
-                 * it is (`Net::rx_due`) -- slept to, or armed before the
+                /* And when the devices' round has to come again on its own,
+                 * while it is this loop's -- slept to, or armed before the
                  * guest is entered, below. */
-                devices_due = p.pci_devs.iter().filter_map(|d| match d {
-                    PciDev::Nic(n) => n.rx_due(now),
-                    PciDev::Disk(_) => None,
-                }).min();
+                devices_due = self.poll_devices(&mut p, me as u32, &mut gc.lapic, &mut gc.counts, now);
                 pins |= sync_ioapic(&mut p, now);
                 self.ioapic_send(&mut p, pins, me as u32, &mut gc.lapic, &mut gc.counts);
                 extint = gc.lapic.accepts_extint() && p.pic.pending().is_some();
@@ -1813,23 +2078,46 @@ impl LinuxGuest {
         }
     }
 
-    /// What the disks' backends have served, given back to the guest, and
-    /// what the NICs' backends have for it, into its buffers: each kind's
-    /// line raised when that calls for an interrupt.
-    fn poll_devices(&self, p: &mut Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts, now: u64) {
-        let mut raised = [Raise::default(); MAX_DISKS + MAX_NICS];
-        for (d, r) in p.pci_devs.iter_mut().zip(raised.iter_mut()) {
-            *r = match d {
-                PciDev::Disk(d) => d.poll(&self.memory),
-                PciDev::Nic(n) => n.poll(&self.memory, now),
+    /// What the disks' backends have served, given back to the guest, and --
+    /// unless a task serves them (`serve_nics`) -- what the NICs' backends
+    /// have for it, into its buffers: each line raised and each MSI sent,
+    /// from CPU `me`, where that calls for an interrupt. With a task serving
+    /// the NICs, what their masks held back is sent from here once unmasked:
+    /// the guest unmasks an entry by a store to its own memory, which nothing
+    /// hears of, and this loop looks every round. Returns when the NICs'
+    /// round has to come again on its own, while it is this loop's: a
+    /// receive interrupt held, frames that woke nobody meanwhile
+    /// (`Net::rx_due`), a transmit pass stopped at its bound.
+    fn poll_devices(&self, p: &mut Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts, now: u64) -> Option<u64> {
+        let served = self.nics_served.load(Ordering::Acquire);
+        let mut due: Option<u64> = None;
+        for dev in 0..p.pci_devs.len() {
+            let raised = match p.pci_devs.get_mut(dev) {
+                Some(PciDev::Disk(d)) => d.poll(&self.memory),
+                Some(PciDev::Nic(c)) => {
+                    let c = c.clone();
+                    if served {
+                        if c.held.load(Ordering::Acquire) {
+                            counts.msi += self.nic_unmasked(&c, &mut Sender::cpu(me, lapic));
+                        }
+                        continue;
+                    }
+                    let round = self.nic_round(&c, now, &mut Sender::cpu(me, lapic));
+                    counts.msi += round.msis;
+                    let next = if round.busy { Some(now) } else { round.due };
+                    due = match (due, next) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
+                    Raise { line: round.line, vectors: 0 }
+                }
+                None => break,
             };
-        }
-        for (dev, r) in raised.iter().enumerate() {
-            if r.any() {
-                self.raise(p, me, lapic, counts, dev, *r);
+            if raised.any() {
+                self.raise(p, me, lapic, counts, dev, raised);
             }
         }
-        /* And what a mask held back, now its mask may be off. */
+        /* And what a mask held back of the disks', now its mask may be off. */
         for dev in 0..p.msix_pending.len() {
             let held = p.msix_pending[dev];
             if held != 0 {
@@ -1840,6 +2128,60 @@ impl LinuxGuest {
                 }
             }
         }
+        due
+    }
+
+    /// A round of NIC `c` at `now`: the queues notified while a task serves
+    /// it looked at, what the driver queued sent, what the backend has for
+    /// the guest delivered -- and the MSIs that leaves it with sent from
+    /// `from`, those masked held.
+    fn nic_round(&self, c: &NicCell, now: u64, from: &mut Sender) -> NicRound {
+        let kicked = c.kicked.swap(0, Ordering::AcqRel);
+        let mut nic = c.nic.lock();
+        let mut left = kicked;
+        while left != 0 {
+            let queue = left.trailing_zeros() as u16;
+            left &= left - 1;
+            nic.net.kick(queue);
+        }
+        let before = nic.net.stats.sent + nic.net.stats.received;
+        let raised = nic.net.poll(&self.memory, now);
+        let msis = if raised.vectors != 0 { self.nic_msix(&mut nic, c, raised.vectors, from) } else { 0 };
+        c.line.store(nic.net.line(), Ordering::Release);
+        let moved = nic.net.stats.sent + nic.net.stats.received != before;
+        NicRound { line: raised.line, due: nic.net.rx_due(now), busy: nic.net.busy(), msis, moved }
+    }
+
+    /// NIC entries `entries` sent from `from` as the function's table says,
+    /// the device held (`nic`): those masked kept pending and shown in the
+    /// table page's pending bits. How many were sent.
+    fn nic_msix(&self, nic: &mut Nic, c: &NicCell, entries: u32, from: &mut Sender) -> u64 {
+        let (held, sent) = self.msix_send(nic.msix, entries, from);
+        if nic.pending | held != nic.pending {
+            nic.pending |= held;
+            if let Some((_, page)) = nic.msix {
+                self.show_pending(page, nic.pending);
+            }
+            c.held.store(true, Ordering::Release);
+        }
+        sent
+    }
+
+    /// NIC `c`'s entries held while masked, sent from `from` as far as their
+    /// masks are off now -- and forgotten with MSI-X turned off, as a
+    /// function's pending bits are. How many were sent.
+    fn nic_unmasked(&self, c: &NicCell, from: &mut Sender) -> u64 {
+        let mut nic = c.nic.lock();
+        let held = nic.pending;
+        let (still, sent) = self.msix_send(nic.msix, held, from);
+        if still != held {
+            nic.pending = still;
+            if let Some((_, page)) = nic.msix {
+                self.show_pending(page, still);
+            }
+            c.held.store(still != 0, Ordering::Release);
+        }
+        sent
     }
 
     /// What device `dev` has for the guest: its line up on the 8259, and
@@ -1853,13 +2195,20 @@ impl LinuxGuest {
             };
             p.pic.raise(line);
         }
-        if r.vectors != 0 {
-            let held = self.msix(p, me, lapic, counts, dev, r.vectors);
-            if let Some(pending) = p.msix_pending.get_mut(dev) {
-                if *pending | held != *pending {
-                    *pending |= held;
-                    self.write_pba(p, dev);
-                }
+        if r.vectors == 0 {
+            return;
+        }
+        if let Some(PciDev::Nic(c)) = p.pci_devs.get(dev) {
+            let c = c.clone();
+            let mut nic = c.nic.lock();
+            counts.msi += self.nic_msix(&mut nic, &c, r.vectors, &mut Sender::cpu(me, lapic));
+            return;
+        }
+        let held = self.msix(p, me, lapic, counts, dev, r.vectors);
+        if let Some(pending) = p.msix_pending.get_mut(dev) {
+            if *pending | held != *pending {
+                *pending |= held;
+                self.write_pba(p, dev);
             }
         }
     }
@@ -1868,23 +2217,40 @@ impl LinuxGuest {
     /// in its table page, after the table.
     fn write_pba(&self, p: &Platform, dev: usize) {
         let (Some((_, page)), Some(&pending)) = (p.pci.msix(dev + 1), p.msix_pending.get(dev)) else { return };
+        self.show_pending(page, pending);
+    }
+
+    /// `pending` shown in the pending bits of the MSI-X table at `page`.
+    fn show_pending(&self, page: u32, pending: u32) {
         let pba = u64::from(page) + u64::from(pci::MSIX_PBA_OFFSET);
         let _ = self.memory.write(pba, &u64::from(pending).to_le_bytes());
     }
 
-    /// Device `dev`'s MSI-X entries in `entries`, a bit each: each sent as
-    /// the message its table entry holds -- read from the table page, which
-    /// is the guest's to write -- unless it or the whole function is masked.
-    /// Those are held, and returned, for the caller to keep pending and send
-    /// from `poll_devices` once unmasked. One the table has not got, or a
-    /// message that is no interrupt, goes nowhere.
+    /// Device `dev`'s MSI-X entries in `entries`, a bit each, sent from CPU
+    /// `me` (`msix_send`): those held returned, for the caller to keep
+    /// pending and send from `poll_devices` once unmasked.
     fn msix(&self, p: &Platform, me: u32, lapic: &mut Lapic, counts: &mut Counts, dev: usize, entries: u32) -> u32 {
-        let Some((control, page)) = p.pci.msix(dev + 1) else { return 0 };
+        let (held, sent) = self.msix_send(p.pci.msix(dev + 1), entries, &mut Sender::cpu(me, lapic));
+        counts.msi += sent;
+        held
+    }
+
+    /// Entries `entries` of the MSI-X table of a function whose capability
+    /// is `msix` -- its control word and its table's page; None for one with
+    /// none -- a bit each: each sent from `from` as the message its table
+    /// entry holds -- read from the page, which is the guest's to write --
+    /// unless it or the whole function is masked. Those are held, and
+    /// returned, with how many were sent. One the table has not got, or a
+    /// message that is no interrupt, goes nowhere; with MSI-X off, nothing
+    /// does and nothing is held.
+    fn msix_send(&self, msix: Option<(u16, u32)>, entries: u32, from: &mut Sender) -> (u32, u64) {
+        let Some((control, page)) = msix else { return (0, 0) };
         if control & pci::MSIX_ENABLE == 0 {
-            return 0;
+            return (0, 0);
         }
         let size = u32::from(control & pci::MSIX_SIZE_MASK) + 1;
         let mut held = 0u32;
+        let mut sent = 0u64;
         let mut left = entries;
         while left != 0 {
             let entry = left.trailing_zeros();
@@ -1904,37 +2270,47 @@ impl LinuxGuest {
             }
             let address = u64::from(word(0)) | (u64::from(word(4)) << 32);
             if let Some(ipi) = lapic::msi(address, word(8)) {
-                counts.msi += 1;
-                self.post_msi(me, lapic, &ipi);
+                sent += 1;
+                self.send_message(from, &ipi, false);
             }
         }
-        held
+        (held, sent)
     }
 
-    /// A device's MSI, as `ipi` decodes it: its vector into the request
-    /// register of each CPU it names -- the first of them only, for lowest
-    /// priority -- straight into `lapic` for the CPU `me` doing the device's
-    /// work, and through the mailbox and a ring for any other.
+    /// A device's MSI, as `ipi` decodes it, from CPU `me` (`send_message`).
     fn post_msi(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi) {
-        self.post_message(me, lapic, ipi, false);
+        self.send_message(&mut Sender::cpu(me, lapic), ipi, false);
+    }
+
+    /// A device's message on the APIC bus from CPU `me` (`send_message`).
+    fn post_message(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi, level: bool) {
+        self.send_message(&mut Sender::cpu(me, lapic), ipi, level);
     }
 
     /// A device's message on the APIC bus -- an MSI, an IO-APIC pin's -- to
-    /// the CPUs it names, as `post_msi` delivers one; `level`, a fixed
-    /// interrupt the local APIC takes as level-triggered, its EOI coming
-    /// back to the IO-APIC. An NMI goes into the mailbox of each CPU named,
-    /// the sender's own included, for its loop to take -- rung, so that one
-    /// already on its way into its guest turns back for it. An INIT from a
-    /// device is none a PC's firmware wires, and is dropped.
-    fn post_message(&self, me: u32, lapic: &mut Lapic, ipi: &Ipi, level: bool) {
+    /// the CPUs it names: its vector into the request register of each --
+    /// the first of them only, for lowest priority -- straight into the
+    /// sender's own local APIC for the CPU that sends it, and posted, or
+    /// through the mailbox and a ring, for any other: every one, when the
+    /// NICs' task sends it, which is none of them. `level`, a fixed interrupt
+    /// the local APIC takes as level-triggered, its EOI coming back to the
+    /// IO-APIC. An NMI goes into the mailbox of each CPU named, the sender's
+    /// own included, for its loop to take -- rung, so that one already on its
+    /// way into its guest turns back for it. An INIT from a device is none a
+    /// PC's firmware wires, and is dropped.
+    fn send_message(&self, from: &mut Sender, ipi: &Ipi, level: bool) {
         for (i, target) in self.cpus.iter().enumerate() {
             let id = i as u32;
-            let addressing = if id == me { lapic.addressing() } else { target.addressing() };
-            if !ipi.reaches(id, addressing, me) {
+            let own = id == from.me;
+            let addressing = match (&from.lapic, own) {
+                (Some(l), true) => l.addressing(),
+                _ => target.addressing(),
+            };
+            if !ipi.reaches(id, addressing, from.me) {
                 continue;
             }
-            let posted = match ipi.delivery {
-                Delivery::Fixed | Delivery::LowestPriority if id == me => {
+            let posted = match (ipi.delivery, from.lapic.as_deref_mut()) {
+                (Delivery::Fixed | Delivery::LowestPriority, Some(lapic)) if own => {
                     if level {
                         lapic.accept_level(ipi.vector);
                     } else {
@@ -1942,16 +2318,16 @@ impl LinuxGuest {
                     }
                     false
                 }
-                Delivery::Fixed | Delivery::LowestPriority if !level => {
+                (Delivery::Fixed | Delivery::LowestPriority, _) if !level => {
                     /* Posted or mailed, and its CPU notified or rung. */
                     self.post_edge(i, target, ipi.vector);
                     false
                 }
-                Delivery::Fixed | Delivery::LowestPriority => {
+                (Delivery::Fixed | Delivery::LowestPriority, _) => {
                     target.mail.post_level(ipi.vector);
                     true
                 }
-                Delivery::Nmi => {
+                (Delivery::Nmi, _) => {
                     target.mail.post_nmi();
                     true
                 }
@@ -1971,16 +2347,24 @@ impl LinuxGuest {
     /// The interrupts the IO-APIC has to send for `pins`, delivered as its
     /// messages say, by CPU `me`, whose local APIC is `lapic`.
     fn ioapic_send(&self, p: &mut Platform, pins: Pins, me: u32, lapic: &mut Lapic, counts: &mut Counts) {
-        let Some(io) = p.ioapic.as_mut() else { return };
+        counts.ioapic += self.ioapic_send_from(p, pins, &mut Sender::cpu(me, lapic));
+    }
+
+    /// The interrupts the IO-APIC has to send for `pins`, from `from`: how
+    /// many it sent.
+    fn ioapic_send_from(&self, p: &mut Platform, pins: Pins, from: &mut Sender) -> u64 {
+        let Some(io) = p.ioapic.as_mut() else { return 0 };
+        let mut sent = 0;
         let mut left = pins;
         while left != 0 {
             let pin = left.trailing_zeros() as usize;
             left &= left - 1;
             if let Some(m) = io.send(pin) {
-                counts.ioapic += 1;
-                self.post_message(me, lapic, &m.ipi, m.level);
+                sent += 1;
+                self.send_message(from, &m.ipi, m.level);
             }
         }
+        sent
     }
 
     /// `gc`'s local APIC ended a level-triggered interrupt of `vector`: its
@@ -2051,8 +2435,10 @@ impl LinuxGuest {
         }
 
         /* Whether the first CPU, whose loop does the devices' rounds, has to
-         * look at them again for what this access did. */
+         * look at them again for what this access did -- or the NICs' task,
+         * when one serves them. */
         let mut first = false;
+        let mut nics = false;
         let mut p = self.platform.lock();
         if io.input && !Uart::owns(COM1, io.port) && (io.port as usize) < p.port_hist.len() {
             let slot = &mut p.port_hist[io.port as usize];
@@ -2129,7 +2515,13 @@ impl LinuxGuest {
             if io.input {
                 let value = match dev {
                     Some(PciDev::Disk(d)) => d.io_read(offset, io.size),
-                    Some(PciDev::Nic(n)) => n.io_read(offset, io.size),
+                    Some(PciDev::Nic(c)) => {
+                        let mut nic = c.nic.lock();
+                        let value = nic.net.io_read(offset, io.size);
+                        /* A read of the interrupt status takes its line down. */
+                        c.line.store(nic.net.line(), Ordering::Release);
+                        value
+                    }
                     None => u32::MAX,
                 };
                 set_in(v.save_mut(), io.size, value);
@@ -2138,21 +2530,43 @@ impl LinuxGuest {
                 let value = v.save().rax as u32;
                 let raised = match dev {
                     Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory, time::boot_time_ns()),
-                    Some(PciDev::Nic(n)) => {
-                        let window = n.rx_window();
-                        let raised = n.io_write(offset, io.size, value, &self.memory, time::boot_time_ns());
-                        /* A receive interrupt raised from another CPU's
-                         * notify -- a driver refilling its ring where its
-                         * interrupt is taken -- holds the next one back, and
-                         * frames that come meanwhile wake nobody: the first
-                         * CPU's loop comes back at the end for them. It may
-                         * be asleep, or in its guest, with an older end in
-                         * mind, and would sleep to its cap with the frames
-                         * waiting: rung, it looks again. Pings between two
-                         * guests on the EX44 had a 10 ms answer every few
-                         * hundred without this, and none in 2,400 with it. */
-                        first |= me != 0 && n.rx_window() != window;
-                        raised
+                    Some(PciDev::Nic(c)) => {
+                        let c = c.clone();
+                        match (self.nics_served.load(Ordering::Acquire), virtio::notify_of(offset, io.size, value)) {
+                            (true, Some(queue)) => {
+                                /* A notify, with a task serving the NIC: which
+                                 * queue, for its next round -- and back to the
+                                 * guest, the device untouched. */
+                                if let Some(bit) = 1u32.checked_shl(u32::from(queue)) {
+                                    c.kicked.fetch_or(bit, Ordering::AcqRel);
+                                }
+                                nics = true;
+                                Raise::default()
+                            }
+                            _ => {
+                                let mut nic = c.nic.lock();
+                                let window = nic.net.rx_window();
+                                let raised = nic.net.io_write(offset, io.size, value, &self.memory, time::boot_time_ns());
+                                /* A receive interrupt raised from another
+                                 * CPU's notify -- a driver refilling its ring
+                                 * where its interrupt is taken -- holds the
+                                 * next one back, and frames that come
+                                 * meanwhile wake nobody: the first CPU's loop
+                                 * comes back at the end for them. It may be
+                                 * asleep, or in its guest, with an older end
+                                 * in mind, and would sleep to its cap with the
+                                 * frames waiting: rung, it looks again. Pings
+                                 * between two guests on the EX44 had a 10 ms
+                                 * answer every few hundred without this, and
+                                 * none in 2,400 with it. A task that serves
+                                 * the NIC is rung for whatever was written,
+                                 * which the device left for its next round. */
+                                first |= me != 0 && nic.net.rx_window() != window;
+                                nics |= nic.net.served();
+                                c.line.store(nic.net.line(), Ordering::Release);
+                                raised
+                            }
+                        }
                     }
                     None => Raise::default(),
                 };
@@ -2185,6 +2599,9 @@ impl LinuxGuest {
             if let Some(d) = self.doorbells.get(0) {
                 d.ring();
             }
+        }
+        if nics {
+            self.doorbells.ring_nics();
         }
         None
     }
@@ -2392,7 +2809,7 @@ fn sync_ioapic(p: &mut Platform, now: u64) -> Pins {
     for d in pci_devs.iter() {
         match d {
             PciDev::Disk(d) => disk |= d.line(),
-            PciDev::Nic(n) => nic |= n.line(),
+            PciDev::Nic(c) => nic |= c.line.load(Ordering::Acquire),
         }
     }
     pins |= io.set_line(ioapic::isa_pin(DISK_IRQ), disk);
@@ -2405,10 +2822,18 @@ fn sync_ioapic(p: &mut Platform, now: u64) -> Pins {
 fn sync_msix(p: &mut Platform) {
     let Platform { pci, pci_devs, .. } = p;
     for (i, d) in pci_devs.iter_mut().enumerate() {
-        let on = pci.msix(i + 1).is_some_and(|(control, _)| control & pci::MSIX_ENABLE != 0);
+        let msix = pci.msix(i + 1);
+        let on = msix.is_some_and(|(control, _)| control & pci::MSIX_ENABLE != 0);
         match d {
             PciDev::Disk(d) => d.set_msix_enabled(on),
-            PciDev::Nic(n) => n.set_msix_enabled(on),
+            PciDev::Nic(c) => {
+                /* What its MSIs are sent by, wherever it is served from; and
+                 * its line, which MSI-X on takes down. */
+                let mut nic = c.nic.lock();
+                nic.net.set_msix_enabled(on);
+                nic.msix = msix;
+                c.line.store(nic.net.line(), Ordering::Release);
+            }
         }
     }
 }

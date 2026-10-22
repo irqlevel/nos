@@ -515,7 +515,7 @@ What the VMX backend does not do yet, and says so rather than pretends:
                                 on cpus of them, each on a host CPU of its
                                 own -- for secs, then print its console and
                                 how it ended
-    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [nonictask] [nicpoll=US] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -1475,10 +1475,35 @@ $ hv forward add 8080 1 80              # nos's 8080, to guest 1's 80
 **The guest's NIC is virtio-net, legacy, on the same transport as its
 disks** (`hv::devices::net`): two queues, a MAC and a link status offered,
 and offloads both ways (below), legacy's header in front of every frame
-either way -- ten bytes, twelve once the driver takes mergeable buffers. A
-send is cut, or handed on whole, before the notify returns; what waits for
-the guest is put into the buffers it has posted each time round the run
-loop, one frame held by the device while it has posted too few.
+either way -- ten bytes, twelve once the driver takes mergeable buffers.
+What the guest sends is cut, or handed on whole, and what waits for it put
+into the buffers it has posted, by whoever serves the device: a task of
+its own (below), or -- where it has none -- the first CPU's loop each time
+round, and the notify itself before it returns; one frame held by the
+device while the guest has posted too few buffers.
+
+**A task of its own.** Served from a vCPU, a NIC takes that vCPU out of its
+guest: the first CPU kicked out for every batch of frames the switch hands
+it, and a CPU that notifies held in the host for the whole pass of what it
+queued -- cut, carried, copied into the other guest's inbox. So a guest's
+NICs are served by a task of their own, `hv/vmN/nics`
+(`LinuxGuest::serve_nics`), where one has a CPU that runs no vCPU of the
+guest's: a notify only marks its queue for the task and rings it -- the
+vCPU back in its guest at once, the device's lock untouched -- the switch
+rings the task, not the first CPU, for a frame, and the task's rounds send,
+deliver and interrupt: its MSIs posted to the CPUs they are for, which take
+them in their guest with no exit at all where the CPU posts interrupts, and
+its INTx line raised on the 8259 and the IO-APIC from it, under the
+platform's lock with the device's let go. The device has a lock of its own
+for this (`NicCell`): the task holds it while it moves frames and the
+platform's lock is free meanwhile, and what the platform's lock-holders need
+of the device -- its INTx line, for the pins -- is kept beside it, read
+without it. Every frame and every notify rings the task, so a round of its
+that finds work after a sleep that ended at its 10 ms cap is a wake that
+was lost: counted, and in the report (`nic task ... -- wakes lost`), and
+hv-fuzz holds every run of a whole machine to none. Without a task -- a
+guest whose vCPUs fill its cores and that has no disks' task to share, or
+`nonictask` on `hv start` -- the first CPU serves its NICs as before.
 
 **Offloads, both ways.** The device completes a checksum the driver leaves
 to it (`VIRTIO_NET_F_CSUM`) and cuts TCP over IPv4 the driver hands it as
@@ -2260,7 +2285,12 @@ the threads left on it, then on cores sharing its last-level cache, the
 faster kind first. Its disks' task goes on a spare thread of its own cores,
 then on a core no guest has, of the slower kind where its cache has one --
 the task waits on the disk, and a fast core is a guest's; it then holds that
-core as well -- then beside a vCPU of its own. A guest
+core as well -- then beside a vCPU of its own. Its NICs' task goes where
+its disks' task does when that is no vCPU's CPU, or else on a spare thread
+of its own cores, and nowhere else: never beside a vCPU of its own, which
+every frame would take out of its guest as the first CPU's serving them
+did, and never on a core taken for it alone -- a guest of two CPUs that
+fills its core and has no disk keeps its NICs on its first CPU. A guest
 that would need a core another has -- `cpu=` on one, or more CPUs than the
 free cores have threads -- is refused, saying so. The place and the hold on
 it are taken under one lock (`modules/hv/src/cores.rs`), so two guests
@@ -2268,7 +2298,7 @@ started at once from two shells cannot both be given a core; an `hv start`
 guest holds its cores until `hv stop` -- parked too, for the restart that
 runs it there again -- and an `hv boot` guest until its run is over. `hv
 cores` says the rule and who holds which CPUs; `hv list` says where each
-guest's disks are served.
+guest's disks and NICs are served.
 
 What it costs: a guest's own CPUs share their core. On one core's two
 threads (13 and 12 on the AX41) two busy loops in a Debian guest took 14.7 s
@@ -3737,9 +3767,11 @@ someone else's; then speed.
    ~~a NIC's receive interrupts moderated~~ done ([A network](#a-network)),
    halt polling having turned out to do it by accident;
    left: the xAPIC
-   page's virtualization, and AMD's AVIC; device work off the first CPU's
-   task, with a lock a device (~~the ring pages mapped once rather than at
-   every access~~ done, [Its memory](#its-memory)); nested leaves of 2
+   page's virtualization, and AMD's AVIC; ~~a NIC's work off the first
+   CPU's task, with a lock of its own~~ done where the guest has a CPU for
+   it ([A network](#a-network)), the disks' rings still the first CPU's
+   (~~the ring pages mapped once rather than at every access~~ done, [Its
+   memory](#its-memory)); nested leaves of 2
    MiB and 1 GiB, over guest memory taken in runs that size; the VMX
    preemption timer, which would take a computing guest out at its timer's
    edge without the host interrupt that does it now ([Time](#time));

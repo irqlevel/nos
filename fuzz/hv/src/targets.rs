@@ -620,6 +620,17 @@ impl DriverQueue {
     fn used(&self) -> u64 {
         (self.avail() + 6 + 2 * QUEUE_SIZE).next_multiple_of(PAGE)
     }
+
+    /// Where the device's flags are -- the first word of the used ring --
+    /// for a queue that is set up.
+    pub fn used_flags(&self) -> Option<u64> {
+        (self.pfn != 0).then(|| self.used())
+    }
+
+    /// The available index as the driver last published it.
+    pub fn published(&self) -> u16 {
+        self.avail_idx
+    }
 }
 
 /// How many chains a racing CPU posts before it calls the device's pass one
@@ -676,6 +687,16 @@ fn gpa(r: &mut Input) -> u64 {
 /// descriptors, put its head in the available ring, and publish it: or, a
 /// guest that makes a ring wrong, a chain that points anywhere.
 pub fn chain(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64, u32, bool)]) {
+    chain_made(mem, q, r, segs, true);
+}
+
+/// A chain of `segs` as `chain` makes one, but with nothing in it wrong: its
+/// descriptors as made, its index one on.
+pub fn chain_clean(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64, u32, bool)]) {
+    chain_made(mem, q, r, segs, false);
+}
+
+fn chain_made(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64, u32, bool)], wrong: bool) {
     if q.pfn == 0 || segs.is_empty() {
         return;
     }
@@ -689,7 +710,7 @@ pub fn chain(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64,
         }
         /* Sometimes a descriptor that is wrong: a loop, an index past the
          * ring, an indirect one that was not offered. */
-        match r.u8() % 32 {
+        match if wrong { r.u8() % 32 } else { 32 } {
             0 => next = head as u16,
             1 => next = r.u16(),
             2 => flags |= 4,
@@ -707,7 +728,7 @@ pub fn chain(mem: &dyn Memory, q: &mut DriverQueue, r: &mut Input, segs: &[(u64,
     let slot = u64::from(q.avail_idx) % QUEUE_SIZE;
     mem.put(q.avail() + 4 + 2 * slot, &(head as u16).to_le_bytes());
     /* The index published: one on, or -- a driver gone wrong -- anything. */
-    q.avail_idx = if r.u8() % 32 == 0 { r.u16() } else { q.avail_idx.wrapping_add(1) };
+    q.avail_idx = if wrong && r.u8() % 32 == 0 { r.u16() } else { q.avail_idx.wrapping_add(1) };
     mem.put(q.avail() + 2, &q.avail_idx.to_le_bytes());
     /* The flags: an interrupt wanted, or not. */
     mem.put(q.avail(), &u16::from(r.bool()).to_le_bytes());

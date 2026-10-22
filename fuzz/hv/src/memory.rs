@@ -79,6 +79,9 @@ struct Racer {
 struct Shared {
     pages: Mutex<Pages>,
     racer: Mutex<Option<Racer>>,
+    /// The last word the device stored at each address, as one access --
+    /// a ring's index or flags (`device_stored`).
+    words: Mutex<HashMap<u64, u16>>,
 }
 
 pub struct GuestMemory {
@@ -96,7 +99,8 @@ impl GuestMemory {
     pub fn new(_vendor: Vendor) -> Result<GuestMemory> {
         Ok(GuestMemory {
             regions: Vec::new(),
-            shared: Arc::new(Shared { pages: Mutex::new(Pages::default()), racer: Mutex::new(None) }),
+            shared: Arc::new(Shared { pages: Mutex::new(Pages::default()), racer: Mutex::new(None),
+                                      words: Mutex::new(HashMap::new()) }),
             absent: Mutex::new(Vec::new()),
             refuse_maps: AtomicBool::new(false),
             maps: AtomicUsize::new(0),
@@ -196,7 +200,11 @@ impl Mapping {
     }
 
     pub fn store_u16(&self, offset: usize, value: u16) -> bool {
-        self.store::<u16>(offset, value)
+        let stored = self.store::<u16>(offset, value);
+        if stored {
+            self.shared.words.lock().unwrap().insert(self.base + offset as u64, value);
+        }
+        stored
     }
 }
 
@@ -319,7 +327,18 @@ impl GuestMemory {
         if gpa % 2 != 0 {
             return Err(Error::BadAddress);
         }
-        self.write(gpa, &value.to_le_bytes())
+        self.write(gpa, &value.to_le_bytes())?;
+        self.shared.words.lock().unwrap().insert(gpa, value);
+        Ok(())
+    }
+
+    /// Whether the word at `gpa` is `value` because the device stored it
+    /// there -- its last store of a word there, through a mapping or a copy,
+    /// was `value` -- rather than because the guest's own writes left it so:
+    /// what a scripted driver goes by, as a driver whose rings nothing
+    /// overwrote would.
+    pub fn device_stored(&self, gpa: u64, value: u16) -> bool {
+        self.shared.words.lock().unwrap().get(&gpa) == Some(&value)
     }
 
     /// As the real one decides it: a page of the MMIO window that is no

@@ -473,7 +473,10 @@ that comes first; each vCPU on a CPU of its own the extension is on for,
 the first where `cpu=` said; and, its cores its own, none of them with
 another guest's CPU on it, every one of them but one filled before the next
 is taken, and its disks' task on a spare thread of its own cores, then on a
-core no guest has, then beside a vCPU of its own. Five mutants of the rule
+core no guest has, then beside a vCPU of its own; and its NICs' task with
+its disks' task where that runs no vCPU of its, else on a spare thread of
+its own cores, else nowhere -- never beside a vCPU of its own, never on a
+core taken for it alone. Five mutants of the rule
 -- later cores not checked, one vCPU a core, the disks' task on a held core,
 `cpu=`'s core not checked, the disks' task elsewhere before a spare thread
 of its own -- each failed within two inputs.
@@ -518,7 +521,24 @@ for; and it runs NAT's boot self-test once, which holds the cases random
 input seldom makes, a tie and every slot held. And `platform` does it to the whole machine: a Linux guest's platform built
 and loaded as `hv boot` builds it -- CPUs, disks, NICs, IO-APIC and all --
 and run by the real run loop, `LinuxGuest::run`, on each of its CPUs, each
-on a thread of its own and one at a time -- the one turn handed from thread
+on a thread of its own and one at a time -- its NICs, on most inputs that
+have them, served by their task on a thread of its own in the same turns
+(`LinuxGuest::serve_nics`) -- the script ringing it for each frame it puts
+in, as the switch does, handing it the turn when the guest runs a while,
+and its drivers holding back a notify where the device asked for none, as
+Linux's do. Half the runs are a tidy guest's: its devices driven by its
+first CPU alone, a queue's rings on pages of their own and zeroed when set
+up, its buffers clear of them, nothing in configuration space or its
+devices' registers but its drivers' doing -- a guest whose every chain a
+notify that reaches the device announces. Its runs are held to the NICs'
+task never finding work after a sleep no ring ended, and to every send
+handed a NIC more than 30 ms before the end having been taken: a notify or
+a frame that did not ring the task failed within 397 inputs, the ring not
+looked at while the driver was told not to notify and the driver never
+told to notify again -- the two bugs the second check found in the first
+polling -- within 23,125. Left out, the look after the drivers are told to
+notify again survives: the turn model seldom puts a guest's chain between
+the task's last round and that telling -- the one turn handed from thread
 to thread directly, and the clock moved on to the next deadline when every
 CPU waits, so that nothing sleeps on a real clock: sixteen times the runs a
 second of the first harness, whose CPUs slept for real, and ten processes

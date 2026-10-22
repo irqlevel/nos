@@ -1011,6 +1011,16 @@ def network(args):
         pt.check("both guests reach their shells", "uid=0 gid=0" in out(4) and "uid=0 gid=0" in out(5),
                  out(4)[-300:] + out(5)[-300:])
         pt.check("hv list gives each its address", "10.0.100.2" in out(6) and "10.0.100.3" in out(6), out(6))
+        # Its NICs served by a task of their own where the guest has a CPU
+        # for one: a guest of one CPU, its core's other thread. Never beside
+        # a vCPU of its own -- guests of two CPUs fill their cores, and keep
+        # their NICs on their first CPU.
+        if args.cpus == 1:
+            pt.check("each guest's NICs are served by a task on its core's other thread",
+                     len(re.findall(r"nics on cpu \d+", out(6))) == 2, out(6))
+        else:
+            pt.check("guests that fill their cores keep their NICs on their first CPU", "nics on cpu" not in out(6),
+                     out(6))
         pt.check("the guest's eth0 has its port's address and MAC",
                  "10.0.100.2" in out(7) and re.search(r"(?i)02:00:00:00:64:02", out(7)) is not None, out(7))
         pt.check("a guest pings nos, at 10.0.100.1 on hv0", ok_ping(out(8)), out(8)[-600:])
@@ -1101,6 +1111,11 @@ def network(args):
         pt.check("a forward to vm 0 is added", "port 8081 forwarded to vm 0, 10.0.100.2:80" in way(17), way(17))
         pt.check("hv stop takes the stopped VM's forward away with it",
                  "its 1 forward(s) taken away with it" in way(18), way(18)[-600:])
+        if args.cpus == 1:
+            task = re.search(r"nic task +(\d+) rounds, (\d+) MSIs sent, slept (\d+) times, polled (\d+) ms; (\d+) rounds "
+                             r"found work after a sleep no ring ended", way(18))
+            pt.check("the NICs' task served vm 0, and none of its wakes was lost",
+                     task is not None and int(task.group(1)) > 0 and task.group(5) == "0", way(18)[-1200:])
         pt.check("hv forward no longer lists it, and still lists the other VM's",
                  "port 8081" not in way(19) and "port 8080 -> vm 1" in way(19), way(19))
         pt.check("NAT keeps no mapping of the stopped VM's address",

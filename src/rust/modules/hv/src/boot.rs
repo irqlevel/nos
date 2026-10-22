@@ -161,7 +161,7 @@ impl Boot {
         let guest = Arc::new(built.guest);
         /* No switch reaches an `hv boot` guest; its disks ring its first
          * CPU. */
-        let ran = guest::run_cpus(&guest, built.cpus, &self.placement, &self.machine, deadline, &host, "boot");
+        let ran = guest::run_cpus(&guest, built.cpus, &self.placement, None, &self.machine, deadline, &host, "boot");
         let run_ns = kcore::time::boot_time_ns().saturating_sub(start);
         let ran = match ran {
             Ok(ran) => ran,
@@ -240,7 +240,7 @@ pub fn boot(machine: &Arc<Machine>, args: &str, cores: &Cores, unloading: &Arc<A
             return;
         }
     };
-    let (place, hold) = match cores.take(machine, spec.cpu, spec.cpus, !spec.disks.is_empty(), Some(Holder::Boot)) {
+    let (place, hold) = match cores.take(machine, spec.cpu, spec.cpus, !spec.disks.is_empty(), false, Some(Holder::Boot)) {
         Ok(taken) => taken,
         Err(why) => {
             let _ = writeln!(out, "hv: {}", why);
