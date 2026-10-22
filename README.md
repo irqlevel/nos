@@ -1,6 +1,6 @@
 ### nos
 
-A hobby operating system kernel for x86-64 and arm64 (aarch64), written in C++20, Rust, and assembly.
+An operating system kernel for x86-64 and arm64 (aarch64), written in C++20, Rust, and assembly.
 Code is partially written by AI models (Claude, GPT) with human control over architecture decisions, testing, and code review.
 Tested primarily in QEMU/KVM environments, including Google Cloud and Yandex Cloud VMs (MBR-based disk image, virtio devices), and on QEMU `virt` with HVF acceleration on Apple Silicon for the arm64 build. On x86-64 it boots under both legacy BIOS and UEFI. It also runs on real hardware — a laptop and two dedicated servers, one Intel and one AMD, see [Real hardware](docs/real-hardware.md) — though only those three machines have been tried, so anything beyond them is untested.
 
