@@ -222,9 +222,13 @@ if "Страница не найдена" not in body.decode("utf-8", "replace")
 # Security headers on a page.
 status, h, body = get("/en")
 lower = {k.lower(): v for k, v in h.items()}
-for header in ("content-security-policy", "x-content-type-options", "referrer-policy", "x-frame-options"):
+for header in ("content-security-policy", "x-content-type-options", "referrer-policy"):
     if header not in lower:
         fail(f"/en lacks {header}")
+# Who may frame the pages: frame-ancestors, which supersedes X-Frame-Options (dropped
+# when a Metrica counter's Session Replay must frame them).
+if "frame-ancestors" not in lower.get("content-security-policy", ""):
+    fail("/en: the Content-Security-Policy has no frame-ancestors")
 if "x-powered-by" in lower:
     fail("/en sends X-Powered-By")
 
