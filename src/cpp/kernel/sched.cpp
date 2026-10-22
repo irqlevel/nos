@@ -76,7 +76,12 @@ void TaskQueue::SwitchComplete(Task* curr)
 
     if (prev->State.Get() != Task::StateExited)
     {
-        auto taskQueue = prev->SelectNextTaskQueue();
+        /* Not a task asleep until a deadline: this CPU's timer has just been
+           armed for it (WakeSleepers), and no other CPU's would be -- moved,
+           it would run at its new CPU's next tick. Asleep, it costs no CPU
+           anything to balance; it moves, if it should, once it runs. */
+        bool sleeping = prev->IsBlocked() && prev->SleepUntil.Get() != 0;
+        auto taskQueue = sleeping ? nullptr : prev->SelectNextTaskQueue();
         if (taskQueue != nullptr)
         {
             TaskMigrations.Inc();
@@ -152,6 +157,44 @@ static bool SleepIsOver(Task* cand, ulong* now)
         *now = GetBootTime().GetValue();
 
     return *now >= until;
+}
+
+ulong TaskQueue::EarliestDeadline(ulong now)
+{
+    ulong earliest = ~0UL;
+
+    for (auto entry = TaskList.Flink; entry != &TaskList; entry = entry->Flink)
+    {
+        Task* task = CONTAINING_RECORD(entry, Task, ListEntry);
+        if (!task->IsBlocked())
+            continue;
+
+        /* One whose time has come is SelectNext's to run, now or at its
+           turn: nothing to fire for */
+        ulong until = (ulong)task->SleepUntil.Get();
+        if (until > now && until < earliest)
+            earliest = until;
+    }
+
+    return earliest;
+}
+
+void TaskQueue::WakeSleepers(Task* curr)
+{
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+
+    /* After the timer fired, the walk: it was armed for the deadline it
+       fired at, or the tick, and others may be due before the next tick.
+       Otherwise every task asleep here armed it as it blocked, and only the
+       one blocking now can need it sooner. */
+    if (cpu.LocalTimerTakeWalk())
+    {
+        cpu.LocalTimerWake(EarliestDeadline(GetBootTime().GetValue()));
+        return;
+    }
+
+    if (curr->IsBlocked())
+        cpu.LocalTimerWake((ulong)curr->SleepUntil.Get());
 }
 
 Task* TaskQueue::SelectNext(Task *curr, bool keepOverIdle)
@@ -271,6 +314,11 @@ void TaskQueue::Schedule(Task* curr, bool keepOverIdle)
         Pause();
         Lock.Lock();
     }
+
+    /* Before the switch, whichever way it goes: a sleeper's deadline is
+       when this CPU's timer is to fire, so that the walk that runs the
+       sleeper comes then and not at the next tick */
+    WakeSleepers(curr);
 
     if (next == nullptr)
     {
@@ -421,15 +469,16 @@ void YieldToRunnable()
 }
 
 /* Sleep blocks. The task is out of the scheduler's walk until its time has
-   come, and the walk on its CPU notices that and runs it: at every
-   scheduling point that CPU has -- the tick's, 100 times a second, at the
-   latest -- which is where a sleeper used to notice it for itself. It used to
-   poll, a loop around Schedule() that left it runnable: alone on its CPU it
-   let the CPU halt until the tick, but two on one CPU handed it to each other
-   without end and the idle task never ran. Two idle hypervisor guests, each
-   vCPU asleep until its guest's next timer edge, kept a CPU of the AX41 busy
-   that way between them, 46% each. The wakeups come where they came before;
-   only the spinning between them is gone.
+   come, and the walk on its CPU notices that and runs it: at the scheduling
+   point the CPU's timer makes at the deadline -- armed for it as the task
+   blocks (TaskQueue::WakeSleepers) -- or at any sooner one that finds the
+   time has come. That used to be the tick's, 100 times a second, at the
+   latest, and a sleep of a millisecond took ten. It used to poll, too, a loop
+   around Schedule() that left it runnable: alone on its CPU it let the CPU
+   halt until the tick, but two on one CPU handed it to each other without
+   end and the idle task never ran. Two idle hypervisor guests, each vCPU
+   asleep until its guest's next timer edge, kept a CPU of the AX41 busy that
+   way between them, 46% each.
 
    Where a task cannot block -- before preemption is on, off a task's stack,
    in a CPU's idle task (which must stay runnable, see Event::Wait), with

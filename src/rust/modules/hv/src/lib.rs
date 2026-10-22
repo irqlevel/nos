@@ -74,11 +74,11 @@ hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile] [mmio]
                                    every entry, as before ASIDs, when told; profile
                                    splits an entry into its parts; mmio times MMIO
                                    loads instead, each decoded and performed
-hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                    a Linux guest for secs, then its console and how it ended;
                                    cpus gives it N CPUs, each on a host CPU of its own, the
                                    first on cpu
-hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself
 hv cores [own|shared]              whether a guest's cores are its own -- whole cores no

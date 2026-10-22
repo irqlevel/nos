@@ -10,6 +10,8 @@
 namespace Kernel
 {
 
+ulong Lapic::TimerTicksPerSec = 0;
+
 void* Lapic::GetRegBase(ulong index)
 {
     return Stdlib::MemAdd(Acpi::GetInstance().GetLapicAddress(), index * 0x10);
@@ -202,12 +204,9 @@ void Lapic::MaskLvtPerfCounter()
     WriteReg(LvtPerfCntIndex, LvtMasked);
 }
 
-u32 Lapic::CalibrateTimer(ulong hz)
+bool Lapic::CalibrateTimer()
 {
     static const ulong SampleNs = 50 * Const::NanoSecsInMs;
-
-    if (hz == 0)
-        return 0;
 
     /* Free-running and masked: nothing is delivered, the counter just
        counts down so we can see how fast it goes. */
@@ -231,30 +230,62 @@ u32 Lapic::CalibrateTimer(ulong hz)
            the measurement is not one to build a tick on. */
         Trace(0, "Lapic: timer calibration failed (remaining %lu, elapsed %lu)",
             (ulong)remaining, elapsed);
-        return 0;
+        return false;
     }
 
+    /* Under 2^32 counts in a sample of 50 ms: the product stays far below
+       2^64 */
     ulong ticks = 0xFFFFFFFFUL - remaining;
     ulong ticksPerSec = (ticks * Const::NanoSecsInSec) / elapsed;
-    ulong count = ticksPerSec / hz;
 
-    if (count == 0 || count > 0xFFFFFFFFUL)
+    /* Under 2^32 a second -- a bus of 68 GHz at the divide of 16 -- or the
+       measurement is not of a local APIC; and ArmTimer's arithmetic stays
+       in a u64 below that. */
+    if (ticksPerSec == 0 || ticksPerSec > 0xFFFFFFFFUL)
     {
-        Trace(0, "Lapic: timer count %lu out of range", count);
-        return 0;
+        Trace(0, "Lapic: timer rate %lu out of range", ticksPerSec);
+        return false;
     }
 
-    Trace(0, "Lapic: timer %lu ticks/s, count %lu for %lu Hz",
-        ticksPerSec, count, hz);
+    TimerTicksPerSec = ticksPerSec;
+    Trace(0, "Lapic: timer %lu ticks/s", ticksPerSec);
 
-    return (u32)count;
+    return true;
 }
 
-void Lapic::StartTimer(u8 vector, u32 initialCount)
+void Lapic::StartTimer(u8 vector)
 {
     WriteReg(TimerDivideIndex, TimerDivideBy16);
-    WriteReg(LvtTimerIndex, (u32)vector | LvtTimerPeriodic);
-    WriteReg(TimerInitialCountIndex, initialCount);
+    WriteReg(LvtTimerIndex, (u32)vector | LvtTimerOneShot);
+    WriteReg(TimerInitialCountIndex, 0);
+}
+
+void Lapic::ArmTimer(ulong deltaNs)
+{
+    ulong perSec = TimerTicksPerSec;
+    if (perSec == 0)
+        return;
+
+    ulong late = deltaNs / TimerLateParts;
+    ulong ns = (deltaNs > ~0UL - late) ? ~0UL : deltaNs + late;
+
+    /* Whole seconds and the rest apart, the rest rounded up: a remainder
+       under 2^30 times a rate under 2^32 (CalibrateTimer) stays in a u64,
+       and whole seconds past what the 32-bit count holds are its most */
+    ulong secs = ns / Const::NanoSecsInSec;
+    ulong rest = ns % Const::NanoSecsInSec;
+    ulong ticks = MaxTimerCount;
+    if (secs <= MaxTimerCount / perSec)
+    {
+        ticks = secs * perSec +
+            (rest * perSec + Const::NanoSecsInSec - 1) / Const::NanoSecsInSec;
+    }
+
+    /* A count of 0 stops the timer instead of firing it */
+    ticks = Stdlib::Max(ticks, 1UL);
+    ticks = Stdlib::Min(ticks, MaxTimerCount);
+
+    WriteReg(TimerInitialCountIndex, (u32)ticks);
 }
 
 void Lapic::SendIPI(u32 apicId, u32 vector)

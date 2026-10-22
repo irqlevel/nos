@@ -59,6 +59,14 @@ impl Caps {
 #[path = "../../../src/rust/hvarch/src/x86/svm/vmcb.rs"]
 pub mod vmcb;
 
+/// `kcore::cpu::timer_at`: the host CPU's own timer armed to interrupt it by
+/// `deadline_ns` -- the vCPU on this thread, entered, leaves its guest at it
+/// with a host interrupt's exit, as on a host (`vm::Cpu::enter`). Nothing
+/// for a deadline past, as the kernel has it.
+pub fn timer_at(deadline_ns: u64) {
+    vm::arm_timer(deadline_ns);
+}
+
 pub mod x86 {
     pub mod cpu {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -169,7 +177,7 @@ pub mod x86 {
     }
 
     pub mod svm {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         pub use crate::cpu::vmcb;
 
@@ -193,22 +201,74 @@ pub mod x86 {
         }
 
         /// What takes a vCPU out of its guest. There is no guest to take it
-        /// out of here; kicks are counted.
+        /// out of here; kicks are counted. Whether the vCPU is in its guest,
+        /// or on its way in, as hvarch's keeps it: what a posted interrupt's
+        /// notification goes to (`notify`), the CPU model taking what was
+        /// posted when the vCPU's turn comes again (`vm::Cpu::enter`).
         pub struct Kick {
             sent: AtomicU64,
+            in_guest: AtomicBool,
         }
 
         impl Kick {
             pub fn new() -> Kick {
-                Kick { sent: AtomicU64::new(0) }
+                Kick { sent: AtomicU64::new(0), in_guest: AtomicBool::new(false) }
             }
             pub fn sent(&self) -> u64 {
                 self.sent.load(Ordering::Relaxed)
             }
-            pub fn prepare(&self) {}
-            pub fn cancel(&self) {}
+            pub fn prepare(&self) {
+                self.in_guest.store(true, Ordering::SeqCst);
+            }
+            pub fn cancel(&self) {
+                self.in_guest.store(false, Ordering::SeqCst);
+            }
             pub fn kick(&self) {
                 self.sent.fetch_add(1, Ordering::Relaxed);
+            }
+            pub fn notify(&self) -> bool {
+                self.in_guest.load(Ordering::SeqCst)
+            }
+            /// The vCPU left its guest (hvarch's, after an exit).
+            pub fn left(&self) {
+                self.in_guest.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// hvarch's posted-interrupt descriptor: the same atomics, as the run
+    /// loop and the posting CPUs use it.
+    pub mod vmx {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        pub struct PostedInterrupts {
+            pir: [AtomicU64; 4],
+            control: AtomicU64,
+        }
+
+        const PI_ON: u64 = 1;
+
+        impl PostedInterrupts {
+            pub fn new() -> PostedInterrupts {
+                PostedInterrupts { pir: [const { AtomicU64::new(0) }; 4], control: AtomicU64::new(0) }
+            }
+            pub fn post(&self, vector: u8) -> bool {
+                self.pir[usize::from(vector / 64)].fetch_or(1 << (vector % 64), Ordering::SeqCst);
+                self.control.fetch_or(PI_ON, Ordering::SeqCst) & PI_ON == 0
+            }
+            pub fn take(&self) -> Option<[u64; 4]> {
+                if self.control.fetch_and(!PI_ON, Ordering::SeqCst) & PI_ON == 0 {
+                    return None;
+                }
+                let mut words = [0u64; 4];
+                for (w, p) in words.iter_mut().zip(self.pir.iter()) {
+                    *w = p.swap(0, Ordering::SeqCst);
+                }
+                Some(words)
+            }
+            /// The model's: whether a notification is outstanding.
+            pub fn outstanding(&self) -> bool {
+                self.control.load(Ordering::SeqCst) & PI_ON != 0
             }
         }
     }
@@ -272,11 +332,15 @@ pub mod machine {
 
     pub struct Machine {
         caps: Caps,
+        /// VT-x's: its CPUs have a virtual APIC, and posted-interrupt
+        /// processing -- what the target makes up of a machine.
+        pub vapic: bool,
+        pub posted: bool,
     }
 
     impl Machine {
         pub fn new(vendor: Vendor) -> Machine {
-            Machine { caps: Caps { vendor } }
+            Machine { caps: Caps { vendor }, vapic: false, posted: false }
         }
         pub fn caps(&self) -> &Caps {
             &self.caps
@@ -373,6 +437,12 @@ pub mod vm {
         /// across an INIT.
         apicv_entered: bool,
         stored: Option<([u32; 8], [u32; 8])>,
+        /// Posted interrupts, as the machine is said to have them: where the
+        /// run loop's CPUs post this one's, which the model takes into VIRR
+        /// when the vCPU's turn comes in its guest with virtual-interrupt
+        /// delivery on, and exits for otherwise, as a notification does.
+        pub pi_capable: bool,
+        posted: Option<Arc<crate::x86::vmx::PostedInterrupts>>,
     }
 
     /// What the modelled virtual APIC did, for `HV_FUZZ_STATS`.
@@ -414,6 +484,8 @@ pub mod vm {
                 eoi_exit: [0; 4],
                 apicv_entered: false,
                 stored: None,
+                pi_capable: false,
+                posted: None,
             }
         }
 
@@ -636,8 +708,45 @@ pub mod vm {
         pub fn has_vapic(&self) -> bool {
             self.vapic
         }
+        pub fn posted_capable(&self) -> bool {
+            self.vapic && self.pi_capable
+        }
+        pub fn set_posted(&mut self, posted: Arc<crate::x86::vmx::PostedInterrupts>) -> bool {
+            if !self.posted_capable() {
+                return false;
+            }
+            /* Its vCPU's thread, which the run loop takes it on. */
+            MY_POSTED.with(|p| *p.borrow_mut() = Some(posted.clone()));
+            self.posted = Some(posted);
+            true
+        }
+        /// The model's, as the vCPU's turn comes again in its guest: a
+        /// notification outstanding is taken by the CPU -- what was posted
+        /// into VIRR -- with virtual-interrupt delivery on, and is an exit
+        /// otherwise, an external interrupt's.
+        pub fn posted_arrival(&mut self) -> Option<Exit> {
+            let p = self.posted.as_ref()?;
+            if !p.outstanding() {
+                return None;
+            }
+            if !self.apicv {
+                return Some(Exit::Host);
+            }
+            if let Some(words) = p.take() {
+                for (i, w) in words.iter().enumerate() {
+                    self.virr[2 * i] |= *w as u32;
+                    self.virr[2 * i + 1] |= (*w >> 32) as u32;
+                }
+                apicv_did("posted interrupts taken in the guest");
+            }
+            None
+        }
         pub fn load_apic(&mut self, v: &crate::lapic::Vectors) {
             invariant!(self.vapic, "virtual-interrupt delivery asked of a CPU with no virtual APIC");
+            /* What was posted is taken by the run loop before every entry
+             * (nothing else runs here between that and this). */
+            invariant!(self.posted.as_ref().is_none_or(|p| !p.outstanding()),
+                       "an entry with interrupts posted for the CPU and not taken");
             invariant!(!self.apicv_entered,
                        "an entry with virtual-interrupt delivery on whose interrupts were never taken back");
             if let Some((irr, isr)) = self.stored.take() {
@@ -886,8 +995,36 @@ pub mod vm {
     pub static HANDOFFS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     pub static SLEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// Entries the host CPU's timer, armed for a guest's timer edge, took
+    /// the guest out of (`timer_at`), for `HV_FUZZ_STATS`.
+    pub static TIMER_EXITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The host CPU's timer, as `kcore::cpu::timer_at` arms it: the deadline
+    /// it is armed for, sooner ones winning; spent when it fires.
+    pub fn arm_timer(deadline_ns: u64) {
+        if deadline_ns > crate::time::peek() {
+            ARMED.with(|a| a.set(a.get().min(deadline_ns)));
+        }
+    }
+
     thread_local! {
+        static ARMED: Cell<u64> = const { Cell::new(u64::MAX) };
         static VCPU: Cell<usize> = const { Cell::new(0) };
+        /// The descriptor this thread's vCPU takes its posted interrupts
+        /// from (`Backend::set_posted`).
+        static MY_POSTED: std::cell::RefCell<Option<Arc<crate::x86::vmx::PostedInterrupts>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A vCPU's task about to wait: what was posted for it is taken by its
+    /// loop before it looks at anything -- and here, where nothing runs but
+    /// it between that look and this wait, nothing more can have come.
+    pub fn check_nothing_posted() {
+        MY_POSTED.with(|p| {
+            if let Some(p) = p.borrow().as_ref() {
+                invariant!(!p.outstanding(), "a CPU waits with an interrupt posted for it and not taken");
+            }
+        });
     }
 
     fn baton() -> std::sync::MutexGuard<'static, Option<Baton>> {
@@ -898,6 +1035,7 @@ pub mod vm {
     /// thread a turn for `i` wakes.
     pub fn set_vcpu(i: usize) {
         VCPU.with(|v| v.set(i));
+        MY_POSTED.with(|p| *p.borrow_mut() = None);
         if let Some(b) = baton().as_mut() {
             if let Some(t) = b.threads.get_mut(i) {
                 *t = Some(std::thread::current());
@@ -1025,6 +1163,8 @@ pub mod vm {
         pub fn new(machine: &Machine, _memory: &GuestMemory, _exceptions: u32) -> crate::Result<Cpu> {
             let mut backend = Backend::new();
             backend.vmx = machine.caps().vendor() == crate::Vendor::Vmx;
+            backend.vapic = backend.vmx && machine.vapic;
+            backend.pi_capable = backend.vapic && machine.posted;
             Ok(Cpu { backend })
         }
         pub fn backend(&self) -> &Backend {
@@ -1037,23 +1177,38 @@ pub mod vm {
         /// Into the guest, which does what its script says -- to the end of
         /// which it shuts down -- letting the others run first when it says
         /// so.
-        pub fn enter(&mut self, memory: &GuestMemory, _machine: &Machine, _kick: Option<&Kick>)
+        pub fn enter(&mut self, memory: &GuestMemory, _machine: &Machine, kick: Option<&Kick>)
             -> core::result::Result<(Exit, u32), Refusal>
         {
             let me = VCPU.with(|v| v.get());
             invariant!(crate::sync::held() == 0, "CPU {} enters its guest with {} of the kernel's locks held", me,
                        crate::sync::held());
             self.backend.entered();
-            loop {
+            let exit = loop {
                 crate::time::progressed();
+                /* A notification of what other CPUs posted while it ran. */
+                if let Some(exit) = self.backend.posted_arrival() {
+                    break exit;
+                }
+                /* The host CPU's timer, armed for the guest's timer edge, at
+                 * it: a host interrupt, and the edge goes in after it. */
+                if ARMED.with(|a| a.get()) <= crate::time::peek() {
+                    ARMED.with(|a| a.set(u64::MAX));
+                    TIMER_EXITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    break Exit::Host;
+                }
                 let next = GUEST.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
                     .and_then(|g| g.next(me, &mut self.backend, memory));
                 match next {
-                    None => return Ok((Exit::Shutdown, me as u32)),
-                    Some(Next::Exit(exit)) => return Ok((exit, me as u32)),
+                    None => break Exit::Shutdown,
+                    Some(Next::Exit(exit)) => break exit,
                     Some(Next::Switch(to)) => switch_to(me, to),
                 }
+            };
+            if let Some(k) = kick {
+                k.left();
             }
+            Ok((exit, me as u32))
         }
     }
 }

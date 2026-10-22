@@ -2927,6 +2927,94 @@ static bool TestSleepBlocks()
     return true;
 }
 
+/* A task asleep until a deadline runs at it, not at the next tick after it:
+   its CPU's timer is armed for the deadline (Cpu::LocalTimerWake). Before,
+   a halted guest's vCPU waited for its guest's next timer edge on the host's
+   tick, and a guest's `usleep 1000` took 10 ms on the EX44. A task of its
+   own on this CPU sleeps a millisecond at a time while this one -- the
+   CPU's idle task, which must not block -- halts between interrupts rather
+   than poll the clock, which would wake the sleeper on time whatever the
+   timer did. At a tick each, the sleeps took ten milliseconds; armed for,
+   1.0-1.1 under HVF and 1.1-2.4 under TCG. The median is what is held to
+   well under a tick: a TCG host that stalls a vCPU for tens of
+   milliseconds now and then puts a sleep or two that far out, and not half
+   of them. */
+static const ulong SleepPromptRounds = 21;
+static const ulong SleepPromptNs = Const::NanoSecsInMs;
+static const ulong SleepPromptMaxMedianNs = 5 * Const::NanoSecsInMs;
+
+struct SleepPromptProbe
+{
+    Atomic Done;
+    ulong Took[SleepPromptRounds];
+};
+
+static void SleepPromptTask(void* ctx)
+{
+    auto* p = static_cast<SleepPromptProbe*>(ctx);
+    for (ulong i = 0; i < SleepPromptRounds; i++)
+    {
+        ulong start = GetBootTime().GetValue();
+        Sleep(SleepPromptNs);
+        p->Took[i] = GetBootTime().GetValue() - start;
+    }
+    p->Done.Set(1);
+}
+
+static bool TestSleepPrompt()
+{
+    auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
+
+    /* A timer that could not be calibrated leaves the broadcast tick in
+       charge (x86), and every sleep on its grid */
+    if (!cpu.LocalTimerOneShot())
+        return true;
+
+    auto* p = Mm::TAlloc<SleepPromptProbe, Tag>();
+    Task* task = Mm::TAlloc<Task, Tag>("sleepprompt");
+    bool ok = (p != nullptr && task != nullptr);
+
+    if (ok)
+        task->SetCpuAffinity(1UL << cpu.GetIndex());
+    if (ok && task->Start(SleepPromptTask, p))
+    {
+        while (p->Done.Get() == 0)
+            cpu.Idle();
+        task->Wait();
+
+        /* Sorted in place, an insertion at a time: the middle one is the
+           median of an odd count */
+        for (ulong i = 1; i < SleepPromptRounds; i++)
+        {
+            ulong v = p->Took[i];
+            ulong j = i;
+            for (; j > 0 && p->Took[j - 1] > v; j--)
+                p->Took[j] = p->Took[j - 1];
+            p->Took[j] = v;
+        }
+
+        ulong median = p->Took[SleepPromptRounds / 2];
+        ok = (median <= SleepPromptMaxMedianNs);
+        if (!ok)
+            Trace(0, "TestSleepPrompt: sleeps of %lu us took %lu us at the median, %lu to %lu",
+                SleepPromptNs / Const::NanoSecsInUsec, median / Const::NanoSecsInUsec,
+                p->Took[0] / Const::NanoSecsInUsec, p->Took[SleepPromptRounds - 1] / Const::NanoSecsInUsec);
+    }
+    else
+    {
+        ok = false;
+    }
+
+    if (task != nullptr)
+        task->Put();
+    if (p != nullptr)
+    {
+        p->~SleepPromptProbe();
+        Mm::Free(p);
+    }
+    return ok;
+}
+
 /* A reschedule that finds preemption off is deferred, not dropped: made by
    the unlock that brings the count back to zero. Preempt() under a spinlock
    stands in for the IPI that used to be lost that way -- refused, it leaves
@@ -2971,6 +3059,9 @@ bool TestMultiTasking()
         return false;
 
     if (!TestSleepBlocks())
+        return false;
+
+    if (!TestSleepPrompt())
         return false;
 
     if (!TestEventWaitFor())

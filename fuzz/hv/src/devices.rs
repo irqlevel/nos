@@ -7,6 +7,8 @@ pub mod blk;
 pub mod ioapic;
 #[path = "../../../src/rust/hv/src/devices/net.rs"]
 pub mod net;
+#[path = "../../../src/rust/hv/src/devices/offload.rs"]
+pub mod offload;
 #[path = "../../../src/rust/hv/src/devices/pci.rs"]
 pub mod pci;
 #[path = "../../../src/rust/hv/src/devices/pic.rs"]

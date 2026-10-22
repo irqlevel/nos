@@ -62,6 +62,32 @@ pub fn kick(cpu: u32) {
     ffi::cpu::kernel_cpu_kick(cpu)
 }
 
+/// The notification of an interrupt posted for a vCPU running on `cpu`
+/// (VT-x's posted interrupts): taken by the CPU in its guest without an
+/// exit, and out of one an interrupt that only ends itself. From any
+/// context; nothing for a `cpu` out of range.
+#[inline]
+pub fn notify(cpu: u32) {
+    ffi::cpu::kernel_cpu_notify(cpu)
+}
+
+/// The vector [`notify`] sends: a VMCS's posted-interrupt notification
+/// vector.
+pub fn posted_interrupt_vector() -> u8 {
+    ffi::cpu::kernel_posted_interrupt_vector()
+}
+
+/// This CPU's own timer to interrupt it by `deadline_ns` on the boot clock
+/// ([`crate::time::boot_time_ns`]), if it is not armed to sooner: what takes
+/// a vCPU out of its guest at its guest's next timer edge, rather than at
+/// its next exit -- the host's tick, for a guest that computes without one.
+/// Nothing for a deadline already past. From any context; the timer is this
+/// CPU's, so a task that can move is served on the CPU it called from.
+#[inline]
+pub fn timer_at(deadline_ns: u64) {
+    ffi::cpu::kernel_cpu_timer_at(deadline_ns)
+}
+
 extern "C" fn nothing(_ctx: *mut u8) {}
 
 /// Returns once every running CPU has taken an interrupt since the call, so

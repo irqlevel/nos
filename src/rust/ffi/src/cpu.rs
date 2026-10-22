@@ -11,6 +11,16 @@ unsafe extern "C" {
     /// interrupts off included. What makes a vCPU running a guest there
     /// leave it; any other CPU takes an interrupt with nothing to do.
     pub safe fn kernel_cpu_kick(cpu: u32);
+    /// The posted-interrupt notification to `cpu`, from any context: a vCPU
+    /// in its guest there takes what was posted for it without an exit;
+    /// out of one it is an interrupt with nothing to do.
+    pub safe fn kernel_cpu_notify(cpu: u32);
+    /// The vector `kernel_cpu_notify` sends.
+    pub safe fn kernel_posted_interrupt_vector() -> u8;
+    /// The CPU this runs on to take an interrupt from its own timer by
+    /// `deadline_ns` on the boot clock, if it is not armed to fire sooner;
+    /// nothing for a deadline past. From any context.
+    pub safe fn kernel_cpu_timer_at(deadline_ns: u64);
 }
 
 /* Interrupts and preemption off, and back on, for code that holds a lock of

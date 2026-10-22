@@ -260,6 +260,11 @@ impl Blk {
         self.broken
     }
 
+    /// Whether its queue has its rings copied (`Transport::rings_copied`).
+    pub fn rings_copied(&self) -> bool {
+        self.transport.rings_copied()
+    }
+
     fn config(&self) -> [u8; CFG_BYTES] {
         let mut c = [0u8; CFG_BYTES];
         let at = usize::from(CFG_CAPACITY);
@@ -303,13 +308,13 @@ impl Blk {
         v
     }
 
-    /// A write of `size` bytes at `offset` in the BAR, and the interrupts it
-    /// leaves the device with. The configuration is read-only.
-    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory) -> Raise {
+    /// A write of `size` bytes at `offset` in the BAR, at `now`, and the
+    /// interrupts it leaves the device with. The configuration is read-only.
+    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory, now: u64) -> Raise {
         if offset >= self.transport.config_offset() {
             return Raise::default();
         }
-        match self.transport.write(offset, size, value) {
+        match self.transport.write(offset, size, value, mem, now) {
             Asked::Notify(0) => {
                 let answered = self.fill(mem);
                 if answered { self.interrupt(mem) } else { Raise::default() }

@@ -195,9 +195,9 @@ static void HaltTcoWatchdog()
 }
 
 /* Calibrated once on the BSP; every core's local timer runs off the same bus
-   clock, so one measurement arms all of them. Zero means calibration failed
+   clock, so one measurement arms all of them. False means calibration failed
    and the old broadcast tick stays in charge. */
-static u32 LapicTimerCount;
+static bool LapicTimerOk;
 
 void ApStartup(void *ctx)
 {
@@ -210,10 +210,14 @@ void ApStartup(void *ctx)
 
     TraceCpuState(cpu.GetIndex());
 
-    /* Before interrupts: this CPU's own periodic tick, so it never depends
-       on another CPU still answering one. */
-    if (LapicTimerCount != 0)
-        Lapic::StartTimer(CpuTable::TimerVector, LapicTimerCount);
+    /* Before interrupts: this CPU's own tick, so it never depends on another
+       CPU still answering one -- one-shot, armed for each tick and for each
+       deadline a task here sleeps to (Cpu::LocalTimerStart). */
+    if (LapicTimerOk)
+    {
+        Lapic::StartTimer(CpuTable::TimerVector);
+        cpu.LocalTimerStart();
+    }
 
     BugOn(Hal::IsInterruptEnabled());
     InterruptEnable();
@@ -554,6 +558,7 @@ void BpStartup(void* ctx)
         idt.SetDescriptor(CpuTable::IPIVector, IdtDescriptor::Encode(IPInterruptStub));
         idt.SetDescriptor(CpuTable::TimerVector,
             IdtDescriptor::Encode(LapicTimerInterruptStub));
+        idt.SetDescriptor(Hal::PostedVector, IdtDescriptor::Encode(PostedInterruptStub));
 
         /* Install a benign handler for the LAPIC spurious-interrupt vector so a
            spurious IRQ counts a stat instead of hitting DummyInterrupt's panic. */
@@ -596,12 +601,13 @@ void BpStartup(void* ctx)
            Calibration needs a clock, which is why this sits after TimeInit,
            and it must precede StartAll so an AP can arm its timer as it comes
            up. arm64 has worked this way from the start (GenericTimer). */
-        LapicTimerCount = Lapic::CalibrateTimer(Hpet::DesiredHz);
-        if (LapicTimerCount != 0)
+        LapicTimerOk = Lapic::CalibrateTimer();
+        if (LapicTimerOk)
         {
-            Lapic::StartTimer(CpuTable::TimerVector, LapicTimerCount);
+            Lapic::StartTimer(CpuTable::TimerVector);
+            cpus.GetCurrentCpu().LocalTimerStart();
             cpus.SetPerCpuTimer();
-            Trace(0, "Tick: per-cpu local apic timer at %lu Hz", (ulong)Hpet::DesiredHz);
+            Trace(0, "Tick: per-cpu local apic timer, one-shot, at %lu Hz", TickHz);
         }
         else
         {

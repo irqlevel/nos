@@ -14,10 +14,21 @@
 //! into buckets at boot, and the largest -- 512 KiB runs -- gets an eighth of
 //! it; a guest's memory in those runs would run out of addresses long before
 //! the machine ran out of memory. A frame costs a page and nothing else.
+//!
+//! The one exception is a few pages read and written all the time -- a
+//! virtqueue's rings, at every frame a guest's NIC handles -- where a copy
+//! through the window maps and unmaps a page, a TLB flush, at every access:
+//! frames of a [`Run`] mapped together for as long as a [`Mapped`] lives,
+//! which holds a share of the run so that none of them is freed under it.
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use ffi::frame;
 
 use crate::consts::PAGE_SIZE;
+use crate::pod::Pod;
 
 /// One zeroed page of RAM, owned: freed when dropped, and mapped nowhere.
 pub struct Frame {
@@ -108,5 +119,166 @@ impl Drop for Frame {
          * owner's to keep, as it is for any address handed to hardware
          * (`phys`); `hv::GuestMemory` keeps it by owning the table too. */
         unsafe { frame::kernel_frame_free(self.phys) }
+    }
+}
+
+/// Frames in a table of a page's worth each, so that no one allocation of
+/// the table outgrows a page however many frames there are.
+const PIECE: usize = PAGE_SIZE / core::mem::size_of::<Frame>();
+
+/// The most frames one [`Mapped`] maps: a queue of 256 entries' rings are
+/// three pages.
+pub const MAPPED_MAX: usize = 4;
+
+/// Frames owned together, and shared: a region of a guest's memory, which
+/// a mapping of some of them holds a share of ([`Mapped`]), so that they go
+/// back to the free list only once every mapping of them is undone --
+/// whichever of the run's holders goes last.
+#[derive(Clone)]
+pub struct Run {
+    pieces: Arc<Vec<Vec<Frame>>>,
+}
+
+impl Run {
+    /// `count` zeroed frames, or None when they cannot all be had -- those
+    /// taken by then going back as the attempt is dropped.
+    pub fn new(count: usize) -> Option<Run> {
+        let mut pieces: Vec<Vec<Frame>> = Vec::new();
+        pieces.try_reserve_exact(count.div_ceil(PIECE)).ok()?;
+        let mut left = count;
+        while left > 0 {
+            let n = left.min(PIECE);
+            let mut piece = Vec::new();
+            piece.try_reserve_exact(n).ok()?;
+            for _ in 0..n {
+                piece.push(Frame::new()?);
+            }
+            pieces.push(piece);
+            left -= n;
+        }
+        Some(Run { pieces: Arc::new(pieces) })
+    }
+
+    /// Its `i`th frame, None past its end.
+    #[inline]
+    pub fn frame(&self, i: usize) -> Option<&Frame> {
+        self.pieces.get(i / PIECE)?.get(i % PIECE)
+    }
+
+    /// Its frames, in order.
+    pub fn iter(&self) -> impl Iterator<Item = &Frame> {
+        self.pieces.iter().flatten()
+    }
+
+    /// Its frames `first..first + count`, `MAPPED_MAX` at most, mapped into
+    /// the kernel's space together in that order: None when they are not
+    /// all its own, or there is no address left for them.
+    pub fn map(&self, first: usize, count: usize) -> Option<Mapped> {
+        if count == 0 || count > MAPPED_MAX {
+            return None;
+        }
+        let mut phys = [0u64; MAPPED_MAX];
+        for (k, p) in phys.iter_mut().take(count).enumerate() {
+            *p = self.frame(first.checked_add(k)?)?.phys();
+        }
+        /* Frames of this run, `count` of them in `phys`: the mapping made
+         * holds a share of the run, which keeps them allocated until after
+         * its `drop` has undone it. */
+        let va = unsafe { frame::kernel_frames_map(phys.as_ptr(), count) };
+        if va == 0 {
+            return None;
+        }
+        Some(Mapped { va, pages: count, _run: self.clone() })
+    }
+}
+
+/// Frames of a [`Run`] mapped into the kernel's space together, from
+/// [`Run::map`] until this is dropped -- the guest pages a device reads and
+/// writes at every request, without a page mapped and unmapped at every
+/// access as [`Frame::read`] has.
+///
+/// It hands out no reference into them, as a `Frame` does not: what is
+/// there is a guest's, its CPUs writing it whenever they run, so every
+/// access is one volatile load or store of a plain value at a checked,
+/// aligned offset -- what is read is whatever was there that instant, as
+/// with memory a device writes ([`DmaBuffer::load`](crate::dma::DmaBuffer::load)).
+/// An index another CPU publishes is read and written as one atomic access
+/// with acquire or release order (`load_u16`, `store_u16`). Through `&self`:
+/// the host side's own accesses are ordered by whoever holds the device.
+pub struct Mapped {
+    va: usize,
+    pages: usize,
+    /// The run the frames are: a share of it, dropped after `drop` has
+    /// undone the mapping, so no frame is freed while it is mapped here.
+    _run: Run,
+}
+
+impl Mapped {
+    /// Whether a `T` lies at `offset`: inside, and aligned for one.
+    #[inline]
+    fn holds<T>(&self, offset: usize) -> bool {
+        let bytes = self.pages * PAGE_SIZE;
+        let size = core::mem::size_of::<T>();
+        offset % core::mem::align_of::<T>() == 0 && offset <= bytes && size <= bytes - offset
+    }
+
+    /// The `T` at `offset`, as it is this instant: a volatile load. None
+    /// when no `T` lies there.
+    #[inline]
+    pub fn load<T: Pod>(&self, offset: usize) -> Option<T> {
+        if !self.holds::<T>(offset) {
+            return None;
+        }
+        /* Inside the mapping, which is there for as long as `self`, and
+         * aligned: checked above. Any bytes are a `T`. */
+        Some(unsafe { ((self.va + offset) as *const T).read_volatile() })
+    }
+
+    /// `value` put at `offset` with a volatile store. False, and nothing
+    /// stored, when no `T` lies there.
+    #[inline]
+    pub fn store<T: Pod>(&self, offset: usize, value: T) -> bool {
+        if !self.holds::<T>(offset) {
+            return false;
+        }
+        /* Inside the mapping and aligned, as `load` has it. */
+        unsafe { ((self.va + offset) as *mut T).write_volatile(value) };
+        true
+    }
+
+    /// The 16-bit word at `offset`, loaded as one access with acquire order:
+    /// what was written before it is there to read after it. What a
+    /// virtqueue's indices are read with. None when no aligned word lies
+    /// there.
+    #[inline]
+    pub fn load_u16(&self, offset: usize) -> Option<u16> {
+        if !self.holds::<u16>(offset) {
+            return None;
+        }
+        /* An aligned word inside the mapping, as `load` has it, taken as an
+         * atomic for the one access and its order. */
+        Some(unsafe { AtomicU16::from_ptr((self.va + offset) as *mut u16) }.load(Ordering::Acquire))
+    }
+
+    /// `value` stored at `offset` as one access with release order: what
+    /// was written before it is there before it. False, and nothing stored,
+    /// when no aligned word lies there.
+    #[inline]
+    pub fn store_u16(&self, offset: usize, value: u16) -> bool {
+        if !self.holds::<u16>(offset) {
+            return false;
+        }
+        /* An aligned word inside the mapping, as `load_u16` has it. */
+        unsafe { AtomicU16::from_ptr((self.va + offset) as *mut u16) }.store(value, Ordering::Release);
+        true
+    }
+}
+
+impl Drop for Mapped {
+    fn drop(&mut self) {
+        /* The address the map gave and the count it was given, undone once:
+         * a `Mapped` is neither `Clone` nor `Copy`, and this is the only
+         * place it is unmapped. Its share of the run goes after this. */
+        unsafe { frame::kernel_frames_unmap(self.va, self.pages) }
     }
 }

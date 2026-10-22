@@ -569,6 +569,40 @@ void kernel_cpu_kick(unsigned int cpu)
     Hal::SendIpi(cpu, Kernel::CpuTable::IPIVector);
 }
 
+/* The notification of an interrupt posted for the vCPU running on `cpu`
+   (Hal::PostedVector): the CPU takes it in the guest without an exit, and
+   out of one it is an interrupt that only ends itself. Sent as the kick is,
+   from any context. */
+void kernel_cpu_notify(unsigned int cpu)
+{
+    if (cpu >= (unsigned int)Kernel::MaxCpus)
+        return;
+
+    Hal::SendIpi(cpu, Hal::PostedVector);
+}
+
+/* The vector kernel_cpu_notify sends: what a VMCS names as its
+   posted-interrupt notification vector. */
+unsigned char kernel_posted_interrupt_vector(void)
+{
+    return Hal::PostedVector;
+}
+
+/* The CPU this runs on to take an interrupt from its own timer by
+   deadlineNs on the boot clock, if it is not armed to fire sooner
+   (Cpu::LocalTimerWake): for a vCPU about to enter its guest, whose timer's
+   next edge would otherwise wait for its next exit -- the host's tick, for a
+   guest that computes without one. Nothing for a deadline that has passed:
+   armed for one, the timer would fire at once, and again at every entry
+   while the guest cannot take what is due. From any context. */
+void kernel_cpu_timer_at(unsigned long long deadlineNs)
+{
+    ulong flags = Hal::IrqSave();
+    if ((ulong)deadlineNs > Kernel::GetBootTime().GetValue())
+        Kernel::CpuTable::GetInstance().GetCurrentCpu().LocalTimerWake((ulong)deadlineNs);
+    Hal::IrqRestore(flags);
+}
+
 void* kernel_alloc_dma_pages(unsigned long count,
     unsigned long* phys_out, unsigned long* actual_pages_out)
 {
@@ -756,6 +790,41 @@ int kernel_frame_store16(unsigned long phys, unsigned long offset, unsigned shor
     pt.UnmapFrameSlot(va);
     Kernel::PreemptIrqRestore(flags);
     return 0;
+}
+
+/* A few frames mapped into the kernel's space together, in the order given,
+   read-write and never executable, for as long as the Rust side keeps them
+   so (kcore::frame::Mapped): a guest's pages the host reads and writes at
+   every frame it handles -- a virtqueue's rings -- which FrameCopy maps and
+   unmaps again at every access, a TLB flush each time. Through MapPages, so
+   the VA is the allocator's to track. The frames stay the caller's, and
+   allocated until kernel_frames_unmap has run: the mapping holds them by
+   their address and nothing else. 0 when there are none or more than
+   FramesMapMax, one is no frame, or no address is left. */
+static const unsigned long FramesMapMax = 4;
+
+unsigned long kernel_frames_map(const unsigned long* phys, unsigned long count)
+{
+    if (phys == nullptr || count == 0 || count > FramesMapMax)
+        return 0;
+
+    auto& pt = Kernel::Mm::PageTable::GetInstance();
+    ulong frames[FramesMapMax];
+    for (unsigned long i = 0; i < count; i++)
+    {
+        if (!pt.IsFrameAddress(phys[i]))
+            return 0;
+        frames[i] = phys[i];
+    }
+    return reinterpret_cast<unsigned long>(Kernel::Mm::MapPages(count, frames));
+}
+
+/* A kernel_frames_map undone: `va` and `count` as it returned and was
+   given. The unmap shoots the address down on every CPU and waits for each
+   to answer, so it is never called with a spin lock held. */
+void kernel_frames_unmap(unsigned long va, unsigned long count)
+{
+    Kernel::Mm::UnmapPages(reinterpret_cast<void*>(va), count);
 }
 
 /* ---- Soft IRQ ---- */
