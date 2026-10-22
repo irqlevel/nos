@@ -63,7 +63,8 @@ for a structure that crosses a page boundary (ACPI tables, mostly).
 The last 64 are a slot for each CPU, and serve one thing: a copy into or
 out of a frame -- a page handed out by address and mapped nowhere, what a
 guest's memory is made of (`kcore::frame`) -- which is every read and write
-of a guest's memory. `MapFrameSlot(phys)` maps this CPU's slot and
+of a guest's memory but its devices' rings, which are mapped through
+`Mm::MapPages` while a queue is up (`kcore::frame::Mapped`). `MapFrameSlot(phys)` maps this CPU's slot and
 `UnmapFrameSlot` clears it, with interrupts off from one to the other,
 which makes the slot the copy's alone: no lock, no slot to search for, no
 reference (the frame is the caller's for the call), no memory-map lookup

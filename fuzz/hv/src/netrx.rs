@@ -252,6 +252,11 @@ pub fn netrx_target(r: &mut Input) {
         accept &= r.u32();
     }
     nic.io_write(DRIVER_FEATURES, 4, accept, &mem, now);
+    /* The ring copied rather than mapped, on some inputs: the same bytes
+     * must go in either way. */
+    if r.u8() < 64 {
+        mem.refuse_maps(true);
+    }
     nic.io_write(QUEUE_SELECT, 2, 0, &mem, now);
     nic.io_write(QUEUE_PFN, 4, RX_PFN as u32, &mem, now);
     let merged = accept & F_MRG_RXBUF != 0;

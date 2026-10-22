@@ -24,4 +24,13 @@ unsafe extern "C" {
     /// `value` stored at `offset` in the frame as one access with release
     /// order: 0, or -1 with nothing stored, as `kernel_frame_load16`.
     pub fn kernel_frame_store16(phys: u64, offset: usize, value: u16) -> i32;
+    /// The `count` frames at `phys`, four at most, mapped into the kernel's
+    /// space together in that order, read-write and never executable: their
+    /// address, or 0 when one is no frame or there is no address left. The
+    /// frames must stay allocated until `kernel_frames_unmap` has run.
+    pub fn kernel_frames_map(phys: *const u64, count: usize) -> usize;
+    /// A `kernel_frames_map` undone, `va` and `count` as it returned and was
+    /// given: shot down on every CPU, waiting for each -- never with a spin
+    /// lock held.
+    pub fn kernel_frames_unmap(va: usize, count: usize);
 }
