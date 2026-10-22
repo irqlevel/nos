@@ -10,7 +10,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use crate::devices::offload::{self, Dropped, Offloads, TxHeader};
+use crate::devices::offload::{self, Dropped, Offloads, Send, TxHeader};
 use crate::targets::Input;
 
 /// What the sends came to, for `HV_FUZZ_STATS`: sends cut and the frames
@@ -68,6 +68,22 @@ fn pseudo(src: &[u8], dst: &[u8], proto: u8, len: usize) -> u64 {
         + u64::from(proto) + len as u64
 }
 
+/// A checksum left at `start + offset` finished as the model has it: the
+/// sum from `start` on, folded and complemented, all ones for UDP's 0.
+pub fn finish(f: &mut [u8], start: usize, offset: usize) {
+    let at = start + offset;
+    if at + 2 > f.len() {
+        return;
+    }
+    let mut sum = !fold_sum(&f[start..], 0);
+    let udp = f.len() >= ETH + 20 && be16(f, 12) == 0x0800 && f[ETH + 9] == 17
+        && at == ETH + usize::from(f[ETH] & 0xF) * 4 + 6;
+    if sum == 0 && udp {
+        sum = 0xFFFF;
+    }
+    put16(f, at, sum);
+}
+
 /// What the model says a send comes to: the frames that go out, or why none.
 fn model(hdr: &TxHeader, frame: &[u8], offloads: Offloads) -> Result<Vec<Vec<u8>>, Dropped> {
     if hdr.gso_type & 0x80 != 0 {
@@ -104,8 +120,9 @@ fn model(hdr: &TxHeader, frame: &[u8], offloads: Offloads) -> Result<Vec<Vec<u8>
     }
 }
 
-/// A TCP send over IPv4 cut as the model has it.
-fn cut(frame: &[u8], mss: usize) -> Result<Vec<Vec<u8>>, Dropped> {
+/// A TCP send over IPv4 cut as the model has it -- for the switch's model
+/// too, which cuts what it does not carry whole.
+pub fn cut(frame: &[u8], mss: usize) -> Result<Vec<Vec<u8>>, Dropped> {
     if frame.len() < ETH + 20 || be16(frame, 12) != 0x0800 {
         return Err(Dropped::NotTcp4);
     }
@@ -163,8 +180,8 @@ fn cut(frame: &[u8], mss: usize) -> Result<Vec<Vec<u8>>, Dropped> {
 /// lengths given, `payload` bytes after them, its checksum field holding the
 /// pseudo-header's sum when the device is to complete it.
 #[allow(clippy::too_many_arguments)]
-fn build(r: &mut Input, proto: u8, ihl: usize, thl: usize, payload: usize, ethertype: u16, frag: u16,
-         flags: u8, partial: bool) -> Vec<u8> {
+pub fn build(r: &mut Input, proto: u8, ihl: usize, thl: usize, payload: usize, ethertype: u16, frag: u16,
+             flags: u8, partial: bool) -> Vec<u8> {
     let l4 = if proto == 17 { 8 } else { thl };
     let mut f = vec![0u8; ETH + ihl + l4 + payload];
     /* Its bytes from a generator the input seeds, not from the input: a
@@ -229,7 +246,7 @@ fn check_frames(sent: &[u8], hdr: &TxHeader, frames: &[Vec<u8>]) {
     invariant!(joined == sent[hl..], "the cut frames' payloads are not the send's, in order");
 }
 
-fn one(r: &mut Input, offloads: Offloads, seg: &mut [u8]) {
+fn one(r: &mut Input, offloads: Offloads, seg: &mut [u8; offload::MAX_FRAME]) {
     let kind = r.u8();
     let (hdr, frame) = if kind < 128 {
         /* TCP to be cut: well made, mostly. */
@@ -279,7 +296,27 @@ fn one(r: &mut Input, offloads: Offloads, seg: &mut [u8]) {
     let want = model(&hdr, &frame, offloads);
     let mut got_frames: Vec<Vec<u8>> = Vec::new();
     let mut work = frame.clone();
-    let got = offload::transmit(&hdr, &mut work, offloads, seg, &mut |f: &[u8]| got_frames.push(f.to_vec()));
+    let got = match offload::transmit(&hdr, &mut work, offloads) {
+        Ok(Send::Frame(f, partial)) => {
+            /* Finished as a backend finishes it for a guest that takes none
+             * partial -- the place it was given, the one the header said. */
+            if let Some(p) = partial {
+                let h = p.header();
+                invariant!(h.csum_start == hdr.csum_start && h.csum_offset == hdr.csum_offset,
+                           "a checksum to finish at {}+{}, its header said {}+{}", h.csum_start, h.csum_offset,
+                           hdr.csum_start, hdr.csum_offset);
+                p.complete(f);
+            }
+            got_frames.push(f.to_vec());
+            Ok(1)
+        }
+        Ok(Send::Tcp4 { frame: f, layout }) => {
+            invariant!(layout.mss() == usize::from(hdr.gso_size), "a send to cut by {}, its header said {}",
+                       layout.mss(), hdr.gso_size);
+            Ok(offload::segment_tcp4(f, layout, seg, &mut |piece: &[u8]| got_frames.push(piece.to_vec())))
+        }
+        Err(e) => Err(e),
+    };
     match (&want, got) {
         (Ok(frames), Ok(n)) => {
             if hdr.gso_type == 1 {
@@ -311,7 +348,7 @@ fn one(r: &mut Input, offloads: Offloads, seg: &mut [u8]) {
 
 pub fn offload_target(r: &mut Input) {
     let offloads = Offloads { csum: r.u8() < 232, tso4: r.u8() < 232 };
-    let mut seg = vec![0u8; offload::MAX_FRAME];
+    let mut seg = [0u8; offload::MAX_FRAME];
     while r.op(1).is_some() {
         one(r, offloads, &mut seg);
     }

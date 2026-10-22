@@ -90,6 +90,15 @@ impl Seg {
     }
 }
 
+/// What the driver has made available for a frame (`Queue::room_ahead`):
+/// enough, in so many chains; not yet; or not in as many as it may take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Room {
+    Enough(u16),
+    Wait,
+    Never,
+}
+
 /// A ring the driver made that the device will not follow.
 #[derive(Clone, Copy, Debug)]
 pub enum Broken {
@@ -149,17 +158,52 @@ impl Queue {
     /// onto `segs` (cleared first; its capacity is the queue's size, so
     /// nothing here allocates) -- or `Ok(None)` when there is none.
     pub fn pop(&mut self, mem: &GuestMemory, segs: &mut Vec<Seg>) -> Result<Option<u16>, Broken> {
-        segs.clear();
-        let avail = self.avail_base();
-        let avail_idx = read_u16(mem, avail + 2)?;
-        let waiting = avail_idx.wrapping_sub(self.next_avail);
-        if waiting == 0 {
+        if self.waiting(mem)? == 0 {
+            segs.clear();
             return Ok(None);
         }
+        let head = self.chain(mem, self.next_avail, segs)?;
+        self.next_avail = self.next_avail.wrapping_add(1);
+        Ok(Some(head))
+    }
+
+    /// How many chains the driver has made available and the device not
+    /// taken: never more than the queue holds.
+    fn waiting(&self, mem: &GuestMemory) -> Result<u16, Broken> {
+        let avail_idx = read_u16(mem, self.avail_base() + 2)?;
+        let waiting = avail_idx.wrapping_sub(self.next_avail);
         if waiting > self.size {
             return Err(Broken::Overrun);
         }
-        let slot = u64::from(self.next_avail % self.size);
+        Ok(waiting)
+    }
+
+    /// Whether the chains made available, from the next one on and `most`
+    /// of them at most, have writable buffers enough for `need` bytes, with
+    /// nothing taken: for a frame spread over as many as it needs (mergeable
+    /// receive buffers), which goes in whole, waits for more, or -- `most`
+    /// of them falling short -- never goes. `most` bounds the walk too, which
+    /// a guest's chains of no room would otherwise make the whole ring's at
+    /// every look. `segs` is scratch.
+    pub fn room_ahead(&self, mem: &GuestMemory, need: u64, most: u16, segs: &mut Vec<Seg>) -> Result<Room, Broken> {
+        let waiting = self.waiting(mem)?;
+        let mut room = 0u64;
+        for k in 0..waiting.min(most) {
+            self.chain(mem, self.next_avail.wrapping_add(k), segs)?;
+            room += segs.iter().filter(|s| s.write).map(|s| u64::from(s.len)).sum::<u64>();
+            if room >= need {
+                return Ok(Room::Enough(k + 1));
+            }
+        }
+        Ok(if waiting >= most { Room::Never } else { Room::Wait })
+    }
+
+    /// The chain whose head is in the available ring's entry `position`, its
+    /// buffers onto `segs` (cleared first): its head.
+    fn chain(&self, mem: &GuestMemory, position: u16, segs: &mut Vec<Seg>) -> Result<u16, Broken> {
+        segs.clear();
+        let avail = self.avail_base();
+        let slot = u64::from(position % self.size);
         let head = read_u16(mem, avail + 4 + 2 * slot)?;
 
         let mut index = head;
@@ -186,8 +230,7 @@ impl Queue {
             }
             index = next;
         }
-        self.next_avail = self.next_avail.wrapping_add(1);
-        Ok(Some(head))
+        Ok(head)
     }
 
     /// Give the chain at `head` back, `len` bytes of it written by the

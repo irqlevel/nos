@@ -17,8 +17,9 @@ use netwire::{self as wire, ETH_HDR_LEN, ETH_TYPE_IP, IP_PROTO_TCP, IP_PROTO_UDP
 /// The longest frame on the wire: Ethernet's, less the FCS.
 pub const MAX_FRAME: usize = 1514;
 /// The longest send a driver that may leave segmentation to the device
-/// makes: 64 KiB of IPv4, the Ethernet header in front of it.
-pub const MAX_SEND: usize = 65_536 + ETH_HDR_LEN;
+/// makes: as much IPv4 as its 16-bit length can say, the Ethernet header in
+/// front of it.
+pub const MAX_SEND: usize = 65_535 + ETH_HDR_LEN;
 /// The least segment size a send may ask to be cut by: a send is then 256
 /// frames at most, a ring's worth, where a byte a segment would make one
 /// notify 65,000 frames on the switch -- free to the guest that asks, and
@@ -127,6 +128,18 @@ impl TxHeader {
             csum_offset: u16::from_le_bytes([b[8], b[9]]),
         }
     }
+
+    /// As it lies in front of a frame the device hands the driver.
+    pub fn bytes(&self) -> [u8; TxHeader::LEN] {
+        let mut b = [0u8; TxHeader::LEN];
+        b[0] = self.flags;
+        b[1] = self.gso_type;
+        b[2..4].copy_from_slice(&self.hdr_len.to_le_bytes());
+        b[4..6].copy_from_slice(&self.gso_size.to_le_bytes());
+        b[6..8].copy_from_slice(&self.csum_start.to_le_bytes());
+        b[8..10].copy_from_slice(&self.csum_offset.to_le_bytes());
+        b
+    }
 }
 
 /// What the driver may leave to the device, by the features it accepted.
@@ -155,49 +168,155 @@ pub enum Dropped {
     SegmentSize,
 }
 
-/// `frame`, sent with `hdr`: handed to `out` as the frame it is, with its
-/// checksum completed where the header asks, or cut into frames of at most
-/// `MAX_FRAME` (`segment_tcp4`, through `seg`, a frame's room) -- how many
-/// frames went out, or why none did.
-pub fn transmit(hdr: &TxHeader, frame: &mut [u8], offloads: Offloads, seg: &mut [u8], out: &mut dyn FnMut(&[u8]))
-    -> Result<usize, Dropped>
-{
+/// What a send comes to once its header is followed: a frame, its checksum
+/// left to finish where the header asked (`Partial`) -- for the backend to
+/// hand on so to a guest that takes checksums partial, and to finish for
+/// anyone else; or TCP over IPv4 that held up (`check_tcp4`), for the
+/// backend to carry whole to a guest that takes it so, or cut
+/// (`segment_tcp4`).
+pub enum Send<'a> {
+    Frame(&'a mut [u8], Option<Partial>),
+    Tcp4 { frame: &'a [u8], layout: Tcp4 },
+}
+
+/// What a frame for a guest is, by the header it goes in with: whole, its
+/// checksums right; its checksum left to finish; or a send of TCP carried
+/// whole, to be cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rx {
+    Done,
+    Partial(Partial),
+    Whole(Tcp4),
+}
+
+impl Rx {
+    pub fn header(&self) -> TxHeader {
+        match self {
+            Rx::Done => TxHeader::default(),
+            Rx::Partial(p) => p.header(),
+            Rx::Whole(t) => t.header(),
+        }
+    }
+}
+
+/// What a guest's driver takes in what it is handed: checksums left to
+/// finish (`GUEST_CSUM`), and sends of TCP whole (`GUEST_TSO4`, which needs
+/// the other).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Takes {
+    pub partial: bool,
+    pub whole: bool,
+}
+
+/// Where a frame's checksum is left to finish: summed from `start` to the
+/// frame's end and put at `start + offset` -- checked against the frame it
+/// came with, so a guest it is handed to is told nothing outside it. Made by
+/// `Partial::check` alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Partial {
+    start: u16,
+    offset: u16,
+}
+
+impl Partial {
+    /// The place a driver gave, if it lies in a frame of `len` bytes.
+    pub fn check(len: usize, start: u16, offset: u16) -> Result<Partial, Dropped> {
+        let at = usize::from(start) + usize::from(offset);
+        if at + 2 > len {
+            return Err(Dropped::ChecksumPlace);
+        }
+        Ok(Partial { start, offset })
+    }
+
+    /// The checksum finished in `frame`, the one it was checked against:
+    /// the driver left there the sum of the pseudo-header, which the sum
+    /// over the rest takes in. Nothing for a frame too short for its place.
+    pub fn complete(&self, frame: &mut [u8]) {
+        let (start, at) = (usize::from(self.start), usize::from(self.start) + usize::from(self.offset));
+        if at + 2 > frame.len() {
+            return;
+        }
+        let mut c = checksum(sum(&frame[start..], 0));
+        if c == 0 && udp4_checksum_at(frame, at) {
+            c = 0xFFFF;
+        }
+        wire::set_be16(frame, at, c);
+    }
+
+    /// The header a driver that takes checksums partial is handed it with.
+    pub fn header(&self) -> TxHeader {
+        TxHeader { flags: NEEDS_CSUM, gso_type: GSO_NONE, hdr_len: 0, gso_size: 0,
+                   csum_start: self.start, csum_offset: self.offset }
+    }
+}
+
+/// A send of TCP over IPv4 that held up: its headers' lengths, and the
+/// segment size it is cut by. Made by `check_tcp4` alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tcp4 {
+    ihl: usize,
+    thl: usize,
+    mss: usize,
+}
+
+impl Tcp4 {
+    /// The segment size it is cut by.
+    pub fn mss(&self) -> usize {
+        self.mss
+    }
+
+    /// Where its headers end: the Ethernet header's, IPv4's and TCP's.
+    pub fn headers(&self) -> usize {
+        ETH_HDR_LEN + self.ihl + self.thl
+    }
+
+    /// The frames it is cut into, `payload` bytes of TCP behind its headers.
+    pub fn frames(&self, payload: usize) -> usize {
+        payload.div_ceil(self.mss).max(1)
+    }
+
+    /// The header a driver that takes sends whole is handed it with: to be
+    /// cut by the segment size, its checksum left to finish at TCP's -- from
+    /// the send as checked here, not from what its sender's header said.
+    pub fn header(&self) -> TxHeader {
+        TxHeader {
+            flags: NEEDS_CSUM,
+            gso_type: GSO_TCPV4,
+            hdr_len: self.headers() as u16,
+            gso_size: self.mss as u16,
+            csum_start: (ETH_HDR_LEN + self.ihl) as u16,
+            csum_offset: TCP_CHECKSUM as u16,
+        }
+    }
+}
+
+/// `frame`, sent with `hdr`: what it comes to (`Send`), or why it goes
+/// nowhere.
+pub fn transmit<'a>(hdr: &TxHeader, frame: &'a mut [u8], offloads: Offloads) -> Result<Send<'a>, Dropped> {
     if hdr.gso_type & GSO_ECN != 0 {
         return Err(Dropped::NotOffered);
     }
     match hdr.gso_type {
         GSO_NONE => {
-            if hdr.flags & NEEDS_CSUM != 0 {
+            let partial = if hdr.flags & NEEDS_CSUM != 0 {
                 if !offloads.csum {
                     return Err(Dropped::NotOffered);
                 }
-                complete_checksum(frame, usize::from(hdr.csum_start), usize::from(hdr.csum_offset))?;
-            }
+                Some(Partial::check(frame.len(), hdr.csum_start, hdr.csum_offset)?)
+            } else {
+                None
+            };
             if frame.len() > MAX_FRAME {
                 return Err(Dropped::TooLong);
             }
-            out(frame);
-            Ok(1)
+            Ok(Send::Frame(frame, partial))
         }
-        GSO_TCPV4 if offloads.tso4 => segment_tcp4(frame, usize::from(hdr.gso_size), seg, out),
+        GSO_TCPV4 if offloads.tso4 => {
+            let layout = check_tcp4(frame, usize::from(hdr.gso_size))?;
+            Ok(Send::Tcp4 { frame, layout })
+        }
         _ => Err(Dropped::NotOffered),
     }
-}
-
-/// The checksum at `start + offset`, over the frame from `start` to its end:
-/// the driver left there the sum of the pseudo-header, which the sum over
-/// the rest takes in.
-fn complete_checksum(frame: &mut [u8], start: usize, offset: usize) -> Result<(), Dropped> {
-    let at = start.checked_add(offset).ok_or(Dropped::ChecksumPlace)?;
-    if at.checked_add(2).map_or(true, |end| end > frame.len()) {
-        return Err(Dropped::ChecksumPlace);
-    }
-    let mut c = checksum(sum(&frame[start..], 0));
-    if c == 0 && udp4_checksum_at(frame, at) {
-        c = 0xFFFF;
-    }
-    wire::set_be16(frame, at, c);
-    Ok(())
 }
 
 /// Whether `at` is the checksum of the UDP datagram an IPv4 frame carries.
@@ -210,13 +329,10 @@ fn udp4_checksum_at(frame: &[u8], at: usize) -> bool {
     ip[IP_PROTO] == IP_PROTO_UDP && at == ETH_HDR_LEN + ihl + UDP_CHECKSUM
 }
 
-/// A send of TCP over IPv4 cut into frames whose payloads are `mss` bytes
-/// but the last, each through `seg` and handed to `out`: the headers of the
-/// send in front of each, with its IP length, ID and checksum, its sequence
-/// number and its TCP checksum its own, FIN and PSH the last one's, CWR the
-/// first's. How many frames went out, or why none did -- the headers checked
-/// whole first, so a send goes out entire or not at all.
-pub fn segment_tcp4(frame: &[u8], mss: usize, seg: &mut [u8], out: &mut dyn FnMut(&[u8])) -> Result<usize, Dropped> {
+/// Whether `frame` is TCP over IPv4 that can be cut by `mss`: its headers,
+/// the lengths they say and the segment size against a frame's room -- all
+/// of it before a byte is cut, so a send goes out entire or not at all.
+pub fn check_tcp4(frame: &[u8], mss: usize) -> Result<Tcp4, Dropped> {
     if frame.len() < ETH_HDR_LEN + IP_MIN || wire::be16(frame, 12) != ETH_TYPE_IP {
         return Err(Dropped::NotTcp4);
     }
@@ -236,12 +352,28 @@ pub fn segment_tcp4(frame: &[u8], mss: usize, seg: &mut [u8], out: &mut dyn FnMu
         return Err(Dropped::Headers);
     }
     let headers = ETH_HDR_LEN + ihl + thl;
-    if mss < MIN_SEGMENT || headers + mss > MAX_FRAME || seg.len() < MAX_FRAME {
+    if mss < MIN_SEGMENT || headers + mss > MAX_FRAME {
         return Err(Dropped::SegmentSize);
     }
+    Ok(Tcp4 { ihl, thl, mss })
+}
 
+/// A send `check_tcp4` passed, cut into frames whose payloads are `mss`
+/// bytes but the last, each through `seg` and handed to `out`: the headers
+/// of the send in front of each, with its IP length, ID and checksum, its
+/// sequence number and its TCP checksum its own, FIN and PSH the last
+/// one's, CWR the first's. How many frames went out.
+pub fn segment_tcp4(frame: &[u8], t: Tcp4, seg: &mut [u8; MAX_FRAME], out: &mut dyn FnMut(&[u8])) -> usize {
+    let (ihl, thl, mss) = (t.ihl, t.thl, t.mss);
+    let headers = t.headers();
+    /* A layout checked against another frame than this one: nothing cut,
+     * rather than a slice past its end. */
+    if frame.len() < headers || frame.len() > MAX_SEND {
+        return 0;
+    }
+    let ip = &frame[ETH_HDR_LEN..];
     let payload = &frame[headers..];
-    let count = payload.len().div_ceil(mss).max(1);
+    let count = t.frames(payload.len());
     let id = wire::be16(ip, IP_ID);
     let tcp = &ip[ihl..];
     let seq = wire::be32(tcp, TCP_SEQ);
@@ -279,5 +411,5 @@ pub fn segment_tcp4(frame: &[u8], mss: usize, seg: &mut [u8], out: &mut dyn FnMu
 
         out(&seg[..total]);
     }
-    Ok(count)
+    count
 }

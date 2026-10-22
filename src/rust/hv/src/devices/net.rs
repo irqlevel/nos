@@ -3,13 +3,13 @@
 //!
 //! Two queues, as legacy has them: 0 the driver fills with buffers for what
 //! the device receives, 1 with what it sends. Every frame either way comes
-//! after the 10-byte header legacy puts in front of it. What the guest sends
-//! may leave its checksum to the device, and TCP over IPv4 may come as one
-//! send of up to 64 KiB for the device to cut (`offload`): the frames that
-//! leave the device are whole, checksummed and at most 1514 bytes, and so is
-//! what the guest is given -- no offload is offered that way. A send is
-//! copied out and handed to the backend, cut or whole, before the notify
-//! returns; what the backend has for the guest is put into
+//! after the header legacy puts in front of it -- ten bytes, or twelve once
+//! the driver takes mergeable buffers. What the guest sends may leave its
+//! checksum to the device, and TCP over IPv4 may come as one send of up to
+//! 64 KiB (`offload`): the backend carries such a send whole to a guest that
+//! takes it so -- `GUEST_TSO4`, spread over as many of its buffers as it
+//! needs -- and cuts it into frames for anyone else. A send is copied out and
+//! handed to the backend before the notify returns; what the backend has for the guest is put into
 //! its buffers each time round the run loop (`poll`) -- one frame held by the
 //! device when the driver has posted none, so nothing is lost for want of a
 //! buffer that is on its way.
@@ -17,9 +17,9 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::offload::{self, Offloads, TxHeader};
+use super::offload::{self, Offloads, Partial, Rx, Send as Sent, Takes, Tcp4, TxHeader};
 use super::pci::Identity;
-use super::virtio::{self, Asked, Broken, Queue, Raise, Seg, Transport};
+use super::virtio::{self, Asked, Broken, Queue, Raise, Room, Seg, Transport};
 use crate::memory::GuestMemory;
 use crate::{Error, Result};
 
@@ -28,9 +28,34 @@ use crate::{Error, Result};
 pub trait Backend: Send {
     /// A frame the guest sent, Ethernet header first.
     fn send(&mut self, frame: &[u8]);
+    /// A frame whose checksum the guest left to finish: handed on so to a
+    /// guest that takes checksums partial, and finished for anyone else --
+    /// which the default does, then `send`.
+    fn send_partial(&mut self, frame: &mut [u8], partial: Partial) {
+        partial.complete(frame);
+        self.send(frame);
+    }
+    /// A send of TCP over IPv4 the guest left to be cut, and that held up
+    /// (`offload::check_tcp4`): carried whole to a guest that takes it so,
+    /// and cut into frames for anyone else -- which the default does, a
+    /// frame at a time through `send`.
+    fn send_tcp4(&mut self, frame: &[u8], layout: Tcp4) {
+        let mut seg = [0u8; MAX_FRAME];
+        offload::segment_tcp4(frame, layout, &mut seg, &mut |f| self.send(f));
+    }
     /// The next frame for the guest, into `buf` (`MAX_FRAME` bytes): its
     /// length, or None when there is none.
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize>;
+    /// The next frame for the guest as `recv`, and what it is (`Rx`): a
+    /// frame whose checksum is left to finish, or a send carried whole, only
+    /// to a device that has said its guest takes them (`takes`); `buf` is
+    /// `offload::MAX_SEND` bytes. The default hands frames whole.
+    fn recv_with(&mut self, buf: &mut [u8]) -> Option<(usize, Rx)> {
+        self.recv(buf).map(|len| (len, Rx::Done))
+    }
+    /// What the guest's driver takes (`Takes`): until it says so again, a
+    /// backend hands it nothing else.
+    fn takes(&mut self, _takes: Takes) {}
     /// Until `until_ns` on the boot clock, a frame for the guest need not
     /// wake the CPU that does the device's work: the device looks for what
     /// came by then on its own (`Net::rx_due`), its receive interrupts held
@@ -59,16 +84,22 @@ const QUEUE_SIZE: u16 = 256;
 /// host for good, the platform's lock with it (hv-fuzz's racing CPU).
 const PASS: usize = QUEUE_SIZE as usize;
 
-/// Features: the guest's checksums completed by the device, a MAC address
-/// of the device's, TCP over IPv4 cut into frames by the device, and a link
-/// status. Segmentation needs the checksums: each frame it makes has its
-/// own.
+/// Features: the guest's checksums completed by the device, and checksums
+/// left partial handed to it; a MAC address of the device's; sends of TCP
+/// over IPv4 handed to it whole, and taken from it to cut; mergeable
+/// receive buffers -- a frame spread over as many as it needs -- and a link
+/// status. Each offload of TCP needs its direction's checksums: a send cut
+/// or carried whole has them partial.
 const F_CSUM: u32 = 1 << 0;
+const F_GUEST_CSUM: u32 = 1 << 1;
 const F_MAC: u32 = 1 << 5;
+const F_GUEST_TSO4: u32 = 1 << 7;
 const F_HOST_TSO4: u32 = 1 << 11;
+const F_MRG_RXBUF: u32 = 1 << 15;
 const F_STATUS: u32 = 1 << 16;
-/// What every NIC here offers.
+/// What every NIC here offers, and the offloads on top (`set_offloads`).
 const BASE_FEATURES: u32 = F_MAC | F_STATUS;
+const OFFLOADS: u32 = F_CSUM | F_GUEST_CSUM | F_GUEST_TSO4 | F_HOST_TSO4 | F_MRG_RXBUF;
 const LINK_UP: u16 = 1;
 
 /// The configuration: the MAC, then the status.
@@ -76,8 +107,15 @@ const CFG_MAC: usize = 0;
 const CFG_STATUS: usize = 6;
 const CFG_BYTES: usize = 8;
 
-/// Legacy's header, before every frame.
+/// Legacy's header, before every frame either way: ten bytes, and two more
+/// -- how many buffers a frame was spread over -- once the driver takes
+/// mergeable buffers.
 const HDR: usize = TxHeader::LEN;
+const HDR_MRG: usize = HDR + 2;
+/// The most buffers a frame is spread over: a whole send of 64 KiB in the
+/// 1,500-odd bytes Linux posts at the least, with room. A frame they would
+/// not hold is dropped rather than wait for good.
+const MAX_MERGE: u16 = 64;
 /// The longest frame either way: Ethernet's, less the FCS.
 pub const MAX_FRAME: usize = offload::MAX_FRAME;
 const MIN_FRAME: usize = 14;
@@ -85,10 +123,14 @@ const MIN_FRAME: usize = 14;
 /// What the device has done, for a report.
 #[derive(Clone, Copy, Default)]
 pub struct Stats {
+    /// Frames sent and received -- a send of TCP up to 64 KiB counted as the
+    /// frames it is cut into, and one received whole as one.
     pub sent: u64,
     pub received: u64,
-    /// Sends the device cut into frames -- `sent` counts the frames.
-    pub cut: u64,
+    /// Sends of TCP up to 64 KiB, cut for their receivers or carried
+    /// whole; and those received whole.
+    pub large: u64,
+    pub whole: u64,
     /// Sent frames that were not frames: too short, or longer than was
     /// offered.
     pub dropped: u64,
@@ -99,16 +141,17 @@ pub struct Net {
     backend: Box<dyn Backend>,
     mac: [u8; 6],
     segs: Vec<Seg>,
-    /// A send, header included: a frame, or up to 64 KiB of TCP for the
-    /// device to cut.
+    /// A send, header included: a frame, or up to 64 KiB of TCP.
     tx_buf: Vec<u8>,
-    /// Room for a frame cut from a send.
-    seg_buf: Vec<u8>,
-    /// The header, all zero -- nothing to say -- and the frame behind it:
-    /// what goes into the guest's buffers as it lies.
+    /// The header and the frame behind it -- or a send carried whole --
+    /// what goes into the guest's buffers as it lies, the frame always at
+    /// `HDR_MRG` and its header right in front of it.
     rx_buf: Vec<u8>,
-    /// The length of a frame in `rx_buf` still waiting for a buffer.
-    held: Option<usize>,
+    /// A frame in `rx_buf` still waiting for buffers: its length, and what
+    /// it is.
+    held: Option<(usize, Rx)>,
+    /// What the backend was told the guest takes.
+    told: Takes,
     /// A transmit pass ended at its bound, with chains perhaps still on the
     /// ring: the next round of the devices goes on with them.
     tx_more: bool,
@@ -132,23 +175,20 @@ impl Net {
         let mut segs = Vec::new();
         segs.try_reserve_exact(usize::from(QUEUE_SIZE)).map_err(|_| Error::NoMemory)?;
         let mut tx_buf = Vec::new();
-        tx_buf.try_reserve_exact(HDR + offload::MAX_SEND).map_err(|_| Error::NoMemory)?;
-        tx_buf.resize(HDR + offload::MAX_SEND, 0);
-        let mut seg_buf = Vec::new();
-        seg_buf.try_reserve_exact(MAX_FRAME).map_err(|_| Error::NoMemory)?;
-        seg_buf.resize(MAX_FRAME, 0);
+        tx_buf.try_reserve_exact(HDR_MRG + offload::MAX_SEND).map_err(|_| Error::NoMemory)?;
+        tx_buf.resize(HDR_MRG + offload::MAX_SEND, 0);
         let mut rx_buf = Vec::new();
-        rx_buf.try_reserve_exact(HDR + MAX_FRAME).map_err(|_| Error::NoMemory)?;
-        rx_buf.resize(HDR + MAX_FRAME, 0);
+        rx_buf.try_reserve_exact(HDR_MRG + offload::MAX_SEND).map_err(|_| Error::NoMemory)?;
+        rx_buf.resize(HDR_MRG + offload::MAX_SEND, 0);
         Ok(Net {
-            transport: Transport::new(BASE_FEATURES | F_CSUM | F_HOST_TSO4, queues),
+            transport: Transport::new(BASE_FEATURES | OFFLOADS, queues),
             backend,
             mac,
             segs,
             tx_buf,
-            seg_buf,
             rx_buf,
             held: None,
+            told: Takes::default(),
             tx_more: false,
             rx_quiet_ns: 0,
             rx_quiet_until: 0,
@@ -173,13 +213,12 @@ impl Net {
         self.broken
     }
 
-    /// The transmit offloads offered -- the guest's checksums completed and
-    /// its TCP over IPv4 cut by the device -- or not, the device as it was
+    /// The offloads offered -- checksums and TCP's sends of up to 64 KiB,
+    /// both ways, and mergeable buffers -- or not, the device as it was
     /// before them, for a guest to be measured or run without. Before the
     /// driver reads the features: at the guest's next boot otherwise.
     pub fn set_offloads(&mut self, on: bool) {
-        let offloads = F_CSUM | F_HOST_TSO4;
-        self.transport.set_device_features(if on { BASE_FEATURES | offloads } else { BASE_FEATURES });
+        self.transport.set_device_features(if on { BASE_FEATURES | OFFLOADS } else { BASE_FEATURES });
     }
 
     /// Receive interrupts no closer than `ns` apart -- 0, as each frame
@@ -256,6 +295,7 @@ impl Net {
                 self.held = None;
                 self.tx_more = false;
                 self.rx_owed = false;
+                self.tell(Takes::default());
                 Raise::default()
             }
             _ => Raise::default(),
@@ -305,16 +345,17 @@ impl Net {
         if wants { self.transport.interrupt(TX_QUEUE) } else { Raise::default() }
     }
 
-    /// One chain the driver sent: the header, then the frame -- or the send
-    /// to cut into frames -- taken whole, and on to the backend as the
+    /// One chain the driver sent: the header, then the frame -- or a send
+    /// of TCP up to 64 KiB -- taken whole, and on to the backend as the
     /// header says (`offload::transmit`).
     fn transmit(&mut self, mem: &GuestMemory, segs: &[Seg]) {
         let features = self.transport.driver_features();
         let offloads = Offloads { csum: features & F_CSUM != 0, tso4: features & F_HOST_TSO4 != 0 };
-        let most = if offloads.tso4 { HDR + offload::MAX_SEND } else { HDR + MAX_FRAME };
+        let hdr = if features & F_MRG_RXBUF != 0 { HDR_MRG } else { HDR };
+        let most = if offloads.tso4 { hdr + offload::MAX_SEND } else { hdr + MAX_FRAME };
         let total: u64 = segs.iter().filter(|s| !s.write).map(|s| u64::from(s.len)).sum();
         let len = total as usize;
-        if total < (HDR + MIN_FRAME) as u64 || total > most as u64 {
+        if total < (hdr + MIN_FRAME) as u64 || total > most as u64 {
             self.stats.dropped += 1;
             return;
         }
@@ -329,18 +370,23 @@ impl Net {
             }
             done += n;
         }
-        let Net { tx_buf, seg_buf, backend, stats, .. } = self;
-        let (head, rest) = tx_buf.split_at_mut(HDR);
+        let Net { tx_buf, backend, stats, .. } = self;
         let mut header = [0u8; HDR];
-        header.copy_from_slice(head);
+        header.copy_from_slice(&tx_buf[..HDR]);
         let header = TxHeader::parse(&header);
-        let mut send = |frame: &[u8]| backend.send(frame);
-        match offload::transmit(&header, &mut rest[..len - HDR], offloads, seg_buf, &mut send) {
-            Ok(frames) => {
-                stats.sent += frames as u64;
-                if header.gso_type != offload::GSO_NONE {
-                    stats.cut += 1;
-                }
+        match offload::transmit(&header, &mut tx_buf[hdr..len], offloads) {
+            Ok(Sent::Frame(frame, None)) => {
+                backend.send(frame);
+                stats.sent += 1;
+            }
+            Ok(Sent::Frame(frame, Some(partial))) => {
+                backend.send_partial(frame, partial);
+                stats.sent += 1;
+            }
+            Ok(Sent::Tcp4 { frame, layout }) => {
+                stats.sent += layout.frames(frame.len() - layout.headers()) as u64;
+                stats.large += 1;
+                backend.send_tcp4(frame, layout);
             }
             Err(_) => stats.dropped += 1,
         }
@@ -363,44 +409,79 @@ impl Net {
             /* A queue taken down, or a ring the device stopped following,
              * is owed nothing: kept owing, it would be due for good, and
              * the round that looks at it run without a pause (hv-fuzz
-             * found it). */
+             * found it). Nor does it take sends whole. */
             self.rx_owed = false;
+            self.tell(Takes::default());
             return Raise::default();
         }
+        let features = self.transport.driver_features();
+        let merged = features & F_MRG_RXBUF != 0;
+        let takes = Takes {
+            partial: features & F_GUEST_CSUM != 0,
+            whole: features & (F_GUEST_TSO4 | F_GUEST_CSUM) == F_GUEST_TSO4 | F_GUEST_CSUM,
+        };
+        self.tell(takes);
+        let hdr = if merged { HDR_MRG } else { HDR };
+        let start = HDR_MRG - hdr;
         let mut delivered = false;
         for _ in 0..PASS {
-            let len = match self.held {
-                Some(len) => len,
-                None => match self.backend.recv(&mut self.rx_buf[HDR..]) {
-                    Some(len) if (MIN_FRAME..=MAX_FRAME).contains(&len) => len,
-                    Some(_) => continue,
+            let (len, rx) = match self.held {
+                Some(h) => h,
+                None => match self.backend.recv_with(&mut self.rx_buf[HDR_MRG..]) {
+                    Some((len, Rx::Done)) if (MIN_FRAME..=MAX_FRAME).contains(&len) => (len, Rx::Done),
+                    Some((len, Rx::Partial(p))) if (MIN_FRAME..=MAX_FRAME).contains(&len) => {
+                        if takes.partial {
+                            (len, Rx::Partial(p))
+                        } else {
+                            /* Its checksum finished here for a driver that
+                             * takes none partial, whoever handed it over. */
+                            p.complete(&mut self.rx_buf[HDR_MRG..HDR_MRG + len]);
+                            (len, Rx::Done)
+                        }
+                    }
+                    Some((len, Rx::Whole(t))) if takes.whole && (t.headers()..=offload::MAX_SEND).contains(&len) => {
+                        (len, Rx::Whole(t))
+                    }
+                    Some(_) => {
+                        self.stats.dropped += 1;
+                        continue;
+                    }
                     None => break,
                 },
             };
+            /* Its header in front of it: nothing to say of a frame with its
+             * checksums whole; one left to finish says where; a send carried
+             * whole is to be cut by its segment size, its checksum partial. */
+            let header = rx.header();
+            self.rx_buf[start..start + HDR].copy_from_slice(&header.bytes());
+            let total = hdr + len;
             let mut segs = core::mem::take(&mut self.segs);
-            let popped = match self.transport.queue(RX_QUEUE) {
-                Some(q) => q.pop(mem, &mut segs),
-                None => Ok(None),
-            };
-            let result = match popped {
-                Ok(Some(head)) => {
-                    let written = self.receive(mem, &segs, len);
-                    self.transport.queue(RX_QUEUE).ok_or(Broken::Index)
-                        .and_then(|q| q.push(mem, head, written as u32))
-                }
-                Ok(None) => {
-                    /* No buffer yet: the frame waits here for one. */
-                    self.held = Some(len);
-                    self.segs = segs;
-                    break;
-                }
-                Err(e) => Err(e),
+            let result = if merged {
+                self.merge(mem, total, start, &mut segs)
+            } else {
+                self.one_chain(mem, total, start, &mut segs)
             };
             self.segs = segs;
-            self.held = None;
             match result {
-                Ok(()) => delivered = true,
+                Ok(Taken::In) => {
+                    self.held = None;
+                    delivered = true;
+                    self.stats.received += 1;
+                    if matches!(rx, Rx::Whole(_)) {
+                        self.stats.whole += 1;
+                    }
+                }
+                Ok(Taken::Wait) => {
+                    /* Not buffers enough yet: the frame waits here. */
+                    self.held = Some((len, rx));
+                    break;
+                }
+                Ok(Taken::Dropped) => {
+                    self.held = None;
+                    self.stats.dropped += 1;
+                }
                 Err(e) => {
+                    self.held = None;
                     self.broken = Some(e);
                     break;
                 }
@@ -410,6 +491,51 @@ impl Net {
             self.rx_owed = true;
         }
         self.rx_interrupt(mem, now)
+    }
+
+    /// The `total` bytes at `rx_buf[start..]`, header and frame, spread over
+    /// as many of the driver's mergeable buffers as they take -- the count
+    /// put in the header first -- or waiting for more, or dropped when as
+    /// many as a frame may take would not hold it.
+    fn merge(&mut self, mem: &GuestMemory, total: usize, start: usize, segs: &mut Vec<Seg>) -> core::result::Result<Taken, Broken> {
+        let q = self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?;
+        let chains = match q.room_ahead(mem, total as u64, MAX_MERGE, segs)? {
+            Room::Enough(n) => n,
+            Room::Wait => return Ok(Taken::Wait),
+            Room::Never => return Ok(Taken::Dropped),
+        };
+        self.rx_buf[start + HDR..start + HDR_MRG].copy_from_slice(&chains.to_le_bytes());
+        let mut done = 0usize;
+        for _ in 0..chains {
+            let q = self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?;
+            /* The chains looked at a moment ago: a driver that took them
+             * back meanwhile, from another CPU, has a frame cut short. */
+            let Some(head) = q.pop(mem, segs)? else { break };
+            let written = write_chain(mem, segs, &self.rx_buf[start + done..start + total]);
+            done += written;
+            self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
+        }
+        Ok(if done == total { Taken::In } else { Taken::Dropped })
+    }
+
+    /// The `total` bytes at `rx_buf[start..]` into one chain of the
+    /// driver's: waiting for one, or -- too short for them -- the frame
+    /// dropped and the chain given back empty.
+    fn one_chain(&mut self, mem: &GuestMemory, total: usize, start: usize, segs: &mut Vec<Seg>) -> core::result::Result<Taken, Broken> {
+        let q = self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?;
+        let Some(head) = q.pop(mem, segs)? else { return Ok(Taken::Wait) };
+        let room: u64 = segs.iter().filter(|s| s.write).map(|s| u64::from(s.len)).sum();
+        let written = if room < total as u64 { 0 } else { write_chain(mem, segs, &self.rx_buf[start..start + total]) };
+        self.transport.queue(RX_QUEUE).ok_or(Broken::Index)?.push(mem, head, written as u32)?;
+        Ok(if written == total { Taken::In } else { Taken::Dropped })
+    }
+
+    /// The backend told what the driver comes to take, or stops taking.
+    fn tell(&mut self, takes: Takes) {
+        if self.told != takes {
+            self.told = takes;
+            self.backend.takes(takes);
+        }
     }
 
     /// The receive interrupt owed for what was delivered, if its time is up
@@ -432,33 +558,32 @@ impl Net {
         self.transport.interrupt(RX_QUEUE)
     }
 
-    /// The header and the frame, as they lie in `rx_buf`, into the chain's
-    /// writable buffers -- one copy a buffer, `GuestMemory` taking it a page
-    /// at a time: what was written, or 0 when they are too short for it --
-    /// the frame then dropped. It went a byte at a time once, through a
-    /// 256-byte bounce buffer whose every piece was mapped on its own -- host
-    /// work on the vCPU's own CPU, for every frame, while the guest waited.
-    fn receive(&mut self, mem: &GuestMemory, segs: &[Seg], len: usize) -> usize {
-        let total = HDR + len;
-        let room: u64 = segs.iter().filter(|s| s.write).map(|s| u64::from(s.len)).sum();
-        if room < total as u64 {
-            self.stats.dropped += 1;
-            return 0;
+}
+
+/// What became of a frame offered to the driver's buffers.
+enum Taken {
+    In,
+    Wait,
+    Dropped,
+}
+
+/// `data` into the chain's writable buffers, one copy a buffer -- `GuestMemory`
+/// taking it a page at a time -- as much as they hold: what was written. It
+/// went a byte at a time once, through a 256-byte bounce buffer whose every
+/// piece was mapped on its own -- host work on the vCPU's own CPU, for every
+/// frame, while the guest waited.
+fn write_chain(mem: &GuestMemory, segs: &[Seg], data: &[u8]) -> usize {
+    let mut done = 0usize;
+    for s in segs.iter().filter(|s| s.write) {
+        if done == data.len() {
+            break;
         }
-        let mut done = 0usize;
-        for s in segs.iter().filter(|s| s.write) {
-            if done == total {
-                break;
-            }
-            let n = (total - done).min(s.len as usize);
-            let Some(at) = s.at(0) else { continue };
-            if mem.write(at, &self.rx_buf[done..done + n]).is_err() {
-                self.stats.dropped += 1;
-                return 0;
-            }
-            done += n;
+        let n = (data.len() - done).min(s.len as usize);
+        let Some(at) = s.at(0) else { continue };
+        if mem.write(at, &data[done..done + n]).is_err() {
+            break;
         }
-        self.stats.received += 1;
-        total
+        done += n;
     }
+    done
 }

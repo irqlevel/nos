@@ -1455,39 +1455,66 @@ $ hv forward add 8080 1 80              # nos's 8080, to guest 1's 80
 
 **The guest's NIC is virtio-net, legacy, on the same transport as its
 disks** (`hv::devices::net`): two queues, a MAC and a link status offered,
-and the guest's transmit offloads (below): what leaves the device either way
-is a whole Ethernet frame of at most 1514 bytes with its checksums right,
-after legacy's 10-byte header going in. A send is cut, or handed on whole,
-before the notify returns; what waits for the guest is put into the buffers
-it has posted each time round the run loop, one frame held by the device
-while it has posted none.
+and offloads both ways (below), legacy's header in front of every frame
+either way -- ten bytes, twelve once the driver takes mergeable buffers. A
+send is cut, or handed on whole, before the notify returns; what waits for
+the guest is put into the buffers it has posted each time round the run
+loop, one frame held by the device while it has posted too few.
 
-**Transmit offloads.** The device completes a checksum the driver leaves to
-it (`VIRTIO_NET_F_CSUM`) and cuts TCP over IPv4 the driver hands it as one
-send of up to 64 KiB into frames (`HOST_TSO4`; `hv::devices::offload`): the
-headers of the send in front of each, its IP length, ID and checksum, its
-sequence number and its TCP checksum its own, FIN and PSH the last one's,
-CWR the first's -- before the switch, so every guest, nos's stack and NAT
-are handed whole frames as before. What the driver says about either --
-where a checksum goes, where the headers end, the segment size -- is checked
-against the frame before it is used, and a send that does not hold up is
-dropped, counted. Not offered: ECN on a cut send, IPv6, UDP; and a segment
-under 256 bytes is refused, so that one notify is 256 frames at most and not
-65,000 that a guest could ask for at no cost to itself. `nooffload` on `hv
-boot` or `hv start` offers the device without them. On the EX44 two guests
-of two CPUs, one serving a file of 100 MB five times over with BusyBox's
-`httpd` -- `sendfile`, sends of 64 KiB -- and the other fetching it: 1.11
-and 1.12 s with them, 1.63 and 1.63 without, about 470 MB/s against 320,
-8,400 sends cut into 362,000 frames. Without them the guest cut its sends
-itself, kicking the device once a send all the same -- the exits were
-alike -- so what they save is the guest's own work for each frame. A sender
-writing a kilobyte at a time (`dd | nc`) hands over full segments one at a
-time and has little to cut: 3.5-4.4 s either way, the device then only
-completing checksums -- which it sums eight bytes at a time, since two
-bytes at a time made that 3-5% slower than the guest's own checksum, taken
-as it copies. hv-fuzz's `offload` target holds every send, well made and
-not, to a model of its own, frame by frame; two mutants -- PSH on every
-frame, one IP ID for all -- each failed within three inputs.
+**Offloads, both ways.** The device completes a checksum the driver leaves
+to it (`VIRTIO_NET_F_CSUM`) and cuts TCP over IPv4 the driver hands it as
+one send of up to 64 KiB into frames (`HOST_TSO4`; `hv::devices::offload`):
+the headers of the send in front of each, its IP length, ID and checksum,
+its sequence number and its TCP checksum its own, FIN and PSH the last
+one's, CWR the first's. What the driver says about either -- where a
+checksum goes, where the headers end, the segment size -- is checked against
+the frame before it is used, and a send that does not hold up is dropped,
+counted. Not offered: ECN on a cut send, IPv6, UDP; and a segment under 256
+bytes is refused, so that one notify is 256 frames at most and not 65,000
+that a guest could ask for at no cost to itself.
+
+Between two guests, the switch does neither where it need not. A guest
+whose driver takes checksums left to finish (`GUEST_CSUM`) is handed a
+frame its sender left so as it was sent, the header saying where -- Linux
+takes it as checked, as it does what comes over its own loopback; one that
+takes sends whole too (`GUEST_TSO4`, with mergeable buffers to spread one
+over, `MRG_RXBUF`) is handed a send of up to 64 KiB as its sender made it,
+the header saying the segment size to cut it by should it be forwarded.
+Everyone else -- nos's stack through `hv0`, NAT, a guest whose driver takes
+neither -- is handed whole frames, finished and cut on the way out of the
+switch, as before. The device tells the switch what its driver takes when
+it says so; a frame put in before a driver took other features is the
+device's to finish, and a send its driver no longer takes whole, to drop.
+A port keeps room for eight sends of 64 KiB beside its frames, taken when
+it is claimed.
+
+`nooffload` on `hv boot` or `hv start` offers the device without any of
+them. On the EX44 two guests of two CPUs, one serving a file of 100 MB five
+times over with BusyBox's `httpd` -- `sendfile`, sends of 64 KiB -- and the
+other fetching it: 0.47 s with them, 1.63-1.68 without, 1.1 GB/s against
+320 MB/s -- the fetching guest took 8,500 sends whole where it had taken
+362,000 frames. With the sending side's alone, the sends cut in the switch,
+it was 1.11 s. A sender whose TCP hands the device a segment at a time,
+`dd | nc`, is 7% slower with them: 4.45 s against 4.15, five runs each.
+Offered one at a time, most of that is the sending side's checksum (4.34 s;
+TSO adds nothing to it, and mergeable buffers alone cost nothing, 4.16),
+with the exits and the guest's IPIs alike either way: a Linux driver that
+leaves its checksums to the device gathers each frame from pages too --
+scatter-gather comes on with them -- three or four descriptors a frame
+where it was two, and every descriptor and buffer the device reads is a
+guest page mapped and unmapped on the host, one access at a time: the
+likeliest cost, and what mapping a ring's pages once is to take away
+([Speed](#speed), item 6). A checksum the device finishes it sums eight
+bytes at a time, since two bytes at a time made that 3-5% slower than the
+guest's own, taken as it copies. hv-fuzz's `offload` target holds every
+send, well made and not, to a model of its own, frame by frame; two mutants
+-- PSH on every frame, one IP ID for all -- each failed within three inputs.
+Its `netrx` target holds what goes into the driver's buffers to another,
+and `switch` where each send and frame goes, whole or finished; six mutants
+-- the buffer count one too many, a partial checksum not finished for a
+driver that takes none, a send whole to one that takes none, the switch not
+told what a driver takes, a partial checksum or a whole send handed to
+every port -- each failed within 17 inputs.
 
 **nos's end is a virtual NIC, `hv0`, in its own stack** (`net/src/vnic.rs`).
 A module cannot register a NIC -- there is no C name for a driver to be bound
@@ -3689,10 +3716,10 @@ someone else's; then speed.
    MiB and 1 GiB, over guest memory taken in runs that size; the VMX
    preemption timer, which would take a computing guest out at its timer's
    edge without the host interrupt that does it now ([Time](#time));
-   ~~virtio-net's transmit offloads~~ done ([A network](#a-network)); its
-   receive offloads -- a send handed to another guest whole, which takes
-   `GUEST_TSO4` and mergeable buffers, and with which a stream between two
-   guests would be a fortieth of the frames, interrupts and copies it is.
+   ~~virtio-net's offloads~~ done both ways ([A network](#a-network)): a
+   stream between two guests is a fortieth of the frames it was. Without
+   the ring pages mapped once, a driver's scatter-gather costs a sender of
+   one segment at a time 7%.
 7. **What has not been measured.** The time each kind of exit takes
    inside `LinuxGuest::run`; fio and iperf in a guest. (An exit under VT-x
    on silicon is measured now: [What an exit costs](#what-an-exit-costs).)
