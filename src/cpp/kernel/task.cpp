@@ -3,10 +3,14 @@
 #include "trace.h"
 #include <hal/cpu.h>
 #include <hal/context.h>
+#include <hal/barrier.h>
 #include "sched.h"
 #include "cpu.h"
 #include "sched.h"
 #include "preempt.h"
+#include "mutex.h"
+#include "stack_trace.h"
+#include "symtab.h"
 #include <mm/new.h>
 
 namespace Kernel
@@ -148,11 +152,327 @@ void Task::Exec(void *task)
     static_cast<Task *>(task)->ExecCallback();
 }
 
-void Task::Wait()
+/* Waits that Wait has reported (GetJoinReportCount) */
+static Atomic JoinReports;
+
+void Task::Wait(ulong reportNs)
 {
+    const ulong start = GetBootTime().GetValue();
+    ulong reportAt = reportNs;
+
     while (State.Get() != StateExited)
     {
         Sleep(1 * Const::NanoSecsInMs);
+
+        ulong waited = GetBootTime().GetValue() - start;
+        if (waited < reportAt)
+            continue;
+
+        ReportJoin(waited);
+        reportAt = waited + Stdlib::Min(waited, JoinReportMaxNs);
+    }
+}
+
+long Task::GetJoinReportCount()
+{
+    return JoinReports.Get();
+}
+
+/* Locate, one at a time across the machine: what it leaves with each CPU it
+   asks (TaskProbe) is the next asker's to reuse, and a report's lines stay
+   together */
+static Mutex& LocateLock()
+{
+    static Mutex lock;
+    return lock;
+}
+
+static void TaskProbeIpi(void* ctx, Context* ipiCtx);
+
+/* What Locate leaves with a CPU it asks whether it is running a task. One
+   per CPU, made the first time that CPU is asked and kept for good: a CPU
+   with interrupts off never takes the IPI, and Locate stops waiting for it,
+   so the IPI queued there -- and the answer its handler writes -- has to
+   outlive the call that queued it. On the asker's stack, a CPU that took
+   it late would write into whatever that stack had become by then. Under
+   LocateLock, but for the answer, which the handler writes before it brings
+   the IPI's Completion back to 0. */
+struct TaskProbe final
+{
+    TaskProbe()
+        : Ipi(TaskProbeIpi, this)
+        , Want(nullptr)
+        , Found(false)
+        , Pc(0)
+        , Count(0)
+        , Frames{}
+        , Pending(false)
+    {
+        /* Nothing asked yet, which is the same as answered */
+        Ipi.Completion.Done();
+    }
+
+    IPITask Ipi;
+    Task* Want;
+    bool Found;
+    ulong Pc;
+    size_t Count;
+    ulong Frames[Task::WhereFrames];
+    /* Sent, and not answered when Locate stopped waiting */
+    bool Pending;
+
+    static const ulong Tag = 'TPrb';
+};
+
+static TaskProbe* TaskProbes[MaxCpus];
+
+/* The IPI, on the CPU asked: whether the task it landed on -- the one whose
+   stack the handler runs on, since neither arch switches stacks for an
+   interrupt taken in the kernel -- is the task wanted, and if it is, where
+   it was */
+static void TaskProbeIpi(void* ctx, Context* ipiCtx)
+{
+    auto* probe = static_cast<TaskProbe*>(ctx);
+    probe->Found = (Task::TryGetCurrentTask() == probe->Want);
+    if (!probe->Found)
+        return;
+
+    probe->Pc = ipiCtx->GetRetRip();
+    probe->Count = StackTrace::CaptureFromSp(ipiCtx->GetFramePointer(),
+        ipiCtx->GetOrigRsp(), probe->Frames, Stdlib::ArraySize(probe->Frames));
+}
+
+/* Asks every other CPU running whether it is running task, and waits up to
+   answerNs for the answers. True when one was -- where says which,
+   and where it was -- and when none was but some CPU did not answer: the
+   task is on one of those, as far as anything can tell. False when every
+   CPU answered no: it has left its CPU since it was seen on one. */
+static bool LocateRunning(Task* task, Task::Where& where, ulong answerNs)
+{
+    auto& cpus = CpuTable::GetInstance();
+    ulong ask = cpus.GetRunningCpusNoLock() & ~(1UL << cpus.GetCurrentCpuId());
+    ulong asked = 0;
+    ulong silent = 0;
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (!(ask & (1UL << i)))
+            continue;
+
+        if (TaskProbes[i] == nullptr)
+            TaskProbes[i] = Mm::TAlloc<TaskProbe, TaskProbe::Tag>();
+
+        TaskProbe* probe = TaskProbes[i];
+        if (probe == nullptr)
+            continue;
+
+        if (probe->Pending)
+        {
+            if (probe->Ipi.Completion.GetCounter() != 0)
+            {
+                /* Still has not taken the one asked before */
+                silent |= 1UL << i;
+                continue;
+            }
+            probe->Pending = false;
+        }
+
+        probe->Want = task;
+        probe->Found = false;
+        probe->Pc = 0;
+        probe->Count = 0;
+        probe->Ipi.Completion.Add(1);
+        cpus.GetCpu(i).QueueIPITaskAsync(probe->Ipi);
+        asked |= 1UL << i;
+    }
+
+    const ulong deadline = GetBootTime().GetValue() + answerNs;
+    bool found = false;
+
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if (!(asked & (1UL << i)))
+            continue;
+
+        TaskProbe* probe = TaskProbes[i];
+        while (probe->Ipi.Completion.GetCounter() != 0 &&
+               GetBootTime().GetValue() < deadline)
+        {
+            Sleep(Const::NanoSecsInMs);
+        }
+
+        if (probe->Ipi.Completion.GetCounter() != 0)
+        {
+            probe->Pending = true;
+            silent |= 1UL << i;
+            continue;
+        }
+
+        if (probe->Found && !found)
+        {
+            found = true;
+            where.What = Task::Where::Running;
+            where.Cpu = i;
+            where.Pc = probe->Pc;
+            where.Count = probe->Count;
+            Stdlib::MemCpy(where.Frames, probe->Frames, probe->Count * sizeof(ulong));
+        }
+    }
+
+    if (found)
+        return true;
+
+    if (silent == 0)
+        return false;
+
+    where.What = Task::Where::Silent;
+    where.SilentCpus = silent;
+    return true;
+}
+
+bool Task::LocateSwitched(Where& where)
+{
+    if (StackPtr == nullptr)
+        return false;
+
+    /* A seqlock's read, with the task's own switches for the sequence: what
+       is read off its stack between the two looks is what its last switch
+       left there only if no switch in or out came between them. Switched
+       back in and still running, its State says so; switched in and out
+       again, its count does. The stack stays mapped through all of it --
+       the caller holds a reference, and Release frees it on the last -- and
+       a stale stack pointer or frame chain is kept inside it by the bounds,
+       so a look that loses the race names wrong frames and is thrown away,
+       and never faults. */
+    long switches = ContextSwitches.Get();
+    ulong base = (ulong)StackPtr;
+    ulong limit = (ulong)&StackPtr->StackTop[0];
+    ulong sp = __atomic_load_n(&Rsp, __ATOMIC_RELAXED);
+
+    size_t count = StackTrace::CaptureFrom(Hal::TaskSavedFramePointer(sp, base, limit),
+        base, limit, where.Frames, WhereFrames);
+
+    Hal::SmpRmb();
+    if (State.Get() != StateWaiting || ContextSwitches.Get() != switches)
+        return false;
+
+    where.What = Where::Switched;
+    where.Blocked = IsBlocked();
+    where.Asleep = where.Blocked && SleepUntil.Get() != 0;
+    where.Count = count;
+    return true;
+}
+
+void Task::LocateLocked(Where& where, ulong answerNs)
+{
+    where.What = Where::Unknown;
+    where.Blocked = false;
+    where.Asleep = false;
+    where.Cpu = 0;
+    where.Pc = 0;
+    where.SilentCpus = 0;
+    where.AnswerNs = answerNs;
+    where.Count = 0;
+
+    if (this == TryGetCurrentTask())
+    {
+        where.What = Where::Running;
+        where.Cpu = CpuTable::GetInstance().GetCurrentCpuId();
+        where.Count = StackTrace::Capture(where.Frames, WhereFrames);
+        return;
+    }
+
+    for (ulong attempt = 0; attempt < LocateAttempts; attempt++)
+    {
+        long state = State.Get();
+        if (state == StateExited)
+        {
+            where.What = Where::Exited;
+            return;
+        }
+
+        if (state == StateWaiting)
+        {
+            if (LocateSwitched(where))
+                return;
+        }
+        else if (state == StateRunning)
+        {
+            if (LocateRunning(this, where, answerNs))
+                return;
+        }
+        else
+        {
+            /* Not started */
+            return;
+        }
+    }
+}
+
+void Task::Locate(Where& where, ulong answerNs)
+{
+    Stdlib::AutoLock lock(LocateLock());
+    LocateLocked(where, answerNs);
+}
+
+void Task::Where::Describe(char* buf, size_t size)
+{
+    char pc[SymbolTable::DescribeMax];
+
+    switch (What)
+    {
+    case Exited:
+        Stdlib::SnPrintf(buf, size, "exited");
+        break;
+    case Switched:
+        Stdlib::SnPrintf(buf, size, "%s",
+            Asleep ? "asleep" : (Blocked ? "blocked" : "runnable, waiting for a cpu"));
+        break;
+    case Running:
+        if (Pc != 0 && SymbolTable::GetInstance().Describe(Pc, pc, sizeof(pc)))
+            Stdlib::SnPrintf(buf, size, "running on cpu %lu at %s", Cpu, pc);
+        else if (Pc != 0)
+            Stdlib::SnPrintf(buf, size, "running on cpu %lu at 0x%lX", Cpu, Pc);
+        else
+            Stdlib::SnPrintf(buf, size, "running on cpu %lu", Cpu);
+        break;
+    case Silent:
+        Stdlib::SnPrintf(buf, size, "on a cpu that would not answer: cpus 0x%lX took no interrupt in %lu ms",
+            SilentCpus, AnswerNs / Const::NanoSecsInMs);
+        break;
+    case Unknown:
+    default:
+        Stdlib::SnPrintf(buf, size, "not started, or never still long enough to be read");
+        break;
+    }
+}
+
+void Task::ReportJoin(ulong waitedNs)
+{
+    JoinReports.Inc();
+
+    Stdlib::AutoLock lock(LocateLock());
+
+    Where where;
+    LocateLocked(where, LocateAnswerNs);
+
+    char what[2 * SymbolTable::DescribeMax];
+    where.Describe(what, sizeof(what));
+
+    Task* waiter = TryGetCurrentTask();
+    Trace(0, "join: %s (pid %lu) has waited %lu ms for %s (pid %lu) to exit, and it is %s",
+        (waiter != nullptr) ? waiter->GetName() : "?",
+        (waiter != nullptr) ? waiter->Pid : InvalidObjectId,
+        waitedNs / Const::NanoSecsInMs, GetName(), Pid, what);
+
+    auto& symtab = SymbolTable::GetInstance();
+    char frame[SymbolTable::DescribeMax];
+    for (size_t i = 0; i < where.Count; i++)
+    {
+        if (symtab.DescribeReturn(where.Frames[i], frame, sizeof(frame)))
+            Trace(0, "join:   [%lu] 0x%lX %s", (ulong)i, where.Frames[i], frame);
+        else
+            Trace(0, "join:   [%lu] 0x%lX", (ulong)i, where.Frames[i]);
     }
 }
 

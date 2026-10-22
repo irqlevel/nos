@@ -659,6 +659,12 @@ void BpStartup(void* ctx)
             return;
         }
 
+        if (!Test::TestTaskLocate())
+        {
+            Panic("Task locate test failed");
+            return;
+        }
+
         rust_test();
 
         if (!SoftIrq::GetInstance().Init())
