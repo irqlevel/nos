@@ -3739,7 +3739,13 @@ someone else's; then speed.
    left: the xAPIC
    page's virtualization, and AMD's AVIC; device work off the first CPU's
    task, with a lock a device (~~the ring pages mapped once rather than at
-   every access~~ done, [Its memory](#its-memory)); nested leaves of 2
+   every access~~ done, [Its memory](#its-memory)) -- tried for a NIC, a
+   task of its own on its guest's spare thread, polling with the driver's
+   notifies off, and left out: for a guest of one CPU, the only kind its
+   own cores leave a thread for, whose interrupts come through the 8259
+   and take it out of its guest all the same, no faster -- `dd | nc` 2.7-2.8
+   s against 2.66, BusyBox's `httpd` 0.42-0.59 s against 0.21; guests with
+   MSI-X and a CPU to spare are where it could pay; nested leaves of 2
    MiB and 1 GiB, over guest memory taken in runs that size; the VMX
    preemption timer, which would take a computing guest out at its timer's
    edge without the host interrupt that does it now ([Time](#time));
