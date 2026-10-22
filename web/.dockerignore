@@ -1,0 +1,10 @@
+# The build context is web/: the build installs its own dependencies and makes
+# its own .next, and the deployment's secrets stay out of the image.
+node_modules
+.next
+out
+.env
+.env.*
+!.env.example
+npm-debug.log*
+.DS_Store

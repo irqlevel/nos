@@ -1,0 +1,68 @@
+# The nos website behind Caddy, which obtains and renews its TLS certificate
+# from Let's Encrypt by itself. Set DOMAIN and ACME_EMAIL in .env (copy
+# .env.example), point the domain's DNS at this server, open ports 80 and 443
+# (or HTTP_PORT and HTTPS_PORT, if .env moves them), then:
+#
+#   docker compose up -d --build
+#
+# Rebuild after a `git pull` to publish new posts and the current docs/.
+#
+# Or build elsewhere and ship it: scripts/release.sh --upload builds the image
+# tagged with the version (VERSION, or IMAGE_VERSION in .env) for the server's
+# platform, sends it over ssh with this file, the Caddyfile and .env -- the
+# version pinned in it -- and starts it there.
+
+name: nos-web
+
+services:
+  web:
+    build:
+      context: .
+      additional_contexts:
+        docs: ../docs
+      args:
+        SITE_URL: https://${DOMAIN:?set DOMAIN in .env}
+        GOOGLE_SITE_VERIFICATION: ${GOOGLE_SITE_VERIFICATION:-}
+        YANDEX_VERIFICATION: ${YANDEX_VERIFICATION:-}
+        VERSION: ${IMAGE_VERSION:-latest}
+        REVISION: ${REVISION:-}
+    # A release pins IMAGE_VERSION; a plain `docker compose up --build` makes :latest.
+    image: ${IMAGE_NAME:-nos-web}:${IMAGE_VERSION:-latest}
+    restart: unless-stopped
+    # Reached only through Caddy, on the compose network.
+    expose:
+      - "3000"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/.next/cache:mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2.11-alpine
+    restart: unless-stopped
+    # No depends_on: compose would stop Caddy whenever a release replaces the
+    # web container, and start it again only once the new one is healthy.
+    # Caddy holds requests while web is away instead (lb_try_duration).
+    # The host's side of each binding, from .env: a port, or address:port to bind
+    # one interface. Caddy itself stays on 80 and 443 in the container, so its
+    # redirects and its certificate are those of the public 80 and 443.
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The certificates and the ACME account: keep them, or every restart asks Let's Encrypt again.
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
