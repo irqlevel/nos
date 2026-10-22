@@ -24,7 +24,7 @@
 
 use alloc::vec::Vec;
 
-use crate::memory::GuestMemory;
+use crate::memory::{GuestMemory, Mapping};
 
 /// The legacy header, by offset in the BAR.
 const DEVICE_FEATURES: u16 = 0x00;
@@ -55,7 +55,7 @@ pub const LEGACY_DEVICE_BASE: u16 = 0x1000;
 const ISR_QUEUE: u8 = 1;
 /// A queue's used ring starts on this boundary, and its page frame number is
 /// in pages of this size.
-const QUEUE_ALIGN: u64 = 4096;
+const QUEUE_ALIGN: usize = 4096;
 const PFN_SHIFT: u32 = 12;
 
 /// Descriptor flags.
@@ -63,8 +63,8 @@ const DESC_NEXT: u16 = 1;
 const DESC_WRITE: u16 = 2;
 const DESC_INDIRECT: u16 = 4;
 /// A descriptor's size in the table, and a used element's.
-const DESC_SIZE: u64 = 16;
-const USED_ELEM_SIZE: u64 = 8;
+const DESC_SIZE: usize = 16;
+const USED_ELEM_SIZE: usize = 8;
 /// The available ring's flag: the driver wants no interrupt.
 const AVAIL_NO_INTERRUPT: u16 = 1;
 
@@ -88,6 +88,15 @@ impl Seg {
     pub fn at(&self, offset: u64) -> Option<u64> {
         if offset < u64::from(self.len) { self.addr.checked_add(offset) } else { None }
     }
+}
+
+/// What the driver has made available for a frame (`Queue::room_ahead`):
+/// enough, in so many chains; not yet; or not in as many as it may take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Room {
+    Enough(u16),
+    Wait,
+    Never,
 }
 
 /// A ring the driver made that the device will not follow.
@@ -114,53 +123,120 @@ pub struct Queue {
     /// The next available entry to take, and the next used one to fill.
     next_avail: u16,
     next_used: u16,
+    /// Its rings mapped into the host's space, from when the driver gives
+    /// their page frame number until it takes the queue down
+    /// (`GuestMemory::map`): read and written at every chain, where a copy
+    /// through the kernel's window maps and unmaps a page -- a TLB flush --
+    /// each time. None while the queue is down, and when no mapping was to
+    /// be had (`Maps`): the rings are copied as they always were then.
+    mapped: Option<Mapping>,
 }
 
 impl Queue {
     pub fn new(size: u16) -> Queue {
-        Queue { size, pfn: 0, next_avail: 0, next_used: 0 }
+        Queue { size, pfn: 0, next_avail: 0, next_used: 0, mapped: None }
     }
 
     fn reset(&mut self) {
         self.pfn = 0;
         self.next_avail = 0;
         self.next_used = 0;
+        self.mapped = None;
+    }
+
+    /// Set up by the driver at `pfn`: its rings mapped from there when `map`
+    /// says they may be, and when they are all in the guest's memory.
+    fn set_pfn(&mut self, pfn: u32, mem: &GuestMemory, map: bool) {
+        self.pfn = pfn;
+        self.next_avail = 0;
+        self.next_used = 0;
+        /* The old rings' mapping undone before a new one is made. */
+        self.mapped = None;
+        if map {
+            self.mapped = mem.map(self.base(), self.ring_bytes()).ok();
+        }
     }
 
     pub fn ready(&self) -> bool {
         self.pfn != 0
     }
 
-    fn desc_base(&self) -> u64 {
+
+    fn base(&self) -> u64 {
         u64::from(self.pfn) << PFN_SHIFT
     }
 
-    fn avail_base(&self) -> u64 {
-        self.desc_base() + DESC_SIZE * u64::from(self.size)
+    /// Where each ring is, in bytes from the descriptors: the available
+    /// ring right after them, the used ring on the next 4 KiB boundary past
+    /// the available one's flags, index, entries and used_event -- and the
+    /// used ring's end, past its avail_event.
+    fn avail_at(&self) -> usize {
+        DESC_SIZE * usize::from(self.size)
     }
 
-    fn used_base(&self) -> u64 {
-        /* flags, idx, the ring, used_event: 6 + 2 * size bytes */
-        let avail_end = self.avail_base() + 6 + 2 * u64::from(self.size);
-        (avail_end + QUEUE_ALIGN - 1) & !(QUEUE_ALIGN - 1)
+    fn used_at(&self) -> usize {
+        (self.avail_at() + 6 + 2 * usize::from(self.size)).next_multiple_of(QUEUE_ALIGN)
+    }
+
+    fn ring_bytes(&self) -> usize {
+        self.used_at() + 6 + USED_ELEM_SIZE * usize::from(self.size)
+    }
+
+    fn rings<'a>(&'a self, mem: &'a GuestMemory) -> Rings<'a> {
+        Rings { mapped: self.mapped.as_ref(), mem, base: self.base() }
     }
 
     /// The next chain the driver has made available: its head, its buffers
     /// onto `segs` (cleared first; its capacity is the queue's size, so
     /// nothing here allocates) -- or `Ok(None)` when there is none.
     pub fn pop(&mut self, mem: &GuestMemory, segs: &mut Vec<Seg>) -> Result<Option<u16>, Broken> {
-        segs.clear();
-        let avail = self.avail_base();
-        let avail_idx = read_u16(mem, avail + 2)?;
-        let waiting = avail_idx.wrapping_sub(self.next_avail);
-        if waiting == 0 {
+        if self.waiting(mem)? == 0 {
+            segs.clear();
             return Ok(None);
         }
+        let head = self.chain(mem, self.next_avail, segs)?;
+        self.next_avail = self.next_avail.wrapping_add(1);
+        Ok(Some(head))
+    }
+
+    /// How many chains the driver has made available and the device not
+    /// taken: never more than the queue holds.
+    fn waiting(&self, mem: &GuestMemory) -> Result<u16, Broken> {
+        let avail_idx = self.rings(mem).word(self.avail_at() + 2)?;
+        let waiting = avail_idx.wrapping_sub(self.next_avail);
         if waiting > self.size {
             return Err(Broken::Overrun);
         }
-        let slot = u64::from(self.next_avail % self.size);
-        let head = read_u16(mem, avail + 4 + 2 * slot)?;
+        Ok(waiting)
+    }
+
+    /// Whether the chains made available, from the next one on and `most`
+    /// of them at most, have writable buffers enough for `need` bytes, with
+    /// nothing taken: for a frame spread over as many as it needs (mergeable
+    /// receive buffers), which goes in whole, waits for more, or -- `most`
+    /// of them falling short -- never goes. `most` bounds the walk too, which
+    /// a guest's chains of no room would otherwise make the whole ring's at
+    /// every look. `segs` is scratch.
+    pub fn room_ahead(&self, mem: &GuestMemory, need: u64, most: u16, segs: &mut Vec<Seg>) -> Result<Room, Broken> {
+        let waiting = self.waiting(mem)?;
+        let mut room = 0u64;
+        for k in 0..waiting.min(most) {
+            self.chain(mem, self.next_avail.wrapping_add(k), segs)?;
+            room += segs.iter().filter(|s| s.write).map(|s| u64::from(s.len)).sum::<u64>();
+            if room >= need {
+                return Ok(Room::Enough(k + 1));
+            }
+        }
+        Ok(if waiting >= most { Room::Never } else { Room::Wait })
+    }
+
+    /// The chain whose head is in the available ring's entry `position`, its
+    /// buffers onto `segs` (cleared first): its head.
+    fn chain(&self, mem: &GuestMemory, position: u16, segs: &mut Vec<Seg>) -> Result<u16, Broken> {
+        segs.clear();
+        let rings = self.rings(mem);
+        let slot = usize::from(position % self.size);
+        let head = rings.half(self.avail_at() + 4 + 2 * slot)?;
 
         let mut index = head;
         loop {
@@ -170,12 +246,10 @@ impl Queue {
             if segs.len() >= usize::from(self.size) {
                 return Err(Broken::Loop);
             }
-            let mut d = [0u8; DESC_SIZE as usize];
-            mem.read(self.desc_base() + DESC_SIZE * u64::from(index), &mut d).map_err(|_| Broken::Memory)?;
-            let addr = u64::from_le_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]]);
-            let len = u32::from_le_bytes([d[8], d[9], d[10], d[11]]);
-            let flags = u16::from_le_bytes([d[12], d[13]]);
-            let next = u16::from_le_bytes([d[14], d[15]]);
+            let (addr, rest) = rings.desc(DESC_SIZE * usize::from(index))?;
+            let len = rest as u32;
+            let flags = (rest >> 32) as u16;
+            let next = (rest >> 48) as u16;
             if flags & DESC_INDIRECT != 0 {
                 return Err(Broken::Indirect);
             }
@@ -186,28 +260,106 @@ impl Queue {
             }
             index = next;
         }
-        self.next_avail = self.next_avail.wrapping_add(1);
-        Ok(Some(head))
+        Ok(head)
     }
 
     /// Give the chain at `head` back, `len` bytes of it written by the
     /// device: the element first, then the index that publishes it -- a
-    /// store of the whole word, after the element, which the driver reads
-    /// on another CPU while it runs (`GuestMemory::write_u16`).
+    /// store of the whole word, with release order, after the element, which
+    /// the driver reads on another CPU while it runs.
     pub fn push(&mut self, mem: &GuestMemory, head: u16, len: u32) -> Result<(), Broken> {
-        let used = self.used_base();
-        let slot = u64::from(self.next_used % self.size);
-        let mut elem = [0u8; USED_ELEM_SIZE as usize];
-        elem[..4].copy_from_slice(&u32::from(head).to_le_bytes());
-        elem[4..].copy_from_slice(&len.to_le_bytes());
-        mem.write(used + 4 + USED_ELEM_SIZE * slot, &elem).map_err(|_| Broken::Memory)?;
-        self.next_used = self.next_used.wrapping_add(1);
-        mem.write_u16(used + 2, self.next_used).map_err(|_| Broken::Memory)
+        let used = self.used_at();
+        let elem = used + 4 + USED_ELEM_SIZE * usize::from(self.next_used % self.size);
+        let next = self.next_used.wrapping_add(1);
+        let rings = self.rings(mem);
+        rings.put_u32(elem, u32::from(head))?;
+        rings.put_u32(elem + 4, len)?;
+        let published = rings.put_word(used + 2, next);
+        self.next_used = next;
+        published
     }
 
-    /// Whether the driver wants an interrupt for what was given back.
+    /// Whether the driver wants an interrupt for what was given back -- read
+    /// after a full fence. The driver turns interrupts back on and then
+    /// looks for what came meanwhile; without the fence, the device's load
+    /// of its flag can pass its own store of the used index, still in the
+    /// CPU's store buffer, and each sees the other's old value: the driver
+    /// waits for an interrupt the device decided not to send. A copy through
+    /// the kernel's window fenced it by accident -- the unmap's INVLPG is a
+    /// serializing instruction -- which the mapped rings do not.
     pub fn wants_interrupt(&self, mem: &GuestMemory) -> bool {
-        read_u16(mem, self.avail_base()).map_or(true, |flags| flags & AVAIL_NO_INTERRUPT == 0)
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.rings(mem).word(self.avail_at()).map_or(true, |flags| flags & AVAIL_NO_INTERRUPT == 0)
+    }
+}
+
+/// A queue's rings, as the device reaches them: mapped when they are, and
+/// copied through the kernel's window from `base` when not. Every value
+/// read is the guest's to have written anything into, and is checked by
+/// whoever reads it.
+struct Rings<'a> {
+    mapped: Option<&'a Mapping>,
+    mem: &'a GuestMemory,
+    base: u64,
+}
+
+impl Rings<'_> {
+    fn gpa(&self, at: usize) -> u64 {
+        self.base + at as u64
+    }
+
+    /// A word of a ring, read whole with acquire order: an index or the
+    /// flags, which the driver stores on another CPU while the device reads
+    /// -- a copy of its two bytes could take one from either side of that
+    /// store, and an index read so, 0x01FF for 0x0100, is a ring that looks
+    /// overrun -- and what it published before the word, there after it.
+    fn word(&self, at: usize) -> Result<u16, Broken> {
+        match self.mapped {
+            Some(m) => m.load_u16(at).ok_or(Broken::Memory),
+            None => self.mem.read_u16(self.gpa(at)).map_err(|_| Broken::Memory),
+        }
+    }
+
+    /// A word of a ring that no other word published: an entry of the
+    /// available ring.
+    fn half(&self, at: usize) -> Result<u16, Broken> {
+        match self.mapped {
+            Some(m) => m.load::<u16>(at).ok_or(Broken::Memory),
+            None => self.mem.read_u16(self.gpa(at)).map_err(|_| Broken::Memory),
+        }
+    }
+
+    /// The descriptor at `at`: its address, and the eight bytes after --
+    /// length, flags and next, low to high.
+    fn desc(&self, at: usize) -> Result<(u64, u64), Broken> {
+        match self.mapped {
+            Some(m) => Ok((m.load::<u64>(at).ok_or(Broken::Memory)?, m.load::<u64>(at + 8).ok_or(Broken::Memory)?)),
+            None => {
+                let mut d = [0u8; DESC_SIZE];
+                self.mem.read(self.gpa(at), &mut d).map_err(|_| Broken::Memory)?;
+                let word = |i: usize| u64::from_le_bytes([d[i], d[i + 1], d[i + 2], d[i + 3], d[i + 4], d[i + 5], d[i + 6], d[i + 7]]);
+                Ok((word(0), word(8)))
+            }
+        }
+    }
+
+    fn put_u32(&self, at: usize, value: u32) -> Result<(), Broken> {
+        let done = match self.mapped {
+            Some(m) => m.store::<u32>(at, value),
+            None => self.mem.write(self.gpa(at), &value.to_le_bytes()).is_ok(),
+        };
+        if done { Ok(()) } else { Err(Broken::Memory) }
+    }
+
+    /// A word stored whole, with release order: what was written before it
+    /// is there before it, for a driver on another CPU that reads the word
+    /// and then what it publishes.
+    fn put_word(&self, at: usize, value: u16) -> Result<(), Broken> {
+        let done = match self.mapped {
+            Some(m) => m.store_u16(at, value),
+            None => self.mem.write_u16(self.gpa(at), value).is_ok(),
+        };
+        if done { Ok(()) } else { Err(Broken::Memory) }
     }
 }
 
@@ -227,13 +379,6 @@ fn get32(h: &[u8], at: u16) -> u32 {
     u32::from_le_bytes([h[at], h[at + 1], h[at + 2], h[at + 3]])
 }
 
-/// A word of a ring, read whole: an index or the flags, which the driver
-/// stores on another CPU while the device reads -- a copy of its two bytes
-/// could take one from either side of that store, and an index read so,
-/// 0x01FF for 0x0100, is a ring that looks overrun.
-fn read_u16(mem: &GuestMemory, gpa: u64) -> Result<u16, Broken> {
-    mem.read_u16(gpa).map_err(|_| Broken::Memory)
-}
 
 /// The interrupts a device has for the driver once it has given buffers
 /// back: the INTx line to raise -- an edge, the interrupt status having been
@@ -272,6 +417,41 @@ pub enum Asked {
     Reset,
 }
 
+/// How many queues' rings a device may map (`Queue::mapped`): a burst of
+/// them, then one a second. Each mapping undone is its address shot down on
+/// every host CPU -- an interrupt each, other guests' CPUs among them -- and
+/// a guest that set its queues up over and over could have them all do so
+/// at the price of an exit each. Past the budget a queue's rings are copied,
+/// as they were before rings were mapped, the guest's own device the slower
+/// for it. A driver sets its queues up once a boot; a reset takes none back.
+struct Maps {
+    left: u32,
+    at: u64,
+}
+
+const MAPS_BURST: u32 = 8;
+const MAPS_EVERY_NS: u64 = 1_000_000_000;
+
+impl Maps {
+    fn new() -> Maps {
+        Maps { left: MAPS_BURST, at: 0 }
+    }
+
+    /// Whether a queue set up at `now` may have its rings mapped.
+    fn take(&mut self, now: u64) -> bool {
+        let earned = now.saturating_sub(self.at) / MAPS_EVERY_NS;
+        if earned != 0 {
+            self.left = earned.saturating_add(u64::from(self.left)).min(u64::from(MAPS_BURST)) as u32;
+            self.at = now;
+        }
+        if self.left == 0 {
+            return false;
+        }
+        self.left -= 1;
+        true
+    }
+}
+
 /// The legacy header's state.
 pub struct Transport {
     device_features: u32,
@@ -281,13 +461,21 @@ pub struct Transport {
     select: u16,
     queues: Vec<Queue>,
     msix: Option<Msix>,
+    maps: Maps,
 }
 
 impl Transport {
     /// A device offering `features`, with `queues` (the capacity already
     /// taken) of the sizes it wants.
     pub fn new(device_features: u32, queues: Vec<Queue>) -> Transport {
-        Transport { device_features, driver_features: 0, status: 0, isr: 0, select: 0, queues, msix: None }
+        Transport { device_features, driver_features: 0, status: 0, isr: 0, select: 0, queues, msix: None, maps: Maps::new() }
+    }
+
+    /// The features offered, before a driver has read them: what the
+    /// device is, for a guest's next boot.
+    pub fn set_device_features(&mut self, features: u32) {
+        self.device_features = features;
+        self.driver_features &= features;
     }
 
     /// Offer MSI-X, with a table of `entries`: every source's vector starts
@@ -327,6 +515,13 @@ impl Transport {
 
     pub fn driver_features(&self) -> u32 {
         self.driver_features
+    }
+
+    /// Whether a queue that is up has its rings copied, no mapping having
+    /// been had for them (`Maps`, `GuestMemory::map`): for a report, since
+    /// nothing else says the device is the slower for it.
+    pub fn rings_copied(&self) -> bool {
+        self.queues.iter().any(|q| q.ready() && q.mapped.is_none())
     }
 
     pub fn queue(&mut self, index: u16) -> Option<&mut Queue> {
@@ -392,8 +587,9 @@ impl Transport {
         v
     }
 
-    /// A write of `size` bytes at `offset` in the header.
-    pub fn write(&mut self, offset: u16, size: u8, value: u32) -> Asked {
+    /// A write of `size` bytes at `offset` in the header, at `now`: a queue
+    /// set up has its rings mapped in `mem` (`Queue::mapped`).
+    pub fn write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory, now: u64) -> Asked {
         let mut h = self.header();
         let end = usize::from(self.config_offset());
         for i in 0..u16::from(size) {
@@ -417,9 +613,8 @@ impl Transport {
                 if pfn == 0 {
                     q.reset();
                 } else {
-                    q.pfn = pfn;
-                    q.next_avail = 0;
-                    q.next_used = 0;
+                    let map = self.maps.take(now);
+                    q.set_pfn(pfn, mem, map);
                 }
             }
         }

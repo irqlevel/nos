@@ -85,6 +85,7 @@ void PitInterruptStub() {}
 void HpetInterruptStub() {}
 void IPInterruptStub() {}
 void LapicTimerInterruptStub() {}
+void PostedInterruptStub() {}
 void VirtioNetInterruptStub() {}
 void VirtioScsiInterruptStub() {}
 void SharedInterruptStub() {}

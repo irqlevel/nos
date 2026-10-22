@@ -105,7 +105,9 @@ Two independent gates:
 
 Involuntary preemption comes from the per-CPU timer tick — the local APIC
 timer on x86-64, the generic timer on arm64, both at 100 Hz — whose handler
-ends in `Preempt()`. So does the IPI handler, which is what makes an IPI a
+ends in `Preempt()`. The timer is one-shot, armed for the next tick or
+sooner for a task asleep until a deadline ([The local
+timer](#the-local-timer)); an interrupt for a deadline only reschedules. So does the IPI handler, which is what makes an IPI a
 reschedule request. Voluntary preemption is a direct `Schedule()` call.
 
 The two differ in one case: when nothing but the idle task could take the
@@ -176,9 +178,10 @@ receive path from 397 silences in 5 seconds to none (see
 `Block()`s, interrupts off as below, and nobody wakes it: the scheduler's walk
 on its CPU (`SelectNext`) treats a blocked task whose deadline has passed as
 runnable, and the task clears the flag itself once it runs. The walk runs at
-every scheduling point the CPU has -- the tick, 100 times a second, at the
-latest -- so a sleep ends at the first of them after its deadline, which is
-where it ended before, when `Sleep` was a loop around `Schedule()` that
+every scheduling point the CPU has, and its timer makes one at the deadline
+([The local timer](#the-local-timer)), so a sleep ends there. It used to end
+at the first tick after its deadline -- a sleep of a millisecond took ten --
+which is where it ended when `Sleep` was a loop around `Schedule()` that
 checked the clock each time it got the CPU back. That loop kept the task
 runnable: alone on its CPU it let the idle task halt it until the tick, but
 two sleepers on one CPU handed it to each other without end and the idle task
@@ -226,8 +229,9 @@ and never to the idle task, returning at once when there is none. A plain spin
 is no better than the yield: it keeps whatever else is runnable on the CPU off
 it until the tick -- a softirq task the tick preempted mid-handler included,
 with its type's work held up on every CPU meanwhile. `Sleep()` is not for
-waiting on work either: it ends at a scheduling point after its deadline, so
-on a CPU with nothing else to do a sleep shorter than a tick costs a tick.
+waiting on work either: it ends at its deadline, which the work may come long
+before; block on the work, with `Event::WaitFor` when there is a deadline as
+well.
 
 `SoftIrq::Run` is the worked example, and it also shows the one case where
 "the task is already running" is true and useless: between `Block()` and the
@@ -248,6 +252,61 @@ next edge or a frame, whichever comes first.
 The netblk module's worker sleeps on one. A CPU's idle task must never block,
 on an event or otherwise: it is the scheduler's last resort, and a task
 exiting on a CPU whose idle task is blocked has nothing to switch to.
+
+## The local timer
+
+Each CPU's timer -- the local APIC's on x86-64, the generic timer's CNTV on
+arm64 -- is one-shot (`Cpu::LocalTimer*`, `hal/timer.h`). It is armed for
+the earlier of two things: the CPU's next tick, on a 100 Hz grid that the
+tick keeps however the interrupts in between fall, and the soonest deadline
+of a task asleep on the CPU until one -- `Sleep()`, `Event::WaitFor()`. An
+interrupt at the tick does the tick's work, as the periodic timer's did; one
+before it only reschedules, and the walk that follows runs the sleeper whose
+time has come.
+
+Who arms it for what:
+
+- A task blocking until a deadline brings its CPU's timer forward to it, in
+  the `Schedule()` that switches it out (`TaskQueue::WakeSleepers`), with
+  interrupts off and the queue's lock held: a write of the local APIC's
+  initial count, or of CNTV's compare value, when the deadline is sooner
+  than what the timer has.
+- The interrupt re-arms it for the tick only, and leaves a flag; the next
+  `Schedule()` on the CPU -- the `Preempt()` at the end of the same handler,
+  as a rule -- walks its queue for the soonest deadline left and brings the
+  timer forward to it. The walk is under the queue lock `Schedule()` holds
+  anyway, so the interrupt takes no lock of its own -- one taken there would
+  spin, interrupts off, on a CPU whose queue another holds, and a stuck one
+  would stop that CPU's tick and with it the watchdog that reports it.
+- A task asleep until a deadline is not moved to another CPU at its
+  switch-out (`SwitchComplete`): only its own CPU's timer is armed for it.
+  It moves, if it should, once it runs.
+- A panic re-arms the tick and nothing else: the queue's lock may be the
+  panicking CPU's.
+
+So every task asleep on a CPU has that CPU's timer armed at or before its
+deadline, but in the moment between an interrupt and the walk after it --
+and the walk is what `Preempt()` does, or the `PreemptEnable()` that makes a
+reschedule the interrupt found deferred. An interrupt for a deadline that a
+`Signal()` already answered finds nothing to run and costs a reschedule.
+
+`TestSleepPrompt`, at every boot on every CPU, has a task of its own sleep a
+millisecond at a time while the CPU's idle task halts between interrupts --
+not polling the clock, which would wake the sleeper on time whatever the
+timer did -- and fails the boot if the median sleep is over 5 ms. Measured:
+1.007-1.07 ms under HVF, 1.1-2.4 ms under TCG; with the arming taken out,
+10.0 ms on both architectures. The median, because a TCG host that stalls a
+vCPU now and then puts a sleep or two at 15-50 ms. On the EX44 a guest's
+`usleep 1000`, its vCPU halted between, took 10 ms before.
+
+Everything that polls with a short sleep now polls at the rate it asked for:
+the USB poll at 4 ms instead of the tick's 10, netconsole's idle poll at 2,
+an ARP wait at 1 -- shorter waits, and more wakeups. TCP's blocking calls --
+connect, accept, send and recv, which nothing signals -- polled at 1 ms
+too, and on the EX44 an idle nos with sshd up and two sessions open woke
+2,220 times a second, 1.2% busy over its 20 CPUs; they back off now, 1 ms
+doubling to 10 (`Poll` in `net/src/tcp.rs`), and the same nos woke 741 times
+a second, 0.4% busy, most of it the USB poll.
 
 ## Load balancing
 

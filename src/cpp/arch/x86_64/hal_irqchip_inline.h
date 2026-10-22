@@ -13,6 +13,13 @@ namespace Hal
 /* IPI vector: IDT slot on x86, SGI INTID on arm64 */
 constexpr u8 IpiVector = 0xFE;
 
+/* The vector a vCPU running a guest is sent to hand it an interrupt posted
+   for it (VT-x's posted interrupts, hvarch): taken by the CPU in its guest
+   without an exit, and in the host -- the guest just left -- an EOI and
+   nothing more (PostedInterrupt). Above every device's and below the
+   timer's. */
+constexpr u8 PostedVector = 0xFC;
+
 /* True once the LAPIC MMIO is discovered: cpu-id reads and IPIs are safe */
 static inline __attribute__((always_inline)) bool IrqChipReady()
 {

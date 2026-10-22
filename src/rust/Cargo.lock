@@ -401,6 +401,7 @@ version = "0.1.0"
 dependencies = [
  "hvarch",
  "kcore",
+ "netwire",
 ]
 
 [[package]]

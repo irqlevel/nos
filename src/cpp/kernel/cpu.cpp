@@ -9,6 +9,7 @@
 
 #include <hal/irqchip.h>
 #include <hal/mmu.h>
+#include <hal/timer.h>
 
 #include <kernel/time.h>
 #include <mm/new.h>
@@ -40,6 +41,10 @@ Cpu::Cpu()
     , State(0)
     , IdleTaskPtr(nullptr)
     , IPITasksClosed(false)
+    , TimerOneShot(false)
+    , TickDue(0)
+    , TimerArmedAt(~0UL)
+    , TimerWalk(false)
 {
     IPITaskList.Init();
 }
@@ -509,19 +514,117 @@ void Cpu::IPI(Context* ctx)
     Preempt();
 }
 
-/* This CPU's own periodic tick. One interrupt per CPU delivered by its own
-   local APIC, instead of one interrupt on one CPU followed by an IPI to
-   every other -- which cost a fan of ICR writes per tick and, worse, made
-   the machine's entire sense of time depend on one CPU still answering
+/* The local timer, one-shot. It used to tick periodically and nothing else,
+   and a task asleep until a deadline -- Sleep(), Event::WaitFor() -- ran at
+   the first tick after it: a halted guest's vCPU waits for its guest's next
+   timer edge that way, and a guest's `usleep 1000` took 10 ms on the EX44.
+   Now the timer fires at the earlier of the next tick and the soonest such
+   deadline on this CPU, and the scheduler's walk that follows runs the
+   sleeper. The tick keeps its grid and its work; a deadline's interrupt only
+   reschedules. */
+void Cpu::LocalTimerStart()
+{
+    ulong flags = Hal::IrqSave();
+    ulong now = GetBootTime().GetValue();
+
+    TimerOneShot = true;
+    TickDue = now + TickPeriodNs;
+    LocalTimerArm(TickDue, now);
+
+    Hal::IrqRestore(flags);
+}
+
+void Cpu::LocalTimerArm(ulong when, ulong now)
+{
+    ulong delta = (when > now) ? when - now : 0;
+
+    /* Never further than a tick and its slack, whatever `when` says: a
+       clock that stepped back would otherwise leave the CPU without a tick. */
+    delta = Stdlib::Max(delta, TimerMinNs);
+    delta = Stdlib::Min(delta, TickPeriodNs + TickSlackNs);
+
+    TimerArmedAt = now + delta;
+    Hal::LocalTimerArm(delta);
+}
+
+bool Cpu::LocalTimerFired(ulong now)
+{
+    if (!TimerOneShot)
+        return true;
+
+    bool tick = (now + TickSlackNs >= TickDue);
+    if (tick)
+    {
+        /* On the grid; a tick missed -- interrupts off a long while -- is
+           not made up, the next one a period from now */
+        TickDue += TickPeriodNs;
+        if (TickDue <= now)
+            TickDue = now + TickPeriodNs;
+    }
+
+    /* The tick, for now: a sleeper's deadline sooner than it is brought
+       forward by the walk the reschedule after this makes, under the queue
+       lock it takes anyway (TaskQueue::Schedule) -- not from here, with
+       interrupts off and whatever this CPU was doing interrupted. */
+    LocalTimerArm(TickDue, now);
+    TimerWalk = true;
+
+    return tick;
+}
+
+bool Cpu::LocalTimerTakeWalk()
+{
+    bool walk = TimerWalk;
+    TimerWalk = false;
+    return walk;
+}
+
+void Cpu::LocalTimerWake(ulong deadline)
+{
+    if (!TimerOneShot || deadline == 0 || deadline >= TimerArmedAt)
+        return;
+
+    LocalTimerArm(deadline, GetBootTime().GetValue());
+}
+
+void Cpu::LocalTimerTick()
+{
+    if (!TimerOneShot)
+        return;
+
+    ulong now = GetBootTime().GetValue();
+    if (TickDue <= now)
+        TickDue = now + TickPeriodNs;
+    LocalTimerArm(TickDue, now);
+}
+
+/* This CPU's own tick. One interrupt per CPU delivered by its own local
+   APIC, instead of one interrupt on one CPU followed by an IPI to every
+   other -- which cost a fan of ICR writes per tick and, worse, made the
+   machine's entire sense of time depend on one CPU still answering
    interrupts. A CPU that wedges now stops only its own tick, and the others
-   go on ticking and notice. */
+   go on ticking and notice. One-shot, and also for a sleeper's deadline
+   (LocalTimerStart): such an interrupt only reschedules. */
 void Cpu::TimerTick(Context* ctx)
 {
     if (Panicker::GetInstance().IsActive())
     {
+        /* Ticking on, as the periodic timer did, without the walk: the
+           queue's lock may be the panicking CPU's */
+        LocalTimerTick();
         Hal::IrqEoi(CpuTable::TimerVector);
         return;
     }
+
+    if (!LocalTimerFired(GetBootTime().GetValue()))
+    {
+        InterruptStats::Inc(IrqTimerWake);
+        Hal::IrqEoi(CpuTable::TimerVector);
+        Preempt();
+        return;
+    }
+
+    InterruptStats::Inc(IrqLapicTimer);
 
     Watchdog::GetInstance().Check();
 
@@ -631,9 +734,18 @@ extern "C" void IPInterrupt(Context* ctx)
     cpu.IPI(ctx);
 }
 
+/* A posted interrupt's notification that found its vCPU out of its guest
+   (Hal::PostedVector): the vCPU folds what was posted for it into its APIC
+   before it next enters, so there is nothing to do but end the interrupt. */
+extern "C" void PostedInterrupt(Context* ctx)
+{
+    (void)ctx;
+    InterruptStats::Inc(IrqPosted);
+    Hal::IrqEoi(Hal::PostedVector);
+}
+
 extern "C" void LapicTimerInterrupt(Context* ctx)
 {
-    InterruptStats::Inc(IrqLapicTimer);
     auto& cpu = CpuTable::GetInstance().GetCurrentCpu();
     cpu.TimerTick(ctx);
 }
