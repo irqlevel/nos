@@ -28,6 +28,12 @@ pub trait Backend: Send {
     /// The next frame for the guest, into `buf` (`MAX_FRAME` bytes): its
     /// length, or None when there is none.
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize>;
+    /// Until `until_ns` on the boot clock, a frame for the guest need not
+    /// wake the CPU that does the device's work: the device looks for what
+    /// came by then on its own (`Net::rx_due`), its receive interrupts held
+    /// till then anyway (`Net::set_rx_moderation`). Nothing to do for a
+    /// backend that wakes nobody.
+    fn quiet_until(&mut self, _until_ns: u64) {}
 }
 
 /// Virtio's type for a network device.
@@ -91,6 +97,13 @@ pub struct Net {
     /// A transmit pass ended at its bound, with chains perhaps still on the
     /// ring: the next round of the devices goes on with them.
     tx_more: bool,
+    /// Receive interrupts, moderated (`set_rx_moderation`): no closer than
+    /// this after the last -- 0, each at once; the next allowed at
+    /// `rx_quiet_until`; and frames delivered since the last with none
+    /// raised for them yet, owed one then.
+    rx_quiet_ns: u64,
+    rx_quiet_until: u64,
+    rx_owed: bool,
     broken: Option<Broken>,
     pub stats: Stats,
 }
@@ -118,6 +131,9 @@ impl Net {
             rx_buf,
             held: None,
             tx_more: false,
+            rx_quiet_ns: 0,
+            rx_quiet_until: 0,
+            rx_owed: false,
             broken: None,
             stats: Stats::default(),
         })
@@ -136,6 +152,27 @@ impl Net {
 
     pub fn broken(&self) -> Option<Broken> {
         self.broken
+    }
+
+    /// Receive interrupts no closer than `ns` apart -- 0, as each frame
+    /// comes -- as a real NIC's interrupt throttling has them. What arrives
+    /// goes into the guest's buffers at once; its interrupt waits until the
+    /// time since the last is up, and then one takes all that came. A frame
+    /// after a quiet spell is interrupted for at once. Without it a guest
+    /// that drains its ring faster than frames come takes an interrupt for
+    /// every frame and acknowledges every one or two: two guests sending
+    /// TCP through the switch exchanged five times the ACKs they did when
+    /// halt polling held frames back by accident (docs/hypervisor.md).
+    pub fn set_rx_moderation(&mut self, ns: u64) {
+        self.rx_quiet_ns = ns;
+    }
+
+    /// When the device must be looked at again by its own round, if it is
+    /// to keep what it promised its backend (`Backend::quiet_until`): the
+    /// interrupt owed for what it delivered, and frames that came meanwhile
+    /// and woke nobody. None when nothing is promised past `now`.
+    pub fn rx_due(&self, now: u64) -> Option<u64> {
+        (self.rx_quiet_until > now || self.rx_owed).then_some(self.rx_quiet_until)
     }
 
     fn config(&self) -> [u8; CFG_BYTES] {
@@ -176,20 +213,21 @@ impl Net {
         v
     }
 
-    /// A write of `size` bytes at `offset` in the BAR, and the interrupts it
-    /// leaves the device with.
-    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory) -> Raise {
+    /// A write of `size` bytes at `offset` in the BAR, at `now`, and the
+    /// interrupts it leaves the device with.
+    pub fn io_write(&mut self, offset: u16, size: u8, value: u32, mem: &GuestMemory, now: u64) -> Raise {
         if offset >= self.transport.config_offset() {
             return Raise::default();
         }
         match self.transport.write(offset, size, value) {
             Asked::Notify(TX_QUEUE) => self.send(mem),
             /* Buffers posted for receiving: whatever is waiting can go. */
-            Asked::Notify(RX_QUEUE) => self.deliver(mem),
+            Asked::Notify(RX_QUEUE) => self.deliver(mem, now),
             Asked::Reset => {
                 self.broken = None;
                 self.held = None;
                 self.tx_more = false;
+                self.rx_owed = false;
                 Raise::default()
             }
             _ => Raise::default(),
@@ -262,19 +300,25 @@ impl Net {
         self.stats.sent += 1;
     }
 
-    /// A round of the device, each time round the run loop: what a transmit
-    /// pass left at its bound sent, and what the backend has for the guest
-    /// delivered -- and the interrupts that leaves the device with.
-    pub fn poll(&mut self, mem: &GuestMemory) -> Raise {
+    /// A round of the device at `now`, each time round the run loop: what a
+    /// transmit pass left at its bound sent, and what the backend has for
+    /// the guest delivered -- and the interrupts that leaves the device
+    /// with, a receive interrupt owed among them once its time is up.
+    pub fn poll(&mut self, mem: &GuestMemory, now: u64) -> Raise {
         let sent = if self.tx_more { self.send(mem) } else { Raise::default() };
-        sent.or(self.deliver(mem))
+        sent.or(self.deliver(mem, now))
     }
 
     /// What the backend has for the guest, into the buffers the driver has
     /// posted -- a pass's worth -- and the interrupts that leaves the device
-    /// with. What is left waits with the backend for the next round.
-    fn deliver(&mut self, mem: &GuestMemory) -> Raise {
+    /// with at `now`. What is left waits with the backend for the next round.
+    fn deliver(&mut self, mem: &GuestMemory, now: u64) -> Raise {
         if self.broken.is_some() || !self.transport.queue(RX_QUEUE).map_or(false, |q| q.ready()) {
+            /* A queue taken down, or a ring the device stopped following,
+             * is owed nothing: kept owing, it would be due for good, and
+             * the round that looks at it run without a pause (hv-fuzz
+             * found it). */
+            self.rx_owed = false;
             return Raise::default();
         }
         let mut delivered = false;
@@ -316,8 +360,30 @@ impl Net {
                 }
             }
         }
-        let wants = delivered && self.transport.queue(RX_QUEUE).map_or(false, |q| q.wants_interrupt(mem));
-        if wants { self.transport.interrupt(RX_QUEUE) } else { Raise::default() }
+        if delivered {
+            self.rx_owed = true;
+        }
+        self.rx_interrupt(mem, now)
+    }
+
+    /// The receive interrupt owed for what was delivered, if its time is up
+    /// at `now` -- and the next not before `rx_quiet_ns` from now, frames
+    /// for the guest until then waking nobody (`Backend::quiet_until`): the
+    /// device's round comes for them by then (`rx_due`). One the driver has
+    /// said it does not want -- it is taking them already -- is not owed.
+    fn rx_interrupt(&mut self, mem: &GuestMemory, now: u64) -> Raise {
+        if !self.rx_owed || now < self.rx_quiet_until {
+            return Raise::default();
+        }
+        self.rx_owed = false;
+        if !self.transport.queue(RX_QUEUE).map_or(false, |q| q.wants_interrupt(mem)) {
+            return Raise::default();
+        }
+        if self.rx_quiet_ns != 0 {
+            self.rx_quiet_until = now.saturating_add(self.rx_quiet_ns);
+            self.backend.quiet_until(self.rx_quiet_until);
+        }
+        self.transport.interrupt(RX_QUEUE)
     }
 
     /// The header and the frame, as they lie in `rx_buf`, into the chain's

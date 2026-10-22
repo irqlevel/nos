@@ -448,7 +448,9 @@ hardware, PCI configuration space, the local APIC through its MSRs and its
 page, the IO-APIC, MSIs, a virtio disk and NIC driven through rings well
 made and not -- and raced: another of the guest's CPUs topping a ring up
 by plain writes while the device takes from it, as nothing on the host can
-stop it doing -- the page walker over random page tables, the decoder, the
+stop it doing; the NIC with its receive interrupts held apart, the clock
+moved on between rounds, and held after each to owing none it should have
+raised (`rx_due`) -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
 `place` holds where guests are put on the host's cores (`hv/src/place.rs`)
@@ -489,7 +491,8 @@ sending each other frames of every kind -- as themselves and as each other
 guest's bursts among them, past its share of `hv0`'s backlog (the backlog
 over the ports in use, counted afresh at each of the stack's passes) and
 past its rate to every port, the clock moved on now and then for the rate
-to come back; `nat`,
+to come back, and ports whose NIC holds its receive interrupts, a frame for
+which wakes nobody while the inbox is under half full; `nat`,
 guests' packets out into the world and the world's answers back, each
 rewrite checked field by field and its sums summed from scratch; and
 `guestnet`, the two as the module wires them, guests on the switch reaching
