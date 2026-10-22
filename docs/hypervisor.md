@@ -616,8 +616,8 @@ Two rules make it the one place that decides what a guest can reach:
   then one a second (`virtio::Maps`): a guest that set its queues up over
   and over would otherwise have every CPU of the host interrupted at will,
   and past the budget its rings are copied, as before, and the report
-  says so. On the EX44, between two guests of two CPUs: `dd | nc` 4.15 s
-  where it took 2.72, and 4.45 where it took 2.83 with the offloads, five
+  says so. On the EX44, between two guests of two CPUs: `dd | nc` 2.72 s
+  where it took 4.15, and 2.83 where it took 4.45 with the offloads, five
   runs of each; BusyBox's `httpd` serving 100 MB five times over 0.29 s
   where it took 0.47 -- 1.8 GB/s -- and 0.62 where it took 1.63-1.68
   without the offloads. A dozen pages mapped and flushed a frame had been
