@@ -118,6 +118,40 @@ export default async function Home({ params }: Props) {
                 </div>
             </section>
 
+            <Section id="why" title={home.why.title} lead={home.why.lead}>
+                <div className="grid gap-4 sm:grid-cols-3">
+                    {home.why.stats.map((stat) => (
+                        <div key={stat.value} className="rounded-xl border border-line bg-card p-5">
+                            <div className="text-3xl font-bold tabular-nums tracking-tight text-fg">{stat.value}</div>
+                            <p className="mt-2 text-sm leading-relaxed text-muted">{stat.label}</p>
+                        </div>
+                    ))}
+                </div>
+                <p className="mt-6 max-w-3xl leading-relaxed text-fg-soft">{home.why.ai}</p>
+                <h3 className="mt-12 text-xl font-bold tracking-tight text-fg">{home.why.approachTitle}</h3>
+                <div className="mt-5 grid gap-4 md:grid-cols-2">
+                    {home.why.approach.map((item) => (
+                        <div key={item.title} className="rounded-xl border border-line bg-card p-5">
+                            <p className="font-mono text-xs font-semibold text-accent">{item.kicker}</p>
+                            <h4 className="mt-2 font-semibold tracking-tight text-fg">{item.title}</h4>
+                            <p className="mt-1.5 text-sm leading-relaxed text-muted">{item.text}</p>
+                        </div>
+                    ))}
+                </div>
+                <p className="mt-8 max-w-3xl text-lg font-medium leading-relaxed text-fg">{home.why.closing}</p>
+                <p className="mt-6 text-xs leading-relaxed text-muted">
+                    {home.why.sourcesTitle}:{" "}
+                    {home.why.sources.map((source, i) => (
+                        <span key={source.href}>
+                            {i > 0 && " · "}
+                            <a href={source.href} className="underline decoration-line-strong underline-offset-2 hover:text-accent">
+                                {source.label}
+                            </a>
+                        </span>
+                    ))}
+                </p>
+            </Section>
+
             <Section id="inside" title={home.highlightsTitle} lead={home.highlightsLead}>
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                     {home.highlights.map((card) => (
