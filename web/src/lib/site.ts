@@ -17,6 +17,8 @@ export const site = {
         google: process.env.GOOGLE_SITE_VERIFICATION,
         yandex: process.env.YANDEX_VERIFICATION,
     },
+    // The Yandex Metrica counter, when the build has one (YANDEX_METRIKA_ID, digits only).
+    metrika: process.env.YANDEX_METRIKA_ID,
 } as const;
 
 export function absoluteUrl(path: string): string {
