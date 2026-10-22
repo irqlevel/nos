@@ -588,6 +588,21 @@ unsigned char kernel_posted_interrupt_vector(void)
     return Hal::PostedVector;
 }
 
+/* The CPU this runs on to take an interrupt from its own timer by
+   deadlineNs on the boot clock, if it is not armed to fire sooner
+   (Cpu::LocalTimerWake): for a vCPU about to enter its guest, whose timer's
+   next edge would otherwise wait for its next exit -- the host's tick, for a
+   guest that computes without one. Nothing for a deadline that has passed:
+   armed for one, the timer would fire at once, and again at every entry
+   while the guest cannot take what is due. From any context. */
+void kernel_cpu_timer_at(unsigned long long deadlineNs)
+{
+    ulong flags = Hal::IrqSave();
+    if ((ulong)deadlineNs > Kernel::GetBootTime().GetValue())
+        Kernel::CpuTable::GetInstance().GetCurrentCpu().LocalTimerWake((ulong)deadlineNs);
+    Hal::IrqRestore(flags);
+}
+
 void* kernel_alloc_dma_pages(unsigned long count,
     unsigned long* phys_out, unsigned long* actual_pages_out)
 {

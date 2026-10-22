@@ -1187,6 +1187,15 @@ impl LinuxGuest {
                 gc.cpu.backend_mut().apicv_off();
             }
 
+            /* Its timers' next edge, if one is coming: the host CPU's own
+             * timer armed for it, so that a guest computing with no exit is
+             * taken out of it then, as a halted one is woken then -- not at
+             * the host's next tick, ten edges of a 1000 Hz guest late. */
+            let edge = pit_edge.unwrap_or(u64::MAX).min(gc.lapic.next_timer_ns().unwrap_or(u64::MAX));
+            if edge != u64::MAX {
+                kcore::cpu::timer_at(edge);
+            }
+
             let entered = gc.cpu.enter(&self.memory, machine, Some(kick));
             if apicv {
                 let (irr, isr, tpr) = gc.cpu.backend_mut().take_apic();
