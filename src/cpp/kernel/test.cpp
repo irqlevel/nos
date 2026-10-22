@@ -3047,6 +3047,260 @@ static bool TestPreemptDeferred()
     return true;
 }
 
+/* Task::Locate, and Wait's report of a join that goes on: a task blocked is
+   read off its stack, one on another CPU with interrupts off is named as
+   that CPU's, one spinning there is found there by the IPI that asks -- on
+   the probe the silent CPU answered late, which has to be reusable -- and a
+   wait that outlasts its report interval is reported. Each is held to
+   frames that name the function the task is in. A join that never ends is
+   told from a quiet one only by these. */
+struct LocateProbe
+{
+    Event Ev;
+    Atomic Started;
+    Atomic Stop;
+    Atomic Done;
+    /* The silent task gave up waiting for Stop, interrupts off */
+    Atomic GaveUp;
+};
+
+static const ulong LocateTestTries = 200;
+static const ulong LocateTestAnswerNs = 100 * Const::NanoSecsInMs;
+/* The longest the silent task keeps its CPU deaf, should the test never
+   tell it to stop: a failure, and not a wedge */
+static const ulong LocateTestSilentMaxNs = 2 * Const::NanoSecsInSec;
+static const ulong JoinTestReportNs = 20 * Const::NanoSecsInMs;
+static const ulong JoinTestNapNs = 50 * Const::NanoSecsInMs;
+
+static void LocateParkTask(void* ctx)
+{
+    auto* p = static_cast<LocateProbe*>(ctx);
+    p->Started.Set(1);
+    p->Ev.Wait();
+    p->Done.Set(1);
+}
+
+/* Out of line, so that the frame named is its caller's, whichever
+   instruction of the loop the IPI lands on: one landing in the loop of a
+   function that has the loop itself is named by Pc alone */
+static __attribute__((noinline)) void LocateSpinning(LocateProbe* p)
+{
+    while (p->Stop.Get() == 0)
+        Pause();
+}
+
+static void LocateSpinTask(void* ctx)
+{
+    auto* p = static_cast<LocateProbe*>(ctx);
+    p->Started.Set(1);
+    LocateSpinning(p);
+    p->Done.Set(1);
+}
+
+static void LocateSilentTask(void* ctx)
+{
+    auto* p = static_cast<LocateProbe*>(ctx);
+    ulong until = GetBootTime().GetValue() + LocateTestSilentMaxNs;
+    ulong flags = Hal::IrqSave();
+    p->Started.Set(1);
+    while (p->Stop.Get() == 0)
+    {
+        if (GetBootTime().GetValue() >= until)
+        {
+            p->GaveUp.Set(1);
+            break;
+        }
+        Pause();
+    }
+    Hal::IrqRestore(flags);
+    p->Done.Set(1);
+}
+
+static void JoinNapTask(void* ctx)
+{
+    (void)ctx;
+    Sleep(JoinTestNapNs);
+}
+
+/* Whether where's frames name fn */
+static bool LocateNames(Task::Where& where, const char* fn)
+{
+    auto& symtab = SymbolTable::GetInstance();
+    char name[SymbolTable::DescribeMax];
+    for (size_t i = 0; i < where.Count; i++)
+    {
+        if (symtab.DescribeReturn(where.Frames[i], name, sizeof(name)) &&
+            Stdlib::StrStr(name, fn) != nullptr)
+            return true;
+    }
+    return false;
+}
+
+static void LocateTrace(const char* test, Task::Where& where)
+{
+    char what[2 * SymbolTable::DescribeMax];
+    where.Describe(what, sizeof(what));
+    Trace(0, "%s: found %s, %lu frames", test, what, (ulong)where.Count);
+}
+
+/* A task made, started with p and on cpu (~0UL: any), or nullptr */
+static Task* LocateStart(const char* name, Task::Func func, LocateProbe* p, ulong cpu)
+{
+    Task* task = Mm::TAlloc<Task, Tag>(name);
+    if (task == nullptr)
+        return nullptr;
+
+    if (cpu != ~0UL)
+        task->SetCpuAffinity(1UL << cpu);
+    if (!task->Start(func, p))
+    {
+        task->Put();
+        return nullptr;
+    }
+
+    while (p->Started.Get() == 0)
+        Sleep(Const::NanoSecsInMs);
+    return task;
+}
+
+static bool TestLocateBlocked()
+{
+    auto* p = Mm::TAlloc<LocateProbe, Tag>();
+    if (p == nullptr)
+        return false;
+
+    bool ok = false;
+    Task* task = LocateStart("locate-park", LocateParkTask, p, ~0UL);
+    if (task != nullptr)
+    {
+        Task::Where where;
+        for (ulong i = 0; i < LocateTestTries && !ok; i++)
+        {
+            task->Locate(where);
+            ok = (where.What == Task::Where::Switched && where.Blocked &&
+                  !where.Asleep && LocateNames(where, "LocateParkTask"));
+            if (!ok)
+                Sleep(Const::NanoSecsInMs);
+        }
+        if (!ok)
+            LocateTrace("TestLocateBlocked", where);
+
+        p->Ev.Signal();
+        task->Wait();
+        task->Put();
+    }
+
+    p->~LocateProbe();
+    Mm::Free(p);
+    return ok;
+}
+
+/* The silent CPU first, then the spinning task on it: the probe left
+   unanswered there is the one the second has to find answered and reuse */
+static bool TestLocateOnCpu(ulong cpu)
+{
+    auto* p = Mm::TAlloc<LocateProbe, Tag>();
+    if (p == nullptr)
+        return false;
+
+    bool ok = false;
+    Task* task = LocateStart("locate-silent", LocateSilentTask, p, cpu);
+    if (task != nullptr)
+    {
+        Task::Where where;
+        task->Locate(where, LocateTestAnswerNs);
+        ok = (where.What == Task::Where::Silent && (where.SilentCpus & (1UL << cpu)));
+        if (!ok)
+            LocateTrace("TestLocateOnCpu silent", where);
+
+        p->Stop.Set(1);
+        task->Wait();
+        task->Put();
+        if (p->GaveUp.Get() != 0)
+        {
+            Trace(0, "TestLocateOnCpu: the silent task was never told to stop");
+            ok = false;
+        }
+    }
+
+    p->~LocateProbe();
+    Mm::Free(p);
+    if (!ok)
+        return false;
+
+    p = Mm::TAlloc<LocateProbe, Tag>();
+    if (p == nullptr)
+        return false;
+
+    ok = false;
+    task = LocateStart("locate-spin", LocateSpinTask, p, cpu);
+    if (task != nullptr)
+    {
+        Task::Where where;
+        for (ulong i = 0; i < LocateTestTries && !ok; i++)
+        {
+            task->Locate(where);
+            ok = (where.What == Task::Where::Running && where.Cpu == cpu &&
+                  where.Pc != 0 && LocateNames(where, "LocateSpinTask"));
+            if (!ok)
+                Sleep(Const::NanoSecsInMs);
+        }
+        if (!ok)
+            LocateTrace("TestLocateOnCpu running", where);
+
+        p->Stop.Set(1);
+        task->Wait();
+        task->Put();
+    }
+
+    p->~LocateProbe();
+    Mm::Free(p);
+    return ok;
+}
+
+static bool TestJoinReport()
+{
+    Task* task = Mm::TAlloc<Task, Tag>("join-nap");
+    if (task == nullptr)
+        return false;
+
+    long before = Task::GetJoinReportCount();
+    bool ok = task->Start(JoinNapTask, nullptr);
+    if (ok)
+    {
+        task->Wait(JoinTestReportNs);
+        ok = (Task::GetJoinReportCount() > before);
+        if (!ok)
+            Trace(0, "TestJoinReport: a wait of %lu ms went unreported",
+                JoinTestNapNs / Const::NanoSecsInMs);
+    }
+    task->Put();
+    return ok;
+}
+
+bool TestTaskLocate()
+{
+    if (!TestLocateBlocked())
+        return false;
+
+    /* Another CPU, should there be one: the highest, the one least likely
+       to be the BSP's */
+    auto& cpus = CpuTable::GetInstance();
+    ulong self = cpus.GetCurrentCpuId();
+    ulong mask = cpus.GetRunningCpus();
+    ulong other = ~0UL;
+    for (ulong i = 0; i < MaxCpus; i++)
+    {
+        if ((mask & (1UL << i)) && i != self)
+            other = i;
+    }
+
+    if (other != ~0UL && !TestLocateOnCpu(other))
+        return false;
+
+    return TestJoinReport();
+}
+
 bool TestMultiTasking()
 {
     if (!TestSpinLockPreempt())

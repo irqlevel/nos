@@ -41,6 +41,14 @@ millisecond twenty-one times while the CPU halts between interrupts: the
 median sleep must be under 5 ms -- 1.0-2.4 under HVF and TCG, 10.0 when the
 CPU's timer is not armed for a sleeper's deadline and the tick wakes it
 ([the local timer](scheduler.md#the-local-timer)).
+Once, from the boot CPU with the others up, `TestTaskLocate` finds tasks
+where they are ([waiting for one to end](scheduler.md#waiting-for-one-to-end)):
+one blocked on an event, read off its stack; one on another CPU with
+interrupts off, which must be named as that CPU's after the tenth of a
+second the test waits for it; one spinning on that CPU, caught there by the
+IPI -- through the slot the deaf CPU answered late, which has to be
+reusable -- each held to frames naming the function it is in; and a join
+of 50 ms reported at a report interval of 20.
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.
