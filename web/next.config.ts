@@ -79,6 +79,13 @@ export default function config(phase: string): NextConfig {
         turbopack: { root: process.cwd() },
         poweredByHeader: false,
         reactStrictMode: true,
+        /*
+         * Nothing here goes through next/image, and its optimizer is the one
+         * user of sharp, the only native code the standalone server would
+         * carry -- the Dockerfile drops it, so the image's last stage holds
+         * JavaScript alone and can be another platform's than the build's.
+         */
+        images: { unoptimized: true },
         env,
         experimental: {
             globalNotFound: true,

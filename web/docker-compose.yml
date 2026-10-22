@@ -6,6 +6,11 @@
 #   docker compose up -d --build
 #
 # Rebuild after a `git pull` to publish new posts and the current docs/.
+#
+# Or build elsewhere and ship it: scripts/release.sh --upload builds the image
+# tagged with the version (VERSION, or IMAGE_VERSION in .env) for the server's
+# platform, sends it over ssh with this file, the Caddyfile and .env -- the
+# version pinned in it -- and starts it there.
 
 name: nos-web
 
@@ -19,7 +24,10 @@ services:
         SITE_URL: https://${DOMAIN:?set DOMAIN in .env}
         GOOGLE_SITE_VERIFICATION: ${GOOGLE_SITE_VERIFICATION:-}
         YANDEX_VERIFICATION: ${YANDEX_VERIFICATION:-}
-    image: nos-web
+        VERSION: ${IMAGE_VERSION:-latest}
+        REVISION: ${REVISION:-}
+    # A release pins IMAGE_VERSION; a plain `docker compose up --build` makes :latest.
+    image: ${IMAGE_NAME:-nos-web}:${IMAGE_VERSION:-latest}
     restart: unless-stopped
     # Reached only through Caddy, on the compose network.
     expose:
@@ -36,9 +44,9 @@ services:
   caddy:
     image: caddy:2.11-alpine
     restart: unless-stopped
-    depends_on:
-      web:
-        condition: service_healthy
+    # No depends_on: compose would stop Caddy whenever a release replaces the
+    # web container, and start it again only once the new one is healthy.
+    # Caddy holds requests while web is away instead (lb_try_duration).
     # The host's side of each binding, from .env: a port, or address:port to bind
     # one interface. Caddy itself stays on 80 and 443 in the container, so its
     # redirects and its certificate are those of the public 80 and 443.
