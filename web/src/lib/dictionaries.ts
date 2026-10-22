@@ -8,6 +8,19 @@ export interface Card {
     href: string;
 }
 
+// The case for nos on the home page: what is wrong with the host as it is, and what nos does about it.
+export interface Why {
+    title: string;
+    lead: string;
+    stats: { value: string; label: string }[];
+    ai: string;
+    approachTitle: string;
+    approach: { kicker: string; title: string; text: string }[];
+    closing: string;
+    sourcesTitle: string;
+    sources: { label: string; href: string }[];
+}
+
 export interface Dictionary {
     meta: {
         title: string;
@@ -34,6 +47,7 @@ export interface Dictionary {
         ctaRun: string;
         ctaGithub: string;
         terminalCaption: string;
+        why: Why;
         highlightsTitle: string;
         highlightsLead: string;
         highlights: Card[];
@@ -98,6 +112,23 @@ export interface Dictionary {
     };
 }
 
+/*
+ * What the case on the home page stands on. The CVE counts are NVD's records
+ * from the kernel.org CNA by publication date, rejected ones left out, counted
+ * on 22 October 2026 (2025: 5,675; 2026 to that day: 7,856; August 1,643,
+ * September 2,111; January to March 644); the exploited ones, CISA's catalog
+ * of 21 October 2026. nos's own: scripts/sloc.py and scripts/unsafe-count.py.
+ */
+const whySources = {
+    nvd: "https://services.nvd.nist.gov/rest/json/cves/2.0?sourceIdentifier=416baaa9-dc9f-4396-8d5f-8c081fb06d67&pubStartDate=2026-09-01T00:00:00.000Z&pubEndDate=2026-09-30T23:59:59.999Z&noRejected&resultsPerPage=1",
+    announce: "https://lore.kernel.org/linux-cve-announce/",
+    kev: "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+    torvalds: "https://lkml.org/lkml/2026/5/17/896",
+    fix: "https://git.kernel.org/linus/de845981da67a6b049080c87e605130b0c30adc5",
+    tencent: "https://matrix.tencent.com/en/2026/10/12/vghost-cve-2026-74580",
+    sloc: "https://github.com/irqlevel/nos/blob/master/scripts/sloc.py",
+};
+
 const en: Dictionary = {
     meta: {
         title: "nos — an OS kernel in C++ and Rust with a hypervisor of its own",
@@ -126,6 +157,50 @@ const en: Dictionary = {
         ctaRun: "Run it in QEMU",
         ctaGithub: "Source on GitHub",
         terminalCaption: "The end of a real arm64 boot log under QEMU.",
+        why: {
+            title: "Why another kernel",
+            lead: "Linux is written in C: a superb language that leaves every bounds check, every lifetime and every lock to the programmer, across tens of millions of lines. Its vulnerabilities no longer come one at a time.",
+            stats: [
+                { value: "7,856", label: "Linux kernel CVEs published in 2026 by 22 October, more than in all of 2025 (5,675)" },
+                { value: "3,754", label: "of them in August and September alone; the first quarter had 644" },
+                { value: "8", label: "Linux kernel vulnerabilities CISA added in 2026 to its catalog of those exploited in the wild" },
+            ],
+            ai: "AI has made finding the mistakes cheap. In May, Linus Torvalds wrote that the “continued flood of AI reports has basically made the security list almost entirely unmanageable”. In August, a fix that credits an AI system closed Vghost (CVE-2026-74580): a stale cache in vhost that gave local users root and, behind a virtual IOMMU, let a guest write out of bounds into the host's QEMU — through the very layer a hypervisor exists to keep shut.",
+            approachTitle: "Our approach",
+            approach: [
+                {
+                    kicker: "≈ 90,000 lines",
+                    title: "Minimal, so it can be checked",
+                    text: "About 90,000 lines of code for the whole kernel, its drivers, network stack and filesystems, and its hypervisor — not tens of millions. Small enough to review whole, and far easier to verify.",
+                },
+                {
+                    kicker: "63% Rust · 1.7% of it unsafe",
+                    title: "Safe Rust by default",
+                    text: "63% of the code is Rust, and only 1.7% of its lines are inside unsafe blocks — concentrated in the crates that touch the hardware and the C ABI, and counted on every change. Out-of-bounds writes, use-after-free and data races cannot be written in the rest: the hypervisor's logic has 4 unsafe sites in 18,929 lines.",
+                },
+                {
+                    kicker: "4 host fuzzers in CI",
+                    title: "Fuzzing as a first-class citizen",
+                    text: "Four fuzzers build the kernel's own sources for the host — the hypervisor's devices and run loop, the network stack, the filesystems, the C++ under ASan and UBSan — and run in CI on every change, with long campaigns between.",
+                },
+                {
+                    kicker: "UBSan · RUSTUB · W^X",
+                    title: "Checked on every change",
+                    text: "UBSan and checked-unsafe builds boot in CI on both architectures, every subsystem has a gate of its own, and a broken invariant is a panic that names its site — never a silent wedge.",
+                },
+            ],
+            closing: "Linux keeps running — as the guest. What changes is the host under it, the one layer that must never fall: small enough to check, and built so that whole classes of its bugs cannot be written.",
+            sourcesTitle: "Sources",
+            sources: [
+                { label: "NVD: the kernel.org CNA's CVEs, e.g. September 2026", href: whySources.nvd },
+                { label: "linux-cve-announce", href: whySources.announce },
+                { label: "CISA KEV catalog", href: whySources.kev },
+                { label: "Linus Torvalds, 17 May 2026", href: whySources.torvalds },
+                { label: "the Vghost fix (Assisted-by: tencentos-corvus-ai)", href: whySources.fix },
+                { label: "Tencent Zhuque Lab on Vghost", href: whySources.tencent },
+                { label: "nos: scripts/sloc.py, scripts/unsafe-count.py", href: whySources.sloc },
+            ],
+        },
         highlightsTitle: "What is inside",
         highlightsLead:
             "No undefined behaviour, no memory corruption, no data races, no deadlocks, no silent failure: every design here is picked for that first.",
@@ -316,6 +391,50 @@ const ru: Dictionary = {
         ctaRun: "Запустить в QEMU",
         ctaGithub: "Исходники на GitHub",
         terminalCaption: "Конец настоящего лога загрузки arm64 в QEMU.",
+        why: {
+            title: "Зачем ещё одно ядро",
+            lead: "Linux написан на C — прекрасном языке, который оставляет программисту каждую проверку границ, каждое время жизни объекта и каждую блокировку, и так на десятках миллионов строк. Уязвимости в нём больше не приходят поодиночке.",
+            stats: [
+                { value: "7 856", label: "CVE ядра Linux опубликовано в 2026 году к 22 октября — больше, чем за весь 2025-й (5 675)" },
+                { value: "3 754", label: "из них — только за август и сентябрь; за весь первый квартал было 644" },
+                { value: "8", label: "уязвимостей ядра Linux CISA добавило в 2026 году в каталог эксплуатируемых в реальных атаках" },
+            ],
+            ai: "Искусственный интеллект сделал поиск ошибок дешёвым. В мае Линус Торвальдс написал, что непрекращающийся поток отчётов от ИИ сделал список рассылки по безопасности почти неуправляемым. В августе исправление, где ИИ-система указана соавтором, закрыло Vghost (CVE-2026-74580): устаревший кэш в vhost давал локальному пользователю root, а за виртуальным IOMMU позволял гостю писать за границы в процесс QEMU на хосте — сквозь тот самый слой, который гипервизор и должен держать закрытым.",
+            approachTitle: "Наш подход",
+            approach: [
+                {
+                    kicker: "≈ 90 000 строк",
+                    title: "Минимальное — значит проверяемое",
+                    text: "Около 90 000 строк кода на всё ядро с драйверами, сетевым стеком и файловыми системами и на гипервизор — не десятки миллионов. Его можно прочитать целиком, и его куда проще верифицировать.",
+                },
+                {
+                    kicker: "63% Rust · 1,7% из них unsafe",
+                    title: "Безопасный Rust по умолчанию",
+                    text: "63% кода — на Rust, и лишь 1,7% его строк лежат внутри unsafe-блоков: они сосредоточены в крейтах, которые касаются железа и C ABI, и пересчитываются при каждом изменении. Запись за границы, use-after-free и гонки данных в остальном коде просто не написать: в логике гипервизора — 4 места с unsafe на 18 929 строк.",
+                },
+                {
+                    kicker: "4 фаззера на хосте, в CI",
+                    title: "Фаззинг — гражданин первого класса",
+                    text: "Четыре фаззера собирают для хоста исходники самого ядра — устройства и цикл исполнения гипервизора, сетевой стек, файловые системы, C++ под ASan и UBSan — и гоняются в CI на каждое изменение, а между изменениями идут долгие кампании.",
+                },
+                {
+                    kicker: "UBSan · RUSTUB · W^X",
+                    title: "Каждое изменение под проверкой",
+                    text: "Сборки с UBSan и проверками unsafe загружаются в CI на обеих архитектурах, у каждой подсистемы свой гейт, а нарушенный инвариант — это паника с указанием места, а не тихое зависание.",
+                },
+            ],
+            closing: "Linux никуда не уходит — он становится гостем. Меняется хост под ним, единственный слой, который не имеет права упасть: достаточно маленький, чтобы его проверить, и устроенный так, что целые классы его ошибок невозможно написать.",
+            sourcesTitle: "Источники",
+            sources: [
+                { label: "NVD: CVE от CNA kernel.org, например за сентябрь 2026", href: whySources.nvd },
+                { label: "linux-cve-announce", href: whySources.announce },
+                { label: "каталог CISA KEV", href: whySources.kev },
+                { label: "Линус Торвальдс, 17 мая 2026", href: whySources.torvalds },
+                { label: "исправление Vghost (Assisted-by: tencentos-corvus-ai)", href: whySources.fix },
+                { label: "Tencent Zhuque Lab о Vghost", href: whySources.tencent },
+                { label: "nos: scripts/sloc.py, scripts/unsafe-count.py", href: whySources.sloc },
+            ],
+        },
         highlightsTitle: "Что внутри",
         highlightsLead:
             "Ни неопределённого поведения, ни порчи памяти, ни гонок, ни взаимоблокировок, ни тихих отказов: каждое решение здесь выбирается прежде всего ради этого.",
