@@ -131,6 +131,16 @@ On a Linux server with Docker Engine and the compose plugin (2.17 or later, for
 3. `cp .env.example .env` and set `DOMAIN` and `ACME_EMAIL`.
 4. `docker compose up -d --build`
 
+`HTTP_PORT` and `HTTPS_PORT` in `.env` (80 and 443 by default) are the host's
+side of Caddy's bindings: a port, or `address:port` to bind one interface
+(`127.0.0.1:8443`). Caddy stays on 80 and 443 inside its container, so its
+redirects and its certificate are those of the public 80 and 443 -- the only
+ports Let's Encrypt checks a domain on. Move them when 80 and 443 still reach
+them: a port forward, or a proxy in front that passes TLS through untouched
+(nginx `stream` with `ssl_preread`, HAProxy in TCP mode). A proxy that
+terminates TLS itself needs no Caddy: publish the web container's port
+instead (`ports: ["127.0.0.1:3000:3000"]` under `web`) and proxy to that.
+
 Caddy obtains the certificate on the first request to the domain and renews it
 by itself; HTTP is redirected to HTTPS and `www` to the bare domain. Watch it with
 `docker compose logs -f caddy`. Keep the `caddy_data` volume -- it holds the

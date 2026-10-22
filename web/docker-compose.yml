@@ -1,7 +1,7 @@
 # The nos website behind Caddy, which obtains and renews its TLS certificate
 # from Let's Encrypt by itself. Set DOMAIN and ACME_EMAIL in .env (copy
-# .env.example), point the domain's DNS at this server, open ports 80 and 443,
-# then:
+# .env.example), point the domain's DNS at this server, open ports 80 and 443
+# (or HTTP_PORT and HTTPS_PORT, if .env moves them), then:
 #
 #   docker compose up -d --build
 #
@@ -39,10 +39,13 @@ services:
     depends_on:
       web:
         condition: service_healthy
+    # The host's side of each binding, from .env: a port, or address:port to bind
+    # one interface. Caddy itself stays on 80 and 443 in the container, so its
+    # redirects and its certificate are those of the public 80 and 443.
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"
     environment:
       DOMAIN: ${DOMAIN:?set DOMAIN in .env}
       ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
