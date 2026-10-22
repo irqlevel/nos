@@ -59,6 +59,14 @@ impl Caps {
 #[path = "../../../src/rust/hvarch/src/x86/svm/vmcb.rs"]
 pub mod vmcb;
 
+/// `kcore::cpu::timer_at`: the host CPU's own timer armed to interrupt it by
+/// `deadline_ns` -- the vCPU on this thread, entered, leaves its guest at it
+/// with a host interrupt's exit, as on a host (`vm::Cpu::enter`). Nothing
+/// for a deadline past, as the kernel has it.
+pub fn timer_at(deadline_ns: u64) {
+    vm::arm_timer(deadline_ns);
+}
+
 pub mod x86 {
     pub mod cpu {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -987,7 +995,20 @@ pub mod vm {
     pub static HANDOFFS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     pub static SLEEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+    /// Entries the host CPU's timer, armed for a guest's timer edge, took
+    /// the guest out of (`timer_at`), for `HV_FUZZ_STATS`.
+    pub static TIMER_EXITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The host CPU's timer, as `kcore::cpu::timer_at` arms it: the deadline
+    /// it is armed for, sooner ones winning; spent when it fires.
+    pub fn arm_timer(deadline_ns: u64) {
+        if deadline_ns > crate::time::peek() {
+            ARMED.with(|a| a.set(a.get().min(deadline_ns)));
+        }
+    }
+
     thread_local! {
+        static ARMED: Cell<u64> = const { Cell::new(u64::MAX) };
         static VCPU: Cell<usize> = const { Cell::new(0) };
         /// The descriptor this thread's vCPU takes its posted interrupts
         /// from (`Backend::set_posted`).
@@ -1168,6 +1189,13 @@ pub mod vm {
                 /* A notification of what other CPUs posted while it ran. */
                 if let Some(exit) = self.backend.posted_arrival() {
                     break exit;
+                }
+                /* The host CPU's timer, armed for the guest's timer edge, at
+                 * it: a host interrupt, and the edge goes in after it. */
+                if ARMED.with(|a| a.get()) <= crate::time::peek() {
+                    ARMED.with(|a| a.set(u64::MAX));
+                    TIMER_EXITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    break Exit::Host;
                 }
                 let next = GUEST.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
                     .and_then(|g| g.next(me, &mut self.backend, memory));

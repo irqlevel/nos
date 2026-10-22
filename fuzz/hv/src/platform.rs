@@ -1343,8 +1343,9 @@ fn mov_checked(what: &'static str) {
 
 pub fn report() {
     let runs: u64 = ENDS.lock().unwrap().values().map(|(n, _)| n).sum();
-    println!("  platform: {} runs, {} turns handed between threads, {} waits", runs,
-             vm::HANDOFFS.load(Ordering::Relaxed), vm::SLEEPS.load(Ordering::Relaxed));
+    println!("  platform: {} runs, {} turns handed between threads, {} waits, {} entries ended by the host's timer armed for the guest's",
+             runs, vm::HANDOFFS.load(Ordering::Relaxed), vm::SLEEPS.load(Ordering::Relaxed),
+             vm::TIMER_EXITS.load(Ordering::Relaxed));
     for (kind, (n, exits)) in ENDS.lock().unwrap().iter() {
         println!("  platform: {:>8} runs ended {:<12} {:>6} exits each", n, kind, exits / n.max(&1));
     }

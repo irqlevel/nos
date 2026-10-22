@@ -954,13 +954,14 @@ And while a guest runs:
   is made the x87 alone at the same moment, if firmware left it with more,
   and put back when the extension goes off; guests are given no XSAVE, so
   AVX and above fault in a guest even if it turns OSXSAVE on itself.
-- **A halted guest costs its CPU nothing** -- but waits at the host tick's
-  grain. A HLT with interrupts on is stepped past, as a CPU an interrupt
-  wakes resumes after it, and the vCPU is not entered again until the PIC
-  has an interrupt for it; meanwhile its task sleeps to the timer's next
-  edge. `task::sleep` blocks until then and is woken at its CPU's first
-  scheduling point after it -- the host tick, at the latest -- so a guest's
-  tick arrives up to 10 ms late. None is lost: every periodic edge that
+- **A halted guest costs its CPU nothing.** A HLT with interrupts on is
+  stepped past, as a CPU an interrupt wakes resumes after it, and the vCPU
+  is not entered again until the PIC has an interrupt for it; meanwhile its
+  task sleeps to the timer's next edge, and is woken at it: the host CPU's
+  one-shot timer is armed for the deadline as the task blocks ([the local
+  timer](scheduler.md#the-local-timer), [Time](#time)). It used to be woken
+  at its CPU's first scheduling point after the edge -- the host tick, at
+  the latest -- so a guest's tick arrived up to 10 ms late. None is lost: every periodic edge that
   elapsed is owed to the guest and handed over one at a time, each once it
   has taken the last (`Pit::ch0_fire`), up to a second's worth. A guest at
   250 Hz was given one edge for every two or three periods before, and a
@@ -2467,10 +2468,10 @@ work unanswered until it ran out, so the frames for that guest waited up to
 4.9 s. Adaptive watches came to 5-7 s for the same reason: they shrank the
 first CPU's watch to nothing, and answered the rest at once. Moderation
 done on purpose -- an interrupt held a bounded while for the frames behind
-it -- needs a host timer finer than the tick: the same wait slept rather
-than spun, which the 100 Hz tick makes 5-10 ms, held 260-290 frames an
-interrupt and took 12.5-14.6 s, the TCP window run dry. None is in the
-tree.
+it -- needs a host timer finer than the tick, which there is now ([the local
+timer](scheduler.md#the-local-timer)): the same wait slept rather than
+spun, which the 100 Hz tick made 5-10 ms, held 260-290 frames an interrupt
+and took 12.5-14.6 s, the TCP window run dry. None is in the tree.
 
 The `apicv` built-in guest asks for it, and holds both ways to one result:
 self-IPIs held by CR8 and taken by priority, one nested, IRR and ISR read
@@ -2487,6 +2488,23 @@ taking what was posted before every entry and to never waiting with it
 untaken.
 
 ### Time
+
+**A timer's edge, on time.** A guest's timers -- the PIT's channel 0 and
+each CPU's local APIC timer -- have their next edge armed on the host CPU
+the vCPU runs on: as its task sleeps, halted, until the edge
+(`Event::WaitFor`, whose deadline arms the CPU's one-shot timer -- [the
+local timer](scheduler.md#the-local-timer)), and before each entry into
+the guest (`kcore::cpu::timer_at`), so that a guest computing with no exit
+is taken out of it at the edge, by a host interrupt, and handed its own then.
+Both used to wait for the host's next tick, at 100 Hz: on the EX44 a halted
+guest's `usleep 1000` took 10 ms, a hundred of them 0.99 s, and a CPU
+computing with no exit was given its ticks in bursts of up to ten. Now a
+hundred take 0.16 s -- halted, and with a CPU-bound loop running in the
+guest -- on one CPU, whose timer is the PIT, and on two, each with its APIC
+timer delivered by the CPU itself; twenty of `usleep 100000` 2.01 s, where
+they took 2.19. The owed periods below keep the count right whatever the
+host does, and PAUSE exits keep a spinning CPU prompt. hv-fuzz's stand-in
+CPU leaves its guest at the deadline it was armed for, as a host interrupt.
 
 Each local APIC has its timer: one-shot and periodic, counting down at a bus
 clock of 1 GHz -- KVM's, and one that makes a count nanoseconds -- with the
@@ -2596,14 +2614,6 @@ frames dropped a gigabyte. A guest of one CPU has no APIC, and keeps the
   IO-APIC; only the interrupts that follow go where the guest steers them
   -- through MSI-X, and with `ioapic` the PIT's and the serial port's too.
   Without one, those two reach the first CPU only.
-- **A timer is as prompt as the host's tick.** Nothing on the host is set
-  for a guest timer's deadline -- `kcore::timer` is periodic, at the
-  host's tick -- so a CPU in its guest is handed a timer interrupt at its
-  next exit, and a CPU asleep is woken for one at the host's next tick
-  at worst: on the EX44 a guest's `usleep 1000`, a hundred times over,
-  took 0.99 s, and `usleep 100000` 109 ms. The owed periods keep the count right on average, and PAUSE
-  exits keep a spinning CPU prompt; a CPU computing with no exit at all
-  gets its ticks in bursts of up to 10 ms.
 - **No TSC-deadline timer.** A kernel built with neither `X86_MPPARSE` nor
   ACPI finds one CPU.
 
@@ -3609,14 +3619,14 @@ someone else's; then speed.
    itself](#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
    left: a NIC's receive interrupts moderated on purpose, which halt
    polling turned out to have been doing by accident (measured there), and
-   which needs a host one-shot finer than the tick; the xAPIC
+   which the host's one-shot timer now makes possible; the xAPIC
    page's virtualization, and AMD's AVIC; device work off the first CPU's
    task, with a lock a device and the
    ring pages mapped once rather than at every access; nested leaves of 2
    MiB and 1 GiB, over guest memory taken in runs that size; the VMX
-   preemption timer and a host one-shot for the guests' timers -- a halted
-   guest's `usleep 1000` takes 10 ms on the EX44, the host's tick
-   ([What it does not do yet](#what-it-does-not-do-yet)); virtio-net's checksum and segmentation offloads,
+   preemption timer, which would take a computing guest out at its timer's
+   edge without the host interrupt that does it now ([Time](#time));
+   virtio-net's checksum and segmentation offloads,
    which 2.5 Gbit on the EX44 needs, and with which a TCP stream would be
    a fortieth of the frames, exits and interrupts it is.
 7. **What has not been measured.** The time each kind of exit takes
