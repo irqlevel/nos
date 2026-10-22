@@ -1468,6 +1468,10 @@ pub fn platform(r: &mut Input) {
     if r.bool() {
         guest.set_apicv(r.u8() >= 32);
     }
+    /* Its NICs' receive interrupts held apart, or each at once. */
+    if r.bool() {
+        guest.set_rx_moderation(r.pick(&[0u64, 20_000, 100_000]));
+    }
 
     /* Disks: none, mostly, or one -- each takes its 2 MiB of request
      * buffers when it is made, zeroed, which for a run of the whole machine

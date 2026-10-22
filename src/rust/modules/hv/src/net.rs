@@ -194,6 +194,10 @@ struct Port {
     /// Its sends to every port, and those their rate kept out.
     flood: IrqSpinLock<Flood>,
     flooded: AtomicU64,
+    /// Until when, on the boot clock, its VM's NIC looks for frames on its
+    /// own, its receive interrupts held till then (`Backend::quiet_until`):
+    /// a frame put in before it wakes nobody.
+    quiet_until: AtomicU64,
 }
 
 /// What a port's guest lost, since it claimed the port: frames for it its
@@ -280,6 +284,15 @@ impl Ports {
         inbox.lens[slot] = frame.len() as u16;
         inbox.count += 1;
         p.waiting.store(inbox.count, Ordering::Release);
+        /* Not while its NIC holds its receive interrupts: its round comes
+         * for what is here by then on its own, and a kick per frame would
+         * hand each over alone -- unless the inbox is filling, which a
+         * fast sender can do within the wait. */
+        if inbox.count < INBOX_FRAMES / 2
+            && p.quiet_until.load(Ordering::Acquire) > kcore::time::boot_time_ns()
+        {
+            return;
+        }
         /* Under the lock: what keeps the VM from going meanwhile. A halted
          * guest's task is woken; one in its guest is kicked out to take the
          * frame now -- at the host's next tick, a busy guest's inbox would
@@ -428,6 +441,12 @@ impl hv::nic::Backend for PortBackend {
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
         self.ports.take(self.port, buf)
     }
+
+    fn quiet_until(&mut self, until_ns: u64) {
+        if let Some(p) = self.ports.ports.get(self.port) {
+            p.quiet_until.store(until_ns, Ordering::Release);
+        }
+    }
 }
 
 /// The switch: the ports, `hv0`'s sink attached for as long as it lives, and
@@ -463,6 +482,7 @@ impl Switch {
                 over_share: AtomicU64::new(0),
                 flood: IrqSpinLock::new(Flood::FULL),
                 flooded: AtomicU64::new(0),
+                quiet_until: AtomicU64::new(0),
             });
         }
         let ports = Arc::new(Ports {
@@ -538,6 +558,7 @@ impl Switch {
                 p.on_backlog.store(0, Ordering::Relaxed);
                 p.over_share.store(0, Ordering::Relaxed);
                 p.flooded.store(0, Ordering::Relaxed);
+                p.quiet_until.store(0, Ordering::Release);
                 *p.flood.lock() = Flood { tokens: FLOOD_BURST, at: kcore::time::boot_time_ns() };
                 self.ports.in_use.fetch_add(1, Ordering::Relaxed);
                 return Ok(i);

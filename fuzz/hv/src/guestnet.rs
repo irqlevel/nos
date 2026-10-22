@@ -91,8 +91,11 @@ struct Model {
     dropped: [u64; MAX_PORTS],
     /// Frames each port's guest sent as another, since it claimed the port.
     spoofed: [u64; MAX_PORTS],
-    /// Frames delivered to each port's VM, which it is woken for once each.
+    /// Frames delivered to each port's VM, which it is woken for once each
+    /// -- but while its NIC holds its receive interrupts (`quiet`) and the
+    /// inbox is under half full.
     woken: [u64; MAX_PORTS],
+    quiet: [bool; MAX_PORTS],
     /// Each port's frames on `hv0`'s backlog since the stack's last pass,
     /// and those its share kept out; its sends to every port their rate
     /// kept out, and its bucket for them: tokens, and when topped up.
@@ -119,6 +122,7 @@ impl Model {
             dropped: [0; MAX_PORTS],
             spoofed: [0; MAX_PORTS],
             woken: [0; MAX_PORTS],
+            quiet: [false; MAX_PORTS],
             on_backlog: [0; MAX_PORTS],
             over_share: [0; MAX_PORTS],
             flooded: [0; MAX_PORTS],
@@ -142,7 +146,9 @@ impl Model {
             return;
         }
         self.inbox[p].push_back(frame.to_vec());
-        self.woken[p] += 1;
+        if !(self.quiet[p] && self.inbox[p].len() < INBOX_FRAMES / 2) {
+            self.woken[p] += 1;
+        }
     }
 
     /// A guest's frame for `hv0`: within its port's share of the backlog --
@@ -361,7 +367,7 @@ pub fn switch_target(r: &mut Input) {
      * one more than there are ports. */
     let most = if r.u8() < 24 { MAX_PORTS + 1 } else { 1 + r.below(4) as usize };
 
-    while let Some(op) = r.op(11) {
+    while let Some(op) = r.op(12) {
         match op {
             0 | 10 => {
                 /* A VM on the switch, the first free port -- or, now and
@@ -378,6 +384,7 @@ pub fn switch_target(r: &mut Input) {
                         m.owned[p] = true;
                         m.inbox[p].clear();
                         m.woken[p] = 0;
+                        m.quiet[p] = false;
                         m.dropped[p] = 0;
                         m.spoofed[p] = 0;
                         m.on_backlog[p] = 0;
@@ -471,6 +478,19 @@ pub fn switch_target(r: &mut Input) {
             9 => {
                 /* Time going by: a port's rate to every port earned back. */
                 time::advance(r.pick(&[NS_PER_SEC / 1000, NS_PER_SEC / 10, NS_PER_SEC, 10 * NS_PER_SEC]));
+            }
+            11 => {
+                /* A port's NIC holding its receive interrupts, or done: a
+                 * frame for it then wakes nobody while the inbox is under
+                 * half full. Open-ended or none, so that the model and the
+                 * switch, reading the clock a step apart, never disagree on
+                 * a window's end -- its end is the NIC target's. */
+                let p = r.below(MAX_PORTS as u64) as usize;
+                if let Some(b) = backends[p].as_mut() {
+                    let quiet = r.bool();
+                    b.quiet_until(if quiet { u64::MAX / 2 } else { 0 });
+                    m.quiet[p] = quiet;
+                }
             }
             _ => {}
         }
