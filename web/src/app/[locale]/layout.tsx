@@ -9,6 +9,8 @@ import { SiteFooter } from "@/components/SiteFooter";
 import { SiteHeader } from "@/components/SiteHeader";
 import { getDictionary } from "@/lib/dictionaries";
 import { isLocale, locales } from "@/lib/i18n";
+import { MetrikaHits } from "@/components/MetrikaHits";
+import { metrikaScript } from "@/lib/metrika";
 import { site } from "@/lib/site";
 import { themeScript } from "@/lib/theme";
 
@@ -70,8 +72,21 @@ export default async function LocaleLayout({ children, params }: Props) {
                 <Script id="theme" strategy="beforeInteractive">
                     {themeScript}
                 </Script>
+                {/* As early in the page as it can be, so a visit that ends at once is still counted. */}
+                {site.metrika && (
+                    <Script id="metrika" strategy="beforeInteractive">
+                        {metrikaScript(site.metrika)}
+                    </Script>
+                )}
             </head>
             <body className="flex min-h-dvh flex-col antialiased">
+                {site.metrika && (
+                    <noscript>
+                        <div>
+                            <img src={`https://mc.yandex.ru/watch/${site.metrika}`} style={{ position: "absolute", left: "-9999px" }} alt="" />
+                        </div>
+                    </noscript>
+                )}
                 <a href="#main" className="skip-link">
                     {dict.nav.skip}
                 </a>
@@ -80,6 +95,7 @@ export default async function LocaleLayout({ children, params }: Props) {
                     {children}
                 </main>
                 <SiteFooter locale={locale} dict={dict} />
+                {site.metrika && <MetrikaHits id={site.metrika} />}
             </body>
         </html>
     );
