@@ -1,0 +1,18 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+next-env.d.ts
+*.tsbuildinfo
+
+# deployment secrets: .env holds the domain, the ACME e-mail and the
+# verification codes; .env.example is the template that is committed
+.env
+.env.*
+!.env.example
+
+# misc
+.DS_Store
+npm-debug.log*

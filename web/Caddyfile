@@ -1,0 +1,20 @@
+# Caddy serves HTTPS for {$DOMAIN} with a certificate it obtains from Let's
+# Encrypt and renews by itself, redirects HTTP to HTTPS, and sends www to the
+# bare domain -- one canonical host, as the sitemap and the canonical links say.
+{
+	email {$ACME_EMAIL}
+}
+
+# Needs a DNS record for www too; without one, delete this block.
+www.{$DOMAIN} {
+	redir https://{$DOMAIN}{uri} permanent
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		-Server
+	}
+	reverse_proxy web:3000
+}
