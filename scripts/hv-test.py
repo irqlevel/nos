@@ -150,9 +150,14 @@ GUESTS = {
     # performed -- except on QEMU's TCG, which checks a read of CR4 against
     # CR0's intercept and so never stops one: 5, its writes. The guest's own
     # check knows which by the hypervisor's CPUID signature.
+    # The host performs every access, 11 of them, or on QEMU's TCG -- which
+    # stops no read of CR4 -- the 5 writes; and refuses PKE, PAE cleared and
+    # bit 32. A CPU may refuse the last two itself, before its intercept, as
+    # the AX41's Zen 2 does under KVM: then 9 and 1, and the guest says so.
     "cr4": [r"while the CPU's CR4 kept MCE; PKE, PAE cleared and bit 32 each a #GP, CR4 as it was",
             r"(?:it read back what it wrote, MCE cleared and then PGE set|its reads the CPU's own, QEMU's TCG)",
-            r"\b(?:11|5) of CR4 performed, 3 refused"],
+            r"\b(?:(?:11|5) of CR4 performed, 3 refused|9 of CR4 performed, 1 refused\b.*\n(?:.*\n)*.*"
+            r"2 of them the CPU's own, before its intercept)"],
     # Every MSR comes to the policy on both backends, so this one says the
     # same under either.
     "msr": [r"SPEC_CTRL, PRED_CMD, LS_CFG and MTRRs turned on each a #GP its own handler took",
