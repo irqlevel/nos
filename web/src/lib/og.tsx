@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { ImageResponse } from "next/og";
+import { site } from "./site";
 
 export const ogSize = { width: 1200, height: 630 };
 
 /*
  * The fonts the cards are set in, read from the npm packages at build time:
- * static WOFF (the renderer reads neither WOFF2 nor variable fonts), Latin and
- * Cyrillic subsets under one family, so a Russian title renders as an English one does.
+ * static WOFF (the renderer reads neither WOFF2 nor variable fonts), the Latin
+ * and the Cyrillic subset of each, so a Russian title renders as an English one does.
  */
 function font(pkg: string, file: string): Buffer {
     return fs.readFileSync(path.join(process.cwd(), "node_modules", "@fontsource", pkg, "files", file));
@@ -73,5 +74,31 @@ export function ogImage({ eyebrow, title, footer }: { eyebrow: string; title: st
             </div>
         ),
         { ...ogSize, fonts: loadFonts() }
+    );
+}
+
+// The logo: the wordmark, square, on the cards' ground -- what search engines show for the site.
+export function logoImage() {
+    return new ImageResponse(
+        (
+            <div
+                style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    width: "100%",
+                    height: "100%",
+                    background: "#0d0e11",
+                    color: "#ebe9e4",
+                    fontFamily: "MonoLatin",
+                    fontSize: 168,
+                    fontWeight: 700,
+                    letterSpacing: -6,
+                }}
+            >
+                nos<span style={{ color: "#f2a93b" }}>_</span>
+            </div>
+        ),
+        { width: site.logo.size, height: site.logo.size, fonts: loadFonts() }
     );
 }
