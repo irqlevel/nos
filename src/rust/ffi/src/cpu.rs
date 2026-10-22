@@ -17,6 +17,10 @@ unsafe extern "C" {
     pub safe fn kernel_cpu_notify(cpu: u32);
     /// The vector `kernel_cpu_notify` sends.
     pub safe fn kernel_posted_interrupt_vector() -> u8;
+    /// The CPU this runs on to take an interrupt from its own timer by
+    /// `deadline_ns` on the boot clock, if it is not armed to fire sooner;
+    /// nothing for a deadline past. From any context.
+    pub safe fn kernel_cpu_timer_at(deadline_ns: u64);
 }
 
 /* Interrupts and preemption off, and back on, for code that holds a lock of
