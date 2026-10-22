@@ -510,12 +510,12 @@ What the VMX backend does not do yet, and says so rather than pretends:
     hv off [cpu|all]            turn it off
     hv run <guest|all> [cpu]    run a built-in guest, or all of them, on a
                                 task of its own -- bound to cpu when one is named
-    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+    hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                 load a Linux bzImage and run it on a vCPU --
                                 on cpus of them, each on a host CPU of its
                                 own -- for secs, then print its console and
                                 how it ended
-    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+    hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
                                 the same, left running until it is stopped;
                                 restart boots it again when it resets itself
     hv list                     the started guests: running or how they ended,
@@ -1455,11 +1455,39 @@ $ hv forward add 8080 1 80              # nos's 8080, to guest 1's 80
 
 **The guest's NIC is virtio-net, legacy, on the same transport as its
 disks** (`hv::devices::net`): two queues, a MAC and a link status offered,
-no checksum offload and no segmentation, so a frame either way is a whole
-Ethernet frame after legacy's 10-byte header. A frame the guest sends is
-handed on before the notify returns; what waits for it is put into the
-buffers it has posted each time round the run loop, one frame held by the
-device while it has posted none.
+and the guest's transmit offloads (below): what leaves the device either way
+is a whole Ethernet frame of at most 1514 bytes with its checksums right,
+after legacy's 10-byte header going in. A send is cut, or handed on whole,
+before the notify returns; what waits for the guest is put into the buffers
+it has posted each time round the run loop, one frame held by the device
+while it has posted none.
+
+**Transmit offloads.** The device completes a checksum the driver leaves to
+it (`VIRTIO_NET_F_CSUM`) and cuts TCP over IPv4 the driver hands it as one
+send of up to 64 KiB into frames (`HOST_TSO4`; `hv::devices::offload`): the
+headers of the send in front of each, its IP length, ID and checksum, its
+sequence number and its TCP checksum its own, FIN and PSH the last one's,
+CWR the first's -- before the switch, so every guest, nos's stack and NAT
+are handed whole frames as before. What the driver says about either --
+where a checksum goes, where the headers end, the segment size -- is checked
+against the frame before it is used, and a send that does not hold up is
+dropped, counted. Not offered: ECN on a cut send, IPv6, UDP; and a segment
+under 256 bytes is refused, so that one notify is 256 frames at most and not
+65,000 that a guest could ask for at no cost to itself. `nooffload` on `hv
+boot` or `hv start` offers the device without them. On the EX44 two guests
+of two CPUs, one serving a file of 100 MB five times over with BusyBox's
+`httpd` -- `sendfile`, sends of 64 KiB -- and the other fetching it: 1.11
+and 1.12 s with them, 1.63 and 1.63 without, about 470 MB/s against 320,
+8,400 sends cut into 362,000 frames. Without them the guest cut its sends
+itself, kicking the device once a send all the same -- the exits were
+alike -- so what they save is the guest's own work for each frame. A sender
+writing a kilobyte at a time (`dd | nc`) hands over full segments one at a
+time and has little to cut: 3.5-4.4 s either way, the device then only
+completing checksums -- which it sums eight bytes at a time, since two
+bytes at a time made that 3-5% slower than the guest's own checksum, taken
+as it copies. hv-fuzz's `offload` target holds every send, well made and
+not, to a model of its own, frame by frame; two mutants -- PSH on every
+frame, one IP ID for all -- each failed within three inputs.
 
 **nos's end is a virtual NIC, `hv0`, in its own stack** (`net/src/vnic.rs`).
 A module cannot register a NIC -- there is no C name for a driver to be bound
@@ -3661,9 +3689,10 @@ someone else's; then speed.
    MiB and 1 GiB, over guest memory taken in runs that size; the VMX
    preemption timer, which would take a computing guest out at its timer's
    edge without the host interrupt that does it now ([Time](#time));
-   virtio-net's checksum and segmentation offloads,
-   which 2.5 Gbit on the EX44 needs, and with which a TCP stream would be
-   a fortieth of the frames, exits and interrupts it is.
+   ~~virtio-net's transmit offloads~~ done ([A network](#a-network)); its
+   receive offloads -- a send handed to another guest whole, which takes
+   `GUEST_TSO4` and mergeable buffers, and with which a stream between two
+   guests would be a fortieth of the frames, interrupts and copies it is.
 7. **What has not been measured.** The time each kind of exit takes
    inside `LinuxGuest::run`; fio and iperf in a guest. (An exit under VT-x
    on silicon is measured now: [What an exit costs](#what-an-exit-costs).)

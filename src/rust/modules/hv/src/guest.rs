@@ -81,6 +81,9 @@ pub struct Spec {
     /// 0 for each as its frame comes; unset, hv's default
     /// (`hv::run::RX_MODERATION_DEFAULT_NS`).
     pub rxmod_us: Option<u64>,
+    /// `nooffload`: its NICs without their transmit offloads -- checksums
+    /// and TCP's segmentation left to its own kernel, as before them.
+    pub nooffload: bool,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
@@ -132,6 +135,7 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         ioapic: false,
         apicv: None,
         rxmod_us: None,
+        nooffload: false,
         log: false,
         restart: false,
         net: false,
@@ -182,6 +186,8 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
             spec.apicv = Some(true);
         } else if word == "noapicv" {
             spec.apicv = Some(false);
+        } else if word == "nooffload" {
+            spec.nooffload = true;
         } else if let Some(v) = word.strip_prefix("rxmod=") {
             spec.rxmod_us = Some(v.parse().map_err(|_| String::from("rxmod= wants microseconds"))?);
         } else if word == "restart" {
@@ -311,6 +317,9 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     }
     if let Some(us) = spec.rxmod_us {
         guest.set_rx_moderation(us.saturating_mul(kcore::consts::NS_PER_US));
+    }
+    if spec.nooffload {
+        guest.set_offloads(false);
     }
 
     /* The 64-bit kernel at its load address, then the initrd high. */
@@ -614,8 +623,8 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
             if broken { "; stopped over a ring the driver broke" } else { "" });
     }
     for (i, (s, broken)) in guest.nic_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped{}",
-            i, s.sent, s.received, s.dropped,
+        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped, {} sends cut into frames by the device{}",
+            i, s.sent, s.received, s.dropped, s.cut,
             if broken { "; stopped over a ring the driver broke" } else { "" });
     }
     let hot = guest.hot_ports(6);

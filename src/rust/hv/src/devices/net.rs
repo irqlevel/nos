@@ -3,11 +3,13 @@
 //!
 //! Two queues, as legacy has them: 0 the driver fills with buffers for what
 //! the device receives, 1 with what it sends. Every frame either way comes
-//! after the 10-byte header legacy puts in front of it, which says nothing
-//! here -- no checksum offload and no segmentation are offered, so the guest
-//! sends whole, checksummed frames of at most 1514 bytes, and is given the
-//! same. A frame the guest sends is copied out and handed to the backend
-//! before the notify returns; what the backend has for the guest is put into
+//! after the 10-byte header legacy puts in front of it. What the guest sends
+//! may leave its checksum to the device, and TCP over IPv4 may come as one
+//! send of up to 64 KiB for the device to cut (`offload`): the frames that
+//! leave the device are whole, checksummed and at most 1514 bytes, and so is
+//! what the guest is given -- no offload is offered that way. A send is
+//! copied out and handed to the backend, cut or whole, before the notify
+//! returns; what the backend has for the guest is put into
 //! its buffers each time round the run loop (`poll`) -- one frame held by the
 //! device when the driver has posted none, so nothing is lost for want of a
 //! buffer that is on its way.
@@ -15,6 +17,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use super::offload::{self, Offloads, TxHeader};
 use super::pci::Identity;
 use super::virtio::{self, Asked, Broken, Queue, Raise, Seg, Transport};
 use crate::memory::GuestMemory;
@@ -56,9 +59,16 @@ const QUEUE_SIZE: u16 = 256;
 /// host for good, the platform's lock with it (hv-fuzz's racing CPU).
 const PASS: usize = QUEUE_SIZE as usize;
 
-/// Features: a MAC address of the device's, and a link status.
+/// Features: the guest's checksums completed by the device, a MAC address
+/// of the device's, TCP over IPv4 cut into frames by the device, and a link
+/// status. Segmentation needs the checksums: each frame it makes has its
+/// own.
+const F_CSUM: u32 = 1 << 0;
 const F_MAC: u32 = 1 << 5;
+const F_HOST_TSO4: u32 = 1 << 11;
 const F_STATUS: u32 = 1 << 16;
+/// What every NIC here offers.
+const BASE_FEATURES: u32 = F_MAC | F_STATUS;
 const LINK_UP: u16 = 1;
 
 /// The configuration: the MAC, then the status.
@@ -67,9 +77,9 @@ const CFG_STATUS: usize = 6;
 const CFG_BYTES: usize = 8;
 
 /// Legacy's header, before every frame.
-const HDR: usize = 10;
+const HDR: usize = TxHeader::LEN;
 /// The longest frame either way: Ethernet's, less the FCS.
-pub const MAX_FRAME: usize = 1514;
+pub const MAX_FRAME: usize = offload::MAX_FRAME;
 const MIN_FRAME: usize = 14;
 
 /// What the device has done, for a report.
@@ -77,6 +87,8 @@ const MIN_FRAME: usize = 14;
 pub struct Stats {
     pub sent: u64,
     pub received: u64,
+    /// Sends the device cut into frames -- `sent` counts the frames.
+    pub cut: u64,
     /// Sent frames that were not frames: too short, or longer than was
     /// offered.
     pub dropped: u64,
@@ -87,8 +99,11 @@ pub struct Net {
     backend: Box<dyn Backend>,
     mac: [u8; 6],
     segs: Vec<Seg>,
-    /// A frame on its way either way, header included.
+    /// A send, header included: a frame, or up to 64 KiB of TCP for the
+    /// device to cut.
     tx_buf: Vec<u8>,
+    /// Room for a frame cut from a send.
+    seg_buf: Vec<u8>,
     /// The header, all zero -- nothing to say -- and the frame behind it:
     /// what goes into the guest's buffers as it lies.
     rx_buf: Vec<u8>,
@@ -117,17 +132,21 @@ impl Net {
         let mut segs = Vec::new();
         segs.try_reserve_exact(usize::from(QUEUE_SIZE)).map_err(|_| Error::NoMemory)?;
         let mut tx_buf = Vec::new();
-        tx_buf.try_reserve_exact(HDR + MAX_FRAME).map_err(|_| Error::NoMemory)?;
-        tx_buf.resize(HDR + MAX_FRAME, 0);
+        tx_buf.try_reserve_exact(HDR + offload::MAX_SEND).map_err(|_| Error::NoMemory)?;
+        tx_buf.resize(HDR + offload::MAX_SEND, 0);
+        let mut seg_buf = Vec::new();
+        seg_buf.try_reserve_exact(MAX_FRAME).map_err(|_| Error::NoMemory)?;
+        seg_buf.resize(MAX_FRAME, 0);
         let mut rx_buf = Vec::new();
         rx_buf.try_reserve_exact(HDR + MAX_FRAME).map_err(|_| Error::NoMemory)?;
         rx_buf.resize(HDR + MAX_FRAME, 0);
         Ok(Net {
-            transport: Transport::new(F_MAC | F_STATUS, queues),
+            transport: Transport::new(BASE_FEATURES | F_CSUM | F_HOST_TSO4, queues),
             backend,
             mac,
             segs,
             tx_buf,
+            seg_buf,
             rx_buf,
             held: None,
             tx_more: false,
@@ -152,6 +171,15 @@ impl Net {
 
     pub fn broken(&self) -> Option<Broken> {
         self.broken
+    }
+
+    /// The transmit offloads offered -- the guest's checksums completed and
+    /// its TCP over IPv4 cut by the device -- or not, the device as it was
+    /// before them, for a guest to be measured or run without. Before the
+    /// driver reads the features: at the guest's next boot otherwise.
+    pub fn set_offloads(&mut self, on: bool) {
+        let offloads = F_CSUM | F_HOST_TSO4;
+        self.transport.set_device_features(if on { BASE_FEATURES | offloads } else { BASE_FEATURES });
     }
 
     /// Receive interrupts no closer than `ns` apart -- 0, as each frame
@@ -277,11 +305,16 @@ impl Net {
         if wants { self.transport.interrupt(TX_QUEUE) } else { Raise::default() }
     }
 
-    /// One chain the driver sent: the header, then the frame, taken whole.
+    /// One chain the driver sent: the header, then the frame -- or the send
+    /// to cut into frames -- taken whole, and on to the backend as the
+    /// header says (`offload::transmit`).
     fn transmit(&mut self, mem: &GuestMemory, segs: &[Seg]) {
+        let features = self.transport.driver_features();
+        let offloads = Offloads { csum: features & F_CSUM != 0, tso4: features & F_HOST_TSO4 != 0 };
+        let most = if offloads.tso4 { HDR + offload::MAX_SEND } else { HDR + MAX_FRAME };
         let total: u64 = segs.iter().filter(|s| !s.write).map(|s| u64::from(s.len)).sum();
         let len = total as usize;
-        if total < (HDR + MIN_FRAME) as u64 || total > (HDR + MAX_FRAME) as u64 {
+        if total < (HDR + MIN_FRAME) as u64 || total > most as u64 {
             self.stats.dropped += 1;
             return;
         }
@@ -296,8 +329,21 @@ impl Net {
             }
             done += n;
         }
-        self.backend.send(&self.tx_buf[HDR..len]);
-        self.stats.sent += 1;
+        let Net { tx_buf, seg_buf, backend, stats, .. } = self;
+        let (head, rest) = tx_buf.split_at_mut(HDR);
+        let mut header = [0u8; HDR];
+        header.copy_from_slice(head);
+        let header = TxHeader::parse(&header);
+        let mut send = |frame: &[u8]| backend.send(frame);
+        match offload::transmit(&header, &mut rest[..len - HDR], offloads, seg_buf, &mut send) {
+            Ok(frames) => {
+                stats.sent += frames as u64;
+                if header.gso_type != offload::GSO_NONE {
+                    stats.cut += 1;
+                }
+            }
+            Err(_) => stats.dropped += 1,
+        }
     }
 
     /// A round of the device at `now`, each time round the run loop: what a
