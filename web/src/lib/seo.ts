@@ -89,6 +89,23 @@ export function pageMetadata(seo: PageSeo): Metadata {
     };
 }
 
+// The site as the publisher of every page, with the logo search engines show for it.
+export function organizationLd() {
+    return {
+        "@type": "Organization",
+        "@id": absoluteUrl("/#organization"),
+        name: site.name,
+        url: absoluteUrl("/"),
+        logo: {
+            "@type": "ImageObject",
+            url: absoluteUrl(site.logo.path),
+            width: site.logo.size,
+            height: site.logo.size,
+        },
+        sameAs: [site.github],
+    };
+}
+
 export function breadcrumbs(items: { name: string; path: string }[]) {
     return {
         "@context": "https://schema.org",
@@ -128,7 +145,7 @@ export function articleLd(opts: {
         dateModified: opts.modified ?? opts.published,
         keywords: opts.tags?.join(", "),
         author: { "@type": "Person", name: site.author, url: site.github.replace(/\/nos$/, "") },
-        publisher: { "@type": "Organization", name: site.name, url: absoluteUrl("/") },
+        publisher: organizationLd(),
         isPartOf: { "@type": "WebSite", name: site.name, url: absoluteUrl("/") },
     };
 }
