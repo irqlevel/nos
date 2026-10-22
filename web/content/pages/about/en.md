@@ -1,9 +1,9 @@
 ---
 title: "What is nos"
-description: "A hobby x86-64 and arm64 kernel in C++20 and Rust, built to be safe by design: it boots on clouds, Apple Silicon and bare metal, and runs Linux guests."
+description: "An x86-64 and arm64 kernel in C++20 and Rust, built to be safe by design: it boots on clouds, Apple Silicon and bare metal, and runs Linux guests."
 ---
 
-nos is a hobby operating system kernel for x86-64 and arm64, written in C++20, Rust and a little assembly. It is freestanding: no libc, no STL, no C++ exceptions or RTTI. On x86-64 it boots through GRUB and Multiboot2, under legacy BIOS and UEFI alike; on arm64 it boots through the Linux `Image` protocol. It runs under QEMU/KVM, on KVM-based clouds, on Apple Silicon under HVF, and on three real machines: a laptop, and two rented dedicated servers whose only console is the network.
+nos is an operating system kernel for x86-64 and arm64, written in C++20, Rust and a little assembly. It is freestanding: no libc, no STL, no C++ exceptions or RTTI. On x86-64 it boots through GRUB and Multiboot2, under legacy BIOS and UEFI alike; on arm64 it boots through the Linux `Image` protocol. It runs under QEMU/KVM, on KVM-based clouds, on Apple Silicon under HVF, and on three real machines: a laptop, and two rented dedicated servers whose only console is the network.
 
 It has its own SMP scheduler and memory manager, and on top of them a TCP/IP stack with HTTPS, an SSH server, ext2 read-write, NVMe and drivers for Realtek and Intel network cards. It loads kernel modules written in Rust, and one of those modules is a type-1 hypervisor that boots unmodified Linux distributions.
 
