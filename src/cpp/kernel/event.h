@@ -41,8 +41,10 @@ public:
     /* Wait() for at most timeoutNs: true when signalled, false when the
        time ran out first. The deadline is Sleep()'s -- the scheduler runs a
        blocked task whose SleepUntil has passed at its CPU's next scheduling
-       point, the tick at the latest -- so a waiter costs its CPU nothing
-       either way, and a Signal() still wakes it at once. */
+       point, which that CPU's timer, armed for the deadline as the task
+       blocks, makes then (TaskQueue::WakeSleepers) -- so a waiter costs its
+       CPU nothing either way, ends at its deadline and not at the next tick
+       after it, and a Signal() still wakes it at once. */
     bool WaitFor(unsigned long long timeoutNs);
 
     /* Any context. A signaller is done with the event only when Signal()

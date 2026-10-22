@@ -35,6 +35,7 @@ enum InterruptSource : u8
     IrqDummy,
     IrqSpurious,
     IrqPosted,
+    IrqTimerWake,
     IrqMax,
 };
 

@@ -35,10 +35,12 @@ Everything the kernel does today, by subsystem. For where the code lives see
   free-list walk touches it at random. Cost: building the free list still
   touches every page twice, about 0.6 µs in total each, so a 64 GiB machine
   spends around ten seconds of its boot there.
-- **Per-CPU tick** — each CPU runs its own periodic timer (x86-64: the local
-  APIC timer, calibrated once against the established clock; arm64: the
-  generic timer), rather than one HPET interrupt on one CPU fanned out to
-  every other by IPI. That removes a write to the interrupt command register
+- **Per-CPU tick** — each CPU runs its own timer (x86-64: the local APIC
+  timer, calibrated once against the established clock; arm64: the generic
+  timer), rather than one HPET interrupt on one CPU fanned out to every other
+  by IPI. One-shot: armed for the next tick, or sooner for a task asleep
+  until a deadline, so a sleep of a millisecond takes one and not the tick's
+  ten ([the local timer](scheduler.md#the-local-timer)). That removes a write to the interrupt command register
   per CPU per tick, and removes the single point of failure: a CPU that stops
   answering interrupts now stops only its own tick, while the others keep
   ticking and the watchdog notices it. The HPET stays as the timekeeper.

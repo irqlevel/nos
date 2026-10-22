@@ -10,7 +10,9 @@ namespace Kernel
    the PPI (INTID from the DTB, 27 on QEMU virt) is banked per-CPU, so every
    CPU arms its own CNTV and services the tick locally (no BSP broadcast).
    The tick is dispatched specially by ArmIrqEntry -> LocalTick, which EOIs
-   before Schedule() may switch away (mirroring the IPI path). */
+   before Schedule() may switch away (mirroring the IPI path). One-shot, by
+   its compare value: armed for each tick and for each deadline a task on
+   the CPU sleeps to (Cpu::LocalTimer*, Hal::LocalTimerArm). */
 class GenericTimer final : public InterruptHandler
 {
 public:
@@ -20,12 +22,17 @@ public:
         return Instance;
     }
 
-    /* BSP: compute the interval, then arm this CPU. */
+    /* BSP: register the PPI, then start this CPU's timer. */
     bool Setup();
 
     /* Each CPU (incl. APs): enable the timer PPI in its own redistributor
-       and arm its CNTV. */
+       and start its CNTV. */
     void ArmSelf();
+
+    /* Fire this CPU's CNTV once, deltaNs from now: its compare value
+       written, which also takes the level line down for one in the past
+       (Hal::LocalTimerArm). */
+    static void ArmIn(ulong deltaNs);
 
     u32 IntId() const { return TimerIntId; }
 
@@ -46,7 +53,8 @@ private:
     GenericTimer& operator=(GenericTimer&& other) = delete;
 
     u32 TimerIntId;
-    u64 TickInterval;
+
+    static constexpr ulong MaxArmNs = Const::NanoSecsInSec;
 };
 
 }
