@@ -36,7 +36,11 @@ is what catches it: a ring whose sequences were relaxed failed eight boots
 of eight under HVF, while TCG on an x86 host may never show it. Its line
 says what a push and a pop cost on one CPU and how long each run took
 (`ring selftest: passed ...`): a number every boot prints is noticed when it
-moves.
+moves. And on every CPU `TestSleepPrompt` has a task of its own sleep a
+millisecond twenty-one times while the CPU halts between interrupts: the
+median sleep must be under 5 ms -- 1.0-2.4 under HVF and TCG, 10.0 when the
+CPU's timer is not armed for a sleeper's deadline and the tick wakes it
+([the local timer](scheduler.md#the-local-timer)).
 
 - To add a test, write a `TestXxx()` and register it in the `Test()`
   dispatcher.
@@ -444,7 +448,19 @@ hardware, PCI configuration space, the local APIC through its MSRs and its
 page, the IO-APIC, MSIs, a virtio disk and NIC driven through rings well
 made and not -- and raced: another of the guest's CPUs topping a ring up
 by plain writes while the device takes from it, as nothing on the host can
-stop it doing -- the page walker over random page tables, the decoder, the
+stop it doing; the NIC with its receive interrupts held apart, the clock
+moved on between rounds, and held after each to owing none it should have
+raised (`rx_due`); its transmit offloads (`offload`), every send -- TCP over
+IPv4 to be cut, a frame whose checksum is left to the device, and noise,
+each well made or not -- held frame by frame to a model of its own written
+from virtio's and the RFCs' words, and on their own terms: no frame over
+1514 bytes, every checksum right, the payloads in order adding up to the
+send's; what it puts into the buffers its driver posts (`netrx`) -- a frame
+into one chain, or spread over mergeable buffers with their count in its
+header, a send carried whole with the header that says how to cut it, a
+checksum left to finish with the header that says where, or finished first
+for a driver that takes none so -- each used element held to the model's
+chain, length and bytes -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
 `place` holds where guests are put on the host's cores (`hv/src/place.rs`)
@@ -485,7 +501,11 @@ sending each other frames of every kind -- as themselves and as each other
 guest's bursts among them, past its share of `hv0`'s backlog (the backlog
 over the ports in use, counted afresh at each of the stack's passes) and
 past its rate to every port, the clock moved on now and then for the rate
-to come back; `nat`,
+to come back, and ports whose NIC holds its receive interrupts, a frame for
+which wakes nobody while the inbox is under half full -- and sends of TCP
+whole and frames with their checksum left to finish among them, each handed
+so to a port whose guest takes it so, and cut, or finished, for every other
+and for `hv0`; `nat`,
 guests' packets out into the world and the world's answers back, each
 rewrite checked field by field and its sums summed from scratch; and
 `guestnet`, the two as the module wires them, guests on the switch reaching
@@ -1255,8 +1275,13 @@ APIC virtualization, and the CPU -- `hv info`'s *APIC virtualization* --
 delivering all six and taking their EOIs under VT-x, the guest stopped after
 the three level-triggered ones alone ([Interrupts the CPU delivers
 itself](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization));
-there `tpr`'s CR8 is the virtual APIC's VTPR and no `mov` of it exits; and
-for `debug`, through the run loop
+there `tpr`'s CR8 is the virtual APIC's VTPR and no `mov` of it exits; for
+`posted`, two CPUs both running, that the first counted all thousand of the
+fixed IPIs the second sent it while it spun -- and who handed them over:
+where the CPU has posted interrupts (`hv info`) each was posted and the
+notification sent for nine in ten at least, the first CPU taking them in
+its guest and leaving it a tenth as many times at most, and elsewhere the
+host; and for `debug`, through the run loop
 a Linux guest's CPUs go through, that a single step and an `int1` -- each a
 #DB the host intercepts -- reached the guest's own handler, the first with
 DR6.BS and after the stepped instruction, the second after the ICEBP: a

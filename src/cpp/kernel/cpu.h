@@ -26,6 +26,11 @@ namespace Kernel
    proportion. */
 const ulong MaxCpus = 64;
 
+/* The tick: every CPU's, 100 times a second on both architectures. The
+   round robin, the watchdog, the profiler and the software timers run on
+   it; a task asleep until a deadline does not wait for it (Cpu::LocalTimer*). */
+const ulong TickHz = 100;
+
 struct IPITask
 {
     using Func = void (*)(void* ctx, Context* ipiCtx);
@@ -62,6 +67,29 @@ public:
 
     void IPI(Context* ctx);
     void TimerTick(Context* ctx);
+
+    /* This CPU's local timer, one-shot: armed for the earlier of its next
+       tick, on a TickHz grid, and the soonest deadline of a task asleep on
+       it -- so a Sleep() or an Event::WaitFor() ends at its deadline, and
+       not at the next tick after it. Each is called on this CPU only, with
+       interrupts off.
+
+       LocalTimerStart: the hardware set up one-shot by the arch, the grid
+       begins and the first tick is armed. LocalTimerFired: from the
+       timer's interrupt, whether the tick is due -- the grid moved on if so
+       -- with the timer armed again for the next one; the soonest deadline,
+       if it is sooner, is the scheduler's to bring forward
+       (LocalTimerTakeWalk, TaskQueue::Schedule). LocalTimerWake: the timer
+       brought forward to a deadline sooner than the one it has; nothing for
+       0, for a later one, or where the timer is not one-shot.
+       LocalTimerTick: the next tick armed and nothing else, for a CPU whose
+       queue may not be looked at -- a panic's. */
+    void LocalTimerStart();
+    bool LocalTimerOneShot() const { return TimerOneShot; }
+    bool LocalTimerFired(ulong now);
+    bool LocalTimerTakeWalk();
+    void LocalTimerWake(ulong deadline);
+    void LocalTimerTick();
 
     static const ulong StateInited = 0x1;
     static const ulong StateRunning = 0x2;
@@ -107,6 +135,24 @@ private:
 
     /* Set by Park() before StateExited; see IsParked */
     Atomic Parked;
+
+    void LocalTimerArm(ulong when, ulong now);
+
+    /* The local timer (LocalTimer*): one-shot here, the next tick's due
+       time, when the timer is armed to fire (~0 when it is not), and that
+       it fired since the scheduler last looked for the soonest deadline.
+       This CPU's alone, with interrupts off. */
+    bool TimerOneShot;
+    ulong TickDue;
+    ulong TimerArmedAt;
+    bool TimerWalk;
+
+    /* Ticks are a period apart; an interrupt this close before the next
+       is that tick, rather than one more interrupt a moment later. */
+    static constexpr ulong TickPeriodNs = Const::NanoSecsInSec / TickHz;
+    static constexpr ulong TickSlackNs = 20 * Const::NanoSecsInUsec;
+    /* The nearest the timer is armed: one already due fires at once. */
+    static constexpr ulong TimerMinNs = Const::NanoSecsInUsec;
 
     static const ulong Tag = 'Cpu ';
 };

@@ -114,9 +114,11 @@ and take mutexes.
   spurious vector (0xFF) get their IDT entries, and interrupts are enabled.
 - `TimeInit()` calibrates the TSC against PIT channel 2 and picks a clock
   source (kvmclock → calibrated TSC → PIT).
-- `Lapic::CalibrateTimer(100 Hz)` and `StartTimer` — this CPU's own periodic
-  tick. It has to precede `StartAll` so an AP can arm its own timer as it
-  comes up.
+- `Lapic::CalibrateTimer()` and `StartTimer` — this CPU's own tick: its
+  local APIC's timer, one-shot, armed for each tick and for each deadline a
+  task on the CPU sleeps to (`Cpu::LocalTimerStart`, [the
+  scheduler](scheduler.md#the-local-timer)). It has to precede `StartAll` so
+  an AP can start its own timer as it comes up.
 - `CpuTable::StartAll()` unless `smp=off`; `maxcpus=N` caps how many.
 - `IrqBalance::Balance()` spreads the device IRQs recorded so far across the
   CPUs that are now running. See [Interrupts](interrupts.md).

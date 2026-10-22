@@ -35,6 +35,8 @@ pub static ALL: &[Target] = &[
     Target { name: "msi", run: msi, max_len: 1024 },
     Target { name: "blk", run: blk_target, max_len: 8192 },
     Target { name: "net", run: net_target, max_len: 8192 },
+    Target { name: "offload", run: crate::offloadmodel::offload_target, max_len: 4096 },
+    Target { name: "netrx", run: crate::netrx::netrx_target, max_len: 2048 },
     Target { name: "walk", run: walk, max_len: 2048 },
     Target { name: "insn", run: insn, max_len: 256 },
     Target { name: "linux", run: linux, max_len: 4096 },
@@ -413,9 +415,13 @@ pub fn apic_value(r: &mut Input, reg: u32) -> u64 {
         APIC_TIMER_DIVIDE => r.below(16),
         APIC_ICR => {
             /* Delivery mode, logical, level assert, level trigger, a
-             * shorthand -- and in x2APIC mode the destination above. */
-            let low = vector | (r.below(8) << 8) | u64::from(r.bool()) << 11 | u64::from(r.bool()) << 14
-                | u64::from(r.bool()) << 15 | (r.below(4) << 18);
+             * shorthand -- and in x2APIC mode the destination above. Half of
+             * them a fixed IPI to one CPU, as most a kernel sends are. */
+            let fixed = r.bool();
+            let mode = if fixed { 0 } else { r.below(8) };
+            let shorthand = if fixed { 0 } else { r.below(4) };
+            let low = vector | (mode << 8) | u64::from(r.bool() && !fixed) << 11 | u64::from(r.bool()) << 14
+                | u64::from(r.bool() && !fixed) << 15 | (shorthand << 18);
             low | (u64::from(r.pick(&[0u32, 1, 2, 3, 0xF, 0xFF, 0xFFFF_FFFF])) << 32)
         }
         APIC_ICR_HIGH => u64::from(r.u8()) << 24,
@@ -803,11 +809,17 @@ fn blk_request(mem: &GuestMemory, q: &mut DriverQueue, r: &mut Input) {
 
 fn blk_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
+    let since = time::boot_time_ns();
     let size = if r.bool() { blk::SECTOR * r.below(1 << 16) } else { r.value64() & !(blk::SECTOR - 1) };
     let state = Arc::new(Mutex::new(DiskState::new(size, r.bool())));
     let mut disk = Blk::new(Box::new(Disk(state.clone())), "fuzz").expect("a disk");
     if r.bool() {
         disk.offer_msix(2);
+    }
+    /* Its rings copied rather than mapped, on some inputs: what a queue is
+     * left with when the kernel has no address for them. */
+    if r.u8() < 48 {
+        mem.refuse_maps(true);
     }
     let mut q = DriverQueue::default();
     while let Some(op) = r.op(13) {
@@ -817,22 +829,22 @@ fn blk_target(r: &mut Input) {
             }
             1 => {
                 let (offset, size, value) = (r.below(u64::from(blk::BAR_SIZE)) as u16, r.io_size(), r.value32());
-                disk.io_write(offset, size, value, &mem);
+                disk.io_write(offset, size, value, &mem, time::boot_time_ns());
             }
             2 => {
                 let mut write = |offset: u16, size: u8, value: u32| {
-                    disk.io_write(offset, size, value, &mem);
+                    disk.io_write(offset, size, value, &mem, time::boot_time_ns());
                 };
                 let index = if r.u8() < 240 { 0 } else { r.u16() };
                 setup_queue(r, &mut write, &mut q, index);
             }
             3 => {
                 let status = r.pick(&[0, 1, 3, 7, 15, 0x80, 0xFF]);
-                disk.io_write(DEVICE_STATUS, 1, status, &mem);
+                disk.io_write(DEVICE_STATUS, 1, status, &mem, time::boot_time_ns());
             }
             4 => {
                 let queue = if r.u8() < 240 { 0 } else { r.u16() };
-                disk.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem);
+                disk.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem, time::boot_time_ns());
             }
             5 => {
                 let (at, n) = (gpa(r), r.below(64) as usize);
@@ -846,7 +858,7 @@ fn blk_target(r: &mut Input) {
                 for _ in 0..1 + r.below(2 * blk::IN_FLIGHT as u64) {
                     blk_request(&mem, &mut q, r);
                 }
-                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem);
+                disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
             }
             8 | 9 => {
                 disk.poll(&mem);
@@ -870,7 +882,7 @@ fn blk_target(r: &mut Input) {
                 let notify = r.bool();
                 racing(&mem, &mut q, || {
                     if notify {
-                        disk.io_write(QUEUE_NOTIFY, 2, 0, &mem);
+                        disk.io_write(QUEUE_NOTIFY, 2, 0, &mem, time::boot_time_ns());
                     } else {
                         disk.poll(&mem);
                     }
@@ -878,13 +890,19 @@ fn blk_target(r: &mut Input) {
             }
         }
     }
+    mem.held_to_map_budget(since);
 }
 
 /// The guests' switch as a NIC's backend sees it: frames sent checked, and
 /// frames to deliver, as the fuzzer makes them.
 #[derive(Default)]
 pub struct NicState {
-    pub rx: VecDeque<Vec<u8>>,
+    /// Frames for the guest -- whole, their checksum left to finish, or
+    /// sends carried whole.
+    pub rx: VecDeque<(Vec<u8>, crate::offload::Rx)>,
+    /// What the device last told it its guest takes (`Backend::takes`),
+    /// which `netrx` holds to the driver's features.
+    pub takes: crate::offload::Takes,
 }
 
 pub struct Nic(pub Arc<Mutex<NicState>>);
@@ -893,23 +911,81 @@ impl net::Backend for Nic {
     fn send(&mut self, frame: &[u8]) {
         invariant!(frame.len() <= net::MAX_FRAME, "a frame of {} bytes sent, past {}", frame.len(), net::MAX_FRAME);
     }
+    /// The next frame finished -- whole, before it is cut to `buf` -- as
+    /// the switch's own `recv` hands one; a send carried whole, which no
+    /// frame's buffer holds, dropped.
     fn recv(&mut self, buf: &mut [u8]) -> Option<usize> {
-        let f = self.0.lock().unwrap().rx.pop_front()?;
-        let n = f.len().min(buf.len());
-        buf[..n].copy_from_slice(&f[..n]);
-        Some(n)
+        use crate::offload::Rx;
+        let mut s = self.0.lock().unwrap();
+        loop {
+            let (mut f, rx) = s.rx.pop_front()?;
+            match rx {
+                Rx::Whole(_) => continue,
+                Rx::Partial(p) => p.complete(&mut f),
+                Rx::Done => {}
+            }
+            let n = f.len().min(buf.len());
+            buf[..n].copy_from_slice(&f[..n]);
+            return Some(n);
+        }
+    }
+    /// What waits, as the switch hands it over: each as it was put in,
+    /// whatever the device has said its guest takes since -- a frame put in
+    /// before its driver took other features is the device's to finish, or
+    /// drop -- and a send carried whole only when it fits.
+    fn recv_with(&mut self, buf: &mut [u8]) -> Option<(usize, crate::offload::Rx)> {
+        let mut s = self.0.lock().unwrap();
+        loop {
+            let (f, rx) = s.rx.pop_front()?;
+            if matches!(rx, crate::offload::Rx::Whole(_)) && f.len() > buf.len() {
+                continue;
+            }
+            let n = f.len().min(buf.len());
+            buf[..n].copy_from_slice(&f[..n]);
+            return Some((n, rx));
+        }
+    }
+    fn takes(&mut self, takes: crate::offload::Takes) {
+        self.0.lock().unwrap().takes = takes;
+    }
+}
+
+/// After a round of the NIC at `now` (`poll`): no receive interrupt still
+/// owed with its time up -- the round raises what is due -- and what it
+/// promised its backend, the next time it looks, ahead of `now`. Not after a
+/// notify: a transmit queue's runs no receive round, and what is due waits
+/// for the next, which a due time already past makes at once.
+fn rx_promise_kept(nic: &Net, now: u64) {
+    if let Some(due) = nic.rx_due(now) {
+        invariant!(due > now, "a receive interrupt owed since {} ns, and the round at {} did not raise it", due, now);
     }
 }
 
 fn net_target(r: &mut Input) {
     let mem = GuestMemory::with_size(MEM);
+    let since = time::boot_time_ns();
     let state = Arc::new(Mutex::new(NicState::default()));
     let mut nic = Net::new(Box::new(Nic(state.clone())), [2, 0, 0, 0, 0x64, 2]).expect("a NIC");
     if r.bool() {
         nic.offer_msix(3);
     }
+    /* Receive interrupts moderated, on most inputs: what is owed comes by
+     * the time the device said it would look again (`rx_due`). */
+    if r.u8() < 192 {
+        nic.set_rx_moderation(r.pick(&[1_000u64, 20_000, 100_000, 1_000_000]));
+    }
+    /* Its transmit offloads offered, mostly: a driver that accepts them may
+     * send what is to be cut through the ring (`offload` holds the cutting
+     * to a model). */
+    if r.u8() < 48 {
+        nic.set_offloads(false);
+    }
+    /* Its rings copied rather than mapped, on some inputs, as the disk's. */
+    if r.u8() < 48 {
+        mem.refuse_maps(true);
+    }
     let mut queues = [DriverQueue::default(); 2];
-    while let Some(op) = r.op(13) {
+    while let Some(op) = r.op(14) {
         let which = r.below(2) as usize;
         match op {
             0 => {
@@ -917,22 +993,22 @@ fn net_target(r: &mut Input) {
             }
             1 => {
                 let (offset, size, value) = (r.below(u64::from(net::BAR_SIZE)) as u16, r.io_size(), r.value32());
-                nic.io_write(offset, size, value, &mem);
+                nic.io_write(offset, size, value, &mem, time::boot_time_ns());
             }
             2 => {
                 let mut write = |offset: u16, size: u8, value: u32| {
-                    nic.io_write(offset, size, value, &mem);
+                    nic.io_write(offset, size, value, &mem, time::boot_time_ns());
                 };
                 let index = if r.u8() < 240 { which as u16 } else { r.u16() };
                 setup_queue(r, &mut write, &mut queues[which], index);
             }
             3 => {
                 let status = r.pick(&[0, 1, 3, 7, 15, 0x80, 0xFF]);
-                nic.io_write(DEVICE_STATUS, 1, status, &mem);
+                nic.io_write(DEVICE_STATUS, 1, status, &mem, time::boot_time_ns());
             }
             4 => {
                 let queue = if r.u8() < 240 { which as u16 } else { r.u16() };
-                nic.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem);
+                nic.io_write(QUEUE_NOTIFY, 2, u32::from(queue), &mem, time::boot_time_ns());
             }
             5 => {
                 let (at, n) = (gpa(r), r.below(64) as usize);
@@ -958,12 +1034,18 @@ fn net_target(r: &mut Input) {
                 chain(&mem, &mut queues[1], r, &segs);
             }
             8 | 9 => {
-                nic.poll(&mem);
+                let now = time::boot_time_ns();
+                nic.poll(&mem, now);
+                rx_promise_kept(&nic, now);
+            }
+            13 => {
+                /* Time going by: a held receive interrupt's due, or not yet. */
+                time::advance(r.pick(&[500u64, 20_000, 100_000, 2_000_000]));
             }
             10 => {
                 let n = r.pick(&[0usize, 13, 14, 60, 64, 1500, 1514, 1515, 4000]);
                 let frame: Vec<u8> = (0..n).map(|_| r.u8()).collect();
-                state.lock().unwrap().rx.push_back(frame);
+                state.lock().unwrap().rx.push_back((frame, crate::offload::Rx::Done));
             }
             11 => {
                 nic.set_msix_enabled(r.bool());
@@ -979,24 +1061,25 @@ fn net_target(r: &mut Input) {
                     let segs = [(gpa(r), 10, false), (gpa(r), 60, false)];
                     chain(&mem, &mut queues[1], r, &segs);
                     racing(&mem, &mut queues[1], || {
-                        nic.io_write(QUEUE_NOTIFY, 2, 1, &mem);
+                        nic.io_write(QUEUE_NOTIFY, 2, 1, &mem, time::boot_time_ns());
                     });
                 } else {
                     {
                         let mut s = state.lock().unwrap();
                         while s.rx.len() < RACE_POSTS + 2 {
-                            s.rx.push_back(vec![0x5A; 60]);
+                            s.rx.push_back((vec![0x5A; 60], crate::offload::Rx::Done));
                         }
                     }
                     let segs = [(gpa(r), 1526, true)];
                     chain(&mem, &mut queues[0], r, &segs);
                     racing(&mem, &mut queues[0], || {
-                        nic.poll(&mem);
+                        nic.poll(&mem, time::boot_time_ns());
                     });
                 }
             }
         }
     }
+    mem.held_to_map_budget(since);
 }
 
 /* ---- the MMIO path: the page walk and the decoder ---- */

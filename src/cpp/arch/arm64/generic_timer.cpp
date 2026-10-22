@@ -10,13 +10,15 @@
 #include <kernel/profiler.h>
 #include <kernel/panic.h>
 #include <kernel/trace.h>
+#include <kernel/time.h>
 #include <hal/irqchip.h>
 
 /* Per-CPU scheduler tick over the ARM generic (virtual) timer: 100 Hz on
-   every CPU. The x86 tick fires on the BSP and broadcasts via SGI
-   (drivers/pit.cpp); here the timer PPI is banked per-CPU, so each CPU
-   ticks itself — no per-tick IPI broadcast, and each CPU schedules
-   independently. Timekeeping reads CNTVCT directly (time_arm64.cpp). */
+   every CPU, the timer PPI banked per-CPU, so each CPU ticks itself and
+   schedules independently -- as x86's local APIC timers do. One-shot: armed
+   by its compare value for the next tick, or sooner for a task asleep until
+   a deadline (Cpu::LocalTimer*). Timekeeping reads CNTVCT directly
+   (time_arm64.cpp). */
 
 /* The network layer is Rust (src/rust/net): a receive pass offered from the
    tick, which it takes only with rxpoll=on. */
@@ -28,8 +30,6 @@ namespace Kernel
 namespace
 {
 
-const ulong TickHz = 100;
-
 u64 ReadCntfrq()
 {
     u64 freq;
@@ -37,9 +37,32 @@ u64 ReadCntfrq()
     return freq;
 }
 
-void ArmTimer(u64 ticks)
+u64 ReadCntvct()
 {
-    asm volatile("msr cntv_tval_el0, %0" :: "r"(ticks));
+    u64 cnt;
+    asm volatile("isb; mrs %0, cntvct_el0" : "=r"(cnt));
+    return cnt;
+}
+
+}
+
+void GenericTimer::ArmIn(ulong deltaNs)
+{
+    u64 freq = ReadCntfrq();
+
+    /* A second ahead at most: the timer is armed for a tick at the latest
+       (Cpu::LocalTimerArm), and no further keeps the sum below in range */
+    deltaNs = Stdlib::Min(deltaNs, MaxArmNs);
+
+    /* Counts, rounded up, whole seconds and the rest apart: a remainder
+       under 2^30 times a frequency the architecture has as a 32-bit field
+       stays in a u64. The counter is what GetBootTime reads, so a deadline
+       in its counts is never early. */
+    u64 secs = deltaNs / Const::NanoSecsInSec;
+    u64 rest = deltaNs % Const::NanoSecsInSec;
+    u64 counts = secs * freq + (rest * freq + Const::NanoSecsInSec - 1) / Const::NanoSecsInSec;
+
+    asm volatile("msr cntv_cval_el0, %0" :: "r"(ReadCntvct() + counts));
     asm volatile("msr cntv_ctl_el0, %0" :: "r"(1UL)); /* ENABLE, no IMASK */
     /* The timer-output (PPI line) update takes effect only after context
        synchronization — required so the EOI that follows a re-arm cannot
@@ -47,11 +70,8 @@ void ArmTimer(u64 ticks)
     asm volatile("isb");
 }
 
-}
-
 GenericTimer::GenericTimer()
     : TimerIntId(0)
-    , TickInterval(0)
 {
 }
 
@@ -61,7 +81,6 @@ GenericTimer::~GenericTimer()
 
 bool GenericTimer::Setup()
 {
-    TickInterval = ReadCntfrq() / TickHz;
     TimerIntId = Board::GetInstance().TimerIntId;
 
     /* Register the handler object once (the INTID -> handler table is
@@ -72,10 +91,10 @@ bool GenericTimer::Setup()
        before the EOI. */
     Interrupt::RegisterLevel(*this, (u8)TimerIntId, (u8)TimerIntId);
 
-    ArmTimer(TickInterval);
+    CpuTable::GetInstance().GetCurrentCpu().LocalTimerStart();
 
-    Trace(0, "GenericTimer: per-cpu tick %lu Hz interval %lu intid %lu",
-        TickHz, TickInterval, (ulong)TimerIntId);
+    Trace(0, "GenericTimer: per-cpu tick %lu Hz, one-shot, counter %lu Hz, intid %lu",
+        TickHz, (ulong)ReadCntfrq(), (ulong)TimerIntId);
     return true;
 }
 
@@ -86,23 +105,33 @@ void GenericTimer::ArmSelf()
     ulong mpidr;
     asm volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
     Gic::GetInstance().EnableIrq(TimerIntId, mpidr, false /* level */);
-    ArmTimer(TickInterval);
+    CpuTable::GetInstance().GetCurrentCpu().LocalTimerStart();
 }
 
 void GenericTimer::LocalTick(Context* ctx)
 {
-    (void)ctx;
+    auto& cpus = CpuTable::GetInstance();
+    auto& cpu = cpus.GetCurrentCpu();
 
-    ArmTimer(TickInterval);
-
+    /* Re-armed first, whatever follows: the line is a level, and armed in
+       the future it goes down before the EOI */
     if (Panicker::GetInstance().IsActive())
     {
+        /* Ticking on, without the walk: the queue's lock may be the
+           panicking CPU's */
+        cpu.LocalTimerTick();
         Hal::IrqEoi((u8)TimerIntId);
         return;
     }
 
-    auto& cpus = CpuTable::GetInstance();
-    auto& cpu = cpus.GetCurrentCpu();
+    if (!cpu.LocalTimerFired(GetBootTime().GetValue()))
+    {
+        /* A sleeper's deadline, not the tick: only the reschedule */
+        InterruptStats::Inc(IrqTimerWake);
+        Hal::IrqEoi((u8)TimerIntId);
+        Preempt();
+        return;
+    }
 
     Watchdog::GetInstance().Check();
 

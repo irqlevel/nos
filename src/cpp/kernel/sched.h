@@ -44,6 +44,16 @@ private:
 
     Task* SelectNext(Task* curr, bool keepOverIdle);
 
+    /* The soonest deadline after now of a task blocked on this queue until
+       one (Sleep, Event::WaitFor) -- what this CPU's timer is to fire for
+       before its next tick -- or ~0 when there is none. Under Lock. */
+    ulong EarliestDeadline(ulong now);
+
+    /* This CPU's timer brought forward to what is asleep here: after it
+       fired, to the soonest deadline of all (EarliestDeadline); otherwise to
+       curr's, blocking now. Under Lock, interrupts off. */
+    void WakeSleepers(Task* curr);
+
     /* Spins allowed in Schedule while an exited task waits for a
        runnable candidate before declaring the queue broken */
     static const ulong MaxExitedRetries = 100000000;

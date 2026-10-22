@@ -567,6 +567,20 @@ impl Vcpu {
         self.guest.has_vapic()
     }
 
+    /// Whether interrupts posted for this guest CPU can be taken in its
+    /// guest, without an exit: a virtual APIC and the CPU's posted-interrupt
+    /// processing.
+    pub fn posted_capable(&self) -> bool {
+        self.guest.posted_capable()
+    }
+
+    /// `posted` is where its interrupts are posted, for the CPU to take in
+    /// the guest while virtual-interrupt delivery is on: before its first
+    /// entry, and true when it took it.
+    pub fn set_posted(&mut self, posted: alloc::sync::Arc<hvarch::x86::vmx::PostedInterrupts>) -> bool {
+        self.guest.set_posted(posted)
+    }
+
     /// Virtual-interrupt delivery for the next entry, from where the guest's
     /// local APIC stands: what it has requested and in service, the
     /// level-triggered of them -- whose EOIs exit -- and its task priority,

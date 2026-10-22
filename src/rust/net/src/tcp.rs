@@ -513,6 +513,33 @@ fn now_ms() -> u64 {
     kcore::time::boot_time().as_nanos() / kcore::consts::NS_PER_MS
 }
 
+/// A wait that nothing signals -- an answer, a connection, room in the
+/// window, data -- polled with a sleep that doubles: a millisecond at first,
+/// so what comes soon is seen at once, and up to ten, so that a wait that
+/// goes on -- a listener's, an idle session's -- wakes its CPU a hundred
+/// times a second and not a thousand. The sleeps were a millisecond each
+/// and lasted a tick, ten; since a sleep ends at its deadline
+/// (docs/scheduler.md, the local timer), a millisecond is one, and an idle
+/// nos on the EX44 with sshd up and two sessions open woke 2,200 times a
+/// second.
+struct Poll {
+    ms: u64,
+}
+
+impl Poll {
+    const FIRST_MS: u64 = 1;
+    const MOST_MS: u64 = 10;
+
+    fn new() -> Poll {
+        Poll { ms: Self::FIRST_MS }
+    }
+
+    fn sleep(&mut self) {
+        kcore::task::sleep_ms(self.ms);
+        self.ms = (self.ms * 2).min(Self::MOST_MS);
+    }
+}
+
 fn hash_index(local_ip: u32, local_port: u16, remote_ip: u32, remote_port: u16) -> usize {
     let mut h = local_ip ^ remote_ip ^ ((local_port as u32) << 16) ^ remote_port as u32;
     h ^= h >> 16;
@@ -1315,6 +1342,7 @@ impl Tcp {
         /* Looked at once more after the last sleep, whatever the clock
          * says by then: an answer that came in during it is an answer. */
         let deadline = now_ms() + CONNECT_TIMEOUT_MS;
+        let mut poll = Poll::new();
         loop {
             if conn.conn_ready.load(Ordering::Acquire) {
                 let state = conn.inner.lock().state;
@@ -1333,7 +1361,7 @@ impl Tcp {
             if now_ms() >= deadline {
                 break;
             }
-            kcore::task::sleep_ms(1);
+            poll.sleep();
         }
 
         trace!(0, "tcp: nothing answered {} -> {}", src_port, dst_port);
@@ -1396,6 +1424,7 @@ impl Tcp {
         };
 
         let deadline = if timeout_ms != 0 { now_ms() + timeout_ms } else { 0 };
+        let mut poll = Poll::new();
 
         loop {
             let pool = self.pool.lock();
@@ -1432,7 +1461,7 @@ impl Tcp {
             if deadline != 0 && now_ms() >= deadline {
                 return None;
             }
-            kcore::task::sleep_ms(1);
+            poll.sleep();
         }
     }
 
@@ -1446,6 +1475,7 @@ impl Tcp {
          * with the rest. */
         let deadline = if timeout_ms != 0 { now_ms() + timeout_ms } else { 0 };
 
+        let mut poll = Poll::new();
         while sent < data.len() {
             let mut inner = conn.inner.lock();
 
@@ -1459,7 +1489,7 @@ impl Tcp {
                 if deadline != 0 && now_ms() >= deadline {
                     return sent as isize;
                 }
-                kcore::task::sleep_ms(1);
+                poll.sleep();
                 continue;
             }
 
@@ -1476,7 +1506,7 @@ impl Tcp {
                 if deadline != 0 && now_ms() >= deadline {
                     return sent as isize;
                 }
-                kcore::task::sleep_ms(1);
+                poll.sleep();
                 continue;
             }
             let window_room = (inner.snd_wnd - in_flight) as usize;
@@ -1500,6 +1530,8 @@ impl Tcp {
             }
             drop(inner);
             sent += chunk;
+            /* Moving again: the next stall is waited for from the start */
+            poll = Poll::new();
         }
 
         sent as isize
@@ -1514,6 +1546,7 @@ impl Tcp {
          * arrives pushes it out again, so a long but progressing download
          * never trips it while a peer that goes silent does. */
         let deadline = if timeout_ms != 0 { now_ms() + timeout_ms } else { 0 };
+        let mut poll = Poll::new();
 
         loop {
             let mut inner = conn.inner.lock();
@@ -1551,7 +1584,7 @@ impl Tcp {
             if deadline != 0 && now_ms() > deadline {
                 return RECV_TIMEOUT;
             }
-            kcore::task::sleep_ms(1);
+            poll.sleep();
         }
     }
 }

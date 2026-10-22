@@ -72,10 +72,18 @@ pub struct Spec {
     /// devices' interrupts through in place of the 8259 -- its local APICs
     /// out of reset in xAPIC mode with it, as `xapic` has them.
     pub ioapic: bool,
-    /// `apicv`: its local APICs' interrupts delivered, and their EOIs taken,
-    /// by the CPU where it can (VT-x's virtual-interrupt delivery, for an
-    /// x2APIC guest) rather than injected by the run loop.
-    pub apicv: bool,
+    /// `apicv` and `noapicv`: its local APICs' interrupts delivered, and
+    /// their EOIs taken, by the CPU where it can (VT-x's virtual-interrupt
+    /// delivery, for an x2APIC guest), or injected by the run loop. Neither,
+    /// the CPU's where it takes another CPU's interrupts posted too.
+    pub apicv: Option<bool>,
+    /// `rxmod=US`: its NICs' receive interrupts no closer than this apart,
+    /// 0 for each as its frame comes; unset, hv's default
+    /// (`hv::run::RX_MODERATION_DEFAULT_NS`).
+    pub rxmod_us: Option<u64>,
+    /// `nooffload`: its NICs without their transmit offloads -- checksums
+    /// and TCP's segmentation left to its own kernel, as before them.
+    pub nooffload: bool,
     /// `log`: its console to the kernel log too, a line at a time.
     pub log: bool,
     /// `restart`, for `hv start`: boot it again when it resets itself.
@@ -125,7 +133,9 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         cpus: 1,
         xapic: false,
         ioapic: false,
-        apicv: false,
+        apicv: None,
+        rxmod_us: None,
+        nooffload: false,
         log: false,
         restart: false,
         net: false,
@@ -173,7 +183,13 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         } else if word == "ioapic" {
             spec.ioapic = true;
         } else if word == "apicv" {
-            spec.apicv = true;
+            spec.apicv = Some(true);
+        } else if word == "noapicv" {
+            spec.apicv = Some(false);
+        } else if word == "nooffload" {
+            spec.nooffload = true;
+        } else if let Some(v) = word.strip_prefix("rxmod=") {
+            spec.rxmod_us = Some(v.parse().map_err(|_| String::from("rxmod= wants microseconds"))?);
         } else if word == "restart" {
             spec.restart = true;
         } else if word == "net" {
@@ -296,7 +312,15 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
 
     let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
         .map_err(|e| alloc::format!("no guest: {}", e))?;
-    guest.set_apicv(spec.apicv);
+    if let Some(on) = spec.apicv {
+        guest.set_apicv(on);
+    }
+    if let Some(us) = spec.rxmod_us {
+        guest.set_rx_moderation(us.saturating_mul(kcore::consts::NS_PER_US));
+    }
+    if spec.nooffload {
+        guest.set_offloads(false);
+    }
 
     /* The 64-bit kernel at its load address, then the initrd high. */
     stream(&guest, &spec.kernel, pm_offset, layout.kernel_addr, kernel_len)?;
@@ -436,6 +460,13 @@ pub fn run_cpus<H: Host + Send + Sync + 'static>(
     Ok(Ran { stopped, counts })
 }
 
+/// What a device's report adds when a queue of its has its rings copied
+/// rather than mapped: set up too often -- or with no address left for them
+/// -- to be given a mapping, and the slower for it.
+fn copied_note(copied: bool) -> &'static str {
+    if copied { "; rings copied, not mapped -- set up too often, or no address left" } else { "" }
+}
+
 /// Why the guest stopped, in a line.
 pub fn describe(stop: &Stop, out: &mut dyn Write) -> core::fmt::Result {
     match *stop {
@@ -540,6 +571,11 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  apic       {} interrupts from the local APICs, {} of their timers; {} IPIs sent, {} taken; {} MSIs",
             total.apic, total.timer, total.ipi_sent, total.ipi_taken, total.msi);
     }
+    let (posted, notified) = guest.posted_stats();
+    if posted != 0 {
+        let _ = writeln!(out, "  posted     {} interrupts posted for a CPU to take in its guest, {} with a notification sent to the CPU it ran on",
+            posted, notified);
+    }
     if total.vid != 0 {
         let _ = writeln!(out, "  apicv      {} entries with the CPU delivering the local APICs' interrupts itself and taking their EOIs (those are not among the APICs' above); {} EOIs it stopped the guest after, of level-triggered vectors",
             total.vid, total.eoi_exits);
@@ -587,16 +623,16 @@ pub fn report(out: &mut dyn Write, guest: &LinuxGuest, stopped: &Stopped, counts
         let _ = writeln!(out, "  nmi        {} NMIs taken from the guest's other CPUs, {} dropped by a CPU waiting to be started",
             total.nmi, total.nmi_lost);
     }
-    for (i, (sectors, s, broken)) in guest.disk_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}",
+    for (i, (sectors, s, broken, copied)) in guest.disk_stats().into_iter().enumerate() {
+        let _ = writeln!(out, "  vd{}        {} MiB: {} reads ({} KiB), {} writes ({} KiB), {} flushes, {} errors{}{}",
             (b'a' + i as u8) as char, sectors * hv::disk::SECTOR / (1024 * 1024), s.reads, s.read_bytes / 1024,
             s.writes, s.written_bytes / 1024, s.flushes, s.errors,
-            if broken { "; stopped over a ring the driver broke" } else { "" });
+            if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
     }
-    for (i, (s, broken)) in guest.nic_stats().into_iter().enumerate() {
-        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped{}",
-            i, s.sent, s.received, s.dropped,
-            if broken { "; stopped over a ring the driver broke" } else { "" });
+    for (i, (s, broken, copied)) in guest.nic_stats().into_iter().enumerate() {
+        let _ = writeln!(out, "  eth{}       {} frames sent, {} received, {} dropped; {} sends of TCP up to 64 KiB, {} received whole{}{}",
+            i, s.sent, s.received, s.dropped, s.large, s.whole,
+            if broken { "; stopped over a ring the driver broke" } else { "" }, copied_note(copied));
     }
     let hot = guest.hot_ports(6);
     if !hot.is_empty() {

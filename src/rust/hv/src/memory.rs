@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use hvarch::{Error, Result};
 use kcore::consts::PAGE_SIZE;
-use kcore::frame::Frame;
+use kcore::frame::{Frame, Run};
 use kcore::pod::{self, Pod};
 use kcore::sync::Mutex;
 
@@ -56,9 +56,11 @@ impl SecondLevel {
 }
 
 const PAGE: u64 = PAGE_SIZE as u64;
-/// Frames are kept in runs of this many, so that no one allocation of the
-/// table of them outgrows a page however large the guest is.
-const RUN_FRAMES: usize = PAGE_SIZE / core::mem::size_of::<Frame>();
+
+/// Guest pages mapped into the host's space for as long as this lives
+/// (`GuestMemory::map`): read and written by offset into them, one plain
+/// value at a time.
+pub use kcore::frame::Mapped as Mapping;
 
 /// Where a guest's physical address space ends: four levels of nested table
 /// translate 48 bits, and an address above that faults whatever is mapped.
@@ -90,7 +92,10 @@ pub const XAPIC_PAGE: u64 = 0xFEE0_0000;
 /// compiler is undefined behaviour however it is used. Every access is a
 /// copy, bounds-checked against the region it falls in, made by the kernel
 /// through its temporary window onto the page: an address the guest gave,
-/// whatever it is, is at worst an `Unmapped`.
+/// whatever it is, is at worst an `Unmapped`. The exception is a few pages
+/// a device reads and writes at every request, its queues' rings, which it
+/// has mapped while the queue is up (`map`) -- three pages a queue, and
+/// still no reference: a load or a store of one value at a time.
 ///
 /// The nested table is inside, and that is the point of it. A guest reaches
 /// exactly what its nested table maps, and the table here maps nothing but
@@ -132,8 +137,9 @@ struct Absent {
 struct Region {
     base: u64,
     size: u64,
-    /// One frame a page, in order, `RUN_FRAMES` to a run.
-    runs: Vec<Vec<Frame>>,
+    /// One frame a page, in order: shared with every mapping of some of
+    /// them (`GuestMemory::map`), which keeps them until it is undone.
+    frames: Run,
 }
 
 impl Region {
@@ -141,10 +147,11 @@ impl Region {
         gpa >= self.base && len <= self.size && gpa - self.base <= self.size - len
     }
 
-    /// The frame `gpa` is in, and where in it: `gpa` is inside the region.
-    fn frame(&self, gpa: u64) -> (&Frame, usize) {
-        let page = ((gpa - self.base) / PAGE) as usize;
-        (&self.runs[page / RUN_FRAMES][page % RUN_FRAMES], (gpa % PAGE) as usize)
+    /// The frame `gpa` is in, and where in it: None for an address outside
+    /// the region.
+    fn frame(&self, gpa: u64) -> Option<(&Frame, usize)> {
+        let page = usize::try_from(gpa.checked_sub(self.base)? / PAGE).ok()?;
+        Some((self.frames.frame(page)?, (gpa % PAGE) as usize))
     }
 }
 
@@ -194,20 +201,8 @@ impl GuestMemory {
         /* The kernel zeroes every frame it hands out: what the guest finds
          * in its memory is what it was given, never what the host left
          * there. A failure part way drops what was taken. */
-        let pages = (size / PAGE) as usize;
-        let mut runs: Vec<Vec<Frame>> = Vec::new();
-        runs.try_reserve_exact(pages.div_ceil(RUN_FRAMES)).map_err(|_| Error::NoMemory)?;
-        let mut left = pages;
-        while left > 0 {
-            let n = left.min(RUN_FRAMES);
-            let mut run = Vec::new();
-            run.try_reserve_exact(n).map_err(|_| Error::NoMemory)?;
-            for _ in 0..n {
-                run.push(Frame::new().ok_or(Error::NoMemory)?);
-            }
-            runs.push(run);
-            left -= n;
-        }
+        let pages = usize::try_from(size / PAGE).map_err(|_| Error::NoMemory)?;
+        let frames = Run::new(pages).ok_or(Error::NoMemory)?;
         /* The tables next, which is all that can fail for want of memory:
          * a failure there leaves empty tables and no page mapped. */
         #[cfg(target_arch = "x86_64")]
@@ -216,7 +211,7 @@ impl GuestMemory {
         table.prepare(base, size)?;
 
         self.regions.try_reserve(1).map_err(|_| Error::NoMemory)?;
-        self.regions.push(Region { base, size, runs });
+        self.regions.push(Region { base, size, frames });
 
         /* Owned first, mapped after, so every page the table points at is
          * this value's from before the moment it is reachable. */
@@ -224,7 +219,7 @@ impl GuestMemory {
         {
             let region = self.regions.last().expect("just pushed");
             let mut gpa = base;
-            for frame in region.runs.iter().flatten() {
+            for frame in region.frames.iter() {
                 table.set(gpa, frame.phys())?;
                 gpa += PAGE;
             }
@@ -314,7 +309,7 @@ impl GuestMemory {
         let region = &self.regions[self.region(gpa, buf.len())?];
         let mut done = 0usize;
         while done < buf.len() {
-            let (frame, off) = region.frame(gpa + done as u64);
+            let (frame, off) = region.frame(gpa + done as u64).ok_or(Error::Unmapped)?;
             let n = (buf.len() - done).min(PAGE_SIZE - off);
             if !frame.read(off, &mut buf[done..done + n]) {
                 return Err(Error::Unmapped);
@@ -331,7 +326,7 @@ impl GuestMemory {
         let region = &self.regions[self.region(gpa, data.len())?];
         let mut done = 0usize;
         while done < data.len() {
-            let (frame, off) = region.frame(gpa + done as u64);
+            let (frame, off) = region.frame(gpa + done as u64).ok_or(Error::Unmapped)?;
             let n = (data.len() - done).min(PAGE_SIZE - off);
             if !frame.write(off, &data[done..done + n]) {
                 return Err(Error::Unmapped);
@@ -351,7 +346,7 @@ impl GuestMemory {
             return Err(Error::BadAddress);
         }
         let region = &self.regions[self.region(gpa, 2)?];
-        let (frame, off) = region.frame(gpa);
+        let (frame, off) = region.frame(gpa).ok_or(Error::Unmapped)?;
         frame.load_u16(off).ok_or(Error::Unmapped)
     }
 
@@ -363,8 +358,28 @@ impl GuestMemory {
             return Err(Error::BadAddress);
         }
         let region = &self.regions[self.region(gpa, 2)?];
-        let (frame, off) = region.frame(gpa);
+        let (frame, off) = region.frame(gpa).ok_or(Error::Unmapped)?;
         if frame.store_u16(off, value) { Ok(()) } else { Err(Error::Unmapped) }
+    }
+
+    /// The guest's pages from `gpa`, as many as `len` bytes reach,
+    /// `kcore::frame::MAPPED_MAX` at most, mapped into the host's space
+    /// until the mapping is dropped: what a device reads and writes at every
+    /// request -- a virtqueue's rings -- without a page mapped and unmapped
+    /// at every access as `read` and `write` have. `gpa` is a page's, and
+    /// every page is RAM of one region; the mapping keeps its frames
+    /// allocated however long it outlives this.
+    pub fn map(&self, gpa: u64, len: usize) -> Result<Mapping> {
+        if gpa % PAGE != 0 || len == 0 {
+            return Err(Error::BadAddress);
+        }
+        let pages = len.div_ceil(PAGE_SIZE);
+        if pages > kcore::frame::MAPPED_MAX {
+            return Err(Error::BadAddress);
+        }
+        let region = &self.regions[self.region(gpa, pages.checked_mul(PAGE_SIZE).ok_or(Error::BadAddress)?)?];
+        let first = usize::try_from((gpa - region.base) / PAGE).map_err(|_| Error::BadAddress)?;
+        region.frames.map(first, pages).ok_or(Error::NoMemory)
     }
 
     /// The `T` at `gpa`, as it is this instant.

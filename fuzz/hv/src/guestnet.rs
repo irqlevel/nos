@@ -12,6 +12,7 @@ use netwire::{arp, udp, ARP_LEN, ETH_HDR_LEN, ETH_TYPE_ARP, MAC_BROADCAST, MAX_F
 use crate::dhcp;
 use crate::network;
 use crate::nic::Backend as _;
+use crate::offload;
 use crate::switch::{self, Switch, MAX_PORTS};
 use crate::targets::Input;
 use crate::vms::Shared;
@@ -85,14 +86,35 @@ fn admit(p: usize, f: &[u8]) -> Admit {
 
 /// Where the switch must put each frame, and what it must count: said from
 /// what the switch is for, and held against what it does.
+/// Sends of TCP the switch carried whole and cut, for `HV_FUZZ_STATS`.
+static WHOLE_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CUT_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What an inbox entry is, by the header it goes to its guest with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Done,
+    Partial(usize, usize),
+    Whole,
+}
+
 struct Model {
     owned: [bool; MAX_PORTS],
-    inbox: Vec<VecDeque<Vec<u8>>>,
+    /// What waits for each port's NIC: frames, frames whose checksum is left
+    /// to finish, and sends carried whole.
+    inbox: Vec<VecDeque<(Vec<u8>, Kind)>>,
+    /// Whether each port's NIC takes checksums left to finish, and sends
+    /// whole.
+    takes_partial: [bool; MAX_PORTS],
+    takes: [bool; MAX_PORTS],
     dropped: [u64; MAX_PORTS],
     /// Frames each port's guest sent as another, since it claimed the port.
     spoofed: [u64; MAX_PORTS],
-    /// Frames delivered to each port's VM, which it is woken for once each.
+    /// Frames delivered to each port's VM, which it is woken for once each
+    /// -- but while its NIC holds its receive interrupts (`quiet`) and the
+    /// inbox is under half full.
     woken: [u64; MAX_PORTS],
+    quiet: [bool; MAX_PORTS],
     /// Each port's frames on `hv0`'s backlog since the stack's last pass,
     /// and those its share kept out; its sends to every port their rate
     /// kept out, and its bucket for them: tokens, and when topped up.
@@ -119,6 +141,9 @@ impl Model {
             dropped: [0; MAX_PORTS],
             spoofed: [0; MAX_PORTS],
             woken: [0; MAX_PORTS],
+            quiet: [false; MAX_PORTS],
+            takes_partial: [false; MAX_PORTS],
+            takes: [false; MAX_PORTS],
             on_backlog: [0; MAX_PORTS],
             over_share: [0; MAX_PORTS],
             flooded: [0; MAX_PORTS],
@@ -134,6 +159,10 @@ impl Model {
     }
 
     fn deliver(&mut self, p: usize, frame: &[u8]) {
+        self.deliver_kind(p, frame, Kind::Done);
+    }
+
+    fn deliver_kind(&mut self, p: usize, frame: &[u8], kind: Kind) {
         if !self.owned[p] {
             return;
         }
@@ -141,8 +170,86 @@ impl Model {
             self.dropped[p] += 1;
             return;
         }
-        self.inbox[p].push_back(frame.to_vec());
-        self.woken[p] += 1;
+        self.inbox[p].push_back((frame.to_vec(), kind));
+        if !(self.quiet[p] && self.inbox[p].len() < INBOX_FRAMES / 2) {
+            self.woken[p] += 1;
+        }
+    }
+
+    /// A send of TCP whole into port `p`'s inbox, as the switch has it: for
+    /// a NIC that takes them, with room in the inbox and for one more of the
+    /// eight it holds -- false otherwise, and the caller cuts it.
+    fn deliver_whole(&mut self, p: usize, frame: &[u8]) -> bool {
+        if !self.takes[p] || frame.len() > offload::MAX_SEND {
+            return false;
+        }
+        if !self.owned[p] {
+            return true;
+        }
+        let whole = self.inbox[p].iter().filter(|e| e.1 == Kind::Whole).count();
+        if self.inbox[p].len() == INBOX_FRAMES || whole == 8 {
+            return false;
+        }
+        self.inbox[p].push_back((frame.to_vec(), Kind::Whole));
+        if !(self.quiet[p] && self.inbox[p].len() < INBOX_FRAMES / 2) {
+            self.woken[p] += 1;
+        }
+        WHOLE_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    /// A send of TCP up to 64 KiB from port `from`: whole to the port it is
+    /// for where that port takes it, cut into frames -- the offload model's
+    /// cut -- and forwarded each otherwise.
+    fn send_tcp4(&mut self, from: usize, frame: &[u8], mss: usize) {
+        if frame.len() < ETH_HDR_LEN {
+            return;
+        }
+        if matches!(admit(from, frame), Admit::Own) && frame[0] & 1 == 0 {
+            if let Some(q) = port_of(&frame[..6]) {
+                if q != from && self.deliver_whole(q, frame) {
+                    return;
+                }
+            }
+        }
+        CUT_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for piece in crate::offloadmodel::cut(frame, mss).expect("a send that held up") {
+            self.forward(Some(from), &piece);
+        }
+    }
+
+    /// A frame from port `from` whose checksum its guest left at `start +
+    /// offset`: so to the port it is for where that port takes it so,
+    /// finished -- by the offload model's sum -- and forwarded otherwise.
+    fn send_partial(&mut self, from: usize, frame: &[u8], start: usize, offset: usize) {
+        if frame.len() >= ETH_HDR_LEN && matches!(admit(from, frame), Admit::Own) && frame[0] & 1 == 0 {
+            if let Some(q) = port_of(&frame[..6]) {
+                if q != from && self.takes_partial[q] {
+                    self.deliver_kind(q, frame, Kind::Partial(start, offset));
+                    return;
+                }
+            }
+        }
+        let mut f = frame.to_vec();
+        crate::offloadmodel::finish(&mut f, start, offset);
+        self.forward(Some(from), &f);
+    }
+
+    /// What port `p`'s NIC takes into a buffer of `room` bytes, as the switch
+    /// hands it: a whole send it has no room for is dropped, counted, and
+    /// the next looked at.
+    fn take(&mut self, p: usize, room: usize) -> Option<(Vec<u8>, Kind)> {
+        if !self.owned[p] {
+            return None;
+        }
+        while let Some((f, kind)) = self.inbox[p].pop_front() {
+            if kind == Kind::Whole && f.len() > room {
+                self.dropped[p] += 1;
+                continue;
+            }
+            return Some((f, kind));
+        }
+        None
     }
 
     /// A guest's frame for `hv0`: within its port's share of the backlog --
@@ -361,7 +468,7 @@ pub fn switch_target(r: &mut Input) {
      * one more than there are ports. */
     let most = if r.u8() < 24 { MAX_PORTS + 1 } else { 1 + r.below(4) as usize };
 
-    while let Some(op) = r.op(11) {
+    while let Some(op) = r.op(15) {
         match op {
             0 | 10 => {
                 /* A VM on the switch, the first free port -- or, now and
@@ -378,6 +485,9 @@ pub fn switch_target(r: &mut Input) {
                         m.owned[p] = true;
                         m.inbox[p].clear();
                         m.woken[p] = 0;
+                        m.quiet[p] = false;
+                        m.takes_partial[p] = false;
+                        m.takes[p] = false;
                         m.dropped[p] = 0;
                         m.spoofed[p] = 0;
                         m.on_backlog[p] = 0;
@@ -432,21 +542,113 @@ pub fn switch_target(r: &mut Input) {
                 }
             }
             6 | 7 => {
-                /* A NIC taking what waits for it, into a buffer of any size. */
+                /* A NIC taking what waits for it, into a buffer of any size:
+                 * a frame as `recv` takes one, or -- a NIC that takes sends
+                 * whole -- with how it is cut, `recv_whole`'s. */
                 let p = r.below(MAX_PORTS as u64) as usize;
                 if let Some(b) = backends[p].as_mut() {
-                    let mut buf = vec![0u8; r.pick(&[MAX_FRAME, 60, 2048, 14, 0])];
-                    let got = b.recv(&mut buf);
-                    let want = if m.owned[p] { m.inbox[p].pop_front() } else { None };
+                    let whole_buf = r.u8() < 64;
+                    let room = if whole_buf { offload::MAX_SEND } else { r.pick(&[MAX_FRAME, 60, 2048, 14, 0]) };
+                    let mut buf = vec![0u8; room];
+                    let got = if whole_buf {
+                        b.recv_with(&mut buf)
+                    } else {
+                        b.recv(&mut buf).map(|n| (n, offload::Rx::Done))
+                    };
+                    let want = m.take(p, room).map(|(mut w, kind)| {
+                        /* `recv` finishes a checksum left to; `recv_with`
+                         * hands it on so. */
+                        if let (Kind::Partial(start, offset), false) = (kind, whole_buf) {
+                            crate::offloadmodel::finish(&mut w, start, offset);
+                        }
+                        (w, kind)
+                    });
                     match (got, want) {
                         (None, None) => {}
-                        (Some(n), Some(w)) => {
+                        (Some((n, rx)), Some((w, kind))) => {
                             let expect = w.len().min(buf.len());
                             invariant!(n == expect && buf[..n] == w[..n],
                                        "port {} took {} bytes, {} expected, of a frame of {}", p, n, expect, w.len());
+                            if whole_buf {
+                                let same = match (rx, kind) {
+                                    (offload::Rx::Done, Kind::Done) | (offload::Rx::Whole(_), Kind::Whole) => true,
+                                    (offload::Rx::Partial(q), Kind::Partial(start, offset)) => {
+                                        let h = q.header();
+                                        usize::from(h.csum_start) == start && usize::from(h.csum_offset) == offset
+                                    }
+                                    _ => false,
+                                };
+                                invariant!(same, "port {} took a frame as {:?}, the model {:?}", p, rx, kind);
+                            }
                         }
                         (got, want) => panic!("invariant: port {} took {:?}, the model has {:?} bytes waiting",
-                                              p, got, want.map(|w| w.len())),
+                                              p, got.map(|g| g.0), want.map(|w| w.0.len())),
+                    }
+                }
+            }
+            12 => {
+                /* A guest's send of TCP up to 64 KiB, held up by its NIC: to
+                 * another port, `hv0`, everyone -- as itself mostly. */
+                let p = r.below(MAX_PORTS as u64) as usize;
+                if backends[p].is_some() {
+                    let q = r.below(MAX_PORTS as u64) as usize;
+                    let (dst_mac, dst_ip) = match r.u8() % 4 {
+                        0 => (HOST_MAC, HOST_IP),
+                        1 => ([0xFF; 6], switch::port_ip(q)),
+                        _ => (switch::port_mac(q), switch::port_ip(q)),
+                    };
+                    let src_ip = if r.u8() < 16 { switch::port_ip(q) } else { switch::port_ip(p) };
+                    let payload = r.pick(&[0usize, 300, 1448, 4000, 20_000]);
+                    let mss = r.pick(&[256usize, 536, 1448]);
+                    let mut f = crate::offloadmodel::build(r, 6, 20, 20, payload, 0x0800, 0x4000, 0x18, true);
+                    f[..6].copy_from_slice(&dst_mac);
+                    f[6..12].copy_from_slice(&switch::port_mac(p));
+                    f[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src_ip.to_be_bytes());
+                    f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst_ip.to_be_bytes());
+                    if let Ok(layout) = offload::check_tcp4(&f, mss) {
+                        m.send_tcp4(p, &f, mss);
+                        if let Some(b) = backends[p].as_mut() {
+                            b.send_tcp4(&f, layout);
+                        }
+                    }
+                }
+            }
+            13 => {
+                /* A port's NIC taking checksums partial and sends whole, or
+                 * not. */
+                let p = r.below(MAX_PORTS as u64) as usize;
+                if let Some(b) = backends[p].as_mut() {
+                    let takes = offload::Takes { partial: r.bool(), whole: r.bool() };
+                    b.takes(takes);
+                    m.takes_partial[p] = takes.partial;
+                    m.takes[p] = takes.whole;
+                }
+            }
+            14 => {
+                /* A guest's frame whose checksum it left to finish: to
+                 * another port, `hv0`, everyone -- as itself mostly. */
+                let p = r.below(MAX_PORTS as u64) as usize;
+                if backends[p].is_some() {
+                    let q = r.below(MAX_PORTS as u64) as usize;
+                    let (dst_mac, dst_ip) = match r.u8() % 4 {
+                        0 => (HOST_MAC, HOST_IP),
+                        1 => ([0xFF; 6], switch::port_ip(q)),
+                        _ => (switch::port_mac(q), switch::port_ip(q)),
+                    };
+                    let src_ip = if r.u8() < 16 { switch::port_ip(q) } else { switch::port_ip(p) };
+                    let proto = r.pick(&[6u8, 17]);
+                    let payload = r.below(1400) as usize;
+                    let mut f = crate::offloadmodel::build(r, proto, 20, 20, payload, 0x0800, 0x4000, 0x18, true);
+                    f[..6].copy_from_slice(&dst_mac);
+                    f[6..12].copy_from_slice(&switch::port_mac(p));
+                    f[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16].copy_from_slice(&src_ip.to_be_bytes());
+                    f[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20].copy_from_slice(&dst_ip.to_be_bytes());
+                    let offset = if proto == 17 { 6 } else { 16 };
+                    if let Ok(partial) = offload::Partial::check(f.len(), 34, offset as u16) {
+                        m.send_partial(p, &f, 34, offset);
+                        if let Some(b) = backends[p].as_mut() {
+                            b.send_partial(&mut f.clone(), partial);
+                        }
                     }
                 }
             }
@@ -471,6 +673,19 @@ pub fn switch_target(r: &mut Input) {
             9 => {
                 /* Time going by: a port's rate to every port earned back. */
                 time::advance(r.pick(&[NS_PER_SEC / 1000, NS_PER_SEC / 10, NS_PER_SEC, 10 * NS_PER_SEC]));
+            }
+            11 => {
+                /* A port's NIC holding its receive interrupts, or done: a
+                 * frame for it then wakes nobody while the inbox is under
+                 * half full. Open-ended or none, so that the model and the
+                 * switch, reading the clock a step apart, never disagree on
+                 * a window's end -- its end is the NIC target's. */
+                let p = r.below(MAX_PORTS as u64) as usize;
+                if let Some(b) = backends[p].as_mut() {
+                    let quiet = r.bool();
+                    b.quiet_until(if quiet { u64::MAX / 2 } else { 0 });
+                    m.quiet[p] = quiet;
+                }
             }
             _ => {}
         }
@@ -498,12 +713,17 @@ pub fn switch_target(r: &mut Input) {
         let mut buf = vec![0u8; MAX_FRAME];
         loop {
             let got = b.recv(&mut buf);
-            let want = if m.owned[p] { m.inbox[p].pop_front() } else { None };
+            let want = m.take(p, MAX_FRAME).map(|(mut w, kind)| {
+                if let Kind::Partial(start, offset) = kind {
+                    crate::offloadmodel::finish(&mut w, start, offset);
+                }
+                (w, kind)
+            });
             match (got, want) {
                 (None, None) => break,
-                (Some(n), Some(w)) => invariant!(buf[..n] == w[..], "port {} took another frame than was sent", p),
+                (Some(n), Some((w, _))) => invariant!(buf[..n] == w[..], "port {} took another frame than was sent", p),
                 (got, want) => panic!("invariant: port {} drained {:?}, the model {:?} bytes", p, got,
-                                      want.map(|w| w.len())),
+                                      want.map(|w| w.0.len())),
             }
         }
     }
@@ -1037,6 +1257,7 @@ pub static TAKEN_CHECKED: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 pub fn report() {
     use std::sync::atomic::Ordering::Relaxed;
+    println!("  switch: {} sends of TCP carried whole, {} cut", WHOLE_SENDS.load(Relaxed), CUT_SENDS.load(Relaxed));
     if OUT_CHECKED.load(Relaxed) + BACK_CHECKED.load(Relaxed) != 0 {
         println!("  nat: {} packets checked out, {} back ({} of them answers a live flow had to let in); {} answers \
                   tried; {} inputs with no NAT", OUT_CHECKED.load(Relaxed), BACK_CHECKED.load(Relaxed),

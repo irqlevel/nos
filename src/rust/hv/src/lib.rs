@@ -78,6 +78,10 @@ pub use devices::blk as disk;
 /// A guest's NICs: what carries one's frames (`Backend`), and what it counts.
 #[cfg(target_arch = "x86_64")]
 pub use devices::net as nic;
+/// What a guest's NIC leaves to the device: checksums, and sends of TCP of
+/// up to 64 KiB -- cut, or carried whole.
+#[cfg(target_arch = "x86_64")]
+pub use devices::offload;
 /// How what the host hands a running guest -- a frame -- gets it to leave
 /// its guest and take it, rather than wait for the host's next interrupt.
 #[cfg(target_arch = "x86_64")]

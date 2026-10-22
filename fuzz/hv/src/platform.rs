@@ -762,6 +762,21 @@ impl Script {
                 self.plan().push_back(Step::Out { port: base + 0x12, size: 1, value: 7 });
                 self.queues[dev][queue] = DriverQueue::at(pfn);
             }
+            8 if self.apic && self.cpus.len() > 1 => {
+                /* A burst of fixed IPIs to one CPU, as a kernel's reschedule
+                 * and function-call IPIs come: the ICR's MSR in x2APIC mode,
+                 * its two halves through the page in xAPIC mode. */
+                let to = r.below(self.cpus.len() as u64);
+                let vector = 0x20 + r.below(0xD0);
+                for _ in 0..1 + r.below(8) {
+                    if self.xapic() {
+                        self.apic_write(0x31, to << 24);
+                        self.apic_write(0x30, vector);
+                    } else {
+                        self.apic_write(0x30, vector | (to << 32));
+                    }
+                }
+            }
             9 => {
                 /* The serial port's interrupts on, OUT2 up, and a byte sent. */
                 self.plan().push_back(Step::Out { port: COM1 + 3, size: 1, value: 0x03 });
@@ -1212,7 +1227,7 @@ impl Script {
                     }
                     for n in &self.nics {
                         let len = r.pick(&[60usize, 64, 590, 1514, 1515, 20]);
-                        n.lock().unwrap().rx.push_back((0..len).map(|i| i as u8).collect());
+                        n.lock().unwrap().rx.push_back(((0..len).map(|i| i as u8).collect(), crate::offload::Rx::Done));
                     }
                     Exit::Host
                 }
@@ -1317,20 +1332,28 @@ static ENDS: Mutex<std::collections::BTreeMap<String, (u64, u64)>> = Mutex::new(
 static MOV_CHECKED: Mutex<std::collections::BTreeMap<&'static str, u64>> =
     Mutex::new(std::collections::BTreeMap::new());
 
+/// Interrupts posted for a CPU to take in its guest, and the notifications
+/// sent for them, for `HV_FUZZ_STATS`.
+static POSTED: AtomicU64 = AtomicU64::new(0);
+static NOTIFIED: AtomicU64 = AtomicU64::new(0);
+
 fn mov_checked(what: &'static str) {
     *MOV_CHECKED.lock().unwrap_or_else(|e| e.into_inner()).entry(what).or_insert(0) += 1;
 }
 
 pub fn report() {
     let runs: u64 = ENDS.lock().unwrap().values().map(|(n, _)| n).sum();
-    println!("  platform: {} runs, {} turns handed between threads, {} waits", runs,
-             vm::HANDOFFS.load(Ordering::Relaxed), vm::SLEEPS.load(Ordering::Relaxed));
+    println!("  platform: {} runs, {} turns handed between threads, {} waits, {} entries ended by the host's timer armed for the guest's",
+             runs, vm::HANDOFFS.load(Ordering::Relaxed), vm::SLEEPS.load(Ordering::Relaxed),
+             vm::TIMER_EXITS.load(Ordering::Relaxed));
     for (kind, (n, exits)) in ENDS.lock().unwrap().iter() {
         println!("  platform: {:>8} runs ended {:<12} {:>6} exits each", n, kind, exits / n.max(&1));
     }
     for (what, n) in MOV_CHECKED.lock().unwrap().iter() {
         println!("  {}: {}", what, n);
     }
+    println!("  platform: {} interrupts posted, {} notifications sent", POSTED.load(Ordering::Relaxed),
+             NOTIFIED.load(Ordering::Relaxed));
     for (what, n) in vm::APICV.lock().unwrap().iter() {
         println!("  platform: virtual APIC: {:>8} {}", n, what);
     }
@@ -1428,7 +1451,11 @@ pub fn platform(r: &mut Input) {
      * which asks it what CR4 may take: an AMD CPU under AMD-V, an Intel one
      * under VT-x. */
     crate::x86::cpu::set_host((r.u64() & !1) | u64::from(vmx));
-    let machine = Machine::new(if vmx { Vendor::Vmx } else { Vendor::Svm });
+    let mut machine = Machine::new(if vmx { Vendor::Vmx } else { Vendor::Svm });
+    /* VT-x's virtual APIC, where the CPU is said to have one, and posted
+     * interrupts on most of those. */
+    machine.vapic = vmx && r.bool();
+    machine.posted = machine.vapic && r.u8() >= 64;
     let Some(doorbells) = Doorbells::new(cpus as usize) else { return };
     let made = LinuxGuest::new(&machine, mem_bytes, cpus, Arc::new(doorbells), x2apic, ioapic);
     if mem_bytes > crate::run::MAX_MEM_BYTES {
@@ -1436,13 +1463,18 @@ pub fn platform(r: &mut Input) {
         return;
     }
     let Ok((mut guest, mut vcpus)) = made else { return };
-    /* VT-x's virtual APIC, where the CPU is said to have one -- and the
-     * guest let use it, mostly. */
-    let vapic = vmx && r.bool();
-    for c in vcpus.iter_mut() {
-        c.backend_mut().vapic = vapic;
+    /* The guest's CPUs' interrupts the CPU's as it asked, or by default --
+     * where the CPU takes them posted too. */
+    if r.bool() {
+        guest.set_apicv(r.u8() >= 32);
     }
-    guest.set_apicv(r.u8() >= 32);
+    /* Its NICs' receive interrupts held apart, or each at once. */
+    if r.bool() {
+        guest.set_rx_moderation(r.pick(&[0u64, 20_000, 100_000]));
+    }
+    if r.u8() < 48 {
+        guest.set_offloads(false);
+    }
 
     /* Disks: none, mostly, or one -- each takes its 2 MiB of request
      * buffers when it is made, zeroed, which for a run of the whole machine
@@ -1519,6 +1551,9 @@ pub fn platform(r: &mut Input) {
         e.0 += 1;
         e.1 += exits;
     }
+    let (posted, notified) = guest.posted_stats();
+    POSTED.fetch_add(posted, Ordering::Relaxed);
+    NOTIFIED.fetch_add(notified, Ordering::Relaxed);
     /* What the module reports of a guest, from what it was left in. */
     let _ = (guest.disk_stats(), guest.nic_stats(), guest.acpi_stats(), guest.msr_faults(), guest.irq_debug(),
              guest.cpu_states(), guest.ioapic_stats(), guest.uart_ier(), guest.absent_pages(), guest.cpus_started(),

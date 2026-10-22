@@ -48,7 +48,8 @@ are (`hal/irqchip.h`: `IrqEoi`, `SendIpi`, `GetCurrentCpuHwId`,
 | — | the virtio devices are Rust drivers and take one of the shared Rust slots below, on a line or as MSI-X |
 | `0x38`–`0x3F` | Legacy INTx lines requested by Rust drivers (8 slots) |
 | `0x40`–`0xEF` | MSI-X vectors, handed out in order by `MsixTable::AllocVector` |
-| `0xFD` | Local APIC timer — this CPU's tick |
+| `0xFC` | Posted-interrupt notification (`Hal::PostedVector`): a vCPU in its guest takes it without an exit (VT-x's posted interrupts, [the hypervisor](hypervisor.md#interrupts-the-cpu-delivers-itself-vt-xs-apic-virtualization)); one out of its guest only ends it |
+| `0xFD` | Local APIC timer — this CPU's tick, and the deadline of a task asleep on it: one-shot ([the local timer](scheduler.md#the-local-timer)) |
 | `0xFE` | IPI (`Hal::IpiVector`) |
 | `0xFF` | Local APIC spurious vector |
 
@@ -231,7 +232,9 @@ disk-log setup happen after it rather than next to the driver init.
 
 `irqstat` prints one counter per source: `pit`, `hpet`, `8042`, `serial`,
 `ipi`, `lapic-timer`, `shared`,
-`msix`, `dummy`, `spurious`. The `msix` and `shared` rows are what answer
+`msix`, `dummy`, `spurious`, `posted`, `timer-wake`. `lapic-timer` counts
+x86's ticks, and `timer-wake` the local timer's interrupts on either
+architecture that came for a sleeper's deadline and not the tick. The `msix` and `shared` rows are what answer
 "has this card stopped interrupting, or has it stopped receiving?" — a
 question that was unanswerable on a running machine until they were counted,
 and most of why the EX44 receive stall took as long as it did to corner.

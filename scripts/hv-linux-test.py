@@ -167,10 +167,11 @@ def interrupt_check(args, text, queue):
 def cpus_opt(args):
     """`cpus=N` for a guest of N CPUs, or nothing for one; `xapic` for a
     guest whose local APICs come out of reset in xAPIC mode; `ioapic` for
-    one with an IO-APIC; and `apicv` for one whose interrupts the CPU
-    delivers itself where it can."""
+    one with an IO-APIC; and `apicv` or `noapicv` for one whose interrupts
+    the CPU delivers itself where it can, or does not."""
     return ((" cpus=%d" % args.cpus if args.cpus > 1 else "") + (" xapic" if args.xapic else "")
-            + (" ioapic" if args.ioapic else "") + (" apicv" if args.apicv else ""))
+            + (" ioapic" if args.ioapic else "") + (" apicv" if args.apicv else "")
+            + (" noapicv" if args.noapicv else ""))
 
 
 def vm_commands(args):
@@ -1227,7 +1228,10 @@ def main():
     ap.add_argument("--apicv", action="store_true",
                     help="the guest's interrupts delivered, and their EOIs taken, by the CPU where it can (hv's "
                          "`apicv`: VT-x's virtual-interrupt delivery, for a guest of more than one CPU in x2APIC "
-                         "mode; the report must then say so)")
+                         "mode, which is the default where the CPU has posted interrupts; the report must then "
+                         "say so)")
+    ap.add_argument("--noapicv", action="store_true",
+                    help="the guest's interrupts injected by the run loop, the CPU delivering none (hv's `noapicv`)")
     ap.add_argument("--mem", type=int, default=256, help="guest RAM in MiB")
     ap.add_argument("--secs", type=int, default=120, help="guest run budget in seconds")
     ap.add_argument("--input", help="a single no-space token typed at the guest console once up; \\n = newline")
