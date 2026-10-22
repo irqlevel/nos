@@ -247,6 +247,13 @@ impl Net {
         (self.rx_quiet_until > now || self.rx_owed).then_some(self.rx_quiet_until)
     }
 
+    /// Until when its receive interrupts are held, as the last one raised
+    /// left them: what has whoever does the device's rounds come back then,
+    /// when it changes behind its back (`LinuxGuest::run`).
+    pub fn rx_window(&self) -> u64 {
+        self.rx_quiet_until
+    }
+
     fn config(&self) -> [u8; CFG_BYTES] {
         let mut c = [0u8; CFG_BYTES];
         c[CFG_MAC..CFG_MAC + 6].copy_from_slice(&self.mac);

@@ -1654,7 +1654,15 @@ fetches between the two, each its own connection, took 0.07 s with none,
 holds the NIC to raising what it owes by the time it said it would look
 again -- which found a queue taken down owing for good, a round the run loop
 would have made without a pause -- the switch's wakes to a model that knows
-each port's window, and runs whole machines with it on and off.
+each port's window, and runs whole machines with it on and off. What it did
+not see is a window opened behind that vCPU's back: a driver refills its
+receive ring from the CPU its interrupt is taken on, and that CPU's notify
+delivers what waited and raises the interrupt itself -- so the first CPU,
+asleep with the old window's end in mind, slept to its 10 ms cap while the
+frames that came in the new one woke nobody. Pings between two guests had
+a 10 ms answer every few hundred; a notify from another CPU that moves the
+window now rings the first CPU, and 2,400 pings had none, 0.19 ms on
+average and 0.28 at most.
 
 **`hv forward` is how a guest is reached from outside.** The guests have
 addresses only on their switch; a forward listens on a port of nos's and,

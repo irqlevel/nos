@@ -2050,6 +2050,9 @@ impl LinuxGuest {
             }
         }
 
+        /* Whether the first CPU, whose loop does the devices' rounds, has to
+         * look at them again for what this access did. */
+        let mut first = false;
         let mut p = self.platform.lock();
         if io.input && !Uart::owns(COM1, io.port) && (io.port as usize) < p.port_hist.len() {
             let slot = &mut p.port_hist[io.port as usize];
@@ -2135,7 +2138,22 @@ impl LinuxGuest {
                 let value = v.save().rax as u32;
                 let raised = match dev {
                     Some(PciDev::Disk(d)) => d.io_write(offset, io.size, value, &self.memory, time::boot_time_ns()),
-                    Some(PciDev::Nic(n)) => n.io_write(offset, io.size, value, &self.memory, time::boot_time_ns()),
+                    Some(PciDev::Nic(n)) => {
+                        let window = n.rx_window();
+                        let raised = n.io_write(offset, io.size, value, &self.memory, time::boot_time_ns());
+                        /* A receive interrupt raised from another CPU's
+                         * notify -- a driver refilling its ring where its
+                         * interrupt is taken -- holds the next one back, and
+                         * frames that come meanwhile wake nobody: the first
+                         * CPU's loop comes back at the end for them. It may
+                         * be asleep, or in its guest, with an older end in
+                         * mind, and would sleep to its cap with the frames
+                         * waiting: rung, it looks again. Pings between two
+                         * guests on the EX44 had a 10 ms answer every few
+                         * hundred without this, and none in 2,400 with it. */
+                        first |= me != 0 && n.rx_window() != window;
+                        raised
+                    }
                     None => Raise::default(),
                 };
                 if let Some(dev) = index.filter(|_| raised.any()) {
@@ -2163,6 +2181,10 @@ impl LinuxGuest {
         v.skip_io(io);
         if ring {
             self.ring_extint();
+        } else if first {
+            if let Some(d) = self.doorbells.get(0) {
+                d.ring();
+            }
         }
         None
     }
