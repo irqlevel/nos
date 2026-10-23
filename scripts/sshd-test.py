@@ -7,7 +7,8 @@ it -- commands, a shell with a terminal and one without, 3 MiB of output
 through the client's window with rekeys in the middle, a key it has to
 refuse, sessions at once, a stop and an rmmod from inside a session. Then it
 puts the module in /etc/rc, reboots, and checks it came back by itself with
-the same host key, and that poweroff unloads it before the filesystems go.
+the same host key, and that poweroff unloads it before the filesystems go and
+then switches the machine off with nothing panicking on the way.
 
 x86_64: boots nos.iso from an ext2 root that already carries sshd.ko, an
 authorized key and an /etc/rc that starts it, and logs in: no shell is
@@ -273,13 +274,13 @@ def serve_http(directory):
     return httpd
 
 
-def wait_log(log, marker, timeout, panic_ok=False):
+def wait_log(log, marker, timeout):
     start = time.time()
     while time.time() - start < timeout:
         text = open(log, errors="replace").read() if os.path.exists(log) else ""
         if marker in text:
             return True
-        if "PANIC" in text and not panic_ok:
+        if "PANIC" in text:
             print(text[-3000:])
             sys.exit("kernel panic")
         time.sleep(0.5)
@@ -299,6 +300,15 @@ def kill(p):
             p.wait(10)
         except subprocess.TimeoutExpired:
             p.kill()
+
+
+def exited(p, timeout):
+    """Whether the machine switched itself off: QEMU exits by itself."""
+    try:
+        p.wait(timeout)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def aarch64(t):
@@ -412,15 +422,20 @@ def aarch64(t):
         check("a login after the reboot", rc == 0 and uptime_like(out), out)
         listed = subprocess.run(["ssh-keygen", "-l", "-f", known_hosts], capture_output=True).stdout.decode()
         check("the same host key", fingerprint != "" and fingerprint in listed, "%s vs %s" % (fingerprint, listed))
-        # arm64's halt panics late in __cxa_finalize (TaskTable::~TaskTable),
-        # after the unmount, and did before sshd: what matters here is that
-        # the module went before the filesystems did
+        # The module has to go before the filesystems do -- the first unmount,
+        # whichever it is -- and then the machine all the way down. The halt's
+        # fault in the static destructors that this used to look away from
+        # was an exiting CPU leaving its one WFI, gone since 7908bf6: a panic
+        # on the way down is a failure like any other now
         t.ssh(["poweroff"], known_hosts=known_hosts)
+        down = wait_log(log, "vfs: unmounting /", 60)
+        text = open(log, errors="replace").read()
+        unloaded = text.find("module: sshd unloaded")
         check("poweroff unloads sshd before the unmount",
-              wait_log(log, "unmounting / (ext2)", 60, panic_ok=True)
-              and "module: sshd unloaded" in open(log, errors="replace").read())
+              down and 0 <= unloaded < text.find("vfs: unmounting /"))
+        check("and switches the machine off, with nothing panicked on the way",
+              exited(p, 30 * slow) and "PANIC" not in open(log, errors="replace").read())
     finally:
-        time.sleep(2)
         kill(p)
 
 

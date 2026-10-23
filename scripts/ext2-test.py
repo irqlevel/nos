@@ -18,9 +18,10 @@ e2fsck is the host's, or the one in the nos-builder image when the host has
 none, as mkrootfs does. Exit code 0 = every check passed and the image is
 clean.
 
-What this does not judge: the shutdown path after the filesystems are
-unmounted. arm64 has a known fault in the static destructors there
-(TaskTable::~TaskTable), which happens long after the superblock is written.
+The way down is judged as well: the unmount writes the superblock's state,
+and after it the machine has to switch itself off with nothing panicking.
+Until 7908bf6 it could not -- an exiting CPU left its one WFI, and the static
+destructors faulted after the unmount -- and this test looked away from it.
 """
 
 import argparse
@@ -92,8 +93,8 @@ def shell_work(sh):
 
 
 def wait_for(log, marker, timeout):
-    """Like parttest's wait_log, but a panic is not the end of the world
-    here: the shutdown path panics on arm64 after everything is unmounted."""
+    """Like parttest's wait_log, but a panic does not end the test here: the
+    image is still worth an e2fsck, and the log is judged at the end."""
     start = time.time()
     while time.time() - start < timeout:
         if os.path.exists(log) and marker in open(log, errors="replace").read():
@@ -157,7 +158,7 @@ def main():
         shell_work(sh)
 
         # Down cleanly: the unmount is what writes the superblock's state,
-        # and it happens before the shutdown path this does not judge.
+        # and then the machine has to switch itself off.
         sh.sock.settimeout(5)
         try:
             sh.run("poweroff")
@@ -169,6 +170,7 @@ def main():
             if p.poll() is not None:
                 break
             time.sleep(0.5)
+        pt.check("and the machine switches itself off", p.poll() is not None)
     finally:
         if p.poll() is None:
             p.send_signal(signal.SIGTERM)
@@ -180,15 +182,13 @@ def main():
     code, out = fsck(image)
     pt.check("e2fsck finds the image clean after all of that", code == 0, out)
 
-    # Nothing must go wrong while the filesystem is being used. The
-    # shutdown that follows is another matter: arm64 has a known fault in
-    # the static destructors after everything is unmounted (the panic names
-    # TaskTable::~TaskTable), and this test is not the place to judge it.
+    # Nothing must go wrong from the boot to the power-off, the halt after
+    # the unmount included: its static destructors faulted on arm64 until
+    # 7908bf6, and this used to stop reading at "Stopping cpu".
     text = open(log, errors="replace").read()
-    up = text.split("Stopping cpu")[0]
-    pt.check("nothing panicked while the filesystem was in use",
-             "PANIC" not in up,
-             "\n".join(l for l in up.splitlines() if "PANIC" in l))
+    pt.check("nothing panicked, the way down included",
+             "PANIC" not in text,
+             "\n".join(l for l in text.splitlines() if "PANIC" in l))
 
     if args.keep:
         print("image left at " + image)

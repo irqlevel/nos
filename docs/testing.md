@@ -116,12 +116,12 @@ swallowing panic messages whole.
 | `wx-test.sh [--arch x86_64\|aarch64]` | both | a mapping path |
 | `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
-| `ext2-test.py` | arm64 | ext2 |
-| `nanofs-test.py` | arm64 | nanofs |
+| `ext2-test.py` | arm64 | ext2, the halt |
+| `nanofs-test.py` | arm64 | nanofs, the halt |
 | `disklog-test.py` | arm64 | the disk log |
 | `netconsole-test.py` | arm64 | the trace path, a net device, netconsole |
 | `tcp-test.py` | arm64 | TCP, the HTTP client |
-| `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations |
+| `sshd-test.py [--arch aarch64\|x86_64]` | both | TCP's listening side, the module loader, the `ffi` declarations; on arm64 the halt |
 | `netblk-test.py [--arch x86_64\|aarch64]` | both | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through |
 | `netload-test.py [--arch aarch64\|x86_64]` | both | the receive path, the frame pool, `modules/netload`, `kcore::net`'s listener, the tick's receive poll (`rxpoll`) |
 | `usb-test.py` | x86-64 | `drivers/usb/` |
@@ -176,6 +176,12 @@ and then lets `e2fsck -fn` judge the image. The boot-time `fstest=on` checks
 that the driver reads back what it wrote; this checks the other half, that
 what is left on the disk is still a filesystem a checker calls clean.
 
+It ends with a `poweroff`, which has to unmount the root, switch the machine
+off and get there with nothing panicked. Until `7908bf6` the arm64 halt
+faulted in the static destructors -- an exiting CPU left its one WFI -- and
+this test, `nanofs-test.py` and `sshd-test.py` stopped reading the log at
+`Stopping cpu`; now these three are what judges the arm64 halt.
+
 ### `nanofs-test.py` -- nanofs
 
 nanofs is the kernel's own small checksummed filesystem, and nothing else in
@@ -185,7 +191,8 @@ written, synced, unmounted and read back from a second mount, so that what
 is judged is what reached the disk rather than what a cache still held --
 and last the image parsed by the script itself. A driver reading back its
 own writes never notices a field at the wrong offset; a second
-implementation of the format does.
+implementation of the format does. Its `poweroff` has to switch the machine
+off with nothing panicked on the way down, as `ext2-test.py`'s does.
 
 ### `disklog-test.py` -- the kernel log on a disk
 
@@ -231,15 +238,19 @@ deaf while its command ran was cut off at three), a key it has to refuse,
 sessions at once, a burst
 of connections past the four that may be logging in, a stop and an `rmmod`
 from inside a session; then it puts the module in `/etc/rc`, reboots, and
-checks it came back by itself with the same host key. On x86-64 it boots an
+checks it came back by itself with the same host key, and that `poweroff`
+unloads it before the first filesystem is unmounted and then switches the
+machine off with nothing panicked on the way. On x86-64 it boots an
 ext2 root that already carries the module, a key and an `/etc/rc`, and logs
 in. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
 `ssh`, `ssh-keygen` and host ports 2222, 8000 and 9000 free.
 
-41 checks pass. One fails, `poweroff unloads sshd before the unmount`, for
-reasons of its own that have nothing to do with TCP; and `connections past
-the four logging in are refused` fails now and then under load -- stragglers
+43 checks pass. `poweroff unloads sshd before the unmount` used to fail: from
+the VFS's move to Rust (`edae1ef`) it waited for `unmounting / (ext2)`, a line
+only the C++ VFS printed, where the Rust one prints `vfs: unmounting /`. One
+check still fails now and then under load, `connections past
+the four logging in are refused` -- stragglers
 of the 70-probe burst reach the server after the three quiet seconds the
 test waits for, and are counted among the refusals it looks for (18 where it
 wants 2). A run that fails anything else is a regression.

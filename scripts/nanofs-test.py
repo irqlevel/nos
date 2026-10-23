@@ -376,6 +376,7 @@ def main():
             if p.poll() is not None:
                 break
             time.sleep(0.5)
+        pt.check("poweroff switches the machine off", p.poll() is not None)
     finally:
         if p.poll() is None:
             p.send_signal(signal.SIGTERM)
@@ -411,14 +412,13 @@ def main():
         pt.check("and its data checksum is the one over those blocks",
                  image.data_checksum_ok(idx))
 
-    # Nothing must go wrong while the filesystem is in use. The shutdown that
-    # follows is another matter: arm64 has a known fault in the static
-    # destructors after everything is unmounted.
+    # Nothing must go wrong from the boot to the power-off, the halt after
+    # the unmount included: its static destructors faulted on arm64 until
+    # 7908bf6, and this used to stop reading at "Stopping cpu".
     text = open(log, errors="replace").read()
-    up = text.split("Stopping cpu")[0]
-    pt.check("nothing panicked while the filesystem was in use",
-             "PANIC" not in up,
-             "\n".join(l for l in up.splitlines() if "PANIC" in l))
+    pt.check("nothing panicked, the way down included",
+             "PANIC" not in text,
+             "\n".join(l for l in text.splitlines() if "PANIC" in l))
 
     if args.keep:
         print("images left at " + tmp)
