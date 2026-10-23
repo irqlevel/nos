@@ -15,6 +15,7 @@ Exit status 0 only if every check passed -- gate on that, not on the output.
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
@@ -65,9 +66,15 @@ class Head(HTMLParser):
         self.robots = None
         self._in_title = False
         self.h1 = 0
+        self.ids = set()
+        self.hrefs = []
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        if a.get("id"):
+            self.ids.add(a["id"])
+        if tag == "a" and a.get("href"):
+            self.hrefs.append(a["href"])
         if tag == "html":
             self.lang = a.get("lang")
         elif tag == "link" and a.get("rel") == "canonical":
@@ -169,6 +176,40 @@ for loc, alts in sorted(urls.items()):
     # The dev default leaking into a page means SITE_URL did not reach the build.
     if b"http://localhost:3000" in body and "localhost:3000" not in site:
         fail(f"{path}: mentions http://localhost:3000")
+
+# Anchors: a link to #x -- on the same page or another of the site's -- must find an element
+# with that id. Renaming a heading silently breaks such links; the build does not see them.
+ids_of = {local(loc): p.ids for loc, p in pages.items()}
+
+
+def ids_at(path):
+    if path not in ids_of:
+        status, h, body = get(path)
+        q = Head()
+        if status == 200:
+            q.feed(body.decode("utf-8", "replace"))
+        ids_of[path] = q.ids if status == 200 else None
+    return ids_of[path]
+
+
+for loc, p in pages.items():
+    here = local(loc)
+    for href in p.hrefs:
+        if "#" not in href:
+            continue
+        target, frag = href.split("#", 1)
+        if target.startswith(site):
+            target = target[len(site):] or "/"
+        elif target == "":
+            target = here
+        elif not target.startswith("/"):
+            continue  # another site's anchor: not ours to check
+        frag = urllib.parse.unquote(frag)
+        found = ids_at(target)
+        if found is None:
+            fail(f"{here}: links to {href}, a page that does not answer 200")
+        elif frag and frag not in found:
+            fail(f"{here}: links to {href}, but {target} has no element with id {frag!r}")
 
 # hreflang reciprocity: every alternate lists this page back.
 for loc, alts in urls.items():
