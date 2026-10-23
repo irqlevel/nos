@@ -1078,26 +1078,32 @@ state and CR4 around it, 220 ns an exit, and the checks' two RDMSRs.
 
 Those numbers are from before the IBPB after every exit that a Zen 2 now
 gets ([What entering a guest cannot be told to
-do](#what-entering-a-guest-cannot-be-told-to-do)), which is not measured on
-the silicon yet. Measured nested -- nos under KVM on the AX41's Ubuntu,
-`-cpu host` with cores of two threads, `hv bench cpu=3 exits=200000`, three
-rounds of each, 2026-10-22 -- it is all of what that work costs, and STIBP
-nothing (Linux there keeps STIBP on itself, so KVM switches nothing):
+do](#what-entering-a-guest-cannot-be-told-to-do)), and from before what the
+month since took off an exit. On the silicon -- nos booted on the AX41
+beside Ubuntu, 2026-10-23, `hv bench cpu=3 exits=200000`, three runs and two
+loads of each module, each the same to a few ns -- that IBPB costs an exit
+a microsecond, which makes it nearly three times what it was, and STIBP
+nothing:
 
-| An exit, ns | nested, on the AX41 |
-|---|---|
-| neither (the commit before) | 10,190-10,260 |
-| STIBP alone | 10,030-10,050 |
-| the IBPB after every exit, and STIBP | 14,790-14,950 |
+| An exit, ns | on the AX41 | a read of 64 pages between |
+|---|---|---|
+| neither (the commit before) | 535-537 | 653-660 |
+| STIBP alone | 537-540 | 647-703 |
+| the IBPB after every exit, and STIBP | 1,543-1,545 | 1,723-1,763 |
 
-The profile puts half of the IBPB's 4.7 µs in `vmrun` to `#vmexit` (5,200
-to 7,560 ns), where the stub writes PRED_CMD, and the other half in the
-exit handled and the loop (2,200 to 4,200): the host's code after the
-barrier running on predictors it emptied. Under nested KVM both are
-inflated by the outer kernel's round trips, and what they come to on the
-silicon is for a boot of nos on the AX41 to say. The cheaper way to the
-same end -- the host built with an untrained return thunk and retpolines,
-so that no IBPB is needed at all -- is left in [What a review
+A third of the microsecond is the barrier itself, in `vmrun` to `#vmexit`
+(330 to 687 ns), where the stub writes PRED_CMD; the other two thirds are
+the host's code after it running on the predictors it emptied -- the
+checks (93 to 113 ns), the x87/SSE registers put in (8 to 50) and the exit
+handled with the loop (117 to 682). Nested under KVM on the same machine
+(`-cpu host` with cores of two threads, 2026-10-22) the same change cost
+4.7 µs of an exit's 10.2, the barrier and the cold predictors there each
+inflated by the outer kernel's round trips, and STIBP nothing there either,
+Linux keeping STIBP on itself. Every built-in guest passes on the silicon
+with the IBPB on, on the first CPU and the last -- the `cr4` guest's two
+impossible values refused by the CPU itself there as under KVM. The cheaper
+way to the same end -- the host built with an untrained return thunk and
+retpolines, so that no IBPB is needed at all -- is left in [What a review
 found](#what-a-review-found), item 1.
 
 Under VT-x the first numbers were nested KVM's on the Intel dev box
@@ -3498,8 +3504,9 @@ someone else's; then speed.
    hv-test runs every built-in guest through the first two on CPU 0 and on
    CPU 3, and holds `hv` to at least two switches between guests a guest,
    each with an IBPB where the CPU offers one. QEMU's TCG offers neither
-   IBPB nor automatic IBRS, so those two writes have run on no machine yet;
-   the AX41's Zen 2, which has IBPB, is where the first will. What it was:
+   IBPB nor automatic IBRS; the AX41's Zen 2 is where the IBPB first ran,
+   under KVM and on the silicon, and automatic IBRS has run on no machine
+   yet. What it was:
    none of it, the guest's values left in the caller-saved registers the
    stub returned with. ~~On Zen 1 to 4 (the AX41), SRSO and Retbleed,
    and BTI where there is no automatic IBRS.~~ Done by an IBPB after every
