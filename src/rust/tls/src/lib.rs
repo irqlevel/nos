@@ -2,10 +2,10 @@
 
 //! A TLS client for the kernel's HTTP client.
 //!
-//! rustls drives the protocol; the socket stays on the C++ side. Because the
-//! kernel has no `std`, this uses rustls' unbuffered API: `process_tls_records`
-//! hands back one state at a time, and the loop here does the reading, the
-//! writing and the buffering that `std::io` would otherwise do.
+//! rustls drives the protocol over a [`Transport`]: the HTTP client's TCP
+//! connection. The kernel has no `std`, so this uses rustls' unbuffered API:
+//! `process_tls_records` hands back one state at a time, and the loop here
+//! does the reading, writing and buffering that `std::io` would otherwise do.
 
 extern crate alloc;
 
@@ -22,8 +22,8 @@ use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use rustls::{ClientConfig, RootCertStore};
 
 /* Every RustCrypto crate that needs randomness goes through getrandom, which
-   has no backend for a freestanding target. Point it at the kernel's entropy
-   source (virtio-rng / RDRAND), the same pool the `random` command uses. */
+   has no backend for a freestanding target. Point it at the kernel's pool:
+   ChaCha20, seeded from every entropy source there is (docs/random.md). */
 fn kernel_getrandom(buf: &mut [u8]) -> Result<(), getrandom::Error> {
     if kcore::random::fill_random(buf) {
         Ok(())
