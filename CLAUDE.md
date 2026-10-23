@@ -66,6 +66,7 @@ What a smoke boot cannot notice has a test of its own, each there for a failure 
 |---|---|
 | a mapping path | `wx-test.sh [--arch x86_64\|aarch64]` |
 | the panic path, `panic=N`, a reset (`Hal::ResetNow`) | `panic-test.sh [--arch x86_64\|aarch64]` |
+| the halt: what `poweroff` stops and in which order, `Cpu::Park`, the static destructors | `ext2-test.py`, `nanofs-test.py`, `sshd-test.py` (arm64): each powers off, and the machine must switch itself off with nothing panicked on the way down. On x86-64 only `image-test.py`'s power-off, which a panic would pass -- `panic=10` and `-no-reboot` end QEMU too |
 | the block layer, the partition tables | `parttest.py [--arch aarch64\|x86_64]`; a batch (`Disk::write_pieces`, a driver's `write_pieces`/`read_pieces`): `hv-linux-test.py --disk` and `--disk --nvme-root` |
 | the block layer's asynchronous path, the C ABI a module reaches `block` and `net` through | `netblk-test.py [--arch x86_64\|aarch64]` (`--arch aarch64` on a Mac) |
 | ext2 | `ext2-test.py` (arm64): lets `e2fsck` judge the image; its file data under a guest's disk -- holes filled, blocks written over, in batches -- `hv-linux-test.py --disk [--nvme-root]` (x86-64), which judges nos's root the same way, on virtio-blk and on NVMe |
@@ -73,7 +74,7 @@ What a smoke boot cannot notice has a test of its own, each there for a failure 
 | the disk log | `disklog-test.py` (arm64): nothing else gives `disklog=on` |
 | the trace path, a net device, netconsole | `netconsole-test.py` (arm64): on the Hetzner boxes it is the only console there is |
 | TCP, the HTTP client | `tcp-test.py` (arm64) |
-| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/sshd` | `sshd-test.py` (arm64). 41 checks pass; `poweroff unloads sshd before the unmount` fails for reasons of its own, unrelated to TCP, and `connections past the four logging in are refused` flakes under load: stragglers of the probe burst land after its quiet window |
+| TCP's listening side, the module loader, the `ffi` declarations, `ssh`, `modules/sshd` | `sshd-test.py` (arm64). 43 checks pass; `connections past the four logging in are refused` flakes under load: stragglers of the probe burst land after its quiet window |
 | the receive path, the frame pool, `modules/netload`, a module's UDP listener in `kcore::net`, the tick's receive poll (`rxpoll`) | `netload-test.py` (arm64; about seven minutes, by design), and `--arch x86_64`, its short form, after touching the module ABI |
 | `drivers/igb`, the driver seam in `net/src/device.rs` | `tcp-test.py --nic igb` and `netload-test.py --nic igb`: QEMU's 82576, the only way a hardware NIC driver runs anywhere but on a Hetzner box (QEMU 8.0 or later; CI's does not have it, so by hand) |
 | `drivers/usb/` | `usb-test.py` (x86-64): types at the kernel through QEMU's monitor |
