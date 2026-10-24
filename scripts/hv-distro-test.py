@@ -66,6 +66,15 @@ The same checks as Debian's but its version, 24.04 on its `-generic`
 kernel, and its network: its initramfs takes the address from the `ip=` hv
 gives a networked guest, and cloud-init keeps it.
 
+With `--hvboot`, Debian's and Ubuntu's images boot the way a disk boots,
+nothing taken out of them: the VM's kernel is hvboot (out/x86_64/hvboot,
+src/rust/hvboot), which hv starts by PVH and which reads the image's own
+grub.cfg, picks the entry GRUB would boot and boots its kernel and initrd
+off the image's own /boot -- so the image's kernel updates are its own to
+boot. The command line the VM is given is only what the profile adds to the
+entry's: Debian's credentials. The checks are the same, and two more: hvboot
+reached the kernel, and says which entry of whose grub.cfg it booted.
+
 All three boot with the machine's ACPI tables: their kernels find the PCI
 host bridge, their devices' interrupts and the PM timer through them.
 `--acpi-off` boots them with `acpi=off` instead -- the MP table, PCI by
@@ -419,7 +428,14 @@ def debian(args):
     import base64
 
     def cmdline(grub):
-        base = args.debian_cmdline + DEBIAN_CREDENTIALS if args.debian_cmdline else DEBIAN_CMDLINE
+        if args.hvboot:
+            # The entry's own line is hvboot's to read out of grub.cfg: the
+            # VM is given only what goes after it.
+            base = DEBIAN_CREDENTIALS.strip()
+        elif args.debian_cmdline:
+            base = args.debian_cmdline + DEBIAN_CREDENTIALS
+        else:
+            base = DEBIAN_CMDLINE
         return (machine_cmdline(base, args) + (ACPI_OFF if args.acpi_off else "") +
                 " systemd.set_credential_binary=network.network.50-nos:" +
                 base64.b64encode(DEBIAN_NETWORK.encode()).decode())
@@ -440,7 +456,7 @@ def ubuntu(args):
     provisioning it from a NoCloud seed -- the way a cloud boots one."""
 
     def cmdline(grub):
-        return machine_cmdline(args.ubuntu_cmdline or grub, args) + (ACPI_OFF if args.acpi_off else "")
+        return machine_cmdline(args.ubuntu_cmdline or grub or "", args) + (ACPI_OFF if args.acpi_off else "")
 
     cloud(args, argparse.Namespace(
         title="Ubuntu", tag="ubuntu", image=args.ubuntu, mem=args.ubuntu_mem, root_mib=args.ubuntu_root_mib,
@@ -472,7 +488,11 @@ def cloud(args, d):
     kernel and initrd, and its root on the guest's disk, written to -- and
     still there after a reboot."""
     tmp = tempfile.mkdtemp(prefix="nos-hv%s-" % d.tag)
-    vmlinuz, initrd, grub = image_boot_files(d.image, tmp, d.part_type, d.boot)
+    if args.hvboot:
+        # Nothing out of the image: hvboot reads its /boot itself.
+        vmlinuz, initrd, grub = HVBOOT, None, None
+    else:
+        vmlinuz, initrd, grub = image_boot_files(d.image, tmp, d.part_type, d.boot)
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(rootdir)
     # A copy, holes and all: the guest writes to it, and it is gigabytes.
@@ -487,8 +507,11 @@ def cloud(args, d):
 
     server, url, token = web(tmp)
     cmdline = d.cmdline(grub)
-    print("  (%s's GRUB line: %s)" % (d.title, grub))
-    print("  (the command line given: %s)" % cmdline[:300])
+    if args.hvboot:
+        print("  (booted by hvboot: the kernel, the initrd and the line %s's own grub.cfg names)" % d.title)
+    else:
+        print("  (%s's GRUB line: %s)" % (d.title, grub))
+    print("  (the command line given: %s)" % (cmdline[:300] or "none: hv's default"))
 
     x = lambda line, secs=60: "hv exec 0 secs=%d %s" % (secs, line)
     marker_line = x("echo %s > /root/nos.txt && sync && cat /root/nos.txt" % marker)
@@ -504,9 +527,14 @@ def cloud(args, d):
     def login(boot):
         return ["hv wait 0 secs=600 boot=%d login:" % boot, r"hv send 0 root\n", "hv wait 0 secs=120 Password:",
                 r"hv send 0 %s\n" % d.password, "hv wait 0 secs=120 " + d.prompt]
-    rc = (["insmod /hv.ko", "hv on", "nat allow 10.0.2.2/32",
-           "hv start /bzImage mem=%d%s initrd=/initrd%s net restart cmdline=%s"
-           % (d.mem, machine_opt(args), disks, cmdline)]
+    # hvboot's last line before the jump, and its console up to then: which
+    # entry of whose grub.cfg it booted, and the line it gave the kernel.
+    hvboot_lines = (["hv wait 0 secs=300 %s" % HVBOOT_JUMP, "hv console 0 bytes=65536"] if args.hvboot else [])
+    start = ("hv start /bzImage mem=%d%s%s%s net restart%s"
+             % (d.mem, machine_opt(args), " initrd=/initrd" if initrd else "", disks,
+                " cmdline=" + cmdline if cmdline else ""))
+    rc = (["insmod /hv.ko", "hv on", "nat allow 10.0.2.2/32", start]
+          + hvboot_lines
           + login(0)
           + [x(d.version),
              x("systemctl is-system-running --wait", 300),
@@ -549,6 +577,23 @@ def cloud(args, d):
             return hvl.output_of(secs, line, occurrence) or ""
 
         first, second = login(0), login(1)
+        if args.hvboot:
+            m = re.search(r'printed "%s", (\d+) ms in' % re.escape(HVBOOT_JUMP), out(hvboot_lines[0]))
+            pt.check("hvboot, started by PVH, reads the image's own /boot and jumps into its kernel", m is not None,
+                     out(hvboot_lines[0]))
+            if m:
+                print("  (hvboot at the kernel %.1f s after the VM started)" % (int(m.group(1)) / 1000.0))
+            console = out(hvboot_lines[1])
+            chose = re.search(r'hvboot: (vd[a-z]\d*)(/\S*grub\.cfg): "([^"]+)", (.+)', console)
+            pt.check("it booted the entry the image's grub.cfg makes its default", chose is not None
+                     and "default" in chose.group(4), console[-2000:])
+            if chose:
+                print("  (hvboot: %s%s, \"%s\", %s)" % chose.groups())
+            line = re.search(r"hvboot: its command line: (.*)", console)
+            if line:
+                print("  (its command line: %s)" % line.group(1).strip()[:300])
+        # The commands after the start, which hvboot's two lines move along.
+        base = rc.index(start) + 1 + len(hvboot_lines) + len(first)
         m = re.search(r'printed "login:", (\d+) ms in', out(first[0]))
         pt.check("%s's own kernel and initrd boot it, systemd, to a login prompt" % d.title, m is not None,
                  out(first[0]))
@@ -556,15 +601,15 @@ def cloud(args, d):
             print("  (login prompt %.1f s after the VM started)" % (int(m.group(1)) / 1000.0))
         pt.check("root logs in, " + d.provisioned,
                  "printed \"%s\"" % d.prompt in out(first[4]), out(first[2]) + out(first[4]))
-        pt.check(d.version_what, d.version_ok(out(rc[9])), out(rc[9]))
-        pt.check("systemd says the system is running", re.search(r"^running\s*$", out(rc[10]), re.M) is not None,
-                 out(rc[10]))
-        pt.check("with no unit failed", re.search(r"^0\s*$", out(rc[11]), re.M) is not None, out(rc[11]))
+        pt.check(d.version_what, d.version_ok(out(rc[base])), out(rc[base]))
+        pt.check("systemd says the system is running", re.search(r"^running\s*$", out(rc[base + 1]), re.M) is not None,
+                 out(rc[base + 1]))
+        pt.check("with no unit failed", re.search(r"^0\s*$", out(rc[base + 2]), re.M) is not None, out(rc[base + 2]))
         pt.check("its root is the guest's disk, ext4, read-write",
-                 re.search(r"^/dev/vda1 ext4 rw", out(rc[12]), re.M) is not None, out(rc[12]))
-        m = re.search(r"^(\d{9,})\s*$", out(rc[13]), re.M)
+                 re.search(r"^/dev/vda1 ext4 rw", out(rc[base + 3]), re.M) is not None, out(rc[base + 3]))
+        m = re.search(r"^(\d{9,})\s*$", out(rc[base + 4]), re.M)
         pt.check("its clock is the host's", m is not None and t_start - 300 <= int(m.group(1)) <= t_end + 300,
-                 out(rc[13]))
+                 out(rc[base + 4]))
         rate = clock_rate(out, clock_lines(0, x))
         pt.check("idle, its clock keeps the host's time (no tick lost)",
                  rate is not None and abs(rate - 1) <= CLOCK_TOLERANCE, "rate %s" % rate)
@@ -631,6 +676,12 @@ def cloud(args, d):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# hvboot, as `make` builds it beside the modules; and the line it prints last,
+# before it jumps into the kernel.
+HVBOOT = os.path.join(hvl.ROOT, "out", "x86_64", "hvboot")
+HVBOOT_JUMP = "hvboot: its command line:"
+
+
 def machine_opt(args):
     """`cpus=N` for guests of N CPUs, and `ioapic` for ones with an IO-APIC."""
     return (" cpus=%d" % args.cpus if args.cpus > 1 else "") + (" ioapic" if args.ioapic else "")
@@ -695,6 +746,10 @@ def main():
     ap.add_argument("--ioapic", action="store_true",
                     help="each guest with an IO-APIC (hv's `ioapic`; needs --cpus 2 or more): the distribution's "
                          "own kernel routing its interrupts through it")
+    ap.add_argument("--hvboot", action="store_true",
+                    help="boot the cloud images with hvboot as the VM's kernel (out/x86_64/hvboot, make builds it): "
+                         "their own kernel and initrd, off their own /boot, by their own grub.cfg -- nothing taken "
+                         "out of them")
     ap.add_argument("--keep", action="store_true", help="keep the serial log")
     args = ap.parse_args()
     if not args.iso and not args.debian and not args.ubuntu:
@@ -704,13 +759,15 @@ def main():
     tools = []
     if args.iso:
         tools += ["xorriso", "ssh", "ssh-keygen"]
-    if args.debian or args.ubuntu:
+    if (args.debian or args.ubuntu) and not args.hvboot:
         tools += ["sfdisk", "debugfs"]
     if args.ubuntu:
         tools += ["xorriso"]
     for tool in tools:
         if shutil.which(tool) is None:
             sys.exit("hv-distro-test needs %s" % tool)
+    if args.hvboot and not os.path.exists(HVBOOT):
+        sys.exit("no %s: build it first (make)" % HVBOOT)
     for path in (args.iso, args.debian, args.ubuntu):
         if path and not os.path.exists(path):
             sys.exit("no %s" % path)

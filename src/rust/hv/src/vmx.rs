@@ -13,7 +13,7 @@ use hvarch::x86::svm::{GuestRegs, Kick, NotRun};
 use hvarch::{Caps, Result};
 
 use crate::memory::GuestMemory;
-use crate::svm::{Exit, Io, LongMode};
+use crate::svm::{Exit, Io, LongMode, ProtectedMode};
 use crate::vm::Refusal;
 
 /* Control-register and EFER bits a guest's starting state is made of. The
@@ -207,6 +207,15 @@ impl Vcpu {
         *self.guest.debug_addrs_mut() = [0; 4];
         /* The whole shadow was just set: the next entry loads all of it,
          * not only the fields a policy changes between entries. */
+        self.guest.mark_full_sync();
+    }
+
+    /// The PVH entry's state, as the AMD side's (`crate::svm::protected_mode`)
+    /// into the shadow: paging off, which only unrestricted guest runs --
+    /// the caller has asked (`crate::vm::Backend::runs_real_mode`).
+    pub fn protected_mode(&mut self, p: &ProtectedMode) {
+        crate::svm::protected_mode(self.guest.save_mut(), p, 0);
+        *self.guest.debug_addrs_mut() = [0; 4];
         self.guest.mark_full_sync();
     }
 

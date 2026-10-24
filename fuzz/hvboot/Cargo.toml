@@ -1,0 +1,21 @@
+# hvboot's parsers on the host: its partition tables, ext2/3/4 reader, GRUB
+# configuration and bzImage header (src/rust/hvboot/src/{gpt,ext,grub,
+# bzimage,crc32}.rs), compiled from their own sources and run over a disk
+# image -- what hvboot would boot off it, and the kernel and initrd read out
+# by its own reader, to compare with what e2fsprogs reads -- and over random
+# inputs (scripts/hvboot-test.py). No dependencies, so it builds offline.
+[package]
+name = "hvboot-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# Overflow checks on, as a RUSTUB=1 build has them: hvboot reads what the
+# guest's disk says, and an overflow there is a bug of its own.
+[profile.release]
+overflow-checks = true
+debug-assertions = true
+panic = "unwind"
+
+[workspace]

@@ -412,6 +412,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hvboot"
+version = "0.1.0"
+
+[[package]]
 name = "igb"
 version = "0.1.0"
 dependencies = [
