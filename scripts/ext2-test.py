@@ -22,11 +22,22 @@ The way down is judged as well: the unmount writes the superblock's state,
 and after it the machine has to switch itself off with nothing panicking.
 Until 7908bf6 it could not -- an exiting CPU left its one WFI, and the static
 destructors faulted after the unmount -- and this test looked away from it.
+
+And a file past 4 GiB: the image starts without large_file, which nos has
+to set when it makes its first file of 2 GiB or more; one is grown by
+`truncate` and written at its end, past 5 GiB, where the size takes both of
+an inode's words and the block hangs under the triple indirect block -- the
+whole of it does, past 64 MiB of 1 KiB blocks; another is grown past 6 GiB
+and cut back; and the self-test's far file is run on the root. Then e2fsck
+judges it all, and debugfs reads the far file's size, and where its last
+line is, off the image -- another implementation of the format, which a
+driver reading back its own writes is not.
 """
 
 import argparse
 import importlib.util
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -48,6 +59,14 @@ SHELL_PORT = pt.SHELL_PORT
 # doubly-indirect boundary at 268 KiB it is not -- the boot-time fstest goes
 # there, and this one goes over the same ground from the shell.
 BIG_LINES = 400
+
+# The far file: grown by truncate, a line appended at its end. 5 GiB is past
+# 2 and 4 GiB, and inside the 16 GiB a file of 1 KiB blocks may be.
+FAR_SIZE = 5 << 30
+FAR_TEXT = "far-past-five-gib"
+# The one grown and cut back.
+CUT_FROM = 6 << 30
+CUT_TO = 1 << 20
 
 
 def shell_work(sh):
@@ -89,7 +108,60 @@ def shell_work(sh):
              "big.txt" in listing and "renamed.txt" in listing
              and "inner" in listing and "tree" not in listing, listing)
 
+    far_work(sh)
+
     sh.run("sync")
+
+
+def far_work(sh):
+    """Files past 4 GiB, from the shell: their sizes as stat has them, and
+    the self-test's far file on the root."""
+    out = sh.run("truncate /work/far.bin 5G")
+    pt.check("truncate grows a file past 4 GiB", "/work/far.bin: %d bytes" % FAR_SIZE in out, out)
+    sh.run("append /work/far.bin " + FAR_TEXT)
+    out = sh.run("stat /work/far.bin")
+    pt.check("a line appended at its end lands past 5 GiB",
+             "%d bytes" % (FAR_SIZE + len(FAR_TEXT)) in out, out)
+
+    sh.run("truncate /work/cut.bin 6G")
+    sh.run("append /work/cut.bin gone-again")
+    out = sh.run("truncate /work/cut.bin 1M")
+    pt.check("a file past 6 GiB cut back to 1 MiB", "/work/cut.bin: %d bytes" % CUT_TO in out, out)
+
+    out = sh.run("fstest /work")
+    pt.check("the self-test's far file passes on the root",
+             "a sparse file past 4 GiB" in out and "fstest: passed" in out, out[-600:])
+
+
+def far_checks(image):
+    """What debugfs reads of the far files off the image nos left: large_file
+    set, the far file's size, its last line where nos wrote it, and the one
+    cut back holding no block at all."""
+    _, stats = e2fs(image, "debugfs", "-R", "stats")
+    pt.check("nos set large_file", re.search(r"(?m)^Filesystem features:.*\blarge_file\b", stats) is not None,
+             "\n".join(l for l in stats.splitlines() if "features" in l))
+    bs = int(re.search(r"(?m)^Block size:\s+(\d+)", stats).group(1))
+
+    _, st = e2fs(image, "debugfs", "-R", "stat /work/far.bin")
+    m = re.search(r"Group:\s+\d+\s+Size:\s+(\d+)", st)
+    pt.check("debugfs reads the far file's size, past 5 GiB",
+             m is not None and int(m.group(1)) == FAR_SIZE + len(FAR_TEXT), st[:600])
+    pt.check("and finds its last block under the triple indirect block", "(TIND)" in st, st[:600])
+
+    _, at = e2fs(image, "debugfs", "-R", "bmap /work/far.bin %d" % (FAR_SIZE // bs))
+    phys = [int(l) for l in at.splitlines() if l.strip().isdigit()]
+    text = b""
+    if phys and phys[-1] != 0:
+        with open(image, "rb") as f:
+            f.seek(phys[-1] * bs + FAR_SIZE % bs)
+            text = f.read(len(FAR_TEXT))
+    pt.check("and the line appended at 5 GiB where nos put it", text == FAR_TEXT.encode(), "%r, %r" % (at, text))
+
+    _, st = e2fs(image, "debugfs", "-R", "stat /work/cut.bin")
+    m = re.search(r"Group:\s+\d+\s+Size:\s+(\d+)", st)
+    pt.check("the file cut back is 1 MiB, and holds no block",
+             m is not None and int(m.group(1)) == CUT_TO and re.search(r"Blockcount:\s+0\b", st) is not None,
+             st[:600])
 
 
 def wait_for(log, marker, timeout):
@@ -103,19 +175,25 @@ def wait_for(log, marker, timeout):
     return False
 
 
-def fsck(image):
-    """What e2fsck makes of the image: the host's, or the one in the builder
-    image when the host has none -- the way mkrootfs.sh picks its mke2fs."""
-    if shutil.which("e2fsck"):
-        argv = ["e2fsck", "-fn", image]
+def e2fs(image, tool, *args):
+    """A tool of e2fsprogs run on the image: the host's, or the one in the
+    builder image when the host has none -- the way mkrootfs.sh picks its
+    mke2fs. Its exit code, and what it said."""
+    if shutil.which(tool):
+        argv = [tool] + list(args) + [image]
     else:
         at = os.path.dirname(image)
         name = os.path.basename(image)
         argv = ["docker", "run", "--platform", "linux/amd64", "--rm",
                 "-v", "%s:/img" % at, "-w", "/img", "nos-builder",
-                "e2fsck", "-fn", "/img/" + name]
+                tool] + list(args) + ["/img/" + name]
     run = subprocess.run(argv, capture_output=True, text=True)
     return run.returncode, (run.stdout + run.stderr).strip()
+
+
+def fsck(image):
+    """What e2fsck makes of the image."""
+    return e2fs(image, "e2fsck", "-fn")
 
 
 def main():
@@ -131,6 +209,14 @@ def main():
 
     code, out = fsck(image)
     if not pt.check("the fresh image is clean to start with", code == 0, out):
+        return 1
+    # Without large_file, which mke2fs gives every image: nos's first file of
+    # 2 GiB or more has to set it
+    e2fs(image, "debugfs", "-w", "-R", "feature -large_file")
+    _, stats = e2fs(image, "debugfs", "-R", "stats")
+    if not pt.check("the image starts without large_file",
+                    re.search(r"(?m)^Filesystem features:", stats) is not None
+                    and re.search(r"(?m)^Filesystem features:.*\blarge_file\b", stats) is None, stats[:800]):
         return 1
 
     import platform
@@ -181,6 +267,7 @@ def main():
 
     code, out = fsck(image)
     pt.check("e2fsck finds the image clean after all of that", code == 0, out)
+    far_checks(image)
 
     # Nothing must go wrong from the boot to the power-off, the halt after
     # the unmount included: its static destructors faulted on arm64 until

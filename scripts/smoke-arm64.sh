@@ -48,7 +48,8 @@ fi
 [ -f nos-arm64.img ] || fail "nos-arm64.img not found"
 
 # The virtio-blk disk carries an ext2 root filesystem (label nos, 1 KiB
-# blocks) that root=auto mounts on / and fstest=on exercises.
+# blocks, so that fstest's far file reaches the triple indirect block) that
+# root=auto mounts on / and fstest=on exercises.
 scripts/mkrootfs.sh "$TMPDIR_SMOKE/root.img" 64 "" 1024 > /dev/null \
     || fail "cannot make the root filesystem image"
 
@@ -75,10 +76,12 @@ QEMU_PID=$!
 #   "Cpus started"                    - every DTB CPU came up via PSCI CPU_ON
 #   "After test"                      - multitasking test green with SMP on
 #   "MountRootFs: mounted ext2 on /"  - the root image was found and mounted rw
+#   "a sparse file past 4 GiB"        - and took ext2 past 2 and 4 GiB, into the
+#                                       triple indirect block's tree
 #   "fstest: passed"                  - the filesystem self-test ran on it
 #   "boot: complete"                  - shell started, BSP reached the idle loop
-MARKERS=("Self test passed" "Cpus started" "After test" "MountRootFs: mounted ext2 on /" "fstest: passed"
-         "EntropySource registered: rng0" "boot: complete")
+MARKERS=("Self test passed" "Cpus started" "After test" "MountRootFs: mounted ext2 on /"
+         "a sparse file past 4 GiB" "fstest: passed" "EntropySource registered: rng0" "boot: complete")
 
 ELAPSED=0
 while [ "$ELAPSED" -lt "$SMOKE_TIMEOUT" ]; do

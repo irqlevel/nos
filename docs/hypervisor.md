@@ -1397,8 +1397,11 @@ hand; with `--initrd` it checks the guest reaches its `init` and a shell, and
 
 `disk=<path>`, on `hv boot` or `hv start` and as many times as there are
 disks, gives the guest a virtio block device over a file of nos's: `vda`,
-`vdb`, ... in that order, each the size of its file. The guest mounts it,
-ext4 and all, as it would a disk of QEMU's:
+`vdb`, ... in that order, each the size of its file -- past 4 GiB too, as
+big as nos's ext2 lets a file be ([Filesystems](filesystems.md#ext2): almost
+2 TiB of 4 KiB blocks), and blank from `truncate /vm/disk.img 20G` if it is
+to be made on nos. The guest mounts it, ext4 and all, as it would a disk of
+QEMU's:
 
 ```
 $ hv start /bzImage initrd=/initrd disk=/disk.img cmdline=console=ttyS0 nolapic
