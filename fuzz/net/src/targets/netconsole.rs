@@ -3,7 +3,7 @@
 //! gateway, or not there yet; over a link that loses what it likes; from a
 //! machine that has no address yet, whose NIC stalls, that logs a line, a
 //! line too long for a record, and bursts that overrun the ring, from every
-//! task and in the middle of a send.
+//! task, from interrupt handlers and in the middle of a send.
 //!
 //! What the collector gets is numbered from 0, every datagram the next
 //! number -- a gap is the network's, never the machine's -- and carries
@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use netwire::udp;
 
-use crate::machine::{self, nic};
+use crate::machine::{self, nic, sched};
 use crate::world::lan::Lan;
 use crate::world::{App, Link, Net, Peers, World, ETH0_IP, GW_IP, MASK};
 use crate::Input;
@@ -81,7 +81,10 @@ fn record(n: u32, len: usize) -> Vec<u8> {
     r
 }
 
-/// A record of the input's length, logged as the tracer logs a line.
+/// A record of the input's length, logged as the tracer logs a line --
+/// from wherever a line is traced: a task, or an interrupt handler, where
+/// there is no task to ask about, as there is none on the stack a panic is
+/// sometimes reported from.
 fn log_one(r: &mut Input, n: &mut u32, logged: &mut Vec<(u32, Vec<u8>)>) {
     let len = match r.u8() % 8 {
         0 => r.pick(&[MAX_RECORD - 14, MAX_RECORD - 13, MAX_RECORD - 12, 600, 2000]),
@@ -90,7 +93,11 @@ fn log_one(r: &mut Input, n: &mut u32, logged: &mut Vec<(u32, Vec<u8>)>) {
     let text = record(*n, len);
     logged.push((*n, text.clone()));
     *n += 1;
-    net::netconsole::NETCONSOLE.log(&text);
+    if r.chance(64) {
+        sched::interrupt(|| net::netconsole::NETCONSOLE.log(&text));
+    } else {
+        net::netconsole::NETCONSOLE.log(&text);
+    }
 }
 
 /// What the collector got of each record, in the order it got them: the
