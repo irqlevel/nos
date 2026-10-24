@@ -61,8 +61,13 @@ public:
 
     ulong GetState();
 
-    /* True once Park() has stopped this CPU for good. Written once by the
-       parking CPU and read by whichever one panics, without the lock. */
+    /* True once Park() has stopped this CPU for good -- the last thing it
+       does, from a stack of its own -- after which the CPU that asked it to
+       exit may free everything it ran on: the task it interrupted, that
+       task's stack, at last the heap. Written once by the parking CPU and
+       read without the lock: by the halt waiting for it
+       (CpuTable::ExitAllExceptSelf), by whatever would send it work, and by
+       whichever CPU panics. */
     bool IsParked();
 
     void IPI(Context* ctx);
@@ -94,7 +99,6 @@ public:
     static const ulong StateInited = 0x1;
     static const ulong StateRunning = 0x2;
     static const ulong StateExiting = 0x4;
-    static const ulong StateExited = 0x8;
 
     bool Run(Task::Func func, void *ctx);
 
@@ -119,6 +123,7 @@ private:
 
     void OnPanic();
     void __attribute__((noreturn)) Park();
+    static void __attribute__((noreturn)) ParkOnOwnStack(void* ctx);
     void ProcessIPITasks(Context* ctx);
     void DrainAndCloseIPITasks(Context* ctx);
 
@@ -133,7 +138,7 @@ private:
     Stdlib::ListEntry IPITaskList;
     bool IPITasksClosed; /* set on exit: queuers self-complete instead of waiting */
 
-    /* Set by Park() before StateExited; see IsParked */
+    /* Set by Park(), last; see IsParked */
     Atomic Parked;
 
     void LocalTimerArm(ulong when, ulong now);

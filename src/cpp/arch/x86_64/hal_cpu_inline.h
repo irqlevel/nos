@@ -66,4 +66,16 @@ static inline __attribute__((always_inline)) u64 ReadCycleCounter()
     return ReadTsc();
 }
 
+// Halts this CPU for good, touching no memory -- no stack, no data: one
+// loop of two instructions, so that a wakeup only halts it again. HLT ends,
+// even with interrupts off, at an NMI or a machine check, whose handlers
+// return here. For a CPU whose stack and everything else may be freed
+// under it (Cpu::Park).
+static inline __attribute__((always_inline, noreturn)) void HaltForever()
+{
+    asm volatile("1: hlt\n\t"
+                 "jmp 1b" ::: "memory");
+    __builtin_unreachable();
+}
+
 }

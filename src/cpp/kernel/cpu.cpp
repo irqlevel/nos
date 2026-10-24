@@ -218,7 +218,7 @@ void CpuTable::ExitAllExceptSelf()
             auto& cpu = GetCpu(i);
             cpu.SetExiting();
 
-            while (!(cpu.GetState() & Cpu::StateExited))
+            while (!cpu.IsParked())
             {
                 cpu.SendIPISelf();
                 Pause();
@@ -264,36 +264,51 @@ void Cpu::OnPanic()
     }
 }
 
-/* Where an exiting CPU ends, for good. Once StateExited is visible the CPU
+/* What a parked CPU stands on (Cpu::Park): a stack of its own, static, which
+   nothing frees -- so that whatever a parked CPU still runs, it touches
+   nothing the halt takes down. That is its last two calls and the halt; on
+   x86 also an NMI or a machine check, which end HLT with interrupts off,
+   push their frames onto the stack the CPU is on, and may panic there. A
+   panic is what the size is for: one made to run on this stack (StackProbe,
+   on a build for the purpose) went 1800 bytes deep on arm64 and 1880 on
+   x86, and 5176 on arm64 with the netconsole sending its report. */
+static const ulong ParkStackSize = 4 * Const::PageSize;
+static char ParkStack[MaxCpus][ParkStackSize] __attribute__((aligned(16)));
+
+/* Where an exiting CPU ends, for good. Once it is parked (IsParked) the CPU
    that asked goes on to free the tasks, their stacks and at last the heap --
-   the stack this one is standing on among them -- so this CPU must never go
-   back to the task it interrupted, and StateExited is published only when
-   there is nothing left for it to do. One halt is not enough to stay put:
-   arm64's WFI may complete at any moment -- a pending interrupt ends it even
-   while masked, and under HVF every AP was out of it within milliseconds --
-   and x86's HLT ends at the first NMI. A CPU that fell out of it used to
-   return from the IPI into a task whose stack was being freed under it: the
-   data abort every arm64 poweroff printed from an AP, in the middle of the
-   boot CPU's static destructors. */
+   the stack this one was interrupted on among them -- so from that moment
+   this CPU must touch none of it, for as long as the machine runs.
+
+   It used to say so on that stack and stay there. One halt is not enough to
+   stay put: arm64's WFI may complete at any moment -- a pending interrupt
+   ends it even while masked, and under HVF every AP was out of it within
+   milliseconds -- and x86's HLT ends at an NMI, whose frame goes onto the
+   stack the CPU is on. The halt was a loop around Hlt(), a call, whose frame
+   record went onto that stack at every wakeup: the data abort a parked AP
+   printed now and then on arm64, in the middle of the boot CPU's static
+   destructors. And the word that it had exited was written under this CPU's
+   lock, whose release went on, past the moment the other CPU could see the
+   word, to write the preemption count of the task it had interrupted.
+
+   So it leaves that stack first, for its own, says it is parked from there
+   -- an atomic store and not this CPU's lock, which off a task's stack would
+   look for the current task and panic -- and halts in a loop that touches no
+   memory at all. */
 void Cpu::Park()
 {
     InterruptDisable();
 
-    /* Before StateExited: from then on the stack under this CPU may be freed
-       at any moment, and a panic must already know not to send it an NMI,
-       whose delivery pushes a frame onto that stack (see
-       Panicker::CollectRemoteStacks). */
-    Parked.Set(1);
+    Hal::RunOnStack((ulong)&ParkStack[Index][ParkStackSize], ParkOnOwnStack, this);
+}
 
-    {
-        Stdlib::AutoLock lock(Lock);
-        State |= StateExited;
-    }
+void Cpu::ParkOnOwnStack(void* ctx)
+{
+    auto cpu = static_cast<Cpu*>(ctx);
 
-    for (;;)
-    {
-        Hlt();
-    }
+    cpu->Parked.Set(1);
+
+    Hal::HaltForever();
 }
 
 static void TlbFlushFunc(void* ctx, Context* ipiCtx)
@@ -324,8 +339,7 @@ ulong CpuTable::GetRemoteCpuMask()
 
     for (ulong i = 0; i < MaxCpus; i++)
     {
-        if ((cpuMask & (1UL << i)) &&
-            (CpuArray[i].GetState() & Cpu::StateExited))
+        if ((cpuMask & (1UL << i)) && CpuArray[i].IsParked())
             cpuMask &= ~(1UL << i);
     }
 
@@ -757,7 +771,7 @@ void Cpu::SendIPISelf()
     if (BugOn(!(State & Cpu::StateRunning)))
         return;
 
-    if (State & Cpu::StateExited)
+    if (IsParked())
         return;
 
     Hal::SendIpi(Index, CpuTable::IPIVector);

@@ -185,9 +185,8 @@ void Panicker::CollectRemoteStacks()
             continue;
 
         /* Stopped for good in the halt path (Cpu::Park): it has nothing to
-           tell, and the stack it stopped on may be freed by now. Delivering
-           an NMI pushes a frame onto that stack, and the fault that follows
-           would bury this report under one of its own. */
+           tell -- what it runs is the halt, on a stack of its own -- and the
+           report says so in a line. */
         if (table.GetCpu(i).IsParked())
         {
             parked |= (1UL << i);
