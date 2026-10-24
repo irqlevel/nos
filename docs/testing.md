@@ -114,7 +114,7 @@ swallowing panic messages whole.
 | Gate | Arch | Run it after touching |
 |---|---|---|
 | `wx-test.sh [--arch x86_64\|aarch64]` | both | a mapping path |
-| `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset |
+| `panic-test.sh [--arch x86_64\|aarch64]` | both | the panic path, `panic=N`, a reset; a panic off a task's stack (x86's double fault), its report through the netconsole |
 | `parttest.py [--arch aarch64\|x86_64]` | both | the block layer, the partition tables |
 | `ext2-test.py` | arm64 | ext2, the halt |
 | `nanofs-test.py` | arm64 | nanofs, the halt |
@@ -157,6 +157,24 @@ from a panic -- the EX44 stayed dark until it was reset by hand from the
 provider's panel after a boot that died before its network was up -- and
 the system image boots nos with `panic=10`, after which GRUB boots the
 server's own system. `--skip-build`; `PANIC_HVF=1` for the arm64 boots under HVF.
+
+And a third boot, with the netconsole on: the panic a running machine has
+from a stack that is no task's, typed at the UDP shell once the collector
+has heard from the machine. On x86-64 a real double fault (`panic df`): a
+stack pointer nothing can use, so the report runs on the IST stack, and the
+stack it came from cannot be read; on arm64, whose exceptions have no stack
+of their own, a panic run on a static one (`panic offstack`). The report has
+to reach the collector -- the x86 one with the other CPU's stack in it, and
+saying the stack it came from could not be read -- and `panic=1` has to
+reset the machine. Until the lock path stopped asking which task held a lock
+once a panic had begun (`PreemptCurrentTask`), such a report stopped at its
+first lock, a panic inside the panic that only spins -- with the netconsole
+on, before it had printed a line -- and nothing reset the machine; a double
+fault's would have stopped again at the walk of the stack it came from, and
+overrun the 4 KiB it was given, where the report with the netconsole sending
+it takes 5688 bytes. Put back one at a time, the lock path's check and the
+walk's fault are each found by this boot: no panic printed at all, and a
+machine still there twenty seconds after the report.
 
 ### `parttest.py` -- partition tables
 

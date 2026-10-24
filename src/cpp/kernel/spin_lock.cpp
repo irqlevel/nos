@@ -24,7 +24,7 @@ void SpinLock::Unwatch()
 void SpinLock::Lock()
 {
     RawLock.Lock();
-    Owner = (PreemptIsOn()) ? Task::GetCurrentTask() : nullptr;
+    Owner = (PreemptIsOn()) ? PreemptCurrentTask() : nullptr;
 }
 
 void SpinLock::Unlock()
@@ -39,7 +39,7 @@ void SpinLock::Unlock()
 void SpinLock::Lock(ulong& flags)
 {
     flags = RawLock.LockIrqSave();
-    Owner = (PreemptIsOn()) ? Task::GetCurrentTask() : nullptr;
+    Owner = (PreemptIsOn()) ? PreemptCurrentTask() : nullptr;
 }
 
 void SpinLock::Unlock(ulong flags)

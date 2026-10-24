@@ -86,7 +86,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `lsmod` | List the modules: name, size, load address, how many kernel functions each binds to, and which are permanent, still loading or still unloading. Never waits on a load or unload in progress |
 | `rc [add <line>\|del <n>\|clear\|run]` | Show or edit `/etc/rc`: shell commands, a line each (blank lines and `#` comments skipped), that the shell's task runs once at boot after DHCP -- how a module such as [sshd](sshd.md) gets loaded and started on a machine nobody can reach until it is. `rc` numbers the lines, `add` appends one, `del` takes one out, `clear` removes the file, `run` runs it now. What it prints at boot goes to the kernel log and the screen; `rc=off` skips it |
 | `usb` | Show xHCI controllers, connected root ports and keyboard report counters |
-| `panic [type]` | Trigger kernel panic (direct, pagefault, divzero, ud) |
+| `panic [type]` | Trigger kernel panic: direct, or `pf` (page fault), `div0` (divide by zero), `ud` (invalid opcode), `df` (a real double fault, x86-64: a stack pointer no access can use, the report from the IST stack), `offstack` (a panic on a stack that is no task's, with preemption on) -- the last two what `panic-test.sh` drives |
 | `version` | Show kernel version |
 | `poweroff` / `shutdown` | Power off (ACPI S5) |
 | `reboot` | Reset system (keyboard controller) |

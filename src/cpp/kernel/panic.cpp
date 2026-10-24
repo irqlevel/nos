@@ -29,6 +29,7 @@ namespace Kernel
 {
 
 Panicker::Panicker()
+    : ProbeCpu(-1)
 {
 }
 
@@ -159,6 +160,22 @@ bool Panicker::CollectRemoteStack()
     Hal::SmpWmb();
     RemoteDone[index].Set(2);
     return true;
+}
+
+void Panicker::RecoverFault()
+{
+    long probe = ProbeCpu.Get();
+    if (probe < 0 || Active.Get() == 0)
+        return;
+
+    /* Which CPU this is, only once it can be asked: before the interrupt
+       controller is up the boot CPU is the only one, and on x86 the asking
+       is a read of the local APIC, not mapped yet -- a fault of its own */
+    if (Hal::IrqChipReady() && probe != (long)Hal::GetCurrentCpuHwId())
+        return;
+
+    ProbeCpu.Set(-1);
+    LongJmp(&ProbeJump, 1);
 }
 
 void Panicker::CollectRemoteStacks()
@@ -313,11 +330,35 @@ void Panicker::DoPanicCtx(Context* ctx, bool hasErrorCode, const char *fmt, ...)
 
         /* Walk from the faulting code's RBP, over the stack its own RSP
            names: #DF arrives on a separate IST stack, and the report wanted
-           is about the stack it came from. */
-        ulong frames[16];
-        size_t count = StackTrace::CaptureFromSp(ctx->GetFramePointer(),
-            ctx->GetOrigRsp(hasErrorCode), frames, Stdlib::ArraySize(frames));
-        DumpBacktrace(frames, count);
+           is about the stack it came from. Which is the likeliest thing
+           there to be broken -- a double fault is a fault the CPU could not
+           push onto that stack -- so the walk reads it as memory that may
+           not be there: a fault in it comes back here (RecoverFault), and
+           the report goes on without it. It used to fault itself, a panic
+           inside the panic, and stop: no other CPU's stack, no netconsole,
+           no reset. */
+        if (SetJmp(&ProbeJump) == 0)
+        {
+            ProbeCpu.Set(Hal::IrqChipReady() ? (long)Hal::GetCurrentCpuHwId() : 0);
+            ulong frames[16];
+            size_t count = StackTrace::CaptureFromSp(ctx->GetFramePointer(),
+                ctx->GetOrigRsp(hasErrorCode), frames, Stdlib::ArraySize(frames));
+            ProbeCpu.Set(-1);
+            DumpBacktrace(frames, count);
+        }
+        else
+        {
+            /* Then at least where it was, which needs no stack */
+            char where[SymbolTable::DescribeMax];
+            char buf[SymbolTable::DescribeMax + 64];
+            if (SymbolTable::GetInstance().Describe(ctx->GetRetRip(hasErrorCode), where, sizeof(where)))
+                Stdlib::SnPrintf(buf, sizeof(buf),
+                    "Backtrace: none, the stack it came from cannot be read; at %s\n", where);
+            else
+                Stdlib::SnPrintf(buf, sizeof(buf),
+                    "Backtrace: none, the stack it came from cannot be read\n");
+            PrintOutput(buf);
+        }
         DumpModules();
 
         CollectRemoteStacks();

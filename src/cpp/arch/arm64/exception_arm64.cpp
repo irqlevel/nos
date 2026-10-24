@@ -37,6 +37,10 @@ const char* EcName(ulong ec)
 
 extern "C" void ArmSyncEntry(Context* ctx)
 {
+    /* A read the panic report was not sure of: back into the report (see
+       Panicker::RecoverFault), and this one is not reported */
+    Panicker::GetInstance().RecoverFault();
+
     ulong ec = (ctx->Esr >> 26) & 0x3F;
     ulong iss = ctx->Esr & 0x1FFFFFF;
 

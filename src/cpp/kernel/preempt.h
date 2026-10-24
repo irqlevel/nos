@@ -29,6 +29,18 @@ class Task;
 Task* PreemptDisableTask();
 void PreemptEnableTask(Task* task);
 
+/* The task running, as the lock path counts and records it -- PreemptDisable,
+   PreemptEnable, a SpinLock's owner: Task::GetCurrentTask(), whose BugOn is
+   the tripwire at the bottom of every task's stack and a stack pointer that
+   has left its task's stack, until a panic has begun. From then on it is
+   nullptr where there is no task: a panic reported from a stack of its own
+   -- x86's double fault's, a static one -- takes its locks there, and the
+   BugOn would be a panic inside the panic, which only spins: the report
+   stopped at its first lock, before the other CPUs' stacks, the netconsole
+   and the reset. A panic switches to no task again, so there is nothing to
+   count. */
+Task* PreemptCurrentTask();
+
 /* May the caller block -- wait for a completion, or Schedule() away? Not
    with interrupts off; and once preemption is on, not off a task stack, and
    not with preemption disabled -- which every spinlock (RawSpinLock,

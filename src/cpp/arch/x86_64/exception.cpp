@@ -250,6 +250,11 @@ void ExceptionTable::ExcStackFault(Context* ctx)
 {
     ExcStackFaultCounter.Inc();
 
+    /* A read the panic report was not sure of: back into the report (see
+       Panicker::RecoverFault), and this one is not reported. The same in
+       the next two. */
+    Panicker::GetInstance().RecoverFault();
+
     PanicCtx(ctx, true, "EXC: StackFault rip 0x%lX rsp 0x%lX err 0x%lX",
         ctx->GetRetRip(true), ctx->GetOrigRsp(true), ctx->GetErrorCode());
 }
@@ -257,6 +262,8 @@ void ExceptionTable::ExcStackFault(Context* ctx)
 void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
 {
     ExcGeneralProtectionFaultCounter.Inc();
+
+    Panicker::GetInstance().RecoverFault();
 
     PanicCtx(ctx, true, "EXC: GP cpu %lu rip 0x%lX rsp 0x%lX err 0x%lX",
         CpuTable::GetInstance().GetCurrentCpuId(),
@@ -266,6 +273,8 @@ void ExceptionTable::ExcGeneralProtectionFault(Context* ctx)
 void ExceptionTable::ExcPageFault(Context* ctx)
 {
     ExcPageFaultCounter.Inc();
+
+    Panicker::GetInstance().RecoverFault();
 
     PanicCtx(ctx, true, "EXC: PageFault cr2 0x%lX rip 0x%lX rsp 0x%lX err 0x%lX cr3 0x%lX",
         GetCr2(), ctx->GetRetRip(true), ctx->GetOrigRsp(true),
