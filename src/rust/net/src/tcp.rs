@@ -84,6 +84,10 @@ pub const OUR_MSS: u16 = 1460;
 const INITIAL_RTO_MS: u64 = 1000;
 const MAX_RTO_MS: u64 = 8000;
 const MAX_RETRANSMITS: u32 = 8;
+/// The most segments a timeout sends again of one connection: all 8 KiB of
+/// its send buffer at an MSS of 128 bytes or more, and no storm of frames
+/// from the timer at a smaller one.
+const RESEND_SEGMENTS: usize = 64;
 /// Linux's sixty seconds standing in for twice the maximum segment lifetime:
 /// a segment of an old incarnation must not be matched by a new connection
 /// reusing the same four addresses.
@@ -1004,6 +1008,44 @@ impl Tcp {
             inner.oow_ack_at = now;
             self.send_ack(inner);
         }
+    }
+
+    /// What a timeout sends again: everything unacknowledged, from SND.UNA
+    /// -- the send buffer holds exactly that -- in segments of the peer's
+    /// MSS, as far as its window reaches, the first whatever the window, as
+    /// the probe it then is; at most `RESEND_SEGMENTS` of them; then the FIN,
+    /// when `fin` says one is out and all before it went. One segment a
+    /// timeout, as it was, gave back a window lost whole -- a NIC's ring
+    /// stalled under it -- a second a segment: two hours and more for 8 KiB
+    /// at the MSS of one byte a peer may ask for. True if anything went.
+    fn resend(&'static self, inner: &mut Inner, fin: bool) -> bool {
+        let saved = inner.snd_nxt;
+        let used = inner.send_buf.used();
+        let mss = (inner.peer_mss as usize).clamp(1, OUR_MSS as usize);
+        let window = inner.snd_wnd as usize;
+        let mut segment = [0u8; OUR_MSS as usize];
+        let mut offset = 0;
+        let mut sent = 0;
+
+        while offset < used && sent < RESEND_SEGMENTS && (sent == 0 || offset < window) {
+            let len = (used - offset).min(mss);
+            let got = inner.send_buf.peek(&mut segment[..len], offset);
+            if got == 0 {
+                break;
+            }
+            inner.snd_nxt = inner.snd_una.wrapping_add(offset as u32);
+            self.send_segment(inner, seg::ACK_FLAG | seg::PSH, &segment[..got]);
+            offset += got;
+            sent += 1;
+        }
+        if fin && offset == used && sent < RESEND_SEGMENTS {
+            inner.snd_nxt = inner.snd_una.wrapping_add(used as u32);
+            self.send_segment(inner, seg::FIN | seg::ACK_FLAG, &[]);
+            sent += 1;
+        }
+
+        inner.snd_nxt = saved;
+        sent != 0
     }
 }
 
@@ -2201,40 +2243,13 @@ impl Tcp {
                         inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
                         retransmitted = true;
                     }
+                    /* Whatever data is unacknowledged, and then our FIN */
                     State::FinWait1 | State::LastAck | State::Closing => {
-                        /* Whatever data is still unacknowledged goes first */
-                        let used = inner.send_buf.used();
-                        if used > 0 {
-                            let len = used.min(inner.peer_mss as usize);
-                            let mut segment = [0u8; OUR_MSS as usize];
-                            let got = inner.send_buf.peek(&mut segment[..len], 0);
-                            if got > 0 {
-                                let saved = inner.snd_nxt;
-                                inner.snd_nxt = inner.snd_una;
-                                self.send_segment(&mut inner, seg::ACK_FLAG | seg::PSH,
-                                    &segment[..got]);
-                                inner.snd_nxt = saved;
-                            }
-                        } else {
-                            inner.snd_nxt = inner.snd_una;
-                            self.send_segment(&mut inner, seg::FIN | seg::ACK_FLAG, &[]);
-                            inner.snd_nxt = inner.snd_nxt.wrapping_add(1);
-                        }
-                        retransmitted = true;
+                        retransmitted = self.resend(&mut inner, true);
                     }
                     _ => {
                         if inner.snd_una != inner.snd_nxt && inner.send_buf.used() > 0 {
-                            let len = inner.send_buf.used().min(inner.peer_mss as usize);
-                            let mut segment = [0u8; OUR_MSS as usize];
-                            let got = inner.send_buf.peek(&mut segment[..len], 0);
-                            if got > 0 {
-                                let saved = inner.snd_nxt;
-                                inner.snd_nxt = inner.snd_una;
-                                self.send_segment(&mut inner, seg::ACK_FLAG | seg::PSH,
-                                    &segment[..got]);
-                                inner.snd_nxt = saved;
-                            }
-                            retransmitted = true;
+                            retransmitted = self.resend(&mut inner, false);
                         }
                     }
                 }
