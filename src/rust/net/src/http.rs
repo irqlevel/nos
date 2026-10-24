@@ -1,11 +1,12 @@
 //! The HTTP client: a GET over plain TCP or over TLS, with the body handed
 //! to a sink as it arrives.
 //!
-//! The client never holds a whole body. A twenty megabyte download passes
+//! The client never holds a whole body. A download of gigabytes passes
 //! through the sink in receive-buffer sized pieces, so the peak cost of any
 //! transfer is one header buffer plus whatever the sink itself keeps. What
-//! the framing says -- chunked encoding, a content length, the hard cap --
-//! is applied on the way there.
+//! the framing says -- chunked encoding, a content length -- is applied on
+//! the way there; how much of a body is wanted is the sink's to say, and
+//! the client has no cap of its own.
 
 use alloc::vec::Vec;
 
@@ -20,8 +21,6 @@ use crate::tcp::{Conn, TCP};
 /// single allocation larger than half a megabyte, so anything bigger has to
 /// stream.
 pub const MAX_RESPONSE: usize = 32768;
-/// The largest download the shell offers.
-pub const MAX_BODY: usize = 20 * 1024 * 1024;
 /// The status line and headers must fit here; the same buffer then carries
 /// the body a receive at a time.
 pub const MAX_HEADER: usize = 16384;
@@ -48,6 +47,11 @@ const MAX_REDIRECTS: u32 = 5;
 /// the sink holds.
 pub trait Sink {
     fn take(&mut self, data: &[u8]) -> usize;
+
+    /// How long the body is, when the server said so before it: called once,
+    /// before the first `take`. Not called for a body that only its last
+    /// chunk or the connection's close ends.
+    fn length(&mut self, _len: usize) {}
 }
 
 /// What a GET turned out to be. The C++ side declares the same struct.
@@ -57,8 +61,8 @@ pub struct Response {
     pub content_length: usize,
     pub body_len: usize,
     pub ok: u32,
-    /// The body was cut short: the cap, a sink that refused, an idle
-    /// timeout, or a peer that closed early
+    /// The body was cut short: a sink that refused, an idle timeout, or a
+    /// peer that closed early
     pub truncated: u32,
     /// The handshake was refused -- a certificate that did not verify, or
     /// no protocol in common
@@ -342,37 +346,28 @@ impl ChunkDecoder {
 
 /* ---- the body on its way to the sink ---- */
 
-/// Everything the framing says about the body, applied on the way to the
-/// caller's sink: the chunk decoding, the content length's cut-off and the
-/// hard cap. It is itself what the decoder writes through, so the cap covers
-/// decoded output too.
+/// The decoded body on its way to the caller's sink, counted: what the
+/// decoder writes through, and what the content length's cut-off measures.
+/// A sink that takes less than it is offered ends the body there.
 struct BodyWriter<'a> {
     sink: &'a mut dyn Sink,
-    limit: usize,
     written: usize,
-    overflow: bool,
     failed: bool,
 }
 
 impl<'a> BodyWriter<'a> {
-    fn new(sink: &'a mut dyn Sink, limit: usize) -> BodyWriter<'a> {
-        BodyWriter { sink, limit, written: 0, overflow: false, failed: false }
+    fn new(sink: &'a mut dyn Sink) -> BodyWriter<'a> {
+        BodyWriter { sink, written: 0, failed: false }
     }
 
     fn write(&mut self, data: &[u8]) -> usize {
-        let mut len = data.len();
-        if len > self.limit - self.written {
-            /* What still fits under the cap goes over, then it stops */
-            self.overflow = true;
-            len = self.limit - self.written;
-        }
-        if len == 0 {
+        if data.is_empty() {
             return 0;
         }
 
-        let taken = self.sink.take(&data[..len]);
+        let taken = self.sink.take(data);
         self.written += taken;
-        if taken < len {
+        if taken < data.len() {
             self.failed = true;
         }
         taken
@@ -389,7 +384,7 @@ struct Body<'a> {
 impl<'a> Body<'a> {
     fn new(sink: &'a mut dyn Sink, chunked: bool, content_length: usize) -> Body<'a> {
         Body {
-            writer: BodyWriter::new(sink, MAX_BODY),
+            writer: BodyWriter::new(sink),
             decoder: if chunked { Some(ChunkDecoder::new()) } else { None },
             content_length,
         }
@@ -421,7 +416,7 @@ impl<'a> Body<'a> {
 
     /// Whether the body ended where the framing said it would.
     fn complete(&self) -> bool {
-        if self.writer.overflow || self.writer.failed {
+        if self.writer.failed {
             return false;
         }
         match self.decoder.as_ref() {
@@ -589,8 +584,8 @@ fn recv_response(
     location: &mut [u8; MAX_URL_LEN],
 ) -> Option<usize> {
     /* One buffer for the whole exchange: it holds the headers first, then
-     * carries the body a receive at a time. A twenty megabyte download costs
-     * no more memory than a two hundred byte one. */
+     * carries the body a receive at a time. A download of gigabytes costs
+     * no more memory than one of two hundred bytes. */
     let mut buf = Vec::new();
     if buf.try_reserve_exact(MAX_HEADER).is_err() {
         return None;
@@ -676,14 +671,8 @@ fn recv_response(
         return Some(location_len);
     }
 
-    if !chunked && resp.content_length > MAX_BODY {
-        /* Refused before the transfer rather than after twenty megabytes */
-        trace!(0, "http: a body of {} bytes is over the {} byte limit",
-            resp.content_length, MAX_BODY);
-        resp.body_len = 0;
-        resp.truncated = 1;
-        resp.ok = 1;
-        return Some(0);
+    if !chunked && resp.content_length != 0 {
+        sink.length(resp.content_length);
     }
 
     let mut body = Body::new(sink, chunked, resp.content_length);

@@ -39,7 +39,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `netconsole` | Show netconsole target, buffered bytes, drop/send counters |
 | `icmpstat` | Show ICMP statistics |
 | `tcpstat` | Show TCP connections and statistics |
-| `wget [-o <path>] <url> [path]` | Fetch a URL via HTTP or HTTPS GET (follows redirects, including http→https). With a path — `-o` and the trailing argument are the same thing — the body is streamed to that file as it arrives, up to 20 MiB, with a progress line every megabyte. Without one it is printed, and kept in memory, so it is capped at 32 KiB. HTTPS verifies the certificate chain against the built-in roots and the wall clock; see [HTTPS](tls.md) |
+| `wget [-o <path>] <url> [path]` | Fetch a URL via HTTP or HTTPS GET (follows redirects, including http→https). With a path — `-o` and the trailing argument are the same thing — the body is streamed to that file as it arrives, with no cap but the filesystem's — a VM's disk image of gigabytes is fine, and a disk that fills ends the download as a failed write — with a progress line now and then (how much, of how much when the server said, and how fast: every 2 s at first, every 30 s at most) and the time it took at the end. Without one it is printed, and kept in memory, so it is capped at 32 KiB. HTTPS verifies the certificate chain against the built-in roots and the wall clock; see [HTTPS](tls.md) |
 | `udpsend <ip> <port> <msg>` | Send a UDP packet |
 | `ping <ip\|hostname>` | Send 5 ICMP echo requests with RTT (resolves hostnames via DNS) |
 | `nslookup <hostname>` | Resolve hostname to IP via DNS |
