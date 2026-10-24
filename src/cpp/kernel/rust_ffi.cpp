@@ -543,7 +543,7 @@ void kernel_cpu_run_on(unsigned int cpu,
     auto& target = Kernel::CpuTable::GetInstance().GetCpu(cpu);
     ulong state = target.GetState();
     if (!(state & Kernel::Cpu::StateRunning) ||
-        (state & (Kernel::Cpu::StateExiting | Kernel::Cpu::StateExited)))
+        (state & Kernel::Cpu::StateExiting) || target.IsParked())
     {
         Trace(0, "kernel_cpu_run_on: cpu %lu not running (state 0x%lX)",
               (ulong)cpu, state);
