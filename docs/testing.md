@@ -56,8 +56,8 @@ of 50 ms reported at a report interval of 20.
   boot, and watch `nos.log`.
 
 Two more run at boot when there is something to run them on: `TestModules`
-loads the `modtest` module embedded in the image and then feeds the loader
-damaged copies of it (see [Loadable modules](modules.md#testing)), and
+loads the `modtest` module embedded in the image, with a parameter and
+without, and then feeds the loader damaged copies of it (see [Loadable modules](modules.md#testing)), and
 `fstest=on` runs the filesystem self-test on `/` once it is mounted
 (`fstest: passed` or `fstest: FAILED`; see [Filesystems](filesystems.md)).
 
@@ -131,7 +131,7 @@ swallowing panic messages whole.
 | `net-fuzz.py [--seed N --seconds S]` | host (CI) | anything the network hands the kernel -- the receive path, ARP, ICMP, UDP and TCP; the DHCP client and the DNS resolver; the HTTP client over TCP and over TLS; the UDP shell; netconsole; `sshd` over the `ssh` crate -- fuzzed with overflow checks on, each protocol against a model of it |
 | `fs-fuzz.py [--seed N --seconds S]` | host (CI) | anything a disk hands the kernel -- the partition tables, the disk log's area, ext2 and nanofs images sound and damaged -- and the storage layers above it: the block table's bounds and claims, the VFS and its C ABI, the file ABI, the shell's storage commands, `root=`; fuzzed with overflow checks on, the filesystems against a model of the tree, e2fsck's judgement and power cuts |
 | `cpp-fuzz.py [--seed N --seconds S]` | host (CI) | what firmware, a bootloader or a disk hands the kernel's C++ -- the device tree and what `Board` takes of it, the memory map, the GRUB environment block, a module's `.ko`, the x86 boot's Multiboot2 tags, microcode file, ACPI tables and command line, and the printf every line is formatted by -- and the memory management under everything: the page tables and the physical page allocator past `Setup`, the kernel heap; the kernel's own sources under the address and undefined-behaviour sanitizers, each against a model of what its header promises |
-| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
+| `hv-linux-test.py --bzimage <img> [--initrd <cpio>]` | x86-64, by hand | the Linux loader, the CPUID/MSR policy, the emulated devices -- a real kernel to its shell; with an initrd, guests that stay up and the commands that reach them, and a VM kept in a folder (`hv create`, `hv start <name>`, its `console.log`), in `/vms` and in a folder `insmod /hv.ko vms=` names; `--net`, the guests' switch, NAT, its DHCP server and the DNS server they are given; `--cpus N`, guests of N CPUs, their local APICs and IPIs; `--xapic`, those APICs in xAPIC mode, every access of theirs by MMIO; `--ioapic`, an IO-APIC routing the timer, the serial port, the SCI and -- with `pci=nomsi` -- virtio's INTx; `--acpi`, a guest kernel with ACPI: the tables it is given, the PM timer and the SCI, the reset register, and `hv stop`'s power button; `--qemu-cpu MODEL`, nos on a named TCG CPU -- `EPYC-Rome-v1`, `Skylake-Client-v1,+svm,+npt,+nrip-save` -- whose family and model put the guest's kernel on that CPU's paths through its MSRs |
 | `hv-distro-test.py --iso <alpine-virt.iso> [--debian <nocloud.raw>] [--ubuntu <cloudimg.raw>] [--internet] [--cpus N [--ioapic]]` | x86-64, by hand | a distribution as it ships -- Alpine's kernel, initramfs and packages, its ISO a read-only disk: login, clock, reboot, network and the way out through NAT, and its own sshd reached from outside; Debian's cloud image, systemd provisioned by credentials, networkd by DHCP, its root written to and kept across a reboot -- both on their ACPI (`--acpi-off`: without), Debian shut down by `hv stop`'s power button |
 | `idle-wait-test.py [--smp N]` | x86-64 | a wait primitive, the scheduler's choice of the idle task |
 | `image-test.py [--image FILE]` | x86-64 (CI) | the system image and what pours and boots it: `make image`, `build/image/`, `nos-install`, `root=UUID=` |
@@ -268,7 +268,8 @@ ServerAliveInterval=1 -o ServerAliveCountMax=2 ... top 5000` -- a session
 deaf while its command ran was cut off at three), a key it has to refuse,
 sessions at once, a burst
 of connections past the four that may be logging in, a stop and an `rmmod`
-from inside a session; then it puts the module in `/etc/rc`, reboots, and
+from inside a session -- and first an `insmod` given a parameter, which a
+module that takes none must refuse, saying so; then it puts the module in `/etc/rc`, reboots, and
 checks it came back by itself with the same host key, and that `poweroff`
 unloads it before the first filesystem is unmounted and then switches the
 machine off with nothing panicked on the way. On x86-64 it boots an
@@ -277,7 +278,7 @@ in. It is also what notices a change to the `ffi` declarations that a module
 was not rebuilt against: a module's header carries a digest of them. Needs
 `ssh`, `ssh-keygen` and host ports 2222, 8000 and 9000 free.
 
-43 checks pass. `poweroff unloads sshd before the unmount` used to fail: from
+44 checks pass. `poweroff unloads sshd before the unmount` used to fail: from
 the VFS's move to Rust (`edae1ef`) it waited for `unmounting / (ext2)`, a line
 only the C++ VFS printed, where the Rust one prints `vfs: unmounting /`. One
 check still fails now and then under load, `connections past
@@ -513,6 +514,13 @@ for a driver that takes none so -- each used element held to the model's
 chain, length and bytes -- the page walker over random page tables, the decoder, the
 Linux loader over headers that parse, the ACPI tables for any machine, and
 the DHCP server over the frames a guest's client sends, well formed and not.
+`config` holds a VM's `vm.toml` (`modules/hv/src/config.rs`): whatever the
+text, the parser does not panic, and what it reads `render` writes back so
+that it reads the same again; a configuration made up the input's way --
+its strings full of quotes, backslashes, control characters and characters
+past ASCII -- comes back from its own rendering whole, and that rendering
+cut, spliced and scribbled on is still read without a panic. A control run
+with backslashes left unescaped was found at the 4th input.
 `place` holds where guests are put on the host's cores (`hv/src/place.rs`)
 to a model of its own (`fuzz/hv/src/placemodel.rs`), over hosts made up an
 input -- one, two or four threads a core, caches shared by one to sixteen
@@ -937,7 +945,12 @@ e2fsck faults, `check` calls unclean or corrupt. The targets:
   meanwhile; the C ABI (`kernel_vfs_*`) handed words that are open files,
   were, and never were; and the file ABI (`kernel_file_*`) a module keeps its
   configuration through, each call held to what its composition of VFS
-  calls does to the model. A mount taken exactly when its path is free and
+  calls does to the model -- a directory read an entry at a time
+  (`kernel_dir_entry`, now and then with too little room for a name) to the
+  model's entries and nothing else, an append to the end of a file made if
+  it is missing, a rename, as hv's VMs in their folders use them. A control
+  run whose append wrote at the start of the file was found at the 47th
+  input. A mount taken exactly when its path is free and
   well formed, its device nobody else's and there is room; an unmount
   refused while anything is open on it; a rename between mounts refused;
   and the disks' filesystems clean after `unmount_all`. Which file an open
@@ -1333,7 +1346,11 @@ load able to see what the first unload left. It also checks that `hv info`
 reports nested paging, which a guest cannot do without, that one named CPU
 can be turned on without the others, and that a second `insmod`, a CPU that
 does not exist, a word that is not a subcommand and a guest that does not
-exist are each refused.
+exist are each refused. Its last loads are of hv's one parameter: a load
+with none keeps the VMs' folders in `/vms`, a parameter hv has not got and
+a `vms=` that is no absolute path refuse the load, each saying why, and
+`vms=/data/vms/` is kept -- its slash let go -- as `hv` and `hv vms` must
+say. On arm64, which runs no Linux guest yet, a parameter is refused.
 
 In between it runs guests. Before `hv on`, and bound to a CPU the extension
 is off for, a guest is not run, and says which CPU. With it on everywhere,

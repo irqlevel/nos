@@ -18,6 +18,20 @@ unsafe extern "C" {
     pub fn kernel_file_create(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;
     /// Makes a directory; 0 also when there is one by that name already.
     pub fn kernel_dir_create(path: *const u8, path_len: usize) -> i32;
+    /// The index'th entry of a directory: its name's length, as much of the
+    /// name as cap holds, its kind (1 a file, 2 a directory) and a file's
+    /// size; -1 past the last entry, -2 when the path names no directory.
+    pub fn kernel_dir_entry(
+        path: *const u8, path_len: usize, index: usize, name: *mut u8, cap: usize, kind: *mut u32, size: *mut u64,
+    ) -> isize;
+    /// Appends to the file, making it if missing. Not synced.
+    pub fn kernel_file_append(path: *const u8, path_len: usize, data: *const u8, len: usize) -> i32;
+    /// Renames a file or a directory on one filesystem; refused when the new
+    /// path is taken, or anything under the old one is open.
+    pub fn kernel_file_rename(from: *const u8, from_len: usize, to: *const u8, to_len: usize) -> i32;
+    /// Removes the file -- and the next content a replace of it left, if it
+    /// left one: 0 once neither is there, -1 when nothing was.
+    pub fn kernel_file_remove(path: *const u8, path_len: usize) -> i32;
 }
 
 /* A file held open -- a guest's disk image, for as long as the guest runs:

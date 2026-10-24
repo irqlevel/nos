@@ -948,7 +948,7 @@ static void CmdInsmod(const char* args, Stdlib::Printer& con)
 {
     if (args[0] == '\0')
     {
-        con.Printf("usage: insmod <path>\n");
+        con.Printf("usage: insmod <path> [parameters]\n");
         return;
     }
 
@@ -1398,7 +1398,7 @@ static const CmdEntry Commands[] = {
     { "pci",       CmdPci,       "pci - show pci devices" },
     { "crc32",     CmdCrc32,     "crc32 <path> - CRC-32 of a file" },
     { "grubenv",   CmdGrubenv,   "grubenv <path> [name=value ...] - show or set GRUB environment variables" },
-    { "insmod",    CmdInsmod,    "insmod <path> - load a kernel module (.ko)" },
+    { "insmod",    CmdInsmod,    "insmod <path> [params] - load a kernel module (.ko), handing its init the parameters" },
     { "rmmod",     CmdRmmod,     "rmmod <name> - unload a kernel module" },
     { "lsmod",     CmdLsmod,     "lsmod - list the loaded kernel modules" },
     { "rc",        CmdRc,        "rc [add <command line>|del <n>|clear|run] - show or edit /etc/rc, run at boot" },

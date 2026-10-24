@@ -2370,10 +2370,12 @@ static void FlipAfter(u8* buf, ulong size, const char* marker, ulong offset)
 /* The loader end to end, on modtest.ko. Loaded, the module runs its own
    checks in its init and adds a shell command, which answers through the
    dispatcher; a second copy is refused; unloaded, the command goes with it.
-   All of it twice, the second time into memory the first gave back. Then
-   damaged copies, which the loader must turn away -- the last three only
-   after mapping and relocating them, so the cleanup of a load that fails
-   halfway runs too. */
+   All of it twice, the second time into memory the first gave back and
+   with a parameter, which the command's answer must show reached the init.
+   Then a parameter the module has not got, and one longer than insmod
+   takes, refused; then damaged copies, which the loader must turn away --
+   the last three only after mapping and relocating them, so the cleanup of
+   a load that fails halfway runs too. */
 Stdlib::Error TestModules()
 {
     /* kmod::ModuleInfo: the magic "NOSM", the version, then the digest of the
@@ -2381,6 +2383,13 @@ Stdlib::Error TestModules()
     static const ulong HeaderAbiOffset = 8;
     static const ulong DamageCount = 6;
     static const ulong OutputSize = 1024;
+    /* What each round hands modtest's init, and what its command answers:
+       42 + 10, what its checks computed, unless answer= says otherwise */
+    static const char* const RoundParams[] = { "", "answer=7" };
+    static const char* const RoundAnswers[] = {
+        "modtest: answer 52 args '1 2'",
+        "modtest: answer 7 args '1 2'",
+    };
 
     auto& modules = ModuleTable::GetInstance();
     char output[OutputSize];
@@ -2389,7 +2398,7 @@ Stdlib::Error TestModules()
     for (ulong round = 0; round < 2; round++)
     {
         out.Reset();
-        Stdlib::Error err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, out);
+        Stdlib::Error err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, RoundParams[round], out);
         if (!err.Ok())
         {
             Trace(0, "TestModules: load failed: %s", out.Get());
@@ -2398,7 +2407,7 @@ Stdlib::Error TestModules()
 
         out.Reset();
         Cmd::Dispatch("modtest 1 2", out);
-        if (Stdlib::StrStr(out.Get(), "modtest: answer 52 args '1 2'") == nullptr)
+        if (Stdlib::StrStr(out.Get(), RoundAnswers[round]) == nullptr)
         {
             Trace(0, "TestModules: the module's command answered: %s", out.Get());
             return MakeError(Stdlib::Error::Unsuccessful);
@@ -2409,7 +2418,7 @@ Stdlib::Error TestModules()
             return err;
 
         out.Reset();
-        err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, out);
+        err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, "", out);
         if (err.GetCode() != Stdlib::Error::AlreadyExists || !modules.IsLoaded("modtest"))
         {
             Trace(0, "TestModules: a second copy was not refused: %s", out.Get());
@@ -2431,6 +2440,28 @@ Stdlib::Error TestModules()
             Trace(0, "TestModules: the command outlived its module: %s", out.Get());
             return MakeError(Stdlib::Error::Unsuccessful);
         }
+    }
+
+    /* A parameter it has not got: its init says so, and refuses the load */
+    out.Reset();
+    Stdlib::Error err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, "answr=7", out);
+    if (err.GetCode() != Stdlib::Error::Unsuccessful || modules.IsLoaded("modtest") ||
+        Stdlib::StrStr(out.Get(), "\"answr\" is not a parameter") == nullptr)
+    {
+        Trace(0, "TestModules: an unknown parameter: error %lu: %s", (ulong)err.GetCode(), out.Get());
+        return MakeError(Stdlib::Error::Unsuccessful);
+    }
+
+    /* Longer than insmod hands on: refused before the module is looked at */
+    char longParams[ModuleTable::ParamsMax + 2];
+    Stdlib::MemSet(longParams, 'a', sizeof(longParams) - 1);
+    longParams[sizeof(longParams) - 1] = '\0';
+    out.Reset();
+    err = modules.Load(nos_modtest_ko, nos_modtest_ko_size, longParams, out);
+    if (err.GetCode() != Stdlib::Error::InvalidValue || modules.IsLoaded("modtest"))
+    {
+        Trace(0, "TestModules: parameters too long: error %lu: %s", (ulong)err.GetCode(), out.Get());
+        return MakeError(Stdlib::Error::Unsuccessful);
     }
 
     u8* copy = static_cast<u8*>(Mm::Alloc(nos_modtest_ko_size, Tag));
@@ -2480,7 +2511,7 @@ Stdlib::Error TestModules()
         }
 
         out.Reset();
-        Stdlib::Error err = modules.Load(copy, size, out);
+        err = modules.Load(copy, size, "", out);
         if (err.GetCode() != expected || modules.IsLoaded("modtest"))
         {
             Trace(0, "TestModules: %s: error %lu, expected %lu: %s", what,

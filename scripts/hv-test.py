@@ -46,12 +46,17 @@ KVM it is whatever the host CPU has):
   - a second `insmod`, a CPU that does not exist, a word that is not a
     subcommand and a guest that does not exist are each refused
   - `rmmod` with the extension on for every CPU turns it off for every CPU
-  - loading it again finds nothing left on -- the check the rest is for
+  - loading it again finds nothing left on -- the check the rest is for --
+    and keeps the VMs' folders in /vms, given no `vms=`
+  - `insmod` given a parameter hv has not got, or a `vms=` that is no
+    absolute path, refuses the load and says why; given `vms=<folder>`,
+    `hv` and `hv vms` say that folder
   - nothing warned, and nothing panicked
 
 and on arm64, where a hypervisor needs EL2 and this kernel dropped to EL1 in
 its first hundred instructions:
 
+  - given a parameter, the module refuses the load -- it takes none here
   - the module loads, says so, and refuses to run anything
   - `hv info` reports the exception level and what stage-2 would offer
   - `hv on` and `hv run` are refused rather than attempted
@@ -110,8 +115,14 @@ SCRIPT = [
     "insmod /hv.ko",        # 20
     "hv",                   # 21
     "rmmod hv",             # 22
-    "lsmod",                # 23
-    "dmesg 400 hv:",        # 24
+    "insmod /hv.ko vmz=/x", # 23
+    "insmod /hv.ko vms=data",  # 24
+    "insmod /hv.ko vms=/data/vms/",  # 25
+    "hv",                   # 26
+    "hv vms",               # 27
+    "rmmod hv",             # 28
+    "lsmod",                # 29
+    "dmesg 400 hv:",        # 30
 ]
 
 # What `hv run all` has to have said about each guest, beyond its verdict.
@@ -453,12 +464,25 @@ def x86_checks(ran):
     pt.check("loading it again finds it off for every CPU", "hv loaded at" in out[20], out[20])
     pt.check("and nothing was left on by the unload before it",
              "on for cpu none of %s" % ALL_CPUS in out[21], out[21])
+    pt.check("with no vms= the vms are kept in /vms",
+             re.search(r"^hv: vms kept in /vms$", out[21], re.M) is not None, out[21])
     pt.check("it unloads again", "hv unloaded" in out[22], out[22])
-    pt.check("and leaves no module behind", "no modules loaded" in out[23], out[23])
+
+    # Its one parameter, vms=: a word it has not got and a path that is no
+    # folder's refuse the load, each said; a folder is kept, its slash let go.
+    pt.check("a parameter hv has not got refuses the load",
+             '"vmz" is not a parameter of hv\'s' in out[23] and "loaded at" not in out[23], out[23])
+    pt.check("and so does vms= with no absolute path",
+             "vms=data is not an absolute path" in out[24] and "loaded at" not in out[24], out[24])
+    pt.check("vms=<folder> loads", "hv loaded at" in out[25], out[25])
+    pt.check("and hv says where the vms are kept", "vms kept in /data/vms, as insmod was told" in out[26], out[26])
+    pt.check("and hv vms looks there", "no /data/vms" in out[27], out[27])
+    pt.check("it unloads", "hv unloaded" in out[28], out[28])
+    pt.check("and leaves no module behind", "no modules loaded" in out[29], out[29])
 
     # What the module traced: not on the serial console, because the shell
     # suppresses trace output there once it starts, so the script asks dmesg.
-    logged = out[24]
+    logged = out[30]
     pt.check("the kernel log says the extension went off for every CPU on the unload",
              "extension off for cpu mask %s" % ALL_MASK in logged, logged)
     pt.check("and nothing warned", "WARNING" not in logged, logged)
@@ -489,6 +513,9 @@ def arm64(args):
         if not pt.check("boots", pt.wait_log(log, "boot: complete", 120 if hvf else 300)):
             return
         sh = pt.Shell()
+        refused = sh.run("insmod /hv.ko vms=/data/vms")
+        pt.check("given a parameter, the module refuses the load -- it takes none here",
+                 "takes none" in refused and "loaded at" not in refused, refused)
         pt.check("the module loads", "hv loaded at" in sh.run("insmod /hv.ko"))
 
         info = sh.run("hv info")

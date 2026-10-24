@@ -403,7 +403,7 @@ Ko Build(Fuzz::Input& in)
     ko.InfoVaddr = data.Vaddr + infoOff;
     std::vector<uint8_t> info(infoSize, 0);
     PutLe(info, 0, 0x4D534F4E, 4);
-    PutLe(info, 4, 1, 4);
+    PutLe(info, 4, 2, 4);
     memcpy(info.data() + 8, "fuzz", 4);
     memcpy(info.data() + 72, ko.Name.data(), ko.Name.size());
     memcpy(data.Bytes.data() + infoOff, info.data(), infoSize);

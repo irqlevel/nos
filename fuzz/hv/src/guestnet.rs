@@ -478,10 +478,18 @@ pub fn switch_target(r: &mut Input) {
                     break;
                 }
                 let vm = Arc::new(Shared::default());
-                let want = (0..MAX_PORTS).find(|&p| !m.owned[p]);
-                match (sw.claim(&vm), want) {
+                /* The first free port -- or, now and then, the port a VM
+                 * asks for (`port=`): that one when it is free, and no other,
+                 * one past the last among those asked for. */
+                let (got, want) = if r.u8() < 64 {
+                    let q = r.below(MAX_PORTS as u64 + 1) as usize;
+                    (sw.claim_at(q, &vm), (q < MAX_PORTS && !m.owned[q]).then_some(q))
+                } else {
+                    (sw.claim(&vm), (0..MAX_PORTS).find(|&p| !m.owned[p]))
+                };
+                match (got, want) {
                     (Ok(p), Some(q)) => {
-                        invariant!(p == q, "a VM given port {}, port {} being the first free", p, q);
+                        invariant!(p == q, "a VM given port {}, port {} being the one it should have", p, q);
                         m.owned[p] = true;
                         m.inbox[p].clear();
                         m.woken[p] = 0;

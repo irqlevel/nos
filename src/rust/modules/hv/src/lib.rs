@@ -15,7 +15,7 @@
 //! NICs will be served by this module over the kernel's own, never by
 //! registering new ones.
 //!
-//!     insmod /hv.ko
+//!     insmod /hv.ko    -- vms=<folder>: where the VMs' folders are, /vms if not
 //!     hv info          -- what this machine has
 //!     hv on            -- turn the extension on
 //!     hv run all       -- run the built-in guests, each in a VM of its own
@@ -34,6 +34,8 @@ extern crate alloc;
 #[cfg(target_arch = "x86_64")]
 mod boot;
 #[cfg(target_arch = "x86_64")]
+mod config;
+#[cfg(target_arch = "x86_64")]
 mod cores;
 #[cfg(target_arch = "x86_64")]
 mod dhcp;
@@ -45,6 +47,10 @@ mod guest;
 mod forward;
 #[cfg(target_arch = "x86_64")]
 mod net;
+#[cfg(target_arch = "x86_64")]
+mod store;
+#[cfg(target_arch = "x86_64")]
+mod vmlog;
 #[cfg(target_arch = "x86_64")]
 mod vms;
 
@@ -61,7 +67,7 @@ use kcore::cmd::{Command, Output};
 use kcore::consts::MAX_CPUS;
 use kcore::sync::Mutex;
 
-const HELP: &str = "hv [info|on|off|run|bench|boot|start|list|console|attach|send|exec|wait|restart|stop|forward|cores|help] - the CPU's virtualization extension, and guests under it";
+const HELP: &str = "hv [info|on|off|run|bench|boot|start|create|vms|list|console|attach|send|exec|wait|restart|stop|forward|cores|help] - the CPU's virtualization extension, and guests under it";
 
 /// What `hv help` prints: every subcommand, a line each.
 const USAGE: &str = "\
@@ -78,24 +84,33 @@ hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|no
                                    a Linux guest for secs, then its console and how it ended;
                                    cpus gives it N CPUs, each on a host CPU of its own, the
                                    first on cpu
-hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [cmdline=...]
+hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
-                                   again when it resets itself
+                                   again when it resets itself; port= its own port of the
+                                   switch, forward= nos's ports relayed to its own
+hv start <name|folder>             the vm in the vms' folder of that name, or in that
+                                   folder, as its vm.toml says: its console to console.log
+                                   there. The vms' folder is /vms, or what insmod hv.ko
+                                   was given as vms=<folder>; hv says which
+hv create <name> <bzImage> [the words hv start takes]
+                                   <name>/vm.toml in the vms' folder, written from them --
+                                   the paths the folder's unless they begin with /
+hv vms                             the vms in the vms' folder, and which of them run
 hv cores [own|shared]              whether a guest's cores are its own -- whole cores no
                                    other guest has a CPU on, its CPUs filling their
                                    threads, and refused where there are none -- or may be
                                    shared; and which guests hold which CPUs
 hv list                            the started guests
-hv console <id> [bytes=N]          the end of one's console
-hv attach <id>                     its console, live, typed at -- ^] detaches (ssh -t)
-hv send <id> <text>                type at it (\\n for a newline)
-hv exec <id> [secs=N] <line>       type a line and print the answer, up to the next prompt
-hv wait <id> [secs=N] [boot=N] <text>
+hv console <vm> [bytes=N]          the end of one's console -- a vm is its number or name
+hv attach <vm>                     its console, live, typed at -- ^] detaches (ssh -t)
+hv send <vm> <text>                type at it (\\n for a newline)
+hv exec <vm> [secs=N] <line>       type a line and print the answer, up to the next prompt
+hv wait <vm> [secs=N] [boot=N] <text>
                                    until its console shows text in this boot -- or,
                                    with boot=N, once it has restarted N times --
                                    or it stops
-hv restart <id>                    boot it again from its files, running or stopped
-hv stop <id|all> [secs=N]          press its power button and give it secs (30) to turn
+hv restart <vm>                    boot it again from its files, running or stopped
+hv stop <vm|all> [secs=N]          press its power button and give it secs (30) to turn
                                    itself off, then stop it; say how it ended, take it off
                                    the list -- secs=0 stops it without asking
 hv forward [add <port> <vm> <guest-port> | del <port>]
@@ -113,6 +128,9 @@ struct State {
     cores: cores::Cores,
     #[cfg(target_arch = "x86_64")]
     forwards: forward::Forwards,
+    /// Where the VMs' folders are: `vms=` of `insmod`'s, or `/vms`.
+    #[cfg(target_arch = "x86_64")]
+    vms_root: String,
     /// Set as the module starts to go: an `hv boot` running then stops at
     /// once instead of at the end of its time.
     #[cfg(target_arch = "x86_64")]
@@ -172,7 +190,54 @@ impl Drop for Hv {
     }
 }
 
-fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
+/// `insmod /hv.ko [vms=<folder>]`: where the VMs' folders are -- `/vms`
+/// unless given. Anything else is refused, said on insmod's output.
+#[cfg(target_arch = "x86_64")]
+fn vms_root(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<String> {
+    let mut root = None;
+    for (key, value) in params.words() {
+        match (key, value) {
+            ("vms", Some(path)) if root.is_none() => match store::root(path) {
+                Ok(r) => root = Some(r),
+                Err(e) => {
+                    let _ = writeln!(out, "hv: vms={} {}", path, e);
+                    return Err(kcore::error::Error::InvalidValue);
+                }
+            },
+            ("vms", _) => {
+                let _ = writeln!(out, "hv: vms= takes a folder, and is given once");
+                return Err(kcore::error::Error::InvalidValue);
+            }
+            _ => {
+                let _ = writeln!(out, "hv: \"{}\" is not a parameter of hv's -- vms=<folder> is", key);
+                return Err(kcore::error::Error::InvalidValue);
+            }
+        }
+    }
+    match root {
+        Some(root) => Ok(root),
+        None => Ok(String::from(store::DEFAULT_ROOT)),
+    }
+}
+
+/// No Linux guest runs here yet, so there is nothing for a parameter to say:
+/// one given is refused rather than kept and never used.
+#[cfg(not(target_arch = "x86_64"))]
+fn vms_root(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<()> {
+    if let Some((key, _)) = params.words().next() {
+        let _ = writeln!(out, "hv: \"{}\" is not a parameter of hv's on this architecture -- it runs no Linux guest \
+                               yet, and takes none", key);
+        return Err(kcore::error::Error::InvalidValue);
+    }
+    Ok(())
+}
+
+fn init(params: &kmod::Params, out: &mut Output) -> kcore::error::Result<Box<dyn kmod::Module>> {
+    #[cfg(target_arch = "x86_64")]
+    let vms_root = vms_root(params, out)?;
+    #[cfg(not(target_arch = "x86_64"))]
+    vms_root(params, out)?;
+
     /* A machine with no virtualization still gets a `Machine` and still
      * loads: `hv info` is a diagnostic, and the machine that most needs one
      * is the machine where a guest will not start. */
@@ -185,6 +250,8 @@ fn init() -> kcore::error::Result<Box<dyn kmod::Module>> {
         cores: cores::Cores::new().ok_or(kcore::error::Error::NoMemory)?,
         #[cfg(target_arch = "x86_64")]
         forwards: forward::Forwards::new().ok_or(kcore::error::Error::NoMemory)?,
+        #[cfg(target_arch = "x86_64")]
+        vms_root,
         #[cfg(target_arch = "x86_64")]
         unloading: Arc::new(core::sync::atomic::AtomicBool::new(false)),
     });
@@ -248,10 +315,16 @@ fn command(state: &State, args: &str, out: &mut Output) {
     let (first, rest) = (&args[..end], args[end..].trim_start());
     let mut words = rest.split_ascii_whitespace();
     match first {
-        "" => status(machine, out),
+        "" => {
+            status(machine, out);
+            #[cfg(target_arch = "x86_64")]
+            vms_status(state, out);
+        }
         "info" => {
             let _ = machine.caps().report(out);
             status(machine, out);
+            #[cfg(target_arch = "x86_64")]
+            vms_status(state, out);
         }
         "help" => {
             let _ = write!(out, "{}", USAGE);
@@ -264,7 +337,11 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "boot" => boot::boot(machine, rest, &state.cores, &state.unloading, state.vms.claims(), out),
         #[cfg(target_arch = "x86_64")]
-        "start" => state.vms.start(machine, &state.cores, rest, out),
+        "start" => state.vms.start(machine, &state.cores, &state.forwards, &state.vms_root, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "create" => store::create(&state.vms_root, rest, out),
+        #[cfg(target_arch = "x86_64")]
+        "vms" => store::list(&state.vms_root, &state.vms, out),
         #[cfg(target_arch = "x86_64")]
         "cores" => cores_command(&state.cores, words.next(), out),
         #[cfg(target_arch = "x86_64")]
@@ -286,8 +363,8 @@ fn command(state: &State, args: &str, out: &mut Output) {
         #[cfg(target_arch = "x86_64")]
         "forward" => forward_command(state, rest, out),
         #[cfg(not(target_arch = "x86_64"))]
-        "boot" | "start" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart" | "stop" | "forward"
-        | "bench" | "cores" => {
+        "boot" | "start" | "create" | "vms" | "list" | "console" | "attach" | "send" | "exec" | "wait" | "restart"
+        | "stop" | "forward" | "bench" | "cores" => {
             let _ = writeln!(out, "hv: no Linux guest on this architecture yet");
         }
         other => {
@@ -297,6 +374,13 @@ fn command(state: &State, args: &str, out: &mut Output) {
     }
 }
 
+/// Where the VMs' folders are, under what `hv` says of the CPUs.
+#[cfg(target_arch = "x86_64")]
+fn vms_status(state: &State, out: &mut Output) {
+    let _ = writeln!(out, "hv: vms kept in {}{}", state.vms_root,
+                     if state.vms_root == store::DEFAULT_ROOT { "" } else { ", as insmod was told" });
+}
+
 /// `hv forward [add <port> <vm> <guest-port> | del <port>]`.
 #[cfg(target_arch = "x86_64")]
 fn forward_command(state: &State, args: &str, out: &mut Output) {
@@ -304,9 +388,16 @@ fn forward_command(state: &State, args: &str, out: &mut Output) {
     match (w.next(), w.next(), w.next(), w.next()) {
         (None, ..) => state.forwards.list(out),
         (Some("add"), Some(port), Some(vm), Some(guest_port)) => {
-            let (Ok(port), Ok(vm), Ok(guest_port)) = (port.parse::<u16>(), vm.parse::<u32>(), guest_port.parse::<u16>()) else {
+            let (Ok(port), Ok(guest_port)) = (port.parse::<u16>(), guest_port.parse::<u16>()) else {
                 let _ = writeln!(out, "{}", forward::usage());
                 return;
+            };
+            let vm = match state.vms.id_of(vm) {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = writeln!(out, "{}", e);
+                    return;
+                }
             };
             if port == 0 || guest_port == 0 {
                 let _ = writeln!(out, "hv: ports are 1..65535");
@@ -791,4 +882,4 @@ fn write_mask(out: &mut Output, mask: u64) {
     }
 }
 
-kmod::module!(name: "hv", init: init);
+kmod::module!(name: "hv", init_with_params: init);

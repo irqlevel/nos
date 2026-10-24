@@ -251,6 +251,32 @@ def vm_commands(args):
     flood_stop = "hv stop %d secs=0" % fv
     flood_lines = [flood_start, flood_ready, FLOOD_BEFORE, flood_send, flood_wait, FLOOD_AFTER,
                    flood_console, flood_stop]
+    # A VM kept in a folder (`modules/hv/src/store.rs`): /vms/t0/vm.toml
+    # written by hv create -- and not written over -- started by its name,
+    # which every command then takes, refused a second time while it is on
+    # the list, its console in console.log there with hv's lines around it,
+    # and started again from it; a vm.toml with a key it does not know
+    # refused, saying the line.
+    folder_vm = fv + 1
+    create = "hv create t0 /bzImage mem=64%s initrd=/initrd cmdline=%s" % (c, args.cmdline)
+    create_again = "hv create t0 /bzImage mem=64%s cmdline=%s" % (c, args.cmdline)
+    exec_named = "hv exec t0 secs=%d echo nos-named-$((6*7))" % args.vm_secs
+    named_log = "cat /vms/t0/console.log"
+    folder_lines = [create, create_again, "hv vms", "hv start t0", "hv start t0", exec_named, "hv list", "hv vms",
+                    "hv stop t0", named_log, "mkdir /vms/bad", "write /vms/bad/vm.toml memroy = 4096",
+                    "hv start bad", "hv start t0", "hv stop t0 secs=0"]
+    # The VMs' folder somewhere else, as the last load is told (`insmod
+    # /hv.ko vms=`): hv create makes it, and the folder above it; hv start
+    # looks for a name there and not in /vms; and the vm's console.log is
+    # in its folder there. Started after the two guests of that load, so the
+    # third it starts.
+    elsewhere = "/data/vms"
+    elsewhere_vm = 2
+    create_elsewhere = "hv create t1 /bzImage mem=64%s initrd=/initrd cmdline=%s" % (c, args.cmdline)
+    exec_elsewhere = "hv exec t1 secs=%d echo nos-elsewhere-$((6*7))" % args.vm_secs
+    elsewhere_log = "cat %s/t1/console.log" % elsewhere
+    elsewhere_lines = [create_elsewhere, "hv start t0", "hv start t1", exec_elsewhere, "hv vms",
+                       "hv stop t1 secs=0", elsewhere_log]
     # Where a guest's CPUs run, as hv start says: its one host CPU, or a list
     # of as many as it has.
     on = r"cpu \d+"
@@ -356,13 +382,14 @@ def vm_commands(args):
              "hv restart 2", wait_stop2, "hv list", "hv stop 2",
              start3, wait_loop, "hv list", "hv stop 3"] + acpi_lines + [
              "hv restart 0", exec_again, "hv list",
-             start_lost, restart_lost, exec_after_lost, stop_lost] + claim_lines + flood_lines + [
-             "hv off", "rmmod hv", "insmod /hv.ko", "hv",
+             start_lost, restart_lost, exec_after_lost, stop_lost] + claim_lines + flood_lines + folder_lines + [
+             "hv off", "rmmod hv", "insmod /hv.ko vms=%s" % elsewhere, "hv",
              "hv on", start_a, start_b, "hv exec 0 secs=%d id" % args.vm_secs, "hv exec 1 secs=%d id" % args.vm_secs,
-             stop_all, "rmmod hv", RC_LOG]
+             stop_all] + elsewhere_lines + ["rmmod hv", RC_LOG]
 
     checks = [
-        ("hv help", 0, "hv help lists the vm commands", r"hv exec <id>", True),
+        ("hv help", 0, "hv help lists the vm commands", r"hv exec <vm>", True),
+        ("hv help", 0, "and the vms kept in folders", r"hv start <name\|folder>", True),
         (start0, 0, "vm 0 starts", r"hv: vm 0 started on %s " % on, True),
         (start1, 0, "vm 1 starts beside it", r"hv: vm 1 started on %s " % on, True),
         ("hv list", 0, "hv list shows vm 0 running", r"vm 0  running", True),
@@ -436,9 +463,42 @@ def vm_commands(args):
         (flood_wait, 0, "and prints %d lines as fast as it can" % FLOOD_LINES, r"flood-42", True),
         (flood_console, 0, "its own console keeps all of them", r"(?m)^%d\s*$" % FLOOD_LINES, True),
         (flood_stop, 0, "and it stops", r"hv: vm %d stopped" % fv, True),
+        (create, 0, "hv create writes a vm's folder", r"hv: /vms/t0/vm.toml written -- hv start t0 boots it", True),
+        (create_again, 0, "and never over a vm.toml that is there",
+         r"hv: /vms/t0/vm.toml is there already -- not written over", True),
+        ("hv vms", 0, "hv vms lists it, not running", r"(?m)^t0  not running  bzImage  64 MiB", True),
+        ("hv start t0", 0, "hv start boots it by its name", r"hv: vm %d \(t0\) started on %s " % (folder_vm, on), True),
+        ("hv start t0", 1, "a second start of the name is refused while it is on the list",
+         r"hv: vm %d is t0 already" % folder_vm, True),
+        (exec_named, 0, "the commands take its name", r"(?m)^nos-named-42$", True),
+        ("hv list", 6, "hv list names it", r"vm %d t0  running" % folder_vm, True),
+        ("hv vms", 1, "hv vms says it runs", r"(?m)^t0  running as vm %d" % folder_vm, True),
+        ("hv stop t0", 0, "hv stop takes its name", r"hv: vm %d stopped" % folder_vm, True),
+        (named_log, 0, "its console.log has its boot, hv's lines around it",
+         r"--- hv: \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC vm %d started on [\s\S]*Linux version[\s\S]*"
+         r"--- hv: .* vm %d stopped -- [\s\S]*--- hv: .* vm %d off the list ---" % (folder_vm, folder_vm, folder_vm),
+         True),
+        ("hv start bad", 0, "a vm.toml with a key it does not know is refused, saying the line",
+         r'hv: /vms/bad/vm.toml: line 1: "memroy" is not a key a vm.toml has', True),
+        ("hv start t0", 2, "and the vm starts again from its folder", r"hv: vm %d \(t0\) started" % (folder_vm + 1),
+         True),
+        ("hv stop t0 secs=0", 0, "and stops", r"hv: vm %d stopped" % (folder_vm + 1), True),
         ("hv off", 0, "hv off will not pull the extension from under vm 0",
          r"hv: vm 0 is running on cpu \d+ -- hv stop it first", True),
         ("hv", 0, "the next load finds it off everywhere", r"on for cpu none of", True),
+        ("hv", 0, "and keeps the vms where insmod's vms= says", r"hv: vms kept in %s, as insmod was told" % elsewhere,
+         True),
+        (create_elsewhere, 0, "hv create makes the vm's folder there, and the folder above it",
+         r"hv: %s/t1/vm.toml written -- hv start t1 boots it" % elsewhere, True),
+        ("hv start t0", 3, "hv start looks for a name there, not in /vms",
+         r"hv: no vm t0: there is no %s/t0/vm.toml" % elsewhere, True),
+        ("hv start t1", 0, "and boots the vm it finds there", r"hv: vm %d \(t1\) started on %s " % (elsewhere_vm, on),
+         True),
+        (exec_elsewhere, 0, "which runs", r"(?m)^nos-elsewhere-42$", True),
+        ("hv vms", 2, "hv vms lists that folder's vms", r"(?m)^t1  running as vm %d" % elsewhere_vm, True),
+        ("hv stop t1 secs=0", 0, "and it stops", r"hv: vm %d stopped" % elsewhere_vm, True),
+        (elsewhere_log, 0, "its console.log is in its folder there",
+         r"vm %d started on [\s\S]*Linux version" % elsewhere_vm, True),
         (RC_LOG, 0, "vm 1's vCPU said how it ended", r"hv: vm 1 stopped after \d+ ms -- on request", True),
         (RC_LOG, 0, "rmmod stopped vm 0 itself, and only then turned the extension off",
          r"hv: vm 0 stopped for the unload -- on request[\s\S]*hv: unloaded, extension off for cpu mask", True),
@@ -983,6 +1043,20 @@ def network(args):
     kept = [x(0, "wget -q -T 5 -O - http://10.0.2.2:%d/nat.txt; echo nat-kept-done" % web),
             x(0, "wget -q -T 5 -O - http://169.254.169.254/; echo nat-metadata-done"),
             "nat allow 10.0.2.2/32"]
+    # A VM kept in its folder, on the switch at a port of its own -- its
+    # address and MAC the port's, 10.0.100.7 whichever ports are free -- and
+    # nos's 8086 relayed to its httpd as its vm.toml says, with no hv
+    # forward of the test's. After vm 0 has stopped, which leaves a core for
+    # it.
+    xn = lambda vm, line, secs=60: "hv exec %s secs=%d %s" % (vm, secs, line)
+    folder = ["hv create w0 /bzImage mem=%d%s initrd=/initrd net port=5 forward=8086:80 cmdline=%s"
+              % (args.mem, cpus_opt(args), args.cmdline),
+              "hv start w0",
+              xn("w0", "ifconfig eth0", args.vm_secs),
+              xn("w0", "mkdir -p /www"),
+              xn("w0", "echo nos-folder-hello > /www/index.html"),
+              xn("w0", "httpd -p 80 -h /www"),
+              "hv forward"]
     rc = ["insmod /hv.ko", "hv on", start, start,
           x(0, "id", args.vm_secs), x(1, "id", args.vm_secs),
           "hv list",
@@ -995,11 +1069,13 @@ def network(args):
           x(1, "echo nos-http-hello > /www/index.html"),
           x(1, "httpd -p 80 -h /www"),
           "hv forward add 8080 1 80",
-          "hv forward", "insmod /sshd.ko", "sshd start"] + kept + way_out + [RC_LAST]
+          "hv forward", "insmod /sshd.ko", "sshd start"] + kept + way_out + folder + [RC_LAST]
     port = free_port()
     ssh_port = free_port()
+    folder_port = free_port()
     qemu = ["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,disable-modern=off",
-            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080,hostfwd=tcp:127.0.0.1:%d-:22" % (port, ssh_port)]
+            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:%d-:8080,hostfwd=tcp:127.0.0.1:%d-:22,"
+                       "hostfwd=tcp:127.0.0.1:%d-:8086" % (port, ssh_port, folder_port)]
     sshd = hvt.pt.module_path("x86_64", "sshd")
     p, log, image = boot_rc(args, tmp, rc, extra={"sshd.ko": sshd}, qemu=qemu)
     try:
@@ -1045,7 +1121,7 @@ def network(args):
 
         # The way-out lines, each by its own occurrence: "hv list" is run
         # before them, and among them twice.
-        first = len(rc) - 1 - len(way_out)
+        first = len(rc) - 1 - len(folder) - len(way_out)
         way = lambda i: output_of(secs, way_out[i], rc[:first + i].count(way_out[i])) or ""
         pt.check("ip= gave the guest nos's DNS server, 10.0.2.3", "nameserver 10.0.2.3" in way(0), way(0))
         pt.check("a guest fetches a page from the test machine through NAT", token in way(1), way(1)[-600:])
@@ -1121,6 +1197,29 @@ def network(args):
             pt.check("a guest's connection to nos's sshd %s is refused" % where,
                      "nc-" in way(i) and "SSH-2.0" not in way(i)
                      and re.search(r"(?i)connection refused", way(i)) is not None, way(i)[-400:])
+        # The VM from its folder: its port's address and MAC, and the
+        # forward its vm.toml asks for, fetched through from outside.
+        ffirst = len(rc) - 1 - len(folder)
+        fo = lambda i: output_of(secs, folder[i], rc[:ffirst + i].count(folder[i])) or ""
+        pt.check("hv create writes a vm on the switch at a port of its own", "hv: /vms/w0/vm.toml written" in fo(0),
+                 fo(0))
+        pt.check("hv start boots it by its name, and adds the forward its vm.toml asks for",
+                 re.search(r"hv: vm \d+ \(w0\) started", fo(1)) is not None
+                 and re.search(r"hv: port 8086 forwarded to vm \d+, 10\.0\.100\.7:80", fo(1)) is not None, fo(1))
+        pt.check("its eth0 has its port's address and MAC, the port its vm.toml says",
+                 "10.0.100.7" in fo(2) and re.search(r"(?i)02:00:00:00:64:07", fo(2)) is not None, fo(2)[-600:])
+        pt.check("hv forward lists the forward its vm.toml asked for", re.search(r"port 8086 -> vm \d+", fo(6))
+                 is not None, fo(6))
+        body = b""
+        for attempt in range(10):
+            try:
+                body = urllib.request.urlopen("http://127.0.0.1:%d/index.html" % folder_port, timeout=60).read()
+                break
+            except Exception as e:
+                body = repr(e).encode()
+                time.sleep(3)
+        pt.check("a page from its httpd, fetched from outside through that forward", b"nos-folder-hello" in body,
+                 body[-300:])
     finally:
         server.shutdown()
         pt.kill(p)

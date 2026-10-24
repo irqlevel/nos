@@ -1989,6 +1989,159 @@ is up and another at its prompt, `send`, `wait`, `console`, the refused
 `hv off`, and an `rmmod` that stops the guest itself and leaves nothing on for
 the next load.
 
+## A VM in a folder
+
+A guest started by its kernel's path is gone with its words: the next `hv
+start` says them all again. A VM kept in a folder is not. Its folder under
+`/vms` -- or wherever `insmod` was told to keep them ([below](#where-the-folders-are))
+-- holds what to boot it with -- `vm.toml` -- and beside it whatever the
+file names: its kernel, its initrd, its disks; and its console's log. `hv
+start <name>` boots it as the file says (`modules/hv/src/store.rs`), and
+every command that reaches a VM takes the name as well as the number:
+
+```
+$ hv create web /boot/bzImage initrd=/boot/initrd disk=root.img mem=1024 cpus=2 net port=3 forward=2222:22 restart cmdline=console=ttyS0 root=/dev/vda rw
+hv: /vms/web/vm.toml written -- hv start web boots it
+hv: /vms/web/root.img is not there yet
+$ truncate /vms/web/root.img 20G
+$ hv vms
+web  not running  bzImage  1024 MiB  2 cpus  disks root.img  net port 3 (10.0.100.5)  forward 2222:22  restart
+$ hv start web
+hv: vm 0 (web) started on cpus 2,3 -- /boot/bzImage, 1024 MiB, 2 cpus, cmdline "..."
+hv: port 2222 forwarded to vm 0, 10.0.100.5:22
+$ hv exec web uname -r
+$ hv list
+vm 0 web  running  cpus 2,3  ...
+$ hv stop web
+```
+
+`hv create <name> <words>` writes the file from the words `hv start` takes
+-- their paths the folder's unless they begin with `/` -- checked as a start
+would check them, and never over a `vm.toml` that is there; it says which of
+the files it names are not there yet. `hv start /some/where/web` boots a
+folder anywhere by its path, the folder's name the VM's. `hv vms` lists the
+folders under `/vms`, what each boots, and which run.
+
+### Where the folders are
+
+`/vms`, unless `insmod` says otherwise: `insmod /hv.ko vms=/data/vms` keeps
+them under `/data/vms` -- an absolute path with no `.`, `..` or empty step
+in it, its trailing `/` let go, and not `/` itself, whose every folder would
+be taken for a VM's -- and `hv` says where they are kept. `hv create` makes
+the folder, and those above it that are missing; `hv start <name>` and `hv
+vms` look there, and only there. A parameter hv has not got refuses the
+load, said on `insmod`'s output -- as a misspelt key does in a `vm.toml`,
+and for the same reason:
+
+```
+$ insmod /hv.ko vmz=/data/vms
+hv: "vmz" is not a parameter of hv's -- vms=<folder> is
+module: hv: init failed
+insmod: /hv.ko failed, error 502
+$ insmod /hv.ko vms=/data/vms
+module: hv loaded at 0xFFFF8000...
+$ hv
+hv: AMD-V on for cpu none of 0-3
+hv: vms kept in /data/vms, as insmod was told
+```
+
+`rc add insmod /hv.ko vms=/data/vms` loads it so at every boot. `vms=` is
+at most 208 bytes: the VFS takes paths of 255, and under the folder go a
+VM's name of up to 32 and the longest file hv writes there,
+`console.log.1`. On arm64, which runs no Linux guest yet, hv takes no
+parameter, and refuses one. How a module is handed its parameters is in
+[Loadable modules](modules.md#parameters).
+
+**The file** is a strict subset of TOML (`modules/hv/src/config.rs`): a
+`key = value` a line, `#` to the end of a line a comment, and for a value a
+string -- `"basic"`, with TOML's escapes, or `'literal'` -- a whole number,
+`true` or `false`, or a list of strings in brackets, over as many lines as it
+takes. No tables, no dotted or quoted keys: what it cannot read it refuses,
+saying the line, and so a key it does not know and one given twice --
+`memroy = 4096` would otherwise boot a guest of the default size without a
+word.
+
+```toml
+# A VM of nos's hypervisor: hv start <this folder's name> boots it (docs/hypervisor.md)
+kernel = "/boot/bzImage"
+initrd = "/boot/initrd"
+cmdline = "console=ttyS0 root=/dev/vda rw"
+memory = 1024
+cpus = 2
+disks = ["root.img"]
+net = true
+port = 3
+forward = ["2222:22"]
+restart = true
+console_log = true
+```
+
+| key | | unless said |
+|---|---|---|
+| `kernel` | its bzImage | -- (the one key a file must have) |
+| `initrd` | its initramfs | none |
+| `cmdline` | its kernel's command line | `console=ttyS0 nolapic`; with several CPUs `console=ttyS0` |
+| `memory` | MiB | 256 |
+| `cpus`, `cpu` | how many CPUs, and the host CPU its first runs on | 1, and where it is placed |
+| `disks` | its disks, `vda` first, `:ro` after one it only reads | none |
+| `net` | a NIC on the guests' switch | `false` |
+| `port` | its port of the switch, 0..15: its address `10.0.100.(port+2)` and its MAC the same at every start | the first free one |
+| `forward` | `"<nos's port>:<the guest's>"`s, relayed once it runs and taken away with it | none |
+| `restart` | booted again when it resets itself | `false` |
+| `console_log` | its console to `console.log` in the folder | `true` |
+| `log` | its console to the kernel log too | `false` |
+| `input` | typed at its first prompt | none |
+| `ioapic`, `xapic`, `apicv`, `rxmod`, `offload` | `hv start`'s words of those names (`offload = false` is `nooffload`) | as `hv start` |
+
+**The name** is the folder's: a letter or a digit, then letters, digits,
+`.`, `_` and `-`, at most 32 -- a word of a command and a component of a
+path, with nothing in it either reads otherwise. One VM of a name is on the
+list at a time: a second `hv start web` is refused while vm 0 is web, even
+stopped -- `hv restart web` boots it again, `hv stop web` takes it off. Its
+disks are claimed as any guest's are (`disk::Claims`), so no other guest
+writes them meanwhile. A number is a VM's number before it is a name: a VM
+named by digits alone is found by its name only where no VM has that number.
+
+**`console.log`** (`modules/hv/src/vmlog.rs`) is the guest's console as it
+wrote it, control sequences and all, appended a second at a time by a task
+of the VM's own (`hv/vm<N>/log`) from the console's ring -- never by the
+guest's CPUs, whose exits would otherwise wait on the disk. Between the
+guest's lines, where they happened, hv's own: `--- hv: <date> UTC vm <N>
+started on cpus 2,3 -- ... ---`, `booting again -- <why>`, `stopped --
+<why>`, and `off the list` when `hv stop` -- or the unload -- takes it away.
+What the ring no longer has when the task gets to it, a guest printing more
+than 64 KiB in a second, is lost to the log, and the log says how much. Past
+8 MiB the file moves to `console.log.1`, the one before it gone.
+
+What it reaches the folder with is three calls of the file ABI made for it:
+`kcore::fs::list`, `append` and `rename` (`kernel_dir_entry`,
+`kernel_file_append`, `kernel_file_rename` in `fs/src/files.rs`), and
+`remove`, which was there already.
+
+**What it does not do yet:** read the file again at `hv restart`, which
+boots with what the start read -- `hv stop` and `hv start` take a changed
+file; start a VM when the module loads; make or take away a disk --
+`truncate` makes one, `rm` takes a folder away; or fetch an image from the
+network, wget's 20 MiB being too few for one.
+
+**Checked by:** `hv-linux-test.py`'s VM phase, which makes a folder with `hv
+create` -- and is refused a second time -- boots it by its name, types at it
+by its name, is refused a second start, finds its boot and hv's lines in its
+`console.log`, boots it again, and is refused a `vm.toml` with a key it does
+not know; then loads hv again with `vms=/data/vms`, makes a VM there -- and
+the folder above it -- boots it and types at it by its name, finds its
+`console.log` there, and is told `/vms`'s VM is none of this folder's; its
+network phase (`--net`), whose VM from its folder asks for
+port 5 and a forward -- its eth0 has the port's address and MAC, and its
+httpd answers from outside through the forward its `vm.toml` asked for;
+`hv-test.py`, whose last loads keep a `vms=` and say it, and refuse a
+parameter hv has not got and a `vms=` that is no absolute path;
+`hv-fuzz.py`'s `config` target, which holds the parser to never
+panicking on any text and `render` and `parse` to giving each other back what
+they were given, and whose `switch` target claims a port asked for as well as
+the first free one; and `fs-fuzz.py`'s `vfs` target, which holds the three
+file calls to its model of the tree.
+
 ## ACPI
 
 A PC's firmware leaves its OS tables that say what the machine is, and a

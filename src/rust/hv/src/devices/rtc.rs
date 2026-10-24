@@ -73,8 +73,9 @@ fn bcd(v: u64) -> u8 {
 }
 
 /// Year, month (1-12) and day (1-31) of the day `days` after 1970-01-01:
-/// Howard Hinnant's `civil_from_days`, for days that are not negative.
-fn civil(days: u64) -> (u64, u64, u64) {
+/// Howard Hinnant's `civil_from_days`, for days that are not negative. The
+/// guest's clock's, and the module's for the dates in a VM's log.
+pub fn civil(days: u64) -> (u64, u64, u64) {
     let z = days + 719_468;
     let era = z / 146_097;
     let doe = z - era * 146_097;

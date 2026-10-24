@@ -17,12 +17,13 @@ use hv::{Doorbells, Machine};
 use kcore::consts::{NS_PER_MS, NS_PER_SEC};
 use kcore::sync::Mutex;
 
+use crate::config::Options;
 use crate::disk::{FileDisk, Runner};
 
 /// How much of the file is read at once when streaming it into guest memory.
 const CHUNK: usize = 64 * 1024;
 /// The default guest RAM, and the range it may be given in.
-const DEFAULT_MEM_MIB: u64 = 256;
+pub const DEFAULT_MEM_MIB: u64 = 256;
 const MIN_MEM_MIB: u64 = 64;
 const MAX_MEM_MIB: u64 = hv::run::MAX_MEM_BYTES / (1024 * 1024);
 /// The default command line of a guest of one CPU: the serial console, and
@@ -91,6 +92,11 @@ pub struct Spec {
     /// `net`, for `hv start`: a NIC on the guests' switch. Which port is
     /// `nic`'s, once `hv start` has claimed one.
     pub net: bool,
+    /// `port=`: the port of the switch to claim, rather than the first free
+    /// one -- an address and a MAC the same at every start.
+    pub port: Option<usize>,
+    /// `forward=`: nos's ports relayed to the guest's, once it runs.
+    pub forwards: Vec<(u16, u16)>,
     pub nic: Option<NicSpec>,
 }
 
@@ -118,37 +124,22 @@ pub fn unescape(text: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Read the words of `args`: a kernel, then `key=value` options, and last
-/// `cmdline=` with the rest of the line. `usage` is what to say for none.
+/// Read the words of `args` into a guest: `words`, then `spec`. `usage` is
+/// what to say for none.
 pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
-    let mut spec = Spec {
-        kernel: String::new(),
-        initrd: None,
-        disks: Vec::new(),
-        mem_bytes: DEFAULT_MEM_MIB * 1024 * 1024,
-        cmdline: String::new(),
-        input: Vec::new(),
-        secs: None,
-        cpu: None,
-        cpus: 1,
-        xapic: false,
-        ioapic: false,
-        apicv: None,
-        rxmod_us: None,
-        nooffload: false,
-        log: false,
-        restart: false,
-        net: false,
-        nic: None,
-    };
-    let mut mem_mib = DEFAULT_MEM_MIB;
-    let mut cmdline = None;
+    spec(words(args, usage)?)
+}
 
+/// What the words of `args` say of a guest, as said: a kernel, then
+/// `key=value` options, and last `cmdline=` with the rest of the line. What
+/// a vm.toml says is read into the same `Options` (`config::parse`).
+pub fn words(args: &str, usage: &str) -> Result<Options, String> {
+    let mut o = Options::default();
     let mut rest = args.trim_start();
     while !rest.is_empty() {
         /* cmdline= takes everything after it, spaces and all. */
         if let Some(line) = rest.strip_prefix("cmdline=") {
-            cmdline = Some(String::from(line.trim_end()));
+            o.cmdline = Some(String::from(line.trim_end()));
             break;
         }
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
@@ -156,69 +147,119 @@ pub fn parse(args: &str, usage: &str) -> Result<Spec, String> {
         rest = rest[end..].trim_start();
 
         if let Some(v) = word.strip_prefix("mem=") {
-            mem_mib = v.parse().map_err(|_| String::from("mem= wants a number of MiB"))?;
+            o.mem_mib = Some(v.parse().map_err(|_| String::from("mem= wants a number of MiB"))?);
         } else if let Some(v) = word.strip_prefix("initrd=") {
-            spec.initrd = Some(String::from(v));
+            o.initrd = Some(String::from(v));
         } else if let Some(v) = word.strip_prefix("disk=") {
-            if spec.disks.len() >= MAX_DISKS {
+            if o.disks.len() >= MAX_DISKS {
                 return Err(alloc::format!("at most {} disks", MAX_DISKS));
             }
-            let (path, ro) = match v.strip_suffix(":ro") {
-                Some(path) => (path, true),
-                None => (v, false),
-            };
-            spec.disks.push((String::from(path), ro));
+            o.disks.push(crate::config::disk(v).ok_or_else(|| String::from("disk= wants a path, :ro after it for one read-only"))?);
+        } else if let Some(v) = word.strip_prefix("forward=") {
+            o.forwards.push(crate::config::forward(v)
+                .ok_or_else(|| String::from("forward= wants <nos's port>:<the guest's>, each 1..65535"))?);
+        } else if let Some(v) = word.strip_prefix("port=") {
+            o.port = Some(v.parse().map_err(|_| String::from("port= wants the number of a port of the switch"))?);
         } else if let Some(v) = word.strip_prefix("secs=") {
-            spec.secs = Some(v.parse().map_err(|_| String::from("secs= wants a number of seconds"))?);
+            o.secs = Some(v.parse().map_err(|_| String::from("secs= wants a number of seconds"))?);
         } else if let Some(v) = word.strip_prefix("cpus=") {
-            spec.cpus = v.parse().map_err(|_| String::from("cpus= wants a number of CPUs"))?;
+            o.cpus = Some(v.parse().map_err(|_| String::from("cpus= wants a number of CPUs"))?);
         } else if let Some(v) = word.strip_prefix("cpu=") {
-            spec.cpu = Some(v.parse().map_err(|_| String::from("cpu= wants a CPU number"))?);
+            o.cpu = Some(v.parse().map_err(|_| String::from("cpu= wants a CPU number"))?);
         } else if let Some(v) = word.strip_prefix("input=") {
-            spec.input = unescape(v)?;
+            /* `\n`s made newlines: a word of a &str with two of its ASCII
+             * bytes made one, so still UTF-8. */
+            o.input = String::from_utf8(unescape(v)?).map_err(|_| String::from("input= that is not text"))?;
         } else if word == "log" {
-            spec.log = true;
+            o.log = true;
         } else if word == "xapic" {
-            spec.xapic = true;
+            o.xapic = true;
         } else if word == "ioapic" {
-            spec.ioapic = true;
+            o.ioapic = true;
         } else if word == "apicv" {
-            spec.apicv = Some(true);
+            o.apicv = Some(true);
         } else if word == "noapicv" {
-            spec.apicv = Some(false);
+            o.apicv = Some(false);
         } else if word == "nooffload" {
-            spec.nooffload = true;
+            o.nooffload = true;
         } else if let Some(v) = word.strip_prefix("rxmod=") {
-            spec.rxmod_us = Some(v.parse().map_err(|_| String::from("rxmod= wants microseconds"))?);
+            o.rxmod_us = Some(v.parse().map_err(|_| String::from("rxmod= wants microseconds"))?);
         } else if word == "restart" {
-            spec.restart = true;
+            o.restart = true;
         } else if word == "net" {
-            spec.net = true;
-        } else if spec.kernel.is_empty() && !word.contains('=') {
-            spec.kernel = String::from(word);
+            o.net = true;
+        } else if o.kernel.is_empty() && !word.contains('=') {
+            o.kernel = String::from(word);
         } else {
             return Err(alloc::format!("hv: \"{}\" is not an option here\n{}", word, usage));
         }
     }
-
-    if spec.kernel.is_empty() {
+    if o.kernel.is_empty() {
         return Err(String::from(usage));
     }
+    Ok(o)
+}
+
+/// The guest `o` describes: what it leaves out given its default, and the
+/// whole of it checked -- for words and for a vm.toml alike.
+pub fn spec(o: Options) -> Result<Spec, String> {
+    let mem_mib = o.mem_mib.unwrap_or(DEFAULT_MEM_MIB);
     if !(MIN_MEM_MIB..=MAX_MEM_MIB).contains(&mem_mib) {
         return Err(alloc::format!("mem= must be {}..{} MiB", MIN_MEM_MIB, MAX_MEM_MIB));
     }
-    if spec.cpus == 0 || spec.cpus as usize > hv::MAX_VCPUS {
+    let cpus = o.cpus.unwrap_or(1);
+    if cpus == 0 || cpus as usize > hv::MAX_VCPUS {
         return Err(alloc::format!("cpus= must be 1..{}", hv::MAX_VCPUS));
     }
-    if spec.ioapic && spec.cpus < 2 {
+    if o.ioapic && cpus < 2 {
         return Err(String::from(
             "ioapic wants cpus=2 or more: a guest of one CPU has no local APIC for it to deliver to"));
     }
-    spec.mem_bytes = mem_mib * 1024 * 1024;
-    spec.cmdline = cmdline.unwrap_or_else(|| {
-        String::from(if spec.cpus > 1 { DEFAULT_CMDLINE_SMP } else { DEFAULT_CMDLINE })
-    });
-    Ok(spec)
+    if o.disks.len() > MAX_DISKS {
+        return Err(alloc::format!("at most {} disks", MAX_DISKS));
+    }
+    let port = match o.port {
+        Some(p) if !o.net => return Err(alloc::format!("port={} is a net guest's -- net too", p)),
+        Some(p) if p as usize >= crate::net::MAX_PORTS => {
+            return Err(alloc::format!("port= must be 0..{}", crate::net::MAX_PORTS - 1));
+        }
+        Some(p) => Some(p as usize),
+        None => None,
+    };
+    if !o.forwards.is_empty() && !o.net {
+        return Err(String::from("forward= is a net guest's -- net too"));
+    }
+    if o.forwards.len() > crate::forward::MAX_FORWARDS {
+        return Err(alloc::format!("at most {} forwards", crate::forward::MAX_FORWARDS));
+    }
+    for (i, (host, _)) in o.forwards.iter().enumerate() {
+        if o.forwards[..i].iter().any(|(h, _)| h == host) {
+            return Err(alloc::format!("nos's port {} is forwarded twice", host));
+        }
+    }
+    let cmdline = o.cmdline.unwrap_or_else(|| String::from(if cpus > 1 { DEFAULT_CMDLINE_SMP } else { DEFAULT_CMDLINE }));
+    Ok(Spec {
+        kernel: o.kernel,
+        initrd: o.initrd,
+        disks: o.disks,
+        mem_bytes: mem_mib * 1024 * 1024,
+        cmdline,
+        input: o.input.into_bytes(),
+        secs: o.secs,
+        cpu: o.cpu,
+        cpus,
+        xapic: o.xapic,
+        ioapic: o.ioapic,
+        apicv: o.apicv,
+        rxmod_us: o.rxmod_us,
+        nooffload: o.nooffload,
+        log: o.log,
+        restart: o.restart,
+        net: o.net,
+        port,
+        forwards: o.forwards,
+        nic: None,
+    })
 }
 
 /// The command line the guest's kernel is given: `cmdline`; for a guest of
