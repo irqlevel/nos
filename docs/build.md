@@ -251,9 +251,10 @@ make image                     # nos-x86_64.squashfs, on Linux with the toolchai
 ./scripts/build-image.sh       # the same in Docker; --clean builds from nothing
 ```
 
-A read-only squashfs of the kernel, every module built with it, the GRUB
-entries that boot it (`build/image/nos.cfg`), the default `/etc/rc`
-(`build/image/rc`), `scripts/nos-install` and a `VERSION` naming the build.
+A read-only squashfs of the kernel, every module built with it, hvboot
+(`/lib/hvboot`, below), the GRUB entries that boot it
+(`build/image/nos.cfg`), the default `/etc/rc` (`build/image/rc`),
+`scripts/nos-install` and a `VERSION` naming the build.
 Owners, times and modes are fixed (`mksquashfs -all-root -all-time 0
 -mkfs-time 0 -no-xattrs`), so the same kernel and modules make the same
 bytes. The revision in `VERSION` is read from the header the kernel was
@@ -262,6 +263,19 @@ as the kernel's is, so give `make image` the one the kernel was built with
 (the release workflow builds both in one builder image with one value).
 x86-64 only: what boots it is a server's own GRUB, over Multiboot2. Needs
 `mksquashfs` (squashfs-tools, in the Docker image).
+
+## hvboot
+
+`make` on x86-64 also builds `out/x86_64/hvboot` (`make hvboot` alone):
+the loader a guest of the hypervisor is started in, by PVH, to boot the
+kernel on its own disk ([A guest's own
+kernel](hypervisor.md#a-guests-own-kernel-pvh-and-hvboot)). It is a
+program of the guest's, not the kernel's, so it is built as a module is --
+its own target directory (`src/rust/target/hvboot`) and flags of its own:
+static, the small code model, compiler-builtins' `memcpy` and friends --
+and then linked by `ld.lld` with `src/rust/hvboot/hvboot.ld`, at 1 MiB,
+into an ELF with the `Xen` note PVH names its entry by. Offline, as
+everything is: it has no dependencies but `core` and `alloc`.
 
 ## Firmware: BIOS and UEFI
 

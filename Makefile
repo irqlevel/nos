@@ -297,7 +297,7 @@ RUST_SRC = $(shell find src/rust -name '*.rs' -not -path 'src/rust/target/*') \
         src/rust/.cargo/config.toml \
         src/rust/rust-toolchain.toml)
 
-.PHONY: all check nocheck clean rust smoke modules image
+.PHONY: all check nocheck clean rust smoke modules image hvboot
 
 # The generated .d files are ordinary makefiles, so the first target of the
 # first one make reads becomes the default goal -- on an incremental build a
@@ -309,8 +309,8 @@ RUST_SRC = $(shell find src/rust -name '*.rs' -not -path 'src/rust/target/*') \
 -include $(DEPS)
 
 ifeq ($(ARCH),x86_64)
-all: check nos.iso modules
-nocheck: nos.iso modules
+all: check nos.iso modules hvboot
+nocheck: nos.iso modules hvboot
 else
 all: check nos-arm64.img modules
 nocheck: nos-arm64.img modules
@@ -425,6 +425,31 @@ $(OUT)/modules/%.ko: $(RUST_SRC) src/rust/kmod/module.ver $(FLAVOR_STAMP)
 	$(OBJCOPY) --add-section .nos_syms=$@.syms $@.elf $@
 	@rm -f $@.elf $@.syms
 
+# hvboot (docs/hypervisor.md, "A guest's own kernel"): the loader a guest of
+# hv is started in, by PVH, to boot the kernel on its own disk -- a program
+# of the guest's, not of the kernel's, and x86-64's alone. Built on its own,
+# as a module is, with flags of its own: static, and the small code model,
+# as it runs where hvboot.ld links it, at 1 MiB; compiler-builtins' memcpy
+# and friends, there being no other. Then linked by that script into the
+# ELF whose PVH note hv starts it at.
+HVBOOT = $(OUT)/hvboot
+HVBOOT_RUSTFLAGS = ["-Ccode-model=small","-Crelocation-model=static"]
+HVBOOT_LDFLAGS = -m elf_x86_64 -static -nostdlib --gc-sections --build-id=none -z noexecstack \
+    -z max-page-size=4096 -T src/rust/hvboot/hvboot.ld
+
+ifeq ($(ARCH),x86_64)
+hvboot: $(HVBOOT)
+else
+hvboot:
+endif
+
+$(HVBOOT): $(RUST_SRC) src/rust/hvboot/hvboot.ld $(FLAVOR_STAMP)
+	@mkdir -p $(dir $@)
+	cd src/rust && cargo build --offline --release --target $(RUST_TARGET) -p hvboot --target-dir target/hvboot \
+	    --config 'target.$(RUST_TARGET).rustflags=$(HVBOOT_RUSTFLAGS)' \
+	    --config 'unstable.build-std-features=["compiler-builtins-mem"]' $(RUST_UB_CFG)
+	ld.lld $(HVBOOT_LDFLAGS) -o $@ src/rust/target/hvboot/$(RUST_TARGET)/release/libhvboot.a
+
 $(OUT)/kernel/module.o: CXXFLAGS += -DNOS_MODULE_ABI=\"$(MODULE_ABI)\"
 $(OUT)/kernel/module.o: $(MODULE_FFI_SRC)
 
@@ -474,11 +499,12 @@ image:
 	@echo "image: x86-64 only -- a server's GRUB boots it, over Multiboot2" >&2; exit 1
 endif
 
-$(IMAGE): $(KERNEL) $(MODULE_KO) build/image/nos.cfg build/image/rc scripts/nos-install
+$(IMAGE): $(KERNEL) $(MODULE_KO) $(HVBOOT) build/image/nos.cfg build/image/rc scripts/nos-install
 	rm -rf $(IMAGE_STAGE) $@.tmp
 	mkdir -p $(IMAGE_STAGE)/boot/grub $(IMAGE_STAGE)/lib/modules $(IMAGE_STAGE)/etc
 	install -m 0644 $(KERNEL) $(IMAGE_STAGE)/boot/kernel64.elf
 	install -m 0644 $(MODULE_KO) $(IMAGE_STAGE)/lib/modules/
+	install -m 0644 $(HVBOOT) $(IMAGE_STAGE)/lib/hvboot
 	install -m 0644 build/image/nos.cfg $(IMAGE_STAGE)/boot/grub/nos.cfg
 	install -m 0644 build/image/rc $(IMAGE_STAGE)/etc/rc
 	install -m 0755 scripts/nos-install $(IMAGE_STAGE)/nos-install

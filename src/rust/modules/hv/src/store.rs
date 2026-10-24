@@ -35,7 +35,7 @@ const PATH_MAX: usize = 255;
 /// folder and the longest name hv writes there.
 const ROOT_MAX: usize = PATH_MAX - (1 + NAME_MAX + 1 + vmlog::LONGEST_NAME);
 
-const CREATE_USAGE: &str = "hv create <name> <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] \
+const CREATE_USAGE: &str = "hv create <name> <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] \
                             [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] \
                             [net] [port=N] [forward=nos:guest]... [cmdline=...]";
 
@@ -116,7 +116,7 @@ pub fn find(root: &str, word: &str) -> Result<Option<Folder>, String> {
         if word.starts_with('/') {
             return Ok(None);
         }
-        return Err(alloc::format!("no vm {}: there is no {} -- hv create {} <bzImage> ... makes one", word, file, word));
+        return Err(alloc::format!("no vm {}: there is no {} -- hv create {} <kernel> ... makes one", word, file, word));
     }
     let name = path.rsplit('/').next().unwrap_or("");
     if !valid_name(name) {
@@ -248,7 +248,7 @@ pub fn list(root: &str, vms: &Vms, out: &mut Output) {
     let entries = match kcore::fs::list(root) {
         Ok(entries) => entries,
         Err(_) => {
-            let _ = writeln!(out, "hv: no {} -- hv create <name> <bzImage> ... makes it, and a vm in it", root);
+            let _ = writeln!(out, "hv: no {} -- hv create <name> <kernel> ... makes it, and a vm in it", root);
             return;
         }
     };
@@ -282,7 +282,7 @@ pub fn list(root: &str, vms: &Vms, out: &mut Output) {
         let _ = writeln!(out);
     }
     if !any {
-        let _ = writeln!(out, "hv: no vms in {} -- hv create <name> <bzImage> ... makes one", root);
+        let _ = writeln!(out, "hv: no vms in {} -- hv create <name> <kernel> ... makes one", root);
     }
 }
 

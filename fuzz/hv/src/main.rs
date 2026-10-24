@@ -85,6 +85,8 @@ pub mod insn;
 pub mod lapic;
 #[path = "../../../src/rust/hv/src/linux.rs"]
 pub mod linux;
+#[path = "../../../src/rust/hv/src/pvh.rs"]
+pub mod pvh;
 #[path = "../../../src/rust/hv/src/mmio.rs"]
 pub mod mmio;
 /// NAT, from the net crate: what a guest's packets for the world, and the
@@ -326,6 +328,7 @@ fn main() {
         placemodel::report();
         offloadmodel::report();
         netrx::report();
+        targets::report();
     }
     if findings.is_empty() {
         println!("hv-fuzz: {} inputs, no finding", total);

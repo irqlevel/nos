@@ -75,6 +75,17 @@ jobs:
           export PATH="$HOME/.cargo/bin:$PATH"
           python3 scripts/hv-fuzz.py
 
+      # What hvboot boots off a guest's disk is the disk's to say -- its
+      # partitions, its filesystem, its grub.cfg -- and the wrong entry, or a
+      # kernel read wrong, looks like a guest that booted something else: on
+      # disks made here, the entry GRUB would boot and its files byte for
+      # byte, and each disk's metadata fuzzed, on the host.
+      - name: hvboot test (host)
+        if: matrix.arch == 'x86_64'
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          python3 scripts/hvboot-test.py
+
       # What is on a disk is whoever wrote it's to choose, and a panic, a
       # write where nothing may write or an image left corrupt there is
       # anyone's to cause: the block and filesystem layers fuzzed on the

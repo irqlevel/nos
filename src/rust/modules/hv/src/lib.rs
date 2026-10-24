@@ -80,11 +80,12 @@ hv bench [cpu=N] [exits=N] [pages=N] [flush] [profile] [mmio]
                                    every entry, as before ASIDs, when told; profile
                                    splits an entry into its parts; mmio times MMIO
                                    loads instead, each decoded and performed
-hv boot <bzImage> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
+hv boot <kernel> [mem=MiB] [cpus=N] [secs=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [cmdline=...]
                                    a Linux guest for secs, then its console and how it ended;
                                    cpus gives it N CPUs, each on a host CPU of its own, the
-                                   first on cpu
-hv start <bzImage> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]
+                                   first on cpu. The kernel is a bzImage, or a PVH ELF:
+                                   /lib/hvboot boots the one its disk's grub.cfg names
+hv start <kernel> [mem=MiB] [cpus=N] [cpu=N] [xapic] [ioapic] [apicv|noapicv] [rxmod=US] [nooffload] [initrd=path] [disk=path[:ro]]... [input=...] [log] [restart] [net] [port=N] [forward=nos:guest]... [cmdline=...]
                                    a Linux guest that runs until hv stop; restart boots it
                                    again when it resets itself; port= its own port of the
                                    switch, forward= nos's ports relayed to its own
@@ -92,7 +93,7 @@ hv start <name|folder>             the vm in the vms' folder of that name, or in
                                    folder, as its vm.toml says: its console to console.log
                                    there. The vms' folder is /vms, or what insmod hv.ko
                                    was given as vms=<folder>; hv says which
-hv create <name> <bzImage> [the words hv start takes]
+hv create <name> <kernel> [the words hv start takes]
                                    <name>/vm.toml in the vms' folder, written from them --
                                    the paths the folder's unless they begin with /
 hv vms                             the vms in the vms' folder, and which of them run

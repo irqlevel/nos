@@ -123,7 +123,19 @@ SCRIPT = [
     "rmmod hv",             # 28
     "lsmod",                # 29
     "dmesg 400 hv:",        # 30
+    # A PVH image (hv/src/pvh.rs): hvboot, started at its 32-bit entry with
+    # paging off -- under VT-x, by unrestricted guest -- and given no disk.
+    "insmod /hv.ko",        # 31
+    "hv on",                # 32
+    "hv boot /hvboot mem=64 secs=120 cmdline=hvboot.verbose",  # 33
+    # And of two CPUs: the MP table written beside the start info, the
+    # second CPU waiting for a start-up IPI that never comes.
+    "hv boot /hvboot mem=64 cpus=2 secs=120 cmdline=hvboot.verbose",  # 34
+    "rmmod hv",             # 35
 ]
+
+# hvboot, as `make` builds it: the PVH image the script boots.
+HVBOOT = os.path.join(ROOT, "out", "x86_64", "hvboot")
 
 # What `hv run all` has to have said about each guest, beyond its verdict.
 GUESTS = {
@@ -219,10 +231,15 @@ def module(arch):
 
 
 def rootfs(tmp, arch, rc=None):
-    """A root filesystem carrying hv.ko, and an /etc/rc when one is wanted."""
+    """A root filesystem carrying hv.ko -- and on x86-64 hvboot, the PVH
+    image the script boots -- and an /etc/rc when one is wanted."""
     rootdir = os.path.join(tmp, "rootdir")
     os.makedirs(os.path.join(rootdir, "etc"), exist_ok=True)
     shutil.copy(module(arch), rootdir)
+    if arch == "x86_64":
+        if not os.path.exists(HVBOOT):
+            sys.exit("no %s -- make first" % HVBOOT)
+        shutil.copy(HVBOOT, os.path.join(rootdir, "hvboot"))
     if rc is not None:
         with open(os.path.join(rootdir, "etc", "rc"), "w") as f:
             f.write("# scripts/hv-test.py\n" + "\n".join(rc) + "\n")
@@ -486,6 +503,19 @@ def x86_checks(ran):
     pt.check("the kernel log says the extension went off for every CPU on the unload",
              "extension off for cpu mask %s" % ALL_MASK in logged, logged)
     pt.check("and nothing warned", "WARNING" not in logged, logged)
+
+    # A PVH image: hvboot, at its 32-bit entry with paging off, reads the
+    # start info hv laid out -- its RAM and the command line, hv's TSC rate
+    # after the VM's own words -- finds no disk, says so, and turns the
+    # guest off through its ACPI, which is what ends the VM.
+    for i, what in ((33, "of one CPU"), (34, "of two CPUs")):
+        pvh = out[i]
+        pt.check("a PVH image boots, %s: hvboot, at its 32-bit entry, reads the start info hv laid out" % what,
+                 re.search(r'hvboot: started by PVH: 6\d MiB of RAM, its command line "hvboot\.verbose', pvh)
+                 is not None, pvh)
+        pt.check("and, given no disk, says so and turns the guest off by its ACPI",
+                 "hvboot: cannot boot: no virtio disk" in pvh and "the guest powered itself off" in pvh, pvh)
+    pt.check("and hv unloads after it", "hv unloaded" in out[35], out[35])
 
 
 def arm64(args):

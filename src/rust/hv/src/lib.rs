@@ -54,6 +54,8 @@ pub mod vm;
 #[cfg(target_arch = "x86_64")]
 pub mod linux;
 #[cfg(target_arch = "x86_64")]
+pub mod pvh;
+#[cfg(target_arch = "x86_64")]
 mod acpi;
 #[cfg(target_arch = "x86_64")]
 mod insn;

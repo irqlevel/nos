@@ -99,8 +99,8 @@ const CMDLINE_MAX: usize = 2048;
 const LOW_TOP: u64 = 0x9_FC00;
 /// Where RAM starts again above the hole, and so the lowest a kernel may be
 /// loaded: everything this loader writes, and the firmware's tables, are
-/// below it.
-const ONE_MIB: u64 = 0x10_0000;
+/// below it -- and a PVH image's (`crate::pvh`) too.
+pub(crate) const ONE_MIB: u64 = 0x10_0000;
 
 /* The MP table: its floating pointer in that last KiB below 640 KiB, the
  * second place a kernel looks ("the top 1K of base RAM"), and the table
@@ -417,7 +417,7 @@ fn checksum(bytes: &[u8]) -> u8 {
 /// not use, described with the wiring a PC's would have, it takes as it is
 /// -- and registers nothing, the machine having none (`noapic` says so
 /// again).
-fn write_mp_table(m: &GuestMemory, cpus: u32, pci: &[Route], ioapic: bool) -> Result<()> {
+pub(crate) fn write_mp_table(m: &GuestMemory, cpus: u32, pci: &[Route], ioapic: bool) -> Result<()> {
     let cpus = usize::try_from(cpus).map_err(|_| Error::BadAddress)?;
     if cpus == 0 || cpus > crate::smp::MAX_VCPUS || pci.len() > MP_MAX_PCI {
         return Err(Error::BadAddress);
@@ -491,35 +491,52 @@ fn write_mp_table(m: &GuestMemory, cpus: u32, pci: &[Route], ioapic: bool) -> Re
     m.write(MP_FLOATING, &f)
 }
 
-/// The memory map the kernel reads instead of asking a BIOS: low RAM, the
-/// hole at 640 KiB -- in which the firmware's tables, when there are any,
-/// are reserved -- and the rest of RAM from 1 MiB up.
-fn write_e820(m: &GuestMemory, mem_bytes: u64, firmware: Option<Firmware>) -> Result<()> {
-    let mut entries = [(0u64, 0u64, 0u32); 3];
+/// An entry of the memory map: e820's, which PVH's start info carries too.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct E820Entry {
+    pub addr: u64,
+    pub size: u64,
+    pub kind: u32,
+}
+
+/// How many entries [`e820_entries`] makes at most.
+pub(crate) const E820_LOW_ENTRIES: usize = 3;
+const _: () = assert!(E820_LOW_ENTRIES <= E820_MAX_ENTRIES);
+
+/// The memory map a guest of `mem_bytes` reads instead of asking a BIOS:
+/// low RAM, the hole at 640 KiB -- in which the firmware's tables, when
+/// there are any, are reserved -- and the rest of RAM from 1 MiB up. Into
+/// `out`; how many entries.
+pub(crate) fn e820_entries(mem_bytes: u64, firmware: Option<Firmware>, out: &mut [E820Entry; E820_LOW_ENTRIES])
+    -> Result<usize>
+{
     let mut n = 0;
-    entries[n] = (0, LOW_TOP, E820_RAM);
+    out[n] = E820Entry { addr: 0, size: LOW_TOP, kind: E820_RAM };
     n += 1;
     if let Some(f) = firmware {
         if f.start < LOW_TOP || f.end > ONE_MIB || f.start >= f.end {
             return Err(Error::BadAddress);
         }
-        entries[n] = (f.start, f.end - f.start, E820_RESERVED);
+        out[n] = E820Entry { addr: f.start, size: f.end - f.start, kind: E820_RESERVED };
         n += 1;
     }
     if mem_bytes > ONE_MIB {
-        entries[n] = (ONE_MIB, mem_bytes - ONE_MIB, E820_RAM);
+        out[n] = E820Entry { addr: ONE_MIB, size: mem_bytes - ONE_MIB, kind: E820_RAM };
         n += 1;
     }
-    if n > E820_MAX_ENTRIES {
-        return Err(Error::BadAddress);
-    }
+    Ok(n)
+}
 
+/// The memory map, [`e820_entries`], into the zero page.
+fn write_e820(m: &GuestMemory, mem_bytes: u64, firmware: Option<Firmware>) -> Result<()> {
+    let mut entries = [E820Entry::default(); E820_LOW_ENTRIES];
+    let n = e820_entries(mem_bytes, firmware, &mut entries)?;
     put8(m, BOOT_PARAMS + BP_E820_ENTRIES as u64, n as u8)?;
-    for (i, (addr, size, kind)) in entries[..n].iter().enumerate() {
+    for (i, e) in entries[..n].iter().enumerate() {
         let at = BOOT_PARAMS + BP_E820_TABLE as u64 + (i * E820_ENTRY_BYTES) as u64;
-        put64(m, at, *addr)?;
-        put64(m, at + 8, *size)?;
-        put32(m, at + 16, *kind)?;
+        put64(m, at, e.addr)?;
+        put64(m, at + 8, e.size)?;
+        put32(m, at + 16, e.kind)?;
     }
     Ok(())
 }

@@ -318,15 +318,44 @@ pub struct Built {
     pub cpus: Vec<GuestCpu>,
 }
 
-/// Build the guest: its memory, the kernel and the initrd streamed into it,
-/// and the rest of what the boot protocol wants laid out beside them; its
-/// CPUs, rung by `doorbells`; its disks served for `runner`, who runs it.
-pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doorbells>) -> Result<Built, String> {
-    /* The image first, and its layout planned, before any of the guest's
-     * memory is taken: a path that is not a bzImage, or a kernel that does
-     * not fit, costs nothing -- not a few gigabytes taken, zeroed and given
-     * back. */
+/// What the kernel file is, read and planned: a bzImage booted by the Linux
+/// boot protocol (`hv::linux`), or an ELF booted by PVH's (`hv::pvh`) -- an
+/// image that is not Linux's own, `hvboot` the one nos ships.
+enum Image {
+    Linux { header: Header, first: Vec<u8>, pm_offset: u64, layout: hv::linux::Layout },
+    Pvh { image: hv::pvh::Image, layout: hv::pvh::Layout },
+}
 
+impl Image {
+    /// Where the initrd goes, and how long it is.
+    fn initrd(&self) -> (u64, u64) {
+        match self {
+            Image::Linux { layout, .. } => (layout.initrd_addr, layout.initrd_len),
+            Image::Pvh { layout, .. } => (layout.initrd_addr, layout.initrd_len),
+        }
+    }
+}
+
+/// The kernel file, read at an offset, for `hv::pvh::Image::parse`: what
+/// went wrong reading it is kept, so that a failed read is not reported as
+/// a file that is not an image.
+struct FileAt<'a> {
+    path: &'a str,
+    failed: Option<String>,
+}
+
+impl hv::pvh::ReadAt for FileAt<'_> {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> hv::Result<usize> {
+        kcore::fs::read_at(self.path, offset, buf).map_err(|e| {
+            self.failed = Some(alloc::format!("reading {}: {}", self.path, e));
+            hv::Error::BadAddress
+        })
+    }
+}
+
+/// Read the kernel file's headers and plan where it goes in a guest of
+/// `spec.mem_bytes`, beside an initrd of `initrd_len` bytes.
+fn plan(spec: &Spec, initrd_len: u64) -> Result<Image, String> {
     /* The header is in the first page or two; read enough to parse it. */
     let mut first = Vec::new();
     first.try_reserve_exact(2 * kcore::consts::PAGE_SIZE).map_err(|_| String::from("out of memory"))?;
@@ -334,22 +363,48 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     let got = kcore::fs::read_at(&spec.kernel, 0, &mut first)
         .map_err(|e| alloc::format!("reading {}: {}", spec.kernel, e))?;
     first.truncate(got);
-    let header = Header::parse(&first).map_err(|_| alloc::format!("{} is not a 64-bit bzImage", spec.kernel))?;
-
     let kernel_size = kcore::fs::size(&spec.kernel).map_err(|e| alloc::format!("{}: {}", spec.kernel, e))?;
+
+    if hv::pvh::Image::is_elf(&first) {
+        let mut file = FileAt { path: &spec.kernel, failed: None };
+        let image = match hv::pvh::Image::parse(&mut file, kernel_size) {
+            Ok(image) => image,
+            Err(_) if file.failed.is_some() => return Err(file.failed.unwrap_or_default()),
+            Err(hv::Error::NotImplemented) => {
+                return Err(alloc::format!("{} is an ELF with no PVH entry note: not one this boots", spec.kernel));
+            }
+            Err(_) => return Err(alloc::format!("{} is not a PVH image this can load", spec.kernel)),
+        };
+        let layout = hv::pvh::plan(&image, spec.mem_bytes, initrd_len)
+            .map_err(|e| alloc::format!("the guest's memory does not fit its image: {}", e))?;
+        return Ok(Image::Pvh { image, layout });
+    }
+
+    let header = Header::parse(&first)
+        .map_err(|_| alloc::format!("{} is neither a 64-bit bzImage nor a PVH ELF", spec.kernel))?;
     let pm_offset = header.pm_offset();
     if pm_offset >= kernel_size {
         return Err(String::from("the image is shorter than its own setup"));
     }
     let kernel_len = kernel_size - pm_offset;
+    let layout = hv::linux::plan(&header, spec.mem_bytes, kernel_len, initrd_len)
+        .map_err(|e| alloc::format!("the guest's memory does not fit its kernel: {}", e))?;
+    Ok(Image::Linux { header, first, pm_offset, layout })
+}
 
+/// Build the guest: its memory, the kernel and the initrd streamed into it,
+/// and the rest of what the boot protocol wants laid out beside them; its
+/// CPUs, rung by `doorbells`; its disks served for `runner`, who runs it.
+pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doorbells>) -> Result<Built, String> {
+    /* The image first, and its layout planned, before any of the guest's
+     * memory is taken: a path that is not an image, or a kernel that does
+     * not fit, costs nothing -- not a few gigabytes taken, zeroed and given
+     * back. */
     let initrd_len = match &spec.initrd {
         Some(path) => kcore::fs::size(path).map_err(|e| alloc::format!("{}: {}", path, e))?,
         None => 0,
     };
-
-    let layout = hv::linux::plan(&header, spec.mem_bytes, kernel_len, initrd_len)
-        .map_err(|e| alloc::format!("the guest's memory does not fit its kernel: {}", e))?;
+    let image = plan(spec, initrd_len)?;
 
     let (mut guest, mut cpus) = LinuxGuest::new(machine, spec.mem_bytes, spec.cpus, doorbells, !spec.xapic, spec.ioapic)
         .map_err(|e| alloc::format!("no guest: {}", e))?;
@@ -363,10 +418,22 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
         guest.set_offloads(false);
     }
 
-    /* The 64-bit kernel at its load address, then the initrd high. */
-    stream(&guest, &spec.kernel, pm_offset, layout.kernel_addr, kernel_len)?;
+    /* The 64-bit kernel at its load address -- or each of a PVH image's
+     * segments at its own, the zeroes past its file bytes being the fresh
+     * memory's -- then the initrd high. */
+    match &image {
+        Image::Linux { pm_offset, layout, .. } => {
+            stream(&guest, &spec.kernel, *pm_offset, layout.kernel_addr, layout.kernel_len)?;
+        }
+        Image::Pvh { image, .. } => {
+            for s in image.segments() {
+                stream(&guest, &spec.kernel, s.offset, s.paddr, s.filesz)?;
+            }
+        }
+    }
     if let Some(path) = &spec.initrd {
-        stream(&guest, path, 0, layout.initrd_addr, layout.initrd_len)?;
+        let (addr, len) = image.initrd();
+        stream(&guest, path, 0, addr, len)?;
     }
 
     /* Its devices before its furniture: the ACPI tables `load` lays out
@@ -386,9 +453,17 @@ pub fn build(machine: &Machine, spec: &Spec, runner: &Runner, doorbells: Arc<Doo
     let tsc_khz = kcore::time::cycle_counter_hz().map(|hz| hz / 1000).filter(|&khz| khz != 0);
     let cmdline = guest_cmdline(&spec.cmdline, spec.cpus > 1 && !spec.ioapic, tsc_khz)?;
     let bsp = cpus.first_mut().ok_or_else(|| String::from("no guest: no CPU"))?;
-    guest
-        .load(bsp, &header, &first, layout, cmdline.as_bytes())
-        .map_err(|e| alloc::format!("laying out the guest: {}", e))?;
+    match &image {
+        Image::Linux { header, first, layout, .. } => guest
+            .load(bsp, header, first, *layout, cmdline.as_bytes())
+            .map_err(|e| alloc::format!("laying out the guest: {}", e))?,
+        Image::Pvh { image, layout } => guest.load_pvh(bsp, image, *layout, cmdline.as_bytes()).map_err(|e| match e {
+            hv::Error::NoUnrestrictedGuest => {
+                String::from("this CPU's VT-x has no unrestricted guest, and a PVH image starts with paging off")
+            }
+            e => alloc::format!("laying out the guest: {}", e),
+        })?,
+    }
     Ok(Built { guest, cpus })
 }
 
