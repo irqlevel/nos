@@ -261,6 +261,128 @@ fn verify(vfs: &Vfs, path: &str, rbuf: &mut [u8], expect_len: usize,
     true
 }
 
+/* ---- the far file ---- */
+
+/// Where the far file has something written: across 2 and 4 GiB, where a
+/// size takes a 32nd and a 33rd bit, and twice past them -- of 4 KiB ext2
+/// blocks the last two under the triple indirect block, of 1 KiB blocks all
+/// four. All inside what ext2 holds at any block size, 16 GiB at 1 KiB.
+const FAR_SPOTS: [usize; 4] = [(1 << 31) - 150, (1 << 32) - 150, (1 << 32) + (8 << 20) + 3, (5 << 30) + 77];
+/// Its size, past every spot.
+const FAR_SIZE: usize = (5 << 30) + 4096;
+/// What is written at each spot.
+const FAR_PATCH: usize = 300;
+/// What is read either side of a patch: holes, reading as zeros.
+const FAR_MARGIN: usize = 64;
+const FAR_SALT: u8 = 0x3C;
+
+/// What the far file holds at `offset`, cut at `end` and grown back since:
+/// a patch, or a hole.
+fn far_byte(offset: usize, end: usize) -> u8 {
+    let patched = FAR_SPOTS.iter().any(|spot| offset >= *spot && offset < spot + FAR_PATCH);
+    if patched && offset < end { pattern(offset, FAR_SALT) } else { 0 }
+}
+
+/// Every patch and the holes either side of it, read back and held to
+/// `far_byte`.
+fn far_verify(vfs: &Vfs, path: &str, buf: &mut [u8], end: usize, report: &mut Reporter, when: &str) -> bool {
+    let file = match open(vfs, path, OPEN_READ) {
+        Some(file) => file,
+        None => { report.say(path, "open of the far file failed"); return false; }
+    };
+    let len = FAR_PATCH + 2 * FAR_MARGIN;
+    for spot in FAR_SPOTS {
+        let from = spot - FAR_MARGIN;
+        if !file.seek(from) {
+            report.say(path, "seek in the far file failed");
+            return false;
+        }
+        let mut got = 0;
+        while got < len {
+            match file.read(&mut buf[got..len]) {
+                Some(0) | None => break,
+                Some(n) => got += n,
+            }
+        }
+        if got != len {
+            report.say(path, "short read of the far file");
+            return false;
+        }
+        if let Some(at) = (0..len).find(|i| buf[*i] != far_byte(from + i, end)) {
+            report.say(path, "far file content mismatch");
+            trace!(0, "fstest: {}: mismatch at {} {}", path, from + at, when);
+            return false;
+        }
+    }
+    true
+}
+
+/// A sparse file past 4 GiB, where the filesystem holds one at no cost but
+/// what is written (`FileSystem::sparse_max`): holes up to its size, a
+/// patch at each spot read back with the holes around it, the file cut in
+/// the middle of one and grown back, what was cut reading as zeros. The
+/// recursive remove at the end of the test then takes the file, tree and
+/// all.
+fn far_file(vfs: &Vfs, path: &str, report: &mut Reporter) -> bool {
+    if vfs.sparse_max(path.as_bytes()) < FAR_SIZE {
+        trace!(0, "fstest: {}: no sparse file that big here, the far file skipped", path);
+        return true;
+    }
+    let mut buf = match buffer(FAR_PATCH + 2 * FAR_MARGIN) {
+        Some(buf) => buf,
+        None => { report.say(path, "alloc failed"); return false; }
+    };
+
+    if !vfs.write_file(path.as_bytes(), b"") || !vfs.truncate(path.as_bytes(), FAR_SIZE) {
+        report.say(path, "the truncate past 4 GiB failed");
+        return false;
+    }
+    {
+        let file = match open(vfs, path, OPEN_WRITE) {
+            Some(file) => file,
+            None => { report.say(path, "open of the far file failed"); return false; }
+        };
+        for spot in FAR_SPOTS {
+            fill(&mut buf, FAR_PATCH, spot, FAR_SALT);
+            if !file.seek(spot) || !file.write(&buf[..FAR_PATCH]) {
+                report.say(path, "a write past 2 GiB failed");
+                return false;
+            }
+        }
+    }
+    match stat_of(vfs, path) {
+        Some(st) if st.size == FAR_SIZE => {}
+        _ => { report.say(path, "the far file's size is wrong"); return false; }
+    }
+    if !far_verify(vfs, path, &mut buf, FAR_SIZE, report, "after the writes") {
+        return false;
+    }
+
+    /* Cut in the middle of the second patch: the two past it go, and the
+     * end of it, and nothing reads past the cut */
+    let cut = FAR_SPOTS[1] + FAR_PATCH / 2;
+    if !vfs.truncate(path.as_bytes(), cut) {
+        report.say(path, "the cut of the far file failed");
+        return false;
+    }
+    let ended = open(vfs, path, OPEN_READ).is_some_and(|file| file.seek(cut) && file.read(&mut buf) == Some(0));
+    match stat_of(vfs, path) {
+        Some(st) if st.size == cut && ended => {}
+        _ => { report.say(path, "the far file does not end at the cut"); return false; }
+    }
+
+    if !vfs.truncate(path.as_bytes(), FAR_SIZE) {
+        report.say(path, "the far file would not grow back");
+        return false;
+    }
+    if !far_verify(vfs, path, &mut buf, cut, report, "grown back after the cut") {
+        return false;
+    }
+
+    report.say(path, "a sparse file past 4 GiB written, read back, cut and grown again");
+    true
+}
+
 /* ---- the whole test ---- */
 
 pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
@@ -290,9 +412,10 @@ pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
         Path::join(base.as_str(), "b.txt"),
         Path::join(base.as_str(), "sub"),
         Path::join(base.as_str(), "big.bin"),
+        Path::join(base.as_str(), "far.bin"),
     ];
-    let (a, b, sub, big) = match &paths {
-        [Some(a), Some(b), Some(sub), Some(big)] => (a, b, sub, big),
+    let (a, b, sub, big, far) = match &paths {
+        [Some(a), Some(b), Some(sub), Some(big), Some(far)] => (a, b, sub, big, far),
         _ => { report.say(dir, "path too long"); return false; }
     };
     let c = match Path::join(sub.as_str(), "c.txt") { Some(p) => p, None => {
@@ -309,7 +432,7 @@ pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
         return false;
     }
 
-    let ok = body(vfs, &base, a, b, sub, &c, big, big_size, &mut report);
+    let ok = body(vfs, &base, a, b, sub, &c, big, far, big_size, &mut report);
     if !ok {
         vfs.remove(base.as_bytes());
     }
@@ -317,7 +440,7 @@ pub fn run(dir: &str, big_size: usize, out: Option<&mut Output>) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &Path,
+fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &Path, far: &Path,
         big_size: usize, report: &mut Reporter) -> bool {
     if !vfs.write_file(a.as_bytes(), b"hello world")
         || !check_content(vfs, a.as_str(), b"hello world", report)
@@ -397,6 +520,10 @@ fn body(vfs: &Vfs, base: &Path, a: &Path, b: &Path, sub: &Path, c: &Path, big: &
     }
 
     if big_size > 0 && !big_file(vfs, big.as_str(), big_size, report) {
+        return false;
+    }
+
+    if !far_file(vfs, far.as_str(), report) {
         return false;
     }
 

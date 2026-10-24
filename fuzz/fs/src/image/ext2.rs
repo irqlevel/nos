@@ -29,6 +29,9 @@ pub const INCOMPAT_FILETYPE: u32 = 0x0002;
 pub const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
 pub const RO_COMPAT_LARGE_FILE: u32 = 0x0002;
 pub const COMPAT_DIR_INDEX: u32 = 0x0020;
+/// A regular file this big or bigger is a large file: what a filesystem
+/// without large_file has none of (e2fsck's `ext2fs_needs_large_file_feature`).
+pub const LARGE_FILE_SIZE: u64 = 1 << 31;
 /// State: cleanly unmounted
 pub const STATE_VALID: u16 = 0x0001;
 
@@ -118,6 +121,51 @@ fn bit(map: &[u8], i: usize) -> bool {
 
 fn set_bit(map: &mut [u8], i: usize) {
     map[i / 8] |= 1 << (i % 8);
+}
+
+/* ---- a file's tree ---- */
+
+/// The logical blocks a file's tree maps: its 12 direct blocks, and what
+/// the single, double and triple indirect blocks do -- `ppb` to the first,
+/// second and third power.
+pub fn tree_blocks(bs: u64) -> u64 {
+    let ppb = bs / 4;
+    12 + ppb + ppb * ppb + ppb * ppb * ppb
+}
+
+/// The indirect blocks that lead to logical block `logical` of a file of
+/// `bs`-byte blocks, from the inode down: each as its level -- 0 a block of
+/// data blocks' pointers, 1 a double indirect one, 2 a triple -- and the
+/// first logical block it maps, which names it. Empty for a direct block.
+pub fn chain(logical: u64, bs: u64) -> Vec<(u32, u64)> {
+    let ppb = bs / 4;
+    if logical < 12 {
+        return Vec::new();
+    }
+    /* Which tree: the first whose range has the block */
+    let mut start = 12;
+    let mut top = 0u32;
+    while logical - start >= ppb.pow(top + 1) {
+        start += ppb.pow(top + 1);
+        top += 1;
+    }
+    let mut out = Vec::new();
+    let mut first = start;
+    for level in (0..=top).rev() {
+        out.push((level, first));
+        let below = ppb.pow(level);
+        first += (logical - first) / below * below;
+    }
+    out
+}
+
+/// The indirect blocks a file with data in the logical blocks `blocks` has.
+pub fn indirect_blocks(blocks: &[u64], bs: u64) -> u64 {
+    let mut all = BTreeSet::new();
+    for &b in blocks {
+        all.extend(chain(b, bs));
+    }
+    all.len() as u64
 }
 
 /* ---- the geometry ---- */
@@ -281,6 +329,9 @@ struct Builder<'a> {
     now: u32,
     style: Style,
     chaos: u64,
+    /// A file of 2 GiB or more was laid down: the superblock gets
+    /// large_file, whatever the geometry asked.
+    large_files: bool,
 }
 
 impl Builder<'_> {
@@ -343,55 +394,49 @@ impl Builder<'_> {
     /// and the indirect blocks that lead to them. The count of blocks it
     /// took, indirect ones included.
     fn map(&mut self, i: &mut [u8], blocks: &[(u32, Vec<u8>)]) -> Result<u32, String> {
-        let ppb = (self.bs / 4) as u32;
+        let bs = self.bs as u64;
+        let ppb = bs / 4;
         let mut taken = 0;
-        let mut ind: BTreeMap<u32, Vec<u8>> = BTreeMap::new(); // single indirect, by which one
-        let mut ind_no: BTreeMap<u32, u32> = BTreeMap::new();
-        let mut dind: Option<(u32, Vec<u8>)> = None;
+        /* The indirect blocks, by their level and the first logical block
+         * each maps (`chain`): the block, and what it holds */
+        let mut tree: BTreeMap<(u32, u64), (u32, Vec<u8>)> = BTreeMap::new();
         for (logical, content) in blocks {
+            let logical = *logical as u64;
+            if logical >= tree_blocks(bs) {
+                return Err("a file past the triple indirect block".into());
+            }
             let b = self.alloc_block()?;
             taken += 1;
             self.write_block(b, content);
-            let logical = *logical;
             if logical < 12 {
                 wr32(i, ino::BLOCK + 4 * logical as usize, b);
                 continue;
             }
-            let rel = logical - 12;
-            let (which, slot) = if rel < ppb {
-                (0, rel)
-            } else {
-                let rel = rel - ppb;
-                if rel >= ppb * ppb {
-                    return Err("a file past the double indirect block".into());
+            /* Down from the inode's slot, each level's block made when it
+             * is missing and named in the one above */
+            let path = chain(logical, bs);
+            for (k, &(level, first)) in path.iter().enumerate() {
+                if tree.contains_key(&(level, first)) {
+                    continue;
                 }
-                (1 + rel / ppb, rel % ppb)
-            };
-            if !ind.contains_key(&which) {
                 let nb = self.alloc_block()?;
                 taken += 1;
-                ind.insert(which, vec![0u8; self.bs]);
-                ind_no.insert(which, nb);
-                if which == 0 {
-                    wr32(i, ino::BLOCK + 4 * 12, nb);
+                tree.insert((level, first), (nb, vec![0u8; self.bs]));
+                if k == 0 {
+                    wr32(i, ino::BLOCK + 4 * (12 + level as usize), nb);
                 } else {
-                    if dind.is_none() {
-                        let db = self.alloc_block()?;
-                        taken += 1;
-                        dind = Some((db, vec![0u8; self.bs]));
-                        wr32(i, ino::BLOCK + 4 * 13, db);
-                    }
-                    let d = dind.as_mut().expect("made above");
-                    wr32(&mut d.1, 4 * (which - 1) as usize, nb);
+                    let (above_level, above_first) = path[k - 1];
+                    let index = (first - above_first) / ppb.pow(above_level);
+                    let above = tree.get_mut(&(above_level, above_first)).expect("made above");
+                    wr32(&mut above.1, 4 * index as usize, nb);
                 }
             }
-            wr32(ind.get_mut(&which).expect("made above"), 4 * slot as usize, b);
+            let &(level, first) = path.last().expect("a block past the direct ones has a chain");
+            debug_assert_eq!(level, 0);
+            let leaf = tree.get_mut(&(level, first)).expect("made above");
+            wr32(&mut leaf.1, 4 * (logical - first) as usize, b);
         }
-        for (which, content) in ind {
-            let b = ind_no[&which];
-            self.write_block(b, &content);
-        }
-        if let Some((b, content)) = dind {
+        for (_, (b, content)) in tree {
             self.write_block(b, &content);
         }
         Ok(taken)
@@ -400,11 +445,18 @@ impl Builder<'_> {
     fn file(&mut self, content: &Data) -> Result<u32, String> {
         let ino_no = self.alloc_inode(false)?;
         let mut i = self.new_inode(S_IFREG | 0o644, 1);
-        if content.len() > u32::MAX as u64 {
-            return Err("a file past what ext2 without large files holds".into());
-        }
-        wr32(&mut i, ino::SIZE, content.len() as u32);
         let bs = self.bs as u64;
+        if content.len() > tree_blocks(bs) * bs {
+            return Err("a file past what its tree maps".into());
+        }
+        /* Both words of the size; and one of 2 GiB or more makes the
+         * filesystem one with large files, as libext2fs has it when a
+         * file's size is set */
+        wr32(&mut i, ino::SIZE, content.len() as u32);
+        wr32(&mut i, ino::DIR_ACL, (content.len() >> 32) as u32);
+        if content.len() >= LARGE_FILE_SIZE {
+            self.large_files = true;
+        }
         let logical: Vec<u64> = if self.style.holes {
             content.nonzero_blocks(bs)
         } else {
@@ -542,6 +594,7 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
         now,
         style: style.clone(),
         chaos: chaos | 1,
+        large_files: false,
     };
     /* Block 0 before the first group, when there is one, is nobody's. */
     for i in 0..g.first_data_block() as usize {
@@ -618,7 +671,10 @@ pub fn mkfs(g: &Geometry, tree: &Node, style: &Style, now: u32, chaos: u64) -> R
         free_inodes += ifree;
     }
 
-    let (compat, incompat, ro_compat) = g.features();
+    let (compat, incompat, mut ro_compat) = g.features();
+    if b.large_files {
+        ro_compat |= RO_COMPAT_LARGE_FILE;
+    }
     let mut s = vec![0u8; 1024];
     wr32(&mut s, sb::INODES_COUNT, g.inodes());
     wr32(&mut s, sb::BLOCKS_COUNT, g.blocks);
@@ -849,6 +905,7 @@ pub fn check(img: &Media, dev_bytes: u64) -> Check {
         return c;
     }
     let sparse = rd32(&s, sb::FEATURE_RO_COMPAT) & RO_COMPAT_SPARSE_SUPER != 0;
+    let large_file = rd32(&s, sb::FEATURE_RO_COMPAT) & RO_COMPAT_LARGE_FILE != 0;
     let gdt_blocks = (groups as usize * GD_SIZE).div_ceil(bs);
     let gdt = img.bytes((first_data_block as u64 + 1) * bs as u64, gdt_blocks * bs);
 
@@ -926,6 +983,15 @@ pub fn check(img: &Media, dev_bytes: u64) -> Check {
                     if last * bs as u64 > size {
                         c.unclean(format!("inode {}: a block at {} past its size {}", n, last, size));
                     }
+                }
+                /* A size past what the tree maps, which e2fsck cuts back;
+                 * and a large file on a filesystem that says it has none,
+                 * which e2fsck gives large_file */
+                if size > tree_blocks(bs as u64) * bs as u64 {
+                    c.unclean(format!("inode {}: size {} is past what its tree maps", n, size));
+                }
+                if size >= LARGE_FILE_SIZE && !large_file {
+                    c.unclean(format!("inode {} is {} bytes, and the superblock has no large_file", n, size));
                 }
             }
             S_IFDIR => {

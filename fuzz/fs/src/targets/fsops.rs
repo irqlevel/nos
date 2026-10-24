@@ -354,10 +354,13 @@ pub fn length(r: &mut Input) -> usize {
 }
 
 /// Where in a file something happens: its start, its end, a block's edge
-/// near either, or somewhere far past it.
+/// near either, an edge of ext2's tree -- where the indirect, the double
+/// and the triple indirect blocks start -- or of a size's words, at 2 and
+/// 4 GiB, or somewhere far past it.
 pub fn offset(r: &mut Input, size: u64, block: u64, max: u64) -> u64 {
     let edge = |r: &mut Input, at: u64| (at + r.below(3)).saturating_sub(1);
-    let at = match r.u8() % 10 {
+    let ppb = block / 4;
+    let at = match r.u8() % 12 {
         0 => 0,
         1 => size,
         2 => size.saturating_sub(r.below(3)),
@@ -366,9 +369,14 @@ pub fn offset(r: &mut Input, size: u64, block: u64, max: u64) -> u64 {
             edge(r, k * block)
         }
         4 => edge(r, 12 * block),
-        5 => edge(r, (12 + block / 4) * block),
-        6 => max.saturating_sub(r.below(8192)),
-        7 => r.below(1 << 20),
+        5 => edge(r, (12 + ppb) * block),
+        6 => edge(r, (12 + ppb + ppb * ppb) * block),
+        7 => {
+            let at = r.pick(&[1u64 << 31, 1 << 32]);
+            edge(r, at)
+        }
+        8 => max.saturating_sub(r.below(8192)),
+        9 => r.below(1 << 20),
         _ => r.below(size + 8192),
     };
     at.min(max.saturating_add(4096))
@@ -395,7 +403,7 @@ fn partial_write(old: &Data, got: &Data, at: u64, data: &[u8]) -> bool {
     }
     let end = (at + data.len() as u64).min(old.len()).max(at.min(old.len()));
     let start = at.min(old.len());
-    if got.read(0, start) != old.read(0, start) || got.read(end, u64::MAX) != old.read(end, u64::MAX) {
+    if !got.same_range(old, 0, start) || !got.same_range(old, end, u64::MAX) {
         return false;
     }
     let mid = got.read(start, end - start);
@@ -702,6 +710,9 @@ impl Fs {
         let want = match self.model.resolve(p) {
             Res::Node(n) if !self.model.read_only && size <= limit => match self.model.file_mut(&n) {
                 Some(d) => {
+                    if d.len() > u32::MAX as u64 && size < d.len() && got {
+                        reached("a file past 4 GiB cut down");
+                    }
                     d.truncate(size);
                     true
                 }

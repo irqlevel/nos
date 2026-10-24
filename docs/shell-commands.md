@@ -63,6 +63,7 @@ suppressed while the shell is active (it still lands in `dmesg`).
 | `append <path> <text>` | Append text to a file (created if missing) |
 | `mv <old> <new>` | Rename or move a file or directory within one filesystem |
 | `stat <path>` | Type, size and inode number |
+| `truncate <path> <size>` | Cut a file to `size` bytes (a `K`, `M`, `G` or `T` suffix), or grow it there with a hole, made first if it is not there -- a blank disk image for a guest, of any size the filesystem holds; refused past what a file can be there |
 | `sync` | Flush every mounted filesystem to disk |
 | `fstest [dir] [size]` | Filesystem self-test in `dir` (default `/`) with a big file of `size` bytes (`K`/`M` suffix; default 300 KiB, at least 8 KiB); `fstest / 5M` reaches the doubly-indirect blocks at 4 KiB blocks |
 | `crc32 <path>` | CRC-32 of a file, to check a copy against the host |

@@ -99,6 +99,24 @@ impl Data {
         self.read(0, self.len)
     }
 
+    /// Whether two contents of one length hold the same bytes from `from` up
+    /// to `to` -- or to their end, `to` past it: compared a chunk at a time
+    /// where either has one, the rest zeros in both, so that a range of
+    /// terabytes of holes costs nothing.
+    pub fn same_range(&self, other: &Data, from: u64, to: u64) -> bool {
+        let to = to.min(self.len.max(other.len));
+        if from >= to {
+            return true;
+        }
+        let (first, last) = (from / CHUNK, (to - 1) / CHUNK);
+        let indices: std::collections::BTreeSet<u64> = self.chunks.range(first..=last)
+            .chain(other.chunks.range(first..=last)).map(|(&i, _)| i).collect();
+        indices.into_iter().all(|i| {
+            let (a, b) = ((i * CHUNK).max(from), ((i + 1) * CHUNK).min(to));
+            self.read(a, b - a) == other.read(a, b - a)
+        })
+    }
+
     /// Where two contents first differ, if they do.
     pub fn first_difference(&self, other: &Data) -> Option<u64> {
         if self.len != other.len {

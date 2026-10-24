@@ -118,9 +118,13 @@ pointer and a length.
 ## ext2
 
 `src/rust/fs/src/ext2.rs` reads and writes ext2 rev 1 with 1, 2 or 4 KiB blocks:
-direct, indirect and doubly-indirect blocks (a file can reach 4 GiB at 4 KiB
-blocks; the triple-indirect block is not implemented and a file needing it is
-refused), sparse files, directories of any size. Directories are read from
+direct, single-, double- and triple-indirect blocks, sparse files, files past
+4 GiB (`large_file`, a regular file's size in both of its inode's words),
+directories of any size. A file is as big as Linux's ext2 lets one be
+(`ext2_max_size`): all its block tree maps -- 16 GiB at 1 KiB blocks, 256 GiB
+at 2 KiB -- unless a file that size, written whole, would count more blocks
+than its 32-bit `i_blocks` holds, as at 4 KiB blocks, where it ends just short
+of 2 TiB. Directories are read from
 disk the first time a path walk enters them, not at mount, so the memory
 cost is what is used, not what is on the disk -- all of a directory or none
 of it: one whose read fails part way keeps nothing it read, and is read
@@ -139,13 +143,19 @@ What it refuses, and why:
 - any `ro_compat` feature other than `sparse_super` and `large_file` is
   mounted **read-only**: `gdt_csum` above all, whose group checksums a write
   would silently break.
-- symlinks and device nodes are left out of the tree; a file over 4 GiB is
-  skipped with a message.
-- a write or a truncate past what the blocks map -- 64 MiB at 1 KiB blocks,
-  512 MiB at 2 KiB, 4 GiB at 4 KiB -- is refused whole, before anything is
+- symlinks and device nodes are left out of the tree; a file whose size is
+  past what a file can be is skipped with a message.
+- a write or a truncate past that size is refused whole, before anything is
   allocated. A write that fails part way (the disk full, a block that would
-  not read) gives back what it allocated past the end of the file, and the
-  file keeps the size it had; what it wrote inside that size stays.
+  not read) gives back what it allocated past the end of the file, and
+  zeroes what it wrote past the end into the last block, so that the file
+  growing over it later shows zeros; the file keeps the size it had, and
+  what it wrote inside that size stays.
+- a block the filesystem keeps for itself -- the boot block, a copy of the
+  superblock and the descriptors, a bitmap, the inode table -- that a
+  damaged bitmap has free is never handed out: it is marked in use, said
+  so, and the next free one taken, as Linux's ext2 does a block "in system
+  zone". Written over, the filesystem would be gone.
 - a name with a NUL in it: the VFS refuses one for every filesystem.
 
 Writing keeps the on-disk structures consistent for e2fsck and for Linux,
@@ -179,10 +189,19 @@ the journal ext2 does not have:
   bitmaps.
 - **Frees run the other way.** A truncate cuts the tail off the block tree,
   commits the inode without it, and only then clears the bits, in batches of
-  512 blocks so a large file does not hold a huge list in memory. A remove
-  takes the name out of its directory first, so a crash leaves an orphan for
-  `lost+found`, never a name leading nowhere; a directory goes deepest first,
-  by a walk and not a recursion, as deep as the paths reach.
+  512 blocks so a large file does not hold a huge list in memory. It walks
+  down from the end of what the tree maps, not of the size -- whatever the
+  tree has past the size goes too, as Linux's truncate has it -- and steps
+  over a missing indirect block of any level whole, as the run of holes it
+  is: a sparse file of terabytes costs what it has, not what it could have.
+  An indirect block goes once the walk has come down to the first block it
+  maps. A remove takes the name out of its directory first, so a crash
+  leaves an orphan for `lost+found`, never a name leading nowhere; a
+  directory goes deepest first, by a walk and not a recursion, as deep as
+  the paths reach.
+- **`large_file`** is set in the superblock, on the medium, before the
+  inode of the first file of 2 GiB or more is -- what Linux does, and what
+  e2fsck wants of a filesystem that has one.
 - **Renames add the new name before dropping the old one**, so a crash
   leaves the file reachable twice, which e2fsck reduces to once.
 - **The `valid` state bit is cleared at a read-write mount and set again
@@ -201,16 +220,17 @@ the call asks for them, a batch at a time -- up to 64 blocks, a page of a
 256 KiB buffer each (`Disk::write_pieces`, `read_pieces`), in flight
 together on NVMe and virtio-blk, where they used to go one synchronous
 request after another. A batch of a write stays under one pointer block --
-the inode's, the indirect block's, one of the doubly-indirect block's --
+the inode's, the indirect block's, one of those under the double and the
+triple indirect block --
 because moving on to the next puts the last one down after a flush, and the
 blocks it points at have to be on the disk by then, not waiting in the
 batch. A partial block is read in first, and a block the batch allocated is
 written even when the batch stops short, so it never holds what the disk
 had there before. Metadata -- inodes, bitmaps, directories, indirect
-blocks -- still goes a block at a time. The inode table block, the indirect
-and the doubly-indirect block last used are kept in memory, so a file read
-or written a piece at a time does not read its inode back for every piece,
-and a sequential pass does not re-read its indirect blocks per data block.
+blocks -- still goes a block at a time. The inode table block and the
+indirect block of each level last used are kept in memory, so a file read or
+written a piece at a time does not read its inode back for every piece, and
+a sequential pass does not re-read its indirect blocks per data block.
 
 ## nanofs, ramfs, procfs
 
@@ -275,8 +295,16 @@ operations that must fail, a file of `size` bytes (300 KiB by default)
 written in 64 KiB pieces and read back in 12345-byte ones, patched in the
 middle, cut short, grown back, and a recursive remove. `fstest / 5M` at
 4 KiB blocks reaches the doubly-indirect blocks; the smoke tests get there at
-300 KiB by using 1 KiB blocks. `crc32 <path>` checks a file against its
-copy on the host.
+300 KiB by using 1 KiB blocks. And where the filesystem holds a sparse file
+that big at no cost but what is written (`FileSystem::sparse_max`: ext2,
+and not ramfs or nanofs, which pay for a file's whole size), a far file:
+grown past 5 GiB with holes, patches written across 2 and 4 GiB and twice
+past them -- under the triple indirect block, of 1 KiB blocks all of them --
+read back with the holes around them, cut in the middle of one and grown
+again, what was cut reading as zeros; the smoke tests require its line on
+both architectures. `crc32 <path>` checks a file against its copy on the
+host, and `truncate <path> <size>` cuts a file, or grows it with a hole -- a
+guest's blank disk image of any size the filesystem holds.
 
 `TestVfs` in `kernel/test.cpp` runs the same test on a ramfs at every boot,
 before any disk is up.
