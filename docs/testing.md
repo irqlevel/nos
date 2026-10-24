@@ -745,7 +745,13 @@ own, TCP's flags in combinations that mean something. The targets:
   against RFC 9293 -- the window, the sequence space, what may carry data --
   and does what peers do: retransmits, probes a zero window, resets, goes
   quiet; and an attacker off the path injecting segments at every sequence
-  number, an ICMP error at every quoted one. And now and then a second
+  number, an ICMP error at every quoted one. The machine's connects are
+  plain or bulk, and the peer scales its window or not, at any shift -- past
+  RFC 7323's 14 too -- so that the window the machine offers runs past 64
+  KiB and must never shrink, not even by the rounding of its units, and what
+  the link reorders is kept past a hole and taken in when it fills; and a
+  blind reset in the window, past the edge of everything the peer sent, must
+  change nothing (RFC 5961). And now and then a second
   device, eth1, standing for the hypervisor's switch, from which a guest
   sends a SYN to a port the machine listens on -- at eth1's address or at
   eth0's: a listener takes connections from its own device alone, so no
@@ -755,7 +761,8 @@ own, TCP's flags in combinations that mean something. The targets:
   from a server that answers well -- whose result is then known exactly --
   or to break it: numbers longer than any field, chunk sizes of every
   length, headers that never end, a redirect anywhere, a connection reset,
-  a pause past the idle timeout. Over TLS the server is rustls driven by
+  a pause past the idle timeout -- and a server that never opens its window,
+  which the GET must give up on rather than wait on for good. Over TLS the server is rustls driven by
   hand as the `tls` crate drives the client, with a certificate from the
   fuzzer's own CA (`certs/make.sh`) or one run out, for another address,
   or from nobody -- which the client must refuse before its request goes --

@@ -130,6 +130,15 @@ pub struct Ep {
     ooo_fin: Option<u64>,
     /// The furthest the peer's window ever let the machine send.
     pub right_edge: u32,
+    /// Both SYNs carried a window scale (RFC 7323): the machine's windows
+    /// are its field shifted by `snd_shift`, and the peer's own said in
+    /// units of two to `rcv_shift`. Both 0 on a connection that does not
+    /// scale.
+    pub snd_shift: u8,
+    pub rcv_shift: u8,
+    /// The furthest right edge the machine's window ever offered: it must
+    /// never fall back from it.
+    machine_edge: Option<u32>,
 
     rto_at: u64,
     rto: u64,
@@ -173,8 +182,21 @@ impl Ep {
         }
     }
 
+    /// What the peer has room for, as far as its window can say it.
     fn window(&self) -> u32 {
-        self.rcv_cap.saturating_sub(self.unread).min(0xFFFF)
+        self.rcv_cap.saturating_sub(self.unread).min(0xFFFF << self.rcv_shift)
+    }
+
+    /// What a segment of the peer's says its window is -- its field -- and
+    /// what that lets the machine send: a SYN's unscaled, any other's in
+    /// units of two to the peer's shift, rounded down.
+    fn window_field(&self, syn: bool) -> (u16, u32) {
+        if syn {
+            let w = self.window().min(0xFFFF);
+            return (w as u16, w);
+        }
+        let field = self.window() >> self.rcv_shift;
+        (field as u16, field << self.rcv_shift)
     }
 
     /// The stream offset of the machine's sequence number `seq`.
@@ -241,6 +263,9 @@ pub struct Tcp {
     pub accept_iss: u32,
     pub accept_mss: Option<u16>,
     pub accept_window: u32,
+    /// The window scale the peer answers a SYN that offers one with -- sent
+    /// as it is, past 14 too -- or None for a peer that does not scale.
+    pub accept_ws: Option<u8>,
     /// Segments from the machine the peer took, for the statistics.
     pub segments: u64,
 }
@@ -248,7 +273,7 @@ pub struct Tcp {
 impl Tcp {
     pub fn new(ip: u32, mac: Mac) -> Tcp {
         Tcp { eps: Vec::new(), listening: Vec::new(), ignored: Vec::new(), serve: Vec::new(), next_id: 1000, ip, mac, accept_iss: 1, accept_mss: Some(1460),
-              accept_window: 8192, segments: 0 }
+              accept_window: 8192, accept_ws: None, segments: 0 }
     }
 
     /// A segment of the peer's on `ep`. Whatever carries an ACK advertises
@@ -257,12 +282,12 @@ impl Tcp {
         if ep.silent {
             return;
         }
+        let (field, granted) = ep.window_field(flags & tcp::SYN != 0);
         if flags & tcp::ACK_FLAG != 0 {
-            ep.right_edge = later(ep.right_edge, ep.rcv_nxt.wrapping_add(ep.window()));
+            ep.right_edge = later(ep.right_edge, ep.rcv_nxt.wrapping_add(granted));
         }
         let ack = if flags & tcp::ACK_FLAG != 0 { ep.rcv_nxt } else { 0 };
-        let s = frames::tcp(ep.ip, ep.mip, ep.port, ep.mport, seq, ack, flags, ep.window() as u16, opts, data,
-                            Sum::Right);
+        let s = frames::tcp(ep.ip, ep.mip, ep.port, ep.mport, seq, ack, flags, field, opts, data, Sum::Right);
         net.send(frames::ipv4(ETH0_MAC, ep.mac, &Ip::new(ep.ip, ep.mip, IP_PROTO_TCP), &s));
     }
 
@@ -282,7 +307,7 @@ impl Tcp {
             iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_wnd: 0, wl1: 0, wl2: 0, mss: DEFAULT_MSS, our_mss,
             queued: 0, fin_queued: false, fin_seq: None,
             irs: 0, rcv_nxt: 0, rcv_cap: window, unread: 0, got: 0, fin_got: None, ooo: Vec::new(), ooo_fin: None,
-            right_edge: 0,
+            right_edge: 0, snd_shift: 0, rcv_shift: 0, machine_edge: None,
             rto_at: sched::now() + RTO, rto: RTO, tries: 0, probe_at: 0, tw_until: 0, oow_at: 0,
             silent: false, tainted: false, reset: None, syn_opts: opts, offered: 0, closed_at: None, data: None,
         };
@@ -353,7 +378,18 @@ impl Tcp {
     #[allow(clippy::too_many_arguments)]
     fn accept(&mut self, net: &mut Net, id: usize, port: u16, mip: u32, mport: u16, seq: u32, wnd: u32, opts: &[u8]) {
         let iss = self.accept_iss;
-        let our_opts = self.accept_mss.map(frames::mss).unwrap_or_default();
+        let mut our_opts = self.accept_mss.map(frames::mss).unwrap_or_default();
+        /* Scaled when the machine's SYN offered a scale and the peer answers
+         * with one of its own (RFC 7323 1.3): each end's past 14 taken as
+         * 14, as the RFC has the other end take it. */
+        let (snd_shift, rcv_shift) = match (ws_of(opts), self.accept_ws) {
+            (Some(theirs), Some(ours)) => {
+                our_opts.extend_from_slice(&[tcp::OPT_NOP, tcp::OPT_WS, tcp::OPT_WS_LEN, ours]);
+                crate::common::runner::reached("tcp: a connection the machine opened, scaled both ways");
+                (theirs.min(tcp::MAX_WSCALE), ours.min(tcp::MAX_WSCALE))
+            }
+            _ => (0, 0),
+        };
         let ep = Ep {
             id, ip: self.ip, port, mac: self.mac, mip, mport, st: S::SynRcvd,
             iss, snd_una: iss, snd_nxt: iss.wrapping_add(1), snd_wnd: wnd, wl1: seq, wl2: 0,
@@ -363,6 +399,7 @@ impl Tcp {
             irs: seq, rcv_nxt: seq.wrapping_add(1), rcv_cap: self.accept_window, unread: 0, got: 0, fin_got: None,
             ooo: Vec::new(), ooo_fin: None,
             right_edge: seq.wrapping_add(1).wrapping_add(self.accept_window.min(0xFFFF)),
+            snd_shift, rcv_shift, machine_edge: None,
             rto_at: sched::now() + RTO, rto: RTO, tries: 0, probe_at: 0, tw_until: 0, oow_at: 0,
             silent: false, tainted: false, reset: None, syn_opts: our_opts, offered: 0, closed_at: None,
             data: if self.serve.contains(&port) { Some(Data::default()) } else { None },
@@ -423,7 +460,13 @@ impl Tcp {
                 invariant!(payload.is_empty(), "data on the machine's SYN-ACK");
                 ep.irs = seq;
                 ep.rcv_nxt = seq.wrapping_add(1);
-                ep.right_edge = ep.rcv_nxt.wrapping_add(ep.window());
+                /* Scaled from here when both SYNs offered a scale; the
+                 * SYN-ACK's own window is not. */
+                if let (Some(theirs), Some(ours)) = (ws_of(opts), ws_of(&ep.syn_opts)) {
+                    ep.snd_shift = theirs.min(tcp::MAX_WSCALE);
+                    ep.rcv_shift = ours.min(tcp::MAX_WSCALE);
+                }
+                ep.right_edge = ep.rcv_nxt.wrapping_add(ep.window_field(false).1);
                 ep.snd_una = ack;
                 ep.snd_wnd = wnd;
                 ep.wl1 = seq;
@@ -496,6 +539,26 @@ impl Tcp {
         if ackf {
             invariant!(before_eq(ack, ep.snd_nxt) || ep.tainted,
                        "the machine acknowledged {} past everything the peer sent ({})", ack, ep.snd_nxt);
+            /* The window the machine offers never shrinks: its right edge
+             * never falls back (RFC 9293 3.8.6.2.2) -- with a scaled window,
+             * not even by the rounding of its units. The machine's segments
+             * reach the peer as it sent them, in order, whatever the link
+             * does to the peer's: any segment of its is judged. */
+            let edge = ack.wrapping_add(wnd << ep.snd_shift);
+            if let (Some(was), false) = (ep.machine_edge, ep.tainted) {
+                invariant!(!before(edge, was), "the machine's window shrank on connection {}: its right edge {} \
+                           after {} (ack {}, window {} << {})", ep.id, edge, was, ack, wnd, ep.snd_shift);
+            }
+            ep.machine_edge = Some(ep.machine_edge.map_or(edge, |was| later(was, edge)));
+            if wnd << ep.snd_shift > 0xFFFF {
+                crate::common::runner::reached("tcp: the machine offered a window past 64 KiB");
+            }
+            /* The machine acknowledges every segment it takes, and none of
+             * its acknowledgements is lost on the way: one that moves on by
+             * more than a segment took in what it had kept past a hole. */
+            if !ep.tainted && before(ep.snd_una.wrapping_add(ep.mss as u32), ack) {
+                crate::common::runner::reached("tcp: the machine took in what it kept past a hole");
+            }
             if before(ep.snd_una, ack) {
                 ep.snd_una = ack;
                 ep.tries = 0;
@@ -503,7 +566,7 @@ impl Tcp {
                 ep.rto_at = if ep.snd_una == ep.snd_nxt { 0 } else { now + ep.rto };
             }
             if before(ep.wl1, seq) || (ep.wl1 == seq && before_eq(ep.wl2, ack)) {
-                ep.snd_wnd = wnd;
+                ep.snd_wnd = wnd << ep.snd_shift;
                 ep.wl1 = seq;
                 ep.wl2 = ack;
             }
@@ -678,11 +741,13 @@ impl Tcp {
     /// machine its window is open again when it was near shut.
     pub fn read(&mut self, net: &mut Net, i: usize, n: u32) {
         let ep = &mut self.eps[i];
-        let before_wnd = ep.window();
+        let before_wnd = ep.window_field(false).1;
         ep.unread -= n.min(ep.unread);
         /* A window that was shut, or too small for a segment, and is not
-         * now: said at once, as a receiver that has read does. */
-        if ep.window() > before_wnd && before_wnd < ep.mss as u32 && ep.open() && ep.st != S::SynSent {
+         * now: said at once, as a receiver that has read does. As the
+         * window is said, in the peer's units: a scaled one rounds a few
+         * bytes short of a unit to nothing. */
+        if ep.window_field(false).1 > before_wnd && before_wnd < ep.mss as u32 && ep.open() && ep.st != S::SynSent {
             Self::ack_now(net, ep);
         }
     }
@@ -783,8 +848,10 @@ fn later(a: u32, b: u32) -> u32 {
     if before(a, b) { b } else { a }
 }
 
-/// The MSS option's value, when `opts` carries a well-formed one.
-pub fn mss_of(opts: &[u8]) -> Option<u16> {
+/// What option `kind` says -- the bytes past its kind and length -- when
+/// `opts` carries one `len` bytes long, well made: the walk ends at the end
+/// of the list and at a length that is no length.
+fn option_of(opts: &[u8], want: u8, want_len: usize) -> Option<&[u8]> {
     let mut at = 0;
     while at < opts.len() {
         match opts[at] {
@@ -795,14 +862,25 @@ pub fn mss_of(opts: &[u8]) -> Option<u16> {
                 if len < 2 || at + len > opts.len() {
                     return None;
                 }
-                if kind == tcp::OPT_MSS && len == 4 {
-                    return Some(u16::from_be_bytes([opts[at + 2], opts[at + 3]]));
+                if kind == want && len == want_len {
+                    return Some(&opts[at + 2..at + len]);
                 }
                 at += len;
             }
         }
     }
     None
+}
+
+/// The MSS option's value, when `opts` carries a well-formed one.
+pub fn mss_of(opts: &[u8]) -> Option<u16> {
+    option_of(opts, tcp::OPT_MSS, 4).map(|v| u16::from_be_bytes([v[0], v[1]]))
+}
+
+/// The window scale option's shift, as sent, when `opts` carries a
+/// well-formed one.
+pub fn ws_of(opts: &[u8]) -> Option<u8> {
+    option_of(opts, tcp::OPT_WS, 3).map(|v| v[0])
 }
 
 /// The most the machine may put in a segment to a peer whose SYN carried

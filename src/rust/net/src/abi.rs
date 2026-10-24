@@ -147,7 +147,7 @@ pub extern "C" fn rust_netconsole_panic_flush() {
 
 /* ---- TCP ---- */
 
-use crate::tcp::{Conn, TCP};
+use crate::tcp::{Conn, Receive, TCP};
 
 /// What the C++ side sees a connection as.
 type ConnPtr = *mut u8;
@@ -236,7 +236,10 @@ pub extern "C" fn kernel_tcp_connect(dev: usize, ip: u32, port: u16) -> ConnPtr 
         Some(nic) => nic,
         None => return core::ptr::null_mut(),
     };
-    match TCP.connect(&nic, ip, port, 0) {
+    /* The slot's own buffer: what a module opens -- hv's forwards among
+     * them -- someone outside may have it open, and a bulk buffer each
+     * would be heap for the asking. */
+    match TCP.connect(&nic, ip, port, 0, Receive::Small) {
         Some(conn) => conn as *const Conn as ConnPtr,
         None => core::ptr::null_mut(),
     }

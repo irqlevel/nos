@@ -579,6 +579,13 @@ pub mod tcp {
     pub const OPT_NOP: u8 = 1;
     pub const OPT_MSS: u8 = 2;
     pub const OPT_MSS_LEN: u8 = 4;
+    /// Window scale (RFC 7323 2.2): the shift its sender applies to every
+    /// window it advertises after the SYN that carries it.
+    pub const OPT_WS: u8 = 3;
+    pub const OPT_WS_LEN: u8 = 3;
+    /// The largest shift there is: a window of a gigabyte. A bigger one is
+    /// taken as this (RFC 7323 2.3).
+    pub const MAX_WSCALE: u8 = 14;
 
     #[inline]
     pub fn src_port(seg: &[u8]) -> u16 {
@@ -637,22 +644,24 @@ pub mod tcp {
         set_be16(seg, URGENT, 0);
     }
 
-    /// The peer's maximum segment size from a SYN's options, capped at ours.
-    /// `default` when it named none.
-    pub fn parse_mss(seg: &[u8], ours: u16, default: u16) -> u16 {
-        let len = header_len(seg);
-        if len <= HDR_LEN || len > seg.len() {
-            return default;
+    /// What option `kind` says, when the segment carries one `len` bytes
+    /// long: the bytes after its kind and length. The walk stops at the end
+    /// of the list, and at an option whose length runs past the header; one
+    /// of the kind but another length is passed over.
+    fn option(seg: &[u8], kind: u8, len: u8) -> Option<&[u8]> {
+        let hdr_len = header_len(seg);
+        if hdr_len <= HDR_LEN || hdr_len > seg.len() {
+            return None;
         }
 
-        let options = &seg[HDR_LEN..len];
+        let options = &seg[HDR_LEN..hdr_len];
         let mut at = 0;
         while at < options.len() {
-            let kind = options[at];
-            if kind == OPT_END {
+            let found = options[at];
+            if found == OPT_END {
                 break;
             }
-            if kind == OPT_NOP {
+            if found == OPT_NOP {
                 at += 1;
                 continue;
             }
@@ -663,13 +672,32 @@ pub mod tcp {
             if opt_len < 2 || at + opt_len > options.len() {
                 break;
             }
-            if kind == OPT_MSS && opt_len == OPT_MSS_LEN as usize {
-                let mss = be16(options, at + 2);
-                return if mss == 0 { default } else { mss.min(ours) };
+            if found == kind && opt_len == len as usize {
+                return Some(&options[at + 2..at + opt_len]);
             }
             at += opt_len;
         }
-        default
+        None
+    }
+
+    /// The peer's maximum segment size from a SYN's options, capped at ours.
+    /// `default` when it named none.
+    pub fn parse_mss(seg: &[u8], ours: u16, default: u16) -> u16 {
+        match option(seg, OPT_MSS, OPT_MSS_LEN) {
+            Some(value) => {
+                let mss = be16(value, 0);
+                if mss == 0 { default } else { mss.min(ours) }
+            }
+            None => default,
+        }
+    }
+
+    /// The window scale a SYN asks for (RFC 7323 2.3): the shift its sender
+    /// will apply to the windows it advertises after it, at most
+    /// `MAX_WSCALE`. None when it asks for none -- and then neither end
+    /// scales.
+    pub fn parse_wscale(seg: &[u8]) -> Option<u8> {
+        option(seg, OPT_WS, OPT_WS_LEN).map(|value| value[0].min(MAX_WSCALE))
     }
 
     /// The checksum a TCP segment carries: over the pseudo-header of
